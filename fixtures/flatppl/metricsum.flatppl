@@ -1,0 +1,9 @@
+# Metric-aware Einstein summation (spec §04): the `metric: …` statement form
+# lowers to a `metricsum(metric, [.axes…], expr)` call. `.name^` and `.name_`
+# are the upper / lower variance markers. Composition of three Lorentz
+# transformations as (1,1)-tensors under metric `g` (the spec's example).
+g = eye(4)
+L1 = eye(4)
+L2 = eye(4)
+L3 = eye(4)
+g: L[.mu^, .rho_] := L1[.mu^, .nu_] * L2[.nu^, .sigma_] * L3[.sigma^, .rho_]

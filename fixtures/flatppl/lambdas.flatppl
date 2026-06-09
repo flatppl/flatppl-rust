@@ -1,0 +1,9 @@
+# Lambda (`->`) and `fn(…)` hole sugar — both lower to `functionof` with
+# placeholders (spec §04).
+cs = [0.5, 1.5, 2.5]
+double_plus = x -> 2 * x + 1
+combine = (x, y) -> x * y + 1
+poly = fn(polynomial(coefficients = cs, x = _))
+ratio_sq = fn((_ / _) ^ 2)
+log_normal = pushfwd(x -> exp(x), Normal(mu = 0.0, sigma = 1.0))
+mapped = broadcast((a, b) -> a * b, [1.0, 2.0], [3.0, 4.0])

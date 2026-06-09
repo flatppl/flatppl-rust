@@ -1,0 +1,14 @@
+; User-defined callable %call round-trip — the spec's key cross-engine
+; structural check (a user binding head is (%call (%ref …) …), not a bare op).
+(%module
+  (%public scale scaled result)
+
+  (%bind scale (elementof reals))
+
+  (%bind scaled
+    (functionof
+      (mul (%ref %local _x_) (%ref self scale))
+      %specinputs
+      ((x (%ref %local _x_)))))
+
+  (%bind result (%call (%ref self scaled) (%kwarg x 4.0))))

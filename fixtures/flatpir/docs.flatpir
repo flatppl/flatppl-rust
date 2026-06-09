@@ -1,0 +1,15 @@
+; Doc-comment coverage: module-level doc on flatppl_compat, leading/trailing
+; docs, md and typ markup, a blank content line.
+(%module
+  (%public flatppl_compat mu sigma obs)
+
+  (%bind flatppl_compat "0.1"
+    (%doc md "# Example model" "" "Module-level documentation via flatppl_compat."))
+
+  (%bind mu 0 (%doc md "Prior mean."))
+
+  (%bind sigma 1 (%doc md "Prior standard deviation."))
+
+  (%bind obs
+    (draw (Normal (%kwarg mu (%ref self mu)) (%kwarg sigma (%ref self sigma))))
+    (%doc typ "The observation.")))

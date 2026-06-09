@@ -1,7 +1,7 @@
 # FlatPPL Rust monorepo — virtual workspace.
-# No member crates yet; they will live under `crates/` and are picked up by the
-# glob below. Shared metadata and dependency versions are centralised here so
-# member crates can opt in with `<field>.workspace = true`.
+# Member crates live under `crates/` and are picked up by the glob below.
+# Shared metadata and dependency versions are centralised here so member
+# crates can opt in with `<field>.workspace = true`.
 
 [workspace]
 resolver = "3"
@@ -15,3 +15,4 @@ license = "MIT"
 repository = "https://github.com/flatppl/flatppl-rust"
 
 [workspace.dependencies]
+clap = { version = "4", features = ["derive"] }

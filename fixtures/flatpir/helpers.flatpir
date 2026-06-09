@@ -1,0 +1,19 @@
+; Bare FlatPIR — spec §11 `helpers.flatpir` example (functionof + %specinputs + %local).
+(%module
+  (%public center spread obs_kernel shifted_value)
+
+  (%bind center (elementof reals))
+
+  (%bind spread (elementof posreals))
+
+  (%bind obs_kernel
+    (functionof
+      (Normal
+        (%kwarg mu (add (%ref self center) (%ref %local _x_)))
+        (%kwarg sigma (%ref self spread)))
+      %specinputs
+      ((center (%ref self center))
+       (spread (%ref self spread))
+       (x (%ref %local _x_)))))
+
+  (%bind shifted_value (add (%ref self center) 1.0)))

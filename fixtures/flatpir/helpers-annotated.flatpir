@@ -1,0 +1,26 @@
+; Annotated FlatPIR — spec §11 annotated `helpers.flatpir` (%meta type/phase).
+; Exercises %scalar, %kernel/%inputs, %measure/%domain, and the three phases.
+(%module
+  (%public center spread obs_kernel shifted_value)
+
+  (%bind center
+    (elementof (%meta (%scalar real) %parameterized) reals))
+
+  (%bind spread
+    (elementof (%meta (%scalar real) %parameterized) posreals))
+
+  (%bind obs_kernel
+    (functionof
+      (%meta (%kernel (%inputs center spread x)) %fixed)
+      (Normal (%meta (%measure (%domain (%scalar real))) %parameterized)
+        (%kwarg mu (add (%meta (%scalar real) %parameterized)
+                        (%ref self center) (%ref %local _x_)))
+        (%kwarg sigma (%ref self spread)))
+      %specinputs
+      ((center (%ref self center))
+       (spread (%ref self spread))
+       (x (%ref %local _x_)))))
+
+  (%bind shifted_value
+    (add (%meta (%scalar real) %parameterized)
+         (%ref self center) 1.0)))

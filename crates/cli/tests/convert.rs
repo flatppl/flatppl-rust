@@ -1,0 +1,115 @@
+//! End-to-end tests for `flatppl convert`, exercising the built binary.
+
+use std::fs;
+use std::path::PathBuf;
+use std::process::Command;
+
+fn bin() -> Command {
+    Command::new(env!("CARGO_BIN_EXE_flatppl"))
+}
+
+/// A scratch dir unique to this test process, cleaned up on drop.
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn new(label: &str) -> Scratch {
+        let dir = std::env::temp_dir().join(format!("flatppl-cli-{label}-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("create scratch dir");
+        Scratch(dir)
+    }
+    fn path(&self, name: &str) -> PathBuf {
+        self.0.join(name)
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        fs::remove_dir_all(&self.0).ok();
+    }
+}
+
+#[test]
+fn converts_flatppl_to_flatpir_and_back() {
+    let dir = Scratch::new("roundtrip");
+    let src = dir.path("model.flatppl");
+    let pir = dir.path("model.flatpir");
+    let back = dir.path("back.flatppl");
+    fs::write(
+        &src,
+        "mu = elementof(reals)\nx ~ Normal(mu = mu, sigma = 1.0)\n",
+    )
+    .unwrap();
+
+    let status = bin().arg("convert").arg(&src).arg(&pir).status().unwrap();
+    assert!(status.success());
+    let pir_text = fs::read_to_string(&pir).unwrap();
+    assert!(
+        pir_text.contains("(%bind x (draw (Normal"),
+        "got:\n{pir_text}"
+    );
+    assert!(pir_text.ends_with('\n'));
+
+    let status = bin().arg("convert").arg(&pir).arg(&back).status().unwrap();
+    assert!(status.success());
+    let back_text = fs::read_to_string(&back).unwrap();
+    assert!(
+        back_text.contains("x ~ Normal(mu = mu, sigma = 1.0)"),
+        "got:\n{back_text}"
+    );
+}
+
+/// Same-format conversion canonicalizes (one stmt per line, sugar re-applied
+/// by default; `--syntax minimal` emits the lowered call form instead).
+#[test]
+fn same_format_canonicalizes() {
+    let dir = Scratch::new("canon");
+    let src = dir.path("messy.flatppl");
+    let out = dir.path("canonical.flatppl");
+    fs::write(&src, "x = add(1, 2); y ~ Normal(0, 1)\n").unwrap();
+
+    let status = bin().arg("convert").arg(&src).arg(&out).status().unwrap();
+    assert!(status.success());
+    assert_eq!(
+        fs::read_to_string(&out).unwrap(),
+        "x = 1 + 2\ny ~ Normal(0, 1)\n"
+    );
+
+    let status = bin()
+        .args(["convert", "--syntax", "minimal"])
+        .arg(&src)
+        .arg(&out)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    assert_eq!(
+        fs::read_to_string(&out).unwrap(),
+        "x = add(1, 2)\ny ~ Normal(0, 1)\n"
+    );
+}
+
+#[test]
+fn rejects_unknown_extension() {
+    let out = bin()
+        .args(["convert", "model.txt", "model.flatpir"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("extension"));
+}
+
+#[test]
+fn reports_parse_errors_with_the_file_name() {
+    let dir = Scratch::new("err");
+    let src = dir.path("bad.flatppl");
+    fs::write(&src, "x = \n").unwrap();
+
+    let out = bin()
+        .arg("convert")
+        .arg(&src)
+        .arg(dir.path("out.flatpir"))
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("bad.flatppl"), "got:\n{stderr}");
+}

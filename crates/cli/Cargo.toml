@@ -1,0 +1,21 @@
+[package]
+name = "flatppl-cli"
+description = "The `flatppl` command-line driver: convert between FlatPPL and FlatPIR (more verbs as the toolchain grows)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# One driver binary; later capabilities (infer, lower, check) arrive as
+# subcommands, heavy/optional ones behind cargo features. The library crates
+# stay binary-free (they compile to wasm32 and link into PyO3/jlrs/cxx).
+[[bin]]
+name = "flatppl"
+path = "src/main.rs"
+
+[dependencies]
+flatppl-core = { path = "../core" }
+flatppl-syntax = { path = "../syntax" }
+flatppl-flatpir = { path = "../flatpir" }
+clap = { workspace = true }

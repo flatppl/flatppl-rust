@@ -1,0 +1,18 @@
+; Bare FlatPIR — spec §11 `model.flatpir` example.
+; Note: `helpers` (load_module) and `_combined` are NOT in (%public …) — the
+; public list is the authored interface, not all non-underscore names.
+(%module
+  (%public a b input_data L)
+
+  (%bind helpers
+    (load_module "helpers.flatppl" (%assign center (%ref self a))))
+
+  (%bind a (elementof reals))
+
+  (%bind b (draw (Normal (%kwarg mu 0.0) (%kwarg sigma 2.0))))
+
+  (%bind _combined (add (%ref self a) (%ref self b)))
+
+  (%bind input_data 2.5)
+
+  (%bind L (likelihoodof (%ref helpers obs_kernel) (%ref self input_data))))

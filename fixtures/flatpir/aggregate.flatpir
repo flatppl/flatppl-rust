@@ -1,0 +1,24 @@
+; Axis-node coverage: aggregate (%axis) and metricsum (%uaxis / %laxis), plus a
+; bare built-in function used as a value (`sum` as a Const head argument).
+(%module
+  (%public A B C g T1 T2 M)
+
+  (%bind A (rowstack (vector (vector 1 3 5) (vector 9 5 1))))
+
+  (%bind B (rowstack (vector (vector 1 0) (vector 0 1) (vector 1 1))))
+
+  (%bind C
+    (aggregate sum (vector (%axis i) (%axis k))
+      (mul (get (%ref self A) (%axis i) (%axis j))
+           (get (%ref self B) (%axis j) (%axis k)))))
+
+  (%bind g (eye 2))
+
+  (%bind T1 (elementof (cartpow reals (vector 2 2))))
+
+  (%bind T2 (elementof (cartpow reals (vector 2 2))))
+
+  (%bind M
+    (metricsum (%ref self g) (vector (%uaxis a) (%laxis c))
+      (mul (get (%ref self T1) (%uaxis a) (%laxis b))
+           (get (%ref self T2) (%uaxis b) (%laxis c))))))

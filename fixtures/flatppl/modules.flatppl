@@ -1,0 +1,15 @@
+# Module-member access (`mod.x` → cross-module ref, spec §04), the reserved
+# namespaces `self.x` / `base.x`, load-time substitution, and `_` discard.
+a = elementof(reals)
+helpers = load_module("helpers.flatppl", center = a)
+hepphys = standard_module("particle-physics", "0.1")
+
+kernel_alias = helpers.obs_kernel
+shifted = helpers.shifted_value + 1.0
+applied = helpers.obs_kernel(x = a)
+peak = hepphys.CrystalBall(m0 = 125.0, sigma = 2.0, alpha = 1.5, n = 3.0)
+
+self_ref = self.a
+builtin_const = base.pi
+builtin_call = base.add(a, 1.0)
+_ = base.exp(a)

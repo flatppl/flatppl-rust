@@ -1,0 +1,95 @@
+name: Test
+
+# Runs format / lint / test for the whole workspace on every push and
+# pull request, with test coverage uploaded to Codecov. Tests run under
+# cargo-llvm-cov (LLVM source-based coverage on stable), so the test and
+# coverage runs are one and the same — mirroring how flatppl-js runs its
+# suite under c8.
+#
+# The cross-engine FlatPIR parity check (crates/syntax/tests/cross_engine.rs)
+# needs the flatppl-js reference engine: it is checked out side-by-side and
+# located via FLATPPL_JS_DIR — the same pattern flatppl-js uses for
+# flatppl-grammars. The checkout tracks flatppl-js@main deliberately: this
+# is the one place the two engines are compared, so a JS-side change that
+# breaks parity should surface here. With FLATPPL_JS_DIR set the harness
+# refuses to skip — a missing engine or unusable node fails the job rather
+# than silently passing.
+
+# Pushes trigger only on the long-lived branches and on release tags
+# (`v*` — a GitHub release published from such a tag is thereby covered);
+# any other branch gets its signal from the pull_request trigger once a
+# PR is opened, so WIP pushes to topic branches don't burn CI minutes.
+on:
+  push:
+    branches: [main, dev]
+    tags: ["v*"]
+  pull_request:
+
+# Cancel an in-flight run when a new commit lands on the same ref —
+# the previous result is uninteresting.
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      FLATPPL_JS_DIR: ${{ github.workspace }}/.flatppl-js
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Check out flatppl-js (cross-engine parity reference)
+        uses: actions/checkout@v6
+        with:
+          repository: flatppl/flatppl-js
+          ref: main
+          path: .flatppl-js
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Install flatppl-js engine dependencies
+        # The parity shim require()s the engine package, which pulls its
+        # @stdlib runtime deps from node_modules. npm ci at the workspace
+        # root installs every package's deps from the committed lockfile.
+        run: npm ci
+        working-directory: .flatppl-js
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy, llvm-tools-preview
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run tests with coverage
+        # Runs the full workspace test suite (including the cross-engine
+        # parity harness) under LLVM source-based coverage and writes an
+        # LCOV report for the upload step below.
+        run: cargo llvm-cov --workspace --lcov --output-path lcov.info
+
+      - name: Upload coverage to Codecov
+        # For public repos the upload works without CODECOV_TOKEN; set the
+        # secret if rate-limited. fail_ci_if_error stays off so a Codecov
+        # outage doesn't mask a green test run.
+        uses: codecov/codecov-action@v6
+        with:
+          files: lcov.info
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}

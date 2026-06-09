@@ -1,0 +1,33 @@
+# Deterministic-expression coverage: operators (precedence + chaining),
+# field/index access, arrays, records, tuples, dot-broadcast, slicing,
+# set membership.
+a = elementof(reals)
+b = elementof(reals)
+c = elementof(reals)
+
+sum_ab = a + b
+diff = a - b * 2.0
+powers = a ^ 2 + b ^ 2
+neg = -a + b
+cmp = a < b
+chained = a < b < c
+logic = cmp && (a > c)
+
+arr = [1.0, 2.0, 3.0]
+rec = record(x = a, y = b)
+pair = (a, b)
+
+first = arr[1]
+field = rec.x
+broadcasted = a .+ b
+
+M = rowstack([[1.0, 2.0], [3.0, 4.0]])
+col = M[:, 2]
+row = M[1, :]
+unit = [42.0]
+sole = unit[!]
+single_row = rowstack([[5.0, 6.0]])
+mixed = single_row[!, :]
+member = a in interval(0.0, 1.0)
+picked = arr[!false + 1]
+applied = functionof(sum_ab, p = a, q = b)(0.5, 1.5)

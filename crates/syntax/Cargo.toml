@@ -1,0 +1,15 @@
+[package]
+name = "flatppl-syntax"
+description = "FlatPPL canonical surface syntax: parse/lower to, and pretty-print from, flatppl-core."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+flatppl-core = { path = "../core" }
+
+[dev-dependencies]
+# Round-trip tests cross-check FlatPPL → core → FlatPIR.
+flatppl-flatpir = { path = "../flatpir" }

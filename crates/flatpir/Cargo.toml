@@ -1,0 +1,11 @@
+[package]
+name = "flatppl-flatpir"
+description = "FlatPIR canonical S-expression syntax: read/write flatppl-core from/to FlatPIR (spec section 11)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+flatppl-core = { path = "../core" }

@@ -1,0 +1,14 @@
+# Literal coverage: integers (dec/hex/underscore), reals, booleans, strings,
+# arrays, nested arrays, records, tuples.
+n = 42
+h = 0xF7
+big = 1_000_000
+x = 3.14
+sci = 1.45e7
+flag = true
+other = false
+label = "hello, world"
+v = [1.0, 2.0, 3.0]
+nested = [[1, 2], [3, 4]]
+r = record(mu = 0.0, sigma = 1.0)
+pair = (n, x)

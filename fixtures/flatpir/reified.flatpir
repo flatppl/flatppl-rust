@@ -1,0 +1,17 @@
+; Boundary-less reification lifecycle (spec §11 "Reified callables"):
+; %autoinputs %deferred (pre-inference) and a filled %autoinputs list
+; (post-phase-inference, inference metadata), for functionof and kernelof.
+(%module
+  (%public a b f g kernel)
+
+  (%bind a (elementof reals))
+
+  (%bind b (pow (%ref self a) 0.5))
+
+  (%bind f (functionof (%ref self b) %autoinputs %deferred))
+
+  (%bind g (functionof (%ref self b) %autoinputs ((a (%ref self a)))))
+
+  (%bind kernel
+    (kernelof (draw (Normal (%kwarg mu (%ref self a)) (%kwarg sigma 1.0)))
+      %autoinputs %deferred)))

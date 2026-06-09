@@ -1,0 +1,22 @@
+; Literal and composite-value coverage: int/real/bool/string, vector, nested
+; vector (vec-of-vec), record (%field), tuple, complex.
+(%module
+  (%public n x flag label v nested r pair z)
+
+  (%bind n 42)
+
+  (%bind x 3.14)
+
+  (%bind flag true)
+
+  (%bind label "hello, world")
+
+  (%bind v (vector 1.0 2.0 3.0))
+
+  (%bind nested (vector (vector 1 2) (vector 3 4)))
+
+  (%bind r (record (%field mu 0.0) (%field sigma 1.0)))
+
+  (%bind pair (tuple (%ref self x) (%ref self n)))
+
+  (%bind z (complex 0.5 2.0)))
