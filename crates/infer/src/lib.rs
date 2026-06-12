@@ -53,10 +53,32 @@ impl Diagnostic {
     }
 }
 
-/// Infer types and phases for every binding of `module`, filling its
-/// type/phase side-tables in place. Best-effort: always annotates as much as
-/// it can; returned diagnostics report errors (ill-formed module) and notes
-/// (honest `%deferred` gaps).
+/// How far to take the trace. The levels form a hierarchy — each includes
+/// everything below it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Level {
+    /// Phases only (the spec-§04 ancestor classification). Types are not
+    /// annotated — `%meta` carries `%deferred` in the type slot.
+    Phase,
+    /// Phases + structural types. Array dimensions are static only where
+    /// they are syntactically literal.
+    Type,
+    /// Phases + types + shape resolution: fixed-phase integer expressions at
+    /// shape positions (`iid` counts, `cartpow` sizes, distribution dims)
+    /// are resolved demand-driven (engine-concepts §17.1 — "resolve, don't
+    /// rewrite"; the source IR is never modified).
+    Shape,
+}
+
+/// Infer at [`Level::Shape`] (everything) — see [`infer_with`].
 pub fn infer(module: &mut Module) -> Vec<Diagnostic> {
-    trace::Inferencer::new(module).run()
+    infer_with(module, Level::Shape)
+}
+
+/// Infer types and phases for every binding of `module` at the given
+/// [`Level`], filling its type/phase side-tables in place. Best-effort:
+/// always annotates as much as it can; returned diagnostics report errors
+/// (ill-formed module) and notes (honest `%deferred` gaps).
+pub fn infer_with(module: &mut Module, level: Level) -> Vec<Diagnostic> {
+    trace::Inferencer::new(module, level).run()
 }

@@ -156,3 +156,82 @@ fn unknown_op_is_an_honest_gap() {
         "got:\n{out}"
     );
 }
+
+// ---- inference levels ----
+
+#[test]
+fn level_phase_annotates_no_types() {
+    let mut module = flatppl_syntax::parse("a = elementof(reals)\nb ~ Normal(a, 1.0)").unwrap();
+    flatppl_infer::infer_with(&mut module, flatppl_infer::Level::Phase);
+    let out = flatppl_flatpir::write(&module);
+    assert!(
+        out.contains("(draw (%meta %deferred %stochastic)"),
+        "got:\n{out}"
+    );
+    assert!(
+        !out.contains("%scalar"),
+        "types must not be annotated:\n{out}"
+    );
+}
+
+#[test]
+fn level_shape_resolves_fixed_dims() {
+    let src = "J = 8\nx ~ iid(Normal(0.0, 1.0), J)";
+    // Type level: the computed count stays dynamic.
+    let mut m = flatppl_syntax::parse(src).unwrap();
+    flatppl_infer::infer_with(&mut m, flatppl_infer::Level::Type);
+    assert!(
+        flatppl_flatpir::write(&m).contains("(%array 1 (%dynamic) (%scalar real))"),
+        "got:\n{}",
+        flatppl_flatpir::write(&m)
+    );
+    // Shape level: J resolves through the fixed-phase ref.
+    let mut m = flatppl_syntax::parse(src).unwrap();
+    flatppl_infer::infer_with(&mut m, flatppl_infer::Level::Shape);
+    assert!(
+        flatppl_flatpir::write(&m).contains("(%array 1 (8) (%scalar real))"),
+        "got:\n{}",
+        flatppl_flatpir::write(&m)
+    );
+}
+
+#[test]
+fn shape_resolver_arithmetic_and_length_observer() {
+    // Arithmetic over fixed ints, and `lengthof` short-circuiting off the
+    // inferred dim (never evaluating the array).
+    let src = "J = 4\nx ~ iid(Normal(0.0, 1.0), J + J)";
+    let (module, _) = infer_src(src);
+    assert!(
+        flatppl_flatpir::write(&module).contains("(%array 1 (8)"),
+        "got:\n{}",
+        flatppl_flatpir::write(&module)
+    );
+
+    let src = "v = [1.0, 2.0]\nn = lengthof(v)\nx ~ iid(Normal(0.0, 1.0), n)";
+    let (module, _) = infer_src(src);
+    assert!(
+        flatppl_flatpir::write(&module).contains("(%array 1 (2)"),
+        "got:\n{}",
+        flatppl_flatpir::write(&module)
+    );
+
+    // A stochastic count is NOT resolvable — stays dynamic.
+    let src = "n ~ Poisson(5.0)\nx ~ iid(Normal(0.0, 1.0), n)";
+    let (module, _) = infer_src(src);
+    assert!(
+        flatppl_flatpir::write(&module).contains("(%array 1 (%dynamic)"),
+        "got:\n{}",
+        flatppl_flatpir::write(&module)
+    );
+}
+
+#[test]
+fn mvnormal_dim_from_mu_type() {
+    let src = "m = MvNormal(mu = [0.0, 0.0], cov = eye(2))";
+    let (module, _) = infer_src(src);
+    let out = flatppl_flatpir::write(&module);
+    assert!(
+        out.contains("(%measure (%domain (%array 1 (2) (%scalar real))))"),
+        "got:\n{out}"
+    );
+}

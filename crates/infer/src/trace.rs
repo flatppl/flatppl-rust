@@ -5,16 +5,21 @@
 //! cycle is an error (the module is not a DAG); the offending binding gets a
 //! `(%failed …)` type so the gap is visible in annotated output.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use flatppl_core::{BindingId, Call, CallHead, Module, Node, NodeId, Phase, RefNs, Symbol, Type};
 
-use crate::Diagnostic;
 use crate::ops;
+use crate::{Diagnostic, Level};
 
 pub(crate) struct Inferencer<'m> {
     pub(crate) module: &'m mut Module,
+    pub(crate) level: Level,
     pub(crate) diags: Vec<Diagnostic>,
+    /// Inferred types/phases, local until the final level-aware flush (a
+    /// `Level::Phase` run computes types internally but never annotates them).
+    tys: HashMap<NodeId, Type>,
+    phases: HashMap<NodeId, Phase>,
     /// Bindings on the active resolution path (cycle detection).
     in_progress: Vec<BindingId>,
     /// Ops already reported as catalogue gaps (one note per op).
@@ -22,10 +27,13 @@ pub(crate) struct Inferencer<'m> {
 }
 
 impl<'m> Inferencer<'m> {
-    pub(crate) fn new(module: &'m mut Module) -> Self {
+    pub(crate) fn new(module: &'m mut Module, level: Level) -> Self {
         Inferencer {
             module,
+            level,
             diags: Vec::new(),
+            tys: HashMap::new(),
+            phases: HashMap::new(),
             in_progress: Vec::new(),
             noted_gaps: HashSet::new(),
         }
@@ -36,14 +44,29 @@ impl<'m> Inferencer<'m> {
         for id in ids {
             self.infer_binding(id);
         }
+        // Level-aware flush into the module's annotation side-tables.
+        for (&id, phase) in &self.phases {
+            self.module.set_phase(id, *phase);
+        }
+        if self.level >= Level::Type {
+            for (&id, ty) in &self.tys {
+                self.module.set_type(id, ty.clone());
+            }
+        }
         self.diags
     }
 
-    /// Type + phase of a binding's RHS (memoised via the side-tables).
+    /// The inferred type of an already-visited node (ops rules use this to
+    /// look through reified bodies).
+    pub(crate) fn lookup_type(&self, id: NodeId) -> Option<&Type> {
+        self.tys.get(&id)
+    }
+
+    /// Type + phase of a binding's RHS (memoised).
     pub(crate) fn infer_binding(&mut self, id: BindingId) -> (Type, Phase) {
         let rhs = self.module.binding(id).rhs;
-        if let (Some(ty), Some(phase)) = (self.module.type_of(rhs), self.module.phase_of(rhs)) {
-            return (ty.clone(), phase);
+        if let (Some(ty), Some(phase)) = (self.tys.get(&rhs), self.phases.get(&rhs)) {
+            return (ty.clone(), *phase);
         }
         if self.in_progress.contains(&id) {
             let path: Vec<&str> = self
@@ -60,8 +83,8 @@ impl<'m> Inferencer<'m> {
                 path.join(" → ")
             )));
             let ty = Type::Failed("reference cycle".into());
-            self.module.set_type(rhs, ty.clone());
-            self.module.set_phase(rhs, Phase::Fixed);
+            self.tys.insert(rhs, ty.clone());
+            self.phases.insert(rhs, Phase::Fixed);
             return (ty, Phase::Fixed);
         }
         self.in_progress.push(id);
@@ -70,12 +93,12 @@ impl<'m> Inferencer<'m> {
         result
     }
 
-    /// Type + phase of a node (memoised via the side-tables). Every node gets
-    /// annotated; the FlatPIR writer projects `%meta` at call positions only
-    /// (spec §11), the rest is internal to the trace.
+    /// Type + phase of a node (memoised). Every node is traced; the flush
+    /// annotates the module per level, and the FlatPIR writer projects
+    /// `%meta` at call positions only (spec §11).
     pub(crate) fn infer_node(&mut self, id: NodeId) -> (Type, Phase) {
-        if let (Some(ty), Some(phase)) = (self.module.type_of(id), self.module.phase_of(id)) {
-            return (ty.clone(), phase);
+        if let (Some(ty), Some(phase)) = (self.tys.get(&id), self.phases.get(&id)) {
+            return (ty.clone(), *phase);
         }
         // Clone the node to release the module borrow during recursion; nodes
         // are small (boxed slices of ids).
@@ -111,11 +134,11 @@ impl<'m> Inferencer<'m> {
         };
         // A cycle marker may have landed on this node while the walk was in
         // flight (see infer_binding); it is authoritative — don't clobber it.
-        if let (Some(t), Some(p)) = (self.module.type_of(id), self.module.phase_of(id)) {
-            return (t.clone(), p);
+        if let (Some(t), Some(p)) = (self.tys.get(&id), self.phases.get(&id)) {
+            return (t.clone(), *p);
         }
-        self.module.set_type(id, ty.clone());
-        self.module.set_phase(id, phase);
+        self.tys.insert(id, ty.clone());
+        self.phases.insert(id, phase);
         (ty, phase)
     }
 
@@ -162,8 +185,12 @@ impl<'m> Inferencer<'m> {
         )
     }
 
-    /// Record a catalogue gap for `op`, once.
+    /// Record a catalogue gap for `op`, once. Phase-only runs skip these —
+    /// type gaps are irrelevant when types are not requested.
     pub(crate) fn note_gap(&mut self, op: Symbol) {
+        if self.level == Level::Phase {
+            return;
+        }
         if self.noted_gaps.insert(op) {
             let name = self.module.resolve(op).to_string();
             self.diags.push(Diagnostic::note(format!(

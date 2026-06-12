@@ -6,10 +6,9 @@
 //! §07 functions (domains/results), §08 distributions (variate domains),
 //! §06 measure combinators, §04 reified callables.
 
-use flatppl_core::{
-    Call, Dim, Inputs, Module, Node, NodeId, Phase, Scalar, ScalarType, Symbol, Type,
-};
+use flatppl_core::{Call, Dim, Inputs, Node, NodeId, Phase, Scalar, ScalarType, Symbol, Type};
 
+use crate::Level;
 use crate::trace::Inferencer;
 
 /// `(node, type, phase)` of an inferred positional argument.
@@ -111,7 +110,7 @@ pub(crate) fn call_rule(
         "checked" => args.first().map_or(Type::Deferred, |(_, t, _)| t.clone()),
 
         // ---- parameters / inputs (spec §04) ----
-        "elementof" | "external" => set_element_type(inf.module, args.first().map(|a| a.0)),
+        "elementof" | "external" => set_element_type(inf, args.first().map(|a| a.0)),
 
         // ---- measure algebra (spec §06) ----
         "lawof" => Type::Measure {
@@ -152,7 +151,7 @@ pub(crate) fn call_rule(
         "broadcast" => broadcast_type(inf, args),
 
         // ---- distributions (spec §08) ----
-        _ => match distribution_domain(&name, args) {
+        _ => match distribution_domain(inf, &name, args, named) {
             Some(domain) => Type::Measure {
                 domain: Box::new(domain),
             },
@@ -335,10 +334,11 @@ fn get_type(inf: &mut Inferencer<'_>, args: &[ArgInfo], base: i64) -> Type {
 
 /// The element type of a set expression (`elementof` / `external` argument),
 /// read structurally — sets are not first-class in the type grammar.
-fn set_element_type(module: &Module, node: Option<NodeId>) -> Type {
+fn set_element_type(inf: &mut Inferencer<'_>, node: Option<NodeId>) -> Type {
     let Some(node) = node else {
         return Type::Deferred;
     };
+    let module = &*inf.module;
     match module.node(node) {
         Node::Const(sym) => match module.resolve(*sym) {
             "reals" | "posreals" | "nonnegreals" | "unitinterval" => Type::Scalar(ScalarType::Real),
@@ -350,13 +350,17 @@ fn set_element_type(module: &Module, node: Option<NodeId>) -> Type {
             _ => Type::Deferred,
         },
         Node::Call(c) => match c.head {
-            flatppl_core::CallHead::Builtin(op) => match module.resolve(op) {
+            flatppl_core::CallHead::Builtin(op) => match module.resolve(op).to_string().as_str() {
                 "interval" => Type::Scalar(ScalarType::Real),
-                "cartpow" => Type::Array {
-                    // The length needs fixed-value const-eval — next slice.
-                    shape: Box::new([Dim::Dynamic]),
-                    elem: Box::new(set_element_type(module, c.args.first().copied())),
-                },
+                "cartpow" => {
+                    let (set_arg, len_arg) = (c.args.first().copied(), c.args.get(1).copied());
+                    let elem = set_element_type(inf, set_arg);
+                    let dim = len_arg.map_or(Dim::Dynamic, |n| resolve_dim(inf, n));
+                    Type::Array {
+                        shape: Box::new([dim]),
+                        elem: Box::new(elem),
+                    }
+                }
                 _ => Type::Deferred,
             },
             _ => Type::Deferred,
@@ -384,27 +388,100 @@ fn iid_type(inf: &mut Inferencer<'_>, args: &[ArgInfo]) -> Type {
     let Some((count_node, _, _)) = args.get(1) else {
         return Type::Deferred;
     };
-    let shape: Box<[Dim]> = match inf.module.node(*count_node).clone() {
-        Node::Lit(Scalar::Int(n)) => Box::new([static_dim(n)]),
-        Node::Call(c)
-            if matches!(c.head, flatppl_core::CallHead::Builtin(op)
-                if inf.module.resolve(op) == "vector") =>
-        {
-            c.args
-                .iter()
-                .map(|&a| match inf.module.node(a) {
-                    Node::Lit(Scalar::Int(n)) => static_dim(*n),
-                    _ => Dim::Dynamic,
-                })
-                .collect()
-        }
-        _ => Box::new([Dim::Dynamic]),
-    };
     Type::Measure {
         domain: Box::new(Type::Array {
-            shape,
+            shape: count_dims(inf, *count_node),
             elem: Box::new(domain),
         }),
+    }
+}
+
+/// The dims of an `iid` count argument: a vector literal contributes one dim
+/// per element, anything else a single dim (see [`resolve_dim`]).
+fn count_dims(inf: &mut Inferencer<'_>, node: NodeId) -> Box<[Dim]> {
+    if let Node::Call(c) = inf.module.node(node)
+        && matches!(c.head, flatppl_core::CallHead::Builtin(op)
+            if inf.module.resolve(op) == "vector")
+    {
+        let elements: Vec<NodeId> = c.args.to_vec();
+        return elements.iter().map(|&a| resolve_dim(inf, a)).collect();
+    }
+    Box::new([resolve_dim(inf, node)])
+}
+
+/// A single shape dim: literal integers are static at every level; at
+/// `Level::Shape` the demand-driven fixed-integer resolver kicks in.
+fn resolve_dim(inf: &mut Inferencer<'_>, node: NodeId) -> Dim {
+    if let Node::Lit(Scalar::Int(n)) = inf.module.node(node) {
+        return static_dim(*n);
+    }
+    if inf.level >= Level::Shape {
+        if let Some(n) = resolve_fixed_int(inf, node, 0) {
+            return static_dim(n);
+        }
+    }
+    Dim::Dynamic
+}
+
+/// Demand-driven const-eval of a fixed-phase integer expression at a shape
+/// position (engine-concepts §17.1, first slice: integers only). "Resolve,
+/// don't rewrite" — the IR is read, never modified. Shape observers
+/// (`lengthof`) short-circuit off the inferred type instead of recursing
+/// into the value, so deferred-by-design computation stays deferred.
+/// `None` means not statically resolvable — a non-fixed ancestor, or a
+/// value op outside this resolver's reach (legitimately `%dynamic` for now;
+/// the op-gap-vs-dynamic distinction hardens with the full §17.1 slice).
+fn resolve_fixed_int(inf: &mut Inferencer<'_>, node: NodeId, depth: u32) -> Option<i64> {
+    if depth > 64 {
+        return None;
+    }
+    match inf.module.node(node).clone() {
+        Node::Lit(Scalar::Int(n)) => Some(n),
+        Node::Ref(r) if r.ns == flatppl_core::RefNs::SelfMod => {
+            let binding = inf.module.binding_by_name(r.name)?;
+            let rhs = inf.module.binding(binding).rhs;
+            let (_, phase) = inf.infer_node(rhs);
+            if phase == Phase::Fixed {
+                resolve_fixed_int(inf, rhs, depth + 1)
+            } else {
+                None
+            }
+        }
+        Node::Call(c) => {
+            let flatppl_core::CallHead::Builtin(op) = c.head else {
+                return None;
+            };
+            let name = inf.module.resolve(op).to_string();
+            match name.as_str() {
+                // Shape observer: read the inferred dim, never the value.
+                "lengthof" | "length" => {
+                    let arg = *c.args.first()?;
+                    match inf.infer_node(arg).0 {
+                        Type::Array { shape, .. } if shape.len() == 1 => match shape[0] {
+                            Dim::Static(n) => Some(i64::from(n)),
+                            Dim::Dynamic => None,
+                        },
+                        Type::TVector {
+                            len: Dim::Static(n),
+                            ..
+                        } => Some(i64::from(n)),
+                        _ => None,
+                    }
+                }
+                "add" | "sub" | "mul" => {
+                    let a = resolve_fixed_int(inf, *c.args.first()?, depth + 1)?;
+                    let b = resolve_fixed_int(inf, *c.args.get(1)?, depth + 1)?;
+                    match name.as_str() {
+                        "add" => a.checked_add(b),
+                        "sub" => a.checked_sub(b),
+                        _ => a.checked_mul(b),
+                    }
+                }
+                "neg" => resolve_fixed_int(inf, *c.args.first()?, depth + 1).map(|n| -n),
+                _ => None,
+            }
+        }
+        _ => None,
     }
 }
 
@@ -514,7 +591,7 @@ fn reified_result_type(inf: &mut Inferencer<'_>, mut node: NodeId) -> Option<Typ
             }
             Node::Call(c) if c.inputs.is_some() => {
                 let body = *c.args.first()?;
-                return inf.module.type_of(body).cloned();
+                return inf.lookup_type(body).cloned();
             }
             _ => return None,
         }
@@ -573,15 +650,14 @@ fn broadcast_type(inf: &mut Inferencer<'_>, args: &[ArgInfo]) -> Type {
 
 /// The variate domain of a spec-§08 distribution constructor, or `None` when
 /// the name is not a known distribution.
-fn distribution_domain(name: &str, args: &[ArgInfo]) -> Option<Type> {
+fn distribution_domain(
+    inf: &mut Inferencer<'_>,
+    name: &str,
+    args: &[ArgInfo],
+    named: &[NamedInfo],
+) -> Option<Type> {
     use ScalarType::*;
     let scalar = |s: ScalarType| Some(Type::Scalar(s));
-    let dynvec = |s: ScalarType| {
-        Some(Type::Array {
-            shape: Box::new([Dim::Dynamic]),
-            elem: Box::new(Type::Scalar(s)),
-        })
-    };
     let dynmat = || {
         Some(Type::Array {
             shape: Box::new([Dim::Dynamic, Dim::Dynamic]),
@@ -600,13 +676,45 @@ fn distribution_domain(name: &str, args: &[ArgInfo]) -> Option<Type> {
         "Bernoulli" => scalar(Boolean),
         "Categorical" | "Categorical0" | "Binomial" | "Geometric" | "NegativeBinomial"
         | "NegativeBinomial2" | "Poisson" => scalar(Integer),
-        // Multivariate — lengths need const-eval (next slice); dynamic dims.
+        // Multivariate — at Level::Shape the dim comes from the length
+        // parameter's inferred type (`mu` / `alpha` / `p`).
         "MvNormal" | "Dirichlet" => {
-            let _ = args;
-            dynvec(Real)
+            let dim = param_dim(
+                inf,
+                args,
+                named,
+                if name == "MvNormal" { "mu" } else { "alpha" },
+            );
+            Some(Type::Array {
+                shape: Box::new([dim]),
+                elem: Box::new(Type::Scalar(Real)),
+            })
         }
-        "Multinomial" => dynvec(Integer),
+        "Multinomial" => {
+            let dim = param_dim(inf, args, named, "p");
+            Some(Type::Array {
+                shape: Box::new([dim]),
+                elem: Box::new(Type::Scalar(Integer)),
+            })
+        }
         "Wishart" | "InverseWishart" | "LKJ" | "LKJCholesky" => dynmat(),
         _ => None,
+    }
+}
+
+/// The static dim of a distribution's length-defining parameter (`mu`,
+/// `alpha`, `p`): its inferred type's single array dim, at `Level::Shape`.
+fn param_dim(inf: &Inferencer<'_>, args: &[ArgInfo], named: &[NamedInfo], kwarg: &str) -> Dim {
+    if inf.level < Level::Shape {
+        return Dim::Dynamic;
+    }
+    let ty = named
+        .iter()
+        .find(|(n, _, _, _)| inf.module.resolve(*n) == kwarg)
+        .map(|(_, _, t, _)| t)
+        .or_else(|| args.first().map(|(_, t, _)| t));
+    match ty {
+        Some(Type::Array { shape, .. }) if shape.len() == 1 => shape[0],
+        _ => Dim::Dynamic,
     }
 }

@@ -51,7 +51,33 @@ enum Command {
         input: PathBuf,
         /// Output file (`.flatpir` — FlatPPL cannot carry annotations)
         output: PathBuf,
+        /// Inference level — a hierarchy, each including the previous:
+        /// `phase` classifies bindings only (types stay `%deferred`),
+        /// `type` adds structural types (literal dims only), `shape` also
+        /// resolves fixed-phase dims (`iid` counts, distribution lengths).
+        #[arg(long, value_enum, default_value_t = InferLevel::Shape)]
+        level: InferLevel,
     },
+}
+
+/// CLI mirror of [`flatppl_infer::Level`] (the library stays clap-free).
+#[cfg(feature = "infer")]
+#[derive(Clone, Copy, ValueEnum)]
+enum InferLevel {
+    Phase,
+    Type,
+    Shape,
+}
+
+#[cfg(feature = "infer")]
+impl From<InferLevel> for flatppl_infer::Level {
+    fn from(level: InferLevel) -> Self {
+        match level {
+            InferLevel::Phase => flatppl_infer::Level::Phase,
+            InferLevel::Type => flatppl_infer::Level::Type,
+            InferLevel::Shape => flatppl_infer::Level::Shape,
+        }
+    }
 }
 
 /// CLI mirror of [`flatppl_syntax::Syntax`] (the library stays clap-free).
@@ -126,7 +152,11 @@ fn main() -> ExitCode {
             syntax,
         } => convert(&input, &output, syntax.into()),
         #[cfg(feature = "infer")]
-        Command::Infer { input, output } => infer_cmd(&input, &output),
+        Command::Infer {
+            input,
+            output,
+            level,
+        } => infer_cmd(&input, &output, level.into()),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -222,7 +252,7 @@ fn convert(input: &Path, output: &Path, syntax: flatppl_syntax::Syntax) -> Resul
 /// `flatppl infer <in> <out.flatpir>` — run the type/phase trace, report
 /// diagnostics, write annotated FlatPIR.
 #[cfg(feature = "infer")]
-fn infer_cmd(input: &Path, output: &Path) -> Result<(), Failure> {
+fn infer_cmd(input: &Path, output: &Path, level: flatppl_infer::Level) -> Result<(), Failure> {
     let from = Format::from_path(input)?;
     if !matches!(Format::from_path(output)?, Format::FlatPir) {
         return Err(Failure::Plain(format!(
@@ -246,7 +276,7 @@ fn infer_cmd(input: &Path, output: &Path) -> Result<(), Failure> {
         }
     };
 
-    let diags = flatppl_infer::infer(&mut module);
+    let diags = flatppl_infer::infer_with(&mut module, level);
     let mut errors = 0u32;
     for d in &diags {
         match d.severity {
