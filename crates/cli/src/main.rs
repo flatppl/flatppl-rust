@@ -52,9 +52,12 @@ enum Command {
         /// Output file (`.flatpir` — FlatPPL cannot carry annotations)
         output: PathBuf,
         /// Inference level — a hierarchy, each including the previous:
-        /// `phase` classifies bindings only (types stay `%deferred`),
-        /// `type` adds structural types (literal dims only), `shape` also
-        /// resolves fixed-phase dims (`iid` counts, distribution lengths).
+        /// `phase` classifies bindings only (types stay `%deferred`);
+        /// `type` adds structural types (literal dims only); `valueset`
+        /// adds the strongest known value set per node (the third `%meta`
+        /// slot); `normalization` adds total-mass classes on measure and
+        /// kernel types; `shape` also resolves fixed-phase dims (`iid`
+        /// counts, distribution lengths).
         #[arg(long, value_enum, default_value_t = InferLevel::Shape)]
         level: InferLevel,
     },
@@ -66,6 +69,8 @@ enum Command {
 enum InferLevel {
     Phase,
     Type,
+    Valueset,
+    Normalization,
     Shape,
 }
 
@@ -75,6 +80,8 @@ impl From<InferLevel> for flatppl_infer::Level {
         match level {
             InferLevel::Phase => flatppl_infer::Level::Phase,
             InferLevel::Type => flatppl_infer::Level::Type,
+            InferLevel::Valueset => flatppl_infer::Level::Valueset,
+            InferLevel::Normalization => flatppl_infer::Level::Normalization,
             InferLevel::Shape => flatppl_infer::Level::Shape,
         }
     }
