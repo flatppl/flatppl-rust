@@ -13,6 +13,9 @@ pub struct Error {
     pub message: String,
     /// 1-based source line, or `0` when the error is not tied to a position.
     pub line: usize,
+    /// Byte span `[start, end)` into the source, when known. Renderers fall
+    /// back to highlighting all of `line` when absent.
+    pub span: Option<(u32, u32)>,
 }
 
 impl Error {
@@ -21,6 +24,7 @@ impl Error {
         Error {
             message: message.into(),
             line: 0,
+            span: None,
         }
     }
 
@@ -29,6 +33,16 @@ impl Error {
         Error {
             message: message.into(),
             line,
+            span: None,
+        }
+    }
+
+    /// An error at a known 1-based source line and byte span.
+    pub fn at_span(line: usize, span: (u32, u32), message: impl Into<String>) -> Self {
+        Error {
+            message: message.into(),
+            line,
+            span: Some(span),
         }
     }
 }

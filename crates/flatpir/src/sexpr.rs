@@ -55,6 +55,8 @@ struct Parser {
     src: Vec<char>,
     pos: usize,
     line: usize,
+    /// Byte offset of the cursor (UTF-8 aware), for error spans.
+    byte: u32,
 }
 
 impl Parser {
@@ -63,7 +65,13 @@ impl Parser {
             src: input.chars().collect(),
             pos: 0,
             line: 1,
+            byte: 0,
         }
+    }
+
+    /// An error spanning the single character at the cursor.
+    fn err_here(&self, message: impl Into<String>) -> Error {
+        Error::at_span(self.line, (self.byte, self.byte + 1), message)
     }
 
     fn at_end(&self) -> bool {
@@ -78,6 +86,7 @@ impl Parser {
         let c = self.src.get(self.pos).copied();
         if let Some(ch) = c {
             self.pos += 1;
+            self.byte += ch.len_utf8() as u32;
             if ch == '\n' {
                 self.line += 1;
             }
@@ -106,15 +115,16 @@ impl Parser {
     fn parse_form(&mut self) -> Result<Sexpr> {
         match self.peek() {
             Some('(') => self.parse_list(),
-            Some(')') => Err(Error::at(self.line, "unexpected `)`")),
+            Some(')') => Err(self.err_here("unexpected `)`")),
             Some('"') => self.parse_string(),
             Some(_) => self.parse_atom(),
-            None => Err(Error::at(self.line, "unexpected end of input")),
+            None => Err(self.err_here("unexpected end of input")),
         }
     }
 
     fn parse_list(&mut self) -> Result<Sexpr> {
         let open_line = self.line;
+        let open_byte = self.byte;
         self.bump(); // consume '('
         let mut items = Vec::new();
         loop {
@@ -124,7 +134,13 @@ impl Parser {
                     self.bump();
                     return Ok(Sexpr::List(items));
                 }
-                None => return Err(Error::at(open_line, "unclosed `(`")),
+                None => {
+                    return Err(Error::at_span(
+                        open_line,
+                        (open_byte, open_byte + 1),
+                        "unclosed `(`",
+                    ));
+                }
                 _ => items.push(self.parse_form()?),
             }
         }
@@ -132,12 +148,14 @@ impl Parser {
 
     fn parse_string(&mut self) -> Result<Sexpr> {
         let open_line = self.line;
+        let open_byte = self.byte;
         self.bump(); // consume opening '"'
         let mut s = String::new();
         loop {
             match self.bump() {
                 Some('"') => return Ok(Sexpr::Str(s)),
                 Some('\\') => match self.bump() {
+                    // (escape span: backslash is 1 byte, the escaped char follows)
                     Some('"') => s.push('"'),
                     Some('\\') => s.push('\\'),
                     Some('n') => s.push('\n'),
@@ -145,15 +163,29 @@ impl Parser {
                     Some('r') => s.push('\r'),
                     Some('0') => s.push('\0'),
                     Some(other) => {
-                        return Err(Error::at(
+                        let end = self.byte;
+                        return Err(Error::at_span(
                             self.line,
+                            (end - 1 - other.len_utf8() as u32, end),
                             format!("invalid string escape `\\{other}`"),
                         ));
                     }
-                    None => return Err(Error::at(open_line, "unterminated string")),
+                    None => {
+                        return Err(Error::at_span(
+                            open_line,
+                            (open_byte, open_byte + 1),
+                            "unterminated string",
+                        ));
+                    }
                 },
                 Some(c) => s.push(c),
-                None => return Err(Error::at(open_line, "unterminated string")),
+                None => {
+                    return Err(Error::at_span(
+                        open_line,
+                        (open_byte, open_byte + 1),
+                        "unterminated string",
+                    ));
+                }
             }
         }
     }

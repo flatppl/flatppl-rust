@@ -153,6 +153,20 @@ impl Lexer {
         c
     }
 
+    /// An error spanning byte offset `start` to the current position
+    /// (widened to at least the character under the cursor, so an
+    /// unconsumed offending character is still covered).
+    fn err_span(&self, start: u32, line: u32, message: impl Into<String>) -> Error {
+        let here = self.offsets[self.pos.min(self.chars.len())];
+        let next = self.offsets[(self.pos + 1).min(self.chars.len())];
+        let end = if here > start {
+            here
+        } else {
+            next.max(start + 1)
+        };
+        Error::at_span(line, (start, end), message)
+    }
+
     fn run(mut self) -> Result<Vec<Token>> {
         loop {
             self.skip_inline_ws_and_comments()?;
@@ -234,11 +248,17 @@ impl Lexer {
 
     fn skip_block_comment(&mut self) -> Result<()> {
         let open = self.line;
+        let open_start = self.byte_pos();
         // Consume the opening `###` line.
         self.consume_to_newline();
         loop {
             if self.peek().is_none() {
-                return Err(Error::at(open, "unterminated `###` block comment"));
+                // Point at the opening fence, not the whole runaway block.
+                return Err(Error::at_span(
+                    open,
+                    (open_start, open_start + 3),
+                    "unterminated `###` block comment",
+                ));
             }
             // A line whose trimmed content is exactly `###` closes the block.
             if self.at_line_start_fence('#') {
@@ -430,7 +450,7 @@ impl Lexer {
                     self.bump();
                     self.push(TokenKind::AmpAmp, start, line);
                 } else {
-                    return Err(Error::at(line, "unexpected `&` (did you mean `&&`?)"));
+                    return Err(self.err_span(start, line, "unexpected `&` (did you mean `&&`?)"));
                 }
             }
             '|' => {
@@ -439,10 +459,12 @@ impl Lexer {
                     self.bump();
                     self.push(TokenKind::PipePipe, start, line);
                 } else {
-                    return Err(Error::at(line, "unexpected `|` (did you mean `||`?)"));
+                    return Err(self.err_span(start, line, "unexpected `|` (did you mean `||`?)"));
                 }
             }
-            other => return Err(Error::at(line, format!("unexpected character `{other}`"))),
+            other => {
+                return Err(self.err_span(start, line, format!("unexpected character `{other}`")));
+            }
         }
         Ok(())
     }
@@ -517,7 +539,7 @@ impl Lexer {
                     self.bump();
                     TokenKind::DotEqEq
                 } else {
-                    return Err(Error::at(line, "`.=` is not an operator"));
+                    return Err(self.err_span(start, line, "`.=` is not an operator"));
                 }
             }
             '!' => {
@@ -535,7 +557,7 @@ impl Lexer {
                     self.bump();
                     TokenKind::DotAmpAmp
                 } else {
-                    return Err(Error::at(line, "`.&` is not an operator"));
+                    return Err(self.err_span(start, line, "`.&` is not an operator"));
                 }
             }
             '|' => {
@@ -544,10 +566,10 @@ impl Lexer {
                     self.bump();
                     TokenKind::DotPipePipe
                 } else {
-                    return Err(Error::at(line, "`.|` is not an operator"));
+                    return Err(self.err_span(start, line, "`.|` is not an operator"));
                 }
             }
-            _ => return Err(Error::at(line, format!("`.{op}` is not an operator"))),
+            _ => return Err(self.err_span(start, line, format!("`.{op}` is not an operator"))),
         };
         self.push(kind, start, line);
         Ok(())
@@ -566,7 +588,7 @@ impl Lexer {
             let text: String = self.chars[begin..self.pos].iter().collect();
             let digits: String = text[2..].chars().filter(|&c| c != '_').collect();
             let v = i64::from_str_radix(&digits, 16)
-                .map_err(|_| Error::at(line, format!("invalid hex integer `{text}`")))?;
+                .map_err(|_| self.err_span(start, line, format!("invalid hex integer `{text}`")))?;
             self.push(TokenKind::Int(v), start, line);
             return Ok(());
         }
@@ -596,14 +618,14 @@ impl Lexer {
         let text: String = self.chars[begin..self.pos].iter().collect();
         let cleaned: String = text.chars().filter(|&c| c != '_').collect();
         let kind = if is_real {
-            let v: f64 = cleaned
-                .parse()
-                .map_err(|_| Error::at(line, format!("invalid real literal `{text}`")))?;
+            let v: f64 = cleaned.parse().map_err(|_| {
+                self.err_span(start, line, format!("invalid real literal `{text}`"))
+            })?;
             TokenKind::Real(v)
         } else {
-            let v: i64 = cleaned
-                .parse()
-                .map_err(|_| Error::at(line, format!("invalid integer literal `{text}`")))?;
+            let v: i64 = cleaned.parse().map_err(|_| {
+                self.err_span(start, line, format!("invalid integer literal `{text}`"))
+            })?;
             TokenKind::Int(v)
         };
         self.push(kind, start, line);
@@ -627,12 +649,16 @@ impl Lexer {
                     Some('r') => s.push('\r'),
                     Some('0') => s.push('\0'),
                     Some(o) => {
-                        return Err(Error::at(line, format!("invalid string escape `\\{o}`")));
+                        return Err(self.err_span(
+                            start,
+                            line,
+                            format!("invalid string escape `\\{o}`"),
+                        ));
                     }
-                    None => return Err(Error::at(line, "unterminated string")),
+                    None => return Err(self.err_span(start, line, "unterminated string")),
                 },
                 Some(c) => s.push(c),
-                None => return Err(Error::at(line, "unterminated string")),
+                None => return Err(self.err_span(start, line, "unterminated string")),
             }
         }
     }
@@ -663,7 +689,12 @@ impl Lexer {
             let mut lines = Vec::new();
             loop {
                 if self.peek().is_none() {
-                    return Err(Error::at(line, "unterminated `%%%` doc block"));
+                    // Point at the opening fence, not the whole runaway block.
+                    return Err(Error::at_span(
+                        line,
+                        (start, start + 3),
+                        "unterminated `%%%` doc block",
+                    ));
                 }
                 if self.at_line_start_fence('%') {
                     self.consume_to_newline();

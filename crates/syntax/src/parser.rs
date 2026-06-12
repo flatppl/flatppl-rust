@@ -28,6 +28,12 @@ use flatppl_core::{
 use crate::error::{Error, Result};
 use crate::token::{self, Doc, Token, TokenKind};
 
+/// An error anchored to `tok`'s span (widened to one byte for the
+/// zero-width Eof token).
+fn err_at(tok: &Token, message: impl Into<String>) -> Error {
+    Error::at_span(tok.line, (tok.start, tok.end.max(tok.start + 1)), message)
+}
+
 /// Parse canonical FlatPPL surface text into a [`Module`].
 pub fn parse(input: &str) -> Result<Module> {
     let tokens = token::tokenize(input)?;
@@ -101,21 +107,18 @@ fn split_statements(tokens: &[Token]) -> Result<Vec<Stmt>> {
             TokenKind::Doc(doc) => {
                 if doc.trailing {
                     if pending_leading.is_some() || trailing.is_some() {
-                        return Err(Error::at(
-                            tok.line,
+                        return Err(err_at(
+                            tok,
                             "a binding may carry at most one doc-comment \
                              (leading or trailing, not both)",
                         ));
                     }
                     trailing = Some(doc.clone());
                 } else if !cur.is_empty() {
-                    return Err(Error::at(
-                        tok.line,
-                        "a doc-comment may not interrupt a statement",
-                    ));
+                    return Err(err_at(tok, "a doc-comment may not interrupt a statement"));
                 } else if pending_leading.is_some() {
-                    return Err(Error::at(
-                        tok.line,
+                    return Err(err_at(
+                        tok,
                         "only one doc-comment may precede a binding \
                          (use a `%%%` block for multi-line content)",
                     ));
@@ -185,13 +188,15 @@ fn collect_lhs_names(stmt: &Stmt, names: &mut Names) {
 
 fn lower_statement(module: &mut Module, stmt: &Stmt, names: &Names, synth: &mut u32) -> Result<()> {
     let toks = &stmt.tokens;
-    let line = toks.first().map_or(0, |t| t.line);
 
-    // LHS: leading `Name (',' Name)*`, then the binding operator.
+    // LHS: leading `Name (',' Name)*`, then the binding operator. The token
+    // of each name rides along to anchor binding-name diagnostics.
     let mut lhs = Vec::new();
+    let mut lhs_toks = Vec::new();
     let mut i = 0;
     while let Some(TokenKind::Name(n)) = toks.get(i).map(|t| &t.kind) {
         lhs.push(n.clone());
+        lhs_toks.push(&toks[i]);
         i += 1;
         if matches!(toks.get(i).map(|t| &t.kind), Some(TokenKind::Comma)) {
             i += 1;
@@ -203,9 +208,12 @@ fn lower_statement(module: &mut Module, stmt: &Stmt, names: &Names, synth: &mut 
         // `C[.i, .k] := expr` — sum-aggregate.
         Some(TokenKind::LBracket) => {
             if lhs.len() != 1 {
-                return Err(Error::at(line, "an aggregate target must be a single name"));
+                return Err(err_at(
+                    &toks[0],
+                    "an aggregate target must be a single name",
+                ));
             }
-            check_binding_name(&lhs[0], line)?;
+            check_binding_name(&lhs[0], lhs_toks[0])?;
             let mut ep = ExprParser::new(&toks[i..], module, names);
             let rhs = ep.parse_aggregate()?;
             ep.expect_end()?;
@@ -217,19 +225,19 @@ fn lower_statement(module: &mut Module, stmt: &Stmt, names: &Names, synth: &mut 
         // leading name is a *reference* to the metric, not a binding.
         Some(TokenKind::Colon) => {
             if lhs.len() != 1 {
-                return Err(Error::at(line, "a metricsum metric must be a single name"));
+                return Err(err_at(&toks[0], "a metricsum metric must be a single name"));
             }
             let mut ep = ExprParser::new(&toks[i + 1..], module, names);
             let result = ep.expect_name("a result name after the metric `:`")?;
-            check_binding_name(&result, line)?;
+            check_binding_name(&result, ep.prev_token().unwrap_or(&toks[0]))?;
             let rhs = ep.parse_metricsum(&lhs[0])?;
             ep.expect_end()?;
             bind_name(module, &result, rhs, stmt.doc.as_ref(), synth);
             Ok(())
         }
         Some(op @ (TokenKind::Assign | TokenKind::Tilde)) => {
-            for name in &lhs {
-                check_binding_name(name, line)?;
+            for (name, tok) in lhs.iter().zip(&lhs_toks) {
+                check_binding_name(name, tok)?;
             }
             let is_tilde = matches!(op, TokenKind::Tilde);
             let mut ep = ExprParser::new(&toks[i + 1..], module, names);
@@ -241,14 +249,14 @@ fn lower_statement(module: &mut Module, stmt: &Stmt, names: &Names, synth: &mut 
             if lhs.len() == 1 {
                 bind_name(module, &lhs[0], rhs, stmt.doc.as_ref(), synth);
             } else if lhs.is_empty() {
-                return Err(Error::at(line, "binding has no name"));
+                return Err(err_at(&toks[0], "binding has no name"));
             } else {
                 lower_decomposition(module, &lhs, rhs, synth);
             }
             Ok(())
         }
-        _ => Err(Error::at(
-            line,
+        _ => Err(err_at(
+            toks.get(i).unwrap_or(&toks[0]),
             "expected `=`, `~`, or `[…] :=` after the binding name",
         )),
     }
@@ -257,19 +265,19 @@ fn lower_statement(module: &mut Module, stmt: &Stmt, names: &Names, synth: &mut 
 /// Reject names that cannot be bound: reserved words (spec §05), the reserved
 /// modules `self` / `base` (spec §04), and the placeholder lexical class
 /// (spec §04 binding names). `_` is allowed — it discards (see [`bind_name`]).
-fn check_binding_name(name: &str, line: u32) -> Result<()> {
+fn check_binding_name(name: &str, tok: &Token) -> Result<()> {
     match name {
         "_" => Ok(()),
-        "true" | "false" | "in" | "all" | "only" => Err(Error::at(
-            line,
+        "true" | "false" | "in" | "all" | "only" => Err(err_at(
+            tok,
             format!("`{name}` is a reserved word and cannot be bound"),
         )),
-        "self" | "base" => Err(Error::at(
-            line,
+        "self" | "base" => Err(err_at(
+            tok,
             format!("`{name}` is a reserved module name and cannot be bound"),
         )),
-        _ if is_placeholder(name) => Err(Error::at(
-            line,
+        _ if is_placeholder(name) => Err(err_at(
+            tok,
             format!("placeholder `{name}` cannot be a module-level binding"),
         )),
         _ => Ok(()),
@@ -425,11 +433,27 @@ impl<'a> ExprParser<'a> {
         self.toks.get(self.pos + n).map(|t| &t.kind)
     }
 
-    fn line(&self) -> u32 {
-        self.toks
-            .get(self.pos)
-            .or_else(|| self.toks.last())
-            .map_or(0, |t| t.line)
+    /// An error anchored to the token at the cursor (or the last token when
+    /// the cursor has run off the end of the slice).
+    fn err_here(&self, message: impl Into<String>) -> Error {
+        match self.toks.get(self.pos).or_else(|| self.toks.last()) {
+            Some(t) => err_at(t, message),
+            None => Error::new(message),
+        }
+    }
+
+    /// An error anchored to the most recently consumed token — for
+    /// "this thing you just wrote is invalid" diagnostics.
+    fn err_prev(&self, message: impl Into<String>) -> Error {
+        match self.prev_token() {
+            Some(t) => err_at(t, message),
+            None => Error::new(message),
+        }
+    }
+
+    /// The most recently consumed token, if any.
+    fn prev_token(&self) -> Option<&Token> {
+        self.toks.get(self.pos.saturating_sub(1))
     }
 
     fn advance(&mut self) {
@@ -449,7 +473,7 @@ impl<'a> ExprParser<'a> {
         if self.eat(kind) {
             Ok(())
         } else {
-            Err(Error::at(self.line(), format!("expected {what}")))
+            Err(self.err_here(format!("expected {what}")))
         }
     }
 
@@ -457,10 +481,7 @@ impl<'a> ExprParser<'a> {
         if self.pos >= self.toks.len() {
             Ok(())
         } else {
-            Err(Error::at(
-                self.line(),
-                "unexpected trailing tokens in expression",
-            ))
+            Err(self.err_here("unexpected trailing tokens in expression"))
         }
     }
 
@@ -525,10 +546,9 @@ impl<'a> ExprParser<'a> {
             return Ok(None);
         }
         if params.len() == 1 {
-            return Err(Error::at(
-                self.line(),
-                "`(arg) -> expr` is not valid lambda syntax; write `arg -> expr`",
-            ));
+            return Err(
+                self.err_here("`(arg) -> expr` is not valid lambda syntax; write `arg -> expr`")
+            );
         }
         for p in &params {
             self.check_lambda_param(p)?;
@@ -543,10 +563,7 @@ impl<'a> ExprParser<'a> {
             "_" | "true" | "false" | "in" | "all" | "only" | "self" | "base"
         );
         if reserved || is_placeholder(name) {
-            return Err(Error::at(
-                self.line(),
-                format!("`{name}` cannot be a lambda argument name"),
-            ));
+            return Err(self.err_here(format!("`{name}` cannot be a lambda argument name")));
         }
         Ok(())
     }
@@ -594,10 +611,7 @@ impl<'a> ExprParser<'a> {
         let body = body?;
         self.expect(&TokenKind::RParen, "`)` to close `fn(…)`")?;
         if entries.is_empty() {
-            return Err(Error::at(
-                self.line(),
-                "`fn(…)` requires at least one `_` hole in its expression",
-            ));
+            return Err(self.err_prev("`fn(…)` requires at least one `_` hole in its expression"));
         }
         let head = CallHead::Builtin(self.module.intern("functionof"));
         Ok(self.module.alloc(Node::Call(Call {
@@ -676,10 +690,7 @@ impl<'a> ExprParser<'a> {
         // Chained: AND together each adjacent comparison (plain only; dotted
         // chains are unusual and not lowered here).
         if dotted {
-            return Err(Error::at(
-                self.line(),
-                "chained dotted comparisons are not supported",
-            ));
+            return Err(self.err_here("chained dotted comparisons are not supported"));
         }
         let mut terms = Vec::with_capacity(ops.len());
         for (k, func) in ops.iter().enumerate() {
@@ -894,16 +905,14 @@ impl<'a> ExprParser<'a> {
             // A leading `.name` is an axis label (legal inside aggregate bodies /
             // indexing); a `.name` *after* an expression is field access (postfix).
             Some(TokenKind::Dot) => self.parse_axis_node(),
-            other => Err(Error::at(
-                self.line(),
-                format!("expected an expression, found {}", describe(other)),
-            )),
+            other => {
+                Err(self.err_here(format!("expected an expression, found {}", describe(other))))
+            }
         }
     }
 
     fn parse_axis_node(&mut self) -> Result<NodeId> {
         self.advance(); // .
-        let line = self.line();
         let mut name = self.expect_name("an axis name after `.`")?;
         // Variance markers (spec §05 axis names): a trailing `_` in the lexed
         // name is the lower marker (axis names themselves may not end in `_`);
@@ -918,10 +927,9 @@ impl<'a> ExprParser<'a> {
         let valid =
             !name.is_empty() && name.as_bytes()[0].is_ascii_alphabetic() && !name.ends_with('_');
         if !valid {
-            return Err(Error::at(
-                line,
-                format!("invalid axis name `.{name}`: must start with a letter and not end in `_`"),
-            ));
+            return Err(self.err_prev(format!(
+                "invalid axis name `.{name}`: must start with a letter and not end in `_`"
+            )));
         }
         let sym = self.module.intern(&name);
         Ok(self.module.alloc(Node::Axis(Axis {
@@ -1070,7 +1078,7 @@ impl<'a> ExprParser<'a> {
                 } else {
                     "`_` hole is only valid inside `fn(…)`"
                 };
-                return Err(Error::at(self.line(), msg));
+                return Err(self.err_prev(msg));
             }
             let Some(ReifyFrame::Fn(entries)) = self.reify_frames.last_mut() else {
                 unreachable!("checked above");
@@ -1107,14 +1115,11 @@ impl<'a> ExprParser<'a> {
             return Ok(self.module.alloc(Node::Ref(r)));
         }
         if self.reify_frames.iter().any(lambda_arg) {
-            return Err(Error::at(
-                self.line(),
-                format!(
-                    "`{name}` is an argument of an enclosing lambda and cannot be referenced \
+            return Err(self.err_prev(format!(
+                "`{name}` is an argument of an enclosing lambda and cannot be referenced \
                      inside a nested reification (placeholders are scoped to the nearest \
                      enclosing `functionof`)"
-                ),
-            ));
+            )));
         }
 
         if matches!(self.peek(), Some(TokenKind::LParen)) {
@@ -1213,10 +1218,9 @@ impl<'a> ExprParser<'a> {
         // to phase inference).
         if name == "functionof" || name == "kernelof" {
             if positional.len() != 1 {
-                return Err(Error::at(
-                    self.line(),
-                    format!("`{name}` takes exactly one expression to reify"),
-                ));
+                return Err(
+                    self.err_here(format!("`{name}` takes exactly one expression to reify"))
+                );
             }
             let inputs = if named.is_empty() {
                 Inputs::Auto
@@ -1224,9 +1228,7 @@ impl<'a> ExprParser<'a> {
                 let mut entries = Vec::with_capacity(named.len());
                 for n in &named {
                     let Node::Ref(r) = self.module.node(n.value) else {
-                        return Err(Error::at(
-                            self.line(),
-                            format!(
+                        return Err(self.err_here(format!(
                                 "`{name}` boundary input `{}` must be a module binding or a placeholder",
                                 self.module.resolve(n.name)
                             ),
@@ -1353,7 +1355,7 @@ impl<'a> ExprParser<'a> {
                 self.advance();
                 Ok(n)
             }
-            _ => Err(Error::at(self.line(), format!("expected {what}"))),
+            _ => Err(self.err_here(format!("expected {what}"))),
         }
     }
 }
