@@ -269,3 +269,15 @@ fn broadcast_user_kernel_head_with_keyword_data() {
         "got:\n{out}"
     );
 }
+
+#[test]
+fn weighted_types_from_its_base_measure() {
+    // §06: weighted(weight, base) — the measure is the SECOND argument.
+    let src = "f = fn(_ * 2.0)\nm = normalize(weighted(f, Lebesgue(reals)))";
+    let (module, _) = infer_src(src);
+    let out = flatppl_flatpir::write(&module);
+    assert!(
+        out.contains("(normalize (%meta (%measure (%domain (%scalar real))) %fixed)"),
+        "got:\n{out}"
+    );
+}

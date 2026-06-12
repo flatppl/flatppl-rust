@@ -118,9 +118,14 @@ pub(crate) fn call_rule(
         },
         "draw" => measure_domain(arg_ty(args, 0)),
         "iid" => iid_type(inf, args),
-        "truncate" | "weight" | "normalize" => {
-            args.first().map_or(Type::Deferred, |(_, t, _)| t.clone())
-        }
+        "truncate" | "normalize" => args.first().map_or(Type::Deferred, |(_, t, _)| t.clone()),
+        // `weighted(weight, base)` / `logweighted(logweight, base)` (spec
+        // §06): the measure is the SECOND argument.
+        "weighted" | "logweighted" => arg_ty(args, 1).cloned().unwrap_or(Type::Deferred),
+        // Reference measures (spec §06): measures over their support set.
+        "Lebesgue" | "Counting" => Type::Measure {
+            domain: Box::new(set_element_type(inf, args.first().map(|a| a.0))),
+        },
         // `bayesupdate(L, prior)` (spec §06): the unnormalized posterior is a
         // measure over the prior's domain — pick the measure-typed argument.
         "bayesupdate" => args
