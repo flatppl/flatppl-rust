@@ -370,3 +370,99 @@ fn level_valueset_vs_normalization() {
     let out = flatppl_flatpir::write(&module);
     assert!(out.contains("(%mass %normalized)"), "got:\n{out}");
 }
+
+// ---- coverage hardening ----
+
+/// Inference must be total over the whole surface fixture corpus: no panics,
+/// no error diagnostics, and the ANNOTATED output must survive a strict
+/// FlatPIR read → write round-trip (exercising the three-slot %meta and
+/// %mass forms on arbitrary real models, not just the goldens).
+#[test]
+fn corpus_inference_smoke_and_annotated_roundtrip() {
+    let dir: PathBuf = [env!("CARGO_MANIFEST_DIR"), "../../fixtures/flatppl"]
+        .iter()
+        .collect();
+    for entry in fs::read_dir(&dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|e| e.to_str()) != Some("flatppl") {
+            continue;
+        }
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let src = fs::read_to_string(&path).unwrap();
+        let mut module = flatppl_syntax::parse(&src).unwrap();
+        let diags = infer(&mut module);
+        let errors: Vec<_> = diags
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .collect();
+        assert!(errors.is_empty(), "{name}: {errors:?}");
+
+        let annotated = flatppl_flatpir::write(&module);
+        let reread = flatppl_flatpir::read(&annotated)
+            .unwrap_or_else(|e| panic!("{name}: annotated output unreadable: {e}\n{annotated}"));
+        assert_eq!(
+            flatppl_flatpir::write(&reread),
+            annotated,
+            "{name}: annotated FlatPIR is not a write fixpoint"
+        );
+    }
+}
+
+#[test]
+fn l1unit_simplex_guard() {
+    // Literal nonnegative weights widen to a common named set, so the
+    // simplex guard fires; a negative entry defeats it (natural fallback).
+    let (module, _) = infer_src("w = l1unit([0.3, 0.7])");
+    let out = flatppl_flatpir::write(&module);
+    assert!(
+        out.contains("(l1unit (%meta (%array 1 (2) (%scalar real)) %fixed (stdsimplex 2))"),
+        "got:\n{out}"
+    );
+
+    let (module, _) = infer_src("w = l1unit([0.3, -0.7])");
+    let out = flatppl_flatpir::write(&module);
+    assert!(
+        out.contains("(l1unit (%meta (%array 1 (2) (%scalar real)) %fixed (cartpow reals 2))"),
+        "got:\n{out}"
+    );
+}
+
+#[test]
+fn weighted_fixed_scalar_mass_rules() {
+    // A fixed scalar weight rescales: classes survive, %normalized demotes
+    // to %finite (the constant is unknown); a function weight is %unknown.
+    let src = "a = weighted(2.5, Lebesgue(reals))\n\
+               b = weighted(2.5, Normal(0.0, 1.0))";
+    let (module, _) = infer_src(src);
+    let out = flatppl_flatpir::write(&module);
+    assert!(
+        out.contains(
+            "(%bind a (weighted (%meta (%measure (%domain (%scalar real)) (%mass %locallyfinite))"
+        ),
+        "got:\n{out}"
+    );
+    assert!(
+        out.contains(
+            "(%bind b (weighted (%meta (%measure (%domain (%scalar real)) (%mass %finite))"
+        ),
+        "got:\n{out}"
+    );
+}
+
+#[test]
+fn joint_mass_products() {
+    let src = "j1 = joint(a = Normal(0.0, 1.0), b = Beta(1.0, 1.0))\n\
+               j2 = joint(a = Normal(0.0, 1.0), b = Lebesgue(reals))";
+    let (module, _) = infer_src(src);
+    let out = flatppl_flatpir::write(&module);
+    // normalized × normalized = normalized; normalized × locallyfinite =
+    // locallyfinite (Normal ⊗ Lebesgue is infinite but boundedly finite).
+    assert!(
+        out.contains("(%bind j1 (joint (%meta (%measure (%domain (%record (a (%scalar real)) (b (%scalar real)))) (%mass %normalized))"),
+        "got:\n{out}"
+    );
+    assert!(
+        out.contains("(%bind j2 (joint (%meta (%measure (%domain (%record (a (%scalar real)) (b (%scalar real)))) (%mass %locallyfinite))"),
+        "got:\n{out}"
+    );
+}

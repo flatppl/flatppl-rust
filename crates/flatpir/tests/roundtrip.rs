@@ -162,3 +162,47 @@ fn reports_malformed_input() {
     assert!(read("(%bind x 1)").is_err()); // no (%module …) wrapper
     assert!(read("(%module (%public ghost))").is_err()); // public names unknown binding
 }
+
+/// The §11 strictness contract for the new forms: a massless measure/kernel
+/// type, a two-slot `%meta`, and malformed mass/set values are parse errors
+/// (early days — no tolerant reading of incomplete forms).
+#[test]
+fn mass_and_valueset_strictness() {
+    let cases = [
+        // %mass is a required sub-form.
+        "(%module (%bind x (draw (%meta (%measure (%domain (%scalar real))) %fixed reals) (Normal 0 1))))",
+        "(%module (%bind k (functionof (%meta (%kernel (%inputs a)) %fixed %unknown) (%ref %local _a_) %specinputs ((a (%ref %local _a_))))))",
+        // %meta takes exactly three slots.
+        "(%module (%bind x (add (%meta (%scalar real) %fixed) 1 2)))",
+        // Unknown mass class / value set.
+        "(%module (%bind x (draw (%meta (%measure (%domain (%scalar real)) (%mass %tiny)) %fixed reals) (Normal 0 1))))",
+        "(%module (%bind x (add (%meta (%scalar real) %fixed %sometimes) 1 2)))",
+        // Malformed set forms.
+        "(%module (%bind x (add (%meta (%scalar real) %fixed (stdsimplex)) 1 2)))",
+        "(%module (%bind x (add (%meta (%scalar real) %fixed (cartpow reals)) 1 2)))",
+    ];
+    for src in cases {
+        assert!(read(src).is_err(), "should be rejected: {src}");
+    }
+}
+
+/// The value-set slot round-trips every form class.
+#[test]
+fn valueset_forms_roundtrip() {
+    let src = r#"(%module
+  (%bind a (add (%meta (%scalar real) %fixed (interval 0.0 inf)) 1.0 2.0))
+  (%bind b (add (%meta (%scalar real) %fixed (stdsimplex %dynamic)) 1.0 2.0))
+  (%bind c (add (%meta (%scalar real) %fixed (cartpow posintegers 4)) 1.0 2.0))
+  (%bind d (add (%meta (%scalar real) %fixed anything) 1.0 2.0)))"#;
+    let m = read(src).unwrap();
+    let out = write(&m);
+    for needle in [
+        "(interval 0.0 inf)",
+        "(stdsimplex %dynamic)",
+        "(cartpow posintegers 4)",
+        " anything)",
+    ] {
+        assert!(out.contains(needle), "missing {needle} in:\n{out}");
+    }
+    assert_eq!(write(&read(&out).unwrap()), out);
+}

@@ -215,3 +215,82 @@ pub enum Phase {
     Parameterized,
     Stochastic,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn subset_chains() {
+        use ValueSet::*;
+        assert!(PosReals.subset_of(&Reals));
+        assert!(PosIntegers.subset_of(&NonNegIntegers));
+        assert!(PosIntegers.subset_of(&NonNegReals));
+        assert!(UnitInterval.subset_of(&NonNegReals));
+        assert!(!UnitInterval.subset_of(&PosReals)); // contains 0
+        assert!(!NonNegReals.subset_of(&PosReals));
+        assert!(Interval(0.25, 0.75).subset_of(&UnitInterval));
+        assert!(Interval(0.0, f64::INFINITY).subset_of(&NonNegReals));
+        assert!(!Interval(-1.0, 1.0).subset_of(&NonNegReals));
+        // Deferred/Unknown prove nothing, not even reflexively.
+        assert!(!Unknown.subset_of(&Unknown));
+        assert!(!Deferred.subset_of(&Anything));
+        // The simplex sits inside nonnegative unit vectors.
+        let nn = CartPow(Box::new(NonNegReals), Dim::Dynamic);
+        assert!(StdSimplex(Dim::Static(3)).subset_of(&nn));
+        assert!(
+            CartPow(Box::new(UnitInterval), Dim::Static(3))
+                .subset_of(&CartPow(Box::new(Reals), Dim::Static(3)))
+        );
+        assert!(
+            !CartPow(Box::new(Reals), Dim::Static(3))
+                .subset_of(&CartPow(Box::new(Reals), Dim::Static(4)))
+        );
+    }
+
+    #[test]
+    fn boundedness() {
+        use ValueSet::*;
+        assert_eq!(UnitInterval.is_bounded(), Some(true));
+        assert_eq!(StdSimplex(Dim::Dynamic).is_bounded(), Some(true));
+        assert_eq!(Interval(0.0, 1.0).is_bounded(), Some(true));
+        assert_eq!(Interval(0.0, f64::INFINITY).is_bounded(), Some(false));
+        assert_eq!(Reals.is_bounded(), Some(false));
+        assert_eq!(
+            CartPow(Box::new(UnitInterval), Dim::Static(3)).is_bounded(),
+            Some(true)
+        );
+        assert_eq!(
+            CartPow(Box::new(UnitInterval), Dim::Dynamic).is_bounded(),
+            None
+        );
+        assert_eq!(Unknown.is_bounded(), None);
+    }
+
+    #[test]
+    fn natural_extents() {
+        assert_eq!(
+            ValueSet::natural_of(&Type::Scalar(ScalarType::Real)),
+            ValueSet::Reals
+        );
+        let vec3 = Type::Array {
+            shape: Box::new([Dim::Static(3)]),
+            elem: Box::new(Type::Scalar(ScalarType::Integer)),
+        };
+        assert_eq!(
+            ValueSet::natural_of(&vec3),
+            ValueSet::CartPow(Box::new(ValueSet::Integers), Dim::Static(3))
+        );
+        // A measure's extent is its domain's; callables have none.
+        let m = Type::Measure {
+            domain: Box::new(Type::Scalar(ScalarType::Real)),
+            mass: Mass::Normalized,
+        };
+        assert_eq!(ValueSet::natural_of(&m), ValueSet::Reals);
+        let k = Type::Kernel {
+            inputs: Box::new([]),
+            mass: Mass::Normalized,
+        };
+        assert_eq!(ValueSet::natural_of(&k), ValueSet::Unknown);
+    }
+}

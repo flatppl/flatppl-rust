@@ -193,3 +193,27 @@ fn infer_rejects_flatppl_output() {
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains(".flatpir"));
 }
+
+/// `--level=valueset` fills the value-set slot but leaves masses %deferred
+/// (the level hierarchy is observable on the wire).
+#[test]
+fn infer_level_valueset_leaves_mass_deferred() {
+    let dir = Scratch::new("level");
+    let src = dir.path("m.flatppl");
+    let out_path = dir.path("m.flatpir");
+    fs::write(&src, "m = Normal(0.0, 1.0)\n").unwrap();
+
+    let out = bin()
+        .arg("infer")
+        .arg("--level=valueset")
+        .arg(&src)
+        .arg(&out_path)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let written = fs::read_to_string(&out_path).unwrap();
+    assert!(
+        written.contains("(%measure (%domain (%scalar real)) (%mass %deferred)) %fixed reals)"),
+        "got:\n{written}"
+    );
+}

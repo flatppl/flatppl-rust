@@ -936,22 +936,18 @@ pub(crate) fn call_valueset(
         "exp" => ValueSet::PosReals,
         "abs" | "abs2" | "sqrt" => ValueSet::NonNegReals,
         "invlogit" | "invprobit" => ValueSet::UnitInterval,
-        // Homogeneous vectors inherit a common element set.
+        // Vectors lift a common element set; heterogeneous elements widen
+        // to the strongest named set containing all of them (literal reals
+        // are singleton intervals, so without widening `l1unit`'s simplex
+        // guard would never fire on literal weight vectors).
         "vector" => {
-            let mut elem: Option<ValueSet> = None;
-            for (n, _, _) in args {
-                let set = inf.lookup_valueset(*n);
-                match &elem {
-                    None => elem = Some(set),
-                    Some(prev) if *prev == set => {}
-                    Some(_) => return ValueSet::Unknown,
-                }
-            }
-            match elem {
-                Some(e) if e != ValueSet::Unknown => {
-                    ValueSet::CartPow(Box::new(e), Dim::Static(args.len() as u32))
-                }
-                _ => ValueSet::Unknown,
+            let sets: Vec<ValueSet> = args
+                .iter()
+                .map(|(n, _, _)| inf.lookup_valueset(*n))
+                .collect();
+            match join_scalar_sets(&sets) {
+                Some(e) => ValueSet::CartPow(Box::new(e), Dim::Static(args.len() as u32)),
+                None => ValueSet::Unknown,
             }
         }
         // Distribution constructors: the support column of spec §08.
@@ -1221,4 +1217,29 @@ fn broadcast_mass(cell: Mass) -> Mass {
         Mass::Finite => Mass::Finite,
         _ => Mass::Unknown,
     }
+}
+
+/// The strongest common containing set of several element sets: their shared
+/// value if equal, else the strongest named scalar set that contains all
+/// (widening, strongest first). `None` when nothing fits.
+fn join_scalar_sets(sets: &[ValueSet]) -> Option<ValueSet> {
+    let first = sets.first()?;
+    if sets.iter().all(|s| s == first) && *first != ValueSet::Unknown {
+        return Some(first.clone());
+    }
+    const CANDIDATES: &[ValueSet] = &[
+        ValueSet::PosIntegers,
+        ValueSet::NonNegIntegers,
+        ValueSet::Integers,
+        ValueSet::UnitInterval,
+        ValueSet::PosReals,
+        ValueSet::NonNegReals,
+        ValueSet::Reals,
+        ValueSet::Booleans,
+        ValueSet::Complexes,
+    ];
+    CANDIDATES
+        .iter()
+        .find(|c| sets.iter().all(|s| s.subset_of(c)))
+        .cloned()
 }
