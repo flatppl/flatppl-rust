@@ -1,0 +1,17 @@
+[package]
+name = "flatppl-infer"
+description = "Type, shape, and phase inference for flatppl-core modules — the type-domain trace (engine-concepts §17)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+flatppl-core = { path = "../core" }
+
+[dev-dependencies]
+# Golden tests run FlatPIR fixtures through inference and compare canonical
+# annotated output; unit tests build modules from FlatPPL surface text.
+flatppl-flatpir = { path = "../flatpir" }
+flatppl-syntax = { path = "../syntax" }

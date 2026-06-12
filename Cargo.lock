@@ -116,6 +116,7 @@ dependencies = [
  "clap",
  "flatppl-core",
  "flatppl-flatpir",
+ "flatppl-infer",
  "flatppl-syntax",
 ]
 
@@ -128,6 +129,15 @@ name = "flatppl-flatpir"
 version = "0.1.0"
 dependencies = [
  "flatppl-core",
+]
+
+[[package]]
+name = "flatppl-infer"
+version = "0.1.0"
+dependencies = [
+ "flatppl-core",
+ "flatppl-flatpir",
+ "flatppl-syntax",
 ]
 
 [[package]]
