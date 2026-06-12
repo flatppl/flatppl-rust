@@ -14,9 +14,16 @@ repository.workspace = true
 name = "flatppl"
 path = "src/main.rs"
 
+[features]
+# Verbs are opt-in cargo features so heavy capabilities never burden the
+# default build; `infer` is light and rides along by default.
+default = ["infer"]
+infer = ["dep:flatppl-infer"]
+
 [dependencies]
 flatppl-core = { path = "../core" }
 flatppl-syntax = { path = "../syntax" }
 flatppl-flatpir = { path = "../flatpir" }
+flatppl-infer = { path = "../infer", optional = true }
 clap = { workspace = true }
 ariadne = { workspace = true }

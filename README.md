@@ -14,11 +14,12 @@ This monorepo is a Cargo workspace; member crates live under `crates/`:
 * [`flatppl-core`](crates/core) — the in-memory IR (extended-FlatPIR model)
 * [`flatppl-syntax`](crates/syntax) — canonical FlatPPL surface syntax: parse + print
 * [`flatppl-flatpir`](crates/flatpir) — FlatPIR S-expression reader + writer
+* [`flatppl-infer`](crates/infer) — type, shape, and phase inference
 * [`flatppl-cli`](crates/cli) — the `flatppl` command-line driver
 
 See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the design and the road ahead.
-Status: Phase 1 — FlatPPL ↔ FlatPIR conversion; inference, lowering, and
-codegen are in development.
+Status: Phase 2 — FlatPPL ↔ FlatPIR conversion is complete; type/shape
+inference is growing; lowering and codegen are in development.
 
 ## Installation (early users)
 
@@ -36,6 +37,7 @@ This places a `flatppl` binary on your Cargo bin path:
 flatppl convert model.flatppl model.flatpir   # FlatPPL → FlatPIR
 flatppl convert model.flatpir model.flatppl   # FlatPIR → FlatPPL
 flatppl convert messy.flatppl tidy.flatppl    # canonicalize (same format)
+flatppl infer model.flatppl typed.flatpir     # emit type/phase-annotated FlatPIR
 ```
 
 Formats are inferred from the file extensions. FlatPPL output uses the full

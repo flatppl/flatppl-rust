@@ -138,3 +138,58 @@ fn renders_span_diagnostics() {
     // The offending source line is quoted in the snippet.
     assert!(stderr.contains("self = elementof(reals)"), "got:\n{stderr}");
 }
+
+/// `flatppl infer` annotates a module with `%meta` and reports honest gaps
+/// as notes on stderr.
+#[test]
+fn infer_emits_annotated_flatpir() {
+    let dir = Scratch::new("infer");
+    let src = dir.path("m.flatppl");
+    let out_path = dir.path("m.flatpir");
+    fs::write(
+        &src,
+        "a = elementof(reals)\nb ~ Normal(a, 1.0)\nc = mystery(b)\n",
+    )
+    .unwrap();
+
+    let out = bin()
+        .arg("infer")
+        .arg(&src)
+        .arg(&out_path)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("note: no type rule for `mystery`"),
+        "got:\n{stderr}"
+    );
+
+    let written = fs::read_to_string(&out_path).unwrap();
+    assert!(written.contains("(elementof (%meta (%scalar real) %parameterized) reals)"));
+    assert!(written.contains("(draw (%meta (%scalar real) %stochastic)"));
+    assert!(
+        written.contains("(mystery (%meta %deferred %stochastic)"),
+        "got:\n{written}"
+    );
+}
+
+/// `flatppl infer` refuses a FlatPPL output path (annotations need FlatPIR).
+#[test]
+fn infer_rejects_flatppl_output() {
+    let dir = Scratch::new("infer-out");
+    let src = dir.path("m.flatppl");
+    fs::write(&src, "x = 1\n").unwrap();
+    let out = bin()
+        .arg("infer")
+        .arg(&src)
+        .arg(dir.path("m.flatppl"))
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains(".flatpir"));
+}

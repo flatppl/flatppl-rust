@@ -160,22 +160,24 @@ legalization targets above.
 
 ## Crates
 
-Phase 1 (current): `flatppl-core` (the IR) · `flatppl-syntax` (FlatPPL surface ↔
-core) · `flatppl-flatpir` (FlatPIR S-expr ↔ core) · `flatppl-cli` (the `flatppl`
-driver binary — `flatppl convert` today). `syntax`/`flatpir` depend on `core`;
-`core` depends on nothing. Library crates stay **binary-free** (they compile to
+Landed: `flatppl-core` (the IR) · `flatppl-syntax` (FlatPPL surface ↔ core) ·
+`flatppl-flatpir` (FlatPIR S-expr ↔ core) · `flatppl-infer` (the type/phase
+trace + per-op rule catalogue) · `flatppl-cli` (the `flatppl` driver binary —
+`convert` and `infer`). `syntax`/`flatpir`/`infer` depend on `core`; `core`
+depends on nothing. Library crates stay **binary-free** (they compile to
 `wasm32` and link into PyO3 / jlrs / cxx); all CLI surface lives in `flatppl-cli`.
 
 **CLI model.** One driver binary (`flatppl`) with subcommands; capabilities are
 compile-time cargo features of `flatppl-cli` (a verb's crates link only when its
-feature is on — lean default build, opt-in weight). Verbs map to library crates:
-`convert` → syntax + flatpir; later `infer` → `flatppl-infer`, `lower` / `check`
-→ the rule catalog + profile checker. The crate can host additional `[[bin]]`s
-later (gated by `required-features`); a second tool with its own heavy dependency
-stack would split into its own crate instead.
+feature is on — lean default build, opt-in weight; `infer` is light and rides
+in the default set). Verbs map to library crates: `convert` → syntax + flatpir;
+`infer` → `flatppl-infer`; later `lower` / `check` → the rule catalog + profile
+checker. The crate can host additional `[[bin]]`s later (gated by
+`required-features`); a second tool with its own heavy dependency stack would
+split into its own crate instead.
 
-Planned (later phases): `flatppl-infer`, the lowering rule-catalog (possibly
-merged with a rewrite/egglog crate), per-target codegen crates, remote/server, …
+Planned (later phases): the lowering rule-catalog (possibly merged with a
+rewrite/egglog crate), per-target codegen crates, remote/server, …
 
 Conventions: crate names are hyphenated and prefixed (`flatppl-…`), singular
 concepts; workspace directories drop the prefix (`crates/core`, `crates/syntax`);

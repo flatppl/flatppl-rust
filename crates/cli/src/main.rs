@@ -39,6 +39,19 @@ enum Command {
         #[arg(long, value_enum, default_value_t = SyntaxLevel::Full)]
         syntax: SyntaxLevel,
     },
+    /// Infer types and phases; emit annotated FlatPIR.
+    ///
+    /// Runs the type/shape/phase trace over the module and writes FlatPIR
+    /// with `(%meta <type> <phase>)` annotations (spec §11). Inference notes
+    /// (honest `%deferred` gaps) go to stderr; inference errors (cycles,
+    /// unresolved names) fail the command.
+    #[cfg(feature = "infer")]
+    Infer {
+        /// Input file (`.flatppl` or `.flatpir`)
+        input: PathBuf,
+        /// Output file (`.flatpir` — FlatPPL cannot carry annotations)
+        output: PathBuf,
+    },
 }
 
 /// CLI mirror of [`flatppl_syntax::Syntax`] (the library stays clap-free).
@@ -112,6 +125,8 @@ fn main() -> ExitCode {
             output,
             syntax,
         } => convert(&input, &output, syntax.into()),
+        #[cfg(feature = "infer")]
+        Command::Infer { input, output } => infer_cmd(&input, &output),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -197,6 +212,59 @@ fn convert(input: &Path, output: &Path, syntax: flatppl_syntax::Syntax) -> Resul
         }
     };
     let mut text = write_module(to, &module, syntax);
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    fs::write(output, text)
+        .map_err(|e| Failure::Plain(format!("writing `{}`: {e}", output.display())))
+}
+
+/// `flatppl infer <in> <out.flatpir>` — run the type/phase trace, report
+/// diagnostics, write annotated FlatPIR.
+#[cfg(feature = "infer")]
+fn infer_cmd(input: &Path, output: &Path) -> Result<(), Failure> {
+    let from = Format::from_path(input)?;
+    if !matches!(Format::from_path(output)?, Format::FlatPir) {
+        return Err(Failure::Plain(format!(
+            "`infer` writes annotated FlatPIR; `{}` must have a `.flatpir` extension \
+             (FlatPPL cannot carry %meta annotations)",
+            output.display()
+        )));
+    }
+    let source =
+        fs::read_to_string(input).map_err(|e| format!("reading `{}`: {e}", input.display()))?;
+    let mut module = match read_module(from, &source) {
+        Ok(module) => module,
+        Err((message, line, span)) => {
+            return Err(Failure::Diagnostic {
+                path: input.to_path_buf(),
+                source,
+                message,
+                line,
+                span,
+            });
+        }
+    };
+
+    let diags = flatppl_infer::infer(&mut module);
+    let mut errors = 0u32;
+    for d in &diags {
+        match d.severity {
+            flatppl_infer::Severity::Error => {
+                errors += 1;
+                eprintln!("error: {}", d.message);
+            }
+            flatppl_infer::Severity::Note => eprintln!("note: {}", d.message),
+        }
+    }
+    if errors > 0 {
+        return Err(Failure::Plain(format!(
+            "inference found {errors} error(s) in `{}`",
+            input.display()
+        )));
+    }
+
+    let mut text = flatppl_flatpir::write(&module);
     if !text.ends_with('\n') {
         text.push('\n');
     }
