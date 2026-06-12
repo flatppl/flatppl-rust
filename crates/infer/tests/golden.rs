@@ -466,3 +466,115 @@ fn joint_mass_products() {
         "got:\n{out}"
     );
 }
+
+/// Every §08 distribution row in the catalogue: constructs as a measure,
+/// mass %normalized, and a support that is never weaker than the domain's
+/// natural extent. Catches transcription slips in the table itself.
+#[test]
+fn distribution_catalogue_sweep() {
+    let scalar_dists = [
+        "Uniform",
+        "Normal",
+        "GeneralizedNormal",
+        "Cauchy",
+        "StudentT",
+        "Logistic",
+        "LogNormal",
+        "Exponential",
+        "Gamma",
+        "Weibull",
+        "InverseGamma",
+        "Beta",
+        "ChiSquared",
+        "VonMises",
+        "Laplace",
+        "Bernoulli",
+        "Categorical",
+        "Categorical0",
+        "Binomial",
+        "Geometric",
+        "NegativeBinomial",
+        "NegativeBinomial2",
+        "Poisson",
+    ];
+    for name in scalar_dists {
+        let src = format!("m = {name}(0.5, 0.5)");
+        let (module, _) = infer_src(&src);
+        let out = flatppl_flatpir::write(&module);
+        assert!(
+            out.contains("(%mass %normalized)"),
+            "{name}: not a normalized measure:\n{out}"
+        );
+        assert!(
+            !out.contains("%fixed %unknown)"),
+            "{name}: support missing:\n{out}"
+        );
+    }
+    // Multivariate rows: dims ride the length parameter's type.
+    let (module, _) = infer_src("m = Dirichlet([1.0, 1.0])");
+    let out = flatppl_flatpir::write(&module);
+    assert!(out.contains("(stdsimplex 2)"), "got:\n{out}");
+    let (module, _) = infer_src("m = Multinomial(5, [0.5, 0.5])");
+    let out = flatppl_flatpir::write(&module);
+    assert!(
+        out.contains("(%mass %normalized)") && out.contains("(cartpow nonnegintegers"),
+        "got:\n{out}"
+    );
+}
+
+#[test]
+fn get_failure_paths() {
+    // A missing record field and an out-of-range tuple index are %failed.
+    let (module, _) = infer_src("r = record(a = 1.0)\nx = get(r, \"b\")");
+    assert!(flatppl_flatpir::write(&module).contains("%failed"));
+    let (module, _) = infer_src("t = (1.0, true)\nx = get(t, 3)");
+    assert!(flatppl_flatpir::write(&module).contains("%failed"));
+    // get0 is 0-based: index 1 of a pair is its second component.
+    let (module, _) = infer_src("t = (1.0, true)\nx = get0(t, 1)");
+    assert!(
+        flatppl_flatpir::write(&module).contains("(get0 (%meta (%scalar boolean)"),
+        "got:\n{}",
+        flatppl_flatpir::write(&module)
+    );
+}
+
+#[test]
+fn set_expression_readers() {
+    // Negative literal bounds arrive as `neg` calls; cartpow nests.
+    let src = "a = elementof(interval(-1.0, 1.0))\nb = elementof(cartpow(integers, 3))";
+    let (module, _) = infer_src(src);
+    let out = flatppl_flatpir::write(&module);
+    assert!(
+        out.contains("(elementof (%meta (%scalar real) %parameterized (interval -1.0 1.0))"),
+        "got:\n{out}"
+    );
+    assert!(
+        out.contains("(elementof (%meta (%array 1 (3) (%scalar integer)) %parameterized (cartpow integers 3))"),
+        "got:\n{out}"
+    );
+}
+
+#[test]
+fn reference_measure_mass_arms() {
+    // iid of a locally finite measure stays locally finite; truncating one
+    // to a bounded window is finite; Counting on integers is locally finite.
+    let src = "a = iid(Lebesgue(reals), 3)\n\
+               b = truncate(Lebesgue(reals), interval(0.0, 1.0))\n\
+               c = Counting(integers)";
+    let (module, _) = infer_src(src);
+    let out = flatppl_flatpir::write(&module);
+    assert!(
+        out.contains("(%bind a (iid (%meta (%measure (%domain (%array 1 (3) (%scalar real))) (%mass %locallyfinite))"),
+        "got:\n{out}"
+    );
+    assert!(
+        out.contains(
+            "(%bind b (truncate (%meta (%measure (%domain (%scalar real)) (%mass %finite))"
+        ),
+        "got:\n{out}"
+    );
+    assert!(
+        out.contains("(%bind c (Counting (%meta (%measure (%domain (%scalar integer)) (%mass %locallyfinite))"),
+        "got:\n{out}"
+    );
+}
