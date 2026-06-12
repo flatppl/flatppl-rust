@@ -1,0 +1,125 @@
+name: Build
+
+# Builds release `flatppl` binaries for the supported platforms on every
+# push and pull request to main, and updates the rolling `nightly`
+# prerelease with the packaged binaries on pushes to main — the same
+# pattern as flatppl-js's VSIX nightly.
+#
+# NOTE: correctness is covered by the separate `Test` workflow (test.yml).
+# This job only needs the workspace to BUILD in release mode per target;
+# --locked additionally catches a stale Cargo.lock.
+#
+# Linux binaries are musl-linked (fully static) so one download runs on
+# any distro regardless of glibc version; the workspace is pure Rust, so
+# static linking costs nothing. Both macOS targets build on the arm64
+# runner — cross-compiling x86_64 there only needs the rustup target.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Only one nightly update per ref. cancel-in-progress so a rapid run of
+# pushes to main doesn't leave two jobs racing to push the shared
+# `nightly` release tag (action-gh-release below) — the later commit
+# wins, the earlier is cancelled.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-latest }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm }
+          - { target: x86_64-apple-darwin, os: macos-latest }
+          - { target: aarch64-apple-darwin, os: macos-latest }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest }
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install musl linker
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build flatppl
+        run: cargo build --release --locked -p flatppl-cli --target ${{ matrix.target }}
+
+      - name: Package binary with README and LICENSE
+        shell: bash
+        run: |
+          mkdir -p dist/stage
+          cp README.md LICENSE dist/stage/
+          case "${{ matrix.target }}" in
+            *windows*)
+              cp "target/${{ matrix.target }}/release/flatppl.exe" dist/stage/
+              (cd dist/stage && 7z a "../flatppl-nightly-${{ matrix.target }}.zip" .)
+              ;;
+            *)
+              cp "target/${{ matrix.target }}/release/flatppl" dist/stage/
+              tar -czf "dist/flatppl-nightly-${{ matrix.target }}.tar.gz" -C dist/stage .
+              ;;
+          esac
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: flatppl-nightly-${{ matrix.target }}
+          path: |
+            dist/flatppl-nightly-*.tar.gz
+            dist/flatppl-nightly-*.zip
+
+  release:
+    name: Update nightly release
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Collect binary artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Update nightly release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: nightly
+          name: Nightly Build
+          prerelease: true
+          files: dist/*
+          body: |
+            Nightly build of the `flatppl` CLI.
+            Built from commit ${{ github.sha }}.
+
+            Pick the archive for your platform (Linux binaries are fully
+            static musl builds), e.g.:
+            ```
+            curl -L https://github.com/${{ github.repository }}/releases/download/nightly/flatppl-nightly-x86_64-unknown-linux-musl.tar.gz | tar -xz
+            ./flatppl --help
+            ```
+
+            Alternatively, build from source:
+            ```
+            cargo install --git https://github.com/${{ github.repository }} flatppl-cli
+            ```
