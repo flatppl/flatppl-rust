@@ -53,7 +53,7 @@ fn model_inference_single_module_part() {
         "(elementof (%meta (%scalar real) %parameterized reals) reals)",
         "(draw (%meta (%scalar real) %stochastic reals)",
         "(Normal (%meta (%measure (%domain (%scalar real)) (%mass %normalized)) %fixed reals)",
-        "(add (%meta (%scalar real) %stochastic %unknown)",
+        "(add (%meta (%scalar real) %stochastic reals)",
         "(likelihoodof (%meta %deferred %fixed %unknown)",
     ] {
         assert!(out.contains(expected), "missing `{expected}` in:\n{out}");
@@ -102,12 +102,10 @@ fn phases_follow_the_ancestor_rule() {
     assert!(out.contains("(draw (%meta (%scalar real) %stochastic reals)"));
     // c joins parameterized ⊔ stochastic = stochastic.
     assert!(
-        out.contains(
-            "(add (%meta (%scalar real) %stochastic %unknown) (%ref self a) (%ref self b))"
-        ),
+        out.contains("(add (%meta (%scalar real) %stochastic reals) (%ref self a) (%ref self b))"),
         "got:\n{out}"
     );
-    assert!(out.contains("(add (%meta (%scalar integer) %fixed %unknown) 1 2)"));
+    assert!(out.contains("(add (%meta (%scalar integer) %fixed integers) 1 2)"));
 }
 
 #[test]
@@ -247,12 +245,12 @@ fn broadcast_distribution_head_is_a_measure_over_the_array() {
     let out = flatppl_flatpir::write(&module);
     assert!(
         out.contains(
-            "(broadcast (%meta (%measure (%domain (%array 1 (3) (%scalar real))) (%mass %normalized)) %fixed %unknown)"
+            "(broadcast (%meta (%measure (%domain (%array 1 (3) (%scalar real))) (%mass %normalized)) %fixed (cartpow reals 3))"
         ),
         "got:\n{out}"
     );
     assert!(
-        out.contains("(draw (%meta (%array 1 (3) (%scalar real)) %stochastic %unknown)"),
+        out.contains("(draw (%meta (%array 1 (3) (%scalar real)) %stochastic (cartpow reals 3))"),
         "got:\n{out}"
     );
 }
@@ -266,7 +264,7 @@ fn broadcast_user_kernel_head_with_keyword_data() {
     let out = flatppl_flatpir::write(&module);
     assert!(
         out.contains(
-            "(broadcast (%meta (%measure (%domain (%array 1 (2) (%scalar real))) (%mass %normalized)) %fixed %unknown)"
+            "(broadcast (%meta (%measure (%domain (%array 1 (2) (%scalar real))) (%mass %normalized)) %fixed (cartpow reals 2))"
         ),
         "got:\n{out}"
     );

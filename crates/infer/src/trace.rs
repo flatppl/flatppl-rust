@@ -59,6 +59,19 @@ impl<'m> Inferencer<'m> {
             }
         }
         if self.level >= Level::Valueset {
+            // Total discipline (spec §11): a value-typed node's set is at
+            // least the type's natural extent — fall back where no producer
+            // established anything finer. One chokepoint; producers stay
+            // refinement-only.
+            for (&id, ty) in &self.tys {
+                let stored = self.vsets.get(&id);
+                if stored.is_none() || stored == Some(&ValueSet::Unknown) {
+                    let natural = ValueSet::natural_of(ty);
+                    if natural != ValueSet::Unknown {
+                        self.vsets.insert(id, natural);
+                    }
+                }
+            }
             for (&id, set) in &self.vsets {
                 self.module.set_valueset(id, set.clone());
             }

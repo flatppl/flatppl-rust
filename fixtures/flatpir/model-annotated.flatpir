@@ -18,7 +18,7 @@
                   (%kwarg mu 0.0) (%kwarg sigma 2.0))))
 
   (%bind _combined
-    (add (%meta (%scalar real) %stochastic %unknown)
+    (add (%meta (%scalar real) %stochastic reals)
          (%ref self a) (%ref self b)))
 
   (%bind input_data 2.5)

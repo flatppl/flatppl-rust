@@ -15,7 +15,7 @@
       (%meta (%kernel (%inputs center spread x) (%mass %normalized)) %fixed %unknown)
       (Normal (%meta (%measure (%domain (%scalar real)) (%mass %normalized))
                      %parameterized reals)
-        (%kwarg mu (add (%meta (%scalar real) %parameterized %unknown)
+        (%kwarg mu (add (%meta (%scalar real) %parameterized reals)
                         (%ref self center) (%ref %local _x_)))
         (%kwarg sigma (%ref self spread)))
       %specinputs
@@ -24,5 +24,5 @@
        (x (%ref %local _x_)))))
 
   (%bind shifted_value
-    (add (%meta (%scalar real) %parameterized %unknown)
+    (add (%meta (%scalar real) %parameterized reals)
          (%ref self center) 1.0)))

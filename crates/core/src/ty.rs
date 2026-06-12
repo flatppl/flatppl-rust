@@ -131,6 +131,28 @@ pub enum ValueSet {
 }
 
 impl ValueSet {
+    /// The **natural extent** of a type: the maximal set its values inhabit
+    /// (`(%scalar real)` → `reals`, a 1-D real array → `cartpow(reals, n)`,
+    /// a measure → its domain's extent). `Unknown` for non-value types
+    /// (callables, modules) and for types without a set vocabulary. The
+    /// value-set slot of a value-typed call is at least this (spec §11).
+    pub fn natural_of(ty: &Type) -> ValueSet {
+        match ty {
+            Type::Scalar(ScalarType::Real) => ValueSet::Reals,
+            Type::Scalar(ScalarType::Integer) => ValueSet::Integers,
+            Type::Scalar(ScalarType::Boolean) => ValueSet::Booleans,
+            Type::Scalar(ScalarType::Complex) => ValueSet::Complexes,
+            Type::Array { shape, elem } if shape.len() == 1 => match ValueSet::natural_of(elem) {
+                ValueSet::Unknown => ValueSet::Unknown,
+                inner => ValueSet::CartPow(Box::new(inner), shape[0]),
+            },
+            Type::Measure { domain, .. } => ValueSet::natural_of(domain),
+            Type::RngState => ValueSet::RngStates,
+            Type::Any => ValueSet::Anything,
+            _ => ValueSet::Unknown,
+        }
+    }
+
     /// Is the set bounded? `None` when not statically known. (Drives the
     /// `Lebesgue`/`truncate` total-mass rules.)
     pub fn is_bounded(&self) -> Option<bool> {
