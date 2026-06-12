@@ -235,3 +235,37 @@ fn mvnormal_dim_from_mu_type() {
         "got:\n{out}"
     );
 }
+
+#[test]
+fn broadcast_distribution_head_is_a_measure_over_the_array() {
+    // §04 broadcasting: a distribution-constructor head yields a measure
+    // over the array of per-cell variates; draw produces the array.
+    let src = "mus = [0.0, 1.0, 2.0]\ny ~ broadcast(Normal, mus, 1.0)";
+    let (module, _) = infer_src(src);
+    let out = flatppl_flatpir::write(&module);
+    assert!(
+        out.contains(
+            "(broadcast (%meta (%measure (%domain (%array 1 (3) (%scalar real)))) %fixed)"
+        ),
+        "got:\n{out}"
+    );
+    assert!(
+        out.contains("(draw (%meta (%array 1 (3) (%scalar real)) %stochastic)"),
+        "got:\n{out}"
+    );
+}
+
+#[test]
+fn broadcast_user_kernel_head_with_keyword_data() {
+    let src = "mu_g = [0.0, 1.0]\n\
+               k = kernelof(_m_ + 0.0, m = _m_)\n\
+               obs ~ broadcast(k, m = mu_g)";
+    let (module, _) = infer_src(src);
+    let out = flatppl_flatpir::write(&module);
+    assert!(
+        out.contains(
+            "(broadcast (%meta (%measure (%domain (%array 1 (2) (%scalar real)))) %fixed)"
+        ),
+        "got:\n{out}"
+    );
+}

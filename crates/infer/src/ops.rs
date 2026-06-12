@@ -148,7 +148,7 @@ pub(crate) fn call_rule(
         "interval" | "cartprod" | "cartpow" => Type::Any,
 
         // ---- broadcasting (spec §04) ----
-        "broadcast" => broadcast_type(inf, args),
+        "broadcast" => broadcast_type(inf, args, named),
 
         // ---- distributions (spec §08) ----
         _ => match distribution_domain(inf, &name, args, named) {
@@ -598,22 +598,26 @@ fn reified_result_type(inf: &mut Inferencer<'_>, mut node: NodeId) -> Option<Typ
     }
 }
 
-/// `broadcast(f, arrays…)` with a deterministic scalar built-in head: maps
-/// elementwise over same-shape arrays (scalars ride along). Kernel/measure
-/// heads and shape-mismatch handling arrive with the shape work.
-fn broadcast_type(inf: &mut Inferencer<'_>, args: &[ArgInfo]) -> Type {
-    let Some((head_node, _, _)) = args.first() else {
+/// `broadcast(f_or_K, args…)` (spec §04 broadcasting): a deterministic head
+/// maps elementwise over same-shape arrays (scalars ride along) into an
+/// array; a kernel / distribution-constructor head yields a **measure over
+/// the array** of per-cell variates — that is why `draw` of a broadcast
+/// distribution produces the observation array.
+fn broadcast_type(inf: &mut Inferencer<'_>, args: &[ArgInfo], named: &[NamedInfo]) -> Type {
+    let Some((head_node, head_ty, _)) = args.first() else {
         return Type::Deferred;
     };
-    let Node::Const(op) = inf.module.node(*head_node) else {
-        return Type::Deferred;
-    };
-    let op_name = inf.module.resolve(*op).to_string();
+    let (head_node, head_ty) = (*head_node, head_ty.clone());
 
-    // Common shape: all array inputs agree.
+    // Common shape over every data input — positional and keyword alike;
+    // mismatching array shapes are deferred until real shape-broadcasting.
     let mut shape: Option<Box<[Dim]>> = None;
     let mut elems: Vec<Type> = Vec::new();
-    for (_, t, _) in &args[1..] {
+    let data_types = args[1..]
+        .iter()
+        .map(|(_, t, _)| t)
+        .chain(named.iter().map(|(_, _, t, _)| t));
+    for t in data_types {
         match t {
             Type::Array { shape: s, elem } => {
                 match &shape {
@@ -629,6 +633,47 @@ fn broadcast_type(inf: &mut Inferencer<'_>, args: &[ArgInfo]) -> Type {
     let Some(shape) = shape else {
         return Type::Deferred; // no array input — scalar broadcast is a no-op shape-wise
     };
+
+    // User-callable head (`broadcast(group_kernel, mu = mu_g)`): the cell
+    // comes from the reified body, exactly as in a direct call.
+    match &head_ty {
+        Type::Function { .. } => {
+            let cell = reified_result_type(inf, head_node).unwrap_or(Type::Deferred);
+            return Type::Array {
+                shape,
+                elem: Box::new(cell),
+            };
+        }
+        Type::Kernel { .. } => {
+            let cell = match reified_result_type(inf, head_node) {
+                Some(Type::Measure { domain }) => *domain,
+                Some(value_ty) => value_ty,
+                None => return Type::Deferred,
+            };
+            return Type::Measure {
+                domain: Box::new(Type::Array {
+                    shape,
+                    elem: Box::new(cell),
+                }),
+            };
+        }
+        _ => {}
+    }
+
+    // Built-in head: a distribution constructor broadcasts into a measure
+    // over the array; a deterministic scalar op maps elementwise.
+    let Node::Const(op) = inf.module.node(head_node) else {
+        return Type::Deferred;
+    };
+    let op_name = inf.module.resolve(*op).to_string();
+    if let Some(cell_domain) = distribution_domain(inf, &op_name, &[], &[]) {
+        return Type::Measure {
+            domain: Box::new(Type::Array {
+                shape,
+                elem: Box::new(cell_domain),
+            }),
+        };
+    }
 
     let cell = match (op_name.as_str(), elems.as_slice()) {
         ("add" | "sub" | "mul" | "divide" | "pow" | "min" | "max", [a, b]) => {
