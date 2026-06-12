@@ -7,7 +7,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use flatppl_core::{BindingId, Call, CallHead, Module, Node, NodeId, Phase, RefNs, Symbol, Type};
+use flatppl_core::{
+    BindingId, Call, CallHead, Module, Node, NodeId, Phase, RefNs, Symbol, Type, ValueSet,
+};
 
 use crate::ops;
 use crate::{Diagnostic, Level};
@@ -16,10 +18,12 @@ pub(crate) struct Inferencer<'m> {
     pub(crate) module: &'m mut Module,
     pub(crate) level: Level,
     pub(crate) diags: Vec<Diagnostic>,
-    /// Inferred types/phases, local until the final level-aware flush (a
-    /// `Level::Phase` run computes types internally but never annotates them).
+    /// Inferred types/phases/value-sets, local until the final level-aware
+    /// flush (a `Level::Phase` run computes types internally but never
+    /// annotates them).
     tys: HashMap<NodeId, Type>,
     phases: HashMap<NodeId, Phase>,
+    vsets: HashMap<NodeId, ValueSet>,
     /// Bindings on the active resolution path (cycle detection).
     in_progress: Vec<BindingId>,
     /// Ops already reported as catalogue gaps (one note per op).
@@ -34,6 +38,7 @@ impl<'m> Inferencer<'m> {
             diags: Vec::new(),
             tys: HashMap::new(),
             phases: HashMap::new(),
+            vsets: HashMap::new(),
             in_progress: Vec::new(),
             noted_gaps: HashSet::new(),
         }
@@ -53,6 +58,11 @@ impl<'m> Inferencer<'m> {
                 self.module.set_type(id, ty.clone());
             }
         }
+        if self.level >= Level::Valueset {
+            for (&id, set) in &self.vsets {
+                self.module.set_valueset(id, set.clone());
+            }
+        }
         self.diags
     }
 
@@ -60,6 +70,19 @@ impl<'m> Inferencer<'m> {
     /// look through reified bodies).
     pub(crate) fn lookup_type(&self, id: NodeId) -> Option<&Type> {
         self.tys.get(&id)
+    }
+
+    /// The inferred value set of an already-visited node (`Unknown` when the
+    /// walk has not established one).
+    pub(crate) fn lookup_valueset(&self, id: NodeId) -> ValueSet {
+        self.vsets.get(&id).cloned().unwrap_or(ValueSet::Unknown)
+    }
+
+    /// Record a node's value set (no-op below `Level::Valueset`).
+    pub(crate) fn set_vset(&mut self, id: NodeId, set: ValueSet) {
+        if self.level >= Level::Valueset {
+            self.vsets.insert(id, set);
+        }
     }
 
     /// Type + phase of a binding's RHS (memoised).
@@ -104,11 +127,24 @@ impl<'m> Inferencer<'m> {
         // are small (boxed slices of ids).
         let node = self.module.node(id).clone();
         let (ty, phase) = match &node {
-            Node::Lit(s) => (ops::literal_type(s), Phase::Fixed),
-            Node::Const(sym) => (ops::const_type(self.module.resolve(*sym)), Phase::Fixed),
+            Node::Lit(s) => {
+                self.set_vset(id, ops::literal_valueset(s));
+                (ops::literal_type(s), Phase::Fixed)
+            }
+            Node::Const(sym) => {
+                let name = self.module.resolve(*sym).to_string();
+                self.set_vset(id, ops::const_valueset(&name));
+                (ops::const_type(&name), Phase::Fixed)
+            }
             Node::Ref(r) => match r.ns {
                 RefNs::SelfMod => match self.module.binding_by_name(r.name) {
-                    Some(b) => self.infer_binding(b),
+                    Some(b) => {
+                        let result = self.infer_binding(b);
+                        let rhs = self.module.binding(b).rhs;
+                        let set = self.lookup_valueset(rhs);
+                        self.set_vset(id, set);
+                        result
+                    }
                     None => {
                         let name = self.module.resolve(r.name).to_string();
                         self.diags
@@ -118,7 +154,10 @@ impl<'m> Inferencer<'m> {
                 },
                 // A placeholder is implicitly `elementof(anything)` (spec §04
                 // "Placeholder variables") — unconstrained, parameterized.
-                RefNs::Local => (Type::Any, Phase::Parameterized),
+                RefNs::Local => {
+                    self.set_vset(id, ValueSet::Anything);
+                    (Type::Any, Phase::Parameterized)
+                }
                 // Cross-module inference rides on load_module support, which
                 // is deferred until multi-file fixtures exist (see TODO).
                 RefNs::Module(_) => {
@@ -126,10 +165,14 @@ impl<'m> Inferencer<'m> {
                         "cross-module references are not inferred yet \
                          (load_module support is deferred) — types left %deferred",
                     );
+                    self.set_vset(id, ValueSet::Unknown);
                     (Type::Deferred, Phase::Fixed)
                 }
             },
-            Node::Hole | Node::Axis(_) => (Type::Any, Phase::Fixed),
+            Node::Hole | Node::Axis(_) => {
+                self.set_vset(id, ValueSet::Unknown);
+                (Type::Any, Phase::Fixed)
+            }
             Node::Call(call) => self.infer_call(id, call),
         };
         // A cycle marker may have landed on this node while the walk was in
@@ -174,15 +217,18 @@ impl<'m> Inferencer<'m> {
             .chain(named.iter().map(|(_, _, _, p)| *p))
             .fold(Phase::Fixed, join_phase);
 
-        ops::call_rule(
-            self,
-            id,
-            call,
-            callee.map(|(n, tp)| (n, tp.0)),
-            &args,
-            &named,
-            joined,
-        )
+        let callee = callee.map(|(n, tp)| (n, tp.0));
+        let (ty, phase) = ops::call_rule(self, id, call, callee.clone(), &args, &named, joined);
+        if self.level >= Level::Valueset {
+            let set = ops::call_valueset(self, call, callee.as_ref(), &args, &named, &ty);
+            self.set_vset(id, set);
+        }
+        let ty = if self.level >= Level::Normalization {
+            ops::fill_mass(self, call, callee.as_ref(), ty, &args, &named)
+        } else {
+            ty
+        };
+        (ty, phase)
     }
 
     /// Record a catalogue gap for `op`, once. Phase-only runs skip these —

@@ -61,9 +61,20 @@ pub enum Level {
     /// annotated — `%meta` carries `%deferred` in the type slot.
     Phase,
     /// Phases + structural types. Array dimensions are static only where
-    /// they are syntactically literal.
+    /// they are syntactically literal; measure/kernel masses stay
+    /// `%deferred`.
     Type,
-    /// Phases + types + shape resolution: fixed-phase integer expressions at
+    /// Phases + types + value sets: the strongest statically known set
+    /// containing each node's value (a measure node's support), from the
+    /// spec-§03 set vocabulary — the third `%meta` slot. Producers: the §08
+    /// Domain/Support catalogue, `elementof`/`truncate` set arguments,
+    /// normalization functions (`softmax`, guarded `l1unit`).
+    Valueset,
+    /// Phases + types + value sets + total-mass classes on measure/kernel
+    /// types (spec §11 "Total-mass classes"), composed per op — and static
+    /// rejection of `normalize` on measures with known zero/infinite mass.
+    Normalization,
+    /// Everything + shape resolution: fixed-phase integer expressions at
     /// shape positions (`iid` counts, `cartpow` sizes, distribution dims)
     /// are resolved demand-driven (engine-concepts §17.1 — "resolve, don't
     /// rewrite"; the source IR is never modified).

@@ -49,12 +49,12 @@ fn model_inference_single_module_part() {
     let out = flatppl_flatpir::write(&module);
 
     for expected in [
-        "(load_module (%meta %module %fixed)",
-        "(elementof (%meta (%scalar real) %parameterized) reals)",
-        "(draw (%meta (%scalar real) %stochastic)",
-        "(Normal (%meta (%measure (%domain (%scalar real))) %fixed)",
-        "(add (%meta (%scalar real) %stochastic)",
-        "(likelihoodof (%meta %deferred %fixed)",
+        "(load_module (%meta %module %fixed %unknown)",
+        "(elementof (%meta (%scalar real) %parameterized reals) reals)",
+        "(draw (%meta (%scalar real) %stochastic reals)",
+        "(Normal (%meta (%measure (%domain (%scalar real)) (%mass %normalized)) %fixed reals)",
+        "(add (%meta (%scalar real) %stochastic %unknown)",
+        "(likelihoodof (%meta %deferred %fixed %unknown)",
     ] {
         assert!(out.contains(expected), "missing `{expected}` in:\n{out}");
     }
@@ -98,14 +98,16 @@ fn phases_follow_the_ancestor_rule() {
     let src = "a = elementof(reals)\nb ~ Normal(0.0, 1.0)\nc = a + b\nd = 1 + 2";
     let (module, _) = infer_src(src);
     let out = flatppl_flatpir::write(&module);
-    assert!(out.contains("(elementof (%meta (%scalar real) %parameterized) reals)"));
-    assert!(out.contains("(draw (%meta (%scalar real) %stochastic)"));
+    assert!(out.contains("(elementof (%meta (%scalar real) %parameterized reals) reals)"));
+    assert!(out.contains("(draw (%meta (%scalar real) %stochastic reals)"));
     // c joins parameterized ⊔ stochastic = stochastic.
     assert!(
-        out.contains("(add (%meta (%scalar real) %stochastic) (%ref self a) (%ref self b))"),
+        out.contains(
+            "(add (%meta (%scalar real) %stochastic %unknown) (%ref self a) (%ref self b))"
+        ),
         "got:\n{out}"
     );
-    assert!(out.contains("(add (%meta (%scalar integer) %fixed) 1 2)"));
+    assert!(out.contains("(add (%meta (%scalar integer) %fixed %unknown) 1 2)"));
 }
 
 #[test]
@@ -122,7 +124,7 @@ fn iid_static_count_shapes_the_domain() {
     let needle = "(iid";
     let meta = meta_of("x ~ iid(Normal(0.0, 1.0), 3)", needle);
     assert!(
-        meta.contains("(%measure (%domain (%array 1 (3) (%scalar real))))"),
+        meta.contains("(%measure (%domain (%array 1 (3) (%scalar real))) (%mass %normalized))"),
         "got: {meta}"
     );
 }
@@ -152,7 +154,7 @@ fn unknown_op_is_an_honest_gap() {
     );
     let out = flatppl_flatpir::write(&module);
     assert!(
-        out.contains("(frobnicate (%meta %deferred %fixed) 1 2)"),
+        out.contains("(frobnicate (%meta %deferred %fixed %unknown) 1 2)"),
         "got:\n{out}"
     );
 }
@@ -165,7 +167,7 @@ fn level_phase_annotates_no_types() {
     flatppl_infer::infer_with(&mut module, flatppl_infer::Level::Phase);
     let out = flatppl_flatpir::write(&module);
     assert!(
-        out.contains("(draw (%meta %deferred %stochastic)"),
+        out.contains("(draw (%meta %deferred %stochastic %deferred)"),
         "got:\n{out}"
     );
     assert!(
@@ -231,7 +233,7 @@ fn mvnormal_dim_from_mu_type() {
     let (module, _) = infer_src(src);
     let out = flatppl_flatpir::write(&module);
     assert!(
-        out.contains("(%measure (%domain (%array 1 (2) (%scalar real))))"),
+        out.contains("(%measure (%domain (%array 1 (2) (%scalar real))) (%mass %normalized))"),
         "got:\n{out}"
     );
 }
@@ -245,12 +247,12 @@ fn broadcast_distribution_head_is_a_measure_over_the_array() {
     let out = flatppl_flatpir::write(&module);
     assert!(
         out.contains(
-            "(broadcast (%meta (%measure (%domain (%array 1 (3) (%scalar real)))) %fixed)"
+            "(broadcast (%meta (%measure (%domain (%array 1 (3) (%scalar real))) (%mass %normalized)) %fixed %unknown)"
         ),
         "got:\n{out}"
     );
     assert!(
-        out.contains("(draw (%meta (%array 1 (3) (%scalar real)) %stochastic)"),
+        out.contains("(draw (%meta (%array 1 (3) (%scalar real)) %stochastic %unknown)"),
         "got:\n{out}"
     );
 }
@@ -264,7 +266,7 @@ fn broadcast_user_kernel_head_with_keyword_data() {
     let out = flatppl_flatpir::write(&module);
     assert!(
         out.contains(
-            "(broadcast (%meta (%measure (%domain (%array 1 (2) (%scalar real)))) %fixed)"
+            "(broadcast (%meta (%measure (%domain (%array 1 (2) (%scalar real))) (%mass %normalized)) %fixed %unknown)"
         ),
         "got:\n{out}"
     );
@@ -277,7 +279,96 @@ fn weighted_types_from_its_base_measure() {
     let (module, _) = infer_src(src);
     let out = flatppl_flatpir::write(&module);
     assert!(
-        out.contains("(normalize (%meta (%measure (%domain (%scalar real))) %fixed)"),
+        out.contains("(normalize (%meta (%measure (%domain (%scalar real)) (%mass %normalized)) %fixed reals)"),
         "got:\n{out}"
     );
+}
+
+// ---- value sets and total-mass classes ----
+
+#[test]
+fn mass_classes_compose() {
+    let src = "lam = Lebesgue(reals)\n\
+               lu = Lebesgue(unitinterval)\n\
+               t = truncate(Normal(0.0, 1.0), interval(0, inf))\n\
+               n = normalize(t)\n\
+               post = bayesupdate(n, n)";
+    let (module, _) = infer_src(src);
+    let out = flatppl_flatpir::write(&module);
+    // Unbounded reference measure: infinite but boundedly finite.
+    assert!(
+        out.contains("(Lebesgue (%meta (%measure (%domain (%scalar real)) (%mass %locallyfinite)) %fixed reals) reals)"),
+        "got:\n{out}"
+    );
+    // Bounded support: finite.
+    assert!(
+        out.contains("(Lebesgue (%meta (%measure (%domain (%scalar real)) (%mass %finite)) %fixed unitinterval) unitinterval)"),
+        "got:\n{out}"
+    );
+    // Truncation demotes %normalized to %finite (renormalization is not
+    // optional); normalize restores %normalized; bayesupdate is %unknown.
+    assert!(
+        out.contains("(truncate (%meta (%measure (%domain (%scalar real)) (%mass %finite))"),
+        "got:\n{out}"
+    );
+    assert!(
+        out.contains("(normalize (%meta (%measure (%domain (%scalar real)) (%mass %normalized))"),
+        "got:\n{out}"
+    );
+    assert!(
+        out.contains("(bayesupdate (%meta (%measure (%domain (%scalar real)) (%mass %unknown))"),
+        "got:\n{out}"
+    );
+}
+
+#[test]
+fn normalize_of_known_infinite_mass_is_a_static_error() {
+    let (module, diags) = infer_src("m = normalize(Lebesgue(reals))");
+    assert!(
+        diags
+            .iter()
+            .any(|d| d.severity == Severity::Error && d.message.contains("infinite total mass")),
+        "got: {diags:?}"
+    );
+    let out = flatppl_flatpir::write(&module);
+    assert!(out.contains("%failed"), "got:\n{out}");
+}
+
+#[test]
+fn valueset_producers_and_simplex_chain() {
+    // The §08 support column: a Dirichlet draw lands on the simplex; softmax
+    // lands on the simplex; the broadcast/categorical mass story rides it.
+    let src = "x ~ Dirichlet([1.0, 1.0, 1.0])\nz = softmax([0.0, 1.0])\nc = Categorical(x)";
+    let (module, _) = infer_src(src);
+    let out = flatppl_flatpir::write(&module);
+    assert!(
+        out.contains("(draw (%meta (%array 1 (3) (%scalar real)) %stochastic (stdsimplex 3))"),
+        "got:\n{out}"
+    );
+    assert!(
+        out.contains("(softmax (%meta (%array 1 (2) (%scalar real)) %fixed (stdsimplex 2))"),
+        "got:\n{out}"
+    );
+    assert!(
+        out.contains("(Categorical (%meta (%measure (%domain (%scalar integer)) (%mass %normalized)) %stochastic posintegers)"),
+        "got:\n{out}"
+    );
+}
+
+#[test]
+fn level_valueset_vs_normalization() {
+    let src = "m = Normal(0.0, 1.0)";
+    // Valueset level: support filled, mass still %deferred.
+    let mut module = flatppl_syntax::parse(src).unwrap();
+    flatppl_infer::infer_with(&mut module, flatppl_infer::Level::Valueset);
+    let out = flatppl_flatpir::write(&module);
+    assert!(
+        out.contains("(%measure (%domain (%scalar real)) (%mass %deferred)) %fixed reals)"),
+        "got:\n{out}"
+    );
+    // Normalization level: mass filled.
+    let mut module = flatppl_syntax::parse(src).unwrap();
+    flatppl_infer::infer_with(&mut module, flatppl_infer::Level::Normalization);
+    let out = flatppl_flatpir::write(&module);
+    assert!(out.contains("(%mass %normalized)"), "got:\n{out}");
 }

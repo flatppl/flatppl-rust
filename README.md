@@ -38,7 +38,7 @@ flatppl convert model.flatppl model.flatpir   # FlatPPL → FlatPIR
 flatppl convert model.flatpir model.flatppl   # FlatPIR → FlatPPL
 flatppl convert messy.flatppl tidy.flatppl    # canonicalize (same format)
 flatppl infer model.flatppl typed.flatpir    # emit type/phase-annotated FlatPIR
-flatppl infer --level=phase m.flatppl m.flatpir  # phases only (or: type, shape)
+flatppl infer --level=phase m.flatppl m.flatpir  # or: type, valueset, normalization, shape
 ```
 
 Formats are inferred from the file extensions. FlatPPL output uses the full

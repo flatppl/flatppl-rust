@@ -6,7 +6,10 @@
 //! §07 functions (domains/results), §08 distributions (variate domains),
 //! §06 measure combinators, §04 reified callables.
 
-use flatppl_core::{Call, Dim, Inputs, Node, NodeId, Phase, Scalar, ScalarType, Symbol, Type};
+use flatppl_core::{
+    Call, CallHead, Dim, Inputs, Mass, Node, NodeId, Phase, Scalar, ScalarType, Symbol, Type,
+    ValueSet,
+};
 
 use crate::Level;
 use crate::trace::Inferencer;
@@ -104,6 +107,15 @@ pub(crate) fn call_rule(
             elem: Box::new(Type::Scalar(ScalarType::Integer)),
         },
         "sum" | "prod" => reduce_type(arg_ty(args, 0)),
+        "l1norm" | "l2norm" | "logsumexp" => Type::Scalar(ScalarType::Real),
+        // Vector normalizations map a vector to a same-shape real vector.
+        "softmax" | "logsoftmax" | "l1unit" | "l2unit" => match arg_ty(args, 0) {
+            Some(Type::Array { shape, .. }) if shape.len() == 1 => Type::Array {
+                shape: shape.clone(),
+                elem: Box::new(Type::Scalar(ScalarType::Real)),
+            },
+            _ => Type::Deferred,
+        },
         "mean" => Type::Scalar(ScalarType::Real),
 
         // ---- value-preserving assertion (spec §07) ----
@@ -115,25 +127,31 @@ pub(crate) fn call_rule(
         // ---- measure algebra (spec §06) ----
         "lawof" => Type::Measure {
             domain: Box::new(args.first().map_or(Type::Any, |(_, t, _)| t.clone())),
+            mass: Mass::Deferred,
         },
         "draw" => measure_domain(arg_ty(args, 0)),
         "iid" => iid_type(inf, args),
-        "truncate" | "normalize" => args.first().map_or(Type::Deferred, |(_, t, _)| t.clone()),
+        // Measure-transforming ops keep the domain but get a FRESH mass slot
+        // — their total mass differs from the base's and is computed by the
+        // normalization-level rules (inheriting it via the type clone would
+        // smuggle the base's class through `fill_mass`).
+        "truncate" | "normalize" => fresh_measure(arg_ty(args, 0)),
         // `weighted(weight, base)` / `logweighted(logweight, base)` (spec
         // §06): the measure is the SECOND argument.
-        "weighted" | "logweighted" => arg_ty(args, 1).cloned().unwrap_or(Type::Deferred),
+        "weighted" | "logweighted" => fresh_measure(arg_ty(args, 1)),
         // Reference measures (spec §06): measures over their support set.
         "Lebesgue" | "Counting" => Type::Measure {
             domain: Box::new(set_element_type(inf, args.first().map(|a| a.0))),
+            mass: Mass::Deferred,
         },
         // `bayesupdate(L, prior)` (spec §06): the unnormalized posterior is a
-        // measure over the prior's domain — pick the measure-typed argument.
-        "bayesupdate" => args
-            .iter()
-            .map(|(_, t, _)| t)
-            .find(|t| matches!(t, Type::Measure { .. }))
-            .cloned()
-            .unwrap_or(Type::Deferred),
+        // measure over the prior's domain — pick the measure-typed argument,
+        // with a fresh mass slot (the posterior's mass is the evidence).
+        "bayesupdate" => fresh_measure(
+            args.iter()
+                .map(|(_, t, _)| t)
+                .find(|t| matches!(t, Type::Measure { .. })),
+        ),
         "joint" => joint_type(named),
         "likelihoodof" => likelihood_type(inf, args),
         "logdensityof" | "densityof" => Type::Scalar(ScalarType::Real),
@@ -159,6 +177,7 @@ pub(crate) fn call_rule(
         _ => match distribution_domain(inf, &name, args, named) {
             Some(domain) => Type::Measure {
                 domain: Box::new(domain),
+                mass: Mass::Deferred,
             },
             None => {
                 inf.note_gap(op);
@@ -178,6 +197,20 @@ pub(crate) fn call_rule(
 
 fn arg_ty(args: &[ArgInfo], i: usize) -> Option<&Type> {
     args.get(i).map(|(_, t, _)| t)
+}
+
+/// Clone a measure type with its mass reset to `Deferred` (to be filled by
+/// the normalization-level rule for the op at hand); non-measures clone
+/// as-is, absent arguments defer.
+fn fresh_measure(t: Option<&Type>) -> Type {
+    match t {
+        Some(Type::Measure { domain, .. }) => Type::Measure {
+            domain: domain.clone(),
+            mass: Mass::Deferred,
+        },
+        Some(other) => other.clone(),
+        None => Type::Deferred,
+    }
 }
 
 /// Numeric promotion: integer ⊔ integer = integer, real dominates integer,
@@ -377,7 +410,7 @@ fn set_element_type(inf: &mut Inferencer<'_>, node: Option<NodeId>) -> Type {
 /// The domain of a measure type, for `draw` / `rand`.
 fn measure_domain(m: Option<&Type>) -> Type {
     match m {
-        Some(Type::Measure { domain }) => domain.as_ref().clone(),
+        Some(Type::Measure { domain, .. }) => domain.as_ref().clone(),
         _ => Type::Deferred,
     }
 }
@@ -387,7 +420,7 @@ fn measure_domain(m: Option<&Type>) -> Type {
 /// dynamic until fixed-value const-eval lands (engine-concepts §17.1).
 fn iid_type(inf: &mut Inferencer<'_>, args: &[ArgInfo]) -> Type {
     let domain = match arg_ty(args, 0) {
-        Some(Type::Measure { domain }) => domain.as_ref().clone(),
+        Some(Type::Measure { domain, .. }) => domain.as_ref().clone(),
         _ => return Type::Deferred,
     };
     let Some((count_node, _, _)) = args.get(1) else {
@@ -398,6 +431,7 @@ fn iid_type(inf: &mut Inferencer<'_>, args: &[ArgInfo]) -> Type {
             shape: count_dims(inf, *count_node),
             elem: Box::new(domain),
         }),
+        mass: Mass::Deferred,
     }
 }
 
@@ -500,12 +534,13 @@ fn joint_type(named: &[NamedInfo]) -> Type {
     let mut fields = Vec::with_capacity(named.len());
     for (name, _, t, _) in named {
         match t {
-            Type::Measure { domain } => fields.push((*name, domain.as_ref().clone())),
+            Type::Measure { domain, .. } => fields.push((*name, domain.as_ref().clone())),
             _ => return Type::Deferred,
         }
     }
     Type::Measure {
         domain: Box::new(Type::Record(fields.into())),
+        mass: Mass::Deferred,
     }
 }
 
@@ -536,8 +571,16 @@ fn reification_type(
     };
     let body_ty = args.first().map(|(_, t, _)| t);
     match (name, body_ty) {
-        ("kernelof", _) => Type::Kernel { inputs },
-        ("functionof", Some(Type::Measure { .. })) => Type::Kernel { inputs },
+        // `kernelof` reifies the LAW of a value-typed body — a probability
+        // measure per input, i.e. a Markov kernel.
+        ("kernelof", _) => Type::Kernel {
+            inputs,
+            mass: Mass::Normalized,
+        },
+        ("functionof", Some(Type::Measure { mass, .. })) => Type::Kernel {
+            inputs,
+            mass: *mass,
+        },
         ("functionof", _) => Type::Function { inputs },
         _ => Type::Deferred,
     }
@@ -547,14 +590,14 @@ fn reification_type(
 /// the kernel's measure domain, recovered by looking through to the reified
 /// body (spec §11 `%likelihood`).
 fn likelihood_type(inf: &mut Inferencer<'_>, args: &[ArgInfo]) -> Type {
-    let Some((k_node, Type::Kernel { inputs }, _)) = args.first() else {
+    let Some((k_node, Type::Kernel { inputs, .. }, _)) = args.first() else {
         return Type::Deferred;
     };
     let inputs = inputs.clone();
     // A `functionof`-of-measure body exposes its domain; a `kernelof` body is
     // the random *value* itself, so its type is the observation domain.
     match reified_result_type(inf, *k_node) {
-        Some(Type::Measure { domain }) => Type::Likelihood {
+        Some(Type::Measure { domain, .. }) => Type::Likelihood {
             inputs,
             obstype: domain,
         },
@@ -572,10 +615,14 @@ fn likelihood_type(inf: &mut Inferencer<'_>, args: &[ArgInfo]) -> Type {
 fn user_call_type(inf: &mut Inferencer<'_>, callee: NodeId, callee_ty: &Type) -> Type {
     match callee_ty {
         Type::Function { .. } => reified_result_type(inf, callee).unwrap_or(Type::Deferred),
-        Type::Kernel { .. } => match reified_result_type(inf, callee) {
-            Some(m @ Type::Measure { .. }) => m,
+        Type::Kernel { mass, .. } => match reified_result_type(inf, callee) {
+            Some(Type::Measure { domain, .. }) => Type::Measure {
+                domain,
+                mass: *mass,
+            },
             Some(value_ty) => Type::Measure {
                 domain: Box::new(value_ty),
+                mass: *mass,
             },
             None => Type::Deferred,
         },
@@ -584,8 +631,8 @@ fn user_call_type(inf: &mut Inferencer<'_>, callee: NodeId, callee_ty: &Type) ->
 }
 
 /// Look through a callable expression (a `%ref` to a binding, or an inline
-/// reification) to its reified body's inferred type.
-fn reified_result_type(inf: &mut Inferencer<'_>, mut node: NodeId) -> Option<Type> {
+/// reification) to its reified body node.
+fn reified_body(inf: &Inferencer<'_>, mut node: NodeId) -> Option<NodeId> {
     // Deref self-module refs to the bound RHS (already inferred — typing the
     // callee forced the binding).
     loop {
@@ -594,13 +641,16 @@ fn reified_result_type(inf: &mut Inferencer<'_>, mut node: NodeId) -> Option<Typ
                 let binding = inf.module.binding_by_name(r.name)?;
                 node = inf.module.binding(binding).rhs;
             }
-            Node::Call(c) if c.inputs.is_some() => {
-                let body = *c.args.first()?;
-                return inf.lookup_type(body).cloned();
-            }
+            Node::Call(c) if c.inputs.is_some() => return c.args.first().copied(),
             _ => return None,
         }
     }
+}
+
+/// The inferred type of a callable's reified body.
+fn reified_result_type(inf: &mut Inferencer<'_>, node: NodeId) -> Option<Type> {
+    let body = reified_body(inf, node)?;
+    inf.lookup_type(body).cloned()
 }
 
 /// `broadcast(f_or_K, args…)` (spec §04 broadcasting): a deterministic head
@@ -649,9 +699,10 @@ fn broadcast_type(inf: &mut Inferencer<'_>, args: &[ArgInfo], named: &[NamedInfo
                 elem: Box::new(cell),
             };
         }
-        Type::Kernel { .. } => {
+        Type::Kernel { mass, .. } => {
+            let mass = *mass;
             let cell = match reified_result_type(inf, head_node) {
-                Some(Type::Measure { domain }) => *domain,
+                Some(Type::Measure { domain, .. }) => *domain,
                 Some(value_ty) => value_ty,
                 None => return Type::Deferred,
             };
@@ -660,6 +711,7 @@ fn broadcast_type(inf: &mut Inferencer<'_>, args: &[ArgInfo], named: &[NamedInfo
                     shape,
                     elem: Box::new(cell),
                 }),
+                mass: broadcast_mass(mass),
             };
         }
         _ => {}
@@ -677,6 +729,8 @@ fn broadcast_type(inf: &mut Inferencer<'_>, args: &[ArgInfo], named: &[NamedInfo
                 shape,
                 elem: Box::new(cell_domain),
             }),
+            // Independent product of per-cell distributions.
+            mass: Mass::Normalized,
         };
     }
 
@@ -766,5 +820,405 @@ fn param_dim(inf: &Inferencer<'_>, args: &[ArgInfo], named: &[NamedInfo], kwarg:
     match ty {
         Some(Type::Array { shape, .. }) if shape.len() == 1 => shape[0],
         _ => Dim::Dynamic,
+    }
+}
+
+// =====================================================================
+// Value sets (Level::Valueset) — the third `%meta` slot
+// =====================================================================
+
+pub(crate) fn literal_valueset(s: &Scalar) -> ValueSet {
+    match s {
+        Scalar::Int(n) if *n > 0 => ValueSet::PosIntegers,
+        Scalar::Int(n) if *n == 0 => ValueSet::NonNegIntegers,
+        Scalar::Int(_) => ValueSet::Integers,
+        // A real literal is its own singleton interval.
+        Scalar::Real(r) => ValueSet::Interval(*r, *r),
+        Scalar::Bool(_) => ValueSet::Booleans,
+        Scalar::Str(_) => ValueSet::Unknown,
+    }
+}
+
+pub(crate) fn const_valueset(name: &str) -> ValueSet {
+    match name {
+        "pi" | "inf" => ValueSet::PosReals,
+        "im" => ValueSet::Complexes,
+        _ => ValueSet::Unknown,
+    }
+}
+
+/// The value set of a call node: a measure node's support, a value node's
+/// strongest known containing set. Conservative — `Unknown` is always sound.
+pub(crate) fn call_valueset(
+    inf: &mut Inferencer<'_>,
+    call: &Call,
+    callee: Option<&(NodeId, Type)>,
+    args: &[ArgInfo],
+    named: &[NamedInfo],
+    ty: &Type,
+) -> ValueSet {
+    // User-callable application: the reified body's set rides over (for a
+    // kernel call, the body set IS the output measure's support).
+    if let Some((callee_node, _)) = callee {
+        return match reified_body(inf, *callee_node) {
+            Some(body) => inf.lookup_valueset(body),
+            None => ValueSet::Unknown,
+        };
+    }
+    let CallHead::Builtin(op) = call.head else {
+        return ValueSet::Unknown;
+    };
+    // Reifications are callables, not values.
+    if call.inputs.is_some() {
+        return ValueSet::Unknown;
+    }
+    let name = inf.module.resolve(op).to_string();
+    match name.as_str() {
+        // Parameters / loaded sets.
+        "elementof" | "external" => set_expr_valueset(inf, args.first().map(|a| a.0)),
+        // Measure supports (the measure node's value set IS its support).
+        "Lebesgue" | "Counting" => set_expr_valueset(inf, args.first().map(|a| a.0)),
+        "lawof" => args
+            .first()
+            .map_or(ValueSet::Unknown, |(n, _, _)| inf.lookup_valueset(*n)),
+        "truncate" => {
+            // Sound superset: the truncated support lies inside S.
+            match set_expr_valueset(inf, args.get(1).map(|a| a.0)) {
+                ValueSet::Unknown => args
+                    .first()
+                    .map_or(ValueSet::Unknown, |(n, _, _)| inf.lookup_valueset(*n)),
+                set => set,
+            }
+        }
+        // Reweighting never grows the support.
+        "normalize" | "bayesupdate" => args
+            .first()
+            .map_or(ValueSet::Unknown, |(n, _, _)| inf.lookup_valueset(*n)),
+        "weighted" | "logweighted" => args
+            .get(1)
+            .map_or(ValueSet::Unknown, |(n, _, _)| inf.lookup_valueset(*n)),
+        // Drawing yields a value in the measure's support.
+        "draw" => args
+            .first()
+            .map_or(ValueSet::Unknown, |(n, _, _)| inf.lookup_valueset(*n)),
+        "iid" => {
+            let inner = args
+                .first()
+                .map_or(ValueSet::Unknown, |(n, _, _)| inf.lookup_valueset(*n));
+            match (inner, ty) {
+                (ValueSet::Unknown, _) => ValueSet::Unknown,
+                (inner, Type::Measure { domain, .. }) => match domain.as_ref() {
+                    Type::Array { shape, .. } if shape.len() == 1 => {
+                        ValueSet::CartPow(Box::new(inner), shape[0])
+                    }
+                    _ => ValueSet::Unknown,
+                },
+                _ => ValueSet::Unknown,
+            }
+        }
+        // Normalization functions (spec §07).
+        "softmax" => ValueSet::StdSimplex(vector_dim(arg_ty(args, 0))),
+        "l1unit" => {
+            let arg_set = args
+                .first()
+                .map_or(ValueSet::Unknown, |(n, _, _)| inf.lookup_valueset(*n));
+            // `v/‖v‖₁` lies on the simplex only for nonnegative `v`.
+            if arg_set.subset_of(&ValueSet::CartPow(
+                Box::new(ValueSet::NonNegReals),
+                Dim::Dynamic,
+            )) {
+                ValueSet::StdSimplex(vector_dim(arg_ty(args, 0)))
+            } else {
+                ValueSet::Unknown
+            }
+        }
+        // Range-constrained scalar functions.
+        "exp" => ValueSet::PosReals,
+        "abs" | "abs2" | "sqrt" => ValueSet::NonNegReals,
+        "invlogit" | "invprobit" => ValueSet::UnitInterval,
+        // Homogeneous vectors inherit a common element set.
+        "vector" => {
+            let mut elem: Option<ValueSet> = None;
+            for (n, _, _) in args {
+                let set = inf.lookup_valueset(*n);
+                match &elem {
+                    None => elem = Some(set),
+                    Some(prev) if *prev == set => {}
+                    Some(_) => return ValueSet::Unknown,
+                }
+            }
+            match elem {
+                Some(e) if e != ValueSet::Unknown => {
+                    ValueSet::CartPow(Box::new(e), Dim::Static(args.len() as u32))
+                }
+                _ => ValueSet::Unknown,
+            }
+        }
+        // Distribution constructors: the support column of spec §08.
+        _ => distribution_support(inf, &name, args, named),
+    }
+}
+
+/// The single dim of a vector-typed argument, for simplex sizes.
+fn vector_dim(ty: Option<&Type>) -> Dim {
+    match ty {
+        Some(Type::Array { shape, .. }) if shape.len() == 1 => shape[0],
+        _ => Dim::Dynamic,
+    }
+}
+
+/// A set *expression* (an `elementof` / `truncate` / reference-measure
+/// argument) read structurally into a [`ValueSet`].
+fn set_expr_valueset(inf: &mut Inferencer<'_>, node: Option<NodeId>) -> ValueSet {
+    let Some(node) = node else {
+        return ValueSet::Unknown;
+    };
+    match inf.module.node(node).clone() {
+        Node::Const(sym) => match inf.module.resolve(sym) {
+            "reals" => ValueSet::Reals,
+            "posreals" => ValueSet::PosReals,
+            "nonnegreals" => ValueSet::NonNegReals,
+            "unitinterval" => ValueSet::UnitInterval,
+            "integers" => ValueSet::Integers,
+            "posintegers" => ValueSet::PosIntegers,
+            "nonnegintegers" => ValueSet::NonNegIntegers,
+            "booleans" => ValueSet::Booleans,
+            "complexes" => ValueSet::Complexes,
+            "rngstates" => ValueSet::RngStates,
+            "anything" => ValueSet::Anything,
+            _ => ValueSet::Unknown,
+        },
+        Node::Call(c) => {
+            let CallHead::Builtin(op) = c.head else {
+                return ValueSet::Unknown;
+            };
+            match inf.module.resolve(op).to_string().as_str() {
+                "interval" => {
+                    let bound = |n: Option<&NodeId>| match n.map(|&n| inf.module.node(n).clone()) {
+                        Some(Node::Lit(Scalar::Real(r))) => Some(r),
+                        Some(Node::Lit(Scalar::Int(i))) => Some(i as f64),
+                        Some(Node::Const(sym)) if inf.module.resolve(sym) == "inf" => {
+                            Some(f64::INFINITY)
+                        }
+                        Some(Node::Call(neg))
+                            if matches!(neg.head, CallHead::Builtin(op)
+                                if inf.module.resolve(op) == "neg") =>
+                        {
+                            bound_of(inf, neg.args.first().copied()).map(|b| -b)
+                        }
+                        _ => None,
+                    };
+                    match (bound(c.args.first()), bound(c.args.get(1))) {
+                        (Some(lo), Some(hi)) => ValueSet::Interval(lo, hi),
+                        _ => ValueSet::Unknown,
+                    }
+                }
+                "stdsimplex" => ValueSet::StdSimplex(
+                    c.args
+                        .first()
+                        .map_or(Dim::Dynamic, |&n| resolve_dim(inf, n)),
+                ),
+                "cartpow" => {
+                    let elem = set_expr_valueset(inf, c.args.first().copied());
+                    if elem == ValueSet::Unknown {
+                        return ValueSet::Unknown;
+                    }
+                    let dim = c.args.get(1).map_or(Dim::Dynamic, |&n| resolve_dim(inf, n));
+                    ValueSet::CartPow(Box::new(elem), dim)
+                }
+                _ => ValueSet::Unknown,
+            }
+        }
+        _ => ValueSet::Unknown,
+    }
+}
+
+/// A literal numeric bound (used by the `interval` reader above for `neg`).
+fn bound_of(inf: &Inferencer<'_>, node: Option<NodeId>) -> Option<f64> {
+    match node.map(|n| inf.module.node(n)) {
+        Some(Node::Lit(Scalar::Real(r))) => Some(*r),
+        Some(Node::Lit(Scalar::Int(i))) => Some(*i as f64),
+        Some(Node::Const(sym)) if inf.module.resolve(*sym) == "inf" => Some(f64::INFINITY),
+        _ => None,
+    }
+}
+
+/// The §08 Domain/Support column as a producer table: the support of a
+/// distribution constructor, or `Unknown` for a non-distribution.
+fn distribution_support(
+    inf: &mut Inferencer<'_>,
+    name: &str,
+    args: &[ArgInfo],
+    named: &[NamedInfo],
+) -> ValueSet {
+    use ValueSet::*;
+    match name {
+        "Uniform" => set_expr_valueset(inf, args.first().map(|a| a.0)),
+        "Normal" | "GeneralizedNormal" | "Cauchy" | "StudentT" | "Logistic" | "VonMises"
+        | "Laplace" => Reals,
+        "LogNormal" | "Gamma" | "InverseGamma" | "ChiSquared" => PosReals,
+        "Exponential" | "Weibull" => NonNegReals,
+        "Beta" => UnitInterval,
+        "Bernoulli" => Booleans,
+        "Categorical" => PosIntegers,
+        "Categorical0" | "Binomial" | "Geometric" | "NegativeBinomial" | "NegativeBinomial2"
+        | "Poisson" => NonNegIntegers,
+        "MvNormal" => CartPow(Box::new(Reals), param_dim(inf, args, named, "mu")),
+        "Dirichlet" => StdSimplex(param_dim(inf, args, named, "alpha")),
+        "Multinomial" => CartPow(Box::new(NonNegIntegers), param_dim(inf, args, named, "p")),
+        _ => Unknown,
+    }
+}
+
+// =====================================================================
+// Total-mass classes (Level::Normalization) — spec §11
+// =====================================================================
+
+/// Fill the `%mass` slot of a measure/kernel-typed call result, per the §06
+/// composition rules. `normalize` on a measure with statically known zero or
+/// infinite mass is a static error (spec: the result is undefined).
+pub(crate) fn fill_mass(
+    inf: &mut Inferencer<'_>,
+    call: &Call,
+    callee: Option<&(NodeId, Type)>,
+    ty: Type,
+    args: &[ArgInfo],
+    named: &[NamedInfo],
+) -> Type {
+    // Only measure types carry a deferred mass to fill; kernels and user
+    // calls were filled at construction (their mass rides the callee).
+    let Type::Measure { domain, mass } = ty else {
+        return ty;
+    };
+    if mass != Mass::Deferred {
+        return Type::Measure { domain, mass };
+    }
+    if callee.is_some() || call.inputs.is_some() {
+        return Type::Measure { domain, mass };
+    }
+    let CallHead::Builtin(op) = call.head else {
+        return Type::Measure { domain, mass };
+    };
+    let name = inf.module.resolve(op).to_string();
+
+    let arg_mass = |i: usize| match arg_ty(args, i) {
+        Some(Type::Measure { mass, .. }) => *mass,
+        _ => Mass::Unknown,
+    };
+
+    let mass = match name.as_str() {
+        // Every §08 distribution is a probability measure.
+        "lawof" => Mass::Normalized,
+        // Reference measures: finite on a bounded support, infinite (but
+        // boundedly finite) on an unbounded one.
+        "Lebesgue" | "Counting" => {
+            match set_expr_valueset(inf, args.first().map(|a| a.0)).is_bounded() {
+                Some(true) => Mass::Finite,
+                Some(false) => Mass::LocallyFinite,
+                None => Mass::Unknown,
+            }
+        }
+        "iid" => match arg_mass(0) {
+            Mass::Normalized => Mass::Normalized,
+            Mass::Null => Mass::Null,
+            Mass::Finite => Mass::Finite,
+            Mass::LocallyFinite => Mass::LocallyFinite,
+            _ => Mass::Unknown,
+        },
+        "joint" => {
+            let masses: Vec<Mass> = named
+                .iter()
+                .map(|(_, _, t, _)| match t {
+                    Type::Measure { mass, .. } => *mass,
+                    _ => Mass::Unknown,
+                })
+                .collect();
+            product_mass(&masses)
+        }
+        "truncate" => match arg_mass(0) {
+            Mass::Null => Mass::Null,
+            Mass::Normalized | Mass::Finite => Mass::Finite,
+            Mass::LocallyFinite => {
+                match set_expr_valueset(inf, args.get(1).map(|a| a.0)).is_bounded() {
+                    Some(true) => Mass::Finite,
+                    _ => Mass::Unknown,
+                }
+            }
+            _ => Mass::Unknown,
+        },
+        // A fixed scalar weight rescales: classes survive, except that an
+        // unknown constant demotes `%normalized` to `%finite`.
+        "weighted" | "logweighted" => {
+            let base = arg_mass(1);
+            if base == Mass::Null {
+                Mass::Null
+            } else if matches!(
+                (arg_ty(args, 0), args.first().map(|(_, _, p)| *p)),
+                (Some(Type::Scalar(_)), Some(Phase::Fixed))
+            ) {
+                match base {
+                    Mass::Normalized | Mass::Finite => Mass::Finite,
+                    Mass::LocallyFinite => Mass::LocallyFinite,
+                    _ => Mass::Unknown,
+                }
+            } else {
+                Mass::Unknown
+            }
+        }
+        "normalize" => match arg_mass(0) {
+            Mass::Null => {
+                inf.diags.push(crate::Diagnostic::error(
+                    "`normalize` of a measure with zero total mass is undefined (spec §06)",
+                ));
+                return Type::Failed("normalize of a zero-mass measure".into());
+            }
+            Mass::LocallyFinite => {
+                inf.diags.push(crate::Diagnostic::error(
+                    "`normalize` of a measure with infinite total mass is undefined (spec §06)",
+                ));
+                return Type::Failed("normalize of an infinite-mass measure".into());
+            }
+            _ => Mass::Normalized,
+        },
+        "bayesupdate" => Mass::Unknown,
+        "jointchain" => match (arg_mass(0), arg_mass(1)) {
+            (m, Mass::Normalized) => m,
+            _ => Mass::Unknown,
+        },
+        // A §08 distribution constructor (this arm is reached only for
+        // measure-typed results, i.e. recognized distributions).
+        _ => Mass::Normalized,
+    };
+    Type::Measure { domain, mass }
+}
+
+/// The mass of an independent product of components.
+fn product_mass(masses: &[Mass]) -> Mass {
+    use Mass::*;
+    if masses.contains(&Null) {
+        return Null;
+    }
+    if masses.iter().all(|m| *m == Normalized) {
+        return Normalized;
+    }
+    if masses.iter().all(|m| matches!(m, Normalized | Finite)) {
+        return Finite;
+    }
+    if masses
+        .iter()
+        .all(|m| matches!(m, Normalized | Finite | LocallyFinite))
+    {
+        return LocallyFinite;
+    }
+    Unknown
+}
+
+/// Broadcasting a kernel over data cells: an independent product per cell.
+fn broadcast_mass(cell: Mass) -> Mass {
+    match cell {
+        Mass::Normalized => Mass::Normalized,
+        Mass::Null => Mass::Null,
+        Mass::Finite => Mass::Finite,
+        _ => Mass::Unknown,
     }
 }
