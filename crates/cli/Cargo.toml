@@ -19,3 +19,4 @@ flatppl-core = { path = "../core" }
 flatppl-syntax = { path = "../syntax" }
 flatppl-flatpir = { path = "../flatpir" }
 clap = { workspace = true }
+ariadne = { workspace = true }

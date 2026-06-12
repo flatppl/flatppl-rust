@@ -15,4 +15,5 @@ license = "MIT"
 repository = "https://github.com/flatppl/flatppl-rust"
 
 [workspace.dependencies]
+ariadne = "0.6"
 clap = { version = "4", features = ["derive"] }

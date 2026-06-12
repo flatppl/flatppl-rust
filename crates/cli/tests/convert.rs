@@ -113,3 +113,28 @@ fn reports_parse_errors_with_the_file_name() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("bad.flatppl"), "got:\n{stderr}");
 }
+
+/// Parse errors render as a source-annotated report: file:line:col header,
+/// the offending source line, and a span marker — not just a bare message.
+#[test]
+fn renders_span_diagnostics() {
+    let dir = Scratch::new("diag");
+    let src = dir.path("bad.flatppl");
+    fs::write(&src, "x = 1\nself = elementof(reals)\n").unwrap();
+
+    let out = bin()
+        .arg("convert")
+        .arg(&src)
+        .arg(dir.path("out.flatpir"))
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("`self` is a reserved module name"),
+        "got:\n{stderr}"
+    );
+    assert!(stderr.contains("bad.flatppl:2:1"), "got:\n{stderr}");
+    // The offending source line is quoted in the snippet.
+    assert!(stderr.contains("self = elementof(reals)"), "got:\n{stderr}");
+}

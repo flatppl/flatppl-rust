@@ -7,9 +7,11 @@
 //! further subcommands.
 
 use std::fs;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use ariadne::{Config, Label, Report, ReportKind, Source};
 use clap::{Parser, Subcommand, ValueEnum};
 use flatppl_core::Module;
 
@@ -81,6 +83,27 @@ impl Format {
     }
 }
 
+/// Why a command failed: a plain one-line message (I/O, usage), or a parse
+/// diagnostic rendered as a source-annotated report.
+enum Failure {
+    Plain(String),
+    Diagnostic {
+        path: PathBuf,
+        source: String,
+        message: String,
+        /// 1-based source line (0 = unlocalized).
+        line: usize,
+        /// Byte span `[start, end)`, when the error carries one.
+        span: Option<(usize, usize)>,
+    },
+}
+
+impl From<String> for Failure {
+    fn from(msg: String) -> Self {
+        Failure::Plain(msg)
+    }
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
@@ -92,34 +115,109 @@ fn main() -> ExitCode {
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
-        Err(msg) => {
+        Err(Failure::Plain(msg)) => {
             eprintln!("flatppl: {msg}");
+            ExitCode::FAILURE
+        }
+        Err(Failure::Diagnostic {
+            path,
+            source,
+            message,
+            line,
+            span,
+        }) => {
+            render_diagnostic(&path, &source, &message, line, span);
             ExitCode::FAILURE
         }
     }
 }
 
-fn convert(input: &Path, output: &Path, syntax: flatppl_syntax::Syntax) -> Result<(), String> {
+/// Print a source-annotated error report to stderr. The span is the error's
+/// own when it carries one; a line-only error highlights its whole line; an
+/// unlocalized error degrades to a plain message.
+fn render_diagnostic(
+    path: &Path,
+    source: &str,
+    message: &str,
+    line: usize,
+    span: Option<(usize, usize)>,
+) {
+    let located = span.or_else(|| line_span(source, line));
+    let (Some((start, end)), false) = (located, source.is_empty()) else {
+        eprintln!("flatppl: {}: {message}", path.display());
+        return;
+    };
+    // Clamp to the source: spans may legitimately point at EOF (zero-width
+    // cursor past the last byte), and the renderer needs in-bounds offsets.
+    let start = start.min(source.len() - 1);
+    let end = end.clamp(start + 1, source.len());
+
+    let name = path.display().to_string();
+    let report = Report::build(ReportKind::Error, (name.clone(), start..end))
+        .with_config(Config::default().with_color(std::io::stderr().is_terminal()))
+        .with_message(message)
+        .with_label(Label::new((name.clone(), start..end)).with_message("here"))
+        .finish();
+    let _ = report.eprint((name, Source::from(source)));
+}
+
+/// Byte range of the 1-based `line` in `source` (at least one byte, so an
+/// empty line still renders a caret).
+fn line_span(source: &str, line: usize) -> Option<(usize, usize)> {
+    if line == 0 {
+        return None;
+    }
+    let mut start = 0usize;
+    for (i, raw) in source.split_inclusive('\n').enumerate() {
+        if i + 1 == line {
+            let content = raw.trim_end_matches(['\n', '\r']);
+            return Some((start, start + content.len().max(1)));
+        }
+        start += raw.len();
+    }
+    None
+}
+
+fn convert(input: &Path, output: &Path, syntax: flatppl_syntax::Syntax) -> Result<(), Failure> {
     let from = Format::from_path(input)?;
     let to = Format::from_path(output)?;
     let source =
         fs::read_to_string(input).map_err(|e| format!("reading `{}`: {e}", input.display()))?;
 
-    let module = read_module(from, &source, input)?;
+    let module = match read_module(from, &source) {
+        Ok(module) => module,
+        Err((message, line, span)) => {
+            return Err(Failure::Diagnostic {
+                path: input.to_path_buf(),
+                source,
+                message,
+                line,
+                span,
+            });
+        }
+    };
     let mut text = write_module(to, &module, syntax);
     if !text.ends_with('\n') {
         text.push('\n');
     }
-    fs::write(output, text).map_err(|e| format!("writing `{}`: {e}", output.display()))
+    fs::write(output, text)
+        .map_err(|e| Failure::Plain(format!("writing `{}`: {e}", output.display())))
 }
 
-fn read_module(format: Format, source: &str, path: &Path) -> Result<Module, String> {
+/// Parse/read `source`; an error comes back as `(message, line, span)` in a
+/// format-agnostic shape for [`render_diagnostic`].
+type ReadError = (String, usize, Option<(usize, usize)>);
+
+fn read_module(format: Format, source: &str) -> Result<Module, ReadError> {
+    fn widen(span: Option<(u32, u32)>) -> Option<(usize, usize)> {
+        span.map(|(s, e)| (s as usize, e as usize))
+    }
     match format {
         Format::FlatPpl => {
-            flatppl_syntax::parse(source).map_err(|e| format!("{}: {e}", path.display()))
+            flatppl_syntax::parse(source).map_err(|e| (e.message, e.line as usize, widen(e.span)))
         }
         Format::FlatPir => {
-            flatppl_flatpir::read(source).map_err(|e| format!("{}: {e}", path.display()))
+            flatppl_flatpir::read(source).map_err(|e| (e.message, e.line, widen(e.span)))
         }
     }
 }
