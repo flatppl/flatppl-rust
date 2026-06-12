@@ -1,19 +1,21 @@
-; Annotated FlatPIR — spec §11 annotated `helpers.flatpir` (%meta type/phase).
-; Exercises %scalar, %kernel/%inputs, %measure/%domain, and the three phases.
+; Annotated FlatPIR — spec §11 annotated `helpers.flatpir` (%meta type/phase/valueset).
+; Exercises %scalar, %kernel/%inputs/%mass, %measure/%domain/%mass, the three
+; phases, and value-set slots (elementof sets, distribution supports).
 (%module
   (%public center spread obs_kernel shifted_value)
 
   (%bind center
-    (elementof (%meta (%scalar real) %parameterized) reals))
+    (elementof (%meta (%scalar real) %parameterized reals) reals))
 
   (%bind spread
-    (elementof (%meta (%scalar real) %parameterized) posreals))
+    (elementof (%meta (%scalar real) %parameterized posreals) posreals))
 
   (%bind obs_kernel
     (functionof
-      (%meta (%kernel (%inputs center spread x)) %fixed)
-      (Normal (%meta (%measure (%domain (%scalar real))) %parameterized)
-        (%kwarg mu (add (%meta (%scalar real) %parameterized)
+      (%meta (%kernel (%inputs center spread x) (%mass %normalized)) %fixed %unknown)
+      (Normal (%meta (%measure (%domain (%scalar real)) (%mass %normalized))
+                     %parameterized reals)
+        (%kwarg mu (add (%meta (%scalar real) %parameterized %unknown)
                         (%ref self center) (%ref %local _x_)))
         (%kwarg sigma (%ref self spread)))
       %specinputs
@@ -22,5 +24,5 @@
        (x (%ref %local _x_)))))
 
   (%bind shifted_value
-    (add (%meta (%scalar real) %parameterized)
+    (add (%meta (%scalar real) %parameterized %unknown)
          (%ref self center) 1.0)))

@@ -23,4 +23,4 @@ pub use module::{Binding, Doc, Markup, Module, Span};
 pub use node::{
     Axis, Call, CallHead, Inputs, NamedArg, NamedKind, Node, Ref, RefNs, Scalar, Variance,
 };
-pub use ty::{Dim, Phase, ScalarType, Type};
+pub use ty::{Dim, Mass, Phase, ScalarType, Type, ValueSet};

@@ -1,22 +1,24 @@
 ; Annotated FlatPIR — spec §11 annotated `model.flatpir`.
-; Exercises %module type, %likelihood/%inputs/%obstype, draw/add phases.
+; Exercises %module type, %likelihood/%inputs/%obstype, draw/add phases,
+; %mass on measures, and value-set slots.
 (%module
   (%public a b input_data L)
 
   (%bind helpers
-    (load_module (%meta %module %fixed)
+    (load_module (%meta %module %fixed %unknown)
                  "helpers.flatppl" (%assign center (%ref self a))))
 
   (%bind a
-    (elementof (%meta (%scalar real) %parameterized) reals))
+    (elementof (%meta (%scalar real) %parameterized reals) reals))
 
   (%bind b
-    (draw (%meta (%scalar real) %stochastic)
-          (Normal (%meta (%measure (%domain (%scalar real))) %fixed)
+    (draw (%meta (%scalar real) %stochastic reals)
+          (Normal (%meta (%measure (%domain (%scalar real)) (%mass %normalized))
+                         %fixed reals)
                   (%kwarg mu 0.0) (%kwarg sigma 2.0))))
 
   (%bind _combined
-    (add (%meta (%scalar real) %stochastic)
+    (add (%meta (%scalar real) %stochastic %unknown)
          (%ref self a) (%ref self b)))
 
   (%bind input_data 2.5)
@@ -25,5 +27,5 @@
     (likelihoodof
       (%meta (%likelihood (%inputs center spread x)
                           (%obstype (%scalar real)))
-             %fixed)
+             %fixed %unknown)
       (%ref helpers obs_kernel) (%ref self input_data))))

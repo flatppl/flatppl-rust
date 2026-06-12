@@ -11,6 +11,7 @@
 use crate::error::{Error, Result};
 use crate::sexpr::{self, Sexpr};
 use flatppl_core::{
+    Mass, ValueSet,
     Axis, Binding, Call, CallHead, Dim, Doc, Inputs, Markup, Module, NamedArg, NamedKind, Node,
     NodeId, Phase, Ref, RefNs, Scalar, ScalarType, Symbol, Type, Variance,
 };
@@ -258,7 +259,7 @@ fn read_reification(module: &mut Module, op: &str, rest: &[Sexpr]) -> Result<Nod
         Some(Sexpr::List(inner)) if inner.first().and_then(Sexpr::as_atom) == Some("%meta") => {
             (parse_meta(module, &rest[0])?, &rest[1..])
         }
-        _ => ((None, None), rest),
+        _ => ((None, None, None), rest),
     };
 
     if rest.len() != 3 {
@@ -331,13 +332,16 @@ fn parse_input_entries(module: &mut Module, form: &Sexpr) -> Result<Box<[(Symbol
 struct CallTail {
     args: Vec<NodeId>,
     named: Vec<NamedArg>,
-    meta: (Option<Type>, Option<Phase>),
+    meta: Meta,
 }
+
+/// The three `%meta` slots: type, phase, value set.
+type Meta = (Option<Type>, Option<Phase>, Option<ValueSet>);
 
 fn parse_call_tail(module: &mut Module, items: &[Sexpr]) -> Result<CallTail> {
     let mut args = Vec::new();
     let mut named = Vec::new();
-    let mut meta = (None, None);
+    let mut meta = (None, None, None);
 
     for item in items {
         match tail_kind(item) {
@@ -384,23 +388,92 @@ fn parse_named(module: &mut Module, item: &Sexpr, kind: NamedKind) -> Result<Nam
     Ok(NamedArg { kind, name, value })
 }
 
-fn apply_meta(module: &mut Module, id: NodeId, meta: (Option<Type>, Option<Phase>)) {
+fn apply_meta(module: &mut Module, id: NodeId, meta: Meta) {
     if let Some(ty) = meta.0 {
         module.set_type(id, ty);
     }
     if let Some(phase) = meta.1 {
         module.set_phase(id, phase);
     }
+    if let Some(set) = meta.2 {
+        module.set_valueset(id, set);
+    }
 }
 
-fn parse_meta(module: &mut Module, item: &Sexpr) -> Result<(Option<Type>, Option<Phase>)> {
+fn parse_meta(module: &mut Module, item: &Sexpr) -> Result<Meta> {
     let items = list(item)?;
-    if items.len() != 3 {
-        return Err(Error::new("(%meta <type> <phase>) takes two slots"));
+    if items.len() != 4 {
+        return Err(Error::new(
+            "(%meta <type> <phase> <valueset>) takes three slots",
+        ));
     }
     let ty = read_type(module, &items[1])?;
     let phase = read_phase(&items[2])?;
-    Ok((ty, phase))
+    let set = read_valueset(&items[3])?;
+    Ok((ty, phase, set))
+}
+
+/// Read a `%meta` value-set slot: a set expression, `%unknown`, or
+/// `%deferred` (→ `None`, like the other slots).
+fn read_valueset(form: &Sexpr) -> Result<Option<ValueSet>> {
+    match form {
+        Sexpr::Atom(s) => match s.as_str() {
+            "%deferred" => Ok(None),
+            "%unknown" => Ok(Some(ValueSet::Unknown)),
+            "reals" => Ok(Some(ValueSet::Reals)),
+            "posreals" => Ok(Some(ValueSet::PosReals)),
+            "nonnegreals" => Ok(Some(ValueSet::NonNegReals)),
+            "unitinterval" => Ok(Some(ValueSet::UnitInterval)),
+            "integers" => Ok(Some(ValueSet::Integers)),
+            "posintegers" => Ok(Some(ValueSet::PosIntegers)),
+            "nonnegintegers" => Ok(Some(ValueSet::NonNegIntegers)),
+            "booleans" => Ok(Some(ValueSet::Booleans)),
+            "complexes" => Ok(Some(ValueSet::Complexes)),
+            "rngstates" => Ok(Some(ValueSet::RngStates)),
+            "anything" => Ok(Some(ValueSet::Anything)),
+            other => Err(Error::new(format!("unknown value set `{other}`"))),
+        },
+        Sexpr::Str(_) => Err(Error::new("a string is not a value set")),
+        Sexpr::List(items) => {
+            let head = atom(&items[0])?;
+            match head {
+                "stdsimplex" => {
+                    if items.len() != 2 {
+                        return Err(Error::new("(stdsimplex <n>) takes one size"));
+                    }
+                    Ok(Some(ValueSet::StdSimplex(parse_dim(&items[1])?)))
+                }
+                "interval" => {
+                    if items.len() != 3 {
+                        return Err(Error::new("(interval <lo> <hi>) takes two bounds"));
+                    }
+                    Ok(Some(ValueSet::Interval(
+                        parse_bound(&items[1])?,
+                        parse_bound(&items[2])?,
+                    )))
+                }
+                "cartpow" => {
+                    if items.len() != 3 {
+                        return Err(Error::new("(cartpow <set> <n>) takes a set and a size"));
+                    }
+                    let elem = read_valueset(&items[1])?
+                        .ok_or_else(|| Error::new("`%deferred` is not allowed inside a set"))?;
+                    Ok(Some(ValueSet::CartPow(
+                        Box::new(elem),
+                        parse_dim(&items[2])?,
+                    )))
+                }
+                other => Err(Error::new(format!("unknown value-set form `{other}`"))),
+            }
+        }
+    }
+}
+
+/// An interval bound: a numeric literal, `inf`, or `-inf`.
+fn parse_bound(form: &Sexpr) -> Result<f64> {
+    let text = atom(form)?;
+    text.parse::<f64>()
+        .map_err(|_| Error::new(format!("invalid interval bound `{text}`")))
 }
 
 // ---- types ----
@@ -470,17 +543,29 @@ fn read_type_list(module: &mut Module, items: &[Sexpr]) -> Result<Type> {
         }
         "%table" => read_table_type(module, items),
         "%measure" => {
-            if items.len() != 2 {
-                return Err(Error::new("(%measure (%domain <type>)) takes one domain"));
+            if items.len() != 3 {
+                return Err(Error::new(
+                    "(%measure (%domain <type>) (%mass <mass>)) takes a domain and a mass",
+                ));
             }
             let domain = parse_wrapped_type(module, &items[1], "%domain")?;
+            let mass = parse_wrapped_mass(&items[2])?;
             Ok(Type::Measure {
                 domain: Box::new(domain),
+                mass,
             })
         }
-        "%kernel" => Ok(Type::Kernel {
-            inputs: parse_inputs(module, items)?.into(),
-        }),
+        "%kernel" => {
+            if items.len() != 3 {
+                return Err(Error::new(
+                    "(%kernel (%inputs …) (%mass <mass>)) takes inputs and a mass",
+                ));
+            }
+            Ok(Type::Kernel {
+                inputs: parse_inputs(module, &items[..2])?.into(),
+                mass: parse_wrapped_mass(&items[2])?,
+            })
+        }
         "%function" => Ok(Type::Function {
             inputs: parse_inputs(module, items)?.into(),
         }),
@@ -564,6 +649,23 @@ fn parse_inputs(module: &mut Module, items: &[Sexpr]) -> Result<Vec<flatppl_core
         .iter()
         .map(|n| Ok(module.intern(atom(n)?)))
         .collect()
+}
+
+/// Read a `(%mass <mass>)` sub-form (spec §11 "Total-mass classes").
+fn parse_wrapped_mass(form: &Sexpr) -> Result<Mass> {
+    let items = list(form)?;
+    if items.first().and_then(Sexpr::as_atom) != Some("%mass") || items.len() != 2 {
+        return Err(Error::new("expected (%mass <mass>)"));
+    }
+    match atom(&items[1])? {
+        "%deferred" => Ok(Mass::Deferred),
+        "%null" => Ok(Mass::Null),
+        "%normalized" => Ok(Mass::Normalized),
+        "%finite" => Ok(Mass::Finite),
+        "%locallyfinite" => Ok(Mass::LocallyFinite),
+        "%unknown" => Ok(Mass::Unknown),
+        other => Err(Error::new(format!("unknown mass class `{other}`"))),
+    }
 }
 
 /// Read a single-type wrapper like `(%domain <type>)` or `(%obstype <type>)`.

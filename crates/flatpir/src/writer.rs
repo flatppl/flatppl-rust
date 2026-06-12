@@ -10,8 +10,8 @@
 //! them; a bare (pre-inference) module writes no `%meta`.
 
 use flatppl_core::{
-    Axis, Call, CallHead, Dim, Doc, Inputs, Markup, Module, NamedKind, Node, NodeId, Phase, Ref,
-    RefNs, Scalar, ScalarType, Symbol, Type, Variance,
+    Axis, Call, CallHead, Dim, Doc, Inputs, Markup, Mass, Module, NamedKind, Node, NodeId, Phase,
+    Ref, RefNs, Scalar, ScalarType, Symbol, Type, ValueSet, Variance,
 };
 
 /// Render `module` as canonical FlatPIR text (no trailing newline).
@@ -206,12 +206,52 @@ fn render_input_entries(module: &Module, entries: &[(Symbol, Ref)]) -> String {
 fn render_meta(module: &Module, id: NodeId) -> Option<String> {
     let ty = module.type_of(id);
     let phase = module.phase_of(id);
-    if ty.is_none() && phase.is_none() {
+    let vset = module.valueset_of(id);
+    if ty.is_none() && phase.is_none() && vset.is_none() {
         return None;
     }
     let ty_s = ty.map_or_else(|| "%deferred".to_string(), |t| render_type(module, t));
     let phase_s = phase.map_or("%deferred", render_phase);
-    Some(format!("(%meta {ty_s} {phase_s})"))
+    let vset_s = vset.map_or_else(|| "%deferred".to_string(), render_valueset);
+    Some(format!("(%meta {ty_s} {phase_s} {vset_s})"))
+}
+
+fn render_mass(mass: Mass) -> &'static str {
+    match mass {
+        Mass::Deferred => "%deferred",
+        Mass::Null => "%null",
+        Mass::Normalized => "%normalized",
+        Mass::Finite => "%finite",
+        Mass::LocallyFinite => "%locallyfinite",
+        Mass::Unknown => "%unknown",
+    }
+}
+
+/// A value set renders as its FlatPPL set expression (bare set constants,
+/// `(stdsimplex n)`, `(interval lo hi)`, `(cartpow set n)`).
+fn render_valueset(set: &ValueSet) -> String {
+    match set {
+        ValueSet::Deferred => "%deferred".to_string(),
+        ValueSet::Unknown => "%unknown".to_string(),
+        ValueSet::Reals => "reals".to_string(),
+        ValueSet::PosReals => "posreals".to_string(),
+        ValueSet::NonNegReals => "nonnegreals".to_string(),
+        ValueSet::UnitInterval => "unitinterval".to_string(),
+        ValueSet::Integers => "integers".to_string(),
+        ValueSet::PosIntegers => "posintegers".to_string(),
+        ValueSet::NonNegIntegers => "nonnegintegers".to_string(),
+        ValueSet::Booleans => "booleans".to_string(),
+        ValueSet::Complexes => "complexes".to_string(),
+        ValueSet::RngStates => "rngstates".to_string(),
+        ValueSet::Anything => "anything".to_string(),
+        ValueSet::StdSimplex(n) => format!("(stdsimplex {})", render_dim(*n)),
+        ValueSet::Interval(lo, hi) => {
+            format!("(interval {} {})", render_real(*lo), render_real(*hi))
+        }
+        ValueSet::CartPow(elem, n) => {
+            format!("(cartpow {} {})", render_valueset(elem), render_dim(*n))
+        }
+    }
 }
 
 fn render_phase(phase: Phase) -> &'static str {
@@ -259,10 +299,16 @@ fn render_type(module: &Module, ty: &Type) -> String {
             render_named_types(module, columns),
             render_dim(*nrows)
         ),
-        Type::Measure { domain } => format!("(%measure (%domain {}))", render_type(module, domain)),
-        Type::Kernel { inputs } => {
-            format!("(%kernel (%inputs {}))", render_input_names(module, inputs))
-        }
+        Type::Measure { domain, mass } => format!(
+            "(%measure (%domain {}) (%mass {}))",
+            render_type(module, domain),
+            render_mass(*mass)
+        ),
+        Type::Kernel { inputs, mass } => format!(
+            "(%kernel (%inputs {}) (%mass {}))",
+            render_input_names(module, inputs),
+            render_mass(*mass)
+        ),
         Type::Function { inputs } => {
             format!(
                 "(%function (%inputs {}))",

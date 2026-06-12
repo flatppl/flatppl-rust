@@ -3,7 +3,7 @@
 
 use crate::id::{Arena, BindingId, Interner, NodeId, SecondaryMap, Symbol};
 use crate::node::{Node, Ref};
-use crate::ty::{Phase, Type};
+use crate::ty::{Phase, Type, ValueSet};
 use std::collections::HashMap;
 
 /// A single FlatPPL module: a flat, order-irrelevant set of named bindings over a
@@ -30,6 +30,10 @@ pub struct Module {
     /// FlatPIR `%meta` annotates calls, and a binding's phase is just its RHS
     /// node's phase (see [`Module::binding_phase`]).
     phases: SecondaryMap<NodeId, Phase>,
+    /// Inferred value set per node (`flatppl-infer`): the strongest known set
+    /// containing the node's value (a measure node's support). The third
+    /// `%meta` slot.
+    valuesets: SecondaryMap<NodeId, ValueSet>,
     /// Source span per node (`flatppl-syntax`), for diagnostics / DAG back-refs.
     spans: SecondaryMap<NodeId, Span>,
     /// Filled `%autoinputs` lists per boundary-less reification node
@@ -144,6 +148,13 @@ impl Module {
     }
     pub fn set_phase(&mut self, id: NodeId, phase: Phase) {
         self.phases.insert(id, phase);
+    }
+
+    pub fn valueset_of(&self, id: NodeId) -> Option<&ValueSet> {
+        self.valuesets.get(id)
+    }
+    pub fn set_valueset(&mut self, id: NodeId, set: ValueSet) {
+        self.valuesets.insert(id, set);
     }
 
     /// The phase of a binding — i.e. the phase of its right-hand-side node.
