@@ -11,9 +11,8 @@
 use crate::error::{Error, Result};
 use crate::sexpr::{self, Sexpr};
 use flatppl_core::{
-    Mass, ValueSet,
-    Axis, Binding, Call, CallHead, Dim, Doc, Inputs, Markup, Module, NamedArg, NamedKind, Node,
-    NodeId, Phase, Ref, RefNs, Scalar, ScalarType, Symbol, Type, Variance,
+    Axis, Binding, Call, CallHead, Dim, Doc, Inputs, Markup, Mass, Module, NamedArg, NamedKind,
+    Node, NodeId, Phase, Ref, RefNs, Scalar, ScalarType, Symbol, Type, ValueSet, Variance,
 };
 
 /// Parse canonical FlatPIR text into a [`Module`].

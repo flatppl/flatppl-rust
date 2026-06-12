@@ -169,8 +169,7 @@ impl ValueSet {
                 _ => false,
             },
             (StdSimplex(n), CartPow(elem, d)) => {
-                (n == d || matches!(d, Dim::Dynamic))
-                    && UnitInterval.subset_of(elem.as_ref())
+                (n == d || matches!(d, Dim::Dynamic)) && UnitInterval.subset_of(elem.as_ref())
             }
             (CartPow(a, n), CartPow(b, d)) => {
                 (n == d || matches!(d, Dim::Dynamic)) && a.subset_of(b)
