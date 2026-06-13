@@ -16,6 +16,9 @@ use ariadne::{Config, Label, Report, ReportKind, Source};
 use clap::{Parser, Subcommand, ValueEnum};
 use flatppl_core::Module;
 
+mod provenance;
+use provenance::Provenance;
+
 #[derive(Parser)]
 #[command(name = "flatppl", version, about = "FlatPPL toolchain driver")]
 struct Cli {
@@ -47,6 +50,12 @@ enum Command {
         /// JSON document (top-level `channels` array).
         #[arg(long, value_enum, default_value_t = FromFormat::Auto)]
         from: FromFormat,
+        /// Omit the leading provenance header comment. The header (records
+        /// when/from-what/by-whom the file was generated) is included by
+        /// default; pass this — or set `SOURCE_DATE_EPOCH` — for reproducible
+        /// byte-output.
+        #[arg(long)]
+        no_header: bool,
     },
     /// Infer types and phases; emit annotated FlatPIR.
     ///
@@ -69,6 +78,9 @@ enum Command {
         /// counts, distribution lengths).
         #[arg(long, value_enum, default_value_t = InferLevel::Shape)]
         level: InferLevel,
+        /// Omit the leading provenance header comment (see `convert --no-header`).
+        #[arg(long)]
+        no_header: bool,
     },
 }
 
@@ -147,6 +159,22 @@ impl Format {
             )),
         }
     }
+
+    /// The line-comment marker for this format (for the provenance header).
+    fn line_comment(self) -> &'static str {
+        match self {
+            Format::FlatPpl => "%",
+            Format::FlatPir => ";",
+        }
+    }
+
+    /// Human name of the format, for the header's `from:` field.
+    fn describe(self) -> &'static str {
+        match self {
+            Format::FlatPpl => "FlatPPL",
+            Format::FlatPir => "FlatPIR",
+        }
+    }
 }
 
 /// Why a command failed: a plain one-line message (I/O, usage), or a parse
@@ -178,13 +206,15 @@ fn main() -> ExitCode {
             output,
             syntax,
             from,
-        } => convert(&input, &output, syntax.into(), from),
+            no_header,
+        } => convert(&input, &output, syntax.into(), from, no_header),
         #[cfg(feature = "infer")]
         Command::Infer {
             input,
             output,
             level,
-        } => infer_cmd(&input, &output, level.into()),
+            no_header,
+        } => infer_cmd(&input, &output, level.into(), no_header),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -256,6 +286,7 @@ fn convert(
     output: &Path,
     syntax: flatppl_syntax::Syntax,
     from_format: FromFormat,
+    no_header: bool,
 ) -> Result<(), Failure> {
     let to = Format::from_path(output)?;
 
@@ -301,6 +332,22 @@ fn convert(
     if !text.ends_with('\n') {
         text.push('\n');
     }
+    if !no_header {
+        let from_label = match from_format {
+            FromFormat::Hs3 => "HS3 JSON",
+            FromFormat::Pyhf => "pyhf workspace JSON",
+            FromFormat::Auto => Format::from_path(input)
+                .map(Format::describe)
+                .unwrap_or("FlatPPL/FlatPIR"),
+        };
+        let header = Provenance {
+            converted_from: from_label,
+            source: input,
+            generator: "convert",
+        }
+        .header(to.line_comment());
+        text.insert_str(0, &header);
+    }
     fs::write(output, text)
         .map_err(|e| Failure::Plain(format!("writing `{}`: {e}", output.display())))
 }
@@ -308,7 +355,12 @@ fn convert(
 /// `flatppl infer <in> <out.flatpir>` — run the type/phase trace, report
 /// diagnostics, write annotated FlatPIR.
 #[cfg(feature = "infer")]
-fn infer_cmd(input: &Path, output: &Path, level: flatppl_infer::Level) -> Result<(), Failure> {
+fn infer_cmd(
+    input: &Path,
+    output: &Path,
+    level: flatppl_infer::Level,
+    no_header: bool,
+) -> Result<(), Failure> {
     let from = Format::from_path(input)?;
     if !matches!(Format::from_path(output)?, Format::FlatPir) {
         return Err(Failure::Plain(format!(
@@ -353,6 +405,16 @@ fn infer_cmd(input: &Path, output: &Path, level: flatppl_infer::Level) -> Result
     let mut text = flatppl_flatpir::write(&module);
     if !text.ends_with('\n') {
         text.push('\n');
+    }
+    if !no_header {
+        // `infer` always writes FlatPIR (`;` comments); records the input format.
+        let header = Provenance {
+            converted_from: from.describe(),
+            source: input,
+            generator: "infer",
+        }
+        .header(Format::FlatPir.line_comment());
+        text.insert_str(0, &header);
     }
     fs::write(output, text)
         .map_err(|e| Failure::Plain(format!("writing `{}`: {e}", output.display())))
