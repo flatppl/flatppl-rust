@@ -67,7 +67,14 @@ fn same_format_canonicalizes() {
     let out = dir.path("canonical.flatppl");
     fs::write(&src, "x = add(1, 2); y ~ Normal(0, 1)\n").unwrap();
 
-    let status = bin().arg("convert").arg(&src).arg(&out).status().unwrap();
+    // --no-header keeps canonicalization byte-exact (the provenance header is
+    // covered separately in provenance_header_*).
+    let status = bin()
+        .args(["convert", "--no-header"])
+        .arg(&src)
+        .arg(&out)
+        .status()
+        .unwrap();
     assert!(status.success());
     assert_eq!(
         fs::read_to_string(&out).unwrap(),
@@ -75,7 +82,7 @@ fn same_format_canonicalizes() {
     );
 
     let status = bin()
-        .args(["convert", "--syntax", "minimal"])
+        .args(["convert", "--no-header", "--syntax", "minimal"])
         .arg(&src)
         .arg(&out)
         .status()
@@ -84,6 +91,58 @@ fn same_format_canonicalizes() {
     assert_eq!(
         fs::read_to_string(&out).unwrap(),
         "x = add(1, 2)\ny ~ Normal(0, 1)\n"
+    );
+}
+
+/// Generated files carry a provenance header by default: a leading comment
+/// block (`;` for FlatPIR) recording generator, source format + file, and platform.
+#[test]
+fn provenance_header_present_by_default() {
+    let dir = Scratch::new("prov");
+    let src = dir.path("m.flatppl");
+    let out = dir.path("m.flatpir");
+    fs::write(&src, "x ~ Normal(0, 1)\n").unwrap();
+
+    let status = bin().arg("convert").arg(&src).arg(&out).status().unwrap();
+    assert!(status.success());
+    let text = fs::read_to_string(&out).unwrap();
+    assert!(
+        text.starts_with("; AUTOMATICALLY GENERATED"),
+        "expected a leading FlatPIR provenance comment, got:\n{text}"
+    );
+    for field in [
+        "generator:  flatppl",
+        "from:       FlatPPL file `m.flatppl`",
+        "platform:",
+    ] {
+        assert!(text.contains(field), "missing `{field}` in:\n{text}");
+    }
+    // The model still follows the header.
+    assert!(
+        text.contains("(%module"),
+        "model body missing, got:\n{text}"
+    );
+}
+
+/// `--no-header` suppresses the provenance block entirely.
+#[test]
+fn no_header_suppresses_provenance() {
+    let dir = Scratch::new("noprov");
+    let src = dir.path("m.flatppl");
+    let out = dir.path("m.flatpir");
+    fs::write(&src, "x ~ Normal(0, 1)\n").unwrap();
+
+    let status = bin()
+        .args(["convert", "--no-header"])
+        .arg(&src)
+        .arg(&out)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let text = fs::read_to_string(&out).unwrap();
+    assert!(
+        !text.contains("AUTOMATICALLY GENERATED"),
+        "--no-header must omit the provenance block, got:\n{text}"
     );
 }
 
