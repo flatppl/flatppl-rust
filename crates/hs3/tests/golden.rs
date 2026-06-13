@@ -332,19 +332,29 @@ fn golden_paper_histfactory_staterror_deltas() {
 }
 
 // ---------------------------------------------------------------------------
-// paper_product.json (HS3 paper § A.2): product_dist over two gaussians with
-// 10 unbinned toy-data entries. Pins the joint( assembly and that both Normals
-// appear, plus a distinctive toy-data value.
+// paper_product.json (HS3 paper § A.2): product_dist over two gaussians of the
+// SAME observable `x` with 10 unbinned toy-data entries. RooProdPdf over a
+// shared observable is the normalized pointwise density product, lowered to
+// `normalize(logweighted(x -> Σ logdensityof(gᵢ, x), g₀))` (§12) — NOT a `joint`
+// (which would be a 2-D independent product over distinct variates).
 // ---------------------------------------------------------------------------
 const FIXTURE_PRODUCT: &str = include_str!("fixtures/paper_product.json");
 
 #[test]
-fn golden_paper_product_joint() {
+fn golden_paper_product_density_product() {
     let m = flatppl_hs3::read(FIXTURE_PRODUCT).expect("paper_product must convert");
     let text = print_with(&m, Syntax::Minimal);
+    // Shared-variate product: reweight g1 by g2's log-density, then normalize.
     assert!(
-        text.contains("joint("),
-        "missing joint( from product_dist, got:\n{text}"
+        text.contains(
+            "prod = normalize(logweighted(functionof(logdensityof(g2, _x_), x = _x_), g1))"
+        ),
+        "shared-variate product_dist lowering mismatch, got:\n{text}"
+    );
+    // Must NOT be an independent joint over (x, x).
+    assert!(
+        !text.contains("joint("),
+        "same-variate product must not lower to joint, got:\n{text}"
     );
     assert!(
         text.matches("Normal").count() >= 2,
@@ -364,6 +374,49 @@ fn golden_paper_product_joint() {
     assert!(
         text.contains("likelihood = likelihoodof(prod, toy)"),
         "toy-data likelihood wiring mismatch, got:\n{text}"
+    );
+    assert!(parse(&text).is_ok(), "round-trip parse failed:\n{text}");
+}
+
+// product_dist over factors with DISTINCT variates is a genuine independent
+// product → joint (the shared-variate density-product form must NOT fire).
+#[test]
+fn golden_product_distinct_variates_joins() {
+    let json = r#"{"distributions":[
+        {"name":"pd","type":"product_dist","factors":["gx","gy"]},
+        {"name":"gx","type":"gaussian_dist","mean":"mx","sigma":"sx","x":"x"},
+        {"name":"gy","type":"gaussian_dist","mean":"my","sigma":"sy","x":"y"}],
+        "parameter_points":[{"name":"v","entries":[{"name":"mx","value":0.0},{"name":"sx","value":1.0},{"name":"my","value":0.0},{"name":"sy","value":1.0}]}]}"#;
+    let m = flatppl_hs3::read_hs3(json).expect("read_hs3");
+    let text = print_with(&m, Syntax::Minimal);
+    assert!(
+        text.contains("pd = joint(gx = gx, gy = gy)"),
+        "distinct-variate product must lower to joint, got:\n{text}"
+    );
+    assert!(
+        !text.contains("logweighted"),
+        "distinct-variate product must not use the density-product form, got:\n{text}"
+    );
+    assert!(parse(&text).is_ok(), "round-trip parse failed:\n{text}");
+}
+
+// Three factors over the SAME variate: the density product stays flat — one
+// add-fold of N-1 log-densities, base = first factor (no nesting).
+#[test]
+fn golden_product_three_shared_variates() {
+    let json = r#"{"distributions":[
+        {"name":"prod3","type":"product_dist","factors":["a","b","c"]},
+        {"name":"a","type":"gaussian_dist","mean":"ma","sigma":"sa","x":"x"},
+        {"name":"b","type":"gaussian_dist","mean":"mb","sigma":"sb","x":"x"},
+        {"name":"c","type":"gaussian_dist","mean":"mc","sigma":"sc","x":"x"}],
+        "parameter_points":[{"name":"v","entries":[{"name":"ma","value":0.0},{"name":"sa","value":1.0},{"name":"mb","value":0.0},{"name":"sb","value":1.0},{"name":"mc","value":0.0},{"name":"sc","value":1.0}]}]}"#;
+    let m = flatppl_hs3::read_hs3(json).expect("read_hs3");
+    let text = print_with(&m, Syntax::Minimal);
+    assert!(
+        text.contains(
+            "prod3 = normalize(logweighted(functionof(add(logdensityof(b, _x_), logdensityof(c, _x_)), x = _x_), a))"
+        ),
+        "3-factor shared-variate product lowering mismatch, got:\n{text}"
     );
     assert!(parse(&text).is_ok(), "round-trip parse failed:\n{text}");
 }

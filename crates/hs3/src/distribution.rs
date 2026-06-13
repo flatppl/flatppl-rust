@@ -126,45 +126,13 @@ pub fn emit_distribution(
             let support = b.call("interval", &[lo, hi]);
             Ok(b.call("Uniform", &[support]))
         }
-        // §12: product_dist maps to joint over its factor sub-distributions.
-        // joint uses NamedKind::Field (like `record`/`cartprod`), so named entries
-        // must be built with Field kind.  Factor names are the field labels.
-        // NOTE: both factors here share the same variate ("x") — this models a
-        // density-product, not a joint independent distribution over distinct
-        // variates.  The spec §12 mapping is `product_dist → joint`; whether
-        // same-variate joint is semantically correct is a spec-fidelity question.
-        "product_dist" => {
-            let factors: Vec<String> = d
-                .extra
-                .get("factors")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(str::to_string))
-                        .collect()
-                })
-                .unwrap_or_default();
-            if factors.is_empty() {
-                return Err(Error::Unsupported(
-                    "product_dist with no factors".into(),
-                ));
-            }
-            let named: Vec<NamedArg> = factors
-                .iter()
-                .map(|f| {
-                    let name = b.m.intern(f);
-                    let value = b.self_ref(f);
-                    NamedArg { kind: NamedKind::Field, name, value }
-                })
-                .collect();
-            let head = b.m.intern("joint");
-            Ok(b.m.alloc(Node::Call(Call {
-                head: CallHead::Builtin(head),
-                args: Vec::new().into(),
-                named: named.into(),
-                inputs: None,
-            })))
-        }
+        // §12: product_dist is lowered by `emit_product`, which needs each
+        // factor's variate (resolved by the caller from the document) to choose
+        // between an independent `joint` and a same-variate pointwise density
+        // product. It is therefore dispatched from convert.rs, not here.
+        "product_dist" => Err(Error::Unsupported(
+            "product_dist is handled via emit_product".into(),
+        )),
         "generalized_normal_dist" => {
             let mut kws: Vec<(&str, NodeId)> = Vec::new();
             if let Some(v) = d.extra.get("mean") {
@@ -588,6 +556,125 @@ fn build_lebesgue_reals(b: &mut Builder) -> NodeId {
     let reals_sym = b.m.intern("reals");
     let reals = b.m.alloc(flatppl_core::node::Node::Const(reals_sym));
     b.call("Lebesgue", &[reals])
+}
+
+/// HS3 `product_dist` lowering (§12). The form depends on the factors' variates,
+/// which the caller resolves from the document (in `factors` order):
+///
+/// * **shared single variate** — all factors are pdfs over the *same* observable
+///   (RooProdPdf of same-observable pdfs): the normalized pointwise density
+///   product. Take the first factor as the base measure and reweight it, in log
+///   space, by the sum of the other factors' log-densities:
+///   `normalize(logweighted(functionof(add(logdensityof(M2, _), …, logdensityof(Mₙ, _))), M1))`.
+///   This is flat in the factor count (one `add`-fold of N−1 log-densities, no
+///   nesting) and the reweighted base yields the unnormalized product `∏ᵢ gᵢ`,
+///   which `normalize` renders a probability measure (§06).
+/// * **otherwise** — an independent product over distinct variates:
+///   `joint(f1 = M1, f2 = M2, …)`.
+pub fn emit_product(
+    b: &mut Builder,
+    d: &Distribution,
+    factor_variates: &[Option<VariateName>],
+) -> Result<NodeId> {
+    let factors = product_factors(d);
+    if factors.is_empty() {
+        return Err(Error::Unsupported("product_dist with no factors".into()));
+    }
+    if product_shared_variate(factor_variates) {
+        // Normalized pointwise density product over the shared variate `var`.
+        // weight(point) = exp(Σ_{i≥1} logdensityof(factorᵢ, point)); base = factor₀.
+        let var = match &factor_variates[0] {
+            Some(VariateName::Single(s)) => s.clone(),
+            // product_shared_variate guarantees factor 0 is a Single variate.
+            _ => unreachable!("product_shared_variate ensures a single variate"),
+        };
+        let ph_sym = b.m.intern(&format!("_{var}_"));
+        let point = b.m.alloc(Node::Ref(Ref {
+            ns: RefNs::Local,
+            name: ph_sym,
+        }));
+        // add-fold of logdensityof(factorᵢ, point) for the non-base factors.
+        let mut body: Option<NodeId> = None;
+        for f in &factors[1..] {
+            let mref = b.self_ref(f);
+            let ld = b.call("logdensityof", &[mref, point]);
+            body = Some(match body {
+                None => ld,
+                Some(prev) => b.call("add", &[prev, ld]),
+            });
+        }
+        let body = body.expect("shared variate implies >= 2 factors");
+        // functionof(body, var = _var_) — the single-argument weight function.
+        let head = CallHead::Builtin(b.m.intern("functionof"));
+        let entry = (
+            b.m.intern(&var),
+            Ref {
+                ns: RefNs::Local,
+                name: ph_sym,
+            },
+        );
+        let weight_fn = b.m.alloc(Node::Call(Call {
+            head,
+            args: Box::new([body]),
+            named: Box::new([]),
+            inputs: Some(Inputs::Spec(Box::new([entry]))),
+        }));
+        let base = b.self_ref(&factors[0]);
+        let lw = b.call("logweighted", &[weight_fn, base]);
+        Ok(b.call("normalize", &[lw]))
+    } else {
+        // Independent product → joint with factor-named variate fields.
+        let named: Vec<NamedArg> = factors
+            .iter()
+            .map(|f| {
+                let name = b.m.intern(f);
+                let value = b.self_ref(f);
+                NamedArg {
+                    kind: NamedKind::Field,
+                    name,
+                    value,
+                }
+            })
+            .collect();
+        let head = b.m.intern("joint");
+        Ok(b.m.alloc(Node::Call(Call {
+            head: CallHead::Builtin(head),
+            args: Vec::new().into(),
+            named: named.into(),
+            inputs: None,
+        })))
+    }
+}
+
+/// Factor distribution names of a `product_dist`, in document order.
+pub fn product_factors(d: &Distribution) -> Vec<String> {
+    d.extra
+        .get("factors")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// True when there are ≥2 factors and every one has the same single scalar
+/// variate — the RooProdPdf-over-a-shared-observable case that lowers to a
+/// pointwise density product rather than an independent `joint`.
+pub fn product_shared_variate(factor_variates: &[Option<VariateName>]) -> bool {
+    if factor_variates.len() < 2 {
+        return false;
+    }
+    let mut names = factor_variates.iter().map(|v| match v {
+        Some(VariateName::Single(s)) => Some(s.as_str()),
+        _ => None,
+    });
+    let first = match names.next() {
+        Some(Some(s)) => s,
+        _ => return false,
+    };
+    names.all(|v| v == Some(first))
 }
 
 /// The variate name(s) for a distribution, if any.
