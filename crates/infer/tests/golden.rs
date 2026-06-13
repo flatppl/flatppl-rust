@@ -195,6 +195,27 @@ fn level_shape_resolves_fixed_dims() {
     );
 }
 
+// `relabel(M, labels)` renames the variate but preserves the value domain and
+// total mass, so the call must infer to the base measure's type (not %deferred).
+#[test]
+fn relabel_preserves_measure_type_and_mass() {
+    let mut module = flatppl_syntax::parse(
+        "mu = elementof(reals)\ng = relabel(Normal(mu = mu, sigma = 1.0), [\"x\"])",
+    )
+    .unwrap();
+    flatppl_infer::infer(&mut module);
+    let out = flatppl_flatpir::write(&module);
+    // relabel carries a measure type (domain real) with the base's mass preserved.
+    assert!(
+        out.contains("(relabel (%meta (%measure (%domain (%scalar real)) (%mass %normalized))"),
+        "relabel must preserve the measure type + normalized mass, got:\n{out}"
+    );
+    assert!(
+        !out.contains("(relabel (%meta %deferred"),
+        "relabel must no longer be deferred, got:\n{out}"
+    );
+}
+
 #[test]
 fn shape_resolver_arithmetic_and_length_observer() {
     // Arithmetic over fixed ints, and `lengthof` short-circuiting off the
