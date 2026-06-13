@@ -10,6 +10,7 @@ mod error;
 pub use error::{Error, Result};
 pub(crate) mod builder;
 mod convert;
+pub(crate) mod dist_spec;
 pub(crate) mod distribution;
 pub(crate) mod expr;
 pub(crate) mod histfactory;
@@ -19,6 +20,22 @@ pub(crate) mod presets;
 pub(crate) mod pyhf;
 
 use flatppl_core::Module;
+use flatppl_syntax::{Syntax, parse, print_with};
+
+/// Validate that a freshly built module survives a print-then-reparse round
+/// trip: the importer's output is printed in canonical (`Minimal`) surface text
+/// and parsed back by `flatppl_syntax`. A parse failure means the importer
+/// emitted syntactically-corrupt text, so the module is rejected with
+/// [`Error::RoundTrip`] rather than returned silently. On success the original
+/// module is returned unchanged (the reparse result is discarded — it only
+/// serves as the validity check).
+fn validate_round_trip(module: Module) -> Result<Module> {
+    let text = print_with(&module, Syntax::Minimal);
+    match parse(&text) {
+        Ok(_) => Ok(module),
+        Err(e) => Err(Error::RoundTrip(e.to_string())),
+    }
+}
 
 /// Parse an HS3 or pyhf JSON document into a FlatPPL module.
 ///
@@ -26,13 +43,14 @@ use flatppl_core::Module;
 /// workspace lift path is taken; otherwise, the native HS3 path is used.
 pub fn read(json: &str) -> Result<Module> {
     let value: serde_json::Value = serde_json::from_str(json)?;
-    if value.get("channels").is_some() {
+    let module = if value.get("channels").is_some() {
         let doc: model::PyhfDocument = serde_json::from_value(value)?;
-        pyhf::pyhf_to_module(&doc)
+        pyhf::pyhf_to_module(&doc)?
     } else {
         let doc: model::Document = serde_json::from_value(value)?;
-        convert::document_to_module(&doc)
-    }
+        convert::document_to_module(&doc)?
+    };
+    validate_round_trip(module)
 }
 
 /// Parse a pyhf workspace JSON document into a FlatPPL module.
@@ -50,7 +68,8 @@ pub fn read_pyhf(json: &str) -> Result<Module> {
         ));
     }
     let doc: model::PyhfDocument = serde_json::from_value(value)?;
-    pyhf::pyhf_to_module(&doc)
+    let module = pyhf::pyhf_to_module(&doc)?;
+    validate_round_trip(module)
 }
 
 /// Parse a native HS3 JSON document into a FlatPPL module.
@@ -68,7 +87,8 @@ pub fn read_hs3(json: &str) -> Result<Module> {
         ));
     }
     let doc: model::Document = serde_json::from_value(value)?;
-    convert::document_to_module(&doc)
+    let module = convert::document_to_module(&doc)?;
+    validate_round_trip(module)
 }
 
 #[cfg(test)]

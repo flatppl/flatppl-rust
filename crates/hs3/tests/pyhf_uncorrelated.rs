@@ -21,8 +21,13 @@ fn pyhf_uncorrelated_background_assembles() {
     assert!(text.contains("joint_likelihood("), "got:\n{text}");
     assert!(text.contains("likelihoodof("), "got:\n{text}");
     assert!(!text.contains("fn("), "must be point-free, got:\n{text}");
-    // observed + nominal data present somewhere:
-    assert!(text.contains("51") && text.contains("48"), "got:\n{text}");
+    // observed data [51.0, 48.0] on the main Poisson term, as the exact in-order
+    // vector (a bare contains("51")/("48") would false-pass on substrings and
+    // miss a reordered observation).
+    assert!(
+        text.contains("likelihoodof(obs_model_singlechannel, [51.0, 48.0])"),
+        "observed data [51.0, 48.0] not on main term, got:\n{text}"
+    );
     // shapesys domain uses integer size, not real:
     assert!(
         text.contains("cartpow(posreals, 2)"),

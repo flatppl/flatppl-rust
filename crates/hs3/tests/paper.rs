@@ -14,10 +14,13 @@ fn paper_gaussian_converts() {
 
     assert!(text.contains("Normal"), "missing Normal, got:\n{text}");
     assert!(text.contains("relabel"), "missing relabel, got:\n{text}");
-    // observed value from unbinned data entry
+    // The single unbinned observation 1.27 becomes the channel data vector,
+    // then feeds the likelihood. Pin the exact bracketed binding RHS so a
+    // dropped/extra entry fails (bare contains("1.27") false-passes on the
+    // record default `x = 1.27`).
     assert!(
-        text.contains("1.27"),
-        "missing observed value 1.27, got:\n{text}"
+        text.contains("obs_gaussian_channel = [1.27]"),
+        "observed-data vector mismatch (expected [1.27]), got:\n{text}"
     );
     assert!(
         text.contains("elementof"),
@@ -61,24 +64,20 @@ fn paper_histfactory_converts() {
         text.contains("joint_likelihood"),
         "missing joint_likelihood, got:\n{text}"
     );
+    // Observed bin contents [122.0, 112.0], in order, on the main Poisson term.
+    // Pin the exact bracketed vector so a reordered observation array fails.
     assert!(
-        text.contains("122.0") || text.contains("122"),
-        "missing observed bin0, got:\n{text}"
-    );
-    assert!(
-        text.contains("112.0") || text.contains("112"),
-        "missing observed bin1, got:\n{text}"
+        text.contains("likelihoodof(obs_model_model_channel1, [122.0, 112.0])"),
+        "observed-data likelihood mismatch (expected [122.0, 112.0]), got:\n{text}"
     );
     assert!(!text.contains("fn("), "not point-free, got:\n{text}");
 
-    // staterror deltas: bin0 = 5/100 = 0.05, bin1 = 10/100 = 0.1
+    // staterror aux: a Gaussian constraint on the per-bin mcstat scales with
+    // relative deltas [0.05, 0.1] (bin0 = 5/100, bin1 = 10/100). Pin the exact
+    // array so a swapped/reordered delta vector fails.
     assert!(
-        text.contains("0.05"),
-        "missing staterror delta 0.05, got:\n{text}"
-    );
-    assert!(
-        text.contains("0.1"),
-        "missing staterror delta 0.1, got:\n{text}"
+        text.contains("likelihoodof(broadcast(Normal, mcstat, [0.05, 0.1]), 1.0)"),
+        "staterror aux mismatch (expected deltas [0.05, 0.1]), got:\n{text}"
     );
 
     // Round-trip parse.
@@ -112,11 +111,20 @@ fn paper_product_converts() {
         text.contains("likelihoodof"),
         "missing likelihoodof, got:\n{text}"
     );
-    // toy data values should appear (at least one of the 10 entries)
-    // the last entry is 1.8448742587493427; check for a distinctive value
+    // The 10 unbinned toy-data entries become the `toy` vector, in order, fed to
+    // the product likelihood. Pin the exact bracketed binding RHS (a reordered or
+    // truncated array fails) plus the wiring into likelihoodof.
     assert!(
-        text.contains("1.8448742587493427") || text.contains("0.8301414"),
-        "missing toy data values, got:\n{text}"
+        text.contains(
+            "toy = [-0.028567328469794265, -0.0975895992436726, 0.8301414329794277, \
+             -0.18001364208465098, 0.8853988033587967, -0.2791754160017632, 1.168603380508273, \
+             2.290388749097474, 0.18297688463530193, 1.8448742587493427]"
+        ),
+        "toy-data vector mismatch, got:\n{text}"
+    );
+    assert!(
+        text.contains("likelihood = likelihoodof(prod, toy)"),
+        "toy-data likelihood wiring mismatch, got:\n{text}"
     );
 
     // Round-trip: emitted FlatPPL must re-parse without error.

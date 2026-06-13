@@ -1,10 +1,11 @@
 //! `flatppl` — the FlatPPL command-line driver.
 //!
 //! Thin wiring over the library crates: argument parsing, format dispatch by
-//! file extension, and I/O. All conversion logic lives in `flatppl-syntax` /
-//! `flatppl-flatpir` — the libraries are the test target, the CLI is the
-//! surface. Later toolchain capabilities (infer, lower, check) arrive as
-//! further subcommands.
+//! file extension, and I/O. All conversion logic lives in the library crates —
+//! `flatppl-syntax` / `flatppl-flatpir` for FlatPPL text and IR, and
+//! `flatppl-hs3` for HS3 / pyhf import — the libraries are the test target, the
+//! CLI is the surface. Later toolchain capabilities (infer, lower, check)
+//! arrive as further subcommands.
 
 use std::fs;
 use std::io::IsTerminal;

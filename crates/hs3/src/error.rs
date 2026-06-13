@@ -19,6 +19,10 @@ pub enum Error {
     IncompatibleConstraint { parameter: String },
     /// No observation data found for the named channel.
     NoObservation(String),
+    /// The built module failed to print-then-reparse cleanly: the importer
+    /// produced surface text that `flatppl_syntax` cannot parse back. Carries
+    /// the parser's error message.
+    RoundTrip(String),
 }
 
 impl From<serde_json::Error> for Error {
@@ -44,11 +48,21 @@ impl fmt::Display for Error {
             Error::NoObservation(ch) => {
                 write!(f, "no observation data for channel `{ch}`")
             }
+            Error::RoundTrip(msg) => {
+                write!(f, "imported module failed to re-parse: {msg}")
+            }
         }
     }
 }
 
-impl std::error::Error for Error {}
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Json(e) => Some(e),
+            _ => None,
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
