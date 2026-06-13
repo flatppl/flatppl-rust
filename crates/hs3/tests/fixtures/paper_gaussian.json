@@ -1,0 +1,109 @@
+{
+    "analyses": [
+        {
+            "domains": [
+                "obs_parameters_of_interest"
+            ],
+            "likelihood": "obs",
+            "name": "obs",
+            "parameters_of_interest": [
+                "mu"
+            ]
+        }
+    ],
+    "data": [
+        {
+            "axes": [
+                {
+                    "name": "x",
+                    "value": 1.27
+                }
+            ],
+            "entries": [
+                [
+                    1.27
+                ]
+            ],
+            "name": "obs_gaussian_channel",
+            "type": "unbinned"
+        }
+    ],
+    "distributions": [
+        {
+            "mean": "mu",
+            "name": "gauss_x",
+            "sigma": "sigma",
+            "type": "gaussian_dist",
+            "x": "x"
+        }
+    ],
+    "domains": [
+        {
+            "axes": [
+                {
+                    "max": 10.0,
+                    "min": -10.0,
+                    "name": "mu"
+                }
+            ],
+            "name": "obs_parameters_of_interest",
+            "type": "product_domain"
+        },
+        {
+            "axes": [
+                {
+                    "max": 10.0,
+                    "min": -10.0,
+                    "name": "mu"
+                },
+                {
+                    "max": 10.0,
+                    "min": -10.0,
+                    "name": "x"
+                }
+            ],
+            "name": "default_domain",
+            "type": "product_domain"
+        }
+    ],
+    "likelihoods": [
+        {
+            "data": [
+                "obs_gaussian_channel"
+            ],
+            "distributions": [
+                "gauss_x"
+            ],
+            "name": "obs"
+        }
+    ],
+    "metadata": {
+        "hs3_version": "0.2",
+        "packages": [
+            {
+                "name": "ROOT",
+                "version": "6.38.04"
+            }
+        ]
+    },
+    "parameter_points": [
+        {
+            "name": "default_values",
+            "parameters": [
+                {
+                    "name": "x",
+                    "value": 1.27
+                },
+                {
+                    "name": "mu",
+                    "value": 0.0
+                },
+                {
+                    "const": true,
+                    "name": "sigma",
+                    "value": 1.0
+                }
+            ]
+        }
+    ]
+}

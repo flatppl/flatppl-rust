@@ -1,0 +1,21 @@
+{
+    "channels": [
+        { "name": "channel1", "samples": [
+            { "data": [20.0, 10.0], "modifiers": [
+                { "data": {"hi": 1.05, "lo": 0.95}, "name": "syst1", "type": "normsys" },
+                { "data": null, "name": "SigXsecOverSM", "type": "normfactor" } ], "name": "signal" },
+            { "data": [100.0, 0.0], "modifiers": [
+                { "data": null, "name": "lumi", "type": "lumi" },
+                { "data": [5.0, 0.0], "name": "staterror_channel1", "type": "staterror" },
+                { "data": {"hi": 1.05, "lo": 0.95}, "name": "syst2", "type": "normsys" } ], "name": "background1" },
+            { "data": [0.0, 100.0], "modifiers": [
+                { "data": null, "name": "lumi", "type": "lumi" },
+                { "data": [0.0, 10.0], "name": "staterror_channel1", "type": "staterror" },
+                { "data": {"hi": 1.05, "lo": 0.95}, "name": "syst3", "type": "normsys" } ], "name": "background2" } ] }
+    ],
+    "data": { "channel1": [122.0, 112.0] },
+    "toplvl": { "measurements": [ { "config": {
+        "poi": "SigXsecOverSM",
+        "parameters": [ { "name": "lumi", "auxdata": [1.0], "sigmas": [0.1], "inits": [1.0] } ]
+    }, "name": "GaussExample" } ] }
+}
