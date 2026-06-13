@@ -3,13 +3,19 @@
 //! Interprets the generic [`Sexpr`](crate::sexpr) tree as FlatPIR: `(%module …)`
 //! with `(%public …)` and `(%bind …)` stanzas, expressions (built-in calls,
 //! `(%call (%ref …) …)` user calls, refs, axes, literals), and optional
-//! `(%meta <type> <phase>)` annotations that populate the side-tables.
+//! `(%meta <type> <phase> <valueset>)` annotations that populate the side-tables.
 //!
 //! References carry only names (`(%ref self x)` → `Symbol`), so forward
 //! references resolve for free — no binding-ID fix-up pass.
+//!
+//! **Diagnostics.** Every form carries a [`Span`], so structural/semantic
+//! errors point back at the offending source. The [`err`] / [`err_slice`]
+//! helpers turn a `&Sexpr` (or the inner items of a list) into a positioned
+//! [`Error`]; the small accessors ([`atom`], [`list`], [`string`]) localize on
+//! the form they inspect.
 
 use crate::error::{Error, Result};
-use crate::sexpr::{self, Sexpr};
+use crate::sexpr::{self, Sexpr, SexprKind, Span};
 use flatppl_core::{
     Axis, Binding, Call, CallHead, Dim, Doc, Inputs, Markup, Mass, Module, NamedArg, NamedKind,
     Node, NodeId, Phase, Ref, RefNs, Scalar, ScalarType, Symbol, Type, ValueSet, Variance,
@@ -19,41 +25,75 @@ use flatppl_core::{
 pub fn read(input: &str) -> Result<Module> {
     let forms = sexpr::parse_top(input)?;
     if forms.len() != 1 {
-        return Err(Error::new(format!(
+        let message = format!(
             "expected exactly one top-level (%module …) form, found {}",
             forms.len()
-        )));
+        );
+        // Point at the first extra form when there is one; an empty file has no
+        // form to anchor on.
+        return Err(match forms.get(1) {
+            Some(extra) => err(extra, message),
+            None => Error::new(message),
+        });
     }
     read_module(&forms[0])
+}
+
+// ---- positioned-error helpers ----
+
+/// Build an error anchored at `span`.
+fn err_at(span: Span, message: impl Into<String>) -> Error {
+    Error::at_span(span.line, (span.start, span.end), message)
+}
+
+/// Build an error pointing at `form`.
+fn err(form: &Sexpr, message: impl Into<String>) -> Error {
+    err_at(form.span, message)
+}
+
+/// Build an error spanning a list's inner items `[first ..= last]` (the content
+/// between the enclosing parens). Falls back to unpositioned for an empty slice.
+fn err_slice(items: &[Sexpr], message: impl Into<String>) -> Error {
+    match (items.first(), items.last()) {
+        (Some(first), Some(last)) => {
+            Error::at_span(first.span.line, (first.span.start, last.span.end), message)
+        }
+        _ => Error::new(message),
+    }
 }
 
 fn read_module(form: &Sexpr) -> Result<Module> {
     let items = list(form)?;
     if items.first().and_then(Sexpr::as_atom) != Some("%module") {
-        return Err(Error::new("expected a (%module …) form"));
+        return Err(err(form, "expected a (%module …) form"));
     }
 
     let mut module = Module::new();
     let mut pending: Vec<PendingBind> = Vec::new();
-    let mut declared_public: Option<Vec<String>> = None;
+    // Public names keep their span so an unmatched `(%public …)` entry localizes.
+    let mut declared_public: Option<Vec<(String, Span)>> = None;
 
     for elem in &items[1..] {
-        let inner = list(elem)
-            .map_err(|_| Error::new("module elements must be (%public …) or (%bind …) forms"))?;
+        let inner = list(elem).map_err(|_| {
+            err(
+                elem,
+                "module elements must be (%public …) or (%bind …) forms",
+            )
+        })?;
         let head = inner
             .first()
             .and_then(Sexpr::as_atom)
-            .ok_or_else(|| Error::new("module element has no head symbol"))?;
+            .ok_or_else(|| err(elem, "module element has no head symbol"))?;
         match head {
             "%public" => {
                 let mut names = Vec::new();
                 for n in &inner[1..] {
-                    names.push(atom(n)?.to_string());
+                    names.push((atom(n)?.to_string(), n.span));
                 }
                 declared_public = Some(names);
             }
             "%bind" => pending.push(parse_bind(&mut module, inner)?),
-            other => return Err(Error::new(format!("unexpected module element `{other}`"))),
+            other => return Err(err(elem, format!("unexpected module element `{other}`"))),
         }
     }
 
@@ -64,14 +104,15 @@ fn read_module(form: &Sexpr) -> Result<Module> {
     // not underscore-prefixed, spec §04).
     let public_set: Option<std::collections::HashSet<&str>> = declared_public
         .as_ref()
-        .map(|names| names.iter().map(String::as_str).collect());
+        .map(|names| names.iter().map(|(name, _)| name.as_str()).collect());
 
-    if let Some(set) = &public_set {
-        for name in set {
+    if let Some(names) = &declared_public {
+        for (name, span) in names {
             if !pending.iter().any(|p| p.name == *name) {
-                return Err(Error::new(format!(
-                    "(%public …) lists `{name}`, which is not a binding"
-                )));
+                return Err(err_at(
+                    *span,
+                    format!("(%public …) lists `{name}`, which is not a binding"),
+                ));
             }
         }
     }
@@ -104,7 +145,7 @@ struct PendingBind {
 
 fn parse_bind(module: &mut Module, items: &[Sexpr]) -> Result<PendingBind> {
     if items.len() < 3 {
-        return Err(Error::new("(%bind …) needs a name and an expression"));
+        return Err(err_slice(items, "(%bind …) needs a name and an expression"));
     }
     let name = atom(&items[1])?.to_string();
 
@@ -114,10 +155,13 @@ fn parse_bind(module: &mut Module, items: &[Sexpr]) -> Result<PendingBind> {
         _ => (&items[2..], None),
     };
     if expr_items.len() != 1 {
-        return Err(Error::new(format!(
-            "(%bind {name} …) expects exactly one expression, found {}",
-            expr_items.len()
-        )));
+        return Err(err_slice(
+            items,
+            format!(
+                "(%bind {name} …) expects exactly one expression, found {}",
+                expr_items.len()
+            ),
+        ));
     }
 
     let rhs = read_expr(module, &expr_items[0])?;
@@ -125,14 +169,14 @@ fn parse_bind(module: &mut Module, items: &[Sexpr]) -> Result<PendingBind> {
 }
 
 fn read_expr(module: &mut Module, form: &Sexpr) -> Result<NodeId> {
-    match form {
-        Sexpr::Atom(s) => read_atom_expr(module, s),
-        Sexpr::Str(s) => Ok(module.alloc(Node::Lit(Scalar::Str(s.clone().into_boxed_str())))),
-        Sexpr::List(items) => read_list_expr(module, items),
+    match &form.kind {
+        SexprKind::Atom(s) => read_atom_expr(module, s, form.span),
+        SexprKind::Str(s) => Ok(module.alloc(Node::Lit(Scalar::Str(s.clone().into_boxed_str())))),
+        SexprKind::List(items) => read_list_expr(module, items, form.span),
     }
 }
 
-fn read_atom_expr(module: &mut Module, s: &str) -> Result<NodeId> {
+fn read_atom_expr(module: &mut Module, s: &str, span: Span) -> Result<NodeId> {
     let node = match s {
         "true" => Node::Lit(Scalar::Bool(true)),
         "false" => Node::Lit(Scalar::Bool(false)),
@@ -141,9 +185,10 @@ fn read_atom_expr(module: &mut Module, s: &str) -> Result<NodeId> {
             if let Some(num) = classify_number(s) {
                 Node::Lit(num)
             } else if s.starts_with('%') {
-                return Err(Error::new(format!(
-                    "unexpected keyword `{s}` in expression position"
-                )));
+                return Err(err_at(
+                    span,
+                    format!("unexpected keyword `{s}` in expression position"),
+                ));
             } else {
                 Node::Const(module.intern(s))
             }
@@ -152,15 +197,15 @@ fn read_atom_expr(module: &mut Module, s: &str) -> Result<NodeId> {
     Ok(module.alloc(node))
 }
 
-fn read_list_expr(module: &mut Module, items: &[Sexpr]) -> Result<NodeId> {
+fn read_list_expr(module: &mut Module, items: &[Sexpr], span: Span) -> Result<NodeId> {
     if items.is_empty() {
-        return Err(Error::new("empty `()` is not an expression"));
+        return Err(err_at(span, "empty `()` is not an expression"));
     }
     let head = items[0].as_atom().ok_or_else(|| {
-        Error::new(format!(
-            "call head must be a symbol, found {}",
-            describe(&items[0])
-        ))
+        err(
+            &items[0],
+            format!("call head must be a symbol, found {}", describe(&items[0])),
+        )
     })?;
     match head {
         "%ref" => {
@@ -171,16 +216,18 @@ fn read_list_expr(module: &mut Module, items: &[Sexpr]) -> Result<NodeId> {
         "%uaxis" => read_axis_node(module, items, Some(Variance::Upper)),
         "%laxis" => read_axis_node(module, items, Some(Variance::Lower)),
         "%call" => read_user_call(module, items),
-        _ if head.starts_with('%') => {
-            Err(Error::new(format!("unexpected `{head}` as a call head")))
-        }
+        _ if head.starts_with('%') => Err(err(
+            &items[0],
+            format!("unexpected `{head}` as a call head"),
+        )),
         _ => read_builtin_call(module, head, &items[1..]),
     }
 }
 
 fn parse_ref(module: &mut Module, items: &[Sexpr]) -> Result<Ref> {
     if items.len() != 3 {
-        return Err(Error::new(
+        return Err(err_slice(
+            items,
             "(%ref <namespace> <name>) takes exactly two operands",
         ));
     }
@@ -190,7 +237,10 @@ fn parse_ref(module: &mut Module, items: &[Sexpr]) -> Result<Ref> {
         "self" => RefNs::SelfMod,
         "%local" => RefNs::Local,
         alias if alias.starts_with('%') => {
-            return Err(Error::new(format!("invalid reference namespace `{alias}`")));
+            return Err(err(
+                &items[1],
+                format!("invalid reference namespace `{alias}`"),
+            ));
         }
         alias => RefNs::Module(module.intern(alias)),
     };
@@ -206,7 +256,7 @@ fn read_axis_node(
     variance: Option<Variance>,
 ) -> Result<NodeId> {
     if items.len() != 2 {
-        return Err(Error::new("an axis form takes exactly one name"));
+        return Err(err_slice(items, "an axis form takes exactly one name"));
     }
     let name = module.intern(atom(&items[1])?);
     Ok(module.alloc(Node::Axis(Axis { name, variance })))
@@ -214,7 +264,7 @@ fn read_axis_node(
 
 fn read_user_call(module: &mut Module, items: &[Sexpr]) -> Result<NodeId> {
     if items.len() < 2 {
-        return Err(Error::new("(%call …) needs a callable"));
+        return Err(err_slice(items, "(%call …) needs a callable"));
     }
     // The callee is an expression that must evaluate to a user-defined
     // callable — a `(%ref …)` in the common case, or an inline callable
@@ -255,17 +305,26 @@ fn read_builtin_call(module: &mut Module, op: &str, rest: &[Sexpr]) -> Result<No
 fn read_reification(module: &mut Module, op: &str, rest: &[Sexpr]) -> Result<NodeId> {
     // Optional `(%meta …)` immediately after the head.
     let (meta, rest) = match rest.first() {
-        Some(Sexpr::List(inner)) if inner.first().and_then(Sexpr::as_atom) == Some("%meta") => {
-            (parse_meta(module, &rest[0])?, &rest[1..])
+        Some(first)
+            if first
+                .as_list()
+                .and_then(|l| l.first())
+                .and_then(Sexpr::as_atom)
+                == Some("%meta") =>
+        {
+            (parse_meta(module, first)?, &rest[1..])
         }
         _ => ((None, None, None), rest),
     };
 
     if rest.len() != 3 {
-        return Err(Error::new(format!(
-            "`{op}` takes <output> <origin-tag> <input-list>, found {} operands",
-            rest.len()
-        )));
+        return Err(err_slice(
+            rest,
+            format!(
+                "`{op}` takes <output> <origin-tag> <input-list>, found {} operands",
+                rest.len()
+            ),
+        ));
     }
     let output = read_expr(module, &rest[0])?;
     let tag = atom(&rest[1])?;
@@ -281,9 +340,10 @@ fn read_reification(module: &mut Module, op: &str, rest: &[Sexpr]) -> Result<Nod
             }
         }
         other => {
-            return Err(Error::new(format!(
-                "`{op}` origin tag must be %specinputs or %autoinputs, found `{other}`"
-            )));
+            return Err(err(
+                &rest[1],
+                format!("`{op}` origin tag must be %specinputs or %autoinputs, found `{other}`"),
+            ));
         }
     };
 
@@ -305,7 +365,8 @@ fn read_reification(module: &mut Module, op: &str, rest: &[Sexpr]) -> Result<Nod
 fn parse_input_entries(module: &mut Module, form: &Sexpr) -> Result<Box<[(Symbol, Ref)]>> {
     let items = list(form)?;
     if items.is_empty() {
-        return Err(Error::new(
+        return Err(err(
+            form,
             "a reification input list cannot be empty (callables cannot be nullary)",
         ));
     }
@@ -314,12 +375,12 @@ fn parse_input_entries(module: &mut Module, form: &Sexpr) -> Result<Box<[(Symbol
         .map(|item| {
             let pair = list(item)?;
             if pair.len() != 2 {
-                return Err(Error::new("a input entry takes (<name> (%ref …))"));
+                return Err(err(item, "a input entry takes (<name> (%ref …))"));
             }
             let name = module.intern(atom(&pair[0])?);
             let ref_items = list(&pair[1])?;
             if ref_items.first().and_then(Sexpr::as_atom) != Some("%ref") {
-                return Err(Error::new("a input entry's value must be a (%ref …)"));
+                return Err(err(&pair[1], "a input entry's value must be a (%ref …)"));
             }
             let r = parse_ref(module, ref_items)?;
             Ok((name, r))
@@ -363,7 +424,7 @@ enum TailKind {
 /// forms are structural; everything else (including `(%ref …)`, `(%axis …)`,
 /// `(%call …)`, and built-in calls) is a positional expression.
 fn tail_kind(item: &Sexpr) -> TailKind {
-    if let Sexpr::List(inner) = item {
+    if let SexprKind::List(inner) = &item.kind {
         if let Some(head) = inner.first().and_then(Sexpr::as_atom) {
             return match head {
                 "%meta" => TailKind::Meta,
@@ -380,7 +441,7 @@ fn tail_kind(item: &Sexpr) -> TailKind {
 fn parse_named(module: &mut Module, item: &Sexpr, kind: NamedKind) -> Result<NamedArg> {
     let items = list(item)?;
     if items.len() != 3 {
-        return Err(Error::new("a named entry takes (<keyword> <name> <value>)"));
+        return Err(err(item, "a named entry takes (<keyword> <name> <value>)"));
     }
     let name = module.intern(atom(&items[1])?);
     let value = read_expr(module, &items[2])?;
@@ -402,7 +463,8 @@ fn apply_meta(module: &mut Module, id: NodeId, meta: Meta) {
 fn parse_meta(module: &mut Module, item: &Sexpr) -> Result<Meta> {
     let items = list(item)?;
     if items.len() != 4 {
-        return Err(Error::new(
+        return Err(err(
+            item,
             "(%meta <type> <phase> <valueset>) takes three slots",
         ));
     }
@@ -415,8 +477,8 @@ fn parse_meta(module: &mut Module, item: &Sexpr) -> Result<Meta> {
 /// Read a `%meta` value-set slot: a set expression, `%unknown`, or
 /// `%deferred` (→ `None`, like the other slots).
 fn read_valueset(form: &Sexpr) -> Result<Option<ValueSet>> {
-    match form {
-        Sexpr::Atom(s) => match s.as_str() {
+    match &form.kind {
+        SexprKind::Atom(s) => match s.as_str() {
             "%deferred" => Ok(None),
             "%unknown" => Ok(Some(ValueSet::Unknown)),
             "reals" => Ok(Some(ValueSet::Reals)),
@@ -430,21 +492,21 @@ fn read_valueset(form: &Sexpr) -> Result<Option<ValueSet>> {
             "complexes" => Ok(Some(ValueSet::Complexes)),
             "rngstates" => Ok(Some(ValueSet::RngStates)),
             "anything" => Ok(Some(ValueSet::Anything)),
-            other => Err(Error::new(format!("unknown value set `{other}`"))),
+            other => Err(err(form, format!("unknown value set `{other}`"))),
         },
-        Sexpr::Str(_) => Err(Error::new("a string is not a value set")),
-        Sexpr::List(items) => {
+        SexprKind::Str(_) => Err(err(form, "a string is not a value set")),
+        SexprKind::List(items) => {
             let head = atom(&items[0])?;
             match head {
                 "stdsimplex" => {
                     if items.len() != 2 {
-                        return Err(Error::new("(stdsimplex <n>) takes one size"));
+                        return Err(err(form, "(stdsimplex <n>) takes one size"));
                     }
                     Ok(Some(ValueSet::StdSimplex(parse_dim(&items[1])?)))
                 }
                 "interval" => {
                     if items.len() != 3 {
-                        return Err(Error::new("(interval <lo> <hi>) takes two bounds"));
+                        return Err(err(form, "(interval <lo> <hi>) takes two bounds"));
                     }
                     Ok(Some(ValueSet::Interval(
                         parse_bound(&items[1])?,
@@ -453,16 +515,16 @@ fn read_valueset(form: &Sexpr) -> Result<Option<ValueSet>> {
                 }
                 "cartpow" => {
                     if items.len() != 3 {
-                        return Err(Error::new("(cartpow <set> <n>) takes a set and a size"));
+                        return Err(err(form, "(cartpow <set> <n>) takes a set and a size"));
                     }
                     let elem = read_valueset(&items[1])?
-                        .ok_or_else(|| Error::new("`%deferred` is not allowed inside a set"))?;
+                        .ok_or_else(|| err(&items[1], "`%deferred` is not allowed inside a set"))?;
                     Ok(Some(ValueSet::CartPow(
                         Box::new(elem),
                         parse_dim(&items[2])?,
                     )))
                 }
-                other => Err(Error::new(format!("unknown value-set form `{other}`"))),
+                other => Err(err(&items[0], format!("unknown value-set form `{other}`"))),
             }
         }
     }
@@ -472,7 +534,7 @@ fn read_valueset(form: &Sexpr) -> Result<Option<ValueSet>> {
 fn parse_bound(form: &Sexpr) -> Result<f64> {
     let text = atom(form)?;
     text.parse::<f64>()
-        .map_err(|_| Error::new(format!("invalid interval bound `{text}`")))
+        .map_err(|_| err(form, format!("invalid interval bound `{text}`")))
 }
 
 // ---- types ----
@@ -480,8 +542,8 @@ fn parse_bound(form: &Sexpr) -> Result<f64> {
 /// Read a `%meta` type slot. `%deferred` (and, by extension, an absent slot)
 /// maps to `None`; every other form yields a concrete [`Type`].
 fn read_type(module: &mut Module, form: &Sexpr) -> Result<Option<Type>> {
-    match form {
-        Sexpr::Atom(s) => match s.as_str() {
+    match &form.kind {
+        SexprKind::Atom(s) => match s.as_str() {
             "%deferred" => Ok(None),
             "%any" => Ok(Some(Type::Any)),
             "%module" => Ok(Some(Type::Module)),
@@ -492,19 +554,18 @@ fn read_type(module: &mut Module, form: &Sexpr) -> Result<Option<Type>> {
                         return Ok(Some(Type::Var(v)));
                     }
                 }
-                Err(Error::new(format!("unknown type `{other}`")))
+                Err(err(form, format!("unknown type `{other}`")))
             }
         },
-        Sexpr::Str(_) => Err(Error::new("a string is not a type")),
-        Sexpr::List(items) => read_type_list(module, items).map(Some),
+        SexprKind::Str(_) => Err(err(form, "a string is not a type")),
+        SexprKind::List(items) => read_type_list(module, items).map(Some),
     }
 }
 
 /// A type position that must be concrete (not `%deferred`); used for nested
 /// component types (array element, record fields, measure domain, …).
 fn read_type_required(module: &mut Module, form: &Sexpr) -> Result<Type> {
-    read_type(module, form)?
-        .ok_or_else(|| Error::new("`%deferred` is not allowed in a nested type"))
+    read_type(module, form)?.ok_or_else(|| err(form, "`%deferred` is not allowed in a nested type"))
 }
 
 fn read_type_list(module: &mut Module, items: &[Sexpr]) -> Result<Type> {
@@ -512,20 +573,23 @@ fn read_type_list(module: &mut Module, items: &[Sexpr]) -> Result<Type> {
     match head {
         "%failed" => {
             if items.len() != 2 {
-                return Err(Error::new("(%failed \"reason\") takes one string"));
+                return Err(err_slice(items, "(%failed \"reason\") takes one string"));
             }
             Ok(Type::Failed(string(&items[1])?.into()))
         }
         "%scalar" => {
             if items.len() != 2 {
-                return Err(Error::new("(%scalar <kind>) takes one kind"));
+                return Err(err_slice(items, "(%scalar <kind>) takes one kind"));
             }
-            Ok(Type::Scalar(parse_scalar_type(atom(&items[1])?)?))
+            Ok(Type::Scalar(parse_scalar_type(&items[1])?))
         }
         "%array" => read_array_type(module, items),
         "%tvector" => {
             if items.len() != 3 {
-                return Err(Error::new("(%tvector <len> <elem>) takes two operands"));
+                return Err(err_slice(
+                    items,
+                    "(%tvector <len> <elem>) takes two operands",
+                ));
             }
             Ok(Type::TVector {
                 len: parse_dim(&items[1])?,
@@ -543,7 +607,8 @@ fn read_type_list(module: &mut Module, items: &[Sexpr]) -> Result<Type> {
         "%table" => read_table_type(module, items),
         "%measure" => {
             if items.len() != 3 {
-                return Err(Error::new(
+                return Err(err_slice(
+                    items,
                     "(%measure (%domain <type>) (%mass <mass>)) takes a domain and a mass",
                 ));
             }
@@ -556,7 +621,8 @@ fn read_type_list(module: &mut Module, items: &[Sexpr]) -> Result<Type> {
         }
         "%kernel" => {
             if items.len() != 3 {
-                return Err(Error::new(
+                return Err(err_slice(
+                    items,
                     "(%kernel (%inputs …) (%mass <mass>)) takes inputs and a mass",
                 ));
             }
@@ -569,26 +635,30 @@ fn read_type_list(module: &mut Module, items: &[Sexpr]) -> Result<Type> {
             inputs: parse_inputs(module, items)?.into(),
         }),
         "%likelihood" => read_likelihood_type(module, items),
-        other => Err(Error::new(format!("unknown type form `{other}`"))),
+        other => Err(err(&items[0], format!("unknown type form `{other}`"))),
     }
 }
 
 fn read_array_type(module: &mut Module, items: &[Sexpr]) -> Result<Type> {
     if items.len() != 4 {
-        return Err(Error::new(
+        return Err(err_slice(
+            items,
             "(%array <ndims> (<shape>) <elem>) takes three operands",
         ));
     }
     let ndims: usize = atom(&items[1])?
         .parse()
-        .map_err(|_| Error::new("(%array …) ndims must be a non-negative integer"))?;
+        .map_err(|_| err(&items[1], "(%array …) ndims must be a non-negative integer"))?;
     let shape_items = list(&items[2])?;
     let shape: Vec<Dim> = shape_items.iter().map(parse_dim).collect::<Result<_>>()?;
     if shape.len() != ndims {
-        return Err(Error::new(format!(
-            "(%array …) ndims {ndims} disagrees with shape length {}",
-            shape.len()
-        )));
+        return Err(err_slice(
+            items,
+            format!(
+                "(%array …) ndims {ndims} disagrees with shape length {}",
+                shape.len()
+            ),
+        ));
     }
     let elem = read_type_required(module, &items[3])?;
     Ok(Type::Array {
@@ -599,18 +669,25 @@ fn read_array_type(module: &mut Module, items: &[Sexpr]) -> Result<Type> {
 
 fn read_table_type(module: &mut Module, items: &[Sexpr]) -> Result<Type> {
     if items.len() != 3 {
-        return Err(Error::new(
+        return Err(err_slice(
+            items,
             "(%table (%columns …) (%nrows N)) takes two operands",
         ));
     }
     let cols_form = list(&items[1])?;
     if cols_form.first().and_then(Sexpr::as_atom) != Some("%columns") {
-        return Err(Error::new("(%table …) first operand must be (%columns …)"));
+        return Err(err(
+            &items[1],
+            "(%table …) first operand must be (%columns …)",
+        ));
     }
     let columns = parse_named_types(module, &cols_form[1..])?;
     let nrows_form = list(&items[2])?;
     if nrows_form.first().and_then(Sexpr::as_atom) != Some("%nrows") || nrows_form.len() != 2 {
-        return Err(Error::new("(%table …) second operand must be (%nrows N)"));
+        return Err(err(
+            &items[2],
+            "(%table …) second operand must be (%nrows N)",
+        ));
     }
     Ok(Type::Table {
         columns: columns.into(),
@@ -620,7 +697,8 @@ fn read_table_type(module: &mut Module, items: &[Sexpr]) -> Result<Type> {
 
 fn read_likelihood_type(module: &mut Module, items: &[Sexpr]) -> Result<Type> {
     if items.len() != 3 {
-        return Err(Error::new(
+        return Err(err_slice(
+            items,
             "(%likelihood (%inputs …) (%obstype <type>)) takes two operands",
         ));
     }
@@ -638,11 +716,11 @@ fn read_likelihood_type(module: &mut Module, items: &[Sexpr]) -> Result<Type> {
 /// `items` is the whole type form; the inputs list is its second element.
 fn parse_inputs(module: &mut Module, items: &[Sexpr]) -> Result<Vec<flatppl_core::Symbol>> {
     if items.len() != 2 {
-        return Err(Error::new("expected a single (%inputs …) list"));
+        return Err(err_slice(items, "expected a single (%inputs …) list"));
     }
     let inputs = list(&items[1])?;
     if inputs.first().and_then(Sexpr::as_atom) != Some("%inputs") {
-        return Err(Error::new("expected (%inputs name …)"));
+        return Err(err(&items[1], "expected (%inputs name …)"));
     }
     inputs[1..]
         .iter()
@@ -654,7 +732,7 @@ fn parse_inputs(module: &mut Module, items: &[Sexpr]) -> Result<Vec<flatppl_core
 fn parse_wrapped_mass(form: &Sexpr) -> Result<Mass> {
     let items = list(form)?;
     if items.first().and_then(Sexpr::as_atom) != Some("%mass") || items.len() != 2 {
-        return Err(Error::new("expected (%mass <mass>)"));
+        return Err(err(form, "expected (%mass <mass>)"));
     }
     match atom(&items[1])? {
         "%deferred" => Ok(Mass::Deferred),
@@ -663,7 +741,7 @@ fn parse_wrapped_mass(form: &Sexpr) -> Result<Mass> {
         "%finite" => Ok(Mass::Finite),
         "%locallyfinite" => Ok(Mass::LocallyFinite),
         "%unknown" => Ok(Mass::Unknown),
-        other => Err(Error::new(format!("unknown mass class `{other}`"))),
+        other => Err(err(&items[1], format!("unknown mass class `{other}`"))),
     }
 }
 
@@ -671,7 +749,7 @@ fn parse_wrapped_mass(form: &Sexpr) -> Result<Mass> {
 fn parse_wrapped_type(module: &mut Module, form: &Sexpr, keyword: &str) -> Result<Type> {
     let items = list(form)?;
     if items.first().and_then(Sexpr::as_atom) != Some(keyword) || items.len() != 2 {
-        return Err(Error::new(format!("expected ({keyword} <type>)")));
+        return Err(err(form, format!("expected ({keyword} <type>)")));
     }
     read_type_required(module, &items[1])
 }
@@ -684,7 +762,7 @@ fn parse_named_types(
     for it in items {
         let pair = list(it)?;
         if pair.len() != 2 {
-            return Err(Error::new("expected (<name> <type>)"));
+            return Err(err(it, "expected (<name> <type>)"));
         }
         let name = module.intern(atom(&pair[0])?);
         out.push((name, read_type_required(module, &pair[1])?));
@@ -692,13 +770,13 @@ fn parse_named_types(
     Ok(out)
 }
 
-fn parse_scalar_type(s: &str) -> Result<ScalarType> {
-    match s {
+fn parse_scalar_type(form: &Sexpr) -> Result<ScalarType> {
+    match atom(form)? {
         "real" => Ok(ScalarType::Real),
         "integer" => Ok(ScalarType::Integer),
         "boolean" => Ok(ScalarType::Boolean),
         "complex" => Ok(ScalarType::Complex),
-        other => Err(Error::new(format!("unknown scalar type `{other}`"))),
+        other => Err(err(form, format!("unknown scalar type `{other}`"))),
     }
 }
 
@@ -709,43 +787,46 @@ fn parse_dim(form: &Sexpr) -> Result<Dim> {
     } else {
         a.parse::<u32>()
             .map(Dim::Static)
-            .map_err(|_| Error::new(format!("invalid dimension `{a}`")))
+            .map_err(|_| err(form, format!("invalid dimension `{a}`")))
     }
 }
 
 fn read_phase(form: &Sexpr) -> Result<Option<Phase>> {
-    match form {
-        Sexpr::Atom(s) => match s.as_str() {
+    match &form.kind {
+        SexprKind::Atom(s) => match s.as_str() {
             "%deferred" => Ok(None),
             "%fixed" => Ok(Some(Phase::Fixed)),
             "%parameterized" => Ok(Some(Phase::Parameterized)),
             "%stochastic" => Ok(Some(Phase::Stochastic)),
-            other => Err(Error::new(format!("unknown phase `{other}`"))),
+            other => Err(err(form, format!("unknown phase `{other}`"))),
         },
-        Sexpr::List(items) if items.first().and_then(Sexpr::as_atom) == Some("%failed") => Err(
+        SexprKind::List(items) if items.first().and_then(Sexpr::as_atom) == Some("%failed") => {
             // core's Phase has no failure variant; phase inference rarely fails
             // (it is an ancestor walk) and any %failed module is ill-formed.
-            Error::new("(%failed …) in the phase slot is not yet supported"),
-        ),
-        other => Err(Error::new(format!("invalid phase: {}", describe(other)))),
+            Err(err(
+                form,
+                "(%failed …) in the phase slot is not yet supported",
+            ))
+        }
+        _ => Err(err(form, format!("invalid phase: {}", describe(form)))),
     }
 }
 
 // ---- docs ----
 
 fn is_doc_form(form: &Sexpr) -> bool {
-    matches!(form, Sexpr::List(items) if items.first().and_then(Sexpr::as_atom) == Some("%doc"))
+    matches!(&form.kind, SexprKind::List(items) if items.first().and_then(Sexpr::as_atom) == Some("%doc"))
 }
 
 fn read_doc(form: &Sexpr) -> Result<Doc> {
     let items = list(form)?;
     if items.len() < 2 {
-        return Err(Error::new("(%doc <markup> <line>…) needs a markup tag"));
+        return Err(err(form, "(%doc <markup> <line>…) needs a markup tag"));
     }
     let markup = match atom(&items[1])? {
         "md" => Markup::Md,
         "typ" => Markup::Typ,
-        other => return Err(Error::new(format!("unknown doc markup `{other}`"))),
+        other => return Err(err(&items[1], format!("unknown doc markup `{other}`"))),
     };
     let mut lines = Vec::new();
     for it in &items[2..] {
@@ -796,33 +877,33 @@ fn classify_number(s: &str) -> Option<Scalar> {
     }
 }
 
-// ---- small Sexpr accessors with descriptive errors ----
+// ---- small Sexpr accessors with descriptive, positioned errors ----
 
 fn atom(form: &Sexpr) -> Result<&str> {
     form.as_atom()
-        .ok_or_else(|| Error::new(format!("expected a symbol, found {}", describe(form))))
+        .ok_or_else(|| err(form, format!("expected a symbol, found {}", describe(form))))
 }
 
 fn list(form: &Sexpr) -> Result<&[Sexpr]> {
     form.as_list()
-        .ok_or_else(|| Error::new(format!("expected a list, found {}", describe(form))))
+        .ok_or_else(|| err(form, format!("expected a list, found {}", describe(form))))
 }
 
 fn string(form: &Sexpr) -> Result<&str> {
-    match form {
-        Sexpr::Str(s) => Ok(s),
-        _ => Err(Error::new(format!(
-            "expected a string, found {}",
-            describe(form)
-        ))),
+    match &form.kind {
+        SexprKind::Str(s) => Ok(s),
+        _ => Err(err(
+            form,
+            format!("expected a string, found {}", describe(form)),
+        )),
     }
 }
 
 fn describe(form: &Sexpr) -> String {
-    match form {
-        Sexpr::Atom(a) => format!("`{a}`"),
-        Sexpr::Str(_) => "a string".to_string(),
-        Sexpr::List(items) => {
+    match &form.kind {
+        SexprKind::Atom(a) => format!("`{a}`"),
+        SexprKind::Str(_) => "a string".to_string(),
+        SexprKind::List(items) => {
             let head = items.first().and_then(Sexpr::as_atom).unwrap_or("…");
             format!("`({head} …)`")
         }
