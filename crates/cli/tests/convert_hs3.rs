@@ -121,3 +121,60 @@ fn convert_from_hs3_fixture() {
         "missing likelihoodof wiring, got:\n{text}"
     );
 }
+
+/// HS3/pyhf conversions carry the provenance header by default — recording the
+/// source format and the `--from` input file — and `--no-header` omits it. The
+/// FlatPPL output uses `%` comments.
+#[test]
+fn hs3_convert_emits_provenance_header() {
+    let dir = std::env::temp_dir();
+    let inp = dir.join("hs3_prov_cli.json");
+    let out = dir.join("hs3_prov_cli.flatppl");
+    std::fs::write(
+        &inp,
+        r#"{"distributions":[{"name":"mass","type":"gaussian_dist","mean":"mu","sigma":"s","x":"m_obs"}],"parameter_points":[{"name":"nom","entries":[{"name":"mu","value":1.0},{"name":"s","value":1.0}]}]}"#,
+    )
+    .unwrap();
+
+    // Default: header present, naming the HS3 source file.
+    let status = Command::new(env!("CARGO_BIN_EXE_flatppl"))
+        .args([
+            "convert",
+            "--from",
+            "hs3",
+            inp.to_str().unwrap(),
+            out.to_str().unwrap(),
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let text = std::fs::read_to_string(&out).unwrap();
+    assert!(
+        text.starts_with("% AUTOMATICALLY GENERATED"),
+        "expected a leading FlatPPL provenance comment, got:\n{text}"
+    );
+    assert!(
+        text.contains("from:       HS3 JSON file `hs3_prov_cli.json`"),
+        "header must name the HS3 source, got:\n{text}"
+    );
+    assert!(text.contains("generator:  flatppl"), "got:\n{text}");
+
+    // --no-header omits the block.
+    let status = Command::new(env!("CARGO_BIN_EXE_flatppl"))
+        .args([
+            "convert",
+            "--from",
+            "hs3",
+            "--no-header",
+            inp.to_str().unwrap(),
+            out.to_str().unwrap(),
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let text = std::fs::read_to_string(&out).unwrap();
+    assert!(
+        !text.contains("AUTOMATICALLY GENERATED"),
+        "--no-header must omit the provenance block, got:\n{text}"
+    );
+}
