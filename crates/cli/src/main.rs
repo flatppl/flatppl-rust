@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use ariadne::{Config, Label, Report, ReportKind, Source};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use flatppl_core::Module;
 
 mod provenance;
@@ -81,6 +81,16 @@ enum Command {
         /// Omit the leading provenance header comment (see `convert --no-header`).
         #[arg(long)]
         no_header: bool,
+    },
+    /// Print a shell completion script to stdout.
+    ///
+    /// Covers every subcommand and flag. Install, e.g.:
+    /// `flatppl completions bash > /etc/bash_completion.d/flatppl`,
+    /// `flatppl completions zsh > ~/.zfunc/_flatppl`, or
+    /// `flatppl completions fish > ~/.config/fish/completions/flatppl.fish`.
+    Completions {
+        /// Target shell.
+        shell: clap_complete::Shell,
     },
 }
 
@@ -215,6 +225,11 @@ fn main() -> ExitCode {
             level,
             no_header,
         } => infer_cmd(&input, &output, level.into(), no_header),
+        Command::Completions { shell } => {
+            let mut cmd = Cli::command();
+            clap_complete::generate(shell, &mut cmd, "flatppl", &mut std::io::stdout());
+            Ok(())
+        }
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

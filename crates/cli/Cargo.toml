@@ -28,4 +28,5 @@ flatppl-flatpir = { path = "../flatpir" }
 flatppl-infer = { path = "../infer", optional = true }
 flatppl-hs3 = { path = "../hs3", optional = true }
 clap = { workspace = true }
+clap_complete = { workspace = true }
 ariadne = { workspace = true }
