@@ -28,8 +28,10 @@ enum Command {
     ///
     /// Formats are inferred from the file extensions (`.flatppl` /
     /// `.flatpir`). Converting to the same format canonicalizes the file.
+    /// Use `--from hs3` or `--from pyhf` to import a JSON file.
     Convert {
-        /// Input file (`.flatppl` or `.flatpir`)
+        /// Input file (`.flatppl`, `.flatpir`, native HS3 JSON with `--from hs3`,
+        /// or pyhf workspace JSON with `--from pyhf`)
         input: PathBuf,
         /// Output file (`.flatppl` or `.flatpir`)
         output: PathBuf,
@@ -38,6 +40,12 @@ enum Command {
         /// lambdas, `:=`); `minimal` emits the lowered function-call form.
         #[arg(long, value_enum, default_value_t = SyntaxLevel::Full)]
         syntax: SyntaxLevel,
+        /// Input format: `auto` infers from the file extension (`.flatppl` /
+        /// `.flatpir`); `hs3` reads a native HS3 JSON document
+        /// (`distributions`, `likelihoods`, …); `pyhf` reads a pyhf workspace
+        /// JSON document (top-level `channels` array).
+        #[arg(long, value_enum, default_value_t = FromFormat::Auto)]
+        from: FromFormat,
     },
     /// Infer types and phases; emit annotated FlatPIR.
     ///
@@ -78,6 +86,17 @@ impl From<InferLevel> for flatppl_infer::Level {
             InferLevel::Shape => flatppl_infer::Level::Shape,
         }
     }
+}
+
+/// Input format selector for `--from`.
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum FromFormat {
+    /// Infer the input format from the file extension (`.flatppl` / `.flatpir`).
+    Auto,
+    /// Read a native HS3 JSON document (`distributions`, `likelihoods`, …).
+    Hs3,
+    /// Read a pyhf workspace JSON document (top-level `channels` array).
+    Pyhf,
 }
 
 /// CLI mirror of [`flatppl_syntax::Syntax`] (the library stays clap-free).
@@ -150,7 +169,8 @@ fn main() -> ExitCode {
             input,
             output,
             syntax,
-        } => convert(&input, &output, syntax.into()),
+            from,
+        } => convert(&input, &output, syntax.into(), from),
         #[cfg(feature = "infer")]
         Command::Infer {
             input,
@@ -223,24 +243,52 @@ fn line_span(source: &str, line: usize) -> Option<(usize, usize)> {
     None
 }
 
-fn convert(input: &Path, output: &Path, syntax: flatppl_syntax::Syntax) -> Result<(), Failure> {
-    let from = Format::from_path(input)?;
+fn convert(
+    input: &Path,
+    output: &Path,
+    syntax: flatppl_syntax::Syntax,
+    from_format: FromFormat,
+) -> Result<(), Failure> {
     let to = Format::from_path(output)?;
-    let source =
-        fs::read_to_string(input).map_err(|e| format!("reading `{}`: {e}", input.display()))?;
 
-    let module = match read_module(from, &source) {
-        Ok(module) => module,
-        Err((message, line, span)) => {
-            return Err(Failure::Diagnostic {
-                path: input.to_path_buf(),
-                source,
-                message,
-                line,
-                span,
-            });
+    // Read the module: HS3/pyhf paths (feature-gated) or the standard
+    // extension-based FlatPPL/FlatPIR path.
+    let module = match from_format {
+        #[cfg(feature = "hs3")]
+        FromFormat::Hs3 => {
+            let source = fs::read_to_string(input)
+                .map_err(|e| format!("reading `{}`: {e}", input.display()))?;
+            flatppl_hs3::read_hs3(&source).map_err(|e| Failure::Plain(format!("hs3: {e}")))?
+        }
+        #[cfg(feature = "hs3")]
+        FromFormat::Pyhf => {
+            let source = fs::read_to_string(input)
+                .map_err(|e| format!("reading `{}`: {e}", input.display()))?;
+            flatppl_hs3::read_pyhf(&source).map_err(|e| Failure::Plain(format!("pyhf: {e}")))?
+        }
+        // `Auto` (and, when the feature is absent, the `Hs3`/`Pyhf` arms that
+        // can never be reached) falls through to extension inference.
+        // Check the input extension BEFORE reading the file so that an
+        // unknown extension is reported even when the file does not exist.
+        _ => {
+            let from = Format::from_path(input)?;
+            let source = fs::read_to_string(input)
+                .map_err(|e| format!("reading `{}`: {e}", input.display()))?;
+            match read_module(from, &source) {
+                Ok(module) => module,
+                Err((message, line, span)) => {
+                    return Err(Failure::Diagnostic {
+                        path: input.to_path_buf(),
+                        source,
+                        message,
+                        line,
+                        span,
+                    });
+                }
+            }
         }
     };
+
     let mut text = write_module(to, &module, syntax);
     if !text.ends_with('\n') {
         text.push('\n');

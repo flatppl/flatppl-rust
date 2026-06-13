@@ -1,0 +1,47 @@
+{
+    "channels": [
+        {
+            "name": "singlechannel",
+            "samples": [
+                {
+                    "data": [5.0, 10.0],
+                    "modifiers": [
+                        {
+                            "data": null,
+                            "name": "mu",
+                            "type": "normfactor"
+                        }
+                    ],
+                    "name": "signal"
+                },
+                {
+                    "data": [50.0, 60.0],
+                    "modifiers": [
+                        {
+                            "data": [5.0, 12.0],
+                            "name": "uncorr_bkguncrt",
+                            "type": "shapesys"
+                        }
+                    ],
+                    "name": "background"
+                }
+            ]
+        }
+    ],
+    "measurements": [
+        {
+            "config": {
+                "parameters": [],
+                "poi": "mu"
+            },
+            "name": "Measurement"
+        }
+    ],
+    "observations": [
+        {
+            "data": [50.0, 60.0],
+            "name": "singlechannel"
+        }
+    ],
+    "version": "1.0.0"
+}
