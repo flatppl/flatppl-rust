@@ -10,11 +10,12 @@
 use crate::builder::Builder;
 use crate::dist_spec;
 use crate::distribution::{
-    VariateName, emit_distribution, field_node, needs_hepphys, variate_name,
+    VariateName, emit_distribution, emit_product, field_node, needs_hepphys, product_factors,
+    product_shared_variate, variate_name,
 };
 use crate::error::{Error, Result};
 use crate::expr;
-use crate::model::{Document, Function, HistFactory, Modifier};
+use crate::model::{Distribution, Document, Function, HistFactory, Modifier};
 use crate::presets::{emit_domain, emit_parameter_point};
 use flatppl_core::Module;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -330,8 +331,30 @@ fn emit_distributions(m: &mut Module, doc: &Document) -> Result<()> {
         if needs_hp && !has_histfactory {
             crate::pyhf::emit_standard_module(&mut b);
         }
+        // Resolve each distribution's variate once, so product_dist can classify
+        // its factors (shared variate → density product, else independent joint).
+        let dist_by_name: std::collections::BTreeMap<&str, &Distribution> = doc
+            .distributions
+            .iter()
+            .map(|d| (d.name.as_str(), d))
+            .collect();
         for d in &doc.distributions {
             if d.kind == "histfactory_dist" {
+                continue;
+            }
+            // product_dist is composite: its form depends on the factors' variates.
+            if d.kind == "product_dist" {
+                let factor_variates: Vec<Option<VariateName>> = product_factors(d)
+                    .iter()
+                    .map(|f| dist_by_name.get(f.as_str()).and_then(|fd| variate_name(fd)))
+                    .collect();
+                let node = emit_product(&mut b, d, &factor_variates)?;
+                let doc_line = if product_shared_variate(&factor_variates) {
+                    "HS3 product_dist (shared variate) → normalize(logweighted …): pointwise density product"
+                } else {
+                    "HS3 product_dist → joint over factor distributions"
+                };
+                b.bind_doc(&d.name, node, &[doc_line]);
                 continue;
             }
             // Resolve the variate's declared domain (needed for uniform_dist).

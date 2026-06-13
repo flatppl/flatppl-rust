@@ -95,10 +95,17 @@ fn paper_product_converts() {
     let m = flatppl_hs3::read(FIXTURE_PRODUCT).expect("paper_product.json must parse and convert");
     let text = print_with(&m, Syntax::Minimal);
 
-    // joint(...) from product_dist
+    // product_dist over the SAME observable x → normalized pointwise density
+    // product (§12), not a joint.
     assert!(
-        text.contains("joint("),
-        "missing joint( from product_dist, got:\n{text}"
+        text.contains(
+            "prod = normalize(logweighted(functionof(logdensityof(g2, _x_), x = _x_), g1))"
+        ),
+        "shared-variate product_dist lowering mismatch, got:\n{text}"
+    );
+    assert!(
+        !text.contains("joint("),
+        "same-variate product must not lower to joint, got:\n{text}"
     );
     // two Normal distributions (g1 and g2)
     let normal_count = text.matches("Normal").count();
