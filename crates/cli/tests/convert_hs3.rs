@@ -158,6 +158,14 @@ fn hs3_convert_emits_provenance_header() {
         "header must name the HS3 source, got:\n{text}"
     );
     assert!(text.contains("generator:  flatppl"), "got:\n{text}");
+    // The full invocation is captured, including the --from flag and its value.
+    assert!(
+        text.contains("command:    ")
+            && text.contains("convert")
+            && text.contains("--from")
+            && text.contains("hs3"),
+        "header must record the full convert command, got:\n{text}"
+    );
 
     // --no-header omits the block.
     let status = Command::new(env!("CARGO_BIN_EXE_flatppl"))
