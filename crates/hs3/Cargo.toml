@@ -9,8 +9,6 @@ repository.workspace = true
 
 [dependencies]
 flatppl-core = { path = "../core" }
+flatppl-syntax = { path = "../syntax" }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
-
-[dev-dependencies]
-flatppl-syntax = { path = "../syntax" }

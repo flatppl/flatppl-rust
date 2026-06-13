@@ -47,38 +47,23 @@ fn density_function_dist_converts() {
     let text = print_with(&m, Syntax::Minimal);
     eprintln!("=== density_function_dist ===\n{text}\n=== end ===");
 
-    // The functions block must produce a lambda binding for my_gauss_fn
+    // Exact body: the generic_function lowers each operator to its FlatPPL call
+    // form over a fresh bound variable _x_; free names mu/sigma stay as refs.
     assert!(
-        text.contains("my_gauss_fn"),
-        "missing my_gauss_fn binding, got:\n{text}"
+        text.contains(
+            "my_gauss_fn = functionof(exp(mul(neg(0.5), pow(divide(sub(_x_, mu), sigma), 2.0))), x = _x_)"
+        ),
+        "generic_function body mismatch, got:\n{text}"
     );
-    // The lambda should contain the expression content
+    // density (not log-density) → normalize(weighted(<fn>, Lebesgue(reals))).
     assert!(
-        text.contains("exp"),
-        "missing exp in function, got:\n{text}"
+        text.contains("gauss_dist = normalize(weighted(my_gauss_fn, Lebesgue(reals)))"),
+        "density_function_dist body mismatch, got:\n{text}"
     );
-    assert!(text.contains("mu"), "missing mu in function, got:\n{text}");
-    assert!(
-        text.contains("sigma"),
-        "missing sigma in function, got:\n{text}"
-    );
-
-    // The distribution must emit normalize(weighted(...))
-    assert!(
-        text.contains("normalize"),
-        "missing normalize, got:\n{text}"
-    );
-    assert!(text.contains("weighted"), "missing weighted, got:\n{text}");
-    assert!(text.contains("Lebesgue"), "missing Lebesgue, got:\n{text}");
+    // density_function_dist must use weighted, never logweighted.
     assert!(
         !text.contains("logweighted"),
         "must not emit logweighted for density_function_dist, got:\n{text}"
-    );
-
-    // gauss_dist binding must be present
-    assert!(
-        text.contains("gauss_dist"),
-        "missing gauss_dist binding, got:\n{text}"
     );
 
     let parsed = parse(&text);
@@ -126,22 +111,18 @@ fn log_density_function_dist_converts() {
     let text = print_with(&m, Syntax::Minimal);
     eprintln!("=== log_density_function_dist ===\n{text}\n=== end ===");
 
+    // Exact body: same operator-lowering as the density variant, but the
+    // distribution wraps the function in normalize(LOGweighted(...)) — the log
+    // variant treats the function as a log-density, not a density.
     assert!(
-        text.contains("log_gauss_fn"),
-        "missing log_gauss_fn binding, got:\n{text}"
+        text.contains(
+            "log_gauss_fn = functionof(mul(neg(0.5), pow(divide(sub(_x_, mu), sigma), 2.0)), x = _x_)"
+        ),
+        "log generic_function body mismatch, got:\n{text}"
     );
     assert!(
-        text.contains("normalize"),
-        "missing normalize, got:\n{text}"
-    );
-    assert!(
-        text.contains("logweighted"),
-        "missing logweighted, got:\n{text}"
-    );
-    assert!(text.contains("Lebesgue"), "missing Lebesgue, got:\n{text}");
-    assert!(
-        !text.contains("\"weighted\"") || !text.contains("weighted(log_gauss"),
-        "must use logweighted not plain weighted for log variant"
+        text.contains("log_gauss_dist = normalize(logweighted(log_gauss_fn, Lebesgue(reals)))"),
+        "log_density_function_dist body mismatch, got:\n{text}"
     );
 
     let parsed = parse(&text);
@@ -182,29 +163,16 @@ fn generic_dist_converts() {
     let text = print_with(&m, Syntax::Minimal);
     eprintln!("=== generic_dist ===\n{text}\n=== end ===");
 
+    // Exact body: the inline expression lowers into a functionof(...) over a
+    // fresh _x_, wrapped directly in normalize(weighted(..., Lebesgue(reals)))
+    // (no separate functions-block binding — the expression is embedded).
     assert!(
-        text.contains("inline_gauss"),
-        "missing inline_gauss binding, got:\n{text}"
+        text.contains(
+            "inline_gauss = normalize(weighted(functionof(exp(mul(neg(0.5), pow(divide(sub(_x_, mu), sigma), 2.0))), x = _x_), Lebesgue(reals)))"
+        ),
+        "generic_dist body mismatch, got:\n{text}"
     );
-    assert!(
-        text.contains("normalize"),
-        "missing normalize, got:\n{text}"
-    );
-    assert!(text.contains("weighted"), "missing weighted, got:\n{text}");
-    assert!(text.contains("Lebesgue"), "missing Lebesgue, got:\n{text}");
-    // The lambda/functionof and its body should include the arithmetic
-    assert!(
-        text.contains("exp"),
-        "missing exp in expression, got:\n{text}"
-    );
-    assert!(
-        text.contains("mu"),
-        "missing mu in expression, got:\n{text}"
-    );
-    assert!(
-        text.contains("sigma"),
-        "missing sigma in expression, got:\n{text}"
-    );
+    // generic_dist is a density, never a log-density.
     assert!(
         !text.contains("logweighted"),
         "must not emit logweighted for generic_dist, got:\n{text}"
@@ -257,18 +225,13 @@ fn product_function_converts() {
     let text = print_with(&m, Syntax::Minimal);
     eprintln!("=== product function ===\n{text}\n=== end ===");
 
+    // Exact body: the factors [a, b, 2.0] fold LEFT-ASSOCIATIVELY into
+    // mul(mul(a, b), 2.0). Pinning the whole RHS catches both a wrong fold
+    // direction (mul(a, mul(b, 2.0))) and any factor reordering.
     assert!(
-        text.contains("prod_fn"),
-        "missing prod_fn binding, got:\n{text}"
+        text.contains("prod_fn = mul(mul(a, b), 2.0)"),
+        "product fold mismatch (expected left-assoc mul(mul(a, b), 2.0)), got:\n{text}"
     );
-    // mul must appear (folded product)
-    assert!(
-        text.contains("*") || text.contains("mul"),
-        "missing mul/*, got:\n{text}"
-    );
-    assert!(text.contains("a"), "missing factor a, got:\n{text}");
-    assert!(text.contains("b"), "missing factor b, got:\n{text}");
-    assert!(text.contains("2"), "missing literal 2.0, got:\n{text}");
 
     let parsed = parse(&text);
     assert!(
@@ -317,18 +280,12 @@ fn sum_function_converts() {
     let text = print_with(&m, Syntax::Minimal);
     eprintln!("=== sum function ===\n{text}\n=== end ===");
 
+    // Exact body: the summands [c1, c2, 1.0] fold LEFT-ASSOCIATIVELY into
+    // add(add(c1, c2), 1.0).
     assert!(
-        text.contains("sum_fn"),
-        "missing sum_fn binding, got:\n{text}"
+        text.contains("sum_fn = add(add(c1, c2), 1.0)"),
+        "sum fold mismatch (expected left-assoc add(add(c1, c2), 1.0)), got:\n{text}"
     );
-    // add must appear (folded sum)
-    assert!(
-        text.contains("+") || text.contains("add"),
-        "missing add/+, got:\n{text}"
-    );
-    assert!(text.contains("c1"), "missing summand c1, got:\n{text}");
-    assert!(text.contains("c2"), "missing summand c2, got:\n{text}");
-    assert!(text.contains("1"), "missing literal 1.0, got:\n{text}");
 
     let parsed = parse(&text);
     assert!(

@@ -6,6 +6,28 @@
 //! call).  A direct 1:1 function→function map gets NO comment.
 use flatppl_syntax::{Syntax, parse, print_with};
 
+/// Assert that a `%`-doc-comment line containing `comment_substr` appears
+/// IMMEDIATELY ABOVE the binding for `binding` (i.e. the very next non-blank
+/// line is `<binding> = ...`). This pins the provenance comment to the correct
+/// binding rather than merely checking it appears *somewhere* in the module.
+fn assert_comment_precedes_binding(text: &str, comment_substr: &str, binding: &str) {
+    let lines: Vec<&str> = text.lines().collect();
+    let binding_prefix = format!("{binding} =");
+    for (i, line) in lines.iter().enumerate() {
+        if line.trim_start().starts_with('%') && line.contains(comment_substr) {
+            // The next non-blank line must be the target binding.
+            if let Some(next) = lines[i + 1..].iter().find(|l| !l.trim().is_empty()) {
+                if next.trim_start().starts_with(&binding_prefix) {
+                    return; // found comment correctly attached to binding
+                }
+            }
+        }
+    }
+    panic!(
+        "expected a `% …{comment_substr}…` comment directly above `{binding} = …`, got:\n{text}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // mixture_dist — normalize(superpose(weighted(…)))
 // ---------------------------------------------------------------------------
@@ -50,11 +72,9 @@ fn mixture_dist_has_doc_comment_and_roundtrips() {
     let text = print_with(&m, Syntax::Minimal);
     eprintln!("=== mixture_dist doc-comment ===\n{text}\n=== end ===");
 
-    // The binding for mix_dist must carry the HS3 provenance comment.
-    assert!(
-        text.contains("% HS3 mixture_dist"),
-        "missing mixture_dist doc-comment, got:\n{text}"
-    );
+    // The HS3 provenance comment must sit directly above the mix_dist binding
+    // (not just appear somewhere in the module).
+    assert_comment_precedes_binding(&text, "HS3 mixture_dist", "mix_dist");
     // The output must still contain the FlatPPL expression.
     assert!(
         text.contains("normalize"),
@@ -95,10 +115,7 @@ fn generic_dist_has_doc_comment_and_roundtrips() {
     let text = print_with(&m, Syntax::Minimal);
     eprintln!("=== generic_dist doc-comment ===\n{text}\n=== end ===");
 
-    assert!(
-        text.contains("% HS3 generic_dist"),
-        "missing generic_dist doc-comment, got:\n{text}"
-    );
+    assert_comment_precedes_binding(&text, "HS3 generic_dist", "my_generic");
     assert!(
         text.contains("normalize"),
         "missing normalize, got:\n{text}"
@@ -151,21 +168,17 @@ fn histfactory_channel_has_doc_comments_and_roundtrips() {
     let text = print_with(&m, Syntax::Minimal);
     eprintln!("=== histfactory channel doc-comment ===\n{text}\n=== end ===");
 
-    // obs_model binding must have the channel-level doc-comment.
-    assert!(
-        text.contains("% HS3 histfactory channel"),
-        "missing histfactory channel doc-comment, got:\n{text}"
-    );
+    // The channel-level provenance comment must sit directly above the
+    // obs_model_chan1 binding.
+    assert_comment_precedes_binding(&text, "HS3 histfactory channel", "obs_model_chan1");
     assert!(
         text.contains("broadcast(Poisson"),
         "missing Poisson broadcast, got:\n{text}"
     );
 
-    // L_ binding must have the likelihood doc-comment.
-    assert!(
-        text.contains("% HS3 histfactory likelihood"),
-        "missing histfactory likelihood doc-comment, got:\n{text}"
-    );
+    // The likelihood provenance comment must sit directly above the L_chan1
+    // binding.
+    assert_comment_precedes_binding(&text, "HS3 histfactory likelihood", "L_chan1");
 
     // Round-trip.
     let rt = parse(&text);

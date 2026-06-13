@@ -20,10 +20,11 @@ fn two_bin_one_channel_converts() {
         text.contains("joint_likelihood"),
         "missing joint_likelihood, got:\n{text}"
     );
-    // observed data must appear literally
+    // observed data [50.0, 60.0] must appear as the exact in-order vector on the
+    // main Poisson term (pinned bracketed form catches a reordered observation).
     assert!(
-        text.contains("50.0") && text.contains("60.0"),
-        "observed data [50.0, 60.0] not in output, got:\n{text}"
+        text.contains("likelihoodof(obs_model_singlechannel, [50.0, 60.0])"),
+        "observed data [50.0, 60.0] not on main term, got:\n{text}"
     );
     // no lambda/fn — must be point-free
     assert!(!text.contains("fn("), "must be point-free, got:\n{text}");
@@ -64,16 +65,14 @@ fn multichan_old_converts() {
     // point-free: no lambda/fn
     assert!(!text.contains("fn("), "must be point-free, got:\n{text}");
 
-    // staterror delta literals:
-    // bin0: sqrt(5.0^2) / 100.0 = 0.05
-    // bin1: sqrt(10.0^2) / 100.0 = 0.1
+    // staterror aux term: a Gaussian constraint on the per-bin staterror scales
+    // with relative deltas [0.05, 0.1] (bin0 = sqrt(5^2)/100, bin1 = sqrt(10^2)/100).
+    // Pin the exact bracketed array — a bare contains("0.1") would false-pass on
+    // the lumi constraint's `sigma = 0.1`, and a swapped delta vector would slip
+    // through.
     assert!(
-        text.contains("0.05"),
-        "missing staterror delta 0.05 (bin0), got:\n{text}"
-    );
-    assert!(
-        text.contains("0.1"),
-        "missing staterror delta 0.1 (bin1), got:\n{text}"
+        text.contains("likelihoodof(broadcast(Normal, staterror_channel1, [0.05, 0.1]), 1.0)"),
+        "staterror aux mismatch (expected deltas [0.05, 0.1]), got:\n{text}"
     );
 
     // `call(hepphys...)` must never appear — that used a non-existent builtin
