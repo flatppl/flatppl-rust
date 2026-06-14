@@ -440,3 +440,22 @@ fn same_variate_product_with_mixed_measures_errs() {
         "reference measure",
     );
 }
+
+#[test]
+fn same_variate_three_factor_product_mixed_measures_errs() {
+    // g1, g2 (Lebesgue) then p (counting), all over `obs`: base measure is set by
+    // g1, and the later poisson differs — the any()-over-non-first path.
+    assert_err_hs3(
+        "mixed_measure_product_3factor",
+        r#"{"distributions":[
+            {"name":"prod","type":"product_dist","factors":["g1","g2","p"]},
+            {"name":"g1","type":"gaussian_dist","mean":"m1","sigma":"s1","x":"obs"},
+            {"name":"g2","type":"gaussian_dist","mean":"m2","sigma":"s2","x":"obs"},
+            {"name":"p","type":"poisson_dist","mean":"lam","x":"obs"}
+        ],"parameter_points":[{"name":"nom","entries":[
+            {"name":"m1","value":0.0},{"name":"s1","value":1.0},
+            {"name":"m2","value":0.0},{"name":"s2","value":1.0},{"name":"lam","value":3.0}
+        ]}]}"#,
+        "reference measure",
+    );
+}

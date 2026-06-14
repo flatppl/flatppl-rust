@@ -108,3 +108,23 @@ fn checked_and_unchecked_agree() {
     let render = |m| flatppl_syntax::print_with(m, flatppl_syntax::Syntax::Minimal);
     assert_eq!(render(&checked), render(&unchecked));
 }
+
+/// A same-observable product of two *discrete* factors shares the counting
+/// measure, so it is a valid pointwise density (pmf) product — it must convert,
+/// not be rejected by the mixed-measure guard.
+#[test]
+fn same_variate_product_all_discrete_is_allowed() {
+    let json = r#"{"distributions":[
+        {"name":"prod","type":"product_dist","factors":["p1","p2"]},
+        {"name":"p1","type":"poisson_dist","mean":"l1","x":"n"},
+        {"name":"p2","type":"poisson_dist","mean":"l2","x":"n"}
+    ],"parameter_points":[{"name":"nom","entries":[
+        {"name":"l1","value":3.0},{"name":"l2","value":4.0}
+    ]}]}"#;
+    let m = flatppl_hs3::read_hs3(json).expect("all-discrete shared product must convert");
+    let text = flatppl_syntax::print_with(&m, flatppl_syntax::Syntax::Minimal);
+    assert!(
+        text.contains("logweighted"),
+        "expected density-product form, got:\n{text}"
+    );
+}
