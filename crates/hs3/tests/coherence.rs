@@ -75,6 +75,10 @@ fn analyses_block_is_detected() {
     let without = r#"{"distributions":[]}"#;
     assert!(flatppl_hs3::document_has_analyses(with));
     assert!(!flatppl_hs3::document_has_analyses(without));
+    // An empty `analyses` array dropped nothing → no note.
+    assert!(!flatppl_hs3::document_has_analyses(
+        r#"{"distributions":[],"analyses":[]}"#
+    ));
 }
 
 /// Conversely, a genuinely unknown `type` MUST yield `UnknownDistType` — this

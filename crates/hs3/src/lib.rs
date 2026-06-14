@@ -80,15 +80,20 @@ pub fn read_pyhf_unchecked(json: &str) -> Result<Module> {
     pyhf::pyhf_to_module(&doc)
 }
 
-/// Whether the document carries an `analyses` block. That block is not imported
-/// by `read_hs3`/`read_pyhf` (it is inference configuration, out of scope for
-/// model conversion); this lets a CLI surface a note without the library
-/// printing.
+/// Whether the document carries a *non-empty* `analyses` block. That block is
+/// not imported by `read_hs3`/`read_pyhf` (it is inference configuration, out of
+/// scope for model conversion); this lets a CLI surface a note without the
+/// library printing. An absent, null, or empty `analyses` returns `false` —
+/// nothing was actually dropped.
 pub fn document_has_analyses(json: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(json)
         .ok()
-        .and_then(|v| v.get("analyses").map(|a| !a.is_null()))
-        .unwrap_or(false)
+        .and_then(|v| v.get("analyses").cloned())
+        .is_some_and(|a| match a {
+            serde_json::Value::Null => false,
+            serde_json::Value::Array(items) => !items.is_empty(),
+            other => !other.is_null(),
+        })
 }
 
 /// Parse a native HS3 JSON document into a FlatPPL module.
