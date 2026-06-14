@@ -677,6 +677,43 @@ pub fn product_shared_variate(factor_variates: &[Option<VariateName>]) -> bool {
     names.all(|v| v == Some(first))
 }
 
+/// The reference (base) measure a distribution's density is taken against.
+/// Used to guard the shared-variate `product_dist` lowering: a pointwise density
+/// product is only meaningful when all factors share one reference measure (§12).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RefMeasure {
+    /// Continuous — density w.r.t. Lebesgue measure.
+    Lebesgue,
+    /// Discrete — density (pmf) w.r.t. the counting measure.
+    Counting,
+    /// Composite or point-process distributions whose measure is not a simple
+    /// pointwise density over a shared scalar observable — never eligible for the
+    /// density-product form (treated as incompatible).
+    Other,
+}
+
+/// Classify a distribution kind's reference measure (see [`RefMeasure`]).
+pub fn reference_measure(kind: &str) -> RefMeasure {
+    match kind {
+        "gaussian_dist"
+        | "normal_dist"
+        | "exponential_dist"
+        | "lognormal_dist"
+        | "uniform_dist"
+        | "generalized_normal_dist"
+        | "crystalball_dist"
+        | "argus_dist"
+        | "multivariate_normal_dist"
+        | "generic_dist"
+        | "density_function_dist"
+        | "log_density_function_dist"
+        | "polynomial_dist"
+        | "relativistic_breit_wigner_dist" => RefMeasure::Lebesgue,
+        "poisson_dist" | "barlow_beeston_lite_poisson_constraint_dist" => RefMeasure::Counting,
+        _ => RefMeasure::Other,
+    }
+}
+
 /// The variate name(s) for a distribution, if any.
 ///
 /// Returns `VariateName::Single` for scalar variates and
