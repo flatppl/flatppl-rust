@@ -126,3 +126,73 @@ fn lints_a_repo_fixture_without_crashing() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+#[test]
+fn lint_no_files_errors() {
+    let out = bin().arg("lint").output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("no input files"));
+}
+
+#[test]
+fn lint_invalid_syntax_reports_diagnostic() {
+    let dir = Scratch::new("badsyntax");
+    let f = dir.path("m.flatppl");
+    fs::write(&f, "x\n").unwrap(); // bare name — parse error
+    let out = bin().arg("lint").arg(&f).output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(!out.stderr.is_empty());
+}
+
+#[test]
+fn lint_missing_file_errors() {
+    let dir = Scratch::new("missing");
+    let out = bin()
+        .arg("lint")
+        .arg(dir.path("nope.flatppl"))
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("reading"));
+}
+
+#[test]
+fn lint_unknown_extension_errors() {
+    let dir = Scratch::new("ext");
+    let f = dir.path("m.txt");
+    fs::write(&f, "mu = 0.0\n").unwrap();
+    let out = bin().arg("lint").arg(&f).output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+}
+
+#[test]
+fn lint_allow_not_canonical_suppresses_it() {
+    let dir = Scratch::new("allowcanon");
+    let f = dir.path("m.flatppl");
+    fs::write(&f, "x ~ Normal(mu=0.0,sigma=1.0)\n").unwrap(); // non-canonical
+    let out = bin()
+        .arg("lint")
+        .arg("--allow")
+        .arg("not-canonical")
+        .arg(&f)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("not-canonical"));
+}
+
+#[test]
+fn lint_reports_inference_gap() {
+    let dir = Scratch::new("gap");
+    let f = dir.path("m.flatppl");
+    fs::write(&f, "y = somethingweird(1.0)\n").unwrap();
+    let out = bin().arg("lint").arg(&f).output().unwrap();
+    assert!(String::from_utf8_lossy(&out.stderr).contains("inference-gap"));
+}
+
+#[test]
+fn fmt_lint_completions_emits_script() {
+    let out = bin().arg("completions").arg("bash").output().unwrap();
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("flatppl-fmt"));
+}
