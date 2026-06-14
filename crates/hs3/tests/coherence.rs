@@ -69,6 +69,14 @@ fn every_recognized_dist_kind_has_a_dispatch_arm() {
     }
 }
 
+#[test]
+fn analyses_block_is_detected() {
+    let with = r#"{"distributions":[],"analyses":[{"name":"a"}]}"#;
+    let without = r#"{"distributions":[]}"#;
+    assert!(flatppl_hs3::document_has_analyses(with));
+    assert!(!flatppl_hs3::document_has_analyses(without));
+}
+
 /// Conversely, a genuinely unknown `type` MUST yield `UnknownDistType` — this
 /// pins the negative side so the guard above can't be trivially satisfied by a
 /// converter that swallows everything.
@@ -79,4 +87,20 @@ fn truly_unknown_dist_kind_is_unknown_dist_type() {
         Err(Error::UnknownDistType(t)) => assert_eq!(t, "definitely_not_a_real_dist"),
         other => panic!("expected UnknownDistType, got: {other:?}"),
     }
+}
+
+/// The checked and unchecked import paths must produce the same module — the
+/// round-trip self-check (on by default) only validates, it must not alter the
+/// result. (Task 5: `read_*_unchecked` variants for latency-sensitive callers.)
+#[test]
+fn checked_and_unchecked_agree() {
+    let json = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/paper_gaussian.json"
+    ))
+    .unwrap();
+    let checked = flatppl_hs3::read_hs3(&json).unwrap();
+    let unchecked = flatppl_hs3::read_hs3_unchecked(&json).unwrap();
+    let render = |m| flatppl_syntax::print_with(m, flatppl_syntax::Syntax::Minimal);
+    assert_eq!(render(&checked), render(&unchecked));
 }

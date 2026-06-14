@@ -3,7 +3,7 @@ use crate::builder::Builder;
 use crate::error::{Error, Result};
 use crate::model::Likelihood;
 use flatppl_core::id::NodeId;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 /// Emit a likelihood binding.
 ///
@@ -26,7 +26,7 @@ use std::collections::HashMap;
 pub fn emit_likelihood(
     b: &mut Builder,
     lk: &Likelihood,
-    data_map: &HashMap<String, Vec<f64>>,
+    data_map: &BTreeMap<String, Vec<f64>>,
 ) -> Result<()> {
     if lk.distributions.is_empty() {
         return Ok(());
@@ -89,7 +89,7 @@ mod tests {
             data: vec![serde_json::json!("obs_data"), serde_json::json!("aux_obs")],
         };
         // Both data refs are real unbinned data (the only by-name datum source).
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         map.insert("obs_data".to_string(), vec![3.0]);
         map.insert("aux_obs".to_string(), vec![4.0]);
         {
@@ -114,7 +114,7 @@ mod tests {
             distributions: vec!["model".into()],
             data: vec![serde_json::json!("d")],
         };
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         map.insert("d".to_string(), vec![1.0, 2.0, 3.0]);
         {
             let mut b = Builder::new(&mut m);
@@ -143,7 +143,7 @@ mod tests {
             // `nowhere` is not in data_map — a dangling reference.
             data: vec![serde_json::json!("nowhere")],
         };
-        let empty_map = HashMap::new();
+        let empty_map = BTreeMap::new();
         let mut b = Builder::new(&mut m);
         let result = emit_likelihood(&mut b, &lk, &empty_map);
         assert!(
@@ -177,7 +177,7 @@ mod tests {
             distributions: vec!["model".into()],
             data: vec![serde_json::json!("decoy")],
         };
-        let empty_map = HashMap::new();
+        let empty_map = BTreeMap::new();
         let mut b = Builder::new(&mut m);
         let result = emit_likelihood(&mut b, &lk, &empty_map);
         assert!(

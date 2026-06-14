@@ -3,32 +3,32 @@ use flatppl_core::id::{NodeId, Symbol};
 use flatppl_core::node::{Call, CallHead, NamedArg, NamedKind, Node, Ref, RefNs, Scalar};
 use flatppl_core::{Binding, Doc, Markup, Module};
 
-pub struct Builder<'m> {
+pub(crate) struct Builder<'m> {
     pub m: &'m mut Module,
 }
 
 impl<'m> Builder<'m> {
-    pub fn new(m: &'m mut Module) -> Self {
+    pub(crate) fn new(m: &'m mut Module) -> Self {
         Builder { m }
     }
 
-    pub fn sym(&mut self, s: &str) -> Symbol {
+    pub(crate) fn sym(&mut self, s: &str) -> Symbol {
         self.m.intern(s)
     }
 
-    pub fn lit_real(&mut self, v: f64) -> NodeId {
+    pub(crate) fn lit_real(&mut self, v: f64) -> NodeId {
         self.m.alloc(Node::Lit(Scalar::Real(v)))
     }
 
-    pub fn lit_int(&mut self, v: i64) -> NodeId {
+    pub(crate) fn lit_int(&mut self, v: i64) -> NodeId {
         self.m.alloc(Node::Lit(Scalar::Int(v)))
     }
 
-    pub fn str_lit(&mut self, s: &str) -> NodeId {
+    pub(crate) fn str_lit(&mut self, s: &str) -> NodeId {
         self.m.alloc(Node::Lit(Scalar::Str(s.into())))
     }
 
-    pub fn self_ref(&mut self, name: &str) -> NodeId {
+    pub(crate) fn self_ref(&mut self, name: &str) -> NodeId {
         let name = self.sym(name);
         self.m.alloc(Node::Ref(Ref {
             ns: RefNs::SelfMod,
@@ -36,7 +36,7 @@ impl<'m> Builder<'m> {
         }))
     }
 
-    pub fn call(&mut self, head: &str, args: &[NodeId]) -> NodeId {
+    pub(crate) fn call(&mut self, head: &str, args: &[NodeId]) -> NodeId {
         let head = self.sym(head);
         self.m.alloc(Node::Call(Call {
             head: CallHead::Builtin(head),
@@ -46,7 +46,7 @@ impl<'m> Builder<'m> {
         }))
     }
 
-    pub fn call_kw(&mut self, head: &str, kw: &[(&str, NodeId)]) -> NodeId {
+    pub(crate) fn call_kw(&mut self, head: &str, kw: &[(&str, NodeId)]) -> NodeId {
         let head = self.sym(head);
         let named = kw
             .iter()
@@ -65,11 +65,11 @@ impl<'m> Builder<'m> {
     }
 
     /// Array literal `[a,b,...]`. Uses `vector` (the canonical FlatPPL builtin).
-    pub fn array(&mut self, elems: &[NodeId]) -> NodeId {
+    pub(crate) fn array(&mut self, elems: &[NodeId]) -> NodeId {
         self.call("vector", elems)
     }
 
-    pub fn bind(&mut self, name: &str, rhs: NodeId) {
+    pub(crate) fn bind(&mut self, name: &str, rhs: NodeId) {
         let name = self.sym(name);
         self.m.add_binding(Binding {
             name,
@@ -85,7 +85,7 @@ impl<'m> Builder<'m> {
     /// Used for non-1:1 HS3 → FlatPPL lowerings so that the emitted FlatPPL
     /// carries a human-readable `% HS3 <type> → <what was emitted>` provenance
     /// note (spec §05 / §11 doc-comment syntax).
-    pub fn bind_doc(&mut self, name: &str, rhs: NodeId, doc_lines: &[&str]) {
+    pub(crate) fn bind_doc(&mut self, name: &str, rhs: NodeId, doc_lines: &[&str]) {
         let name = self.sym(name);
         let lines: Box<[Box<str>]> = doc_lines.iter().map(|s| Box::from(*s)).collect();
         self.m.add_binding(Binding {
@@ -101,19 +101,19 @@ impl<'m> Builder<'m> {
     }
 
     /// `name = elementof(<set_node>)`.
-    pub fn bind_set(&mut self, name: &str, set: NodeId) {
+    pub(crate) fn bind_set(&mut self, name: &str, set: NodeId) {
         let eo = self.call("elementof", &[set]);
         self.bind(name, eo);
     }
 
     /// A built-in used as a value (head passed positionally, e.g. into broadcast).
-    pub fn call_head(&mut self, name: &str) -> NodeId {
+    pub(crate) fn call_head(&mut self, name: &str) -> NodeId {
         let sym = self.sym(name);
         self.m.alloc(Node::Const(sym))
     }
 
     /// A module-qualified callable `alias.name` (e.g. `hepphys.ContinuedPoisson`) as a value.
-    pub fn module_call(&mut self, alias: &str, name: &str) -> NodeId {
+    pub(crate) fn module_call(&mut self, alias: &str, name: &str) -> NodeId {
         let alias = self.sym(alias);
         let name = self.sym(name);
         self.m.alloc(Node::Ref(Ref {
@@ -124,7 +124,7 @@ impl<'m> Builder<'m> {
 
     /// A module-member application `alias.name(args...)` — emits `CallHead::User` over a
     /// module ref, which prints as `alias.name(arg0, arg1, ...)` and round-trips correctly.
-    pub fn module_user_call(&mut self, alias: &str, name: &str, args: &[NodeId]) -> NodeId {
+    pub(crate) fn module_user_call(&mut self, alias: &str, name: &str, args: &[NodeId]) -> NodeId {
         let callee = self.module_call(alias, name);
         self.m.alloc(Node::Call(Call {
             head: CallHead::User(callee),
