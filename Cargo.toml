@@ -7,6 +7,11 @@
 resolver = "3"
 members = ["crates/*"]
 
+# Release artifacts are shipped tools (notably the lean `flatppl-fmt`): strip
+# symbols for a smaller binary. Debug/`dev` builds keep symbols for backtraces.
+[profile.release]
+strip = true
+
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
