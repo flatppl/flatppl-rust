@@ -344,15 +344,19 @@ fn emit_distributions(m: &mut Module, doc: &Document) -> Result<()> {
             }
             // product_dist is composite: its form depends on the factors' variates.
             if d.kind == "product_dist" {
-                let factor_variates: Vec<Option<VariateName>> = product_factors(d)
+                // The factor list is immutable; build it once and reuse it for the
+                // variate map, the measure map, and the emit (threaded below).
+                let factors = product_factors(d);
+                let factor_variates: Vec<Option<VariateName>> = factors
                     .iter()
                     .map(|f| dist_by_name.get(f.as_str()).and_then(|fd| variate_name(fd)))
                     .collect();
+                let shared = product_shared_variate(&factor_variates);
                 // A shared-observable product is a pointwise density product
                 // (§12), well-defined only when all factors share one reference
                 // measure. Reject mixed measures rather than emit a wrong one.
-                if product_shared_variate(&factor_variates) {
-                    let measures: Vec<RefMeasure> = product_factors(d)
+                if shared {
+                    let measures: Vec<RefMeasure> = factors
                         .iter()
                         .map(|f| {
                             dist_by_name
@@ -370,8 +374,8 @@ fn emit_distributions(m: &mut Module, doc: &Document) -> Result<()> {
                         )));
                     }
                 }
-                let node = emit_product(&mut b, d, &factor_variates)?;
-                let doc_line = if product_shared_variate(&factor_variates) {
+                let node = emit_product(&mut b, &factors, &factor_variates)?;
+                let doc_line = if shared {
                     "HS3 product_dist (shared variate) → normalize(logweighted …): pointwise density product"
                 } else {
                     "HS3 product_dist → joint over factor distributions"
@@ -512,6 +516,10 @@ fn emit_likelihoods(
 ) -> Result<()> {
     let mut data_map: BTreeMap<String, Vec<f64>> = BTreeMap::new();
     for d in doc.data.iter().filter(|d| d.kind == "unbinned") {
+        // NOTE: unbinned data is materialized into memory proportional to the input
+        // document size (one f64 per entry), with no entry-count cap. Fine for the
+        // current CLI-on-local-file threat model. If untrusted HS3 documents are ever
+        // ingested non-interactively, add a hard limit on the total entry count here.
         let mut vals = Vec::with_capacity(d.entries.len());
         for e in &d.entries {
             if e.len() != 1 {

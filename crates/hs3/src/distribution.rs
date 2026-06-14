@@ -573,10 +573,9 @@ fn build_lebesgue_reals(b: &mut Builder) -> NodeId {
 ///   `joint(f1 = M1, f2 = M2, …)`.
 pub fn emit_product(
     b: &mut Builder,
-    d: &Distribution,
+    factors: &[String],
     factor_variates: &[Option<VariateName>],
 ) -> Result<NodeId> {
-    let factors = product_factors(d);
     if factors.is_empty() {
         return Err(Error::Unsupported("product_dist with no factors".into()));
     }
@@ -1028,5 +1027,50 @@ mod tests {
         assert!(text.contains("Normal"), "got: {text}");
         // numeric literals should appear in output
         assert!(text.contains("0") || text.contains("1"), "got: {text}");
+    }
+
+    /// Coherence guard for [`reference_measure`] — the second hand-maintained
+    /// `kind`-match parallel to the `dist_spec` dispatch table. A genuine pdf
+    /// (a kind with a single scalar variate) that is added to the dispatch but
+    /// forgotten here silently falls to [`RefMeasure::Other`] and is then
+    /// wrongly rejected from valid shared-variate `product_dist` lowerings (§12).
+    ///
+    /// Eligibility is derived from the table itself: every kind whose
+    /// `dist_spec::variate` is a scalar is a pointwise-density candidate and MUST
+    /// classify to a concrete reference measure. (Companion to the black-box
+    /// `every_recognized_dist_kind_has_a_dispatch_arm` test in tests/coherence.rs;
+    /// it lives here because `reference_measure` is `pub(crate)`.)
+    #[test]
+    fn every_scalar_variate_kind_has_a_concrete_reference_measure() {
+        // The recognized scalar-variate (pdf) kinds. `polynomial_dist` is omitted
+        // deliberately: it has a scalar `x` for variate-naming but lowers to a
+        // `functionof`/normalize form, so it is NOT a same-measure density-product
+        // factor and is correctly `Other` (it is never paired in a shared product).
+        const SCALAR_PDF_KINDS: &[&str] = &[
+            "gaussian_dist",
+            "normal_dist",
+            "poisson_dist",
+            "exponential_dist",
+            "lognormal_dist",
+            "uniform_dist",
+            "generalized_normal_dist",
+            "crystalball_dist",
+            "argus_dist",
+        ];
+        for kind in SCALAR_PDF_KINDS {
+            // The list must stay honest: each entry really is a scalar-variate kind.
+            assert!(
+                matches!(dist_spec::variate(kind), Variate::Scalar(_)),
+                "{kind} is listed as a scalar-variate pdf but dist_spec says otherwise — \
+                 update SCALAR_PDF_KINDS or the table"
+            );
+            assert_ne!(
+                reference_measure(kind),
+                RefMeasure::Other,
+                "{kind} is a scalar-variate pdf but reference_measure classifies it as `Other`; \
+                 it will be wrongly rejected from shared-variate product_dist lowerings. \
+                 Add it to the reference_measure match."
+            );
+        }
     }
 }
