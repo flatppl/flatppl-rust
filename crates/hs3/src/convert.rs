@@ -18,7 +18,7 @@ use crate::expr;
 use crate::model::{Distribution, Document, Function, HistFactory, Modifier};
 use crate::presets::{emit_domain, emit_parameter_point};
 use flatppl_core::Module;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 
 pub fn document_to_module(doc: &Document) -> Result<Module> {
     reject_unsupported(doc)?;
@@ -488,7 +488,7 @@ fn emit_likelihoods(
     doc: &Document,
     histfactory_names: &BTreeSet<&str>,
 ) -> Result<()> {
-    let mut data_map: HashMap<String, Vec<f64>> = HashMap::new();
+    let mut data_map: BTreeMap<String, Vec<f64>> = BTreeMap::new();
     for d in doc.data.iter().filter(|d| d.kind == "unbinned") {
         let mut vals = Vec::with_capacity(d.entries.len());
         for e in &d.entries {

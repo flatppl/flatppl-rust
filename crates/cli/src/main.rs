@@ -181,6 +181,19 @@ fn main() -> ExitCode {
     report(result)
 }
 
+/// Print a note when an HS3/pyhf document carried an `analyses` block: it is
+/// not imported by `convert` (inference configuration is out of scope), and the
+/// user should know part of the document was skipped.
+#[cfg(feature = "hs3")]
+fn note_dropped_analyses(source: &str) {
+    if flatppl_hs3::document_has_analyses(source) {
+        eprintln!(
+            "flatppl: note: the input's `analyses` block was not imported \
+             (inference configuration is out of scope for `convert`)"
+        );
+    }
+}
+
 #[cfg(feature = "convert")]
 fn convert(
     input: &Path,
@@ -198,13 +211,19 @@ fn convert(
         FromFormat::Hs3 => {
             let source = fs::read_to_string(input)
                 .map_err(|e| format!("reading `{}`: {e}", input.display()))?;
-            flatppl_hs3::read_hs3(&source).map_err(|e| Failure::Plain(format!("hs3: {e}")))?
+            let module =
+                flatppl_hs3::read_hs3(&source).map_err(|e| Failure::Plain(format!("hs3: {e}")))?;
+            note_dropped_analyses(&source);
+            module
         }
         #[cfg(feature = "hs3")]
         FromFormat::Pyhf => {
             let source = fs::read_to_string(input)
                 .map_err(|e| format!("reading `{}`: {e}", input.display()))?;
-            flatppl_hs3::read_pyhf(&source).map_err(|e| Failure::Plain(format!("pyhf: {e}")))?
+            let module = flatppl_hs3::read_pyhf(&source)
+                .map_err(|e| Failure::Plain(format!("pyhf: {e}")))?;
+            note_dropped_analyses(&source);
+            module
         }
         // `Auto` (and, when the feature is absent, the `Hs3`/`Pyhf` arms that
         // can never be reached) falls through to extension inference.

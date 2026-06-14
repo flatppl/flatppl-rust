@@ -26,7 +26,7 @@ required-features = ["fmtlint"]
 [features]
 # Verbs are opt-in cargo features so heavy capabilities never burden the
 # default build; `infer` is light and rides along by default.
-default = ["convert", "infer", "hs3", "fmtlint"]
+default = ["convert", "infer", "fmtlint"]
 convert = ["dep:flatppl-flatpir"]
 infer = ["dep:flatppl-infer", "dep:flatppl-flatpir"]
 hs3 = ["dep:flatppl-hs3", "dep:flatppl-flatpir"]

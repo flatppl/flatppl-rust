@@ -42,15 +42,19 @@ fn validate_round_trip(module: Module) -> Result<Module> {
 /// Dispatch: if the top-level JSON object has a `"channels"` key, the pyhf
 /// workspace lift path is taken; otherwise, the native HS3 path is used.
 pub fn read(json: &str) -> Result<Module> {
+    validate_round_trip(read_unchecked(json)?)
+}
+
+/// Like [`read`] but without the print→reparse self-check.
+pub fn read_unchecked(json: &str) -> Result<Module> {
     let value: serde_json::Value = serde_json::from_str(json)?;
-    let module = if value.get("channels").is_some() {
+    if value.get("channels").is_some() {
         let doc: model::PyhfDocument = serde_json::from_value(value)?;
-        pyhf::pyhf_to_module(&doc)?
+        pyhf::pyhf_to_module(&doc)
     } else {
         let doc: model::Document = serde_json::from_value(value)?;
-        convert::document_to_module(&doc)?
-    };
-    validate_round_trip(module)
+        convert::document_to_module(&doc)
+    }
 }
 
 /// Parse a pyhf workspace JSON document into a FlatPPL module.
@@ -59,6 +63,11 @@ pub fn read(json: &str) -> Result<Module> {
 /// Returns [`Error::Unsupported`] if the document lacks `"channels"`, with a
 /// hint to use the native HS3 path instead.
 pub fn read_pyhf(json: &str) -> Result<Module> {
+    validate_round_trip(read_pyhf_unchecked(json)?)
+}
+
+/// Like [`read_pyhf`] but without the print→reparse self-check.
+pub fn read_pyhf_unchecked(json: &str) -> Result<Module> {
     let value: serde_json::Value = serde_json::from_str(json)?;
     if value.get("channels").is_none() {
         return Err(Error::Unsupported(
@@ -68,8 +77,18 @@ pub fn read_pyhf(json: &str) -> Result<Module> {
         ));
     }
     let doc: model::PyhfDocument = serde_json::from_value(value)?;
-    let module = pyhf::pyhf_to_module(&doc)?;
-    validate_round_trip(module)
+    pyhf::pyhf_to_module(&doc)
+}
+
+/// Whether the document carries an `analyses` block. That block is not imported
+/// by `read_hs3`/`read_pyhf` (it is inference configuration, out of scope for
+/// model conversion); this lets a CLI surface a note without the library
+/// printing.
+pub fn document_has_analyses(json: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(json)
+        .ok()
+        .and_then(|v| v.get("analyses").map(|a| !a.is_null()))
+        .unwrap_or(false)
 }
 
 /// Parse a native HS3 JSON document into a FlatPPL module.
@@ -78,6 +97,13 @@ pub fn read_pyhf(json: &str) -> Result<Module> {
 /// workspace, not native HS3), returns [`Error::Unsupported`] with a hint to
 /// use `--from pyhf`.
 pub fn read_hs3(json: &str) -> Result<Module> {
+    validate_round_trip(read_hs3_unchecked(json)?)
+}
+
+/// Like [`read_hs3`] but without the print→reparse self-check. Lower latency
+/// for callers (e.g. language bindings) that don't need the importer's output
+/// re-validated on every call.
+pub fn read_hs3_unchecked(json: &str) -> Result<Module> {
     let value: serde_json::Value = serde_json::from_str(json)?;
     if value.get("channels").is_some() {
         return Err(Error::Unsupported(
@@ -87,8 +113,7 @@ pub fn read_hs3(json: &str) -> Result<Module> {
         ));
     }
     let doc: model::Document = serde_json::from_value(value)?;
-    let module = convert::document_to_module(&doc)?;
-    validate_round_trip(module)
+    convert::document_to_module(&doc)
 }
 
 #[cfg(test)]
