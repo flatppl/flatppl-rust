@@ -20,6 +20,7 @@ pub(crate) mod presets;
 pub(crate) mod pyhf;
 
 use flatppl_core::Module;
+#[cfg(debug_assertions)]
 use flatppl_syntax::{Syntax, parse, print_with};
 
 /// Validate that a freshly built module survives a print-then-reparse round
@@ -29,6 +30,12 @@ use flatppl_syntax::{Syntax, parse, print_with};
 /// [`Error::RoundTrip`] rather than returned silently. On success the original
 /// module is returned unchanged (the reparse result is discarded — it only
 /// serves as the validity check).
+///
+/// This is a self-check on the importer's own output, so it only runs in debug
+/// builds (`#[cfg(debug_assertions)]`): the O(output) print + full reparse is
+/// pure overhead on the default `read*` path in release. Release builds make
+/// `read*` identical to `read*_unchecked`.
+#[cfg(debug_assertions)]
 fn validate_round_trip(module: Module) -> Result<Module> {
     let text = print_with(&module, Syntax::Minimal);
     match parse(&text) {
@@ -37,15 +44,31 @@ fn validate_round_trip(module: Module) -> Result<Module> {
     }
 }
 
+/// Release-build sibling: the round-trip self-check is skipped (see the
+/// `#[cfg(debug_assertions)]` variant above), so this is the identity.
+#[cfg(not(debug_assertions))]
+fn validate_round_trip(module: Module) -> Result<Module> {
+    Ok(module)
+}
+
 /// Parse an HS3 or pyhf JSON document into a FlatPPL module.
 ///
 /// Dispatch: if the top-level JSON object has a `"channels"` key, the pyhf
 /// workspace lift path is taken; otherwise, the native HS3 path is used.
+///
+/// The print→reparse well-formedness self-check runs in **debug builds only**;
+/// release builds skip it and behave identically to [`read_unchecked`]. Use
+/// [`read_unchecked`] when you also want it skipped in debug builds.
 pub fn read(json: &str) -> Result<Module> {
     validate_round_trip(read_unchecked(json)?)
 }
 
 /// Like [`read`] but without the print→reparse self-check.
+///
+/// Caveat: output may be syntactically invalid FlatPPL for malformed or
+/// adversarial input, because the well-formedness round-trip is skipped.
+/// Callers must trust or separately validate the source before exposing the
+/// result to untrusted JSON.
 pub fn read_unchecked(json: &str) -> Result<Module> {
     let value: serde_json::Value = serde_json::from_str(json)?;
     if value.get("channels").is_some() {
@@ -62,11 +85,20 @@ pub fn read_unchecked(json: &str) -> Result<Module> {
 /// Requires the top-level `"channels"` key that identifies a pyhf workspace.
 /// Returns [`Error::Unsupported`] if the document lacks `"channels"`, with a
 /// hint to use the native HS3 path instead.
+///
+/// The print→reparse well-formedness self-check runs in **debug builds only**;
+/// release builds skip it and behave identically to [`read_pyhf_unchecked`].
+/// Use [`read_pyhf_unchecked`] when you also want it skipped in debug builds.
 pub fn read_pyhf(json: &str) -> Result<Module> {
     validate_round_trip(read_pyhf_unchecked(json)?)
 }
 
 /// Like [`read_pyhf`] but without the print→reparse self-check.
+///
+/// Caveat: output may be syntactically invalid FlatPPL for malformed or
+/// adversarial input, because the well-formedness round-trip is skipped.
+/// Callers must trust or separately validate the source before exposing the
+/// result to untrusted JSON.
 pub fn read_pyhf_unchecked(json: &str) -> Result<Module> {
     let value: serde_json::Value = serde_json::from_str(json)?;
     if value.get("channels").is_none() {
@@ -88,12 +120,20 @@ pub fn read_pyhf_unchecked(json: &str) -> Result<Module> {
 pub fn document_has_analyses(json: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(json)
         .ok()
-        .and_then(|v| v.get("analyses").cloned())
-        .is_some_and(|a| match a {
-            serde_json::Value::Null => false,
-            serde_json::Value::Array(items) => !items.is_empty(),
-            other => !other.is_null(),
-        })
+        .as_ref()
+        .is_some_and(value_has_analyses)
+}
+
+/// Like [`document_has_analyses`] but on an already-parsed [`serde_json::Value`],
+/// so a caller that has parsed the document once need not re-parse the source.
+/// `pub(crate)` for now: an in-crate hook for a future cross-crate caller that
+/// already holds a parsed document; not part of the public surface until needed.
+pub(crate) fn value_has_analyses(value: &serde_json::Value) -> bool {
+    value.get("analyses").is_some_and(|a| match a {
+        serde_json::Value::Null => false,
+        serde_json::Value::Array(items) => !items.is_empty(),
+        other => !other.is_null(),
+    })
 }
 
 /// Parse a native HS3 JSON document into a FlatPPL module.
@@ -101,6 +141,10 @@ pub fn document_has_analyses(json: &str) -> bool {
 /// If the document has a top-level `"channels"` key (which identifies a pyhf
 /// workspace, not native HS3), returns [`Error::Unsupported`] with a hint to
 /// use `--from pyhf`.
+///
+/// The print→reparse well-formedness self-check runs in **debug builds only**;
+/// release builds skip it and behave identically to [`read_hs3_unchecked`].
+/// Use [`read_hs3_unchecked`] when you also want it skipped in debug builds.
 pub fn read_hs3(json: &str) -> Result<Module> {
     validate_round_trip(read_hs3_unchecked(json)?)
 }
@@ -108,6 +152,11 @@ pub fn read_hs3(json: &str) -> Result<Module> {
 /// Like [`read_hs3`] but without the print→reparse self-check. Lower latency
 /// for callers (e.g. language bindings) that don't need the importer's output
 /// re-validated on every call.
+///
+/// Caveat: output may be syntactically invalid FlatPPL for malformed or
+/// adversarial input, because the well-formedness round-trip is skipped.
+/// Callers must trust or separately validate the source before exposing the
+/// result to untrusted JSON.
 pub fn read_hs3_unchecked(json: &str) -> Result<Module> {
     let value: serde_json::Value = serde_json::from_str(json)?;
     if value.get("channels").is_some() {

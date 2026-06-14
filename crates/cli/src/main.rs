@@ -184,6 +184,14 @@ fn main() -> ExitCode {
 /// Print a note when an HS3/pyhf document carried an `analyses` block: it is
 /// not imported by `convert` (inference configuration is out of scope), and the
 /// user should know part of the document was skipped.
+///
+// NOTE (L3): this re-parses `source` to inspect a single top-level key, after
+// `read_hs3`/`read_pyhf` already parsed it. The clean fix is for the importer
+// to surface an analyses-present flag from its existing parse (in `convert.rs`);
+// that's a cross-crate change outside this CLI's scope, so the extra parse is
+// left in place (Low severity, accepted by review). The cheaper `&Value`
+// alternative would require adding a `serde_json` dependency to this crate's
+// `Cargo.toml`, which is likewise out of scope here.
 #[cfg(feature = "hs3")]
 fn note_dropped_analyses(source: &str) {
     if flatppl_hs3::document_has_analyses(source) {
