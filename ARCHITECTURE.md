@@ -162,10 +162,11 @@ legalization targets above.
 
 Landed: `flatppl-core` (the IR) · `flatppl-syntax` (FlatPPL surface ↔ core) ·
 `flatppl-flatpir` (FlatPIR S-expr ↔ core) · `flatppl-infer` (the type/phase
-trace + per-op rule catalogue) · `flatppl-cli` (the `flatppl` driver binary —
-`convert` and `infer`). `syntax`/`flatpir`/`infer` depend on `core`; `core`
-depends on nothing. Library crates stay **binary-free** (they compile to
-`wasm32` and link into PyO3 / jlrs / cxx); all CLI surface lives in `flatppl-cli`.
+trace + per-op rule catalogue) · `flatppl-lint` (lint rules over the IR) ·
+`flatppl-cli` (the `flatppl` driver binary — `convert`, `infer`, `fmt`, `lint`).
+`syntax`/`flatpir`/`infer` depend on `core`; `core` depends on nothing. Library
+crates stay **binary-free** (they compile to `wasm32` and link into PyO3 / jlrs /
+cxx); all CLI surface lives in `flatppl-cli`.
 
 **CLI model.** One driver binary (`flatppl`) with subcommands; capabilities are
 compile-time cargo features of `flatppl-cli` (a verb's crates link only when its
@@ -175,6 +176,23 @@ in the default set). Verbs map to library crates: `convert` → syntax + flatpir
 checker. The crate can host additional `[[bin]]`s later (gated by
 `required-features`); a second tool with its own heavy dependency stack would
 split into its own crate instead.
+
+**Formatter + linter.** `flatppl-lint` (binary-free lint rules over the IR) plus
+a thin `fmt` layer over the `flatppl-syntax` canonicalizing printer are surfaced
+two ways. The full `flatppl` driver gains `fmt` and `lint` subcommands (behind the
+default `fmtlint` feature). A **standalone `flatppl-fmt` binary** (subcommands
+`fmt` / `lint`, `required-features = ["fmtlint"]`) is the lean CI/editor tool: it
+links only `core` + `syntax` + `infer` + `lint`, **not** the converter
+(`flatpir`/`hs3`), so `cargo build -p flatppl-cli --no-default-features
+--features fmtlint --bin flatppl-fmt` produces a minimal binary. `flatppl-cli` is
+therefore a **lib + two bins**: shared logic (`read_module`, `format_text`,
+`run_fmt`, `run_lint`, diagnostics) lives in the lib; each converter verb is its
+own cargo feature (`convert`/`infer`/`hs3`, all enabling `flatpir`). Lint rules:
+`unused-binding`, `shadows-builtin`, `missing-doc`, `not-canonical`, plus an
+`flatppl-infer` bridge (`unresolved-name` / `inference-cycle` / `inference-gap`);
+severities are leveled (allow/warn/deny) with CLI overrides
+(`--deny`/`--warn`/`--allow`/`--deny-warnings`) and a `% flatppl-lint: allow RULE`
+file-level suppression directive. The formatter is zero-config and idempotent.
 
 Planned (later phases): the lowering rule-catalog (possibly merged with a
 rewrite/egglog crate), per-target codegen crates, remote/server, …

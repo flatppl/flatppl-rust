@@ -128,6 +128,7 @@ dependencies = [
  "flatppl-flatpir",
  "flatppl-hs3",
  "flatppl-infer",
+ "flatppl-lint",
  "flatppl-syntax",
 ]
 
@@ -159,6 +160,16 @@ dependencies = [
  "flatppl-core",
  "flatppl-flatpir",
  "flatppl-syntax",
+]
+
+[[package]]
+name = "flatppl-lint"
+version = "0.1.0"
+dependencies = [
+ "flatppl-core",
+ "flatppl-infer",
+ "flatppl-syntax",
+ "serde_json",
 ]
 
 [[package]]

@@ -1,31 +1,13 @@
 //! End-to-end tests for `flatppl convert`, exercising the built binary.
 
 use std::fs;
-use std::path::PathBuf;
 use std::process::Command;
+
+mod common;
+use common::Scratch;
 
 fn bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_flatppl"))
-}
-
-/// A scratch dir unique to this test process, cleaned up on drop.
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn new(label: &str) -> Scratch {
-        let dir = std::env::temp_dir().join(format!("flatppl-cli-{label}-{}", std::process::id()));
-        fs::create_dir_all(&dir).expect("create scratch dir");
-        Scratch(dir)
-    }
-    fn path(&self, name: &str) -> PathBuf {
-        self.0.join(name)
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        fs::remove_dir_all(&self.0).ok();
-    }
 }
 
 #[test]
