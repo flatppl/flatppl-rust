@@ -843,7 +843,7 @@ fn read_doc(form: &Sexpr) -> Result<Doc> {
 /// Classify a bare atom as an integer or real *by lexical form* (spec §11), or
 /// `None` if it is not numeric (and so a symbol / constant). Crucially, this
 /// never treats `inf` / `nan` / `pi` as numbers — those are bare constants.
-fn classify_number(s: &str) -> Option<Scalar> {
+pub(crate) fn classify_number(s: &str) -> Option<Scalar> {
     let bytes = s.as_bytes();
     let first = *bytes.first()?;
     let numeric_start =

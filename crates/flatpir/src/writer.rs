@@ -93,7 +93,7 @@ fn render_scalar(lit: &Scalar) -> String {
 /// Format a real so it always re-reads as a real, never an integer: the default
 /// shortest round-trip repr of e.g. `2.0` is `"2"`, so append `.0` when there is
 /// no `.`/`e`/`E` in the output.
-fn render_real(r: f64) -> String {
+pub(crate) fn render_real(r: f64) -> String {
     let s = format!("{r}");
     if s.contains(['.', 'e', 'E']) || s.contains("inf") || s.contains("NaN") {
         s
@@ -102,7 +102,7 @@ fn render_real(r: f64) -> String {
     }
 }
 
-fn quote_string(s: &str) -> String {
+pub(crate) fn quote_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for c in s.chars() {

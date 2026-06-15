@@ -9,3 +9,4 @@ repository.workspace = true
 
 [dependencies]
 flatppl-core = { path = "../core" }
+serde_json = { workspace = true }
