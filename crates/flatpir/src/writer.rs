@@ -18,16 +18,20 @@ use flatppl_core::{
 pub fn write(module: &Module) -> String {
     let mut out = String::from("(%module");
 
-    // Public interface, if any: `(%public name …)`.
+    // Public interface: `(%public name …)`. ALWAYS emitted, even when empty, so
+    // re-reading uses the explicit interface and never the name-convention
+    // fallback. Omitting an empty `(%public)` is lossy: a module with no public
+    // bindings would re-read with its non-underscore bindings flipped to public.
     let publics: Vec<&str> = module
         .public_bindings()
         .map(|(_, b)| module.resolve(b.name))
         .collect();
-    if !publics.is_empty() {
-        out.push_str("\n  (%public ");
-        out.push_str(&publics.join(" "));
-        out.push(')');
+    out.push_str("\n  (%public");
+    for name in &publics {
+        out.push(' ');
+        out.push_str(name);
     }
+    out.push(')');
 
     // One `(%bind …)` stanza per binding, in source order, blank-line separated.
     for (id, binding) in module.bindings() {

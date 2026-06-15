@@ -206,3 +206,33 @@ fn valueset_forms_roundtrip() {
     }
     assert_eq!(write(&read(&out).unwrap()), out);
 }
+
+/// A module with an explicit *empty* `(%public)` — no public bindings — must
+/// survive `write → read`. The writer emits `(%public)` so re-reading uses the
+/// explicit (empty) interface rather than the name-convention fallback (which
+/// would otherwise flip the non-underscore `vis` to public). Regression test
+/// for the empty-public writer lossiness.
+#[test]
+fn empty_public_interface_is_faithful() {
+    let src = "(%module (%public) (%bind vis (elementof reals)))";
+    let m = read(src).unwrap();
+    assert_eq!(
+        m.public_bindings().count(),
+        0,
+        "an explicit empty (%public) means nothing is public"
+    );
+
+    let text = write(&m);
+    assert!(
+        text.contains("(%public)"),
+        "writer must emit an explicit empty (%public):\n{text}"
+    );
+
+    let m2 = read(&text).unwrap();
+    assert_eq!(
+        m2.public_bindings().count(),
+        0,
+        "empty public interface must round-trip, not name-convention `vis` to public"
+    );
+    assert_eq!(write(&m), write(&m2), "canonical fixpoint");
+}
