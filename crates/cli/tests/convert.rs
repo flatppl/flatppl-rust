@@ -1,6 +1,7 @@
 //! End-to-end tests for `flatppl convert`, exercising the built binary.
 
 use std::fs;
+use std::path::PathBuf;
 use std::process::Command;
 
 mod common;
@@ -8,6 +9,22 @@ use common::Scratch;
 
 fn bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_flatppl"))
+}
+
+/// Run `flatppl convert --no-header <input> <output>`, asserting success.
+fn convert_nh(input: &std::path::Path, output: &std::path::Path) {
+    let status = bin()
+        .args(["convert", "--no-header"])
+        .arg(input)
+        .arg(output)
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "convert {} -> {} failed",
+        input.display(),
+        output.display()
+    );
 }
 
 #[test]
@@ -327,4 +344,50 @@ fn rejects_bare_json_extension() {
         .unwrap();
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("extension"));
+}
+
+/// Integrity of the FlatPIR↔JSON round-trip over real models: take every
+/// `.flatppl` fixture, lower it to FlatPIR, encode that to `.flatpir.json`, and
+/// decode back to FlatPIR — the FlatPIR→JSON→FlatPIR leg must be byte-identical
+/// (the JSON encoding loses nothing). All conversions use `--no-header` so the
+/// canonical text is directly comparable.
+#[test]
+fn flatppl_through_flatpir_json_is_lossless() {
+    let fixtures: PathBuf = [
+        env!("CARGO_MANIFEST_DIR"),
+        "..",
+        "..",
+        "fixtures",
+        "flatppl",
+    ]
+    .iter()
+    .collect();
+    let dir = Scratch::new("pipeline");
+    let mut count = 0;
+    for entry in fs::read_dir(&fixtures).expect("read fixtures/flatppl") {
+        let src = entry.unwrap().path();
+        if src.extension().and_then(|e| e.to_str()) != Some("flatppl") {
+            continue;
+        }
+        let stem = src.file_stem().unwrap().to_str().unwrap();
+        let pir = dir.path(&format!("{stem}.flatpir"));
+        let json = dir.path(&format!("{stem}.flatpir.json"));
+        let back = dir.path(&format!("{stem}.back.flatpir"));
+
+        convert_nh(&src, &pir); // FlatPPL  → FlatPIR
+        convert_nh(&pir, &json); // FlatPIR  → JSON
+        convert_nh(&json, &back); // JSON     → FlatPIR
+
+        // The FlatPIR → JSON → FlatPIR leg must round-trip exactly.
+        assert_eq!(
+            fs::read_to_string(&pir).unwrap(),
+            fs::read_to_string(&back).unwrap(),
+            "FlatPIR→JSON→FlatPIR not lossless for `{stem}`"
+        );
+        count += 1;
+    }
+    assert!(
+        count >= 8,
+        "expected at least 8 .flatppl fixtures, found {count}"
+    );
 }
