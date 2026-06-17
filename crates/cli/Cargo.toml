@@ -17,13 +17,15 @@ path = "src/main.rs"
 [features]
 # Verbs are opt-in cargo features so heavy capabilities never burden the
 # default build; `infer` is light and rides along by default.
-default = ["infer"]
+default = ["infer", "hs3"]
 infer = ["dep:flatppl-infer"]
+hs3 = ["dep:flatppl-hs3"]
 
 [dependencies]
 flatppl-core = { path = "../core" }
 flatppl-syntax = { path = "../syntax" }
 flatppl-flatpir = { path = "../flatpir" }
 flatppl-infer = { path = "../infer", optional = true }
+flatppl-hs3 = { path = "../hs3", optional = true }
 clap = { workspace = true }
 ariadne = { workspace = true }
