@@ -95,7 +95,7 @@ pub fn parse<'db>(db: &'db dyn salsa::Database, file: SourceFile) -> Parsed<'db>
 /// not resolve to a `SourceFile` (so `resolve_path` returns `None` and they are
 /// correctly skipped from the bundle). Standard-module resolution happens inside
 /// `infer` via the catalogue, not the bundle.
-fn load_module_paths(module: &Module) -> Vec<String> {
+pub(crate) fn load_module_paths(module: &Module) -> Vec<String> {
     let mut paths = Vec::new();
     for (_, binding) in module.bindings() {
         let Node::Call(call) = module.node(binding.rhs) else {
@@ -146,7 +146,7 @@ fn normalize_path(path: &str) -> String {
 /// also accepted (so paths that are already workspace-relative resolve without a
 /// parent prefix). Returns `None` when nothing matches (the common case for
 /// `standard_module` names).
-fn resolve_path(
+pub(crate) fn resolve_path(
     db: &dyn salsa::Database,
     importer: SourceFile,
     directive_path: &str,

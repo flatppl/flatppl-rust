@@ -1,10 +1,14 @@
 //! Capability helpers: the owned diagnostic type the queries carry, mapping
-//! from parse errors and inference diagnostics, and the public `diagnostics`
-//! and `hover` functions that convert internal types to LSP protocol values.
+//! from parse errors and inference diagnostics, and the public `diagnostics`,
+//! `hover`, `document_symbols`, `workspace_symbols`, and `inlay_hints` functions
+//! that convert internal types to LSP protocol values.
 
-use crate::db::{Catalogues, FileSet, SourceFile};
+use std::str::FromStr;
+
+use crate::db::{Catalogues, Database, FileSet, SourceFile};
 use crate::line_index::LineIndex;
-use crate::queries::analyze;
+use crate::queries::{analyze, resolve_path};
+use flatppl_core::{CallHead, Node, RefNs, Scalar};
 
 /// An owned, salsa-friendly diagnostic: a byte range into the source, a severity,
 /// and a message. The LSP `Range` (UTF-16) is computed at emit time from these
@@ -95,6 +99,121 @@ pub fn diagnostics(
         .collect()
 }
 
+/// Return all top-level bindings in `file` as LSP `DocumentSymbol`s.
+///
+/// Each binding is emitted as a `VARIABLE` symbol whose range and selection
+/// range are derived from the byte span of its RHS node. Bindings whose RHS
+/// node has no recorded span are silently skipped. Returns an empty vec when
+/// the file fails to parse or contains no spanned bindings.
+pub fn document_symbols(
+    db: &dyn salsa::Database,
+    file: SourceFile,
+    fs: FileSet,
+    cats: Catalogues,
+) -> Vec<lsp_types::DocumentSymbol> {
+    let text = file.text(db);
+    let li = LineIndex::new(text);
+    let analyzed = analyze(db, file, fs, cats);
+    let Some(module) = analyzed.module(db) else {
+        return vec![];
+    };
+    let mut syms = Vec::new();
+    for (_, binding) in module.bindings() {
+        let Some(span) = module.span_of(binding.rhs) else {
+            continue;
+        };
+        let start = li.position(span.start);
+        let end = li.position(span.end);
+        let range = lsp_types::Range::new(
+            lsp_types::Position::new(start.line, start.character),
+            lsp_types::Position::new(end.line, end.character),
+        );
+        #[allow(deprecated)]
+        syms.push(lsp_types::DocumentSymbol {
+            name: module.resolve(binding.name).to_string(),
+            kind: lsp_types::SymbolKind::VARIABLE,
+            range,
+            selection_range: range,
+            detail: None,
+            tags: None,
+            deprecated: None,
+            children: None,
+        });
+    }
+    syms
+}
+
+/// Return all top-level bindings across every file in `fs` as LSP
+/// [`SymbolInformation`] values, filtered by `query`.
+///
+/// `query` is matched case-insensitively against each binding name; an empty
+/// `query` matches every binding.  Bindings whose RHS node has no recorded span
+/// are silently skipped.  Files that fail to parse produce no symbols.
+///
+/// The `location.uri` is derived from the [`SourceFile::path`] stored in the
+/// salsa database: paths that already look like `file://…` URIs are used as-is;
+/// bare filesystem paths are prefixed with `file://`.
+#[allow(deprecated)] // SymbolInformation.deprecated field is deprecated in LSP 3.16
+pub fn workspace_symbols(
+    db: &Database,
+    fs: FileSet,
+    cats: Catalogues,
+    query: &str,
+) -> Vec<lsp_types::SymbolInformation> {
+    let query_lower = query.to_lowercase();
+    let mut syms = Vec::new();
+
+    for &file in fs.files(db) {
+        let path = file.path(db);
+        let uri_str = if path.starts_with("file://") {
+            path.clone()
+        } else {
+            format!("file://{path}")
+        };
+        let Ok(uri) = lsp_types::Uri::from_str(&uri_str) else {
+            continue;
+        };
+
+        let text = file.text(db);
+        let li = LineIndex::new(text);
+        let analyzed = analyze(db, file, fs, cats);
+        let Some(module) = analyzed.module(db) else {
+            continue;
+        };
+
+        for (_, binding) in module.bindings() {
+            let name = module.resolve(binding.name).to_string();
+            if !query_lower.is_empty() && !name.to_lowercase().contains(&query_lower) {
+                continue;
+            }
+            let Some(span) = module.span_of(binding.rhs) else {
+                continue;
+            };
+            let start = li.position(span.start);
+            let end = li.position(span.end);
+            let range = lsp_types::Range::new(
+                lsp_types::Position::new(start.line, start.character),
+                lsp_types::Position::new(end.line, end.character),
+            );
+            let location = lsp_types::Location {
+                uri: uri.clone(),
+                range,
+            };
+            #[allow(deprecated)]
+            syms.push(lsp_types::SymbolInformation {
+                name,
+                kind: lsp_types::SymbolKind::VARIABLE,
+                tags: None,
+                deprecated: None,
+                location,
+                container_name: None,
+            });
+        }
+    }
+
+    syms
+}
+
 /// Return a markdown hover string for the node at `byte_offset` in `file`, or
 /// `None` when the cursor is not over any typed node.
 ///
@@ -121,6 +240,347 @@ pub fn hover(
         parts.push(format!("**value-set:** `{vs:?}`"));
     }
     Some(parts.join("  \n"))
+}
+
+/// The resolved location of a definition: a file path (as stored in the salsa
+/// database, i.e. a bare filesystem path or workspace-relative path) and a
+/// half-open byte range `[start, end)` of the definition's RHS node.
+pub struct DefLoc {
+    pub path: String,
+    pub start: u32,
+    pub end: u32,
+}
+
+/// Return the definition location for the symbol under `byte_offset` in `file`,
+/// or `None` when the cursor is not over a resolvable reference.
+///
+/// - [`RefNs::SelfMod`]: resolve to the binding in the same module whose RHS
+///   span is returned.
+/// - [`RefNs::Module`]: cross-file goto; find the alias binding's `load_module`
+///   path, resolve it to a dep [`SourceFile`], analyze it, and search its
+///   bindings by name string for the binding named `r.name`.
+/// - [`RefNs::Local`]: not navigable from the surface; returns `None`.
+pub fn goto_definition(
+    db: &dyn salsa::Database,
+    file: SourceFile,
+    fs: FileSet,
+    cats: Catalogues,
+    byte_offset: u32,
+) -> Option<DefLoc> {
+    let analyzed = analyze(db, file, fs, cats);
+    let module = analyzed.module(db)?;
+    let node_id = module.node_at_offset(byte_offset)?;
+    let Node::Ref(r) = module.node(node_id) else {
+        return None;
+    };
+    match r.ns {
+        RefNs::SelfMod => {
+            let bid = module.binding_by_name(r.name)?;
+            let rhs = module.binding(bid).rhs;
+            let span = module.span_of(rhs)?;
+            Some(DefLoc {
+                path: file.path(db).clone(),
+                start: span.start,
+                end: span.end,
+            })
+        }
+        RefNs::Module(alias) => {
+            // Find the binding named `alias` in `module` and extract its
+            // load_module/standard_module directive path from the call's first arg.
+            let alias_name = module.resolve(alias);
+            let (_, alias_binding) = module
+                .bindings()
+                .find(|(_, b)| module.resolve(b.name) == alias_name)?;
+            let Node::Call(call) = module.node(alias_binding.rhs) else {
+                return None;
+            };
+            let CallHead::Builtin(_) = call.head else {
+                return None;
+            };
+            let directive_path = match call.args.first().map(|&a| module.node(a)) {
+                Some(Node::Lit(Scalar::Str(s))) => s.to_string(),
+                _ => return None,
+            };
+            // Resolve the directive path to a workspace SourceFile.
+            let dep_file = resolve_path(db, file, &directive_path, fs)?;
+            // Analyze the dependency (uses salsa cache).
+            let dep_analyzed = analyze(db, dep_file, fs, cats);
+            let dep_mod = dep_analyzed.module(db)?;
+            // Cross-interner name match: compare by string, not by Symbol.
+            let want_name = module.resolve(r.name);
+            let (_, dep_binding) = dep_mod
+                .bindings()
+                .find(|(_, b)| dep_mod.resolve(b.name) == want_name)?;
+            let span = dep_mod.span_of(dep_binding.rhs)?;
+            Some(DefLoc {
+                path: dep_file.path(db).clone(),
+                start: span.start,
+                end: span.end,
+            })
+        }
+        RefNs::Local => None,
+    }
+}
+
+/// Return inlay type hints for all bindings in `file` whose RHS span falls
+/// within `[start_byte, end_byte)` and whose type is known.
+///
+/// For each qualifying binding a single `InlayHint` is emitted at the end of
+/// the RHS span (i.e. after the last character of the expression). The label
+/// is `: <type>` formatted via the `Debug` representation of the inferred
+/// type. Bindings with no RHS span or no inferred type are silently skipped.
+pub fn inlay_hints(
+    db: &Database,
+    file: SourceFile,
+    fs: FileSet,
+    cats: Catalogues,
+    start_byte: u32,
+    end_byte: u32,
+) -> Vec<lsp_types::InlayHint> {
+    let text = file.text(db);
+    let li = LineIndex::new(text);
+    let analyzed = analyze(db, file, fs, cats);
+    let Some(module) = analyzed.module(db) else {
+        return vec![];
+    };
+    let mut hints = Vec::new();
+    for (_, binding) in module.bindings() {
+        let Some(span) = module.span_of(binding.rhs) else {
+            continue;
+        };
+        // Filter to bindings whose RHS falls within the requested range.
+        if span.start < start_byte || span.end > end_byte {
+            continue;
+        }
+        let Some(ty) = module.type_of(binding.rhs) else {
+            continue;
+        };
+        let pos = li.position(span.end);
+        hints.push(lsp_types::InlayHint {
+            position: lsp_types::Position::new(pos.line, pos.character),
+            label: lsp_types::InlayHintLabel::String(format!(": {ty:?}")),
+            kind: Some(lsp_types::InlayHintKind::TYPE),
+            text_edits: None,
+            tooltip: None,
+            padding_left: Some(false),
+            padding_right: Some(false),
+            data: None,
+        });
+    }
+    hints
+}
+
+/// Return completion items for the given position in `file`.
+///
+/// `byte_offset` is the cursor position (UTF-8 byte offset); `member_prefix` is
+/// `Some(alias)` when the cursor is immediately after `alias.` (member
+/// completion) or `None` for general completion.
+///
+/// **Member completion** (`member_prefix = Some(alias)`): finds the binding
+/// named `alias` in the analyzed module, reads its `standard_module` call's
+/// module name, then lists all matching binding names from the built-in
+/// catalogue and any external catalogues. Returns only those items (kind
+/// `FUNCTION`).
+///
+/// **General completion** (`member_prefix = None`): returns
+/// - Language keywords (`self`, `base`, `in`, `all`, `only`, `true`, `false`)
+///   with kind `KEYWORD`.
+/// - All built-in base names (distributions and functions from the built-in
+///   catalogue) with kind `FUNCTION`.
+/// - All external catalogue base names (from the `cats` sources) with kind
+///   `FUNCTION`.
+/// - All in-scope binding names from the analyzed module with kind `VARIABLE`.
+///
+/// Items are deduplicated by label.
+pub fn completion(
+    db: &dyn salsa::Database,
+    file: SourceFile,
+    fs: FileSet,
+    cats: Catalogues,
+    _byte_offset: u32,
+    member_prefix: Option<String>,
+) -> Vec<lsp_types::CompletionItem> {
+    use lsp_types::{CompletionItem, CompletionItemKind};
+
+    // Parse external catalogues (RON sources stored in `cats`); failures are
+    // silently skipped — the server already emits diagnostics for them via
+    // `analyze`.
+    let external_cats: Vec<flatppl_infer::Catalogue> = cats
+        .sources(db)
+        .iter()
+        .filter_map(|src| flatppl_infer::parse_catalogue(src).ok())
+        .collect();
+
+    let builtin = flatppl_infer::builtin_catalogue();
+
+    if let Some(alias) = member_prefix {
+        // Member completion: find the alias binding, read its standard_module name,
+        // list that module's bindings from built-in + external catalogues.
+        let module_name = find_standard_module_name(db, file, fs, cats, &alias);
+        let mut items: Vec<CompletionItem> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        if let Some(mod_name) = module_name {
+            // Built-in catalogue first.
+            if let Some(names) = builtin.module_binding_names(&mod_name) {
+                for name in names {
+                    if seen.insert(name.to_string()) {
+                        items.push(CompletionItem {
+                            label: name.to_string(),
+                            kind: Some(CompletionItemKind::FUNCTION),
+                            ..Default::default()
+                        });
+                    }
+                }
+            }
+            // External catalogues in order.
+            for ext in &external_cats {
+                if let Some(names) = ext.module_binding_names(&mod_name) {
+                    for name in names {
+                        if seen.insert(name.to_string()) {
+                            items.push(CompletionItem {
+                                label: name.to_string(),
+                                kind: Some(CompletionItemKind::FUNCTION),
+                                ..Default::default()
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        return items;
+    }
+
+    // General completion.
+    let mut items: Vec<CompletionItem> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // Keywords.
+    for kw in &["self", "base", "in", "all", "only", "true", "false"] {
+        if seen.insert((*kw).to_string()) {
+            items.push(CompletionItem {
+                label: (*kw).to_string(),
+                kind: Some(CompletionItemKind::KEYWORD),
+                ..Default::default()
+            });
+        }
+    }
+
+    // Built-in base names (distributions and functions).
+    for name in builtin.base_names() {
+        if seen.insert(name.to_string()) {
+            items.push(CompletionItem {
+                label: name.to_string(),
+                kind: Some(CompletionItemKind::FUNCTION),
+                ..Default::default()
+            });
+        }
+    }
+
+    // External catalogue base names.
+    for ext in &external_cats {
+        for name in ext.base_names() {
+            if seen.insert(name.to_string()) {
+                items.push(CompletionItem {
+                    label: name.to_string(),
+                    kind: Some(CompletionItemKind::FUNCTION),
+                    ..Default::default()
+                });
+            }
+        }
+    }
+
+    // In-scope binding names from the analyzed module.
+    let analyzed = analyze(db, file, fs, cats);
+    if let Some(module) = analyzed.module(db) {
+        for (_, binding) in module.bindings() {
+            let name = module.resolve(binding.name).to_string();
+            if seen.insert(name.clone()) {
+                items.push(CompletionItem {
+                    label: name,
+                    kind: Some(CompletionItemKind::VARIABLE),
+                    ..Default::default()
+                });
+            }
+        }
+    }
+
+    items
+}
+
+/// Attempt to resolve the `standard_module` module name for the binding named
+/// `alias` in `file`. Returns `None` when the binding is absent, is not a
+/// `standard_module` call, or the first argument is not a string literal.
+///
+/// When the file fails to parse (e.g. because the cursor is mid-expression on
+/// the last line), this function retries with the last newline-delimited line
+/// stripped, allowing completion to work even while the user is still typing.
+fn find_standard_module_name(
+    db: &dyn salsa::Database,
+    file: SourceFile,
+    fs: FileSet,
+    cats: Catalogues,
+    alias: &str,
+) -> Option<String> {
+    // First attempt: analyze the file as-is.
+    let analyzed = analyze(db, file, fs, cats);
+    if let Some(module) = analyzed.module(db) {
+        return extract_standard_module_name(module, alias);
+    }
+
+    // Second attempt: the file may fail to parse because the cursor is in the
+    // middle of an incomplete expression (e.g. `x = alias.`). Strip the last
+    // non-empty line and try parsing the remainder directly.
+    let text = file.text(db);
+    let repaired = strip_last_nonempty_line(text);
+    if repaired.is_empty() || repaired == text {
+        return None;
+    }
+    let module = flatppl_syntax::parse(repaired).ok()?;
+    extract_standard_module_name(&module, alias)
+}
+
+/// Extract the `standard_module` first-arg string from the binding named `alias`.
+fn extract_standard_module_name(module: &flatppl_core::Module, alias: &str) -> Option<String> {
+    // Find the binding whose name equals `alias` (string compare across the
+    // module's interner).
+    let (_, binding) = module
+        .bindings()
+        .find(|(_, b)| module.resolve(b.name) == alias)?;
+    let Node::Call(call) = module.node(binding.rhs) else {
+        return None;
+    };
+    let CallHead::Builtin(head_sym) = call.head else {
+        return None;
+    };
+    if module.resolve(head_sym) != "standard_module" {
+        return None;
+    }
+    // First arg is the module name string.
+    match call.args.first().map(|&a| module.node(a)) {
+        Some(Node::Lit(Scalar::Str(s))) => Some(s.to_string()),
+        _ => None,
+    }
+}
+
+/// Strip the last non-empty line from `text` (newline-separated), returning
+/// the remainder. If `text` has no newline or is entirely blank, returns an
+/// empty string.
+fn strip_last_nonempty_line(text: &str) -> &str {
+    // Walk backwards, skipping trailing whitespace / empty lines, then find the
+    // newline that ends the preceding line.
+    let bytes = text.as_bytes();
+    let mut end = bytes.len();
+    // Skip trailing blank content.
+    while end > 0 && (bytes[end - 1] == b'\n' || bytes[end - 1] == b'\r') {
+        end -= 1;
+    }
+    // Now find the last newline before `end`.
+    let nl = bytes[..end].iter().rposition(|&b| b == b'\n' || b == b'\r');
+    match nl {
+        Some(pos) => &text[..=pos],
+        None => "",
+    }
 }
 
 #[cfg(test)]
@@ -215,6 +675,7 @@ mod tests {
 
     // ── diagnostics() capability tests ──────────────────────────────────────
 
+    use super::workspace_symbols;
     use crate::db::{Catalogues, Database, FileSet, SourceFile};
 
     #[test]
@@ -304,6 +765,26 @@ mod tests {
         );
     }
 
+    // ── document_symbols() capability tests ─────────────────────────────────
+
+    #[test]
+    fn document_symbols_lists_bindings() {
+        let db = Database::default();
+        let cats = Catalogues::new(&db, vec![]);
+        let f = SourceFile::new(
+            &db,
+            "m.flatppl".to_string(),
+            "x = 1\ny = add(x, 2)".to_string(),
+        );
+        let fs = FileSet::new(&db, vec![f]);
+        let syms = document_symbols(&db, f, fs, cats);
+        let names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            names.contains(&"x") && names.contains(&"y"),
+            "document_symbols must include both 'x' and 'y'; got: {names:?}"
+        );
+    }
+
     #[test]
     fn hover_none_on_parse_error() {
         let db = Database::default();
@@ -314,6 +795,130 @@ mod tests {
         assert!(
             hover(&db, f, fs, cats, 0).is_none(),
             "hover on a parse-error file must return None"
+        );
+    }
+
+    // ── workspace_symbols() capability tests ────────────────────────────────
+
+    #[test]
+    fn workspace_symbols_span_files_and_filter() {
+        let db = Database::default();
+        let cats = Catalogues::new(&db, vec![]);
+        let a = SourceFile::new(&db, "a.flatppl".to_string(), "alpha = 1".to_string());
+        let b = SourceFile::new(&db, "b.flatppl".to_string(), "beta = 2".to_string());
+        let fs = FileSet::new(&db, vec![a, b]);
+        let all = workspace_symbols(&db, fs, cats, "");
+        assert!(
+            all.iter().any(|s| s.name == "alpha") && all.iter().any(|s| s.name == "beta"),
+            "workspace_symbols must include 'alpha' and 'beta'; got: {:?}",
+            all.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+        let filtered = workspace_symbols(&db, fs, cats, "alph");
+        assert!(
+            !filtered.is_empty()
+                && filtered
+                    .iter()
+                    .all(|s| s.name.to_lowercase().contains("alph")),
+            "filtered workspace_symbols must contain only 'alph' matches; got: {:?}",
+            filtered.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
+    // ── inlay_hints() capability tests ──────────────────────────────────────
+
+    #[test]
+    fn inlay_hints_label_binding_types() {
+        let db = Database::default();
+        let cats = Catalogues::new(&db, vec![]);
+        let src = "x = add(1, 2)";
+        let f = SourceFile::new(&db, "m.flatppl".to_string(), src.to_string());
+        let fs = FileSet::new(&db, vec![f]);
+        let hints = inlay_hints(&db, f, fs, cats, 0, src.len() as u32);
+        assert!(
+            hints
+                .iter()
+                .any(|h| matches!(&h.label, lsp_types::InlayHintLabel::String(s)
+            if s.to_lowercase().contains("scalar") || s.contains("Integer") || s.contains("Real")))
+        );
+    }
+
+    // ── goto_definition() capability tests ──────────────────────────────────
+
+    #[test]
+    fn goto_same_module_binding() {
+        let db = Database::default();
+        let cats = Catalogues::new(&db, vec![]);
+        let src = "x = 1\ny = add(x, 2)";
+        let f = SourceFile::new(&db, "m.flatppl".to_string(), src.to_string());
+        let fs = FileSet::new(&db, vec![f]);
+        let off = "x = 1\ny = add(".len() as u32; // on the `x` argument
+        let loc = goto_definition(&db, f, fs, cats, off).expect("definition");
+        assert_eq!(loc.path, "m.flatppl");
+        // x's binding rhs is the literal `1` at byte 4
+        assert!(loc.start <= 4 && 4 < loc.end);
+    }
+
+    #[test]
+    fn goto_cross_file_load_module_binding() {
+        let db = Database::default();
+        let cats = Catalogues::new(&db, vec![]);
+        let helpers = SourceFile::new(
+            &db,
+            "helpers.flatppl".to_string(),
+            "shifted = 1.0".to_string(),
+        );
+        let model = SourceFile::new(
+            &db,
+            "model.flatppl".to_string(),
+            "h = load_module(\"helpers.flatppl\")\nv = h.shifted".to_string(),
+        );
+        let fs = FileSet::new(&db, vec![helpers, model]);
+        let off = "h = load_module(\"helpers.flatppl\")\nv = h.".len() as u32; // on `shifted`
+        let loc = goto_definition(&db, model, fs, cats, off).expect("cross-file def");
+        assert_eq!(loc.path, "helpers.flatppl");
+    }
+
+    // ── completion() capability tests ────────────────────────────────────────
+
+    #[test]
+    fn completion_includes_keywords_builtins_and_scope() {
+        let db = Database::default();
+        let cats = Catalogues::new(&db, vec![]);
+        let src = "alpha = 1\nbeta = 2";
+        let f = SourceFile::new(&db, "m.flatppl".to_string(), src.to_string());
+        let fs = FileSet::new(&db, vec![f]);
+        let items = completion(&db, f, fs, cats, src.len() as u32, None);
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        // Built-in base distribution must be present.
+        assert!(
+            labels.contains(&"Normal"),
+            "completion must include built-in base name 'Normal'; got: {labels:?}"
+        );
+        // In-scope bindings must be present.
+        assert!(
+            labels.contains(&"alpha"),
+            "completion must include in-scope binding 'alpha'; got: {labels:?}"
+        );
+        // At least one keyword must be present.
+        assert!(
+            labels.iter().any(|l| *l == "self" || *l == "base"),
+            "completion must include a keyword such as 'self' or 'base'; got: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn completion_after_module_alias_dot_lists_module_bindings() {
+        let db = Database::default();
+        let ron = r#"Catalogue(base: [], modules: [Module(name:"myext",version:"0.1",bindings:[Binding(name:"MyDist", sig: Distribution(domain: Scalar(Real), support: Reals, mass: Normalized))])])"#;
+        let cats = Catalogues::new(&db, vec![ron.to_string()]);
+        let src = "e = standard_module(\"myext\",\"0.1\")\nx = e.";
+        let f = SourceFile::new(&db, "m.flatppl".to_string(), src.to_string());
+        let fs = FileSet::new(&db, vec![f]);
+        let items = completion(&db, f, fs, cats, src.len() as u32, Some("e".to_string()));
+        assert!(
+            items.iter().any(|i| i.label == "MyDist"),
+            "member completion must list 'MyDist' from the external module; got: {:?}",
+            items.iter().map(|i| &i.label).collect::<Vec<_>>()
         );
     }
 }

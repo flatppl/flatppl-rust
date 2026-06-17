@@ -1,22 +1,134 @@
-//! End-to-end protocol smoke test: initialize → didOpen → hover.
+//! End-to-end protocol smoke tests: initialize → didOpen → hover / completion /
+//! documentSymbol / definition.
 //!
 //! Drives the full LSP handshake over an in-memory `Connection::memory()` pair
-//! and verifies that a `textDocument/hover` response comes back with a non-null
-//! result containing type information.
+//! and verifies that requests for each P-B capability come back with real
+//! responses over the wire.
 
 use std::str::FromStr;
+use std::time::Duration;
 
 use lsp_server::{Connection, Message, Request, RequestId};
 use lsp_types::{
     ClientCapabilities, HoverContents, InitializeParams, InitializedParams, MarkupContent,
     MarkupKind, TextDocumentItem, Uri,
     notification::{DidOpenTextDocument, Initialized, Notification as _},
-    request::{HoverRequest, Initialize, Request as _},
+    request::{
+        Completion, DocumentSymbolRequest, GotoDefinition, HoverRequest, Initialize, Request as _,
+    },
 };
 
-/// Source text used throughout.  The expression `add(1, 2)` is fully typed by
-/// the engine; byte offset 8 lands on the literal `1` which carries an inferred
-/// scalar type.
+// ── shared helpers ───────────────────────────────────────────────────────────
+
+/// Drive the `initialize` / `initialized` handshake from the client side.
+///
+/// Sends the `initialize` request with `req_id`, reads the `InitializeResult`
+/// response, then sends the `initialized` notification.  After this returns the
+/// connection is ready for normal LSP traffic.
+fn do_handshake(client_conn: &Connection, req_id: i32) {
+    #[allow(deprecated)]
+    let init_params_value = serde_json::to_value(InitializeParams {
+        capabilities: ClientCapabilities::default(),
+        ..Default::default()
+    })
+    .expect("serialize InitializeParams");
+
+    let init_req = lsp_server::Request {
+        id: RequestId::from(req_id),
+        method: Initialize::METHOD.to_owned(),
+        params: init_params_value,
+    };
+    client_conn.sender.send(Message::Request(init_req)).unwrap();
+
+    // Read the InitializeResult response.
+    let _init_resp = client_conn
+        .receiver
+        .recv_timeout(Duration::from_secs(5))
+        .expect("timed out waiting for InitializeResult");
+
+    // Send `initialized` notification.
+    let initialized_note =
+        lsp_server::Notification::new(Initialized::METHOD.to_owned(), InitializedParams {});
+    client_conn
+        .sender
+        .send(Message::Notification(initialized_note))
+        .unwrap();
+}
+
+/// Send a `textDocument/didOpen` notification and drain the resulting
+/// `publishDiagnostics` notification(s) until we see one matching `uri`.
+fn do_open_and_drain_diags(client_conn: &Connection, uri: &str, text: &str) {
+    let did_open_params = lsp_types::DidOpenTextDocumentParams {
+        text_document: TextDocumentItem {
+            uri: Uri::from_str(uri).unwrap(),
+            language_id: "flatppl".into(),
+            version: 1,
+            text: text.into(),
+        },
+    };
+    let note =
+        lsp_server::Notification::new(DidOpenTextDocument::METHOD.to_owned(), did_open_params);
+    client_conn
+        .sender
+        .send(Message::Notification(note))
+        .unwrap();
+
+    // Drain until we see the publishDiagnostics notification.
+    loop {
+        let msg = client_conn
+            .receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("timed out waiting for publishDiagnostics");
+        if let Message::Notification(n) = &msg {
+            if n.method == lsp_types::notification::PublishDiagnostics::METHOD {
+                break;
+            }
+        }
+    }
+}
+
+/// Send a request and receive its response, skipping any interleaved
+/// notifications.  Panics if no response arrives within 5 s.
+fn round_trip(client_conn: &Connection, req: lsp_server::Request) -> lsp_server::Response {
+    let id = req.id.clone();
+    client_conn.sender.send(Message::Request(req)).unwrap();
+    loop {
+        let msg = client_conn
+            .receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("timed out waiting for response");
+        match msg {
+            Message::Response(resp) if resp.id == id => return resp,
+            _ => continue,
+        }
+    }
+}
+
+/// Send shutdown + exit and join the server thread.
+fn do_shutdown(client_conn: &Connection, shutdown_id: i32) {
+    let shutdown_req = Request::new(
+        RequestId::from(shutdown_id),
+        "shutdown".into(),
+        serde_json::Value::Null,
+    );
+    client_conn
+        .sender
+        .send(Message::Request(shutdown_req))
+        .unwrap();
+    let _shutdown_resp = client_conn
+        .receiver
+        .recv_timeout(Duration::from_secs(5))
+        .ok();
+    let exit_note = lsp_server::Notification::new("exit".into(), serde_json::Value::Null);
+    client_conn
+        .sender
+        .send(Message::Notification(exit_note))
+        .unwrap();
+}
+
+/// Source text used for the hover smoke test.  The expression `add(1, 2)` is
+/// fully typed by the engine; byte offset 8 lands on the literal `1` which
+/// carries an inferred scalar type.
 const SRC: &str = "x = add(1, 2)";
 
 /// Byte offset of the literal `1` inside `add(1, 2)`.
@@ -27,6 +139,15 @@ const HOVER_OFFSET: u32 = 8;
 
 /// The file URI used for the didOpen + hover requests.
 const FILE_URI: &str = "file:///tmp/smoke.flatppl";
+
+// ── P-B source: two bindings, one cross-reference ───────────────────────────
+//
+// Used for the completion / documentSymbol / definition smoke tests.
+//
+//  Line 0: "x = 1"        — x is a scalar integer literal
+//  Line 1: "y = add(x, 2)" — y uses x; `x` inside add() is at char 8
+const PB_SRC: &str = "x = 1\ny = add(x, 2)";
+const PB_FILE_URI: &str = "file:///tmp/smoke_pb.flatppl";
 
 #[test]
 fn initialize_did_open_hover_smoke() {
@@ -48,78 +169,13 @@ fn initialize_did_open_hover_smoke() {
         flatppl_lsp::server::run(server_conn, init_params).expect("server loop");
     });
 
-    // ── 3. Client side: drive the initialize handshake ───────────────────────
-    //
-    // `server_conn.initialize` waits for:
-    //   a) an `initialize` Request from the client,
-    //   b) then replies with `InitializeResult`,
-    //   c) then waits for an `initialized` Notification.
-    //
-    // So we must send (a), read (b), then send (c).
-    let init_req_id = RequestId::from(1i32);
+    // ── 3. Client: drive the initialize handshake ────────────────────────────
+    do_handshake(&client_conn, 1);
 
-    #[allow(deprecated)]
-    let init_params_value = serde_json::to_value(InitializeParams {
-        capabilities: ClientCapabilities::default(),
-        ..Default::default()
-    })
-    .expect("serialize InitializeParams");
+    // ── 4. didOpen + drain publishDiagnostics ────────────────────────────────
+    do_open_and_drain_diags(&client_conn, FILE_URI, SRC);
 
-    let init_req = lsp_server::Request {
-        id: init_req_id.clone(),
-        method: Initialize::METHOD.to_owned(),
-        params: init_params_value,
-    };
-    client_conn.sender.send(Message::Request(init_req)).unwrap();
-
-    // Read the InitializeResult response.
-    let _init_resp = client_conn
-        .receiver
-        .recv_timeout(std::time::Duration::from_secs(5))
-        .expect("timed out waiting for InitializeResult");
-
-    // Send `initialized` notification to complete the handshake.
-    let initialized_note =
-        lsp_server::Notification::new(Initialized::METHOD.to_owned(), InitializedParams {});
-    client_conn
-        .sender
-        .send(Message::Notification(initialized_note))
-        .unwrap();
-
-    // ── 4. Send didOpen ──────────────────────────────────────────────────────
-    let did_open_params = lsp_types::DidOpenTextDocumentParams {
-        text_document: TextDocumentItem {
-            uri: Uri::from_str(FILE_URI).unwrap(),
-            language_id: "flatppl".into(),
-            version: 1,
-            text: SRC.into(),
-        },
-    };
-    let did_open_note =
-        lsp_server::Notification::new(DidOpenTextDocument::METHOD.to_owned(), did_open_params);
-    client_conn
-        .sender
-        .send(Message::Notification(did_open_note))
-        .unwrap();
-
-    // ── 5. Skip the publishDiagnostics notification ──────────────────────────
-    //
-    // The server sends `publishDiagnostics` after every didOpen.  Drain
-    // messages until we see it, then move on.
-    loop {
-        let msg = client_conn
-            .receiver
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("timed out waiting for publishDiagnostics");
-        if let Message::Notification(n) = &msg {
-            if n.method == lsp_types::notification::PublishDiagnostics::METHOD {
-                break;
-            }
-        }
-    }
-
-    // ── 6. Send a hover request at byte offset 8 (the literal `1`) ──────────
-    let hover_req_id = RequestId::from(2i32);
+    // ── 5. Send a hover request at byte offset 8 (the literal `1`) ──────────
     let hover_params = lsp_types::HoverParams {
         text_document_position_params: lsp_types::TextDocumentPositionParams {
             text_document: lsp_types::TextDocumentIdentifier {
@@ -134,29 +190,13 @@ fn initialize_did_open_hover_smoke() {
         work_done_progress_params: Default::default(),
     };
     let hover_req = Request {
-        id: hover_req_id.clone(),
+        id: RequestId::from(2i32),
         method: HoverRequest::METHOD.to_owned(),
         params: serde_json::to_value(hover_params).unwrap(),
     };
-    client_conn
-        .sender
-        .send(Message::Request(hover_req))
-        .unwrap();
+    let hover_response = round_trip(&client_conn, hover_req);
 
-    // ── 7. Read messages until the hover Response arrives ────────────────────
-    let hover_response = loop {
-        let msg = client_conn
-            .receiver
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("timed out waiting for hover response");
-        match msg {
-            Message::Response(resp) if resp.id == hover_req_id => break resp,
-            // Skip any intervening notifications (there should be none, but be safe).
-            _ => continue,
-        }
-    };
-
-    // ── 8. Assert the hover response is non-null with type information ────────
+    // ── 6. Assert the hover response is non-null with type information ────────
     assert!(
         hover_response.error.is_none(),
         "hover response must not be an error; got: {:?}",
@@ -194,27 +234,215 @@ fn initialize_did_open_hover_smoke() {
         "hover markdown must mention a scalar type token; got: {markdown:?}"
     );
 
-    // ── 9. Shutdown + exit ───────────────────────────────────────────────────
-    let shutdown_req = Request::new(
-        RequestId::from(99i32),
-        "shutdown".into(),
-        serde_json::Value::Null,
-    );
-    client_conn
-        .sender
-        .send(Message::Request(shutdown_req))
-        .unwrap();
-    // Read the shutdown response.
-    let _shutdown_resp = client_conn
-        .receiver
-        .recv_timeout(std::time::Duration::from_secs(5))
-        .ok();
-    // Send exit.
-    let exit_note = lsp_server::Notification::new("exit".into(), serde_json::Value::Null);
-    client_conn
-        .sender
-        .send(Message::Notification(exit_note))
-        .unwrap();
+    // ── 7. Shutdown + exit ───────────────────────────────────────────────────
+    do_shutdown(&client_conn, 99);
+    server_thread.join().expect("server thread must not panic");
+}
 
+// ── P-B protocol smoke: completion + documentSymbol + definition ─────────────
+
+/// Protocol-level smoke coverage for the P-B capabilities added in this plan:
+/// `textDocument/completion`, `textDocument/documentSymbol`, and
+/// `textDocument/definition`.
+///
+/// Source: `"x = 1\ny = add(x, 2)"` — two in-scope bindings, one
+/// same-module reference.  All three requests are driven over the wire after a
+/// single `initialize` + `didOpen` handshake.
+#[test]
+fn pb_capabilities_smoke() {
+    // ── 1. Spawn server ──────────────────────────────────────────────────────
+    let (server_conn, client_conn) = Connection::memory();
+    let server_thread = std::thread::spawn(move || {
+        let server_caps =
+            serde_json::to_value(flatppl_lsp::server::server_capabilities()).expect("caps");
+        let init_params = server_conn.initialize(server_caps).expect("handshake");
+        flatppl_lsp::server::run(server_conn, init_params).expect("server loop");
+    });
+
+    // ── 2. Handshake + didOpen ───────────────────────────────────────────────
+    do_handshake(&client_conn, 1);
+    do_open_and_drain_diags(&client_conn, PB_FILE_URI, PB_SRC);
+
+    // ── 3. textDocument/completion ───────────────────────────────────────────
+    //
+    // Cursor at the end of the document (line 1, char 14 — after "y = add(x, 2)").
+    // General completion should return a non-empty list containing at least one
+    // built-in base name ("Normal") and the in-scope bindings ("x", "y").
+    {
+        let comp_params = lsp_types::CompletionParams {
+            text_document_position: lsp_types::TextDocumentPositionParams {
+                text_document: lsp_types::TextDocumentIdentifier {
+                    uri: Uri::from_str(PB_FILE_URI).unwrap(),
+                },
+                position: lsp_types::Position {
+                    line: 1,
+                    character: 14, // end of "y = add(x, 2)"
+                },
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        };
+        let comp_req = Request {
+            id: RequestId::from(10i32),
+            method: Completion::METHOD.to_owned(),
+            params: serde_json::to_value(comp_params).unwrap(),
+        };
+        let resp = round_trip(&client_conn, comp_req);
+
+        assert!(
+            resp.error.is_none(),
+            "completion response must not be an error; got: {:?}",
+            resp.error
+        );
+        let result = resp.result.expect("completion result must be present");
+        assert!(
+            !result.is_null(),
+            "completion result must be non-null for PB_SRC"
+        );
+        // Deserialize as a CompletionResponse (Array or List).
+        let comp_resp: lsp_types::CompletionResponse =
+            serde_json::from_value(result).expect("completion result must deserialize");
+        let items = match comp_resp {
+            lsp_types::CompletionResponse::Array(items) => items,
+            lsp_types::CompletionResponse::List(list) => list.items,
+        };
+        assert!(
+            !items.is_empty(),
+            "completion list must be non-empty for source {PB_SRC:?}"
+        );
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        // Built-in base distribution must be present (general completion includes catalogue).
+        assert!(
+            labels.contains(&"Normal"),
+            "completion must include built-in 'Normal'; got: {labels:?}"
+        );
+        // In-scope bindings from the open document must be present.
+        assert!(
+            labels.contains(&"x"),
+            "completion must include in-scope binding 'x'; got: {labels:?}"
+        );
+        assert!(
+            labels.contains(&"y"),
+            "completion must include in-scope binding 'y'; got: {labels:?}"
+        );
+    }
+
+    // ── 4. textDocument/documentSymbol ───────────────────────────────────────
+    //
+    // Must return at least "x" and "y" as symbols.
+    {
+        let sym_params = lsp_types::DocumentSymbolParams {
+            text_document: lsp_types::TextDocumentIdentifier {
+                uri: Uri::from_str(PB_FILE_URI).unwrap(),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+        let sym_req = Request {
+            id: RequestId::from(11i32),
+            method: DocumentSymbolRequest::METHOD.to_owned(),
+            params: serde_json::to_value(sym_params).unwrap(),
+        };
+        let resp = round_trip(&client_conn, sym_req);
+
+        assert!(
+            resp.error.is_none(),
+            "documentSymbol response must not be an error; got: {:?}",
+            resp.error
+        );
+        let result = resp.result.expect("documentSymbol result must be present");
+        assert!(
+            !result.is_null(),
+            "documentSymbol result must be non-null for PB_SRC"
+        );
+        let sym_resp: lsp_types::DocumentSymbolResponse =
+            serde_json::from_value(result).expect("documentSymbol result must deserialize");
+        let names: Vec<String> = match sym_resp {
+            lsp_types::DocumentSymbolResponse::Nested(syms) => {
+                syms.into_iter().map(|s| s.name).collect()
+            }
+            lsp_types::DocumentSymbolResponse::Flat(syms) => {
+                syms.into_iter().map(|s| s.name).collect()
+            }
+        };
+        assert!(
+            names.iter().any(|n| n == "x"),
+            "documentSymbol must include 'x'; got: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "y"),
+            "documentSymbol must include 'y'; got: {names:?}"
+        );
+    }
+
+    // ── 5. textDocument/definition ───────────────────────────────────────────
+    //
+    // Cursor on the `x` inside `add(x, 2)` on line 1, char 8 (0-indexed).
+    // Source line 1: "y = add(x, 2)"
+    //                 01234567890123
+    //                         ^ char 8 = 'x'
+    // Expect a non-null Location pointing back into the same file.
+    {
+        let def_params = lsp_types::GotoDefinitionParams {
+            text_document_position_params: lsp_types::TextDocumentPositionParams {
+                text_document: lsp_types::TextDocumentIdentifier {
+                    uri: Uri::from_str(PB_FILE_URI).unwrap(),
+                },
+                position: lsp_types::Position {
+                    line: 1,
+                    character: 8, // 'x' inside add(x, 2)
+                },
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+        let def_req = Request {
+            id: RequestId::from(12i32),
+            method: GotoDefinition::METHOD.to_owned(),
+            params: serde_json::to_value(def_params).unwrap(),
+        };
+        let resp = round_trip(&client_conn, def_req);
+
+        assert!(
+            resp.error.is_none(),
+            "definition response must not be an error; got: {:?}",
+            resp.error
+        );
+        let result = resp.result.expect("definition result must be present");
+        assert!(
+            !result.is_null(),
+            "definition result must be non-null for 'x' reference in PB_SRC"
+        );
+        // Deserialize as a GotoDefinitionResponse (Scalar Location or array).
+        let def_resp: lsp_types::GotoDefinitionResponse =
+            serde_json::from_value(result).expect("definition result must deserialize");
+        // The response is a scalar Location pointing into the same file at line 0
+        // (where `x = 1` is defined).
+        let location = match def_resp {
+            lsp_types::GotoDefinitionResponse::Scalar(loc) => loc,
+            lsp_types::GotoDefinitionResponse::Array(locs) => {
+                assert!(!locs.is_empty(), "definition array must be non-empty");
+                locs.into_iter().next().unwrap()
+            }
+            lsp_types::GotoDefinitionResponse::Link(links) => {
+                assert!(!links.is_empty(), "definition link array must be non-empty");
+                let link = links.into_iter().next().unwrap();
+                lsp_types::Location {
+                    uri: link.target_uri,
+                    range: link.target_range,
+                }
+            }
+        };
+        // The definition of `x` is on line 0 of the same file.
+        assert_eq!(
+            location.range.start.line, 0,
+            "definition of 'x' must be on line 0; got range: {:?}",
+            location.range
+        );
+    }
+
+    // ── 6. Shutdown ──────────────────────────────────────────────────────────
+    do_shutdown(&client_conn, 99);
     server_thread.join().expect("server thread must not panic");
 }
