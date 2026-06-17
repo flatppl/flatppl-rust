@@ -8,6 +8,7 @@ pub struct Pos {
     pub character: u32, // UTF-16 code units within the line
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, salsa::Update)]
 pub struct LineIndex {
     text: String,
     line_starts: Vec<u32>, // byte offset of each line's first char; [0] = 0

@@ -193,7 +193,7 @@ mod cross_module_value_tests {
     fn bundle_with(path: &str, src: &str) -> ModuleBundle {
         let dep = flatppl_syntax::parse(src).expect("dep parses");
         let mut b = ModuleBundle::new();
-        b.insert(path, dep);
+        b.insert(path, std::sync::Arc::new(dep));
         b
     }
 
@@ -286,7 +286,7 @@ mod substitution_tests {
         // assertion fails if seeding is disabled.
         let dep = flatppl_syntax::parse("p = elementof(integers)\nout = add(p, 1)").expect("dep");
         let mut bundle = ModuleBundle::new();
-        bundle.insert("d.flatppl", dep);
+        bundle.insert("d.flatppl", std::sync::Arc::new(dep));
         let mut model = flatppl_syntax::parse(
             "a = add(2.0, 3.0)\nd = load_module(\"d.flatppl\", p = a)\nv = d.out",
         )
@@ -307,7 +307,7 @@ mod substitution_tests {
     fn same_dep_two_substitutions_memoize_separately() {
         let dep = flatppl_syntax::parse("p = elementof(reals)\nout = p").expect("dep");
         let mut bundle = ModuleBundle::new();
-        bundle.insert("d.flatppl", dep);
+        bundle.insert("d.flatppl", std::sync::Arc::new(dep));
         let mut model = flatppl_syntax::parse(
             "a = 1\nb = 2.0\nd1 = load_module(\"d.flatppl\", p = a)\nd2 = load_module(\"d.flatppl\", p = b)\nv1 = d1.out\nv2 = d2.out",
         ).expect("model");
@@ -344,7 +344,7 @@ mod unknown_input_tests {
     fn substitution_for_unknown_input_is_an_error() {
         let dep = flatppl_syntax::parse("p = elementof(reals)\nout = p").expect("dep");
         let mut bundle = ModuleBundle::new();
-        bundle.insert("d.flatppl", dep);
+        bundle.insert("d.flatppl", std::sync::Arc::new(dep));
         let mut model =
             flatppl_syntax::parse("a = 1.0\nd = load_module(\"d.flatppl\", q = a)\nv = d.out")
                 .expect("model");
@@ -366,8 +366,8 @@ mod cycle_tests {
         let a = flatppl_syntax::parse("bb = load_module(\"b.flatppl\")\nx = bb.y").expect("a");
         let b = flatppl_syntax::parse("aa = load_module(\"a.flatppl\")\ny = aa.x").expect("b");
         let mut bundle = ModuleBundle::new();
-        bundle.insert("a.flatppl", a.clone());
-        bundle.insert("b.flatppl", b);
+        bundle.insert("a.flatppl", std::sync::Arc::new(a.clone()));
+        bundle.insert("b.flatppl", std::sync::Arc::new(b));
         // Infer `a` as root; resolving bb.y → b, whose aa.x → a closes the loop.
         let mut root = a;
         let diags = infer_module(&mut root, &bundle, Level::Type);
@@ -389,7 +389,7 @@ mod cross_module_callable_tests {
              obs_kernel = functionof(Normal(mu = add(center, _x_), sigma = spread), center = center, spread = spread, x = _x_)",
         ).expect("helpers");
         let mut bundle = ModuleBundle::new();
-        bundle.insert("helpers.flatppl", helpers);
+        bundle.insert("helpers.flatppl", std::sync::Arc::new(helpers));
         let mut model = flatppl_syntax::parse(
             "a = elementof(reals)\nhelpers = load_module(\"helpers.flatppl\", center = a)\n\
              input_data = 2.5\nL = likelihoodof(helpers.obs_kernel, input_data)",
@@ -448,7 +448,7 @@ mod cross_module_callable_tests {
         )
         .expect("helpers");
         let mut bundle = ModuleBundle::new();
-        bundle.insert("helpers.flatppl", helpers);
+        bundle.insert("helpers.flatppl", std::sync::Arc::new(helpers));
         let mut model = flatppl_syntax::parse(
             "a = elementof(reals)\nhelpers = load_module(\"helpers.flatppl\", center = a)\n\
              input_data = 2.5\nL = likelihoodof(helpers.obs_kernel, input_data)",

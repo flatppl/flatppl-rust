@@ -44,7 +44,7 @@ jobs:
           - { target: aarch64-apple-darwin, os: macos-latest }
           - { target: x86_64-pc-windows-msvc, os: windows-latest }
     steps:
-      - uses: actions/checkout@v6.0.2
+      - uses: actions/checkout@v6
 
       - name: Install musl linker
         if: contains(matrix.target, 'musl')
@@ -102,7 +102,7 @@ jobs:
       contents: write
     steps:
       - name: Collect binary artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@v7
         with:
           path: dist
           merge-multiple: true

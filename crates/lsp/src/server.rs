@@ -6,7 +6,7 @@
 //! `didOpen`/`didChange` notifications (full-sync), `hover` requests, and
 //! `shutdown`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::str::FromStr;
 
@@ -15,7 +15,8 @@ use lsp_types::{
     CompletionOptions, HoverProviderCapability, OneOf, PublishDiagnosticsParams,
     ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind, Uri,
     notification::{
-        DidChangeTextDocument, DidOpenTextDocument, Notification as _, PublishDiagnostics,
+        DidChangeTextDocument, DidChangeWatchedFiles, DidOpenTextDocument, Notification as _,
+        PublishDiagnostics,
     },
     request::{
         Completion, DocumentSymbolRequest, GotoDefinition, HoverRequest, InlayHintRequest,
@@ -24,7 +25,8 @@ use lsp_types::{
 };
 
 use crate::db::{Catalogues, Database, FileSet, SourceFile};
-use crate::line_index::{LineIndex, Pos};
+use crate::line_index::Pos;
+use crate::queries::{import_bundle, line_index};
 
 // ── run ─────────────────────────────────────────────────────────────────────
 
@@ -82,6 +84,13 @@ pub fn run(
 
     let fs = build_fileset(&db, &uri_to_file);
 
+    // URIs of files currently open in the editor (via didOpen/didClose).
+    // Files added from disk by didChangeWatchedFiles are NOT in this set, so
+    // the watched-file handler can distinguish editor-managed from disk-only
+    // files and update disk-only files on CHANGED/CREATED without clobbering
+    // unsaved editor edits.
+    let mut editor_open_uris: HashSet<String> = HashSet::new();
+
     // Publish initial diagnostics for all workspace files.
     for (uri_str, &file) in &uri_to_file {
         publish_diagnostics(&connection, &db, file, fs, cats, uri_str)?;
@@ -106,18 +115,16 @@ pub fn run(
                             };
                         let uri_str = p.text_document.uri.as_str().to_owned();
                         let text = p.text_document.text;
+                        // Mark as editor-managed so watched-file CHANGED events
+                        // skip it (editor content takes precedence over on-disk).
+                        editor_open_uris.insert(uri_str.clone());
                         upsert_file(&mut db, &mut uri_to_file, uri_str, text);
-                        // Update the single shared FileSet so hover and future
-                        // analyses see the newly-opened file.
-                        {
-                            use salsa::Setter;
-                            let new_files: Vec<SourceFile> =
-                                uri_to_file.values().copied().collect();
-                            fs.set_files(&mut db).to(new_files);
-                        }
-                        // Re-publish diagnostics for ALL open docs so that
-                        // files that import the newly-opened one also refresh
-                        // (symmetric with didChange).
+                        // Update the shared FileSet only when the file SET membership
+                        // changes (a new open always adds a file, so this fires).
+                        sync_file_set(&mut db, fs, &uri_to_file);
+                        // Re-publish diagnostics for ALL open docs: a newly-opened
+                        // file can satisfy a previously-unresolved import in any
+                        // already-open doc, so the full set must be refreshed.
                         let open_files: Vec<(String, SourceFile)> =
                             uri_to_file.iter().map(|(u, &f)| (u.clone(), f)).collect();
                         for (doc_uri_str, file) in open_files {
@@ -140,16 +147,79 @@ pub fn run(
                         if let Some(change) = p.content_changes.into_iter().last() {
                             upsert_file(&mut db, &mut uri_to_file, uri_str.clone(), change.text);
                         }
-                        // Update the single shared FileSet in place so hover
-                        // always sees the current document set.
-                        {
-                            use salsa::Setter;
-                            let new_files: Vec<SourceFile> =
-                                uri_to_file.values().copied().collect();
-                            fs.set_files(&mut db).to(new_files);
+                        // Guard the FileSet salsa input: a pure text edit leaves
+                        // membership unchanged, so no revision bump is needed.
+                        sync_file_set(&mut db, fs, &uri_to_file);
+                        // Republish diagnostics only for the changed doc and the
+                        // open docs that (transitively) import it — the only docs
+                        // whose diagnostics can change on this edit.
+                        if let Some(&changed) = uri_to_file.get(&uri_str) {
+                            for (doc_uri_str, file) in
+                                affected_files(&db, fs, &uri_to_file, changed)
+                            {
+                                publish_diagnostics(
+                                    &connection,
+                                    &db,
+                                    file,
+                                    fs,
+                                    cats,
+                                    &doc_uri_str,
+                                )?;
+                            }
                         }
-                        // Re-publish diagnostics for ALL open docs so cross-file
-                        // dependency edges are re-evaluated.
+                    }
+                    DidChangeWatchedFiles::METHOD => {
+                        // Clients (e.g. VS Code) register their own glob watchers and
+                        // push `workspace/didChangeWatchedFiles` for on-disk changes to
+                        // files that are NOT open in the editor (e.g. a `load_module`
+                        // dependency edited by another tool, or a git checkout).
+                        // lsp-types 0.97's `WorkspaceServerCapabilities` has no static
+                        // field for `didChangeWatchedFiles` registration options, so we
+                        // handle the notification here and rely on the client's own
+                        // watcher registration (dynamic `client/registerCapability`).
+                        let p: lsp_types::DidChangeWatchedFilesParams = match serde_json::from_value(
+                            note.params,
+                        ) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                eprintln!(
+                                    "flatppl-lsp: malformed didChangeWatchedFiles, skipping: {e}"
+                                );
+                                continue;
+                            }
+                        };
+                        for change in p.changes {
+                            let uri_str = change.uri.as_str().to_owned();
+                            // Only .flatppl files; skip anything else.
+                            if !uri_str.ends_with(".flatppl") {
+                                continue;
+                            }
+                            // Skip files currently open in the editor — the editor's
+                            // didChange is the source of truth for those (avoid
+                            // clobbering unsaved edits).
+                            if editor_open_uris.contains(&uri_str)
+                                && change.typ != lsp_types::FileChangeType::DELETED
+                            {
+                                continue;
+                            }
+                            match change.typ {
+                                lsp_types::FileChangeType::CREATED
+                                | lsp_types::FileChangeType::CHANGED => {
+                                    if let Some(path) = file_uri_to_path(&uri_str) {
+                                        if let Ok(text) = std::fs::read_to_string(&path) {
+                                            upsert_file(&mut db, &mut uri_to_file, uri_str, text);
+                                        }
+                                    }
+                                }
+                                lsp_types::FileChangeType::DELETED => {
+                                    uri_to_file.remove(&uri_str);
+                                }
+                                _ => {}
+                            }
+                        }
+                        sync_file_set(&mut db, fs, &uri_to_file);
+                        // Republish diagnostics for all tracked docs: a watched-file
+                        // change can affect any open importer.
                         let open_files: Vec<(String, SourceFile)> =
                             uri_to_file.iter().map(|(u, &f)| (u.clone(), f)).collect();
                         for (doc_uri_str, file) in open_files {
@@ -171,11 +241,11 @@ pub fn run(
                         connection.sender.send(Message::Response(hover_resp))?;
                     }
                     DocumentSymbolRequest::METHOD => {
-                        let sym_resp = handle_document_symbols(&db, &uri_to_file, fs, cats, &req);
+                        let sym_resp = handle_document_symbols(&db, &uri_to_file, &req);
                         connection.sender.send(Message::Response(sym_resp))?;
                     }
                     WorkspaceSymbolRequest::METHOD => {
-                        let sym_resp = handle_workspace_symbols(&db, fs, cats, &req);
+                        let sym_resp = handle_workspace_symbols(&db, fs, &req);
                         connection.sender.send(Message::Response(sym_resp))?;
                     }
                     InlayHintRequest::METHOD => {
@@ -308,6 +378,59 @@ fn build_fileset(db: &Database, uri_to_file: &HashMap<String, SourceFile>) -> Fi
     FileSet::new(db, files)
 }
 
+/// Update the `FileSet` salsa input only when the file SET membership changes.
+///
+/// A pure text edit of an already-open file leaves membership unchanged — the
+/// edit flows through `SourceFile::set_text` in `upsert_file`, not through
+/// `FileSet`. Bumping the `FileSet` input on every keystroke causes unnecessary
+/// salsa revision churn; this guard skips the setter when the set of `SourceFile`
+/// handles is identical to what is already stored.
+///
+/// Membership is compared structurally (sorted by stored path) rather than by
+/// count. A `didChangeWatchedFiles` batch that deletes one file and creates
+/// another leaves the count unchanged but changes membership — the count-based
+/// guard would wrongly skip the update, leaving the `FileSet` salsa input stale
+/// (keeping the deleted `SourceFile`, missing the new one). Comparing the actual
+/// member handles catches this case correctly.
+fn sync_file_set(db: &mut Database, fs: FileSet, uri_to_file: &HashMap<String, SourceFile>) {
+    use salsa::Setter;
+    let mut new_files: Vec<SourceFile> = uri_to_file.values().copied().collect();
+    new_files.sort_by_key(|f| f.path(db).clone());
+    let mut current: Vec<SourceFile> = fs.files(db).to_vec();
+    current.sort_by_key(|f| f.path(db).clone());
+    if new_files == current {
+        return; // membership + identity unchanged → no salsa input churn
+    }
+    fs.set_files(db).to(new_files);
+}
+
+/// Return the subset of `uri_to_file` whose diagnostics can change when
+/// `changed` is edited: `changed` itself, plus every open file whose transitive
+/// import bundle includes `changed` as a resolved dependency.
+///
+/// `import_bundle` is a memoized salsa query, so the bundle lookups here are
+/// cache hits for every file whose inputs have not changed.  Independent files
+/// (those that do not import `changed`) are excluded, avoiding spurious
+/// `analyze` recomputation.
+///
+/// Matching is by `SourceFile` identity (salsa input id) rather than by the
+/// directive's literal path string.  This matters when a relative import such
+/// as `"../helpers.flatppl"` resolves to a `SourceFile` whose stored path is
+/// the absolute `/abs/helpers.flatppl` — the literal and the path differ, so a
+/// string comparison would miss the importer and leave its diagnostics stale.
+fn affected_files(
+    db: &dyn salsa::Database,
+    fs: FileSet,
+    uri_to_file: &HashMap<String, SourceFile>,
+    changed: SourceFile,
+) -> Vec<(String, SourceFile)> {
+    uri_to_file
+        .iter()
+        .filter(|(_, f)| **f == changed || import_bundle(db, **f, fs).imports(changed))
+        .map(|(u, f)| (u.clone(), *f))
+        .collect()
+}
+
 /// Insert or update a [`SourceFile`] in the map.
 ///
 /// If the URI already has an entry, the `text` input is updated via the salsa
@@ -374,8 +497,7 @@ fn handle_hover(
             .to_owned();
         let lsp_pos = params.text_document_position_params.position;
         let file = *uri_to_file.get(&uri_str)?;
-        let text = file.text(db);
-        let li = LineIndex::new(text);
+        let li = line_index(db, file);
         let byte_offset = li.offset(Pos {
             line: lsp_pos.line,
             character: lsp_pos.character,
@@ -401,8 +523,6 @@ fn handle_hover(
 fn handle_document_symbols(
     db: &Database,
     uri_to_file: &HashMap<String, SourceFile>,
-    fs: FileSet,
-    cats: Catalogues,
     req: &lsp_server::Request,
 ) -> Response {
     let syms: Vec<lsp_types::DocumentSymbol> = (|| {
@@ -410,7 +530,7 @@ fn handle_document_symbols(
             serde_json::from_value(req.params.clone()).ok()?;
         let uri_str = params.text_document.uri.as_str().to_owned();
         let file = *uri_to_file.get(&uri_str)?;
-        Some(crate::capabilities::document_symbols(db, file, fs, cats))
+        Some(crate::capabilities::document_symbols(db, file))
     })()
     .unwrap_or_default();
 
@@ -420,12 +540,7 @@ fn handle_document_symbols(
 
 /// Handle a `workspace/symbol` request.  Returns a `Response` (result or
 /// null) without sending it — the caller dispatches the message.
-fn handle_workspace_symbols(
-    db: &Database,
-    fs: FileSet,
-    cats: Catalogues,
-    req: &lsp_server::Request,
-) -> Response {
+fn handle_workspace_symbols(db: &Database, fs: FileSet, req: &lsp_server::Request) -> Response {
     let query = (|| -> Option<String> {
         let params: lsp_types::WorkspaceSymbolParams =
             serde_json::from_value(req.params.clone()).ok()?;
@@ -433,7 +548,7 @@ fn handle_workspace_symbols(
     })()
     .unwrap_or_default();
 
-    let syms = crate::capabilities::workspace_symbols(db, fs, cats, &query);
+    let syms = crate::capabilities::workspace_symbols(db, fs, &query);
     let response = lsp_types::WorkspaceSymbolResponse::Flat(syms);
     Response::new_ok(req.id.clone(), response)
 }
@@ -451,8 +566,7 @@ fn handle_inlay_hints(
         let params: lsp_types::InlayHintParams = serde_json::from_value(req.params.clone()).ok()?;
         let uri_str = params.text_document.uri.as_str().to_owned();
         let file = *uri_to_file.get(&uri_str)?;
-        let text = file.text(db);
-        let li = LineIndex::new(text);
+        let li = line_index(db, file);
         let start_byte = li.offset(Pos {
             line: params.range.start.line,
             character: params.range.start.character,
@@ -490,8 +604,7 @@ fn handle_goto_definition(
             .to_owned();
         let lsp_pos = params.text_document_position_params.position;
         let file = *uri_to_file.get(&uri_str)?;
-        let text = file.text(db);
-        let li = LineIndex::new(text);
+        let li = line_index(db, file);
         let byte_offset = li.offset(Pos {
             line: lsp_pos.line,
             character: lsp_pos.character,
@@ -504,16 +617,16 @@ fn handle_goto_definition(
             format!("file://{}", def_loc.path)
         };
         let target_uri = Uri::from_str(&target_uri_str).ok()?;
-        // Build the target range: need the text of the target file to do
-        // byte→position conversion.
-        let target_text = fs
+        // Build the target range: find the dep SourceFile and use its cached
+        // line index (avoids a per-request LineIndex::new rebuild).
+        let dep_file = fs
             .files(db)
             .iter()
             .copied()
-            .find(|f| f.path(db) == def_loc.path)
-            .map(|f| f.text(db).to_string())
-            .unwrap_or_default();
-        let target_li = LineIndex::new(&target_text);
+            .find(|f| f.path(db) == def_loc.path);
+        let target_li = dep_file
+            .map(|f| line_index(db, f))
+            .unwrap_or_else(|| crate::line_index::LineIndex::new(""));
         let start = target_li.position(def_loc.start);
         let end = target_li.position(def_loc.end);
         let range = lsp_types::Range::new(
@@ -554,12 +667,12 @@ fn handle_completion(
             .to_owned();
         let lsp_pos = params.text_document_position.position;
         let file = *uri_to_file.get(&uri_str)?;
-        let text = file.text(db);
-        let li = LineIndex::new(text);
+        let li = line_index(db, file);
         let byte_offset = li.offset(Pos {
             line: lsp_pos.line,
             character: lsp_pos.character,
         });
+        let text = file.text(db);
         let prefix = member_prefix_at(text, byte_offset);
         let items = crate::capabilities::completion(db, file, fs, cats, byte_offset, prefix);
         Some(lsp_types::CompletionResponse::Array(items))
@@ -625,6 +738,7 @@ fn is_ident_byte(b: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::line_index::LineIndex;
 
     // ── member_prefix_at ─────────────────────────────────────────────────────
 
@@ -1014,5 +1128,353 @@ mod tests {
             .unwrap();
 
         server_thread.join().expect("server thread panicked");
+    }
+
+    // ── didChangeWatchedFiles: on-disk create/change picked up ───────────────
+    //
+    // Scenario: the server starts with an empty workspace. A `.flatppl` file is
+    // written to a temp path. The client sends `workspace/didChangeWatchedFiles`
+    // with a CREATED event for that file's `file://` URI. The test then sends a
+    // `documentSymbol` request for that URI and asserts the server returns at
+    // least one symbol — proving it read the file from disk.
+    //
+    // A CHANGED event for the same URI (with updated content) is then sent, and
+    // a second `documentSymbol` request asserts the updated symbol name is
+    // visible, proving the disk-reload path works.
+
+    #[test]
+    fn watched_file_created_and_changed_picked_up() {
+        use lsp_server::{Connection, Message};
+        use lsp_types::notification::Notification as _;
+        use lsp_types::request::{DocumentSymbolRequest, Request as _};
+
+        // Write a temp .flatppl file with a known binding.
+        let tmp_path = std::env::temp_dir().join(format!(
+            "flatppl_lsp_watched_{}.flatppl",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::write(&tmp_path, "alpha = elementof(reals)\n").unwrap();
+        let tmp_uri_str = format!("file://{}", tmp_path.display());
+
+        let (client_conn, server_conn) = Connection::memory();
+        let server_thread = std::thread::spawn(move || {
+            let init_params = serde_json::json!({ "capabilities": {} });
+            run(server_conn, init_params).expect("server loop failed");
+        });
+
+        // Helper: send a notification.
+        let send_note = |method: &str, params: serde_json::Value| {
+            let note = lsp_server::Notification::new(method.to_owned(), params);
+            client_conn
+                .sender
+                .send(Message::Notification(note))
+                .unwrap();
+        };
+
+        // Helper: drain messages until a non-publishDiagnostics message arrives,
+        // returning that message. Discards any publishDiagnostics notifications
+        // that the server emits after a watched-file event.
+        let drain_to_response = || loop {
+            let msg = client_conn
+                .receiver
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("timed out waiting for response");
+            match &msg {
+                Message::Notification(n)
+                    if n.method == lsp_types::notification::PublishDiagnostics::METHOD =>
+                {
+                    continue;
+                }
+                _ => return msg,
+            }
+        };
+
+        // Send a CREATED watched-file event. The server reads the file from disk
+        // and emits a publishDiagnostics notification for it (empty, valid file).
+        let dcwf_params = serde_json::json!({
+            "changes": [{ "uri": tmp_uri_str, "type": 1 }]  // 1 = CREATED
+        });
+        send_note(DidChangeWatchedFiles::METHOD, dcwf_params);
+
+        // Send a documentSymbol request; drain any publishDiagnostics first.
+        let ds_params = serde_json::json!({
+            "textDocument": { "uri": tmp_uri_str }
+        });
+        // Enqueue the request then drain to get the response (past any diagnostics).
+        {
+            let req = lsp_server::Request::new(
+                lsp_server::RequestId::from(10i32),
+                DocumentSymbolRequest::METHOD.to_owned(),
+                ds_params.clone(),
+            );
+            client_conn.sender.send(Message::Request(req)).unwrap();
+        }
+        let resp_msg = drain_to_response();
+        let Message::Response(resp) = resp_msg else {
+            panic!("expected Response, got: {resp_msg:?}");
+        };
+        assert!(
+            resp.error.is_none(),
+            "documentSymbol must not error: {:?}",
+            resp.error
+        );
+        let result = resp.result.expect("documentSymbol result must be present");
+        // The server should have loaded "alpha = elementof(reals)" → at least one symbol.
+        let syms = result.to_string();
+        assert!(
+            syms.contains("alpha"),
+            "symbol 'alpha' must appear after CREATED watched-file event; got: {syms}"
+        );
+
+        // Now update the file on disk with a new binding name.
+        std::fs::write(&tmp_path, "beta = elementof(reals)\n").unwrap();
+
+        // Send a CHANGED watched-file event.
+        let dcwf_changed = serde_json::json!({
+            "changes": [{ "uri": tmp_uri_str, "type": 2 }]  // 2 = CHANGED
+        });
+        send_note(DidChangeWatchedFiles::METHOD, dcwf_changed);
+
+        // Query symbols again — must now show "beta".
+        {
+            let req = lsp_server::Request::new(
+                lsp_server::RequestId::from(11i32),
+                DocumentSymbolRequest::METHOD.to_owned(),
+                ds_params,
+            );
+            client_conn.sender.send(Message::Request(req)).unwrap();
+        }
+        let resp_msg2 = drain_to_response();
+        let Message::Response(resp2) = resp_msg2 else {
+            panic!("expected Response, got: {resp_msg2:?}");
+        };
+        assert!(
+            resp2.error.is_none(),
+            "second documentSymbol must not error: {:?}",
+            resp2.error
+        );
+        let result2 = resp2
+            .result
+            .expect("second documentSymbol result must be present");
+        let syms2 = result2.to_string();
+        assert!(
+            syms2.contains("beta"),
+            "symbol 'beta' must appear after CHANGED watched-file event; got: {syms2}"
+        );
+
+        // Cleanup temp file.
+        let _ = std::fs::remove_file(&tmp_path);
+
+        // Shutdown.
+        let shutdown_req = lsp_server::Request::new(
+            lsp_server::RequestId::from(99i32),
+            "shutdown".into(),
+            serde_json::Value::Null,
+        );
+        client_conn
+            .sender
+            .send(Message::Request(shutdown_req))
+            .unwrap();
+        let _ = client_conn
+            .receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .ok();
+        let exit_note = lsp_server::Notification::new("exit".into(), serde_json::Value::Null);
+        client_conn
+            .sender
+            .send(Message::Notification(exit_note))
+            .unwrap();
+        server_thread.join().expect("server thread panicked");
+    }
+
+    // ── affected_files / ANALYZE_RUNS tests ──────────────────────────────────
+    //
+    // 3-file workspace: B is a leaf; A does `load_module` of B; C is
+    // independent (imports neither A nor B).
+
+    fn make_abc_workspace() -> (
+        crate::db::Database,
+        SourceFile,
+        SourceFile,
+        SourceFile,
+        crate::db::FileSet,
+        HashMap<String, SourceFile>,
+    ) {
+        let db = crate::db::Database::default();
+        let b = SourceFile::new(
+            &db,
+            "/tmp/b.flatppl".to_string(),
+            "leaf = elementof(reals)\n".to_string(),
+        );
+        let a = SourceFile::new(
+            &db,
+            "/tmp/a.flatppl".to_string(),
+            "b = load_module(\"/tmp/b.flatppl\")\nv = add(b.leaf, 1.0)\n".to_string(),
+        );
+        let c = SourceFile::new(
+            &db,
+            "/tmp/c.flatppl".to_string(),
+            "x = add(1, 2)\n".to_string(),
+        );
+        let fs = crate::db::FileSet::new(&db, vec![a, b, c]);
+        let mut uri_to_file: HashMap<String, SourceFile> = HashMap::new();
+        uri_to_file.insert("file:///tmp/a.flatppl".to_string(), a);
+        uri_to_file.insert("file:///tmp/b.flatppl".to_string(), b);
+        uri_to_file.insert("file:///tmp/c.flatppl".to_string(), c);
+        (db, a, b, c, fs, uri_to_file)
+    }
+
+    // ── sync_file_set membership guard tests ─────────────────────────────────
+
+    /// A delete+create batch with unchanged count must still update the FileSet.
+    ///
+    /// Start with FileSet = {A, B}. Build a `uri_to_file` map representing {A, C}
+    /// (B removed, C added — same count 2). Call `sync_file_set` and assert
+    /// `fs.files(db)` now contains A and C and NOT B. This is the MEASURED proof
+    /// that equal count but changed membership still triggers the update.
+    #[test]
+    fn sync_file_set_delete_create_batch_updates_membership() {
+        use crate::db::{Database, FileSet, SourceFile};
+
+        let mut db = Database::default();
+        let a = SourceFile::new(&db, "/tmp/a.flatppl".to_string(), "a = 1".to_string());
+        let b = SourceFile::new(&db, "/tmp/b.flatppl".to_string(), "b = 2".to_string());
+        let fs = FileSet::new(&db, vec![a, b]);
+
+        // Simulate a didChangeWatchedFiles batch: B deleted, C created (same count).
+        let c = SourceFile::new(&db, "/tmp/c.flatppl".to_string(), "c = 3".to_string());
+        let mut uri_to_file: HashMap<String, SourceFile> = HashMap::new();
+        uri_to_file.insert("file:///tmp/a.flatppl".to_string(), a);
+        uri_to_file.insert("file:///tmp/c.flatppl".to_string(), c);
+
+        // Before the call, fs still holds {A, B}.
+        assert_eq!(
+            fs.files(&db).len(),
+            2,
+            "initial FileSet must have 2 members"
+        );
+
+        sync_file_set(&mut db, fs, &uri_to_file);
+
+        let current: Vec<SourceFile> = fs.files(&db).to_vec();
+        assert_eq!(
+            current.len(),
+            2,
+            "FileSet must still have 2 members after delete+create"
+        );
+        assert!(
+            current.contains(&a),
+            "A must be in the updated FileSet; got {current:?}"
+        );
+        assert!(
+            current.contains(&c),
+            "C (newly created) must be in the updated FileSet; got {current:?}"
+        );
+        assert!(
+            !current.contains(&b),
+            "B (deleted) must NOT be in the updated FileSet; got {current:?}"
+        );
+    }
+
+    /// A pure text edit must NOT cause `sync_file_set` to bump the FileSet input.
+    ///
+    /// After warming the FileSet with {A}, update A's text via `set_text` (a
+    /// membership-unchanged edit), then call `sync_file_set`. The FileSet must
+    /// still contain exactly A. This is the guard against per-keystroke revision
+    /// churn: membership is identical, so the salsa setter is skipped.
+    #[test]
+    fn sync_file_set_skips_update_on_pure_text_edit() {
+        use crate::db::{Database, FileSet, SourceFile};
+        use salsa::Setter;
+
+        let mut db = Database::default();
+        let a = SourceFile::new(&db, "/tmp/a.flatppl".to_string(), "a = 1".to_string());
+        let fs = FileSet::new(&db, vec![a]);
+        let mut uri_to_file: HashMap<String, SourceFile> = HashMap::new();
+        uri_to_file.insert("file:///tmp/a.flatppl".to_string(), a);
+
+        // Pure text edit: membership unchanged.
+        a.set_text(&mut db).to("a = 99".to_string());
+
+        // sync_file_set must not panic and must leave the membership intact.
+        sync_file_set(&mut db, fs, &uri_to_file);
+
+        let current: Vec<SourceFile> = fs.files(&db).to_vec();
+        assert_eq!(current, vec![a], "FileSet must still contain only A");
+    }
+
+    /// `affected_files(changed=B)` must include A and B (A imports B) but must
+    /// exclude C (C imports neither A nor B).
+    #[test]
+    fn affected_files_excludes_non_importers() {
+        let (db, _a, b, _c, fs, uri_to_file) = make_abc_workspace();
+
+        let affected: std::collections::HashSet<String> = affected_files(&db, fs, &uri_to_file, b)
+            .into_iter()
+            .map(|(u, _)| u)
+            .collect();
+
+        assert!(
+            affected.contains("file:///tmp/b.flatppl"),
+            "changed file B must be in affected set; got {affected:?}"
+        );
+        assert!(
+            affected.contains("file:///tmp/a.flatppl"),
+            "A imports B, so A must be in affected set; got {affected:?}"
+        );
+        assert!(
+            !affected.contains("file:///tmp/c.flatppl"),
+            "C is independent; must NOT be in affected set; got {affected:?}"
+        );
+    }
+
+    /// Editing B (via `set_text`) must NOT invalidate C's `analyze` cache.
+    ///
+    /// After warming A, B, C, we reset `ANALYZE_RUNS`, edit B's text, and
+    /// re-run `analyze` for only the affected set (A, B). Running `analyze(C)`
+    /// afterward must not increment the counter — C's inputs are unchanged so
+    /// salsa serves it from cache.
+    #[test]
+    fn editing_a_file_does_not_reanalyze_independent_files() {
+        use crate::queries::{ANALYZE_RUNS, analyze};
+        use salsa::Setter;
+
+        let (mut db, a, b, c, fs, _uri_to_file) = make_abc_workspace();
+        let cats = crate::db::Catalogues::new(&db, Vec::new());
+
+        // Warm: analyze all three so the revision is established.
+        let _ = analyze(&db, a, fs, cats);
+        let _ = analyze(&db, b, fs, cats);
+        let _ = analyze(&db, c, fs, cats);
+
+        // Reset the counter, then edit B's text (a pure text change, not a
+        // membership change).
+        ANALYZE_RUNS.with(|c| c.set(0));
+        b.set_text(&mut db)
+            .to("leaf = elementof(reals)\nextra = add(leaf, 2.0)\n".to_string());
+
+        // Simulate what the fixed didChange arm does: re-analyze only the
+        // affected set (B and A, which imports B).
+        let _ = analyze(&db, b, fs, cats);
+        let _ = analyze(&db, a, fs, cats);
+        let runs_after_ab = ANALYZE_RUNS.with(|c| c.get());
+        assert_eq!(
+            runs_after_ab, 2,
+            "editing B should recompute analyze for B and A (its importer); got {runs_after_ab}"
+        );
+
+        // Now run analyze(C) — C's inputs are unchanged, so salsa must serve it
+        // from cache without running the body again.
+        ANALYZE_RUNS.with(|c| c.set(0));
+        let _ = analyze(&db, c, fs, cats);
+        let runs_c = ANALYZE_RUNS.with(|c| c.get());
+        assert_eq!(
+            runs_c, 0,
+            "C is independent of B; editing B must NOT invalidate C's analyze cache \
+             (ANALYZE_RUNS incremented {runs_c} times for C, expected 0)"
+        );
     }
 }

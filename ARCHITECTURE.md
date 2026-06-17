@@ -163,10 +163,17 @@ legalization targets above.
 Landed: `flatppl-core` (the IR) · `flatppl-syntax` (FlatPPL surface ↔ core) ·
 `flatppl-flatpir` (FlatPIR S-expr ↔ core) · `flatppl-infer` (the type/phase
 trace + per-op rule catalogue) · `flatppl-lint` (lint rules over the IR) ·
-`flatppl-cli` (the `flatppl` driver binary — `convert`, `infer`, `fmt`, `lint`).
+`flatppl-cli` (the `flatppl` driver binary — `convert`, `infer`, `fmt`, `lint`) ·
+`flatppl-lsp` (the FlatPPL language server binary).
 `syntax`/`flatpir`/`infer` depend on `core`; `core` depends on nothing. Library
 crates stay **binary-free** (they compile to `wasm32` and link into PyO3 / jlrs /
 cxx); all CLI surface lives in `flatppl-cli`.
+
+**Binary tool crates** — `flatppl-cli` and `flatppl-lsp` — are the two exceptions
+to the binary-free rule: they are standalone tools, never wasm-linked. Both ship a
+`[[bin]]`; this is intentional and does not violate the library-crates rule.
+`flatppl-lsp` additionally exposes a `[lib]` target so integration tests can drive
+the server in-process without spawning a subprocess.
 
 **CLI model.** One driver binary (`flatppl`) with subcommands; capabilities are
 compile-time cargo features of `flatppl-cli` (a verb's crates link only when its
