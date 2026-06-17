@@ -113,7 +113,9 @@ jobs:
           tag_name: nightly
           name: Nightly Build
           prerelease: true
-          files: dist/*
+          files: |
+            dist/*
+            dist/lsp/*
           body: |
             Nightly build of the `flatppl` CLI.
             Built from commit ${{ github.sha }}.
