@@ -130,6 +130,7 @@ dependencies = [
  "flatppl-infer",
  "flatppl-lint",
  "flatppl-syntax",
+ "serde_json",
 ]
 
 [[package]]

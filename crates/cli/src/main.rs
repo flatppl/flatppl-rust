@@ -38,17 +38,19 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Convert between FlatPPL and FlatPIR.
+    /// Convert between FlatPPL, FlatPIR, and the FlatPIR JSON encoding.
     ///
-    /// Formats are inferred from the file extensions (`.flatppl` /
-    /// `.flatpir`). Converting to the same format canonicalizes the file.
-    /// Use `--from hs3` or `--from pyhf` to import a JSON file.
+    /// Formats are inferred from the file extensions (`.flatppl` / `.flatpir` /
+    /// `.flatpir.json`). Converting to the same format canonicalizes the file.
+    /// `.flatpir.json` is an alternate representation of FlatPIR (same content,
+    /// including `%meta` annotations). Use `--from hs3` or `--from pyhf` to
+    /// import a JSON file instead.
     #[cfg(feature = "convert")]
     Convert {
-        /// Input file (`.flatppl`, `.flatpir`, native HS3 JSON with `--from hs3`,
-        /// or pyhf workspace JSON with `--from pyhf`)
+        /// Input file (`.flatppl`, `.flatpir`, `.flatpir.json`, native HS3 JSON
+        /// with `--from hs3`, or pyhf workspace JSON with `--from pyhf`)
         input: PathBuf,
-        /// Output file (`.flatppl` or `.flatpir`)
+        /// Output file (`.flatppl`, `.flatpir`, or `.flatpir.json`)
         output: PathBuf,
         /// FlatPPL output syntax level (ignored for FlatPIR output):
         /// `full` re-applies all syntactic sugar (operators, indexing,
@@ -256,11 +258,13 @@ fn convert(
         }
     };
 
-    let mut text = write_module(to, &module, syntax);
+    let mut text = write_module(to, &module, syntax)?;
     if !text.ends_with('\n') {
         text.push('\n');
     }
-    if !no_header {
+    // The provenance header is a leading comment; skip it for a format that has
+    // no comment syntax (`.flatpir.json` — JSON can't carry it).
+    if let (false, Some(comment)) = (no_header, to.line_comment()) {
         let from_label = match from_format {
             FromFormat::Hs3 => "HS3 JSON",
             FromFormat::Pyhf => "pyhf workspace JSON",
@@ -273,7 +277,7 @@ fn convert(
             source: input,
             generator: "convert",
         }
-        .header(to.line_comment());
+        .header(comment);
         text.insert_str(0, &header);
     }
     fs::write(output, text)
@@ -341,7 +345,11 @@ fn infer_cmd(
             source: input,
             generator: "infer",
         }
-        .header(Format::FlatPir.line_comment());
+        .header(
+            Format::FlatPir
+                .line_comment()
+                .expect("FlatPIR has a line comment"),
+        );
         text.insert_str(0, &header);
     }
     fs::write(output, text)

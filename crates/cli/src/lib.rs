@@ -72,35 +72,46 @@ pub struct LintArgs {
 // ── Format ───────────────────────────────────────────────────────────────────
 
 /// A serialization format, inferred from a filename extension.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Format {
     FlatPpl,
     FlatPir,
+    /// The Option-C JSON encoding of FlatPIR (`.flatpir.json`).
+    FlatPirJson,
 }
 
 impl Format {
     pub fn from_path(path: &Path) -> Result<Format, String> {
+        // `.flatpir.json` is a double extension; match the full file name first,
+        // since `Path::extension` only sees the trailing `json`.
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if name.ends_with(".flatpir.json") {
+            return Ok(Format::FlatPirJson);
+        }
         match path.extension().and_then(|e| e.to_str()) {
             Some("flatppl") => Ok(Format::FlatPpl),
             Some("flatpir") => Ok(Format::FlatPir),
             Some(other) => Err(format!(
                 "unsupported file extension `.{other}` for `{}` \
-                 (expected `.flatppl` or `.flatpir`)",
+                 (expected `.flatppl`, `.flatpir`, or `.flatpir.json`)",
                 path.display()
             )),
             None => Err(format!(
                 "cannot infer a format for `{}`: no file extension \
-                 (expected `.flatppl` or `.flatpir`)",
+                 (expected `.flatppl`, `.flatpir`, or `.flatpir.json`)",
                 path.display()
             )),
         }
     }
 
-    /// The line-comment marker for this format (for the provenance header).
-    pub fn line_comment(self) -> &'static str {
+    /// The line-comment marker for this format (for the provenance header), or
+    /// `None` for a format that has no comment syntax (JSON — the header is
+    /// omitted for it).
+    pub fn line_comment(self) -> Option<&'static str> {
         match self {
-            Format::FlatPpl => "%",
-            Format::FlatPir => ";",
+            Format::FlatPpl => Some("%"),
+            Format::FlatPir => Some(";"),
+            Format::FlatPirJson => None,
         }
     }
 
@@ -109,6 +120,7 @@ impl Format {
         match self {
             Format::FlatPpl => "FlatPPL",
             Format::FlatPir => "FlatPIR",
+            Format::FlatPirJson => "FlatPIR JSON",
         }
     }
 }
@@ -222,8 +234,16 @@ pub fn read_module(format: Format, source: &str) -> Result<Module, ReadError> {
         Format::FlatPir => {
             flatppl_flatpir::read(source).map_err(|e| (e.message, e.line, widen(e.span)))
         }
+        // The JSON encoding routes through synthesized canonical text, so its
+        // errors are not source-positioned: report unlocalized (line 0).
+        #[cfg(any(feature = "convert", feature = "infer", feature = "hs3"))]
+        Format::FlatPirJson => {
+            let value: serde_json::Value = serde_json::from_str(source)
+                .map_err(|e| (format!("invalid `.flatpir.json`: {e}"), 0usize, None))?;
+            flatppl_flatpir::from_json(&value).map_err(|e| (e.message, 0usize, None))
+        }
         #[cfg(not(any(feature = "convert", feature = "infer", feature = "hs3")))]
-        Format::FlatPir => Err((
+        Format::FlatPir | Format::FlatPirJson => Err((
             "FlatPIR support not compiled in (missing `convert`, `infer`, or `hs3` feature)"
                 .to_string(),
             0,
@@ -232,16 +252,27 @@ pub fn read_module(format: Format, source: &str) -> Result<Module, ReadError> {
     }
 }
 
-pub fn write_module(format: Format, module: &Module, syntax: flatppl_syntax::Syntax) -> String {
-    match format {
+pub fn write_module(
+    format: Format,
+    module: &Module,
+    syntax: flatppl_syntax::Syntax,
+) -> Result<String, Failure> {
+    Ok(match format {
         Format::FlatPpl => flatppl_syntax::print_with(module, syntax),
         #[cfg(any(feature = "convert", feature = "infer", feature = "hs3"))]
         Format::FlatPir => flatppl_flatpir::write(module),
+        #[cfg(any(feature = "convert", feature = "infer", feature = "hs3"))]
+        Format::FlatPirJson => {
+            let value = flatppl_flatpir::try_to_json(module)
+                .map_err(|e| Failure::Plain(format!("encoding `.flatpir.json`: {}", e.message)))?;
+            serde_json::to_string_pretty(&value)
+                .map_err(|e| Failure::Plain(format!("serializing JSON: {e}")))?
+        }
         #[cfg(not(any(feature = "convert", feature = "infer", feature = "hs3")))]
-        Format::FlatPir => unreachable!(
-            "write_module called with FlatPir in a lean build; all callers are guarded by a converter feature"
+        Format::FlatPir | Format::FlatPirJson => unreachable!(
+            "write_module called with a FlatPIR format in a lean build; all callers are guarded by a converter feature"
         ),
-    }
+    })
 }
 
 // ── fmt/lint logic ────────────────────────────────────────────────────────────
@@ -297,7 +328,7 @@ pub fn run_fmt(
     for file in files {
         match Format::from_path(file)? {
             Format::FlatPpl => {}
-            Format::FlatPir => {
+            Format::FlatPir | Format::FlatPirJson => {
                 return Err(Failure::Plain(format!(
                     "`fmt` only formats FlatPPL; `{}` is FlatPIR (use `convert`)",
                     file.display()
