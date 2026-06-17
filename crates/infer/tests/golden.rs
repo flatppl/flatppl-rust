@@ -39,9 +39,11 @@ fn helpers_inference_matches_spec_golden() {
     );
 }
 
-/// model.flatpir: every single-module binding matches the golden; `L`
-/// (likelihood over a cross-module kernel) is honestly `%deferred` until
-/// `load_module` support lands, with a note diagnostic saying so.
+/// model.flatpir: every single-module binding matches the golden. The `L`
+/// binding references `helpers.obs_kernel` via a cross-module ref; when no
+/// bundle is supplied (`infer` uses an empty one) the resolution fails with an
+/// anchored error ("not found") and `L`'s type is left `%deferred` because the
+/// argument that failed has `(%failed …)` which propagates through `likelihoodof`.
 #[test]
 fn model_inference_single_module_part() {
     let mut module = flatppl_flatpir::read(&fixture("model.flatpir")).unwrap();
@@ -58,11 +60,12 @@ fn model_inference_single_module_part() {
     ] {
         assert!(out.contains(expected), "missing `{expected}` in:\n{out}");
     }
+    // With cross-module resolution active, a missing bundle entry is an error.
     assert!(
-        diags.iter().any(|d| d.severity == Severity::Note
-            && d.message
-                .contains("cross-module references are not inferred yet")),
-        "expected a cross-module gap note, got: {diags:?}"
+        diags
+            .iter()
+            .any(|d| d.severity == Severity::Error && d.message.contains("not found")),
+        "expected a not-found error for the missing bundle dependency, got: {diags:?}"
     );
 }
 
@@ -412,6 +415,13 @@ fn corpus_inference_smoke_and_annotated_roundtrip() {
         }
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
         let src = fs::read_to_string(&path).unwrap();
+        // Fixtures that use load_module / standard_module need a populated
+        // bundle to infer cleanly; bundle-less they raise (correct) errors that
+        // would trip the no-error assertion below. Skip them here — the real
+        // fixture is exercised by `modules_fixture_resolves_with_expected_gap`.
+        if src.contains("load_module") || src.contains("standard_module") {
+            continue;
+        }
         let mut module = flatppl_syntax::parse(&src).unwrap();
         let diags = infer(&mut module);
         let errors: Vec<_> = diags
@@ -429,6 +439,30 @@ fn corpus_inference_smoke_and_annotated_roundtrip() {
             "{name}: annotated FlatPIR is not a write fixpoint"
         );
     }
+}
+
+/// `modules.flatppl` uses `load_module(...)` and `standard_module(...)`; with no
+/// bundle the cross-module refs resolve to not-found errors (the std-module
+/// registry and dependency fixtures are later plans). Pins that the real
+/// fixture flows through cross-module resolution without panicking and surfaces
+/// the gap as an anchored error.
+#[test]
+fn modules_fixture_resolves_with_expected_gap() {
+    let path: PathBuf = [
+        env!("CARGO_MANIFEST_DIR"),
+        "../../fixtures/flatppl/modules.flatppl",
+    ]
+    .iter()
+    .collect();
+    let src = fs::read_to_string(&path).unwrap();
+    let mut module = flatppl_syntax::parse(&src).unwrap();
+    let diags = infer(&mut module); // empty bundle
+    assert!(
+        diags
+            .iter()
+            .any(|d| d.severity == Severity::Error && d.message.contains("not found")),
+        "expected a not-found error for the unresolved module dep; got {diags:?}"
+    );
 }
 
 #[test]

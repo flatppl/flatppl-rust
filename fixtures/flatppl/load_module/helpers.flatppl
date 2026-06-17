@@ -1,0 +1,8 @@
+center = elementof(reals)
+spread = elementof(posreals)
+
+obs_kernel = functionof(
+    Normal(mu = center + _x_, sigma = spread),
+    center = center, spread = spread, x = _x_)
+
+shifted_value = center + 1.0

@@ -45,7 +45,7 @@ pub(crate) fn const_type(name: &str) -> Type {
 /// join over all inputs; rules override it only where the op itself
 /// introduces a phase (`elementof`, `draw`, reification closure, loaders).
 pub(crate) fn call_rule(
-    inf: &mut Inferencer<'_>,
+    inf: &mut Inferencer<'_, '_>,
     id: NodeId,
     call: &Call,
     callee: Option<(NodeId, Type)>,
@@ -335,7 +335,7 @@ fn reduce_type(a: Option<&Type>) -> Type {
 /// `get` with static selectors: integer indices consume array axes / pick
 /// tuple components; string keys pick record fields. Anything dynamic or
 /// sliced (`all` / `only` / axes) is deferred until the shape work.
-fn get_type(inf: &mut Inferencer<'_>, args: &[ArgInfo], base: i64) -> Type {
+fn get_type(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo], base: i64) -> Type {
     let Some((_, container, _)) = args.first() else {
         return Type::Deferred;
     };
@@ -376,7 +376,7 @@ fn get_type(inf: &mut Inferencer<'_>, args: &[ArgInfo], base: i64) -> Type {
 
 /// The element type of a set expression (`elementof` / `external` argument),
 /// read structurally — sets are not first-class in the type grammar.
-fn set_element_type(inf: &mut Inferencer<'_>, node: Option<NodeId>) -> Type {
+fn set_element_type(inf: &mut Inferencer<'_, '_>, node: Option<NodeId>) -> Type {
     let Some(node) = node else {
         return Type::Deferred;
     };
@@ -422,7 +422,7 @@ fn measure_domain(m: Option<&Type>) -> Type {
 /// `iid(M, n)`: n iid draws bundle into an array over M's domain. A literal
 /// count (or literal count vector) gives static dims; anything computed is
 /// dynamic until fixed-value const-eval lands (engine-concepts §17.1).
-fn iid_type(inf: &mut Inferencer<'_>, args: &[ArgInfo]) -> Type {
+fn iid_type(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> Type {
     let domain = match arg_ty(args, 0) {
         Some(Type::Measure { domain, .. }) => domain.as_ref().clone(),
         _ => return Type::Deferred,
@@ -441,7 +441,7 @@ fn iid_type(inf: &mut Inferencer<'_>, args: &[ArgInfo]) -> Type {
 
 /// The dims of an `iid` count argument: a vector literal contributes one dim
 /// per element, anything else a single dim (see [`resolve_dim`]).
-fn count_dims(inf: &mut Inferencer<'_>, node: NodeId) -> Box<[Dim]> {
+fn count_dims(inf: &mut Inferencer<'_, '_>, node: NodeId) -> Box<[Dim]> {
     if let Node::Call(c) = inf.module.node(node)
         && matches!(c.head, flatppl_core::CallHead::Builtin(op)
             if inf.module.resolve(op) == "vector")
@@ -454,7 +454,7 @@ fn count_dims(inf: &mut Inferencer<'_>, node: NodeId) -> Box<[Dim]> {
 
 /// A single shape dim: literal integers are static at every level; at
 /// `Level::Shape` the demand-driven fixed-integer resolver kicks in.
-fn resolve_dim(inf: &mut Inferencer<'_>, node: NodeId) -> Dim {
+fn resolve_dim(inf: &mut Inferencer<'_, '_>, node: NodeId) -> Dim {
     if let Node::Lit(Scalar::Int(n)) = inf.module.node(node) {
         return static_dim(*n);
     }
@@ -474,7 +474,7 @@ fn resolve_dim(inf: &mut Inferencer<'_>, node: NodeId) -> Dim {
 /// `None` means not statically resolvable — a non-fixed ancestor, or a
 /// value op outside this resolver's reach (legitimately `%dynamic` for now;
 /// the op-gap-vs-dynamic distinction hardens with the full §17.1 slice).
-fn resolve_fixed_int(inf: &mut Inferencer<'_>, node: NodeId, depth: u32) -> Option<i64> {
+fn resolve_fixed_int(inf: &mut Inferencer<'_, '_>, node: NodeId, depth: u32) -> Option<i64> {
     if depth > 64 {
         return None;
     }
@@ -551,7 +551,7 @@ fn joint_type(named: &[NamedInfo]) -> Type {
 /// `functionof` / `kernelof` (spec §04 reification, §11 reified callables).
 /// A `functionof` whose body is a measure *is* a kernel.
 fn reification_type(
-    inf: &mut Inferencer<'_>,
+    inf: &mut Inferencer<'_, '_>,
     id: NodeId,
     call: &Call,
     name: &str,
@@ -593,7 +593,7 @@ fn reification_type(
 /// `likelihoodof(K, obs)` — inputs ride over from the kernel; the obstype is
 /// the kernel's measure domain, recovered by looking through to the reified
 /// body (spec §11 `%likelihood`).
-fn likelihood_type(inf: &mut Inferencer<'_>, args: &[ArgInfo]) -> Type {
+fn likelihood_type(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> Type {
     let Some((k_node, Type::Kernel { inputs, .. }, _)) = args.first() else {
         return Type::Deferred;
     };
@@ -616,7 +616,7 @@ fn likelihood_type(inf: &mut Inferencer<'_>, args: &[ArgInfo]) -> Type {
 /// Calling a user-defined callable: a function returns its body's type, a
 /// kernel returns the *measure* its body denotes (`kernelof` reifies the law
 /// of a value-typed body).
-fn user_call_type(inf: &mut Inferencer<'_>, callee: NodeId, callee_ty: &Type) -> Type {
+fn user_call_type(inf: &mut Inferencer<'_, '_>, callee: NodeId, callee_ty: &Type) -> Type {
     match callee_ty {
         Type::Function { .. } => reified_result_type(inf, callee).unwrap_or(Type::Deferred),
         Type::Kernel { mass, .. } => match reified_result_type(inf, callee) {
@@ -636,7 +636,7 @@ fn user_call_type(inf: &mut Inferencer<'_>, callee: NodeId, callee_ty: &Type) ->
 
 /// Look through a callable expression (a `%ref` to a binding, or an inline
 /// reification) to its reified body node.
-fn reified_body(inf: &Inferencer<'_>, mut node: NodeId) -> Option<NodeId> {
+fn reified_body(inf: &Inferencer<'_, '_>, mut node: NodeId) -> Option<NodeId> {
     // Deref self-module refs to the bound RHS (already inferred — typing the
     // callee forced the binding).
     loop {
@@ -651,8 +651,15 @@ fn reified_body(inf: &Inferencer<'_>, mut node: NodeId) -> Option<NodeId> {
     }
 }
 
-/// The inferred type of a callable's reified body.
-fn reified_result_type(inf: &mut Inferencer<'_>, node: NodeId) -> Option<Type> {
+/// The inferred type of a callable's reified body. For a cross-module callable
+/// reference the body lives in the dependency's interner and is unreachable by
+/// node here, so its result type was carried over at resolution time and is
+/// read from the importer's side-table; for a local callable the body is found
+/// by node and looked up in the trace.
+fn reified_result_type(inf: &mut Inferencer<'_, '_>, node: NodeId) -> Option<Type> {
+    if let Some(result) = inf.module_callable_result(node) {
+        return Some(result.clone());
+    }
     let body = reified_body(inf, node)?;
     inf.lookup_type(body).cloned()
 }
@@ -662,7 +669,7 @@ fn reified_result_type(inf: &mut Inferencer<'_>, node: NodeId) -> Option<Type> {
 /// array; a kernel / distribution-constructor head yields a **measure over
 /// the array** of per-cell variates — that is why `draw` of a broadcast
 /// distribution produces the observation array.
-fn broadcast_type(inf: &mut Inferencer<'_>, args: &[ArgInfo], named: &[NamedInfo]) -> Type {
+fn broadcast_type(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo], named: &[NamedInfo]) -> Type {
     let Some((head_node, head_ty, _)) = args.first() else {
         return Type::Deferred;
     };
@@ -759,7 +766,7 @@ fn broadcast_type(inf: &mut Inferencer<'_>, args: &[ArgInfo], named: &[NamedInfo
 /// The variate domain of a spec-§08 distribution constructor, or `None` when
 /// the name is not a known distribution.
 fn distribution_domain(
-    inf: &mut Inferencer<'_>,
+    inf: &mut Inferencer<'_, '_>,
     name: &str,
     args: &[ArgInfo],
     named: &[NamedInfo],
@@ -812,7 +819,7 @@ fn distribution_domain(
 
 /// The static dim of a distribution's length-defining parameter (`mu`,
 /// `alpha`, `p`): its inferred type's single array dim, at `Level::Shape`.
-fn param_dim(inf: &Inferencer<'_>, args: &[ArgInfo], named: &[NamedInfo], kwarg: &str) -> Dim {
+fn param_dim(inf: &Inferencer<'_, '_>, args: &[ArgInfo], named: &[NamedInfo], kwarg: &str) -> Dim {
     if inf.level < Level::Shape {
         return Dim::Dynamic;
     }
@@ -854,7 +861,7 @@ pub(crate) fn const_valueset(name: &str) -> ValueSet {
 /// The value set of a call node: a measure node's support, a value node's
 /// strongest known containing set. Conservative — `Unknown` is always sound.
 pub(crate) fn call_valueset(
-    inf: &mut Inferencer<'_>,
+    inf: &mut Inferencer<'_, '_>,
     call: &Call,
     callee: Option<&(NodeId, Type)>,
     args: &[ArgInfo],
@@ -969,7 +976,7 @@ fn vector_dim(ty: Option<&Type>) -> Dim {
 
 /// A set *expression* (an `elementof` / `truncate` / reference-measure
 /// argument) read structurally into a [`ValueSet`].
-fn set_expr_valueset(inf: &mut Inferencer<'_>, node: Option<NodeId>) -> ValueSet {
+fn set_expr_valueset(inf: &mut Inferencer<'_, '_>, node: Option<NodeId>) -> ValueSet {
     let Some(node) = node else {
         return ValueSet::Unknown;
     };
@@ -1034,7 +1041,7 @@ fn set_expr_valueset(inf: &mut Inferencer<'_>, node: Option<NodeId>) -> ValueSet
 }
 
 /// A literal numeric bound (used by the `interval` reader above for `neg`).
-fn bound_of(inf: &Inferencer<'_>, node: Option<NodeId>) -> Option<f64> {
+fn bound_of(inf: &Inferencer<'_, '_>, node: Option<NodeId>) -> Option<f64> {
     match node.map(|n| inf.module.node(n)) {
         Some(Node::Lit(Scalar::Real(r))) => Some(*r),
         Some(Node::Lit(Scalar::Int(i))) => Some(*i as f64),
@@ -1046,7 +1053,7 @@ fn bound_of(inf: &Inferencer<'_>, node: Option<NodeId>) -> Option<f64> {
 /// The §08 Domain/Support column as a producer table: the support of a
 /// distribution constructor, or `Unknown` for a non-distribution.
 fn distribution_support(
-    inf: &mut Inferencer<'_>,
+    inf: &mut Inferencer<'_, '_>,
     name: &str,
     args: &[ArgInfo],
     named: &[NamedInfo],
@@ -1078,7 +1085,8 @@ fn distribution_support(
 /// composition rules. `normalize` on a measure with statically known zero or
 /// infinite mass is a static error (spec: the result is undefined).
 pub(crate) fn fill_mass(
-    inf: &mut Inferencer<'_>,
+    inf: &mut Inferencer<'_, '_>,
+    id: NodeId,
     call: &Call,
     callee: Option<&(NodeId, Type)>,
     ty: Type,
@@ -1167,13 +1175,15 @@ pub(crate) fn fill_mass(
         }
         "normalize" => match arg_mass(0) {
             Mass::Null => {
-                inf.diags.push(crate::Diagnostic::error(
+                inf.diags.push(crate::Diagnostic::error_at(
+                    id,
                     "`normalize` of a measure with zero total mass is undefined (spec §06)",
                 ));
                 return Type::Failed("normalize of a zero-mass measure".into());
             }
             Mass::LocallyFinite => {
-                inf.diags.push(crate::Diagnostic::error(
+                inf.diags.push(crate::Diagnostic::error_at(
+                    id,
                     "`normalize` of a measure with infinite total mass is undefined (spec §06)",
                 ));
                 return Type::Failed("normalize of an infinite-mass measure".into());

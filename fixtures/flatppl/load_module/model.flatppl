@@ -1,0 +1,9 @@
+a = elementof(reals)
+helpers = load_module("helpers.flatppl", center = a)
+
+b ~ Normal(mu = 0.0, sigma = 2.0)
+_combined = a + b
+
+input_data = 2.5
+
+L = likelihoodof(helpers.obs_kernel, input_data)
