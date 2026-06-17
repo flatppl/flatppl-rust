@@ -170,16 +170,16 @@ fn reports_malformed_input() {
 fn mass_and_valueset_strictness() {
     let cases = [
         // %mass is a required sub-form.
-        "(%module (%bind x (draw (%meta (%measure (%domain (%scalar real))) %fixed reals) (Normal 0 1))))",
-        "(%module (%bind k (functionof (%meta (%kernel (%inputs a)) %fixed %unknown) (%ref %local _a_) %specinputs ((a (%ref %local _a_))))))",
+        "(%module (%bind x (%meta ((%measure (%domain (%scalar real))) %fixed reals) (draw (Normal 0 1)))))",
+        "(%module (%bind k (%meta ((%kernel (%inputs a)) %fixed %unknown) (functionof (%ref %local _a_) %specinputs ((a (%ref %local _a_)))))))",
         // %meta takes exactly three slots.
-        "(%module (%bind x (add (%meta (%scalar real) %fixed) 1 2)))",
+        "(%module (%bind x (%meta ((%scalar real) %fixed) (add 1 2))))",
         // Unknown mass class / value set.
-        "(%module (%bind x (draw (%meta (%measure (%domain (%scalar real)) (%mass %tiny)) %fixed reals) (Normal 0 1))))",
-        "(%module (%bind x (add (%meta (%scalar real) %fixed %sometimes) 1 2)))",
+        "(%module (%bind x (%meta ((%measure (%domain (%scalar real)) (%mass %tiny)) %fixed reals) (draw (Normal 0 1)))))",
+        "(%module (%bind x (%meta ((%scalar real) %fixed %sometimes) (add 1 2))))",
         // Malformed set forms.
-        "(%module (%bind x (add (%meta (%scalar real) %fixed (stdsimplex)) 1 2)))",
-        "(%module (%bind x (add (%meta (%scalar real) %fixed (cartpow reals)) 1 2)))",
+        "(%module (%bind x (%meta ((%scalar real) %fixed (stdsimplex)) (add 1 2))))",
+        "(%module (%bind x (%meta ((%scalar real) %fixed (cartpow reals)) (add 1 2))))",
     ];
     for src in cases {
         assert!(read(src).is_err(), "should be rejected: {src}");
@@ -190,10 +190,10 @@ fn mass_and_valueset_strictness() {
 #[test]
 fn valueset_forms_roundtrip() {
     let src = r#"(%module
-  (%bind a (add (%meta (%scalar real) %fixed (interval 0.0 inf)) 1.0 2.0))
-  (%bind b (add (%meta (%scalar real) %fixed (stdsimplex %dynamic)) 1.0 2.0))
-  (%bind c (add (%meta (%scalar real) %fixed (cartpow posintegers 4)) 1.0 2.0))
-  (%bind d (add (%meta (%scalar real) %fixed anything) 1.0 2.0)))"#;
+  (%bind a (%meta ((%scalar real) %fixed (interval 0.0 inf)) (add 1.0 2.0)))
+  (%bind b (%meta ((%scalar real) %fixed (stdsimplex %dynamic)) (add 1.0 2.0)))
+  (%bind c (%meta ((%scalar real) %fixed (cartpow posintegers 4)) (add 1.0 2.0)))
+  (%bind d (%meta ((%scalar real) %fixed anything) (add 1.0 2.0))))"#;
     let m = read(src).unwrap();
     let out = write(&m);
     for needle in [

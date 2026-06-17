@@ -15,7 +15,8 @@
 //! **Round-trip contract.** `core → FlatPIR → core` is structure-preserving;
 //! `FlatPIR → core → FlatPIR` reaches a canonical fixpoint after the first
 //! write (whitespace/ordering normalized, semantics preserved). Annotations
-//! (`%meta` type/phase) live in side-tables and are emitted only when present.
+//! (the `%meta` type / phase / value-set wrapper) live in side-tables and are
+//! emitted only when present.
 
 mod error;
 mod json;

@@ -1,28 +1,29 @@
 ; Annotated FlatPIR — spec §11 annotated `helpers.flatpir` (%meta type/phase/valueset).
 ; Exercises %scalar, %kernel/%inputs/%mass, %measure/%domain/%mass, the three
 ; phases, and value-set slots (elementof sets, distribution supports).
+; `%meta` is a transparent wrapper around any expression (spec §11): the grouped
+; (<type> <phase> <valueset>) triple, then the wrapped expression.
 (%module
   (%public center spread obs_kernel shifted_value)
 
   (%bind center
-    (elementof (%meta (%scalar real) %parameterized reals) reals))
+    (%meta ((%scalar real) %parameterized reals) (elementof reals)))
 
   (%bind spread
-    (elementof (%meta (%scalar real) %parameterized posreals) posreals))
+    (%meta ((%scalar real) %parameterized posreals) (elementof posreals)))
 
   (%bind obs_kernel
-    (functionof
-      (%meta (%kernel (%inputs center spread x) (%mass %normalized)) %fixed %unknown)
-      (Normal (%meta (%measure (%domain (%scalar real)) (%mass %normalized))
-                     %parameterized reals)
-        (%kwarg mu (add (%meta (%scalar real) %parameterized reals)
-                        (%ref self center) (%ref %local _x_)))
-        (%kwarg sigma (%ref self spread)))
-      %specinputs
-      ((center (%ref self center))
-       (spread (%ref self spread))
-       (x (%ref %local _x_)))))
+    (%meta ((%kernel (%inputs center spread x) (%mass %normalized)) %fixed %unknown)
+      (functionof
+        (%meta ((%measure (%domain (%scalar real)) (%mass %normalized)) %parameterized reals)
+          (Normal
+            (%kwarg mu (%meta ((%scalar real) %parameterized reals)
+                         (add (%ref self center) (%ref %local _x_))))
+            (%kwarg sigma (%ref self spread))))
+        %specinputs
+        ((center (%ref self center))
+         (spread (%ref self spread))
+         (x (%ref %local _x_))))))
 
   (%bind shifted_value
-    (add (%meta (%scalar real) %parameterized reals)
-         (%ref self center) 1.0)))
+    (%meta ((%scalar real) %parameterized reals) (add (%ref self center) 1.0))))

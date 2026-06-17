@@ -6,8 +6,9 @@
 //! idempotent — `write(read(write(m)))  ==  write(m)` — which is the round-trip
 //! contract the tests pin (canonical fixpoint, not source fidelity).
 //!
-//! Annotations (`%meta` type/phase) are emitted only where the side-tables hold
-//! them; a bare (pre-inference) module writes no `%meta`.
+//! Annotations are emitted as a transparent `(%meta (<type> <phase> <valueset>)
+//! <expr>)` wrapper, only where the side-tables hold one for a node; a bare
+//! (pre-inference) module writes no `%meta`.
 
 use flatppl_core::{
     Axis, Call, CallHead, Dim, Doc, Inputs, Markup, Mass, Module, NamedKind, Node, NodeId, Phase,
@@ -70,7 +71,24 @@ fn render_doc(doc: &Doc) -> String {
     format!("({})", parts.join(" "))
 }
 
+/// Render a node, wrapping it in a `(%meta (<type> <phase> <valueset>) …)`
+/// annotation when warranted. `%meta` is a transparent wrapper that *can* go
+/// around any expression (spec §11), but serialization is **sparse**: we emit it
+/// only around composite expressions (calls, including reifications) and leave
+/// atomic leaves — literals, refs, consts, axes — bare, since their annotations
+/// are recoverable and the spec annotated example keeps them bare. A bare
+/// (pre-inference) node also renders without a wrapper.
 fn render_node(module: &Module, id: NodeId) -> String {
+    let inner = render_node_inner(module, id);
+    if matches!(module.node(id), Node::Call(_)) {
+        if let Some(triple) = render_meta(module, id) {
+            return format!("(%meta {triple} {inner})");
+        }
+    }
+    inner
+}
+
+fn render_node_inner(module: &Module, id: NodeId) -> String {
     match module.node(id) {
         Node::Lit(lit) => render_scalar(lit),
         Node::Const(sym) => module.resolve(*sym).to_string(),
@@ -151,11 +169,6 @@ fn render_call(module: &Module, id: NodeId, call: &Call) -> String {
         }
     }
 
-    // `(%meta <type> <phase>)` immediately after the head, if annotated.
-    if let Some(meta) = render_meta(module, id) {
-        parts.push(meta);
-    }
-
     // Positional arguments.
     for &arg in call.args.iter() {
         parts.push(render_node(module, arg));
@@ -205,8 +218,9 @@ fn render_input_entries(module: &Module, entries: &[(Symbol, Ref)]) -> String {
     format!("({})", inner.join(" "))
 }
 
-/// `(%meta <type> <phase>)`, or `None` when neither slot is annotated (canonical
-/// for a bare call: omit the form entirely).
+/// The grouped `(<type> <phase> <valueset>)` triple for a node's `%meta`
+/// wrapper, or `None` when no slot is annotated (canonical: omit the wrapper).
+/// The enclosing `(%meta … <expr>)` is added by [`render_node`].
 fn render_meta(module: &Module, id: NodeId) -> Option<String> {
     let ty = module.type_of(id);
     let phase = module.phase_of(id);
@@ -217,7 +231,7 @@ fn render_meta(module: &Module, id: NodeId) -> Option<String> {
     let ty_s = ty.map_or_else(|| "%deferred".to_string(), |t| render_type(module, t));
     let phase_s = phase.map_or("%deferred", render_phase);
     let vset_s = vset.map_or_else(|| "%deferred".to_string(), render_valueset);
-    Some(format!("(%meta {ty_s} {phase_s} {vset_s})"))
+    Some(format!("({ty_s} {phase_s} {vset_s})"))
 }
 
 fn render_mass(mass: Mass) -> &'static str {

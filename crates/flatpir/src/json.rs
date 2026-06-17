@@ -188,23 +188,22 @@ fn enc_list(items: &[Sexpr]) -> Value {
 }
 
 fn enc_meta(items: &[Sexpr]) -> Value {
+    // (%meta (<type> <phase> <valueset>) <expr>) — a transparent wrapper around
+    // any expression (spec §11). The triple is grouped; the wrapped expr follows.
+    let triple = items[1].as_list().expect("%meta triple is a list");
     json!({
-        "type": enc(&items[1]),
-        "phase": items[2].as_atom().expect("phase is a symbol"),
-        "valueset": enc(&items[3]),
+        "type": enc(&triple[0]),
+        "phase": triple[1].as_atom().expect("phase is a symbol"),
+        "valueset": enc(&triple[2]),
+        "expr": enc(&items[2]),
     })
 }
 
 fn enc_reified(head: &str, items: &[Sexpr]) -> Value {
-    // (functionof <meta?> <output> <origin> <inputs|%deferred>)
+    // (functionof <output> <origin> <inputs|%deferred>) — any `%meta` wraps the
+    // whole form externally, so it never appears as a leading operand here.
     let mut arr = vec![json!(head)];
-    let mut rest = &items[1..];
-    if let Some(first) = rest.first() {
-        if list_head(first) == Some("%meta") {
-            arr.push(enc(first));
-            rest = &rest[1..];
-        }
-    }
+    let rest = &items[1..];
     arr.push(enc(&rest[0])); // output
     let origin = rest[1].as_atom().expect("reification origin tag");
     let list = match rest[2].as_atom() {
@@ -417,10 +416,11 @@ fn emit_obj(o: &Map<String, Value>, depth: usize) -> Result<String> {
 
 fn emit_meta(m: &Map<String, Value>, depth: usize) -> Result<String> {
     Ok(format!(
-        "(%meta {} {} {})",
+        "(%meta ({} {} {}) {})",
         emit(get(m, "type", "%meta")?, depth + 1)?,
         as_str(get(m, "phase", "%meta")?, "a phase")?,
-        emit(get(m, "valueset", "%meta")?, depth + 1)?
+        emit(get(m, "valueset", "%meta")?, depth + 1)?,
+        emit(get(m, "expr", "%meta")?, depth + 1)?
     ))
 }
 

@@ -228,10 +228,10 @@ fn infer_emits_annotated_flatpir() {
     );
 
     let written = fs::read_to_string(&out_path).unwrap();
-    assert!(written.contains("(elementof (%meta (%scalar real) %parameterized reals) reals)"));
-    assert!(written.contains("(draw (%meta (%scalar real) %stochastic reals)"));
+    assert!(written.contains("(%meta ((%scalar real) %parameterized reals) (elementof reals))"));
+    assert!(written.contains("(%meta ((%scalar real) %stochastic reals) (draw "));
     assert!(
-        written.contains("(mystery (%meta %deferred %stochastic %unknown)"),
+        written.contains("(%meta (%deferred %stochastic %unknown) (mystery "),
         "got:\n{written}"
     );
 }

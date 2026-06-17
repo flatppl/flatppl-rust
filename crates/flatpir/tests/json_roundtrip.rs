@@ -130,8 +130,8 @@ fn annotated_meta_shape() {
 
     // `b ~ Normal(...)` — the draw carries a stochastic %meta on the call array.
     let b = &binds.iter().find(|b| b["name"] == "b").unwrap()["expr"];
-    assert_eq!(b[0], "draw");
-    assert_eq!(b[1]["%meta"]["phase"], "%stochastic");
+    assert_eq!(b["%meta"]["phase"], "%stochastic");
+    assert_eq!(b["%meta"]["expr"][0], "draw");
 }
 
 #[test]
@@ -154,11 +154,11 @@ fn type_grammar_roundtrip_and_headless_shape() {
     let src = "\
 (%module
   (%public a b c d e)
-  (%bind a (elementof (%meta (%array 2 (2 3) (%scalar real)) %parameterized reals) reals))
-  (%bind b (elementof (%meta (%tvector 3 (%scalar real)) %fixed reals) reals))
-  (%bind c (elementof (%meta (%record (mu (%scalar real)) (sigma (%scalar real))) %fixed %unknown) reals))
-  (%bind d (elementof (%meta (%tuple (%scalar real) (%scalar integer)) %fixed %unknown) reals))
-  (%bind e (elementof (%meta (%table (%columns (x (%scalar real))) (%nrows 10)) %fixed %unknown) reals)))";
+  (%bind a (%meta ((%array 2 (2 3) (%scalar real)) %parameterized reals) (elementof reals)))
+  (%bind b (%meta ((%tvector 3 (%scalar real)) %fixed reals) (elementof reals)))
+  (%bind c (%meta ((%record (mu (%scalar real)) (sigma (%scalar real))) %fixed %unknown) (elementof reals)))
+  (%bind d (%meta ((%tuple (%scalar real) (%scalar integer)) %fixed %unknown) (elementof reals)))
+  (%bind e (%meta ((%table (%columns (x (%scalar real))) (%nrows 10)) %fixed %unknown) (elementof reals))))";
 
     let m1 = read(src).unwrap();
     let j = to_json(&m1);
@@ -166,7 +166,7 @@ fn type_grammar_roundtrip_and_headless_shape() {
     assert_eq!(write(&m1), write(&m2), "type-grammar round-trip");
 
     // `a`'s %array type: ["%array", {int:2}, [{int:2},{int:3}], ["%scalar",…]]
-    let ty = &j["%module"]["binds"][0]["expr"][1]["%meta"]["type"];
+    let ty = &j["%module"]["binds"][0]["expr"]["%meta"]["type"];
     assert_eq!(ty[0], "%array");
     assert_eq!(ty[1]["int"], 2); // ndims is a tagged integer
     assert!(ty[2].is_array()); // the shape is a headless array …
@@ -233,8 +233,8 @@ fn hole_roundtrips() {
 fn partial_meta_deferred_slots() {
     // Only the phase slot is known; type and value-set are %deferred.
     let j = rt("(%module (%public a)\
-        (%bind a (elementof (%meta %deferred %parameterized %deferred) reals)))");
-    let meta = &j["%module"]["binds"][0]["expr"][1]["%meta"];
+        (%bind a (%meta (%deferred %parameterized %deferred) (elementof reals))))");
+    let meta = &j["%module"]["binds"][0]["expr"]["%meta"];
     assert_eq!(meta["type"]["const"], "%deferred");
     assert_eq!(meta["phase"], "%parameterized");
     assert_eq!(meta["valueset"]["const"], "%deferred");
@@ -243,11 +243,11 @@ fn partial_meta_deferred_slots() {
 #[test]
 fn mass_classes_and_valueset_forms() {
     let j = rt("(%module (%public p q r s)\
-        (%bind p (elementof (%meta (%measure (%domain (%scalar real)) (%mass %null)) %fixed reals) reals))\
-        (%bind q (elementof (%meta (%scalar real) %fixed (stdsimplex 3)) reals))\
-        (%bind r (elementof (%meta (%scalar real) %fixed (interval 0 1)) reals))\
-        (%bind s (elementof (%meta (%array 1 (%dynamic) (%scalar real)) %fixed (cartpow reals 4)) reals)))");
-    let b = |n: usize| j["%module"]["binds"][n]["expr"][1]["%meta"].clone();
+        (%bind p (%meta ((%measure (%domain (%scalar real)) (%mass %null)) %fixed reals) (elementof reals)))\
+        (%bind q (%meta ((%scalar real) %fixed (stdsimplex 3)) (elementof reals)))\
+        (%bind r (%meta ((%scalar real) %fixed (interval 0 1)) (elementof reals)))\
+        (%bind s (%meta ((%array 1 (%dynamic) (%scalar real)) %fixed (cartpow reals 4)) (elementof reals))))");
+    let b = |n: usize| j["%module"]["binds"][n]["expr"]["%meta"].clone();
     // mass class inside a %measure type
     assert_eq!(b(0)["type"][2], json!(["%mass", { "const": "%null" }]));
     // value-set slot forms
@@ -447,35 +447,35 @@ fn empty_public_roundtrips() {
 /// variant, plus a `bool:false` literal and a neutral `%axis`. The `%meta`
 /// slots need not agree with the bound expression — the reader does not
 /// typecheck meta against the expr — so each bind is a trivially-valid
-/// `(elementof (%meta …) <set>)`.
+/// `(%meta (…) (elementof <set>))`.
 #[test]
 fn all_type_valueset_mass_variants() {
     let src = "\
 (%module
   (%public fn lk rg vr fl an cx bf)
-  (%bind fn (elementof (%meta (%function (%inputs a)) %fixed %unknown) reals))
-  (%bind lk (elementof (%meta (%likelihood (%inputs a) (%obstype (%scalar boolean))) %fixed %unknown) reals))
-  (%bind rg (elementof (%meta %rngstate %fixed rngstates) rngstates))
-  (%bind vr (elementof (%meta %var3 %deferred %deferred) reals))
-  (%bind fl (elementof (%meta (%failed \"boom\") %fixed %unknown) reals))
-  (%bind an (elementof (%meta %any %fixed anything) reals))
-  (%bind cx (elementof (%meta (%scalar complex) %fixed complexes) complexes))
+  (%bind fn (%meta ((%function (%inputs a)) %fixed %unknown) (elementof reals)))
+  (%bind lk (%meta ((%likelihood (%inputs a) (%obstype (%scalar boolean))) %fixed %unknown) (elementof reals)))
+  (%bind rg (%meta (%rngstate %fixed rngstates) (elementof rngstates)))
+  (%bind vr (%meta (%var3 %deferred %deferred) (elementof reals)))
+  (%bind fl (%meta ((%failed \"boom\") %fixed %unknown) (elementof reals)))
+  (%bind an (%meta (%any %fixed anything) (elementof reals)))
+  (%bind cx (%meta ((%scalar complex) %fixed complexes) (elementof complexes)))
   (%bind bf false)
-  (%bind vs1 (elementof (%meta (%scalar real) %fixed posreals) posreals))
-  (%bind vs2 (elementof (%meta (%scalar real) %fixed nonnegreals) nonnegreals))
-  (%bind vs3 (elementof (%meta (%scalar real) %fixed unitinterval) unitinterval))
-  (%bind vs4 (elementof (%meta (%scalar integer) %fixed integers) integers))
-  (%bind vs5 (elementof (%meta (%scalar integer) %fixed posintegers) posintegers))
-  (%bind vs6 (elementof (%meta (%scalar integer) %fixed nonnegintegers) nonnegintegers))
-  (%bind vs7 (elementof (%meta (%scalar boolean) %fixed booleans) booleans))
-  (%bind vs8 (elementof (%meta (%scalar complex) %fixed complexes) complexes))
-  (%bind vs9 (elementof (%meta %rngstate %fixed rngstates) rngstates))
-  (%bind vs10 (elementof (%meta %any %fixed anything) anything))
-  (%bind ms1 (elementof (%meta (%measure (%domain (%scalar real)) (%mass %deferred)) %fixed reals) reals))
-  (%bind ms2 (elementof (%meta (%measure (%domain (%scalar real)) (%mass %normalized)) %fixed reals) reals))
-  (%bind ms3 (elementof (%meta (%measure (%domain (%scalar real)) (%mass %finite)) %fixed reals) reals))
-  (%bind ms4 (elementof (%meta (%measure (%domain (%scalar real)) (%mass %locallyfinite)) %fixed reals) reals))
-  (%bind ms5 (elementof (%meta (%measure (%domain (%scalar real)) (%mass %unknown)) %fixed reals) reals)))";
+  (%bind vs1 (%meta ((%scalar real) %fixed posreals) (elementof posreals)))
+  (%bind vs2 (%meta ((%scalar real) %fixed nonnegreals) (elementof nonnegreals)))
+  (%bind vs3 (%meta ((%scalar real) %fixed unitinterval) (elementof unitinterval)))
+  (%bind vs4 (%meta ((%scalar integer) %fixed integers) (elementof integers)))
+  (%bind vs5 (%meta ((%scalar integer) %fixed posintegers) (elementof posintegers)))
+  (%bind vs6 (%meta ((%scalar integer) %fixed nonnegintegers) (elementof nonnegintegers)))
+  (%bind vs7 (%meta ((%scalar boolean) %fixed booleans) (elementof booleans)))
+  (%bind vs8 (%meta ((%scalar complex) %fixed complexes) (elementof complexes)))
+  (%bind vs9 (%meta (%rngstate %fixed rngstates) (elementof rngstates)))
+  (%bind vs10 (%meta (%any %fixed anything) (elementof anything)))
+  (%bind ms1 (%meta ((%measure (%domain (%scalar real)) (%mass %deferred)) %fixed reals) (elementof reals)))
+  (%bind ms2 (%meta ((%measure (%domain (%scalar real)) (%mass %normalized)) %fixed reals) (elementof reals)))
+  (%bind ms3 (%meta ((%measure (%domain (%scalar real)) (%mass %finite)) %fixed reals) (elementof reals)))
+  (%bind ms4 (%meta ((%measure (%domain (%scalar real)) (%mass %locallyfinite)) %fixed reals) (elementof reals)))
+  (%bind ms5 (%meta ((%measure (%domain (%scalar real)) (%mass %unknown)) %fixed reals) (elementof reals))))";
 
     let j = rt(src);
     let binds = j["%module"]["binds"].as_array().unwrap();
@@ -483,7 +483,7 @@ fn all_type_valueset_mass_variants() {
         binds
             .iter()
             .find(|b| b["name"] == name)
-            .unwrap_or_else(|| panic!("no bind {name}"))["expr"][1]["%meta"]
+            .unwrap_or_else(|| panic!("no bind {name}"))["expr"]["%meta"]
             .clone()
     };
     let expr = |name: &str| {
@@ -592,8 +592,8 @@ fn interval_inf_bounds() {
     // `inf` / `-inf` bounds parse (via parse_bound) and round-trip. They encode
     // as bare `const` symbols inside an `["interval", …]` value-set form.
     let j = rt("(%module (%public a)\
-        (%bind a (elementof (%meta (%scalar real) %fixed (interval -inf inf)) reals)))");
-    let vs = &j["%module"]["binds"][0]["expr"][1]["%meta"]["valueset"];
+        (%bind a (%meta ((%scalar real) %fixed (interval -inf inf)) (elementof reals))))");
+    let vs = &j["%module"]["binds"][0]["expr"]["%meta"]["valueset"];
     assert_eq!(vs[0], "interval");
     assert_eq!(
         *vs,
@@ -644,8 +644,8 @@ fn rejects_deeply_nested_expr() {
 #[test]
 fn dynamic_dim_is_position_independent() {
     let j = rt("(%module (%public a)\
-        (%bind a (elementof (%meta (%array 2 (%dynamic 3) (%scalar real)) %fixed %unknown) reals)))");
-    let shape = &j["%module"]["binds"][0]["expr"][1]["%meta"]["type"][2];
+        (%bind a (%meta ((%array 2 (%dynamic 3) (%scalar real)) %fixed %unknown) (elementof reals))))");
+    let shape = &j["%module"]["binds"][0]["expr"]["%meta"]["type"][2];
     // headless list: dynamic-first dim and the static dim both tagged explicitly
     assert_eq!(*shape, json!([{ "%dynamic": true }, { "int": 3 }]));
 }

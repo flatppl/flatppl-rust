@@ -23,16 +23,15 @@ pub struct Module {
     by_name: HashMap<Symbol, BindingId>,
 
     // ---- annotation side-tables (empty until the producing pass fills them) ----
-    /// Inferred type per node (`flatppl-infer`). Mirrors the FlatPIR `%meta`
-    /// type slot, which rides on *calls* (spec §11).
+    /// Inferred type per node (`flatppl-infer`) — the FlatPIR `%meta` type slot.
+    /// `%meta` is a transparent wrapper around any expression (spec §11), so
+    /// annotations are keyed per node, not per call.
     types: SecondaryMap<NodeId, Type>,
-    /// Inferred phase per node (`flatppl-infer`). Per-node, not per-binding:
-    /// FlatPIR `%meta` annotates calls, and a binding's phase is just its RHS
-    /// node's phase (see [`Module::binding_phase`]).
+    /// Inferred phase per node (`flatppl-infer`). Per-node, not per-binding: a
+    /// binding's phase is just its RHS node's phase (see [`Module::binding_phase`]).
     phases: SecondaryMap<NodeId, Phase>,
-    /// Inferred value set per node (`flatppl-infer`): the strongest known set
-    /// containing the node's value (a measure node's support). The third
-    /// `%meta` slot.
+    /// Inferred value set per node (`flatppl-infer`): a sound set containing the
+    /// node's value (a measure node's support). The third `%meta` slot.
     valuesets: SecondaryMap<NodeId, ValueSet>,
     /// Source span per node (`flatppl-syntax`), for diagnostics / DAG back-refs.
     spans: SecondaryMap<NodeId, Span>,

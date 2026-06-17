@@ -3,7 +3,8 @@
 //! Interprets the generic [`Sexpr`](crate::sexpr) tree as FlatPIR: `(%module …)`
 //! with `(%public …)` and `(%bind …)` stanzas, expressions (built-in calls,
 //! `(%call (%ref …) …)` user calls, refs, axes, literals), and optional
-//! `(%meta <type> <phase> <valueset>)` annotations that populate the side-tables.
+//! `(%meta (<type> <phase> <valueset>) <expr>)` annotation wrappers that
+//! populate the side-tables.
 //!
 //! References carry only names (`(%ref self x)` → `Symbol`), so forward
 //! references resolve for free — no binding-ID fix-up pass.
@@ -216,6 +217,7 @@ fn read_list_expr(module: &mut Module, items: &[Sexpr], span: Span) -> Result<No
         "%uaxis" => read_axis_node(module, items, Some(Variance::Upper)),
         "%laxis" => read_axis_node(module, items, Some(Variance::Lower)),
         "%call" => read_user_call(module, items),
+        "%meta" => read_meta_wrapper(module, items, span),
         _ if head.starts_with('%') => Err(err(
             &items[0],
             format!("unexpected `{head}` as a call head"),
@@ -278,9 +280,7 @@ fn read_user_call(module: &mut Module, items: &[Sexpr]) -> Result<NodeId> {
         named: tail.named.into(),
         inputs: None,
     };
-    let id = module.alloc(Node::Call(call));
-    apply_meta(module, id, tail.meta);
-    Ok(id)
+    Ok(module.alloc(Node::Call(call)))
 }
 
 fn read_builtin_call(module: &mut Module, op: &str, rest: &[Sexpr]) -> Result<NodeId> {
@@ -295,28 +295,13 @@ fn read_builtin_call(module: &mut Module, op: &str, rest: &[Sexpr]) -> Result<No
         named: tail.named.into(),
         inputs: None,
     };
-    let id = module.alloc(Node::Call(call));
-    apply_meta(module, id, tail.meta);
-    Ok(id)
+    Ok(module.alloc(Node::Call(call)))
 }
 
 /// Read a `functionof` / `kernelof` form (spec §11 "Reified callables"):
-/// `(<op> [%meta] <output> %specinputs|%autoinputs <input-list>|%deferred)`.
+/// `(<op> <output> %specinputs|%autoinputs <input-list>|%deferred)`. A `%meta`
+/// annotation wraps the whole form and is handled by [`read_meta_wrapper`].
 fn read_reification(module: &mut Module, op: &str, rest: &[Sexpr]) -> Result<NodeId> {
-    // Optional `(%meta …)` immediately after the head.
-    let (meta, rest) = match rest.first() {
-        Some(first)
-            if first
-                .as_list()
-                .and_then(|l| l.first())
-                .and_then(Sexpr::as_atom)
-                == Some("%meta") =>
-        {
-            (parse_meta(module, first)?, &rest[1..])
-        }
-        _ => ((None, None, None), rest),
-    };
-
     if rest.len() != 3 {
         return Err(err_slice(
             rest,
@@ -357,7 +342,6 @@ fn read_reification(module: &mut Module, op: &str, rest: &[Sexpr]) -> Result<Nod
     if let Some(entries) = inferred {
         module.set_auto_inputs(id, entries);
     }
-    apply_meta(module, id, meta);
     Ok(id)
 }
 
@@ -392,7 +376,6 @@ fn parse_input_entries(module: &mut Module, form: &Sexpr) -> Result<Box<[(Symbol
 struct CallTail {
     args: Vec<NodeId>,
     named: Vec<NamedArg>,
-    meta: Meta,
 }
 
 /// The three `%meta` slots: type, phase, value set.
@@ -401,33 +384,29 @@ type Meta = (Option<Type>, Option<Phase>, Option<ValueSet>);
 fn parse_call_tail(module: &mut Module, items: &[Sexpr]) -> Result<CallTail> {
     let mut args = Vec::new();
     let mut named = Vec::new();
-    let mut meta = (None, None, None);
 
     for item in items {
         match tail_kind(item) {
-            TailKind::Meta => meta = parse_meta(module, item)?,
             TailKind::Named(kind) => named.push(parse_named(module, item, kind)?),
             TailKind::Expr => args.push(read_expr(module, item)?),
         }
     }
 
-    Ok(CallTail { args, named, meta })
+    Ok(CallTail { args, named })
 }
 
 enum TailKind {
-    Meta,
     Named(NamedKind),
     Expr,
 }
 
-/// Classify a call operand. Only `%meta` / `%kwarg` / `%field` / `%assign`
-/// forms are structural; everything else (including `(%ref …)`, `(%axis …)`,
-/// `(%call …)`, and built-in calls) is a positional expression.
+/// Classify a call operand. Only `%kwarg` / `%field` / `%assign` forms are
+/// structural; everything else (including `(%ref …)`, `(%axis …)`, `(%call …)`,
+/// a `(%meta …)` wrapper, and built-in calls) is a positional expression.
 fn tail_kind(item: &Sexpr) -> TailKind {
     if let SexprKind::List(inner) = &item.kind {
         if let Some(head) = inner.first().and_then(Sexpr::as_atom) {
             return match head {
-                "%meta" => TailKind::Meta,
                 "%kwarg" => TailKind::Named(NamedKind::Kwarg),
                 "%field" => TailKind::Named(NamedKind::Field),
                 "%assign" => TailKind::Named(NamedKind::Assign),
@@ -460,17 +439,43 @@ fn apply_meta(module: &mut Module, id: NodeId, meta: Meta) {
     }
 }
 
-fn parse_meta(module: &mut Module, item: &Sexpr) -> Result<Meta> {
-    let items = list(item)?;
-    if items.len() != 4 {
-        return Err(err(
-            item,
-            "(%meta <type> <phase> <valueset>) takes three slots",
+/// `(%meta (<type> <phase> <valueset>) <expr>)` — a transparent annotation
+/// wrapper (spec §11): parse the grouped triple, read the inner expression, and
+/// attach the annotation to the inner node. The wrapper adds no node and never
+/// directly wraps another `%meta`.
+fn read_meta_wrapper(module: &mut Module, items: &[Sexpr], span: Span) -> Result<NodeId> {
+    if items.len() != 3 {
+        return Err(err_at(
+            span,
+            "(%meta (<type> <phase> <valueset>) <expr>) takes a triple and one expression",
         ));
     }
-    let ty = read_type(module, &items[1])?;
-    let phase = read_phase(&items[2])?;
-    let set = read_valueset(&items[3])?;
+    let meta = parse_meta_triple(module, &items[1])?;
+    if items[2]
+        .as_list()
+        .and_then(|l| l.first())
+        .and_then(Sexpr::as_atom)
+        == Some("%meta")
+    {
+        return Err(err(
+            &items[2],
+            "a %meta wrapper must not directly wrap another %meta",
+        ));
+    }
+    let inner = read_expr(module, &items[2])?;
+    apply_meta(module, inner, meta);
+    Ok(inner)
+}
+
+/// Parse the grouped `(<type> <phase> <valueset>)` triple of a `%meta` wrapper.
+fn parse_meta_triple(module: &mut Module, form: &Sexpr) -> Result<Meta> {
+    let items = list(form)?;
+    if items.len() != 3 {
+        return Err(err(form, "a %meta triple is (<type> <phase> <valueset>)"));
+    }
+    let ty = read_type(module, &items[0])?;
+    let phase = read_phase(&items[1])?;
+    let set = read_valueset(&items[2])?;
     Ok((ty, phase, set))
 }
 
