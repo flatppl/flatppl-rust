@@ -136,6 +136,10 @@ pub(crate) fn call_rule(
         // normalization-level rules (inheriting it via the type clone would
         // smuggle the base's class through `fill_mass`).
         "truncate" | "normalize" => fresh_measure(arg_ty(args, 0)),
+        // `relabel(M, labels)` (spec §06) renames the variate; the value domain
+        // AND total mass are unchanged, so the measure type passes through whole
+        // (unlike normalize/truncate, which reset the mass slot).
+        "relabel" => arg_ty(args, 0).cloned().unwrap_or(Type::Deferred),
         // `weighted(weight, base)` / `logweighted(logweight, base)` (spec
         // §06): the measure is the SECOND argument.
         "weighted" | "logweighted" => fresh_measure(arg_ty(args, 1)),
