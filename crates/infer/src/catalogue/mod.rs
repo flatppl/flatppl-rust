@@ -3,12 +3,6 @@
 //! `lower` bridge to core inference types. Per-name *signatures* only;
 //! structural inference stays in `ops.rs`/`trace.rs`.
 
-// Module, Binding, ParamSig, ResultSig, DimExpr and the `degraded` field are
-// read-from-RON scaffolding for Tasks 5–8 (std-module dispatch, host catalogues).
-// They are parsed but not yet consumed by inference dispatch; suppress the lint
-// rather than delete the schema prematurely.
-#![allow(dead_code)]
-
 use std::sync::OnceLock;
 
 use serde::Deserialize;
@@ -29,7 +23,12 @@ pub(crate) struct Builtin {
     /// Honest-degrade note (design policy): set when this row's support/shape
     /// is a sound approximation of the spec §08 entry that the type system
     /// cannot express exactly (e.g. param-dependent integer-bounded supports).
+    ///
+    /// Parsed from RON for schema fidelity, but base-builtin degraded notes have
+    /// no runtime surfacing path (only standard-module notes are reported via
+    /// `module`), so the field is deserialized and never read.
     #[serde(default)]
+    #[allow(dead_code)]
     pub(crate) degraded: Option<String>,
 }
 
@@ -56,6 +55,10 @@ pub(crate) enum Sig {
         mass: MassTag,
     },
     Function {
+        // Declared parameter types: parsed from RON for schema fidelity, but
+        // `lower` does not type-check function arguments (result inference is
+        // structural over the call), so the field is never read.
+        #[allow(dead_code)]
         params: Vec<ParamSig>,
         result: ResultSig,
     },
@@ -117,7 +120,10 @@ pub(crate) enum MassTag {
     Unknown,
 }
 
+// Parameter-type tags: parsed alongside `Sig::Function.params` for RON schema
+// fidelity, but `lower` does not consult them, so the payloads are never read.
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub(crate) enum ParamSig {
     Scalar(ScalarTag),
     Vector(ScalarTag),
@@ -140,7 +146,11 @@ pub(crate) enum ResultSig {
     },
 }
 
+// Matrix dimension expressions: parsed for RON schema fidelity. Lowering maps
+// every `ResultSig::Matrix` to a dynamic-dim matrix (the type system has no
+// shape arithmetic), so the parameter indices are never read.
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub(crate) enum DimExpr {
     Dyn,
     OfParam(usize),
@@ -245,12 +255,6 @@ impl<'a> CatalogueSet<'a> {
         self.builtin
             .module_version(module)
             .or_else(|| self.external.iter().find_map(|c| c.module_version(module)))
-    }
-
-    /// Look up a base-distribution/function signature (built-in only; the
-    /// external catalogues carry standard-module bindings, not base names).
-    pub(crate) fn base(&self, name: &str) -> Option<&Sig> {
-        self.builtin.base(name)
     }
 
     /// Check for duplicate module names across all sources.  A name that
