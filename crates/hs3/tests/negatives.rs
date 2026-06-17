@@ -422,3 +422,21 @@ fn likelihood_data_ref_colliding_with_param_name_errs() {
         &["mu", "resolves to no datum"],
     );
 }
+
+#[test]
+fn same_variate_product_with_mixed_measures_errs() {
+    // A product over one observable `obs` of a continuous (gaussian, Lebesgue)
+    // and a discrete (poisson, counting) factor has no pointwise-density-product
+    // meaning — must fail loud, not emit a wrong measure (§12).
+    assert_err_hs3(
+        "mixed_measure_product",
+        r#"{"distributions":[
+            {"name":"prod","type":"product_dist","factors":["g","p"]},
+            {"name":"g","type":"gaussian_dist","mean":"mu","sigma":"s","x":"obs"},
+            {"name":"p","type":"poisson_dist","mean":"lam","x":"obs"}
+        ],"parameter_points":[{"name":"nom","entries":[
+            {"name":"mu","value":0.0},{"name":"s","value":1.0},{"name":"lam","value":3.0}
+        ]}]}"#,
+        "reference measure",
+    );
+}

@@ -10,8 +10,8 @@
 use crate::builder::Builder;
 use crate::dist_spec;
 use crate::distribution::{
-    VariateName, emit_distribution, emit_product, field_node, needs_hepphys, product_factors,
-    product_shared_variate, variate_name,
+    RefMeasure, VariateName, emit_distribution, emit_product, field_node, needs_hepphys,
+    product_factors, product_shared_variate, reference_measure, variate_name,
 };
 use crate::error::{Error, Result};
 use crate::expr;
@@ -348,6 +348,28 @@ fn emit_distributions(m: &mut Module, doc: &Document) -> Result<()> {
                     .iter()
                     .map(|f| dist_by_name.get(f.as_str()).and_then(|fd| variate_name(fd)))
                     .collect();
+                // A shared-observable product is a pointwise density product
+                // (§12), well-defined only when all factors share one reference
+                // measure. Reject mixed measures rather than emit a wrong one.
+                if product_shared_variate(&factor_variates) {
+                    let measures: Vec<RefMeasure> = product_factors(d)
+                        .iter()
+                        .map(|f| {
+                            dist_by_name
+                                .get(f.as_str())
+                                .map_or(RefMeasure::Other, |fd| reference_measure(&fd.kind))
+                        })
+                        .collect();
+                    let base = measures[0];
+                    if base == RefMeasure::Other || measures.iter().any(|m| *m != base) {
+                        return Err(Error::Unsupported(format!(
+                            "product_dist `{}` multiplies factors over the same observable, but \
+                             they do not share a known reference measure — a pointwise density \
+                             product is undefined across mixed measures (§12)",
+                            d.name
+                        )));
+                    }
+                }
                 let node = emit_product(&mut b, d, &factor_variates)?;
                 let doc_line = if product_shared_variate(&factor_variates) {
                     "HS3 product_dist (shared variate) → normalize(logweighted …): pointwise density product"
