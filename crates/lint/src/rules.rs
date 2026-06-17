@@ -37,7 +37,12 @@ pub(crate) fn native(module: &Module, cfg: &Config) -> Vec<Diagnostic> {
         // `shadows-builtin`: name collides with a built-in. `BUILTINS` is sorted
         // (generated from `keyword-lists.json`), so binary search beats a linear
         // scan — see the `builtins_sorted_and_unique` test.
-        if shadow_on && BUILTINS.binary_search(&name).is_ok() {
+        //
+        // `flatppl_compat` is the exception: it is a reserved name whose *purpose*
+        // is to be bound (spec §11 module version directive — every module may
+        // declare `flatppl_compat = "0.1"`), so binding it is correct use, not
+        // shadowing. Converters emit it as the leading binding.
+        if shadow_on && name != "flatppl_compat" && BUILTINS.binary_search(&name).is_ok() {
             push(
                 &mut out,
                 cfg,

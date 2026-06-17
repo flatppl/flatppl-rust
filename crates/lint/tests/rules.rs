@@ -76,6 +76,15 @@ fn flags_a_binding_that_shadows_a_builtin() {
     assert!(fired(src).contains(&RuleId::ShadowsBuiltin));
 }
 
+#[test]
+fn does_not_flag_flatppl_compat_directive() {
+    // `flatppl_compat` is a reserved name whose *purpose* is to be bound (spec §11
+    // module version directive), so binding it is correct use, not shadowing —
+    // every well-formed module and every converter-generated file may declare it.
+    let src = "flatppl_compat = \"0.1\"\n";
+    assert!(!fired(src).contains(&RuleId::ShadowsBuiltin));
+}
+
 /// The rules that fire when `missing-doc` is promoted to a warning (its default
 /// is `allow`, i.e. suppressed).
 fn fired_with_doc_enabled(src: &str) -> Vec<RuleId> {
