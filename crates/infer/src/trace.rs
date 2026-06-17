@@ -8,15 +8,20 @@
 use std::collections::{HashMap, HashSet};
 
 use flatppl_core::{
-    BindingId, Call, CallHead, Module, Node, NodeId, Phase, RefNs, Symbol, Type, ValueSet,
+    BindingId, Call, CallHead, Module, NamedKind, Node, NodeId, Phase, RefNs, Scalar, Symbol, Type,
+    ValueSet,
 };
 
+use crate::modules::InferSession;
 use crate::ops;
 use crate::{Diagnostic, Level};
 
-pub(crate) struct Inferencer<'m> {
+pub(crate) struct Inferencer<'m, 's> {
     pub(crate) module: &'m mut Module,
     pub(crate) level: Level,
+    /// Spans the dependency bundle; read by the `RefNs::Module` arm to resolve
+    /// cross-module references.
+    pub(crate) session: &'s InferSession<'s>,
     pub(crate) diags: Vec<Diagnostic>,
     /// Inferred types/phases/value-sets, local until the final level-aware
     /// flush (a `Level::Phase` run computes types internally but never
@@ -24,23 +29,64 @@ pub(crate) struct Inferencer<'m> {
     tys: HashMap<NodeId, Type>,
     phases: HashMap<NodeId, Phase>,
     vsets: HashMap<NodeId, ValueSet>,
+    /// Pre-seeded annotations for substituted input nodes: (type, phase,
+    /// valueset). Applied at the top of `infer_node` before any other logic,
+    /// making the substituted input authoritative for everything downstream.
+    seeds: HashMap<NodeId, (Type, Phase, ValueSet)>,
     /// Bindings on the active resolution path (cycle detection).
     in_progress: Vec<BindingId>,
     /// Ops already reported as catalogue gaps (one note per op).
     noted_gaps: HashSet<Symbol>,
+    /// For a cross-module callable reference (`helpers.obs_kernel`), the
+    /// dependency's inferred body-result type, keyed by the importer ref node.
+    /// `reified_result_type` consults this so applying a cross-module callable
+    /// reaches its body type — the body lives in the dependency's interner and
+    /// cannot be looked up by node here. Populated in the `RefNs::Module` arm.
+    module_callable_results: HashMap<NodeId, Type>,
 }
 
-impl<'m> Inferencer<'m> {
-    pub(crate) fn new(module: &'m mut Module, level: Level) -> Self {
+impl<'m, 's> Inferencer<'m, 's> {
+    pub(crate) fn new(module: &'m mut Module, level: Level, session: &'s InferSession<'s>) -> Self {
         Inferencer {
             module,
             level,
+            session,
             diags: Vec::new(),
             tys: HashMap::new(),
             phases: HashMap::new(),
             vsets: HashMap::new(),
+            seeds: HashMap::new(),
             in_progress: Vec::new(),
             noted_gaps: HashSet::new(),
+            module_callable_results: HashMap::new(),
+        }
+    }
+
+    /// Like `new`, but pre-seeds the given node annotations so that
+    /// substituted input nodes carry their importer-context types into the
+    /// dependency walk.
+    pub(crate) fn new_seeded(
+        module: &'m mut Module,
+        level: Level,
+        session: &'s InferSession<'s>,
+        seeds: &[(NodeId, crate::modules::Resolved)],
+    ) -> Self {
+        let seed_map = seeds
+            .iter()
+            .map(|(id, r)| (*id, (r.ty.clone(), r.phase, r.vset.clone())))
+            .collect();
+        Inferencer {
+            module,
+            level,
+            session,
+            diags: Vec::new(),
+            tys: HashMap::new(),
+            phases: HashMap::new(),
+            vsets: HashMap::new(),
+            seeds: seed_map,
+            in_progress: Vec::new(),
+            noted_gaps: HashSet::new(),
+            module_callable_results: HashMap::new(),
         }
     }
 
@@ -76,6 +122,11 @@ impl<'m> Inferencer<'m> {
                 self.module.set_valueset(id, set.clone());
             }
         }
+        // Drain dependency diagnostics accumulated during this run (cross-module
+        // cycle errors and other dep-level errors). `infer_dep` stores child
+        // diagnostics here after each dependency walk; draining ensures they
+        // propagate up through every level of the import chain.
+        self.diags.extend(self.session.drain_dep_diags());
         self.diags
     }
 
@@ -83,6 +134,13 @@ impl<'m> Inferencer<'m> {
     /// look through reified bodies).
     pub(crate) fn lookup_type(&self, id: NodeId) -> Option<&Type> {
         self.tys.get(&id)
+    }
+
+    /// The cross-module callable body-result type recorded for `id`, if `id`
+    /// is a `RefNs::Module` reference to a reified-callable binding. `None`
+    /// for local callables (their body is looked up by node instead).
+    pub(crate) fn module_callable_result(&self, id: NodeId) -> Option<&Type> {
+        self.module_callable_results.get(&id)
     }
 
     /// The inferred value set of an already-visited node (`Unknown` when the
@@ -133,6 +191,17 @@ impl<'m> Inferencer<'m> {
     /// annotates the module per level, and the FlatPIR writer projects
     /// `%meta` at call positions only (spec §11).
     pub(crate) fn infer_node(&mut self, id: NodeId) -> (Type, Phase) {
+        // Substitution seed: if this node was pre-seeded by a %assign
+        // substitution, write its annotation directly and return — making the
+        // input authoritative for everything downstream that references it.
+        if let Some((ty, phase, vset)) = self.seeds.get(&id).cloned() {
+            self.tys.insert(id, ty.clone());
+            self.phases.insert(id, phase);
+            if self.level >= Level::Valueset {
+                self.vsets.insert(id, vset);
+            }
+            return (ty, phase);
+        }
         if let (Some(ty), Some(phase)) = (self.tys.get(&id), self.phases.get(&id)) {
             return (ty.clone(), *phase);
         }
@@ -160,8 +229,10 @@ impl<'m> Inferencer<'m> {
                     }
                     None => {
                         let name = self.module.resolve(r.name).to_string();
-                        self.diags
-                            .push(Diagnostic::error(format!("unresolved reference `{name}`")));
+                        self.diags.push(Diagnostic::error_at(
+                            id,
+                            format!("unresolved reference `{name}`"),
+                        ));
                         (Type::Failed("unresolved reference".into()), Phase::Fixed)
                     }
                 },
@@ -171,15 +242,32 @@ impl<'m> Inferencer<'m> {
                     self.set_vset(id, ValueSet::Anything);
                     (Type::Any, Phase::Parameterized)
                 }
-                // Cross-module inference rides on load_module support, which
-                // is deferred until multi-file fixtures exist (see TODO).
-                RefNs::Module(_) => {
-                    self.note_once_str(
-                        "cross-module references are not inferred yet \
-                         (load_module support is deferred) — types left %deferred",
-                    );
-                    self.set_vset(id, ValueSet::Unknown);
-                    (Type::Deferred, Phase::Fixed)
+                RefNs::Module(alias) => {
+                    let binding_name = self.module.resolve(r.name).to_string();
+                    let subst_annos = self.subst_annos_for(alias);
+                    match self.session.resolve(
+                        &*self.module,
+                        alias,
+                        &binding_name,
+                        &subst_annos,
+                        self.level,
+                    ) {
+                        Ok(res) => {
+                            // Stash the dependency's callable body-result type
+                            // (if any) keyed by this ref node, so applying the
+                            // callable (`reified_result_type`) can reach it
+                            // across the interner boundary.
+                            if let Some(result) = res.result {
+                                self.module_callable_results.insert(id, result);
+                            }
+                            self.set_vset(id, res.vset);
+                            (res.ty, res.phase)
+                        }
+                        Err(message) => {
+                            self.diags.push(crate::Diagnostic::error_at(id, message));
+                            (Type::Failed("cross-module resolution".into()), Phase::Fixed)
+                        }
+                    }
                 }
             },
             Node::Hole | Node::Axis(_) => {
@@ -221,6 +309,8 @@ impl<'m> Inferencer<'m> {
             })
             .collect();
 
+        self.validate_load_assigns(call);
+
         // The §04 ancestor rule: a call's phase is the join of its inputs'
         // phases, except where the op itself introduces a phase.
         let joined = callee
@@ -237,11 +327,60 @@ impl<'m> Inferencer<'m> {
             self.set_vset(id, set);
         }
         let ty = if self.level >= Level::Normalization {
-            ops::fill_mass(self, call, callee.as_ref(), ty, &args, &named)
+            ops::fill_mass(self, id, call, callee.as_ref(), ty, &args, &named)
         } else {
             ty
         };
         (ty, phase)
+    }
+
+    /// Validate `%assign` substitution names on a `load_module` /
+    /// `standard_module` call. For each named `%assign` arg whose name is not
+    /// a known binding in the dependency, emits an anchored error on the
+    /// argument value node. No-op for every other call head or builtin op.
+    ///
+    /// The data needed from `call` is cloned out first so the borrow is
+    /// released before `self.diags.push` or `self.module.resolve` are called.
+    fn validate_load_assigns(&mut self, call: &Call) {
+        let load_check: Option<(String, Vec<(Symbol, NodeId)>)> =
+            if let CallHead::Builtin(head) = call.head {
+                let head_name = self.module.resolve(head).to_string();
+                if matches!(head_name.as_str(), "load_module" | "standard_module") {
+                    let path = call.args.first().and_then(|&a| {
+                        if let Node::Lit(Scalar::Str(s)) = self.module.node(a) {
+                            Some(s.to_string())
+                        } else {
+                            None
+                        }
+                    });
+                    let assigns: Vec<(Symbol, NodeId)> = call
+                        .named
+                        .iter()
+                        .filter(|n| n.kind == NamedKind::Assign)
+                        .map(|n| (n.name, n.value))
+                        .collect();
+                    path.map(|p| (p, assigns))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+        // `call` borrow is fully released — safe to push diagnostics.
+        if let Some((path, assigns)) = load_check {
+            if let Some(dep) = self.session.bundle.get(&path) {
+                for (name_sym, value_node) in assigns {
+                    let input = self.module.resolve(name_sym).to_string();
+                    let known = dep.bindings().any(|(_, b)| dep.resolve(b.name) == input);
+                    if !known {
+                        self.diags.push(Diagnostic::error_at(
+                            value_node,
+                            format!("module `{path}` has no input `{input}`"),
+                        ));
+                    }
+                }
+            }
+        }
     }
 
     /// Record a catalogue gap for `op`, once. Phase-only runs skip these —
@@ -263,6 +402,27 @@ impl<'m> Inferencer<'m> {
         if !self.diags.iter().any(|d| d.message == message) {
             self.diags.push(Diagnostic::note(message));
         }
+    }
+
+    /// Infer the substitution value nodes of `alias`'s load directive in this
+    /// (importer) module's context, returning `(input-name, Resolved)` pairs.
+    fn subst_annos_for(&mut self, alias: Symbol) -> Vec<(String, crate::modules::Resolved)> {
+        let subs = self.session.substitutions_of(self.module, alias);
+        subs.into_iter()
+            .map(|(name, value)| {
+                let (ty, phase) = self.infer_node(value);
+                let vset = self.lookup_valueset(value);
+                (
+                    name,
+                    crate::modules::Resolved {
+                        ty,
+                        phase,
+                        vset,
+                        result: None,
+                    },
+                )
+            })
+            .collect()
     }
 }
 

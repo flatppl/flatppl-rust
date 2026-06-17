@@ -1,7 +1,7 @@
 //! The [`Module`] — owns the IR arena, the bindings, the interner, and the
 //! (optional) annotation side-tables; exposes the read / build / annotate API.
 
-use crate::id::{Arena, BindingId, Interner, NodeId, SecondaryMap, Symbol};
+use crate::id::{Arena, BindingId, Idx, Interner, NodeId, SecondaryMap, Symbol};
 use crate::node::{Node, Ref};
 use crate::ty::{Phase, Type, ValueSet};
 use std::collections::HashMap;
@@ -179,6 +179,27 @@ impl Module {
         self.spans.insert(id, span);
     }
 
+    /// The innermost node whose span contains the byte `offset` — the node a
+    /// cursor at `offset` is "on". Returns the span with the smallest width
+    /// among all containing spans (so an argument wins over its enclosing
+    /// call). `None` if no node's span contains `offset`.
+    pub fn node_at_offset(&self, offset: u32) -> Option<NodeId> {
+        let mut best: Option<(NodeId, u32)> = None; // (node, width)
+        for i in 0..self.node_count() {
+            let id = NodeId::from_usize(i);
+            let Some(span) = self.span_of(id) else {
+                continue;
+            };
+            if offset >= span.start && offset < span.end {
+                let width = span.end - span.start;
+                if best.is_none_or(|(_, w)| width < w) {
+                    best = Some((id, width));
+                }
+            }
+        }
+        best.map(|(id, _)| id)
+    }
+
     /// The inferred input list of a boundary-less reification
     /// ([`Inputs::Auto`](crate::Inputs::Auto)), if phase inference has filled it.
     pub fn auto_inputs_of(&self, id: NodeId) -> Option<&[(Symbol, Ref)]> {
@@ -194,6 +215,29 @@ mod tests {
     use super::*;
     use crate::node::{Call, CallHead, Node, Scalar};
     use crate::ty::{ScalarType, Type};
+
+    #[test]
+    fn node_at_offset_returns_innermost() {
+        use crate::node::{Call, CallHead, Node, Scalar};
+        let mut m = Module::new();
+        // Build `add(7, 9)` with spans: call [0,9), `7` [4,5), `9` [7,8).
+        let seven = m.alloc(Node::Lit(Scalar::Int(7)));
+        m.set_span(seven, Span { start: 4, end: 5 });
+        let nine = m.alloc(Node::Lit(Scalar::Int(9)));
+        m.set_span(nine, Span { start: 7, end: 8 });
+        let add = m.intern("add");
+        let call = m.alloc(Node::Call(Call {
+            head: CallHead::Builtin(add),
+            args: vec![seven, nine].into(),
+            named: Vec::new().into(),
+            inputs: None,
+        }));
+        m.set_span(call, Span { start: 0, end: 9 });
+
+        assert_eq!(m.node_at_offset(4), Some(seven)); // inside `7` -> the literal
+        assert_eq!(m.node_at_offset(1), Some(call)); // on `add` text -> the call
+        assert_eq!(m.node_at_offset(99), None); // past end -> nothing
+    }
 
     #[test]
     fn build_access_traverse_annotate() {

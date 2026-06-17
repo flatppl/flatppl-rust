@@ -22,7 +22,7 @@ use std::collections::HashSet;
 
 use flatppl_core::{
     Axis, Binding, Call, CallHead, Doc as CoreDoc, Inputs, Markup, Module, NamedArg, NamedKind,
-    Node, NodeId, Ref, RefNs, Scalar, Variance,
+    Node, NodeId, Ref, RefNs, Scalar, Span, Variance,
 };
 
 use crate::error::{Error, Result};
@@ -32,6 +32,15 @@ use crate::token::{self, Doc, Token, TokenKind};
 /// zero-width Eof token).
 fn err_at(tok: &Token, message: impl Into<String>) -> Error {
     Error::at_span(tok.line, (tok.start, tok.end.max(tok.start + 1)), message)
+}
+
+/// The source span covering a whole statement's body tokens (first token start
+/// through last token end). Used to span synthetic nodes the statement layer
+/// introduces, which have no single natural token of their own.
+fn stmt_span(toks: &[Token]) -> Span {
+    let start = toks.first().map(|t| t.start).unwrap_or(0);
+    let end = toks.last().map(|t| t.end).unwrap_or(start);
+    Span { start, end }
 }
 
 /// Parse canonical FlatPPL surface text into a [`Module`].
@@ -296,7 +305,7 @@ fn lower_statement(module: &mut Module, stmt: &Stmt, names: &Names, synth: &mut 
             for p in &params {
                 ep.check_lambda_param(p)?;
             }
-            let rhs = ep.lower_lambda(params)?;
+            let rhs = ep.lower_lambda(params, 0)?;
             ep.expect_end()?;
             bind_name(module, &lhs[0], rhs, stmt.doc.as_ref(), synth);
             Ok(())
@@ -310,14 +319,14 @@ fn lower_statement(module: &mut Module, stmt: &Stmt, names: &Names, synth: &mut 
             let mut rhs = ep.parse_expr()?;
             ep.expect_end()?;
             if is_tilde {
-                rhs = wrap_draw(module, rhs);
+                rhs = wrap_draw(module, rhs, stmt_span(toks));
             }
             if lhs.len() == 1 {
                 bind_name(module, &lhs[0], rhs, stmt.doc.as_ref(), synth);
             } else if lhs.is_empty() {
                 return Err(err_at(&toks[0], "binding has no name"));
             } else {
-                lower_decomposition(module, &lhs, rhs, synth);
+                lower_decomposition(module, &lhs, rhs, synth, stmt_span(toks));
             }
             Ok(())
         }
@@ -369,15 +378,19 @@ fn bind_name(module: &mut Module, name: &str, rhs: NodeId, doc: Option<&Doc>, sy
     }
 }
 
-/// Wrap a measure node in `draw(…)` (the lowering of a `~` binding).
-fn wrap_draw(module: &mut Module, measure: NodeId) -> NodeId {
+/// Wrap a measure node in `draw(…)` (the lowering of a `~` binding). The
+/// synthetic `draw` call has no token of its own, so it takes the statement's
+/// span.
+fn wrap_draw(module: &mut Module, measure: NodeId, span: Span) -> NodeId {
     let draw = CallHead::Builtin(module.intern("draw"));
-    module.alloc(Node::Call(Call {
+    let id = module.alloc(Node::Call(Call {
         head: draw,
         args: Box::new([measure]),
         named: Box::new([]),
         inputs: None,
-    }))
+    }));
+    module.set_span(id, span);
+    id
 }
 
 fn add_simple_binding(module: &mut Module, name: &str, rhs: NodeId, doc: Option<&Doc>) {
@@ -397,7 +410,13 @@ fn add_simple_binding(module: &mut Module, name: &str, rhs: NodeId, doc: Option<
 /// each non-`_` target by 1-based position (`get(tmp, k)`). The shared `tmp`
 /// keeps every projection reading the *same* value — essential when the source
 /// is stochastic (re-evaluating it would redraw).
-fn lower_decomposition(module: &mut Module, names: &[String], source: NodeId, synth: &mut u32) {
+fn lower_decomposition(
+    module: &mut Module,
+    names: &[String],
+    source: NodeId,
+    synth: &mut u32,
+    span: Span,
+) {
     *synth += 1;
     let tmp_name = format!("__0x{:x}", *synth);
     let tmp_sym = module.intern(&tmp_name);
@@ -409,15 +428,19 @@ fn lower_decomposition(module: &mut Module, names: &[String], source: NodeId, sy
         synthetic: true,
     });
 
+    // The projection nodes are synthetic (no token of their own), so each takes
+    // the originating statement's span.
     for (k, name) in names.iter().enumerate() {
         if name == "_" {
             continue; // discard this component
         }
         let idx = module.alloc(Node::Lit(Scalar::Int((k + 1) as i64)));
+        module.set_span(idx, span);
         let tmp_ref = module.alloc(Node::Ref(Ref {
             ns: RefNs::SelfMod,
             name: tmp_sym,
         }));
+        module.set_span(tmp_ref, span);
         let get = CallHead::Builtin(module.intern("get"));
         let proj = module.alloc(Node::Call(Call {
             head: get,
@@ -425,6 +448,7 @@ fn lower_decomposition(module: &mut Module, names: &[String], source: NodeId, sy
             named: Box::new([]),
             inputs: None,
         }));
+        module.set_span(proj, span);
         add_simple_binding(module, name, proj, None);
     }
 }
@@ -553,14 +577,33 @@ impl<'a> ExprParser<'a> {
 
     // ---- node constructors ----
 
-    fn builtin_call(&mut self, op: &str, args: Vec<NodeId>) -> NodeId {
+    /// Allocate `node` and record its source span as
+    /// `[toks[start].start, toks[self.pos - 1].end)` — from the first token of
+    /// the (sub)expression that began at token index `start` through the last
+    /// token consumed. Token offsets are absolute into the original source.
+    fn alloc_spanned(&mut self, node: Node, start: usize) -> NodeId {
+        let id = self.module.alloc(node);
+        let lo = self.toks[start].start;
+        let hi = self
+            .toks
+            .get(self.pos.saturating_sub(1))
+            .map(|t| t.end)
+            .unwrap_or(lo);
+        self.module.set_span(id, Span { start: lo, end: hi });
+        id
+    }
+
+    fn builtin_call(&mut self, op: &str, args: Vec<NodeId>, start: usize) -> NodeId {
         let head = CallHead::Builtin(self.module.intern(op));
-        self.module.alloc(Node::Call(Call {
-            head,
-            args: args.into(),
-            named: Box::new([]),
-            inputs: None,
-        }))
+        self.alloc_spanned(
+            Node::Call(Call {
+                head,
+                args: args.into(),
+                named: Box::new([]),
+                inputs: None,
+            }),
+            start,
+        )
     }
 
     // ---- precedence levels (low → high) ----
@@ -568,8 +611,9 @@ impl<'a> ExprParser<'a> {
     fn parse_expr(&mut self) -> Result<NodeId> {
         // Lambdas sit at the lowest precedence; the body extends as far right
         // as possible (spec §05).
+        let start = self.pos;
         if let Some(params) = self.try_lambda_params()? {
-            return self.lower_lambda(params);
+            return self.lower_lambda(params, start);
         }
         self.parse_or()
     }
@@ -637,7 +681,7 @@ impl<'a> ExprParser<'a> {
     /// Lambda sugar (spec §04): `x -> expr` resolves to
     /// `functionof(expr', x = _x_)` where free occurrences of `x` in `expr`
     /// are rewritten to the placeholder `_x_`.
-    fn lower_lambda(&mut self, params: Vec<String>) -> Result<NodeId> {
+    fn lower_lambda(&mut self, params: Vec<String>, start: usize) -> Result<NodeId> {
         self.reify_frames.push(ReifyFrame::Lambda(params.clone()));
         let body = self.parse_expr();
         self.reify_frames.pop();
@@ -656,19 +700,22 @@ impl<'a> ExprParser<'a> {
             ));
         }
         let head = CallHead::Builtin(self.module.intern("functionof"));
-        Ok(self.module.alloc(Node::Call(Call {
-            head,
-            args: Box::new([body]),
-            named: Box::new([]),
-            inputs: Some(Inputs::Spec(entries.into())),
-        })))
+        Ok(self.alloc_spanned(
+            Node::Call(Call {
+                head,
+                args: Box::new([body]),
+                named: Box::new([]),
+                inputs: Some(Inputs::Spec(entries.into())),
+            }),
+            start,
+        ))
     }
 
     /// `fn(expr)` hole sugar (spec §04): each `_` in `expr` becomes a distinct
     /// positional input `arg<n>` in left-to-right reading order, lowering to
     /// `functionof(expr', arg1 = _arg1_, …)`. The `fn(…)` call delimits the
     /// hole scope. The opening `(` has already been consumed.
-    fn lower_fn(&mut self) -> Result<NodeId> {
+    fn lower_fn(&mut self, start: usize) -> Result<NodeId> {
         self.reify_frames.push(ReifyFrame::Fn(Vec::new()));
         let body = self.parse_expr();
         let Some(ReifyFrame::Fn(entries)) = self.reify_frames.pop() else {
@@ -680,27 +727,31 @@ impl<'a> ExprParser<'a> {
             return Err(self.err_prev("`fn(…)` requires at least one `_` hole in its expression"));
         }
         let head = CallHead::Builtin(self.module.intern("functionof"));
-        Ok(self.module.alloc(Node::Call(Call {
-            head,
-            args: Box::new([body]),
-            named: Box::new([]),
-            inputs: Some(Inputs::Spec(entries.into())),
-        })))
+        Ok(self.alloc_spanned(
+            Node::Call(Call {
+                head,
+                args: Box::new([body]),
+                named: Box::new([]),
+                inputs: Some(Inputs::Spec(entries.into())),
+            }),
+            start,
+        ))
     }
 
     fn parse_or(&mut self) -> Result<NodeId> {
+        let start = self.pos;
         let mut lhs = self.parse_and()?;
         loop {
             match self.peek() {
                 Some(TokenKind::PipePipe) => {
                     self.advance();
                     let rhs = self.parse_and()?;
-                    lhs = self.builtin_call("lor", vec![lhs, rhs]);
+                    lhs = self.builtin_call("lor", vec![lhs, rhs], start);
                 }
                 Some(TokenKind::DotPipePipe) => {
                     self.advance();
                     let rhs = self.parse_and()?;
-                    lhs = self.broadcast_op("lor", lhs, rhs);
+                    lhs = self.broadcast_op("lor", lhs, rhs, start);
                 }
                 _ => return Ok(lhs),
             }
@@ -708,18 +759,19 @@ impl<'a> ExprParser<'a> {
     }
 
     fn parse_and(&mut self) -> Result<NodeId> {
+        let start = self.pos;
         let mut lhs = self.parse_cmp()?;
         loop {
             match self.peek() {
                 Some(TokenKind::AmpAmp) => {
                     self.advance();
                     let rhs = self.parse_cmp()?;
-                    lhs = self.builtin_call("land", vec![lhs, rhs]);
+                    lhs = self.builtin_call("land", vec![lhs, rhs], start);
                 }
                 Some(TokenKind::DotAmpAmp) => {
                     self.advance();
                     let rhs = self.parse_cmp()?;
-                    lhs = self.broadcast_op("land", lhs, rhs);
+                    lhs = self.broadcast_op("land", lhs, rhs, start);
                 }
                 _ => return Ok(lhs),
             }
@@ -728,6 +780,7 @@ impl<'a> ExprParser<'a> {
 
     /// Comparisons chain: `a < b <= c` lowers to `land(lt(a,b), le(b,c))`.
     fn parse_cmp(&mut self) -> Result<NodeId> {
+        let start = self.pos;
         let first = self.parse_add()?;
         let mut operands = vec![first];
         let mut ops: Vec<&'static str> = Vec::new();
@@ -748,9 +801,9 @@ impl<'a> ExprParser<'a> {
             let rhs = operands.pop().unwrap();
             let lhs = operands.pop().unwrap();
             return Ok(if dotted {
-                self.broadcast_op(ops[0], lhs, rhs)
+                self.broadcast_op(ops[0], lhs, rhs, start)
             } else {
-                self.builtin_call(ops[0], vec![lhs, rhs])
+                self.builtin_call(ops[0], vec![lhs, rhs], start)
             });
         }
         // Chained: AND together each adjacent comparison (plain only; dotted
@@ -760,17 +813,18 @@ impl<'a> ExprParser<'a> {
         }
         let mut terms = Vec::with_capacity(ops.len());
         for (k, func) in ops.iter().enumerate() {
-            let pair = self.builtin_call(func, vec![operands[k], operands[k + 1]]);
+            let pair = self.builtin_call(func, vec![operands[k], operands[k + 1]], start);
             terms.push(pair);
         }
         let mut acc = terms[0];
         for &t in &terms[1..] {
-            acc = self.builtin_call("land", vec![acc, t]);
+            acc = self.builtin_call("land", vec![acc, t], start);
         }
         Ok(acc)
     }
 
     fn parse_add(&mut self) -> Result<NodeId> {
+        let start = self.pos;
         let mut lhs = self.parse_mul()?;
         loop {
             let (func, dotted) = match self.peek() {
@@ -782,11 +836,12 @@ impl<'a> ExprParser<'a> {
             };
             self.advance();
             let rhs = self.parse_mul()?;
-            lhs = self.apply_binop(func, dotted, lhs, rhs);
+            lhs = self.apply_binop(func, dotted, lhs, rhs, start);
         }
     }
 
     fn parse_mul(&mut self) -> Result<NodeId> {
+        let start = self.pos;
         let mut lhs = self.parse_unary()?;
         loop {
             let (func, dotted) = match self.peek() {
@@ -798,31 +853,32 @@ impl<'a> ExprParser<'a> {
             };
             self.advance();
             let rhs = self.parse_unary()?;
-            lhs = self.apply_binop(func, dotted, lhs, rhs);
+            lhs = self.apply_binop(func, dotted, lhs, rhs, start);
         }
     }
 
     fn parse_unary(&mut self) -> Result<NodeId> {
+        let start = self.pos;
         match self.peek() {
             Some(TokenKind::Minus) => {
                 self.advance();
                 let operand = self.parse_unary()?;
-                Ok(self.builtin_call("neg", vec![operand]))
+                Ok(self.builtin_call("neg", vec![operand], start))
             }
             Some(TokenKind::Bang) => {
                 self.advance();
                 let operand = self.parse_unary()?;
-                Ok(self.builtin_call("lnot", vec![operand]))
+                Ok(self.builtin_call("lnot", vec![operand], start))
             }
             Some(TokenKind::DotMinus) => {
                 self.advance();
                 let operand = self.parse_unary()?;
-                Ok(self.broadcast_unop("neg", operand))
+                Ok(self.broadcast_unop("neg", operand, start))
             }
             Some(TokenKind::DotBang) => {
                 self.advance();
                 let operand = self.parse_unary()?;
-                Ok(self.broadcast_unop("lnot", operand))
+                Ok(self.broadcast_unop("lnot", operand, start))
             }
             _ => self.parse_exp(),
         }
@@ -831,23 +887,25 @@ impl<'a> ExprParser<'a> {
     /// `^` is right-associative and binds tighter than unary minus (its RHS is a
     /// `Unary`, so `a ^ -b` and `a ^ b ^ c` parse as in the spec).
     fn parse_exp(&mut self) -> Result<NodeId> {
+        let start = self.pos;
         let base = self.parse_postfix()?;
         match self.peek() {
             Some(TokenKind::Caret) => {
                 self.advance();
                 let exp = self.parse_unary()?;
-                Ok(self.builtin_call("pow", vec![base, exp]))
+                Ok(self.builtin_call("pow", vec![base, exp], start))
             }
             Some(TokenKind::DotCaret) => {
                 self.advance();
                 let exp = self.parse_unary()?;
-                Ok(self.broadcast_op("pow", base, exp))
+                Ok(self.broadcast_op("pow", base, exp, start))
             }
             _ => Ok(base),
         }
     }
 
     fn parse_postfix(&mut self) -> Result<NodeId> {
+        let start = self.pos;
         let mut expr = self.parse_primary()?;
         loop {
             match self.peek() {
@@ -859,13 +917,12 @@ impl<'a> ExprParser<'a> {
                     // are namespaces, so the access lowers to a ref or call
                     // head, never to `get` (spec §04 / §07).
                     if let Some(ns) = self.member_namespace(expr) {
-                        expr = self.lower_member(ns, &name)?;
+                        expr = self.lower_member(ns, &name, start)?;
                     } else {
                         // Field access `obj.name` → `get(obj, "name")`.
                         let key = self
-                            .module
-                            .alloc(Node::Lit(Scalar::Str(name.into_boxed_str())));
-                        expr = self.builtin_call("get", vec![expr, key]);
+                            .alloc_spanned(Node::Lit(Scalar::Str(name.into_boxed_str())), start);
+                        expr = self.builtin_call("get", vec![expr, key], start);
                     }
                 }
                 Some(TokenKind::LBracket) => {
@@ -874,7 +931,7 @@ impl<'a> ExprParser<'a> {
                     let mut args = vec![expr];
                     self.parse_index_args(&mut args)?;
                     self.expect(&TokenKind::RBracket, "`]` to close indexing")?;
-                    expr = self.builtin_call("get", args);
+                    expr = self.builtin_call("get", args, start);
                 }
                 Some(TokenKind::DotLParen) => {
                     // Dot-call `f.(args)` → `broadcast(f, args…)`.
@@ -884,12 +941,15 @@ impl<'a> ExprParser<'a> {
                     let mut args = vec![expr];
                     args.append(&mut positional);
                     let head = CallHead::Builtin(self.module.intern("broadcast"));
-                    expr = self.module.alloc(Node::Call(Call {
-                        head,
-                        args: args.into(),
-                        named: named.into(),
-                        inputs: None,
-                    }));
+                    expr = self.alloc_spanned(
+                        Node::Call(Call {
+                            head,
+                            args: args.into(),
+                            named: named.into(),
+                            inputs: None,
+                        }),
+                        start,
+                    );
                 }
                 Some(TokenKind::LParen) => {
                     // Postfix application (spec §05 `Postfix Call`): the
@@ -901,7 +961,7 @@ impl<'a> ExprParser<'a> {
                     self.advance();
                     let (positional, named) = self.parse_call_args()?;
                     self.expect(&TokenKind::RParen, "`)` to close the call")?;
-                    expr = self.make_applied_call(expr, positional, named);
+                    expr = self.make_applied_call(expr, positional, named, start);
                 }
                 _ => return Ok(expr),
             }
@@ -916,7 +976,8 @@ impl<'a> ExprParser<'a> {
                 Some(TokenKind::Colon) => {
                     self.advance();
                     let sym = self.module.intern("all");
-                    args.push(self.module.alloc(Node::Const(sym)));
+                    let id = self.alloc_spanned(Node::Const(sym), self.pos - 1);
+                    args.push(id);
                 }
                 // `!` immediately before `,` / `]` is the `only` selector
                 // (unique element of a length-1 axis); otherwise it starts a
@@ -929,7 +990,8 @@ impl<'a> ExprParser<'a> {
                 {
                     self.advance();
                     let sym = self.module.intern("only");
-                    args.push(self.module.alloc(Node::Const(sym)));
+                    let id = self.alloc_spanned(Node::Const(sym), self.pos - 1);
+                    args.push(id);
                 }
                 _ => {
                     let idx = self.parse_expr()?;
@@ -943,28 +1005,27 @@ impl<'a> ExprParser<'a> {
     }
 
     fn parse_primary(&mut self) -> Result<NodeId> {
+        let start = self.pos;
         match self.peek() {
             Some(TokenKind::Int(n)) => {
                 let n = *n;
                 self.advance();
-                Ok(self.module.alloc(Node::Lit(Scalar::Int(n))))
+                Ok(self.alloc_spanned(Node::Lit(Scalar::Int(n)), start))
             }
             Some(TokenKind::Real(r)) => {
                 let r = *r;
                 self.advance();
-                Ok(self.module.alloc(Node::Lit(Scalar::Real(r))))
+                Ok(self.alloc_spanned(Node::Lit(Scalar::Real(r)), start))
             }
             Some(TokenKind::Str(s)) => {
                 let s = s.clone();
                 self.advance();
-                Ok(self
-                    .module
-                    .alloc(Node::Lit(Scalar::Str(s.into_boxed_str()))))
+                Ok(self.alloc_spanned(Node::Lit(Scalar::Str(s.into_boxed_str())), start))
             }
             Some(TokenKind::Name(n)) => {
                 let n = n.clone();
                 self.advance();
-                self.parse_name_tail(n)
+                self.parse_name_tail(n, start)
             }
             Some(TokenKind::LParen) => self.parse_paren_or_tuple(),
             Some(TokenKind::LBracket) => self.parse_array(),
@@ -978,6 +1039,7 @@ impl<'a> ExprParser<'a> {
     }
 
     fn parse_axis_node(&mut self) -> Result<NodeId> {
+        let start = self.pos;
         self.advance(); // .
         let mut name = self.expect_name("an axis name after `.`")?;
         // Variance markers (spec §05 axis names): a trailing `_` in the lexed
@@ -998,32 +1060,38 @@ impl<'a> ExprParser<'a> {
             )));
         }
         let sym = self.module.intern(&name);
-        Ok(self.module.alloc(Node::Axis(Axis {
-            name: sym,
-            variance,
-        })))
+        Ok(self.alloc_spanned(
+            Node::Axis(Axis {
+                name: sym,
+                variance,
+            }),
+            start,
+        ))
     }
 
     /// Parse `[.i, .k] := <body>` (the LHS bracket onward) into
     /// `aggregate(sum, [.i, .k], <body>)`. Position starts at the `[`.
     fn parse_aggregate(&mut self) -> Result<NodeId> {
+        let start = self.pos;
         let (axes_vec, body) = self.parse_axes_walrus_body()?;
         let sum_sym = self.module.intern("sum");
-        let sum = self.module.alloc(Node::Const(sum_sym));
-        Ok(self.builtin_call("aggregate", vec![sum, axes_vec, body]))
+        let sum = self.alloc_spanned(Node::Const(sum_sym), start);
+        Ok(self.builtin_call("aggregate", vec![sum, axes_vec, body], start))
     }
 
     /// Parse `[.axes…] := <body>` (the result-name bracket onward) into
     /// `metricsum(metric, [.axes…], <body>)` (spec §04 metricsum shorthand).
     fn parse_metricsum(&mut self, metric: &str) -> Result<NodeId> {
-        let metric_node = self.resolve_bare_name(metric);
+        let start = self.pos;
+        let metric_node = self.resolve_bare_name(metric, start);
         let (axes_vec, body) = self.parse_axes_walrus_body()?;
-        Ok(self.builtin_call("metricsum", vec![metric_node, axes_vec, body]))
+        Ok(self.builtin_call("metricsum", vec![metric_node, axes_vec, body], start))
     }
 
     /// The shared `[.i, .k] := <body>` tail of `:=` statements: the axis list
     /// (possibly empty) as a `vector` literal, and the body expression.
     fn parse_axes_walrus_body(&mut self) -> Result<(NodeId, NodeId)> {
+        let start = self.pos;
         self.expect(&TokenKind::LBracket, "`[` to open the axis list")?;
         let mut axes = Vec::new();
         while !matches!(self.peek(), Some(TokenKind::RBracket)) {
@@ -1033,15 +1101,20 @@ impl<'a> ExprParser<'a> {
             }
         }
         self.expect(&TokenKind::RBracket, "`]` to close the axis list")?;
+        // The `vector` of axes spans only the bracket list, not the body.
+        let axes_end = self.pos;
         self.expect(&TokenKind::Walrus, "`:=`")?;
         let body = self.parse_expr()?;
-        let axes_vec = self.builtin_call("vector", axes);
+        let saved = self.pos;
+        self.pos = axes_end;
+        let axes_vec = self.builtin_call("vector", axes, start);
+        self.pos = saved;
         Ok((axes_vec, body))
     }
 
     /// Resolve a bare (non-call) name: a module binding is a self-ref,
     /// anything else a built-in constant.
-    fn resolve_bare_name(&mut self, name: &str) -> NodeId {
+    fn resolve_bare_name(&mut self, name: &str, start: usize) -> NodeId {
         let sym = self.module.intern(name);
         let node = if self.names.bound.contains(name) {
             Node::Ref(Ref {
@@ -1051,7 +1124,7 @@ impl<'a> ExprParser<'a> {
         } else {
             Node::Const(sym)
         };
-        self.module.alloc(node)
+        self.alloc_spanned(node, start)
     }
 
     /// If `expr` is a bare name that opens a namespace — the reserved `self` /
@@ -1079,7 +1152,7 @@ impl<'a> ExprParser<'a> {
     /// Lower `<ns>.<name>` — optionally followed by a call — to a ref, a bare
     /// built-in constant, or a call through the namespace. `base.foo` always
     /// denotes the built-in and lowers to the bare form (spec §11).
-    fn lower_member(&mut self, ns: MemberNs, name: &str) -> Result<NodeId> {
+    fn lower_member(&mut self, ns: MemberNs, name: &str, start: usize) -> Result<NodeId> {
         let is_call = self.eat(&TokenKind::LParen);
         if let MemberNs::Base = ns {
             return if is_call {
@@ -1095,10 +1168,10 @@ impl<'a> ExprParser<'a> {
                 }
                 let (positional, named) = args?;
                 self.expect(&TokenKind::RParen, "`)` to close the call")?;
-                self.make_builtin_call(name, positional, named)
+                self.make_builtin_call(name, positional, named, start)
             } else {
                 let sym = self.module.intern(name);
-                Ok(self.module.alloc(Node::Const(sym)))
+                Ok(self.alloc_spanned(Node::Const(sym), start))
             };
         }
         let name_sym = self.module.intern(name);
@@ -1113,20 +1186,21 @@ impl<'a> ExprParser<'a> {
         if is_call {
             let (positional, named) = self.parse_call_args()?;
             self.expect(&TokenKind::RParen, "`)` to close the call")?;
-            Ok(self.make_user_call(r, positional, named))
+            Ok(self.make_user_call(r, positional, named, start))
         } else {
-            Ok(self.module.alloc(Node::Ref(r)))
+            Ok(self.alloc_spanned(Node::Ref(r), start))
         }
     }
 
     /// A bare name has already been consumed; decide literal / call / reference.
-    fn parse_name_tail(&mut self, name: String) -> Result<NodeId> {
+    /// `start` is the token index of that name (its span anchor).
+    fn parse_name_tail(&mut self, name: String, start: usize) -> Result<NodeId> {
         // `true` / `false` are boolean literals (never callable).
         if name == "true" {
-            return Ok(self.module.alloc(Node::Lit(Scalar::Bool(true))));
+            return Ok(self.alloc_spanned(Node::Lit(Scalar::Bool(true)), start));
         }
         if name == "false" {
-            return Ok(self.module.alloc(Node::Lit(Scalar::Bool(false))));
+            return Ok(self.alloc_spanned(Node::Lit(Scalar::Bool(false)), start));
         }
 
         // `_` is a hole (spec §04): valid only when the *innermost* enclosing
@@ -1157,7 +1231,7 @@ impl<'a> ExprParser<'a> {
                 name: ph_sym,
             };
             entries.push((arg_sym, r));
-            return Ok(self.module.alloc(Node::Ref(r)));
+            return Ok(self.alloc_spanned(Node::Ref(r), start));
         }
 
         // A lambda argument shadows module bindings and built-ins inside its
@@ -1176,9 +1250,9 @@ impl<'a> ExprParser<'a> {
             if self.eat(&TokenKind::LParen) {
                 let (positional, named) = self.parse_call_args()?;
                 self.expect(&TokenKind::RParen, "`)` to close the call")?;
-                return Ok(self.make_user_call(r, positional, named));
+                return Ok(self.make_user_call(r, positional, named, start));
             }
-            return Ok(self.module.alloc(Node::Ref(r)));
+            return Ok(self.alloc_spanned(Node::Ref(r), start));
         }
         if self.reify_frames.iter().any(lambda_arg) {
             return Err(self.err_prev(format!(
@@ -1192,7 +1266,7 @@ impl<'a> ExprParser<'a> {
             self.advance();
             // `fn(expr)` is the hole-sugar special operation (spec §05).
             if name == "fn" {
-                return self.lower_fn();
+                return self.lower_fn(start);
             }
             // An explicit reification's whole argument list is a placeholder-
             // scope boundary (body and boundary kwargs alike).
@@ -1206,7 +1280,7 @@ impl<'a> ExprParser<'a> {
             }
             let (positional, named) = args?;
             self.expect(&TokenKind::RParen, "`)` to close the call")?;
-            return self.make_call(&name, positional, named);
+            return self.make_call(&name, positional, named, start);
         }
 
         // A bare reference: a placeholder (`_x_`, reserved lexical class) is a
@@ -1226,7 +1300,7 @@ impl<'a> ExprParser<'a> {
         } else {
             Node::Const(sym)
         };
-        Ok(self.module.alloc(node))
+        Ok(self.alloc_spanned(node, start))
     }
 
     fn make_call(
@@ -1234,6 +1308,7 @@ impl<'a> ExprParser<'a> {
         name: &str,
         positional: Vec<NodeId>,
         named: Vec<NamedArg>,
+        start: usize,
     ) -> Result<NodeId> {
         // The reification constructs are special operations with their own
         // syntax (spec §05), recognised before name resolution.
@@ -1244,15 +1319,21 @@ impl<'a> ExprParser<'a> {
                 ns: RefNs::SelfMod,
                 name: sym,
             };
-            return Ok(self.make_user_call(r, positional, named));
+            return Ok(self.make_user_call(r, positional, named, start));
         }
-        self.make_builtin_call(name, positional, named)
+        self.make_builtin_call(name, positional, named, start)
     }
 
     /// A call to a user-defined callable named by `r` — `(%call (%ref …) …)`.
-    fn make_user_call(&mut self, r: Ref, positional: Vec<NodeId>, named: Vec<NamedArg>) -> NodeId {
-        let callee = self.module.alloc(Node::Ref(r));
-        self.make_applied_call(callee, positional, named)
+    fn make_user_call(
+        &mut self,
+        r: Ref,
+        positional: Vec<NodeId>,
+        named: Vec<NamedArg>,
+        start: usize,
+    ) -> NodeId {
+        let callee = self.alloc_spanned(Node::Ref(r), start);
+        self.make_applied_call(callee, positional, named, start)
     }
 
     /// Apply a callable-valued expression — `(%call <callable> …)` with an
@@ -1262,13 +1343,17 @@ impl<'a> ExprParser<'a> {
         callee: NodeId,
         positional: Vec<NodeId>,
         named: Vec<NamedArg>,
+        start: usize,
     ) -> NodeId {
-        self.module.alloc(Node::Call(Call {
-            head: CallHead::User(callee),
-            args: positional.into(),
-            named: named.into(),
-            inputs: None,
-        }))
+        self.alloc_spanned(
+            Node::Call(Call {
+                head: CallHead::User(callee),
+                args: positional.into(),
+                named: named.into(),
+                inputs: None,
+            }),
+            start,
+        )
     }
 
     fn make_builtin_call(
@@ -1276,6 +1361,7 @@ impl<'a> ExprParser<'a> {
         name: &str,
         positional: Vec<NodeId>,
         named: Vec<NamedArg>,
+        start: usize,
     ) -> Result<NodeId> {
         // Reification (spec §11 "Reified callables"): the single positional is
         // the reified output; boundary kwargs become the `%specinputs` entries
@@ -1305,12 +1391,15 @@ impl<'a> ExprParser<'a> {
                 Inputs::Spec(entries.into())
             };
             let head = CallHead::Builtin(self.module.intern(name));
-            return Ok(self.module.alloc(Node::Call(Call {
-                head,
-                args: Box::new([positional[0]]),
-                named: Box::new([]),
-                inputs: Some(inputs),
-            })));
+            return Ok(self.alloc_spanned(
+                Node::Call(Call {
+                    head,
+                    args: Box::new([positional[0]]),
+                    named: Box::new([]),
+                    inputs: Some(inputs),
+                }),
+                start,
+            ));
         }
 
         // Built-in data/binding constructors use ordered `%field` / `%assign`
@@ -1318,12 +1407,15 @@ impl<'a> ExprParser<'a> {
         let sym = self.module.intern(name);
         let kind = named_kind_for(name);
         let named: Vec<NamedArg> = named.into_iter().map(|a| NamedArg { kind, ..a }).collect();
-        Ok(self.module.alloc(Node::Call(Call {
-            head: CallHead::Builtin(sym),
-            args: positional.into(),
-            named: named.into(),
-            inputs: None,
-        })))
+        Ok(self.alloc_spanned(
+            Node::Call(Call {
+                head: CallHead::Builtin(sym),
+                args: positional.into(),
+                named: named.into(),
+                inputs: None,
+            }),
+            start,
+        ))
     }
 
     /// Parse `pos, …, kw = val, …` up to (not consuming) the closing delimiter.
@@ -1358,6 +1450,7 @@ impl<'a> ExprParser<'a> {
     }
 
     fn parse_paren_or_tuple(&mut self) -> Result<NodeId> {
+        let start = self.pos;
         self.advance(); // (
         let first = self.parse_expr()?;
         if matches!(self.peek(), Some(TokenKind::Comma)) {
@@ -1369,7 +1462,7 @@ impl<'a> ExprParser<'a> {
                 elems.push(self.parse_expr()?);
             }
             self.expect(&TokenKind::RParen, "`)` to close the tuple")?;
-            Ok(self.builtin_call("tuple", elems))
+            Ok(self.builtin_call("tuple", elems, start))
         } else {
             self.expect(&TokenKind::RParen, "`)` to close the group")?;
             Ok(first)
@@ -1377,6 +1470,7 @@ impl<'a> ExprParser<'a> {
     }
 
     fn parse_array(&mut self) -> Result<NodeId> {
+        let start = self.pos;
         self.advance(); // [
         let mut elems = Vec::new();
         loop {
@@ -1389,28 +1483,35 @@ impl<'a> ExprParser<'a> {
             }
         }
         self.expect(&TokenKind::RBracket, "`]` to close the array")?;
-        Ok(self.builtin_call("vector", elems))
+        Ok(self.builtin_call("vector", elems, start))
     }
 
     // ---- broadcast helpers (dotted operators) ----
 
-    fn broadcast_op(&mut self, func: &str, lhs: NodeId, rhs: NodeId) -> NodeId {
+    fn broadcast_op(&mut self, func: &str, lhs: NodeId, rhs: NodeId, start: usize) -> NodeId {
         let fsym = self.module.intern(func);
-        let f = self.module.alloc(Node::Const(fsym));
-        self.builtin_call("broadcast", vec![f, lhs, rhs])
+        let f = self.alloc_spanned(Node::Const(fsym), start);
+        self.builtin_call("broadcast", vec![f, lhs, rhs], start)
     }
 
-    fn broadcast_unop(&mut self, func: &str, operand: NodeId) -> NodeId {
+    fn broadcast_unop(&mut self, func: &str, operand: NodeId, start: usize) -> NodeId {
         let fsym = self.module.intern(func);
-        let f = self.module.alloc(Node::Const(fsym));
-        self.builtin_call("broadcast", vec![f, operand])
+        let f = self.alloc_spanned(Node::Const(fsym), start);
+        self.builtin_call("broadcast", vec![f, operand], start)
     }
 
-    fn apply_binop(&mut self, func: &str, dotted: bool, lhs: NodeId, rhs: NodeId) -> NodeId {
+    fn apply_binop(
+        &mut self,
+        func: &str,
+        dotted: bool,
+        lhs: NodeId,
+        rhs: NodeId,
+        start: usize,
+    ) -> NodeId {
         if dotted {
-            self.broadcast_op(func, lhs, rhs)
+            self.broadcast_op(func, lhs, rhs, start)
         } else {
-            self.builtin_call(func, vec![lhs, rhs])
+            self.builtin_call(func, vec![lhs, rhs], start)
         }
     }
 
@@ -1480,5 +1581,40 @@ fn describe(kind: Option<&TokenKind>) -> String {
     match kind {
         None => "end of input".to_string(),
         Some(k) => format!("{k:?}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_node_has_a_span() {
+        use flatppl_core::{Idx, NodeId};
+        let src = "y = add(mul(2, x), 1)\nx = Normal(0, 1)";
+        let m = parse(src).expect("parses");
+        for i in 0..m.node_count() {
+            let id = NodeId::from_usize(i);
+            assert!(m.span_of(id).is_some(), "node {i} has no span");
+        }
+    }
+
+    #[test]
+    fn span_covers_the_construct() {
+        let src = "z = add(1, 2)";
+        let m = parse(src).expect("parses");
+        let (_bid, b) = m.bindings().next().unwrap();
+        let span = m.span_of(b.rhs).expect("call has a span");
+        assert_eq!(&src[span.start as usize..span.end as usize], "add(1, 2)");
+    }
+
+    #[test]
+    fn node_at_offset_finds_the_inner_literal() {
+        let src = "z = add(1, 2)";
+        let m = parse(src).expect("parses");
+        let off = src.find('2').unwrap() as u32;
+        let node = m.node_at_offset(off).expect("a node under `2`");
+        let span = m.span_of(node).unwrap();
+        assert_eq!(&src[span.start as usize..span.end as usize], "2");
     }
 }
