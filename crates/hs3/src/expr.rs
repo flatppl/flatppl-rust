@@ -64,6 +64,42 @@ pub fn parse_expr_inline(b: &mut Builder, src: &str) -> Result<NodeId> {
     Ok(node)
 }
 
+/// Collect the *variable* identifiers referenced in an HS3 expression string.
+///
+/// Tokenizes `src` with the same tokenizer the parser uses and returns each
+/// `Tok::Ident` that is NOT immediately followed by `(` — i.e. a value
+/// reference, never a function call (`sqrt`, `abs`, `sin`, …). Results are
+/// deduplicated, preserving first-occurrence order.
+///
+/// The constants `PI`/`Pi`/`pi` and `EULER`/`Euler` are inlined as literals by
+/// the parser (never module references), so they are excluded here too.
+///
+/// A malformed expression that fails to tokenize yields an empty list rather
+/// than an error: this helper is used to *discover* declarations, and any real
+/// tokenization failure surfaces later when the expression itself is parsed.
+pub fn free_identifiers(src: &str) -> Vec<String> {
+    let Ok(toks) = tokenize(src) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    for (i, t) in toks.iter().enumerate() {
+        if let Tok::Ident(name) = t {
+            // A following `(` makes this a function call, not a value reference.
+            if matches!(toks.get(i + 1), Some(Tok::LParen)) {
+                continue;
+            }
+            // Parser-inlined constants are never module references.
+            if matches!(name.as_str(), "PI" | "Pi" | "pi" | "EULER" | "Euler") {
+                continue;
+            }
+            if !out.iter().any(|s| s == name) {
+                out.push(name.clone());
+            }
+        }
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Lambda wrapper — builds `obs_name -> body` in the IR
 // ---------------------------------------------------------------------------
@@ -787,6 +823,28 @@ mod tests {
             "expected Unsupported error for `==`, got: {:?}",
             result
         );
+    }
+
+    #[test]
+    fn free_identifiers_excludes_calls_and_constants() {
+        // `sqrt`, `abs`, `sin` are calls (followed by `(`) — excluded.
+        // `x`, `alpha` are value references — included, in first-occurrence order.
+        // `PI` is an inlined constant — excluded.
+        let ids = free_identifiers("(1 + 0.1 * abs(x) + sin(sqrt(abs(x * alpha + 0.1)))) / PI");
+        assert_eq!(ids, vec!["x".to_string(), "alpha".to_string()]);
+    }
+
+    #[test]
+    fn free_identifiers_dedups_preserving_order() {
+        let ids = free_identifiers("mean2 + sqrt(mean2) - other");
+        assert_eq!(ids, vec!["mean2".to_string(), "other".to_string()]);
+    }
+
+    #[test]
+    fn free_identifiers_bad_expr_is_empty() {
+        // Unterminated/garbage tokenization → no discovered identifiers (the real
+        // failure surfaces when the expression is parsed).
+        assert!(free_identifiers("@@@").is_empty());
     }
 
     #[test]

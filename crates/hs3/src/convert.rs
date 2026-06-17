@@ -298,6 +298,119 @@ fn declare_free_params(
                 }
             }
         }
+        // Free parameters referenced ONLY inside generic `expression` strings are
+        // never seen by the field walk above (it explicitly skips the formula
+        // fields). Identifiers in those expressions lower to `self_ref` nodes
+        // resolved at module level, so each must have a module binding or the
+        // emitted FlatPPL has an unresolved reference. Declare any such
+        // identifier here.
+        declare_generic_expr_params(&mut b, doc, dist_names, fn_names, &mut declared)?;
+    }
+    Ok(())
+}
+
+/// Declare free parameters that appear ONLY inside generic `expression` strings
+/// (`generic_function`, `generic_dist`, and — defensively — the inline
+/// `expression` of `density_function_dist`/`log_density_function_dist`).
+///
+/// An identifier is declared `name = elementof(<set>)` when it:
+///   - is listed in some `parameter_points` entry (i.e. it is a real model
+///     parameter, not a typo or an inlined math symbol),
+///   - is not already declared,
+///   - does not name a distribution, a function, or an observable/variate, and
+///   - is not the generic lambda's bound variable (the observable name).
+///
+/// The set is `interval(lo, hi)` when the name has a `domains` axis, else
+/// `reals`. Discovery is order-deterministic (distributions then functions, each
+/// in document order; identifiers in first-occurrence order).
+fn declare_generic_expr_params(
+    b: &mut Builder,
+    doc: &Document,
+    dist_names: &BTreeSet<&str>,
+    fn_names: &BTreeSet<&str>,
+    declared: &mut BTreeSet<String>,
+) -> Result<()> {
+    let bounds = domain_bounds(doc)?;
+
+    // Names that denote observables (a distribution's variate), never free params.
+    let mut observables: BTreeSet<String> = BTreeSet::new();
+    for d in &doc.distributions {
+        match variate_name(d) {
+            Some(VariateName::Single(v)) => {
+                observables.insert(v);
+            }
+            Some(VariateName::Multiple(ns)) => observables.extend(ns),
+            None => {}
+        }
+    }
+
+    // Names declared in some parameter_points entry — the authoritative list of
+    // real model parameters. An expression identifier not in here is either an
+    // observable (handled above) or out of scope to declare.
+    let param_point_names: BTreeSet<&str> = doc
+        .parameter_points
+        .iter()
+        .flat_map(|pp| pp.entries.iter().map(|e| e.name.as_str()))
+        .collect();
+
+    // (expression, bound-variable name) pairs to scan, in deterministic order.
+    let mut sources: Vec<(&str, &str)> = Vec::new();
+    // generic_dist / density_function_dist / log_density_function_dist inline
+    // expressions (the latter two normally carry only a `function` ref, but an
+    // inline `expression`, if present, is scanned too).
+    for d in &doc.distributions {
+        if matches!(
+            d.kind.as_str(),
+            "generic_dist" | "density_function_dist" | "log_density_function_dist"
+        ) {
+            if let Some(expr) = d.extra.get("expression").and_then(|v| v.as_str()) {
+                // generic_dist lowers over the hardcoded observable `x`.
+                sources.push((expr, "x"));
+            }
+        }
+    }
+    // generic_function expressions, over their declared bound variable.
+    for f in &doc.functions {
+        if f.kind == "generic_function" {
+            if let Some(expr) = f.extra.get("expression").and_then(|v| v.as_str()) {
+                let obs_name = f
+                    .extra
+                    .get("variables")
+                    .and_then(|v| v.as_array())
+                    .and_then(|arr| arr.first())
+                    .and_then(|v| v.as_str())
+                    .or_else(|| f.extra.get("x").and_then(|v| v.as_str()))
+                    .unwrap_or("x");
+                sources.push((expr, obs_name));
+            }
+        }
+    }
+
+    for (expr, bound_var) in sources {
+        for name in expr::free_identifiers(expr) {
+            if name == bound_var
+                || dist_names.contains(name.as_str())
+                || fn_names.contains(name.as_str())
+                || observables.contains(&name)
+                || declared.contains(&name)
+            {
+                continue;
+            }
+            // Only declare names the model actually lists as parameters.
+            if !param_point_names.contains(name.as_str()) {
+                continue;
+            }
+            let set = match bounds.get(name.as_str()) {
+                Some(&(lo, hi)) => {
+                    let lo = b.lit_real(lo);
+                    let hi = b.lit_real(hi);
+                    b.call("interval", &[lo, hi])
+                }
+                None => b.call_head("reals"),
+            };
+            b.bind_set(&name, set);
+            declared.insert(name);
+        }
     }
     Ok(())
 }
