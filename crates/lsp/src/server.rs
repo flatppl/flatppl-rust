@@ -6,7 +6,7 @@
 //! `didOpen`/`didChange` notifications (full-sync), `hover` requests, and
 //! `shutdown`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::str::FromStr;
 
@@ -15,7 +15,8 @@ use lsp_types::{
     CompletionOptions, HoverProviderCapability, OneOf, PublishDiagnosticsParams,
     ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind, Uri,
     notification::{
-        DidChangeTextDocument, DidOpenTextDocument, Notification as _, PublishDiagnostics,
+        DidChangeTextDocument, DidChangeWatchedFiles, DidOpenTextDocument, Notification as _,
+        PublishDiagnostics,
     },
     request::{
         Completion, DocumentSymbolRequest, GotoDefinition, HoverRequest, InlayHintRequest,
@@ -86,6 +87,13 @@ pub fn run(
     // the salsa setter when only text (not membership) changes.
     let mut fileset_len = uri_to_file.len();
 
+    // URIs of files currently open in the editor (via didOpen/didClose).
+    // Files added from disk by didChangeWatchedFiles are NOT in this set, so
+    // the watched-file handler can distinguish editor-managed from disk-only
+    // files and update disk-only files on CHANGED/CREATED without clobbering
+    // unsaved editor edits.
+    let mut editor_open_uris: HashSet<String> = HashSet::new();
+
     // Publish initial diagnostics for all workspace files.
     for (uri_str, &file) in &uri_to_file {
         publish_diagnostics(&connection, &db, file, fs, cats, uri_str)?;
@@ -110,6 +118,9 @@ pub fn run(
                             };
                         let uri_str = p.text_document.uri.as_str().to_owned();
                         let text = p.text_document.text;
+                        // Mark as editor-managed so watched-file CHANGED events
+                        // skip it (editor content takes precedence over on-disk).
+                        editor_open_uris.insert(uri_str.clone());
                         upsert_file(&mut db, &mut uri_to_file, uri_str, text);
                         // Update the shared FileSet only when the file SET membership
                         // changes (a new open always adds a file, so this fires).
@@ -158,6 +169,64 @@ pub fn run(
                                     &doc_uri_str,
                                 )?;
                             }
+                        }
+                    }
+                    DidChangeWatchedFiles::METHOD => {
+                        // Clients (e.g. VS Code) register their own glob watchers and
+                        // push `workspace/didChangeWatchedFiles` for on-disk changes to
+                        // files that are NOT open in the editor (e.g. a `load_module`
+                        // dependency edited by another tool, or a git checkout).
+                        // lsp-types 0.97's `WorkspaceServerCapabilities` has no static
+                        // field for `didChangeWatchedFiles` registration options, so we
+                        // handle the notification here and rely on the client's own
+                        // watcher registration (dynamic `client/registerCapability`).
+                        let p: lsp_types::DidChangeWatchedFilesParams = match serde_json::from_value(
+                            note.params,
+                        ) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                eprintln!(
+                                    "flatppl-lsp: malformed didChangeWatchedFiles, skipping: {e}"
+                                );
+                                continue;
+                            }
+                        };
+                        for change in p.changes {
+                            let uri_str = change.uri.as_str().to_owned();
+                            // Only .flatppl files; skip anything else.
+                            if !uri_str.ends_with(".flatppl") {
+                                continue;
+                            }
+                            // Skip files currently open in the editor — the editor's
+                            // didChange is the source of truth for those (avoid
+                            // clobbering unsaved edits).
+                            if editor_open_uris.contains(&uri_str)
+                                && change.typ != lsp_types::FileChangeType::DELETED
+                            {
+                                continue;
+                            }
+                            match change.typ {
+                                lsp_types::FileChangeType::CREATED
+                                | lsp_types::FileChangeType::CHANGED => {
+                                    if let Some(path) = file_uri_to_path(&uri_str) {
+                                        if let Ok(text) = std::fs::read_to_string(&path) {
+                                            upsert_file(&mut db, &mut uri_to_file, uri_str, text);
+                                        }
+                                    }
+                                }
+                                lsp_types::FileChangeType::DELETED => {
+                                    uri_to_file.remove(&uri_str);
+                                }
+                                _ => {}
+                            }
+                        }
+                        sync_file_set(&mut db, fs, &uri_to_file, &mut fileset_len);
+                        // Republish diagnostics for all tracked docs: a watched-file
+                        // change can affect any open importer.
+                        let open_files: Vec<(String, SourceFile)> =
+                            uri_to_file.iter().map(|(u, &f)| (u.clone(), f)).collect();
+                        for (doc_uri_str, file) in open_files {
+                            publish_diagnostics(&connection, &db, file, fs, cats, &doc_uri_str)?;
                         }
                     }
                     _ => {} // ignore other notifications
@@ -1059,6 +1128,166 @@ mod tests {
             .send(Message::Notification(exit_note))
             .unwrap();
 
+        server_thread.join().expect("server thread panicked");
+    }
+
+    // ── didChangeWatchedFiles: on-disk create/change picked up ───────────────
+    //
+    // Scenario: the server starts with an empty workspace. A `.flatppl` file is
+    // written to a temp path. The client sends `workspace/didChangeWatchedFiles`
+    // with a CREATED event for that file's `file://` URI. The test then sends a
+    // `documentSymbol` request for that URI and asserts the server returns at
+    // least one symbol — proving it read the file from disk.
+    //
+    // A CHANGED event for the same URI (with updated content) is then sent, and
+    // a second `documentSymbol` request asserts the updated symbol name is
+    // visible, proving the disk-reload path works.
+
+    #[test]
+    fn watched_file_created_and_changed_picked_up() {
+        use lsp_server::{Connection, Message};
+        use lsp_types::notification::Notification as _;
+        use lsp_types::request::{DocumentSymbolRequest, Request as _};
+
+        // Write a temp .flatppl file with a known binding.
+        let tmp_path = std::env::temp_dir().join(format!(
+            "flatppl_lsp_watched_{}.flatppl",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::write(&tmp_path, "alpha = elementof(reals)\n").unwrap();
+        let tmp_uri_str = format!("file://{}", tmp_path.display());
+
+        let (client_conn, server_conn) = Connection::memory();
+        let server_thread = std::thread::spawn(move || {
+            let init_params = serde_json::json!({ "capabilities": {} });
+            run(server_conn, init_params).expect("server loop failed");
+        });
+
+        // Helper: send a notification.
+        let send_note = |method: &str, params: serde_json::Value| {
+            let note = lsp_server::Notification::new(method.to_owned(), params);
+            client_conn
+                .sender
+                .send(Message::Notification(note))
+                .unwrap();
+        };
+
+        // Helper: drain messages until a non-publishDiagnostics message arrives,
+        // returning that message. Discards any publishDiagnostics notifications
+        // that the server emits after a watched-file event.
+        let drain_to_response = || loop {
+            let msg = client_conn
+                .receiver
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("timed out waiting for response");
+            match &msg {
+                Message::Notification(n)
+                    if n.method == lsp_types::notification::PublishDiagnostics::METHOD =>
+                {
+                    continue;
+                }
+                _ => return msg,
+            }
+        };
+
+        // Send a CREATED watched-file event. The server reads the file from disk
+        // and emits a publishDiagnostics notification for it (empty, valid file).
+        let dcwf_params = serde_json::json!({
+            "changes": [{ "uri": tmp_uri_str, "type": 1 }]  // 1 = CREATED
+        });
+        send_note(DidChangeWatchedFiles::METHOD, dcwf_params);
+
+        // Send a documentSymbol request; drain any publishDiagnostics first.
+        let ds_params = serde_json::json!({
+            "textDocument": { "uri": tmp_uri_str }
+        });
+        // Enqueue the request then drain to get the response (past any diagnostics).
+        {
+            let req = lsp_server::Request::new(
+                lsp_server::RequestId::from(10i32),
+                DocumentSymbolRequest::METHOD.to_owned(),
+                ds_params.clone(),
+            );
+            client_conn.sender.send(Message::Request(req)).unwrap();
+        }
+        let resp_msg = drain_to_response();
+        let Message::Response(resp) = resp_msg else {
+            panic!("expected Response, got: {resp_msg:?}");
+        };
+        assert!(
+            resp.error.is_none(),
+            "documentSymbol must not error: {:?}",
+            resp.error
+        );
+        let result = resp.result.expect("documentSymbol result must be present");
+        // The server should have loaded "alpha = elementof(reals)" → at least one symbol.
+        let syms = result.to_string();
+        assert!(
+            syms.contains("alpha"),
+            "symbol 'alpha' must appear after CREATED watched-file event; got: {syms}"
+        );
+
+        // Now update the file on disk with a new binding name.
+        std::fs::write(&tmp_path, "beta = elementof(reals)\n").unwrap();
+
+        // Send a CHANGED watched-file event.
+        let dcwf_changed = serde_json::json!({
+            "changes": [{ "uri": tmp_uri_str, "type": 2 }]  // 2 = CHANGED
+        });
+        send_note(DidChangeWatchedFiles::METHOD, dcwf_changed);
+
+        // Query symbols again — must now show "beta".
+        {
+            let req = lsp_server::Request::new(
+                lsp_server::RequestId::from(11i32),
+                DocumentSymbolRequest::METHOD.to_owned(),
+                ds_params,
+            );
+            client_conn.sender.send(Message::Request(req)).unwrap();
+        }
+        let resp_msg2 = drain_to_response();
+        let Message::Response(resp2) = resp_msg2 else {
+            panic!("expected Response, got: {resp_msg2:?}");
+        };
+        assert!(
+            resp2.error.is_none(),
+            "second documentSymbol must not error: {:?}",
+            resp2.error
+        );
+        let result2 = resp2
+            .result
+            .expect("second documentSymbol result must be present");
+        let syms2 = result2.to_string();
+        assert!(
+            syms2.contains("beta"),
+            "symbol 'beta' must appear after CHANGED watched-file event; got: {syms2}"
+        );
+
+        // Cleanup temp file.
+        let _ = std::fs::remove_file(&tmp_path);
+
+        // Shutdown.
+        let shutdown_req = lsp_server::Request::new(
+            lsp_server::RequestId::from(99i32),
+            "shutdown".into(),
+            serde_json::Value::Null,
+        );
+        client_conn
+            .sender
+            .send(Message::Request(shutdown_req))
+            .unwrap();
+        let _ = client_conn
+            .receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .ok();
+        let exit_note = lsp_server::Notification::new("exit".into(), serde_json::Value::Null);
+        client_conn
+            .sender
+            .send(Message::Notification(exit_note))
+            .unwrap();
         server_thread.join().expect("server thread panicked");
     }
 

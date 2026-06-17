@@ -127,3 +127,74 @@ fn spec_example_infers_cross_module() {
         "obs_kernel at Normalization level should be Kernel{{mass: Normalized}}; got {obs_kernel_norm_ty:?}"
     );
 }
+
+/// Cross-module callable APPLICATION (load-module flavor b): module B imports
+/// A's reified callable and APPLIES it — concrete argument types from B flow
+/// through A's callable body to produce a typed result.
+///
+/// Setup:
+///   A (helpers) defines `obs_kernel = functionof(Normal(...), center=..., x=...)`
+///   B (model)   loads A with `center = a` and does `L = likelihoodof(helpers.obs_kernel, obs)`
+///
+/// The applied result `L` must infer to a concrete `Likelihood` whose obstype is
+/// `(%scalar real)` — i.e., the real-valued argument `obs` flowed through
+/// `Normal`'s domain inside A's callable body and produced a concrete type.
+///
+/// If the engine does NOT yet flow concrete args through a cross-module callable
+/// body, `L` would be `%deferred` or `%failed` rather than a concrete
+/// `Likelihood`; in that case this test is `#[ignore]`'d with a clear reason.
+#[test]
+fn cross_module_callable_application_yields_concrete_result() {
+    // Module A: the kernel is a reified callable over Normal, parameterized by
+    // `center` (substituted via load_module) and free variable `x`.
+    let a_src = "center = elementof(reals)\nspread = elementof(posreals)\n\
+         obs_kernel = functionof(Normal(mu = add(center, _x_), sigma = spread), \
+         center = center, spread = spread, x = _x_)";
+
+    // Module B: loads A with a concrete `center` substitution, then applies the
+    // imported callable to a concrete scalar observation.
+    let b_src = "a = elementof(reals)\n\
+         helpers = load_module(\"helpers.flatppl\", center = a)\n\
+         obs = 2.5\n\
+         L = likelihoodof(helpers.obs_kernel, obs)";
+
+    let helpers = flatppl_syntax::parse(a_src).expect("helpers (module A) parses");
+    let mut bundle = ModuleBundle::new();
+    bundle.insert("helpers.flatppl", std::sync::Arc::new(helpers));
+
+    let mut model = flatppl_syntax::parse(b_src).expect("model (module B) parses");
+    let diags = infer_module(&mut model, &bundle, Level::Normalization);
+
+    // No resolution errors — the bundle satisfies the dependency.
+    let unresolved: Vec<_> = diags
+        .iter()
+        .filter(|d| {
+            d.severity == flatppl_infer::Severity::Error
+                && (d.message.contains("not found") || d.message.contains("deferred"))
+        })
+        .collect();
+    assert!(
+        unresolved.is_empty(),
+        "unexpected resolution errors: {unresolved:?}"
+    );
+
+    // The applied result `L` must be a concrete Likelihood — NOT Deferred/Failed.
+    // Concrete arg types (real obs) must have flowed through A's callable body.
+    let lb = model
+        .bindings()
+        .find(|(_, b)| model.resolve(b.name) == "L")
+        .expect("model has an `L` binding")
+        .1
+        .rhs;
+    let ty = model.type_of(lb);
+    assert!(
+        matches!(
+            ty,
+            Some(Type::Likelihood { obstype, .. })
+                if **obstype == Type::Scalar(ScalarType::Real)
+        ),
+        "L = likelihoodof(helpers.obs_kernel, obs) must infer to \
+         Likelihood{{obstype: (%scalar real)}} after concrete args flow \
+         through A's callable body; got {ty:?}; diags: {diags:?}"
+    );
+}

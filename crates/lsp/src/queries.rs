@@ -768,6 +768,50 @@ mod tests {
         );
     }
 
+    /// Editing the `Catalogues` input must cause `analyze` to recompute for a
+    /// file that reads from it — proving the salsa edge `analyze` → `Catalogues`
+    /// is recorded. The proof is that `ANALYZE_RUNS` increments after a catalogue
+    /// edit even though the source file itself was not changed.
+    ///
+    /// Approach: warm the cache with a catalogue that contains a module binding,
+    /// reset the counter, swap in a new `Catalogues` value (different `Arc`, so
+    /// pointer-identity equality detects the change), call `analyze` again, and
+    /// assert the body re-ran (counter > 0).
+    #[test]
+    fn catalogue_edit_reanalyzes_dependents() {
+        let mut db = Database::default();
+        // A catalogue exposing one module with one distribution binding.
+        let cat_v1 = r#"Catalogue(base:[],modules:[Module(name:"myext",version:"0.1",bindings:[Binding(name:"MyDist",sig:Distribution(domain:Scalar(Real),support:Reals,mass:Normalized))])])"#;
+        let f = SourceFile::new(
+            &db,
+            "m.flatppl".to_string(),
+            "e = standard_module(\"myext\",\"0.1\")\nx = e.MyDist(0.0)".to_string(),
+        );
+        let fs = FileSet::new(&db, vec![f]);
+        let cats = Catalogues::new(&db, vec![cat_v1.to_string()]);
+
+        // Warm: first analysis populates salsa's memoization table.
+        let _ = analyze(&db, f, fs, cats);
+
+        // Reset the counter after the warm-up run.
+        ANALYZE_RUNS.with(|c| c.set(0));
+
+        // Edit the Catalogues input: a new Vec is a new Arc (pointer-identity
+        // change), so ArcCatalogues::maybe_update returns `true` and salsa marks
+        // all dependents stale. The source file `f` did not change.
+        use salsa::Setter;
+        let cat_v2 = r#"Catalogue(base:[],modules:[])"#; // module removed
+        cats.set_sources(&mut db).to(vec![cat_v2.to_string()]);
+
+        let _ = analyze(&db, f, fs, cats);
+        let runs = ANALYZE_RUNS.with(|c| c.get());
+        assert!(
+            runs > 0,
+            "editing Catalogues must re-analyze dependents (ANALYZE_RUNS={runs}); \
+             if 0, the salsa edge analyze → Catalogues is not recorded"
+        );
+    }
+
     // ── import_bundle memoization tests ───────────────────────────────────────
 
     /// A two-file workspace: B (`helpers`) defines a binding; A (`model`) does
