@@ -381,8 +381,12 @@ pub fn assemble_channel(
     let poisson = b.call_head("Poisson");
     let obs_model = b.call("broadcast", &[poisson, expected]);
     let obs_model_name = format!("obs_model_{channel_name}");
+    // `assemble_channel` serves BOTH the pyhf importer and the native-HS3
+    // `histfactory_dist` importer, so the provenance note names the shared model
+    // paradigm (HistFactory) rather than a serialization format — saying "HS3"
+    // here would be wrong for a pyhf input (and vice versa).
     let obs_doc = format!(
-        "HS3 histfactory channel '{}': samples × modifiers → broadcast(Poisson, expected)",
+        "HistFactory channel '{}': samples × modifiers → broadcast(Poisson, expected)",
         channel_name
     );
     b.bind_doc(&obs_model_name, obs_model, &[obs_doc.as_str()]);
@@ -400,7 +404,7 @@ pub fn assemble_channel(
         all_terms.extend_from_slice(&aux_terms);
         b.call("joint_likelihood", &all_terms)
     };
-    let l_doc = "HS3 histfactory likelihood: main Poisson term + auxiliary constraint terms (joint_likelihood)";
+    let l_doc = "HistFactory likelihood: main Poisson term + auxiliary constraint terms (joint_likelihood)";
     b.bind_doc(&l_name, l_combined, &[l_doc]);
 
     Ok(())

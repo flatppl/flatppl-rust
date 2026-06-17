@@ -170,7 +170,7 @@ fn histfactory_channel_has_doc_comments_and_roundtrips() {
 
     // The channel-level provenance comment must sit directly above the
     // obs_model_chan1 binding.
-    assert_comment_precedes_binding(&text, "HS3 histfactory channel", "obs_model_chan1");
+    assert_comment_precedes_binding(&text, "HistFactory channel", "obs_model_chan1");
     assert!(
         text.contains("broadcast(Poisson"),
         "missing Poisson broadcast, got:\n{text}"
@@ -178,7 +178,7 @@ fn histfactory_channel_has_doc_comments_and_roundtrips() {
 
     // The likelihood provenance comment must sit directly above the L_chan1
     // binding.
-    assert_comment_precedes_binding(&text, "HS3 histfactory likelihood", "L_chan1");
+    assert_comment_precedes_binding(&text, "HistFactory likelihood", "L_chan1");
 
     // Round-trip.
     let rt = parse(&text);
