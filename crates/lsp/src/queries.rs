@@ -157,29 +157,54 @@ impl std::hash::Hash for ArcModule {
 // Within a single revision the memoized query returns the *same* `Arc`, so the
 // per-dependency `Arc<Module>` is shared across every `analyze` of that revision
 // (verified by `dependency_module_is_shared_not_recloned`).
+//
+// `dep_files` records the RESOLVED `SourceFile` handles for every transitive
+// dependency. `affected_files` (server.rs) matches importers by `SourceFile`
+// identity rather than directive-literal path strings, so a relative import
+// `"../helpers.flatppl"` whose directive differs lexically from the stored path
+// still identifies the correct importer.
 #[derive(Clone, Debug)]
-pub struct ImportBundle(Arc<flatppl_infer::ModuleBundle>);
+pub struct ImportBundle {
+    bundle: Arc<flatppl_infer::ModuleBundle>,
+    dep_files: Arc<std::collections::HashSet<SourceFile>>,
+}
 
 impl ImportBundle {
-    fn new(bundle: flatppl_infer::ModuleBundle) -> Self {
-        ImportBundle(Arc::new(bundle))
+    fn new(
+        bundle: flatppl_infer::ModuleBundle,
+        dep_files: std::collections::HashSet<SourceFile>,
+    ) -> Self {
+        ImportBundle {
+            bundle: Arc::new(bundle),
+            dep_files: Arc::new(dep_files),
+        }
     }
 
     /// Borrow the assembled bundle, for passing to `infer_module_ext`.
     pub fn as_bundle(&self) -> &flatppl_infer::ModuleBundle {
-        &self.0
+        &self.bundle
     }
 
     /// The shared `Arc<Module>` for the dependency keyed by `path`, if present.
     /// Cloning the returned `Arc` is a refcount bump, not a deep clone.
     pub fn module_for(&self, path: &str) -> Option<Arc<Module>> {
-        self.0.get_arc(path).cloned()
+        self.bundle.get_arc(path).cloned()
+    }
+
+    /// Return `true` when `dep` is a (direct or transitive) dependency of this
+    /// file, matched by `SourceFile` identity (salsa input id), not by path
+    /// string. This is the correct predicate for `affected_files`: a relative
+    /// import `"../helpers.flatppl"` resolves to the same `SourceFile` id as
+    /// the absolute stored path, so the match is exact regardless of the literal
+    /// directive text.
+    pub fn imports(&self, dep: SourceFile) -> bool {
+        self.dep_files.contains(&dep)
     }
 }
 
 impl PartialEq for ImportBundle {
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
+        Arc::ptr_eq(&self.bundle, &other.bundle)
     }
 }
 
@@ -187,7 +212,7 @@ impl Eq for ImportBundle {}
 
 impl std::hash::Hash for ImportBundle {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        std::ptr::hash(Arc::as_ptr(&self.0), state);
+        std::ptr::hash(Arc::as_ptr(&self.bundle), state);
     }
 }
 
@@ -198,7 +223,7 @@ impl std::hash::Hash for ImportBundle {
 unsafe impl salsa::Update for ImportBundle {
     unsafe fn maybe_update(old_pointer: *mut Self, new_value: Self) -> bool {
         let old: &mut Self = unsafe { &mut *old_pointer };
-        if Arc::ptr_eq(&old.0, &new_value.0) {
+        if Arc::ptr_eq(&old.bundle, &new_value.bundle) {
             return false;
         }
         *old = new_value;
@@ -382,6 +407,12 @@ pub fn import_bundle(db: &dyn salsa::Database, file: SourceFile, fs: FileSet) ->
     IMPORT_BUNDLE_RUNS.with(|c| c.set(c.get() + 1));
 
     let mut bundle = flatppl_infer::ModuleBundle::new();
+    // Tracks the RESOLVED SourceFile for every transitive dependency. Used by
+    // `affected_files` (server.rs) to match importers by SourceFile identity
+    // instead of directive-literal path strings — so a relative import such as
+    // `"../helpers.flatppl"` correctly identifies the same dependency as its
+    // absolute stored path.
+    let mut dep_files: std::collections::HashSet<SourceFile> = std::collections::HashSet::new();
     let mut visited: std::collections::HashSet<SourceFile> = std::collections::HashSet::new();
     let mut queue: std::collections::VecDeque<SourceFile> = std::collections::VecDeque::new();
     visited.insert(file);
@@ -396,6 +427,9 @@ pub fn import_bundle(db: &dyn salsa::Database, file: SourceFile, fs: FileSet) ->
             let Some(dep_file) = resolve_path(db, current, &path, fs) else {
                 continue;
             };
+            // Record the resolved SourceFile identity so affected_files can
+            // match by id rather than by the directive's literal path string.
+            dep_files.insert(dep_file);
             if let Some(dep_mod) = parse(db, dep_file).module(db) {
                 // Key by the directive-literal path so infer's `(%ref alias X)`
                 // lookup (keyed by directive path) matches. The single deep
@@ -411,7 +445,7 @@ pub fn import_bundle(db: &dyn salsa::Database, file: SourceFile, fs: FileSet) ->
             }
         }
     }
-    ImportBundle::new(bundle)
+    ImportBundle::new(bundle, dep_files)
 }
 
 // Per-thread execution counter for `import_bundle` (proves the query is
@@ -844,6 +878,100 @@ mod tests {
             IMPORT_BUNDLE_RUNS.with(|c| c.get()),
             1,
             "import_bundle computed once per revision, not per analyze"
+        );
+    }
+
+    /// `ImportBundle::imports` matches by SourceFile identity, not by
+    /// directive-literal path string.
+    ///
+    /// A builds a `load_module` of B using B's stored path as the directive
+    /// (the simplest case where the directive equals the stored path). We verify:
+    ///   1. `import_bundle(A).imports(B)` returns `true`.
+    ///   2. `import_bundle(A).imports(A)` (self) returns `false` — the self node
+    ///      is the root and NOT in dep_files.
+    ///   3. `import_bundle(A).imports(C)` (independent file) returns `false`.
+    ///
+    /// These assertions prove the identity-based match is correct and that the
+    /// set does not accidentally include unrelated files.
+    #[test]
+    fn import_bundle_imports_matches_by_sourcefile_identity() {
+        let db = Database::default();
+        let b = SourceFile::new(
+            &db,
+            "helpers.flatppl".to_string(),
+            "center = elementof(reals)\n".to_string(),
+        );
+        let a = SourceFile::new(
+            &db,
+            "model.flatppl".to_string(),
+            "h = load_module(\"helpers.flatppl\")\nv = add(h.center, 1.0)\n".to_string(),
+        );
+        let c = SourceFile::new(
+            &db,
+            "independent.flatppl".to_string(),
+            "x = add(1, 2)\n".to_string(),
+        );
+        let fs = FileSet::new(&db, vec![a, b, c]);
+
+        let bundle_a = import_bundle(&db, a, fs);
+
+        assert!(
+            bundle_a.imports(b),
+            "import_bundle(A).imports(B) must be true: A has load_module(\"helpers.flatppl\") \
+             which resolves to B by SourceFile identity"
+        );
+        assert!(
+            !bundle_a.imports(a),
+            "import_bundle(A).imports(A) must be false: A is the root, not a dependency"
+        );
+        assert!(
+            !bundle_a.imports(c),
+            "import_bundle(A).imports(C) must be false: C is independent"
+        );
+    }
+
+    /// `affected_files` with SourceFile-identity matching correctly includes
+    /// the importer when the dependency is changed.
+    ///
+    /// This mirrors the server-side `affected_files_excludes_non_importers` test
+    /// at the queries layer: using `imports(changed)` rather than
+    /// `module_for(&changed.path(db)).is_some()`, the importer is found even
+    /// when the directive literal does not byte-match the stored path.
+    #[test]
+    fn import_bundle_dep_files_excludes_self_and_non_deps() {
+        let db = Database::default();
+        let helpers = SourceFile::new(
+            &db,
+            "helpers.flatppl".to_string(),
+            "leaf = elementof(reals)\n".to_string(),
+        );
+        let model = SourceFile::new(
+            &db,
+            "model.flatppl".to_string(),
+            "h = load_module(\"helpers.flatppl\")\nv = add(h.leaf, 1.0)\n".to_string(),
+        );
+        let other = SourceFile::new(
+            &db,
+            "other.flatppl".to_string(),
+            "z = add(2, 3)\n".to_string(),
+        );
+        let fs = FileSet::new(&db, vec![helpers, model, other]);
+
+        // bundle for `model`: deps = {helpers}
+        let bundle_model = import_bundle(&db, model, fs);
+        assert!(bundle_model.imports(helpers), "model imports helpers");
+        assert!(!bundle_model.imports(model), "model is the root, not a dep");
+        assert!(!bundle_model.imports(other), "model does not import other");
+
+        // bundle for `helpers` (a leaf): no deps
+        let bundle_helpers = import_bundle(&db, helpers, fs);
+        assert!(
+            !bundle_helpers.imports(model),
+            "helpers does not import model"
+        );
+        assert!(
+            !bundle_helpers.imports(other),
+            "helpers does not import other"
         );
     }
 

@@ -83,9 +83,6 @@ pub fn run(
     }
 
     let fs = build_fileset(&db, &uri_to_file);
-    // Track the current FileSet membership size so `sync_file_set` can skip
-    // the salsa setter when only text (not membership) changes.
-    let mut fileset_len = uri_to_file.len();
 
     // URIs of files currently open in the editor (via didOpen/didClose).
     // Files added from disk by didChangeWatchedFiles are NOT in this set, so
@@ -124,7 +121,7 @@ pub fn run(
                         upsert_file(&mut db, &mut uri_to_file, uri_str, text);
                         // Update the shared FileSet only when the file SET membership
                         // changes (a new open always adds a file, so this fires).
-                        sync_file_set(&mut db, fs, &uri_to_file, &mut fileset_len);
+                        sync_file_set(&mut db, fs, &uri_to_file);
                         // Re-publish diagnostics for ALL open docs: a newly-opened
                         // file can satisfy a previously-unresolved import in any
                         // already-open doc, so the full set must be refreshed.
@@ -152,7 +149,7 @@ pub fn run(
                         }
                         // Guard the FileSet salsa input: a pure text edit leaves
                         // membership unchanged, so no revision bump is needed.
-                        sync_file_set(&mut db, fs, &uri_to_file, &mut fileset_len);
+                        sync_file_set(&mut db, fs, &uri_to_file);
                         // Republish diagnostics only for the changed doc and the
                         // open docs that (transitively) import it — the only docs
                         // whose diagnostics can change on this edit.
@@ -220,7 +217,7 @@ pub fn run(
                                 _ => {}
                             }
                         }
-                        sync_file_set(&mut db, fs, &uri_to_file, &mut fileset_len);
+                        sync_file_set(&mut db, fs, &uri_to_file);
                         // Republish diagnostics for all tracked docs: a watched-file
                         // change can affect any open importer.
                         let open_files: Vec<(String, SourceFile)> =
@@ -386,48 +383,50 @@ fn build_fileset(db: &Database, uri_to_file: &HashMap<String, SourceFile>) -> Fi
 /// A pure text edit of an already-open file leaves membership unchanged — the
 /// edit flows through `SourceFile::set_text` in `upsert_file`, not through
 /// `FileSet`. Bumping the `FileSet` input on every keystroke causes unnecessary
-/// salsa revision churn; this guard skips the setter when the file count is the
-/// same as the last observed count (file length is a sufficient membership proxy
-/// because files are only added, never swapped).
-fn sync_file_set(
-    db: &mut Database,
-    fs: FileSet,
-    uri_to_file: &HashMap<String, SourceFile>,
-    last_len: &mut usize,
-) {
-    if uri_to_file.len() == *last_len {
-        return; // membership unchanged → skip the salsa input bump
-    }
-    *last_len = uri_to_file.len();
+/// salsa revision churn; this guard skips the setter when the set of `SourceFile`
+/// handles is identical to what is already stored.
+///
+/// Membership is compared structurally (sorted by stored path) rather than by
+/// count. A `didChangeWatchedFiles` batch that deletes one file and creates
+/// another leaves the count unchanged but changes membership — the count-based
+/// guard would wrongly skip the update, leaving the `FileSet` salsa input stale
+/// (keeping the deleted `SourceFile`, missing the new one). Comparing the actual
+/// member handles catches this case correctly.
+fn sync_file_set(db: &mut Database, fs: FileSet, uri_to_file: &HashMap<String, SourceFile>) {
     use salsa::Setter;
-    let new_files: Vec<SourceFile> = uri_to_file.values().copied().collect();
+    let mut new_files: Vec<SourceFile> = uri_to_file.values().copied().collect();
+    new_files.sort_by_key(|f| f.path(db).clone());
+    let mut current: Vec<SourceFile> = fs.files(db).to_vec();
+    current.sort_by_key(|f| f.path(db).clone());
+    if new_files == current {
+        return; // membership + identity unchanged → no salsa input churn
+    }
     fs.set_files(db).to(new_files);
 }
 
 /// Return the subset of `uri_to_file` whose diagnostics can change when
 /// `changed` is edited: `changed` itself, plus every open file whose transitive
-/// import bundle includes `changed`'s path (i.e. files that directly or
-/// transitively import `changed`).
+/// import bundle includes `changed` as a resolved dependency.
 ///
 /// `import_bundle` is a memoized salsa query, so the bundle lookups here are
 /// cache hits for every file whose inputs have not changed.  Independent files
 /// (those that do not import `changed`) are excluded, avoiding spurious
 /// `analyze` recomputation.
+///
+/// Matching is by `SourceFile` identity (salsa input id) rather than by the
+/// directive's literal path string.  This matters when a relative import such
+/// as `"../helpers.flatppl"` resolves to a `SourceFile` whose stored path is
+/// the absolute `/abs/helpers.flatppl` — the literal and the path differ, so a
+/// string comparison would miss the importer and leave its diagnostics stale.
 fn affected_files(
     db: &dyn salsa::Database,
     fs: FileSet,
     uri_to_file: &HashMap<String, SourceFile>,
     changed: SourceFile,
 ) -> Vec<(String, SourceFile)> {
-    let changed_path = changed.path(db);
     uri_to_file
         .iter()
-        .filter(|(_, f)| {
-            **f == changed
-                || import_bundle(db, **f, fs)
-                    .module_for(&changed_path)
-                    .is_some()
-        })
+        .filter(|(_, f)| **f == changed || import_bundle(db, **f, fs).imports(changed))
         .map(|(u, f)| (u.clone(), *f))
         .collect()
 }
@@ -1326,6 +1325,85 @@ mod tests {
         uri_to_file.insert("file:///tmp/b.flatppl".to_string(), b);
         uri_to_file.insert("file:///tmp/c.flatppl".to_string(), c);
         (db, a, b, c, fs, uri_to_file)
+    }
+
+    // ── sync_file_set membership guard tests ─────────────────────────────────
+
+    /// A delete+create batch with unchanged count must still update the FileSet.
+    ///
+    /// Start with FileSet = {A, B}. Build a `uri_to_file` map representing {A, C}
+    /// (B removed, C added — same count 2). Call `sync_file_set` and assert
+    /// `fs.files(db)` now contains A and C and NOT B. This is the MEASURED proof
+    /// that equal count but changed membership still triggers the update.
+    #[test]
+    fn sync_file_set_delete_create_batch_updates_membership() {
+        use crate::db::{Database, FileSet, SourceFile};
+
+        let mut db = Database::default();
+        let a = SourceFile::new(&db, "/tmp/a.flatppl".to_string(), "a = 1".to_string());
+        let b = SourceFile::new(&db, "/tmp/b.flatppl".to_string(), "b = 2".to_string());
+        let fs = FileSet::new(&db, vec![a, b]);
+
+        // Simulate a didChangeWatchedFiles batch: B deleted, C created (same count).
+        let c = SourceFile::new(&db, "/tmp/c.flatppl".to_string(), "c = 3".to_string());
+        let mut uri_to_file: HashMap<String, SourceFile> = HashMap::new();
+        uri_to_file.insert("file:///tmp/a.flatppl".to_string(), a);
+        uri_to_file.insert("file:///tmp/c.flatppl".to_string(), c);
+
+        // Before the call, fs still holds {A, B}.
+        assert_eq!(
+            fs.files(&db).len(),
+            2,
+            "initial FileSet must have 2 members"
+        );
+
+        sync_file_set(&mut db, fs, &uri_to_file);
+
+        let current: Vec<SourceFile> = fs.files(&db).to_vec();
+        assert_eq!(
+            current.len(),
+            2,
+            "FileSet must still have 2 members after delete+create"
+        );
+        assert!(
+            current.contains(&a),
+            "A must be in the updated FileSet; got {current:?}"
+        );
+        assert!(
+            current.contains(&c),
+            "C (newly created) must be in the updated FileSet; got {current:?}"
+        );
+        assert!(
+            !current.contains(&b),
+            "B (deleted) must NOT be in the updated FileSet; got {current:?}"
+        );
+    }
+
+    /// A pure text edit must NOT cause `sync_file_set` to bump the FileSet input.
+    ///
+    /// After warming the FileSet with {A}, update A's text via `set_text` (a
+    /// membership-unchanged edit), then call `sync_file_set`. The FileSet must
+    /// still contain exactly A. This is the guard against per-keystroke revision
+    /// churn: membership is identical, so the salsa setter is skipped.
+    #[test]
+    fn sync_file_set_skips_update_on_pure_text_edit() {
+        use crate::db::{Database, FileSet, SourceFile};
+        use salsa::Setter;
+
+        let mut db = Database::default();
+        let a = SourceFile::new(&db, "/tmp/a.flatppl".to_string(), "a = 1".to_string());
+        let fs = FileSet::new(&db, vec![a]);
+        let mut uri_to_file: HashMap<String, SourceFile> = HashMap::new();
+        uri_to_file.insert("file:///tmp/a.flatppl".to_string(), a);
+
+        // Pure text edit: membership unchanged.
+        a.set_text(&mut db).to("a = 99".to_string());
+
+        // sync_file_set must not panic and must leave the membership intact.
+        sync_file_set(&mut db, fs, &uri_to_file);
+
+        let current: Vec<SourceFile> = fs.files(&db).to_vec();
+        assert_eq!(current, vec![a], "FileSet must still contain only A");
     }
 
     /// `affected_files(changed=B)` must include A and B (A imports B) but must
