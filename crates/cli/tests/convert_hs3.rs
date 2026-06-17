@@ -201,7 +201,7 @@ fn hs3_convert_emits_banner_and_compat() {
     assert!(status.success());
     let text = std::fs::read_to_string(&out).unwrap();
     assert!(
-        text.starts_with("# AUTOMATICALLY GENERATED — do not edit\n"),
+        text.starts_with("# AUTOMATICALLY GENERATED - do not edit\n"),
         "expected a minimal leading FlatPPL banner, got:\n{text}"
     );
     assert!(

@@ -14,7 +14,7 @@ flatppl completions zsh > ~/.zfunc/_flatppl     # shell completions (bash|zsh|fi
 ```
 
 Formats are inferred from file extensions. Generated files carry a single minimal banner comment
-(`AUTOMATICALLY GENERATED — do not edit`) — deliberately no timestamp, user, host, platform, or
+(`AUTOMATICALLY GENERATED - do not edit`) - deliberately no timestamp, user, host, platform, or
 command line, which would leak personal/system information; model imports also stamp a leading
 `flatppl_compat` binding recording the targeted FlatPPL version. `--no-header` omits the banner.
 Verbs are opt-in cargo features (`infer`, `hs3`; both on by default).

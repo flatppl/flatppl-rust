@@ -18,7 +18,7 @@ use crate::CommentStyle;
 /// The banner text (no comment prefix, no trailing newline). Contains no `;`, so
 /// it is safe as a single `#` line comment in FlatPPL (spec §05: a `#` comment
 /// ends at the first `;`).
-const BANNER: &str = "AUTOMATICALLY GENERATED — do not edit";
+const BANNER: &str = "AUTOMATICALLY GENERATED - do not edit";
 
 /// The leading generated-file banner for `style`, terminated by a blank line and
 /// ready to prepend to output. Empty for [`CommentStyle::None`] (JSON has no
@@ -38,11 +38,11 @@ mod tests {
     fn banner_is_a_single_prefixed_line() {
         // FlatPPL: a `#` line comment (safe — the text carries no `;`).
         let h = banner(CommentStyle::Line("#"));
-        assert_eq!(h, "# AUTOMATICALLY GENERATED — do not edit\n\n");
+        assert_eq!(h, "# AUTOMATICALLY GENERATED - do not edit\n\n");
 
         // FlatPIR: per-line `;`.
         let h = banner(CommentStyle::Line(";"));
-        assert!(h.starts_with("; AUTOMATICALLY GENERATED — do not edit"));
+        assert!(h.starts_with("; AUTOMATICALLY GENERATED - do not edit"));
 
         // No personal/system fields ever leak into the banner.
         for leaked in ["generated:", "by:", "platform:", "command:", "from:"] {

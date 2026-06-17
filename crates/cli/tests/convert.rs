@@ -108,7 +108,7 @@ fn provenance_header_present_by_default() {
     assert!(status.success());
     let text = fs::read_to_string(&out).unwrap();
     assert!(
-        text.starts_with("; AUTOMATICALLY GENERATED — do not edit\n"),
+        text.starts_with("; AUTOMATICALLY GENERATED - do not edit\n"),
         "expected a leading FlatPIR banner, got:\n{text}"
     );
     // No pseudo-provenance / personal fields leak into the banner.
