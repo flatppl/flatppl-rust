@@ -298,6 +298,119 @@ fn declare_free_params(
                 }
             }
         }
+        // Free parameters referenced ONLY inside generic `expression` strings are
+        // never seen by the field walk above (it explicitly skips the formula
+        // fields). Identifiers in those expressions lower to `self_ref` nodes
+        // resolved at module level, so each must have a module binding or the
+        // emitted FlatPPL has an unresolved reference. Declare any such
+        // identifier here.
+        declare_generic_expr_params(&mut b, doc, dist_names, fn_names, &mut declared)?;
+    }
+    Ok(())
+}
+
+/// Declare free parameters that appear ONLY inside generic `expression` strings
+/// (`generic_function`, `generic_dist`, and — defensively — the inline
+/// `expression` of `density_function_dist`/`log_density_function_dist`).
+///
+/// An identifier is declared `name = elementof(<set>)` when it:
+///   - is listed in some `parameter_points` entry (i.e. it is a real model
+///     parameter, not a typo or an inlined math symbol),
+///   - is not already declared,
+///   - does not name a distribution, a function, or an observable/variate, and
+///   - is not the generic lambda's bound variable (the observable name).
+///
+/// The set is `interval(lo, hi)` when the name has a `domains` axis, else
+/// `reals`. Discovery is order-deterministic (distributions then functions, each
+/// in document order; identifiers in first-occurrence order).
+fn declare_generic_expr_params(
+    b: &mut Builder,
+    doc: &Document,
+    dist_names: &BTreeSet<&str>,
+    fn_names: &BTreeSet<&str>,
+    declared: &mut BTreeSet<String>,
+) -> Result<()> {
+    let bounds = domain_bounds(doc)?;
+
+    // Names that denote observables (a distribution's variate), never free params.
+    let mut observables: BTreeSet<String> = BTreeSet::new();
+    for d in &doc.distributions {
+        match variate_name(d) {
+            Some(VariateName::Single(v)) => {
+                observables.insert(v);
+            }
+            Some(VariateName::Multiple(ns)) => observables.extend(ns),
+            None => {}
+        }
+    }
+
+    // Names declared in some parameter_points entry — the authoritative list of
+    // real model parameters. An expression identifier not in here is either an
+    // observable (handled above) or out of scope to declare.
+    let param_point_names: BTreeSet<&str> = doc
+        .parameter_points
+        .iter()
+        .flat_map(|pp| pp.entries.iter().map(|e| e.name.as_str()))
+        .collect();
+
+    // (expression, bound-variable name) pairs to scan, in deterministic order.
+    let mut sources: Vec<(&str, &str)> = Vec::new();
+    // generic_dist / density_function_dist / log_density_function_dist inline
+    // expressions (the latter two normally carry only a `function` ref, but an
+    // inline `expression`, if present, is scanned too).
+    for d in &doc.distributions {
+        if matches!(
+            d.kind.as_str(),
+            "generic_dist" | "density_function_dist" | "log_density_function_dist"
+        ) {
+            if let Some(expr) = d.extra.get("expression").and_then(|v| v.as_str()) {
+                // generic_dist lowers over the hardcoded observable `x`.
+                sources.push((expr, "x"));
+            }
+        }
+    }
+    // generic_function expressions, over their declared bound variable.
+    for f in &doc.functions {
+        if f.kind == "generic_function" {
+            if let Some(expr) = f.extra.get("expression").and_then(|v| v.as_str()) {
+                let obs_name = f
+                    .extra
+                    .get("variables")
+                    .and_then(|v| v.as_array())
+                    .and_then(|arr| arr.first())
+                    .and_then(|v| v.as_str())
+                    .or_else(|| f.extra.get("x").and_then(|v| v.as_str()))
+                    .unwrap_or("x");
+                sources.push((expr, obs_name));
+            }
+        }
+    }
+
+    for (expr, bound_var) in sources {
+        for name in expr::free_identifiers(expr) {
+            if name == bound_var
+                || dist_names.contains(name.as_str())
+                || fn_names.contains(name.as_str())
+                || observables.contains(&name)
+                || declared.contains(&name)
+            {
+                continue;
+            }
+            // Only declare names the model actually lists as parameters.
+            if !param_point_names.contains(name.as_str()) {
+                continue;
+            }
+            let set = match bounds.get(name.as_str()) {
+                Some(&(lo, hi)) => {
+                    let lo = b.lit_real(lo);
+                    let hi = b.lit_real(hi);
+                    b.call("interval", &[lo, hi])
+                }
+                None => b.call_head("reals"),
+            };
+            b.bind_set(&name, set);
+            declared.insert(name);
+        }
     }
     Ok(())
 }
@@ -407,9 +520,19 @@ fn emit_distributions(m: &mut Module, doc: &Document) -> Result<()> {
                 b.bind_doc(&d.name, node, &[doc_line]);
                 continue;
             }
-            // Resolve the variate's declared domain (needed for uniform_dist).
+            // Resolve the variate's declared domain (needed for uniform_dist and the
+            // generic kinds). For generic_dist / density_function_dist /
+            // log_density_function_dist the observable is the hardcoded bound variable
+            // "x", because variate_name() returns None (Variate::None) for those kinds.
             let domain = match variate_name(d) {
                 Some(VariateName::Single(ref v)) => domains.get(v.as_str()).copied(),
+                None if matches!(
+                    d.kind.as_str(),
+                    "generic_dist" | "density_function_dist" | "log_density_function_dist"
+                ) =>
+                {
+                    domains.get("x").copied()
+                }
                 _ => None,
             };
             let dist = emit_distribution(&mut b, d, domain)?;
@@ -687,11 +810,21 @@ fn emit_function(b: &mut Builder, f: &Function) -> Result<()> {
                 .and_then(|v| v.as_str())
                 .or_else(|| f.extra.get("x").and_then(|v| v.as_str()))
                 .unwrap_or("x");
-            // Emit as a lambda: `obs_name -> <expr>`, making it a callable weight.
-            let fn_node = expr::parse_expr_as_fn(b, expression, obs_name)?;
+            // Emit as a lambda only when the expression references the observable.
+            // If the expression is purely a function of parameters (e.g. `sqrt(mean2)`),
+            // emit a scalar binding instead — wrapping it in a lambda would make it a
+            // function-valued node where a real is expected.
+            let node = if expr::free_identifiers(expression)
+                .iter()
+                .any(|id| id == obs_name)
+            {
+                expr::parse_expr_as_fn(b, expression, obs_name)?
+            } else {
+                expr::parse_expr_inline(b, expression)?
+            };
             b.bind_doc(
                 &f.name,
-                fn_node,
+                node,
                 &["HS3 generic_function → lowered expression"],
             );
         }
@@ -848,5 +981,64 @@ mod tests {
             text.contains("Uniform") && text.contains("interval"),
             "got:\n{text}"
         );
+    }
+
+    // A generic_function whose expression references the observable variable must
+    // be lowered as a lambda `obs_name -> <expr>`.
+    const GENERIC_FN_LAMBDA_JSON: &str = r#"{
+      "functions": [
+        {"name": "weight_fn", "type": "generic_function",
+         "expression": "x * alpha",
+         "variables": ["x"]}
+      ],
+      "distributions": [
+        {"name": "d", "type": "gaussian_dist",
+         "mean": "mu_p", "sigma": "sigma_p", "x": "obs"}
+      ]
+    }"#;
+
+    #[test]
+    fn generic_function_with_observable_ref_is_lambda() {
+        let m = crate::read(GENERIC_FN_LAMBDA_JSON).expect("must convert");
+        let text = print_with(&m, Syntax::Minimal);
+        eprintln!("generic_fn_lambda output:\n{text}");
+        // Must contain a lambda (either `->` or `functionof`) for the weight_fn binding.
+        assert!(
+            text.contains("->") || text.contains("functionof"),
+            "expected lambda (`->` or `functionof`) in output, got:\n{text}"
+        );
+        assert!(
+            text.contains("weight_fn"),
+            "expected weight_fn binding, got:\n{text}"
+        );
+    }
+
+    // A generic_function whose expression does NOT reference the observable
+    // must be lowered as a scalar (deterministic), not a lambda.
+    // Concrete rf103 case: `mean = sqrt(mean2)` where `mean2` is a parameter.
+    const GENERIC_FN_SCALAR_JSON: &str = r#"{
+      "functions": [
+        {"name": "mean", "type": "generic_function",
+         "expression": "sqrt(mean2)",
+         "variables": ["x"]}
+      ],
+      "distributions": [
+        {"name": "g", "type": "gaussian_dist",
+         "mean": "mean", "sigma": "sigma_p", "x": "obs"}
+      ]
+    }"#;
+
+    #[test]
+    fn generic_function_without_observable_ref_is_scalar() {
+        let m = crate::read(GENERIC_FN_SCALAR_JSON).expect("must convert");
+        let text = print_with(&m, Syntax::Minimal);
+        eprintln!("generic_fn_scalar output:\n{text}");
+        // Must NOT contain a lambda (either `->` or `functionof`) in the mean binding.
+        assert!(
+            !text.contains("->") && !text.contains("functionof"),
+            "expected NO lambda (`->` or `functionof`) in output (should be scalar), got:\n{text}"
+        );
+        assert!(text.contains("mean"), "expected mean binding, got:\n{text}");
+        assert!(text.contains("sqrt"), "expected sqrt call, got:\n{text}");
     }
 }

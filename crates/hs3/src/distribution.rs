@@ -286,7 +286,9 @@ pub fn emit_distribution(
         }
 
         // §12: generic_dist → normalize(weighted(<expr_fn>, Lebesgue(reals)))
-        // `expression` is a C-like formula string referencing the observable `x`.
+        // When the observable's domain is declared, the normalization is restricted
+        // to that interval: normalize(truncate(weighted(…, Lebesgue(reals)), interval(lo, hi))).
+        // Without a declared domain the fallback is normalize(weighted(…, Lebesgue(reals))).
         "generic_dist" => {
             let expression = d
                 .extra
@@ -296,12 +298,20 @@ pub fn emit_distribution(
             let weight_fn = expr::parse_expr_as_fn(b, expression, "x")?;
             let lebesgue = build_lebesgue_reals(b);
             let weighted = b.call("weighted", &[weight_fn, lebesgue]);
-            Ok(b.call("normalize", &[weighted]))
+            let measure = match domain {
+                Some((lo, hi)) => {
+                    let lo_node = b.lit_real(lo);
+                    let hi_node = b.lit_real(hi);
+                    let itvl = b.call("interval", &[lo_node, hi_node]);
+                    b.call("truncate", &[weighted, itvl])
+                }
+                None => weighted,
+            };
+            Ok(b.call("normalize", &[measure]))
         }
 
         // §12: density_function_dist → normalize(weighted(<named_fn>, Lebesgue(reals)))
-        // `function` names a binding (from the `functions` block) that is already
-        // a callable accepting the observable.
+        // When the observable's domain is declared, wraps with truncate over the interval.
         "density_function_dist" => {
             let fname = d
                 .extra
@@ -311,10 +321,20 @@ pub fn emit_distribution(
             let fn_ref = b.self_ref(fname);
             let lebesgue = build_lebesgue_reals(b);
             let weighted = b.call("weighted", &[fn_ref, lebesgue]);
-            Ok(b.call("normalize", &[weighted]))
+            let measure = match domain {
+                Some((lo, hi)) => {
+                    let lo_node = b.lit_real(lo);
+                    let hi_node = b.lit_real(hi);
+                    let itvl = b.call("interval", &[lo_node, hi_node]);
+                    b.call("truncate", &[weighted, itvl])
+                }
+                None => weighted,
+            };
+            Ok(b.call("normalize", &[measure]))
         }
 
         // §12: log_density_function_dist → normalize(logweighted(<named_fn>, Lebesgue(reals)))
+        // When the observable's domain is declared, wraps with truncate over the interval.
         "log_density_function_dist" => {
             let fname = d
                 .extra
@@ -324,7 +344,16 @@ pub fn emit_distribution(
             let fn_ref = b.self_ref(fname);
             let lebesgue = build_lebesgue_reals(b);
             let logweighted = b.call("logweighted", &[fn_ref, lebesgue]);
-            Ok(b.call("normalize", &[logweighted]))
+            let measure = match domain {
+                Some((lo, hi)) => {
+                    let lo_node = b.lit_real(lo);
+                    let hi_node = b.lit_real(hi);
+                    let itvl = b.call("interval", &[lo_node, hi_node]);
+                    b.call("truncate", &[logweighted, itvl])
+                }
+                None => logweighted,
+            };
+            Ok(b.call("normalize", &[measure]))
         }
 
         // §08: rate_extended_dist → PoissonProcess(weighted(<rate>, self_ref(<distribution>)))
@@ -1040,6 +1069,122 @@ mod tests {
     /// classify to a concrete reference measure. (Companion to the black-box
     /// `every_recognized_dist_kind_has_a_dispatch_arm` test in tests/coherence.rs;
     /// it lives here because `reference_measure` is `pub(crate)`.)
+    // ── generic_dist domain normalization (§12) ──────────────────────────────
+
+    #[test]
+    fn generic_dist_with_domain_emits_truncate_interval() {
+        let d = dist(
+            "generic_dist",
+            &[("expression", serde_json::json!("1.0 + 0.1*abs(x)"))],
+        );
+        let mut m = flatppl_core::Module::new();
+        let node = {
+            let mut b = Builder::new(&mut m);
+            emit_distribution(&mut b, &d, Some((-20.0, 20.0))).unwrap()
+        };
+        {
+            let mut b = Builder::new(&mut m);
+            b.bind("d", node);
+        }
+        let text = print_with(&m, Syntax::Minimal);
+        assert!(text.contains("normalize"), "got: {text}");
+        assert!(
+            text.contains("truncate"),
+            "normalize over domain requires truncate, got: {text}"
+        );
+        assert!(
+            text.contains("interval"),
+            "truncate requires interval, got: {text}"
+        );
+        assert!(text.contains("-20"), "expected lo bound, got: {text}");
+        assert!(text.contains("20"), "expected hi bound, got: {text}");
+        assert!(text.contains("weighted"), "got: {text}");
+        assert!(text.contains("Lebesgue"), "got: {text}");
+    }
+
+    #[test]
+    fn generic_dist_without_domain_emits_lebesgue_reals_no_truncate() {
+        let d = dist(
+            "generic_dist",
+            &[("expression", serde_json::json!("1.0 + 0.1*abs(x)"))],
+        );
+        let mut m = flatppl_core::Module::new();
+        let node = {
+            let mut b = Builder::new(&mut m);
+            emit_distribution(&mut b, &d, None).unwrap()
+        };
+        {
+            let mut b = Builder::new(&mut m);
+            b.bind("d", node);
+        }
+        let text = print_with(&m, Syntax::Minimal);
+        assert!(text.contains("normalize"), "got: {text}");
+        assert!(text.contains("weighted"), "got: {text}");
+        assert!(text.contains("Lebesgue"), "got: {text}");
+        assert!(
+            !text.contains("truncate"),
+            "fallback must not emit truncate, got: {text}"
+        );
+    }
+
+    #[test]
+    fn density_function_dist_with_domain_emits_truncate_interval() {
+        let d = dist(
+            "density_function_dist",
+            &[("function", serde_json::json!("my_pdf"))],
+        );
+        let mut m = flatppl_core::Module::new();
+        let node = {
+            let mut b = Builder::new(&mut m);
+            emit_distribution(&mut b, &d, Some((-5.0, 5.0))).unwrap()
+        };
+        {
+            let mut b = Builder::new(&mut m);
+            b.bind("d", node);
+        }
+        let text = print_with(&m, Syntax::Minimal);
+        assert!(text.contains("normalize"), "got: {text}");
+        assert!(
+            text.contains("truncate"),
+            "normalize over domain requires truncate, got: {text}"
+        );
+        assert!(
+            text.contains("interval"),
+            "truncate requires interval, got: {text}"
+        );
+        assert!(text.contains("weighted"), "got: {text}");
+        assert!(text.contains("Lebesgue"), "got: {text}");
+    }
+
+    #[test]
+    fn log_density_function_dist_with_domain_emits_truncate_interval() {
+        let d = dist(
+            "log_density_function_dist",
+            &[("function", serde_json::json!("my_logpdf"))],
+        );
+        let mut m = flatppl_core::Module::new();
+        let node = {
+            let mut b = Builder::new(&mut m);
+            emit_distribution(&mut b, &d, Some((0.0, 10.0))).unwrap()
+        };
+        {
+            let mut b = Builder::new(&mut m);
+            b.bind("d", node);
+        }
+        let text = print_with(&m, Syntax::Minimal);
+        assert!(text.contains("normalize"), "got: {text}");
+        assert!(
+            text.contains("truncate"),
+            "normalize over domain requires truncate, got: {text}"
+        );
+        assert!(
+            text.contains("interval"),
+            "truncate requires interval, got: {text}"
+        );
+        assert!(text.contains("logweighted"), "got: {text}");
+        assert!(text.contains("Lebesgue"), "got: {text}");
+    }
+
     #[test]
     fn every_scalar_variate_kind_has_a_concrete_reference_measure() {
         // The recognized scalar-variate (pdf) kinds. `polynomial_dist` is omitted
