@@ -58,6 +58,7 @@ impl Provenance<'_> {
                 std::env::consts::OS,
                 std::env::consts::ARCH
             ),
+            format!("command:    {}", invocation()),
         ];
         let mut out = String::new();
         for l in lines {
@@ -69,6 +70,35 @@ impl Provenance<'_> {
         out.push('\n');
         out
     }
+}
+
+/// The full command that produced the output: the program name (basename of
+/// `argv[0]`) followed by every argument verbatim — flags, values, and paths —
+/// so the exact invocation is recorded. Arguments containing whitespace are
+/// quoted so the line is a faithful, re-runnable record.
+fn invocation() -> String {
+    let mut args = std::env::args();
+    let prog = args
+        .next()
+        .map(|a0| {
+            Path::new(&a0)
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or(a0)
+        })
+        .unwrap_or_else(|| "flatppl".into());
+    let mut parts = vec![prog];
+    for a in args {
+        if a.is_empty() || a.contains(|c: char| c.is_whitespace() || c == '"') {
+            parts.push(format!(
+                "\"{}\"",
+                a.replace('\\', "\\\\").replace('"', "\\\"")
+            ));
+        } else {
+            parts.push(a);
+        }
+    }
+    parts.join(" ")
 }
 
 /// ISO-8601 UTC timestamp (`YYYY-MM-DDThh:mm:ssZ`). Honors `SOURCE_DATE_EPOCH`
@@ -135,6 +165,9 @@ mod tests {
         assert!(h.contains("from:       HS3 JSON file `model.json`"));
         assert!(h.contains("generated:  1970-01-01T00:00:00Z"));
         assert!(h.contains("convert --from hs3"));
+        // The full invocation is recorded (under the test harness, argv[0] is the
+        // test binary — we only assert the line is present).
+        assert!(h.contains("command:    "), "missing command line in:\n{h}");
         assert!(h.ends_with("\n\n"));
         unsafe {
             std::env::remove_var("SOURCE_DATE_EPOCH");
