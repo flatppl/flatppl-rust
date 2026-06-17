@@ -1,4 +1,4 @@
-//! Round-trip tests for the Option-C JSON encoding over the workspace
+//! Round-trip tests for the FlatPIR JSON encoding over the workspace
 //! `fixtures/flatpir/*.flatpir` corpus.
 //!
 //! Oracle (spec §11: comments/whitespace are not part of the data model): the
@@ -81,8 +81,8 @@ fn every_corpus_fixture_roundtrips() {
     );
 }
 
-/// Targeted shape checks: confirm the encoding is genuine Option-C, not merely
-/// an internally-consistent round-trip.
+/// Targeted shape checks: confirm the encoding matches the documented
+/// `.flatpir.json` shape, not merely an internally-consistent round-trip.
 #[test]
 fn reified_inputs_shape() {
     let j = to_json(&read(&fixture("reified.flatpir")).unwrap());

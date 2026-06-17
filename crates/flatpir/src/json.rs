@@ -1,4 +1,4 @@
-//! FlatPIR JSON (the Option-C `.flatpir.json` encoding).
+//! FlatPIR JSON (the `.flatpir.json` encoding).
 //!
 //! A *syntactic* transducer between the canonical S-expression representation
 //! and JSON — it carries no FlatPIR semantics of its own. All semantics
@@ -11,7 +11,7 @@
 //! from_json :  JSON --emit--> canonical text --reader::read--> Module
 //! ```
 //!
-//! Shape (Option C): structural kinds (`%module`/`%bind`/`%ref`/`%meta`/`%doc`/
+//! Shape: structural kinds (`%module`/`%bind`/`%ref`/`%meta`/`%doc`/
 //! `%kwarg`/`%field`/`%assign`/axes, reified input lists) are tagged objects;
 //! calls are arrays `[head, …elements]`; atoms are explicit literal wrappers
 //! (`{int}`/`{real}`/`{str}`/`{bool}`/`{const}`/`{hole}`).
@@ -28,7 +28,7 @@ use flatppl_core::{Module, Scalar};
 // Encode:  Module -> canonical text -> Sexpr -> JSON
 // ===========================================================================
 
-/// Encode a [`Module`] as Option-C JSON.
+/// Encode a [`Module`] as FlatPIR JSON.
 ///
 /// Precondition: the `Module` must be writable as valid FlatPIR (true for any
 /// module produced by [`read`](crate::read)). Symbol/const names containing
@@ -39,7 +39,7 @@ pub fn to_json(module: &Module) -> Value {
         .expect("to_json: module is not writable as valid FlatPIR (see precondition)")
 }
 
-/// Encode a [`Module`] as Option-C JSON, returning an error instead of panicking
+/// Encode a [`Module`] as FlatPIR JSON, returning an error instead of panicking
 /// if the module is not writable as valid FlatPIR (e.g. a symbol/const name
 /// containing whitespace or `()";`, which the canonical text cannot represent).
 pub fn try_to_json(module: &Module) -> Result<Value> {
@@ -231,7 +231,7 @@ fn enc_reified(head: &str, items: &[Sexpr]) -> Value {
 // Decode:  JSON -> canonical text -> reader::read -> Module
 // ===========================================================================
 
-/// Decode Option-C JSON into a [`Module`] (via the canonical-text reader).
+/// Decode FlatPIR JSON into a [`Module`] (via the canonical-text reader).
 pub fn from_json(value: &Value) -> Result<Module> {
     let text = emit_module(value)?;
     crate::read(&text)

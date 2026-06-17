@@ -76,7 +76,7 @@ pub struct LintArgs {
 pub enum Format {
     FlatPpl,
     FlatPir,
-    /// The Option-C JSON encoding of FlatPIR (`.flatpir.json`).
+    /// The JSON encoding of FlatPIR (`.flatpir.json`).
     FlatPirJson,
 }
 
