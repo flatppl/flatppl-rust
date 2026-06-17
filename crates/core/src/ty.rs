@@ -6,6 +6,7 @@
 //! size or `%dynamic` — never a sentinel.
 
 use crate::id::Symbol;
+use std::fmt;
 
 /// The structural category of a value / object (the FlatPIR `%meta` type slot).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -216,6 +217,104 @@ pub enum Phase {
     Stochastic,
 }
 
+// ── Human-facing rendering (concise, code-like surface notation) ─────────────
+//
+// These `Display` impls render the inference domain in a compact, readable
+// notation for IDE surfaces, unlike the derived `Debug` (which prints Rust
+// struct syntax). `Type` itself is rendered by `Module::display_type`, because
+// naming its interned fields/inputs needs the module interner. Symbol-free
+// domains (value-sets, phases, masses, scalars, dims) need no interner, so they
+// get plain `Display` impls here.
+
+impl ScalarType {
+    /// The spec §11 scalar keyword (`real` / `integer` / `boolean` / `complex`).
+    pub fn name(self) -> &'static str {
+        match self {
+            ScalarType::Real => "real",
+            ScalarType::Integer => "integer",
+            ScalarType::Boolean => "boolean",
+            ScalarType::Complex => "complex",
+        }
+    }
+}
+
+impl fmt::Display for ScalarType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+impl Mass {
+    /// Friendly total-mass word (`normalized`, `finite`, `locally-finite`, …).
+    pub fn name(self) -> &'static str {
+        match self {
+            Mass::Deferred => "deferred",
+            Mass::Null => "null",
+            Mass::Normalized => "normalized",
+            Mass::Finite => "finite",
+            Mass::LocallyFinite => "locally-finite",
+            Mass::Unknown => "unknown",
+        }
+    }
+}
+
+impl fmt::Display for Mass {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+impl fmt::Display for Dim {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Dim::Static(n) => write!(f, "{n}"),
+            Dim::Dynamic => f.write_str("?"),
+        }
+    }
+}
+
+impl Phase {
+    /// The spec §04 phase keyword (`fixed` / `parameterized` / `stochastic`).
+    pub fn name(self) -> &'static str {
+        match self {
+            Phase::Fixed => "fixed",
+            Phase::Parameterized => "parameterized",
+            Phase::Stochastic => "stochastic",
+        }
+    }
+}
+
+impl fmt::Display for Phase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+impl fmt::Display for ValueSet {
+    /// The value-set surface vocabulary (`reals`, `cartpow(set, n)`, …).
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use ValueSet::*;
+        match self {
+            Deferred => f.write_str("deferred"),
+            Unknown => f.write_str("unknown"),
+            Reals => f.write_str("reals"),
+            PosReals => f.write_str("posreals"),
+            NonNegReals => f.write_str("nonnegreals"),
+            UnitInterval => f.write_str("unitinterval"),
+            Integers => f.write_str("integers"),
+            PosIntegers => f.write_str("posintegers"),
+            NonNegIntegers => f.write_str("nonnegintegers"),
+            Booleans => f.write_str("booleans"),
+            Complexes => f.write_str("complexes"),
+            RngStates => f.write_str("rngstates"),
+            Anything => f.write_str("anything"),
+            StdSimplex(d) => write!(f, "stdsimplex({d})"),
+            Interval(lo, hi) => write!(f, "interval({lo}, {hi})"),
+            CartPow(set, d) => write!(f, "cartpow({set}, {d})"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,6 +364,24 @@ mod tests {
             None
         );
         assert_eq!(Unknown.is_bounded(), None);
+    }
+
+    #[test]
+    fn display_surface_vocab() {
+        use ValueSet::*;
+        assert_eq!(ScalarType::Real.to_string(), "real");
+        assert_eq!(Mass::Normalized.to_string(), "normalized");
+        assert_eq!(Mass::LocallyFinite.to_string(), "locally-finite");
+        assert_eq!(Phase::Stochastic.to_string(), "stochastic");
+        assert_eq!(Dim::Static(3).to_string(), "3");
+        assert_eq!(Dim::Dynamic.to_string(), "?");
+        assert_eq!(Reals.to_string(), "reals");
+        assert_eq!(StdSimplex(Dim::Static(4)).to_string(), "stdsimplex(4)");
+        assert_eq!(Interval(0.0, 1.0).to_string(), "interval(0, 1)");
+        assert_eq!(
+            CartPow(Box::new(Reals), Dim::Dynamic).to_string(),
+            "cartpow(reals, ?)"
+        );
     }
 
     #[test]

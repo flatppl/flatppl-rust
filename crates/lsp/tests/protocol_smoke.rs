@@ -222,12 +222,12 @@ fn initialize_did_open_hover_smoke() {
     };
 
     // The hover string is `**type:** \`...\`` — assert it mentions "type" and a
-    // scalar type token ("Integer", "Real", "Scalar", or "scalar").
+    // scalar type keyword (rendered bare/lowercase: `real`, `integer`, …).
     assert!(
         markdown.to_lowercase().contains("type"),
         "hover markdown must mention 'type'; got: {markdown:?}"
     );
-    let has_scalar_token = ["Integer", "Real", "Scalar", "scalar", "Complex"]
+    let has_scalar_token = ["integer", "real", "boolean", "complex"]
         .iter()
         .any(|tok| markdown.contains(tok));
     assert!(

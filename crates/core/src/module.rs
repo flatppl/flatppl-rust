@@ -3,8 +3,21 @@
 
 use crate::id::{Arena, BindingId, Idx, Interner, NodeId, SecondaryMap, Symbol};
 use crate::node::{Node, Ref};
-use crate::ty::{Phase, Type, ValueSet};
+use crate::ty::{Mass, Phase, Type, ValueSet};
 use std::collections::HashMap;
+
+/// The trailing ` · <mass>` annotation for a measure/kernel type in
+/// [`Module::display_type`]. An unknown or not-yet-inferred mass adds no
+/// annotation (it would only be noise).
+fn mass_suffix(mass: Mass) -> &'static str {
+    match mass {
+        Mass::Normalized => " · normalized",
+        Mass::Finite => " · finite",
+        Mass::LocallyFinite => " · locally-finite",
+        Mass::Null => " · null",
+        Mass::Unknown | Mass::Deferred => "",
+    }
+}
 
 /// A single FlatPPL module: a flat, order-irrelevant set of named bindings over a
 /// shared node arena, plus the interner and analysis side-tables.
@@ -124,6 +137,124 @@ impl Module {
         self.interner.resolve(sym)
     }
 
+    /// Render a [`Type`] in a concise, code-like notation, resolving interned
+    /// field/input names to their source text.
+    ///
+    /// Unlike the derived `Debug` — which prints Rust struct syntax and shows
+    /// interned names as opaque `Symbol(n)` integers — this produces the
+    /// readable form used for human-facing surfaces (e.g. LSP hover):
+    /// `{mu: real, n: integer}`, `kernel(theta) → measure · normalized`,
+    /// `measure<real> · normalized`, `real[3]`, `likelihood(theta) over real`.
+    pub fn display_type(&self, ty: &Type) -> String {
+        let mut s = String::new();
+        self.write_type(&mut s, ty);
+        s
+    }
+
+    fn write_type(&self, out: &mut String, ty: &Type) {
+        use std::fmt::Write as _;
+        match ty {
+            Type::Deferred => out.push_str("deferred"),
+            Type::Failed(reason) => {
+                let _ = write!(out, "failed(\"{reason}\")");
+            }
+            Type::Any => out.push_str("any"),
+            Type::Scalar(st) => {
+                let _ = write!(out, "{st}");
+            }
+            Type::Array { shape, elem } => {
+                self.write_type(out, elem);
+                out.push('[');
+                for (i, d) in shape.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    let _ = write!(out, "{d}");
+                }
+                out.push(']');
+            }
+            Type::TVector { len, elem } => {
+                self.write_type(out, elem);
+                let _ = write!(out, "[{len}]ᵀ");
+            }
+            Type::Record(fields) => {
+                out.push('{');
+                for (i, (name, fty)) in fields.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    let _ = write!(out, "{}: ", self.resolve(*name));
+                    self.write_type(out, fty);
+                }
+                out.push('}');
+            }
+            Type::Tuple(parts) => {
+                out.push('(');
+                for (i, p) in parts.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    self.write_type(out, p);
+                }
+                out.push(')');
+            }
+            Type::Table { columns, nrows } => {
+                out.push_str("table {");
+                for (i, (name, cty)) in columns.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    let _ = write!(out, "{}: ", self.resolve(*name));
+                    self.write_type(out, cty);
+                }
+                let _ = write!(out, "}}[{nrows}]");
+            }
+            Type::Measure { domain, mass } => {
+                out.push_str("measure<");
+                self.write_type(out, domain);
+                out.push('>');
+                out.push_str(mass_suffix(*mass));
+            }
+            Type::Kernel { inputs, mass } => {
+                out.push_str("kernel(");
+                for (i, inp) in inputs.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    out.push_str(self.resolve(*inp));
+                }
+                out.push_str(") → measure");
+                out.push_str(mass_suffix(*mass));
+            }
+            Type::Function { inputs } => {
+                out.push_str("fn(");
+                for (i, inp) in inputs.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    out.push_str(self.resolve(*inp));
+                }
+                out.push(')');
+            }
+            Type::Likelihood { inputs, obstype } => {
+                out.push_str("likelihood(");
+                for (i, inp) in inputs.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    out.push_str(self.resolve(*inp));
+                }
+                out.push_str(") over ");
+                self.write_type(out, obstype);
+            }
+            Type::RngState => out.push_str("rngstate"),
+            Type::Module => out.push_str("module"),
+            Type::Var(n) => {
+                let _ = write!(out, "?{n}");
+            }
+        }
+    }
+
     /// Look up a top-level binding by name.
     pub fn binding_by_name(&self, name: Symbol) -> Option<BindingId> {
         self.by_name.get(&name).copied()
@@ -237,6 +368,101 @@ mod tests {
         assert_eq!(m.node_at_offset(4), Some(seven)); // inside `7` -> the literal
         assert_eq!(m.node_at_offset(1), Some(call)); // on `add` text -> the call
         assert_eq!(m.node_at_offset(99), None); // past end -> nothing
+    }
+
+    #[test]
+    fn display_type_resolves_names_and_uses_code_notation() {
+        use crate::ty::{Dim, Mass, ScalarType, Type};
+        let mut m = Module::new();
+        let mu = m.intern("mu");
+        let n = m.intern("n");
+        let theta = m.intern("theta");
+        let a = m.intern("a");
+        let b = m.intern("b");
+        let real = || Type::Scalar(ScalarType::Real);
+        let int = || Type::Scalar(ScalarType::Integer);
+
+        // Record field names are resolved (not `Symbol(n)`); scalars are bare.
+        let rec = Type::Record(vec![(mu, real()), (n, int())].into());
+        assert_eq!(m.display_type(&rec), "{mu: real, n: integer}");
+
+        // Kernel / likelihood / measure — the constructs whose Debug was worst.
+        assert_eq!(
+            m.display_type(&Type::Kernel {
+                inputs: vec![theta].into(),
+                mass: Mass::Normalized
+            }),
+            "kernel(theta) → measure · normalized"
+        );
+        assert_eq!(
+            m.display_type(&Type::Likelihood {
+                inputs: vec![theta].into(),
+                obstype: Box::new(real())
+            }),
+            "likelihood(theta) over real"
+        );
+        assert_eq!(
+            m.display_type(&Type::Measure {
+                domain: Box::new(real()),
+                mass: Mass::Finite
+            }),
+            "measure<real> · finite"
+        );
+        // Unknown / deferred mass adds no annotation (avoids noise).
+        assert_eq!(
+            m.display_type(&Type::Measure {
+                domain: Box::new(real()),
+                mass: Mass::Unknown
+            }),
+            "measure<real>"
+        );
+
+        // Arrays: static, multi-dim, and dynamic (`?`); transposed vector.
+        assert_eq!(
+            m.display_type(&Type::Array {
+                shape: vec![Dim::Static(3)].into(),
+                elem: Box::new(real())
+            }),
+            "real[3]"
+        );
+        assert_eq!(
+            m.display_type(&Type::Array {
+                shape: vec![Dim::Static(2), Dim::Dynamic].into(),
+                elem: Box::new(int())
+            }),
+            "integer[2, ?]"
+        );
+        assert_eq!(
+            m.display_type(&Type::TVector {
+                len: Dim::Static(3),
+                elem: Box::new(real())
+            }),
+            "real[3]ᵀ"
+        );
+
+        // Function / tuple / table / type-var / bare keywords.
+        assert_eq!(
+            m.display_type(&Type::Function {
+                inputs: vec![a, b].into()
+            }),
+            "fn(a, b)"
+        );
+        assert_eq!(
+            m.display_type(&Type::Tuple(vec![real(), int()].into())),
+            "(real, integer)"
+        );
+        assert_eq!(
+            m.display_type(&Type::Table {
+                columns: vec![(a, real())].into(),
+                nrows: Dim::Static(100)
+            }),
+            "table {a: real}[100]"
+        );
+        assert_eq!(m.display_type(&Type::Var(0)), "?0");
+        assert_eq!(m.display_type(&Type::Any), "any");
+        assert_eq!(m.display_type(&Type::Deferred), "deferred");
+        assert_eq!(m.display_type(&Type::RngState), "rngstate");
+        assert_eq!(m.display_type(&Type::Module), "module");
     }
 
     #[test]

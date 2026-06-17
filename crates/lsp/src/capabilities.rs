@@ -232,12 +232,12 @@ pub fn hover(
     let module = analyzed.module(db)?;
     let node_id = module.node_at_offset(byte_offset)?;
     let ty = module.type_of(node_id)?;
-    let mut parts = vec![format!("**type:** `{ty:?}`")];
+    let mut parts = vec![format!("**type:** `{}`", module.display_type(ty))];
     if let Some(phase) = module.phase_of(node_id) {
-        parts.push(format!("**phase:** `{phase:?}`"));
+        parts.push(format!("**phase:** `{phase}`"));
     }
     if let Some(vs) = module.valueset_of(node_id) {
-        parts.push(format!("**value-set:** `{vs:?}`"));
+        parts.push(format!("**value-set:** `{vs}`"));
     }
     Some(parts.join("  \n"))
 }
@@ -766,10 +766,11 @@ mod tests {
             s.contains("value-set"),
             "hover string must contain 'value-set'; got: {s:?}"
         );
-        // The value-set for elementof(reals) should be Reals.
+        // The value-set for elementof(reals) renders in the spec surface
+        // vocabulary as `reals` (lowercase), not the Debug `Reals`.
         assert!(
-            s.contains("Reals"),
-            "hover string must mention 'Reals' for elementof(reals); got: {s:?}"
+            s.contains("reals"),
+            "hover string must mention 'reals' for elementof(reals); got: {s:?}"
         );
     }
 
