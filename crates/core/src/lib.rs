@@ -24,3 +24,9 @@ pub use node::{
     Axis, Call, CallHead, Inputs, NamedArg, NamedKind, Node, Ref, RefNs, Scalar, Variance,
 };
 pub use ty::{Dim, Mass, Phase, ScalarType, Type, ValueSet};
+
+/// The FlatPPL language version this toolchain targets — the string stamped into
+/// a generated module's `flatppl_compat` binding (spec §11). The whole ecosystem
+/// is pinned to `0.1` pre-release (see `flatppl-dev/CONVENTIONS.md`, "Version
+/// state"); this constant is the single source of truth for that value.
+pub const FLATPPL_COMPAT: &str = "0.1";

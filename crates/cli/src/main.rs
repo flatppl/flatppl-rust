@@ -25,7 +25,7 @@ use flatppl_cli::report;
 #[cfg(feature = "convert")]
 use flatppl_cli::write_module;
 #[cfg(any(feature = "convert", feature = "infer"))]
-use flatppl_cli::{Failure, Format, Provenance};
+use flatppl_cli::{Failure, Format, banner};
 #[cfg(feature = "fmtlint")]
 use flatppl_cli::{run_fmt, run_lint};
 
@@ -65,10 +65,10 @@ enum Command {
         /// override the extension.
         #[arg(long, value_enum, default_value_t = FromFormat::Auto)]
         from: FromFormat,
-        /// Omit the leading provenance header comment. The header (records
-        /// when/from-what/by-whom the file was generated) is included by
-        /// default; pass this — or set `SOURCE_DATE_EPOCH` — for reproducible
-        /// byte-output.
+        /// Omit the leading "do not edit" banner comment (a single line, no
+        /// timestamp/user/host/platform/command — included by default). The
+        /// targeted FlatPPL version is recorded in-model as `flatppl_compat`,
+        /// not in the banner.
         #[arg(long)]
         no_header: bool,
     },
@@ -305,23 +305,11 @@ fn convert(
     if !text.ends_with('\n') {
         text.push('\n');
     }
-    // The provenance header is a leading comment block; a format with no comment
-    // syntax (`.flatpir.json`) renders an empty header (`CommentStyle::None`).
+    // A leading "do not edit" banner; a format with no comment syntax
+    // (`.flatpir.json`) renders nothing (`CommentStyle::None`). The targeted
+    // FlatPPL version is recorded in-model as `flatppl_compat`, not here.
     if !no_header {
-        let from_label = match from_format {
-            FromFormat::Hs3 => "HS3 JSON",
-            FromFormat::Pyhf => "pyhf workspace JSON",
-            FromFormat::Auto => Format::from_path(input)
-                .map(Format::describe)
-                .unwrap_or("FlatPPL/FlatPIR"),
-        };
-        let header = Provenance {
-            converted_from: from_label,
-            source: input,
-            generator: "convert",
-        }
-        .header(to.comment_style());
-        text.insert_str(0, &header);
+        text.insert_str(0, &banner(to.comment_style()));
     }
     // Surface lint findings on generated FlatPPL (advisory — the file is still
     // written). The output is already canonically formatted by the printer.
@@ -388,14 +376,8 @@ fn infer_cmd(
         text.push('\n');
     }
     if !no_header {
-        // `infer` always writes FlatPIR (`;` comments); records the input format.
-        let header = Provenance {
-            converted_from: from.describe(),
-            source: input,
-            generator: "infer",
-        }
-        .header(Format::FlatPir.comment_style());
-        text.insert_str(0, &header);
+        // `infer` always writes FlatPIR (`;` comments).
+        text.insert_str(0, &banner(Format::FlatPir.comment_style()));
     }
     fs::write(output, text)
         .map_err(|e| Failure::Plain(format!("writing `{}`: {e}", output.display())))

@@ -13,7 +13,7 @@ use ariadne::{Config, Label, Report, ReportKind, Source};
 use flatppl_core::Module;
 
 pub mod provenance;
-pub use provenance::Provenance;
+pub use provenance::banner;
 
 // ── clap mirrors ───────────────────────────────────────────────────────────────
 
@@ -104,40 +104,27 @@ impl Format {
         }
     }
 
-    /// How a provenance header comment is written for this format.
+    /// How the leading generated-file banner is commented for this format.
     ///
-    /// FlatPPL uses a `###` **block** comment, not per-line `#`: a `%` line is a
-    /// *doc*-comment (it must attach to a binding), and a `#` line-comment ends at
-    /// the first `;` (spec §05) — which the header prose and the recorded command
-    /// can both contain — so only a block comment carries arbitrary header text
-    /// safely. FlatPIR uses per-line `;`; JSON has no comment syntax (no header).
+    /// FlatPPL and FlatPIR both use a single line comment — `#` and `;`
+    /// respectively. (A `#` comment ends at the first `;` per spec §05, but the
+    /// banner text carries none, so a line comment is safe.) JSON has no comment
+    /// syntax, so it gets no banner.
     pub fn comment_style(self) -> CommentStyle {
         match self {
-            Format::FlatPpl => CommentStyle::Block("###"),
+            Format::FlatPpl => CommentStyle::Line("#"),
             Format::FlatPir => CommentStyle::Line(";"),
             Format::FlatPirJson => CommentStyle::None,
         }
     }
-
-    /// Human name of the format, for the header's `from:` field.
-    pub fn describe(self) -> &'static str {
-        match self {
-            Format::FlatPpl => "FlatPPL",
-            Format::FlatPir => "FlatPIR",
-            Format::FlatPirJson => "FlatPIR JSON",
-        }
-    }
 }
 
-/// How a provenance header is commented for a given [`Format`].
+/// How the generated-file banner is commented for a given [`Format`].
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum CommentStyle {
-    /// Prefix every line with this marker (e.g. FlatPIR `;`).
+    /// Prefix the banner line with this marker (e.g. FlatPPL `#`, FlatPIR `;`).
     Line(&'static str),
-    /// Fence the whole header between `<fence>` lines (e.g. FlatPPL `###`),
-    /// immune to in-line terminators such as FlatPPL's `;`.
-    Block(&'static str),
-    /// The format has no comment syntax (JSON): no header is written.
+    /// The format has no comment syntax (JSON): no banner is written.
     None,
 }
 

@@ -24,6 +24,9 @@ pub fn document_to_module(doc: &Document) -> Result<Module> {
     reject_unsupported(doc)?;
 
     let mut m = Module::new();
+    // Stamp the targeted FlatPPL language version first, so `flatppl_compat`
+    // leads the generated module (spec §11).
+    Builder::new(&mut m).stamp_compat();
     let dist_names: BTreeSet<&str> = doc.distributions.iter().map(|d| d.name.as_str()).collect();
     // Names defined in the `functions` block — these are deterministic bindings, not free params.
     let fn_names: BTreeSet<&str> = doc.functions.iter().map(|f| f.name.as_str()).collect();

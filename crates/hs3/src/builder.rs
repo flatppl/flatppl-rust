@@ -69,6 +69,15 @@ impl<'m> Builder<'m> {
         self.call("vector", elems)
     }
 
+    /// Stamp the module with `flatppl_compat = "<version>"` (spec §11: an ordinary
+    /// string binding declaring the targeted FlatPPL language version). Call this
+    /// **first** when building a generated module so it lands as the first binding.
+    /// The version is [`flatppl_core::FLATPPL_COMPAT`], the ecosystem-wide pin.
+    pub(crate) fn stamp_compat(&mut self) {
+        let v = self.str_lit(flatppl_core::FLATPPL_COMPAT);
+        self.bind("flatppl_compat", v);
+    }
+
     pub(crate) fn bind(&mut self, name: &str, rhs: NodeId) {
         let name = self.sym(name);
         self.m.add_binding(Binding {

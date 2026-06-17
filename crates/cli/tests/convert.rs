@@ -93,8 +93,10 @@ fn same_format_canonicalizes() {
     );
 }
 
-/// Generated files carry a provenance header by default: a leading comment
-/// block (`;` for FlatPIR) recording generator, source format + file, and platform.
+/// Generated files carry a minimal "do not edit" banner by default: a single
+/// leading comment line (`;` for FlatPIR). It records nothing else — no
+/// timestamp, user, host, platform, or command line — so no personal or system
+/// information leaks (see `provenance.rs`).
 #[test]
 fn provenance_header_present_by_default() {
     let dir = Scratch::new("prov");
@@ -106,17 +108,21 @@ fn provenance_header_present_by_default() {
     assert!(status.success());
     let text = fs::read_to_string(&out).unwrap();
     assert!(
-        text.starts_with("; AUTOMATICALLY GENERATED"),
-        "expected a leading FlatPIR provenance comment, got:\n{text}"
+        text.starts_with("; AUTOMATICALLY GENERATED — do not edit\n"),
+        "expected a leading FlatPIR banner, got:\n{text}"
     );
-    for field in [
-        "generator:  flatppl",
-        "from:       FlatPPL file `m.flatppl`",
+    // No pseudo-provenance / personal fields leak into the banner.
+    for leaked in [
+        "generator:",
+        "from:",
+        "by:",
         "platform:",
+        "command:",
+        "generated:",
     ] {
-        assert!(text.contains(field), "missing `{field}` in:\n{text}");
+        assert!(!text.contains(leaked), "banner must not leak `{leaked}` in:\n{text}");
     }
-    // The model still follows the header.
+    // The model still follows the banner.
     assert!(
         text.contains("(%module"),
         "model body missing, got:\n{text}"

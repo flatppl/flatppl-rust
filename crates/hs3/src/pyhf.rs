@@ -20,6 +20,8 @@ pub fn pyhf_to_module(doc: &PyhfDocument) -> Result<Module> {
     let mut m = Module::new();
     {
         let mut b = Builder::new(&mut m);
+        // `flatppl_compat` leads the generated module (spec §11).
+        b.stamp_compat();
         emit_pyhf(&mut b, doc)?;
     }
     Ok(m)

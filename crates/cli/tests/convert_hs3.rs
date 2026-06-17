@@ -35,7 +35,8 @@ fn convert_from_hs3_minimal() {
 
 /// `.hs3.json` / `.pyhf.json` names are auto-detected without `--from`
 /// (mirroring the `.flatpir.json` convention; an explicit `--from` overrides).
-/// The provenance `from:` label is the discriminator HS3 vs pyhf.
+/// The discriminator is the emitted content (HS3 → a `Normal`, pyhf → an
+/// assembled `joint_likelihood`); both stamp the leading `flatppl_compat`.
 #[test]
 fn auto_detects_hs3_and_pyhf_by_extension() {
     let dir = std::env::temp_dir();
@@ -50,10 +51,10 @@ fn auto_detects_hs3_and_pyhf_by_extension() {
         .unwrap();
     assert!(status.success(), "auto-detected .hs3.json convert failed");
     let text = std::fs::read_to_string(&hs3_out).unwrap();
-    assert!(text.contains("Normal"), "got:\n{text}");
+    assert!(text.contains("Normal"), "HS3 path must emit a Normal, got:\n{text}");
     assert!(
-        text.contains("from:       HS3 JSON"),
-        "header must record HS3 as the source, got:\n{text}"
+        text.contains("flatppl_compat = \"0.1\""),
+        "generated module must stamp flatppl_compat, got:\n{text}"
     );
 
     // `*.pyhf.json` → pyhf importer, no `--from`.
@@ -67,8 +68,12 @@ fn auto_detects_hs3_and_pyhf_by_extension() {
     assert!(status.success(), "auto-detected .pyhf.json convert failed");
     let text = std::fs::read_to_string(&pyhf_out).unwrap();
     assert!(
-        text.contains("from:       pyhf workspace JSON"),
-        "header must record pyhf as the source, got:\n{text}"
+        text.contains("joint_likelihood("),
+        "pyhf path must assemble a joint_likelihood, got:\n{text}"
+    );
+    assert!(
+        text.contains("flatppl_compat = \"0.1\""),
+        "generated module must stamp flatppl_compat, got:\n{text}"
     );
 }
 
@@ -166,11 +171,13 @@ fn convert_from_hs3_fixture() {
     );
 }
 
-/// HS3/pyhf conversions carry the provenance header by default — recording the
-/// source format and the `--from` input file — and `--no-header` omits it. The
-/// FlatPPL output uses `%` comments.
+/// HS3/pyhf conversions carry a minimal "do not edit" banner by default (a single
+/// FlatPPL `#` line comment) and stamp `flatppl_compat = "0.1"` as the leading
+/// binding. The banner leaks no personal/system information (no timestamp, user,
+/// host, platform, or command line). `--no-header` drops the banner but keeps the
+/// `flatppl_compat` binding — it is part of the model, not the comment.
 #[test]
-fn hs3_convert_emits_provenance_header() {
+fn hs3_convert_emits_banner_and_compat() {
     let dir = std::env::temp_dir();
     let inp = dir.join("hs3_prov_cli.json");
     let out = dir.join("hs3_prov_cli.flatppl");
@@ -180,7 +187,7 @@ fn hs3_convert_emits_provenance_header() {
     )
     .unwrap();
 
-    // Default: header present, naming the HS3 source file.
+    // Default: minimal banner, then the leading flatppl_compat binding.
     let status = Command::new(env!("CARGO_BIN_EXE_flatppl"))
         .args([
             "convert",
@@ -194,24 +201,26 @@ fn hs3_convert_emits_provenance_header() {
     assert!(status.success());
     let text = std::fs::read_to_string(&out).unwrap();
     assert!(
-        text.starts_with("###\nAUTOMATICALLY GENERATED"),
-        "expected a leading FlatPPL provenance block comment, got:\n{text}"
+        text.starts_with("# AUTOMATICALLY GENERATED — do not edit\n"),
+        "expected a minimal leading FlatPPL banner, got:\n{text}"
     );
     assert!(
-        text.contains("from:       HS3 JSON file `hs3_prov_cli.json`"),
-        "header must name the HS3 source, got:\n{text}"
+        text.contains("flatppl_compat = \"0.1\""),
+        "generated module must stamp the leading flatppl_compat binding, got:\n{text}"
     );
-    assert!(text.contains("generator:  flatppl"), "got:\n{text}");
-    // The full invocation is captured, including the --from flag and its value.
-    assert!(
-        text.contains("command:    ")
-            && text.contains("convert")
-            && text.contains("--from")
-            && text.contains("hs3"),
-        "header must record the full convert command, got:\n{text}"
-    );
+    // No pseudo-provenance / personal information of any kind.
+    for leaked in [
+        "generator:",
+        "from:",
+        "by:",
+        "platform:",
+        "command:",
+        "generated:",
+    ] {
+        assert!(!text.contains(leaked), "banner must not leak `{leaked}`, got:\n{text}");
+    }
 
-    // --no-header omits the block.
+    // --no-header: banner gone, but flatppl_compat (a binding) leads the output.
     let status = Command::new(env!("CARGO_BIN_EXE_flatppl"))
         .args([
             "convert",
@@ -227,6 +236,10 @@ fn hs3_convert_emits_provenance_header() {
     let text = std::fs::read_to_string(&out).unwrap();
     assert!(
         !text.contains("AUTOMATICALLY GENERATED"),
-        "--no-header must omit the provenance block, got:\n{text}"
+        "--no-header must omit the banner, got:\n{text}"
+    );
+    assert!(
+        text.starts_with("flatppl_compat = \"0.1\""),
+        "flatppl_compat must persist and lead under --no-header, got:\n{text}"
     );
 }
