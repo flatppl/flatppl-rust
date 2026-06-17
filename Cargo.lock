@@ -141,6 +141,7 @@ name = "flatppl-flatpir"
 version = "0.1.0"
 dependencies = [
  "flatppl-core",
+ "serde_json",
 ]
 
 [[package]]
