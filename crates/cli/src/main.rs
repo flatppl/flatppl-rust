@@ -265,9 +265,9 @@ fn convert(
     if !text.ends_with('\n') {
         text.push('\n');
     }
-    // The provenance header is a leading comment; skip it for a format that has
-    // no comment syntax (`.flatpir.json` — JSON can't carry it).
-    if let (false, Some(comment)) = (no_header, to.line_comment()) {
+    // The provenance header is a leading comment block; a format with no comment
+    // syntax (`.flatpir.json`) renders an empty header (`CommentStyle::None`).
+    if !no_header {
         let from_label = match from_format {
             FromFormat::Hs3 => "HS3 JSON",
             FromFormat::Pyhf => "pyhf workspace JSON",
@@ -280,7 +280,7 @@ fn convert(
             source: input,
             generator: "convert",
         }
-        .header(comment);
+        .header(to.comment_style());
         text.insert_str(0, &header);
     }
     // Surface lint findings on generated FlatPPL (advisory — the file is still
@@ -354,11 +354,7 @@ fn infer_cmd(
             source: input,
             generator: "infer",
         }
-        .header(
-            Format::FlatPir
-                .line_comment()
-                .expect("FlatPIR has a line comment"),
-        );
+        .header(Format::FlatPir.comment_style());
         text.insert_str(0, &header);
     }
     fs::write(output, text)

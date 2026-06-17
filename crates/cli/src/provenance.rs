@@ -3,13 +3,15 @@
 //! Every file the `flatppl` driver writes carries a leading comment block
 //! recording how it was produced — when, from what source, by whom, on which
 //! platform — so a generated artifact stays traceable to its origin. The block
-//! uses the target format's line comment (`%` for FlatPPL, `;` for FlatPIR).
+//! uses the target format's comment syntax (a `###` block comment for FlatPPL,
+//! `;` line comments for FlatPIR).
 //!
 //! The header embeds a wall-clock timestamp and the invoking user, so output is
 //! not byte-reproducible by default. Pass `--no-header` to omit the block
 //! entirely, or set `SOURCE_DATE_EPOCH` to pin the timestamp, when reproducible
 //! output (golden diffs, deterministic builds) is required.
 
+use crate::CommentStyle;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -24,9 +26,10 @@ pub struct Provenance<'a> {
 }
 
 impl Provenance<'_> {
-    /// Render the header as a `comment`-prefixed (`%` or `;`) block terminated by
-    /// a blank line, suitable for prepending to the generated source.
-    pub fn header(&self, comment: &str) -> String {
+    /// Render the header as a comment block (per [`CommentStyle`]) terminated by
+    /// a blank line, suitable for prepending to the generated source. Returns an
+    /// empty string for [`CommentStyle::None`].
+    pub fn header(&self, style: CommentStyle) -> String {
         let user = std::env::var("USER")
             .or_else(|_| std::env::var("USERNAME"))
             .unwrap_or_else(|_| "unknown".into());
@@ -61,11 +64,28 @@ impl Provenance<'_> {
             format!("command:    {}", invocation()),
         ];
         let mut out = String::new();
-        for l in lines {
-            out.push_str(comment);
-            out.push(' ');
-            out.push_str(&l);
-            out.push('\n');
+        match style {
+            CommentStyle::None => return out,
+            CommentStyle::Line(prefix) => {
+                for l in lines {
+                    out.push_str(prefix);
+                    out.push(' ');
+                    out.push_str(&l);
+                    out.push('\n');
+                }
+            }
+            CommentStyle::Block(fence) => {
+                // Fences sit on their own lines; the free text between them can
+                // contain `;` (which would end a `#`/`%` line comment) safely.
+                out.push_str(fence);
+                out.push('\n');
+                for l in lines {
+                    out.push_str(&l);
+                    out.push('\n');
+                }
+                out.push_str(fence);
+                out.push('\n');
+            }
         }
         out.push('\n');
         out
@@ -160,8 +180,11 @@ mod tests {
             source: Path::new("/tmp/model.json"),
             generator: "convert --from hs3",
         };
-        let h = p.header("%");
-        assert!(h.lines().all(|l| l.is_empty() || l.starts_with('%')));
+        // FlatPPL uses a `###` block comment: opening + closing fences with
+        // free-text content between (so a `;` in the prose can't end it).
+        let h = p.header(CommentStyle::Block("###"));
+        assert!(h.starts_with("###\n"), "got:\n{h}");
+        assert!(h.trim_end().ends_with("###"), "got:\n{h}");
         assert!(h.contains("from:       HS3 JSON file `model.json`"));
         assert!(h.contains("generated:  1970-01-01T00:00:00Z"));
         assert!(h.contains("convert --from hs3"));
@@ -169,6 +192,11 @@ mod tests {
         // test binary — we only assert the line is present).
         assert!(h.contains("command:    "), "missing command line in:\n{h}");
         assert!(h.ends_with("\n\n"));
+
+        // FlatPIR uses per-line `;`; the no-comment format yields no header.
+        let line = p.header(CommentStyle::Line(";"));
+        assert!(line.lines().all(|l| l.is_empty() || l.starts_with(';')));
+        assert!(p.header(CommentStyle::None).is_empty());
         unsafe {
             std::env::remove_var("SOURCE_DATE_EPOCH");
         }

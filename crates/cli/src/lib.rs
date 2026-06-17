@@ -104,14 +104,18 @@ impl Format {
         }
     }
 
-    /// The line-comment marker for this format (for the provenance header), or
-    /// `None` for a format that has no comment syntax (JSON — the header is
-    /// omitted for it).
-    pub fn line_comment(self) -> Option<&'static str> {
+    /// How a provenance header comment is written for this format.
+    ///
+    /// FlatPPL uses a `###` **block** comment, not per-line `#`: a `%` line is a
+    /// *doc*-comment (it must attach to a binding), and a `#` line-comment ends at
+    /// the first `;` (spec §05) — which the header prose and the recorded command
+    /// can both contain — so only a block comment carries arbitrary header text
+    /// safely. FlatPIR uses per-line `;`; JSON has no comment syntax (no header).
+    pub fn comment_style(self) -> CommentStyle {
         match self {
-            Format::FlatPpl => Some("%"),
-            Format::FlatPir => Some(";"),
-            Format::FlatPirJson => None,
+            Format::FlatPpl => CommentStyle::Block("###"),
+            Format::FlatPir => CommentStyle::Line(";"),
+            Format::FlatPirJson => CommentStyle::None,
         }
     }
 
@@ -123,6 +127,18 @@ impl Format {
             Format::FlatPirJson => "FlatPIR JSON",
         }
     }
+}
+
+/// How a provenance header is commented for a given [`Format`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum CommentStyle {
+    /// Prefix every line with this marker (e.g. FlatPIR `;`).
+    Line(&'static str),
+    /// Fence the whole header between `<fence>` lines (e.g. FlatPPL `###`),
+    /// immune to in-line terminators such as FlatPPL's `;`.
+    Block(&'static str),
+    /// The format has no comment syntax (JSON): no header is written.
+    None,
 }
 
 // ── Failure / diagnostics ────────────────────────────────────────────────────

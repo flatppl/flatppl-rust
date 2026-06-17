@@ -155,8 +155,8 @@ fn hs3_convert_emits_provenance_header() {
     assert!(status.success());
     let text = std::fs::read_to_string(&out).unwrap();
     assert!(
-        text.starts_with("% AUTOMATICALLY GENERATED"),
-        "expected a leading FlatPPL provenance comment, got:\n{text}"
+        text.starts_with("###\nAUTOMATICALLY GENERATED"),
+        "expected a leading FlatPPL provenance block comment, got:\n{text}"
     );
     assert!(
         text.contains("from:       HS3 JSON file `hs3_prov_cli.json`"),
