@@ -35,6 +35,13 @@ pub struct Document {
     /// HS3 `functions` block: deterministic derived quantities.
     #[serde(default)]
     pub functions: Vec<Function>,
+    /// HS3 `analyses` block (paper § A.5): named analysis configurations binding
+    /// a likelihood to a POI / domain. This is inference configuration, out of
+    /// scope for a model-only importer — it is intentionally not lowered. Parsed
+    /// for schema fidelity (and so its presence is not mistaken for an unknown key).
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub analyses: Vec<serde_json::Value>,
 }
 
 /// An HS3 data set (unbinned or binned). `unbinned` data uses `entries`; the
@@ -237,8 +244,7 @@ pub struct PyhfObservation {
 #[derive(Debug, Deserialize)]
 pub struct PyhfParam {
     pub name: String,
-    // Parsed for schema fidelity; lumi observed nominal is taken as 1.0.
-    #[allow(dead_code)]
+    // Lumi observed nominal: `auxdata.first()` is used (default 1.0 when absent).
     #[serde(default)]
     pub auxdata: Vec<f64>,
     #[serde(default)]

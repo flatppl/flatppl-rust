@@ -1,5 +1,6 @@
 //! Fundamental HS3 distribution `type` -> FlatPPL distribution call.
 use crate::builder::Builder;
+use crate::dist_spec::{self, Variate};
 use crate::error::{Error, Result};
 use crate::expr;
 use crate::model::Distribution;
@@ -7,13 +8,16 @@ use flatppl_core::id::NodeId;
 use flatppl_core::node::{Call, CallHead, Inputs, NamedArg, NamedKind, Node, Ref, RefNs};
 
 /// Build a FlatPPL array node from a JSON array of scalars (numbers/strings).
-fn array_of_values(b: &mut Builder, arr: &[serde_json::Value]) -> NodeId {
-    let elems: Vec<NodeId> = arr.iter().map(|v| field_node(b, v)).collect();
-    b.array(&elems)
+fn array_of_values(b: &mut Builder, arr: &[serde_json::Value]) -> Result<NodeId> {
+    let elems: Vec<NodeId> = arr
+        .iter()
+        .map(|v| field_node(b, v))
+        .collect::<Result<_>>()?;
+    Ok(b.array(&elems))
 }
 
 /// Build a FlatPPL 2-D array (vector of vectors) from a JSON 2-D array.
-fn array2d_of_values(b: &mut Builder, arr: &[serde_json::Value]) -> NodeId {
+fn array2d_of_values(b: &mut Builder, arr: &[serde_json::Value]) -> Result<NodeId> {
     let rows: Vec<NodeId> = arr
         .iter()
         .map(|row| {
@@ -23,56 +27,105 @@ fn array2d_of_values(b: &mut Builder, arr: &[serde_json::Value]) -> NodeId {
                 field_node(b, row)
             }
         })
-        .collect();
-    b.array(&rows)
+        .collect::<Result<_>>()?;
+    Ok(b.array(&rows))
 }
 
-fn field_node(b: &mut Builder, v: &serde_json::Value) -> NodeId {
+/// Lower a scalar JSON field value to a FlatPPL node: numbers become real
+/// literals, strings become self-refs (to a parameter/binding by name).
+///
+/// Any other JSON shape (object, array, bool, null) — or a number that does not
+/// fit an `f64` — has no scalar lowering and is rejected with
+/// [`Error::Unsupported`] rather than being silently coerced to `0.0`.
+pub(crate) fn field_node(b: &mut Builder, v: &serde_json::Value) -> Result<NodeId> {
     match v {
-        serde_json::Value::Number(n) => b.lit_real(n.as_f64().unwrap_or(0.0)),
-        serde_json::Value::String(s) => b.self_ref(s),
-        _ => b.lit_real(0.0),
+        serde_json::Value::Number(n) => n.as_f64().map(|x| b.lit_real(x)).ok_or_else(|| {
+            Error::Unsupported(format!("numeric field not representable as f64: {n}"))
+        }),
+        serde_json::Value::String(s) => Ok(b.self_ref(s)),
+        other => Err(Error::Unsupported(format!(
+            "expected a numeric or string field value, got: {other}"
+        ))),
+    }
+}
+
+/// Lower the `key` field of `d` to a node, falling back to the real literal
+/// `default` when the field is absent. Propagates the [`field_node`] error for a
+/// present-but-unlowerable value (object/array/null/bool) rather than masking it
+/// with the default.
+fn field_or(b: &mut Builder, d: &Distribution, key: &str, default: f64) -> Result<NodeId> {
+    match d.extra.get(key) {
+        Some(v) => field_node(b, v),
+        None => Ok(b.lit_real(default)),
     }
 }
 
 /// Bare distribution call (no relabel; caller wraps with the variate).
-pub fn emit_distribution(b: &mut Builder, d: &Distribution) -> Result<NodeId> {
+///
+/// `domain` carries the `(min, max)` bounds resolved from the document's
+/// `domains` block for this distribution's variate, when one is declared. It is
+/// required for `uniform_dist` (whose support has no other source) and ignored
+/// by all other kinds.
+pub fn emit_distribution(
+    b: &mut Builder,
+    d: &Distribution,
+    domain: Option<(f64, f64)>,
+) -> Result<NodeId> {
     match d.kind.as_str() {
         "gaussian_dist" | "normal_dist" => {
             let mut kws: Vec<(&str, NodeId)> = Vec::new();
             if let Some(v) = d.extra.get("mean") {
-                kws.push(("mu", field_node(b, v)));
+                kws.push(("mu", field_node(b, v)?));
             }
             if let Some(v) = d.extra.get("sigma") {
-                kws.push(("sigma", field_node(b, v)));
+                kws.push(("sigma", field_node(b, v)?));
             }
             Ok(b.call_kw("Normal", &kws))
         }
         "poisson_dist" => {
             let mut kws: Vec<(&str, NodeId)> = Vec::new();
             if let Some(v) = d.extra.get("mean") {
-                kws.push(("rate", field_node(b, v)));
+                kws.push(("rate", field_node(b, v)?));
             }
             Ok(b.call_kw("Poisson", &kws))
         }
+        // §12: HS³ `c` is the negated FlatPPL `rate` (RooFit: c = −rate), so the
+        // density is rate·exp(−rate·x) with rate = −c. Emit `rate = neg(c)`.
         "exponential_dist" => {
             let mut kws: Vec<(&str, NodeId)> = Vec::new();
             if let Some(v) = d.extra.get("c") {
-                kws.push(("rate", field_node(b, v)));
+                let c_node = field_node(b, v)?;
+                let rate = b.call("neg", &[c_node]);
+                kws.push(("rate", rate));
             }
             Ok(b.call_kw("Exponential", &kws))
         }
         "lognormal_dist" => {
             let mut kws: Vec<(&str, NodeId)> = Vec::new();
             if let Some(v) = d.extra.get("mu") {
-                kws.push(("mu", field_node(b, v)));
+                kws.push(("mu", field_node(b, v)?));
             }
             if let Some(v) = d.extra.get("sigma") {
-                kws.push(("sigma", field_node(b, v)));
+                kws.push(("sigma", field_node(b, v)?));
             }
             Ok(b.call_kw("LogNormal", &kws))
         }
-        "uniform_dist" => Ok(b.call_kw("Uniform", &[])),
+        // §08: Uniform(S) == normalize(Lebesgue(S)). The support set is the
+        // variate's declared domain interval; without one there is no finite
+        // support to normalize over, so reject rather than emit a bare Uniform().
+        "uniform_dist" => {
+            let (min, max) = domain.ok_or_else(|| {
+                Error::Unsupported(format!(
+                    "uniform_dist `{}` has no declared domain for its variate; \
+                     a `domains` entry giving (min, max) is required",
+                    d.name
+                ))
+            })?;
+            let lo = b.lit_real(min);
+            let hi = b.lit_real(max);
+            let support = b.call("interval", &[lo, hi]);
+            Ok(b.call("Uniform", &[support]))
+        }
         // §12: product_dist maps to joint over its factor sub-distributions.
         // joint uses NamedKind::Field (like `record`/`cartprod`), so named entries
         // must be built with Field kind.  Factor names are the field labels.
@@ -80,7 +133,6 @@ pub fn emit_distribution(b: &mut Builder, d: &Distribution) -> Result<NodeId> {
         // density-product, not a joint independent distribution over distinct
         // variates.  The spec §12 mapping is `product_dist → joint`; whether
         // same-variate joint is semantically correct is a spec-fidelity question.
-        // ponytail: §12 maps product_dist→joint; same-variate product may need review
         "product_dist" => {
             let factors: Vec<String> = d
                 .extra
@@ -116,23 +168,23 @@ pub fn emit_distribution(b: &mut Builder, d: &Distribution) -> Result<NodeId> {
         "generalized_normal_dist" => {
             let mut kws: Vec<(&str, NodeId)> = Vec::new();
             if let Some(v) = d.extra.get("mean") {
-                kws.push(("mean", field_node(b, v)));
+                kws.push(("mean", field_node(b, v)?));
             }
             if let Some(v) = d.extra.get("alpha") {
-                kws.push(("alpha", field_node(b, v)));
+                kws.push(("alpha", field_node(b, v)?));
             }
             if let Some(v) = d.extra.get("beta") {
-                kws.push(("beta", field_node(b, v)));
+                kws.push(("beta", field_node(b, v)?));
             }
             Ok(b.call_kw("GeneralizedNormal", &kws))
         }
         "multivariate_normal_dist" => {
             let mut kws: Vec<(&str, NodeId)> = Vec::new();
             if let Some(arr) = d.extra.get("mean").and_then(|v| v.as_array()) {
-                kws.push(("mu", array_of_values(b, arr)));
+                kws.push(("mu", array_of_values(b, arr)?));
             }
             if let Some(arr) = d.extra.get("covariances").and_then(|v| v.as_array()) {
-                kws.push(("cov", array2d_of_values(b, arr)));
+                kws.push(("cov", array2d_of_values(b, arr)?));
             }
             Ok(b.call_kw("MvNormal", &kws))
         }
@@ -143,26 +195,26 @@ pub fn emit_distribution(b: &mut Builder, d: &Distribution) -> Result<NodeId> {
                 || d.extra.contains_key("alpha_L")
                 || d.extra.contains_key("n_L");
             if double_sided {
-                let m0 = d.extra.get("m0").map(|v| field_node(b, v)).unwrap_or_else(|| b.lit_real(0.0));
-                let sigma_l = d.extra.get("sigma_L").map(|v| field_node(b, v)).unwrap_or_else(|| b.lit_real(1.0));
-                let sigma_r = d.extra.get("sigma_R").map(|v| field_node(b, v)).unwrap_or_else(|| b.lit_real(1.0));
-                let alpha_l = d.extra.get("alpha_L").map(|v| field_node(b, v)).unwrap_or_else(|| b.lit_real(1.0));
-                let n_l = d.extra.get("n_L").map(|v| field_node(b, v)).unwrap_or_else(|| b.lit_real(1.0));
-                let alpha_r = d.extra.get("alpha_R").map(|v| field_node(b, v)).unwrap_or_else(|| b.lit_real(1.0));
-                let n_r = d.extra.get("n_R").map(|v| field_node(b, v)).unwrap_or_else(|| b.lit_real(1.0));
+                let m0 = field_or(b, d, "m0", 0.0)?;
+                let sigma_l = field_or(b, d, "sigma_L", 1.0)?;
+                let sigma_r = field_or(b, d, "sigma_R", 1.0)?;
+                let alpha_l = field_or(b, d, "alpha_L", 1.0)?;
+                let n_l = field_or(b, d, "n_L", 1.0)?;
+                let alpha_r = field_or(b, d, "alpha_R", 1.0)?;
+                let n_r = field_or(b, d, "n_R", 1.0)?;
                 Ok(b.module_user_call("hepphys", "DoubleSidedCrystalBall", &[m0, sigma_l, sigma_r, alpha_l, n_l, alpha_r, n_r]))
             } else {
-                let m0 = d.extra.get("m0").map(|v| field_node(b, v)).unwrap_or_else(|| b.lit_real(0.0));
-                let sigma = d.extra.get("sigma").map(|v| field_node(b, v)).unwrap_or_else(|| b.lit_real(1.0));
-                let alpha = d.extra.get("alpha").map(|v| field_node(b, v)).unwrap_or_else(|| b.lit_real(1.0));
-                let n = d.extra.get("n").map(|v| field_node(b, v)).unwrap_or_else(|| b.lit_real(1.0));
+                let m0 = field_or(b, d, "m0", 0.0)?;
+                let sigma = field_or(b, d, "sigma", 1.0)?;
+                let alpha = field_or(b, d, "alpha", 1.0)?;
+                let n = field_or(b, d, "n", 1.0)?;
                 Ok(b.module_user_call("hepphys", "CrystalBall", &[m0, sigma, alpha, n]))
             }
         }
         "argus_dist" => {
-            let resonance = d.extra.get("resonance").map(|v| field_node(b, v)).unwrap_or_else(|| b.lit_real(0.0));
-            let slope = d.extra.get("slope").map(|v| field_node(b, v)).unwrap_or_else(|| b.lit_real(-1.0));
-            let power = d.extra.get("power").map(|v| field_node(b, v)).unwrap_or_else(|| b.lit_real(0.5));
+            let resonance = field_or(b, d, "resonance", 0.0)?;
+            let slope = field_or(b, d, "slope", -1.0)?;
+            let power = field_or(b, d, "power", 0.5)?;
             Ok(b.module_user_call("hepphys", "Argus", &[resonance, slope, power]))
         }
         // §12: mixture_dist maps to normalize(superpose(weighted(c1, s1), weighted(c2, s2), ...))
@@ -198,7 +250,10 @@ pub fn emit_distribution(b: &mut Builder, d: &Distribution) -> Result<NodeId> {
 
             // Build coefficient NodeIds, computing the implicit last for non-extended.
             let n = summands.len();
-            let mut coeff_nodes: Vec<NodeId> = coeff_vals.iter().map(|v| field_node(b, v)).collect();
+            let mut coeff_nodes: Vec<NodeId> = coeff_vals
+                .iter()
+                .map(|v| field_node(b, v))
+                .collect::<Result<_>>()?;
 
             if !extended {
                 // Non-extended: N-1 explicit coefficients; implicit Nth = 1 - sum(given).
@@ -250,8 +305,16 @@ pub fn emit_distribution(b: &mut Builder, d: &Distribution) -> Result<NodeId> {
 
             // superpose(weighted(c1,s1), weighted(c2,s2), ...)
             let superpose_node = b.call("superpose", &weighted_nodes);
-            // normalize(superpose(...))
-            Ok(b.call("normalize", &[superpose_node]))
+            if extended {
+                // §12:140 — the extended mixture is the *unnormalized* superposition
+                // (RooAddPdf in extended mode); coefficients are absolute yields, so
+                // there is no outer normalize.
+                Ok(superpose_node)
+            } else {
+                // Non-extended: coefficients are mixing fractions summing to 1, so
+                // normalize the superposition.
+                Ok(b.call("normalize", &[superpose_node]))
+            }
         }
 
         // §12: generic_dist → normalize(weighted(<expr_fn>, Lebesgue(reals)))
@@ -308,7 +371,7 @@ pub fn emit_distribution(b: &mut Builder, d: &Distribution) -> Result<NodeId> {
                 .get("distribution")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| Error::Unsupported("rate_extended_dist missing `distribution` field".into()))?;
-            let rate_node = field_node(b, rate);
+            let rate_node = field_node(b, rate)?;
             let shape = b.self_ref(dist_name);
             let weighted = b.call("weighted", &[rate_node, shape]);
             Ok(b.call("PoissonProcess", &[weighted]))
@@ -345,7 +408,7 @@ pub fn emit_distribution(b: &mut Builder, d: &Distribution) -> Result<NodeId> {
                 .and_then(|v| v.as_array())
                 .ok_or_else(|| Error::Unsupported("bincounts_extended_dist missing `axes` field".into()))?;
             let bins = build_bins(b, axes)?;
-            let rate_node = field_node(b, rate);
+            let rate_node = field_node(b, rate)?;
             let shape = b.self_ref(dist_name);
             let weighted = b.call("weighted", &[rate_node, shape]);
             Ok(b.call("BinnedPoissonProcess", &[bins, weighted]))
@@ -380,7 +443,10 @@ pub fn emit_distribution(b: &mut Builder, d: &Distribution) -> Result<NodeId> {
                 .ok_or_else(|| Error::Unsupported("polynomial_dist missing `coefficients` field".into()))?
                 .clone();
             // Build coefficient vector.
-            let coeff_elems: Vec<NodeId> = coeff_arr.iter().map(|v| field_node(b, v)).collect();
+            let coeff_elems: Vec<NodeId> = coeff_arr
+                .iter()
+                .map(|v| field_node(b, v))
+                .collect::<Result<_>>()?;
             let coeff_vec = b.array(&coeff_elems);
             // Build functionof(polynomial([...], _x_), x = _x_) with obs_name from the `x` field.
             let obs_name = d
@@ -416,7 +482,10 @@ pub fn emit_distribution(b: &mut Builder, d: &Distribution) -> Result<NodeId> {
                 ))?
                 .clone();
             // Build expected vector.
-            let exp_elems: Vec<NodeId> = expected_arr.iter().map(|v| field_node(b, v)).collect();
+            let exp_elems: Vec<NodeId> = expected_arr
+                .iter()
+                .map(|v| field_node(b, v))
+                .collect::<Result<_>>()?;
             let exp_vec = b.array(&exp_elems);
             // broadcast(Poisson, [expected...])
             let poisson_head = b.call_head("Poisson");
@@ -453,7 +522,10 @@ fn build_bins(b: &mut Builder, axes: &[serde_json::Value]) -> Result<NodeId> {
     let axis = &axes[0];
     // {edges: [...]} form
     if let Some(edges) = axis.get("edges").and_then(|v| v.as_array()) {
-        let nodes: Vec<NodeId> = edges.iter().map(|v| field_node(b, v)).collect();
+        let nodes: Vec<NodeId> = edges
+            .iter()
+            .map(|v| field_node(b, v))
+            .collect::<Result<_>>()?;
         return Ok(b.array(&nodes));
     }
     // {nbins, min, max} form
@@ -518,34 +590,6 @@ fn build_lebesgue_reals(b: &mut Builder) -> NodeId {
     b.call("Lebesgue", &[reals])
 }
 
-/// The scalar variate field name for the given distribution kind.
-/// Returns the field key whose value is the observed-variable name.
-fn variate_field(kind: &str) -> &'static str {
-    match kind {
-        "crystalball_dist" => "m",
-        "argus_dist" => "mass",
-        _ => "x",
-    }
-}
-
-/// Returns true if this distribution kind carries no variate of its own
-/// (variate comes from summand/factor distributions, or the expression embeds it).
-fn has_no_own_variate(kind: &str) -> bool {
-    matches!(
-        kind,
-        "mixture_dist"
-            | "product_dist"
-            | "generic_dist"
-            | "density_function_dist"
-            | "log_density_function_dist"
-            // Poisson-process types: variate comes from inner distribution / is the count space.
-            | "rate_extended_dist"
-            | "rate_density_dist"
-            | "bincounts_extended_dist"
-            | "bincounts_density_dist"
-    )
-}
-
 /// The variate name(s) for a distribution, if any.
 ///
 /// Returns `VariateName::Single` for scalar variates and
@@ -557,43 +601,39 @@ pub enum VariateName {
     Multiple(Vec<String>),
 }
 
-/// Extract the variate from a distribution.  Returns `None` if the variate
-/// field is absent.
+/// Extract the per-instance variate name(s) from a distribution, consulting the
+/// static [`dist_spec`] table for the kind's variate shape and field key.
+/// Returns `None` when the kind carries no variate of its own
+/// ([`Variate::None`]) or the variate field is absent.
 pub fn variate_name(d: &Distribution) -> Option<VariateName> {
-    // Composite distributions carry no variate of their own.
-    if has_no_own_variate(&d.kind) {
-        return None;
-    }
-    // Distributions with an array-valued `x` field: multivariate_normal_dist and
-    // barlow_beeston_lite_poisson_constraint_dist both use x as a list of obs names.
-    // barlow_beeston_lite emits relabel(..., [x_names]) itself — return None so the
-    // convert.rs caller does NOT wrap with an additional relabel.
-    if d.kind == "barlow_beeston_lite_poisson_constraint_dist" {
-        return None;
-    }
-    if d.kind == "multivariate_normal_dist" {
-        // x is a JSON array of variable-name strings
-        if let Some(arr) = d.extra.get("x").and_then(|v| v.as_array()) {
-            let names: Vec<String> = arr
+    match dist_spec::variate(&d.kind) {
+        // No variate of its own (composites, expression kinds, Poisson-process
+        // kinds, and barlow_beeston_lite which emits its own relabel).
+        Variate::None => None,
+        // Scalar variate: the named field holds a single observed-variable name.
+        Variate::Scalar(field) => d
+            .extra
+            .get(field)
+            .and_then(|v| v.as_str())
+            .map(|s| VariateName::Single(s.to_string())),
+        // Array variate (multivariate_normal_dist): the field holds a JSON array
+        // of observed-variable names.
+        Variate::MultiArray(field) => {
+            let names: Vec<String> = d
+                .extra
+                .get(field)
+                .and_then(|v| v.as_array())?
                 .iter()
                 .filter_map(|v| v.as_str().map(str::to_string))
                 .collect();
-            if !names.is_empty() {
-                return Some(VariateName::Multiple(names));
-            }
+            (!names.is_empty()).then_some(VariateName::Multiple(names))
         }
-        return None;
     }
-    let field = variate_field(&d.kind);
-    d.extra
-        .get(field)
-        .and_then(|v| v.as_str())
-        .map(|s| VariateName::Single(s.to_string()))
 }
 
 /// Returns true if this distribution kind requires `hepphys` module to be in scope.
 pub fn needs_hepphys(kind: &str) -> bool {
-    matches!(kind, "crystalball_dist" | "argus_dist")
+    dist_spec::needs_hepphys(kind)
 }
 
 #[cfg(test)]
@@ -628,7 +668,7 @@ mod tests {
         let mut m = flatppl_core::Module::new();
         let node = {
             let mut b = Builder::new(&mut m);
-            emit_distribution(&mut b, &d).unwrap()
+            emit_distribution(&mut b, &d, None).unwrap()
         };
         {
             let mut b = Builder::new(&mut m);
@@ -654,7 +694,7 @@ mod tests {
         let mut m = flatppl_core::Module::new();
         let node = {
             let mut b = Builder::new(&mut m);
-            emit_distribution(&mut b, &d).unwrap()
+            emit_distribution(&mut b, &d, None).unwrap()
         };
         {
             let mut b = Builder::new(&mut m);
@@ -676,7 +716,7 @@ mod tests {
         let mut m = flatppl_core::Module::new();
         let node = {
             let mut b = Builder::new(&mut m);
-            emit_distribution(&mut b, &d).unwrap()
+            emit_distribution(&mut b, &d, None).unwrap()
         };
         {
             let mut b = Builder::new(&mut m);
@@ -700,7 +740,7 @@ mod tests {
         let mut m = flatppl_core::Module::new();
         let node = {
             let mut b = Builder::new(&mut m);
-            emit_distribution(&mut b, &d).unwrap()
+            emit_distribution(&mut b, &d, None).unwrap()
         };
         {
             let mut b = Builder::new(&mut m);
@@ -710,6 +750,8 @@ mod tests {
         assert!(text.contains("Exponential"), "got: {text}");
         assert!(text.contains("rate"), "got: {text}");
         assert!(text.contains("c_param"), "got: {text}");
+        // §12: HS³ `c` is the negated FlatPPL rate, so the rate is `neg(c)`.
+        assert!(text.contains("neg"), "rate should be neg(c), got: {text}");
     }
 
     #[test]
@@ -725,7 +767,7 @@ mod tests {
         let mut m = flatppl_core::Module::new();
         let node = {
             let mut b = Builder::new(&mut m);
-            emit_distribution(&mut b, &d).unwrap()
+            emit_distribution(&mut b, &d, None).unwrap()
         };
         {
             let mut b = Builder::new(&mut m);
@@ -740,12 +782,12 @@ mod tests {
     }
 
     #[test]
-    fn uniform_maps_correctly() {
+    fn uniform_with_domain_emits_interval_support() {
         let d = dist("uniform_dist", &[("x", serde_json::json!("x_obs"))]);
         let mut m = flatppl_core::Module::new();
         let node = {
             let mut b = Builder::new(&mut m);
-            emit_distribution(&mut b, &d).unwrap()
+            emit_distribution(&mut b, &d, Some((0.0, 10.0))).unwrap()
         };
         {
             let mut b = Builder::new(&mut m);
@@ -753,6 +795,25 @@ mod tests {
         }
         let text = print_with(&m, Syntax::Minimal);
         assert!(text.contains("Uniform"), "got: {text}");
+        // Support is the variate's declared interval, not a bare Uniform().
+        assert!(text.contains("interval"), "got: {text}");
+        assert!(text.contains("10"), "got: {text}");
+        assert!(
+            !text.contains("Uniform()"),
+            "must not be a bare Uniform(), got: {text}"
+        );
+    }
+
+    #[test]
+    fn uniform_without_domain_errors() {
+        let d = dist("uniform_dist", &[("x", serde_json::json!("x_obs"))]);
+        let mut m = flatppl_core::Module::new();
+        let mut b = Builder::new(&mut m);
+        let result = emit_distribution(&mut b, &d, None);
+        assert!(
+            matches!(result, Err(Error::Unsupported(_))),
+            "got: {result:?}"
+        );
     }
 
     #[test]
@@ -760,7 +821,7 @@ mod tests {
         let d = dist("no_such_dist", &[]);
         let mut m = flatppl_core::Module::new();
         let mut b = Builder::new(&mut m);
-        let result = emit_distribution(&mut b, &d);
+        let result = emit_distribution(&mut b, &d, None);
         assert!(matches!(result, Err(Error::UnknownDistType(_))));
     }
 
@@ -769,7 +830,7 @@ mod tests {
         let d = dist("histfactory_dist", &[]);
         let mut m = flatppl_core::Module::new();
         let mut b = Builder::new(&mut m);
-        let result = emit_distribution(&mut b, &d);
+        let result = emit_distribution(&mut b, &d, None);
         assert!(matches!(result, Err(Error::Unsupported(_))));
     }
 
@@ -833,7 +894,7 @@ mod tests {
         let mut m = flatppl_core::Module::new();
         let node = {
             let mut b = Builder::new(&mut m);
-            emit_distribution(&mut b, &d).unwrap()
+            emit_distribution(&mut b, &d, None).unwrap()
         };
         {
             let mut b = Builder::new(&mut m);

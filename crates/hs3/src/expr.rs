@@ -22,6 +22,10 @@
 //!   Math fns: `exp log sqrt abs sin cos tan asin acos atan` (1-arg)
 //!             `min max pow` (2-arg)
 //!   Constants: `PI` → lit_real(π), `EULER` → lit_real(e)
+//!
+//! NOT supported (rejected with `Error::Unsupported`, never silently parsed):
+//!   comparisons `== != < <= > >=`, boolean `&& || !`, and the ternary
+//!   conditional `a ? b : c` — there is no ternary/ifelse parse rule.
 
 use crate::builder::Builder;
 use crate::error::{Error, Result};
@@ -101,9 +105,10 @@ fn rewrite_self_to_local(
     target_sym: flatppl_core::id::Symbol,
     ph_sym: flatppl_core::id::Symbol,
 ) -> NodeId {
-    // Clone so we can inspect without borrowing `b.m` mutably.
-    let n = b.m.node(node).clone();
-    match n {
+    // Only Ref and Call nodes need handling. Inspect by reference and clone the
+    // Call (which owns boxed children) lazily — leaves (Lit/Const/Hole/Axis) carry
+    // no refs and are returned unchanged without an allocation.
+    match b.m.node(node) {
         Node::Ref(r) if r.ns == RefNs::SelfMod && r.name == target_sym => {
             // Replace: emit a Local ref (the lambda placeholder).
             b.m.alloc(Node::Ref(Ref {
@@ -111,7 +116,11 @@ fn rewrite_self_to_local(
                 name: ph_sym,
             }))
         }
-        Node::Call(call) => {
+        Node::Call(_) => {
+            // Clone the Call so we can recurse without holding a borrow of `b.m`.
+            let Node::Call(call) = b.m.node(node).clone() else {
+                unreachable!("matched Node::Call above")
+            };
             // Rewrite head if it is a User(callee) node.
             let new_head = match call.head {
                 CallHead::User(callee_id) => {
@@ -142,11 +151,8 @@ fn rewrite_self_to_local(
                 inputs: call.inputs,
             }))
         }
-        // Lit, Const, Hole, Axis — no refs inside.
-        other => {
-            let _ = other; // already cloned; node is unchanged
-            node
-        }
+        // Ref (non-matching), Lit, Const, Hole, Axis — no rewritable refs inside.
+        _ => node,
     }
 }
 
@@ -285,7 +291,7 @@ fn tokenize(src: &str) -> Result<Vec<Tok>> {
                     i += 2;
                 } else {
                     return Err(Error::Unsupported(
-                        "expression operator '=' not supported (did you mean `==`?)".to_string(),
+                        "expression operator '=' not supported (did you mean `==`?)".into(),
                     ));
                 }
             }
@@ -373,10 +379,37 @@ impl<'b, 'm> Parser<'b, 'm> {
         self.tokens.get(self.pos)
     }
 
-    fn advance(&mut self) -> &Tok {
-        let t = &self.tokens[self.pos];
-        self.pos += 1;
+    /// Advance past the current token, returning it (or `None` at end of input).
+    fn advance(&mut self) -> Option<&Tok> {
+        let t = self.tokens.get(self.pos);
+        if t.is_some() {
+            self.pos += 1;
+        }
         t
+    }
+
+    /// If the current token is a number, consume and return its value.
+    fn next_num(&mut self) -> Option<f64> {
+        match self.tokens.get(self.pos) {
+            Some(Tok::Num(v)) => {
+                let v = *v;
+                self.pos += 1;
+                Some(v)
+            }
+            _ => None,
+        }
+    }
+
+    /// If the current token is an identifier, consume and return its name.
+    fn next_ident(&mut self) -> Option<String> {
+        match self.tokens.get(self.pos) {
+            Some(Tok::Ident(s)) => {
+                let s = s.clone();
+                self.pos += 1;
+                Some(s)
+            }
+            _ => None,
+        }
     }
 
     fn check_unsupported(&self, t: &Tok) -> Result<()> {
@@ -502,11 +535,8 @@ impl<'b, 'm> Parser<'b, 'm> {
     fn parse_atom(&mut self) -> Result<NodeId> {
         match self.peek() {
             Some(Tok::Num(_)) => {
-                if let Tok::Num(v) = self.advance().clone() {
-                    Ok(self.b.lit_real(v))
-                } else {
-                    unreachable!()
-                }
+                let v = self.next_num().expect("peeked Num");
+                Ok(self.b.lit_real(v))
             }
             Some(Tok::LParen) => {
                 self.advance();
@@ -524,11 +554,7 @@ impl<'b, 'm> Parser<'b, 'm> {
                 Ok(inner)
             }
             Some(Tok::Ident(_)) => {
-                let name = if let Tok::Ident(s) = self.advance().clone() {
-                    s
-                } else {
-                    unreachable!()
-                };
+                let name = self.next_ident().expect("peeked Ident");
                 // Check for function call: IDENT '('
                 if matches!(self.peek(), Some(Tok::LParen)) {
                     self.advance(); // consume '('

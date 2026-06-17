@@ -52,7 +52,30 @@ fn convert_from_pyhf_fixture() {
         .unwrap();
     assert!(status.success(), "flatppl convert --from pyhf failed");
     let text = std::fs::read_to_string(&out).unwrap();
-    assert!(!text.trim().is_empty(), "output should be non-empty");
+    // The 2-bin/1-channel pyhf workspace must assemble into the point-free
+    // histfactory likelihood: a Poisson observation model, a shapesys aux term,
+    // and the joint_likelihood binding tying them together. Observed data
+    // [50.0, 60.0] must appear literally.
+    assert!(
+        text.contains("obs_model_singlechannel"),
+        "missing assembled obs_model binding, got:\n{text}"
+    );
+    assert!(
+        text.contains("Poisson"),
+        "missing Poisson observation model, got:\n{text}"
+    );
+    assert!(
+        text.contains("ContinuedPoisson"),
+        "missing shapesys ContinuedPoisson aux term, got:\n{text}"
+    );
+    assert!(
+        text.contains("joint_likelihood("),
+        "missing joint_likelihood binding, got:\n{text}"
+    );
+    assert!(
+        text.contains("[50.0, 60.0]"),
+        "missing observed data vector [50.0, 60.0], got:\n{text}"
+    );
 }
 
 #[test]
@@ -74,5 +97,27 @@ fn convert_from_hs3_fixture() {
         "flatppl convert --from hs3 (paper_gaussian) failed"
     );
     let text = std::fs::read_to_string(&out).unwrap();
-    assert!(!text.trim().is_empty(), "output should be non-empty");
+    // HS3 paper § A.1: a single gaussian_dist relabeled onto the observed
+    // variate, a free mean param, a const-fixed sigma, the unbinned observation
+    // value 1.27, and the likelihoodof wiring.
+    assert!(
+        text.contains("Normal(") && text.contains("relabel"),
+        "missing relabeled Normal, got:\n{text}"
+    );
+    assert!(
+        text.contains("mu = elementof(reals)"),
+        "missing free mean parameter declaration, got:\n{text}"
+    );
+    assert!(
+        text.contains("fixed(1.0)"),
+        "missing const-fixed sigma, got:\n{text}"
+    );
+    assert!(
+        text.contains("1.27"),
+        "missing observed value 1.27, got:\n{text}"
+    );
+    assert!(
+        text.contains("likelihoodof("),
+        "missing likelihoodof wiring, got:\n{text}"
+    );
 }

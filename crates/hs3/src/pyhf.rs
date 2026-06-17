@@ -5,7 +5,10 @@
 //! modifier effects generating auxiliary likelihood terms as needed.
 use crate::builder::Builder;
 use crate::error::{Error, Result};
-use crate::histfactory::{Effect, modifier_effect, sample_nominal, staterror_aux};
+use crate::histfactory::{
+    Effect, ParamDomain, mod_spec, modifier_effect, require_param, require_spec, sample_nominal,
+    staterror_aux,
+};
 use crate::model::{PyhfDocument, PyhfParam, SampleData};
 use flatppl_core::Module;
 use flatppl_core::id::NodeId;
@@ -35,7 +38,7 @@ fn emit_pyhf(b: &mut Builder, doc: &PyhfDocument) -> Result<()> {
 }
 
 /// Emit `hepphys = standard_module("particle-physics", "0.1")`.
-fn emit_standard_module(b: &mut Builder) {
+pub(crate) fn emit_standard_module(b: &mut Builder) {
     let name_arg = b.str_lit("particle-physics");
     let ver_arg = b.str_lit("0.1");
     let head = b.sym("standard_module");
@@ -46,6 +49,16 @@ fn emit_standard_module(b: &mut Builder) {
         inputs: None,
     }));
     b.bind("hepphys", node);
+}
+
+/// The lumi constraint's resolved config: the Normal `sigma` and the observed
+/// point `nom` (pyhf `auxdata`, §12:208 "observed at lumi_nom").
+#[derive(Debug, Clone, Copy)]
+pub struct LumiConfig {
+    /// Normal constraint width (lumi `sigmas[0]`).
+    pub sigma: f64,
+    /// Observed value the constraint is evaluated at (lumi `auxdata[0]`, default 1.0).
+    pub nom: f64,
 }
 
 /// Find the lumi parameter config entry across both new- and old-format measurements.
@@ -85,14 +98,15 @@ fn emit_channel(
         .map(|s| (s.name.as_str(), s.data.as_slice(), s.modifiers.as_slice()))
         .collect();
 
-    // Resolve observation for this channel into an array node.
-    let observed = find_obs(b, doc, channel_name)?;
+    // Resolve observation for this channel into an array node (and its bin count).
+    let (observed, n_observed) = find_obs(b, doc, channel_name)?;
 
     // Resolve lumi config (sigma) if any sample carries a lumi modifier.
-    let has_lumi = channel
-        .samples
-        .iter()
-        .any(|s| s.modifiers.iter().any(|m| m.kind == "lumi"));
+    let has_lumi = channel.samples.iter().any(|s| {
+        s.modifiers
+            .iter()
+            .any(|m| mod_spec(&m.kind).is_some_and(|spec| spec.channel_lumi))
+    });
     let lumi = if has_lumi {
         let lumi_cfg = find_lumi_param(doc).ok_or_else(|| {
             Error::Unsupported(
@@ -101,16 +115,20 @@ fn emit_channel(
                     .into(),
             )
         })?;
-        let sigma_lumi = *lumi_cfg
+        let sigma = *lumi_cfg
             .sigmas
             .first()
             .ok_or_else(|| Error::Unsupported("lumi config `sigmas` array is empty".into()))?;
-        Some(sigma_lumi)
+        // The constraint is observed at `lumi_nom` (§12:208); pyhf carries this in
+        // the lumi parameter's `auxdata`. Default to 1.0 when the array is absent
+        // (the pyhf convention), matching prior hardcoded behaviour.
+        let nom = lumi_cfg.auxdata.first().copied().unwrap_or(1.0);
+        Some(LumiConfig { sigma, nom })
     } else {
         None
     };
 
-    assemble_channel(b, channel_name, &samples, observed, lumi)
+    assemble_channel(b, channel_name, &samples, observed, n_observed, lumi)
 }
 
 /// Assemble one channel's observation model and auxiliary likelihood terms,
@@ -130,8 +148,37 @@ pub fn assemble_channel(
     channel_name: &str,
     samples: &[(&str, &[f64], &[crate::model::Modifier])],
     observed: NodeId,
-    lumi: Option<f64>,
+    n_observed: usize,
+    lumi: Option<LumiConfig>,
 ) -> Result<()> {
+    // ---- Pass 0: validate channel shape ----
+    //
+    // Every sample must have the same number of bins, and that count must match
+    // the observed-data length. A degenerate (empty / ragged) channel would emit a
+    // `broadcast(Poisson, [])` or length-mismatched model that is silently wrong.
+    let n_bins = samples
+        .first()
+        .map(|(_, nominal, _)| nominal.len())
+        .ok_or_else(|| Error::Unsupported(format!("channel `{channel_name}` has no samples")))?;
+    if n_bins == 0 {
+        return Err(Error::Unsupported(format!(
+            "channel `{channel_name}`: samples have zero bins"
+        )));
+    }
+    for (name, nominal, _) in samples {
+        if nominal.len() != n_bins {
+            return Err(Error::Unsupported(format!(
+                "channel `{channel_name}`: sample `{name}` has {} bins but expected {n_bins}",
+                nominal.len()
+            )));
+        }
+    }
+    if n_observed != n_bins {
+        return Err(Error::Unsupported(format!(
+            "channel `{channel_name}`: observed data has {n_observed} bins but samples have {n_bins}"
+        )));
+    }
+
     // ---- Pass 1: aggregate staterror nominals and errors across samples ----
     //
     // Staterror is channel-shared: one gamma per named staterror param, one aux
@@ -143,25 +190,51 @@ pub fn assemble_channel(
     let mut staterror_acc: std::collections::BTreeMap<String, (Vec<f64>, Vec<f64>)> =
         std::collections::BTreeMap::new();
 
-    for (_name, nominal, modifiers) in samples {
+    for (name, nominal, modifiers) in samples {
         for modifier in *modifiers {
-            if modifier.kind == "staterror" {
-                let param_name = modifier.parameter.as_deref().unwrap_or("staterror");
-                let n = nominal.len();
-                let errors: Vec<f64> = modifier
+            if mod_spec(&modifier.kind).is_some_and(|spec| spec.channel_staterror) {
+                let param_name = modifier.parameter.as_deref().ok_or_else(|| {
+                    Error::Unsupported(format!(
+                        "channel `{channel_name}`: staterror modifier on sample `{name}` is \
+                         missing its `parameter`"
+                    ))
+                })?;
+                // Per-bin errors are required and must match the channel bin count;
+                // a ragged array used to be silently truncated/zero-padded.
+                let arr = modifier
                     .data
                     .as_ref()
                     .and_then(|d| d.as_array())
-                    .map(|a| a.iter().map(|v| v.as_f64().unwrap_or(0.0)).collect())
-                    .unwrap_or_else(|| vec![0.0; n]);
+                    .ok_or_else(|| {
+                        Error::Unsupported(format!(
+                            "channel `{channel_name}`: staterror `{param_name}` on sample \
+                             `{name}` is missing its per-bin error array"
+                        ))
+                    })?;
+                if arr.len() != n_bins {
+                    return Err(Error::Unsupported(format!(
+                        "channel `{channel_name}`: staterror `{param_name}` on sample `{name}` \
+                         has {} bins but the channel has {n_bins}",
+                        arr.len()
+                    )));
+                }
+                let mut errors: Vec<f64> = Vec::with_capacity(n_bins);
+                for (i, v) in arr.iter().enumerate() {
+                    let e = v.as_f64().ok_or_else(|| {
+                        Error::Unsupported(format!(
+                            "channel `{channel_name}`: staterror `{param_name}` error {i} on \
+                             sample `{name}` is not a number"
+                        ))
+                    })?;
+                    errors.push(e);
+                }
 
                 let entry = staterror_acc
                     .entry(param_name.to_string())
-                    .or_insert_with(|| (vec![0.0; n], vec![0.0; n]));
-                for i in 0..n.min(entry.0.len()) {
+                    .or_insert_with(|| (vec![0.0; n_bins], vec![0.0; n_bins]));
+                for i in 0..n_bins {
                     entry.0[i] += nominal[i]; // sum of nominals
-                    let e = errors.get(i).copied().unwrap_or(0.0);
-                    entry.1[i] += e * e; // sum of squared errors
+                    entry.1[i] += errors[i] * errors[i]; // sum of squared errors
                 }
             }
         }
@@ -183,17 +256,11 @@ pub fn assemble_channel(
     // ---- Pass 2: declare free params (idempotent by name) ----
     let mut declared: HashSet<String> = HashSet::new();
 
-    for (_name, nominal, modifiers) in samples {
-        let n_bins = nominal.len();
+    for (_name, _nominal, modifiers) in samples {
         for modifier in *modifiers {
-            let param_name = match &modifier.parameter {
-                Some(p) => p.clone(),
-                None => continue,
-            };
-            if declared.contains(&param_name) {
-                continue;
-            }
-            declare_modifier_param(b, modifier, n_bins)?;
+            // `declare_modifier_param` validates the modifier kind and requires a
+            // `parameter`; only dedupe once we know the name is present.
+            let param_name = declare_modifier_param(b, modifier, n_bins, &declared)?;
             declared.insert(param_name);
         }
     }
@@ -201,10 +268,10 @@ pub fn assemble_channel(
     // ---- Pass 3: lumi aux once (if present) ----
     let mut aux_terms: Vec<NodeId> = Vec::new();
 
-    if let Some(sigma_lumi) = lumi {
+    if let Some(LumiConfig { sigma, nom }) = lumi {
         let lam = b.self_ref("lumi");
-        let sigma_node = b.lit_real(sigma_lumi);
-        let nom_node = b.lit_real(1.0);
+        let sigma_node = b.lit_real(sigma);
+        let nom_node = b.lit_real(nom);
         let lumi_normal = b.call_kw("Normal", &[("mu", lam), ("sigma", sigma_node)]);
         let lumi_aux = b.call("likelihoodof", &[lumi_normal, nom_node]);
         aux_terms.push(lumi_aux);
@@ -224,57 +291,42 @@ pub fn assemble_channel(
         let data = SampleData::Flat(nominal.to_vec());
         let mut nom = sample_nominal(b, &data);
 
-        // First pass: apply histosys modifiers (they replace nominal).
+        // First pass: apply nominal-replacing modifiers (histosys).
         for modifier in *modifiers {
-            if modifier.kind == "histosys" {
-                let effect = modifier_effect(b, modifier, nom)?;
+            if mod_spec(&modifier.kind).is_some_and(|spec| spec.replaces_nominal) {
+                let effect = modifier_effect(b, modifier, nom, n_bins)?;
                 match effect {
                     Effect::HistoSys { new_nom, aux } => {
                         nom = new_nom;
                         aux_terms.push(aux);
                     }
-                    _ => unreachable!("histosys must produce HistoSys effect"),
+                    _ => unreachable!("replaces_nominal modifier must produce HistoSys effect"),
                 }
             }
         }
 
-        // Second pass: apply all multiplicative modifiers.
+        // Second pass: apply all multiplicative modifiers. Every non-replacing
+        // effect reduces to `acc = broadcast(mul, acc, factor)` plus an optional
+        // aux term, so extract `(factor, Option<aux>)` and emit one broadcast.
         let mut acc = nom;
         for modifier in *modifiers {
-            if modifier.kind == "histosys" {
+            if mod_spec(&modifier.kind).is_some_and(|spec| spec.replaces_nominal) {
                 continue; // already handled above
             }
-            let effect = modifier_effect(b, modifier, nom)?;
-            match effect {
-                Effect::MulParam(param) => {
-                    let mul = b.call_head("mul");
-                    acc = b.call("broadcast", &[mul, acc, param]);
-                }
-                Effect::MulGammaWithAux { gamma, aux } => {
-                    let mul = b.call_head("mul");
-                    acc = b.call("broadcast", &[mul, acc, gamma]);
-                    aux_terms.push(aux);
-                }
-                Effect::NormSys { factor, aux } => {
-                    let mul = b.call_head("mul");
-                    acc = b.call("broadcast", &[mul, acc, factor]);
-                    aux_terms.push(aux);
-                }
-                Effect::HistoSys { .. } => {
-                    unreachable!("histosys handled in first pass")
-                }
-                Effect::MulLumi(lam) => {
-                    let mul = b.call_head("mul");
-                    acc = b.call("broadcast", &[mul, acc, lam]);
-                }
-                Effect::MulStaterrGamma(gamma) => {
-                    let mul = b.call_head("mul");
-                    acc = b.call("broadcast", &[mul, acc, gamma]);
-                }
-                Effect::MulShapefactorGamma(gamma) => {
-                    let mul = b.call_head("mul");
-                    acc = b.call("broadcast", &[mul, acc, gamma]);
-                }
+            let effect = modifier_effect(b, modifier, nom, n_bins)?;
+            let (factor, aux) = match effect {
+                Effect::MulParam(param) => (param, None),
+                Effect::MulGammaWithAux { gamma, aux } => (gamma, Some(aux)),
+                Effect::NormSys { factor, aux } => (factor, Some(aux)),
+                Effect::MulLumi(lam) => (lam, None),
+                Effect::MulStaterrGamma(gamma) => (gamma, None),
+                Effect::MulShapefactorGamma(gamma) => (gamma, None),
+                Effect::HistoSys { .. } => unreachable!("histosys handled in first pass"),
+            };
+            let mul = b.call_head("mul");
+            acc = b.call("broadcast", &[mul, acc, factor]);
+            if let Some(aux) = aux {
+                aux_terms.push(aux);
             }
         }
         sample_expected.push(acc);
@@ -321,78 +373,56 @@ pub fn assemble_channel(
     Ok(())
 }
 
-/// Declare the free-parameter binding for a modifier (deduplication is handled by
-/// the caller tracking `declared` names — this function always writes the binding).
+/// Validate a modifier and declare its free-parameter binding, returning the
+/// parameter name. A modifier of a known kind that is missing its `parameter`, or
+/// of an unknown kind, is rejected here rather than emitting a malformed binding.
+/// If the parameter is already in `declared`, the binding is skipped (idempotent)
+/// but the name is still returned and validated.
 fn declare_modifier_param(
     b: &mut Builder,
     modifier: &crate::model::Modifier,
     n_bins: usize,
-) -> Result<()> {
-    let param = match &modifier.parameter {
-        Some(p) => p.clone(),
-        None => return Ok(()),
-    };
+    declared: &HashSet<String>,
+) -> Result<String> {
+    // Kind validation + the `parameter` requirement are driven by the shared
+    // MOD_SPECS table (histfactory.rs), so this path cannot disagree with
+    // `modifier_effect` about which kinds are supported or need a parameter.
+    let spec = require_spec(modifier)?;
+    let param = require_param(modifier, spec)?;
 
-    match modifier.kind.as_str() {
-        "normfactor" => {
-            let set = b.call_head("nonnegreals");
-            b.bind_set(&param, set);
-        }
-        "shapesys" => {
+    if !declared.contains(param) {
+        let set = param_domain_set(b, spec.param_domain, n_bins);
+        b.bind_set(param, set);
+    }
+    Ok(param.to_string())
+}
+
+/// Emit the FlatPPL set node a [`ParamDomain`] corresponds to.
+fn param_domain_set(b: &mut Builder, domain: ParamDomain, n_bins: usize) -> NodeId {
+    match domain {
+        ParamDomain::Reals => b.call_head("reals"),
+        ParamDomain::PosReals => b.call_head("posreals"),
+        ParamDomain::PosRealsPow => {
             let posreals = b.call_head("posreals");
             let n_node = b.lit_int(n_bins as i64);
-            let set = b.call("cartpow", &[posreals, n_node]);
-            b.bind_set(&param, set);
-        }
-        "normsys" => {
-            // alpha: real-valued nuisance
-            let set = b.call_head("reals");
-            b.bind_set(&param, set);
-        }
-        "histosys" => {
-            // alpha: real-valued nuisance
-            let set = b.call_head("reals");
-            b.bind_set(&param, set);
-        }
-        "lumi" => {
-            // lam: positive real
-            let set = b.call_head("posreals");
-            b.bind_set(&param, set);
-        }
-        "staterror" => {
-            // gamma: cartpow(posreals, n_bins)
-            let posreals = b.call_head("posreals");
-            let n_node = b.lit_int(n_bins as i64);
-            let set = b.call("cartpow", &[posreals, n_node]);
-            b.bind_set(&param, set);
-        }
-        "shapefactor" => {
-            // gamma: cartpow(posreals, n_bins)
-            let posreals = b.call_head("posreals");
-            let n_node = b.lit_int(n_bins as i64);
-            let set = b.call("cartpow", &[posreals, n_node]);
-            b.bind_set(&param, set);
-        }
-        _ => {
-            // Unknown modifier — modifier_effect will error; skip declaration.
+            b.call("cartpow", &[posreals, n_node])
         }
     }
-    Ok(())
 }
 
 /// Resolve the observed-data vector for `channel_name` from either schema.
 ///
 /// New format: `doc.observations` list keyed by name.
 /// Old format: `doc.data` map keyed by channel name.
-fn find_obs(b: &mut Builder, doc: &PyhfDocument, channel_name: &str) -> Result<NodeId> {
+fn find_obs(b: &mut Builder, doc: &PyhfDocument, channel_name: &str) -> Result<(NodeId, usize)> {
     if let Some(obs) = doc.observations.iter().find(|o| o.name == channel_name) {
         let elems: Vec<NodeId> = obs.data.iter().map(|x| b.lit_real(*x)).collect();
-        return Ok(b.array(&elems));
+        return Ok((b.array(&elems), obs.data.len()));
     }
     if let Some(map) = &doc.data {
         if let Some(data) = map.get(channel_name) {
             let elems: Vec<NodeId> = data.iter().map(|x| b.lit_real(*x)).collect();
-            return Ok(b.array(&elems));
+            return Ok((b.array(&elems), data.len()));
         }
     }
     Err(Error::NoObservation(channel_name.to_owned()))

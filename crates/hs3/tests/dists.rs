@@ -37,19 +37,15 @@ fn generalized_normal_converts() {
     let text = print_with(&m, Syntax::Minimal);
     eprintln!("=== GeneralizedNormal ===\n{text}\n=== end ===");
 
+    // Exact body: each keyword must bind its matching HS3 field (mean=gn_mu,
+    // alpha=gn_alpha, beta=gn_beta) — a swapped-kwarg lowering would still pass
+    // bare-token checks, so pin the full call RHS and relabel.
     assert!(
-        text.contains("GeneralizedNormal"),
-        "missing GeneralizedNormal, got:\n{text}"
+        text.contains(
+            r#"gn_dist = relabel(GeneralizedNormal(mean = gn_mu, alpha = gn_alpha, beta = gn_beta), ["x_obs"])"#
+        ),
+        "GeneralizedNormal body mismatch (kwarg→field binding), got:\n{text}"
     );
-    assert!(text.contains("mean"), "missing mean kwarg, got:\n{text}");
-    assert!(text.contains("alpha"), "missing alpha kwarg, got:\n{text}");
-    assert!(text.contains("beta"), "missing beta kwarg, got:\n{text}");
-    assert!(text.contains("gn_mu"), "missing gn_mu, got:\n{text}");
-    assert!(text.contains("gn_alpha"), "missing gn_alpha, got:\n{text}");
-    assert!(text.contains("gn_beta"), "missing gn_beta, got:\n{text}");
-    // variate relabeled
-    assert!(text.contains("relabel"), "missing relabel, got:\n{text}");
-    assert!(text.contains("x_obs"), "missing x_obs, got:\n{text}");
 
     let parsed = parse(&text);
     assert!(
@@ -87,15 +83,15 @@ fn multivariate_normal_converts() {
     let text = print_with(&m, Syntax::Minimal);
     eprintln!("=== MvNormal ===\n{text}\n=== end ===");
 
-    assert!(text.contains("MvNormal"), "missing MvNormal, got:\n{text}");
-    assert!(text.contains("mu"), "missing mu kwarg, got:\n{text}");
-    assert!(text.contains("cov"), "missing cov kwarg, got:\n{text}");
-    assert!(text.contains("mv_mu0"), "missing mv_mu0, got:\n{text}");
-    assert!(text.contains("mv_mu1"), "missing mv_mu1, got:\n{text}");
-    // both observed variable names must appear in relabel
-    assert!(text.contains("obs0"), "missing obs0, got:\n{text}");
-    assert!(text.contains("obs1"), "missing obs1, got:\n{text}");
-    assert!(text.contains("relabel"), "missing relabel, got:\n{text}");
+    // Exact body: mean vector [mv_mu0, mv_mu1], 2×2 identity covariance, both
+    // observed names in the relabel, in order.
+    assert!(
+        text.contains(
+            "mv_dist = relabel(MvNormal(mu = [mv_mu0, mv_mu1], cov = [[1.0, 0.0], [0.0, 1.0]]), \
+             [\"obs0\", \"obs1\"])"
+        ),
+        "MvNormal body mismatch, got:\n{text}"
+    );
 
     let parsed = parse(&text);
     assert!(
@@ -138,29 +134,21 @@ fn crystalball_single_sided_converts() {
     eprintln!("=== CrystalBall ===\n{text}\n=== end ===");
 
     assert!(
-        text.contains("hepphys.CrystalBall"),
-        "missing hepphys.CrystalBall, got:\n{text}"
-    );
-    assert!(
         !text.contains("DoubleSided"),
         "must not emit DoubleSided, got:\n{text}"
     );
+    // hepphys must be imported from the particle-physics standard module.
     assert!(
-        text.contains("hepphys"),
-        "missing hepphys binding, got:\n{text}"
+        text.contains("hepphys = standard_module(\"particle-physics\", \"0.1\")"),
+        "missing hepphys standard_module import, got:\n{text}"
     );
-    assert!(text.contains("cb_m0"), "missing cb_m0, got:\n{text}");
-    assert!(text.contains("cb_sigma"), "missing cb_sigma, got:\n{text}");
-    assert!(text.contains("cb_alpha"), "missing cb_alpha, got:\n{text}");
-    assert!(text.contains("cb_n"), "missing cb_n, got:\n{text}");
+    // Exact body: positional args (m0, sigma, alpha, n) in HS3 order, relabeled
+    // onto the observed mass variate m_obs.
     assert!(
-        text.contains("m_obs"),
-        "missing m_obs variate, got:\n{text}"
-    );
-    assert!(text.contains("relabel"), "missing relabel, got:\n{text}");
-    assert!(
-        text.contains("standard_module"),
-        "missing standard_module binding, got:\n{text}"
+        text.contains(
+            "cb_dist = relabel(hepphys.CrystalBall(cb_m0, cb_sigma, cb_alpha, cb_n), [\"m_obs\"])"
+        ),
+        "single-sided CrystalBall body mismatch, got:\n{text}"
     );
 
     let parsed = parse(&text);
@@ -210,33 +198,17 @@ fn crystalball_double_sided_converts() {
     eprintln!("=== DoubleSidedCrystalBall ===\n{text}\n=== end ===");
 
     assert!(
-        text.contains("hepphys.DoubleSidedCrystalBall"),
-        "missing hepphys.DoubleSidedCrystalBall, got:\n{text}"
-    );
-    assert!(
         !text.contains("hepphys.CrystalBall("),
         "must not emit single-sided CB, got:\n{text}"
     );
-    assert!(text.contains("dscb_m0"), "missing dscb_m0, got:\n{text}");
+    // Exact body: the seven double-sided parameters in HS3 order
+    // (m0, sigma_L, sigma_R, alpha_L, n_L, alpha_R, n_R), relabeled onto m_obs2.
     assert!(
-        text.contains("dscb_sigL"),
-        "missing dscb_sigL, got:\n{text}"
-    );
-    assert!(
-        text.contains("dscb_sigR"),
-        "missing dscb_sigR, got:\n{text}"
-    );
-    assert!(text.contains("dscb_aL"), "missing dscb_aL, got:\n{text}");
-    assert!(text.contains("dscb_nL"), "missing dscb_nL, got:\n{text}");
-    assert!(text.contains("dscb_aR"), "missing dscb_aR, got:\n{text}");
-    assert!(text.contains("dscb_nR"), "missing dscb_nR, got:\n{text}");
-    assert!(
-        text.contains("m_obs2"),
-        "missing m_obs2 variate, got:\n{text}"
-    );
-    assert!(
-        text.contains("standard_module"),
-        "missing standard_module binding, got:\n{text}"
+        text.contains(
+            "dscb_dist = relabel(hepphys.DoubleSidedCrystalBall(dscb_m0, dscb_sigL, dscb_sigR, \
+             dscb_aL, dscb_nL, dscb_aR, dscb_nR), [\"m_obs2\"])"
+        ),
+        "double-sided CrystalBall body mismatch, got:\n{text}"
     );
 
     let parsed = parse(&text);
@@ -277,21 +249,15 @@ fn argus_converts() {
     let text = print_with(&m, Syntax::Minimal);
     eprintln!("=== Argus ===\n{text}\n=== end ===");
 
+    // Exact body: positional args (resonance, slope, power) in HS3 order,
+    // relabeled onto the observed mass variate.
     assert!(
-        text.contains("hepphys.Argus"),
-        "missing hepphys.Argus, got:\n{text}"
+        text.contains("argus_d = relabel(hepphys.Argus(arg_c, arg_chi, arg_p), [\"mass_obs\"])"),
+        "Argus body mismatch, got:\n{text}"
     );
-    assert!(text.contains("arg_c"), "missing arg_c, got:\n{text}");
-    assert!(text.contains("arg_chi"), "missing arg_chi, got:\n{text}");
-    assert!(text.contains("arg_p"), "missing arg_p, got:\n{text}");
     assert!(
-        text.contains("mass_obs"),
-        "missing mass_obs variate, got:\n{text}"
-    );
-    assert!(text.contains("relabel"), "missing relabel, got:\n{text}");
-    assert!(
-        text.contains("standard_module"),
-        "missing standard_module binding, got:\n{text}"
+        text.contains("hepphys = standard_module(\"particle-physics\", \"0.1\")"),
+        "missing hepphys standard_module import, got:\n{text}"
     );
 
     let parsed = parse(&text);
@@ -347,17 +313,26 @@ fn mixture_extended_converts() {
     let text = print_with(&m, Syntax::Minimal);
     eprintln!("=== mixture_dist extended ===\n{text}\n=== end ===");
 
+    // The whole `mix` binding is the bare superpose of two weighted summands,
+    // with the declared coefficients (0.3, 0.7) bound to the matching summand
+    // (g1, g2). extended=true uses the coefficients directly.
     assert!(
-        text.contains("normalize(superpose("),
-        "missing normalize(superpose(, got:\n{text}"
+        text.contains("mix = superpose(weighted(0.3, g1), weighted(0.7, g2))"),
+        "extended mixture body mismatch (coeff→summand binding), got:\n{text}"
     );
+    // extended=true must NOT wrap the superposition in an outer `normalize(`
+    // (the rate-weighted superposition is already an unnormalized measure —
+    // normalizing would discard the rate information). Check the *binding* line,
+    // not the provenance comment (which mentions normalize for the non-extended
+    // form).
+    let mix_line = text
+        .lines()
+        .find(|l| l.trim_start().starts_with("mix ="))
+        .expect("mix binding line present");
     assert!(
-        text.contains("weighted("),
-        "missing weighted(, got:\n{text}"
+        !mix_line.contains("normalize("),
+        "extended mixture binding must NOT contain normalize(, got:\n{mix_line}"
     );
-    // both summand self-refs must appear
-    assert!(text.contains("g1"), "missing g1 summand ref, got:\n{text}");
-    assert!(text.contains("g2"), "missing g2 summand ref, got:\n{text}");
 
     let parsed = parse(&text);
     assert!(
@@ -413,21 +388,13 @@ fn mixture_nonextended_converts() {
     let text = print_with(&m, Syntax::Minimal);
     eprintln!("=== mixture_dist non-extended ===\n{text}\n=== end ===");
 
+    // Non-extended: the full normalized superposition. The single explicit
+    // coefficient 0.4 binds to the FIRST summand (h1); the implicit last
+    // coefficient 0.6 (= 1 - 0.4) binds to the SECOND summand (h2). This exact
+    // body pins both the normalize wrapper AND the coefficient→summand binding.
     assert!(
-        text.contains("normalize(superpose("),
-        "missing normalize(superpose(, got:\n{text}"
-    );
-    assert!(
-        text.contains("weighted("),
-        "missing weighted(, got:\n{text}"
-    );
-    // both summand self-refs must appear
-    assert!(text.contains("h1"), "missing h1 summand ref, got:\n{text}");
-    assert!(text.contains("h2"), "missing h2 summand ref, got:\n{text}");
-    // implicit second coefficient 0.6 (= 1 - 0.4) must appear
-    assert!(
-        text.contains("0.6"),
-        "missing implicit coefficient 0.6, got:\n{text}"
+        text.contains("mix2 = normalize(superpose(weighted(0.4, h1), weighted(0.6, h2)))"),
+        "non-extended mixture body mismatch (coeff→summand binding), got:\n{text}"
     );
 
     let parsed = parse(&text);
@@ -510,17 +477,14 @@ fn rate_extended_dist_converts() {
     let text = print_with(&m, Syntax::Minimal);
     eprintln!("=== rate_extended_dist ===\n{text}\n=== end ===");
 
+    // Exact body: the rate (n_sig) weights a self-ref to the inner shape dist;
+    // rate_extended has no own variate, so the `process` binding is the bare
+    // PoissonProcess with no relabel. Pinning the whole RHS catches a swapped
+    // weighted(shape_dist, n_sig) order or a stray relabel.
     assert!(
-        text.contains("PoissonProcess(weighted("),
-        "missing PoissonProcess(weighted(, got:\n{text}"
+        text.contains("process = PoissonProcess(weighted(n_sig, shape_dist))"),
+        "rate_extended_dist body mismatch, got:\n{text}"
     );
-    assert!(text.contains("n_sig"), "missing n_sig, got:\n{text}");
-    assert!(
-        text.contains("shape_dist"),
-        "missing shape_dist self-ref, got:\n{text}"
-    );
-    // rate_extended has no own variate — no relabel for 'process'
-    // (the inner dist shape_dist carries a variate, but process itself does not)
 
     let parsed = parse(&text);
     assert!(
@@ -559,15 +523,13 @@ fn rate_density_dist_converts() {
     let text = print_with(&m, Syntax::Minimal);
     eprintln!("=== rate_density_dist ===\n{text}\n=== end ===");
 
+    // Exact body: the density function is weighted against Lebesgue(reals)
+    // (no rate parameter — the function carries the intensity), wrapped in
+    // PoissonProcess.
     assert!(
-        text.contains("PoissonProcess(weighted("),
-        "missing PoissonProcess(weighted(, got:\n{text}"
+        text.contains("process2 = PoissonProcess(weighted(my_density, Lebesgue(reals)))"),
+        "rate_density_dist body mismatch, got:\n{text}"
     );
-    assert!(
-        text.contains("my_density"),
-        "missing my_density ref, got:\n{text}"
-    );
-    assert!(text.contains("Lebesgue"), "missing Lebesgue, got:\n{text}");
 
     let parsed = parse(&text);
     assert!(
@@ -614,27 +576,16 @@ fn bincounts_extended_dist_converts() {
     let text = print_with(&m, Syntax::Minimal);
     eprintln!("=== bincounts_extended_dist ===\n{text}\n=== end ===");
 
+    // Exact body: the {nbins:4, min:0, max:2} axis expands to the full edge
+    // vector [0.0, 0.5, 1.0, 1.5, 2.0] (step = 0.5), and the rate (n_bkg)
+    // weights a self-ref to the shape dist. Pinning the whole RHS is what makes
+    // the edge expansion meaningful — bare contains("0.5") false-passes on the
+    // `bsig` parameter value 0.5.
     assert!(
-        text.contains("BinnedPoissonProcess("),
-        "missing BinnedPoissonProcess(, got:\n{text}"
-    );
-    assert!(text.contains("n_bkg"), "missing n_bkg rate, got:\n{text}");
-    assert!(
-        text.contains("bshape"),
-        "missing bshape self-ref, got:\n{text}"
-    );
-    assert!(
-        text.contains("weighted("),
-        "missing weighted(, got:\n{text}"
-    );
-    // Edge expansion: 4 bins [0,2] → step=0.5 → edges 0.0, 0.5, 1.0, 1.5, 2.0
-    assert!(
-        text.contains("0.5"),
-        "missing computed edge 0.5, got:\n{text}"
-    );
-    assert!(
-        text.contains("1.5"),
-        "missing computed edge 1.5, got:\n{text}"
+        text.contains(
+            "binned_proc = BinnedPoissonProcess([0.0, 0.5, 1.0, 1.5, 2.0], weighted(n_bkg, bshape))"
+        ),
+        "bincounts_extended_dist body mismatch (edge expansion + weighted order), got:\n{text}"
     );
 
     let parsed = parse(&text);
@@ -664,6 +615,9 @@ const BINCOUNTS_EDGES_JSON: &str = r#"{
       "axes": [{"edges": [0.0, 1.0, 3.0, 6.0]}]
     }
   ],
+  "domains": [
+    {"name": "obs_domain", "axes": [{"name": "ex_obs", "min": 0.0, "max": 6.0}]}
+  ],
   "parameter_points": [
     {"name": "nominal", "entries": [
       {"name": "n_edge", "value": 10.0}
@@ -677,13 +631,15 @@ fn bincounts_extended_edges_form_converts() {
     let text = print_with(&m, Syntax::Minimal);
     eprintln!("=== bincounts_extended edges ===\n{text}\n=== end ===");
 
+    // Exact body: the explicit edge vector [0.0, 1.0, 3.0, 6.0] from axes.edges
+    // (not expanded — used verbatim), with the rate (n_edge) weighting a self-ref
+    // to the uniform shape.
     assert!(
-        text.contains("BinnedPoissonProcess("),
-        "missing BinnedPoissonProcess(, got:\n{text}"
+        text.contains(
+            "edge_proc = BinnedPoissonProcess([0.0, 1.0, 3.0, 6.0], weighted(n_edge, eshape))"
+        ),
+        "bincounts edges-form body mismatch, got:\n{text}"
     );
-    // Edge vector from axes.edges
-    assert!(text.contains("3.0"), "missing edge 3.0, got:\n{text}");
-    assert!(text.contains("6.0"), "missing edge 6.0, got:\n{text}");
 
     let parsed = parse(&text);
     assert!(
@@ -714,6 +670,9 @@ const BINCOUNTS_MULTIAXIS_JSON: &str = r#"{
         {"nbins": 3, "min": 0.0, "max": 3.0}
       ]
     }
+  ],
+  "domains": [
+    {"name": "obs_domain", "axes": [{"name": "mx_obs", "min": 0.0, "max": 3.0}]}
   ],
   "parameter_points": [
     {"name": "nominal", "entries": [
@@ -763,16 +722,14 @@ fn bincounts_density_dist_converts() {
     let text = print_with(&m, Syntax::Minimal);
     eprintln!("=== bincounts_density_dist ===\n{text}\n=== end ===");
 
+    // Exact body: the explicit edge vector [0.0, 2.0, 4.0, 6.0] from axes.edges,
+    // and the density function weighted against Lebesgue(reals) (no rate param).
     assert!(
-        text.contains("BinnedPoissonProcess("),
-        "missing BinnedPoissonProcess(, got:\n{text}"
+        text.contains(
+            "density_proc = BinnedPoissonProcess([0.0, 2.0, 4.0, 6.0], weighted(flat_fn, Lebesgue(reals)))"
+        ),
+        "bincounts_density_dist body mismatch, got:\n{text}"
     );
-    assert!(
-        text.contains("flat_fn"),
-        "missing flat_fn ref, got:\n{text}"
-    );
-    assert!(text.contains("Lebesgue"), "missing Lebesgue, got:\n{text}");
-    assert!(text.contains("4.0"), "missing edge 4.0, got:\n{text}");
 
     let parsed = parse(&text);
     assert!(
@@ -808,18 +765,21 @@ fn polynomial_dist_converts() {
     let text = print_with(&m, Syntax::Minimal);
     eprintln!("=== polynomial_dist ===\n{text}\n=== end ===");
 
+    // Exact body: the coefficient vector [1.0, c1, 0.5] (mixed literal/param) is
+    // applied via polynomial over a fresh bound variable _p_obs_, normalized
+    // against Lebesgue(reals), and relabeled onto the observed variate p_obs.
     assert!(
-        text.contains("normalize(weighted(functionof(polynomial("),
-        "missing normalize(weighted(functionof(polynomial(, got:\n{text}"
+        text.contains(
+            "poly_d = relabel(normalize(weighted(functionof(polynomial([1.0, c1, 0.5], _p_obs_), \
+             p_obs = _p_obs_), Lebesgue(reals))), [\"p_obs\"])"
+        ),
+        "polynomial_dist body mismatch, got:\n{text}"
     );
-    assert!(text.contains("c1"), "missing c1 param, got:\n{text}");
-    assert!(text.contains("0.5"), "missing literal 0.5, got:\n{text}");
-    assert!(text.contains("Lebesgue"), "missing Lebesgue, got:\n{text}");
+    // c1 is a free parameter (the only non-literal coefficient).
     assert!(
-        text.contains("p_obs"),
-        "missing p_obs variate relabel, got:\n{text}"
+        text.contains("c1 = elementof(reals)"),
+        "missing c1 free-param declaration, got:\n{text}"
     );
-    assert!(text.contains("relabel"), "missing relabel, got:\n{text}");
 
     let parsed = parse(&text);
     assert!(
@@ -856,21 +816,20 @@ fn barlow_beeston_lite_poisson_constraint_converts() {
     let text = print_with(&m, Syntax::Minimal);
     eprintln!("=== barlow_beeston_lite ===\n{text}\n=== end ===");
 
+    // Exact body: per-bin Poisson broadcast over the expected vector
+    // [10.0, e1, 5.0] (mixed literal/param), relabeled onto the three observed
+    // bin names in order.
     assert!(
-        text.contains("broadcast(Poisson,"),
-        "missing broadcast(Poisson,, got:\n{text}"
+        text.contains(
+            "bb_constraint = relabel(broadcast(Poisson, [10.0, e1, 5.0]), \
+             [\"bb_obs0\", \"bb_obs1\", \"bb_obs2\"])"
+        ),
+        "barlow_beeston_lite body mismatch, got:\n{text}"
     );
-    assert!(text.contains("relabel"), "missing relabel, got:\n{text}");
-    assert!(text.contains("bb_obs0"), "missing bb_obs0, got:\n{text}");
-    assert!(text.contains("bb_obs1"), "missing bb_obs1, got:\n{text}");
-    assert!(text.contains("bb_obs2"), "missing bb_obs2, got:\n{text}");
+    // e1 is the only free (non-literal) expected value; it must be a positive rate.
     assert!(
-        text.contains("e1"),
-        "missing e1 expected param, got:\n{text}"
-    );
-    assert!(
-        text.contains("10.0") || text.contains("10"),
-        "missing 10.0 literal, got:\n{text}"
+        text.contains("e1 = elementof(posreals)"),
+        "missing e1 positive-rate declaration, got:\n{text}"
     );
 
     let parsed = parse(&text);

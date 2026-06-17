@@ -16,16 +16,22 @@ pub fn sample_nominal(b: &mut Builder, data: &SampleData) -> NodeId {
 }
 
 /// A JSON array (modifier.data) -> FlatPPL array node.
-fn json_array(b: &mut Builder, v: &serde_json::Value) -> NodeId {
-    let elems: Vec<NodeId> = v
+///
+/// `what` names the field for the error message. Returns `Err(Unsupported)` if
+/// `v` is not a JSON array or if any element is not a number — silently coercing
+/// a non-numeric entry to `0.0` would emit a wrong-but-plausible model.
+fn json_array(b: &mut Builder, v: &serde_json::Value, what: &str) -> Result<NodeId> {
+    let arr = v
         .as_array()
-        .map(|a| {
-            a.iter()
-                .map(|x| b.lit_real(x.as_f64().unwrap_or(0.0)))
-                .collect()
-        })
-        .unwrap_or_default();
-    b.array(&elems)
+        .ok_or_else(|| Error::Unsupported(format!("{what}: expected a JSON array of numbers")))?;
+    let mut elems: Vec<NodeId> = Vec::with_capacity(arr.len());
+    for (i, x) in arr.iter().enumerate() {
+        let val = x
+            .as_f64()
+            .ok_or_else(|| Error::Unsupported(format!("{what}: element {i} is not a number")))?;
+        elems.push(b.lit_real(val));
+    }
+    Ok(b.array(&elems))
 }
 
 /// tau = broadcast(pow, broadcast(divide, nom, sigma), 2)  [point-free].
@@ -48,25 +54,161 @@ pub fn shapesys_aux(b: &mut Builder, gamma: NodeId, nom: NodeId, sigma: NodeId) 
     b.call("likelihoodof", &[aux_model, t])
 }
 
+// pyhf interpolation codes (the `interpolation` field on a modifier).
+const INTERP_CODE_LIN: &str = "lin";
+const INTERP_CODE_LOG: &str = "log";
+const INTERP_CODE_PARABOLIC: &str = "parabolic";
+const INTERP_CODE_POLY6: &str = "poly6";
+
+// hepphys interpolation function names these codes map to.
+const INTERP_PWLIN: &str = "interp_pwlin";
+const INTERP_PWEXP: &str = "interp_pwexp";
+const INTERP_POLY2_LIN: &str = "interp_poly2_lin";
+const INTERP_POLY6_LIN: &str = "interp_poly6_lin";
+
+/// normsys default interpolation function.
+pub const INTERP_NORMSYS_DEFAULT: &str = "interp_poly6_exp";
+/// histosys default interpolation function.
+pub const INTERP_HISTOSYS_DEFAULT: &str = "interp_poly6_lin";
+
 /// Map `modifier.interpolation` field (or None) to the hepphys interp function name.
 ///
-/// normsys default: `interp_poly6_exp`
-/// histosys default: `interp_poly6_lin`
-pub fn interp_fn(code: Option<&str>, default: &str) -> &'static str {
-    match code.unwrap_or(default) {
-        "lin" => "interp_pwlin",
-        "log" => "interp_pwexp",
-        "parabolic" => "interp_poly2_lin",
-        "poly6" => "interp_poly6_lin",
-        _ => {
-            // Treat the default string as the fallback case identifier.
-            // normsys passes "interp_poly6_exp", histosys passes "interp_poly6_lin".
-            if default == "interp_poly6_exp" {
-                "interp_poly6_exp"
-            } else {
-                "interp_poly6_lin"
-            }
-        }
+/// `default` is the interp function used when the field is absent or unrecognised —
+/// `INTERP_NORMSYS_DEFAULT` for normsys, `INTERP_HISTOSYS_DEFAULT` for histosys.
+pub fn interp_fn(code: Option<&str>, default: &'static str) -> &'static str {
+    match code {
+        Some(INTERP_CODE_LIN) => INTERP_PWLIN,
+        Some(INTERP_CODE_LOG) => INTERP_PWEXP,
+        Some(INTERP_CODE_PARABOLIC) => INTERP_POLY2_LIN,
+        Some(INTERP_CODE_POLY6) => INTERP_POLY6_LIN,
+        // Absent or unrecognised: fall back to the caller's default.
+        _ => default,
+    }
+}
+
+/// The set a modifier's free parameter ranges over.
+///
+/// `PosRealsPow` is `cartpow(posreals, n_bins)` — one positive real per bin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParamDomain {
+    /// `reals` — normfactor scale + normsys/histosys alpha nuisance (spec §12:206).
+    Reals,
+    /// `posreals` — scalar lumi.
+    PosReals,
+    /// `cartpow(posreals, n_bins)` — per-bin gammas (shapesys/staterror/shapefactor).
+    PosRealsPow,
+}
+
+/// Static description of one histfactory modifier kind. The single source of
+/// truth for kind-dependent knowledge that `modifier_effect` (histfactory.rs) and
+/// `declare_modifier_param` (pyhf.rs) both consume — adding a modifier is a
+/// one-row edit to [`MOD_SPECS`].
+#[derive(Debug, Clone, Copy)]
+pub struct ModSpec {
+    /// The pyhf modifier `type` string.
+    pub kind: &'static str,
+    /// The set the modifier's free parameter ranges over.
+    pub param_domain: ParamDomain,
+    /// Whether a `parameter` field is mandatory (all current kinds require one).
+    pub requires_param: bool,
+    /// histosys: applied in a first pass that replaces the sample nominal rather
+    /// than multiplying into the running product.
+    pub replaces_nominal: bool,
+    /// lumi: needs the channel's `lumi` measurement-config entry and emits one
+    /// channel-wide Normal aux term.
+    pub channel_lumi: bool,
+    /// staterror: nominals and squared errors are aggregated across samples into
+    /// one Gaussian (BB-lite) aux term per bin, emitted channel-wide.
+    pub channel_staterror: bool,
+}
+
+/// The modifier-kind table. One row per supported histfactory modifier.
+pub const MOD_SPECS: &[ModSpec] = &[
+    // normfactor: `factor = elementof(reals)` per spec §12:206 (not constrained nonneg).
+    ModSpec {
+        kind: "normfactor",
+        param_domain: ParamDomain::Reals,
+        requires_param: true,
+        replaces_nominal: false,
+        channel_lumi: false,
+        channel_staterror: false,
+    },
+    ModSpec {
+        kind: "shapesys",
+        param_domain: ParamDomain::PosRealsPow,
+        requires_param: true,
+        replaces_nominal: false,
+        channel_lumi: false,
+        channel_staterror: false,
+    },
+    ModSpec {
+        kind: "normsys",
+        param_domain: ParamDomain::Reals,
+        requires_param: true,
+        replaces_nominal: false,
+        channel_lumi: false,
+        channel_staterror: false,
+    },
+    ModSpec {
+        kind: "histosys",
+        param_domain: ParamDomain::Reals,
+        requires_param: true,
+        replaces_nominal: true,
+        channel_lumi: false,
+        channel_staterror: false,
+    },
+    ModSpec {
+        kind: "lumi",
+        param_domain: ParamDomain::PosReals,
+        requires_param: true,
+        replaces_nominal: false,
+        channel_lumi: true,
+        channel_staterror: false,
+    },
+    ModSpec {
+        kind: "staterror",
+        param_domain: ParamDomain::PosRealsPow,
+        requires_param: true,
+        replaces_nominal: false,
+        channel_lumi: false,
+        channel_staterror: true,
+    },
+    ModSpec {
+        kind: "shapefactor",
+        param_domain: ParamDomain::PosRealsPow,
+        requires_param: true,
+        replaces_nominal: false,
+        channel_lumi: false,
+        channel_staterror: false,
+    },
+];
+
+/// Look up the [`ModSpec`] for a modifier `kind`, or `None` if unsupported.
+pub fn mod_spec(kind: &str) -> Option<&'static ModSpec> {
+    MOD_SPECS.iter().find(|s| s.kind == kind)
+}
+
+/// The [`ModSpec`] for a modifier, or `Err(UnknownModifier)` if the kind is unsupported.
+pub fn require_spec(m: &Modifier) -> Result<&'static ModSpec> {
+    mod_spec(&m.kind).ok_or_else(|| Error::UnknownModifier(m.kind.clone()))
+}
+
+/// The parameter name a modifier binds, validated against its [`ModSpec`].
+///
+/// Returns `Err(UnknownModifier)` for an unsupported kind, or `Err(Unsupported)`
+/// if the kind requires a `parameter` but none is present — a missing `parameter`
+/// would otherwise emit a `self.""` ref or a broadcast with a missing operand.
+/// Shared by `modifier_effect` (histfactory.rs) and `declare_modifier_param`
+/// (pyhf.rs) so the two paths cannot disagree.
+pub fn require_param<'m>(m: &'m Modifier, spec: &ModSpec) -> Result<&'m str> {
+    match m.parameter.as_deref() {
+        Some(p) => Ok(p),
+        None if spec.requires_param => Err(Error::Unsupported(format!(
+            "{} modifier is missing its `parameter` (name of the free parameter it binds)",
+            m.kind
+        ))),
+        // A kind that does not require a parameter but has none: caller decides.
+        None => Ok(""),
     }
 }
 
@@ -103,18 +245,29 @@ pub enum Effect {
 ///
 /// Aux terms for **lumi** and **staterror** are NOT generated here; they are
 /// assembled channel-wide by `emit_channel` in `pyhf.rs`.
-pub fn modifier_effect(b: &mut Builder, m: &Modifier, nom: NodeId) -> Result<Effect> {
-    let param = m.parameter.as_deref().unwrap_or("");
-    match m.kind.as_str() {
+///
+/// `nom_len` is the number of bins in the sample nominal — used to validate that
+/// histosys `lo`/`hi` content arrays have a matching length.
+pub fn modifier_effect(
+    b: &mut Builder,
+    m: &Modifier,
+    nom: NodeId,
+    nom_len: usize,
+) -> Result<Effect> {
+    let spec = require_spec(m)?;
+    let param = require_param(m, spec)?;
+    // The Effect *shape* still varies per kind, but kind validation and the
+    // `parameter` requirement are now driven by `spec`/[`MOD_SPECS`].
+    match spec.kind {
         "normfactor" => Ok(Effect::MulParam(b.self_ref(param))),
 
         "shapesys" => {
             let gamma = b.self_ref(param);
-            let sigma = m
-                .data
-                .as_ref()
-                .map(|d| json_array(b, d))
-                .unwrap_or_else(|| b.array(&[]));
+            // sigma is the per-bin uncertainty array; it is required for the tau term.
+            let data = m.data.as_ref().ok_or_else(|| {
+                Error::Unsupported(format!("shapesys `{param}` missing data (per-bin errors)"))
+            })?;
+            let sigma = json_array(b, data, &format!("shapesys `{param}` data"))?;
             let aux = shapesys_aux(b, gamma, nom, sigma);
             Ok(Effect::MulGammaWithAux { gamma, aux })
         }
@@ -126,7 +279,7 @@ pub fn modifier_effect(b: &mut Builder, m: &Modifier, nom: NodeId) -> Result<Eff
             let one = b.lit_real(1.0);
             let hi = b.lit_real(hi_val);
             let alpha = b.self_ref(param);
-            let fn_name = interp_fn(m.interpolation.as_deref(), "interp_poly6_exp");
+            let fn_name = interp_fn(m.interpolation.as_deref(), INTERP_NORMSYS_DEFAULT);
             let factor = b.module_user_call("hepphys", fn_name, &[lo, one, hi, alpha]);
             // aux: likelihoodof(Normal(mu=alpha, sigma=1.0), 0.0)
             let aux = normsys_aux(b, alpha);
@@ -135,18 +288,15 @@ pub fn modifier_effect(b: &mut Builder, m: &Modifier, nom: NodeId) -> Result<Eff
 
         "histosys" => {
             // data = {hi: {contents:[...]}, lo: {contents:[...]}}
-            let (lo_arr, hi_arr) = parse_histosys_data(b, m)?;
+            let (lo_arr, hi_arr) = parse_histosys_data(b, m, nom_len)?;
             let alpha = b.self_ref(param);
-            let fn_name = interp_fn(m.interpolation.as_deref(), "interp_poly6_lin");
+            let fn_name = interp_fn(m.interpolation.as_deref(), INTERP_HISTOSYS_DEFAULT);
             let new_nom = b.module_user_call("hepphys", fn_name, &[lo_arr, nom, hi_arr, alpha]);
             let aux = normsys_aux(b, alpha); // same Normal(alpha,1) form
             Ok(Effect::HistoSys { new_nom, aux })
         }
 
-        "lumi" => {
-            let lam = b.self_ref(param);
-            Ok(Effect::MulLumi(lam))
-        }
+        "lumi" => Ok(Effect::MulLumi(b.self_ref(param))),
 
         "staterror" => {
             if m.constraint.as_deref() == Some("Poisson") {
@@ -155,16 +305,14 @@ pub fn modifier_effect(b: &mut Builder, m: &Modifier, nom: NodeId) -> Result<Eff
                         .into(),
                 ));
             }
-            let gamma = b.self_ref(param);
-            Ok(Effect::MulStaterrGamma(gamma))
+            Ok(Effect::MulStaterrGamma(b.self_ref(param)))
         }
 
-        "shapefactor" => {
-            let gamma = b.self_ref(param);
-            Ok(Effect::MulShapefactorGamma(gamma))
-        }
+        "shapefactor" => Ok(Effect::MulShapefactorGamma(b.self_ref(param))),
 
-        other => Err(Error::UnknownModifier(other.to_string())),
+        // Unreachable: `require_spec` already rejected unknown kinds, and every
+        // row in MOD_SPECS is handled above.
+        other => unreachable!("MOD_SPECS row `{other}` has no Effect mapping"),
     }
 }
 
@@ -192,16 +340,46 @@ fn parse_normsys_data(m: &Modifier) -> Result<(f64, f64)> {
 }
 
 /// Parse histosys modifier data `{hi: {contents:[...]}, lo: {contents:[...]}}`.
-fn parse_histosys_data(b: &mut Builder, m: &Modifier) -> Result<(NodeId, NodeId)> {
-    let data = m.data.as_ref().ok_or_else(|| {
-        Error::Unsupported(format!(
-            "histosys modifier `{}` missing data",
-            m.parameter.as_deref().unwrap_or("?")
-        ))
-    })?;
-    let lo_arr = json_array(b, &data["lo"]["contents"]);
-    let hi_arr = json_array(b, &data["hi"]["contents"]);
+///
+/// Validates that both `lo.contents` and `hi.contents` exist, are numeric arrays,
+/// and have `nom_len` bins — a ragged or missing array would otherwise feed a
+/// length-mismatched (or empty) array into the interpolation function.
+fn parse_histosys_data(b: &mut Builder, m: &Modifier, nom_len: usize) -> Result<(NodeId, NodeId)> {
+    let param = m.parameter.as_deref().unwrap_or("?");
+    let data = m
+        .data
+        .as_ref()
+        .ok_or_else(|| Error::Unsupported(format!("histosys modifier `{param}` missing data")))?;
+    let lo_arr = histosys_contents(b, data, "lo", param, nom_len)?;
+    let hi_arr = histosys_contents(b, data, "hi", param, nom_len)?;
     Ok((lo_arr, hi_arr))
+}
+
+/// Parse and validate one of the `lo`/`hi` `contents` arrays of a histosys modifier.
+fn histosys_contents(
+    b: &mut Builder,
+    data: &serde_json::Value,
+    side: &str,
+    param: &str,
+    nom_len: usize,
+) -> Result<NodeId> {
+    let contents = &data[side]["contents"];
+    if contents.is_null() {
+        return Err(Error::Unsupported(format!(
+            "histosys `{param}`: `{side}.contents` is missing"
+        )));
+    }
+    let what = format!("histosys `{param}` {side}.contents");
+    let arr = contents
+        .as_array()
+        .ok_or_else(|| Error::Unsupported(format!("{what}: expected a JSON array of numbers")))?;
+    if arr.len() != nom_len {
+        return Err(Error::Unsupported(format!(
+            "{what}: has {} bins but the sample nominal has {nom_len}",
+            arr.len()
+        )));
+    }
+    json_array(b, contents, &what)
 }
 
 /// `likelihoodof(Normal(mu=alpha, sigma=1.0), 0.0)` — shared by normsys and histosys.
