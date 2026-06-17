@@ -423,6 +423,15 @@ thread_local! {
     pub static IMPORT_BUNDLE_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+// Per-thread execution counter for `analyze`. Thread-local so concurrent tests
+// do not interfere with each other's measurements (mirrors `IMPORT_BUNDLE_RUNS`).
+// Reset with `ANALYZE_RUNS.with(|c| c.set(0))` before measuring; read with
+// `ANALYZE_RUNS.with(|c| c.get())`.
+#[cfg(test)]
+thread_local! {
+    pub static ANALYZE_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 // ── Analyzed tracked struct ──────────────────────────────────────────────────
 
 /// The result of analyzing (parsing + inferring) a single source file against
@@ -461,6 +470,8 @@ pub fn analyze<'db>(
     fs: FileSet,
     cats: Catalogues,
 ) -> Analyzed<'db> {
+    #[cfg(test)]
+    ANALYZE_RUNS.with(|c| c.set(c.get() + 1));
     let parsed = parse(db, file);
     let Some(module) = parsed.module(db) else {
         return Analyzed::new(db, None, parsed.diagnostics(db).clone());

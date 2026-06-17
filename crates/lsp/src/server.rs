@@ -25,7 +25,7 @@ use lsp_types::{
 
 use crate::db::{Catalogues, Database, FileSet, SourceFile};
 use crate::line_index::Pos;
-use crate::queries::line_index;
+use crate::queries::{import_bundle, line_index};
 
 // ── run ─────────────────────────────────────────────────────────────────────
 
@@ -82,6 +82,9 @@ pub fn run(
     }
 
     let fs = build_fileset(&db, &uri_to_file);
+    // Track the current FileSet membership size so `sync_file_set` can skip
+    // the salsa setter when only text (not membership) changes.
+    let mut fileset_len = uri_to_file.len();
 
     // Publish initial diagnostics for all workspace files.
     for (uri_str, &file) in &uri_to_file {
@@ -108,17 +111,12 @@ pub fn run(
                         let uri_str = p.text_document.uri.as_str().to_owned();
                         let text = p.text_document.text;
                         upsert_file(&mut db, &mut uri_to_file, uri_str, text);
-                        // Update the single shared FileSet so hover and future
-                        // analyses see the newly-opened file.
-                        {
-                            use salsa::Setter;
-                            let new_files: Vec<SourceFile> =
-                                uri_to_file.values().copied().collect();
-                            fs.set_files(&mut db).to(new_files);
-                        }
-                        // Re-publish diagnostics for ALL open docs so that
-                        // files that import the newly-opened one also refresh
-                        // (symmetric with didChange).
+                        // Update the shared FileSet only when the file SET membership
+                        // changes (a new open always adds a file, so this fires).
+                        sync_file_set(&mut db, fs, &uri_to_file, &mut fileset_len);
+                        // Re-publish diagnostics for ALL open docs: a newly-opened
+                        // file can satisfy a previously-unresolved import in any
+                        // already-open doc, so the full set must be refreshed.
                         let open_files: Vec<(String, SourceFile)> =
                             uri_to_file.iter().map(|(u, &f)| (u.clone(), f)).collect();
                         for (doc_uri_str, file) in open_files {
@@ -141,20 +139,25 @@ pub fn run(
                         if let Some(change) = p.content_changes.into_iter().last() {
                             upsert_file(&mut db, &mut uri_to_file, uri_str.clone(), change.text);
                         }
-                        // Update the single shared FileSet in place so hover
-                        // always sees the current document set.
-                        {
-                            use salsa::Setter;
-                            let new_files: Vec<SourceFile> =
-                                uri_to_file.values().copied().collect();
-                            fs.set_files(&mut db).to(new_files);
-                        }
-                        // Re-publish diagnostics for ALL open docs so cross-file
-                        // dependency edges are re-evaluated.
-                        let open_files: Vec<(String, SourceFile)> =
-                            uri_to_file.iter().map(|(u, &f)| (u.clone(), f)).collect();
-                        for (doc_uri_str, file) in open_files {
-                            publish_diagnostics(&connection, &db, file, fs, cats, &doc_uri_str)?;
+                        // Guard the FileSet salsa input: a pure text edit leaves
+                        // membership unchanged, so no revision bump is needed.
+                        sync_file_set(&mut db, fs, &uri_to_file, &mut fileset_len);
+                        // Republish diagnostics only for the changed doc and the
+                        // open docs that (transitively) import it — the only docs
+                        // whose diagnostics can change on this edit.
+                        if let Some(&changed) = uri_to_file.get(&uri_str) {
+                            for (doc_uri_str, file) in
+                                affected_files(&db, fs, &uri_to_file, changed)
+                            {
+                                publish_diagnostics(
+                                    &connection,
+                                    &db,
+                                    file,
+                                    fs,
+                                    cats,
+                                    &doc_uri_str,
+                                )?;
+                            }
                         }
                     }
                     _ => {} // ignore other notifications
@@ -172,11 +175,11 @@ pub fn run(
                         connection.sender.send(Message::Response(hover_resp))?;
                     }
                     DocumentSymbolRequest::METHOD => {
-                        let sym_resp = handle_document_symbols(&db, &uri_to_file, fs, cats, &req);
+                        let sym_resp = handle_document_symbols(&db, &uri_to_file, &req);
                         connection.sender.send(Message::Response(sym_resp))?;
                     }
                     WorkspaceSymbolRequest::METHOD => {
-                        let sym_resp = handle_workspace_symbols(&db, fs, cats, &req);
+                        let sym_resp = handle_workspace_symbols(&db, fs, &req);
                         connection.sender.send(Message::Response(sym_resp))?;
                     }
                     InlayHintRequest::METHOD => {
@@ -309,6 +312,57 @@ fn build_fileset(db: &Database, uri_to_file: &HashMap<String, SourceFile>) -> Fi
     FileSet::new(db, files)
 }
 
+/// Update the `FileSet` salsa input only when the file SET membership changes.
+///
+/// A pure text edit of an already-open file leaves membership unchanged — the
+/// edit flows through `SourceFile::set_text` in `upsert_file`, not through
+/// `FileSet`. Bumping the `FileSet` input on every keystroke causes unnecessary
+/// salsa revision churn; this guard skips the setter when the file count is the
+/// same as the last observed count (file length is a sufficient membership proxy
+/// because files are only added, never swapped).
+fn sync_file_set(
+    db: &mut Database,
+    fs: FileSet,
+    uri_to_file: &HashMap<String, SourceFile>,
+    last_len: &mut usize,
+) {
+    if uri_to_file.len() == *last_len {
+        return; // membership unchanged → skip the salsa input bump
+    }
+    *last_len = uri_to_file.len();
+    use salsa::Setter;
+    let new_files: Vec<SourceFile> = uri_to_file.values().copied().collect();
+    fs.set_files(db).to(new_files);
+}
+
+/// Return the subset of `uri_to_file` whose diagnostics can change when
+/// `changed` is edited: `changed` itself, plus every open file whose transitive
+/// import bundle includes `changed`'s path (i.e. files that directly or
+/// transitively import `changed`).
+///
+/// `import_bundle` is a memoized salsa query, so the bundle lookups here are
+/// cache hits for every file whose inputs have not changed.  Independent files
+/// (those that do not import `changed`) are excluded, avoiding spurious
+/// `analyze` recomputation.
+fn affected_files(
+    db: &dyn salsa::Database,
+    fs: FileSet,
+    uri_to_file: &HashMap<String, SourceFile>,
+    changed: SourceFile,
+) -> Vec<(String, SourceFile)> {
+    let changed_path = changed.path(db);
+    uri_to_file
+        .iter()
+        .filter(|(_, f)| {
+            **f == changed
+                || import_bundle(db, **f, fs)
+                    .module_for(&changed_path)
+                    .is_some()
+        })
+        .map(|(u, f)| (u.clone(), *f))
+        .collect()
+}
+
 /// Insert or update a [`SourceFile`] in the map.
 ///
 /// If the URI already has an entry, the `text` input is updated via the salsa
@@ -401,8 +455,6 @@ fn handle_hover(
 fn handle_document_symbols(
     db: &Database,
     uri_to_file: &HashMap<String, SourceFile>,
-    fs: FileSet,
-    cats: Catalogues,
     req: &lsp_server::Request,
 ) -> Response {
     let syms: Vec<lsp_types::DocumentSymbol> = (|| {
@@ -410,7 +462,7 @@ fn handle_document_symbols(
             serde_json::from_value(req.params.clone()).ok()?;
         let uri_str = params.text_document.uri.as_str().to_owned();
         let file = *uri_to_file.get(&uri_str)?;
-        Some(crate::capabilities::document_symbols(db, file, fs, cats))
+        Some(crate::capabilities::document_symbols(db, file))
     })()
     .unwrap_or_default();
 
@@ -420,12 +472,7 @@ fn handle_document_symbols(
 
 /// Handle a `workspace/symbol` request.  Returns a `Response` (result or
 /// null) without sending it — the caller dispatches the message.
-fn handle_workspace_symbols(
-    db: &Database,
-    fs: FileSet,
-    cats: Catalogues,
-    req: &lsp_server::Request,
-) -> Response {
+fn handle_workspace_symbols(db: &Database, fs: FileSet, req: &lsp_server::Request) -> Response {
     let query = (|| -> Option<String> {
         let params: lsp_types::WorkspaceSymbolParams =
             serde_json::from_value(req.params.clone()).ok()?;
@@ -433,7 +480,7 @@ fn handle_workspace_symbols(
     })()
     .unwrap_or_default();
 
-    let syms = crate::capabilities::workspace_symbols(db, fs, cats, &query);
+    let syms = crate::capabilities::workspace_symbols(db, fs, &query);
     let response = lsp_types::WorkspaceSymbolResponse::Flat(syms);
     Response::new_ok(req.id.clone(), response)
 }
@@ -1013,5 +1060,114 @@ mod tests {
             .unwrap();
 
         server_thread.join().expect("server thread panicked");
+    }
+
+    // ── affected_files / ANALYZE_RUNS tests ──────────────────────────────────
+    //
+    // 3-file workspace: B is a leaf; A does `load_module` of B; C is
+    // independent (imports neither A nor B).
+
+    fn make_abc_workspace() -> (
+        crate::db::Database,
+        SourceFile,
+        SourceFile,
+        SourceFile,
+        crate::db::FileSet,
+        HashMap<String, SourceFile>,
+    ) {
+        let db = crate::db::Database::default();
+        let b = SourceFile::new(
+            &db,
+            "/tmp/b.flatppl".to_string(),
+            "leaf = elementof(reals)\n".to_string(),
+        );
+        let a = SourceFile::new(
+            &db,
+            "/tmp/a.flatppl".to_string(),
+            "b = load_module(\"/tmp/b.flatppl\")\nv = add(b.leaf, 1.0)\n".to_string(),
+        );
+        let c = SourceFile::new(
+            &db,
+            "/tmp/c.flatppl".to_string(),
+            "x = add(1, 2)\n".to_string(),
+        );
+        let fs = crate::db::FileSet::new(&db, vec![a, b, c]);
+        let mut uri_to_file: HashMap<String, SourceFile> = HashMap::new();
+        uri_to_file.insert("file:///tmp/a.flatppl".to_string(), a);
+        uri_to_file.insert("file:///tmp/b.flatppl".to_string(), b);
+        uri_to_file.insert("file:///tmp/c.flatppl".to_string(), c);
+        (db, a, b, c, fs, uri_to_file)
+    }
+
+    /// `affected_files(changed=B)` must include A and B (A imports B) but must
+    /// exclude C (C imports neither A nor B).
+    #[test]
+    fn affected_files_excludes_non_importers() {
+        let (db, _a, b, _c, fs, uri_to_file) = make_abc_workspace();
+
+        let affected: std::collections::HashSet<String> = affected_files(&db, fs, &uri_to_file, b)
+            .into_iter()
+            .map(|(u, _)| u)
+            .collect();
+
+        assert!(
+            affected.contains("file:///tmp/b.flatppl"),
+            "changed file B must be in affected set; got {affected:?}"
+        );
+        assert!(
+            affected.contains("file:///tmp/a.flatppl"),
+            "A imports B, so A must be in affected set; got {affected:?}"
+        );
+        assert!(
+            !affected.contains("file:///tmp/c.flatppl"),
+            "C is independent; must NOT be in affected set; got {affected:?}"
+        );
+    }
+
+    /// Editing B (via `set_text`) must NOT invalidate C's `analyze` cache.
+    ///
+    /// After warming A, B, C, we reset `ANALYZE_RUNS`, edit B's text, and
+    /// re-run `analyze` for only the affected set (A, B). Running `analyze(C)`
+    /// afterward must not increment the counter — C's inputs are unchanged so
+    /// salsa serves it from cache.
+    #[test]
+    fn editing_a_file_does_not_reanalyze_independent_files() {
+        use crate::queries::{ANALYZE_RUNS, analyze};
+        use salsa::Setter;
+
+        let (mut db, a, b, c, fs, _uri_to_file) = make_abc_workspace();
+        let cats = crate::db::Catalogues::new(&db, Vec::new());
+
+        // Warm: analyze all three so the revision is established.
+        let _ = analyze(&db, a, fs, cats);
+        let _ = analyze(&db, b, fs, cats);
+        let _ = analyze(&db, c, fs, cats);
+
+        // Reset the counter, then edit B's text (a pure text change, not a
+        // membership change).
+        ANALYZE_RUNS.with(|c| c.set(0));
+        b.set_text(&mut db)
+            .to("leaf = elementof(reals)\nextra = add(leaf, 2.0)\n".to_string());
+
+        // Simulate what the fixed didChange arm does: re-analyze only the
+        // affected set (B and A, which imports B).
+        let _ = analyze(&db, b, fs, cats);
+        let _ = analyze(&db, a, fs, cats);
+        let runs_after_ab = ANALYZE_RUNS.with(|c| c.get());
+        assert_eq!(
+            runs_after_ab, 2,
+            "editing B should recompute analyze for B and A (its importer); got {runs_after_ab}"
+        );
+
+        // Now run analyze(C) — C's inputs are unchanged, so salsa must serve it
+        // from cache without running the body again.
+        ANALYZE_RUNS.with(|c| c.set(0));
+        let _ = analyze(&db, c, fs, cats);
+        let runs_c = ANALYZE_RUNS.with(|c| c.get());
+        assert_eq!(
+            runs_c, 0,
+            "C is independent of B; editing B must NOT invalidate C's analyze cache \
+             (ANALYZE_RUNS incremented {runs_c} times for C, expected 0)"
+        );
     }
 }

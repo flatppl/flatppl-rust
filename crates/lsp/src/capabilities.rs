@@ -6,8 +6,15 @@
 use std::str::FromStr;
 
 use crate::db::{Catalogues, Database, FileSet, SourceFile};
-use crate::queries::{analyze, line_index, parsed_catalogues, resolve_path};
+use crate::queries::{analyze, line_index, parse, parsed_catalogues, resolve_path};
 use flatppl_core::{CallHead, Node, RefNs, Scalar};
+
+/// Test-only counter incremented each time the static completion set is built.
+/// Used by `static_completion_items_built_once` to prove the `OnceLock` cache is
+/// populated exactly once across calls.
+#[cfg(test)]
+static STATIC_COMPLETION_BUILDS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 /// An owned, salsa-friendly diagnostic: a byte range into the source, a severity,
 /// and a message. The LSP `Range` (UTF-16) is computed at emit time from these
@@ -106,12 +113,10 @@ pub fn diagnostics(
 pub fn document_symbols(
     db: &dyn salsa::Database,
     file: SourceFile,
-    fs: FileSet,
-    cats: Catalogues,
 ) -> Vec<lsp_types::DocumentSymbol> {
     let li = line_index(db, file);
-    let analyzed = analyze(db, file, fs, cats);
-    let Some(module) = analyzed.module(db) else {
+    let parsed = parse(db, file);
+    let Some(module) = parsed.module(db) else {
         return vec![];
     };
     let mut syms = Vec::new();
@@ -154,7 +159,6 @@ pub fn document_symbols(
 pub fn workspace_symbols(
     db: &Database,
     fs: FileSet,
-    cats: Catalogues,
     query: &str,
 ) -> Vec<lsp_types::SymbolInformation> {
     let query_lower = query.to_lowercase();
@@ -172,8 +176,8 @@ pub fn workspace_symbols(
         };
 
         let li = line_index(db, file);
-        let analyzed = analyze(db, file, fs, cats);
-        let Some(module) = analyzed.module(db) else {
+        let parsed = parse(db, file);
+        let Some(module) = parsed.module(db) else {
             continue;
         };
 
@@ -412,9 +416,8 @@ pub fn completion(
     // server already emits diagnostics for them via `analyze`).
     let external_cats = parsed_catalogues(db, cats);
 
-    let builtin = flatppl_infer::builtin_catalogue();
-
     if let Some(alias) = member_prefix {
+        let builtin = flatppl_infer::builtin_catalogue();
         // Member completion: find the alias binding, read its standard_module name,
         // list that module's bindings from built-in + external catalogues.
         let module_name = find_standard_module_name(db, file, fs, cats, &alias);
@@ -453,32 +456,19 @@ pub fn completion(
     }
 
     // General completion.
-    let mut items: Vec<CompletionItem> = Vec::new();
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    //
+    // The keyword + built-in base-name set is process-constant: it never depends
+    // on the file, file-set, or catalogue inputs. Build it exactly once and reuse
+    // the cached vector on every subsequent call.
+    let static_items = static_completion_items();
 
-    // Keywords.
-    for kw in &["self", "base", "in", "all", "only", "true", "false"] {
-        if seen.insert((*kw).to_string()) {
-            items.push(CompletionItem {
-                label: (*kw).to_string(),
-                kind: Some(CompletionItemKind::KEYWORD),
-                ..Default::default()
-            });
-        }
-    }
+    // Start from the cached static set; pre-populate `seen` from its labels so the
+    // per-call external/in-scope passes do not re-add a static item.
+    let mut items: Vec<CompletionItem> = static_items.clone();
+    let mut seen: std::collections::HashSet<String> =
+        static_items.iter().map(|i| i.label.clone()).collect();
 
-    // Built-in base names (distributions and functions).
-    for name in builtin.base_names() {
-        if seen.insert(name.to_string()) {
-            items.push(CompletionItem {
-                label: name.to_string(),
-                kind: Some(CompletionItemKind::FUNCTION),
-                ..Default::default()
-            });
-        }
-    }
-
-    // External catalogue base names.
+    // External catalogue base names (per-call: depend on the `cats` input).
     for ext in external_cats.as_slice() {
         for name in ext.base_names() {
             if seen.insert(name.to_string()) {
@@ -507,6 +497,72 @@ pub fn completion(
     }
 
     items
+}
+
+/// Build the process-constant portion of the general completion set: the
+/// language keywords and every built-in base name, deduplicated by label.
+///
+/// This never depends on any request input, so it is built once and reused.
+fn build_static_completion_items() -> Vec<lsp_types::CompletionItem> {
+    #[cfg(test)]
+    STATIC_COMPLETION_BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    use lsp_types::{CompletionItem, CompletionItemKind};
+    let mut items: Vec<CompletionItem> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for kw in &["self", "base", "in", "all", "only", "true", "false"] {
+        if seen.insert((*kw).to_string()) {
+            items.push(CompletionItem {
+                label: (*kw).to_string(),
+                kind: Some(CompletionItemKind::KEYWORD),
+                ..Default::default()
+            });
+        }
+    }
+    let builtin = flatppl_infer::builtin_catalogue();
+    for name in builtin.base_names() {
+        if seen.insert(name.to_string()) {
+            items.push(CompletionItem {
+                label: name.to_string(),
+                kind: Some(CompletionItemKind::FUNCTION),
+                ..Default::default()
+            });
+        }
+    }
+    items
+}
+
+/// Return the cached static completion set, building it on first use.
+///
+/// In production the cache is a process-global `OnceLock`: the set is built once
+/// for the life of the process. Under `cfg(test)` the cache is resettable (via
+/// [`reset_static_completion_items`]) so the build-once contract can be asserted
+/// deterministically regardless of which test populates the cache first.
+#[cfg(not(test))]
+fn static_completion_items() -> Vec<lsp_types::CompletionItem> {
+    use std::sync::OnceLock;
+    static STATIC_ITEMS: OnceLock<Vec<lsp_types::CompletionItem>> = OnceLock::new();
+    STATIC_ITEMS
+        .get_or_init(build_static_completion_items)
+        .clone()
+}
+
+#[cfg(test)]
+fn static_completion_items() -> Vec<lsp_types::CompletionItem> {
+    let mut guard = STATIC_ITEMS_TEST_CACHE.lock().unwrap();
+    if guard.is_none() {
+        *guard = Some(build_static_completion_items());
+    }
+    guard.as_ref().unwrap().clone()
+}
+
+#[cfg(test)]
+static STATIC_ITEMS_TEST_CACHE: std::sync::Mutex<Option<Vec<lsp_types::CompletionItem>>> =
+    std::sync::Mutex::new(None);
+
+/// Drop the test-only static-completion cache so the next call rebuilds it.
+#[cfg(test)]
+fn reset_static_completion_items() {
+    *STATIC_ITEMS_TEST_CACHE.lock().unwrap() = None;
 }
 
 /// Attempt to resolve the `standard_module` module name for the binding named
@@ -587,6 +643,13 @@ fn strip_last_nonempty_line(text: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serializes the general-completion tests, which share the resettable
+    /// static-items cache and its build counter. Without this guard they could
+    /// interleave (one test's `reset` racing another's `get_or_build`) and skew
+    /// the build count. The member-completion path does not touch the cache, so
+    /// it intentionally does not take this lock.
+    static COMPLETION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     // ── parse error tests ────────────────────────────────────────────────────
 
@@ -779,11 +842,39 @@ mod tests {
             "x = 1\ny = add(x, 2)".to_string(),
         );
         let fs = FileSet::new(&db, vec![f]);
-        let syms = document_symbols(&db, f, fs, cats);
+        let _ = (fs, cats);
+        let syms = document_symbols(&db, f);
         let names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
         assert!(
             names.contains(&"x") && names.contains(&"y"),
             "document_symbols must include both 'x' and 'y'; got: {names:?}"
+        );
+    }
+
+    #[test]
+    fn document_symbols_does_not_run_inference() {
+        use crate::queries::ANALYZE_RUNS;
+        let db = Database::default();
+        let cats = Catalogues::new(&db, vec![]);
+        let f = SourceFile::new(
+            &db,
+            "m.flatppl".to_string(),
+            "x = 1\ny = add(x, 2)".to_string(),
+        );
+        let fs = FileSet::new(&db, vec![f]);
+        let _ = (fs, cats);
+        // Reset the counter, call document_symbols, then verify no analyze ran.
+        ANALYZE_RUNS.with(|c| c.set(0));
+        let syms = document_symbols(&db, f);
+        let names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            names.contains(&"x") && names.contains(&"y"),
+            "document_symbols must still include 'x' and 'y' after switching to parse; got: {names:?}"
+        );
+        let runs = ANALYZE_RUNS.with(|c| c.get());
+        assert_eq!(
+            runs, 0,
+            "document_symbols must not run inference (ANALYZE_RUNS should be 0, got {runs})"
         );
     }
 
@@ -809,13 +900,14 @@ mod tests {
         let a = SourceFile::new(&db, "a.flatppl".to_string(), "alpha = 1".to_string());
         let b = SourceFile::new(&db, "b.flatppl".to_string(), "beta = 2".to_string());
         let fs = FileSet::new(&db, vec![a, b]);
-        let all = workspace_symbols(&db, fs, cats, "");
+        let _ = cats;
+        let all = workspace_symbols(&db, fs, "");
         assert!(
             all.iter().any(|s| s.name == "alpha") && all.iter().any(|s| s.name == "beta"),
             "workspace_symbols must include 'alpha' and 'beta'; got: {:?}",
             all.iter().map(|s| &s.name).collect::<Vec<_>>()
         );
-        let filtered = workspace_symbols(&db, fs, cats, "alph");
+        let filtered = workspace_symbols(&db, fs, "alph");
         assert!(
             !filtered.is_empty()
                 && filtered
@@ -896,6 +988,9 @@ mod tests {
 
     #[test]
     fn completion_includes_keywords_builtins_and_scope() {
+        let _guard = COMPLETION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let db = Database::default();
         let cats = Catalogues::new(&db, vec![]);
         let src = "alpha = 1\nbeta = 2";
@@ -934,5 +1029,59 @@ mod tests {
             "member completion must list 'MyDist' from the external module; got: {:?}",
             items.iter().map(|i| &i.label).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn static_completion_items_built_once() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let _guard = COMPLETION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Drop any cache another test may have populated, then reset the counter,
+        // so the build-once contract is measured deterministically here.
+        reset_static_completion_items();
+        STATIC_COMPLETION_BUILDS.store(0, Relaxed);
+
+        let db1 = Database::default();
+        let cats1 = Catalogues::new(&db1, vec![]);
+        let f1 = SourceFile::new(&db1, "a.flatppl".to_string(), "alpha = 1".to_string());
+        let fs1 = FileSet::new(&db1, vec![f1]);
+
+        let db2 = Database::default();
+        let cats2 = Catalogues::new(&db2, vec![]);
+        let f2 = SourceFile::new(&db2, "b.flatppl".to_string(), "beta = 2".to_string());
+        let fs2 = FileSet::new(&db2, vec![f2]);
+
+        let items1 = completion(&db1, f1, fs1, cats1, 0, None);
+        let items2 = completion(&db2, f2, fs2, cats2, 0, None);
+        let items3 = completion(&db1, f1, fs1, cats1, 0, None);
+
+        // The static portion must have been built exactly once across all calls.
+        let builds = STATIC_COMPLETION_BUILDS.load(Relaxed);
+        assert_eq!(
+            builds, 1,
+            "static completion items must be built once, not per call; got {builds} builds"
+        );
+
+        // The returned sets must still include the expected items.
+        let labels1: Vec<&str> = items1.iter().map(|i| i.label.as_str()).collect();
+        assert!(
+            labels1.contains(&"Normal"),
+            "completion must include built-in 'Normal'; got: {labels1:?}"
+        );
+        assert!(
+            labels1.contains(&"alpha"),
+            "completion must include in-scope 'alpha'; got: {labels1:?}"
+        );
+        assert!(
+            labels1.iter().any(|l| *l == "self" || *l == "base"),
+            "completion must include keywords; got: {labels1:?}"
+        );
+        let labels2: Vec<&str> = items2.iter().map(|i| i.label.as_str()).collect();
+        assert!(
+            labels2.contains(&"beta"),
+            "second db completion must include 'beta'; got: {labels2:?}"
+        );
+        let _ = items3; // third call must reuse the cache
     }
 }
