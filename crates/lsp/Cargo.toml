@@ -1,0 +1,24 @@
+[package]
+name = "flatppl-lsp"
+description = "FlatPPL language server — diagnostics and hover over a salsa-incremental database, driven by flatppl-infer."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "flatppl-lsp"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+flatppl-core = { path = "../core" }
+flatppl-syntax = { path = "../syntax" }
+flatppl-infer = { path = "../infer" }
+salsa = "0.18"
+lsp-server = "0.7"
+lsp-types = "0.97"
+serde_json = { workspace = true }
