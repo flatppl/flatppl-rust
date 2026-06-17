@@ -1,6 +1,6 @@
 [package]
 name = "flatppl-cli"
-description = "The `flatppl` command-line driver: convert between FlatPPL and FlatPIR (more verbs as the toolchain grows)."
+description = "The `flatppl` command-line driver: convert, infer, format, and lint FlatPPL / FlatPIR (verbs are cargo features)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,23 +10,35 @@ repository.workspace = true
 # One driver binary; later capabilities (infer, lower, check) arrive as
 # subcommands, heavy/optional ones behind cargo features. The library crates
 # stay binary-free (they compile to wasm32 and link into PyO3/jlrs/cxx).
+[lib]
+name = "flatppl_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "flatppl"
 path = "src/main.rs"
 
+[[bin]]
+name = "flatppl-fmt"
+path = "src/bin/fmt_lint.rs"
+required-features = ["fmtlint"]
+
 [features]
 # Verbs are opt-in cargo features so heavy capabilities never burden the
 # default build; `infer` is light and rides along by default.
-default = ["infer", "hs3"]
-infer = ["dep:flatppl-infer"]
-hs3 = ["dep:flatppl-hs3"]
+default = ["convert", "infer", "hs3", "fmtlint"]
+convert = ["dep:flatppl-flatpir"]
+infer = ["dep:flatppl-infer", "dep:flatppl-flatpir"]
+hs3 = ["dep:flatppl-hs3", "dep:flatppl-flatpir"]
+fmtlint = ["dep:flatppl-lint"]
 
 [dependencies]
 flatppl-core = { path = "../core" }
 flatppl-syntax = { path = "../syntax" }
-flatppl-flatpir = { path = "../flatpir" }
+flatppl-flatpir = { path = "../flatpir", optional = true }
 flatppl-infer = { path = "../infer", optional = true }
 flatppl-hs3 = { path = "../hs3", optional = true }
+flatppl-lint = { path = "../lint", optional = true }
 clap = { workspace = true }
 clap_complete = { workspace = true }
 ariadne = { workspace = true }

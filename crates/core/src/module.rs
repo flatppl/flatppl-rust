@@ -109,6 +109,17 @@ impl Module {
         &self.bindings[id]
     }
 
+    /// Number of allocated nodes — an upper bound on `NodeId` indices, for
+    /// sizing dense per-node side structures (e.g. a visited bitmap).
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// Number of top-level bindings.
+    pub fn binding_count(&self) -> usize {
+        self.bindings.len()
+    }
+
     /// Resolve a symbol to its name.
     pub fn resolve(&self, sym: Symbol) -> &str {
         self.interner.resolve(sym)

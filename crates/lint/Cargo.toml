@@ -1,0 +1,18 @@
+[package]
+name = "flatppl-lint"
+description = "FlatPPL lint rules over the flatppl-core IR (binary-free; surfaced by flatppl-cli as `flatppl lint`)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+flatppl-core = { path = "../core" }
+flatppl-infer = { path = "../infer" }
+
+[dev-dependencies]
+# Unit tests build modules from FlatPPL surface text.
+flatppl-syntax = { path = "../syntax" }
+# The keyword-lists sync guard parses the authoritative JSON.
+serde_json = { workspace = true }
