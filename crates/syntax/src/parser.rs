@@ -235,6 +235,72 @@ fn lower_statement(module: &mut Module, stmt: &Stmt, names: &Names, synth: &mut 
             bind_name(module, &result, rhs, stmt.doc.as_ref(), synth);
             Ok(())
         }
+        // `f(arg1, arg2, …) = expr` — function-definition sugar (spec §05
+        // "Function definition syntax"): a named binding of `f` to the lambda
+        // `(arg1, …) -> expr`. It reuses the lambda desugaring verbatim, so it
+        // produces the same `functionof` node and IR as the explicit lambda
+        // form. The name-collection loop above stops at `(`, leaving `i` on it.
+        Some(TokenKind::LParen) => {
+            if lhs.len() != 1 {
+                return Err(err_at(
+                    &toks[0],
+                    "a function definition target must be a single name",
+                ));
+            }
+            check_binding_name(&lhs[0], lhs_toks[0])?;
+            // At least one argument is required; `f() = expr` is not legal.
+            if matches!(toks.get(i + 1).map(|t| &t.kind), Some(TokenKind::RParen)) {
+                return Err(err_at(
+                    &toks[i],
+                    "a function definition needs at least one argument (`f() = …` is not legal; bind a plain value with `f = …`)",
+                ));
+            }
+            // Parse the `( Name (',' Name)* )` parameter list, then `=`.
+            let mut j = i + 1;
+            let mut params = Vec::new();
+            loop {
+                match toks.get(j).map(|t| &t.kind) {
+                    Some(TokenKind::Name(n)) => {
+                        params.push(n.clone());
+                        j += 1;
+                    }
+                    _ => {
+                        return Err(err_at(
+                            toks.get(j).unwrap_or(&toks[i]),
+                            "expected an argument name in the function definition",
+                        ));
+                    }
+                }
+                match toks.get(j).map(|t| &t.kind) {
+                    Some(TokenKind::Comma) => j += 1,
+                    Some(TokenKind::RParen) => {
+                        j += 1;
+                        break;
+                    }
+                    _ => {
+                        return Err(err_at(
+                            toks.get(j).unwrap_or(&toks[i]),
+                            "expected `,` or `)` in the function definition argument list",
+                        ));
+                    }
+                }
+            }
+            if !matches!(toks.get(j).map(|t| &t.kind), Some(TokenKind::Assign)) {
+                return Err(err_at(
+                    toks.get(j).unwrap_or(&toks[i]),
+                    "expected `=` after the function definition argument list",
+                ));
+            }
+            j += 1; // consume `=`; the rest of the statement is the lambda body
+            let mut ep = ExprParser::new(&toks[j..], module, names);
+            for p in &params {
+                ep.check_lambda_param(p)?;
+            }
+            let rhs = ep.lower_lambda(params)?;
+            ep.expect_end()?;
+            bind_name(module, &lhs[0], rhs, stmt.doc.as_ref(), synth);
+            Ok(())
+        }
         Some(op @ (TokenKind::Assign | TokenKind::Tilde)) => {
             for (name, tok) in lhs.iter().zip(&lhs_toks) {
                 check_binding_name(name, tok)?;

@@ -320,6 +320,55 @@ fn lambda_and_fn_errors() {
     assert!(parse("f = true -> 1").is_err()); // reserved word as arg
 }
 
+/// Function-definition sugar (spec §05 "Function definition syntax"):
+/// `f(args) = expr` is exactly the lambda binding `f = (args) -> expr`, so it
+/// lowers to the same `functionof` and produces byte-identical FlatPIR. There
+/// is no dedicated node or printed form — full syntax re-sugars to the lambda.
+#[test]
+fn function_definition_lowers() {
+    // Multi- and single-argument forms are identical to their lambda bindings.
+    for (def, lam) in [
+        ("f(x, y) = x * y + 1", "f = (x, y) -> x * y + 1"),
+        ("g(x) = 2 * x + 1", "g = x -> 2 * x + 1"),
+        // The body type is the output type — a record body is multi-output.
+        (
+            "h(x, y) = record(p = x + y, q = x * y)",
+            "h = (x, y) -> record(p = x + y, q = x * y)",
+        ),
+    ] {
+        assert_eq!(
+            flatppl_flatpir::write(&parse(def).unwrap()),
+            flatppl_flatpir::write(&parse(lam).unwrap()),
+            "`{def}` should lower identically to `{lam}`"
+        );
+        // Full syntax has no `f(args) =` form; it re-sugars to the lambda.
+        assert_eq!(print(&parse(def).unwrap()), lam);
+    }
+
+    // Definition args shadow module bindings, exactly as lambda args do.
+    assert_eq!(
+        print_with(
+            &parse("x = elementof(reals)\nf(x) = x + x").unwrap(),
+            Syntax::Minimal
+        ),
+        print_with(
+            &parse("x = elementof(reals)\nf = x -> x + x").unwrap(),
+            Syntax::Minimal
+        ),
+    );
+}
+
+#[test]
+fn function_definition_errors() {
+    assert!(parse("f() = 1").is_err()); // no nullary definitions
+    assert!(parse("f(x = a) = 1").is_err()); // params are bare names, not kwargs
+    assert!(parse("f(true) = 1").is_err()); // reserved word as arg
+    assert!(parse("f(_) = 1").is_err()); // placeholder/discard as arg
+    assert!(parse("f(x,) = 1").is_err()); // trailing comma, no name
+    // A bare call is still not a statement, with or without the new arm.
+    assert!(parse("f(a, b)").is_err());
+}
+
 /// Placeholders are scoped to the nearest enclosing reification (spec §04):
 /// referencing an enclosing lambda's argument — or an enclosing `fn`'s hole —
 /// from inside a nested lambda / `fn` / `functionof` would leave the
