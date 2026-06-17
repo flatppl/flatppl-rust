@@ -276,3 +276,24 @@ fn infer_level_valueset_leaves_mass_deferred() {
         "got:\n{written}"
     );
 }
+
+/// `flatppl completions <shell>` emits a non-empty completion script naming the
+/// driver and its subcommands, for every shell clap_complete supports.
+#[test]
+fn completions_generate_for_each_shell() {
+    for shell in ["bash", "zsh", "fish", "powershell", "elvish"] {
+        let out = bin().args(["completions", shell]).output().unwrap();
+        assert!(out.status.success(), "completions {shell} failed");
+        let script = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            !script.trim().is_empty(),
+            "{shell}: empty completion script"
+        );
+        assert!(
+            script.contains("flatppl")
+                && script.contains("convert")
+                && script.contains("completions"),
+            "{shell}: completion script missing driver/subcommands:\n{script}"
+        );
+    }
+}
