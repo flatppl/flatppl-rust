@@ -33,6 +33,45 @@ fn convert_from_hs3_minimal() {
     assert!(text.contains("relabel"), "got:\n{text}");
 }
 
+/// `.hs3.json` / `.pyhf.json` names are auto-detected without `--from`
+/// (mirroring the `.flatpir.json` convention; an explicit `--from` overrides).
+/// The provenance `from:` label is the discriminator HS3 vs pyhf.
+#[test]
+fn auto_detects_hs3_and_pyhf_by_extension() {
+    let dir = std::env::temp_dir();
+
+    // `*.hs3.json` → HS3 importer, no `--from`.
+    let hs3_in = dir.join("auto_detect.hs3.json");
+    std::fs::write(&hs3_in, r#"{"distributions":[{"name":"mass","type":"gaussian_dist","mean":"mu","sigma":"s","x":"m_obs"}],"parameter_points":[{"name":"nom","entries":[{"name":"mu","value":5.28},{"name":"s","value":0.003}]}]}"#).unwrap();
+    let hs3_out = dir.join("auto_detect_hs3.flatppl");
+    let status = Command::new(env!("CARGO_BIN_EXE_flatppl"))
+        .args(["convert", hs3_in.to_str().unwrap(), hs3_out.to_str().unwrap()])
+        .status()
+        .unwrap();
+    assert!(status.success(), "auto-detected .hs3.json convert failed");
+    let text = std::fs::read_to_string(&hs3_out).unwrap();
+    assert!(text.contains("Normal"), "got:\n{text}");
+    assert!(
+        text.contains("from:       HS3 JSON"),
+        "header must record HS3 as the source, got:\n{text}"
+    );
+
+    // `*.pyhf.json` → pyhf importer, no `--from`.
+    let pyhf_in = dir.join("auto_detect.pyhf.json");
+    std::fs::copy(fixture("2bin_1channel.json"), &pyhf_in).unwrap();
+    let pyhf_out = dir.join("auto_detect_pyhf.flatppl");
+    let status = Command::new(env!("CARGO_BIN_EXE_flatppl"))
+        .args(["convert", pyhf_in.to_str().unwrap(), pyhf_out.to_str().unwrap()])
+        .status()
+        .unwrap();
+    assert!(status.success(), "auto-detected .pyhf.json convert failed");
+    let text = std::fs::read_to_string(&pyhf_out).unwrap();
+    assert!(
+        text.contains("from:       pyhf workspace JSON"),
+        "header must record pyhf as the source, got:\n{text}"
+    );
+}
+
 /// Path to the committed HS3 fixture directory (relative to CARGO_MANIFEST_DIR,
 /// which for the CLI crate is `crates/cli`).
 fn fixture(name: &str) -> std::path::PathBuf {

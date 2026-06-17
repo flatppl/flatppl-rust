@@ -41,10 +41,11 @@ enum Command {
     /// Convert between FlatPPL, FlatPIR, and the FlatPIR JSON encoding.
     ///
     /// Formats are inferred from the file extensions (`.flatppl` / `.flatpir` /
-    /// `.flatpir.json`). Converting to the same format canonicalizes the file.
-    /// `.flatpir.json` is an alternate representation of FlatPIR (same content,
-    /// including `%meta` annotations). Use `--from hs3` or `--from pyhf` to
-    /// import a JSON file instead (both require the optional `hs3` build feature).
+    /// `.flatpir.json`, and `.hs3.json` / `.pyhf.json` for HS3 / pyhf import).
+    /// Converting to the same format canonicalizes the file. `.flatpir.json` is
+    /// an alternate representation of FlatPIR (same content, including `%meta`
+    /// annotations). `--from hs3` / `--from pyhf` force HS3 / pyhf import of any
+    /// JSON file (and override the extension); both need the optional `hs3` feature.
     #[cfg(feature = "convert")]
     Convert {
         /// Input file (`.flatppl`, `.flatpir`, `.flatpir.json`, native HS3 JSON
@@ -58,9 +59,10 @@ enum Command {
         #[arg(long, value_enum, default_value_t = SyntaxLevel::Full)]
         syntax: SyntaxLevel,
         /// Input format: `auto` infers from the file extension (`.flatppl` /
-        /// `.flatpir`); `hs3` reads a native HS3 JSON document
-        /// (`distributions`, `likelihoods`, …); `pyhf` reads a pyhf workspace
-        /// JSON document (top-level `channels` array).
+        /// `.flatpir`, and `.hs3.json` / `.pyhf.json`); `hs3` reads a native HS3
+        /// JSON document (`distributions`, `likelihoods`, …); `pyhf` reads a pyhf
+        /// workspace JSON document (top-level `channels` array). `hs3` / `pyhf`
+        /// override the extension.
         #[arg(long, value_enum, default_value_t = FromFormat::Auto)]
         from: FromFormat,
         /// Omit the leading provenance header comment. The header (records
@@ -144,7 +146,8 @@ impl From<InferLevel> for flatppl_infer::Level {
 #[cfg(feature = "convert")]
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum FromFormat {
-    /// Infer the input format from the file extension (`.flatppl` / `.flatpir`).
+    /// Infer the input format from the file extension: `.flatppl`, `.flatpir`,
+    /// `.flatpir.json`, `.hs3.json` (HS3), `.pyhf.json` (pyhf).
     Auto,
     /// Read a native HS3 JSON document (`distributions`, `likelihoods`, …).
     /// Requires the optional `hs3` build feature.
@@ -152,6 +155,25 @@ enum FromFormat {
     /// Read a pyhf workspace JSON document (top-level `channels` array).
     /// Requires the optional `hs3` build feature.
     Pyhf,
+}
+
+/// Resolve `--from auto` against the input filename: `*.hs3.json` / `*.pyhf.json`
+/// select the HS3 / pyhf importers (mirroring the `*.flatpir.json` convention);
+/// any other name stays `Auto` (extension-inferred). An explicit `--from`
+/// overrides and is returned unchanged.
+#[cfg(feature = "convert")]
+fn resolve_from_format(from: FromFormat, input: &Path) -> FromFormat {
+    if from != FromFormat::Auto {
+        return from;
+    }
+    let name = input.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    if name.ends_with(".hs3.json") {
+        FromFormat::Hs3
+    } else if name.ends_with(".pyhf.json") {
+        FromFormat::Pyhf
+    } else {
+        FromFormat::Auto
+    }
 }
 
 fn main() -> ExitCode {
@@ -215,6 +237,9 @@ fn convert(
     no_header: bool,
 ) -> Result<(), Failure> {
     let to = Format::from_path(output)?;
+    // `--from auto` keys off the input name: `*.hs3.json` / `*.pyhf.json` select
+    // the importers; an explicit `--from` overrides.
+    let from_format = resolve_from_format(from_format, input);
 
     // Read the module: HS3/pyhf paths (feature-gated) or the standard
     // extension-based FlatPPL/FlatPIR path.
@@ -238,12 +263,27 @@ fn convert(
             note_dropped_analyses(&source);
             module
         }
-        // `Auto` (and, when the feature is absent, the `Hs3`/`Pyhf` arms that
-        // can never be reached) falls through to extension inference.
-        // Check the input extension BEFORE reading the file so that an
-        // unknown extension is reported even when the file does not exist.
-        _ => {
-            let from = Format::from_path(input)?;
+        // HS3/pyhf were selected (via `--from` or a `*.hs3.json` / `*.pyhf.json`
+        // name) but this binary was built without the `hs3` feature.
+        #[cfg(not(feature = "hs3"))]
+        FromFormat::Hs3 | FromFormat::Pyhf => {
+            return Err(Failure::Plain(
+                "HS3/pyhf import is not compiled in — rebuild with `--features hs3`".into(),
+            ));
+        }
+        // Extension-based FlatPPL / FlatPIR / FlatPIR-JSON. Check the extension
+        // BEFORE reading the file so an unknown one is reported even if the file
+        // is missing; for a bare `.json`, hint at the importers.
+        FromFormat::Auto => {
+            let from = Format::from_path(input).map_err(|mut e| {
+                if input.extension().and_then(|x| x.to_str()) == Some("json") {
+                    e.push_str(
+                        "; for an HS3 or pyhf JSON document pass `--from hs3` / `--from pyhf` \
+                         (or name it `*.hs3.json` / `*.pyhf.json`)",
+                    );
+                }
+                e
+            })?;
             let source = fs::read_to_string(input)
                 .map_err(|e| format!("reading `{}`: {e}", input.display()))?;
             match flatppl_cli::read_module(from, &source) {
