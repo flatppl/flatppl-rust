@@ -81,8 +81,10 @@ jobs:
       - name: Run tests with coverage
         # Runs the full workspace test suite (including the cross-engine
         # parity harness) under LLVM source-based coverage and writes an
-        # LCOV report for the upload step below.
-        run: cargo llvm-cov --workspace --lcov --output-path lcov.info
+        # LCOV report for the upload step below. `--all-features` keeps the
+        # opt-in verbs (notably `hs3`) tested and covered even though they are
+        # off in the default build.
+        run: cargo llvm-cov --workspace --all-features --lcov --output-path lcov.info
 
       - name: Upload coverage to Codecov
         # For public repos the upload works without CODECOV_TOKEN; set the

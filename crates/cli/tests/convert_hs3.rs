@@ -1,4 +1,9 @@
 //! Integration tests for `flatppl convert --from hs3` and `--from pyhf`.
+//!
+//! `hs3` is an opt-in CLI feature, so these only compile/run with
+//! `--features hs3` (CI exercises them via `--all-features`); the default
+//! `cargo test` build skips the whole file.
+#![cfg(feature = "hs3")]
 
 use std::path::Path;
 use std::process::Command;
