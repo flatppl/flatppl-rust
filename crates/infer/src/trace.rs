@@ -43,6 +43,13 @@ pub(crate) struct Inferencer<'m, 's> {
     /// reaches its body type — the body lives in the dependency's interner and
     /// cannot be looked up by node here. Populated in the `RefNs::Module` arm.
     module_callable_results: HashMap<NodeId, Type>,
+    /// For a §09 standard-module reference (`hepphys.CrystalBall`), the
+    /// catalogue signature of the referenced binding, keyed by the importer ref
+    /// node. The user-call path consults this so that applying the reference
+    /// (`hepphys.CrystalBall(args)`) lowers the catalogue sig with the concrete
+    /// call args — the bare ref node itself types as `Type::Any` (matching a
+    /// bare base name). Populated in the `RefNs::Module` arm.
+    module_catalogue_refs: HashMap<NodeId, crate::modules::CatalogueRef>,
 }
 
 impl<'m, 's> Inferencer<'m, 's> {
@@ -59,6 +66,7 @@ impl<'m, 's> Inferencer<'m, 's> {
             in_progress: Vec::new(),
             noted_gaps: HashSet::new(),
             module_callable_results: HashMap::new(),
+            module_catalogue_refs: HashMap::new(),
         }
     }
 
@@ -87,6 +95,7 @@ impl<'m, 's> Inferencer<'m, 's> {
             in_progress: Vec::new(),
             noted_gaps: HashSet::new(),
             module_callable_results: HashMap::new(),
+            module_catalogue_refs: HashMap::new(),
         }
     }
 
@@ -141,6 +150,13 @@ impl<'m, 's> Inferencer<'m, 's> {
     /// for local callables (their body is looked up by node instead).
     pub(crate) fn module_callable_result(&self, id: NodeId) -> Option<&Type> {
         self.module_callable_results.get(&id)
+    }
+
+    /// The catalogue signature recorded for `id`, if `id` is a `RefNs::Module`
+    /// reference resolved to a §09 standard-module binding. `None` otherwise.
+    /// The user-call path reads this to lower the sig with concrete call args.
+    pub(crate) fn module_catalogue_ref(&self, id: NodeId) -> Option<&crate::modules::CatalogueRef> {
+        self.module_catalogue_refs.get(&id)
     }
 
     /// The inferred value set of an already-visited node (`Unknown` when the
@@ -259,6 +275,12 @@ impl<'m, 's> Inferencer<'m, 's> {
                             // across the interner boundary.
                             if let Some(result) = res.result {
                                 self.module_callable_results.insert(id, result);
+                            }
+                            // Stash the §09 catalogue sig (if any) keyed by this
+                            // ref node, so the user-call path can lower it with
+                            // the concrete call args when the ref is applied.
+                            if let Some(catalogue) = res.catalogue {
+                                self.module_catalogue_refs.insert(id, catalogue);
                             }
                             self.set_vset(id, res.vset);
                             (res.ty, res.phase)
@@ -419,6 +441,7 @@ impl<'m, 's> Inferencer<'m, 's> {
                         phase,
                         vset,
                         result: None,
+                        catalogue: None,
                     },
                 )
             })

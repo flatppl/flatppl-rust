@@ -11,6 +11,7 @@ use flatppl_core::{
 };
 
 use crate::Diagnostic;
+use crate::catalogue::CatalogueSet;
 
 /// Parsed dependency modules, keyed by the `load_module` path string. Supplied
 /// by the host (the engine does no file I/O).
@@ -49,11 +50,35 @@ pub(crate) struct Resolved {
     /// rides over here instead of being looked up by node. `None` for
     /// non-callable bindings.
     pub(crate) result: Option<Type>,
+    /// For a §09 *standard-module* reference resolved against the built-in
+    /// catalogue, the catalogue signature of the referenced binding (plus its
+    /// honest-degrade note). The `ty`/`vset` above carry the *bare-reference*
+    /// type (matching a bare base-distribution/function name); the actual
+    /// measure/result type is lowered at the APPLICATION site, where the
+    /// concrete argument types are known. `None` for cross-module
+    /// (`load_module`) references — those resolve to a dependency binding, not
+    /// a catalogue sig.
+    pub(crate) catalogue: Option<CatalogueRef>,
+}
+
+/// A §09 standard-module binding resolved against the built-in catalogue: its
+/// signature (cloned so the application site can lower it with concrete call
+/// args) and its honest-degrade note.
+#[derive(Debug, Clone)]
+pub(crate) struct CatalogueRef {
+    pub(crate) sig: crate::catalogue::Sig,
+    pub(crate) degraded: Option<String>,
 }
 
 /// Parsed directive from a `load_module` / `standard_module` call.
 struct LoadDirective {
     path: String,
+    /// `true` when the head was `standard_module` (resolve against the built-in
+    /// catalogue rather than the host bundle).
+    standard: bool,
+    /// The requested version (the second `standard_module` positional arg), if
+    /// present. `None` for `load_module` or a malformed call.
+    version: Option<String>,
     /// (dependency input-name, substitution value node in the importer).
     substitutions: Vec<(String, NodeId)>,
 }
@@ -64,6 +89,10 @@ struct LoadDirective {
 /// `Inferencer` over a cloned dependency.
 pub(crate) struct InferSession<'b> {
     pub(crate) bundle: &'b ModuleBundle,
+    /// Merged catalogue set (built-in + host-supplied external catalogues).
+    /// `standard_module` resolution consults this instead of `builtin()` directly
+    /// so that host-supplied external catalogues are visible.
+    pub(crate) catalogues: CatalogueSet<'b>,
     /// (path, substitution-signature) -> the dependency's inferred (annotated) Module.
     memo: RefCell<HashMap<(String, String), Module>>,
     /// Active import paths on the current resolution chain (cycle detection).
@@ -78,6 +107,23 @@ impl<'b> InferSession<'b> {
     pub(crate) fn new(bundle: &'b ModuleBundle) -> Self {
         InferSession {
             bundle,
+            catalogues: CatalogueSet::builtin_only(),
+            memo: RefCell::new(HashMap::new()),
+            stack: RefCell::new(Vec::new()),
+            dep_diags: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// Like `new`, but also wires in host-supplied external catalogues.
+    /// The `CatalogueSet` holds a `&'b [Catalogue]` so the external slice must
+    /// live at least as long as `'b` (the bundle).
+    pub(crate) fn with_external_catalogues(
+        bundle: &'b ModuleBundle,
+        external: &'b [crate::catalogue::Catalogue],
+    ) -> Self {
+        InferSession {
+            bundle,
+            catalogues: CatalogueSet::with_external(external),
             memo: RefCell::new(HashMap::new()),
             stack: RefCell::new(Vec::new()),
             dep_diags: RefCell::new(Vec::new()),
@@ -115,9 +161,16 @@ impl<'b> InferSession<'b> {
         if head_name != "load_module" && head_name != "standard_module" {
             return Err(format!("`{alias_name}` is not a module"));
         }
+        let standard = head_name == "standard_module";
         let path = match call.args.first().map(|&a| importer.node(a)) {
             Some(Node::Lit(Scalar::Str(s))) => s.to_string(),
             _ => return Err(format!("`{alias_name}` load is missing a path string")),
+        };
+        // `standard_module(name, version)` carries the requested version as the
+        // second positional arg; `load_module(path)` has no version.
+        let version = match call.args.get(1).map(|&a| importer.node(a)) {
+            Some(Node::Lit(Scalar::Str(s))) => Some(s.to_string()),
+            _ => None,
         };
         let substitutions = call
             .named
@@ -127,6 +180,8 @@ impl<'b> InferSession<'b> {
             .collect();
         Ok(LoadDirective {
             path,
+            standard,
+            version,
             substitutions,
         })
     }
@@ -184,6 +239,16 @@ impl<'b> InferSession<'b> {
         level: crate::Level,
     ) -> Result<Resolved, String> {
         let directive = self.load_directive(importer, alias)?;
+
+        // §09 standard modules resolve against the merged catalogue set
+        // (built-in + host-supplied external catalogues). The bare-reference
+        // type matches a bare base name; the measure/result type is lowered at
+        // the application site (where the concrete arg types are known), so the
+        // catalogue sig rides over here.
+        if directive.standard {
+            return resolve_standard(&self.catalogues, &directive, binding_name);
+        }
+
         let dep = self
             .bundle
             .get(&directive.path)
@@ -235,8 +300,54 @@ impl<'b> InferSession<'b> {
                 .cloned()
                 .unwrap_or(ValueSet::Unknown),
             result: callable_body_result(dep_annotated, rhs),
+            catalogue: None,
         })
     }
+}
+
+/// Resolve a §09 standard-module reference against the merged catalogue set.
+/// Validates the requested version, distinguishes a missing module ("not
+/// found") from a missing binding ("has no binding"), and returns a `Resolved`
+/// whose `ty`/`vset` are the *bare-reference* values (matching a bare base
+/// name) with the catalogue sig carried for lowering at the application site.
+fn resolve_standard(
+    catalogues: &CatalogueSet<'_>,
+    directive: &LoadDirective,
+    binding_name: &str,
+) -> Result<Resolved, String> {
+    let path = &directive.path;
+
+    // Module-name miss → "not found"; module present but binding absent →
+    // "has no binding".
+    let known_version = catalogues
+        .module_version(path)
+        .ok_or_else(|| format!("standard module `{path}` not found"))?;
+
+    // Validate the requested version (when the call supplied one).
+    if let Some(requested) = &directive.version {
+        if requested != known_version {
+            return Err(format!(
+                "standard module `{path}` has unknown version `{requested}` (catalogue provides `{known_version}`)"
+            ));
+        }
+    }
+
+    let (sig, degraded) = catalogues
+        .module(path, binding_name)
+        .ok_or_else(|| format!("standard module `{path}` has no binding `{binding_name}`"))?;
+
+    Ok(Resolved {
+        // Bare reference: matches a bare base name (`Normal` referenced bare is
+        // `Type::Any`). The real type is lowered when the ref is applied.
+        ty: Type::Any,
+        phase: Phase::Fixed,
+        vset: ValueSet::Unknown,
+        result: None,
+        catalogue: Some(CatalogueRef {
+            sig: sig.clone(),
+            degraded: degraded.map(str::to_string),
+        }),
+    })
 }
 
 /// For a binding whose RHS is a reified callable (`functionof` / `kernelof`,
@@ -278,6 +389,7 @@ pub(crate) fn seed_plan(
                 b.rhs,
                 Resolved {
                     result: None,
+                    catalogue: None,
                     ..res.clone()
                 },
             ));

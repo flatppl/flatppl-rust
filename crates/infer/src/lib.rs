@@ -20,6 +20,7 @@
 //! fixed`, with `elementof` introducing *parameterized*, `draw` *stochastic*,
 //! and `external` / loaded data / reifications *fixed*.
 
+mod catalogue;
 mod modules;
 mod ops;
 mod trace;
@@ -28,6 +29,7 @@ use crate::modules::InferSession;
 
 use flatppl_core::{Module, NodeId};
 
+pub use catalogue::{Catalogue, parse_catalogue};
 pub use modules::ModuleBundle;
 
 /// A message produced during inference. `Error` marks an ill-formed module
@@ -122,6 +124,37 @@ pub fn infer_module(module: &mut Module, bundle: &ModuleBundle, level: Level) ->
 pub fn infer_with(module: &mut Module, level: Level) -> Vec<Diagnostic> {
     let bundle = ModuleBundle::new();
     infer_module(module, &bundle, level)
+}
+
+/// Like [`infer_module`], but also resolves `standard_module` references
+/// against host-supplied external catalogues (merged with the built-in
+/// catalogue).
+///
+/// The host pre-parses each external `.ron` catalogue file via
+/// [`parse_catalogue`] and passes the slice here. If any external catalogue
+/// introduces a module name that already exists in the built-in catalogue (or
+/// in an earlier external catalogue in the slice), one module-level
+/// `Severity::Error` diagnostic is emitted per collision; inference then
+/// proceeds using the built-in-only catalogue for colliding names (the
+/// external entry is shadowed, never silently merged).
+///
+/// Passing an empty `catalogues` slice is equivalent to calling
+/// [`infer_module`] directly.
+pub fn infer_module_ext(
+    module: &mut Module,
+    bundle: &ModuleBundle,
+    catalogues: &[Catalogue],
+    level: Level,
+) -> Vec<Diagnostic> {
+    let session = InferSession::with_external_catalogues(bundle, catalogues);
+    // Surface collision errors before (or alongside) the trace run so the host
+    // always sees them regardless of whether the colliding module is referenced.
+    let mut diags = match session.catalogues.check_collisions() {
+        Ok(()) => Vec::new(),
+        Err(msg) => msg.lines().map(Diagnostic::error).collect::<Vec<_>>(),
+    };
+    diags.extend(trace::Inferencer::new(module, level, &session).run());
+    diags
 }
 
 #[cfg(test)]
@@ -470,5 +503,178 @@ mod diag_anchor_tests {
         let node = unresolved.node.expect("diagnostic carries a node anchor");
         let span = m.span_of(node).expect("anchored node has a span");
         assert_eq!(span, ref_span, "anchored span matches the ref node's span");
+    }
+}
+
+#[cfg(test)]
+mod infer_module_ext_tests {
+    use super::*;
+    use flatppl_core::{Mass, ScalarType, Type, ValueSet};
+
+    /// RON source for a minimal external catalogue that defines one module
+    /// `"myext"` with a single normalized real distribution `"MyDist"`.
+    const MYEXT_RON: &str = r#"Catalogue(
+        base: [],
+        modules: [
+            Module(name: "myext", version: "0.1", bindings: [
+                Binding(name: "MyDist", sig: Distribution(
+                    domain: Scalar(Real),
+                    support: Reals,
+                    mass: Normalized,
+                )),
+            ]),
+        ],
+    )"#;
+
+    /// RON source for an external catalogue whose module name collides with
+    /// the built-in `"particle-physics"` module.
+    const COLLIDING_RON: &str = r#"Catalogue(
+        base: [],
+        modules: [
+            Module(name: "particle-physics", version: "9.9", bindings: [
+                Binding(name: "Dummy", sig: Distribution(
+                    domain: Scalar(Real),
+                    support: Reals,
+                    mass: Normalized,
+                )),
+            ]),
+        ],
+    )"#;
+
+    fn errors(diags: &[Diagnostic]) -> Vec<&Diagnostic> {
+        diags
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .collect()
+    }
+
+    fn binding_ty<'m>(module: &'m flatppl_core::Module, name: &str) -> Option<&'m Type> {
+        let rhs = module
+            .bindings()
+            .find(|(_, b)| module.resolve(b.name) == name)?
+            .1
+            .rhs;
+        module.type_of(rhs)
+    }
+
+    /// An external module's distribution applied via `standard_module` infers
+    /// to a normalized real measure — proving a third-party module resolves
+    /// end-to-end without built-in catalogue changes.
+    #[test]
+    fn external_distribution_resolves_and_infers_measure() {
+        let ext = parse_catalogue(MYEXT_RON).expect("myext parses");
+        let bundle = ModuleBundle::new();
+        let src = r#"
+e = standard_module("myext", "0.1")
+x = e.MyDist(0.0, 1.0)
+"#;
+        let mut module = flatppl_syntax::parse(src).expect("source parses");
+        let diags = infer_module_ext(&mut module, &bundle, &[ext], Level::Normalization);
+
+        assert!(
+            errors(&diags).is_empty(),
+            "no errors expected for a valid external module; got {diags:?}"
+        );
+
+        let ty = binding_ty(&module, "x");
+        assert!(
+            matches!(
+                ty,
+                Some(Type::Measure { domain, mass: Mass::Normalized })
+                    if **domain == Type::Scalar(ScalarType::Real)
+            ),
+            "x should be Measure(Real, Normalized); got {ty:?}"
+        );
+
+        let rhs = module
+            .bindings()
+            .find(|(_, b)| module.resolve(b.name) == "x")
+            .unwrap()
+            .1
+            .rhs;
+        let vset = module.valueset_of(rhs).cloned();
+        assert_eq!(
+            vset,
+            Some(ValueSet::Reals),
+            "x's support should be Reals; got {vset:?}"
+        );
+    }
+
+    /// An external catalogue whose module name collides with a built-in module
+    /// surfaces a `"duplicate standard module"` error diagnostic.  The
+    /// built-in wins: the colliding external entry is shadowed, so a reference
+    /// to the built-in binding (`hepphys.CrystalBall`) still resolves to the
+    /// built-in type (`Measure{real, Normalized}`).
+    #[test]
+    fn collision_with_builtin_emits_error_diagnostic() {
+        let colliding = parse_catalogue(COLLIDING_RON).expect("colliding parses");
+        let bundle = ModuleBundle::new();
+        let src = r#"
+hepphys = standard_module("particle-physics", "0.1")
+y = hepphys.CrystalBall(0.0, 1.0, 1.5, 2.0)
+"#;
+        let mut module = flatppl_syntax::parse(src).expect("source parses");
+        let diags = infer_module_ext(&mut module, &bundle, &[colliding], Level::Normalization);
+
+        let collision_errors: Vec<_> = diags
+            .iter()
+            .filter(|d| {
+                d.severity == Severity::Error && d.message.contains("duplicate standard module")
+            })
+            .collect();
+        assert!(
+            !collision_errors.is_empty(),
+            "expected a 'duplicate standard module' error; got {diags:?}"
+        );
+        assert!(
+            collision_errors
+                .iter()
+                .any(|d| d.message.contains("particle-physics")),
+            "collision error should name the colliding module; got {collision_errors:?}"
+        );
+
+        // Built-in wins: despite the collision, `hepphys.CrystalBall` must
+        // still resolve to the built-in type — the external entry is shadowed,
+        // never merged.  A regression that ejects the catalogue on collision
+        // would leave `y` as Deferred or Failed.
+        let ty = binding_ty(&module, "y");
+        assert!(
+            matches!(
+                ty,
+                Some(Type::Measure { domain, mass: Mass::Normalized })
+                    if **domain == Type::Scalar(ScalarType::Real)
+            ),
+            "built-in wins: y should be Measure(Real, Normalized) despite the collision; got {ty:?}"
+        );
+    }
+
+    /// `infer_module_ext` with an empty external slice produces identical
+    /// results to `infer_module` on the same input.
+    #[test]
+    fn empty_external_is_equivalent_to_infer_module() {
+        let src = r#"
+hepphys = standard_module("particle-physics", "0.1")
+y = hepphys.CrystalBall(0.0, 1.0, 1.5, 2.0)
+"#;
+        let bundle = ModuleBundle::new();
+
+        let mut m_base = flatppl_syntax::parse(src).expect("parses");
+        let diags_base = infer_module(&mut m_base, &bundle, Level::Normalization);
+
+        let mut m_ext = flatppl_syntax::parse(src).expect("parses");
+        let diags_ext = infer_module_ext(&mut m_ext, &bundle, &[], Level::Normalization);
+
+        let ty_base = binding_ty(&m_base, "y").cloned();
+        let ty_ext = binding_ty(&m_ext, "y").cloned();
+
+        assert_eq!(
+            ty_base, ty_ext,
+            "empty-external infer_module_ext must match infer_module"
+        );
+        assert_eq!(
+            errors(&diags_base).len(),
+            errors(&diags_ext).len(),
+            "error counts must match"
+        );
     }
 }

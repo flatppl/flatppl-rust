@@ -1,0 +1,368 @@
+// Built-in base distribution catalogue (spec §08).
+// One Builtin row per distribution; modules: [] this phase.
+// Faithfulness test in crates/infer/src/ops.rs proves this table reproduces
+// the legacy ops.rs distribution_domain / distribution_support rules exactly.
+Catalogue(
+    base: [
+        // ---- Continuous univariate, domain ⊆ ℝ ----
+        Builtin(name: "Normal",            sig: Distribution(domain: Scalar(Real), support: Reals,         mass: Normalized)),
+        Builtin(name: "GeneralizedNormal", sig: Distribution(domain: Scalar(Real), support: Reals,         mass: Normalized)),
+        Builtin(name: "Cauchy",            sig: Distribution(domain: Scalar(Real), support: Reals,         mass: Normalized)),
+        Builtin(name: "StudentT",          sig: Distribution(domain: Scalar(Real), support: Reals,         mass: Normalized)),
+        Builtin(name: "Logistic",          sig: Distribution(domain: Scalar(Real), support: Reals,         mass: Normalized)),
+        Builtin(name: "VonMises",          sig: Distribution(domain: Scalar(Real), support: Reals,         mass: Normalized)),
+        Builtin(name: "Laplace",           sig: Distribution(domain: Scalar(Real), support: Reals,         mass: Normalized)),
+        Builtin(name: "LogNormal",         sig: Distribution(domain: Scalar(Real), support: PosReals,      mass: Normalized)),
+        Builtin(name: "Gamma",             sig: Distribution(domain: Scalar(Real), support: PosReals,      mass: Normalized)),
+        Builtin(name: "InverseGamma",      sig: Distribution(domain: Scalar(Real), support: PosReals,      mass: Normalized)),
+        Builtin(name: "ChiSquared",        sig: Distribution(domain: Scalar(Real), support: PosReals,      mass: Normalized)),
+        Builtin(name: "Exponential",       sig: Distribution(domain: Scalar(Real), support: NonNegReals,   mass: Normalized)),
+        Builtin(name: "Weibull",           sig: Distribution(domain: Scalar(Real), support: NonNegReals,   mass: Normalized)),
+        Builtin(name: "Beta",              sig: Distribution(domain: Scalar(Real), support: UnitInterval,  mass: Normalized)),
+        // Pareto: spec §08 — domain reals, support posreals (x >= x_m > 0).
+        // Legacy ops.rs distribution_domain does not list Pareto (falls through
+        // to %deferred); this row brings the catalogue into spec compliance.
+        Builtin(name: "Pareto",            sig: Distribution(domain: Scalar(Real), support: PosReals,      mass: Normalized)),
+        // Uniform(support): spec §08 — domain is `reals`, support is the set
+        // expression passed as argument (structural, not a fixed tag).
+        // SupportTag::Structural signals to Task-4 dispatch that the support
+        // MUST be kept on the code path (ops.rs set_expr_valueset); the static
+        // approximation is Unknown (the catalogue row is domain-only for Uniform).
+        Builtin(name: "Uniform",           sig: Distribution(domain: Scalar(Real), support: Structural,    mass: Normalized)),
+
+        // ---- Discrete univariate ----
+        // Bernoulli: spec §08 "Domain/Support: integers/booleans" — density is
+        // w.r.t. Counting(integers); the variate is integer-typed, support is
+        // {0,1} = booleans. Legacy ops.rs returns Scalar(Boolean) for domain
+        // (a legacy bug: domain should be integers per spec).
+        Builtin(name: "Bernoulli",         sig: Distribution(domain: Scalar(Integer), support: Booleans,       mass: Normalized)),
+        // Categorical/Categorical0/Binomial: spec §08 supports are param-bounded
+        // integer intervals, but ValueSet::Interval takes only static literal
+        // bounds — a parameter-dependent integer-bounded set is inexpressible, so
+        // the sound named-set superset is used and flagged degraded (honest-degrade
+        // policy). Support value is unchanged from legacy ops.rs.
+        Builtin(name: "Categorical",       sig: Distribution(domain: Scalar(Integer), support: PosIntegers,    mass: Normalized),
+            degraded: Some("spec §08 support is interval(1, n); type system has no parameter-dependent integer-bounded ValueSet → PosIntegers (sound superset)")),
+        Builtin(name: "Categorical0",      sig: Distribution(domain: Scalar(Integer), support: NonNegIntegers, mass: Normalized),
+            degraded: Some("spec §08 support is interval(0, n-1); type system has no parameter-dependent integer-bounded ValueSet → NonNegIntegers (sound superset)")),
+        Builtin(name: "Binomial",          sig: Distribution(domain: Scalar(Integer), support: NonNegIntegers, mass: Normalized),
+            degraded: Some("spec §08 support is interval(0, n); type system has no parameter-dependent integer-bounded ValueSet → NonNegIntegers (sound superset)")),
+        Builtin(name: "Geometric",         sig: Distribution(domain: Scalar(Integer), support: NonNegIntegers, mass: Normalized)),
+        Builtin(name: "NegativeBinomial",  sig: Distribution(domain: Scalar(Integer), support: NonNegIntegers, mass: Normalized)),
+        Builtin(name: "NegativeBinomial2", sig: Distribution(domain: Scalar(Integer), support: NonNegIntegers, mass: Normalized)),
+        Builtin(name: "Poisson",           sig: Distribution(domain: Scalar(Integer), support: NonNegIntegers, mass: Normalized)),
+
+        // ---- Multivariate ----
+        // MvNormal: domain ℝ^n, support CartPow(Reals, n) where n = length(mu).
+        Builtin(name: "MvNormal",    sig: Distribution(domain: VectorFromParam(elem: Real,    param: "mu"),    support: CartPowReals,          mass: Normalized)),
+        // Dirichlet: domain Δ^n (standard simplex), support StdSimplex(n) where n = length(alpha).
+        Builtin(name: "Dirichlet",   sig: Distribution(domain: VectorFromParam(elem: Real,    param: "alpha"), support: StdSimplex,            mass: Normalized)),
+        // Multinomial: domain ℕ^n, support CartPow(NonNegIntegers, n) where n = length(p).
+        Builtin(name: "Multinomial", sig: Distribution(domain: VectorFromParam(elem: Integer, param: "p"),     support: CartPowNonNegIntegers, mass: Normalized)),
+
+        // ---- Matrix distributions ----
+        // Legacy ops.rs does not enumerate these in distribution_support (falls
+        // through to Unknown). Domain is always a dynamic real matrix.
+        Builtin(name: "Wishart",        sig: Distribution(domain: DynMatrix, support: Unknown, mass: Normalized)),
+        Builtin(name: "InverseWishart", sig: Distribution(domain: DynMatrix, support: Unknown, mass: Normalized)),
+        Builtin(name: "LKJ",            sig: Distribution(domain: DynMatrix, support: Unknown, mass: Normalized)),
+        Builtin(name: "LKJCholesky",    sig: Distribution(domain: DynMatrix, support: Unknown, mass: Normalized)),
+
+        // ---- base per-name functions (spec §07) ----
+        // Only pure per-name signatures: constant scalar output, SameScalarKind,
+        // or DomainMap. Structural ops (add/sub/mul/pow, shape-preserving
+        // vectors, reductions that thread element types, containers) stay in
+        // ops.rs call_rule because their result types depend on argument shapes
+        // or multiple argument types that ResultSig cannot express.
+
+        // -- scalar-integer output --
+        // spec §07 "Elementary functions": floor/ceil/round return integers.
+        Builtin(name: "floor",    sig: Function(params: [Scalar(Real)],    result: Scalar(Integer))),
+        Builtin(name: "ceil",     sig: Function(params: [Scalar(Real)],    result: Scalar(Integer))),
+        Builtin(name: "round",    sig: Function(params: [Scalar(Real)],    result: Scalar(Integer))),
+        // integer(x): set-restrict to integers (spec §07 "Scalar restrictions").
+        Builtin(name: "integer",  sig: Function(params: [Any],             result: Scalar(Integer))),
+        // div / mod: integer Euclidean quotient/remainder (spec §07).
+        Builtin(name: "div",      sig: Function(params: [Scalar(Integer), Scalar(Integer)], result: Scalar(Integer))),
+        Builtin(name: "mod",      sig: Function(params: [Scalar(Integer), Scalar(Integer)], result: Scalar(Integer))),
+        // lengthof / length: number of elements in a vector (spec §07 Reductions).
+        Builtin(name: "lengthof", sig: Function(params: [Any], result: Scalar(Integer))),
+        Builtin(name: "length",   sig: Function(params: [Any], result: Scalar(Integer))),
+
+        // -- scalar-real output --
+        // NOTE: divide and mean are intentionally NOT here. Their result types
+        // are structural, not constant:
+        //   - divide(a, b) promotes its two operands (complex if either is) —
+        //     stays in ops.rs call_rule via promote2, like pow/min/max.
+        //   - mean(xs) reduces to the array element type (complex array →
+        //     complex) — stays in ops.rs via reduce_type, like sum/prod.
+        // (spec §07: divide over "scalars (real or complex)"; mean over
+        // "real/complex arrays".)
+        // logdensityof / densityof return a real scalar (spec §07 §06).
+        Builtin(name: "logdensityof", sig: Function(params: [Any, Any], result: Scalar(Real))),
+        Builtin(name: "densityof",    sig: Function(params: [Any, Any], result: Scalar(Real))),
+        // Norms (spec §07 "Norms and normalization"): l1/l2 norm → real scalar.
+        Builtin(name: "l1norm",       sig: Function(params: [Any],      result: Scalar(Real))),
+        Builtin(name: "l2norm",       sig: Function(params: [Any],      result: Scalar(Real))),
+        // logsumexp (spec §07): log Σ exp(v_i) → real.
+        Builtin(name: "logsumexp",    sig: Function(params: [Any],      result: Scalar(Real))),
+
+        // -- scalar-complex output --
+        // cis(theta) = exp(i*theta); complex(re, im) = re + i*im (spec §07).
+        Builtin(name: "cis",     sig: Function(params: [Scalar(Real)],               result: Scalar(Complex))),
+        Builtin(name: "complex", sig: Function(params: [Scalar(Real), Scalar(Real)], result: Scalar(Complex))),
+
+        // -- scalar-boolean output --
+        // Comparison operators (spec §07 "Operator-equivalent functions").
+        Builtin(name: "equal",    sig: Function(params: [Any, Any], result: Scalar(Boolean))),
+        Builtin(name: "unequal",  sig: Function(params: [Any, Any], result: Scalar(Boolean))),
+        Builtin(name: "lt",       sig: Function(params: [Any, Any], result: Scalar(Boolean))),
+        Builtin(name: "le",       sig: Function(params: [Any, Any], result: Scalar(Boolean))),
+        Builtin(name: "gt",       sig: Function(params: [Any, Any], result: Scalar(Boolean))),
+        Builtin(name: "ge",       sig: Function(params: [Any, Any], result: Scalar(Boolean))),
+        // Membership test (spec §07).
+        Builtin(name: "in",       sig: Function(params: [Any, Any], result: Scalar(Boolean))),
+        // Logical operators (spec §07 "Logic and conditionals").
+        Builtin(name: "land",     sig: Function(params: [Scalar(Boolean), Scalar(Boolean)], result: Scalar(Boolean))),
+        Builtin(name: "lor",      sig: Function(params: [Scalar(Boolean), Scalar(Boolean)], result: Scalar(Boolean))),
+        Builtin(name: "lnot",     sig: Function(params: [Scalar(Boolean)],                  result: Scalar(Boolean))),
+        // Scalar predicates (spec §07).
+        Builtin(name: "isfinite", sig: Function(params: [Any], result: Scalar(Boolean))),
+        Builtin(name: "isinf",    sig: Function(params: [Any], result: Scalar(Boolean))),
+        Builtin(name: "isnan",    sig: Function(params: [Any], result: Scalar(Boolean))),
+        Builtin(name: "iszero",   sig: Function(params: [Any], result: Scalar(Boolean))),
+
+        // -- SameScalarKind(0): real→real, complex→complex --
+        // (spec §07 "Elementary functions": all accept reals and complexes)
+        Builtin(name: "exp",       sig: Function(params: [Any], result: SameScalarKind(0))),
+        Builtin(name: "log",       sig: Function(params: [Any], result: SameScalarKind(0))),
+        // log2: in ops.rs but absent from spec §07. Kept for engine compatibility.
+        Builtin(name: "log2",      sig: Function(params: [Any], result: SameScalarKind(0)),
+            degraded: Some("log2 is not listed in spec §07; kept for engine compatibility")),
+        Builtin(name: "log10",     sig: Function(params: [Any], result: SameScalarKind(0))),
+        Builtin(name: "sqrt",      sig: Function(params: [Any], result: SameScalarKind(0))),
+        Builtin(name: "sin",       sig: Function(params: [Any], result: SameScalarKind(0))),
+        Builtin(name: "cos",       sig: Function(params: [Any], result: SameScalarKind(0))),
+        Builtin(name: "tan",       sig: Function(params: [Any], result: SameScalarKind(0))),
+        Builtin(name: "asin",      sig: Function(params: [Any], result: SameScalarKind(0))),
+        Builtin(name: "acos",      sig: Function(params: [Any], result: SameScalarKind(0))),
+        Builtin(name: "atan",      sig: Function(params: [Any], result: SameScalarKind(0))),
+        Builtin(name: "sinh",      sig: Function(params: [Any], result: SameScalarKind(0))),
+        Builtin(name: "cosh",      sig: Function(params: [Any], result: SameScalarKind(0))),
+        Builtin(name: "tanh",      sig: Function(params: [Any], result: SameScalarKind(0))),
+        Builtin(name: "asinh",     sig: Function(params: [Any], result: SameScalarKind(0))),
+        Builtin(name: "acosh",     sig: Function(params: [Any], result: SameScalarKind(0))),
+        Builtin(name: "atanh",     sig: Function(params: [Any], result: SameScalarKind(0))),
+        Builtin(name: "log1p",     sig: Function(params: [Any], result: SameScalarKind(0))),
+        Builtin(name: "expm1",     sig: Function(params: [Any], result: SameScalarKind(0))),
+        Builtin(name: "gamma",     sig: Function(params: [Any], result: SameScalarKind(0))),
+        Builtin(name: "loggamma",  sig: Function(params: [Any], result: SameScalarKind(0))),
+        Builtin(name: "logit",     sig: Function(params: [Any], result: SameScalarKind(0))),
+        Builtin(name: "invlogit",  sig: Function(params: [Any], result: SameScalarKind(0))),
+        Builtin(name: "probit",    sig: Function(params: [Any], result: SameScalarKind(0))),
+        Builtin(name: "invprobit", sig: Function(params: [Any], result: SameScalarKind(0))),
+        // abs / abs2: |x| and |x|² are real for both real and complex inputs
+        // (real_or_complex(arg) in ops.rs: complex→real, not complex→complex).
+        // DomainMap captures this: Complex maps to Real; anything else defaults Real.
+        Builtin(name: "abs",  sig: Function(params: [Any], result: DomainMap(arg: 0, map: [(Complex, Real)]))),
+        Builtin(name: "abs2", sig: Function(params: [Any], result: DomainMap(arg: 0, map: [(Complex, Real)]))),
+        // conj: complex conjugate — real→real, complex→complex.
+        Builtin(name: "conj", sig: Function(params: [Any], result: SameScalarKind(0))),
+    ],
+    modules: [
+        // ---- Module: particle-physics (spec §09) ----
+        Module(
+            name: "particle-physics",
+            version: "0.1",
+            bindings: [
+                // -- Distributions --
+                // Oracle-verified supports (scipy cross-check per task brief).
+                Binding(name: "CrystalBall",            sig: Distribution(domain: Scalar(Real), support: Reals,       mass: Normalized)),
+                Binding(name: "DoubleSidedCrystalBall", sig: Distribution(domain: Scalar(Real), support: Reals,       mass: Normalized)),
+                // Argus: spec §09 support is interval(0, resonance); no parameter-dependent
+                // real bound in the type system → PosReals (sound superset).
+                Binding(name: "Argus",                  sig: Distribution(domain: Scalar(Real), support: PosReals,    mass: Normalized),
+                    degraded: Some("§09 support is interval(0, resonance); no parameter-dependent real bound in the type system → PosReals (sound superset)")),
+                Binding(name: "RelativisticBreitWigner", sig: Distribution(domain: Scalar(Real), support: PosReals,   mass: Normalized)),
+                Binding(name: "Voigtian",               sig: Distribution(domain: Scalar(Real), support: Reals,       mass: Normalized)),
+                Binding(name: "BifurcatedNormal",       sig: Distribution(domain: Scalar(Real), support: Reals,       mass: Normalized)),
+                // ContinuedPoisson: not a normalized probability measure (spec §09);
+                // mass is Finite (locally integrable unnormalized density).
+                Binding(name: "ContinuedPoisson",       sig: Distribution(domain: Scalar(Real), support: NonNegReals, mass: Finite),
+                    degraded: Some("spec §09: ContinuedPoisson is not normalized (mass Finite); rand is undefined in FlatPPL")),
+
+                // -- Three-point interpolation functions (spec §09) --
+                // All share signature (left, center, right, alpha): (real,real,real,real) → real.
+                Binding(name: "interp_pwlin",     sig: Function(params: [Scalar(Real), Scalar(Real), Scalar(Real), Scalar(Real)], result: Scalar(Real))),
+                Binding(name: "interp_pwexp",     sig: Function(params: [Scalar(Real), Scalar(Real), Scalar(Real), Scalar(Real)], result: Scalar(Real))),
+                Binding(name: "interp_poly2_lin", sig: Function(params: [Scalar(Real), Scalar(Real), Scalar(Real), Scalar(Real)], result: Scalar(Real))),
+                Binding(name: "interp_poly6_lin", sig: Function(params: [Scalar(Real), Scalar(Real), Scalar(Real), Scalar(Real)], result: Scalar(Real))),
+                Binding(name: "interp_poly6_exp", sig: Function(params: [Scalar(Real), Scalar(Real), Scalar(Real), Scalar(Real)], result: Scalar(Real))),
+
+                // -- Resonance functions (spec §09) --
+                // resonance_breitwigner(sigma, m, width, ma, mb, l, d) → Complex
+                // Domains: posreals, posreals, posreals, nonnegreals, nonnegreals,
+                //          nonnegintegers, posreals.
+                // l is a non-negative integer; use Scalar(Integer) for it.
+                Binding(name: "resonance_breitwigner",
+                    sig: Function(
+                        params: [Scalar(Real), Scalar(Real), Scalar(Real), Scalar(Real), Scalar(Real), Scalar(Integer), Scalar(Real)],
+                        result: Scalar(Complex))),
+
+                // -- Kinematics functions (spec §09) --
+                // kallen(x, y, z): (real, real, real) → real
+                Binding(name: "kallen",
+                    sig: Function(params: [Scalar(Real), Scalar(Real), Scalar(Real)], result: Scalar(Real))),
+                // breakup_momentum(m, ma, mb): (posreal, nonnegreal, nonnegreal) → real
+                // Domains encoded as Scalar(Real); domain constraints are value-level (can't
+                // distinguish posreals from reals in ParamSig).
+                Binding(name: "breakup_momentum",
+                    sig: Function(params: [Scalar(Real), Scalar(Real), Scalar(Real)], result: Scalar(Real))),
+                // blatt_weisskopf(l, p, d): (nonneginteger, nonnegreal, posreal) → real
+                Binding(name: "blatt_weisskopf",
+                    sig: Function(params: [Scalar(Integer), Scalar(Real), Scalar(Real)], result: Scalar(Real))),
+
+                // -- Wigner rotation functions (spec §09) --
+                // wignerd(j, m1, m2, cosbeta): integer args; cosbeta ∈ [-1,1] → real
+                // Spec domain for j/m1/m2 is integers (integer-valued angular momenta).
+                Binding(name: "wignerd",
+                    sig: Function(params: [Scalar(Integer), Scalar(Integer), Scalar(Integer), Scalar(Real)], result: Scalar(Real))),
+                // wignerD(j, m1, m2, alpha, cosbeta, gamma) → Complex
+                Binding(name: "wignerD",
+                    sig: Function(
+                        params: [Scalar(Integer), Scalar(Integer), Scalar(Integer), Scalar(Real), Scalar(Real), Scalar(Real)],
+                        result: Scalar(Complex))),
+                // wignerd_doublearg(two_j, two_m1, two_m2, cosbeta): doubled integer args → real
+                // Angular momenta passed as 2j, 2m1, 2m2 (integers, covering half-integer spin).
+                Binding(name: "wignerd_doublearg",
+                    sig: Function(params: [Scalar(Integer), Scalar(Integer), Scalar(Integer), Scalar(Real)], result: Scalar(Real))),
+                // wignerD_doublearg(two_j, two_m1, two_m2, alpha, cosbeta, gamma) → Complex
+                Binding(name: "wignerD_doublearg",
+                    sig: Function(
+                        params: [Scalar(Integer), Scalar(Integer), Scalar(Integer), Scalar(Real), Scalar(Real), Scalar(Real)],
+                        result: Scalar(Complex))),
+            ]
+        ),
+
+        // ---- Module: ext-linear-algebra (spec §09) ----
+        Module(
+            name: "ext-linear-algebra",
+            version: "0.1",
+            bindings: [
+                // lu(A) → record(P, L, U): returns a struct of three matrices.
+                // ResultSig has no Record variant; closest expressible type is dynamic matrix.
+                // (The actual return is a named-field record, inexpressible in ResultSig.)
+                Binding(name: "lu",
+                    sig: Function(params: [Matrix], result: Matrix(rows: Dyn, cols: Dyn)),
+                    degraded: Some("true result is record(P, L, U) — three square matrices; ResultSig::Record not in the type system → Matrix(Dyn, Dyn) (placeholder)")),
+                // svd(A) → record(U, S, V)
+                Binding(name: "svd",
+                    sig: Function(params: [Matrix], result: Matrix(rows: Dyn, cols: Dyn)),
+                    degraded: Some("true result is record(U, S, V) — two matrices and a vector; ResultSig::Record not in the type system → Matrix(Dyn, Dyn) (placeholder)")),
+                // eigen(A) → record(values, vectors)
+                Binding(name: "eigen",
+                    sig: Function(params: [Matrix], result: Matrix(rows: Dyn, cols: Dyn)),
+                    degraded: Some("true result is record(values, vectors) — vector and matrix; ResultSig::Record not in the type system → Matrix(Dyn, Dyn) (placeholder)")),
+                // eigmax(A) → real (maximal eigenvalue, real-valued when A has real eigenvalues)
+                Binding(name: "eigmax",
+                    sig: Function(params: [Matrix], result: Scalar(Real))),
+                // eigmin(A) → real
+                Binding(name: "eigmin",
+                    sig: Function(params: [Matrix], result: Scalar(Real))),
+                // matexp(A) → matrix (same shape as A)
+                Binding(name: "matexp",
+                    sig: Function(params: [Matrix], result: Matrix(rows: Dyn, cols: Dyn)),
+                    degraded: Some("result shape equals input shape; no shape-passthrough in ResultSig → Matrix(Dyn, Dyn)")),
+                // kron(A, B) → matrix of shape pm×qn
+                Binding(name: "kron",
+                    sig: Function(params: [Matrix, Matrix], result: Matrix(rows: Dyn, cols: Dyn)),
+                    degraded: Some("result shape is pm×qn; no shape arithmetic in ResultSig → Matrix(Dyn, Dyn)")),
+                // lstsq(A, b) → vector (least squares solution x)
+                Binding(name: "lstsq",
+                    sig: Function(params: [Matrix, Vector(Real)], result: Matrix(rows: Dyn, cols: Dyn)),
+                    degraded: Some("true result is a vector of length k (columns of A); ResultSig has no vector-from-arg-shape → Matrix(Dyn, Dyn) (placeholder)")),
+                // rank(A) → integer (numerical rank)
+                Binding(name: "rank",
+                    sig: Function(params: [Matrix], result: Scalar(Integer))),
+            ]
+        ),
+
+        // ---- Module: special-functions (spec §09) ----
+        Module(
+            name: "special-functions",
+            version: "0.1",
+            bindings: [
+                // erf(x) → real
+                Binding(name: "erf",  sig: Function(params: [Scalar(Real)], result: Scalar(Real))),
+                // erfc(x) → real
+                Binding(name: "erfc", sig: Function(params: [Scalar(Real)], result: Scalar(Real))),
+                // bessel_j(v, z): real order, real argument → real
+                Binding(name: "bessel_j", sig: Function(params: [Scalar(Real), Scalar(Real)], result: Scalar(Real))),
+                // bessel_y(v, z): real order, positive real argument → real
+                Binding(name: "bessel_y", sig: Function(params: [Scalar(Real), Scalar(Real)], result: Scalar(Real))),
+                // bessel_i(v, z): real order, real argument → real
+                Binding(name: "bessel_i", sig: Function(params: [Scalar(Real), Scalar(Real)], result: Scalar(Real))),
+                // bessel_k(v, z): real order, positive real argument → real
+                Binding(name: "bessel_k", sig: Function(params: [Scalar(Real), Scalar(Real)], result: Scalar(Real))),
+                // digamma(x) → real
+                Binding(name: "digamma",  sig: Function(params: [Scalar(Real)], result: Scalar(Real))),
+                // polygamma(n, x): non-negative integer order, real argument → real
+                Binding(name: "polygamma", sig: Function(params: [Scalar(Integer), Scalar(Real)], result: Scalar(Real))),
+                // gammainc(a, x): regularized lower incomplete gamma → real ∈ [0,1]
+                Binding(name: "gammainc", sig: Function(params: [Scalar(Real), Scalar(Real)], result: Scalar(Real))),
+                // betainc(a, b, x): regularized incomplete beta → real ∈ [0,1]
+                Binding(name: "betainc", sig: Function(params: [Scalar(Real), Scalar(Real), Scalar(Real)], result: Scalar(Real))),
+                // airy(x) → real
+                Binding(name: "airy", sig: Function(params: [Scalar(Real)], result: Scalar(Real))),
+            ]
+        ),
+
+        // ---- Module: polynomials (spec §09) ----
+        Module(
+            name: "polynomials",
+            version: "0.1",
+            bindings: [
+                // legendre(n, x): non-negative integer degree, real argument → real
+                Binding(name: "legendre",  sig: Function(params: [Scalar(Integer), Scalar(Real)], result: Scalar(Real))),
+                // hermite(n, x): physicist's Hermite polynomial
+                Binding(name: "hermite",   sig: Function(params: [Scalar(Integer), Scalar(Real)], result: Scalar(Real))),
+                // laguerre(n, x)
+                Binding(name: "laguerre",  sig: Function(params: [Scalar(Integer), Scalar(Real)], result: Scalar(Real))),
+                // chebyshev(n, x): Chebyshev polynomial of the first kind
+                Binding(name: "chebyshev", sig: Function(params: [Scalar(Integer), Scalar(Real)], result: Scalar(Real))),
+            ]
+        ),
+
+        // ---- Module: distances (spec §09) ----
+        Module(
+            name: "distances",
+            version: "0.1",
+            bindings: [
+                // pairwise_distance(distance, x): higher-order — takes a callable + vector of vectors
+                // Returns an N×N matrix.
+                Binding(name: "pairwise_distance",
+                    sig: Function(params: [Callable, Any], result: Matrix(rows: Dyn, cols: Dyn)),
+                    degraded: Some("distance arg is a callable; x is a vector-of-vectors (inexpressible in ParamSig) → Any; result is N×N but N is arg-dependent → Matrix(Dyn, Dyn)")),
+                // cross_distance(distance, x, y): callable + two vector-of-vectors → N×M matrix
+                Binding(name: "cross_distance",
+                    sig: Function(params: [Callable, Any, Any], result: Matrix(rows: Dyn, cols: Dyn)),
+                    degraded: Some("distance arg is a callable; x/y are vector-of-vectors (inexpressible in ParamSig) → Any; result is N×M but dims are arg-dependent → Matrix(Dyn, Dyn)")),
+                // euclidean(u, v) → real
+                Binding(name: "euclidean",         sig: Function(params: [Vector(Real), Vector(Real)], result: Scalar(Real))),
+                // squared_euclidean(u, v) → real
+                Binding(name: "squared_euclidean", sig: Function(params: [Vector(Real), Vector(Real)], result: Scalar(Real))),
+                // cosine(u, v) → real ∈ [0, 2]
+                Binding(name: "cosine",            sig: Function(params: [Vector(Real), Vector(Real)], result: Scalar(Real))),
+                // manhattan(u, v) → real (L1 distance)
+                Binding(name: "manhattan",         sig: Function(params: [Vector(Real), Vector(Real)], result: Scalar(Real))),
+                // chebyshev(u, v) → real (L∞ distance)
+                Binding(name: "chebyshev",         sig: Function(params: [Vector(Real), Vector(Real)], result: Scalar(Real))),
+                // minkowski(u, v, p): p-norm distance
+                Binding(name: "minkowski",         sig: Function(params: [Vector(Real), Vector(Real), Scalar(Real)], result: Scalar(Real))),
+                // jensenshannon(u, v): probability vectors (std simplex) → real ∈ [0,1]
+                Binding(name: "jensenshannon",     sig: Function(params: [Vector(Real), Vector(Real)], result: Scalar(Real)),
+                    degraded: Some("u and v must be probability vectors (stdsimplex); ParamSig::Vector(Real) is a sound superset; the unit constraint is not encoded")),
+            ]
+        ),
+    ]
+)

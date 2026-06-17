@@ -56,7 +56,7 @@ pub(crate) fn call_rule(
     // User-defined callable application: the result looks through the callee
     // to the reified body (spec §11 reified callables).
     if let Some((callee_node, callee_ty)) = callee {
-        let ty = user_call_type(inf, callee_node, &callee_ty);
+        let ty = user_call_type(inf, callee_node, &callee_ty, args);
         return (ty, joined);
     }
 
@@ -72,43 +72,34 @@ pub(crate) fn call_rule(
     }
 
     let ty = match name.as_str() {
-        // ---- arithmetic (spec §07) ----
+        // ---- arithmetic (spec §07) — structural: result depends on arg shapes/types ----
         "add" | "sub" => elementwise2(&args.first(), &args.get(1)),
         "mul" => mul_type(args),
-        "divide" => Type::Scalar(ScalarType::Real),
         "pow" => promote2(arg_ty(args, 0), arg_ty(args, 1)),
         "neg" => args.first().map_or(Type::Deferred, |(_, t, _)| t.clone()),
         "min" | "max" | "atan2" => promote2(arg_ty(args, 0), arg_ty(args, 1)),
-        "div" | "mod" => Type::Scalar(ScalarType::Integer),
-        "abs" | "abs2" => real_or_complex(arg_ty(args, 0)),
-        "exp" | "log" | "log2" | "log10" | "sqrt" | "sin" | "cos" | "tan" | "asin" | "acos"
-        | "atan" | "sinh" | "cosh" | "tanh" | "asinh" | "acosh" | "atanh" | "log1p" | "expm1"
-        | "gamma" | "loggamma" | "logit" | "invlogit" | "probit" | "invprobit" => {
-            real_or_complex(arg_ty(args, 0))
-        }
-        "floor" | "ceil" | "round" | "integer" => Type::Scalar(ScalarType::Integer),
-        "cis" | "complex" => Type::Scalar(ScalarType::Complex),
-        "conj" => real_or_complex(arg_ty(args, 0)),
+        // `divide(a, b) = a / b` over real OR complex scalars (spec §07):
+        // complex if either operand is complex, else real (true division —
+        // integer operands still divide to real). NOT a constant Scalar(Real):
+        // the complex case must promote. See `divide_type`.
+        "divide" => divide_type(arg_ty(args, 0), arg_ty(args, 1)),
 
-        // ---- comparisons / logic (spec §07) ----
-        "equal" | "unequal" | "lt" | "le" | "gt" | "ge" | "in" | "land" | "lor" | "lnot"
-        | "isfinite" | "isinf" | "isnan" | "iszero" => Type::Scalar(ScalarType::Boolean),
-
-        // ---- containers (spec §03) ----
+        // ---- containers (spec §03) — structural: result type threads arg types ----
         "vector" => vector_type(args),
         "tuple" => Type::Tuple(args.iter().map(|(_, t, _)| t.clone()).collect()),
         "record" => Type::Record(named.iter().map(|(n, _, t, _)| (*n, t.clone())).collect()),
         "rowstack" => rowstack_type(arg_ty(args, 0)),
         "get" => get_type(inf, args, /*base=*/ 1),
         "get0" => get_type(inf, args, /*base=*/ 0),
-        "lengthof" | "length" => Type::Scalar(ScalarType::Integer),
         "indicesof" | "indicesof0" => Type::Array {
             shape: Box::new([Dim::Dynamic]),
             elem: Box::new(Type::Scalar(ScalarType::Integer)),
         },
-        "sum" | "prod" => reduce_type(arg_ty(args, 0)),
-        "l1norm" | "l2norm" | "logsumexp" => Type::Scalar(ScalarType::Real),
-        // Vector normalizations map a vector to a same-shape real vector.
+        // `sum` / `prod` / `mean` reduce a real/complex array to its element
+        // type (spec §07 Reductions): mean of a complex array is complex.
+        // (NOT a constant Scalar(Real); legacy ops.rs returned Real always.)
+        "sum" | "prod" | "mean" => reduce_type(arg_ty(args, 0)),
+        // Vector normalizations: same-shape real vector — shape must thread through.
         "softmax" | "logsoftmax" | "l1unit" | "l2unit" => match arg_ty(args, 0) {
             Some(Type::Array { shape, .. }) if shape.len() == 1 => Type::Array {
                 shape: shape.clone(),
@@ -116,7 +107,6 @@ pub(crate) fn call_rule(
             },
             _ => Type::Deferred,
         },
-        "mean" => Type::Scalar(ScalarType::Real),
 
         // ---- value-preserving assertion (spec §07) ----
         "checked" => args.first().map_or(Type::Deferred, |(_, t, _)| t.clone()),
@@ -158,7 +148,6 @@ pub(crate) fn call_rule(
         ),
         "joint" => joint_type(named),
         "likelihoodof" => likelihood_type(inf, args),
-        "logdensityof" | "densityof" => Type::Scalar(ScalarType::Real),
 
         // ---- explicit RNG (spec §07) ----
         "rnginit" => Type::RngState,
@@ -177,16 +166,23 @@ pub(crate) fn call_rule(
         // ---- broadcasting (spec §04) ----
         "broadcast" => broadcast_type(inf, args, named),
 
-        // ---- distributions (spec §08) ----
-        _ => match distribution_domain(inf, &name, args, named) {
-            Some(domain) => Type::Measure {
-                domain: Box::new(domain),
-                mass: Mass::Deferred,
+        // ---- catalogue dispatch (spec §07 functions + spec §08 distributions) ----
+        // Per-name functions whose result is a pure scalar (constant, SameScalarKind,
+        // or DomainMap) are declared in catalogue.ron and lowered here.
+        // Distribution constructors (Sig::Distribution rows) are also dispatched here.
+        // Structural ops above cannot be expressed in ResultSig and stay as code.
+        _ => match function_result(&name, args) {
+            Some(ty) => ty,
+            None => match distribution_domain(inf, &name, args, named) {
+                Some(domain) => Type::Measure {
+                    domain: Box::new(domain),
+                    mass: Mass::Deferred,
+                },
+                None => {
+                    inf.note_gap(op);
+                    Type::Deferred
+                }
             },
-            None => {
-                inf.note_gap(op);
-                Type::Deferred
-            }
         },
     };
 
@@ -244,6 +240,29 @@ fn real_or_complex(a: Option<&Type>) -> Type {
     match a {
         Some(Type::Scalar(ScalarType::Complex)) => Type::Scalar(ScalarType::Complex),
         _ => Type::Scalar(ScalarType::Real),
+    }
+}
+
+/// `divide(a, b) = a / b` (spec §07): true division over scalars that are real
+/// OR complex. The result is complex iff either operand is complex; otherwise
+/// it is real — even for integer operands, since `1 / 2 = 0.5` is real (integer
+/// floor-division is the separate `div` op). This differs from `promote2`,
+/// which would keep integer/integer as integer.
+fn divide_type(a: Option<&Type>, b: Option<&Type>) -> Type {
+    use ScalarType::*;
+    let is_complex = |t: Option<&Type>| matches!(t, Some(Type::Scalar(Complex)));
+    let known_scalar = |t: Option<&Type>| {
+        matches!(
+            t,
+            Some(Type::Scalar(Integer | Real | Complex | Boolean)) | Some(Type::Any)
+        )
+    };
+    if is_complex(a) || is_complex(b) {
+        Type::Scalar(Complex)
+    } else if known_scalar(a) && known_scalar(b) {
+        Type::Scalar(Real)
+    } else {
+        Type::Deferred
     }
 }
 
@@ -616,7 +635,30 @@ fn likelihood_type(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> Type {
 /// Calling a user-defined callable: a function returns its body's type, a
 /// kernel returns the *measure* its body denotes (`kernelof` reifies the law
 /// of a value-typed body).
-fn user_call_type(inf: &mut Inferencer<'_, '_>, callee: NodeId, callee_ty: &Type) -> Type {
+fn user_call_type(
+    inf: &mut Inferencer<'_, '_>,
+    callee: NodeId,
+    callee_ty: &Type,
+    args: &[ArgInfo],
+) -> Type {
+    // §09 standard-module application (`hepphys.CrystalBall(args)` /
+    // `specfns.erf(x)`): the callee is a `RefNs::Module` ref whose catalogue
+    // signature was stashed at resolution time. Lower it with the concrete
+    // call args — a Distribution sig yields the measure with the catalogue
+    // `MassTag`-derived mass (Normalized or Finite) already concrete, a
+    // Function sig yields the result type. This is the §09 analogue of the
+    // base-distribution / per-name-function dispatch in the builtin-call path,
+    // which the user-call path bypasses.
+    // Surface the honest-degrade note (spec policy): when this catalogue
+    // row's support/shape is a sound approximation of the spec entry that
+    // the type system cannot express exactly, the user sees why.
+    if let Some(cref) = inf.module_catalogue_ref(callee) {
+        let note = cref.degraded.clone(); // clone to drop the borrow before &mut inf call
+        if let Some(note) = note {
+            inf.note_once_str(&note);
+        }
+        return catalogue_call_type(inf, callee, args);
+    }
     match callee_ty {
         Type::Function { .. } => reified_result_type(inf, callee).unwrap_or(Type::Deferred),
         Type::Kernel { mass, .. } => match reified_result_type(inf, callee) {
@@ -632,6 +674,74 @@ fn user_call_type(inf: &mut Inferencer<'_, '_>, callee: NodeId, callee_ty: &Type
         },
         _ => Type::Deferred,
     }
+}
+
+/// Apply a §09 standard-module reference resolved against the catalogue. The
+/// catalogue sig (stashed at resolution time, keyed by `callee`) is lowered
+/// with a `LowerCtx` built from the concrete call args:
+///   - Distribution sig → the lowered `Measure` with the mass from the
+///     catalogue `MassTag` preserved (`Normalized` for a probability
+///     distribution, `Finite` for a non-probability one such as
+///     `ContinuedPoisson`). `fill_mass` leaves a concrete (non-`Deferred`)
+///     mass untouched, so this rides through unchanged.
+///   - Function sig → the lowered result type (scalar following the arg kind,
+///     or a dynamic-dim matrix).
+///
+/// The support is carried separately by `catalogue_call_valueset`.
+fn catalogue_call_type(inf: &mut Inferencer<'_, '_>, callee: NodeId, args: &[ArgInfo]) -> Type {
+    // Clone the sig out to drop the immutable borrow before `lower`'s closures
+    // re-borrow `args` inside the `&mut inf` call frame.
+    let Some(sig) = inf.module_catalogue_ref(callee).map(|c| c.sig.clone()) else {
+        return Type::Deferred;
+    };
+    // Both Distribution and Function sigs return the lowered type directly:
+    // `catalogue_lower` already embeds the catalogue `MassTag` mass in the
+    // `Measure` for distributions, and the result scalar/matrix type for
+    // functions. No per-variant fixup is needed.
+    let (ty, _vset) = catalogue_lower(&sig, args);
+    ty
+}
+
+/// The value set of an applied §09 standard-module reference: a distribution's
+/// support (the lowered support ValueSet) or a function result's natural set.
+/// Mirrors `distribution_support` / `function_result`'s value-set handling but
+/// reads the sig from the catalogue-ref side-table rather than by op name.
+fn catalogue_call_valueset(
+    inf: &mut Inferencer<'_, '_>,
+    callee: NodeId,
+    args: &[ArgInfo],
+) -> ValueSet {
+    let Some(sig) = inf.module_catalogue_ref(callee).map(|c| c.sig.clone()) else {
+        return ValueSet::Unknown;
+    };
+    catalogue_lower(&sig, args).1
+}
+
+/// Lower a §09 catalogue sig with a `LowerCtx` built from the concrete
+/// positional call args: `arg_scalar`/`arg_dim` read arg `i`'s inferred type,
+/// `param_dim` (VectorFromParam) has no named-kwarg source at a `RefNs::Module`
+/// application, so it falls back to the first positional arg's vector dim.
+/// The `LowerCtx` borrows local closures, so it is built and consumed here in
+/// one scope rather than returned.
+fn catalogue_lower(sig: &crate::catalogue::Sig, args: &[ArgInfo]) -> (Type, ValueSet) {
+    use crate::catalogue::{LowerCtx, lower};
+
+    let first_dim = || match args.first().map(|(_, t, _)| t) {
+        Some(Type::Array { shape, .. }) if shape.len() == 1 => shape[0],
+        _ => Dim::Dynamic,
+    };
+    let ctx = LowerCtx {
+        arg_scalar: &|i| match arg_ty(args, i) {
+            Some(Type::Scalar(s)) => Some(*s),
+            _ => None,
+        },
+        param_dim: &|_| first_dim(),
+        arg_dim: &|i| match arg_ty(args, i) {
+            Some(Type::Array { shape, .. }) if shape.len() == 1 => shape[0],
+            _ => Dim::Dynamic,
+        },
+    };
+    lower(sig, &ctx)
 }
 
 /// Look through a callable expression (a `%ref` to a binding, or an inline
@@ -763,58 +873,86 @@ fn broadcast_type(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo], named: &[Named
     }
 }
 
+/// The result type of a per-name function declared in the catalogue as
+/// `Sig::Function`, or `None` if the name is not a known function (so the
+/// caller can fall through to distribution dispatch, then gap).
+///
+/// `arg_scalar` is built from the inferred positional argument types so that
+/// `SameScalarKind` and `DomainMap` sigs can read the call-site scalar kind.
+fn function_result(name: &str, args: &[ArgInfo]) -> Option<Type> {
+    use crate::catalogue::{LowerCtx, Sig, lower};
+
+    let sig = crate::catalogue::builtin().base(name)?;
+    // Only Function rows here; Distribution rows are handled by distribution_domain.
+    let Sig::Function { .. } = sig else {
+        return None;
+    };
+    let ctx = LowerCtx {
+        arg_scalar: &|i| match arg_ty(args, i) {
+            Some(Type::Scalar(s)) => Some(*s),
+            _ => None,
+        },
+        param_dim: &|_| Dim::Dynamic,
+        arg_dim: &|i| match arg_ty(args, i) {
+            Some(Type::Array { shape, .. }) if shape.len() == 1 => shape[0],
+            _ => Dim::Dynamic,
+        },
+    };
+    // `lower` for Sig::Function returns (Type, ValueSet::natural_of(&ty)).
+    // We only need the type here; the value-set arm is handled by call_valueset.
+    let (ty, _) = lower(sig, &ctx);
+    Some(ty)
+}
+
 /// The variate domain of a spec-§08 distribution constructor, or `None` when
 /// the name is not a known distribution.
+///
+/// Dispatches via the catalogue for all 30 base distributions; non-distribution
+/// names fall through to `None` unchanged.
 fn distribution_domain(
     inf: &mut Inferencer<'_, '_>,
     name: &str,
     args: &[ArgInfo],
     named: &[NamedInfo],
 ) -> Option<Type> {
-    use ScalarType::*;
-    let scalar = |s: ScalarType| Some(Type::Scalar(s));
-    let dynmat = || {
-        Some(Type::Array {
-            shape: Box::new([Dim::Dynamic, Dim::Dynamic]),
-            elem: Box::new(Type::Scalar(Real)),
-        })
+    use crate::catalogue::{LowerCtx, Sig, lower};
+
+    let sig = crate::catalogue::builtin().base(name)?;
+    // Confirm it's a distribution sig (Function rows are not distributions).
+    let Sig::Distribution { .. } = sig else {
+        return None;
     };
-    match name {
-        // Continuous univariate — domain ⊆ reals.
-        "Normal" | "GeneralizedNormal" | "Cauchy" | "StudentT" | "Logistic" | "LogNormal"
-        | "Exponential" | "Gamma" | "Weibull" | "InverseGamma" | "Beta" | "ChiSquared"
-        | "VonMises" | "Laplace" => scalar(Real),
-        // `Uniform(support)` — over its support set; scalar-real for now
-        // (set-valued supports refine with the shape work).
-        "Uniform" => scalar(Real),
-        // Discrete univariate.
-        "Bernoulli" => scalar(Boolean),
-        "Categorical" | "Categorical0" | "Binomial" | "Geometric" | "NegativeBinomial"
-        | "NegativeBinomial2" | "Poisson" => scalar(Integer),
-        // Multivariate — at Level::Shape the dim comes from the length
-        // parameter's inferred type (`mu` / `alpha` / `p`).
-        "MvNormal" | "Dirichlet" => {
-            let dim = param_dim(
-                inf,
-                args,
-                named,
-                if name == "MvNormal" { "mu" } else { "alpha" },
-            );
-            Some(Type::Array {
-                shape: Box::new([dim]),
-                elem: Box::new(Type::Scalar(Real)),
-            })
-        }
-        "Multinomial" => {
-            let dim = param_dim(inf, args, named, "p");
-            Some(Type::Array {
-                shape: Box::new([dim]),
-                elem: Box::new(Type::Scalar(Integer)),
-            })
-        }
-        "Wishart" | "InverseWishart" | "LKJ" | "LKJCholesky" => dynmat(),
-        _ => None,
+    // Build a context whose `param_dim` delegates to the existing helper
+    // so that VectorFromParam dims (MvNormal/Dirichlet/Multinomial) resolve
+    // the same way as before.  The closure borrows `inf` as `&Inferencer`
+    // (a shared reborrow of the `&mut`); it is dropped before `inf` is
+    // used mutably again.
+    let ctx = LowerCtx {
+        param_dim: &|kwarg| param_dim(inf, args, named, kwarg),
+        arg_scalar: &|_| None,
+        arg_dim: &|_| Dim::Dynamic,
+    };
+    let (ty, _vset) = lower(sig, &ctx);
+    // `lower` wraps the domain in a `Type::Measure`; unwrap to get the domain.
+    if let Type::Measure { domain, .. } = ty {
+        Some(*domain)
+    } else {
+        None
     }
+}
+
+/// A dummy `SupportTag::Structural` check helper so `distribution_support` can
+/// peek at the raw tag without re-looking up the catalogue entry.
+#[inline]
+fn support_is_structural(sig: &crate::catalogue::Sig) -> bool {
+    use crate::catalogue::{Sig, SupportTag};
+    matches!(
+        sig,
+        Sig::Distribution {
+            support: SupportTag::Structural,
+            ..
+        }
+    )
 }
 
 /// The static dim of a distribution's length-defining parameter (`mu`,
@@ -869,8 +1007,13 @@ pub(crate) fn call_valueset(
     ty: &Type,
 ) -> ValueSet {
     // User-callable application: the reified body's set rides over (for a
-    // kernel call, the body set IS the output measure's support).
+    // kernel call, the body set IS the output measure's support). A §09
+    // standard-module reference has no reified body — its support/result set
+    // is lowered from the catalogue sig with the call args.
     if let Some((callee_node, _)) = callee {
+        if inf.module_catalogue_ref(*callee_node).is_some() {
+            return catalogue_call_valueset(inf, *callee_node, args);
+        }
         return match reified_body(inf, *callee_node) {
             Some(body) => inf.lookup_valueset(body),
             None => ValueSet::Unknown,
@@ -1052,29 +1195,36 @@ fn bound_of(inf: &Inferencer<'_, '_>, node: Option<NodeId>) -> Option<f64> {
 
 /// The §08 Domain/Support column as a producer table: the support of a
 /// distribution constructor, or `Unknown` for a non-distribution.
+///
+/// Dispatches via the catalogue for all 30 base distributions.  Distributions
+/// with `SupportTag::Structural` (currently only Uniform) retain their live
+/// code path so the support is computed from the call argument at inference
+/// time rather than from a static tag.
 fn distribution_support(
     inf: &mut Inferencer<'_, '_>,
     name: &str,
     args: &[ArgInfo],
     named: &[NamedInfo],
 ) -> ValueSet {
-    use ValueSet::*;
-    match name {
-        "Uniform" => set_expr_valueset(inf, args.first().map(|a| a.0)),
-        "Normal" | "GeneralizedNormal" | "Cauchy" | "StudentT" | "Logistic" | "VonMises"
-        | "Laplace" => Reals,
-        "LogNormal" | "Gamma" | "InverseGamma" | "ChiSquared" => PosReals,
-        "Exponential" | "Weibull" => NonNegReals,
-        "Beta" => UnitInterval,
-        "Bernoulli" => Booleans,
-        "Categorical" => PosIntegers,
-        "Categorical0" | "Binomial" | "Geometric" | "NegativeBinomial" | "NegativeBinomial2"
-        | "Poisson" => NonNegIntegers,
-        "MvNormal" => CartPow(Box::new(Reals), param_dim(inf, args, named, "mu")),
-        "Dirichlet" => StdSimplex(param_dim(inf, args, named, "alpha")),
-        "Multinomial" => CartPow(Box::new(NonNegIntegers), param_dim(inf, args, named, "p")),
-        _ => Unknown,
+    use crate::catalogue::{LowerCtx, lower};
+
+    let Some(sig) = crate::catalogue::builtin().base(name) else {
+        return ValueSet::Unknown;
+    };
+    // Structural support: live code path reads the actual set argument.
+    // Currently only Uniform; the static catalogue approximation (Unknown) is
+    // not used here — the concrete arg-dependent value is what inference needs.
+    if support_is_structural(sig) {
+        return set_expr_valueset(inf, args.first().map(|a| a.0));
     }
+    // All other distributions: lower via the catalogue to get the support ValueSet.
+    let ctx = LowerCtx {
+        param_dim: &|kwarg| param_dim(inf, args, named, kwarg),
+        arg_scalar: &|_| None,
+        arg_dim: &|_| Dim::Dynamic,
+    };
+    let (_ty, vs) = lower(sig, &ctx);
+    vs
 }
 
 // =====================================================================
@@ -1102,6 +1252,12 @@ pub(crate) fn fill_mass(
         return Type::Measure { domain, mass };
     }
     if callee.is_some() || call.inputs.is_some() {
+        // User calls (including applied §09 catalogue distribution references)
+        // had their mass set at construction — a catalogue distribution carries
+        // its `MassTag`-derived mass (Normalized/Finite) out of
+        // `catalogue_call_type`, so it is already concrete and was returned by
+        // the `mass != Deferred` guard above. Reaching here means a deferred
+        // mass that the call site cannot refine; pass it through unchanged.
         return Type::Measure { domain, mass };
     }
     let CallHead::Builtin(op) = call.head else {
@@ -1230,6 +1386,130 @@ fn broadcast_mass(cell: Mass) -> Mass {
         Mass::Null => Mass::Null,
         Mass::Finite => Mass::Finite,
         _ => Mass::Unknown,
+    }
+}
+
+// =====================================================================
+// Test helpers (not part of the normal public API)
+// =====================================================================
+
+/// For test use: the variate domain of a named distribution, with
+/// `param_dim` provided by the caller rather than inferred from a live Module.
+/// Returns `None` for non-distributions, matching the production function.
+#[cfg(test)]
+pub(crate) fn distribution_domain_static(
+    name: &str,
+    param_dim: &dyn Fn(&str) -> Dim,
+) -> Option<Type> {
+    use ScalarType::*;
+    let scalar = |s: ScalarType| Some(Type::Scalar(s));
+    let dynmat = || {
+        Some(Type::Array {
+            shape: Box::new([Dim::Dynamic, Dim::Dynamic]),
+            elem: Box::new(Type::Scalar(Real)),
+        })
+    };
+    match name {
+        "Normal" | "GeneralizedNormal" | "Cauchy" | "StudentT" | "Logistic" | "LogNormal"
+        | "Exponential" | "Gamma" | "Weibull" | "Pareto" | "InverseGamma" | "Beta"
+        | "ChiSquared" | "VonMises" | "Laplace" | "Uniform" => scalar(Real),
+        // Bernoulli: spec §08 "Domain/Support: integers/booleans".
+        // Legacy ops.rs returned Boolean — that is a legacy bug; oracle now
+        // reflects the spec-correct value (Integer) to match the catalogue.
+        "Bernoulli" => scalar(Integer),
+        "Categorical" | "Categorical0" | "Binomial" | "Geometric" | "NegativeBinomial"
+        | "NegativeBinomial2" | "Poisson" => scalar(Integer),
+        "MvNormal" => Some(Type::Array {
+            shape: Box::new([param_dim("mu")]),
+            elem: Box::new(Type::Scalar(Real)),
+        }),
+        "Dirichlet" => Some(Type::Array {
+            shape: Box::new([param_dim("alpha")]),
+            elem: Box::new(Type::Scalar(Real)),
+        }),
+        "Multinomial" => Some(Type::Array {
+            shape: Box::new([param_dim("p")]),
+            elem: Box::new(Type::Scalar(Integer)),
+        }),
+        "Wishart" | "InverseWishart" | "LKJ" | "LKJCholesky" => dynmat(),
+        _ => None,
+    }
+}
+
+/// For test use: the support `ValueSet` of a named distribution, with
+/// `param_dim` provided by the caller. Returns `ValueSet::Unknown` for
+/// non-distributions or arg-dependent supports (Uniform, Wishart family).
+#[cfg(test)]
+pub(crate) fn distribution_support_static(name: &str, param_dim: &dyn Fn(&str) -> Dim) -> ValueSet {
+    use ValueSet::*;
+    match name {
+        // Uniform: support is structural (the set arg passed at the call site,
+        // evaluated by set_expr_valueset at inference time). This oracle returns
+        // Unknown — the correct static approximation — so the faithfulness test
+        // can verify it matches the catalogue's Structural tag (which also lowers
+        // to Unknown). The real arg-dependent behavior is guarded by the
+        // dedicated `uniform_support_is_the_argument_set` test.
+        "Uniform" => Unknown,
+        "Normal" | "GeneralizedNormal" | "Cauchy" | "StudentT" | "Logistic" | "VonMises"
+        | "Laplace" => Reals,
+        "LogNormal" | "Gamma" | "InverseGamma" | "ChiSquared" | "Pareto" => PosReals,
+        "Exponential" | "Weibull" => NonNegReals,
+        "Beta" => UnitInterval,
+        "Bernoulli" => Booleans,
+        "Categorical" => PosIntegers,
+        "Categorical0" | "Binomial" | "Geometric" | "NegativeBinomial" | "NegativeBinomial2"
+        | "Poisson" => NonNegIntegers,
+        "MvNormal" => CartPow(Box::new(Reals), param_dim("mu")),
+        "Dirichlet" => StdSimplex(param_dim("alpha")),
+        "Multinomial" => CartPow(Box::new(NonNegIntegers), param_dim("p")),
+        // not in distribution_support — legacy returns Unknown
+        "Wishart" | "InverseWishart" | "LKJ" | "LKJCholesky" => Unknown,
+        _ => Unknown,
+    }
+}
+
+/// For test use: the expected result type of a per-name function, mirroring
+/// what the old per-name call_rule arms produced.  This is the static oracle
+/// for the catalogue faithfulness test: it must match `function_result` for
+/// every name in the migrated set.
+///
+/// `arg_scalar` simulates the caller's arg type at position 0.
+/// Returns `None` for names that were never in the per-name arm set.
+#[cfg(test)]
+pub(crate) fn function_type_static(name: &str, arg0_scalar: Option<ScalarType>) -> Option<Type> {
+    use ScalarType::*;
+    let real_or_cplx = |s: Option<ScalarType>| match s {
+        Some(Complex) => Type::Scalar(Complex),
+        _ => Type::Scalar(Real),
+    };
+    match name {
+        // scalar-integer output
+        "floor" | "ceil" | "round" | "integer" => Some(Type::Scalar(Integer)),
+        "div" | "mod" => Some(Type::Scalar(Integer)),
+        "lengthof" | "length" => Some(Type::Scalar(Integer)),
+        // scalar-real output
+        // (divide and mean are NOT here: they are structural — divide promotes
+        // its two operands, mean reduces to the array element type — handled
+        // in call_rule, not the catalogue.)
+        "logdensityof" | "densityof" => Some(Type::Scalar(Real)),
+        "l1norm" | "l2norm" | "logsumexp" => Some(Type::Scalar(Real)),
+        // scalar-complex output
+        "cis" | "complex" => Some(Type::Scalar(Complex)),
+        // scalar-boolean output
+        "equal" | "unequal" | "lt" | "le" | "gt" | "ge" | "in" | "land" | "lor" | "lnot"
+        | "isfinite" | "isinf" | "isnan" | "iszero" => Some(Type::Scalar(Boolean)),
+        // real_or_complex: exp/log/sqrt/trig and friends
+        "exp" | "log" | "log2" | "log10" | "sqrt" | "sin" | "cos" | "tan" | "asin" | "acos"
+        | "atan" | "sinh" | "cosh" | "tanh" | "asinh" | "acosh" | "atanh" | "log1p" | "expm1"
+        | "gamma" | "loggamma" | "logit" | "invlogit" | "probit" | "invprobit" | "conj" => {
+            Some(real_or_cplx(arg0_scalar))
+        }
+        // abs / abs2: |z| and |z|² are always REAL even for complex input
+        // (spec §07: |·| maps ℂ → ℝ). Legacy ops.rs used real_or_complex which
+        // incorrectly returned Complex for complex input; the catalogue
+        // DomainMap(Complex→Real) is spec-correct. The test oracle follows spec.
+        "abs" | "abs2" => Some(Type::Scalar(Real)),
+        _ => None,
     }
 }
 
