@@ -53,6 +53,10 @@ pub struct Datum {
     #[serde(rename = "type", default)]
     pub kind: String,
     /// Unbinned entries: each inner vec is one event's coordinates.
+    // NOTE: deserialized in full, allocating proportional to the input document
+    // size with no entry-count cap. Fine for the current CLI-on-local-file threat
+    // model; if untrusted HS3 documents are ever ingested non-interactively, add a
+    // bound on the number of entries (e.g. a custom deserializer with a limit).
     #[serde(default)]
     pub entries: Vec<Vec<f64>>,
     /// Binned observation bin contents (histfactory channel observed counts).

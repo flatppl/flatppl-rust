@@ -76,7 +76,10 @@ jobs:
         run: cargo fmt --all --check
 
       - name: Clippy (deny warnings)
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        # `--all-features` so the hs3-gated CLI code and the gated
+        # `convert_hs3.rs` test lint-compile under `-D warnings` too — with hs3
+        # off in the CLI default build, plain clippy never sees them.
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
       - name: Run tests with coverage
         # Runs the full workspace test suite (including the cross-engine
