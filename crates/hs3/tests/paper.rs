@@ -14,13 +14,12 @@ fn paper_gaussian_converts() {
 
     assert!(text.contains("Normal"), "missing Normal, got:\n{text}");
     assert!(text.contains("relabel"), "missing relabel, got:\n{text}");
-    // The single unbinned observation 1.27 becomes the channel data vector,
-    // then feeds the likelihood. Pin the exact bracketed binding RHS so a
-    // dropped/extra entry fails (bare contains("1.27") false-passes on the
-    // record default `x = 1.27`).
+    // The single unbinned observation 1.27 is observed as a record keyed by the
+    // distribution's variate name `x` (the model is `relabel(Normal, ["x"])`, a
+    // record-shaped measure, so the observation must match its axes).
     assert!(
-        text.contains("obs_gaussian_channel = [1.27]"),
-        "observed-data vector mismatch (expected [1.27]), got:\n{text}"
+        text.contains("obs_gaussian_channel = record(x = 1.27)"),
+        "observed-data record mismatch (expected record(x = 1.27)), got:\n{text}"
     );
     assert!(
         text.contains("elementof"),
@@ -72,12 +71,12 @@ fn paper_histfactory_converts() {
     );
     assert!(!text.contains("fn("), "not point-free, got:\n{text}");
 
-    // staterror aux: a Gaussian constraint on the per-bin mcstat scales with
-    // relative deltas [0.05, 0.1] (bin0 = 5/100, bin1 = 10/100). Pin the exact
-    // array so a swapped/reordered delta vector fails.
+    // staterror aux: ROOT-default Poisson (Barlow–Beeston) constraint on the
+    // per-bin mcstat scales, emitted as a ContinuedPoisson. Numerical
+    // conformance vs ROOT/pyhf is covered in the flatppl-js cross-engine suite.
     assert!(
-        text.contains("likelihoodof(broadcast(Normal, mcstat, [0.05, 0.1]), [1.0, 1.0])"),
-        "staterror aux mismatch (expected deltas [0.05, 0.1]), got:\n{text}"
+        text.contains("hepphys.ContinuedPoisson") && text.contains("mcstat"),
+        "expected a ContinuedPoisson staterror constraint on mcstat, got:\n{text}"
     );
 
     // Round-trip parse.

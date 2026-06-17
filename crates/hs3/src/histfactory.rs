@@ -201,15 +201,15 @@ pub fn require_spec(m: &Modifier) -> Result<&'static ModSpec> {
 /// would otherwise emit a `self.""` ref or a broadcast with a missing operand.
 /// Shared by `modifier_effect` (histfactory.rs) and `declare_modifier_param`
 /// (pyhf.rs) so the two paths cannot disagree.
-pub fn require_param<'m>(m: &'m Modifier, spec: &ModSpec) -> Result<&'m str> {
-    match m.parameter.as_deref() {
+pub fn require_param(m: &Modifier, spec: &ModSpec) -> Result<String> {
+    match m.effective_param() {
         Some(p) => Ok(p),
         None if spec.requires_param => Err(Error::Unsupported(format!(
             "{} modifier is missing its `parameter` (name of the free parameter it binds)",
             m.kind
         ))),
         // A kind that does not require a parameter but has none: caller decides.
-        None => Ok(""),
+        None => Ok(String::new()),
     }
 }
 
@@ -257,6 +257,7 @@ pub fn modifier_effect(
 ) -> Result<Effect> {
     let spec = require_spec(m)?;
     let param = require_param(m, spec)?;
+    let param: &str = param.as_str();
     // The Effect *shape* still varies per kind, but kind validation and the
     // `parameter` requirement are now driven by `spec`/[`MOD_SPECS`].
     match spec.kind {
@@ -299,15 +300,12 @@ pub fn modifier_effect(
 
         "lumi" => Ok(Effect::MulLumi(b.self_ref(param))),
 
-        "staterror" => {
-            if m.constraint.as_deref() == Some("Poisson") {
-                return Err(Error::Unsupported(
-                    "staterror with Poisson constraint is not yet supported (only Gaussian BB-lite)"
-                        .into(),
-                ));
-            }
-            Ok(Effect::MulStaterrGamma(b.self_ref(param)))
-        }
+        // The aux constraint (built in pyhf.rs from the channel-summed
+        // uncertainties) is a per-bin Poisson term, matching ROOT HistFactory
+        // (which always Poisson-constrains staterror γ, regardless of the HS3
+        // `constraint` field — pyhf's Gaussian staterror is an approximation we
+        // intentionally do not follow).
+        "staterror" => Ok(Effect::MulStaterrGamma(b.self_ref(param))),
 
         "shapefactor" => Ok(Effect::MulShapefactorGamma(b.self_ref(param))),
 
@@ -398,23 +396,53 @@ pub fn normsys_aux(b: &mut Builder, alpha: NodeId) -> NodeId {
     b.call("likelihoodof", &[normal, obs_zero])
 }
 
-/// Staterror BB-lite aux: `likelihoodof(broadcast(Normal, gamma, delta), [1.0, …])`
+/// Staterror Barlow–Beeston aux. The per-bin scale `gamma_b` is constrained by
+/// the channel-summed relative uncertainty
+/// `delta_b = sqrt(sum_s err_{s,b}^2) / sum_s nom_{s,b}`.
 ///
-/// `delta` is precomputed as a Rust Vec<f64>:
-///   `delta_b = sqrt(sum_s err_{s,b}^2) / sum_s nom_{s,b}`
+/// The constraint TYPE follows ROOT HistFactory's `StatErrorConfig`: **Poisson
+/// by default** (and for `constraint: "Poisson"`), **Gaussian** for
+/// `constraint: "Gauss"`/`"Gaussian"`. (ROOT honours this; its HS3 *reader*
+/// currently forces Poisson, but native HistFactory and the spec allow both.)
 ///
-/// The observation is a PER-BIN vector of `1.0`s (one auxiliary measurement
-/// per bin, matching pyhf's staterror auxdata): the model is a per-bin
-/// `broadcast(Normal, …)`, so a scalar `1.0` would shape-mismatch the vector
-/// leaf.
-pub fn staterror_aux(b: &mut Builder, gamma: NodeId, delta_vals: &[f64]) -> NodeId {
-    let delta_elems: Vec<NodeId> = delta_vals.iter().map(|x| b.lit_real(*x)).collect();
-    let delta = b.array(&delta_elems);
-    let normal_head = b.call_head("Normal");
-    let broadcast_model = b.call("broadcast", &[normal_head, gamma, delta]);
-    let ones: Vec<NodeId> = delta_vals.iter().map(|_| b.lit_real(1.0)).collect();
-    let obs_ones = b.array(&ones);
-    b.call("likelihoodof", &[broadcast_model, obs_ones])
+/// - Poisson: `likelihoodof(broadcast(ContinuedPoisson, broadcast(mul, gamma, tau)), tau)`,
+///   effective count `tau_b = 1/delta_b^2` (= ROOT's `gamma·tau` poisMean, observed at `tau`).
+/// - Gaussian: `likelihoodof(broadcast(Normal, gamma, delta), [1.0, …])`.
+pub fn staterror_aux(
+    b: &mut Builder,
+    gamma: NodeId,
+    sum_nom: &[f64],
+    sum_sq: &[f64],
+    gaussian: bool,
+) -> NodeId {
+    if gaussian {
+        // delta_b = sqrt(sum_sq_b) / sum_nom_b (relative uncertainty).
+        let delta_elems: Vec<NodeId> = sum_nom
+            .iter()
+            .zip(sum_sq.iter())
+            .map(|(n, sq)| b.lit_real(if *n > 0.0 { sq.sqrt() / n } else { 0.0 }))
+            .collect();
+        let delta = b.array(&delta_elems);
+        let normal = b.call_head("Normal");
+        let model = b.call("broadcast", &[normal, gamma, delta]);
+        let ones: Vec<NodeId> = sum_nom.iter().map(|_| b.lit_real(1.0)).collect();
+        let obs = b.array(&ones);
+        return b.call("likelihoodof", &[model, obs]);
+    }
+    // tau_b = sum_nom_b^2 / sum_sq_b = 1/delta_b^2 (effective counts), computed
+    // directly from the sums to match ROOT exactly (e.g. 100^2/25 = 400, not
+    // 399.999… via a sqrt-then-square round trip).
+    let tau_elems: Vec<NodeId> = sum_nom
+        .iter()
+        .zip(sum_sq.iter())
+        .map(|(n, sq)| b.lit_real(if *sq > 0.0 { n * n / sq } else { 0.0 }))
+        .collect();
+    let tau = b.array(&tau_elems);
+    let mul = b.call_head("mul");
+    let prod = b.call("broadcast", &[mul, gamma, tau]);
+    let cp = b.module_call("hepphys", "ContinuedPoisson");
+    let aux_model = b.call("broadcast", &[cp, prod]);
+    b.call("likelihoodof", &[aux_model, tau])
 }
 
 #[cfg(test)]
@@ -437,8 +465,9 @@ mod tests {
         let ch: crate::model::PyhfChannel = serde_json::from_value(json).unwrap();
         assert_eq!(ch.samples.len(), 2);
         assert_eq!(ch.samples[1].modifiers[0].kind, "shapesys");
+        // pyhf form names the parameter via `name`; the effective param resolves it.
         assert_eq!(
-            ch.samples[1].modifiers[0].parameter.as_deref(),
+            ch.samples[1].modifiers[0].effective_param().as_deref(),
             Some("uncorr_bkguncrt")
         );
     }
@@ -487,19 +516,46 @@ mod tests {
     }
 
     #[test]
-    fn staterror_aux_emits_broadcast_normal() {
+    fn staterror_aux_poisson_default() {
+        // ROOT default: Poisson constraint via ContinuedPoisson, effective count
+        // tau = sum_nom^2/sum_sq (exact): 100^2/25 = 400, 100^2/100 = 100.
         let mut m = flatppl_core::Module::new();
         {
             let mut b = Builder::new(&mut m);
             let gamma = b.self_ref("gamma");
-            let aux = staterror_aux(&mut b, gamma, &[0.05, 0.1]);
+            let aux = staterror_aux(&mut b, gamma, &[100.0, 100.0], &[25.0, 100.0], false);
+            b.bind("L_aux", aux);
+        }
+        let text = print_with(&m, Syntax::Minimal);
+        assert!(text.contains("ContinuedPoisson"), "got:\n{text}");
+        assert!(
+            !text.contains("Normal"),
+            "Poisson default must not emit Normal, got:\n{text}"
+        );
+        assert!(
+            text.contains("[400.0, 100.0]"),
+            "exact tau = [400, 100], got:\n{text}"
+        );
+        assert!(!text.contains("fn("), "must be point-free, got:\n{text}");
+    }
+
+    #[test]
+    fn staterror_aux_gaussian_option() {
+        // `constraint: "Gauss"` → Normal(gamma, delta), delta = sqrt(sum_sq)/sum_nom
+        // = [0.05, 0.1], observed at per-bin 1.0.
+        let mut m = flatppl_core::Module::new();
+        {
+            let mut b = Builder::new(&mut m);
+            let gamma = b.self_ref("gamma");
+            let aux = staterror_aux(&mut b, gamma, &[100.0, 100.0], &[25.0, 100.0], true);
             b.bind("L_aux", aux);
         }
         let text = print_with(&m, Syntax::Minimal);
         assert!(text.contains("Normal"), "got:\n{text}");
-        assert!(text.contains("broadcast"), "got:\n{text}");
-        assert!(text.contains("0.05"), "got:\n{text}");
-        assert!(text.contains("0.1"), "got:\n{text}");
+        assert!(
+            text.contains("[0.05, 0.1]"),
+            "delta = [0.05, 0.1], got:\n{text}"
+        );
         assert!(!text.contains("fn("), "must be point-free, got:\n{text}");
     }
 }

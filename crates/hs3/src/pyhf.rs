@@ -189,16 +189,20 @@ pub fn assemble_channel(
     // Value: (sum_nom[b], sum_sq_err[b]) accumulated over staterror samples
     let mut staterror_acc: std::collections::BTreeMap<String, (Vec<f64>, Vec<f64>)> =
         std::collections::BTreeMap::new();
+    // Per-staterror-param constraint type (None ⇒ ROOT default Poisson).
+    let mut staterror_constraint: std::collections::BTreeMap<String, Option<String>> =
+        std::collections::BTreeMap::new();
 
     for (name, nominal, modifiers) in samples {
         for modifier in *modifiers {
             if mod_spec(&modifier.kind).is_some_and(|spec| spec.channel_staterror) {
-                let param_name = modifier.parameter.as_deref().ok_or_else(|| {
+                let param_name = modifier.effective_param().ok_or_else(|| {
                     Error::Unsupported(format!(
                         "channel `{channel_name}`: staterror modifier on sample `{name}` is \
                          missing its `parameter`"
                     ))
                 })?;
+                let param_name: &str = param_name.as_str();
                 // Per-bin errors are required and must match the channel bin count;
                 // a ragged array used to be silently truncated/zero-padded.
                 let arr = modifier
@@ -229,6 +233,9 @@ pub fn assemble_channel(
                     errors.push(e);
                 }
 
+                staterror_constraint
+                    .entry(param_name.to_string())
+                    .or_insert_with(|| modifier.constraint.clone());
                 let entry = staterror_acc
                     .entry(param_name.to_string())
                     .or_insert_with(|| (vec![0.0; n_bins], vec![0.0; n_bins]));
@@ -239,19 +246,6 @@ pub fn assemble_channel(
             }
         }
     }
-
-    // Compute delta arrays: delta_b = sqrt(sum_sq_err_b) / sum_nom_b
-    let staterror_delta: std::collections::BTreeMap<String, Vec<f64>> = staterror_acc
-        .iter()
-        .map(|(name, (sum_nom, sum_sq))| {
-            let delta: Vec<f64> = sum_nom
-                .iter()
-                .zip(sum_sq.iter())
-                .map(|(nom, sq)| if *nom > 0.0 { sq.sqrt() / nom } else { 0.0 })
-                .collect();
-            (name.clone(), delta)
-        })
-        .collect();
 
     // ---- Pass 2: declare free params (idempotent by name) ----
     let mut declared: HashSet<String> = HashSet::new();
@@ -278,9 +272,20 @@ pub fn assemble_channel(
     }
 
     // ---- Pass 4: emit staterror per-bin aux terms ----
-    for (param_name, delta_vals) in &staterror_delta {
+    // Channel-summed Barlow–Beeston: per bin `sum_nom` (Σ sample nominals) and
+    // `sum_sq` (Σ squared errors). staterror_aux derives δ (Gaussian) or
+    // τ = sum_nom²/sum_sq (Poisson) from these directly — exact, no √-then-square
+    // round-trip.
+    for (param_name, (sum_nom, sum_sq)) in &staterror_acc {
         let gamma = b.self_ref(param_name);
-        let aux = staterror_aux(b, gamma, delta_vals);
+        // ROOT default is Poisson; `constraint: "Gauss"`/`"Gaussian"` selects Normal.
+        let gaussian = matches!(
+            staterror_constraint
+                .get(param_name)
+                .and_then(|c| c.as_deref()),
+            Some("Gauss") | Some("Gaussian")
+        );
+        let aux = staterror_aux(b, gamma, sum_nom, sum_sq, gaussian);
         aux_terms.push(aux);
     }
 
@@ -389,6 +394,7 @@ fn declare_modifier_param(
     // `modifier_effect` about which kinds are supported or need a parameter.
     let spec = require_spec(modifier)?;
     let param = require_param(modifier, spec)?;
+    let param: &str = param.as_str();
 
     if !declared.contains(param) {
         let set = param_domain_set(b, spec.param_domain, n_bins);
@@ -448,6 +454,7 @@ mod tests {
                         modifiers: vec![Modifier {
                             kind: "normfactor".into(),
                             parameter: Some("mu".into()),
+                            name: None,
                             parameters: vec![],
                             data: None,
                             constraint: None,
@@ -460,6 +467,7 @@ mod tests {
                         modifiers: vec![Modifier {
                             kind: "shapesys".into(),
                             parameter: Some("uncorr_bkguncrt".into()),
+                            name: None,
                             parameters: vec![],
                             data: Some(serde_json::json!([3.0, 7.0])),
                             constraint: None,
@@ -521,6 +529,7 @@ mod tests {
                     modifiers: vec![Modifier {
                         kind: "normsys".into(),
                         parameter: Some("alpha1".into()),
+                        name: None,
                         parameters: vec![],
                         data: Some(serde_json::json!({"hi": 1.1, "lo": 0.9})),
                         constraint: None,
@@ -558,6 +567,7 @@ mod tests {
                     modifiers: vec![Modifier {
                         kind: "lumi".into(),
                         parameter: Some("lumi".into()),
+                        name: None,
                         parameters: vec![],
                         data: None,
                         constraint: None,
@@ -591,6 +601,7 @@ mod tests {
                     modifiers: vec![Modifier {
                         kind: "lumi".into(),
                         parameter: Some("lumi".into()),
+                        name: None,
                         parameters: vec![],
                         data: None,
                         constraint: None,

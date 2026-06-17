@@ -65,16 +65,13 @@ fn multichan_old_converts() {
     // point-free: no lambda/fn
     assert!(!text.contains("fn("), "must be point-free, got:\n{text}");
 
-    // staterror aux term: a Gaussian constraint on the per-bin staterror scales
-    // with relative deltas [0.05, 0.1] (bin0 = sqrt(5^2)/100, bin1 = sqrt(10^2)/100).
-    // Pin the exact bracketed array — a bare contains("0.1") would false-pass on
-    // the lumi constraint's `sigma = 0.1`, and a swapped delta vector would slip
-    // through.
+    // staterror aux: ROOT-default Poisson (Barlow–Beeston) constraint on the
+    // per-bin staterror scales, emitted as a ContinuedPoisson on
+    // staterror_channel1. Numerical conformance vs ROOT/pyhf lives in the
+    // flatppl-js cross-engine suite.
     assert!(
-        text.contains(
-            "likelihoodof(broadcast(Normal, staterror_channel1, [0.05, 0.1]), [1.0, 1.0])"
-        ),
-        "staterror aux mismatch (expected deltas [0.05, 0.1]), got:\n{text}"
+        text.contains("hepphys.ContinuedPoisson") && text.contains("staterror_channel1"),
+        "expected a ContinuedPoisson staterror constraint on staterror_channel1, got:\n{text}"
     );
 
     // `call(hepphys...)` must never appear — that used a non-existent builtin

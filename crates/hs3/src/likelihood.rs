@@ -27,6 +27,7 @@ pub fn emit_likelihood(
     b: &mut Builder,
     lk: &Likelihood,
     data_map: &BTreeMap<String, Vec<f64>>,
+    labels_by_dist: &BTreeMap<String, Vec<String>>,
 ) -> Result<()> {
     if lk.distributions.is_empty() {
         return Ok(());
@@ -42,10 +43,26 @@ pub fn emit_likelihood(
                         lk.name
                     ))
                 })?;
-                // Bind the datum as a named vector, then self-ref it.
-                let elems: Vec<NodeId> = vals.iter().map(|&v| b.lit_real(v)).collect();
-                let vec_node = b.array(&elems);
-                b.bind(name, vec_node);
+                // The distribution is `relabel(<dist>, [labels])` — a record-shaped
+                // measure. A single observation over named axes is observed as a
+                // matching `record(label = value, …)`; otherwise (no labels, or an
+                // iid/multi-point vector) fall back to a bare vector.
+                let labels = labels_by_dist
+                    .get(dist.as_str())
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                let obs_node = if !labels.is_empty() && labels.len() == vals.len() {
+                    let fields: Vec<(&str, NodeId)> = labels
+                        .iter()
+                        .zip(vals.iter())
+                        .map(|(lbl, &v)| (lbl.as_str(), b.lit_real(v)))
+                        .collect();
+                    b.call_kw("record", &fields)
+                } else {
+                    let elems: Vec<NodeId> = vals.iter().map(|&v| b.lit_real(v)).collect();
+                    b.array(&elems)
+                };
+                b.bind(name, obs_node);
                 b.self_ref(name)
             }
             Some(serde_json::Value::Number(n)) => b.lit_real(n.as_f64().unwrap_or(0.0)),
@@ -94,7 +111,8 @@ mod tests {
         map.insert("aux_obs".to_string(), vec![4.0]);
         {
             let mut b = Builder::new(&mut m);
-            emit_likelihood(&mut b, &lk, &map).expect("unbinned data refs resolve");
+            emit_likelihood(&mut b, &lk, &map, &BTreeMap::new())
+                .expect("unbinned data refs resolve");
         }
         let text = print_with(&m, Syntax::Minimal);
         assert!(text.contains("joint_likelihood("), "got:\n{text}");
@@ -118,7 +136,7 @@ mod tests {
         map.insert("d".to_string(), vec![1.0, 2.0, 3.0]);
         {
             let mut b = Builder::new(&mut m);
-            emit_likelihood(&mut b, &lk, &map).expect("data_map ref inlines");
+            emit_likelihood(&mut b, &lk, &map, &BTreeMap::new()).expect("data_map ref inlines");
         }
         let text = print_with(&m, Syntax::Minimal);
         assert!(text.contains("likelihoodof("), "got:\n{text}");
@@ -145,7 +163,7 @@ mod tests {
         };
         let empty_map = BTreeMap::new();
         let mut b = Builder::new(&mut m);
-        let result = emit_likelihood(&mut b, &lk, &empty_map);
+        let result = emit_likelihood(&mut b, &lk, &empty_map, &BTreeMap::new());
         assert!(
             matches!(result, Err(Error::Unsupported(_))),
             "got: {result:?}"
@@ -179,7 +197,7 @@ mod tests {
         };
         let empty_map = BTreeMap::new();
         let mut b = Builder::new(&mut m);
-        let result = emit_likelihood(&mut b, &lk, &empty_map);
+        let result = emit_likelihood(&mut b, &lk, &empty_map, &BTreeMap::new());
         assert!(
             matches!(result, Err(Error::Unsupported(_))),
             "got: {result:?}"

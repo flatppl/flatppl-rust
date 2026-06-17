@@ -309,13 +309,13 @@ fn golden_paper_histfactory_staterror_deltas() {
         !text.contains("call(hepphys"),
         "must not emit invalid call(hepphys...) builtin, got:\n{text}"
     );
-    // staterror aux term: a Gaussian constraint on the per-bin mcstat scale
-    // factors, with relative deltas [0.05, 0.1] (bin0 = 5/100, bin1 = 10/100),
-    // observed at the nominal 1.0. Pin the exact bracketed form so a swapped or
-    // reordered delta array fails (bare contains("0.05") would not).
+    // staterror aux: the per-bin mcstat scales carry a Poisson (Barlow–Beeston)
+    // constraint — ROOT's default — emitted as a ContinuedPoisson on mcstat.
+    // Structural check only; exact numerical conformance vs ROOT/pyhf lives in
+    // the flatppl-js cross-engine suite.
     assert!(
-        text.contains("likelihoodof(broadcast(Normal, mcstat, [0.05, 0.1]), [1.0, 1.0])"),
-        "staterror aux term mismatch (expected deltas [0.05, 0.1]), got:\n{text}"
+        text.contains("hepphys.ContinuedPoisson") && text.contains("mcstat"),
+        "expected a ContinuedPoisson staterror constraint on mcstat, got:\n{text}"
     );
     // Observed bin contents [122.0, 112.0], in order, fed to the main Poisson
     // term. Pin the full likelihoodof so a reordered observation array fails.

@@ -110,20 +110,6 @@ fn multiaxis_bincounts_errs() {
 // histfactory modifier negatives (driven through the pyhf channel assembler).
 // ---------------------------------------------------------------------------
 
-/// staterror with a Poisson constraint is not yet supported (only Gaussian BB-lite).
-#[test]
-fn staterror_poisson_constraint_errs() {
-    assert_err_pyhf(
-        "staterror_poisson",
-        r#"{"channels":[{"name":"c","samples":[
-            {"name":"sig","data":[10.0,12.0],"modifiers":[
-              {"name":"se","type":"staterror","constraint":"Poisson","data":[1.0,1.0]}]}]}],
-            "observations":[{"name":"c","data":[10.0,12.0]}],
-            "measurements":[{"name":"m","config":{"poi":""}}]}"#,
-        "Poisson constraint",
-    );
-}
-
 /// A modifier missing its `parameter`/`name` field → Err (would emit a dangling ref).
 #[test]
 fn modifier_missing_parameter_errs() {

@@ -466,8 +466,25 @@ fn emit_histfactory_channels(m: &mut Module, doc: &Document) -> Result<()> {
                     .iter()
                     .map(|mo| {
                         let mut mo = mo.clone();
-                        if mo.kind == "staterror" && mo.data.is_none() {
-                            mo.data = Some(serde_json::json!(errors));
+                        if mo.kind == "staterror" {
+                            // Normalize the per-bin uncertainty array the channel
+                            // assembler reads from `modifier.data` to a bare array,
+                            // accepting any source: a bare array (pyhf), a
+                            // `{"uncertainties": [...]}` object (modern HS3 / pyhs3),
+                            // or the sample's `data.errors` (spec form, no modifier
+                            // data).
+                            let arr: Option<Vec<f64>> = match &mo.data {
+                                Some(v) if v.is_array() => None,
+                                Some(v) => {
+                                    v.get("uncertainties").and_then(|u| u.as_array()).map(|a| {
+                                        a.iter().filter_map(serde_json::Value::as_f64).collect()
+                                    })
+                                }
+                                None => Some(errors.clone()),
+                            };
+                            if let Some(a) = arr {
+                                mo.data = Some(serde_json::json!(a));
+                            }
                         }
                         mo
                     })
@@ -534,6 +551,19 @@ fn emit_likelihoods(
         }
         data_map.insert(d.name.clone(), vals);
     }
+    // Per-distribution variate (axis) names. A distribution is lowered as
+    // `relabel(<dist>, [names])`, i.e. a record-shaped measure keyed by those
+    // names, so its observation must be a matching record (see emit_likelihood).
+    let labels_by_dist: BTreeMap<String, Vec<String>> = doc
+        .distributions
+        .iter()
+        .filter(|d| d.kind != "histfactory_dist")
+        .filter_map(|d| match variate_name(d) {
+            Some(VariateName::Single(v)) => Some((d.name.clone(), vec![v])),
+            Some(VariateName::Multiple(ns)) => Some((d.name.clone(), ns)),
+            None => None,
+        })
+        .collect();
     let mut b = Builder::new(m);
     for lk in &doc.likelihoods {
         // Skip likelihoods whose distributions are all native histfactory_dist;
@@ -546,7 +576,7 @@ fn emit_likelihoods(
         {
             continue;
         }
-        crate::likelihood::emit_likelihood(&mut b, lk, &data_map)?;
+        crate::likelihood::emit_likelihood(&mut b, lk, &data_map, &labels_by_dist)?;
     }
     Ok(())
 }

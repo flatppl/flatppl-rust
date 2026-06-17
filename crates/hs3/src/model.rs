@@ -176,18 +176,75 @@ pub struct Sample {
 pub struct Modifier {
     #[serde(rename = "type")]
     pub kind: String,
-    #[serde(default, alias = "name")]
+    /// The controlling parameter (modern HS3 single-parameter modifiers:
+    /// normfactor/normsys/histosys). Kept SEPARATE from `name` — modern HS3
+    /// carries BOTH (`name` = modifier instance, `parameter` = nuisance), and
+    /// aliasing them would reject such documents as a duplicate field.
+    #[serde(default)]
     pub parameter: Option<String>,
+    /// Modifier instance name. The pyhf / paper-appendix form names the
+    /// controlling parameter HERE (no separate `parameter`); see
+    /// [`Modifier::effective_param`].
+    #[serde(default)]
+    pub name: Option<String>,
     #[serde(default)]
     pub data: Option<serde_json::Value>,
-    // Multi-parameter modifier names (currently parsed but not used in logic)
-    #[allow(dead_code)]
+    /// Per-bin parameter names of a multi-bin modifier (modern HS3
+    /// staterror/shapefactor). Collapsed to a single vector-binding name by
+    /// [`Modifier::effective_param`].
     #[serde(default)]
     pub parameters: Vec<String>,
+    /// Constraint type (`Gauss`/`Gaussian`/`Poisson`/…). Consulted for
+    /// staterror (ROOT default Poisson; `Gauss` ⇒ Normal); normsys/histosys
+    /// constraints are fixed by their interpolation.
     #[serde(default)]
     pub constraint: Option<String>,
     #[serde(default)]
     pub interpolation: Option<String>,
+}
+
+impl Modifier {
+    /// The single FlatPPL binding name this modifier's free parameter(s) map
+    /// to, resolved across the HS3 dialects: an explicit `parameter` (modern),
+    /// else `name` (pyhf / paper appendix), else the collapsed `parameters`
+    /// array (modern multi-bin staterror/shapefactor). `None` only when a
+    /// modifier carries no parameter identity at all.
+    pub fn effective_param(&self) -> Option<String> {
+        if let Some(p) = &self.parameter {
+            return Some(p.clone());
+        }
+        if let Some(n) = &self.name {
+            return Some(n.clone());
+        }
+        if !self.parameters.is_empty() {
+            return Some(derive_vector_param_name(&self.parameters));
+        }
+        None
+    }
+}
+
+/// Collapse a modern-HS3 per-bin `parameters` array (e.g.
+/// `["gamma_stat_0", "gamma_stat_1"]`) to a single FlatPPL vector-binding
+/// name: the longest common prefix with trailing separators/digits trimmed
+/// (`gamma_stat_0`/`gamma_stat_1` → `gamma_stat`), falling back to the first
+/// entry. Identical arrays yield the same name, preserving correlation.
+pub fn derive_vector_param_name(parameters: &[String]) -> String {
+    let first = &parameters[0];
+    let mut prefix_len = first.len();
+    for p in &parameters[1..] {
+        let common = first
+            .bytes()
+            .zip(p.bytes())
+            .take_while(|(a, b)| a == b)
+            .count();
+        prefix_len = prefix_len.min(common);
+    }
+    let trimmed = first[..prefix_len].trim_end_matches(|c: char| c == '_' || c.is_ascii_digit());
+    if trimmed.is_empty() {
+        first.clone()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 // ---- pyhf top-level document ----
