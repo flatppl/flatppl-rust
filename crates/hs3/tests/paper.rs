@@ -128,8 +128,10 @@ fn paper_product_converts() {
         ),
         "toy-data vector mismatch, got:\n{text}"
     );
+    // 10 unbinned entries over one observable = N iid observations: the model is
+    // plated `iid(prod, 10)`, observed against the bare toy vector.
     assert!(
-        text.contains("likelihood = likelihoodof(prod, toy)"),
+        text.contains("likelihood = likelihoodof(iid(prod, 10), toy)"),
         "toy-data likelihood wiring mismatch, got:\n{text}"
     );
 

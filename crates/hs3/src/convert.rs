@@ -338,6 +338,30 @@ fn emit_distributions(m: &mut Module, doc: &Document) -> Result<()> {
             .iter()
             .map(|d| (d.name.as_str(), d))
             .collect();
+        // Factors of a shared-variate product_dist are emitted as SCALAR measures
+        // (no `relabel`): the pointwise density product is over the scalar
+        // observable, and the §12 lowering scores it as `iid(prod, N)` over a bare
+        // observation vector — a record-keyed (relabelled) factor cannot be
+        // consumed by `iid` (which threads a flat value). The shared variate's
+        // identity is still carried by the product's own classification.
+        let shared_product_factors: std::collections::BTreeSet<&str> = doc
+            .distributions
+            .iter()
+            .filter(|d| d.kind == "product_dist")
+            .flat_map(|d| {
+                let factors = product_factors(d);
+                let fv: Vec<Option<VariateName>> = factors
+                    .iter()
+                    .map(|f| dist_by_name.get(f.as_str()).and_then(|fd| variate_name(fd)))
+                    .collect();
+                if product_shared_variate(&fv) {
+                    factors
+                } else {
+                    Vec::new()
+                }
+            })
+            .filter_map(|f| dist_by_name.get_key_value(f.as_str()).map(|(k, _)| *k))
+            .collect();
         for d in &doc.distributions {
             if d.kind == "histfactory_dist" {
                 continue;
@@ -389,18 +413,23 @@ fn emit_distributions(m: &mut Module, doc: &Document) -> Result<()> {
                 _ => None,
             };
             let dist = emit_distribution(&mut b, d, domain)?;
-            let bound = match variate_name(d) {
-                Some(VariateName::Single(v)) => {
-                    let label = b.str_lit(&v);
-                    let labels = b.array(&[label]);
-                    b.call("relabel", &[dist, labels])
+            // A shared-variate product factor stays scalar (see above).
+            let bound = if shared_product_factors.contains(d.name.as_str()) {
+                dist
+            } else {
+                match variate_name(d) {
+                    Some(VariateName::Single(v)) => {
+                        let label = b.str_lit(&v);
+                        let labels = b.array(&[label]);
+                        b.call("relabel", &[dist, labels])
+                    }
+                    Some(VariateName::Multiple(names)) => {
+                        let label_nodes: Vec<_> = names.iter().map(|n| b.str_lit(n)).collect();
+                        let labels = b.array(&label_nodes);
+                        b.call("relabel", &[dist, labels])
+                    }
+                    None => dist,
                 }
-                Some(VariateName::Multiple(names)) => {
-                    let label_nodes: Vec<_> = names.iter().map(|n| b.str_lit(n)).collect();
-                    let labels = b.array(&label_nodes);
-                    b.call("relabel", &[dist, labels])
-                }
-                None => dist,
             };
             if let Some(line) = dist_spec::doc_line(&d.kind) {
                 b.bind_doc(&d.name, bound, &[line]);

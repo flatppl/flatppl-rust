@@ -371,8 +371,10 @@ fn golden_paper_product_density_product() {
         ),
         "toy-data vector mismatch, got:\n{text}"
     );
+    // 10 unbinned entries over the single observable are N iid observations:
+    // the model is plated `iid(prod, 10)` and observed against the bare vector.
     assert!(
-        text.contains("likelihood = likelihoodof(prod, toy)"),
+        text.contains("likelihood = likelihoodof(iid(prod, 10), toy)"),
         "toy-data likelihood wiring mismatch, got:\n{text}"
     );
     assert!(parse(&text).is_ok(), "round-trip parse failed:\n{text}");

@@ -34,7 +34,11 @@ pub fn emit_likelihood(
     }
     let mut terms: Vec<NodeId> = Vec::new();
     for (i, dist) in lk.distributions.iter().enumerate() {
-        let model = b.self_ref(dist);
+        let model0 = b.self_ref(dist);
+        // Set when the observation is a multi-entry unbinned vector over a single
+        // axis: the data are N iid draws, so the model is plated `iid(M, N)` and
+        // observed against the bare value vector (06-measure-algebra.md).
+        let mut iid_n: Option<usize> = None;
         let obs = match lk.data.get(i) {
             Some(serde_json::Value::String(name)) => {
                 let vals = data_map.get(name.as_str()).ok_or_else(|| {
@@ -59,6 +63,11 @@ pub fn emit_likelihood(
                         .collect();
                     b.call_kw("record", &fields)
                 } else {
+                    // A bare vector over a single observable (≤ 1 axis) with more
+                    // than one entry is N iid observations — plate the model.
+                    if vals.len() > 1 && labels.len() <= 1 {
+                        iid_n = Some(vals.len());
+                    }
                     let elems: Vec<NodeId> = vals.iter().map(|&v| b.lit_real(v)).collect();
                     b.array(&elems)
                 };
@@ -72,6 +81,13 @@ pub fn emit_likelihood(
                     lk.name
                 )));
             }
+        };
+        let model = match iid_n {
+            Some(n) => {
+                let n_lit = b.lit_int(n as i64);
+                b.call("iid", &[model0, n_lit])
+            }
+            None => model0,
         };
         terms.push(b.call("likelihoodof", &[model, obs]));
     }
