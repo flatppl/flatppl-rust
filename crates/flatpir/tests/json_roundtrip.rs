@@ -58,6 +58,29 @@ json_tests! {
     json_reified => "reified.flatpir",
 }
 
+/// Every `.flatpir` file in the corpus round-trips through the JSON encoding —
+/// a glob guard so any fixture added later is covered without editing the
+/// `json_tests!` list above.
+#[test]
+fn every_corpus_fixture_roundtrips() {
+    let dir: PathBuf = [env!("CARGO_MANIFEST_DIR"), "../../fixtures/flatpir"]
+        .iter()
+        .collect();
+    let mut count = 0;
+    for entry in fs::read_dir(&dir).expect("read fixtures/flatpir") {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|e| e.to_str()) == Some("flatpir") {
+            let name = path.file_name().unwrap().to_str().unwrap();
+            assert_json_roundtrip(name);
+            count += 1;
+        }
+    }
+    assert!(
+        count >= 9,
+        "expected at least the 9 corpus fixtures, found {count}"
+    );
+}
+
 /// Targeted shape checks: confirm the encoding is genuine Option-C, not merely
 /// an internally-consistent round-trip.
 #[test]
