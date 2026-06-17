@@ -202,10 +202,20 @@ pub struct Modifier {
     /// [`Modifier::effective_param`].
     #[serde(default)]
     pub parameters: Vec<String>,
-    /// Constraint type (`Gauss`/`Gaussian`/`Poisson`/…). Consulted for
-    /// staterror (ROOT default Poisson; `Gauss` ⇒ Normal); normsys/histosys
-    /// constraints are fixed by their interpolation.
-    #[serde(default)]
+    /// Constraint *type* string (`Gauss`/`Gaussian`/`Poisson`/…). Consulted for
+    /// staterror (ROOT default Poisson; `Gauss`/`Gaussian` ⇒ Normal);
+    /// normsys/histosys constraints are fixed by their interpolation.
+    ///
+    /// `constraint_type` is the modern-HS3 / ROOT spelling of this same type
+    /// string — ROOT's HS3 writer emits `constraint_type`, while the pyhf / paper
+    /// dialect emits `constraint` — so we accept both via the alias. (Without this
+    /// a ROOT-exported Gaussian-constrained staterror was silently mislowered to
+    /// the Poisson default.) ROOT's *other* form, `constraint_name` — a reference
+    /// to a named constraint pdf, used for custom constraints — is NOT resolved
+    /// here: such a modifier falls back to the default (Poisson). Resolving named
+    /// constraints needs a distributions-block lookup; deferred until a real file
+    /// needs it.
+    #[serde(default, alias = "constraint_type")]
     pub constraint: Option<String>,
     #[serde(default)]
     pub interpolation: Option<String>,
@@ -362,6 +372,25 @@ mod tests {
         assert_eq!(pp.entries.len(), 2);
         assert_eq!(pp.entries[0].name, "mu_param");
         assert_eq!(pp.entries[0].value, 5.28);
+    }
+
+    #[test]
+    fn modifier_accepts_root_constraint_type_alias() {
+        // ROOT's native-HS3 writer emits the constraint *type* string under
+        // `constraint_type`; the pyhf / paper dialect uses `constraint`. Both must
+        // land in the same field, else a Gaussian-constrained staterror is
+        // silently mislowered to the Poisson default.
+        let root: Modifier = serde_json::from_str(
+            r#"{"type":"staterror","parameter":"gamma","constraint_type":"Gaussian"}"#,
+        )
+        .unwrap();
+        assert_eq!(root.constraint.as_deref(), Some("Gaussian"));
+
+        let pyhf: Modifier = serde_json::from_str(
+            r#"{"type":"staterror","parameter":"gamma","constraint":"Poisson"}"#,
+        )
+        .unwrap();
+        assert_eq!(pyhf.constraint.as_deref(), Some("Poisson"));
     }
 
     #[test]
