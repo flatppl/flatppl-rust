@@ -329,8 +329,10 @@ pub fn goto_definition(
 ///
 /// For each qualifying binding a single `InlayHint` is emitted at the end of
 /// the RHS span (i.e. after the last character of the expression). The label
-/// is `: <type>` formatted via the `Debug` representation of the inferred
-/// type. Bindings with no RHS span or no inferred type are silently skipped.
+/// is `: <type>` formatted via [`flatppl_core::Module::display_type`], the
+/// same readable code-like notation used by hover (e.g. `integer`, `real`,
+/// `measure<real> · normalized`). Bindings with no RHS span or no inferred
+/// type are silently skipped.
 pub fn inlay_hints(
     db: &Database,
     file: SourceFile,
@@ -363,7 +365,7 @@ pub fn inlay_hints(
         let pos = li.position(span.end);
         hints.push(lsp_types::InlayHint {
             position: lsp_types::Position::new(pos.line, pos.character),
-            label: lsp_types::InlayHintLabel::String(format!(": {ty:?}")),
+            label: lsp_types::InlayHintLabel::String(format!(": {}", module.display_type(ty))),
             kind: Some(lsp_types::InlayHintKind::TYPE),
             text_edits: None,
             tooltip: None,
@@ -839,15 +841,27 @@ mod tests {
     fn inlay_hints_label_binding_types() {
         let db = Database::default();
         let cats = Catalogues::new(&db, vec![]);
+        // `add(1, 2)` infers to integer; the hint must use display_type notation.
         let src = "x = add(1, 2)";
         let f = SourceFile::new(&db, "m.flatppl".to_string(), src.to_string());
         let fs = FileSet::new(&db, vec![f]);
         let hints = inlay_hints(&db, f, fs, cats, 0, src.len() as u32);
+        let labels: Vec<String> = hints
+            .iter()
+            .filter_map(|h| match &h.label {
+                lsp_types::InlayHintLabel::String(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
         assert!(
-            hints
+            labels.iter().any(|l| l == ": integer"),
+            "inlay label must be the readable `: integer`; got: {labels:?}"
+        );
+        assert!(
+            !labels
                 .iter()
-                .any(|h| matches!(&h.label, lsp_types::InlayHintLabel::String(s)
-            if s.to_lowercase().contains("scalar") || s.contains("Integer") || s.contains("Real")))
+                .any(|l| l.contains("Scalar(") || l.contains("Symbol(")),
+            "inlay labels must not contain Debug struct syntax; got: {labels:?}"
         );
     }
 
