@@ -32,6 +32,17 @@ use flatppl_core::{Module, NodeId};
 pub use catalogue::{Catalogue, parse_catalogue};
 pub use modules::ModuleBundle;
 
+/// Return the process-global built-in catalogue (parsed once from the bundled
+/// `catalogue.ron`).
+///
+/// Exposes the same singleton as the crate-internal `catalogue::builtin()` but
+/// makes it accessible to crates that drive the LSP — e.g. `flatppl-lsp` uses
+/// this to enumerate base distribution/function names and standard-module
+/// binding names for completion suggestions without duplicating the catalogue.
+pub fn builtin_catalogue() -> &'static Catalogue {
+    catalogue::builtin()
+}
+
 /// A message produced during inference. `Error` marks an ill-formed module
 /// (the offending nodes carry `(%failed …)` types); `Note` records an
 /// honest gap (op not yet in the catalogue, deferred feature).

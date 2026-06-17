@@ -189,6 +189,19 @@ impl Catalogue {
             .find(|m| m.name == module)
             .map(|m| m.version.as_str())
     }
+
+    /// All base (§07/§08) builtin names.
+    pub fn base_names(&self) -> impl Iterator<Item = &str> {
+        self.base.iter().map(|b| b.name.as_str())
+    }
+
+    /// The public binding names of a standard module, if present.
+    pub fn module_binding_names(&self, module: &str) -> Option<impl Iterator<Item = &str>> {
+        self.modules
+            .iter()
+            .find(|m| m.name == module)
+            .map(|m| m.bindings.iter().map(|b| b.name.as_str()))
+    }
 }
 
 /// A merged view of the built-in catalogue plus zero or more host-supplied
@@ -660,5 +673,17 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn enumerates_base_and_module_binding_names() {
+        let cat = builtin();
+        assert!(cat.base_names().any(|n| n == "Normal"));
+        let pp: Vec<&str> = cat
+            .module_binding_names("particle-physics")
+            .unwrap()
+            .collect();
+        assert!(pp.contains(&"CrystalBall"));
+        assert!(cat.module_binding_names("no-such-module").is_none());
     }
 }

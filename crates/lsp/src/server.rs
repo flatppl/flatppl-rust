@@ -12,12 +12,15 @@ use std::str::FromStr;
 
 use lsp_server::{Connection, Message, Response};
 use lsp_types::{
-    HoverProviderCapability, PublishDiagnosticsParams, ServerCapabilities,
-    TextDocumentSyncCapability, TextDocumentSyncKind, Uri,
+    CompletionOptions, HoverProviderCapability, OneOf, PublishDiagnosticsParams,
+    ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind, Uri,
     notification::{
         DidChangeTextDocument, DidOpenTextDocument, Notification as _, PublishDiagnostics,
     },
-    request::{HoverRequest, Request as _},
+    request::{
+        Completion, DocumentSymbolRequest, GotoDefinition, HoverRequest, InlayHintRequest,
+        Request as _, WorkspaceSymbolRequest,
+    },
 };
 
 use crate::db::{Catalogues, Database, FileSet, SourceFile};
@@ -167,6 +170,26 @@ pub fn run(
                         let hover_resp = handle_hover(&db, &uri_to_file, fs, cats, &req);
                         connection.sender.send(Message::Response(hover_resp))?;
                     }
+                    DocumentSymbolRequest::METHOD => {
+                        let sym_resp = handle_document_symbols(&db, &uri_to_file, fs, cats, &req);
+                        connection.sender.send(Message::Response(sym_resp))?;
+                    }
+                    WorkspaceSymbolRequest::METHOD => {
+                        let sym_resp = handle_workspace_symbols(&db, fs, cats, &req);
+                        connection.sender.send(Message::Response(sym_resp))?;
+                    }
+                    InlayHintRequest::METHOD => {
+                        let hints_resp = handle_inlay_hints(&db, &uri_to_file, fs, cats, &req);
+                        connection.sender.send(Message::Response(hints_resp))?;
+                    }
+                    GotoDefinition::METHOD => {
+                        let def_resp = handle_goto_definition(&db, &uri_to_file, fs, cats, &req);
+                        connection.sender.send(Message::Response(def_resp))?;
+                    }
+                    Completion::METHOD => {
+                        let comp_resp = handle_completion(&db, &uri_to_file, fs, cats, &req);
+                        connection.sender.send(Message::Response(comp_resp))?;
+                    }
                     _ => {
                         // Unknown request: reply with MethodNotFound.
                         let resp = Response::new_err(
@@ -192,6 +215,14 @@ pub fn server_capabilities() -> ServerCapabilities {
     ServerCapabilities {
         hover_provider: Some(HoverProviderCapability::Simple(true)),
         text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
+        document_symbol_provider: Some(OneOf::Left(true)),
+        workspace_symbol_provider: Some(OneOf::Left(true)),
+        inlay_hint_provider: Some(OneOf::Left(true)),
+        definition_provider: Some(OneOf::Left(true)),
+        completion_provider: Some(CompletionOptions {
+            trigger_characters: Some(vec![".".to_string()]),
+            ..Default::default()
+        }),
         ..Default::default()
     }
 }
@@ -365,11 +396,272 @@ fn handle_hover(
     }
 }
 
+/// Handle a `textDocument/documentSymbol` request.  Returns a `Response`
+/// (result or null) without sending it — the caller dispatches the message.
+fn handle_document_symbols(
+    db: &Database,
+    uri_to_file: &HashMap<String, SourceFile>,
+    fs: FileSet,
+    cats: Catalogues,
+    req: &lsp_server::Request,
+) -> Response {
+    let syms: Vec<lsp_types::DocumentSymbol> = (|| {
+        let params: lsp_types::DocumentSymbolParams =
+            serde_json::from_value(req.params.clone()).ok()?;
+        let uri_str = params.text_document.uri.as_str().to_owned();
+        let file = *uri_to_file.get(&uri_str)?;
+        Some(crate::capabilities::document_symbols(db, file, fs, cats))
+    })()
+    .unwrap_or_default();
+
+    let response = lsp_types::DocumentSymbolResponse::Nested(syms);
+    Response::new_ok(req.id.clone(), response)
+}
+
+/// Handle a `workspace/symbol` request.  Returns a `Response` (result or
+/// null) without sending it — the caller dispatches the message.
+fn handle_workspace_symbols(
+    db: &Database,
+    fs: FileSet,
+    cats: Catalogues,
+    req: &lsp_server::Request,
+) -> Response {
+    let query = (|| -> Option<String> {
+        let params: lsp_types::WorkspaceSymbolParams =
+            serde_json::from_value(req.params.clone()).ok()?;
+        Some(params.query)
+    })()
+    .unwrap_or_default();
+
+    let syms = crate::capabilities::workspace_symbols(db, fs, cats, &query);
+    let response = lsp_types::WorkspaceSymbolResponse::Flat(syms);
+    Response::new_ok(req.id.clone(), response)
+}
+
+/// Handle a `textDocument/inlayHint` request.  Returns a `Response`
+/// (result or null) without sending it — the caller dispatches the message.
+fn handle_inlay_hints(
+    db: &Database,
+    uri_to_file: &HashMap<String, SourceFile>,
+    fs: FileSet,
+    cats: Catalogues,
+    req: &lsp_server::Request,
+) -> Response {
+    let hints: Vec<lsp_types::InlayHint> = (|| {
+        let params: lsp_types::InlayHintParams = serde_json::from_value(req.params.clone()).ok()?;
+        let uri_str = params.text_document.uri.as_str().to_owned();
+        let file = *uri_to_file.get(&uri_str)?;
+        let text = file.text(db);
+        let li = LineIndex::new(text);
+        let start_byte = li.offset(Pos {
+            line: params.range.start.line,
+            character: params.range.start.character,
+        });
+        let end_byte = li.offset(Pos {
+            line: params.range.end.line,
+            character: params.range.end.character,
+        });
+        Some(crate::capabilities::inlay_hints(
+            db, file, fs, cats, start_byte, end_byte,
+        ))
+    })()
+    .unwrap_or_default();
+
+    Response::new_ok(req.id.clone(), hints)
+}
+
+/// Handle a `textDocument/definition` request.  Returns a `Response`
+/// (scalar `Location` or null) without sending it — the caller dispatches.
+fn handle_goto_definition(
+    db: &Database,
+    uri_to_file: &HashMap<String, SourceFile>,
+    fs: FileSet,
+    cats: Catalogues,
+    req: &lsp_server::Request,
+) -> Response {
+    let result = (|| -> Option<lsp_types::GotoDefinitionResponse> {
+        let params: lsp_types::GotoDefinitionParams =
+            serde_json::from_value(req.params.clone()).ok()?;
+        let uri_str = params
+            .text_document_position_params
+            .text_document
+            .uri
+            .as_str()
+            .to_owned();
+        let lsp_pos = params.text_document_position_params.position;
+        let file = *uri_to_file.get(&uri_str)?;
+        let text = file.text(db);
+        let li = LineIndex::new(text);
+        let byte_offset = li.offset(Pos {
+            line: lsp_pos.line,
+            character: lsp_pos.character,
+        });
+        let def_loc = crate::capabilities::goto_definition(db, file, fs, cats, byte_offset)?;
+        // Build the target URI from the DefLoc path.
+        let target_uri_str = if def_loc.path.starts_with("file://") {
+            def_loc.path.clone()
+        } else {
+            format!("file://{}", def_loc.path)
+        };
+        let target_uri = Uri::from_str(&target_uri_str).ok()?;
+        // Build the target range: need the text of the target file to do
+        // byte→position conversion.
+        let target_text = fs
+            .files(db)
+            .iter()
+            .copied()
+            .find(|f| f.path(db) == def_loc.path)
+            .map(|f| f.text(db).to_string())
+            .unwrap_or_default();
+        let target_li = LineIndex::new(&target_text);
+        let start = target_li.position(def_loc.start);
+        let end = target_li.position(def_loc.end);
+        let range = lsp_types::Range::new(
+            lsp_types::Position::new(start.line, start.character),
+            lsp_types::Position::new(end.line, end.character),
+        );
+        let location = lsp_types::Location {
+            uri: target_uri,
+            range,
+        };
+        Some(lsp_types::GotoDefinitionResponse::Scalar(location))
+    })();
+
+    match result {
+        Some(resp) => Response::new_ok(req.id.clone(), resp),
+        None => Response::new_ok(req.id.clone(), serde_json::Value::Null),
+    }
+}
+
+/// Handle a `textDocument/completion` request.  Returns a `Response`
+/// (a `CompletionResponse::Array` of items or null) without sending it — the
+/// caller dispatches the message.
+fn handle_completion(
+    db: &Database,
+    uri_to_file: &HashMap<String, SourceFile>,
+    fs: FileSet,
+    cats: Catalogues,
+    req: &lsp_server::Request,
+) -> Response {
+    let result = (|| -> Option<lsp_types::CompletionResponse> {
+        let params: lsp_types::CompletionParams =
+            serde_json::from_value(req.params.clone()).ok()?;
+        let uri_str = params
+            .text_document_position
+            .text_document
+            .uri
+            .as_str()
+            .to_owned();
+        let lsp_pos = params.text_document_position.position;
+        let file = *uri_to_file.get(&uri_str)?;
+        let text = file.text(db);
+        let li = LineIndex::new(text);
+        let byte_offset = li.offset(Pos {
+            line: lsp_pos.line,
+            character: lsp_pos.character,
+        });
+        let prefix = member_prefix_at(text, byte_offset);
+        let items = crate::capabilities::completion(db, file, fs, cats, byte_offset, prefix);
+        Some(lsp_types::CompletionResponse::Array(items))
+    })();
+
+    match result {
+        Some(resp) => Response::new_ok(req.id.clone(), resp),
+        None => Response::new_ok(req.id.clone(), serde_json::Value::Null),
+    }
+}
+
+/// Scan backwards from `byte` in `text` to detect a member-access prefix.
+///
+/// Returns `Some(ident)` when the character immediately before `byte` is `.`
+/// and the characters before the `.` form a non-empty ASCII identifier
+/// (`[A-Za-z0-9_]+` ending with `[A-Za-z_]`). Returns `None` otherwise (e.g.
+/// bare identifier, start of line, or the `.` is not preceded by an ident).
+///
+/// Only the ASCII identifier characters are recognized; Unicode identifiers
+/// are not supported by the current FlatPPL surface syntax.
+pub(crate) fn member_prefix_at(text: &str, byte: u32) -> Option<String> {
+    let byte = byte as usize;
+    // There must be at least one byte before the cursor.
+    if byte == 0 {
+        return None;
+    }
+    let bytes = text.as_bytes();
+    // The byte immediately before the cursor must be `.`.
+    if bytes[byte - 1] != b'.' {
+        return None;
+    }
+    // Scan backwards from the `.` to collect identifier bytes.
+    let dot_pos = byte - 1;
+    if dot_pos == 0 {
+        return None;
+    }
+    let mut end = dot_pos;
+    // Walk backwards while we see ASCII identifier chars.
+    while end > 0 && is_ident_byte(bytes[end - 1]) {
+        end -= 1;
+    }
+    let start = end;
+    if start == dot_pos {
+        // Nothing before the dot — no identifier.
+        return None;
+    }
+    let ident = std::str::from_utf8(&bytes[start..dot_pos]).ok()?;
+    if ident.is_empty() {
+        return None;
+    }
+    Some(ident.to_string())
+}
+
+/// Return `true` for bytes that may appear in a FlatPPL identifier
+/// (`[A-Za-z0-9_]`).
+#[inline]
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
 // ── Unit tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── member_prefix_at ─────────────────────────────────────────────────────
+
+    #[test]
+    fn member_prefix_at_detects_ident_before_dot() {
+        // "x = e." — cursor at byte 6 (after '.'), ident is "e".
+        assert_eq!(
+            member_prefix_at("x = e.", 6),
+            Some("e".to_string()),
+            "cursor right after 'e.' must yield Some(\"e\")"
+        );
+    }
+
+    #[test]
+    fn member_prefix_at_no_dot_returns_none() {
+        // "x = add" — cursor at byte 7, no dot.
+        assert_eq!(
+            member_prefix_at("x = add", 7),
+            None,
+            "cursor after plain ident must yield None"
+        );
+    }
+
+    #[test]
+    fn member_prefix_at_dot_at_start_returns_none() {
+        // ".foo" — dot at byte 0, nothing before it.
+        assert_eq!(member_prefix_at(".foo", 1), None);
+    }
+
+    #[test]
+    fn member_prefix_at_multi_char_ident() {
+        // "mymod.x" — cursor at byte 7.
+        assert_eq!(
+            member_prefix_at("a = mymod.", 10),
+            Some("mymod".to_string()),
+        );
+    }
 
     // ── position_to_byte ──────────────────────────────────────────────────────
 
@@ -443,6 +735,36 @@ mod tests {
         assert_eq!(
             caps.text_document_sync,
             Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL))
+        );
+        assert_eq!(
+            caps.document_symbol_provider,
+            Some(OneOf::Left(true)),
+            "server must advertise documentSymbol capability"
+        );
+        assert_eq!(
+            caps.workspace_symbol_provider,
+            Some(OneOf::Left(true)),
+            "server must advertise workspaceSymbol capability"
+        );
+        assert_eq!(
+            caps.inlay_hint_provider,
+            Some(OneOf::Left(true)),
+            "server must advertise inlayHint capability"
+        );
+        assert_eq!(
+            caps.definition_provider,
+            Some(OneOf::Left(true)),
+            "server must advertise definition capability"
+        );
+        assert!(
+            caps.completion_provider.is_some(),
+            "server must advertise completion capability"
+        );
+        let comp_opts = caps.completion_provider.as_ref().unwrap();
+        assert_eq!(
+            comp_opts.trigger_characters.as_deref(),
+            Some([".".to_string()].as_slice()),
+            "completion trigger character must be '.'"
         );
     }
 
