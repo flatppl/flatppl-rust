@@ -98,8 +98,11 @@ pub struct Domain {
 #[derive(Debug, Deserialize)]
 pub struct DomainAxis {
     pub name: String,
-    pub min: f64,
-    pub max: f64,
+    /// Optional. The HS3 spec text lists `min`/`max` as required, but RooFit's
+    /// HS3 export omits a bound for an unbounded parameter range (e.g. a global
+    /// observable on `[0, ∞)`). We tolerate the omission (treated as ±∞).
+    pub min: Option<f64>,
+    pub max: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]

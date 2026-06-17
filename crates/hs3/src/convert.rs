@@ -99,7 +99,15 @@ fn domain_bounds(doc: &Document) -> Result<BTreeMap<&str, (f64, f64)>> {
     let mut map: BTreeMap<&str, (f64, f64)> = BTreeMap::new();
     for d in &doc.domains {
         for ax in &d.axes {
-            let bounds = (ax.min, ax.max);
+            // A `uniform_dist` support needs both bounds; an axis missing one
+            // (RooFit omits a bound for an unbounded parameter) can't define a
+            // proper support, so it is not recorded here — a `uniform_dist` over
+            // it then fails with the clear "no declared domain" error. (The
+            // `domains` preset still emits the axis, with ±∞ for the open side.)
+            let (Some(min), Some(max)) = (ax.min, ax.max) else {
+                continue;
+            };
+            let bounds = (min, max);
             match map.insert(ax.name.as_str(), bounds) {
                 Some(prev) if prev != bounds => {
                     return Err(Error::Unsupported(format!(

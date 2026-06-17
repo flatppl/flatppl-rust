@@ -1,6 +1,7 @@
 //! parameter_points / domains -> FlatPPL preset bindings (03-value-types.md).
 use crate::builder::Builder;
 use crate::model::{Domain, ParameterPoint};
+use flatppl_core::NodeId;
 use flatppl_core::node::{Call, CallHead, NamedArg, NamedKind, Node};
 
 /// `parameter_points` entry -> `name = record(p = v, ..., q = fixed(w))`.
@@ -29,11 +30,13 @@ pub fn emit_parameter_point(b: &mut Builder, pp: &ParameterPoint) {
 }
 
 /// `domains` (product_domain) -> `name = cartprod(p = interval(min, max), ...)`.
+/// An omitted bound (RooFit emits one-sided ranges for unbounded parameters)
+/// becomes `±inf`, so `[0, ∞)` lowers to `interval(0.0, inf)`.
 pub fn emit_domain(b: &mut Builder, d: &Domain) {
     let mut fields = Vec::new();
     for ax in &d.axes {
-        let lo = b.lit_real(ax.min);
-        let hi = b.lit_real(ax.max);
+        let lo = bound_node(b, ax.min, false);
+        let hi = bound_node(b, ax.max, true);
         let interval = b.call("interval", &[lo, hi]);
         let name = b.m.intern(&ax.name);
         fields.push(NamedArg {
@@ -50,6 +53,24 @@ pub fn emit_domain(b: &mut Builder, d: &Domain) {
         inputs: None,
     }));
     b.bind(&d.name, cp);
+}
+
+/// An interval bound node: the literal value, or `±inf` when RooFit omitted the
+/// bound (an unbounded parameter range; see [`crate::model::DomainAxis`]).
+/// `positive` selects `+inf` (upper) vs `-inf` (lower).
+fn bound_node(b: &mut Builder, v: Option<f64>, positive: bool) -> NodeId {
+    match v {
+        Some(x) => b.lit_real(x),
+        None => {
+            let inf_sym = b.m.intern("inf");
+            let inf = b.m.alloc(Node::Const(inf_sym));
+            if positive {
+                inf
+            } else {
+                b.call("neg", &[inf])
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -126,13 +147,19 @@ mod tests {
             axes: vec![
                 DomainAxis {
                     name: "mass".into(),
-                    min: 5.0,
-                    max: 6.0,
+                    min: Some(5.0),
+                    max: Some(6.0),
                 },
                 DomainAxis {
                     name: "pt".into(),
-                    min: 0.0,
-                    max: 100.0,
+                    min: Some(0.0),
+                    max: Some(100.0),
+                },
+                // RooFit-style one-sided range (no upper bound) → interval(0.0, inf).
+                DomainAxis {
+                    name: "eta".into(),
+                    min: Some(0.0),
+                    max: None,
                 },
             ],
         };
@@ -147,5 +174,8 @@ mod tests {
         assert!(text.contains("pt"), "got: {text}");
         assert!(text.contains("5"), "got: {text}");
         assert!(text.contains("100"), "got: {text}");
+        // The unbounded axis lowers to an `inf` upper bound.
+        assert!(text.contains("eta"), "got: {text}");
+        assert!(text.contains("inf"), "unbounded axis must use inf, got: {text}");
     }
 }
