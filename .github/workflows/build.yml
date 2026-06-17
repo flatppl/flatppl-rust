@@ -63,19 +63,24 @@ jobs:
       - name: Build flatppl
         run: cargo build --release --locked -p flatppl-cli --target ${{ matrix.target }}
 
+      - name: Build flatppl-lsp
+        run: cargo build --release --locked -p flatppl-lsp --target ${{ matrix.target }}
+
       - name: Package binary with README and LICENSE
         shell: bash
         run: |
-          mkdir -p dist/stage
+          mkdir -p dist/stage dist/lsp
           cp README.md LICENSE dist/stage/
           case "${{ matrix.target }}" in
             *windows*)
               cp "target/${{ matrix.target }}/release/flatppl.exe" dist/stage/
               (cd dist/stage && 7z a "../flatppl-nightly-${{ matrix.target }}.zip" .)
+              cp "target/${{ matrix.target }}/release/flatppl-lsp.exe" "dist/lsp/flatppl-lsp-${{ matrix.target }}.exe"
               ;;
             *)
               cp "target/${{ matrix.target }}/release/flatppl" dist/stage/
               tar -czf "dist/flatppl-nightly-${{ matrix.target }}.tar.gz" -C dist/stage .
+              cp "target/${{ matrix.target }}/release/flatppl-lsp" "dist/lsp/flatppl-lsp-${{ matrix.target }}"
               ;;
           esac
 
@@ -86,6 +91,7 @@ jobs:
           path: |
             dist/flatppl-nightly-*.tar.gz
             dist/flatppl-nightly-*.zip
+            dist/lsp/flatppl-lsp-*
 
   release:
     name: Update nightly release
@@ -123,3 +129,6 @@ jobs:
             ```
             cargo install --git https://github.com/${{ github.repository }} flatppl-cli
             ```
+
+            The language server is published as a raw per-platform binary,
+            e.g. `flatppl-lsp-x86_64-unknown-linux-musl` (no archive).
