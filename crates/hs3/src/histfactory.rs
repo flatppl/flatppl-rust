@@ -45,10 +45,11 @@ fn tau(b: &mut Builder, nom: NodeId, sigma: NodeId) -> NodeId {
 
 /// shapesys auxiliary likelihood term (point-free).
 ///
-/// `likelihoodof(broadcast(hepphys.ContinuedPoisson, bcmul(gamma, tau)), tau)`
+/// `likelihoodof(broadcast(hepphys.ContinuedPoisson, broadcast(mul, gamma, tau)), tau)`
 pub fn shapesys_aux(b: &mut Builder, gamma: NodeId, nom: NodeId, sigma: NodeId) -> NodeId {
     let t = tau(b, nom, sigma);
-    let prod = b.call("bcmul", &[gamma, t]);
+    let mul = b.call_head("mul");
+    let prod = b.call("broadcast", &[mul, gamma, t]);
     let cp = b.module_call("hepphys", "ContinuedPoisson");
     let aux_model = b.call("broadcast", &[cp, prod]);
     b.call("likelihoodof", &[aux_model, t])
@@ -363,10 +364,17 @@ fn histosys_contents(
     param: &str,
     nom_len: usize,
 ) -> Result<NodeId> {
-    let contents = &data[side]["contents"];
+    // Two source shapes: pyhf workspaces use a flat `{side}_data` array
+    // (`hi_data` / `lo_data`); native HS³ uses a binned `{side}: {contents}`.
+    let pyhf_key = format!("{side}_data");
+    let contents = if !data[&pyhf_key].is_null() {
+        &data[&pyhf_key]
+    } else {
+        &data[side]["contents"]
+    };
     if contents.is_null() {
         return Err(Error::Unsupported(format!(
-            "histosys `{param}`: `{side}.contents` is missing"
+            "histosys `{param}`: neither `{side}_data` (pyhf) nor `{side}.contents` (HS3) is present"
         )));
     }
     let what = format!("histosys `{param}` {side}.contents");
@@ -390,17 +398,23 @@ pub fn normsys_aux(b: &mut Builder, alpha: NodeId) -> NodeId {
     b.call("likelihoodof", &[normal, obs_zero])
 }
 
-/// Staterror BB-lite aux: `likelihoodof(broadcast(Normal, gamma, delta), 1.0)`
+/// Staterror BB-lite aux: `likelihoodof(broadcast(Normal, gamma, delta), [1.0, …])`
 ///
 /// `delta` is precomputed as a Rust Vec<f64>:
 ///   `delta_b = sqrt(sum_s err_{s,b}^2) / sum_s nom_{s,b}`
+///
+/// The observation is a PER-BIN vector of `1.0`s (one auxiliary measurement
+/// per bin, matching pyhf's staterror auxdata): the model is a per-bin
+/// `broadcast(Normal, …)`, so a scalar `1.0` would shape-mismatch the vector
+/// leaf.
 pub fn staterror_aux(b: &mut Builder, gamma: NodeId, delta_vals: &[f64]) -> NodeId {
     let delta_elems: Vec<NodeId> = delta_vals.iter().map(|x| b.lit_real(*x)).collect();
     let delta = b.array(&delta_elems);
     let normal_head = b.call_head("Normal");
     let broadcast_model = b.call("broadcast", &[normal_head, gamma, delta]);
-    let obs_one = b.lit_real(1.0);
-    b.call("likelihoodof", &[broadcast_model, obs_one])
+    let ones: Vec<NodeId> = delta_vals.iter().map(|_| b.lit_real(1.0)).collect();
+    let obs_ones = b.array(&ones);
+    b.call("likelihoodof", &[broadcast_model, obs_ones])
 }
 
 #[cfg(test)]

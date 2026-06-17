@@ -71,7 +71,9 @@ fn multichan_old_converts() {
     // the lumi constraint's `sigma = 0.1`, and a swapped delta vector would slip
     // through.
     assert!(
-        text.contains("likelihoodof(broadcast(Normal, staterror_channel1, [0.05, 0.1]), 1.0)"),
+        text.contains(
+            "likelihoodof(broadcast(Normal, staterror_channel1, [0.05, 0.1]), [1.0, 1.0])"
+        ),
         "staterror aux mismatch (expected deltas [0.05, 0.1]), got:\n{text}"
     );
 

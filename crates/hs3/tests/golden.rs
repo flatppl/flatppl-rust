@@ -314,7 +314,7 @@ fn golden_paper_histfactory_staterror_deltas() {
     // observed at the nominal 1.0. Pin the exact bracketed form so a swapped or
     // reordered delta array fails (bare contains("0.05") would not).
     assert!(
-        text.contains("likelihoodof(broadcast(Normal, mcstat, [0.05, 0.1]), 1.0)"),
+        text.contains("likelihoodof(broadcast(Normal, mcstat, [0.05, 0.1]), [1.0, 1.0])"),
         "staterror aux term mismatch (expected deltas [0.05, 0.1]), got:\n{text}"
     );
     // Observed bin contents [122.0, 112.0], in order, fed to the main Poisson

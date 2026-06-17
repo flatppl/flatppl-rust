@@ -76,7 +76,7 @@ fn paper_histfactory_converts() {
     // relative deltas [0.05, 0.1] (bin0 = 5/100, bin1 = 10/100). Pin the exact
     // array so a swapped/reordered delta vector fails.
     assert!(
-        text.contains("likelihoodof(broadcast(Normal, mcstat, [0.05, 0.1]), 1.0)"),
+        text.contains("likelihoodof(broadcast(Normal, mcstat, [0.05, 0.1]), [1.0, 1.0])"),
         "staterror aux mismatch (expected deltas [0.05, 0.1]), got:\n{text}"
     );
 
