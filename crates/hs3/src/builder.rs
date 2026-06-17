@@ -4,7 +4,7 @@ use flatppl_core::node::{Call, CallHead, NamedArg, NamedKind, Node, Ref, RefNs, 
 use flatppl_core::{Binding, Doc, Markup, Module};
 
 pub(crate) struct Builder<'m> {
-    pub m: &'m mut Module,
+    pub(crate) m: &'m mut Module,
 }
 
 impl<'m> Builder<'m> {
