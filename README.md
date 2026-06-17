@@ -15,6 +15,7 @@ This monorepo is a Cargo workspace; member crates live under `crates/`:
 * [`flatppl-syntax`](crates/syntax) — canonical FlatPPL surface syntax: parse + print
 * [`flatppl-flatpir`](crates/flatpir) — FlatPIR S-expression reader + writer
 * [`flatppl-infer`](crates/infer) — type, shape, and phase inference
+* [`flatppl-hs3`](crates/hs3) — HS3 / pyhf → FlatPPL importer
 * [`flatppl-cli`](crates/cli) — the `flatppl` command-line driver
 
 See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the design and the road ahead.
