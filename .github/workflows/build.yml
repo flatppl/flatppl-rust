@@ -61,7 +61,9 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: Build flatppl
-        run: cargo build --release --locked -p flatppl-cli --target ${{ matrix.target }}
+        # --all-features so the shipped binary includes the optional verbs /
+        # importers (hs3, pyhf); the default feature set omits them.
+        run: cargo build --release --locked --all-features -p flatppl-cli --target ${{ matrix.target }}
 
       - name: Build flatppl-lsp
         run: cargo build --release --locked -p flatppl-lsp --target ${{ matrix.target }}
@@ -129,7 +131,7 @@ jobs:
 
             Alternatively, build from source:
             ```
-            cargo install --git https://github.com/${{ github.repository }} flatppl-cli
+            cargo install --git https://github.com/${{ github.repository }} flatppl-cli --all-features
             ```
 
             The language server is published as a raw per-platform binary,

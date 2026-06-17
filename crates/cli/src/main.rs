@@ -44,7 +44,7 @@ enum Command {
     /// `.flatpir.json`). Converting to the same format canonicalizes the file.
     /// `.flatpir.json` is an alternate representation of FlatPIR (same content,
     /// including `%meta` annotations). Use `--from hs3` or `--from pyhf` to
-    /// import a JSON file instead.
+    /// import a JSON file instead (both require the optional `hs3` build feature).
     #[cfg(feature = "convert")]
     Convert {
         /// Input file (`.flatppl`, `.flatpir`, `.flatpir.json`, native HS3 JSON
@@ -147,8 +147,10 @@ enum FromFormat {
     /// Infer the input format from the file extension (`.flatppl` / `.flatpir`).
     Auto,
     /// Read a native HS3 JSON document (`distributions`, `likelihoods`, …).
+    /// Requires the optional `hs3` build feature.
     Hs3,
     /// Read a pyhf workspace JSON document (top-level `channels` array).
+    /// Requires the optional `hs3` build feature.
     Pyhf,
 }
 
