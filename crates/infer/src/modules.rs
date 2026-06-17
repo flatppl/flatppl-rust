@@ -5,6 +5,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use flatppl_core::{
     BindingId, CallHead, Module, NamedKind, Node, NodeId, Phase, Scalar, Symbol, Type, ValueSet,
@@ -15,9 +16,16 @@ use crate::catalogue::CatalogueSet;
 
 /// Parsed dependency modules, keyed by the `load_module` path string. Supplied
 /// by the host (the engine does no file I/O).
-#[derive(Debug, Default)]
+///
+/// Dependencies are held behind `Arc<Module>` so a host that assembles the same
+/// bundle repeatedly (e.g. the LSP, once per keystroke) shares one parsed copy
+/// rather than deep-cloning each dependency `Module` on every assembly. Inserts
+/// and lookups move/borrow the `Arc`; the only deep clone of a dependency is the
+/// per-import-site working copy `infer_dep` mutates, which is genuinely needed
+/// (inference annotates it in place).
+#[derive(Debug, Default, Clone)]
 pub struct ModuleBundle {
-    modules: HashMap<String, Module>,
+    modules: HashMap<String, Arc<Module>>,
 }
 
 impl ModuleBundle {
@@ -25,13 +33,18 @@ impl ModuleBundle {
         Self::default()
     }
 
-    /// Insert a parsed dependency under its `load_module` path.
-    pub fn insert(&mut self, path: impl Into<String>, module: Module) {
+    /// Insert a parsed dependency (shared `Arc`) under its `load_module` path.
+    pub fn insert(&mut self, path: impl Into<String>, module: Arc<Module>) {
         self.modules.insert(path.into(), module);
     }
 
     /// The dependency parsed for `path`, if present.
     pub fn get(&self, path: &str) -> Option<&Module> {
+        self.modules.get(path).map(|a| a.as_ref())
+    }
+
+    /// The shared `Arc` for `path`, if present (refcount bump, no deep clone).
+    pub fn get_arc(&self, path: &str) -> Option<&Arc<Module>> {
         self.modules.get(path)
     }
 }
@@ -405,7 +418,7 @@ mod tests {
     #[test]
     fn bundle_inserts_and_looks_up() {
         let mut b = ModuleBundle::new();
-        b.insert("helpers.flatppl", Module::new());
+        b.insert("helpers.flatppl", Arc::new(Module::new()));
         assert!(b.get("helpers.flatppl").is_some());
         assert!(b.get("missing.flatppl").is_none());
     }

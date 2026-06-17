@@ -30,7 +30,7 @@ fn spec_example_infers_cross_module() {
 
     let helpers = flatppl_syntax::parse(&helpers_src).expect("helpers.flatppl parses");
     let mut bundle = ModuleBundle::new();
-    bundle.insert("helpers.flatppl", helpers);
+    bundle.insert("helpers.flatppl", std::sync::Arc::new(helpers));
 
     let mut model = flatppl_syntax::parse(&model_src).expect("model.flatppl parses");
     let diags = infer_module(&mut model, &bundle, Level::Shape);

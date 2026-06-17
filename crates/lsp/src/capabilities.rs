@@ -6,8 +6,7 @@
 use std::str::FromStr;
 
 use crate::db::{Catalogues, Database, FileSet, SourceFile};
-use crate::line_index::LineIndex;
-use crate::queries::{analyze, resolve_path};
+use crate::queries::{analyze, line_index, parsed_catalogues, resolve_path};
 use flatppl_core::{CallHead, Node, RefNs, Scalar};
 
 /// An owned, salsa-friendly diagnostic: a byte range into the source, a severity,
@@ -70,7 +69,7 @@ impl LspDiag {
 /// Map all `LspDiag`s from an analyzed file to `lsp_types::Diagnostic` values.
 ///
 /// Byte offsets are converted to UTF-16 (line, character) positions via
-/// [`LineIndex`] so that LSP clients receive correctly positioned ranges.
+/// [`crate::line_index::LineIndex`] so that LSP clients receive correctly positioned ranges.
 pub fn diagnostics(
     db: &dyn salsa::Database,
     file: SourceFile,
@@ -78,8 +77,7 @@ pub fn diagnostics(
     cats: Catalogues,
 ) -> Vec<lsp_types::Diagnostic> {
     let analyzed = analyze(db, file, fs, cats);
-    let text = file.text(db);
-    let li = LineIndex::new(text);
+    let li = line_index(db, file);
     analyzed
         .diagnostics(db)
         .iter()
@@ -111,8 +109,7 @@ pub fn document_symbols(
     fs: FileSet,
     cats: Catalogues,
 ) -> Vec<lsp_types::DocumentSymbol> {
-    let text = file.text(db);
-    let li = LineIndex::new(text);
+    let li = line_index(db, file);
     let analyzed = analyze(db, file, fs, cats);
     let Some(module) = analyzed.module(db) else {
         return vec![];
@@ -174,8 +171,7 @@ pub fn workspace_symbols(
             continue;
         };
 
-        let text = file.text(db);
-        let li = LineIndex::new(text);
+        let li = line_index(db, file);
         let analyzed = analyze(db, file, fs, cats);
         let Some(module) = analyzed.module(db) else {
             continue;
@@ -341,8 +337,7 @@ pub fn inlay_hints(
     start_byte: u32,
     end_byte: u32,
 ) -> Vec<lsp_types::InlayHint> {
-    let text = file.text(db);
-    let li = LineIndex::new(text);
+    let li = line_index(db, file);
     let analyzed = analyze(db, file, fs, cats);
     let Some(module) = analyzed.module(db) else {
         return vec![];
@@ -412,14 +407,10 @@ pub fn completion(
 ) -> Vec<lsp_types::CompletionItem> {
     use lsp_types::{CompletionItem, CompletionItemKind};
 
-    // Parse external catalogues (RON sources stored in `cats`); failures are
-    // silently skipped — the server already emits diagnostics for them via
-    // `analyze`.
-    let external_cats: Vec<flatppl_infer::Catalogue> = cats
-        .sources(db)
-        .iter()
-        .filter_map(|src| flatppl_infer::parse_catalogue(src).ok())
-        .collect();
+    // Obtain the external catalogues from the tracked `parsed_catalogues` query
+    // (parsed once per `Catalogues` revision; failures silently skipped — the
+    // server already emits diagnostics for them via `analyze`).
+    let external_cats = parsed_catalogues(db, cats);
 
     let builtin = flatppl_infer::builtin_catalogue();
 
@@ -444,7 +435,7 @@ pub fn completion(
                 }
             }
             // External catalogues in order.
-            for ext in &external_cats {
+            for ext in external_cats.as_slice() {
                 if let Some(names) = ext.module_binding_names(&mod_name) {
                     for name in names {
                         if seen.insert(name.to_string()) {
@@ -488,7 +479,7 @@ pub fn completion(
     }
 
     // External catalogue base names.
-    for ext in &external_cats {
+    for ext in external_cats.as_slice() {
         for name in ext.base_names() {
             if seen.insert(name.to_string()) {
                 items.push(CompletionItem {

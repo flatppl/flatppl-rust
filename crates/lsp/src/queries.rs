@@ -2,8 +2,106 @@
 
 use crate::capabilities::LspDiag;
 use crate::db::{Catalogues, FileSet, SourceFile};
+use crate::line_index::LineIndex;
 use flatppl_core::{CallHead, Module, Node, Scalar};
 use std::sync::Arc;
+
+// ── ArcCatalogues wrapper ────────────────────────────────────────────────────
+//
+// `flatppl_infer::Catalogue` derives only `Clone + Debug` — not `PartialEq`,
+// `Eq`, `Hash`, or `salsa::Update` — so `Arc<Vec<Catalogue>>` satisfies none
+// of the bounds salsa's `#[salsa::tracked]` function return type requires
+// (`Eq` for backdating, `Update` for the update dispatch).
+//
+// `ArcCatalogues` wraps `Arc<Vec<Catalogue>>` and provides pointer-identity
+// `PartialEq`/`Eq` (two separately-created arcs are never pointer-equal, so
+// salsa will always re-propagate; over-recomputes rather than under-computes —
+// the same conservative policy used by `ArcModule`). The `Update` impl
+// likewise falls back to pointer identity: if the arc pointer changed the
+// value definitely changed, so we always overwrite and return `true`.
+#[derive(Clone, Debug)]
+pub struct ArcCatalogues(Arc<Vec<flatppl_infer::Catalogue>>);
+
+impl ArcCatalogues {
+    fn new(v: Vec<flatppl_infer::Catalogue>) -> Self {
+        ArcCatalogues(Arc::new(v))
+    }
+
+    /// Return a reference to the inner slice, for passing to `infer_module_ext`
+    /// and the completion builder.
+    pub fn as_slice(&self) -> &[flatppl_infer::Catalogue] {
+        &self.0
+    }
+}
+
+impl PartialEq for ArcCatalogues {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for ArcCatalogues {}
+
+impl std::hash::Hash for ArcCatalogues {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::ptr::hash(Arc::as_ptr(&self.0), state);
+    }
+}
+
+// SAFETY: pointer-identity equality is conservative (may over-recompute but
+// never under-computes). `maybe_update` always overwrites `old_pointer` with
+// `new_value`; returning `true` tells salsa the value changed, triggering
+// downstream recomputation. This is sound because we never suppress a genuine
+// change.
+unsafe impl salsa::Update for ArcCatalogues {
+    unsafe fn maybe_update(old_pointer: *mut Self, new_value: Self) -> bool {
+        let old: &mut Self = unsafe { &mut *old_pointer };
+        if Arc::ptr_eq(&old.0, &new_value.0) {
+            return false;
+        }
+        *old = new_value;
+        true
+    }
+}
+
+// ── parsed_catalogues tracked query ─────────────────────────────────────────
+
+/// Parse the host-supplied external RON catalogues once per `Catalogues`
+/// revision (was re-parsed on every analyze + completion). Unparseable sources
+/// are dropped here; the diagnostics path reports them separately.
+#[salsa::tracked]
+pub fn parsed_catalogues(db: &dyn salsa::Database, cats: Catalogues) -> ArcCatalogues {
+    #[cfg(test)]
+    PARSED_CATALOGUES_RUNS.with(|c| c.set(c.get() + 1));
+    ArcCatalogues::new(
+        cats.sources(db)
+            .iter()
+            .filter_map(|s| flatppl_infer::parse_catalogue(s).ok())
+            .collect(),
+    )
+}
+
+// Per-thread execution counter for `parsed_catalogues`. Thread-local so
+// concurrent tests do not interfere with each other's measurements.
+#[cfg(test)]
+thread_local! {
+    pub static PARSED_CATALOGUES_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+// ── LineIndex tracked query ──────────────────────────────────────────────────
+
+/// The UTF-8↔UTF-16 line index for a file, computed once per revision and
+/// shared across every capability/handler (was rebuilt per request).
+#[salsa::tracked]
+pub fn line_index(db: &dyn salsa::Database, file: SourceFile) -> LineIndex {
+    #[cfg(test)]
+    LINE_INDEX_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    LineIndex::new(file.text(db))
+}
+
+/// Test-only execution counter (proves the query is memoized per revision).
+#[cfg(test)]
+pub static LINE_INDEX_RUNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 // ── Salsa field-compatibility wrapper ───────────────────────────────────────
 //
@@ -42,6 +140,69 @@ impl Eq for ArcModule {}
 impl std::hash::Hash for ArcModule {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         std::ptr::hash(Arc::as_ptr(&self.0), state);
+    }
+}
+
+// ── ImportBundle wrapper ─────────────────────────────────────────────────────
+//
+// `flatppl_infer::ModuleBundle` holds `Arc<Module>` deps but is neither `Eq`
+// nor `salsa::Update` (its `Module`s have f64 literals, so no structural `Eq`).
+// `import_bundle` is a `#[salsa::tracked]` query, whose return type must satisfy
+// `Eq + Update + Debug + Send + Sync`. `ImportBundle` wraps `Arc<ModuleBundle>`
+// and supplies the same pointer-identity `Eq`/`Hash`/`Update` policy as
+// `ArcModule`/`ArcCatalogues`: two separately-assembled bundles are never
+// pointer-equal, so salsa always re-propagates on a genuine recompute
+// (over-recomputes rather than under-computes — conservatively correct).
+//
+// Within a single revision the memoized query returns the *same* `Arc`, so the
+// per-dependency `Arc<Module>` is shared across every `analyze` of that revision
+// (verified by `dependency_module_is_shared_not_recloned`).
+#[derive(Clone, Debug)]
+pub struct ImportBundle(Arc<flatppl_infer::ModuleBundle>);
+
+impl ImportBundle {
+    fn new(bundle: flatppl_infer::ModuleBundle) -> Self {
+        ImportBundle(Arc::new(bundle))
+    }
+
+    /// Borrow the assembled bundle, for passing to `infer_module_ext`.
+    pub fn as_bundle(&self) -> &flatppl_infer::ModuleBundle {
+        &self.0
+    }
+
+    /// The shared `Arc<Module>` for the dependency keyed by `path`, if present.
+    /// Cloning the returned `Arc` is a refcount bump, not a deep clone.
+    pub fn module_for(&self, path: &str) -> Option<Arc<Module>> {
+        self.0.get_arc(path).cloned()
+    }
+}
+
+impl PartialEq for ImportBundle {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for ImportBundle {}
+
+impl std::hash::Hash for ImportBundle {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::ptr::hash(Arc::as_ptr(&self.0), state);
+    }
+}
+
+// SAFETY: pointer-identity equality is conservative (may over-recompute but
+// never under-computes). `maybe_update` overwrites `old_pointer` with
+// `new_value` on a pointer difference and returns `true`, telling salsa the
+// value changed. Sound because we never suppress a genuine change.
+unsafe impl salsa::Update for ImportBundle {
+    unsafe fn maybe_update(old_pointer: *mut Self, new_value: Self) -> bool {
+        let old: &mut Self = unsafe { &mut *old_pointer };
+        if Arc::ptr_eq(&old.0, &new_value.0) {
+            return false;
+        }
+        *old = new_value;
+        true
     }
 }
 
@@ -203,15 +364,23 @@ pub(crate) fn resolve_path(
 /// the directive used, so `infer`'s `(%ref alias X)` resolution (which keys the
 /// bundle by the directive path) finds it.
 ///
-/// This is a plain `fn`, not a `#[salsa::tracked]` query: it cannot be tracked
-/// because `ModuleBundle` is neither `Hash`/`Eq` nor `Update` (it owns
-/// `Module`s). Tracking is unnecessary — the salsa edges it creates are recorded
-/// in its caller's (`analyze`'s) read set regardless.
-pub fn import_bundle(
-    db: &dyn salsa::Database,
-    file: SourceFile,
-    fs: FileSet,
-) -> flatppl_infer::ModuleBundle {
+/// This is a `#[salsa::tracked]` query so the transitive bundle is assembled
+/// **once per revision** rather than rebuilt on every `analyze` call (per
+/// keystroke, per open doc). Each dependency `Module` is held behind an
+/// `Arc<Module>` (see [`ImportBundle`]); the single `Arc::new(parsed.clone())`
+/// per dependency happens inside this memoized body, so repeat `analyze`s reuse
+/// the same shared `Arc`s instead of deep-cloning every dependency anew.
+///
+/// The query reads `parse(db, dep)` for every transitive dependency, so the
+/// cross-file salsa edges are recorded in the query's own read set — and, via
+/// `analyze` calling `import_bundle`, in `analyze`'s read set too. Editing any
+/// dependency's text therefore invalidates this query and the importer's
+/// `analyze`.
+#[salsa::tracked]
+pub fn import_bundle(db: &dyn salsa::Database, file: SourceFile, fs: FileSet) -> ImportBundle {
+    #[cfg(test)]
+    IMPORT_BUNDLE_RUNS.with(|c| c.set(c.get() + 1));
+
     let mut bundle = flatppl_infer::ModuleBundle::new();
     let mut visited: std::collections::HashSet<SourceFile> = std::collections::HashSet::new();
     let mut queue: std::collections::VecDeque<SourceFile> = std::collections::VecDeque::new();
@@ -229,8 +398,10 @@ pub fn import_bundle(
             };
             if let Some(dep_mod) = parse(db, dep_file).module(db) {
                 // Key by the directive-literal path so infer's `(%ref alias X)`
-                // lookup (keyed by directive path) matches.
-                bundle.insert(path, dep_mod.clone());
+                // lookup (keyed by directive path) matches. The single deep
+                // clone of the parsed dependency lives here, behind an `Arc`,
+                // computed once per revision rather than per `analyze` call.
+                bundle.insert(path, Arc::new(dep_mod.clone()));
             }
             // Enqueue once; the visited set is keyed on the resolved file so two
             // directives that resolve to the same file (or an import cycle) do
@@ -240,7 +411,16 @@ pub fn import_bundle(
             }
         }
     }
-    bundle
+    ImportBundle::new(bundle)
+}
+
+// Per-thread execution counter for `import_bundle` (proves the query is
+// memoized once per revision, not recomputed per `analyze` call). Thread-local
+// so concurrent tests do not interfere with each other's measurements (mirrors
+// `PARSED_CATALOGUES_RUNS`).
+#[cfg(test)]
+thread_local! {
+    pub static IMPORT_BUNDLE_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 // ── Analyzed tracked struct ──────────────────────────────────────────────────
@@ -287,27 +467,28 @@ pub fn analyze<'db>(
     };
     let mut m = module.clone();
 
-    // Parse the external catalogues; RON failures become Error diagnostics
-    // anchored at offset 0 rather than aborting analysis.
+    // Obtain the external catalogues via the tracked `parsed_catalogues` query
+    // (parsed once per `Catalogues` revision, not per analyze call). Emit
+    // diagnostics for sources that fail to parse; the failed entries are absent
+    // from the memoised `catalogues` vec (already filtered out by the query).
     let mut diags = parsed.diagnostics(db).clone();
-    let mut catalogues = Vec::new();
     for src in cats.sources(db) {
-        match flatppl_infer::parse_catalogue(src) {
-            Ok(cat) => catalogues.push(cat),
-            Err(e) => diags.push(LspDiag {
+        if let Err(e) = flatppl_infer::parse_catalogue(src) {
+            diags.push(LspDiag {
                 start: 0,
                 end: 0,
                 severity: crate::capabilities::DiagSeverity::Error,
                 message: format!("catalogue parse error: {e}"),
-            }),
+            });
         }
     }
+    let catalogues = parsed_catalogues(db, cats);
 
     let bundle = import_bundle(db, file, fs);
     let infer_diags = flatppl_infer::infer_module_ext(
         &mut m,
-        &bundle,
-        &catalogues,
+        bundle.as_bundle(),
+        catalogues.as_slice(),
         flatppl_infer::Level::Normalization,
     );
     diags.extend(infer_diags.iter().map(|d| LspDiag::from_infer(d, &m)));
@@ -319,6 +500,22 @@ pub fn analyze<'db>(
 mod tests {
     use super::*;
     use crate::db::{Catalogues, Database, FileSet, SourceFile};
+
+    #[test]
+    fn line_index_is_memoized_per_revision() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let db = Database::default();
+        let f = SourceFile::new(&db, "m.flatppl".to_string(), "a\nbb\nc".to_string());
+        LINE_INDEX_RUNS.store(0, Relaxed);
+        let _ = line_index(&db, f);
+        let _ = line_index(&db, f);
+        let _ = line_index(&db, f); // 3 calls, same revision
+        assert_eq!(
+            LINE_INDEX_RUNS.load(Relaxed),
+            1,
+            "computed once per revision, not per call"
+        );
+    }
 
     #[test]
     fn parse_returns_module_for_valid_source() {
@@ -488,6 +685,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn external_catalogues_parsed_once_per_revision() {
+        let db = Database::default();
+        // A trivial valid catalogue source.
+        let cats = Catalogues::new(&db, vec!["Catalogue(base:[],modules:[])".to_string()]);
+        let f = SourceFile::new(&db, "m.flatppl".to_string(), "x = 1".to_string());
+        let fs = FileSet::new(&db, vec![f]);
+        // Thread-local counter: reset to 0, exercise analyze + a direct
+        // parsed_catalogues call (3 calls total), assert the body ran exactly once.
+        PARSED_CATALOGUES_RUNS.with(|c| c.set(0));
+        let _ = analyze(&db, f, fs, cats);
+        let _ = analyze(&db, f, fs, cats);
+        let _ = parsed_catalogues(&db, cats);
+        let runs = PARSED_CATALOGUES_RUNS.with(|c| c.get());
+        assert_eq!(
+            runs, 1,
+            "external catalogues parsed once per revision, not per analyze/completion"
+        );
+    }
+
     /// The cross-file salsa-edge guard: editing a dependency's text must
     /// invalidate (and recompute) the importer's analysis. We assert the
     /// observable type change — after `helpers.shifted` becomes complex-valued,
@@ -537,6 +754,58 @@ mod tests {
             "editing the dependency must re-analyze the importer: v should now be \
              Scalar(Complex); got {ty2:?}. If still Real, the cross-file salsa edge \
              was not recorded."
+        );
+    }
+
+    // ── import_bundle memoization tests ───────────────────────────────────────
+
+    /// A two-file workspace: B (`helpers`) defines a binding; A (`model`) does
+    /// `load_module` of B and uses it. Returns `(db, a, b, fs, cats)`.
+    fn import_workspace() -> (Database, SourceFile, SourceFile, FileSet, Catalogues) {
+        let db = Database::default();
+        let b = SourceFile::new(
+            &db,
+            "helpers.flatppl".to_string(),
+            "center = elementof(reals)\nshifted = add(center, 1.0)".to_string(),
+        );
+        let a = SourceFile::new(
+            &db,
+            "model.flatppl".to_string(),
+            "h = load_module(\"helpers.flatppl\")\nv = add(h.shifted, 2.0)".to_string(),
+        );
+        let fs = FileSet::new(&db, vec![b, a]);
+        let cats = empty_cats(&db);
+        (db, a, b, fs, cats)
+    }
+
+    #[test]
+    fn import_bundle_memoized_per_revision() {
+        let (db, a, _b, fs, cats) = import_workspace();
+        IMPORT_BUNDLE_RUNS.with(|c| c.set(0));
+        let _ = import_bundle(&db, a, fs);
+        let _ = import_bundle(&db, a, fs);
+        let _ = analyze(&db, a, fs, cats); // also reads the bundle
+        assert_eq!(
+            IMPORT_BUNDLE_RUNS.with(|c| c.get()),
+            1,
+            "import_bundle computed once per revision, not per analyze"
+        );
+    }
+
+    #[test]
+    fn dependency_module_is_shared_not_recloned() {
+        // The Arc<Module> for B inside two import_bundle results in the same
+        // revision must be pointer-equal (shared, not deep-cloned each call).
+        let (db, a, _b, fs, _cats) = import_workspace();
+        let b1 = import_bundle(&db, a, fs)
+            .module_for("helpers.flatppl")
+            .expect("dep B present in bundle");
+        let b2 = import_bundle(&db, a, fs)
+            .module_for("helpers.flatppl")
+            .expect("dep B present in bundle");
+        assert!(
+            std::sync::Arc::ptr_eq(&b1, &b2),
+            "dep module shared across calls"
         );
     }
 }

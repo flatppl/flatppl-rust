@@ -24,7 +24,8 @@ use lsp_types::{
 };
 
 use crate::db::{Catalogues, Database, FileSet, SourceFile};
-use crate::line_index::{LineIndex, Pos};
+use crate::line_index::Pos;
+use crate::queries::line_index;
 
 // ── run ─────────────────────────────────────────────────────────────────────
 
@@ -374,8 +375,7 @@ fn handle_hover(
             .to_owned();
         let lsp_pos = params.text_document_position_params.position;
         let file = *uri_to_file.get(&uri_str)?;
-        let text = file.text(db);
-        let li = LineIndex::new(text);
+        let li = line_index(db, file);
         let byte_offset = li.offset(Pos {
             line: lsp_pos.line,
             character: lsp_pos.character,
@@ -451,8 +451,7 @@ fn handle_inlay_hints(
         let params: lsp_types::InlayHintParams = serde_json::from_value(req.params.clone()).ok()?;
         let uri_str = params.text_document.uri.as_str().to_owned();
         let file = *uri_to_file.get(&uri_str)?;
-        let text = file.text(db);
-        let li = LineIndex::new(text);
+        let li = line_index(db, file);
         let start_byte = li.offset(Pos {
             line: params.range.start.line,
             character: params.range.start.character,
@@ -490,8 +489,7 @@ fn handle_goto_definition(
             .to_owned();
         let lsp_pos = params.text_document_position_params.position;
         let file = *uri_to_file.get(&uri_str)?;
-        let text = file.text(db);
-        let li = LineIndex::new(text);
+        let li = line_index(db, file);
         let byte_offset = li.offset(Pos {
             line: lsp_pos.line,
             character: lsp_pos.character,
@@ -504,16 +502,16 @@ fn handle_goto_definition(
             format!("file://{}", def_loc.path)
         };
         let target_uri = Uri::from_str(&target_uri_str).ok()?;
-        // Build the target range: need the text of the target file to do
-        // byte→position conversion.
-        let target_text = fs
+        // Build the target range: find the dep SourceFile and use its cached
+        // line index (avoids a per-request LineIndex::new rebuild).
+        let dep_file = fs
             .files(db)
             .iter()
             .copied()
-            .find(|f| f.path(db) == def_loc.path)
-            .map(|f| f.text(db).to_string())
-            .unwrap_or_default();
-        let target_li = LineIndex::new(&target_text);
+            .find(|f| f.path(db) == def_loc.path);
+        let target_li = dep_file
+            .map(|f| line_index(db, f))
+            .unwrap_or_else(|| crate::line_index::LineIndex::new(""));
         let start = target_li.position(def_loc.start);
         let end = target_li.position(def_loc.end);
         let range = lsp_types::Range::new(
@@ -554,12 +552,12 @@ fn handle_completion(
             .to_owned();
         let lsp_pos = params.text_document_position.position;
         let file = *uri_to_file.get(&uri_str)?;
-        let text = file.text(db);
-        let li = LineIndex::new(text);
+        let li = line_index(db, file);
         let byte_offset = li.offset(Pos {
             line: lsp_pos.line,
             character: lsp_pos.character,
         });
+        let text = file.text(db);
         let prefix = member_prefix_at(text, byte_offset);
         let items = crate::capabilities::completion(db, file, fs, cats, byte_offset, prefix);
         Some(lsp_types::CompletionResponse::Array(items))
@@ -625,6 +623,7 @@ fn is_ident_byte(b: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::line_index::LineIndex;
 
     // ── member_prefix_at ─────────────────────────────────────────────────────
 
