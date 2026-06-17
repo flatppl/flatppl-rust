@@ -96,6 +96,39 @@ fn arithmetic_promotion() {
     assert!(meta_of("x = 1 < 2", "lt").contains("(%scalar boolean)"));
 }
 
+/// `divide(a, b)` is structural, not a constant real: it promotes its two
+/// operands (spec §07 "scalars (real or complex)"). Real/real → real, but if
+/// either operand is complex the quotient is complex. The legacy always-Real
+/// rule (and the briefly-mistaken catalogue row) would type this as real.
+#[test]
+fn divide_promotes_complex_operands() {
+    // real / real → real (the established case).
+    assert!(meta_of("x = 1.0 / 2.0", "divide").contains("(%scalar real)"));
+    // complex / complex → complex.
+    let m = meta_of(
+        "z = divide(complex(1.0, 2.0), complex(3.0, 4.0))",
+        "(divide",
+    );
+    assert!(m.contains("(%scalar complex)"), "got: {m}");
+    // mixed real / complex → complex (promotion across operands).
+    let m = meta_of("z = divide(2.0, complex(3.0, 4.0))", "(divide");
+    assert!(m.contains("(%scalar complex)"), "got: {m}");
+}
+
+/// `mean(xs)` is structural, not a constant real: it reduces to the array's
+/// element type (spec §07 Reductions "real/complex arrays"). A real array
+/// gives a real mean; a complex array gives a complex mean. The legacy
+/// always-Real rule would type the complex case as real.
+#[test]
+fn mean_reduces_to_element_type() {
+    // real array → real mean.
+    let m = meta_of("x = mean([1.0, 2.0, 3.0])", "(mean");
+    assert!(m.contains("(%scalar real)"), "got: {m}");
+    // complex array → complex mean.
+    let m = meta_of("x = mean([complex(1.0, 2.0), complex(3.0, 4.0)])", "(mean");
+    assert!(m.contains("(%scalar complex)"), "got: {m}");
+}
+
 #[test]
 fn phases_follow_the_ancestor_rule() {
     let src = "a = elementof(reals)\nb ~ Normal(0.0, 1.0)\nc = a + b\nd = 1 + 2";
@@ -520,6 +553,54 @@ fn joint_mass_products() {
     );
 }
 
+/// Uniform's support is the set expression passed as its argument (spec §08
+/// "Domain/Support: ambient value space of `support` / `support`").  It is
+/// structural — resolved by `distribution_support` at inference time via
+/// `set_expr_valueset` — NOT a static catalogue tag.  This test guards that
+/// the live arg-dependent behavior is preserved even after Task 4 switches
+/// distribution dispatch to the catalogue: when the catalogue row carries
+/// `SupportTag::Structural`, dispatch MUST fall back to the code path.
+#[test]
+fn uniform_support_is_the_argument_set() {
+    // interval(-2.0, 3.0) is a named FlatPPL set expression; inferred support
+    // must be ValueSet::Interval(-2.0, 3.0), not Unknown.
+    let src = "u = Uniform(interval(-2.0, 3.0))";
+    let (module, diags) = infer_src(src);
+    let errors: Vec<_> = diags
+        .iter()
+        .filter(|d| d.severity == flatppl_infer::Severity::Error)
+        .collect();
+    assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+    let out = flatppl_flatpir::write(&module);
+    // Support must be the interval, not %unknown.
+    assert!(
+        out.contains("(interval -2.0 3.0)"),
+        "Uniform support must be the argument interval, got:\n{out}"
+    );
+    assert!(
+        !out.contains("%unknown"),
+        "Uniform support must not be Unknown when the arg set is known, got:\n{out}"
+    );
+    // Domain is always scalar real; mass is normalized.
+    assert!(
+        out.contains("(%scalar real)"),
+        "Uniform domain must be scalar real, got:\n{out}"
+    );
+    assert!(
+        out.contains("(%mass %normalized)"),
+        "Uniform must be a normalized measure, got:\n{out}"
+    );
+
+    // Also check with a named set constant: Uniform(reals) should give support reals.
+    let src2 = "u = Uniform(reals)";
+    let (module2, _) = infer_src(src2);
+    let out2 = flatppl_flatpir::write(&module2);
+    assert!(
+        out2.contains("(%meta ((%measure (%domain (%scalar real)) (%mass %normalized)) %fixed reals) (Uniform reals))"),
+        "Uniform(reals) support must be reals, got:\n{out2}"
+    );
+}
+
 /// Every §08 distribution row in the catalogue: constructs as a measure,
 /// mass %normalized, and a support that is never weaker than the domain's
 /// natural extent. Catches transcription slips in the table itself.
@@ -536,6 +617,7 @@ fn distribution_catalogue_sweep() {
         "Exponential",
         "Gamma",
         "Weibull",
+        "Pareto",
         "InverseGamma",
         "Beta",
         "ChiSquared",
