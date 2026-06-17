@@ -109,7 +109,9 @@ pub(crate) fn call_rule(
         },
 
         // ---- value-preserving assertion (spec §07) ----
-        "checked" => args.first().map_or(Type::Deferred, |(_, t, _)| t.clone()),
+        // `checked`/`fixed` are identity for typing (spec §03: `fixed(x)` ≡
+        // `identity(x)`, a tooling hint) — the wrapped value's type rides through.
+        "checked" | "fixed" => args.first().map_or(Type::Deferred, |(_, t, _)| t.clone()),
 
         // ---- parameters / inputs (spec §04) ----
         "elementof" | "external" => set_element_type(inf, args.first().map(|a| a.0)),
@@ -148,6 +150,7 @@ pub(crate) fn call_rule(
         ),
         "joint" => joint_type(named),
         "likelihoodof" => likelihood_type(inf, args),
+        "joint_likelihood" => joint_likelihood_type(args),
 
         // ---- explicit RNG (spec §07) ----
         "rnginit" => Type::RngState,
@@ -632,6 +635,131 @@ fn likelihood_type(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> Type {
     }
 }
 
+/// `joint_likelihood(L1, L2, …)` — combine likelihoods by multiplying densities
+/// (spec §06). It is *defined* to equal `likelihoodof(joint(model1, …), cat(obs1,
+/// …))`, so the combined inputs are the union of the component inputs (order-
+/// preserving) and the combined obstype is the §06 cat-composition of the
+/// component obstypes — NOT a tuple. Any non-likelihood (or `%deferred`) argument
+/// defers the whole result.
+fn joint_likelihood_type(args: &[ArgInfo]) -> Type {
+    if args.is_empty() {
+        return Type::Deferred;
+    }
+    let mut inputs: Vec<Symbol> = Vec::new();
+    let mut obstypes: Vec<Type> = Vec::with_capacity(args.len());
+    for (_, t, _) in args {
+        let Type::Likelihood {
+            inputs: li,
+            obstype,
+        } = t
+        else {
+            return Type::Deferred;
+        };
+        for name in li.iter() {
+            if !inputs.contains(name) {
+                inputs.push(*name);
+            }
+        }
+        obstypes.push((**obstype).clone());
+    }
+    Type::Likelihood {
+        inputs: inputs.into(),
+        obstype: Box::new(cat_compose(&obstypes)),
+    }
+}
+
+/// The spec §06 "same shape class" composition for `cat`-joined variates: the
+/// type of `cat(x1, x2, …)` when the components share a shape class. Used for the
+/// obstype of [`joint_likelihood_type`] (the joint observation is `cat(obs…)`);
+/// the same rule is what a future `cat` / positional-`joint` / `jointchain`
+/// domain rule needs.
+///
+/// - all scalars    → a length-`n` vector (component scalars promoted);
+/// - all 1-D arrays → one concatenated 1-D array (lengths summed, `%dynamic` if
+///   any is dynamic; elements promoted);
+/// - all records    → a merged record (fields concatenated — the spec requires
+///   the component field names be distinct).
+///
+/// Anything else — an empty list, a `%deferred` component, mixed shape classes, or
+/// a higher-rank array — yields `%deferred` (a sound "don't know", never a guess).
+fn cat_compose(types: &[Type]) -> Type {
+    let Some(first) = types.first() else {
+        return Type::Deferred;
+    };
+    if types.iter().any(|t| matches!(t, Type::Deferred)) {
+        return Type::Deferred;
+    }
+    match first {
+        // all scalars → a length-n vector
+        Type::Scalar(_) => {
+            let mut elem: Option<Type> = None;
+            for t in types {
+                if !matches!(t, Type::Scalar(_)) {
+                    return Type::Deferred; // mixed shape class
+                }
+                elem = Some(match elem {
+                    None => t.clone(),
+                    Some(prev) if &prev == t => prev,
+                    Some(prev) => match promote2(Some(&prev), Some(t)) {
+                        Type::Deferred => return Type::Deferred,
+                        p => p,
+                    },
+                });
+            }
+            Type::Array {
+                shape: Box::new([Dim::Static(types.len() as u32)]),
+                elem: Box::new(elem.unwrap_or(Type::Any)),
+            }
+        }
+        // all 1-D arrays → one concatenated 1-D array
+        Type::Array { shape, .. } if shape.len() == 1 => {
+            let mut total = 0u32;
+            let mut dynamic = false;
+            let mut elem: Option<Type> = None;
+            for t in types {
+                let Type::Array { shape, elem: e } = t else {
+                    return Type::Deferred; // mixed shape class
+                };
+                if shape.len() != 1 {
+                    return Type::Deferred; // higher-rank cat is not a §06 joint
+                }
+                match shape[0] {
+                    Dim::Static(n) => total += n,
+                    Dim::Dynamic => dynamic = true,
+                }
+                elem = Some(match elem {
+                    None => (**e).clone(),
+                    Some(prev) if &prev == e.as_ref() => prev,
+                    Some(prev) => match promote2(Some(&prev), Some(e.as_ref())) {
+                        Type::Deferred => return Type::Deferred,
+                        p => p,
+                    },
+                });
+            }
+            Type::Array {
+                shape: Box::new([if dynamic {
+                    Dim::Dynamic
+                } else {
+                    Dim::Static(total)
+                }]),
+                elem: Box::new(elem.unwrap_or(Type::Any)),
+            }
+        }
+        // all records → a merged record (component fields assumed distinct)
+        Type::Record(_) => {
+            let mut fields: Vec<(Symbol, Type)> = Vec::new();
+            for t in types {
+                let Type::Record(fs) = t else {
+                    return Type::Deferred; // mixed shape class
+                };
+                fields.extend(fs.iter().cloned());
+            }
+            Type::Record(fields.into())
+        }
+        _ => Type::Deferred,
+    }
+}
+
 /// Calling a user-defined callable: a function returns its body's type, a
 /// kernel returns the *measure* its body denotes (`kernelof` reifies the law
 /// of a value-typed body).
@@ -1104,6 +1232,11 @@ pub(crate) fn call_valueset(
                 None => ValueSet::Unknown,
             }
         }
+        // `checked`/`fixed` are identity (spec §03), so the wrapped value's set
+        // rides through — otherwise it would be needlessly lost to `Unknown`.
+        "checked" | "fixed" => args
+            .first()
+            .map_or(ValueSet::Unknown, |(n, _, _)| inf.lookup_valueset(*n)),
         // Distribution constructors: the support column of spec §08.
         _ => distribution_support(inf, &name, args, named),
     }
@@ -1536,4 +1669,70 @@ fn join_scalar_sets(sets: &[ValueSet]) -> Option<ValueSet> {
         .iter()
         .find(|c| sets.iter().all(|s| s.subset_of(c)))
         .cloned()
+}
+
+#[cfg(test)]
+mod cat_compose_tests {
+    //! Unit coverage for the §06 cat-composition helper (the `joint_likelihood`
+    //! obstype rule). The scalar→vector branch is also exercised end-to-end by
+    //! the `joint_likelihood_unions_inputs_and_cats_obstype` golden test; these
+    //! cover the array-concat / mixed-class / deferred branches directly.
+    use super::*;
+
+    fn arr(n: Dim, elem: ScalarType) -> Type {
+        Type::Array {
+            shape: Box::new([n]),
+            elem: Box::new(Type::Scalar(elem)),
+        }
+    }
+
+    #[test]
+    fn scalars_make_a_length_n_vector() {
+        use ScalarType::*;
+        assert_eq!(
+            cat_compose(&[Type::Scalar(Real), Type::Scalar(Real)]),
+            arr(Dim::Static(2), Real)
+        );
+    }
+
+    #[test]
+    fn arrays_concatenate_their_lengths() {
+        use ScalarType::*;
+        assert_eq!(
+            cat_compose(&[arr(Dim::Static(2), Real), arr(Dim::Static(3), Real)]),
+            arr(Dim::Static(5), Real)
+        );
+    }
+
+    #[test]
+    fn a_dynamic_length_makes_the_concat_dynamic() {
+        use ScalarType::*;
+        assert_eq!(
+            cat_compose(&[arr(Dim::Dynamic, Real), arr(Dim::Static(3), Real)]),
+            arr(Dim::Dynamic, Real)
+        );
+    }
+
+    #[test]
+    fn mixed_shape_classes_defer() {
+        use ScalarType::*;
+        assert_eq!(
+            cat_compose(&[Type::Scalar(Real), arr(Dim::Static(2), Real)]),
+            Type::Deferred
+        );
+    }
+
+    #[test]
+    fn a_deferred_component_propagates() {
+        use ScalarType::*;
+        assert_eq!(
+            cat_compose(&[Type::Scalar(Real), Type::Deferred]),
+            Type::Deferred
+        );
+    }
+
+    #[test]
+    fn an_empty_list_defers() {
+        assert_eq!(cat_compose(&[]), Type::Deferred);
+    }
 }

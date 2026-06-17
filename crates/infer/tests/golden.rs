@@ -166,6 +166,38 @@ fn iid_static_count_shapes_the_domain() {
 }
 
 #[test]
+fn fixed_is_identity_for_type_and_valueset() {
+    // `fixed(x)` ≡ `identity(x)` (spec §03, a tooling hint): type, phase, and
+    // value set all ride through the wrapper — no `%deferred`, no lost value set.
+    let m = meta_of("p = elementof(posreals)\nx = fixed(p)", "(fixed");
+    assert!(m.contains("(%scalar real)"), "type must ride through, got: {m}");
+    assert!(m.contains("posreals"), "value set must ride through, got: {m}");
+    assert!(!m.contains("%deferred"), "fixed must not defer, got: {m}");
+}
+
+#[test]
+fn joint_likelihood_unions_inputs_and_cats_obstype() {
+    // joint_likelihood(L1, L2) ≡ likelihoodof(joint(models), cat(obs)) (spec §06):
+    // its inputs are the union of the components', and its obstype is the §06
+    // cat-composition of theirs — two scalar observations → a length-2 vector,
+    // NOT a tuple.
+    let src = "\
+mu = elementof(reals)
+nu = elementof(reals)
+m1 = functionof(Normal(mu = mu, sigma = 1.0), mu = mu)
+m2 = functionof(Normal(mu = nu, sigma = 0.5), nu = nu)
+L1 = likelihoodof(m1, 1.5)
+L2 = likelihoodof(m2, 3.2)
+L = joint_likelihood(L1, L2)";
+    let m = meta_of(src, "(joint_likelihood");
+    assert!(m.contains("(%inputs mu nu)"), "inputs must be the union, got: {m}");
+    assert!(
+        m.contains("(%obstype (%array 1 (2) (%scalar real)))"),
+        "obstype must be cat(obs) = a length-2 real vector, got: {m}"
+    );
+}
+
+#[test]
 fn reference_cycle_is_an_error() {
     let (module, diags) = infer_src("x = y + 1\ny = x + 1");
     assert!(
