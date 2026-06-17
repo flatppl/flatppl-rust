@@ -216,7 +216,8 @@ fn convert(
 
     // Read the module: HS3/pyhf paths (feature-gated) or the standard
     // extension-based FlatPPL/FlatPIR path.
-    let module = match from_format {
+    #[cfg_attr(not(feature = "fmtlint"), allow(unused_mut))]
+    let mut module = match from_format {
         #[cfg(feature = "hs3")]
         FromFormat::Hs3 => {
             let source = fs::read_to_string(input)
@@ -279,6 +280,12 @@ fn convert(
         }
         .header(comment);
         text.insert_str(0, &header);
+    }
+    // Surface lint findings on generated FlatPPL (advisory — the file is still
+    // written). The output is already canonically formatted by the printer.
+    #[cfg(feature = "fmtlint")]
+    if matches!(to, Format::FlatPpl) {
+        flatppl_cli::lint_generated(&mut module, output);
     }
     fs::write(output, text)
         .map_err(|e| Failure::Plain(format!("writing `{}`: {e}", output.display())))

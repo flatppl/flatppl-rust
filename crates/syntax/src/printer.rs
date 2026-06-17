@@ -21,11 +21,18 @@
 use std::collections::HashSet;
 
 use flatppl_core::{
-    Axis, Call, CallHead, Doc, Inputs, Markup, Module, Node, NodeId, Ref, RefNs, Scalar, Symbol,
-    Variance,
+    Axis, Call, CallHead, Doc, Inputs, Markup, Module, NamedArg, Node, NodeId, Ref, RefNs, Scalar,
+    Symbol, Variance,
 };
 
 use crate::parser::is_placeholder;
+
+/// Target line width for [`Syntax::Full`]. A statement whose single-line form
+/// would exceed this is broken across lines at its outermost composition
+/// boundary (call argument lists, dotted-broadcast operands, literals).
+const WIDTH: usize = 100;
+/// Continuation indent (spaces) per nesting level when a line is broken.
+const INDENT: usize = 2;
 
 /// Surface-syntax level for printed FlatPPL.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -88,6 +95,17 @@ struct BinOp {
     plain: &'static str,
     dotted: Option<&'static str>,
     prec: u8,
+}
+
+/// A node viewed as an infix operator application, for line wrapping: the
+/// surface operator spelling, its operands, and the precedence floors each
+/// operand prints at (so a broken chain re-parses to the same tree).
+struct Infix {
+    op: String,
+    lmin: u8,
+    rmin: u8,
+    left: NodeId,
+    right: NodeId,
 }
 
 /// The lowered builtin → infix operator map (the inverse of the parser's
@@ -198,7 +216,9 @@ impl<'m> Printer<'m> {
                     && call.named.is_empty()
                     && call.inputs.is_none()
                 {
-                    return format!("{name} ~ {}", self.expr_top(call.args[0]));
+                    let prefix = format!("{name} ~ ");
+                    let body = self.body_w(call.args[0], prefix.chars().count());
+                    return format!("{prefix}{body}");
                 }
             }
             if self.syntax == Syntax::Full {
@@ -210,12 +230,18 @@ impl<'m> Printer<'m> {
                 }
             }
         }
-        format!("{name} = {}", self.expr_top(binding.rhs))
+        let prefix = format!("{name} = ");
+        let body = self.body_w(binding.rhs, prefix.chars().count());
+        format!("{prefix}{body}")
     }
 
-    fn expr_top(&self, id: NodeId) -> String {
+    /// A statement's right-hand side, width-aware: [`Syntax::Full`] breaks an
+    /// over-wide composition across lines (starting at column `col`, the width
+    /// already consumed by the statement's `lhs = ` / `lhs ~ ` / `… :=` prefix);
+    /// [`Syntax::Minimal`] always emits the flat linear form.
+    fn body_w(&self, id: NodeId, col: usize) -> String {
         match self.syntax {
-            Syntax::Full => self.full(id, EXPR, &[]),
+            Syntax::Full => self.full_w(id, EXPR, &[], col, 0, false),
             Syntax::Minimal => self.minimal(id),
         }
     }
@@ -238,10 +264,9 @@ impl<'m> Printer<'m> {
             _ => return None,
         }
         let axes = self.axis_list_text(call.args[1])?;
-        Some(format!(
-            "{name}[{axes}] := {}",
-            self.full(call.args[2], EXPR, &[])
-        ))
+        let prefix = format!("{name}[{axes}] := ");
+        let body = self.body_w(call.args[2], prefix.chars().count());
+        Some(format!("{prefix}{body}"))
     }
 
     /// `metric: name[.axes…] := body` — the statement form's metric is a
@@ -269,10 +294,9 @@ impl<'m> Printer<'m> {
             return None;
         }
         let axes = self.axis_list_text(call.args[1])?;
-        Some(format!(
-            "{metric}: {name}[{axes}] := {}",
-            self.full(call.args[2], EXPR, &[])
-        ))
+        let prefix = format!("{metric}: {name}[{axes}] := ");
+        let body = self.body_w(call.args[2], prefix.chars().count());
+        Some(format!("{prefix}{body}"))
     }
 
     /// The `[.i, .k^]` axis list of a `:=` statement: a `vector` literal whose
@@ -652,6 +676,252 @@ impl<'m> Printer<'m> {
             ));
         }
         parts.join(", ")
+    }
+
+    // ---- full-syntax line wrapping (width-aware) ----
+    //
+    // A node prints flat when it fits within `WIDTH` at its starting column;
+    // otherwise it breaks at its outermost composition boundary. Breaking is
+    // only ever introduced INSIDE a bracket pair (call `()`, dot-call `.(`,
+    // literal `[ ]`), because the lexer treats a newline as whitespace only at
+    // nonzero bracket depth — at depth 0 it is a statement separator (§05). So
+    // a bare top-level operator chain (no enclosing bracket) is left flat; the
+    // `bracketed` flag tracks whether breaking is admissible here. The flat
+    // form drives every fit/measure decision, so re-parsing and re-printing a
+    // wrapped module reproduces it exactly (idempotent, semantics-preserving).
+
+    /// Print `id` for a context accepting precedence ≥ `min`, breaking across
+    /// lines if the flat form would overflow `WIDTH` from column `col`.
+    /// `indent` is the indentation of the line this node starts on (its
+    /// continuation lines indent one [`INDENT`] step deeper); `bracketed` is
+    /// whether an enclosing bracket makes a line break safe here.
+    fn full_w(
+        &self,
+        id: NodeId,
+        min: u8,
+        lambda: &[Symbol],
+        col: usize,
+        indent: usize,
+        bracketed: bool,
+    ) -> String {
+        let (text, prec) = self.full_node(id, lambda);
+        let flat = if prec < min {
+            format!("({text})")
+        } else {
+            text
+        };
+        if col + flat.chars().count() <= WIDTH {
+            return flat;
+        }
+        // Over width. Parenthesizing parens are a real bracket pair, so an
+        // otherwise-unbreakable node may break inside them.
+        if prec < min {
+            let inner = self.break_node(id, lambda, indent + INDENT, true);
+            if inner.contains('\n') {
+                let pad = " ".repeat(indent + INDENT);
+                let close = " ".repeat(indent);
+                return format!("(\n{pad}{inner}\n{close})");
+            }
+            return flat;
+        }
+        let broken = self.break_node(id, lambda, indent, bracketed);
+        if broken.contains('\n') { broken } else { flat }
+    }
+
+    /// Break `id` across lines at its outermost composition boundary. Returns a
+    /// flat string (no newline) when the node has no breakable form, in which
+    /// case [`full_w`](Self::full_w) keeps the measured flat text instead.
+    fn break_node(&self, id: NodeId, lambda: &[Symbol], indent: usize, bracketed: bool) -> String {
+        // An operator chain breaks one operand per line — but only inside a
+        // bracket, since the continuation newlines must not end the statement.
+        if bracketed {
+            if let Some(inf) = self.as_infix(id) {
+                return self.break_op(id, &inf.op, inf.lmin, inf.rmin, lambda, indent);
+            }
+        }
+        let Node::Call(c) = self.module.node(id) else {
+            return self.full(id, EXPR, lambda);
+        };
+        // Reified callables / lambdas keep their flat form.
+        if c.inputs.is_some() {
+            return self.full(id, EXPR, lambda);
+        }
+        match &c.head {
+            CallHead::Builtin(op) => {
+                let name = self.module.resolve(*op);
+                match name {
+                    "vector" if c.named.is_empty() => {
+                        self.break_list("[", "]", &c.args, &[], lambda, indent)
+                    }
+                    "tuple" if c.named.is_empty() && c.args.len() >= 2 => {
+                        self.break_list("(", ")", &c.args, &[], lambda, indent)
+                    }
+                    // A non-operator broadcast prints as a dot-call `head.(…)`;
+                    // break its operand list (the operator forms are handled by
+                    // the `as_infix` branch above).
+                    "broadcast" if c.args.len() >= 2 => {
+                        let head = self.dot_object(c.args[0], lambda);
+                        let open = format!("{head}.(");
+                        self.break_list(&open, ")", &c.args[1..], &c.named, lambda, indent)
+                    }
+                    // Indexing / field access (`get`) has no comma-list to break.
+                    "get" => self.full(id, EXPR, lambda),
+                    _ => {
+                        let open = format!("{}(", self.builtin_name(*op));
+                        self.break_list(&open, ")", &c.args, &c.named, lambda, indent)
+                    }
+                }
+            }
+            CallHead::User(callee) => {
+                let open = format!("{}(", self.full(*callee, POSTFIX, lambda));
+                self.break_list(&open, ")", &c.args, &c.named, lambda, indent)
+            }
+        }
+    }
+
+    /// Render a bracketed argument / element list one entry per line:
+    /// ```text
+    /// open
+    ///   entry0,
+    ///   entry1,
+    /// close
+    /// ```
+    /// `open` carries the head and opening bracket (e.g. `f(`, `[`, `m.(`);
+    /// the trailing comma re-parses away. Each entry is itself width-aware at
+    /// the deeper indent.
+    fn break_list(
+        &self,
+        open: &str,
+        close: &str,
+        positional: &[NodeId],
+        named: &[NamedArg],
+        lambda: &[Symbol],
+        indent: usize,
+    ) -> String {
+        let child = indent + INDENT;
+        let pad = " ".repeat(child);
+        let mut s = String::from(open);
+        s.push('\n');
+        for &a in positional {
+            let r = self.full_w(a, EXPR, lambda, child, child, true);
+            s.push_str(&pad);
+            s.push_str(&r);
+            s.push_str(",\n");
+        }
+        for n in named {
+            let key = self.module.resolve(n.name);
+            let prefix = format!("{key} = ");
+            let r = self.full_w(
+                n.value,
+                EXPR,
+                lambda,
+                child + prefix.chars().count(),
+                child,
+                true,
+            );
+            s.push_str(&pad);
+            s.push_str(&prefix);
+            s.push_str(&r);
+            s.push_str(",\n");
+        }
+        s.push_str(&" ".repeat(indent));
+        s.push_str(close);
+        s
+    }
+
+    /// Break a same-operator chain `e0 op e1 op e2` so each subsequent operand
+    /// starts a continuation line under a leading operator:
+    /// ```text
+    /// e0
+    /// op e1
+    /// op e2
+    /// ```
+    /// (A leading-operator continuation re-lexes inside the enclosing bracket.)
+    fn break_op(
+        &self,
+        id: NodeId,
+        op: &str,
+        lmin: u8,
+        rmin: u8,
+        lambda: &[Symbol],
+        indent: usize,
+    ) -> String {
+        let mut elems = Vec::new();
+        self.op_spine(id, op, &mut elems);
+        let pad = " ".repeat(indent);
+        let mut s = self.full_w(elems[0], lmin, lambda, indent, indent, true);
+        for &e in &elems[1..] {
+            let opcol = indent + op.chars().count() + 1;
+            let r = self.full_w(e, rmin, lambda, opcol, indent, true);
+            s.push('\n');
+            s.push_str(&pad);
+            s.push_str(op);
+            s.push(' ');
+            s.push_str(&r);
+        }
+        s
+    }
+
+    /// Flatten the left spine of nodes joined by the SAME infix operator `op`
+    /// (left-associative), so the chain prints as one column of operands.
+    fn op_spine(&self, id: NodeId, op: &str, out: &mut Vec<NodeId>) {
+        if let Some(inf) = self.as_infix(id) {
+            if inf.op == op {
+                self.op_spine(inf.left, op, out);
+                out.push(inf.right);
+                return;
+            }
+        }
+        out.push(id);
+    }
+
+    /// View a node as a breakable infix operator application: a plain binary
+    /// builtin (`add`/`mul`/…) or a dotted broadcast `broadcast(op, l, r)`.
+    /// `land` is excluded — a 2-arg `land` may be a comparison-chain sugar
+    /// (`a < b < c`), and chains are short enough never to wrap.
+    fn as_infix(&self, id: NodeId) -> Option<Infix> {
+        let Node::Call(c) = self.module.node(id) else {
+            return None;
+        };
+        if !c.named.is_empty() || c.inputs.is_some() {
+            return None;
+        }
+        let CallHead::Builtin(op) = c.head else {
+            return None;
+        };
+        let name = self.module.resolve(op);
+        if c.args.len() == 2 {
+            if let Some(b) = binop(name) {
+                if b.prec == AND {
+                    return None;
+                }
+                let (lmin, rmin) = operand_mins(b.prec);
+                return Some(Infix {
+                    op: b.plain.to_string(),
+                    lmin,
+                    rmin,
+                    left: c.args[0],
+                    right: c.args[1],
+                });
+            }
+        }
+        if name == "broadcast" && c.args.len() == 3 {
+            if let Node::Const(f) = self.module.node(c.args[0]) {
+                if let Some(b) = binop(self.module.resolve(*f)) {
+                    if let Some(dotted) = b.dotted {
+                        let (lmin, rmin) = operand_mins(b.prec);
+                        return Some(Infix {
+                            op: dotted.to_string(),
+                            lmin,
+                            rmin,
+                            left: c.args[1],
+                            right: c.args[2],
+                        });
+                    }
+                }
+            }
+        }
+        None
     }
 
     // ---- reified callables (shared by both syntaxes) ----

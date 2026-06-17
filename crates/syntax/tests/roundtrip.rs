@@ -72,6 +72,63 @@ roundtrip_tests! {
     metricsum => "metricsum.flatppl",
 }
 
+/// Over-wide Full-syntax statements break at their composition boundaries
+/// (call argument lists, dotted-broadcast operator spines, named arguments),
+/// while staying semantics-preserving and idempotent. A bare top-level
+/// operator chain cannot break (a depth-0 newline ends the statement) and is
+/// left flat. Source is inlined rather than added to `fixtures/flatppl/` so it
+/// stays out of the cross-engine corpus (these dotted-op forms hit a filed
+/// JS eta-expansion divergence orthogonal to printing).
+#[test]
+fn full_syntax_wraps_wide_statements() {
+    let src = "\
+m = standard_module(\"particle-physics\", \"0.1\")
+a = elementof(reals)
+b = elementof(reals)
+c = elementof(cartpow(posreals, 2))
+expected = [20.0, 10.0] .* m.interp_poly6_exp(0.95, 1.0, 1.05, a) .* b .+ [100.0, 0.0] .* c
+obs = Poisson.([20.0, 10.0] .* m.interp_poly6_exp(0.95, 1.0, 1.05, a) .* b .+ [100.0, 0.0] .* m.interp_poly6_exp(0.95, 1.0, 1.05, a) .* c .+ [0.0, 100.0] .* m.interp_poly6_exp(0.95, 1.0, 1.05, b) .* c)
+L = joint_likelihood(likelihoodof(obs, [122.0, 112.0]), likelihoodof(Normal(mu = a, sigma = 1.0), 0.0), likelihoodof(Normal(mu = b, sigma = 1.0), 0.0))
+dom = cartprod(a = interval(0.0, 10.0), b = interval(-5.0, 5.0), c0 = interval(0.0, 10.0), c1 = interval(0.0, 10.0))";
+
+    let m1 = parse(src).unwrap();
+    let printed = print_with(&m1, Syntax::Full);
+
+    // Breakable statements actually broke.
+    assert!(
+        printed.contains("joint_likelihood(\n"),
+        "wide call did not break"
+    );
+    assert!(
+        printed.contains("Poisson.(\n"),
+        "wide dot-call did not break"
+    );
+    assert!(printed.contains("\n  .+ "), "dotted-op spine did not break");
+
+    // Every breakable line is within width; only the bare top-level chain is over.
+    for line in printed.lines() {
+        let unbreakable = line.starts_with("expected = ");
+        assert!(
+            line.chars().count() <= 100 || unbreakable,
+            "line exceeds width and is breakable: {line}"
+        );
+    }
+
+    // Semantics-preserving and idempotent.
+    let m2 =
+        parse(&printed).unwrap_or_else(|e| panic!("wrapped form re-parse failed: {e}\n{printed}"));
+    assert_eq!(
+        flatppl_flatpir::write(&m1),
+        flatppl_flatpir::write(&m2),
+        "wrapping changed the module"
+    );
+    assert_eq!(
+        printed,
+        print_with(&m2, Syntax::Full),
+        "wrapping is not idempotent"
+    );
+}
+
 /// Pins both printer levels so accidental drift is caught.
 #[test]
 fn print_level_goldens() {

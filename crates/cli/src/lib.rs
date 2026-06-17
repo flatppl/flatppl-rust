@@ -474,6 +474,32 @@ pub fn run_lint(
     Ok(())
 }
 
+/// Lint a freshly generated FlatPPL `module` and print any findings to stderr
+/// as advisory diagnostics tagged with the output `path`. Conversion output is
+/// canonically formatted by construction (it comes straight from the printer),
+/// so `not-canonical` is silenced and this never fails the run — it only
+/// surfaces modelling-level lints the importer's output happens to trip.
+#[cfg(feature = "fmtlint")]
+pub fn lint_generated(module: &mut Module, path: &std::path::Path) {
+    use flatppl_lint::{Config, RuleId, Severity};
+    use std::io::Write;
+
+    let mut cfg = Config::default();
+    cfg.set(RuleId::NotCanonical, Severity::Allow);
+    let diags = flatppl_lint::lint(module, &cfg);
+
+    let disp = path.display();
+    let mut err = std::io::stderr().lock();
+    for d in &diags {
+        let tag = match d.severity {
+            Severity::Deny => "error",
+            Severity::Warn => "warning",
+            Severity::Allow => continue,
+        };
+        let _ = writeln!(err, "{disp}: {tag}[{}]: {}", d.rule, d.message);
+    }
+}
+
 /// Scan source for file-level `% flatppl-lint: allow RULE` directives.
 #[cfg(feature = "fmtlint")]
 fn inline_allows(source: &str) -> Vec<flatppl_lint::RuleId> {
