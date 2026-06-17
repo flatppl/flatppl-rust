@@ -1,0 +1,35 @@
+# Dependabot configuration.
+# Docs: https://docs.github.com/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
+#
+# `version: 2` is the current configuration schema. Updates run weekly; the
+# `cooldown` keeps any newly released version out of a PR until it has been
+# available for 30 days, so we never adopt a release in its first month.
+version: 2
+updates:
+  # Rust crates (the virtual workspace at the repo root).
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 30
+    open-pull-requests-limit: 10
+    groups:
+      cargo-minor-patch:
+        update-types:
+          - minor
+          - patch
+
+  # GitHub Actions used by the workflows under .github/workflows.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 30
+    open-pull-requests-limit: 10
+    groups:
+      github-actions:
+        update-types:
+          - minor
+          - patch
