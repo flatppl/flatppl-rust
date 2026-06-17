@@ -149,8 +149,13 @@ impl SampleData {
 /// from the `Distribution.extra` map.
 #[derive(Debug, Deserialize)]
 pub struct HistFactory {
-    // Axes are parsed for schema fidelity; bin count is taken from sample contents.
+    // Parsed for schema fidelity only — the bin count is taken from sample
+    // contents, never from the axes. `#[serde(default)]` because we never read it:
+    // requiring a field we don't use would hard-fail a document for no reason if a
+    // producer omits it. (ROOT writes `axes` unconditionally, so this is defensive
+    // robustness against other HS3 producers, not a ROOT-omission workaround.)
     #[allow(dead_code)]
+    #[serde(default)]
     pub axes: Vec<HfAxis>,
     pub samples: Vec<Sample>,
 }
