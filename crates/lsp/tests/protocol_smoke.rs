@@ -14,7 +14,8 @@ use lsp_types::{
     MarkupKind, TextDocumentItem, Uri,
     notification::{DidOpenTextDocument, Initialized, Notification as _},
     request::{
-        Completion, DocumentSymbolRequest, GotoDefinition, HoverRequest, Initialize, Request as _,
+        Completion, DocumentSymbolRequest, GotoDefinition, HoverRequest, Initialize,
+        InlayHintRequest, Request as _, WorkspaceSymbolRequest,
     },
 };
 
@@ -242,8 +243,8 @@ fn initialize_did_open_hover_smoke() {
 // ── P-B protocol smoke: completion + documentSymbol + definition ─────────────
 
 /// Protocol-level smoke coverage for the P-B capabilities added in this plan:
-/// `textDocument/completion`, `textDocument/documentSymbol`, and
-/// `textDocument/definition`.
+/// `textDocument/completion`, `textDocument/documentSymbol`,
+/// `textDocument/definition`, `workspace/symbol`, and `textDocument/inlayHint`.
 ///
 /// Source: `"x = 1\ny = add(x, 2)"` — two in-scope bindings, one
 /// same-module reference.  All three requests are driven over the wire after a
@@ -442,7 +443,92 @@ fn pb_capabilities_smoke() {
         );
     }
 
-    // ── 6. Shutdown ──────────────────────────────────────────────────────────
+    // ── 6. workspace/symbol ──────────────────────────────────────────────────
+    //
+    // An empty query returns every workspace symbol; must include "x" and "y".
+    {
+        let ws_params = lsp_types::WorkspaceSymbolParams {
+            query: String::new(),
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+        let ws_req = Request {
+            id: RequestId::from(13i32),
+            method: WorkspaceSymbolRequest::METHOD.to_owned(),
+            params: serde_json::to_value(ws_params).unwrap(),
+        };
+        let resp = round_trip(&client_conn, ws_req);
+
+        assert!(
+            resp.error.is_none(),
+            "workspace/symbol response must not be an error; got: {:?}",
+            resp.error
+        );
+        let result = resp
+            .result
+            .expect("workspace/symbol result must be present");
+        assert!(
+            !result.is_null(),
+            "workspace/symbol result must be non-null for PB_SRC"
+        );
+        let ws_resp: lsp_types::WorkspaceSymbolResponse =
+            serde_json::from_value(result).expect("workspace/symbol result must deserialize");
+        let names: Vec<String> = match ws_resp {
+            lsp_types::WorkspaceSymbolResponse::Flat(syms) => {
+                syms.into_iter().map(|s| s.name).collect()
+            }
+            lsp_types::WorkspaceSymbolResponse::Nested(syms) => {
+                syms.into_iter().map(|s| s.name).collect()
+            }
+        };
+        assert!(
+            names.iter().any(|n| n == "x"),
+            "workspace/symbol must include 'x'; got: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "y"),
+            "workspace/symbol must include 'y'; got: {names:?}"
+        );
+    }
+
+    // ── 7. textDocument/inlayHint ────────────────────────────────────────────
+    //
+    // Request hints over the whole document range; the binding RHSs carry
+    // inferred types, so at least one type hint must come back.
+    {
+        let inlay_params = lsp_types::InlayHintParams {
+            text_document: lsp_types::TextDocumentIdentifier {
+                uri: Uri::from_str(PB_FILE_URI).unwrap(),
+            },
+            range: lsp_types::Range {
+                start: lsp_types::Position::new(0, 0),
+                end: lsp_types::Position::new(1, 14),
+            },
+            work_done_progress_params: Default::default(),
+        };
+        let inlay_req = Request {
+            id: RequestId::from(14i32),
+            method: InlayHintRequest::METHOD.to_owned(),
+            params: serde_json::to_value(inlay_params).unwrap(),
+        };
+        let resp = round_trip(&client_conn, inlay_req);
+
+        assert!(
+            resp.error.is_none(),
+            "inlayHint response must not be an error; got: {:?}",
+            resp.error
+        );
+        let result = resp.result.expect("inlayHint result must be present");
+        assert!(!result.is_null(), "inlayHint result must be non-null");
+        let hints: Vec<lsp_types::InlayHint> =
+            serde_json::from_value(result).expect("inlayHint result must deserialize");
+        assert!(
+            !hints.is_empty(),
+            "inlayHint must return at least one type hint over the full range of {PB_SRC:?}"
+        );
+    }
+
+    // ── 8. Shutdown ──────────────────────────────────────────────────────────
     do_shutdown(&client_conn, 99);
     server_thread.join().expect("server thread must not panic");
 }

@@ -256,9 +256,11 @@ pub struct DefLoc {
 ///
 /// - [`RefNs::SelfMod`]: resolve to the binding in the same module whose RHS
 ///   span is returned.
-/// - [`RefNs::Module`]: cross-file goto; find the alias binding's `load_module`
-///   path, resolve it to a dep [`SourceFile`], analyze it, and search its
-///   bindings by name string for the binding named `r.name`.
+/// - [`RefNs::Module`]: cross-file goto; find the alias binding's directive
+///   (`load_module` or `standard_module`), resolve its path to a dep
+///   [`SourceFile`], analyze it, and search its bindings by name string for the
+///   binding named `r.name`. A `standard_module` reference has no workspace file
+///   to navigate to, so `resolve_path` finds nothing and this returns `None`.
 /// - [`RefNs::Local`]: not navigable from the surface; returns `None`.
 pub fn goto_definition(
     db: &dyn salsa::Database,
@@ -348,7 +350,10 @@ pub fn inlay_hints(
         let Some(span) = module.span_of(binding.rhs) else {
             continue;
         };
-        // Filter to bindings whose RHS falls within the requested range.
+        // Filter to bindings whose RHS is fully contained in the requested
+        // range. Containment (not intersection) is deliberate: it can never
+        // place a hint outside the client's visible window. A binding whose RHS
+        // straddles a range boundary gets no hint until the range covers it.
         if span.start < start_byte || span.end > end_byte {
             continue;
         }
@@ -397,6 +402,9 @@ pub fn completion(
     file: SourceFile,
     fs: FileSet,
     cats: Catalogues,
+    // Cursor byte offset. The server already resolves `member_prefix` from it
+    // before calling, so the body does not read it; kept in the signature for
+    // future prefix-aware filtering (narrowing items by the typed text).
     _byte_offset: u32,
     member_prefix: Option<String>,
 ) -> Vec<lsp_types::CompletionItem> {
