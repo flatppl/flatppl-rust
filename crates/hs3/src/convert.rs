@@ -495,6 +495,29 @@ fn emit_histfactory_channels(m: &mut Module, doc: &Document) -> Result<()> {
                     .iter()
                     .map(|mo| {
                         let mut mo = mo.clone();
+                        if mo.kind == "shapesys" {
+                            // HS3 `shapesys` `vals` are RELATIVE per-bin
+                            // uncertainties (RooFit / HS3 convention), unlike
+                            // pyhf's absolute `data`. Scale by this sample's
+                            // nominal to absolute σ so the shared channel
+                            // assembler's τ = (nominal/σ)² yields RooFit's
+                            // τ = 1/vals². (The pyhf path passes absolute vals
+                            // straight through and is untouched.)
+                            let nominal = s.data.contents();
+                            let vals = mo
+                                .data
+                                .as_ref()
+                                .map(|v| v.get("vals").unwrap_or(v))
+                                .and_then(serde_json::Value::as_array);
+                            if let Some(vals) = vals {
+                                let abs: Vec<f64> = vals
+                                    .iter()
+                                    .zip(nominal)
+                                    .filter_map(|(rel, nom)| rel.as_f64().map(|r| r * nom))
+                                    .collect();
+                                mo.data = Some(serde_json::json!(abs));
+                            }
+                        }
                         if mo.kind == "staterror" {
                             // Normalize the per-bin uncertainty array the channel
                             // assembler reads from `modifier.data` to a bare array,

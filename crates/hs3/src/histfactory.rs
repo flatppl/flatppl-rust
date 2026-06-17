@@ -21,6 +21,10 @@ pub fn sample_nominal(b: &mut Builder, data: &SampleData) -> NodeId {
 /// `v` is not a JSON array or if any element is not a number — silently coercing
 /// a non-numeric entry to `0.0` would emit a wrong-but-plausible model.
 fn json_array(b: &mut Builder, v: &serde_json::Value, what: &str) -> Result<NodeId> {
+    // Accept both the bare `[...]` form (pyhf) and the `{ "vals": [...] }`
+    // object form (RooFit / HS3 high-level). Both are valid HS3; unwrap the
+    // object to its inner array before the array check.
+    let v = v.get("vals").unwrap_or(v);
     let arr = v
         .as_array()
         .ok_or_else(|| Error::Unsupported(format!("{what}: expected a JSON array of numbers")))?;

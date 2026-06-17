@@ -34,7 +34,33 @@ fn emit_pyhf(b: &mut Builder, doc: &PyhfDocument) -> Result<()> {
         emit_channel(b, doc, channel)?;
     }
 
+    // Measurement parameter-of-interest → record binding (so `config.poi`
+    // survives the lift; FlatPPL has no dedicated POI construct).
+    emit_poi(b, doc);
+
     Ok(())
+}
+
+/// Emit each measurement's parameter-of-interest as `<measurement> = record(poi = <param>)`.
+///
+/// pyhf's `config.poi` names a free parameter already declared by a modifier; a
+/// record preserves the association without inventing a language construct.
+/// Measurements from either schema (top-level `measurements` or old-format
+/// `toplvl.measurements`) are covered.
+fn emit_poi(b: &mut Builder, doc: &PyhfDocument) {
+    let toplvl = doc.toplvl.iter().flat_map(|t| t.measurements.iter());
+    for meas in doc.measurements.iter().chain(toplvl) {
+        match &meas.config.poi {
+            // An empty `poi` string means "no POI declared" — skip it (emitting
+            // `record(poi = )` would be syntactically invalid).
+            Some(poi) if !poi.is_empty() => {
+                let poi_ref = b.self_ref(poi);
+                let rec = b.call_kw("record", &[("poi", poi_ref)]);
+                b.bind(&meas.name, rec);
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Emit `hepphys = standard_module("particle-physics", "0.1")`.
