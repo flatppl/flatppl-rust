@@ -128,6 +128,65 @@ y = broadcast(hepphys.ContinuedPoisson, rates)
     );
 }
 
+/// `broadcast(hepphys.interp_poly6_exp, …)` over a §09 standard-module
+/// *function* head maps elementwise into an array of the per-cell result type
+/// (here real → real), just like the built-in deterministic-op path
+/// (`broadcast(add, …)`) — not a measure, and never `%deferred`. The per-bin
+/// templates (lo/nom/hi) are arrays while the nuisance parameter `alpha` is a
+/// single scalar that rides along — exactly the histfactory normsys shape.
+#[test]
+fn broadcast_of_std_function_infers_array_value() {
+    let src = r#"
+hepphys = standard_module("particle-physics", "0.1")
+lo = [0.9, 0.8]
+nom = [1.0, 1.0]
+hi = [1.1, 1.2]
+alpha = elementof(reals)
+y = broadcast(hepphys.interp_poly6_exp, lo, nom, hi, alpha)
+"#;
+    let (module, diags) = infer_src(src, Level::Type);
+    assert!(errors(&diags).is_empty(), "unexpected errors: {diags:?}");
+
+    let ty = binding_ty(&module, "y");
+    assert!(
+        matches!(
+            ty,
+            Some(Type::Array { shape, elem })
+                if shape.len() == 1 && **elem == Type::Scalar(ScalarType::Real)
+        ),
+        "broadcast of interp_poly6_exp should be an array of reals (a value, not a measure); got {ty:?}"
+    );
+}
+
+/// A §09 function whose result is a different scalar kind than its inputs
+/// (`hepphys.resonance_breitwigner(…) → Complex`) broadcasts to an array of that
+/// result kind — the cell type comes from the catalogue sig, not the inputs.
+#[test]
+fn broadcast_of_std_function_uses_catalogue_result_kind() {
+    let src = r#"
+hepphys = standard_module("particle-physics", "0.1")
+sigma = [1.0, 2.0]
+m = [3.0, 4.0]
+width = [0.1, 0.2]
+ma = [0.0, 0.0]
+mb = [0.0, 0.0]
+l = [1, 1]
+d = [1.0, 1.0]
+y = broadcast(hepphys.resonance_breitwigner, sigma, m, width, ma, mb, l, d)
+"#;
+    let (module, diags) = infer_src(src, Level::Type);
+    assert!(errors(&diags).is_empty(), "unexpected errors: {diags:?}");
+
+    let ty = binding_ty(&module, "y");
+    assert!(
+        matches!(
+            ty,
+            Some(Type::Array { elem, .. }) if **elem == Type::Scalar(ScalarType::Complex)
+        ),
+        "broadcast of resonance_breitwigner should be an array of complex; got {ty:?}"
+    );
+}
+
 /// End-to-end of the converter's constraint chain (the reported inference gap):
 /// a boundary-less `functionof` over a `broadcast` of a §09 distribution is a
 /// kernel over its single parametric leaf, and `likelihoodof` of it carries that

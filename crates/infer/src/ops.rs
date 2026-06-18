@@ -969,25 +969,45 @@ fn broadcast_type(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo], named: &[Named
         _ => {}
     }
 
-    // §09 standard-module distribution head (`hepphys.ContinuedPoisson`): an
-    // independent product over the array, exactly like a built-in distribution
-    // head — but its cell domain and mass come from the catalogue sig (so a
-    // non-probability measure like `ContinuedPoisson` stays `Finite`, not
-    // forced to `Normalized`). Checked first: the catalogue-ref side-table is
-    // populated only for §09 module references, so this never shadows a
-    // built-in. Lowered with empty args — the per-cell rate is the broadcast
-    // data, as in the built-in path's `distribution_domain(…, &[], &[])`.
+    // §09 standard-module head (`hepphys.ContinuedPoisson`, `hepphys.interp_*`):
+    // broadcast against the catalogue sig, exactly like a built-in head below.
+    // Checked first because the catalogue-ref side-table is populated only for
+    // §09 module references, so this never shadows a built-in. The per-cell
+    // argument types feed the lowering: an array input contributes its element
+    // type, a scalar rides along unchanged (every current §09 sig has a fixed
+    // cell type, but lowering against the cell args keeps a future
+    // `SameScalarKind` / `DomainMap` row correct).
     if let Some(sig) = inf.module_catalogue_ref(head_node).map(|c| c.sig.clone()) {
-        if let (Type::Measure { domain, mass }, _) = catalogue_lower(&sig, &[]) {
-            return Type::Measure {
+        let cell_args: Vec<ArgInfo> = args[1..]
+            .iter()
+            .map(|(n, t, p)| {
+                let cell = match t {
+                    Type::Array { elem, .. } => elem.as_ref().clone(),
+                    other => other.clone(),
+                };
+                (*n, cell, *p)
+            })
+            .collect();
+        return match catalogue_lower(&sig, &cell_args).0 {
+            // Distribution head: an independent product over the array. Its cell
+            // domain and mass come from the catalogue sig, so a non-probability
+            // measure like `ContinuedPoisson` stays `Finite`, not forced to
+            // `Normalized` (mirrors the built-in distribution path below).
+            Type::Measure { domain, mass } => Type::Measure {
                 domain: Box::new(Type::Array {
                     shape,
                     elem: domain,
                 }),
                 mass: broadcast_mass(mass),
-            };
-        }
-        return Type::Deferred;
+            },
+            // Deterministic function head (`hepphys.interp_poly6_exp`, …): maps
+            // elementwise into an array of the per-cell result, exactly as the
+            // built-in deterministic-op path does.
+            cell => Type::Array {
+                shape,
+                elem: Box::new(cell),
+            },
+        };
     }
 
     // Built-in head: a distribution constructor broadcasts into a measure
