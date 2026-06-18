@@ -105,3 +105,66 @@ model = functionof(broadcast(Poisson, expected))
         other => panic!("model should be a Kernel; got {other:?}"),
     }
 }
+
+/// A leaf reached by two distinct paths (a shared sub-expression / diamond) is
+/// recorded once: the ancestor walk's visited-set both dedupes the input and
+/// stops the second traversal from re-descending the shared subgraph.
+#[test]
+fn auto_inputs_dedupe_shared_subexpression() {
+    let src = r#"
+a = elementof(reals)
+shared = mul(a, a)
+model = functionof(add(shared, shared))
+"#;
+    let module = infer_src(src, Level::Type);
+    match binding_ty(&module, "model") {
+        Some(Type::Function { inputs }) => assert_eq!(
+            input_names(&module, inputs),
+            ["a"],
+            "the diamond's shared leaf must appear once"
+        ),
+        other => panic!("model should be a Function; got {other:?}"),
+    }
+}
+
+/// The walk descends through an *alias* binding (`b = a`, an RHS that is a bare
+/// reference, not a call) to reach the genuine `elementof` leaf behind it.
+#[test]
+fn auto_inputs_descend_through_alias() {
+    let src = r#"
+a = elementof(reals)
+b = a
+model = functionof(add(b, b))
+"#;
+    let module = infer_src(src, Level::Type);
+    match binding_ty(&module, "model") {
+        Some(Type::Function { inputs }) => assert_eq!(
+            input_names(&module, inputs),
+            ["a"],
+            "the alias `b` resolves to its leaf `a`"
+        ),
+        other => panic!("model should be a Function; got {other:?}"),
+    }
+}
+
+/// The walk descends through a *user-callable application* in the body — the
+/// callee is followed and the argument's `elementof` leaf is discovered — so a
+/// reification over a body that calls a helper binding still types its inputs.
+#[test]
+fn auto_inputs_descend_through_user_call() {
+    let src = r#"
+a = elementof(reals)
+helper = functionof(mul(a, a))
+applied = helper(a)
+model = functionof(add(applied, a))
+"#;
+    let module = infer_src(src, Level::Type);
+    match binding_ty(&module, "model") {
+        Some(Type::Function { inputs }) => assert_eq!(
+            input_names(&module, inputs),
+            ["a"],
+            "the user-call's leaf must be discovered through callee + args"
+        ),
+        other => panic!("model should be a Function; got {other:?}"),
+    }
+}
