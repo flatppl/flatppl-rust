@@ -15,7 +15,13 @@ const RESERVED: &[&str] = &["true", "false", "in", "all", "only", "self", "base"
 fn sanitize_ident(s: &str) -> String {
     let mut out: String = s
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     if out.is_empty() {
         out.push('_');

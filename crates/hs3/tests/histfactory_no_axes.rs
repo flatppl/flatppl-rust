@@ -32,7 +32,10 @@ fn histfactory_dist_without_axes_is_accepted() {
         .expect("a histfactory_dist without `axes` should still convert");
     let text = flatppl_syntax::print_with(&m, flatppl_syntax::Syntax::Minimal);
     // Two-bin Poisson observation model, assembled from sample contents.
-    assert!(text.contains("Poisson"), "expected a Poisson obs model, got:\n{text}");
+    assert!(
+        text.contains("Poisson"),
+        "expected a Poisson obs model, got:\n{text}"
+    );
     assert!(
         text.contains("flatppl_compat = \"0.1\""),
         "generated module must stamp flatppl_compat, got:\n{text}"

@@ -633,7 +633,8 @@ mod tests {
         let mut m = flatppl_core::Module::new();
         {
             let mut b = Builder::new(&mut m);
-            let _ = emit_staterror_constraint(&mut b, "gamma", &[100.0, 100.0], &[25.0, 100.0], false);
+            let _ =
+                emit_staterror_constraint(&mut b, "gamma", &[100.0, 100.0], &[25.0, 100.0], false);
         }
         let text = print_with(&m, Syntax::Minimal);
         assert!(text.contains("ContinuedPoisson"), "got:\n{text}");
@@ -655,7 +656,8 @@ mod tests {
         let mut m = flatppl_core::Module::new();
         {
             let mut b = Builder::new(&mut m);
-            let _ = emit_staterror_constraint(&mut b, "gamma", &[100.0, 100.0], &[25.0, 100.0], true);
+            let _ =
+                emit_staterror_constraint(&mut b, "gamma", &[100.0, 100.0], &[25.0, 100.0], true);
         }
         let text = print_with(&m, Syntax::Minimal);
         assert!(text.contains("Normal"), "got:\n{text}");

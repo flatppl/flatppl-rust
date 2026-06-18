@@ -46,12 +46,19 @@ fn auto_detects_hs3_and_pyhf_by_extension() {
     std::fs::write(&hs3_in, r#"{"distributions":[{"name":"mass","type":"gaussian_dist","mean":"mu","sigma":"s","x":"m_obs"}],"parameter_points":[{"name":"nom","entries":[{"name":"mu","value":5.28},{"name":"s","value":0.003}]}]}"#).unwrap();
     let hs3_out = dir.join("auto_detect_hs3.flatppl");
     let status = Command::new(env!("CARGO_BIN_EXE_flatppl"))
-        .args(["convert", hs3_in.to_str().unwrap(), hs3_out.to_str().unwrap()])
+        .args([
+            "convert",
+            hs3_in.to_str().unwrap(),
+            hs3_out.to_str().unwrap(),
+        ])
         .status()
         .unwrap();
     assert!(status.success(), "auto-detected .hs3.json convert failed");
     let text = std::fs::read_to_string(&hs3_out).unwrap();
-    assert!(text.contains("Normal"), "HS3 path must emit a Normal, got:\n{text}");
+    assert!(
+        text.contains("Normal"),
+        "HS3 path must emit a Normal, got:\n{text}"
+    );
     assert!(
         text.contains("flatppl_compat = \"0.1\""),
         "generated module must stamp flatppl_compat, got:\n{text}"
@@ -62,7 +69,11 @@ fn auto_detects_hs3_and_pyhf_by_extension() {
     std::fs::copy(fixture("2bin_1channel.json"), &pyhf_in).unwrap();
     let pyhf_out = dir.join("auto_detect_pyhf.flatppl");
     let status = Command::new(env!("CARGO_BIN_EXE_flatppl"))
-        .args(["convert", pyhf_in.to_str().unwrap(), pyhf_out.to_str().unwrap()])
+        .args([
+            "convert",
+            pyhf_in.to_str().unwrap(),
+            pyhf_out.to_str().unwrap(),
+        ])
         .status()
         .unwrap();
     assert!(status.success(), "auto-detected .pyhf.json convert failed");
@@ -217,7 +228,10 @@ fn hs3_convert_emits_banner_and_compat() {
         "command:",
         "generated:",
     ] {
-        assert!(!text.contains(leaked), "banner must not leak `{leaked}`, got:\n{text}");
+        assert!(
+            !text.contains(leaked),
+            "banner must not leak `{leaked}`, got:\n{text}"
+        );
     }
 
     // --no-header: banner gone, but flatppl_compat (a binding) leads the output.

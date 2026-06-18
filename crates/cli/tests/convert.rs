@@ -120,7 +120,10 @@ fn provenance_header_present_by_default() {
         "command:",
         "generated:",
     ] {
-        assert!(!text.contains(leaked), "banner must not leak `{leaked}` in:\n{text}");
+        assert!(
+            !text.contains(leaked),
+            "banner must not leak `{leaked}` in:\n{text}"
+        );
     }
     // The model still follows the banner.
     assert!(

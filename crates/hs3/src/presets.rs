@@ -64,11 +64,7 @@ fn bound_node(b: &mut Builder, v: Option<f64>, positive: bool) -> NodeId {
         None => {
             let inf_sym = b.m.intern("inf");
             let inf = b.m.alloc(Node::Const(inf_sym));
-            if positive {
-                inf
-            } else {
-                b.call("neg", &[inf])
-            }
+            if positive { inf } else { b.call("neg", &[inf]) }
         }
     }
 }
@@ -176,6 +172,9 @@ mod tests {
         assert!(text.contains("100"), "got: {text}");
         // The unbounded axis lowers to an `inf` upper bound.
         assert!(text.contains("eta"), "got: {text}");
-        assert!(text.contains("inf"), "unbounded axis must use inf, got: {text}");
+        assert!(
+            text.contains("inf"),
+            "unbounded axis must use inf, got: {text}"
+        );
     }
 }

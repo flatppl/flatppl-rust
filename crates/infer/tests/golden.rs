@@ -170,8 +170,14 @@ fn fixed_is_identity_for_type_and_valueset() {
     // `fixed(x)` ≡ `identity(x)` (spec §03, a tooling hint): type, phase, and
     // value set all ride through the wrapper — no `%deferred`, no lost value set.
     let m = meta_of("p = elementof(posreals)\nx = fixed(p)", "(fixed");
-    assert!(m.contains("(%scalar real)"), "type must ride through, got: {m}");
-    assert!(m.contains("posreals"), "value set must ride through, got: {m}");
+    assert!(
+        m.contains("(%scalar real)"),
+        "type must ride through, got: {m}"
+    );
+    assert!(
+        m.contains("posreals"),
+        "value set must ride through, got: {m}"
+    );
     assert!(!m.contains("%deferred"), "fixed must not defer, got: {m}");
 }
 
@@ -190,7 +196,10 @@ L1 = likelihoodof(m1, 1.5)
 L2 = likelihoodof(m2, 3.2)
 L = joint_likelihood(L1, L2)";
     let m = meta_of(src, "(joint_likelihood");
-    assert!(m.contains("(%inputs mu nu)"), "inputs must be the union, got: {m}");
+    assert!(
+        m.contains("(%inputs mu nu)"),
+        "inputs must be the union, got: {m}"
+    );
     assert!(
         m.contains("(%obstype (%array 1 (2) (%scalar real)))"),
         "obstype must be cat(obs) = a length-2 real vector, got: {m}"
