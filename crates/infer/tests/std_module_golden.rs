@@ -100,6 +100,62 @@ y = hepphys.ContinuedPoisson(2.0)
     );
 }
 
+/// `broadcast(hepphys.ContinuedPoisson, rates)` over a §09 standard-module
+/// distribution head is an independent product over the array — a measure,
+/// exactly like a built-in distribution head (`broadcast(Poisson, …)`), and it
+/// keeps the catalogue's `Finite` mass rather than being forced to Normalized.
+#[test]
+fn broadcast_of_std_distribution_infers_array_measure() {
+    let src = r#"
+hepphys = standard_module("particle-physics", "0.1")
+rates = [2.0, 3.0]
+y = broadcast(hepphys.ContinuedPoisson, rates)
+"#;
+    let (module, diags) = infer_src(src, Level::Normalization);
+    assert!(errors(&diags).is_empty(), "unexpected errors: {diags:?}");
+
+    let ty = binding_ty(&module, "y");
+    assert!(
+        matches!(
+            ty,
+            Some(Type::Measure { domain, mass: Mass::Finite })
+                if matches!(
+                    domain.as_ref(),
+                    Type::Array { elem, .. } if **elem == Type::Scalar(ScalarType::Real)
+                )
+        ),
+        "broadcast of ContinuedPoisson should be a Finite measure over an array of reals; got {ty:?}"
+    );
+}
+
+/// End-to-end of the converter's constraint chain (the reported inference gap):
+/// a boundary-less `functionof` over a `broadcast` of a §09 distribution is a
+/// kernel over its single parametric leaf, and `likelihoodof` of it carries that
+/// input — the whole chain types, no silent `%deferred`.
+#[test]
+fn functionof_of_std_distribution_broadcast_chains_to_likelihood() {
+    let src = r#"
+hepphys = standard_module("particle-physics", "0.1")
+g = elementof(cartpow(posreals, 2))
+tau = [4.0, 9.0]
+constraint = functionof(broadcast(hepphys.ContinuedPoisson, broadcast(mul, g, tau)))
+L = likelihoodof(constraint, tau)
+"#;
+    let (module, diags) = infer_src(src, Level::Type);
+    assert!(errors(&diags).is_empty(), "unexpected errors: {diags:?}");
+
+    let constraint_ty = binding_ty(&module, "constraint");
+    assert!(
+        matches!(constraint_ty, Some(Type::Kernel { inputs, .. }) if inputs.len() == 1),
+        "constraint should be a Kernel over its one parametric leaf; got {constraint_ty:?}"
+    );
+    let l_ty = binding_ty(&module, "L");
+    assert!(
+        matches!(l_ty, Some(Type::Likelihood { inputs, .. }) if inputs.len() == 1),
+        "L should be a Likelihood carrying the auto-traced input; got {l_ty:?}"
+    );
+}
+
 /// A standard-module function applied (`specfns.erf(x)`) follows the argument's
 /// scalar kind: real in, real out.
 #[test]

@@ -5,11 +5,11 @@
 //! cycle is an error (the module is not a DAG); the offending binding gets a
 //! `(%failed …)` type so the gap is visible in annotated output.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use flatppl_core::{
-    BindingId, Call, CallHead, Module, NamedKind, Node, NodeId, Phase, RefNs, Scalar, Symbol, Type,
-    ValueSet,
+    BindingId, Call, CallHead, Module, NamedKind, Node, NodeId, Phase, Ref, RefNs, Scalar, Symbol,
+    Type, ValueSet,
 };
 
 use crate::modules::InferSession;
@@ -169,6 +169,83 @@ impl<'m, 's> Inferencer<'m, 's> {
     pub(crate) fn set_vset(&mut self, id: NodeId, set: ValueSet) {
         if self.level >= Level::Valueset {
             self.vsets.insert(id, set);
+        }
+    }
+
+    /// §04 auto-trace for a boundary-less `functionof` / `kernelof`: its inputs
+    /// are the `elementof` parametric-phase leaves of the body's ancestor
+    /// subgraph, in **canonical order (sorted by name)** so a converter's
+    /// incidental build order (e.g. pyhf JSON sample/modifier order) never leaks
+    /// into the input list. Fixed-phase ancestors (`external` / `load_data` /
+    /// literals) are closed over — pruned via the phase table. Every ancestor's
+    /// phase is already memoised when this runs (the reification's children are
+    /// traced before its op rule), so the walk reads, never recurses, inference.
+    pub(crate) fn collect_auto_inputs(&self, body: NodeId) -> Vec<(Symbol, Ref)> {
+        let mut leaves: BTreeMap<String, Symbol> = BTreeMap::new();
+        let mut visited: HashSet<NodeId> = HashSet::new();
+        self.walk_auto(body, &mut leaves, &mut visited);
+        leaves
+            .into_values()
+            .map(|name| {
+                (
+                    name,
+                    Ref {
+                        ns: RefNs::SelfMod,
+                        name,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// Depth-first ancestor walk for [`collect_auto_inputs`], following `self`
+    /// references across binding boundaries and recording each `elementof`
+    /// leaf binding's name once (`leaves`, keyed by name → sorted + deduped).
+    fn walk_auto(
+        &self,
+        id: NodeId,
+        leaves: &mut BTreeMap<String, Symbol>,
+        visited: &mut HashSet<NodeId>,
+    ) {
+        if !visited.insert(id) {
+            return;
+        }
+        // A fixed-phase subgraph has no `elementof` ancestor (spec §04) — prune.
+        // (Absent phase ⇒ don't prune: soundly does extra work, never skips.)
+        if self.phases.get(&id) == Some(&Phase::Fixed) {
+            return;
+        }
+        // Gather the children to recurse into, releasing the node borrow first.
+        let children: Vec<NodeId> = match self.module.node(id) {
+            Node::Ref(r) if r.ns == RefNs::SelfMod => match self.module.binding_by_name(r.name) {
+                Some(b) => {
+                    let rhs = self.module.binding(b).rhs;
+                    if is_elementof(self.module, rhs) {
+                        // A parametric leaf: record the binding (by name); do not
+                        // descend into the `elementof` set argument.
+                        leaves.insert(self.module.resolve(r.name).to_string(), r.name);
+                        Vec::new()
+                    } else {
+                        vec![rhs]
+                    }
+                }
+                None => Vec::new(),
+            },
+            Node::Call(call) => {
+                let mut c = Vec::new();
+                if let CallHead::User(callee) = call.head {
+                    c.push(callee);
+                }
+                c.extend(call.args.iter().copied());
+                c.extend(call.named.iter().map(|n| n.value));
+                c
+            }
+            // Lit / Const / Hole / Axis / Ref(Module|Local) carry no parametric
+            // leaves (a `%local` placeholder is a Spec-boundary input, never auto).
+            _ => Vec::new(),
+        };
+        for child in children {
+            self.walk_auto(child, leaves, visited);
         }
     }
 
@@ -446,6 +523,18 @@ impl<'m, 's> Inferencer<'m, 's> {
                 )
             })
             .collect()
+    }
+}
+
+/// Is the node at `id` a bare `elementof(...)` call — a module parameter, the
+/// parametric leaf of [`Inferencer::collect_auto_inputs`]?
+fn is_elementof(module: &Module, id: NodeId) -> bool {
+    match module.node(id) {
+        Node::Call(c) => match c.head {
+            CallHead::Builtin(h) => module.resolve(h) == "elementof",
+            CallHead::User(_) => false,
+        },
+        _ => false,
     }
 }
 

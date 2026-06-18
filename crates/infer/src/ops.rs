@@ -584,13 +584,16 @@ fn reification_type(
         Some(Inputs::Auto) => match inf.module.auto_inputs_of(id) {
             Some(entries) => entries.iter().map(|(n, _)| *n).collect(),
             None => {
-                // The §04 auto-trace (parametric-leaf discovery) is future
-                // work; a boundary-less reification stays %deferred.
-                inf.note_once_str(
-                    "boundary-less reifications (`%autoinputs`) are not traced yet \
-                     — their types are left %deferred",
-                );
-                return Type::Deferred;
+                // §04 auto-trace: discover the body's `elementof` parametric
+                // leaves (canonical-sorted by name) and fill the side-table, so
+                // the reification types as a kernel/function over those inputs.
+                let Some((body, _, _)) = args.first() else {
+                    return Type::Deferred;
+                };
+                let entries = inf.collect_auto_inputs(*body);
+                let names: Box<[Symbol]> = entries.iter().map(|(n, _)| *n).collect();
+                inf.module.set_auto_inputs(id, entries.into());
+                names
             }
         },
         None => unreachable!("reification_type called only when inputs are present"),
@@ -964,6 +967,27 @@ fn broadcast_type(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo], named: &[Named
             };
         }
         _ => {}
+    }
+
+    // §09 standard-module distribution head (`hepphys.ContinuedPoisson`): an
+    // independent product over the array, exactly like a built-in distribution
+    // head — but its cell domain and mass come from the catalogue sig (so a
+    // non-probability measure like `ContinuedPoisson` stays `Finite`, not
+    // forced to `Normalized`). Checked first: the catalogue-ref side-table is
+    // populated only for §09 module references, so this never shadows a
+    // built-in. Lowered with empty args — the per-cell rate is the broadcast
+    // data, as in the built-in path's `distribution_domain(…, &[], &[])`.
+    if let Some(sig) = inf.module_catalogue_ref(head_node).map(|c| c.sig.clone()) {
+        if let (Type::Measure { domain, mass }, _) = catalogue_lower(&sig, &[]) {
+            return Type::Measure {
+                domain: Box::new(Type::Array {
+                    shape,
+                    elem: domain,
+                }),
+                mass: broadcast_mass(mass),
+            };
+        }
+        return Type::Deferred;
     }
 
     // Built-in head: a distribution constructor broadcasts into a measure
