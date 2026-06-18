@@ -20,10 +20,15 @@ fn two_bin_one_channel_converts() {
         text.contains("joint_likelihood"),
         "missing joint_likelihood, got:\n{text}"
     );
-    // observed data [50.0, 60.0] must appear as the exact in-order vector on the
-    // main Poisson term (pinned bracketed form catches a reordered observation).
+    // observed data [50.0, 60.0] must appear as the exact in-order vector, bound
+    // as the channel's observed counts and fed to its observation term (pinned
+    // bracketed form catches a reordered observation).
     assert!(
-        text.contains("likelihoodof(obs_model_singlechannel, [50.0, 60.0])"),
+        text.contains("singlechannel_observed = [50.0, 60.0]")
+            && text.contains(
+                "singlechannel_likelihood = \
+                 likelihoodof(singlechannel_model, singlechannel_observed)"
+            ),
         "observed data [50.0, 60.0] not on main term, got:\n{text}"
     );
     // no lambda/fn — must be point-free

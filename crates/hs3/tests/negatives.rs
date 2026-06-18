@@ -156,16 +156,27 @@ fn histosys_modifier_path_converts() {
         "measurements":[{"name":"m","config":{"poi":""}}]}"#;
     let m = flatppl_hs3::read_pyhf(json).expect("histosys must convert");
     let text = flatppl_syntax::print_with(&m, flatppl_syntax::Syntax::Minimal);
-    // histosys interpolates the nominal between lo/hi via the interp module call,
-    // with an N(alpha, 1) auxiliary constraint on the shape parameter.
+    // histosys interpolates the nominal between lo/hi via the interp module call
+    // (the sample's expected yields), then the channel model is a reified Poisson.
     assert!(
         text.contains(
-            "obs_model_c = broadcast(Poisson, hepphys.interp_poly6_lin([9.0, 11.0], [10.0, 12.0], [11.0, 13.0], alpha_shape))"
+            "c_sig_expected = \
+             hepphys.interp_poly6_lin([9.0, 11.0], c_sig_nominal, [11.0, 13.0], alpha_shape)"
         ),
-        "histosys obs_model mismatch, got:\n{text}"
+        "histosys interpolation mismatch, got:\n{text}"
     );
     assert!(
-        text.contains("likelihoodof(Normal(mu = alpha_shape, sigma = 1.0), 0.0)"),
+        text.contains("c_model = functionof(broadcast(Poisson, c_expected))"),
+        "histosys obs model mismatch, got:\n{text}"
+    );
+    // The shape parameter carries an N(alpha, 1) auxiliary constraint, reified
+    // (functionof) and observed at 0, parameter-keyed.
+    assert!(
+        text.contains("alpha_shape_constraint = functionof(Normal(mu = alpha_shape, sigma = 1.0))")
+            && text.contains(
+                "alpha_shape_constraint_likelihood = \
+                 likelihoodof(alpha_shape_constraint, 0.0)"
+            ),
         "histosys aux constraint mismatch, got:\n{text}"
     );
     assert!(
@@ -185,17 +196,25 @@ fn shapefactor_modifier_path_converts() {
     let text = flatppl_syntax::print_with(&m, flatppl_syntax::Syntax::Minimal);
     // shapefactor is an unconstrained per-bin multiplicative scale: no aux term.
     assert!(
-        text.contains("obs_model_c = broadcast(Poisson, broadcast(mul, [10.0, 12.0], sf))"),
-        "shapefactor obs_model mismatch, got:\n{text}"
+        text.contains("c_sig_expected = broadcast(mul, c_sig_nominal, sf)")
+            && text.contains("c_model = functionof(broadcast(Poisson, c_expected))"),
+        "shapefactor obs model mismatch, got:\n{text}"
     );
     assert!(
         text.contains("sf = elementof(cartpow(posreals, 2))"),
         "shapefactor parameter domain mismatch, got:\n{text}"
     );
-    // No auxiliary likelihood term (unconstrained).
+    // Unconstrained: a single observation term, so the top-level likelihood is
+    // just that term (no joint_likelihood, no constraint terms).
     assert!(
-        text.contains("L_c = likelihoodof(obs_model_c, [10.0, 12.0])"),
+        text.contains("c_observed = [10.0, 12.0]")
+            && text.contains("c_likelihood = likelihoodof(c_model, c_observed)")
+            && text.contains("likelihood = c_likelihood"),
         "shapefactor likelihood should be the bare main term, got:\n{text}"
+    );
+    assert!(
+        !text.contains("joint_likelihood"),
+        "single unconstrained term must not wrap in joint_likelihood, got:\n{text}"
     );
     assert!(
         flatppl_syntax::parse(&text).is_ok(),

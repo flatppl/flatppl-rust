@@ -580,6 +580,7 @@ fn emit_distributions(m: &mut Module, doc: &Document) -> Result<()> {
 fn emit_histfactory_channels(m: &mut Module, doc: &Document) -> Result<()> {
     let mut b = Builder::new(m);
     let mut bound_hepphys = false;
+    let mut terms = crate::pyhf::Terms::default();
     for d in &doc.distributions {
         if d.kind != "histfactory_dist" {
             continue;
@@ -689,8 +690,20 @@ fn emit_histfactory_channels(m: &mut Module, doc: &Document) -> Result<()> {
         let obs_elems: Vec<_> = obs_vals.iter().map(|v| b.lit_real(*v)).collect();
         let observed = b.array(&obs_elems);
 
-        crate::pyhf::assemble_channel(&mut b, &d.name, &samples, observed, obs_vals.len(), None)?;
+        crate::pyhf::assemble_channel(
+            &mut b,
+            &d.name,
+            &samples,
+            observed,
+            obs_vals.len(),
+            None,
+            &mut terms,
+        )?;
     }
+    // Flat top-level `likelihood` over the histfactory channels (the
+    // `histfactory_dist` internals can restructure; the generic-distribution HS3
+    // path is separate and unaffected).
+    crate::pyhf::bind_likelihood(&mut b, &terms);
     Ok(())
 }
 

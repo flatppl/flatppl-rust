@@ -106,8 +106,8 @@ fn convert_from_pyhf_fixture() {
     // and the joint_likelihood binding tying them together. Observed data
     // [50.0, 60.0] must appear literally.
     assert!(
-        text.contains("obs_model_singlechannel"),
-        "missing assembled obs_model binding, got:\n{text}"
+        text.contains("singlechannel_model") && text.contains("singlechannel_likelihood"),
+        "missing assembled channel model/likelihood bindings, got:\n{text}"
     );
     assert!(
         text.contains("Poisson"),

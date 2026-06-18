@@ -6,8 +6,9 @@
 use crate::builder::Builder;
 use crate::error::{Error, Result};
 use crate::histfactory::{
-    Effect, ParamDomain, mod_spec, modifier_effect, require_param, require_spec, sample_nominal,
-    staterror_aux,
+    Effect, ParamDomain, PendingConstraint, emit_lumi_constraint, emit_normal01_constraint,
+    emit_shapesys_constraint, emit_staterror_constraint, mod_spec, modifier_effect, require_param,
+    require_spec, sample_nominal,
 };
 use crate::model::{PyhfDocument, PyhfParam, SampleData};
 use flatppl_core::Module;
@@ -31,14 +32,20 @@ fn emit_pyhf(b: &mut Builder, doc: &PyhfDocument) -> Result<()> {
     // `hepphys = standard_module("particle-physics", "0.1")`
     emit_standard_module(b);
 
-    // Per channel: declare free params, build expected, obs model, likelihoods.
+    // Per channel: declare free params, build expected, obs model, and accumulate
+    // observation + constraint likelihood terms.
+    let mut terms = Terms::default();
     for channel in &doc.channels {
-        emit_channel(b, doc, channel)?;
+        emit_channel(b, doc, channel, &mut terms)?;
     }
 
     // Measurement parameter-of-interest → record binding (so `config.poi`
     // survives the lift; FlatPPL has no dedicated POI construct).
     emit_poi(b, doc);
+
+    // The flat top-level `likelihood` = joint of every channel's observation term
+    // and all constraint terms.
+    bind_likelihood(b, &terms);
 
     Ok(())
 }
@@ -116,6 +123,7 @@ fn emit_channel(
     b: &mut Builder,
     doc: &PyhfDocument,
     channel: &crate::model::PyhfChannel,
+    terms: &mut Terms,
 ) -> Result<()> {
     let channel_name = &channel.name;
 
@@ -156,21 +164,55 @@ fn emit_channel(
         None
     };
 
-    assemble_channel(b, channel_name, &samples, observed, n_observed, lumi)
+    assemble_channel(b, channel_name, &samples, observed, n_observed, lumi, terms)
 }
 
-/// Assemble one channel's observation model and auxiliary likelihood terms,
-/// shared by the pyhf and native HS3 `histfactory_dist` paths.
+/// Accumulated likelihood terms across a workspace's channels: the per-channel
+/// observation terms and the constraint (auxiliary-measurement) terms. The caller
+/// binds the flat top-level `likelihood` from these via [`bind_likelihood`].
+#[derive(Default)]
+pub struct Terms {
+    /// One observation likelihood term per channel.
+    observation: Vec<NodeId>,
+    /// Constraint (auxiliary-measurement) likelihood terms.
+    constraints: Vec<NodeId>,
+    /// Parameters whose constraint has already been emitted — a constraint
+    /// belongs to its (possibly shared) parameter, so it is emitted exactly once
+    /// (pyhf: one auxiliary measurement per constrained parameter).
+    emitted_params: HashSet<String>,
+}
+
+/// Bind the flat top-level `likelihood` = `joint_likelihood(observation terms…,
+/// constraint terms…)`. A single term is aliased directly; nothing is emitted
+/// when there are no terms.
+pub fn bind_likelihood(b: &mut Builder, terms: &Terms) {
+    let mut all = terms.observation.clone();
+    all.extend(terms.constraints.iter().copied());
+    let node = match all.len() {
+        0 => return,
+        1 => all[0],
+        _ => b.call("joint_likelihood", &all),
+    };
+    b.bind_unique_doc(
+        "likelihood",
+        node,
+        "Full likelihood: observation and constraint terms.",
+    );
+}
+
+/// Assemble one channel into named, channel-scoped FlatPPL bindings, pushing its
+/// observation term and constraint terms into `terms`. Shared by the pyhf and
+/// native-HS3 `histfactory_dist` paths.
 ///
-/// `samples` is a list of `(name, nominal_bins, modifiers)`. Staterror errors
-/// are read from each staterror modifier's `data` array (an array of per-bin
-/// errors); the native path injects the sample's `errors` there before calling.
+/// `samples` is `(name, nominal_bins, modifiers)`. Staterror errors are read from
+/// each staterror modifier's `data` array; the native path injects the sample's
+/// `errors` there before calling.
 ///
-/// Steps: declare free params, fold modifiers via `modifier_effect`/`Effect`
-/// (histosys replaces nominal), aggregate staterror across staterror-carrying
-/// samples into one Gauss aux per bin, emit one lumi aux (if `lumi` is `Some`),
-/// per-sample normsys aux, sum samples → `broadcast(Poisson, expected)`, then
-/// `joint_likelihood(L_obs, aux...)`.
+/// Emits `<channel>_observed`, `<channel>_<sample>_{nominal,expected}`,
+/// `<channel>_expected`, `<channel>_model` (`functionof(broadcast(Poisson, …))` —
+/// a kernel, as `likelihoodof` requires, spec §06), `<channel>_likelihood` (the
+/// observation term), plus the auxiliary constraint terms (lumi, staterror,
+/// per-sample shapesys/normsys/histosys).
 pub fn assemble_channel(
     b: &mut Builder,
     channel_name: &str,
@@ -178,6 +220,7 @@ pub fn assemble_channel(
     observed: NodeId,
     n_observed: usize,
     lumi: Option<LumiConfig>,
+    terms: &mut Terms,
 ) -> Result<()> {
     // ---- Pass 0: validate channel shape ----
     //
@@ -287,86 +330,69 @@ pub fn assemble_channel(
         }
     }
 
-    // ---- Pass 3: lumi aux once (if present) ----
-    let mut aux_terms: Vec<NodeId> = Vec::new();
+    // ---- Observed counts for this channel ----
+    let observed_name = b.bind_unique_doc(
+        &format!("{channel_name}_observed"),
+        observed,
+        &format!("Observed event counts for channel \"{channel_name}\"."),
+    );
 
-    if let Some(LumiConfig { sigma, nom }) = lumi {
-        let lam = b.self_ref("lumi");
-        let sigma_node = b.lit_real(sigma);
-        let nom_node = b.lit_real(nom);
-        let lumi_normal = b.call_kw("Normal", &[("mu", lam), ("sigma", sigma_node)]);
-        let lumi_aux = b.call("likelihoodof", &[lumi_normal, nom_node]);
-        aux_terms.push(lumi_aux);
-    }
-
-    // ---- Pass 4: emit staterror per-bin aux terms ----
-    // Channel-summed Barlow–Beeston: per bin `sum_nom` (Σ sample nominals) and
-    // `sum_sq` (Σ squared errors). staterror_aux derives δ (Gaussian) or
-    // τ = sum_nom²/sum_sq (Poisson) from these directly — exact, no √-then-square
-    // round-trip.
-    for (param_name, (sum_nom, sum_sq)) in &staterror_acc {
-        let gamma = b.self_ref(param_name);
-        // ROOT default is Poisson; `constraint: "Gauss"`/`"Gaussian"` selects Normal.
-        let gaussian = matches!(
-            staterror_constraint
-                .get(param_name)
-                .and_then(|c| c.as_deref()),
-            Some("Gauss") | Some("Gaussian")
-        );
-        let aux = staterror_aux(b, gamma, sum_nom, sum_sq, gaussian);
-        aux_terms.push(aux);
-    }
-
-    // ---- Pass 5: build per-sample expected vectors ----
+    // ---- Per-sample expected yields: nominal template, then modifiers ----
+    // Per-sample constraints are collected here and emitted *after* the
+    // observation term, so the file reads observation-first then constraints
+    // (each carries the sample nominal its `tau` needs).
     let mut sample_expected: Vec<NodeId> = Vec::new();
-
-    for (_name, nominal, modifiers) in samples {
+    let mut pending: Vec<(String, PendingConstraint, NodeId)> = Vec::new();
+    for (sname, nominal, modifiers) in samples {
         let data = SampleData::Flat(nominal.to_vec());
-        let mut nom = sample_nominal(b, &data);
+        let nom_arr = sample_nominal(b, &data);
+        let nom_name = b.bind_unique_doc(
+            &format!("{channel_name}_{sname}_nominal"),
+            nom_arr,
+            &format!("Nominal yields for sample \"{sname}\"."),
+        );
+        let mut nom = b.self_ref(&nom_name);
 
-        // First pass: apply nominal-replacing modifiers (histosys).
+        // First: nominal-replacing modifiers (histosys).
         for modifier in *modifiers {
             if mod_spec(&modifier.kind).is_some_and(|spec| spec.replaces_nominal) {
-                let effect = modifier_effect(b, modifier, nom, n_bins)?;
-                match effect {
-                    Effect::HistoSys { new_nom, aux } => {
-                        nom = new_nom;
-                        aux_terms.push(aux);
-                    }
-                    _ => unreachable!("replaces_nominal modifier must produce HistoSys effect"),
+                let (effect, constraint) = modifier_effect(b, modifier, nom, n_bins)?;
+                if let Effect::ReplaceNominal(new_nom) = effect {
+                    nom = new_nom;
+                }
+                if let Some((param, pc)) = constraint {
+                    pending.push((param, pc, nom));
                 }
             }
         }
 
-        // Second pass: apply all multiplicative modifiers. Every non-replacing
-        // effect reduces to `acc = broadcast(mul, acc, factor)` plus an optional
-        // aux term, so extract `(factor, Option<aux>)` and emit one broadcast.
+        // Then: multiplicative modifiers (`acc = broadcast(mul, acc, factor)`).
         let mut acc = nom;
         for modifier in *modifiers {
             if mod_spec(&modifier.kind).is_some_and(|spec| spec.replaces_nominal) {
-                continue; // already handled above
+                continue;
             }
-            let effect = modifier_effect(b, modifier, nom, n_bins)?;
-            let (factor, aux) = match effect {
-                Effect::MulParam(param) => (param, None),
-                Effect::MulGammaWithAux { gamma, aux } => (gamma, Some(aux)),
-                Effect::NormSys { factor, aux } => (factor, Some(aux)),
-                Effect::MulLumi(lam) => (lam, None),
-                Effect::MulStaterrGamma(gamma) => (gamma, None),
-                Effect::MulShapefactorGamma(gamma) => (gamma, None),
-                Effect::HistoSys { .. } => unreachable!("histosys handled in first pass"),
-            };
-            let mul = b.call_head("mul");
-            acc = b.call("broadcast", &[mul, acc, factor]);
-            if let Some(aux) = aux {
-                aux_terms.push(aux);
+            let (effect, constraint) = modifier_effect(b, modifier, nom, n_bins)?;
+            if let Effect::Multiply(factor) = effect {
+                let mul = b.call_head("mul");
+                acc = b.call("broadcast", &[mul, acc, factor]);
+            }
+            // shapesys uses the sample's nominal for its tau; other constraints ignore it.
+            if let Some((param, pc)) = constraint {
+                pending.push((param, pc, nom));
             }
         }
-        sample_expected.push(acc);
+
+        let exp_name = b.bind_unique_doc(
+            &format!("{channel_name}_{sname}_expected"),
+            acc,
+            &format!("Expected yields for sample \"{sname}\" (nominal x modifiers)."),
+        );
+        sample_expected.push(b.self_ref(&exp_name));
     }
 
-    // Fold samples: `expected_total = broadcast(add, s0, s1, ...)` (pairwise fold).
-    let expected = if sample_expected.is_empty() {
+    // ---- Total expected per bin (sum over samples) ----
+    let total = if sample_expected.is_empty() {
         b.array(&[])
     } else {
         let mut acc = sample_expected[0];
@@ -376,38 +402,85 @@ pub fn assemble_channel(
         }
         acc
     };
-
-    // `obs_model = broadcast(Poisson, expected)`
-    let poisson = b.call_head("Poisson");
-    let obs_model = b.call("broadcast", &[poisson, expected]);
-    let obs_model_name = format!("obs_model_{channel_name}");
-    // `assemble_channel` serves BOTH the pyhf importer and the native-HS3
-    // `histfactory_dist` importer, so the provenance note names the shared model
-    // paradigm (HistFactory) rather than a serialization format — saying "HS3"
-    // here would be wrong for a pyhf input (and vice versa).
-    let obs_doc = format!(
-        "HistFactory channel '{}': samples × modifiers → broadcast(Poisson, expected)",
-        channel_name
+    let expected_name = b.bind_unique_doc(
+        &format!("{channel_name}_expected"),
+        total,
+        "Total expected counts per bin (sum over samples).",
     );
-    b.bind_doc(&obs_model_name, obs_model, &[obs_doc.as_str()]);
 
-    // `L_obs = likelihoodof(obs_model, observed)`
-    let obs_model_ref = b.self_ref(&obs_model_name);
-    let l_obs = b.call("likelihoodof", &[obs_model_ref, observed]);
+    // ---- Observation model + likelihood term ----
+    // `functionof` reifies the parameter-dependent measure into a kernel, as
+    // `likelihoodof` requires (spec §06).
+    let poisson = b.call_head("Poisson");
+    let expected_ref = b.self_ref(&expected_name);
+    let obs_measure = b.call("broadcast", &[poisson, expected_ref]);
+    let obs_kernel = b.functionof(obs_measure);
+    let model_name = b.bind_unique_doc(
+        &format!("{channel_name}_model"),
+        obs_kernel,
+        &format!("Per-bin Poisson observation model for channel \"{channel_name}\"."),
+    );
+    let model_ref = b.self_ref(&model_name);
+    let observed_ref = b.self_ref(&observed_name);
+    let obs_term = b.call("likelihoodof", &[model_ref, observed_ref]);
+    let obs_term_name = b.bind_unique_doc(
+        &format!("{channel_name}_likelihood"),
+        obs_term,
+        &format!("Observation likelihood term for channel \"{channel_name}\"."),
+    );
+    terms.observation.push(b.self_ref(&obs_term_name));
 
-    // Combine into final likelihood.
-    let l_name = format!("L_{channel_name}");
-    let l_combined = if aux_terms.is_empty() {
-        l_obs
-    } else {
-        let mut all_terms = vec![l_obs];
-        all_terms.extend_from_slice(&aux_terms);
-        b.call("joint_likelihood", &all_terms)
-    };
-    let l_doc = "HistFactory likelihood: main Poisson term + auxiliary constraint terms (joint_likelihood)";
-    b.bind_doc(&l_name, l_combined, &[l_doc]);
+    // ---- Per-sample constraint terms (parameter-keyed, once per parameter) ----
+    for (param, pending_c, nominal) in pending {
+        emit_pending_constraint(b, terms, param, pending_c, nominal);
+    }
+
+    // ---- lumi constraint (global; one Normal aux, deduped across channels) ----
+    if let Some(LumiConfig { sigma, nom }) = lumi
+        && terms.emitted_params.insert("lumi".to_string())
+    {
+        let term = emit_lumi_constraint(b, "lumi", sigma, nom);
+        terms.constraints.push(term);
+    }
+
+    // ---- staterror constraints (channel-summed Barlow-Beeston, one per param) ----
+    for (param_name, (sum_nom, sum_sq)) in &staterror_acc {
+        if terms.emitted_params.insert(param_name.clone()) {
+            // ROOT default is Poisson; `constraint: "Gauss"`/`"Gaussian"` selects Normal.
+            let gaussian = matches!(
+                staterror_constraint
+                    .get(param_name)
+                    .and_then(|c| c.as_deref()),
+                Some("Gauss") | Some("Gaussian")
+            );
+            let term = emit_staterror_constraint(b, param_name, sum_nom, sum_sq, gaussian);
+            terms.constraints.push(term);
+        }
+    }
 
     Ok(())
+}
+
+/// Emit a per-parameter constraint once (deduped via `terms.emitted_params`) and
+/// push its likelihood term. `nominal` is the sample's nominal-yield ref, used by
+/// the shapesys constraint's `tau`; other constraints ignore it.
+fn emit_pending_constraint(
+    b: &mut Builder,
+    terms: &mut Terms,
+    param: String,
+    pending: PendingConstraint,
+    nominal: NodeId,
+) {
+    if !terms.emitted_params.insert(param.clone()) {
+        return; // already emitted (shared parameter)
+    }
+    let term = match pending {
+        PendingConstraint::Shapesys { sigma } => {
+            emit_shapesys_constraint(b, &param, nominal, &sigma)
+        }
+        PendingConstraint::Normal01 => emit_normal01_constraint(b, &param),
+    };
+    terms.constraints.push(term);
 }
 
 /// Validate a modifier and declare its free-parameter binding, returning the

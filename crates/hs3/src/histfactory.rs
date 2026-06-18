@@ -47,16 +47,184 @@ fn tau(b: &mut Builder, nom: NodeId, sigma: NodeId) -> NodeId {
     b.call("broadcast", &[pow, div, two])
 }
 
-/// shapesys auxiliary likelihood term (point-free).
-///
-/// `likelihoodof(broadcast(hepphys.ContinuedPoisson, broadcast(mul, gamma, tau)), tau)`
-pub fn shapesys_aux(b: &mut Builder, gamma: NodeId, nom: NodeId, sigma: NodeId) -> NodeId {
-    let t = tau(b, nom, sigma);
+/// Emit the **shapesys** auxiliary constraint for parameter `param`, returning its
+/// constraint-likelihood term. Binds (parameter-keyed): `<param>_sigma`,
+/// `<param>_tau` = `(nominal/sigma)^2`, `<param>_constraint` =
+/// `functionof(ContinuedPoisson.(gamma * tau))`, `<param>_constraint_likelihood`.
+/// `nominal` refs the sample's nominal-yield binding. The caller emits this once
+/// per parameter (spec §06 / pyhf: one constraint per nuisance parameter).
+pub fn emit_shapesys_constraint(
+    b: &mut Builder,
+    param: &str,
+    nominal: NodeId,
+    sigma_vals: &[f64],
+) -> NodeId {
+    let sigma_elems: Vec<NodeId> = sigma_vals.iter().map(|&v| b.lit_real(v)).collect();
+    let sigma_arr = b.array(&sigma_elems);
+    let sigma_name = b.bind_unique_doc(
+        &format!("{param}_sigma"),
+        sigma_arr,
+        "Absolute per-bin uncertainties (pyhf shapesys data).",
+    );
+    let sigma_ref = b.self_ref(&sigma_name);
+    let t = tau(b, nominal, sigma_ref);
+    let tau_name = b.bind_unique_doc(
+        &format!("{param}_tau"),
+        t,
+        "Effective event counts (nominal/sigma)^2: the constraint's observed aux data.",
+    );
+    let gamma = b.self_ref(param);
+    let tau_ref = b.self_ref(&tau_name);
     let mul = b.call_head("mul");
-    let prod = b.call("broadcast", &[mul, gamma, t]);
+    let mean = b.call("broadcast", &[mul, gamma, tau_ref]);
     let cp = b.module_call("hepphys", "ContinuedPoisson");
-    let aux_model = b.call("broadcast", &[cp, prod]);
-    b.call("likelihoodof", &[aux_model, t])
+    let dist = b.call("broadcast", &[cp, mean]);
+    let kernel = b.functionof(dist);
+    let constraint_name = b.bind_unique_doc(
+        &format!("{param}_constraint"),
+        kernel,
+        "Auxiliary Poisson constraint on the nuisance parameter.",
+    );
+    let constraint_ref = b.self_ref(&constraint_name);
+    let tau_ref2 = b.self_ref(&tau_name);
+    let term = b.call("likelihoodof", &[constraint_ref, tau_ref2]);
+    let term_name = b.bind_unique_doc(
+        &format!("{param}_constraint_likelihood"),
+        term,
+        "shapesys constraint likelihood term.",
+    );
+    b.self_ref(&term_name)
+}
+
+/// Emit a **Normal(alpha, 1) observed at 0** constraint (normsys / histosys) for
+/// parameter `param`, returning its constraint-likelihood term. Binds
+/// `<param>_constraint` = `functionof(Normal(mu = alpha, sigma = 1.0))` and
+/// `<param>_constraint_likelihood`. Caller emits once per parameter.
+pub fn emit_normal01_constraint(b: &mut Builder, param: &str) -> NodeId {
+    let alpha = b.self_ref(param);
+    let sigma_one = b.lit_real(1.0);
+    let normal = b.call_kw("Normal", &[("mu", alpha), ("sigma", sigma_one)]);
+    let kernel = b.functionof(normal);
+    let constraint_name = b.bind_unique_doc(
+        &format!("{param}_constraint"),
+        kernel,
+        "Auxiliary Gaussian constraint on the nuisance parameter.",
+    );
+    let constraint_ref = b.self_ref(&constraint_name);
+    let obs_zero = b.lit_real(0.0);
+    let term = b.call("likelihoodof", &[constraint_ref, obs_zero]);
+    let term_name = b.bind_unique_doc(
+        &format!("{param}_constraint_likelihood"),
+        term,
+        "Constraint likelihood term (observed at 0).",
+    );
+    b.self_ref(&term_name)
+}
+
+/// Emit the **luminosity** constraint `Normal(lumi, sigma) observed at nom` for
+/// parameter `param`, returning its constraint-likelihood term.
+pub fn emit_lumi_constraint(b: &mut Builder, param: &str, sigma: f64, nom: f64) -> NodeId {
+    let lam = b.self_ref(param);
+    let sigma_node = b.lit_real(sigma);
+    let normal = b.call_kw("Normal", &[("mu", lam), ("sigma", sigma_node)]);
+    let kernel = b.functionof(normal);
+    let constraint_name = b.bind_unique_doc(
+        &format!("{param}_constraint"),
+        kernel,
+        "Auxiliary luminosity constraint.",
+    );
+    let constraint_ref = b.self_ref(&constraint_name);
+    let nom_node = b.lit_real(nom);
+    let term = b.call("likelihoodof", &[constraint_ref, nom_node]);
+    let term_name = b.bind_unique_doc(
+        &format!("{param}_constraint_likelihood"),
+        term,
+        "Luminosity constraint likelihood term.",
+    );
+    b.self_ref(&term_name)
+}
+
+/// Emit the **staterror** (Barlow-Beeston) constraint for parameter `param`,
+/// returning its constraint-likelihood term. `sum_nom`/`sum_sq` are the
+/// channel-summed nominal and squared-error per bin.
+///
+/// - Gaussian: `<param>_delta` = `sqrt(sum_sq)/sum_nom`, constraint
+///   `Normal.(gamma, delta)` observed at `[1, …]`.
+/// - Poisson: `<param>_tau` = `sum_nom^2/sum_sq` (effective counts), constraint
+///   `ContinuedPoisson.(gamma * tau)` observed at `tau`.
+pub fn emit_staterror_constraint(
+    b: &mut Builder,
+    param: &str,
+    sum_nom: &[f64],
+    sum_sq: &[f64],
+    gaussian: bool,
+) -> NodeId {
+    let gamma = b.self_ref(param);
+    if gaussian {
+        let delta_elems: Vec<NodeId> = sum_nom
+            .iter()
+            .zip(sum_sq.iter())
+            .map(|(n, sq)| b.lit_real(if *n > 0.0 { sq.sqrt() / n } else { 0.0 }))
+            .collect();
+        let delta_arr = b.array(&delta_elems);
+        let delta_name = b.bind_unique_doc(
+            &format!("{param}_delta"),
+            delta_arr,
+            "Relative per-bin MC-stat uncertainty (Gaussian constraint width).",
+        );
+        let delta_ref = b.self_ref(&delta_name);
+        let normal = b.call_head("Normal");
+        let model = b.call("broadcast", &[normal, gamma, delta_ref]);
+        let kernel = b.functionof(model);
+        let constraint_name = b.bind_unique_doc(
+            &format!("{param}_constraint"),
+            kernel,
+            "Auxiliary Gaussian (MC-stat) constraint on the nuisance parameter.",
+        );
+        let ones: Vec<NodeId> = sum_nom.iter().map(|_| b.lit_real(1.0)).collect();
+        let obs = b.array(&ones);
+        let constraint_ref = b.self_ref(&constraint_name);
+        let term = b.call("likelihoodof", &[constraint_ref, obs]);
+        let term_name = b.bind_unique_doc(
+            &format!("{param}_constraint_likelihood"),
+            term,
+            "staterror constraint likelihood term.",
+        );
+        return b.self_ref(&term_name);
+    }
+    // Poisson form: tau_b = sum_nom_b^2 / sum_sq_b (effective counts), computed
+    // directly from the sums to match ROOT exactly.
+    let tau_elems: Vec<NodeId> = sum_nom
+        .iter()
+        .zip(sum_sq.iter())
+        .map(|(n, sq)| b.lit_real(if *sq > 0.0 { n * n / sq } else { 0.0 }))
+        .collect();
+    let tau_arr = b.array(&tau_elems);
+    let tau_name = b.bind_unique_doc(
+        &format!("{param}_tau"),
+        tau_arr,
+        "Effective event counts: the Poisson constraint's observed aux data.",
+    );
+    let tau_ref = b.self_ref(&tau_name);
+    let mul = b.call_head("mul");
+    let mean = b.call("broadcast", &[mul, gamma, tau_ref]);
+    let cp = b.module_call("hepphys", "ContinuedPoisson");
+    let dist = b.call("broadcast", &[cp, mean]);
+    let kernel = b.functionof(dist);
+    let constraint_name = b.bind_unique_doc(
+        &format!("{param}_constraint"),
+        kernel,
+        "Auxiliary Poisson (MC-stat) constraint on the nuisance parameter.",
+    );
+    let constraint_ref = b.self_ref(&constraint_name);
+    let tau_ref2 = b.self_ref(&tau_name);
+    let term = b.call("likelihoodof", &[constraint_ref, tau_ref2]);
+    let term_name = b.bind_unique_doc(
+        &format!("{param}_constraint_likelihood"),
+        term,
+        "staterror constraint likelihood term.",
+    );
+    b.self_ref(&term_name)
 }
 
 // pyhf interpolation codes (the `interpolation` field on a modifier).
@@ -217,65 +385,59 @@ pub fn require_param(m: &Modifier, spec: &ModSpec) -> Result<String> {
     }
 }
 
-/// The deterministic effect a modifier applies to a sample, plus optional aux term.
-///
-/// Variants are consumed by `emit_channel` in `pyhf.rs`.
+/// The deterministic effect a modifier applies to a sample's expected yields.
 pub enum Effect {
-    /// Multiply `expected` by a free scalar parameter: `broadcast(mul, expected, p)`.
-    MulParam(NodeId),
-    /// Multiply `expected` element-wise by gamma, with a ContinuedPoisson aux term.
-    MulGammaWithAux { gamma: NodeId, aux: NodeId },
-    /// Multiply `expected` by a normsys interpolation factor (scalar), with a
-    /// Normal(alpha, 1.0) aux term.
-    NormSys { factor: NodeId, aux: NodeId },
-    /// Replace the sample nominal with an interpolated array (histosys). No direct
-    /// multiplication applied here; the caller splices `new_nom` in.  Carries a
-    /// Normal(alpha, 1.0) aux term.
-    HistoSys { new_nom: NodeId, aux: NodeId },
-    /// Multiply by a shared lumi parameter; the caller emits the aux once.
-    MulLumi(NodeId),
-    /// Multiply element-wise by a shared per-bin staterror gamma; aux emitted once
-    /// per channel by the caller after aggregating nominals and errors.
-    MulStaterrGamma(NodeId),
-    /// Multiply by a free per-bin shapefactor gamma (no aux).
-    MulShapefactorGamma(NodeId),
+    /// Multiply the running expected by this factor (normfactor / shapefactor /
+    /// lumi / staterror gamma / shapesys gamma / normsys interpolation factor).
+    Multiply(NodeId),
+    /// Replace the sample nominal with this interpolated array (histosys).
+    ReplaceNominal(NodeId),
 }
 
-/// Map one `Modifier` to its `Effect`.
+/// A constraint a modifier's parameter needs, emitted once per parameter by the
+/// caller (deduped). staterror and lumi constraints are channel-level and emitted
+/// directly by the assembler, so they are not described here (`None`).
+pub enum PendingConstraint {
+    /// shapesys: `ContinuedPoisson.(gamma * tau)`, `tau = (nominal/sigma)^2`. The
+    /// caller supplies the sample's nominal ref to [`emit_shapesys_constraint`].
+    Shapesys { sigma: Vec<f64> },
+    /// normsys / histosys: `Normal(alpha, 1)` observed at 0
+    /// ([`emit_normal01_constraint`]).
+    Normal01,
+}
+
+/// Map one `Modifier` to its deterministic [`Effect`] and the constraint its
+/// parameter needs (if any). The caller applies the effect and emits the
+/// constraint once per parameter. staterror/lumi report `None` — their
+/// constraints are channel-level (assembler emits them from the channel-summed
+/// uncertainties / measurement config).
 ///
-/// * `nom` is the sample's nominal data node (needed for histosys interpolation and
-///   shapesys tau).
-/// * `lumi_declared` signals that `declare_modifier_param` has already been called for
-///   the lumi parameter — the caller passes `true` on the second sample.
-///
-/// Aux terms for **lumi** and **staterror** are NOT generated here; they are
-/// assembled channel-wide by `emit_channel` in `pyhf.rs`.
-///
-/// `nom_len` is the number of bins in the sample nominal — used to validate that
-/// histosys `lo`/`hi` content arrays have a matching length.
+/// `nom` is the sample's (post-histosys) nominal node, used for histosys
+/// interpolation; `nom_len` validates histosys `lo`/`hi` array lengths.
 pub fn modifier_effect(
     b: &mut Builder,
     m: &Modifier,
     nom: NodeId,
     nom_len: usize,
-) -> Result<Effect> {
+) -> Result<(Effect, Option<(String, PendingConstraint)>)> {
     let spec = require_spec(m)?;
     let param = require_param(m, spec)?;
-    let param: &str = param.as_str();
-    // The Effect *shape* still varies per kind, but kind validation and the
-    // `parameter` requirement are now driven by `spec`/[`MOD_SPECS`].
     match spec.kind {
-        "normfactor" => Ok(Effect::MulParam(b.self_ref(param))),
+        // Free / channel-level-constrained: just a multiply here.
+        "normfactor" | "shapefactor" | "lumi" | "staterror" => {
+            Ok((Effect::Multiply(b.self_ref(&param)), None))
+        }
 
         "shapesys" => {
-            let gamma = b.self_ref(param);
-            // sigma is the per-bin uncertainty array; it is required for the tau term.
             let data = m.data.as_ref().ok_or_else(|| {
                 Error::Unsupported(format!("shapesys `{param}` missing data (per-bin errors)"))
             })?;
-            let sigma = json_array(b, data, &format!("shapesys `{param}` data"))?;
-            let aux = shapesys_aux(b, gamma, nom, sigma);
-            Ok(Effect::MulGammaWithAux { gamma, aux })
+            let sigma = f64_array(data, &format!("shapesys `{param}` data"))?;
+            let factor = b.self_ref(&param);
+            Ok((
+                Effect::Multiply(factor),
+                Some((param, PendingConstraint::Shapesys { sigma })),
+            ))
         }
 
         "normsys" => {
@@ -284,39 +446,47 @@ pub fn modifier_effect(
             let lo = b.lit_real(lo_val);
             let one = b.lit_real(1.0);
             let hi = b.lit_real(hi_val);
-            let alpha = b.self_ref(param);
+            let alpha = b.self_ref(&param);
             let fn_name = interp_fn(m.interpolation.as_deref(), INTERP_NORMSYS_DEFAULT);
             let factor = b.module_user_call("hepphys", fn_name, &[lo, one, hi, alpha]);
-            // aux: likelihoodof(Normal(mu=alpha, sigma=1.0), 0.0)
-            let aux = normsys_aux(b, alpha);
-            Ok(Effect::NormSys { factor, aux })
+            Ok((
+                Effect::Multiply(factor),
+                Some((param, PendingConstraint::Normal01)),
+            ))
         }
 
         "histosys" => {
             // data = {hi: {contents:[...]}, lo: {contents:[...]}}
             let (lo_arr, hi_arr) = parse_histosys_data(b, m, nom_len)?;
-            let alpha = b.self_ref(param);
+            let alpha = b.self_ref(&param);
             let fn_name = interp_fn(m.interpolation.as_deref(), INTERP_HISTOSYS_DEFAULT);
             let new_nom = b.module_user_call("hepphys", fn_name, &[lo_arr, nom, hi_arr, alpha]);
-            let aux = normsys_aux(b, alpha); // same Normal(alpha,1) form
-            Ok(Effect::HistoSys { new_nom, aux })
+            Ok((
+                Effect::ReplaceNominal(new_nom),
+                Some((param, PendingConstraint::Normal01)),
+            ))
         }
-
-        "lumi" => Ok(Effect::MulLumi(b.self_ref(param))),
-
-        // The aux constraint (built in pyhf.rs from the channel-summed
-        // uncertainties) is a per-bin Poisson term, matching ROOT HistFactory
-        // (which always Poisson-constrains staterror γ, regardless of the HS3
-        // `constraint` field — pyhf's Gaussian staterror is an approximation we
-        // intentionally do not follow).
-        "staterror" => Ok(Effect::MulStaterrGamma(b.self_ref(param))),
-
-        "shapefactor" => Ok(Effect::MulShapefactorGamma(b.self_ref(param))),
 
         // Unreachable: `require_spec` already rejected unknown kinds, and every
         // row in MOD_SPECS is handled above.
         other => unreachable!("MOD_SPECS row `{other}` has no Effect mapping"),
     }
+}
+
+/// Extract a bare numeric array (pyhf form) or a `{ "vals": [...] }` object
+/// (RooFit / HS3 form) into `Vec<f64>`.
+fn f64_array(v: &serde_json::Value, what: &str) -> Result<Vec<f64>> {
+    let v = v.get("vals").unwrap_or(v);
+    let arr = v
+        .as_array()
+        .ok_or_else(|| Error::Unsupported(format!("{what}: expected a JSON array of numbers")))?;
+    arr.iter()
+        .enumerate()
+        .map(|(i, x)| {
+            x.as_f64()
+                .ok_or_else(|| Error::Unsupported(format!("{what}: element {i} is not a number")))
+        })
+        .collect()
 }
 
 /// Parse normsys modifier data `{hi: f64, lo: f64}`.
@@ -392,63 +562,6 @@ fn histosys_contents(
     json_array(b, contents, &what)
 }
 
-/// `likelihoodof(Normal(mu=alpha, sigma=1.0), 0.0)` — shared by normsys and histosys.
-pub fn normsys_aux(b: &mut Builder, alpha: NodeId) -> NodeId {
-    let sigma_one = b.lit_real(1.0);
-    let normal = b.call_kw("Normal", &[("mu", alpha), ("sigma", sigma_one)]);
-    let obs_zero = b.lit_real(0.0);
-    b.call("likelihoodof", &[normal, obs_zero])
-}
-
-/// Staterror Barlow–Beeston aux. The per-bin scale `gamma_b` is constrained by
-/// the channel-summed relative uncertainty
-/// `delta_b = sqrt(sum_s err_{s,b}^2) / sum_s nom_{s,b}`.
-///
-/// The constraint TYPE follows ROOT HistFactory's `StatErrorConfig`: **Poisson
-/// by default** (and for `constraint: "Poisson"`), **Gaussian** for
-/// `constraint: "Gauss"`/`"Gaussian"`. (ROOT honours this; its HS3 *reader*
-/// currently forces Poisson, but native HistFactory and the spec allow both.)
-///
-/// - Poisson: `likelihoodof(broadcast(ContinuedPoisson, broadcast(mul, gamma, tau)), tau)`,
-///   effective count `tau_b = 1/delta_b^2` (= ROOT's `gamma·tau` poisMean, observed at `tau`).
-/// - Gaussian: `likelihoodof(broadcast(Normal, gamma, delta), [1.0, …])`.
-pub fn staterror_aux(
-    b: &mut Builder,
-    gamma: NodeId,
-    sum_nom: &[f64],
-    sum_sq: &[f64],
-    gaussian: bool,
-) -> NodeId {
-    if gaussian {
-        // delta_b = sqrt(sum_sq_b) / sum_nom_b (relative uncertainty).
-        let delta_elems: Vec<NodeId> = sum_nom
-            .iter()
-            .zip(sum_sq.iter())
-            .map(|(n, sq)| b.lit_real(if *n > 0.0 { sq.sqrt() / n } else { 0.0 }))
-            .collect();
-        let delta = b.array(&delta_elems);
-        let normal = b.call_head("Normal");
-        let model = b.call("broadcast", &[normal, gamma, delta]);
-        let ones: Vec<NodeId> = sum_nom.iter().map(|_| b.lit_real(1.0)).collect();
-        let obs = b.array(&ones);
-        return b.call("likelihoodof", &[model, obs]);
-    }
-    // tau_b = sum_nom_b^2 / sum_sq_b = 1/delta_b^2 (effective counts), computed
-    // directly from the sums to match ROOT exactly (e.g. 100^2/25 = 400, not
-    // 399.999… via a sqrt-then-square round trip).
-    let tau_elems: Vec<NodeId> = sum_nom
-        .iter()
-        .zip(sum_sq.iter())
-        .map(|(n, sq)| b.lit_real(if *sq > 0.0 { n * n / sq } else { 0.0 }))
-        .collect();
-    let tau = b.array(&tau_elems);
-    let mul = b.call_head("mul");
-    let prod = b.call("broadcast", &[mul, gamma, tau]);
-    let cp = b.module_call("hepphys", "ContinuedPoisson");
-    let aux_model = b.call("broadcast", &[cp, prod]);
-    b.call("likelihoodof", &[aux_model, tau])
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -477,58 +590,50 @@ mod tests {
     }
 
     #[test]
-    fn shapesys_aux_is_point_free_continued_poisson() {
+    fn emit_shapesys_constraint_is_point_free_continued_poisson() {
         let mut m = flatppl_core::Module::new();
-        let aux = {
+        {
             let mut b = Builder::new(&mut m);
             let nom = {
                 let a = b.lit_real(50.0);
                 let c = b.lit_real(52.0);
                 b.array(&[a, c])
             };
-            let sigma = {
-                let a = b.lit_real(3.0);
-                let c = b.lit_real(7.0);
-                b.array(&[a, c])
-            };
-            let gamma = b.self_ref("gamma");
-            shapesys_aux(&mut b, gamma, nom, sigma)
-        };
-        {
-            let mut b = Builder::new(&mut m);
-            b.bind("L_aux", aux);
+            let _ = emit_shapesys_constraint(&mut b, "gamma", nom, &[3.0, 7.0]);
         }
         let text = print_with(&m, Syntax::Minimal);
         assert!(text.contains("ContinuedPoisson"), "got:\n{text}");
         assert!(text.contains("likelihoodof"), "got:\n{text}");
+        assert!(text.contains("functionof"), "got:\n{text}");
+        assert!(
+            text.contains("gamma_tau") && text.contains("gamma_constraint_likelihood"),
+            "parameter-keyed named bindings, got:\n{text}"
+        );
         assert!(!text.contains("fn("), "MUST be point-free, got:\n{text}");
     }
 
     #[test]
-    fn normsys_aux_emits_normal() {
+    fn emit_normal01_constraint_emits_normal() {
         let mut m = flatppl_core::Module::new();
         {
             let mut b = Builder::new(&mut m);
-            let alpha = b.self_ref("alpha");
-            let aux = normsys_aux(&mut b, alpha);
-            b.bind("L_aux", aux);
+            let _ = emit_normal01_constraint(&mut b, "alpha");
         }
         let text = print_with(&m, Syntax::Minimal);
         assert!(text.contains("Normal"), "got:\n{text}");
-        assert!(text.contains("likelihoodof"), "got:\n{text}");
+        assert!(text.contains("functionof"), "got:\n{text}");
+        assert!(text.contains("alpha_constraint"), "got:\n{text}");
         assert!(!text.contains("fn("), "must be point-free, got:\n{text}");
     }
 
     #[test]
-    fn staterror_aux_poisson_default() {
-        // ROOT default: Poisson constraint via ContinuedPoisson, effective count
+    fn emit_staterror_constraint_poisson_default() {
+        // Poisson constraint via ContinuedPoisson, effective count
         // tau = sum_nom^2/sum_sq (exact): 100^2/25 = 400, 100^2/100 = 100.
         let mut m = flatppl_core::Module::new();
         {
             let mut b = Builder::new(&mut m);
-            let gamma = b.self_ref("gamma");
-            let aux = staterror_aux(&mut b, gamma, &[100.0, 100.0], &[25.0, 100.0], false);
-            b.bind("L_aux", aux);
+            let _ = emit_staterror_constraint(&mut b, "gamma", &[100.0, 100.0], &[25.0, 100.0], false);
         }
         let text = print_with(&m, Syntax::Minimal);
         assert!(text.contains("ContinuedPoisson"), "got:\n{text}");
@@ -544,15 +649,13 @@ mod tests {
     }
 
     #[test]
-    fn staterror_aux_gaussian_option() {
+    fn emit_staterror_constraint_gaussian_option() {
         // `constraint: "Gauss"` → Normal(gamma, delta), delta = sqrt(sum_sq)/sum_nom
         // = [0.05, 0.1], observed at per-bin 1.0.
         let mut m = flatppl_core::Module::new();
         {
             let mut b = Builder::new(&mut m);
-            let gamma = b.self_ref("gamma");
-            let aux = staterror_aux(&mut b, gamma, &[100.0, 100.0], &[25.0, 100.0], true);
-            b.bind("L_aux", aux);
+            let _ = emit_staterror_constraint(&mut b, "gamma", &[100.0, 100.0], &[25.0, 100.0], true);
         }
         let text = print_with(&m, Syntax::Minimal);
         assert!(text.contains("Normal"), "got:\n{text}");

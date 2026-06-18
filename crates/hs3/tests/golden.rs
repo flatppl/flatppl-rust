@@ -261,29 +261,60 @@ const FIXTURE_2BIN: &str = include_str!("fixtures/2bin_1channel.json");
 fn golden_pyhf_2bin_assembly() {
     let m = flatppl_hs3::read(FIXTURE_2BIN).expect("2bin fixture must convert");
     let text = print_with(&m, Syntax::Minimal);
-    // Expected count = signal·mu + background·gamma, per bin.
+    // Per-sample expected: each nominal template scaled by its modifier
+    // (signal * mu, background * gamma).
     assert!(
         text.contains(
-            "obs_model_singlechannel = broadcast(Poisson, broadcast(add, \
-             broadcast(mul, [5.0, 10.0], mu), broadcast(mul, [50.0, 60.0], uncorr_bkguncrt)))"
+            "singlechannel_signal_expected = broadcast(mul, singlechannel_signal_nominal, mu)"
         ),
-        "pyhf 2bin obs_model mismatch, got:\n{text}"
+        "signal expected mismatch, got:\n{text}"
     );
-    // Likelihood: main Poisson term on observed [50.0, 60.0] + shapesys aux.
     assert!(
         text.contains(
-            "L_singlechannel = joint_likelihood(likelihoodof(obs_model_singlechannel, [50.0, 60.0])"
+            "singlechannel_background_expected = \
+             broadcast(mul, singlechannel_background_nominal, uncorr_bkguncrt)"
         ),
-        "pyhf 2bin likelihood head mismatch, got:\n{text}"
+        "background expected mismatch, got:\n{text}"
+    );
+    // Total expected = sum over samples, per bin.
+    assert!(
+        text.contains(
+            "singlechannel_expected = \
+             broadcast(add, singlechannel_signal_expected, singlechannel_background_expected)"
+        ),
+        "total expected mismatch, got:\n{text}"
+    );
+    // The observation model is a reified kernel (functionof), as likelihoodof
+    // requires; the observation term binds it to the observed counts.
+    assert!(
+        text.contains(
+            "singlechannel_model = functionof(broadcast(Poisson, singlechannel_expected))"
+        ),
+        "obs model mismatch, got:\n{text}"
     );
     assert!(
-        text.contains("hepphys.ContinuedPoisson"),
-        "pyhf 2bin missing shapesys ContinuedPoisson aux, got:\n{text}"
+        text.contains(
+            "singlechannel_likelihood = likelihoodof(singlechannel_model, singlechannel_observed)"
+        ) && text.contains("singlechannel_observed = [50.0, 60.0]"),
+        "observation term / observed data mismatch, got:\n{text}"
     );
-    // shapesys parameter domain is a 2-vector of positive rates.
+    // shapesys constraint: a ContinuedPoisson on effective counts, parameter-keyed.
+    assert!(
+        text.contains("hepphys.ContinuedPoisson")
+            && text.contains("uncorr_bkguncrt_constraint_likelihood"),
+        "missing parameter-keyed shapesys constraint, got:\n{text}"
+    );
     assert!(
         text.contains("uncorr_bkguncrt = elementof(cartpow(posreals, 2))"),
-        "pyhf 2bin shapesys domain mismatch, got:\n{text}"
+        "shapesys domain mismatch, got:\n{text}"
+    );
+    // Flat top-level likelihood = observation term + constraint term.
+    assert!(
+        text.contains(
+            "likelihood = \
+             joint_likelihood(singlechannel_likelihood, uncorr_bkguncrt_constraint_likelihood)"
+        ),
+        "flat top-level likelihood mismatch, got:\n{text}"
     );
     assert!(!text.contains("fn("), "must be point-free, got:\n{text}");
     assert!(parse(&text).is_ok(), "round-trip parse failed:\n{text}");
@@ -309,18 +340,23 @@ fn golden_paper_histfactory_staterror_deltas() {
         !text.contains("call(hepphys"),
         "must not emit invalid call(hepphys...) builtin, got:\n{text}"
     );
-    // staterror aux: the per-bin mcstat scales carry a Poisson (Barlow–Beeston)
-    // constraint — ROOT's default — emitted as a ContinuedPoisson on mcstat.
-    // Structural check only; exact numerical conformance vs ROOT/pyhf lives in
-    // the flatppl-js cross-engine suite.
+    // staterror (mcstat): ROOT-default Poisson (Barlow-Beeston) constraint, a
+    // ContinuedPoisson on the per-bin effective counts tau = 1/delta^2 =
+    // [1/0.05^2, 1/0.1^2] = [400, 100]. Parameter-keyed, computed once.
     assert!(
-        text.contains("hepphys.ContinuedPoisson") && text.contains("mcstat"),
+        text.contains("mcstat_tau = [400.0, 100.0]"),
+        "staterror effective counts mismatch (expected [400, 100]), got:\n{text}"
+    );
+    assert!(
+        text.contains("mcstat_constraint = functionof(broadcast(hepphys.ContinuedPoisson"),
         "expected a ContinuedPoisson staterror constraint on mcstat, got:\n{text}"
     );
-    // Observed bin contents [122.0, 112.0], in order, fed to the main Poisson
-    // term. Pin the full likelihoodof so a reordered observation array fails.
+    // Observed bin contents [122.0, 112.0], in order, fed to the channel's
+    // observation term. Pin the full likelihoodof so a reordered array fails.
     assert!(
-        text.contains("likelihoodof(obs_model_model_channel1, [122.0, 112.0])"),
+        text.contains(
+            "model_channel1_likelihood = likelihoodof(model_channel1_model, model_channel1_observed)"
+        ) && text.contains("model_channel1_observed = [122.0, 112.0]"),
         "observed-data likelihood mismatch (expected [122.0, 112.0]), got:\n{text}"
     );
     assert!(

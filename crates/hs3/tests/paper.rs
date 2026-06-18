@@ -63,10 +63,15 @@ fn paper_histfactory_converts() {
         text.contains("joint_likelihood"),
         "missing joint_likelihood, got:\n{text}"
     );
-    // Observed bin contents [122.0, 112.0], in order, on the main Poisson term.
-    // Pin the exact bracketed vector so a reordered observation array fails.
+    // Observed bin contents [122.0, 112.0], in order, bound as the channel's
+    // observed counts and fed to its observation term. Pin the exact bracketed
+    // vector so a reordered observation array fails.
     assert!(
-        text.contains("likelihoodof(obs_model_model_channel1, [122.0, 112.0])"),
+        text.contains("model_channel1_observed = [122.0, 112.0]")
+            && text.contains(
+                "model_channel1_likelihood = \
+                 likelihoodof(model_channel1_model, model_channel1_observed)"
+            ),
         "observed-data likelihood mismatch (expected [122.0, 112.0]), got:\n{text}"
     );
     assert!(!text.contains("fn("), "not point-free, got:\n{text}");
