@@ -689,3 +689,91 @@ y = hepphys.CrystalBall(0.0, 1.0, 1.5, 2.0)
         );
     }
 }
+
+/// `div` / `mod` are integer-domain (spec §07): a real or complex operand is a
+/// static error, integer operands type to `integer`, and real division stays
+/// available as the separate `divide` op.
+#[cfg(test)]
+mod int_domain_div_mod_tests {
+    use super::*;
+    use flatppl_core::{ScalarType, Type};
+
+    fn infer_src(src: &str) -> (flatppl_core::Module, Vec<Diagnostic>) {
+        let mut module = flatppl_syntax::parse(src).expect("source parses");
+        let diags = infer_with(&mut module, Level::Normalization);
+        (module, diags)
+    }
+
+    fn errs(diags: &[Diagnostic]) -> Vec<&Diagnostic> {
+        diags
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .collect()
+    }
+
+    fn ty<'m>(module: &'m flatppl_core::Module, name: &str) -> Option<&'m Type> {
+        let rhs = module
+            .bindings()
+            .find(|(_, b)| module.resolve(b.name) == name)?
+            .1
+            .rhs;
+        module.type_of(rhs)
+    }
+
+    #[test]
+    fn real_operand_to_div_is_an_integer_domain_error() {
+        // One real operand (arg 1), one integer (arg 2): exactly one error,
+        // anchored to the real operand — pins the per-operand check.
+        let (_m, diags) = infer_src("a = 7.0\nb = 2\nq = div(a, b)\n");
+        let e = errs(&diags);
+        assert_eq!(e.len(), 1, "one error expected; got {diags:?}");
+        assert!(
+            e[0].message.contains("`div` is integer-domain")
+                && e[0].message.contains("argument 1 is real")
+                && e[0].message.contains("use `divide` for real division"),
+            "message should name argument 1 (real) + the divide hint; got {:?}",
+            e[0].message
+        );
+    }
+
+    #[test]
+    fn real_operand_to_mod_is_an_integer_domain_error() {
+        let (_m, diags) = infer_src("a = 7\nb = 2.0\nr = mod(a, b)\n");
+        let e = errs(&diags);
+        assert_eq!(e.len(), 1, "one error expected; got {diags:?}");
+        assert!(
+            e[0].message.contains("`mod` is integer-domain")
+                && e[0].message.contains("argument 2 is real"),
+            "message should name argument 2 (real); got {:?}",
+            e[0].message
+        );
+        // `mod` is not real division, so it carries no `divide` hint.
+        assert!(!e[0].message.contains("use `divide`"));
+    }
+
+    #[test]
+    fn both_real_operands_flag_each_argument() {
+        // Both operands real → one diagnostic per offending operand.
+        let (_m, diags) = infer_src("a = 7.0\nb = 2.0\nq = div(a, b)\n");
+        assert_eq!(
+            errs(&diags).len(),
+            2,
+            "both operands flagged; got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn integer_operands_to_div_mod_type_to_integer_with_no_error() {
+        let (m, diags) = infer_src("a = 7\nb = 2\nq = div(a, b)\nr = mod(a, b)\n");
+        assert!(errs(&diags).is_empty(), "no errors expected; got {diags:?}");
+        assert_eq!(ty(&m, "q"), Some(&Type::Scalar(ScalarType::Integer)));
+        assert_eq!(ty(&m, "r"), Some(&Type::Scalar(ScalarType::Integer)));
+    }
+
+    #[test]
+    fn divide_keeps_real_division_no_integer_domain_check() {
+        let (m, diags) = infer_src("a = 7.0\nb = 2.0\nq = divide(a, b)\n");
+        assert!(errs(&diags).is_empty(), "no errors expected; got {diags:?}");
+        assert_eq!(ty(&m, "q"), Some(&Type::Scalar(ScalarType::Real)));
+    }
+}

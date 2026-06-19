@@ -84,6 +84,42 @@ pub(crate) fn call_rule(
         // the complex case must promote. See `divide_type`.
         "divide" => divide_type(arg_ty(args, 0), arg_ty(args, 1)),
 
+        // `div(a, b) = ⌊a/b⌋` and `mod(a, b) = a − b·⌊a/b⌋` are integer-domain
+        // (spec §07: operands and result `integers`, `b ≠ 0`). The result is
+        // always `integer` (per the catalogue); additionally reject a real or
+        // complex operand as a static error rather than letting it through to a
+        // silently-fractional value — real division is the separate `divide`
+        // op. Booleans embed into integers (spec §03 `booleans ⊂ integers ⊂
+        // reals`) and pass; deferred/any operands defer to runtime.
+        "div" | "mod" => {
+            let mut ok = true;
+            for i in 0..2 {
+                let Some(t) = arg_ty(args, i) else { continue };
+                if let Some(kind @ (ScalarType::Real | ScalarType::Complex)) = scalar_kind(t) {
+                    let anchor = args.get(i).map_or(id, |(n, _, _)| *n);
+                    let hint = if name == "div" {
+                        " — use `divide` for real division"
+                    } else {
+                        ""
+                    };
+                    inf.diags.push(crate::Diagnostic::error_at(
+                        anchor,
+                        format!(
+                            "`{name}` is integer-domain (spec §07): argument {} \
+                             is {kind}, but `{name}` requires integers{hint}",
+                            i + 1,
+                        ),
+                    ));
+                    ok = false;
+                }
+            }
+            if ok {
+                Type::Scalar(ScalarType::Integer)
+            } else {
+                Type::Failed(format!("{name} non-integer operand").into())
+            }
+        }
+
         // ---- containers (spec §03) — structural: result type threads arg types ----
         "vector" => vector_type(args),
         "tuple" => Type::Tuple(args.iter().map(|(_, t, _)| t.clone()).collect()),
@@ -309,6 +345,18 @@ pub(crate) fn call_rule(
 
 fn arg_ty(args: &[ArgInfo], i: usize) -> Option<&Type> {
     args.get(i).map(|(_, t, _)| t)
+}
+
+/// The scalar element kind of `t`, drilling through array nesting (an
+/// elementwise op over an array carries the constraint to its elements).
+/// `None` for non-scalar/non-array types (measures, modules, deferred,
+/// failed, any) — those cannot be statically disproven as integer.
+fn scalar_kind(t: &Type) -> Option<ScalarType> {
+    match t {
+        Type::Scalar(s) => Some(*s),
+        Type::Array { elem, .. } => scalar_kind(elem),
+        _ => None,
+    }
 }
 
 /// Clone a measure type with its mass reset to `Deferred` (to be filled by
