@@ -149,19 +149,31 @@ fn level_normalization_does_not_resolve_dims() {
     );
 }
 
-// ---- Gap documentation: measure ops ----
+// ---- measure ops ----
 
-/// `Dirac` stays honestly deferred — point-mass measure semantics not yet
-/// typed. (The chain/scan/compose/disintegrate ops are no longer here — they
-/// now infer; see `kernel_chain_ops_infer_measures` and
-/// `scan_fchain_disintegrate_infer`.)
+/// `Dirac(value)` is the point-mass probability measure at `value` (spec §06):
+/// a normalized measure over `value`'s type (works for any variate type — a
+/// scalar gives a real-domain measure, a record gives a record-domain measure).
+/// `value` may be the named kwarg or positional.
 #[test]
-fn unimplemented_measure_ops_are_deferred() {
-    // Dirac
-    let out = ir("x = Dirac(0.0)");
+fn dirac_infers_a_normalized_point_mass() {
+    let out = ir("d = Dirac(value = 3.0)");
     assert!(
-        out.contains("(%meta (%deferred %fixed %unknown) (Dirac"),
-        "Dirac: expected %deferred gap, got:\n{out}"
+        out.contains("(%measure (%domain (%scalar real)) (%mass %normalized))")
+            && out.contains("(Dirac"),
+        "Dirac(value=3.0) should be a normalized real measure, got:\n{out}"
+    );
+    // Positional form too.
+    let out = ir("d = Dirac(0.0)");
+    assert!(
+        out.contains("(%measure (%domain (%scalar real)) (%mass %normalized))"),
+        "Dirac(0.0) should be a normalized real measure, got:\n{out}"
+    );
+    // Record variate → record-domain measure.
+    let out = ir("d = Dirac(value = record(a = 1.0))");
+    assert!(
+        out.contains("(%measure (%domain (%record (a (%scalar real)))) (%mass %normalized))"),
+        "Dirac over a record should be a record-domain measure, got:\n{out}"
     );
 }
 

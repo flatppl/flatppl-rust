@@ -332,6 +332,25 @@ pub(crate) fn call_rule(
             domain: Box::new(set_element_type(inf, args.first().map(|a| a.0))),
             mass: Mass::Deferred,
         },
+        // `Dirac(value = v)` (spec §06) is the point-mass probability measure at
+        // `v`, for any variate type: the domain is `v`'s type. `value` is given
+        // as the named kwarg (spec form) or positionally. Mass is normalized
+        // (total mass 1) — set in `fill_mass`.
+        "Dirac" => {
+            let v = arg_ty(args, 0).cloned().or_else(|| {
+                named
+                    .iter()
+                    .find(|(n, _, _, _)| inf.module.resolve(*n) == "value")
+                    .map(|(_, _, t, _)| t.clone())
+            });
+            match v {
+                Some(t) => Type::Measure {
+                    domain: Box::new(t),
+                    mass: Mass::Deferred,
+                },
+                None => Type::Deferred,
+            }
+        }
         // `bayesupdate(L, prior)` (spec §06): the unnormalized posterior is a
         // measure over the prior's domain — pick the measure-typed argument,
         // with a fresh mass slot (the posterior's mass is the evidence).
@@ -1822,6 +1841,8 @@ pub(crate) fn fill_mass(
     let mass = match name.as_str() {
         // Every §08 distribution is a probability measure.
         "lawof" => Mass::Normalized,
+        // `Dirac(value)` is a point-mass probability measure (total mass 1).
+        "Dirac" => Mass::Normalized,
         // Reference measures: finite on a bounded support, infinite (but
         // boundedly finite) on an unbounded one.
         "Lebesgue" | "Counting" => {
