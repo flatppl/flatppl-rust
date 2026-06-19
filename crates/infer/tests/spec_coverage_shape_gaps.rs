@@ -721,3 +721,37 @@ fn addaxes_and_splitblocks_infer() {
         "splitblocks(1-D) should be a vector of real sub-vectors, got:\n{out}"
     );
 }
+
+/// ext-linear-algebra `lu`/`svd`/`eigen` now infer proper records (via the new
+/// ResultSig::Record), no longer the degraded Matrix placeholder; `matexp`
+/// passes its shape through and `lstsq` is a vector.
+#[test]
+fn ext_linalg_record_results_infer() {
+    let pre =
+        "e = standard_module(\"ext-linear-algebra\", \"0.1\")\nA = [[4.0, 0.0], [0.0, 9.0]]\n";
+    let out = ir(&format!("{pre}d = e.lu(A)"));
+    assert!(
+        out.contains("(%record (P (%array 2")
+            && out.contains("(L (%array 2")
+            && out.contains("(U (%array 2"),
+        "lu should infer record(P, L, U) of matrices, got:\n{out}"
+    );
+    let out = ir(&format!("{pre}d = e.svd(A)"));
+    assert!(
+        out.contains("(%record (U (%array 2")
+            && out.contains("(S (%array 1 (%dynamic) (%scalar real)))")
+            && out.contains("(V (%array 2"),
+        "svd should infer record(U: matrix, S: real vector, V: matrix), got:\n{out}"
+    );
+    let out = ir(&format!("{pre}d = e.eigen(A)"));
+    assert!(
+        out.contains("(%record (values (%array 1") && out.contains("(vectors (%array 2"),
+        "eigen should infer record(values: vector, vectors: matrix), got:\n{out}"
+    );
+    // matexp passes A's shape through; lstsq is a vector.
+    let out = ir(&format!("{pre}d = e.matexp(A)"));
+    assert!(
+        out.contains("(%array 1 (2) (%array 1 (2) (%scalar real)))") && out.contains("matexp"),
+        "matexp should preserve A's shape, got:\n{out}"
+    );
+}

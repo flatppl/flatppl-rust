@@ -1352,7 +1352,7 @@ fn catalogue_call_type(inf: &mut Inferencer<'_, '_>, callee: NodeId, args: &[Arg
     // `catalogue_lower` already embeds the catalogue `MassTag` mass in the
     // `Measure` for distributions, and the result scalar/matrix type for
     // functions. No per-variant fixup is needed.
-    let (ty, _vset) = catalogue_lower(&sig, args);
+    let (ty, _vset) = catalogue_lower(&mut *inf.module, &sig, args);
     ty
 }
 
@@ -1368,7 +1368,7 @@ fn catalogue_call_valueset(
     let Some(sig) = inf.module_catalogue_ref(callee).map(|c| c.sig.clone()) else {
         return ValueSet::Unknown;
     };
-    catalogue_lower(&sig, args).1
+    catalogue_lower(&mut *inf.module, &sig, args).1
 }
 
 /// Lower a §09 catalogue sig with a `LowerCtx` built from the concrete
@@ -1377,13 +1377,22 @@ fn catalogue_call_valueset(
 /// application, so it falls back to the first positional arg's vector dim.
 /// The `LowerCtx` borrows local closures, so it is built and consumed here in
 /// one scope rather than returned.
-fn catalogue_lower(sig: &crate::catalogue::Sig, args: &[ArgInfo]) -> (Type, ValueSet) {
+fn catalogue_lower(
+    module: &mut flatppl_core::Module,
+    sig: &crate::catalogue::Sig,
+    args: &[ArgInfo],
+) -> (Type, ValueSet) {
     use crate::catalogue::{LowerCtx, lower};
+    use std::cell::RefCell;
 
     let first_dim = || match args.first().map(|(_, t, _)| t) {
         Some(Type::Array { shape, .. }) if shape.len() == 1 => shape[0],
         _ => Dim::Dynamic,
     };
+    // RefCell so the `intern` closure is a `Fn` alongside the immutable arg
+    // accessors — module functions can return records (lu/svd/eigen) whose
+    // field names must be interned into the current module.
+    let module = RefCell::new(module);
     let ctx = LowerCtx {
         arg_scalar: &|i| match arg_ty(args, i) {
             Some(Type::Scalar(s)) => Some(*s),
@@ -1395,7 +1404,7 @@ fn catalogue_lower(sig: &crate::catalogue::Sig, args: &[ArgInfo]) -> (Type, Valu
             _ => Dim::Dynamic,
         },
         arg_type: &|i| arg_ty(args, i).cloned(),
-        intern: &crate::catalogue::no_intern,
+        intern: &|s| module.borrow_mut().intern(s),
     };
     lower(sig, &ctx)
 }
@@ -1513,7 +1522,7 @@ fn broadcast_type(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo], named: &[Named
                 (*n, cell, *p)
             })
             .collect();
-        return match catalogue_lower(&sig, &cell_args).0 {
+        return match catalogue_lower(&mut *inf.module, &sig, &cell_args).0 {
             // Distribution head: an independent product over the array. Its cell
             // domain and mass come from the catalogue sig, so a non-probability
             // measure like `ContinuedPoisson` stays `Finite`, not forced to
