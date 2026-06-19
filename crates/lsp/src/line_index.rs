@@ -1,6 +1,8 @@
 //! Byte-offset ↔ (line, UTF-16 column) conversion. LSP `Position.character` is a
 //! UTF-16 code-unit count within the line; FlatPPL spans are byte offsets.
 
+use std::sync::Arc;
+
 /// A 0-based (line, UTF-16 column) position.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Pos {
@@ -10,7 +12,7 @@ pub struct Pos {
 
 #[derive(Clone, Debug, PartialEq, Eq, salsa::Update)]
 pub struct LineIndex {
-    text: String,
+    text: Arc<str>,
     line_starts: Vec<u32>, // byte offset of each line's first char; [0] = 0
 }
 
@@ -23,7 +25,7 @@ impl LineIndex {
             }
         }
         LineIndex {
-            text: text.to_string(),
+            text: text.into(),
             line_starts,
         }
     }
