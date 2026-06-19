@@ -948,6 +948,38 @@ mod tests {
         );
     }
 
+    /// An iid count derived from a fixed `lengthof` of a literal array must show
+    /// a CONCRETE dim in the inlay hint, not `?`. This is what `Level::Shape`
+    /// (vs `Normalization`) buys: shape resolution folds `lengthof([…5…])` → 5,
+    /// so `y ~ iid(Poisson(λ), n)` is `…[5]`, not `…[?]`.
+    #[test]
+    fn inlay_hints_resolve_iid_count_dim() {
+        let db = Database::default();
+        let cats = Catalogues::new(&db, vec![]);
+        let src = "counts = [2, 3, 7, 6, 4]\n\
+                   n = lengthof(counts)\n\
+                   lambda ~ Gamma(2.0, 1.0)\n\
+                   y ~ iid(Poisson(lambda), n)\n";
+        let f = SourceFile::new(&db, "m.flatppl".to_string(), src.to_string());
+        let fs = FileSet::new(&db, vec![f]);
+        let hints = inlay_hints(&db, f, fs, cats, 0, src.len() as u32);
+        let labels: Vec<String> = hints
+            .iter()
+            .filter_map(|h| match &h.label {
+                lsp_types::InlayHintLabel::String(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            labels.iter().any(|l| l.contains("[5]")),
+            "y's iid count should resolve to dim 5 ([5], not [?]); got: {labels:?}"
+        );
+        assert!(
+            !labels.iter().any(|l| l.contains("[?]")),
+            "no shape should be left dynamic for this fully-fixed model; got: {labels:?}"
+        );
+    }
+
     // ── goto_definition() capability tests ──────────────────────────────────
 
     #[test]
