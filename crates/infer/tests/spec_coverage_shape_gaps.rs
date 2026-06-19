@@ -755,3 +755,34 @@ fn ext_linalg_record_results_infer() {
         "matexp should preserve A's shape, got:\n{out}"
     );
 }
+
+/// Indexing an array by an integer ARRAY is a gather (`a[group_data]`, spec §07
+/// "array of indices subset selection"): the result has the index's shape and
+/// the container's element type — so a hierarchical `eta = a[g] .+ b .* x`
+/// traces as a real array, not %deferred.
+#[test]
+fn gather_by_index_array_traces_real() {
+    let src = "G = 3\n\
+               x_data = [-1.2, 0.4, 1.1]\n\
+               group_data = [1, 2, 3]\n\
+               a ~ iid(Normal(0.0, 1.0), G)\n\
+               b ~ Normal(0.0, 1.0)\n\
+               gath = a[group_data]\n\
+               eta = a[group_data] .+ b .* x_data\n";
+    let out = ir(src);
+    let line = |n: &str| {
+        out.lines()
+            .find(|l| l.contains(&format!("(%bind {n} ")))
+            .unwrap_or("NONE")
+    };
+    assert!(
+        line("gath").contains("(%array 1 (3) (%scalar real))"),
+        "a[group_data] should gather to a length-3 real array, got:\n{}",
+        line("gath")
+    );
+    assert!(
+        line("eta").contains("(%array 1 (3) (%scalar real))"),
+        "eta should be a real array (not %deferred element), got:\n{}",
+        line("eta")
+    );
+}

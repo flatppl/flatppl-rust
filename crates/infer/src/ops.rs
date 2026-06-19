@@ -696,7 +696,7 @@ fn get_type(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo], base: i64) -> Type {
         return Type::Deferred;
     };
     let mut current = container.clone();
-    for (node, _, _) in &args[1..] {
+    for (node, sel_ty, _) in &args[1..] {
         let selector = inf.module.node(*node).clone();
         current = match (&current, &selector) {
             (Type::Tuple(comps), Node::Lit(Scalar::Int(k))) => {
@@ -724,7 +724,34 @@ fn get_type(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo], base: i64) -> Type {
                 }
             }
             (Type::Any | Type::Deferred, _) => return current.clone(),
-            _ => return Type::Deferred,
+            // A non-literal selector: fall back to its inferred TYPE. Indexing
+            // an array by an integer ARRAY is a GATHER (`a[idxs]` — result has
+            // the index's shape and the container's element, spec §07 "array of
+            // indices subset selection"); a scalar-integer selector consumes
+            // the leading axis like a literal `Int`.
+            _ => match (&current, sel_ty) {
+                (
+                    Type::Array { elem, .. },
+                    Type::Array {
+                        shape: ish,
+                        elem: ie,
+                    },
+                ) if matches!(ie.as_ref(), Type::Scalar(ScalarType::Integer)) => Type::Array {
+                    shape: ish.clone(),
+                    elem: elem.clone(),
+                },
+                (Type::Array { shape, elem }, Type::Scalar(ScalarType::Integer)) => {
+                    if shape.len() == 1 {
+                        elem.as_ref().clone()
+                    } else {
+                        Type::Array {
+                            shape: shape[1..].into(),
+                            elem: elem.clone(),
+                        }
+                    }
+                }
+                _ => return Type::Deferred,
+            },
         };
     }
     current
