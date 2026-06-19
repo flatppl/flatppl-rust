@@ -221,6 +221,36 @@ pub(crate) fn lower(sig: &Sig, ctx: &LowerCtx) -> (Type, ValueSet) {
                     shape: Box::new([dim_of(rows, ctx), dim_of(cols, ctx)]),
                     elem: Box::new(Type::Scalar(elem_of(elem, ctx))),
                 },
+                ResultSig::TransposeOf(i) => match (ctx.arg_type)(*i) {
+                    // Flat rank-2 array: swap the two dims, element preserved.
+                    Some(Type::Array { shape, elem }) if shape.len() == 2 => Type::Array {
+                        shape: Box::new([shape[1], shape[0]]),
+                        elem,
+                    },
+                    // Matrix as nested vectors `Array[r]{ Array[c]{e} }` → swap
+                    // outer/inner lengths to `Array[c]{ Array[r]{e} }`.
+                    Some(Type::Array { shape, elem })
+                        if shape.len() == 1
+                            && matches!(elem.as_ref(),
+                                Type::Array { shape: inner, .. } if inner.len() == 1) =>
+                    {
+                        let Type::Array {
+                            shape: inner,
+                            elem: ie,
+                        } = *elem
+                        else {
+                            unreachable!()
+                        };
+                        Type::Array {
+                            shape: inner,
+                            elem: Box::new(Type::Array { shape, elem: ie }),
+                        }
+                    }
+                    // Plain vector: a transposed vector is the same rank-1 array
+                    // type — orientation is not a type-level distinction (spec §07).
+                    Some(t @ Type::Array { .. }) => t,
+                    _ => Type::Deferred,
+                },
             };
             let vset = ValueSet::natural_of(&ty);
             (ty, vset)

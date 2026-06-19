@@ -194,19 +194,24 @@ fn unimplemented_measure_ops_are_deferred() {
     );
 }
 
-// ---- Gap documentation: linear-algebra functions ----
+// ---- linear-algebra functions now inferred via the catalogue ----
 
-/// `transpose` still parses and is honestly deferred — no type rule yet (its
-/// result rank depends on whether the argument is a vector or a matrix, which
-/// the catalogue cannot yet branch on). (`det`/`eye`/`linspace` are no longer
-/// here — they now infer via the catalogue; see the tests below.)
+/// `transpose`/`adjoint` preserve rank and element kind: a matrix's two dims
+/// swap; a vector's transpose stays a rank-1 transposed vector (spec §07: "the
+/// transpose of a vector is a transposed vector, not a single-row matrix").
 #[test]
-fn unimplemented_functions_are_deferred() {
-    // transpose
+fn transpose_preserves_rank_and_element_kind() {
+    // matrix (nested vectors) → matrix, element kind preserved
     let out = ir("A = [[1.0, 2.0], [3.0, 4.0]]\nx = transpose(A)");
     assert!(
-        out.contains("(%meta (%deferred %fixed %unknown) (transpose"),
-        "transpose: expected %deferred gap, got:\n{out}"
+        out.contains("(%array 1 (2) (%array 1 (2) (%scalar real)))") && out.contains("(transpose"),
+        "transpose(2x2 matrix) should be a 2x2 real matrix, got:\n{out}"
+    );
+    // vector → rank-1 (a transposed vector is NOT a single-row matrix)
+    let out = ir("v = [1.0, 2.0, 3.0]\nx = adjoint(v)");
+    assert!(
+        out.contains("(%array 1 (") && out.contains("(adjoint"),
+        "adjoint(vector) should stay a rank-1 array, got:\n{out}"
     );
 }
 

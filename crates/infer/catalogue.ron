@@ -182,6 +182,10 @@ Catalogue(
         Builtin(name: "crosscorr",      sig: Function(params: [Vector(Real), Vector(Real)], result: Vector(len: Dyn, elem: OfArg(0)))),
         // bincounts(bins, data): integer counts per bin.
         Builtin(name: "bincounts",      sig: Function(params: [Any, Any], result: Vector(len: Dyn, elem: Integer))),
+        // transpose / adjoint: rank- and element-preserving (a matrix's dims
+        // swap; a vector's transpose stays a rank-1 transposed vector, spec §07).
+        Builtin(name: "transpose",      sig: Function(params: [Any], result: TransposeOf(0))),
+        Builtin(name: "adjoint",        sig: Function(params: [Any], result: TransposeOf(0))),
 
         // -- scalar-complex output --
         // cis(theta) = exp(i*theta); complex(re, im) = re + i*im (spec §07).

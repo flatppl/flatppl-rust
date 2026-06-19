@@ -176,6 +176,11 @@ pub(crate) enum ResultSig {
         cols: DimExpr,
         elem: ElemSig,
     },
+    /// Transpose of arg `i`, preserving rank and element kind (`transpose`,
+    /// `adjoint`): a rank-2 array's two dims are swapped; a vector's transpose
+    /// is a transposed vector (spec §07: "the transpose of a vector is a
+    /// transposed vector, not a single-row matrix") — same rank-1 array type.
+    TransposeOf(usize),
 }
 
 /// The element-type source of a `Vector` / `MatrixElem` result.
