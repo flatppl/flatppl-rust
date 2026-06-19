@@ -468,3 +468,46 @@ fn linsolve_and_basis_evals_infer() {
         "polynomial at scalar x should infer a real scalar, got:\n{out}"
     );
 }
+
+// ---- Value-shaped array constructors (spec §07, §17.1 shape resolution) ----
+
+/// `zeros`/`ones` are real arrays whose RANK comes from the size argument's
+/// value: a scalar size → vector, a vector size → matrix. Dims resolve at
+/// `Level::Shape`.
+#[test]
+fn zeros_ones_rank_from_size_value() {
+    let out = ir_at("x = zeros(3)", Level::Shape);
+    assert!(
+        out.contains("(%array 1 (3) (%scalar real))") && out.contains("(zeros"),
+        "zeros(3) should be a length-3 real vector, got:\n{out}"
+    );
+    let out = ir_at("x = zeros([2, 3])", Level::Shape);
+    assert!(
+        out.contains("(%array 2 (2 3) (%scalar real))") && out.contains("(zeros"),
+        "zeros([2,3]) should be a 2x3 real matrix, got:\n{out}"
+    );
+    let out = ir_at("x = ones(4)", Level::Shape);
+    assert!(
+        out.contains("(%array 1 (4) (%scalar real))") && out.contains("(ones"),
+        "ones(4) should be a length-4 real vector, got:\n{out}"
+    );
+}
+
+/// `fill(x, size)` takes the element kind from the fill value; `array(data,
+/// size, …)` from the data — both shaped by `size`.
+#[test]
+fn fill_and_array_element_kind_and_shape() {
+    let out = ir_at("x = fill(2, 3)", Level::Shape);
+    assert!(
+        out.contains("(%array 1 (3) (%scalar integer))") && out.contains("(fill"),
+        "fill(2, 3) should be a length-3 integer vector, got:\n{out}"
+    );
+    let out = ir_at(
+        "d = [1.0, 2.0, 3.0, 4.0]\nx = array(d, [2, 2])",
+        Level::Shape,
+    );
+    assert!(
+        out.contains("(%array 2 (2 2) (%scalar real))") && out.contains("(array"),
+        "array(d, [2,2]) should be a 2x2 real matrix, got:\n{out}"
+    );
+}

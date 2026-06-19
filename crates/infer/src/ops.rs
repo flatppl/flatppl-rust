@@ -115,6 +115,47 @@ pub(crate) fn call_rule(
         // SameAsArg / CommonOf / RealOfArgShape.)
         "checked" | "fixed" => args.first().map_or(Type::Deferred, |(_, t, _)| t.clone()),
 
+        // ---- value-shaped array constructors (spec §07) ----
+        // Structural, NOT catalogue rows: the result RANK comes from a `size`
+        // argument's value (`zeros(3)` is a vector, `zeros([2, 3])` a matrix),
+        // which a single catalogue row cannot express. `count_dims` reads the
+        // size arg's shape (vector literal → one dim per element, else a single
+        // dim), resolving fixed-integer dims at Level::Shape (§17.1).
+        // `zeros`/`ones` are real-valued; `fill(x, size)` takes x's element kind.
+        "zeros" | "ones" => Type::Array {
+            shape: args.first().map_or_else(
+                || Box::new([Dim::Dynamic]) as Box<[Dim]>,
+                |a| count_dims(inf, a.0),
+            ),
+            elem: Box::new(Type::Scalar(ScalarType::Real)),
+        },
+        "fill" => Type::Array {
+            shape: args.get(1).map_or_else(
+                || Box::new([Dim::Dynamic]) as Box<[Dim]>,
+                |a| count_dims(inf, a.0),
+            ),
+            elem: Box::new(match arg_ty(args, 0) {
+                Some(Type::Scalar(s)) => Type::Scalar(*s),
+                _ => Type::Scalar(ScalarType::Real),
+            }),
+        },
+        // array(data, size, dimorder): n-d array of `size`, element kind from data.
+        "array" => Type::Array {
+            shape: args.get(1).map_or_else(
+                || Box::new([Dim::Dynamic]) as Box<[Dim]>,
+                |a| count_dims(inf, a.0),
+            ),
+            elem: Box::new(Type::Scalar(
+                arg_ty(args, 0)
+                    .and_then(|t| match t {
+                        Type::Scalar(s) => Some(*s),
+                        Type::Array { .. } => elem_scalar_kind_of(t),
+                        _ => None,
+                    })
+                    .unwrap_or(ScalarType::Real),
+            )),
+        },
+
         // ---- parameters / inputs (spec §04) ----
         "elementof" | "external" => set_element_type(inf, args.first().map(|a| a.0)),
 
@@ -511,6 +552,16 @@ fn iid_type(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> Type {
             elem: Box::new(domain),
         }),
         mass: Mass::Deferred,
+    }
+}
+
+/// Scalar element kind of `t`, drilling array nesting; `None` for
+/// non-scalar/non-array types.
+fn elem_scalar_kind_of(t: &Type) -> Option<ScalarType> {
+    match t {
+        Type::Scalar(s) => Some(*s),
+        Type::Array { elem, .. } => elem_scalar_kind_of(elem),
+        _ => None,
     }
 }
 
