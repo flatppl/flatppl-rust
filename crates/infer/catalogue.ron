@@ -69,11 +69,12 @@ Catalogue(
         Builtin(name: "LKJCholesky",    sig: Distribution(domain: DynMatrix, support: Unknown, mass: Normalized)),
 
         // ---- base per-name functions (spec §07) ----
-        // Only pure per-name signatures: constant scalar output, SameScalarKind,
-        // or DomainMap. Structural ops (add/sub/mul/pow, shape-preserving
-        // vectors, reductions that thread element types, containers) stay in
-        // ops.rs call_rule because their result types depend on argument shapes
-        // or multiple argument types that ResultSig cannot express.
+        // Per-name signatures expressible via ResultSig: constant scalar output,
+        // SameScalarKind, DomainMap, Matrix, and the arg-threading forms
+        // SameAsArg / RealOfArgShape / CommonOf / ElemScalarKind. Only ops whose
+        // result genuinely cannot be expressed (e.g. operand-promoting elementwise
+        // arith add/sub/mul/pow, container shape construction) stay in ops.rs
+        // call_rule; prefer a catalogue row whenever ResultSig can carry the rule.
 
         // -- scalar-integer output --
         // spec §07 "Elementary functions": floor/ceil/round return integers.
@@ -106,6 +107,95 @@ Catalogue(
         Builtin(name: "l2norm",       sig: Function(params: [Any],      result: Scalar(Real))),
         // logsumexp (spec §07): log Σ exp(v_i) → real.
         Builtin(name: "logsumexp",    sig: Function(params: [Any],      result: Scalar(Real))),
+        // var/std (spec §07 "Reductions") involve a division/sqrt → always real.
+        Builtin(name: "var",          sig: Function(params: [Any],      result: Scalar(Real))),
+        Builtin(name: "std",          sig: Function(params: [Any],      result: Scalar(Real))),
+        // maximum/minimum return an ELEMENT of the array, so the result kind
+        // follows the element kind (an integer array yields an integer).
+        Builtin(name: "maximum",      sig: Function(params: [Any],      result: ElemScalarKind(0))),
+        Builtin(name: "minimum",      sig: Function(params: [Any],      result: ElemScalarKind(0))),
+        // logabsdet(A) = log|det A| (spec §07 "Linear algebra"): always real.
+        Builtin(name: "logabsdet",    sig: Function(params: [Matrix],   result: Scalar(Real))),
+
+        // -- scalar output threading the argument's element kind --
+        // det(A) / trace(A) (spec §07 "Linear algebra"): a real matrix yields a
+        // real scalar, a complex matrix a complex scalar — ElemScalarKind drills
+        // the matrix element type.
+        Builtin(name: "det",          sig: Function(params: [Matrix],   result: ElemScalarKind(0))),
+        Builtin(name: "trace",        sig: Function(params: [Matrix],   result: ElemScalarKind(0))),
+
+        // -- result threads the argument's full type / shape (spec §07) --
+        // identity(x) returns x unchanged; reverse/cumsum/cumprod preserve the
+        // input vector's shape and element type.
+        Builtin(name: "identity",     sig: Function(params: [Any],      result: SameAsArg(0))),
+        // bijection(f, f_inv, logvolume) annotates f and is semantically f
+        // (spec §06) → its type is f's type.
+        Builtin(name: "bijection",    sig: Function(params: [Callable, Callable, Any], result: SameAsArg(0))),
+        Builtin(name: "reverse",      sig: Function(params: [Any],      result: SameAsArg(0))),
+        Builtin(name: "cumsum",       sig: Function(params: [Any],      result: SameAsArg(0))),
+        Builtin(name: "cumprod",      sig: Function(params: [Any],      result: SameAsArg(0))),
+        // real(x) = Re(x), imag(x) = Im(x): real-valued, shape-preserving (spec §07).
+        Builtin(name: "real",         sig: Function(params: [Any],      result: RealOfArgShape(0))),
+        Builtin(name: "imag",         sig: Function(params: [Any],      result: RealOfArgShape(0))),
+        // ifelse(cond, a, b) returns a or b → the common type of the two branches (spec §07).
+        Builtin(name: "ifelse",       sig: Function(params: [Scalar(Boolean), Any, Any], result: CommonOf(1, 2))),
+
+        // -- linear algebra: matrix/vector results (spec §07 "Linear algebra") --
+        // Lengths/dims degrade to dynamic (no value-level shape arithmetic in the
+        // type system); element kinds are exact.
+        // eye(n): real identity matrix.
+        Builtin(name: "eye",            sig: Function(params: [Scalar(Integer)], result: Matrix(rows: Dyn, cols: Dyn))),
+        // inv / lower_cholesky: square matrix, element kind preserved (a complex
+        // matrix inverts to a complex matrix).
+        Builtin(name: "inv",            sig: Function(params: [Matrix], result: MatrixElem(rows: Dyn, cols: Dyn, elem: OfArg(0)))),
+        Builtin(name: "lower_cholesky", sig: Function(params: [Matrix], result: MatrixElem(rows: Dyn, cols: Dyn, elem: OfArg(0)))),
+        // diagmat(x): vector → diagonal matrix, element kind from the vector.
+        Builtin(name: "diagmat",        sig: Function(params: [Vector(Real)], result: MatrixElem(rows: Dyn, cols: Dyn, elem: OfArg(0)))),
+        // diag(A, k=0): extract a diagonal as a vector, element kind from A.
+        Builtin(name: "diag",           sig: Function(params: [Matrix, Scalar(Integer)], result: Vector(len: Dyn, elem: OfArg(0)))),
+        // cross(a, b): 3-vector cross product, element kind from a.
+        Builtin(name: "cross",          sig: Function(params: [Vector(Real), Vector(Real)], result: Vector(len: Dyn, elem: OfArg(0)))),
+        // linspace / extlinspace: real vector of grid points.
+        Builtin(name: "linspace",       sig: Function(params: [Scalar(Real), Scalar(Real), Scalar(Integer)], result: Vector(len: Dyn, elem: Real))),
+        Builtin(name: "extlinspace",    sig: Function(params: [Scalar(Real), Scalar(Real), Scalar(Integer)], result: Vector(len: Dyn, elem: Real))),
+        // sizeof(x): the dimensions of x as an integer vector.
+        Builtin(name: "sizeof",         sig: Function(params: [Any], result: Vector(len: Dyn, elem: Integer))),
+        // totalmass(M): total mass Z = ∫ dM as a real scalar (spec §06).
+        Builtin(name: "totalmass",      sig: Function(params: [Any], result: Scalar(Real))),
+
+        // -- more linear algebra / vector constructors (spec §07) --
+        // boolean(x): set-restrict to booleans → boolean scalar.
+        Builtin(name: "boolean",        sig: Function(params: [Any], result: Scalar(Boolean))),
+        // quadform(A, x) = xᵀ A x → scalar, element kind from A.
+        Builtin(name: "quadform",       sig: Function(params: [Matrix, Vector(Real)], result: ElemScalarKind(0))),
+        // Gram / outer products → matrix, element kind preserved.
+        Builtin(name: "row_gram",       sig: Function(params: [Matrix], result: MatrixElem(rows: Dyn, cols: Dyn, elem: OfArg(0)))),
+        Builtin(name: "col_gram",       sig: Function(params: [Matrix], result: MatrixElem(rows: Dyn, cols: Dyn, elem: OfArg(0)))),
+        Builtin(name: "self_outer",     sig: Function(params: [Vector(Real)], result: MatrixElem(rows: Dyn, cols: Dyn, elem: OfArg(0)))),
+        // Block / banded / stacked matrix constructors → matrix, element kind
+        // drilled from the (nested) argument.
+        Builtin(name: "blockdiagmat",   sig: Function(params: [Any], result: MatrixElem(rows: Dyn, cols: Dyn, elem: OfArg(0)))),
+        Builtin(name: "bandedmat",      sig: Function(params: [Vector(Real), Scalar(Integer)], result: MatrixElem(rows: Dyn, cols: Dyn, elem: OfArg(0)))),
+        Builtin(name: "joinblocks",     sig: Function(params: [Any], result: MatrixElem(rows: Dyn, cols: Dyn, elem: OfArg(0)))),
+        Builtin(name: "colstack",       sig: Function(params: [Any], result: MatrixElem(rows: Dyn, cols: Dyn, elem: OfArg(0)))),
+        // onehot(i, n): real basis vector.
+        Builtin(name: "onehot",         sig: Function(params: [Scalar(Integer), Scalar(Integer)], result: Vector(len: Dyn, elem: Real))),
+        // conv / crosscorr: 1-D vector result, element kind from the signal.
+        Builtin(name: "conv",           sig: Function(params: [Vector(Real), Vector(Real)], result: Vector(len: Dyn, elem: OfArg(0)))),
+        Builtin(name: "crosscorr",      sig: Function(params: [Vector(Real), Vector(Real)], result: Vector(len: Dyn, elem: OfArg(0)))),
+        // bincounts(bins, data): integer counts per bin.
+        Builtin(name: "bincounts",      sig: Function(params: [Any, Any], result: Vector(len: Dyn, elem: Integer))),
+        // transpose / adjoint: rank- and element-preserving (a matrix's dims
+        // swap; a vector's transpose stays a rank-1 transposed vector, spec §07).
+        Builtin(name: "transpose",      sig: Function(params: [Any], result: TransposeOf(0))),
+        Builtin(name: "adjoint",        sig: Function(params: [Any], result: TransposeOf(0))),
+        // linsolve(A, b): solve Ax = b → x has the same shape/type as b.
+        Builtin(name: "linsolve",       sig: Function(params: [Matrix, Vector(Real)], result: SameAsArg(1))),
+        // Polynomial / basis evaluations at x → real-valued, shaped like x
+        // (scalar x → scalar, array x → array).
+        Builtin(name: "polynomial",     sig: Function(params: [Vector(Real), Any], result: RealOfArgShape(1))),
+        Builtin(name: "bernstein",      sig: Function(params: [Vector(Real), Any], result: RealOfArgShape(1))),
+        Builtin(name: "stepwise",       sig: Function(params: [Vector(Real), Vector(Real), Any], result: RealOfArgShape(2))),
 
         // -- scalar-complex output --
         // cis(theta) = exp(i*theta); complex(re, im) = re + i*im (spec §07).
@@ -126,6 +216,7 @@ Catalogue(
         Builtin(name: "land",     sig: Function(params: [Scalar(Boolean), Scalar(Boolean)], result: Scalar(Boolean))),
         Builtin(name: "lor",      sig: Function(params: [Scalar(Boolean), Scalar(Boolean)], result: Scalar(Boolean))),
         Builtin(name: "lnot",     sig: Function(params: [Scalar(Boolean)],                  result: Scalar(Boolean))),
+        Builtin(name: "lxor",     sig: Function(params: [Scalar(Boolean), Scalar(Boolean)], result: Scalar(Boolean))),
         // Scalar predicates (spec §07).
         Builtin(name: "isfinite", sig: Function(params: [Any], result: Scalar(Boolean))),
         Builtin(name: "isinf",    sig: Function(params: [Any], result: Scalar(Boolean))),

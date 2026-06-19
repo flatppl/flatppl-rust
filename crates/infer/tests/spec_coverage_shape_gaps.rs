@@ -151,39 +151,12 @@ fn level_normalization_does_not_resolve_dims() {
 
 // ---- Gap documentation: measure ops ----
 
-/// All of `restrict`, `pushfwd`, `totalmass`, `superpose`, `Dirac`, `kchain`
-/// parse without error and are honestly deferred (no type rule yet). Each
-/// binding gets `%deferred` rather than a wrong type or a panic.
+/// `Dirac` and the kernel-chain ops (`kchain`, `markovchain`, `scan`, …) stay
+/// honestly deferred — point-mass / kernel-composition semantics the engine has
+/// no evaluator for. (`restrict`/`pushfwd`/`superpose`/`locscale` are no longer
+/// here — they now infer a measure type; see `domain_preserving_measure_ops_infer`.)
 #[test]
 fn unimplemented_measure_ops_are_deferred() {
-    // restrict
-    let out = ir("x = restrict(Normal(0.0,1.0), interval(0.0,1.0))");
-    assert!(
-        out.contains("(%meta (%deferred %fixed %unknown) (restrict"),
-        "restrict: expected %deferred gap, got:\n{out}"
-    );
-
-    // pushfwd
-    let out = ir("f = fn(_ * 2.0)\nx = pushfwd(f, Normal(0.0,1.0))");
-    assert!(
-        out.contains("(%meta (%deferred %fixed %unknown) (pushfwd"),
-        "pushfwd: expected %deferred gap, got:\n{out}"
-    );
-
-    // totalmass
-    let out = ir("x = totalmass(Normal(0.0,1.0))");
-    assert!(
-        out.contains("(%meta (%deferred %fixed %unknown) (totalmass"),
-        "totalmass: expected %deferred gap, got:\n{out}"
-    );
-
-    // superpose
-    let out = ir("x = superpose(Normal(0.0,1.0), Normal(1.0,1.0))");
-    assert!(
-        out.contains("(%meta (%deferred %fixed %unknown) (superpose"),
-        "superpose: expected %deferred gap, got:\n{out}"
-    );
-
     // Dirac
     let out = ir("x = Dirac(0.0)");
     assert!(
@@ -199,37 +172,388 @@ fn unimplemented_measure_ops_are_deferred() {
     );
 }
 
-// ---- Gap documentation: linear-algebra functions ----
-
-/// `det`, `transpose`, `eye`, and `linspace` all parse and are honestly
-/// deferred — no type rule yet, each binding gets `%deferred` without panic.
+/// Domain-preserving measure-algebra ops infer a `(%measure …)` type with the
+/// spec-§06 mass class: `restrict`/`superpose` are sub-/sum-measures (finite,
+/// not normalized); `locscale`/`pushfwd` preserve total mass (a probability
+/// measure stays normalized).
 #[test]
-fn unimplemented_functions_are_deferred() {
-    // det
-    let out = ir("x = det([[1.0, 0.0], [0.0, 1.0]])");
+fn domain_preserving_measure_ops_infer() {
+    let out = ir("x = restrict(Normal(0.0, 1.0), interval(0.0, 1.0))");
     assert!(
-        out.contains("(%meta (%deferred %fixed %unknown) (det"),
-        "det: expected %deferred gap, got:\n{out}"
+        out.contains("(%measure (%domain (%scalar real)) (%mass %finite))")
+            && out.contains("(restrict"),
+        "restrict should infer a finite real measure, got:\n{out}"
     );
+    let out = ir("x = superpose(Normal(0.0, 1.0), Normal(1.0, 1.0))");
+    assert!(
+        out.contains("(%mass %finite)") && out.contains("(superpose"),
+        "superpose of two probability measures should be finite (mass 2), got:\n{out}"
+    );
+    let out = ir("x = locscale(Normal(0.0, 1.0), 2.0, 3.0)");
+    assert!(
+        out.contains("(%measure (%domain (%scalar real)) (%mass %normalized))")
+            && out.contains("(locscale"),
+        "locscale of a probability measure stays normalized, got:\n{out}"
+    );
+    let out = ir("f = fn(_ * 2.0)\nx = pushfwd(f, Normal(0.0, 1.0))");
+    assert!(
+        out.contains("(%mass %normalized)") && out.contains("(pushfwd"),
+        "pushfwd preserves total mass → normalized, got:\n{out}"
+    );
+}
 
-    // transpose
+// ---- linear-algebra functions now inferred via the catalogue ----
+
+/// `transpose`/`adjoint` preserve rank and element kind: a matrix's two dims
+/// swap; a vector's transpose stays a rank-1 transposed vector (spec §07: "the
+/// transpose of a vector is a transposed vector, not a single-row matrix").
+#[test]
+fn transpose_preserves_rank_and_element_kind() {
+    // matrix (nested vectors) → matrix, element kind preserved
     let out = ir("A = [[1.0, 2.0], [3.0, 4.0]]\nx = transpose(A)");
     assert!(
-        out.contains("(%meta (%deferred %fixed %unknown) (transpose"),
-        "transpose: expected %deferred gap, got:\n{out}"
+        out.contains("(%array 1 (2) (%array 1 (2) (%scalar real)))") && out.contains("(transpose"),
+        "transpose(2x2 matrix) should be a 2x2 real matrix, got:\n{out}"
     );
+    // vector → rank-1 (a transposed vector is NOT a single-row matrix)
+    let out = ir("v = [1.0, 2.0, 3.0]\nx = adjoint(v)");
+    assert!(
+        out.contains("(%array 1 (") && out.contains("(adjoint"),
+        "adjoint(vector) should stay a rank-1 array, got:\n{out}"
+    );
+}
 
-    // eye
+// ---- Previously-deferred §07 functions now inferred via the catalogue ----
+// These were %deferred gaps; each is now a catalogue row (no structural arm),
+// so the binding carries a real type instead of the %deferred placeholder.
+
+/// `identity(x)` returns its argument unchanged — the full type (array shape +
+/// element) threads through via `ResultSig::SameAsArg`.
+#[test]
+fn identity_threads_the_argument_type() {
+    let out = ir("a = [1.0, 2.0, 3.0]\nx = identity(a)");
+    assert!(
+        out.contains("(%array 1 (3) (%scalar real)) %fixed") && out.contains("(identity"),
+        "identity should preserve the (3)-real-array type, got:\n{out}"
+    );
+}
+
+/// `reverse(xs)` preserves the input vector's shape and element type.
+#[test]
+fn reverse_preserves_shape_and_element() {
+    let out = ir("a = [1.0, 2.0]\nx = reverse(a)");
+    assert!(
+        out.contains("(%array 1 (2) (%scalar real))") && out.contains("(reverse"),
+        "reverse should preserve the (2)-real-array type, got:\n{out}"
+    );
+}
+
+/// `ifelse(cond, a, b)` is the common type of its two branches — `int`/`real`
+/// promote to `real` (`ResultSig::CommonOf`).
+#[test]
+fn ifelse_is_the_common_type_of_its_branches() {
+    let out = ir("c = true\nx = ifelse(c, 1, 2.0)");
+    assert!(
+        out.contains("(%meta ((%scalar real) %fixed reals) (ifelse"),
+        "ifelse(c, 1, 2.0) should infer a real scalar, got:\n{out}"
+    );
+}
+
+/// `real(x)` / `imag(x)` are real-valued regardless of input kind
+/// (`ResultSig::RealOfArgShape`).
+#[test]
+fn real_imag_are_real_valued() {
+    let out = ir("x = real(complex(1.0, 2.0))");
+    assert!(
+        out.contains("(%meta ((%scalar real) %fixed reals) (real"),
+        "real(complex) should infer a real scalar, got:\n{out}"
+    );
+    let out = ir("x = imag(complex(1.0, 2.0))");
+    assert!(
+        out.contains("(%meta ((%scalar real) %fixed reals) (imag"),
+        "imag(complex) should infer a real scalar, got:\n{out}"
+    );
+}
+
+/// `det` / `trace` thread the matrix's element kind: a real matrix yields a
+/// real scalar, a complex matrix a complex scalar (`ResultSig::ElemScalarKind`).
+#[test]
+fn det_infers_element_scalar_kind() {
+    let out = ir("x = det([[1.0, 0.0], [0.0, 1.0]])");
+    assert!(
+        out.contains("(%meta ((%scalar real) %fixed reals) (det"),
+        "det(real matrix) should infer a real scalar, got:\n{out}"
+    );
+    let out = ir("A = [[complex(1.0, 2.0)]]\nx = det(A)");
+    assert!(
+        out.contains("(%scalar complex)") && out.contains("(det"),
+        "det(complex matrix) should infer a complex scalar, got:\n{out}"
+    );
+    let out = ir("A = [[1.0, 0.0], [0.0, 1.0]]\nx = trace(A)");
+    assert!(
+        out.contains("(%meta ((%scalar real) %fixed reals) (trace"),
+        "trace(real matrix) should infer a real scalar, got:\n{out}"
+    );
+}
+
+/// Reductions infer a scalar: `var`/`std`/`logabsdet` are always real; over a
+/// real array `maximum`/`minimum` are real too.
+#[test]
+fn real_scalar_reductions_infer() {
+    for op in ["var", "std", "maximum", "minimum"] {
+        let out = ir(&format!("a = [1.0, 2.0, 3.0]\nx = {op}(a)"));
+        assert!(
+            out.contains(&format!("(%meta ((%scalar real) %fixed reals) ({op}")),
+            "{op} should infer a real scalar over a real array, got:\n{out}"
+        );
+    }
+    let out = ir("x = logabsdet([[2.0, 0.0], [0.0, 2.0]])");
+    assert!(
+        out.contains("(%meta ((%scalar real) %fixed reals) (logabsdet"),
+        "logabsdet should infer a real scalar, got:\n{out}"
+    );
+}
+
+/// `maximum`/`minimum` thread the element kind: an integer array yields an
+/// integer scalar (`ResultSig::ElemScalarKind`), not a widened real.
+#[test]
+fn maximum_minimum_thread_element_kind() {
+    for op in ["maximum", "minimum"] {
+        let out = ir(&format!("a = [1, 2, 3]\nx = {op}(a)"));
+        assert!(
+            out.contains("(%scalar integer)") && out.contains(&format!("({op}")),
+            "{op} over an integer array should infer an integer scalar, got:\n{out}"
+        );
+    }
+}
+
+// ---- Round 3: linear-algebra matrix/vector results via the catalogue ----
+
+/// `eye(n)` infers a real (dynamic-dim) matrix.
+#[test]
+fn eye_infers_a_real_matrix() {
     let out = ir("x = eye(3)");
     assert!(
-        out.contains("(%meta (%deferred %fixed %unknown) (eye"),
-        "eye: expected %deferred gap, got:\n{out}"
+        out.contains("(%array 2 (%dynamic %dynamic) (%scalar real))") && out.contains("(eye"),
+        "eye should infer a rank-2 real array, got:\n{out}"
     );
+}
 
-    // linspace
+/// `inv` / `lower_cholesky` / `diagmat` infer a matrix whose element kind is
+/// preserved from the argument — a complex matrix inverts to a complex matrix.
+#[test]
+fn matrix_maps_preserve_element_kind() {
+    let out = ir("A = [[1.0, 0.0], [0.0, 1.0]]\nx = inv(A)");
+    assert!(
+        out.contains("(%array 2 (%dynamic %dynamic) (%scalar real))") && out.contains("(inv"),
+        "inv(real matrix) should be a real matrix, got:\n{out}"
+    );
+    let out = ir("A = [[complex(1.0, 0.0)]]\nx = inv(A)");
+    assert!(
+        out.contains("(%array 2 (%dynamic %dynamic) (%scalar complex))") && out.contains("(inv"),
+        "inv(complex matrix) should be a complex matrix, got:\n{out}"
+    );
+    let out = ir("A = [[4.0, 0.0], [0.0, 9.0]]\nx = lower_cholesky(A)");
+    assert!(
+        out.contains("(%array 2 (%dynamic %dynamic) (%scalar real))")
+            && out.contains("(lower_cholesky"),
+        "lower_cholesky(real PD) should be a real matrix, got:\n{out}"
+    );
+    let out = ir("v = [1.0, 2.0]\nx = diagmat(v)");
+    assert!(
+        out.contains("(%array 2 (%dynamic %dynamic) (%scalar real))") && out.contains("(diagmat"),
+        "diagmat(real vector) should be a real matrix, got:\n{out}"
+    );
+}
+
+/// Vector-result functions infer a rank-1 array with the right element kind:
+/// `linspace` → real, `sizeof` → integer, `diag` → the matrix's element kind.
+#[test]
+fn vector_result_functions_infer() {
     let out = ir("x = linspace(0.0, 1.0, 5)");
     assert!(
-        out.contains("(%meta (%deferred %fixed %unknown) (linspace"),
-        "linspace: expected %deferred gap, got:\n{out}"
+        out.contains("(%array 1 (%dynamic) (%scalar real))") && out.contains("(linspace"),
+        "linspace should infer a real vector, got:\n{out}"
+    );
+    let out = ir("v = [1.0, 2.0, 3.0]\nx = sizeof(v)");
+    assert!(
+        out.contains("(%array 1 (%dynamic) (%scalar integer))") && out.contains("(sizeof"),
+        "sizeof should infer an integer vector, got:\n{out}"
+    );
+    let out = ir("A = [[1.0, 2.0], [3.0, 4.0]]\nx = diag(A)");
+    assert!(
+        out.contains("(%array 1 (%dynamic) (%scalar real))") && out.contains("(diag"),
+        "diag(real matrix) should infer a real vector, got:\n{out}"
+    );
+}
+
+/// `totalmass(M)` is the total mass as a real scalar (spec §06).
+#[test]
+fn totalmass_infers_a_real_scalar() {
+    let out = ir("m = Normal(0.0, 1.0)\nx = totalmass(m)");
+    assert!(
+        out.contains("(%meta ((%scalar real) %fixed reals) (totalmass"),
+        "totalmass should infer a real scalar, got:\n{out}"
+    );
+}
+
+// ---- Round 4: more linear-algebra / vector ops via the catalogue ----
+
+/// `boolean(x)` → boolean scalar; `quadform(A, x)` → scalar of A's element kind.
+#[test]
+fn boolean_and_quadform_infer_scalars() {
+    let out = ir("b = true\nx = boolean(b)");
+    assert!(
+        out.contains("(%meta ((%scalar boolean) %fixed booleans) (boolean"),
+        "boolean should infer a boolean scalar, got:\n{out}"
+    );
+    let out = ir("A = [[1.0, 0.0], [0.0, 1.0]]\nv = [1.0, 2.0]\nx = quadform(A, v)");
+    assert!(
+        out.contains("(%meta ((%scalar real) %fixed reals) (quadform"),
+        "quadform(real) should infer a real scalar, got:\n{out}"
+    );
+}
+
+/// Gram / outer / block matrix constructors infer a matrix with the element
+/// kind preserved from the argument.
+#[test]
+fn matrix_constructors_infer_matrices() {
+    for (op, src) in [
+        ("row_gram", "A = [[1.0, 2.0], [3.0, 4.0]]\nx = row_gram(A)"),
+        ("col_gram", "A = [[1.0, 2.0], [3.0, 4.0]]\nx = col_gram(A)"),
+        ("self_outer", "v = [1.0, 2.0]\nx = self_outer(v)"),
+        (
+            "colstack",
+            "vs = [[1.0, 2.0], [3.0, 4.0]]\nx = colstack(vs)",
+        ),
+    ] {
+        let out = ir(src);
+        assert!(
+            out.contains("(%array 2 (%dynamic %dynamic) (%scalar real))")
+                && out.contains(&format!("({op}")),
+            "{op} should infer a real matrix, got:\n{out}"
+        );
+    }
+}
+
+/// Vector-result constructors: `onehot`/`conv` → real, `bincounts` → integer.
+#[test]
+fn more_vector_results_infer() {
+    let out = ir("x = onehot(1, 3)");
+    assert!(
+        out.contains("(%array 1 (%dynamic) (%scalar real))") && out.contains("(onehot"),
+        "onehot should infer a real vector, got:\n{out}"
+    );
+    let out = ir("b = [0.0, 1.0, 2.0]\nd = [0.5, 1.5]\nx = bincounts(b, d)");
+    assert!(
+        out.contains("(%array 1 (%dynamic) (%scalar integer))") && out.contains("(bincounts"),
+        "bincounts should infer an integer vector, got:\n{out}"
+    );
+}
+
+/// `lxor(a, b)` is a boolean op like `land`/`lor` (spec §07).
+#[test]
+fn lxor_infers_boolean() {
+    let out = ir("a = true\nb = false\nx = lxor(a, b)");
+    assert!(
+        out.contains("(%meta ((%scalar boolean) %fixed booleans) (lxor"),
+        "lxor should infer a boolean scalar, got:\n{out}"
+    );
+}
+
+/// `linsolve(A, b)` → x with b's type; `polynomial`/`bernstein` evaluated at a
+/// scalar x → real scalar (shaped like the eval point, spec §07).
+#[test]
+fn linsolve_and_basis_evals_infer() {
+    let out = ir("A = [[1.0, 0.0], [0.0, 1.0]]\nb = [1.0, 2.0]\nx = linsolve(A, b)");
+    assert!(
+        out.contains("(%array 1 (2) (%scalar real))") && out.contains("(linsolve"),
+        "linsolve should infer b's vector type, got:\n{out}"
+    );
+    let out = ir("c = [1.0, 2.0, 3.0]\nx = polynomial(c, 0.5)");
+    assert!(
+        out.contains("(%meta ((%scalar real) %fixed reals) (polynomial"),
+        "polynomial at scalar x should infer a real scalar, got:\n{out}"
+    );
+}
+
+// ---- Value-shaped array constructors (spec §07, §17.1 shape resolution) ----
+
+/// `zeros`/`ones` are real arrays whose RANK comes from the size argument's
+/// value: a scalar size → vector, a vector size → matrix. Dims resolve at
+/// `Level::Shape`.
+#[test]
+fn zeros_ones_rank_from_size_value() {
+    let out = ir_at("x = zeros(3)", Level::Shape);
+    assert!(
+        out.contains("(%array 1 (3) (%scalar real))") && out.contains("(zeros"),
+        "zeros(3) should be a length-3 real vector, got:\n{out}"
+    );
+    let out = ir_at("x = zeros([2, 3])", Level::Shape);
+    assert!(
+        out.contains("(%array 2 (2 3) (%scalar real))") && out.contains("(zeros"),
+        "zeros([2,3]) should be a 2x3 real matrix, got:\n{out}"
+    );
+    let out = ir_at("x = ones(4)", Level::Shape);
+    assert!(
+        out.contains("(%array 1 (4) (%scalar real))") && out.contains("(ones"),
+        "ones(4) should be a length-4 real vector, got:\n{out}"
+    );
+}
+
+/// `fill(x, size)` takes the element kind from the fill value; `array(data,
+/// size, …)` from the data — both shaped by `size`.
+#[test]
+fn fill_and_array_element_kind_and_shape() {
+    let out = ir_at("x = fill(2, 3)", Level::Shape);
+    assert!(
+        out.contains("(%array 1 (3) (%scalar integer))") && out.contains("(fill"),
+        "fill(2, 3) should be a length-3 integer vector, got:\n{out}"
+    );
+    let out = ir_at(
+        "d = [1.0, 2.0, 3.0, 4.0]\nx = array(d, [2, 2])",
+        Level::Shape,
+    );
+    assert!(
+        out.contains("(%array 2 (2 2) (%scalar real))") && out.contains("(array"),
+        "array(d, [2,2]) should be a 2x2 real matrix, got:\n{out}"
+    );
+}
+
+/// `cat` of scalars → a rank-1 vector of that kind; `tile` preserves the
+/// argument's rank and element kind (only sizes become dynamic).
+#[test]
+fn cat_and_tile_preserve_kind_and_rank() {
+    let out = ir("x = cat(1.0, 2.0, 3.0)");
+    assert!(
+        out.contains("(%array 1 (%dynamic) (%scalar real))") && out.contains("(cat"),
+        "cat(scalars) should be a rank-1 real vector, got:\n{out}"
+    );
+    let out = ir("a = [1.0, 2.0]\nx = tile(a, 3)");
+    assert!(
+        out.contains("(%array 1 (%dynamic) (%scalar real))") && out.contains("(tile"),
+        "tile(vector) should stay a rank-1 real vector, got:\n{out}"
+    );
+    let out = ir("A = [[1.0, 2.0], [3.0, 4.0]]\nx = tile(A, [2, 2])");
+    assert!(
+        out.contains("(%array 1 (%dynamic) (%array 1 (%dynamic) (%scalar real)))")
+            && out.contains("(tile"),
+        "tile(matrix) should stay a rank-2 (nested) real matrix, got:\n{out}"
+    );
+}
+
+/// `reduce(f, xs)` folds to xs's element type (spec §07: f returns the element
+/// type); `filter(pred, data)` keeps data's type/rank with a dynamic length.
+#[test]
+fn reduce_and_filter_infer() {
+    let out = ir("xs = [1.0, 2.0, 3.0]\nx = reduce(fn(_ + 1.0), xs)");
+    assert!(
+        out.contains("(%meta ((%scalar real) %fixed reals) (reduce"),
+        "reduce over a real vector should infer a real scalar, got:\n{out}"
+    );
+    let out = ir("d = [1.0, 2.0, 3.0]\ny = filter(fn(_ in interval(0.0, 2.0)), d)");
+    assert!(
+        out.contains("(%array 1 (%dynamic) (%scalar real))") && out.contains("(filter"),
+        "filter of a real vector should stay a real vector (dynamic length), got:\n{out}"
     );
 }

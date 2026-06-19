@@ -111,7 +111,73 @@ pub(crate) fn call_rule(
         // ---- value-preserving assertion (spec §07) ----
         // `checked`/`fixed` are identity for typing (spec §03: `fixed(x)` ≡
         // `identity(x)`, a tooling hint) — the wrapped value's type rides through.
+        // (`identity` itself, `ifelse`, `real`, `imag` are catalogue rows —
+        // SameAsArg / CommonOf / RealOfArgShape.)
         "checked" | "fixed" => args.first().map_or(Type::Deferred, |(_, t, _)| t.clone()),
+
+        // ---- value-shaped array constructors (spec §07) ----
+        // Structural, NOT catalogue rows: the result RANK comes from a `size`
+        // argument's value (`zeros(3)` is a vector, `zeros([2, 3])` a matrix),
+        // which a single catalogue row cannot express. `count_dims` reads the
+        // size arg's shape (vector literal → one dim per element, else a single
+        // dim), resolving fixed-integer dims at Level::Shape (§17.1).
+        // `zeros`/`ones` are real-valued; `fill(x, size)` takes x's element kind.
+        "zeros" | "ones" => Type::Array {
+            shape: args.first().map_or_else(
+                || Box::new([Dim::Dynamic]) as Box<[Dim]>,
+                |a| count_dims(inf, a.0),
+            ),
+            elem: Box::new(Type::Scalar(ScalarType::Real)),
+        },
+        "fill" => Type::Array {
+            shape: args.get(1).map_or_else(
+                || Box::new([Dim::Dynamic]) as Box<[Dim]>,
+                |a| count_dims(inf, a.0),
+            ),
+            elem: Box::new(match arg_ty(args, 0) {
+                Some(Type::Scalar(s)) => Type::Scalar(*s),
+                _ => Type::Scalar(ScalarType::Real),
+            }),
+        },
+        // array(data, size, dimorder): n-d array of `size`, element kind from data.
+        "array" => Type::Array {
+            shape: args.get(1).map_or_else(
+                || Box::new([Dim::Dynamic]) as Box<[Dim]>,
+                |a| count_dims(inf, a.0),
+            ),
+            elem: Box::new(Type::Scalar(
+                arg_ty(args, 0)
+                    .and_then(|t| match t {
+                        Type::Scalar(s) => Some(*s),
+                        Type::Array { .. } => elem_scalar_kind_of(t),
+                        _ => None,
+                    })
+                    .unwrap_or(ScalarType::Real),
+            )),
+        },
+        // tile(A, size) keeps A's rank and element kind; only the sizes change.
+        "tile" => arg_ty(args, 0).map_or(Type::Deferred, with_dynamic_dims),
+        // reduce(f, xs) folds xs with an associative f; spec §07 requires f to
+        // return the element type of xs, so the result IS that element type
+        // (a vector of reals reduces to a real, a vector of vectors to a vector).
+        "reduce" => match arg_ty(args, 1) {
+            Some(Type::Array { elem, .. }) => (**elem).clone(),
+            _ => Type::Deferred,
+        },
+        // filter(pred, data) keeps a subset of data's elements/rows: same type
+        // and rank as data, with the filtered axis now dynamic.
+        "filter" => arg_ty(args, 1).map_or(Type::Deferred, with_dynamic_dims),
+        // cat(x, y, …) concatenates values of the same structural kind: scalars
+        // → a rank-1 vector of that kind; arrays → the same rank/element as the
+        // first argument (one axis grows, so sizes are dynamic).
+        "cat" => match arg_ty(args, 0) {
+            Some(Type::Scalar(s)) => Type::Array {
+                shape: Box::new([Dim::Dynamic]),
+                elem: Box::new(Type::Scalar(*s)),
+            },
+            Some(t @ Type::Array { .. }) => with_dynamic_dims(t),
+            _ => Type::Deferred,
+        },
 
         // ---- parameters / inputs (spec §04) ----
         "elementof" | "external" => set_element_type(inf, args.first().map(|a| a.0)),
@@ -128,6 +194,22 @@ pub(crate) fn call_rule(
         // normalization-level rules (inheriting it via the type clone would
         // smuggle the base's class through `fill_mass`).
         "truncate" | "normalize" => fresh_measure(arg_ty(args, 0)),
+        // Domain-preserving measure-algebra ops (spec §06): the result is a
+        // measure over the SAME value domain as its measure argument, with a
+        // fresh (recomputed) mass — like truncate/normalize.
+        //   `restrict(M, S)`   — restrict M to S
+        //   `superpose(M1, …)` — measure addition M1 + M2 + … (shared domain)
+        //   `locscale(M, …)`   — affine pushforward x → scale·x + shift
+        // These no longer defer: even before the engine evaluates their mass,
+        // the value domain is known, so the type slot carries `(%measure …)`.
+        "restrict" | "superpose" | "locscale" => fresh_measure(arg_ty(args, 0)),
+        // `pushfwd(f, M)` (spec §06) is a measure, but its domain is the
+        // codomain of `f`, which inference does not track — so we know the
+        // result IS a measure (better than %deferred) with a deferred domain.
+        "pushfwd" => Type::Measure {
+            domain: Box::new(Type::Any),
+            mass: Mass::Deferred,
+        },
         // `relabel(M, labels)` (spec §06) renames the variate; the value domain
         // AND total mass are unchanged, so the measure type passes through whole
         // (unlike normalize/truncate, which reset the mass slot).
@@ -509,6 +591,29 @@ fn iid_type(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> Type {
             elem: Box::new(domain),
         }),
         mass: Mass::Deferred,
+    }
+}
+
+/// Scalar element kind of `t`, drilling array nesting; `None` for
+/// non-scalar/non-array types.
+fn elem_scalar_kind_of(t: &Type) -> Option<ScalarType> {
+    match t {
+        Type::Scalar(s) => Some(*s),
+        Type::Array { elem, .. } => elem_scalar_kind_of(elem),
+        _ => None,
+    }
+}
+
+/// `t` with every array dim (at every nesting level) replaced by `%dynamic`,
+/// preserving rank and element type. For ops that keep an argument's rank and
+/// element but change its sizes (`tile`, `cat`).
+fn with_dynamic_dims(t: &Type) -> Type {
+    match t {
+        Type::Array { shape, elem } => Type::Array {
+            shape: vec![Dim::Dynamic; shape.len()].into_boxed_slice(),
+            elem: Box::new(with_dynamic_dims(elem)),
+        },
+        other => other.clone(),
     }
 }
 
@@ -975,6 +1080,7 @@ fn catalogue_lower(sig: &crate::catalogue::Sig, args: &[ArgInfo]) -> (Type, Valu
             Some(Type::Array { shape, .. }) if shape.len() == 1 => shape[0],
             _ => Dim::Dynamic,
         },
+        arg_type: &|i| arg_ty(args, i).cloned(),
     };
     lower(sig, &ctx)
 }
@@ -1173,6 +1279,7 @@ fn function_result(name: &str, args: &[ArgInfo]) -> Option<Type> {
             Some(Type::Array { shape, .. }) if shape.len() == 1 => shape[0],
             _ => Dim::Dynamic,
         },
+        arg_type: &|i| arg_ty(args, i).cloned(),
     };
     // `lower` for Sig::Function returns (Type, ValueSet::natural_of(&ty)).
     // We only need the type here; the value-set arm is handled by call_valueset.
@@ -1207,6 +1314,7 @@ fn distribution_domain(
         param_dim: &|kwarg| param_dim(inf, args, named, kwarg),
         arg_scalar: &|_| None,
         arg_dim: &|_| Dim::Dynamic,
+        arg_type: &|i| arg_ty(args, i).cloned(),
     };
     let (ty, _vset) = lower(sig, &ctx);
     // `lower` wraps the domain in a `Type::Measure`; unwrap to get the domain.
@@ -1515,6 +1623,7 @@ fn distribution_support(
         param_dim: &|kwarg| param_dim(inf, args, named, kwarg),
         arg_scalar: &|_| None,
         arg_dim: &|_| Dim::Dynamic,
+        arg_type: &|i| arg_ty(args, i).cloned(),
     };
     let (_ty, vs) = lower(sig, &ctx);
     vs
@@ -1592,7 +1701,11 @@ pub(crate) fn fill_mass(
                 .collect();
             product_mass(&masses)
         }
-        "truncate" => match arg_mass(0) {
+        // `restrict` shares truncate's support-restriction mass behaviour: the
+        // result is a sub-measure, so a probability/finite measure becomes
+        // merely finite, and an infinite measure stays finite only on a bounded
+        // restriction set.
+        "truncate" | "restrict" => match arg_mass(0) {
             Mass::Null => Mass::Null,
             Mass::Normalized | Mass::Finite => Mass::Finite,
             Mass::LocallyFinite => {
@@ -1603,6 +1716,26 @@ pub(crate) fn fill_mass(
             }
             _ => Mass::Unknown,
         },
+        // Pushforward through a (measurable) map preserves total mass (spec §06
+        // image measure): `pushfwd(f, M)` keeps M's mass, `locscale(M, …)` — an
+        // affine pushforward — keeps M's mass.
+        "pushfwd" => arg_mass(1),
+        "locscale" => arg_mass(0),
+        // `superpose(M1, M2, …)` is measure addition Z = Σ Zi (spec §06): the
+        // sum of finite masses is finite but generally not normalized; any
+        // infinite component makes the sum infinite; an Unknown taints the sum.
+        "superpose" => {
+            let masses: Vec<Mass> = (0..args.len()).map(arg_mass).collect();
+            if masses.iter().any(|m| matches!(m, Mass::Unknown)) {
+                Mass::Unknown
+            } else if masses.iter().any(|m| matches!(m, Mass::LocallyFinite)) {
+                Mass::LocallyFinite
+            } else if masses.iter().all(|m| matches!(m, Mass::Null)) {
+                Mass::Null
+            } else {
+                Mass::Finite
+            }
+        }
         // A fixed scalar weight rescales: classes survive, except that an
         // unknown constant demotes `%normalized` to `%finite`.
         "weighted" | "logweighted" => {

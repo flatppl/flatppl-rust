@@ -144,6 +144,55 @@ pub(crate) enum ResultSig {
         rows: DimExpr,
         cols: DimExpr,
     },
+    /// Result is exactly arg `i`'s type — shape and element preserved. For
+    /// identity-like, order-permuting, and cumulative ops whose output mirrors
+    /// the input (`identity`, `reverse`, `cumsum`, `cumprod`).
+    SameAsArg(usize),
+    /// Result has arg `i`'s shape but a real element type (`real`, `imag`):
+    /// a real scalar for a scalar argument, a real array of the same shape for
+    /// an array argument.
+    RealOfArgShape(usize),
+    /// Result is the common type of args `i` and `j`: identical argument types
+    /// pass through unchanged, otherwise the scalar promotion of the two
+    /// (`integers ⊂ reals ⊂ complexes`). For `ifelse`'s two branches.
+    CommonOf(usize, usize),
+    /// Result is a scalar whose kind is arg `i`'s element kind, drilling array
+    /// nesting (`det`, `trace`): a real matrix yields a real scalar, a complex
+    /// matrix a complex scalar.
+    ElemScalarKind(usize),
+    /// Result is a rank-1 array (vector) of the given length and element type
+    /// (`linspace`/`extlinspace` → real, `sizeof` → integer, `diag` → the
+    /// argument's element kind via `ElemSig::OfArg`).
+    Vector {
+        len: DimExpr,
+        elem: ElemSig,
+    },
+    /// Result is a rank-2 array (matrix) whose element type follows `elem`
+    /// rather than being forced real — for element-preserving matrix maps
+    /// (`inv`, `lower_cholesky`, `diagmat`): a complex matrix inverts to a
+    /// complex matrix. (`ResultSig::Matrix` stays for always-real results.)
+    MatrixElem {
+        rows: DimExpr,
+        cols: DimExpr,
+        elem: ElemSig,
+    },
+    /// Transpose of arg `i`, preserving rank and element kind (`transpose`,
+    /// `adjoint`): a rank-2 array's two dims are swapped; a vector's transpose
+    /// is a transposed vector (spec §07: "the transpose of a vector is a
+    /// transposed vector, not a single-row matrix") — same rank-1 array type.
+    TransposeOf(usize),
+}
+
+/// The element-type source of a `Vector` / `MatrixElem` result.
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) enum ElemSig {
+    Real,
+    Integer,
+    Boolean,
+    Complex,
+    /// The (array-drilled) element kind of positional arg `i`; defaults to real
+    /// when that arg's kind is not statically known.
+    OfArg(usize),
 }
 
 // Matrix dimension expressions: parsed for RON schema fidelity. Lowering maps
@@ -393,6 +442,7 @@ mod tests {
                 arg_scalar: &|_| Some(ScalarType::Real),
                 param_dim: param_dim_fn,
                 arg_dim: &|_| Dim::Dynamic,
+                arg_type: &|_| None,
             };
             let (cat_ty, cat_support) = lower(sig, &ctx);
 
@@ -530,6 +580,7 @@ mod tests {
                 arg_scalar: &|i| if i == 0 { arg0_scalar } else { None },
                 param_dim: &|_| Dim::Dynamic,
                 arg_dim: &|_| Dim::Dynamic,
+                arg_type: &|_| None,
             };
             let (cat_ty, _) = lower(sig, &ctx);
 
