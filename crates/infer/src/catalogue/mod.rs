@@ -199,15 +199,21 @@ pub(crate) enum ElemSig {
     OfArg(usize),
 }
 
-// Matrix dimension expressions: parsed for RON schema fidelity. Lowering maps
-// every `ResultSig::Matrix` to a dynamic-dim matrix (the type system has no
-// shape arithmetic), so the parameter indices are never read.
+/// A result-shape dimension expression (for `Matrix` / `MatrixElem` / `Vector`
+/// result sigs), resolved against the call args by `lower::dim_of`.
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
 pub(crate) enum DimExpr {
+    /// Unknown at this level → `%dynamic`.
     Dyn,
+    /// Leading dim of positional arg `i` (rank-1 args).
     OfParam(usize),
-    MulDims(usize, usize),
+    /// Flattened dim `axis` of positional arg `i` — drills array nesting, so a
+    /// matrix's rows/cols are `Axis(i, 0)` / `Axis(i, 1)` whether it is a flat
+    /// rank-2 array or a nested vector-of-vectors.
+    Axis(usize, usize),
+    /// Product of two dim expressions (e.g. `kron`'s pq × mn). Static only when
+    /// both operands are static (overflow falls back to dynamic).
+    Mul(Box<DimExpr>, Box<DimExpr>),
 }
 
 /// Parse a catalogue from RON source.

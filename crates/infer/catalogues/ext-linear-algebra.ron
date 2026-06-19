@@ -36,11 +36,13 @@
                 // matexp(A) → matrix with the same shape as A (shape passes through).
                 Binding(name: "matexp",
                     sig: Function(params: [Matrix], result: SameAsArg(0))),
-                // kron(A, B) → matrix of shape pm×qn; element kind preserved, dims
-                // dynamic (no shape arithmetic in ResultSig).
+                // kron(A, B): Kronecker product — (rows A · rows B) × (cols A · cols B),
+                // element kind preserved (spec §09).
                 Binding(name: "kron",
-                    sig: Function(params: [Matrix, Matrix], result: MatrixElem(rows: Dyn, cols: Dyn, elem: OfArg(0))),
-                    degraded: Some("result shape is pm×qn; no shape arithmetic in ResultSig → dims dynamic")),
+                    sig: Function(params: [Matrix, Matrix], result: MatrixElem(
+                        rows: Mul(Axis(0, 0), Axis(1, 0)),
+                        cols: Mul(Axis(0, 1), Axis(1, 1)),
+                        elem: OfArg(0)))),
                 // lstsq(A, b) → least-squares solution vector x, element kind from b.
                 Binding(name: "lstsq",
                     sig: Function(params: [Matrix, Vector(Real)], result: Vector(len: Dyn, elem: OfArg(1)))),
