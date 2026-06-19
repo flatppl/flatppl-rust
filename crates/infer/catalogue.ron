@@ -202,6 +202,7 @@ Catalogue(
         Builtin(name: "land",     sig: Function(params: [Scalar(Boolean), Scalar(Boolean)], result: Scalar(Boolean))),
         Builtin(name: "lor",      sig: Function(params: [Scalar(Boolean), Scalar(Boolean)], result: Scalar(Boolean))),
         Builtin(name: "lnot",     sig: Function(params: [Scalar(Boolean)],                  result: Scalar(Boolean))),
+        Builtin(name: "lxor",     sig: Function(params: [Scalar(Boolean), Scalar(Boolean)], result: Scalar(Boolean))),
         // Scalar predicates (spec §07).
         Builtin(name: "isfinite", sig: Function(params: [Any], result: Scalar(Boolean))),
         Builtin(name: "isinf",    sig: Function(params: [Any], result: Scalar(Boolean))),

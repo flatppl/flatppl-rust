@@ -437,3 +437,13 @@ fn more_vector_results_infer() {
         "bincounts should infer an integer vector, got:\n{out}"
     );
 }
+
+/// `lxor(a, b)` is a boolean op like `land`/`lor` (spec §07).
+#[test]
+fn lxor_infers_boolean() {
+    let out = ir("a = true\nb = false\nx = lxor(a, b)");
+    assert!(
+        out.contains("(%meta ((%scalar boolean) %fixed booleans) (lxor"),
+        "lxor should infer a boolean scalar, got:\n{out}"
+    );
+}
