@@ -731,6 +731,167 @@ fn set_expression_readers() {
 }
 
 #[test]
+fn cartpow_multi_axis_shape() {
+    // §03 "Cartesian power": `cartpow(S, size)` accepts a vector of positive
+    // integers for a multi-axis power, so `cartpow(reals, [2, 3])` is the set
+    // of 2×3 real matrices — a rank-2 array of shape (2 3), NOT a rank-1
+    // dynamic array. `Y = X .^ 2` broadcasts elementwise and carries the same
+    // rank-2 shape. The single-dim `ValueSet::CartPow` cannot name a rank-2
+    // power, so the value-set slot is honestly `%unknown` (matching
+    // `ValueSet::natural_of` for rank-≥2 arrays).
+    let src = "X = elementof(cartpow(reals, [2, 3]))\nY = X .^ 2";
+    let (module, _) = infer_src(src);
+    let out = flatppl_flatpir::write(&module);
+    assert!(
+        out.contains("(%meta ((%array 2 (2 3) (%scalar real)) %parameterized %unknown) (elementof"),
+        "X should infer rank-2 (2 3) real array, got:\n{out}"
+    );
+    assert!(
+        out.contains(
+            "(%meta ((%array 2 (2 3) (%scalar real)) %parameterized %unknown) (broadcast pow"
+        ),
+        "Y = X .^ 2 should carry the rank-2 (2 3) shape, got:\n{out}"
+    );
+}
+
+#[test]
+fn cartpow_variadic_arity_is_rejected() {
+    // The legacy variadic `cartpow(S, d1, d2, …)` is not in the spec (§03): a
+    // multi-axis power must be written `cartpow(S, [d1, d2, …])`. The variadic
+    // form must be flagged, not silently read as `cartpow(S, d1)`.
+    let src = "X = elementof(cartpow(reals, 2, 3))";
+    let (_module, diags) = infer_src(src);
+    assert!(
+        diags
+            .iter()
+            .any(|d| d.message.contains("cartpow") && d.message.contains("not valid")),
+        "expected a cartpow-arity diagnostic, got: {diags:?}"
+    );
+}
+
+#[test]
+fn lawof_absorbs_stochasticity() {
+    // §04 "Phase of the reified law": `lawof` absorbs the stochasticity of its
+    // `draw` ancestors — the reified law is parameterized (depends on a free
+    // `elementof` leaf) or fixed, never stochastic.
+    let src = "a = elementof(reals)\n\
+               x ~ Normal(a, 1.0)\n\
+               y ~ Normal(0.0, 1.0)\n\
+               mu ~ Normal(0.0, 1.0)\n\
+               z ~ Normal(mu, 1.0)\n\
+               mx = lawof(x)\n\
+               my = lawof(y)\n\
+               mz = lawof(z)";
+    let (module, _) = infer_src(src);
+    let out = flatppl_flatpir::write(&module);
+    // Law of x depends on the free parameter `a` → parameterized.
+    assert!(
+        out.contains("%parameterized reals) (lawof (%ref self x))"),
+        "lawof(x) should be parameterized, got:\n{out}"
+    );
+    // Law of y is fully specified → fixed.
+    assert!(
+        out.contains("%fixed reals) (lawof (%ref self y))"),
+        "lawof(y) should be fixed, got:\n{out}"
+    );
+    // Hierarchical: z's measure operand is itself a draw (mu); absorption
+    // recurses, and with no free parameter the law is fixed.
+    assert!(
+        out.contains("%fixed reals) (lawof (%ref self z))"),
+        "lawof(z) should be fixed (recursive absorption), got:\n{out}"
+    );
+    // No lawof binding is ever stochastic.
+    assert!(
+        !out.contains("%stochastic reals) (lawof"),
+        "lawof must never be stochastic, got:\n{out}"
+    );
+}
+
+#[test]
+fn get_peels_one_axis_off_a_multidim_array() {
+    // §03 "Arrays" / indexing: a single integer index reduces an array's rank
+    // by one. A 2×4 matrix indexed once is a length-4 row vector.
+    let src = "A = elementof(cartpow(reals, [3, 4]))\nrow = get(A, 1)";
+    let (module, _) = infer_src(src);
+    let out = flatppl_flatpir::write(&module);
+    assert!(
+        out.contains(
+            "(%meta ((%array 1 (4) (%scalar real)) %parameterized (cartpow reals 4)) (get"
+        ),
+        "get(A, 1) on a 3×4 matrix should peel to a length-4 real vector, got:\n{out}"
+    );
+}
+
+#[test]
+fn l1unit_simplex_guard_respects_input_sign() {
+    // §07 norms + §03 value-set subset: `l1unit` lands on the simplex only when
+    // the input is provably nonnegative. A nonneg-reals input → `(stdsimplex n)`;
+    // a possibly-negative reals input → no simplex (stays `(cartpow reals n)`).
+    let src = "wn = l1unit(elementof(cartpow(nonnegreals, 3)))\n\
+               ws = l1unit(elementof(cartpow(reals, 3)))";
+    let (module, _) = infer_src(src);
+    let out = flatppl_flatpir::write(&module);
+    assert!(
+        out.contains("(stdsimplex 3)) (l1unit"),
+        "l1unit of a nonneg vector should be on the simplex, got:\n{out}"
+    );
+    assert!(
+        out.contains("(cartpow reals 3)) (l1unit"),
+        "l1unit of a signed vector should NOT be on the simplex, got:\n{out}"
+    );
+}
+
+#[test]
+fn lebesgue_counting_boundedness_arms() {
+    // §06 reference-measure mass: an unbounded support is locally finite; a
+    // bounded support is finite. Covers the predefined-set boundedness arms
+    // beyond `Lebesgue(reals)` / `Lebesgue(unitinterval)`.
+    let src = "a = Lebesgue(posreals)\n\
+               b = Lebesgue(booleans)\n\
+               c = Counting(booleans)";
+    let (module, _) = infer_src(src);
+    let out = flatppl_flatpir::write(&module);
+    assert!(
+        out.contains("(%mass %locallyfinite)) %fixed posreals) (Lebesgue"),
+        "Lebesgue(posreals) is unbounded → locally finite, got:\n{out}"
+    );
+    assert!(
+        out.contains("(%mass %finite)) %fixed booleans) (Lebesgue"),
+        "Lebesgue(booleans) is bounded → finite, got:\n{out}"
+    );
+    assert!(
+        out.contains("(%mass %finite)) %fixed booleans) (Counting"),
+        "Counting(booleans) is a finite set → finite, got:\n{out}"
+    );
+}
+
+#[test]
+fn reference_cycle_writes_failed_into_the_type_slot() {
+    // §11 "Type categories": a reference cycle yields `(%failed "<reason>")` in
+    // the TYPE slot of the offending binding (not merely somewhere in the IR),
+    // plus an error diagnostic — and never a spurious note on the same binding.
+    let src = "x = y + 1\ny = x + 1";
+    let (module, diags) = infer_src(src);
+    let out = flatppl_flatpir::write(&module);
+    assert!(
+        out.contains("(%bind x (%meta ((%failed"),
+        "the failed marker must sit in x's type slot, got:\n{out}"
+    );
+    assert!(
+        diags
+            .iter()
+            .any(|d| matches!(d.severity, flatppl_infer::Severity::Error)),
+        "a reference cycle is an error, got: {diags:?}"
+    );
+    assert!(
+        !diags
+            .iter()
+            .any(|d| matches!(d.severity, flatppl_infer::Severity::Note)),
+        "no spurious note alongside the cycle error, got: {diags:?}"
+    );
+}
+
+#[test]
 fn reference_measure_mass_arms() {
     // iid of a locally finite measure stays locally finite; truncating one
     // to a bounded window is finite; Counting on integers is locally finite.

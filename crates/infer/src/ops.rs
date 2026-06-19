@@ -12,7 +12,7 @@ use flatppl_core::{
 };
 
 use crate::Level;
-use crate::trace::Inferencer;
+use crate::trace::{Inferencer, join_phase};
 
 /// `(node, type, phase)` of an inferred positional argument.
 type ArgInfo = (NodeId, Type, Phase);
@@ -164,7 +164,26 @@ pub(crate) fn call_rule(
 
         // ---- set constructors (spec §03) — set objects have no first-class
         // type; consumers (`elementof`, `truncate`, …) read them structurally.
-        "interval" | "cartprod" | "cartpow" => Type::Any,
+        "interval" | "cartprod" => Type::Any,
+        // `cartpow(S, size)` takes exactly a set and a size; the size is an
+        // integer (1-D) or a vector of positive integers (multi-axis), §03
+        // "Cartesian power". The legacy variadic `cartpow(S, d1, d2, …)` form
+        // is not in the spec — reject it rather than silently reading only the
+        // first dimension (a multi-axis power is `cartpow(S, [d1, d2, …])`).
+        "cartpow" => {
+            if args.len() == 2 {
+                Type::Any
+            } else {
+                inf.diags.push(crate::Diagnostic::error_at(
+                    id,
+                    "`cartpow` takes a set and a size: `cartpow(S, n)` or, for a \
+                     multi-axis power, `cartpow(S, [d1, d2, …])` (a single vector \
+                     size). The variadic `cartpow(S, d1, d2, …)` form is not valid \
+                     (spec §03).",
+                ));
+                Type::Failed("cartpow expects (set, size)".into())
+            }
+        }
 
         // ---- broadcasting (spec §04) ----
         "broadcast" => broadcast_type(inf, args, named),
@@ -193,6 +212,14 @@ pub(crate) fn call_rule(
         "elementof" => Phase::Parameterized,
         "external" | "load_data" | "load_module" | "standard_module" => Phase::Fixed,
         "draw" => Phase::Stochastic,
+        // `lawof` reifies a value into its law; the law is deterministic
+        // (parameterized or fixed) — `lawof` absorbs the stochasticity of the
+        // `draw` ancestors rather than propagating it (spec §04 "Phase of the
+        // reified law"). Trace the argument's law-phase instead of inheriting
+        // the stochastic `joined`.
+        "lawof" => args
+            .first()
+            .map_or(Phase::Fixed, |a| law_phase(inf, a.0, 0)),
         _ => joined,
     };
     (ty, phase)
@@ -417,12 +444,36 @@ fn set_element_type(inf: &mut Inferencer<'_, '_>, node: Option<NodeId>) -> Type 
             flatppl_core::CallHead::Builtin(op) => match module.resolve(op).to_string().as_str() {
                 "interval" => Type::Scalar(ScalarType::Real),
                 "cartpow" => {
-                    let (set_arg, len_arg) = (c.args.first().copied(), c.args.get(1).copied());
+                    // `cartpow(S, size)` where `size` is an integer (1-D) or a
+                    // vector of positive integers (multi-axis), §03 "Cartesian
+                    // power". `count_dims` reads a `vector` literal as one dim
+                    // per element, so `cartpow(reals, [2, 3])` yields a rank-2
+                    // (2×3) array — not the rank-1 dynamic a single-dim read
+                    // would give (the legacy `cartpow(S, d1, d2, …)` arity is
+                    // not in the spec; only arg 1 is the size).
+                    let (set_arg, size_arg) = (c.args.first().copied(), c.args.get(1).copied());
                     let elem = set_element_type(inf, set_arg);
-                    let dim = len_arg.map_or(Dim::Dynamic, |n| resolve_dim(inf, n));
+                    let shape = size_arg.map_or_else(
+                        || Box::new([Dim::Dynamic]) as Box<[Dim]>,
+                        |n| count_dims(inf, n),
+                    );
+                    Type::Array {
+                        shape,
+                        elem: Box::new(elem),
+                    }
+                }
+                "stdsimplex" => {
+                    // `stdsimplex(n)` is the (n-1)-simplex {x ∈ ℝⁿ : xᵢ ≥ 0,
+                    // Σxᵢ = 1} embedded in ℝⁿ (§03 "Standard simplex"): an
+                    // element is a length-n real vector. The ≥0 / sum-to-1
+                    // constraint lives in the value-set slot (`StdSimplex`), not
+                    // the scalar type — so the element type is a rank-1 real
+                    // array, mirroring `cartpow(reals, n)`.
+                    let size_arg = c.args.first().copied();
+                    let dim = size_arg.map_or(Dim::Dynamic, |n| resolve_dim(inf, n));
                     Type::Array {
                         shape: Box::new([dim]),
-                        elem: Box::new(elem),
+                        elem: Box::new(Type::Scalar(ScalarType::Real)),
                     }
                 }
                 _ => Type::Deferred,
@@ -486,6 +537,59 @@ fn resolve_dim(inf: &mut Inferencer<'_, '_>, node: NodeId) -> Dim {
         }
     }
     Dim::Dynamic
+}
+
+/// The phase of `lawof(arg)` — the phase of the **reified law** of `arg`.
+///
+/// `lawof` absorbs the stochasticity of `draw` ancestors into the law, so the
+/// result is deterministic: parameterized if the law depends on a free
+/// `elementof` leaf, else fixed; never stochastic (spec §04 "Phase of the
+/// reified law"). We re-derive the phase over the argument's ancestor subgraph
+/// with two overrides vs the normal join: a `draw` contributes the law-phase of
+/// its *measure operand* (absorbing the draw), and the recursion bottoms out at
+/// `elementof` (parameterized) / fixed leaves — mirroring how `functionof`
+/// traces to parametric leaves. Ref/`draw` cycles are bounded by `depth`.
+fn law_phase(inf: &mut Inferencer<'_, '_>, node: NodeId, depth: u32) -> Phase {
+    if depth > 64 {
+        return Phase::Parameterized; // safe non-stochastic fallback
+    }
+    match inf.module.node(node).clone() {
+        Node::Ref(r) if r.ns == flatppl_core::RefNs::SelfMod => {
+            match inf.module.binding_by_name(r.name) {
+                Some(b) => {
+                    let rhs = inf.module.binding(b).rhs;
+                    law_phase(inf, rhs, depth + 1)
+                }
+                None => Phase::Parameterized,
+            }
+        }
+        Node::Call(c) => match c.head {
+            flatppl_core::CallHead::Builtin(op) => match inf.module.resolve(op) {
+                // Parametric leaf: the law depends on this free input.
+                "elementof" => Phase::Parameterized,
+                // Closed-over fixed leaves.
+                "external" | "load_data" | "load_module" | "standard_module" => Phase::Fixed,
+                // Absorb: the draw's stochasticity collapses into the law of
+                // the measure it draws from.
+                "draw" => c
+                    .args
+                    .first()
+                    .map_or(Phase::Fixed, |&m| law_phase(inf, m, depth + 1)),
+                // Any other node (measure constructor, container, arithmetic,
+                // nested `lawof`, …): join the law-phases of its inputs.
+                _ => c.args.iter().fold(Phase::Fixed, |acc, &a| {
+                    join_phase(acc, law_phase(inf, a, depth + 1))
+                }),
+            },
+            // User-callable application within a law: conservatively
+            // parameterized (deterministic, may depend on inputs).
+            _ => Phase::Parameterized,
+        },
+        // Literals and named constants are fixed; anything else (holes,
+        // cross-module refs) is conservatively non-stochastic.
+        Node::Lit(_) | Node::Const(_) => Phase::Fixed,
+        _ => Phase::Parameterized,
+    }
 }
 
 /// Demand-driven const-eval of a fixed-phase integer expression at a shape
@@ -1350,8 +1454,20 @@ fn set_expr_valueset(inf: &mut Inferencer<'_, '_>, node: Option<NodeId>) -> Valu
                     if elem == ValueSet::Unknown {
                         return ValueSet::Unknown;
                     }
-                    let dim = c.args.get(1).map_or(Dim::Dynamic, |&n| resolve_dim(inf, n));
-                    ValueSet::CartPow(Box::new(elem), dim)
+                    // `ValueSet::CartPow` carries a single dim, so it can only
+                    // describe a rank-1 power. A multi-axis size (`[2, 3]`) is a
+                    // genuine rank-≥2 array whose value-set has no single-dim
+                    // vocabulary — report `Unknown` rather than a misleading
+                    // rank-1 set (consistent with `ValueSet::natural_of`, which
+                    // also yields `Unknown` for rank-≥2 arrays).
+                    let shape = c.args.get(1).map_or_else(
+                        || Box::new([Dim::Dynamic]) as Box<[Dim]>,
+                        |&n| count_dims(inf, n),
+                    );
+                    match shape.as_ref() {
+                        [dim] => ValueSet::CartPow(Box::new(elem), *dim),
+                        _ => ValueSet::Unknown,
+                    }
                 }
                 _ => ValueSet::Unknown,
             }
