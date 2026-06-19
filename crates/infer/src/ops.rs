@@ -193,22 +193,6 @@ pub(crate) fn call_rule(
         },
         // tile(A, size) keeps A's rank and element kind; only the sizes change.
         "tile" => arg_ty(args, 0).map_or(Type::Deferred, with_dynamic_dims),
-        // `qr(A)` (spec §07) returns `record(Q, R)` — both matrices with A's
-        // element kind, dims dynamic. Structural (not a catalogue row): building
-        // a `Type::Record` needs interned field Symbols, and the catalogue's
-        // `lower` has no interner (`Symbol::intern` is `&mut`); `call_rule` does.
-        "qr" => {
-            let elem = arg_ty(args, 0)
-                .and_then(elem_scalar_kind_of)
-                .unwrap_or(ScalarType::Real);
-            let matrix = Type::Array {
-                shape: Box::new([Dim::Dynamic, Dim::Dynamic]),
-                elem: Box::new(Type::Scalar(elem)),
-            };
-            let q = inf.module.intern("Q");
-            let r = inf.module.intern("R");
-            Type::Record(Box::new([(q, matrix.clone()), (r, matrix)]))
-        }
         // reduce(f, xs) folds xs with an associative f; spec §07 requires f to
         // return the element type of xs, so the result IS that element type
         // (a vector of reals reduces to a real, a vector of vectors to a vector).
@@ -420,7 +404,7 @@ pub(crate) fn call_rule(
         // or DomainMap) are declared in catalogue.ron and lowered here.
         // Distribution constructors (Sig::Distribution rows) are also dispatched here.
         // Structural ops above cannot be expressed in ResultSig and stay as code.
-        _ => match function_result(&name, args) {
+        _ => match function_result(inf.module, &name, args) {
             Some(ty) => ty,
             None => match distribution_domain(inf, &name, args, named) {
                 Some(domain) => Type::Measure {
@@ -1260,6 +1244,7 @@ fn catalogue_lower(sig: &crate::catalogue::Sig, args: &[ArgInfo]) -> (Type, Valu
             _ => Dim::Dynamic,
         },
         arg_type: &|i| arg_ty(args, i).cloned(),
+        intern: &crate::catalogue::no_intern,
     };
     lower(sig, &ctx)
 }
@@ -1440,14 +1425,24 @@ fn broadcast_type(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo], named: &[Named
 ///
 /// `arg_scalar` is built from the inferred positional argument types so that
 /// `SameScalarKind` and `DomainMap` sigs can read the call-site scalar kind.
-fn function_result(name: &str, args: &[ArgInfo]) -> Option<Type> {
+fn function_result(
+    module: &mut flatppl_core::Module,
+    name: &str,
+    args: &[ArgInfo],
+) -> Option<Type> {
     use crate::catalogue::{LowerCtx, Sig, lower};
+    use std::cell::RefCell;
 
     let sig = crate::catalogue::builtin().base(name)?;
     // Only Function rows here; Distribution rows are handled by distribution_domain.
     let Sig::Function { .. } = sig else {
         return None;
     };
+    // `ResultSig::Record` interns field-name Symbols into the module. Behind a
+    // RefCell so the `intern` closure is a `Fn` (not `FnMut`), coexisting with
+    // the immutable arg accessors. This is the one live function-row lower path,
+    // so it gets the real interner (other sites use `no_intern`).
+    let module = RefCell::new(module);
     let ctx = LowerCtx {
         arg_scalar: &|i| match arg_ty(args, i) {
             Some(Type::Scalar(s)) => Some(*s),
@@ -1459,6 +1454,7 @@ fn function_result(name: &str, args: &[ArgInfo]) -> Option<Type> {
             _ => Dim::Dynamic,
         },
         arg_type: &|i| arg_ty(args, i).cloned(),
+        intern: &|s| module.borrow_mut().intern(s),
     };
     // `lower` for Sig::Function returns (Type, ValueSet::natural_of(&ty)).
     // We only need the type here; the value-set arm is handled by call_valueset.
@@ -1494,6 +1490,7 @@ fn distribution_domain(
         arg_scalar: &|_| None,
         arg_dim: &|_| Dim::Dynamic,
         arg_type: &|i| arg_ty(args, i).cloned(),
+        intern: &crate::catalogue::no_intern,
     };
     let (ty, _vset) = lower(sig, &ctx);
     // `lower` wraps the domain in a `Type::Measure`; unwrap to get the domain.
@@ -1803,6 +1800,7 @@ fn distribution_support(
         arg_scalar: &|_| None,
         arg_dim: &|_| Dim::Dynamic,
         arg_type: &|i| arg_ty(args, i).cloned(),
+        intern: &crate::catalogue::no_intern,
     };
     let (_ty, vs) = lower(sig, &ctx);
     vs

@@ -149,6 +149,11 @@ Catalogue(
         // matrix inverts to a complex matrix).
         Builtin(name: "inv",            sig: Function(params: [Matrix], result: MatrixElem(rows: Dyn, cols: Dyn, elem: OfArg(0)))),
         Builtin(name: "lower_cholesky", sig: Function(params: [Matrix], result: MatrixElem(rows: Dyn, cols: Dyn, elem: OfArg(0)))),
+        // qr(A) → record(Q, R): both matrices with A's element kind (spec §07).
+        Builtin(name: "qr", sig: Function(params: [Matrix], result: Record([
+            ("Q", MatrixElem(rows: Dyn, cols: Dyn, elem: OfArg(0))),
+            ("R", MatrixElem(rows: Dyn, cols: Dyn, elem: OfArg(0))),
+        ]))),
         // diagmat(x): vector → diagonal matrix, element kind from the vector.
         Builtin(name: "diagmat",        sig: Function(params: [Vector(Real)], result: MatrixElem(rows: Dyn, cols: Dyn, elem: OfArg(0)))),
         // diag(A, k=0): extract a diagonal as a vector, element kind from A.

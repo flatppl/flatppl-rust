@@ -640,8 +640,8 @@ fn reduce_and_filter_infer() {
 }
 
 /// `qr(A)` (spec §07) returns `record(Q, R)` — both matrices with A's element
-/// kind. Structural (not a catalogue row): a `Type::Record` needs interned
-/// field Symbols, which the catalogue's `lower` can't produce.
+/// kind, via the RON catalogue's `ResultSig::Record` (field names interned
+/// through the lowering context). The reusable record-valued result path.
 #[test]
 fn qr_infers_a_record_of_matrices() {
     let out = ir("A = [[1.0, 0.0], [0.0, 1.0]]\nd = qr(A)");

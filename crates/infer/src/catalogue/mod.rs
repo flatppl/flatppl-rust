@@ -8,7 +8,7 @@ use std::sync::OnceLock;
 use serde::Deserialize;
 
 mod lower;
-pub(crate) use lower::{LowerCtx, lower};
+pub(crate) use lower::{LowerCtx, lower, no_intern};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Catalogue {
@@ -181,6 +181,10 @@ pub(crate) enum ResultSig {
     /// is a transposed vector (spec §07: "the transpose of a vector is a
     /// transposed vector, not a single-row matrix") — same rank-1 array type.
     TransposeOf(usize),
+    /// A record result with named fields, each field's type given by its own
+    /// `ResultSig` (`qr` → `record(Q, R)`; more record-valued functions to
+    /// come). Field names are interned via the lowering context's interner.
+    Record(Vec<(String, ResultSig)>),
 }
 
 /// The element-type source of a `Vector` / `MatrixElem` result.
@@ -443,6 +447,7 @@ mod tests {
                 param_dim: param_dim_fn,
                 arg_dim: &|_| Dim::Dynamic,
                 arg_type: &|_| None,
+                intern: &no_intern,
             };
             let (cat_ty, cat_support) = lower(sig, &ctx);
 
@@ -581,6 +586,7 @@ mod tests {
                 param_dim: &|_| Dim::Dynamic,
                 arg_dim: &|_| Dim::Dynamic,
                 arg_type: &|_| None,
+                intern: &no_intern,
             };
             let (cat_ty, _) = lower(sig, &ctx);
 
