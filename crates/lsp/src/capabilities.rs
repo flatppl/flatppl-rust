@@ -6,7 +6,9 @@
 use std::str::FromStr;
 
 use crate::db::{Catalogues, Database, FileSet, SourceFile};
-use crate::queries::{analyze, line_index, parse, parsed_catalogues, resolve_path};
+use crate::queries::{
+    SpanIndex, analyze, line_index, node_at_offset_indexed, parse, parsed_catalogues, resolve_path,
+};
 use flatppl_core::{CallHead, Node, RefNs, Scalar};
 
 /// Test-only counter incremented each time the static completion set is built.
@@ -227,10 +229,11 @@ pub fn hover(
     fs: FileSet,
     cats: Catalogues,
     byte_offset: u32,
+    index: &SpanIndex,
 ) -> Option<String> {
     let analyzed = analyze(db, file, fs, cats);
     let module = analyzed.module(db)?;
-    let node_id = module.node_at_offset(byte_offset)?;
+    let node_id = node_at_offset_indexed(index, byte_offset)?;
     let ty = module.type_of(node_id)?;
     let mut parts = vec![format!("**type:** `{}`", module.display_type(ty))];
     if let Some(phase) = module.phase_of(node_id) {
@@ -268,10 +271,11 @@ pub fn goto_definition(
     fs: FileSet,
     cats: Catalogues,
     byte_offset: u32,
+    index: &SpanIndex,
 ) -> Option<DefLoc> {
     let analyzed = analyze(db, file, fs, cats);
     let module = analyzed.module(db)?;
-    let node_id = module.node_at_offset(byte_offset)?;
+    let node_id = node_at_offset_indexed(index, byte_offset)?;
     let Node::Ref(r) = module.node(node_id) else {
         return None;
     };
@@ -781,7 +785,10 @@ mod tests {
         let fs = FileSet::new(&db, vec![f]);
         // Try a few offsets; at least one inside the expression should return Some.
         let offsets: &[u32] = &[0, 4, 9];
-        let found = offsets.iter().find_map(|&off| hover(&db, f, fs, cats, off));
+        let index = crate::queries::node_span_index(&db, f, fs, cats);
+        let found = offsets
+            .iter()
+            .find_map(|&off| hover(&db, f, fs, cats, off, &index));
         let s = found.expect("at least one offset inside 'x = add(1, 2)' must yield hover info");
         assert!(
             s.to_lowercase().contains("type"),
@@ -795,8 +802,9 @@ mod tests {
         let cats = Catalogues::new(&db, vec![]);
         let f = SourceFile::new(&db, "m.flatppl".to_string(), "x = add(1, 2)".to_string());
         let fs = FileSet::new(&db, vec![f]);
+        let index = crate::queries::node_span_index(&db, f, fs, cats);
         assert!(
-            hover(&db, f, fs, cats, 9999).is_none(),
+            hover(&db, f, fs, cats, 9999, &index).is_none(),
             "offset past end of source must yield None"
         );
     }
@@ -819,7 +827,10 @@ mod tests {
         // Try several offsets inside the elementof(...) call; at least one must
         // report a value-set (the infer engine annotates the call node).
         let offsets: &[u32] = &[4, 9, 14, 18];
-        let found = offsets.iter().find_map(|&off| hover(&db, f, fs, cats, off));
+        let index = crate::queries::node_span_index(&db, f, fs, cats);
+        let found = offsets
+            .iter()
+            .find_map(|&off| hover(&db, f, fs, cats, off, &index));
         let s = found.expect("at least one offset inside 'elementof(reals)' must yield hover info");
         assert!(
             s.contains("value-set"),
@@ -888,8 +899,9 @@ mod tests {
         let f = SourceFile::new(&db, "bad.flatppl".to_string(), "x = (((".to_string());
         let fs = FileSet::new(&db, vec![f]);
         // Parse failure means no module, so hover must always return None.
+        let index = crate::queries::node_span_index(&db, f, fs, cats);
         assert!(
-            hover(&db, f, fs, cats, 0).is_none(),
+            hover(&db, f, fs, cats, 0, &index).is_none(),
             "hover on a parse-error file must return None"
         );
     }
@@ -1013,13 +1025,15 @@ mod tests {
 
     #[test]
     fn goto_same_module_binding() {
+        use crate::queries::node_span_index;
         let db = Database::default();
         let cats = Catalogues::new(&db, vec![]);
         let src = "x = 1\ny = add(x, 2)";
         let f = SourceFile::new(&db, "m.flatppl".to_string(), src.to_string());
         let fs = FileSet::new(&db, vec![f]);
         let off = "x = 1\ny = add(".len() as u32; // on the `x` argument
-        let loc = goto_definition(&db, f, fs, cats, off).expect("definition");
+        let index = node_span_index(&db, f, fs, cats);
+        let loc = goto_definition(&db, f, fs, cats, off, &index).expect("definition");
         assert_eq!(loc.path, "m.flatppl");
         // x's binding rhs is the literal `1` at byte 4
         assert!(loc.start <= 4 && 4 < loc.end);
@@ -1027,6 +1041,7 @@ mod tests {
 
     #[test]
     fn goto_cross_file_load_module_binding() {
+        use crate::queries::node_span_index;
         let db = Database::default();
         let cats = Catalogues::new(&db, vec![]);
         let helpers = SourceFile::new(
@@ -1041,7 +1056,8 @@ mod tests {
         );
         let fs = FileSet::new(&db, vec![helpers, model]);
         let off = "h = load_module(\"helpers.flatppl\")\nv = h.".len() as u32; // on `shifted`
-        let loc = goto_definition(&db, model, fs, cats, off).expect("cross-file def");
+        let index = node_span_index(&db, model, fs, cats);
+        let loc = goto_definition(&db, model, fs, cats, off, &index).expect("cross-file def");
         assert_eq!(loc.path, "helpers.flatppl");
     }
 

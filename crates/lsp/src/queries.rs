@@ -3,7 +3,7 @@
 use crate::capabilities::LspDiag;
 use crate::db::{Catalogues, FileSet, SourceFile};
 use crate::line_index::LineIndex;
-use flatppl_core::{CallHead, Module, Node, Scalar};
+use flatppl_core::{CallHead, Idx, Module, Node, NodeId, Scalar};
 use std::sync::Arc;
 
 // ── ArcCatalogues wrapper ────────────────────────────────────────────────────
@@ -86,6 +86,71 @@ pub fn parsed_catalogues(db: &dyn salsa::Database, cats: Catalogues) -> ArcCatal
 #[cfg(test)]
 thread_local! {
     pub static PARSED_CATALOGUES_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+// ── SpanIndex: offset→node lookup (salsa-memoized) ──────────────────────────
+
+/// Sorted span table for offset→node lookup. Entries are `(start, end, node)`
+/// sorted by `start` ascending, then `end` descending, so a binary search to
+/// the last `start <= offset` gives a short candidate prefix.
+#[derive(Clone, Debug, PartialEq, Eq, salsa::Update)]
+pub struct SpanIndex {
+    spans: Vec<(u32, u32, NodeId)>,
+}
+
+/// Test-only execution counter for `node_span_index` (proves salsa memoizes it).
+#[cfg(test)]
+pub static SPAN_INDEX_RUNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Build the offset→node span index for the analyzed module, once per revision.
+#[salsa::tracked]
+pub fn node_span_index(
+    db: &dyn salsa::Database,
+    file: SourceFile,
+    fs: FileSet,
+    cats: Catalogues,
+) -> SpanIndex {
+    #[cfg(test)]
+    SPAN_INDEX_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let analyzed = analyze(db, file, fs, cats);
+    let mut spans: Vec<(u32, u32, NodeId)> = Vec::new();
+    if let Some(module) = analyzed.module(db) {
+        for i in 0..module.node_count() {
+            let id = NodeId::from_usize(i);
+            if let Some(span) = module.span_of(id) {
+                spans.push((span.start, span.end, id));
+            }
+        }
+    }
+    spans.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+    SpanIndex { spans }
+}
+
+/// The innermost (smallest-width) node whose span contains `offset`, ties broken
+/// to the LOWEST NodeId — byte-for-byte equivalent to `Module::node_at_offset`'s
+/// linear scan (which keeps the first minimal-width hit in NodeId order).
+pub fn node_at_offset_indexed(index: &SpanIndex, offset: u32) -> Option<NodeId> {
+    let mut best: Option<(u32 /*width*/, NodeId)> = None;
+    // All spans with start <= offset live in the prefix up to this point.
+    let upper = index
+        .spans
+        .partition_point(|&(start, _, _)| start <= offset);
+    for &(start, end, id) in &index.spans[..upper] {
+        debug_assert!(start <= offset);
+        if offset < end {
+            let width = end - start;
+            // Strict `<` keeps the first (lowest-NodeId) hit on a width tie,
+            // matching Module::node_at_offset's `is_none_or(|(_, w)| width < w)`.
+            let better = match best {
+                None => true,
+                Some((w, prev_id)) => width < w || (width == w && id < prev_id),
+            };
+            if better {
+                best = Some((width, id));
+            }
+        }
+    }
+    best.map(|(_, id)| id)
 }
 
 // ── LineIndex tracked query ──────────────────────────────────────────────────
@@ -997,5 +1062,54 @@ mod tests {
             std::sync::Arc::ptr_eq(&b1, &b2),
             "dep module shared across calls"
         );
+    }
+
+    // ── 3a: span index tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn span_index_matches_linear_node_at_offset() {
+        let db = Database::default();
+        let src = "x = add(mul(2, 3), sqrt(4.0))\ny ~ Normal(x, 1.0)";
+        let f = SourceFile::new(&db, "m.flatppl".to_string(), src.to_string());
+        let fs = FileSet::new(&db, Vec::new());
+        let cats = Catalogues::new(&db, Vec::new());
+        let analyzed = analyze(&db, f, fs, cats);
+        let module = analyzed.module(&db).expect("module");
+        let index = node_span_index(&db, f, fs, cats);
+        for off in 0..(src.len() as u32) {
+            assert_eq!(
+                node_at_offset_indexed(&index, off),
+                module.node_at_offset(off),
+                "mismatch at offset {off}"
+            );
+        }
+    }
+
+    #[test]
+    fn span_index_memoized_per_revision() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let db = Database::default();
+        let f = SourceFile::new(&db, "m.flatppl".to_string(), "x = 1".to_string());
+        let fs = FileSet::new(&db, Vec::new());
+        let cats = Catalogues::new(&db, Vec::new());
+        SPAN_INDEX_RUNS.store(0, Relaxed);
+        let _ = node_span_index(&db, f, fs, cats);
+        let _ = node_span_index(&db, f, fs, cats);
+        assert_eq!(SPAN_INDEX_RUNS.load(Relaxed), 1);
+    }
+
+    // ── 3b: catalogue single-parse test ──────────────────────────────────────
+
+    #[test]
+    fn analyze_does_not_reparse_catalogues() {
+        let db = Database::default();
+        let f = SourceFile::new(&db, "m.flatppl".to_string(), "x = 1".to_string());
+        let fs = FileSet::new(&db, Vec::new());
+        let cats = Catalogues::new(&db, vec!["(((".to_string()]);
+        PARSED_CATALOGUES_RUNS.with(|c| c.set(0));
+        let _ = analyze(&db, f, fs, cats);
+        // analyze must obtain catalogues + their errors solely via the memoized
+        // query — exactly one parse pass.
+        assert_eq!(PARSED_CATALOGUES_RUNS.with(|c| c.get()), 1);
     }
 }

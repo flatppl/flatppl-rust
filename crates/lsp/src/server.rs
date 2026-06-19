@@ -26,7 +26,7 @@ use lsp_types::{
 
 use crate::db::{Catalogues, Database, FileSet, SourceFile};
 use crate::line_index::Pos;
-use crate::queries::{import_bundle, line_index};
+use crate::queries::{import_bundle, line_index, node_span_index};
 
 // ── run ─────────────────────────────────────────────────────────────────────
 
@@ -577,7 +577,8 @@ fn handle_hover(
             line: lsp_pos.line,
             character: lsp_pos.character,
         });
-        let markdown = crate::capabilities::hover(db, file, fs, cats, byte_offset)?;
+        let index = node_span_index(db, file, fs, cats);
+        let markdown = crate::capabilities::hover(db, file, fs, cats, byte_offset, &index)?;
         Some(lsp_types::Hover {
             contents: lsp_types::HoverContents::Markup(lsp_types::MarkupContent {
                 kind: lsp_types::MarkupKind::Markdown,
@@ -684,7 +685,9 @@ fn handle_goto_definition(
             line: lsp_pos.line,
             character: lsp_pos.character,
         });
-        let def_loc = crate::capabilities::goto_definition(db, file, fs, cats, byte_offset)?;
+        let index = node_span_index(db, file, fs, cats);
+        let def_loc =
+            crate::capabilities::goto_definition(db, file, fs, cats, byte_offset, &index)?;
         // Build the target URI from the DefLoc path.
         let target_uri_str = if def_loc.path.starts_with("file://") {
             def_loc.path.clone()
