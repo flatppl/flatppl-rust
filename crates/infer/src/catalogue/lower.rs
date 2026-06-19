@@ -14,14 +14,35 @@ pub(crate) fn no_intern(_: &str) -> Symbol {
     Symbol::from_usize(0)
 }
 
-/// Resolve a `DimExpr` against the call context (the same mapping the `Matrix`
-/// result sig uses): a param-indexed dim reads the arg's dim, everything else
-/// degrades to dynamic.
+/// Resolve a `DimExpr` against the call context.
 fn dim_of(e: &DimExpr, ctx: &LowerCtx) -> Dim {
     match e {
         DimExpr::Dyn => Dim::Dynamic,
         DimExpr::OfParam(i) => (ctx.arg_dim)(*i),
-        DimExpr::MulDims(_, _) => Dim::Dynamic,
+        // Flattened dim `axis` of arg `i` (drills nested arrays so a matrix's
+        // rows/cols are axes 0/1 regardless of flat-vs-nested representation).
+        DimExpr::Axis(i, axis) => flatten_dims((ctx.arg_type)(*i).as_ref())
+            .get(*axis)
+            .copied()
+            .unwrap_or(Dim::Dynamic),
+        // Product: static only when both sides are static (overflow → dynamic).
+        DimExpr::Mul(a, b) => match (dim_of(a, ctx), dim_of(b, ctx)) {
+            (Dim::Static(x), Dim::Static(y)) => x.checked_mul(y).map_or(Dim::Dynamic, Dim::Static),
+            _ => Dim::Dynamic,
+        },
+    }
+}
+
+/// All dims of `t` flattened across array nesting (`Array[r]{ Array[c]{e} }` →
+/// `[r, c]`), so a `DimExpr::Axis(_, k)` selects a single extent.
+fn flatten_dims(t: Option<&Type>) -> Vec<Dim> {
+    match t {
+        Some(Type::Array { shape, elem }) => {
+            let mut v = shape.to_vec();
+            v.extend(flatten_dims(Some(elem)));
+            v
+        }
+        _ => Vec::new(),
     }
 }
 
@@ -208,17 +229,10 @@ fn lower_result(result: &ResultSig, ctx: &LowerCtx) -> Type {
                 .unwrap_or(ScalarType::Real);
             Type::Scalar(out)
         }
-        ResultSig::Matrix { rows, cols } => {
-            let d = |e: &DimExpr| match e {
-                DimExpr::Dyn => Dim::Dynamic,
-                DimExpr::OfParam(i) => (ctx.arg_dim)(*i),
-                DimExpr::MulDims(_, _) => Dim::Dynamic, // shape arithmetic degraded → dynamic
-            };
-            Type::Array {
-                shape: Box::new([d(rows), d(cols)]),
-                elem: Box::new(Type::Scalar(ScalarType::Real)),
-            }
-        }
+        ResultSig::Matrix { rows, cols } => Type::Array {
+            shape: Box::new([dim_of(rows, ctx), dim_of(cols, ctx)]),
+            elem: Box::new(Type::Scalar(ScalarType::Real)),
+        },
         ResultSig::SameAsArg(i) => (ctx.arg_type)(*i).unwrap_or(Type::Deferred),
         ResultSig::RealOfArgShape(i) => match (ctx.arg_type)(*i) {
             Some(Type::Scalar(_)) => Type::Scalar(ScalarType::Real),

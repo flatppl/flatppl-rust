@@ -807,3 +807,17 @@ fn distance_matrix_dims_resolve() {
         "cross_distance (3 x, 2 y) should be 3x2, got:\n{out}"
     );
 }
+
+/// `kron(A, B)` resolves EXACT Kronecker dims (rows A · rows B) × (cols A ·
+/// cols B) via the new axis-aware DimExpr (Axis + Mul) — e.g. 2×3 ⊗ 2×2 → 4×6.
+#[test]
+fn kron_resolves_kronecker_dims() {
+    let out = ir("e = standard_module(\"ext-linear-algebra\", \"0.1\")\n\
+                  A = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]\n\
+                  B = [[1.0, 0.0], [0.0, 1.0]]\n\
+                  k = e.kron(A, B)");
+    assert!(
+        out.contains("(%array 2 (4 6) (%scalar real))") && out.contains("kron"),
+        "kron(2x3, 2x2) should be 4x6, got:\n{out}"
+    );
+}
