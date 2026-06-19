@@ -786,3 +786,24 @@ fn gather_by_index_array_traces_real() {
         line("eta")
     );
 }
+
+/// distances `pairwise_distance`/`cross_distance` now infer EXACT result dims
+/// from their input lengths (N×N and N×M) via DimExpr::OfParam, not the prior
+/// Matrix(Dyn, Dyn) degraded placeholder.
+#[test]
+fn distance_matrix_dims_resolve() {
+    let pre = "d = standard_module(\"distances\", \"0.1\")\n\
+               f = (u, v) -> euclidean(u, v)\n\
+               X = [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]\n\
+               Y = [[0.0, 0.0], [1.0, 1.0]]\n";
+    let out = ir(&format!("{pre}r = d.pairwise_distance(f, X)"));
+    assert!(
+        out.contains("(%array 2 (3 3) (%scalar real))") && out.contains("pairwise_distance"),
+        "pairwise_distance over 3 points should be 3x3, got:\n{out}"
+    );
+    let out = ir(&format!("{pre}r = d.cross_distance(f, X, Y)"));
+    assert!(
+        out.contains("(%array 2 (3 2) (%scalar real))") && out.contains("cross_distance"),
+        "cross_distance (3 x, 2 y) should be 3x2, got:\n{out}"
+    );
+}

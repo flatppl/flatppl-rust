@@ -3,15 +3,15 @@
             name: "distances",
             version: "0.1",
             bindings: [
-                // pairwise_distance(distance, x): higher-order — takes a callable + vector of vectors
-                // Returns an N×N matrix.
+                // pairwise_distance(distance, x): callable + vector-of-vectors → N×N
+                // matrix, N = lengthof(x) (x is arg 1). (distance/x param domains
+                // stay Callable/Any — inexpressible in ParamSig.)
                 Binding(name: "pairwise_distance",
-                    sig: Function(params: [Callable, Any], result: Matrix(rows: Dyn, cols: Dyn)),
-                    degraded: Some("distance arg is a callable; x is a vector-of-vectors (inexpressible in ParamSig) → Any; result is N×N but N is arg-dependent → Matrix(Dyn, Dyn)")),
-                // cross_distance(distance, x, y): callable + two vector-of-vectors → N×M matrix
+                    sig: Function(params: [Callable, Any], result: Matrix(rows: OfParam(1), cols: OfParam(1)))),
+                // cross_distance(distance, x, y): callable + two vector-of-vectors →
+                // N×M matrix, N = lengthof(x) (arg 1), M = lengthof(y) (arg 2).
                 Binding(name: "cross_distance",
-                    sig: Function(params: [Callable, Any, Any], result: Matrix(rows: Dyn, cols: Dyn)),
-                    degraded: Some("distance arg is a callable; x/y are vector-of-vectors (inexpressible in ParamSig) → Any; result is N×M but dims are arg-dependent → Matrix(Dyn, Dyn)")),
+                    sig: Function(params: [Callable, Any, Any], result: Matrix(rows: OfParam(1), cols: OfParam(2)))),
                 // euclidean(u, v) → real
                 Binding(name: "euclidean",         sig: Function(params: [Vector(Real), Vector(Real)], result: Scalar(Real))),
                 // squared_euclidean(u, v) → real
