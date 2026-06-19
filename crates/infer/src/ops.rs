@@ -7,8 +7,8 @@
 //! §06 measure combinators, §04 reified callables.
 
 use flatppl_core::{
-    Call, CallHead, Dim, Inputs, Mass, Node, NodeId, Phase, Scalar, ScalarType, Symbol, Type,
-    ValueSet,
+    Call, CallHead, Dim, Inputs, Mass, Node, NodeId, Phase, Ref, RefNs, Scalar, ScalarType, Symbol,
+    Type, ValueSet,
 };
 
 use crate::Level;
@@ -56,7 +56,7 @@ pub(crate) fn call_rule(
     // User-defined callable application: the result looks through the callee
     // to the reified body (spec §11 reified callables).
     if let Some((callee_node, callee_ty)) = callee {
-        let ty = user_call_type(inf, callee_node, &callee_ty, args);
+        let ty = user_call_type(inf, callee_node, &callee_ty, args, named);
         return (ty, joined);
     }
 
@@ -1321,6 +1321,7 @@ fn user_call_type(
     callee: NodeId,
     callee_ty: &Type,
     args: &[ArgInfo],
+    named: &[NamedInfo],
 ) -> Type {
     // §09 standard-module application (`hepphys.CrystalBall(args)` /
     // `specfns.erf(x)`): the callee is a `RefNs::Module` ref whose catalogue
@@ -1340,9 +1341,16 @@ fn user_call_type(
         }
         return catalogue_call_type(inf, callee, args);
     }
+    // Prefer the per-call substituted body type (arg types bound to the
+    // callable's parameters); fall back to the un-substituted body type for
+    // cross-module callables and any case substitution can't bind.
     match callee_ty {
-        Type::Function { .. } => reified_result_type(inf, callee).unwrap_or(Type::Deferred),
-        Type::Kernel { mass, .. } => match reified_result_type(inf, callee) {
+        Type::Function { .. } => substituted_result_type(inf, callee, args, named)
+            .or_else(|| reified_result_type(inf, callee))
+            .unwrap_or(Type::Deferred),
+        Type::Kernel { mass, .. } => match substituted_result_type(inf, callee, args, named)
+            .or_else(|| reified_result_type(inf, callee))
+        {
             Some(Type::Measure { domain, .. }) => Type::Measure {
                 domain,
                 mass: *mass,
@@ -1466,6 +1474,137 @@ fn reified_result_type(inf: &mut Inferencer<'_, '_>, node: NodeId) -> Option<Typ
     inf.lookup_type(body).cloned()
 }
 
+/// Per-call result type of a **local** reified callable, computed by substituting
+/// the concrete call-arg annotations for the callable's input parameters and
+/// re-inferring its body in a throwaway module clone. This is the single-module
+/// analogue of the cross-module substitution path (`modules::seed_plan` +
+/// `infer_dep`): there the dependency's input *bindings* are seeded; here the
+/// body's `%local` placeholder refs (or a self-bound input binding's RHS) are
+/// seeded, and the body type is read back.
+///
+/// Without this, a callable written `f(a, b, x) = a + b * x` lowers to a
+/// reification whose parameters are unconstrained `%local` placeholders
+/// (`Type::Any`), so its body — and every application of it, direct or under
+/// `broadcast` — types as `any`. Substituting the call's arg types makes
+/// `f(1.0, 2.0, 3.0)` a `real` and `broadcast(f, x = real[5])` a `real[5]`.
+///
+/// Returns `None` when `callee` is not a local reification, or no parameter could
+/// be bound to an argument (caller falls back to the un-substituted body type).
+fn substituted_result_type(
+    inf: &mut Inferencer<'_, '_>,
+    callee: NodeId,
+    args: &[ArgInfo],
+    named: &[NamedInfo],
+) -> Option<Type> {
+    let (reif_id, body) = local_reification(inf, callee)?;
+    let inputs = input_entries(inf, reif_id)?;
+
+    // Seed targets: for each parameter bound to a call argument, the body nodes
+    // that read it (every matching `%local` placeholder ref, or a self-bound
+    // input binding's RHS) annotated with the argument's type/phase/value-set.
+    let mut seeds: Vec<(NodeId, crate::modules::Resolved)> = Vec::new();
+    for (i, (sym, decl)) in inputs.iter().enumerate() {
+        // Bind by keyword first (broadcast / named application), then by position.
+        let arg = named
+            .iter()
+            .find(|(n, ..)| n == sym)
+            .map(|(_, node, t, p)| (*node, t.clone(), *p))
+            .or_else(|| args.get(i).map(|(node, t, p)| (*node, t.clone(), *p)));
+        let Some((arg_node, ty, phase)) = arg else {
+            continue;
+        };
+        let res = crate::modules::Resolved {
+            ty,
+            phase,
+            vset: inf.lookup_valueset(arg_node),
+            result: None,
+            catalogue: None,
+        };
+        match decl.ns {
+            RefNs::Local => collect_local_ref_seeds(inf, body, decl.name, &res, &mut seeds),
+            RefNs::SelfMod => {
+                if let Some(b) = inf.module.binding_by_name(decl.name) {
+                    seeds.push((inf.module.binding(b).rhs, res));
+                }
+            }
+            RefNs::Module(_) => {}
+        }
+    }
+    if seeds.is_empty() {
+        return None;
+    }
+
+    // Re-infer ONLY the body in an isolated clone seeded with the substitutions.
+    // Inferring the body alone (not the whole module via `run`) avoids re-entering
+    // the application that triggered this — the seeds cut every parameter, so the
+    // body walk never reaches back to the call site.
+    let mut clone = inf.module.clone();
+    let mut sub = Inferencer::new_seeded(&mut clone, inf.level, inf.session, &seeds);
+    let (ty, _) = sub.infer_node(body);
+    Some(ty)
+}
+
+/// Deref a callee expression to its local reification: follow `self` refs to the
+/// bound RHS, returning `(reification_node, body_node)` when the RHS is a
+/// reification (a call carrying an inputs boundary). `None` otherwise.
+fn local_reification(inf: &Inferencer<'_, '_>, mut node: NodeId) -> Option<(NodeId, NodeId)> {
+    loop {
+        match inf.module.node(node) {
+            Node::Ref(r) if r.ns == RefNs::SelfMod => {
+                let binding = inf.module.binding_by_name(r.name)?;
+                node = inf.module.binding(binding).rhs;
+            }
+            Node::Call(c) if c.inputs.is_some() => return Some((node, *c.args.first()?)),
+            _ => return None,
+        }
+    }
+}
+
+/// The ordered input parameters of a reification: `(param-name, declaration-ref)`
+/// pairs. A `%specinputs` boundary carries them inline; an `%autoinputs`
+/// (keyword-only) boundary reads them from the auto-inputs side-table.
+fn input_entries(inf: &Inferencer<'_, '_>, reif_id: NodeId) -> Option<Vec<(Symbol, Ref)>> {
+    let Node::Call(call) = inf.module.node(reif_id) else {
+        return None;
+    };
+    match call.inputs.as_ref()? {
+        Inputs::Spec(entries) => Some(entries.to_vec()),
+        Inputs::Auto => inf.module.auto_inputs_of(reif_id).map(<[_]>::to_vec),
+    }
+}
+
+/// Collect seeds for every `%local` placeholder ref in `body` whose name matches
+/// `param`, annotating each with `res`. The body reads a parameter through these
+/// placeholder refs, so seeding each makes the substituted annotation authoritative.
+fn collect_local_ref_seeds(
+    inf: &Inferencer<'_, '_>,
+    body: NodeId,
+    param: Symbol,
+    res: &crate::modules::Resolved,
+    out: &mut Vec<(NodeId, crate::modules::Resolved)>,
+) {
+    let mut stack = vec![body];
+    let mut seen = std::collections::HashSet::new();
+    while let Some(id) = stack.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        match inf.module.node(id) {
+            Node::Ref(r) if r.ns == RefNs::Local && r.name == param => {
+                out.push((id, res.clone()));
+            }
+            Node::Call(c) => {
+                if let CallHead::User(callee) = c.head {
+                    stack.push(callee);
+                }
+                stack.extend(c.args.iter().copied());
+                stack.extend(c.named.iter().map(|n| n.value));
+            }
+            _ => {}
+        }
+    }
+}
+
 /// `broadcast(f_or_K, args…)` (spec §04 broadcasting): a deterministic head
 /// maps elementwise over same-shape arrays (scalars ride along) into an
 /// array; a kernel / distribution-constructor head yields a **measure over
@@ -1502,11 +1641,28 @@ fn broadcast_type(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo], named: &[Named
         return Type::Deferred; // no array input — scalar broadcast is a no-op shape-wise
     };
 
-    // User-callable head (`broadcast(group_kernel, mu = mu_g)`): the cell
-    // comes from the reified body, exactly as in a direct call.
+    // User-callable head (`broadcast(predict, x = x_data)`): the cell comes from
+    // the reified body applied to the PER-CELL argument types — an array input
+    // contributes its element type, a scalar rides along — exactly the §09
+    // standard-module head treatment below, and the substituted analogue of a
+    // direct call.
+    let cell_arg = |t: &Type| match t {
+        Type::Array { elem, .. } => elem.as_ref().clone(),
+        other => other.clone(),
+    };
     match &head_ty {
         Type::Function { .. } => {
-            let cell = reified_result_type(inf, head_node).unwrap_or(Type::Deferred);
+            let cell_args: Vec<ArgInfo> = args[1..]
+                .iter()
+                .map(|(n, t, p)| (*n, cell_arg(t), *p))
+                .collect();
+            let cell_named: Vec<NamedInfo> = named
+                .iter()
+                .map(|(s, n, t, p)| (*s, *n, cell_arg(t), *p))
+                .collect();
+            let cell = substituted_result_type(inf, head_node, &cell_args, &cell_named)
+                .or_else(|| reified_result_type(inf, head_node))
+                .unwrap_or(Type::Deferred);
             return Type::Array {
                 shape,
                 elem: Box::new(cell),
@@ -1514,7 +1670,17 @@ fn broadcast_type(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo], named: &[Named
         }
         Type::Kernel { mass, .. } => {
             let mass = *mass;
-            let cell = match reified_result_type(inf, head_node) {
+            let cell_args: Vec<ArgInfo> = args[1..]
+                .iter()
+                .map(|(n, t, p)| (*n, cell_arg(t), *p))
+                .collect();
+            let cell_named: Vec<NamedInfo> = named
+                .iter()
+                .map(|(s, n, t, p)| (*s, *n, cell_arg(t), *p))
+                .collect();
+            let cell = match substituted_result_type(inf, head_node, &cell_args, &cell_named)
+                .or_else(|| reified_result_type(inf, head_node))
+            {
                 Some(Type::Measure { domain, .. }) => *domain,
                 Some(value_ty) => value_ty,
                 None => return Type::Deferred,
@@ -1643,10 +1809,43 @@ fn function_result(
         arg_type: &|i| arg_ty(args, i).cloned(),
         intern: &|s| module.borrow_mut().intern(s),
     };
-    // `lower` for Sig::Function returns (Type, ValueSet::natural_of(&ty)).
-    // We only need the type here; the value-set arm is handled by call_valueset.
     let (ty, _) = lower(sig, &ctx);
     Some(ty)
+}
+
+/// The value-set of a per-name catalogue `Sig::Function` result — its `result_set`
+/// tag lowered with the concrete arg types (`sqrt → nonnegreals`, `lengthof →
+/// nonnegintegers`, `Natural` rows → the type's natural extent). `None` when the
+/// name is not a known function row, so the caller falls through to distribution
+/// support. Mirrors `function_result`, returning the value-set arm of `lower`.
+fn function_valueset(
+    module: &mut flatppl_core::Module,
+    name: &str,
+    args: &[ArgInfo],
+) -> Option<ValueSet> {
+    use crate::catalogue::{LowerCtx, Sig, lower};
+    use std::cell::RefCell;
+
+    let sig = crate::catalogue::builtin().base(name)?;
+    let Sig::Function { .. } = sig else {
+        return None;
+    };
+    let module = RefCell::new(module);
+    let ctx = LowerCtx {
+        arg_scalar: &|i| match arg_ty(args, i) {
+            Some(Type::Scalar(s)) => Some(*s),
+            _ => None,
+        },
+        param_dim: &|_| Dim::Dynamic,
+        arg_dim: &|i| match arg_ty(args, i) {
+            Some(Type::Array { shape, .. }) if shape.len() == 1 => shape[0],
+            _ => Dim::Dynamic,
+        },
+        arg_type: &|i| arg_ty(args, i).cloned(),
+        intern: &|s| module.borrow_mut().intern(s),
+    };
+    let (_, vset) = lower(sig, &ctx);
+    Some(vset)
 }
 
 /// The variate domain of a spec-§08 distribution constructor, or `None` when
@@ -1833,10 +2032,6 @@ pub(crate) fn call_valueset(
                 ValueSet::Unknown
             }
         }
-        // Range-constrained scalar functions.
-        "exp" => ValueSet::PosReals,
-        "abs" | "abs2" | "sqrt" => ValueSet::NonNegReals,
-        "invlogit" | "invprobit" => ValueSet::UnitInterval,
         // Vectors lift a common element set; heterogeneous elements widen
         // to the strongest named set containing all of them (literal reals
         // are singleton intervals, so without widening `l1unit`'s simplex
@@ -1856,8 +2051,17 @@ pub(crate) fn call_valueset(
         "checked" | "fixed" => args
             .first()
             .map_or(ValueSet::Unknown, |(n, _, _)| inf.lookup_valueset(*n)),
-        // Distribution constructors: the support column of spec §08.
-        _ => distribution_support(inf, &name, args, named),
+        // Catalogue functions carry their result value-set (`result_set` tag);
+        // distribution constructors carry the support column of spec §08. A
+        // bare name is one or the other — try the function row first, then fall
+        // through to distribution support.
+        _ => {
+            if let Some(vs) = function_valueset(&mut *inf.module, &name, args) {
+                vs
+            } else {
+                distribution_support(inf, &name, args, named)
+            }
+        }
     }
 }
 

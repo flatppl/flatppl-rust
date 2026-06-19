@@ -151,6 +151,35 @@ impl Module {
         s
     }
 
+    /// Render the full inferred *specification* of a node — its type plus the
+    /// value-set and phase — as one compact line for an inline surface (LSP
+    /// inlay hint), e.g. `real {nonnegreals, stochastic}`.
+    ///
+    /// The brace group carries the facts the bare type omits: the value-set
+    /// when it is tighter than the type's natural extent (a plain `reals` over
+    /// a `real` adds nothing and is dropped), and the phase. Returns `None`
+    /// when the node has no inferred type.
+    pub fn display_meta(&self, id: NodeId) -> Option<String> {
+        let ty = self.type_of(id)?;
+        let mut facts: Vec<String> = Vec::new();
+        if let Some(vs) = self.valueset_of(id) {
+            if !matches!(vs, ValueSet::Unknown | ValueSet::Deferred)
+                && *vs != ValueSet::natural_of(ty)
+            {
+                facts.push(vs.to_string());
+            }
+        }
+        if let Some(phase) = self.phase_of(id) {
+            facts.push(phase.to_string());
+        }
+        let base = self.display_type(ty);
+        Some(if facts.is_empty() {
+            base
+        } else {
+            format!("{base} {{{}}}", facts.join(", "))
+        })
+    }
+
     fn write_type(&self, out: &mut String, ty: &Type) {
         use std::fmt::Write as _;
         match ty {

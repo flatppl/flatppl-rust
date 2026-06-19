@@ -87,8 +87,8 @@ Catalogue(
         Builtin(name: "div",      sig: Function(params: [Scalar(Integer), Scalar(Integer)], result: Scalar(Integer))),
         Builtin(name: "mod",      sig: Function(params: [Scalar(Integer), Scalar(Integer)], result: Scalar(Integer))),
         // lengthof / length: number of elements in a vector (spec §07 Reductions).
-        Builtin(name: "lengthof", sig: Function(params: [Any], result: Scalar(Integer))),
-        Builtin(name: "length",   sig: Function(params: [Any], result: Scalar(Integer))),
+        Builtin(name: "lengthof", sig: Function(params: [Any], result: Scalar(Integer), result_set: NonNegIntegers)),
+        Builtin(name: "length",   sig: Function(params: [Any], result: Scalar(Integer), result_set: NonNegIntegers)),
 
         // -- scalar-real output --
         // NOTE: divide and mean are intentionally NOT here. Their result types
@@ -101,15 +101,15 @@ Catalogue(
         // "real/complex arrays".)
         // logdensityof / densityof return a real scalar (spec §07 §06).
         Builtin(name: "logdensityof", sig: Function(params: [Any, Any], result: Scalar(Real))),
-        Builtin(name: "densityof",    sig: Function(params: [Any, Any], result: Scalar(Real))),
+        Builtin(name: "densityof",    sig: Function(params: [Any, Any], result: Scalar(Real), result_set: NonNegReals)),
         // Norms (spec §07 "Norms and normalization"): l1/l2 norm → real scalar.
-        Builtin(name: "l1norm",       sig: Function(params: [Any],      result: Scalar(Real))),
-        Builtin(name: "l2norm",       sig: Function(params: [Any],      result: Scalar(Real))),
+        Builtin(name: "l1norm",       sig: Function(params: [Any],      result: Scalar(Real), result_set: NonNegReals)),
+        Builtin(name: "l2norm",       sig: Function(params: [Any],      result: Scalar(Real), result_set: NonNegReals)),
         // logsumexp (spec §07): log Σ exp(v_i) → real.
         Builtin(name: "logsumexp",    sig: Function(params: [Any],      result: Scalar(Real))),
         // var/std (spec §07 "Reductions") involve a division/sqrt → always real.
-        Builtin(name: "var",          sig: Function(params: [Any],      result: Scalar(Real))),
-        Builtin(name: "std",          sig: Function(params: [Any],      result: Scalar(Real))),
+        Builtin(name: "var",          sig: Function(params: [Any],      result: Scalar(Real), result_set: NonNegReals)),
+        Builtin(name: "std",          sig: Function(params: [Any],      result: Scalar(Real), result_set: NonNegReals)),
         // maximum/minimum return an ELEMENT of the array, so the result kind
         // follows the element kind (an integer array yields an integer).
         Builtin(name: "maximum",      sig: Function(params: [Any],      result: ElemScalarKind(0))),
@@ -166,7 +166,7 @@ Catalogue(
         // sizeof(x): the dimensions of x as an integer vector.
         Builtin(name: "sizeof",         sig: Function(params: [Any], result: Vector(len: Dyn, elem: Integer))),
         // totalmass(M): total mass Z = ∫ dM as a real scalar (spec §06).
-        Builtin(name: "totalmass",      sig: Function(params: [Any], result: Scalar(Real))),
+        Builtin(name: "totalmass",      sig: Function(params: [Any], result: Scalar(Real), result_set: NonNegReals)),
 
         // -- more linear algebra / vector constructors (spec §07) --
         // boolean(x): set-restrict to booleans → boolean scalar.
@@ -230,22 +230,22 @@ Catalogue(
 
         // -- SameScalarKind(0): real→real, complex→complex --
         // (spec §07 "Elementary functions": all accept reals and complexes)
-        Builtin(name: "exp",       sig: Function(params: [Any], result: SameScalarKind(0))),
+        Builtin(name: "exp",       sig: Function(params: [Any], result: SameScalarKind(0), result_set: PosReals)),
         Builtin(name: "log",       sig: Function(params: [Any], result: SameScalarKind(0))),
         // log2: in ops.rs but absent from spec §07. Kept for engine compatibility.
         Builtin(name: "log2",      sig: Function(params: [Any], result: SameScalarKind(0)),
             degraded: Some("log2 is not listed in spec §07; kept for engine compatibility")),
         Builtin(name: "log10",     sig: Function(params: [Any], result: SameScalarKind(0))),
-        Builtin(name: "sqrt",      sig: Function(params: [Any], result: SameScalarKind(0))),
-        Builtin(name: "sin",       sig: Function(params: [Any], result: SameScalarKind(0))),
-        Builtin(name: "cos",       sig: Function(params: [Any], result: SameScalarKind(0))),
+        Builtin(name: "sqrt",      sig: Function(params: [Any], result: SameScalarKind(0), result_set: NonNegReals)),
+        Builtin(name: "sin",       sig: Function(params: [Any], result: SameScalarKind(0), result_set: Interval(-1.0, 1.0))),
+        Builtin(name: "cos",       sig: Function(params: [Any], result: SameScalarKind(0), result_set: Interval(-1.0, 1.0))),
         Builtin(name: "tan",       sig: Function(params: [Any], result: SameScalarKind(0))),
         Builtin(name: "asin",      sig: Function(params: [Any], result: SameScalarKind(0))),
         Builtin(name: "acos",      sig: Function(params: [Any], result: SameScalarKind(0))),
         Builtin(name: "atan",      sig: Function(params: [Any], result: SameScalarKind(0))),
         Builtin(name: "sinh",      sig: Function(params: [Any], result: SameScalarKind(0))),
-        Builtin(name: "cosh",      sig: Function(params: [Any], result: SameScalarKind(0))),
-        Builtin(name: "tanh",      sig: Function(params: [Any], result: SameScalarKind(0))),
+        Builtin(name: "cosh",      sig: Function(params: [Any], result: SameScalarKind(0), result_set: PosReals)),
+        Builtin(name: "tanh",      sig: Function(params: [Any], result: SameScalarKind(0), result_set: Interval(-1.0, 1.0))),
         Builtin(name: "asinh",     sig: Function(params: [Any], result: SameScalarKind(0))),
         Builtin(name: "acosh",     sig: Function(params: [Any], result: SameScalarKind(0))),
         Builtin(name: "atanh",     sig: Function(params: [Any], result: SameScalarKind(0))),
@@ -254,14 +254,14 @@ Catalogue(
         Builtin(name: "gamma",     sig: Function(params: [Any], result: SameScalarKind(0))),
         Builtin(name: "loggamma",  sig: Function(params: [Any], result: SameScalarKind(0))),
         Builtin(name: "logit",     sig: Function(params: [Any], result: SameScalarKind(0))),
-        Builtin(name: "invlogit",  sig: Function(params: [Any], result: SameScalarKind(0))),
+        Builtin(name: "invlogit",  sig: Function(params: [Any], result: SameScalarKind(0), result_set: UnitInterval)),
         Builtin(name: "probit",    sig: Function(params: [Any], result: SameScalarKind(0))),
-        Builtin(name: "invprobit", sig: Function(params: [Any], result: SameScalarKind(0))),
+        Builtin(name: "invprobit", sig: Function(params: [Any], result: SameScalarKind(0), result_set: UnitInterval)),
         // abs / abs2: |x| and |x|² are real for both real and complex inputs
         // (real_or_complex(arg) in ops.rs: complex→real, not complex→complex).
         // DomainMap captures this: Complex maps to Real; anything else defaults Real.
-        Builtin(name: "abs",  sig: Function(params: [Any], result: DomainMap(arg: 0, map: [(Complex, Real)]))),
-        Builtin(name: "abs2", sig: Function(params: [Any], result: DomainMap(arg: 0, map: [(Complex, Real)]))),
+        Builtin(name: "abs",  sig: Function(params: [Any], result: DomainMap(arg: 0, map: [(Complex, Real)]), result_set: NonNegReals)),
+        Builtin(name: "abs2", sig: Function(params: [Any], result: DomainMap(arg: 0, map: [(Complex, Real)]), result_set: NonNegReals)),
         // conj: complex conjugate — real→real, complex→complex.
         Builtin(name: "conj", sig: Function(params: [Any], result: SameScalarKind(0))),
     ],

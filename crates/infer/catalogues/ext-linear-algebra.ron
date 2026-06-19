@@ -48,6 +48,6 @@
                     sig: Function(params: [Matrix, Vector(Real)], result: Vector(len: Dyn, elem: OfArg(1)))),
                 // rank(A) → integer (numerical rank)
                 Binding(name: "rank",
-                    sig: Function(params: [Matrix], result: Scalar(Integer))),
+                    sig: Function(params: [Matrix], result: Scalar(Integer), result_set: NonNegIntegers)),
             ]
 )
