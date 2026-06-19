@@ -906,3 +906,58 @@ fn function_result_set_falls_back_for_complex() {
         "exp of a complex should be complexes, not posreals; got:\n{out}"
     );
 }
+
+// ---- load_data: dynamic-length vector of the declared valueset (§07) ----
+
+/// `load_data(source, valueset)` is a vector of the declared `valueset`'s
+/// element type with a `%dynamic` length (the row count is not statically
+/// known). The value-set is `cartpow(valueset, %dynamic)`. Keyword and
+/// positional spellings agree; a `cartpow` valueset gives a vector-of-vectors.
+#[test]
+fn load_data_is_a_dynamic_vector_of_the_valueset() {
+    let out = ir("w = load_data(source = \"w.csv\", valueset = reals)");
+    let w = out.lines().find(|l| l.contains("%bind w")).unwrap_or("");
+    assert!(
+        w.contains("(%array 1 (%dynamic) (%scalar real))")
+            && w.contains("(cartpow reals %dynamic)"),
+        "load_data(valueset=reals) should be a dynamic real vector; got:\n{out}"
+    );
+    // Positional form agrees.
+    let out = ir("w = load_data(\"w.csv\", nonnegintegers)");
+    let w = out.lines().find(|l| l.contains("%bind w")).unwrap_or("");
+    assert!(
+        w.contains("(%array 1 (%dynamic) (%scalar integer))")
+            && w.contains("(cartpow nonnegintegers %dynamic)"),
+        "positional load_data(.., nonnegintegers) should be a dynamic integer vector; got:\n{out}"
+    );
+    // A cartpow valueset → a dynamic vector of fixed-width vectors.
+    let out = ir("w = load_data(source = \"w.csv\", valueset = cartpow(reals, 3))");
+    let w = out.lines().find(|l| l.contains("%bind w")).unwrap_or("");
+    assert!(
+        w.contains("(%array 1 (%dynamic) (%array 1 (3) (%scalar real)))"),
+        "load_data(valueset=cartpow(reals,3)) should be a dynamic vector of 3-vectors; got:\n{out}"
+    );
+}
+
+// ---- User-callable results carry the substituted body's value-set (§04/§07) --
+
+/// A callable whose body tightens its range carries that value-set to the call
+/// site, direct and under `broadcast`: `f(x) = sqrt(x)` applied to a real gives
+/// `nonnegreals`; `broadcast(f, v)` over a real vector gives
+/// `cartpow(nonnegreals, n)`. Before, only the result TYPE was substituted and
+/// the value-set fell back to the natural `reals`.
+#[test]
+fn user_call_carries_substituted_value_set() {
+    let out = ir("f(x) = sqrt(x)\nr = f(2.0)");
+    let r = out.lines().find(|l| l.contains("%bind r")).unwrap_or("");
+    assert!(
+        r.contains("(%scalar real) %fixed nonnegreals"),
+        "f(x)=sqrt(x) applied should carry nonnegreals; got:\n{out}"
+    );
+    let out = ir("f(x) = sqrt(x)\nv = [1.0, 2.0, 3.0]\nr = broadcast(f, v)");
+    let r = out.lines().find(|l| l.contains("%bind r")).unwrap_or("");
+    assert!(
+        r.contains("(cartpow nonnegreals 3)"),
+        "broadcast(f, real[3]) should carry cartpow(nonnegreals, 3); got:\n{out}"
+    );
+}
