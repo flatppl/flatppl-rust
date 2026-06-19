@@ -160,6 +160,29 @@ Catalogue(
         // totalmass(M): total mass Z = ∫ dM as a real scalar (spec §06).
         Builtin(name: "totalmass",      sig: Function(params: [Any], result: Scalar(Real))),
 
+        // -- more linear algebra / vector constructors (spec §07) --
+        // boolean(x): set-restrict to booleans → boolean scalar.
+        Builtin(name: "boolean",        sig: Function(params: [Any], result: Scalar(Boolean))),
+        // quadform(A, x) = xᵀ A x → scalar, element kind from A.
+        Builtin(name: "quadform",       sig: Function(params: [Matrix, Vector(Real)], result: ElemScalarKind(0))),
+        // Gram / outer products → matrix, element kind preserved.
+        Builtin(name: "row_gram",       sig: Function(params: [Matrix], result: MatrixElem(rows: Dyn, cols: Dyn, elem: OfArg(0)))),
+        Builtin(name: "col_gram",       sig: Function(params: [Matrix], result: MatrixElem(rows: Dyn, cols: Dyn, elem: OfArg(0)))),
+        Builtin(name: "self_outer",     sig: Function(params: [Vector(Real)], result: MatrixElem(rows: Dyn, cols: Dyn, elem: OfArg(0)))),
+        // Block / banded / stacked matrix constructors → matrix, element kind
+        // drilled from the (nested) argument.
+        Builtin(name: "blockdiagmat",   sig: Function(params: [Any], result: MatrixElem(rows: Dyn, cols: Dyn, elem: OfArg(0)))),
+        Builtin(name: "bandedmat",      sig: Function(params: [Vector(Real), Scalar(Integer)], result: MatrixElem(rows: Dyn, cols: Dyn, elem: OfArg(0)))),
+        Builtin(name: "joinblocks",     sig: Function(params: [Any], result: MatrixElem(rows: Dyn, cols: Dyn, elem: OfArg(0)))),
+        Builtin(name: "colstack",       sig: Function(params: [Any], result: MatrixElem(rows: Dyn, cols: Dyn, elem: OfArg(0)))),
+        // onehot(i, n): real basis vector.
+        Builtin(name: "onehot",         sig: Function(params: [Scalar(Integer), Scalar(Integer)], result: Vector(len: Dyn, elem: Real))),
+        // conv / crosscorr: 1-D vector result, element kind from the signal.
+        Builtin(name: "conv",           sig: Function(params: [Vector(Real), Vector(Real)], result: Vector(len: Dyn, elem: OfArg(0)))),
+        Builtin(name: "crosscorr",      sig: Function(params: [Vector(Real), Vector(Real)], result: Vector(len: Dyn, elem: OfArg(0)))),
+        // bincounts(bins, data): integer counts per bin.
+        Builtin(name: "bincounts",      sig: Function(params: [Any, Any], result: Vector(len: Dyn, elem: Integer))),
+
         // -- scalar-complex output --
         // cis(theta) = exp(i*theta); complex(re, im) = re + i*im (spec §07).
         Builtin(name: "cis",     sig: Function(params: [Scalar(Real)],               result: Scalar(Complex))),

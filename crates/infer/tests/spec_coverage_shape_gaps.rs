@@ -383,3 +383,57 @@ fn totalmass_infers_a_real_scalar() {
         "totalmass should infer a real scalar, got:\n{out}"
     );
 }
+
+// ---- Round 4: more linear-algebra / vector ops via the catalogue ----
+
+/// `boolean(x)` → boolean scalar; `quadform(A, x)` → scalar of A's element kind.
+#[test]
+fn boolean_and_quadform_infer_scalars() {
+    let out = ir("b = true\nx = boolean(b)");
+    assert!(
+        out.contains("(%meta ((%scalar boolean) %fixed booleans) (boolean"),
+        "boolean should infer a boolean scalar, got:\n{out}"
+    );
+    let out = ir("A = [[1.0, 0.0], [0.0, 1.0]]\nv = [1.0, 2.0]\nx = quadform(A, v)");
+    assert!(
+        out.contains("(%meta ((%scalar real) %fixed reals) (quadform"),
+        "quadform(real) should infer a real scalar, got:\n{out}"
+    );
+}
+
+/// Gram / outer / block matrix constructors infer a matrix with the element
+/// kind preserved from the argument.
+#[test]
+fn matrix_constructors_infer_matrices() {
+    for (op, src) in [
+        ("row_gram", "A = [[1.0, 2.0], [3.0, 4.0]]\nx = row_gram(A)"),
+        ("col_gram", "A = [[1.0, 2.0], [3.0, 4.0]]\nx = col_gram(A)"),
+        ("self_outer", "v = [1.0, 2.0]\nx = self_outer(v)"),
+        (
+            "colstack",
+            "vs = [[1.0, 2.0], [3.0, 4.0]]\nx = colstack(vs)",
+        ),
+    ] {
+        let out = ir(src);
+        assert!(
+            out.contains("(%array 2 (%dynamic %dynamic) (%scalar real))")
+                && out.contains(&format!("({op}")),
+            "{op} should infer a real matrix, got:\n{out}"
+        );
+    }
+}
+
+/// Vector-result constructors: `onehot`/`conv` → real, `bincounts` → integer.
+#[test]
+fn more_vector_results_infer() {
+    let out = ir("x = onehot(1, 3)");
+    assert!(
+        out.contains("(%array 1 (%dynamic) (%scalar real))") && out.contains("(onehot"),
+        "onehot should infer a real vector, got:\n{out}"
+    );
+    let out = ir("b = [0.0, 1.0, 2.0]\nd = [0.5, 1.5]\nx = bincounts(b, d)");
+    assert!(
+        out.contains("(%array 1 (%dynamic) (%scalar integer))") && out.contains("(bincounts"),
+        "bincounts should infer an integer vector, got:\n{out}"
+    );
+}
