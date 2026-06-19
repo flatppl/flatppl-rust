@@ -193,6 +193,27 @@ pub(crate) fn call_rule(
         },
         // tile(A, size) keeps A's rank and element kind; only the sizes change.
         "tile" => arg_ty(args, 0).map_or(Type::Deferred, with_dynamic_dims),
+        // `aggregate(f, output_axes, expr)` / `metricsum(metric, output_axes,
+        // expr)` (spec §04): an einsum-style reduction. The result RANK is the
+        // number of output axes (the `output_axes` vector at arg 1); the element
+        // kind comes from the reduced `expr` (arg 2). Empty output axes → a
+        // scalar (e.g. `aggregate(sum, [], A[.i]*B[.i])`). A non-literal axis
+        // list leaves the rank unknown → defer.
+        "aggregate" | "metricsum" => {
+            let elem = Type::Scalar(
+                arg_ty(args, 2)
+                    .and_then(elem_scalar_kind_of)
+                    .unwrap_or(ScalarType::Real),
+            );
+            match args.get(1).and_then(|a| output_axis_rank(inf, a.0)) {
+                Some(0) => elem,
+                Some(rank) => Type::Array {
+                    shape: vec![Dim::Dynamic; rank].into_boxed_slice(),
+                    elem: Box::new(elem),
+                },
+                None => Type::Deferred,
+            }
+        }
         // reduce(f, xs) folds xs with an associative f; spec §07 requires f to
         // return the element type of xs, so the result IS that element type
         // (a vector of reals reduces to a real, a vector of vectors to a vector).
@@ -778,6 +799,19 @@ fn with_dynamic_dims(t: &Type) -> Type {
         },
         other => other.clone(),
     }
+}
+
+/// The number of output axes of an `aggregate`/`metricsum` — the length of the
+/// `output_axes` vector literal `[.i, .k]` (each element is one result axis).
+/// `None` when the axis list isn't a literal vector (rank not statically known).
+fn output_axis_rank(inf: &Inferencer<'_, '_>, node: NodeId) -> Option<usize> {
+    if let Node::Call(c) = inf.module.node(node)
+        && matches!(c.head, flatppl_core::CallHead::Builtin(op)
+            if inf.module.resolve(op) == "vector")
+    {
+        return Some(c.args.len());
+    }
+    None
 }
 
 /// The dims of an `iid` count argument: a vector literal contributes one dim

@@ -651,3 +651,30 @@ fn qr_infers_a_record_of_matrices() {
         "qr should infer record(Q: matrix, R: matrix), got:\n{out}"
     );
 }
+
+/// `aggregate(f, output_axes, expr)` / `metricsum` (spec §04) are einsum-style
+/// reductions: the result rank is the number of output axes, the element kind
+/// comes from the reduced expr, and empty output axes give a scalar.
+#[test]
+fn aggregate_rank_from_output_axes() {
+    // Two output axes → rank-2 real array (matrix product).
+    let out = ir("A = [[1.0, 2.0], [3.0, 4.0]]\n\
+                  B = [[5.0, 6.0], [7.0, 8.0]]\n\
+                  C = aggregate(sum, [.i, .k], A[.i, .j] * B[.j, .k])");
+    assert!(
+        out.contains("(%array 2 (%dynamic %dynamic) (%scalar real))") && out.contains("(aggregate"),
+        "aggregate over 2 axes should be a rank-2 real array, got:\n{out}"
+    );
+    // Empty output axes → scalar (full contraction).
+    let out = ir("A = [1.0, 2.0]\nB = [3.0, 4.0]\ns = aggregate(sum, [], A[.i] * B[.i])");
+    assert!(
+        out.contains("(%meta ((%scalar real) %fixed reals) (aggregate"),
+        "aggregate over no axes should be a real scalar, got:\n{out}"
+    );
+    // One output axis → rank-1; metricsum shares the rule.
+    let out = ir("A = [[1.0, 2.0], [3.0, 4.0]]\nV = aggregate(var, [.j], A[.i, .j])");
+    assert!(
+        out.contains("(%array 1 (%dynamic) (%scalar real))") && out.contains("(aggregate"),
+        "aggregate over 1 axis should be a rank-1 real array, got:\n{out}"
+    );
+}
