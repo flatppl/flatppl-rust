@@ -120,9 +120,12 @@ pub struct SpanIndex {
     spans: Vec<(u32, u32, NodeId)>,
 }
 
-/// Test-only execution counter for `node_span_index` (proves salsa memoizes it).
+// Test-only execution counter for `node_span_index` (proves salsa memoizes it).
+// Thread-local so concurrent tests do not interfere with each other's measurements.
 #[cfg(test)]
-pub static SPAN_INDEX_RUNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    pub static SPAN_INDEX_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// Build the offset→node span index for the analyzed module, once per revision.
 #[salsa::tracked]
@@ -133,7 +136,7 @@ pub fn node_span_index(
     cats: Catalogues,
 ) -> SpanIndex {
     #[cfg(test)]
-    SPAN_INDEX_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    SPAN_INDEX_RUNS.with(|c| c.set(c.get() + 1));
     let analyzed = analyze(db, file, fs, cats);
     let mut spans: Vec<(u32, u32, NodeId)> = Vec::new();
     if let Some(module) = analyzed.module(db) {
@@ -1100,15 +1103,14 @@ mod tests {
 
     #[test]
     fn span_index_memoized_per_revision() {
-        use std::sync::atomic::Ordering::Relaxed;
         let db = Database::default();
         let f = SourceFile::new(&db, "m.flatppl".to_string(), "x = 1".to_string());
         let fs = FileSet::new(&db, Vec::new());
         let cats = Catalogues::new(&db, Vec::new());
-        SPAN_INDEX_RUNS.store(0, Relaxed);
+        SPAN_INDEX_RUNS.with(|c| c.set(0));
         let _ = node_span_index(&db, f, fs, cats);
         let _ = node_span_index(&db, f, fs, cats);
-        assert_eq!(SPAN_INDEX_RUNS.load(Relaxed), 1);
+        assert_eq!(SPAN_INDEX_RUNS.with(|c| c.get()), 1);
     }
 
     // ── 3b: catalogue single-parse test ──────────────────────────────────────
@@ -1120,9 +1122,19 @@ mod tests {
         let fs = FileSet::new(&db, Vec::new());
         let cats = Catalogues::new(&db, vec!["(((".to_string()]);
         PARSED_CATALOGUES_RUNS.with(|c| c.set(0));
-        let _ = analyze(&db, f, fs, cats);
+        let analyzed = analyze(&db, f, fs, cats);
         // analyze must obtain catalogues + their errors solely via the memoized
         // query — exactly one parse pass.
         assert_eq!(PARSED_CATALOGUES_RUNS.with(|c| c.get()), 1);
+        // Errors from the invalid catalogue source must surface in analyze's
+        // diagnostics — proving they travel through the memoized query's
+        // carried errors, not a re-parse loop in analyze.
+        assert!(
+            analyzed
+                .diagnostics(&db)
+                .iter()
+                .any(|d| d.message.contains("catalogue parse error")),
+            "catalogue parse errors must reach analyze diagnostics via the memoized query"
+        );
     }
 }
