@@ -452,3 +452,19 @@ fn lxor_infers_boolean() {
         "lxor should infer a boolean scalar, got:\n{out}"
     );
 }
+
+/// `linsolve(A, b)` → x with b's type; `polynomial`/`bernstein` evaluated at a
+/// scalar x → real scalar (shaped like the eval point, spec §07).
+#[test]
+fn linsolve_and_basis_evals_infer() {
+    let out = ir("A = [[1.0, 0.0], [0.0, 1.0]]\nb = [1.0, 2.0]\nx = linsolve(A, b)");
+    assert!(
+        out.contains("(%array 1 (2) (%scalar real))") && out.contains("(linsolve"),
+        "linsolve should infer b's vector type, got:\n{out}"
+    );
+    let out = ir("c = [1.0, 2.0, 3.0]\nx = polynomial(c, 0.5)");
+    assert!(
+        out.contains("(%meta ((%scalar real) %fixed reals) (polynomial"),
+        "polynomial at scalar x should infer a real scalar, got:\n{out}"
+    );
+}

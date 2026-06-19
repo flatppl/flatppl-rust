@@ -186,6 +186,13 @@ Catalogue(
         // swap; a vector's transpose stays a rank-1 transposed vector, spec §07).
         Builtin(name: "transpose",      sig: Function(params: [Any], result: TransposeOf(0))),
         Builtin(name: "adjoint",        sig: Function(params: [Any], result: TransposeOf(0))),
+        // linsolve(A, b): solve Ax = b → x has the same shape/type as b.
+        Builtin(name: "linsolve",       sig: Function(params: [Matrix, Vector(Real)], result: SameAsArg(1))),
+        // Polynomial / basis evaluations at x → real-valued, shaped like x
+        // (scalar x → scalar, array x → array).
+        Builtin(name: "polynomial",     sig: Function(params: [Vector(Real), Any], result: RealOfArgShape(1))),
+        Builtin(name: "bernstein",      sig: Function(params: [Vector(Real), Any], result: RealOfArgShape(1))),
+        Builtin(name: "stepwise",       sig: Function(params: [Vector(Real), Vector(Real), Any], result: RealOfArgShape(2))),
 
         // -- scalar-complex output --
         // cis(theta) = exp(i*theta); complex(re, im) = re + i*im (spec §07).
