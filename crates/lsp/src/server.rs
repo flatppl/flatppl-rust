@@ -9,14 +9,16 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::str::FromStr;
+use std::time::{Duration, Instant};
 
+use crossbeam_channel::select;
 use lsp_server::{Connection, Message, Response};
 use lsp_types::{
     CompletionOptions, HoverProviderCapability, OneOf, PublishDiagnosticsParams,
     ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind, Uri,
     notification::{
-        DidChangeTextDocument, DidChangeWatchedFiles, DidOpenTextDocument, Notification as _,
-        PublishDiagnostics,
+        DidChangeTextDocument, DidChangeWatchedFiles, DidCloseTextDocument, DidOpenTextDocument,
+        Notification as _, PublishDiagnostics,
     },
     request::{
         Completion, DocumentSymbolRequest, GotoDefinition, HoverRequest, InlayHintRequest,
@@ -26,7 +28,7 @@ use lsp_types::{
 
 use crate::db::{Catalogues, Database, FileSet, SourceFile};
 use crate::line_index::Pos;
-use crate::queries::{import_bundle, line_index};
+use crate::queries::{import_bundle, line_index, node_span_index};
 
 // ── run ─────────────────────────────────────────────────────────────────────
 
@@ -91,14 +93,72 @@ pub fn run(
     // unsaved editor edits.
     let mut editor_open_uris: HashSet<String> = HashSet::new();
 
-    // Publish initial diagnostics for all workspace files.
+    // Last document version reported by the editor (didOpen / didChange).
+    // Used to (a) drop stale / out-of-order edits and (b) stamp the published
+    // diagnostics with the version they were computed against.
+    let mut doc_versions: HashMap<String, i32> = HashMap::new();
+
+    // Publish initial diagnostics for all workspace files. Startup is not part
+    // of an edit burst, so these go out immediately (no debounce).
     for (uri_str, &file) in &uri_to_file {
-        publish_diagnostics(&connection, &db, file, fs, cats, uri_str)?;
+        publish_diagnostics(&connection, &db, file, fs, cats, uri_str, None)?;
     }
 
-    // ── Main loop ────────────────────────────────────────────────────────────
+    // ── Concurrency + debounce machinery ─────────────────────────────────────
+    //
+    // Requests run off the main thread on a worker pool holding cloned salsa
+    // `Database` handles; worker responses come back on `result_rx`. Diagnostics
+    // are debounced: notification arms mark affected URIs `dirty` and arm a
+    // deadline; once the burst settles (`DEBOUNCE` of quiescence) we flush.
+    let (result_tx, result_rx) = crossbeam_channel::unbounded::<Message>();
+    let pool = crate::pool::Pool::new(
+        std::thread::available_parallelism()
+            .map(|n| n.get().min(4))
+            .unwrap_or(2),
+        result_tx.clone(),
+    );
+    const DEBOUNCE: Duration = Duration::from_millis(200);
+    let mut diag_deadline: Option<Instant> = None;
+    // URIs whose diagnostics need (re)publishing once the burst settles.
+    let mut dirty: HashSet<String> = HashSet::new();
 
-    for msg in &connection.receiver {
+    // ── Main loop ────────────────────────────────────────────────────────────
+    //
+    // `select!` over three sources: the client connection, the worker results
+    // channel, and (when armed) the debounce timeout. A `None` from the match
+    // means "handled internally, no client message to process this iteration".
+
+    loop {
+        let timeout = diag_deadline.map(|d| d.saturating_duration_since(Instant::now()));
+        let selected: Option<Result<Message, crossbeam_channel::RecvError>> = match timeout {
+            Some(t) => select! {
+                recv(connection.receiver) -> m => Some(m),
+                recv(result_rx) -> r => {
+                    if let Ok(msg) = r { connection.sender.send(msg)?; }
+                    None
+                }
+                default(t) => {
+                    // Debounce fired: publish the coalesced dirty set.
+                    flush_dirty(
+                        &connection, &db, fs, cats, &uri_to_file, &doc_versions, &mut dirty,
+                    )?;
+                    diag_deadline = None;
+                    None
+                }
+            },
+            None => select! {
+                recv(connection.receiver) -> m => Some(m),
+                recv(result_rx) -> r => {
+                    if let Ok(msg) = r { connection.sender.send(msg)?; }
+                    None
+                }
+            },
+        };
+        let Some(msg) = selected else { continue };
+        let msg = match msg {
+            Ok(m) => m,
+            Err(_) => break, // client connection closed
+        };
         match msg {
             Message::Notification(note) => {
                 match note.method.as_str() {
@@ -118,6 +178,7 @@ pub fn run(
                         // Mark as editor-managed so watched-file CHANGED events
                         // skip it (editor content takes precedence over on-disk).
                         editor_open_uris.insert(uri_str.clone());
+                        doc_versions.insert(uri_str.clone(), p.text_document.version);
                         upsert_file(&mut db, &mut uri_to_file, uri_str, text);
                         // Update the shared FileSet only when the file SET membership
                         // changes (a new open always adds a file, so this fires).
@@ -125,11 +186,12 @@ pub fn run(
                         // Re-publish diagnostics for ALL open docs: a newly-opened
                         // file can satisfy a previously-unresolved import in any
                         // already-open doc, so the full set must be refreshed.
-                        let open_files: Vec<(String, SourceFile)> =
-                            uri_to_file.iter().map(|(u, &f)| (u.clone(), f)).collect();
-                        for (doc_uri_str, file) in open_files {
-                            publish_diagnostics(&connection, &db, file, fs, cats, &doc_uri_str)?;
+                        // Mark them dirty and arm the debounce instead of
+                        // publishing inline.
+                        for doc_uri_str in uri_to_file.keys() {
+                            dirty.insert(doc_uri_str.clone());
                         }
+                        diag_deadline = Some(Instant::now() + DEBOUNCE);
                     }
                     DidChangeTextDocument::METHOD => {
                         let p: lsp_types::DidChangeTextDocumentParams =
@@ -143,6 +205,17 @@ pub fn run(
                                 }
                             };
                         let uri_str = p.text_document.uri.as_str().to_owned();
+                        // Drop stale / out-of-order edits: an editor may deliver a
+                        // didChange whose version predates one we already applied
+                        // (network reordering, replayed buffers). Applying it would
+                        // resurrect older text; ignore it entirely.
+                        let new_version = p.text_document.version;
+                        if let Some(&prev) = doc_versions.get(&uri_str) {
+                            if new_version < prev {
+                                continue;
+                            }
+                        }
+                        doc_versions.insert(uri_str.clone(), new_version);
                         // Full sync — take last content change.
                         if let Some(change) = p.content_changes.into_iter().last() {
                             upsert_file(&mut db, &mut uri_to_file, uri_str.clone(), change.text);
@@ -152,21 +225,34 @@ pub fn run(
                         sync_file_set(&mut db, fs, &uri_to_file);
                         // Republish diagnostics only for the changed doc and the
                         // open docs that (transitively) import it — the only docs
-                        // whose diagnostics can change on this edit.
+                        // whose diagnostics can change on this edit. Mark them
+                        // dirty and (re)arm the debounce; a rapid edit burst thus
+                        // coalesces into a single publish per affected doc.
                         if let Some(&changed) = uri_to_file.get(&uri_str) {
-                            for (doc_uri_str, file) in
+                            for (doc_uri_str, _file) in
                                 affected_files(&db, fs, &uri_to_file, changed)
                             {
-                                publish_diagnostics(
-                                    &connection,
-                                    &db,
-                                    file,
-                                    fs,
-                                    cats,
-                                    &doc_uri_str,
-                                )?;
+                                dirty.insert(doc_uri_str);
                             }
+                            diag_deadline = Some(Instant::now() + DEBOUNCE);
                         }
+                    }
+                    DidCloseTextDocument::METHOD => {
+                        // The editor closed its buffer for this file. Drop it from
+                        // the editor-managed set and forget its version so on-disk
+                        // `didChangeWatchedFiles` events take over again (the file
+                        // is no longer authoritatively owned by the editor).
+                        let p: lsp_types::DidCloseTextDocumentParams =
+                            match serde_json::from_value(note.params) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    eprintln!("flatppl-lsp: malformed didClose, skipping: {e}");
+                                    continue;
+                                }
+                            };
+                        let uri_str = p.text_document.uri.as_str().to_owned();
+                        editor_open_uris.remove(&uri_str);
+                        doc_versions.remove(&uri_str);
                     }
                     DidChangeWatchedFiles::METHOD => {
                         // Clients (e.g. VS Code) register their own glob watchers and
@@ -219,12 +305,12 @@ pub fn run(
                         }
                         sync_file_set(&mut db, fs, &uri_to_file);
                         // Republish diagnostics for all tracked docs: a watched-file
-                        // change can affect any open importer.
-                        let open_files: Vec<(String, SourceFile)> =
-                            uri_to_file.iter().map(|(u, &f)| (u.clone(), f)).collect();
-                        for (doc_uri_str, file) in open_files {
-                            publish_diagnostics(&connection, &db, file, fs, cats, &doc_uri_str)?;
+                        // change can affect any open importer. Mark them dirty and
+                        // arm the debounce.
+                        for doc_uri_str in uri_to_file.keys() {
+                            dirty.insert(doc_uri_str.clone());
                         }
+                        diag_deadline = Some(Instant::now() + DEBOUNCE);
                     }
                     _ => {} // ignore other notifications
                 }
@@ -234,42 +320,11 @@ pub fn run(
                 if connection.handle_shutdown(&req)? {
                     break;
                 }
-
-                match req.method.as_str() {
-                    HoverRequest::METHOD => {
-                        let hover_resp = handle_hover(&db, &uri_to_file, fs, cats, &req);
-                        connection.sender.send(Message::Response(hover_resp))?;
-                    }
-                    DocumentSymbolRequest::METHOD => {
-                        let sym_resp = handle_document_symbols(&db, &uri_to_file, &req);
-                        connection.sender.send(Message::Response(sym_resp))?;
-                    }
-                    WorkspaceSymbolRequest::METHOD => {
-                        let sym_resp = handle_workspace_symbols(&db, fs, &req);
-                        connection.sender.send(Message::Response(sym_resp))?;
-                    }
-                    InlayHintRequest::METHOD => {
-                        let hints_resp = handle_inlay_hints(&db, &uri_to_file, fs, cats, &req);
-                        connection.sender.send(Message::Response(hints_resp))?;
-                    }
-                    GotoDefinition::METHOD => {
-                        let def_resp = handle_goto_definition(&db, &uri_to_file, fs, cats, &req);
-                        connection.sender.send(Message::Response(def_resp))?;
-                    }
-                    Completion::METHOD => {
-                        let comp_resp = handle_completion(&db, &uri_to_file, fs, cats, &req);
-                        connection.sender.send(Message::Response(comp_resp))?;
-                    }
-                    _ => {
-                        // Unknown request: reply with MethodNotFound.
-                        let resp = Response::new_err(
-                            req.id.clone(),
-                            lsp_server::ErrorCode::MethodNotFound as i32,
-                            format!("unsupported method: {}", req.method),
-                        );
-                        connection.sender.send(Message::Response(resp))?;
-                    }
-                }
+                // Dispatch the request to a worker thread on the pool. The
+                // worker snapshots a salsa handle on the main thread (so a later
+                // edit's `cancel_others` waits for it) and replies on
+                // `result_tx`; cancelled jobs drop silently.
+                dispatch_request(&pool, &result_tx, &db, &uri_to_file, fs, cats, req);
             }
             Message::Response(_) => {} // ignore server-originated response echoes
         }
@@ -278,11 +333,120 @@ pub fn run(
     Ok(())
 }
 
+// ── Off-main-thread request dispatch ─────────────────────────────────────────
+
+/// Snapshot the salsa database + file map on the **main thread** and hand a
+/// request job to the worker pool.
+///
+/// The `Database::clone` MUST happen here, on the main thread, before the job
+/// is enqueued: salsa's `Storage::clone` bumps the live-clone count, and a later
+/// input write (`set_text` on an edit) calls `cancel_others`, which sets the
+/// cancellation flag and blocks until every outstanding clone drops. Cloning on
+/// the worker would race that wait. The clone drops when the job returns,
+/// releasing the handle so a pending write can proceed.
+///
+/// On the worker the query body runs under `salsa::Cancelled::catch`: if a
+/// concurrent write cancels this revision the body unwinds with
+/// `salsa::Cancelled` and we reply nothing (the client re-requests against the
+/// new state; a stale reply computed against pre-edit text would be wrong).
+fn dispatch_request(
+    pool: &crate::pool::Pool,
+    result_tx: &crossbeam_channel::Sender<Message>,
+    db: &Database,
+    uri_to_file: &HashMap<String, SourceFile>,
+    fs: FileSet,
+    cats: Catalogues,
+    req: lsp_server::Request,
+) {
+    let db: Database = db.clone();
+    let files: HashMap<String, SourceFile> = uri_to_file.clone();
+    let result_tx = result_tx.clone();
+    pool.spawn(move || {
+        // `AssertUnwindSafe`: `&Database`/`&Request` are not auto-`UnwindSafe`,
+        // but this is sound — on cancel we discard all captured state and reply
+        // nothing, so no observer sees a half-updated value.
+        let outcome = salsa::Cancelled::catch(std::panic::AssertUnwindSafe(|| {
+            handle_request_on_worker(&db, &files, fs, cats, &req)
+        }));
+        match outcome {
+            Ok(resp) => {
+                let _ = result_tx.send(Message::Response(resp));
+            }
+            // Cancelled by a newer revision: drop silently, send no response.
+            Err(_cancelled) => {}
+        }
+        // `db` (the clone) drops here, releasing the salsa handle.
+    });
+}
+
+/// Run a single LSP request to a `Response` on a worker thread.
+///
+/// Dispatches over `req.method` to the existing capability handlers. An unknown
+/// method yields a `MethodNotFound` error response. This runs inside
+/// `salsa::Cancelled::catch`, so any salsa query it touches may unwind with
+/// `salsa::Cancelled` when a concurrent edit invalidates the revision.
+fn handle_request_on_worker(
+    db: &Database,
+    uri_to_file: &HashMap<String, SourceFile>,
+    fs: FileSet,
+    cats: Catalogues,
+    req: &lsp_server::Request,
+) -> Response {
+    match req.method.as_str() {
+        HoverRequest::METHOD => handle_hover(db, uri_to_file, fs, cats, req),
+        DocumentSymbolRequest::METHOD => handle_document_symbols(db, uri_to_file, req),
+        WorkspaceSymbolRequest::METHOD => handle_workspace_symbols(db, fs, req),
+        InlayHintRequest::METHOD => handle_inlay_hints(db, uri_to_file, fs, cats, req),
+        GotoDefinition::METHOD => handle_goto_definition(db, uri_to_file, fs, cats, req),
+        Completion::METHOD => handle_completion(db, uri_to_file, fs, cats, req),
+        _ => Response::new_err(
+            req.id.clone(),
+            lsp_server::ErrorCode::MethodNotFound as i32,
+            format!("unsupported method: {}", req.method),
+        ),
+    }
+}
+
+/// Publish diagnostics for every URI accumulated in `dirty`, draining the set.
+///
+/// Diagnostics are published synchronously on the main thread: they are cheap
+/// relative to a full edit burst and publishing here keeps ordering simple
+/// (no interleaving with worker responses mid-flush). URIs no longer tracked
+/// (e.g. a file deleted between dirtying and flush) are skipped.
+fn flush_dirty(
+    connection: &Connection,
+    db: &Database,
+    fs: FileSet,
+    cats: Catalogues,
+    uri_to_file: &HashMap<String, SourceFile>,
+    doc_versions: &HashMap<String, i32>,
+    dirty: &mut HashSet<String>,
+) -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
+    for uri_str in dirty.drain() {
+        if let Some(&file) = uri_to_file.get(&uri_str) {
+            publish_diagnostics(
+                connection,
+                db,
+                file,
+                fs,
+                cats,
+                &uri_str,
+                doc_versions.get(&uri_str).copied(),
+            )?;
+        }
+    }
+    Ok(())
+}
+
 // ── Capability advertisement ─────────────────────────────────────────────────
 
 /// Build the `ServerCapabilities` value we advertise during `initialize`.
 pub fn server_capabilities() -> ServerCapabilities {
     ServerCapabilities {
+        // We index positions in UTF-16 code units (the LSP default and what our
+        // LineIndex computes), so advertise it explicitly rather than relying on
+        // the client's assumed default.
+        position_encoding: Some(lsp_types::PositionEncodingKind::UTF16),
         hover_provider: Some(HoverProviderCapability::Simple(true)),
         text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
         document_symbol_provider: Some(OneOf::Left(true)),
@@ -321,6 +485,22 @@ fn file_uri_to_path(uri_str: &str) -> Option<String> {
     // authority is always empty so `path` is now the absolute path (possibly
     // percent-encoded).
     Some(percent_decode(path))
+}
+
+/// Percent-encode a filesystem path into a `file://` URI body (encodes spaces
+/// and other reserved bytes; leaves `/` and unreserved chars). Symmetric with
+/// `file_uri_to_path`'s decode.
+pub(crate) fn path_to_file_uri(path: &str) -> String {
+    let mut out = String::from("file://");
+    for b in path.bytes() {
+        match b {
+            b'/' | b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 /// Percent-decode a URI path component (`%XX` → byte, then UTF-8).
@@ -363,7 +543,7 @@ fn scan_dir(dir: &Path, db: &mut Database, uri_to_file: &mut HashMap<String, Sou
                 continue;
             };
             let path_str = path.to_string_lossy().into_owned();
-            let uri_str = format!("file://{path_str}");
+            let uri_str = path_to_file_uri(&path_str);
             let file = SourceFile::new(db, path_str, text);
             uri_to_file.insert(uri_str, file);
         }
@@ -465,13 +645,14 @@ fn publish_diagnostics(
     fs: FileSet,
     cats: Catalogues,
     uri_str: &str,
+    version: Option<i32>,
 ) -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
     let diagnostics = crate::capabilities::diagnostics(db, file, fs, cats);
     let uri = Uri::from_str(uri_str)?;
     let params = PublishDiagnosticsParams {
         uri,
         diagnostics,
-        version: None,
+        version,
     };
     let note = lsp_server::Notification::new(PublishDiagnostics::METHOD.to_owned(), params);
     connection.sender.send(Message::Notification(note))?;
@@ -502,7 +683,8 @@ fn handle_hover(
             line: lsp_pos.line,
             character: lsp_pos.character,
         });
-        let markdown = crate::capabilities::hover(db, file, fs, cats, byte_offset)?;
+        let index = node_span_index(db, file, fs, cats);
+        let markdown = crate::capabilities::hover(db, file, fs, cats, byte_offset, &index)?;
         Some(lsp_types::Hover {
             contents: lsp_types::HoverContents::Markup(lsp_types::MarkupContent {
                 kind: lsp_types::MarkupKind::Markdown,
@@ -609,12 +791,14 @@ fn handle_goto_definition(
             line: lsp_pos.line,
             character: lsp_pos.character,
         });
-        let def_loc = crate::capabilities::goto_definition(db, file, fs, cats, byte_offset)?;
+        let index = node_span_index(db, file, fs, cats);
+        let def_loc =
+            crate::capabilities::goto_definition(db, file, fs, cats, byte_offset, &index)?;
         // Build the target URI from the DefLoc path.
         let target_uri_str = if def_loc.path.starts_with("file://") {
             def_loc.path.clone()
         } else {
-            format!("file://{}", def_loc.path)
+            path_to_file_uri(&def_loc.path)
         };
         let target_uri = Uri::from_str(&target_uri_str).ok()?;
         // Build the target range: find the dep SourceFile and use its cached

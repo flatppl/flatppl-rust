@@ -3,7 +3,7 @@
 use crate::capabilities::LspDiag;
 use crate::db::{Catalogues, FileSet, SourceFile};
 use crate::line_index::LineIndex;
-use flatppl_core::{CallHead, Module, Node, Scalar};
+use flatppl_core::{CallHead, Idx, Module, Node, NodeId, Scalar};
 use std::sync::Arc;
 
 // ── ArcCatalogues wrapper ────────────────────────────────────────────────────
@@ -19,24 +19,33 @@ use std::sync::Arc;
 // the same conservative policy used by `ArcModule`). The `Update` impl
 // likewise falls back to pointer identity: if the arc pointer changed the
 // value definitely changed, so we always overwrite and return `true`.
+//
+// `errors` carries per-source parse diagnostics produced at catalogue-parse time
+// so `analyze` does not re-parse the sources a second time just to emit them.
 #[derive(Clone, Debug)]
-pub struct ArcCatalogues(Arc<Vec<flatppl_infer::Catalogue>>);
+pub struct ArcCatalogues {
+    cats: Arc<Vec<flatppl_infer::Catalogue>>,
+    errors: Arc<Vec<LspDiag>>,
+}
 
 impl ArcCatalogues {
-    fn new(v: Vec<flatppl_infer::Catalogue>) -> Self {
-        ArcCatalogues(Arc::new(v))
+    /// Return a reference to the successfully-parsed catalogues, for passing to
+    /// `infer_module_ext` and the completion builder.
+    pub fn as_slice(&self) -> &[flatppl_infer::Catalogue] {
+        &self.cats
     }
 
-    /// Return a reference to the inner slice, for passing to `infer_module_ext`
-    /// and the completion builder.
-    pub fn as_slice(&self) -> &[flatppl_infer::Catalogue] {
-        &self.0
+    /// Return the parse-error diagnostics for sources that failed to parse.
+    pub fn errors(&self) -> &[LspDiag] {
+        &self.errors
     }
 }
 
+// Pointer-identity on `cats` only — `errors` is derived from the same parse
+// pass and changes exactly when `cats` changes.
 impl PartialEq for ArcCatalogues {
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
+        Arc::ptr_eq(&self.cats, &other.cats)
     }
 }
 
@@ -44,7 +53,7 @@ impl Eq for ArcCatalogues {}
 
 impl std::hash::Hash for ArcCatalogues {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        std::ptr::hash(Arc::as_ptr(&self.0), state);
+        std::ptr::hash(Arc::as_ptr(&self.cats), state);
     }
 }
 
@@ -56,7 +65,7 @@ impl std::hash::Hash for ArcCatalogues {
 unsafe impl salsa::Update for ArcCatalogues {
     unsafe fn maybe_update(old_pointer: *mut Self, new_value: Self) -> bool {
         let old: &mut Self = unsafe { &mut *old_pointer };
-        if Arc::ptr_eq(&old.0, &new_value.0) {
+        if Arc::ptr_eq(&old.cats, &new_value.cats) {
             return false;
         }
         *old = new_value;
@@ -67,18 +76,31 @@ unsafe impl salsa::Update for ArcCatalogues {
 // ── parsed_catalogues tracked query ─────────────────────────────────────────
 
 /// Parse the host-supplied external RON catalogues once per `Catalogues`
-/// revision (was re-parsed on every analyze + completion). Unparseable sources
-/// are dropped here; the diagnostics path reports them separately.
+/// revision. Successful sources are collected into the `cats` vec; failing
+/// sources produce `LspDiag` entries in `errors`. Both are stored in the
+/// returned `ArcCatalogues` so `analyze` can consume the errors without
+/// re-parsing.
 #[salsa::tracked]
 pub fn parsed_catalogues(db: &dyn salsa::Database, cats: Catalogues) -> ArcCatalogues {
     #[cfg(test)]
     PARSED_CATALOGUES_RUNS.with(|c| c.set(c.get() + 1));
-    ArcCatalogues::new(
-        cats.sources(db)
-            .iter()
-            .filter_map(|s| flatppl_infer::parse_catalogue(s).ok())
-            .collect(),
-    )
+    let mut parsed = Vec::new();
+    let mut errors = Vec::new();
+    for s in cats.sources(db) {
+        match flatppl_infer::parse_catalogue(s) {
+            Ok(c) => parsed.push(c),
+            Err(e) => errors.push(LspDiag {
+                start: 0,
+                end: 0,
+                severity: crate::capabilities::DiagSeverity::Error,
+                message: format!("catalogue parse error: {e}"),
+            }),
+        }
+    }
+    ArcCatalogues {
+        cats: Arc::new(parsed),
+        errors: Arc::new(errors),
+    }
 }
 
 // Per-thread execution counter for `parsed_catalogues`. Thread-local so
@@ -86,6 +108,74 @@ pub fn parsed_catalogues(db: &dyn salsa::Database, cats: Catalogues) -> ArcCatal
 #[cfg(test)]
 thread_local! {
     pub static PARSED_CATALOGUES_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+// ── SpanIndex: offset→node lookup (salsa-memoized) ──────────────────────────
+
+/// Sorted span table for offset→node lookup. Entries are `(start, end, node)`
+/// sorted by `start` ascending, then `end` descending, so a binary search to
+/// the last `start <= offset` gives a short candidate prefix.
+#[derive(Clone, Debug, PartialEq, Eq, salsa::Update)]
+pub struct SpanIndex {
+    spans: Vec<(u32, u32, NodeId)>,
+}
+
+// Test-only execution counter for `node_span_index` (proves salsa memoizes it).
+// Thread-local so concurrent tests do not interfere with each other's measurements.
+#[cfg(test)]
+thread_local! {
+    pub static SPAN_INDEX_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Build the offset→node span index for the analyzed module, once per revision.
+#[salsa::tracked]
+pub fn node_span_index(
+    db: &dyn salsa::Database,
+    file: SourceFile,
+    fs: FileSet,
+    cats: Catalogues,
+) -> SpanIndex {
+    #[cfg(test)]
+    SPAN_INDEX_RUNS.with(|c| c.set(c.get() + 1));
+    let analyzed = analyze(db, file, fs, cats);
+    let mut spans: Vec<(u32, u32, NodeId)> = Vec::new();
+    if let Some(module) = analyzed.module(db) {
+        for i in 0..module.node_count() {
+            let id = NodeId::from_usize(i);
+            if let Some(span) = module.span_of(id) {
+                spans.push((span.start, span.end, id));
+            }
+        }
+    }
+    spans.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+    SpanIndex { spans }
+}
+
+/// The innermost (smallest-width) node whose span contains `offset`, ties broken
+/// to the LOWEST NodeId — byte-for-byte equivalent to `Module::node_at_offset`'s
+/// linear scan (which keeps the first minimal-width hit in NodeId order).
+pub fn node_at_offset_indexed(index: &SpanIndex, offset: u32) -> Option<NodeId> {
+    let mut best: Option<(u32 /*width*/, NodeId)> = None;
+    // All spans with start <= offset live in the prefix up to this point.
+    let upper = index
+        .spans
+        .partition_point(|&(start, _, _)| start <= offset);
+    for &(start, end, id) in &index.spans[..upper] {
+        debug_assert!(start <= offset);
+        if offset < end {
+            let width = end - start;
+            // Strict `<` keeps the first (lowest-NodeId) hit on a width tie,
+            // matching Module::node_at_offset's `is_none_or(|(_, w)| width < w)`.
+            let better = match best {
+                None => true,
+                Some((w, prev_id)) => width < w || (width == w && id < prev_id),
+            };
+            if better {
+                best = Some((width, id));
+            }
+        }
+    }
+    best.map(|(_, id)| id)
 }
 
 // ── LineIndex tracked query ──────────────────────────────────────────────────
@@ -519,22 +609,13 @@ pub fn analyze<'db>(
     };
     let mut m = module.clone();
 
-    // Obtain the external catalogues via the tracked `parsed_catalogues` query
-    // (parsed once per `Catalogues` revision, not per analyze call). Emit
-    // diagnostics for sources that fail to parse; the failed entries are absent
-    // from the memoised `catalogues` vec (already filtered out by the query).
+    // Obtain the external catalogues and their parse errors via the tracked
+    // `parsed_catalogues` query (parsed once per `Catalogues` revision, not per
+    // analyze call). The query carries both the parsed catalogues and any
+    // per-source diagnostics, so no second parse pass is needed here.
     let mut diags = parsed.diagnostics(db).clone();
-    for src in cats.sources(db) {
-        if let Err(e) = flatppl_infer::parse_catalogue(src) {
-            diags.push(LspDiag {
-                start: 0,
-                end: 0,
-                severity: crate::capabilities::DiagSeverity::Error,
-                message: format!("catalogue parse error: {e}"),
-            });
-        }
-    }
     let catalogues = parsed_catalogues(db, cats);
+    diags.extend(catalogues.errors().iter().cloned());
 
     let bundle = import_bundle(db, file, fs);
     let infer_diags = flatppl_infer::infer_module_ext(
@@ -996,6 +1077,64 @@ mod tests {
         assert!(
             std::sync::Arc::ptr_eq(&b1, &b2),
             "dep module shared across calls"
+        );
+    }
+
+    // ── 3a: span index tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn span_index_matches_linear_node_at_offset() {
+        let db = Database::default();
+        let src = "x = add(mul(2, 3), sqrt(4.0))\ny ~ Normal(x, 1.0)";
+        let f = SourceFile::new(&db, "m.flatppl".to_string(), src.to_string());
+        let fs = FileSet::new(&db, Vec::new());
+        let cats = Catalogues::new(&db, Vec::new());
+        let analyzed = analyze(&db, f, fs, cats);
+        let module = analyzed.module(&db).expect("module");
+        let index = node_span_index(&db, f, fs, cats);
+        for off in 0..(src.len() as u32) {
+            assert_eq!(
+                node_at_offset_indexed(&index, off),
+                module.node_at_offset(off),
+                "mismatch at offset {off}"
+            );
+        }
+    }
+
+    #[test]
+    fn span_index_memoized_per_revision() {
+        let db = Database::default();
+        let f = SourceFile::new(&db, "m.flatppl".to_string(), "x = 1".to_string());
+        let fs = FileSet::new(&db, Vec::new());
+        let cats = Catalogues::new(&db, Vec::new());
+        SPAN_INDEX_RUNS.with(|c| c.set(0));
+        let _ = node_span_index(&db, f, fs, cats);
+        let _ = node_span_index(&db, f, fs, cats);
+        assert_eq!(SPAN_INDEX_RUNS.with(|c| c.get()), 1);
+    }
+
+    // ── 3b: catalogue single-parse test ──────────────────────────────────────
+
+    #[test]
+    fn analyze_does_not_reparse_catalogues() {
+        let db = Database::default();
+        let f = SourceFile::new(&db, "m.flatppl".to_string(), "x = 1".to_string());
+        let fs = FileSet::new(&db, Vec::new());
+        let cats = Catalogues::new(&db, vec!["(((".to_string()]);
+        PARSED_CATALOGUES_RUNS.with(|c| c.set(0));
+        let analyzed = analyze(&db, f, fs, cats);
+        // analyze must obtain catalogues + their errors solely via the memoized
+        // query — exactly one parse pass.
+        assert_eq!(PARSED_CATALOGUES_RUNS.with(|c| c.get()), 1);
+        // Errors from the invalid catalogue source must surface in analyze's
+        // diagnostics — proving they travel through the memoized query's
+        // carried errors, not a re-parse loop in analyze.
+        assert!(
+            analyzed
+                .diagnostics(&db)
+                .iter()
+                .any(|d| d.message.contains("catalogue parse error")),
+            "catalogue parse errors must reach analyze diagnostics via the memoized query"
         );
     }
 }

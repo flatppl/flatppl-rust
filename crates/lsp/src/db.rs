@@ -65,4 +65,14 @@ mod tests {
         let f = SourceFile::new(&db, "a.flatppl".to_string(), "x = 1".to_string());
         assert_eq!(f.text(&db), "x = 1");
     }
+
+    /// VERIFY-FIRST gate for the off-main-thread request worker pool: a cloned
+    /// `Database` handle must be `Send + 'static` to move onto a worker thread.
+    /// salsa `Storage::clone` shares the `Arc<Zalsa>` memo, so this should hold.
+    /// If this fails to compile the worker-pool design is blocked.
+    #[test]
+    fn database_is_send() {
+        fn assert_send<T: Send + 'static>() {}
+        assert_send::<Database>();
+    }
 }
