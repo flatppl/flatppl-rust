@@ -511,3 +511,25 @@ fn fill_and_array_element_kind_and_shape() {
         "array(d, [2,2]) should be a 2x2 real matrix, got:\n{out}"
     );
 }
+
+/// `cat` of scalars → a rank-1 vector of that kind; `tile` preserves the
+/// argument's rank and element kind (only sizes become dynamic).
+#[test]
+fn cat_and_tile_preserve_kind_and_rank() {
+    let out = ir("x = cat(1.0, 2.0, 3.0)");
+    assert!(
+        out.contains("(%array 1 (%dynamic) (%scalar real))") && out.contains("(cat"),
+        "cat(scalars) should be a rank-1 real vector, got:\n{out}"
+    );
+    let out = ir("a = [1.0, 2.0]\nx = tile(a, 3)");
+    assert!(
+        out.contains("(%array 1 (%dynamic) (%scalar real))") && out.contains("(tile"),
+        "tile(vector) should stay a rank-1 real vector, got:\n{out}"
+    );
+    let out = ir("A = [[1.0, 2.0], [3.0, 4.0]]\nx = tile(A, [2, 2])");
+    assert!(
+        out.contains("(%array 1 (%dynamic) (%array 1 (%dynamic) (%scalar real)))")
+            && out.contains("(tile"),
+        "tile(matrix) should stay a rank-2 (nested) real matrix, got:\n{out}"
+    );
+}

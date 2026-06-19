@@ -155,6 +155,19 @@ pub(crate) fn call_rule(
                     .unwrap_or(ScalarType::Real),
             )),
         },
+        // tile(A, size) keeps A's rank and element kind; only the sizes change.
+        "tile" => arg_ty(args, 0).map_or(Type::Deferred, with_dynamic_dims),
+        // cat(x, y, …) concatenates values of the same structural kind: scalars
+        // → a rank-1 vector of that kind; arrays → the same rank/element as the
+        // first argument (one axis grows, so sizes are dynamic).
+        "cat" => match arg_ty(args, 0) {
+            Some(Type::Scalar(s)) => Type::Array {
+                shape: Box::new([Dim::Dynamic]),
+                elem: Box::new(Type::Scalar(*s)),
+            },
+            Some(t @ Type::Array { .. }) => with_dynamic_dims(t),
+            _ => Type::Deferred,
+        },
 
         // ---- parameters / inputs (spec §04) ----
         "elementof" | "external" => set_element_type(inf, args.first().map(|a| a.0)),
@@ -562,6 +575,19 @@ fn elem_scalar_kind_of(t: &Type) -> Option<ScalarType> {
         Type::Scalar(s) => Some(*s),
         Type::Array { elem, .. } => elem_scalar_kind_of(elem),
         _ => None,
+    }
+}
+
+/// `t` with every array dim (at every nesting level) replaced by `%dynamic`,
+/// preserving rank and element type. For ops that keep an argument's rank and
+/// element but change its sizes (`tile`, `cat`).
+fn with_dynamic_dims(t: &Type) -> Type {
+    match t {
+        Type::Array { shape, elem } => Type::Array {
+            shape: vec![Dim::Dynamic; shape.len()].into_boxed_slice(),
+            elem: Box::new(with_dynamic_dims(elem)),
+        },
+        other => other.clone(),
     }
 }
 
