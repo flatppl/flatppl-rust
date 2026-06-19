@@ -301,6 +301,22 @@ pub(crate) fn call_rule(
 
         // ---- parameters / inputs (spec §04) ----
         "elementof" | "external" => set_element_type(inf, args.first().map(|a| a.0)),
+        // `load_data(source, valueset)` (spec §07): a vector/table of the
+        // declared `valueset`'s element type. The row count is not statically
+        // known (spec §11 "a common source of dynamic row counts"), so the
+        // leading dim is `%dynamic`. `valueset` is the keyword or the second
+        // positional arg (after `source`). A scalar / cartpow / stdsimplex
+        // valueset gives a vector; a cartprod (table) valueset is left deferred.
+        "load_data" => {
+            let vs = named_or_positional_node(inf.module, named, args, "valueset", 1);
+            match set_element_type(inf, vs) {
+                Type::Deferred => Type::Deferred,
+                elem => Type::Array {
+                    shape: Box::new([Dim::Dynamic]),
+                    elem: Box::new(elem),
+                },
+            }
+        }
 
         // ---- measure algebra (spec §06) ----
         "lawof" => Type::Measure {
@@ -522,6 +538,23 @@ pub(crate) fn call_rule(
 
 fn arg_ty(args: &[ArgInfo], i: usize) -> Option<&Type> {
     args.get(i).map(|(_, t, _)| t)
+}
+
+/// The node supplied for a parameter that may be passed by keyword (`key = …`)
+/// or positionally (index `pos`). Keyword takes precedence. Used by callables
+/// whose args have both spellings (e.g. `load_data(source, valueset)`).
+fn named_or_positional_node(
+    module: &flatppl_core::Module,
+    named: &[NamedInfo],
+    args: &[ArgInfo],
+    key: &str,
+    pos: usize,
+) -> Option<NodeId> {
+    named
+        .iter()
+        .find(|(s, ..)| module.resolve(*s) == key)
+        .map(|(_, n, ..)| *n)
+        .or_else(|| args.get(pos).map(|(n, ..)| *n))
 }
 
 /// The scalar element kind of `t`, drilling through array nesting (an
@@ -1345,10 +1378,12 @@ fn user_call_type(
     // callable's parameters); fall back to the un-substituted body type for
     // cross-module callables and any case substitution can't bind.
     match callee_ty {
-        Type::Function { .. } => substituted_result_type(inf, callee, args, named)
+        Type::Function { .. } => substituted_result(inf, callee, args, named)
+            .map(|(ty, _)| ty)
             .or_else(|| reified_result_type(inf, callee))
             .unwrap_or(Type::Deferred),
-        Type::Kernel { mass, .. } => match substituted_result_type(inf, callee, args, named)
+        Type::Kernel { mass, .. } => match substituted_result(inf, callee, args, named)
+            .map(|(ty, _)| ty)
             .or_else(|| reified_result_type(inf, callee))
         {
             Some(Type::Measure { domain, .. }) => Type::Measure {
@@ -1488,14 +1523,17 @@ fn reified_result_type(inf: &mut Inferencer<'_, '_>, node: NodeId) -> Option<Typ
 /// `broadcast` — types as `any`. Substituting the call's arg types makes
 /// `f(1.0, 2.0, 3.0)` a `real` and `broadcast(f, x = real[5])` a `real[5]`.
 ///
-/// Returns `None` when `callee` is not a local reification, or no parameter could
-/// be bound to an argument (caller falls back to the un-substituted body type).
-fn substituted_result_type(
+/// Returns the substituted body's `(type, value-set)` — so a callable whose body
+/// tightens its range (`f(x) = sqrt(x)` → `nonnegreals`) carries that set to the
+/// call site too. `None` when `callee` is not a local reification, or no
+/// parameter could be bound to an argument (caller falls back to the
+/// un-substituted body).
+fn substituted_result(
     inf: &mut Inferencer<'_, '_>,
     callee: NodeId,
     args: &[ArgInfo],
     named: &[NamedInfo],
-) -> Option<Type> {
+) -> Option<(Type, ValueSet)> {
     let (reif_id, body) = local_reification(inf, callee)?;
     let inputs = input_entries(inf, reif_id)?;
 
@@ -1541,7 +1579,8 @@ fn substituted_result_type(
     let mut clone = inf.module.clone();
     let mut sub = Inferencer::new_seeded(&mut clone, inf.level, inf.session, &seeds);
     let (ty, _) = sub.infer_node(body);
-    Some(ty)
+    let vset = sub.lookup_valueset(body);
+    Some((ty, vset))
 }
 
 /// Deref a callee expression to its local reification: follow `self` refs to the
@@ -1660,7 +1699,8 @@ fn broadcast_type(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo], named: &[Named
                 .iter()
                 .map(|(s, n, t, p)| (*s, *n, cell_arg(t), *p))
                 .collect();
-            let cell = substituted_result_type(inf, head_node, &cell_args, &cell_named)
+            let cell = substituted_result(inf, head_node, &cell_args, &cell_named)
+                .map(|(ty, _)| ty)
                 .or_else(|| reified_result_type(inf, head_node))
                 .unwrap_or(Type::Deferred);
             return Type::Array {
@@ -1678,7 +1718,8 @@ fn broadcast_type(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo], named: &[Named
                 .iter()
                 .map(|(s, n, t, p)| (*s, *n, cell_arg(t), *p))
                 .collect();
-            let cell = match substituted_result_type(inf, head_node, &cell_args, &cell_named)
+            let cell = match substituted_result(inf, head_node, &cell_args, &cell_named)
+                .map(|(ty, _)| ty)
                 .or_else(|| reified_result_type(inf, head_node))
             {
                 Some(Type::Measure { domain, .. }) => *domain,
@@ -1960,6 +2001,16 @@ pub(crate) fn call_valueset(
         if inf.module_catalogue_ref(*callee_node).is_some() {
             return catalogue_call_valueset(inf, *callee_node, args);
         }
+        // Per-call substituted body value-set (arg sets bound to the callable's
+        // parameters): a callable whose body tightens its range — `f(x) =
+        // sqrt(x)` — carries `nonnegreals` to the call site. Fall back to the
+        // un-substituted body set when substitution binds nothing or yields no
+        // finer set.
+        if let Some((_, vs)) = substituted_result(inf, *callee_node, args, named) {
+            if vs != ValueSet::Unknown {
+                return vs;
+            }
+        }
         return match reified_body(inf, *callee_node) {
             Some(body) => inf.lookup_valueset(body),
             None => ValueSet::Unknown,
@@ -1976,6 +2027,47 @@ pub(crate) fn call_valueset(
     match name.as_str() {
         // Parameters / loaded sets.
         "elementof" | "external" => set_expr_valueset(inf, args.first().map(|a| a.0)),
+        // `broadcast(head, data…)` over a user callable: the cell value-set is
+        // the substituted body's set (per-cell arg sets bound to the head's
+        // parameters), lifted into a `CartPow` over the result array. So
+        // `broadcast(f, v)` with `f(x) = sqrt(x)` is `cartpow(nonnegreals, n)`.
+        // Other heads (built-ins / §09 modules) fall back to the natural set.
+        "broadcast" => {
+            let Some((head_node, _, _)) = args.first() else {
+                return ValueSet::Unknown;
+            };
+            let head_node = *head_node;
+            let cell = |t: &Type| match t {
+                Type::Array { elem, .. } => elem.as_ref().clone(),
+                other => other.clone(),
+            };
+            let cell_args: Vec<ArgInfo> = args[1..]
+                .iter()
+                .map(|(n, t, p)| (*n, cell(t), *p))
+                .collect();
+            let cell_named: Vec<NamedInfo> = named
+                .iter()
+                .map(|(s, n, t, p)| (*s, *n, cell(t), *p))
+                .collect();
+            match (
+                substituted_result(inf, head_node, &cell_args, &cell_named),
+                result_array_dim(ty),
+            ) {
+                (Some((_, cell_vs)), Some(dim)) if cell_vs != ValueSet::Unknown => {
+                    ValueSet::CartPow(Box::new(cell_vs), dim)
+                }
+                _ => ValueSet::Unknown,
+            }
+        }
+        // `load_data` is a dynamic-length vector whose entries lie in the
+        // declared `valueset`: `CartPow(valueset, %dynamic)`.
+        "load_data" => {
+            let vs = named_or_positional_node(inf.module, named, args, "valueset", 1);
+            match set_expr_valueset(inf, vs) {
+                ValueSet::Unknown => ValueSet::Unknown,
+                set => ValueSet::CartPow(Box::new(set), Dim::Dynamic),
+            }
+        }
         // Measure supports (the measure node's value set IS its support).
         "Lebesgue" | "Counting" => set_expr_valueset(inf, args.first().map(|a| a.0)),
         "lawof" => args
@@ -2062,6 +2154,17 @@ pub(crate) fn call_valueset(
                 distribution_support(inf, &name, args, named)
             }
         }
+    }
+}
+
+/// The leading dim of a rank-1 array result, drilling through a measure wrapper
+/// (a broadcast deterministic head gives an array; a kernel head gives a measure
+/// over an array). `None` for any other shape.
+fn result_array_dim(ty: &Type) -> Option<Dim> {
+    match ty {
+        Type::Array { shape, .. } if shape.len() == 1 => Some(shape[0]),
+        Type::Measure { domain, .. } => result_array_dim(domain),
+        _ => None,
     }
 }
 
