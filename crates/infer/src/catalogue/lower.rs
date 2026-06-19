@@ -9,6 +9,40 @@ pub(crate) struct LowerCtx<'a> {
     pub(crate) arg_scalar: &'a dyn Fn(usize) -> Option<ScalarType>,
     pub(crate) param_dim: &'a dyn Fn(&str) -> Dim,
     pub(crate) arg_dim: &'a dyn Fn(usize) -> Dim,
+    /// Full inferred type of positional arg `i` — needed by result signatures
+    /// that thread an argument's whole type (shape included) rather than just
+    /// its scalar kind: `SameAsArg`, `RealOfArgShape`, `CommonOf`,
+    /// `ElemScalarKind`. `None` when the arg is absent.
+    pub(crate) arg_type: &'a dyn Fn(usize) -> Option<Type>,
+}
+
+/// Scalar kind of `t`, drilling array nesting; `None` for non-scalar/non-array.
+fn elem_scalar_kind(t: Option<&Type>) -> Option<ScalarType> {
+    match t {
+        Some(Type::Scalar(s)) => Some(*s),
+        Some(Type::Array { elem, .. }) => elem_scalar_kind(Some(elem)),
+        _ => None,
+    }
+}
+
+/// Scalar promotion `integers ⊂ reals ⊂ complexes` (booleans rank with
+/// integers); `Deferred` if either operand is not a scalar.
+fn promote_scalar_types(a: &Type, b: &Type) -> Type {
+    use ScalarType::*;
+    let rank = |t: &Type| match t {
+        Type::Scalar(Integer) | Type::Scalar(Boolean) => Some(0),
+        Type::Scalar(Real) => Some(1),
+        Type::Scalar(Complex) => Some(2),
+        _ => None,
+    };
+    match (rank(a), rank(b)) {
+        (Some(x), Some(y)) => Type::Scalar(match x.max(y) {
+            0 => Integer,
+            1 => Real,
+            _ => Complex,
+        }),
+        _ => Type::Deferred,
+    }
 }
 
 fn scalar(tag: ScalarTag) -> ScalarType {
@@ -137,6 +171,23 @@ pub(crate) fn lower(sig: &Sig, ctx: &LowerCtx) -> (Type, ValueSet) {
                         elem: Box::new(Type::Scalar(ScalarType::Real)),
                     }
                 }
+                ResultSig::SameAsArg(i) => (ctx.arg_type)(*i).unwrap_or(Type::Deferred),
+                ResultSig::RealOfArgShape(i) => match (ctx.arg_type)(*i) {
+                    Some(Type::Scalar(_)) => Type::Scalar(ScalarType::Real),
+                    Some(Type::Array { shape, .. }) => Type::Array {
+                        shape,
+                        elem: Box::new(Type::Scalar(ScalarType::Real)),
+                    },
+                    _ => Type::Deferred,
+                },
+                ResultSig::CommonOf(i, j) => match ((ctx.arg_type)(*i), (ctx.arg_type)(*j)) {
+                    (Some(a), Some(b)) if a == b => a,
+                    (Some(a), Some(b)) => promote_scalar_types(&a, &b),
+                    _ => Type::Deferred,
+                },
+                ResultSig::ElemScalarKind(i) => Type::Scalar(
+                    elem_scalar_kind((ctx.arg_type)(*i).as_ref()).unwrap_or(ScalarType::Real),
+                ),
             };
             let vset = ValueSet::natural_of(&ty);
             (ty, vset)
@@ -159,6 +210,7 @@ mod tests {
             arg_scalar: &|_| Some(ScalarType::Real),
             param_dim: &|_| Dim::Dynamic,
             arg_dim: &|_| Dim::Dynamic,
+            arg_type: &|_| None,
         };
         let (ty, vset) = lower(&sig, &cx);
         assert!(matches!(
@@ -181,6 +233,7 @@ mod tests {
             arg_scalar: &|_| Some(ScalarType::Complex),
             param_dim: &|_| Dim::Dynamic,
             arg_dim: &|_| Dim::Dynamic,
+            arg_type: &|_| None,
         };
         let (ty, _) = lower(&sig, &cx);
         assert_eq!(ty, Type::Scalar(ScalarType::Complex));

@@ -201,17 +201,12 @@ fn unimplemented_measure_ops_are_deferred() {
 
 // ---- Gap documentation: linear-algebra functions ----
 
-/// `det`, `transpose`, `eye`, and `linspace` all parse and are honestly
-/// deferred — no type rule yet, each binding gets `%deferred` without panic.
+/// `transpose`, `eye`, and `linspace` all parse and are honestly deferred —
+/// no type rule yet, each binding gets `%deferred` without panic. (`det` is no
+/// longer here — it now infers a scalar via the catalogue; see
+/// `det_infers_element_scalar_kind`.)
 #[test]
 fn unimplemented_functions_are_deferred() {
-    // det
-    let out = ir("x = det([[1.0, 0.0], [0.0, 1.0]])");
-    assert!(
-        out.contains("(%meta (%deferred %fixed %unknown) (det"),
-        "det: expected %deferred gap, got:\n{out}"
-    );
-
     // transpose
     let out = ir("A = [[1.0, 2.0], [3.0, 4.0]]\nx = transpose(A)");
     assert!(
@@ -232,4 +227,108 @@ fn unimplemented_functions_are_deferred() {
         out.contains("(%meta (%deferred %fixed %unknown) (linspace"),
         "linspace: expected %deferred gap, got:\n{out}"
     );
+}
+
+// ---- Previously-deferred §07 functions now inferred via the catalogue ----
+// These were %deferred gaps; each is now a catalogue row (no structural arm),
+// so the binding carries a real type instead of the %deferred placeholder.
+
+/// `identity(x)` returns its argument unchanged — the full type (array shape +
+/// element) threads through via `ResultSig::SameAsArg`.
+#[test]
+fn identity_threads_the_argument_type() {
+    let out = ir("a = [1.0, 2.0, 3.0]\nx = identity(a)");
+    assert!(
+        out.contains("(%array 1 (3) (%scalar real)) %fixed") && out.contains("(identity"),
+        "identity should preserve the (3)-real-array type, got:\n{out}"
+    );
+}
+
+/// `reverse(xs)` preserves the input vector's shape and element type.
+#[test]
+fn reverse_preserves_shape_and_element() {
+    let out = ir("a = [1.0, 2.0]\nx = reverse(a)");
+    assert!(
+        out.contains("(%array 1 (2) (%scalar real))") && out.contains("(reverse"),
+        "reverse should preserve the (2)-real-array type, got:\n{out}"
+    );
+}
+
+/// `ifelse(cond, a, b)` is the common type of its two branches — `int`/`real`
+/// promote to `real` (`ResultSig::CommonOf`).
+#[test]
+fn ifelse_is_the_common_type_of_its_branches() {
+    let out = ir("c = true\nx = ifelse(c, 1, 2.0)");
+    assert!(
+        out.contains("(%meta ((%scalar real) %fixed reals) (ifelse"),
+        "ifelse(c, 1, 2.0) should infer a real scalar, got:\n{out}"
+    );
+}
+
+/// `real(x)` / `imag(x)` are real-valued regardless of input kind
+/// (`ResultSig::RealOfArgShape`).
+#[test]
+fn real_imag_are_real_valued() {
+    let out = ir("x = real(complex(1.0, 2.0))");
+    assert!(
+        out.contains("(%meta ((%scalar real) %fixed reals) (real"),
+        "real(complex) should infer a real scalar, got:\n{out}"
+    );
+    let out = ir("x = imag(complex(1.0, 2.0))");
+    assert!(
+        out.contains("(%meta ((%scalar real) %fixed reals) (imag"),
+        "imag(complex) should infer a real scalar, got:\n{out}"
+    );
+}
+
+/// `det` / `trace` thread the matrix's element kind: a real matrix yields a
+/// real scalar, a complex matrix a complex scalar (`ResultSig::ElemScalarKind`).
+#[test]
+fn det_infers_element_scalar_kind() {
+    let out = ir("x = det([[1.0, 0.0], [0.0, 1.0]])");
+    assert!(
+        out.contains("(%meta ((%scalar real) %fixed reals) (det"),
+        "det(real matrix) should infer a real scalar, got:\n{out}"
+    );
+    let out = ir("A = [[complex(1.0, 2.0)]]\nx = det(A)");
+    assert!(
+        out.contains("(%scalar complex)") && out.contains("(det"),
+        "det(complex matrix) should infer a complex scalar, got:\n{out}"
+    );
+    let out = ir("A = [[1.0, 0.0], [0.0, 1.0]]\nx = trace(A)");
+    assert!(
+        out.contains("(%meta ((%scalar real) %fixed reals) (trace"),
+        "trace(real matrix) should infer a real scalar, got:\n{out}"
+    );
+}
+
+/// Reductions infer a scalar: `var`/`std`/`logabsdet` are always real; over a
+/// real array `maximum`/`minimum` are real too.
+#[test]
+fn real_scalar_reductions_infer() {
+    for op in ["var", "std", "maximum", "minimum"] {
+        let out = ir(&format!("a = [1.0, 2.0, 3.0]\nx = {op}(a)"));
+        assert!(
+            out.contains(&format!("(%meta ((%scalar real) %fixed reals) ({op}")),
+            "{op} should infer a real scalar over a real array, got:\n{out}"
+        );
+    }
+    let out = ir("x = logabsdet([[2.0, 0.0], [0.0, 2.0]])");
+    assert!(
+        out.contains("(%meta ((%scalar real) %fixed reals) (logabsdet"),
+        "logabsdet should infer a real scalar, got:\n{out}"
+    );
+}
+
+/// `maximum`/`minimum` thread the element kind: an integer array yields an
+/// integer scalar (`ResultSig::ElemScalarKind`), not a widened real.
+#[test]
+fn maximum_minimum_thread_element_kind() {
+    for op in ["maximum", "minimum"] {
+        let out = ir(&format!("a = [1, 2, 3]\nx = {op}(a)"));
+        assert!(
+            out.contains("(%scalar integer)") && out.contains(&format!("({op}")),
+            "{op} over an integer array should infer an integer scalar, got:\n{out}"
+        );
+    }
 }

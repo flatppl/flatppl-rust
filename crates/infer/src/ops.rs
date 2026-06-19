@@ -111,6 +111,8 @@ pub(crate) fn call_rule(
         // ---- value-preserving assertion (spec §07) ----
         // `checked`/`fixed` are identity for typing (spec §03: `fixed(x)` ≡
         // `identity(x)`, a tooling hint) — the wrapped value's type rides through.
+        // (`identity` itself, `ifelse`, `real`, `imag` are catalogue rows —
+        // SameAsArg / CommonOf / RealOfArgShape.)
         "checked" | "fixed" => args.first().map_or(Type::Deferred, |(_, t, _)| t.clone()),
 
         // ---- parameters / inputs (spec §04) ----
@@ -975,6 +977,7 @@ fn catalogue_lower(sig: &crate::catalogue::Sig, args: &[ArgInfo]) -> (Type, Valu
             Some(Type::Array { shape, .. }) if shape.len() == 1 => shape[0],
             _ => Dim::Dynamic,
         },
+        arg_type: &|i| arg_ty(args, i).cloned(),
     };
     lower(sig, &ctx)
 }
@@ -1173,6 +1176,7 @@ fn function_result(name: &str, args: &[ArgInfo]) -> Option<Type> {
             Some(Type::Array { shape, .. }) if shape.len() == 1 => shape[0],
             _ => Dim::Dynamic,
         },
+        arg_type: &|i| arg_ty(args, i).cloned(),
     };
     // `lower` for Sig::Function returns (Type, ValueSet::natural_of(&ty)).
     // We only need the type here; the value-set arm is handled by call_valueset.
@@ -1207,6 +1211,7 @@ fn distribution_domain(
         param_dim: &|kwarg| param_dim(inf, args, named, kwarg),
         arg_scalar: &|_| None,
         arg_dim: &|_| Dim::Dynamic,
+        arg_type: &|i| arg_ty(args, i).cloned(),
     };
     let (ty, _vset) = lower(sig, &ctx);
     // `lower` wraps the domain in a `Type::Measure`; unwrap to get the domain.
@@ -1515,6 +1520,7 @@ fn distribution_support(
         param_dim: &|kwarg| param_dim(inf, args, named, kwarg),
         arg_scalar: &|_| None,
         arg_dim: &|_| Dim::Dynamic,
+        arg_type: &|i| arg_ty(args, i).cloned(),
     };
     let (_ty, vs) = lower(sig, &ctx);
     vs

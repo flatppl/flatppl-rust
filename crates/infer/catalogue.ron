@@ -69,11 +69,12 @@ Catalogue(
         Builtin(name: "LKJCholesky",    sig: Distribution(domain: DynMatrix, support: Unknown, mass: Normalized)),
 
         // ---- base per-name functions (spec §07) ----
-        // Only pure per-name signatures: constant scalar output, SameScalarKind,
-        // or DomainMap. Structural ops (add/sub/mul/pow, shape-preserving
-        // vectors, reductions that thread element types, containers) stay in
-        // ops.rs call_rule because their result types depend on argument shapes
-        // or multiple argument types that ResultSig cannot express.
+        // Per-name signatures expressible via ResultSig: constant scalar output,
+        // SameScalarKind, DomainMap, Matrix, and the arg-threading forms
+        // SameAsArg / RealOfArgShape / CommonOf / ElemScalarKind. Only ops whose
+        // result genuinely cannot be expressed (e.g. operand-promoting elementwise
+        // arith add/sub/mul/pow, container shape construction) stay in ops.rs
+        // call_rule; prefer a catalogue row whenever ResultSig can carry the rule.
 
         // -- scalar-integer output --
         // spec §07 "Elementary functions": floor/ceil/round return integers.
@@ -106,6 +107,35 @@ Catalogue(
         Builtin(name: "l2norm",       sig: Function(params: [Any],      result: Scalar(Real))),
         // logsumexp (spec §07): log Σ exp(v_i) → real.
         Builtin(name: "logsumexp",    sig: Function(params: [Any],      result: Scalar(Real))),
+        // var/std (spec §07 "Reductions") involve a division/sqrt → always real.
+        Builtin(name: "var",          sig: Function(params: [Any],      result: Scalar(Real))),
+        Builtin(name: "std",          sig: Function(params: [Any],      result: Scalar(Real))),
+        // maximum/minimum return an ELEMENT of the array, so the result kind
+        // follows the element kind (an integer array yields an integer).
+        Builtin(name: "maximum",      sig: Function(params: [Any],      result: ElemScalarKind(0))),
+        Builtin(name: "minimum",      sig: Function(params: [Any],      result: ElemScalarKind(0))),
+        // logabsdet(A) = log|det A| (spec §07 "Linear algebra"): always real.
+        Builtin(name: "logabsdet",    sig: Function(params: [Matrix],   result: Scalar(Real))),
+
+        // -- scalar output threading the argument's element kind --
+        // det(A) / trace(A) (spec §07 "Linear algebra"): a real matrix yields a
+        // real scalar, a complex matrix a complex scalar — ElemScalarKind drills
+        // the matrix element type.
+        Builtin(name: "det",          sig: Function(params: [Matrix],   result: ElemScalarKind(0))),
+        Builtin(name: "trace",        sig: Function(params: [Matrix],   result: ElemScalarKind(0))),
+
+        // -- result threads the argument's full type / shape (spec §07) --
+        // identity(x) returns x unchanged; reverse/cumsum/cumprod preserve the
+        // input vector's shape and element type.
+        Builtin(name: "identity",     sig: Function(params: [Any],      result: SameAsArg(0))),
+        Builtin(name: "reverse",      sig: Function(params: [Any],      result: SameAsArg(0))),
+        Builtin(name: "cumsum",       sig: Function(params: [Any],      result: SameAsArg(0))),
+        Builtin(name: "cumprod",      sig: Function(params: [Any],      result: SameAsArg(0))),
+        // real(x) = Re(x), imag(x) = Im(x): real-valued, shape-preserving (spec §07).
+        Builtin(name: "real",         sig: Function(params: [Any],      result: RealOfArgShape(0))),
+        Builtin(name: "imag",         sig: Function(params: [Any],      result: RealOfArgShape(0))),
+        // ifelse(cond, a, b) returns a or b → the common type of the two branches (spec §07).
+        Builtin(name: "ifelse",       sig: Function(params: [Scalar(Boolean), Any, Any], result: CommonOf(1, 2))),
 
         // -- scalar-complex output --
         // cis(theta) = exp(i*theta); complex(re, im) = re + i*im (spec §07).
