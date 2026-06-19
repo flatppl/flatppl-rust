@@ -358,13 +358,16 @@ pub fn inlay_hints(
         if span.start < start_byte || span.end > end_byte {
             continue;
         }
-        let Some(ty) = module.type_of(binding.rhs) else {
+        // The inlay carries the node's full inferred specification — type,
+        // value-set, and phase — via `display_meta`, e.g.
+        // `sqrt(x): real {nonnegreals, stochastic}`.
+        let Some(meta) = module.display_meta(binding.rhs) else {
             continue;
         };
         let pos = li.position(span.end);
         hints.push(lsp_types::InlayHint {
             position: lsp_types::Position::new(pos.line, pos.character),
-            label: lsp_types::InlayHintLabel::String(format!(": {}", module.display_type(ty))),
+            label: lsp_types::InlayHintLabel::String(format!(": {meta}")),
             kind: Some(lsp_types::InlayHintKind::TYPE),
             text_edits: None,
             tooltip: None,
@@ -924,7 +927,9 @@ mod tests {
     fn inlay_hints_label_binding_types() {
         let db = Database::default();
         let cats = Catalogues::new(&db, vec![]);
-        // `add(1, 2)` infers to integer; the hint must use display_type notation.
+        // `add(1, 2)` infers to integer at fixed phase. The hint renders the
+        // full spec via `display_meta`: type + phase (the integer value-set is
+        // the natural extent of `integer`, so it is omitted as redundant).
         let src = "x = add(1, 2)";
         let f = SourceFile::new(&db, "m.flatppl".to_string(), src.to_string());
         let fs = FileSet::new(&db, vec![f]);
@@ -937,8 +942,8 @@ mod tests {
             })
             .collect();
         assert!(
-            labels.iter().any(|l| l == ": integer"),
-            "inlay label must be the readable `: integer`; got: {labels:?}"
+            labels.iter().any(|l| l == ": integer {fixed}"),
+            "inlay label must be the readable spec `: integer {{fixed}}`; got: {labels:?}"
         );
         assert!(
             !labels
@@ -977,6 +982,30 @@ mod tests {
         assert!(
             !labels.iter().any(|l| l.contains("[?]")),
             "no shape should be left dynamic for this fully-fixed model; got: {labels:?}"
+        );
+    }
+
+    /// A tightened value-set (here `sqrt` of a real → `nonnegreals`) must
+    /// surface in the inlay's spec brace, since it is tighter than `real`'s
+    /// natural extent and is what distinguishes the binding's domain.
+    #[test]
+    fn inlay_hints_show_tightened_value_set() {
+        let db = Database::default();
+        let cats = Catalogues::new(&db, vec![]);
+        let src = "x ~ Normal(0.0, 1.0)\nr = sqrt(x)\n";
+        let f = SourceFile::new(&db, "m.flatppl".to_string(), src.to_string());
+        let fs = FileSet::new(&db, vec![f]);
+        let hints = inlay_hints(&db, f, fs, cats, 0, src.len() as u32);
+        let labels: Vec<String> = hints
+            .iter()
+            .filter_map(|h| match &h.label {
+                lsp_types::InlayHintLabel::String(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            labels.iter().any(|l| l.contains("nonnegreals")),
+            "sqrt's nonnegreals value-set must show in the inlay spec; got: {labels:?}"
         );
     }
 

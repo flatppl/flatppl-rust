@@ -4,9 +4,9 @@
             version: "0.1",
             bindings: [
                 // erf(x) → real
-                Binding(name: "erf",  sig: Function(params: [Scalar(Real)], result: Scalar(Real))),
+                Binding(name: "erf",  sig: Function(params: [Scalar(Real)], result: Scalar(Real), result_set: Interval(-1.0, 1.0))),
                 // erfc(x) → real
-                Binding(name: "erfc", sig: Function(params: [Scalar(Real)], result: Scalar(Real))),
+                Binding(name: "erfc", sig: Function(params: [Scalar(Real)], result: Scalar(Real), result_set: Interval(0.0, 2.0))),
                 // bessel_j(v, z): real order, real argument → real
                 Binding(name: "bessel_j", sig: Function(params: [Scalar(Real), Scalar(Real)], result: Scalar(Real))),
                 // bessel_y(v, z): real order, positive real argument → real

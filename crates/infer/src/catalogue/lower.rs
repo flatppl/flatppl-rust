@@ -205,11 +205,46 @@ pub(crate) fn lower(sig: &Sig, ctx: &LowerCtx) -> (Type, ValueSet) {
                 vset,
             )
         }
-        Sig::Function { params: _, result } => {
+        Sig::Function {
+            params: _,
+            result,
+            result_set,
+        } => {
             let ty = lower_result(result, ctx);
-            let vset = ValueSet::natural_of(&ty);
+            let vset = function_set(*result_set, &ty);
             (ty, vset)
         }
+    }
+}
+
+/// The value-set of a function result given its catalogue `result_set` tag and
+/// the lowered result type. A tag applies only when the result's scalar kind
+/// matches the tag's domain — so a real-range tag on a complex result (e.g.
+/// `exp` of a complex) falls back to the natural set (`complexes`) rather than
+/// claiming a spurious `posreals`. Over a rank-1 array result the tag lifts into
+/// a `CartPow`. `Natural` is exactly `ValueSet::natural_of`.
+fn function_set(tag: crate::catalogue::ResultSet, ty: &Type) -> ValueSet {
+    use crate::catalogue::ResultSet;
+    let (set, kind) = match tag {
+        ResultSet::Natural => return ValueSet::natural_of(ty),
+        ResultSet::Reals => (ValueSet::Reals, ScalarType::Real),
+        ResultSet::PosReals => (ValueSet::PosReals, ScalarType::Real),
+        ResultSet::NonNegReals => (ValueSet::NonNegReals, ScalarType::Real),
+        ResultSet::UnitInterval => (ValueSet::UnitInterval, ScalarType::Real),
+        ResultSet::Interval(lo, hi) => (ValueSet::Interval(lo, hi), ScalarType::Real),
+        ResultSet::Integers => (ValueSet::Integers, ScalarType::Integer),
+        ResultSet::PosIntegers => (ValueSet::PosIntegers, ScalarType::Integer),
+        ResultSet::NonNegIntegers => (ValueSet::NonNegIntegers, ScalarType::Integer),
+        ResultSet::Booleans => (ValueSet::Booleans, ScalarType::Boolean),
+        ResultSet::Complexes => (ValueSet::Complexes, ScalarType::Complex),
+    };
+    match ty {
+        Type::Scalar(s) if *s == kind => set,
+        Type::Array { shape, elem } if shape.len() == 1 => match elem.as_ref() {
+            Type::Scalar(s) if *s == kind => ValueSet::CartPow(Box::new(set), shape[0]),
+            _ => ValueSet::natural_of(ty),
+        },
+        _ => ValueSet::natural_of(ty),
     }
 }
 
@@ -331,6 +366,7 @@ mod tests {
         let sig = Sig::Function {
             params: vec![],
             result: ResultSig::SameScalarKind(0),
+            result_set: crate::catalogue::ResultSet::Natural,
         };
         let cx = LowerCtx {
             arg_scalar: &|_| Some(ScalarType::Complex),

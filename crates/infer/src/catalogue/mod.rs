@@ -61,7 +61,36 @@ pub(crate) enum Sig {
         #[allow(dead_code)]
         params: Vec<ParamSig>,
         result: ResultSig,
+        /// The result's value-set, when tighter than the result type's natural
+        /// extent (e.g. `sqrt → nonnegreals`, `invlogit → unitinterval`).
+        /// Defaults to `Natural` (= `ValueSet::natural_of(result_type)`), so a
+        /// row that does not constrain its range needs no entry.
+        #[serde(default)]
+        result_set: ResultSet,
     },
+}
+
+/// The value-set of a function result, tighter than its type's natural extent.
+/// Applied by [`lower`] only when the result's scalar kind matches the tag's
+/// domain (a real-range tag on a complex result falls back to the natural set),
+/// and lifted over a rank-1 array result into a `CartPow`. `Natural` (the
+/// default) is exactly `ValueSet::natural_of(result_type)`.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+pub(crate) enum ResultSet {
+    #[default]
+    Natural,
+    Reals,
+    PosReals,
+    NonNegReals,
+    UnitInterval,
+    Integers,
+    PosIntegers,
+    NonNegIntegers,
+    Booleans,
+    Complexes,
+    /// A closed real range `[lo, hi]` (infinities allowed for half-bounded
+    /// ranges): `tanh → interval(-1, 1)`, `erfc → interval(0, 2)`.
+    Interval(f64, f64),
 }
 
 #[derive(Debug, Clone, Deserialize)]

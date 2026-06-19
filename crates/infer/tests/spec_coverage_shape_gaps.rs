@@ -378,10 +378,19 @@ fn det_infers_element_scalar_kind() {
 }
 
 /// Reductions infer a scalar: `var`/`std`/`logabsdet` are always real; over a
-/// real array `maximum`/`minimum` are real too.
+/// real array `maximum`/`minimum` are real too. `var`/`std` are non-negative
+/// (a variance/standard deviation ≥ 0 — catalogue `result_set: NonNegReals`),
+/// while `maximum`/`minimum` of a real array range over all reals.
 #[test]
 fn real_scalar_reductions_infer() {
-    for op in ["var", "std", "maximum", "minimum"] {
+    for op in ["var", "std"] {
+        let out = ir(&format!("a = [1.0, 2.0, 3.0]\nx = {op}(a)"));
+        assert!(
+            out.contains(&format!("(%meta ((%scalar real) %fixed nonnegreals) ({op}")),
+            "{op} should infer a non-negative real scalar, got:\n{out}"
+        );
+    }
+    for op in ["maximum", "minimum"] {
         let out = ir(&format!("a = [1.0, 2.0, 3.0]\nx = {op}(a)"));
         assert!(
             out.contains(&format!("(%meta ((%scalar real) %fixed reals) ({op}")),
@@ -468,13 +477,14 @@ fn vector_result_functions_infer() {
     );
 }
 
-/// `totalmass(M)` is the total mass as a real scalar (spec §06).
+/// `totalmass(M)` is the total mass as a real scalar (spec §06) — a mass is
+/// non-negative, so its value-set is `nonnegreals` (catalogue `result_set`).
 #[test]
 fn totalmass_infers_a_real_scalar() {
     let out = ir("m = Normal(0.0, 1.0)\nx = totalmass(m)");
     assert!(
-        out.contains("(%meta ((%scalar real) %fixed reals) (totalmass"),
-        "totalmass should infer a real scalar, got:\n{out}"
+        out.contains("(%meta ((%scalar real) %fixed nonnegreals) (totalmass"),
+        "totalmass should infer a non-negative real scalar, got:\n{out}"
     );
 }
 
@@ -819,5 +829,80 @@ fn kron_resolves_kronecker_dims() {
     assert!(
         out.contains("(%array 2 (4 6) (%scalar real))") && out.contains("kron"),
         "kron(2x3, 2x2) should be 4x6, got:\n{out}"
+    );
+}
+
+// ---- User-callable application: per-call argument substitution (§04/§11) ----
+
+/// A user function `f(a, b, x) = a + b * x` lowers to a reification whose
+/// parameters are unconstrained `%local` placeholders. Applying it must bind the
+/// concrete call-arg types to those parameters and re-infer the body — so
+/// `predict(1.0, 2.0, 3.0)` is a `real`, NOT `any`. Before the substitution path
+/// the body typed as `any` and every application inherited it.
+#[test]
+fn user_call_substitutes_arg_types_into_body() {
+    let out = ir("predict(a, b, x) = a + b * x\n\
+         z = predict(1.0, 2.0, 3.0)\n");
+    let z = out.lines().find(|l| l.contains("%bind z")).unwrap_or("");
+    assert!(
+        z.contains("(%scalar real)") && !z.contains("%any"),
+        "predict(reals) should yield a real, not any; got:\n{out}"
+    );
+}
+
+/// The same substitution must flow through `broadcast`: a deterministic
+/// user-callable head mapped over a `real[5]` data input yields `real[5]`, not
+/// `any[5]`. The per-cell argument types (element of each array input) are bound
+/// to the callable's parameters.
+#[test]
+fn broadcast_user_callable_substitutes_cell_types() {
+    let out = ir("predict(a, b, x) = a + b * x\n\
+         intercept ~ Normal(0.0, 1.0)\n\
+         slope ~ Normal(0.0, 1.0)\n\
+         x_data = [1.0, 2.0, 3.0, 4.0, 5.0]\n\
+         eta = broadcast(predict, a = intercept, b = slope, x = x_data)\n");
+    let eta = out.lines().find(|l| l.contains("%bind eta")).unwrap_or("");
+    assert!(
+        eta.contains("(%array 1 (5) (%scalar real))") && !eta.contains("%any"),
+        "broadcast(predict, x = real[5]) should yield real[5], not any[5]; got:\n{out}"
+    );
+}
+
+// ---- Function result value-sets via the catalogue `result_set` tag (§07) ----
+
+/// Range-constrained scalar functions carry a value-set tighter than `reals`,
+/// driven by the catalogue `result_set` tag rather than hardcoded inference
+/// arms: `exp → posreals`, `sqrt`/`abs → nonnegreals`, `invlogit →
+/// unitinterval`, `tanh → interval(-1, 1)`, `lengthof → nonnegintegers`.
+#[test]
+fn function_result_sets_are_tightened() {
+    let cases = [
+        ("y = exp(x)\nx = elementof(reals)", "posreals"),
+        ("y = sqrt(x)\nx = elementof(reals)", "nonnegreals"),
+        ("y = abs(x)\nx = elementof(reals)", "nonnegreals"),
+        ("y = invlogit(x)\nx = elementof(reals)", "unitinterval"),
+        ("y = tanh(x)\nx = elementof(reals)", "(interval -1.0 1.0)"),
+        ("y = lengthof(v)\nv = [1.0, 2.0, 3.0]", "nonnegintegers"),
+    ];
+    for (src, want) in cases {
+        let out = ir(src);
+        let y = out.lines().find(|l| l.contains("%bind y")).unwrap_or("");
+        assert!(
+            y.contains(want),
+            "expected `y`'s value-set to contain `{want}`; got:\n{out}"
+        );
+    }
+}
+
+/// A real-range `result_set` tag must NOT be claimed for a complex result: `exp`
+/// of a complex value is complex-valued and not positive-real, so the value-set
+/// falls back to the natural extent `complexes` (the `im` constant is complex).
+#[test]
+fn function_result_set_falls_back_for_complex() {
+    let out = ir("y = exp(im)");
+    let y = out.lines().find(|l| l.contains("%bind y")).unwrap_or("");
+    assert!(
+        y.contains("(%scalar complex)") && y.contains("complexes") && !y.contains("posreals"),
+        "exp of a complex should be complexes, not posreals; got:\n{out}"
     );
 }
