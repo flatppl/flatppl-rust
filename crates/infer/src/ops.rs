@@ -193,6 +193,22 @@ pub(crate) fn call_rule(
         },
         // tile(A, size) keeps A's rank and element kind; only the sizes change.
         "tile" => arg_ty(args, 0).map_or(Type::Deferred, with_dynamic_dims),
+        // `qr(A)` (spec §07) returns `record(Q, R)` — both matrices with A's
+        // element kind, dims dynamic. Structural (not a catalogue row): building
+        // a `Type::Record` needs interned field Symbols, and the catalogue's
+        // `lower` has no interner (`Symbol::intern` is `&mut`); `call_rule` does.
+        "qr" => {
+            let elem = arg_ty(args, 0)
+                .and_then(elem_scalar_kind_of)
+                .unwrap_or(ScalarType::Real);
+            let matrix = Type::Array {
+                shape: Box::new([Dim::Dynamic, Dim::Dynamic]),
+                elem: Box::new(Type::Scalar(elem)),
+            };
+            let q = inf.module.intern("Q");
+            let r = inf.module.intern("R");
+            Type::Record(Box::new([(q, matrix.clone()), (r, matrix)]))
+        }
         // reduce(f, xs) folds xs with an associative f; spec §07 requires f to
         // return the element type of xs, so the result IS that element type
         // (a vector of reals reduces to a real, a vector of vectors to a vector).

@@ -638,3 +638,16 @@ fn reduce_and_filter_infer() {
         "filter of a real vector should stay a real vector (dynamic length), got:\n{out}"
     );
 }
+
+/// `qr(A)` (spec §07) returns `record(Q, R)` — both matrices with A's element
+/// kind. Structural (not a catalogue row): a `Type::Record` needs interned
+/// field Symbols, which the catalogue's `lower` can't produce.
+#[test]
+fn qr_infers_a_record_of_matrices() {
+    let out = ir("A = [[1.0, 0.0], [0.0, 1.0]]\nd = qr(A)");
+    assert!(
+        out.contains("(%record (Q (%array 2 (%dynamic %dynamic) (%scalar real))) (R (%array 2 (%dynamic %dynamic) (%scalar real))))")
+            && out.contains("(qr"),
+        "qr should infer record(Q: matrix, R: matrix), got:\n{out}"
+    );
+}
