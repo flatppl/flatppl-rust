@@ -19,6 +19,7 @@ flatppl-core = { path = "../core" }
 flatppl-syntax = { path = "../syntax" }
 flatppl-infer = { path = "../infer" }
 salsa = "0.18"
+crossbeam-channel = "0.5"
 lsp-server = "0.7"
 lsp-types = "0.97"
 serde_json = { workspace = true }

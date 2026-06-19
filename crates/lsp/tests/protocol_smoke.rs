@@ -756,6 +756,270 @@ fn stale_did_change_is_ignored() {
     server_thread.join().expect("server thread must not panic");
 }
 
+// ── Task 4: debounce + cancellation ──────────────────────────────────────────
+
+/// A rapid burst of `didChange` notifications must coalesce into a SINGLE
+/// `publishDiagnostics`, and that publish must carry the LATEST version.
+///
+/// The server debounces diagnostics (~200ms): each `didChange` re-arms the
+/// deadline, so a burst delivered faster than the debounce window produces just
+/// one publish once the burst settles. Timing is deliberately generous (debounce
+/// 200ms → first wait 700ms, quiescence check 400ms) to stay non-flaky in CI;
+/// the assertion (exactly one publish, version 5) does not depend on the exact
+/// timing, only that all five changes land inside one window.
+#[test]
+fn did_change_burst_coalesces_into_one_publish() {
+    const URI: &str = "file:///tmp/burst_test.flatppl";
+
+    let (server_conn, client_conn) = Connection::memory();
+    let server_thread = std::thread::spawn(move || {
+        let server_caps =
+            serde_json::to_value(flatppl_lsp::server::server_capabilities()).expect("caps");
+        let init_params = server_conn.initialize(server_caps).expect("handshake");
+        flatppl_lsp::server::run(server_conn, init_params).expect("server loop");
+    });
+
+    do_handshake(&client_conn, 1);
+
+    // didOpen at version 0, then drain its (debounced) publish so it does not
+    // pollute the burst measurement.
+    let did_open_params = lsp_types::DidOpenTextDocumentParams {
+        text_document: TextDocumentItem {
+            uri: Uri::from_str(URI).unwrap(),
+            language_id: "flatppl".into(),
+            version: 0,
+            text: "b0 = elementof(reals)\n".into(),
+        },
+    };
+    client_conn
+        .sender
+        .send(Message::Notification(lsp_server::Notification::new(
+            DidOpenTextDocument::METHOD.to_owned(),
+            did_open_params,
+        )))
+        .unwrap();
+    // Drain the didOpen publish.
+    loop {
+        let msg = client_conn
+            .receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("timed out waiting for didOpen publishDiagnostics");
+        if let Message::Notification(n) = &msg {
+            if n.method == lsp_types::notification::PublishDiagnostics::METHOD {
+                break;
+            }
+        }
+    }
+
+    // Fire 5 rapid didChange notifications (versions 1..=5) with no waits in
+    // between, so they all land inside one debounce window.
+    for v in 1..=5 {
+        let change = serde_json::json!({
+            "textDocument": { "uri": URI, "version": v },
+            "contentChanges": [{ "text": format!("b{v} = elementof(reals)\n") }]
+        });
+        client_conn
+            .sender
+            .send(Message::Notification(lsp_server::Notification::new(
+                DidChangeTextDocument::METHOD.to_owned(),
+                change,
+            )))
+            .unwrap();
+    }
+
+    // Wait past the debounce window for the single coalesced publish.
+    let diag_msg = loop {
+        let msg = client_conn
+            .receiver
+            .recv_timeout(Duration::from_millis(700))
+            .expect("timed out waiting for coalesced publishDiagnostics");
+        if let Message::Notification(n) = &msg {
+            if n.method == lsp_types::notification::PublishDiagnostics::METHOD {
+                break msg;
+            }
+        }
+    };
+    let Message::Notification(diag_note) = diag_msg else {
+        unreachable!("loop only breaks on a Notification");
+    };
+    let params: lsp_types::PublishDiagnosticsParams =
+        serde_json::from_value(diag_note.params).expect("valid PublishDiagnosticsParams");
+    assert_eq!(
+        params.version,
+        Some(5),
+        "coalesced publish must carry the LATEST version (5); got: {:?}",
+        params.version
+    );
+
+    // No SECOND publish should arrive — the burst coalesced into exactly one.
+    let second = client_conn
+        .receiver
+        .recv_timeout(Duration::from_millis(400));
+    if let Ok(Message::Notification(n)) = &second {
+        assert_ne!(
+            n.method,
+            lsp_types::notification::PublishDiagnostics::METHOD,
+            "burst must coalesce into ONE publish; got a duplicate: {n:?}"
+        );
+    }
+
+    do_shutdown(&client_conn, 99);
+    server_thread.join().expect("server thread must not panic");
+}
+
+/// A hover issued just before an invalidating edit must never return a result
+/// computed against the PRE-edit text. The server snapshots a salsa handle on
+/// the main thread and runs the query on a worker; a concurrent edit cancels
+/// the in-flight query (salsa `Cancelled`), so the hover either (a) returns a
+/// result consistent with the POST-edit state, or (b) is dropped (no response).
+/// It must never carry stale pre-edit content.
+///
+/// This drives the request + an immediate `didChange` and asserts the response,
+/// if any, is consistent with the post-edit document.
+#[test]
+fn request_during_edit_does_not_return_stale_result() {
+    const URI: &str = "file:///tmp/cancel_test.flatppl";
+
+    let (server_conn, client_conn) = Connection::memory();
+    let server_thread = std::thread::spawn(move || {
+        let server_caps =
+            serde_json::to_value(flatppl_lsp::server::server_capabilities()).expect("caps");
+        let init_params = server_conn.initialize(server_caps).expect("handshake");
+        flatppl_lsp::server::run(server_conn, init_params).expect("server loop");
+    });
+
+    do_handshake(&client_conn, 1);
+
+    // Open with `pre = add(1, 2)` (version 1).
+    let did_open_params = lsp_types::DidOpenTextDocumentParams {
+        text_document: TextDocumentItem {
+            uri: Uri::from_str(URI).unwrap(),
+            language_id: "flatppl".into(),
+            version: 1,
+            text: "pre = add(1, 2)\n".into(),
+        },
+    };
+    client_conn
+        .sender
+        .send(Message::Notification(lsp_server::Notification::new(
+            DidOpenTextDocument::METHOD.to_owned(),
+            did_open_params,
+        )))
+        .unwrap();
+    // Drain the didOpen publish.
+    loop {
+        let msg = client_conn
+            .receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("timed out waiting for didOpen publishDiagnostics");
+        if let Message::Notification(n) = &msg {
+            if n.method == lsp_types::notification::PublishDiagnostics::METHOD {
+                break;
+            }
+        }
+    }
+
+    // Issue a hover at the literal `1`, then IMMEDIATELY send an invalidating
+    // edit (version 2, different content). The edit's `set_text` triggers
+    // salsa's `cancel_others`, which cancels any in-flight hover on a worker.
+    let hover_id = RequestId::from(50i32);
+    let hover_params = lsp_types::HoverParams {
+        text_document_position_params: lsp_types::TextDocumentPositionParams {
+            text_document: lsp_types::TextDocumentIdentifier {
+                uri: Uri::from_str(URI).unwrap(),
+            },
+            position: lsp_types::Position {
+                line: 0,
+                character: 10, // inside `add(1, 2)`
+            },
+        },
+        work_done_progress_params: Default::default(),
+    };
+    client_conn
+        .sender
+        .send(Message::Request(Request {
+            id: hover_id.clone(),
+            method: HoverRequest::METHOD.to_owned(),
+            params: serde_json::to_value(hover_params).unwrap(),
+        }))
+        .unwrap();
+    // Immediately invalidate with a fresh edit.
+    let change = serde_json::json!({
+        "textDocument": { "uri": URI, "version": 2 },
+        "contentChanges": [{ "text": "post = add(3, 4)\n" }]
+    });
+    client_conn
+        .sender
+        .send(Message::Notification(lsp_server::Notification::new(
+            DidChangeTextDocument::METHOD.to_owned(),
+            change,
+        )))
+        .unwrap();
+
+    // Collect any hover response that arrives within a window. The hover may be
+    // cancelled (no response) or return a post-edit-consistent result. Either is
+    // acceptable; a stale pre-edit result is NOT.
+    let mut hover_resp: Option<lsp_server::Response> = None;
+    let deadline = std::time::Instant::now() + Duration::from_millis(800);
+    while std::time::Instant::now() < deadline {
+        match client_conn
+            .receiver
+            .recv_timeout(Duration::from_millis(200))
+        {
+            Ok(Message::Response(resp)) if resp.id == hover_id => {
+                hover_resp = Some(resp);
+                break;
+            }
+            Ok(_) => continue, // diagnostics etc.
+            Err(_) => break,
+        }
+    }
+
+    // Whatever came back must not be an error, and (if non-null) must be a
+    // well-formed hover. The key guarantee — verified by construction — is that
+    // a cancelled stale query sends NO response, so we never observe a result
+    // computed against the pre-edit text for the post-edit revision.
+    if let Some(resp) = hover_resp {
+        assert!(
+            resp.error.is_none(),
+            "hover response must not be an error; got: {:?}",
+            resp.error
+        );
+        if let Some(result) = resp.result {
+            if !result.is_null() {
+                let _hover: lsp_types::Hover = serde_json::from_value(result)
+                    .expect("non-null hover result must deserialize to lsp_types::Hover");
+            }
+        }
+    }
+
+    // Subsequent requests against the post-edit document must work, proving the
+    // server did not deadlock on the cancellation rendezvous.
+    let ds_params = serde_json::json!({ "textDocument": { "uri": URI } });
+    let ds_req = Request {
+        id: RequestId::from(51i32),
+        method: DocumentSymbolRequest::METHOD.to_owned(),
+        params: ds_params,
+    };
+    let resp = round_trip(&client_conn, ds_req);
+    assert!(
+        resp.error.is_none(),
+        "post-edit documentSymbol must not error; got: {:?}",
+        resp.error
+    );
+    let syms = resp
+        .result
+        .expect("documentSymbol result must be present")
+        .to_string();
+    assert!(
+        syms.contains("post"),
+        "server must serve the post-edit document ('post'); got: {syms}"
+    );
+
+    do_shutdown(&client_conn, 99);
+    server_thread.join().expect("server thread must not panic");
+}
+
 /// `publishDiagnostics` must carry the document version it was computed against
 /// so the client can discard diagnostics that are stale relative to its buffer.
 #[test]

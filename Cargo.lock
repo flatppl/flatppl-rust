@@ -309,6 +309,7 @@ dependencies = [
 name = "flatppl-lsp"
 version = "0.1.0"
 dependencies = [
+ "crossbeam-channel",
  "flatppl-core",
  "flatppl-infer",
  "flatppl-syntax",
