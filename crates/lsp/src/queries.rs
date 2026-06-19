@@ -19,24 +19,33 @@ use std::sync::Arc;
 // the same conservative policy used by `ArcModule`). The `Update` impl
 // likewise falls back to pointer identity: if the arc pointer changed the
 // value definitely changed, so we always overwrite and return `true`.
+//
+// `errors` carries per-source parse diagnostics produced at catalogue-parse time
+// so `analyze` does not re-parse the sources a second time just to emit them.
 #[derive(Clone, Debug)]
-pub struct ArcCatalogues(Arc<Vec<flatppl_infer::Catalogue>>);
+pub struct ArcCatalogues {
+    cats: Arc<Vec<flatppl_infer::Catalogue>>,
+    errors: Arc<Vec<LspDiag>>,
+}
 
 impl ArcCatalogues {
-    fn new(v: Vec<flatppl_infer::Catalogue>) -> Self {
-        ArcCatalogues(Arc::new(v))
+    /// Return a reference to the successfully-parsed catalogues, for passing to
+    /// `infer_module_ext` and the completion builder.
+    pub fn as_slice(&self) -> &[flatppl_infer::Catalogue] {
+        &self.cats
     }
 
-    /// Return a reference to the inner slice, for passing to `infer_module_ext`
-    /// and the completion builder.
-    pub fn as_slice(&self) -> &[flatppl_infer::Catalogue] {
-        &self.0
+    /// Return the parse-error diagnostics for sources that failed to parse.
+    pub fn errors(&self) -> &[LspDiag] {
+        &self.errors
     }
 }
 
+// Pointer-identity on `cats` only — `errors` is derived from the same parse
+// pass and changes exactly when `cats` changes.
 impl PartialEq for ArcCatalogues {
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
+        Arc::ptr_eq(&self.cats, &other.cats)
     }
 }
 
@@ -44,7 +53,7 @@ impl Eq for ArcCatalogues {}
 
 impl std::hash::Hash for ArcCatalogues {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        std::ptr::hash(Arc::as_ptr(&self.0), state);
+        std::ptr::hash(Arc::as_ptr(&self.cats), state);
     }
 }
 
@@ -56,7 +65,7 @@ impl std::hash::Hash for ArcCatalogues {
 unsafe impl salsa::Update for ArcCatalogues {
     unsafe fn maybe_update(old_pointer: *mut Self, new_value: Self) -> bool {
         let old: &mut Self = unsafe { &mut *old_pointer };
-        if Arc::ptr_eq(&old.0, &new_value.0) {
+        if Arc::ptr_eq(&old.cats, &new_value.cats) {
             return false;
         }
         *old = new_value;
@@ -67,18 +76,31 @@ unsafe impl salsa::Update for ArcCatalogues {
 // ── parsed_catalogues tracked query ─────────────────────────────────────────
 
 /// Parse the host-supplied external RON catalogues once per `Catalogues`
-/// revision (was re-parsed on every analyze + completion). Unparseable sources
-/// are dropped here; the diagnostics path reports them separately.
+/// revision. Successful sources are collected into the `cats` vec; failing
+/// sources produce `LspDiag` entries in `errors`. Both are stored in the
+/// returned `ArcCatalogues` so `analyze` can consume the errors without
+/// re-parsing.
 #[salsa::tracked]
 pub fn parsed_catalogues(db: &dyn salsa::Database, cats: Catalogues) -> ArcCatalogues {
     #[cfg(test)]
     PARSED_CATALOGUES_RUNS.with(|c| c.set(c.get() + 1));
-    ArcCatalogues::new(
-        cats.sources(db)
-            .iter()
-            .filter_map(|s| flatppl_infer::parse_catalogue(s).ok())
-            .collect(),
-    )
+    let mut parsed = Vec::new();
+    let mut errors = Vec::new();
+    for s in cats.sources(db) {
+        match flatppl_infer::parse_catalogue(s) {
+            Ok(c) => parsed.push(c),
+            Err(e) => errors.push(LspDiag {
+                start: 0,
+                end: 0,
+                severity: crate::capabilities::DiagSeverity::Error,
+                message: format!("catalogue parse error: {e}"),
+            }),
+        }
+    }
+    ArcCatalogues {
+        cats: Arc::new(parsed),
+        errors: Arc::new(errors),
+    }
 }
 
 // Per-thread execution counter for `parsed_catalogues`. Thread-local so
@@ -584,22 +606,13 @@ pub fn analyze<'db>(
     };
     let mut m = module.clone();
 
-    // Obtain the external catalogues via the tracked `parsed_catalogues` query
-    // (parsed once per `Catalogues` revision, not per analyze call). Emit
-    // diagnostics for sources that fail to parse; the failed entries are absent
-    // from the memoised `catalogues` vec (already filtered out by the query).
+    // Obtain the external catalogues and their parse errors via the tracked
+    // `parsed_catalogues` query (parsed once per `Catalogues` revision, not per
+    // analyze call). The query carries both the parsed catalogues and any
+    // per-source diagnostics, so no second parse pass is needed here.
     let mut diags = parsed.diagnostics(db).clone();
-    for src in cats.sources(db) {
-        if let Err(e) = flatppl_infer::parse_catalogue(src) {
-            diags.push(LspDiag {
-                start: 0,
-                end: 0,
-                severity: crate::capabilities::DiagSeverity::Error,
-                message: format!("catalogue parse error: {e}"),
-            });
-        }
-    }
     let catalogues = parsed_catalogues(db, cats);
+    diags.extend(catalogues.errors().iter().cloned());
 
     let bundle = import_bundle(db, file, fs);
     let infer_diags = flatppl_infer::infer_module_ext(
