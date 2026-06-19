@@ -184,6 +184,22 @@ pub(crate) fn call_rule(
         // normalization-level rules (inheriting it via the type clone would
         // smuggle the base's class through `fill_mass`).
         "truncate" | "normalize" => fresh_measure(arg_ty(args, 0)),
+        // Domain-preserving measure-algebra ops (spec §06): the result is a
+        // measure over the SAME value domain as its measure argument, with a
+        // fresh (recomputed) mass — like truncate/normalize.
+        //   `restrict(M, S)`   — restrict M to S
+        //   `superpose(M1, …)` — measure addition M1 + M2 + … (shared domain)
+        //   `locscale(M, …)`   — affine pushforward x → scale·x + shift
+        // These no longer defer: even before the engine evaluates their mass,
+        // the value domain is known, so the type slot carries `(%measure …)`.
+        "restrict" | "superpose" | "locscale" => fresh_measure(arg_ty(args, 0)),
+        // `pushfwd(f, M)` (spec §06) is a measure, but its domain is the
+        // codomain of `f`, which inference does not track — so we know the
+        // result IS a measure (better than %deferred) with a deferred domain.
+        "pushfwd" => Type::Measure {
+            domain: Box::new(Type::Any),
+            mass: Mass::Deferred,
+        },
         // `relabel(M, labels)` (spec §06) renames the variate; the value domain
         // AND total mass are unchanged, so the measure type passes through whole
         // (unlike normalize/truncate, which reset the mass slot).
@@ -1675,7 +1691,11 @@ pub(crate) fn fill_mass(
                 .collect();
             product_mass(&masses)
         }
-        "truncate" => match arg_mass(0) {
+        // `restrict` shares truncate's support-restriction mass behaviour: the
+        // result is a sub-measure, so a probability/finite measure becomes
+        // merely finite, and an infinite measure stays finite only on a bounded
+        // restriction set.
+        "truncate" | "restrict" => match arg_mass(0) {
             Mass::Null => Mass::Null,
             Mass::Normalized | Mass::Finite => Mass::Finite,
             Mass::LocallyFinite => {
@@ -1686,6 +1706,26 @@ pub(crate) fn fill_mass(
             }
             _ => Mass::Unknown,
         },
+        // Pushforward through a (measurable) map preserves total mass (spec §06
+        // image measure): `pushfwd(f, M)` keeps M's mass, `locscale(M, …)` — an
+        // affine pushforward — keeps M's mass.
+        "pushfwd" => arg_mass(1),
+        "locscale" => arg_mass(0),
+        // `superpose(M1, M2, …)` is measure addition Z = Σ Zi (spec §06): the
+        // sum of finite masses is finite but generally not normalized; any
+        // infinite component makes the sum infinite; an Unknown taints the sum.
+        "superpose" => {
+            let masses: Vec<Mass> = (0..args.len()).map(arg_mass).collect();
+            if masses.iter().any(|m| matches!(m, Mass::Unknown)) {
+                Mass::Unknown
+            } else if masses.iter().any(|m| matches!(m, Mass::LocallyFinite)) {
+                Mass::LocallyFinite
+            } else if masses.iter().all(|m| matches!(m, Mass::Null)) {
+                Mass::Null
+            } else {
+                Mass::Finite
+            }
+        }
         // A fixed scalar weight rescales: classes survive, except that an
         // unknown constant demotes `%normalized` to `%finite`.
         "weighted" | "logweighted" => {

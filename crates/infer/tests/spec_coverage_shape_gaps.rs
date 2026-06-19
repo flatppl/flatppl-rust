@@ -151,34 +151,12 @@ fn level_normalization_does_not_resolve_dims() {
 
 // ---- Gap documentation: measure ops ----
 
-/// `restrict`, `pushfwd`, `superpose`, `Dirac`, `kchain` parse without error
-/// and are honestly deferred (no type rule yet — measure-algebra transforms the
-/// engine has no evaluator for). Each binding gets `%deferred` rather than a
-/// wrong type or a panic. (`totalmass` is no longer here — it now infers a real
-/// scalar; see `totalmass_infers_a_real_scalar`.)
+/// `Dirac` and the kernel-chain ops (`kchain`, `markovchain`, `scan`, …) stay
+/// honestly deferred — point-mass / kernel-composition semantics the engine has
+/// no evaluator for. (`restrict`/`pushfwd`/`superpose`/`locscale` are no longer
+/// here — they now infer a measure type; see `domain_preserving_measure_ops_infer`.)
 #[test]
 fn unimplemented_measure_ops_are_deferred() {
-    // restrict
-    let out = ir("x = restrict(Normal(0.0,1.0), interval(0.0,1.0))");
-    assert!(
-        out.contains("(%meta (%deferred %fixed %unknown) (restrict"),
-        "restrict: expected %deferred gap, got:\n{out}"
-    );
-
-    // pushfwd
-    let out = ir("f = fn(_ * 2.0)\nx = pushfwd(f, Normal(0.0,1.0))");
-    assert!(
-        out.contains("(%meta (%deferred %fixed %unknown) (pushfwd"),
-        "pushfwd: expected %deferred gap, got:\n{out}"
-    );
-
-    // superpose
-    let out = ir("x = superpose(Normal(0.0,1.0), Normal(1.0,1.0))");
-    assert!(
-        out.contains("(%meta (%deferred %fixed %unknown) (superpose"),
-        "superpose: expected %deferred gap, got:\n{out}"
-    );
-
     // Dirac
     let out = ir("x = Dirac(0.0)");
     assert!(
@@ -191,6 +169,36 @@ fn unimplemented_measure_ops_are_deferred() {
     assert!(
         out.contains("(%meta (%deferred %fixed %unknown) (kchain"),
         "kchain: expected %deferred gap, got:\n{out}"
+    );
+}
+
+/// Domain-preserving measure-algebra ops infer a `(%measure …)` type with the
+/// spec-§06 mass class: `restrict`/`superpose` are sub-/sum-measures (finite,
+/// not normalized); `locscale`/`pushfwd` preserve total mass (a probability
+/// measure stays normalized).
+#[test]
+fn domain_preserving_measure_ops_infer() {
+    let out = ir("x = restrict(Normal(0.0, 1.0), interval(0.0, 1.0))");
+    assert!(
+        out.contains("(%measure (%domain (%scalar real)) (%mass %finite))")
+            && out.contains("(restrict"),
+        "restrict should infer a finite real measure, got:\n{out}"
+    );
+    let out = ir("x = superpose(Normal(0.0, 1.0), Normal(1.0, 1.0))");
+    assert!(
+        out.contains("(%mass %finite)") && out.contains("(superpose"),
+        "superpose of two probability measures should be finite (mass 2), got:\n{out}"
+    );
+    let out = ir("x = locscale(Normal(0.0, 1.0), 2.0, 3.0)");
+    assert!(
+        out.contains("(%measure (%domain (%scalar real)) (%mass %normalized))")
+            && out.contains("(locscale"),
+        "locscale of a probability measure stays normalized, got:\n{out}"
+    );
+    let out = ir("f = fn(_ * 2.0)\nx = pushfwd(f, Normal(0.0, 1.0))");
+    assert!(
+        out.contains("(%mass %normalized)") && out.contains("(pushfwd"),
+        "pushfwd preserves total mass → normalized, got:\n{out}"
     );
 }
 
