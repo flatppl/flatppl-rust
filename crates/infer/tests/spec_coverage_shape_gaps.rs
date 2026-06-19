@@ -541,3 +541,19 @@ fn cat_and_tile_preserve_kind_and_rank() {
         "tile(matrix) should stay a rank-2 (nested) real matrix, got:\n{out}"
     );
 }
+
+/// `reduce(f, xs)` folds to xs's element type (spec §07: f returns the element
+/// type); `filter(pred, data)` keeps data's type/rank with a dynamic length.
+#[test]
+fn reduce_and_filter_infer() {
+    let out = ir("xs = [1.0, 2.0, 3.0]\nx = reduce(fn(_ + 1.0), xs)");
+    assert!(
+        out.contains("(%meta ((%scalar real) %fixed reals) (reduce"),
+        "reduce over a real vector should infer a real scalar, got:\n{out}"
+    );
+    let out = ir("d = [1.0, 2.0, 3.0]\ny = filter(fn(_ in interval(0.0, 2.0)), d)");
+    assert!(
+        out.contains("(%array 1 (%dynamic) (%scalar real))") && out.contains("(filter"),
+        "filter of a real vector should stay a real vector (dynamic length), got:\n{out}"
+    );
+}

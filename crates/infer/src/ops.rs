@@ -157,6 +157,16 @@ pub(crate) fn call_rule(
         },
         // tile(A, size) keeps A's rank and element kind; only the sizes change.
         "tile" => arg_ty(args, 0).map_or(Type::Deferred, with_dynamic_dims),
+        // reduce(f, xs) folds xs with an associative f; spec §07 requires f to
+        // return the element type of xs, so the result IS that element type
+        // (a vector of reals reduces to a real, a vector of vectors to a vector).
+        "reduce" => match arg_ty(args, 1) {
+            Some(Type::Array { elem, .. }) => (**elem).clone(),
+            _ => Type::Deferred,
+        },
+        // filter(pred, data) keeps a subset of data's elements/rows: same type
+        // and rank as data, with the filtered axis now dynamic.
+        "filter" => arg_ty(args, 1).map_or(Type::Deferred, with_dynamic_dims),
         // cat(x, y, …) concatenates values of the same structural kind: scalars
         // → a rank-1 vector of that kind; arrays → the same rank/element as the
         // first argument (one axis grows, so sizes are dynamic).

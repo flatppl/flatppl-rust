@@ -128,6 +128,9 @@ Catalogue(
         // identity(x) returns x unchanged; reverse/cumsum/cumprod preserve the
         // input vector's shape and element type.
         Builtin(name: "identity",     sig: Function(params: [Any],      result: SameAsArg(0))),
+        // bijection(f, f_inv, logvolume) annotates f and is semantically f
+        // (spec §06) → its type is f's type.
+        Builtin(name: "bijection",    sig: Function(params: [Callable, Callable, Any], result: SameAsArg(0))),
         Builtin(name: "reverse",      sig: Function(params: [Any],      result: SameAsArg(0))),
         Builtin(name: "cumsum",       sig: Function(params: [Any],      result: SameAsArg(0))),
         Builtin(name: "cumprod",      sig: Function(params: [Any],      result: SameAsArg(0))),
