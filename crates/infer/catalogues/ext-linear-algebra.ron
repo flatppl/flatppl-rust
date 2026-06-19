@@ -1,0 +1,42 @@
+// Standard module: ext-linear-algebra (spec §09). Loaded by catalogue::builtin().
+        Module(
+            name: "ext-linear-algebra",
+            version: "0.1",
+            bindings: [
+                // lu(A) → record(P, L, U): returns a struct of three matrices.
+                // ResultSig has no Record variant; closest expressible type is dynamic matrix.
+                // (The actual return is a named-field record, inexpressible in ResultSig.)
+                Binding(name: "lu",
+                    sig: Function(params: [Matrix], result: Matrix(rows: Dyn, cols: Dyn)),
+                    degraded: Some("true result is record(P, L, U) — three square matrices; ResultSig::Record not in the type system → Matrix(Dyn, Dyn) (placeholder)")),
+                // svd(A) → record(U, S, V)
+                Binding(name: "svd",
+                    sig: Function(params: [Matrix], result: Matrix(rows: Dyn, cols: Dyn)),
+                    degraded: Some("true result is record(U, S, V) — two matrices and a vector; ResultSig::Record not in the type system → Matrix(Dyn, Dyn) (placeholder)")),
+                // eigen(A) → record(values, vectors)
+                Binding(name: "eigen",
+                    sig: Function(params: [Matrix], result: Matrix(rows: Dyn, cols: Dyn)),
+                    degraded: Some("true result is record(values, vectors) — vector and matrix; ResultSig::Record not in the type system → Matrix(Dyn, Dyn) (placeholder)")),
+                // eigmax(A) → real (maximal eigenvalue, real-valued when A has real eigenvalues)
+                Binding(name: "eigmax",
+                    sig: Function(params: [Matrix], result: Scalar(Real))),
+                // eigmin(A) → real
+                Binding(name: "eigmin",
+                    sig: Function(params: [Matrix], result: Scalar(Real))),
+                // matexp(A) → matrix (same shape as A)
+                Binding(name: "matexp",
+                    sig: Function(params: [Matrix], result: Matrix(rows: Dyn, cols: Dyn)),
+                    degraded: Some("result shape equals input shape; no shape-passthrough in ResultSig → Matrix(Dyn, Dyn)")),
+                // kron(A, B) → matrix of shape pm×qn
+                Binding(name: "kron",
+                    sig: Function(params: [Matrix, Matrix], result: Matrix(rows: Dyn, cols: Dyn)),
+                    degraded: Some("result shape is pm×qn; no shape arithmetic in ResultSig → Matrix(Dyn, Dyn)")),
+                // lstsq(A, b) → vector (least squares solution x)
+                Binding(name: "lstsq",
+                    sig: Function(params: [Matrix, Vector(Real)], result: Matrix(rows: Dyn, cols: Dyn)),
+                    degraded: Some("true result is a vector of length k (columns of A); ResultSig has no vector-from-arg-shape → Matrix(Dyn, Dyn) (placeholder)")),
+                // rank(A) → integer (numerical rank)
+                Binding(name: "rank",
+                    sig: Function(params: [Matrix], result: Scalar(Integer))),
+            ]
+)

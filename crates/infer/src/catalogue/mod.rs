@@ -220,10 +220,28 @@ static BUILTIN: OnceLock<Catalogue> = OnceLock::new();
 /// The process-global built-in catalogue (parsed once from `catalogue.ron`).
 pub(crate) fn builtin() -> &'static Catalogue {
     BUILTIN.get_or_init(|| {
-        parse_catalogue(include_str!("../../catalogue.ron"))
-            .expect("built-in catalogue.ron must parse")
+        let mut cat = parse_catalogue(include_str!("../../catalogue.ron"))
+            .expect("built-in catalogue.ron must parse");
+        // Standard modules (spec §09) each live in their own RON file under
+        // `catalogues/`; parse and merge them into the base catalogue here.
+        cat.modules = STD_MODULE_SRCS
+            .iter()
+            .map(|src| {
+                ron::from_str::<Module>(src).expect("built-in standard-module .ron must parse")
+            })
+            .collect();
+        cat
     })
 }
+
+/// Per-module RON sources for the spec-§09 standard modules, embedded at build.
+const STD_MODULE_SRCS: &[&str] = &[
+    include_str!("../../catalogues/particle-physics.ron"),
+    include_str!("../../catalogues/ext-linear-algebra.ron"),
+    include_str!("../../catalogues/special-functions.ron"),
+    include_str!("../../catalogues/polynomials.ron"),
+    include_str!("../../catalogues/distances.ron"),
+];
 
 impl Catalogue {
     /// Look up a base (built-in) distribution signature by name.

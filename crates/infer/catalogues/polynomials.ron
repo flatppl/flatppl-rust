@@ -1,0 +1,15 @@
+// Standard module: polynomials (spec §09). Loaded by catalogue::builtin().
+        Module(
+            name: "polynomials",
+            version: "0.1",
+            bindings: [
+                // legendre(n, x): non-negative integer degree, real argument → real
+                Binding(name: "legendre",  sig: Function(params: [Scalar(Integer), Scalar(Real)], result: Scalar(Real))),
+                // hermite(n, x): physicist's Hermite polynomial
+                Binding(name: "hermite",   sig: Function(params: [Scalar(Integer), Scalar(Real)], result: Scalar(Real))),
+                // laguerre(n, x)
+                Binding(name: "laguerre",  sig: Function(params: [Scalar(Integer), Scalar(Real)], result: Scalar(Real))),
+                // chebyshev(n, x): Chebyshev polynomial of the first kind
+                Binding(name: "chebyshev", sig: Function(params: [Scalar(Integer), Scalar(Real)], result: Scalar(Real))),
+            ]
+)

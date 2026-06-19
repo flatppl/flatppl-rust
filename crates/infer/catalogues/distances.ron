@@ -1,0 +1,31 @@
+// Standard module: distances (spec §09). Loaded by catalogue::builtin().
+        Module(
+            name: "distances",
+            version: "0.1",
+            bindings: [
+                // pairwise_distance(distance, x): higher-order — takes a callable + vector of vectors
+                // Returns an N×N matrix.
+                Binding(name: "pairwise_distance",
+                    sig: Function(params: [Callable, Any], result: Matrix(rows: Dyn, cols: Dyn)),
+                    degraded: Some("distance arg is a callable; x is a vector-of-vectors (inexpressible in ParamSig) → Any; result is N×N but N is arg-dependent → Matrix(Dyn, Dyn)")),
+                // cross_distance(distance, x, y): callable + two vector-of-vectors → N×M matrix
+                Binding(name: "cross_distance",
+                    sig: Function(params: [Callable, Any, Any], result: Matrix(rows: Dyn, cols: Dyn)),
+                    degraded: Some("distance arg is a callable; x/y are vector-of-vectors (inexpressible in ParamSig) → Any; result is N×M but dims are arg-dependent → Matrix(Dyn, Dyn)")),
+                // euclidean(u, v) → real
+                Binding(name: "euclidean",         sig: Function(params: [Vector(Real), Vector(Real)], result: Scalar(Real))),
+                // squared_euclidean(u, v) → real
+                Binding(name: "squared_euclidean", sig: Function(params: [Vector(Real), Vector(Real)], result: Scalar(Real))),
+                // cosine(u, v) → real ∈ [0, 2]
+                Binding(name: "cosine",            sig: Function(params: [Vector(Real), Vector(Real)], result: Scalar(Real))),
+                // manhattan(u, v) → real (L1 distance)
+                Binding(name: "manhattan",         sig: Function(params: [Vector(Real), Vector(Real)], result: Scalar(Real))),
+                // chebyshev(u, v) → real (L∞ distance)
+                Binding(name: "chebyshev",         sig: Function(params: [Vector(Real), Vector(Real)], result: Scalar(Real))),
+                // minkowski(u, v, p): p-norm distance
+                Binding(name: "minkowski",         sig: Function(params: [Vector(Real), Vector(Real), Scalar(Real)], result: Scalar(Real))),
+                // jensenshannon(u, v): probability vectors (std simplex) → real ∈ [0,1]
+                Binding(name: "jensenshannon",     sig: Function(params: [Vector(Real), Vector(Real)], result: Scalar(Real)),
+                    degraded: Some("u and v must be probability vectors (stdsimplex); ParamSig::Vector(Real) is a sound superset; the unit constraint is not encoded")),
+            ]
+)
