@@ -653,17 +653,19 @@ fn qr_infers_a_record_of_matrices() {
 }
 
 /// `aggregate(f, output_axes, expr)` / `metricsum` (spec §04) are einsum-style
-/// reductions: the result rank is the number of output axes, the element kind
-/// comes from the reduced expr, and empty output axes give a scalar.
+/// reductions: element from the reduced expr, empty axes → scalar, and the
+/// result dims are the EXACT extents — each output axis is traced to the input
+/// dimension it indexes in the body (`A[.i, .j]` → `.i` is A's flat dim 0).
 #[test]
-fn aggregate_rank_from_output_axes() {
-    // Two output axes → rank-2 real array (matrix product).
-    let out = ir("A = [[1.0, 2.0], [3.0, 4.0]]\n\
-                  B = [[5.0, 6.0], [7.0, 8.0]]\n\
+fn aggregate_resolves_exact_einsum_dims() {
+    // Matrix product A:(2,3) · B:(3,4) → C[.i,.k] is (2,4): .i ← A dim0,
+    // .k ← B dim1 (the contracted .j is gone).
+    let out = ir("A = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]\n\
+                  B = [[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0], [9.0, 8.0, 7.0, 6.0]]\n\
                   C = aggregate(sum, [.i, .k], A[.i, .j] * B[.j, .k])");
     assert!(
-        out.contains("(%array 2 (%dynamic %dynamic) (%scalar real))") && out.contains("(aggregate"),
-        "aggregate over 2 axes should be a rank-2 real array, got:\n{out}"
+        out.contains("(%array 2 (2 4) (%scalar real))") && out.contains("(aggregate"),
+        "matmul aggregate should resolve to exact (2,4), got:\n{out}"
     );
     // Empty output axes → scalar (full contraction).
     let out = ir("A = [1.0, 2.0]\nB = [3.0, 4.0]\ns = aggregate(sum, [], A[.i] * B[.i])");
@@ -671,11 +673,12 @@ fn aggregate_rank_from_output_axes() {
         out.contains("(%meta ((%scalar real) %fixed reals) (aggregate"),
         "aggregate over no axes should be a real scalar, got:\n{out}"
     );
-    // One output axis → rank-1; metricsum shares the rule.
-    let out = ir("A = [[1.0, 2.0], [3.0, 4.0]]\nV = aggregate(var, [.j], A[.i, .j])");
+    // var over axis .j of A:(2,3) → length-3 vector (.j ← A dim1); metricsum
+    // shares the rule.
+    let out = ir("A = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]\nV = aggregate(var, [.j], A[.i, .j])");
     assert!(
-        out.contains("(%array 1 (%dynamic) (%scalar real))") && out.contains("(aggregate"),
-        "aggregate over 1 axis should be a rank-1 real array, got:\n{out}"
+        out.contains("(%array 1 (3) (%scalar real))") && out.contains("(aggregate"),
+        "var over .j should resolve to exact length 3, got:\n{out}"
     );
 }
 

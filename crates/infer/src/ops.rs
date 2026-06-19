@@ -205,12 +205,25 @@ pub(crate) fn call_rule(
                     .and_then(elem_scalar_kind_of)
                     .unwrap_or(ScalarType::Real),
             );
-            match args.get(1).and_then(|a| output_axis_rank(inf, a.0)) {
-                Some(0) => elem,
-                Some(rank) => Type::Array {
-                    shape: vec![Dim::Dynamic; rank].into_boxed_slice(),
-                    elem: Box::new(elem),
-                },
+            match args.get(1).and_then(|a| output_axis_names(inf, a.0)) {
+                // No output axes → full contraction → scalar.
+                Some(axes) if axes.is_empty() => elem,
+                Some(axes) => {
+                    // Exact dims: trace each output axis to the input dim it
+                    // indexes in the body (`A[.i, .j]` → `.i` is A's flat dim 0).
+                    let mut extents = std::collections::HashMap::new();
+                    if let Some(b) = args.get(2) {
+                        collect_axis_dims(inf, b.0, &mut extents);
+                    }
+                    let dims: Vec<Dim> = axes
+                        .iter()
+                        .map(|a| extents.get(a).copied().unwrap_or(Dim::Dynamic))
+                        .collect();
+                    Type::Array {
+                        shape: dims.into_boxed_slice(),
+                        elem: Box::new(elem),
+                    }
+                }
                 None => Type::Deferred,
             }
         }
@@ -851,17 +864,71 @@ fn with_dynamic_dims(t: &Type) -> Type {
     }
 }
 
-/// The number of output axes of an `aggregate`/`metricsum` — the length of the
-/// `output_axes` vector literal `[.i, .k]` (each element is one result axis).
+/// The output axes of an `aggregate`/`metricsum` — the `(%axis …)` names in the
+/// `output_axes` vector literal `[.i, .k]`, in order (one result axis each).
 /// `None` when the axis list isn't a literal vector (rank not statically known).
-fn output_axis_rank(inf: &Inferencer<'_, '_>, node: NodeId) -> Option<usize> {
-    if let Node::Call(c) = inf.module.node(node)
-        && matches!(c.head, flatppl_core::CallHead::Builtin(op)
-            if inf.module.resolve(op) == "vector")
+fn output_axis_names(inf: &Inferencer<'_, '_>, node: NodeId) -> Option<Vec<Symbol>> {
+    let Node::Call(c) = inf.module.node(node) else {
+        return None;
+    };
+    if !matches!(c.head, flatppl_core::CallHead::Builtin(op)
+        if inf.module.resolve(op) == "vector")
     {
-        return Some(c.args.len());
+        return None;
     }
-    None
+    let mut out = Vec::new();
+    for &a in c.args.iter() {
+        if let Node::Axis(ax) = inf.module.node(a) {
+            out.push(ax.name);
+        }
+    }
+    Some(out)
+}
+
+/// All dims of `t` flattened across array nesting (a nested-vector matrix
+/// `Array[r]{ Array[c]{e} }` flattens to `[r, c]`), so an index position maps to
+/// a single extent.
+fn flatten_dims(t: &Type) -> Vec<Dim> {
+    match t {
+        Type::Array { shape, elem } => {
+            let mut v = shape.to_vec();
+            v.extend(flatten_dims(elem));
+            v
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Walk an `aggregate`/`metricsum` body collecting, for each axis name, the
+/// input dim it indexes: an index `arr[…, ax_k, …]` (`get`/`get0`) binds `ax_k`
+/// to `arr`'s flattened dim at that position. First binding wins (einsum
+/// consistency); axes that never index a statically-shaped array stay absent
+/// (→ dynamic).
+fn collect_axis_dims(
+    inf: &mut Inferencer<'_, '_>,
+    node: NodeId,
+    out: &mut std::collections::HashMap<Symbol, Dim>,
+) {
+    let Node::Call(c) = inf.module.node(node).clone() else {
+        return;
+    };
+    if let flatppl_core::CallHead::Builtin(op) = c.head {
+        let name = inf.module.resolve(op).to_string();
+        if (name == "get" || name == "get0") && !c.args.is_empty() {
+            let arr_ty = inf.infer_node(c.args[0]).0;
+            let flat = flatten_dims(&arr_ty);
+            for (k, &idx) in c.args.iter().enumerate().skip(1) {
+                if let Node::Axis(ax) = inf.module.node(idx) {
+                    if let Some(&d) = flat.get(k - 1) {
+                        out.entry(ax.name).or_insert(d);
+                    }
+                }
+            }
+        }
+    }
+    for &a in c.args.iter() {
+        collect_axis_dims(inf, a, out);
+    }
 }
 
 /// The dims of an `iid` count argument: a vector literal contributes one dim
