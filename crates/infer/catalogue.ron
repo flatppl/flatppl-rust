@@ -137,6 +137,29 @@ Catalogue(
         // ifelse(cond, a, b) returns a or b → the common type of the two branches (spec §07).
         Builtin(name: "ifelse",       sig: Function(params: [Scalar(Boolean), Any, Any], result: CommonOf(1, 2))),
 
+        // -- linear algebra: matrix/vector results (spec §07 "Linear algebra") --
+        // Lengths/dims degrade to dynamic (no value-level shape arithmetic in the
+        // type system); element kinds are exact.
+        // eye(n): real identity matrix.
+        Builtin(name: "eye",            sig: Function(params: [Scalar(Integer)], result: Matrix(rows: Dyn, cols: Dyn))),
+        // inv / lower_cholesky: square matrix, element kind preserved (a complex
+        // matrix inverts to a complex matrix).
+        Builtin(name: "inv",            sig: Function(params: [Matrix], result: MatrixElem(rows: Dyn, cols: Dyn, elem: OfArg(0)))),
+        Builtin(name: "lower_cholesky", sig: Function(params: [Matrix], result: MatrixElem(rows: Dyn, cols: Dyn, elem: OfArg(0)))),
+        // diagmat(x): vector → diagonal matrix, element kind from the vector.
+        Builtin(name: "diagmat",        sig: Function(params: [Vector(Real)], result: MatrixElem(rows: Dyn, cols: Dyn, elem: OfArg(0)))),
+        // diag(A, k=0): extract a diagonal as a vector, element kind from A.
+        Builtin(name: "diag",           sig: Function(params: [Matrix, Scalar(Integer)], result: Vector(len: Dyn, elem: OfArg(0)))),
+        // cross(a, b): 3-vector cross product, element kind from a.
+        Builtin(name: "cross",          sig: Function(params: [Vector(Real), Vector(Real)], result: Vector(len: Dyn, elem: OfArg(0)))),
+        // linspace / extlinspace: real vector of grid points.
+        Builtin(name: "linspace",       sig: Function(params: [Scalar(Real), Scalar(Real), Scalar(Integer)], result: Vector(len: Dyn, elem: Real))),
+        Builtin(name: "extlinspace",    sig: Function(params: [Scalar(Real), Scalar(Real), Scalar(Integer)], result: Vector(len: Dyn, elem: Real))),
+        // sizeof(x): the dimensions of x as an integer vector.
+        Builtin(name: "sizeof",         sig: Function(params: [Any], result: Vector(len: Dyn, elem: Integer))),
+        // totalmass(M): total mass Z = ∫ dM as a real scalar (spec §06).
+        Builtin(name: "totalmass",      sig: Function(params: [Any], result: Scalar(Real))),
+
         // -- scalar-complex output --
         // cis(theta) = exp(i*theta); complex(re, im) = re + i*im (spec §07).
         Builtin(name: "cis",     sig: Function(params: [Scalar(Real)],               result: Scalar(Complex))),

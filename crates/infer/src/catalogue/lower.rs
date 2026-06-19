@@ -1,8 +1,33 @@
 //! The single code↔data bridge: a `Sig` + call context → core inference types.
 //! Arg-dependent forms (VectorFromParam, DimExpr) are evaluated here.
 
-use super::{DimExpr, DomainSig, MassTag, ResultSig, ScalarTag, Sig, SupportTag};
+use super::{DimExpr, DomainSig, ElemSig, MassTag, ResultSig, ScalarTag, Sig, SupportTag};
 use flatppl_core::{Dim, Mass, ScalarType, Type, ValueSet};
+
+/// Resolve a `DimExpr` against the call context (the same mapping the `Matrix`
+/// result sig uses): a param-indexed dim reads the arg's dim, everything else
+/// degrades to dynamic.
+fn dim_of(e: &DimExpr, ctx: &LowerCtx) -> Dim {
+    match e {
+        DimExpr::Dyn => Dim::Dynamic,
+        DimExpr::OfParam(i) => (ctx.arg_dim)(*i),
+        DimExpr::MulDims(_, _) => Dim::Dynamic,
+    }
+}
+
+/// Resolve an `ElemSig` to a concrete scalar kind; `OfArg(i)` drills arg `i`'s
+/// element kind, defaulting to real when it is not statically known.
+fn elem_of(e: &ElemSig, ctx: &LowerCtx) -> ScalarType {
+    match e {
+        ElemSig::Real => ScalarType::Real,
+        ElemSig::Integer => ScalarType::Integer,
+        ElemSig::Boolean => ScalarType::Boolean,
+        ElemSig::Complex => ScalarType::Complex,
+        ElemSig::OfArg(i) => {
+            elem_scalar_kind((ctx.arg_type)(*i).as_ref()).unwrap_or(ScalarType::Real)
+        }
+    }
+}
 
 /// What `lower` needs from the call site to evaluate arg-dependent signatures.
 pub(crate) struct LowerCtx<'a> {
@@ -188,6 +213,14 @@ pub(crate) fn lower(sig: &Sig, ctx: &LowerCtx) -> (Type, ValueSet) {
                 ResultSig::ElemScalarKind(i) => Type::Scalar(
                     elem_scalar_kind((ctx.arg_type)(*i).as_ref()).unwrap_or(ScalarType::Real),
                 ),
+                ResultSig::Vector { len, elem } => Type::Array {
+                    shape: Box::new([dim_of(len, ctx)]),
+                    elem: Box::new(Type::Scalar(elem_of(elem, ctx))),
+                },
+                ResultSig::MatrixElem { rows, cols, elem } => Type::Array {
+                    shape: Box::new([dim_of(rows, ctx), dim_of(cols, ctx)]),
+                    elem: Box::new(Type::Scalar(elem_of(elem, ctx))),
+                },
             };
             let vset = ValueSet::natural_of(&ty);
             (ty, vset)

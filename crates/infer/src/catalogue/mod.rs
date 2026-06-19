@@ -160,6 +160,34 @@ pub(crate) enum ResultSig {
     /// nesting (`det`, `trace`): a real matrix yields a real scalar, a complex
     /// matrix a complex scalar.
     ElemScalarKind(usize),
+    /// Result is a rank-1 array (vector) of the given length and element type
+    /// (`linspace`/`extlinspace` → real, `sizeof` → integer, `diag` → the
+    /// argument's element kind via `ElemSig::OfArg`).
+    Vector {
+        len: DimExpr,
+        elem: ElemSig,
+    },
+    /// Result is a rank-2 array (matrix) whose element type follows `elem`
+    /// rather than being forced real — for element-preserving matrix maps
+    /// (`inv`, `lower_cholesky`, `diagmat`): a complex matrix inverts to a
+    /// complex matrix. (`ResultSig::Matrix` stays for always-real results.)
+    MatrixElem {
+        rows: DimExpr,
+        cols: DimExpr,
+        elem: ElemSig,
+    },
+}
+
+/// The element-type source of a `Vector` / `MatrixElem` result.
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) enum ElemSig {
+    Real,
+    Integer,
+    Boolean,
+    Complex,
+    /// The (array-drilled) element kind of positional arg `i`; defaults to real
+    /// when that arg's kind is not statically known.
+    OfArg(usize),
 }
 
 // Matrix dimension expressions: parsed for RON schema fidelity. Lowering maps

@@ -151,9 +151,11 @@ fn level_normalization_does_not_resolve_dims() {
 
 // ---- Gap documentation: measure ops ----
 
-/// All of `restrict`, `pushfwd`, `totalmass`, `superpose`, `Dirac`, `kchain`
-/// parse without error and are honestly deferred (no type rule yet). Each
-/// binding gets `%deferred` rather than a wrong type or a panic.
+/// `restrict`, `pushfwd`, `superpose`, `Dirac`, `kchain` parse without error
+/// and are honestly deferred (no type rule yet — measure-algebra transforms the
+/// engine has no evaluator for). Each binding gets `%deferred` rather than a
+/// wrong type or a panic. (`totalmass` is no longer here — it now infers a real
+/// scalar; see `totalmass_infers_a_real_scalar`.)
 #[test]
 fn unimplemented_measure_ops_are_deferred() {
     // restrict
@@ -168,13 +170,6 @@ fn unimplemented_measure_ops_are_deferred() {
     assert!(
         out.contains("(%meta (%deferred %fixed %unknown) (pushfwd"),
         "pushfwd: expected %deferred gap, got:\n{out}"
-    );
-
-    // totalmass
-    let out = ir("x = totalmass(Normal(0.0,1.0))");
-    assert!(
-        out.contains("(%meta (%deferred %fixed %unknown) (totalmass"),
-        "totalmass: expected %deferred gap, got:\n{out}"
     );
 
     // superpose
@@ -201,10 +196,10 @@ fn unimplemented_measure_ops_are_deferred() {
 
 // ---- Gap documentation: linear-algebra functions ----
 
-/// `transpose`, `eye`, and `linspace` all parse and are honestly deferred —
-/// no type rule yet, each binding gets `%deferred` without panic. (`det` is no
-/// longer here — it now infers a scalar via the catalogue; see
-/// `det_infers_element_scalar_kind`.)
+/// `transpose` still parses and is honestly deferred — no type rule yet (its
+/// result rank depends on whether the argument is a vector or a matrix, which
+/// the catalogue cannot yet branch on). (`det`/`eye`/`linspace` are no longer
+/// here — they now infer via the catalogue; see the tests below.)
 #[test]
 fn unimplemented_functions_are_deferred() {
     // transpose
@@ -212,20 +207,6 @@ fn unimplemented_functions_are_deferred() {
     assert!(
         out.contains("(%meta (%deferred %fixed %unknown) (transpose"),
         "transpose: expected %deferred gap, got:\n{out}"
-    );
-
-    // eye
-    let out = ir("x = eye(3)");
-    assert!(
-        out.contains("(%meta (%deferred %fixed %unknown) (eye"),
-        "eye: expected %deferred gap, got:\n{out}"
-    );
-
-    // linspace
-    let out = ir("x = linspace(0.0, 1.0, 5)");
-    assert!(
-        out.contains("(%meta (%deferred %fixed %unknown) (linspace"),
-        "linspace: expected %deferred gap, got:\n{out}"
     );
 }
 
@@ -331,4 +312,74 @@ fn maximum_minimum_thread_element_kind() {
             "{op} over an integer array should infer an integer scalar, got:\n{out}"
         );
     }
+}
+
+// ---- Round 3: linear-algebra matrix/vector results via the catalogue ----
+
+/// `eye(n)` infers a real (dynamic-dim) matrix.
+#[test]
+fn eye_infers_a_real_matrix() {
+    let out = ir("x = eye(3)");
+    assert!(
+        out.contains("(%array 2 (%dynamic %dynamic) (%scalar real))") && out.contains("(eye"),
+        "eye should infer a rank-2 real array, got:\n{out}"
+    );
+}
+
+/// `inv` / `lower_cholesky` / `diagmat` infer a matrix whose element kind is
+/// preserved from the argument — a complex matrix inverts to a complex matrix.
+#[test]
+fn matrix_maps_preserve_element_kind() {
+    let out = ir("A = [[1.0, 0.0], [0.0, 1.0]]\nx = inv(A)");
+    assert!(
+        out.contains("(%array 2 (%dynamic %dynamic) (%scalar real))") && out.contains("(inv"),
+        "inv(real matrix) should be a real matrix, got:\n{out}"
+    );
+    let out = ir("A = [[complex(1.0, 0.0)]]\nx = inv(A)");
+    assert!(
+        out.contains("(%array 2 (%dynamic %dynamic) (%scalar complex))") && out.contains("(inv"),
+        "inv(complex matrix) should be a complex matrix, got:\n{out}"
+    );
+    let out = ir("A = [[4.0, 0.0], [0.0, 9.0]]\nx = lower_cholesky(A)");
+    assert!(
+        out.contains("(%array 2 (%dynamic %dynamic) (%scalar real))")
+            && out.contains("(lower_cholesky"),
+        "lower_cholesky(real PD) should be a real matrix, got:\n{out}"
+    );
+    let out = ir("v = [1.0, 2.0]\nx = diagmat(v)");
+    assert!(
+        out.contains("(%array 2 (%dynamic %dynamic) (%scalar real))") && out.contains("(diagmat"),
+        "diagmat(real vector) should be a real matrix, got:\n{out}"
+    );
+}
+
+/// Vector-result functions infer a rank-1 array with the right element kind:
+/// `linspace` → real, `sizeof` → integer, `diag` → the matrix's element kind.
+#[test]
+fn vector_result_functions_infer() {
+    let out = ir("x = linspace(0.0, 1.0, 5)");
+    assert!(
+        out.contains("(%array 1 (%dynamic) (%scalar real))") && out.contains("(linspace"),
+        "linspace should infer a real vector, got:\n{out}"
+    );
+    let out = ir("v = [1.0, 2.0, 3.0]\nx = sizeof(v)");
+    assert!(
+        out.contains("(%array 1 (%dynamic) (%scalar integer))") && out.contains("(sizeof"),
+        "sizeof should infer an integer vector, got:\n{out}"
+    );
+    let out = ir("A = [[1.0, 2.0], [3.0, 4.0]]\nx = diag(A)");
+    assert!(
+        out.contains("(%array 1 (%dynamic) (%scalar real))") && out.contains("(diag"),
+        "diag(real matrix) should infer a real vector, got:\n{out}"
+    );
+}
+
+/// `totalmass(M)` is the total mass as a real scalar (spec §06).
+#[test]
+fn totalmass_infers_a_real_scalar() {
+    let out = ir("m = Normal(0.0, 1.0)\nx = totalmass(m)");
+    assert!(
+        out.contains("(%meta ((%scalar real) %fixed reals) (totalmass"),
+        "totalmass should infer a real scalar, got:\n{out}"
+    );
 }
