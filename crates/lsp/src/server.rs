@@ -15,8 +15,8 @@ use lsp_types::{
     CompletionOptions, HoverProviderCapability, OneOf, PublishDiagnosticsParams,
     ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind, Uri,
     notification::{
-        DidChangeTextDocument, DidChangeWatchedFiles, DidOpenTextDocument, Notification as _,
-        PublishDiagnostics,
+        DidChangeTextDocument, DidChangeWatchedFiles, DidCloseTextDocument, DidOpenTextDocument,
+        Notification as _, PublishDiagnostics,
     },
     request::{
         Completion, DocumentSymbolRequest, GotoDefinition, HoverRequest, InlayHintRequest,
@@ -91,9 +91,14 @@ pub fn run(
     // unsaved editor edits.
     let mut editor_open_uris: HashSet<String> = HashSet::new();
 
+    // Last document version reported by the editor (didOpen / didChange).
+    // Used to (a) drop stale / out-of-order edits and (b) stamp the published
+    // diagnostics with the version they were computed against.
+    let mut doc_versions: HashMap<String, i32> = HashMap::new();
+
     // Publish initial diagnostics for all workspace files.
     for (uri_str, &file) in &uri_to_file {
-        publish_diagnostics(&connection, &db, file, fs, cats, uri_str)?;
+        publish_diagnostics(&connection, &db, file, fs, cats, uri_str, None)?;
     }
 
     // ── Main loop ────────────────────────────────────────────────────────────
@@ -118,6 +123,7 @@ pub fn run(
                         // Mark as editor-managed so watched-file CHANGED events
                         // skip it (editor content takes precedence over on-disk).
                         editor_open_uris.insert(uri_str.clone());
+                        doc_versions.insert(uri_str.clone(), p.text_document.version);
                         upsert_file(&mut db, &mut uri_to_file, uri_str, text);
                         // Update the shared FileSet only when the file SET membership
                         // changes (a new open always adds a file, so this fires).
@@ -128,7 +134,16 @@ pub fn run(
                         let open_files: Vec<(String, SourceFile)> =
                             uri_to_file.iter().map(|(u, &f)| (u.clone(), f)).collect();
                         for (doc_uri_str, file) in open_files {
-                            publish_diagnostics(&connection, &db, file, fs, cats, &doc_uri_str)?;
+                            let version = doc_versions.get(&doc_uri_str).copied();
+                            publish_diagnostics(
+                                &connection,
+                                &db,
+                                file,
+                                fs,
+                                cats,
+                                &doc_uri_str,
+                                version,
+                            )?;
                         }
                     }
                     DidChangeTextDocument::METHOD => {
@@ -143,6 +158,17 @@ pub fn run(
                                 }
                             };
                         let uri_str = p.text_document.uri.as_str().to_owned();
+                        // Drop stale / out-of-order edits: an editor may deliver a
+                        // didChange whose version predates one we already applied
+                        // (network reordering, replayed buffers). Applying it would
+                        // resurrect older text; ignore it entirely.
+                        let new_version = p.text_document.version;
+                        if let Some(&prev) = doc_versions.get(&uri_str) {
+                            if new_version < prev {
+                                continue;
+                            }
+                        }
+                        doc_versions.insert(uri_str.clone(), new_version);
                         // Full sync — take last content change.
                         if let Some(change) = p.content_changes.into_iter().last() {
                             upsert_file(&mut db, &mut uri_to_file, uri_str.clone(), change.text);
@@ -157,6 +183,7 @@ pub fn run(
                             for (doc_uri_str, file) in
                                 affected_files(&db, fs, &uri_to_file, changed)
                             {
+                                let version = doc_versions.get(&doc_uri_str).copied();
                                 publish_diagnostics(
                                     &connection,
                                     &db,
@@ -164,9 +191,27 @@ pub fn run(
                                     fs,
                                     cats,
                                     &doc_uri_str,
+                                    version,
                                 )?;
                             }
                         }
+                    }
+                    DidCloseTextDocument::METHOD => {
+                        // The editor closed its buffer for this file. Drop it from
+                        // the editor-managed set and forget its version so on-disk
+                        // `didChangeWatchedFiles` events take over again (the file
+                        // is no longer authoritatively owned by the editor).
+                        let p: lsp_types::DidCloseTextDocumentParams =
+                            match serde_json::from_value(note.params) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    eprintln!("flatppl-lsp: malformed didClose, skipping: {e}");
+                                    continue;
+                                }
+                            };
+                        let uri_str = p.text_document.uri.as_str().to_owned();
+                        editor_open_uris.remove(&uri_str);
+                        doc_versions.remove(&uri_str);
                     }
                     DidChangeWatchedFiles::METHOD => {
                         // Clients (e.g. VS Code) register their own glob watchers and
@@ -223,7 +268,16 @@ pub fn run(
                         let open_files: Vec<(String, SourceFile)> =
                             uri_to_file.iter().map(|(u, &f)| (u.clone(), f)).collect();
                         for (doc_uri_str, file) in open_files {
-                            publish_diagnostics(&connection, &db, file, fs, cats, &doc_uri_str)?;
+                            let version = doc_versions.get(&doc_uri_str).copied();
+                            publish_diagnostics(
+                                &connection,
+                                &db,
+                                file,
+                                fs,
+                                cats,
+                                &doc_uri_str,
+                                version,
+                            )?;
                         }
                     }
                     _ => {} // ignore other notifications
@@ -283,6 +337,10 @@ pub fn run(
 /// Build the `ServerCapabilities` value we advertise during `initialize`.
 pub fn server_capabilities() -> ServerCapabilities {
     ServerCapabilities {
+        // We index positions in UTF-16 code units (the LSP default and what our
+        // LineIndex computes), so advertise it explicitly rather than relying on
+        // the client's assumed default.
+        position_encoding: Some(lsp_types::PositionEncodingKind::UTF16),
         hover_provider: Some(HoverProviderCapability::Simple(true)),
         text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
         document_symbol_provider: Some(OneOf::Left(true)),
@@ -321,6 +379,22 @@ fn file_uri_to_path(uri_str: &str) -> Option<String> {
     // authority is always empty so `path` is now the absolute path (possibly
     // percent-encoded).
     Some(percent_decode(path))
+}
+
+/// Percent-encode a filesystem path into a `file://` URI body (encodes spaces
+/// and other reserved bytes; leaves `/` and unreserved chars). Symmetric with
+/// `file_uri_to_path`'s decode.
+fn path_to_file_uri(path: &str) -> String {
+    let mut out = String::from("file://");
+    for b in path.bytes() {
+        match b {
+            b'/' | b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 /// Percent-decode a URI path component (`%XX` → byte, then UTF-8).
@@ -363,7 +437,7 @@ fn scan_dir(dir: &Path, db: &mut Database, uri_to_file: &mut HashMap<String, Sou
                 continue;
             };
             let path_str = path.to_string_lossy().into_owned();
-            let uri_str = format!("file://{path_str}");
+            let uri_str = path_to_file_uri(&path_str);
             let file = SourceFile::new(db, path_str, text);
             uri_to_file.insert(uri_str, file);
         }
@@ -465,13 +539,14 @@ fn publish_diagnostics(
     fs: FileSet,
     cats: Catalogues,
     uri_str: &str,
+    version: Option<i32>,
 ) -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
     let diagnostics = crate::capabilities::diagnostics(db, file, fs, cats);
     let uri = Uri::from_str(uri_str)?;
     let params = PublishDiagnosticsParams {
         uri,
         diagnostics,
-        version: None,
+        version,
     };
     let note = lsp_server::Notification::new(PublishDiagnostics::METHOD.to_owned(), params);
     connection.sender.send(Message::Notification(note))?;
