@@ -492,7 +492,14 @@ impl<'db> Analyzed<'db> {
 
 /// Analyze `file`: parse it, build the cross-file `load_module` bundle from
 /// `fs`, parse `cats`' RON catalogue sources, and run inference at
-/// [`Level::Normalization`](flatppl_infer::Level::Normalization).
+/// [`Level::Shape`](flatppl_infer::Level::Shape).
+///
+/// `Level::Shape` is the maximal (additive) level: it does everything
+/// `Normalization` does plus demand-driven shape resolution, so fixed-phase
+/// integer shape expressions fold to concrete dims. This is what editor
+/// surfaces want — an `iid(M, lengthof(data))` binding shows `…[5]` in its
+/// inlay hint / hover instead of `…[?]`. Resolution is lazy (consulted only at
+/// shape positions, depth-capped), so it adds no blanket cost.
 ///
 /// Diagnostics combine the parse diagnostics, any catalogue RON parse errors,
 /// and the inference diagnostics. On parse failure the module is `None` and only
@@ -534,7 +541,7 @@ pub fn analyze<'db>(
         &mut m,
         bundle.as_bundle(),
         catalogues.as_slice(),
-        flatppl_infer::Level::Normalization,
+        flatppl_infer::Level::Shape,
     );
     diags.extend(infer_diags.iter().map(|d| LspDiag::from_infer(d, &m)));
 
