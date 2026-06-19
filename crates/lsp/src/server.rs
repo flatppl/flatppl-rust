@@ -490,7 +490,7 @@ fn file_uri_to_path(uri_str: &str) -> Option<String> {
 /// Percent-encode a filesystem path into a `file://` URI body (encodes spaces
 /// and other reserved bytes; leaves `/` and unreserved chars). Symmetric with
 /// `file_uri_to_path`'s decode.
-fn path_to_file_uri(path: &str) -> String {
+pub(crate) fn path_to_file_uri(path: &str) -> String {
     let mut out = String::from("file://");
     for b in path.bytes() {
         match b {
@@ -798,7 +798,7 @@ fn handle_goto_definition(
         let target_uri_str = if def_loc.path.starts_with("file://") {
             def_loc.path.clone()
         } else {
-            format!("file://{}", def_loc.path)
+            path_to_file_uri(&def_loc.path)
         };
         let target_uri = Uri::from_str(&target_uri_str).ok()?;
         // Build the target range: find the dep SourceFile and use its cached

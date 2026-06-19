@@ -171,7 +171,7 @@ pub fn workspace_symbols(
         let uri_str = if path.starts_with("file://") {
             path.clone()
         } else {
-            format!("file://{path}")
+            crate::server::path_to_file_uri(&path)
         };
         let Ok(uri) = lsp_types::Uri::from_str(&uri_str) else {
             continue;
