@@ -151,10 +151,10 @@ fn level_normalization_does_not_resolve_dims() {
 
 // ---- Gap documentation: measure ops ----
 
-/// `Dirac` (and the deterministic `scan`/`fchain`, structural `disintegrate`)
-/// stay honestly deferred — point-mass / deterministic-composition semantics
-/// not yet typed. (`kchain`/`markovchain`/`kscan` are no longer here — they now
-/// infer a measure type; see `kernel_chain_ops_infer_measures`.)
+/// `Dirac` stays honestly deferred — point-mass measure semantics not yet
+/// typed. (The chain/scan/compose/disintegrate ops are no longer here — they
+/// now infer; see `kernel_chain_ops_infer_measures` and
+/// `scan_fchain_disintegrate_infer`.)
 #[test]
 fn unimplemented_measure_ops_are_deferred() {
     // Dirac
@@ -162,6 +162,34 @@ fn unimplemented_measure_ops_are_deferred() {
     assert!(
         out.contains("(%meta (%deferred %fixed %unknown) (Dirac"),
         "Dirac: expected %deferred gap, got:\n{out}"
+    );
+}
+
+/// The deterministic composition / structural-disintegration ops infer, reusing
+/// existing types: `scan` → a value `array[lengthof(xs)]` of the accumulator
+/// type; `fchain` → a `function` with f1's input signature; `disintegrate` → a
+/// `(forward_kernel, marginal)` tuple, with mass classes following the joint
+/// (a probability joint → Markov kernel + probability marginal).
+#[test]
+fn scan_fchain_disintegrate_infer() {
+    let out = ir("xs = [1.0, 2.0, 3.0]\nf = (acc, x) -> acc + x\ns = scan(f, 0.0, xs)");
+    assert!(
+        out.contains("(%array 1 (3) (%scalar real))") && out.contains("(scan"),
+        "scan should infer a length-3 real value array, got:\n{out}"
+    );
+    let out = ir("f1 = x -> x + 1.0\nf2 = y -> y * 2.0\nc = fchain(f1, f2)");
+    assert!(
+        out.contains("(%function (%inputs x))") && out.contains("(fchain"),
+        "fchain should infer a function with f1's inputs, got:\n{out}"
+    );
+    let out = ir("a ~ Normal(0.0, 2.0)\n\
+                  b ~ Normal(a, 1.0)\n\
+                  jm = lawof(record(a = a, b = b))\n\
+                  fk = disintegrate([\"b\"], jm)");
+    assert!(
+        out.contains("(%tuple (%kernel (%inputs ) (%mass %normalized)) (%measure (%domain %deferred) (%mass %normalized)))")
+            && out.contains("(disintegrate"),
+        "disintegrate of a probability joint should be a (normalized kernel, normalized marginal) tuple, got:\n{out}"
     );
 }
 

@@ -271,6 +271,55 @@ pub(crate) fn call_rule(
             domain: Box::new(Type::Deferred),
             mass: Mass::Deferred,
         },
+        // `scan(f, init, xs)` (spec §04) is the DETERMINISTIC left scan — a value,
+        // not a measure: `array[lengthof(xs)]` of the accumulator type (= init's
+        // type). The stochastic analogue is `kscan`.
+        "scan" => match arg_ty(args, 1) {
+            Some(t @ (Type::Scalar(_) | Type::Array { .. })) => {
+                let len = match arg_ty(args, 2) {
+                    Some(Type::Array { shape, .. }) if !shape.is_empty() => shape[0],
+                    _ => Dim::Dynamic,
+                };
+                Type::Array {
+                    shape: Box::new([len]),
+                    elem: Box::new(t.clone()),
+                }
+            }
+            _ => Type::Deferred,
+        },
+        // `fchain(f1, f2, …)` (spec §04) composes deterministic functions; the
+        // result is a function with `f1`'s input signature (output type is not
+        // tracked by `Type::Function`).
+        "fchain" => match arg_ty(args, 0) {
+            Some(Type::Function { inputs }) => Type::Function {
+                inputs: inputs.clone(),
+            },
+            _ => Type::Deferred,
+        },
+        // `disintegrate(selector, joint)` (spec §06) splits a joint measure into
+        // a `(forward_kernel, marginal)` tuple. The kernel inputs / marginal
+        // domain depend on the selector + DAG structure (not statically tracked),
+        // but disintegrating a probability measure yields a Markov forward kernel
+        // and a probability marginal — so the mass classes follow the joint's.
+        "disintegrate" => {
+            let part_mass = match arg_ty(args, 1) {
+                Some(Type::Measure {
+                    mass: Mass::Normalized,
+                    ..
+                }) => Mass::Normalized,
+                _ => Mass::Unknown,
+            };
+            Type::Tuple(Box::new([
+                Type::Kernel {
+                    inputs: Box::new([]),
+                    mass: part_mass,
+                },
+                Type::Measure {
+                    domain: Box::new(Type::Deferred),
+                    mass: part_mass,
+                },
+            ]))
+        }
         // `relabel(M, labels)` (spec §06) renames the variate; the value domain
         // AND total mass are unchanged, so the measure type passes through whole
         // (unlike normalize/truncate, which reset the mass slot).
