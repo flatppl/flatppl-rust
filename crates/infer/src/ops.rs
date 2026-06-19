@@ -224,6 +224,18 @@ pub(crate) fn call_rule(
         // filter(pred, data) keeps a subset of data's elements/rows: same type
         // and rank as data, with the filtered axis now dynamic.
         "filter" => arg_ty(args, 1).map_or(Type::Deferred, with_dynamic_dims),
+        // partition(xs, spec) splits a vector into a vector of sub-vectors (spec
+        // §07): an outer vector whose elements are dynamic-length copies of xs.
+        "partition" => match arg_ty(args, 0) {
+            Some(t @ Type::Array { .. }) => Type::Array {
+                shape: Box::new([Dim::Dynamic]),
+                elem: Box::new(with_dynamic_dims(t)),
+            },
+            _ => Type::Deferred,
+        },
+        // selectbins(edges, region, counts) returns a shorter count array (spec
+        // §07): counts' type and rank, with the selected axis dynamic.
+        "selectbins" => arg_ty(args, 2).map_or(Type::Deferred, with_dynamic_dims),
         // cat(x, y, …) concatenates values of the same structural kind: scalars
         // → a rank-1 vector of that kind; arrays → the same rank/element as the
         // first argument (one axis grows, so sizes are dynamic).

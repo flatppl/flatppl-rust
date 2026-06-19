@@ -678,3 +678,20 @@ fn aggregate_rank_from_output_axes() {
         "aggregate over 1 axis should be a rank-1 real array, got:\n{out}"
     );
 }
+
+/// `partition(xs, spec)` → a vector of sub-vectors (spec §07); `selectbins(…,
+/// counts)` → a shorter array of counts' type.
+#[test]
+fn partition_and_selectbins_infer() {
+    let out = ir("xs = [1.0, 2.0, 3.0, 4.0]\np = partition(xs, 2)");
+    assert!(
+        out.contains("(%array 1 (%dynamic) (%array 1 (%dynamic) (%scalar real)))")
+            && out.contains("(partition"),
+        "partition should infer a vector of real sub-vectors, got:\n{out}"
+    );
+    let out = ir("e = [0.0, 1.0, 2.0]\nc = [5.0, 7.0]\nr = selectbins(e, interval(0.0, 1.0), c)");
+    assert!(
+        out.contains("(%array 1 (%dynamic) (%scalar real))") && out.contains("(selectbins"),
+        "selectbins should infer a shorter real count array, got:\n{out}"
+    );
+}
