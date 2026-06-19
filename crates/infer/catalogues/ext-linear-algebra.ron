@@ -1,0 +1,51 @@
+// Standard module: ext-linear-algebra (spec §09). Loaded by catalogue::builtin().
+        Module(
+            name: "ext-linear-algebra",
+            version: "0.1",
+            bindings: [
+                // lu(A) → record(P, L, U): permutation, lower-tri, upper-tri —
+                // all matrices with A's element kind (spec §09).
+                Binding(name: "lu",
+                    sig: Function(params: [Matrix], result: Record([
+                        ("P", MatrixElem(rows: Dyn, cols: Dyn, elem: OfArg(0))),
+                        ("L", MatrixElem(rows: Dyn, cols: Dyn, elem: OfArg(0))),
+                        ("U", MatrixElem(rows: Dyn, cols: Dyn, elem: OfArg(0))),
+                    ]))),
+                // svd(A) → record(U, S, V): U/V matrices (A's element kind); S is a
+                // vector of non-negative REAL singular values (spec §09).
+                Binding(name: "svd",
+                    sig: Function(params: [Matrix], result: Record([
+                        ("U", MatrixElem(rows: Dyn, cols: Dyn, elem: OfArg(0))),
+                        ("S", Vector(len: Dyn, elem: Real)),
+                        ("V", MatrixElem(rows: Dyn, cols: Dyn, elem: OfArg(0))),
+                    ]))),
+                // eigen(A) → record(values, vectors): values vector, vectors matrix.
+                // Element kind follows A (matching eigmax/eigmin, which assume real
+                // eigenvalues); a complex A yields complex values/vectors.
+                Binding(name: "eigen",
+                    sig: Function(params: [Matrix], result: Record([
+                        ("values", Vector(len: Dyn, elem: OfArg(0))),
+                        ("vectors", MatrixElem(rows: Dyn, cols: Dyn, elem: OfArg(0))),
+                    ]))),
+                // eigmax(A) → real (maximal eigenvalue, real-valued when A has real eigenvalues)
+                Binding(name: "eigmax",
+                    sig: Function(params: [Matrix], result: Scalar(Real))),
+                // eigmin(A) → real
+                Binding(name: "eigmin",
+                    sig: Function(params: [Matrix], result: Scalar(Real))),
+                // matexp(A) → matrix with the same shape as A (shape passes through).
+                Binding(name: "matexp",
+                    sig: Function(params: [Matrix], result: SameAsArg(0))),
+                // kron(A, B) → matrix of shape pm×qn; element kind preserved, dims
+                // dynamic (no shape arithmetic in ResultSig).
+                Binding(name: "kron",
+                    sig: Function(params: [Matrix, Matrix], result: MatrixElem(rows: Dyn, cols: Dyn, elem: OfArg(0))),
+                    degraded: Some("result shape is pm×qn; no shape arithmetic in ResultSig → dims dynamic")),
+                // lstsq(A, b) → least-squares solution vector x, element kind from b.
+                Binding(name: "lstsq",
+                    sig: Function(params: [Matrix, Vector(Real)], result: Vector(len: Dyn, elem: OfArg(1)))),
+                // rank(A) → integer (numerical rank)
+                Binding(name: "rank",
+                    sig: Function(params: [Matrix], result: Scalar(Integer))),
+            ]
+)

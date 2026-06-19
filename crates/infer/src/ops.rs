@@ -193,6 +193,40 @@ pub(crate) fn call_rule(
         },
         // tile(A, size) keeps A's rank and element kind; only the sizes change.
         "tile" => arg_ty(args, 0).map_or(Type::Deferred, with_dynamic_dims),
+        // `aggregate(f, output_axes, expr)` / `metricsum(metric, output_axes,
+        // expr)` (spec §04): an einsum-style reduction. The result RANK is the
+        // number of output axes (the `output_axes` vector at arg 1); the element
+        // kind comes from the reduced `expr` (arg 2). Empty output axes → a
+        // scalar (e.g. `aggregate(sum, [], A[.i]*B[.i])`). A non-literal axis
+        // list leaves the rank unknown → defer.
+        "aggregate" | "metricsum" => {
+            let elem = Type::Scalar(
+                arg_ty(args, 2)
+                    .and_then(elem_scalar_kind_of)
+                    .unwrap_or(ScalarType::Real),
+            );
+            match args.get(1).and_then(|a| output_axis_names(inf, a.0)) {
+                // No output axes → full contraction → scalar.
+                Some(axes) if axes.is_empty() => elem,
+                Some(axes) => {
+                    // Exact dims: trace each output axis to the input dim it
+                    // indexes in the body (`A[.i, .j]` → `.i` is A's flat dim 0).
+                    let mut extents = std::collections::HashMap::new();
+                    if let Some(b) = args.get(2) {
+                        collect_axis_dims(inf, b.0, &mut extents);
+                    }
+                    let dims: Vec<Dim> = axes
+                        .iter()
+                        .map(|a| extents.get(a).copied().unwrap_or(Dim::Dynamic))
+                        .collect();
+                    Type::Array {
+                        shape: dims.into_boxed_slice(),
+                        elem: Box::new(elem),
+                    }
+                }
+                None => Type::Deferred,
+            }
+        }
         // reduce(f, xs) folds xs with an associative f; spec §07 requires f to
         // return the element type of xs, so the result IS that element type
         // (a vector of reals reduces to a real, a vector of vectors to a vector).
@@ -203,6 +237,56 @@ pub(crate) fn call_rule(
         // filter(pred, data) keeps a subset of data's elements/rows: same type
         // and rank as data, with the filtered axis now dynamic.
         "filter" => arg_ty(args, 1).map_or(Type::Deferred, with_dynamic_dims),
+        // partition(xs, spec) splits a vector into a vector of sub-vectors (spec
+        // §07): an outer vector whose elements are dynamic-length copies of xs.
+        "partition" => match arg_ty(args, 0) {
+            Some(t @ Type::Array { .. }) => Type::Array {
+                shape: Box::new([Dim::Dynamic]),
+                elem: Box::new(with_dynamic_dims(t)),
+            },
+            _ => Type::Deferred,
+        },
+        // selectbins(edges, region, counts) returns a shorter count array (spec
+        // §07): counts' type and rank, with the selected axis dynamic.
+        "selectbins" => arg_ty(args, 2).map_or(Type::Deferred, with_dynamic_dims),
+        // addaxes(A, n_leading, n_trailing) (spec §07) inserts `n_leading`
+        // size-1 axes before A's axes and `n_trailing` after — exact when the
+        // counts are fixed integers: result shape = [1;nl] ++ A.shape ++ [1;nt],
+        // element preserved. (e.g. A:(3,4,5), addaxes(A,2,3) → (1,1,3,4,5,1,1,1).)
+        "addaxes" => {
+            let nl = args.get(1).and_then(|a| resolve_fixed_int(inf, a.0, 0));
+            let nt = args.get(2).and_then(|a| resolve_fixed_int(inf, a.0, 0));
+            match (arg_ty(args, 0), nl, nt) {
+                (Some(Type::Array { shape, elem }), Some(nl), Some(nt)) if nl >= 0 && nt >= 0 => {
+                    let mut dims: Vec<Dim> =
+                        std::iter::repeat_n(static_dim(1), nl as usize).collect();
+                    dims.extend_from_slice(shape);
+                    dims.extend(std::iter::repeat_n(static_dim(1), nt as usize));
+                    Type::Array {
+                        shape: dims.into_boxed_slice(),
+                        elem: elem.clone(),
+                    }
+                }
+                _ => Type::Deferred,
+            }
+        }
+        // splitblocks(A, blocksize) (spec §07) nests A into a vector of equal
+        // sub-arrays. Exact for a 1-D scalar vector → vector of sub-vectors;
+        // multi-D outer rank is value-dependent, so those defer.
+        "splitblocks" => match arg_ty(args, 0) {
+            Some(Type::Array { shape, elem })
+                if shape.len() == 1 && matches!(elem.as_ref(), Type::Scalar(_)) =>
+            {
+                Type::Array {
+                    shape: Box::new([Dim::Dynamic]),
+                    elem: Box::new(Type::Array {
+                        shape: Box::new([Dim::Dynamic]),
+                        elem: elem.clone(),
+                    }),
+                }
+            }
+            _ => Type::Deferred,
+        },
         // cat(x, y, …) concatenates values of the same structural kind: scalars
         // → a rank-1 vector of that kind; arrays → the same rank/element as the
         // first argument (one axis grows, so sizes are dynamic).
@@ -246,6 +330,80 @@ pub(crate) fn call_rule(
             domain: Box::new(Type::Any),
             mass: Mass::Deferred,
         },
+        // `markovchain(kernel, init, n)` / `kscan(kernel, init, xs)` (spec §06):
+        // a measure over a length-`len` trajectory in `init`'s state space.
+        // Domain is `array[len]` of `init`'s type — `n` (markovchain) folds at
+        // Level::Shape, `lengthof(xs)` (kscan) is xs's leading dim. (Record-state
+        // trajectories are tables — left with a deferred domain for now.) Mass is
+        // filled from the kernel's class in `fill_mass`.
+        "markovchain" => {
+            let len = args.get(2).map_or(Dim::Dynamic, |a| resolve_dim(inf, a.0));
+            trajectory_measure(arg_ty(args, 1), len)
+        }
+        "kscan" => {
+            let len = match arg_ty(args, 2) {
+                Some(Type::Array { shape, .. }) if !shape.is_empty() => shape[0],
+                _ => Dim::Dynamic,
+            };
+            trajectory_measure(arg_ty(args, 1), len)
+        }
+        // `kchain` / `jointchain` (spec §06) are measures, but their output
+        // variate (last kernel's codomain / `cat` of all variates) is not
+        // statically extractable — so we record that the result IS a measure
+        // (better than %deferred) with a deferred domain; mass class in `fill_mass`.
+        "kchain" | "jointchain" => Type::Measure {
+            domain: Box::new(Type::Deferred),
+            mass: Mass::Deferred,
+        },
+        // `scan(f, init, xs)` (spec §04) is the DETERMINISTIC left scan — a value,
+        // not a measure: `array[lengthof(xs)]` of the accumulator type (= init's
+        // type). The stochastic analogue is `kscan`.
+        "scan" => match arg_ty(args, 1) {
+            Some(t @ (Type::Scalar(_) | Type::Array { .. })) => {
+                let len = match arg_ty(args, 2) {
+                    Some(Type::Array { shape, .. }) if !shape.is_empty() => shape[0],
+                    _ => Dim::Dynamic,
+                };
+                Type::Array {
+                    shape: Box::new([len]),
+                    elem: Box::new(t.clone()),
+                }
+            }
+            _ => Type::Deferred,
+        },
+        // `fchain(f1, f2, …)` (spec §04) composes deterministic functions; the
+        // result is a function with `f1`'s input signature (output type is not
+        // tracked by `Type::Function`).
+        "fchain" => match arg_ty(args, 0) {
+            Some(Type::Function { inputs }) => Type::Function {
+                inputs: inputs.clone(),
+            },
+            _ => Type::Deferred,
+        },
+        // `disintegrate(selector, joint)` (spec §06) splits a joint measure into
+        // a `(forward_kernel, marginal)` tuple. The kernel inputs / marginal
+        // domain depend on the selector + DAG structure (not statically tracked),
+        // but disintegrating a probability measure yields a Markov forward kernel
+        // and a probability marginal — so the mass classes follow the joint's.
+        "disintegrate" => {
+            let part_mass = match arg_ty(args, 1) {
+                Some(Type::Measure {
+                    mass: Mass::Normalized,
+                    ..
+                }) => Mass::Normalized,
+                _ => Mass::Unknown,
+            };
+            Type::Tuple(Box::new([
+                Type::Kernel {
+                    inputs: Box::new([]),
+                    mass: part_mass,
+                },
+                Type::Measure {
+                    domain: Box::new(Type::Deferred),
+                    mass: part_mass,
+                },
+            ]))
+        }
         // `relabel(M, labels)` (spec §06) renames the variate; the value domain
         // AND total mass are unchanged, so the measure type passes through whole
         // (unlike normalize/truncate, which reset the mass slot).
@@ -258,6 +416,25 @@ pub(crate) fn call_rule(
             domain: Box::new(set_element_type(inf, args.first().map(|a| a.0))),
             mass: Mass::Deferred,
         },
+        // `Dirac(value = v)` (spec §06) is the point-mass probability measure at
+        // `v`, for any variate type: the domain is `v`'s type. `value` is given
+        // as the named kwarg (spec form) or positionally. Mass is normalized
+        // (total mass 1) — set in `fill_mass`.
+        "Dirac" => {
+            let v = arg_ty(args, 0).cloned().or_else(|| {
+                named
+                    .iter()
+                    .find(|(n, _, _, _)| inf.module.resolve(*n) == "value")
+                    .map(|(_, _, t, _)| t.clone())
+            });
+            match v {
+                Some(t) => Type::Measure {
+                    domain: Box::new(t),
+                    mass: Mass::Deferred,
+                },
+                None => Type::Deferred,
+            }
+        }
         // `bayesupdate(L, prior)` (spec §06): the unnormalized posterior is a
         // measure over the prior's domain — pick the measure-typed argument,
         // with a fresh mass slot (the posterior's mass is the evidence).
@@ -311,7 +488,7 @@ pub(crate) fn call_rule(
         // or DomainMap) are declared in catalogue.ron and lowered here.
         // Distribution constructors (Sig::Distribution rows) are also dispatched here.
         // Structural ops above cannot be expressed in ResultSig and stay as code.
-        _ => match function_result(&name, args) {
+        _ => match function_result(inf.module, &name, args) {
             Some(ty) => ty,
             None => match distribution_domain(inf, &name, args, named) {
                 Some(domain) => Type::Measure {
@@ -519,7 +696,7 @@ fn get_type(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo], base: i64) -> Type {
         return Type::Deferred;
     };
     let mut current = container.clone();
-    for (node, _, _) in &args[1..] {
+    for (node, sel_ty, _) in &args[1..] {
         let selector = inf.module.node(*node).clone();
         current = match (&current, &selector) {
             (Type::Tuple(comps), Node::Lit(Scalar::Int(k))) => {
@@ -547,7 +724,34 @@ fn get_type(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo], base: i64) -> Type {
                 }
             }
             (Type::Any | Type::Deferred, _) => return current.clone(),
-            _ => return Type::Deferred,
+            // A non-literal selector: fall back to its inferred TYPE. Indexing
+            // an array by an integer ARRAY is a GATHER (`a[idxs]` — result has
+            // the index's shape and the container's element, spec §07 "array of
+            // indices subset selection"); a scalar-integer selector consumes
+            // the leading axis like a literal `Int`.
+            _ => match (&current, sel_ty) {
+                (
+                    Type::Array { elem, .. },
+                    Type::Array {
+                        shape: ish,
+                        elem: ie,
+                    },
+                ) if matches!(ie.as_ref(), Type::Scalar(ScalarType::Integer)) => Type::Array {
+                    shape: ish.clone(),
+                    elem: elem.clone(),
+                },
+                (Type::Array { shape, elem }, Type::Scalar(ScalarType::Integer)) => {
+                    if shape.len() == 1 {
+                        elem.as_ref().clone()
+                    } else {
+                        Type::Array {
+                            shape: shape[1..].into(),
+                            elem: elem.clone(),
+                        }
+                    }
+                }
+                _ => return Type::Deferred,
+            },
         };
     }
     current
@@ -642,6 +846,28 @@ fn iid_type(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> Type {
     }
 }
 
+/// A measure over a length-`len` trajectory in `init`'s state space (spec §06
+/// `markovchain` / `kscan`): domain is `array[len]` of `init`'s type. The
+/// initial state is excluded from the trajectory, so the element type is
+/// exactly `init`'s. Record-state trajectories are tables (spec) — not built
+/// here; a record `init` yields a deferred domain. Mass is left `Deferred` for
+/// `fill_mass` to set from the kernel class.
+fn trajectory_measure(init: Option<&Type>, len: Dim) -> Type {
+    match init {
+        Some(t @ (Type::Scalar(_) | Type::Array { .. })) => Type::Measure {
+            domain: Box::new(Type::Array {
+                shape: Box::new([len]),
+                elem: Box::new(t.clone()),
+            }),
+            mass: Mass::Deferred,
+        },
+        _ => Type::Measure {
+            domain: Box::new(Type::Deferred),
+            mass: Mass::Deferred,
+        },
+    }
+}
+
 /// Scalar element kind of `t`, drilling array nesting; `None` for
 /// non-scalar/non-array types.
 fn elem_scalar_kind_of(t: &Type) -> Option<ScalarType> {
@@ -662,6 +888,73 @@ fn with_dynamic_dims(t: &Type) -> Type {
             elem: Box::new(with_dynamic_dims(elem)),
         },
         other => other.clone(),
+    }
+}
+
+/// The output axes of an `aggregate`/`metricsum` — the `(%axis …)` names in the
+/// `output_axes` vector literal `[.i, .k]`, in order (one result axis each).
+/// `None` when the axis list isn't a literal vector (rank not statically known).
+fn output_axis_names(inf: &Inferencer<'_, '_>, node: NodeId) -> Option<Vec<Symbol>> {
+    let Node::Call(c) = inf.module.node(node) else {
+        return None;
+    };
+    if !matches!(c.head, flatppl_core::CallHead::Builtin(op)
+        if inf.module.resolve(op) == "vector")
+    {
+        return None;
+    }
+    let mut out = Vec::new();
+    for &a in c.args.iter() {
+        if let Node::Axis(ax) = inf.module.node(a) {
+            out.push(ax.name);
+        }
+    }
+    Some(out)
+}
+
+/// All dims of `t` flattened across array nesting (a nested-vector matrix
+/// `Array[r]{ Array[c]{e} }` flattens to `[r, c]`), so an index position maps to
+/// a single extent.
+fn flatten_dims(t: &Type) -> Vec<Dim> {
+    match t {
+        Type::Array { shape, elem } => {
+            let mut v = shape.to_vec();
+            v.extend(flatten_dims(elem));
+            v
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Walk an `aggregate`/`metricsum` body collecting, for each axis name, the
+/// input dim it indexes: an index `arr[…, ax_k, …]` (`get`/`get0`) binds `ax_k`
+/// to `arr`'s flattened dim at that position. First binding wins (einsum
+/// consistency); axes that never index a statically-shaped array stay absent
+/// (→ dynamic).
+fn collect_axis_dims(
+    inf: &mut Inferencer<'_, '_>,
+    node: NodeId,
+    out: &mut std::collections::HashMap<Symbol, Dim>,
+) {
+    let Node::Call(c) = inf.module.node(node).clone() else {
+        return;
+    };
+    if let flatppl_core::CallHead::Builtin(op) = c.head {
+        let name = inf.module.resolve(op).to_string();
+        if (name == "get" || name == "get0") && !c.args.is_empty() {
+            let arr_ty = inf.infer_node(c.args[0]).0;
+            let flat = flatten_dims(&arr_ty);
+            for (k, &idx) in c.args.iter().enumerate().skip(1) {
+                if let Node::Axis(ax) = inf.module.node(idx) {
+                    if let Some(&d) = flat.get(k - 1) {
+                        out.entry(ax.name).or_insert(d);
+                    }
+                }
+            }
+        }
+    }
+    for &a in c.args.iter() {
+        collect_axis_dims(inf, a, out);
     }
 }
 
@@ -1086,7 +1379,7 @@ fn catalogue_call_type(inf: &mut Inferencer<'_, '_>, callee: NodeId, args: &[Arg
     // `catalogue_lower` already embeds the catalogue `MassTag` mass in the
     // `Measure` for distributions, and the result scalar/matrix type for
     // functions. No per-variant fixup is needed.
-    let (ty, _vset) = catalogue_lower(&sig, args);
+    let (ty, _vset) = catalogue_lower(&mut *inf.module, &sig, args);
     ty
 }
 
@@ -1102,7 +1395,7 @@ fn catalogue_call_valueset(
     let Some(sig) = inf.module_catalogue_ref(callee).map(|c| c.sig.clone()) else {
         return ValueSet::Unknown;
     };
-    catalogue_lower(&sig, args).1
+    catalogue_lower(&mut *inf.module, &sig, args).1
 }
 
 /// Lower a §09 catalogue sig with a `LowerCtx` built from the concrete
@@ -1111,13 +1404,22 @@ fn catalogue_call_valueset(
 /// application, so it falls back to the first positional arg's vector dim.
 /// The `LowerCtx` borrows local closures, so it is built and consumed here in
 /// one scope rather than returned.
-fn catalogue_lower(sig: &crate::catalogue::Sig, args: &[ArgInfo]) -> (Type, ValueSet) {
+fn catalogue_lower(
+    module: &mut flatppl_core::Module,
+    sig: &crate::catalogue::Sig,
+    args: &[ArgInfo],
+) -> (Type, ValueSet) {
     use crate::catalogue::{LowerCtx, lower};
+    use std::cell::RefCell;
 
     let first_dim = || match args.first().map(|(_, t, _)| t) {
         Some(Type::Array { shape, .. }) if shape.len() == 1 => shape[0],
         _ => Dim::Dynamic,
     };
+    // RefCell so the `intern` closure is a `Fn` alongside the immutable arg
+    // accessors — module functions can return records (lu/svd/eigen) whose
+    // field names must be interned into the current module.
+    let module = RefCell::new(module);
     let ctx = LowerCtx {
         arg_scalar: &|i| match arg_ty(args, i) {
             Some(Type::Scalar(s)) => Some(*s),
@@ -1129,6 +1431,7 @@ fn catalogue_lower(sig: &crate::catalogue::Sig, args: &[ArgInfo]) -> (Type, Valu
             _ => Dim::Dynamic,
         },
         arg_type: &|i| arg_ty(args, i).cloned(),
+        intern: &|s| module.borrow_mut().intern(s),
     };
     lower(sig, &ctx)
 }
@@ -1246,7 +1549,7 @@ fn broadcast_type(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo], named: &[Named
                 (*n, cell, *p)
             })
             .collect();
-        return match catalogue_lower(&sig, &cell_args).0 {
+        return match catalogue_lower(&mut *inf.module, &sig, &cell_args).0 {
             // Distribution head: an independent product over the array. Its cell
             // domain and mass come from the catalogue sig, so a non-probability
             // measure like `ContinuedPoisson` stays `Finite`, not forced to
@@ -1309,14 +1612,24 @@ fn broadcast_type(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo], named: &[Named
 ///
 /// `arg_scalar` is built from the inferred positional argument types so that
 /// `SameScalarKind` and `DomainMap` sigs can read the call-site scalar kind.
-fn function_result(name: &str, args: &[ArgInfo]) -> Option<Type> {
+fn function_result(
+    module: &mut flatppl_core::Module,
+    name: &str,
+    args: &[ArgInfo],
+) -> Option<Type> {
     use crate::catalogue::{LowerCtx, Sig, lower};
+    use std::cell::RefCell;
 
     let sig = crate::catalogue::builtin().base(name)?;
     // Only Function rows here; Distribution rows are handled by distribution_domain.
     let Sig::Function { .. } = sig else {
         return None;
     };
+    // `ResultSig::Record` interns field-name Symbols into the module. Behind a
+    // RefCell so the `intern` closure is a `Fn` (not `FnMut`), coexisting with
+    // the immutable arg accessors. This is the one live function-row lower path,
+    // so it gets the real interner (other sites use `no_intern`).
+    let module = RefCell::new(module);
     let ctx = LowerCtx {
         arg_scalar: &|i| match arg_ty(args, i) {
             Some(Type::Scalar(s)) => Some(*s),
@@ -1328,6 +1641,7 @@ fn function_result(name: &str, args: &[ArgInfo]) -> Option<Type> {
             _ => Dim::Dynamic,
         },
         arg_type: &|i| arg_ty(args, i).cloned(),
+        intern: &|s| module.borrow_mut().intern(s),
     };
     // `lower` for Sig::Function returns (Type, ValueSet::natural_of(&ty)).
     // We only need the type here; the value-set arm is handled by call_valueset.
@@ -1363,6 +1677,7 @@ fn distribution_domain(
         arg_scalar: &|_| None,
         arg_dim: &|_| Dim::Dynamic,
         arg_type: &|i| arg_ty(args, i).cloned(),
+        intern: &crate::catalogue::no_intern,
     };
     let (ty, _vset) = lower(sig, &ctx);
     // `lower` wraps the domain in a `Type::Measure`; unwrap to get the domain.
@@ -1672,6 +1987,7 @@ fn distribution_support(
         arg_scalar: &|_| None,
         arg_dim: &|_| Dim::Dynamic,
         arg_type: &|i| arg_ty(args, i).cloned(),
+        intern: &crate::catalogue::no_intern,
     };
     let (_ty, vs) = lower(sig, &ctx);
     vs
@@ -1717,12 +2033,17 @@ pub(crate) fn fill_mass(
 
     let arg_mass = |i: usize| match arg_ty(args, i) {
         Some(Type::Measure { mass, .. }) => *mass,
+        // Kernels carry a mass class too (a `Normalized` kernel is a Markov /
+        // probability kernel) — chain/trajectory ops read it.
+        Some(Type::Kernel { mass, .. }) => *mass,
         _ => Mass::Unknown,
     };
 
     let mass = match name.as_str() {
         // Every §08 distribution is a probability measure.
         "lawof" => Mass::Normalized,
+        // `Dirac(value)` is a point-mass probability measure (total mass 1).
+        "Dirac" => Mass::Normalized,
         // Reference measures: finite on a bounded support, infinite (but
         // boundedly finite) on an unbounded one.
         "Lebesgue" | "Counting" => {
@@ -1769,6 +2090,25 @@ pub(crate) fn fill_mass(
         // affine pushforward — keeps M's mass.
         "pushfwd" => arg_mass(1),
         "locscale" => arg_mass(0),
+        // `markovchain(kernel, …)` / `kscan(kernel, …)`: a trajectory of a
+        // normalized (Markov) kernel is itself a probability measure; a
+        // non-normalized step kernel gives an unknown total mass.
+        "markovchain" | "kscan" => match arg_mass(0) {
+            Mass::Normalized => Mass::Normalized,
+            Mass::Null => Mass::Null,
+            _ => Mass::Unknown,
+        },
+        // `kchain`: a Kleisli chain of probability components (base measure +
+        // Markov kernels) is a probability measure; otherwise the total mass is
+        // not statically known (the bind carries a generally-intractable
+        // marginalization integral). (`jointchain` has its own mass arm below.)
+        "kchain" => {
+            if (0..args.len()).all(|i| matches!(arg_mass(i), Mass::Normalized)) {
+                Mass::Normalized
+            } else {
+                Mass::Unknown
+            }
+        }
         // `superpose(M1, M2, …)` is measure addition Z = Σ Zi (spec §06): the
         // sum of finite masses is finite but generally not normalized; any
         // infinite component makes the sum infinite; an Unknown taints the sum.

@@ -1,0 +1,73 @@
+// Standard module: particle-physics (spec §09). Loaded by catalogue::builtin().
+        Module(
+            name: "particle-physics",
+            version: "0.1",
+            bindings: [
+                // -- Distributions --
+                // Oracle-verified supports (scipy cross-check per task brief).
+                Binding(name: "CrystalBall",            sig: Distribution(domain: Scalar(Real), support: Reals,       mass: Normalized)),
+                Binding(name: "DoubleSidedCrystalBall", sig: Distribution(domain: Scalar(Real), support: Reals,       mass: Normalized)),
+                // Argus: spec §09 support is interval(0, resonance); no parameter-dependent
+                // real bound in the type system → PosReals (sound superset).
+                Binding(name: "Argus",                  sig: Distribution(domain: Scalar(Real), support: PosReals,    mass: Normalized),
+                    degraded: Some("§09 support is interval(0, resonance); no parameter-dependent real bound in the type system → PosReals (sound superset)")),
+                Binding(name: "RelativisticBreitWigner", sig: Distribution(domain: Scalar(Real), support: PosReals,   mass: Normalized)),
+                Binding(name: "Voigtian",               sig: Distribution(domain: Scalar(Real), support: Reals,       mass: Normalized)),
+                Binding(name: "BifurcatedNormal",       sig: Distribution(domain: Scalar(Real), support: Reals,       mass: Normalized)),
+                // ContinuedPoisson: not a normalized probability measure (spec §09);
+                // mass is Finite (locally integrable unnormalized density).
+                Binding(name: "ContinuedPoisson",       sig: Distribution(domain: Scalar(Real), support: NonNegReals, mass: Finite),
+                    degraded: Some("spec §09: ContinuedPoisson is not normalized (mass Finite); rand is undefined in FlatPPL")),
+
+                // -- Three-point interpolation functions (spec §09) --
+                // All share signature (left, center, right, alpha): (real,real,real,real) → real.
+                Binding(name: "interp_pwlin",     sig: Function(params: [Scalar(Real), Scalar(Real), Scalar(Real), Scalar(Real)], result: Scalar(Real))),
+                Binding(name: "interp_pwexp",     sig: Function(params: [Scalar(Real), Scalar(Real), Scalar(Real), Scalar(Real)], result: Scalar(Real))),
+                Binding(name: "interp_poly2_lin", sig: Function(params: [Scalar(Real), Scalar(Real), Scalar(Real), Scalar(Real)], result: Scalar(Real))),
+                Binding(name: "interp_poly6_lin", sig: Function(params: [Scalar(Real), Scalar(Real), Scalar(Real), Scalar(Real)], result: Scalar(Real))),
+                Binding(name: "interp_poly6_exp", sig: Function(params: [Scalar(Real), Scalar(Real), Scalar(Real), Scalar(Real)], result: Scalar(Real))),
+
+                // -- Resonance functions (spec §09) --
+                // resonance_breitwigner(sigma, m, width, ma, mb, l, d) → Complex
+                // Domains: posreals, posreals, posreals, nonnegreals, nonnegreals,
+                //          nonnegintegers, posreals.
+                // l is a non-negative integer; use Scalar(Integer) for it.
+                Binding(name: "resonance_breitwigner",
+                    sig: Function(
+                        params: [Scalar(Real), Scalar(Real), Scalar(Real), Scalar(Real), Scalar(Real), Scalar(Integer), Scalar(Real)],
+                        result: Scalar(Complex))),
+
+                // -- Kinematics functions (spec §09) --
+                // kallen(x, y, z): (real, real, real) → real
+                Binding(name: "kallen",
+                    sig: Function(params: [Scalar(Real), Scalar(Real), Scalar(Real)], result: Scalar(Real))),
+                // breakup_momentum(m, ma, mb): (posreal, nonnegreal, nonnegreal) → real
+                // Domains encoded as Scalar(Real); domain constraints are value-level (can't
+                // distinguish posreals from reals in ParamSig).
+                Binding(name: "breakup_momentum",
+                    sig: Function(params: [Scalar(Real), Scalar(Real), Scalar(Real)], result: Scalar(Real))),
+                // blatt_weisskopf(l, p, d): (nonneginteger, nonnegreal, posreal) → real
+                Binding(name: "blatt_weisskopf",
+                    sig: Function(params: [Scalar(Integer), Scalar(Real), Scalar(Real)], result: Scalar(Real))),
+
+                // -- Wigner rotation functions (spec §09) --
+                // wignerd(j, m1, m2, cosbeta): integer args; cosbeta ∈ [-1,1] → real
+                // Spec domain for j/m1/m2 is integers (integer-valued angular momenta).
+                Binding(name: "wignerd",
+                    sig: Function(params: [Scalar(Integer), Scalar(Integer), Scalar(Integer), Scalar(Real)], result: Scalar(Real))),
+                // wignerD(j, m1, m2, alpha, cosbeta, gamma) → Complex
+                Binding(name: "wignerD",
+                    sig: Function(
+                        params: [Scalar(Integer), Scalar(Integer), Scalar(Integer), Scalar(Real), Scalar(Real), Scalar(Real)],
+                        result: Scalar(Complex))),
+                // wignerd_doublearg(two_j, two_m1, two_m2, cosbeta): doubled integer args → real
+                // Angular momenta passed as 2j, 2m1, 2m2 (integers, covering half-integer spin).
+                Binding(name: "wignerd_doublearg",
+                    sig: Function(params: [Scalar(Integer), Scalar(Integer), Scalar(Integer), Scalar(Real)], result: Scalar(Real))),
+                // wignerD_doublearg(two_j, two_m1, two_m2, alpha, cosbeta, gamma) → Complex
+                Binding(name: "wignerD_doublearg",
+                    sig: Function(
+                        params: [Scalar(Integer), Scalar(Integer), Scalar(Integer), Scalar(Real), Scalar(Real), Scalar(Real)],
+                        result: Scalar(Complex))),
+            ]
+)

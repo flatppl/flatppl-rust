@@ -8,7 +8,7 @@ use std::sync::OnceLock;
 use serde::Deserialize;
 
 mod lower;
-pub(crate) use lower::{LowerCtx, lower};
+pub(crate) use lower::{LowerCtx, lower, no_intern};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Catalogue {
@@ -181,6 +181,10 @@ pub(crate) enum ResultSig {
     /// is a transposed vector (spec §07: "the transpose of a vector is a
     /// transposed vector, not a single-row matrix") — same rank-1 array type.
     TransposeOf(usize),
+    /// A record result with named fields, each field's type given by its own
+    /// `ResultSig` (`qr` → `record(Q, R)`; more record-valued functions to
+    /// come). Field names are interned via the lowering context's interner.
+    Record(Vec<(String, ResultSig)>),
 }
 
 /// The element-type source of a `Vector` / `MatrixElem` result.
@@ -216,10 +220,28 @@ static BUILTIN: OnceLock<Catalogue> = OnceLock::new();
 /// The process-global built-in catalogue (parsed once from `catalogue.ron`).
 pub(crate) fn builtin() -> &'static Catalogue {
     BUILTIN.get_or_init(|| {
-        parse_catalogue(include_str!("../../catalogue.ron"))
-            .expect("built-in catalogue.ron must parse")
+        let mut cat = parse_catalogue(include_str!("../../catalogue.ron"))
+            .expect("built-in catalogue.ron must parse");
+        // Standard modules (spec §09) each live in their own RON file under
+        // `catalogues/`; parse and merge them into the base catalogue here.
+        cat.modules = STD_MODULE_SRCS
+            .iter()
+            .map(|src| {
+                ron::from_str::<Module>(src).expect("built-in standard-module .ron must parse")
+            })
+            .collect();
+        cat
     })
 }
+
+/// Per-module RON sources for the spec-§09 standard modules, embedded at build.
+const STD_MODULE_SRCS: &[&str] = &[
+    include_str!("../../catalogues/particle-physics.ron"),
+    include_str!("../../catalogues/ext-linear-algebra.ron"),
+    include_str!("../../catalogues/special-functions.ron"),
+    include_str!("../../catalogues/polynomials.ron"),
+    include_str!("../../catalogues/distances.ron"),
+];
 
 impl Catalogue {
     /// Look up a base (built-in) distribution signature by name.
@@ -443,6 +465,7 @@ mod tests {
                 param_dim: param_dim_fn,
                 arg_dim: &|_| Dim::Dynamic,
                 arg_type: &|_| None,
+                intern: &no_intern,
             };
             let (cat_ty, cat_support) = lower(sig, &ctx);
 
@@ -581,6 +604,7 @@ mod tests {
                 param_dim: &|_| Dim::Dynamic,
                 arg_dim: &|_| Dim::Dynamic,
                 arg_type: &|_| None,
+                intern: &no_intern,
             };
             let (cat_ty, _) = lower(sig, &ctx);
 

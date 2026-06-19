@@ -1,0 +1,29 @@
+// Standard module: special-functions (spec §09). Loaded by catalogue::builtin().
+        Module(
+            name: "special-functions",
+            version: "0.1",
+            bindings: [
+                // erf(x) → real
+                Binding(name: "erf",  sig: Function(params: [Scalar(Real)], result: Scalar(Real))),
+                // erfc(x) → real
+                Binding(name: "erfc", sig: Function(params: [Scalar(Real)], result: Scalar(Real))),
+                // bessel_j(v, z): real order, real argument → real
+                Binding(name: "bessel_j", sig: Function(params: [Scalar(Real), Scalar(Real)], result: Scalar(Real))),
+                // bessel_y(v, z): real order, positive real argument → real
+                Binding(name: "bessel_y", sig: Function(params: [Scalar(Real), Scalar(Real)], result: Scalar(Real))),
+                // bessel_i(v, z): real order, real argument → real
+                Binding(name: "bessel_i", sig: Function(params: [Scalar(Real), Scalar(Real)], result: Scalar(Real))),
+                // bessel_k(v, z): real order, positive real argument → real
+                Binding(name: "bessel_k", sig: Function(params: [Scalar(Real), Scalar(Real)], result: Scalar(Real))),
+                // digamma(x) → real
+                Binding(name: "digamma",  sig: Function(params: [Scalar(Real)], result: Scalar(Real))),
+                // polygamma(n, x): non-negative integer order, real argument → real
+                Binding(name: "polygamma", sig: Function(params: [Scalar(Integer), Scalar(Real)], result: Scalar(Real))),
+                // gammainc(a, x): regularized lower incomplete gamma → real ∈ [0,1]
+                Binding(name: "gammainc", sig: Function(params: [Scalar(Real), Scalar(Real)], result: Scalar(Real))),
+                // betainc(a, b, x): regularized incomplete beta → real ∈ [0,1]
+                Binding(name: "betainc", sig: Function(params: [Scalar(Real), Scalar(Real), Scalar(Real)], result: Scalar(Real))),
+                // airy(x) → real
+                Binding(name: "airy", sig: Function(params: [Scalar(Real)], result: Scalar(Real))),
+            ]
+)

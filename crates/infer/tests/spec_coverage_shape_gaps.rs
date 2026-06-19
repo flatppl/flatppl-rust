@@ -149,26 +149,107 @@ fn level_normalization_does_not_resolve_dims() {
     );
 }
 
-// ---- Gap documentation: measure ops ----
+// ---- measure ops ----
 
-/// `Dirac` and the kernel-chain ops (`kchain`, `markovchain`, `scan`, …) stay
-/// honestly deferred — point-mass / kernel-composition semantics the engine has
-/// no evaluator for. (`restrict`/`pushfwd`/`superpose`/`locscale` are no longer
-/// here — they now infer a measure type; see `domain_preserving_measure_ops_infer`.)
+/// `Dirac(value)` is the point-mass probability measure at `value` (spec §06):
+/// a normalized measure over `value`'s type (works for any variate type — a
+/// scalar gives a real-domain measure, a record gives a record-domain measure).
+/// `value` may be the named kwarg or positional.
 #[test]
-fn unimplemented_measure_ops_are_deferred() {
-    // Dirac
-    let out = ir("x = Dirac(0.0)");
+fn dirac_infers_a_normalized_point_mass() {
+    let out = ir("d = Dirac(value = 3.0)");
     assert!(
-        out.contains("(%meta (%deferred %fixed %unknown) (Dirac"),
-        "Dirac: expected %deferred gap, got:\n{out}"
+        out.contains("(%measure (%domain (%scalar real)) (%mass %normalized))")
+            && out.contains("(Dirac"),
+        "Dirac(value=3.0) should be a normalized real measure, got:\n{out}"
     );
-
-    // kchain
-    let out = ir("x = kchain(Normal(0.0,1.0), Normal(0.0,1.0))");
+    // Positional form too.
+    let out = ir("d = Dirac(0.0)");
     assert!(
-        out.contains("(%meta (%deferred %fixed %unknown) (kchain"),
-        "kchain: expected %deferred gap, got:\n{out}"
+        out.contains("(%measure (%domain (%scalar real)) (%mass %normalized))"),
+        "Dirac(0.0) should be a normalized real measure, got:\n{out}"
+    );
+    // Record variate → record-domain measure.
+    let out = ir("d = Dirac(value = record(a = 1.0))");
+    assert!(
+        out.contains("(%measure (%domain (%record (a (%scalar real)))) (%mass %normalized))"),
+        "Dirac over a record should be a record-domain measure, got:\n{out}"
+    );
+}
+
+/// The deterministic composition / structural-disintegration ops infer, reusing
+/// existing types: `scan` → a value `array[lengthof(xs)]` of the accumulator
+/// type; `fchain` → a `function` with f1's input signature; `disintegrate` → a
+/// `(forward_kernel, marginal)` tuple, with mass classes following the joint
+/// (a probability joint → Markov kernel + probability marginal).
+#[test]
+fn scan_fchain_disintegrate_infer() {
+    let out = ir("xs = [1.0, 2.0, 3.0]\nf = (acc, x) -> acc + x\ns = scan(f, 0.0, xs)");
+    assert!(
+        out.contains("(%array 1 (3) (%scalar real))") && out.contains("(scan"),
+        "scan should infer a length-3 real value array, got:\n{out}"
+    );
+    let out = ir("f1 = x -> x + 1.0\nf2 = y -> y * 2.0\nc = fchain(f1, f2)");
+    assert!(
+        out.contains("(%function (%inputs x))") && out.contains("(fchain"),
+        "fchain should infer a function with f1's inputs, got:\n{out}"
+    );
+    let out = ir("a ~ Normal(0.0, 2.0)\n\
+                  b ~ Normal(a, 1.0)\n\
+                  jm = lawof(record(a = a, b = b))\n\
+                  fk = disintegrate([\"b\"], jm)");
+    assert!(
+        out.contains("(%tuple (%kernel (%inputs ) (%mass %normalized)) (%measure (%domain %deferred) (%mass %normalized)))")
+            && out.contains("(disintegrate"),
+        "disintegrate of a probability joint should be a (normalized kernel, normalized marginal) tuple, got:\n{out}"
+    );
+}
+
+/// The Kleisli / trajectory ops infer a `(%measure …)` type (spec §06), reusing
+/// the existing measure type — no new type kind. `markovchain`/`kscan` give a
+/// length-resolved trajectory domain (`array[n]` / `array[lengthof(xs)]` of the
+/// state type) and stay normalized when the step kernel is a Markov kernel;
+/// `kchain` is a measure whose output variate isn't statically extractable
+/// (deferred domain) but is normalized when its components are.
+#[test]
+fn kernel_chain_ops_infer_measures() {
+    // markovchain: n=100 folds, state is real → array[100] real, normalized.
+    let out = ir("f = x -> Normal(x, 1.0)\ntraj = markovchain(f, 0.0, 100)");
+    assert!(
+        out.contains("(%measure (%domain (%array 1 (100) (%scalar real))) (%mass %normalized))")
+            && out.contains("(markovchain"),
+        "markovchain should be a normalized measure over array[100] real, got:\n{out}"
+    );
+    // kscan: trajectory length = lengthof(xs) = 3.
+    let out =
+        ir("dts = [0.01, 0.02, 0.015]\ng = (x, dt) -> Normal(x, dt)\ntr = kscan(g, 0.0, dts)");
+    assert!(
+        out.contains("(%measure (%domain (%array 1 (3) (%scalar real))) (%mass %normalized))")
+            && out.contains("(kscan"),
+        "kscan should be a normalized measure over array[3] real, got:\n{out}"
+    );
+    // kchain: a measure (not %deferred), normalized when components are; domain
+    // is deferred (last variate not statically extractable).
+    let out = ir("lambda ~ Gamma(2.0, 1.0)\n\
+                  prior = lawof(record(lambda = lambda))\n\
+                  fk = kernelof(record(y = lambda), lambda = lambda)\n\
+                  pp = kchain(prior, fk)");
+    assert!(
+        out.contains("(%measure (%domain %deferred) (%mass %normalized))")
+            && out.contains("(kchain"),
+        "kchain should be a normalized measure with a deferred domain, got:\n{out}"
+    );
+    // jointchain: previously %deferred-typed (so its existing mass arm was dead);
+    // typing it as a measure activates that arm — a joint chain of a base measure
+    // and Markov kernels is a probability measure.
+    let out = ir("lambda ~ Gamma(2.0, 1.0)\n\
+                  m0 = lawof(record(a = lambda))\n\
+                  k = kernelof(record(b = lambda), a = lambda)\n\
+                  j = jointchain(m0, k)");
+    assert!(
+        out.contains("(%measure (%domain %deferred) (%mass %normalized))")
+            && out.contains("(jointchain"),
+        "jointchain should be a normalized measure with a deferred domain, got:\n{out}"
     );
 }
 
@@ -555,5 +636,153 @@ fn reduce_and_filter_infer() {
     assert!(
         out.contains("(%array 1 (%dynamic) (%scalar real))") && out.contains("(filter"),
         "filter of a real vector should stay a real vector (dynamic length), got:\n{out}"
+    );
+}
+
+/// `qr(A)` (spec §07) returns `record(Q, R)` — both matrices with A's element
+/// kind, via the RON catalogue's `ResultSig::Record` (field names interned
+/// through the lowering context). The reusable record-valued result path.
+#[test]
+fn qr_infers_a_record_of_matrices() {
+    let out = ir("A = [[1.0, 0.0], [0.0, 1.0]]\nd = qr(A)");
+    assert!(
+        out.contains("(%record (Q (%array 2 (%dynamic %dynamic) (%scalar real))) (R (%array 2 (%dynamic %dynamic) (%scalar real))))")
+            && out.contains("(qr"),
+        "qr should infer record(Q: matrix, R: matrix), got:\n{out}"
+    );
+}
+
+/// `aggregate(f, output_axes, expr)` / `metricsum` (spec §04) are einsum-style
+/// reductions: element from the reduced expr, empty axes → scalar, and the
+/// result dims are the EXACT extents — each output axis is traced to the input
+/// dimension it indexes in the body (`A[.i, .j]` → `.i` is A's flat dim 0).
+#[test]
+fn aggregate_resolves_exact_einsum_dims() {
+    // Matrix product A:(2,3) · B:(3,4) → C[.i,.k] is (2,4): .i ← A dim0,
+    // .k ← B dim1 (the contracted .j is gone).
+    let out = ir("A = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]\n\
+                  B = [[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0], [9.0, 8.0, 7.0, 6.0]]\n\
+                  C = aggregate(sum, [.i, .k], A[.i, .j] * B[.j, .k])");
+    assert!(
+        out.contains("(%array 2 (2 4) (%scalar real))") && out.contains("(aggregate"),
+        "matmul aggregate should resolve to exact (2,4), got:\n{out}"
+    );
+    // Empty output axes → scalar (full contraction).
+    let out = ir("A = [1.0, 2.0]\nB = [3.0, 4.0]\ns = aggregate(sum, [], A[.i] * B[.i])");
+    assert!(
+        out.contains("(%meta ((%scalar real) %fixed reals) (aggregate"),
+        "aggregate over no axes should be a real scalar, got:\n{out}"
+    );
+    // var over axis .j of A:(2,3) → length-3 vector (.j ← A dim1); metricsum
+    // shares the rule.
+    let out = ir("A = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]\nV = aggregate(var, [.j], A[.i, .j])");
+    assert!(
+        out.contains("(%array 1 (3) (%scalar real))") && out.contains("(aggregate"),
+        "var over .j should resolve to exact length 3, got:\n{out}"
+    );
+}
+
+/// `partition(xs, spec)` → a vector of sub-vectors (spec §07); `selectbins(…,
+/// counts)` → a shorter array of counts' type.
+#[test]
+fn partition_and_selectbins_infer() {
+    let out = ir("xs = [1.0, 2.0, 3.0, 4.0]\np = partition(xs, 2)");
+    assert!(
+        out.contains("(%array 1 (%dynamic) (%array 1 (%dynamic) (%scalar real)))")
+            && out.contains("(partition"),
+        "partition should infer a vector of real sub-vectors, got:\n{out}"
+    );
+    let out = ir("e = [0.0, 1.0, 2.0]\nc = [5.0, 7.0]\nr = selectbins(e, interval(0.0, 1.0), c)");
+    assert!(
+        out.contains("(%array 1 (%dynamic) (%scalar real))") && out.contains("(selectbins"),
+        "selectbins should infer a shorter real count array, got:\n{out}"
+    );
+}
+
+/// `addaxes(A, nl, nt)` (spec §07) inserts size-1 axes around A — exact dims
+/// when the counts are fixed; `splitblocks(v, bs)` nests a 1-D vector into a
+/// vector of sub-vectors.
+#[test]
+fn addaxes_and_splitblocks_infer() {
+    let out = ir("v = [1.0, 2.0, 3.0]\nx = addaxes(v, 1, 0)");
+    assert!(
+        out.contains("(%array 2 (1 3) (%scalar real))") && out.contains("(addaxes"),
+        "addaxes(v,1,0) should be (1,3), got:\n{out}"
+    );
+    let out = ir("v = [1.0, 2.0, 3.0]\nx = addaxes(v, 0, 1)");
+    assert!(
+        out.contains("(%array 2 (3 1) (%scalar real))"),
+        "addaxes(v,0,1) should be (3,1), got:\n{out}"
+    );
+    let out = ir("v = [1.0, 2.0, 3.0, 4.0]\nx = splitblocks(v, 2)");
+    assert!(
+        out.contains("(%array 1 (%dynamic) (%array 1 (%dynamic) (%scalar real)))")
+            && out.contains("(splitblocks"),
+        "splitblocks(1-D) should be a vector of real sub-vectors, got:\n{out}"
+    );
+}
+
+/// ext-linear-algebra `lu`/`svd`/`eigen` now infer proper records (via the new
+/// ResultSig::Record), no longer the degraded Matrix placeholder; `matexp`
+/// passes its shape through and `lstsq` is a vector.
+#[test]
+fn ext_linalg_record_results_infer() {
+    let pre =
+        "e = standard_module(\"ext-linear-algebra\", \"0.1\")\nA = [[4.0, 0.0], [0.0, 9.0]]\n";
+    let out = ir(&format!("{pre}d = e.lu(A)"));
+    assert!(
+        out.contains("(%record (P (%array 2")
+            && out.contains("(L (%array 2")
+            && out.contains("(U (%array 2"),
+        "lu should infer record(P, L, U) of matrices, got:\n{out}"
+    );
+    let out = ir(&format!("{pre}d = e.svd(A)"));
+    assert!(
+        out.contains("(%record (U (%array 2")
+            && out.contains("(S (%array 1 (%dynamic) (%scalar real)))")
+            && out.contains("(V (%array 2"),
+        "svd should infer record(U: matrix, S: real vector, V: matrix), got:\n{out}"
+    );
+    let out = ir(&format!("{pre}d = e.eigen(A)"));
+    assert!(
+        out.contains("(%record (values (%array 1") && out.contains("(vectors (%array 2"),
+        "eigen should infer record(values: vector, vectors: matrix), got:\n{out}"
+    );
+    // matexp passes A's shape through; lstsq is a vector.
+    let out = ir(&format!("{pre}d = e.matexp(A)"));
+    assert!(
+        out.contains("(%array 1 (2) (%array 1 (2) (%scalar real)))") && out.contains("matexp"),
+        "matexp should preserve A's shape, got:\n{out}"
+    );
+}
+
+/// Indexing an array by an integer ARRAY is a gather (`a[group_data]`, spec §07
+/// "array of indices subset selection"): the result has the index's shape and
+/// the container's element type — so a hierarchical `eta = a[g] .+ b .* x`
+/// traces as a real array, not %deferred.
+#[test]
+fn gather_by_index_array_traces_real() {
+    let src = "G = 3\n\
+               x_data = [-1.2, 0.4, 1.1]\n\
+               group_data = [1, 2, 3]\n\
+               a ~ iid(Normal(0.0, 1.0), G)\n\
+               b ~ Normal(0.0, 1.0)\n\
+               gath = a[group_data]\n\
+               eta = a[group_data] .+ b .* x_data\n";
+    let out = ir(src);
+    let line = |n: &str| {
+        out.lines()
+            .find(|l| l.contains(&format!("(%bind {n} ")))
+            .unwrap_or("NONE")
+    };
+    assert!(
+        line("gath").contains("(%array 1 (3) (%scalar real))"),
+        "a[group_data] should gather to a length-3 real array, got:\n{}",
+        line("gath")
+    );
+    assert!(
+        line("eta").contains("(%array 1 (3) (%scalar real))"),
+        "eta should be a real array (not %deferred element), got:\n{}",
+        line("eta")
     );
 }
