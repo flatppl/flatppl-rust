@@ -1,0 +1,23 @@
+[package]
+name = "flatppl-wasm-api"
+description = "WebAssembly (wasm-bindgen) API exposing FlatPPL conversion to JavaScript hosts (the web gallery, …)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+# `cdylib` for the wasm artifact (wasm-pack/wasm-bindgen); `rlib` so the
+# pure-Rust core (`convert_str`) is usable + unit-testable on the host.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+flatppl-hs3 = { path = "../hs3" }
+flatppl-syntax = { path = "../syntax" }
+
+# wasm-bindgen is pulled in ONLY for the wasm target, so host builds (and the
+# workspace's host CI: fmt / clippy / test) never compile or link it — the
+# `convert_str` core stays pure Rust and host-verifiable.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
