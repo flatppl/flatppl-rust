@@ -246,6 +246,31 @@ pub(crate) fn call_rule(
             domain: Box::new(Type::Any),
             mass: Mass::Deferred,
         },
+        // `markovchain(kernel, init, n)` / `kscan(kernel, init, xs)` (spec §06):
+        // a measure over a length-`len` trajectory in `init`'s state space.
+        // Domain is `array[len]` of `init`'s type — `n` (markovchain) folds at
+        // Level::Shape, `lengthof(xs)` (kscan) is xs's leading dim. (Record-state
+        // trajectories are tables — left with a deferred domain for now.) Mass is
+        // filled from the kernel's class in `fill_mass`.
+        "markovchain" => {
+            let len = args.get(2).map_or(Dim::Dynamic, |a| resolve_dim(inf, a.0));
+            trajectory_measure(arg_ty(args, 1), len)
+        }
+        "kscan" => {
+            let len = match arg_ty(args, 2) {
+                Some(Type::Array { shape, .. }) if !shape.is_empty() => shape[0],
+                _ => Dim::Dynamic,
+            };
+            trajectory_measure(arg_ty(args, 1), len)
+        }
+        // `kchain` / `jointchain` (spec §06) are measures, but their output
+        // variate (last kernel's codomain / `cat` of all variates) is not
+        // statically extractable — so we record that the result IS a measure
+        // (better than %deferred) with a deferred domain; mass class in `fill_mass`.
+        "kchain" | "jointchain" => Type::Measure {
+            domain: Box::new(Type::Deferred),
+            mass: Mass::Deferred,
+        },
         // `relabel(M, labels)` (spec §06) renames the variate; the value domain
         // AND total mass are unchanged, so the measure type passes through whole
         // (unlike normalize/truncate, which reset the mass slot).
@@ -639,6 +664,28 @@ fn iid_type(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> Type {
             elem: Box::new(domain),
         }),
         mass: Mass::Deferred,
+    }
+}
+
+/// A measure over a length-`len` trajectory in `init`'s state space (spec §06
+/// `markovchain` / `kscan`): domain is `array[len]` of `init`'s type. The
+/// initial state is excluded from the trajectory, so the element type is
+/// exactly `init`'s. Record-state trajectories are tables (spec) — not built
+/// here; a record `init` yields a deferred domain. Mass is left `Deferred` for
+/// `fill_mass` to set from the kernel class.
+fn trajectory_measure(init: Option<&Type>, len: Dim) -> Type {
+    match init {
+        Some(t @ (Type::Scalar(_) | Type::Array { .. })) => Type::Measure {
+            domain: Box::new(Type::Array {
+                shape: Box::new([len]),
+                elem: Box::new(t.clone()),
+            }),
+            mass: Mass::Deferred,
+        },
+        _ => Type::Measure {
+            domain: Box::new(Type::Deferred),
+            mass: Mass::Deferred,
+        },
     }
 }
 
@@ -1717,6 +1764,9 @@ pub(crate) fn fill_mass(
 
     let arg_mass = |i: usize| match arg_ty(args, i) {
         Some(Type::Measure { mass, .. }) => *mass,
+        // Kernels carry a mass class too (a `Normalized` kernel is a Markov /
+        // probability kernel) — chain/trajectory ops read it.
+        Some(Type::Kernel { mass, .. }) => *mass,
         _ => Mass::Unknown,
     };
 
@@ -1769,6 +1819,25 @@ pub(crate) fn fill_mass(
         // affine pushforward — keeps M's mass.
         "pushfwd" => arg_mass(1),
         "locscale" => arg_mass(0),
+        // `markovchain(kernel, …)` / `kscan(kernel, …)`: a trajectory of a
+        // normalized (Markov) kernel is itself a probability measure; a
+        // non-normalized step kernel gives an unknown total mass.
+        "markovchain" | "kscan" => match arg_mass(0) {
+            Mass::Normalized => Mass::Normalized,
+            Mass::Null => Mass::Null,
+            _ => Mass::Unknown,
+        },
+        // `kchain`: a Kleisli chain of probability components (base measure +
+        // Markov kernels) is a probability measure; otherwise the total mass is
+        // not statically known (the bind carries a generally-intractable
+        // marginalization integral). (`jointchain` has its own mass arm below.)
+        "kchain" => {
+            if (0..args.len()).all(|i| matches!(arg_mass(i), Mass::Normalized)) {
+                Mass::Normalized
+            } else {
+                Mass::Unknown
+            }
+        }
         // `superpose(M1, M2, …)` is measure addition Z = Σ Zi (spec §06): the
         // sum of finite masses is finite but generally not normalized; any
         // infinite component makes the sum infinite; an Unknown taints the sum.

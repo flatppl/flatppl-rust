@@ -151,10 +151,10 @@ fn level_normalization_does_not_resolve_dims() {
 
 // ---- Gap documentation: measure ops ----
 
-/// `Dirac` and the kernel-chain ops (`kchain`, `markovchain`, `scan`, …) stay
-/// honestly deferred — point-mass / kernel-composition semantics the engine has
-/// no evaluator for. (`restrict`/`pushfwd`/`superpose`/`locscale` are no longer
-/// here — they now infer a measure type; see `domain_preserving_measure_ops_infer`.)
+/// `Dirac` (and the deterministic `scan`/`fchain`, structural `disintegrate`)
+/// stay honestly deferred — point-mass / deterministic-composition semantics
+/// not yet typed. (`kchain`/`markovchain`/`kscan` are no longer here — they now
+/// infer a measure type; see `kernel_chain_ops_infer_measures`.)
 #[test]
 fn unimplemented_measure_ops_are_deferred() {
     // Dirac
@@ -163,12 +163,53 @@ fn unimplemented_measure_ops_are_deferred() {
         out.contains("(%meta (%deferred %fixed %unknown) (Dirac"),
         "Dirac: expected %deferred gap, got:\n{out}"
     );
+}
 
-    // kchain
-    let out = ir("x = kchain(Normal(0.0,1.0), Normal(0.0,1.0))");
+/// The Kleisli / trajectory ops infer a `(%measure …)` type (spec §06), reusing
+/// the existing measure type — no new type kind. `markovchain`/`kscan` give a
+/// length-resolved trajectory domain (`array[n]` / `array[lengthof(xs)]` of the
+/// state type) and stay normalized when the step kernel is a Markov kernel;
+/// `kchain` is a measure whose output variate isn't statically extractable
+/// (deferred domain) but is normalized when its components are.
+#[test]
+fn kernel_chain_ops_infer_measures() {
+    // markovchain: n=100 folds, state is real → array[100] real, normalized.
+    let out = ir("f = x -> Normal(x, 1.0)\ntraj = markovchain(f, 0.0, 100)");
     assert!(
-        out.contains("(%meta (%deferred %fixed %unknown) (kchain"),
-        "kchain: expected %deferred gap, got:\n{out}"
+        out.contains("(%measure (%domain (%array 1 (100) (%scalar real))) (%mass %normalized))")
+            && out.contains("(markovchain"),
+        "markovchain should be a normalized measure over array[100] real, got:\n{out}"
+    );
+    // kscan: trajectory length = lengthof(xs) = 3.
+    let out =
+        ir("dts = [0.01, 0.02, 0.015]\ng = (x, dt) -> Normal(x, dt)\ntr = kscan(g, 0.0, dts)");
+    assert!(
+        out.contains("(%measure (%domain (%array 1 (3) (%scalar real))) (%mass %normalized))")
+            && out.contains("(kscan"),
+        "kscan should be a normalized measure over array[3] real, got:\n{out}"
+    );
+    // kchain: a measure (not %deferred), normalized when components are; domain
+    // is deferred (last variate not statically extractable).
+    let out = ir("lambda ~ Gamma(2.0, 1.0)\n\
+                  prior = lawof(record(lambda = lambda))\n\
+                  fk = kernelof(record(y = lambda), lambda = lambda)\n\
+                  pp = kchain(prior, fk)");
+    assert!(
+        out.contains("(%measure (%domain %deferred) (%mass %normalized))")
+            && out.contains("(kchain"),
+        "kchain should be a normalized measure with a deferred domain, got:\n{out}"
+    );
+    // jointchain: previously %deferred-typed (so its existing mass arm was dead);
+    // typing it as a measure activates that arm — a joint chain of a base measure
+    // and Markov kernels is a probability measure.
+    let out = ir("lambda ~ Gamma(2.0, 1.0)\n\
+                  m0 = lawof(record(a = lambda))\n\
+                  k = kernelof(record(b = lambda), a = lambda)\n\
+                  j = jointchain(m0, k)");
+    assert!(
+        out.contains("(%measure (%domain %deferred) (%mass %normalized))")
+            && out.contains("(jointchain"),
+        "jointchain should be a normalized measure with a deferred domain, got:\n{out}"
     );
 }
 
