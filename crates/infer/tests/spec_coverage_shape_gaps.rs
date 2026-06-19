@@ -695,3 +695,26 @@ fn partition_and_selectbins_infer() {
         "selectbins should infer a shorter real count array, got:\n{out}"
     );
 }
+
+/// `addaxes(A, nl, nt)` (spec §07) inserts size-1 axes around A — exact dims
+/// when the counts are fixed; `splitblocks(v, bs)` nests a 1-D vector into a
+/// vector of sub-vectors.
+#[test]
+fn addaxes_and_splitblocks_infer() {
+    let out = ir("v = [1.0, 2.0, 3.0]\nx = addaxes(v, 1, 0)");
+    assert!(
+        out.contains("(%array 2 (1 3) (%scalar real))") && out.contains("(addaxes"),
+        "addaxes(v,1,0) should be (1,3), got:\n{out}"
+    );
+    let out = ir("v = [1.0, 2.0, 3.0]\nx = addaxes(v, 0, 1)");
+    assert!(
+        out.contains("(%array 2 (3 1) (%scalar real))"),
+        "addaxes(v,0,1) should be (3,1), got:\n{out}"
+    );
+    let out = ir("v = [1.0, 2.0, 3.0, 4.0]\nx = splitblocks(v, 2)");
+    assert!(
+        out.contains("(%array 1 (%dynamic) (%array 1 (%dynamic) (%scalar real)))")
+            && out.contains("(splitblocks"),
+        "splitblocks(1-D) should be a vector of real sub-vectors, got:\n{out}"
+    );
+}

@@ -236,6 +236,44 @@ pub(crate) fn call_rule(
         // selectbins(edges, region, counts) returns a shorter count array (spec
         // §07): counts' type and rank, with the selected axis dynamic.
         "selectbins" => arg_ty(args, 2).map_or(Type::Deferred, with_dynamic_dims),
+        // addaxes(A, n_leading, n_trailing) (spec §07) inserts `n_leading`
+        // size-1 axes before A's axes and `n_trailing` after — exact when the
+        // counts are fixed integers: result shape = [1;nl] ++ A.shape ++ [1;nt],
+        // element preserved. (e.g. A:(3,4,5), addaxes(A,2,3) → (1,1,3,4,5,1,1,1).)
+        "addaxes" => {
+            let nl = args.get(1).and_then(|a| resolve_fixed_int(inf, a.0, 0));
+            let nt = args.get(2).and_then(|a| resolve_fixed_int(inf, a.0, 0));
+            match (arg_ty(args, 0), nl, nt) {
+                (Some(Type::Array { shape, elem }), Some(nl), Some(nt)) if nl >= 0 && nt >= 0 => {
+                    let mut dims: Vec<Dim> =
+                        std::iter::repeat_n(static_dim(1), nl as usize).collect();
+                    dims.extend_from_slice(shape);
+                    dims.extend(std::iter::repeat_n(static_dim(1), nt as usize));
+                    Type::Array {
+                        shape: dims.into_boxed_slice(),
+                        elem: elem.clone(),
+                    }
+                }
+                _ => Type::Deferred,
+            }
+        }
+        // splitblocks(A, blocksize) (spec §07) nests A into a vector of equal
+        // sub-arrays. Exact for a 1-D scalar vector → vector of sub-vectors;
+        // multi-D outer rank is value-dependent, so those defer.
+        "splitblocks" => match arg_ty(args, 0) {
+            Some(Type::Array { shape, elem })
+                if shape.len() == 1 && matches!(elem.as_ref(), Type::Scalar(_)) =>
+            {
+                Type::Array {
+                    shape: Box::new([Dim::Dynamic]),
+                    elem: Box::new(Type::Array {
+                        shape: Box::new([Dim::Dynamic]),
+                        elem: elem.clone(),
+                    }),
+                }
+            }
+            _ => Type::Deferred,
+        },
         // cat(x, y, …) concatenates values of the same structural kind: scalars
         // → a rank-1 vector of that kind; arrays → the same rank/element as the
         // first argument (one axis grows, so sizes are dynamic).
