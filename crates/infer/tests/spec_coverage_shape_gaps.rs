@@ -328,8 +328,27 @@ fn domain_preserving_measure_ops_infer() {
     );
     let out = ir("f = fn(_ * 2.0)\nx = pushfwd(f, Normal(0.0, 1.0))");
     assert!(
-        out.contains("(%mass %normalized)") && out.contains("(pushfwd"),
-        "pushfwd preserves total mass → normalized, got:\n{out}"
+        out.contains("(%measure (%domain (%scalar real)) (%mass %normalized))")
+            && out.contains("(pushfwd"),
+        "pushfwd domain = f's codomain (real), mass preserved → normalized, got:\n{out}"
+    );
+}
+
+/// `pushfwd(f, M)` (spec §06) infers its domain as the CODOMAIN of `f` — found by
+/// binding f's input to M's variate and reading f's body type — instead of the
+/// old `%any` fallback. The codomain flows downstream: `iid(pareto, G)` is a real
+/// array, not `any[]`.
+#[test]
+fn pushfwd_domain_is_f_codomain() {
+    let out = ir("pareto = pushfwd(fn(0.1 * exp(_)), Exponential(1.5))\n\
+                  a ~ iid(pareto, 2)");
+    assert!(
+        out.contains("(%bind pareto (%meta ((%measure (%domain (%scalar real))"),
+        "pushfwd(exp reparam) should have a real domain, not %any, got:\n{out}"
+    );
+    assert!(
+        out.contains("(%bind a (%meta ((%array 1 (2) (%scalar real))"),
+        "iid of the pushforward should be a real vector, not any[], got:\n{out}"
     );
 }
 
