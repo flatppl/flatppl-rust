@@ -1374,6 +1374,14 @@ fn reification_type(
 /// `likelihoodof(K, obs)` — inputs ride over from the kernel; the obstype is
 /// the kernel's measure domain, recovered by looking through to the reified
 /// body (spec §11 `%likelihood`).
+///
+/// When the kernel comes from `disintegrate` (via `fk, prior = disintegrate(sel,
+/// joint)`, which desugars to `fk = get(__synth, 1)`), `reified_result_type`
+/// returns `None` because `get` is not a reification. In that case we fall back
+/// to `disintegrate_kernel_obstype`, which follows the `get` → ref →
+/// `disintegrate` chain and re-derives the SELECTED-variate record type (the
+/// mirror of `disintegrate_type`'s complement computation, keeping selected
+/// fields). Spec §06 "Structural disintegration".
 fn likelihood_type(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> Type {
     let Some((k_node, Type::Kernel { inputs, .. }, _)) = args.first() else {
         return Type::Deferred;
@@ -1386,12 +1394,101 @@ fn likelihood_type(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> Type {
             inputs,
             obstype: domain,
         },
-        Some(Type::Deferred) | None => Type::Deferred,
+        Some(Type::Deferred) | None => {
+            // Fall back: check if this kernel came from `disintegrate` and
+            // recover the selected-variate obstype from the joint's record domain.
+            match disintegrate_kernel_obstype(inf, *k_node) {
+                Some(obstype) => Type::Likelihood {
+                    inputs,
+                    obstype: Box::new(obstype),
+                },
+                None => Type::Deferred,
+            }
+        }
         Some(value_ty) => Type::Likelihood {
             inputs,
             obstype: Box::new(value_ty),
         },
     }
+}
+
+/// Recover the obstype for a kernel that came from `disintegrate`. The
+/// desugaring of `fk, prior = disintegrate(sel, joint)` produces
+/// `fk = get(__synth, 1)` where `__synth` is bound to the `disintegrate`
+/// call. We follow the `get` → ref → `disintegrate` chain and re-derive the
+/// SELECTED-variate record (the mirror of `disintegrate_type`'s complement
+/// computation, but keeping the selected fields instead of the complement).
+/// Returns `None` when the chain is absent or the joint is not a record-domain
+/// measure with a static selector (honest — never fabricates a type).
+fn disintegrate_kernel_obstype(inf: &mut Inferencer<'_, '_>, mut node: NodeId) -> Option<Type> {
+    // Follow any self-module refs on the kernel node.
+    loop {
+        match inf.module.node(node) {
+            Node::Ref(r) if r.ns == RefNs::SelfMod => {
+                let b = inf.module.binding_by_name(r.name)?;
+                node = inf.module.binding(b).rhs;
+            }
+            _ => break,
+        }
+    }
+    // Expect: `get(<tuple_ref>, 1)` — the first component of the disintegrate
+    // tuple (1-based index). The second component is the marginal.
+    let Node::Call(get_call) = inf.module.node(node).clone() else {
+        return None;
+    };
+    if !matches!(get_call.head, CallHead::Builtin(op) if inf.module.resolve(op) == "get") {
+        return None;
+    }
+    // arg[0] = tuple ref, arg[1] = index literal 1 (1-based first component)
+    let (tuple_arg, idx_arg) = (
+        get_call.args.first().copied()?,
+        get_call.args.get(1).copied()?,
+    );
+    if !matches!(inf.module.node(idx_arg), Node::Lit(Scalar::Int(1))) {
+        return None;
+    }
+    // Follow the tuple ref to the disintegrate call.
+    let mut tuple_node = tuple_arg;
+    loop {
+        match inf.module.node(tuple_node) {
+            Node::Ref(r) if r.ns == RefNs::SelfMod => {
+                let b = inf.module.binding_by_name(r.name)?;
+                tuple_node = inf.module.binding(b).rhs;
+            }
+            _ => break,
+        }
+    }
+    let Node::Call(dis_call) = inf.module.node(tuple_node).clone() else {
+        return None;
+    };
+    if !matches!(dis_call.head, CallHead::Builtin(op) if inf.module.resolve(op) == "disintegrate") {
+        return None;
+    }
+    // Recover the selector field names (arg[0]) and the joint's record domain (arg[1]).
+    let sel_node = *dis_call.args.first()?;
+    let joint_node = *dis_call.args.get(1)?;
+    let sel = selector_field_names(inf, sel_node)?;
+    let joint_ty = inf.lookup_type(joint_node)?.clone();
+    let domain = match &joint_ty {
+        Type::Measure { domain, .. } => domain.as_ref(),
+        _ => return None,
+    };
+    let Type::Record(fields) = domain else {
+        return None;
+    };
+    // Keep the SELECTED fields (the forward kernel's output variate — spec §06).
+    let is_sel = |n: &Symbol| sel.iter().any(|s| inf.module.resolve(*n) == &**s);
+    let all_present = sel
+        .iter()
+        .all(|s| fields.iter().any(|(n, _)| inf.module.resolve(*n) == &**s));
+    if !all_present {
+        return None;
+    }
+    let selected: Vec<(Symbol, Type)> = fields.iter().filter(|(n, _)| is_sel(n)).cloned().collect();
+    if selected.is_empty() {
+        return None;
+    }
+    Some(Type::Record(selected.into()))
 }
 
 /// `joint_likelihood(L1, L2, …)` — combine likelihoods by multiplying densities
