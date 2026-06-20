@@ -260,10 +260,16 @@ fn kernel_chain_ops_infer_measures() {
         "jointchain keyword form should name each component's variate, got:\n{out}"
     );
 
-    // Finite-base + Normalized-kernel ⇒ Finite result (regression for the
-    // "all-Normalized" bug: previously Finite base caused Unknown output).
-    // `superpose` of two probability measures is a finite (non-normalized)
-    // measure; a Normalized kernel leaves the total mass class unchanged.
+    // Finite-base + Normalized-kernel ⇒ Finite result. The prior arm required
+    // ALL components (including the base) to be Normalized, so a Finite base
+    // with Normalized kernels yielded Unknown. The real bug was that the 2-arg
+    // case happened to produce the correct answer for fully-Normalized inputs
+    // only, and ignored the base-mass distinction — any kernel at index ≥ 1 with
+    // a non-Normalized base would silently give Unknown. The fix separates
+    // base_mass (component 0) from the kernel-Normalized check (components 1..n)
+    // and generalises to any arity, adding keyword-form support in the same pass.
+    // `superpose` of two probability measures is finite (non-normalized);
+    // a Normalized kernel leaves the total mass class unchanged.
     let out = ir("lambda ~ Gamma(2.0, 1.0)\n\
                   m0 = lawof(record(a = lambda))\n\
                   finite_m = superpose(m0, m0)\n\
@@ -1088,5 +1094,33 @@ fn disintegrate_defers_for_non_literal_selector() {
     assert!(
         out.contains("(%measure (%domain %deferred) (%mass %normalized))"),
         "disintegrate with non-literal selector should have deferred marginal domain, got:\n{out}"
+    );
+}
+
+/// `disintegrate([], joint)` — an empty selector `[]` — must yield the deferred
+/// fallback, not a fabricated result.
+///
+/// Discovery (2026-06-20): `[]` lowers to `(vector)` — a `vector` call with zero
+/// args, which matches the `vector`-literal branch of `selector_field_names` and
+/// collects to an empty vec. Without the guard, that empty vec was treated as
+/// `Some([])` — a resolved-but-empty selector — causing `disintegrate` to walk the
+/// record fields and produce non-empty kernel inputs and a full marginal domain.
+/// The fix returns `None` (→ deferred) whenever the collected name list is empty.
+#[test]
+fn disintegrate_defers_for_empty_selector() {
+    // `[]` lowers to `(vector)` with zero args. `selector_field_names` must
+    // return `None` for an empty name list, so `disintegrate_type` falls back
+    // to the deferred path: empty kernel inputs + deferred marginal domain.
+    let out = ir("a ~ Normal(0.0, 1.0)\n\
+                  b ~ Normal(a, 1.0)\n\
+                  mu = lawof(record(a = a, b = b))\n\
+                  parts = disintegrate([], mu)");
+    assert!(
+        out.contains("(%inputs )"),
+        "disintegrate([], mu) should have empty kernel inputs, got:\n{out}"
+    );
+    assert!(
+        out.contains("(%domain %deferred)"),
+        "disintegrate([], mu) should have a deferred marginal domain, got:\n{out}"
     );
 }

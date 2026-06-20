@@ -923,13 +923,19 @@ fn selector_field_names(inf: &Inferencer<'_, '_>, node: NodeId) -> Option<Vec<Bo
             if matches!(c.head, CallHead::Builtin(op)
                 if inf.module.resolve(op) == "vector") =>
         {
-            c.args
+            let names: Option<Vec<Box<str>>> = c
+                .args
                 .iter()
                 .map(|&a| match inf.module.node(a) {
                     Node::Lit(Scalar::Str(s)) => Some(s.clone()),
                     _ => None,
                 })
-                .collect()
+                .collect();
+            // An empty selector (`[]`) lowers to `(vector)` with no args —
+            // `disintegrate([], M)` has no defined meaning (a zero-field selected
+            // subset is a vacuous disintegration). Return `None` so the caller
+            // falls back to the deferred result rather than fabricating an output.
+            names.filter(|v| !v.is_empty())
         }
         _ => None,
     }
@@ -1668,6 +1674,13 @@ fn component_variate(inf: &mut Inferencer<'_, '_>, node: NodeId, ty: &Type) -> O
 /// component whose variate is not statically resolvable ⇒ `%deferred`.
 fn jointchain_domain(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo], named: &[NamedInfo]) -> Type {
     if !named.is_empty() {
+        // Keyword form `jointchain(n1 = M, n2 = K, …)`: each component's variate
+        // is nested under the supplied keyword name, producing
+        // `record{n1: variate(M), n2: variate(K), …}`. This nesting shape
+        // (`record{name: component-variate}`) is a defensible reading of spec §06's
+        // keyword form (which is defined via `relabel`, not modeled in inference).
+        // Pending spec clarification on whether the keyword names wrap or replace
+        // the component variate's own field names.
         let mut fields = Vec::with_capacity(named.len());
         for (name, node, t, _) in named {
             match component_variate(inf, *node, t) {
