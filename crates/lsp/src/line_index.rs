@@ -43,24 +43,32 @@ impl LineIndex {
         byte
     }
 
-    /// The byte offset of the end of line `line`'s CONTENT — i.e. the line's
-    /// next-line start minus the `\n`, and minus a `\r` if the line ends `\r\n`.
-    /// For the final line, the content end is `text.len()`.
+    /// The byte offset of the end of line `line`'s CONTENT.
+    ///
+    /// For a NON-final line this is the next line's start minus the trailing
+    /// `\n` (and a preceding `\r` for CRLF). For the FINAL line it is
+    /// `text.len()` with NOTHING stripped: the final line has no terminator —
+    /// any trailing `\n` belongs to the *previous* line, making the final line
+    /// an empty line that starts at `text.len()`. Stripping there would push
+    /// the content end BELOW the line start and panic the `text[start..end]`
+    /// slices in `position` / `offset` (e.g. a cursor at EOF of a file that
+    /// ends in a newline).
     fn line_content_end(&self, line: usize) -> usize {
-        let raw_end = self
-            .line_starts
-            .get(line + 1)
-            .map(|&s| s as usize)
-            .unwrap_or(self.text.len());
-        // raw_end is either text.len() (final line) or one past a '\n'.
-        let mut end = raw_end;
-        if end > 0 && self.text.as_bytes().get(end - 1) == Some(&b'\n') {
-            end -= 1;
+        match self.line_starts.get(line + 1) {
+            // Not the final line: `next` is one past THIS line's '\n'.
+            Some(&next) => {
+                let mut end = next as usize;
+                if end > 0 && self.text.as_bytes().get(end - 1) == Some(&b'\n') {
+                    end -= 1;
+                }
+                if end > 0 && self.text.as_bytes().get(end - 1) == Some(&b'\r') {
+                    end -= 1;
+                }
+                end
+            }
+            // Final line: no terminator to strip; content ends at text.len().
+            None => self.text.len(),
         }
-        if end > 0 && self.text.as_bytes().get(end - 1) == Some(&b'\r') {
-            end -= 1;
-        }
-        end
     }
 
     /// Byte offset → (line, UTF-16 column). Clamps to the end if out of range.
@@ -203,5 +211,30 @@ mod tests {
             }),
             2
         );
+    }
+
+    #[test]
+    fn final_empty_line_at_eof_does_not_panic() {
+        // A document ending in a newline has a final EMPTY line that starts at
+        // text.len(). position()/offset() on it must not slice text[len..len-1]
+        // — the reversed-range panic that crashed the LSP ("byte range starts
+        // at N but ends at N-1") for a cursor/diagnostic at EOF.
+        for text in ["ab\n", "ab\r\n", "\n"] {
+            let li = LineIndex::new(text);
+            let last_line = (li.line_starts.len() - 1) as u32;
+            let len = text.len() as u32;
+            let p = li.position(len); // EOF on the final empty line
+            assert_eq!(p.line, last_line);
+            assert_eq!(p.character, 0);
+            assert_eq!(li.offset(p), len);
+            // Overshoot column on the empty final line clamps to len, no panic.
+            assert_eq!(
+                li.offset(Pos {
+                    line: last_line,
+                    character: 99
+                }),
+                len
+            );
+        }
     }
 }
