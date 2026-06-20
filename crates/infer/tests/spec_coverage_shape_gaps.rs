@@ -260,6 +260,20 @@ fn kernel_chain_ops_infer_measures() {
             && out.contains("(jointchain"),
         "jointchain keyword form should name each component's variate, got:\n{out}"
     );
+
+    // Finite-base + Normalized-kernel ⇒ Finite result (regression for the
+    // "all-Normalized" bug: previously Finite base caused Unknown output).
+    // `superpose` of two probability measures is a finite (non-normalized)
+    // measure; a Normalized kernel leaves the total mass class unchanged.
+    let out = ir("lambda ~ Gamma(2.0, 1.0)\n\
+                  m0 = lawof(record(a = lambda))\n\
+                  finite_m = superpose(m0, m0)\n\
+                  k = kernelof(record(b = lambda), a = lambda)\n\
+                  j = jointchain(finite_m, k)");
+    assert!(
+        out.contains("(%mass %finite)") && out.contains("(jointchain"),
+        "jointchain with Finite base + Normalized kernel should yield %finite, got:\n{out}"
+    );
 }
 
 /// Domain-preserving measure-algebra ops infer a `(%measure …)` type with the

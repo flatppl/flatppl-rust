@@ -2609,23 +2609,39 @@ pub(crate) fn fill_mass(
         },
         "bayesupdate" => Mass::Unknown,
         "jointchain" => {
-            // `jointchain` is normalized iff the base measure is normalized and
-            // every subsequent component kernel is normalized. Check positional
-            // or keyword args uniformly: all components must be Normalized.
-            let all_masses: Vec<Mass> = if !named.is_empty() {
-                named
-                    .iter()
-                    .map(|(_, _, t, _)| match t {
-                        Type::Measure { mass, .. } => *mass,
-                        Type::Kernel { mass, .. } => *mass,
-                        _ => Mass::Unknown,
-                    })
-                    .collect()
-            } else {
-                (0..args.len()).map(arg_mass).collect()
+            // `jointchain(M, K1, …, Kn)` spec §06: the result carries the base
+            // measure's mass class (component 0) provided every kernel (components
+            // 1..n) is Normalized.  A Finite base + Normalized kernels ⇒ Finite
+            // result; a Normalized base + Normalized kernels ⇒ Normalized result.
+            // If any kernel is not Normalized the total mass is generally
+            // intractable ⇒ Unknown.
+            let named_mass = |t: &Type| match t {
+                Type::Measure { mass, .. } => *mass,
+                Type::Kernel { mass, .. } => *mass,
+                _ => Mass::Unknown,
             };
-            if all_masses.iter().all(|m| matches!(m, Mass::Normalized)) {
-                Mass::Normalized
+            let (base_mass, kernels_normalized): (Mass, bool) = if !named.is_empty() {
+                let base = named
+                    .first()
+                    .map(|(_, _, t, _)| named_mass(t))
+                    .unwrap_or(Mass::Unknown);
+                let all_kernels_norm = named
+                    .iter()
+                    .skip(1)
+                    .all(|(_, _, t, _)| matches!(named_mass(t), Mass::Normalized));
+                (base, all_kernels_norm)
+            } else {
+                let n = args.len();
+                if n == 0 {
+                    (Mass::Unknown, true)
+                } else {
+                    let base = arg_mass(0);
+                    let all_kernels_norm = (1..n).all(|i| matches!(arg_mass(i), Mass::Normalized));
+                    (base, all_kernels_norm)
+                }
+            };
+            if kernels_normalized {
+                base_mass
             } else {
                 Mass::Unknown
             }
