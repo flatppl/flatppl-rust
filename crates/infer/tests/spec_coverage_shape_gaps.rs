@@ -228,16 +228,16 @@ fn kernel_chain_ops_infer_measures() {
             && out.contains("(kscan"),
         "kscan should be a normalized measure over array[3] real, got:\n{out}"
     );
-    // kchain: a measure (not %deferred), normalized when components are; domain
-    // is deferred (last variate not statically extractable).
+    // kchain keeps the LAST component's variate (spec §06 Kleisli bind): fk's
+    // output is record{y: real}.
     let out = ir("lambda ~ Gamma(2.0, 1.0)\n\
                   prior = lawof(record(lambda = lambda))\n\
                   fk = kernelof(record(y = lambda), lambda = lambda)\n\
                   pp = kchain(prior, fk)");
     assert!(
-        out.contains("(%measure (%domain %deferred) (%mass %normalized))")
+        out.contains("(%measure (%domain (%record (y (%scalar real)))) (%mass %normalized))")
             && out.contains("(kchain"),
-        "kchain should be a normalized measure with a deferred domain, got:\n{out}"
+        "kchain domain should be the last component's variate record{{y}}, got:\n{out}"
     );
     // jointchain: previously %deferred-typed (so its existing mass arm was dead);
     // typing it as a measure activates that arm — a joint chain of a base measure

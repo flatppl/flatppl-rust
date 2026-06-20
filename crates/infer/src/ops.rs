@@ -364,11 +364,19 @@ pub(crate) fn call_rule(
             };
             trajectory_measure(arg_ty(args, 1), len)
         }
-        // `kchain` / `jointchain` (spec §06) are measures, but their output
-        // variate (last kernel's codomain / `cat` of all variates) is not
-        // statically extractable — so we record that the result IS a measure
-        // (better than %deferred) with a deferred domain; mass class in `fill_mass`.
-        "kchain" | "jointchain" => Type::Measure {
+        // `kchain(M, K1, …, Kn)` (spec §06): Kleisli bind — marginalizes the
+        // intermediate variates, KEEPS THE LAST component's variate. Mass is
+        // filled by `fill_mass`.
+        "kchain" => Type::Measure {
+            domain: Box::new(
+                args.last()
+                    .and_then(|(n, t, _)| component_variate(inf, *n, t))
+                    .unwrap_or(Type::Deferred),
+            ),
+            mass: Mass::Deferred,
+        },
+        // (Task 2 replaces this with a real domain.)
+        "jointchain" => Type::Measure {
             domain: Box::new(Type::Deferred),
             mass: Mass::Deferred,
         },
@@ -1568,6 +1576,31 @@ fn reified_result_type(inf: &mut Inferencer<'_, '_>, node: NodeId) -> Option<Typ
     }
     let body = reified_body(inf, node)?;
     inf.lookup_type(body).cloned()
+}
+
+/// The output variate (value domain) of a measure-algebra chain component
+/// (spec §06): a base measure contributes its own `domain`; a kernel contributes
+/// its reified body's output value — a `kernelof` body IS the random value (its
+/// type is the variate), a `functionof`-of-measure body exposes a measure whose
+/// `domain` is the variate. `None` (→ caller leaves the chain domain `%deferred`)
+/// when the component is neither a measure nor a kernel, or its body / domain is
+/// not statically resolvable.
+fn component_variate(inf: &mut Inferencer<'_, '_>, node: NodeId, ty: &Type) -> Option<Type> {
+    match ty {
+        Type::Measure { domain, .. } => match domain.as_ref() {
+            Type::Deferred => None,
+            d => Some(d.clone()),
+        },
+        Type::Kernel { .. } => match reified_result_type(inf, node)? {
+            Type::Measure { domain, .. } => match *domain {
+                Type::Deferred => None,
+                d => Some(d),
+            },
+            Type::Deferred => None,
+            value_ty => Some(value_ty),
+        },
+        _ => None,
+    }
 }
 
 /// Per-call result type of a **local** reified callable, computed by substituting
