@@ -518,6 +518,11 @@ fn emit_distributions(m: &mut Module, doc: &Document) -> Result<()> {
         if needs_hp && !has_histfactory {
             crate::pyhf::emit_standard_module(&mut b);
         }
+        // Bind the polynomials standard module once if any distribution uses chebychev_dist.
+        let needs_poly = doc.distributions.iter().any(|d| d.kind == "chebychev_dist");
+        if needs_poly {
+            crate::pyhf::bind_standard_module(&mut b, "poly", "polynomials", "0.1");
+        }
         // Resolve each distribution's variate once, so product_dist can classify
         // its factors (shared variate → density product, else independent joint).
         let dist_by_name: std::collections::BTreeMap<&str, &Distribution> = doc

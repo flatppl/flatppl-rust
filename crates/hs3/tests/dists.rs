@@ -839,3 +839,33 @@ fn barlow_beeston_lite_poisson_constraint_converts() {
         parsed.err()
     );
 }
+
+// ---------------------------------------------------------------------------
+// chebychev_dist → normalize(truncate(weighted(functionof(WEIGHT, x=_x_), Lebesgue(reals)), interval(lo, hi)))
+// WEIGHT = add(1.0, Σ mul(cᵢ, poly.chebyshev(i, t)))
+// t = div(sub(mul(2.0, _x_), lo+hi), hi-lo)
+// ---------------------------------------------------------------------------
+
+const CHEBY_JSON: &str = r#"{
+  "distributions": [
+    {"name": "bkg", "type": "chebychev_dist", "coefficients": ["c0","c1"], "x": "m"}
+  ],
+  "domains": [
+    {"name": "default_domain", "type": "product_domain",
+     "axes": [{"name": "m", "min": 0.0, "max": 10.0}]}
+  ]
+}"#;
+
+#[test]
+fn chebychev_converts() {
+    let m = flatppl_hs3::read_hs3(CHEBY_JSON).expect("read_hs3");
+    let text = flatppl_syntax::print_with(&m, flatppl_syntax::Syntax::Minimal);
+    eprintln!("{text}");
+    assert!(text.contains("chebyshev("), "missing chebyshev: {text}");
+    assert!(text.contains("normalize"), "must be normalized: {text}");
+    assert!(
+        text.contains("c0") && text.contains("c1"),
+        "missing coeffs: {text}"
+    );
+    flatppl_syntax::parse(&text).expect("re-parse");
+}
