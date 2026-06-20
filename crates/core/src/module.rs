@@ -542,6 +542,32 @@ mod tests {
     }
 
     #[test]
+    fn display_valueset_recurses_record_inside_cartprod() {
+        use crate::ty::Dim;
+        use crate::ty::ValueSet::*;
+        let mut m = Module::new();
+        let a = m.intern("a");
+        let b = m.intern("b");
+        // RecordSet nested as the first element of a CartProd — the interner
+        // must be threaded into the recursive call so field names resolve.
+        let rs = RecordSet(Box::new([(a, Reals), (b, UnitInterval)]));
+        let cp = CartProd(Box::new([rs, PosReals]));
+        assert_eq!(
+            m.display_valueset(&cp),
+            "cartprod(record(a: reals, b: unitinterval), posreals)"
+        );
+        // RecordSet nested inside CartPow — same recursion path, different arm.
+        let a2 = m.intern("a");
+        let b2 = m.intern("b");
+        let rs2 = RecordSet(Box::new([(a2, Reals), (b2, UnitInterval)]));
+        let cpow = CartPow(Box::new(rs2), Dim::Static(3));
+        assert_eq!(
+            m.display_valueset(&cpow),
+            "cartpow(record(a: reals, b: unitinterval), 3)"
+        );
+    }
+
+    #[test]
     fn build_access_traverse_annotate() {
         let mut m = Module::new();
 
