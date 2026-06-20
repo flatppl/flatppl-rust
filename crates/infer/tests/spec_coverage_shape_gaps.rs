@@ -1198,3 +1198,47 @@ fn disintegrate_defers_for_empty_selector() {
         "disintegrate([], mu) should have a deferred marginal domain, got:\n{out}"
     );
 }
+
+/// `likelihoodof(fk, obs)` where `fk` is a `disintegrate` forward-kernel recovers
+/// the obstype from the joint's selected-variate record (spec §06 "Structural
+/// disintegration"). The kernel comes from `fk, prior = disintegrate(sel, joint)`
+/// which desugars to `fk = get(__synth, 1)`; `likelihood_type` follows the
+/// `get` → ref → `disintegrate` chain and keeps the SELECTED fields.
+/// Discovery (2026-06-20): before the fix `L` was `%deferred`; after, it is
+/// `(%likelihood (%inputs a) (%obstype (%record (b (%scalar real)))))`.
+#[test]
+fn likelihoodof_of_disintegrate_kernel_recovers_obstype() {
+    let out = ir("a ~ Normal(0.0, 1.0)\n\
+                  b ~ Normal(a, 1.0)\n\
+                  joint_model = lawof(record(a = a, b = b))\n\
+                  fk, prior = disintegrate([\"b\"], joint_model)\n\
+                  L = likelihoodof(fk, record(b = 1.0))");
+    assert!(
+        out.contains(
+            "(%bind L (%meta ((%likelihood (%inputs a) (%obstype (%record (b (%scalar real)))))"
+        ),
+        "likelihoodof of a disintegrate kernel should recover the selected-variate obstype; got:\n{out}"
+    );
+}
+
+/// A `cartprod`/`cartpow`/`interval` PRESET binding (spec §03 "Presets") denotes
+/// a set; its value-set slot carries that set (the PR-#34 vocabulary), not
+/// `anything`. (Its TYPE stays `%any` — a set is not a value type, §03 "Sets".)
+#[test]
+fn set_constructor_presets_carry_their_set() {
+    let out = ir("default_domain = cartprod(a = interval(0.0, 5.0), b = unitinterval)");
+    assert!(
+        out.contains("(record (a (interval 0.0 5.0)) (b unitinterval))"),
+        "cartprod preset value-set should be the denoted record set, got:\n{out}"
+    );
+    let out = ir("grid = cartpow(interval(-10.0, 10.0), 3)");
+    assert!(
+        out.contains("(cartpow (interval -10.0 10.0) 3)"),
+        "cartpow preset value-set should be the denoted power set, got:\n{out}"
+    );
+    let out = ir("r = interval(0.0, 1.0)");
+    assert!(
+        out.contains("(interval 0.0 1.0)"),
+        "interval preset value-set should be the denoted interval, got:\n{out}"
+    );
+}

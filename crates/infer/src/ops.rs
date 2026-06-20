@@ -1374,6 +1374,14 @@ fn reification_type(
 /// `likelihoodof(K, obs)` — inputs ride over from the kernel; the obstype is
 /// the kernel's measure domain, recovered by looking through to the reified
 /// body (spec §11 `%likelihood`).
+///
+/// When the kernel comes from `disintegrate` (via `fk, prior = disintegrate(sel,
+/// joint)`, which desugars to `fk = get(__synth, 1)`), `reified_result_type`
+/// returns `None` because `get` is not a reification. In that case we fall back
+/// to `disintegrate_kernel_obstype`, which follows the `get` → ref →
+/// `disintegrate` chain and re-derives the SELECTED-variate record type (the
+/// mirror of `disintegrate_type`'s complement computation, keeping selected
+/// fields). Spec §06 "Structural disintegration".
 fn likelihood_type(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> Type {
     let Some((k_node, Type::Kernel { inputs, .. }, _)) = args.first() else {
         return Type::Deferred;
@@ -1386,12 +1394,101 @@ fn likelihood_type(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> Type {
             inputs,
             obstype: domain,
         },
-        Some(Type::Deferred) | None => Type::Deferred,
+        Some(Type::Deferred) | None => {
+            // Fall back: check if this kernel came from `disintegrate` and
+            // recover the selected-variate obstype from the joint's record domain.
+            match disintegrate_kernel_obstype(inf, *k_node) {
+                Some(obstype) => Type::Likelihood {
+                    inputs,
+                    obstype: Box::new(obstype),
+                },
+                None => Type::Deferred,
+            }
+        }
         Some(value_ty) => Type::Likelihood {
             inputs,
             obstype: Box::new(value_ty),
         },
     }
+}
+
+/// Recover the obstype for a kernel that came from `disintegrate`. The
+/// desugaring of `fk, prior = disintegrate(sel, joint)` produces
+/// `fk = get(__synth, 1)` where `__synth` is bound to the `disintegrate`
+/// call. We follow the `get` → ref → `disintegrate` chain and re-derive the
+/// SELECTED-variate record (the mirror of `disintegrate_type`'s complement
+/// computation, but keeping the selected fields instead of the complement).
+/// Returns `None` when the chain is absent or the joint is not a record-domain
+/// measure with a static selector (honest — never fabricates a type).
+fn disintegrate_kernel_obstype(inf: &mut Inferencer<'_, '_>, mut node: NodeId) -> Option<Type> {
+    // Follow any self-module refs on the kernel node.
+    loop {
+        match inf.module.node(node) {
+            Node::Ref(r) if r.ns == RefNs::SelfMod => {
+                let b = inf.module.binding_by_name(r.name)?;
+                node = inf.module.binding(b).rhs;
+            }
+            _ => break,
+        }
+    }
+    // Expect: `get(<tuple_ref>, 1)` — the first component of the disintegrate
+    // tuple (1-based index). The second component is the marginal.
+    let Node::Call(get_call) = inf.module.node(node).clone() else {
+        return None;
+    };
+    if !matches!(get_call.head, CallHead::Builtin(op) if inf.module.resolve(op) == "get") {
+        return None;
+    }
+    // arg[0] = tuple ref, arg[1] = index literal 1 (1-based first component)
+    let (tuple_arg, idx_arg) = (
+        get_call.args.first().copied()?,
+        get_call.args.get(1).copied()?,
+    );
+    if !matches!(inf.module.node(idx_arg), Node::Lit(Scalar::Int(1))) {
+        return None;
+    }
+    // Follow the tuple ref to the disintegrate call.
+    let mut tuple_node = tuple_arg;
+    loop {
+        match inf.module.node(tuple_node) {
+            Node::Ref(r) if r.ns == RefNs::SelfMod => {
+                let b = inf.module.binding_by_name(r.name)?;
+                tuple_node = inf.module.binding(b).rhs;
+            }
+            _ => break,
+        }
+    }
+    let Node::Call(dis_call) = inf.module.node(tuple_node).clone() else {
+        return None;
+    };
+    if !matches!(dis_call.head, CallHead::Builtin(op) if inf.module.resolve(op) == "disintegrate") {
+        return None;
+    }
+    // Recover the selector field names (arg[0]) and the joint's record domain (arg[1]).
+    let sel_node = *dis_call.args.first()?;
+    let joint_node = *dis_call.args.get(1)?;
+    let sel = selector_field_names(inf, sel_node)?;
+    let joint_ty = inf.lookup_type(joint_node)?.clone();
+    let domain = match &joint_ty {
+        Type::Measure { domain, .. } => domain.as_ref(),
+        _ => return None,
+    };
+    let Type::Record(fields) = domain else {
+        return None;
+    };
+    // Keep the SELECTED fields (the forward kernel's output variate — spec §06).
+    let is_sel = |n: &Symbol| sel.iter().any(|s| inf.module.resolve(*n) == &**s);
+    let all_present = sel
+        .iter()
+        .all(|s| fields.iter().any(|(n, _)| inf.module.resolve(*n) == &**s));
+    if !all_present {
+        return None;
+    }
+    let selected: Vec<(Symbol, Type)> = fields.iter().filter(|(n, _)| is_sel(n)).cloned().collect();
+    if selected.is_empty() {
+        return None;
+    }
+    Some(Type::Record(selected.into()))
 }
 
 /// `joint_likelihood(L1, L2, …)` — combine likelihoods by multiplying densities
@@ -2321,6 +2418,10 @@ pub(crate) fn call_valueset(
     }
     let name = inf.module.resolve(op).to_string();
     match name.as_str() {
+        // A set-constructor used directly as a value binding is a PRESET (spec
+        // §03): its value-set is the set it denotes. (Its TYPE is `%any` — a set
+        // is not a value type — set in the `cartprod`/`interval`/… type arms.)
+        "interval" | "stdsimplex" | "cartpow" | "cartprod" => set_call_valueset(inf, call),
         // Parameters / loaded sets.
         "elementof" | "external" => set_expr_valueset(inf, args.first().map(|a| a.0)),
         // `broadcast(head, data…)` over a user callable: the cell value-set is
@@ -2472,6 +2573,82 @@ fn vector_dim(ty: Option<&Type>) -> Dim {
     }
 }
 
+/// The value-set denoted by a set-constructor CALL (`interval(...)`,
+/// `stdsimplex(n)`, `cartpow(S, size)`, `cartprod(...)`). Shared by
+/// `set_expr_valueset` (set-expression argument position) and `call_valueset`
+/// (a set-constructor used directly as a preset binding, spec §03). `Unknown`
+/// for any non-set-constructor head or unresolvable component.
+fn set_call_valueset(inf: &mut Inferencer<'_, '_>, c: &Call) -> ValueSet {
+    let CallHead::Builtin(op) = c.head else {
+        return ValueSet::Unknown;
+    };
+    match inf.module.resolve(op).to_string().as_str() {
+        "interval" => {
+            let bound = |n: Option<&NodeId>| match n.map(|&n| inf.module.node(n).clone()) {
+                Some(Node::Lit(Scalar::Real(r))) => Some(r),
+                Some(Node::Lit(Scalar::Int(i))) => Some(i as f64),
+                Some(Node::Const(sym)) if inf.module.resolve(sym) == "inf" => Some(f64::INFINITY),
+                Some(Node::Call(neg))
+                    if matches!(neg.head, CallHead::Builtin(op)
+                        if inf.module.resolve(op) == "neg") =>
+                {
+                    bound_of(inf, neg.args.first().copied()).map(|b| -b)
+                }
+                _ => None,
+            };
+            match (bound(c.args.first()), bound(c.args.get(1))) {
+                (Some(lo), Some(hi)) => ValueSet::Interval(lo, hi),
+                _ => ValueSet::Unknown,
+            }
+        }
+        "stdsimplex" => ValueSet::StdSimplex(
+            c.args
+                .first()
+                .map_or(Dim::Dynamic, |&n| resolve_dim(inf, n)),
+        ),
+        "cartpow" => {
+            let elem = set_expr_valueset(inf, c.args.first().copied());
+            if elem == ValueSet::Unknown {
+                return ValueSet::Unknown;
+            }
+            let shape = c.args.get(1).map_or_else(
+                || Box::new([Dim::Dynamic]) as Box<[Dim]>,
+                |&n| count_dims(inf, n),
+            );
+            flatppl_core::ty::cartpow_over(elem, &shape)
+        }
+        "cartprod" => {
+            // Positional → CartProd; keyword → RecordSet. Mixing is not
+            // a valid set expression (spec §03 gives the two forms
+            // separately); if both are present, the named fields win as
+            // a record and positional args are ignored (front-end
+            // should already reject the mix).
+            if !c.named.is_empty() {
+                let mut fields = Vec::with_capacity(c.named.len());
+                for na in c.named.iter() {
+                    let set = set_expr_valueset(inf, Some(na.value));
+                    if set == ValueSet::Unknown {
+                        return ValueSet::Unknown;
+                    }
+                    fields.push((na.name, set));
+                }
+                ValueSet::RecordSet(fields.into())
+            } else {
+                let mut parts = Vec::with_capacity(c.args.len());
+                for &arg in c.args.iter() {
+                    let set = set_expr_valueset(inf, Some(arg));
+                    if set == ValueSet::Unknown {
+                        return ValueSet::Unknown;
+                    }
+                    parts.push(set);
+                }
+                ValueSet::CartProd(parts.into())
+            }
+        }
+        _ => ValueSet::Unknown,
+    }
+}
+
 /// A set *expression* (an `elementof` / `truncate` / reference-measure
 /// argument) read structurally into a [`ValueSet`].
 fn set_expr_valueset(inf: &mut Inferencer<'_, '_>, node: Option<NodeId>) -> ValueSet {
@@ -2493,78 +2670,7 @@ fn set_expr_valueset(inf: &mut Inferencer<'_, '_>, node: Option<NodeId>) -> Valu
             "anything" => ValueSet::Anything,
             _ => ValueSet::Unknown,
         },
-        Node::Call(c) => {
-            let CallHead::Builtin(op) = c.head else {
-                return ValueSet::Unknown;
-            };
-            match inf.module.resolve(op).to_string().as_str() {
-                "interval" => {
-                    let bound = |n: Option<&NodeId>| match n.map(|&n| inf.module.node(n).clone()) {
-                        Some(Node::Lit(Scalar::Real(r))) => Some(r),
-                        Some(Node::Lit(Scalar::Int(i))) => Some(i as f64),
-                        Some(Node::Const(sym)) if inf.module.resolve(sym) == "inf" => {
-                            Some(f64::INFINITY)
-                        }
-                        Some(Node::Call(neg))
-                            if matches!(neg.head, CallHead::Builtin(op)
-                                if inf.module.resolve(op) == "neg") =>
-                        {
-                            bound_of(inf, neg.args.first().copied()).map(|b| -b)
-                        }
-                        _ => None,
-                    };
-                    match (bound(c.args.first()), bound(c.args.get(1))) {
-                        (Some(lo), Some(hi)) => ValueSet::Interval(lo, hi),
-                        _ => ValueSet::Unknown,
-                    }
-                }
-                "stdsimplex" => ValueSet::StdSimplex(
-                    c.args
-                        .first()
-                        .map_or(Dim::Dynamic, |&n| resolve_dim(inf, n)),
-                ),
-                "cartpow" => {
-                    let elem = set_expr_valueset(inf, c.args.first().copied());
-                    if elem == ValueSet::Unknown {
-                        return ValueSet::Unknown;
-                    }
-                    let shape = c.args.get(1).map_or_else(
-                        || Box::new([Dim::Dynamic]) as Box<[Dim]>,
-                        |&n| count_dims(inf, n),
-                    );
-                    flatppl_core::ty::cartpow_over(elem, &shape)
-                }
-                "cartprod" => {
-                    // Positional → CartProd; keyword → RecordSet. Mixing is not
-                    // a valid set expression (spec §03 gives the two forms
-                    // separately); if both are present, the named fields win as
-                    // a record and positional args are ignored (front-end
-                    // should already reject the mix).
-                    if !c.named.is_empty() {
-                        let mut fields = Vec::with_capacity(c.named.len());
-                        for na in c.named.iter() {
-                            let set = set_expr_valueset(inf, Some(na.value));
-                            if set == ValueSet::Unknown {
-                                return ValueSet::Unknown;
-                            }
-                            fields.push((na.name, set));
-                        }
-                        ValueSet::RecordSet(fields.into())
-                    } else {
-                        let mut parts = Vec::with_capacity(c.args.len());
-                        for &arg in c.args.iter() {
-                            let set = set_expr_valueset(inf, Some(arg));
-                            if set == ValueSet::Unknown {
-                                return ValueSet::Unknown;
-                            }
-                            parts.push(set);
-                        }
-                        ValueSet::CartProd(parts.into())
-                    }
-                }
-                _ => ValueSet::Unknown,
-            }
-        }
+        Node::Call(c) => set_call_valueset(inf, &c),
         _ => ValueSet::Unknown,
     }
 }
