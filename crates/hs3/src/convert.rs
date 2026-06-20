@@ -100,6 +100,20 @@ fn reject_unsupported(doc: &Document) -> Result<()> {
 /// would pick an arbitrary support — so this is rejected.
 fn domain_bounds(doc: &Document) -> Result<BTreeMap<&str, (f64, f64)>> {
     let mut map: BTreeMap<&str, (f64, f64)> = BTreeMap::new();
+    if let Some(d) = doc.domains.iter().find(|d| d.name == "default_domain") {
+        // A named default domain IS the variate support. Other `domains` entries
+        // are RooFit named sub-ranges (fit/integration/plot), NOT redefinitions —
+        // do not consult them here, so they never "conflict".
+        for ax in &d.axes {
+            let (Some(min), Some(max)) = (ax.min, ax.max) else {
+                continue;
+            };
+            map.insert(ax.name.as_str(), (min, max));
+        }
+        return Ok(map);
+    }
+    // No default_domain: preserve the existing guard — merge all domains' axes and
+    // reject the same observable bound to *different* bounds (not last-wins).
     for d in &doc.domains {
         for ax in &d.axes {
             // A `uniform_dist` support needs both bounds; an axis missing one
