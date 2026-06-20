@@ -340,11 +340,13 @@ pub(crate) fn call_rule(
         // These no longer defer: even before the engine evaluates their mass,
         // the value domain is known, so the type slot carries `(%measure …)`.
         "restrict" | "superpose" | "locscale" => fresh_measure(arg_ty(args, 0)),
-        // `pushfwd(f, M)` (spec §06) is a measure, but its domain is the
-        // codomain of `f`, which inference does not track — so we know the
-        // result IS a measure (better than %deferred) with a deferred domain.
+        // `pushfwd(f, M)` (spec §06): a measure whose domain is the CODOMAIN of
+        // `f`. `f` maps a value drawn from `M`, so binding its input to `M`'s
+        // variate (domain + support value-set) and reading `f`'s body type gives
+        // the codomain; fall back to `f`'s un-substituted body, then to `%any`
+        // (honest — never a guess). Mass is filled (mass-preserving) by `fill_mass`.
         "pushfwd" => Type::Measure {
-            domain: Box::new(Type::Any),
+            domain: Box::new(pushfwd_codomain(inf, args).unwrap_or(Type::Any)),
             mass: Mass::Deferred,
         },
         // `markovchain(kernel, init, n)` / `kscan(kernel, init, xs)` (spec §06):
@@ -1664,6 +1666,29 @@ fn reified_body(inf: &Inferencer<'_, '_>, mut node: NodeId) -> Option<NodeId> {
             Node::Call(c) if c.inputs.is_some() => return c.args.first().copied(),
             _ => return None,
         }
+    }
+}
+
+/// The codomain of `f` in `pushfwd(f, M)` (spec §06). `f` maps a value drawn from
+/// `M`, so its single input is bound to `M`'s variate — type = `M`'s domain,
+/// value-set = `M`'s support (read by `substituted_result` from the `M` node) —
+/// and `f`'s re-inferred body type is the codomain. Falls back to `f`'s
+/// un-substituted body type, then `None` (caller uses `%any`) when `f` is not a
+/// resolvable reification or its body is `%deferred`.
+fn pushfwd_codomain(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> Option<Type> {
+    let f_node = args.first()?.0;
+    let seed = match args.get(1) {
+        Some((m_node, Type::Measure { domain, .. }, m_phase))
+            if !matches!(domain.as_ref(), Type::Deferred) =>
+        {
+            Some(vec![(*m_node, (**domain).clone(), *m_phase)])
+        }
+        _ => None,
+    };
+    let sub = seed.and_then(|s| substituted_result(inf, f_node, &s, &[]).map(|(t, _)| t));
+    match sub.or_else(|| reified_result_type(inf, f_node)) {
+        Some(Type::Deferred) | None => None,
+        Some(t) => Some(t),
     }
 }
 
