@@ -17,7 +17,7 @@ use crate::error::{Error, Result};
 use crate::expr;
 use crate::model::{Distribution, Document, Function, HistFactory, Modifier};
 use crate::presets::{emit_domain, emit_parameter_point};
-use flatppl_core::Module;
+use flatppl_core::{Module, NodeId};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub fn document_to_module(doc: &Document) -> Result<Module> {
@@ -90,16 +90,35 @@ fn reject_unsupported(doc: &Document) -> Result<()> {
     Ok(())
 }
 
-/// Build a lookup from observed-variable name → `(min, max)` over every axis of
-/// every `domains` entry. Used to resolve a distribution variate's support
+/// Build a lookup from observed-variable name → `(min, max)` over the
+/// document's `domains` block. Used to resolve a distribution variate's support
 /// (e.g. for `uniform_dist`).
 ///
-/// The same observable may appear in more than one `domains` entry; that is fine
-/// as long as the bounds agree. Two axes naming the same observable with
-/// *conflicting* `(min, max)` are contradictory — silently keeping the last
-/// would pick an arbitrary support — so this is rejected.
+/// When a domain named `default_domain` is present it is the variate support;
+/// all other `domains` entries are treated as RooFit named sub-ranges
+/// (fit/integration/plot ranges) and are not consulted for support resolution.
+///
+/// Without `default_domain`, all domains are merged: the same observable may
+/// appear in more than one `domains` entry as long as the bounds agree. Two
+/// axes naming the same observable with *conflicting* `(min, max)` are
+/// contradictory — silently keeping the last would pick an arbitrary support —
+/// so this is rejected.
 fn domain_bounds(doc: &Document) -> Result<BTreeMap<&str, (f64, f64)>> {
     let mut map: BTreeMap<&str, (f64, f64)> = BTreeMap::new();
+    if let Some(d) = doc.domains.iter().find(|d| d.name == "default_domain") {
+        // A named default domain IS the variate support. Other `domains` entries
+        // are RooFit named sub-ranges (fit/integration/plot), NOT redefinitions —
+        // do not consult them here, so they never "conflict".
+        for ax in &d.axes {
+            let (Some(min), Some(max)) = (ax.min, ax.max) else {
+                continue;
+            };
+            map.insert(ax.name.as_str(), (min, max));
+        }
+        return Ok(map);
+    }
+    // No default_domain: preserve the existing guard — merge all domains' axes and
+    // reject the same observable bound to *different* bounds (not last-wins).
     for d in &doc.domains {
         for ax in &d.axes {
             // A `uniform_dist` support needs both bounds; an axis missing one
@@ -426,9 +445,72 @@ fn declare_generic_expr_params(
     Ok(())
 }
 
+/// Return true if `expr` contains an `erf` or `erfc` function call.
+///
+/// Uses a boundary-aware token check: the name must not be immediately preceded
+/// by an ASCII identifier character (letter, digit, or `_`), so `xerf(` is not
+/// a false positive while `erf(` and `erfc(` are. A plain substring match on
+/// `"erf("` would also match inside a longer name — the boundary guard prevents
+/// that at negligible cost.
+fn expr_uses_specfun(expr: &str) -> bool {
+    let bytes = expr.as_bytes();
+    for name in &["erfc(", "erf("] {
+        let needle = name.as_bytes();
+        let nlen = needle.len();
+        let mut i = 0;
+        while i + nlen <= bytes.len() {
+            if bytes[i..i + nlen] == *needle {
+                // Guard: preceding byte must not be an identifier character.
+                let ok = i == 0
+                    || !{
+                        let b = bytes[i - 1];
+                        b.is_ascii_alphanumeric() || b == b'_'
+                    };
+                if ok {
+                    return true;
+                }
+            }
+            i += 1;
+        }
+    }
+    false
+}
+
+/// Return true if any expression string in the document uses `erf` or `erfc`.
+fn doc_uses_specfun(doc: &Document) -> bool {
+    // Scan generic_function expressions.
+    for f in &doc.functions {
+        if f.kind == "generic_function" {
+            if let Some(expr) = f.extra.get("expression").and_then(|v| v.as_str()) {
+                if expr_uses_specfun(expr) {
+                    return true;
+                }
+            }
+        }
+    }
+    // Scan generic_dist / density_function_dist / log_density_function_dist inline expressions.
+    for d in &doc.distributions {
+        if matches!(
+            d.kind.as_str(),
+            "generic_dist" | "density_function_dist" | "log_density_function_dist"
+        ) {
+            if let Some(expr) = d.extra.get("expression").and_then(|v| v.as_str()) {
+                if expr_uses_specfun(expr) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Step 1b: lower each `functions` block entry to a deterministic binding.
 fn emit_functions(m: &mut Module, doc: &Document) -> Result<()> {
     let mut b = Builder::new(m);
+    // Bind the special-functions standard module once if any expression uses erf/erfc.
+    if doc_uses_specfun(doc) {
+        crate::pyhf::bind_standard_module(&mut b, "specfun", "special-functions", "0.1");
+    }
     for f in &doc.functions {
         emit_function(&mut b, f)?;
     }
@@ -454,6 +536,11 @@ fn emit_distributions(m: &mut Module, doc: &Document) -> Result<()> {
             .any(|d| d.kind == "histfactory_dist");
         if needs_hp && !has_histfactory {
             crate::pyhf::emit_standard_module(&mut b);
+        }
+        // Bind the polynomials standard module once if any distribution uses chebychev_dist.
+        let needs_poly = doc.distributions.iter().any(|d| d.kind == "chebychev_dist");
+        if needs_poly {
+            crate::pyhf::bind_standard_module(&mut b, "poly", "polynomials", "0.1");
         }
         // Resolve each distribution's variate once, so product_dist can classify
         // its factors (shared variate → density product, else independent joint).
@@ -850,6 +937,30 @@ fn emit_function(b: &mut Builder, f: &Function) -> Result<()> {
                 &f.name,
                 node,
                 &["HS3 generic_function → lowered expression"],
+            );
+        }
+        "polynomial" => {
+            let coeff_arr = f
+                .extra
+                .get("coefficients")
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| {
+                    Error::Unsupported(format!(
+                        "polynomial function `{}` missing `coefficients` field",
+                        f.name
+                    ))
+                })?;
+            let coeff_elems: Vec<NodeId> = coeff_arr
+                .iter()
+                .map(|v| crate::distribution::field_node(b, v))
+                .collect::<Result<_>>()?;
+            let coeff_vec = b.array(&coeff_elems);
+            let obs_name = f.extra.get("x").and_then(|v| v.as_str()).unwrap_or("x");
+            let node = crate::distribution::build_polynomial_fn(b, coeff_vec, obs_name);
+            b.bind_doc(
+                &f.name,
+                node,
+                &["HS3 polynomial function → polynomial(coefficients, x)"],
             );
         }
         other => {

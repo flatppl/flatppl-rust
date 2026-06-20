@@ -242,6 +242,16 @@ static SPECS: &[DistSpec] = &[
         ),
         known_fields: &["coefficients", "x"],
     },
+    DistSpec {
+        kind: "chebychev_dist",
+        // Variate is the `x` field (scalar observable); domain required for truncation.
+        variate: Variate::Scalar("x"),
+        needs_hepphys: false,
+        doc_line: Some(
+            "HS3 chebychev_dist → normalize(truncate(weighted(functionof(1+Σ a_k·T_k(t)), Lebesgue(reals)), interval))",
+        ),
+        known_fields: &["coefficients", "x"],
+    },
     // Deliberately Unsupported: `emit_distribution` returns Err(Unsupported) for
     // relativistic_breit_wigner_dist (HS3's multi-channel parameterization has no
     // 1:1 FlatPPL map), so conversion aborts before any of this metadata is read.
@@ -351,6 +361,8 @@ pub(crate) fn param_domain(kind: &str, field: &str) -> &'static str {
         (_, "rate") => "posreals",
         // Barlow-Beeston expected counts are ≥ 0
         ("barlow_beeston_lite_poisson_constraint_dist", "expected") => "posreals",
+        // Chebyshev coefficients are unrestricted real numbers
+        ("chebychev_dist", "coefficients") => "reals",
         _ => "reals",
     }
 }

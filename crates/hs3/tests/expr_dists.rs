@@ -454,3 +454,51 @@ fn pi_constant_inlined_in_generic_dist() {
         parsed.err()
     );
 }
+
+// ---------------------------------------------------------------------------
+// erf/erfc → special-functions module
+//
+// A generic_function that uses `erf`/`erfc` must:
+//   1. Emit a call into the `specfun` alias (`specfun.erf(...)` / `.erfc(...)`).
+//   2. Bind the special-functions standard module at exactly the spec name and
+//      version — pin the full binding string, since a wrong module name or
+//      version (e.g. `special_functions`/`0.2`) would silently break inference
+//      resolution while a bare `standard_module` substring still matched.
+//   3. Round-trip parse without error.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn expr_erf_lowers_to_special_functions() {
+    const JSON: &str = r#"{
+      "functions": [
+        {"name": "eff", "type": "generic_function", "expression": "erf(x)", "x": "x"}
+      ]
+    }"#;
+    let m = flatppl_hs3::read_hs3(JSON).expect("read_hs3");
+    let text = print_with(&m, Syntax::Minimal);
+    eprintln!("=== erf emit ===\n{text}\n=== end ===");
+    assert!(text.contains(".erf("), "missing specfun.erf call: {text}");
+    assert!(
+        text.contains(r#"standard_module("special-functions", "0.1")"#),
+        "missing/wrong special-functions binding: {text}"
+    );
+    flatppl_syntax::parse(&text).expect("re-parse");
+}
+
+#[test]
+fn expr_erfc_lowers_to_special_functions() {
+    const JSON: &str = r#"{
+      "functions": [
+        {"name": "eff", "type": "generic_function", "expression": "erfc(x)", "x": "x"}
+      ]
+    }"#;
+    let m = flatppl_hs3::read_hs3(JSON).expect("read_hs3");
+    let text = print_with(&m, Syntax::Minimal);
+    eprintln!("=== erfc emit ===\n{text}\n=== end ===");
+    assert!(text.contains(".erfc("), "missing specfun.erfc call: {text}");
+    assert!(
+        text.contains(r#"standard_module("special-functions", "0.1")"#),
+        "missing/wrong special-functions binding: {text}"
+    );
+    flatppl_syntax::parse(&text).expect("re-parse");
+}

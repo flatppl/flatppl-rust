@@ -493,6 +493,82 @@ pub fn emit_distribution(
             Ok(b.call("relabel", &[broadcasted, labels]))
         }
 
+        // §09: chebychev_dist → RooChebychev convention.
+        //
+        // pdf(x) ∝ 1 + Σ_{k=1..N} a_k · T_k(t)
+        //   t = (2x − lo − hi) / (hi − lo)   (rescale [lo,hi] → [−1,1])
+        //   T_k = Chebyshev polynomial of the first kind (degree k)
+        //   a_1..a_N = coefficients[0..N-1]  (degrees start at 1; T_0=1 is the implicit leading 1)
+        // Emits: normalize(truncate(weighted(functionof(WEIGHT, x=_x_), Lebesgue(reals)), interval(lo,hi)))
+        //
+        // NUMERIC CONVENTION PENDING: Phase-4 rf207 end-to-end confirmation vs ROOT required.
+        "chebychev_dist" => {
+            let (lo, hi) = domain.ok_or_else(|| {
+                Error::Unsupported(format!(
+                    "chebychev_dist `{}` has no declared domain for its variate; \
+                     a `domains` entry giving (min, max) is required",
+                    d.name
+                ))
+            })?;
+            let coeff_arr = d
+                .extra
+                .get("coefficients")
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| Error::Unsupported("chebychev_dist missing `coefficients` field".into()))?
+                .clone();
+            let obs_name = d
+                .extra
+                .get("x")
+                .and_then(|v| v.as_str())
+                .unwrap_or("x");
+            // Build the placeholder ref for the observable.
+            let ph_name = format!("_{obs_name}_");
+            let ph_sym = b.m.intern(&ph_name);
+            let x_ref = b.m.alloc(Node::Ref(Ref {
+                ns: RefNs::Local,
+                name: ph_sym,
+            }));
+            // t = div(sub(mul(2.0, _x_), lo+hi), hi-lo)
+            let two = b.lit_real(2.0);
+            let lo_plus_hi = b.lit_real(lo + hi);
+            let hi_minus_lo = b.lit_real(hi - lo);
+            let two_x = b.call("mul", &[two, x_ref]);
+            let numerator = b.call("sub", &[two_x, lo_plus_hi]);
+            let t = b.call("div", &[numerator, hi_minus_lo]);
+            // Build the Chebyshev series: 1 + fold of add(acc, mul(coeff_k, poly.chebyshev(k, t)))
+            let mut weight = b.lit_real(1.0);
+            for (idx, coeff_val) in coeff_arr.iter().enumerate() {
+                let degree = b.lit_int((idx + 1) as i64);
+                let cheby = b.module_user_call("poly", "chebyshev", &[degree, t]);
+                let coeff = field_node(b, coeff_val)?;
+                let term = b.call("mul", &[coeff, cheby]);
+                weight = b.call("add", &[weight, term]);
+            }
+            // functionof(weight, obs_name = _obs_name_)
+            let name_sym = b.m.intern(obs_name);
+            let functionof_sym = b.m.intern("functionof");
+            let entry = (
+                name_sym,
+                Ref {
+                    ns: RefNs::Local,
+                    name: ph_sym,
+                },
+            );
+            let weight_fn = b.m.alloc(Node::Call(Call {
+                head: CallHead::Builtin(functionof_sym),
+                args: Box::new([weight]),
+                named: Box::new([]),
+                inputs: Some(Inputs::Spec(Box::new([entry]))),
+            }));
+            let lebesgue = build_lebesgue_reals(b);
+            let weighted = b.call("weighted", &[weight_fn, lebesgue]);
+            let lo_node = b.lit_real(lo);
+            let hi_node = b.lit_real(hi);
+            let interval = b.call("interval", &[lo_node, hi_node]);
+            let truncated = b.call("truncate", &[weighted, interval]);
+            Ok(b.call("normalize", &[truncated]))
+        }
+
         // HS3 RBW uses a multi-channel parameterization; no 1:1 FlatPPL map yet
         "relativistic_breit_wigner_dist" => Err(Error::Unsupported(
             "relativistic_breit_wigner_dist: HS3 uses a multi-channel parameterization with no 1:1 FlatPPL map".into(),
@@ -552,7 +628,7 @@ fn build_bins(b: &mut Builder, axes: &[serde_json::Value]) -> Result<NodeId> {
 ///
 /// The placeholder name follows the same convention as `expr::wrap_lambda`:
 /// `obs_name` → `_<obs_name>_`.
-fn build_polynomial_fn(b: &mut Builder, coeff_vec: NodeId, obs_name: &str) -> NodeId {
+pub(crate) fn build_polynomial_fn(b: &mut Builder, coeff_vec: NodeId, obs_name: &str) -> NodeId {
     let name_sym = b.m.intern(obs_name);
     let ph_name = format!("_{obs_name}_");
     let ph_sym = b.m.intern(&ph_name);

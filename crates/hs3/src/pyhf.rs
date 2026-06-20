@@ -72,10 +72,10 @@ fn emit_poi(b: &mut Builder, doc: &PyhfDocument) {
     }
 }
 
-/// Emit `hepphys = standard_module("particle-physics", "0.1")`.
-pub(crate) fn emit_standard_module(b: &mut Builder) {
-    let name_arg = b.str_lit("particle-physics");
-    let ver_arg = b.str_lit("0.1");
+/// Emit `alias = standard_module("<module>", "<version>")`.
+pub(crate) fn bind_standard_module(b: &mut Builder, alias: &str, module: &str, version: &str) {
+    let name_arg = b.str_lit(module);
+    let ver_arg = b.str_lit(version);
     let head = b.sym("standard_module");
     let node = b.m.alloc(Node::Call(Call {
         head: CallHead::Builtin(head),
@@ -83,7 +83,12 @@ pub(crate) fn emit_standard_module(b: &mut Builder) {
         named: Vec::new().into(),
         inputs: None,
     }));
-    b.bind("hepphys", node);
+    b.bind(alias, node);
+}
+
+/// Emit `hepphys = standard_module("particle-physics", "0.1")`.
+pub(crate) fn emit_standard_module(b: &mut Builder) {
+    bind_standard_module(b, "hepphys", "particle-physics", "0.1");
 }
 
 /// The lumi constraint's resolved config: the Normal `sigma` and the observed
