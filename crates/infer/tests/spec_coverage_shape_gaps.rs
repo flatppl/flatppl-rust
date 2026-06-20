@@ -239,17 +239,26 @@ fn kernel_chain_ops_infer_measures() {
             && out.contains("(kchain"),
         "kchain domain should be the last component's variate record{{y}}, got:\n{out}"
     );
-    // jointchain: previously %deferred-typed (so its existing mass arm was dead);
-    // typing it as a measure activates that arm — a joint chain of a base measure
-    // and Markov kernels is a probability measure.
+    // jointchain keeps ALL variates: cat of m0's record{a} and k's record{b}.
     let out = ir("lambda ~ Gamma(2.0, 1.0)\n\
                   m0 = lawof(record(a = lambda))\n\
                   k = kernelof(record(b = lambda), a = lambda)\n\
                   j = jointchain(m0, k)");
     assert!(
-        out.contains("(%measure (%domain %deferred) (%mass %normalized))")
+        out.contains("(%measure (%domain (%record (a (%scalar real)) (b (%scalar real)))) (%mass %normalized))")
             && out.contains("(jointchain"),
-        "jointchain should be a normalized measure with a deferred domain, got:\n{out}"
+        "jointchain domain should be cat of all variates record{{a, b}}, got:\n{out}"
+    );
+
+    // Keyword form names each component's variate (spec §06 keyword form).
+    let out = ir("lambda ~ Gamma(2.0, 1.0)\n\
+                  m0 = lawof(record(a = lambda))\n\
+                  k = kernelof(record(b = lambda), a = lambda)\n\
+                  j = jointchain(prior = m0, fwd = k)");
+    assert!(
+        out.contains("(%measure (%domain (%record (prior (%record (a (%scalar real)))) (fwd (%record (b (%scalar real)))))) (%mass %normalized))")
+            && out.contains("(jointchain"),
+        "jointchain keyword form should name each component's variate, got:\n{out}"
     );
 }
 

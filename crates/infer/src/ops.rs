@@ -375,9 +375,11 @@ pub(crate) fn call_rule(
             ),
             mass: Mass::Deferred,
         },
-        // (Task 2 replaces this with a real domain.)
+        // `jointchain(M, K1, …)` (spec §06): dependent joint — KEEPS ALL variates
+        // (`cat` of every component's, or a named record in keyword form). Mass
+        // is filled by `fill_mass`.
         "jointchain" => Type::Measure {
-            domain: Box::new(Type::Deferred),
+            domain: Box::new(jointchain_domain(inf, args, named)),
             mass: Mass::Deferred,
         },
         // `scan(f, init, xs)` (spec §04) is the DETERMINISTIC left scan — a value,
@@ -1603,6 +1605,31 @@ fn component_variate(inf: &mut Inferencer<'_, '_>, node: NodeId, ty: &Type) -> O
     }
 }
 
+/// `jointchain` output variate (spec §06): the `cat` of every component's
+/// variate (positional form, as with `joint`), or a record naming each
+/// component's variate (keyword form `jointchain(n1 = …, n2 = …)`). Any
+/// component whose variate is not statically resolvable ⇒ `%deferred`.
+fn jointchain_domain(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo], named: &[NamedInfo]) -> Type {
+    if !named.is_empty() {
+        let mut fields = Vec::with_capacity(named.len());
+        for (name, node, t, _) in named {
+            match component_variate(inf, *node, t) {
+                Some(v) => fields.push((*name, v)),
+                None => return Type::Deferred,
+            }
+        }
+        return Type::Record(fields.into());
+    }
+    let mut variates = Vec::with_capacity(args.len());
+    for (n, t, _) in args {
+        match component_variate(inf, *n, t) {
+            Some(v) => variates.push(v),
+            None => return Type::Deferred,
+        }
+    }
+    cat_compose(&variates)
+}
+
 /// Per-call result type of a **local** reified callable, computed by substituting
 /// the concrete call-arg annotations for the callable's input parameters and
 /// re-inferring its body in a throwaway module clone. This is the single-module
@@ -2581,10 +2608,28 @@ pub(crate) fn fill_mass(
             _ => Mass::Normalized,
         },
         "bayesupdate" => Mass::Unknown,
-        "jointchain" => match (arg_mass(0), arg_mass(1)) {
-            (m, Mass::Normalized) => m,
-            _ => Mass::Unknown,
-        },
+        "jointchain" => {
+            // `jointchain` is normalized iff the base measure is normalized and
+            // every subsequent component kernel is normalized. Check positional
+            // or keyword args uniformly: all components must be Normalized.
+            let all_masses: Vec<Mass> = if !named.is_empty() {
+                named
+                    .iter()
+                    .map(|(_, _, t, _)| match t {
+                        Type::Measure { mass, .. } => *mass,
+                        Type::Kernel { mass, .. } => *mass,
+                        _ => Mass::Unknown,
+                    })
+                    .collect()
+            } else {
+                (0..args.len()).map(arg_mass).collect()
+            };
+            if all_masses.iter().all(|m| matches!(m, Mass::Normalized)) {
+                Mass::Normalized
+            } else {
+                Mass::Unknown
+            }
+        }
         // A §08 distribution constructor (this arm is reached only for
         // measure-typed results, i.e. recognized distributions).
         _ => Mass::Normalized,
