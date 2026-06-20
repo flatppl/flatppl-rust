@@ -124,6 +124,7 @@ pub(crate) fn call_rule(
         "vector" => vector_type(args),
         "tuple" => Type::Tuple(args.iter().map(|(_, t, _)| t.clone()).collect()),
         "record" => Type::Record(named.iter().map(|(n, _, t, _)| (*n, t.clone())).collect()),
+        "table" => table_type(named),
         "rowstack" => rowstack_type(arg_ty(args, 0)),
         "get" => get_type(inf, args, /*base=*/ 1),
         "get0" => get_type(inf, args, /*base=*/ 0),
@@ -363,12 +364,22 @@ pub(crate) fn call_rule(
             };
             trajectory_measure(arg_ty(args, 1), len)
         }
-        // `kchain` / `jointchain` (spec §06) are measures, but their output
-        // variate (last kernel's codomain / `cat` of all variates) is not
-        // statically extractable — so we record that the result IS a measure
-        // (better than %deferred) with a deferred domain; mass class in `fill_mass`.
-        "kchain" | "jointchain" => Type::Measure {
-            domain: Box::new(Type::Deferred),
+        // `kchain(M, K1, …, Kn)` (spec §06): Kleisli bind — marginalizes the
+        // intermediate variates, KEEPS THE LAST component's variate. Mass is
+        // filled by `fill_mass`.
+        "kchain" => Type::Measure {
+            domain: Box::new(
+                args.last()
+                    .and_then(|(n, t, _)| component_variate(inf, *n, t))
+                    .unwrap_or(Type::Deferred),
+            ),
+            mass: Mass::Deferred,
+        },
+        // `jointchain(M, K1, …)` (spec §06): dependent joint — KEEPS ALL variates
+        // (`cat` of every component's, or a named record in keyword form). Mass
+        // is filled by `fill_mass`.
+        "jointchain" => Type::Measure {
+            domain: Box::new(jointchain_domain(inf, args, named)),
             mass: Mass::Deferred,
         },
         // `scan(f, init, xs)` (spec §04) is the DETERMINISTIC left scan — a value,
@@ -397,29 +408,11 @@ pub(crate) fn call_rule(
             _ => Type::Deferred,
         },
         // `disintegrate(selector, joint)` (spec §06) splits a joint measure into
-        // a `(forward_kernel, marginal)` tuple. The kernel inputs / marginal
-        // domain depend on the selector + DAG structure (not statically tracked),
-        // but disintegrating a probability measure yields a Markov forward kernel
-        // and a probability marginal — so the mass classes follow the joint's.
-        "disintegrate" => {
-            let part_mass = match arg_ty(args, 1) {
-                Some(Type::Measure {
-                    mass: Mass::Normalized,
-                    ..
-                }) => Mass::Normalized,
-                _ => Mass::Unknown,
-            };
-            Type::Tuple(Box::new([
-                Type::Kernel {
-                    inputs: Box::new([]),
-                    mass: part_mass,
-                },
-                Type::Measure {
-                    domain: Box::new(Type::Deferred),
-                    mass: part_mass,
-                },
-            ]))
-        }
+        // a `(forward_kernel, marginal)` tuple. When the joint is a record-domain
+        // measure and the selector is a static set of field names, the marginal
+        // carries the complement fields and the kernel inputs are those complement
+        // (conditioning) variates. See `disintegrate_type` for the full logic.
+        "disintegrate" => disintegrate_type(inf, call, args),
         // `relabel(M, labels)` (spec §06) renames the variate; the value domain
         // AND total mass are unchanged, so the measure type passes through whole
         // (unlike normalize/truncate, which reset the mass slot).
@@ -695,6 +688,38 @@ fn vector_type(args: &[ArgInfo]) -> Type {
     }
 }
 
+/// `table(col1 = v1, col2 = v2, …)` (spec §03 "Tables"): named equal-length
+/// column vectors → a table. FlatPIR stores each column's ELEMENT type (not the
+/// vector) plus a single shared `nrows` (§11 `(%table (%columns (name elem) …)
+/// (%nrows N))`), so the leading dim is lifted out of the columns into `nrows`,
+/// taken from the first column (the spec requires all columns equal-length).
+/// Columns must be rank-1 vectors; a non-vector or `%deferred` column leaves the
+/// table `%deferred` — no valid table type can be formed (honesty over coverage).
+/// The `table(r)` record-of-vectors form (spec §03) is not handled here and
+/// defers. `nrows` is `%dynamic` when the first column's length is dynamic.
+fn table_type(named: &[NamedInfo]) -> Type {
+    if named.is_empty() {
+        return Type::Deferred;
+    }
+    let mut columns = Vec::with_capacity(named.len());
+    let mut nrows = Dim::Dynamic;
+    for (name, _, t, _) in named {
+        match t {
+            Type::Array { shape, elem } if shape.len() == 1 => {
+                if columns.is_empty() {
+                    nrows = shape[0];
+                }
+                columns.push((*name, (**elem).clone()));
+            }
+            _ => return Type::Deferred,
+        }
+    }
+    Type::Table {
+        columns: columns.into(),
+        nrows,
+    }
+}
+
 /// `rowstack([rows…])`: an array of equal-length vectors becomes a matrix.
 fn rowstack_type(a: Option<&Type>) -> Type {
     match a {
@@ -885,6 +910,87 @@ fn measure_domain(m: Option<&Type>) -> Type {
         Some(Type::Measure { domain, .. }) => domain.as_ref().clone(),
         _ => Type::Deferred,
     }
+}
+
+/// The field names a `disintegrate` selector picks (spec §06: works like `get` —
+/// `"b"` selects field `b`; `["b", "c"]` selects `b` and `c`). `Some` only when
+/// every entry is a literal string (a bare `Scalar::Str`, or a `vector(...)` of
+/// `Scalar::Str`); index selectors and non-literals ⇒ `None` (caller defers).
+fn selector_field_names(inf: &Inferencer<'_, '_>, node: NodeId) -> Option<Vec<Box<str>>> {
+    match inf.module.node(node).clone() {
+        Node::Lit(Scalar::Str(s)) => Some(vec![s]),
+        Node::Call(c)
+            if matches!(c.head, CallHead::Builtin(op)
+                if inf.module.resolve(op) == "vector") =>
+        {
+            let names: Option<Vec<Box<str>>> = c
+                .args
+                .iter()
+                .map(|&a| match inf.module.node(a) {
+                    Node::Lit(Scalar::Str(s)) => Some(s.clone()),
+                    _ => None,
+                })
+                .collect();
+            // An empty selector (`[]`) lowers to `(vector)` with no args —
+            // `disintegrate([], M)` has no defined meaning (a zero-field selected
+            // subset is a vacuous disintegration). Return `None` so the caller
+            // falls back to the deferred result rather than fabricating an output.
+            names.filter(|v| !v.is_empty())
+        }
+        _ => None,
+    }
+}
+
+/// `disintegrate(selector, joint)` (spec §06) → `(kernel, marginal)`. When the
+/// joint is a record-domain measure and the selector statically names a non-empty
+/// proper subset of its fields, the marginal is the record of the COMPLEMENT
+/// (unselected) fields and the kernel's inputs are those complement variate names
+/// (the conditioning variates). The kernel's OUTPUT domain (the selected
+/// variates) is not carried by `Type::Kernel`, so it stays implicit. Falls back
+/// to empty kernel inputs + a `%deferred` marginal domain when the joint isn't a
+/// record measure or the selector isn't a static field-name set.
+fn disintegrate_type(inf: &mut Inferencer<'_, '_>, call: &Call, args: &[ArgInfo]) -> Type {
+    let part_mass = match arg_ty(args, 1) {
+        Some(Type::Measure {
+            mass: Mass::Normalized,
+            ..
+        }) => Mass::Normalized,
+        _ => Mass::Unknown,
+    };
+    let selected = call
+        .args
+        .first()
+        .and_then(|&n| selector_field_names(inf, n));
+    let (inputs, marginal_domain): (Box<[Symbol]>, Type) = match (arg_ty(args, 1), selected) {
+        (Some(Type::Measure { domain, .. }), Some(sel)) => match domain.as_ref() {
+            Type::Record(fields) => {
+                let is_sel = |n: &Symbol| sel.iter().any(|s| inf.module.resolve(*n) == &**s);
+                let all_present = sel
+                    .iter()
+                    .all(|s| fields.iter().any(|(n, _)| inf.module.resolve(*n) == &**s));
+                let complement: Vec<(Symbol, Type)> =
+                    fields.iter().filter(|(n, _)| !is_sel(n)).cloned().collect();
+                if all_present && !complement.is_empty() {
+                    let inputs: Box<[Symbol]> = complement.iter().map(|(n, _)| *n).collect();
+                    (inputs, Type::Record(complement.into()))
+                } else {
+                    (Box::new([]), Type::Deferred)
+                }
+            }
+            _ => (Box::new([]), Type::Deferred),
+        },
+        _ => (Box::new([]), Type::Deferred),
+    };
+    Type::Tuple(Box::new([
+        Type::Kernel {
+            inputs,
+            mass: part_mass,
+        },
+        Type::Measure {
+            domain: Box::new(marginal_domain),
+            mass: part_mass,
+        },
+    ]))
 }
 
 /// `iid(M, n)`: n iid draws bundle into an array over M's domain. A literal
@@ -1535,6 +1641,63 @@ fn reified_result_type(inf: &mut Inferencer<'_, '_>, node: NodeId) -> Option<Typ
     }
     let body = reified_body(inf, node)?;
     inf.lookup_type(body).cloned()
+}
+
+/// The output variate (value domain) of a measure-algebra chain component
+/// (spec §06): a base measure contributes its own `domain`; a kernel contributes
+/// its reified body's output value — a `kernelof` body IS the random value (its
+/// type is the variate), a `functionof`-of-measure body exposes a measure whose
+/// `domain` is the variate. `None` (→ caller leaves the chain domain `%deferred`)
+/// when the component is neither a measure nor a kernel, or its body / domain is
+/// not statically resolvable.
+fn component_variate(inf: &mut Inferencer<'_, '_>, node: NodeId, ty: &Type) -> Option<Type> {
+    match ty {
+        Type::Measure { domain, .. } => match domain.as_ref() {
+            Type::Deferred => None,
+            d => Some(d.clone()),
+        },
+        Type::Kernel { .. } => match reified_result_type(inf, node)? {
+            Type::Measure { domain, .. } => match *domain {
+                Type::Deferred => None,
+                d => Some(d),
+            },
+            Type::Deferred => None,
+            value_ty => Some(value_ty),
+        },
+        _ => None,
+    }
+}
+
+/// `jointchain` output variate (spec §06): the `cat` of every component's
+/// variate (positional form, as with `joint`), or a record naming each
+/// component's variate (keyword form `jointchain(n1 = …, n2 = …)`). Any
+/// component whose variate is not statically resolvable ⇒ `%deferred`.
+fn jointchain_domain(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo], named: &[NamedInfo]) -> Type {
+    if !named.is_empty() {
+        // Keyword form `jointchain(n1 = M, n2 = K, …)`: each component's variate
+        // is nested under the supplied keyword name, producing
+        // `record{n1: variate(M), n2: variate(K), …}`. This nesting shape
+        // (`record{name: component-variate}`) is a defensible reading of spec §06's
+        // keyword form (which is defined via `relabel`, not modeled in inference).
+        // Pending spec clarification on whether the keyword names wrap or replace
+        // the component variate's own field names.
+        let mut fields = Vec::with_capacity(named.len());
+        for (name, node, t, _) in named {
+            match component_variate(inf, *node, t) {
+                Some(v) => fields.push((*name, v)),
+                None => return Type::Deferred,
+            }
+        }
+        return Type::Record(fields.into());
+    }
+    let mut variates = Vec::with_capacity(args.len());
+    for (n, t, _) in args {
+        match component_variate(inf, *n, t) {
+            Some(v) => variates.push(v),
+            None => return Type::Deferred,
+        }
+    }
+    cat_compose(&variates)
 }
 
 /// Per-call result type of a **local** reified callable, computed by substituting
@@ -2515,10 +2678,44 @@ pub(crate) fn fill_mass(
             _ => Mass::Normalized,
         },
         "bayesupdate" => Mass::Unknown,
-        "jointchain" => match (arg_mass(0), arg_mass(1)) {
-            (m, Mass::Normalized) => m,
-            _ => Mass::Unknown,
-        },
+        "jointchain" => {
+            // `jointchain(M, K1, …, Kn)` spec §06: the result carries the base
+            // measure's mass class (component 0) provided every kernel (components
+            // 1..n) is Normalized.  A Finite base + Normalized kernels ⇒ Finite
+            // result; a Normalized base + Normalized kernels ⇒ Normalized result.
+            // If any kernel is not Normalized the total mass is generally
+            // intractable ⇒ Unknown.
+            let named_mass = |t: &Type| match t {
+                Type::Measure { mass, .. } => *mass,
+                Type::Kernel { mass, .. } => *mass,
+                _ => Mass::Unknown,
+            };
+            let (base_mass, kernels_normalized): (Mass, bool) = if !named.is_empty() {
+                let base = named
+                    .first()
+                    .map(|(_, _, t, _)| named_mass(t))
+                    .unwrap_or(Mass::Unknown);
+                let all_kernels_norm = named
+                    .iter()
+                    .skip(1)
+                    .all(|(_, _, t, _)| matches!(named_mass(t), Mass::Normalized));
+                (base, all_kernels_norm)
+            } else {
+                let n = args.len();
+                if n == 0 {
+                    (Mass::Unknown, true)
+                } else {
+                    let base = arg_mass(0);
+                    let all_kernels_norm = (1..n).all(|i| matches!(arg_mass(i), Mass::Normalized));
+                    (base, all_kernels_norm)
+                }
+            };
+            if kernels_normalized {
+                base_mass
+            } else {
+                Mass::Unknown
+            }
+        }
         // A §08 distribution constructor (this arm is reached only for
         // measure-typed results, i.e. recognized distributions).
         _ => Mass::Normalized,
