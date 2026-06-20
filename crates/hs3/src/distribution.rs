@@ -552,7 +552,7 @@ fn build_bins(b: &mut Builder, axes: &[serde_json::Value]) -> Result<NodeId> {
 ///
 /// The placeholder name follows the same convention as `expr::wrap_lambda`:
 /// `obs_name` → `_<obs_name>_`.
-fn build_polynomial_fn(b: &mut Builder, coeff_vec: NodeId, obs_name: &str) -> NodeId {
+pub(crate) fn build_polynomial_fn(b: &mut Builder, coeff_vec: NodeId, obs_name: &str) -> NodeId {
     let name_sym = b.m.intern(obs_name);
     let ph_name = format!("_{obs_name}_");
     let ph_sym = b.m.intern(&ph_name);

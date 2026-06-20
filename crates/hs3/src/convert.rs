@@ -17,7 +17,7 @@ use crate::error::{Error, Result};
 use crate::expr;
 use crate::model::{Distribution, Document, Function, HistFactory, Modifier};
 use crate::presets::{emit_domain, emit_parameter_point};
-use flatppl_core::Module;
+use flatppl_core::{Module, NodeId};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub fn document_to_module(doc: &Document) -> Result<Module> {
@@ -850,6 +850,30 @@ fn emit_function(b: &mut Builder, f: &Function) -> Result<()> {
                 &f.name,
                 node,
                 &["HS3 generic_function → lowered expression"],
+            );
+        }
+        "polynomial" => {
+            let coeff_arr = f
+                .extra
+                .get("coefficients")
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| {
+                    Error::Unsupported(format!(
+                        "polynomial function `{}` missing `coefficients` field",
+                        f.name
+                    ))
+                })?;
+            let coeff_elems: Vec<NodeId> = coeff_arr
+                .iter()
+                .map(|v| crate::distribution::field_node(b, v))
+                .collect::<Result<_>>()?;
+            let coeff_vec = b.array(&coeff_elems);
+            let obs_name = f.extra.get("x").and_then(|v| v.as_str()).unwrap_or("x");
+            let node = crate::distribution::build_polynomial_fn(b, coeff_vec, obs_name);
+            b.bind_doc(
+                &f.name,
+                node,
+                &["HS3 polynomial function → polynomial(coefficients, x)"],
             );
         }
         other => {
