@@ -207,10 +207,9 @@ fn scan_fchain_disintegrate_infer() {
 
 /// The Kleisli / trajectory ops infer a `(%measure …)` type (spec §06), reusing
 /// the existing measure type — no new type kind. `markovchain`/`kscan` give a
-/// length-resolved trajectory domain (`array[n]` / `array[lengthof(xs)]` of the
-/// state type) and stay normalized when the step kernel is a Markov kernel;
-/// `kchain` is a measure whose output variate isn't statically extractable
-/// (deferred domain) but is normalized when its components are.
+/// length-resolved trajectory domain; `kchain` carries the LAST component's
+/// concrete variate; `jointchain` carries ALL variates as a merged record (or a
+/// named record in keyword form); record-state `markovchain`/`kscan` stay deferred.
 #[test]
 fn kernel_chain_ops_infer_measures() {
     // markovchain: n=100 folds, state is real → array[100] real, normalized.
@@ -1063,5 +1062,31 @@ fn disintegrate_splits_record_joint() {
     assert!(
         out.contains("(%tuple (%kernel (%inputs a) (%mass %normalized)) (%measure (%domain (%record (a (%scalar real)))) (%mass %normalized)))"),
         "disintegrate(['b'], mu) → (kernel inputs=a, marginal over record{{a}}), got:\n{out}"
+    );
+}
+
+/// `disintegrate` falls back to empty-inputs kernel + deferred marginal domain
+/// when the selector is a non-literal (a binding reference, not a `["b"]` vector
+/// literal): spec §06 honesty — no domain is fabricated.
+#[test]
+fn disintegrate_defers_for_non_literal_selector() {
+    // `sel` is a binding ref — `selector_field_names` returns None (it only
+    // handles literal strings / vector-of-literals), so both the kernel inputs
+    // and the marginal domain fall back to the deferred form.
+    // Discovery (2026-06-20): `["b"]` in source lowers to `(vector "b")` as a
+    // binding; `disintegrate` receives `(%ref self sel)` — a Ref node — so the
+    // selector is not statically resolvable.
+    let out = ir("a ~ Normal(0.0, 1.0)\n\
+                  b ~ Normal(a, 1.0)\n\
+                  mu = lawof(record(a = a, b = b))\n\
+                  sel = [\"b\"]\n\
+                  parts = disintegrate(sel, mu)");
+    assert!(
+        out.contains("(%kernel (%inputs ) (%mass %normalized))"),
+        "disintegrate with non-literal selector should have empty kernel inputs, got:\n{out}"
+    );
+    assert!(
+        out.contains("(%measure (%domain %deferred) (%mass %normalized))"),
+        "disintegrate with non-literal selector should have deferred marginal domain, got:\n{out}"
     );
 }
