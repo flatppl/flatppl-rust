@@ -182,6 +182,28 @@ fn dirac_infers_a_normalized_point_mass() {
 /// type; `fchain` → a `function` with f1's input signature; `disintegrate` → a
 /// `(forward_kernel, marginal)` tuple, with mass classes following the joint
 /// (a probability joint → Markov kernel + probability marginal).
+/// A lambda whose body BROADCASTS a distribution over its (placeholder) params
+/// — `(nr, pr) -> Binomial.(nr, pr)` — classifies as a KERNEL, not a plain
+/// function: broadcasting a distribution is a measure (an independent product)
+/// even before the shape is known, so the reified body is a measure. Stochastic
+/// broadcast-application `r ~ K.(rows, …)` then resolves to the per-row
+/// trajectory (the call-site substitution supplies the concrete shape).
+#[test]
+fn broadcast_distribution_lambda_is_a_kernel() {
+    let out = ir("n_data = [[5, 6], [7, 8]]\n\
+                  p = [[0.1, 0.2], [0.3, 0.4]]\n\
+                  K = (nr, pr) -> Binomial.(nr, pr)\n\
+                  r ~ K.(n_data, p)");
+    assert!(
+        out.contains("(%bind K (%meta ((%kernel (%inputs nr pr)"),
+        "lambda with a broadcast-distribution body should be a kernel, got:\n{out}"
+    );
+    assert!(
+        out.contains("(%bind r (%meta ((%array 1 (2) (%array 1 (2) (%scalar integer)))"),
+        "r ~ K.(n_data, p) should be a nested 2x2 integer trajectory, got:\n{out}"
+    );
+}
+
 #[test]
 fn scan_fchain_disintegrate_infer() {
     let out = ir("xs = [1.0, 2.0, 3.0]\nf = (acc, x) -> acc + x\ns = scan(f, 0.0, xs)");

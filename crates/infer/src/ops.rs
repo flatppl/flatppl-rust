@@ -1905,7 +1905,15 @@ fn broadcast_type(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo], named: &[Named
         }
     }
     let Some(shape) = shape else {
-        return Type::Deferred; // no array input — scalar broadcast is a no-op shape-wise
+        // No concrete array argument. Broadcasting a DISTRIBUTION is still a
+        // measure (an independent product over the eventual broadcast shape), so
+        // a reified lambda body `dist.(params)` — whose params are still `%local`
+        // placeholders, hence no array yet — must classify as a MEASURE so the
+        // reification becomes a kernel rather than a plain function; the
+        // call-site substitution then refines the concrete shape. A deterministic
+        // op or a user-callable head with no array input stays a shape-wise
+        // no-op (`%deferred`).
+        return broadcast_distribution_no_shape(inf, head_node);
     };
 
     // User-callable head (`broadcast(predict, x = x_data)`): the cell comes from
@@ -2038,6 +2046,41 @@ fn broadcast_type(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo], named: &[Named
     Type::Array {
         shape,
         elem: Box::new(cell),
+    }
+}
+
+/// `broadcast` with no concrete array argument (e.g. a reified lambda body
+/// `dist.(params)` whose params are still `%local` placeholders): a distribution
+/// head is nonetheless a measure — its broadcast is an independent product over a
+/// not-yet-known shape — so report `(%measure %deferred · normalized)` to flag
+/// it as a measure (the reification then classifies as a kernel; the call-site
+/// substitution supplies the concrete domain). A §08 builtin or §09 module
+/// distribution both count; anything else (deterministic op, user callable) is a
+/// shape-wise no-op and stays `%deferred`.
+fn broadcast_distribution_no_shape(inf: &mut Inferencer<'_, '_>, head_node: NodeId) -> Type {
+    use crate::catalogue::Sig;
+    // §09 module distribution head (catalogue-ref side-table). `.map().unwrap_or`
+    // drops the borrow before the `&mut inf` call below.
+    let module_dist = inf
+        .module_catalogue_ref(head_node)
+        .map(|c| matches!(c.sig, Sig::Distribution { .. }))
+        .unwrap_or(false);
+    // §08 builtin distribution head: resolve the name (immutable borrow ends with
+    // the owned `String`), then probe `distribution_domain` (needs `&mut inf`).
+    let builtin_name = match inf.module.node(head_node) {
+        Node::Const(op) => Some(inf.module.resolve(*op).to_string()),
+        _ => None,
+    };
+    let builtin_dist = builtin_name
+        .map(|n| distribution_domain(inf, &n, &[], &[]).is_some())
+        .unwrap_or(false);
+    if module_dist || builtin_dist {
+        Type::Measure {
+            domain: Box::new(Type::Deferred),
+            mass: Mass::Normalized,
+        }
+    } else {
+        Type::Deferred
     }
 }
 
