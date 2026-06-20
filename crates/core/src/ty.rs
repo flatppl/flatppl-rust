@@ -250,7 +250,7 @@ impl ValueSet {
 /// Right-nested Cartesian power over a multi-axis shape:
 /// `[d0, d1, …, dk]` → `CartPow(… CartPow(elem, dk) …, d0)`. An empty shape
 /// returns `elem` unchanged (rank-0 = a scalar set).
-pub(crate) fn cartpow_over(elem: ValueSet, shape: &[Dim]) -> ValueSet {
+pub fn cartpow_over(elem: ValueSet, shape: &[Dim]) -> ValueSet {
     shape
         .iter()
         .rev()

@@ -843,6 +843,34 @@ fn set_element_type(inf: &mut Inferencer<'_, '_>, node: Option<NodeId>) -> Type 
                         elem: Box::new(Type::Scalar(ScalarType::Real)),
                     }
                 }
+                "cartprod" => {
+                    // Clone to release the module borrow before recursing into
+                    // set_element_type (mirrors the pattern used in set_expr_valueset).
+                    let c = c.clone();
+                    if !c.named.is_empty() {
+                        let fields: Vec<(Symbol, Type)> = c
+                            .named
+                            .iter()
+                            .map(|na| (na.name, set_element_type(inf, Some(na.value))))
+                            .collect();
+                        if fields.iter().any(|(_, t)| matches!(t, Type::Deferred)) {
+                            Type::Deferred
+                        } else {
+                            Type::Record(fields.into())
+                        }
+                    } else {
+                        let parts: Vec<Type> = c
+                            .args
+                            .iter()
+                            .map(|&a| set_element_type(inf, Some(a)))
+                            .collect();
+                        if parts.iter().any(|t| matches!(t, Type::Deferred)) {
+                            Type::Deferred
+                        } else {
+                            Type::Tuple(parts.into())
+                        }
+                    }
+                }
                 _ => Type::Deferred,
             },
             _ => Type::Deferred,
@@ -2232,19 +2260,38 @@ fn set_expr_valueset(inf: &mut Inferencer<'_, '_>, node: Option<NodeId>) -> Valu
                     if elem == ValueSet::Unknown {
                         return ValueSet::Unknown;
                     }
-                    // `ValueSet::CartPow` carries a single dim, so it can only
-                    // describe a rank-1 power. A multi-axis size (`[2, 3]`) is a
-                    // genuine rank-≥2 array whose value-set has no single-dim
-                    // vocabulary — report `Unknown` rather than a misleading
-                    // rank-1 set (consistent with `ValueSet::natural_of`, which
-                    // also yields `Unknown` for rank-≥2 arrays).
                     let shape = c.args.get(1).map_or_else(
                         || Box::new([Dim::Dynamic]) as Box<[Dim]>,
                         |&n| count_dims(inf, n),
                     );
-                    match shape.as_ref() {
-                        [dim] => ValueSet::CartPow(Box::new(elem), *dim),
-                        _ => ValueSet::Unknown,
+                    flatppl_core::ty::cartpow_over(elem, &shape)
+                }
+                "cartprod" => {
+                    // Positional → CartProd; keyword → RecordSet. Mixing is not
+                    // a valid set expression (spec §03 gives the two forms
+                    // separately); if both are present, the named fields win as
+                    // a record and positional args are ignored (front-end
+                    // should already reject the mix).
+                    if !c.named.is_empty() {
+                        let mut fields = Vec::with_capacity(c.named.len());
+                        for na in c.named.iter() {
+                            let set = set_expr_valueset(inf, Some(na.value));
+                            if set == ValueSet::Unknown {
+                                return ValueSet::Unknown;
+                            }
+                            fields.push((na.name, set));
+                        }
+                        ValueSet::RecordSet(fields.into())
+                    } else {
+                        let mut parts = Vec::with_capacity(c.args.len());
+                        for &arg in c.args.iter() {
+                            let set = set_expr_valueset(inf, Some(arg));
+                            if set == ValueSet::Unknown {
+                                return ValueSet::Unknown;
+                            }
+                            parts.push(set);
+                        }
+                        ValueSet::CartProd(parts.into())
                     }
                 }
                 _ => ValueSet::Unknown,
