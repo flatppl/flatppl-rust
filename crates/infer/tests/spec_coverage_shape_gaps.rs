@@ -709,6 +709,18 @@ fn partition_and_selectbins_infer() {
     );
 }
 
+/// `table(col = vector, …)` (spec §03 "Tables") → a `%table` whose stored
+/// column types are the vectors' ELEMENT types, with `%nrows` the shared
+/// column length (FlatPIR §11 `(%table (%columns (name elem) …) (%nrows N))`).
+#[test]
+fn table_constructor_infers() {
+    let out = ir("t = table(mass = [1.1, 1.2, 1.3], pt = [4.5, 3.2, 6.7])");
+    assert!(
+        out.contains("(%table (%columns (mass (%scalar real)) (pt (%scalar real))) (%nrows 3))"),
+        "table(...) should infer a 3-row table of real columns, got:\n{out}"
+    );
+}
+
 /// `addaxes(A, nl, nt)` (spec §07) inserts size-1 axes around A — exact dims
 /// when the counts are fixed; `splitblocks(v, bs)` nests a 1-D vector into a
 /// vector of sub-vectors.

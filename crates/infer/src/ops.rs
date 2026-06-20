@@ -124,6 +124,7 @@ pub(crate) fn call_rule(
         "vector" => vector_type(args),
         "tuple" => Type::Tuple(args.iter().map(|(_, t, _)| t.clone()).collect()),
         "record" => Type::Record(named.iter().map(|(n, _, t, _)| (*n, t.clone())).collect()),
+        "table" => table_type(named),
         "rowstack" => rowstack_type(arg_ty(args, 0)),
         "get" => get_type(inf, args, /*base=*/ 1),
         "get0" => get_type(inf, args, /*base=*/ 0),
@@ -692,6 +693,38 @@ fn vector_type(args: &[ArgInfo]) -> Type {
     Type::Array {
         shape: Box::new([Dim::Static(args.len() as u32)]),
         elem: Box::new(elem.unwrap_or(Type::Any)),
+    }
+}
+
+/// `table(col1 = v1, col2 = v2, …)` (spec §03 "Tables"): named equal-length
+/// column vectors → a table. FlatPIR stores each column's ELEMENT type (not the
+/// vector) plus a single shared `nrows` (§11 `(%table (%columns (name elem) …)
+/// (%nrows N))`), so the leading dim is lifted out of the columns into `nrows`,
+/// taken from the first column (the spec requires all columns equal-length).
+/// Columns must be rank-1 vectors; a non-vector or `%deferred` column leaves the
+/// table `%deferred` — no valid table type can be formed (honesty over coverage).
+/// The `table(r)` record-of-vectors form (spec §03) is not handled here and
+/// defers. `nrows` is `%dynamic` when the first column's length is dynamic.
+fn table_type(named: &[NamedInfo]) -> Type {
+    if named.is_empty() {
+        return Type::Deferred;
+    }
+    let mut columns = Vec::with_capacity(named.len());
+    let mut nrows = Dim::Dynamic;
+    for (name, _, t, _) in named {
+        match t {
+            Type::Array { shape, elem } if shape.len() == 1 => {
+                if columns.is_empty() {
+                    nrows = shape[0];
+                }
+                columns.push((*name, (**elem).clone()));
+            }
+            _ => return Type::Deferred,
+        }
+    }
+    Type::Table {
+        columns: columns.into(),
+        nrows,
     }
 }
 
