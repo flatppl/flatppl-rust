@@ -653,8 +653,13 @@ fn elementwise2(a: &Option<&ArgInfo>, b: &Option<&ArgInfo>) -> Type {
     }
 }
 
-/// `mul`: scalar·scalar and scalar·array for now; the matrix/vector forms
-/// arrive with the shape work.
+/// `mul` (`a * b`, spec §07): scalar·scalar, scalar·array (both orders), and the
+/// matrix-multiply forms over FLAT rank-2 matrices — matrix·matrix
+/// (`[m,k]·[k,n] → [m,n]`) and matrix·vector (`[m,k]·[k] → [m]`). A statically
+/// provable inner-dimension mismatch is a shape error (`%failed`). The remaining
+/// §07 forms — transposed-vector·vector (dot) and vector·transposed-vector
+/// (outer), and matmul over matrices represented as nested rank-1 arrays — are
+/// not yet typed and stay `%deferred` (honest: no guessed shape).
 fn mul_type(args: &[ArgInfo]) -> Type {
     let (a, b) = match (arg_ty(args, 0), arg_ty(args, 1)) {
         (Some(a), Some(b)) => (a, b),
@@ -665,6 +670,38 @@ fn mul_type(args: &[ArgInfo]) -> Type {
         _ if scalarish(a) && scalarish(b) => promote2(Some(a), Some(b)),
         (Type::Array { .. }, s) if scalarish(s) => a.clone(),
         (s, Type::Array { .. }) if scalarish(s) => b.clone(),
+        // Matrix multiply over flat rank-2 matrices: matrix·matrix → matrix,
+        // matrix·vector → vector. The left operand is a rank-2 matrix; the right
+        // is a matrix (rank-2) or a vector (rank-1). The shared inner dimension
+        // (`sa[1]` vs the right's leading dim) must agree; the result drops it.
+        (
+            Type::Array {
+                shape: sa,
+                elem: ea,
+            },
+            Type::Array {
+                shape: sb,
+                elem: eb,
+            },
+        ) if sa.len() == 2 && (sb.len() == 2 || sb.len() == 1) => {
+            if matches!((sa[1], sb[0]), (Dim::Static(k1), Dim::Static(k2)) if k1 != k2) {
+                return Type::Failed(
+                    "matrix multiply: inner dimensions disagree (spec §07)".into(),
+                );
+            }
+            let out_shape: Box<[Dim]> = if sb.len() == 2 {
+                Box::new([sa[0], sb[1]])
+            } else {
+                Box::new([sa[0]])
+            };
+            match promote2(Some(ea.as_ref()), Some(eb.as_ref())) {
+                Type::Deferred => Type::Deferred, // non-numeric elements
+                elem => Type::Array {
+                    shape: out_shape,
+                    elem: Box::new(elem),
+                },
+            }
+        }
         _ => Type::Deferred,
     }
 }

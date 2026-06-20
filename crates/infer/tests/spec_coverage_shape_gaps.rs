@@ -384,6 +384,39 @@ fn real_imag_are_real_valued() {
     );
 }
 
+/// `mul` (`*`) over matrices/vectors (spec §07 line 448): flat rank-2 matrix ×
+/// vector → vector; matrix × matrix → matrix; a static inner-dimension mismatch
+/// is a shape error (`%failed`). Scalar/scalar-array forms are covered elsewhere.
+#[test]
+fn matmul_matrix_vector_and_matrix_matrix() {
+    // matrix[3,3] × vector[3] → vector[3] (the matrix-vector product)
+    let out = ir(
+        "X = rowstack([[1.0,2.0,3.0],[4.0,5.0,6.0],[7.0,8.0,9.0]])\n\
+                  v = [1.0, 2.0, 3.0]\n\
+                  m = X * v",
+    );
+    assert!(
+        out.contains("(%bind m (%meta ((%array 1 (3) (%scalar real))"),
+        "matrix·vector should be a real vector[3], got:\n{out}"
+    );
+    // matrix[2,3] × matrix[3,2] → matrix[2,2]
+    let out = ir("A = rowstack([[1.0,2.0,3.0],[4.0,5.0,6.0]])\n\
+                  B = rowstack([[1.0,2.0],[3.0,4.0],[5.0,6.0]])\n\
+                  C = A * B");
+    assert!(
+        out.contains("(%bind C (%meta ((%array 2 (2 2) (%scalar real))"),
+        "matrix·matrix should be a real matrix[2,2], got:\n{out}"
+    );
+    // inner-dimension mismatch ([2,3] × [2]) is a static shape error
+    let out = ir("A = rowstack([[1.0,2.0,3.0],[4.0,5.0,6.0]])\n\
+                  v = [1.0, 2.0]\n\
+                  m = A * v");
+    assert!(
+        out.contains("(%bind m (%meta ((%failed"),
+        "matrix·vector inner-dim mismatch should be %failed, got:\n{out}"
+    );
+}
+
 /// `det` / `trace` thread the matrix's element kind: a real matrix yields a
 /// real scalar, a complex matrix a complex scalar (`ResultSig::ElemScalarKind`).
 #[test]
