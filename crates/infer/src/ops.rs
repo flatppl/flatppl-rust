@@ -2321,6 +2321,10 @@ pub(crate) fn call_valueset(
     }
     let name = inf.module.resolve(op).to_string();
     match name.as_str() {
+        // A set-constructor used directly as a value binding is a PRESET (spec
+        // §03): its value-set is the set it denotes. (Its TYPE is `%any` — a set
+        // is not a value type — set in the `cartprod`/`interval`/… type arms.)
+        "interval" | "stdsimplex" | "cartpow" | "cartprod" => set_call_valueset(inf, call),
         // Parameters / loaded sets.
         "elementof" | "external" => set_expr_valueset(inf, args.first().map(|a| a.0)),
         // `broadcast(head, data…)` over a user callable: the cell value-set is
@@ -2472,6 +2476,82 @@ fn vector_dim(ty: Option<&Type>) -> Dim {
     }
 }
 
+/// The value-set denoted by a set-constructor CALL (`interval(...)`,
+/// `stdsimplex(n)`, `cartpow(S, size)`, `cartprod(...)`). Shared by
+/// `set_expr_valueset` (set-expression argument position) and `call_valueset`
+/// (a set-constructor used directly as a preset binding, spec §03). `Unknown`
+/// for any non-set-constructor head or unresolvable component.
+fn set_call_valueset(inf: &mut Inferencer<'_, '_>, c: &Call) -> ValueSet {
+    let CallHead::Builtin(op) = c.head else {
+        return ValueSet::Unknown;
+    };
+    match inf.module.resolve(op).to_string().as_str() {
+        "interval" => {
+            let bound = |n: Option<&NodeId>| match n.map(|&n| inf.module.node(n).clone()) {
+                Some(Node::Lit(Scalar::Real(r))) => Some(r),
+                Some(Node::Lit(Scalar::Int(i))) => Some(i as f64),
+                Some(Node::Const(sym)) if inf.module.resolve(sym) == "inf" => Some(f64::INFINITY),
+                Some(Node::Call(neg))
+                    if matches!(neg.head, CallHead::Builtin(op)
+                        if inf.module.resolve(op) == "neg") =>
+                {
+                    bound_of(inf, neg.args.first().copied()).map(|b| -b)
+                }
+                _ => None,
+            };
+            match (bound(c.args.first()), bound(c.args.get(1))) {
+                (Some(lo), Some(hi)) => ValueSet::Interval(lo, hi),
+                _ => ValueSet::Unknown,
+            }
+        }
+        "stdsimplex" => ValueSet::StdSimplex(
+            c.args
+                .first()
+                .map_or(Dim::Dynamic, |&n| resolve_dim(inf, n)),
+        ),
+        "cartpow" => {
+            let elem = set_expr_valueset(inf, c.args.first().copied());
+            if elem == ValueSet::Unknown {
+                return ValueSet::Unknown;
+            }
+            let shape = c.args.get(1).map_or_else(
+                || Box::new([Dim::Dynamic]) as Box<[Dim]>,
+                |&n| count_dims(inf, n),
+            );
+            flatppl_core::ty::cartpow_over(elem, &shape)
+        }
+        "cartprod" => {
+            // Positional → CartProd; keyword → RecordSet. Mixing is not
+            // a valid set expression (spec §03 gives the two forms
+            // separately); if both are present, the named fields win as
+            // a record and positional args are ignored (front-end
+            // should already reject the mix).
+            if !c.named.is_empty() {
+                let mut fields = Vec::with_capacity(c.named.len());
+                for na in c.named.iter() {
+                    let set = set_expr_valueset(inf, Some(na.value));
+                    if set == ValueSet::Unknown {
+                        return ValueSet::Unknown;
+                    }
+                    fields.push((na.name, set));
+                }
+                ValueSet::RecordSet(fields.into())
+            } else {
+                let mut parts = Vec::with_capacity(c.args.len());
+                for &arg in c.args.iter() {
+                    let set = set_expr_valueset(inf, Some(arg));
+                    if set == ValueSet::Unknown {
+                        return ValueSet::Unknown;
+                    }
+                    parts.push(set);
+                }
+                ValueSet::CartProd(parts.into())
+            }
+        }
+        _ => ValueSet::Unknown,
+    }
+}
+
 /// A set *expression* (an `elementof` / `truncate` / reference-measure
 /// argument) read structurally into a [`ValueSet`].
 fn set_expr_valueset(inf: &mut Inferencer<'_, '_>, node: Option<NodeId>) -> ValueSet {
@@ -2493,78 +2573,7 @@ fn set_expr_valueset(inf: &mut Inferencer<'_, '_>, node: Option<NodeId>) -> Valu
             "anything" => ValueSet::Anything,
             _ => ValueSet::Unknown,
         },
-        Node::Call(c) => {
-            let CallHead::Builtin(op) = c.head else {
-                return ValueSet::Unknown;
-            };
-            match inf.module.resolve(op).to_string().as_str() {
-                "interval" => {
-                    let bound = |n: Option<&NodeId>| match n.map(|&n| inf.module.node(n).clone()) {
-                        Some(Node::Lit(Scalar::Real(r))) => Some(r),
-                        Some(Node::Lit(Scalar::Int(i))) => Some(i as f64),
-                        Some(Node::Const(sym)) if inf.module.resolve(sym) == "inf" => {
-                            Some(f64::INFINITY)
-                        }
-                        Some(Node::Call(neg))
-                            if matches!(neg.head, CallHead::Builtin(op)
-                                if inf.module.resolve(op) == "neg") =>
-                        {
-                            bound_of(inf, neg.args.first().copied()).map(|b| -b)
-                        }
-                        _ => None,
-                    };
-                    match (bound(c.args.first()), bound(c.args.get(1))) {
-                        (Some(lo), Some(hi)) => ValueSet::Interval(lo, hi),
-                        _ => ValueSet::Unknown,
-                    }
-                }
-                "stdsimplex" => ValueSet::StdSimplex(
-                    c.args
-                        .first()
-                        .map_or(Dim::Dynamic, |&n| resolve_dim(inf, n)),
-                ),
-                "cartpow" => {
-                    let elem = set_expr_valueset(inf, c.args.first().copied());
-                    if elem == ValueSet::Unknown {
-                        return ValueSet::Unknown;
-                    }
-                    let shape = c.args.get(1).map_or_else(
-                        || Box::new([Dim::Dynamic]) as Box<[Dim]>,
-                        |&n| count_dims(inf, n),
-                    );
-                    flatppl_core::ty::cartpow_over(elem, &shape)
-                }
-                "cartprod" => {
-                    // Positional → CartProd; keyword → RecordSet. Mixing is not
-                    // a valid set expression (spec §03 gives the two forms
-                    // separately); if both are present, the named fields win as
-                    // a record and positional args are ignored (front-end
-                    // should already reject the mix).
-                    if !c.named.is_empty() {
-                        let mut fields = Vec::with_capacity(c.named.len());
-                        for na in c.named.iter() {
-                            let set = set_expr_valueset(inf, Some(na.value));
-                            if set == ValueSet::Unknown {
-                                return ValueSet::Unknown;
-                            }
-                            fields.push((na.name, set));
-                        }
-                        ValueSet::RecordSet(fields.into())
-                    } else {
-                        let mut parts = Vec::with_capacity(c.args.len());
-                        for &arg in c.args.iter() {
-                            let set = set_expr_valueset(inf, Some(arg));
-                            if set == ValueSet::Unknown {
-                                return ValueSet::Unknown;
-                            }
-                            parts.push(set);
-                        }
-                        ValueSet::CartProd(parts.into())
-                    }
-                }
-                _ => ValueSet::Unknown,
-            }
-        }
+        Node::Call(c) => set_call_valueset(inf, &c),
         _ => ValueSet::Unknown,
     }
 }

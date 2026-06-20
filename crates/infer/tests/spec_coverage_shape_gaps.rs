@@ -1198,3 +1198,25 @@ fn disintegrate_defers_for_empty_selector() {
         "disintegrate([], mu) should have a deferred marginal domain, got:\n{out}"
     );
 }
+
+/// A `cartprod`/`cartpow`/`interval` PRESET binding (spec §03 "Presets") denotes
+/// a set; its value-set slot carries that set (the PR-#34 vocabulary), not
+/// `anything`. (Its TYPE stays `%any` — a set is not a value type, §03 "Sets".)
+#[test]
+fn set_constructor_presets_carry_their_set() {
+    let out = ir("default_domain = cartprod(a = interval(0.0, 5.0), b = unitinterval)");
+    assert!(
+        out.contains("(record (a (interval 0.0 5.0)) (b unitinterval))"),
+        "cartprod preset value-set should be the denoted record set, got:\n{out}"
+    );
+    let out = ir("grid = cartpow(interval(-10.0, 10.0), 3)");
+    assert!(
+        out.contains("(cartpow (interval -10.0 10.0) 3)"),
+        "cartpow preset value-set should be the denoted power set, got:\n{out}"
+    );
+    let out = ir("r = interval(0.0, 1.0)");
+    assert!(
+        out.contains("(interval 0.0 1.0)"),
+        "interval preset value-set should be the denoted interval, got:\n{out}"
+    );
+}
