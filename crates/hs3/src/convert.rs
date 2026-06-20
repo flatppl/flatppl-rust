@@ -90,14 +90,19 @@ fn reject_unsupported(doc: &Document) -> Result<()> {
     Ok(())
 }
 
-/// Build a lookup from observed-variable name → `(min, max)` over every axis of
-/// every `domains` entry. Used to resolve a distribution variate's support
+/// Build a lookup from observed-variable name → `(min, max)` over the
+/// document's `domains` block. Used to resolve a distribution variate's support
 /// (e.g. for `uniform_dist`).
 ///
-/// The same observable may appear in more than one `domains` entry; that is fine
-/// as long as the bounds agree. Two axes naming the same observable with
-/// *conflicting* `(min, max)` are contradictory — silently keeping the last
-/// would pick an arbitrary support — so this is rejected.
+/// When a domain named `default_domain` is present it is the variate support;
+/// all other `domains` entries are treated as RooFit named sub-ranges
+/// (fit/integration/plot ranges) and are not consulted for support resolution.
+///
+/// Without `default_domain`, all domains are merged: the same observable may
+/// appear in more than one `domains` entry as long as the bounds agree. Two
+/// axes naming the same observable with *conflicting* `(min, max)` are
+/// contradictory — silently keeping the last would pick an arbitrary support —
+/// so this is rejected.
 fn domain_bounds(doc: &Document) -> Result<BTreeMap<&str, (f64, f64)>> {
     let mut map: BTreeMap<&str, (f64, f64)> = BTreeMap::new();
     if let Some(d) = doc.domains.iter().find(|d| d.name == "default_domain") {

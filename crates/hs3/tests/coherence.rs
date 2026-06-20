@@ -43,6 +43,7 @@ const RECOGNIZED_DIST_KINDS: &[&str] = &[
     "bincounts_density_dist",
     "polynomial_dist",
     "barlow_beeston_lite_poisson_constraint_dist",
+    "chebychev_dist",
     // Tabulated-but-deferred: these have an explicit dispatch arm that returns
     // Error::Unsupported (NOT UnknownDistType), so they belong in the guard.
     "relativistic_breit_wigner_dist",
