@@ -475,13 +475,13 @@ fn parse_meta_triple(module: &mut Module, form: &Sexpr) -> Result<Meta> {
     }
     let ty = read_type(module, &items[0])?;
     let phase = read_phase(&items[1])?;
-    let set = read_valueset(&items[2])?;
+    let set = read_valueset(module, &items[2])?;
     Ok((ty, phase, set))
 }
 
 /// Read a `%meta` value-set slot: a set expression, `%unknown`, or
 /// `%deferred` (→ `None`, like the other slots).
-fn read_valueset(form: &Sexpr) -> Result<Option<ValueSet>> {
+fn read_valueset(module: &mut Module, form: &Sexpr) -> Result<Option<ValueSet>> {
     match &form.kind {
         SexprKind::Atom(s) => match s.as_str() {
             "%deferred" => Ok(None),
@@ -522,12 +522,39 @@ fn read_valueset(form: &Sexpr) -> Result<Option<ValueSet>> {
                     if items.len() != 3 {
                         return Err(err(form, "(cartpow <set> <n>) takes a set and a size"));
                     }
-                    let elem = read_valueset(&items[1])?
+                    let elem = read_valueset(module, &items[1])?
                         .ok_or_else(|| err(&items[1], "`%deferred` is not allowed inside a set"))?;
                     Ok(Some(ValueSet::CartPow(
                         Box::new(elem),
                         parse_dim(&items[2])?,
                     )))
+                }
+                "cartprod" => {
+                    let parts: Result<Vec<ValueSet>> = items[1..]
+                        .iter()
+                        .map(|it| {
+                            read_valueset(module, it)?
+                                .ok_or_else(|| err(it, "`%deferred` is not allowed inside a set"))
+                        })
+                        .collect();
+                    Ok(Some(ValueSet::CartProd(parts?.into())))
+                }
+                "record" => {
+                    let mut fields = Vec::new();
+                    for pair in &items[1..] {
+                        let SexprKind::List(kv) = &pair.kind else {
+                            return Err(err(pair, "a record value-set field is (<name> <set>)"));
+                        };
+                        if kv.len() != 2 {
+                            return Err(err(pair, "a record value-set field is (<name> <set>)"));
+                        }
+                        let name = module.intern(atom(&kv[0])?);
+                        let set = read_valueset(module, &kv[1])?.ok_or_else(|| {
+                            err(&kv[1], "`%deferred` is not allowed inside a set")
+                        })?;
+                        fields.push((name, set));
+                    }
+                    Ok(Some(ValueSet::RecordSet(fields.into())))
                 }
                 other => Err(err(&items[0], format!("unknown value-set form `{other}`"))),
             }

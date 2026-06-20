@@ -129,6 +129,15 @@ pub enum ValueSet {
     Interval(f64, f64),
     /// `cartpow(set, n)` — arrays with every element in `set`.
     CartPow(Box<ValueSet>, Dim),
+    /// `cartprod(S1, S2, …)` — heterogeneous product: a fixed-length array /
+    /// tuple whose i-th element lies in the i-th component set (spec §03,
+    /// "Cartesian product", positional form).
+    CartProd(Box<[ValueSet]>),
+    /// `cartprod(a = S1, b = S2, …)` — a record / table-column set: field `a`
+    /// in `S1`, … (spec §03, keyword form). Field names are interned
+    /// `Symbol`s, so this renders via `Module::display_valueset`, not the
+    /// symbol-free `Display` impl.
+    RecordSet(Box<[(Symbol, ValueSet)]>),
 }
 
 impl ValueSet {
@@ -143,10 +152,34 @@ impl ValueSet {
             Type::Scalar(ScalarType::Integer) => ValueSet::Integers,
             Type::Scalar(ScalarType::Boolean) => ValueSet::Booleans,
             Type::Scalar(ScalarType::Complex) => ValueSet::Complexes,
-            Type::Array { shape, elem } if shape.len() == 1 => match ValueSet::natural_of(elem) {
+            Type::Array { shape, elem } => match ValueSet::natural_of(elem) {
                 ValueSet::Unknown => ValueSet::Unknown,
-                inner => ValueSet::CartPow(Box::new(inner), shape[0]),
+                inner => cartpow_over(inner, shape),
             },
+            Type::TVector { len, elem } => match ValueSet::natural_of(elem) {
+                ValueSet::Unknown => ValueSet::Unknown,
+                inner => ValueSet::CartPow(Box::new(inner), *len),
+            },
+            Type::Tuple(parts) => {
+                let sets: Vec<ValueSet> = parts.iter().map(ValueSet::natural_of).collect();
+                if sets.iter().any(|s| matches!(s, ValueSet::Unknown)) {
+                    ValueSet::Unknown
+                } else {
+                    ValueSet::CartProd(sets.into())
+                }
+            }
+            Type::Record(fields) => record_natural(fields),
+            // A table's per-row value is a record of its columns' *element*
+            // sets (columns are equal-length vectors; one row picks one
+            // element from each — spec §03 "Tables"). The dynamic row count
+            // lives in the type, not the row's value-set.
+            Type::Table { columns, .. } => {
+                let elems: Vec<(Symbol, Type)> = columns
+                    .iter()
+                    .map(|(n, cty)| (*n, column_elem(cty)))
+                    .collect();
+                record_natural(&elems)
+            }
             Type::Measure { domain, .. } => ValueSet::natural_of(domain),
             Type::RngState => ValueSet::RngStates,
             Type::Any => ValueSet::Anything,
@@ -165,6 +198,8 @@ impl ValueSet {
             | Complexes => Some(false),
             CartPow(elem, Dim::Static(_)) => elem.is_bounded(),
             CartPow(_, Dim::Dynamic) => None,
+            CartProd(parts) => product_bounded(parts.iter()),
+            RecordSet(fields) => product_bounded(fields.iter().map(|(_, s)| s)),
             Deferred | Unknown | Anything | RngStates => None,
         }
     }
@@ -197,9 +232,65 @@ impl ValueSet {
             (CartPow(a, n), CartPow(b, d)) => {
                 (n == d || matches!(d, Dim::Dynamic)) && a.subset_of(b)
             }
+            (CartProd(a), CartProd(b)) if a.len() == b.len() => {
+                a.iter().zip(b.iter()).all(|(x, y)| x.subset_of(y))
+            }
+            (RecordSet(a), RecordSet(b))
+                if a.len() == b.len() && a.iter().zip(b.iter()).all(|((n, _), (m, _))| n == m) =>
+            {
+                a.iter()
+                    .zip(b.iter())
+                    .all(|((_, x), (_, y))| x.subset_of(y))
+            }
             _ => false,
         }
     }
+}
+
+/// Right-nested Cartesian power over a multi-axis shape:
+/// `[d0, d1, …, dk]` → `CartPow(… CartPow(elem, dk) …, d0)`. An empty shape
+/// returns `elem` unchanged (rank-0 = a scalar set).
+pub(crate) fn cartpow_over(elem: ValueSet, shape: &[Dim]) -> ValueSet {
+    shape
+        .iter()
+        .rev()
+        .fold(elem, |acc, &d| ValueSet::CartPow(Box::new(acc), d))
+}
+
+fn record_natural(fields: &[(Symbol, Type)]) -> ValueSet {
+    let sets: Vec<(Symbol, ValueSet)> = fields
+        .iter()
+        .map(|(n, t)| (*n, ValueSet::natural_of(t)))
+        .collect();
+    if sets.iter().any(|(_, s)| matches!(s, ValueSet::Unknown)) {
+        ValueSet::Unknown
+    } else {
+        ValueSet::RecordSet(sets.into())
+    }
+}
+
+/// The element type of a table column (a vector); a non-array column type is
+/// returned unchanged (defensive — table columns are vectors per spec §03).
+fn column_elem(col: &Type) -> Type {
+    match col {
+        Type::Array { elem, .. } => (**elem).clone(),
+        other => other.clone(),
+    }
+}
+
+fn product_bounded<'a>(parts: impl Iterator<Item = &'a ValueSet>) -> Option<bool> {
+    // bounded ⇔ every component bounded; an unbounded component short-circuits
+    // to Some(false); an unknown component (and no unbounded one) is None; the
+    // empty product is Some(true).
+    let mut saw_none = false;
+    for p in parts {
+        match p.is_bounded() {
+            Some(true) => {}
+            Some(false) => return Some(false),
+            None => saw_none = true,
+        }
+    }
+    if saw_none { None } else { Some(true) }
 }
 
 /// An array dimension: a concrete size, or `%dynamic` (resolved at load / run time).
@@ -311,6 +402,14 @@ impl fmt::Display for ValueSet {
             StdSimplex(d) => write!(f, "stdsimplex({d})"),
             Interval(lo, hi) => write!(f, "interval({lo}, {hi})"),
             CartPow(set, d) => write!(f, "cartpow({set}, {d})"),
+            CartProd(parts) => {
+                let inner: Vec<String> = parts.iter().map(ToString::to_string).collect();
+                write!(f, "cartprod({})", inner.join(", "))
+            }
+            RecordSet(fields) => {
+                let inner: Vec<String> = fields.iter().map(|(_, s)| format!("_: {s}")).collect();
+                write!(f, "record({})", inner.join(", "))
+            }
         }
     }
 }
@@ -318,6 +417,107 @@ impl fmt::Display for ValueSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cartpow_over_nests_multi_axis() {
+        use ValueSet::*;
+        // [2, 3] → CartPow(CartPow(reals, 3), 2)
+        let got = cartpow_over(Reals, &[Dim::Static(2), Dim::Static(3)]);
+        assert_eq!(
+            got,
+            CartPow(
+                Box::new(CartPow(Box::new(Reals), Dim::Static(3))),
+                Dim::Static(2)
+            )
+        );
+        // empty shape returns the element unchanged
+        assert_eq!(cartpow_over(Reals, &[]), Reals);
+        // single axis is a plain rank-1 power
+        assert_eq!(
+            cartpow_over(Integers, &[Dim::Static(4)]),
+            CartPow(Box::new(Integers), Dim::Static(4))
+        );
+    }
+
+    #[test]
+    fn natural_of_lifts_rank2_and_products() {
+        use crate::ty::{ScalarType, Type};
+        use ValueSet::*;
+        // flat rank-2 real array → nested CartPow
+        let flat = Type::Array {
+            shape: Box::new([Dim::Static(2), Dim::Static(3)]),
+            elem: Box::new(Type::Scalar(ScalarType::Real)),
+        };
+        assert_eq!(
+            ValueSet::natural_of(&flat),
+            CartPow(
+                Box::new(CartPow(Box::new(Reals), Dim::Static(3))),
+                Dim::Static(2)
+            )
+        );
+        // nested rank-1 array (matrix-as-vec-of-vec) → same nested CartPow
+        let nested = Type::Array {
+            shape: Box::new([Dim::Static(2)]),
+            elem: Box::new(Type::Array {
+                shape: Box::new([Dim::Static(3)]),
+                elem: Box::new(Type::Scalar(ScalarType::Real)),
+            }),
+        };
+        assert_eq!(ValueSet::natural_of(&nested), ValueSet::natural_of(&flat));
+        // tuple → CartProd
+        let tup = Type::Tuple(Box::new([
+            Type::Scalar(ScalarType::Real),
+            Type::Scalar(ScalarType::Integer),
+        ]));
+        assert_eq!(
+            ValueSet::natural_of(&tup),
+            CartProd(Box::new([Reals, Integers]))
+        );
+    }
+
+    #[test]
+    fn product_subset_and_bounded() {
+        use ValueSet::*;
+        // componentwise subset, same length
+        assert!(
+            CartProd(Box::new([PosReals, UnitInterval]))
+                .subset_of(&CartProd(Box::new([Reals, Reals])))
+        );
+        // length mismatch is not a subset
+        assert!(!CartProd(Box::new([Reals])).subset_of(&CartProd(Box::new([Reals, Reals]))));
+        // bounded iff every component bounded
+        assert_eq!(
+            CartProd(Box::new([UnitInterval, Booleans])).is_bounded(),
+            Some(true)
+        );
+        assert_eq!(
+            CartProd(Box::new([UnitInterval, Reals])).is_bounded(),
+            Some(false)
+        );
+        // multi-axis power bounded follows the element
+        assert_eq!(
+            cartpow_over(UnitInterval, &[Dim::Static(2), Dim::Static(2)]).is_bounded(),
+            Some(true)
+        );
+        assert_eq!(
+            cartpow_over(Reals, &[Dim::Static(2), Dim::Static(2)]).is_bounded(),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn recordset_subset_matches_fields() {
+        use ValueSet::*;
+        let mut m = crate::module::Module::new();
+        let a = m.intern("a");
+        let b = m.intern("b");
+        let lhs = RecordSet(Box::new([(a, PosReals), (b, UnitInterval)]));
+        let rhs = RecordSet(Box::new([(a, Reals), (b, Reals)]));
+        assert!(lhs.subset_of(&rhs));
+        // mismatched field order / names is not a subset
+        let swapped = RecordSet(Box::new([(b, Reals), (a, Reals)]));
+        assert!(!lhs.subset_of(&swapped));
+    }
 
     #[test]
     fn subset_chains() {
