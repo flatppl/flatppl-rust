@@ -653,8 +653,13 @@ fn elementwise2(a: &Option<&ArgInfo>, b: &Option<&ArgInfo>) -> Type {
     }
 }
 
-/// `mul`: scalar·scalar and scalar·array for now; the matrix/vector forms
-/// arrive with the shape work.
+/// `mul` (`a * b`, spec §07): scalar·scalar, scalar·array (both orders), and the
+/// matrix-multiply forms over FLAT rank-2 matrices — matrix·matrix
+/// (`[m,k]·[k,n] → [m,n]`) and matrix·vector (`[m,k]·[k] → [m]`). A statically
+/// provable inner-dimension mismatch is a shape error (`%failed`). The remaining
+/// §07 forms — transposed-vector·vector (dot) and vector·transposed-vector
+/// (outer), and matmul over matrices represented as nested rank-1 arrays — are
+/// not yet typed and stay `%deferred` (honest: no guessed shape).
 fn mul_type(args: &[ArgInfo]) -> Type {
     let (a, b) = match (arg_ty(args, 0), arg_ty(args, 1)) {
         (Some(a), Some(b)) => (a, b),
@@ -665,6 +670,38 @@ fn mul_type(args: &[ArgInfo]) -> Type {
         _ if scalarish(a) && scalarish(b) => promote2(Some(a), Some(b)),
         (Type::Array { .. }, s) if scalarish(s) => a.clone(),
         (s, Type::Array { .. }) if scalarish(s) => b.clone(),
+        // Matrix multiply over flat rank-2 matrices: matrix·matrix → matrix,
+        // matrix·vector → vector. The left operand is a rank-2 matrix; the right
+        // is a matrix (rank-2) or a vector (rank-1). The shared inner dimension
+        // (`sa[1]` vs the right's leading dim) must agree; the result drops it.
+        (
+            Type::Array {
+                shape: sa,
+                elem: ea,
+            },
+            Type::Array {
+                shape: sb,
+                elem: eb,
+            },
+        ) if sa.len() == 2 && (sb.len() == 2 || sb.len() == 1) => {
+            if matches!((sa[1], sb[0]), (Dim::Static(k1), Dim::Static(k2)) if k1 != k2) {
+                return Type::Failed(
+                    "matrix multiply: inner dimensions disagree (spec §07)".into(),
+                );
+            }
+            let out_shape: Box<[Dim]> = if sb.len() == 2 {
+                Box::new([sa[0], sb[1]])
+            } else {
+                Box::new([sa[0]])
+            };
+            match promote2(Some(ea.as_ref()), Some(eb.as_ref())) {
+                Type::Deferred => Type::Deferred, // non-numeric elements
+                elem => Type::Array {
+                    shape: out_shape,
+                    elem: Box::new(elem),
+                },
+            }
+        }
         _ => Type::Deferred,
     }
 }
@@ -1868,7 +1905,15 @@ fn broadcast_type(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo], named: &[Named
         }
     }
     let Some(shape) = shape else {
-        return Type::Deferred; // no array input — scalar broadcast is a no-op shape-wise
+        // No concrete array argument. Broadcasting a DISTRIBUTION is still a
+        // measure (an independent product over the eventual broadcast shape), so
+        // a reified lambda body `dist.(params)` — whose params are still `%local`
+        // placeholders, hence no array yet — must classify as a MEASURE so the
+        // reification becomes a kernel rather than a plain function; the
+        // call-site substitution then refines the concrete shape. A deterministic
+        // op or a user-callable head with no array input stays a shape-wise
+        // no-op (`%deferred`).
+        return broadcast_distribution_no_shape(inf, head_node);
     };
 
     // User-callable head (`broadcast(predict, x = x_data)`): the cell comes from
@@ -2001,6 +2046,41 @@ fn broadcast_type(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo], named: &[Named
     Type::Array {
         shape,
         elem: Box::new(cell),
+    }
+}
+
+/// `broadcast` with no concrete array argument (e.g. a reified lambda body
+/// `dist.(params)` whose params are still `%local` placeholders): a distribution
+/// head is nonetheless a measure — its broadcast is an independent product over a
+/// not-yet-known shape — so report `(%measure %deferred · normalized)` to flag
+/// it as a measure (the reification then classifies as a kernel; the call-site
+/// substitution supplies the concrete domain). A §08 builtin or §09 module
+/// distribution both count; anything else (deterministic op, user callable) is a
+/// shape-wise no-op and stays `%deferred`.
+fn broadcast_distribution_no_shape(inf: &mut Inferencer<'_, '_>, head_node: NodeId) -> Type {
+    use crate::catalogue::Sig;
+    // §09 module distribution head (catalogue-ref side-table). `.map().unwrap_or`
+    // drops the borrow before the `&mut inf` call below.
+    let module_dist = inf
+        .module_catalogue_ref(head_node)
+        .map(|c| matches!(c.sig, Sig::Distribution { .. }))
+        .unwrap_or(false);
+    // §08 builtin distribution head: resolve the name (immutable borrow ends with
+    // the owned `String`), then probe `distribution_domain` (needs `&mut inf`).
+    let builtin_name = match inf.module.node(head_node) {
+        Node::Const(op) => Some(inf.module.resolve(*op).to_string()),
+        _ => None,
+    };
+    let builtin_dist = builtin_name
+        .map(|n| distribution_domain(inf, &n, &[], &[]).is_some())
+        .unwrap_or(false);
+    if module_dist || builtin_dist {
+        Type::Measure {
+            domain: Box::new(Type::Deferred),
+            mass: Mass::Normalized,
+        }
+    } else {
+        Type::Deferred
     }
 }
 

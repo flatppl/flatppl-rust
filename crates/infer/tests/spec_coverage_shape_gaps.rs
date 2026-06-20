@@ -182,6 +182,28 @@ fn dirac_infers_a_normalized_point_mass() {
 /// type; `fchain` → a `function` with f1's input signature; `disintegrate` → a
 /// `(forward_kernel, marginal)` tuple, with mass classes following the joint
 /// (a probability joint → Markov kernel + probability marginal).
+/// A lambda whose body BROADCASTS a distribution over its (placeholder) params
+/// — `(nr, pr) -> Binomial.(nr, pr)` — classifies as a KERNEL, not a plain
+/// function: broadcasting a distribution is a measure (an independent product)
+/// even before the shape is known, so the reified body is a measure. Stochastic
+/// broadcast-application `r ~ K.(rows, …)` then resolves to the per-row
+/// trajectory (the call-site substitution supplies the concrete shape).
+#[test]
+fn broadcast_distribution_lambda_is_a_kernel() {
+    let out = ir("n_data = [[5, 6], [7, 8]]\n\
+                  p = [[0.1, 0.2], [0.3, 0.4]]\n\
+                  K = (nr, pr) -> Binomial.(nr, pr)\n\
+                  r ~ K.(n_data, p)");
+    assert!(
+        out.contains("(%bind K (%meta ((%kernel (%inputs nr pr)"),
+        "lambda with a broadcast-distribution body should be a kernel, got:\n{out}"
+    );
+    assert!(
+        out.contains("(%bind r (%meta ((%array 1 (2) (%array 1 (2) (%scalar integer)))"),
+        "r ~ K.(n_data, p) should be a nested 2x2 integer trajectory, got:\n{out}"
+    );
+}
+
 #[test]
 fn scan_fchain_disintegrate_infer() {
     let out = ir("xs = [1.0, 2.0, 3.0]\nf = (acc, x) -> acc + x\ns = scan(f, 0.0, xs)");
@@ -381,6 +403,39 @@ fn real_imag_are_real_valued() {
     assert!(
         out.contains("(%meta ((%scalar real) %fixed reals) (imag"),
         "imag(complex) should infer a real scalar, got:\n{out}"
+    );
+}
+
+/// `mul` (`*`) over matrices/vectors (spec §07 line 448): flat rank-2 matrix ×
+/// vector → vector; matrix × matrix → matrix; a static inner-dimension mismatch
+/// is a shape error (`%failed`). Scalar/scalar-array forms are covered elsewhere.
+#[test]
+fn matmul_matrix_vector_and_matrix_matrix() {
+    // matrix[3,3] × vector[3] → vector[3] (the matrix-vector product)
+    let out = ir(
+        "X = rowstack([[1.0,2.0,3.0],[4.0,5.0,6.0],[7.0,8.0,9.0]])\n\
+                  v = [1.0, 2.0, 3.0]\n\
+                  m = X * v",
+    );
+    assert!(
+        out.contains("(%bind m (%meta ((%array 1 (3) (%scalar real))"),
+        "matrix·vector should be a real vector[3], got:\n{out}"
+    );
+    // matrix[2,3] × matrix[3,2] → matrix[2,2]
+    let out = ir("A = rowstack([[1.0,2.0,3.0],[4.0,5.0,6.0]])\n\
+                  B = rowstack([[1.0,2.0],[3.0,4.0],[5.0,6.0]])\n\
+                  C = A * B");
+    assert!(
+        out.contains("(%bind C (%meta ((%array 2 (2 2) (%scalar real))"),
+        "matrix·matrix should be a real matrix[2,2], got:\n{out}"
+    );
+    // inner-dimension mismatch ([2,3] × [2]) is a static shape error
+    let out = ir("A = rowstack([[1.0,2.0,3.0],[4.0,5.0,6.0]])\n\
+                  v = [1.0, 2.0]\n\
+                  m = A * v");
+    assert!(
+        out.contains("(%bind m (%meta ((%failed"),
+        "matrix·vector inner-dim mismatch should be %failed, got:\n{out}"
     );
 }
 
