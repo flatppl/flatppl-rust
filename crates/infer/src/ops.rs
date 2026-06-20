@@ -408,29 +408,11 @@ pub(crate) fn call_rule(
             _ => Type::Deferred,
         },
         // `disintegrate(selector, joint)` (spec §06) splits a joint measure into
-        // a `(forward_kernel, marginal)` tuple. The kernel inputs / marginal
-        // domain depend on the selector + DAG structure (not statically tracked),
-        // but disintegrating a probability measure yields a Markov forward kernel
-        // and a probability marginal — so the mass classes follow the joint's.
-        "disintegrate" => {
-            let part_mass = match arg_ty(args, 1) {
-                Some(Type::Measure {
-                    mass: Mass::Normalized,
-                    ..
-                }) => Mass::Normalized,
-                _ => Mass::Unknown,
-            };
-            Type::Tuple(Box::new([
-                Type::Kernel {
-                    inputs: Box::new([]),
-                    mass: part_mass,
-                },
-                Type::Measure {
-                    domain: Box::new(Type::Deferred),
-                    mass: part_mass,
-                },
-            ]))
-        }
+        // a `(forward_kernel, marginal)` tuple. When the joint is a record-domain
+        // measure and the selector is a static set of field names, the marginal
+        // carries the complement fields and the kernel inputs are those complement
+        // (conditioning) variates. See `disintegrate_type` for the full logic.
+        "disintegrate" => disintegrate_type(inf, call, args),
         // `relabel(M, labels)` (spec §06) renames the variate; the value domain
         // AND total mass are unchanged, so the measure type passes through whole
         // (unlike normalize/truncate, which reset the mass slot).
@@ -928,6 +910,81 @@ fn measure_domain(m: Option<&Type>) -> Type {
         Some(Type::Measure { domain, .. }) => domain.as_ref().clone(),
         _ => Type::Deferred,
     }
+}
+
+/// The field names a `disintegrate` selector picks (spec §06: works like `get` —
+/// `"b"` selects field `b`; `["b", "c"]` selects `b` and `c`). `Some` only when
+/// every entry is a literal string (a bare `Scalar::Str`, or a `vector(...)` of
+/// `Scalar::Str`); index selectors and non-literals ⇒ `None` (caller defers).
+fn selector_field_names(inf: &Inferencer<'_, '_>, node: NodeId) -> Option<Vec<Box<str>>> {
+    match inf.module.node(node).clone() {
+        Node::Lit(Scalar::Str(s)) => Some(vec![s]),
+        Node::Call(c)
+            if matches!(c.head, CallHead::Builtin(op)
+                if inf.module.resolve(op) == "vector") =>
+        {
+            c.args
+                .iter()
+                .map(|&a| match inf.module.node(a) {
+                    Node::Lit(Scalar::Str(s)) => Some(s.clone()),
+                    _ => None,
+                })
+                .collect()
+        }
+        _ => None,
+    }
+}
+
+/// `disintegrate(selector, joint)` (spec §06) → `(kernel, marginal)`. When the
+/// joint is a record-domain measure and the selector statically names a non-empty
+/// proper subset of its fields, the marginal is the record of the COMPLEMENT
+/// (unselected) fields and the kernel's inputs are those complement variate names
+/// (the conditioning variates). The kernel's OUTPUT domain (the selected
+/// variates) is not carried by `Type::Kernel`, so it stays implicit. Falls back
+/// to empty kernel inputs + a `%deferred` marginal domain when the joint isn't a
+/// record measure or the selector isn't a static field-name set.
+fn disintegrate_type(inf: &mut Inferencer<'_, '_>, call: &Call, args: &[ArgInfo]) -> Type {
+    let part_mass = match arg_ty(args, 1) {
+        Some(Type::Measure {
+            mass: Mass::Normalized,
+            ..
+        }) => Mass::Normalized,
+        _ => Mass::Unknown,
+    };
+    let selected = call
+        .args
+        .first()
+        .and_then(|&n| selector_field_names(inf, n));
+    let (inputs, marginal_domain): (Box<[Symbol]>, Type) = match (arg_ty(args, 1), selected) {
+        (Some(Type::Measure { domain, .. }), Some(sel)) => match domain.as_ref() {
+            Type::Record(fields) => {
+                let is_sel = |n: &Symbol| sel.iter().any(|s| inf.module.resolve(*n) == &**s);
+                let all_present = sel
+                    .iter()
+                    .all(|s| fields.iter().any(|(n, _)| inf.module.resolve(*n) == &**s));
+                let complement: Vec<(Symbol, Type)> =
+                    fields.iter().filter(|(n, _)| !is_sel(n)).cloned().collect();
+                if all_present && !complement.is_empty() {
+                    let inputs: Box<[Symbol]> = complement.iter().map(|(n, _)| *n).collect();
+                    (inputs, Type::Record(complement.into()))
+                } else {
+                    (Box::new([]), Type::Deferred)
+                }
+            }
+            _ => (Box::new([]), Type::Deferred),
+        },
+        _ => (Box::new([]), Type::Deferred),
+    };
+    Type::Tuple(Box::new([
+        Type::Kernel {
+            inputs,
+            mass: part_mass,
+        },
+        Type::Measure {
+            domain: Box::new(marginal_domain),
+            mass: part_mass,
+        },
+    ]))
 }
 
 /// `iid(M, n)`: n iid draws bundle into an array over M's domain. A literal

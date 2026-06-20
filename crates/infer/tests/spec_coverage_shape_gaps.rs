@@ -199,9 +199,9 @@ fn scan_fchain_disintegrate_infer() {
                   jm = lawof(record(a = a, b = b))\n\
                   fk = disintegrate([\"b\"], jm)");
     assert!(
-        out.contains("(%tuple (%kernel (%inputs ) (%mass %normalized)) (%measure (%domain %deferred) (%mass %normalized)))")
+        out.contains("(%tuple (%kernel (%inputs a) (%mass %normalized)) (%measure (%domain (%record (a (%scalar real)))) (%mass %normalized)))")
             && out.contains("(disintegrate"),
-        "disintegrate of a probability joint should be a (normalized kernel, normalized marginal) tuple, got:\n{out}"
+        "disintegrate of a probability joint should be a (normalized kernel w/ inputs=a, marginal over record{{a}}) tuple, got:\n{out}"
     );
 }
 
@@ -1045,5 +1045,23 @@ fn load_data_table_valueset() {
     assert!(
         out.contains("(cartpow (record (a reals) (b unitinterval)) %dynamic)"),
         "load_data(cartprod record) should be a dynamic vector of records; got:\n{out}"
+    );
+}
+
+/// `disintegrate(selector, joint)` (spec §06): the marginal carries the
+/// COMPLEMENT of the selected variates, and the forward kernel's inputs are those
+/// complement (conditioning) variates. Selector reads like `get` (`Scalar::Str`).
+/// Discovery (2026-06-20): `["b"]` lowers to `(vector "b")` — a vector call of
+/// string literals. `mu` types as a record-domain measure over {a, b}. Selecting
+/// `b` → complement is `{a}` → kernel inputs = a, marginal domain = record{a}.
+#[test]
+fn disintegrate_splits_record_joint() {
+    let out = ir("a ~ Normal(0.0, 1.0)\n\
+                  b ~ Normal(a, 1.0)\n\
+                  mu = lawof(record(a = a, b = b))\n\
+                  parts = disintegrate([\"b\"], mu)");
+    assert!(
+        out.contains("(%tuple (%kernel (%inputs a) (%mass %normalized)) (%measure (%domain (%record (a (%scalar real)))) (%mass %normalized)))"),
+        "disintegrate(['b'], mu) → (kernel inputs=a, marginal over record{{a}}), got:\n{out}"
     );
 }
