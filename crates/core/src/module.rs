@@ -151,6 +151,31 @@ impl Module {
         s
     }
 
+    /// Render a [`ValueSet`] in the value-set surface vocabulary, resolving
+    /// interned `RecordSet` field names to their source text. For the
+    /// symbol-free variants this matches the plain `Display` impl; only
+    /// `RecordSet` (and nestings containing it) need the interner.
+    pub fn display_valueset(&self, vs: &ValueSet) -> String {
+        match vs {
+            ValueSet::CartPow(elem, d) => {
+                format!("cartpow({}, {d})", self.display_valueset(elem))
+            }
+            ValueSet::CartProd(parts) => {
+                let inner: Vec<String> = parts.iter().map(|s| self.display_valueset(s)).collect();
+                format!("cartprod({})", inner.join(", "))
+            }
+            ValueSet::RecordSet(fields) => {
+                let inner: Vec<String> = fields
+                    .iter()
+                    .map(|(n, s)| format!("{}: {}", self.resolve(*n), self.display_valueset(s)))
+                    .collect();
+                format!("record({})", inner.join(", "))
+            }
+            // Symbol-free atoms: defer to the plain Display impl.
+            other => other.to_string(),
+        }
+    }
+
     /// Render the full inferred *specification* of a node — its type plus the
     /// value-set and phase — as one compact line for an inline surface (LSP
     /// inlay hint), e.g. `real {nonnegreals, stochastic}`.
@@ -166,7 +191,7 @@ impl Module {
             if !matches!(vs, ValueSet::Unknown | ValueSet::Deferred)
                 && *vs != ValueSet::natural_of(ty)
             {
-                facts.push(vs.to_string());
+                facts.push(self.display_valueset(vs));
             }
         }
         if let Some(phase) = self.phase_of(id) {
@@ -492,6 +517,54 @@ mod tests {
         assert_eq!(m.display_type(&Type::Deferred), "deferred");
         assert_eq!(m.display_type(&Type::RngState), "rngstate");
         assert_eq!(m.display_type(&Type::Module), "module");
+    }
+
+    #[test]
+    fn display_valueset_shows_record_field_names() {
+        use crate::ty::Dim;
+        use crate::ty::ValueSet::*;
+        let mut m = Module::new();
+        let a = m.intern("alpha");
+        let b = m.intern("beta");
+        let rs = RecordSet(Box::new([(a, Reals), (b, UnitInterval)]));
+        assert_eq!(
+            m.display_valueset(&rs),
+            "record(alpha: reals, beta: unitinterval)"
+        );
+        // positional + nested power render too
+        let cp = CartProd(Box::new([Reals, PosReals]));
+        assert_eq!(m.display_valueset(&cp), "cartprod(reals, posreals)");
+        let pow = CartPow(
+            Box::new(CartPow(Box::new(Reals), Dim::Static(3))),
+            Dim::Static(2),
+        );
+        assert_eq!(m.display_valueset(&pow), "cartpow(cartpow(reals, 3), 2)");
+    }
+
+    #[test]
+    fn display_valueset_recurses_record_inside_cartprod() {
+        use crate::ty::Dim;
+        use crate::ty::ValueSet::*;
+        let mut m = Module::new();
+        let a = m.intern("a");
+        let b = m.intern("b");
+        // RecordSet nested as the first element of a CartProd — the interner
+        // must be threaded into the recursive call so field names resolve.
+        let rs = RecordSet(Box::new([(a, Reals), (b, UnitInterval)]));
+        let cp = CartProd(Box::new([rs, PosReals]));
+        assert_eq!(
+            m.display_valueset(&cp),
+            "cartprod(record(a: reals, b: unitinterval), posreals)"
+        );
+        // RecordSet nested inside CartPow — same recursion path, different arm.
+        let a2 = m.intern("a");
+        let b2 = m.intern("b");
+        let rs2 = RecordSet(Box::new([(a2, Reals), (b2, UnitInterval)]));
+        let cpow = CartPow(Box::new(rs2), Dim::Static(3));
+        assert_eq!(
+            m.display_valueset(&cpow),
+            "cartpow(record(a: reals, b: unitinterval), 3)"
+        );
     }
 
     #[test]

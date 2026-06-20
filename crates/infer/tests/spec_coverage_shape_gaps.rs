@@ -961,3 +961,54 @@ fn user_call_carries_substituted_value_set() {
         "broadcast(f, real[3]) should carry cartpow(nonnegreals, 3); got:\n{out}"
     );
 }
+
+// ---- Array/table value-sets: multi-axis cartpow, cartprod, load_data ----
+// Discovery observations (2026-06-20, before implementation):
+//   cartpow_multiaxis: already shows (cartpow (cartpow reals 3) 2) via
+//     natural_of fallback (Task 1); set_expr_valueset is updated for
+//     directness / correctness.
+//   cartprod_positional: shows %unknown — needs set_expr_valueset arm.
+//   cartprod_record:    shows %unknown — needs set_expr_valueset arm.
+//   load_data_table:    shows %unknown — needs set_expr_valueset cartprod arm
+//     which feeds into the load_data CartPow wrapping.
+
+/// A multi-axis `cartpow` carries a nested value-set (gap A/B), not `%unknown`.
+#[test]
+fn cartpow_multiaxis_valueset() {
+    let out = ir("m = elementof(cartpow(reals, [2, 3]))");
+    assert!(
+        out.contains("(cartpow (cartpow reals 3) 2)"),
+        "multi-axis cartpow should carry a nested value-set; got:\n{out}"
+    );
+}
+
+/// Positional `cartprod` carries a heterogeneous product value-set.
+#[test]
+fn cartprod_positional_valueset() {
+    let out = ir("p = elementof(cartprod(reals, posreals))");
+    assert!(
+        out.contains("(cartprod reals posreals)"),
+        "positional cartprod should carry a CartProd value-set; got:\n{out}"
+    );
+}
+
+/// Keyword `cartprod` carries a named record value-set.
+#[test]
+fn cartprod_record_valueset() {
+    let out = ir("r = elementof(cartprod(a = reals, b = unitinterval))");
+    assert!(
+        out.contains("(record (a reals) (b unitinterval))"),
+        "keyword cartprod should carry a RecordSet value-set; got:\n{out}"
+    );
+}
+
+/// `load_data` over a record cartprod is a dynamic-row table value-set.
+#[test]
+fn load_data_table_valueset() {
+    let out =
+        ir("t = load_data(source = \"d.csv\", valueset = cartprod(a = reals, b = unitinterval))");
+    assert!(
+        out.contains("(cartpow (record (a reals) (b unitinterval)) %dynamic)"),
+        "load_data(cartprod record) should be a dynamic vector of records; got:\n{out}"
+    );
+}

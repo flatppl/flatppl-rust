@@ -230,7 +230,7 @@ fn render_meta(module: &Module, id: NodeId) -> Option<String> {
     }
     let ty_s = ty.map_or_else(|| "%deferred".to_string(), |t| render_type(module, t));
     let phase_s = phase.map_or("%deferred", render_phase);
-    let vset_s = vset.map_or_else(|| "%deferred".to_string(), render_valueset);
+    let vset_s = vset.map_or_else(|| "%deferred".to_string(), |v| render_valueset(module, v));
     Some(format!("({ty_s} {phase_s} {vset_s})"))
 }
 
@@ -247,7 +247,7 @@ fn render_mass(mass: Mass) -> &'static str {
 
 /// A value set renders as its FlatPPL set expression (bare set constants,
 /// `(stdsimplex n)`, `(interval lo hi)`, `(cartpow set n)`).
-fn render_valueset(set: &ValueSet) -> String {
+fn render_valueset(module: &Module, set: &ValueSet) -> String {
     match set {
         ValueSet::Deferred => "%deferred".to_string(),
         ValueSet::Unknown => "%unknown".to_string(),
@@ -267,7 +267,22 @@ fn render_valueset(set: &ValueSet) -> String {
             format!("(interval {} {})", render_real(*lo), render_real(*hi))
         }
         ValueSet::CartPow(elem, n) => {
-            format!("(cartpow {} {})", render_valueset(elem), render_dim(*n))
+            format!(
+                "(cartpow {} {})",
+                render_valueset(module, elem),
+                render_dim(*n)
+            )
+        }
+        ValueSet::CartProd(parts) => {
+            let inner: Vec<String> = parts.iter().map(|s| render_valueset(module, s)).collect();
+            format!("(cartprod {})", inner.join(" "))
+        }
+        ValueSet::RecordSet(fields) => {
+            let inner: Vec<String> = fields
+                .iter()
+                .map(|(n, s)| format!("({} {})", module.resolve(*n), render_valueset(module, s)))
+                .collect();
+            format!("(record {})", inner.join(" "))
         }
     }
 }

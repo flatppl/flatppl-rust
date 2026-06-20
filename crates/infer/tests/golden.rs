@@ -736,19 +736,21 @@ fn cartpow_multi_axis_shape() {
     // integers for a multi-axis power, so `cartpow(reals, [2, 3])` is the set
     // of 2×3 real matrices — a rank-2 array of shape (2 3), NOT a rank-1
     // dynamic array. `Y = X .^ 2` broadcasts elementwise and carries the same
-    // rank-2 shape. The single-dim `ValueSet::CartPow` cannot name a rank-2
-    // power, so the value-set slot is honestly `%unknown` (matching
-    // `ValueSet::natural_of` for rank-≥2 arrays).
+    // rank-2 shape. The natural value-set for a rank-2 real array is the
+    // right-nested `(cartpow (cartpow reals 3) 2)` (spec §03 "Cartesian power",
+    // Task 1: multi-axis `cartpow_over` nesting).
     let src = "X = elementof(cartpow(reals, [2, 3]))\nY = X .^ 2";
     let (module, _) = infer_src(src);
     let out = flatppl_flatpir::write(&module);
     assert!(
-        out.contains("(%meta ((%array 2 (2 3) (%scalar real)) %parameterized %unknown) (elementof"),
+        out.contains(
+            "(%meta ((%array 2 (2 3) (%scalar real)) %parameterized (cartpow (cartpow reals 3) 2)) (elementof"
+        ),
         "X should infer rank-2 (2 3) real array, got:\n{out}"
     );
     assert!(
         out.contains(
-            "(%meta ((%array 2 (2 3) (%scalar real)) %parameterized %unknown) (broadcast pow"
+            "(%meta ((%array 2 (2 3) (%scalar real)) %parameterized (cartpow (cartpow reals 3) 2)) (broadcast pow"
         ),
         "Y = X .^ 2 should carry the rank-2 (2 3) shape, got:\n{out}"
     );

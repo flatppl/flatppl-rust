@@ -240,8 +240,15 @@ fn function_set(tag: crate::catalogue::ResultSet, ty: &Type) -> ValueSet {
     };
     match ty {
         Type::Scalar(s) if *s == kind => set,
-        Type::Array { shape, elem } if shape.len() == 1 => match elem.as_ref() {
-            Type::Scalar(s) if *s == kind => ValueSet::CartPow(Box::new(set), shape[0]),
+        Type::Array { shape, elem } => match elem.as_ref() {
+            // Array of the tagged scalar kind (any rank) → lift the tag over
+            // every axis. Nested arrays (matrix-as-vec-of-vec) recurse through
+            // the element's own `function_set`.
+            Type::Scalar(s) if *s == kind => flatppl_core::ty::cartpow_over(set, shape),
+            Type::Array { .. } => match function_set(tag, elem) {
+                ValueSet::Unknown => ValueSet::natural_of(ty),
+                inner => flatppl_core::ty::cartpow_over(inner, shape),
+            },
             _ => ValueSet::natural_of(ty),
         },
         _ => ValueSet::natural_of(ty),

@@ -207,6 +207,35 @@ fn valueset_forms_roundtrip() {
     assert_eq!(write(&read(&out).unwrap()), out);
 }
 
+use flatppl_flatpir::{read as fp_read, write as fp_write};
+
+/// The new heterogeneous value-set forms survive read → write → read.
+#[test]
+fn cartprod_and_record_valuesets_roundtrip() {
+    // positional cartprod, multi-axis cartpow, and named record value-sets
+    let src = "(%module \
+        (%bind p (%meta ((%tuple (%scalar real) (%scalar real)) %fixed (cartprod reals posreals)) (elementof reals))) \
+        (%bind m (%meta ((%array 2 (2 3) (%scalar real)) %fixed (cartpow (cartpow reals 3) 2)) (elementof reals))) \
+        (%bind r (%meta ((%record (a (%scalar real)) (b (%scalar real))) %fixed (record (a reals) (b unitinterval))) (elementof reals))))";
+    let m1 = fp_read(src).expect("initial read");
+    let s1 = fp_write(&m1);
+    let m2 = fp_read(&s1).expect("re-read of canonical form");
+    let s2 = fp_write(&m2);
+    assert_eq!(s1, s2, "value-set forms not idempotent:\n{s1}");
+    assert!(
+        s1.contains("(cartprod reals posreals)"),
+        "positional cartprod missing:\n{s1}"
+    );
+    assert!(
+        s1.contains("(record (a reals) (b unitinterval))"),
+        "record set missing:\n{s1}"
+    );
+    assert!(
+        s1.contains("(cartpow (cartpow reals 3) 2)"),
+        "nested cartpow missing:\n{s1}"
+    );
+}
+
 /// A module with an explicit *empty* `(%public)` — no public bindings — must
 /// survive `write → read`. The writer emits `(%public)` so re-reading uses the
 /// explicit (empty) interface rather than the name-convention fallback (which
