@@ -454,3 +454,32 @@ fn pi_constant_inlined_in_generic_dist() {
         parsed.err()
     );
 }
+
+// ---------------------------------------------------------------------------
+// erf/erfc → special-functions module
+//
+// A generic_function that uses `erf` must:
+//   1. Emit a call that contains `erf` (via the `specfun` alias).
+//   2. Emit a `standard_module` binding for `special-functions`.
+//   3. Round-trip parse without error.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn expr_erf_lowers_to_special_functions() {
+    const JSON: &str = r#"{
+      "functions": [
+        {"name": "eff", "type": "generic_function", "expression": "erf(x)", "x": "x"}
+      ]
+    }"#;
+    let m = flatppl_hs3::read_hs3(JSON).expect("read_hs3");
+    let text = print_with(&m, Syntax::Minimal);
+    assert!(
+        text.contains(".erf(") || text.contains("erf("),
+        "missing erf: {text}"
+    );
+    assert!(
+        text.contains("standard_module"),
+        "missing special-functions binding: {text}"
+    );
+    flatppl_syntax::parse(&text).expect("re-parse");
+}

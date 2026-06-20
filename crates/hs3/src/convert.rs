@@ -426,9 +426,72 @@ fn declare_generic_expr_params(
     Ok(())
 }
 
+/// Return true if `expr` contains an `erf` or `erfc` function call.
+///
+/// Uses a boundary-aware token check: the name must not be immediately preceded
+/// by an ASCII identifier character (letter, digit, or `_`), so `xerf(` is not
+/// a false positive while `erf(` and `erfc(` are. A plain substring match on
+/// `"erf("` would also match inside a longer name — the boundary guard prevents
+/// that at negligible cost.
+fn expr_uses_specfun(expr: &str) -> bool {
+    let bytes = expr.as_bytes();
+    for name in &["erfc(", "erf("] {
+        let needle = name.as_bytes();
+        let nlen = needle.len();
+        let mut i = 0;
+        while i + nlen <= bytes.len() {
+            if bytes[i..i + nlen] == *needle {
+                // Guard: preceding byte must not be an identifier character.
+                let ok = i == 0
+                    || !{
+                        let b = bytes[i - 1];
+                        b.is_ascii_alphanumeric() || b == b'_'
+                    };
+                if ok {
+                    return true;
+                }
+            }
+            i += 1;
+        }
+    }
+    false
+}
+
+/// Return true if any expression string in the document uses `erf` or `erfc`.
+fn doc_uses_specfun(doc: &Document) -> bool {
+    // Scan generic_function expressions.
+    for f in &doc.functions {
+        if f.kind == "generic_function" {
+            if let Some(expr) = f.extra.get("expression").and_then(|v| v.as_str()) {
+                if expr_uses_specfun(expr) {
+                    return true;
+                }
+            }
+        }
+    }
+    // Scan generic_dist / density_function_dist / log_density_function_dist inline expressions.
+    for d in &doc.distributions {
+        if matches!(
+            d.kind.as_str(),
+            "generic_dist" | "density_function_dist" | "log_density_function_dist"
+        ) {
+            if let Some(expr) = d.extra.get("expression").and_then(|v| v.as_str()) {
+                if expr_uses_specfun(expr) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Step 1b: lower each `functions` block entry to a deterministic binding.
 fn emit_functions(m: &mut Module, doc: &Document) -> Result<()> {
     let mut b = Builder::new(m);
+    // Bind the special-functions standard module once if any expression uses erf/erfc.
+    if doc_uses_specfun(doc) {
+        crate::pyhf::bind_standard_module(&mut b, "specfun", "special-functions", "0.1");
+    }
     for f in &doc.functions {
         emit_function(&mut b, f)?;
     }

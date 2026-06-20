@@ -668,6 +668,16 @@ impl<'b, 'm> Parser<'b, 'm> {
                 }
                 name
             }
+            "erf" | "erfc" => {
+                if args.len() != 1 {
+                    return Err(Error::Unsupported(format!(
+                        "expression parser: `{name}` expects 1 argument, got {}",
+                        args.len()
+                    )));
+                }
+                // special-functions module member: alias `specfun`.
+                return Ok(self.b.module_user_call("specfun", name, &args));
+            }
             other => {
                 return Err(Error::Unsupported(format!(
                     "expression parser: unknown function `{other}`"
