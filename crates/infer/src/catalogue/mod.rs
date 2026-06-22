@@ -284,6 +284,12 @@ impl Catalogue {
         self.base.iter().find(|b| b.name == name).map(|b| &b.sig)
     }
 
+    /// True iff base builtin `name` exists and has a distribution signature.
+    /// Used by the LSP to bias completion ordering after a `~` binding.
+    pub fn base_is_distribution(&self, name: &str) -> bool {
+        matches!(self.base(name), Some(Sig::Distribution { .. }))
+    }
+
     /// Look up a standard-module binding.  Returns `(sig, degraded_note)` or
     /// `None` if the module or binding is not in the catalogue.
     pub(crate) fn module(&self, module: &str, binding: &str) -> Option<(&Sig, Option<&str>)> {
@@ -799,5 +805,25 @@ mod tests {
             .collect();
         assert!(pp.contains(&"CrystalBall"));
         assert!(cat.module_binding_names("no-such-module").is_none());
+    }
+
+    #[test]
+    fn base_is_distribution_classifies_builtins() {
+        let cat = builtin();
+        // "Normal" is a §08 distribution in the base catalogue.
+        assert!(
+            cat.base_is_distribution("Normal"),
+            "Normal must be a distribution"
+        );
+        // A base function (not a distribution) must be false.
+        assert!(
+            !cat.base_is_distribution("sqrt"),
+            "sqrt is a function, not a distribution"
+        );
+        // An unknown name is false (not present in base).
+        assert!(
+            !cat.base_is_distribution("NotARealBuiltin"),
+            "unknown name must be false"
+        );
     }
 }
