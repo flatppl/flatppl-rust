@@ -864,7 +864,8 @@ fn handle_completion(
         });
         let text = file.text(db);
         let ctx = completion_context(text, byte_offset);
-        let items = crate::capabilities::completion(db, file, fs, cats, ctx);
+        let lead_space = tight_after_operator(text, byte_offset);
+        let items = crate::capabilities::completion(db, file, fs, cats, ctx, lead_space);
         Some(lsp_types::CompletionResponse::Array(items))
     })();
 
@@ -948,6 +949,24 @@ pub(crate) fn completion_context(text: &str, byte: u32) -> CompletionContext {
         return CompletionContext::AfterTilde;
     }
     CompletionContext::Other
+}
+
+/// Whether the cursor sits *tight* against a `~` or `=` operator: the character
+/// immediately before the in-progress identifier — with **no** whitespace
+/// between — is `~` or `=`.
+///
+/// Unlike [`completion_context`], this does NOT skip whitespace: it is true only
+/// at `x ~|` / `mu =|`, not at `x ~ |`. The language server uses it to prepend a
+/// space to a completion's inserted text (`x ~` + `Normal` → `x ~ Normal`) only
+/// when the user has not already typed the space, so an existing space is never
+/// doubled.
+pub(crate) fn tight_after_operator(text: &str, byte: u32) -> bool {
+    let bytes = text.as_bytes();
+    let mut i = byte as usize;
+    while i > 0 && is_ident_byte(bytes[i - 1]) {
+        i -= 1;
+    }
+    i > 0 && (bytes[i - 1] == b'~' || bytes[i - 1] == b'=')
 }
 
 /// Return `true` for bytes that may appear in a FlatPPL identifier
@@ -1055,6 +1074,46 @@ mod tests {
             completion_context(text, text.len() as u32),
             CompletionContext::AfterTilde
         ));
+    }
+
+    // ── tight_after_operator ──────────────────────────────────────────────────
+    #[test]
+    fn tight_after_operator_immediately_after_tilde() {
+        // "x ~" — cursor at byte 3, right after `~`, no space yet.
+        assert!(tight_after_operator("x ~", 3));
+    }
+
+    #[test]
+    fn tight_after_operator_immediately_after_eq() {
+        // "mu =" — cursor at byte 4, right after `=`.
+        assert!(tight_after_operator("mu =", 4));
+    }
+
+    #[test]
+    fn tight_after_operator_tight_with_partial_ident() {
+        // "x ~Nor" — cursor at byte 6; ident "Nor" sits directly on `~`, no space.
+        assert!(tight_after_operator("x ~Nor", 6));
+    }
+
+    #[test]
+    fn tight_after_operator_false_when_space_present() {
+        // "x ~ " — a space already separates `~` from the cursor: not tight.
+        assert!(!tight_after_operator("x ~ ", 4));
+        // "x ~ Nor" — space before the ident: not tight.
+        assert!(!tight_after_operator("x ~ Nor", 7));
+    }
+
+    #[test]
+    fn tight_after_operator_false_for_non_operator() {
+        assert!(!tight_after_operator("x", 1));
+        assert!(!tight_after_operator("f(a,", 4)); // comma is not ~ or =
+    }
+
+    #[test]
+    fn tight_after_operator_false_at_start_of_buffer() {
+        // Nothing before the cursor: the `i > 0` guard must short-circuit, no panic.
+        assert!(!tight_after_operator("", 0));
+        assert!(!tight_after_operator("x", 0));
     }
 
     // ── position_to_byte ──────────────────────────────────────────────────────
