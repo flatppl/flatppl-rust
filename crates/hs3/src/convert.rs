@@ -179,6 +179,41 @@ fn declare_array_params(
 /// Step 1: declare free parameters — string-valued distribution fields (other
 /// than the variate) that name neither another distribution nor a function.
 /// Each becomes `name = elementof(<natural-domain set>)`.
+/// The set of observable variable names in the document: every distribution's
+/// variate plus every dataset axis name. Used to tell an observable apart from a
+/// free parameter when inferring the variable a generic expression is a function
+/// of — an observable can also appear in `parameter_points` (as its
+/// reference-point value), so `parameter_points` membership is not a reliable
+/// signal.
+fn observable_names(doc: &Document) -> BTreeSet<String> {
+    let mut obs: BTreeSet<String> = BTreeSet::new();
+    for d in &doc.distributions {
+        match variate_name(d) {
+            Some(VariateName::Single(v)) => {
+                obs.insert(v);
+            }
+            Some(VariateName::Multiple(ns)) => obs.extend(ns),
+            None => {}
+        }
+    }
+    for dt in &doc.data {
+        for ax in &dt.axes {
+            obs.insert(ax.name.clone());
+        }
+    }
+    obs
+}
+
+/// The single observable an HS3 generic `expression` is a function of: the first
+/// free identifier (in source order) that names an observable. `None` when the
+/// expression references no observable (a function of parameters only — e.g.
+/// `-tau`), which is emitted as a bare scalar binding rather than a lambda.
+fn generic_observable(expression: &str, observables: &BTreeSet<String>) -> Option<String> {
+    expr::free_identifiers(expression)
+        .into_iter()
+        .find(|id| observables.contains(id))
+}
+
 fn declare_free_params(
     m: &mut Module,
     doc: &Document,
@@ -371,17 +406,9 @@ fn declare_generic_expr_params(
 ) -> Result<()> {
     let bounds = domain_bounds(doc)?;
 
-    // Names that denote observables (a distribution's variate), never free params.
-    let mut observables: BTreeSet<String> = BTreeSet::new();
-    for d in &doc.distributions {
-        match variate_name(d) {
-            Some(VariateName::Single(v)) => {
-                observables.insert(v);
-            }
-            Some(VariateName::Multiple(ns)) => observables.extend(ns),
-            None => {}
-        }
-    }
+    // Names that denote observables (a distribution variate or a data axis),
+    // never free params — even if they also appear in parameter_points.
+    let observables = observable_names(doc);
 
     // Names declared in some parameter_points entry — the authoritative list of
     // real model parameters. An expression identifier not in here is either an
@@ -515,13 +542,14 @@ fn doc_uses_specfun(doc: &Document) -> bool {
 
 /// Step 1b: lower each `functions` block entry to a deterministic binding.
 fn emit_functions(m: &mut Module, doc: &Document) -> Result<()> {
+    let observables = observable_names(doc);
     let mut b = Builder::new(m);
     // Bind the special-functions standard module once if any expression uses erf/erfc.
     if doc_uses_specfun(doc) {
         crate::pyhf::bind_standard_module(&mut b, "specfun", "special-functions", "0.1");
     }
     for f in &doc.functions {
-        emit_function(&mut b, f)?;
+        emit_function(&mut b, f, &observables)?;
     }
     Ok(())
 }
@@ -531,6 +559,7 @@ fn emit_functions(m: &mut Module, doc: &Document) -> Result<()> {
 /// if any distribution needs it and no histfactory channel path will bind it.
 fn emit_distributions(m: &mut Module, doc: &Document) -> Result<()> {
     let domains = domain_bounds(doc)?;
+    let observables = observable_names(doc);
     {
         let mut b = Builder::new(m);
         let needs_hp = doc
@@ -628,9 +657,19 @@ fn emit_distributions(m: &mut Module, doc: &Document) -> Result<()> {
                 continue;
             }
             // Resolve the variate's declared domain (needed for uniform_dist and the
-            // generic kinds). For generic_dist / density_function_dist /
-            // log_density_function_dist the observable is the hardcoded bound variable
-            // "x", because variate_name() returns None (Variate::None) for those kinds.
+            // generic kinds). For generic_dist the observable is INFERRED from the
+            // inline expression (its first free identifier that names an observable),
+            // not hardcoded to "x". density_function_dist / log_density_function_dist
+            // reference a named function (whose own observable is bound at
+            // emit_function time); they keep the "x" fallback for the domain lookup.
+            let generic_obs: Option<String> = if d.kind == "generic_dist" {
+                d.extra
+                    .get("expression")
+                    .and_then(|v| v.as_str())
+                    .and_then(|e| generic_observable(e, &observables))
+            } else {
+                None
+            };
             let domain = match variate_name(d) {
                 Some(VariateName::Single(ref v)) => domains.get(v.as_str()).copied(),
                 None if matches!(
@@ -638,11 +677,11 @@ fn emit_distributions(m: &mut Module, doc: &Document) -> Result<()> {
                     "generic_dist" | "density_function_dist" | "log_density_function_dist"
                 ) =>
                 {
-                    domains.get("x").copied()
+                    domains.get(generic_obs.as_deref().unwrap_or("x")).copied()
                 }
                 _ => None,
             };
-            let dist = emit_distribution(&mut b, d, domain)?;
+            let dist = emit_distribution(&mut b, d, domain, generic_obs.as_deref())?;
             // A shared-variate product factor stays scalar (see above).
             let bound = if shared_product_factors.contains(d.name.as_str()) {
                 dist
@@ -905,7 +944,7 @@ fn find_histfactory_observed(doc: &Document, dist_name: &str) -> Option<Vec<f64>
 /// - `generic_function`: `name = <parsed expression>` (the expression may
 ///   reference other bindings via `self_ref`; it is *not* wrapped in a lambda
 ///   here — the expression is a deterministic scalar/function-valued formula).
-fn emit_function(b: &mut Builder, f: &Function) -> Result<()> {
+fn emit_function(b: &mut Builder, f: &Function, observables: &BTreeSet<String>) -> Result<()> {
     match f.kind.as_str() {
         "product" => fold_function(b, f, "factors", "mul", "HS3 product function → fold of mul")?,
         "sum" => fold_function(b, f, "summands", "add", "HS3 sum function → fold of add")?,
@@ -920,27 +959,27 @@ fn emit_function(b: &mut Builder, f: &Function) -> Result<()> {
                         f.name
                     ))
                 })?;
-            // Determine the observable variable name.  HS3 generic_function uses
-            // a `variables` (or `x`) field to name the input(s); we default to `"x"`.
-            let obs_name = f
+            // The observable this function is of: prefer an explicit `variables`/`x`
+            // field IF it's actually referenced, else infer it as the first free
+            // identifier that names an observable (a distribution variate or data
+            // axis). A function of parameters only (e.g. `-tau`, `sqrt(mean2)`) has
+            // no observable → emit a bare scalar binding; wrapping it in a lambda
+            // would make it a function-valued node where a real is expected.
+            let explicit = f
                 .extra
                 .get("variables")
                 .and_then(|v| v.as_array())
                 .and_then(|arr| arr.first())
                 .and_then(|v| v.as_str())
-                .or_else(|| f.extra.get("x").and_then(|v| v.as_str()))
-                .unwrap_or("x");
-            // Emit as a lambda only when the expression references the observable.
-            // If the expression is purely a function of parameters (e.g. `sqrt(mean2)`),
-            // emit a scalar binding instead — wrapping it in a lambda would make it a
-            // function-valued node where a real is expected.
-            let node = if expr::free_identifiers(expression)
-                .iter()
-                .any(|id| id == obs_name)
-            {
-                expr::parse_expr_as_fn(b, expression, obs_name)?
-            } else {
-                expr::parse_expr_inline(b, expression)?
+                .or_else(|| f.extra.get("x").and_then(|v| v.as_str()));
+            let free = expr::free_identifiers(expression);
+            let obs_name: Option<String> = match explicit {
+                Some(v) if free.iter().any(|id| id == v) => Some(v.to_string()),
+                _ => generic_observable(expression, observables),
+            };
+            let node = match &obs_name {
+                Some(obs) => expr::parse_expr_as_fn(b, expression, obs)?,
+                None => expr::parse_expr_inline(b, expression)?,
             };
             b.bind_doc(
                 &f.name,

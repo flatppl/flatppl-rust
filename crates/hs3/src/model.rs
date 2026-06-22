@@ -62,6 +62,12 @@ pub struct Datum {
     /// Binned observation bin contents (histfactory channel observed counts).
     #[serde(default)]
     pub contents: Option<Vec<f64>>,
+    /// Observable axes. Only each axis's `name` is read — it identifies an
+    /// observable variable (used to infer the observable of a generic_dist /
+    /// generic_function expression). `DomainAxis` parses `{name, min?, max?}`
+    /// and ignores any extra keys (e.g. `nbins`).
+    #[serde(default)]
+    pub axes: Vec<DomainAxis>,
 }
 
 #[derive(Debug, Deserialize)]

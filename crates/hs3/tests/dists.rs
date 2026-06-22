@@ -968,3 +968,71 @@ fn string_literal_coefficient_lowers_to_literal_not_param() {
     );
     flatppl_syntax::parse(&text).expect("re-parse");
 }
+
+// ---------------------------------------------------------------------------
+// M1: generic_dist / generic_function infer their observable from the document
+// (the free identifier naming a data axis or distribution variate), instead of
+// hardcoding "x". rf703's `eff` and rf210's angular generic_dist hit this.
+// ---------------------------------------------------------------------------
+const GENERIC_NONX_JSON: &str = r#"{
+  "distributions": [
+    {"name": "g", "type": "generic_dist", "expression": "1 + sin(2 * psi)"}
+  ],
+  "data": [
+    {"name": "d", "type": "unbinned", "axes": [{"name": "psi", "min": 0.0, "max": 3.0}], "entries": [[0.5]]}
+  ],
+  "domains": [
+    {"name": "default_domain", "type": "product_domain",
+     "axes": [{"name": "psi", "min": 0.0, "max": 3.0}]}
+  ]
+}"#;
+
+#[test]
+fn generic_dist_infers_non_x_observable() {
+    let m = flatppl_hs3::read_hs3(GENERIC_NONX_JSON).expect("read_hs3");
+    let text = flatppl_syntax::print_with(&m, flatppl_syntax::Syntax::Minimal);
+    eprintln!("=== generic_dist non-x observable ===\n{text}\n=== end ===");
+    // Observable inferred as `psi` (a data axis): functionof binds psi, and the
+    // truncation uses psi's declared domain — never the hardcoded "x".
+    assert!(
+        text.contains("functionof(") && text.contains("psi = _psi_"),
+        "generic_dist must bind the inferred observable psi, got:\n{text}"
+    );
+    assert!(
+        text.contains("interval(0.0, 3.0)"),
+        "must truncate over psi's declared domain, got:\n{text}"
+    );
+    assert!(
+        !text.contains("psi = elementof"),
+        "psi is the observable, not a free param, got:\n{text}"
+    );
+    flatppl_syntax::parse(&text).expect("re-parse");
+}
+
+const GENERIC_FN_OBS_JSON: &str = r#"{
+  "distributions": [
+    {"name": "m", "type": "gaussian_dist", "mean": "mu", "sigma": 1.0, "x": "t"}
+  ],
+  "functions": [
+    {"name": "eff", "type": "generic_function", "expression": "0.5 * t"}
+  ],
+  "parameter_points": [{"name": "n", "entries": [{"name": "mu", "value": 0.0}]}]
+}"#;
+
+#[test]
+fn generic_function_of_observable_is_a_lambda() {
+    let m = flatppl_hs3::read_hs3(GENERIC_FN_OBS_JSON).expect("read_hs3");
+    let text = flatppl_syntax::print_with(&m, flatppl_syntax::Syntax::Minimal);
+    eprintln!("=== generic_function of observable ===\n{text}\n=== end ===");
+    // `t` is the gaussian's variate (an observable), so eff is a function of t:
+    // emitted as functionof binding t, not a bare expr leaving t unbound.
+    assert!(
+        text.contains("eff = functionof(") && text.contains("t = _t_"),
+        "generic_function of an observable must be a lambda over it, got:\n{text}"
+    );
+    assert!(
+        !text.contains("t = elementof"),
+        "t is the observable, not a free param, got:\n{text}"
+    );
+    flatppl_syntax::parse(&text).expect("re-parse");
+}

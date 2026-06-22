@@ -73,10 +73,15 @@ fn field_or(b: &mut Builder, d: &Distribution, key: &str, default: f64) -> Resul
 /// `domains` block for this distribution's variate, when one is declared. It is
 /// required for `uniform_dist` (whose support has no other source) and ignored
 /// by all other kinds.
+///
+/// `generic_obs` is the observable variable a `generic_dist`'s inline expression
+/// is a function of (inferred by the caller from the document). When `None`, the
+/// `generic_dist` lowering falls back to the conventional `"x"`.
 pub fn emit_distribution(
     b: &mut Builder,
     d: &Distribution,
     domain: Option<(f64, f64)>,
+    generic_obs: Option<&str>,
 ) -> Result<NodeId> {
     match d.kind.as_str() {
         "gaussian_dist" | "normal_dist" => {
@@ -303,7 +308,8 @@ pub fn emit_distribution(
                 .get("expression")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| Error::Unsupported("generic_dist missing `expression` field".into()))?;
-            let weight_fn = expr::parse_expr_as_fn(b, expression, "x")?;
+            let obs = generic_obs.unwrap_or("x");
+            let weight_fn = expr::parse_expr_as_fn(b, expression, obs)?;
             let lebesgue = build_lebesgue_reals(b);
             let weighted = b.call("weighted", &[weight_fn, lebesgue]);
             let measure = match domain {
@@ -947,7 +953,7 @@ mod tests {
         let mut m = flatppl_core::Module::new();
         let node = {
             let mut b = Builder::new(&mut m);
-            emit_distribution(&mut b, &d, None).unwrap()
+            emit_distribution(&mut b, &d, None, None).unwrap()
         };
         {
             let mut b = Builder::new(&mut m);
@@ -973,7 +979,7 @@ mod tests {
         let mut m = flatppl_core::Module::new();
         let node = {
             let mut b = Builder::new(&mut m);
-            emit_distribution(&mut b, &d, None).unwrap()
+            emit_distribution(&mut b, &d, None, None).unwrap()
         };
         {
             let mut b = Builder::new(&mut m);
@@ -995,7 +1001,7 @@ mod tests {
         let mut m = flatppl_core::Module::new();
         let node = {
             let mut b = Builder::new(&mut m);
-            emit_distribution(&mut b, &d, None).unwrap()
+            emit_distribution(&mut b, &d, None, None).unwrap()
         };
         {
             let mut b = Builder::new(&mut m);
@@ -1019,7 +1025,7 @@ mod tests {
         let mut m = flatppl_core::Module::new();
         let node = {
             let mut b = Builder::new(&mut m);
-            emit_distribution(&mut b, &d, None).unwrap()
+            emit_distribution(&mut b, &d, None, None).unwrap()
         };
         {
             let mut b = Builder::new(&mut m);
@@ -1050,7 +1056,7 @@ mod tests {
         let mut m = flatppl_core::Module::new();
         let node = {
             let mut b = Builder::new(&mut m);
-            emit_distribution(&mut b, &d, None).unwrap()
+            emit_distribution(&mut b, &d, None, None).unwrap()
         };
         {
             let mut b = Builder::new(&mut m);
@@ -1070,7 +1076,7 @@ mod tests {
         let mut m = flatppl_core::Module::new();
         let node = {
             let mut b = Builder::new(&mut m);
-            emit_distribution(&mut b, &d, Some((0.0, 10.0))).unwrap()
+            emit_distribution(&mut b, &d, Some((0.0, 10.0)), None).unwrap()
         };
         {
             let mut b = Builder::new(&mut m);
@@ -1092,7 +1098,7 @@ mod tests {
         let d = dist("uniform_dist", &[("x", serde_json::json!("x_obs"))]);
         let mut m = flatppl_core::Module::new();
         let mut b = Builder::new(&mut m);
-        let result = emit_distribution(&mut b, &d, None);
+        let result = emit_distribution(&mut b, &d, None, None);
         assert!(
             matches!(result, Err(Error::Unsupported(_))),
             "got: {result:?}"
@@ -1104,7 +1110,7 @@ mod tests {
         let d = dist("no_such_dist", &[]);
         let mut m = flatppl_core::Module::new();
         let mut b = Builder::new(&mut m);
-        let result = emit_distribution(&mut b, &d, None);
+        let result = emit_distribution(&mut b, &d, None, None);
         assert!(matches!(result, Err(Error::UnknownDistType(_))));
     }
 
@@ -1113,7 +1119,7 @@ mod tests {
         let d = dist("histfactory_dist", &[]);
         let mut m = flatppl_core::Module::new();
         let mut b = Builder::new(&mut m);
-        let result = emit_distribution(&mut b, &d, None);
+        let result = emit_distribution(&mut b, &d, None, None);
         assert!(matches!(result, Err(Error::Unsupported(_))));
     }
 
@@ -1177,7 +1183,7 @@ mod tests {
         let mut m = flatppl_core::Module::new();
         let node = {
             let mut b = Builder::new(&mut m);
-            emit_distribution(&mut b, &d, None).unwrap()
+            emit_distribution(&mut b, &d, None, None).unwrap()
         };
         {
             let mut b = Builder::new(&mut m);
@@ -1211,7 +1217,7 @@ mod tests {
         let mut m = flatppl_core::Module::new();
         let node = {
             let mut b = Builder::new(&mut m);
-            emit_distribution(&mut b, &d, Some((-20.0, 20.0))).unwrap()
+            emit_distribution(&mut b, &d, Some((-20.0, 20.0)), None).unwrap()
         };
         {
             let mut b = Builder::new(&mut m);
@@ -1242,7 +1248,7 @@ mod tests {
         let mut m = flatppl_core::Module::new();
         let node = {
             let mut b = Builder::new(&mut m);
-            emit_distribution(&mut b, &d, None).unwrap()
+            emit_distribution(&mut b, &d, None, None).unwrap()
         };
         {
             let mut b = Builder::new(&mut m);
@@ -1267,7 +1273,7 @@ mod tests {
         let mut m = flatppl_core::Module::new();
         let node = {
             let mut b = Builder::new(&mut m);
-            emit_distribution(&mut b, &d, Some((-5.0, 5.0))).unwrap()
+            emit_distribution(&mut b, &d, Some((-5.0, 5.0)), None).unwrap()
         };
         {
             let mut b = Builder::new(&mut m);
@@ -1296,7 +1302,7 @@ mod tests {
         let mut m = flatppl_core::Module::new();
         let node = {
             let mut b = Builder::new(&mut m);
-            emit_distribution(&mut b, &d, Some((0.0, 10.0))).unwrap()
+            emit_distribution(&mut b, &d, Some((0.0, 10.0)), None).unwrap()
         };
         {
             let mut b = Builder::new(&mut m);
