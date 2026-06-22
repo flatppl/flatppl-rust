@@ -454,7 +454,13 @@ pub fn server_capabilities() -> ServerCapabilities {
         inlay_hint_provider: Some(OneOf::Left(true)),
         definition_provider: Some(OneOf::Left(true)),
         completion_provider: Some(CompletionOptions {
-            trigger_characters: Some(vec![".".to_string()]),
+            trigger_characters: Some(vec![
+                ".".to_string(),
+                "~".to_string(),
+                "=".to_string(),
+                "(".to_string(),
+                ",".to_string(),
+            ]),
             ..Default::default()
         }),
         ..Default::default()
@@ -1153,8 +1159,17 @@ mod tests {
         let comp_opts = caps.completion_provider.as_ref().unwrap();
         assert_eq!(
             comp_opts.trigger_characters.as_deref(),
-            Some([".".to_string()].as_slice()),
-            "completion trigger character must be '.'"
+            Some(
+                [
+                    ".".to_string(),
+                    "~".to_string(),
+                    "=".to_string(),
+                    "(".to_string(),
+                    ",".to_string(),
+                ]
+                .as_slice()
+            ),
+            "completion trigger characters must be '.', '~', '=', '(', ','"
         );
     }
 
