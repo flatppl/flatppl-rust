@@ -1,18 +1,19 @@
 //! The salsa database for the FlatPPL language server.
 //!
-//! salsa 0.18 (the "salsa-2022" rewrite). Inputs are declared with
+//! salsa 0.26 (the "salsa-2022" rewrite). Inputs are declared with
 //! `#[salsa::input]` on a struct; the database is a struct holding a
 //! `salsa::Storage<Self>` and carrying `#[salsa::db]` plus an impl of
-//! `salsa::Database`. The `salsa::Database` trait requires one method,
-//! `salsa_event` (an event hook; a no-op default is fine here). Inputs are
-//! constructed with `Field::new(&db, field0, field1, ...)` in declaration
-//! order, and fields are read with `field(&db)`. A `#[return_ref]` field
-//! returns a borrow (`&String`) instead of a clone.
+//! `salsa::Database`. As of salsa 0.26 `salsa::Database` has no required
+//! methods (the event hook moved to `Storage::new`), so the impl is empty.
+//! Inputs are constructed with `Field::new(&db, field0, field1, ...)` in
+//! declaration order, and fields are read with `field(&db)`. A `#[returns(ref)]`
+//! field returns a borrow (`&String`) instead of a clone, and `#[salsa::input(debug)]`
+//! opts the generated id into `Debug` (no longer derived by default).
 
-#[salsa::input]
+#[salsa::input(debug)]
 pub struct SourceFile {
     pub path: String,
-    #[return_ref]
+    #[returns(ref)]
     pub text: String,
 }
 
@@ -25,7 +26,7 @@ pub struct SourceFile {
 /// editing a dependency's text input invalidates the importer's analysis.
 #[salsa::input]
 pub struct FileSet {
-    #[return_ref]
+    #[returns(ref)]
     pub files: Vec<SourceFile>,
 }
 
@@ -40,7 +41,7 @@ pub struct FileSet {
 /// diagnostic on the analyzed file (offset 0) rather than a panic.
 #[salsa::input]
 pub struct Catalogues {
-    #[return_ref]
+    #[returns(ref)]
     pub sources: Vec<String>,
 }
 
@@ -51,9 +52,7 @@ pub struct Database {
 }
 
 #[salsa::db]
-impl salsa::Database for Database {
-    fn salsa_event(&self, _event: &dyn Fn() -> salsa::Event) {}
-}
+impl salsa::Database for Database {}
 
 #[cfg(test)]
 mod tests {
