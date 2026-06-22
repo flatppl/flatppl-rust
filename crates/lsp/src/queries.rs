@@ -195,7 +195,7 @@ pub static LINE_INDEX_RUNS: std::sync::atomic::AtomicUsize = std::sync::atomic::
 
 // ── Salsa field-compatibility wrapper ───────────────────────────────────────
 //
-// salsa 0.18 tracked-struct fields (even `#[return_ref]` ones) must satisfy
+// salsa tracked-struct fields (even `#[returns(ref)]` ones) must satisfy
 // `Hash + Update` (the latter is either the `salsa::Update` trait or the
 // fallback `'static + PartialEq`).  `Module` derives only `Clone + Debug +
 // Default`; it has neither `Hash` nor `PartialEq`.
@@ -332,9 +332,9 @@ unsafe impl salsa::Update for ImportBundle {
 /// Callers access the module via [`Parsed::module`] which returns `Option<&Module>`.
 #[salsa::tracked]
 pub struct Parsed<'db> {
-    #[return_ref]
+    #[returns(ref)]
     module_arc: Option<ArcModule>,
-    #[return_ref]
+    #[returns(ref)]
     pub diagnostics: Vec<LspDiag>,
 }
 
@@ -567,9 +567,9 @@ thread_local! {
 /// Access the inferred module via [`Analyzed::module`].
 #[salsa::tracked]
 pub struct Analyzed<'db> {
-    #[return_ref]
+    #[returns(ref)]
     module_arc: Option<ArcModule>,
-    #[return_ref]
+    #[returns(ref)]
     pub diagnostics: Vec<LspDiag>,
 }
 
