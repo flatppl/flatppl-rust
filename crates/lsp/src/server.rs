@@ -454,7 +454,13 @@ pub fn server_capabilities() -> ServerCapabilities {
         inlay_hint_provider: Some(OneOf::Left(true)),
         definition_provider: Some(OneOf::Left(true)),
         completion_provider: Some(CompletionOptions {
-            trigger_characters: Some(vec![".".to_string()]),
+            trigger_characters: Some(vec![
+                ".".to_string(),
+                "~".to_string(),
+                "=".to_string(),
+                "(".to_string(),
+                ",".to_string(),
+            ]),
             ..Default::default()
         }),
         ..Default::default()
@@ -857,8 +863,8 @@ fn handle_completion(
             character: lsp_pos.character,
         });
         let text = file.text(db);
-        let prefix = member_prefix_at(text, byte_offset);
-        let items = crate::capabilities::completion(db, file, fs, cats, byte_offset, prefix);
+        let ctx = completion_context(text, byte_offset);
+        let items = crate::capabilities::completion(db, file, fs, cats, ctx);
         Some(lsp_types::CompletionResponse::Array(items))
     })();
 
@@ -910,6 +916,40 @@ pub(crate) fn member_prefix_at(text: &str, byte: u32) -> Option<String> {
     Some(ident.to_string())
 }
 
+/// Cursor context for a completion request, derived textually (no parse, since
+/// completion fires on often-unparseable mid-edit text).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CompletionContext {
+    /// Immediately after `alias.` — member completion (unchanged behavior).
+    Member(String),
+    /// The nearest significant char left of the in-progress identifier is `~`,
+    /// i.e. the cursor is in a tilde-binding RHS (a measure expression, §05).
+    AfterTilde,
+    /// Anything else: `=` RHS, call args, line start, fallback. Full set.
+    Other,
+}
+
+/// Classify the completion context at `byte` in `text`.
+pub(crate) fn completion_context(text: &str, byte: u32) -> CompletionContext {
+    if let Some(alias) = member_prefix_at(text, byte) {
+        return CompletionContext::Member(alias);
+    }
+    let bytes = text.as_bytes();
+    let mut i = byte as usize;
+    // Skip the in-progress identifier directly left of the cursor.
+    while i > 0 && is_ident_byte(bytes[i - 1]) {
+        i -= 1;
+    }
+    // Skip whitespace and newlines back to the nearest significant char.
+    while i > 0 && matches!(bytes[i - 1], b' ' | b'\t' | b'\r' | b'\n') {
+        i -= 1;
+    }
+    if i > 0 && bytes[i - 1] == b'~' {
+        return CompletionContext::AfterTilde;
+    }
+    CompletionContext::Other
+}
+
 /// Return `true` for bytes that may appear in a FlatPPL identifier
 /// (`[A-Za-z0-9_]`).
 #[inline]
@@ -959,6 +999,62 @@ mod tests {
             member_prefix_at("a = mymod.", 10),
             Some("mymod".to_string()),
         );
+    }
+
+    // ── completion_context ────────────────────────────────────────────────────
+    #[test]
+    fn completion_context_after_dot_is_member() {
+        // "a = mymod." — cursor at byte 10.
+        assert!(matches!(
+            completion_context("a = mymod.", 10),
+            CompletionContext::Member(ref s) if s == "mymod"
+        ));
+    }
+
+    #[test]
+    fn completion_context_after_tilde_empty() {
+        // "x ~ " — cursor at byte 4, right after "~ ".
+        assert!(matches!(
+            completion_context("x ~ ", 4),
+            CompletionContext::AfterTilde
+        ));
+    }
+
+    #[test]
+    fn completion_context_after_tilde_partial_ident() {
+        // "x ~ Nor" — cursor at byte 7, mid-distribution-name.
+        assert!(matches!(
+            completion_context("x ~ Nor", 7),
+            CompletionContext::AfterTilde
+        ));
+    }
+
+    #[test]
+    fn completion_context_after_eq_is_other() {
+        // "x = " — cursor at byte 4. v1 keeps `=` as Other (full set).
+        assert!(matches!(
+            completion_context("x = ", 4),
+            CompletionContext::Other
+        ));
+    }
+
+    #[test]
+    fn completion_context_line_start_is_other() {
+        // "x" — cursor at byte 1, typing a binding name.
+        assert!(matches!(
+            completion_context("x", 1),
+            CompletionContext::Other
+        ));
+    }
+
+    #[test]
+    fn completion_context_tilde_across_newline() {
+        // multi-line: "obs ~\n  Nor" — cursor at byte 10, ident "Nor" after newline+indent.
+        let text = "obs ~\n  Nor";
+        assert!(matches!(
+            completion_context(text, text.len() as u32),
+            CompletionContext::AfterTilde
+        ));
     }
 
     // ── position_to_byte ──────────────────────────────────────────────────────
@@ -1061,8 +1157,17 @@ mod tests {
         let comp_opts = caps.completion_provider.as_ref().unwrap();
         assert_eq!(
             comp_opts.trigger_characters.as_deref(),
-            Some([".".to_string()].as_slice()),
-            "completion trigger character must be '.'"
+            Some(
+                [
+                    ".".to_string(),
+                    "~".to_string(),
+                    "=".to_string(),
+                    "(".to_string(),
+                    ",".to_string(),
+                ]
+                .as_slice()
+            ),
+            "completion trigger characters must be '.', '~', '=', '(', ','"
         );
     }
 
