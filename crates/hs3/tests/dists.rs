@@ -201,12 +201,12 @@ fn crystalball_double_sided_converts() {
         !text.contains("hepphys.CrystalBall("),
         "must not emit single-sided CB, got:\n{text}"
     );
-    // Exact body: the seven double-sided parameters in HS3 order
-    // (m0, sigma_L, sigma_R, alpha_L, n_L, alpha_R, n_R), relabeled onto m_obs2.
+    // Exact body: the seven double-sided parameters in the spec §09 alternating order
+    // (m0, sigma_L, sigma_R, alpha_L, alpha_R, n_L, n_R), relabeled onto m_obs2.
     assert!(
         text.contains(
             "dscb_dist = relabel(hepphys.DoubleSidedCrystalBall(dscb_m0, dscb_sigL, dscb_sigR, \
-             dscb_aL, dscb_nL, dscb_aR, dscb_nR), [\"m_obs2\"])"
+             dscb_aL, dscb_aR, dscb_nL, dscb_nR), [\"m_obs2\"])"
         ),
         "double-sided CrystalBall body mismatch, got:\n{text}"
     );

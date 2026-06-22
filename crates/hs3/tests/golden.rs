@@ -185,7 +185,7 @@ fn golden_crystalball_single_and_double() {
         "crystalball_double",
         r#"{"distributions":[{"name":"dcb","type":"crystalball_dist","m0":"m0","sigma_L":"sl","sigma_R":"sr","alpha_L":"al","n_L":"nl","alpha_R":"ar","n_R":"nr","m":"mo"}],
             "parameter_points":[{"name":"p","entries":[{"name":"m0","value":125.0},{"name":"sl","value":1.5},{"name":"sr","value":2.0},{"name":"al","value":1.2},{"name":"nl","value":5.0},{"name":"ar","value":1.8},{"name":"nr","value":4.0}]}]}"#,
-        r#"dcb = relabel(hepphys.DoubleSidedCrystalBall(m0, sl, sr, al, nl, ar, nr), ["mo"])"#,
+        r#"dcb = relabel(hepphys.DoubleSidedCrystalBall(m0, sl, sr, al, ar, nl, nr), ["mo"])"#,
     );
 }
 

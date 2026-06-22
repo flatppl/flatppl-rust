@@ -170,7 +170,7 @@ pub fn emit_distribution(
                 let n_l = field_or(b, d, "n_L", 1.0)?;
                 let alpha_r = field_or(b, d, "alpha_R", 1.0)?;
                 let n_r = field_or(b, d, "n_R", 1.0)?;
-                Ok(b.module_user_call("hepphys", "DoubleSidedCrystalBall", &[m0, sigma_l, sigma_r, alpha_l, n_l, alpha_r, n_r]))
+                Ok(b.module_user_call("hepphys", "DoubleSidedCrystalBall", &[m0, sigma_l, sigma_r, alpha_l, alpha_r, n_l, n_r]))
             } else {
                 let m0 = field_or(b, d, "m0", 0.0)?;
                 let sigma = field_or(b, d, "sigma", 1.0)?;
