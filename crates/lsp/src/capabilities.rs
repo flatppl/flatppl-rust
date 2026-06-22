@@ -402,6 +402,12 @@ pub fn inlay_hints(
 /// built-in base names, external catalogue base names, and in-scope binding
 /// names.
 ///
+/// When `lead_space` is true the cursor sits tight against a `~`/`=` operator
+/// (no space typed yet); every returned item's `insert_text` gains a leading
+/// space so accepting one yields `x ~ Normal` rather than `x ~Normal`. The
+/// display `label` stays clean. Member completion never sees this (it returns
+/// before the leading-space pass).
+///
 /// All items are deduplicated by label.
 pub(crate) fn completion(
     db: &dyn salsa::Database,
@@ -409,6 +415,7 @@ pub(crate) fn completion(
     fs: FileSet,
     cats: Catalogues,
     ctx: crate::server::CompletionContext,
+    lead_space: bool,
 ) -> Vec<lsp_types::CompletionItem> {
     use lsp_types::{CompletionItem, CompletionItemKind};
 
@@ -511,6 +518,21 @@ pub(crate) fn completion(
                     .any(|c| c.base_is_distribution(&it.label));
             let bucket = if is_dist { '0' } else { '1' };
             it.sort_text = Some(format!("{bucket}_{}", it.label));
+        }
+    }
+
+    // Tight against a `~`/`=` operator: prepend a space to the inserted text so
+    // accepting an item produces `x ~ Normal` (the idiomatic spacing) without
+    // the user typing the space. The `label` is left clean for display and
+    // filtering. Skipped once a space already separates operator and cursor, so
+    // an existing space is never doubled.
+    //
+    // `filter_text` is intentionally left unset: clients default it to `label`
+    // (LSP §3.3.1), so typed-prefix matching uses the clean label, not the
+    // space-prefixed `insert_text`.
+    if lead_space {
+        for it in &mut items {
+            it.insert_text = Some(format!(" {}", it.label));
         }
     }
 
@@ -1083,7 +1105,7 @@ mod tests {
         let fs = FileSet::new(&db, vec![file]);
         let cats = Catalogues::new(&db, Vec::<String>::new());
 
-        let items = completion(&db, file, fs, cats, CompletionContext::AfterTilde);
+        let items = completion(&db, file, fs, cats, CompletionContext::AfterTilde, false);
 
         let normal = items
             .iter()
@@ -1118,13 +1140,68 @@ mod tests {
         let fs = FileSet::new(&db, vec![file]);
         let cats = Catalogues::new(&db, Vec::<String>::new());
 
-        let items = completion(&db, file, fs, cats, CompletionContext::Other);
+        let items = completion(&db, file, fs, cats, CompletionContext::Other, false);
         // Full set still present; no AfterTilde bias applied.
         assert!(items.iter().any(|i| i.label == "Normal"));
         assert!(
             items.iter().all(|i| i.sort_text.is_none()),
             "Other context sets no sort_text"
         );
+        // lead_space == false: inserted text is untouched (no leading space).
+        assert!(
+            items.iter().all(|i| i.insert_text.is_none()),
+            "lead_space=false must leave insert_text unset"
+        );
+    }
+
+    #[test]
+    fn lead_space_prepends_space_to_insert_text_without_touching_label() {
+        use crate::db::{Catalogues, Database, FileSet, SourceFile};
+        use crate::server::CompletionContext;
+        let db = Database::default();
+        // "mu =" — cursor tight against `=`, value position (Other).
+        let file = SourceFile::new(&db, "m.flatppl".to_string(), "mu =".to_string());
+        let fs = FileSet::new(&db, vec![file]);
+        let cats = Catalogues::new(&db, Vec::<String>::new());
+
+        let items = completion(&db, file, fs, cats, CompletionContext::Other, true);
+        let normal = items
+            .iter()
+            .find(|i| i.label == "Normal")
+            .expect("Normal present");
+        // Display label stays clean; only the inserted text gains the space.
+        assert_eq!(normal.label, "Normal");
+        assert_eq!(
+            normal.insert_text.as_deref(),
+            Some(" Normal"),
+            "tight lead_space must prepend a single leading space to insert_text"
+        );
+        assert!(
+            items
+                .iter()
+                .all(|i| i.insert_text.as_deref() == Some(&format!(" {}", i.label))),
+            "every item must carry a leading-space insert_text when lead_space=true"
+        );
+    }
+
+    #[test]
+    fn after_tilde_with_lead_space_keeps_sort_and_adds_space() {
+        use crate::db::{Catalogues, Database, FileSet, SourceFile};
+        use crate::server::CompletionContext;
+        let db = Database::default();
+        // "x ~" — tight against `~`, distribution position.
+        let file = SourceFile::new(&db, "m.flatppl".to_string(), "x ~".to_string());
+        let fs = FileSet::new(&db, vec![file]);
+        let cats = Catalogues::new(&db, Vec::<String>::new());
+
+        let items = completion(&db, file, fs, cats, CompletionContext::AfterTilde, true);
+        let normal = items
+            .iter()
+            .find(|i| i.label == "Normal")
+            .expect("Normal present");
+        // Distribution bias and leading-space insert coexist.
+        assert_eq!(normal.sort_text.as_deref(), Some("0_Normal"));
+        assert_eq!(normal.insert_text.as_deref(), Some(" Normal"));
     }
 
     #[test]
@@ -1137,7 +1214,14 @@ mod tests {
         let src = "alpha = 1\nbeta = 2";
         let f = SourceFile::new(&db, "m.flatppl".to_string(), src.to_string());
         let fs = FileSet::new(&db, vec![f]);
-        let items = completion(&db, f, fs, cats, crate::server::CompletionContext::Other);
+        let items = completion(
+            &db,
+            f,
+            fs,
+            cats,
+            crate::server::CompletionContext::Other,
+            false,
+        );
         let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
         // Built-in base distribution must be present.
         assert!(
@@ -1170,6 +1254,7 @@ mod tests {
             fs,
             cats,
             crate::server::CompletionContext::Member("e".to_string()),
+            false,
         );
         assert!(
             items.iter().any(|i| i.label == "MyDist"),
@@ -1205,6 +1290,7 @@ mod tests {
             fs1,
             cats1,
             crate::server::CompletionContext::Other,
+            false,
         );
         let items2 = completion(
             &db2,
@@ -1212,6 +1298,7 @@ mod tests {
             fs2,
             cats2,
             crate::server::CompletionContext::Other,
+            false,
         );
         let items3 = completion(
             &db1,
@@ -1219,6 +1306,7 @@ mod tests {
             fs1,
             cats1,
             crate::server::CompletionContext::Other,
+            false,
         );
 
         // The static portion must have been built exactly once across all calls.
