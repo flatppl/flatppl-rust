@@ -405,16 +405,12 @@ pub fn inlay_hints(
 /// - All in-scope binding names from the analyzed module with kind `VARIABLE`.
 ///
 /// Items are deduplicated by label.
-pub fn completion(
+pub(crate) fn completion(
     db: &dyn salsa::Database,
     file: SourceFile,
     fs: FileSet,
     cats: Catalogues,
-    // Cursor byte offset. The server already resolves `member_prefix` from it
-    // before calling, so the body does not read it; kept in the signature for
-    // future prefix-aware filtering (narrowing items by the typed text).
-    _byte_offset: u32,
-    member_prefix: Option<String>,
+    ctx: crate::server::CompletionContext,
 ) -> Vec<lsp_types::CompletionItem> {
     use lsp_types::{CompletionItem, CompletionItemKind};
 
@@ -423,7 +419,7 @@ pub fn completion(
     // server already emits diagnostics for them via `analyze`).
     let external_cats = parsed_catalogues(db, cats);
 
-    if let Some(alias) = member_prefix {
+    if let crate::server::CompletionContext::Member(alias) = ctx {
         let builtin = flatppl_infer::builtin_catalogue();
         // Member completion: find the alias binding, read its standard_module name,
         // list that module's bindings from built-in + external catalogues.
@@ -500,6 +496,23 @@ pub fn completion(
                     ..Default::default()
                 });
             }
+        }
+    }
+
+    // AfterTilde: float distributions to the top via sortText buckets, hiding
+    // nothing. Distributions (catalogue Sig::Distribution, built-in or external)
+    // get bucket "0_", everything else "1_". `Other` leaves sortText unset so
+    // the client uses its default ordering.
+    if matches!(ctx, crate::server::CompletionContext::AfterTilde) {
+        let builtin = flatppl_infer::builtin_catalogue();
+        for it in &mut items {
+            let is_dist = builtin.base_is_distribution(&it.label)
+                || external_cats
+                    .as_slice()
+                    .iter()
+                    .any(|c| c.base_is_distribution(&it.label));
+            let bucket = if is_dist { '0' } else { '1' };
+            it.sort_text = Some(format!("{bucket}_{}", it.label));
         }
     }
 
@@ -1064,6 +1077,59 @@ mod tests {
     // ── completion() capability tests ────────────────────────────────────────
 
     #[test]
+    fn after_tilde_sorts_distributions_first_without_hiding() {
+        use crate::db::{Catalogues, Database, FileSet, SourceFile};
+        use crate::server::CompletionContext;
+        let db = Database::default();
+        let file = SourceFile::new(&db, "m.flatppl".to_string(), "x ~ ".to_string());
+        let fs = FileSet::new(&db, vec![file]);
+        let cats = Catalogues::new(&db, Vec::<String>::new());
+
+        let items = completion(&db, file, fs, cats, CompletionContext::AfterTilde);
+
+        let normal = items
+            .iter()
+            .find(|i| i.label == "Normal")
+            .expect("Normal present");
+        let kw = items
+            .iter()
+            .find(|i| i.label == "self")
+            .expect("keyword present");
+        let n_sort = normal
+            .sort_text
+            .as_deref()
+            .expect("distribution has sort_text");
+        let kw_sort = kw.sort_text.as_deref().expect("keyword has sort_text");
+        assert!(
+            n_sort < kw_sort,
+            "distribution must sort before keyword: {n_sort} !< {kw_sort}"
+        );
+        // Nothing hidden: the keyword is still in the list.
+        assert!(
+            items.iter().any(|i| i.label == "self"),
+            "keyword must still be present"
+        );
+    }
+
+    #[test]
+    fn other_context_leaves_default_order() {
+        use crate::db::{Catalogues, Database, FileSet, SourceFile};
+        use crate::server::CompletionContext;
+        let db = Database::default();
+        let file = SourceFile::new(&db, "m.flatppl".to_string(), "x = ".to_string());
+        let fs = FileSet::new(&db, vec![file]);
+        let cats = Catalogues::new(&db, Vec::<String>::new());
+
+        let items = completion(&db, file, fs, cats, CompletionContext::Other);
+        // Full set still present; no AfterTilde bias applied.
+        assert!(items.iter().any(|i| i.label == "Normal"));
+        assert!(
+            items.iter().all(|i| i.sort_text.is_none()),
+            "Other context sets no sort_text"
+        );
+    }
+
+    #[test]
     fn completion_includes_keywords_builtins_and_scope() {
         let _guard = COMPLETION_TEST_LOCK
             .lock()
@@ -1073,7 +1139,7 @@ mod tests {
         let src = "alpha = 1\nbeta = 2";
         let f = SourceFile::new(&db, "m.flatppl".to_string(), src.to_string());
         let fs = FileSet::new(&db, vec![f]);
-        let items = completion(&db, f, fs, cats, src.len() as u32, None);
+        let items = completion(&db, f, fs, cats, crate::server::CompletionContext::Other);
         let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
         // Built-in base distribution must be present.
         assert!(
@@ -1100,7 +1166,13 @@ mod tests {
         let src = "e = standard_module(\"myext\",\"0.1\")\nx = e.";
         let f = SourceFile::new(&db, "m.flatppl".to_string(), src.to_string());
         let fs = FileSet::new(&db, vec![f]);
-        let items = completion(&db, f, fs, cats, src.len() as u32, Some("e".to_string()));
+        let items = completion(
+            &db,
+            f,
+            fs,
+            cats,
+            crate::server::CompletionContext::Member("e".to_string()),
+        );
         assert!(
             items.iter().any(|i| i.label == "MyDist"),
             "member completion must list 'MyDist' from the external module; got: {:?}",
@@ -1129,9 +1201,27 @@ mod tests {
         let f2 = SourceFile::new(&db2, "b.flatppl".to_string(), "beta = 2".to_string());
         let fs2 = FileSet::new(&db2, vec![f2]);
 
-        let items1 = completion(&db1, f1, fs1, cats1, 0, None);
-        let items2 = completion(&db2, f2, fs2, cats2, 0, None);
-        let items3 = completion(&db1, f1, fs1, cats1, 0, None);
+        let items1 = completion(
+            &db1,
+            f1,
+            fs1,
+            cats1,
+            crate::server::CompletionContext::Other,
+        );
+        let items2 = completion(
+            &db2,
+            f2,
+            fs2,
+            cats2,
+            crate::server::CompletionContext::Other,
+        );
+        let items3 = completion(
+            &db1,
+            f1,
+            fs1,
+            cats1,
+            crate::server::CompletionContext::Other,
+        );
 
         // The static portion must have been built exactly once across all calls.
         let builds = STATIC_COMPLETION_BUILDS.load(Relaxed);

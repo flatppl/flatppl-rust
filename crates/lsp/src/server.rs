@@ -863,8 +863,8 @@ fn handle_completion(
             character: lsp_pos.character,
         });
         let text = file.text(db);
-        let prefix = member_prefix_at(text, byte_offset);
-        let items = crate::capabilities::completion(db, file, fs, cats, byte_offset, prefix);
+        let ctx = completion_context(text, byte_offset);
+        let items = crate::capabilities::completion(db, file, fs, cats, ctx);
         Some(lsp_types::CompletionResponse::Array(items))
     })();
 
@@ -919,7 +919,6 @@ pub(crate) fn member_prefix_at(text: &str, byte: u32) -> Option<String> {
 /// Cursor context for a completion request, derived textually (no parse, since
 /// completion fires on often-unparseable mid-edit text).
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) enum CompletionContext {
     /// Immediately after `alias.` — member completion (unchanged behavior).
     Member(String),
@@ -931,7 +930,6 @@ pub(crate) enum CompletionContext {
 }
 
 /// Classify the completion context at `byte` in `text`.
-#[allow(dead_code)]
 pub(crate) fn completion_context(text: &str, byte: u32) -> CompletionContext {
     if let Some(alias) = member_prefix_at(text, byte) {
         return CompletionContext::Member(alias);
