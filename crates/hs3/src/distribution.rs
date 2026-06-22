@@ -42,7 +42,14 @@ pub(crate) fn field_node(b: &mut Builder, v: &serde_json::Value) -> Result<NodeI
         serde_json::Value::Number(n) => n.as_f64().map(|x| b.lit_real(x)).ok_or_else(|| {
             Error::Unsupported(format!("numeric field not representable as f64: {n}"))
         }),
-        serde_json::Value::String(s) => Ok(b.self_ref(s)),
+        // A numeric literal written as a string (e.g. "1.0" — common in HS3/RooFit
+        // where coefficient/parameter values are stringified) lowers to a real
+        // literal; any other string is a reference to another binding (a
+        // parameter, function, or distribution).
+        serde_json::Value::String(s) => match s.parse::<f64>() {
+            Ok(x) => Ok(b.lit_real(x)),
+            Err(_) => Ok(b.self_ref(s)),
+        },
         other => Err(Error::Unsupported(format!(
             "expected a numeric or string field value, got: {other}"
         ))),
@@ -89,14 +96,15 @@ pub fn emit_distribution(
             }
             Ok(b.call_kw("Poisson", &kws))
         }
-        // §12: HS³ `c` is the negated FlatPPL `rate` (RooFit: c = −rate), so the
-        // density is rate·exp(−rate·x) with rate = −c. Emit `rate = neg(c)`.
+        // §08/§12: HS³ `exponential_dist` density is exp(−c·x), so the HS³ `c` is
+        // a positive decay rate. FlatPPL `Exponential(rate)` is rate·exp(−rate·x),
+        // so the rate maps directly: rate = c, no negation. (RooFit's internal
+        // RooExponential slope is −rate, but HS³ stores the already-inverted,
+        // positive c — e.g. fixtures bind c to a `-tau` function.)
         "exponential_dist" => {
             let mut kws: Vec<(&str, NodeId)> = Vec::new();
             if let Some(v) = d.extra.get("c") {
-                let c_node = field_node(b, v)?;
-                let rate = b.call("neg", &[c_node]);
-                kws.push(("rate", rate));
+                kws.push(("rate", field_node(b, v)?));
             }
             Ok(b.call_kw("Exponential", &kws))
         }
@@ -356,6 +364,31 @@ pub fn emit_distribution(
             Ok(b.call("normalize", &[measure]))
         }
 
+        // §12: efficiency_product_pdf_dist (RooEffProd) → weighted(self_ref(<eff>), self_ref(<pdf>))
+        // The efficiency function reweights the pdf measure pointwise. No own
+        // variate (the inner pdf carries it); the product is integrable over the
+        // pdf's support, so observable-range normalization is applied downstream
+        // (range-normalized by the consumer), like a raw distribution.
+        "efficiency_product_pdf_dist" => {
+            let eff_name = d
+                .extra
+                .get("eff")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    Error::Unsupported("efficiency_product_pdf_dist missing `eff` field".into())
+                })?;
+            let pdf_name = d
+                .extra
+                .get("pdf")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    Error::Unsupported("efficiency_product_pdf_dist missing `pdf` field".into())
+                })?;
+            let eff_ref = b.self_ref(eff_name);
+            let pdf_ref = b.self_ref(pdf_name);
+            Ok(b.call("weighted", &[eff_ref, pdf_ref]))
+        }
+
         // §08: rate_extended_dist → PoissonProcess(weighted(<rate>, self_ref(<distribution>)))
         // No own variate — the inner distribution carries it.
         "rate_extended_dist" => {
@@ -430,9 +463,22 @@ pub fn emit_distribution(
             Ok(b.call("BinnedPoissonProcess", &[bins, weighted]))
         }
 
-        // §08: polynomial_dist → normalize(weighted(functionof(polynomial([c...], _x_), x = _x_), Lebesgue(reals)))
+        // §08/§12: polynomial_dist (RooPolynomial) → normalize(truncate(weighted(
+        //   functionof(polynomial([c...], _x_), x = _x_), Lebesgue(reals)), interval(lo, hi)))
+        // RooFit normalizes the polynomial over the observable's DECLARED range, so
+        // (exactly like chebychev_dist) the weighted measure must be truncated to
+        // interval(lo, hi) before normalize — over all of ℝ the integral of a
+        // degree≥1 polynomial diverges and the normalizer is infinite.
         // Variate is the `x` field.
         "polynomial_dist" => {
+            let (lo, hi) = domain.ok_or_else(|| {
+                Error::Unsupported(format!(
+                    "polynomial_dist `{}` has no declared domain for its variate; \
+                     a `domains` entry giving (min, max) is required (RooPolynomial \
+                     normalizes over the observable's range)",
+                    d.name
+                ))
+            })?;
             let coeff_arr = d
                 .extra
                 .get("coefficients")
@@ -454,7 +500,11 @@ pub fn emit_distribution(
             let weight_fn = build_polynomial_fn(b, coeff_vec, obs_name);
             let lebesgue = build_lebesgue_reals(b);
             let weighted = b.call("weighted", &[weight_fn, lebesgue]);
-            Ok(b.call("normalize", &[weighted]))
+            let lo_node = b.lit_real(lo);
+            let hi_node = b.lit_real(hi);
+            let interval = b.call("interval", &[lo_node, hi_node]);
+            let truncated = b.call("truncate", &[weighted, interval]);
+            Ok(b.call("normalize", &[truncated]))
         }
 
         // §08: barlow_beeston_lite_poisson_constraint_dist →
@@ -528,13 +578,14 @@ pub fn emit_distribution(
                 ns: RefNs::Local,
                 name: ph_sym,
             }));
-            // t = div(sub(mul(2.0, _x_), lo+hi), hi-lo)
+            // t = divide(sub(mul(2.0, _x_), lo+hi), hi-lo)  — real division.
+            // (NOT `div`, which is integer floor division and would quantize t.)
             let two = b.lit_real(2.0);
             let lo_plus_hi = b.lit_real(lo + hi);
             let hi_minus_lo = b.lit_real(hi - lo);
             let two_x = b.call("mul", &[two, x_ref]);
             let numerator = b.call("sub", &[two_x, lo_plus_hi]);
-            let t = b.call("div", &[numerator, hi_minus_lo]);
+            let t = b.call("divide", &[numerator, hi_minus_lo]);
             // Build the Chebyshev series: 1 + fold of add(acc, mul(coeff_k, poly.chebyshev(k, t)))
             let mut weight = b.lit_real(1.0);
             for (idx, coeff_val) in coeff_arr.iter().enumerate() {
@@ -978,8 +1029,12 @@ mod tests {
         assert!(text.contains("Exponential"), "got: {text}");
         assert!(text.contains("rate"), "got: {text}");
         assert!(text.contains("c_param"), "got: {text}");
-        // §12: HS³ `c` is the negated FlatPPL rate, so the rate is `neg(c)`.
-        assert!(text.contains("neg"), "rate should be neg(c), got: {text}");
+        // §08/§12: HS³ `c` IS the FlatPPL rate (density exp(−c·x)), so rate = c
+        // directly — never negated.
+        assert!(
+            text.contains("rate = c_param") && !text.contains("neg"),
+            "rate should be the bare c, not neg(c), got: {text}"
+        );
     }
 
     #[test]

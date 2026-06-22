@@ -752,6 +752,10 @@ const POLYNOMIAL_JSON: &str = r#"{
       "x": "p_obs"
     }
   ],
+  "domains": [
+    {"name": "default_domain", "type": "product_domain",
+     "axes": [{"name": "p_obs", "min": -5.0, "max": 5.0}]}
+  ],
   "parameter_points": [
     {"name": "nominal", "entries": [
       {"name": "c1", "value": 0.3}
@@ -770,8 +774,8 @@ fn polynomial_dist_converts() {
     // against Lebesgue(reals), and relabeled onto the observed variate p_obs.
     assert!(
         text.contains(
-            "poly_d = relabel(normalize(weighted(functionof(polynomial([1.0, c1, 0.5], _p_obs_), \
-             p_obs = _p_obs_), Lebesgue(reals))), [\"p_obs\"])"
+            "poly_d = relabel(normalize(truncate(weighted(functionof(polynomial([1.0, c1, 0.5], _p_obs_), \
+             p_obs = _p_obs_), Lebesgue(reals)), interval(-5.0, 5.0))), [\"p_obs\"])"
         ),
         "polynomial_dist body mismatch, got:\n{text}"
     );
@@ -883,6 +887,84 @@ fn chebychev_converts() {
     assert!(
         text.contains("c0") && text.contains("c1"),
         "missing coeffs: {text}"
+    );
+    flatppl_syntax::parse(&text).expect("re-parse");
+}
+
+// ---------------------------------------------------------------------------
+// efficiency_product_pdf_dist → weighted(<eff>, <pdf>)  (RooEffProd)
+// No own variate; the inner pdf carries it. Range-normalization is applied by
+// the consumer (the harness assemble step), so the converter emits the raw
+// pointwise reweighting — no premature normalize/truncate.
+// ---------------------------------------------------------------------------
+const EFFPROD_JSON: &str = r#"{
+  "distributions": [
+    {"name": "m", "type": "exponential_dist", "c": "lam", "x": "t"},
+    {"name": "me", "type": "efficiency_product_pdf_dist", "eff": "effn", "pdf": "m"}
+  ],
+  "functions": [
+    {"name": "effn", "type": "generic_function", "expression": "0.5 * t"}
+  ],
+  "domains": [
+    {"name": "default_domain", "type": "product_domain",
+     "axes": [{"name": "t", "min": 0.0, "max": 5.0}]}
+  ],
+  "parameter_points": [
+    {"name": "n", "entries": [{"name": "lam", "value": 1.5}]}
+  ]
+}"#;
+
+#[test]
+fn efficiency_product_pdf_converts() {
+    let m = flatppl_hs3::read_hs3(EFFPROD_JSON).expect("read_hs3");
+    let text = flatppl_syntax::print_with(&m, flatppl_syntax::Syntax::Minimal);
+    eprintln!("=== efficiency_product_pdf ===\n{text}\n=== end ===");
+    // The effprod binding is the bare reweighting of the pdf measure by the
+    // efficiency function — no own relabel (Variate::None), no premature
+    // normalize/truncate (the consumer range-normalizes).
+    assert!(
+        text.contains("me = weighted(effn, m)"),
+        "efficiency_product_pdf body mismatch, got:\n{text}"
+    );
+    // The wrapped exponential pdf still carries its own variate via relabel,
+    // with the corrected rate = c (no negation).
+    assert!(
+        text.contains(r#"m = relabel(Exponential(rate = lam), ["t"])"#),
+        "wrapped exponential pdf missing or rate mis-emitted, got:\n{text}"
+    );
+    flatppl_syntax::parse(&text).expect("re-parse");
+}
+
+// ---------------------------------------------------------------------------
+// Regression: a coefficient written as a STRING numeric literal ("1.0") is a
+// constant, not a free parameter. It must lower to a literal inside the
+// polynomial and emit NO `1.0 = elementof(...)` binding — that statement is
+// invalid FlatPPL and fails the print→reparse self-check. rf203_ranges hits
+// this (its polynomial coefficients are ["1.0", "a"]).
+// ---------------------------------------------------------------------------
+const STRING_LITERAL_COEFF_JSON: &str = r#"{
+  "distributions": [
+    {"name": "px", "type": "polynomial_dist", "coefficients": ["1.0", "a"], "x": "x"}
+  ],
+  "domains": [
+    {"name": "default_domain", "type": "product_domain",
+     "axes": [{"name": "x", "min": -10.0, "max": 10.0}]}
+  ],
+  "parameter_points": [{"name": "n", "entries": [{"name": "a", "value": 0.1}]}]
+}"#;
+
+#[test]
+fn string_literal_coefficient_lowers_to_literal_not_param() {
+    // read_hs3 runs the print→reparse self-check, so an invalid `1.0 = elementof`
+    // binding would make this `.expect` fail.
+    let m = flatppl_hs3::read_hs3(STRING_LITERAL_COEFF_JSON).expect("read_hs3");
+    let text = flatppl_syntax::print_with(&m, flatppl_syntax::Syntax::Minimal);
+    // The "1.0" string coefficient becomes a literal inside the polynomial array.
+    assert!(text.contains("polynomial([1.0, a]"), "got:\n{text}");
+    // And is NOT declared as a free parameter binding.
+    assert!(
+        !text.contains("1.0 = elementof"),
+        "numeric-literal coefficient must not become a param binding, got:\n{text}"
     );
     flatppl_syntax::parse(&text).expect("re-parse");
 }

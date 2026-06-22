@@ -159,6 +159,13 @@ fn declare_array_params(
 ) {
     for elem in arr {
         if let Some(name) = elem.as_str() {
+            // A numeric literal written as a string (e.g. "1.0") is a constant
+            // coefficient, not a parameter name — `field_node` lowers it to a
+            // literal, so it must NOT be declared as a free `elementof` binding
+            // (which would emit an invalid `1.0 = elementof(...)` statement).
+            if name.parse::<f64>().is_ok() {
+                continue;
+            }
             if dist_names.contains(name) || fn_names.contains(name) || declared.contains(name) {
                 continue;
             }
@@ -265,7 +272,9 @@ fn declare_free_params(
                         continue;
                     }
                 }
-                if d.kind == "polynomial_dist" {
+                // polynomial_dist and chebychev_dist both carry a `coefficients`
+                // array of (possibly symbolic) weights and an `x` variate field.
+                if matches!(d.kind.as_str(), "polynomial_dist" | "chebychev_dist") {
                     if field == "coefficients" {
                         // Walk coefficient array for symbolic names.
                         if let Some(arr) = v.as_array() {

@@ -44,27 +44,27 @@ fn golden_gaussian() {
 }
 
 // ---------------------------------------------------------------------------
-// exponential_dist → Exponential(rate = neg(c))
+// exponential_dist → Exponential(rate = c)
 //
-// HS3 parameterizes by the *decay constant* c in exp(c·x); FlatPPL's
-// Exponential takes a positive `rate` λ for exp(-λ·x). The corrected lowering
-// therefore emits rate = neg(c) (Stream B fix). This test guards that the rate
-// is negated and never the bare parameter.
+// HS3's exponential_dist density is exp(−c·x), so the HS3 `c` is a positive
+// decay rate; FlatPPL's Exponential(rate) is rate·exp(−rate·x). The rate maps
+// directly: rate = c, no negation. (RooFit's internal RooExponential slope is
+// −rate, but HS3 stores the already-inverted, positive c.)
 // ---------------------------------------------------------------------------
 #[test]
-fn golden_exponential_rate_is_negated() {
+fn golden_exponential_rate_is_c() {
     let json = r#"{"distributions":[{"name":"e","type":"exponential_dist","c":"lam","x":"ex"}],
         "parameter_points":[{"name":"n","entries":[{"name":"lam","value":2.0}]}]}"#;
     let m = flatppl_hs3::read_hs3(json).expect("read_hs3");
     let text = print_with(&m, Syntax::Minimal);
     assert!(
-        text.contains(r#"e = relabel(Exponential(rate = neg(lam)), ["ex"])"#),
-        "exponential rate must be neg(c), got:\n{text}"
+        text.contains(r#"e = relabel(Exponential(rate = lam), ["ex"])"#),
+        "exponential rate must be the bare HS3 c, got:\n{text}"
     );
-    // Must NOT emit the un-negated parameter as the rate.
+    // Must NOT negate the parameter (the old, incorrect lowering).
     assert!(
-        !text.contains("rate = lam"),
-        "exponential rate must be negated, not the bare param, got:\n{text}"
+        !text.contains("neg(lam)"),
+        "exponential rate must not be negated, got:\n{text}"
     );
     assert!(parse(&text).is_ok(), "round-trip parse failed:\n{text}");
 }
@@ -223,9 +223,10 @@ fn golden_polynomial() {
     assert_golden(
         "polynomial",
         r#"{"distributions":[{"name":"poly","type":"polynomial_dist","coefficients":[1.0,"c1",0.5],"x":"po"}],
+            "domains":[{"name":"default_domain","type":"product_domain","axes":[{"name":"po","min":-5.0,"max":5.0}]}],
             "parameter_points":[{"name":"n","entries":[{"name":"c1","value":0.3}]}]}"#,
-        "poly = relabel(normalize(weighted(functionof(polynomial([1.0, c1, 0.5], _po_), \
-         po = _po_), Lebesgue(reals))), [\"po\"])",
+        "poly = relabel(normalize(truncate(weighted(functionof(polynomial([1.0, c1, 0.5], _po_), \
+         po = _po_), Lebesgue(reals)), interval(-5.0, 5.0))), [\"po\"])",
     );
 }
 

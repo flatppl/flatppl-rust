@@ -199,6 +199,13 @@ static SPECS: &[DistSpec] = &[
         known_fields: &["function"],
     },
     DistSpec {
+        kind: "efficiency_product_pdf_dist",
+        variate: Variate::None,
+        needs_hepphys: false,
+        doc_line: Some("HS3 efficiency_product_pdf_dist → weighted(<eff>, <pdf>)"),
+        known_fields: &["eff", "pdf"],
+    },
+    DistSpec {
         kind: "rate_extended_dist",
         variate: Variate::None,
         needs_hepphys: false,
