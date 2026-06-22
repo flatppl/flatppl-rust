@@ -385,26 +385,24 @@ pub fn inlay_hints(
 
 /// Return completion items for the given position in `file`.
 ///
-/// `byte_offset` is the cursor position (UTF-8 byte offset); `member_prefix` is
-/// `Some(alias)` when the cursor is immediately after `alias.` (member
-/// completion) or `None` for general completion.
+/// `ctx: crate::server::CompletionContext` determines the completion mode:
 ///
-/// **Member completion** (`member_prefix = Some(alias)`): finds the binding
-/// named `alias` in the analyzed module, reads its `standard_module` call's
-/// module name, then lists all matching binding names from the built-in
-/// catalogue and any external catalogues. Returns only those items (kind
-/// `FUNCTION`).
+/// **`Member(alias)`**: Finds the binding named `alias` in the analyzed module,
+/// reads its `standard_module` call's module name, then lists all matching
+/// binding names from the built-in catalogue and any external catalogues.
+/// Returns only those items (kind `FUNCTION`).
 ///
-/// **General completion** (`member_prefix = None`): returns
-/// - Language keywords (`self`, `base`, `in`, `all`, `only`, `true`, `false`)
-///   with kind `KEYWORD`.
-/// - All built-in base names (distributions and functions from the built-in
-///   catalogue) with kind `FUNCTION`.
-/// - All external catalogue base names (from the `cats` sources) with kind
-///   `FUNCTION`.
-/// - All in-scope binding names from the analyzed module with kind `VARIABLE`.
+/// **`AfterTilde`**: Returns the full general set (keywords, built-in base
+/// names, external catalogue base names, in-scope bindings), with `sort_text`
+/// buckets that float catalogue distributions to the top (`"0_<label>"` for
+/// distributions, `"1_<label>"` for others). Nothing is hidden.
 ///
-/// Items are deduplicated by label.
+/// **`Other`**: Returns the full general set without setting `sort_text`, so
+/// the client uses its default ordering. The set includes language keywords,
+/// built-in base names, external catalogue base names, and in-scope binding
+/// names.
+///
+/// All items are deduplicated by label.
 pub(crate) fn completion(
     db: &dyn salsa::Database,
     file: SourceFile,
