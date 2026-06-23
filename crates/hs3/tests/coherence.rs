@@ -33,6 +33,7 @@ const RECOGNIZED_DIST_KINDS: &[&str] = &[
     "multivariate_normal_dist",
     "crystalball_dist",
     "argus_dist",
+    "landau_dist",
     "mixture_dist",
     "generic_dist",
     "density_function_dist",

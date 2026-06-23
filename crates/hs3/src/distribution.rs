@@ -242,6 +242,11 @@ pub fn emit_distribution(
             let power = field_or(b, d, "power", 0.5, cond)?;
             Ok(b.module_user_call("hepphys", "Argus", &[resonance, slope, power]))
         }
+        "landau_dist" => {
+            let mean = field_or(b, d, "mean", 0.0, cond)?;
+            let sigma = field_or(b, d, "sigma", 1.0, cond)?;
+            Ok(b.module_user_call("hepphys", "Landau", &[mean, sigma]))
+        }
         // §12: mixture_dist maps to normalize(superpose(weighted(c1, s1), weighted(c2, s2), ...))
         // Summand names are self-refs (other distributions in the document).
         // If extended==true there are N coefficients for N summands; if extended==false (or absent)
@@ -915,6 +920,7 @@ pub fn reference_measure(kind: &str) -> RefMeasure {
         | "generalized_normal_dist"
         | "crystalball_dist"
         | "argus_dist"
+        | "landau_dist"
         | "multivariate_normal_dist"
         | "generic_dist"
         | "density_function_dist"

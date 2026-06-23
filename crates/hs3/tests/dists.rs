@@ -267,6 +267,53 @@ fn argus_converts() {
 }
 
 // ---------------------------------------------------------------------------
+// landau_dist → hepphys.Landau(mean, sigma)
+// ---------------------------------------------------------------------------
+
+const LANDAU_JSON: &str = r#"{
+  "distributions": [
+    {
+      "name": "lx",
+      "type": "landau_dist",
+      "mean":  "ml",
+      "sigma": "sl",
+      "x":     "t_obs"
+    }
+  ],
+  "parameter_points": [
+    {"name": "nominal", "entries": [
+      {"name": "ml", "value": 0.0},
+      {"name": "sl", "value": 1.0}
+    ]}
+  ]
+}"#;
+
+#[test]
+fn landau_converts() {
+    let m = flatppl_hs3::read_hs3(LANDAU_JSON).expect("read_hs3 must succeed");
+    let text = print_with(&m, Syntax::Minimal);
+    eprintln!("=== Landau ===\n{text}\n=== end ===");
+
+    // Exact body: positional args (mean, sigma) in HS3 order, relabeled onto the
+    // observed variate.
+    assert!(
+        text.contains("lx = hepphys.Landau(ml, sl)"),
+        "Landau body mismatch, got:\n{text}"
+    );
+    assert!(
+        text.contains("hepphys = standard_module(\"particle-physics\", \"0.1\")"),
+        "missing hepphys standard_module import, got:\n{text}"
+    );
+
+    let parsed = parse(&text);
+    assert!(
+        parsed.is_ok(),
+        "round-trip parse failed: {:?}\n\nEmitted:\n{text}",
+        parsed.err()
+    );
+}
+
+// ---------------------------------------------------------------------------
 // mixture_dist (extended=true) → normalize(superpose(weighted(c1, s1), weighted(c2, s2)))
 // extended=true: N coefficients for N summands, all used directly.
 // ---------------------------------------------------------------------------
