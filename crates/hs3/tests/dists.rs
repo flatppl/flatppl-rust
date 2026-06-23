@@ -1097,3 +1097,35 @@ fn conditional_dist_without_observable_record_fails_loud() {
         "expected a record-region error, got: {msg}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// rf309 round-trip idempotency: print(parse(out)) == print(parse(print(parse(out))))
+// This verifies the printer emits canonical FlatPPL: feeding the output back
+// through parse+print a second time produces exactly the same bytes. A
+// non-idempotent printer would expose itself here even if the first parse
+// succeeds (the existing rf309 golden only asserts re-parse, not idempotency).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn rf309_conditional_roundtrips_through_parser() {
+    let hs3 = r#"{
+      "distributions": [{"name":"model","type":"gaussian_dist","x":"x","sigma":"sigma","mean":"fy"}],
+      "functions": [{"name":"fy","type":"generic_function","expression":"a0-a1*sqrt(10*abs(y))"}],
+      "domains": [{"name":"d","type":"product_domain","axes":[
+        {"name":"x","min":-5.0,"max":5.0},{"name":"y","min":-5.0,"max":5.0}]}],
+      "data": [{"name":"modelData","type":"unbinned","axes":[{"name":"x"},{"name":"y"}],"entries":[[0.0,0.0]]}]
+    }"#;
+    let m = flatppl_hs3::read_hs3(hs3).expect("convert");
+    let out = print_with(&m, Syntax::Minimal);
+    // First pass: parse the converter output, re-print canonically.
+    let parsed1 = parse(&out).expect("emitted FlatPPL must parse (first pass)");
+    let reprinted1 = print_with(&parsed1, Syntax::Minimal);
+    // Second pass: parse the reprinted output, re-print again.
+    let parsed2 = parse(&reprinted1).expect("reprinted FlatPPL must parse (second pass)");
+    let reprinted2 = print_with(&parsed2, Syntax::Minimal);
+    // Idempotency: both reprintings must be byte-identical.
+    assert_eq!(
+        reprinted1, reprinted2,
+        "printer is not idempotent: second pass differs from first pass"
+    );
+}
