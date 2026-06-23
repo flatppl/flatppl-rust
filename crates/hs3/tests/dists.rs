@@ -1034,3 +1034,47 @@ fn generic_function_of_observable_is_a_lambda() {
     );
     flatppl_syntax::parse(&text).expect("re-parse");
 }
+
+// ---------------------------------------------------------------------------
+// rf309: a conditional gaussian whose `mean` names a generic_function of a
+// DISTINCT co-observed axis (y) lowers to a joint-normalized density over the
+// observable record (x, y) — not the invalid bare-function mean `Normal(mu = fy)`.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn rf309_conditional_gaussian_lowers_to_joint_normalized_density() {
+    let hs3 = r#"{
+      "distributions": [{"name":"model","type":"gaussian_dist","x":"x","sigma":"sigma","mean":"fy"}],
+      "functions": [{"name":"fy","type":"generic_function","expression":"a0-a1*sqrt(10*abs(y))"}],
+      "domains": [{"name":"d","type":"product_domain","axes":[
+        {"name":"x","min":-5.0,"max":5.0},{"name":"y","min":-5.0,"max":5.0}]}],
+      "data": [{"name":"modelData","type":"unbinned","axes":[{"name":"x"},{"name":"y"}],"entries":[[0.0,0.0]]}]
+    }"#;
+    let m = flatppl_hs3::read_hs3(hs3).expect("convert");
+    let out = flatppl_syntax::print_with(&m, flatppl_syntax::Syntax::Minimal);
+    eprintln!("=== rf309 conditional gaussian ===\n{out}\n=== end ===");
+    assert!(out.contains("normalize("), "got:\n{out}");
+    assert!(out.contains("logweighted("), "got:\n{out}");
+    // Minimal syntax rewrites the lambda's bound vars to placeholders (`_x_`,
+    // `_y_`): the functional mean is `fy(_y_)` (func applied to its axis), the
+    // scored point is `_x_`. The full inner call pins the mu→fy(y) binding, the
+    // sigma kwarg, and the observable being scored — a swapped or dropped piece
+    // would not match.
+    assert!(
+        out.contains("logdensityof(Normal(mu = fy(_y_), sigma = sigma), _x_)"),
+        "got:\n{out}"
+    );
+    // The joint Lebesgue support is the record's cartesian product, with x's
+    // declared [-5, 5] interval leading.
+    assert!(
+        out.contains("Lebesgue(support = cartprod(x = interval(-5.0, 5.0)"),
+        "got:\n{out}"
+    );
+    // Must NOT emit the invalid bare-function mean `Normal(mu = fy, …)` — a
+    // generic_function is not a real value, so a bare `mu = fy` is ill-typed.
+    assert!(
+        !out.contains("Normal(mu = fy,"),
+        "must not emit the invalid bare-fn mean:\n{out}"
+    );
+    flatppl_syntax::parse(&out).expect("re-parse");
+}

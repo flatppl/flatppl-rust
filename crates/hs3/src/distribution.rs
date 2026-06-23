@@ -38,13 +38,9 @@ fn array2d_of_values(b: &mut Builder, arr: &[serde_json::Value]) -> Result<NodeI
 /// `field_node_ctx` emits `func(axis)` (a `CallHead::User` call) rather than a
 /// bare `self_ref`. Without this context the behaviour is identical to
 /// `field_node`.
-// `axes` is not yet consumed within this crate; Task 3 (emit_conditional) will use it.
-#[allow(dead_code)]
 pub struct CondCtx<'a> {
     /// Maps a `generic_function` name → its observable axis name.
     pub funcs: &'a std::collections::BTreeMap<&'a str, &'a str>,
-    /// The set of dataset observable axis names.
-    pub axes: &'a std::collections::BTreeSet<&'a str>,
 }
 
 /// Resolve a parameter value. With a conditional context, a value that names a
@@ -975,8 +971,6 @@ pub fn needs_hepphys(kind: &str) -> bool {
 ///
 /// `obs` is this distribution's own observable; `record_axes` is every observable
 /// in the record with its `(lo, hi)` interval, in axis order.
-// Unused until Task 4 wires the dispatch caller; the allow is removed there.
-#[allow(dead_code)]
 pub fn emit_conditional(
     b: &mut Builder,
     d: &Distribution,
@@ -1415,16 +1409,12 @@ mod tests {
 
     #[test]
     fn conditional_gaussian_mean_emits_func_applied_to_axis() {
-        use std::collections::{BTreeMap, BTreeSet};
+        use std::collections::BTreeMap;
         let mut m = flatppl_core::Module::new();
         let text = {
             let mut b = Builder::new(&mut m);
             let funcs: BTreeMap<&str, &str> = [("fy", "y")].into_iter().collect();
-            let axes: BTreeSet<&str> = ["x", "y"].into_iter().collect();
-            let ctx = CondCtx {
-                funcs: &funcs,
-                axes: &axes,
-            };
+            let ctx = CondCtx { funcs: &funcs };
             let d = dist(
                 "gaussian_dist",
                 &[
@@ -1442,16 +1432,12 @@ mod tests {
 
     #[test]
     fn emit_conditional_builds_joint_normalized_density() {
-        use std::collections::{BTreeMap, BTreeSet};
+        use std::collections::BTreeMap;
         let mut m = flatppl_core::Module::new();
         let text = {
             let mut b = Builder::new(&mut m);
             let funcs: BTreeMap<&str, &str> = [("fy", "y")].into_iter().collect();
-            let axes: BTreeSet<&str> = ["x", "y"].into_iter().collect();
-            let ctx = CondCtx {
-                funcs: &funcs,
-                axes: &axes,
-            };
+            let ctx = CondCtx { funcs: &funcs };
             let d = dist(
                 "gaussian_dist",
                 &[
