@@ -723,6 +723,18 @@ fn emit_distributions(m: &mut Module, doc: &Document) -> Result<()> {
             if let (Some(obs), Some(_)) = (own_obs.as_deref(), cond_axis) {
                 let ctx = crate::distribution::CondCtx { funcs: &funcs_axis };
                 let record = ordered_record_axes(doc, obs, &domains);
+                // The joint normalization region needs the observable record with
+                // bounds. An empty record (no dataset provides `obs`, or no axis has a
+                // declared domain) would emit a degenerate `cartprod()` — fail loud
+                // instead of emitting unscoreable FlatPPL.
+                if record.is_empty() {
+                    return Err(Error::Unsupported(format!(
+                        "conditional distribution `{}` is a function of another observable, \
+                         but no dataset/domain provides the observable record for `{obs}` — \
+                         cannot build the joint normalization region",
+                        d.name
+                    )));
+                }
                 let node = crate::distribution::emit_conditional(&mut b, d, obs, &record, &ctx)?;
                 b.bind_doc(
                     &d.name,

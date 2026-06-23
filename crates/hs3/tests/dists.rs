@@ -1078,3 +1078,22 @@ fn rf309_conditional_gaussian_lowers_to_joint_normalized_density() {
     );
     flatppl_syntax::parse(&out).expect("re-parse");
 }
+
+// A conditional dist whose observable record has no declared bounds cannot be
+// joint-normalized; the converter must fail loud, not emit a degenerate
+// `cartprod()`. Here `y` is a co-observed data axis (so the conditional path
+// fires) but no `domains` block supplies bounds, so the record is empty.
+#[test]
+fn conditional_dist_without_observable_record_fails_loud() {
+    let hs3 = r#"{
+      "distributions": [{"name":"model","type":"gaussian_dist","x":"x","sigma":"sigma","mean":"fy"}],
+      "functions": [{"name":"fy","type":"generic_function","expression":"a0-a1*sqrt(10*abs(y))"}],
+      "data": [{"name":"modelData","type":"unbinned","axes":[{"name":"x"},{"name":"y"}],"entries":[[0.0,0.0]]}]
+    }"#;
+    let err = flatppl_hs3::read_hs3(hs3).expect_err("must fail without an observable record");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("observable record"),
+        "expected a record-region error, got: {msg}"
+    );
+}
