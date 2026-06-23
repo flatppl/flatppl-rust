@@ -1123,6 +1123,16 @@ fn rf309_conditional_roundtrips_through_parser() {
     // Second pass: parse the reprinted output, re-print again.
     let parsed2 = parse(&reprinted1).expect("reprinted FlatPPL must parse (second pass)");
     let reprinted2 = print_with(&parsed2, Syntax::Minimal);
+    // The conditional-density structure must SURVIVE the parse→print round-trip
+    // (not just be stable): a regression that dropped the construct could still
+    // be idempotent on its own output, so assert the canonical form still carries
+    // it. (Note: `out` itself is not asserted equal to `reprinted1` — the printer
+    // is only idempotent *after* the first print, e.g. the converter's `-5.0`
+    // literal canonicalizes to `neg(5.0)` on reparse; both parse to the same AST.)
+    assert!(
+        reprinted1.contains("normalize(logweighted(functionof("),
+        "round-trip dropped the conditional-density structure:\n{reprinted1}"
+    );
     // Idempotency: both reprintings must be byte-identical.
     assert_eq!(
         reprinted1, reprinted2,
