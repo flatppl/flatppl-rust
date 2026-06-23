@@ -97,9 +97,15 @@ pub(crate) fn field_node(b: &mut Builder, v: &serde_json::Value) -> Result<NodeI
 /// `default` when the field is absent. Propagates the [`field_node`] error for a
 /// present-but-unlowerable value (object/array/null/bool) rather than masking it
 /// with the default.
-fn field_or(b: &mut Builder, d: &Distribution, key: &str, default: f64) -> Result<NodeId> {
+fn field_or(
+    b: &mut Builder,
+    d: &Distribution,
+    key: &str,
+    default: f64,
+    cond: Option<&CondCtx>,
+) -> Result<NodeId> {
     match d.extra.get(key) {
-        Some(v) => field_node(b, v),
+        Some(v) => field_node_ctx(b, v, cond),
         None => Ok(b.lit_real(default)),
     }
 }
@@ -135,7 +141,7 @@ pub fn emit_distribution(
         "poisson_dist" => {
             let mut kws: Vec<(&str, NodeId)> = Vec::new();
             if let Some(v) = d.extra.get("mean") {
-                kws.push(("rate", field_node(b, v)?));
+                kws.push(("rate", field_node_ctx(b, v, cond)?));
             }
             Ok(b.call_kw("Poisson", &kws))
         }
@@ -147,17 +153,17 @@ pub fn emit_distribution(
         "exponential_dist" => {
             let mut kws: Vec<(&str, NodeId)> = Vec::new();
             if let Some(v) = d.extra.get("c") {
-                kws.push(("rate", field_node(b, v)?));
+                kws.push(("rate", field_node_ctx(b, v, cond)?));
             }
             Ok(b.call_kw("Exponential", &kws))
         }
         "lognormal_dist" => {
             let mut kws: Vec<(&str, NodeId)> = Vec::new();
             if let Some(v) = d.extra.get("mu") {
-                kws.push(("mu", field_node(b, v)?));
+                kws.push(("mu", field_node_ctx(b, v, cond)?));
             }
             if let Some(v) = d.extra.get("sigma") {
-                kws.push(("sigma", field_node(b, v)?));
+                kws.push(("sigma", field_node_ctx(b, v, cond)?));
             }
             Ok(b.call_kw("LogNormal", &kws))
         }
@@ -187,13 +193,13 @@ pub fn emit_distribution(
         "generalized_normal_dist" => {
             let mut kws: Vec<(&str, NodeId)> = Vec::new();
             if let Some(v) = d.extra.get("mean") {
-                kws.push(("mean", field_node(b, v)?));
+                kws.push(("mean", field_node_ctx(b, v, cond)?));
             }
             if let Some(v) = d.extra.get("alpha") {
-                kws.push(("alpha", field_node(b, v)?));
+                kws.push(("alpha", field_node_ctx(b, v, cond)?));
             }
             if let Some(v) = d.extra.get("beta") {
-                kws.push(("beta", field_node(b, v)?));
+                kws.push(("beta", field_node_ctx(b, v, cond)?));
             }
             Ok(b.call_kw("GeneralizedNormal", &kws))
         }
@@ -214,26 +220,26 @@ pub fn emit_distribution(
                 || d.extra.contains_key("alpha_L")
                 || d.extra.contains_key("n_L");
             if double_sided {
-                let m0 = field_or(b, d, "m0", 0.0)?;
-                let sigma_l = field_or(b, d, "sigma_L", 1.0)?;
-                let sigma_r = field_or(b, d, "sigma_R", 1.0)?;
-                let alpha_l = field_or(b, d, "alpha_L", 1.0)?;
-                let n_l = field_or(b, d, "n_L", 1.0)?;
-                let alpha_r = field_or(b, d, "alpha_R", 1.0)?;
-                let n_r = field_or(b, d, "n_R", 1.0)?;
+                let m0 = field_or(b, d, "m0", 0.0, cond)?;
+                let sigma_l = field_or(b, d, "sigma_L", 1.0, cond)?;
+                let sigma_r = field_or(b, d, "sigma_R", 1.0, cond)?;
+                let alpha_l = field_or(b, d, "alpha_L", 1.0, cond)?;
+                let n_l = field_or(b, d, "n_L", 1.0, cond)?;
+                let alpha_r = field_or(b, d, "alpha_R", 1.0, cond)?;
+                let n_r = field_or(b, d, "n_R", 1.0, cond)?;
                 Ok(b.module_user_call("hepphys", "DoubleSidedCrystalBall", &[m0, sigma_l, sigma_r, alpha_l, alpha_r, n_l, n_r]))
             } else {
-                let m0 = field_or(b, d, "m0", 0.0)?;
-                let sigma = field_or(b, d, "sigma", 1.0)?;
-                let alpha = field_or(b, d, "alpha", 1.0)?;
-                let n = field_or(b, d, "n", 1.0)?;
+                let m0 = field_or(b, d, "m0", 0.0, cond)?;
+                let sigma = field_or(b, d, "sigma", 1.0, cond)?;
+                let alpha = field_or(b, d, "alpha", 1.0, cond)?;
+                let n = field_or(b, d, "n", 1.0, cond)?;
                 Ok(b.module_user_call("hepphys", "CrystalBall", &[m0, sigma, alpha, n]))
             }
         }
         "argus_dist" => {
-            let resonance = field_or(b, d, "resonance", 0.0)?;
-            let slope = field_or(b, d, "slope", -1.0)?;
-            let power = field_or(b, d, "power", 0.5)?;
+            let resonance = field_or(b, d, "resonance", 0.0, cond)?;
+            let slope = field_or(b, d, "slope", -1.0, cond)?;
+            let power = field_or(b, d, "power", 0.5, cond)?;
             Ok(b.module_user_call("hepphys", "Argus", &[resonance, slope, power]))
         }
         // §12: mixture_dist maps to normalize(superpose(weighted(c1, s1), weighted(c2, s2), ...))
@@ -1428,6 +1434,31 @@ mod tests {
             flatppl_syntax::print_with(&m, flatppl_syntax::Syntax::Minimal)
         };
         assert!(text.contains("Normal(mu = fy(y)"), "got: {text}");
+    }
+
+    #[test]
+    fn conditional_non_gaussian_param_emits_func_applied_to_axis() {
+        // The conditional context applies to every distribution arm, not just
+        // gaussian: an exponential whose rate is a function of a co-observed axis
+        // emits `Exponential(rate = fc(y))`, never a bare-function `rate = fc`.
+        use std::collections::BTreeMap;
+        let mut m = flatppl_core::Module::new();
+        let text = {
+            let mut b = Builder::new(&mut m);
+            let funcs: BTreeMap<&str, &str> = [("fc", "y")].into_iter().collect();
+            let ctx = CondCtx { funcs: &funcs };
+            let d = dist(
+                "exponential_dist",
+                &[
+                    ("x", serde_json::json!("x")),
+                    ("c", serde_json::json!("fc")),
+                ],
+            );
+            let node = emit_distribution(&mut b, &d, None, None, Some(&ctx)).unwrap();
+            b.bind("e", node);
+            flatppl_syntax::print_with(&m, flatppl_syntax::Syntax::Minimal)
+        };
+        assert!(text.contains("Exponential(rate = fc(y))"), "got: {text}");
     }
 
     #[test]
