@@ -1,3 +1,4 @@
+flatppl_compat = "0.1"
 # Literal coverage: integers (dec/hex/underscore), reals, booleans, strings,
 # arrays, nested arrays, records, tuples.
 n = 42

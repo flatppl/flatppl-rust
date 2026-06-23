@@ -1,3 +1,4 @@
+flatppl_compat = "0.1"
 # Module-member access (`mod.x` → cross-module ref, spec §04), the reserved
 # namespaces `self.x` / `base.x`, load-time substitution, and `_` discard.
 a = elementof(reals)

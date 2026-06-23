@@ -1,3 +1,5 @@
+flatppl_compat = "0.1"
+
 a = elementof(reals)
 helpers = load_module("helpers.flatppl", center = a)
 
