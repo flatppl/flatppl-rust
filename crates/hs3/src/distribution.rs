@@ -31,6 +31,46 @@ fn array2d_of_values(b: &mut Builder, arr: &[serde_json::Value]) -> Result<NodeI
     Ok(b.array(&rows))
 }
 
+/// Context for conditional distribution parameter resolution.
+///
+/// When a parameter value names a `generic_function` of an observable axis,
+/// `field_node_ctx` emits `func(axis)` (a `CallHead::User` call) rather than a
+/// bare `self_ref`. Without this context the behaviour is identical to
+/// `field_node`.
+// `axes` is not yet consumed within this crate; Task 3 (emit_conditional) will use it.
+#[allow(dead_code)]
+pub struct CondCtx<'a> {
+    /// Maps a `generic_function` name → its observable axis name.
+    pub funcs: &'a std::collections::BTreeMap<&'a str, &'a str>,
+    /// The set of dataset observable axis names.
+    pub axes: &'a std::collections::BTreeSet<&'a str>,
+}
+
+/// Resolve a parameter value. With a conditional context, a value that names a
+/// `generic_function` of an observable axis emits `func(axis)` (a user-call);
+/// otherwise behaves exactly like `field_node`.
+fn field_node_ctx(
+    b: &mut Builder,
+    v: &serde_json::Value,
+    cond: Option<&CondCtx>,
+) -> Result<NodeId> {
+    if let (Some(ctx), Some(name)) = (cond, v.as_str()) {
+        if let Some(axis) = ctx.funcs.get(name) {
+            let func = b.self_ref(name);
+            let arg = b.self_ref(axis);
+            return Ok(b
+                .m
+                .alloc(flatppl_core::node::Node::Call(flatppl_core::node::Call {
+                    head: flatppl_core::node::CallHead::User(func),
+                    args: Box::new([arg]),
+                    named: Box::new([]),
+                    inputs: None,
+                })));
+        }
+    }
+    field_node(b, v)
+}
+
 /// Lower a scalar JSON field value to a FlatPPL node: numbers become real
 /// literals, strings become self-refs (to a parameter/binding by name).
 ///
@@ -82,15 +122,16 @@ pub fn emit_distribution(
     d: &Distribution,
     domain: Option<(f64, f64)>,
     generic_obs: Option<&str>,
+    cond: Option<&CondCtx>,
 ) -> Result<NodeId> {
     match d.kind.as_str() {
         "gaussian_dist" | "normal_dist" => {
             let mut kws: Vec<(&str, NodeId)> = Vec::new();
             if let Some(v) = d.extra.get("mean") {
-                kws.push(("mu", field_node(b, v)?));
+                kws.push(("mu", field_node_ctx(b, v, cond)?));
             }
             if let Some(v) = d.extra.get("sigma") {
-                kws.push(("sigma", field_node(b, v)?));
+                kws.push(("sigma", field_node_ctx(b, v, cond)?));
             }
             Ok(b.call_kw("Normal", &kws))
         }
@@ -960,7 +1001,7 @@ mod tests {
         let mut m = flatppl_core::Module::new();
         let node = {
             let mut b = Builder::new(&mut m);
-            emit_distribution(&mut b, &d, None, None).unwrap()
+            emit_distribution(&mut b, &d, None, None, None).unwrap()
         };
         {
             let mut b = Builder::new(&mut m);
@@ -986,7 +1027,7 @@ mod tests {
         let mut m = flatppl_core::Module::new();
         let node = {
             let mut b = Builder::new(&mut m);
-            emit_distribution(&mut b, &d, None, None).unwrap()
+            emit_distribution(&mut b, &d, None, None, None).unwrap()
         };
         {
             let mut b = Builder::new(&mut m);
@@ -1008,7 +1049,7 @@ mod tests {
         let mut m = flatppl_core::Module::new();
         let node = {
             let mut b = Builder::new(&mut m);
-            emit_distribution(&mut b, &d, None, None).unwrap()
+            emit_distribution(&mut b, &d, None, None, None).unwrap()
         };
         {
             let mut b = Builder::new(&mut m);
@@ -1032,7 +1073,7 @@ mod tests {
         let mut m = flatppl_core::Module::new();
         let node = {
             let mut b = Builder::new(&mut m);
-            emit_distribution(&mut b, &d, None, None).unwrap()
+            emit_distribution(&mut b, &d, None, None, None).unwrap()
         };
         {
             let mut b = Builder::new(&mut m);
@@ -1063,7 +1104,7 @@ mod tests {
         let mut m = flatppl_core::Module::new();
         let node = {
             let mut b = Builder::new(&mut m);
-            emit_distribution(&mut b, &d, None, None).unwrap()
+            emit_distribution(&mut b, &d, None, None, None).unwrap()
         };
         {
             let mut b = Builder::new(&mut m);
@@ -1083,7 +1124,7 @@ mod tests {
         let mut m = flatppl_core::Module::new();
         let node = {
             let mut b = Builder::new(&mut m);
-            emit_distribution(&mut b, &d, Some((0.0, 10.0)), None).unwrap()
+            emit_distribution(&mut b, &d, Some((0.0, 10.0)), None, None).unwrap()
         };
         {
             let mut b = Builder::new(&mut m);
@@ -1105,7 +1146,7 @@ mod tests {
         let d = dist("uniform_dist", &[("x", serde_json::json!("x_obs"))]);
         let mut m = flatppl_core::Module::new();
         let mut b = Builder::new(&mut m);
-        let result = emit_distribution(&mut b, &d, None, None);
+        let result = emit_distribution(&mut b, &d, None, None, None);
         assert!(
             matches!(result, Err(Error::Unsupported(_))),
             "got: {result:?}"
@@ -1117,7 +1158,7 @@ mod tests {
         let d = dist("no_such_dist", &[]);
         let mut m = flatppl_core::Module::new();
         let mut b = Builder::new(&mut m);
-        let result = emit_distribution(&mut b, &d, None, None);
+        let result = emit_distribution(&mut b, &d, None, None, None);
         assert!(matches!(result, Err(Error::UnknownDistType(_))));
     }
 
@@ -1126,7 +1167,7 @@ mod tests {
         let d = dist("histfactory_dist", &[]);
         let mut m = flatppl_core::Module::new();
         let mut b = Builder::new(&mut m);
-        let result = emit_distribution(&mut b, &d, None, None);
+        let result = emit_distribution(&mut b, &d, None, None, None);
         assert!(matches!(result, Err(Error::Unsupported(_))));
     }
 
@@ -1190,7 +1231,7 @@ mod tests {
         let mut m = flatppl_core::Module::new();
         let node = {
             let mut b = Builder::new(&mut m);
-            emit_distribution(&mut b, &d, None, None).unwrap()
+            emit_distribution(&mut b, &d, None, None, None).unwrap()
         };
         {
             let mut b = Builder::new(&mut m);
@@ -1224,7 +1265,7 @@ mod tests {
         let mut m = flatppl_core::Module::new();
         let node = {
             let mut b = Builder::new(&mut m);
-            emit_distribution(&mut b, &d, Some((-20.0, 20.0)), None).unwrap()
+            emit_distribution(&mut b, &d, Some((-20.0, 20.0)), None, None).unwrap()
         };
         {
             let mut b = Builder::new(&mut m);
@@ -1255,7 +1296,7 @@ mod tests {
         let mut m = flatppl_core::Module::new();
         let node = {
             let mut b = Builder::new(&mut m);
-            emit_distribution(&mut b, &d, None, None).unwrap()
+            emit_distribution(&mut b, &d, None, None, None).unwrap()
         };
         {
             let mut b = Builder::new(&mut m);
@@ -1280,7 +1321,7 @@ mod tests {
         let mut m = flatppl_core::Module::new();
         let node = {
             let mut b = Builder::new(&mut m);
-            emit_distribution(&mut b, &d, Some((-5.0, 5.0)), None).unwrap()
+            emit_distribution(&mut b, &d, Some((-5.0, 5.0)), None, None).unwrap()
         };
         {
             let mut b = Builder::new(&mut m);
@@ -1309,7 +1350,7 @@ mod tests {
         let mut m = flatppl_core::Module::new();
         let node = {
             let mut b = Builder::new(&mut m);
-            emit_distribution(&mut b, &d, Some((0.0, 10.0)), None).unwrap()
+            emit_distribution(&mut b, &d, Some((0.0, 10.0)), None, None).unwrap()
         };
         {
             let mut b = Builder::new(&mut m);
@@ -1327,6 +1368,33 @@ mod tests {
         );
         assert!(text.contains("logweighted"), "got: {text}");
         assert!(text.contains("Lebesgue"), "got: {text}");
+    }
+
+    #[test]
+    fn conditional_gaussian_mean_emits_func_applied_to_axis() {
+        use std::collections::{BTreeMap, BTreeSet};
+        let mut m = flatppl_core::Module::new();
+        let text = {
+            let mut b = Builder::new(&mut m);
+            let funcs: BTreeMap<&str, &str> = [("fy", "y")].into_iter().collect();
+            let axes: BTreeSet<&str> = ["x", "y"].into_iter().collect();
+            let ctx = CondCtx {
+                funcs: &funcs,
+                axes: &axes,
+            };
+            let d = dist(
+                "gaussian_dist",
+                &[
+                    ("x", serde_json::json!("x")),
+                    ("mean", serde_json::json!("fy")),
+                    ("sigma", serde_json::json!("sigma")),
+                ],
+            );
+            let node = emit_distribution(&mut b, &d, None, None, Some(&ctx)).unwrap();
+            b.bind("g", node);
+            flatppl_syntax::print_with(&m, flatppl_syntax::Syntax::Minimal)
+        };
+        assert!(text.contains("Normal(mu = fy(y)"), "got: {text}");
     }
 
     #[test]

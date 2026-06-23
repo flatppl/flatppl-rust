@@ -683,7 +683,7 @@ fn emit_distributions(m: &mut Module, doc: &Document) -> Result<()> {
                 }
                 _ => None,
             };
-            let dist = emit_distribution(&mut b, d, domain, generic_obs.as_deref())?;
+            let dist = emit_distribution(&mut b, d, domain, generic_obs.as_deref(), None)?;
             // A shared-variate product factor stays scalar (see above).
             let bound = if shared_product_factors.contains(d.name.as_str()) {
                 dist
