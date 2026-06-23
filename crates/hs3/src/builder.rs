@@ -93,6 +93,29 @@ impl<'m> Builder<'m> {
         }))
     }
 
+    /// A call with `name = value` **field**-named arguments, e.g.
+    /// `table(x = …, y = …)`, `cartprod(a = …, b = …)`, `record(p = …)`.
+    /// Distinct from [`Builder::call_kw`], which emits function **kwargs**
+    /// (`Normal(mu = …)`); the field form is the record/table/set-product
+    /// constructor syntax (spec §03).
+    pub(crate) fn call_fields(&mut self, head: &str, fields: &[(&str, NodeId)]) -> NodeId {
+        let head = self.sym(head);
+        let named = fields
+            .iter()
+            .map(|(k, v)| NamedArg {
+                kind: NamedKind::Field,
+                name: self.m.intern(k),
+                value: *v,
+            })
+            .collect::<Vec<_>>();
+        self.m.alloc(Node::Call(Call {
+            head: CallHead::Builtin(head),
+            args: Vec::new().into(),
+            named: named.into(),
+            inputs: None,
+        }))
+    }
+
     /// Array literal `[a,b,...]`. Uses `vector` (the canonical FlatPPL builtin).
     pub(crate) fn array(&mut self, elems: &[NodeId]) -> NodeId {
         self.call("vector", elems)

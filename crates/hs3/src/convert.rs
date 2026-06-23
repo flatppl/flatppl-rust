@@ -51,7 +51,9 @@ pub fn document_to_module(doc: &Document) -> Result<Module> {
     emit_histfactory_channels(&mut m, doc)?;
     // 3.  Presets (domains, parameter_points).
     emit_presets(&mut m, doc);
-    // 4.  Likelihoods.
+    // 3b. Embedded `data` → `<name> = table(...)` + `<name>_domain = cartprod(...)`.
+    crate::data::emit_data(&mut m, doc)?;
+    // 4.  Likelihoods (observe the embedded tables emitted in 3b).
     emit_likelihoods(&mut m, doc, &histfactory_names)?;
 
     Ok(m)
@@ -687,11 +689,11 @@ fn emit_distributions(m: &mut Module, doc: &Document) -> Result<()> {
                 dist
             } else {
                 match variate_name(d) {
-                    Some(VariateName::Single(v)) => {
-                        let label = b.str_lit(&v);
-                        let labels = b.array(&[label]);
-                        b.call("relabel", &[dist, labels])
-                    }
+                    // Univariate: emit the bare measure (no single-axis relabel);
+                    // an anonymous scalar measure composes the same under
+                    // iid / likelihoodof. The observable name is preserved in a
+                    // doc comment below.
+                    Some(VariateName::Single(_)) => dist,
                     Some(VariateName::Multiple(names)) => {
                         let label_nodes: Vec<_> = names.iter().map(|n| b.str_lit(n)).collect();
                         let labels = b.array(&label_nodes);
@@ -700,10 +702,21 @@ fn emit_distributions(m: &mut Module, doc: &Document) -> Result<()> {
                     None => dist,
                 }
             };
+            // Doc lines: the spec-provenance line for non-1:1 lowerings, plus —
+            // for a bare univariate measure — the HS3 observable name, which is
+            // otherwise unrecorded once the single-axis relabel is dropped.
+            let mut doc_lines: Vec<String> = Vec::new();
             if let Some(line) = dist_spec::doc_line(&d.kind) {
-                b.bind_doc(&d.name, bound, &[line]);
-            } else {
+                doc_lines.push(line.to_string());
+            }
+            if let Some(VariateName::Single(v)) = variate_name(d) {
+                doc_lines.push(format!("observable: {v}"));
+            }
+            if doc_lines.is_empty() {
                 b.bind(&d.name, bound);
+            } else {
+                let refs: Vec<&str> = doc_lines.iter().map(String::as_str).collect();
+                b.bind_doc(&d.name, bound, &refs);
             }
         }
     }
@@ -853,51 +866,17 @@ fn emit_presets(m: &mut Module, doc: &Document) {
     }
 }
 
-/// Step 4: emit likelihood bindings. Builds a datum-name → flattened-values map
-/// so the emitter can inline unbinned observations. Skips likelihoods whose
+/// Step 4: emit likelihood bindings. Each likelihood observes the embedded data
+/// tables emitted in step 3b: a single-axis dataset is observed against its
+/// column vector under an `iid` plate, a multi-axis dataset against the table
+/// itself (spec §03 multivariate event sample). Skips likelihoods whose
 /// distributions are all native `histfactory_dist` (assembled in step 2b).
-///
-/// Unbinned data is lowered as a 1-D column of scalar observations; a
-/// multidimensional entry (an event with more than one coordinate) cannot be
-/// inlined this way and would silently drop columns, so it is rejected.
 fn emit_likelihoods(
     m: &mut Module,
     doc: &Document,
     histfactory_names: &BTreeSet<&str>,
 ) -> Result<()> {
-    let mut data_map: BTreeMap<String, Vec<f64>> = BTreeMap::new();
-    for d in doc.data.iter().filter(|d| d.kind == "unbinned") {
-        // NOTE: unbinned data is materialized into memory proportional to the input
-        // document size (one f64 per entry), with no entry-count cap. Fine for the
-        // current CLI-on-local-file threat model. If untrusted HS3 documents are ever
-        // ingested non-interactively, add a hard limit on the total entry count here.
-        let mut vals = Vec::with_capacity(d.entries.len());
-        for e in &d.entries {
-            if e.len() != 1 {
-                return Err(Error::Unsupported(format!(
-                    "unbinned datum `{}` has a {}-dimensional entry; only scalar \
-                     (1-D) observations are supported",
-                    d.name,
-                    e.len()
-                )));
-            }
-            vals.push(e[0]);
-        }
-        data_map.insert(d.name.clone(), vals);
-    }
-    // Per-distribution variate (axis) names. A distribution is lowered as
-    // `relabel(<dist>, [names])`, i.e. a record-shaped measure keyed by those
-    // names, so its observation must be a matching record (see emit_likelihood).
-    let labels_by_dist: BTreeMap<String, Vec<String>> = doc
-        .distributions
-        .iter()
-        .filter(|d| d.kind != "histfactory_dist")
-        .filter_map(|d| match variate_name(d) {
-            Some(VariateName::Single(v)) => Some((d.name.clone(), vec![v])),
-            Some(VariateName::Multiple(ns)) => Some((d.name.clone(), ns)),
-            None => None,
-        })
-        .collect();
+    let data_shapes = crate::data::data_shapes(doc)?;
     let mut b = Builder::new(m);
     for lk in &doc.likelihoods {
         // Skip likelihoods whose distributions are all native histfactory_dist;
@@ -910,7 +889,7 @@ fn emit_likelihoods(
         {
             continue;
         }
-        crate::likelihood::emit_likelihood(&mut b, lk, &data_map, &labels_by_dist)?;
+        crate::likelihood::emit_likelihood(&mut b, lk, &data_shapes)?;
     }
     Ok(())
 }
@@ -1066,9 +1045,13 @@ mod tests {
     fn slice1_minimal_gaussian_matches_spec() {
         let m = crate::read(MINIMAL).unwrap();
         let text = print_with(&m, Syntax::Minimal);
-        assert!(text.contains("relabel"), "got:\n{text}");
-        assert!(text.contains("Normal"), "got:\n{text}");
-        assert!(text.contains("mass_obs"), "got:\n{text}");
+        // Univariate gaussian → bare measure (no relabel); the observable name is
+        // preserved in a doc comment on the binding.
+        assert!(
+            text.contains("% observable: mass_obs")
+                && text.contains("mass = Normal(mu = mu_param, sigma = sigma_param)"),
+            "got:\n{text}"
+        );
         assert!(
             text.contains("mu_param") && text.contains("sigma_param"),
             "got:\n{text}"

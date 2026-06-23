@@ -1,33 +1,31 @@
 //! likelihoods -> likelihoodof / joint_likelihood (06-measure-algebra.md).
 use crate::builder::Builder;
+use crate::data::DataShape;
 use crate::error::{Error, Result};
 use crate::model::Likelihood;
 use flatppl_core::id::NodeId;
 use std::collections::BTreeMap;
 
-/// Emit a likelihood binding.
+/// Emit a likelihood binding, observing the embedded `data` tables (emitted as
+/// `<name> = table(...)` by the data step).
 ///
-/// `data_map` maps datum names to their observed value vectors (built from the
-/// document's unbinned `data` entries). A likelihood's `data[i]` string is
-/// resolved strictly:
-///   - if it names an entry in `data_map`, the values are emitted as an inline
-///     `vector(...)` literal bound to that name and self-referenced;
-///   - otherwise it resolves to no observation. A datum is only ever made
-///     available by name through `data_map` (unbinned data); binned/histfactory
-///     observations are consumed by the channel-assembly path, never reach this
-///     emitter, and are not bound by name. So a `data[i]` not in `data_map` is a
-///     dangling observation reference — emitting a bare `self_ref` would either
-///     produce an unbound name or silently bind the observation to an unrelated
-///     top-level binding (a distribution / parameter / function with a colliding
-///     name). Both are wrong, and the round-trip gate cannot catch them
-///     (syntactically valid), so this is rejected with [`Error::Unsupported`].
-///
-/// A numeric `data[i]` is emitted as a scalar literal.
+/// A likelihood's `data[i]` is resolved strictly:
+///   - a string naming a dataset in `data_shapes`: observe its embedded table.
+///     A single-axis dataset is observed against its column vector
+///     `<name>.<axis>` under an `iid(<model>, n_rows)` plate — the column holds
+///     the N iid scalar observations (06-measure-algebra.md). A multi-axis
+///     dataset is observed against the table itself: each row is one event over
+///     the observable axes (spec §03: a multivariate event sample IS a table).
+///   - a number: a scalar observation literal (no plate).
+///   - any other string resolves to no dataset (binned/histfactory observations
+///     are consumed by the channel-assembly path, never reached by name here),
+///     so it is a dangling reference — rejected with [`Error::Unsupported`]
+///     rather than emitting an unbound/mis-bound name the round-trip gate cannot
+///     catch.
 pub fn emit_likelihood(
     b: &mut Builder,
     lk: &Likelihood,
-    data_map: &BTreeMap<String, Vec<f64>>,
-    labels_by_dist: &BTreeMap<String, Vec<String>>,
+    data_shapes: &BTreeMap<String, DataShape>,
 ) -> Result<()> {
     if lk.distributions.is_empty() {
         return Ok(());
@@ -35,44 +33,28 @@ pub fn emit_likelihood(
     let mut terms: Vec<NodeId> = Vec::new();
     for (i, dist) in lk.distributions.iter().enumerate() {
         let model0 = b.self_ref(dist);
-        // Set when the observation is a multi-entry unbinned vector over a single
-        // axis: the data are N iid draws, so the model is plated `iid(M, N)` and
-        // observed against the bare value vector (06-measure-algebra.md).
+        // Number of iid rows to plate the model over (None ⇒ a scalar datum).
         let mut iid_n: Option<usize> = None;
         let obs = match lk.data.get(i) {
             Some(serde_json::Value::String(name)) => {
-                let vals = data_map.get(name.as_str()).ok_or_else(|| {
+                let shape = data_shapes.get(name.as_str()).ok_or_else(|| {
                     Error::Unsupported(format!(
                         "likelihood `{}` data reference `{name}` resolves to no datum",
                         lk.name
                     ))
                 })?;
-                // The distribution is `relabel(<dist>, [labels])` — a record-shaped
-                // measure. A single observation over named axes is observed as a
-                // matching `record(label = value, …)`; otherwise (no labels, or an
-                // iid/multi-point vector) fall back to a bare vector.
-                let labels = labels_by_dist
-                    .get(dist.as_str())
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[]);
-                let obs_node = if !labels.is_empty() && labels.len() == vals.len() {
-                    let fields: Vec<(&str, NodeId)> = labels
-                        .iter()
-                        .zip(vals.iter())
-                        .map(|(lbl, &v)| (lbl.as_str(), b.lit_real(v)))
-                        .collect();
-                    b.call_kw("record", &fields)
+                iid_n = Some(shape.n_rows);
+                let table = b.self_ref(name);
+                if shape.columns.len() == 1 {
+                    // Single observable: observe the column vector `<name>.<axis>`
+                    // (`get(table, "axis")` prints as `<name>.<axis>`; a table
+                    // column is a vector, spec §03) — N iid scalar observations.
+                    let key = b.str_lit(&shape.columns[0]);
+                    b.call("get", &[table, key])
                 } else {
-                    // A bare vector over a single observable (≤ 1 axis) with more
-                    // than one entry is N iid observations — plate the model.
-                    if vals.len() > 1 && labels.len() <= 1 {
-                        iid_n = Some(vals.len());
-                    }
-                    let elems: Vec<NodeId> = vals.iter().map(|&v| b.lit_real(v)).collect();
-                    b.array(&elems)
-                };
-                b.bind(name, obs_node);
-                b.self_ref(name)
+                    // Multivariate event sample: observe the table directly.
+                    table
+                }
             }
             Some(serde_json::Value::Number(n)) => b.lit_real(n.as_f64().unwrap_or(0.0)),
             other => {
@@ -106,6 +88,14 @@ mod tests {
     use crate::builder::Builder;
     use crate::model::Likelihood;
     use flatppl_syntax::{Syntax, print_with};
+
+    fn shape(columns: &[&str], n_rows: usize) -> DataShape {
+        DataShape {
+            columns: columns.iter().map(|s| s.to_string()).collect(),
+            n_rows,
+        }
+    }
+
     #[test]
     fn two_term_joint_likelihood() {
         let mut m = flatppl_core::Module::new();
@@ -121,14 +111,12 @@ mod tests {
             distributions: vec!["obs_model".into(), "aux_model".into()],
             data: vec![serde_json::json!("obs_data"), serde_json::json!("aux_obs")],
         };
-        // Both data refs are real unbinned data (the only by-name datum source).
-        let mut map = BTreeMap::new();
-        map.insert("obs_data".to_string(), vec![3.0]);
-        map.insert("aux_obs".to_string(), vec![4.0]);
+        let mut shapes = BTreeMap::new();
+        shapes.insert("obs_data".to_string(), shape(&["x"], 1));
+        shapes.insert("aux_obs".to_string(), shape(&["y"], 1));
         {
             let mut b = Builder::new(&mut m);
-            emit_likelihood(&mut b, &lk, &map, &BTreeMap::new())
-                .expect("unbinned data refs resolve");
+            emit_likelihood(&mut b, &lk, &shapes).expect("data refs resolve");
         }
         let text = print_with(&m, Syntax::Minimal);
         assert!(text.contains("joint_likelihood("), "got:\n{text}");
@@ -136,7 +124,7 @@ mod tests {
     }
 
     #[test]
-    fn data_ref_in_map_inlines_vector() {
+    fn single_axis_data_observes_column_under_iid() {
         let mut m = flatppl_core::Module::new();
         {
             let mut b = Builder::new(&mut m);
@@ -148,18 +136,45 @@ mod tests {
             distributions: vec!["model".into()],
             data: vec![serde_json::json!("d")],
         };
-        let mut map = BTreeMap::new();
-        map.insert("d".to_string(), vec![1.0, 2.0, 3.0]);
+        let mut shapes = BTreeMap::new();
+        shapes.insert("d".to_string(), shape(&["x"], 3));
         {
             let mut b = Builder::new(&mut m);
-            emit_likelihood(&mut b, &lk, &map, &BTreeMap::new()).expect("data_map ref inlines");
+            emit_likelihood(&mut b, &lk, &shapes).expect("data ref resolves");
         }
         let text = print_with(&m, Syntax::Minimal);
-        assert!(text.contains("likelihoodof("), "got:\n{text}");
-        // The datum is inlined as a vector literal.
+        // 3 rows over one observable → iid plate, observed against the column
+        // vector (`get(d, "x")` is the canonical `t.col` column access, spec §03).
         assert!(
-            text.contains("vector") || text.contains('['),
-            "got:\n{text}"
+            text.contains("likelihoodof(iid(model, 3), get(d, \"x\"))"),
+            "single-axis column observation expected, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn multi_axis_data_observes_table() {
+        let mut m = flatppl_core::Module::new();
+        {
+            let mut b = Builder::new(&mut m);
+            let one = b.lit_real(1.0);
+            b.bind("model", one);
+        }
+        let lk = Likelihood {
+            name: "L".into(),
+            distributions: vec!["model".into()],
+            data: vec![serde_json::json!("d")],
+        };
+        let mut shapes = BTreeMap::new();
+        shapes.insert("d".to_string(), shape(&["x", "y"], 5));
+        {
+            let mut b = Builder::new(&mut m);
+            emit_likelihood(&mut b, &lk, &shapes).expect("data ref resolves");
+        }
+        let text = print_with(&m, Syntax::Minimal);
+        // Multivariate sample → observe the whole table under the iid plate.
+        assert!(
+            text.contains("likelihoodof(iid(model, 5), d)"),
+            "table observation expected, got:\n{text}"
         );
     }
 
@@ -174,12 +189,12 @@ mod tests {
         let lk = Likelihood {
             name: "L".into(),
             distributions: vec!["model".into()],
-            // `nowhere` is not in data_map — a dangling reference.
+            // `nowhere` is not a known dataset — a dangling reference.
             data: vec![serde_json::json!("nowhere")],
         };
-        let empty_map = BTreeMap::new();
+        let empty = BTreeMap::new();
         let mut b = Builder::new(&mut m);
-        let result = emit_likelihood(&mut b, &lk, &empty_map, &BTreeMap::new());
+        let result = emit_likelihood(&mut b, &lk, &empty);
         assert!(
             matches!(result, Err(Error::Unsupported(_))),
             "got: {result:?}"
@@ -191,10 +206,9 @@ mod tests {
         );
     }
 
-    // A data ref that collides with an existing top-level binding (a model
-    // component / parameter / function) must NOT silently bind the observation
-    // to it. With path #2 removed, this is rejected exactly like any other
-    // not-in-data_map reference.
+    // A data ref that collides with a non-datum top-level binding must NOT
+    // silently bind to it; with no matching dataset it is rejected like any
+    // other unknown reference.
     #[test]
     fn data_ref_colliding_with_binding_errors() {
         let mut m = flatppl_core::Module::new();
@@ -202,7 +216,6 @@ mod tests {
             let mut b = Builder::new(&mut m);
             let one = b.lit_real(1.0);
             b.bind("model", one);
-            // `decoy` exists as a binding but is NOT observed data.
             let decoy = b.lit_real(7.0);
             b.bind("decoy", decoy);
         }
@@ -211,9 +224,9 @@ mod tests {
             distributions: vec!["model".into()],
             data: vec![serde_json::json!("decoy")],
         };
-        let empty_map = BTreeMap::new();
+        let empty = BTreeMap::new();
         let mut b = Builder::new(&mut m);
-        let result = emit_likelihood(&mut b, &lk, &empty_map, &BTreeMap::new());
+        let result = emit_likelihood(&mut b, &lk, &empty);
         assert!(
             matches!(result, Err(Error::Unsupported(_))),
             "got: {result:?}"

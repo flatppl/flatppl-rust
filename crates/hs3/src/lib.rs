@@ -10,6 +10,7 @@ mod error;
 pub use error::{Error, Result};
 pub(crate) mod builder;
 mod convert;
+pub(crate) mod data;
 pub(crate) mod dist_spec;
 pub(crate) mod distribution;
 pub(crate) mod expr;
