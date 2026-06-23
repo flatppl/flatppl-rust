@@ -556,12 +556,57 @@ fn emit_functions(m: &mut Module, doc: &Document) -> Result<()> {
     Ok(())
 }
 
+/// The observable record a conditional distribution over `obs` is normalized
+/// against: every axis of the dataset that contains `obs`, paired with its
+/// `(lo, hi)` bounds from the document's `domains`, in dataset axis order. Axes
+/// without declared bounds are dropped (no finite interval to integrate over).
+/// Returns an empty vec when no dataset carries `obs`.
+fn ordered_record_axes(
+    doc: &Document,
+    obs: &str,
+    domains: &BTreeMap<&str, (f64, f64)>,
+) -> Vec<(String, (f64, f64))> {
+    let Some(dataset) = doc
+        .data
+        .iter()
+        .find(|ds| ds.axes.iter().any(|a| a.name == obs))
+    else {
+        return Vec::new();
+    };
+    dataset
+        .axes
+        .iter()
+        .filter_map(|a| {
+            let bounds = *domains.get(a.name.as_str())?;
+            Some((a.name.clone(), bounds))
+        })
+        .collect()
+}
+
 /// Step 2: emit each non-histfactory distribution as a binding, wrapping with a
 /// `relabel` over its variate. Binds the `hepphys` standard module once up front
 /// if any distribution needs it and no histfactory channel path will bind it.
 fn emit_distributions(m: &mut Module, doc: &Document) -> Result<()> {
     let domains = domain_bounds(doc)?;
     let observables = observable_names(doc);
+    // Conditional detection support. `axis_set` is every dataset observable axis;
+    // `funcs_axis` maps each `generic_function` to the (first) observable axis its
+    // expression depends on. A distribution whose parameter names such a function
+    // of a DISTINCT (non-self) axis is conditional and lowers via emit_conditional.
+    let axis_set: BTreeSet<&str> = observables.iter().map(String::as_str).collect();
+    let funcs_axis: BTreeMap<&str, &str> = doc
+        .functions
+        .iter()
+        .filter(|f| f.kind == "generic_function")
+        .filter_map(|f| {
+            let expr = f.extra.get("expression").and_then(|v| v.as_str())?;
+            let axis = expr::free_identifiers(expr)
+                .into_iter()
+                .find(|id| axis_set.contains(id.as_str()))?;
+            let axis = *axis_set.get(axis.as_str())?;
+            Some((f.name.as_str(), axis))
+        })
+        .collect();
     {
         let mut b = Builder::new(m);
         let needs_hp = doc
@@ -658,6 +703,46 @@ fn emit_distributions(m: &mut Module, doc: &Document) -> Result<()> {
                 b.bind_doc(&d.name, node, &[doc_line]);
                 continue;
             }
+            // Conditional: a scalar-valued parameter of `d` names a generic_function
+            // of a DISTINCT co-observed axis (not `d`'s own variate). RooFit treats
+            // such a pdf as conditional on that axis; FlatPPL has no conditional
+            // primitive, so it lowers to the joint-normalized density over the whole
+            // observable record (emit_conditional, §12). A parameter that is itself a
+            // function of the OWN variate is just an ordinary functional parameter and
+            // is handled by the normal emit path below.
+            let own_obs = match variate_name(d) {
+                Some(VariateName::Single(ref v)) => Some(v.clone()),
+                _ => None,
+            };
+            let cond_axis = d
+                .extra
+                .values()
+                .filter_map(|v| v.as_str())
+                .filter_map(|s| funcs_axis.get(s).copied())
+                .find(|ax| Some(*ax) != own_obs.as_deref());
+            if let (Some(obs), Some(_)) = (own_obs.as_deref(), cond_axis) {
+                let ctx = crate::distribution::CondCtx { funcs: &funcs_axis };
+                let record = ordered_record_axes(doc, obs, &domains);
+                // The joint normalization region needs the observable record with
+                // bounds. An empty record (no dataset provides `obs`, or no axis has a
+                // declared domain) would emit a degenerate `cartprod()` — fail loud
+                // instead of emitting unscoreable FlatPPL.
+                if record.is_empty() {
+                    return Err(Error::Unsupported(format!(
+                        "conditional distribution `{}` is a function of another observable, \
+                         but no dataset/domain provides the observable record for `{obs}` — \
+                         cannot build the joint normalization region",
+                        d.name
+                    )));
+                }
+                let node = crate::distribution::emit_conditional(&mut b, d, obs, &record, &ctx)?;
+                b.bind_doc(
+                    &d.name,
+                    node,
+                    &["HS3 conditional dist → normalize(logweighted …): joint-normalized density over the observable record"],
+                );
+                continue;
+            }
             // Resolve the variate's declared domain (needed for uniform_dist and the
             // generic kinds). For generic_dist the observable is INFERRED from the
             // inline expression (its first free identifier that names an observable),
@@ -683,7 +768,7 @@ fn emit_distributions(m: &mut Module, doc: &Document) -> Result<()> {
                 }
                 _ => None,
             };
-            let dist = emit_distribution(&mut b, d, domain, generic_obs.as_deref())?;
+            let dist = emit_distribution(&mut b, d, domain, generic_obs.as_deref(), None)?;
             // A shared-variate product factor stays scalar (see above).
             let bound = if shared_product_factors.contains(d.name.as_str()) {
                 dist

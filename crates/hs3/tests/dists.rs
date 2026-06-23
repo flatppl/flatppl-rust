@@ -1034,3 +1034,108 @@ fn generic_function_of_observable_is_a_lambda() {
     );
     flatppl_syntax::parse(&text).expect("re-parse");
 }
+
+// ---------------------------------------------------------------------------
+// rf309: a conditional gaussian whose `mean` names a generic_function of a
+// DISTINCT co-observed axis (y) lowers to a joint-normalized density over the
+// observable record (x, y) — not the invalid bare-function mean `Normal(mu = fy)`.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn rf309_conditional_gaussian_lowers_to_joint_normalized_density() {
+    let hs3 = r#"{
+      "distributions": [{"name":"model","type":"gaussian_dist","x":"x","sigma":"sigma","mean":"fy"}],
+      "functions": [{"name":"fy","type":"generic_function","expression":"a0-a1*sqrt(10*abs(y))"}],
+      "domains": [{"name":"d","type":"product_domain","axes":[
+        {"name":"x","min":-5.0,"max":5.0},{"name":"y","min":-5.0,"max":5.0}]}],
+      "data": [{"name":"modelData","type":"unbinned","axes":[{"name":"x"},{"name":"y"}],"entries":[[0.0,0.0]]}]
+    }"#;
+    let m = flatppl_hs3::read_hs3(hs3).expect("convert");
+    let out = flatppl_syntax::print_with(&m, flatppl_syntax::Syntax::Minimal);
+    eprintln!("=== rf309 conditional gaussian ===\n{out}\n=== end ===");
+    assert!(out.contains("normalize("), "got:\n{out}");
+    assert!(out.contains("logweighted("), "got:\n{out}");
+    // Minimal syntax rewrites the lambda's bound vars to placeholders (`_x_`,
+    // `_y_`): the functional mean is `fy(_y_)` (func applied to its axis), the
+    // scored point is `_x_`. The full inner call pins the mu→fy(y) binding, the
+    // sigma kwarg, and the observable being scored — a swapped or dropped piece
+    // would not match.
+    assert!(
+        out.contains("logdensityof(Normal(mu = fy(_y_), sigma = sigma), _x_)"),
+        "got:\n{out}"
+    );
+    // The joint Lebesgue support is the record's cartesian product, with x's
+    // declared [-5, 5] interval leading.
+    assert!(
+        out.contains("Lebesgue(support = cartprod(x = interval(-5.0, 5.0)"),
+        "got:\n{out}"
+    );
+    // Must NOT emit the invalid bare-function mean `Normal(mu = fy, …)` — a
+    // generic_function is not a real value, so a bare `mu = fy` is ill-typed.
+    assert!(
+        !out.contains("Normal(mu = fy,"),
+        "must not emit the invalid bare-fn mean:\n{out}"
+    );
+    flatppl_syntax::parse(&out).expect("re-parse");
+}
+
+// A conditional dist whose observable record has no declared bounds cannot be
+// joint-normalized; the converter must fail loud, not emit a degenerate
+// `cartprod()`. Here `y` is a co-observed data axis (so the conditional path
+// fires) but no `domains` block supplies bounds, so the record is empty.
+#[test]
+fn conditional_dist_without_observable_record_fails_loud() {
+    let hs3 = r#"{
+      "distributions": [{"name":"model","type":"gaussian_dist","x":"x","sigma":"sigma","mean":"fy"}],
+      "functions": [{"name":"fy","type":"generic_function","expression":"a0-a1*sqrt(10*abs(y))"}],
+      "data": [{"name":"modelData","type":"unbinned","axes":[{"name":"x"},{"name":"y"}],"entries":[[0.0,0.0]]}]
+    }"#;
+    let err = flatppl_hs3::read_hs3(hs3).expect_err("must fail without an observable record");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("observable record"),
+        "expected a record-region error, got: {msg}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// rf309 round-trip idempotency: print(parse(out)) == print(parse(print(parse(out))))
+// This verifies the printer emits canonical FlatPPL: feeding the output back
+// through parse+print a second time produces exactly the same bytes. A
+// non-idempotent printer would expose itself here even if the first parse
+// succeeds (the existing rf309 golden only asserts re-parse, not idempotency).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn rf309_conditional_roundtrips_through_parser() {
+    let hs3 = r#"{
+      "distributions": [{"name":"model","type":"gaussian_dist","x":"x","sigma":"sigma","mean":"fy"}],
+      "functions": [{"name":"fy","type":"generic_function","expression":"a0-a1*sqrt(10*abs(y))"}],
+      "domains": [{"name":"d","type":"product_domain","axes":[
+        {"name":"x","min":-5.0,"max":5.0},{"name":"y","min":-5.0,"max":5.0}]}],
+      "data": [{"name":"modelData","type":"unbinned","axes":[{"name":"x"},{"name":"y"}],"entries":[[0.0,0.0]]}]
+    }"#;
+    let m = flatppl_hs3::read_hs3(hs3).expect("convert");
+    let out = print_with(&m, Syntax::Minimal);
+    // First pass: parse the converter output, re-print canonically.
+    let parsed1 = parse(&out).expect("emitted FlatPPL must parse (first pass)");
+    let reprinted1 = print_with(&parsed1, Syntax::Minimal);
+    // Second pass: parse the reprinted output, re-print again.
+    let parsed2 = parse(&reprinted1).expect("reprinted FlatPPL must parse (second pass)");
+    let reprinted2 = print_with(&parsed2, Syntax::Minimal);
+    // The conditional-density structure must SURVIVE the parse→print round-trip
+    // (not just be stable): a regression that dropped the construct could still
+    // be idempotent on its own output, so assert the canonical form still carries
+    // it. (Note: `out` itself is not asserted equal to `reprinted1` — the printer
+    // is only idempotent *after* the first print, e.g. the converter's `-5.0`
+    // literal canonicalizes to `neg(5.0)` on reparse; both parse to the same AST.)
+    assert!(
+        reprinted1.contains("normalize(logweighted(functionof("),
+        "round-trip dropped the conditional-density structure:\n{reprinted1}"
+    );
+    // Idempotency: both reprintings must be byte-identical.
+    assert_eq!(
+        reprinted1, reprinted2,
+        "printer is not idempotent: second pass differs from first pass"
+    );
+}
