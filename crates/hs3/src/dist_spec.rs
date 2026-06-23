@@ -137,6 +137,13 @@ static SPECS: &[DistSpec] = &[
         doc_line: None,
         known_fields: &["mass", "resonance", "slope", "power"],
     },
+    DistSpec {
+        kind: "landau_dist",
+        variate: Variate::Scalar("x"),
+        needs_hepphys: true,
+        doc_line: None,
+        known_fields: &["mean", "sigma", "x"],
+    },
     // ---- multivariate ----
     DistSpec {
         kind: "multivariate_normal_dist",
@@ -398,6 +405,14 @@ mod tests {
         assert_eq!(variate_field("argus_dist"), "mass");
         assert!(needs_hepphys("argus_dist"));
         assert_eq!(param_domain("argus_dist", "slope"), "reals");
+    }
+
+    #[test]
+    fn landau_uses_x_and_needs_hepphys() {
+        assert_eq!(variate_field("landau_dist"), "x");
+        assert!(needs_hepphys("landau_dist"));
+        assert_eq!(param_domain("landau_dist", "mean"), "reals");
+        assert_eq!(param_domain("landau_dist", "sigma"), "posreals");
     }
 
     #[test]
