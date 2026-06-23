@@ -104,32 +104,33 @@ pub fn free_identifiers(src: &str) -> Vec<String> {
 // Lambda wrapper — builds `obs_name -> body` in the IR
 // ---------------------------------------------------------------------------
 
-fn wrap_lambda(b: &mut Builder, body: NodeId, obs_name: &str) -> NodeId {
-    // The lambda parameter name and its placeholder (`_obs_name_`).
-    let name_sym = b.m.intern(obs_name);
-    let ph_name = format!("_{obs_name}_");
-    let ph_sym = b.m.intern(&ph_name);
-
-    // Rewrite every SelfMod ref to `obs_name` inside `body` to a Local ref.
-    // We do this by replacing the body's children transitively.  Because the
-    // builder's module allocates nodes by appending, we can safely walk already-
-    // allocated nodes; newly-appended nodes won't be revisited.
-    let rewritten_body = rewrite_self_to_local(b, body, name_sym, ph_sym);
-
+// Lambda wrapper — builds `(name0, name1, ...) -> body` in the IR.
+pub(crate) fn wrap_lambda_multi(b: &mut Builder, body: NodeId, obs_names: &[&str]) -> NodeId {
+    let mut rewritten = body;
+    let mut entries: Vec<(flatppl_core::id::Symbol, Ref)> = Vec::with_capacity(obs_names.len());
+    for name in obs_names {
+        let name_sym = b.m.intern(name);
+        let ph_sym = b.m.intern(&format!("_{name}_"));
+        rewritten = rewrite_self_to_local(b, rewritten, name_sym, ph_sym);
+        entries.push((
+            name_sym,
+            Ref {
+                ns: RefNs::Local,
+                name: ph_sym,
+            },
+        ));
+    }
     let head = CallHead::Builtin(b.m.intern("functionof"));
-    let entry = (
-        name_sym,
-        Ref {
-            ns: RefNs::Local,
-            name: ph_sym,
-        },
-    );
     b.m.alloc(Node::Call(Call {
         head,
-        args: Box::new([rewritten_body]),
+        args: Box::new([rewritten]),
         named: Box::new([]),
-        inputs: Some(Inputs::Spec(Box::new([entry]))),
+        inputs: Some(Inputs::Spec(entries.into_boxed_slice())),
     }))
+}
+
+fn wrap_lambda(b: &mut Builder, body: NodeId, obs_name: &str) -> NodeId {
+    wrap_lambda_multi(b, body, &[obs_name])
 }
 
 /// Recursively copy the sub-graph rooted at `node`, replacing every
@@ -866,6 +867,35 @@ mod tests {
             matches!(result, Err(Error::Unsupported(_))),
             "expected Unsupported error for ternary, got: {:?}",
             result
+        );
+    }
+
+    #[test]
+    fn wrap_lambda_multi_builds_two_param_lambda() {
+        let mut m = flatppl_core::Module::new();
+        {
+            let mut b = Builder::new(&mut m);
+            // body: logdensityof(Normal(mu = y, sigma = 1.0), x)  with x,y as self-refs
+            let y = b.self_ref("y");
+            let one = b.lit_real(1.0);
+            let normal = b.call_kw("Normal", &[("mu", y), ("sigma", one)]);
+            let x = b.self_ref("x");
+            let body = b.call("logdensityof", &[normal, x]);
+            let lam = super::wrap_lambda_multi(&mut b, body, &["x", "y"]);
+            b.bind("w", lam);
+        }
+        let text = flatppl_syntax::print_with(&m, flatppl_syntax::Syntax::Minimal);
+        // Minimal syntax prints the lambda as `functionof(<body>, x = _x_, y = _y_)`
+        // (the `(x, y) ->` arrow is the canonical-printer sugar, not Minimal).
+        assert!(text.contains("functionof("), "missing lambda: {text}");
+        assert!(
+            text.contains("x = _x_") && text.contains("y = _y_"),
+            "both params not bound as locals: {text}"
+        );
+        // Body self-refs to x and y were rewritten to the lambda placeholders.
+        assert!(
+            text.contains("logdensityof(Normal(mu = _y_"),
+            "body not rewritten to placeholders: {text}"
         );
     }
 }
