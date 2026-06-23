@@ -975,7 +975,7 @@ pub fn needs_hepphys(kind: &str) -> bool {
 ///
 /// `obs` is this distribution's own observable; `record_axes` is every observable
 /// in the record with its `(lo, hi)` interval, in axis order.
-// Task 4 (detect + dispatch) will be the first caller outside tests.
+// Unused until Task 4 wires the dispatch caller; the allow is removed there.
 #[allow(dead_code)]
 pub fn emit_conditional(
     b: &mut Builder,
@@ -1468,8 +1468,11 @@ mod tests {
             b.bind("model", node);
             flatppl_syntax::print_with(&m, flatppl_syntax::Syntax::Minimal)
         };
-        assert!(text.contains("normalize("), "got: {text}");
-        assert!(text.contains("logweighted("), "got: {text}");
+        // Assert the full outer nesting, not just the tokens occurring anywhere.
+        assert!(
+            text.contains("normalize(logweighted(functionof("),
+            "got: {text}"
+        );
         // Minimal syntax: functionof(<body>, x = _x_, y = _y_); obs/axis refs rewritten to locals.
         assert!(
             text.contains("logdensityof(Normal(mu = fy(_y_), sigma = sigma), _x_)"),
