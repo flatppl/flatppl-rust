@@ -1,6 +1,6 @@
 //! parameter_points / domains -> FlatPPL preset bindings (03-value-types.md).
 use crate::builder::Builder;
-use crate::model::{Domain, ParameterPoint};
+use crate::model::{Domain, DomainAxis, ParameterPoint};
 use flatppl_core::NodeId;
 use flatppl_core::node::{Call, CallHead, NamedArg, NamedKind, Node};
 
@@ -33,26 +33,26 @@ pub fn emit_parameter_point(b: &mut Builder, pp: &ParameterPoint) {
 /// An omitted bound (RooFit emits one-sided ranges for unbounded parameters)
 /// becomes `±inf`, so `[0, ∞)` lowers to `interval(0.0, inf)`.
 pub fn emit_domain(b: &mut Builder, d: &Domain) {
-    let mut fields = Vec::new();
-    for ax in &d.axes {
+    let cp = cartprod_of_axes(b, &d.axes);
+    b.bind(&d.name, cp);
+}
+
+/// Build a Cartesian-product set node `cartprod(name = interval(min, max), ...)`
+/// over the given observable axes (spec §03 "Cartesian product"). Each axis maps
+/// to an `interval`, with an omitted bound becoming `±inf` (see [`bound_node`]).
+///
+/// Shared by [`emit_domain`] (the `domains` block) and the `data` → `<name>_domain`
+/// companion binding, so both formulate a data/parameter region identically.
+pub(crate) fn cartprod_of_axes(b: &mut Builder, axes: &[DomainAxis]) -> NodeId {
+    let mut fields: Vec<(String, NodeId)> = Vec::with_capacity(axes.len());
+    for ax in axes {
         let lo = bound_node(b, ax.min, false);
         let hi = bound_node(b, ax.max, true);
         let interval = b.call("interval", &[lo, hi]);
-        let name = b.m.intern(&ax.name);
-        fields.push(NamedArg {
-            kind: NamedKind::Field,
-            name,
-            value: interval,
-        });
+        fields.push((ax.name.clone(), interval));
     }
-    let head = b.m.intern("cartprod");
-    let cp = b.m.alloc(Node::Call(Call {
-        head: CallHead::Builtin(head),
-        args: Vec::new().into(),
-        named: fields.into(),
-        inputs: None,
-    }));
-    b.bind(&d.name, cp);
+    let refs: Vec<(&str, NodeId)> = fields.iter().map(|(n, v)| (n.as_str(), *v)).collect();
+    b.call_fields("cartprod", &refs)
 }
 
 /// An interval bound node: the literal value, or `±inf` when RooFit omitted the

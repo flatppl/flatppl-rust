@@ -39,7 +39,7 @@ fn golden_gaussian() {
         "gaussian",
         r#"{"distributions":[{"name":"g","type":"gaussian_dist","mean":"mu","sigma":"s","x":"gx"}],
             "parameter_points":[{"name":"n","entries":[{"name":"mu","value":0.0},{"name":"s","value":1.0}]}]}"#,
-        r#"g = relabel(Normal(mu = mu, sigma = s), ["gx"])"#,
+        r#"g = Normal(mu = mu, sigma = s)"#,
     );
 }
 
@@ -58,7 +58,7 @@ fn golden_exponential_rate_is_c() {
     let m = flatppl_hs3::read_hs3(json).expect("read_hs3");
     let text = print_with(&m, Syntax::Minimal);
     assert!(
-        text.contains(r#"e = relabel(Exponential(rate = lam), ["ex"])"#),
+        text.contains(r#"e = Exponential(rate = lam)"#),
         "exponential rate must be the bare HS3 c, got:\n{text}"
     );
     // Must NOT negate the parameter (the old, incorrect lowering).
@@ -84,7 +84,7 @@ fn golden_uniform_interval_uses_declared_bounds() {
     let m = flatppl_hs3::read_hs3(json).expect("read_hs3");
     let text = print_with(&m, Syntax::Minimal);
     assert!(
-        text.contains(r#"u = relabel(Uniform(interval(-2.0, 5.0)), ["ux"])"#),
+        text.contains(r#"u = Uniform(interval(-2.0, 5.0))"#),
         "uniform must carry declared interval bounds (-2.0, 5.0), got:\n{text}"
     );
     assert!(parse(&text).is_ok(), "round-trip parse failed:\n{text}");
@@ -103,7 +103,7 @@ fn golden_generalized_normal() {
         "generalized_normal",
         r#"{"distributions":[{"name":"gn","type":"generalized_normal_dist","mean":"gn_mu","alpha":"gn_alpha","beta":"gn_beta","x":"gx"}],
             "parameter_points":[{"name":"n","entries":[{"name":"gn_mu","value":0.0},{"name":"gn_alpha","value":1.0},{"name":"gn_beta","value":2.0}]}]}"#,
-        r#"gn = relabel(GeneralizedNormal(mean = gn_mu, alpha = gn_alpha, beta = gn_beta), ["gx"])"#,
+        r#"gn = GeneralizedNormal(mean = gn_mu, alpha = gn_alpha, beta = gn_beta)"#,
     );
 }
 
@@ -116,7 +116,7 @@ fn golden_lognormal() {
         "lognormal",
         r#"{"distributions":[{"name":"ln","type":"lognormal_dist","mu":"lm","sigma":"ls","x":"lx"}],
             "parameter_points":[{"name":"n","entries":[{"name":"lm","value":0.0},{"name":"ls","value":1.0}]}]}"#,
-        r#"ln = relabel(LogNormal(mu = lm, sigma = ls), ["lx"])"#,
+        r#"ln = LogNormal(mu = lm, sigma = ls)"#,
     );
 }
 
@@ -179,13 +179,13 @@ fn golden_crystalball_single_and_double() {
         "crystalball_single",
         r#"{"distributions":[{"name":"cb","type":"crystalball_dist","m0":"m0","sigma":"sg","alpha":"a","n":"nn","m":"mo"}],
             "parameter_points":[{"name":"p","entries":[{"name":"m0","value":5.0},{"name":"sg","value":0.1},{"name":"a","value":1.5},{"name":"nn","value":3.0}]}]}"#,
-        r#"cb = relabel(hepphys.CrystalBall(m0, sg, a, nn), ["mo"])"#,
+        r#"cb = hepphys.CrystalBall(m0, sg, a, nn)"#,
     );
     assert_golden(
         "crystalball_double",
         r#"{"distributions":[{"name":"dcb","type":"crystalball_dist","m0":"m0","sigma_L":"sl","sigma_R":"sr","alpha_L":"al","n_L":"nl","alpha_R":"ar","n_R":"nr","m":"mo"}],
             "parameter_points":[{"name":"p","entries":[{"name":"m0","value":125.0},{"name":"sl","value":1.5},{"name":"sr","value":2.0},{"name":"al","value":1.2},{"name":"nl","value":5.0},{"name":"ar","value":1.8},{"name":"nr","value":4.0}]}]}"#,
-        r#"dcb = relabel(hepphys.DoubleSidedCrystalBall(m0, sl, sr, al, ar, nl, nr), ["mo"])"#,
+        r#"dcb = hepphys.DoubleSidedCrystalBall(m0, sl, sr, al, ar, nl, nr)"#,
     );
 }
 
@@ -198,7 +198,7 @@ fn golden_argus() {
         "argus",
         r#"{"distributions":[{"name":"ar","type":"argus_dist","resonance":"c","slope":"chi","power":"p","mass":"mo"}],
             "parameter_points":[{"name":"n","entries":[{"name":"c","value":5.29},{"name":"chi","value":-10.0},{"name":"p","value":0.5}]}]}"#,
-        r#"ar = relabel(hepphys.Argus(c, chi, p), ["mo"])"#,
+        r#"ar = hepphys.Argus(c, chi, p)"#,
     );
 }
 
@@ -225,8 +225,8 @@ fn golden_polynomial() {
         r#"{"distributions":[{"name":"poly","type":"polynomial_dist","coefficients":[1.0,"c1",0.5],"x":"po"}],
             "domains":[{"name":"default_domain","type":"product_domain","axes":[{"name":"po","min":-5.0,"max":5.0}]}],
             "parameter_points":[{"name":"n","entries":[{"name":"c1","value":0.3}]}]}"#,
-        "poly = relabel(normalize(truncate(weighted(functionof(polynomial([1.0, c1, 0.5], _po_), \
-         po = _po_), Lebesgue(reals)), interval(-5.0, 5.0))), [\"po\"])",
+        "poly = normalize(truncate(weighted(functionof(polynomial([1.0, c1, 0.5], _po_), \
+         po = _po_), Lebesgue(reals)), interval(-5.0, 5.0)))",
     );
 }
 
@@ -397,21 +397,27 @@ fn golden_paper_product_density_product() {
         text.matches("Normal").count() >= 2,
         "expected >=2 Normal calls, got:\n{text}"
     );
-    // The 10 unbinned toy-data entries become the `toy` vector (exact, in order)
-    // wired into the product likelihood — pin the full bracketed RHS so a
-    // reordered/truncated array fails rather than a single distinctive value.
+    // The 10 unbinned toy-data entries are embedded as a single-column `table`
+    // (one column per observable axis, `x`), exact and in order — pin the full
+    // column so a reordered/truncated array fails rather than one value.
     assert!(
         text.contains(
-            "toy = [-0.028567328469794265, -0.0975895992436726, 0.8301414329794277, \
+            "toy = table(x = [-0.028567328469794265, -0.0975895992436726, 0.8301414329794277, \
              -0.18001364208465098, 0.8853988033587967, -0.2791754160017632, 1.168603380508273, \
-             2.290388749097474, 0.18297688463530193, 1.8448742587493427]"
+             2.290388749097474, 0.18297688463530193, 1.8448742587493427])"
         ),
-        "toy-data vector mismatch, got:\n{text}"
+        "toy-data table mismatch, got:\n{text}"
     );
-    // 10 unbinned entries over the single observable are N iid observations:
-    // the model is plated `iid(prod, 10)` and observed against the bare vector.
+    // The data axis range becomes a companion Cartesian-product domain.
     assert!(
-        text.contains("likelihood = likelihoodof(iid(prod, 10), toy)"),
+        text.contains("toy_domain = cartprod(x = interval(-10.0, 10.0))"),
+        "toy data domain mismatch, got:\n{text}"
+    );
+    // 10 unbinned entries over the single observable are N iid observations: the
+    // model is plated `iid(prod, 10)` and observed against the table's column
+    // vector `toy.x` (`get(toy, "x")`, the canonical column access).
+    assert!(
+        text.contains("likelihood = likelihoodof(iid(prod, 10), get(toy, \"x\"))"),
         "toy-data likelihood wiring mismatch, got:\n{text}"
     );
     assert!(parse(&text).is_ok(), "round-trip parse failed:\n{text}");
@@ -429,8 +435,8 @@ fn golden_product_distinct_variates_joins() {
     let m = flatppl_hs3::read_hs3(json).expect("read_hs3");
     let text = print_with(&m, Syntax::Minimal);
     assert!(
-        text.contains("pd = joint(gx = gx, gy = gy)"),
-        "distinct-variate product must lower to joint, got:\n{text}"
+        text.contains("pd = joint(x = gx, y = gy)"),
+        "distinct-variate product must lower to a variate-keyed joint, got:\n{text}"
     );
     assert!(
         !text.contains("logweighted"),

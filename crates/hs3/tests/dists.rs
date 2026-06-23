@@ -42,7 +42,7 @@ fn generalized_normal_converts() {
     // bare-token checks, so pin the full call RHS and relabel.
     assert!(
         text.contains(
-            r#"gn_dist = relabel(GeneralizedNormal(mean = gn_mu, alpha = gn_alpha, beta = gn_beta), ["x_obs"])"#
+            r#"gn_dist = GeneralizedNormal(mean = gn_mu, alpha = gn_alpha, beta = gn_beta)"#
         ),
         "GeneralizedNormal body mismatch (kwarg→field binding), got:\n{text}"
     );
@@ -145,9 +145,7 @@ fn crystalball_single_sided_converts() {
     // Exact body: positional args (m0, sigma, alpha, n) in HS3 order, relabeled
     // onto the observed mass variate m_obs.
     assert!(
-        text.contains(
-            "cb_dist = relabel(hepphys.CrystalBall(cb_m0, cb_sigma, cb_alpha, cb_n), [\"m_obs\"])"
-        ),
+        text.contains("cb_dist = hepphys.CrystalBall(cb_m0, cb_sigma, cb_alpha, cb_n)"),
         "single-sided CrystalBall body mismatch, got:\n{text}"
     );
 
@@ -205,8 +203,8 @@ fn crystalball_double_sided_converts() {
     // (m0, sigma_L, sigma_R, alpha_L, alpha_R, n_L, n_R), relabeled onto m_obs2.
     assert!(
         text.contains(
-            "dscb_dist = relabel(hepphys.DoubleSidedCrystalBall(dscb_m0, dscb_sigL, dscb_sigR, \
-             dscb_aL, dscb_aR, dscb_nL, dscb_nR), [\"m_obs2\"])"
+            "dscb_dist = hepphys.DoubleSidedCrystalBall(dscb_m0, dscb_sigL, dscb_sigR, \
+             dscb_aL, dscb_aR, dscb_nL, dscb_nR)"
         ),
         "double-sided CrystalBall body mismatch, got:\n{text}"
     );
@@ -252,7 +250,7 @@ fn argus_converts() {
     // Exact body: positional args (resonance, slope, power) in HS3 order,
     // relabeled onto the observed mass variate.
     assert!(
-        text.contains("argus_d = relabel(hepphys.Argus(arg_c, arg_chi, arg_p), [\"mass_obs\"])"),
+        text.contains("argus_d = hepphys.Argus(arg_c, arg_chi, arg_p)"),
         "Argus body mismatch, got:\n{text}"
     );
     assert!(
@@ -774,8 +772,8 @@ fn polynomial_dist_converts() {
     // against Lebesgue(reals), and relabeled onto the observed variate p_obs.
     assert!(
         text.contains(
-            "poly_d = relabel(normalize(truncate(weighted(functionof(polynomial([1.0, c1, 0.5], _p_obs_), \
-             p_obs = _p_obs_), Lebesgue(reals)), interval(-5.0, 5.0))), [\"p_obs\"])"
+            "poly_d = normalize(truncate(weighted(functionof(polynomial([1.0, c1, 0.5], _p_obs_), \
+             p_obs = _p_obs_), Lebesgue(reals)), interval(-5.0, 5.0)))"
         ),
         "polynomial_dist body mismatch, got:\n{text}"
     );
@@ -929,7 +927,7 @@ fn efficiency_product_pdf_converts() {
     // The wrapped exponential pdf still carries its own variate via relabel,
     // with the corrected rate = c (no negation).
     assert!(
-        text.contains(r#"m = relabel(Exponential(rate = lam), ["t"])"#),
+        text.contains(r#"m = Exponential(rate = lam)"#),
         "wrapped exponential pdf missing or rate mis-emitted, got:\n{text}"
     );
     flatppl_syntax::parse(&text).expect("re-parse");

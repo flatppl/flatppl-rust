@@ -784,16 +784,23 @@ pub fn emit_product(
         let lw = b.call("logweighted", &[weight_fn, base]);
         Ok(b.call("normalize", &[lw]))
     } else {
-        // Independent product → joint with factor-named variate fields.
+        // Independent product → joint keyed by each factor's VARIATE name, so the
+        // joint's record fields match the observable names in the data / domain
+        // (e.g. `joint(x = gx, y = gy)`). The keyword form is exactly
+        // `joint(relabel(gx, ["x"]), …)` (§06), so the factor measures stay bare.
+        // A multivariate or unnamed factor falls back to its binding name.
         let named: Vec<NamedArg> = factors
             .iter()
-            .map(|f| {
-                let name = b.m.intern(f);
-                let value = b.self_ref(f);
+            .zip(factor_variates)
+            .map(|(f, fv)| {
+                let key = match fv {
+                    Some(VariateName::Single(v)) => v.clone(),
+                    _ => f.clone(),
+                };
                 NamedArg {
                     kind: NamedKind::Field,
-                    name,
-                    value,
+                    name: b.m.intern(&key),
+                    value: b.self_ref(f),
                 }
             })
             .collect();

@@ -30,7 +30,7 @@ fn convert_from_hs3_minimal() {
         text.contains("Normal") && text.contains("record"),
         "got:\n{text}"
     );
-    assert!(text.contains("relabel"), "got:\n{text}");
+    assert!(text.contains("% observable: m_obs"), "got:\n{text}");
 }
 
 /// `.hs3.json` / `.pyhf.json` names are auto-detected without `--from`
@@ -157,12 +157,13 @@ fn convert_from_hs3_fixture() {
         "flatppl convert --from hs3 (paper_gaussian) failed"
     );
     let text = std::fs::read_to_string(&out).unwrap();
-    // HS3 paper § A.1: a single gaussian_dist relabeled onto the observed
-    // variate, a free mean param, a const-fixed sigma, the unbinned observation
-    // value 1.27, and the likelihoodof wiring.
+    // HS3 paper § A.1: a single gaussian_dist as a bare measure with its
+    // observable recorded in a doc comment, a free mean param, a const-fixed
+    // sigma, the unbinned observation value 1.27, and the likelihoodof wiring.
     assert!(
-        text.contains("Normal(") && text.contains("relabel"),
-        "missing relabeled Normal, got:\n{text}"
+        text.contains("gauss_x = Normal(mu = mu, sigma = sigma)")
+            && text.contains("% observable: x"),
+        "missing bare Normal + observable doc, got:\n{text}"
     );
     assert!(
         text.contains("mu = elementof(reals)"),

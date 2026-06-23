@@ -12,14 +12,22 @@ fn paper_gaussian_converts() {
         flatppl_hs3::read(FIXTURE_GAUSSIAN).expect("paper_gaussian.json must parse and convert");
     let text = print_with(&m, Syntax::Minimal);
 
-    assert!(text.contains("Normal"), "missing Normal, got:\n{text}");
-    assert!(text.contains("relabel"), "missing relabel, got:\n{text}");
-    // The single unbinned observation 1.27 is observed as a record keyed by the
-    // distribution's variate name `x` (the model is `relabel(Normal, ["x"])`, a
-    // record-shaped measure, so the observation must match its axes).
+    // Univariate gaussian lowers to a bare measure (no relabel); the observable
+    // name `x` is carried by the data table / domain below.
     assert!(
-        text.contains("obs_gaussian_channel = record(x = 1.27)"),
-        "observed-data record mismatch (expected record(x = 1.27)), got:\n{text}"
+        text.contains("gauss_x = Normal(mu = mu, sigma = sigma)"),
+        "expected bare Normal lowering, got:\n{text}"
+    );
+    // The unbinned data (one entry, 1.27) is embedded as a single-column `table`
+    // keyed by the observable axis `x` (spec §03 data carrier).
+    assert!(
+        text.contains("obs_gaussian_channel = table(x = [1.27])"),
+        "observed-data table mismatch (expected table(x = [1.27])), got:\n{text}"
+    );
+    // The data axis carries no min/max here, so its domain is the unbounded reals.
+    assert!(
+        text.contains("obs_gaussian_channel_domain = cartprod(x = interval(neg(inf), inf))"),
+        "data domain mismatch, got:\n{text}"
     );
     assert!(
         text.contains("elementof"),
@@ -27,10 +35,11 @@ fn paper_gaussian_converts() {
     );
     // sigma is const:true -> fixed(...)
     assert!(text.contains("fixed"), "missing fixed(sigma), got:\n{text}");
-    // likelihoodof wiring
+    // The single observation over one observable is observed against the table
+    // column vector under a one-row iid plate.
     assert!(
-        text.contains("likelihoodof"),
-        "missing likelihoodof, got:\n{text}"
+        text.contains("obs = likelihoodof(iid(gauss_x, 1), get(obs_gaussian_channel, \"x\"))"),
+        "likelihood wiring mismatch, got:\n{text}"
     );
 
     // Round-trip: emitted FlatPPL must re-parse without error.
@@ -122,21 +131,25 @@ fn paper_product_converts() {
         text.contains("likelihoodof"),
         "missing likelihoodof, got:\n{text}"
     );
-    // The 10 unbinned toy-data entries become the `toy` vector, in order, fed to
-    // the product likelihood. Pin the exact bracketed binding RHS (a reordered or
-    // truncated array fails) plus the wiring into likelihoodof.
+    // The 10 unbinned toy-data entries become the `toy` table's `x` column, in
+    // order. Pin the exact column RHS (a reordered or truncated array fails),
+    // its companion data domain, and the wiring into likelihoodof.
     assert!(
         text.contains(
-            "toy = [-0.028567328469794265, -0.0975895992436726, 0.8301414329794277, \
+            "toy = table(x = [-0.028567328469794265, -0.0975895992436726, 0.8301414329794277, \
              -0.18001364208465098, 0.8853988033587967, -0.2791754160017632, 1.168603380508273, \
-             2.290388749097474, 0.18297688463530193, 1.8448742587493427]"
+             2.290388749097474, 0.18297688463530193, 1.8448742587493427])"
         ),
-        "toy-data vector mismatch, got:\n{text}"
+        "toy-data table mismatch, got:\n{text}"
+    );
+    assert!(
+        text.contains("toy_domain = cartprod(x = interval(-10.0, 10.0))"),
+        "toy data domain mismatch, got:\n{text}"
     );
     // 10 unbinned entries over one observable = N iid observations: the model is
-    // plated `iid(prod, 10)`, observed against the bare toy vector.
+    // plated `iid(prod, 10)`, observed against the table column `toy.x`.
     assert!(
-        text.contains("likelihood = likelihoodof(iid(prod, 10), toy)"),
+        text.contains("likelihood = likelihoodof(iid(prod, 10), get(toy, \"x\"))"),
         "toy-data likelihood wiring mismatch, got:\n{text}"
     );
 

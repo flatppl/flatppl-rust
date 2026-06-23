@@ -75,19 +75,9 @@ fn duplicate_binding_name_errs() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Multi-dimensional unbinned datum → Err (only scalar observations supported).
-// ---------------------------------------------------------------------------
-#[test]
-fn multidim_unbinned_data_errs() {
-    assert_err_hs3(
-        "multidim_unbinned",
-        r#"{"distributions":[{"name":"g","type":"gaussian_dist","mean":"mu","sigma":"s","x":"gx"}],
-            "data":[{"name":"obs","type":"unbinned","entries":[[1.0,2.0]]}],
-            "parameter_points":[{"name":"n","entries":[{"name":"mu","value":0.0},{"name":"s","value":1.0}]}]}"#,
-        "dimensional",
-    );
-}
+// NOTE: multi-dimensional unbinned data is no longer an error — it is embedded
+// as a multi-column `table` (one column per observable axis). Positive coverage
+// of the table/domain lowering lives in `tests/data_tables.rs`.
 
 // ---------------------------------------------------------------------------
 // Multi-axis bincounts → Err (only single-axis binning supported).
