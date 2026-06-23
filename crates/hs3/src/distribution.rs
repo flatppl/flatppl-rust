@@ -3,6 +3,7 @@ use crate::builder::Builder;
 use crate::dist_spec::{self, Variate};
 use crate::error::{Error, Result};
 use crate::expr;
+use crate::expr::wrap_lambda_multi;
 use crate::model::Distribution;
 use flatppl_core::id::NodeId;
 use flatppl_core::node::{Call, CallHead, Inputs, NamedArg, NamedKind, Node, Ref, RefNs};
@@ -969,6 +970,48 @@ pub fn needs_hepphys(kind: &str) -> bool {
     dist_spec::needs_hepphys(kind)
 }
 
+/// Emit a conditional/multivariate distribution as a joint-normalized density:
+/// `normalize(logweighted((axes…) -> logdensityof(<dist>, obs), Lebesgue(support = cartprod(…))))`.
+///
+/// `obs` is this distribution's own observable; `record_axes` is every observable
+/// in the record with its `(lo, hi)` interval, in axis order.
+// Task 4 (detect + dispatch) will be the first caller outside tests.
+#[allow(dead_code)]
+pub fn emit_conditional(
+    b: &mut Builder,
+    d: &Distribution,
+    obs: &str,
+    record_axes: &[(String, (f64, f64))],
+    cond: &CondCtx,
+) -> Result<NodeId> {
+    // Inner distribution with functional params applied to their axes.
+    let inner = emit_distribution(b, d, None, None, Some(cond))?;
+    let obs_ref = b.self_ref(obs);
+    let body = b.call("logdensityof", &[inner, obs_ref]);
+    // Lambda over the record axes, in order.
+    let names: Vec<&str> = record_axes.iter().map(|(n, _)| n.as_str()).collect();
+    let lambda = wrap_lambda_multi(b, body, &names);
+    // Build interval nodes in a separate pass to avoid interleaving borrows.
+    let intervals: Vec<NodeId> = record_axes
+        .iter()
+        .map(|(_, (lo, hi))| {
+            let lo_node = b.lit_real(*lo);
+            let hi_node = b.lit_real(*hi);
+            b.call("interval", &[lo_node, hi_node])
+        })
+        .collect();
+    // Joint Lebesgue support = cartprod(axis = interval(lo, hi), …).
+    let axis_fields: Vec<(&str, NodeId)> = record_axes
+        .iter()
+        .zip(intervals.iter())
+        .map(|((n, _), &iv)| (n.as_str(), iv))
+        .collect();
+    let support = b.call_fields("cartprod", &axis_fields);
+    let lebesgue = b.call_kw("Lebesgue", &[("support", support)]);
+    let lw = b.call("logweighted", &[lambda, lebesgue]);
+    Ok(b.call("normalize", &[lw]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1395,6 +1438,49 @@ mod tests {
             flatppl_syntax::print_with(&m, flatppl_syntax::Syntax::Minimal)
         };
         assert!(text.contains("Normal(mu = fy(y)"), "got: {text}");
+    }
+
+    #[test]
+    fn emit_conditional_builds_joint_normalized_density() {
+        use std::collections::{BTreeMap, BTreeSet};
+        let mut m = flatppl_core::Module::new();
+        let text = {
+            let mut b = Builder::new(&mut m);
+            let funcs: BTreeMap<&str, &str> = [("fy", "y")].into_iter().collect();
+            let axes: BTreeSet<&str> = ["x", "y"].into_iter().collect();
+            let ctx = CondCtx {
+                funcs: &funcs,
+                axes: &axes,
+            };
+            let d = dist(
+                "gaussian_dist",
+                &[
+                    ("x", serde_json::json!("x")),
+                    ("mean", serde_json::json!("fy")),
+                    ("sigma", serde_json::json!("sigma")),
+                ],
+            );
+            let record = vec![
+                ("x".to_string(), (-5.0, 5.0)),
+                ("y".to_string(), (-5.0, 5.0)),
+            ];
+            let node = emit_conditional(&mut b, &d, "x", &record, &ctx).unwrap();
+            b.bind("model", node);
+            flatppl_syntax::print_with(&m, flatppl_syntax::Syntax::Minimal)
+        };
+        assert!(text.contains("normalize("), "got: {text}");
+        assert!(text.contains("logweighted("), "got: {text}");
+        // Minimal syntax: functionof(<body>, x = _x_, y = _y_); obs/axis refs rewritten to locals.
+        assert!(
+            text.contains("logdensityof(Normal(mu = fy(_y_), sigma = sigma), _x_)"),
+            "got: {text}"
+        );
+        assert!(
+            text.contains(
+                "Lebesgue(support = cartprod(x = interval(-5.0, 5.0), y = interval(-5.0, 5.0)))"
+            ),
+            "got: {text}"
+        );
     }
 
     #[test]
