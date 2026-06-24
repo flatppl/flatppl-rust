@@ -81,27 +81,47 @@ impl CliResolver {
         }
     }
 
-    /// Resolve `loc` to a local file and read it as UTF-8 text. A URL is fetched
-    /// and cached, gated on trust (which a prior `ensure_trusted` call may
-    /// already have granted for the whole wave, so this does not re-prompt).
-    pub fn read_string(&self, loc: &Location) -> Result<String, Failure> {
+    /// Resolve `loc` to a local file path: a local path is returned if it
+    /// exists; a URL is fetched + cached (gated on trust, which a prior
+    /// `ensure_trusted` may already have granted for the wave) and its cached
+    /// object path returned. Reads no content — the data reader / parser does.
+    pub fn resolve_path(&self, loc: &Location) -> Result<std::path::PathBuf, Failure> {
         self.ensure_trusted(&[loc])?;
-        let path = match loc {
+        match loc {
             Location::Local(p) => {
-                if !p.exists() {
-                    return Err(Failure::Plain(format!("file not found: {}", p.display())));
+                if p.exists() {
+                    Ok(p.clone())
+                } else {
+                    Err(Failure::Plain(format!("file not found: {}", p.display())))
                 }
-                p.clone()
             }
             Location::Remote(url) => {
                 let oracle = |u: &str| self.approved.borrow().contains(u);
                 self.cache
                     .get(url, &self.fetcher, &oracle)
-                    .map_err(|e| Failure::Plain(e.to_string()))?
+                    .map_err(|e| Failure::Plain(e.to_string()))
             }
-        };
+        }
+    }
+
+    /// Resolve `loc` and read it as UTF-8 text (for FlatPPL/FlatPIR sources).
+    pub fn read_string(&self, loc: &Location) -> Result<String, Failure> {
+        let path = self.resolve_path(loc)?;
         std::fs::read_to_string(&path)
             .map_err(|e| Failure::Plain(format!("reading `{}`: {e}", loc.display())))
+    }
+
+    /// Resolve a batch of locations to local files (fetching + caching URLs,
+    /// validating local paths) with a single batched trust prompt. Used to make
+    /// a model's `load_data` sources locally available; the bytes are read later
+    /// by the data reader, not here.
+    pub fn resolve_all(&self, locs: &[Location]) -> Result<(), Failure> {
+        let refs: Vec<&Location> = locs.iter().collect();
+        self.ensure_trusted(&refs)?;
+        for loc in locs {
+            self.resolve_path(loc)?;
+        }
+        Ok(())
     }
 }
 
@@ -125,36 +145,70 @@ fn prompt_trust(urls: &[String]) -> Result<bool, Failure> {
     ))
 }
 
-/// The `load_module` directives in `module`: each `(source-string, resolved
-/// Location)`, the source resolved relative to `base`. `standard_module` is a
-/// catalogue reference (not a file) and is excluded; a non-literal source is
-/// skipped (it cannot be resolved statically).
-pub fn directives_of(module: &Module, base: &Location) -> Vec<(String, Location)> {
+/// The string literal `source` of a `load_module`/`load_data` call: the first
+/// positional argument, or a `source =` keyword argument (the form `load_data`
+/// commonly uses). `None` for a non-literal source — it cannot be resolved
+/// statically by the host.
+fn source_of<'m>(module: &'m Module, call: &flatppl_core::Call) -> Option<&'m str> {
+    if let Some(&arg0) = call.args.first() {
+        if let Node::Lit(Scalar::Str(s)) = module.node(arg0) {
+            return Some(s);
+        }
+    }
+    for named in call.named.iter() {
+        if module.resolve(named.name) == "source" {
+            if let Node::Lit(Scalar::Str(s)) = module.node(named.value) {
+                return Some(s);
+            }
+        }
+    }
+    None
+}
+
+/// Every `source` of the builtin `head` in `module`, as `(source-string,
+/// resolved Location)` with the source resolved relative to `base`.
+/// `standard_module` is a catalogue reference (not a file) and never matched
+/// here; non-literal sources are skipped.
+fn sources_with_head(module: &Module, base: &Location, head: &str) -> Vec<(String, Location)> {
     let mut out = Vec::new();
     for i in 0..module.node_count() {
         let id = NodeId::from_usize(i);
         let Node::Call(call) = module.node(id) else {
             continue;
         };
-        let CallHead::Builtin(head) = call.head else {
+        let CallHead::Builtin(h) = call.head else {
             continue;
         };
-        if module.resolve(head) != "load_module" {
+        if module.resolve(h) != head {
             continue;
         }
-        if let Some(&arg0) = call.args.first() {
-            if let Node::Lit(Scalar::Str(source)) = module.node(arg0) {
-                out.push((source.to_string(), base.join(source)));
-            }
+        if let Some(source) = source_of(module, call) {
+            out.push((source.to_string(), base.join(source)));
         }
     }
     out
 }
 
-/// Build the inference [`ModuleBundle`] for `root` (located at `root_loc`):
-/// breadth-first over the `load_module` graph, resolving + parsing each
-/// dependency through `resolver` and keying the bundle by the directive string
-/// the engine looks up. Trust is batched per BFS level.
+/// The `load_module` directives in `module`, each resolved relative to `base`.
+pub fn directives_of(module: &Module, base: &Location) -> Vec<(String, Location)> {
+    sources_with_head(module, base, "load_module")
+}
+
+/// The `load_data` source locations in `module`, resolved relative to `base`.
+pub fn data_sources_of(module: &Module, base: &Location) -> Vec<Location> {
+    sources_with_head(module, base, "load_data")
+        .into_iter()
+        .map(|(_, loc)| loc)
+        .collect()
+}
+
+/// Discover and resolve a model's references for inference. Walks the
+/// `load_module` graph breadth-first, resolving + parsing each dependency
+/// through `resolver` into a [`ModuleBundle`] keyed by the directive string the
+/// engine looks up (trust batched per BFS level), and collects every
+/// `load_data` source location found across the graph (root + dependencies),
+/// deduplicated. The data locations are returned, not fetched here — the caller
+/// decides whether/when to resolve them (see [`CliResolver::resolve_all`]).
 ///
 /// The bundle is keyed by directive string (the engine's lookup key), so a
 /// given string must denote one file across the whole graph — a conflict is a
@@ -164,7 +218,7 @@ pub fn build_bundle(
     root: &Module,
     root_loc: &Location,
     resolver: &CliResolver,
-) -> Result<flatppl_infer::ModuleBundle, Failure> {
+) -> Result<(flatppl_infer::ModuleBundle, Vec<Location>), Failure> {
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -175,7 +229,18 @@ pub fn build_bundle(
     let mut walked: HashSet<String> = HashSet::new();
     // directive string → resolved location, to catch a string used for two files.
     let mut key_loc: HashMap<String, String> = HashMap::new();
+    // `load_data` source locations across the graph, deduped by display.
+    let mut data: Vec<Location> = Vec::new();
+    let mut data_seen: HashSet<String> = HashSet::new();
+    let mut collect_data = |module: &Module, base: &Location| {
+        for loc in data_sources_of(module, base) {
+            if data_seen.insert(loc.display()) {
+                data.push(loc);
+            }
+        }
+    };
 
+    collect_data(root, root_loc);
     walked.insert(root_loc.display());
     let mut level = directives_of(root, root_loc);
 
@@ -221,14 +286,16 @@ pub fn build_bundle(
             };
             bundle.insert(directive.clone(), module.clone());
 
-            // Queue this file's own dependencies exactly once.
+            // Queue this file's own dependencies (and collect its data
+            // sources) exactly once.
             if walked.insert(ld.clone()) {
+                collect_data(&module, loc);
                 next.extend(directives_of(&module, loc));
             }
         }
         level = next;
     }
-    Ok(bundle)
+    Ok((bundle, data))
 }
 
 #[cfg(all(test, feature = "infer"))]
@@ -255,7 +322,7 @@ mod tests {
         let source = std::fs::read_to_string(&root_path).unwrap();
         let mut root = flatppl_syntax::parse(&source).expect("root parses");
 
-        let bundle = build_bundle(&root, &root_loc, &resolver).expect("bundle builds");
+        let (bundle, _data) = build_bundle(&root, &root_loc, &resolver).expect("bundle builds");
         let diags = flatppl_infer::infer_module(&mut root, &bundle, flatppl_infer::Level::Shape);
 
         let resolution_errors: Vec<_> = diags
@@ -271,5 +338,37 @@ mod tests {
             resolution_errors.is_empty(),
             "nested local deps must resolve via the CLI walker; got {resolution_errors:?}"
         );
+    }
+
+    /// `load_data` sources are discovered (kwarg `source =` form included) and
+    /// routed through the same resolver: a present local file resolves, a
+    /// missing one errors — proving load_data file resolution goes through
+    /// `fileaccess` like `load_module`.
+    #[test]
+    fn load_data_sources_discovered_and_resolved() {
+        let dir = std::env::temp_dir().join(format!("flatppl-ld-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("events.csv"), "a\n1\n").unwrap();
+        let model = "obs = load_data(source = \"events.csv\", valueset = reals)\n\
+                     w = load_data(\"weights.csv\", reals)\n";
+        let root_loc = Location::Local(dir.join("model.flatppl"));
+        let root = flatppl_syntax::parse(model).expect("parses");
+        let resolver = CliResolver::from_env();
+
+        let (_bundle, data) = build_bundle(&root, &root_loc, &resolver).expect("walks");
+        let names: Vec<String> = data.iter().map(|l| l.name()).collect();
+        assert!(
+            names.contains(&"events.csv".to_string()) && names.contains(&"weights.csv".to_string()),
+            "both load_data sources (kwarg + positional) must be discovered; got {names:?}"
+        );
+
+        // The present file resolves; the missing one is an error.
+        let present = Location::Local(dir.join("events.csv"));
+        assert!(resolver.resolve_path(&present).is_ok());
+        let missing = Location::Local(dir.join("weights.csv"));
+        assert!(resolver.resolve_path(&missing).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
