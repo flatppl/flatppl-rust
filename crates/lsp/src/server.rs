@@ -65,6 +65,16 @@ pub fn run(
 
     let mut uri_to_file: HashMap<String, SourceFile> = HashMap::new();
 
+    // Remote `load_module` / `load_data` URL sources, fed by the editor client
+    // via the `flatppl/urlSources` notification and keyed by the URL string.
+    // The LSP NEVER fetches: it can't obtain URL-trust approval over the protocol
+    // (spec §sec:url-cache requires interactive approval / non-interactive
+    // refusal), and the client is already the sole fetcher+truster. These are
+    // merged into the `FileSet` for resolution but kept OUT of `uri_to_file`, so
+    // they participate in cross-module inference yet never get diagnostics
+    // published (they are dependency content, not editor buffers).
+    let mut url_to_file: HashMap<String, SourceFile> = HashMap::new();
+
     #[allow(deprecated)]
     let roots: Vec<String> = {
         let mut v = Vec::new();
@@ -84,7 +94,7 @@ pub fn run(
         }
     }
 
-    let fs = build_fileset(&db, &uri_to_file);
+    let fs = build_fileset(&db, &uri_to_file, &url_to_file);
 
     // URIs of files currently open in the editor (via didOpen/didClose).
     // Files added from disk by didChangeWatchedFiles are NOT in this set, so
@@ -182,7 +192,7 @@ pub fn run(
                         upsert_file(&mut db, &mut uri_to_file, uri_str, text);
                         // Update the shared FileSet only when the file SET membership
                         // changes (a new open always adds a file, so this fires).
-                        sync_file_set(&mut db, fs, &uri_to_file);
+                        sync_file_set(&mut db, fs, &uri_to_file, &url_to_file);
                         // Re-publish diagnostics for ALL open docs: a newly-opened
                         // file can satisfy a previously-unresolved import in any
                         // already-open doc, so the full set must be refreshed.
@@ -222,7 +232,7 @@ pub fn run(
                         }
                         // Guard the FileSet salsa input: a pure text edit leaves
                         // membership unchanged, so no revision bump is needed.
-                        sync_file_set(&mut db, fs, &uri_to_file);
+                        sync_file_set(&mut db, fs, &uri_to_file, &url_to_file);
                         // Republish diagnostics only for the changed doc and the
                         // open docs that (transitively) import it — the only docs
                         // whose diagnostics can change on this edit. Mark them
@@ -303,7 +313,7 @@ pub fn run(
                                 _ => {}
                             }
                         }
-                        sync_file_set(&mut db, fs, &uri_to_file);
+                        sync_file_set(&mut db, fs, &uri_to_file, &url_to_file);
                         // Republish diagnostics for all tracked docs: a watched-file
                         // change can affect any open importer. Mark them dirty and
                         // arm the debounce.
@@ -311,6 +321,50 @@ pub fn run(
                             dirty.insert(doc_uri_str.clone());
                         }
                         diag_deadline = Some(Instant::now() + DEBOUNCE);
+                    }
+                    "flatppl/urlSources" => {
+                        // The editor client is the sole fetcher+truster of remote
+                        // `load_module` / `load_data` URLs (the LSP cannot prompt
+                        // for URL approval over the protocol). It pushes the
+                        // content it already fetched as `{ sources: [{uri, text}] }`;
+                        // we merge it into the FileSet as read-only source entries
+                        // so resolution finds it. No network, no trust, no fetch
+                        // on this side — the content is simply a salsa input.
+                        let entries = note
+                            .params
+                            .get("sources")
+                            .and_then(|v| v.as_array())
+                            .cloned()
+                            .unwrap_or_default();
+                        let mut changed = false;
+                        for entry in &entries {
+                            let (Some(url), Some(text)) = (
+                                entry.get("uri").and_then(|v| v.as_str()),
+                                entry.get("text").and_then(|v| v.as_str()),
+                            ) else {
+                                continue;
+                            };
+                            upsert_url_source(
+                                &mut db,
+                                &mut url_to_file,
+                                url.to_string(),
+                                text.to_string(),
+                            );
+                            changed = true;
+                        }
+                        if changed {
+                            // A fed URL can satisfy a previously-unresolved import
+                            // in any open doc, so refresh them all (the URL sources
+                            // themselves are not in `uri_to_file`, so they get no
+                            // diagnostics). A pure-text re-feed leaves membership
+                            // unchanged but still invalidates importers via the
+                            // dep's `parse` edge.
+                            sync_file_set(&mut db, fs, &uri_to_file, &url_to_file);
+                            for doc_uri_str in uri_to_file.keys() {
+                                dirty.insert(doc_uri_str.clone());
+                            }
+                            diag_deadline = Some(Instant::now() + DEBOUNCE);
+                        }
                     }
                     _ => {} // ignore other notifications
                 }
@@ -556,11 +610,22 @@ fn scan_dir(dir: &Path, db: &mut Database, uri_to_file: &mut HashMap<String, Sou
     }
 }
 
-/// Build (or rebuild) a [`FileSet`] from the current `uri_to_file` map.
+/// Build (or rebuild) a [`FileSet`] from the editor buffers (`uri_to_file`) plus
+/// the client-fed URL sources (`url_to_file`).
 ///
-/// Called any time a file is added or modified so salsa sees a fresh input.
-fn build_fileset(db: &Database, uri_to_file: &HashMap<String, SourceFile>) -> FileSet {
-    let files: Vec<SourceFile> = uri_to_file.values().copied().collect();
+/// Called any time the membership changes so salsa sees a fresh input. URL
+/// sources are included for resolution (their stored path is the URL, which
+/// `resolve_path` matches via `Location`) but never get diagnostics published.
+fn build_fileset(
+    db: &Database,
+    uri_to_file: &HashMap<String, SourceFile>,
+    url_to_file: &HashMap<String, SourceFile>,
+) -> FileSet {
+    let files: Vec<SourceFile> = uri_to_file
+        .values()
+        .chain(url_to_file.values())
+        .copied()
+        .collect();
     FileSet::new(db, files)
 }
 
@@ -578,9 +643,18 @@ fn build_fileset(db: &Database, uri_to_file: &HashMap<String, SourceFile>) -> Fi
 /// guard would wrongly skip the update, leaving the `FileSet` salsa input stale
 /// (keeping the deleted `SourceFile`, missing the new one). Comparing the actual
 /// member handles catches this case correctly.
-fn sync_file_set(db: &mut Database, fs: FileSet, uri_to_file: &HashMap<String, SourceFile>) {
+fn sync_file_set(
+    db: &mut Database,
+    fs: FileSet,
+    uri_to_file: &HashMap<String, SourceFile>,
+    url_to_file: &HashMap<String, SourceFile>,
+) {
     use salsa::Setter;
-    let mut new_files: Vec<SourceFile> = uri_to_file.values().copied().collect();
+    let mut new_files: Vec<SourceFile> = uri_to_file
+        .values()
+        .chain(url_to_file.values())
+        .copied()
+        .collect();
     new_files.sort_by_key(|f| f.path(db).clone());
     let mut current: Vec<SourceFile> = fs.files(db).to_vec();
     current.sort_by_key(|f| f.path(db).clone());
@@ -636,6 +710,31 @@ fn upsert_file(
         let path = file_uri_to_path(&uri_str).unwrap_or_else(|| uri_str.clone());
         let file = SourceFile::new(db, path, text);
         uri_to_file.insert(uri_str, file);
+        file
+    }
+}
+
+/// Insert or update a client-fed URL source (from `flatppl/urlSources`), keyed
+/// by the URL.
+///
+/// Unlike [`upsert_file`] there is no URI→path conversion: the stored
+/// `SourceFile.path` **is** the URL, so [`resolve_path`](crate::queries) (via
+/// `Location`) matches a `load_module(url)` directive — or a URL-relative
+/// directive joined against an importer URL — straight against it. An existing
+/// entry is updated in place via the salsa setter so importers recompute.
+fn upsert_url_source(
+    db: &mut Database,
+    url_to_file: &mut HashMap<String, SourceFile>,
+    url: String,
+    text: String,
+) -> SourceFile {
+    use salsa::Setter;
+    if let Some(&existing) = url_to_file.get(&url) {
+        existing.set_text(db).to(text);
+        existing
+    } else {
+        let file = SourceFile::new(db, url.clone(), text);
+        url_to_file.insert(url, file);
         file
     }
 }
@@ -1478,6 +1577,136 @@ mod tests {
         server_thread.join().expect("server thread panicked");
     }
 
+    // ── flatppl/urlSources: client-fed URL deps resolve (server never fetches) ─
+    //
+    // A model loads a URL module which itself has a *relative* `load_module` dep.
+    // The server has no network; the editor client pushes the fetched URL content
+    // via `flatppl/urlSources`. After the push, a hover on the model's cross-URL
+    // reference resolves through the whole chain (model → common → priors, the
+    // last reached by URL-relative join) — proving URL deps resolve from fed
+    // content alone, with zero fetching.
+
+    #[test]
+    fn url_sources_feed_resolves_cross_url_reference() {
+        use lsp_server::{Connection, Message};
+        use lsp_types::notification::{DidOpenTextDocument, Notification as _};
+        use lsp_types::request::{HoverRequest, Request as _};
+
+        let (client_conn, server_conn) = Connection::memory();
+        let server_thread = std::thread::spawn(move || {
+            let init_params = serde_json::json!({ "capabilities": {} });
+            run(server_conn, init_params).expect("server loop failed");
+        });
+
+        // Open the model: it loads a URL `common` module and uses `c.m`.
+        let open = lsp_types::DidOpenTextDocumentParams {
+            text_document: lsp_types::TextDocumentItem {
+                uri: Uri::from_str("file:///tmp/model.flatppl").unwrap(),
+                language_id: "flatppl".into(),
+                version: 1,
+                text: "c = load_module(\"https://h.example/ex/common.flatppl\")\n\
+                       v = add(c.m, 1.0)\n"
+                    .into(),
+            },
+        };
+        client_conn
+            .sender
+            .send(Message::Notification(lsp_server::Notification::new(
+                DidOpenTextDocument::METHOD.to_owned(),
+                open,
+            )))
+            .unwrap();
+        // Drain the model's initial diagnostics (URL dep not yet fed).
+        let _ = client_conn
+            .receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("expected initial publishDiagnostics for model");
+
+        // Push the fetched URL sources: `common` (which loads `priors.flatppl`
+        // RELATIVE to its own URL) and `priors`.
+        let url_sources = serde_json::json!({
+            "sources": [
+                {
+                    "uri": "https://h.example/ex/common.flatppl",
+                    "text": "pr = load_module(\"priors.flatppl\")\nm = add(pr.theta, 1.0)\n"
+                },
+                {
+                    "uri": "https://h.example/ex/priors.flatppl",
+                    "text": "theta = elementof(reals)\n"
+                }
+            ]
+        });
+        client_conn
+            .sender
+            .send(Message::Notification(lsp_server::Notification::new(
+                "flatppl/urlSources".to_owned(),
+                url_sources,
+            )))
+            .unwrap();
+        // Drain the model's re-published diagnostics after the feed.
+        let _ = client_conn
+            .receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("expected re-published diagnostics after urlSources feed");
+
+        // Hover on `add(c.m, 1.0)` (line 1, char 4 = 'a' of 'add'). Resolves to
+        // Scalar(Real) only if the whole URL chain resolved from fed content.
+        let hover_params = lsp_types::HoverParams {
+            text_document_position_params: lsp_types::TextDocumentPositionParams {
+                text_document: lsp_types::TextDocumentIdentifier {
+                    uri: Uri::from_str("file:///tmp/model.flatppl").unwrap(),
+                },
+                position: lsp_types::Position {
+                    line: 1,
+                    character: 4,
+                },
+            },
+            work_done_progress_params: Default::default(),
+        };
+        client_conn
+            .sender
+            .send(Message::Request(lsp_server::Request::new(
+                lsp_server::RequestId::from(42i32),
+                HoverRequest::METHOD.to_owned(),
+                serde_json::to_value(hover_params).unwrap(),
+            )))
+            .unwrap();
+        let resp_msg = client_conn
+            .receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("timed out waiting for hover response");
+        let Message::Response(resp) = resp_msg else {
+            panic!("expected a Response, got: {resp_msg:?}");
+        };
+        let result = resp.result.expect("hover result present");
+        assert!(
+            result != serde_json::Value::Null && result.to_string().to_lowercase().contains("real"),
+            "hover on `c.m` must resolve through the fed URL chain to a real type; got: {result}"
+        );
+
+        // Shutdown.
+        client_conn
+            .sender
+            .send(Message::Request(lsp_server::Request::new(
+                lsp_server::RequestId::from(99i32),
+                "shutdown".into(),
+                serde_json::Value::Null,
+            )))
+            .unwrap();
+        let _ = client_conn
+            .receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .ok();
+        client_conn
+            .sender
+            .send(Message::Notification(lsp_server::Notification::new(
+                "exit".into(),
+                serde_json::Value::Null,
+            )))
+            .unwrap();
+        server_thread.join().expect("server thread panicked");
+    }
+
     // ── didChangeWatchedFiles: on-disk create/change picked up ───────────────
     //
     // Scenario: the server starts with an empty workspace. A `.flatppl` file is
@@ -1705,7 +1934,7 @@ mod tests {
             "initial FileSet must have 2 members"
         );
 
-        sync_file_set(&mut db, fs, &uri_to_file);
+        sync_file_set(&mut db, fs, &uri_to_file, &HashMap::new());
 
         let current: Vec<SourceFile> = fs.files(&db).to_vec();
         assert_eq!(
@@ -1748,7 +1977,7 @@ mod tests {
         a.set_text(&mut db).to("a = 99".to_string());
 
         // sync_file_set must not panic and must leave the membership intact.
-        sync_file_set(&mut db, fs, &uri_to_file);
+        sync_file_set(&mut db, fs, &uri_to_file, &HashMap::new());
 
         let current: Vec<SourceFile> = fs.files(&db).to_vec();
         assert_eq!(current, vec![a], "FileSet must still contain only A");
