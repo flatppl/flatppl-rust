@@ -40,19 +40,23 @@ flatppl convert model.flatpir model.flatppl   # FlatPIR → FlatPPL
 flatppl convert messy.flatppl tidy.flatppl    # canonicalize (same format)
 flatppl infer model.flatppl typed.flatpir    # emit type/phase-annotated FlatPIR
 flatppl infer --level=phase m.flatppl m.flatpir  # or: type, valueset, normalization, shape
-flatppl infer https://example.org/m.flatppl m.flatpir  # URL input + load_module deps
+flatppl fetch model.flatppl                  # fetch the model's remote deps into the cache
 ```
 
 Formats are inferred from the file extensions. FlatPPL output uses the full
 surface syntax (operators, indexing, lambdas, `:=`); pass `--syntax minimal`
 for the lowered function-call form instead.
 
-The input — and, for `infer`, the model's transitive `load_module`
-dependencies — may be a local path or an `http`/`https` URL. URLs are fetched
-into a shared local cache (`$FLATPPL_CACHEDIR`, default per-platform); an
-untrusted URL prompts for approval when run interactively, and is refused
-otherwise (set `FLATPPL_TRUST=1` to allow all, `FLATPPL_CACHE_OFFLINE=1` to use
-only the cache).
+**Inputs are local files.** A model may `load_module` *remote* (`http`/`https`)
+dependencies, but the command input itself is always a local path — like
+`cargo build` on a local crate. `convert` and `infer` are **local and offline**:
+they resolve dependencies from a shared local cache only and never touch the
+network. To populate that cache, run **`flatppl fetch <model>`** — the one
+command that downloads a model's transitive remote dependencies (recursively,
+relative URLs resolved against their importing file). `flatppl fetch --update`
+refreshes already-cached deps. Cache location and trust are env-controlled
+(`$FLATPPL_CACHEDIR`; an untrusted URL prompts interactively and is refused in
+non-interactive use unless `FLATPPL_TRUST=1`).
 
 ## Building and testing (developers)
 

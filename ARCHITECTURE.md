@@ -184,20 +184,35 @@ the other libraries it is native-only** (fs + optional network), not
 wasm-targeted — URL loading in a browser/wasm context is the JS host's job — but
 it stays binary-free.
 
-**Wired into the CLI (`crates/cli/src/resolve.rs`).** `flatppl convert`/`infer`
-read their input — local path or URL — through this layer, and `infer`
-additionally walks the model's transitive `load_module` graph to assemble the
-inference `ModuleBundle` (the engine stays I/O-free). The walk is breadth-first;
-trust is **batched per BFS level** (one interactive prompt per discovery wave;
-non-interactive refuses untrusted URLs); the bundle is keyed by the directive
-string the engine looks up, and a string denoting two different files across the
-graph is a hard error. URL fetching is **default-on** for the `flatppl` driver
-(the `net` feature rides `convert`/`infer`), but stays out of the lean
-`flatppl-fmt` build. The **reads-only / writes-direct** split holds: source
-reads route through `fileaccess`; output writes are plain `fs::write`. The LSP
-keeps its in-memory salsa `FileSet` for editor buffers — a separate, reactive
-file abstraction — so `fileaccess` is the disk/URL layer for the non-reactive
-host tools, not a replacement for it.
+**Wired into the CLI (`crates/cli/src/resolve.rs`), package-manager style.**
+CLI inputs are always **local files** (no URLs) — a model may `load_module`
+remote deps, but the command operates on a local path, like `cargo build` on a
+local crate. Fetching is a separate, explicit step:
+
+- **`flatppl fetch <file>… [--update]`** is the *only* network-touching verb. It
+  BFS-walks each local model's transitive `load_module` (+ `load_data`) graph —
+  reading + parsing each module to discover its deps — and downloads the
+  `http`/`https` ones into the shared cache. Relative deps of a URL-loaded module
+  resolve against that module's URL (`Location::join`). Trust is **batched per
+  BFS level** (one interactive prompt per discovery wave; non-interactive
+  refuses untrusted URLs). `--update` re-fetches cached URLs.
+- **`convert` / `infer` are local and offline** — a cache-only resolver
+  (`OfflineFetcher`, no HTTP client) resolves deps from the cache + local files;
+  an uncached remote dep is an error pointing at `flatppl fetch`. `infer`
+  assembles the inference `ModuleBundle` from the walk (engine stays I/O-free),
+  keyed by the directive string the engine looks up (a string denoting two
+  different files across the graph is a hard error); it discovers but does **not**
+  resolve `load_data` (inference never reads data). `convert` is a single-file
+  transform.
+
+Feature isolation makes `infer` **net-free by construction**: it links
+`flatppl-fileaccess` *without* `net` (no TLS); only `fetch` enables
+`flatppl-fileaccess/net`; the lean `flatppl-fmt` links neither. The
+**reads-only / writes-direct** split holds (source reads via `fileaccess`,
+output writes are plain `fs::write`). The LSP keeps its in-memory salsa
+`FileSet` for editor buffers — a separate, reactive file abstraction — so
+`fileaccess` is the disk/URL layer for the non-reactive host tools, not a
+replacement for it.
 
 **Binary tool crates** — `flatppl-cli` and `flatppl-lsp` — are the two exceptions
 to the binary-free rule: they are standalone tools, never wasm-linked. Both ship a
