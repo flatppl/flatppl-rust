@@ -13,24 +13,26 @@ use std::process::ExitCode;
 use std::fs;
 #[cfg(any(feature = "convert", feature = "infer"))]
 use std::path::Path;
-#[cfg(any(feature = "convert", feature = "infer"))]
+#[cfg(any(feature = "convert", feature = "infer", feature = "fetch"))]
 use std::path::PathBuf;
 
 #[cfg(any(feature = "convert", feature = "infer"))]
 use clap::ValueEnum;
 use clap::{CommandFactory, Parser, Subcommand};
+#[cfg(any(feature = "convert", feature = "infer", feature = "fetch"))]
+use flatppl_cli::Failure;
 #[cfg(feature = "convert")]
 use flatppl_cli::SyntaxLevel;
 use flatppl_cli::report;
-#[cfg(any(feature = "convert", feature = "infer"))]
+#[cfg(any(feature = "infer", feature = "fetch"))]
 use flatppl_cli::resolve::CliResolver;
 #[cfg(feature = "convert")]
 use flatppl_cli::write_module;
 #[cfg(any(feature = "convert", feature = "infer"))]
-use flatppl_cli::{Failure, Format, banner};
+use flatppl_cli::{Format, banner};
 #[cfg(feature = "fmtlint")]
 use flatppl_cli::{run_fmt, run_lint};
-#[cfg(any(feature = "convert", feature = "infer"))]
+#[cfg(any(feature = "infer", feature = "fetch"))]
 use flatppl_fileaccess::Location;
 
 #[derive(Parser)]
@@ -52,10 +54,11 @@ enum Command {
     /// JSON file (and override the extension); both need the optional `hs3` feature.
     #[cfg(feature = "convert")]
     Convert {
-        /// Input source: a file path or an `http`/`https` URL (`.flatppl`,
-        /// `.flatpir`, `.flatpir.json`, native HS3 JSON with `--from hs3`, or
-        /// pyhf workspace JSON with `--from pyhf`). URLs are fetched + cached.
-        input: String,
+        /// Input file (`.flatppl`, `.flatpir`, `.flatpir.json`, native HS3 JSON
+        /// with `--from hs3`, or pyhf workspace JSON with `--from pyhf`). A local
+        /// path — a model with remote `load_module` deps must be pre-fetched
+        /// with `flatppl fetch`.
+        input: PathBuf,
         /// Output file (`.flatppl`, `.flatpir`, or `.flatpir.json`)
         output: PathBuf,
         /// FlatPPL output syntax level (ignored for FlatPIR output):
@@ -85,10 +88,10 @@ enum Command {
     /// unresolved names) fail the command.
     #[cfg(feature = "infer")]
     Infer {
-        /// Input source: a file path or an `http`/`https` URL (`.flatppl` or
-        /// `.flatpir`). URL sources — and the model's transitive `load_module`
-        /// dependencies — are fetched + cached.
-        input: String,
+        /// Input file (`.flatppl` or `.flatpir`). A local path; `infer` resolves
+        /// the model's `load_module` dependencies from the local cache only —
+        /// run `flatppl fetch` first if it has remote deps.
+        input: PathBuf,
         /// Output file (`.flatpir` — FlatPPL cannot carry annotations)
         output: PathBuf,
         /// Inference level — a hierarchy, each including the previous:
@@ -103,6 +106,21 @@ enum Command {
         /// Omit the leading provenance header comment (see `convert --no-header`).
         #[arg(long)]
         no_header: bool,
+    },
+    /// Fetch a model's remote dependencies into the local cache.
+    ///
+    /// Walks each input model's transitive `load_module` (and `load_data`)
+    /// dependencies and downloads the `http`/`https` ones into the shared cache
+    /// (`$FLATPPL_CACHEDIR`), so `convert`/`infer` — which never touch the
+    /// network — can then resolve them locally. Arguments are local files;
+    /// purely-local models with no remote deps need no fetch.
+    #[cfg(feature = "fetch")]
+    Fetch {
+        /// Model files to fetch dependencies for (`.flatppl` / `.flatpir`).
+        files: Vec<PathBuf>,
+        /// Re-fetch dependencies even if already cached (refresh).
+        #[arg(long)]
+        update: bool,
     },
     /// Print a shell completion script to stdout.
     ///
@@ -169,11 +187,11 @@ enum FromFormat {
 /// any other name stays `Auto` (extension-inferred). An explicit `--from`
 /// overrides and is returned unchanged.
 #[cfg(feature = "convert")]
-fn resolve_from_format(from: FromFormat, input: &Location) -> FromFormat {
+fn resolve_from_format(from: FromFormat, input: &Path) -> FromFormat {
     if from != FromFormat::Auto {
         return from;
     }
-    let name = input.name();
+    let name = input.file_name().and_then(|n| n.to_str()).unwrap_or("");
     if name.ends_with(".hs3.json") {
         FromFormat::Hs3
     } else if name.ends_with(".pyhf.json") {
@@ -201,6 +219,8 @@ fn main() -> ExitCode {
             level,
             no_header,
         } => infer_cmd(&input, &output, level.into(), no_header),
+        #[cfg(feature = "fetch")]
+        Command::Fetch { files, update } => fetch_cmd(&files, update),
         Command::Completions { shell } => {
             let mut cmd = Cli::command();
             clap_complete::generate(shell, &mut cmd, "flatppl", &mut std::io::stdout());
@@ -237,28 +257,26 @@ fn note_dropped_analyses(source: &str) {
 
 #[cfg(feature = "convert")]
 fn convert(
-    input: &str,
+    input: &Path,
     output: &Path,
     syntax: flatppl_syntax::Syntax,
     from_format: FromFormat,
     no_header: bool,
 ) -> Result<(), Failure> {
     let to = Format::from_path(output)?;
-    // The input may be a local path or an `http`/`https` URL; resolve + read it
-    // through the file-access layer (URLs are fetched + cached).
-    let in_loc = Location::parse(input);
     // `--from auto` keys off the input name: `*.hs3.json` / `*.pyhf.json` select
     // the importers; an explicit `--from` overrides.
-    let from_format = resolve_from_format(from_format, &in_loc);
-    let resolver = CliResolver::from_env();
+    let from_format = resolve_from_format(from_format, input);
 
     // Read the module: HS3/pyhf paths (feature-gated) or the standard
-    // extension-based FlatPPL/FlatPIR path.
+    // extension-based FlatPPL/FlatPIR path. The input is a local file — a model
+    // with remote `load_module` deps is pre-fetched with `flatppl fetch`.
     #[cfg_attr(not(feature = "fmtlint"), allow(unused_mut))]
     let mut module = match from_format {
         #[cfg(feature = "hs3")]
         FromFormat::Hs3 => {
-            let source = resolver.read_string(&in_loc)?;
+            let source = fs::read_to_string(input)
+                .map_err(|e| format!("reading `{}`: {e}", input.display()))?;
             let module =
                 flatppl_hs3::read_hs3(&source).map_err(|e| Failure::Plain(format!("hs3: {e}")))?;
             note_dropped_analyses(&source);
@@ -266,7 +284,8 @@ fn convert(
         }
         #[cfg(feature = "hs3")]
         FromFormat::Pyhf => {
-            let source = resolver.read_string(&in_loc)?;
+            let source = fs::read_to_string(input)
+                .map_err(|e| format!("reading `{}`: {e}", input.display()))?;
             let module = flatppl_hs3::read_pyhf(&source)
                 .map_err(|e| Failure::Plain(format!("pyhf: {e}")))?;
             note_dropped_analyses(&source);
@@ -280,11 +299,12 @@ fn convert(
                 "HS3/pyhf import is not compiled in — rebuild with `--features hs3`".into(),
             ));
         }
-        // Extension-based FlatPPL / FlatPIR / FlatPIR-JSON. Detect the format
-        // from the source name first; for a bare `.json`, hint at the importers.
+        // Extension-based FlatPPL / FlatPIR / FlatPIR-JSON. Check the extension
+        // BEFORE reading the file so an unknown one is reported even if the file
+        // is missing; for a bare `.json`, hint at the importers.
         FromFormat::Auto => {
-            let from = Format::from_location(&in_loc).map_err(|mut e| {
-                if in_loc.name().ends_with(".json") {
+            let from = Format::from_path(input).map_err(|mut e| {
+                if input.extension().and_then(|x| x.to_str()) == Some("json") {
                     e.push_str(
                         "; for an HS3 or pyhf JSON document pass `--from hs3` / `--from pyhf` \
                          (or name it `*.hs3.json` / `*.pyhf.json`)",
@@ -292,12 +312,13 @@ fn convert(
                 }
                 e
             })?;
-            let source = resolver.read_string(&in_loc)?;
+            let source = fs::read_to_string(input)
+                .map_err(|e| format!("reading `{}`: {e}", input.display()))?;
             match flatppl_cli::read_module(from, &source) {
                 Ok(module) => module,
                 Err((message, line, span)) => {
                     return Err(Failure::Diagnostic {
-                        path: PathBuf::from(in_loc.display()),
+                        path: input.to_path_buf(),
                         source,
                         message,
                         line,
@@ -332,13 +353,12 @@ fn convert(
 /// diagnostics, write annotated FlatPIR.
 #[cfg(feature = "infer")]
 fn infer_cmd(
-    input: &str,
+    input: &Path,
     output: &Path,
     level: flatppl_infer::Level,
     no_header: bool,
 ) -> Result<(), Failure> {
-    let in_loc = Location::parse(input);
-    let from = Format::from_location(&in_loc)?;
+    let from = Format::from_path(input)?;
     if !matches!(Format::from_path(output)?, Format::FlatPir) {
         return Err(Failure::Plain(format!(
             "`infer` writes annotated FlatPIR; `{}` must have a `.flatpir` extension \
@@ -346,13 +366,15 @@ fn infer_cmd(
             output.display()
         )));
     }
-    let resolver = CliResolver::from_env();
-    let source = resolver.read_string(&in_loc)?;
+    // The input is a local file; cross-module deps resolve from the local cache
+    // only (run `flatppl fetch` first for remote deps).
+    let source =
+        fs::read_to_string(input).map_err(|e| format!("reading `{}`: {e}", input.display()))?;
     let mut module = match flatppl_cli::read_module(from, &source) {
         Ok(module) => module,
         Err((message, line, span)) => {
             return Err(Failure::Diagnostic {
-                path: PathBuf::from(in_loc.display()),
+                path: input.to_path_buf(),
                 source,
                 message,
                 line,
@@ -362,12 +384,13 @@ fn infer_cmd(
     };
 
     // Assemble the cross-module bundle: resolve the model's transitive
-    // `load_module` dependencies (local or URL) through the file-access layer,
-    // so the engine — which stays I/O-free — can type cross-module references.
-    // `infer` is a local analysis tool: it resolves the program text it analyzes
-    // (modules), but does NOT touch the model's `load_data` sources — inference
-    // never reads data, so a type-check must not fetch (or require) datasets.
-    // The discovered data locations are left for a data-reading consumer.
+    // `load_module` dependencies from the local cache (+ local files) so the
+    // engine — which stays I/O-free — can type cross-module references. A
+    // cache-only resolver never touches the network; a remote dep that isn't
+    // cached errors with a "run `flatppl fetch`" hint. `load_data` sources are
+    // discovered but NOT resolved — inference never reads data.
+    let resolver = CliResolver::cache_only();
+    let in_loc = Location::Local(input.to_path_buf());
     let (bundle, _data_sources) = flatppl_cli::resolve::build_bundle(&module, &in_loc, &resolver)?;
     let diags = flatppl_infer::infer_module(&mut module, &bundle, level);
     let mut errors = 0u32;
@@ -382,7 +405,8 @@ fn infer_cmd(
     }
     if errors > 0 {
         return Err(Failure::Plain(format!(
-            "inference found {errors} error(s) in `{input}`"
+            "inference found {errors} error(s) in `{}`",
+            input.display()
         )));
     }
 
@@ -396,4 +420,18 @@ fn infer_cmd(
     }
     fs::write(output, text)
         .map_err(|e| Failure::Plain(format!("writing `{}`: {e}", output.display())))
+}
+
+/// `flatppl fetch <file>… [--update]` — fetch each model's remote dependencies
+/// into the local cache so `convert`/`infer` can resolve them offline.
+#[cfg(feature = "fetch")]
+fn fetch_cmd(files: &[PathBuf], update: bool) -> Result<(), Failure> {
+    if files.is_empty() {
+        return Err(Failure::Plain(
+            "no input files — usage: `flatppl fetch <model.flatppl>…`".to_string(),
+        ));
+    }
+    let resolver = CliResolver::fetching(update);
+    let locations: Vec<Location> = files.iter().map(|f| Location::Local(f.clone())).collect();
+    flatppl_cli::resolve::fetch_graph(&locations, &resolver)
 }

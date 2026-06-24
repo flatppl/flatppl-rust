@@ -132,6 +132,13 @@ impl Cache {
         &self.root
     }
 
+    /// Force the offline flag (e.g. a tool that is cache-only regardless of
+    /// `FLATPPL_CACHE_OFFLINE`). When offline, a cache miss is an error and no
+    /// fetch is attempted.
+    pub fn set_offline(&mut self, offline: bool) {
+        self.offline = offline;
+    }
+
     /// Would resolving `url` prompt for trust? `true` only when a fetch would
     /// actually happen *and* needs approval: not offline, not already cached,
     /// not blanket-trusted (`FLATPPL_TRUST`), and no per-URL marker. Lets a
@@ -166,15 +173,41 @@ impl Cache {
         if object.exists() {
             return Ok(object);
         }
+        self.fetch_and_store(url, &k, object, fetcher, trust)
+    }
+
+    /// Re-fetch `url` and overwrite any cached object (the `--update` path):
+    /// ignores an existing object, but is otherwise identical to [`get`](Self::get)
+    /// (offline → error; trust-gated; atomic publish).
+    pub fn refetch(
+        &self,
+        url: &str,
+        fetcher: &dyn Fetcher,
+        trust: &dyn TrustOracle,
+    ) -> Result<PathBuf, Error> {
+        let k = cache_key(url);
+        let object = self.object_path(&k);
+        self.fetch_and_store(url, &k, object, fetcher, trust)
+    }
+
+    /// Trust-gate, fetch, and atomically publish `_meta.json` then the object.
+    fn fetch_and_store(
+        &self,
+        url: &str,
+        k: &Key,
+        object: PathBuf,
+        fetcher: &dyn Fetcher,
+        trust: &dyn TrustOracle,
+    ) -> Result<PathBuf, Error> {
         if self.offline {
             return Err(Error::Offline(url.to_string()));
         }
 
-        // Trust gate (only reached on a miss that needs a fetch).
-        let trusted = self.trust_all || self.trust_path(&k).exists();
+        // Trust gate (only reached on a miss/refresh that needs a fetch).
+        let trusted = self.trust_all || self.trust_path(k).exists();
         if !trusted {
             if trust.approve(url) {
-                self.create_trust_marker(&k)?;
+                self.create_trust_marker(k)?;
             } else {
                 return Err(Error::Untrusted(url.to_string()));
             }
@@ -195,7 +228,7 @@ impl Cache {
         };
         // Metadata first, then the object — so a present object always has meta.
         let meta_bytes = serde_json::to_vec_pretty(&meta).map_err(std::io::Error::other)?;
-        self.write_atomic(&self.meta_path(&k), &meta_bytes)?;
+        self.write_atomic(&self.meta_path(k), &meta_bytes)?;
         self.write_atomic(&object, &fetched.bytes)?;
         Ok(object)
     }

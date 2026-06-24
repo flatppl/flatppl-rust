@@ -14,32 +14,55 @@ use std::collections::HashSet;
 use std::io::IsTerminal;
 
 use flatppl_core::{CallHead, Idx, Module, Node, NodeId, Scalar};
-use flatppl_fileaccess::{Cache, HttpFetcher, Location};
+use flatppl_fileaccess::{Cache, Fetcher, Location, OfflineFetcher};
 
 use crate::Failure;
 
-/// The CLI's file-access layer: a [`Cache`] + HTTP fetcher plus the interactive
-/// trust policy. Reads go through here so every `source` (local or URL) is
-/// handled uniformly.
+/// The CLI's file-access layer: a [`Cache`] + a fetcher plus the interactive
+/// trust policy. `source` reads (deps) go through here so local paths and URLs
+/// are handled uniformly. A cache-only resolver (`convert`/`infer`) carries an
+/// [`OfflineFetcher`] and never touches the network; the fetching resolver
+/// (`flatppl fetch`) carries the HTTP client.
 pub struct CliResolver {
     cache: Cache,
-    fetcher: HttpFetcher,
+    fetcher: Box<dyn Fetcher>,
     /// Whether we may prompt for trust (stdin + stderr are both TTYs).
     interactive: bool,
+    /// Re-fetch URLs even when cached (`flatppl fetch --update`).
+    update: bool,
     /// URLs approved this session (so a batch-prompted wave is not re-prompted
     /// when each member is then read).
     approved: RefCell<HashSet<String>>,
 }
 
 impl CliResolver {
-    /// Configure from the environment (`FLATPPL_CACHEDIR` / `_OFFLINE` /
-    /// `FLATPPL_TRUST`; spec §sec:url-cache). Interactive iff stdin and stderr
-    /// are terminals.
-    pub fn from_env() -> Self {
+    /// A cache-only resolver: local files + the existing cache, never the
+    /// network (no HTTP client linked). Forces offline regardless of
+    /// `FLATPPL_CACHE_OFFLINE`. Used by `convert`/`infer` — a remote dependency
+    /// that is not cached is an error pointing at `flatppl fetch`.
+    pub fn cache_only() -> Self {
+        let mut cache = Cache::from_env();
+        cache.set_offline(true);
+        CliResolver {
+            cache,
+            fetcher: Box::new(OfflineFetcher),
+            interactive: false,
+            update: false,
+            approved: RefCell::new(HashSet::new()),
+        }
+    }
+
+    /// A fetching resolver for `flatppl fetch`: online (HTTP), trust-prompting
+    /// when interactive, honoring `FLATPPL_CACHEDIR` / `_OFFLINE` / `FLATPPL_TRUST`
+    /// (so `FLATPPL_CACHE_OFFLINE` makes a fetch fail loudly). `update` re-fetches
+    /// URLs even when already cached.
+    #[cfg(feature = "fetch")]
+    pub fn fetching(update: bool) -> Self {
         CliResolver {
             cache: Cache::from_env(),
-            fetcher: HttpFetcher,
+            fetcher: Box::new(flatppl_fileaccess::HttpFetcher),
             interactive: std::io::stdin().is_terminal() && std::io::stderr().is_terminal(),
+            update,
             approved: RefCell::new(HashSet::new()),
         }
     }
@@ -97,9 +120,18 @@ impl CliResolver {
             }
             Location::Remote(url) => {
                 let oracle = |u: &str| self.approved.borrow().contains(u);
-                self.cache
-                    .get(url, &self.fetcher, &oracle)
-                    .map_err(|e| Failure::Plain(e.to_string()))
+                let fetched = if self.update {
+                    self.cache.refetch(url, &*self.fetcher, &oracle)
+                } else {
+                    self.cache.get(url, &*self.fetcher, &oracle)
+                };
+                fetched.map_err(|e| match e {
+                    flatppl_fileaccess::Error::Offline(u) => Failure::Plain(format!(
+                        "`{u}` is not in the local cache — run `flatppl fetch <model>` to fetch \
+                         its dependencies"
+                    )),
+                    other => Failure::Plain(other.to_string()),
+                })
             }
         }
     }
@@ -298,6 +330,52 @@ pub fn build_bundle(
     Ok((bundle, data))
 }
 
+/// Fetch a model's transitive dependencies into the cache (the `flatppl fetch`
+/// command). BFS over each input file's `load_module` graph — reading + parsing
+/// each module to discover its deps, fetching remote ones — then resolve every
+/// `load_data` source. Local files and local deps need no fetch. Trust is
+/// batched per BFS level. The `resolver`'s `update` flag controls whether
+/// already-cached URLs are re-fetched.
+#[cfg(feature = "fetch")]
+pub fn fetch_graph(files: &[Location], resolver: &CliResolver) -> Result<(), Failure> {
+    let mut walked: HashSet<String> = HashSet::new();
+    let mut data: Vec<Location> = Vec::new();
+    let mut data_seen: HashSet<String> = HashSet::new();
+    let mut level: Vec<Location> = files.to_vec();
+
+    while !level.is_empty() {
+        let refs: Vec<&Location> = level.iter().collect();
+        resolver.ensure_trusted(&refs)?;
+        let mut next: Vec<Location> = Vec::new();
+        for loc in &level {
+            if !walked.insert(loc.display()) {
+                continue;
+            }
+            let source = resolver.read_string(loc)?;
+            let format = crate::Format::from_location(loc).map_err(Failure::Plain)?;
+            let module = crate::read_module(format, &source).map_err(|(message, line, span)| {
+                Failure::Diagnostic {
+                    path: std::path::PathBuf::from(loc.display()),
+                    source: source.clone(),
+                    message,
+                    line,
+                    span,
+                }
+            })?;
+            for d in data_sources_of(&module, loc) {
+                if data_seen.insert(d.display()) {
+                    data.push(d);
+                }
+            }
+            for (_, dep) in directives_of(&module, loc) {
+                next.push(dep);
+            }
+        }
+        level = next;
+    }
+    resolver.resolve_all(&data)
+}
+
 #[cfg(all(test, feature = "infer"))]
 mod tests {
     use super::*;
@@ -318,7 +396,7 @@ mod tests {
         let root_path = dir.join("bayesian_inference_3.flatppl");
         let root_loc = Location::Local(root_path.clone());
 
-        let resolver = CliResolver::from_env(); // local-only: no env/net/trust needed
+        let resolver = CliResolver::cache_only(); // local-only: no env/net/trust needed
         let source = std::fs::read_to_string(&root_path).unwrap();
         let mut root = flatppl_syntax::parse(&source).expect("root parses");
 
@@ -354,7 +432,7 @@ mod tests {
                      w = load_data(\"weights.csv\", reals)\n";
         let root_loc = Location::Local(dir.join("model.flatppl"));
         let root = flatppl_syntax::parse(model).expect("parses");
-        let resolver = CliResolver::from_env();
+        let resolver = CliResolver::cache_only();
 
         let (_bundle, data) = build_bundle(&root, &root_loc, &resolver).expect("walks");
         let names: Vec<String> = data.iter().map(|l| l.name()).collect();
@@ -371,6 +449,51 @@ mod tests {
                 .is_ok()
         );
         assert!(resolver.resolve_all(&data).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(all(test, feature = "fetch"))]
+mod fetch_tests {
+    use super::*;
+
+    /// `fetch_graph` walks an all-local model graph (module dep + data source)
+    /// with nothing to fetch, and errors when a dependency is missing. (Uses a
+    /// cache-only resolver — local files need no network — so it exercises the
+    /// walk itself without hitting the wire.)
+    #[test]
+    fn fetch_graph_walks_local_graph_and_reports_missing() {
+        let dir = std::env::temp_dir().join(format!("flatppl-fg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("helper.flatppl"), "h = 1.0\n").unwrap();
+        std::fs::write(dir.join("data.csv"), "a\n1\n").unwrap();
+        std::fs::write(
+            dir.join("model.flatppl"),
+            "m = load_module(\"helper.flatppl\")\n\
+             d = load_data(source = \"data.csv\", valueset = reals)\n\
+             x = m.h\n",
+        )
+        .unwrap();
+        let resolver = CliResolver::cache_only();
+
+        let ok = vec![Location::Local(dir.join("model.flatppl"))];
+        assert!(
+            fetch_graph(&ok, &resolver).is_ok(),
+            "all-local graph resolves"
+        );
+
+        std::fs::write(
+            dir.join("broken.flatppl"),
+            "m = load_module(\"absent.flatppl\")\n",
+        )
+        .unwrap();
+        let broken = vec![Location::Local(dir.join("broken.flatppl"))];
+        assert!(
+            fetch_graph(&broken, &resolver).is_err(),
+            "missing dep errors"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

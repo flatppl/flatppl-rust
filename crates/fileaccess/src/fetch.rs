@@ -26,6 +26,18 @@ pub trait Fetcher {
     fn fetch(&self, url: &str) -> Result<Fetched, String>;
 }
 
+/// A fetcher that never reaches the network — for cache-only / offline
+/// resolution. The cache invokes a fetcher only on a miss it intends to fetch,
+/// so in offline mode this is never actually called; it satisfies the type
+/// without linking an HTTP client (so a cache-only tool stays TLS-free).
+pub struct OfflineFetcher;
+
+impl Fetcher for OfflineFetcher {
+    fn fetch(&self, url: &str) -> Result<Fetched, String> {
+        Err(format!("offline: refusing to fetch `{url}`"))
+    }
+}
+
 /// A blocking HTTP(S) fetcher backed by `ureq` (rustls TLS). Follows redirects
 /// and treats a non-`2xx` final status as an error, per the spec.
 #[cfg(feature = "net")]

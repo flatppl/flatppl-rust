@@ -23,7 +23,7 @@ mod trust;
 use std::path::PathBuf;
 
 pub use cache::{Cache, Meta};
-pub use fetch::{Fetched, Fetcher};
+pub use fetch::{Fetched, Fetcher, OfflineFetcher};
 pub use location::Location;
 pub use trust::{ApproveAll, DenyAll, TrustOracle};
 
