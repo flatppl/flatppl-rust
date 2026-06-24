@@ -20,9 +20,6 @@ This monorepo is a Cargo workspace; member crates live under `crates/`:
 * [`flatppl-lsp`](crates/lsp) — FlatPPL language server (diagnostics, hover, go-to-definition, completion)
 
 See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the design and the road ahead.
-Status: Phase 2 — FlatPPL ↔ FlatPIR conversion is complete; type/shape
-inference and multi-file / `load_module` support largely landed; LSP editor
-features in development; lowering and codegen are in development.
 
 ## Installation (early users)
 
