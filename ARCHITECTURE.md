@@ -184,6 +184,14 @@ the other libraries it is native-only** (fs + optional network), not
 wasm-targeted — URL loading in a browser/wasm context is the JS host's job — but
 it stays binary-free.
 
+**`Location` is the zero-dep core; the cache is a feature.** The §04 path/URL
+`join` (`Location`) needs no dependencies and is always compiled. The whole pull
+layer — `Cache`/`Resolver`/`Fetcher`/`TrustOracle` and its deps
+(sha2/serde/dirs/ureq) — lives behind the default-on `cache` feature
+(`net` ⊃ `cache`). A consumer that only *resolves* (notably the LSP, below)
+depends with `default-features = false` and links nothing heavy: pure §04
+resolution, no cache, no TLS.
+
 **Wired into the CLI (`crates/cli/src/resolve.rs`), package-manager style.**
 CLI inputs are always **local files** (no URLs) — a model may `load_module`
 remote deps, but the command operates on a local path, like `cargo build` on a
@@ -209,10 +217,23 @@ Feature isolation makes `infer` **net-free by construction**: it links
 `flatppl-fileaccess` *without* `net` (no TLS); only `fetch` enables
 `flatppl-fileaccess/net`; the lean `flatppl-fmt` links neither. The
 **reads-only / writes-direct** split holds (source reads via `fileaccess`,
-output writes are plain `fs::write`). The LSP keeps its in-memory salsa
-`FileSet` for editor buffers — a separate, reactive file abstraction — so
-`fileaccess` is the disk/URL layer for the non-reactive host tools, not a
-replacement for it.
+output writes are plain `fs::write`).
+
+**The LSP resolves URL deps but never fetches.** It links only `Location`
+(`fileaccess` with the `cache` feature off — no `Fetcher`/`Cache`/TLS) and routes
+all `load_module`/`load_data` path resolution through it (`crates/lsp/src/queries.rs`
+`resolve_path`), replacing a bespoke lexical normalizer. It cannot fetch: §sec:url-cache
+requires interactive trust approval (non-interactive tooling must refuse), and the
+LSP — non-interactive over the protocol, resolving inside a pure salsa query —
+has no way to prompt; the editor client is already the sole fetcher+truster.
+Instead, remote content arrives as a salsa **input**: the client pushes what it
+fetched via a `flatppl/urlSources` notification (`{ sources: [{uri, text}] }`,
+keyed by the resolved URL), which the server merges into the reactive `FileSet`
+(under a URL key, kept out of the editor-buffer map, so URL deps resolve for
+cross-module inference but get no diagnostics). This is the reactive counterpart
+of the CLI's pull cache: same `Location` resolver, content-as-input instead of
+content-fetched. The matching VS Code extension feed-hook is tracked in
+`flatppl-dev/TODO-flatppl-js.md`.
 
 **Binary tool crates** — `flatppl-cli` and `flatppl-lsp` — are the two exceptions
 to the binary-free rule: they are standalone tools, never wasm-linked. Both ship a
