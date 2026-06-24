@@ -1,3 +1,4 @@
+flatppl_compat = "0.1"
 # Lambda (`->`) and `fn(…)` hole sugar — both lower to `functionof` with
 # placeholders (spec §04).
 cs = [0.5, 1.5, 2.5]

@@ -1,3 +1,4 @@
+flatppl_compat = "0.1"
 # Deterministic-expression coverage: operators (precedence + chaining),
 # field/index access, arrays, records, tuples, dot-broadcast, slicing,
 # set membership.

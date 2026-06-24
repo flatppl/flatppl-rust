@@ -1,4 +1,13 @@
-# "Eight Schools" model (D. Rubin, 1981)
+%%%
+# Eight Schools model (Rubin, 1981)
+
+Classic hierarchical Normal model. Eight high-school coaching programmes each
+have an estimated treatment effect $y_j$ with known standard error $\sigma_j$.
+A shared hyperprior on the programme mean $\mu$ and scale $\tau$ partially pools
+the estimates. The half-Cauchy prior on $\tau$ is rendered with
+`normalize(truncate(...))`.
+%%%
+flatppl_compat = "0.1"
 
 y_data = [28, 8, -3, 7, -1, 1, 18, 12]
 std_errs_data = [15, 10, 16, 11, 9, 11, 10, 18]

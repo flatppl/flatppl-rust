@@ -1,3 +1,4 @@
+flatppl_compat = "0.1"
 # Metric-aware Einstein summation (spec §04): the `metric: …` statement form
 # lowers to a `metricsum(metric, [.axes…], expr)` call. `.name^` and `.name_`
 # are the upper / lower variance markers. Composition of three Lorentz

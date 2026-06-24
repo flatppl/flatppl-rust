@@ -1,3 +1,5 @@
+flatppl_compat = "0.1"
+
 center = elementof(reals)
 spread = elementof(posreals)
 

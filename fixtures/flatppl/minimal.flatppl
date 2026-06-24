@@ -1,3 +1,5 @@
+flatppl_compat = "0.1"
+
 a = elementof(nonnegreals)
 b = a^0.5
 f_sqrt = functionof(b)
