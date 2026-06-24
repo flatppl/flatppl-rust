@@ -4,6 +4,7 @@ use crate::capabilities::LspDiag;
 use crate::db::{Catalogues, FileSet, SourceFile};
 use crate::line_index::LineIndex;
 use flatppl_core::{CallHead, Idx, Module, Node, NodeId, Scalar};
+use flatppl_fileaccess::Location;
 use std::sync::Arc;
 
 // ── ArcCatalogues wrapper ────────────────────────────────────────────────────
@@ -391,65 +392,38 @@ pub(crate) fn load_module_paths(module: &Module) -> Vec<String> {
     paths
 }
 
-/// Normalize a slash-separated path: drop `.` segments and collapse `..` against
-/// the preceding non-`..` segment. Leading `..` segments that cannot be
-/// collapsed are preserved. No filesystem access — purely lexical, matching how
-/// directive paths are compared against workspace `SourceFile` paths.
-fn normalize_path(path: &str) -> String {
-    let mut out: Vec<&str> = Vec::new();
-    for seg in path.split('/') {
-        match seg {
-            "" | "." => {}
-            ".." => {
-                if matches!(out.last(), Some(&s) if s != "..") {
-                    out.pop();
-                } else {
-                    out.push("..");
-                }
-            }
-            other => out.push(other),
-        }
-    }
-    out.join("/")
-}
-
 /// Resolve `directive_path` (from a `load_module` directive in `importer`) to a
 /// workspace [`SourceFile`] in `fs`.
 ///
-/// Resolution joins the directive path onto the importer's parent directory and
-/// normalizes it, comparing the result against each `SourceFile`'s (normalized)
-/// path. A direct match where the directive path equals a `SourceFile` path is
-/// also accepted (so paths that are already workspace-relative resolve without a
-/// parent prefix). Returns `None` when nothing matches (the common case for
-/// `standard_module` names).
+/// Resolution goes through [`flatppl_fileaccess::Location`] — the ecosystem's one
+/// §04 path/URL resolver — so a local importer's relative dep joins against its
+/// directory, while an `http`/`https` directive (or a URL importer's relative
+/// dep) resolves as a URL, all uniformly. The LSP only *resolves* here; it never
+/// fetches (URL-dep content arrives as client-fed `SourceFile`s — see
+/// `server.rs`).
+///
+/// Two interpretations are tried, preferring the importer-relative `join`
+/// (deterministic in ambiguous workspaces where both `a/b/x.flatppl` and
+/// `b/x.flatppl` exist) over taking the directive as-is. Each candidate file's
+/// stored path is canonicalized the same way ([`Location::normalized`]), so the
+/// comparison is symmetric. Returns `None` when nothing matches: the common case
+/// for `standard_module` names, and for an as-yet-unfed URL dep — a soft "source
+/// not available", like a missing local dep.
 pub(crate) fn resolve_path(
     db: &dyn salsa::Database,
     importer: SourceFile,
     directive_path: &str,
     fs: FileSet,
 ) -> Option<SourceFile> {
-    let importer_path = importer.path(db);
-    let parent = match importer_path.rfind('/') {
-        Some(i) => &importer_path[..i],
-        None => "",
-    };
-    let joined = if parent.is_empty() {
-        directive_path.to_string()
-    } else {
-        format!("{parent}/{directive_path}")
-    };
-    let joined_norm = normalize_path(&joined);
-    let direct_norm = normalize_path(directive_path);
-    // Prefer the relative-`joined` interpretation (deterministic in ambiguous
-    // workspaces where both `a/b/x.flatppl` and `b/x.flatppl` exist); only fall
-    // back to a direct path match when no joined match exists.
-    let by = |target: &str| {
+    let joined = Location::parse(&importer.path(db)).join(directive_path);
+    let direct = Location::parse(directive_path).normalized();
+    let find = |target: &Location| {
         fs.files(db)
             .iter()
             .copied()
-            .find(|f| normalize_path(&f.path(db)) == target)
+            .find(|f| &Location::parse(&f.path(db)).normalized() == target)
     };
-    by(&joined_norm).or_else(|| by(&direct_norm))
+    find(&joined).or_else(|| find(&direct))
 }
 
 /// Build the **transitively closed** cross-file
@@ -738,6 +712,94 @@ mod tests {
         assert!(
             matches!(ty, Type::Measure { .. }),
             "x = e.MyDist(0.0) should infer a measure type; got {ty:?}"
+        );
+    }
+
+    /// `resolve_path` resolves URL `load_module` deps through `fileaccess::Location`:
+    /// (1) a local importer with an absolute-URL directive → the URL SourceFile;
+    /// (2) a URL importer with a *relative* directive → the §04 URL-relative join
+    /// (the load-bearing case for client-fed URL modules whose own deps are
+    /// relative); (3) a `..` relative directive normalizes against the URL.
+    /// Locks resolution through `fileaccess::Location` (the §04 resolver).
+    #[test]
+    fn resolve_path_resolves_url_deps() {
+        let db = Database::default();
+        let common = SourceFile::new(
+            &db,
+            "https://h.example/examples/common.flatppl".to_string(),
+            "x = elementof(reals)".to_string(),
+        );
+        let priors = SourceFile::new(
+            &db,
+            "https://h.example/examples/priors.flatppl".to_string(),
+            "p = elementof(reals)".to_string(),
+        );
+        let shared = SourceFile::new(
+            &db,
+            "https://h.example/shared/util.flatppl".to_string(),
+            "u = elementof(reals)".to_string(),
+        );
+        let model = SourceFile::new(
+            &db,
+            "/proj/model.flatppl".to_string(),
+            "c = load_module(\"https://h.example/examples/common.flatppl\")".to_string(),
+        );
+        let fs = FileSet::new(&db, vec![common, priors, shared, model]);
+
+        // (1) local importer + absolute-URL directive.
+        assert_eq!(
+            resolve_path(&db, model, "https://h.example/examples/common.flatppl", fs),
+            Some(common),
+            "absolute-URL directive resolves to the URL SourceFile"
+        );
+        // (2) URL importer + relative directive → URL-relative join.
+        assert_eq!(
+            resolve_path(&db, common, "priors.flatppl", fs),
+            Some(priors),
+            "relative directive resolves against the importer URL's directory"
+        );
+        // (3) URL importer + `..` directive normalizes.
+        assert_eq!(
+            resolve_path(&db, common, "../shared/util.flatppl", fs),
+            Some(shared),
+            "`..` in a URL-relative directive normalizes across path segments"
+        );
+    }
+
+    /// End-to-end: a local model loads a URL module which itself has a *relative*
+    /// `load_module` dep; both URL sources are present in the FileSet (as the
+    /// editor client would feed them). `import_bundle` must include the
+    /// transitively-resolved relative URL dep.
+    #[test]
+    fn import_bundle_walks_url_relative_deps() {
+        let db = Database::default();
+        let priors = SourceFile::new(
+            &db,
+            "https://h.example/examples/priors.flatppl".to_string(),
+            "theta = elementof(reals)".to_string(),
+        );
+        let common = SourceFile::new(
+            &db,
+            "https://h.example/examples/common.flatppl".to_string(),
+            "pr = load_module(\"priors.flatppl\")\nm = add(pr.theta, 1.0)".to_string(),
+        );
+        let model = SourceFile::new(
+            &db,
+            "/proj/model.flatppl".to_string(),
+            "c = load_module(\"https://h.example/examples/common.flatppl\")\nv = add(c.m, 2.0)"
+                .to_string(),
+        );
+        let fs = FileSet::new(&db, vec![priors, common, model]);
+
+        let bundle = import_bundle(&db, model, fs);
+        // The transitive URL-relative dep is reached and recorded.
+        assert!(
+            bundle.imports(priors),
+            "import_bundle(model) must include the URL-relative transitive dep `priors`"
+        );
+        assert!(
+            bundle.imports(common),
+            "and the directly-loaded URL `common`"
         );
     }
 
