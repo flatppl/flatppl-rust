@@ -364,11 +364,11 @@ fn infer_cmd(
     // Assemble the cross-module bundle: resolve the model's transitive
     // `load_module` dependencies (local or URL) through the file-access layer,
     // so the engine — which stays I/O-free — can type cross-module references.
-    // The same walk discovers the model's `load_data` sources; resolve them too
-    // (fetch + cache URLs, validate local files) so a model's external data
-    // references are reachable. Inference itself does not read the data.
-    let (bundle, data_sources) = flatppl_cli::resolve::build_bundle(&module, &in_loc, &resolver)?;
-    resolver.resolve_all(&data_sources)?;
+    // `infer` is a local analysis tool: it resolves the program text it analyzes
+    // (modules), but does NOT touch the model's `load_data` sources — inference
+    // never reads data, so a type-check must not fetch (or require) datasets.
+    // The discovered data locations are left for a data-reading consumer.
+    let (bundle, _data_sources) = flatppl_cli::resolve::build_bundle(&module, &in_loc, &resolver)?;
     let diags = flatppl_infer::infer_module(&mut module, &bundle, level);
     let mut errors = 0u32;
     for d in &diags {

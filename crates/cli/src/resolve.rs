@@ -363,11 +363,14 @@ mod tests {
             "both load_data sources (kwarg + positional) must be discovered; got {names:?}"
         );
 
-        // The present file resolves; the missing one is an error.
-        let present = Location::Local(dir.join("events.csv"));
-        assert!(resolver.resolve_path(&present).is_ok());
-        let missing = Location::Local(dir.join("weights.csv"));
-        assert!(resolver.resolve_path(&missing).is_err());
+        // Batched resolution: the present file resolves; a batch including the
+        // missing `weights.csv` errors.
+        assert!(
+            resolver
+                .resolve_all(&[Location::Local(dir.join("events.csv"))])
+                .is_ok()
+        );
+        assert!(resolver.resolve_all(&data).is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
