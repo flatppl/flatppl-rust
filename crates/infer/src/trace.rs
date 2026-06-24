@@ -433,10 +433,13 @@ impl<'m, 's> Inferencer<'m, 's> {
         (ty, phase)
     }
 
-    /// Validate `%assign` substitution names on a `load_module` /
-    /// `standard_module` call. For each named `%assign` arg whose name is not
-    /// a known binding in the dependency, emits an anchored error on the
-    /// argument value node. No-op for every other call head or builtin op.
+    /// Validate `%assign` substitutions on a `load_module` call against spec §04
+    /// (Module composition → Load-time substitution): each `%assign` name must
+    /// designate an `external`/`elementof` **input** of the dependency, and the
+    /// substitution value's phase must match the input's kind — `external` ←
+    /// fixed, `elementof` ← parameterized. Emits anchored errors on the offending
+    /// value node. No-op for non-load calls and for `standard_module` (its
+    /// dependency never enters the bundle, so the inner block is skipped).
     ///
     /// The data needed from `call` is cloned out first so the borrow is
     /// released before `self.diags.push` or `self.module.resolve` are called.
@@ -470,17 +473,49 @@ impl<'m, 's> Inferencer<'m, 's> {
             if let Some(dep) = self.session.bundle.get(&path) {
                 for (name_sym, value_node) in assigns {
                     let input = self.module.resolve(name_sym).to_string();
-                    let known = dep.bindings().any(|(_, b)| dep.resolve(b.name) == input);
-                    if !known {
-                        self.diags.push(Diagnostic::error_at(
+                    match dep_input_kind(dep, &input) {
+                        // Spec §04: the LHS must name an *input* of the loaded
+                        // module. No binding by that name → "has no input".
+                        None => self.diags.push(Diagnostic::error_at(
                             value_node,
                             format!("module `{path}` has no input `{input}`"),
-                        ));
+                        )),
+                        // A binding exists but is an ordinary computed value, not
+                        // an `external`/`elementof` input ("No other kinds of
+                        // nodes … may be bound").
+                        Some(InputKind::Other) => self.diags.push(Diagnostic::error_at(
+                            value_node,
+                            format!(
+                                "`{input}` is not an input (`external`/`elementof`) of module `{path}`"
+                            ),
+                        )),
+                        // An input: its phase governs what may bind to it —
+                        // `external` ← fixed, `elementof` ← parameterized.
+                        Some(kind) => {
+                            // The substitution value was inferred just above, so
+                            // its phase is recorded; skip the check if not (never
+                            // false-positive on a missing phase).
+                            if let Some(&value_phase) = self.phases.get(&value_node) {
+                                let required = kind.required_phase();
+                                if value_phase != required {
+                                    self.diags.push(Diagnostic::error_at(
+                                        value_node,
+                                        format!(
+                                            "{} `{input}` of module `{path}` may only be bound to \
+                                             a {required} value (got {value_phase})",
+                                            kind.describe()
+                                        ),
+                                    ));
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
     }
+
+    // (free helpers `InputKind` / `dep_input_kind` live at module scope below)
 
     /// Record a catalogue gap for `op`, once. Phase-only runs skip these —
     /// type gaps are irrelevant when types are not requested.
@@ -536,6 +571,55 @@ fn is_elementof(module: &Module, id: NodeId) -> bool {
         },
         _ => false,
     }
+}
+
+/// How a loaded-module binding may be used as a substitution target (spec §04).
+enum InputKind {
+    /// `external(...)` — a load-time hyperparameter; bind a **fixed** value.
+    External,
+    /// `elementof(...)` — a model parameter; bind a **parameterized** value.
+    Elementof,
+    /// An ordinary computed binding, not an input — may not be substituted.
+    Other,
+}
+
+impl InputKind {
+    /// The phase a substitution value must have to bind to this input.
+    fn required_phase(&self) -> Phase {
+        match self {
+            InputKind::External => Phase::Fixed,
+            InputKind::Elementof => Phase::Parameterized,
+            InputKind::Other => Phase::Fixed, // unreachable: Other is rejected earlier
+        }
+    }
+
+    /// Human-readable label for the diagnostic ("external input" / "parameter …").
+    fn describe(&self) -> &'static str {
+        match self {
+            InputKind::External => "external input",
+            InputKind::Elementof => "parameter (`elementof`) input",
+            InputKind::Other => "binding",
+        }
+    }
+}
+
+/// Classify the binding named `name` in dependency module `dep` for §04
+/// substitution rules. `None` when no such binding exists ("has no input");
+/// `Some(External|Elementof)` for a bare `external(...)`/`elementof(...)` input;
+/// `Some(Other)` for any other binding (a non-input that may not be substituted).
+fn dep_input_kind(dep: &Module, name: &str) -> Option<InputKind> {
+    let (_, b) = dep.bindings().find(|(_, b)| dep.resolve(b.name) == name)?;
+    let Node::Call(c) = dep.node(b.rhs) else {
+        return Some(InputKind::Other);
+    };
+    let CallHead::Builtin(h) = c.head else {
+        return Some(InputKind::Other);
+    };
+    Some(match dep.resolve(h) {
+        "external" => InputKind::External,
+        "elementof" => InputKind::Elementof,
+        _ => InputKind::Other,
+    })
 }
 
 /// `stochastic > parameterized > fixed` (spec §04 phases).

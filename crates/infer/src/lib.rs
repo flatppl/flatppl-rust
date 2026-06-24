@@ -283,12 +283,14 @@ mod substitution_tests {
     fn substitution_flows_into_dependency() {
         // Unsubstituted, the dep gives `out: Integer` (add(Integer, Integer)).
         // Seeding `p` with a Real-typed argument promotes `out` to Real, so this
-        // assertion fails if seeding is disabled.
+        // assertion fails if seeding is disabled. The substituted source `a` is
+        // parameterized (spec §04: an `elementof` input takes a parameterized
+        // value).
         let dep = flatppl_syntax::parse("p = elementof(integers)\nout = add(p, 1)").expect("dep");
         let mut bundle = ModuleBundle::new();
         bundle.insert("d.flatppl", std::sync::Arc::new(dep));
         let mut model = flatppl_syntax::parse(
-            "a = add(2.0, 3.0)\nd = load_module(\"d.flatppl\", p = a)\nv = d.out",
+            "a = elementof(reals)\nd = load_module(\"d.flatppl\", p = a)\nv = d.out",
         )
         .expect("model");
         let _ = infer_module(&mut model, &bundle, Level::Type);
@@ -308,8 +310,11 @@ mod substitution_tests {
         let dep = flatppl_syntax::parse("p = elementof(reals)\nout = p").expect("dep");
         let mut bundle = ModuleBundle::new();
         bundle.insert("d.flatppl", std::sync::Arc::new(dep));
+        // Both substitution sources are parameterized (spec §04: `elementof`
+        // input ← parameterized) but carry distinct types, so the two loads
+        // memoize separately (Integer vs Real).
         let mut model = flatppl_syntax::parse(
-            "a = 1\nb = 2.0\nd1 = load_module(\"d.flatppl\", p = a)\nd2 = load_module(\"d.flatppl\", p = b)\nv1 = d1.out\nv2 = d2.out",
+            "a = elementof(integers)\nb = elementof(reals)\nd1 = load_module(\"d.flatppl\", p = a)\nd2 = load_module(\"d.flatppl\", p = b)\nv1 = d1.out\nv2 = d2.out",
         ).expect("model");
         let _ = infer_module(&mut model, &bundle, Level::Type);
         let v1 = model
@@ -333,6 +338,98 @@ mod substitution_tests {
         assert_eq!(
             model.type_of(v2),
             Some(&flatppl_core::Type::Scalar(flatppl_core::ScalarType::Real))
+        );
+    }
+}
+
+#[cfg(test)]
+mod substitution_phase_tests {
+    //! Spec §04 (Module composition → Load-time substitution): the phase of a
+    //! loaded module's input governs what it may be bound to —
+    //! `external` ← **fixed** only, `elementof` ← **parameterized** only.
+    use super::*;
+
+    fn bundle_with(path: &str, src: &str) -> ModuleBundle {
+        let dep = flatppl_syntax::parse(src).expect("dep parses");
+        let mut b = ModuleBundle::new();
+        b.insert(path, std::sync::Arc::new(dep));
+        b
+    }
+
+    /// `external` input ← fixed value: the allowed case, no diagnostic.
+    /// (Mirrors the corrected `bayesian_inference_common`: `c = external(reals)`
+    /// bound to a fixed `c_scaling = 5`.)
+    #[test]
+    fn external_input_bound_to_fixed_is_ok() {
+        let bundle = bundle_with("d.flatppl", "c = external(reals)\nout = mul(c, 2.0)");
+        let mut model = flatppl_syntax::parse(
+            "c_scaling = 5\nd = load_module(\"d.flatppl\", c = c_scaling)\nv = d.out",
+        )
+        .expect("model");
+        let diags = infer_module(&mut model, &bundle, Level::Type);
+        assert!(
+            !diags
+                .iter()
+                .any(|d| d.severity == Severity::Error && d.message.contains("may only be bound")),
+            "external ← fixed is valid; got {diags:?}"
+        );
+    }
+
+    /// `elementof` input ← fixed value: the spec violation (this was the bug in
+    /// the pre-fix `bayesian_inference_common`). Must be an anchored Error.
+    #[test]
+    fn elementof_input_bound_to_fixed_is_an_error() {
+        let bundle = bundle_with("d.flatppl", "c = elementof(reals)\nout = mul(c, 2.0)");
+        let mut model = flatppl_syntax::parse(
+            "c_scaling = 5\nd = load_module(\"d.flatppl\", c = c_scaling)\nv = d.out",
+        )
+        .expect("model");
+        let diags = infer_module(&mut model, &bundle, Level::Type);
+        let err = diags
+            .iter()
+            .find(|d| d.severity == Severity::Error && d.message.contains("may only be bound"));
+        let err = err.unwrap_or_else(|| {
+            panic!("elementof ← fixed must be an error; got {diags:?}");
+        });
+        assert!(
+            err.message.contains("parameterized") && err.node.is_some(),
+            "error must cite the parameterized requirement and anchor to the value node; got {err:?}"
+        );
+    }
+
+    /// `external` input ← parameterized value: also a violation (external is a
+    /// load-time-fixed hyperparameter).
+    #[test]
+    fn external_input_bound_to_parameterized_is_an_error() {
+        let bundle = bundle_with("d.flatppl", "c = external(reals)\nout = mul(c, 2.0)");
+        let mut model = flatppl_syntax::parse(
+            "p = elementof(reals)\nd = load_module(\"d.flatppl\", c = p)\nv = d.out",
+        )
+        .expect("model");
+        let diags = infer_module(&mut model, &bundle, Level::Type);
+        assert!(
+            diags.iter().any(|d| d.severity == Severity::Error
+                && d.message.contains("may only be bound")
+                && d.message.contains("fixed")),
+            "external ← parameterized must be an error; got {diags:?}"
+        );
+    }
+
+    /// `elementof` input ← parameterized value: the allowed case (the
+    /// `load_module/` fixture's `center = a` shape), no phase diagnostic.
+    #[test]
+    fn elementof_input_bound_to_parameterized_is_ok() {
+        let bundle = bundle_with("d.flatppl", "c = elementof(reals)\nout = mul(c, 2.0)");
+        let mut model = flatppl_syntax::parse(
+            "p = elementof(reals)\nd = load_module(\"d.flatppl\", c = p)\nv = d.out",
+        )
+        .expect("model");
+        let diags = infer_module(&mut model, &bundle, Level::Type);
+        assert!(
+            !diags
+                .iter()
+                .any(|d| d.severity == Severity::Error && d.message.contains("may only be bound")),
+            "elementof ← parameterized is valid; got {diags:?}"
         );
     }
 }

@@ -918,6 +918,43 @@ mod tests {
         );
     }
 
+    /// The §04 load-time substitution phase rule surfaces through the LSP
+    /// diagnostics path: binding a loaded module's `elementof` input to a fixed
+    /// value (the pre-fix `bayesian_inference_common` bug) is an ERROR; the
+    /// corrected `external` input bound to the same fixed value is clean.
+    #[test]
+    fn diagnostics_flag_elementof_input_bound_to_fixed() {
+        fn errors_for_dep(dep_src: &str) -> Vec<lsp_types::Diagnostic> {
+            let db = Database::default();
+            let cats = Catalogues::new(&db, vec![]);
+            let dep = SourceFile::new(&db, "common.flatppl".to_string(), dep_src.to_string());
+            let model = SourceFile::new(
+                &db,
+                "model.flatppl".to_string(),
+                "c_scaling = 5\nm = load_module(\"common.flatppl\", c = c_scaling)\nv = m.f"
+                    .to_string(),
+            );
+            let fs = FileSet::new(&db, vec![dep, model]);
+            diagnostics(&db, model, fs, cats)
+        }
+
+        // elementof ← fixed: must be flagged.
+        let bad = errors_for_dep("c = elementof(reals)\nf = mul(c, 2.0)");
+        assert!(
+            bad.iter()
+                .any(|d| d.severity == Some(lsp_types::DiagnosticSeverity::ERROR)
+                    && d.message.contains("may only be bound")),
+            "LSP must flag elementof ← fixed; got {bad:?}"
+        );
+
+        // external ← fixed: the corrected form, no phase error.
+        let good = errors_for_dep("c = external(reals)\nf = mul(c, 2.0)");
+        assert!(
+            !good.iter().any(|d| d.message.contains("may only be bound")),
+            "external ← fixed must be clean; got {good:?}"
+        );
+    }
+
     // ── hover() capability tests ─────────────────────────────────────────────
 
     #[test]
