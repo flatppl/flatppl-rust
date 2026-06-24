@@ -17,10 +17,12 @@ This monorepo is a Cargo workspace; member crates live under `crates/`:
 * [`flatppl-infer`](crates/infer) — type, shape, and phase inference
 * [`flatppl-hs3`](crates/hs3) — HS3 / pyhf → FlatPPL importer
 * [`flatppl-cli`](crates/cli) — the `flatppl` command-line driver
+* [`flatppl-lsp`](crates/lsp) — FlatPPL language server (diagnostics, hover, go-to-definition, completion)
 
 See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the design and the road ahead.
 Status: Phase 2 — FlatPPL ↔ FlatPIR conversion is complete; type/shape
-inference is growing; lowering and codegen are in development.
+inference and multi-file / `load_module` support largely landed; LSP editor
+features in development; lowering and codegen are in development.
 
 ## Installation (early users)
 
