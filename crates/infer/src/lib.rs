@@ -273,6 +273,63 @@ mod cross_module_value_tests {
             "expected unknown-binding error; got {diags:?}"
         );
     }
+
+    /// Spec §04 stochastic boundary: a `stochastic`-phase binding in the loaded
+    /// module is invisible to the importer. A `draw` that has not been reified
+    /// via `lawof`/`kernelof` may not be referenced across the module boundary.
+    #[test]
+    fn stochastic_dep_binding_is_invisible() {
+        let bundle = bundle_with("h.flatppl", "x ~ Normal(0.0, 1.0)\nmu = 1.0");
+        let mut model =
+            flatppl_syntax::parse("h = load_module(\"h.flatppl\")\nv = h.x").expect("parses");
+        let diags = infer_module(&mut model, &bundle, Level::Type);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.severity == Severity::Error && d.message.contains("stochastic")),
+            "a stochastic dep binding must be invisible; got {diags:?}"
+        );
+    }
+
+    /// A `fixed`/`parameterized` binding right beside the stochastic one stays
+    /// visible — the boundary hides only stochastic bindings.
+    #[test]
+    fn non_stochastic_dep_binding_stays_visible() {
+        let bundle = bundle_with("h.flatppl", "x ~ Normal(0.0, 1.0)\nmu = 1.0");
+        let mut model =
+            flatppl_syntax::parse("h = load_module(\"h.flatppl\")\nv = h.mu").expect("parses");
+        let diags = infer_module(&mut model, &bundle, Level::Type);
+        assert!(
+            !diags
+                .iter()
+                .any(|d| d.severity == Severity::Error && d.message.contains("stochastic")),
+            "a fixed dep binding must stay visible; got {diags:?}"
+        );
+    }
+
+    /// Spec §04: access to loaded modules is NOT transitive. The importer reaches
+    /// names in `mid`, but not names in `leaf` that `mid` loads but does not
+    /// re-export — `m.seed` (seed lives in leaf) is "has no binding", not a
+    /// silent two-hop reach.
+    #[test]
+    fn access_is_not_transitive() {
+        let mut bundle = bundle_with("leaf.flatppl", "seed = 5");
+        bundle.insert(
+            "mid.flatppl",
+            std::sync::Arc::new(
+                flatppl_syntax::parse("leaf = load_module(\"leaf.flatppl\")").expect("mid parses"),
+            ),
+        );
+        let mut model =
+            flatppl_syntax::parse("m = load_module(\"mid.flatppl\")\nv = m.seed").expect("parses");
+        let diags = infer_module(&mut model, &bundle, Level::Type);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("has no binding `seed`")),
+            "leaf's `seed` must not be reachable through mid; got {diags:?}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -281,16 +338,16 @@ mod substitution_tests {
 
     #[test]
     fn substitution_flows_into_dependency() {
-        // Unsubstituted, the dep gives `out: Integer` (add(Integer, Integer)).
-        // Seeding `p` with a Real-typed argument promotes `out` to Real, so this
-        // assertion fails if seeding is disabled. The substituted source `a` is
-        // parameterized (spec §04: an `elementof` input takes a parameterized
-        // value).
-        let dep = flatppl_syntax::parse("p = elementof(integers)\nout = add(p, 1)").expect("dep");
+        // Unsubstituted, the dep gives `out: Real` (add(Real, Integer)). Seeding
+        // `p` with an Integer-typed argument narrows `out` to Integer, so this
+        // assertion fails if seeding is disabled. The source `a` is parameterized
+        // and its set (`integers`) lies within the input's declared `reals` —
+        // spec §04 compatible (phase + value set).
+        let dep = flatppl_syntax::parse("p = elementof(reals)\nout = add(p, 1)").expect("dep");
         let mut bundle = ModuleBundle::new();
         bundle.insert("d.flatppl", std::sync::Arc::new(dep));
         let mut model = flatppl_syntax::parse(
-            "a = elementof(reals)\nd = load_module(\"d.flatppl\", p = a)\nv = d.out",
+            "a = elementof(integers)\nd = load_module(\"d.flatppl\", p = a)\nv = d.out",
         )
         .expect("model");
         let _ = infer_module(&mut model, &bundle, Level::Type);
@@ -300,8 +357,10 @@ mod substitution_tests {
             .expect("binding `v` not found");
         assert_eq!(
             model.type_of(vb.rhs),
-            Some(&flatppl_core::Type::Scalar(flatppl_core::ScalarType::Real)),
-            "out promotes to real because substituted p is real (Integer otherwise)"
+            Some(&flatppl_core::Type::Scalar(
+                flatppl_core::ScalarType::Integer
+            )),
+            "out narrows to integer because substituted p is integer (Real otherwise)"
         );
     }
 
@@ -430,6 +489,42 @@ mod substitution_phase_tests {
                 .iter()
                 .any(|d| d.severity == Severity::Error && d.message.contains("may only be bound")),
             "elementof ← parameterized is valid; got {diags:?}"
+        );
+    }
+
+    /// Spec §04: "Value sets must be compatible." Binding an input declared over
+    /// `posreals` with a value whose set is `reals` (a proven strict superset)
+    /// is incompatible — the value can take points outside the input's domain.
+    #[test]
+    fn substitution_value_set_wider_than_input_is_an_error() {
+        let bundle = bundle_with("d.flatppl", "c = elementof(posreals)\nout = mul(c, 2.0)");
+        let mut model = flatppl_syntax::parse(
+            "p = elementof(reals)\nd = load_module(\"d.flatppl\", c = p)\nv = d.out",
+        )
+        .expect("model");
+        let diags = infer_module(&mut model, &bundle, Level::Valueset);
+        assert!(
+            diags.iter().any(|d| d.severity == Severity::Error
+                && d.message.contains("value set")
+                && d.message.contains("posreals")),
+            "reals ⊋ posreals substitution must be flagged; got {diags:?}"
+        );
+    }
+
+    /// The compatible direction (`posreals` value into a `reals` input) is fine —
+    /// and the conservative check must NOT false-positive when it cannot prove a
+    /// strict superset.
+    #[test]
+    fn substitution_value_set_within_input_is_ok() {
+        let bundle = bundle_with("d.flatppl", "c = elementof(reals)\nout = mul(c, 2.0)");
+        let mut model = flatppl_syntax::parse(
+            "p = elementof(posreals)\nd = load_module(\"d.flatppl\", c = p)\nv = d.out",
+        )
+        .expect("model");
+        let diags = infer_module(&mut model, &bundle, Level::Valueset);
+        assert!(
+            !diags.iter().any(|d| d.message.contains("value set")),
+            "posreals ⊆ reals is compatible; got {diags:?}"
         );
     }
 }

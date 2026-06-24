@@ -490,10 +490,12 @@ impl<'m, 's> Inferencer<'m, 's> {
                             ),
                         )),
                         // An input: its phase governs what may bind to it —
-                        // `external` ← fixed, `elementof` ← parameterized.
+                        // `external` ← fixed, `elementof` ← parameterized — and
+                        // (spec §04) the value's set must lie within the input's
+                        // declared set.
                         Some(kind) => {
-                            // The substitution value was inferred just above, so
-                            // its phase is recorded; skip the check if not (never
+                            // Phase. The substitution value was inferred just
+                            // above, so its phase is recorded; skip if not (never
                             // false-positive on a missing phase).
                             if let Some(&value_phase) = self.phases.get(&value_node) {
                                 let required = kind.required_phase();
@@ -504,6 +506,29 @@ impl<'m, 's> Inferencer<'m, 's> {
                                             "{} `{input}` of module `{path}` may only be bound to \
                                              a {required} value (got {value_phase})",
                                             kind.describe()
+                                        ),
+                                    ));
+                                }
+                            }
+                            // Value set (only at `Level::Valueset`+). Conservative:
+                            // flag only a *proven strict superset* — the value
+                            // admits points outside the declared domain. Pairs the
+                            // checker can't prove (incomparable / `Unknown` sets)
+                            // are left alone, so no valid model is rejected.
+                            if self.level >= Level::Valueset {
+                                let declared = declared_input_set(dep, &input);
+                                let value_set = self.lookup_valueset(value_node);
+                                if is_concrete_set(&value_set)
+                                    && declared.subset_of(&value_set)
+                                    && !value_set.subset_of(&declared)
+                                {
+                                    self.diags.push(Diagnostic::error_at(
+                                        value_node,
+                                        format!(
+                                            "the substitution value set `{}` is wider than input \
+                                             `{input}`'s declared set `{declared}` in module \
+                                             `{path}` (spec §04: value sets must be compatible)",
+                                            self.module.display_valueset(&value_set)
                                         ),
                                     ));
                                 }
@@ -620,6 +645,79 @@ fn dep_input_kind(dep: &Module, name: &str) -> Option<InputKind> {
         "elementof" => InputKind::Elementof,
         _ => InputKind::Other,
     })
+}
+
+/// The declared value-set of dependency input `name` — the set argument of its
+/// `elementof(S)` / `external(S)` binding, read structurally (no inference, the
+/// dep may be uninferred here). Covers the set-constant vocabulary and
+/// literal-bound `interval`; anything else → `Unknown` (so the §04 value-set
+/// check simply does not fire — conservative).
+fn declared_input_set(dep: &Module, name: &str) -> ValueSet {
+    let Some((_, b)) = dep.bindings().find(|(_, b)| dep.resolve(b.name) == name) else {
+        return ValueSet::Unknown;
+    };
+    let Node::Call(c) = dep.node(b.rhs) else {
+        return ValueSet::Unknown;
+    };
+    let CallHead::Builtin(h) = c.head else {
+        return ValueSet::Unknown;
+    };
+    match dep.resolve(h) {
+        "elementof" | "external" => set_const_node(dep, c.args.first().copied()),
+        _ => ValueSet::Unknown,
+    }
+}
+
+/// Read a constant set expression node (`reals`, `posreals`, …, or
+/// `interval(lo, hi)` with literal bounds) into a [`ValueSet`]. `Unknown` for
+/// anything non-constant — the foreign dep is not inferred here, so only the
+/// statically-evident set vocabulary is recognised.
+fn set_const_node(dep: &Module, node: Option<NodeId>) -> ValueSet {
+    let Some(node) = node else {
+        return ValueSet::Unknown;
+    };
+    match dep.node(node) {
+        Node::Const(sym) => match dep.resolve(*sym) {
+            "reals" => ValueSet::Reals,
+            "posreals" => ValueSet::PosReals,
+            "nonnegreals" => ValueSet::NonNegReals,
+            "unitinterval" => ValueSet::UnitInterval,
+            "integers" => ValueSet::Integers,
+            "posintegers" => ValueSet::PosIntegers,
+            "nonnegintegers" => ValueSet::NonNegIntegers,
+            "booleans" => ValueSet::Booleans,
+            "complexes" => ValueSet::Complexes,
+            "rngstates" => ValueSet::RngStates,
+            "anything" => ValueSet::Anything,
+            _ => ValueSet::Unknown,
+        },
+        Node::Call(c) if matches!(c.head, CallHead::Builtin(h) if dep.resolve(h) == "interval") => {
+            let bound = |n: Option<NodeId>| match n.map(|n| dep.node(n)) {
+                Some(Node::Lit(Scalar::Real(r))) => Some(*r),
+                Some(Node::Lit(Scalar::Int(i))) => Some(*i as f64),
+                Some(Node::Const(s)) if dep.resolve(*s) == "inf" => Some(f64::INFINITY),
+                _ => None,
+            };
+            match (
+                bound(c.args.first().copied()),
+                bound(c.args.get(1).copied()),
+            ) {
+                (Some(lo), Some(hi)) => ValueSet::Interval(lo, hi),
+                _ => ValueSet::Unknown,
+            }
+        }
+        _ => ValueSet::Unknown,
+    }
+}
+
+/// A set concrete enough to ground a §04 value-set comparison (not a
+/// "don't-know" marker). `Anything` is excluded so an unconstrained value is
+/// never flagged as a violation on its own.
+fn is_concrete_set(vs: &ValueSet) -> bool {
+    !matches!(
+        vs,
+        ValueSet::Deferred | ValueSet::Unknown | ValueSet::Anything
+    )
 }
 
 /// `stochastic > parameterized > fixed` (spec §04 phases).

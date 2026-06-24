@@ -302,6 +302,19 @@ impl<'b> InferSession<'b> {
             return Err(format!("`{binding_name}` is private to `{dep_path}`"));
         }
         let rhs = b.rhs;
+        // Spec §04 stochastic boundary: only `fixed`/`parameterized` bindings of
+        // the loaded module are accessible. A `stochastic`-phase binding — a
+        // `draw` (or `draw` descendant) not reified via `lawof`/`kernelof` — is
+        // invisible across the load boundary (preserving referential
+        // transparency). `lawof`/`kernelof` absorb stochasticity, so a reified
+        // measure/kernel is fixed/parameterized and stays visible.
+        if dep_annotated.phase_of(rhs) == Some(Phase::Stochastic) {
+            return Err(format!(
+                "`{binding_name}` is stochastic and not accessible from module `{dep_path}` \
+                 (spec §04: stochastic bindings are invisible across the load boundary; \
+                 reify it with `lawof`/`kernelof` to export it)"
+            ));
+        }
         Ok(Resolved {
             ty: dep_annotated
                 .type_of(rhs)
