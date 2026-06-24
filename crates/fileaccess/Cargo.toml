@@ -16,15 +16,20 @@ name = "flatppl_fileaccess"
 path = "src/lib.rs"
 
 [features]
-# Real HTTP fetching (ureq + rustls TLS). Off by default so the crate's
-# resolution + cache logic stays network-free and unit-testable via a fake
-# Fetcher; the CLI turns it on.
-default = []
-net = ["dep:ureq"]
+# The pure `Location` resolver (spec §04 join) is ALWAYS available with zero
+# dependencies. The on-disk remote cache + `Resolver` (Cache/Fetcher/TrustOracle)
+# and the deps it needs live behind `cache` (on by default). `net` adds the real
+# HTTP client on top. A pure-resolution consumer that never fetches — the LSP,
+# which can't obtain URL-trust approval over the protocol, so the editor client
+# fetches and the LSP only resolves+reads client-fed content — depends with
+# `default-features = false` and links only `Location` (no sha2/serde/TLS).
+default = ["cache"]
+cache = ["dep:sha2", "dep:dirs", "dep:serde", "dep:serde_json"]
+net = ["cache", "dep:ureq"]
 
 [dependencies]
-sha2.workspace = true
-dirs.workspace = true
-serde.workspace = true
-serde_json.workspace = true
+sha2 = { workspace = true, optional = true }
+dirs = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
 ureq = { version = "2", optional = true }

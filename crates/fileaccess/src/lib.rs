@@ -15,22 +15,34 @@
 //! feature ([`HttpFetcher`]). This is a **native** host-layer library (fs +
 //! optional network), not one of the wasm-targeted core libraries.
 
-mod cache;
-mod fetch;
 mod location;
+
+#[cfg(feature = "cache")]
+mod cache;
+#[cfg(feature = "cache")]
+mod fetch;
+#[cfg(feature = "cache")]
 mod trust;
 
+// `Location` (the spec §04 path/URL join) is the dependency-free core, always
+// available. Everything below is the host-side pull cache, gated behind `cache`.
+pub use location::Location;
+
+#[cfg(feature = "cache")]
 use std::path::PathBuf;
 
+#[cfg(feature = "cache")]
 pub use cache::{Cache, Meta};
+#[cfg(feature = "cache")]
 pub use fetch::{Fetched, Fetcher, OfflineFetcher};
-pub use location::Location;
+#[cfg(feature = "cache")]
 pub use trust::{ApproveAll, DenyAll, TrustOracle};
 
 #[cfg(feature = "net")]
 pub use fetch::HttpFetcher;
 
 /// A source-resolution failure.
+#[cfg(feature = "cache")]
 #[derive(Debug)]
 pub enum Error {
     /// A local source does not exist.
@@ -45,6 +57,7 @@ pub enum Error {
     Fetch { url: String, reason: String },
 }
 
+#[cfg(feature = "cache")]
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -63,6 +76,7 @@ impl std::fmt::Display for Error {
     }
 }
 
+#[cfg(feature = "cache")]
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
@@ -72,6 +86,7 @@ impl std::error::Error for Error {
     }
 }
 
+#[cfg(feature = "cache")]
 impl From<std::io::Error> for Error {
     fn from(e: std::io::Error) -> Self {
         Error::Io(e)
@@ -80,12 +95,14 @@ impl From<std::io::Error> for Error {
 
 /// Resolves [`Location`]s to local files, bundling the [`Cache`] with the
 /// [`Fetcher`] and [`TrustOracle`] a resolve needs.
+#[cfg(feature = "cache")]
 pub struct Resolver<'a> {
     cache: Cache,
     fetcher: &'a dyn Fetcher,
     trust: &'a dyn TrustOracle,
 }
 
+#[cfg(feature = "cache")]
 impl<'a> Resolver<'a> {
     /// Bundle a cache with the fetch + trust policy to use for remote sources.
     pub fn new(cache: Cache, fetcher: &'a dyn Fetcher, trust: &'a dyn TrustOracle) -> Self {
@@ -124,7 +141,7 @@ impl<'a> Resolver<'a> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cache"))]
 mod tests {
     use super::*;
     use std::cell::RefCell;

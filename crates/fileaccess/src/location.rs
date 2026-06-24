@@ -71,6 +71,21 @@ impl Location {
             }
         }
     }
+
+    /// Canonicalize this location for equality comparison. A local path has its
+    /// `.`/`..` components resolved lexically (so two spellings of the same path
+    /// compare equal); a remote URL is returned verbatim — URLs are already
+    /// canonical as keyed (spec §sec:url-cache keys the request URL with no
+    /// normalization, and a query string is significant). Pairs with [`join`],
+    /// whose resolved result is already in this form.
+    ///
+    /// [`join`]: Location::join
+    pub fn normalized(&self) -> Location {
+        match self {
+            Location::Local(p) => Location::Local(lexical_normalize(p)),
+            Location::Remote(_) => self.clone(),
+        }
+    }
 }
 
 /// Join a relative (or absolute) path `source` against the directory of the
@@ -266,6 +281,32 @@ mod tests {
         assert_eq!(
             base.join("c.flatppl"),
             Location::Remote("https://h.example:8443/a/b/c.flatppl".to_string())
+        );
+    }
+
+    #[test]
+    fn normalized_canonicalizes_local_paths_for_comparison() {
+        // A stored path carrying redundant `.`/`..` compares equal to its
+        // canonical form (what `join` already produces on the resolved side).
+        assert_eq!(
+            Location::parse("/proj/sub/../sub/./x.flatppl").normalized(),
+            Location::parse("/proj/sub/x.flatppl")
+        );
+        // Already-canonical paths are unchanged.
+        assert_eq!(
+            Location::parse("helpers.flatppl").normalized(),
+            Location::Local(PathBuf::from("helpers.flatppl"))
+        );
+    }
+
+    #[test]
+    fn normalized_leaves_remote_urls_verbatim() {
+        // URLs are canonical as keyed (spec §sec:url-cache keys verbatim, no
+        // normalization), and a query string is significant — never stripped.
+        let u = "https://h.example/a/b.flatppl?v=2";
+        assert_eq!(
+            Location::Remote(u.to_string()).normalized(),
+            Location::Remote(u.to_string())
         );
     }
 }
