@@ -1,0 +1,30 @@
+[package]
+name = "flatppl-fileaccess"
+description = "Resolve a FlatPPL `source` (local path or http/https URL) to a local file, with the spec §sec:url-cache shared cache for remote content. No file-format decoding."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# A NATIVE host-layer library (fs + optional network): used by `flatppl-cli`
+# to resolve `load_module` / `load_data` sources. Unlike core/syntax/infer it is
+# NOT wasm-targeted (URL loading in a browser is the JS host's concern), but it
+# stays binary-free like the other libraries.
+[lib]
+name = "flatppl_fileaccess"
+path = "src/lib.rs"
+
+[features]
+# Real HTTP fetching (ureq + rustls TLS). Off by default so the crate's
+# resolution + cache logic stays network-free and unit-testable via a fake
+# Fetcher; the CLI turns it on.
+default = []
+net = ["dep:ureq"]
+
+[dependencies]
+sha2.workspace = true
+dirs.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ureq = { version = "2", optional = true }

@@ -16,6 +16,7 @@ This monorepo is a Cargo workspace; member crates live under `crates/`:
 * [`flatppl-flatpir`](crates/flatpir) — FlatPIR S-expression reader + writer
 * [`flatppl-infer`](crates/infer) — type, shape, and phase inference
 * [`flatppl-hs3`](crates/hs3) — HS3 / pyhf → FlatPPL importer
+* [`flatppl-fileaccess`](crates/fileaccess) — resolve a `source` (local path or `http`/`https` URL) to a local file, with the shared remote-content cache (native host layer)
 * [`flatppl-cli`](crates/cli) — the `flatppl` command-line driver
 * [`flatppl-lsp`](crates/lsp) — FlatPPL language server (diagnostics, hover, go-to-definition, completion)
 

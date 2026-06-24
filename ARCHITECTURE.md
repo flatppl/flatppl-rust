@@ -163,11 +163,27 @@ legalization targets above.
 Landed: `flatppl-core` (the IR) · `flatppl-syntax` (FlatPPL surface ↔ core) ·
 `flatppl-flatpir` (FlatPIR S-expr ↔ core) · `flatppl-infer` (the type/phase
 trace + per-op rule catalogue) · `flatppl-lint` (lint rules over the IR) ·
+`flatppl-fileaccess` (resolve a `source` to a local file) ·
 `flatppl-cli` (the `flatppl` driver binary — `convert`, `infer`, `fmt`, `lint`) ·
 `flatppl-lsp` (the FlatPPL language server binary).
 `syntax`/`flatpir`/`infer` depend on `core`; `core` depends on nothing. Library
 crates stay **binary-free** (they compile to `wasm32` and link into PyO3 / jlrs /
 cxx); all CLI surface lives in `flatppl-cli`.
+
+**`flatppl-fileaccess` — source resolution + remote cache.** A thin file-access
+abstraction for the host layer: a `Location` (local path | `http`/`https` URL)
+with relative-`join` resolution (spec §04 path resolution + the URL analogue),
+and a `Resolver` that returns a local file path — local paths pass through,
+remote URLs are fetched and cached per spec §sec:url-cache (content-addressed by
+URL hash under `<flatppl-cachedir>/v1/`, per-URL trust markers, atomic
+publishes, never revalidated). It does **no** file-format decoding and does not
+parse FlatPPL. Network is a seam: fetching goes through a `Fetcher` trait and
+the trust decision through a `TrustOracle`, so the cache logic is unit-testable
+without a network; the real `ureq` client is behind the `net` feature. **Unlike
+the other libraries it is native-only** (fs + optional network), not
+wasm-targeted — URL loading in a browser/wasm context is the JS host's job — but
+it stays binary-free. Not yet wired into the CLI's `load_module`/`load_data`
+dependency resolution (that integration is the next step).
 
 **Binary tool crates** — `flatppl-cli` and `flatppl-lsp` — are the two exceptions
 to the binary-free rule: they are standalone tools, never wasm-linked. Both ship a
