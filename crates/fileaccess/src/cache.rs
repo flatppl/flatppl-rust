@@ -132,6 +132,22 @@ impl Cache {
         &self.root
     }
 
+    /// Would resolving `url` prompt for trust? `true` only when a fetch would
+    /// actually happen *and* needs approval: not offline, not already cached,
+    /// not blanket-trusted (`FLATPPL_TRUST`), and no per-URL marker. Lets a
+    /// caller batch the trust prompt for a set of URLs before resolving them.
+    pub fn needs_approval(&self, url: &str) -> bool {
+        if self.offline || self.trust_all {
+            return false;
+        }
+        let k = cache_key(url);
+        // A cached object is returned without fetching → no prompt.
+        if self.object_path(&k).exists() {
+            return false;
+        }
+        !self.trust_path(&k).exists()
+    }
+
     /// Resolve `url` to a local cached object path, fetching it on a miss.
     ///
     /// A present object is authoritative and returned as-is — the cache never
@@ -365,6 +381,25 @@ mod tests {
         assert_eq!(iso8601_utc(0), "1970-01-01T00:00:00Z");
         assert_eq!(iso8601_utc(1_700_000_000), "2023-11-14T22:13:20Z");
         assert_eq!(iso8601_utc(1_719_263_400), "2024-06-24T21:10:00Z");
+    }
+
+    #[test]
+    fn needs_approval_tracks_offline_trust_and_cache_state() {
+        let url = "https://example.com/models/m.flatppl";
+        // Fresh, online, not trusted → would prompt.
+        let dir = std::env::temp_dir().join(format!("flatppl-na-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let c = Cache::new(dir.clone(), false, false);
+        assert!(c.needs_approval(url));
+        // Blanket trust or offline → never prompts.
+        assert!(!Cache::new(dir.clone(), false, true).needs_approval(url));
+        assert!(!Cache::new(dir.clone(), true, false).needs_approval(url));
+        // A trust marker suppresses the prompt.
+        let k = cache_key(url);
+        std::fs::create_dir_all(c.trust_path(&k).parent().unwrap()).unwrap();
+        std::fs::write(c.trust_path(&k), b"").unwrap();
+        assert!(!c.needs_approval(url));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

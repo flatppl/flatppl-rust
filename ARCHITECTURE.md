@@ -182,8 +182,22 @@ the trust decision through a `TrustOracle`, so the cache logic is unit-testable
 without a network; the real `ureq` client is behind the `net` feature. **Unlike
 the other libraries it is native-only** (fs + optional network), not
 wasm-targeted — URL loading in a browser/wasm context is the JS host's job — but
-it stays binary-free. Not yet wired into the CLI's `load_module`/`load_data`
-dependency resolution (that integration is the next step).
+it stays binary-free.
+
+**Wired into the CLI (`crates/cli/src/resolve.rs`).** `flatppl convert`/`infer`
+read their input — local path or URL — through this layer, and `infer`
+additionally walks the model's transitive `load_module` graph to assemble the
+inference `ModuleBundle` (the engine stays I/O-free). The walk is breadth-first;
+trust is **batched per BFS level** (one interactive prompt per discovery wave;
+non-interactive refuses untrusted URLs); the bundle is keyed by the directive
+string the engine looks up, and a string denoting two different files across the
+graph is a hard error. URL fetching is **default-on** for the `flatppl` driver
+(the `net` feature rides `convert`/`infer`), but stays out of the lean
+`flatppl-fmt` build. The **reads-only / writes-direct** split holds: source
+reads route through `fileaccess`; output writes are plain `fs::write`. The LSP
+keeps its in-memory salsa `FileSet` for editor buffers — a separate, reactive
+file abstraction — so `fileaccess` is the disk/URL layer for the non-reactive
+host tools, not a replacement for it.
 
 **Binary tool crates** — `flatppl-cli` and `flatppl-lsp` — are the two exceptions
 to the binary-free rule: they are standalone tools, never wasm-linked. Both ship a

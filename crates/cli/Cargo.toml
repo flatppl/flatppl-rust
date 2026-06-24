@@ -27,8 +27,8 @@ required-features = ["fmtlint"]
 # Verbs are opt-in cargo features so heavy capabilities never burden the
 # default build; `infer` is light and rides along by default.
 default = ["convert", "infer", "fmtlint"]
-convert = ["dep:flatppl-flatpir"]
-infer = ["dep:flatppl-infer", "dep:flatppl-flatpir"]
+convert = ["dep:flatppl-flatpir", "dep:flatppl-fileaccess"]
+infer = ["dep:flatppl-infer", "dep:flatppl-flatpir", "dep:flatppl-fileaccess"]
 hs3 = ["dep:flatppl-hs3", "dep:flatppl-flatpir"]
 fmtlint = ["dep:flatppl-lint"]
 
@@ -39,6 +39,9 @@ flatppl-flatpir = { path = "../flatpir", optional = true }
 flatppl-infer = { path = "../infer", optional = true }
 flatppl-hs3 = { path = "../hs3", optional = true }
 flatppl-lint = { path = "../lint", optional = true }
+# URL fetching is default-on for the `flatppl` driver (net feature); pulled only
+# by `convert`/`infer`, so the lean `flatppl-fmt` build never links the TLS stack.
+flatppl-fileaccess = { path = "../fileaccess", features = ["net"], optional = true }
 clap = { workspace = true }
 clap_complete = { workspace = true }
 ariadne = { workspace = true }

@@ -15,6 +15,11 @@ use flatppl_core::Module;
 pub mod provenance;
 pub use provenance::banner;
 
+/// Source resolution (local paths + `http`/`https` URLs) through the
+/// `flatppl-fileaccess` layer, and `load_module` dependency-graph assembly.
+#[cfg(any(feature = "convert", feature = "infer"))]
+pub mod resolve;
+
 // ── clap mirrors ───────────────────────────────────────────────────────────────
 
 /// CLI mirror of [`flatppl_syntax::Syntax`].
@@ -104,6 +109,14 @@ impl Format {
         }
     }
 
+    /// Infer the format of a resolved source [`Location`] from its final
+    /// filename — so a URL source (`https://…/m.flatppl`) detects the same way
+    /// as a local path.
+    #[cfg(any(feature = "convert", feature = "infer"))]
+    pub fn from_location(loc: &flatppl_fileaccess::Location) -> Result<Format, String> {
+        Format::from_path(Path::new(&loc.name()))
+    }
+
     /// How the leading generated-file banner is commented for this format.
     ///
     /// FlatPPL and FlatPIR both use a single line comment — `#` and `;`
@@ -132,6 +145,7 @@ pub enum CommentStyle {
 
 /// Why a command failed: a plain one-line message (I/O, usage), or a parse
 /// diagnostic rendered as a source-annotated report.
+#[derive(Debug)]
 pub enum Failure {
     Plain(String),
     Diagnostic {

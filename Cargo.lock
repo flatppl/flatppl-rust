@@ -348,6 +348,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "flatppl-core",
+ "flatppl-fileaccess",
  "flatppl-flatpir",
  "flatppl-hs3",
  "flatppl-infer",

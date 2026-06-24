@@ -54,6 +54,23 @@ impl Location {
             Location::Remote(u) => u.clone(),
         }
     }
+
+    /// The final filename component — a local path's file name, or a URL's last
+    /// path segment with any query/fragment stripped. Empty when there is none
+    /// (e.g. a URL ending in `/`). Used to detect a format from the extension.
+    pub fn name(&self) -> String {
+        match self {
+            Location::Local(p) => p
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string(),
+            Location::Remote(url) => {
+                let no_qf = url.split(['?', '#']).next().unwrap_or(url);
+                no_qf.rsplit('/').next().unwrap_or("").to_string()
+            }
+        }
+    }
 }
 
 /// Join a relative (or absolute) path `source` against the directory of the
@@ -225,6 +242,22 @@ mod tests {
         let abs = "https://other.example/z.flatppl";
         assert_eq!(local.join(abs), Location::Remote(abs.to_string()));
         assert_eq!(remote.join(abs), Location::Remote(abs.to_string()));
+    }
+
+    #[test]
+    fn name_is_final_segment_sans_query() {
+        assert_eq!(
+            Location::Local(PathBuf::from("/a/b/model.flatppl")).name(),
+            "model.flatppl"
+        );
+        assert_eq!(
+            Location::Remote("https://h/dir/events.csv?v=2".to_string()).name(),
+            "events.csv"
+        );
+        assert_eq!(
+            Location::Remote("https://h/m.flatpir#frag".to_string()).name(),
+            "m.flatpir"
+        );
     }
 
     #[test]

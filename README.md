@@ -40,11 +40,19 @@ flatppl convert model.flatpir model.flatppl   # FlatPIR → FlatPPL
 flatppl convert messy.flatppl tidy.flatppl    # canonicalize (same format)
 flatppl infer model.flatppl typed.flatpir    # emit type/phase-annotated FlatPIR
 flatppl infer --level=phase m.flatppl m.flatpir  # or: type, valueset, normalization, shape
+flatppl infer https://example.org/m.flatppl m.flatpir  # URL input + load_module deps
 ```
 
 Formats are inferred from the file extensions. FlatPPL output uses the full
 surface syntax (operators, indexing, lambdas, `:=`); pass `--syntax minimal`
 for the lowered function-call form instead.
+
+The input — and, for `infer`, the model's transitive `load_module`
+dependencies — may be a local path or an `http`/`https` URL. URLs are fetched
+into a shared local cache (`$FLATPPL_CACHEDIR`, default per-platform); an
+untrusted URL prompts for approval when run interactively, and is refused
+otherwise (set `FLATPPL_TRUST=1` to allow all, `FLATPPL_CACHE_OFFLINE=1` to use
+only the cache).
 
 ## Building and testing (developers)
 

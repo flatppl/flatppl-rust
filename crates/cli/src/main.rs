@@ -22,12 +22,16 @@ use clap::{CommandFactory, Parser, Subcommand};
 #[cfg(feature = "convert")]
 use flatppl_cli::SyntaxLevel;
 use flatppl_cli::report;
+#[cfg(any(feature = "convert", feature = "infer"))]
+use flatppl_cli::resolve::CliResolver;
 #[cfg(feature = "convert")]
 use flatppl_cli::write_module;
 #[cfg(any(feature = "convert", feature = "infer"))]
 use flatppl_cli::{Failure, Format, banner};
 #[cfg(feature = "fmtlint")]
 use flatppl_cli::{run_fmt, run_lint};
+#[cfg(any(feature = "convert", feature = "infer"))]
+use flatppl_fileaccess::Location;
 
 #[derive(Parser)]
 #[command(name = "flatppl", version, about = "FlatPPL toolchain driver")]
@@ -48,9 +52,10 @@ enum Command {
     /// JSON file (and override the extension); both need the optional `hs3` feature.
     #[cfg(feature = "convert")]
     Convert {
-        /// Input file (`.flatppl`, `.flatpir`, `.flatpir.json`, native HS3 JSON
-        /// with `--from hs3`, or pyhf workspace JSON with `--from pyhf`)
-        input: PathBuf,
+        /// Input source: a file path or an `http`/`https` URL (`.flatppl`,
+        /// `.flatpir`, `.flatpir.json`, native HS3 JSON with `--from hs3`, or
+        /// pyhf workspace JSON with `--from pyhf`). URLs are fetched + cached.
+        input: String,
         /// Output file (`.flatppl`, `.flatpir`, or `.flatpir.json`)
         output: PathBuf,
         /// FlatPPL output syntax level (ignored for FlatPIR output):
@@ -80,8 +85,10 @@ enum Command {
     /// unresolved names) fail the command.
     #[cfg(feature = "infer")]
     Infer {
-        /// Input file (`.flatppl` or `.flatpir`)
-        input: PathBuf,
+        /// Input source: a file path or an `http`/`https` URL (`.flatppl` or
+        /// `.flatpir`). URL sources — and the model's transitive `load_module`
+        /// dependencies — are fetched + cached.
+        input: String,
         /// Output file (`.flatpir` — FlatPPL cannot carry annotations)
         output: PathBuf,
         /// Inference level — a hierarchy, each including the previous:
@@ -162,11 +169,11 @@ enum FromFormat {
 /// any other name stays `Auto` (extension-inferred). An explicit `--from`
 /// overrides and is returned unchanged.
 #[cfg(feature = "convert")]
-fn resolve_from_format(from: FromFormat, input: &Path) -> FromFormat {
+fn resolve_from_format(from: FromFormat, input: &Location) -> FromFormat {
     if from != FromFormat::Auto {
         return from;
     }
-    let name = input.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let name = input.name();
     if name.ends_with(".hs3.json") {
         FromFormat::Hs3
     } else if name.ends_with(".pyhf.json") {
@@ -230,16 +237,20 @@ fn note_dropped_analyses(source: &str) {
 
 #[cfg(feature = "convert")]
 fn convert(
-    input: &Path,
+    input: &str,
     output: &Path,
     syntax: flatppl_syntax::Syntax,
     from_format: FromFormat,
     no_header: bool,
 ) -> Result<(), Failure> {
     let to = Format::from_path(output)?;
+    // The input may be a local path or an `http`/`https` URL; resolve + read it
+    // through the file-access layer (URLs are fetched + cached).
+    let in_loc = Location::parse(input);
     // `--from auto` keys off the input name: `*.hs3.json` / `*.pyhf.json` select
     // the importers; an explicit `--from` overrides.
-    let from_format = resolve_from_format(from_format, input);
+    let from_format = resolve_from_format(from_format, &in_loc);
+    let resolver = CliResolver::from_env();
 
     // Read the module: HS3/pyhf paths (feature-gated) or the standard
     // extension-based FlatPPL/FlatPIR path.
@@ -247,8 +258,7 @@ fn convert(
     let mut module = match from_format {
         #[cfg(feature = "hs3")]
         FromFormat::Hs3 => {
-            let source = fs::read_to_string(input)
-                .map_err(|e| format!("reading `{}`: {e}", input.display()))?;
+            let source = resolver.read_string(&in_loc)?;
             let module =
                 flatppl_hs3::read_hs3(&source).map_err(|e| Failure::Plain(format!("hs3: {e}")))?;
             note_dropped_analyses(&source);
@@ -256,8 +266,7 @@ fn convert(
         }
         #[cfg(feature = "hs3")]
         FromFormat::Pyhf => {
-            let source = fs::read_to_string(input)
-                .map_err(|e| format!("reading `{}`: {e}", input.display()))?;
+            let source = resolver.read_string(&in_loc)?;
             let module = flatppl_hs3::read_pyhf(&source)
                 .map_err(|e| Failure::Plain(format!("pyhf: {e}")))?;
             note_dropped_analyses(&source);
@@ -271,12 +280,11 @@ fn convert(
                 "HS3/pyhf import is not compiled in — rebuild with `--features hs3`".into(),
             ));
         }
-        // Extension-based FlatPPL / FlatPIR / FlatPIR-JSON. Check the extension
-        // BEFORE reading the file so an unknown one is reported even if the file
-        // is missing; for a bare `.json`, hint at the importers.
+        // Extension-based FlatPPL / FlatPIR / FlatPIR-JSON. Detect the format
+        // from the source name first; for a bare `.json`, hint at the importers.
         FromFormat::Auto => {
-            let from = Format::from_path(input).map_err(|mut e| {
-                if input.extension().and_then(|x| x.to_str()) == Some("json") {
+            let from = Format::from_location(&in_loc).map_err(|mut e| {
+                if in_loc.name().ends_with(".json") {
                     e.push_str(
                         "; for an HS3 or pyhf JSON document pass `--from hs3` / `--from pyhf` \
                          (or name it `*.hs3.json` / `*.pyhf.json`)",
@@ -284,13 +292,12 @@ fn convert(
                 }
                 e
             })?;
-            let source = fs::read_to_string(input)
-                .map_err(|e| format!("reading `{}`: {e}", input.display()))?;
+            let source = resolver.read_string(&in_loc)?;
             match flatppl_cli::read_module(from, &source) {
                 Ok(module) => module,
                 Err((message, line, span)) => {
                     return Err(Failure::Diagnostic {
-                        path: input.to_path_buf(),
+                        path: PathBuf::from(in_loc.display()),
                         source,
                         message,
                         line,
@@ -325,12 +332,13 @@ fn convert(
 /// diagnostics, write annotated FlatPIR.
 #[cfg(feature = "infer")]
 fn infer_cmd(
-    input: &Path,
+    input: &str,
     output: &Path,
     level: flatppl_infer::Level,
     no_header: bool,
 ) -> Result<(), Failure> {
-    let from = Format::from_path(input)?;
+    let in_loc = Location::parse(input);
+    let from = Format::from_location(&in_loc)?;
     if !matches!(Format::from_path(output)?, Format::FlatPir) {
         return Err(Failure::Plain(format!(
             "`infer` writes annotated FlatPIR; `{}` must have a `.flatpir` extension \
@@ -338,13 +346,13 @@ fn infer_cmd(
             output.display()
         )));
     }
-    let source =
-        fs::read_to_string(input).map_err(|e| format!("reading `{}`: {e}", input.display()))?;
+    let resolver = CliResolver::from_env();
+    let source = resolver.read_string(&in_loc)?;
     let mut module = match flatppl_cli::read_module(from, &source) {
         Ok(module) => module,
         Err((message, line, span)) => {
             return Err(Failure::Diagnostic {
-                path: input.to_path_buf(),
+                path: PathBuf::from(in_loc.display()),
                 source,
                 message,
                 line,
@@ -353,7 +361,11 @@ fn infer_cmd(
         }
     };
 
-    let diags = flatppl_infer::infer_with(&mut module, level);
+    // Assemble the cross-module bundle: resolve the model's transitive
+    // `load_module` dependencies (local or URL) through the file-access layer,
+    // so the engine — which stays I/O-free — can type cross-module references.
+    let bundle = flatppl_cli::resolve::build_bundle(&module, &in_loc, &resolver)?;
+    let diags = flatppl_infer::infer_module(&mut module, &bundle, level);
     let mut errors = 0u32;
     for d in &diags {
         match d.severity {
@@ -366,8 +378,7 @@ fn infer_cmd(
     }
     if errors > 0 {
         return Err(Failure::Plain(format!(
-            "inference found {errors} error(s) in `{}`",
-            input.display()
+            "inference found {errors} error(s) in `{input}`"
         )));
     }
 
