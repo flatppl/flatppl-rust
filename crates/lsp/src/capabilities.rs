@@ -9,7 +9,7 @@ use crate::db::{Catalogues, Database, FileSet, SourceFile};
 use crate::queries::{
     SpanIndex, analyze, line_index, node_at_offset_indexed, parse, parsed_catalogues, resolve_path,
 };
-use flatppl_core::{CallHead, Node, RefNs, Scalar};
+use flatppl_core::{BindingId, CallHead, Doc, Node, Ref, RefNs, Scalar};
 
 /// Test-only counter incremented each time the static completion set is built.
 /// Used by `static_completion_items_built_once` to prove the `OnceLock` cache is
@@ -242,7 +242,105 @@ pub fn hover(
     if let Some(vs) = module.valueset_of(node_id) {
         parts.push(format!("**value-set:** `{vs}`"));
     }
-    Some(parts.join("  \n"))
+    let mut out = parts.join("  \n");
+    // Append the doc-comment of the binding this node designates, inherited
+    // through alias chains and across module boundaries (see `hover_doc`).
+    if let Some(doc) = hover_doc(db, file, fs, cats, module, node_id, byte_offset) {
+        out.push_str("\n\n");
+        out.push_str(&doc);
+    }
+    Some(out)
+}
+
+/// Resolve the doc-comment to show when hovering the node at `node_id` /
+/// `byte_offset`, or `None` when no documented binding is in view.
+///
+/// Two starting points feed the same alias-following resolver:
+/// - the node is a [`Node::Ref`] (a use of a binding, or a `module.member`
+///   access) → start from the binding that reference designates;
+/// - otherwise the node sits inside some top-level binding's RHS → start from
+///   that enclosing binding.
+///
+/// From the starting binding, [`effective_doc`] returns its own doc or, when it
+/// is a bare alias (`b = a`, or `b = mod.a`), follows the alias chain to the
+/// originating binding's doc, across module hops.
+fn hover_doc(
+    db: &dyn salsa::Database,
+    file: SourceFile,
+    fs: FileSet,
+    cats: Catalogues,
+    module: &flatppl_core::Module,
+    node_id: flatppl_core::NodeId,
+    byte_offset: u32,
+) -> Option<String> {
+    // A reference designates another binding: show that definition's doc.
+    if let Node::Ref(r) = module.node(node_id) {
+        let (def_file, def_bid) = resolve_ref_def(db, file, fs, cats, module, r)?;
+        return effective_doc(db, fs, cats, def_file, def_bid, &mut Vec::new());
+    }
+    // Otherwise: the enclosing binding whose RHS span contains the cursor.
+    let (bid, _) = module
+        .bindings()
+        .filter(|(_, b)| {
+            module
+                .span_of(b.rhs)
+                .is_some_and(|s| s.start <= byte_offset && byte_offset < s.end)
+        })
+        .min_by_key(|(_, b)| {
+            let s = module.span_of(b.rhs).expect("filtered to spanned RHS");
+            s.end - s.start
+        })?;
+    effective_doc(db, fs, cats, file, bid, &mut Vec::new())
+}
+
+/// The effective doc-comment of the binding `bid` in `file`: its own doc if it
+/// has one, else — when the binding is a bare alias (`b = a` or `b = mod.a`) —
+/// the effective doc of the alias target, recursively across modules.
+///
+/// `visited` carries `(path, name)` pairs already entered, so an alias cycle
+/// (`a = b; b = a`) terminates instead of looping.
+fn effective_doc(
+    db: &dyn salsa::Database,
+    fs: FileSet,
+    cats: Catalogues,
+    file: SourceFile,
+    bid: BindingId,
+    visited: &mut Vec<(String, String)>,
+) -> Option<String> {
+    let analyzed = analyze(db, file, fs, cats);
+    let module = analyzed.module(db)?;
+    let binding = module.binding(bid);
+
+    let key = (
+        file.path(db).clone(),
+        module.resolve(binding.name).to_string(),
+    );
+    if visited.contains(&key) {
+        return None;
+    }
+    visited.push(key);
+
+    if let Some(doc) = &binding.doc {
+        return Some(render_doc(doc));
+    }
+    // No own doc: follow a bare-alias RHS to its target binding.
+    let Node::Ref(r) = module.node(binding.rhs) else {
+        return None;
+    };
+    let (def_file, def_bid) = resolve_ref_def(db, file, fs, cats, module, r)?;
+    effective_doc(db, fs, cats, def_file, def_bid, visited)
+}
+
+/// Render a binding doc-comment as markdown hover text: a `**doc:**` label
+/// followed by the doc lines joined with newlines.
+fn render_doc(doc: &Doc) -> String {
+    let body = doc
+        .lines
+        .iter()
+        .map(|l| l.as_ref())
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("**doc:** {body}")
 }
 
 /// The resolved location of a definition: a file path (as stored in the salsa
@@ -279,19 +377,40 @@ pub fn goto_definition(
     let Node::Ref(r) = module.node(node_id) else {
         return None;
     };
+    let (def_file, def_bid) = resolve_ref_def(db, file, fs, cats, module, r)?;
+    // The definition's span lives in the *defining* module, which may be `file`
+    // itself (SelfMod) or a loaded dependency (Module ref).
+    let def_analyzed = analyze(db, def_file, fs, cats);
+    let def_mod = def_analyzed.module(db)?;
+    let span = def_mod.span_of(def_mod.binding(def_bid).rhs)?;
+    Some(DefLoc {
+        path: def_file.path(db).clone(),
+        start: span.start,
+        end: span.end,
+    })
+}
+
+/// Resolve a reference `r` (read in `module`, which is `file`'s analyzed module)
+/// to the binding it designates, as a `(defining file, binding id)` pair.
+///
+/// - [`RefNs::SelfMod`]: the same-module binding of that name.
+/// - [`RefNs::Module`]: cross-file — find the alias binding's
+///   `load_module`/`standard_module` directive, resolve its path to a dependency
+///   [`SourceFile`], and match the member name there. A `standard_module` alias
+///   has no workspace file (`resolve_path` finds nothing) → `None`.
+/// - [`RefNs::Local`]: a placeholder input, not navigable → `None`.
+fn resolve_ref_def(
+    db: &dyn salsa::Database,
+    file: SourceFile,
+    fs: FileSet,
+    cats: Catalogues,
+    module: &flatppl_core::Module,
+    r: &Ref,
+) -> Option<(SourceFile, BindingId)> {
     match r.ns {
-        RefNs::SelfMod => {
-            let bid = module.binding_by_name(r.name)?;
-            let rhs = module.binding(bid).rhs;
-            let span = module.span_of(rhs)?;
-            Some(DefLoc {
-                path: file.path(db).clone(),
-                start: span.start,
-                end: span.end,
-            })
-        }
+        RefNs::SelfMod => Some((file, module.binding_by_name(r.name)?)),
         RefNs::Module(alias) => {
-            // Find the binding named `alias` in `module` and extract its
+            // Find the binding named `alias` and extract its
             // load_module/standard_module directive path from the call's first arg.
             let alias_name = module.resolve(alias);
             let (_, alias_binding) = module
@@ -307,22 +426,16 @@ pub fn goto_definition(
                 Some(Node::Lit(Scalar::Str(s))) => s.to_string(),
                 _ => return None,
             };
-            // Resolve the directive path to a workspace SourceFile.
             let dep_file = resolve_path(db, file, &directive_path, fs)?;
-            // Analyze the dependency (uses salsa cache).
             let dep_analyzed = analyze(db, dep_file, fs, cats);
             let dep_mod = dep_analyzed.module(db)?;
             // Cross-interner name match: compare by string, not by Symbol.
             let want_name = module.resolve(r.name);
-            let (_, dep_binding) = dep_mod
+            let dep_bid = dep_mod
                 .bindings()
-                .find(|(_, b)| dep_mod.resolve(b.name) == want_name)?;
-            let span = dep_mod.span_of(dep_binding.rhs)?;
-            Some(DefLoc {
-                path: dep_file.path(db).clone(),
-                start: span.start,
-                end: span.end,
-            })
+                .find(|(_, b)| dep_mod.resolve(b.name) == want_name)
+                .map(|(bid, _)| bid)?;
+            Some((dep_file, dep_bid))
         }
         RefNs::Local => None,
     }
@@ -874,6 +987,93 @@ mod tests {
         assert!(
             s.contains("reals"),
             "hover string must mention 'reals' for elementof(reals); got: {s:?}"
+        );
+    }
+
+    // ── hover doc-comment tests ──────────────────────────────────────────────
+
+    /// Hovering a use of a documented binding shows that binding's own
+    /// doc-comment (resolved through the `SelfMod` reference).
+    #[test]
+    fn hover_shows_own_doc_on_self_ref() {
+        let db = Database::default();
+        let cats = Catalogues::new(&db, vec![]);
+        let src = "% Prior mean.\nmu = 0\ny = add(mu, 1)";
+        let f = SourceFile::new(&db, "m.flatppl".to_string(), src.to_string());
+        let fs = FileSet::new(&db, vec![f]);
+        // Offset of the `mu` argument inside `add(mu, 1)`.
+        let off = "% Prior mean.\nmu = 0\ny = add(".len() as u32;
+        let index = crate::queries::node_span_index(&db, f, fs, cats);
+        let s = hover(&db, f, fs, cats, off, &index).expect("hover over `mu` use");
+        assert!(
+            s.contains("Prior mean."),
+            "hover must include the referenced binding's doc; got: {s:?}"
+        );
+    }
+
+    /// Hovering a cross-module member ref (`h.shifted`) shows the originating
+    /// binding's doc from the loaded module.
+    #[test]
+    fn hover_shows_doc_across_module_member_ref() {
+        let db = Database::default();
+        let cats = Catalogues::new(&db, vec![]);
+        let helpers = SourceFile::new(
+            &db,
+            "helpers.flatppl".to_string(),
+            "% The shift value.\nshifted = 1.0".to_string(),
+        );
+        let model = SourceFile::new(
+            &db,
+            "model.flatppl".to_string(),
+            "h = load_module(\"helpers.flatppl\")\nv = h.shifted".to_string(),
+        );
+        let fs = FileSet::new(&db, vec![helpers, model]);
+        let off = "h = load_module(\"helpers.flatppl\")\nv = h.".len() as u32;
+        let index = crate::queries::node_span_index(&db, model, fs, cats);
+        let s = hover(&db, model, fs, cats, off, &index).expect("hover over `h.shifted`");
+        assert!(
+            s.contains("The shift value."),
+            "hover must follow the member ref to the origin's doc; got: {s:?}"
+        );
+    }
+
+    /// A bare alias (`alias_b = orig`) carries no doc of its own; hovering a use
+    /// of it follows the alias chain to the originating binding's doc.
+    #[test]
+    fn hover_follows_alias_chain_to_origin_doc() {
+        let db = Database::default();
+        let cats = Catalogues::new(&db, vec![]);
+        let src = "% Original doc.\norig = 1.0\nalias_b = orig\nz = add(alias_b, 1)";
+        let f = SourceFile::new(&db, "m.flatppl".to_string(), src.to_string());
+        let fs = FileSet::new(&db, vec![f]);
+        let off = "% Original doc.\norig = 1.0\nalias_b = orig\nz = add(".len() as u32;
+        let index = crate::queries::node_span_index(&db, f, fs, cats);
+        let s = hover(&db, f, fs, cats, off, &index).expect("hover over `alias_b` use");
+        assert!(
+            s.contains("Original doc."),
+            "hover must follow a bare alias to the origin's doc; got: {s:?}"
+        );
+    }
+
+    /// An undocumented binding referenced by a use yields no doc line, but hover
+    /// still returns its type info (doc is purely additive).
+    #[test]
+    fn hover_undocumented_binding_has_no_doc_line() {
+        let db = Database::default();
+        let cats = Catalogues::new(&db, vec![]);
+        let src = "mu = 0\ny = add(mu, 1)";
+        let f = SourceFile::new(&db, "m.flatppl".to_string(), src.to_string());
+        let fs = FileSet::new(&db, vec![f]);
+        let off = "mu = 0\ny = add(".len() as u32;
+        let index = crate::queries::node_span_index(&db, f, fs, cats);
+        let s = hover(&db, f, fs, cats, off, &index).expect("hover over `mu` use");
+        assert!(
+            s.contains("type"),
+            "hover must still carry type info; got: {s:?}"
+        );
+        assert!(
+            !s.contains("**doc:**"),
+            "an undocumented binding must not emit a doc section; got: {s:?}"
         );
     }
 
