@@ -1,0 +1,48 @@
+%%%
+# Bayesian inference (2/4): stochastic bindings + explicit reification
+
+Two fit parameters with independent priors and a deterministic computation
+followed by IID Normal observations. Parameters are drawn with `~`; prior
+and forward kernel are reified explicitly with `lawof` and `kernelof`.
+Compare with `bayesian_inference_1.flatppl` (domain declarations + `joint`)
+and variants 3–4 (disintegration and restriction).
+%%%
+flatppl_compat = "0.1"
+
+# Prior distributions
+theta1_dist = Normal(0, 1)
+theta2_dist = Exponential(1)
+
+# Prior variates
+theta1 ~ theta1_dist
+theta2 ~ theta2_dist
+
+# Deterministic computation
+c = 5                   % Scaling factor
+f_a = par -> c * par    % Scale by c
+f_b = fn(abs(_) * _)    % abs(arg1) * arg2
+a = f_a(theta2)
+b = f_b(theta1, theta2)
+
+# IID observations from the forward model
+obs ~ iid(Normal(mu = a, sigma = b), 10)
+
+# Reify different sub-DAGs to prior and forward model kernel
+prior = lawof(record(theta1 = theta1, theta2 = theta2))
+forward_kernel = kernelof(record(obs = obs), theta1 = theta1, theta2 = theta2)
+
+# Observed data
+observed_data = [1.2, 3.4, 5.1, 2.8, 4.0, 3.7, 5.5, 2.1, 4.3, 3.9]
+
+# Likelihood and posterior
+% The likelihood
+L = likelihoodof(forward_kernel, record(obs = observed_data))
+% Non-normalized posterior
+posterior = bayesupdate(L, prior)
+
+# Preset points:
+default_pars = record(theta1 = 0.5,  theta2 = 1.0)
+alternative_pars = record(theta1 = -1.5, theta2 = fixed(0.8))
+
+# Preset domain:
+pars_domain = cartprod(theta1 = interval(-3, 3), theta2 = interval(0, 2))

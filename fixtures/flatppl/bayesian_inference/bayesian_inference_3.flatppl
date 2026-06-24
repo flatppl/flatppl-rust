@@ -1,0 +1,47 @@
+%%%
+# Bayesian inference (3/4): joint law + `disintegrate`
+
+Same semantics as `bayesian_inference_2.flatppl`, expressed via structural
+disintegration: build the joint law over all variables with `lawof`, then
+split it into a forward kernel and prior with `disintegrate(["obs"], ...)`.
+Compare with variant 4 (`restrict`) and variants 1–2.
+%%%
+flatppl_compat = "0.1"
+
+% Common module
+common = load_module("bayesian_inference_common.flatppl", c = c_scaling)
+
+# Prior variates
+theta1 ~ common.theta1_dist
+theta2 ~ common.theta2_dist
+
+# Deterministic computation
+c_scaling = 5             % Scaling factor
+a = common.f_a(theta2)
+f_b = common.f_b
+b = f_b(theta1, theta2)
+
+# IID observations from the forward model
+obs ~ iid(Normal(mu = a, sigma = b), 10)
+
+# Joint distribution over parameters and observations
+joint_model = lawof(record(theta1 = theta1, theta2 = theta2, obs = obs))
+
+# Structural disintegration
+forward_kernel, prior = disintegrate(["obs"], joint_model)
+
+# Observed data
+observed_data = [1.2, 3.4, 5.1, 2.8, 4.0, 3.7, 5.5, 2.1, 4.3, 3.9]
+
+# Likelihood and posterior
+% The likelihood
+L = likelihoodof(forward_kernel, record(obs = observed_data))
+% Non-normalized posterior
+posterior = bayesupdate(L, prior)
+
+# Preset points:
+default_pars = record(theta1 = 0.5,  theta2 = 1.0)
+alternative_pars = record(theta1 = -1.5, theta2 = fixed(0.8))
+
+# Preset domain:
+pars_domain = cartprod(theta1 = interval(-3, 3), theta2 = interval(0, 2))
