@@ -197,7 +197,7 @@ CLI inputs are always **local files** (no URLs) — a model may `load_module`
 remote deps, but the command operates on a local path, like `cargo build` on a
 local crate. Fetching is a separate, explicit step:
 
-- **`flatppl fetch <file>… [--update]`** is the *only* network-touching verb. It
+- **`flatppl prepare <file>… [--update]`** is the *only* network-touching verb. It
   BFS-walks each local model's transitive `load_module` (+ `load_data`) graph —
   reading + parsing each module to discover its deps — and downloads the
   `http`/`https` ones into the shared cache. Relative deps of a URL-loaded module
@@ -206,7 +206,7 @@ local crate. Fetching is a separate, explicit step:
   refuses untrusted URLs). `--update` re-fetches cached URLs.
 - **`convert` / `infer` are local and offline** — a cache-only resolver
   (`OfflineFetcher`, no HTTP client) resolves deps from the cache + local files;
-  an uncached remote dep is an error pointing at `flatppl fetch`. `infer`
+  an uncached remote dep is an error pointing at `flatppl prepare`. `infer`
   assembles the inference `ModuleBundle` from the walk (engine stays I/O-free),
   keyed by the directive string the engine looks up (a string denoting two
   different files across the graph is a hard error); it discovers but does **not**
@@ -214,7 +214,7 @@ local crate. Fetching is a separate, explicit step:
   transform.
 
 Feature isolation makes `infer` **net-free by construction**: it links
-`flatppl-fileaccess` *without* `net` (no TLS); only `fetch` enables
+`flatppl-fileaccess` *without* `net` (no TLS); only `prepare` enables
 `flatppl-fileaccess/net`; the lean `flatppl-fmt` links neither. The
 **reads-only / writes-direct** split holds (source reads via `fileaccess`,
 output writes are plain `fs::write`).

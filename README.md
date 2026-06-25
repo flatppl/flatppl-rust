@@ -40,7 +40,7 @@ flatppl convert model.flatpir model.flatppl   # FlatPIR → FlatPPL
 flatppl convert messy.flatppl tidy.flatppl    # canonicalize (same format)
 flatppl infer model.flatppl typed.flatpir    # emit type/phase-annotated FlatPIR
 flatppl infer --level=phase m.flatppl m.flatpir  # or: type, valueset, normalization, shape
-flatppl fetch model.flatppl                  # fetch the model's remote deps into the cache
+flatppl prepare model.flatppl                  # fetch the model's remote deps into the cache
 ```
 
 Formats are inferred from the file extensions. FlatPPL output uses the full
@@ -51,9 +51,9 @@ for the lowered function-call form instead.
 dependencies, but the command input itself is always a local path — like
 `cargo build` on a local crate. `convert` and `infer` are **local and offline**:
 they resolve dependencies from a shared local cache only and never touch the
-network. To populate that cache, run **`flatppl fetch <model>`** — the one
+network. To populate that cache, run **`flatppl prepare <model>`** — the one
 command that downloads a model's transitive remote dependencies (recursively,
-relative URLs resolved against their importing file). `flatppl fetch --update`
+relative URLs resolved against their importing file). `flatppl prepare --update`
 refreshes already-cached deps. Cache location and trust are env-controlled
 (`$FLATPPL_CACHEDIR`; an untrusted URL prompts interactively and is refused in
 non-interactive use unless `FLATPPL_TRUST=1`).

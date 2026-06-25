@@ -17,7 +17,7 @@ pub use provenance::banner;
 
 /// Source resolution (local paths + `http`/`https` URLs) through the
 /// `flatppl-fileaccess` layer, and `load_module` dependency-graph assembly.
-#[cfg(any(feature = "infer", feature = "fetch"))]
+#[cfg(any(feature = "infer", feature = "prepare"))]
 pub mod resolve;
 
 // ── clap mirrors ───────────────────────────────────────────────────────────────
@@ -112,7 +112,7 @@ impl Format {
     /// Infer the format of a resolved dependency [`Location`] from its final
     /// filename — so a URL dep (`https://…/helper.flatppl`) detects the same way
     /// as a local one.
-    #[cfg(any(feature = "infer", feature = "fetch"))]
+    #[cfg(any(feature = "infer", feature = "prepare"))]
     pub fn from_location(loc: &flatppl_fileaccess::Location) -> Result<Format, String> {
         Format::from_path(Path::new(&loc.name()))
     }

@@ -13,18 +13,18 @@ use std::process::ExitCode;
 use std::fs;
 #[cfg(any(feature = "convert", feature = "infer"))]
 use std::path::Path;
-#[cfg(any(feature = "convert", feature = "infer", feature = "fetch"))]
+#[cfg(any(feature = "convert", feature = "infer", feature = "prepare"))]
 use std::path::PathBuf;
 
 #[cfg(any(feature = "convert", feature = "infer"))]
 use clap::ValueEnum;
 use clap::{CommandFactory, Parser, Subcommand};
-#[cfg(any(feature = "convert", feature = "infer", feature = "fetch"))]
+#[cfg(any(feature = "convert", feature = "infer", feature = "prepare"))]
 use flatppl_cli::Failure;
 #[cfg(feature = "convert")]
 use flatppl_cli::SyntaxLevel;
 use flatppl_cli::report;
-#[cfg(any(feature = "infer", feature = "fetch"))]
+#[cfg(any(feature = "infer", feature = "prepare"))]
 use flatppl_cli::resolve::CliResolver;
 #[cfg(feature = "convert")]
 use flatppl_cli::write_module;
@@ -32,7 +32,7 @@ use flatppl_cli::write_module;
 use flatppl_cli::{Format, banner};
 #[cfg(feature = "fmtlint")]
 use flatppl_cli::{run_fmt, run_lint};
-#[cfg(any(feature = "infer", feature = "fetch"))]
+#[cfg(any(feature = "infer", feature = "prepare"))]
 use flatppl_fileaccess::Location;
 
 #[derive(Parser)]
@@ -57,7 +57,7 @@ enum Command {
         /// Input file (`.flatppl`, `.flatpir`, `.flatpir.json`, native HS3 JSON
         /// with `--from hs3`, or pyhf workspace JSON with `--from pyhf`). A local
         /// path — a model with remote `load_module` deps must be pre-fetched
-        /// with `flatppl fetch`.
+        /// with `flatppl prepare`.
         input: PathBuf,
         /// Output file (`.flatppl`, `.flatpir`, or `.flatpir.json`)
         output: PathBuf,
@@ -90,7 +90,7 @@ enum Command {
     Infer {
         /// Input file (`.flatppl` or `.flatpir`). A local path; `infer` resolves
         /// the model's `load_module` dependencies from the local cache only —
-        /// run `flatppl fetch` first if it has remote deps.
+        /// run `flatppl prepare` first if it has remote deps.
         input: PathBuf,
         /// Output file (`.flatpir` — FlatPPL cannot carry annotations)
         output: PathBuf,
@@ -107,15 +107,15 @@ enum Command {
         #[arg(long)]
         no_header: bool,
     },
-    /// Fetch a model's remote dependencies into the local cache.
+    /// Prepare a model for offline use: fetch its remote dependencies into the cache.
     ///
     /// Walks each input model's transitive `load_module` (and `load_data`)
     /// dependencies and downloads the `http`/`https` ones into the shared cache
     /// (`$FLATPPL_CACHEDIR`), so `convert`/`infer` — which never touch the
     /// network — can then resolve them locally. Arguments are local files;
     /// purely-local models with no remote deps need no fetch.
-    #[cfg(feature = "fetch")]
-    Fetch {
+    #[cfg(feature = "prepare")]
+    Prepare {
         /// Model files to fetch dependencies for (`.flatppl` / `.flatpir`).
         files: Vec<PathBuf>,
         /// Re-fetch dependencies even if already cached (refresh).
@@ -219,8 +219,8 @@ fn main() -> ExitCode {
             level,
             no_header,
         } => infer_cmd(&input, &output, level.into(), no_header),
-        #[cfg(feature = "fetch")]
-        Command::Fetch { files, update } => fetch_cmd(&files, update),
+        #[cfg(feature = "prepare")]
+        Command::Prepare { files, update } => prepare_cmd(&files, update),
         Command::Completions { shell } => {
             let mut cmd = Cli::command();
             clap_complete::generate(shell, &mut cmd, "flatppl", &mut std::io::stdout());
@@ -270,7 +270,7 @@ fn convert(
 
     // Read the module: HS3/pyhf paths (feature-gated) or the standard
     // extension-based FlatPPL/FlatPIR path. The input is a local file — a model
-    // with remote `load_module` deps is pre-fetched with `flatppl fetch`.
+    // with remote `load_module` deps is pre-fetched with `flatppl prepare`.
     #[cfg_attr(not(feature = "fmtlint"), allow(unused_mut))]
     let mut module = match from_format {
         #[cfg(feature = "hs3")]
@@ -367,7 +367,7 @@ fn infer_cmd(
         )));
     }
     // The input is a local file; cross-module deps resolve from the local cache
-    // only (run `flatppl fetch` first for remote deps).
+    // only (run `flatppl prepare` first for remote deps).
     let source =
         fs::read_to_string(input).map_err(|e| format!("reading `{}`: {e}", input.display()))?;
     let mut module = match flatppl_cli::read_module(from, &source) {
@@ -387,7 +387,7 @@ fn infer_cmd(
     // `load_module` dependencies from the local cache (+ local files) so the
     // engine — which stays I/O-free — can type cross-module references. A
     // cache-only resolver never touches the network; a remote dep that isn't
-    // cached errors with a "run `flatppl fetch`" hint. `load_data` sources are
+    // cached errors with a "run `flatppl prepare`" hint. `load_data` sources are
     // discovered but NOT resolved — inference never reads data.
     let resolver = CliResolver::cache_only();
     let in_loc = Location::Local(input.to_path_buf());
@@ -422,13 +422,13 @@ fn infer_cmd(
         .map_err(|e| Failure::Plain(format!("writing `{}`: {e}", output.display())))
 }
 
-/// `flatppl fetch <file>… [--update]` — fetch each model's remote dependencies
+/// `flatppl prepare <file>… [--update]` — fetch each model's remote dependencies
 /// into the local cache so `convert`/`infer` can resolve them offline.
-#[cfg(feature = "fetch")]
-fn fetch_cmd(files: &[PathBuf], update: bool) -> Result<(), Failure> {
+#[cfg(feature = "prepare")]
+fn prepare_cmd(files: &[PathBuf], update: bool) -> Result<(), Failure> {
     if files.is_empty() {
         return Err(Failure::Plain(
-            "no input files — usage: `flatppl fetch <model.flatppl>…`".to_string(),
+            "no input files — usage: `flatppl prepare <model.flatppl>…`".to_string(),
         ));
     }
     let resolver = CliResolver::fetching(update);

@@ -22,13 +22,13 @@ use crate::Failure;
 /// trust policy. `source` reads (deps) go through here so local paths and URLs
 /// are handled uniformly. A cache-only resolver (`convert`/`infer`) carries an
 /// [`OfflineFetcher`] and never touches the network; the fetching resolver
-/// (`flatppl fetch`) carries the HTTP client.
+/// (`flatppl prepare`) carries the HTTP client.
 pub struct CliResolver {
     cache: Cache,
     fetcher: Box<dyn Fetcher>,
     /// Whether we may prompt for trust (stdin + stderr are both TTYs).
     interactive: bool,
-    /// Re-fetch URLs even when cached (`flatppl fetch --update`).
+    /// Re-fetch URLs even when cached (`flatppl prepare --update`).
     update: bool,
     /// URLs approved this session (so a batch-prompted wave is not re-prompted
     /// when each member is then read).
@@ -39,7 +39,7 @@ impl CliResolver {
     /// A cache-only resolver: local files + the existing cache, never the
     /// network (no HTTP client linked). Forces offline regardless of
     /// `FLATPPL_CACHE_OFFLINE`. Used by `convert`/`infer` — a remote dependency
-    /// that is not cached is an error pointing at `flatppl fetch`.
+    /// that is not cached is an error pointing at `flatppl prepare`.
     pub fn cache_only() -> Self {
         let mut cache = Cache::from_env();
         cache.set_offline(true);
@@ -52,11 +52,11 @@ impl CliResolver {
         }
     }
 
-    /// A fetching resolver for `flatppl fetch`: online (HTTP), trust-prompting
+    /// A fetching resolver for `flatppl prepare`: online (HTTP), trust-prompting
     /// when interactive, honoring `FLATPPL_CACHEDIR` / `_OFFLINE` / `FLATPPL_TRUST`
     /// (so `FLATPPL_CACHE_OFFLINE` makes a fetch fail loudly). `update` re-fetches
     /// URLs even when already cached.
-    #[cfg(feature = "fetch")]
+    #[cfg(feature = "prepare")]
     pub fn fetching(update: bool) -> Self {
         CliResolver {
             cache: Cache::from_env(),
@@ -127,7 +127,7 @@ impl CliResolver {
                 };
                 fetched.map_err(|e| match e {
                     flatppl_fileaccess::Error::Offline(u) => Failure::Plain(format!(
-                        "`{u}` is not in the local cache — run `flatppl fetch <model>` to fetch \
+                        "`{u}` is not in the local cache — run `flatppl prepare <model>` to fetch \
                          its dependencies"
                     )),
                     other => Failure::Plain(other.to_string()),
@@ -330,13 +330,13 @@ pub fn build_bundle(
     Ok((bundle, data))
 }
 
-/// Fetch a model's transitive dependencies into the cache (the `flatppl fetch`
+/// Fetch a model's transitive dependencies into the cache (the `flatppl prepare`
 /// command). BFS over each input file's `load_module` graph — reading + parsing
 /// each module to discover its deps, fetching remote ones — then resolve every
 /// `load_data` source. Local files and local deps need no fetch. Trust is
 /// batched per BFS level. The `resolver`'s `update` flag controls whether
 /// already-cached URLs are re-fetched.
-#[cfg(feature = "fetch")]
+#[cfg(feature = "prepare")]
 pub fn fetch_graph(files: &[Location], resolver: &CliResolver) -> Result<(), Failure> {
     let mut walked: HashSet<String> = HashSet::new();
     let mut data: Vec<Location> = Vec::new();
@@ -454,7 +454,7 @@ mod tests {
     }
 }
 
-#[cfg(all(test, feature = "fetch"))]
+#[cfg(all(test, feature = "prepare"))]
 mod fetch_tests {
     use super::*;
 
