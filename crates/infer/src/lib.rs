@@ -232,6 +232,36 @@ mod cross_module_value_tests {
         assert!(diags.iter().any(|d| d.message.contains("not found")));
     }
 
+    /// A `load_module` of an `http`/`https` URL that isn't in the bundle must not
+    /// read like a 404 / "use a filename instead" — the reference is fine, its
+    /// source just hasn't been fetched into the local module set. The message
+    /// says so (remote / not available), distinctly from a missing local file
+    /// (which still reads as "not found", a file lookup).
+    #[test]
+    fn missing_remote_dependency_reads_as_unfetched_not_404() {
+        let url = "https://h.example/ex/common.flatppl";
+        let mut model =
+            flatppl_syntax::parse(&format!("c = load_module(\"{url}\")\nv = c.x")).expect("parses");
+        let diags = infer_module(&mut model, &ModuleBundle::new(), Level::Type);
+        let msg = diags
+            .iter()
+            .map(|d| d.message.as_str())
+            .find(|m| m.contains(url))
+            .expect("a diagnostic mentions the URL");
+        assert!(
+            msg.contains("remote module") && msg.contains("not available"),
+            "remote dep should read as not-fetched, not a bare 'not found'; got: {msg}"
+        );
+
+        let mut local =
+            flatppl_syntax::parse("h = load_module(\"absent.flatppl\")\nv = h.x").expect("parses");
+        let ldiags = infer_module(&mut local, &ModuleBundle::new(), Level::Type);
+        assert!(
+            ldiags.iter().any(|d| d.message.contains("not found")),
+            "a missing local file still reads as 'not found'"
+        );
+    }
+
     #[test]
     fn private_binding_reference_is_an_error() {
         let bundle = bundle_with("h.flatppl", "_secret = 1.0\npublic_v = 2.0");

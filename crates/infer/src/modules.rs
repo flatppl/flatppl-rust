@@ -14,6 +14,17 @@ use flatppl_core::{
 use crate::Diagnostic;
 use crate::catalogue::CatalogueSet;
 
+/// Does `source` name an `http`/`https` URL (case-insensitive)? Used only to
+/// phrase an unresolved-dependency diagnostic: a remote source absent from the
+/// bundle hasn't been *fetched*, which is different from a local file that isn't
+/// *found*. Mirrors the scheme check in `flatppl-fileaccess` — kept inline so
+/// `flatppl-infer` stays dependency-free and wasm-targetable.
+fn is_remote_source(source: &str) -> bool {
+    let b = source.as_bytes();
+    (b.len() >= 7 && source[..7].eq_ignore_ascii_case("http://"))
+        || (b.len() >= 8 && source[..8].eq_ignore_ascii_case("https://"))
+}
+
 /// Parsed dependency modules, keyed by the `load_module` path string. Supplied
 /// by the host (the engine does no file I/O).
 ///
@@ -262,10 +273,22 @@ impl<'b> InferSession<'b> {
             return resolve_standard(&self.catalogues, &directive, binding_name);
         }
 
-        let dep = self
-            .bundle
-            .get(&directive.path)
-            .ok_or_else(|| format!("module `{}` not found", directive.path))?;
+        let dep = self.bundle.get(&directive.path).ok_or_else(|| {
+            // Distinguish a remote (URL) directive from a local one. A URL that
+            // isn't in the module set is a fine reference whose source simply
+            // hasn't been fetched yet — say so, rather than a bare "not found"
+            // that reads like a 404 / "use a filename instead". The remedy
+            // (fetch the deps) is host-neutral: `flatppl prepare` on the CLI, the
+            // editor's download-dependencies action in an LSP client.
+            let p = &directive.path;
+            if is_remote_source(p) {
+                format!(
+                    "remote module `{p}` is not available — fetch the model's dependencies first"
+                )
+            } else {
+                format!("module file `{p}` not found")
+            }
+        })?;
 
         // Memo key: path + Debug signature of substitution annotations
         // (ValueSet is not Hash/Eq, so we use Debug strings).
