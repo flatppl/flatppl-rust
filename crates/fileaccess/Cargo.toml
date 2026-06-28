@@ -32,4 +32,4 @@ sha2 = { workspace = true, optional = true }
 dirs = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
-ureq = { version = "2", optional = true }
+ureq = { version = "3", optional = true }
