@@ -31,6 +31,7 @@ const MEASURE_VOCAB: &[&str] = &[
     "normalize",
     "truncate",
     "pushfwd",
+    "locscale",
     "bayesupdate",
     "disintegrate",
     "restrict",
@@ -39,6 +40,7 @@ const MEASURE_VOCAB: &[&str] = &[
     "rand",
     "totalmass",
     "likelihoodof",
+    "joint_likelihood",
 ];
 
 /// Transform `m` into a FlatPDL-conformant module, or return the first construct
