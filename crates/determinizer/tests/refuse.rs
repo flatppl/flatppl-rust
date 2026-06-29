@@ -79,7 +79,7 @@ lp = logdensityof(mc, record(z = 1.0))";
         "refusal names markovchain: {err:?}"
     );
     assert!(
-        !err.reason.is_empty(),
-        "refusal has a non-empty reason: {err:?}"
+        err.reason.contains("not implemented") && err.reason.contains("deferred"),
+        "refusal reason explains markovchain density lowering is deferred: {err:?}"
     );
 }
