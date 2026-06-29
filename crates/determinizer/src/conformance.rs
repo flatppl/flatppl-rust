@@ -28,20 +28,11 @@ fn visit(m: &Module, id: NodeId, parent_builtin: Option<&str>, bad: &mut Vec<Non
         });
     }
     match m.type_of(id) {
-        Some(Type::Measure { .. })
-            // Allow a Measure-typed node when it is the direct argument of `totalmass`:
-            // `totalmass(M)` is a deterministic Real-valued function of a measure —
-            // it is legal in FlatPDL as long as M is a primitive constructor rather than
-            // a surviving combinator op. The driver ensures combinators are lowered before
-            // `totalmass` is reached, so this relaxation is safe.
-            if !matches!(parent_builtin, Some("totalmass")) =>
-        {
-            bad.push(NonConformance {
-                node: id,
-                kind: NonConformKind::MeasureTyped,
-                reason: "measure-typed node".into(),
-            })
-        }
+        Some(Type::Measure { .. }) => bad.push(NonConformance {
+            node: id,
+            kind: NonConformKind::MeasureTyped,
+            reason: "measure-typed node".into(),
+        }),
         Some(Type::Likelihood { .. }) => bad.push(NonConformance {
             node: id,
             kind: NonConformKind::LikelihoodTyped,

@@ -17,8 +17,12 @@
 //! - `weighted(w, M)` → `add(log(w), density(M, v))`
 //! - `logweighted(ℓ, M)` → `add(ℓ, density(M, v))`
 //! - `superpose(M₁, …, Mₖ)` → `logsumexp(density(M₁, v), …, density(Mₖ, v))`
-//! - `normalize(M)` → `sub(density(M, v), log(totalmass(M)))`
-//! - `truncate(M, S)` → `ifelse(elementof(v, S), density(M, v), neg(inf))`
+//! - `normalize(M)` → `density(M, v)` when `M` is already a probability measure
+//!   (closed-form `logZ = 0`); **refuses** otherwise (no closed-form mass rule;
+//!   `totalmass` is OUT of FlatPDL).
+//! - `truncate(M, S)` → `ifelse(in(v, S), density(M, v), neg(inf))` (the `_ in R`
+//!   membership builtin, which infers to a boolean — `elementof` is a set-valued
+//!   parameter declaration, not a membership predicate).
 //! - `pushfwd(bijection(f, f_inv, logvol), M)` → `sub(density(M, f_inv(v)), logvol(f_inv(v)))`
 //!
 //! **Refused:** `kchain` marginals, `joint`/`iid`, `bayesupdate`, `disintegrate`, `restrict`,
@@ -26,7 +30,8 @@
 
 use crate::refuse::RefuseError;
 use flatppl_core::{
-    BindingId, Call, CallHead, Module, NamedArg, NamedKind, Node, NodeId, Ref, RefNs, Symbol,
+    BindingId, Call, CallHead, Mass, Module, NamedArg, NamedKind, Node, NodeId, Ref, RefNs, Symbol,
+    Type,
 };
 
 // ---------------------------------------------------------------------------
@@ -247,10 +252,20 @@ fn lower_superpose(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Re
         density_terms.push(lower_measure_density(m, mi, v)?);
     }
 
-    Ok(build_variadic_call(m, "logsumexp", &density_terms))
+    Ok(build_call(m, "logsumexp", &density_terms))
 }
 
-/// `logdensityof(normalize(M), v)` = `logdensityof(M, v) - log(totalmass(M))`
+/// `logdensityof(normalize(M), v)` = `logdensityof(M, v) - logZ`, where
+/// `Z = totalmass(M)` must be a **closed-form** deterministic expression — never
+/// the `totalmass` query op, which is OUT of FlatPDL (measures are not values).
+///
+/// The only mass rule available in this MVP: if `M` is already a probability
+/// measure (`Type::Measure { mass: Mass::Normalized, .. }`) then `Z = 1`,
+/// `logZ = 0`, so `normalize(M)` is the identity on the density — it lowers to
+/// just `logdensityof(M, v)`. Any unnormalized `M` (`Finite`, `LocallyFinite`,
+/// …) has no closed-form mass rule here, so we **refuse** rather than emit
+/// `totalmass`. (Truncation / mixture closed-form `logZ` are acceptable later
+/// follow-ons; for now they refuse.)
 fn lower_normalize(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseError> {
     let m_inner = {
         let c = expect_builtin_call(m, node, "normalize")
@@ -261,13 +276,36 @@ fn lower_normalize(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Re
         c.args[0]
     };
 
-    let inner_density = lower_measure_density(m, m_inner, v)?;
-    let totalmass_node = build_call(m, "totalmass", &[m_inner]);
-    let log_totalmass = build_call(m, "log", &[totalmass_node]);
-    Ok(build_call(m, "sub", &[inner_density, log_totalmass]))
+    // Read the inferred total-mass class of M. Resolve one level of ref
+    // indirection so `m = Normal(...)` referenced by name is classified by the
+    // constructor's mass, not the (typeless) ref node.
+    let (m_inner_resolved, _) = resolve_ref_one(m, m_inner);
+    let inner_mass = match m.type_of(m_inner_resolved) {
+        Some(Type::Measure { mass, .. }) => Some(*mass),
+        _ => None,
+    };
+
+    match inner_mass {
+        // Probability measure: Z = 1, logZ = 0. `normalize(M)` ≡ density(M, v).
+        Some(Mass::Normalized) => lower_measure_density(m, m_inner, v),
+        // No closed-form mass rule for an unnormalized measure in this MVP.
+        _ => Err(RefuseError {
+            node,
+            construct: "normalize".to_string(),
+            reason: "normalize of an unnormalized measure needs a closed-form mass rule; \
+                     `totalmass` is not FlatPDL"
+                .to_string(),
+        }),
+    }
 }
 
-/// `logdensityof(truncate(M, S), v)` = `ifelse(elementof(v, S), logdensityof(M, v), neg(inf))`
+/// `logdensityof(truncate(M, S), v)` = `ifelse(in(v, S), logdensityof(M, v), neg(inf))`.
+///
+/// The gate is the `_ in R` membership builtin (FlatPIR head `in`), which infers
+/// to a boolean — the spec's membership idiom (§06, `fn(_ in R)`). `elementof`
+/// is a *set-valued parameter declaration* (`elementof(R)`), not a 2-arg
+/// membership predicate, so it must not be used here (a 2-arg `elementof` infers
+/// to `%deferred`, an ill-typed `ifelse` condition).
 fn lower_truncate(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseError> {
     let (m_inner, s_node) = {
         let c = expect_builtin_call(m, node, "truncate")
@@ -279,15 +317,11 @@ fn lower_truncate(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Ref
     };
 
     let inner_density = lower_measure_density(m, m_inner, v)?;
-    let elementof = build_call(m, "elementof", &[v, s_node]);
+    let gate = build_call(m, "in", &[v, s_node]);
     let inf_sym = m.intern("inf");
     let inf_node = m.alloc(Node::Const(inf_sym));
     let neg_inf = build_call(m, "neg", &[inf_node]);
-    Ok(build_call(
-        m,
-        "ifelse",
-        &[elementof, inner_density, neg_inf],
-    ))
+    Ok(build_call(m, "ifelse", &[gate, inner_density, neg_inf]))
 }
 
 /// `logdensityof(pushfwd(bij, M), v)` = `logdensityof(M, f_inv(v)) - logvol(f_inv(v))`
@@ -419,11 +453,6 @@ fn build_call(m: &mut Module, head: &str, args: &[NodeId]) -> NodeId {
         named: Vec::<NamedArg>::new().into(),
         inputs: None,
     }))
-}
-
-/// Allocate a variadic positional builtin call `head(args…)` (same as `build_call`; alias for clarity).
-fn build_variadic_call(m: &mut Module, head: &str, args: &[NodeId]) -> NodeId {
-    build_call(m, head, args)
 }
 
 /// Allocate a user-function call `(%call callee arg)`.

@@ -38,9 +38,10 @@ const MEASURE_VOCAB: &[&str] = &[
     "logdensityof",
     "densityof",
     "rand",
-    // NOTE: "totalmass" is intentionally absent — totalmass(M) returns Real, and
-    // once M is a primitive constructor (not a combinator), it is legal in FlatPDL.
-    // The conformance checker allows a Measure-typed node as the direct arg of totalmass.
+    // `totalmass` is OUT of FlatPDL: it is a query op that takes a measure, which
+    // is no longer a value (flatpdl-determinise.md §1–§2). It must be eliminated
+    // (refused, in this MVP) like any other measure-layer op — never emitted.
+    "totalmass",
     "likelihoodof",
     "joint_likelihood",
 ];
@@ -372,25 +373,36 @@ const COMBINATOR_OPS: &[&str] = &[
 /// After lowering, `a` is a Real literal, so `m` is an unreferenced measure
 /// binding.  Without this sweep the driver would encounter `weighted` on the
 /// next iteration and refuse, since there is no standalone rule for it.
+///
+/// **Soundness invariant.** A binding is rewritten iff it is BOTH (a) a measure
+/// combinator op (`is_combinator_rhs`) AND (b) provably unreferenced — no *other*
+/// binding subtree contains a `(%ref self name)` to it (`binding_is_referenced`'s
+/// BFS).  Zeroing a genuinely-dead combinator binding is sound dead-code
+/// elimination: it has no observable effect because nothing reads it.  The guard
+/// below never touches anything that fails *either* condition, so it cannot
+/// disturb a live value, a non-combinator binding, or a still-referenced measure.
 fn sweep_dead_measure_bindings(m: &mut Module) {
-    // Collect binding ids whose RHS is a combinator op.
-    let dead_candidates: Vec<(BindingId, Symbol)> = m
+    // Collect (binding, name) pairs whose RHS is a combinator op AND that no
+    // other binding references. Both predicates are read-only over `m`, so we
+    // settle the full kill-set before any mutation (a later zeroing cannot make
+    // a previously-live binding look dead).
+    let dead: Vec<BindingId> = m
         .bindings()
-        .filter_map(|(bid, b)| {
-            let name_sym = b.name;
-            if is_combinator_rhs(m, b.rhs) {
-                Some((bid, name_sym))
-            } else {
-                None
-            }
-        })
+        .filter(|(bid, b)| is_combinator_rhs(m, b.rhs) && !binding_is_referenced(m, *bid, b.name))
+        .map(|(bid, _)| bid)
         .collect();
 
-    for (bid, name_sym) in dead_candidates {
-        if !binding_is_referenced(m, bid, name_sym) {
-            let zero = m.alloc(Node::Lit(Scalar::Real(0.0)));
-            m.set_binding_rhs(bid, zero);
-        }
+    for bid in dead {
+        // Re-assert the invariant at the rewrite site: we only zero a binding
+        // that is still a combinator op and still unreferenced. Cheap, and it
+        // documents/enforces that the sweep never rewrites anything else.
+        let binding = m.binding(bid);
+        debug_assert!(
+            is_combinator_rhs(m, binding.rhs) && !binding_is_referenced(m, bid, binding.name),
+            "sweep must only zero a dead measure-combinator binding"
+        );
+        let zero = m.alloc(Node::Lit(Scalar::Real(0.0)));
+        m.set_binding_rhs(bid, zero);
     }
 }
 

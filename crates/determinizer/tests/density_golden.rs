@@ -37,11 +37,13 @@ a = draw(m)
 lp = logdensityof(lawof(record(a = a)), record(a = 0.5))";
     let out = determinize_src(src);
     let pir = flatppl_flatpir::write(&out);
-    assert!(pir.contains("log"), "log(w) present:\n{pir}");
     assert!(
         pir.contains("builtin_logdensityof"),
         "inner density present:\n{pir}"
     );
+    // log(w) is the weight term — assert the `(log ` call head, not a bare "log"
+    // substring (which `builtin_logdensityof` would satisfy tautologically).
+    assert!(pir.contains("(log "), "log(w) call present:\n{pir}");
     assert!(pir.contains("add"), "add(log(w), density) present:\n{pir}");
     assert!(
         !pir.contains("weighted") && !pir.contains("lawof") && !pir.contains("(draw "),
@@ -103,9 +105,12 @@ lp = logdensityof(lawof(record(a = a)), record(a = 0.5))";
     );
 }
 
-// normalize(M): logdensityof → logdensityof(M, v) - log(totalmass(M))
+// normalize(M) where M is ALREADY a probability measure: Z = 1, logZ = 0, so
+// logdensityof lowers to the identity — just logdensityof(M, v). Crucially NO
+// `totalmass` is emitted (it is OUT of FlatPDL), and the result is genuinely
+// conformant.
 #[test]
-fn normalize_lowers_to_density_minus_log_totalmass() {
+fn normalize_of_probability_measure_lowers_to_identity_density() {
     let src = "\
 m = normalize(Normal(mu = 0.0, sigma = 1.0))
 a = draw(m)
@@ -116,10 +121,12 @@ lp = logdensityof(lawof(record(a = a)), record(a = 0.5))";
         pir.contains("builtin_logdensityof"),
         "inner density present:\n{pir}"
     );
-    assert!(pir.contains("totalmass"), "totalmass present:\n{pir}");
-    assert!(pir.contains("log"), "log(totalmass) present:\n{pir}");
-    assert!(pir.contains("sub"), "sub present:\n{pir}");
-    // Check that the normalize combinator op itself is gone — use "(normalize " to avoid
+    // `totalmass` must NOT survive — it is a measure-query op, OUT of FlatPDL.
+    assert!(
+        !pir.contains("totalmass"),
+        "totalmass must not be emitted:\n{pir}"
+    );
+    // Check the normalize combinator op itself is gone — use "(normalize " to avoid
     // matching the "%normalized" mass annotation that appears in FlatPIR %meta types.
     assert!(
         !pir.contains("(normalize ") && !pir.contains("lawof") && !pir.contains("(draw "),
@@ -131,9 +138,38 @@ lp = logdensityof(lawof(record(a = a)), record(a = 0.5))";
     );
 }
 
-// truncate(M, S): logdensityof → ifelse(elementof(v, S), density(M, v), neg(inf))
+// normalize(M) of an UNNORMALIZED measure has no closed-form mass rule in this
+// MVP. The determiniser must REFUSE rather than emit `totalmass`.
 #[test]
-fn truncate_lowers_to_ifelse_density_neginf() {
+fn normalize_of_unnormalized_measure_refuses() {
+    let src = "\
+w = 2.0
+inner = weighted(w, Normal(mu = 0.0, sigma = 1.0))
+m = normalize(inner)
+a = draw(m)
+lp = logdensityof(lawof(record(a = a)), record(a = 0.5))";
+    let m = {
+        let mut m = flatppl_syntax::parse(src).unwrap();
+        let _ = flatppl_infer::infer(&mut m);
+        m
+    };
+    let err = determinize(&m).expect_err("unnormalized normalize must refuse, not lower");
+    assert_eq!(
+        err.construct, "normalize",
+        "refusal names normalize: {err:?}"
+    );
+    assert!(
+        err.reason.contains("closed-form mass rule") && err.reason.contains("totalmass"),
+        "refusal explains the missing mass rule: {err:?}"
+    );
+}
+
+// truncate(M, S): logdensityof → ifelse(in(v, S), density(M, v), neg(inf)).
+// The gate is the `_ in R` membership builtin (FlatPIR head `in`), which infers
+// to a boolean — NOT `elementof` (a set-valued param-decl that would type to
+// %deferred as a 2-arg call).
+#[test]
+fn truncate_lowers_to_ifelse_with_in_gate() {
     let src = "\
 S = interval(0.0, 1.0)
 m = truncate(Normal(mu = 0.0, sigma = 1.0), S)
@@ -142,7 +178,15 @@ lp = logdensityof(lawof(record(a = a)), record(a = 0.5))";
     let out = determinize_src(src);
     let pir = flatppl_flatpir::write(&out);
     assert!(pir.contains("ifelse"), "ifelse present:\n{pir}");
-    assert!(pir.contains("elementof"), "elementof present:\n{pir}");
+    // The membership gate is `(in v S)`, a boolean — and NOT `elementof`.
+    assert!(
+        pir.contains("(in "),
+        "boolean `in` membership gate present:\n{pir}"
+    );
+    assert!(
+        !pir.contains("elementof"),
+        "no ill-typed elementof gate:\n{pir}"
+    );
     assert!(
         pir.contains("builtin_logdensityof"),
         "inner density present:\n{pir}"
