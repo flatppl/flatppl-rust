@@ -40,3 +40,21 @@ fn builtin_logdensityof_is_real_scalar() {
         "builtin_logdensityof must not be stochastic-phase; got: {m}"
     );
 }
+
+#[test]
+fn builtin_sample_is_variate_rngstate_tuple() {
+    let m = meta_of(
+        "state = rnginit(0)\nxs, s2 = builtin_sample(state, Normal, record(mu = 0.0, sigma = 1.0))",
+        "builtin_sample",
+    );
+    // Result meta is a (variate, new_rngstate) tuple.
+    assert!(
+        m.contains("(%meta ((%tuple") && m.contains("%rngstate"),
+        "builtin_sample result must be a (variate, rngstate) tuple; got: {m}"
+    );
+    // The Normal kernel's variate is a real scalar.
+    assert!(
+        m.contains("(%tuple (%scalar real) %rngstate)"),
+        "builtin_sample variate (Normal) must be a real scalar; got: {m}"
+    );
+}

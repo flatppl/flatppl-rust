@@ -471,6 +471,24 @@ pub(crate) fn call_rule(
         // engine-concepts §13.3), independent of the kernel's variate; `-inf` outside
         // support is a runtime value, not a type concern.
         "builtin_logdensityof" => Type::Scalar(ScalarType::Real),
+        // `builtin_sample(rngstate, kernel, kernel_input, n, m, …)` → `(variate,
+        // new_rngstate)`. Kernel = arg 1, kernel_input = arg 2. The variate comes from
+        // `component_variate` (reified kernels — the accessor `kchain` uses) or, for a
+        // bare distribution constructor, from `kernel_variate` (the catalogue). The
+        // no-dims case is typed here; the optional `n, m, …` dims that array-ify the
+        // variate are a follow-up.
+        "builtin_sample" => {
+            let k = args.get(1);
+            let variate = k
+                .and_then(|(n, t, _)| component_variate(inf, *n, t))
+                .or_else(|| {
+                    k.and_then(|(n, _, _)| kernel_variate(inf, *n, args.get(2).map(|a| a.0)))
+                });
+            match variate {
+                Some(v) => Type::Tuple(Box::new([v, Type::RngState])),
+                None => Type::Deferred,
+            }
+        }
 
         // ---- multi-file (deferred — see TODO) ----
         "load_module" | "standard_module" => Type::Module,
@@ -2326,6 +2344,53 @@ fn distribution_domain(
     } else {
         None
     }
+}
+
+/// The variate domain of the measure `kernel(kernel_input)` would produce, for a
+/// kernel given as a bare built-in distribution constructor (§08) — the
+/// `distribution_domain` pattern, but the name comes from the `kernel` argument node
+/// and the length params come from the `kernel_input` record (not call args).
+/// Returns `None` when the kernel is not a (base) distribution constructor.
+fn kernel_variate(
+    inf: &mut Inferencer<'_, '_>,
+    kernel_node: NodeId,
+    kernel_input_node: Option<NodeId>,
+) -> Option<Type> {
+    use crate::catalogue::{LowerCtx, Sig, lower, no_intern};
+
+    // Base built-in constructor: the kernel node is a builtin head (or a bare const).
+    let name = match inf.module.node(kernel_node) {
+        Node::Call(c) => match c.head {
+            CallHead::Builtin(op) => inf.module.resolve(op).to_string(),
+            _ => return None,
+        },
+        Node::Const(sym) => inf.module.resolve(*sym).to_string(),
+        _ => return None,
+    };
+    let sig = crate::catalogue::builtin().base(&name)?;
+    let Sig::Distribution { .. } = sig else {
+        return None;
+    };
+
+    // `param_dim` reads the kernel_input RECORD's field `kwarg` (vs `distribution_domain`'s
+    // call args). Scalar dists never call it; shaped dists are wired in Task 2.
+    let pd = |kwarg: &str| record_field_dim(inf, kernel_input_node, kwarg);
+    let ctx = LowerCtx {
+        param_dim: &pd,
+        arg_scalar: &|_| None,
+        arg_dim: &|_| Dim::Dynamic,
+        arg_type: &|_| None,
+        intern: &no_intern,
+    };
+    match lower(sig, &ctx).0 {
+        Type::Measure { domain, .. } => Some(*domain),
+        _ => None,
+    }
+}
+
+/// Stub for Task 1 (scalar dists don't read it). Task 2 implements the record read.
+fn record_field_dim(_inf: &Inferencer<'_, '_>, _rec: Option<NodeId>, _kwarg: &str) -> Dim {
+    Dim::Dynamic
 }
 
 /// A dummy `SupportTag::Structural` check helper so `distribution_support` can
