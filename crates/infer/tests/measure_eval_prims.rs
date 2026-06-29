@@ -58,3 +58,30 @@ fn builtin_sample_is_variate_rngstate_tuple() {
         "builtin_sample variate (Normal) must be a real scalar; got: {m}"
     );
 }
+
+#[test]
+fn builtin_sample_mvnormal_variate_is_vector() {
+    let m = meta_of(
+        "state = rnginit(0)\nmu = [0.0, 0.0, 0.0]\ncov = eye(3)\nxs, s2 = builtin_sample(state, MvNormal, record(mu = mu, cov = cov))",
+        "builtin_sample",
+    );
+    // variate is a length-3 real vector (dim read from kernel_input.mu). Assert the
+    // RESULT tuple (the line also holds the nested `(mu (%array 1 (3) …))` arg).
+    assert!(
+        m.contains("(%tuple (%array 1 (3) (%scalar real)) %rngstate)"),
+        "MvNormal sample variate must be array[3] of real in the result tuple; got: {m}"
+    );
+}
+
+#[test]
+fn builtin_sample_wishart_variate_is_matrix() {
+    let m = meta_of(
+        "state = rnginit(0)\nsc = eye(2)\nxs, s2 = builtin_sample(state, Wishart, record(nu = 3.0, scale = sc))",
+        "builtin_sample",
+    );
+    // DynMatrix path: array[Dynamic, Dynamic] of real (dims NOT from the record).
+    assert!(
+        m.contains("(%tuple (%array 2 (%dynamic %dynamic) (%scalar real)) %rngstate)"),
+        "Wishart sample variate must be array[Dynamic,Dynamic] of real in the result tuple; got: {m}"
+    );
+}

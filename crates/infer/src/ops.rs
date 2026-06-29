@@ -2388,8 +2388,28 @@ fn kernel_variate(
     }
 }
 
-/// Stub for Task 1 (scalar dists don't read it). Task 2 implements the record read.
-fn record_field_dim(_inf: &Inferencer<'_, '_>, _rec: Option<NodeId>, _kwarg: &str) -> Dim {
+/// Leading array dim of the kernel_input record's `kwarg` field, for shaped dists
+/// (`MvNormal` `mu`, `Dirichlet` `alpha`, `Multinomial` `p`). The kernel_input is a
+/// `record(...)` call whose fields are its `named` args (`NamedKind::Field`); read the
+/// named field's value type. `Dim::Dynamic` if the input is absent / not a record /
+/// lacks the field / the field is not an array — the honest under-approximation (matrix
+/// dists never call this; a not-yet-inferred field also yields `Dynamic`).
+fn record_field_dim(inf: &Inferencer<'_, '_>, rec: Option<NodeId>, kwarg: &str) -> Dim {
+    let Some(rec) = rec else { return Dim::Dynamic };
+    let Node::Call(c) = inf.module.node(rec) else {
+        return Dim::Dynamic;
+    };
+    if !matches!(c.head, CallHead::Builtin(op) if inf.module.resolve(op) == "record") {
+        return Dim::Dynamic;
+    }
+    for na in c.named.iter() {
+        if inf.module.resolve(na.name) == kwarg {
+            return match inf.lookup_type(na.value) {
+                Some(Type::Array { shape, .. }) => shape.first().copied().unwrap_or(Dim::Dynamic),
+                _ => Dim::Dynamic,
+            };
+        }
+    }
     Dim::Dynamic
 }
 
