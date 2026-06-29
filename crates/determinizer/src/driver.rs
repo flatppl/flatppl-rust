@@ -84,14 +84,47 @@ pub fn determinize(m: &Module) -> Result<Module, RefuseError> {
     }
 }
 
-/// Scan bindings in source order for the outermost measure-layer node (by type
-/// or by op name in the measure vocabulary). Returns `(binding_id, node_id)` of
-/// the outermost reducible node, preferring the binding's own RHS before
-/// descending into children.
+/// Scan bindings for the next measure-layer node to reduce. Returns
+/// `(binding_id, node_id)` of the chosen node.
+///
+/// **Two-pass, query-first.** A `logdensityof` query pins the latent `draw`s it
+/// scores (it rewrites their bindings to the scored value), so it must fire
+/// *before* those bare `draw` bindings are reached and refused: a draw consumed
+/// by a density query is reducible *through* that query, not on its own. So we
+/// first look for any `logdensityof` node (scanning bindings in source order,
+/// outermost-first), and only if none exists fall back to the general
+/// outermost-measure scan (β-law `lawof`, or a refusal target). Without this,
+/// the source-order scan would hit a `draw` binding first and refuse before the
+/// query that would have legalised it.
 fn find_measure_node(m: &Module) -> Option<(BindingId, NodeId)> {
+    if let Some(hit) = find_op_node(m, "logdensityof") {
+        return Some(hit);
+    }
     for (bid, binding) in m.bindings() {
         if let Some(id) = find_in_subtree(m, binding.rhs) {
             return Some((bid, id));
+        }
+    }
+    None
+}
+
+/// Find the first node (outermost, BFS) whose builtin head is named `op`,
+/// scanning bindings in source order.
+fn find_op_node(m: &Module, op: &str) -> Option<(BindingId, NodeId)> {
+    for (bid, binding) in m.bindings() {
+        let mut queue = vec![binding.rhs];
+        let mut qi = 0;
+        while qi < queue.len() {
+            let id = queue[qi];
+            qi += 1;
+            if let Node::Call(c) = m.node(id) {
+                if let CallHead::Builtin(sym) = c.head {
+                    if m.resolve(sym) == op {
+                        return Some((bid, id));
+                    }
+                }
+            }
+            m.for_each_child(id, |child| queue.push(child));
         }
     }
     None
@@ -140,6 +173,14 @@ fn is_measure_layer(m: &Module, id: NodeId) -> bool {
 /// zero new nodes since we reuse the existing `?m` NodeId). Each rewrite
 /// strictly lowers the count of measure-layer nodes, guaranteeing termination.
 fn apply_rule(m: &mut Module, bid: BindingId, target_node: NodeId) -> Result<(), RefuseError> {
+    // --- density disintegration: logdensityof(lawof(record(..)), v) → Σ terms ---
+    if is_op(m, target_node, "logdensityof") {
+        let new_root = crate::density::lower_logdensityof(m, target_node)?;
+        let new_rhs = substitute_in_tree(m, m.binding(bid).rhs, target_node, new_root);
+        m.set_binding_rhs(bid, new_rhs);
+        return Ok(());
+    }
+
     // --- β-law: lawof(draw ?m) → ?m ---
     if let Some(measure_id) = try_beta_law(m, target_node) {
         // Replace every occurrence of `target_node` in the binding tree.
@@ -269,6 +310,16 @@ fn substitute_in_tree(m: &mut Module, root: NodeId, old: NodeId, new_id: NodeId)
         named: new_named.into(),
         inputs,
     }))
+}
+
+/// True iff `id` is a builtin call whose head is named `op`.
+fn is_op(m: &Module, id: NodeId, op: &str) -> bool {
+    if let Node::Call(c) = m.node(id) {
+        if let CallHead::Builtin(sym) = c.head {
+            return m.resolve(sym) == op;
+        }
+    }
+    false
 }
 
 /// The op name for a measure-layer node (for refusal messages).

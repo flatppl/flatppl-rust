@@ -3,6 +3,7 @@
 //! Type-level transform — flatppl-rust does not evaluate densities.
 mod build;
 mod conformance;
+mod density;
 mod driver;
 mod refuse;
 pub use conformance::is_flatpdl;
