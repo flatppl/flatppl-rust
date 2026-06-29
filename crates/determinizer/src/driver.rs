@@ -10,7 +10,7 @@
 //! table (`apply_rule`) is the single extension point.
 
 use crate::refuse::RefuseError;
-use flatppl_core::{BindingId, CallHead, Module, Node, NodeId};
+use flatppl_core::{BindingId, CallHead, Module, Node, NodeId, Ref, RefNs, Scalar, Symbol};
 
 /// The measure-algebra vocabulary: op names whose presence signals a node that
 /// must be eliminated before the module is FlatPDL-conformant. This list matches
@@ -38,7 +38,9 @@ const MEASURE_VOCAB: &[&str] = &[
     "logdensityof",
     "densityof",
     "rand",
-    "totalmass",
+    // NOTE: "totalmass" is intentionally absent — totalmass(M) returns Real, and
+    // once M is a primitive constructor (not a combinator), it is legal in FlatPDL.
+    // The conformance checker allows a Measure-typed node as the direct arg of totalmass.
     "likelihoodof",
     "joint_likelihood",
 ];
@@ -173,11 +175,17 @@ fn is_measure_layer(m: &Module, id: NodeId) -> bool {
 /// zero new nodes since we reuse the existing `?m` NodeId). Each rewrite
 /// strictly lowers the count of measure-layer nodes, guaranteeing termination.
 fn apply_rule(m: &mut Module, bid: BindingId, target_node: NodeId) -> Result<(), RefuseError> {
-    // --- density disintegration: logdensityof(lawof(record(..)), v) → Σ terms ---
+    // --- density disintegration: logdensityof(lawof(M), v) → deterministic density ---
     if is_op(m, target_node, "logdensityof") {
         let new_root = crate::density::lower_logdensityof(m, target_node)?;
         let new_rhs = substitute_in_tree(m, m.binding(bid).rhs, target_node, new_root);
         m.set_binding_rhs(bid, new_rhs);
+        // After lowering a logdensityof query, some measure bindings (e.g.
+        // `m = weighted(...)`) may now be dead code — the draw was pinned and
+        // the combinator binding is no longer referenced.  Sweep them out now so
+        // the outer scan loop does not encounter them as unhandled measure-layer
+        // nodes on the next iteration.
+        sweep_dead_measure_bindings(m);
         return Ok(());
     }
 
@@ -331,4 +339,103 @@ fn op_name(m: &Module, id: NodeId) -> String {
     }
     // Fallback for Measure/Likelihood-typed non-call nodes.
     format!("{:?}", m.type_of(id))
+}
+
+// ---------------------------------------------------------------------------
+// Dead-binding sweep — post-logdensityof cleanup
+// ---------------------------------------------------------------------------
+
+/// Combinators used as `measure` vocabulary that can become dead bindings after
+/// `logdensityof` lowering.  These are the ops consumed by density rules but
+/// left behind as orphaned bindings once the draw that referenced them is pinned.
+const COMBINATOR_OPS: &[&str] = &[
+    "weighted",
+    "logweighted",
+    "superpose",
+    "normalize",
+    "truncate",
+    "pushfwd",
+    "bijection",
+];
+
+/// After a `logdensityof` rewrite, scan all bindings whose RHS is a measure
+/// combinator op.  If no other binding tree references the binding by name,
+/// replace its RHS with `0.0` (a harmless Real literal) so the driver loop no
+/// longer sees it as a measure-layer node.
+///
+/// This handles the common pattern:
+/// ```text
+/// m = weighted(w, Normal(...))
+/// a = draw(m)               ← pinned to the scored value after logdensityof lowering
+/// lp = logdensityof(...)    ← already lowered
+/// ```
+/// After lowering, `a` is a Real literal, so `m` is an unreferenced measure
+/// binding.  Without this sweep the driver would encounter `weighted` on the
+/// next iteration and refuse, since there is no standalone rule for it.
+fn sweep_dead_measure_bindings(m: &mut Module) {
+    // Collect binding ids whose RHS is a combinator op.
+    let dead_candidates: Vec<(BindingId, Symbol)> = m
+        .bindings()
+        .filter_map(|(bid, b)| {
+            let name_sym = b.name;
+            if is_combinator_rhs(m, b.rhs) {
+                Some((bid, name_sym))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    for (bid, name_sym) in dead_candidates {
+        if !binding_is_referenced(m, bid, name_sym) {
+            let zero = m.alloc(Node::Lit(Scalar::Real(0.0)));
+            m.set_binding_rhs(bid, zero);
+        }
+    }
+}
+
+/// True iff `rhs` is a builtin call whose head is in [`COMBINATOR_OPS`].
+fn is_combinator_rhs(m: &Module, rhs: NodeId) -> bool {
+    if let Node::Call(c) = m.node(rhs) {
+        if let CallHead::Builtin(sym) = c.head {
+            return COMBINATOR_OPS.contains(&m.resolve(sym));
+        }
+    }
+    false
+}
+
+/// True iff any binding (other than `bid` itself) contains a `(%ref self name)`
+/// node that refers to `name_sym`.
+fn binding_is_referenced(m: &Module, bid: BindingId, name_sym: Symbol) -> bool {
+    for (other_bid, binding) in m.bindings() {
+        if other_bid == bid {
+            continue;
+        }
+        if subtree_contains_ref(m, binding.rhs, name_sym) {
+            return true;
+        }
+    }
+    false
+}
+
+/// BFS subtree search: returns true iff the subtree at `root` contains a
+/// `Ref(SelfMod, name_sym)` node.
+fn subtree_contains_ref(m: &Module, root: NodeId, name_sym: Symbol) -> bool {
+    let mut queue = vec![root];
+    let mut qi = 0;
+    while qi < queue.len() {
+        let id = queue[qi];
+        qi += 1;
+        if let Node::Ref(Ref {
+            ns: RefNs::SelfMod,
+            name,
+        }) = m.node(id)
+        {
+            if *name == name_sym {
+                return true;
+            }
+        }
+        m.for_each_child(id, |c| queue.push(c));
+    }
+    false
 }
