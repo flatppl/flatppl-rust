@@ -14,8 +14,12 @@
 //!
 //! **Measure combinators** (Task 4) — each wraps an inner measure; recursion bottoms out at a
 //! primitive constructor:
-//! - `weighted(w, M)` → `add(log(w), density(M, v))`
-//! - `logweighted(ℓ, M)` → `add(ℓ, density(M, v))`
+//! - `weighted(w, M)` → `add(log(w), density(M, v))` — **constant/scalar `w` only**;
+//!   a variate-dependent (function-valued) `w` must be applied at the variate
+//!   (`log w(v)`) and is **refused** (deferred follow-on), never mislowered to
+//!   `log` of a function object.
+//! - `logweighted(ℓ, M)` → `add(ℓ, density(M, v))` — likewise constant/scalar `ℓ`
+//!   only; a function-valued `ℓ` is **refused**.
 //! - `superpose(M₁, …, Mₖ)` → `logsumexp(density(M₁, v), …, density(Mₖ, v))`
 //! - `normalize(M)` → `density(M, v)` when `M` is already a probability measure
 //!   (closed-form `logZ = 0`); **refuses** otherwise (no closed-form mass rule;
@@ -26,7 +30,8 @@
 //! - `pushfwd(bijection(f, f_inv, logvol), M)` → `sub(density(M, f_inv(v)), logvol(f_inv(v)))`
 //!
 //! **Refused:** `kchain` marginals, `joint`/`iid`, `bayesupdate`, `disintegrate`, `restrict`,
-//! `likelihoodof`, `pushfwd` with a non-bijection argument, and any unrecognised shape.
+//! `likelihoodof`, `pushfwd` with a non-bijection argument, a variate-dependent
+//! (function-valued) `weighted`/`logweighted` weight, and any unrecognised shape.
 
 use crate::refuse::RefuseError;
 use flatppl_core::{
@@ -209,7 +214,70 @@ fn resolve_component_draw(m: &Module, value: NodeId) -> Option<(NodeId, Option<B
 // Combinator rules (Task 4)
 // ---------------------------------------------------------------------------
 
-/// `logdensityof(weighted(w, M), v)` = `log(w) + logdensityof(M, v)`
+/// Is `w_node` a **variate-dependent** weight — i.e. a function of the variate
+/// rather than a constant/scalar (spec §06, "Density of composed measures":
+/// `log densityof(weighted(w, M), x) = log w(x) + log densityof(M, x)`, where `w`
+/// is a constant OR a function of the variate)?
+///
+/// The scalar/constant case lowers correctly with the weight node AS-IS (`log w`
+/// / `lw`). A function-valued weight does NOT: it must be APPLIED to the variate
+/// (`log w(v)` / `lw(v)`) before scoring, which this MVP does not yet do. Emitting
+/// `log(w)` / `add(w, …)` on a function object is a silent mislowering — and it
+/// *passes* `is_flatpdl` (the weight is `Function`/`Kernel`-typed, not measure-
+/// typed), so the conformance gate does not catch it. We therefore detect it here
+/// and refuse, per the refuse-don't-mislower discipline.
+///
+/// Two surface shapes both reach us (dump-verified):
+/// * inline `functionof(…)` / `kernelof(…)` reification — a builtin call whose
+///   head is `functionof`/`kernelof` (carrying `inputs = Some(..)`);
+/// * a reified callable bound by name — `(%ref self f)` whose inferred type is
+///   `Type::Function` / `Type::Kernel`.
+///
+/// We catch both: resolve one ref level and test the reification head, and test
+/// the inferred type of the (original) weight node. Either positive ⇒ refuse.
+fn weight_is_variate_dependent(m: &Module, w_node: NodeId) -> bool {
+    // Inferred type of the weight (catches the bound-by-name `(%ref self f)` form,
+    // whose call head we never see): a reified callable types to Function/Kernel,
+    // a constant/scalar weight does not.
+    if matches!(
+        m.type_of(w_node),
+        Some(Type::Function { .. }) | Some(Type::Kernel { .. })
+    ) {
+        return true;
+    }
+    // Reification head (catches an inline `functionof(…)`/`kernelof(…)` weight even
+    // if inference left its type `%deferred`); resolve one ref level so a named
+    // reification is seen by its constructor.
+    let (resolved, _) = resolve_ref_one(m, w_node);
+    if matches!(
+        builtin_name(m, resolved),
+        Some("functionof") | Some("kernelof")
+    ) {
+        return true;
+    }
+    if matches!(
+        m.type_of(resolved),
+        Some(Type::Function { .. }) | Some(Type::Kernel { .. })
+    ) {
+        return true;
+    }
+    false
+}
+
+/// The shared refusal for a variate-dependent (function) `weighted`/`logweighted`
+/// weight: applying the weight at the variate is a follow-on, not yet lowered.
+fn refuse_variate_dependent_weight(node: NodeId, m: &Module) -> RefuseError {
+    refuse(
+        node,
+        m,
+        "variate-dependent (function) weight not yet lowered (deferred; applying the weight at the variate is a follow-on)",
+    )
+}
+
+/// `logdensityof(weighted(w, M), v)` = `log w(v) + logdensityof(M, v)`, where `w`
+/// is a constant/scalar OR a function of the variate (spec §06). Only the
+/// constant/scalar case is lowered here (`log(w) + density`); a variate-dependent
+/// (function) weight is **refused** — see [`weight_is_variate_dependent`].
 fn lower_weighted(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseError> {
     let c = expect_builtin_call(m, node, "weighted")
         .ok_or_else(|| refuse(node, m, "expected weighted"))?;
@@ -219,12 +287,19 @@ fn lower_weighted(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Ref
     let w_node = c.args[0];
     let m_inner = c.args[1];
 
+    if weight_is_variate_dependent(m, w_node) {
+        return Err(refuse_variate_dependent_weight(node, m));
+    }
+
     let inner_density = lower_measure_density(m, m_inner, v)?;
     let log_w = build_call(m, "log", &[w_node]);
     Ok(build_call(m, "add", &[log_w, inner_density]))
 }
 
-/// `logdensityof(logweighted(ℓ, M), v)` = `ℓ + logdensityof(M, v)`
+/// `logdensityof(logweighted(ℓ, M), v)` = `ℓ(v) + logdensityof(M, v)`, where `ℓ`
+/// is a constant/scalar OR a function of the variate (spec §06). Only the
+/// constant/scalar case is lowered here (`lw + density`); a variate-dependent
+/// (function) log-weight is **refused** — see [`weight_is_variate_dependent`].
 fn lower_logweighted(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseError> {
     let c = expect_builtin_call(m, node, "logweighted")
         .ok_or_else(|| refuse(node, m, "expected logweighted"))?;
@@ -233,6 +308,10 @@ fn lower_logweighted(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, 
     }
     let lw_node = c.args[0];
     let m_inner = c.args[1];
+
+    if weight_is_variate_dependent(m, lw_node) {
+        return Err(refuse_variate_dependent_weight(node, m));
+    }
 
     let inner_density = lower_measure_density(m, m_inner, v)?;
     Ok(build_call(m, "add", &[lw_node, inner_density]))

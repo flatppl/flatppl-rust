@@ -332,6 +332,12 @@ fn resolve_kernel(m: &Module, k_arg: NodeId) -> Option<Kernel> {
 /// This is `K(a)`: it pins the kernel's boundary input to the atom value `a`
 /// inside a fresh copy of the kernel body, so the body's draws score against the
 /// pinned latent and no reference to the (now marginalized) latent survives.
+///
+/// INVARIANT: this is scope-UNAWARE — it rewrites *every* matching `(%ref … name)`
+/// in the subtree, with no notion of an inner binder shadowing `name`. Sound only
+/// under the workspace no-shadowing assumption: the kernel-body substitution only
+/// ever targets the single boundary-input symbol, which is never rebound inside
+/// the body.
 fn substitute_ref(m: &mut Module, root: NodeId, name: Symbol, new_id: NodeId) -> NodeId {
     if let Node::Ref(Ref { ns, name: rname }) = m.node(root) {
         if matches!(ns, RefNs::SelfMod | RefNs::Local) && *rname == name {
