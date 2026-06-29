@@ -2358,6 +2358,35 @@ fn kernel_variate(
 ) -> Option<Type> {
     use crate::catalogue::{LowerCtx, Sig, lower, no_intern};
 
+    // Lower a distribution `Sig` to its variate domain. `param_dim` reads the
+    // kernel_input RECORD's field `kwarg` (vs `distribution_domain`'s call args);
+    // scalar / matrix dists never call it, shaped dists (`MvNormal`/…) do.
+    let lower_dist = |inf: &mut Inferencer<'_, '_>, sig: &Sig| -> Option<Type> {
+        let pd = |kwarg: &str| record_field_dim(inf, kernel_input_node, kwarg);
+        let ctx = LowerCtx {
+            param_dim: &pd,
+            arg_scalar: &|_| None,
+            arg_dim: &|_| Dim::Dynamic,
+            arg_type: &|_| None,
+            intern: &no_intern,
+        };
+        match lower(sig, &ctx).0 {
+            Type::Measure { domain, .. } => Some(*domain),
+            _ => None,
+        }
+    };
+
+    // §09 module member (e.g. `hepphys.Argus`): the stashed catalogue ref carries the
+    // Sig (alias→module resolved at ref-resolution time, as `catalogue_call_type` reads
+    // it). Clone the Sig to drop the borrow before the `&mut inf` lower. A module ref
+    // that isn't a distribution is not a kernel — `None`, not a fall-through to base.
+    if let Some(sig) = inf.module_catalogue_ref(kernel_node).map(|c| c.sig.clone()) {
+        return match sig {
+            Sig::Distribution { .. } => lower_dist(inf, &sig),
+            _ => None,
+        };
+    }
+
     // Base built-in constructor: the kernel node is a builtin head (or a bare const).
     let name = match inf.module.node(kernel_node) {
         Node::Call(c) => match c.head {
@@ -2371,21 +2400,7 @@ fn kernel_variate(
     let Sig::Distribution { .. } = sig else {
         return None;
     };
-
-    // `param_dim` reads the kernel_input RECORD's field `kwarg` (vs `distribution_domain`'s
-    // call args). Scalar dists never call it; shaped dists are wired in Task 2.
-    let pd = |kwarg: &str| record_field_dim(inf, kernel_input_node, kwarg);
-    let ctx = LowerCtx {
-        param_dim: &pd,
-        arg_scalar: &|_| None,
-        arg_dim: &|_| Dim::Dynamic,
-        arg_type: &|_| None,
-        intern: &no_intern,
-    };
-    match lower(sig, &ctx).0 {
-        Type::Measure { domain, .. } => Some(*domain),
-        _ => None,
-    }
+    lower_dist(inf, sig)
 }
 
 /// Leading array dim of the kernel_input record's `kwarg` field, for shaped dists

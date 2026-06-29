@@ -85,3 +85,16 @@ fn builtin_sample_wishart_variate_is_matrix() {
         "Wishart sample variate must be array[Dynamic,Dynamic] of real in the result tuple; got: {m}"
     );
 }
+
+#[test]
+fn builtin_sample_hepphys_argus_variate() {
+    let m = meta_of(
+        "hepphys = standard_module(\"particle-physics\", \"0.1\")\nstate = rnginit(0)\nxs, s2 = builtin_sample(state, hepphys.Argus, record(chi = 1.0, c = 2.0, p = 0.5))",
+        "builtin_sample",
+    );
+    // Argus is a scalar-real-variate distribution (particle-physics.ron).
+    assert!(
+        m.contains("(%tuple (%scalar real) %rngstate)"),
+        "hepphys.Argus sample variate must be a real scalar in the result tuple; got: {m}"
+    );
+}
