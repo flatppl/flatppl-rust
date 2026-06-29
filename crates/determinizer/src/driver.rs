@@ -190,6 +190,22 @@ fn apply_rule(m: &mut Module, bid: BindingId, target_node: NodeId) -> Result<(),
         return Ok(());
     }
 
+    // --- rand / builtin_sample: sampling-side slice — deferred ---
+    // `rand(rng, M)` threads an RNG through the measure algebra and returns a
+    // (value, new_rng) tuple (spec §07). The determiniser MVP lowers the density
+    // side only; sampling/`rand` is a later slice whose implementation requires
+    // RNG-threading and shared-ancestor preservation. Refuse immediately with a
+    // clear message rather than falling through to the generic fallback.
+    if is_op(m, target_node, "rand") {
+        return Err(RefuseError {
+            node: target_node,
+            construct: "rand".to_string(),
+            reason: "sampling/`rand` is a later slice; this MVP lowers density only — \
+                     deferred to the sample-side determinizer (spec §07 / RNG-threading)"
+                .to_string(),
+        });
+    }
+
     // --- β-law: lawof(draw ?m) → ?m ---
     if let Some(measure_id) = try_beta_law(m, target_node) {
         // Replace every occurrence of `target_node` in the binding tree.
