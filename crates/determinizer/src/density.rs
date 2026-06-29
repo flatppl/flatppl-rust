@@ -56,7 +56,7 @@ pub(crate) fn lower_logdensityof(m: &mut Module, query: NodeId) -> Result<NodeId
 /// Compute the log-density of `measure_expr` at `v`, returning a deterministic node.
 /// `measure_expr` may be a record-of-draws, a combinator, a `(%ref self x)` pointing
 /// to one of those, or a bare primitive constructor.
-fn lower_measure_density(
+pub(crate) fn lower_measure_density(
     m: &mut Module,
     measure_expr: NodeId,
     v: NodeId,
@@ -75,10 +75,13 @@ fn lower_measure_density(
         Some("normalize") => lower_normalize(m, measure_node, v),
         Some("truncate") => lower_truncate(m, measure_node, v),
         Some("pushfwd") => lower_pushfwd(m, measure_node, v),
+        // kchain marginal: discrete-finite latent → mass-weighted logsumexp;
+        // continuous / infinite-discrete / non-enumerable → refuse (Task 5).
+        Some("kchain") => crate::marginal::lower_kchain_marginal(m, measure_node, v),
         // Refused combinators — refused here rather than mis-lowered.
-        Some("joint") | Some("iid") | Some("kchain") | Some("markovchain") | Some("kscan")
-        | Some("jointchain") | Some("bayesupdate") | Some("disintegrate") | Some("restrict")
-        | Some("likelihoodof") | Some("locscale") => Err(refuse_op(measure_node, m)),
+        Some("joint") | Some("iid") | Some("markovchain") | Some("kscan") | Some("jointchain")
+        | Some("bayesupdate") | Some("disintegrate") | Some("restrict") | Some("likelihoodof")
+        | Some("locscale") => Err(refuse_op(measure_node, m)),
         // Fallthrough: treat as a primitive distribution constructor.
         _ => build_density_term(m, measure_node, v),
     }
@@ -375,7 +378,7 @@ fn lower_pushfwd(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Refu
 
 /// Build `builtin_logdensityof(kernel, kernel_input, pinned)` for a primitive
 /// distribution constructor `measure` applied to keyword arguments.
-fn build_density_term(
+pub(crate) fn build_density_term(
     m: &mut Module,
     measure: NodeId,
     pinned: NodeId,
@@ -423,21 +426,43 @@ fn build_density_term(
 // Helper: extract (measure_expr, v) from logdensityof(lawof(M), v)
 // ---------------------------------------------------------------------------
 
+/// Extract `(measure_expr, v)` from `logdensityof(measure, v)`.
+///
+/// The first argument is the measure whose density we score. It comes in two
+/// shapes that both reduce to "the underlying measure":
+///
+/// * `lawof(M_value)` — `lawof` reifies a (stochastic) value to its law; we
+///   score the value's law, i.e. `M_value` (a record-of-draws, a combinator,
+///   …). This is the inline form the Task-3/4 record/combinator goldens use.
+/// * a bare measure expression — e.g. `(%ref self pp)` where `pp = kchain(…)`
+///   (or any combinator binding). Here the measure is already a measure; there
+///   is no `lawof` wrapper to strip.
+///
+/// We resolve one level of ref indirection and strip a `lawof` if present;
+/// otherwise we hand the (resolved) measure node straight to the dispatcher,
+/// which classifies it by op.
 fn extract_logdensityof_args(m: &Module, query: NodeId) -> Result<(NodeId, NodeId), RefuseError> {
     let q = expect_builtin_call(m, query, "logdensityof")
         .ok_or_else(|| refuse(query, m, "expected logdensityof"))?;
     if q.args.len() != 2 {
         return Err(refuse(query, m, "logdensityof expects 2 args"));
     }
-    let law_arg = q.args[0];
+    let measure_arg = q.args[0];
     let v = q.args[1];
 
-    let law = expect_builtin_call(m, law_arg, "lawof")
-        .ok_or_else(|| refuse(law_arg, m, "logdensityof first arg must be lawof(...)"))?;
-    if law.args.len() != 1 {
-        return Err(refuse(law_arg, m, "lawof expects 1 arg"));
+    // Resolve a single level of `(%ref self x)` indirection so a measure bound by
+    // name (`pp = kchain(…)`) is classified by its constructor, and a `lawof`
+    // wrapper is visible whether inline or behind a ref.
+    let (resolved, _) = resolve_ref_one(m, measure_arg);
+    if let Some(law) = expect_builtin_call(m, resolved, "lawof") {
+        if law.args.len() != 1 {
+            return Err(refuse(resolved, m, "lawof expects 1 arg"));
+        }
+        return Ok((law.args[0], v));
     }
-    Ok((law.args[0], v))
+    // Bare measure expression: hand the original (unresolved) node to the
+    // dispatcher, which itself resolves one ref level and dispatches by op.
+    Ok((measure_arg, v))
 }
 
 // ---------------------------------------------------------------------------
@@ -445,7 +470,7 @@ fn extract_logdensityof_args(m: &Module, query: NodeId) -> Result<(NodeId, NodeI
 // ---------------------------------------------------------------------------
 
 /// Allocate a positional builtin call `head(args…)`.
-fn build_call(m: &mut Module, head: &str, args: &[NodeId]) -> NodeId {
+pub(crate) fn build_call(m: &mut Module, head: &str, args: &[NodeId]) -> NodeId {
     let sym = m.intern(head);
     m.alloc(Node::Call(Call {
         head: CallHead::Builtin(sym),
@@ -513,7 +538,7 @@ fn lookup_field(_m: &Module, named: &[NamedArg], name: Symbol) -> Option<NodeId>
 }
 
 /// If `id` is a builtin call with head named `name`, return its [`Call`].
-fn expect_builtin_call<'a>(m: &'a Module, id: NodeId, name: &str) -> Option<&'a Call> {
+pub(crate) fn expect_builtin_call<'a>(m: &'a Module, id: NodeId, name: &str) -> Option<&'a Call> {
     let Node::Call(c) = m.node(id) else {
         return None;
     };
@@ -539,7 +564,7 @@ fn builtin_name(m: &Module, id: NodeId) -> Option<&str> {
 
 /// Follow one level of `(%ref self x)` indirection: if `id` is a self-ref,
 /// return `(binding.rhs, Some(bid))`; otherwise return `(id, None)`.
-fn resolve_ref_one(m: &Module, id: NodeId) -> (NodeId, Option<BindingId>) {
+pub(crate) fn resolve_ref_one(m: &Module, id: NodeId) -> (NodeId, Option<BindingId>) {
     if let Node::Ref(Ref {
         ns: RefNs::SelfMod,
         name,
@@ -553,7 +578,7 @@ fn resolve_ref_one(m: &Module, id: NodeId) -> (NodeId, Option<BindingId>) {
 }
 
 /// A refusal naming the construct at `id`.
-fn refuse(id: NodeId, m: &Module, reason: &str) -> RefuseError {
+pub(crate) fn refuse(id: NodeId, m: &Module, reason: &str) -> RefuseError {
     let construct = match m.node(id) {
         Node::Call(c) => match c.head {
             CallHead::Builtin(sym) => m.resolve(sym).to_string(),

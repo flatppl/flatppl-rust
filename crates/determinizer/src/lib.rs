@@ -5,6 +5,7 @@ mod build;
 mod conformance;
 mod density;
 mod driver;
+mod marginal;
 mod refuse;
 pub use conformance::is_flatpdl;
 pub use driver::determinize;

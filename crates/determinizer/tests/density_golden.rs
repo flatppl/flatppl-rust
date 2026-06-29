@@ -227,6 +227,47 @@ lp = logdensityof(lawof(record(a = a)), record(a = 0.5))";
     );
 }
 
+// kchain(M, K) with a DISCRETE-FINITE latent (Bernoulli, 2 atoms) marginalizes
+// to the mass-weighted logsumexp:
+//   logsumexpᵢ[ logdensityof(M, aᵢ) + logdensityof(K(aᵢ), v) ]
+// For a 2-atom Bernoulli latent and a 1-component Normal kernel that means:
+//   - one outer `logsumexp` with 2 arguments,
+//   - 2 mass terms (the latent's log-pmf at 0 and at 1) + 2 kernel terms = 4
+//     `builtin_logdensityof` calls total,
+//   - the `−logN` uniform/biased-MC form is NOT used (each branch carries the
+//     latent's own mass term), and
+//   - no `kchain` / `lawof` / `draw` / `kernelof` survives.
+#[test]
+fn kchain_discrete_bernoulli_latent_lowers_to_mass_weighted_logsumexp() {
+    let src = "\
+z = draw(Bernoulli(p = 0.3))
+k = kernelof(record(y = draw(Normal(mu = z, sigma = 1.0))), z = z)
+pp = kchain(lawof(record(z = z)), k)
+lp = logdensityof(pp, record(y = 0.5))";
+    let out = determinize_src(src);
+    let pir = flatppl_flatpir::write(&out);
+    assert!(pir.contains("logsumexp"), "outer logsumexp present:\n{pir}");
+    // 2 mass terms + 2 kernel terms over the 2 Bernoulli atoms.
+    assert_eq!(
+        pir.matches("builtin_logdensityof").count(),
+        4,
+        "mass-weighted: 2 atoms × (latent pmf + kernel density):\n{pir}"
+    );
+    // Each branch adds a mass term to a kernel term.
+    assert!(pir.contains("add"), "mass-weighted add per branch:\n{pir}");
+    assert!(
+        !pir.contains("kchain")
+            && !pir.contains("lawof")
+            && !pir.contains("(draw ")
+            && !pir.contains("kernelof"),
+        "measure layer gone:\n{pir}"
+    );
+    assert!(
+        flatppl_determinizer::is_flatpdl(&out).is_ok(),
+        "is_flatpdl failed:\n{pir}"
+    );
+}
+
 fn determinize_src(src: &str) -> flatppl_core::Module {
     let m = {
         let mut m = flatppl_syntax::parse(src).unwrap();
