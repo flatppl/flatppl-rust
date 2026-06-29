@@ -1,4 +1,4 @@
-use flatppl_determinizer::is_flatpdl;
+use flatppl_determinizer::{determinize, is_flatpdl};
 
 fn infer_module(src: &str) -> flatppl_core::Module {
     let mut m = flatppl_syntax::parse(src).unwrap();
@@ -25,5 +25,27 @@ fn a_draw_is_not_flatpdl() {
                 | flatppl_determinizer::NonConformKind::MeasureTyped
         )),
         "expected a stochastic/measure violation; got: {v:?}"
+    );
+}
+
+// --- Task 2 tests ---
+
+#[test]
+fn already_deterministic_determinizes_to_conformant() {
+    let m = infer_module("x = elementof(reals)\ny = add(x, 1.0)");
+    let out = determinize(&m).expect("deterministic model must not refuse");
+    assert!(is_flatpdl(&out).is_ok());
+}
+
+#[test]
+fn unhandled_measure_algebra_refuses_clearly() {
+    // joint of two laws — not yet lowered => a clear refusal naming the construct
+    let m = infer_module(
+        "a = Normal(mu = 0.0, sigma = 1.0)\nb = Normal(mu = 1.0, sigma = 1.0)\nj = joint(a, b)",
+    );
+    let e = determinize(&m).unwrap_err();
+    assert!(
+        e.construct.contains("joint"),
+        "refusal must name the construct; got: {e:?}"
     );
 }

@@ -356,6 +356,16 @@ name = "flatppl-core"
 version = "0.1.0"
 
 [[package]]
+name = "flatppl-determinizer"
+version = "0.1.0"
+dependencies = [
+ "flatppl-core",
+ "flatppl-flatpir",
+ "flatppl-infer",
+ "flatppl-syntax",
+]
+
+[[package]]
 name = "flatppl-fileaccess"
 version = "0.1.0"
 dependencies = [
