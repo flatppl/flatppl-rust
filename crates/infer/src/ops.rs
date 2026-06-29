@@ -465,6 +465,13 @@ pub(crate) fn call_rule(
             domain => Type::Tuple(Box::new([domain, Type::RngState])),
         },
 
+        // ---- measure-kernel evaluation primitives (spec §07 sec:measure-eval-prims) ----
+        // FlatPDL primitive surface; TYPE-LEVEL ONLY (flatppl-rust does not evaluate
+        // densities/samples). `builtin_logdensityof` is a real scalar (scalar-over-batch,
+        // engine-concepts §13.3), independent of the kernel's variate; `-inf` outside
+        // support is a runtime value, not a type concern.
+        "builtin_logdensityof" => Type::Scalar(ScalarType::Real),
+
         // ---- multi-file (deferred — see TODO) ----
         "load_module" | "standard_module" => Type::Module,
 
