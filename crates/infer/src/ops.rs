@@ -486,7 +486,7 @@ pub(crate) fn call_rule(
                 });
             match variate {
                 Some(v) => Type::Tuple(Box::new([v, Type::RngState])),
-                None => Type::Deferred,
+                None => non_kernel_or_defer(inf, k, "builtin_sample", "argument 2"),
             }
         }
         // The four transports `f(kernel, kernel_input, x)` → the kernel's variate.
@@ -496,11 +496,15 @@ pub(crate) fn call_rule(
         // function is a static error" — is a follow-up; v1 types the variate regardless.)
         "builtin_touniform" | "builtin_fromuniform" | "builtin_tonormal" | "builtin_fromnormal" => {
             let k = args.first();
-            k.and_then(|(n, t, _)| component_variate(inf, *n, t))
+            let variate = k
+                .and_then(|(n, t, _)| component_variate(inf, *n, t))
                 .or_else(|| {
                     k.and_then(|(n, _, _)| kernel_variate(inf, *n, args.get(1).map(|a| a.0)))
-                })
-                .unwrap_or(Type::Deferred)
+                });
+            match variate {
+                Some(v) => v,
+                None => non_kernel_or_defer(inf, k, name.as_str(), "argument 1"),
+            }
         }
 
         // ---- multi-file (deferred — see TODO) ----
@@ -2359,11 +2363,47 @@ fn distribution_domain(
     }
 }
 
+/// The `None`-variate fallback for `builtin_sample` / the transports: a resolved-but-
+/// non-kernel `kernel` argument is a static error (§07 operates on a kernel object); a
+/// still-pending type (`%deferred` / a type variable) defers, cleared by re-inference.
+/// `Failed` / `Any` stay silent — the cause was reported elsewhere, or is unconstrained.
+fn non_kernel_or_defer(
+    inf: &mut Inferencer<'_, '_>,
+    kernel: Option<&ArgInfo>,
+    op: &str,
+    argpos: &str,
+) -> Type {
+    match kernel {
+        Some((kn, kt, _))
+            if !matches!(
+                kt,
+                Type::Deferred
+                    | Type::Var(_)
+                    | Type::Failed(_)
+                    | Type::Any
+                    | Type::Kernel { .. }
+                    | Type::Measure { .. }
+            ) =>
+        {
+            inf.diags.push(crate::Diagnostic::error_at(
+                *kn,
+                format!(
+                    "{op}: {argpos} must be a distribution kernel — a built-in \
+                     constructor or a reified kernel (spec §07)"
+                ),
+            ));
+            Type::Failed(format!("{op}: non-kernel argument").into())
+        }
+        _ => Type::Deferred,
+    }
+}
+
 /// The variate domain of the measure `kernel(kernel_input)` would produce, for a
-/// kernel given as a bare built-in distribution constructor (§08) — the
-/// `distribution_domain` pattern, but the name comes from the `kernel` argument node
-/// and the length params come from the `kernel_input` record (not call args).
-/// Returns `None` when the kernel is not a (base) distribution constructor.
+/// kernel given as a bare distribution constructor — a base built-in (§08) or a §09
+/// module member (`hepphys.Argus`). The `distribution_domain` pattern, but the name
+/// comes from the `kernel` argument node and the length params come from the
+/// `kernel_input` record (not call args). `None` when the kernel is not a (base or
+/// module) distribution constructor.
 fn kernel_variate(
     inf: &mut Inferencer<'_, '_>,
     kernel_node: NodeId,

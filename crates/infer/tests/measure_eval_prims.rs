@@ -116,3 +116,18 @@ fn builtin_transports_are_variate_typed() {
         );
     }
 }
+
+#[test]
+fn builtin_sample_non_kernel_diagnoses() {
+    // A resolved-but-non-kernel `kernel` arg (here `3.0`) is a static error, not a
+    // silent `%deferred`.
+    let (_module, diags) =
+        infer_src("state = rnginit(0)\nxs, s2 = builtin_sample(state, 3.0, record(x = 0.0))");
+    assert!(
+        diags
+            .iter()
+            .any(|d| d.severity == flatppl_infer::Severity::Error
+                && d.message.contains("builtin_sample")),
+        "a non-kernel kernel arg must emit an error diagnostic; got: {diags:?}"
+    );
+}
