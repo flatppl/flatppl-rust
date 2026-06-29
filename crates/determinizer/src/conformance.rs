@@ -2,8 +2,10 @@ use crate::refuse::{NonConformKind, NonConformance};
 use flatppl_core::{CallHead, Module, Node, NodeId, Phase, Type};
 
 /// FlatPDL conformance over `flatppl-infer` output: no `Measure`/`Likelihood`-typed node;
-/// `Kernel` type only as the first argument of a `builtin_*` primitive; no `Stochastic`
-/// phase. Pure read of the inferred side-tables — run `infer` first.
+/// `Kernel` type only as an argument of a `builtin_*` primitive (the constructor-tag arg —
+/// its position varies: arg 0 for `builtin_logdensityof` and the transports, arg 1 for
+/// `builtin_sample`); no `Stochastic` phase. Pure read of the inferred side-tables — run
+/// `infer` first.
 pub fn is_flatpdl(m: &Module) -> Result<(), Vec<NonConformance>> {
     let mut bad = Vec::new();
     for (_bid, binding) in m.bindings() {
@@ -13,7 +15,10 @@ pub fn is_flatpdl(m: &Module) -> Result<(), Vec<NonConformance>> {
 }
 
 // `parent_builtin`: the interned name of the enclosing builtin call head, so a
-// `Kernel`-typed node can be allowed iff it is the first arg of a `builtin_*` call.
+// `Kernel`-typed node is allowed iff it sits inside a `builtin_*` call. The kernel arg's
+// position varies by primitive, so the check is by-enclosing-call, not by-index; non-kernel
+// args are never `Kernel`-typed, so this admits no stray kernel.
+
 fn visit(m: &Module, id: NodeId, parent_builtin: Option<&str>, bad: &mut Vec<NonConformance>) {
     if matches!(m.phase_of(id), Some(Phase::Stochastic)) {
         bad.push(NonConformance {
