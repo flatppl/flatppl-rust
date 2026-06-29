@@ -489,6 +489,19 @@ pub(crate) fn call_rule(
                 None => Type::Deferred,
             }
         }
+        // The four transports `f(kernel, kernel_input, x)` → the kernel's variate.
+        // Kernel = arg 0, kernel_input = arg 1. Same kernel resolution as
+        // `builtin_sample` (reified kernel, then bare constructor via the catalogue).
+        // (The discrete-kernel transport refusal — §07 "use of an undefined transport
+        // function is a static error" — is a follow-up; v1 types the variate regardless.)
+        "builtin_touniform" | "builtin_fromuniform" | "builtin_tonormal" | "builtin_fromnormal" => {
+            let k = args.first();
+            k.and_then(|(n, t, _)| component_variate(inf, *n, t))
+                .or_else(|| {
+                    k.and_then(|(n, _, _)| kernel_variate(inf, *n, args.get(1).map(|a| a.0)))
+                })
+                .unwrap_or(Type::Deferred)
+        }
 
         // ---- multi-file (deferred — see TODO) ----
         "load_module" | "standard_module" => Type::Module,

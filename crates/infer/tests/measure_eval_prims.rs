@@ -98,3 +98,21 @@ fn builtin_sample_hepphys_argus_variate() {
         "hepphys.Argus sample variate must be a real scalar in the result tuple; got: {m}"
     );
 }
+
+#[test]
+fn builtin_transports_are_variate_typed() {
+    for op in [
+        "builtin_touniform",
+        "builtin_fromuniform",
+        "builtin_tonormal",
+        "builtin_fromnormal",
+    ] {
+        let src = format!("u = {op}(Normal, record(mu = 0.0, sigma = 1.0), 0.0)");
+        let m = meta_of(&src, op);
+        // The RESULT meta (the one wrapping the op call) is Normal's variate: real scalar.
+        assert!(
+            m.contains(&format!("(%scalar real) %fixed reals) ({op} ")),
+            "{op} of a univariate continuous kernel must type as a real scalar; got: {m}"
+        );
+    }
+}
