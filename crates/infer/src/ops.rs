@@ -454,7 +454,7 @@ pub(crate) fn call_rule(
                 .map(|(_, t, _)| t)
                 .find(|t| matches!(t, Type::Measure { .. })),
         ),
-        "joint" => joint_type(named),
+        "joint" => joint_type(args, named),
         "likelihoodof" => likelihood_type(inf, args),
         "joint_likelihood" => joint_likelihood_type(args),
 
@@ -1453,16 +1453,37 @@ fn static_dim(n: i64) -> Dim {
 
 /// `joint(a = M1, b = M2, …)` — a measure over the record of the components'
 /// domains (the positional form is deferred with the shape work).
-fn joint_type(named: &[NamedInfo]) -> Type {
-    let mut fields = Vec::with_capacity(named.len());
-    for (name, _, t, _) in named {
+fn joint_type(args: &[ArgInfo], named: &[NamedInfo]) -> Type {
+    // Keyword form `joint(a = M1, b = M2, …)`: a measure over a RECORD, each
+    // component variate under its name (a record-valued component nests under
+    // the name, not merged — spec §06).
+    if !named.is_empty() {
+        let mut fields = Vec::with_capacity(named.len());
+        for (name, _, t, _) in named {
+            match t {
+                Type::Measure { domain, .. } => fields.push((*name, domain.as_ref().clone())),
+                _ => return Type::Deferred,
+            }
+        }
+        return Type::Measure {
+            domain: Box::new(Type::Record(fields.into())),
+            mass: Mass::Deferred,
+        };
+    }
+    // Positional form `joint(M1, M2, …)`: the variate is the `cat` of the
+    // component variates (spec §06) — same shape-class rule as positional
+    // `cartprod` and `cat`: all scalars → a vector, all vectors → a
+    // concatenated vector, all records → a merged record; a mixed shape class
+    // defers. (Not a record-per-component — that is the keyword form above.)
+    let mut domains = Vec::with_capacity(args.len());
+    for (_, t, _) in args {
         match t {
-            Type::Measure { domain, .. } => fields.push((*name, domain.as_ref().clone())),
+            Type::Measure { domain, .. } => domains.push(domain.as_ref().clone()),
             _ => return Type::Deferred,
         }
     }
     Type::Measure {
-        domain: Box::new(Type::Record(fields.into())),
+        domain: Box::new(cat_compose(&domains)),
         mass: Mass::Deferred,
     }
 }

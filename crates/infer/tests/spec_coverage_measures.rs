@@ -278,3 +278,21 @@ fn matrix_dists_domain_is_rank2_dynamic_real() {
         );
     }
 }
+
+/// Positional `joint` has a `cat`-shaped variate DOMAIN (spec §06: the variate
+/// is the `cat` of the component variates — all scalars → a vector), not the
+/// (empty) record the keyword-only `joint_type` produced for positional args.
+/// Keyword `joint` stays a record domain.
+#[test]
+fn positional_joint_domain_is_cat_array() {
+    let out = ir("j = joint(Normal(mu = 0.0, sigma = 1.0), Exponential(rate = 1.0))");
+    assert!(
+        out.contains("(%domain (%array 1 (2) (%scalar real)))"),
+        "positional joint of two scalar measures → 2-element real array domain; got:\n{out}"
+    );
+    let outr = ir("jr = joint(a = Normal(mu = 0.0, sigma = 1.0), b = Exponential(rate = 1.0))");
+    assert!(
+        outr.contains("(%domain (%record (a (%scalar real)) (b (%scalar real))))"),
+        "keyword joint → record domain; got:\n{outr}"
+    );
+}
