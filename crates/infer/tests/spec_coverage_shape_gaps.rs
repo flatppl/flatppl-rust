@@ -1106,6 +1106,29 @@ fn cartprod_positional_valueset() {
     );
 }
 
+/// Positional `cartprod` is a set of ARRAYS, not a tuple (spec §03): the
+/// `elementof` result types as an array of the unified element type, with the
+/// per-position membership kept in the value-set slot. A tuple must NOT leak
+/// into the type (tuples are objects — no value-set, not an `elementof`
+/// result, not a measure domain — spec §04). A scalar+vector mix defers, since
+/// §06/§07 `cat` forbid that concatenation.
+#[test]
+fn cartprod_positional_is_array_not_tuple() {
+    let out = ir("p = elementof(cartprod(reals, integers))");
+    assert!(
+        out.contains("(%array 1 (2) (%scalar real))"),
+        "positional cartprod should type as a 2-element real array; got:\n{out}"
+    );
+    assert!(
+        out.contains("(cartprod reals integers)"),
+        "per-position membership stays in the value-set; got:\n{out}"
+    );
+    assert!(
+        !out.contains("%tuple"),
+        "no tuple may leak from positional cartprod into an elementof type; got:\n{out}"
+    );
+}
+
 /// Keyword `cartprod` carries a named record value-set.
 #[test]
 fn cartprod_record_valueset() {

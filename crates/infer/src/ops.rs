@@ -1059,16 +1059,21 @@ fn set_element_type(inf: &mut Inferencer<'_, '_>, node: Option<NodeId>) -> Type 
                             Type::Record(fields.into())
                         }
                     } else {
+                        // Positional `cartprod` is a set of ARRAYS, not a tuple
+                        // (spec §03): a member is the `cat` of one element per
+                        // component, so the element type follows the same
+                        // shape-class `cat` rule as a positional `joint` variate
+                        // — all-scalar components → a length-n vector, all-vector
+                        // components → a concatenated vector. The per-position
+                        // membership lives in the value-set slot (`CartProd`),
+                        // not the type. A mixed shape class (scalar with vector)
+                        // defers, since §06/§07 `cat` forbid that concatenation.
                         let parts: Vec<Type> = c
                             .args
                             .iter()
                             .map(|&a| set_element_type(inf, Some(a)))
                             .collect();
-                        if parts.iter().any(|t| matches!(t, Type::Deferred)) {
-                            Type::Deferred
-                        } else {
-                            Type::Tuple(parts.into())
-                        }
+                        cat_compose(&parts)
                     }
                 }
                 _ => Type::Deferred,

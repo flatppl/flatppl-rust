@@ -214,7 +214,7 @@ use flatppl_flatpir::{read as fp_read, write as fp_write};
 fn cartprod_and_record_valuesets_roundtrip() {
     // positional cartprod, multi-axis cartpow, and named record value-sets
     let src = "(%module \
-        (%bind p (%meta ((%tuple (%scalar real) (%scalar real)) %fixed (cartprod reals posreals)) (elementof reals))) \
+        (%bind p (%meta ((%array 1 (2) (%scalar real)) %fixed (cartprod reals posreals)) (elementof reals))) \
         (%bind m (%meta ((%array 2 (2 3) (%scalar real)) %fixed (cartpow (cartpow reals 3) 2)) (elementof reals))) \
         (%bind r (%meta ((%record (a (%scalar real)) (b (%scalar real))) %fixed (record (a reals) (b unitinterval))) (elementof reals))))";
     let m1 = fp_read(src).expect("initial read");
