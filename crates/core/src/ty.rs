@@ -165,12 +165,16 @@ impl ValueSet {
             // own types; the tuple itself contributes none.
             Type::Tuple(_) => ValueSet::Unknown,
             Type::Record(fields) => record_natural(fields),
-            // A table's per-row value is the record formed by its columns: each
-            // column already stores its per-row element type (a scalar, an
-            // array, or — for a table-valued column — a record), so this is the
-            // value-set of `Record(columns)` (spec §03 "Tables"). The row count
-            // lives in the type, not the row's value-set.
-            Type::Table { columns, .. } => record_natural(columns),
+            // A table's value-set is the `cartpow` of its row-record set over the
+            // row count (spec §03: `cartpow(recordset, n)` is "the set of n-row
+            // tables"). The row record is `Record(columns)` — each column stores
+            // its per-row element type (scalar, array, or — for a table-valued
+            // column — a record). This matches `load_data`'s table value-set
+            // (`cartpow(recordset, %dynamic)`), so both representations agree.
+            Type::Table { columns, nrows } => match record_natural(columns) {
+                ValueSet::Unknown => ValueSet::Unknown,
+                rec => ValueSet::CartPow(Box::new(rec), *nrows),
+            },
             Type::Measure { domain, .. } => ValueSet::natural_of(domain),
             Type::RngState => ValueSet::RngStates,
             Type::Any => ValueSet::Anything,
@@ -482,15 +486,19 @@ mod tests {
             ]),
             nrows: Dim::Static(2),
         };
-        // The per-row record carries the 3-vector verbatim (NOT stripped to a
-        // scalar) and nests the sub-table's record.
+        // The table value-set is `cartpow(rowRecord, nrows)` (spec §03 "set of
+        // n-row tables"). The row record carries the 3-vector verbatim (NOT
+        // stripped to a scalar) and nests the sub-table's record.
         assert_eq!(
             ValueSet::natural_of(&table),
-            RecordSet(Box::new([
-                (a, Reals),
-                (b, CartPow(Box::new(Reals), Dim::Static(3))),
-                (hits, RecordSet(Box::new([(x, Reals)]))),
-            ]))
+            CartPow(
+                Box::new(RecordSet(Box::new([
+                    (a, Reals),
+                    (b, CartPow(Box::new(Reals), Dim::Static(3))),
+                    (hits, RecordSet(Box::new([(x, Reals)]))),
+                ]))),
+                Dim::Static(2)
+            )
         );
     }
 
