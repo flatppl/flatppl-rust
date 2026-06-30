@@ -46,16 +46,29 @@ pub struct HttpFetcher;
 #[cfg(feature = "net")]
 impl Fetcher for HttpFetcher {
     fn fetch(&self, url: &str) -> Result<Fetched, String> {
+        // `get_uri` (the post-redirect URL) is on `ResponseExt`.
         use std::io::Read;
+        use ureq::ResponseExt;
         // `ureq` follows redirects by default and returns `Err` for non-2xx.
         let resp = ureq::get(url).call().map_err(|e| e.to_string())?;
-        let resolved_url = resp.get_url().to_string();
-        let header = |name: &str| resp.header(name).map(str::to_string);
-        let content_type = header("Content-Type");
-        let etag = header("ETag");
-        let last_modified = header("Last-Modified");
+        let resolved_url = resp.get_uri().to_string();
+        // Read the headers before consuming the response for its body.
+        let (content_type, etag, last_modified) = {
+            let headers = resp.headers();
+            let get = |name: &str| {
+                headers
+                    .get(name)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string)
+            };
+            (get("content-type"), get("etag"), get("last-modified"))
+        };
+        // `into_reader()` is unlimited, matching the prior ureq-2.x behaviour;
+        // `read_to_vec()` would impose a 10MB cap that `load_data` files
+        // (safetensors, Arrow, datasets) routinely exceed.
         let mut bytes = Vec::new();
-        resp.into_reader()
+        resp.into_body()
+            .into_reader()
             .read_to_end(&mut bytes)
             .map_err(|e| e.to_string())?;
         Ok(Fetched {
