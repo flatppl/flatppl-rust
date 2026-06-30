@@ -770,14 +770,20 @@ fn vector_type(args: &[ArgInfo]) -> Type {
 }
 
 /// `table(col1 = v1, col2 = v2, …)` (spec §03 "Tables"): named equal-length
-/// column vectors → a table. FlatPIR stores each column's ELEMENT type (not the
-/// vector) plus a single shared `nrows` (§11 `(%table (%columns (name elem) …)
-/// (%nrows N))`), so the leading dim is lifted out of the columns into `nrows`,
+/// columns → a table. FlatPIR stores each column's per-row ELEMENT type (not the
+/// column itself) plus a single shared `nrows` (§11 `(%table (%columns (name elem)
+/// …) (%nrows N))`), so the leading dim is lifted out of the columns into `nrows`,
 /// taken from the first column (the spec requires all columns equal-length).
-/// Columns must be rank-1 vectors; a non-vector or `%deferred` column leaves the
-/// table `%deferred` — no valid table type can be formed (honesty over coverage).
-/// The `table(r)` record-of-vectors form (spec §03) is not handled here and
-/// defers. `nrows` is `%dynamic` when the first column's length is dynamic.
+///
+/// A column is a **vector** or a **table** (spec §03). A vector column's element
+/// may itself be an array (a 3-vector per row), kept verbatim. A **table-valued**
+/// column contributes a record per row — one row of the sub-table — so its stored
+/// element is `Record(sub-columns)` and its length is the sub-table's `nrows`
+/// (`get(t, i)` then yields a row whose entry for that column is a record).
+/// A non-vector / non-table (or `%deferred`) column leaves the table `%deferred`
+/// — no valid table type can be formed (honesty over coverage). The `table(r)`
+/// record-of-vectors form (spec §03) is not handled here and defers. `nrows` is
+/// `%dynamic` when the first column's length is dynamic.
 fn table_type(named: &[NamedInfo]) -> Type {
     if named.is_empty() {
         return Type::Deferred;
@@ -785,15 +791,24 @@ fn table_type(named: &[NamedInfo]) -> Type {
     let mut columns = Vec::with_capacity(named.len());
     let mut nrows = Dim::Dynamic;
     for (name, _, t, _) in named {
-        match t {
-            Type::Array { shape, elem } if shape.len() == 1 => {
-                if columns.is_empty() {
-                    nrows = shape[0];
-                }
-                columns.push((*name, (**elem).clone()));
-            }
+        let (len, elem) = match t {
+            // Vector column: store its element (scalar or array); the length
+            // lifts out to the shared `nrows`.
+            Type::Array { shape, elem } if shape.len() == 1 => (shape[0], (**elem).clone()),
+            // Table-valued column: the per-row entry is a record (one row of the
+            // sub-table). The sub-table's columns are already per-row elements,
+            // so the row record is `Record(sub-columns)`; its length is the
+            // sub-table's row count.
+            Type::Table {
+                columns: sub,
+                nrows: sub_nrows,
+            } => (*sub_nrows, Type::Record(sub.clone())),
             _ => return Type::Deferred,
+        };
+        if columns.is_empty() {
+            nrows = len;
         }
+        columns.push((*name, elem));
     }
     Type::Table {
         columns: columns.into(),
@@ -860,6 +875,31 @@ fn get_type(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo], base: i64) -> Type {
                 match sym {
                     Some((_, t)) => t.clone(),
                     None => return Type::Failed(format!("record has no field `{s}`").into()),
+                }
+            }
+            // A table indexed by an integer is ROW access → the row record
+            // (spec §03 "Each row of a table is a record"); a table-valued
+            // column makes that entry a nested record. The columns already
+            // store per-row element types, so the row record IS `Record(cols)`.
+            // The index value is not needed for typing (no bounds check, as for
+            // arrays).
+            (Type::Table { columns, .. }, Node::Lit(Scalar::Int(_))) => {
+                Type::Record(columns.clone())
+            }
+            // A table indexed by a column name is COLUMN access → the column as
+            // a vector (spec §03); a table-valued column (stored as its per-row
+            // record) returns the sub-table itself, not a vector of records.
+            (Type::Table { columns, nrows }, Node::Lit(Scalar::Str(s))) => {
+                match columns.iter().find(|(n, _)| inf.module.resolve(*n) == &**s) {
+                    Some((_, Type::Record(sub))) => Type::Table {
+                        columns: sub.clone(),
+                        nrows: *nrows,
+                    },
+                    Some((_, colty)) => Type::Array {
+                        shape: Box::new([*nrows]),
+                        elem: Box::new(colty.clone()),
+                    },
+                    None => return Type::Failed(format!("table has no column `{s}`").into()),
                 }
             }
             (Type::Any | Type::Deferred, _) => return current.clone(),

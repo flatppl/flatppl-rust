@@ -236,6 +236,41 @@ fn cartprod_and_record_valuesets_roundtrip() {
     );
 }
 
+/// Nested `%record` / `%tuple` / `%table` type annotations — and the matching
+/// nested value-sets — survive read → write → read (spec §03/§04, flatppl-design
+/// commit ee232b4: records nest, tuples nest, a table column may be a table).
+/// The RHS is an inert `(elementof reals)`; only the `%meta` forms are exercised.
+#[test]
+fn nested_record_tuple_table_types_roundtrip() {
+    let src = "(%module \
+        (%bind r (%meta ((%record (a (%record (b (%scalar real)))) (d (%scalar real))) %fixed (record (a (record (b reals))) (d reals))) (elementof reals))) \
+        (%bind p (%meta ((%tuple (%tuple (%scalar real) (%scalar integer)) (%scalar boolean)) %fixed (cartprod (cartprod reals integers) booleans)) (elementof reals))) \
+        (%bind t (%meta ((%table (%columns (id (%scalar integer)) (hits (%record (x (%scalar real))))) (%nrows 2)) %fixed (record (id integers) (hits (record (x reals))))) (elementof reals))))";
+    let m1 = fp_read(src).expect("initial read");
+    let s1 = fp_write(&m1);
+    let m2 = fp_read(&s1).expect("re-read of canonical form");
+    let s2 = fp_write(&m2);
+    assert_eq!(s1, s2, "nested type/value-set forms not idempotent:\n{s1}");
+    assert!(
+        s1.contains("(%record (a (%record (b (%scalar real)))) (d (%scalar real)))"),
+        "nested record type missing:\n{s1}"
+    );
+    assert!(
+        s1.contains("(%tuple (%tuple (%scalar real) (%scalar integer)) (%scalar boolean))"),
+        "nested tuple type missing:\n{s1}"
+    );
+    assert!(
+        s1.contains(
+            "(%table (%columns (id (%scalar integer)) (hits (%record (x (%scalar real))))) (%nrows 2))"
+        ),
+        "nested table type missing:\n{s1}"
+    );
+    assert!(
+        s1.contains("(record (id integers) (hits (record (x reals))))"),
+        "nested table value-set missing:\n{s1}"
+    );
+}
+
 /// A module with an explicit *empty* `(%public)` — no public bindings — must
 /// survive `write → read`. The writer emits `(%public)` so re-reading uses the
 /// explicit (empty) interface rather than the name-convention fallback (which

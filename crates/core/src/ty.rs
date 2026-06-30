@@ -169,17 +169,12 @@ impl ValueSet {
                 }
             }
             Type::Record(fields) => record_natural(fields),
-            // A table's per-row value is a record of its columns' *element*
-            // sets (columns are equal-length vectors; one row picks one
-            // element from each — spec §03 "Tables"). The dynamic row count
+            // A table's per-row value is the record formed by its columns: each
+            // column already stores its per-row element type (a scalar, an
+            // array, or — for a table-valued column — a record), so this is the
+            // value-set of `Record(columns)` (spec §03 "Tables"). The row count
             // lives in the type, not the row's value-set.
-            Type::Table { columns, .. } => {
-                let elems: Vec<(Symbol, Type)> = columns
-                    .iter()
-                    .map(|(n, cty)| (*n, column_elem(cty)))
-                    .collect();
-                record_natural(&elems)
-            }
+            Type::Table { columns, .. } => record_natural(columns),
             Type::Measure { domain, .. } => ValueSet::natural_of(domain),
             Type::RngState => ValueSet::RngStates,
             Type::Any => ValueSet::Anything,
@@ -266,15 +261,6 @@ fn record_natural(fields: &[(Symbol, Type)]) -> ValueSet {
         ValueSet::Unknown
     } else {
         ValueSet::RecordSet(sets.into())
-    }
-}
-
-/// The element type of a table column (a vector); a non-array column type is
-/// returned unchanged (defensive — table columns are vectors per spec §03).
-fn column_elem(col: &Type) -> Type {
-    match col {
-        Type::Array { elem, .. } => (**elem).clone(),
-        other => other.clone(),
     }
 }
 
@@ -472,6 +458,46 @@ mod tests {
         assert_eq!(
             ValueSet::natural_of(&tup),
             CartProd(Box::new([Reals, Integers]))
+        );
+    }
+
+    #[test]
+    fn natural_of_table_nests_array_and_table_columns() {
+        use crate::ty::{ScalarType, Type};
+        use ValueSet::*;
+        let mut m = crate::module::Module::new();
+        let a = m.intern("a");
+        let b = m.intern("b");
+        let hits = m.intern("hits");
+        let x = m.intern("x");
+        // A table whose columns store per-row elements: a scalar, a 3-vector
+        // (array-valued column), and a record (a table-valued column).
+        let table = Type::Table {
+            columns: Box::new([
+                (a, Type::Scalar(ScalarType::Real)),
+                (
+                    b,
+                    Type::Array {
+                        shape: Box::new([Dim::Static(3)]),
+                        elem: Box::new(Type::Scalar(ScalarType::Real)),
+                    },
+                ),
+                (
+                    hits,
+                    Type::Record(Box::new([(x, Type::Scalar(ScalarType::Real))])),
+                ),
+            ]),
+            nrows: Dim::Static(2),
+        };
+        // The per-row record carries the 3-vector verbatim (NOT stripped to a
+        // scalar) and nests the sub-table's record.
+        assert_eq!(
+            ValueSet::natural_of(&table),
+            RecordSet(Box::new([
+                (a, Reals),
+                (b, CartPow(Box::new(Reals), Dim::Static(3))),
+                (hits, RecordSet(Box::new([(x, Reals)]))),
+            ]))
         );
     }
 

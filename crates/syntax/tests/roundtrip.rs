@@ -72,6 +72,40 @@ roundtrip_tests! {
     metricsum => "metricsum.flatppl",
 }
 
+/// Nested data constructors (spec §03/§04, flatppl-design commit ee232b4):
+/// records inside records, tuples inside tuples, and a table whose column is a
+/// table. Inlined rather than added to `fixtures/flatppl/` (the cross-engine
+/// corpus) so the still-behind flatppl-js harness does not run it — the same
+/// reasoning as `full_syntax_wraps_wide_statements`. Verifies Full/Minimal
+/// print → re-parse stability and FlatPIR stability.
+#[test]
+fn nested_data_constructors_roundtrip() {
+    let src = "\
+r = record(a = record(b = 1.0, c = 2), d = 3.0)
+p = tuple(tuple(1.0, 2), true)
+t = table(id = [1, 2], hits = table(x = [1.0, 2.0], y = [3.0, 4.0]))
+leaf = t[1].hits.x";
+    for syntax in [Syntax::Full, Syntax::Minimal] {
+        let m1 = parse(src).expect("parse nested constructors");
+        let printed = print_with(&m1, syntax);
+        let m2 = parse(&printed)
+            .unwrap_or_else(|e| panic!("re-parse of printed nested form failed: {e}\n{printed}"));
+        assert_eq!(
+            flatppl_flatpir::write(&m1),
+            flatppl_flatpir::write(&m2),
+            "printing changed nested constructors\n--- printed ---\n{printed}"
+        );
+        assert_eq!(printed, print_with(&m2, syntax), "printer not idempotent");
+    }
+    let m = parse(src).unwrap();
+    let pir1 = flatppl_flatpir::write(&m);
+    let pir2 = flatppl_flatpir::write(&flatppl_flatpir::read(&pir1).unwrap());
+    assert_eq!(
+        pir1, pir2,
+        "FlatPPL->FlatPIR not stable for nested constructors"
+    );
+}
+
 /// Over-wide Full-syntax statements break at their composition boundaries
 /// (call argument lists, dotted-broadcast operator spines, named arguments),
 /// while staying semantics-preserving and idempotent. A bare top-level
