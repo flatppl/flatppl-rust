@@ -240,7 +240,9 @@ pub fn hover(
         parts.push(format!("**phase:** `{phase}`"));
     }
     if let Some(vs) = module.valueset_of(node_id) {
-        parts.push(format!("**value-set:** `{vs}`"));
+        // `display_valueset` resolves interned RecordSet field names; the bare
+        // `Display` impl would render every field as the placeholder `_`.
+        parts.push(format!("**value-set:** `{}`", module.display_valueset(vs)));
     }
     let mut out = parts.join("  \n");
     // Append the doc-comment of the binding this node designates, inherited
@@ -1024,6 +1026,36 @@ mod tests {
         assert!(
             s.contains("reals"),
             "hover string must mention 'reals' for elementof(reals); got: {s:?}"
+        );
+    }
+
+    /// A record-valued binding's value-set must render with its field NAMES via
+    /// `display_valueset`, not the bare `Display` placeholder `_` (regression
+    /// for the F5 review finding; nested records lost names at every level).
+    #[test]
+    fn hover_record_value_set_keeps_field_names() {
+        let db = Database::default();
+        let cats = Catalogues::new(&db, vec![]);
+        let src = "r = record(a = 1.0, b = 2)";
+        let f = SourceFile::new(&db, "m.flatppl".to_string(), src.to_string());
+        let fs = FileSet::new(&db, vec![f]);
+        let offsets: &[u32] = &[0, 4, 11, 16, 22];
+        let index = crate::queries::node_span_index(&db, f, fs, cats);
+        let s = offsets
+            .iter()
+            .find_map(|&off| hover(&db, f, fs, cats, off, &index))
+            .expect("a record binding must yield hover info");
+        assert!(
+            s.contains("value-set"),
+            "expected a value-set line; got: {s:?}"
+        );
+        assert!(
+            s.contains("record(a: ") && s.contains("b: "),
+            "record value-set must show field names a/b; got: {s:?}"
+        );
+        assert!(
+            !s.contains("_: "),
+            "record value-set must not render fields as `_`; got: {s:?}"
         );
     }
 
