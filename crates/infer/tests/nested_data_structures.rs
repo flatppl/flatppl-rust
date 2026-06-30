@@ -295,3 +295,31 @@ fn positional_cartprod_mixing_shape_classes_is_an_error() {
         "cartprod of a scalar and a vector set must be a static error, got: {errs:?}"
     );
 }
+
+// ── table(r) / record(t) auto-splat duality (spec §03) ───────────────────────
+
+/// `table(r)` builds a table from a record of equal-length vectors (spec §03
+/// auto-splat duality).
+#[test]
+fn table_from_record_splats() {
+    let out = ir("r = record(a = [1.0, 2.0], b = [3, 4])\nt = table(r)");
+    assert!(
+        out.contains(
+            "(%bind t (%meta ((%table (%columns (a (%scalar real)) (b (%scalar integer))) (%nrows 2))"
+        ),
+        "table(record-of-vectors) should build a 2-row table; got:\n{out}"
+    );
+}
+
+/// `record(t)` is the inverse: a table splats into a record of its column
+/// vectors.
+#[test]
+fn record_from_table_splats() {
+    let out = ir("t = table(a = [1.0, 2.0], b = [3, 4])\nr = record(t)");
+    assert!(
+        out.contains(
+            "(%bind r (%meta ((%record (a (%array 1 (2) (%scalar real))) (b (%array 1 (2) (%scalar integer))))"
+        ),
+        "record(table) should build a record of column vectors; got:\n{out}"
+    );
+}

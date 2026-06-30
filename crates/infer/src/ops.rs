@@ -123,8 +123,22 @@ pub(crate) fn call_rule(
         // ---- containers (spec §03) — structural: result type threads arg types ----
         "vector" => vector_type(inf, args),
         "tuple" => Type::Tuple(args.iter().map(|(_, t, _)| t.clone()).collect()),
-        "record" => Type::Record(named.iter().map(|(n, _, t, _)| (*n, t.clone())).collect()),
-        "table" => table_type(inf, named),
+        // `record(t)` auto-splats a single table into a record of its column
+        // vectors (spec §03); otherwise a record of its named fields.
+        "record" => match (named.is_empty(), args) {
+            (true, [(_, Type::Table { columns, nrows }, _)]) => record_from_table(columns, *nrows),
+            _ => Type::Record(named.iter().map(|(n, _, t, _)| (*n, t.clone())).collect()),
+        },
+        // `table(r)` auto-splats a single record-of-vectors into columns (spec
+        // §03); otherwise a table of its named columns.
+        "table" => match (named.is_empty(), args) {
+            (true, [(node, Type::Record(fields), _)]) => {
+                let cols: Vec<(Symbol, &Type, NodeId)> =
+                    fields.iter().map(|(n, t)| (*n, t, *node)).collect();
+                build_table(inf, &cols)
+            }
+            _ => table_type(inf, named),
+        },
         "rowstack" => rowstack_type(arg_ty(args, 0)),
         "get" => get_type(inf, args, /*base=*/ 1),
         "get0" => get_type(inf, args, /*base=*/ 0),
@@ -850,34 +864,38 @@ fn table_type(inf: &mut Inferencer<'_, '_>, named: &[NamedInfo]) -> Type {
     if named.is_empty() {
         return Type::Deferred;
     }
-    let mut columns = Vec::with_capacity(named.len());
+    let cols: Vec<(Symbol, &Type, NodeId)> =
+        named.iter().map(|(n, node, t, _)| (*n, t, *node)).collect();
+    build_table(inf, &cols)
+}
+
+/// Build a `%table` from `(column name, column-value type, anchor node)` triples
+/// — shared by `table(col = …)` (named columns) and `table(r)` (record-of-vectors
+/// auto-splat). Each column is a **vector** (store its element) or a **table**
+/// (store its per-row record). The shared `nrows` is the first statically-known
+/// column length; a later column whose static length differs is an equal-length
+/// error (spec §03), anchored on that column's node.
+fn build_table(inf: &mut Inferencer<'_, '_>, cols: &[(Symbol, &Type, NodeId)]) -> Type {
+    if cols.is_empty() {
+        return Type::Deferred;
+    }
+    let mut columns = Vec::with_capacity(cols.len());
     let mut nrows = Dim::Dynamic;
-    for (name, node, t, _) in named {
+    for &(name, t, node) in cols {
         let (len, elem) = match t {
-            // Vector column: store its element (scalar or array); the length
-            // lifts out to the shared `nrows`.
             Type::Array { shape, elem } if shape.len() == 1 => (shape[0], (**elem).clone()),
-            // Table-valued column: the per-row entry is a record (one row of the
-            // sub-table). The sub-table's columns are already per-row elements,
-            // so the row record is `Record(sub-columns)`; its length is the
-            // sub-table's row count.
             Type::Table {
                 columns: sub,
                 nrows: sub_nrows,
             } => (*sub_nrows, Type::Record(sub.clone())),
             _ => return Type::Deferred,
         };
-        // §03: all columns must have the same length. The shared `nrows` is the
-        // first STATICALLY-known column length; a later column whose static
-        // length differs is an error (this is what makes the per-row-record
-        // representation of a table-valued column sound — its sub-table row
-        // count must equal the parent's, so column access can reconstruct it).
         match (nrows, len) {
             (Dim::Dynamic, _) => nrows = len,
             (Dim::Static(have), Dim::Static(got)) if have != got => {
-                let col = inf.module.resolve(*name).to_string();
+                let col = inf.module.resolve(name).to_string();
                 inf.diags.push(crate::Diagnostic::error_at(
-                    *node,
+                    node,
                     format!(
                         "table columns must have equal length (spec §03): column `{col}` has \
                          {got} rows, but an earlier column has {have}"
@@ -886,12 +904,37 @@ fn table_type(inf: &mut Inferencer<'_, '_>, named: &[NamedInfo]) -> Type {
             }
             _ => {}
         }
-        columns.push((*name, elem));
+        columns.push((name, elem));
     }
     Type::Table {
         columns: columns.into(),
         nrows,
     }
+}
+
+/// `record(t)`: a table's columns as a record of column vectors (spec §03, the
+/// inverse of `table(r)`). A vector column becomes a length-`nrows` vector; a
+/// table-valued column (stored as its per-row record) becomes the sub-table —
+/// mirroring `get`-by-column access.
+fn record_from_table(columns: &[(Symbol, Type)], nrows: Dim) -> Type {
+    Type::Record(
+        columns
+            .iter()
+            .map(|(n, elem)| {
+                let col = match elem {
+                    Type::Record(sub) => Type::Table {
+                        columns: sub.clone(),
+                        nrows,
+                    },
+                    e => Type::Array {
+                        shape: Box::new([nrows]),
+                        elem: Box::new(e.clone()),
+                    },
+                };
+                (*n, col)
+            })
+            .collect(),
+    )
 }
 
 /// `rowstack([rows…])`: an array of equal-length vectors becomes a matrix.
