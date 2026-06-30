@@ -457,11 +457,58 @@ fn lower_pushfwd(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Refu
 
 /// Build `builtin_logdensityof(kernel, kernel_input, pinned)` for a primitive
 /// distribution constructor `measure` applied to keyword arguments.
+/// The top-level structural kind of a variate type, for a conservative
+/// domain/variate compatibility check. `None` for unknown (deferred / any /
+/// type-var) or non-variate types — those never refuse. `Array` and `TVector`
+/// share a kind, so a column-vs-row-vector annotation difference is not flagged.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VariateKind {
+    Scalar,
+    Vector,
+    Record,
+    Tuple,
+    Table,
+}
+
+fn variate_kind(t: &Type) -> Option<VariateKind> {
+    match t {
+        Type::Scalar(_) => Some(VariateKind::Scalar),
+        Type::Array { .. } | Type::TVector { .. } => Some(VariateKind::Vector),
+        Type::Record(_) => Some(VariateKind::Record),
+        Type::Tuple(_) => Some(VariateKind::Tuple),
+        Type::Table { .. } => Some(VariateKind::Table),
+        _ => None,
+    }
+}
+
 pub(crate) fn build_density_term(
     m: &mut Module,
     measure: NodeId,
     pinned: NodeId,
 ) -> Result<NodeId, RefuseError> {
+    // Refuse scoring a measure at a variate whose structural KIND clearly
+    // mismatches the measure's variate domain — a scalar `Normal` scored at a
+    // record / tuple / vector (review finding F4). Inference does not reject
+    // this, so guard here per the refuse-don't-mislower discipline rather than
+    // emit an ill-typed `builtin_logdensityof`. Conservative: an unknown side or
+    // a matching kind passes; only a definite kind mismatch refuses. (The
+    // determinizer recursion descends into record fields, so a nested mismatch
+    // surfaces here as a scalar measure meeting a structured value.)
+    let domain_kind = match m.type_of(measure) {
+        Some(Type::Measure { domain, .. }) => variate_kind(domain),
+        _ => None,
+    };
+    let obs_kind = m.type_of(pinned).and_then(variate_kind);
+    if let (Some(dk), Some(ok)) = (domain_kind, obs_kind) {
+        if dk != ok {
+            return Err(refuse(
+                pinned,
+                m,
+                "variate type does not match the measure's domain",
+            ));
+        }
+    }
+
     let (ctor_sym, kwargs): (Symbol, Vec<(Symbol, NodeId)>) = {
         let Node::Call(c) = m.node(measure) else {
             return Err(refuse(measure, m, "primitive measure must be a Call node"));

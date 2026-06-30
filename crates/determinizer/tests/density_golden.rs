@@ -276,3 +276,44 @@ fn determinize_src(src: &str) -> flatppl_core::Module {
     };
     determinize(&m).expect("must lower, not refuse")
 }
+
+// A scalar draw scored at a STRUCTURED variate (record / vector) is a type
+// mismatch (spec §06: the variate shape must match the data shape). Inference
+// does not reject it, so the determinizer must REFUSE rather than emit an
+// ill-typed builtin_logdensityof scoring a scalar Normal at a record/vector
+// (review finding F4).
+#[test]
+fn scalar_draw_scored_at_record_variate_refuses() {
+    let src = "\
+a = draw(Normal(mu = 0.0, sigma = 1.0))
+lp = logdensityof(lawof(record(a = a)), record(a = record(x = 0.5)))";
+    let m = {
+        let mut m = flatppl_syntax::parse(src).unwrap();
+        let _ = flatppl_infer::infer(&mut m);
+        m
+    };
+    let err = determinize(&m).expect_err("a scalar measure scored at a record variate must refuse");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("variate") || msg.contains("domain"),
+        "refusal should name the variate/domain mismatch: {msg}"
+    );
+}
+
+#[test]
+fn scalar_draw_scored_at_vector_variate_refuses() {
+    let src = "\
+a = draw(Normal(mu = 0.0, sigma = 1.0))
+lp = logdensityof(lawof(record(a = a)), record(a = [0.1, 0.2, 0.3]))";
+    let m = {
+        let mut m = flatppl_syntax::parse(src).unwrap();
+        let _ = flatppl_infer::infer(&mut m);
+        m
+    };
+    let err = determinize(&m).expect_err("a scalar measure scored at a vector variate must refuse");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("variate") || msg.contains("domain"),
+        "refusal should name the variate/domain mismatch: {msg}"
+    );
+}
