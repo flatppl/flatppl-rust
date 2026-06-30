@@ -454,7 +454,31 @@ pub(crate) fn call_rule(
                 .map(|(_, t, _)| t)
                 .find(|t| matches!(t, Type::Measure { .. })),
         ),
-        "joint" => joint_type(args, named),
+        "joint" => {
+            // Positional `joint` cats the component variates; mixing shape
+            // classes (e.g. a scalar with a vector measure) is a static error
+            // (spec §06), not a silently-deferred domain. Only fire when every
+            // component is a fully-resolved measure (else defer quietly).
+            if named.is_empty() {
+                let domains: Option<Vec<Type>> = args
+                    .iter()
+                    .map(|(_, t, _)| match t {
+                        Type::Measure { domain, .. } => Some((**domain).clone()),
+                        _ => None,
+                    })
+                    .collect();
+                if let Some(domains) = domains {
+                    if cat_is_mixed(&domains) {
+                        inf.diags.push(crate::Diagnostic::error_at(
+                            id,
+                            "joint components must share a shape class (spec §06): mixing \
+                             scalars, vectors, and records is a static error",
+                        ));
+                    }
+                }
+            }
+            joint_type(args, named)
+        }
         "likelihoodof" => likelihood_type(inf, args),
         "joint_likelihood" => joint_likelihood_type(args),
 
@@ -1073,6 +1097,17 @@ fn set_element_type(inf: &mut Inferencer<'_, '_>, node: Option<NodeId>) -> Type 
                             .iter()
                             .map(|&a| set_element_type(inf, Some(a)))
                             .collect();
+                        // Mixing shape classes (a scalar set with a vector set)
+                        // is a static error — §03 cartprod mirrors §06 joint, and
+                        // §07 `cat` forbids that concatenation.
+                        if cat_is_mixed(&parts) {
+                            inf.diags.push(crate::Diagnostic::error_at(
+                                node,
+                                "cartprod components must share a shape class (spec §03, \
+                                 mirroring §06 `joint`): mixing scalars and vectors is a \
+                                 static error",
+                            ));
+                        }
                         cat_compose(&parts)
                     }
                 }
@@ -1776,6 +1811,29 @@ fn cat_compose(types: &[Type]) -> Type {
         }
         _ => Type::Deferred,
     }
+}
+
+/// Do these components have GENUINELY different recognized shape classes
+/// (scalar / 1-D vector / record), with none deferred? Distinguishes a
+/// `cat_compose` deferral that is really a spec-§06 "mixing shape classes is a
+/// static error" from one that is only "a component isn't inferred yet" — so a
+/// caller (positional `cartprod` / `joint`) can raise a loud diagnostic without
+/// firing on an unresolved or unclassifiable component.
+fn cat_is_mixed(types: &[Type]) -> bool {
+    if types.len() < 2 || types.iter().any(|t| matches!(t, Type::Deferred)) {
+        return false;
+    }
+    let class = |t: &Type| match t {
+        Type::Scalar(_) => Some(0u8),
+        Type::Array { shape, .. } if shape.len() == 1 => Some(1),
+        Type::Record(_) => Some(2),
+        _ => None,
+    };
+    let classes: Vec<Option<u8>> = types.iter().map(class).collect();
+    if classes.iter().any(Option::is_none) {
+        return false; // an unclassifiable component — don't fabricate a "mixed" error
+    }
+    classes.iter().any(|c| *c != classes[0])
 }
 
 /// Calling a user-defined callable: a function returns its body's type, a

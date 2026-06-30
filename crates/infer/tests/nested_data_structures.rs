@@ -268,3 +268,30 @@ fn table_valued_column_first_sets_nrows() {
         "a table-valued first column should set nrows = 3, got:\n{out}"
     );
 }
+
+// ── §06 mixing shape classes is a static error (cartprod / joint) ─────────────
+
+/// Positional `joint` of components with different shape classes (a scalar and
+/// a vector) is a static error (spec §06: "Mixing shape classes is a static
+/// error"), not a silently-deferred domain.
+#[test]
+fn positional_joint_mixing_shape_classes_is_an_error() {
+    let errs =
+        errors("j = joint(Normal(mu = 0.0, sigma = 1.0), iid(Normal(mu = 0.0, sigma = 1.0), 2))");
+    assert!(
+        errs.iter().any(|m| m.contains("shape class")),
+        "joint of a scalar and a vector measure must be a static error, got: {errs:?}"
+    );
+}
+
+/// Positional `cartprod` mixing shape classes (a scalar set and a vector set)
+/// is a static error too — §03 cartprod mirrors §06 joint; §07 `cat` forbids
+/// concatenating a scalar with a vector.
+#[test]
+fn positional_cartprod_mixing_shape_classes_is_an_error() {
+    let errs = errors("p = elementof(cartprod(reals, cartpow(reals, 3)))");
+    assert!(
+        errs.iter().any(|m| m.contains("shape class")),
+        "cartprod of a scalar and a vector set must be a static error, got: {errs:?}"
+    );
+}
