@@ -594,10 +594,13 @@ fn read_type(module: &mut Module, form: &Sexpr) -> Result<Option<Type>> {
     }
 }
 
-/// A type position that must be concrete (not `%deferred`); used for nested
-/// component types (array element, record fields, measure domain, …).
+/// A nested component type position (array element, record/table field, tuple
+/// element, measure domain, …). A `%deferred` slot is legal here: inference may
+/// leave a nested type un-resolved (an op with no rule), and the writer emits
+/// `%deferred` for it, so the reader must accept it back as `Type::Deferred` —
+/// otherwise write → read would not round-trip.
 fn read_type_required(module: &mut Module, form: &Sexpr) -> Result<Type> {
-    read_type(module, form)?.ok_or_else(|| err(form, "`%deferred` is not allowed in a nested type"))
+    Ok(read_type(module, form)?.unwrap_or(Type::Deferred))
 }
 
 fn read_type_list(module: &mut Module, items: &[Sexpr]) -> Result<Type> {

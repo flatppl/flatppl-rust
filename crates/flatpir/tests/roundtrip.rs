@@ -271,6 +271,36 @@ fn nested_record_tuple_table_types_roundtrip() {
     );
 }
 
+/// A nested `%deferred` type slot — a record field / tuple element / array
+/// element whose type inference is still a gap (e.g. an op with no rule) — is
+/// emitted by the writer, so the reader must accept it; read → write → read must
+/// round-trip rather than error (review finding F3). `Type::Deferred` is a legal
+/// occupant of every nested slot.
+#[test]
+fn nested_deferred_type_roundtrips() {
+    let src = "(%module \
+        (%bind r (%meta ((%record (a %deferred) (b (%scalar real))) %fixed %unknown) (elementof reals))) \
+        (%bind tup (%meta ((%tuple %deferred (%scalar integer)) %fixed %unknown) (elementof reals))) \
+        (%bind arr (%meta ((%array 1 (2) %deferred) %fixed %unknown) (elementof reals))))";
+    let m1 = fp_read(src).expect("read nested %deferred");
+    let s1 = fp_write(&m1);
+    let m2 = fp_read(&s1).expect("re-read of canonical form must succeed (F3)");
+    let s2 = fp_write(&m2);
+    assert_eq!(s1, s2, "nested %deferred not idempotent:\n{s1}");
+    assert!(
+        s1.contains("(%record (a %deferred) (b (%scalar real)))"),
+        "nested record %deferred missing:\n{s1}"
+    );
+    assert!(
+        s1.contains("(%tuple %deferred (%scalar integer))"),
+        "nested tuple %deferred missing:\n{s1}"
+    );
+    assert!(
+        s1.contains("(%array 1 (2) %deferred)"),
+        "nested array %deferred missing:\n{s1}"
+    );
+}
+
 /// A module with an explicit *empty* `(%public)` — no public bindings — must
 /// survive `write → read`. The writer emits `(%public)` so re-reading uses the
 /// explicit (empty) interface rather than the name-convention fallback (which
