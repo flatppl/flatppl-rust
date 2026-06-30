@@ -227,6 +227,15 @@ impl ValueSet {
             (CartPow(a, n), CartPow(b, d)) => {
                 (n == d || matches!(d, Dim::Dynamic)) && a.subset_of(b)
             }
+            // A heterogeneous product is a subset of a homogeneous power when the
+            // lengths agree and every component lies in the power's element set —
+            // e.g. `cartprod(reals, integers) ⊆ cartpow(reals, 2)`. This is what
+            // lets a positional `cartprod`'s value-set be a refinement of its
+            // array type's natural extent (§11 refinement invariant).
+            (CartProd(parts), CartPow(elem, d)) => {
+                (matches!(d, Dim::Dynamic) || *d == Dim::Static(parts.len() as u32))
+                    && parts.iter().all(|p| p.subset_of(elem))
+            }
             (CartProd(a), CartProd(b)) if a.len() == b.len() => {
                 a.iter().zip(b.iter()).all(|(x, y)| x.subset_of(y))
             }
@@ -512,6 +521,25 @@ mod tests {
         );
         // length mismatch is not a subset
         assert!(!CartProd(Box::new([Reals])).subset_of(&CartProd(Box::new([Reals, Reals]))));
+        // a heterogeneous product is a subset of a homogeneous power when the
+        // lengths agree and each component lies in the element set
+        assert!(
+            CartProd(Box::new([Reals, Integers]))
+                .subset_of(&CartPow(Box::new(Reals), Dim::Static(2)))
+        );
+        assert!(
+            CartProd(Box::new([PosReals, UnitInterval]))
+                .subset_of(&CartPow(Box::new(Reals), Dim::Dynamic))
+        );
+        // wrong length or an out-of-set component is not a subset
+        assert!(
+            !CartProd(Box::new([Reals, Integers]))
+                .subset_of(&CartPow(Box::new(Reals), Dim::Static(3)))
+        );
+        assert!(
+            !CartProd(Box::new([Reals, Integers]))
+                .subset_of(&CartPow(Box::new(PosReals), Dim::Static(2)))
+        );
         // bounded iff every component bounded
         assert_eq!(
             CartProd(Box::new([UnitInterval, Booleans])).is_bounded(),
