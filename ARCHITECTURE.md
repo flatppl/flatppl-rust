@@ -274,6 +274,27 @@ Conventions: crate names are hyphenated and prefixed (`flatppl-…`), singular
 concepts; workspace directories drop the prefix (`crates/core`, `crates/syntax`);
 edition 2024 / resolver 3, toolchain pinned to stable.
 
+## Testing conventions
+
+Distilled from the nested-data work, where coincidental test inputs hid real
+bugs:
+
+- **Exercise the discriminating case, not just the happy path.** Inference bugs
+  hid because every test used the *valid, symmetric* shape — equal inner/outer
+  table row counts hid a row-count reconstruction bug, and the test that caught
+  it was the *unequal-columns* (ill-formed) case. Use distinct, non-coincidental
+  magic numbers per axis so a swapped or mis-derived dimension must show, and
+  always test the boundary / ill-formed input, not only the well-formed one.
+- **Assert against the spec rule, not the current output.** A type / value-set
+  assertion should encode what the spec mandates (cite the §); pinning whatever
+  the engine emits today lets a wrong behaviour "pass" — the `column_elem`
+  double-strip and the tuple / table value-sets all shipped that way.
+- **The §11 value-set refinement invariant is guarded**
+  (`crates/infer/tests/value_set_invariant.rs`): every value-typed node's
+  value-set must be a subset of `natural_of(type)`, the canonical type→value-set
+  mapping. Extend its corpus when you add a value-set producer, so a new one
+  cannot silently drift from the natural extent.
+
 ## Open / not-yet-locked
 
 - **Pipeline-stage modeling:** type-state `Module<Stage>` (gates which annotation
