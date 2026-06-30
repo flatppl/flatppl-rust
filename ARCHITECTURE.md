@@ -117,7 +117,7 @@ Targets tap in at the level matching their native vocabulary:
 | Probabilistically-native | Julia (MeasureBase/Distributions), Stan, RooFit/HS³, NumPyro/PyMC/Pyro PPL layers | higher, measure/distribution-bearing profiles |
 
 So you **lower only as far as the target's native vocabulary** (MLIR's "legalize to
-the target dialect"). The **precompiler** = *"legalize to the FlatPDL profile"* — one
+the target dialect"). The **determiniser** (crate `flatppl-determinizer`) = *"legalize to the FlatPDL profile"* — one
 driver over the shared catalog, not a bespoke monolith; other targets are other
 drivers reusing the same rules.
 
@@ -130,7 +130,7 @@ transformation:
   MLIR). Rules *eliminate* constructs toward the target's legal set, so there is a
   decreasing measure (construct-complexity); a **greedy worklist / ordered pipeline
   terminates**, and *any* legal form is correct. This is classic instruction
-  selection / dialect legalization — **no e-graph needed.** The `precompiler` and
+  selection / dialect legalization — **no e-graph needed.** The `flatppl-determinizer` and
   codegen lowering use this. (An e-graph would only buy the *optimal* lowering among
   choices — a quality concern, deferrable; correctness never needs it.)
 - **Equality saturation** — cross-paradigm raise/lower + optimization (e.g.
@@ -145,7 +145,7 @@ transformation:
   clean failure signal. This is the `flatppl-rewrite` work.
 
 Tag each catalog rule **directional** (lowering-only) vs **equivalence**
-(bidirectional). **Start with the greedy legalizer** — it covers the `precompiler` +
+(bidirectional). **Start with the greedy legalizer** — it covers the `flatppl-determinizer` +
 all codegen lowering; **add the egglog engine for cross-paradigm interop**, the
 ambitious later piece. (egglog is a superset — it could do directional lowering too,
 with a cost model forbidding illegal ops — but greedy is simpler, faster, and

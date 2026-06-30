@@ -1,0 +1,16 @@
+[package]
+name = "flatppl-determinizer"
+description = "FlatPPL → FlatPDL determiniser: eliminates the measure layer, leaving deterministic ops + the six builtin_* primitives."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+flatppl-core = { path = "../core" }
+flatppl-infer = { path = "../infer" }
+
+[dev-dependencies]
+flatppl-syntax = { path = "../syntax" }
+flatppl-flatpir = { path = "../flatpir" }

@@ -112,6 +112,13 @@ impl Module {
         id
     }
 
+    /// Redirect a binding's right-hand side to a freshly-`alloc`'d node.
+    /// Used by rewriting passes (e.g. the determiniser) that replace one expression
+    /// with another inside an already-built module.
+    pub fn set_binding_rhs(&mut self, id: BindingId, rhs: NodeId) {
+        self.bindings.get_mut(id).rhs = rhs;
+    }
+
     // ---- read ----
 
     pub fn node(&self, id: NodeId) -> &Node {
