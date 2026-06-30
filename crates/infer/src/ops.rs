@@ -121,10 +121,10 @@ pub(crate) fn call_rule(
         }
 
         // ---- containers (spec §03) — structural: result type threads arg types ----
-        "vector" => vector_type(args),
+        "vector" => vector_type(inf, args),
         "tuple" => Type::Tuple(args.iter().map(|(_, t, _)| t.clone()).collect()),
         "record" => Type::Record(named.iter().map(|(n, _, t, _)| (*n, t.clone())).collect()),
-        "table" => table_type(named),
+        "table" => table_type(inf, named),
         "rowstack" => rowstack_type(arg_ty(args, 0)),
         "get" => get_type(inf, args, /*base=*/ 1),
         "get0" => get_type(inf, args, /*base=*/ 0),
@@ -750,8 +750,46 @@ fn mul_type(args: &[ArgInfo]) -> Type {
     }
 }
 
+/// If `t` is forbidden as an array / table-column element (spec §03: arrays
+/// hold scalars, strings, or arrays; §02: measures, likelihoods, functions, and
+/// tuples may not appear inside arrays/records/tables), name the kind for a
+/// diagnostic. `Any` (strings, holes), `Deferred`, and `Var` pass — they are
+/// not yet known to be objects.
+fn forbidden_array_element(t: &Type) -> Option<&'static str> {
+    match t {
+        Type::Record(_) => Some("a record"),
+        Type::Tuple(_) => Some("a tuple"),
+        Type::Table { .. } => Some("a table"),
+        Type::Measure { .. } => Some("a measure"),
+        Type::Kernel { .. } => Some("a kernel"),
+        Type::Function { .. } => Some("a function"),
+        Type::Likelihood { .. } => Some("a likelihood"),
+        Type::Module => Some("a module"),
+        _ => None,
+    }
+}
+
 /// `vector(e1, …, en)` — a static-length array of the unified element type.
-fn vector_type(args: &[ArgInfo]) -> Type {
+fn vector_type(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> Type {
+    // §03: array elements must be scalars, strings, or arrays — never records,
+    // tables, tuples, or non-value objects. Rejecting these here is also what
+    // keeps a vector-of-records from masquerading as a table-valued column
+    // (both would otherwise store a `Record` column element; see `table_type`).
+    let mut bad = false;
+    for (node, t, _) in args {
+        if let Some(kind) = forbidden_array_element(t) {
+            inf.diags.push(crate::Diagnostic::error_at(
+                *node,
+                format!(
+                    "array elements must be scalars, strings, or arrays (spec §03); got {kind}"
+                ),
+            ));
+            bad = true;
+        }
+    }
+    if bad {
+        return Type::Failed("array element is not a scalar, string, or array".into());
+    }
     let mut elem: Option<Type> = None;
     for (_, t, _) in args {
         elem = Some(match elem {
@@ -784,13 +822,13 @@ fn vector_type(args: &[ArgInfo]) -> Type {
 /// — no valid table type can be formed (honesty over coverage). The `table(r)`
 /// record-of-vectors form (spec §03) is not handled here and defers. `nrows` is
 /// `%dynamic` when the first column's length is dynamic.
-fn table_type(named: &[NamedInfo]) -> Type {
+fn table_type(inf: &mut Inferencer<'_, '_>, named: &[NamedInfo]) -> Type {
     if named.is_empty() {
         return Type::Deferred;
     }
     let mut columns = Vec::with_capacity(named.len());
     let mut nrows = Dim::Dynamic;
-    for (name, _, t, _) in named {
+    for (name, node, t, _) in named {
         let (len, elem) = match t {
             // Vector column: store its element (scalar or array); the length
             // lifts out to the shared `nrows`.
@@ -805,8 +843,24 @@ fn table_type(named: &[NamedInfo]) -> Type {
             } => (*sub_nrows, Type::Record(sub.clone())),
             _ => return Type::Deferred,
         };
-        if columns.is_empty() {
-            nrows = len;
+        // §03: all columns must have the same length. The shared `nrows` is the
+        // first STATICALLY-known column length; a later column whose static
+        // length differs is an error (this is what makes the per-row-record
+        // representation of a table-valued column sound — its sub-table row
+        // count must equal the parent's, so column access can reconstruct it).
+        match (nrows, len) {
+            (Dim::Dynamic, _) => nrows = len,
+            (Dim::Static(have), Dim::Static(got)) if have != got => {
+                let col = inf.module.resolve(*name).to_string();
+                inf.diags.push(crate::Diagnostic::error_at(
+                    *node,
+                    format!(
+                        "table columns must have equal length (spec §03): column `{col}` has \
+                         {got} rows, but an earlier column has {have}"
+                    ),
+                ));
+            }
+            _ => {}
         }
         columns.push((*name, elem));
     }

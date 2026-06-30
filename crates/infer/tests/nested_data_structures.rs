@@ -7,12 +7,22 @@
 //! corpus) so they don't run through a flatppl-js that has not yet landed the
 //! same change — mirroring `syntax/tests/roundtrip.rs::full_syntax_wraps_*`.
 
-use flatppl_infer::infer;
+use flatppl_infer::{Severity, infer};
 
 fn ir(src: &str) -> String {
     let mut m = flatppl_syntax::parse(src).unwrap();
     let _ = infer(&mut m);
     flatppl_flatpir::write(&m)
+}
+
+/// Inference error messages for `src` (spec §03 well-formedness diagnostics).
+fn errors(src: &str) -> Vec<String> {
+    let mut m = flatppl_syntax::parse(src).unwrap();
+    infer(&mut m)
+        .into_iter()
+        .filter(|d| d.severity == Severity::Error)
+        .map(|d| d.message)
+        .collect()
 }
 
 // ── Nested records (record-in-record) ────────────────────────────────────────
@@ -145,5 +155,113 @@ fn table_column_access_vector_or_subtable() {
     assert!(
         out.contains("(%bind sub (%meta ((%table (%columns (x (%scalar real))) (%nrows 2))"),
         "t.hits should be the sub-table, got:\n{out}"
+    );
+}
+
+// ── §03 well-formedness: equal column lengths + no objects-in-arrays ──────────
+
+/// All table columns must have the same length (spec §03). table_type took the
+/// row count from the first column only; a table-valued column made this
+/// concretely wrong (its sub-table nrows became the parent nrows). A length
+/// mismatch must now be reported, not silently accepted. (Regression for the
+/// F2 finding of the nested-data review.)
+#[test]
+fn table_unequal_column_lengths_is_an_error() {
+    let errs = errors("t = table(hits = table(x = [1.0, 2.0, 3.0, 4.0, 5.0]), id = [10, 20])");
+    assert!(
+        errs.iter()
+            .any(|m| m.contains("equal length") || m.contains("rows")),
+        "unequal column lengths must be reported, got: {errs:?}"
+    );
+}
+
+/// A plain (non-nested) length mismatch is reported too — the rule is general.
+#[test]
+fn table_unequal_plain_columns_is_an_error() {
+    let errs = errors("t = table(a = [1.0, 2.0], b = [1.0, 2.0, 3.0])");
+    assert!(
+        errs.iter()
+            .any(|m| m.contains("equal length") || m.contains("rows")),
+        "unequal plain column lengths must be reported, got: {errs:?}"
+    );
+}
+
+/// An array element must be a scalar, string, or array — never a record (spec
+/// §03). A vector-of-records would otherwise masquerade as a table-valued
+/// column (indistinguishable types, phantom sub-table on column access). It
+/// must be reported at construction. (Regression for the F1 finding.)
+#[test]
+fn array_of_records_is_rejected() {
+    let errs = errors("c = [record(x = 1.0), record(x = 2.0)]");
+    assert!(
+        errs.iter().any(|m| m.contains("array element")),
+        "an array of records must be reported, got: {errs:?}"
+    );
+    // The same rejection applies inside a table column position.
+    let errs = errors("t = table(pts = [record(x = 1.0), record(x = 2.0)])");
+    assert!(
+        errs.iter().any(|m| m.contains("array element")),
+        "a vector-of-records column must be reported, got: {errs:?}"
+    );
+}
+
+/// Measures / tuples are likewise forbidden as array elements (spec §02/§03).
+#[test]
+fn array_of_objects_is_rejected() {
+    let errs = errors("m = Normal(mu = 0.0, sigma = 1.0)\na = [m, m]");
+    assert!(
+        errs.iter().any(|m| m.contains("array element")),
+        "an array of measures must be reported, got: {errs:?}"
+    );
+}
+
+/// Strings and arrays remain valid array elements (selector vectors, vec-of-vec).
+#[test]
+fn array_of_strings_and_arrays_is_ok() {
+    assert!(
+        errors("names = [\"a\", \"b\", \"c\"]").is_empty(),
+        "a string vector must be accepted"
+    );
+    assert!(
+        errors("m = [[1.0, 2.0], [3.0, 4.0]]").is_empty(),
+        "a vector-of-vectors must be accepted"
+    );
+}
+
+/// With equal columns, a nested table reconstructs correctly at a row count
+/// OTHER than 2 (the earlier tests all used nrows = 2, masking F1/F2): the
+/// outer table, the sub-table from column access, and a scalar column vector
+/// all carry nrows = 3.
+#[test]
+fn nested_table_reconstruction_with_distinct_nrows() {
+    let out = ir(
+        "t = table(id = [1, 2, 3], hits = table(x = [1.0, 2.0, 3.0]))\nsub = t.hits\ncol = t.id",
+    );
+    assert!(
+        out.contains(
+            "(%table (%columns (id (%scalar integer)) (hits (%record (x (%scalar real))))) (%nrows 3))"
+        ),
+        "outer table should be 3 rows, got:\n{out}"
+    );
+    assert!(
+        out.contains("(%bind sub (%meta ((%table (%columns (x (%scalar real))) (%nrows 3))"),
+        "t.hits should reconstruct a 3-row sub-table, got:\n{out}"
+    );
+    assert!(
+        out.contains("(%bind col (%meta ((%array 1 (3) (%scalar integer))"),
+        "t.id should be a length-3 column vector, got:\n{out}"
+    );
+}
+
+/// A table-valued column placed FIRST sets the shared row count from its
+/// sub-table (spec §03), with the remaining equal-length columns accepted.
+#[test]
+fn table_valued_column_first_sets_nrows() {
+    let out = ir("t = table(hits = table(x = [1.0, 2.0, 3.0]), id = [1, 2, 3])");
+    assert!(
+        out.contains(
+            "(%table (%columns (hits (%record (x (%scalar real)))) (id (%scalar integer))) (%nrows 3))"
+        ),
+        "a table-valued first column should set nrows = 3, got:\n{out}"
     );
 }
