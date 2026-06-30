@@ -160,14 +160,10 @@ impl ValueSet {
                 ValueSet::Unknown => ValueSet::Unknown,
                 inner => ValueSet::CartPow(Box::new(inner), *len),
             },
-            Type::Tuple(parts) => {
-                let sets: Vec<ValueSet> = parts.iter().map(ValueSet::natural_of).collect();
-                if sets.iter().any(|s| matches!(s, ValueSet::Unknown)) {
-                    ValueSet::Unknown
-                } else {
-                    ValueSet::CartProd(sets.into())
-                }
-            }
+            // Tuples are objects, not values (spec §04): a tuple has no
+            // value-set. Its components carry their own value-sets through their
+            // own types; the tuple itself contributes none.
+            Type::Tuple(_) => ValueSet::Unknown,
             Type::Record(fields) => record_natural(fields),
             // A table's per-row value is the record formed by its columns: each
             // column already stores its per-row element type (a scalar, an
@@ -450,15 +446,12 @@ mod tests {
             }),
         };
         assert_eq!(ValueSet::natural_of(&nested), ValueSet::natural_of(&flat));
-        // tuple → CartProd
+        // tuple → no value-set (spec §04: tuples are objects, not values)
         let tup = Type::Tuple(Box::new([
             Type::Scalar(ScalarType::Real),
             Type::Scalar(ScalarType::Integer),
         ]));
-        assert_eq!(
-            ValueSet::natural_of(&tup),
-            CartProd(Box::new([Reals, Integers]))
-        );
+        assert_eq!(ValueSet::natural_of(&tup), Unknown);
     }
 
     #[test]

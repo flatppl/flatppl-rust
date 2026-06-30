@@ -57,8 +57,9 @@ fn nested_record_field_chains() {
 
 // ── Nested tuples (tuple-in-tuple) ───────────────────────────────────────────
 
-/// A tuple may contain another tuple (spec §04 — tuples nest): the type and
-/// value-set nest, and `t[1][2]` reaches the inner component.
+/// A tuple may contain another tuple (spec §04 — tuples nest): the type nests.
+/// A tuple has NO value-set (spec §04: tuples are objects, not values), so the
+/// value-set slot is `%unknown` — no `cartprod` leaks onto a tuple.
 #[test]
 fn nested_tuple_type_and_valueset() {
     let out = ir("p = tuple(tuple(1.0, 2), true)");
@@ -67,8 +68,10 @@ fn nested_tuple_type_and_valueset() {
         "tuple-of-tuple should nest in the type, got:\n{out}"
     );
     assert!(
-        out.contains("(cartprod (cartprod reals integers) booleans)"),
-        "tuple-of-tuple should nest in the value-set, got:\n{out}"
+        out.contains(
+            "(%tuple (%tuple (%scalar real) (%scalar integer)) (%scalar boolean)) %fixed %unknown)"
+        ),
+        "a tuple has no value-set (§04) — expect %unknown, no cartprod; got:\n{out}"
     );
 }
 
