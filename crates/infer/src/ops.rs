@@ -465,6 +465,48 @@ pub(crate) fn call_rule(
             domain => Type::Tuple(Box::new([domain, Type::RngState])),
         },
 
+        // ---- measure-kernel evaluation primitives (spec §07 sec:measure-eval-prims) ----
+        // FlatPDL primitive surface; TYPE-LEVEL ONLY (flatppl-rust does not evaluate
+        // densities/samples). `builtin_logdensityof` is a real scalar (scalar-over-batch,
+        // engine-concepts §13.3), independent of the kernel's variate; `-inf` outside
+        // support is a runtime value, not a type concern.
+        "builtin_logdensityof" => Type::Scalar(ScalarType::Real),
+        // `builtin_sample(rngstate, kernel, kernel_input, n, m, …)` → `(variate,
+        // new_rngstate)`. Kernel = arg 1, kernel_input = arg 2. The variate comes from
+        // `component_variate` (reified kernels — the accessor `kchain` uses) or, for a
+        // bare distribution constructor, from `kernel_variate` (the catalogue). The
+        // no-dims case is typed here; the optional `n, m, …` dims that array-ify the
+        // variate are a follow-up.
+        "builtin_sample" => {
+            let k = args.get(1);
+            let variate = k
+                .and_then(|(n, t, _)| component_variate(inf, *n, t))
+                .or_else(|| {
+                    k.and_then(|(n, _, _)| kernel_variate(inf, *n, args.get(2).map(|a| a.0)))
+                });
+            match variate {
+                Some(v) => Type::Tuple(Box::new([v, Type::RngState])),
+                None => non_kernel_or_defer(inf, k, "builtin_sample", "argument 2"),
+            }
+        }
+        // The four transports `f(kernel, kernel_input, x)` → the kernel's variate.
+        // Kernel = arg 0, kernel_input = arg 1. Same kernel resolution as
+        // `builtin_sample` (reified kernel, then bare constructor via the catalogue).
+        // (The discrete-kernel transport refusal — §07 "use of an undefined transport
+        // function is a static error" — is a follow-up; v1 types the variate regardless.)
+        "builtin_touniform" | "builtin_fromuniform" | "builtin_tonormal" | "builtin_fromnormal" => {
+            let k = args.first();
+            let variate = k
+                .and_then(|(n, t, _)| component_variate(inf, *n, t))
+                .or_else(|| {
+                    k.and_then(|(n, _, _)| kernel_variate(inf, *n, args.get(1).map(|a| a.0)))
+                });
+            match variate {
+                Some(v) => v,
+                None => non_kernel_or_defer(inf, k, name.as_str(), "argument 1"),
+            }
+        }
+
         // ---- multi-file (deferred — see TODO) ----
         "load_module" | "standard_module" => Type::Module,
 
@@ -2319,6 +2361,124 @@ fn distribution_domain(
     } else {
         None
     }
+}
+
+/// The `None`-variate fallback for `builtin_sample` / the transports: a resolved-but-
+/// non-kernel `kernel` argument is a static error (§07 operates on a kernel object); a
+/// still-pending type (`%deferred` / a type variable) defers, cleared by re-inference.
+/// `Failed` / `Any` stay silent — the cause was reported elsewhere, or is unconstrained.
+fn non_kernel_or_defer(
+    inf: &mut Inferencer<'_, '_>,
+    kernel: Option<&ArgInfo>,
+    op: &str,
+    argpos: &str,
+) -> Type {
+    match kernel {
+        Some((kn, kt, _))
+            if !matches!(
+                kt,
+                Type::Deferred
+                    | Type::Var(_)
+                    | Type::Failed(_)
+                    | Type::Any
+                    | Type::Kernel { .. }
+                    | Type::Measure { .. }
+            ) =>
+        {
+            inf.diags.push(crate::Diagnostic::error_at(
+                *kn,
+                format!(
+                    "{op}: {argpos} must be a distribution kernel — a built-in \
+                     constructor or a reified kernel (spec §07)"
+                ),
+            ));
+            Type::Failed(format!("{op}: non-kernel argument").into())
+        }
+        _ => Type::Deferred,
+    }
+}
+
+/// The variate domain of the measure `kernel(kernel_input)` would produce, for a
+/// kernel given as a bare distribution constructor — a base built-in (§08) or a §09
+/// module member (`hepphys.Argus`). The `distribution_domain` pattern, but the name
+/// comes from the `kernel` argument node and the length params come from the
+/// `kernel_input` record (not call args). `None` when the kernel is not a (base or
+/// module) distribution constructor.
+fn kernel_variate(
+    inf: &mut Inferencer<'_, '_>,
+    kernel_node: NodeId,
+    kernel_input_node: Option<NodeId>,
+) -> Option<Type> {
+    use crate::catalogue::{LowerCtx, Sig, lower, no_intern};
+
+    // Lower a distribution `Sig` to its variate domain. `param_dim` reads the
+    // kernel_input RECORD's field `kwarg` (vs `distribution_domain`'s call args);
+    // scalar / matrix dists never call it, shaped dists (`MvNormal`/…) do.
+    let lower_dist = |inf: &mut Inferencer<'_, '_>, sig: &Sig| -> Option<Type> {
+        let pd = |kwarg: &str| record_field_dim(inf, kernel_input_node, kwarg);
+        let ctx = LowerCtx {
+            param_dim: &pd,
+            arg_scalar: &|_| None,
+            arg_dim: &|_| Dim::Dynamic,
+            arg_type: &|_| None,
+            intern: &no_intern,
+        };
+        match lower(sig, &ctx).0 {
+            Type::Measure { domain, .. } => Some(*domain),
+            _ => None,
+        }
+    };
+
+    // §09 module member (e.g. `hepphys.Argus`): the stashed catalogue ref carries the
+    // Sig (alias→module resolved at ref-resolution time, as `catalogue_call_type` reads
+    // it). Clone the Sig to drop the borrow before the `&mut inf` lower. A module ref
+    // that isn't a distribution is not a kernel — `None`, not a fall-through to base.
+    if let Some(sig) = inf.module_catalogue_ref(kernel_node).map(|c| c.sig.clone()) {
+        return match sig {
+            Sig::Distribution { .. } => lower_dist(inf, &sig),
+            _ => None,
+        };
+    }
+
+    // Base built-in constructor: the kernel node is a builtin head (or a bare const).
+    let name = match inf.module.node(kernel_node) {
+        Node::Call(c) => match c.head {
+            CallHead::Builtin(op) => inf.module.resolve(op).to_string(),
+            _ => return None,
+        },
+        Node::Const(sym) => inf.module.resolve(*sym).to_string(),
+        _ => return None,
+    };
+    let sig = crate::catalogue::builtin().base(&name)?;
+    let Sig::Distribution { .. } = sig else {
+        return None;
+    };
+    lower_dist(inf, sig)
+}
+
+/// Leading array dim of the kernel_input record's `kwarg` field, for shaped dists
+/// (`MvNormal` `mu`, `Dirichlet` `alpha`, `Multinomial` `p`). The kernel_input is a
+/// `record(...)` call whose fields are its `named` args (`NamedKind::Field`); read the
+/// named field's value type. `Dim::Dynamic` if the input is absent / not a record /
+/// lacks the field / the field is not an array — the honest under-approximation (matrix
+/// dists never call this; a not-yet-inferred field also yields `Dynamic`).
+fn record_field_dim(inf: &Inferencer<'_, '_>, rec: Option<NodeId>, kwarg: &str) -> Dim {
+    let Some(rec) = rec else { return Dim::Dynamic };
+    let Node::Call(c) = inf.module.node(rec) else {
+        return Dim::Dynamic;
+    };
+    if !matches!(c.head, CallHead::Builtin(op) if inf.module.resolve(op) == "record") {
+        return Dim::Dynamic;
+    }
+    for na in c.named.iter() {
+        if inf.module.resolve(na.name) == kwarg {
+            return match inf.lookup_type(na.value) {
+                Some(Type::Array { shape, .. }) => shape.first().copied().unwrap_or(Dim::Dynamic),
+                _ => Dim::Dynamic,
+            };
+        }
+    }
+    Dim::Dynamic
 }
 
 /// A dummy `SupportTag::Structural` check helper so `distribution_support` can
