@@ -323,3 +323,27 @@ fn record_from_table_splats() {
         "record(table) should build a record of column vectors; got:\n{out}"
     );
 }
+
+// ── the single cat shape rule (cat / cartprod / joint share cat_shape) ───────
+
+/// The `cat` op routes through the shared `cat_shape` rule: records merge into
+/// one record (previously deferred), static-length vectors concatenate to a
+/// static total, and mixing shape classes is the §07 static error.
+#[test]
+fn cat_op_uses_the_shared_shape_rule() {
+    let out = ir("x = cat(record(a = 1.0), record(b = 2))");
+    assert!(
+        out.contains("(%bind x (%meta ((%record (a (%scalar real)) (b (%scalar integer)))"),
+        "cat of records should merge into one record; got:\n{out}"
+    );
+    let out = ir("x = cat([1.0, 2.0], [3.0, 4.0, 5.0])");
+    assert!(
+        out.contains("(%bind x (%meta ((%array 1 (5) (%scalar real))"),
+        "cat of a 2-vector and a 3-vector should be a static 5-vector; got:\n{out}"
+    );
+    let errs = errors("x = cat(1.0, [2.0, 3.0])");
+    assert!(
+        errs.iter().any(|m| m.contains("shape class")),
+        "cat of a scalar and a vector must be a static error; got: {errs:?}"
+    );
+}

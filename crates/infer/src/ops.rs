@@ -302,17 +302,15 @@ pub(crate) fn call_rule(
             }
             _ => Type::Deferred,
         },
-        // cat(x, y, …) concatenates values of the same structural kind: scalars
-        // → a rank-1 vector of that kind; arrays → the same rank/element as the
-        // first argument (one axis grows, so sizes are dynamic).
-        "cat" => match arg_ty(args, 0) {
-            Some(Type::Scalar(s)) => Type::Array {
-                shape: Box::new([Dim::Dynamic]),
-                elem: Box::new(Type::Scalar(*s)),
-            },
-            Some(t @ Type::Array { .. }) => with_dynamic_dims(t),
-            _ => Type::Deferred,
-        },
+        // `cat(x, y, …)` concatenates same-shape-class values (spec §07): all
+        // scalars → a length-n vector, all 1-D vectors → one concatenated
+        // vector, all records → a merged record. The single `cat` shape rule —
+        // shared with positional `cartprod` / `joint`; mixing shape classes is a
+        // static error.
+        "cat" => {
+            let parts: Vec<Type> = args.iter().map(|(_, t, _)| t.clone()).collect();
+            cat_or_diagnose(inf, id, "cat", &parts)
+        }
 
         // ---- parameters / inputs (spec §04) ----
         "elementof" | "external" => set_element_type(inf, args.first().map(|a| a.0)),
@@ -468,31 +466,7 @@ pub(crate) fn call_rule(
                 .map(|(_, t, _)| t)
                 .find(|t| matches!(t, Type::Measure { .. })),
         ),
-        "joint" => {
-            // Positional `joint` cats the component variates; mixing shape
-            // classes (e.g. a scalar with a vector measure) is a static error
-            // (spec §06), not a silently-deferred domain. Only fire when every
-            // component is a fully-resolved measure (else defer quietly).
-            if named.is_empty() {
-                let domains: Option<Vec<Type>> = args
-                    .iter()
-                    .map(|(_, t, _)| match t {
-                        Type::Measure { domain, .. } => Some((**domain).clone()),
-                        _ => None,
-                    })
-                    .collect();
-                if let Some(domains) = domains {
-                    if cat_is_mixed(&domains) {
-                        inf.diags.push(crate::Diagnostic::error_at(
-                            id,
-                            "joint components must share a shape class (spec §06): mixing \
-                             scalars, vectors, and records is a static error",
-                        ));
-                    }
-                }
-            }
-            joint_type(args, named)
-        }
+        "joint" => joint_type(inf, id, args, named),
         "likelihoodof" => likelihood_type(inf, args),
         "joint_likelihood" => joint_likelihood_type(args),
 
@@ -1140,18 +1114,11 @@ fn set_element_type(inf: &mut Inferencer<'_, '_>, node: Option<NodeId>) -> Type 
                             .iter()
                             .map(|&a| set_element_type(inf, Some(a)))
                             .collect();
-                        // Mixing shape classes (a scalar set with a vector set)
-                        // is a static error — §03 cartprod mirrors §06 joint, and
-                        // §07 `cat` forbids that concatenation.
-                        if cat_is_mixed(&parts) {
-                            inf.diags.push(crate::Diagnostic::error_at(
-                                node,
-                                "cartprod components must share a shape class (spec §03, \
-                                 mirroring §06 `joint`): mixing scalars and vectors is a \
-                                 static error",
-                            ));
-                        }
-                        cat_compose(&parts)
+                        // A member is the `cat` of one element per component
+                        // (the same shape rule as `joint` variates); mixing
+                        // shape classes is a static error (§03 cartprod mirrors
+                        // §06 joint; §07 `cat` forbids scalar+vector).
+                        cat_or_diagnose(inf, node, "cartprod", &parts)
                     }
                 }
                 _ => Type::Deferred,
@@ -1531,7 +1498,12 @@ fn static_dim(n: i64) -> Dim {
 
 /// `joint(a = M1, b = M2, …)` — a measure over the record of the components'
 /// domains (the positional form is deferred with the shape work).
-fn joint_type(args: &[ArgInfo], named: &[NamedInfo]) -> Type {
+fn joint_type(
+    inf: &mut Inferencer<'_, '_>,
+    id: NodeId,
+    args: &[ArgInfo],
+    named: &[NamedInfo],
+) -> Type {
     // Keyword form `joint(a = M1, b = M2, …)`: a measure over a RECORD, each
     // component variate under its name (a record-valued component nests under
     // the name, not merged — spec §06).
@@ -1549,10 +1521,9 @@ fn joint_type(args: &[ArgInfo], named: &[NamedInfo]) -> Type {
         };
     }
     // Positional form `joint(M1, M2, …)`: the variate is the `cat` of the
-    // component variates (spec §06) — same shape-class rule as positional
-    // `cartprod` and `cat`: all scalars → a vector, all vectors → a
-    // concatenated vector, all records → a merged record; a mixed shape class
-    // defers. (Not a record-per-component — that is the keyword form above.)
+    // component variates (spec §06) — the single `cat` shape rule (shared with
+    // `cat` / positional `cartprod`); mixing shape classes is a static error.
+    // (Not a record-per-component — that is the keyword form above.)
     let mut domains = Vec::with_capacity(args.len());
     for (_, t, _) in args {
         match t {
@@ -1561,7 +1532,7 @@ fn joint_type(args: &[ArgInfo], named: &[NamedInfo]) -> Type {
         }
     }
     Type::Measure {
-        domain: Box::new(cat_compose(&domains)),
+        domain: Box::new(cat_or_diagnose(inf, id, "joint", &domains)),
         mass: Mass::Deferred,
     }
 }
@@ -1778,94 +1749,32 @@ fn joint_likelihood_type(args: &[ArgInfo]) -> Type {
 ///
 /// Anything else — an empty list, a `%deferred` component, mixed shape classes, or
 /// a higher-rank array — yields `%deferred` (a sound "don't know", never a guess).
-fn cat_compose(types: &[Type]) -> Type {
-    let Some(first) = types.first() else {
-        return Type::Deferred;
-    };
-    if types.iter().any(|t| matches!(t, Type::Deferred)) {
-        return Type::Deferred;
-    }
-    match first {
-        // all scalars → a length-n vector
-        Type::Scalar(_) => {
-            let mut elem: Option<Type> = None;
-            for t in types {
-                if !matches!(t, Type::Scalar(_)) {
-                    return Type::Deferred; // mixed shape class
-                }
-                elem = Some(match elem {
-                    None => t.clone(),
-                    Some(prev) if &prev == t => prev,
-                    Some(prev) => match promote2(Some(&prev), Some(t)) {
-                        Type::Deferred => return Type::Deferred,
-                        p => p,
-                    },
-                });
-            }
-            Type::Array {
-                shape: Box::new([Dim::Static(types.len() as u32)]),
-                elem: Box::new(elem.unwrap_or(Type::Any)),
-            }
-        }
-        // all 1-D arrays → one concatenated 1-D array
-        Type::Array { shape, .. } if shape.len() == 1 => {
-            let mut total = 0u32;
-            let mut dynamic = false;
-            let mut elem: Option<Type> = None;
-            for t in types {
-                let Type::Array { shape, elem: e } = t else {
-                    return Type::Deferred; // mixed shape class
-                };
-                if shape.len() != 1 {
-                    return Type::Deferred; // higher-rank cat is not a §06 joint
-                }
-                match shape[0] {
-                    Dim::Static(n) => total += n,
-                    Dim::Dynamic => dynamic = true,
-                }
-                elem = Some(match elem {
-                    None => (**e).clone(),
-                    Some(prev) if &prev == e.as_ref() => prev,
-                    Some(prev) => match promote2(Some(&prev), Some(e.as_ref())) {
-                        Type::Deferred => return Type::Deferred,
-                        p => p,
-                    },
-                });
-            }
-            Type::Array {
-                shape: Box::new([if dynamic {
-                    Dim::Dynamic
-                } else {
-                    Dim::Static(total)
-                }]),
-                elem: Box::new(elem.unwrap_or(Type::Any)),
-            }
-        }
-        // all records → a merged record (component fields assumed distinct)
-        Type::Record(_) => {
-            let mut fields: Vec<(Symbol, Type)> = Vec::new();
-            for t in types {
-                let Type::Record(fs) = t else {
-                    return Type::Deferred; // mixed shape class
-                };
-                fields.extend(fs.iter().cloned());
-            }
-            Type::Record(fields.into())
-        }
-        _ => Type::Deferred,
-    }
+/// The outcome of a `cat`-shape composition (spec §06/§07 `cat`): the rule
+/// shared by `cat`, positional `cartprod`, positional `joint`, `joint_likelihood`
+/// obstypes, and joint variates. Returning a classification (rather than a bare
+/// `Deferred`) lets a caller distinguish a genuine *mixing-shape-classes static
+/// error* from a merely *not-yet-resolved* component — so it can raise a precise
+/// diagnostic without firing on partial inference.
+enum CatShape {
+    /// A well-formed cat type (all components share a shape class).
+    Cat(Type),
+    /// Genuinely different recognized shape classes (a static error, spec §06).
+    Mixed,
+    /// A component is deferred or an unclassifiable shape (higher-rank array,
+    /// exotic type) — defer quietly, no error.
+    Unresolved,
 }
 
-/// Do these components have GENUINELY different recognized shape classes
-/// (scalar / 1-D vector / record), with none deferred? Distinguishes a
-/// `cat_compose` deferral that is really a spec-§06 "mixing shape classes is a
-/// static error" from one that is only "a component isn't inferred yet" — so a
-/// caller (positional `cartprod` / `joint`) can raise a loud diagnostic without
-/// firing on an unresolved or unclassifiable component.
-fn cat_is_mixed(types: &[Type]) -> bool {
-    if types.len() < 2 || types.iter().any(|t| matches!(t, Type::Deferred)) {
-        return false;
+/// The single `cat` shape rule (spec §06/§07): all-scalar components → a
+/// length-n vector; all-1-D-vector components → one concatenated vector (static
+/// total, or dynamic if any input is); all-record components → a merged record.
+/// Element types are unified by `promote2`. See [`CatShape`] for the outcomes.
+fn cat_shape(types: &[Type]) -> CatShape {
+    if types.is_empty() || types.iter().any(|t| matches!(t, Type::Deferred)) {
+        return CatShape::Unresolved;
     }
+    // Classify each component: 0 = scalar, 1 = 1-D vector, 2 = record; `None` for
+    // anything else (higher-rank array, tuple, measure, …).
     let class = |t: &Type| match t {
         Type::Scalar(_) => Some(0u8),
         Type::Array { shape, .. } if shape.len() == 1 => Some(1),
@@ -1874,9 +1783,113 @@ fn cat_is_mixed(types: &[Type]) -> bool {
     };
     let classes: Vec<Option<u8>> = types.iter().map(class).collect();
     if classes.iter().any(Option::is_none) {
-        return false; // an unclassifiable component — don't fabricate a "mixed" error
+        return CatShape::Unresolved; // an unclassifiable component — defer, don't error
     }
-    classes.iter().any(|c| *c != classes[0])
+    let first = classes[0].unwrap();
+    if classes.iter().any(|c| c.unwrap() != first) {
+        return CatShape::Mixed;
+    }
+    // Unify the element type across a uniform shape class.
+    let promote_elems = |elems: &[&Type]| -> Option<Type> {
+        let mut acc: Option<Type> = None;
+        for e in elems {
+            acc = Some(match acc {
+                None => (*e).clone(),
+                Some(prev) if &prev == *e => prev,
+                Some(prev) => match promote2(Some(&prev), Some(e)) {
+                    Type::Deferred => return None, // elements don't unify
+                    p => p,
+                },
+            });
+        }
+        Some(acc.unwrap_or(Type::Any))
+    };
+    match first {
+        // all scalars → a length-n vector
+        0 => {
+            let elems: Vec<&Type> = types.iter().collect();
+            match promote_elems(&elems) {
+                Some(elem) => CatShape::Cat(Type::Array {
+                    shape: Box::new([Dim::Static(types.len() as u32)]),
+                    elem: Box::new(elem),
+                }),
+                None => CatShape::Unresolved,
+            }
+        }
+        // all 1-D vectors → one concatenated vector (static total / dynamic)
+        1 => {
+            let mut total = 0u32;
+            let mut dynamic = false;
+            let mut elems: Vec<&Type> = Vec::with_capacity(types.len());
+            for t in types {
+                let Type::Array { shape, elem } = t else {
+                    unreachable!("class 1 is a 1-D array")
+                };
+                match shape[0] {
+                    Dim::Static(n) => total += n,
+                    Dim::Dynamic => dynamic = true,
+                }
+                elems.push(elem.as_ref());
+            }
+            match promote_elems(&elems) {
+                Some(elem) => CatShape::Cat(Type::Array {
+                    shape: Box::new([if dynamic {
+                        Dim::Dynamic
+                    } else {
+                        Dim::Static(total)
+                    }]),
+                    elem: Box::new(elem),
+                }),
+                None => CatShape::Unresolved,
+            }
+        }
+        // all records → a merged record (component fields assumed distinct)
+        _ => {
+            let mut fields: Vec<(Symbol, Type)> = Vec::new();
+            for t in types {
+                let Type::Record(fs) = t else {
+                    unreachable!("class 2 is a record")
+                };
+                fields.extend(fs.iter().cloned());
+            }
+            CatShape::Cat(Type::Record(fields.into()))
+        }
+    }
+}
+
+/// The `cat` type for callers that only want the type (a deferral covers both
+/// "mixed" and "unresolved"); callers that diagnose mixing use [`cat_shape`].
+fn cat_compose(types: &[Type]) -> Type {
+    match cat_shape(types) {
+        CatShape::Cat(t) => t,
+        CatShape::Mixed | CatShape::Unresolved => Type::Deferred,
+    }
+}
+
+/// Emit the spec-§06/§07 "components must share a shape class" diagnostic at
+/// `anchor` when `types` is a genuine mixing (not a partial-inference deferral),
+/// and return the cat type. Shared by the `cat` op, positional `cartprod`, and
+/// positional `joint`.
+fn cat_or_diagnose(
+    inf: &mut Inferencer<'_, '_>,
+    anchor: NodeId,
+    what: &str,
+    types: &[Type],
+) -> Type {
+    match cat_shape(types) {
+        CatShape::Cat(t) => t,
+        CatShape::Mixed => {
+            inf.diags.push(crate::Diagnostic::error_at(
+                anchor,
+                format!(
+                    "{what} components must share a shape class (spec §06): mixing scalars, \
+                     vectors, and records is a static error"
+                ),
+            ));
+            Type::Deferred
+        }
+        CatShape::Unresolved => Type::Deferred,
+    }
 }
 
 /// Calling a user-defined callable: a function returns its body's type, a
