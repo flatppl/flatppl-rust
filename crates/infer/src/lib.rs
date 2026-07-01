@@ -21,6 +21,7 @@
 //! and `external` / loaded data / reifications *fixed*.
 
 mod catalogue;
+mod consteval;
 mod modules;
 mod ops;
 mod trace;

@@ -12,6 +12,7 @@ use flatppl_core::{
 };
 
 use crate::Level;
+use crate::consteval::{count_dims, resolve_dim, resolve_fixed_int, static_dim};
 use crate::trace::{Inferencer, join_phase};
 
 /// `(node, type, phase)` of an inferred positional argument.
@@ -269,8 +270,8 @@ pub(crate) fn call_rule(
         // counts are fixed integers: result shape = [1;nl] ++ A.shape ++ [1;nt],
         // element preserved. (e.g. A:(3,4,5), addaxes(A,2,3) → (1,1,3,4,5,1,1,1).)
         "addaxes" => {
-            let nl = args.get(1).and_then(|a| resolve_fixed_int(inf, a.0, 0));
-            let nt = args.get(2).and_then(|a| resolve_fixed_int(inf, a.0, 0));
+            let nl = args.get(1).and_then(|a| resolve_fixed_int(inf, a.0));
+            let nt = args.get(2).and_then(|a| resolve_fixed_int(inf, a.0));
             match (arg_ty(args, 0), nl, nt) {
                 (Some(Type::Array { shape, elem }), Some(nl), Some(nt)) if nl >= 0 && nt >= 0 => {
                     let mut dims: Vec<Dim> =
@@ -1350,33 +1351,6 @@ fn collect_axis_dims(
     }
 }
 
-/// The dims of an `iid` count argument: a vector literal contributes one dim
-/// per element, anything else a single dim (see [`resolve_dim`]).
-fn count_dims(inf: &mut Inferencer<'_, '_>, node: NodeId) -> Box<[Dim]> {
-    if let Node::Call(c) = inf.module.node(node)
-        && matches!(c.head, flatppl_core::CallHead::Builtin(op)
-            if inf.module.resolve(op) == "vector")
-    {
-        let elements: Vec<NodeId> = c.args.to_vec();
-        return elements.iter().map(|&a| resolve_dim(inf, a)).collect();
-    }
-    Box::new([resolve_dim(inf, node)])
-}
-
-/// A single shape dim: literal integers are static at every level; at
-/// `Level::Shape` the demand-driven fixed-integer resolver kicks in.
-fn resolve_dim(inf: &mut Inferencer<'_, '_>, node: NodeId) -> Dim {
-    if let Node::Lit(Scalar::Int(n)) = inf.module.node(node) {
-        return static_dim(*n);
-    }
-    if inf.level >= Level::Shape {
-        if let Some(n) = resolve_fixed_int(inf, node, 0) {
-            return static_dim(n);
-        }
-    }
-    Dim::Dynamic
-}
-
 /// The phase of `lawof(arg)` — the phase of the **reified law** of `arg`.
 ///
 /// `lawof` absorbs the stochasticity of `draw` ancestors into the law, so the
@@ -1428,72 +1402,6 @@ fn law_phase(inf: &mut Inferencer<'_, '_>, node: NodeId, depth: u32) -> Phase {
         Node::Lit(_) | Node::Const(_) => Phase::Fixed,
         _ => Phase::Parameterized,
     }
-}
-
-/// Demand-driven const-eval of a fixed-phase integer expression at a shape
-/// position (engine-concepts §17.1, first slice: integers only). "Resolve,
-/// don't rewrite" — the IR is read, never modified. Shape observers
-/// (`lengthof`) short-circuit off the inferred type instead of recursing
-/// into the value, so deferred-by-design computation stays deferred.
-/// `None` means not statically resolvable — a non-fixed ancestor, or a
-/// value op outside this resolver's reach (legitimately `%dynamic` for now;
-/// the op-gap-vs-dynamic distinction hardens with the full §17.1 slice).
-fn resolve_fixed_int(inf: &mut Inferencer<'_, '_>, node: NodeId, depth: u32) -> Option<i64> {
-    if depth > 64 {
-        return None;
-    }
-    match inf.module.node(node).clone() {
-        Node::Lit(Scalar::Int(n)) => Some(n),
-        Node::Ref(r) if r.ns == flatppl_core::RefNs::SelfMod => {
-            let binding = inf.module.binding_by_name(r.name)?;
-            let rhs = inf.module.binding(binding).rhs;
-            let (_, phase) = inf.infer_node(rhs);
-            if phase == Phase::Fixed {
-                resolve_fixed_int(inf, rhs, depth + 1)
-            } else {
-                None
-            }
-        }
-        Node::Call(c) => {
-            let flatppl_core::CallHead::Builtin(op) = c.head else {
-                return None;
-            };
-            let name = inf.module.resolve(op).to_string();
-            match name.as_str() {
-                // Shape observer: read the inferred dim, never the value.
-                "lengthof" | "length" => {
-                    let arg = *c.args.first()?;
-                    match inf.infer_node(arg).0 {
-                        Type::Array { shape, .. } if shape.len() == 1 => match shape[0] {
-                            Dim::Static(n) => Some(i64::from(n)),
-                            Dim::Dynamic => None,
-                        },
-                        Type::TVector {
-                            len: Dim::Static(n),
-                            ..
-                        } => Some(i64::from(n)),
-                        _ => None,
-                    }
-                }
-                "add" | "sub" | "mul" => {
-                    let a = resolve_fixed_int(inf, *c.args.first()?, depth + 1)?;
-                    let b = resolve_fixed_int(inf, *c.args.get(1)?, depth + 1)?;
-                    match name.as_str() {
-                        "add" => a.checked_add(b),
-                        "sub" => a.checked_sub(b),
-                        _ => a.checked_mul(b),
-                    }
-                }
-                "neg" => resolve_fixed_int(inf, *c.args.first()?, depth + 1).map(|n| -n),
-                _ => None,
-            }
-        }
-        _ => None,
-    }
-}
-
-fn static_dim(n: i64) -> Dim {
-    u32::try_from(n).map(Dim::Static).unwrap_or(Dim::Dynamic)
 }
 
 /// `joint(a = M1, b = M2, …)` — a measure over the record of the components'
