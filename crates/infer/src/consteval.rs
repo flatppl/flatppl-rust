@@ -160,6 +160,11 @@ fn eval_call(inf: &mut Inferencer<'_, '_>, node: NodeId, c: &Call, depth: u32) -
         op @ ("prod" | "sum") => reduce(inf, c, depth, op),
         "get" => index(inf, c, depth, 1),
         "get0" => index(inf, c, depth, 0),
+        "vector" => match eval_all(inf, &c.args, depth) {
+            Ok(vs) => ConstEval::Val(FixedValue::Vec(vs)),
+            Err(e) => e,
+        },
+        "cat" => cat_value(inf, c, depth),
 
         // Fixed-phase but runtime-determined value sources: known `%dynamic`,
         // never a gap (`external`/`load_data` are compile-time-unknown; the
@@ -294,6 +299,30 @@ fn index(inf: &mut Inferencer<'_, '_>, c: &Call, depth: u32, base: i64) -> Const
     }
 }
 
+/// Value-level `cat` (spec §07): all scalars → a vector of them, all vectors →
+/// their concatenation. A scalar/vector mix is not permitted (§07) and stays
+/// `Dynamic` (a type error handled elsewhere).
+fn cat_value(inf: &mut Inferencer<'_, '_>, c: &Call, depth: u32) -> ConstEval {
+    let parts = match eval_all(inf, &c.args, depth) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    if parts.iter().all(|p| matches!(p, FixedValue::Int(_))) {
+        ConstEval::Val(FixedValue::Vec(parts))
+    } else if parts.iter().all(|p| matches!(p, FixedValue::Vec(_))) {
+        let concatenated = parts
+            .into_iter()
+            .flat_map(|p| match p {
+                FixedValue::Vec(v) => v,
+                FixedValue::Int(_) => Vec::new(), // unreachable (guarded above)
+            })
+            .collect();
+        ConstEval::Val(FixedValue::Vec(concatenated))
+    } else {
+        ConstEval::Dynamic
+    }
+}
+
 /// `lengthof(x)` — the single dim of a rank-1 array / transposed vector, or a
 /// table's row count. Reads the inferred TYPE (never the value).
 fn length_observer(inf: &mut Inferencer<'_, '_>, c: &Call) -> ConstEval {
@@ -397,16 +426,6 @@ pub(crate) fn count_dims(inf: &mut Inferencer<'_, '_>, node: NodeId) -> Box<[Dim
         }
     }
     Box::new([Dim::Dynamic])
-}
-
-/// Demand-driven fixed integer, for callers that want an `Option<i64>` and do
-/// their own fallback (`addaxes` axis counts). No diagnostic — the shape-dim
-/// entry points ([`resolve_dim`] / [`count_dims`]) own the op-gap report.
-pub(crate) fn resolve_fixed_int(inf: &mut Inferencer<'_, '_>, node: NodeId) -> Option<i64> {
-    match const_eval(inf, node, 0) {
-        ConstEval::Val(FixedValue::Int(n)) => Some(n),
-        _ => None,
-    }
 }
 
 fn fixed_to_dim(v: &FixedValue) -> Dim {

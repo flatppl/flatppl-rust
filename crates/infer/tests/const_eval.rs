@@ -108,6 +108,40 @@ fn get_indexes_a_fixed_shape_vector() {
     );
 }
 
+/// Value-level `cat` folds a fixed shape vector (spec §07): concatenating fixed
+/// vectors (`cat([2], [5])`) or scalars (`cat(2, 5)`) both yield the shape
+/// `[2, 5]` → a 2×5 array. (Exercises nested `vector` const-eval too.)
+#[test]
+fn cat_folds_a_fixed_shape_vector() {
+    let out = ir_at("z = zeros(cat([2], [5]))", Level::Shape);
+    assert!(
+        out.contains("(%array 2 (2 5) (%scalar real))"),
+        "zeros(cat([2], [5])) should be a 2x5 real matrix, got:\n{out}"
+    );
+    let out = ir_at("z = zeros(cat(2, 5))", Level::Shape);
+    assert!(
+        out.contains("(%array 2 (2 5) (%scalar real))"),
+        "zeros(cat(2, 5)) should be a 2x5 real matrix, got:\n{out}"
+    );
+}
+
+/// The op-gap doctrine applies at EVERY shape-demand site, not just `iid`/
+/// `zeros`: a gapped `addaxes` axis count reports loudly instead of silently
+/// deferring. `max` is unfolded, so `addaxes(v, max(1, 0), 0)` must diagnose.
+#[test]
+fn addaxes_gap_count_is_a_loud_diagnostic() {
+    let ds = diags_at(
+        "v = [1.0, 2.0, 3.0]\nx = addaxes(v, max(1, 0), 0)",
+        Level::Shape,
+    );
+    assert!(
+        ds.iter()
+            .any(|d| d.message.contains("max") && d.message.contains("shape")),
+        "a gapped addaxes count should emit a loud diagnostic, got: {:?}",
+        ds.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
 /// A genuinely-unknowable size stays `%dynamic` with NO diagnostic — the
 /// op-gap error must not fire for a parameterized (non-fixed) ancestor. This is
 /// the other side of the §17.1 boundary: `%dynamic` is legitimate here.

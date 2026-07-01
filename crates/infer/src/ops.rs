@@ -12,7 +12,7 @@ use flatppl_core::{
 };
 
 use crate::Level;
-use crate::consteval::{count_dims, resolve_dim, resolve_fixed_int, static_dim};
+use crate::consteval::{count_dims, resolve_dim, static_dim};
 use crate::trace::{Inferencer, join_phase};
 
 /// `(node, type, phase)` of an inferred positional argument.
@@ -270,10 +270,17 @@ pub(crate) fn call_rule(
         // counts are fixed integers: result shape = [1;nl] ++ A.shape ++ [1;nt],
         // element preserved. (e.g. A:(3,4,5), addaxes(A,2,3) → (1,1,3,4,5,1,1,1).)
         "addaxes" => {
-            let nl = args.get(1).and_then(|a| resolve_fixed_int(inf, a.0));
-            let nt = args.get(2).and_then(|a| resolve_fixed_int(inf, a.0));
+            // The counts are non-negative fixed integers; `resolve_dim` folds
+            // them (a `Static(n)` is ≥ 0 by construction) AND emits the loud
+            // op-gap diagnostic if a count uses an unfoldable fixed op (§17.1).
+            let nl = args.get(1).map(|a| resolve_dim(inf, a.0));
+            let nt = args.get(2).map(|a| resolve_dim(inf, a.0));
             match (arg_ty(args, 0), nl, nt) {
-                (Some(Type::Array { shape, elem }), Some(nl), Some(nt)) if nl >= 0 && nt >= 0 => {
+                (
+                    Some(Type::Array { shape, elem }),
+                    Some(Dim::Static(nl)),
+                    Some(Dim::Static(nt)),
+                ) => {
                     let mut dims: Vec<Dim> =
                         std::iter::repeat_n(static_dim(1), nl as usize).collect();
                     dims.extend_from_slice(shape);
