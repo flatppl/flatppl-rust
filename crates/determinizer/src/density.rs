@@ -25,8 +25,12 @@
 //!   log space, so no outer `log`).
 //! - `superpose(M₁, …, Mₖ)` → `logsumexp(density(M₁, v), …, density(Mₖ, v))`
 //! - `normalize(M)` → `density(M, v)` when `M` is already a probability measure
-//!   (closed-form `logZ = 0`); **refuses** otherwise (no closed-form mass rule;
-//!   `totalmass` is OUT of FlatPDL).
+//!   (closed-form `logZ = 0`); when `M = truncate(base, interval(lo, hi))` with
+//!   `base` a primitive univariate constructor, → `sub(density(M, v),
+//!   log(sub(touniform(base, hi), touniform(base, lo))))` — the closed-form
+//!   `Z = CDF(hi) - CDF(lo)` via the `builtin_touniform` CDF transport
+//!   (§6a:179, §06:471); **refuses** for any other unnormalized `M` (no
+//!   closed-form mass rule; `totalmass` is OUT of FlatPDL).
 //! - `truncate(M, S)` → `ifelse(in(v, S), density(M, v), neg(inf))` (the `_ in R`
 //!   membership builtin, which infers to a boolean — `elementof` is a set-valued
 //!   parameter declaration, not a membership predicate).
@@ -427,13 +431,20 @@ fn lower_superpose(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Re
 /// `Z = totalmass(M)` must be a **closed-form** deterministic expression — never
 /// the `totalmass` query op, which is OUT of FlatPDL (measures are not values).
 ///
-/// The only mass rule available in this MVP: if `M` is already a probability
-/// measure (`Type::Measure { mass: Mass::Normalized, .. }`) then `Z = 1`,
-/// `logZ = 0`, so `normalize(M)` is the identity on the density — it lowers to
-/// just `logdensityof(M, v)`. Any unnormalized `M` (`Finite`, `LocallyFinite`,
-/// …) has no closed-form mass rule here, so we **refuse** rather than emit
-/// `totalmass`. (Truncation / mixture closed-form `logZ` are acceptable later
-/// follow-ons; for now they refuse.)
+/// Two closed-form mass rules are available:
+/// * If `M` is already a probability measure (`Type::Measure { mass:
+///   Mass::Normalized, .. }`) then `Z = 1`, `logZ = 0`, so `normalize(M)` is
+///   the identity on the density — it lowers to just `logdensityof(M, v)`.
+/// * If `M` is `truncate(base, interval(lo, hi))` with `base` a primitive
+///   univariate constructor, `Z = CDF(hi) - CDF(lo)` via the `builtin_touniform`
+///   CDF transport (§6a:179, §06:471): `logZ = log(touniform(base, hi) -
+///   touniform(base, lo))`. The `-inf` outside-support gate is already handled
+///   by the existing `truncate` lowering, so the emitted density term is just
+///   `lower_measure_density(m, m_inner, v)` minus this `logZ`.
+///
+/// Any other unnormalized `M` (`Finite`, `LocallyFinite`, a non-truncate
+/// combinator, …) has no closed-form mass rule here, so we **refuse** rather
+/// than emit `totalmass` (refuse-don't-mislower).
 fn lower_normalize(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseError> {
     let m_inner = {
         let c = expect_builtin_call(m, node, "normalize")
@@ -453,18 +464,90 @@ fn lower_normalize(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Re
         _ => None,
     };
 
-    match inner_mass {
+    if inner_mass == Some(Mass::Normalized) {
         // Probability measure: Z = 1, logZ = 0. `normalize(M)` ≡ density(M, v).
-        Some(Mass::Normalized) => lower_measure_density(m, m_inner, v),
-        // No closed-form mass rule for an unnormalized measure in this MVP.
-        _ => Err(RefuseError {
-            node,
-            construct: "normalize".to_string(),
-            reason: "normalize of an unnormalized measure needs a closed-form mass rule; \
-                     `totalmass` is not FlatPDL"
-                .to_string(),
-        }),
+        return lower_measure_density(m, m_inner, v);
     }
+
+    // Closed-form Z for a truncated univariate measure: Z = CDF(hi) − CDF(lo),
+    // via the builtin_touniform (CDF) transport (§6a:179). Extract the
+    // truncate/interval shape and its endpoints BEFORE any mutable builds
+    // below (immutable reads of `m` must precede `m.alloc`/`build_*` calls).
+    let truncate_shape: Option<(NodeId, NodeId, NodeId)> = {
+        if let Some(tc) = expect_builtin_call(m, m_inner_resolved, "truncate") {
+            if tc.args.len() == 2 {
+                let (base, set) = (tc.args[0], tc.args[1]);
+                if let Some(ic) = expect_builtin_call(m, set, "interval") {
+                    if ic.args.len() == 2 {
+                        Some((base, ic.args[0], ic.args[1]))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+
+    if let Some((base, lo, hi)) = truncate_shape {
+        let density = lower_measure_density(m, m_inner, v)?; // truncate handles the -inf gate
+        let (kernel, input) = kernel_and_input(m, base)?; // helper below
+        let cdf_hi = build_touniform(m, kernel, input, hi);
+        let cdf_lo = build_touniform(m, kernel, input, lo);
+        let z = build_call(m, "sub", &[cdf_hi, cdf_lo]);
+        let log_z = build_call(m, "log", &[z]);
+        return Ok(build_call(m, "sub", &[density, log_z]));
+    }
+
+    // No closed-form mass rule for an unnormalized measure in this MVP.
+    Err(RefuseError {
+        node,
+        construct: "normalize".to_string(),
+        reason: "normalize of an unnormalized measure needs a closed-form mass rule; \
+                 `totalmass` is not FlatPDL"
+            .to_string(),
+    })
+}
+
+/// Extract `(kernel_const, kernel_input_record)` from a primitive constructor
+/// `Normal(mu = …, sigma = …)` — the `builtin_*` primitive's arg 0/1 shape.
+/// Resolves one level of `(%ref self x)` indirection first, so a truncation
+/// base bound by name (`g = Normal(...); truncate(g, ...)`) is classified by
+/// its constructor.
+fn kernel_and_input(m: &mut Module, ctor: NodeId) -> Result<(NodeId, NodeId), RefuseError> {
+    let (ctor_resolved, _) = resolve_ref_one(m, ctor);
+    let (ctor_sym, kwargs): (Symbol, Vec<(Symbol, NodeId)>) = {
+        let Node::Call(c) = m.node(ctor_resolved) else {
+            return Err(refuse(
+                ctor_resolved,
+                m,
+                "truncation base must be a primitive constructor",
+            ));
+        };
+        let CallHead::Builtin(sym) = c.head else {
+            return Err(refuse(ctor_resolved, m, "non-builtin truncation base"));
+        };
+        (sym, c.named.iter().map(|n| (n.name, n.value)).collect())
+    };
+    let kernel = m.alloc(Node::Const(ctor_sym));
+    let input = build_record(m, &kwargs);
+    Ok((kernel, input))
+}
+
+/// `builtin_touniform(kernel, kernel_input, x)` — the CDF transport (§07).
+fn build_touniform(m: &mut Module, kernel: NodeId, input: NodeId, x: NodeId) -> NodeId {
+    let sym = m.intern("builtin_touniform");
+    m.alloc(Node::Call(Call {
+        head: CallHead::Builtin(sym),
+        args: vec![kernel, input, x].into(),
+        named: Vec::<NamedArg>::new().into(),
+        inputs: None,
+    }))
 }
 
 /// `logdensityof(truncate(M, S), v)` = `ifelse(in(v, S), logdensityof(M, v), neg(inf))`.

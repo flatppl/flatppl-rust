@@ -236,6 +236,32 @@ lp = logdensityof(d, 0.5)";
 }
 
 #[test]
+fn normalize_truncated_normal_oracle() {
+    // normalize(truncate(Normal(0,1), interval(-1,1))) scored at 0.5:
+    //   = logN(0.5;0,1) - log(Φ(1) - Φ(-1))
+    // Φ(1)-Φ(-1) = 0.6826894921370859
+    let z = 0.6826894921370859_f64;
+    let oracle = gaussian_logpdf(0.5, 0.0, 1.0) - z.ln();
+    let src = "\
+g = Normal(mu = 0.0, sigma = 1.0)
+d = normalize(truncate(g, interval(-1.0, 1.0)))
+lp = logdensityof(d, 0.5)";
+    let m = parse_infer(src);
+    let out = determinize(&m).expect("normalize(truncate) must lower");
+    assert!(flatppl_determinizer::is_flatpdl(&out).is_ok());
+    let pir = flatppl_flatpir::write(&out);
+    assert!(
+        pir.contains("builtin_touniform"),
+        "closed-form Z via touniform:\n{pir}"
+    );
+    assert!(
+        !pir.contains("(normalize ") && !pir.contains("totalmass"),
+        "no normalize/totalmass:\n{pir}"
+    );
+    assert!(oracle.is_finite());
+}
+
+#[test]
 fn likelihoodof_gaussian_oracle() {
     // obs = likelihoodof(iid(Normal(mu,sigma), 1), [1.27])
     // logdensityof(obs, record(mu=0, sigma=1)) = log N(1.27; 0, 1)
