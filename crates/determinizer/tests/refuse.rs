@@ -117,8 +117,9 @@ lp = logdensityof(d, [0.5, -0.3, 1.2])";
 // Z = touniform(base, hi) − touniform(base, lo) = CDF(hi) − CDF(lo). That
 // identity holds ONLY when `base` is a normalized univariate continuous
 // probability measure — `builtin_touniform` is the CDF only for univariate
-// continuous kernels (`07-functions.md:831`), and the transport is defined only
-// for continuous kernels (`07-functions.md:838`). For an UNNORMALIZED base
+// continuous kernels (§07 "measure-eval-prims"), and the transport is defined
+// only for continuous built-in kernels (§07 "measure-eval-prims"). For an
+// UNNORMALIZED base
 // (here `Lebesgue(reals)`, whose true
 // Z = hi − lo and for which `touniform` is undefined) the CDF path silently
 // mislowers, so the determiniser must NOT take it — it falls through to the
@@ -136,6 +137,47 @@ lp = logdensityof(d, 0.5)";
     assert!(
         err.construct.contains("normalize") || err.reason.contains("unnormalized"),
         "refusal is about the unnormalized-base normalize, not the CDF path: {err:?}"
+    );
+}
+
+// `normalize(truncate(Binomial, interval(lo, hi)))` — the base is NORMALIZED
+// (a probability measure) but DISCRETE (`domain = Scalar(Integer)`). The CDF-Z
+// path `Z = touniform(base, hi) − touniform(base, lo)` is NOT valid here:
+// `builtin_touniform` is the CDF `F` only for a univariate CONTINUOUS kernel
+// (§07 "measure-eval-prims"), and use of the transport on a non-continuous kernel
+// is an undefined transport / static error — plus `Z = F(hi) − F(lo)` is a
+// univariate-continuous identity regardless. The OLD gate keyed only on
+// `base.mass == Normalized`, so it WRONGLY admitted this discrete base and
+// emitted `builtin_touniform(Binomial, …)` — an undefined transport that still
+// passes `is_flatpdl` (a silent mislowering). The tightened gate additionally
+// requires `domain = Scalar(Real)`, so a normalized discrete base now refuses.
+// This refuse is DISTINCT from the unnormalized-base one (a discrete-truncation
+// closed-form Z — e.g. a CMF / finite-support sum — is a legitimate future
+// follow-on, not an invalid model), so it names the univariate-continuous
+// restriction rather than "unnormalized".
+#[test]
+fn normalize_truncate_discrete_base_refuses() {
+    let src = "\
+d = normalize(truncate(Binomial(n = 10, p = 0.5), interval(2, 8)))
+lp = logdensityof(d, 5)";
+    let m = parse_infer(src);
+    let err = determinize(&m).expect_err(
+        "normalize(truncate(<normalized discrete base>, …)) must refuse (touniform is CDF only \
+         for univariate continuous), not emit an undefined builtin_touniform transport",
+    );
+    assert!(
+        err.construct.contains("normalize"),
+        "refusal names normalize: {err:?}"
+    );
+    // Distinct from the unnormalized-base refuse: it names the univariate-continuous
+    // restriction (touniform = CDF only there), not "unnormalized".
+    assert!(
+        err.reason.contains("univariate continuous") && err.reason.contains("touniform"),
+        "refusal explains the univariate-continuous-only touniform restriction: {err:?}"
+    );
+    assert!(
+        !err.reason.contains("unnormalized"),
+        "discrete base is normalized — refusal must NOT claim it is unnormalized: {err:?}"
     );
 }
 
@@ -161,5 +203,23 @@ lp = logdensityof(mc, record(z = 1.0))";
     assert!(
         err.reason.contains("not implemented") && err.reason.contains("deferred"),
         "refusal reason explains markovchain density lowering is deferred: {err:?}"
+    );
+}
+
+// `iid(M, [2, 3])` — a MULTI-AXIS (vector) `size`. §06 "Independent composition"
+// admits `size` as "an integer (1-D length) or a vector of positive integers
+// (multi-axis shape)", so this is a VALID model. But the determiniser's O(N)
+// static unroll (`literal_usize` + `lower_iid`) reads only a literal SCALAR
+// integer `N`; the vectorized broadcast+reduce over a multi-axis shape is the
+// noted scale path, not built. So a vector `size` is a CONSERVATIVE refuse
+// (refuse-don't-mislower), not a bug — this pins that behavior.
+#[test]
+fn iid_multi_axis_size_refuses() {
+    let src = "\
+d = iid(Normal(mu = 0.0, sigma = 1.0), [2, 3])
+lp = logdensityof(d, [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]])";
+    let m = parse_infer(src);
+    determinize(&m).expect_err(
+        "iid with a multi-axis / vector size must refuse (only a literal scalar N is unrolled)",
     );
 }

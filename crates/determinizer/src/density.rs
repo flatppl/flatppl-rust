@@ -27,23 +27,27 @@
 //! - `superpose(M₁, …, Mₖ)` → `logsumexp(density(M₁, v), …, density(Mₖ, v))`
 //! - `normalize(M)` → `density(M, v)` when `M` is already a probability measure
 //!   (closed-form `logZ = 0`); when `M = truncate(base, interval(lo, hi))` with
-//!   `base` a **normalized** univariate constructor, → `sub(density(M, v),
+//!   `base` a **normalized univariate continuous** constructor, → `sub(density(M, v),
 //!   log(sub(touniform(base, hi), touniform(base, lo))))` — the closed-form
 //!   `Z = CDF(hi) - CDF(lo)` via the `builtin_touniform` CDF transport
-//!   (`builtin_touniform` is the CDF `F` for univariate continuous kernels,
-//!   `07-functions.md:831`; valid only for a normalized base — the transport
-//!   is defined only for continuous kernels, `07-functions.md:838`);
-//!   **refuses** for any
-//!   other unnormalized `M` — including a `truncate` whose `base` is itself
-//!   unnormalized (e.g. `Lebesgue`), where the CDF-Z identity does not hold
-//!   (no closed-form mass rule; `totalmass` is OUT of FlatPDL).
+//!   (`builtin_touniform` is the CDF `F` only for univariate continuous kernels,
+//!   §07 "measure-eval-prims"; valid only for a univariate-continuous-normalized
+//!   base — the transport is defined only for continuous built-in kernels and use
+//!   of an undefined transport is a static error, §07 "measure-eval-prims");
+//!   **refuses** for any other `M` — a `truncate` whose `base` is unnormalized
+//!   (e.g. `Lebesgue`, where the CDF-Z identity does not hold), or normalized but
+//!   discrete (`Binomial`/`Poisson`/`Categorical`) or multivariate (`MvNormal`),
+//!   for which `touniform` is undefined (no closed-form mass rule; `totalmass` is
+//!   OUT of FlatPDL).
 //! - `truncate(M, S)` → `ifelse(in(v, S), density(M, v), neg(inf))` (the `_ in R`
 //!   membership builtin, which infers to a boolean — `elementof` is a set-valued
 //!   parameter declaration, not a membership predicate).
 //! - `pushfwd(bijection(f, f_inv, logvol), M)` → `sub(density(M, f_inv(v)), logvol(f_inv(v)))`
 //! - `iid(M, N)` → `Σ_{i<N} density(M, get0(v, i))` — **`N` must be a literal
-//!   integer** (static unroll; corpus `N` is small). A non-literal `N` is
-//!   **refused**.
+//!   SCALAR integer** (static unroll; corpus `N` is small). A non-literal `N`,
+//!   or a multi-axis / vector `size` (e.g. `iid(M, [2, 3])` — a valid §06 shape),
+//!   is **refused** (the O(N) unroll handles only 1-D literal `N`; the vectorized
+//!   broadcast+reduce over a multi-axis shape is the noted scale path, not built).
 //! - `joint(M₁,…,Mₖ)` (**positional only**) → `Σᵢ density(Mᵢ, get0(v, i))` —
 //!   **scalar-variate components only**; a component whose measure domain is
 //!   non-scalar (e.g. `iid(Normal, 2)`) is **refused up front** by inspecting
@@ -61,20 +65,23 @@
 //! inlined into THIS query's density subtree only — a per-query substitution of
 //! `(%ref self <name>)` for the θ value (never a mutation of the shared module
 //! binding, so two likelihood queries over the same params keep distinct θ
-//! points) — §06:492 `densityof(likelihoodof(K, obs), θ) = pdf(κ(θ), obs)`.
+//! points) — §06 "Likelihood construction":
+//! `densityof(likelihoodof(K, obs), θ) = pdf(κ(θ), obs)`.
 //!
 //! **Refused:** `kchain` marginals, keyword `joint`, `bayesupdate`, `disintegrate`,
 //! `restrict`, `pushfwd` with a non-bijection argument, `iid` with a non-literal
-//! size, `joint` with a non-scalar component (refused up front on the component's
-//! measure-domain kind), `normalize(truncate(base, …))` whose `base` is not a
-//! normalized measure, and any unrecognised shape.
+//! or multi-axis / vector size, `joint` with a non-scalar component (refused up
+//! front on the component's measure-domain kind), `normalize(truncate(base, …))`
+//! whose `base` is not a univariate-continuous-normalized measure (an unnormalized
+//! base, or a normalized-but-discrete/multivariate base — each with its own refuse
+//! message), and any unrecognised shape.
 //! (`likelihoodof` reaching `lower_measure_density` still refuses there as a
 //! safety net — it is normally unwrapped at the `logdensityof` entry above.)
 
 use crate::refuse::RefuseError;
 use flatppl_core::{
     BindingId, Call, CallHead, Mass, Module, NamedArg, NamedKind, Node, NodeId, Ref, RefNs, Scalar,
-    Symbol, Type,
+    ScalarType, Symbol, Type,
 };
 
 // ---------------------------------------------------------------------------
@@ -113,7 +120,8 @@ fn is_likelihood(m: &Module, id: NodeId) -> bool {
 }
 
 /// `logdensityof(likelihoodof(K, obs), θ)` = density of `K` at the observed `obs`,
-/// with `K`'s free parameters bound from the θ record (§06:492, audit H2).
+/// with `K`'s free parameters bound from the θ record (§06 "Likelihood
+/// construction", audit H2).
 ///
 /// Each θ field value is inlined into THIS query's emitted density subtree only
 /// (a self-contained per-query substitution keyed on `(%ref self <name>)` — see
@@ -537,19 +545,28 @@ fn lower_superpose(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Re
 /// * If `M` is already a probability measure (`Type::Measure { mass:
 ///   Mass::Normalized, .. }`) then `Z = 1`, `logZ = 0`, so `normalize(M)` is
 ///   the identity on the density — it lowers to just `logdensityof(M, v)`.
-/// * If `M` is `truncate(base, interval(lo, hi))` with `base` a **normalized**
-///   univariate continuous probability measure (a primitive constructor such as
-///   `Normal`), `Z = CDF(hi) - CDF(lo)` via the `builtin_touniform` CDF transport
-///   (§06:471): `logZ = log(touniform(base, hi) - touniform(base, lo))`. The
-///   `-inf` outside-support gate is already handled by the existing `truncate`
-///   lowering, so the emitted density term is just `lower_measure_density(m,
-///   m_inner, v)` minus this `logZ`. The base MUST be normalized: the CDF-Z
-///   identity holds only for a normalized base, since `builtin_touniform` is the
-///   CDF `F` only for univariate continuous kernels (`07-functions.md:831`) and
-///   the transport is defined only for continuous kernels (`07-functions.md:838`).
-///   An unnormalized base (e.g. `Lebesgue(reals)`, where the true
-///   `Z = hi − lo` and `touniform` is undefined) does NOT take this path — it
-///   falls through to the refuse below, rather than silently mislowering.
+/// * If `M` is `truncate(base, interval(lo, hi))` with `base` a **normalized
+///   univariate continuous** probability measure (a primitive constructor such as
+///   `Normal`, `domain = Scalar(Real)`), `Z = CDF(hi) - CDF(lo)` via the
+///   `builtin_touniform` CDF transport (§06 "Density of composed measures", the
+///   `normalize` rule `Z = totalmass(M)`): `logZ = log(touniform(base, hi) -
+///   touniform(base, lo))`. The `-inf` outside-support gate is already handled by
+///   the existing `truncate` lowering, so the emitted density term is just
+///   `lower_measure_density(m, m_inner, v)` minus this `logZ`. The base must be
+///   univariate-continuous-normalized: the CDF-Z identity holds only there, since
+///   `builtin_touniform` is the CDF `F` only for univariate continuous kernels
+///   (§07 "measure-eval-prims") and the transport is defined only for continuous
+///   built-in kernels — use of an undefined transport is a static error (§07
+///   "measure-eval-prims"). A base that is NOT univariate-continuous-normalized
+///   does NOT take this path:
+///   - an unnormalized base (e.g. `Lebesgue(reals)`, true `Z = hi − lo`,
+///     `touniform` undefined) falls through to the unnormalized refuse below;
+///   - a normalized but DISCRETE base (`Binomial`/`Poisson`/`Categorical`,
+///     `domain = Scalar(Integer)`) or MULTIVARIATE base (`MvNormal`,
+///     `domain = Vector`) has no defined `touniform`, so it refuses with a
+///     DISTINCT message (a discrete/multivariate truncation Z — e.g. a CMF /
+///     finite-support sum — is a legitimate future follow-on, not an invalid
+///     model), rather than mislowering to an undefined transport.
 ///
 /// Any other unnormalized `M` (`Finite`, `LocallyFinite`, a non-truncate
 /// combinator, …) has no closed-form mass rule here, so we **refuse** rather
@@ -605,25 +622,39 @@ fn lower_normalize(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Re
 
     if let Some((base, lo, hi)) = truncate_shape {
         // The CDF-Z identity `Z = touniform(base, hi) − touniform(base, lo) =
-        // totalmass(truncate(base, S))` (§06:471) holds ONLY when `base` is a
-        // normalized univariate continuous probability measure — `builtin_touniform`
-        // is the CDF `F` only for univariate continuous kernels
-        // (`07-functions.md:831`) and the transport is defined only for continuous
-        // kernels (`07-functions.md:838`). For an
-        // unnormalized base (e.g. `Lebesgue(reals)`) the true `Z = hi − lo` and
-        // `touniform` is undefined, so applying the CDF path would silently
-        // mislower. Gate on the (resolved) base's mass; if it is not `Normalized`,
-        // do NOT take the CDF-Z path — fall through to the refuse below (no
-        // closed-form Z for an unnormalized base is built here).
+        // totalmass(truncate(base, S))` (§06 "Density of composed measures", the
+        // `normalize` rule `Z = totalmass(M)`) holds ONLY when `base` is a
+        // normalized *univariate continuous* probability measure — `builtin_touniform`
+        // is the CDF `F` only for univariate continuous kernels (§07
+        // "measure-eval-prims", ~L831) and the transport is defined only for
+        // continuous built-in kernels; use of an undefined transport is a static
+        // error (§07 "measure-eval-prims", ~L838). So the base must be BOTH
+        // `Mass::Normalized` AND have a real (continuous) SCALAR domain:
+        // * an unnormalized base (e.g. `Lebesgue(reals)`) has true `Z = hi − lo`
+        //   and no `touniform` — the CDF path would mislower;
+        // * a normalized *discrete* base (`Binomial`/`Poisson`/`Categorical`,
+        //   `domain = Scalar(Integer)`) or a normalized *multivariate* base
+        //   (`MvNormal`, `domain = Vector`) has NO defined `touniform` transport,
+        //   so `builtin_touniform(base, …)` is an undefined transport / silent
+        //   mislowering that still passes `is_flatpdl`.
+        // If the base is not univariate-continuous-normalized, do NOT take the
+        // CDF-Z path — fall through to the refuse below (exactly as the
+        // unnormalized `Lebesgue` base already does).
         let (base_resolved, _) = resolve_ref_one(m, base);
+        let base_ty = m.type_of(base_resolved);
         let base_normalized = matches!(
-            m.type_of(base_resolved),
+            base_ty,
             Some(Type::Measure {
                 mass: Mass::Normalized,
                 ..
             })
         );
-        if base_normalized {
+        let base_univariate_continuous = matches!(
+            base_ty,
+            Some(Type::Measure { domain, mass: Mass::Normalized })
+                if matches!(**domain, Type::Scalar(ScalarType::Real))
+        );
+        if base_univariate_continuous {
             let density = lower_measure_density(m, m_inner, v)?; // truncate handles the -inf gate
             let (kernel, input) = kernel_and_input(m, base)?; // helper below
             let cdf_hi = build_touniform(m, kernel, input, hi);
@@ -631,6 +662,29 @@ fn lower_normalize(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Re
             let z = build_call(m, "sub", &[cdf_hi, cdf_lo]);
             let log_z = build_call(m, "log", &[z]);
             return Ok(build_call(m, "sub", &[density, log_z]));
+        }
+        if base_normalized {
+            // Normalized but NOT univariate continuous — a discrete base
+            // (`Binomial`/`Poisson`/`Categorical`, `domain = Scalar(Integer)`) or a
+            // multivariate base (`MvNormal`, `domain = Vector`). This is a valid
+            // model, but its closed-form Z is NOT `builtin_touniform(base, hi) −
+            // touniform(base, lo)`: `touniform` is the CDF `F` only for a univariate
+            // *continuous* kernel (§07 "measure-eval-prims"), and use of the
+            // transport on a non-continuous / multivariate kernel is a static error
+            // there — plus `Z = F(hi) − F(lo)` is a univariate identity regardless.
+            // Refuse with its OWN message (a discrete/multivariate truncation Z —
+            // e.g. a CMF / finite-support sum — is a legitimate future follow-on),
+            // distinct from the unnormalized-base refuse below.
+            return Err(RefuseError {
+                node,
+                construct: "normalize".to_string(),
+                reason: "normalize(truncate): closed-form Z via builtin_touniform is only \
+                         defined for a univariate continuous base (touniform is the CDF only \
+                         there, §07); a discrete or multivariate base needs a different \
+                         closed-form Z (e.g. a CMF / finite-support sum), which is not yet \
+                         implemented"
+                    .to_string(),
+            });
         }
     }
 
@@ -752,6 +806,16 @@ fn lower_pushfwd(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Refu
 
 /// Read a literal non-negative integer from `id` (`Scalar::Int`, or an integral
 /// `Scalar::Real`). Returns `None` if `id` is not such a literal.
+///
+/// **Only a literal SCALAR `N` is accepted.** §06 "Independent composition" admits
+/// an `iid` `size` as "an integer (1-D length) or a vector of positive integers
+/// (multi-axis shape)", but a multi-axis / vector size (e.g. `iid(M, [2, 3])`) is
+/// intentionally refused here: this returns `None` for a non-literal, and a vector
+/// literal is not a scalar `Scalar::Int`/`Scalar::Real`, so [`lower_iid`]'s
+/// `literal_usize(size).ok_or_else(refuse …)` rejects it. The O(N) static unroll in
+/// [`lower_iid`] handles only a 1-D literal `N`; the vectorized broadcast+reduce
+/// over a multi-axis shape is the noted scale path, not built (conservative
+/// refuse-don't-mislower, not a bug).
 fn literal_usize(m: &Module, id: NodeId) -> Option<usize> {
     match m.node(id) {
         Node::Lit(Scalar::Int(n)) if *n >= 0 => Some(*n as usize),
@@ -761,17 +825,19 @@ fn literal_usize(m: &Module, id: NodeId) -> Option<usize> {
 }
 
 /// `logdensityof(iid(M, N), v)` = `Σ_{i<N} logdensityof(M, get0(v, i))`
-/// (`06-measure-algebra.md:477`, "iid(M, n) → Σ_i log densityof(M, xᵢ)"). N comes
-/// from the `iid` count arg, which must be a literal integer. Static unroll
-/// (corpus N small; broadcast+reduce is the noted scale path, not built).
+/// (§06 "Density of composed measures", "iid(M, n) → Σ_i log densityof(M, xᵢ)").
+/// N comes from the `iid` count arg, which must be a literal SCALAR integer — a
+/// multi-axis / vector `size` (e.g. `[2, 3]`) is intentionally refused (see
+/// [`literal_usize`]). Static unroll (corpus N small; broadcast+reduce is the
+/// noted scale path, not built).
 /// `N == 0` is the empty independent product: Σ over an empty index set is 0, so
 /// it lowers to the log-density literal `0.0` (consistent with the empty measure
 /// `record()`), not a refusal.
 ///
 /// **No scalar-`M` guard — deliberate asymmetry with [`lower_joint`].** `iid(M,
 /// size)` is the product `M^⊗N` over ARRAYS of shape `size`, i.e. a NESTED variate
-/// with a leading repeat axis `[N, …M-shape]` (`06-measure-algebra.md:176` and
-/// `06-measure-algebra.md:212`). So `get0(v, i)` recovers the full i-th
+/// with a leading repeat axis `[N, …M-shape]` (§06 "Independent composition", the
+/// `iid` bullet). So `get0(v, i)` recovers the full i-th
 /// `M`-variate (an entire row), which is exactly what this rule scores `M` at —
 /// correct for ANY `M`, scalar or not (a non-scalar `M`, e.g. `iid(MvNormal, n)`
 /// or a nested `iid(iid(…), n)`, lowers correctly, its inner variate reached by a
