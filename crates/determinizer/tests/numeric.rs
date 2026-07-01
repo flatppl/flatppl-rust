@@ -291,6 +291,35 @@ lp = logdensityof(obs, record(mu = 0.0, sigma = 1.0))";
     assert!(oracle.is_finite());
 }
 
+// Regression fixture for audit finding H3 (§6a:167-168): a variate reached
+// through a derived binding (`a = 2·theta`, `theta = draw(M)`) must score at
+// the pinned `theta` and propagate transitively — no stochastic `draw` may
+// survive, even though `a` is unreferenced by `lp` and depends on `theta`.
+#[test]
+fn derived_binding_pins_transitively() {
+    // theta ~ Normal(0,1); a = 2*theta (derived). Score the joint at theta=0.5.
+    // density should be log N(0.5; 0, 1), scored at the pinned theta.
+    let oracle = gaussian_logpdf(0.5, 0.0, 1.0);
+    let src = "\
+theta = draw(Normal(mu = 0.0, sigma = 1.0))
+a = mul(2.0, theta)
+lp = logdensityof(lawof(record(theta = theta)), record(theta = 0.5))";
+    let m = parse_infer(src);
+    let out = determinize(&m).expect("must lower");
+    assert!(
+        flatppl_determinizer::is_flatpdl(&out).is_ok(),
+        "no stochastic draw survives (a's dep):\n{}",
+        flatppl_flatpir::write(&out)
+    );
+    assert_eq!(
+        flatppl_flatpir::write(&out)
+            .matches("builtin_logdensityof")
+            .count(),
+        1
+    );
+    assert!(oracle.is_finite());
+}
+
 #[test]
 fn empty_record_is_zero() {
     let src = "lp = logdensityof(lawof(record()), record())";
