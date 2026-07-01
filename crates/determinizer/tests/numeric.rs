@@ -193,6 +193,36 @@ lp = logdensityof(d, [0.5, 0.5])";
     assert!(oracle.is_finite());
 }
 
+#[test]
+fn likelihoodof_gaussian_oracle() {
+    // obs = likelihoodof(iid(Normal(mu,sigma), 1), [1.27])
+    // logdensityof(obs, record(mu=0, sigma=1)) = log N(1.27; 0, 1)
+    let oracle = gaussian_logpdf(1.27, 0.0, 1.0);
+    let src = "\
+mu = elementof(reals)
+sigma = elementof(posreals)
+gauss_x = Normal(mu = mu, sigma = sigma)
+obs = likelihoodof(iid(gauss_x, 1), [1.27])
+lp = logdensityof(obs, record(mu = 0.0, sigma = 1.0))";
+    let m = parse_infer(src);
+    let out = determinize(&m).expect("likelihood must lower");
+    assert!(
+        flatppl_determinizer::is_flatpdl(&out).is_ok(),
+        "must be FlatPDL"
+    );
+    let pir = flatppl_flatpir::write(&out);
+    assert_eq!(
+        pir.matches("builtin_logdensityof").count(),
+        1,
+        "1 term:\n{pir}"
+    );
+    assert!(
+        !pir.contains("(likelihoodof ") && !pir.contains("(iid "),
+        "measure layer gone:\n{pir}"
+    );
+    assert!(oracle.is_finite());
+}
+
 // ── JS engine scoring (requires FLATPPL_JS_DIR + Node 24) ────────────────────
 //
 // These tests are #[ignore]d because they require an external JS engine and

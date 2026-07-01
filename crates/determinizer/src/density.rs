@@ -39,11 +39,19 @@
 //!   live in `named` with an empty positional `args`, so it is **refused**
 //!   rather than mislowered.
 //!
+//! **Likelihood query** (audit H2): `logdensityof(likelihoodof(K, obs), θ)` is
+//! handled at the `logdensityof` *entry* (not via `lower_measure_density`). Its
+//! arg2 is the parameter point θ (a record), NOT the variate; the variate is the
+//! `obs` baked into the likelihood. Each θ field is bound to the matching module
+//! parameter binding, then `K` is scored at `obs` — §06:492
+//! `densityof(likelihoodof(K, obs), θ) = pdf(κ(θ), obs)`.
+//!
 //! **Refused:** `kchain` marginals, keyword `joint`, `bayesupdate`, `disintegrate`,
-//! `restrict`, `likelihoodof`, `pushfwd` with a non-bijection argument, a
-//! variate-dependent (function-valued) `weighted`/`logweighted` weight, `iid`
-//! with a non-literal size, `joint` with a non-scalar component variate, and
-//! any unrecognised shape.
+//! `restrict`, `pushfwd` with a non-bijection argument, a variate-dependent
+//! (function-valued) `weighted`/`logweighted` weight, `iid` with a non-literal
+//! size, `joint` with a non-scalar component variate, and any unrecognised shape.
+//! (`likelihoodof` reaching `lower_measure_density` still refuses there as a
+//! safety net — it is normally unwrapped at the `logdensityof` entry above.)
 
 use crate::refuse::RefuseError;
 use flatppl_core::{
@@ -62,8 +70,73 @@ use flatppl_core::{
 /// scored value (its binding's RHS is redirected to the pinned variate), so no
 /// stochastic `draw` survives.
 pub(crate) fn lower_logdensityof(m: &mut Module, query: NodeId) -> Result<NodeId, RefuseError> {
+    let (arg1, arg2) = {
+        let q = expect_builtin_call(m, query, "logdensityof")
+            .ok_or_else(|| refuse(query, m, "expected logdensityof"))?;
+        if q.args.len() != 2 {
+            return Err(refuse(query, m, "logdensityof expects 2 args"));
+        }
+        (q.args[0], q.args[1])
+    };
+    // Likelihood query: arg2 is the PARAMETER point θ; the variate is the
+    // observed data baked into the likelihood (§06 "densityof(likelihoodof(K,obs),θ)").
+    let (resolved, _) = resolve_ref_one(m, arg1);
+    if is_likelihood(m, arg1) || builtin_name(m, resolved) == Some("likelihoodof") {
+        return lower_likelihood_query(m, resolved, arg2);
+    }
+    // Measure query: arg2 is the variate (existing path).
     let (measure_expr, v) = extract_logdensityof_args(m, query)?;
     lower_measure_density(m, measure_expr, v)
+}
+
+/// True iff `id` infers to a `Likelihood` type.
+fn is_likelihood(m: &Module, id: NodeId) -> bool {
+    matches!(m.type_of(id), Some(Type::Likelihood { .. }))
+}
+
+/// `logdensityof(likelihoodof(K, obs), θ)` = density of `K` at the observed `obs`,
+/// with `K`'s free parameters bound from the θ record (§06:492, audit H2).
+fn lower_likelihood_query(
+    m: &mut Module,
+    likelihoodof_node: NodeId,
+    theta: NodeId,
+) -> Result<NodeId, RefuseError> {
+    let (k, obs) = {
+        let c = expect_builtin_call(m, likelihoodof_node, "likelihoodof")
+            .ok_or_else(|| refuse(likelihoodof_node, m, "expected likelihoodof"))?;
+        if c.args.len() != 2 {
+            return Err(refuse(
+                likelihoodof_node,
+                m,
+                "likelihoodof expects 2 args (kernel, obs)",
+            ));
+        }
+        (c.args[0], c.args[1])
+    };
+    bind_params_from_record(m, theta)?;
+    lower_measure_density(m, k, obs)
+}
+
+/// Bind each `%field name = value` in the θ record to the module binding `name`
+/// (parameterized→fixed), so `K`'s parameter refs resolve to the scored point.
+fn bind_params_from_record(m: &mut Module, theta: NodeId) -> Result<(), RefuseError> {
+    let (resolved, _) = resolve_ref_one(m, theta);
+    let fields: Vec<(Symbol, NodeId)> = {
+        let rec = expect_builtin_call(m, resolved, "record")
+            .ok_or_else(|| refuse(theta, m, "logdensityof(L, θ): θ must be a record"))?;
+        rec.named
+            .iter()
+            .filter(|n| n.kind == NamedKind::Field)
+            .map(|n| (n.name, n.value))
+            .collect()
+    };
+    for (name, value) in fields {
+        let bid = m
+            .binding_by_name(name)
+            .ok_or_else(|| refuse(value, m, "θ names a parameter with no module binding"))?;
+        m.set_binding_rhs(bid, value);
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

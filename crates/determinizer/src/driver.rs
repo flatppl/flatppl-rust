@@ -395,6 +395,11 @@ const COMBINATOR_OPS: &[&str] = &[
     // terms), so a `d = joint(...)` binding referenced only by the now-lowered
     // `logdensityof` query is orphaned the same way.
     "joint",
+    // Likelihood combinator (Task 3 / audit H2): a `obs = likelihoodof(K, data)`
+    // binding is unwrapped at the `logdensityof` entry (its `K` is scored at the
+    // baked-in `data`), so a binding referenced only by the now-lowered
+    // `logdensityof` query is orphaned the same way.
+    "likelihoodof",
 ];
 
 /// After a `logdensityof` rewrite, scan all bindings whose RHS is a measure
@@ -412,29 +417,43 @@ const COMBINATOR_OPS: &[&str] = &[
 /// binding.  Without this sweep the driver would encounter `weighted` on the
 /// next iteration and refuse, since there is no standalone rule for it.
 ///
-/// **Soundness invariant.** A binding is rewritten iff it is BOTH (a) a measure
-/// combinator op (`is_combinator_rhs`) AND (b) provably unreferenced — no *other*
-/// binding subtree contains a `(%ref self name)` to it (`binding_is_referenced`'s
-/// BFS).  Zeroing a genuinely-dead combinator binding is sound dead-code
-/// elimination: it has no observable effect because nothing reads it.  The guard
-/// below never touches anything that fails *either* condition, so it cannot
-/// disturb a live value, a non-combinator binding, or a still-referenced measure.
+/// **Soundness invariant.** A binding is rewritten iff it is BOTH (a) an
+/// eliminable measure binding — either a combinator op (`is_combinator_rhs`) OR a
+/// `Measure`/`Likelihood`-typed RHS (`is_measure_typed_rhs`) — AND (b) provably
+/// unreferenced: no *other* binding subtree contains a `(%ref self name)` to it
+/// (`binding_is_referenced`'s BFS).  Zeroing a genuinely-dead measure binding is
+/// sound dead-code elimination: it has no observable effect because nothing reads
+/// it.  The guard below never touches anything that fails *either* condition, so
+/// it cannot disturb a live value, a non-measure binding, or a still-referenced
+/// measure.
+///
+/// The type-based arm generalises past the fixed `COMBINATOR_OPS` op-name list:
+/// distribution *constructors* (`Normal`, `Beta`, …) are not a closed set, so a
+/// standalone `gauss_x = Normal(mu, sigma)` orphaned after a `likelihoodof`
+/// density query (audit H2) cannot be caught by op name.  Keying the second arm
+/// on the *inferred type* — which `is_flatpdl` itself uses to reject residual
+/// measure-layer values — sweeps exactly the bindings that would otherwise trip
+/// the conformance gate, and no others (a value-typed binding never matches).
 fn sweep_dead_measure_bindings(m: &mut Module) {
     // Iterate to a fixpoint so dead-binding *cascades* are fully eliminated.
     // A `kchain` marginal leaves a chain `pp = kchain(M, k)` → `k = kernelof(…)`
     // → `z = draw(…)`: only `pp` is unreferenced at first (the still-present-but-
     // dead `k` references `z`, and `pp` references `k`). Zeroing `pp` orphans
-    // `k`; zeroing `k` orphans `z`. One pass only kills the currently-orphaned
-    // bindings; we repeat until a pass kills nothing.
+    // `k`; zeroing `k` orphans `z`. A `likelihoodof` query leaves an analogous
+    // chain `obs = likelihoodof(iid(gauss_x, 1), …)` → `gauss_x = Normal(…)`:
+    // sweeping the `obs` combinator orphans the `gauss_x` constructor, caught by
+    // the type arm. One pass only kills the currently-orphaned bindings; we
+    // repeat until a pass kills nothing.
     loop {
-        // Collect (binding, name) pairs whose RHS is a combinator op AND that no
-        // other binding references. Both predicates are read-only over `m`, so we
-        // settle the full kill-set before any mutation (a later zeroing in this
-        // pass cannot make a previously-live binding look dead).
+        // Collect bindings whose RHS is eliminable (combinator op OR
+        // Measure/Likelihood-typed) AND that no other binding references. Both
+        // predicates are read-only over `m`, so we settle the full kill-set
+        // before any mutation (a later zeroing in this pass cannot make a
+        // previously-live binding look dead).
         let dead: Vec<BindingId> = m
             .bindings()
             .filter(|(bid, b)| {
-                is_combinator_rhs(m, b.rhs) && !binding_is_referenced(m, *bid, b.name)
+                is_eliminable_measure_rhs(m, b.rhs) && !binding_is_referenced(m, *bid, b.name)
             })
             .map(|(bid, _)| bid)
             .collect();
@@ -445,17 +464,39 @@ fn sweep_dead_measure_bindings(m: &mut Module) {
 
         for bid in dead {
             // Re-assert the invariant at the rewrite site: we only zero a binding
-            // that is still a combinator op and still unreferenced. Cheap, and it
-            // documents/enforces that the sweep never rewrites anything else.
+            // that is still an eliminable measure binding and still unreferenced.
+            // Cheap, and it documents/enforces that the sweep never rewrites
+            // anything else.
             let binding = m.binding(bid);
             debug_assert!(
-                is_combinator_rhs(m, binding.rhs) && !binding_is_referenced(m, bid, binding.name),
-                "sweep must only zero a dead measure-combinator binding"
+                is_eliminable_measure_rhs(m, binding.rhs)
+                    && !binding_is_referenced(m, bid, binding.name),
+                "sweep must only zero a dead measure binding"
             );
             let zero = m.alloc(Node::Lit(Scalar::Real(0.0)));
             m.set_binding_rhs(bid, zero);
         }
     }
+}
+
+/// True iff `rhs` is an eliminable measure binding: a combinator op
+/// (`is_combinator_rhs`) OR a node whose inferred type is `Measure`/`Likelihood`
+/// (`is_measure_typed_rhs`). Either alone suffices — the op-name arm catches
+/// combinators before inference has classified them, and the type arm catches
+/// distribution constructors, which are not on the op-name list.
+fn is_eliminable_measure_rhs(m: &Module, rhs: NodeId) -> bool {
+    is_combinator_rhs(m, rhs) || is_measure_typed_rhs(m, rhs)
+}
+
+/// True iff `rhs`'s inferred type is `Measure` or `Likelihood` — the residual
+/// measure-layer value types `is_flatpdl` rejects. Used to sweep an orphaned
+/// distribution-constructor binding (`gauss_x = Normal(…)`) whose op name is not
+/// on `COMBINATOR_OPS`.
+fn is_measure_typed_rhs(m: &Module, rhs: NodeId) -> bool {
+    matches!(
+        m.type_of(rhs),
+        Some(flatppl_core::Type::Measure { .. }) | Some(flatppl_core::Type::Likelihood { .. })
+    )
 }
 
 /// True iff `rhs` is a builtin call whose head is in [`COMBINATOR_OPS`].
