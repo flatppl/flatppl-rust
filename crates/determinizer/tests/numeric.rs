@@ -290,3 +290,16 @@ lp = logdensityof(obs, record(mu = 0.0, sigma = 1.0))";
     );
     assert!(oracle.is_finite());
 }
+
+#[test]
+fn empty_record_is_zero() {
+    let src = "lp = logdensityof(lawof(record()), record())";
+    let m = parse_infer(src);
+    let out = determinize(&m).expect("empty record must lower to 0");
+    assert!(flatppl_determinizer::is_flatpdl(&out).is_ok());
+    let pir = flatppl_flatpir::write(&out);
+    assert!(
+        !pir.contains("builtin_logdensityof"),
+        "no density terms:\n{pir}"
+    );
+}

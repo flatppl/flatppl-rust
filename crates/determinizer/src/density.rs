@@ -211,6 +211,11 @@ fn lower_record_of_draws(
 ) -> Result<NodeId, RefuseError> {
     let components = match_independent_record(m, record_node, v)?;
 
+    // Empty record (degenerate joint): log-density is 0 (§10 item 5).
+    if components.is_empty() {
+        return Ok(m.alloc(Node::Lit(Scalar::Real(0.0))));
+    }
+
     // Build density terms per component.
     let mut terms: Vec<NodeId> = Vec::with_capacity(components.len());
     for comp in &components {
@@ -276,9 +281,6 @@ fn match_independent_record(
         });
     }
 
-    if components.is_empty() {
-        return Err(refuse(record_node, m, "empty measure record"));
-    }
     Ok(components)
 }
 
