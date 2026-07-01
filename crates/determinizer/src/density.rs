@@ -58,7 +58,7 @@
 //!   but its components live in `named` with an empty positional `args`, so it
 //!   is **refused** rather than mislowered.
 //!
-//! **Likelihood query** (audit H2): `logdensityof(likelihoodof(K, obs), θ)` is
+//! **Likelihood query** (measure-algebra-audit.md H2): `logdensityof(likelihoodof(K, obs), θ)` is
 //! handled at the `logdensityof` *entry* (not via `lower_measure_density`). Its
 //! arg2 is the parameter point θ (a record), NOT the variate; the variate is the
 //! `obs` baked into the likelihood. `K` is scored at `obs`, then each θ field is
@@ -121,7 +121,7 @@ fn is_likelihood(m: &Module, id: NodeId) -> bool {
 
 /// `logdensityof(likelihoodof(K, obs), θ)` = density of `K` at the observed `obs`,
 /// with `K`'s free parameters bound from the θ record (§06 "Likelihood
-/// construction", audit H2).
+/// construction", measure-algebra-audit.md H2).
 ///
 /// Each θ field value is inlined into THIS query's emitted density subtree only
 /// (a self-contained per-query substitution keyed on `(%ref self <name>)` — see
@@ -169,7 +169,8 @@ fn lower_likelihood_query(
     // Inline this query's θ values into ITS OWN density subtree: substitute each
     // `(%ref self <name>)` matching a θ field with that field's value node. No
     // shared binding is mutated, so sibling queries over the same params keep
-    // their own θ points (fixes the cross-query param leak, C1).
+    // their own θ points (fixes the cross-query parameter leak: two likelihood
+    // queries over shared params would otherwise clobber each other's θ).
     Ok(substitute_refs_by_name(m, density, &theta_map))
 }
 
@@ -644,6 +645,15 @@ fn lower_normalize(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Re
     // measures"). Extract the truncate/interval shape and its endpoints BEFORE any
     // mutable builds below (immutable reads of `m` must precede `m.alloc`/`build_*`
     // calls).
+    //
+    // `non_interval_truncation_set` distinguishes "this IS a `truncate(base, set)`
+    // node, but `set` is not a literal `interval(lo, hi)` call" (e.g. a named set
+    // like `posreals`/`nonnegreals`) from "the outer node is not a `truncate` at
+    // all" — the former gets its OWN refuse message below (closed-form Z is only
+    // implemented for a literal interval bound), rather than falling through to
+    // the generic unnormalized-measure message, which would misleadingly imply
+    // the base itself is the problem.
+    let mut non_interval_truncation_set = false;
     let truncate_shape: Option<(NodeId, NodeId, NodeId)> = {
         if let Some(tc) = expect_builtin_call(m, m_inner_resolved, "truncate") {
             if tc.args.len() == 2 {
@@ -655,6 +665,7 @@ fn lower_normalize(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Re
                         None
                     }
                 } else {
+                    non_interval_truncation_set = true;
                     None
                 }
             } else {
@@ -664,6 +675,16 @@ fn lower_normalize(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Re
             None
         }
     };
+
+    if non_interval_truncation_set {
+        return Err(RefuseError {
+            node,
+            construct: "normalize".to_string(),
+            reason: "normalize(truncate): closed-form Z is only implemented for an \
+                     `interval(lo, hi)` truncation set; a named/other set is not yet supported"
+                .to_string(),
+        });
+    }
 
     if let Some((base, lo, hi)) = truncate_shape {
         // The CDF-Z identity `Z = touniform(base, hi) − touniform(base, lo) =
@@ -767,10 +788,17 @@ fn lower_normalize(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Re
 /// The measure-algebra combinator / operator heads. A `truncate` base whose
 /// builtin head is one of these is a COMPOSED measure, not a leaf distribution
 /// constructor, so it has no defined `builtin_touniform` (CDF) transport — the
-/// CDF-Z `normalize(truncate)` path must refuse it (F3). Leaf constructors
-/// (`Normal`, `Beta`, …) are NOT in this set, which is why membership is the
-/// cleanest "is this a combinator, not a leaf kernel?" test (the constructor set
-/// is open-ended; the combinator vocabulary is fixed, spec §06 measure algebra).
+/// CDF-Z `normalize(truncate)` path must refuse it (composed/pushfwd-style
+/// truncation base, see `normalize_truncate_pushfwd_base_refuses` in
+/// `tests/refuse.rs`). Leaf constructors (`Normal`, `Beta`, …) are NOT in this
+/// set, which is why membership is the cleanest "is this a combinator, not a
+/// leaf kernel?" test (the constructor set is open-ended; the combinator
+/// vocabulary is fixed, spec §06 measure algebra).
+///
+/// Cross-reference: `driver.rs::COMBINATOR_OPS` encodes the same measure-
+/// combinator vocabulary for a DIFFERENT purpose (DCE eligibility of a
+/// `Measure`-typed binding) and intentionally has different membership. A new
+/// measure-algebra op may need adding to both lists — check `driver.rs` too.
 const MEASURE_COMBINATOR_OPS: &[&str] = &[
     "pushfwd",
     "weighted",
@@ -1019,6 +1047,13 @@ fn lower_joint(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Refuse
     // NOT catch this: `get0(v, i)` infers to `%deferred`/`%unknown`, so its guard
     // is skipped. The COMPONENT's own measure domain, by contrast, is known
     // (`iid(Normal,2)` → array[2]), so we can refuse it precisely here.
+    // Best-effort: this guard only fires when inference has actually assigned
+    // `mi` a `Type::Measure { domain, .. }`. A `%deferred`-typed component
+    // (`component_kind = None` below) passes through unchecked and is lowered
+    // via `get0(v, i)` regardless of its true arity — the downstream
+    // `build_density_term` domain check is likewise conservative (see its
+    // comment above), so an untyped non-scalar component is not caught by
+    // either layer.
     for &mi in inner.iter() {
         let (mi_resolved, _) = resolve_ref_one(m, mi);
         let component_kind = match m.type_of(mi_resolved) {
@@ -1328,7 +1363,9 @@ fn refuse_op(id: NodeId, m: &Module) -> RefuseError {
 mod tests {
     use super::*;
 
-    /// F3, direct unit test of the leaf-constructor gate in `lower_normalize`.
+    /// Direct unit test of the leaf-constructor gate in `lower_normalize`
+    /// (companion to `normalize_truncate_pushfwd_base_refuses` in
+    /// `tests/refuse.rs`, which exercises the same gate black-box).
     ///
     /// Through the normal parse+infer path, inference classifies a composed base
     /// (`pushfwd(bij, Normal)`, `superpose(…)`, …) as `domain = %any` or

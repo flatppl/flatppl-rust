@@ -389,6 +389,13 @@ fn op_name(m: &Module, id: NodeId) -> String {
 /// `kernelof` kernel, and the `kchain` node itself. After the marginal is lowered
 /// to a self-contained `logsumexp` (with fresh inlined copies of the latent's
 /// distribution and the per-atom kernel bodies), none of these are referenced.
+///
+/// Cross-reference: `density.rs::MEASURE_COMBINATOR_OPS` encodes the same
+/// measure-combinator vocabulary for a DIFFERENT purpose (rejecting a composed
+/// truncation base in the `normalize(truncate)` CDF-Z path) and intentionally
+/// has different membership — this list is about DCE eligibility, not leaf-vs-
+/// combinator classification. A new measure-algebra op may need adding to
+/// both lists — check `density.rs` too.
 const COMBINATOR_OPS: &[&str] = &[
     "weighted",
     "logweighted",
@@ -412,7 +419,8 @@ const COMBINATOR_OPS: &[&str] = &[
     // terms), so a `d = joint(...)` binding referenced only by the now-lowered
     // `logdensityof` query is orphaned the same way.
     "joint",
-    // Likelihood combinator (Task 3 / audit H2): a `obs = likelihoodof(K, data)`
+    // Likelihood combinator (Task 3 / measure-algebra-audit.md H2): a
+    // `obs = likelihoodof(K, data)`
     // binding is unwrapped at the `logdensityof` entry (its `K` is scored at the
     // baked-in `data`), so a binding referenced only by the now-lowered
     // `logdensityof` query is orphaned the same way.
@@ -447,7 +455,8 @@ const COMBINATOR_OPS: &[&str] = &[
 /// The type-based arm generalises past the fixed `COMBINATOR_OPS` op-name list:
 /// distribution *constructors* (`Normal`, `Beta`, …) are not a closed set, so a
 /// standalone `gauss_x = Normal(mu, sigma)` orphaned after a `likelihoodof`
-/// density query (audit H2) cannot be caught by op name.  Keying the second arm
+/// density query (measure-algebra-audit.md H2) cannot be caught by op name.
+/// Keying the second arm
 /// on the *inferred type* — which `is_flatpdl` itself uses to reject residual
 /// measure-layer values — sweeps exactly the bindings that would otherwise trip
 /// the conformance gate, and no others (a value-typed binding never matches).
@@ -589,7 +598,7 @@ mod tests {
     use super::*;
     use flatppl_core::{Binding, Call, Inputs, Mass, NamedArg, Type};
 
-    /// F2: a `Measure`-typed constructor binding referenced ONLY through another
+    /// A `Measure`-typed constructor binding referenced ONLY through another
     /// binding's `functionof` / `kernelof` reification `Inputs` boundary entry
     /// (`(g, %ref self g)`) must NOT be swept as dead. `children()` excludes the
     /// `Inputs` bucket (core `node.rs`), so a body-only reference check judged `g`

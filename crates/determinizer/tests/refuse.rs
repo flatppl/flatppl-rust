@@ -181,6 +181,38 @@ lp = logdensityof(d, 5)";
     );
 }
 
+// `normalize(truncate(Normal, posreals))` — the truncation set is a NAMED set
+// (`posreals`), not a literal `interval(lo, hi)` call. The CDF-Z path can only
+// read off `lo`/`hi` from a literal `interval(...)` node, so this shape falls
+// out of `truncate_shape` with `non_interval_truncation_set = true`. Before this
+// fix that fell through to the generic "normalize of an unnormalized measure"
+// refuse, which is misleading here — the base (`Normal`) IS normalized; the
+// actual gap is that closed-form Z is only wired up for a literal interval
+// bound. This pins the DISTINCT message naming the interval restriction.
+#[test]
+fn normalize_truncate_non_interval_set_refuses_with_distinct_message() {
+    let src = "\
+d = normalize(truncate(Normal(mu = 0.0, sigma = 1.0), posreals))
+lp = logdensityof(d, 0.5)";
+    let m = parse_infer(src);
+    let err = determinize(&m).expect_err(
+        "normalize(truncate(<normalized base>, <named set>)) must refuse — closed-form Z is only \
+         wired up for a literal interval(lo, hi) bound",
+    );
+    assert!(
+        err.construct.contains("normalize"),
+        "refusal names normalize: {err:?}"
+    );
+    assert!(
+        err.reason.contains("interval(lo, hi)"),
+        "refusal names the interval-only restriction: {err:?}"
+    );
+    assert!(
+        !err.reason.contains("unnormalized"),
+        "base is normalized — refusal must NOT claim it is unnormalized: {err:?}"
+    );
+}
+
 // `markovchain` is an unsupported measure-algebra combinator in this MVP — it
 // requires a Markov kernel and stationary-distribution reasoning that goes well
 // beyond density disintegration. The determiniser must refuse naming the
@@ -224,7 +256,7 @@ lp = logdensityof(d, [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]])";
     );
 }
 
-// F1 (must-fix): a θ parameter captured as a `functionof` / `kernelof`
+// A θ parameter captured as a `functionof` / `kernelof`
 // reification INPUT (a `(coeff, %ref self coeff)` boundary entry) cannot be
 // inlined by the per-query θ substitution — `substitute_refs_by_name` walks
 // `map_tree` / `children()`, which EXCLUDES a `Call`'s `Inputs` bucket (core
@@ -260,7 +292,7 @@ lp = logdensityof(obs, record(coeff = 2.0))";
     );
 }
 
-// F3 (composed truncation base): `normalize(truncate(pushfwd(bij, Normal), S))`
+// Composed truncation base: `normalize(truncate(pushfwd(bij, Normal), S))`
 // — a truncated log-normal-shaped base. The CDF-Z path emits
 // `builtin_touniform(<head>, …)` for ANY builtin head, but `touniform` is the CDF
 // only for a LEAF built-in distribution kernel (`Normal`, …), NOT a measure

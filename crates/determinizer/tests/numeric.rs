@@ -455,7 +455,7 @@ lp = logdensityof(obs, record(mu = 0.0, sigma = 1.0))";
     );
 }
 
-// Regression for review finding C1 (cross-query parameter leak). TWO likelihood
+// Regression for a cross-query parameter leak. TWO likelihood
 // queries over the SAME shared params (`mu`, `sigma`) at DISTINCT θ points must
 // each score at its OWN θ. Each θ is inlined into that query's density subtree;
 // the shared `mu`/`sigma` bindings are NOT mutated (which would clobber both
@@ -530,7 +530,7 @@ lp2 = logdensityof(obs, record(mu = 5.0, sigma = 2.0))";
     );
 }
 
-// Regression fixture for transitive pinning (audit finding H3): a variate reached
+// Regression fixture for transitive pinning (measure-algebra-audit.md H3): a variate reached
 // through a derived binding (`a = 2·theta`, `theta = draw(M)`) must score at
 // the pinned `theta` and propagate transitively — no stochastic `draw` may
 // survive, even though `a` is unreferenced by `lp` and depends on `theta`.
