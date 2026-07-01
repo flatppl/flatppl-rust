@@ -180,12 +180,11 @@ impl<'m, 's> Inferencer<'m, 's> {
     /// literals) are closed over — pruned via the phase table. Every ancestor's
     /// phase is already memoised when this runs (the reification's children are
     /// traced before its op rule), so the walk reads, never recurses, inference.
-    /// Returns the local `elementof` leaf inputs and a flag that is set if the
-    /// trace reached a parametric **cross-module** dependency. Spec §04 reifies
-    /// the combined DAG across module boundaries (splitting a model does not
-    /// change what `functionof` reifies), which the module linker
-    /// (engine-concepts §7) will realize; until then the caller refuses the
-    /// cross-module case rather than mis-reify it.
+    /// Returns the local `elementof` leaf inputs and a flag set if the trace
+    /// reached a parametric **cross-module** dependency. Reification is
+    /// module-local (spec §04): a parameterized value reached through a
+    /// loaded-module reference cannot become an input, so the caller turns the
+    /// flag into a static error.
     pub(crate) fn collect_auto_inputs(&self, body: NodeId) -> (Vec<(Symbol, Ref)>, bool) {
         // Keyed by leaf name (dedup + canonical sort).
         let mut leaves: BTreeMap<String, Ref> = BTreeMap::new();
@@ -239,11 +238,9 @@ impl<'m, 's> Inferencer<'m, 's> {
                 }
                 None => Vec::new(),
             },
-            // A parametric cross-module dependency. Spec §04 traces the combined
-            // DAG into the dependency to its own `elementof` leaves; that
-            // trace-across is the module linker's job (engine-concepts §7) and is
-            // not yet implemented, so flag it and let the caller refuse rather
-            // than mis-reify. (A FIXED cross-module ref was pruned above, so
+            // A parametric cross-module dependency. Reification is module-local
+            // (spec §04): such a value cannot become a reified input — flag it so
+            // the caller errors. (A FIXED cross-module ref was pruned above, so
             // reaching here means the referenced binding is parameterized.)
             Node::Ref(r) if matches!(r.ns, RefNs::Module(_)) => {
                 *cross_module = true;

@@ -1490,7 +1490,27 @@ fn reification_type(
     args: &[ArgInfo],
 ) -> Type {
     let inputs: Box<[Symbol]> = match call.inputs.as_ref() {
-        Some(Inputs::Spec(entries)) => entries.iter().map(|(n, _)| *n).collect(),
+        Some(Inputs::Spec(entries)) => {
+            // Reification is module-local (spec §04): a boundary may not designate
+            // a loaded-module binding — reification never crosses a module
+            // boundary, even explicitly. Use the dependency's callables/values.
+            if let Some((_, r)) = entries
+                .iter()
+                .find(|(_, r)| matches!(r.ns, RefNs::Module(_)))
+            {
+                inf.diags.push(crate::Diagnostic::error_at(
+                    id,
+                    format!(
+                        "reification is module-local: boundary `{}` designates a \
+                         loaded-module binding — reification cannot cross a module \
+                         boundary (spec §04); use the dependency's callables/values instead",
+                        inf.module.resolve(r.name)
+                    ),
+                ));
+                return Type::Failed("cross-module reification boundary".into());
+            }
+            entries.iter().map(|(n, _)| *n).collect()
+        }
         Some(Inputs::Auto) => match inf.module.auto_inputs_of(id) {
             Some(entries) => entries.iter().map(|(n, _)| *n).collect(),
             None => {
@@ -1502,22 +1522,20 @@ fn reification_type(
                 };
                 let (entries, cross_module) = inf.collect_auto_inputs(*body);
                 if cross_module {
-                    // Spec §04 reifies across the combined DAG into the dependency
-                    // to its own `elementof` leaves; that trace-across awaits the
-                    // module linker (engine-concepts §7). Refuse rather than
-                    // mis-reify — explicit boundary specification is the
-                    // cross-module (and encapsulation) opt-out.
+                    // Reification is module-local (spec §04): a parameterized value
+                    // reached through a loaded-module reference cannot become an
+                    // input. (A cross-module callable/value may be USED — applied or
+                    // referenced — just not taken as a reified input.)
                     inf.diags.push(crate::Diagnostic::error_at(
                         id,
-                        "boundary-less reification depends on a value from a loaded \
-                         module; the cross-module trace is not yet implemented — use \
-                         explicit boundary specification to name the input, or reify \
-                         within the defining module (spec §04)",
+                        "reification is module-local: this depends on a parameterized \
+                         value from a loaded module, which cannot become an input \
+                         (spec §04); use the dependency's callables/values instead, or \
+                         reify within the module that defines it",
                     ));
-                    return Type::Failed(
-                        "cross-module boundary-less reification not yet supported".into(),
-                    );
+                    return Type::Failed("cross-module reification".into());
                 }
+
                 let names: Box<[Symbol]> = entries.iter().map(|(n, _)| *n).collect();
                 inf.module.set_auto_inputs(id, entries.into());
                 names
