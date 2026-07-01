@@ -49,14 +49,17 @@
 //!   is **refused** (the O(N) unroll handles only 1-D literal `N`; the vectorized
 //!   broadcast+reduce over a multi-axis shape is the noted scale path, not built).
 //! - `joint(M₁,…,Mₖ)` (**positional only**) → `Σᵢ density(Mᵢ, get0(v, i))` —
-//!   **scalar-variate components only**; a component whose measure domain is
-//!   non-scalar (e.g. `iid(Normal, 2)`) is **refused up front** by inspecting
-//!   each component's measure-domain kind, NOT via the downstream recursive
-//!   call (whose `get0(v, i)` value is `%deferred`/`%unknown`, so its domain
-//!   guard is skipped). Keyword `joint(name = M, …)` (named components → record
-//!   variate) shares the `joint` op name so it reaches the same dispatch arm,
-//!   but its components live in `named` with an empty positional `args`, so it
-//!   is **refused** rather than mislowered.
+//!   **scalar-variate components only**; a component is accepted ONLY when its
+//!   measure-domain kind is CONFIRMED `Scalar` — a component whose domain is
+//!   confirmed non-scalar (e.g. `iid(Normal, 2)`) OR whose domain kind is
+//!   unknown/`%deferred` (inference did not resolve it) is **refused up
+//!   front**, fail-closed, by inspecting each component's measure-domain kind,
+//!   NOT via the downstream recursive call (whose `get0(v, i)` value is
+//!   `%deferred`/`%unknown`, so its domain guard is skipped). Keyword
+//!   `joint(name = M, …)` (named components → record variate) shares the
+//!   `joint` op name so it reaches the same dispatch arm, but its components
+//!   live in `named` with an empty positional `args`, so it is **refused**
+//!   rather than mislowered.
 //!
 //! **Likelihood query** (measure-algebra-audit.md H2): `logdensityof(likelihoodof(K, obs), θ)` is
 //! handled at the `logdensityof` *entry* (not via `lower_measure_density`). Its
@@ -70,8 +73,11 @@
 //!
 //! **Refused:** `kchain` marginals, keyword `joint`, `bayesupdate`, `disintegrate`,
 //! `restrict`, `pushfwd` with a non-bijection argument, `iid` with a non-literal
-//! or multi-axis / vector size, `joint` with a non-scalar component (refused up
-//! front on the component's measure-domain kind), `normalize(truncate(base, …))`
+//! (after resolving one `(%ref self …)` level — a NAMED literal size lowers) or
+//! multi-axis / vector size, `joint` with a component whose measure-domain kind
+//! is not CONFIRMED scalar (refused up front — a confirmed-non-scalar OR an
+//! unknown/`%deferred` domain both refuse, fail-closed),
+//! `normalize(truncate(base, …))`
 //! whose `base` is not a univariate-continuous-normalized measure (an unnormalized
 //! base, or a normalized-but-discrete/multivariate base — each with its own refuse
 //! message), and any unrecognised shape.
@@ -799,7 +805,7 @@ fn lower_normalize(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Re
 /// combinator vocabulary for a DIFFERENT purpose (DCE eligibility of a
 /// `Measure`-typed binding) and intentionally has different membership. A new
 /// measure-algebra op may need adding to both lists — check `driver.rs` too.
-const MEASURE_COMBINATOR_OPS: &[&str] = &[
+pub(crate) const MEASURE_COMBINATOR_OPS: &[&str] = &[
     "pushfwd",
     "weighted",
     "logweighted",
@@ -818,6 +824,7 @@ const MEASURE_COMBINATOR_OPS: &[&str] = &[
     "restrict",
     "bayesupdate",
     "disintegrate",
+    "likelihoodof",
 ];
 
 /// True iff `base`'s builtin head is a measure-algebra combinator (in
@@ -831,6 +838,19 @@ fn base_is_measure_combinator(m: &Module, base: NodeId) -> bool {
 /// Resolves one level of `(%ref self x)` indirection first, so a truncation
 /// base bound by name (`g = Normal(...); truncate(g, ...)`) is classified by
 /// its constructor.
+///
+/// **Defense-in-depth: rejects positional constructor args.** This builds the
+/// kernel input record from `c.named` only, exactly like [`build_density_term`]'s
+/// primitive-constructor path — a positionally-written base (`Normal(0.0,
+/// 1.0)`) has no `named` entries, so silently proceeding would emit
+/// `builtin_touniform(Normal, record(), hi)`, a wrong (missing-parameter)
+/// input record, rather than refusing. In the current call graph this cannot
+/// actually fire: [`lower_normalize`] always lowers the base's own density
+/// term via `build_density_term` first (which already refuses
+/// `!c.args.is_empty()`) before reaching `kernel_and_input`, so a positional
+/// base is refused upstream. But that ordering is not enforced by this
+/// function's own signature, so the guard is repeated here rather than left
+/// implicit/order-dependent on the caller.
 fn kernel_and_input(m: &mut Module, ctor: NodeId) -> Result<(NodeId, NodeId), RefuseError> {
     let (ctor_resolved, _) = resolve_ref_one(m, ctor);
     let (ctor_sym, kwargs): (Symbol, Vec<(Symbol, NodeId)>) = {
@@ -844,6 +864,13 @@ fn kernel_and_input(m: &mut Module, ctor: NodeId) -> Result<(NodeId, NodeId), Re
         let CallHead::Builtin(sym) = c.head else {
             return Err(refuse(ctor_resolved, m, "non-builtin truncation base"));
         };
+        if !c.args.is_empty() {
+            return Err(refuse(
+                ctor_resolved,
+                m,
+                "primitive constructor with positional args not supported",
+            ));
+        }
         (sym, c.named.iter().map(|n| (n.name, n.value)).collect())
     };
     let kernel = m.alloc(Node::Const(ctor_sym));
@@ -981,8 +1008,15 @@ fn lower_iid(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseEr
         if c.args.len() != 2 {
             return Err(refuse(node, m, "iid expects 2 args (measure, size)"));
         }
-        let n = literal_usize(m, c.args[1])
-            .ok_or_else(|| refuse(c.args[1], m, "iid size must be a literal integer"))?;
+        let size_arg = c.args[1];
+        // Resolve one level of `(%ref self n)` indirection so a NAMED literal
+        // size (`n = 3; iid(M, n)`) is read from its binding RHS — `n = 3` is
+        // statically known just as an inline `3` is; only `literal_usize`'s
+        // `Node::Lit` match was too narrow. A non-literal size (bound or
+        // inline) still fails `literal_usize` and refuses, unchanged.
+        let (size_resolved, _) = resolve_ref_one(m, size_arg);
+        let n = literal_usize(m, size_resolved)
+            .ok_or_else(|| refuse(size_arg, m, "iid size must be a literal integer"))?;
         (c.args[0], n)
     };
     // Empty independent product: Σ over an empty index set is 0 (log-density 0),
@@ -1047,27 +1081,30 @@ fn lower_joint(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Refuse
     // NOT catch this: `get0(v, i)` infers to `%deferred`/`%unknown`, so its guard
     // is skipped. The COMPONENT's own measure domain, by contrast, is known
     // (`iid(Normal,2)` → array[2]), so we can refuse it precisely here.
-    // Best-effort: this guard only fires when inference has actually assigned
-    // `mi` a `Type::Measure { domain, .. }`. A `%deferred`-typed component
-    // (`component_kind = None` below) passes through unchecked and is lowered
-    // via `get0(v, i)` regardless of its true arity — the downstream
-    // `build_density_term` domain check is likewise conservative (see its
-    // comment above), so an untyped non-scalar component is not caught by
-    // either layer.
+    //
+    // **Fail-closed on an unknown/deferred component domain.** A component
+    // whose measure domain inference has NOT resolved to `Some(Type::Measure {
+    // domain, .. })` — so `component_kind` is `None` — is refused too, not
+    // waved through. Only a component CONFIRMED `Some(VariateKind::Scalar)` is
+    // accepted. Waving through the `None` case would repeat exactly the
+    // mislowering hazard this guard exists to close: an untyped component's
+    // true arity is unknown, so `get0(v, i)` might silently drop its extra
+    // `cat` slots if it turns out to be non-scalar. Per refuse-don't-mislower,
+    // "unconfirmed" and "confirmed non-scalar" both refuse; only "confirmed
+    // scalar" lowers.
     for &mi in inner.iter() {
         let (mi_resolved, _) = resolve_ref_one(m, mi);
         let component_kind = match m.type_of(mi_resolved) {
             Some(Type::Measure { domain, .. }) => variate_kind(domain),
             _ => None,
         };
-        if let Some(kind) = component_kind {
-            if kind != VariateKind::Scalar {
-                return Err(refuse(
-                    mi,
-                    m,
-                    "joint with a non-scalar component is not yet lowered (needs cat-slice routing)",
-                ));
-            }
+        if component_kind != Some(VariateKind::Scalar) {
+            return Err(refuse(
+                mi,
+                m,
+                "joint component variate kind is not confirmed scalar (unknown/deferred or \
+                 non-scalar); refuse rather than mislower a cat-slice",
+            ));
         }
     }
     let mut terms = Vec::with_capacity(inner.len());
@@ -1436,5 +1473,58 @@ mod tests {
             !err.reason.contains("discrete") && !err.reason.contains("multivariate"),
             "leaf-constructor refuse must be distinct from the discrete/multivariate one: {err:?}"
         );
+    }
+
+    /// Drift guard between the two hand-maintained measure-op vocabulary
+    /// lists: [`MEASURE_COMBINATOR_OPS`] here and `driver::COMBINATOR_OPS`.
+    /// They intentionally have DIFFERENT membership (see the cross-reference
+    /// comments on both), so this is deliberately NOT an equality check —
+    /// it only guards the specific hazard the two comments warn about: "a new
+    /// measure-algebra op may need adding to both lists — check the other
+    /// file too" is easy to forget in practice.
+    ///
+    /// The op names [`lower_measure_density`] dispatches to a DEDICATED
+    /// combinator-lowering rule (i.e. every match arm other than the
+    /// `record`-of-draws case and the primitive-constructor fallthrough) are
+    /// exactly the measure-algebra combinator vocabulary this module
+    /// classifies elsewhere (`base_is_measure_combinator`) — so every one of
+    /// them belongs in [`MEASURE_COMBINATOR_OPS`]. If a future combinator is
+    /// added to the dispatch match in `lower_measure_density` but the author
+    /// forgets to also add it to `MEASURE_COMBINATOR_OPS`, this test catches
+    /// it (a composed base with that head would otherwise slip past
+    /// `base_is_measure_combinator` and `kernel_and_input` would emit an
+    /// undefined `builtin_touniform(<that-head>, …)` transport).
+    #[test]
+    fn measure_combinator_ops_covers_lower_measure_density_dispatch() {
+        // Mirrors the non-fallthrough, non-`record` arms of
+        // `lower_measure_density`'s match — kept in sync BY HAND with that
+        // function; that is the drift this test exists to catch.
+        const DISPATCHED_COMBINATOR_OPS: &[&str] = &[
+            "weighted",
+            "logweighted",
+            "superpose",
+            "normalize",
+            "truncate",
+            "pushfwd",
+            "kchain",
+            "iid",
+            "joint",
+            "markovchain",
+            "kscan",
+            "jointchain",
+            "bayesupdate",
+            "disintegrate",
+            "restrict",
+            "likelihoodof",
+            "locscale",
+        ];
+        for op in DISPATCHED_COMBINATOR_OPS {
+            assert!(
+                MEASURE_COMBINATOR_OPS.contains(op),
+                "`{op}` is dispatched by lower_measure_density as a measure combinator \
+                 but is missing from MEASURE_COMBINATOR_OPS — the two hand-maintained \
+                 op-vocab lists have drifted; add `{op}` to MEASURE_COMBINATOR_OPS"
+            );
+        }
     }
 }

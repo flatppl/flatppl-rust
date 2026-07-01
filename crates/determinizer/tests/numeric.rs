@@ -164,6 +164,37 @@ lp = logdensityof(d, [0.5, -0.3, 1.2])";
     );
 }
 
+// `iid(M, n)` with a NAMED literal size (`n = 3`, referenced by `(%ref self n)`
+// rather than an inline `3`) must lower exactly like the inline-literal case.
+// `literal_usize` alone only matches `Node::Lit` directly, so a size arg that is
+// a self-ref to a literal-bound name previously refused ("iid size must be a
+// literal integer") even though `n` is statically 3 — resolving one
+// `(%ref self …)` level before `literal_usize` fixes this without widening
+// past a genuine non-literal (still refused).
+#[test]
+fn iid_named_literal_size_lowers() {
+    let src = "\
+n = 3
+d = iid(Normal(mu = 0.0, sigma = 1.0), n)
+lp = logdensityof(d, [0.5, -0.3, 1.2])";
+    let m = parse_infer(src);
+    let out = determinize(&m).expect("iid with a named literal size must lower");
+    assert!(
+        flatppl_determinizer::is_flatpdl(&out).is_ok(),
+        "must be FlatPDL"
+    );
+    let pir = flatppl_flatpir::write(&out);
+    assert_eq!(
+        pir.matches("builtin_logdensityof").count(),
+        3,
+        "3 iid terms from a named size:\n{pir}"
+    );
+    assert!(
+        !pir.contains("(iid ") && !pir.contains("(logdensityof "),
+        "no measure layer:\n{pir}"
+    );
+}
+
 // `iid` over a NON-SCALAR `M` (here a nested `iid(Normal, 2)`) must lower
 // correctly — NOT refuse, NOT mislower. This proves the deliberate asymmetry with
 // `joint`: `iid(M, size)` is the product `M^⊗N` over ARRAYS of shape `size`, a

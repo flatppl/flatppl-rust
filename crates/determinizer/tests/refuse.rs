@@ -113,6 +113,37 @@ lp = logdensityof(d, [0.5, -0.3, 1.2])";
     );
 }
 
+// A positional `joint` component whose measure-domain kind is UNKNOWN /
+// `%deferred` — not confirmed non-scalar, just never resolved — must ALSO
+// refuse (fail-closed), not lower via `get0(v, i)` on the strength of "no
+// confirmed mismatch". `flatppl_infer::infer` is best-effort: an unrecognized
+// builtin distribution name is left `%deferred` (a diagnostic is emitted, but
+// inference does not hard-error), so `b`'s inferred type here is
+// `Type::Deferred`, and `component_kind` in `lower_joint` is `None` for it.
+// Before this fail-closed tightening, only a CONFIRMED non-scalar domain
+// refused; an unresolved domain fell through unchecked and was lowered via
+// `get0(v, i)` regardless of `b`'s true (unknown) arity — a mislowering hazard
+// if `b` ever turned out to be non-scalar. Per refuse-don't-mislower, "unknown"
+// must refuse exactly like "confirmed non-scalar".
+#[test]
+fn joint_deferred_domain_component_refuses() {
+    let src = "\
+b = SomeUndefinedDist(mu = 0.0, sigma = 1.0)
+d = joint(b, Normal(mu = 0.0, sigma = 1.0))
+lp = logdensityof(d, [0.5, -0.3])";
+    let m = parse_infer(src);
+    let err = determinize(&m)
+        .expect_err("a joint component with an unresolved/deferred domain must refuse");
+    assert!(
+        err.reason.contains("not confirmed scalar"),
+        "refusal explains the domain kind is not confirmed scalar: {err:?}"
+    );
+    assert!(
+        err.reason.contains("unknown") || err.reason.contains("deferred"),
+        "refusal names the unknown/deferred case, distinct from a confirmed-non-scalar one: {err:?}"
+    );
+}
+
 // `normalize(truncate(base, interval(lo, hi)))` uses the closed-form
 // Z = touniform(base, hi) − touniform(base, lo) = CDF(hi) − CDF(lo). That
 // identity holds ONLY when `base` is a normalized univariate continuous
