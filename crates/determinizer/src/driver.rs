@@ -264,52 +264,69 @@ fn try_beta_law(m: &Module, node_id: NodeId) -> Option<NodeId> {
 
 /// Replace all occurrences of `old` with `new_id` in the subtree rooted at
 /// `root`. Returns the (possibly new) NodeId for the root after substitution.
-///
-/// The arena is append-only: we allocate new `Call` nodes whose children have
-/// been redirected, walking bottom-up. If no child is `old` the original node
-/// is reused (no allocation). This keeps the arena compact for simple rewrites.
 fn substitute_in_tree(m: &mut Module, root: NodeId, old: NodeId, new_id: NodeId) -> NodeId {
-    if root == old {
-        return new_id;
+    map_tree(m, root, &mut |_m, id| (id == old).then_some(new_id))
+}
+
+/// Bottom-up leaf-substituting rebuild of the subtree at `root`.
+///
+/// This is the single shared engine behind [`substitute_in_tree`] (which keys on
+/// a target NodeId) and `density::substitute_refs_by_name` (which keys on a
+/// `Ref(SelfMod, name)` leaf): both walk the same `children()` enumeration,
+/// rebuild only-if-changed, and reconstruct a `Call` from its mapped children.
+/// They differ ONLY in the leaf predicate, so that is the injected closure `f`:
+/// for each visited node, if `f` returns `Some(replacement)` that node is
+/// replaced wholesale (and its children are NOT visited — the caller decides what
+/// stands in); if it returns `None`, we recurse into the node's children and
+/// rebuild the `Call` when any child changed.
+///
+/// The arena is append-only: a `Call` whose children are unchanged is reused (no
+/// allocation), keeping the arena compact for simple rewrites. Only `Call` nodes
+/// carry children (see [`Node::for_each_child`]).
+///
+/// [`Inputs`](flatppl_core::Inputs) entries are `(Symbol, Ref)` leaves, NOT child
+/// sub-nodes, so this walk deliberately does not touch them — it clones them
+/// unchanged, exactly as both original functions did. A `Ref` slot in `Inputs`
+/// also cannot hold an arbitrary replacement node (it is a name reference, not a
+/// `NodeId`), so a leaf mapping that yields a value node has no representable
+/// target there; callers that must not silently skip such an input assert on it
+/// (see `density::substitute_refs_by_name`).
+pub(crate) fn map_tree(
+    m: &mut Module,
+    root: NodeId,
+    f: &mut impl FnMut(&Module, NodeId) -> Option<NodeId>,
+) -> NodeId {
+    // Leaf replacement decided by the caller's predicate. A replaced node stands
+    // in wholesale, so we do NOT descend into its (now-irrelevant) children.
+    if let Some(replacement) = f(m, root) {
+        return replacement;
     }
 
-    // Collect children and check if any need rewriting.
+    // Collect children and map each; only `Call` nodes have any.
     let children: Vec<NodeId> = m.node(root).children();
-    let new_children: Vec<NodeId> = children
-        .iter()
-        .map(|&c| substitute_in_tree(m, c, old, new_id))
-        .collect();
+    let new_children: Vec<NodeId> = children.iter().map(|&c| map_tree(m, c, f)).collect();
 
     // If nothing changed, keep the original node.
     if new_children == children {
         return root;
     }
 
-    // Rebuild the Call node with substituted children. Only `Call` nodes have
+    // Rebuild the Call node with mapped children. Only `Call` nodes have
     // children (see `Node::for_each_child`), so this arm is always reached.
     let Node::Call(orig_call) = m.node(root) else {
-        // Non-call nodes have no children — substitution would have returned
-        // early above (no children, so new_children == children == []).
+        // Non-call nodes have no children — the map would have returned early
+        // above (no children, so new_children == children == []).
         unreachable!("non-call node with children is impossible in this IR");
     };
     let head = orig_call.head;
     let inputs = orig_call.inputs.clone();
+    let pos_count = orig_call.args.len();
+    let named_count = orig_call.named.len();
 
-    // Partition new_children back into positional args and named-arg values.
-    // `for_each_child` visits: callee (User head), positional args, named values.
-    let (pos_count, named_count) = match head {
-        CallHead::User(_) => {
-            // first child is the callee node; rest split as (args, named)
-            (orig_call.args.len(), orig_call.named.len())
-        }
-        CallHead::Builtin(_) => (orig_call.args.len(), orig_call.named.len()),
-    };
-
+    // `for_each_child` visits: callee (User head) first, then positional args,
+    // then named values — mirror that partition here.
     let (new_head, child_slice) = match head {
-        CallHead::User(_) => {
-            // children = [callee, args..., named_values...]
-            (CallHead::User(new_children[0]), &new_children[1..])
-        }
+        CallHead::User(_) => (CallHead::User(new_children[0]), &new_children[1..]),
         CallHead::Builtin(s) => (CallHead::Builtin(s), &new_children[..]),
     };
 

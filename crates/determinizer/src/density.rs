@@ -15,7 +15,8 @@
 //! **Measure combinators** (Task 4) — each wraps an inner measure; recursion bottoms out at a
 //! primitive constructor:
 //! - `weighted(w, M)` → `add(log(w(v)), density(M, v))` — the weight `w` may be a
-//!   constant/scalar (used as-is) OR a **function of the variate** (§06:469), in
+//!   constant/scalar (used as-is) OR a **function of the variate**
+//!   (`06-measure-algebra.md:473`), in
 //!   which case it is **applied at the variate**: `log w(v)`. When `w`'s body
 //!   contains measure ops (e.g. an inner `logdensityof`), the driver's subtree
 //!   scan finds and lowers them on a later iteration and the plain-function call
@@ -29,7 +30,10 @@
 //!   `base` a **normalized** univariate constructor, → `sub(density(M, v),
 //!   log(sub(touniform(base, hi), touniform(base, lo))))` — the closed-form
 //!   `Z = CDF(hi) - CDF(lo)` via the `builtin_touniform` CDF transport
-//!   (§06:471; valid only for a normalized base, §07:829); **refuses** for any
+//!   (`builtin_touniform` is the CDF `F` for univariate continuous kernels,
+//!   `07-functions.md:831`; valid only for a normalized base — the transport
+//!   is defined only for continuous kernels, `07-functions.md:838`);
+//!   **refuses** for any
 //!   other unnormalized `M` — including a `truncate` whose `base` is itself
 //!   unnormalized (e.g. `Lebesgue`), where the CDF-Z identity does not hold
 //!   (no closed-form mass rule; `totalmass` is OUT of FlatPDL).
@@ -174,70 +178,67 @@ fn theta_field_map(m: &Module, theta: NodeId) -> Result<Vec<(Symbol, NodeId)>, R
 /// Replace every `(%ref self <name>)` in the subtree at `root` with the node
 /// mapped from `<name>` in `map`, returning the (possibly new) root node id.
 ///
-/// This mirrors the append-only bottom-up rebuild of `substitute_in_tree`
-/// (`driver.rs`), but keys on a `Ref(SelfMod, name)` leaf rather than a single
-/// target NodeId — so one pass over the emitted density subtree inlines ALL θ
-/// fields at once. Only `Call` nodes carry children; a matched self-ref is
-/// itself a leaf, so it is replaced before its (nonexistent) children recurse.
+/// Thin wrapper over the shared bottom-up rebuild [`crate::driver::map_tree`]
+/// (which also backs `driver::substitute_in_tree`): both walk the same
+/// `children()` enumeration and rebuild only-if-changed. This one keys on a
+/// `Ref(SelfMod, name)` leaf rather than a target NodeId — so one pass inlines
+/// ALL θ fields at once. A matched self-ref is a leaf, replaced wholesale before
+/// its (nonexistent) children recurse.
+///
+/// **Scope limit (θ-capturing reification inputs).** `map_tree` walks
+/// `children()`, which does NOT include a `Call`'s [`flatppl_core::Inputs`] — the
+/// `(Symbol, Ref)` boundary entries of a `functionof` / `kernelof` reification.
+/// Such an entry's `Ref` CAN be `Ref(SelfMod, name)`, so a θ param captured as a
+/// reification boundary input would NOT be inlined by this walk (and an `Inputs`
+/// slot cannot hold a value node anyway — it is a name reference). No density
+/// lowering emitted here builds such a reification: the density subtree is the
+/// deterministic `builtin_logdensityof` / arithmetic tree produced by
+/// [`lower_measure_density`], never a `functionof` / `kernelof` whose inputs
+/// close over a θ binding. We assert that invariant so the scope limit is
+/// explicit and trips loudly (in debug builds) if a future lowering violates it,
+/// rather than silently dropping a θ inlining across a reification boundary.
 fn substitute_refs_by_name(m: &mut Module, root: NodeId, map: &[(Symbol, NodeId)]) -> NodeId {
-    // Leaf self-ref: replace if its name is in the map.
-    if let Node::Ref(Ref {
-        ns: RefNs::SelfMod,
-        name,
-    }) = m.node(root)
-    {
-        if let Some((_, value)) = map.iter().find(|(n, _)| n == name) {
-            return *value;
+    debug_assert!(
+        !subtree_has_theta_capturing_input(m, root, map),
+        "substitute_refs_by_name assumes no reification captures a θ param as an \
+         Inputs boundary entry; map_tree walks children() only, so such an input \
+         would be silently skipped"
+    );
+    crate::driver::map_tree(m, root, &mut |m, id| {
+        if let Node::Ref(Ref {
+            ns: RefNs::SelfMod,
+            name,
+        }) = m.node(id)
+        {
+            if let Some((_, value)) = map.iter().find(|(n, _)| n == name) {
+                return Some(*value);
+            }
         }
-        return root;
+        None
+    })
+}
+
+/// True iff some `functionof` / `kernelof` reification in the subtree at `root`
+/// carries a `Spec` [`flatppl_core::Inputs`] boundary entry whose `Ref` is a
+/// `Ref(SelfMod, name)` for a `name` in `map` — i.e. a θ param captured as a
+/// reification input that [`substitute_refs_by_name`]'s `children()`-only walk
+/// would not reach. Debug-assert companion documenting/enforcing that scope
+/// limit; not compiled into release builds' hot path.
+fn subtree_has_theta_capturing_input(m: &Module, root: NodeId, map: &[(Symbol, NodeId)]) -> bool {
+    let mut stack = vec![root];
+    while let Some(id) = stack.pop() {
+        if let Node::Call(c) = m.node(id) {
+            if let Some(flatppl_core::Inputs::Spec(entries)) = &c.inputs {
+                for (_, r) in entries.iter() {
+                    if r.ns == RefNs::SelfMod && map.iter().any(|(n, _)| *n == r.name) {
+                        return true;
+                    }
+                }
+            }
+        }
+        m.for_each_child(id, |c| stack.push(c));
     }
-
-    // Otherwise recurse into children (only `Call` nodes have any).
-    let children: Vec<NodeId> = m.node(root).children();
-    if children.is_empty() {
-        return root;
-    }
-    let new_children: Vec<NodeId> = children
-        .iter()
-        .map(|&c| substitute_refs_by_name(m, c, map))
-        .collect();
-    if new_children == children {
-        return root;
-    }
-
-    let Node::Call(orig_call) = m.node(root) else {
-        unreachable!("non-call node with children is impossible in this IR");
-    };
-    let head = orig_call.head;
-    let inputs = orig_call.inputs.clone();
-    let pos_count = orig_call.args.len();
-    let named_count = orig_call.named.len();
-
-    // `for_each_child` visits: callee (User head) first, then positional args,
-    // then named values — mirror that partition here.
-    let (new_head, child_slice) = match head {
-        CallHead::User(_) => (CallHead::User(new_children[0]), &new_children[1..]),
-        CallHead::Builtin(s) => (CallHead::Builtin(s), &new_children[..]),
-    };
-    let new_args: Vec<NodeId> = child_slice[..pos_count].to_vec();
-    let new_named_values: Vec<NodeId> = child_slice[pos_count..pos_count + named_count].to_vec();
-    let new_named: Vec<NamedArg> = orig_call
-        .named
-        .iter()
-        .zip(new_named_values.iter())
-        .map(|(n, &v)| NamedArg {
-            kind: n.kind,
-            name: n.name,
-            value: v,
-        })
-        .collect();
-
-    m.alloc(Node::Call(Call {
-        head: new_head,
-        args: new_args.into(),
-        named: new_named.into(),
-        inputs,
-    }))
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -306,7 +307,9 @@ fn lower_record_of_draws(
 ) -> Result<NodeId, RefuseError> {
     let components = match_independent_record(m, record_node, v)?;
 
-    // Empty record (degenerate joint): log-density is 0 (§10 item 5).
+    // Empty record (degenerate joint): a sum over no components. The independent-
+    // product density is Σᵢ logdensityof(Mᵢ, xᵢ) (`06-measure-algebra.md:477`),
+    // whose empty case is 0.
     if components.is_empty() {
         return Ok(m.alloc(Node::Lit(Scalar::Real(0.0))));
     }
@@ -457,7 +460,8 @@ fn weight_is_variate_dependent(m: &Module, w_node: NodeId) -> bool {
 }
 
 /// `logdensityof(weighted(w, M), v)` = `log w(v) + logdensityof(M, v)`, where `w`
-/// is a constant/scalar OR a function of the variate (§06:469). A constant/scalar
+/// is a constant/scalar OR a function of the variate (`06-measure-algebra.md:473`).
+/// A constant/scalar
 /// weight is used as-is (`log(w) + density`); a variate-dependent (function)
 /// weight is **applied at the variate** (`log w(v) + density`), with `w(v)` =
 /// `build_user_call(m, w_node, v)` — see [`weight_is_variate_dependent`].
@@ -482,7 +486,8 @@ fn lower_weighted(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Ref
 }
 
 /// `logdensityof(logweighted(ℓ, M), v)` = `ℓ(v) + logdensityof(M, v)`, where `ℓ`
-/// is a constant/scalar OR a function of the variate (§06:469). The log-weight is
+/// is a constant/scalar OR a function of the variate (`06-measure-algebra.md:473`).
+/// The log-weight is
 /// already in log space, so there is no outer `log`: a constant/scalar `ℓ` is used
 /// as-is, and a variate-dependent (function) log-weight is **applied at the
 /// variate** (`ℓ(v) + density`), with `ℓ(v)` = `build_user_call(m, lw_node, v)`.
@@ -539,9 +544,10 @@ fn lower_superpose(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Re
 ///   `-inf` outside-support gate is already handled by the existing `truncate`
 ///   lowering, so the emitted density term is just `lower_measure_density(m,
 ///   m_inner, v)` minus this `logZ`. The base MUST be normalized: the CDF-Z
-///   identity holds only for a normalized base, since `builtin_touniform` (the
-///   CDF) is defined only for a normalized univariate continuous measure
-///   (§07:829). An unnormalized base (e.g. `Lebesgue(reals)`, where the true
+///   identity holds only for a normalized base, since `builtin_touniform` is the
+///   CDF `F` only for univariate continuous kernels (`07-functions.md:831`) and
+///   the transport is defined only for continuous kernels (`07-functions.md:838`).
+///   An unnormalized base (e.g. `Lebesgue(reals)`, where the true
 ///   `Z = hi − lo` and `touniform` is undefined) does NOT take this path — it
 ///   falls through to the refuse below, rather than silently mislowering.
 ///
@@ -601,7 +607,9 @@ fn lower_normalize(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Re
         // The CDF-Z identity `Z = touniform(base, hi) − touniform(base, lo) =
         // totalmass(truncate(base, S))` (§06:471) holds ONLY when `base` is a
         // normalized univariate continuous probability measure — `builtin_touniform`
-        // (= the CDF transport) is defined only for that class (§07:829). For an
+        // is the CDF `F` only for univariate continuous kernels
+        // (`07-functions.md:831`) and the transport is defined only for continuous
+        // kernels (`07-functions.md:838`). For an
         // unnormalized base (e.g. `Lebesgue(reals)`) the true `Z = hi − lo` and
         // `touniform` is undefined, so applying the CDF path would silently
         // mislower. Gate on the (resolved) base's mass; if it is not `Normalized`,
@@ -752,12 +760,26 @@ fn literal_usize(m: &Module, id: NodeId) -> Option<usize> {
     }
 }
 
-/// `logdensityof(iid(M, N), v)` = `Σ_{i<N} logdensityof(M, get0(v, i))` (§06:473,
-/// "iid(M, n) → Σ_i log densityof(M, xᵢ)"). N comes from the `iid` count arg,
-/// which must be a literal integer. Static unroll (corpus N small; broadcast+
-/// reduce is the noted scale path, not built). `N == 0` is the empty independent
-/// product: Σ over an empty index set is 0, so it lowers to the log-density
-/// literal `0.0` (consistent with the empty measure `record()`), not a refusal.
+/// `logdensityof(iid(M, N), v)` = `Σ_{i<N} logdensityof(M, get0(v, i))`
+/// (`06-measure-algebra.md:477`, "iid(M, n) → Σ_i log densityof(M, xᵢ)"). N comes
+/// from the `iid` count arg, which must be a literal integer. Static unroll
+/// (corpus N small; broadcast+reduce is the noted scale path, not built).
+/// `N == 0` is the empty independent product: Σ over an empty index set is 0, so
+/// it lowers to the log-density literal `0.0` (consistent with the empty measure
+/// `record()`), not a refusal.
+///
+/// **No scalar-`M` guard — deliberate asymmetry with [`lower_joint`].** `iid(M,
+/// size)` is the product `M^⊗N` over ARRAYS of shape `size`, i.e. a NESTED variate
+/// with a leading repeat axis `[N, …M-shape]` (`06-measure-algebra.md:176` and
+/// `06-measure-algebra.md:212`). So `get0(v, i)` recovers the full i-th
+/// `M`-variate (an entire row), which is exactly what this rule scores `M` at —
+/// correct for ANY `M`, scalar or not (a non-scalar `M`, e.g. `iid(MvNormal, n)`
+/// or a nested `iid(iid(…), n)`, lowers correctly, its inner variate reached by a
+/// further `get0`). `joint`, by contrast, has a HETEROGENEOUS variate: the flat
+/// `cat` of its component variates, so `joint`'s positional `get0(v, i)` only
+/// aligns when every component is scalar — hence the scalar-component guard in
+/// [`lower_joint`]. Adding that guard here would WRONGLY refuse valid non-scalar
+/// `iid`, so it is intentionally absent.
 fn lower_iid(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseError> {
     let (m_inner, n) = {
         let c =
@@ -770,7 +792,8 @@ fn lower_iid(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseEr
         (c.args[0], n)
     };
     // Empty independent product: Σ over an empty index set is 0 (log-density 0),
-    // exactly as an empty measure `record()` lowers (§10 item 5). Short-circuit
+    // exactly as an empty measure `record()` lowers (the iid Σ rule,
+    // `06-measure-algebra.md:477`, with an empty index set). Short-circuit
     // BEFORE `fold_add`, which requires at least one term.
     if n == 0 {
         return Ok(m.alloc(Node::Lit(Scalar::Real(0.0))));
@@ -784,11 +807,13 @@ fn lower_iid(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseEr
     Ok(fold_add(m, &terms))
 }
 
-/// `logdensityof(joint(M₁,…,Mₖ), v)` = `Σ logdensityof(Mᵢ, get0(v, i))` (§06:473).
-/// The variate is the positional `cat` of the component variates.
+/// `logdensityof(joint(M₁,…,Mₖ), v)` = `Σ logdensityof(Mᵢ, get0(v, i))`
+/// (`06-measure-algebra.md:477`). The variate is the positional `cat` of the
+/// component variates.
 ///
 /// **Scope:** positional `joint` only, scalar-variate components. `joint`'s
-/// variate is the positional `cat` of the component variates (§06:473); for
+/// variate is the positional `cat` of the component variates
+/// (`06-measure-algebra.md:477`); for
 /// scalar-variate components the destructuring is `get0(v, i)`, one slot per
 /// component. Component variates of higher rank need `cat`-slice routing, which
 /// this does not build — a component whose measure domain is non-scalar
@@ -890,7 +915,7 @@ pub(crate) fn build_density_term(
 ) -> Result<NodeId, RefuseError> {
     // Refuse scoring a measure at a variate whose structural KIND clearly
     // mismatches the measure's variate domain — a scalar `Normal` scored at a
-    // record / tuple / vector (review finding F4). Inference does not reject
+    // record / tuple / vector. Inference does not reject
     // this, so guard here per the refuse-don't-mislower discipline rather than
     // emit an ill-typed `builtin_logdensityof`. Conservative: an unknown side or
     // a matching kind passes; only a definite kind mismatch refuses. (The

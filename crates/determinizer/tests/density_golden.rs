@@ -281,7 +281,7 @@ fn determinize_src(src: &str) -> flatppl_core::Module {
 // mismatch (spec §06: the variate shape must match the data shape). Inference
 // does not reject it, so the determinizer must REFUSE rather than emit an
 // ill-typed builtin_logdensityof scoring a scalar Normal at a record/vector
-// (review finding F4).
+// (refuse a definite measure-domain-vs-variate kind mismatch).
 #[test]
 fn scalar_draw_scored_at_record_variate_refuses() {
     let src = "\

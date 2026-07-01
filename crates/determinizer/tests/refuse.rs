@@ -60,7 +60,8 @@ r = rand(s, lawof(draw(Normal(mu = 0.0, sigma = 1.0))))";
 }
 
 // Note: a variate-dependent (function) `weighted`/`logweighted` weight is NO
-// LONGER refused — per §06:469 the weight may be a function of the variate, so it
+// LONGER refused — per `06-measure-algebra.md:473` the weight may be a function
+// of the variate, so it
 // is APPLIED at the variate (`log w(v)` / `ℓ(v)`). The structural apply-path tests
 // live in `tests/numeric.rs` (`weighted_function_weight_oracle`,
 // `logweighted_function_weight_oracle`).
@@ -94,7 +95,7 @@ lp = logdensityof(d, record(x = 0.5, y = 0.5))";
 // the downstream `build_density_term` domain check compares against
 // `get0(v, i)` (which infers to `%deferred`/`%unknown`) and so is skipped. The
 // gate here reads each component's OWN measure domain kind, which IS known
-// (review finding F1).
+// (refuse up front on a non-scalar joint component's measure domain).
 #[test]
 fn joint_nonscalar_component_refuses() {
     let src = "\
@@ -115,11 +116,14 @@ lp = logdensityof(d, [0.5, -0.3, 1.2])";
 // `normalize(truncate(base, interval(lo, hi)))` uses the closed-form
 // Z = touniform(base, hi) − touniform(base, lo) = CDF(hi) − CDF(lo). That
 // identity holds ONLY when `base` is a normalized univariate continuous
-// probability measure — `builtin_touniform` (the CDF) is defined only for that
-// class (§07). For an UNNORMALIZED base (here `Lebesgue(reals)`, whose true
+// probability measure — `builtin_touniform` is the CDF only for univariate
+// continuous kernels (`07-functions.md:831`), and the transport is defined only
+// for continuous kernels (`07-functions.md:838`). For an UNNORMALIZED base
+// (here `Lebesgue(reals)`, whose true
 // Z = hi − lo and for which `touniform` is undefined) the CDF path silently
 // mislowers, so the determiniser must NOT take it — it falls through to the
-// refuse (no closed-form Z for an unnormalized base is built; review finding F2).
+// refuse (no closed-form Z for an unnormalized base is built; refuse
+// normalize(truncate(<unnormalized base>, …)) rather than use the CDF-Z path).
 #[test]
 fn normalize_truncate_unnormalized_base_refuses() {
     let src = "\

@@ -164,6 +164,72 @@ lp = logdensityof(d, [0.5, -0.3, 1.2])";
     );
 }
 
+// `iid` over a NON-SCALAR `M` (here a nested `iid(Normal, 2)`) must lower
+// correctly — NOT refuse, NOT mislower. This proves the deliberate asymmetry with
+// `joint`: `iid(M, size)` is the product `M^⊗N` over ARRAYS of shape `size`, a
+// nested variate with a leading repeat axis `[N, …M-shape]`
+// (`06-measure-algebra.md:176` and `06-measure-algebra.md:212`). So the outer
+// `get0(v, i)` recovers the full i-th `M`-variate (an entire inner row), and the
+// inner rule then projects each scalar with a further `get0`. There is
+// deliberately NO scalar-component guard on `iid` (unlike `joint`, whose flat
+// `cat` variate needs one); adding one would WRONGLY refuse this valid model.
+//
+// Model: iid(iid(Normal(0,1), 2), 3) scored at a shape-[3,2] array literal.
+// Expected: 3×2 = 6 `builtin_logdensityof` terms, each reached by a NESTED
+// projection get0(get0(v, i), j), and no residual measure layer.
+#[test]
+fn iid_nonscalar_inner_measure_lowers_with_nested_get0() {
+    let src = "\
+d = iid(iid(Normal(mu = 0.0, sigma = 1.0), 2), 3)
+lp = logdensityof(d, [[0.5, -0.3], [1.2, 0.1], [-0.7, 0.9]])";
+    let m = parse_infer(src);
+    let out = determinize(&m).expect("iid over a non-scalar M must lower, not refuse");
+    assert!(
+        flatppl_determinizer::is_flatpdl(&out).is_ok(),
+        "emitted FlatPDL must be conformant"
+    );
+    let pir = flatppl_flatpir::write(&out);
+    // 3 outer rows × 2 inner elements = 6 primitive density terms.
+    assert_eq!(
+        pir.matches("builtin_logdensityof").count(),
+        6,
+        "3×2 nested-iid terms:\n{pir}"
+    );
+    // No residual measure layer: neither the nested `iid` nor the query survives.
+    assert!(
+        !pir.contains("(iid ") && !pir.contains("(logdensityof "),
+        "no measure layer:\n{pir}"
+    );
+    // The KEY structural claim: the inner scalar is reached by a NESTED
+    // projection `get0(get0(v, i), j)` — proving the outer `get0(v, i)` recovers
+    // the full inner `M`-variate (a shape-[2] ROW), NOT a scalar. Two levels of
+    // `get0` means 2 heads per term × 6 = 12 total `get0` projections.
+    assert_eq!(
+        pir.matches("(get0 ").count(),
+        12,
+        "two-level (nested) get0 projection per term, 12 total:\n{pir}"
+    );
+    // The OUTER get0's operand is the inner-`iid` row: a shape-[2] array produced
+    // by the inner `get0`. FlatPIR annotates that operand `(%meta ((%array 1 (2)
+    // (%scalar real)) …`, so the outer get0 over a row prints as
+    // `(get0 (%meta ((%array 1 (2) (%scalar real)) …` — one per term (6 total).
+    // This is the discriminating evidence that the outer projection recovers a
+    // full inner-variate row, not a scalar (a scalar operand would be `%scalar`,
+    // not `%array`).
+    assert_eq!(
+        pir.matches("(get0 (%meta ((%array 1 (2) (%scalar real))")
+            .count(),
+        6,
+        "each outer get0 projects a full inner-iid ROW (array[2]), not a scalar:\n{pir}"
+    );
+    // All six terms score the SAME leaf kernel/params: Normal(mu=0.0, sigma=1.0).
+    assert_eq!(
+        pir.matches("(%field mu 0.0) (%field sigma 1.0)").count(),
+        6,
+        "all six nested-iid terms score Normal(0,1):\n{pir}"
+    );
+}
+
 #[test]
 fn joint_two_gaussians_structure() {
     // logdensityof(joint(Normal(0,1), Normal(1,2)), [0.5, 0.5]) →
@@ -515,9 +581,9 @@ fn empty_record_is_zero() {
 }
 
 // Empty independent product: `iid(M, 0)` is Σ over an empty index set = 0, the
-// same as the empty measure `record()` (§10 item 5 / §06). It lowers to the
-// log-density literal 0 with NO density term — it is NOT refused (both empty
-// products must agree; review finding F4).
+// same as the empty measure `record()` (the iid Σ rule, `06-measure-algebra.md:477`,
+// with an empty index set). It lowers to the log-density literal 0 with NO
+// density term — it is NOT refused (both empty products must agree).
 #[test]
 fn iid_zero_size_is_zero() {
     let src = "\
