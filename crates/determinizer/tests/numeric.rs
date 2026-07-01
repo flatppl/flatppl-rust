@@ -366,7 +366,7 @@ lp2 = logdensityof(obs, record(mu = 5.0, sigma = 2.0))";
     );
 }
 
-// Regression fixture for audit finding H3 (§6a:167-168): a variate reached
+// Regression fixture for transitive pinning (audit finding H3): a variate reached
 // through a derived binding (`a = 2·theta`, `theta = draw(M)`) must score at
 // the pinned `theta` and propagate transitively — no stochastic `draw` may
 // survive, even though `a` is unreferenced by `lp` and depends on `theta`.
