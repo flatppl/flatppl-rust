@@ -61,20 +61,50 @@ fn prod_of_sizeof_resolves_iid_count() {
 // ---- the op-gap vs %dynamic distinction (§17.1) ----
 
 /// A fixed op the evaluator cannot fold at a shape position is a LOUD diagnostic
-/// (never a silent `%dynamic` that hides the gap). `div` is fixed-phase and
-/// computable in principle but not (yet) in the const-eval table, so it must
-/// report — mentioning the op and that a shape needs it.
+/// (never a silent `%dynamic` that hides the gap). `max` is fixed-phase and
+/// integer-valued but not (yet) in the const-eval table, so it must report —
+/// mentioning the op and that a shape needs it.
 ///
-/// (When `div` joins the const-eval table this flips to assert resolution — a
+/// (When `max` joins the const-eval table this flips to assert resolution — a
 /// deliberate gap-documenting test, per the testing conventions.)
 #[test]
 fn op_gap_at_shape_position_is_a_loud_diagnostic() {
-    let ds = diags_at("x ~ iid(Normal(0.0, 1.0), div(6, 2))", Level::Shape);
+    let ds = diags_at("x ~ iid(Normal(0.0, 1.0), max(6, 2))", Level::Shape);
     assert!(
         ds.iter()
-            .any(|d| d.message.contains("div") && d.message.contains("shape")),
+            .any(|d| d.message.contains("max") && d.message.contains("shape")),
         "an unfoldable fixed op at a shape position should emit a loud diagnostic, got: {:?}",
         ds.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+/// `div`/`mod` fold at a shape position (spec §07: floor division / modulo).
+/// `div(7, 2) = 3`, `mod(7, 2) = 1` — distinct results so a swapped op shows.
+#[test]
+fn div_mod_resolve_at_shape_position() {
+    let out = ir_at("x ~ iid(Normal(0.0, 1.0), div(7, 2))", Level::Shape);
+    assert!(
+        out.contains("(%array 1 (3) (%scalar real))"),
+        "div(7, 2) should resolve to dim 3, got:\n{out}"
+    );
+    let out = ir_at("x ~ iid(Normal(0.0, 1.0), mod(7, 2))", Level::Shape);
+    assert!(
+        out.contains("(%array 1 (1) (%scalar real))"),
+        "mod(7, 2) should resolve to dim 1, got:\n{out}"
+    );
+}
+
+/// Indexing a fixed shape vector folds (1-based `get`): `sizeof(A)[2]` selects
+/// A's second axis. A is 3×7 (distinct axes) → `sizeof(A)[2] = 7`.
+#[test]
+fn get_indexes_a_fixed_shape_vector() {
+    let out = ir_at(
+        "A = fill(0.0, [3, 7])\nn = sizeof(A)[2]\nx ~ iid(Normal(0.0, 1.0), n)",
+        Level::Shape,
+    );
+    assert!(
+        out.contains("(%array 1 (7) (%scalar real))"),
+        "sizeof(3x7)[2] should resolve to dim 7, got:\n{out}"
     );
 }
 
@@ -100,11 +130,11 @@ fn parameterized_size_stays_dynamic_without_a_gap_error() {
 /// `%dynamic` wins over a gap: if a size expression mixes a genuinely-dynamic
 /// operand with an unfoldable op, the result is `%dynamic` with NO error — we
 /// only nag about an op-gap when the value would otherwise be fully known. Here
-/// `add(n, div(6, 2))` has a parameterized `n` (dynamic) and an unfoldable
-/// `div` (gap); dynamic dominates, so no diagnostic fires.
+/// `add(n, max(6, 2))` has a parameterized `n` (dynamic) and an unfoldable
+/// `max` (gap); dynamic dominates, so no diagnostic fires.
 #[test]
 fn dynamic_dominates_a_gap_no_error() {
-    let src = "n = elementof(nonnegintegers)\nx ~ iid(Normal(0.0, 1.0), add(n, div(6, 2)))";
+    let src = "n = elementof(nonnegintegers)\nx ~ iid(Normal(0.0, 1.0), add(n, max(6, 2)))";
     let ds = diags_at(src, Level::Shape);
     assert!(
         !ds.iter().any(|d| d.message.contains("shape")),

@@ -58,8 +58,28 @@ fn eval_arith(op: &str, a: &FixedValue, b: &FixedValue) -> Option<FixedValue> {
         "add" => x.checked_add(*y)?,
         "sub" => x.checked_sub(*y)?,
         "mul" => x.checked_mul(*y)?,
+        "div" => floor_div(*x, *y)?,
+        "mod" => floor_mod(*x, *y)?,
         _ => return None,
     }))
+}
+
+/// Spec §07 integer floor division `⌊a/b⌋` — distinct from Rust's truncating `/`
+/// when the signs differ. `None` on division by zero or `i64::MIN / -1`.
+fn floor_div(a: i64, b: i64) -> Option<i64> {
+    let q = a.checked_div(b)?; // b == 0 or MIN/-1 → None
+    let r = a % b;
+    Some(if r != 0 && (r < 0) != (b < 0) {
+        q - 1
+    } else {
+        q
+    })
+}
+
+/// Spec §07 modulo `a − b·⌊a/b⌋` (sign of `b`; `None` on `b == 0` / overflow).
+fn floor_mod(a: i64, b: i64) -> Option<i64> {
+    let q = floor_div(a, b)?;
+    a.checked_sub(b.checked_mul(q)?)
 }
 
 /// `prod`/`sum` over a vector of integers. `None` if an element is not a scalar
@@ -135,9 +155,11 @@ fn eval_call(inf: &mut Inferencer<'_, '_>, node: NodeId, c: &Call, depth: u32) -
         "sizeof" => sizeof_observer(inf, c),
 
         // Pure value ops (the liftable core).
-        op @ ("add" | "sub" | "mul") => binary(inf, c, depth, op),
+        op @ ("add" | "sub" | "mul" | "div" | "mod") => binary(inf, c, depth, op),
         "neg" => unary_neg(inf, c, depth),
         op @ ("prod" | "sum") => reduce(inf, c, depth, op),
+        "get" => index(inf, c, depth, 1),
+        "get0" => index(inf, c, depth, 0),
 
         // Fixed-phase but runtime-determined value sources: known `%dynamic`,
         // never a gap (`external`/`load_data` are compile-time-unknown; the
@@ -241,6 +263,34 @@ fn reduce(inf: &mut Inferencer<'_, '_>, c: &Call, depth: u32, op: &str) -> Const
         // `prod`/`sum` of a non-vector is a type error handled elsewhere.
         ConstEval::Val(_) => ConstEval::Dynamic,
         other => other,
+    }
+}
+
+/// A single integer index into a fixed vector — `get(v, i)` / `get0(v, i)`, the
+/// shape case `sizeof(A)[2]`. `base` is 1 for `get`, 0 for `get0`. Only this
+/// single-scalar-into-vector form folds; record / multi-index / subset `get`
+/// shapes stay `Dynamic`.
+fn index(inf: &mut Inferencer<'_, '_>, c: &Call, depth: u32, base: i64) -> ConstEval {
+    // Exactly one selector (a second would be multi-dim array indexing).
+    let (Some(&container), Some(&sel), None) = (c.args.first(), c.args.get(1), c.args.get(2))
+    else {
+        return ConstEval::Dynamic;
+    };
+    match (
+        const_eval(inf, container, depth + 1),
+        const_eval(inf, sel, depth + 1),
+    ) {
+        (ConstEval::Val(FixedValue::Vec(elems)), ConstEval::Val(FixedValue::Int(i))) => {
+            usize::try_from(i - base)
+                .ok()
+                .and_then(|k| elems.get(k).cloned())
+                .map_or(ConstEval::Dynamic, ConstEval::Val)
+        }
+        // `Dynamic` dominates `Gap` (match order matters).
+        (ConstEval::Dynamic, _) | (_, ConstEval::Dynamic) => ConstEval::Dynamic,
+        (ConstEval::Gap(g), _) | (_, ConstEval::Gap(g)) => ConstEval::Gap(g),
+        // A non-vector container or non-integer selector: a type error elsewhere.
+        _ => ConstEval::Dynamic,
     }
 }
 
