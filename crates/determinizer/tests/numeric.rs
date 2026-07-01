@@ -173,6 +173,26 @@ lp = logdensityof(d, [0.5, -0.3, 1.2])";
     );
 }
 
+#[test]
+fn joint_two_gaussians_oracle() {
+    // logdensityof(joint(Normal(0,1), Normal(1,2)), [0.5, 0.5]) = logN(0.5;0,1)+logN(0.5;1,2)
+    let oracle = gaussian_logpdf(0.5, 0.0, 1.0) + gaussian_logpdf(0.5, 1.0, 2.0);
+    let src = "\
+d = joint(Normal(mu = 0.0, sigma = 1.0), Normal(mu = 1.0, sigma = 2.0))
+lp = logdensityof(d, [0.5, 0.5])";
+    let m = parse_infer(src);
+    let out = determinize(&m).expect("joint must lower");
+    assert!(flatppl_determinizer::is_flatpdl(&out).is_ok());
+    let pir = flatppl_flatpir::write(&out);
+    assert_eq!(
+        pir.matches("builtin_logdensityof").count(),
+        2,
+        "2 joint terms:\n{pir}"
+    );
+    assert!(!pir.contains("(joint "), "no joint:\n{pir}");
+    assert!(oracle.is_finite());
+}
+
 // ── JS engine scoring (requires FLATPPL_JS_DIR + Node 24) ────────────────────
 //
 // These tests are #[ignore]d because they require an external JS engine and
@@ -404,6 +424,24 @@ d = iid(Normal(mu = 0.0, sigma = 1.0), 3)
 lp = logdensityof(d, [0.5, -0.3, 1.2])";
     let m = parse_infer(src);
     let out = determinize(&m).expect("iid must lower");
+    let result = js_score(&flatppl_syntax::print(&out), "lp")
+        .expect("FLATPPL_JS_DIR must be set")
+        .expect("JS scoring must succeed");
+    assert!(
+        (result - oracle).abs() <= 1e-9,
+        "JS {result} vs oracle {oracle}"
+    );
+}
+
+#[test]
+#[ignore = "requires FLATPPL_JS_DIR + Node 24; run with --include-ignored"]
+fn joint_two_gaussians_js_engine_matches_oracle() {
+    let oracle = gaussian_logpdf(0.5, 0.0, 1.0) + gaussian_logpdf(0.5, 1.0, 2.0);
+    let src = "\
+d = joint(Normal(mu = 0.0, sigma = 1.0), Normal(mu = 1.0, sigma = 2.0))
+lp = logdensityof(d, [0.5, 0.5])";
+    let m = parse_infer(src);
+    let out = determinize(&m).expect("joint must lower");
     let result = js_score(&flatppl_syntax::print(&out), "lp")
         .expect("FLATPPL_JS_DIR must be set")
         .expect("JS scoring must succeed");

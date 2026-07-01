@@ -390,6 +390,11 @@ const COMBINATOR_OPS: &[&str] = &[
     // iid(...)` binding referenced only by the now-lowered `logdensityof` query
     // is orphaned the same way a `weighted`/`superpose` binding is.
     "iid",
+    // Positional-joint combinator (Task 2 follow-on): `joint(M1, …, Mk)` is
+    // likewise consumed through the density rule (unrolled into per-component
+    // terms), so a `d = joint(...)` binding referenced only by the now-lowered
+    // `logdensityof` query is orphaned the same way.
+    "joint",
 ];
 
 /// After a `logdensityof` rewrite, scan all bindings whose RHS is a measure

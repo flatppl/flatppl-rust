@@ -31,11 +31,19 @@
 //! - `iid(M, N)` → `Σ_{i<N} density(M, get0(v, i))` — **`N` must be a literal
 //!   integer** (static unroll; corpus `N` is small). A non-literal `N` is
 //!   **refused**.
+//! - `joint(M₁,…,Mₖ)` (**positional only**) → `Σᵢ density(Mᵢ, get0(v, i))` —
+//!   **scalar-variate components only**; a non-scalar component variate
+//!   refuses via the recursive call's own domain/variate shape check. Keyword
+//!   `joint(name = M, …)` (named components → record variate) shares the
+//!   `joint` op name so it reaches the same dispatch arm, but its components
+//!   live in `named` with an empty positional `args`, so it is **refused**
+//!   rather than mislowered.
 //!
-//! **Refused:** `kchain` marginals, `joint`, `bayesupdate`, `disintegrate`, `restrict`,
-//! `likelihoodof`, `pushfwd` with a non-bijection argument, a variate-dependent
-//! (function-valued) `weighted`/`logweighted` weight, `iid` with a non-literal
-//! size, and any unrecognised shape.
+//! **Refused:** `kchain` marginals, keyword `joint`, `bayesupdate`, `disintegrate`,
+//! `restrict`, `likelihoodof`, `pushfwd` with a non-bijection argument, a
+//! variate-dependent (function-valued) `weighted`/`logweighted` weight, `iid`
+//! with a non-literal size, `joint` with a non-scalar component variate, and
+//! any unrecognised shape.
 
 use crate::refuse::RefuseError;
 use flatppl_core::{
@@ -88,10 +96,12 @@ pub(crate) fn lower_measure_density(
         // continuous / infinite-discrete / non-enumerable → refuse (Task 5).
         Some("kchain") => crate::marginal::lower_kchain_marginal(m, measure_node, v),
         Some("iid") => lower_iid(m, measure_node, v),
+        Some("joint") => lower_joint(m, measure_node, v),
         // Refused combinators — refused here rather than mis-lowered.
-        Some("joint") | Some("markovchain") | Some("kscan") | Some("jointchain")
-        | Some("bayesupdate") | Some("disintegrate") | Some("restrict") | Some("likelihoodof")
-        | Some("locscale") => Err(refuse_op(measure_node, m)),
+        Some("markovchain") | Some("kscan") | Some("jointchain") | Some("bayesupdate")
+        | Some("disintegrate") | Some("restrict") | Some("likelihoodof") | Some("locscale") => {
+            Err(refuse_op(measure_node, m))
+        }
         // Fallthrough: treat as a primitive distribution constructor.
         _ => build_density_term(m, measure_node, v),
     }
@@ -489,6 +499,38 @@ fn lower_iid(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseEr
         let idx = m.alloc(Node::Lit(Scalar::Int(i as i64)));
         let elem = build_call(m, "get0", &[v, idx]);
         terms.push(lower_measure_density(m, m_inner, elem)?);
+    }
+    Ok(fold_add(m, &terms))
+}
+
+/// `logdensityof(joint(M₁,…,Mₖ), v)` = `Σ logdensityof(Mᵢ, get0(v, i))` (§06:473).
+/// The variate is the positional `cat` of the component variates.
+///
+/// **Scope:** positional `joint` only, scalar-variate components. `joint`'s
+/// variate is the positional `cat` of the component variates (§06:473); for
+/// scalar-variate components the destructuring is `get0(v, i)`. Component
+/// variates of higher rank need `cat`-slice routing, which this does not build
+/// — a component whose variate is non-scalar refuses via the recursive density
+/// call's own shape handling (`build_density_term`'s domain/variate kind
+/// check). Keyword `joint(name₁ = M₁, …)` (named components → record variate)
+/// is out of scope: it shares the `joint` op name with the positional form, so
+/// it does reach this function, but it carries its components in `named` with
+/// an empty `args`, which fails the `args.len() < 2` check below and refuses
+/// rather than mislowers.
+fn lower_joint(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseError> {
+    let inner: Vec<NodeId> = {
+        let c = expect_builtin_call(m, node, "joint")
+            .ok_or_else(|| refuse(node, m, "expected joint"))?;
+        if c.args.len() < 2 {
+            return Err(refuse(node, m, "joint needs at least 2 components"));
+        }
+        c.args.to_vec()
+    };
+    let mut terms = Vec::with_capacity(inner.len());
+    for (i, &mi) in inner.iter().enumerate() {
+        let idx = m.alloc(Node::Lit(Scalar::Int(i as i64)));
+        let elem = build_call(m, "get0", &[v, idx]);
+        terms.push(lower_measure_density(m, mi, elem)?);
     }
     Ok(fold_add(m, &terms))
 }
