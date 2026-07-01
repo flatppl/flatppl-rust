@@ -56,6 +56,12 @@ fn value_sets_are_refinements_of_natural_extent() {
         "w = [0.2, 0.3, 0.5]\nsm = softmax(w)",
         // positional cartprod: CartProd value-set vs an array type (CartPow nat)
         "p = elementof(cartprod(reals, integers))",
+        // all-vector cartprod: members `cat`, so blocks concatenate into a flat
+        // 5-vector (spec §03) — its CartProd([cartpow 2, cartpow 3]) value-set
+        // must still prove ⊆ cartpow(reals, 5) (block lengths sum, not count)
+        "pv = elementof(cartprod(cartpow(reals, 2), cartpow(reals, 3)))",
+        // heterogeneous block element sets: reals ++ integers, still a real vec
+        "ph = elementof(cartprod(cartpow(reals, 2), cartpow(integers, 3)))",
         // keyword cartprod / records
         "r = elementof(cartprod(a = reals, b = posreals))",
         "rec = record(a = 1.0, b = record(c = 2))",

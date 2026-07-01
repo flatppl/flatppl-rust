@@ -129,9 +129,11 @@ pub enum ValueSet {
     Interval(f64, f64),
     /// `cartpow(set, n)` — arrays with every element in `set`.
     CartPow(Box<ValueSet>, Dim),
-    /// `cartprod(S1, S2, …)` — heterogeneous product: a fixed-length array /
-    /// tuple whose i-th element lies in the i-th component set (spec §03,
-    /// "Cartesian product", positional form).
+    /// `cartprod(S1, S2, …)` — heterogeneous product: the set of `cat`s of one
+    /// element per component set (spec §03, "Cartesian product", positional
+    /// form). A set of ARRAYS, not tuples — scalar components occupy one position
+    /// each, vector components concatenate; the array element type is the common
+    /// type of the components.
     CartProd(Box<[ValueSet]>),
     /// `cartprod(a = S1, b = S2, …)` — a record / table-column set: field `a`
     /// in `S1`, … (spec §03, keyword form). Field names are interned
@@ -228,13 +230,40 @@ impl ValueSet {
                 (n == d || matches!(d, Dim::Dynamic)) && a.subset_of(b)
             }
             // A heterogeneous product is a subset of a homogeneous power when the
-            // lengths agree and every component lies in the power's element set —
-            // e.g. `cartprod(reals, integers) ⊆ cartpow(reals, 2)`. This is what
-            // lets a positional `cartprod`'s value-set be a refinement of its
-            // array type's natural extent (§11 refinement invariant).
+            // flattened lengths agree and every component's element set refines
+            // the power's element — e.g. `cartprod(reals, integers) ⊆
+            // cartpow(reals, 2)`. This is what lets a positional `cartprod`'s
+            // value-set be a refinement of its array type's natural extent (§11
+            // refinement invariant). A `cartprod` member is the `cat` of one
+            // element per component (spec §03), so a component contributes its
+            // own flattened BLOCK of positions: a rank-0 scalar set one position
+            // of that set, a rank-1 power `cartpow(e, n)` n positions of `e`, a
+            // `stdsimplex(n)` n unit-interval positions — so the total length is
+            // the SUM of block lengths, not the component count (all-scalar is
+            // the special case where every block is length one).
             (CartProd(parts), CartPow(elem, d)) => {
-                (matches!(d, Dim::Dynamic) || *d == Dim::Static(parts.len() as u32))
-                    && parts.iter().all(|p| p.subset_of(elem))
+                let mut total: u32 = 0;
+                let elements_refine = parts.iter().all(|p| match p {
+                    CartPow(e, Dim::Static(n)) => {
+                        total += *n;
+                        e.subset_of(elem)
+                    }
+                    StdSimplex(Dim::Static(n)) => {
+                        total += *n;
+                        UnitInterval.subset_of(elem)
+                    }
+                    // A block whose flattened length isn't statically known
+                    // (a dynamic power / simplex) can't prove a length match.
+                    CartPow(_, Dim::Dynamic) | StdSimplex(Dim::Dynamic) => false,
+                    // Otherwise treat the component as a single rank-0 position:
+                    // scalar sets refine directly; nested products / record sets
+                    // fail `subset_of(elem)` (they don't cat into a scalar power).
+                    other => {
+                        total += 1;
+                        other.subset_of(elem)
+                    }
+                });
+                elements_refine && (matches!(d, Dim::Dynamic) || *d == Dim::Static(total))
             }
             (CartProd(a), CartProd(b)) if a.len() == b.len() => {
                 a.iter().zip(b.iter()).all(|(x, y)| x.subset_of(y))
@@ -557,6 +586,74 @@ mod tests {
         assert_eq!(
             cartpow_over(Reals, &[Dim::Static(2), Dim::Static(2)]).is_bounded(),
             Some(false)
+        );
+    }
+
+    #[test]
+    fn product_of_vector_components_subset_of_flat_power() {
+        use ValueSet::*;
+        // Spec §03 (clarified): a `cartprod` member is the `cat` of one element
+        // per component, so VECTOR components concatenate —
+        // `cartprod(cartpow(reals,2), cartpow(reals,3))` is the set of flat
+        // 5-vectors. Its value-set must be provable ⊆ the type's natural extent
+        // `cartpow(reals, 5)` (§11 refinement invariant): the flattened length is
+        // the SUM of block lengths (5), not the component count (2), and every
+        // block's element set must refine the power's element.
+        assert!(
+            CartProd(Box::new([
+                CartPow(Box::new(Reals), Dim::Static(2)),
+                CartPow(Box::new(Reals), Dim::Static(3)),
+            ]))
+            .subset_of(&CartPow(Box::new(Reals), Dim::Static(5)))
+        );
+        // Heterogeneous block element sets: a reals block ++ an integers block is
+        // still a real 5-vector (integers ⊂ reals) — matches the §03 element-type
+        // rule (`cartprod(reals, integers)` is real-valued).
+        assert!(
+            CartProd(Box::new([
+                CartPow(Box::new(Reals), Dim::Static(2)),
+                CartPow(Box::new(Integers), Dim::Static(3)),
+            ]))
+            .subset_of(&CartPow(Box::new(Reals), Dim::Static(5)))
+        );
+        // A scalar block contributes one position; mixing with a vector block is
+        // still sound set algebra (the scalar occupies one flattened slot).
+        assert!(
+            CartProd(Box::new([
+                Reals,
+                CartPow(Box::new(Integers), Dim::Static(3))
+            ]))
+            .subset_of(&CartPow(Box::new(Reals), Dim::Static(4)))
+        );
+        // A `stdsimplex(n)` block contributes n unit-interval positions.
+        assert!(
+            CartProd(Box::new([StdSimplex(Dim::Static(3)), Reals]))
+                .subset_of(&CartPow(Box::new(Reals), Dim::Static(4)))
+        );
+        // Wrong total length is not a subset (2 + 3 = 5, not 6).
+        assert!(
+            !CartProd(Box::new([
+                CartPow(Box::new(Reals), Dim::Static(2)),
+                CartPow(Box::new(Reals), Dim::Static(3)),
+            ]))
+            .subset_of(&CartPow(Box::new(Reals), Dim::Static(6)))
+        );
+        // A dynamic block length can't prove the total → not a provable subset.
+        assert!(
+            !CartProd(Box::new([
+                CartPow(Box::new(Reals), Dim::Dynamic),
+                CartPow(Box::new(Reals), Dim::Static(3)),
+            ]))
+            .subset_of(&CartPow(Box::new(Reals), Dim::Static(5)))
+        );
+        // An out-of-set block element is not a subset (an integers block ⊄ a
+        // posreals power).
+        assert!(
+            !CartProd(Box::new([
+                CartPow(Box::new(Reals), Dim::Static(2)),
+                CartPow(Box::new(Integers), Dim::Static(3)),
+            ]))
+            .subset_of(&CartPow(Box::new(PosReals), Dim::Static(5)))
         );
     }
 

@@ -1161,6 +1161,25 @@ fn cartprod_positional_is_array_not_tuple() {
     );
 }
 
+/// All-vector positional `cartprod` CONCATENATES its component blocks (spec §03:
+/// "each member is the `cat` of one element per component set … vector
+/// components concatenate"). `cartprod(cartpow(reals,2), cartpow(reals,3))` is
+/// therefore the set of flat 5-vectors — a rank-1 length-5 real array — with the
+/// per-block membership kept in the value-set. The flattened length is the SUM
+/// of block lengths (2 + 3 = 5), not the component count (2).
+#[test]
+fn cartprod_positional_vector_components_concatenate() {
+    let out = ir("p = elementof(cartprod(cartpow(reals, 2), cartpow(reals, 3)))");
+    assert!(
+        out.contains("(%array 1 (5) (%scalar real))"),
+        "vector components should concatenate into a flat 5-vector; got:\n{out}"
+    );
+    assert!(
+        out.contains("(cartprod (cartpow reals 2) (cartpow reals 3))"),
+        "per-block membership stays in the value-set; got:\n{out}"
+    );
+}
+
 /// Keyword `cartprod` carries a named record value-set.
 #[test]
 fn cartprod_record_valueset() {
