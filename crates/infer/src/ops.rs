@@ -718,12 +718,12 @@ fn elementwise2(a: &Option<&ArgInfo>, b: &Option<&ArgInfo>) -> Type {
 }
 
 /// `mul` (`a * b`, spec §07): scalar·scalar, scalar·array (both orders), and the
-/// matrix-multiply forms over FLAT rank-2 matrices — matrix·matrix
-/// (`[m,k]·[k,n] → [m,n]`) and matrix·vector (`[m,k]·[k] → [m]`). A statically
-/// provable inner-dimension mismatch is a shape error (`%failed`). The remaining
-/// §07 forms — transposed-vector·vector (dot) and vector·transposed-vector
-/// (outer), and matmul over matrices represented as nested rank-1 arrays — are
-/// not yet typed and stay `%deferred` (honest: no guessed shape).
+/// The spec-§07 `mul` matrix/vector forms: matrix·matrix (`[m,k]·[k,n] →
+/// [m,n]`), matrix·vector (`[m,k]·[k] → [m]`), transposed-vector·vector (dot →
+/// scalar), and vector·transposed-vector (outer → `[n,m]` matrix). A statically
+/// provable dimension mismatch is a shape error (`%failed`). Matrices must be
+/// FLAT rank-2 arrays (from `rowstack`/`colstack`); a nested vec-of-vec is not a
+/// matrix (spec §03), so `mul` over those stays `%deferred` — correctly, not a gap.
 fn mul_type(args: &[ArgInfo]) -> Type {
     let (a, b) = match (arg_ty(args, 0), arg_ty(args, 1)) {
         (Some(a), Some(b)) => (a, b),
@@ -766,6 +766,34 @@ fn mul_type(args: &[ArgInfo]) -> Type {
                 },
             }
         }
+        // Transposed-vector · vector → scalar (inner / dot product). The lengths
+        // must agree; a static mismatch is a shape error (spec §07).
+        (
+            Type::TVector { len: la, elem: ea },
+            Type::Array {
+                shape: sb,
+                elem: eb,
+            },
+        ) if sb.len() == 1 => {
+            if matches!((*la, sb[0]), (Dim::Static(k1), Dim::Static(k2)) if k1 != k2) {
+                return Type::Failed("inner product: vector lengths disagree (spec §07)".into());
+            }
+            promote2(Some(ea.as_ref()), Some(eb.as_ref()))
+        }
+        // Vector · transposed-vector → matrix (outer product), shape `[n, m]`.
+        (
+            Type::Array {
+                shape: sa,
+                elem: ea,
+            },
+            Type::TVector { len: lb, elem: eb },
+        ) if sa.len() == 1 => match promote2(Some(ea.as_ref()), Some(eb.as_ref())) {
+            Type::Deferred => Type::Deferred,
+            elem => Type::Array {
+                shape: Box::new([sa[0], *lb]),
+                elem: Box::new(elem),
+            },
+        },
         _ => Type::Deferred,
     }
 }

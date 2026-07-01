@@ -325,9 +325,24 @@ fn lower_result(result: &ResultSig, ctx: &LowerCtx) -> Type {
                     elem: Box::new(Type::Array { shape, elem: ie }),
                 }
             }
-            // Plain vector: a transposed vector is the same rank-1 array
-            // type — orientation is not a type-level distinction (spec §07).
-            Some(t @ Type::Array { .. }) => t,
+            // Plain (rank-1) vector of scalars → a transposed vector, a DISTINCT
+            // type (spec §07: "the transpose of a vector is a transposed vector,
+            // not a single-row matrix"). Tracking orientation is what lets `mul`
+            // type the dot (`vᵀ·v`) and outer (`v·vᵀ`) products.
+            Some(Type::Array { shape, elem })
+                if shape.len() == 1 && matches!(elem.as_ref(), Type::Scalar(_)) =>
+            {
+                Type::TVector {
+                    len: shape[0],
+                    elem,
+                }
+            }
+            // transpose is self-inverse: a transposed vector → back to rank-1.
+            Some(Type::TVector { len, elem }) => Type::Array {
+                shape: Box::new([len]),
+                elem,
+            },
+            Some(t @ Type::Array { .. }) => t, // other ranks unchanged
             _ => Type::Deferred,
         },
         ResultSig::Record(fields) => Type::Record(

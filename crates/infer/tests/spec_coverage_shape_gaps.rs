@@ -365,11 +365,42 @@ fn transpose_preserves_rank_and_element_kind() {
         out.contains("(%array 1 (2) (%array 1 (2) (%scalar real)))") && out.contains("(transpose"),
         "transpose(2x2 matrix) should be a 2x2 real matrix, got:\n{out}"
     );
-    // vector → rank-1 (a transposed vector is NOT a single-row matrix)
+    // vector → transposed vector, a DISTINCT rank-1 type (spec §07: "the
+    // transpose of a vector is a transposed vector, not a single-row matrix").
     let out = ir("v = [1.0, 2.0, 3.0]\nx = adjoint(v)");
+    let x = out.lines().find(|l| l.contains("%bind x")).unwrap_or("");
     assert!(
-        out.contains("(%array 1 (") && out.contains("(adjoint"),
-        "adjoint(vector) should stay a rank-1 array, got:\n{out}"
+        x.contains("(%tvector 3 (%scalar real))") && x.contains("(adjoint"),
+        "adjoint(vector) should be a transposed vector, got:\n{out}"
+    );
+}
+
+/// `mul` over transposed vectors (spec §07 / §02): a transposed vector · vector
+/// is the inner product (→ scalar; lengths must agree), and a vector ·
+/// transposed vector is the outer product (→ matrix `[n, m]`). Distinguishing
+/// orientation is exactly why `transpose(vector)` types as a distinct `%tvector`.
+#[test]
+fn mul_transposed_vector_dot_and_outer() {
+    // vᵀ · v → real scalar (dot product).
+    let out = ir("v = [1.0, 2.0, 3.0]\nd = transpose(v) * v");
+    let d = out.lines().find(|l| l.contains("%bind d")).unwrap_or("");
+    assert!(
+        d.contains("(%scalar real)") && !d.contains("%deferred"),
+        "transpose(v) * v should be a real scalar (dot product), got:\n{out}"
+    );
+    // v · wᵀ → outer-product matrix [3, 2] (distinct axes so a swap shows).
+    let out = ir("v = [1.0, 2.0, 3.0]\nw = [4.0, 5.0]\nO = v * transpose(w)");
+    let o = out.lines().find(|l| l.contains("%bind O")).unwrap_or("");
+    assert!(
+        o.contains("(%array 2 (3 2) (%scalar real))"),
+        "v * transpose(w) should be a 3x2 outer-product matrix, got:\n{out}"
+    );
+    // A dot with statically-mismatched lengths is a shape error.
+    let out = ir("v = [1.0, 2.0, 3.0]\nu = [1.0, 2.0]\nbad = transpose(v) * u");
+    let bad = out.lines().find(|l| l.contains("%bind bad")).unwrap_or("");
+    assert!(
+        bad.contains("%failed"),
+        "transpose(v3) * u2 length mismatch should be %failed, got:\n{out}"
     );
 }
 
