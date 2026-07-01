@@ -26,11 +26,13 @@
 //! - `superpose(M₁, …, Mₖ)` → `logsumexp(density(M₁, v), …, density(Mₖ, v))`
 //! - `normalize(M)` → `density(M, v)` when `M` is already a probability measure
 //!   (closed-form `logZ = 0`); when `M = truncate(base, interval(lo, hi))` with
-//!   `base` a primitive univariate constructor, → `sub(density(M, v),
+//!   `base` a **normalized** univariate constructor, → `sub(density(M, v),
 //!   log(sub(touniform(base, hi), touniform(base, lo))))` — the closed-form
 //!   `Z = CDF(hi) - CDF(lo)` via the `builtin_touniform` CDF transport
-//!   (§06:471); **refuses** for any other unnormalized `M` (no
-//!   closed-form mass rule; `totalmass` is OUT of FlatPDL).
+//!   (§06:471; valid only for a normalized base, §07:829); **refuses** for any
+//!   other unnormalized `M` — including a `truncate` whose `base` is itself
+//!   unnormalized (e.g. `Lebesgue`), where the CDF-Z identity does not hold
+//!   (no closed-form mass rule; `totalmass` is OUT of FlatPDL).
 //! - `truncate(M, S)` → `ifelse(in(v, S), density(M, v), neg(inf))` (the `_ in R`
 //!   membership builtin, which infers to a boolean — `elementof` is a set-valued
 //!   parameter declaration, not a membership predicate).
@@ -39,12 +41,14 @@
 //!   integer** (static unroll; corpus `N` is small). A non-literal `N` is
 //!   **refused**.
 //! - `joint(M₁,…,Mₖ)` (**positional only**) → `Σᵢ density(Mᵢ, get0(v, i))` —
-//!   **scalar-variate components only**; a non-scalar component variate
-//!   refuses via the recursive call's own domain/variate shape check. Keyword
-//!   `joint(name = M, …)` (named components → record variate) shares the
-//!   `joint` op name so it reaches the same dispatch arm, but its components
-//!   live in `named` with an empty positional `args`, so it is **refused**
-//!   rather than mislowered.
+//!   **scalar-variate components only**; a component whose measure domain is
+//!   non-scalar (e.g. `iid(Normal, 2)`) is **refused up front** by inspecting
+//!   each component's measure-domain kind, NOT via the downstream recursive
+//!   call (whose `get0(v, i)` value is `%deferred`/`%unknown`, so its domain
+//!   guard is skipped). Keyword `joint(name = M, …)` (named components → record
+//!   variate) shares the `joint` op name so it reaches the same dispatch arm,
+//!   but its components live in `named` with an empty positional `args`, so it
+//!   is **refused** rather than mislowered.
 //!
 //! **Likelihood query** (audit H2): `logdensityof(likelihoodof(K, obs), θ)` is
 //! handled at the `logdensityof` *entry* (not via `lower_measure_density`). Its
@@ -57,7 +61,9 @@
 //!
 //! **Refused:** `kchain` marginals, keyword `joint`, `bayesupdate`, `disintegrate`,
 //! `restrict`, `pushfwd` with a non-bijection argument, `iid` with a non-literal
-//! size, `joint` with a non-scalar component variate, and any unrecognised shape.
+//! size, `joint` with a non-scalar component (refused up front on the component's
+//! measure-domain kind), `normalize(truncate(base, …))` whose `base` is not a
+//! normalized measure, and any unrecognised shape.
 //! (`likelihoodof` reaching `lower_measure_density` still refuses there as a
 //! safety net — it is normally unwrapped at the `logdensityof` entry above.)
 
@@ -526,12 +532,18 @@ fn lower_superpose(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Re
 /// * If `M` is already a probability measure (`Type::Measure { mass:
 ///   Mass::Normalized, .. }`) then `Z = 1`, `logZ = 0`, so `normalize(M)` is
 ///   the identity on the density — it lowers to just `logdensityof(M, v)`.
-/// * If `M` is `truncate(base, interval(lo, hi))` with `base` a primitive
-///   univariate constructor, `Z = CDF(hi) - CDF(lo)` via the `builtin_touniform`
-///   CDF transport (§06:471): `logZ = log(touniform(base, hi) -
-///   touniform(base, lo))`. The `-inf` outside-support gate is already handled
-///   by the existing `truncate` lowering, so the emitted density term is just
-///   `lower_measure_density(m, m_inner, v)` minus this `logZ`.
+/// * If `M` is `truncate(base, interval(lo, hi))` with `base` a **normalized**
+///   univariate continuous probability measure (a primitive constructor such as
+///   `Normal`), `Z = CDF(hi) - CDF(lo)` via the `builtin_touniform` CDF transport
+///   (§06:471): `logZ = log(touniform(base, hi) - touniform(base, lo))`. The
+///   `-inf` outside-support gate is already handled by the existing `truncate`
+///   lowering, so the emitted density term is just `lower_measure_density(m,
+///   m_inner, v)` minus this `logZ`. The base MUST be normalized: the CDF-Z
+///   identity holds only for a normalized base, since `builtin_touniform` (the
+///   CDF) is defined only for a normalized univariate continuous measure
+///   (§07:829). An unnormalized base (e.g. `Lebesgue(reals)`, where the true
+///   `Z = hi − lo` and `touniform` is undefined) does NOT take this path — it
+///   falls through to the refuse below, rather than silently mislowering.
 ///
 /// Any other unnormalized `M` (`Finite`, `LocallyFinite`, a non-truncate
 /// combinator, …) has no closed-form mass rule here, so we **refuse** rather
@@ -586,13 +598,32 @@ fn lower_normalize(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Re
     };
 
     if let Some((base, lo, hi)) = truncate_shape {
-        let density = lower_measure_density(m, m_inner, v)?; // truncate handles the -inf gate
-        let (kernel, input) = kernel_and_input(m, base)?; // helper below
-        let cdf_hi = build_touniform(m, kernel, input, hi);
-        let cdf_lo = build_touniform(m, kernel, input, lo);
-        let z = build_call(m, "sub", &[cdf_hi, cdf_lo]);
-        let log_z = build_call(m, "log", &[z]);
-        return Ok(build_call(m, "sub", &[density, log_z]));
+        // The CDF-Z identity `Z = touniform(base, hi) − touniform(base, lo) =
+        // totalmass(truncate(base, S))` (§06:471) holds ONLY when `base` is a
+        // normalized univariate continuous probability measure — `builtin_touniform`
+        // (= the CDF transport) is defined only for that class (§07:829). For an
+        // unnormalized base (e.g. `Lebesgue(reals)`) the true `Z = hi − lo` and
+        // `touniform` is undefined, so applying the CDF path would silently
+        // mislower. Gate on the (resolved) base's mass; if it is not `Normalized`,
+        // do NOT take the CDF-Z path — fall through to the refuse below (no
+        // closed-form Z for an unnormalized base is built here).
+        let (base_resolved, _) = resolve_ref_one(m, base);
+        let base_normalized = matches!(
+            m.type_of(base_resolved),
+            Some(Type::Measure {
+                mass: Mass::Normalized,
+                ..
+            })
+        );
+        if base_normalized {
+            let density = lower_measure_density(m, m_inner, v)?; // truncate handles the -inf gate
+            let (kernel, input) = kernel_and_input(m, base)?; // helper below
+            let cdf_hi = build_touniform(m, kernel, input, hi);
+            let cdf_lo = build_touniform(m, kernel, input, lo);
+            let z = build_call(m, "sub", &[cdf_hi, cdf_lo]);
+            let log_z = build_call(m, "log", &[z]);
+            return Ok(build_call(m, "sub", &[density, log_z]));
+        }
     }
 
     // No closed-form mass rule for an unnormalized measure in this MVP.
@@ -724,7 +755,9 @@ fn literal_usize(m: &Module, id: NodeId) -> Option<usize> {
 /// `logdensityof(iid(M, N), v)` = `Σ_{i<N} logdensityof(M, get0(v, i))` (§06:473,
 /// "iid(M, n) → Σ_i log densityof(M, xᵢ)"). N comes from the `iid` count arg,
 /// which must be a literal integer. Static unroll (corpus N small; broadcast+
-/// reduce is the noted scale path, not built).
+/// reduce is the noted scale path, not built). `N == 0` is the empty independent
+/// product: Σ over an empty index set is 0, so it lowers to the log-density
+/// literal `0.0` (consistent with the empty measure `record()`), not a refusal.
 fn lower_iid(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseError> {
     let (m_inner, n) = {
         let c =
@@ -736,8 +769,11 @@ fn lower_iid(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseEr
             .ok_or_else(|| refuse(c.args[1], m, "iid size must be a literal integer"))?;
         (c.args[0], n)
     };
+    // Empty independent product: Σ over an empty index set is 0 (log-density 0),
+    // exactly as an empty measure `record()` lowers (§10 item 5). Short-circuit
+    // BEFORE `fold_add`, which requires at least one term.
     if n == 0 {
-        return Err(refuse(node, m, "iid with zero size has no density"));
+        return Ok(m.alloc(Node::Lit(Scalar::Real(0.0))));
     }
     let mut terms = Vec::with_capacity(n);
     for i in 0..n {
@@ -753,11 +789,15 @@ fn lower_iid(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseEr
 ///
 /// **Scope:** positional `joint` only, scalar-variate components. `joint`'s
 /// variate is the positional `cat` of the component variates (§06:473); for
-/// scalar-variate components the destructuring is `get0(v, i)`. Component
-/// variates of higher rank need `cat`-slice routing, which this does not build
-/// — a component whose variate is non-scalar refuses via the recursive density
-/// call's own shape handling (`build_density_term`'s domain/variate kind
-/// check). Keyword `joint(name₁ = M₁, …)` (named components → record variate)
+/// scalar-variate components the destructuring is `get0(v, i)`, one slot per
+/// component. Component variates of higher rank need `cat`-slice routing, which
+/// this does not build — a component whose measure domain is non-scalar
+/// (e.g. `iid(Normal, 2)`, domain array[2]) is refused HERE, up front, by
+/// inspecting each component's own measure domain kind. This is NOT left to the
+/// downstream recursive call: `build_density_term`'s domain check compares the
+/// measure domain against the value `get0(v, i)`, which infers to
+/// `%deferred`/`%unknown`, so that guard would be skipped and the extra slots
+/// silently dropped. Keyword `joint(name₁ = M₁, …)` (named components → record variate)
 /// is out of scope: it shares the `joint` op name with the positional form, so
 /// it does reach this function, but it carries its components in `named`
 /// rather than `args`. That is checked explicitly, first, with its own
@@ -780,6 +820,30 @@ fn lower_joint(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Refuse
         }
         c.args.to_vec()
     };
+    // Guard the scalar-only restriction HERE, before the recursion. `get0(v, i)`
+    // assigns each component ONE scalar slot of the positional `cat` variate; a
+    // non-scalar component (e.g. `iid(Normal, 2)`, domain array[2] → Vector) would
+    // be silently mislowered — its extra slots dropped, `get0`-of-scalar nested
+    // into a single slot. The downstream `build_density_term` domain check does
+    // NOT catch this: `get0(v, i)` infers to `%deferred`/`%unknown`, so its guard
+    // is skipped. The COMPONENT's own measure domain, by contrast, is known
+    // (`iid(Normal,2)` → array[2]), so we can refuse it precisely here.
+    for &mi in inner.iter() {
+        let (mi_resolved, _) = resolve_ref_one(m, mi);
+        let component_kind = match m.type_of(mi_resolved) {
+            Some(Type::Measure { domain, .. }) => variate_kind(domain),
+            _ => None,
+        };
+        if let Some(kind) = component_kind {
+            if kind != VariateKind::Scalar {
+                return Err(refuse(
+                    mi,
+                    m,
+                    "joint with a non-scalar component is not yet lowered (needs cat-slice routing)",
+                ));
+            }
+        }
+    }
     let mut terms = Vec::with_capacity(inner.len());
     for (i, &mi) in inner.iter().enumerate() {
         let idx = m.alloc(Node::Lit(Scalar::Int(i as i64)));

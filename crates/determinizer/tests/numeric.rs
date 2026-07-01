@@ -120,10 +120,10 @@ lp = logdensityof(lawof(record(a = a, b = b)), record(a = 0.5, b = 0.5))";
 }
 
 #[test]
-fn iid_normal_sum_oracle() {
-    // logdensityof(iid(Normal(0,1), 3), [0.5, -0.3, 1.2]) = Σ log N(xᵢ;0,1)
-    let xs = [0.5_f64, -0.3, 1.2];
-    let oracle: f64 = xs.iter().map(|&x| gaussian_logpdf(x, 0.0, 1.0)).sum();
+fn iid_normal_sum_structure() {
+    // logdensityof(iid(Normal(0,1), 3), [0.5, -0.3, 1.2]) = Σ_{i<3} log N(get0(v,i);0,1)
+    // Static unroll: each term scores the SAME Normal(0,1) at a distinct index of
+    // the variate `get0(v, i)`, i = 0, 1, 2.
     let src = "\
 d = iid(Normal(mu = 0.0, sigma = 1.0), 3)
 lp = logdensityof(d, [0.5, -0.3, 1.2])";
@@ -143,21 +143,31 @@ lp = logdensityof(d, [0.5, -0.3, 1.2])";
         !pir.contains("(iid ") && !pir.contains("(logdensityof "),
         "no measure layer:\n{pir}"
     );
-    // Closed-form oracle sanity (pure Rust arithmetic, no engine).
-    assert!(
-        (oracle
-            - (gaussian_logpdf(0.5, 0.0, 1.0)
-                + gaussian_logpdf(-0.3, 0.0, 1.0)
-                + gaussian_logpdf(1.2, 0.0, 1.0)))
-        .abs()
-            < 1e-12
+    // Structural: three `get0` projections of the variate, one per unrolled term,
+    // at the distinct static indices 0, 1, 2 (each closes `... <vec>) i)`).
+    assert_eq!(
+        pir.matches("(get0 ").count(),
+        3,
+        "one get0 projection per iid term:\n{pir}"
+    );
+    for i in 0..3 {
+        assert!(
+            pir.contains(&format!(") {i})")),
+            "iid term must index the variate at {i}:\n{pir}"
+        );
+    }
+    // All three terms score the SAME kernel/params: Normal(mu=0.0, sigma=1.0).
+    assert_eq!(
+        pir.matches("(%field mu 0.0) (%field sigma 1.0)").count(),
+        3,
+        "all three iid terms score Normal(0,1):\n{pir}"
     );
 }
 
 #[test]
-fn joint_two_gaussians_oracle() {
-    // logdensityof(joint(Normal(0,1), Normal(1,2)), [0.5, 0.5]) = logN(0.5;0,1)+logN(0.5;1,2)
-    let oracle = gaussian_logpdf(0.5, 0.0, 1.0) + gaussian_logpdf(0.5, 1.0, 2.0);
+fn joint_two_gaussians_structure() {
+    // logdensityof(joint(Normal(0,1), Normal(1,2)), [0.5, 0.5]) →
+    //   add(density(Normal(0,1), get0(v,0)), density(Normal(1,2), get0(v,1)))
     let src = "\
 d = joint(Normal(mu = 0.0, sigma = 1.0), Normal(mu = 1.0, sigma = 2.0))
 lp = logdensityof(d, [0.5, 0.5])";
@@ -171,15 +181,33 @@ lp = logdensityof(d, [0.5, 0.5])";
         "2 joint terms:\n{pir}"
     );
     assert!(!pir.contains("(joint "), "no joint:\n{pir}");
-    assert!(oracle.is_finite());
+    // Structural: the two positional components carry their OWN distinct params —
+    // component 0 scores Normal(0,1), component 1 scores Normal(1,2) — each
+    // projected out of the variate at its own `get0` slot.
+    assert!(
+        pir.contains("(%field mu 0.0) (%field sigma 1.0)"),
+        "component 0 scores Normal(0,1):\n{pir}"
+    );
+    assert!(
+        pir.contains("(%field mu 1.0) (%field sigma 2.0)"),
+        "component 1 scores Normal(1,2):\n{pir}"
+    );
+    assert_eq!(
+        pir.matches("(get0 ").count(),
+        2,
+        "one get0 projection per component:\n{pir}"
+    );
+    assert!(
+        pir.contains(") 0)") && pir.contains(") 1)"),
+        "components projected at slots 0 and 1:\n{pir}"
+    );
 }
 
 #[test]
-fn weighted_function_weight_oracle() {
-    // logdensityof(weighted(x -> exp(x), g), 0.5) = log(exp(0.5)) + logdensityof(g, 0.5)
-    //   = 0.5 + logN(0.5;0,1)   (g = N(0,1))
-    // §06:469 — the weight may be a function of the variate; it is applied at v.
-    let oracle = 0.5 + gaussian_logpdf(0.5, 0.0, 1.0);
+fn weighted_function_weight_structure() {
+    // logdensityof(weighted(x -> exp(x), g), 0.5) → add(log(w(0.5)), density(g, 0.5))
+    //   — §06 "Density of composed measures": the weight may be a function of the
+    //   variate, applied at v then wrapped in `log` (there is an OUTER `log`).
     let src = "\
 g = Normal(mu = 0.0, sigma = 1.0)
 d = weighted(x -> exp(x), g)
@@ -202,15 +230,27 @@ lp = logdensityof(d, 0.5)";
         !pir.contains("(weighted ") && !pir.contains("(logdensityof "),
         "measure layer gone:\n{pir}"
     );
-    assert!(oracle.is_finite());
+    // Structural: `add(log(w(0.5)), density(g, 0.5))`. The weight is APPLIED at
+    // the variate (a `%call ... 0.5`) and wrapped in an OUTER `log` (distinguishes
+    // `weighted` from `logweighted`); g is scored at the same variate 0.5.
+    assert!(pir.contains("(add "), "add(logw, density):\n{pir}");
+    assert!(
+        pir.contains("(log ") && pir.contains("(%call "),
+        "weight applied at v then log-wrapped: log((%call w 0.5)):\n{pir}"
+    );
+    assert!(
+        pir.contains("(%field mu 0.0) (%field sigma 1.0)"),
+        "g = Normal(0,1) scored:\n{pir}"
+    );
 }
 
 #[test]
-fn logweighted_function_weight_oracle() {
+fn logweighted_function_weight_structure() {
     // logdensityof(logweighted(x -> logdensityof(g2, x), g1), 0.5)
-    //   = logdensityof(g2, 0.5) + logdensityof(g1, 0.5)
-    //   = logN(0.5;1,2) + logN(0.5;0,1)   (g1=N(0,1), g2=N(1,2))
-    let oracle = gaussian_logpdf(0.5, 1.0, 2.0) + gaussian_logpdf(0.5, 0.0, 1.0);
+    //   → add(ℓ(0.5), density(g1, 0.5))   (g1=N(0,1), g2=N(1,2))
+    //   — §06: the log-weight ℓ is a function of the variate, applied at v; it is
+    //   ALREADY in log space, so there is NO outer `log` (unlike `weighted`). Here
+    //   ℓ(x) = logdensityof(g2, x), so ℓ(0.5) lowers to a second density term.
     let src = "\
 g1 = Normal(mu = 0.0, sigma = 1.0)
 g2 = Normal(mu = 1.0, sigma = 2.0)
@@ -232,16 +272,33 @@ lp = logdensityof(d, 0.5)";
         !pir.contains("(logweighted ") && !pir.contains("(logdensityof "),
         "measure layer gone:\n{pir}"
     );
-    assert!(oracle.is_finite());
+    // Structural: `add(ℓ(0.5), density(g1, 0.5))`. The log-weight is applied at v
+    // (a `%call ... 0.5`) and, being already in log space, is NOT wrapped in a
+    // top-level `log` — the emitted expression starts with `add`, not `add(log(…`.
+    assert!(pir.contains("(add "), "add(logweight, density):\n{pir}");
+    assert!(
+        pir.contains("(%call "),
+        "log-weight applied at v: (%call ℓ 0.5):\n{pir}"
+    );
+    // No `(log (%call ` — that would be the `weighted` shape (a spurious outer log).
+    assert!(
+        !pir.contains("(log (%call "),
+        "logweighted must NOT wrap the applied log-weight in an outer log:\n{pir}"
+    );
+    // Both Gaussians are scored: g1 = N(0,1) directly, g2 = N(1,2) inside ℓ.
+    assert!(
+        pir.contains("(%field mu 0.0) (%field sigma 1.0)")
+            && pir.contains("(%field mu 1.0) (%field sigma 2.0)"),
+        "g1 = N(0,1) and g2 = N(1,2) both scored:\n{pir}"
+    );
 }
 
 #[test]
-fn normalize_truncated_normal_oracle() {
-    // normalize(truncate(Normal(0,1), interval(-1,1))) scored at 0.5:
-    //   = logN(0.5;0,1) - log(Φ(1) - Φ(-1))
-    // Φ(1)-Φ(-1) = 0.6826894921370859
-    let z = 0.6826894921370859_f64;
-    let oracle = gaussian_logpdf(0.5, 0.0, 1.0) - z.ln();
+fn normalize_truncated_normal_structure() {
+    // normalize(truncate(Normal(0,1), interval(-1,1))) scored at 0.5 →
+    //   sub(density_with_gate, log(sub(touniform(base, hi), touniform(base, lo))))
+    //   — §06:471 closed-form Z = CDF(hi) − CDF(lo) via the touniform (CDF)
+    //   transport; valid here because the base Normal(0,1) is a normalized measure.
     let src = "\
 g = Normal(mu = 0.0, sigma = 1.0)
 d = normalize(truncate(g, interval(-1.0, 1.0)))
@@ -251,21 +308,44 @@ lp = logdensityof(d, 0.5)";
     assert!(flatppl_determinizer::is_flatpdl(&out).is_ok());
     let pir = flatppl_flatpir::write(&out);
     assert!(
-        pir.contains("builtin_touniform"),
-        "closed-form Z via touniform:\n{pir}"
-    );
-    assert!(
         !pir.contains("(normalize ") && !pir.contains("totalmass"),
         "no normalize/totalmass:\n{pir}"
     );
-    assert!(oracle.is_finite());
+    // Structural: the closed-form log-Z is `log(sub(touniform(hi), touniform(lo)))`
+    // — exactly TWO CDF transports (at the two interval endpoints), differenced,
+    // then logged, and subtracted from the gated density.
+    assert_eq!(
+        pir.matches("builtin_touniform").count(),
+        2,
+        "two CDF transports (one per endpoint) for Z:\n{pir}"
+    );
+    assert!(
+        pir.contains("(log (%meta") || pir.contains("(log "),
+        "log-Z present:\n{pir}"
+    );
+    assert!(
+        pir.contains("(sub ") && pir.contains("(log "),
+        "density − log(Z) shape:\n{pir}"
+    );
+    // The gate: the truncate lowering emits `ifelse(in(v, S), density, neg(inf))`.
+    assert!(
+        pir.contains("(ifelse ") && pir.contains("(neg inf)"),
+        "support gate present (ifelse … neg inf):\n{pir}"
+    );
+    // The single density term scores the base Normal(0,1).
+    assert_eq!(
+        pir.matches("builtin_logdensityof").count(),
+        1,
+        "single density term for the base:\n{pir}"
+    );
 }
 
 #[test]
-fn likelihoodof_gaussian_oracle() {
+fn likelihoodof_gaussian_structure() {
     // obs = likelihoodof(iid(Normal(mu,sigma), 1), [1.27])
-    // logdensityof(obs, record(mu=0, sigma=1)) = log N(1.27; 0, 1)
-    let oracle = gaussian_logpdf(1.27, 0.0, 1.0);
+    // logdensityof(obs, record(mu=0, sigma=1)) → density(Normal(0,1), 1.27):
+    // K is scored at the baked-in obs (1.27) with θ = {mu:0, sigma:1} inlined for
+    // the free params — §06:492 densityof(likelihoodof(K, obs), θ) = pdf(κ(θ), obs).
     let src = "\
 mu = elementof(reals)
 sigma = elementof(posreals)
@@ -288,7 +368,25 @@ lp = logdensityof(obs, record(mu = 0.0, sigma = 1.0))";
         !pir.contains("(likelihoodof ") && !pir.contains("(iid "),
         "measure layer gone:\n{pir}"
     );
-    assert!(oracle.is_finite());
+    // Structural: the θ point {mu=0.0, sigma=1.0} is INLINED into the kernel's
+    // params (not left as `(%ref self mu/sigma)`), and the kernel is scored at the
+    // baked-in observation 1.27.
+    let lp_line = pir
+        .lines()
+        .find(|l| l.contains("(%bind lp "))
+        .expect("lp binding present");
+    assert!(
+        lp_line.contains("(%field mu 0.0)") && lp_line.contains("(%field sigma 1.0)"),
+        "θ inlined into the kernel params:\n{lp_line}"
+    );
+    assert!(
+        lp_line.contains("1.27"),
+        "kernel scored at the baked-in observation 1.27:\n{lp_line}"
+    );
+    assert!(
+        !lp_line.contains("(%ref self mu)") && !lp_line.contains("(%ref self sigma)"),
+        "θ must be inlined, not a residual self-ref:\n{lp_line}"
+    );
 }
 
 // Regression for review finding C1 (cross-query parameter leak). TWO likelihood
@@ -373,26 +471,34 @@ lp2 = logdensityof(obs, record(mu = 5.0, sigma = 2.0))";
 #[test]
 fn derived_binding_pins_transitively() {
     // theta ~ Normal(0,1); a = 2*theta (derived). Score the joint at theta=0.5.
-    // density should be log N(0.5; 0, 1), scored at the pinned theta.
-    let oracle = gaussian_logpdf(0.5, 0.0, 1.0);
+    // density is density(Normal(0,1), 0.5), scored at the pinned theta; no
+    // stochastic `draw` may survive, even though `a` depends on `theta`.
     let src = "\
 theta = draw(Normal(mu = 0.0, sigma = 1.0))
 a = mul(2.0, theta)
 lp = logdensityof(lawof(record(theta = theta)), record(theta = 0.5))";
     let m = parse_infer(src);
     let out = determinize(&m).expect("must lower");
+    let pir = flatppl_flatpir::write(&out);
     assert!(
         flatppl_determinizer::is_flatpdl(&out).is_ok(),
-        "no stochastic draw survives (a's dep):\n{}",
-        flatppl_flatpir::write(&out)
+        "no stochastic draw survives (a's dep):\n{pir}"
     );
     assert_eq!(
-        flatppl_flatpir::write(&out)
-            .matches("builtin_logdensityof")
-            .count(),
-        1
+        pir.matches("builtin_logdensityof").count(),
+        1,
+        "single density term:\n{pir}"
     );
-    assert!(oracle.is_finite());
+    // Transitive pinning: no `(draw ` survives anywhere (theta is pinned, and a's
+    // dependency on it is rewritten), and the term scores the pinned theta = 0.5.
+    assert!(
+        !pir.contains("(draw "),
+        "no stochastic draw survives:\n{pir}"
+    );
+    assert!(
+        pir.contains("(%field mu 0.0) (%field sigma 1.0)"),
+        "scores Normal(0,1) at the pinned theta:\n{pir}"
+    );
 }
 
 #[test]
@@ -405,5 +511,33 @@ fn empty_record_is_zero() {
     assert!(
         !pir.contains("builtin_logdensityof"),
         "no density terms:\n{pir}"
+    );
+}
+
+// Empty independent product: `iid(M, 0)` is Σ over an empty index set = 0, the
+// same as the empty measure `record()` (§10 item 5 / §06). It lowers to the
+// log-density literal 0 with NO density term — it is NOT refused (both empty
+// products must agree; review finding F4).
+#[test]
+fn iid_zero_size_is_zero() {
+    let src = "\
+d = iid(Normal(mu = 0.0, sigma = 1.0), 0)
+lp = logdensityof(d, [])";
+    let m = parse_infer(src);
+    let out = determinize(&m).expect("iid with zero size must lower to 0, not refuse");
+    assert!(flatppl_determinizer::is_flatpdl(&out).is_ok());
+    let pir = flatppl_flatpir::write(&out);
+    assert!(
+        !pir.contains("builtin_logdensityof"),
+        "no density terms for an empty product:\n{pir}"
+    );
+    assert!(
+        !pir.contains("(iid ") && !pir.contains("(logdensityof "),
+        "no measure layer:\n{pir}"
+    );
+    // The `lp` binding is the literal 0.0 (log-density of the empty product).
+    assert!(
+        pir.contains("(%bind lp 0.0)"),
+        "empty iid product lowers to log-density 0:\n{pir}"
     );
 }

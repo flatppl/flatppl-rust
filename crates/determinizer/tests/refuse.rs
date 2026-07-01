@@ -86,6 +86,55 @@ lp = logdensityof(d, record(x = 0.5, y = 0.5))";
     );
 }
 
+// A positional `joint` whose component is NON-SCALAR (here `iid(Normal, 2)`,
+// measure domain array[2]) cannot use the `get0(v, i)` one-slot-per-component
+// destructuring: it needs `cat`-slice routing, which is not built. The
+// determiniser must REFUSE up front — the OLD code silently mislowered
+// (destructured positionally as if scalar, dropping the extra slots), because
+// the downstream `build_density_term` domain check compares against
+// `get0(v, i)` (which infers to `%deferred`/`%unknown`) and so is skipped. The
+// gate here reads each component's OWN measure domain kind, which IS known
+// (review finding F1).
+#[test]
+fn joint_nonscalar_component_refuses() {
+    let src = "\
+d = joint(iid(Normal(mu = 0.0, sigma = 1.0), 2), Normal(mu = 0.0, sigma = 1.0))
+lp = logdensityof(d, [0.5, -0.3, 1.2])";
+    let m = parse_infer(src);
+    let err = determinize(&m).expect_err("non-scalar joint component must refuse, not mislower");
+    assert!(
+        err.reason.contains("non-scalar"),
+        "refusal explains the non-scalar component: {err:?}"
+    );
+    assert!(
+        err.reason.contains("cat-slice"),
+        "refusal points at the missing cat-slice routing: {err:?}"
+    );
+}
+
+// `normalize(truncate(base, interval(lo, hi)))` uses the closed-form
+// Z = touniform(base, hi) − touniform(base, lo) = CDF(hi) − CDF(lo). That
+// identity holds ONLY when `base` is a normalized univariate continuous
+// probability measure — `builtin_touniform` (the CDF) is defined only for that
+// class (§07). For an UNNORMALIZED base (here `Lebesgue(reals)`, whose true
+// Z = hi − lo and for which `touniform` is undefined) the CDF path silently
+// mislowers, so the determiniser must NOT take it — it falls through to the
+// refuse (no closed-form Z for an unnormalized base is built; review finding F2).
+#[test]
+fn normalize_truncate_unnormalized_base_refuses() {
+    let src = "\
+d = normalize(truncate(Lebesgue(reals), interval(-1.0, 1.0)))
+lp = logdensityof(d, 0.5)";
+    let m = parse_infer(src);
+    let err = determinize(&m)
+        .expect_err("normalize(truncate(<unnormalized base>, …)) must refuse, not use the CDF-Z");
+    // Must NOT have emitted the touniform CDF-Z path: it refuses instead.
+    assert!(
+        err.construct.contains("normalize") || err.reason.contains("unnormalized"),
+        "refusal is about the unnormalized-base normalize, not the CDF path: {err:?}"
+    );
+}
+
 // `markovchain` is an unsupported measure-algebra combinator in this MVP — it
 // requires a Markov kernel and stationary-distribution reasoning that goes well
 // beyond density disintegration. The determiniser must refuse naming the
