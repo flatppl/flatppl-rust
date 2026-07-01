@@ -291,6 +291,81 @@ lp = logdensityof(obs, record(mu = 0.0, sigma = 1.0))";
     assert!(oracle.is_finite());
 }
 
+// Regression for review finding C1 (cross-query parameter leak). TWO likelihood
+// queries over the SAME shared params (`mu`, `sigma`) at DISTINCT θ points must
+// each score at its OWN θ. Each θ is inlined into that query's density subtree;
+// the shared `mu`/`sigma` bindings are NOT mutated (which would clobber both
+// terms to the last θ written — a silent mislowering that `is_flatpdl` passes).
+#[test]
+fn two_likelihood_queries_do_not_leak_theta_across_each_other() {
+    let src = "\
+mu = elementof(reals)
+sigma = elementof(posreals)
+gauss_x = Normal(mu = mu, sigma = sigma)
+obs = likelihoodof(iid(gauss_x, 1), [1.27])
+lp = logdensityof(obs, record(mu = 0.0, sigma = 1.0))
+lp2 = logdensityof(obs, record(mu = 5.0, sigma = 2.0))";
+    let m = parse_infer(src);
+    let out = determinize(&m).expect("two-query likelihood must lower");
+    assert!(
+        flatppl_determinizer::is_flatpdl(&out).is_ok(),
+        "must be FlatPDL:\n{}",
+        flatppl_flatpir::write(&out)
+    );
+    let pir = flatppl_flatpir::write(&out);
+    assert_eq!(
+        pir.matches("builtin_logdensityof").count(),
+        2,
+        "one density term per query:\n{pir}"
+    );
+
+    // The two terms must be DISTINCT and each carry its OWN θ, inlined as
+    // literals (not a shared `(%ref self mu/sigma)` that resolves to the last
+    // θ). Inspect each query's binding line independently.
+    let lp_line = pir
+        .lines()
+        .find(|l| l.contains("(%bind lp "))
+        .expect("lp binding present");
+    let lp2_line = pir
+        .lines()
+        .find(|l| l.contains("(%bind lp2 "))
+        .expect("lp2 binding present");
+
+    assert!(
+        lp_line.contains("(%field mu 0.0)") && lp_line.contains("(%field sigma 1.0)"),
+        "lp must score at ITS θ (mu=0.0, sigma=1.0):\n{lp_line}"
+    );
+    assert!(
+        lp2_line.contains("(%field mu 5.0)") && lp2_line.contains("(%field sigma 2.0)"),
+        "lp2 must score at ITS θ (mu=5.0, sigma=2.0):\n{lp2_line}"
+    );
+
+    // No θ leaked the other way: the two terms carry different values.
+    assert!(
+        !lp_line.contains("5.0") && !lp2_line.contains("0.0"),
+        "θ leaked across the two queries:\nlp:  {lp_line}\nlp2: {lp2_line}"
+    );
+
+    // The shared params must NOT have been mutated to a θ literal — they stay
+    // `elementof` free-param declarations (valid FlatPDL). A `(%bind mu 5.0)` /
+    // `(%bind sigma 2.0)` is the smoking gun of the mutate-shared-bindings bug.
+    assert!(
+        pir.contains("(%bind mu (") && pir.contains("elementof reals"),
+        "mu stays an elementof param decl (not clobbered to a θ literal):\n{pir}"
+    );
+    assert!(
+        !pir.contains("(%bind mu 5.0)") && !pir.contains("(%bind sigma 2.0)"),
+        "shared params must not be mutated to a query's θ:\n{pir}"
+    );
+
+    // And no residual self-ref to the (now-unused) params survives in either
+    // scored density subtree.
+    assert!(
+        !lp_line.contains("(%ref self mu)") && !lp2_line.contains("(%ref self mu)"),
+        "θ must be inlined, not left as a shared self-ref:\nlp:  {lp_line}\nlp2: {lp2_line}"
+    );
+}
+
 // Regression fixture for audit finding H3 (§6a:167-168): a variate reached
 // through a derived binding (`a = 2·theta`, `theta = draw(M)`) must score at
 // the pinned `theta` and propagate transitively — no stochastic `draw` may

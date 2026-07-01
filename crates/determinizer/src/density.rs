@@ -29,7 +29,7 @@
 //!   `base` a primitive univariate constructor, → `sub(density(M, v),
 //!   log(sub(touniform(base, hi), touniform(base, lo))))` — the closed-form
 //!   `Z = CDF(hi) - CDF(lo)` via the `builtin_touniform` CDF transport
-//!   (§6a:179, §06:471); **refuses** for any other unnormalized `M` (no
+//!   (§06:471); **refuses** for any other unnormalized `M` (no
 //!   closed-form mass rule; `totalmass` is OUT of FlatPDL).
 //! - `truncate(M, S)` → `ifelse(in(v, S), density(M, v), neg(inf))` (the `_ in R`
 //!   membership builtin, which infers to a boolean — `elementof` is a set-valued
@@ -49,9 +49,11 @@
 //! **Likelihood query** (audit H2): `logdensityof(likelihoodof(K, obs), θ)` is
 //! handled at the `logdensityof` *entry* (not via `lower_measure_density`). Its
 //! arg2 is the parameter point θ (a record), NOT the variate; the variate is the
-//! `obs` baked into the likelihood. Each θ field is bound to the matching module
-//! parameter binding, then `K` is scored at `obs` — §06:492
-//! `densityof(likelihoodof(K, obs), θ) = pdf(κ(θ), obs)`.
+//! `obs` baked into the likelihood. `K` is scored at `obs`, then each θ field is
+//! inlined into THIS query's density subtree only — a per-query substitution of
+//! `(%ref self <name>)` for the θ value (never a mutation of the shared module
+//! binding, so two likelihood queries over the same params keep distinct θ
+//! points) — §06:492 `densityof(likelihoodof(K, obs), θ) = pdf(κ(θ), obs)`.
 //!
 //! **Refused:** `kchain` marginals, keyword `joint`, `bayesupdate`, `disintegrate`,
 //! `restrict`, `pushfwd` with a non-bijection argument, `iid` with a non-literal
@@ -102,6 +104,14 @@ fn is_likelihood(m: &Module, id: NodeId) -> bool {
 
 /// `logdensityof(likelihoodof(K, obs), θ)` = density of `K` at the observed `obs`,
 /// with `K`'s free parameters bound from the θ record (§06:492, audit H2).
+///
+/// Each θ field value is inlined into THIS query's emitted density subtree only
+/// (a self-contained per-query substitution keyed on `(%ref self <name>)` — see
+/// [`substitute_refs_by_name`]). We deliberately do NOT mutate the shared module
+/// bindings for `<name>`: a second likelihood query over the same parameters must
+/// score at ITS OWN θ point, not the last θ written globally. Leaving the
+/// `mu = elementof(...)` param decls in place is valid FlatPDL (`is_flatpdl`
+/// allows `elementof` parameter declarations); they become unused free params.
 fn lower_likelihood_query(
     m: &mut Module,
     likelihoodof_node: NodeId,
@@ -119,13 +129,20 @@ fn lower_likelihood_query(
         }
         (c.args[0], c.args[1])
     };
-    bind_params_from_record(m, theta)?;
-    lower_measure_density(m, k, obs)
+    let theta_map = theta_field_map(m, theta)?;
+    let density = lower_measure_density(m, k, obs)?;
+    // Inline this query's θ values into ITS OWN density subtree: substitute each
+    // `(%ref self <name>)` matching a θ field with that field's value node. No
+    // shared binding is mutated, so sibling queries over the same params keep
+    // their own θ points (fixes the cross-query param leak, C1).
+    Ok(substitute_refs_by_name(m, density, &theta_map))
 }
 
-/// Bind each `%field name = value` in the θ record to the module binding `name`
-/// (parameterized→fixed), so `K`'s parameter refs resolve to the scored point.
-fn bind_params_from_record(m: &mut Module, theta: NodeId) -> Result<(), RefuseError> {
+/// Build the `name → θ-value` map from the θ record's `%field name = value`
+/// entries. Refuses if θ is not a record, or names a parameter with no module
+/// binding (a θ field that does not correspond to a declared param is a
+/// mislowering hazard, not a valid point).
+fn theta_field_map(m: &Module, theta: NodeId) -> Result<Vec<(Symbol, NodeId)>, RefuseError> {
     let (resolved, _) = resolve_ref_one(m, theta);
     let fields: Vec<(Symbol, NodeId)> = {
         let rec = expect_builtin_call(m, resolved, "record")
@@ -136,13 +153,85 @@ fn bind_params_from_record(m: &mut Module, theta: NodeId) -> Result<(), RefuseEr
             .map(|n| (n.name, n.value))
             .collect()
     };
-    for (name, value) in fields {
-        let bid = m
-            .binding_by_name(name)
-            .ok_or_else(|| refuse(value, m, "θ names a parameter with no module binding"))?;
-        m.set_binding_rhs(bid, value);
+    for (name, value) in &fields {
+        if m.binding_by_name(*name).is_none() {
+            return Err(refuse(
+                *value,
+                m,
+                "θ names a parameter with no module binding",
+            ));
+        }
     }
-    Ok(())
+    Ok(fields)
+}
+
+/// Replace every `(%ref self <name>)` in the subtree at `root` with the node
+/// mapped from `<name>` in `map`, returning the (possibly new) root node id.
+///
+/// This mirrors the append-only bottom-up rebuild of `substitute_in_tree`
+/// (`driver.rs`), but keys on a `Ref(SelfMod, name)` leaf rather than a single
+/// target NodeId — so one pass over the emitted density subtree inlines ALL θ
+/// fields at once. Only `Call` nodes carry children; a matched self-ref is
+/// itself a leaf, so it is replaced before its (nonexistent) children recurse.
+fn substitute_refs_by_name(m: &mut Module, root: NodeId, map: &[(Symbol, NodeId)]) -> NodeId {
+    // Leaf self-ref: replace if its name is in the map.
+    if let Node::Ref(Ref {
+        ns: RefNs::SelfMod,
+        name,
+    }) = m.node(root)
+    {
+        if let Some((_, value)) = map.iter().find(|(n, _)| n == name) {
+            return *value;
+        }
+        return root;
+    }
+
+    // Otherwise recurse into children (only `Call` nodes have any).
+    let children: Vec<NodeId> = m.node(root).children();
+    if children.is_empty() {
+        return root;
+    }
+    let new_children: Vec<NodeId> = children
+        .iter()
+        .map(|&c| substitute_refs_by_name(m, c, map))
+        .collect();
+    if new_children == children {
+        return root;
+    }
+
+    let Node::Call(orig_call) = m.node(root) else {
+        unreachable!("non-call node with children is impossible in this IR");
+    };
+    let head = orig_call.head;
+    let inputs = orig_call.inputs.clone();
+    let pos_count = orig_call.args.len();
+    let named_count = orig_call.named.len();
+
+    // `for_each_child` visits: callee (User head) first, then positional args,
+    // then named values — mirror that partition here.
+    let (new_head, child_slice) = match head {
+        CallHead::User(_) => (CallHead::User(new_children[0]), &new_children[1..]),
+        CallHead::Builtin(s) => (CallHead::Builtin(s), &new_children[..]),
+    };
+    let new_args: Vec<NodeId> = child_slice[..pos_count].to_vec();
+    let new_named_values: Vec<NodeId> = child_slice[pos_count..pos_count + named_count].to_vec();
+    let new_named: Vec<NamedArg> = orig_call
+        .named
+        .iter()
+        .zip(new_named_values.iter())
+        .map(|(n, &v)| NamedArg {
+            kind: n.kind,
+            name: n.name,
+            value: v,
+        })
+        .collect();
+
+    m.alloc(Node::Call(Call {
+        head: new_head,
+        args: new_args.into(),
+        named: new_named.into(),
+        inputs,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -439,7 +528,7 @@ fn lower_superpose(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Re
 ///   the identity on the density — it lowers to just `logdensityof(M, v)`.
 /// * If `M` is `truncate(base, interval(lo, hi))` with `base` a primitive
 ///   univariate constructor, `Z = CDF(hi) - CDF(lo)` via the `builtin_touniform`
-///   CDF transport (§6a:179, §06:471): `logZ = log(touniform(base, hi) -
+///   CDF transport (§06:471): `logZ = log(touniform(base, hi) -
 ///   touniform(base, lo))`. The `-inf` outside-support gate is already handled
 ///   by the existing `truncate` lowering, so the emitted density term is just
 ///   `lower_measure_density(m, m_inner, v)` minus this `logZ`.
@@ -472,7 +561,7 @@ fn lower_normalize(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Re
     }
 
     // Closed-form Z for a truncated univariate measure: Z = CDF(hi) − CDF(lo),
-    // via the builtin_touniform (CDF) transport (§6a:179). Extract the
+    // via the builtin_touniform (CDF) transport (§06:471). Extract the
     // truncate/interval shape and its endpoints BEFORE any mutable builds
     // below (immutable reads of `m` must precede `m.alloc`/`build_*` calls).
     let truncate_shape: Option<(NodeId, NodeId, NodeId)> = {
