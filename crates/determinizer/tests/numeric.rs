@@ -138,6 +138,41 @@ lp = logdensityof(lawof(record(a = a, b = b)), record(a = 0.5, b = 0.5))";
     );
 }
 
+#[test]
+fn iid_normal_sum_oracle() {
+    // logdensityof(iid(Normal(0,1), 3), [0.5, -0.3, 1.2]) = Σ log N(xᵢ;0,1)
+    let xs = [0.5_f64, -0.3, 1.2];
+    let oracle: f64 = xs.iter().map(|&x| gaussian_logpdf(x, 0.0, 1.0)).sum();
+    let src = "\
+d = iid(Normal(mu = 0.0, sigma = 1.0), 3)
+lp = logdensityof(d, [0.5, -0.3, 1.2])";
+    let m = parse_infer(src);
+    let out = determinize(&m).expect("iid must lower");
+    assert!(
+        flatppl_determinizer::is_flatpdl(&out).is_ok(),
+        "must be FlatPDL"
+    );
+    let pir = flatppl_flatpir::write(&out);
+    assert_eq!(
+        pir.matches("builtin_logdensityof").count(),
+        3,
+        "3 iid terms:\n{pir}"
+    );
+    assert!(
+        !pir.contains("(iid ") && !pir.contains("(logdensityof "),
+        "no measure layer:\n{pir}"
+    );
+    // Oracle sanity (value is checked end-to-end by the #[ignore]d JS test below).
+    assert!(
+        (oracle
+            - (gaussian_logpdf(0.5, 0.0, 1.0)
+                + gaussian_logpdf(-0.3, 0.0, 1.0)
+                + gaussian_logpdf(1.2, 0.0, 1.0)))
+        .abs()
+            < 1e-12
+    );
+}
+
 // ── JS engine scoring (requires FLATPPL_JS_DIR + Node 24) ────────────────────
 //
 // These tests are #[ignore]d because they require an external JS engine and
@@ -356,6 +391,25 @@ lp = logdensityof(lawof(record(a = a, b = b)), record(a = 0.5, b = 0.5))";
         (result - oracle).abs() <= tol,
         "JS engine result {result} differs from oracle {oracle} by {} (> tol {tol})",
         (result - oracle).abs()
+    );
+}
+
+#[test]
+#[ignore = "requires FLATPPL_JS_DIR + Node 24; run with --include-ignored"]
+fn iid_normal_js_engine_matches_oracle() {
+    let xs = [0.5_f64, -0.3, 1.2];
+    let oracle: f64 = xs.iter().map(|&x| gaussian_logpdf(x, 0.0, 1.0)).sum();
+    let src = "\
+d = iid(Normal(mu = 0.0, sigma = 1.0), 3)
+lp = logdensityof(d, [0.5, -0.3, 1.2])";
+    let m = parse_infer(src);
+    let out = determinize(&m).expect("iid must lower");
+    let result = js_score(&flatppl_syntax::print(&out), "lp")
+        .expect("FLATPPL_JS_DIR must be set")
+        .expect("JS scoring must succeed");
+    assert!(
+        (result - oracle).abs() <= 1e-9,
+        "JS {result} vs oracle {oracle}"
     );
 }
 

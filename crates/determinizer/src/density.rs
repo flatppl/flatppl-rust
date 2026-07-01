@@ -28,15 +28,19 @@
 //!   membership builtin, which infers to a boolean — `elementof` is a set-valued
 //!   parameter declaration, not a membership predicate).
 //! - `pushfwd(bijection(f, f_inv, logvol), M)` → `sub(density(M, f_inv(v)), logvol(f_inv(v)))`
+//! - `iid(M, N)` → `Σ_{i<N} density(M, get0(v, i))` — **`N` must be a literal
+//!   integer** (static unroll; corpus `N` is small). A non-literal `N` is
+//!   **refused**.
 //!
-//! **Refused:** `kchain` marginals, `joint`/`iid`, `bayesupdate`, `disintegrate`, `restrict`,
+//! **Refused:** `kchain` marginals, `joint`, `bayesupdate`, `disintegrate`, `restrict`,
 //! `likelihoodof`, `pushfwd` with a non-bijection argument, a variate-dependent
-//! (function-valued) `weighted`/`logweighted` weight, and any unrecognised shape.
+//! (function-valued) `weighted`/`logweighted` weight, `iid` with a non-literal
+//! size, and any unrecognised shape.
 
 use crate::refuse::RefuseError;
 use flatppl_core::{
-    BindingId, Call, CallHead, Mass, Module, NamedArg, NamedKind, Node, NodeId, Ref, RefNs, Symbol,
-    Type,
+    BindingId, Call, CallHead, Mass, Module, NamedArg, NamedKind, Node, NodeId, Ref, RefNs, Scalar,
+    Symbol, Type,
 };
 
 // ---------------------------------------------------------------------------
@@ -83,8 +87,9 @@ pub(crate) fn lower_measure_density(
         // kchain marginal: discrete-finite latent → mass-weighted logsumexp;
         // continuous / infinite-discrete / non-enumerable → refuse (Task 5).
         Some("kchain") => crate::marginal::lower_kchain_marginal(m, measure_node, v),
+        Some("iid") => lower_iid(m, measure_node, v),
         // Refused combinators — refused here rather than mis-lowered.
-        Some("joint") | Some("iid") | Some("markovchain") | Some("kscan") | Some("jointchain")
+        Some("joint") | Some("markovchain") | Some("kscan") | Some("jointchain")
         | Some("bayesupdate") | Some("disintegrate") | Some("restrict") | Some("likelihoodof")
         | Some("locscale") => Err(refuse_op(measure_node, m)),
         // Fallthrough: treat as a primitive distribution constructor.
@@ -449,6 +454,43 @@ fn lower_pushfwd(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Refu
     // logvol_val = logvol(preimage)
     let logvol_val = build_user_call(m, logvol_node, preimage);
     Ok(build_call(m, "sub", &[inner_density, logvol_val]))
+}
+
+/// Read a literal non-negative integer from `id` (`Scalar::Int`, or an integral
+/// `Scalar::Real`). Returns `None` if `id` is not such a literal.
+fn literal_usize(m: &Module, id: NodeId) -> Option<usize> {
+    match m.node(id) {
+        Node::Lit(Scalar::Int(n)) if *n >= 0 => Some(*n as usize),
+        Node::Lit(Scalar::Real(r)) if *r >= 0.0 && r.fract() == 0.0 => Some(*r as usize),
+        _ => None,
+    }
+}
+
+/// `logdensityof(iid(M, N), v)` = `Σ_{i<N} logdensityof(M, get0(v, i))` (§06:473,
+/// "iid(M, n) → Σ_i log densityof(M, xᵢ)"). N comes from the `iid` count arg,
+/// which must be a literal integer. Static unroll (corpus N small; broadcast+
+/// reduce is the noted scale path, not built).
+fn lower_iid(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseError> {
+    let (m_inner, n) = {
+        let c =
+            expect_builtin_call(m, node, "iid").ok_or_else(|| refuse(node, m, "expected iid"))?;
+        if c.args.len() != 2 {
+            return Err(refuse(node, m, "iid expects 2 args (measure, size)"));
+        }
+        let n = literal_usize(m, c.args[1])
+            .ok_or_else(|| refuse(c.args[1], m, "iid size must be a literal integer"))?;
+        (c.args[0], n)
+    };
+    if n == 0 {
+        return Err(refuse(node, m, "iid with zero size has no density"));
+    }
+    let mut terms = Vec::with_capacity(n);
+    for i in 0..n {
+        let idx = m.alloc(Node::Lit(Scalar::Int(i as i64)));
+        let elem = build_call(m, "get0", &[v, idx]);
+        terms.push(lower_measure_density(m, m_inner, elem)?);
+    }
+    Ok(fold_add(m, &terms))
 }
 
 // ---------------------------------------------------------------------------

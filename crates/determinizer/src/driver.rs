@@ -385,6 +385,11 @@ const COMBINATOR_OPS: &[&str] = &[
     "kernelof",
     "lawof",
     "draw",
+    // Independent-product combinator (Task 1 follow-on): `iid(M, N)` is consumed
+    // through the density rule (unrolled into per-element terms), so a `d =
+    // iid(...)` binding referenced only by the now-lowered `logdensityof` query
+    // is orphaned the same way a `weighted`/`superpose` binding is.
+    "iid",
 ];
 
 /// After a `logdensityof` rewrite, scan all bindings whose RHS is a measure
