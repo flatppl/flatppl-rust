@@ -111,6 +111,27 @@ lp = logdensityof(lawof(record(a = a)), record(a = 0.5))";
     );
 }
 
+// Keyword `joint(name = M, …)` (named components, record variate) shares the
+// `joint` op name with the positional form but is deliberately out of scope:
+// its components live in `named`, not `args`, so it must not fall through to
+// the positional arg-count guard (which would misreport it as an under-sized
+// positional `joint`). The determiniser must refuse with a distinct message
+// naming keyword joint specifically.
+#[test]
+fn keyword_joint_refuses_with_distinct_message() {
+    let src = "\
+a = Normal(mu = 0.0, sigma = 1.0)
+b = Normal(mu = 1.0, sigma = 2.0)
+d = joint(x = a, y = b)
+lp = logdensityof(d, record(x = 0.5, y = 0.5))";
+    let m = parse_infer(src);
+    let err = determinize(&m).expect_err("keyword joint must refuse, not lower");
+    assert!(
+        err.reason.contains("keyword joint"),
+        "refusal names keyword joint distinctly: {err:?}"
+    );
+}
+
 // `markovchain` is an unsupported measure-algebra combinator in this MVP — it
 // requires a Markov kernel and stationary-distribution reasoning that goes well
 // beyond density disintegration. The determiniser must refuse naming the

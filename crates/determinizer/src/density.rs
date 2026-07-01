@@ -514,13 +514,22 @@ fn lower_iid(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseEr
 /// call's own shape handling (`build_density_term`'s domain/variate kind
 /// check). Keyword `joint(name₁ = M₁, …)` (named components → record variate)
 /// is out of scope: it shares the `joint` op name with the positional form, so
-/// it does reach this function, but it carries its components in `named` with
-/// an empty `args`, which fails the `args.len() < 2` check below and refuses
-/// rather than mislowers.
+/// it does reach this function, but it carries its components in `named`
+/// rather than `args`. That is checked explicitly, first, with its own
+/// distinct refuse message — not left to fall through to the positional
+/// arg-count guard, which would misname a keyword `joint` as merely
+/// under-sized.
 fn lower_joint(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseError> {
     let inner: Vec<NodeId> = {
         let c = expect_builtin_call(m, node, "joint")
             .ok_or_else(|| refuse(node, m, "expected joint"))?;
+        if !c.named.is_empty() {
+            return Err(refuse(
+                node,
+                m,
+                "keyword joint (named components) is not yet lowered",
+            ));
+        }
         if c.args.len() < 2 {
             return Err(refuse(node, m, "joint needs at least 2 components"));
         }
