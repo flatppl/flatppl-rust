@@ -180,22 +180,33 @@ impl<'m, 's> Inferencer<'m, 's> {
     /// literals) are closed over — pruned via the phase table. Every ancestor's
     /// phase is already memoised when this runs (the reification's children are
     /// traced before its op rule), so the walk reads, never recurses, inference.
-    pub(crate) fn collect_auto_inputs(&self, body: NodeId) -> Vec<(Symbol, Ref)> {
-        // Keyed by leaf name (dedup + canonical sort); the value is the full
-        // `Ref`, so a cross-module leaf keeps its `Module(alias)` namespace.
+    /// Returns the local `elementof` leaf inputs and a flag that is set if the
+    /// trace reached a parametric **cross-module** dependency. Spec §04 reifies
+    /// the combined DAG across module boundaries (splitting a model does not
+    /// change what `functionof` reifies), which the module linker
+    /// (engine-concepts §7) will realize; until then the caller refuses the
+    /// cross-module case rather than mis-reify it.
+    pub(crate) fn collect_auto_inputs(&self, body: NodeId) -> (Vec<(Symbol, Ref)>, bool) {
+        // Keyed by leaf name (dedup + canonical sort).
         let mut leaves: BTreeMap<String, Ref> = BTreeMap::new();
+        let mut cross_module = false;
         let mut visited: HashSet<NodeId> = HashSet::new();
-        self.walk_auto(body, &mut leaves, &mut visited);
-        leaves.into_values().map(|r| (r.name, r)).collect()
+        self.walk_auto(body, &mut leaves, &mut cross_module, &mut visited);
+        (
+            leaves.into_values().map(|r| (r.name, r)).collect(),
+            cross_module,
+        )
     }
 
     /// Depth-first ancestor walk for [`collect_auto_inputs`], following `self`
     /// references across binding boundaries and recording each `elementof`
-    /// leaf binding's name once (`leaves`, keyed by name → sorted + deduped).
+    /// leaf binding's name once (`leaves`, keyed by name → sorted + deduped);
+    /// sets `cross_module` if it reaches a parametric loaded-module reference.
     fn walk_auto(
         &self,
         id: NodeId,
         leaves: &mut BTreeMap<String, Ref>,
+        cross_module: &mut bool,
         visited: &mut HashSet<NodeId>,
     ) {
         if !visited.insert(id) {
@@ -228,13 +239,14 @@ impl<'m, 's> Inferencer<'m, 's> {
                 }
                 None => Vec::new(),
             },
-            // Per-module inference (§11): a parameterized cross-module reference
-            // is an ATOMIC parametric leaf — B does not trace into the dependency,
-            // so `dep.scaled` is an input named `scaled`, referenced as
-            // `(%ref dep scaled)`. (A FIXED cross-module ref was pruned above, so
+            // A parametric cross-module dependency. Spec §04 traces the combined
+            // DAG into the dependency to its own `elementof` leaves; that
+            // trace-across is the module linker's job (engine-concepts §7) and is
+            // not yet implemented, so flag it and let the caller refuse rather
+            // than mis-reify. (A FIXED cross-module ref was pruned above, so
             // reaching here means the referenced binding is parameterized.)
             Node::Ref(r) if matches!(r.ns, RefNs::Module(_)) => {
-                leaves.insert(self.module.resolve(r.name).to_string(), *r);
+                *cross_module = true;
                 Vec::new()
             }
             Node::Call(call) => {
@@ -251,7 +263,7 @@ impl<'m, 's> Inferencer<'m, 's> {
             _ => Vec::new(),
         };
         for child in children {
-            self.walk_auto(child, leaves, visited);
+            self.walk_auto(child, leaves, cross_module, visited);
         }
     }
 

@@ -1500,7 +1500,24 @@ fn reification_type(
                 let Some((body, _, _)) = args.first() else {
                     return Type::Deferred;
                 };
-                let entries = inf.collect_auto_inputs(*body);
+                let (entries, cross_module) = inf.collect_auto_inputs(*body);
+                if cross_module {
+                    // Spec §04 reifies across the combined DAG into the dependency
+                    // to its own `elementof` leaves; that trace-across awaits the
+                    // module linker (engine-concepts §7). Refuse rather than
+                    // mis-reify — explicit boundary specification is the
+                    // cross-module (and encapsulation) opt-out.
+                    inf.diags.push(crate::Diagnostic::error_at(
+                        id,
+                        "boundary-less reification depends on a value from a loaded \
+                         module; the cross-module trace is not yet implemented — use \
+                         explicit boundary specification to name the input, or reify \
+                         within the defining module (spec §04)",
+                    ));
+                    return Type::Failed(
+                        "cross-module boundary-less reification not yet supported".into(),
+                    );
+                }
                 let names: Box<[Symbol]> = entries.iter().map(|(n, _)| *n).collect();
                 inf.module.set_auto_inputs(id, entries.into());
                 names
