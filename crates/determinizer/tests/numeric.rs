@@ -175,6 +175,67 @@ lp = logdensityof(d, [0.5, 0.5])";
 }
 
 #[test]
+fn weighted_function_weight_oracle() {
+    // logdensityof(weighted(x -> exp(x), g), 0.5) = log(exp(0.5)) + logdensityof(g, 0.5)
+    //   = 0.5 + logN(0.5;0,1)   (g = N(0,1))
+    // §06:469 — the weight may be a function of the variate; it is applied at v.
+    let oracle = 0.5 + gaussian_logpdf(0.5, 0.0, 1.0);
+    let src = "\
+g = Normal(mu = 0.0, sigma = 1.0)
+d = weighted(x -> exp(x), g)
+lp = logdensityof(d, 0.5)";
+    let m = parse_infer(src);
+    let out = determinize(&m).expect("function-weighted weighted must lower");
+    assert!(
+        flatppl_determinizer::is_flatpdl(&out).is_ok(),
+        "must be FlatPDL"
+    );
+    let pir = flatppl_flatpir::write(&out);
+    // One density term (g); the applied weight is `log((%call w v))`, not a
+    // `builtin_logdensityof`.
+    assert_eq!(
+        pir.matches("builtin_logdensityof").count(),
+        1,
+        "single density term:\n{pir}"
+    );
+    assert!(
+        !pir.contains("(weighted ") && !pir.contains("(logdensityof "),
+        "measure layer gone:\n{pir}"
+    );
+    assert!(oracle.is_finite());
+}
+
+#[test]
+fn logweighted_function_weight_oracle() {
+    // logdensityof(logweighted(x -> logdensityof(g2, x), g1), 0.5)
+    //   = logdensityof(g2, 0.5) + logdensityof(g1, 0.5)
+    //   = logN(0.5;1,2) + logN(0.5;0,1)   (g1=N(0,1), g2=N(1,2))
+    let oracle = gaussian_logpdf(0.5, 1.0, 2.0) + gaussian_logpdf(0.5, 0.0, 1.0);
+    let src = "\
+g1 = Normal(mu = 0.0, sigma = 1.0)
+g2 = Normal(mu = 1.0, sigma = 2.0)
+d = logweighted(x -> logdensityof(g2, x), g1)
+lp = logdensityof(d, 0.5)";
+    let m = parse_infer(src);
+    let out = determinize(&m).expect("function-weighted logweighted must lower");
+    assert!(
+        flatppl_determinizer::is_flatpdl(&out).is_ok(),
+        "must be FlatPDL"
+    );
+    let pir = flatppl_flatpir::write(&out);
+    assert_eq!(
+        pir.matches("builtin_logdensityof").count(),
+        2,
+        "g1 + g2 terms:\n{pir}"
+    );
+    assert!(
+        !pir.contains("(logweighted ") && !pir.contains("(logdensityof "),
+        "measure layer gone:\n{pir}"
+    );
+    assert!(oracle.is_finite());
+}
+
+#[test]
 fn likelihoodof_gaussian_oracle() {
     // obs = likelihoodof(iid(Normal(mu,sigma), 1), [1.27])
     // logdensityof(obs, record(mu=0, sigma=1)) = log N(1.27; 0, 1)
