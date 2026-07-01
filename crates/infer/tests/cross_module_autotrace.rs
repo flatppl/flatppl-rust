@@ -98,3 +98,26 @@ fn lawof_may_reference_a_cross_module_value() {
         "m should be a measure, got:\n{out}"
     );
 }
+
+/// The spec's explicit consequence (§04): a measure that carries a parametric
+/// dependency on another module's node is a legal *measure* (`lawof` above), but
+/// it "cannot then be reified to a kernel" — `functionof` over such a measure
+/// would auto-collect the cross-module parameterized node as an input, so it is
+/// refused, exactly like a direct value reification.
+#[test]
+fn a_measure_with_a_cross_module_parametric_dep_cannot_be_reified_to_a_kernel() {
+    let (out, diags) = xmod(
+        "dep.flatppl",
+        "scaled = elementof(reals)",
+        "dep = load_module(\"dep.flatppl\")\n\
+         z ~ Normal(dep.scaled, 1.0)\n\
+         m = lawof(z)\n\
+         k = functionof(m)",
+    );
+    assert!(
+        refused(&diags),
+        "reifying a measure with a cross-module parametric dep to a kernel should refuse, got: {diags:?}"
+    );
+    let k = out.lines().find(|l| l.contains("%bind k")).unwrap_or("");
+    assert!(k.contains("%failed"), "k should be %failed, got:\n{out}");
+}
