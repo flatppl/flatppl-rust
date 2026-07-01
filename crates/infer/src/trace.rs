@@ -181,21 +181,12 @@ impl<'m, 's> Inferencer<'m, 's> {
     /// phase is already memoised when this runs (the reification's children are
     /// traced before its op rule), so the walk reads, never recurses, inference.
     pub(crate) fn collect_auto_inputs(&self, body: NodeId) -> Vec<(Symbol, Ref)> {
-        let mut leaves: BTreeMap<String, Symbol> = BTreeMap::new();
+        // Keyed by leaf name (dedup + canonical sort); the value is the full
+        // `Ref`, so a cross-module leaf keeps its `Module(alias)` namespace.
+        let mut leaves: BTreeMap<String, Ref> = BTreeMap::new();
         let mut visited: HashSet<NodeId> = HashSet::new();
         self.walk_auto(body, &mut leaves, &mut visited);
-        leaves
-            .into_values()
-            .map(|name| {
-                (
-                    name,
-                    Ref {
-                        ns: RefNs::SelfMod,
-                        name,
-                    },
-                )
-            })
-            .collect()
+        leaves.into_values().map(|r| (r.name, r)).collect()
     }
 
     /// Depth-first ancestor walk for [`collect_auto_inputs`], following `self`
@@ -204,7 +195,7 @@ impl<'m, 's> Inferencer<'m, 's> {
     fn walk_auto(
         &self,
         id: NodeId,
-        leaves: &mut BTreeMap<String, Symbol>,
+        leaves: &mut BTreeMap<String, Ref>,
         visited: &mut HashSet<NodeId>,
     ) {
         if !visited.insert(id) {
@@ -223,7 +214,13 @@ impl<'m, 's> Inferencer<'m, 's> {
                     if is_elementof(self.module, rhs) {
                         // A parametric leaf: record the binding (by name); do not
                         // descend into the `elementof` set argument.
-                        leaves.insert(self.module.resolve(r.name).to_string(), r.name);
+                        leaves.insert(
+                            self.module.resolve(r.name).to_string(),
+                            Ref {
+                                ns: RefNs::SelfMod,
+                                name: r.name,
+                            },
+                        );
                         Vec::new()
                     } else {
                         vec![rhs]
@@ -231,6 +228,15 @@ impl<'m, 's> Inferencer<'m, 's> {
                 }
                 None => Vec::new(),
             },
+            // Per-module inference (§11): a parameterized cross-module reference
+            // is an ATOMIC parametric leaf — B does not trace into the dependency,
+            // so `dep.scaled` is an input named `scaled`, referenced as
+            // `(%ref dep scaled)`. (A FIXED cross-module ref was pruned above, so
+            // reaching here means the referenced binding is parameterized.)
+            Node::Ref(r) if matches!(r.ns, RefNs::Module(_)) => {
+                leaves.insert(self.module.resolve(r.name).to_string(), *r);
+                Vec::new()
+            }
             Node::Call(call) => {
                 let mut c = Vec::new();
                 if let CallHead::User(callee) = call.head {
@@ -240,8 +246,8 @@ impl<'m, 's> Inferencer<'m, 's> {
                 c.extend(call.named.iter().map(|n| n.value));
                 c
             }
-            // Lit / Const / Hole / Axis / Ref(Module|Local) carry no parametric
-            // leaves (a `%local` placeholder is a Spec-boundary input, never auto).
+            // Lit / Const / Hole / Axis / Ref(%local) carry no parametric leaves
+            // (a `%local` placeholder is a Spec-boundary input, never auto).
             _ => Vec::new(),
         };
         for child in children {
