@@ -168,7 +168,7 @@ lp = logdensityof(d, [0.5, -0.3, 1.2])";
 // correctly — NOT refuse, NOT mislower. This proves the deliberate asymmetry with
 // `joint`: `iid(M, size)` is the product `M^⊗N` over ARRAYS of shape `size`, a
 // nested variate with a leading repeat axis `[N, …M-shape]`
-// (`06-measure-algebra.md:176` and `06-measure-algebra.md:212`). So the outer
+// (§06 "Independent composition"). So the outer
 // `get0(v, i)` recovers the full i-th `M`-variate (an entire inner row), and the
 // inner rule then projects each scalar with a further `get0`. There is
 // deliberately NO scalar-component guard on `iid` (unlike `joint`, whose flat
@@ -363,7 +363,7 @@ lp = logdensityof(d, 0.5)";
 fn normalize_truncated_normal_structure() {
     // normalize(truncate(Normal(0,1), interval(-1,1))) scored at 0.5 →
     //   sub(density_with_gate, log(sub(touniform(base, hi), touniform(base, lo))))
-    //   — §06:471 closed-form Z = CDF(hi) − CDF(lo) via the touniform (CDF)
+    //   — §06 "Density of composed measures" closed-form Z = CDF(hi) − CDF(lo) via the touniform (CDF)
     //   transport; valid here because the base Normal(0,1) is a normalized measure.
     let src = "\
 g = Normal(mu = 0.0, sigma = 1.0)
@@ -411,7 +411,7 @@ fn likelihoodof_gaussian_structure() {
     // obs = likelihoodof(iid(Normal(mu,sigma), 1), [1.27])
     // logdensityof(obs, record(mu=0, sigma=1)) → density(Normal(0,1), 1.27):
     // K is scored at the baked-in obs (1.27) with θ = {mu:0, sigma:1} inlined for
-    // the free params — §06:492 densityof(likelihoodof(K, obs), θ) = pdf(κ(θ), obs).
+    // the free params — §06 "Likelihood construction" densityof(likelihoodof(K, obs), θ) = pdf(κ(θ), obs).
     let src = "\
 mu = elementof(reals)
 sigma = elementof(posreals)
@@ -581,7 +581,7 @@ fn empty_record_is_zero() {
 }
 
 // Empty independent product: `iid(M, 0)` is Σ over an empty index set = 0, the
-// same as the empty measure `record()` (the iid Σ rule, `06-measure-algebra.md:477`,
+// same as the empty measure `record()` (the iid Σ rule, §06 "Density of composed measures",
 // with an empty index set). It lowers to the log-density literal 0 with NO
 // density term — it is NOT refused (both empty products must agree).
 #[test]

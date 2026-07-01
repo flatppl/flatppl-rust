@@ -541,23 +541,158 @@ fn binding_is_referenced(m: &Module, bid: BindingId, name_sym: Symbol) -> bool {
 }
 
 /// BFS subtree search: returns true iff the subtree at `root` contains a
-/// `Ref(SelfMod, name_sym)` node.
+/// `Ref(SelfMod, name_sym)` node — as a body sub-node OR as a `functionof` /
+/// `kernelof` reification *input* boundary entry.
+///
+/// **`Inputs`-aware (sweep-only).** `for_each_child` / `children()` deliberately
+/// EXCLUDE a `Call`'s [`flatppl_core::Inputs`] bucket (core `node.rs`), so a
+/// constructor/kernel binding referenced ONLY through a `(name, %ref self <name>)`
+/// reification input — e.g. `k = kernelof(pushfwd(f, g), …)` closing over `g =
+/// Normal(…)` — would look UNREFERENCED to a body-only walk, and the dead-binding
+/// sweep would zero it, leaving the live reification closing over a zeroed
+/// constructor. So this walk additionally scans each `Call`'s `inputs` entries.
+/// It only makes "referenced" MORE inclusive, so the sweep zeroes strictly fewer
+/// bindings — a sound tightening. This `Inputs`-scanning behaviour is scoped to
+/// the sweep, which is `subtree_contains_ref`'s only caller
+/// ([`binding_is_referenced`]).
 fn subtree_contains_ref(m: &Module, root: NodeId, name_sym: Symbol) -> bool {
     let mut queue = vec![root];
     let mut qi = 0;
     while qi < queue.len() {
         let id = queue[qi];
         qi += 1;
-        if let Node::Ref(Ref {
-            ns: RefNs::SelfMod,
-            name,
-        }) = m.node(id)
-        {
-            if *name == name_sym {
-                return true;
+        match m.node(id) {
+            Node::Ref(Ref {
+                ns: RefNs::SelfMod,
+                name,
+            }) if *name == name_sym => return true,
+            Node::Call(c) => {
+                // A reification input `(name, %ref self <name>)` references the
+                // binding just as a body ref does — but lives outside `children()`.
+                if let Some(flatppl_core::Inputs::Spec(entries)) = &c.inputs {
+                    for (_, r) in entries.iter() {
+                        if r.ns == RefNs::SelfMod && r.name == name_sym {
+                            return true;
+                        }
+                    }
+                }
             }
+            _ => {}
         }
         m.for_each_child(id, |c| queue.push(c));
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flatppl_core::{Binding, Call, Inputs, Mass, NamedArg, Type};
+
+    /// F2: a `Measure`-typed constructor binding referenced ONLY through another
+    /// binding's `functionof` / `kernelof` reification `Inputs` boundary entry
+    /// (`(g, %ref self g)`) must NOT be swept as dead. `children()` excludes the
+    /// `Inputs` bucket (core `node.rs`), so a body-only reference check judged `g`
+    /// unreferenced and the type arm zeroed it — leaving the live reification `k`
+    /// closing over a zeroed constructor. The `Inputs`-aware `subtree_contains_ref`
+    /// sees the boundary reference, so the sweep leaves `g` alone. This drives the
+    /// sweep directly (the full `determinize` over such a shape refuses anyway,
+    /// because the surviving `g` is a residual measure-layer binding — the point
+    /// here is that the sweep does not UNSOUNDLY zero it out from under `k`).
+    #[test]
+    fn sweep_preserves_binding_referenced_only_via_reification_input() {
+        let mut m = Module::new();
+
+        // g = Normal(mu=0.0, sigma=1.0) — a Measure-typed constructor.
+        let normal = m.intern("Normal");
+        let mu = m.intern("mu");
+        let sigma = m.intern("sigma");
+        let z0 = m.alloc(Node::Lit(Scalar::Real(0.0)));
+        let one = m.alloc(Node::Lit(Scalar::Real(1.0)));
+        let g_rhs = m.alloc(Node::Call(Call {
+            head: CallHead::Builtin(normal),
+            args: Vec::<NodeId>::new().into(),
+            named: vec![
+                NamedArg {
+                    kind: flatppl_core::NamedKind::Kwarg,
+                    name: mu,
+                    value: z0,
+                },
+                NamedArg {
+                    kind: flatppl_core::NamedKind::Kwarg,
+                    name: sigma,
+                    value: one,
+                },
+            ]
+            .into(),
+            inputs: None,
+        }));
+        m.set_type(
+            g_rhs,
+            Type::Measure {
+                domain: Box::new(Type::Scalar(flatppl_core::ScalarType::Real)),
+                mass: Mass::Normalized,
+            },
+        );
+        let g_name = m.intern("g");
+        let g_bid = m.add_binding(Binding {
+            name: g_name,
+            rhs: g_rhs,
+            doc: None,
+            public: true,
+            synthetic: false,
+        });
+
+        // k = functionof(_x_, x = _x_, g = g) — references `g` ONLY via its
+        // reification `Inputs`, never in the body.
+        let functionof = m.intern("functionof");
+        let x = m.intern("x");
+        let ph_x = m.intern("_x_");
+        let body = m.alloc(Node::Ref(Ref {
+            ns: RefNs::Local,
+            name: ph_x,
+        }));
+        let k_rhs = m.alloc(Node::Call(Call {
+            head: CallHead::Builtin(functionof),
+            args: vec![body].into(),
+            named: Vec::<NamedArg>::new().into(),
+            inputs: Some(Inputs::Spec(
+                vec![
+                    (
+                        x,
+                        Ref {
+                            ns: RefNs::Local,
+                            name: ph_x,
+                        },
+                    ),
+                    (
+                        g_name,
+                        Ref {
+                            ns: RefNs::SelfMod,
+                            name: g_name,
+                        },
+                    ),
+                ]
+                .into(),
+            )),
+        }));
+        let k_name = m.intern("k");
+        let _k_bid = m.add_binding(Binding {
+            name: k_name,
+            rhs: k_rhs,
+            doc: None,
+            public: true,
+            synthetic: false,
+        });
+
+        sweep_dead_measure_bindings(&mut m);
+
+        // `g` must survive: still a `Normal` call, NOT the `0.0` sweep sentinel.
+        let g_after = m.binding(g_bid).rhs;
+        assert!(
+            matches!(m.node(g_after), Node::Call(c) if matches!(c.head, CallHead::Builtin(s) if m.resolve(s) == "Normal")),
+            "g referenced only via k's reification Inputs must not be swept: got {:?}",
+            m.node(g_after)
+        );
+    }
 }

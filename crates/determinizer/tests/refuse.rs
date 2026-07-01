@@ -60,7 +60,7 @@ r = rand(s, lawof(draw(Normal(mu = 0.0, sigma = 1.0))))";
 }
 
 // Note: a variate-dependent (function) `weighted`/`logweighted` weight is NO
-// LONGER refused — per `06-measure-algebra.md:473` the weight may be a function
+// LONGER refused — per §06 "Density of composed measures" the weight may be a function
 // of the variate, so it
 // is APPLIED at the variate (`log w(v)` / `ℓ(v)`). The structural apply-path tests
 // live in `tests/numeric.rs` (`weighted_function_weight_oracle`,
@@ -221,5 +221,71 @@ lp = logdensityof(d, [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]])";
     let m = parse_infer(src);
     determinize(&m).expect_err(
         "iid with a multi-axis / vector size must refuse (only a literal scalar N is unrolled)",
+    );
+}
+
+// F1 (must-fix): a θ parameter captured as a `functionof` / `kernelof`
+// reification INPUT (a `(coeff, %ref self coeff)` boundary entry) cannot be
+// inlined by the per-query θ substitution — `substitute_refs_by_name` walks
+// `map_tree` / `children()`, which EXCLUDES a `Call`'s `Inputs` bucket (core
+// `node.rs` `for_each_child`). Here the density subtree references its weight by
+// name (`(%call (%ref self w) obs)`), and `w = functionof(mul(coeff, _x_), …,
+// coeff = coeff)` closes over the θ param `coeff` as a boundary input. Left
+// un-inlined, `coeff` would stay a dangling `(%ref self coeff)` inside the
+// reification, so the density would score as a function of the FREE `coeff`
+// instead of at θ = 2.0 — a silent mislowering that still passes `is_flatpdl`. A
+// prior fix guarded this with a `debug_assert!`, which is STRIPPED in release, so
+// in release the mislowering shipped. The determiniser must HARD REFUSE in every
+// build profile (this test runs in debug and encodes the refuse, not the assert).
+#[test]
+fn theta_captured_in_reification_input_refuses() {
+    let src = "\
+coeff = elementof(reals)
+w = functionof(mul(coeff, _x_), x = _x_, coeff = coeff)
+weight_base = weighted(w, Normal(mu = 0.0, sigma = 1.0))
+obs = likelihoodof(weight_base, 0.5)
+lp = logdensityof(obs, record(coeff = 2.0))";
+    let m = parse_infer(src);
+    let err = determinize(&m).expect_err(
+        "a θ param captured inside a functionof/kernelof reification input must refuse, \
+         not silently score at the free param",
+    );
+    assert!(
+        err.reason.contains("reification input") && err.reason.contains("cannot be"),
+        "refusal explains the θ-in-reification-input cannot be inlined: {err:?}"
+    );
+    assert!(
+        err.reason.contains("refuse rather than mislower"),
+        "refusal makes the refuse-don't-mislower stance explicit: {err:?}"
+    );
+}
+
+// F3 (composed truncation base): `normalize(truncate(pushfwd(bij, Normal), S))`
+// — a truncated log-normal-shaped base. The CDF-Z path emits
+// `builtin_touniform(<head>, …)` for ANY builtin head, but `touniform` is the CDF
+// only for a LEAF built-in distribution kernel (`Normal`, …), NOT a measure
+// combinator (`pushfwd`, …): `builtin_touniform(pushfwd, …)` is an UNDEFINED
+// transport (a static error, §07 "Measure kernel evaluation primitives"). The
+// determiniser must REFUSE. (With current inference the composed base surfaces
+// as `domain = %any`, so this shape happens to refuse via the
+// discrete/multivariate arm; the leaf-constructor HEAD gate — which does not rely
+// on downstream re-inference — is unit-tested directly in
+// `density.rs::tests::normalize_truncate_composed_head_refuses_leaf_constructor_message`.
+// This black-box test pins that a composed/pushfwd base is refused, not lowered.)
+#[test]
+fn normalize_truncate_pushfwd_base_refuses() {
+    let src = "\
+b = bijection(x -> add(x, 1.0), y -> sub(y, 1.0), z -> 0.0)
+comp_base = pushfwd(b, Normal(mu = 0.0, sigma = 1.0))
+d = normalize(truncate(comp_base, interval(1.0, 3.0)))
+lp = logdensityof(d, 2.0)";
+    let m = parse_infer(src);
+    let err = determinize(&m).expect_err(
+        "normalize(truncate(<composed/pushfwd base>, …)) must refuse — touniform is undefined \
+         for a measure-combinator head, not just discrete/multivariate leaf kernels",
+    );
+    assert!(
+        err.construct.contains("normalize"),
+        "refusal names normalize: {err:?}"
     );
 }
