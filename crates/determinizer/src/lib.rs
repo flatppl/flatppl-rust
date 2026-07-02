@@ -1,7 +1,6 @@
 //! FlatPPL → FlatPDL determiniser: a greedy directional legalizer that eliminates
 //! the measure layer, leaving deterministic ops + the six `builtin_*` primitives.
 //! Type-level transform — flatppl-rust does not evaluate densities.
-mod build;
 mod conformance;
 mod density;
 mod driver;
