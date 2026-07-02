@@ -657,6 +657,50 @@ lp = logdensityof(L, record(mu = 0.0, nu = 0.5))";
     );
 }
 
+// A component of a `joint_likelihood` may itself be a `joint_likelihood`
+// (§06 combination is associative). `joint_likelihood(joint_likelihood(L1, L2),
+// L3)` must flatten to `Σ` over all three leaf likelihoods — three density terms
+// — via the per-likelihood lowering's recursion, not stop at the outer two.
+#[test]
+fn joint_likelihood_nested_flattens_to_all_leaf_densities() {
+    let src = "\
+mu = elementof(reals)
+nu = elementof(reals)
+xi = elementof(reals)
+g1 = Normal(mu = mu, sigma = 1.0)
+g2 = Normal(mu = nu, sigma = 1.0)
+g3 = Normal(mu = xi, sigma = 1.0)
+L1 = likelihoodof(iid(g1, 1), [1.0])
+L2 = likelihoodof(iid(g2, 1), [2.0])
+L3 = likelihoodof(iid(g3, 1), [3.0])
+inner = joint_likelihood(L1, L2)
+L = joint_likelihood(inner, L3)
+lp = logdensityof(L, record(mu = 0.0, nu = 0.5, xi = 1.0))";
+    let m = parse_infer(src);
+    let out =
+        determinize(&m).expect("nested joint_likelihood must lower to a sum of leaf densities");
+    assert!(
+        flatppl_determinizer::is_flatpdl(&out).is_ok(),
+        "must be FlatPDL:\n{}",
+        flatppl_flatpir::write(&out)
+    );
+    let pir = flatppl_flatpir::write(&out);
+    // One density term per LEAF likelihood — the nested joint_likelihood flattens.
+    assert_eq!(
+        pir.matches("builtin_logdensityof").count(),
+        3,
+        "one density term per leaf likelihood (nested joint_likelihood flattened):\n{pir}"
+    );
+    // No residual measure / likelihood layer (including the nested combinator).
+    assert!(
+        !pir.contains("(joint_likelihood ")
+            && !pir.contains("(likelihoodof ")
+            && !pir.contains("(iid ")
+            && !pir.contains("(logdensityof "),
+        "measure/likelihood layer eliminated:\n{pir}"
+    );
+}
+
 // Regression fixture for transitive pinning (measure-algebra-audit.md H3): a variate reached
 // through a derived binding (`a = 2·theta`, `theta = draw(M)`) must score at
 // the pinned `theta` and propagate transitively — no stochastic `draw` may
