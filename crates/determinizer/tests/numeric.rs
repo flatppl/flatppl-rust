@@ -598,6 +598,65 @@ lp2 = logdensityof(obs, record(mu = 5.0, sigma = 2.0))";
     );
 }
 
+// `joint_likelihood(L1, …, Lk)` combines likelihoods by summing their
+// log-densities (§06 "Combining likelihoods":
+// `log L(θ) = log L1(θ) + log L2(θ) + …`), all components scored at the SAME
+// parameter point θ. `logdensityof(joint_likelihood(L1, L2), θ)` must lower to
+// `add(logdensityof(L1, θ), logdensityof(L2, θ))` — two density terms folded
+// with `add`, each component's own free params bound from the shared θ.
+#[test]
+fn joint_likelihood_sums_component_densities() {
+    let src = "\
+mu = elementof(reals)
+nu = elementof(reals)
+g1 = Normal(mu = mu, sigma = 1.0)
+g2 = Normal(mu = nu, sigma = 1.0)
+L1 = likelihoodof(iid(g1, 1), [1.0])
+L2 = likelihoodof(iid(g2, 1), [2.0])
+L = joint_likelihood(L1, L2)
+lp = logdensityof(L, record(mu = 0.0, nu = 0.5))";
+    let m = parse_infer(src);
+    let out = determinize(&m).expect("joint_likelihood must lower to a sum of component densities");
+    assert!(
+        flatppl_determinizer::is_flatpdl(&out).is_ok(),
+        "must be FlatPDL:\n{}",
+        flatppl_flatpir::write(&out)
+    );
+    let pir = flatppl_flatpir::write(&out);
+    // Two component densities, folded with `add`.
+    assert_eq!(
+        pir.matches("builtin_logdensityof").count(),
+        2,
+        "one density term per joint_likelihood component:\n{pir}"
+    );
+    let lp_line = pir
+        .lines()
+        .find(|l| l.contains("(%bind lp "))
+        .expect("lp binding present");
+    assert!(
+        lp_line.contains("(add "),
+        "components summed with add:\n{lp_line}"
+    );
+    // No residual measure / likelihood layer.
+    assert!(
+        !pir.contains("(joint_likelihood ")
+            && !pir.contains("(likelihoodof ")
+            && !pir.contains("(iid ")
+            && !pir.contains("(logdensityof "),
+        "measure/likelihood layer eliminated:\n{pir}"
+    );
+    // Each component scores at ITS θ: component 1 → Normal(mu=0.0), scored at the
+    // baked-in observation 1.0; component 2 → Normal(mu=0.5), scored at 2.0.
+    assert!(
+        lp_line.contains("(%field mu 0.0)") && lp_line.contains("(%field mu 0.5)"),
+        "each component binds its own free param from the shared θ:\n{lp_line}"
+    );
+    assert!(
+        !lp_line.contains("(%ref self mu)") && !lp_line.contains("(%ref self nu)"),
+        "θ must be inlined per component, not left as a shared self-ref:\n{lp_line}"
+    );
+}
+
 // Regression fixture for transitive pinning (measure-algebra-audit.md H3): a variate reached
 // through a derived binding (`a = 2·theta`, `theta = draw(M)`) must score at
 // the pinned `theta` and propagate transitively — no stochastic `draw` may

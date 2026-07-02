@@ -76,10 +76,18 @@
 //! points) — §06 "Likelihood construction":
 //! `densityof(likelihoodof(K, obs), θ) = pdf(κ(θ), obs)`.
 //!
-//! **Refused:** `kchain` marginals, keyword `joint`, `bayesupdate`, `disintegrate`,
-//! `restrict`, `pushfwd` with a non-bijection argument, `iid` with a non-literal
-//! (after resolving one `(%ref self …)` level — a NAMED literal size lowers) or
-//! multi-axis / vector size, `joint` with a component whose measure-domain kind
+//! **Joint likelihood** (§06 "Combining likelihoods"):
+//! `logdensityof(joint_likelihood(L1, …, Lk), θ)` = `Σᵢ logdensityof(Lᵢ, θ)` —
+//! likelihoods combine by multiplying densities (summing log-densities), every
+//! component scored at the SAME θ. Each `Lᵢ` is itself a likelihood, lowered by
+//! recursing through the per-likelihood dispatch at the shared θ. Positional
+//! components only (§06 form); a keyword `joint_likelihood` refuses.
+//!
+//! **Refused:** `kchain` marginals, keyword `joint`, keyword `joint_likelihood`,
+//! `bayesupdate`, `disintegrate`,
+//! `restrict`, `pushfwd` with a non-bijection argument, `iid` with a genuinely
+//! dynamic size (not statically resolvable from its const-evaluated domain
+//! shape) or a multi-axis / vector size, `joint` with a component whose measure-domain kind
 //! is not CONFIRMED scalar (refused up front — a confirmed-non-scalar OR an
 //! unknown/`%deferred` domain both refuse, fail-closed),
 //! `normalize(truncate(base, …))`
@@ -116,9 +124,18 @@ pub(crate) fn lower_logdensityof(m: &mut Module, query: NodeId) -> Result<NodeId
     };
     // Likelihood query: arg2 is the PARAMETER point θ; the variate is the
     // observed data baked into the likelihood (§06 "densityof(likelihoodof(K,obs),θ)").
+    // Both `likelihoodof` and `joint_likelihood` are likelihood-layer ops (each
+    // typing to `Type::Likelihood`); dispatch on the op name too, since a
+    // `(%ref self L)` to a likelihood binding may not carry the `Likelihood` type
+    // on the ref node itself.
     let (resolved, _) = resolve_ref_one(m, arg1);
-    if is_likelihood(m, arg1) || builtin_name(m, resolved) == Some("likelihoodof") {
-        return lower_likelihood_query(m, resolved, arg2);
+    if is_likelihood(m, arg1)
+        || matches!(
+            builtin_name(m, resolved),
+            Some("likelihoodof") | Some("joint_likelihood")
+        )
+    {
+        return lower_likelihood_density(m, resolved, arg2);
     }
     // Measure query: arg2 is the variate (existing path).
     let (measure_expr, v) = extract_logdensityof_args(m, query)?;
@@ -128,6 +145,76 @@ pub(crate) fn lower_logdensityof(m: &mut Module, query: NodeId) -> Result<NodeId
 /// True iff `id` infers to a `Likelihood` type.
 fn is_likelihood(m: &Module, id: NodeId) -> bool {
     matches!(m.type_of(id), Some(Type::Likelihood { .. }))
+}
+
+/// Lower `logdensityof(L, θ)` for a likelihood-layer `L`, dispatching on its op:
+/// * `likelihoodof(K, obs)` → density of `K` at `obs`, θ inlined
+///   ([`lower_likelihood_query`]);
+/// * `joint_likelihood(L1, …, Lk)` → `Σᵢ logdensityof(Lᵢ, θ)`
+///   ([`lower_joint_likelihood`]).
+///
+/// `resolved` is the likelihood node after one `(%ref self …)` hop. A
+/// likelihood-typed node that is neither op (e.g. reached only via its type)
+/// falls through to [`lower_likelihood_query`], which refuses unless it is a
+/// well-formed `likelihoodof` (refuse-don't-mislower).
+fn lower_likelihood_density(
+    m: &mut Module,
+    resolved: NodeId,
+    theta: NodeId,
+) -> Result<NodeId, RefuseError> {
+    match builtin_name(m, resolved) {
+        Some("joint_likelihood") => lower_joint_likelihood(m, resolved, theta),
+        _ => lower_likelihood_query(m, resolved, theta),
+    }
+}
+
+/// `logdensityof(joint_likelihood(L1, …, Lk), θ)` = `Σᵢ logdensityof(Lᵢ, θ)`
+/// (§06 "Combining likelihoods": likelihoods combine by multiplying densities,
+/// i.e. **summing log-densities** — `log L(θ) = Σᵢ log Lᵢ(θ)`), every component
+/// scored at the SAME parameter point θ. Each component `Lᵢ` is itself a
+/// likelihood — typically `likelihoodof(Kᵢ, obsᵢ)`, possibly bound by name, or a
+/// nested `joint_likelihood` — so we recurse through [`lower_likelihood_density`]
+/// at the shared θ (reusing the per-likelihood lowering, which inlines θ into
+/// each component's own density subtree). A component that cannot be lowered
+/// refuses (don't mislower).
+///
+/// **Positional only.** §06 spells `joint_likelihood(L1, L2, …)` as a positional
+/// list; a keyword form has no §06 meaning, so a `joint_likelihood` carrying
+/// named args is refused (consistent with how [`lower_joint`] treats a keyword
+/// `joint`), rather than silently dropped.
+fn lower_joint_likelihood(
+    m: &mut Module,
+    node: NodeId,
+    theta: NodeId,
+) -> Result<NodeId, RefuseError> {
+    let components: Vec<NodeId> = {
+        let c = expect_builtin_call(m, node, "joint_likelihood")
+            .ok_or_else(|| refuse(node, m, "expected joint_likelihood"))?;
+        if !c.named.is_empty() {
+            return Err(refuse(
+                node,
+                m,
+                "keyword joint_likelihood (named components) is not a §06 form",
+            ));
+        }
+        if c.args.is_empty() {
+            return Err(refuse(
+                node,
+                m,
+                "joint_likelihood needs at least one component",
+            ));
+        }
+        c.args.to_vec()
+    };
+    let mut terms = Vec::with_capacity(components.len());
+    for comp in components {
+        // Each component is a likelihood scored at the SHARED θ. Resolve one ref
+        // hop and reuse the per-likelihood dispatch (also handles a nested
+        // joint_likelihood).
+        let (comp_resolved, _) = resolve_ref_one(m, comp);
+        terms.push(lower_likelihood_density(m, comp_resolved, theta)?);
+    }
+    Ok(fold_add(m, &terms))
 }
 
 /// `logdensityof(likelihoodof(K, obs), θ)` = density of `K` at the observed `obs`,
@@ -325,10 +412,19 @@ pub(crate) fn lower_measure_density(
         Some("iid") => lower_iid(m, measure_node, v),
         Some("joint") => lower_joint(m, measure_node, v),
         // Refused combinators — refused here rather than mis-lowered.
-        Some("markovchain") | Some("kscan") | Some("jointchain") | Some("bayesupdate")
-        | Some("disintegrate") | Some("restrict") | Some("likelihoodof") | Some("locscale") => {
-            Err(refuse_op(measure_node, m))
-        }
+        // `likelihoodof` / `joint_likelihood` are normally unwrapped at the
+        // `logdensityof` entry (their arg2 is θ, not a variate); reaching the
+        // measure dispatcher means they were entered as a bare measure — refuse
+        // (safety net) rather than emit `builtin_logdensityof(joint_likelihood, …)`.
+        Some("markovchain")
+        | Some("kscan")
+        | Some("jointchain")
+        | Some("bayesupdate")
+        | Some("disintegrate")
+        | Some("restrict")
+        | Some("likelihoodof")
+        | Some("joint_likelihood")
+        | Some("locscale") => Err(refuse_op(measure_node, m)),
         // Fallthrough: treat as a primitive distribution constructor.
         _ => build_density_term(m, measure_node, v),
     }
@@ -830,6 +926,7 @@ pub(crate) const MEASURE_COMBINATOR_OPS: &[&str] = &[
     "bayesupdate",
     "disintegrate",
     "likelihoodof",
+    "joint_likelihood",
 ];
 
 /// True iff `base`'s builtin head is a measure-algebra combinator (in
@@ -1551,6 +1648,7 @@ mod tests {
             "disintegrate",
             "restrict",
             "likelihoodof",
+            "joint_likelihood",
             "locscale",
         ];
         for op in DISPATCHED_COMBINATOR_OPS {
