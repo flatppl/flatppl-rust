@@ -9,27 +9,39 @@
 
 use std::process::ExitCode;
 
-#[cfg(any(feature = "convert", feature = "infer"))]
+#[cfg(any(feature = "convert", feature = "infer", feature = "determinize"))]
 use std::fs;
-#[cfg(any(feature = "convert", feature = "infer"))]
+#[cfg(any(feature = "convert", feature = "infer", feature = "determinize"))]
 use std::path::Path;
-#[cfg(any(feature = "convert", feature = "infer", feature = "prepare"))]
+#[cfg(any(
+    feature = "convert",
+    feature = "infer",
+    feature = "prepare",
+    feature = "determinize"
+))]
 use std::path::PathBuf;
 
 #[cfg(any(feature = "convert", feature = "infer"))]
 use clap::ValueEnum;
 use clap::{CommandFactory, Parser, Subcommand};
-#[cfg(any(feature = "convert", feature = "infer", feature = "prepare"))]
+#[cfg(any(
+    feature = "convert",
+    feature = "infer",
+    feature = "prepare",
+    feature = "determinize"
+))]
 use flatppl_cli::Failure;
+#[cfg(any(feature = "convert", feature = "infer", feature = "determinize"))]
+use flatppl_cli::Format;
 #[cfg(feature = "convert")]
 use flatppl_cli::SyntaxLevel;
+#[cfg(any(feature = "convert", feature = "infer"))]
+use flatppl_cli::banner;
 use flatppl_cli::report;
 #[cfg(any(feature = "infer", feature = "prepare"))]
 use flatppl_cli::resolve::CliResolver;
 #[cfg(feature = "convert")]
 use flatppl_cli::write_module;
-#[cfg(any(feature = "convert", feature = "infer"))]
-use flatppl_cli::{Format, banner};
 #[cfg(feature = "fmtlint")]
 use flatppl_cli::{run_fmt, run_lint};
 #[cfg(any(feature = "infer", feature = "prepare"))]
