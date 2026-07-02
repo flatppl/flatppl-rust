@@ -24,7 +24,8 @@
 //! - `logweighted(ℓ, M)` → `add(ℓ(v), density(M, v))` — likewise, `ℓ` may be a
 //!   constant/scalar or a function of the variate, applied as `ℓ(v)` (already in
 //!   log space, so no outer `log`).
-//! - `superpose(M₁, …, Mₖ)` → `logsumexp(density(M₁, v), …, density(Mₖ, v))`
+//! - `superpose(M₁, …, Mₖ)` → `logsumexp([density(M₁, v), …, density(Mₖ, v)])`
+//!   (§07 `logsumexp` takes a single real vector, not variadic scalars)
 //! - `normalize(M)` → `density(M, v)` when `M` is already a probability measure
 //!   (closed-form `logZ = 0`); when `M = truncate(base, interval(lo, hi))` with
 //!   `base` a **normalized univariate continuous** constructor, → `sub(density(M, v),
@@ -657,7 +658,7 @@ fn lower_logweighted(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, 
     Ok(build_call(m, "add", &[lw_scored, inner_density]))
 }
 
-/// `logdensityof(superpose(M₁, …, Mₖ), v)` = `logsumexp(density(M₁,v), …, density(Mₖ,v))`
+/// `logdensityof(superpose(M₁, …, Mₖ), v)` = `logsumexp([density(M₁,v), …, density(Mₖ,v)])`
 fn lower_superpose(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseError> {
     // Read the args list before any mutable borrow.
     let inner_measures: Vec<NodeId> = {
@@ -674,7 +675,11 @@ fn lower_superpose(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Re
         density_terms.push(lower_measure_density(m, mi, v)?);
     }
 
-    Ok(build_call(m, "logsumexp", &density_terms))
+    // §07 "Reductions and norms": `logsumexp(v)` takes a single real VECTOR, not
+    // a variadic positional argument list — wrap the per-component densities in a
+    // `vector` literal (`[t₁, …, tₖ]`) so the emitted call is `logsumexp([…])`.
+    let terms_vec = build_call(m, "vector", &density_terms);
+    Ok(build_call(m, "logsumexp", &[terms_vec]))
 }
 
 /// `logdensityof(normalize(M), v)` = `logdensityof(M, v) - logZ`, where

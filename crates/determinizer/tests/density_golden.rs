@@ -89,7 +89,15 @@ a = draw(m)
 lp = logdensityof(lawof(record(a = a)), record(a = 0.5))";
     let out = determinize_src(src);
     let pir = flatppl_flatpir::write(&out);
-    assert!(pir.contains("logsumexp"), "logsumexp present:\n{pir}");
+    // §07 `logsumexp(v)` takes a single real VECTOR — the emitted call must wrap its
+    // per-component densities in a `vector`, not pass them as variadic scalars. The
+    // annotated FlatPIR of the vector form reads `(logsumexp (%meta ((%array …) …
+    // (vector …)))`; a (wrong) variadic form would show a scalar-typed first arg
+    // `(logsumexp (%meta ((%scalar …`.
+    assert!(
+        pir.contains("(logsumexp (%meta ((%array"),
+        "logsumexp must take a single vector (array-typed) argument, not variadic scalars (§07):\n{pir}"
+    );
     assert_eq!(
         pir.matches("builtin_logdensityof").count(),
         2,
@@ -246,7 +254,12 @@ pp = kchain(lawof(record(z = z)), k)
 lp = logdensityof(pp, record(y = 0.5))";
     let out = determinize_src(src);
     let pir = flatppl_flatpir::write(&out);
-    assert!(pir.contains("logsumexp"), "outer logsumexp present:\n{pir}");
+    // §07 `logsumexp(v)` takes a single real VECTOR: the per-atom branches must be
+    // wrapped in a `vector` (array-typed arg), not passed as variadic scalars.
+    assert!(
+        pir.contains("(logsumexp (%meta ((%array"),
+        "logsumexp must take a single vector argument (§07), not variadic scalars:\n{pir}"
+    );
     // 2 mass terms + 2 kernel terms over the 2 Bernoulli atoms.
     assert_eq!(
         pir.matches("builtin_logdensityof").count(),
@@ -293,6 +306,10 @@ lp = logdensityof(pp, record(y = 0.5))";
         pir.matches("logsumexp").count(),
         1,
         "one outer logsumexp over the 3 atoms:\n{pir}"
+    );
+    assert!(
+        pir.contains("(logsumexp (%meta ((%array"),
+        "logsumexp must take a single vector argument (§07), not variadic scalars:\n{pir}"
     );
     // 3 mass terms + 3 kernel terms over the 3 Categorical atoms {1, 2, 3}.
     assert_eq!(
@@ -345,6 +362,10 @@ lp = logdensityof(pp, record(y = 0.5))";
         pir.matches("logsumexp").count(),
         1,
         "one outer logsumexp over the 3 atoms:\n{pir}"
+    );
+    assert!(
+        pir.contains("(logsumexp (%meta ((%array"),
+        "logsumexp must take a single vector argument (§07), not variadic scalars:\n{pir}"
     );
     assert_eq!(
         pir.matches("builtin_logdensityof").count(),
@@ -403,6 +424,10 @@ lp = logdensityof(pp, record(y = 0.5))";
         pir.matches("logsumexp").count(),
         1,
         "one outer logsumexp over the n+1 = 3 atoms:\n{pir}"
+    );
+    assert!(
+        pir.contains("(logsumexp (%meta ((%array"),
+        "logsumexp must take a single vector argument (§07), not variadic scalars:\n{pir}"
     );
     // 3 mass terms + 3 kernel terms over the 3 Binomial atoms {0, 1, 2}.
     assert_eq!(
