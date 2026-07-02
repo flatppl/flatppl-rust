@@ -26,7 +26,7 @@ required-features = ["fmtlint"]
 [features]
 # Verbs are opt-in cargo features so heavy capabilities never burden the
 # default build; `infer` is light and rides along by default.
-default = ["convert", "infer", "prepare", "fmtlint"]
+default = ["convert", "infer", "prepare", "fmtlint", "determinize"]
 convert = ["dep:flatppl-flatpir"]
 # `infer` resolves cross-module deps from the cache only (no network), so it
 # links `flatppl-fileaccess` WITHOUT its `net` feature — no TLS stack.
@@ -37,6 +37,9 @@ infer = ["dep:flatppl-infer", "dep:flatppl-flatpir", "dep:flatppl-fileaccess"]
 prepare = ["dep:flatppl-fileaccess", "dep:flatppl-flatpir", "flatppl-fileaccess/net"]
 hs3 = ["dep:flatppl-hs3", "dep:flatppl-flatpir"]
 fmtlint = ["dep:flatppl-lint"]
+# `determinize` legalizes a FlatPPL model to the deterministic FlatPDL profile
+# (eliminate the measure layer), refusing constructs it cannot lower.
+determinize = ["dep:flatppl-determinizer"]
 
 [dependencies]
 flatppl-core = { path = "../core" }
@@ -45,6 +48,7 @@ flatppl-flatpir = { path = "../flatpir", optional = true }
 flatppl-infer = { path = "../infer", optional = true }
 flatppl-hs3 = { path = "../hs3", optional = true }
 flatppl-lint = { path = "../lint", optional = true }
+flatppl-determinizer = { path = "../determinizer", optional = true }
 # Source resolution + remote cache. `net` (TLS) is enabled only via the `prepare`
 # feature, so `infer` (cache-only) and the lean `flatppl-fmt` stay TLS-free.
 flatppl-fileaccess = { path = "../fileaccess", optional = true }

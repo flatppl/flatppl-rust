@@ -9,27 +9,39 @@
 
 use std::process::ExitCode;
 
-#[cfg(any(feature = "convert", feature = "infer"))]
+#[cfg(any(feature = "convert", feature = "infer", feature = "determinize"))]
 use std::fs;
-#[cfg(any(feature = "convert", feature = "infer"))]
+#[cfg(any(feature = "convert", feature = "infer", feature = "determinize"))]
 use std::path::Path;
-#[cfg(any(feature = "convert", feature = "infer", feature = "prepare"))]
+#[cfg(any(
+    feature = "convert",
+    feature = "infer",
+    feature = "prepare",
+    feature = "determinize"
+))]
 use std::path::PathBuf;
 
 #[cfg(any(feature = "convert", feature = "infer"))]
 use clap::ValueEnum;
 use clap::{CommandFactory, Parser, Subcommand};
-#[cfg(any(feature = "convert", feature = "infer", feature = "prepare"))]
+#[cfg(any(
+    feature = "convert",
+    feature = "infer",
+    feature = "prepare",
+    feature = "determinize"
+))]
 use flatppl_cli::Failure;
+#[cfg(any(feature = "convert", feature = "infer", feature = "determinize"))]
+use flatppl_cli::Format;
 #[cfg(feature = "convert")]
 use flatppl_cli::SyntaxLevel;
+#[cfg(any(feature = "convert", feature = "infer"))]
+use flatppl_cli::banner;
 use flatppl_cli::report;
 #[cfg(any(feature = "infer", feature = "prepare"))]
 use flatppl_cli::resolve::CliResolver;
 #[cfg(feature = "convert")]
 use flatppl_cli::write_module;
-#[cfg(any(feature = "convert", feature = "infer"))]
-use flatppl_cli::{Format, banner};
 #[cfg(feature = "fmtlint")]
 use flatppl_cli::{run_fmt, run_lint};
 #[cfg(any(feature = "infer", feature = "prepare"))]
@@ -121,6 +133,17 @@ enum Command {
         /// Re-fetch dependencies even if already cached (refresh).
         #[arg(long)]
         update: bool,
+    },
+    /// Determinize a FlatPPL model to the deterministic FlatPDL profile
+    /// (eliminate the measure layer). Refuses (exit 3) any construct it cannot
+    /// legalize, per refuse-don't-mislower.
+    #[cfg(feature = "determinize")]
+    Determinize {
+        /// Input FlatPPL file.
+        input: PathBuf,
+        /// Output file (`.flatppl`); stdout if omitted.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
     },
     /// Print a shell completion script to stdout.
     ///
@@ -221,6 +244,8 @@ fn main() -> ExitCode {
         } => infer_cmd(&input, &output, level.into(), no_header),
         #[cfg(feature = "prepare")]
         Command::Prepare { files, update } => prepare_cmd(&files, update),
+        #[cfg(feature = "determinize")]
+        Command::Determinize { input, output } => determinize_cmd(&input, output.as_deref()),
         Command::Completions { shell } => {
             let mut cmd = Cli::command();
             clap_complete::generate(shell, &mut cmd, "flatppl", &mut std::io::stdout());
@@ -434,4 +459,39 @@ fn prepare_cmd(files: &[PathBuf], update: bool) -> Result<(), Failure> {
     let resolver = CliResolver::fetching(update);
     let locations: Vec<Location> = files.iter().map(|f| Location::Local(f.clone())).collect();
     flatppl_cli::resolve::fetch_graph(&locations, &resolver)
+}
+
+/// `flatppl determinize <in.flatppl> [-o out]` — legalize a FlatPPL model to
+/// the deterministic FlatPDL profile (eliminate the measure layer), printing
+/// canonical FlatPPL syntax to `output`/stdout. Refuses (exit 3, via
+/// `Failure::Refuse`) any construct the determiniser cannot legalize.
+#[cfg(feature = "determinize")]
+fn determinize_cmd(input: &Path, output: Option<&Path>) -> Result<(), Failure> {
+    let source =
+        fs::read_to_string(input).map_err(|e| format!("reading `{}`: {e}", input.display()))?;
+    let module = match flatppl_cli::read_module(Format::FlatPpl, &source) {
+        Ok(m) => m,
+        Err((message, line, span)) => {
+            return Err(Failure::Diagnostic {
+                path: input.to_path_buf(),
+                source,
+                message,
+                line,
+                span,
+            });
+        }
+    };
+    let lowered = flatppl_determinizer::determinize(&module).map_err(|e| {
+        Failure::Refuse(format!(
+            "determinize: refuse {} (node {:?}): {}",
+            e.construct, e.node, e.reason
+        ))
+    })?;
+    let rendered = flatppl_syntax::print(&lowered);
+    match output {
+        Some(path) => fs::write(path, rendered)
+            .map_err(|e| Failure::Plain(format!("writing `{}`: {e}", path.display())))?,
+        None => print!("{rendered}"),
+    }
+    Ok(())
 }
