@@ -264,52 +264,69 @@ fn try_beta_law(m: &Module, node_id: NodeId) -> Option<NodeId> {
 
 /// Replace all occurrences of `old` with `new_id` in the subtree rooted at
 /// `root`. Returns the (possibly new) NodeId for the root after substitution.
-///
-/// The arena is append-only: we allocate new `Call` nodes whose children have
-/// been redirected, walking bottom-up. If no child is `old` the original node
-/// is reused (no allocation). This keeps the arena compact for simple rewrites.
 fn substitute_in_tree(m: &mut Module, root: NodeId, old: NodeId, new_id: NodeId) -> NodeId {
-    if root == old {
-        return new_id;
+    map_tree(m, root, &mut |_m, id| (id == old).then_some(new_id))
+}
+
+/// Bottom-up leaf-substituting rebuild of the subtree at `root`.
+///
+/// This is the single shared engine behind [`substitute_in_tree`] (which keys on
+/// a target NodeId) and `density::substitute_refs_by_name` (which keys on a
+/// `Ref(SelfMod, name)` leaf): both walk the same `children()` enumeration,
+/// rebuild only-if-changed, and reconstruct a `Call` from its mapped children.
+/// They differ ONLY in the leaf predicate, so that is the injected closure `f`:
+/// for each visited node, if `f` returns `Some(replacement)` that node is
+/// replaced wholesale (and its children are NOT visited — the caller decides what
+/// stands in); if it returns `None`, we recurse into the node's children and
+/// rebuild the `Call` when any child changed.
+///
+/// The arena is append-only: a `Call` whose children are unchanged is reused (no
+/// allocation), keeping the arena compact for simple rewrites. Only `Call` nodes
+/// carry children (see [`Node::for_each_child`]).
+///
+/// [`Inputs`](flatppl_core::Inputs) entries are `(Symbol, Ref)` leaves, NOT child
+/// sub-nodes, so this walk deliberately does not touch them — it clones them
+/// unchanged, exactly as both original functions did. A `Ref` slot in `Inputs`
+/// also cannot hold an arbitrary replacement node (it is a name reference, not a
+/// `NodeId`), so a leaf mapping that yields a value node has no representable
+/// target there; callers that must not silently skip such an input assert on it
+/// (see `density::substitute_refs_by_name`).
+pub(crate) fn map_tree(
+    m: &mut Module,
+    root: NodeId,
+    f: &mut impl FnMut(&Module, NodeId) -> Option<NodeId>,
+) -> NodeId {
+    // Leaf replacement decided by the caller's predicate. A replaced node stands
+    // in wholesale, so we do NOT descend into its (now-irrelevant) children.
+    if let Some(replacement) = f(m, root) {
+        return replacement;
     }
 
-    // Collect children and check if any need rewriting.
+    // Collect children and map each; only `Call` nodes have any.
     let children: Vec<NodeId> = m.node(root).children();
-    let new_children: Vec<NodeId> = children
-        .iter()
-        .map(|&c| substitute_in_tree(m, c, old, new_id))
-        .collect();
+    let new_children: Vec<NodeId> = children.iter().map(|&c| map_tree(m, c, f)).collect();
 
     // If nothing changed, keep the original node.
     if new_children == children {
         return root;
     }
 
-    // Rebuild the Call node with substituted children. Only `Call` nodes have
+    // Rebuild the Call node with mapped children. Only `Call` nodes have
     // children (see `Node::for_each_child`), so this arm is always reached.
     let Node::Call(orig_call) = m.node(root) else {
-        // Non-call nodes have no children — substitution would have returned
-        // early above (no children, so new_children == children == []).
+        // Non-call nodes have no children — the map would have returned early
+        // above (no children, so new_children == children == []).
         unreachable!("non-call node with children is impossible in this IR");
     };
     let head = orig_call.head;
     let inputs = orig_call.inputs.clone();
+    let pos_count = orig_call.args.len();
+    let named_count = orig_call.named.len();
 
-    // Partition new_children back into positional args and named-arg values.
-    // `for_each_child` visits: callee (User head), positional args, named values.
-    let (pos_count, named_count) = match head {
-        CallHead::User(_) => {
-            // first child is the callee node; rest split as (args, named)
-            (orig_call.args.len(), orig_call.named.len())
-        }
-        CallHead::Builtin(_) => (orig_call.args.len(), orig_call.named.len()),
-    };
-
+    // `for_each_child` visits: callee (User head) first, then positional args,
+    // then named values — mirror that partition here.
     let (new_head, child_slice) = match head {
-        CallHead::User(_) => {
-            // children = [callee, args..., named_values...]
-            (CallHead::User(new_children[0]), &new_children[1..])
-        }
+        CallHead::User(_) => (CallHead::User(new_children[0]), &new_children[1..]),
         CallHead::Builtin(s) => (CallHead::Builtin(s), &new_children[..]),
     };
 
@@ -372,6 +389,13 @@ fn op_name(m: &Module, id: NodeId) -> String {
 /// `kernelof` kernel, and the `kchain` node itself. After the marginal is lowered
 /// to a self-contained `logsumexp` (with fresh inlined copies of the latent's
 /// distribution and the per-atom kernel bodies), none of these are referenced.
+///
+/// Cross-reference: `density.rs::MEASURE_COMBINATOR_OPS` encodes the same
+/// measure-combinator vocabulary for a DIFFERENT purpose (rejecting a composed
+/// truncation base in the `normalize(truncate)` CDF-Z path) and intentionally
+/// has different membership — this list is about DCE eligibility, not leaf-vs-
+/// combinator classification. A new measure-algebra op may need adding to
+/// both lists — check `density.rs` too.
 const COMBINATOR_OPS: &[&str] = &[
     "weighted",
     "logweighted",
@@ -385,6 +409,22 @@ const COMBINATOR_OPS: &[&str] = &[
     "kernelof",
     "lawof",
     "draw",
+    // Independent-product combinator (Task 1 follow-on): `iid(M, N)` is consumed
+    // through the density rule (unrolled into per-element terms), so a `d =
+    // iid(...)` binding referenced only by the now-lowered `logdensityof` query
+    // is orphaned the same way a `weighted`/`superpose` binding is.
+    "iid",
+    // Positional-joint combinator (Task 2 follow-on): `joint(M1, …, Mk)` is
+    // likewise consumed through the density rule (unrolled into per-component
+    // terms), so a `d = joint(...)` binding referenced only by the now-lowered
+    // `logdensityof` query is orphaned the same way.
+    "joint",
+    // Likelihood combinator (Task 3 / measure-algebra-audit.md H2): a
+    // `obs = likelihoodof(K, data)`
+    // binding is unwrapped at the `logdensityof` entry (its `K` is scored at the
+    // baked-in `data`), so a binding referenced only by the now-lowered
+    // `logdensityof` query is orphaned the same way.
+    "likelihoodof",
 ];
 
 /// After a `logdensityof` rewrite, scan all bindings whose RHS is a measure
@@ -402,29 +442,44 @@ const COMBINATOR_OPS: &[&str] = &[
 /// binding.  Without this sweep the driver would encounter `weighted` on the
 /// next iteration and refuse, since there is no standalone rule for it.
 ///
-/// **Soundness invariant.** A binding is rewritten iff it is BOTH (a) a measure
-/// combinator op (`is_combinator_rhs`) AND (b) provably unreferenced — no *other*
-/// binding subtree contains a `(%ref self name)` to it (`binding_is_referenced`'s
-/// BFS).  Zeroing a genuinely-dead combinator binding is sound dead-code
-/// elimination: it has no observable effect because nothing reads it.  The guard
-/// below never touches anything that fails *either* condition, so it cannot
-/// disturb a live value, a non-combinator binding, or a still-referenced measure.
+/// **Soundness invariant.** A binding is rewritten iff it is BOTH (a) an
+/// eliminable measure binding — either a combinator op (`is_combinator_rhs`) OR a
+/// `Measure`/`Likelihood`-typed RHS (`is_measure_typed_rhs`) — AND (b) provably
+/// unreferenced: no *other* binding subtree contains a `(%ref self name)` to it
+/// (`binding_is_referenced`'s BFS).  Zeroing a genuinely-dead measure binding is
+/// sound dead-code elimination: it has no observable effect because nothing reads
+/// it.  The guard below never touches anything that fails *either* condition, so
+/// it cannot disturb a live value, a non-measure binding, or a still-referenced
+/// measure.
+///
+/// The type-based arm generalises past the fixed `COMBINATOR_OPS` op-name list:
+/// distribution *constructors* (`Normal`, `Beta`, …) are not a closed set, so a
+/// standalone `gauss_x = Normal(mu, sigma)` orphaned after a `likelihoodof`
+/// density query (measure-algebra-audit.md H2) cannot be caught by op name.
+/// Keying the second arm
+/// on the *inferred type* — which `is_flatpdl` itself uses to reject residual
+/// measure-layer values — sweeps exactly the bindings that would otherwise trip
+/// the conformance gate, and no others (a value-typed binding never matches).
 fn sweep_dead_measure_bindings(m: &mut Module) {
     // Iterate to a fixpoint so dead-binding *cascades* are fully eliminated.
     // A `kchain` marginal leaves a chain `pp = kchain(M, k)` → `k = kernelof(…)`
     // → `z = draw(…)`: only `pp` is unreferenced at first (the still-present-but-
     // dead `k` references `z`, and `pp` references `k`). Zeroing `pp` orphans
-    // `k`; zeroing `k` orphans `z`. One pass only kills the currently-orphaned
-    // bindings; we repeat until a pass kills nothing.
+    // `k`; zeroing `k` orphans `z`. A `likelihoodof` query leaves an analogous
+    // chain `obs = likelihoodof(iid(gauss_x, 1), …)` → `gauss_x = Normal(…)`:
+    // sweeping the `obs` combinator orphans the `gauss_x` constructor, caught by
+    // the type arm. One pass only kills the currently-orphaned bindings; we
+    // repeat until a pass kills nothing.
     loop {
-        // Collect (binding, name) pairs whose RHS is a combinator op AND that no
-        // other binding references. Both predicates are read-only over `m`, so we
-        // settle the full kill-set before any mutation (a later zeroing in this
-        // pass cannot make a previously-live binding look dead).
+        // Collect bindings whose RHS is eliminable (combinator op OR
+        // Measure/Likelihood-typed) AND that no other binding references. Both
+        // predicates are read-only over `m`, so we settle the full kill-set
+        // before any mutation (a later zeroing in this pass cannot make a
+        // previously-live binding look dead).
         let dead: Vec<BindingId> = m
             .bindings()
             .filter(|(bid, b)| {
-                is_combinator_rhs(m, b.rhs) && !binding_is_referenced(m, *bid, b.name)
+                is_eliminable_measure_rhs(m, b.rhs) && !binding_is_referenced(m, *bid, b.name)
             })
             .map(|(bid, _)| bid)
             .collect();
@@ -435,17 +490,39 @@ fn sweep_dead_measure_bindings(m: &mut Module) {
 
         for bid in dead {
             // Re-assert the invariant at the rewrite site: we only zero a binding
-            // that is still a combinator op and still unreferenced. Cheap, and it
-            // documents/enforces that the sweep never rewrites anything else.
+            // that is still an eliminable measure binding and still unreferenced.
+            // Cheap, and it documents/enforces that the sweep never rewrites
+            // anything else.
             let binding = m.binding(bid);
             debug_assert!(
-                is_combinator_rhs(m, binding.rhs) && !binding_is_referenced(m, bid, binding.name),
-                "sweep must only zero a dead measure-combinator binding"
+                is_eliminable_measure_rhs(m, binding.rhs)
+                    && !binding_is_referenced(m, bid, binding.name),
+                "sweep must only zero a dead measure binding"
             );
             let zero = m.alloc(Node::Lit(Scalar::Real(0.0)));
             m.set_binding_rhs(bid, zero);
         }
     }
+}
+
+/// True iff `rhs` is an eliminable measure binding: a combinator op
+/// (`is_combinator_rhs`) OR a node whose inferred type is `Measure`/`Likelihood`
+/// (`is_measure_typed_rhs`). Either alone suffices — the op-name arm catches
+/// combinators before inference has classified them, and the type arm catches
+/// distribution constructors, which are not on the op-name list.
+fn is_eliminable_measure_rhs(m: &Module, rhs: NodeId) -> bool {
+    is_combinator_rhs(m, rhs) || is_measure_typed_rhs(m, rhs)
+}
+
+/// True iff `rhs`'s inferred type is `Measure` or `Likelihood` — the residual
+/// measure-layer value types `is_flatpdl` rejects. Used to sweep an orphaned
+/// distribution-constructor binding (`gauss_x = Normal(…)`) whose op name is not
+/// on `COMBINATOR_OPS`.
+fn is_measure_typed_rhs(m: &Module, rhs: NodeId) -> bool {
+    matches!(
+        m.type_of(rhs),
+        Some(flatppl_core::Type::Measure { .. }) | Some(flatppl_core::Type::Likelihood { .. })
+    )
 }
 
 /// True iff `rhs` is a builtin call whose head is in [`COMBINATOR_OPS`].
@@ -473,23 +550,158 @@ fn binding_is_referenced(m: &Module, bid: BindingId, name_sym: Symbol) -> bool {
 }
 
 /// BFS subtree search: returns true iff the subtree at `root` contains a
-/// `Ref(SelfMod, name_sym)` node.
+/// `Ref(SelfMod, name_sym)` node — as a body sub-node OR as a `functionof` /
+/// `kernelof` reification *input* boundary entry.
+///
+/// **`Inputs`-aware (sweep-only).** `for_each_child` / `children()` deliberately
+/// EXCLUDE a `Call`'s [`flatppl_core::Inputs`] bucket (core `node.rs`), so a
+/// constructor/kernel binding referenced ONLY through a `(name, %ref self <name>)`
+/// reification input — e.g. `k = kernelof(pushfwd(f, g), …)` closing over `g =
+/// Normal(…)` — would look UNREFERENCED to a body-only walk, and the dead-binding
+/// sweep would zero it, leaving the live reification closing over a zeroed
+/// constructor. So this walk additionally scans each `Call`'s `inputs` entries.
+/// It only makes "referenced" MORE inclusive, so the sweep zeroes strictly fewer
+/// bindings — a sound tightening. This `Inputs`-scanning behaviour is scoped to
+/// the sweep, which is `subtree_contains_ref`'s only caller
+/// ([`binding_is_referenced`]).
 fn subtree_contains_ref(m: &Module, root: NodeId, name_sym: Symbol) -> bool {
     let mut queue = vec![root];
     let mut qi = 0;
     while qi < queue.len() {
         let id = queue[qi];
         qi += 1;
-        if let Node::Ref(Ref {
-            ns: RefNs::SelfMod,
-            name,
-        }) = m.node(id)
-        {
-            if *name == name_sym {
-                return true;
+        match m.node(id) {
+            Node::Ref(Ref {
+                ns: RefNs::SelfMod,
+                name,
+            }) if *name == name_sym => return true,
+            Node::Call(c) => {
+                // A reification input `(name, %ref self <name>)` references the
+                // binding just as a body ref does — but lives outside `children()`.
+                if let Some(flatppl_core::Inputs::Spec(entries)) = &c.inputs {
+                    for (_, r) in entries.iter() {
+                        if r.ns == RefNs::SelfMod && r.name == name_sym {
+                            return true;
+                        }
+                    }
+                }
             }
+            _ => {}
         }
         m.for_each_child(id, |c| queue.push(c));
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flatppl_core::{Binding, Call, Inputs, Mass, NamedArg, Type};
+
+    /// A `Measure`-typed constructor binding referenced ONLY through another
+    /// binding's `functionof` / `kernelof` reification `Inputs` boundary entry
+    /// (`(g, %ref self g)`) must NOT be swept as dead. `children()` excludes the
+    /// `Inputs` bucket (core `node.rs`), so a body-only reference check judged `g`
+    /// unreferenced and the type arm zeroed it — leaving the live reification `k`
+    /// closing over a zeroed constructor. The `Inputs`-aware `subtree_contains_ref`
+    /// sees the boundary reference, so the sweep leaves `g` alone. This drives the
+    /// sweep directly (the full `determinize` over such a shape refuses anyway,
+    /// because the surviving `g` is a residual measure-layer binding — the point
+    /// here is that the sweep does not UNSOUNDLY zero it out from under `k`).
+    #[test]
+    fn sweep_preserves_binding_referenced_only_via_reification_input() {
+        let mut m = Module::new();
+
+        // g = Normal(mu=0.0, sigma=1.0) — a Measure-typed constructor.
+        let normal = m.intern("Normal");
+        let mu = m.intern("mu");
+        let sigma = m.intern("sigma");
+        let z0 = m.alloc(Node::Lit(Scalar::Real(0.0)));
+        let one = m.alloc(Node::Lit(Scalar::Real(1.0)));
+        let g_rhs = m.alloc(Node::Call(Call {
+            head: CallHead::Builtin(normal),
+            args: Vec::<NodeId>::new().into(),
+            named: vec![
+                NamedArg {
+                    kind: flatppl_core::NamedKind::Kwarg,
+                    name: mu,
+                    value: z0,
+                },
+                NamedArg {
+                    kind: flatppl_core::NamedKind::Kwarg,
+                    name: sigma,
+                    value: one,
+                },
+            ]
+            .into(),
+            inputs: None,
+        }));
+        m.set_type(
+            g_rhs,
+            Type::Measure {
+                domain: Box::new(Type::Scalar(flatppl_core::ScalarType::Real)),
+                mass: Mass::Normalized,
+            },
+        );
+        let g_name = m.intern("g");
+        let g_bid = m.add_binding(Binding {
+            name: g_name,
+            rhs: g_rhs,
+            doc: None,
+            public: true,
+            synthetic: false,
+        });
+
+        // k = functionof(_x_, x = _x_, g = g) — references `g` ONLY via its
+        // reification `Inputs`, never in the body.
+        let functionof = m.intern("functionof");
+        let x = m.intern("x");
+        let ph_x = m.intern("_x_");
+        let body = m.alloc(Node::Ref(Ref {
+            ns: RefNs::Local,
+            name: ph_x,
+        }));
+        let k_rhs = m.alloc(Node::Call(Call {
+            head: CallHead::Builtin(functionof),
+            args: vec![body].into(),
+            named: Vec::<NamedArg>::new().into(),
+            inputs: Some(Inputs::Spec(
+                vec![
+                    (
+                        x,
+                        Ref {
+                            ns: RefNs::Local,
+                            name: ph_x,
+                        },
+                    ),
+                    (
+                        g_name,
+                        Ref {
+                            ns: RefNs::SelfMod,
+                            name: g_name,
+                        },
+                    ),
+                ]
+                .into(),
+            )),
+        }));
+        let k_name = m.intern("k");
+        let _k_bid = m.add_binding(Binding {
+            name: k_name,
+            rhs: k_rhs,
+            doc: None,
+            public: true,
+            synthetic: false,
+        });
+
+        sweep_dead_measure_bindings(&mut m);
+
+        // `g` must survive: still a `Normal` call, NOT the `0.0` sweep sentinel.
+        let g_after = m.binding(g_bid).rhs;
+        assert!(
+            matches!(m.node(g_after), Node::Call(c) if matches!(c.head, CallHead::Builtin(s) if m.resolve(s) == "Normal")),
+            "g referenced only via k's reification Inputs must not be swept: got {:?}",
+            m.node(g_after)
+        );
+    }
 }

@@ -49,3 +49,40 @@ fn unhandled_measure_algebra_refuses_clearly() {
         "refusal must name the construct; got: {e:?}"
     );
 }
+
+// A bare `likelihoodof(kernelof(...), obs)` binding — inferred but NOT
+// determinized — is non-conformant on TWO counts that `is_flatpdl` reads straight
+// off the `flatppl-infer` side-tables:
+//   * the `likelihoodof` node itself infers to `Type::Likelihood` — a measure-
+//     layer type that is OUT of FlatPDL (the `Type::Likelihood` arm of `visit`),
+//     so a `LikelihoodTyped` violation must be reported; and
+//   * the `kernelof(...)` node infers to `Type::Kernel` but sits OUTSIDE any
+//     `builtin_*` call argument (it is a plain top-level binding RHS), so the
+//     "kernel only as a builtin_* arg" rule flags it as `KernelNotBuiltinArg`.
+// This asserts BOTH kinds appear in the violation vector (there will also be
+// `StochasticPhase` / `MeasureTyped` violations from the surviving draw and the
+// inner Normal law — we do not require their absence, only that the two
+// measure-algebra-type arms fired).
+#[test]
+fn bare_likelihoodof_of_kernel_reports_likelihood_and_kernel_violations() {
+    let m = infer_module(
+        "mu = elementof(reals)\n\
+         k = kernelof(record(y = draw(Normal(mu = mu, sigma = 1.0))), mu = mu)\n\
+         L = likelihoodof(k, record(y = 0.5))",
+    );
+    let v = is_flatpdl(&m).unwrap_err();
+    assert!(
+        v.iter().any(|n| matches!(
+            n.kind,
+            flatppl_determinizer::NonConformKind::LikelihoodTyped
+        )),
+        "the likelihoodof node is Likelihood-typed => LikelihoodTyped; got: {v:?}"
+    );
+    assert!(
+        v.iter().any(|n| matches!(
+            n.kind,
+            flatppl_determinizer::NonConformKind::KernelNotBuiltinArg
+        )),
+        "the kernelof node is Kernel-typed outside a builtin_* arg => KernelNotBuiltinArg; got: {v:?}"
+    );
+}

@@ -14,29 +14,80 @@
 //!
 //! **Measure combinators** (Task 4) — each wraps an inner measure; recursion bottoms out at a
 //! primitive constructor:
-//! - `weighted(w, M)` → `add(log(w), density(M, v))` — **constant/scalar `w` only**;
-//!   a variate-dependent (function-valued) `w` must be applied at the variate
-//!   (`log w(v)`) and is **refused** (deferred follow-on), never mislowered to
-//!   `log` of a function object.
-//! - `logweighted(ℓ, M)` → `add(ℓ, density(M, v))` — likewise constant/scalar `ℓ`
-//!   only; a function-valued `ℓ` is **refused**.
+//! - `weighted(w, M)` → `add(log(w(v)), density(M, v))` — the weight `w` may be a
+//!   constant/scalar (used as-is) OR a **function of the variate**
+//!   (§06 "Density of composed measures"), in
+//!   which case it is **applied at the variate**: `log w(v)`. When `w`'s body
+//!   contains measure ops (e.g. an inner `logdensityof`), the driver's subtree
+//!   scan finds and lowers them on a later iteration and the plain-function call
+//!   is beta-reduced by the backend.
+//! - `logweighted(ℓ, M)` → `add(ℓ(v), density(M, v))` — likewise, `ℓ` may be a
+//!   constant/scalar or a function of the variate, applied as `ℓ(v)` (already in
+//!   log space, so no outer `log`).
 //! - `superpose(M₁, …, Mₖ)` → `logsumexp(density(M₁, v), …, density(Mₖ, v))`
 //! - `normalize(M)` → `density(M, v)` when `M` is already a probability measure
-//!   (closed-form `logZ = 0`); **refuses** otherwise (no closed-form mass rule;
-//!   `totalmass` is OUT of FlatPDL).
+//!   (closed-form `logZ = 0`); when `M = truncate(base, interval(lo, hi))` with
+//!   `base` a **normalized univariate continuous** constructor, → `sub(density(M, v),
+//!   log(sub(touniform(base, hi), touniform(base, lo))))` — the closed-form
+//!   `Z = CDF(hi) - CDF(lo)` via the `builtin_touniform` CDF transport
+//!   (`builtin_touniform` is the CDF `F` only for univariate continuous kernels,
+//!   §07 "Measure kernel evaluation primitives"; valid only for a univariate-continuous-normalized
+//!   base — the transport is defined only for continuous built-in kernels and use
+//!   of an undefined transport is a static error, §07 "Measure kernel evaluation primitives");
+//!   **refuses** for any other `M` — a `truncate` whose `base` is unnormalized
+//!   (e.g. `Lebesgue`, where the CDF-Z identity does not hold), or normalized but
+//!   discrete (`Binomial`/`Poisson`/`Categorical`) or multivariate (`MvNormal`),
+//!   for which `touniform` is undefined (no closed-form mass rule; `totalmass` is
+//!   OUT of FlatPDL).
 //! - `truncate(M, S)` → `ifelse(in(v, S), density(M, v), neg(inf))` (the `_ in R`
 //!   membership builtin, which infers to a boolean — `elementof` is a set-valued
 //!   parameter declaration, not a membership predicate).
 //! - `pushfwd(bijection(f, f_inv, logvol), M)` → `sub(density(M, f_inv(v)), logvol(f_inv(v)))`
+//! - `iid(M, N)` → `Σ_{i<N} density(M, get0(v, i))` — **`N` must be a literal
+//!   SCALAR integer** (static unroll; corpus `N` is small). A non-literal `N`,
+//!   or a multi-axis / vector `size` (e.g. `iid(M, [2, 3])` — a valid §06 shape),
+//!   is **refused** (the O(N) unroll handles only 1-D literal `N`; the vectorized
+//!   broadcast+reduce over a multi-axis shape is the noted scale path, not built).
+//! - `joint(M₁,…,Mₖ)` (**positional only**) → `Σᵢ density(Mᵢ, get0(v, i))` —
+//!   **scalar-variate components only**; a component is accepted ONLY when its
+//!   measure-domain kind is CONFIRMED `Scalar` — a component whose domain is
+//!   confirmed non-scalar (e.g. `iid(Normal, 2)`) OR whose domain kind is
+//!   unknown/`%deferred` (inference did not resolve it) is **refused up
+//!   front**, fail-closed, by inspecting each component's measure-domain kind,
+//!   NOT via the downstream recursive call (whose `get0(v, i)` value is
+//!   `%deferred`/`%unknown`, so its domain guard is skipped). Keyword
+//!   `joint(name = M, …)` (named components → record variate) shares the
+//!   `joint` op name so it reaches the same dispatch arm, but its components
+//!   live in `named` with an empty positional `args`, so it is **refused**
+//!   rather than mislowered.
 //!
-//! **Refused:** `kchain` marginals, `joint`/`iid`, `bayesupdate`, `disintegrate`, `restrict`,
-//! `likelihoodof`, `pushfwd` with a non-bijection argument, a variate-dependent
-//! (function-valued) `weighted`/`logweighted` weight, and any unrecognised shape.
+//! **Likelihood query** (measure-algebra-audit.md H2): `logdensityof(likelihoodof(K, obs), θ)` is
+//! handled at the `logdensityof` *entry* (not via `lower_measure_density`). Its
+//! arg2 is the parameter point θ (a record), NOT the variate; the variate is the
+//! `obs` baked into the likelihood. `K` is scored at `obs`, then each θ field is
+//! inlined into THIS query's density subtree only — a per-query substitution of
+//! `(%ref self <name>)` for the θ value (never a mutation of the shared module
+//! binding, so two likelihood queries over the same params keep distinct θ
+//! points) — §06 "Likelihood construction":
+//! `densityof(likelihoodof(K, obs), θ) = pdf(κ(θ), obs)`.
+//!
+//! **Refused:** `kchain` marginals, keyword `joint`, `bayesupdate`, `disintegrate`,
+//! `restrict`, `pushfwd` with a non-bijection argument, `iid` with a non-literal
+//! (after resolving one `(%ref self …)` level — a NAMED literal size lowers) or
+//! multi-axis / vector size, `joint` with a component whose measure-domain kind
+//! is not CONFIRMED scalar (refused up front — a confirmed-non-scalar OR an
+//! unknown/`%deferred` domain both refuse, fail-closed),
+//! `normalize(truncate(base, …))`
+//! whose `base` is not a univariate-continuous-normalized measure (an unnormalized
+//! base, or a normalized-but-discrete/multivariate base — each with its own refuse
+//! message), and any unrecognised shape.
+//! (`likelihoodof` reaching `lower_measure_density` still refuses there as a
+//! safety net — it is normally unwrapped at the `logdensityof` entry above.)
 
 use crate::refuse::RefuseError;
 use flatppl_core::{
-    BindingId, Call, CallHead, Mass, Module, NamedArg, NamedKind, Node, NodeId, Ref, RefNs, Symbol,
-    Type,
+    BindingId, Call, CallHead, Mass, Module, NamedArg, NamedKind, Node, NodeId, Ref, RefNs, Scalar,
+    ScalarType, Symbol, Type,
 };
 
 // ---------------------------------------------------------------------------
@@ -50,8 +101,191 @@ use flatppl_core::{
 /// scored value (its binding's RHS is redirected to the pinned variate), so no
 /// stochastic `draw` survives.
 pub(crate) fn lower_logdensityof(m: &mut Module, query: NodeId) -> Result<NodeId, RefuseError> {
+    let (arg1, arg2) = {
+        let q = expect_builtin_call(m, query, "logdensityof")
+            .ok_or_else(|| refuse(query, m, "expected logdensityof"))?;
+        if q.args.len() != 2 {
+            return Err(refuse(query, m, "logdensityof expects 2 args"));
+        }
+        (q.args[0], q.args[1])
+    };
+    // Likelihood query: arg2 is the PARAMETER point θ; the variate is the
+    // observed data baked into the likelihood (§06 "densityof(likelihoodof(K,obs),θ)").
+    let (resolved, _) = resolve_ref_one(m, arg1);
+    if is_likelihood(m, arg1) || builtin_name(m, resolved) == Some("likelihoodof") {
+        return lower_likelihood_query(m, resolved, arg2);
+    }
+    // Measure query: arg2 is the variate (existing path).
     let (measure_expr, v) = extract_logdensityof_args(m, query)?;
     lower_measure_density(m, measure_expr, v)
+}
+
+/// True iff `id` infers to a `Likelihood` type.
+fn is_likelihood(m: &Module, id: NodeId) -> bool {
+    matches!(m.type_of(id), Some(Type::Likelihood { .. }))
+}
+
+/// `logdensityof(likelihoodof(K, obs), θ)` = density of `K` at the observed `obs`,
+/// with `K`'s free parameters bound from the θ record (§06 "Likelihood
+/// construction", measure-algebra-audit.md H2).
+///
+/// Each θ field value is inlined into THIS query's emitted density subtree only
+/// (a self-contained per-query substitution keyed on `(%ref self <name>)` — see
+/// [`substitute_refs_by_name`]). We deliberately do NOT mutate the shared module
+/// bindings for `<name>`: a second likelihood query over the same parameters must
+/// score at ITS OWN θ point, not the last θ written globally. Leaving the
+/// `mu = elementof(...)` param decls in place is valid FlatPDL (`is_flatpdl`
+/// allows `elementof` parameter declarations); they become unused free params.
+fn lower_likelihood_query(
+    m: &mut Module,
+    likelihoodof_node: NodeId,
+    theta: NodeId,
+) -> Result<NodeId, RefuseError> {
+    let (k, obs) = {
+        let c = expect_builtin_call(m, likelihoodof_node, "likelihoodof")
+            .ok_or_else(|| refuse(likelihoodof_node, m, "expected likelihoodof"))?;
+        if c.args.len() != 2 {
+            return Err(refuse(
+                likelihoodof_node,
+                m,
+                "likelihoodof expects 2 args (kernel, obs)",
+            ));
+        }
+        (c.args[0], c.args[1])
+    };
+    let theta_map = theta_field_map(m, theta)?;
+    let density = lower_measure_density(m, k, obs)?;
+    // Refuse-don't-mislower: a θ param captured as a `functionof` / `kernelof`
+    // reification *input* (a `(name, %ref self <name>)` boundary entry) cannot be
+    // reached by the `substitute_refs_by_name` inliner below — `map_tree` walks
+    // `children()`, which excludes a `Call`'s `Inputs` bucket (core `node.rs`,
+    // `for_each_child`). Left un-inlined, that θ param stays a dangling `(%ref self
+    // <name>)` inside the reification, so the density scores as a function of the
+    // FREE param instead of at θ — a silent mislowering that still passes
+    // `is_flatpdl`. This must hold in EVERY build profile (a `debug_assert` is
+    // stripped in release), so we HARD REFUSE here rather than assert.
+    if subtree_has_theta_capturing_input(m, density, &theta_map) {
+        return Err(refuse(
+            likelihoodof_node,
+            m,
+            "θ parameter captured inside a functionof/kernelof reification input cannot be \
+             inlined per query; this density is not yet lowerable — refuse rather than mislower",
+        ));
+    }
+    // Inline this query's θ values into ITS OWN density subtree: substitute each
+    // `(%ref self <name>)` matching a θ field with that field's value node. No
+    // shared binding is mutated, so sibling queries over the same params keep
+    // their own θ points (fixes the cross-query parameter leak: two likelihood
+    // queries over shared params would otherwise clobber each other's θ).
+    Ok(substitute_refs_by_name(m, density, &theta_map))
+}
+
+/// Build the `name → θ-value` map from the θ record's `%field name = value`
+/// entries. Refuses if θ is not a record, or names a parameter with no module
+/// binding (a θ field that does not correspond to a declared param is a
+/// mislowering hazard, not a valid point).
+fn theta_field_map(m: &Module, theta: NodeId) -> Result<Vec<(Symbol, NodeId)>, RefuseError> {
+    let (resolved, _) = resolve_ref_one(m, theta);
+    let fields: Vec<(Symbol, NodeId)> = {
+        let rec = expect_builtin_call(m, resolved, "record")
+            .ok_or_else(|| refuse(theta, m, "logdensityof(L, θ): θ must be a record"))?;
+        rec.named
+            .iter()
+            .filter(|n| n.kind == NamedKind::Field)
+            .map(|n| (n.name, n.value))
+            .collect()
+    };
+    for (name, value) in &fields {
+        if m.binding_by_name(*name).is_none() {
+            return Err(refuse(
+                *value,
+                m,
+                "θ names a parameter with no module binding",
+            ));
+        }
+    }
+    Ok(fields)
+}
+
+/// Replace every `(%ref self <name>)` in the subtree at `root` with the node
+/// mapped from `<name>` in `map`, returning the (possibly new) root node id.
+///
+/// Thin wrapper over the shared bottom-up rebuild [`crate::driver::map_tree`]
+/// (which also backs `driver::substitute_in_tree`): both walk the same
+/// `children()` enumeration and rebuild only-if-changed. This one keys on a
+/// `Ref(SelfMod, name)` leaf rather than a target NodeId — so one pass inlines
+/// ALL θ fields at once. A matched self-ref is a leaf, replaced wholesale before
+/// its (nonexistent) children recurse.
+///
+/// **Scope limit (θ-capturing reification inputs).** `map_tree` walks
+/// `children()`, which does NOT include a `Call`'s [`flatppl_core::Inputs`] — the
+/// `(Symbol, Ref)` boundary entries of a `functionof` / `kernelof` reification.
+/// Such an entry's `Ref` CAN be `Ref(SelfMod, name)`, so a θ param captured as a
+/// reification boundary input would NOT be inlined by this walk (and an `Inputs`
+/// slot cannot hold a value node anyway — it is a name reference). The caller
+/// [`lower_likelihood_query`] therefore HARD REFUSES (in every build profile)
+/// when [`subtree_has_theta_capturing_input`] reports such a capture, so this
+/// walk is only ever reached for a density subtree free of θ-capturing inputs.
+fn substitute_refs_by_name(m: &mut Module, root: NodeId, map: &[(Symbol, NodeId)]) -> NodeId {
+    crate::driver::map_tree(m, root, &mut |m, id| {
+        if let Node::Ref(Ref {
+            ns: RefNs::SelfMod,
+            name,
+        }) = m.node(id)
+        {
+            if let Some((_, value)) = map.iter().find(|(n, _)| n == name) {
+                return Some(*value);
+            }
+        }
+        None
+    })
+}
+
+/// True iff some `functionof` / `kernelof` reification reachable from `root`
+/// carries a `Spec` [`flatppl_core::Inputs`] boundary entry whose `Ref` is a
+/// `Ref(SelfMod, name)` for a `name` in `map` — i.e. a θ param captured as a
+/// reification input that [`substitute_refs_by_name`]'s `children()`-only walk
+/// would not reach. Backs the hard refuse in [`lower_likelihood_query`].
+///
+/// The scan is `%ref self`-aware: an emitted density subtree references its
+/// weight/kernel reification by NAME (`(%call (%ref self w) v)`), not inline, so
+/// the `functionof` carrying the θ-capturing input lives in `w`'s binding RHS,
+/// one indirection away. `children()` alone (which stops at the `(%ref self w)`
+/// leaf) would miss it, so whenever we meet a `Ref(SelfMod, name)` whose binding
+/// RHS we have not yet visited, we descend into that RHS too. `visited_bindings`
+/// bounds the walk against reference cycles.
+fn subtree_has_theta_capturing_input(m: &Module, root: NodeId, map: &[(Symbol, NodeId)]) -> bool {
+    let mut stack = vec![root];
+    let mut visited_bindings = std::collections::HashSet::new();
+    while let Some(id) = stack.pop() {
+        match m.node(id) {
+            Node::Call(c) => {
+                if let Some(flatppl_core::Inputs::Spec(entries)) = &c.inputs {
+                    for (_, r) in entries.iter() {
+                        if r.ns == RefNs::SelfMod && map.iter().any(|(n, _)| *n == r.name) {
+                            return true;
+                        }
+                    }
+                }
+                m.for_each_child(id, |c| stack.push(c));
+            }
+            // Follow a self-ref into its binding RHS: the reification a density
+            // subtree captures is bound by name, so it is not among `root`'s
+            // `children()`. Guard against cycles via `visited_bindings`.
+            Node::Ref(Ref {
+                ns: RefNs::SelfMod,
+                name,
+            }) => {
+                if let Some(bid) = m.binding_by_name(*name) {
+                    if visited_bindings.insert(bid) {
+                        stack.push(m.binding(bid).rhs);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -83,10 +317,13 @@ pub(crate) fn lower_measure_density(
         // kchain marginal: discrete-finite latent → mass-weighted logsumexp;
         // continuous / infinite-discrete / non-enumerable → refuse (Task 5).
         Some("kchain") => crate::marginal::lower_kchain_marginal(m, measure_node, v),
+        Some("iid") => lower_iid(m, measure_node, v),
+        Some("joint") => lower_joint(m, measure_node, v),
         // Refused combinators — refused here rather than mis-lowered.
-        Some("joint") | Some("iid") | Some("markovchain") | Some("kscan") | Some("jointchain")
-        | Some("bayesupdate") | Some("disintegrate") | Some("restrict") | Some("likelihoodof")
-        | Some("locscale") => Err(refuse_op(measure_node, m)),
+        Some("markovchain") | Some("kscan") | Some("jointchain") | Some("bayesupdate")
+        | Some("disintegrate") | Some("restrict") | Some("likelihoodof") | Some("locscale") => {
+            Err(refuse_op(measure_node, m))
+        }
         // Fallthrough: treat as a primitive distribution constructor.
         _ => build_density_term(m, measure_node, v),
     }
@@ -116,6 +353,13 @@ fn lower_record_of_draws(
     v: NodeId,
 ) -> Result<NodeId, RefuseError> {
     let components = match_independent_record(m, record_node, v)?;
+
+    // Empty record (degenerate joint): a sum over no components. The independent-
+    // product density is Σᵢ logdensityof(Mᵢ, xᵢ) (§06 "Density of composed measures"),
+    // whose empty case is 0.
+    if components.is_empty() {
+        return Ok(m.alloc(Node::Lit(Scalar::Real(0.0))));
+    }
 
     // Build density terms per component.
     let mut terms: Vec<NodeId> = Vec::with_capacity(components.len());
@@ -182,9 +426,6 @@ fn match_independent_record(
         });
     }
 
-    if components.is_empty() {
-        return Err(refuse(record_node, m, "empty measure record"));
-    }
     Ok(components)
 }
 
@@ -221,11 +462,12 @@ fn resolve_component_draw(m: &Module, value: NodeId) -> Option<(NodeId, Option<B
 ///
 /// The scalar/constant case lowers correctly with the weight node AS-IS (`log w`
 /// / `lw`). A function-valued weight does NOT: it must be APPLIED to the variate
-/// (`log w(v)` / `lw(v)`) before scoring, which this MVP does not yet do. Emitting
-/// `log(w)` / `add(w, …)` on a function object is a silent mislowering — and it
-/// *passes* `is_flatpdl` (the weight is `Function`/`Kernel`-typed, not measure-
-/// typed), so the conformance gate does not catch it. We therefore detect it here
-/// and refuse, per the refuse-don't-mislower discipline.
+/// (`log w(v)` / `lw(v)`) before scoring. Emitting `log(w)` / `add(w, …)` on a
+/// function object is a silent mislowering — and it *passes* `is_flatpdl` (the
+/// weight is `Function`/`Kernel`-typed, not measure-typed), so the conformance
+/// gate would not catch it. We therefore detect the function-valued case here so
+/// [`lower_weighted`] / [`lower_logweighted`] apply the weight at the variate
+/// (`build_user_call(m, w_node, v)`) rather than lowering it as a scalar.
 ///
 /// Two surface shapes both reach us (dump-verified):
 /// * inline `functionof(…)` / `kernelof(…)` reification — a builtin call whose
@@ -264,57 +506,54 @@ fn weight_is_variate_dependent(m: &Module, w_node: NodeId) -> bool {
     false
 }
 
-/// The shared refusal for a variate-dependent (function) `weighted`/`logweighted`
-/// weight: applying the weight at the variate is a follow-on, not yet lowered.
-fn refuse_variate_dependent_weight(node: NodeId, m: &Module) -> RefuseError {
-    refuse(
-        node,
-        m,
-        "variate-dependent (function) weight not yet lowered (deferred; applying the weight at the variate is a follow-on)",
-    )
-}
-
 /// `logdensityof(weighted(w, M), v)` = `log w(v) + logdensityof(M, v)`, where `w`
-/// is a constant/scalar OR a function of the variate (spec §06). Only the
-/// constant/scalar case is lowered here (`log(w) + density`); a variate-dependent
-/// (function) weight is **refused** — see [`weight_is_variate_dependent`].
+/// is a constant/scalar OR a function of the variate (§06 "Density of composed measures").
+/// A constant/scalar
+/// weight is used as-is (`log(w) + density`); a variate-dependent (function)
+/// weight is **applied at the variate** (`log w(v) + density`), with `w(v)` =
+/// `build_user_call(m, w_node, v)` — see [`weight_is_variate_dependent`].
 fn lower_weighted(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseError> {
-    let c = expect_builtin_call(m, node, "weighted")
-        .ok_or_else(|| refuse(node, m, "expected weighted"))?;
-    if c.args.len() != 2 {
-        return Err(refuse(node, m, "weighted expects 2 args"));
-    }
-    let w_node = c.args[0];
-    let m_inner = c.args[1];
-
-    if weight_is_variate_dependent(m, w_node) {
-        return Err(refuse_variate_dependent_weight(node, m));
-    }
-
+    let (w_node, m_inner) = {
+        let c = expect_builtin_call(m, node, "weighted")
+            .ok_or_else(|| refuse(node, m, "expected weighted"))?;
+        if c.args.len() != 2 {
+            return Err(refuse(node, m, "weighted expects 2 args"));
+        }
+        (c.args[0], c.args[1])
+    };
     let inner_density = lower_measure_density(m, m_inner, v)?;
-    let log_w = build_call(m, "log", &[w_node]);
+    // log w + density; a variate-dependent (function) weight is applied at v: log w(v).
+    let w_scored = if weight_is_variate_dependent(m, w_node) {
+        build_user_call(m, w_node, v)
+    } else {
+        w_node
+    };
+    let log_w = build_call(m, "log", &[w_scored]);
     Ok(build_call(m, "add", &[log_w, inner_density]))
 }
 
 /// `logdensityof(logweighted(ℓ, M), v)` = `ℓ(v) + logdensityof(M, v)`, where `ℓ`
-/// is a constant/scalar OR a function of the variate (spec §06). Only the
-/// constant/scalar case is lowered here (`lw + density`); a variate-dependent
-/// (function) log-weight is **refused** — see [`weight_is_variate_dependent`].
+/// is a constant/scalar OR a function of the variate (§06 "Density of composed measures").
+/// The log-weight is
+/// already in log space, so there is no outer `log`: a constant/scalar `ℓ` is used
+/// as-is, and a variate-dependent (function) log-weight is **applied at the
+/// variate** (`ℓ(v) + density`), with `ℓ(v)` = `build_user_call(m, lw_node, v)`.
 fn lower_logweighted(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseError> {
-    let c = expect_builtin_call(m, node, "logweighted")
-        .ok_or_else(|| refuse(node, m, "expected logweighted"))?;
-    if c.args.len() != 2 {
-        return Err(refuse(node, m, "logweighted expects 2 args"));
-    }
-    let lw_node = c.args[0];
-    let m_inner = c.args[1];
-
-    if weight_is_variate_dependent(m, lw_node) {
-        return Err(refuse_variate_dependent_weight(node, m));
-    }
-
+    let (lw_node, m_inner) = {
+        let c = expect_builtin_call(m, node, "logweighted")
+            .ok_or_else(|| refuse(node, m, "expected logweighted"))?;
+        if c.args.len() != 2 {
+            return Err(refuse(node, m, "logweighted expects 2 args"));
+        }
+        (c.args[0], c.args[1])
+    };
     let inner_density = lower_measure_density(m, m_inner, v)?;
-    Ok(build_call(m, "add", &[lw_node, inner_density]))
+    let lw_scored = if weight_is_variate_dependent(m, lw_node) {
+        build_user_call(m, lw_node, v)
+    } else {
+        lw_node
+    };
+    Ok(build_call(m, "add", &[lw_scored, inner_density]))
 }
 
 /// `logdensityof(superpose(M₁, …, Mₖ), v)` = `logsumexp(density(M₁,v), …, density(Mₖ,v))`
@@ -341,13 +580,48 @@ fn lower_superpose(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Re
 /// `Z = totalmass(M)` must be a **closed-form** deterministic expression — never
 /// the `totalmass` query op, which is OUT of FlatPDL (measures are not values).
 ///
-/// The only mass rule available in this MVP: if `M` is already a probability
-/// measure (`Type::Measure { mass: Mass::Normalized, .. }`) then `Z = 1`,
-/// `logZ = 0`, so `normalize(M)` is the identity on the density — it lowers to
-/// just `logdensityof(M, v)`. Any unnormalized `M` (`Finite`, `LocallyFinite`,
-/// …) has no closed-form mass rule here, so we **refuse** rather than emit
-/// `totalmass`. (Truncation / mixture closed-form `logZ` are acceptable later
-/// follow-ons; for now they refuse.)
+/// Two closed-form mass rules are available:
+/// * If `M` is already a probability measure (`Type::Measure { mass:
+///   Mass::Normalized, .. }`) then `Z = 1`, `logZ = 0`, so `normalize(M)` is
+///   the identity on the density — it lowers to just `logdensityof(M, v)`.
+/// * If `M` is `truncate(base, interval(lo, hi))` with `base` a **normalized
+///   univariate continuous** probability measure (a primitive constructor such as
+///   `Normal`, `domain = Scalar(Real)`), `Z = CDF(hi) - CDF(lo)` via the
+///   `builtin_touniform` CDF transport (§06 "Density of composed measures", the
+///   `normalize` rule `Z = totalmass(M)`): `logZ = log(touniform(base, hi) -
+///   touniform(base, lo))`. The `-inf` outside-support gate is already handled by
+///   the existing `truncate` lowering, so the emitted density term is just
+///   `lower_measure_density(m, m_inner, v)` minus this `logZ`. The base must be
+///   univariate-continuous-normalized AND a **leaf** built-in distribution
+///   constructor (`Normal`, `Beta`, …), NOT a measure-combinator: the CDF-Z
+///   identity holds only there, since `builtin_touniform` is the CDF `F` only for
+///   univariate continuous kernels (§07 "Measure kernel evaluation primitives")
+///   and the transport is defined only for continuous built-in kernels — use of
+///   an undefined transport is a static error (§07 "Measure kernel evaluation
+///   primitives"). A base that is NOT univariate-continuous-normalized, or IS
+///   univariate-continuous-normalized but a composed combinator, does NOT take
+///   this path:
+///   - an unnormalized base (e.g. `Lebesgue(reals)`, true `Z = hi − lo`,
+///     `touniform` undefined) falls through to the unnormalized refuse below;
+///   - a normalized but DISCRETE base (`Binomial`/`Poisson`/`Categorical`,
+///     `domain = Scalar(Integer)`) or MULTIVARIATE base (`MvNormal`,
+///     `domain = Vector`) has no defined `touniform`, so it refuses with a
+///     DISTINCT message (a discrete/multivariate truncation Z — e.g. a CMF /
+///     finite-support sum — is a legitimate future follow-on, not an invalid
+///     model), rather than mislowering to an undefined transport;
+///   - a composed/`pushfwd` base (e.g. `pushfwd(exp_bijection, Normal(0,1))`, a
+///     truncated log-normal) whose head is a measure-combinator, not a leaf
+///     kernel, has no defined `touniform` head — it refuses with its OWN
+///     leaf-constructor message ([`base_is_measure_combinator`]).
+///
+/// Any other unnormalized `M` (`Finite`, `LocallyFinite`, a non-truncate
+/// combinator, …) has no closed-form mass rule here, so we **refuse** rather
+/// than emit `totalmass` (refuse-don't-mislower).
+///
+/// The emitted `−logZ` inherits §06's `Z ≠ 0` precondition ("`normalize` … with
+/// `Z = totalmass(M)` finite and nonzero", §06 "Density of composed measures"): a
+/// degenerate/empty interval collapses `Z → 0`, so `logZ → −∞`. That is the
+/// backend's concern (a runtime `log(0)`), not statically checked here.
 fn lower_normalize(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseError> {
     let m_inner = {
         let c = expect_builtin_call(m, node, "normalize")
@@ -367,18 +641,252 @@ fn lower_normalize(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Re
         _ => None,
     };
 
-    match inner_mass {
+    if inner_mass == Some(Mass::Normalized) {
         // Probability measure: Z = 1, logZ = 0. `normalize(M)` ≡ density(M, v).
-        Some(Mass::Normalized) => lower_measure_density(m, m_inner, v),
-        // No closed-form mass rule for an unnormalized measure in this MVP.
-        _ => Err(RefuseError {
+        return lower_measure_density(m, m_inner, v);
+    }
+
+    // Closed-form Z for a truncated univariate measure: Z = CDF(hi) − CDF(lo),
+    // via the builtin_touniform (CDF) transport (§06 "Density of composed
+    // measures"). Extract the truncate/interval shape and its endpoints BEFORE any
+    // mutable builds below (immutable reads of `m` must precede `m.alloc`/`build_*`
+    // calls).
+    //
+    // `non_interval_truncation_set` distinguishes "this IS a `truncate(base, set)`
+    // node, but `set` is not a literal `interval(lo, hi)` call" (e.g. a named set
+    // like `posreals`/`nonnegreals`) from "the outer node is not a `truncate` at
+    // all" — the former gets its OWN refuse message below (closed-form Z is only
+    // implemented for a literal interval bound), rather than falling through to
+    // the generic unnormalized-measure message, which would misleadingly imply
+    // the base itself is the problem.
+    let mut non_interval_truncation_set = false;
+    let truncate_shape: Option<(NodeId, NodeId, NodeId)> = {
+        if let Some(tc) = expect_builtin_call(m, m_inner_resolved, "truncate") {
+            if tc.args.len() == 2 {
+                let (base, set) = (tc.args[0], tc.args[1]);
+                if let Some(ic) = expect_builtin_call(m, set, "interval") {
+                    if ic.args.len() == 2 {
+                        Some((base, ic.args[0], ic.args[1]))
+                    } else {
+                        None
+                    }
+                } else {
+                    non_interval_truncation_set = true;
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+
+    if non_interval_truncation_set {
+        return Err(RefuseError {
             node,
             construct: "normalize".to_string(),
-            reason: "normalize of an unnormalized measure needs a closed-form mass rule; \
-                     `totalmass` is not FlatPDL"
+            reason: "normalize(truncate): closed-form Z is only implemented for an \
+                     `interval(lo, hi)` truncation set; a named/other set is not yet supported"
                 .to_string(),
-        }),
+        });
     }
+
+    if let Some((base, lo, hi)) = truncate_shape {
+        // The CDF-Z identity `Z = touniform(base, hi) − touniform(base, lo) =
+        // totalmass(truncate(base, S))` (§06 "Density of composed measures", the
+        // `normalize` rule `Z = totalmass(M)`) holds ONLY when `base` is a
+        // normalized *univariate continuous* probability measure — `builtin_touniform`
+        // is the CDF `F` only for univariate continuous kernels (§07 "Measure
+        // kernel evaluation primitives") and the transport is defined only for
+        // continuous built-in kernels; use of an undefined transport is a static
+        // error (§07 "Measure kernel evaluation primitives"). So the base must be
+        // BOTH `Mass::Normalized` AND have a real (continuous) SCALAR domain:
+        // * an unnormalized base (e.g. `Lebesgue(reals)`) has true `Z = hi − lo`
+        //   and no `touniform` — the CDF path would mislower;
+        // * a normalized *discrete* base (`Binomial`/`Poisson`/`Categorical`,
+        //   `domain = Scalar(Integer)`) or a normalized *multivariate* base
+        //   (`MvNormal`, `domain = Vector`) has NO defined `touniform` transport,
+        //   so `builtin_touniform(base, …)` is an undefined transport / silent
+        //   mislowering that still passes `is_flatpdl`.
+        // If the base is not univariate-continuous-normalized, do NOT take the
+        // CDF-Z path — fall through to the refuse below (exactly as the
+        // unnormalized `Lebesgue` base already does).
+        let (base_resolved, _) = resolve_ref_one(m, base);
+        let base_ty = m.type_of(base_resolved);
+        let base_normalized = matches!(
+            base_ty,
+            Some(Type::Measure {
+                mass: Mass::Normalized,
+                ..
+            })
+        );
+        let base_univariate_continuous = matches!(
+            base_ty,
+            Some(Type::Measure { domain, mass: Mass::Normalized })
+                if matches!(**domain, Type::Scalar(ScalarType::Real))
+        );
+        // The type gate above is necessary but NOT sufficient: `kernel_and_input`
+        // emits `builtin_touniform(<head>, …)` for ANY `CallHead::Builtin` head,
+        // so a *composed* base whose head is a measure-combinator (`pushfwd`,
+        // `weighted`, `superpose`, …) — e.g. a truncated log-normal
+        // `pushfwd(exp_bijection, Normal(0,1))` — would emit
+        // `builtin_touniform(pushfwd, …)`, an UNDEFINED transport (a static error,
+        // §07 "Measure kernel evaluation primitives"). `touniform` is the CDF only
+        // for a *leaf* built-in distribution kernel (`Normal`, `Beta`, …), never a
+        // measure-algebra combinator. A combinator base may even infer to
+        // `Scalar(Real)`, passing the type gate — so we must reject it on its HEAD,
+        // not rely on downstream re-inference. Refuse with a message DISTINCT from
+        // the discrete/multivariate one below.
+        if base_univariate_continuous && base_is_measure_combinator(m, base_resolved) {
+            return Err(RefuseError {
+                node,
+                construct: "normalize".to_string(),
+                reason: "normalize(truncate): closed-form Z needs a leaf built-in distribution \
+                         base; a composed/pushfwd base has no defined touniform transport"
+                    .to_string(),
+            });
+        }
+        if base_univariate_continuous {
+            let density = lower_measure_density(m, m_inner, v)?; // truncate handles the -inf gate
+            let (kernel, input) = kernel_and_input(m, base)?; // helper below
+            let cdf_hi = build_touniform(m, kernel, input, hi);
+            let cdf_lo = build_touniform(m, kernel, input, lo);
+            let z = build_call(m, "sub", &[cdf_hi, cdf_lo]);
+            let log_z = build_call(m, "log", &[z]);
+            return Ok(build_call(m, "sub", &[density, log_z]));
+        }
+        if base_normalized {
+            // Normalized but NOT univariate continuous — a discrete base
+            // (`Binomial`/`Poisson`/`Categorical`, `domain = Scalar(Integer)`) or a
+            // multivariate base (`MvNormal`, `domain = Vector`). This is a valid
+            // model, but its closed-form Z is NOT `builtin_touniform(base, hi) −
+            // touniform(base, lo)`: `touniform` is the CDF `F` only for a univariate
+            // *continuous* kernel (§07 "Measure kernel evaluation primitives"), and use of the
+            // transport on a non-continuous / multivariate kernel is a static error
+            // there — plus `Z = F(hi) − F(lo)` is a univariate identity regardless.
+            // Refuse with its OWN message (a discrete/multivariate truncation Z —
+            // e.g. a CMF / finite-support sum — is a legitimate future follow-on),
+            // distinct from the unnormalized-base refuse below.
+            return Err(RefuseError {
+                node,
+                construct: "normalize".to_string(),
+                reason: "normalize(truncate): closed-form Z via builtin_touniform is only \
+                         defined for a univariate continuous base (touniform is the CDF only \
+                         there, §07); a discrete or multivariate base needs a different \
+                         closed-form Z (e.g. a CMF / finite-support sum), which is not yet \
+                         implemented"
+                    .to_string(),
+            });
+        }
+    }
+
+    // No closed-form mass rule for an unnormalized measure in this MVP.
+    Err(RefuseError {
+        node,
+        construct: "normalize".to_string(),
+        reason: "normalize of an unnormalized measure needs a closed-form mass rule; \
+                 `totalmass` is not FlatPDL"
+            .to_string(),
+    })
+}
+
+/// The measure-algebra combinator / operator heads. A `truncate` base whose
+/// builtin head is one of these is a COMPOSED measure, not a leaf distribution
+/// constructor, so it has no defined `builtin_touniform` (CDF) transport — the
+/// CDF-Z `normalize(truncate)` path must refuse it (composed/pushfwd-style
+/// truncation base, see `normalize_truncate_pushfwd_base_refuses` in
+/// `tests/refuse.rs`). Leaf constructors (`Normal`, `Beta`, …) are NOT in this
+/// set, which is why membership is the cleanest "is this a combinator, not a
+/// leaf kernel?" test (the constructor set is open-ended; the combinator
+/// vocabulary is fixed, spec §06 measure algebra).
+///
+/// Cross-reference: `driver.rs::COMBINATOR_OPS` encodes the same measure-
+/// combinator vocabulary for a DIFFERENT purpose (DCE eligibility of a
+/// `Measure`-typed binding) and intentionally has different membership. A new
+/// measure-algebra op may need adding to both lists — check `driver.rs` too.
+pub(crate) const MEASURE_COMBINATOR_OPS: &[&str] = &[
+    "pushfwd",
+    "weighted",
+    "logweighted",
+    "superpose",
+    "normalize",
+    "truncate",
+    "joint",
+    "jointchain",
+    "iid",
+    "lawof",
+    "draw",
+    "kchain",
+    "kscan",
+    "markovchain",
+    "locscale",
+    "restrict",
+    "bayesupdate",
+    "disintegrate",
+    "likelihoodof",
+];
+
+/// True iff `base`'s builtin head is a measure-algebra combinator (in
+/// [`MEASURE_COMBINATOR_OPS`]) rather than a leaf distribution constructor.
+fn base_is_measure_combinator(m: &Module, base: NodeId) -> bool {
+    matches!(builtin_name(m, base), Some(name) if MEASURE_COMBINATOR_OPS.contains(&name))
+}
+
+/// Extract `(kernel_const, kernel_input_record)` from a primitive constructor
+/// `Normal(mu = …, sigma = …)` — the `builtin_*` primitive's arg 0/1 shape.
+/// Resolves one level of `(%ref self x)` indirection first, so a truncation
+/// base bound by name (`g = Normal(...); truncate(g, ...)`) is classified by
+/// its constructor.
+///
+/// **Defense-in-depth: rejects positional constructor args.** This builds the
+/// kernel input record from `c.named` only, exactly like [`build_density_term`]'s
+/// primitive-constructor path — a positionally-written base (`Normal(0.0,
+/// 1.0)`) has no `named` entries, so silently proceeding would emit
+/// `builtin_touniform(Normal, record(), hi)`, a wrong (missing-parameter)
+/// input record, rather than refusing. In the current call graph this cannot
+/// actually fire: [`lower_normalize`] always lowers the base's own density
+/// term via `build_density_term` first (which already refuses
+/// `!c.args.is_empty()`) before reaching `kernel_and_input`, so a positional
+/// base is refused upstream. But that ordering is not enforced by this
+/// function's own signature, so the guard is repeated here rather than left
+/// implicit/order-dependent on the caller.
+fn kernel_and_input(m: &mut Module, ctor: NodeId) -> Result<(NodeId, NodeId), RefuseError> {
+    let (ctor_resolved, _) = resolve_ref_one(m, ctor);
+    let (ctor_sym, kwargs): (Symbol, Vec<(Symbol, NodeId)>) = {
+        let Node::Call(c) = m.node(ctor_resolved) else {
+            return Err(refuse(
+                ctor_resolved,
+                m,
+                "truncation base must be a primitive constructor",
+            ));
+        };
+        let CallHead::Builtin(sym) = c.head else {
+            return Err(refuse(ctor_resolved, m, "non-builtin truncation base"));
+        };
+        if !c.args.is_empty() {
+            return Err(refuse(
+                ctor_resolved,
+                m,
+                "primitive constructor with positional args not supported",
+            ));
+        }
+        (sym, c.named.iter().map(|n| (n.name, n.value)).collect())
+    };
+    let kernel = m.alloc(Node::Const(ctor_sym));
+    let input = build_record(m, &kwargs);
+    Ok((kernel, input))
+}
+
+/// `builtin_touniform(kernel, kernel_input, x)` — the CDF transport (§07).
+fn build_touniform(m: &mut Module, kernel: NodeId, input: NodeId, x: NodeId) -> NodeId {
+    let sym = m.intern("builtin_touniform");
+    m.alloc(Node::Call(Call {
+        head: CallHead::Builtin(sym),
+        args: vec![kernel, input, x].into(),
+        named: Vec::<NamedArg>::new().into(),
+        inputs: None,
+    }))
 }
 
 /// `logdensityof(truncate(M, S), v)` = `ifelse(in(v, S), logdensityof(M, v), neg(inf))`.
@@ -451,6 +959,163 @@ fn lower_pushfwd(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Refu
     Ok(build_call(m, "sub", &[inner_density, logvol_val]))
 }
 
+/// Read a literal non-negative integer from `id` (`Scalar::Int`, or an integral
+/// `Scalar::Real`). Returns `None` if `id` is not such a literal.
+///
+/// **Only a literal SCALAR `N` is accepted.** §06 "Independent composition" admits
+/// an `iid` `size` as "an integer (1-D length) or a vector of positive integers
+/// (multi-axis shape)", but a multi-axis / vector size (e.g. `iid(M, [2, 3])`) is
+/// intentionally refused here: this returns `None` for a non-literal, and a vector
+/// literal is not a scalar `Scalar::Int`/`Scalar::Real`, so [`lower_iid`]'s
+/// `literal_usize(size).ok_or_else(refuse …)` rejects it. The O(N) static unroll in
+/// [`lower_iid`] handles only a 1-D literal `N`; the vectorized broadcast+reduce
+/// over a multi-axis shape is the noted scale path, not built (conservative
+/// refuse-don't-mislower, not a bug).
+fn literal_usize(m: &Module, id: NodeId) -> Option<usize> {
+    match m.node(id) {
+        Node::Lit(Scalar::Int(n)) if *n >= 0 => Some(*n as usize),
+        Node::Lit(Scalar::Real(r)) if *r >= 0.0 && r.fract() == 0.0 => Some(*r as usize),
+        _ => None,
+    }
+}
+
+/// `logdensityof(iid(M, N), v)` = `Σ_{i<N} logdensityof(M, get0(v, i))`
+/// (§06 "Density of composed measures", "iid(M, n) → Σ_i log densityof(M, xᵢ)").
+/// N comes from the `iid` count arg, which must be a literal SCALAR integer — a
+/// multi-axis / vector `size` (e.g. `[2, 3]`) is intentionally refused (see
+/// [`literal_usize`]). Static unroll (corpus N small; broadcast+reduce is the
+/// noted scale path, not built).
+/// `N == 0` is the empty independent product: Σ over an empty index set is 0, so
+/// it lowers to the log-density literal `0.0` (consistent with the empty measure
+/// `record()`), not a refusal.
+///
+/// **No scalar-`M` guard — deliberate asymmetry with [`lower_joint`].** `iid(M,
+/// size)` is the product `M^⊗N` over ARRAYS of shape `size`, i.e. a NESTED variate
+/// with a leading repeat axis `[N, …M-shape]` (§06 "Independent composition", the
+/// `iid` bullet). So `get0(v, i)` recovers the full i-th
+/// `M`-variate (an entire row), which is exactly what this rule scores `M` at —
+/// correct for ANY `M`, scalar or not (a non-scalar `M`, e.g. `iid(MvNormal, n)`
+/// or a nested `iid(iid(…), n)`, lowers correctly, its inner variate reached by a
+/// further `get0`). `joint`, by contrast, has a HETEROGENEOUS variate: the flat
+/// `cat` of its component variates, so `joint`'s positional `get0(v, i)` only
+/// aligns when every component is scalar — hence the scalar-component guard in
+/// [`lower_joint`]. Adding that guard here would WRONGLY refuse valid non-scalar
+/// `iid`, so it is intentionally absent.
+fn lower_iid(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseError> {
+    let (m_inner, n) = {
+        let c =
+            expect_builtin_call(m, node, "iid").ok_or_else(|| refuse(node, m, "expected iid"))?;
+        if c.args.len() != 2 {
+            return Err(refuse(node, m, "iid expects 2 args (measure, size)"));
+        }
+        let size_arg = c.args[1];
+        // Resolve one level of `(%ref self n)` indirection so a NAMED literal
+        // size (`n = 3; iid(M, n)`) is read from its binding RHS — `n = 3` is
+        // statically known just as an inline `3` is; only `literal_usize`'s
+        // `Node::Lit` match was too narrow. A non-literal size (bound or
+        // inline) still fails `literal_usize` and refuses, unchanged.
+        let (size_resolved, _) = resolve_ref_one(m, size_arg);
+        let n = literal_usize(m, size_resolved)
+            .ok_or_else(|| refuse(size_arg, m, "iid size must be a literal integer"))?;
+        (c.args[0], n)
+    };
+    // Empty independent product: Σ over an empty index set is 0 (log-density 0),
+    // exactly as an empty measure `record()` lowers (the iid Σ rule,
+    // §06 "Density of composed measures", with an empty index set). Short-circuit
+    // BEFORE `fold_add`, which requires at least one term.
+    if n == 0 {
+        return Ok(m.alloc(Node::Lit(Scalar::Real(0.0))));
+    }
+    let mut terms = Vec::with_capacity(n);
+    for i in 0..n {
+        let idx = m.alloc(Node::Lit(Scalar::Int(i as i64)));
+        let elem = build_call(m, "get0", &[v, idx]);
+        terms.push(lower_measure_density(m, m_inner, elem)?);
+    }
+    Ok(fold_add(m, &terms))
+}
+
+/// `logdensityof(joint(M₁,…,Mₖ), v)` = `Σ logdensityof(Mᵢ, get0(v, i))`
+/// (§06 "Density of composed measures"). The variate is the positional `cat` of the
+/// component variates.
+///
+/// **Scope:** positional `joint` only, scalar-variate components. `joint`'s
+/// variate is the positional `cat` of the component variates
+/// (§06 "Density of composed measures"); for
+/// scalar-variate components the destructuring is `get0(v, i)`, one slot per
+/// component. Component variates of higher rank need `cat`-slice routing, which
+/// this does not build — a component whose measure domain is non-scalar
+/// (e.g. `iid(Normal, 2)`, domain array[2]) is refused HERE, up front, by
+/// inspecting each component's own measure domain kind. This is NOT left to the
+/// downstream recursive call: `build_density_term`'s domain check compares the
+/// measure domain against the value `get0(v, i)`, which infers to
+/// `%deferred`/`%unknown`, so that guard would be skipped and the extra slots
+/// silently dropped. Keyword `joint(name₁ = M₁, …)` (named components → record variate)
+/// is out of scope: it shares the `joint` op name with the positional form, so
+/// it does reach this function, but it carries its components in `named`
+/// rather than `args`. That is checked explicitly, first, with its own
+/// distinct refuse message — not left to fall through to the positional
+/// arg-count guard, which would misname a keyword `joint` as merely
+/// under-sized.
+fn lower_joint(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseError> {
+    let inner: Vec<NodeId> = {
+        let c = expect_builtin_call(m, node, "joint")
+            .ok_or_else(|| refuse(node, m, "expected joint"))?;
+        if !c.named.is_empty() {
+            return Err(refuse(
+                node,
+                m,
+                "keyword joint (named components) is not yet lowered",
+            ));
+        }
+        if c.args.len() < 2 {
+            return Err(refuse(node, m, "joint needs at least 2 components"));
+        }
+        c.args.to_vec()
+    };
+    // Guard the scalar-only restriction HERE, before the recursion. `get0(v, i)`
+    // assigns each component ONE scalar slot of the positional `cat` variate; a
+    // non-scalar component (e.g. `iid(Normal, 2)`, domain array[2] → Vector) would
+    // be silently mislowered — its extra slots dropped, `get0`-of-scalar nested
+    // into a single slot. The downstream `build_density_term` domain check does
+    // NOT catch this: `get0(v, i)` infers to `%deferred`/`%unknown`, so its guard
+    // is skipped. The COMPONENT's own measure domain, by contrast, is known
+    // (`iid(Normal,2)` → array[2]), so we can refuse it precisely here.
+    //
+    // **Fail-closed on an unknown/deferred component domain.** A component
+    // whose measure domain inference has NOT resolved to `Some(Type::Measure {
+    // domain, .. })` — so `component_kind` is `None` — is refused too, not
+    // waved through. Only a component CONFIRMED `Some(VariateKind::Scalar)` is
+    // accepted. Waving through the `None` case would repeat exactly the
+    // mislowering hazard this guard exists to close: an untyped component's
+    // true arity is unknown, so `get0(v, i)` might silently drop its extra
+    // `cat` slots if it turns out to be non-scalar. Per refuse-don't-mislower,
+    // "unconfirmed" and "confirmed non-scalar" both refuse; only "confirmed
+    // scalar" lowers.
+    for &mi in inner.iter() {
+        let (mi_resolved, _) = resolve_ref_one(m, mi);
+        let component_kind = match m.type_of(mi_resolved) {
+            Some(Type::Measure { domain, .. }) => variate_kind(domain),
+            _ => None,
+        };
+        if component_kind != Some(VariateKind::Scalar) {
+            return Err(refuse(
+                mi,
+                m,
+                "joint component variate kind is not confirmed scalar (unknown/deferred or \
+                 non-scalar); refuse rather than mislower a cat-slice",
+            ));
+        }
+    }
+    let mut terms = Vec::with_capacity(inner.len());
+    for (i, &mi) in inner.iter().enumerate() {
+        let idx = m.alloc(Node::Lit(Scalar::Int(i as i64)));
+        let elem = build_call(m, "get0", &[v, idx]);
+        terms.push(lower_measure_density(m, mi, elem)?);
+    }
+    Ok(fold_add(m, &terms))
+}
+
 // ---------------------------------------------------------------------------
 // Primitive distribution constructor density term (Task 3 helper)
 // ---------------------------------------------------------------------------
@@ -488,7 +1153,7 @@ pub(crate) fn build_density_term(
 ) -> Result<NodeId, RefuseError> {
     // Refuse scoring a measure at a variate whose structural KIND clearly
     // mismatches the measure's variate domain — a scalar `Normal` scored at a
-    // record / tuple / vector (review finding F4). Inference does not reject
+    // record / tuple / vector. Inference does not reject
     // this, so guard here per the refuse-don't-mislower discipline rather than
     // emit an ill-typed `builtin_logdensityof`. Conservative: an unknown side or
     // a matching kind passes; only a definite kind mismatch refuses. (The
@@ -728,5 +1393,138 @@ fn refuse_op(id: NodeId, m: &Module) -> RefuseError {
         reason: format!(
             "density lowering for `{op}` is not implemented (deferred to a later task)"
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Direct unit test of the leaf-constructor gate in `lower_normalize`
+    /// (companion to `normalize_truncate_pushfwd_base_refuses` in
+    /// `tests/refuse.rs`, which exercises the same gate black-box).
+    ///
+    /// Through the normal parse+infer path, inference classifies a composed base
+    /// (`pushfwd(bij, Normal)`, `superpose(…)`, …) as `domain = %any` or
+    /// `mass ≠ Normalized`, so it never reaches the `base_univariate_continuous`
+    /// CDF-Z arm — the black-box `tests/refuse.rs` shape refuses via the
+    /// discrete/multivariate arm instead. But the type gate is NOT a reliable
+    /// guard against a composed head: if inference ever DID classify a `pushfwd`
+    /// base as `Scalar(Real)` + `Normalized` it would pass the type gate and
+    /// `kernel_and_input` would emit `builtin_touniform(pushfwd, …)`, an undefined
+    /// transport (§07 "Measure kernel evaluation primitives"). We must reject on
+    /// the HEAD, not rely on re-inference. This test builds exactly that adverse
+    /// case by hand — a `pushfwd`-headed base FORCED to `Scalar(Real)` +
+    /// `Normalized` — and asserts `lower_normalize` refuses with the DISTINCT
+    /// leaf-constructor message (not the discrete/multivariate one).
+    #[test]
+    fn normalize_truncate_composed_head_refuses_leaf_constructor_message() {
+        let mut m = Module::new();
+
+        // A `pushfwd`-headed Call standing in for a composed base. Its two args
+        // are inert leaves — the gate rejects it on the HEAD before touching them.
+        let pushfwd_sym = m.intern("pushfwd");
+        let a0 = m.alloc(Node::Lit(Scalar::Real(0.0)));
+        let a1 = m.alloc(Node::Lit(Scalar::Real(0.0)));
+        let base = m.alloc(Node::Call(Call {
+            head: CallHead::Builtin(pushfwd_sym),
+            args: vec![a0, a1].into(),
+            named: Vec::<NamedArg>::new().into(),
+            inputs: None,
+        }));
+        // FORCE the adversarial classification the type gate would wave through.
+        m.set_type(
+            base,
+            Type::Measure {
+                domain: Box::new(Type::Scalar(ScalarType::Real)),
+                mass: Mass::Normalized,
+            },
+        );
+
+        // interval(1.0, 3.0)
+        let lo = m.alloc(Node::Lit(Scalar::Real(1.0)));
+        let hi = m.alloc(Node::Lit(Scalar::Real(3.0)));
+        let interval = build_call(&mut m, "interval", &[lo, hi]);
+        // truncate(base, interval) — typed non-normalized so it does not hit the
+        // `inner_mass == Normalized` identity short-circuit.
+        let truncate = build_call(&mut m, "truncate", &[base, interval]);
+        m.set_type(
+            truncate,
+            Type::Measure {
+                domain: Box::new(Type::Scalar(ScalarType::Real)),
+                mass: Mass::Finite,
+            },
+        );
+        let normalize = build_call(&mut m, "normalize", &[truncate]);
+        let v = m.alloc(Node::Lit(Scalar::Real(2.0)));
+
+        let err = lower_normalize(&mut m, normalize, v)
+            .expect_err("composed (pushfwd) base must refuse, not emit builtin_touniform(pushfwd)");
+        assert!(
+            err.reason.contains("leaf built-in distribution"),
+            "refusal names the leaf-constructor requirement: {err:?}"
+        );
+        assert!(
+            err.reason.contains("composed") || err.reason.contains("pushfwd"),
+            "refusal points at the composed/pushfwd base: {err:?}"
+        );
+        // DISTINCT from the discrete/multivariate refuse.
+        assert!(
+            !err.reason.contains("discrete") && !err.reason.contains("multivariate"),
+            "leaf-constructor refuse must be distinct from the discrete/multivariate one: {err:?}"
+        );
+    }
+
+    /// Drift guard between the two hand-maintained measure-op vocabulary
+    /// lists: [`MEASURE_COMBINATOR_OPS`] here and `driver::COMBINATOR_OPS`.
+    /// They intentionally have DIFFERENT membership (see the cross-reference
+    /// comments on both), so this is deliberately NOT an equality check —
+    /// it only guards the specific hazard the two comments warn about: "a new
+    /// measure-algebra op may need adding to both lists — check the other
+    /// file too" is easy to forget in practice.
+    ///
+    /// The op names [`lower_measure_density`] dispatches to a DEDICATED
+    /// combinator-lowering rule (i.e. every match arm other than the
+    /// `record`-of-draws case and the primitive-constructor fallthrough) are
+    /// exactly the measure-algebra combinator vocabulary this module
+    /// classifies elsewhere (`base_is_measure_combinator`) — so every one of
+    /// them belongs in [`MEASURE_COMBINATOR_OPS`]. If a future combinator is
+    /// added to the dispatch match in `lower_measure_density` but the author
+    /// forgets to also add it to `MEASURE_COMBINATOR_OPS`, this test catches
+    /// it (a composed base with that head would otherwise slip past
+    /// `base_is_measure_combinator` and `kernel_and_input` would emit an
+    /// undefined `builtin_touniform(<that-head>, …)` transport).
+    #[test]
+    fn measure_combinator_ops_covers_lower_measure_density_dispatch() {
+        // Mirrors the non-fallthrough, non-`record` arms of
+        // `lower_measure_density`'s match — kept in sync BY HAND with that
+        // function; that is the drift this test exists to catch.
+        const DISPATCHED_COMBINATOR_OPS: &[&str] = &[
+            "weighted",
+            "logweighted",
+            "superpose",
+            "normalize",
+            "truncate",
+            "pushfwd",
+            "kchain",
+            "iid",
+            "joint",
+            "markovchain",
+            "kscan",
+            "jointchain",
+            "bayesupdate",
+            "disintegrate",
+            "restrict",
+            "likelihoodof",
+            "locscale",
+        ];
+        for op in DISPATCHED_COMBINATOR_OPS {
+            assert!(
+                MEASURE_COMBINATOR_OPS.contains(op),
+                "`{op}` is dispatched by lower_measure_density as a measure combinator \
+                 but is missing from MEASURE_COMBINATOR_OPS — the two hand-maintained \
+                 op-vocab lists have drifted; add `{op}` to MEASURE_COMBINATOR_OPS"
+            );
+        }
     }
 }

@@ -1,37 +1,18 @@
-// Numeric conformance gate for the determiniser.
+// Structural conformance gate for the determiniser.
 //
-// Two rosetta models (single Gaussian, product of two independent Gaussians)
-// are determinized, then the emitted FlatPDL `lp` binding is checked against:
-//   (a) a closed-form oracle computed directly in Rust (always runs), and
-//   (b) the flatppl-js engine's evaluation of the emitted FlatPDL surface
-//       syntax (runs when `FLATPPL_JS_DIR` is set and Node 24+ is present;
-//       otherwise the JS-engine tests are skipped via `#[ignore]`).
+// This file holds STRUCTURAL determinizer tests only: they check that a
+// handful of rosetta models (single Gaussian, product of Gaussians, iid,
+// joint, likelihoodof) determinize into a FlatPDL-conformant module with the
+// expected number of `builtin_logdensityof` calls and no residual
+// measure-layer ops (`lawof`, `draw`, `iid`, `joint`, `likelihoodof`,
+// `logdensityof`). Each test also sanity-checks a closed-form oracle value in
+// pure Rust — no external engine is involved.
 //
-// ## Running the JS-engine tests
-//
-// Set the environment variable `FLATPPL_JS_DIR` to the path of the
-// `flatppl-js` repository root (e.g. `~/Code/flatppl/flatppl-js`) and use
-// Node 24 (Node 26+ breaks native TypeScript loading):
-//
-//   FLATPPL_JS_DIR=/path/to/flatppl-js \
-//   NODE24=/opt/homebrew/opt/node@24/bin/node \
-//   cargo test -p flatppl-determinizer --test numeric -- --include-ignored
-//
-// The helper script (`score_flatpdl.cjs`, embedded in the test and written to a
-// temp dir) materialises a deterministic binding via the flatppl-js engine and
-// prints its scalar value, exactly as the testsuite's `score_js.cjs` does for
-// measure bindings.
-//
-// ## Why this is here vs the testsuite
-//
-// The unconditional closed-form-oracle portion belongs in the Rust crate: it
-// locks the determiniser's arithmetic against the spec's Gaussian log-density
-// formula without any external dependency. The JS-engine portion could migrate
-// to `flatppl-testsuite` once the determiniser is wired into the pixi harness;
-// for now the `#[ignore]`d test keeps the plumbing self-contained.
+// Numeric value verification (scoring the emitted FlatPDL surface syntax
+// through the flatppl-js engine and comparing to a frozen oracle) lives in
+// `flatppl-testsuite`, not here: `flatppl-rust` is not a density engine.
 
 use std::f64::consts::PI;
-use std::io::Write;
 
 use flatppl_determinizer::determinize;
 
@@ -51,9 +32,9 @@ fn gaussian_logpdf(x: f64, mu: f64, sigma: f64) -> f64 {
 // These verify that:
 // 1. The determinizer produces a FlatPDL-conformant module.
 // 2. The emitted surface syntax encodes the correct `builtin_logdensityof`
-//    call, which the JS engine evaluates to match the closed-form oracle.
-// The numeric values computed below are ALSO the expected JS engine results
-// (verified manually; see the #[ignore] tests below).
+//    call(s), with no residual measure layer.
+// The closed-form oracle values below are pure-Rust arithmetic sanity checks;
+// they are not compared against any engine here.
 
 #[test]
 fn single_gaussian_oracle_agrees_with_flatpdl_structure() {
@@ -138,262 +119,522 @@ lp = logdensityof(lawof(record(a = a, b = b)), record(a = 0.5, b = 0.5))";
     );
 }
 
-// ── JS engine scoring (requires FLATPPL_JS_DIR + Node 24) ────────────────────
+#[test]
+fn iid_normal_sum_structure() {
+    // logdensityof(iid(Normal(0,1), 3), [0.5, -0.3, 1.2]) = Σ_{i<3} log N(get0(v,i);0,1)
+    // Static unroll: each term scores the SAME Normal(0,1) at a distinct index of
+    // the variate `get0(v, i)`, i = 0, 1, 2.
+    let src = "\
+d = iid(Normal(mu = 0.0, sigma = 1.0), 3)
+lp = logdensityof(d, [0.5, -0.3, 1.2])";
+    let m = parse_infer(src);
+    let out = determinize(&m).expect("iid must lower");
+    assert!(
+        flatppl_determinizer::is_flatpdl(&out).is_ok(),
+        "must be FlatPDL"
+    );
+    let pir = flatppl_flatpir::write(&out);
+    assert_eq!(
+        pir.matches("builtin_logdensityof").count(),
+        3,
+        "3 iid terms:\n{pir}"
+    );
+    assert!(
+        !pir.contains("(iid ") && !pir.contains("(logdensityof "),
+        "no measure layer:\n{pir}"
+    );
+    // Structural: three `get0` projections of the variate, one per unrolled term,
+    // at the distinct static indices 0, 1, 2 (each closes `... <vec>) i)`).
+    assert_eq!(
+        pir.matches("(get0 ").count(),
+        3,
+        "one get0 projection per iid term:\n{pir}"
+    );
+    for i in 0..3 {
+        assert!(
+            pir.contains(&format!(") {i})")),
+            "iid term must index the variate at {i}:\n{pir}"
+        );
+    }
+    // All three terms score the SAME kernel/params: Normal(mu=0.0, sigma=1.0).
+    assert_eq!(
+        pir.matches("(%field mu 0.0) (%field sigma 1.0)").count(),
+        3,
+        "all three iid terms score Normal(0,1):\n{pir}"
+    );
+}
+
+// `iid(M, n)` with a NAMED literal size (`n = 3`, referenced by `(%ref self n)`
+// rather than an inline `3`) must lower exactly like the inline-literal case.
+// `literal_usize` alone only matches `Node::Lit` directly, so a size arg that is
+// a self-ref to a literal-bound name previously refused ("iid size must be a
+// literal integer") even though `n` is statically 3 — resolving one
+// `(%ref self …)` level before `literal_usize` fixes this without widening
+// past a genuine non-literal (still refused).
+#[test]
+fn iid_named_literal_size_lowers() {
+    let src = "\
+n = 3
+d = iid(Normal(mu = 0.0, sigma = 1.0), n)
+lp = logdensityof(d, [0.5, -0.3, 1.2])";
+    let m = parse_infer(src);
+    let out = determinize(&m).expect("iid with a named literal size must lower");
+    assert!(
+        flatppl_determinizer::is_flatpdl(&out).is_ok(),
+        "must be FlatPDL"
+    );
+    let pir = flatppl_flatpir::write(&out);
+    assert_eq!(
+        pir.matches("builtin_logdensityof").count(),
+        3,
+        "3 iid terms from a named size:\n{pir}"
+    );
+    assert!(
+        !pir.contains("(iid ") && !pir.contains("(logdensityof "),
+        "no measure layer:\n{pir}"
+    );
+}
+
+// `iid` over a NON-SCALAR `M` (here a nested `iid(Normal, 2)`) must lower
+// correctly — NOT refuse, NOT mislower. This proves the deliberate asymmetry with
+// `joint`: `iid(M, size)` is the product `M^⊗N` over ARRAYS of shape `size`, a
+// nested variate with a leading repeat axis `[N, …M-shape]`
+// (§06 "Independent composition"). So the outer
+// `get0(v, i)` recovers the full i-th `M`-variate (an entire inner row), and the
+// inner rule then projects each scalar with a further `get0`. There is
+// deliberately NO scalar-component guard on `iid` (unlike `joint`, whose flat
+// `cat` variate needs one); adding one would WRONGLY refuse this valid model.
 //
-// These tests are #[ignore]d because they require an external JS engine and
-// Node 24. See the module-level doc for how to run them.
-
-/// Create a temporary directory under the system temp dir for the test.
-/// Returns the path; callers are responsible for cleanup (or leaving it for
-/// the OS to clean up on reboot — acceptable for short-lived test artifacts).
-fn make_test_tmp(name: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir()
-        .join("flatppl-determinizer-numeric")
-        .join(name);
-    std::fs::create_dir_all(&dir).expect("create test tmp dir");
-    dir
-}
-
-/// Embed the minimal `score_flatpdl.cjs` node script needed to evaluate a
-/// deterministic binding from a FlatPDL file. Returns the path to the script.
-fn write_score_script(dir: &std::path::Path) -> std::path::PathBuf {
-    let script = dir.join("score_flatpdl.cjs");
-    let mut f = std::fs::File::create(&script).expect("write score script");
-    f.write_all(
-        br#"'use strict';
-// Evaluate a deterministic binding from a FlatPDL file via the flatppl-js engine.
-// Usage: node score_flatpdl.cjs <file.flatppl> <binding>
-// Requires: FLATPPL_JS_DIR env var pointing at the flatppl-js repo root.
-// Returns the f64 scalar value of <binding> on stdout.
-
-const fs = require('fs');
-const path = require('path');
-
-const engineBase = process.env.FLATPPL_JS_DIR;
-if (!engineBase || !fs.existsSync(path.join(engineBase, 'packages', 'engine', 'index.ts'))) {
-  process.stderr.write('FLATPPL_JS_DIR not set or missing packages/engine/index.ts\n');
-  process.exit(1);
-}
-const engineDir = path.join(engineBase, 'packages', 'engine');
-const { processSource, orchestrator, materialiser } = require(path.join(engineDir, 'index.ts'));
-const { createWorkerHandler } = require(path.join(engineDir, 'worker.ts'));
-
-async function main() {
-  const src = fs.readFileSync(process.argv[2], 'utf8');
-  const binding = process.argv[3];
-  const proc = processSource(src);
-  const built = orchestrator.buildDerivations(proc.bindings);
-  const w = createWorkerHandler();
-  w.handle({ type: 'init', seed: 42 });
-  const cache = new Map();
-  const ctx = {
-    derivations: built.derivations,
-    bindings: built.bindings,
-    fixedValues: built.fixedValues || new Map(),
-    sampleCount: 1,
-    rootKey: 42,
-    rootSeed: 42,
-    marginalizationCount: 32,
-    moduleRegistry: proc.loweredModule && proc.loweredModule.moduleRegistry,
-    getMeasure: (n) => {
-      if (cache.has(n)) return cache.get(n);
-      const m = materialiser.materialiseMeasure(n, ctx);
-      cache.set(n, m);
-      return m;
-    },
-    sendWorker: (m) => Promise.resolve(w.handle(m)),
-  };
-  const measure = await ctx.getMeasure(binding);
-  if (measure && measure.value && measure.value.data) {
-    process.stdout.write(measure.value.data[0] + '\n');
-  } else if (measure && measure.samples && measure.samples.length > 0) {
-    process.stdout.write(measure.samples[0] + '\n');
-  } else {
-    process.stderr.write('no value for binding: ' + binding + '\n');
-    process.exit(1);
-  }
-}
-main().catch(e => { process.stderr.write('' + e + '\n'); process.exit(1); });
-"#,
-    )
-    .expect("write score script body");
-    script
-}
-
-/// Resolve the Node 24 binary: prefer `NODE24` env var, then look for the
-/// homebrew keg-only binary, then fall back to `node` (which may be 26+).
-fn node_binary() -> Option<std::path::PathBuf> {
-    // Explicit override (e.g. CI sets this).
-    if let Ok(n) = std::env::var("NODE24") {
-        let p = std::path::PathBuf::from(&n);
-        if p.exists() {
-            return Some(p);
-        }
-    }
-    // Homebrew keg-only on macOS.
-    let brew_node24 = std::path::PathBuf::from("/opt/homebrew/opt/node@24/bin/node");
-    if brew_node24.exists() {
-        return Some(brew_node24);
-    }
-    // Fall back to whatever `node` is on PATH (may be 26+; let the test fail
-    // with a clear message if native TypeScript loading breaks).
-    which_node()
-}
-
-fn which_node() -> Option<std::path::PathBuf> {
-    std::process::Command::new("which")
-        .arg("node")
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| std::path::PathBuf::from(String::from_utf8_lossy(&o.stdout).trim().to_string()))
-}
-
-/// Score a deterministic binding in a FlatPDL source string via the flatppl-js
-/// engine. Returns `None` if `FLATPPL_JS_DIR` is not set or the binary is
-/// missing; returns `Err` on a scoring failure.
-fn js_score(flatpdl_src: &str, binding: &str) -> Option<Result<f64, String>> {
-    if std::env::var("FLATPPL_JS_DIR").is_err() {
-        return None;
-    }
-    let node = node_binary()?;
-
-    // Use a unique dir per invocation (pid + a hash of the source) to avoid
-    // races when multiple tests run in parallel.
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut h = DefaultHasher::new();
-    flatpdl_src.hash(&mut h);
-    binding.hash(&mut h);
-    std::process::id().hash(&mut h);
-    let tag = format!("{:x}", h.finish());
-    let dir = make_test_tmp(&tag);
-    let model_path = dir.join("model.flatppl");
-    std::fs::write(&model_path, flatpdl_src).ok()?;
-    let script = write_score_script(&dir);
-
-    let out = std::process::Command::new(&node)
-        .arg(&script)
-        .arg(&model_path)
-        .arg(binding)
-        .env(
-            "FLATPPL_JS_DIR",
-            std::env::var("FLATPPL_JS_DIR").unwrap_or_default(),
-        )
-        .output()
-        .map_err(|e| format!("node exec failed: {e}"))
-        .ok()?;
-
-    if !out.status.success() {
-        return Some(Err(format!(
-            "score_flatpdl.cjs exited {}: {}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr)
-        )));
-    }
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    Some(
-        stdout
-            .trim()
-            .parse::<f64>()
-            .map_err(|e| format!("parse float failed: {e} (stdout: {stdout:?})")),
-    )
-}
-
+// Model: iid(iid(Normal(0,1), 2), 3) scored at a shape-[3,2] array literal.
+// Expected: 3×2 = 6 `builtin_logdensityof` terms, each reached by a NESTED
+// projection get0(get0(v, i), j), and no residual measure layer.
 #[test]
-#[ignore = "requires FLATPPL_JS_DIR env var (flatppl-js repo root) and Node 24; \
-            run with: FLATPPL_JS_DIR=... NODE24=... cargo test -p flatppl-determinizer \
-            --test numeric -- --include-ignored"]
-fn single_gaussian_js_engine_matches_oracle() {
-    // This test verifies end-to-end: determinize a single-Gaussian model, emit
-    // the FlatPDL as surface syntax, score `lp` via the flatppl-js engine, and
-    // compare to the closed-form oracle within 1e-9 tolerance.
-    //
-    // Oracle: log N(0.5; mu=0.0, sigma=1.0) = -1.0439385332046727
-    let oracle = gaussian_logpdf(0.5, 0.0, 1.0);
-
+fn iid_nonscalar_inner_measure_lowers_with_nested_get0() {
     let src = "\
-a = draw(Normal(mu = 0.0, sigma = 1.0))
-lp = logdensityof(lawof(record(a = a)), record(a = 0.5))";
+d = iid(iid(Normal(mu = 0.0, sigma = 1.0), 2), 3)
+lp = logdensityof(d, [[0.5, -0.3], [1.2, 0.1], [-0.7, 0.9]])";
     let m = parse_infer(src);
-    let out = determinize(&m).expect("single-gaussian must lower");
-    let flatpdl_src = flatppl_syntax::print(&out);
-
-    let result = js_score(&flatpdl_src, "lp")
-        .expect("FLATPPL_JS_DIR must be set to run this test")
-        .expect("JS engine scoring must succeed");
-
-    let tol = 1e-9;
+    let out = determinize(&m).expect("iid over a non-scalar M must lower, not refuse");
     assert!(
-        (result - oracle).abs() <= tol,
-        "JS engine result {result} differs from oracle {oracle} by {} (> tol {tol})",
-        (result - oracle).abs()
+        flatppl_determinizer::is_flatpdl(&out).is_ok(),
+        "emitted FlatPDL must be conformant"
+    );
+    let pir = flatppl_flatpir::write(&out);
+    // 3 outer rows × 2 inner elements = 6 primitive density terms.
+    assert_eq!(
+        pir.matches("builtin_logdensityof").count(),
+        6,
+        "3×2 nested-iid terms:\n{pir}"
+    );
+    // No residual measure layer: neither the nested `iid` nor the query survives.
+    assert!(
+        !pir.contains("(iid ") && !pir.contains("(logdensityof "),
+        "no measure layer:\n{pir}"
+    );
+    // The KEY structural claim: the inner scalar is reached by a NESTED
+    // projection `get0(get0(v, i), j)` — proving the outer `get0(v, i)` recovers
+    // the full inner `M`-variate (a shape-[2] ROW), NOT a scalar. Two levels of
+    // `get0` means 2 heads per term × 6 = 12 total `get0` projections.
+    assert_eq!(
+        pir.matches("(get0 ").count(),
+        12,
+        "two-level (nested) get0 projection per term, 12 total:\n{pir}"
+    );
+    // The OUTER get0's operand is the inner-`iid` row: a shape-[2] array produced
+    // by the inner `get0`. FlatPIR annotates that operand `(%meta ((%array 1 (2)
+    // (%scalar real)) …`, so the outer get0 over a row prints as
+    // `(get0 (%meta ((%array 1 (2) (%scalar real)) …` — one per term (6 total).
+    // This is the discriminating evidence that the outer projection recovers a
+    // full inner-variate row, not a scalar (a scalar operand would be `%scalar`,
+    // not `%array`).
+    assert_eq!(
+        pir.matches("(get0 (%meta ((%array 1 (2) (%scalar real))")
+            .count(),
+        6,
+        "each outer get0 projects a full inner-iid ROW (array[2]), not a scalar:\n{pir}"
+    );
+    // All six terms score the SAME leaf kernel/params: Normal(mu=0.0, sigma=1.0).
+    assert_eq!(
+        pir.matches("(%field mu 0.0) (%field sigma 1.0)").count(),
+        6,
+        "all six nested-iid terms score Normal(0,1):\n{pir}"
     );
 }
 
 #[test]
-#[ignore = "requires FLATPPL_JS_DIR env var (flatppl-js repo root) and Node 24; \
-            run with: FLATPPL_JS_DIR=... NODE24=... cargo test -p flatppl-determinizer \
-            --test numeric -- --include-ignored"]
-fn product_gaussians_js_engine_matches_oracle() {
-    // Oracle: log N(0.5;0,1) + log N(0.5;1,2) = -2.6872742469692907
-    let oracle = gaussian_logpdf(0.5, 0.0, 1.0) + gaussian_logpdf(0.5, 1.0, 2.0);
-
+fn joint_two_gaussians_structure() {
+    // logdensityof(joint(Normal(0,1), Normal(1,2)), [0.5, 0.5]) →
+    //   add(density(Normal(0,1), get0(v,0)), density(Normal(1,2), get0(v,1)))
     let src = "\
-a = draw(Normal(mu = 0.0, sigma = 1.0))
-b = draw(Normal(mu = 1.0, sigma = 2.0))
-lp = logdensityof(lawof(record(a = a, b = b)), record(a = 0.5, b = 0.5))";
+d = joint(Normal(mu = 0.0, sigma = 1.0), Normal(mu = 1.0, sigma = 2.0))
+lp = logdensityof(d, [0.5, 0.5])";
     let m = parse_infer(src);
-    let out = determinize(&m).expect("product must lower");
-    let flatpdl_src = flatppl_syntax::print(&out);
-
-    let result = js_score(&flatpdl_src, "lp")
-        .expect("FLATPPL_JS_DIR must be set to run this test")
-        .expect("JS engine scoring must succeed");
-
-    let tol = 1e-9;
+    let out = determinize(&m).expect("joint must lower");
+    assert!(flatppl_determinizer::is_flatpdl(&out).is_ok());
+    let pir = flatppl_flatpir::write(&out);
+    assert_eq!(
+        pir.matches("builtin_logdensityof").count(),
+        2,
+        "2 joint terms:\n{pir}"
+    );
+    assert!(!pir.contains("(joint "), "no joint:\n{pir}");
+    // Structural: the two positional components carry their OWN distinct params —
+    // component 0 scores Normal(0,1), component 1 scores Normal(1,2) — each
+    // projected out of the variate at its own `get0` slot.
     assert!(
-        (result - oracle).abs() <= tol,
-        "JS engine result {result} differs from oracle {oracle} by {} (> tol {tol})",
-        (result - oracle).abs()
+        pir.contains("(%field mu 0.0) (%field sigma 1.0)"),
+        "component 0 scores Normal(0,1):\n{pir}"
+    );
+    assert!(
+        pir.contains("(%field mu 1.0) (%field sigma 2.0)"),
+        "component 1 scores Normal(1,2):\n{pir}"
+    );
+    assert_eq!(
+        pir.matches("(get0 ").count(),
+        2,
+        "one get0 projection per component:\n{pir}"
+    );
+    assert!(
+        pir.contains(") 0)") && pir.contains(") 1)"),
+        "components projected at slots 0 and 1:\n{pir}"
     );
 }
 
 #[test]
-#[ignore = "requires FLATPPL_JS_DIR env var (flatppl-js repo root) and Node 24; \
-            run with: FLATPPL_JS_DIR=... NODE24=... cargo test -p flatppl-determinizer \
-            --test numeric -- --include-ignored"]
-fn single_gaussian_js_engine_matches_pre_conversion_score() {
-    // Cross-check: the pre-conversion flatppl-js score of the *original* model
-    // (i.e., evaluating `logdensityof(lawof(record(a=a)), record(a=0.5))` directly
-    // via the engine, without going through the determinizer) must agree with the
-    // post-conversion score to within 1e-9.
-    //
-    // This catches a correctness regression where the determinizer emits a
-    // structurally valid FlatPDL that nevertheless evaluates to a different
-    // number than the original model.
+fn weighted_function_weight_structure() {
+    // logdensityof(weighted(x -> exp(x), g), 0.5) → add(log(w(0.5)), density(g, 0.5))
+    //   — §06 "Density of composed measures": the weight may be a function of the
+    //   variate, applied at v then wrapped in `log` (there is an OUTER `log`).
+    let src = "\
+g = Normal(mu = 0.0, sigma = 1.0)
+d = weighted(x -> exp(x), g)
+lp = logdensityof(d, 0.5)";
+    let m = parse_infer(src);
+    let out = determinize(&m).expect("function-weighted weighted must lower");
+    assert!(
+        flatppl_determinizer::is_flatpdl(&out).is_ok(),
+        "must be FlatPDL"
+    );
+    let pir = flatppl_flatpir::write(&out);
+    // One density term (g); the applied weight is `log((%call w v))`, not a
+    // `builtin_logdensityof`.
+    assert_eq!(
+        pir.matches("builtin_logdensityof").count(),
+        1,
+        "single density term:\n{pir}"
+    );
+    assert!(
+        !pir.contains("(weighted ") && !pir.contains("(logdensityof "),
+        "measure layer gone:\n{pir}"
+    );
+    // Structural: `add(log(w(0.5)), density(g, 0.5))`. The weight is APPLIED at
+    // the variate (a `%call ... 0.5`) and wrapped in an OUTER `log` (distinguishes
+    // `weighted` from `logweighted`); g is scored at the same variate 0.5.
+    assert!(pir.contains("(add "), "add(logw, density):\n{pir}");
+    assert!(
+        pir.contains("(log ") && pir.contains("(%call "),
+        "weight applied at v then log-wrapped: log((%call w 0.5)):\n{pir}"
+    );
+    assert!(
+        pir.contains("(%field mu 0.0) (%field sigma 1.0)"),
+        "g = Normal(0,1) scored:\n{pir}"
+    );
+}
 
-    let pre_src = "\
-a = draw(Normal(mu = 0.0, sigma = 1.0))
-lp = logdensityof(lawof(record(a = a)), record(a = 0.5))";
+#[test]
+fn logweighted_function_weight_structure() {
+    // logdensityof(logweighted(x -> logdensityof(g2, x), g1), 0.5)
+    //   → add(ℓ(0.5), density(g1, 0.5))   (g1=N(0,1), g2=N(1,2))
+    //   — §06: the log-weight ℓ is a function of the variate, applied at v; it is
+    //   ALREADY in log space, so there is NO outer `log` (unlike `weighted`). Here
+    //   ℓ(x) = logdensityof(g2, x), so ℓ(0.5) lowers to a second density term.
+    let src = "\
+g1 = Normal(mu = 0.0, sigma = 1.0)
+g2 = Normal(mu = 1.0, sigma = 2.0)
+d = logweighted(x -> logdensityof(g2, x), g1)
+lp = logdensityof(d, 0.5)";
+    let m = parse_infer(src);
+    let out = determinize(&m).expect("function-weighted logweighted must lower");
+    assert!(
+        flatppl_determinizer::is_flatpdl(&out).is_ok(),
+        "must be FlatPDL"
+    );
+    let pir = flatppl_flatpir::write(&out);
+    assert_eq!(
+        pir.matches("builtin_logdensityof").count(),
+        2,
+        "g1 + g2 terms:\n{pir}"
+    );
+    assert!(
+        !pir.contains("(logweighted ") && !pir.contains("(logdensityof "),
+        "measure layer gone:\n{pir}"
+    );
+    // Structural: `add(ℓ(0.5), density(g1, 0.5))`. The log-weight is applied at v
+    // (a `%call ... 0.5`) and, being already in log space, is NOT wrapped in a
+    // top-level `log` — the emitted expression starts with `add`, not `add(log(…`.
+    assert!(pir.contains("(add "), "add(logweight, density):\n{pir}");
+    assert!(
+        pir.contains("(%call "),
+        "log-weight applied at v: (%call ℓ 0.5):\n{pir}"
+    );
+    // No `(log (%call ` — that would be the `weighted` shape (a spurious outer log).
+    assert!(
+        !pir.contains("(log (%call "),
+        "logweighted must NOT wrap the applied log-weight in an outer log:\n{pir}"
+    );
+    // Both Gaussians are scored: g1 = N(0,1) directly, g2 = N(1,2) inside ℓ.
+    assert!(
+        pir.contains("(%field mu 0.0) (%field sigma 1.0)")
+            && pir.contains("(%field mu 1.0) (%field sigma 2.0)"),
+        "g1 = N(0,1) and g2 = N(1,2) both scored:\n{pir}"
+    );
+}
 
-    let pre_score = js_score(pre_src, "lp")
-        .expect("FLATPPL_JS_DIR must be set")
-        .expect("pre-conversion JS scoring must succeed");
+#[test]
+fn normalize_truncated_normal_structure() {
+    // normalize(truncate(Normal(0,1), interval(-1,1))) scored at 0.5 →
+    //   sub(density_with_gate, log(sub(touniform(base, hi), touniform(base, lo))))
+    //   — §06 "Density of composed measures" closed-form Z = CDF(hi) − CDF(lo) via the touniform (CDF)
+    //   transport; valid here because the base Normal(0,1) is a normalized measure.
+    let src = "\
+g = Normal(mu = 0.0, sigma = 1.0)
+d = normalize(truncate(g, interval(-1.0, 1.0)))
+lp = logdensityof(d, 0.5)";
+    let m = parse_infer(src);
+    let out = determinize(&m).expect("normalize(truncate) must lower");
+    assert!(flatppl_determinizer::is_flatpdl(&out).is_ok());
+    let pir = flatppl_flatpir::write(&out);
+    assert!(
+        !pir.contains("(normalize ") && !pir.contains("totalmass"),
+        "no normalize/totalmass:\n{pir}"
+    );
+    // Structural: the closed-form log-Z is `log(sub(touniform(hi), touniform(lo)))`
+    // — exactly TWO CDF transports (at the two interval endpoints), differenced,
+    // then logged, and subtracted from the gated density.
+    assert_eq!(
+        pir.matches("builtin_touniform").count(),
+        2,
+        "two CDF transports (one per endpoint) for Z:\n{pir}"
+    );
+    assert!(
+        pir.contains("(log (%meta") || pir.contains("(log "),
+        "log-Z present:\n{pir}"
+    );
+    assert!(
+        pir.contains("(sub ") && pir.contains("(log "),
+        "density − log(Z) shape:\n{pir}"
+    );
+    // The gate: the truncate lowering emits `ifelse(in(v, S), density, neg(inf))`.
+    assert!(
+        pir.contains("(ifelse ") && pir.contains("(neg inf)"),
+        "support gate present (ifelse … neg inf):\n{pir}"
+    );
+    // The single density term scores the base Normal(0,1).
+    assert_eq!(
+        pir.matches("builtin_logdensityof").count(),
+        1,
+        "single density term for the base:\n{pir}"
+    );
+}
 
-    let m = parse_infer(pre_src);
+#[test]
+fn likelihoodof_gaussian_structure() {
+    // obs = likelihoodof(iid(Normal(mu,sigma), 1), [1.27])
+    // logdensityof(obs, record(mu=0, sigma=1)) → density(Normal(0,1), 1.27):
+    // K is scored at the baked-in obs (1.27) with θ = {mu:0, sigma:1} inlined for
+    // the free params — §06 "Likelihood construction" densityof(likelihoodof(K, obs), θ) = pdf(κ(θ), obs).
+    let src = "\
+mu = elementof(reals)
+sigma = elementof(posreals)
+gauss_x = Normal(mu = mu, sigma = sigma)
+obs = likelihoodof(iid(gauss_x, 1), [1.27])
+lp = logdensityof(obs, record(mu = 0.0, sigma = 1.0))";
+    let m = parse_infer(src);
+    let out = determinize(&m).expect("likelihood must lower");
+    assert!(
+        flatppl_determinizer::is_flatpdl(&out).is_ok(),
+        "must be FlatPDL"
+    );
+    let pir = flatppl_flatpir::write(&out);
+    assert_eq!(
+        pir.matches("builtin_logdensityof").count(),
+        1,
+        "1 term:\n{pir}"
+    );
+    assert!(
+        !pir.contains("(likelihoodof ") && !pir.contains("(iid "),
+        "measure layer gone:\n{pir}"
+    );
+    // Structural: the θ point {mu=0.0, sigma=1.0} is INLINED into the kernel's
+    // params (not left as `(%ref self mu/sigma)`), and the kernel is scored at the
+    // baked-in observation 1.27.
+    let lp_line = pir
+        .lines()
+        .find(|l| l.contains("(%bind lp "))
+        .expect("lp binding present");
+    assert!(
+        lp_line.contains("(%field mu 0.0)") && lp_line.contains("(%field sigma 1.0)"),
+        "θ inlined into the kernel params:\n{lp_line}"
+    );
+    assert!(
+        lp_line.contains("1.27"),
+        "kernel scored at the baked-in observation 1.27:\n{lp_line}"
+    );
+    assert!(
+        !lp_line.contains("(%ref self mu)") && !lp_line.contains("(%ref self sigma)"),
+        "θ must be inlined, not a residual self-ref:\n{lp_line}"
+    );
+}
+
+// Regression for a cross-query parameter leak. TWO likelihood
+// queries over the SAME shared params (`mu`, `sigma`) at DISTINCT θ points must
+// each score at its OWN θ. Each θ is inlined into that query's density subtree;
+// the shared `mu`/`sigma` bindings are NOT mutated (which would clobber both
+// terms to the last θ written — a silent mislowering that `is_flatpdl` passes).
+#[test]
+fn two_likelihood_queries_do_not_leak_theta_across_each_other() {
+    let src = "\
+mu = elementof(reals)
+sigma = elementof(posreals)
+gauss_x = Normal(mu = mu, sigma = sigma)
+obs = likelihoodof(iid(gauss_x, 1), [1.27])
+lp = logdensityof(obs, record(mu = 0.0, sigma = 1.0))
+lp2 = logdensityof(obs, record(mu = 5.0, sigma = 2.0))";
+    let m = parse_infer(src);
+    let out = determinize(&m).expect("two-query likelihood must lower");
+    assert!(
+        flatppl_determinizer::is_flatpdl(&out).is_ok(),
+        "must be FlatPDL:\n{}",
+        flatppl_flatpir::write(&out)
+    );
+    let pir = flatppl_flatpir::write(&out);
+    assert_eq!(
+        pir.matches("builtin_logdensityof").count(),
+        2,
+        "one density term per query:\n{pir}"
+    );
+
+    // The two terms must be DISTINCT and each carry its OWN θ, inlined as
+    // literals (not a shared `(%ref self mu/sigma)` that resolves to the last
+    // θ). Inspect each query's binding line independently.
+    let lp_line = pir
+        .lines()
+        .find(|l| l.contains("(%bind lp "))
+        .expect("lp binding present");
+    let lp2_line = pir
+        .lines()
+        .find(|l| l.contains("(%bind lp2 "))
+        .expect("lp2 binding present");
+
+    assert!(
+        lp_line.contains("(%field mu 0.0)") && lp_line.contains("(%field sigma 1.0)"),
+        "lp must score at ITS θ (mu=0.0, sigma=1.0):\n{lp_line}"
+    );
+    assert!(
+        lp2_line.contains("(%field mu 5.0)") && lp2_line.contains("(%field sigma 2.0)"),
+        "lp2 must score at ITS θ (mu=5.0, sigma=2.0):\n{lp2_line}"
+    );
+
+    // No θ leaked the other way: the two terms carry different values.
+    assert!(
+        !lp_line.contains("5.0") && !lp2_line.contains("0.0"),
+        "θ leaked across the two queries:\nlp:  {lp_line}\nlp2: {lp2_line}"
+    );
+
+    // The shared params must NOT have been mutated to a θ literal — they stay
+    // `elementof` free-param declarations (valid FlatPDL). A `(%bind mu 5.0)` /
+    // `(%bind sigma 2.0)` is the smoking gun of the mutate-shared-bindings bug.
+    assert!(
+        pir.contains("(%bind mu (") && pir.contains("elementof reals"),
+        "mu stays an elementof param decl (not clobbered to a θ literal):\n{pir}"
+    );
+    assert!(
+        !pir.contains("(%bind mu 5.0)") && !pir.contains("(%bind sigma 2.0)"),
+        "shared params must not be mutated to a query's θ:\n{pir}"
+    );
+
+    // And no residual self-ref to the (now-unused) params survives in either
+    // scored density subtree.
+    assert!(
+        !lp_line.contains("(%ref self mu)") && !lp2_line.contains("(%ref self mu)"),
+        "θ must be inlined, not left as a shared self-ref:\nlp:  {lp_line}\nlp2: {lp2_line}"
+    );
+}
+
+// Regression fixture for transitive pinning (measure-algebra-audit.md H3): a variate reached
+// through a derived binding (`a = 2·theta`, `theta = draw(M)`) must score at
+// the pinned `theta` and propagate transitively — no stochastic `draw` may
+// survive, even though `a` is unreferenced by `lp` and depends on `theta`.
+#[test]
+fn derived_binding_pins_transitively() {
+    // theta ~ Normal(0,1); a = 2*theta (derived). Score the joint at theta=0.5.
+    // density is density(Normal(0,1), 0.5), scored at the pinned theta; no
+    // stochastic `draw` may survive, even though `a` depends on `theta`.
+    let src = "\
+theta = draw(Normal(mu = 0.0, sigma = 1.0))
+a = mul(2.0, theta)
+lp = logdensityof(lawof(record(theta = theta)), record(theta = 0.5))";
+    let m = parse_infer(src);
     let out = determinize(&m).expect("must lower");
-    let flatpdl_src = flatppl_syntax::print(&out);
-
-    let post_score = js_score(&flatpdl_src, "lp")
-        .expect("FLATPPL_JS_DIR must be set")
-        .expect("post-conversion JS scoring must succeed");
-
-    let tol = 1e-9;
+    let pir = flatppl_flatpir::write(&out);
     assert!(
-        (pre_score - post_score).abs() <= tol,
-        "pre-conversion score {pre_score} differs from post-conversion score {post_score} \
-         by {} (> tol {tol}) — determinizer altered the numeric value",
-        (pre_score - post_score).abs()
+        flatppl_determinizer::is_flatpdl(&out).is_ok(),
+        "no stochastic draw survives (a's dep):\n{pir}"
+    );
+    assert_eq!(
+        pir.matches("builtin_logdensityof").count(),
+        1,
+        "single density term:\n{pir}"
+    );
+    // Transitive pinning: no `(draw ` survives anywhere (theta is pinned, and a's
+    // dependency on it is rewritten), and the term scores the pinned theta = 0.5.
+    assert!(
+        !pir.contains("(draw "),
+        "no stochastic draw survives:\n{pir}"
+    );
+    assert!(
+        pir.contains("(%field mu 0.0) (%field sigma 1.0)"),
+        "scores Normal(0,1) at the pinned theta:\n{pir}"
+    );
+}
+
+#[test]
+fn empty_record_is_zero() {
+    let src = "lp = logdensityof(lawof(record()), record())";
+    let m = parse_infer(src);
+    let out = determinize(&m).expect("empty record must lower to 0");
+    assert!(flatppl_determinizer::is_flatpdl(&out).is_ok());
+    let pir = flatppl_flatpir::write(&out);
+    assert!(
+        !pir.contains("builtin_logdensityof"),
+        "no density terms:\n{pir}"
+    );
+}
+
+// Empty independent product: `iid(M, 0)` is Σ over an empty index set = 0, the
+// same as the empty measure `record()` (the iid Σ rule, §06 "Density of composed measures",
+// with an empty index set). It lowers to the log-density literal 0 with NO
+// density term — it is NOT refused (both empty products must agree).
+#[test]
+fn iid_zero_size_is_zero() {
+    let src = "\
+d = iid(Normal(mu = 0.0, sigma = 1.0), 0)
+lp = logdensityof(d, [])";
+    let m = parse_infer(src);
+    let out = determinize(&m).expect("iid with zero size must lower to 0, not refuse");
+    assert!(flatppl_determinizer::is_flatpdl(&out).is_ok());
+    let pir = flatppl_flatpir::write(&out);
+    assert!(
+        !pir.contains("builtin_logdensityof"),
+        "no density terms for an empty product:\n{pir}"
+    );
+    assert!(
+        !pir.contains("(iid ") && !pir.contains("(logdensityof "),
+        "no measure layer:\n{pir}"
+    );
+    // The `lp` binding is the literal 0.0 (log-density of the empty product).
+    assert!(
+        pir.contains("(%bind lp 0.0)"),
+        "empty iid product lowers to log-density 0:\n{pir}"
     );
 }
