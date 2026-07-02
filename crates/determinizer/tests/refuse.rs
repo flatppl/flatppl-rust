@@ -352,3 +352,140 @@ lp = logdensityof(d, 2.0)";
         "refusal names normalize: {err:?}"
     );
 }
+
+// `logdensityof(M)` with the wrong arity. §06's density query is binary —
+// `logdensityof(measure, variate)` — so a call with any argument count other than
+// 2 (here a single-argument call, no variate) is not a well-formed density query.
+// `flatppl_infer::infer` is best-effort and does not reject the arity, so the
+// determiniser's own 2-arg guard at the `logdensityof` entry must REFUSE (naming
+// `logdensityof`) rather than index a missing `args[1]`.
+#[test]
+fn logdensityof_wrong_arity_refuses() {
+    let src = "\
+a = draw(Normal(mu = 0.0, sigma = 1.0))
+lp = logdensityof(lawof(record(a = a)))";
+    let m = parse_infer(src);
+    let err = determinize(&m)
+        .expect_err("a non-binary logdensityof is not a well-formed density query — refuse");
+    assert!(
+        err.construct.contains("logdensityof"),
+        "refusal names logdensityof: {err:?}"
+    );
+    assert!(
+        err.reason.contains("2 args"),
+        "refusal explains the binary-query arity: {err:?}"
+    );
+}
+
+// `likelihoodof(K)` with the wrong arity. §06 constructs a likelihood as
+// `likelihoodof(kernel, obs)` — binary. A call with any other arg count (here a
+// single argument, no observation) is malformed. When such a likelihood reaches
+// the likelihood-query entry (`logdensityof(L, θ)`), the determiniser's 2-arg
+// guard inside `lower_likelihood_query` must REFUSE naming `likelihoodof`, rather
+// than index a missing `obs` arg.
+#[test]
+fn likelihoodof_wrong_arity_refuses() {
+    let src = "\
+mu = elementof(reals)
+k = kernelof(record(y = draw(Normal(mu = mu, sigma = 1.0))), mu = mu)
+L = likelihoodof(k)
+lp = logdensityof(L, record(mu = 2.0))";
+    let m = parse_infer(src);
+    let err = determinize(&m)
+        .expect_err("a non-binary likelihoodof is not a well-formed likelihood — refuse");
+    assert!(
+        err.construct.contains("likelihoodof"),
+        "refusal names likelihoodof: {err:?}"
+    );
+    assert!(
+        err.reason.contains("2 args"),
+        "refusal explains the (kernel, obs) arity: {err:?}"
+    );
+}
+
+// A likelihood query whose θ record names a parameter with NO module binding.
+// `logdensityof(likelihoodof(K, obs), θ)` inlines each θ field into the density
+// subtree by matching `(%ref self <name>)` against the emitted kernel's free
+// params. A θ field naming something that is not a declared param (here
+// `nonexistent`) has no such ref to bind and no corresponding param decl — it is
+// a mislowering hazard (a θ point that silently scores nothing), not a valid
+// parameter point. `theta_field_map` must REFUSE such a θ up front rather than
+// build a density that ignores the stray field.
+#[test]
+fn likelihoodof_query_theta_names_unbound_param_refuses() {
+    let src = "\
+mu = elementof(reals)
+k = kernelof(record(y = draw(Normal(mu = mu, sigma = 1.0))), mu = mu)
+L = likelihoodof(k, record(y = 0.5))
+lp = logdensityof(L, record(nonexistent = 2.0))";
+    let m = parse_infer(src);
+    let err = determinize(&m).expect_err(
+        "a θ field naming a parameter with no module binding is not a valid point — refuse",
+    );
+    assert!(
+        err.reason.contains("no module binding"),
+        "refusal explains the θ field has no corresponding param binding: {err:?}"
+    );
+}
+
+// A likelihood query whose θ argument is NOT a record. `logdensityof(L, θ)` reads
+// θ as the parameter point, which §06 models as a field-keyed record (one field
+// per free param). A scalar θ (here `2.0`) has no field structure to inline, so
+// `theta_field_map` must REFUSE naming the record requirement rather than treat
+// the scalar as the variate (the measure-query path) — the likelihood-query entry
+// has already committed to the θ interpretation.
+#[test]
+fn likelihoodof_query_theta_not_a_record_refuses() {
+    let src = "\
+mu = elementof(reals)
+k = kernelof(record(y = draw(Normal(mu = mu, sigma = 1.0))), mu = mu)
+L = likelihoodof(k, record(y = 0.5))
+lp = logdensityof(L, 2.0)";
+    let m = parse_infer(src);
+    let err =
+        determinize(&m).expect_err("a non-record θ in a likelihood query is malformed — refuse");
+    assert!(
+        err.reason.contains("θ must be a record"),
+        "refusal explains θ must be a field-keyed record: {err:?}"
+    );
+}
+
+// A MEASURE-side `record` built with POSITIONAL args instead of `%field name =`
+// entries. The independent-product density rule pairs each measure component with
+// the matching field of the value record by NAME (§06 "Density of composed
+// measures"). A positional `record(draw(..))` carries no field names, so there is
+// no key to pair against the value record — it is not a field-keyed product. The
+// determiniser must REFUSE rather than mis-pair positionally.
+#[test]
+fn measure_record_with_positional_args_refuses() {
+    let src = "\
+a = draw(Normal(mu = 0.0, sigma = 1.0))
+lp = logdensityof(lawof(record(a)), record(a = 0.5))";
+    let m = parse_infer(src);
+    let err = determinize(&m)
+        .expect_err("a positional measure record is not a field-keyed product — refuse");
+    assert!(
+        err.reason.contains("field-keyed product"),
+        "refusal explains the record is not field-keyed: {err:?}"
+    );
+}
+
+// A VALUE-side `record` built with POSITIONAL args. The variate of an independent
+// product is matched to the measure components BY FIELD NAME, so a positional
+// value record (here `record(0.5)`, no field names) cannot be looked up per
+// component. This is distinct from the measure-side positional refuse above — it
+// fires on the value record after the measure record has already matched. The
+// determiniser must REFUSE.
+#[test]
+fn value_record_with_positional_args_refuses() {
+    let src = "\
+a = draw(Normal(mu = 0.0, sigma = 1.0))
+lp = logdensityof(lawof(record(a = a)), record(0.5))";
+    let m = parse_infer(src);
+    let err = determinize(&m)
+        .expect_err("a positional value record has no field keys to match against — refuse");
+    assert!(
+        err.reason.contains("positional args"),
+        "refusal explains the value record carries positional args: {err:?}"
+    );
+}

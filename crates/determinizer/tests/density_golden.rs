@@ -268,6 +268,217 @@ lp = logdensityof(pp, record(y = 0.5))";
     );
 }
 
+// kchain(M, K) with a DISCRETE-FINITE `Categorical` latent. `Categorical(p)` is
+// 1-BASED: its atoms are {1, …, n} where n is the static length of the `p`
+// vector. A length-3 `p` therefore enumerates atoms {1, 2, 3} — NOT {0, 1, 2}.
+// The marginal lowers to the same mass-weighted logsumexp as the Bernoulli case:
+//   - one outer `logsumexp` with 3 arguments (one per atom),
+//   - 3 mass terms (Categorical log-pmf at atoms 1, 2, 3) + 3 kernel terms = 6
+//     `builtin_logdensityof` calls,
+//   - each branch is an `add` of a mass term and a kernel term (mass-weighted,
+//     not the biased `−logN` uniform form), and
+//   - no `kchain` / `lawof` / `draw` / `kernelof` survives.
+// The 1-based atom values must appear as the scored value of the Categorical
+// mass terms (`(builtin_logdensityof Categorical … 1)`, `… 2`, `… 3`).
+#[test]
+fn kchain_discrete_categorical_latent_lowers_to_mass_weighted_logsumexp() {
+    let src = "\
+z = draw(Categorical(p = [0.2, 0.3, 0.5]))
+k = kernelof(record(y = draw(Normal(mu = z, sigma = 1.0))), z = z)
+pp = kchain(lawof(record(z = z)), k)
+lp = logdensityof(pp, record(y = 0.5))";
+    let out = determinize_src(src);
+    let pir = flatppl_flatpir::write(&out);
+    assert_eq!(
+        pir.matches("logsumexp").count(),
+        1,
+        "one outer logsumexp over the 3 atoms:\n{pir}"
+    );
+    // 3 mass terms + 3 kernel terms over the 3 Categorical atoms {1, 2, 3}.
+    assert_eq!(
+        pir.matches("builtin_logdensityof").count(),
+        6,
+        "mass-weighted: 3 atoms × (latent pmf + kernel density):\n{pir}"
+    );
+    // 1-based atoms: each atom is pinned into the kernel's `mu`, so the kernel
+    // bodies carry `(%field mu 1)`, `(%field mu 2)`, `(%field mu 3)` — never 0.
+    assert!(pir.contains("Categorical"), "Categorical mass term:\n{pir}");
+    assert!(
+        pir.contains("(%field mu 1)")
+            && pir.contains("(%field mu 2)")
+            && pir.contains("(%field mu 3)"),
+        "Categorical atoms are 1-based {{1, 2, 3}}:\n{pir}"
+    );
+    assert!(
+        !pir.contains("(%field mu 0)"),
+        "1-based Categorical must not enumerate atom 0:\n{pir}"
+    );
+    assert!(pir.contains("add"), "mass-weighted add per branch:\n{pir}");
+    assert!(
+        !pir.contains("kchain")
+            && !pir.contains("lawof")
+            && !pir.contains("(draw ")
+            && !pir.contains("kernelof"),
+        "measure layer gone:\n{pir}"
+    );
+    assert!(
+        flatppl_determinizer::is_flatpdl(&out).is_ok(),
+        "is_flatpdl failed:\n{pir}"
+    );
+}
+
+// kchain(M, K) with a DISCRETE-FINITE `Categorical0` latent. `Categorical0(p)` is
+// the 0-BASED variant: its atoms are {0, …, n-1}. A length-3 `p` enumerates atoms
+// {0, 1, 2}. This is the only structural difference from the `Categorical` case
+// above (same n, same logsumexp / term-count shape), so it pins that the
+// determiniser reads the 0-based offset off the constructor name, not the vector.
+#[test]
+fn kchain_discrete_categorical0_latent_lowers_to_zero_based_atoms() {
+    let src = "\
+z = draw(Categorical0(p = [0.2, 0.3, 0.5]))
+k = kernelof(record(y = draw(Normal(mu = z, sigma = 1.0))), z = z)
+pp = kchain(lawof(record(z = z)), k)
+lp = logdensityof(pp, record(y = 0.5))";
+    let out = determinize_src(src);
+    let pir = flatppl_flatpir::write(&out);
+    assert_eq!(
+        pir.matches("logsumexp").count(),
+        1,
+        "one outer logsumexp over the 3 atoms:\n{pir}"
+    );
+    assert_eq!(
+        pir.matches("builtin_logdensityof").count(),
+        6,
+        "mass-weighted: 3 atoms × (latent pmf + kernel density):\n{pir}"
+    );
+    // 0-based atoms: each atom is pinned into the kernel's `mu`, so the kernel
+    // bodies carry `(%field mu 0)`, `(%field mu 1)`, `(%field mu 2)` — never 3.
+    assert!(
+        pir.contains("Categorical0"),
+        "Categorical0 mass term:\n{pir}"
+    );
+    assert!(
+        pir.contains("(%field mu 0)")
+            && pir.contains("(%field mu 1)")
+            && pir.contains("(%field mu 2)"),
+        "Categorical0 atoms are 0-based {{0, 1, 2}}:\n{pir}"
+    );
+    assert!(
+        !pir.contains("(%field mu 3)"),
+        "0-based Categorical0 must not enumerate the out-of-range atom 3:\n{pir}"
+    );
+    assert!(pir.contains("add"), "mass-weighted add per branch:\n{pir}");
+    assert!(
+        !pir.contains("kchain")
+            && !pir.contains("lawof")
+            && !pir.contains("(draw ")
+            && !pir.contains("kernelof"),
+        "measure layer gone:\n{pir}"
+    );
+    assert!(
+        flatppl_determinizer::is_flatpdl(&out).is_ok(),
+        "is_flatpdl failed:\n{pir}"
+    );
+}
+
+// kchain(M, K) with a DISCRETE-FINITE `Binomial` latent. `Binomial(n, p)` has
+// n+1 atoms {0, 1, …, n} (inclusive of both 0 and n), read from the STATIC INT
+// `n` kwarg (not a vector length). `n = 2` therefore enumerates atoms {0, 1, 2}
+// — three atoms, so the same 3-branch logsumexp shape as the Categorical cases:
+//   - one outer `logsumexp` with 3 arguments,
+//   - 3 Binomial mass terms + 3 kernel terms = 6 `builtin_logdensityof` calls, and
+//   - no residual measure layer.
+// This exercises the `static_int` (rather than `static_vector_len`) atom-count
+// path in the classifier.
+#[test]
+fn kchain_discrete_binomial_latent_lowers_to_mass_weighted_logsumexp() {
+    let src = "\
+z = draw(Binomial(n = 2, p = 0.5))
+k = kernelof(record(y = draw(Normal(mu = z, sigma = 1.0))), z = z)
+pp = kchain(lawof(record(z = z)), k)
+lp = logdensityof(pp, record(y = 0.5))";
+    let out = determinize_src(src);
+    let pir = flatppl_flatpir::write(&out);
+    assert_eq!(
+        pir.matches("logsumexp").count(),
+        1,
+        "one outer logsumexp over the n+1 = 3 atoms:\n{pir}"
+    );
+    // 3 mass terms + 3 kernel terms over the 3 Binomial atoms {0, 1, 2}.
+    assert_eq!(
+        pir.matches("builtin_logdensityof").count(),
+        6,
+        "mass-weighted: (n+1) atoms × (latent pmf + kernel density):\n{pir}"
+    );
+    // Atoms {0, …, n} inclusive: each atom is pinned into the kernel's `mu`, so
+    // the kernel bodies carry `(%field mu 0)`, `(%field mu 1)`, `(%field mu 2)`.
+    assert!(pir.contains("Binomial"), "Binomial mass term:\n{pir}");
+    assert!(
+        pir.contains("(%field mu 0)")
+            && pir.contains("(%field mu 1)")
+            && pir.contains("(%field mu 2)"),
+        "Binomial atoms run {{0, …, n}} inclusive:\n{pir}"
+    );
+    assert!(pir.contains("add"), "mass-weighted add per branch:\n{pir}");
+    assert!(
+        !pir.contains("kchain")
+            && !pir.contains("lawof")
+            && !pir.contains("(draw ")
+            && !pir.contains("kernelof"),
+        "measure layer gone:\n{pir}"
+    );
+    assert!(
+        flatppl_determinizer::is_flatpdl(&out).is_ok(),
+        "is_flatpdl failed:\n{pir}"
+    );
+}
+
+// A likelihood query `logdensityof(likelihoodof(K, obs), θ)` is handled at the
+// `logdensityof` ENTRY (not via the measure-density recursion): arg2 `θ` is the
+// PARAMETER point (a record), and the variate is the `obs` baked into the
+// likelihood (§06 "Likelihood construction": densityof(likelihoodof(K,obs),θ) =
+// pdf(κ(θ), obs)). Each θ field value is inlined into THIS query's density
+// subtree by substituting `(%ref self <name>)` — so with θ = record(mu = 2.0) and
+// a `mu = elementof(reals)` param, the density scores `Normal(mu = 2.0)` at the
+// baked obs `0.5`, i.e. the θ value 2.0 lands in the `mu` field of the emitted
+// `builtin_logdensityof`. The `elementof` param declaration is left in place
+// (valid FlatPDL — an unused free param), and no `likelihoodof` / `lawof` / draw
+// survives.
+#[test]
+fn likelihoodof_query_inlines_theta_into_density() {
+    let src = "\
+mu = elementof(reals)
+k = Normal(mu = mu, sigma = 1.0)
+L = likelihoodof(k, 0.5)
+lp = logdensityof(L, record(mu = 2.0))";
+    let out = determinize_src(src);
+    let pir = flatppl_flatpir::write(&out);
+    assert!(
+        pir.contains("builtin_logdensityof"),
+        "kernel density present:\n{pir}"
+    );
+    // The θ value 2.0 is inlined into the mu field; the density scores at θ = 2.0,
+    // NOT at the free `mu` param (which would be a `(%ref self mu)` left dangling).
+    assert!(
+        pir.contains("(%field mu 2.0)"),
+        "θ value 2.0 inlined into the mu field:\n{pir}"
+    );
+    // The `elementof` param declaration remains as an unused free param — valid
+    // FlatPDL, and NOT mutated per-query (each query keeps its own θ point).
+    assert!(
+        pir.contains("elementof"),
+        "the mu param declaration is left in place:\n{pir}"
+    );
+    assert!(
+        !pir.contains("likelihoodof") && !pir.contains("lawof") && !pir.contains("(draw "),
+        "measure layer gone:\n{pir}"
+    );
+    assert!(
+        flatppl_determinizer::is_flatpdl(&out).is_ok(),
+        "is_flatpdl failed:\n{pir}"
+    );
+}
+
 fn determinize_src(src: &str) -> flatppl_core::Module {
     let m = {
         let mut m = flatppl_syntax::parse(src).unwrap();
