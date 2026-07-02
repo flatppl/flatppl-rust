@@ -157,6 +157,9 @@ pub enum Failure {
         /// Byte span `[start, end)`, when the error carries one.
         span: Option<(usize, usize)>,
     },
+    /// A determiniser refusal — a construct that cannot be legalized to FlatPDL.
+    /// Distinct exit code (3) so callers classify refuse ≠ parse/IO error.
+    Refuse(String),
 }
 
 impl From<String> for Failure {
@@ -229,6 +232,10 @@ pub fn report(result: Result<(), Failure>) -> ExitCode {
         }) => {
             render_diagnostic(&path, &source, &message, line, span);
             ExitCode::FAILURE
+        }
+        Err(Failure::Refuse(msg)) => {
+            eprintln!("{msg}");
+            ExitCode::from(3)
         }
     }
 }
