@@ -287,6 +287,22 @@ lp = logdensityof(d, [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]])";
     );
 }
 
+// A GENUINELY dynamic iid size must still refuse (refuse-don't-mislower). The
+// determiniser now resolves an iid's repeat count from its const-evaluated
+// static domain shape (so a `lengthof(fixed_array)` size lowers), but an
+// `external(posintegers)` count is runtime-determined — const-eval yields a
+// `%dynamic` dim, not a static one — so the O(N) static unroll has no `N` and
+// must refuse rather than guess a size.
+#[test]
+fn iid_dynamic_size_refuses() {
+    let src = "\
+n = external(posintegers)
+d = iid(Normal(mu = 0.0, sigma = 1.0), n)
+lp = logdensityof(d, [0.5, -0.3, 1.2])";
+    let m = parse_infer(src);
+    determinize(&m).expect_err("iid with a genuinely dynamic (external) size must refuse");
+}
+
 // A θ parameter captured as a `functionof` / `kernelof`
 // reification INPUT (a `(coeff, %ref self coeff)` boundary entry) cannot be
 // inlined by the per-query θ substitution — `substitute_refs_by_name` walks

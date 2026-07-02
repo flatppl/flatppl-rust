@@ -195,6 +195,43 @@ lp = logdensityof(d, [0.5, -0.3, 1.2])";
     );
 }
 
+// `iid(M, lengthof(data))` — the canonical §06 shape-dependent iid size
+// (`iid(M, lengthof(obs))`). The size is not a raw literal: it is `lengthof`
+// over a fixed-shape array, which `flatppl-infer` const-evaluates (it runs at
+// `Level::Shape`) into the iid measure's static domain shape. The determiniser
+// reads that resolved static size from the iid node's own inferred domain type,
+// so a `lengthof`-sized iid lowers to the right number of density terms rather
+// than refusing "iid size must be a literal integer".
+#[test]
+fn iid_lengthof_sized_lowers() {
+    let src = "\
+data = [1.2, 3.4, 5.1]
+d = iid(Normal(mu = 0.0, sigma = 1.0), lengthof(data))
+lp = logdensityof(d, data)";
+    let m = parse_infer(src);
+    let out = determinize(&m).expect("lengthof-sized iid must lower via const-eval");
+    assert!(
+        flatppl_determinizer::is_flatpdl(&out).is_ok(),
+        "must be FlatPDL"
+    );
+    let pir = flatppl_flatpir::write(&out);
+    assert_eq!(
+        pir.matches("builtin_logdensityof").count(),
+        3,
+        "3 iid terms from lengthof(data) = 3:\n{pir}"
+    );
+    assert!(
+        !pir.contains("(iid ") && !pir.contains("(logdensityof "),
+        "no residual measure layer:\n{pir}"
+    );
+    // All three terms score the SAME kernel/params: Normal(mu=0.0, sigma=1.0).
+    assert_eq!(
+        pir.matches("(%field mu 0.0) (%field sigma 1.0)").count(),
+        3,
+        "all three lengthof-iid terms score Normal(0,1):\n{pir}"
+    );
+}
+
 // `iid` over a NON-SCALAR `M` (here a nested `iid(Normal, 2)`) must lower
 // correctly — NOT refuse, NOT mislower. This proves the deliberate asymmetry with
 // `joint`: `iid(M, size)` is the product `M^⊗N` over ARRAYS of shape `size`, a

@@ -43,11 +43,16 @@
 //!   membership builtin, which infers to a boolean — `elementof` is a set-valued
 //!   parameter declaration, not a membership predicate).
 //! - `pushfwd(bijection(f, f_inv, logvol), M)` → `sub(density(M, f_inv(v)), logvol(f_inv(v)))`
-//! - `iid(M, N)` → `Σ_{i<N} density(M, get0(v, i))` — **`N` must be a literal
-//!   SCALAR integer** (static unroll; corpus `N` is small). A non-literal `N`,
-//!   or a multi-axis / vector `size` (e.g. `iid(M, [2, 3])` — a valid §06 shape),
-//!   is **refused** (the O(N) unroll handles only 1-D literal `N`; the vectorized
-//!   broadcast+reduce over a multi-axis shape is the noted scale path, not built).
+//! - `iid(M, N)` → `Σ_{i<N} density(M, get0(v, i))` — **`N` is the static
+//!   1-D repeat count read from the iid node's own const-evaluated domain
+//!   shape** (`iid_static_size`), so a shape-dependent size (`iid(M,
+//!   lengthof(obs))`, `sizeof(M)`, arithmetic on lengths, or a named/inline
+//!   literal) resolves as readily as a raw literal — `flatppl_infer` (at
+//!   `Level::Shape`) folds the size into that shape (static unroll; corpus `N`
+//!   is small). A genuinely dynamic size, or a multi-axis / vector `size` (e.g.
+//!   `iid(M, [2, 3])` — a valid §06 shape), is **refused** (the O(N) unroll
+//!   handles only 1-D `N`; the vectorized broadcast+reduce over a multi-axis
+//!   shape is the noted scale path, not built).
 //! - `joint(M₁,…,Mₖ)` (**positional only**) → `Σᵢ density(Mᵢ, get0(v, i))` —
 //!   **scalar-variate components only**; a component is accepted ONLY when its
 //!   measure-domain kind is CONFIRMED `Scalar` — a component whose domain is
@@ -86,8 +91,8 @@
 
 use crate::refuse::RefuseError;
 use flatppl_core::{
-    BindingId, Call, CallHead, Mass, Module, NamedArg, NamedKind, Node, NodeId, Ref, RefNs, Scalar,
-    ScalarType, Symbol, Type,
+    BindingId, Call, CallHead, Dim, Mass, Module, NamedArg, NamedKind, Node, NodeId, Ref, RefNs,
+    Scalar, ScalarType, Symbol, Type,
 };
 
 // ---------------------------------------------------------------------------
@@ -959,32 +964,59 @@ fn lower_pushfwd(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Refu
     Ok(build_call(m, "sub", &[inner_density, logvol_val]))
 }
 
-/// Read a literal non-negative integer from `id` (`Scalar::Int`, or an integral
-/// `Scalar::Real`). Returns `None` if `id` is not such a literal.
+/// Resolve the static repeat count `N` of an `iid(M, size)` from the iid node's
+/// own INFERRED domain type — general over any const-resolvable size, not just a
+/// raw literal.
 ///
-/// **Only a literal SCALAR `N` is accepted.** §06 "Independent composition" admits
-/// an `iid` `size` as "an integer (1-D length) or a vector of positive integers
-/// (multi-axis shape)", but a multi-axis / vector size (e.g. `iid(M, [2, 3])`) is
-/// intentionally refused here: this returns `None` for a non-literal, and a vector
-/// literal is not a scalar `Scalar::Int`/`Scalar::Real`, so [`lower_iid`]'s
-/// `literal_usize(size).ok_or_else(refuse …)` rejects it. The O(N) static unroll in
-/// [`lower_iid`] handles only a 1-D literal `N`; the vectorized broadcast+reduce
-/// over a multi-axis shape is the noted scale path, not built (conservative
-/// refuse-don't-mislower, not a bug).
-fn literal_usize(m: &Module, id: NodeId) -> Option<usize> {
-    match m.node(id) {
-        Node::Lit(Scalar::Int(n)) if *n >= 0 => Some(*n as usize),
-        Node::Lit(Scalar::Real(r)) if *r >= 0.0 && r.fract() == 0.0 => Some(*r as usize),
-        _ => None,
+/// `iid(M, size)` infers to `Measure { domain: Array { shape, elem }, .. }` where
+/// `shape` is the const-evaluated `size` (`crates/infer/src/consteval.rs`): the
+/// determiniser re-runs `flatppl_infer::infer` — which runs at `Level::Shape` —
+/// each driver iteration, so a shape-dependent size (`lengthof(obs)`,
+/// `sizeof(M)`, or fixed-value arithmetic over lengths — engine-concepts §17.1)
+/// is already folded into a static `Dim` on the iid measure's domain. Reading it
+/// here (rather than pattern-matching the raw size node) is the do-it-once,
+/// reuse-existing-API mechanism: the const knowledge lives on the type, exposed
+/// via [`Module::type_of`].
+///
+/// **Only a 1-D STATIC leading axis is accepted.** §06 "Independent composition"
+/// admits an `iid` `size` as "an integer (1-D length) or a vector of positive
+/// integers (multi-axis shape)":
+/// * a genuinely dynamic size (`external`/runtime — `Dim::Dynamic`) is not
+///   statically unrollable → `None` → refuse;
+/// * a multi-axis / vector size (`iid(M, [2, 3])` → `shape.len() != 1`) is
+///   refused → `None`: the O(N) static unroll in [`lower_iid`] handles only a
+///   1-D `N`; the vectorized broadcast+reduce over a multi-axis shape is the
+///   noted scale path, not built (conservative refuse-don't-mislower, not a bug).
+///
+/// A `%deferred` iid type (inference did not resolve `M`'s domain, so
+/// `iid_type` returned `Type::Deferred`) also yields `None` — refuse, never
+/// guess a size.
+fn iid_static_size(m: &Module, iid_node: NodeId) -> Option<usize> {
+    let Some(Type::Measure { domain, .. }) = m.type_of(iid_node) else {
+        return None;
+    };
+    let Type::Array { shape, .. } = domain.as_ref() else {
+        return None;
+    };
+    if shape.len() != 1 {
+        return None; // multi-axis / vector size — not the 1-D unroll case
+    }
+    match shape[0] {
+        Dim::Static(n) => Some(n as usize),
+        Dim::Dynamic => None,
     }
 }
 
 /// `logdensityof(iid(M, N), v)` = `Σ_{i<N} logdensityof(M, get0(v, i))`
 /// (§06 "Density of composed measures", "iid(M, n) → Σ_i log densityof(M, xᵢ)").
-/// N comes from the `iid` count arg, which must be a literal SCALAR integer — a
-/// multi-axis / vector `size` (e.g. `[2, 3]`) is intentionally refused (see
-/// [`literal_usize`]). Static unroll (corpus N small; broadcast+reduce is the
-/// noted scale path, not built).
+/// `N` is the static repeat count read from the iid node's own inferred domain
+/// shape (see [`iid_static_size`]) — general over any const-resolvable size
+/// (`lengthof(obs)`, `sizeof(M)`, arithmetic on lengths, a named or inline
+/// literal), since `flatppl_infer` (at `Level::Shape`) has already folded the
+/// size into that static shape. A genuinely dynamic size, or a multi-axis /
+/// vector `size` (e.g. `[2, 3]`), is refused ([`iid_static_size`] returns
+/// `None`). Static unroll (corpus N small; broadcast+reduce is the noted scale
+/// path, not built).
 /// `N == 0` is the empty independent product: Σ over an empty index set is 0, so
 /// it lowers to the log-density literal `0.0` (consistent with the empty measure
 /// `record()`), not a refusal.
@@ -1002,22 +1034,25 @@ fn literal_usize(m: &Module, id: NodeId) -> Option<usize> {
 /// [`lower_joint`]. Adding that guard here would WRONGLY refuse valid non-scalar
 /// `iid`, so it is intentionally absent.
 fn lower_iid(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseError> {
-    let (m_inner, n) = {
+    // The repeat count comes from the iid node's own const-evaluated domain shape
+    // (see `iid_static_size`), so a `lengthof(obs)` / `sizeof(M)` / arithmetic
+    // size resolves as readily as a raw literal. A genuinely dynamic or
+    // multi-axis size yields `None` and refuses.
+    let n = iid_static_size(m, node).ok_or_else(|| {
+        refuse(
+            node,
+            m,
+            "iid size is not a statically-resolved 1-D count (dynamic, multi-axis, \
+             or unresolved domain); only a 1-D static size is unrolled",
+        )
+    })?;
+    let m_inner = {
         let c =
             expect_builtin_call(m, node, "iid").ok_or_else(|| refuse(node, m, "expected iid"))?;
         if c.args.len() != 2 {
             return Err(refuse(node, m, "iid expects 2 args (measure, size)"));
         }
-        let size_arg = c.args[1];
-        // Resolve one level of `(%ref self n)` indirection so a NAMED literal
-        // size (`n = 3; iid(M, n)`) is read from its binding RHS — `n = 3` is
-        // statically known just as an inline `3` is; only `literal_usize`'s
-        // `Node::Lit` match was too narrow. A non-literal size (bound or
-        // inline) still fails `literal_usize` and refuses, unchanged.
-        let (size_resolved, _) = resolve_ref_one(m, size_arg);
-        let n = literal_usize(m, size_resolved)
-            .ok_or_else(|| refuse(size_arg, m, "iid size must be a literal integer"))?;
-        (c.args[0], n)
+        c.args[0]
     };
     // Empty independent product: Σ over an empty index set is 0 (log-density 0),
     // exactly as an empty measure `record()` lowers (the iid Σ rule,
