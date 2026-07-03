@@ -195,6 +195,43 @@ lp = logdensityof(d, [0.5, -0.3, 1.2])";
     );
 }
 
+// `iid(M, lengthof(data))` — the canonical §06 shape-dependent iid size
+// (`iid(M, lengthof(obs))`). The size is not a raw literal: it is `lengthof`
+// over a fixed-shape array, which `flatppl-infer` const-evaluates (it runs at
+// `Level::Shape`) into the iid measure's static domain shape. The determiniser
+// reads that resolved static size from the iid node's own inferred domain type,
+// so a `lengthof`-sized iid lowers to the right number of density terms rather
+// than refusing "iid size must be a literal integer".
+#[test]
+fn iid_lengthof_sized_lowers() {
+    let src = "\
+data = [1.2, 3.4, 5.1]
+d = iid(Normal(mu = 0.0, sigma = 1.0), lengthof(data))
+lp = logdensityof(d, data)";
+    let m = parse_infer(src);
+    let out = determinize(&m).expect("lengthof-sized iid must lower via const-eval");
+    assert!(
+        flatppl_determinizer::is_flatpdl(&out).is_ok(),
+        "must be FlatPDL"
+    );
+    let pir = flatppl_flatpir::write(&out);
+    assert_eq!(
+        pir.matches("builtin_logdensityof").count(),
+        3,
+        "3 iid terms from lengthof(data) = 3:\n{pir}"
+    );
+    assert!(
+        !pir.contains("(iid ") && !pir.contains("(logdensityof "),
+        "no residual measure layer:\n{pir}"
+    );
+    // All three terms score the SAME kernel/params: Normal(mu=0.0, sigma=1.0).
+    assert_eq!(
+        pir.matches("(%field mu 0.0) (%field sigma 1.0)").count(),
+        3,
+        "all three lengthof-iid terms score Normal(0,1):\n{pir}"
+    );
+}
+
 // `iid` over a NON-SCALAR `M` (here a nested `iid(Normal, 2)`) must lower
 // correctly — NOT refuse, NOT mislower. This proves the deliberate asymmetry with
 // `joint`: `iid(M, size)` is the product `M^⊗N` over ARRAYS of shape `size`, a
@@ -558,6 +595,109 @@ lp2 = logdensityof(obs, record(mu = 5.0, sigma = 2.0))";
     assert!(
         !lp_line.contains("(%ref self mu)") && !lp2_line.contains("(%ref self mu)"),
         "θ must be inlined, not left as a shared self-ref:\nlp:  {lp_line}\nlp2: {lp2_line}"
+    );
+}
+
+// `joint_likelihood(L1, …, Lk)` combines likelihoods by summing their
+// log-densities (§06 "Combining likelihoods":
+// `log L(θ) = log L1(θ) + log L2(θ) + …`), all components scored at the SAME
+// parameter point θ. `logdensityof(joint_likelihood(L1, L2), θ)` must lower to
+// `add(logdensityof(L1, θ), logdensityof(L2, θ))` — two density terms folded
+// with `add`, each component's own free params bound from the shared θ.
+#[test]
+fn joint_likelihood_sums_component_densities() {
+    let src = "\
+mu = elementof(reals)
+nu = elementof(reals)
+g1 = Normal(mu = mu, sigma = 1.0)
+g2 = Normal(mu = nu, sigma = 1.0)
+L1 = likelihoodof(iid(g1, 1), [1.0])
+L2 = likelihoodof(iid(g2, 1), [2.0])
+L = joint_likelihood(L1, L2)
+lp = logdensityof(L, record(mu = 0.0, nu = 0.5))";
+    let m = parse_infer(src);
+    let out = determinize(&m).expect("joint_likelihood must lower to a sum of component densities");
+    assert!(
+        flatppl_determinizer::is_flatpdl(&out).is_ok(),
+        "must be FlatPDL:\n{}",
+        flatppl_flatpir::write(&out)
+    );
+    let pir = flatppl_flatpir::write(&out);
+    // Two component densities, folded with `add`.
+    assert_eq!(
+        pir.matches("builtin_logdensityof").count(),
+        2,
+        "one density term per joint_likelihood component:\n{pir}"
+    );
+    let lp_line = pir
+        .lines()
+        .find(|l| l.contains("(%bind lp "))
+        .expect("lp binding present");
+    assert!(
+        lp_line.contains("(add "),
+        "components summed with add:\n{lp_line}"
+    );
+    // No residual measure / likelihood layer.
+    assert!(
+        !pir.contains("(joint_likelihood ")
+            && !pir.contains("(likelihoodof ")
+            && !pir.contains("(iid ")
+            && !pir.contains("(logdensityof "),
+        "measure/likelihood layer eliminated:\n{pir}"
+    );
+    // Each component scores at ITS θ: component 1 → Normal(mu=0.0), scored at the
+    // baked-in observation 1.0; component 2 → Normal(mu=0.5), scored at 2.0.
+    assert!(
+        lp_line.contains("(%field mu 0.0)") && lp_line.contains("(%field mu 0.5)"),
+        "each component binds its own free param from the shared θ:\n{lp_line}"
+    );
+    assert!(
+        !lp_line.contains("(%ref self mu)") && !lp_line.contains("(%ref self nu)"),
+        "θ must be inlined per component, not left as a shared self-ref:\n{lp_line}"
+    );
+}
+
+// A component of a `joint_likelihood` may itself be a `joint_likelihood`
+// (§06 combination is associative). `joint_likelihood(joint_likelihood(L1, L2),
+// L3)` must flatten to `Σ` over all three leaf likelihoods — three density terms
+// — via the per-likelihood lowering's recursion, not stop at the outer two.
+#[test]
+fn joint_likelihood_nested_flattens_to_all_leaf_densities() {
+    let src = "\
+mu = elementof(reals)
+nu = elementof(reals)
+xi = elementof(reals)
+g1 = Normal(mu = mu, sigma = 1.0)
+g2 = Normal(mu = nu, sigma = 1.0)
+g3 = Normal(mu = xi, sigma = 1.0)
+L1 = likelihoodof(iid(g1, 1), [1.0])
+L2 = likelihoodof(iid(g2, 1), [2.0])
+L3 = likelihoodof(iid(g3, 1), [3.0])
+inner = joint_likelihood(L1, L2)
+L = joint_likelihood(inner, L3)
+lp = logdensityof(L, record(mu = 0.0, nu = 0.5, xi = 1.0))";
+    let m = parse_infer(src);
+    let out =
+        determinize(&m).expect("nested joint_likelihood must lower to a sum of leaf densities");
+    assert!(
+        flatppl_determinizer::is_flatpdl(&out).is_ok(),
+        "must be FlatPDL:\n{}",
+        flatppl_flatpir::write(&out)
+    );
+    let pir = flatppl_flatpir::write(&out);
+    // One density term per LEAF likelihood — the nested joint_likelihood flattens.
+    assert_eq!(
+        pir.matches("builtin_logdensityof").count(),
+        3,
+        "one density term per leaf likelihood (nested joint_likelihood flattened):\n{pir}"
+    );
+    // No residual measure / likelihood layer (including the nested combinator).
+    assert!(
+        !pir.contains("(joint_likelihood ")
+            && !pir.contains("(likelihoodof ")
+            && !pir.contains("(iid ")
+            && !pir.contains("(logdensityof "),
+        "measure/likelihood layer eliminated:\n{pir}"
     );
 }
 

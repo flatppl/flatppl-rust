@@ -127,7 +127,10 @@ pub(crate) fn lower_kchain_marginal(
     if branches.len() == 1 {
         return Ok(branches[0]);
     }
-    Ok(build_call(m, "logsumexp", &branches))
+    // §07 `logsumexp(v)` takes a single real VECTOR, not variadic scalars: wrap the
+    // per-atom branches in a `vector` literal so the emitted call is `logsumexp([…])`.
+    let branches_vec = build_call(m, "vector", &branches);
+    Ok(build_call(m, "logsumexp", &[branches_vec]))
 }
 
 // ---------------------------------------------------------------------------

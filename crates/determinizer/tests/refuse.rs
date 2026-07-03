@@ -287,6 +287,22 @@ lp = logdensityof(d, [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]])";
     );
 }
 
+// A GENUINELY dynamic iid size must still refuse (refuse-don't-mislower). The
+// determiniser now resolves an iid's repeat count from its const-evaluated
+// static domain shape (so a `lengthof(fixed_array)` size lowers), but an
+// `external(posintegers)` count is runtime-determined — const-eval yields a
+// `%dynamic` dim, not a static one — so the O(N) static unroll has no `N` and
+// must refuse rather than guess a size.
+#[test]
+fn iid_dynamic_size_refuses() {
+    let src = "\
+n = external(posintegers)
+d = iid(Normal(mu = 0.0, sigma = 1.0), n)
+lp = logdensityof(d, [0.5, -0.3, 1.2])";
+    let m = parse_infer(src);
+    determinize(&m).expect_err("iid with a genuinely dynamic (external) size must refuse");
+}
+
 // A θ parameter captured as a `functionof` / `kernelof`
 // reification INPUT (a `(coeff, %ref self coeff)` boundary entry) cannot be
 // inlined by the per-query θ substitution — `substitute_refs_by_name` walks
@@ -487,5 +503,80 @@ lp = logdensityof(lawof(record(a = a)), record(0.5))";
     assert!(
         err.reason.contains("positional args"),
         "refusal explains the value record carries positional args: {err:?}"
+    );
+}
+
+// `joint_likelihood` combines a POSITIONAL list of likelihoods (§06 "Combining
+// likelihoods": `log L(θ) = Σᵢ log Lᵢ(θ)`). A KEYWORD form (`joint_likelihood(a
+// = L1, b = L2)`, named components) has no §06 meaning — mirroring how a keyword
+// `joint(name = M, …)` is refused — so it must refuse, not silently drop the
+// named components or guess a combination order.
+#[test]
+fn joint_likelihood_keyword_form_refuses() {
+    let src = "\
+mu = elementof(reals)
+g1 = Normal(mu = mu, sigma = 1.0)
+g2 = Normal(mu = mu, sigma = 1.0)
+L1 = likelihoodof(iid(g1, 1), [1.0])
+L2 = likelihoodof(iid(g2, 1), [2.0])
+L = joint_likelihood(a = L1, b = L2)
+lp = logdensityof(L, record(mu = 0.0))";
+    let m = parse_infer(src);
+    let err = determinize(&m)
+        .expect_err("keyword joint_likelihood (named components) has no §06 form — refuse");
+    assert!(
+        err.construct.contains("joint_likelihood"),
+        "refusal names joint_likelihood: {err:?}"
+    );
+    assert!(
+        err.reason.contains("keyword joint_likelihood") && err.reason.contains("§06 form"),
+        "refusal explains the keyword form is not a §06 form: {err:?}"
+    );
+}
+
+// `joint_likelihood()` with NO components is not a well-formed §06 combination
+// (there is nothing to sum). The determiniser must refuse rather than fold an
+// empty term list into a degenerate `0.0`-density.
+#[test]
+fn joint_likelihood_empty_refuses() {
+    let src = "\
+mu = elementof(reals)
+L = joint_likelihood()
+lp = logdensityof(L, record(mu = 0.0))";
+    let m = parse_infer(src);
+    let err = determinize(&m)
+        .expect_err("joint_likelihood with no components has nothing to sum — refuse");
+    assert!(
+        err.construct.contains("joint_likelihood"),
+        "refusal names joint_likelihood: {err:?}"
+    );
+    assert!(
+        err.reason.contains("at least one component"),
+        "refusal explains a component is required: {err:?}"
+    );
+}
+
+// Every `joint_likelihood` component must itself be a likelihood (typically
+// `likelihoodof(K, obs)`, a name bound to one, or a nested `joint_likelihood`).
+// A component that resolves to a BARE measure (`Normal(…)`, not wrapped in
+// `likelihoodof`) cannot be scored as a per-component density at the shared θ,
+// so the recursion through the per-likelihood lowering must refuse
+// (refuse-don't-mislower) rather than treat the measure as a likelihood.
+#[test]
+fn joint_likelihood_non_likelihood_component_refuses() {
+    let src = "\
+mu = elementof(reals)
+g1 = Normal(mu = mu, sigma = 1.0)
+L1 = likelihoodof(iid(g1, 1), [1.0])
+bare = Normal(mu = mu, sigma = 1.0)
+L = joint_likelihood(L1, bare)
+lp = logdensityof(L, record(mu = 0.0))";
+    let m = parse_infer(src);
+    let err = determinize(&m).expect_err(
+        "a joint_likelihood component that is a bare measure, not a likelihood, must refuse",
+    );
+    assert!(
+        err.reason.contains("expected likelihoodof"),
+        "refusal explains the component is not a likelihood: {err:?}"
     );
 }

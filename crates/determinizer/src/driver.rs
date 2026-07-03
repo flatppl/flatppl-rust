@@ -425,6 +425,16 @@ const COMBINATOR_OPS: &[&str] = &[
     // baked-in `data`), so a binding referenced only by the now-lowered
     // `logdensityof` query is orphaned the same way.
     "likelihoodof",
+    // Likelihood-combining op (§06 "Combining likelihoods"): a
+    // `L = joint_likelihood(L1, …, Lk)` binding is unwrapped at the
+    // `logdensityof` entry (each component scored at the shared θ and summed), so
+    // it is orphaned the same way. It is REQUIRED on the op-name list — unlike a
+    // `likelihoodof`, a `joint_likelihood` may infer to `%deferred` (its obstype
+    // resolution is a separate infer limitation), so the `Measure`/`Likelihood`
+    // type arm would not catch it; without this, the dead `L` binding survives
+    // and keeps its components referenced, so the driver later trips over a
+    // standalone component `likelihoodof`.
+    "joint_likelihood",
 ];
 
 /// After a `logdensityof` rewrite, scan all bindings whose RHS is a measure
