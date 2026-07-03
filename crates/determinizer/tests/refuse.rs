@@ -30,34 +30,12 @@ lp = logdensityof(pp, record(y = 0.5))";
     );
 }
 
-// `rand(rng, M)` is the sample-side slice (spec §07): it threads an RNG through
-// the measure algebra and returns a (value, new_rng) tuple. The determiniser
-// lowering is density-only for this MVP; sampling is a later slice. The refusal
-// must name `rand` and make clear that sampling is deferred, not that there is
-// a generic missing rule.
-#[test]
-fn rand_refuses_with_sampling_deferred_message() {
-    let src = "\
-s = rnginit(0)
-r = rand(s, lawof(draw(Normal(mu = 0.0, sigma = 1.0))))";
-    let m = parse_infer(src);
-    let err = determinize(&m).expect_err("rand must refuse in the density-only MVP");
-    assert!(
-        err.construct.contains("rand"),
-        "refusal names rand: {err:?}"
-    );
-    assert!(
-        err.reason.contains("sampling") || err.reason.contains("rand"),
-        "refusal mentions sampling/rand as the deferred construct: {err:?}"
-    );
-    // Must not be the generic fallback — the message must reference the later-slice deferral.
-    assert!(
-        err.reason.contains("later")
-            || err.reason.contains("slice")
-            || err.reason.contains("deferred"),
-        "refusal explains this is a later-slice / deferred construct: {err:?}"
-    );
-}
+// Note: `rand` no longer refuses unconditionally — a single-draw
+// `rand(rng, lawof(record(x = draw(M))))` now lowers to `builtin_sample`
+// (`tests/sample_golden.rs::single_draw_samples_via_builtin_sample`). The
+// construct-specific sample-side refuse tests (the intractable/deferred
+// measure set, malformed `rand`/`draw` arity, etc.) live in the "sample path"
+// section at the end of this file.
 
 // Note: a variate-dependent (function) `weighted`/`logweighted` weight is NO
 // LONGER refused — per §06 "Density of composed measures" the weight may be a function
@@ -578,5 +556,358 @@ lp = logdensityof(L, record(mu = 0.0))";
     assert!(
         err.reason.contains("expected likelihoodof"),
         "refusal explains the component is not a likelihood: {err:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Sample path: the intractable / deferred set (spec §07 `rand` tractable set)
+// ---------------------------------------------------------------------------
+//
+// `sample.rs`'s `lower_measure_sample` dispatcher used to fall through every
+// unhandled measure-algebra op to one generic "unsupported measure construct"
+// message. These tests pin EXPLICIT, distinct refusals instead, so a refusal
+// tells the author WHY (outside rand's tractable set vs. simply not built
+// yet), not just THAT.
+//
+// `weighted`/`logweighted`/`bayesupdate`, `truncate`, and the deferred
+// combinators (`jointchain`/`kchain`/`superpose`/`pushfwd`) all reach their
+// refuse arm via `draw(<op>(...))` — the common surface shape — rather than
+// via `lower_measure_sample`'s own dispatch match (which only sees these ops
+// when they are NOT wrapped in `draw`: `lawof`'s direct argument, or an
+// un-drawn measure sitting in a record field). `sample.rs::lower_draw`
+// classifies its inner measure the same way for exactly this reason — see its
+// doc comment.
+
+// `d = draw(weighted(w, Normal(...)))`: a reweighted measure has no direct
+// sampling recipe (realizing its law needs a change-of-measure algorithm —
+// rejection/importance sampling, MCMC — out of scope for this MVP's exact
+// sample lowering). `logweighted`/`bayesupdate` share the same arm/message
+// (not separately tested — the match arm covers all three identically).
+#[test]
+fn sample_weighted_refuses() {
+    let src = "\
+s = rnginit(0)
+w = functionof(mul(2.0, _x_), x = _x_)
+m = weighted(w, Normal(mu = 0.0, sigma = 1.0))
+d = draw(m)
+draws = rand(s, lawof(record(d = d)))";
+    let m = parse_infer(src);
+    let err = determinize(&m).expect_err("sampling a weighted measure is intractable — refuse");
+    assert!(
+        err.reason.contains("weighted") || err.reason.contains("intractable"),
+        "refusal explains weighted is outside rand's tractable set: {err:?}"
+    );
+}
+
+// `lawof(c)` where `c` is a plain constant, not a draw: `lawof`'s OWN phase is
+// deterministic (spec §04 "Phase of the reified law" — it absorbs the
+// argument's stochasticity rather than propagating it), so the phase that must
+// be checked is the ARGUMENT's. `c`'s phase is `Fixed`, not `Stochastic`: there
+// is no generative `draw` subgraph for `rand` to re-run, so `rand` must refuse
+// rather than echo the constant back out as a "sample".
+#[test]
+fn sample_lawof_of_nonstochastic_refuses() {
+    let src = "\
+s = rnginit(0)
+c = 3.0
+draws = rand(s, lawof(c))";
+    let m = parse_infer(src);
+    let err = determinize(&m).expect_err("lawof of a non-stochastic value must refuse");
+    assert!(
+        err.reason.contains("stochastic"),
+        "refusal names the non-stochastic arg: {err:?}"
+    );
+}
+
+// `d = draw(truncate(MvNormal(...), S))`: the base is CONFIRMED multivariate
+// (`truncate(base, S)` infers `base`'s own domain — an `array` here, from
+// MvNormal's `VectorFromParam` domain). There is no general sampling recipe
+// for an arbitrary multivariate truncated region (rejection sampling is not
+// exact/closed-form in general), so this is intractable — a DIFFERENT
+// classification from the univariate case (pinned separately below), which is
+// plausible future work, just not yet built.
+#[test]
+fn sample_truncate_multivariate_refuses() {
+    let src = "\
+s = rnginit(0)
+d = draw(truncate(MvNormal(mu = [0.0, 0.0], cov = eye(2)), interval(-1.0, 1.0)))
+draws = rand(s, lawof(record(d = d)))";
+    let m = parse_infer(src);
+    let err = determinize(&m)
+        .expect_err("sampling a multivariate truncated measure is intractable — refuse");
+    assert!(
+        err.reason.contains("multivariate") && err.reason.contains("intractable"),
+        "refusal explains the multivariate truncation is outside rand's tractable set: {err:?}"
+    );
+}
+
+// `d = draw(truncate(Normal(...), S))`: the base is confirmed UNIVARIATE
+// (`domain = Scalar(Real)`), so this is NOT the intractable multivariate case
+// above — it falls into the deferred-combinator bucket (a closed-form or
+// rejection-sampling recipe is plausible future work, simply not built in this
+// vertical). Pins the OTHER branch of the truncate split, distinct from the
+// multivariate one.
+#[test]
+fn sample_truncate_univariate_deferred_refuses() {
+    let src = "\
+s = rnginit(0)
+d = draw(truncate(Normal(mu = 0.0, sigma = 1.0), interval(-1.0, 1.0)))
+draws = rand(s, lawof(record(d = d)))";
+    let m = parse_infer(src);
+    let err = determinize(&m).expect_err("univariate truncate sampling is not yet built — refuse");
+    assert!(
+        err.reason.contains("deferred"),
+        "refusal explains the univariate truncate is deferred, not intractable: {err:?}"
+    );
+    assert!(
+        !err.reason.contains("multivariate"),
+        "univariate truncate must not be classified multivariate: {err:?}"
+    );
+}
+
+// `d = draw(superpose(Normal(...), Normal(...)))`: `superpose` (measure
+// addition) is not conceptually intractable — a later vertical could thread
+// the rng through it — it is simply not built in this one (direct draws +
+// record-of-draws + shared ancestors). `jointchain`/`kchain`/`pushfwd` share
+// the identical match arm and message (not separately tested).
+#[test]
+fn sample_deferred_combinator_refuses() {
+    let src = "\
+s = rnginit(0)
+d = draw(superpose(Normal(mu = 0.0, sigma = 1.0), Normal(mu = 1.0, sigma = 1.0)))
+draws = rand(s, lawof(record(d = d)))";
+    let m = parse_infer(src);
+    let err =
+        determinize(&m).expect_err("sample lowering for superpose is deferred — refuse, not lower");
+    assert!(
+        err.reason.contains("deferred"),
+        "refusal explains the combinator's sample lowering is deferred: {err:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Sample path: malformed-shape guards in `lower_rand`/`lower_draw` (Task 1)
+// ---------------------------------------------------------------------------
+//
+// These guards shipped with Task 1 (`sample.rs::lower_rand`/`lower_draw`) but
+// had no dedicated test — added here per the same TDD discipline as the rest
+// of this file.
+
+// `rand` takes exactly 2 args (rng, measure); a 1-arg call is malformed.
+#[test]
+fn sample_rand_wrong_arity_refuses() {
+    let src = "\
+s = rnginit(0)
+draws = rand(s)";
+    let m = parse_infer(src);
+    let err = determinize(&m).expect_err("rand with the wrong arity must refuse");
+    assert!(
+        err.reason.contains("rand expects 2 args"),
+        "refusal explains the (rng, measure) arity: {err:?}"
+    );
+}
+
+// `rand(rng, M)` where `M` is not `lawof(...)` at all — `rand` samples the LAW
+// of a stochastic subgraph, so its second argument must be a `lawof(...)`.
+#[test]
+fn sample_rand_measure_not_lawof_refuses() {
+    let src = "\
+s = rnginit(0)
+draws = rand(s, Normal(mu = 0.0, sigma = 1.0))";
+    let m = parse_infer(src);
+    let err = determinize(&m).expect_err("rand's measure must be lawof(...) — refuse");
+    assert!(
+        err.reason.contains("lawof"),
+        "refusal names the lawof requirement: {err:?}"
+    );
+}
+
+// `draw` takes exactly 1 arg (the measure); a 2-arg call is malformed.
+#[test]
+fn sample_draw_wrong_arity_refuses() {
+    let src = "\
+s = rnginit(0)
+x = draw(Normal(mu = 0.0, sigma = 1.0), Normal(mu = 1.0, sigma = 1.0))
+draws = rand(s, lawof(record(x = x)))";
+    let m = parse_infer(src);
+    let err = determinize(&m).expect_err("draw with the wrong arity must refuse");
+    assert!(
+        err.reason.contains("draw expects 1 arg"),
+        "refusal explains the 1-arg draw shape: {err:?}"
+    );
+}
+
+// `draw(M)` where `M` is a constructor call with POSITIONAL args
+// (`Normal(0.0, 1.0)`, valid surface syntax) — `split_kernel_constructor`
+// builds the kernel-input record from named kwargs only (mirroring the
+// density side's identical guard), so a positional-arg constructor has no
+// kwargs to read and must refuse rather than emit a missing-parameter input.
+#[test]
+fn sample_draw_positional_constructor_refuses() {
+    let src = "\
+s = rnginit(0)
+x = draw(Normal(0.0, 1.0))
+draws = rand(s, lawof(record(x = x)))";
+    let m = parse_infer(src);
+    let err = determinize(&m)
+        .expect_err("a positional-arg constructor is not a valid sample leaf — refuse");
+    assert!(
+        err.reason.contains("built-in kernel constructor"),
+        "refusal explains the constructor-shape requirement: {err:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Sample path: an inline-hierarchical shared latent (untested boundary, T3 M6)
+// ---------------------------------------------------------------------------
+//
+// `record(c = draw(Normal(mu = mu, sigma = 1.0)))` where `mu = draw(Normal(0,
+// 10))` is a SEPARATE latent binding, referenced only from INSIDE the record
+// field's INLINE draw (not via a `(%ref self mu)` field of its own, and not
+// via a named binding consuming `mu` — c's own draw is written inline). Task
+// 3's shared-latent detection (`field_draw_binding`/
+// `requires_shared_binding_rewrite`) only recognizes a field whose OWN value
+// is `(%ref self <draw-binding>)`; an inline `draw(...)` field value returns
+// `None` from `field_draw_binding`, so this shape is NOT detected as
+// hierarchical and takes the independent-draws fold instead. That fold DOES
+// correctly sample `c`'s inline draw (its kernel input keeps its
+// `(%ref self mu)`, unresolved) — but `mu`'s OWN `draw`-binding is never
+// visited (nothing in the record's own field-list references `mu` directly),
+// so it survives the `rand` lowering as a bare, un-sampled, Stochastic-phase
+// `draw(...)` binding. The determiniser's own residual-measure-layer sweep
+// (`driver.rs`'s next scan iteration) then finds it and refuses with the
+// generic "no determinization rule" message — SAFE (no silent mislowering:
+// `mu` is never smuggled through as a `%deferred`/un-sampled ref), but
+// previously untested. This pins that the boundary refuses cleanly rather than
+// silently drops `mu`'s stochasticity.
+#[test]
+fn sample_inline_hierarchical_shared_latent_refuses() {
+    let src = "\
+s = rnginit(0)
+mu = draw(Normal(mu = 0.0, sigma = 10.0))
+draws = rand(s, lawof(record(c = draw(Normal(mu = mu, sigma = 1.0)))))";
+    let m = parse_infer(src);
+    let err = determinize(&m).expect_err(
+        "an inline-hierarchical shared latent (mu referenced only from inside c's inline draw) \
+         must refuse cleanly, not silently drop mu's stochasticity",
+    );
+    assert!(
+        err.construct.contains("draw"),
+        "refusal names the un-sampled mu draw binding: {err:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Sample path: destructured / rng-threaded `rand` refuses (whole-branch review
+// "silent mislowering" finding)
+// ---------------------------------------------------------------------------
+//
+// `lower_rand` only implements the VALUE-terminal convention: it returns the
+// bare sampled value and drops the advanced rngstate (spec §07 types
+// `rand(rstate, m)` as a tuple `(value, new_rstate)`, but this vertical never
+// builds the second slot). The parser's `v, s2 = rand(...)` multi-LHS sugar
+// (`lower_decomposition`, `crates/syntax/src/parser.rs`) lowers to `__0x1 =
+// rand(...); v = get(__0x1, 1); s2 = get(__0x1, 2)` — 1-based integer-literal
+// `get` projections off the synthetic tmp binding. Before this guard, once
+// `lower_rand` substituted the bare value in place of `__0x1`'s `rand(...)`
+// rhs, those `get(__0x1, 1)` / `get(__0x1, 2)` calls silently indexed a
+// NON-tuple: wrong/out-of-range FlatPDL emitted with no error, since the
+// determiniser does not re-infer after the rewrite and `is_flatpdl` is
+// structural. This is reachable from valid, in-tractable-set source — two
+// single-draw `rand`s threading the rng, the spec's own example shape
+// (07-functions.md). Refuse rather than mislower.
+#[test]
+fn destructured_rand_refuses() {
+    let src = "\
+s = rnginit(0)
+x = draw(Normal(mu = 0.0, sigma = 1.0))
+v, s2 = rand(s, lawof(record(x = x)))";
+    let m = parse_infer(src);
+    let err = determinize(&m).expect_err(
+        "a destructured rand (consuming the returned rngstate via get(_, k)) must refuse, not \
+         silently index the erased tuple",
+    );
+    assert!(
+        err.reason.contains("destructured") && err.reason.contains("rng-threaded"),
+        "refusal names the destructured/rng-threaded rand shape: {err:?}"
+    );
+    assert!(
+        err.reason.contains("value-terminal"),
+        "refusal points at the value-terminal convention this vertical does support: {err:?}"
+    );
+}
+
+// The same hazard reached via the realistic "thread the rng across two draws"
+// shape the spec's own §07 example uses: `s2` (the first `rand`'s advanced
+// rngstate) is destructured out and threaded into a second `rand`. Both draws
+// are individually within `rand`'s tractable set (single-draw records) — the
+// determiniser must still refuse, since it is the DESTRUCTURING of the first
+// `rand`'s result (not the tractability of either draw) that is unsupported.
+#[test]
+fn destructured_rand_rng_threaded_into_second_rand_refuses() {
+    let src = "\
+s = rnginit(0)
+x = draw(Normal(mu = 0.0, sigma = 1.0))
+v, s2 = rand(s, lawof(record(x = x)))
+y = draw(Normal(mu = 1.0, sigma = 1.0))
+w = rand(s2, lawof(record(y = y)))";
+    let m = parse_infer(src);
+    let err = determinize(&m).expect_err(
+        "threading a destructured rand's rngstate into a second rand must still refuse",
+    );
+    assert!(
+        err.reason.contains("destructured") && err.reason.contains("rng-threaded"),
+        "refusal names the destructured/rng-threaded rand shape: {err:?}"
+    );
+}
+
+// `get0(draws, 0)` / `get0(draws, 1)` — the 0-based spelling of the same
+// tuple-projection hazard a user could write directly (without the `v, s2 =`
+// decomposition sugar, which always emits 1-based `get`). Same guard, same
+// refusal.
+#[test]
+fn get0_tuple_projection_of_rand_refuses() {
+    let src = "\
+s = rnginit(0)
+x = draw(Normal(mu = 0.0, sigma = 1.0))
+draws = rand(s, lawof(record(x = x)))
+v = get0(draws, 0)";
+    let m = parse_infer(src);
+    let err = determinize(&m)
+        .expect_err("get0(draws, 0) is a tuple-slot projection and must refuse, not mislower");
+    assert!(
+        err.reason.contains("destructured") && err.reason.contains("rng-threaded"),
+        "refusal names the destructured/rng-threaded rand shape: {err:?}"
+    );
+}
+
+// A record-field STRING selector on a value-terminal rand's result
+// (`get(draws, "mu")` / `draws.mu`) is NOT a tuple projection — `get_type`
+// keys record-field access on `Node::Lit(Scalar::Str(_))`, never
+// `Scalar::Int` — so it must NOT trip the destructuring guard. This is the
+// "record fields accessed by string selector" shape the fix must not
+// over-refuse (the value-terminal convention must keep lowering).
+#[test]
+fn value_terminal_rand_field_access_by_string_still_lowers() {
+    let src = "\
+s = rnginit(0)
+mu = draw(Normal(mu = 0.0, sigma = 1.0))
+draws = rand(s, lawof(record(mu = mu)))
+out = draws.mu";
+    let m = parse_infer(src);
+    let out = determinize(&m)
+        .expect("a string-selector field access on a value-terminal rand must still lower");
+    let pir = flatppl_flatpir::write(&out);
+    assert!(
+        pir.contains("builtin_sample"),
+        "the single draw still lowers to builtin_sample:\n{pir}"
+    );
+    assert!(
+        !pir.contains("(draw ") && !pir.contains("(lawof ") && !pir.contains("(rand "),
+        "measure/sample-surface layer eliminated:\n{pir}"
+    );
+    assert!(
+        flatppl_determinizer::is_flatpdl(&out).is_ok(),
+        "must be FlatPDL:\n{pir}"
     );
 }

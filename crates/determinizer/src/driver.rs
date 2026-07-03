@@ -99,8 +99,16 @@ pub fn determinize(m: &Module) -> Result<Module, RefuseError> {
 /// outermost-measure scan (β-law `lawof`, or a refusal target). Without this,
 /// the source-order scan would hit a `draw` binding first and refuse before the
 /// query that would have legalised it.
+///
+/// **`rand` gets the same early-probe treatment**, for the identical reason: a
+/// `rand(rng, lawof(record(x = x)))` query samples (and thereby legalises) the
+/// `x = draw(...)` binding it closes over, so it must fire before the
+/// source-order scan reaches that `draw` binding on its own and refuses it.
 fn find_measure_node(m: &Module) -> Option<(BindingId, NodeId)> {
     if let Some(hit) = find_op_node(m, "logdensityof") {
+        return Some(hit);
+    }
+    if let Some(hit) = find_op_node(m, "rand") {
         return Some(hit);
     }
     for (bid, binding) in m.bindings() {
@@ -190,20 +198,18 @@ fn apply_rule(m: &mut Module, bid: BindingId, target_node: NodeId) -> Result<(),
         return Ok(());
     }
 
-    // --- rand / builtin_sample: sampling-side slice — deferred ---
-    // `rand(rng, M)` threads an RNG through the measure algebra and returns a
-    // (value, new_rng) tuple (spec §07). The determiniser MVP lowers the density
-    // side only; sampling/`rand` is a later slice whose implementation requires
-    // RNG-threading and shared-ancestor preservation. Refuse immediately with a
-    // clear message rather than falling through to the generic fallback.
+    // --- rand / builtin_sample: sampling-side slice ---
+    // `rand(rng, lawof(M))` threads an RNG through M's generative subgraph,
+    // replacing each `draw(mᵢ)` with `builtin_sample(rngᵢ, mᵢ, inputᵢ)` (spec §07).
     if is_op(m, target_node, "rand") {
-        return Err(RefuseError {
-            node: target_node,
-            construct: "rand".to_string(),
-            reason: "sampling/`rand` is a later slice; this MVP lowers density only — \
-                     deferred to the sample-side determinizer (spec §07 / RNG-threading)"
-                .to_string(),
-        });
+        let new_root = crate::sample::lower_rand(m, bid, target_node)?;
+        let new_rhs = substitute_in_tree(m, m.binding(bid).rhs, target_node, new_root);
+        m.set_binding_rhs(bid, new_rhs);
+        // As with `logdensityof`, sampling a draw leaves its `x = draw(...)`
+        // binding referenced by nothing (the sampled value is a fresh inline
+        // node, not a ref to `x`) — sweep it out before the next scan.
+        sweep_dead_measure_bindings(m);
+        return Ok(());
     }
 
     // --- β-law: lawof(draw ?m) → ?m ---
