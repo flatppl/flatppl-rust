@@ -23,7 +23,7 @@ use crate::density::{
 };
 use crate::refuse::RefuseError;
 use flatppl_core::{
-    Binding, BindingId, Module, NamedKind, Node, NodeId, Ref, RefNs, Scalar, Symbol,
+    Binding, BindingId, Module, NamedKind, Node, NodeId, Phase, Ref, RefNs, Scalar, Symbol, Type,
 };
 
 /// `rand(rng, lawof(x))` → deterministic sample of x's generative subgraph.
@@ -40,6 +40,23 @@ pub(crate) fn lower_rand(m: &mut Module, rand_node: NodeId) -> Result<NodeId, Re
     // a non-stochastic (Dirac) argument (spec: lawof of a deterministic point).
     let inner = strip_lawof(m, measure)
         .ok_or_else(|| refuse(measure, m, "rand's measure must be lawof(<stochastic>)"))?;
+    // `lawof(?x)` itself infers to a DETERMINISTIC phase (spec §04 "Phase of the
+    // reified law": lawof absorbs its argument's stochasticity rather than
+    // propagating it — `crates/infer/src/ops.rs`'s `"lawof"` phase arm traces
+    // `law_phase(?x)`, never `Phase::Stochastic`). So the phase that matters here
+    // is `?x`'s own, not `lawof(?x)`'s: a `?x` that is not Stochastic-phase (e.g.
+    // `lawof(3.0)`, or `lawof(record(a = a))` where `a` is a plain constant, not a
+    // draw) has no generative `draw` subgraph for `rand` to re-run — refuse rather
+    // than silently echo the constant back out as a "sample".
+    if !matches!(m.phase_of(inner), Some(Phase::Stochastic)) {
+        return Err(refuse(
+            inner,
+            m,
+            "lawof's argument is not stochastic-phase (a Dirac/deterministic point) — rand \
+             samples the law of a STOCHASTIC subgraph, so lawof(<non-stochastic>) has no \
+             generative draw to sample; refuse rather than mislower",
+        ));
+    }
     let (value, _rng_out) = lower_measure_sample(m, inner, rng)?;
     Ok(value)
 }
@@ -64,18 +81,135 @@ fn lower_measure_sample(
     match op {
         Some("record") => lower_record_of_draws_sample(m, resolved, rng),
         Some("draw") => lower_draw(m, resolved, rng),
-        // Intractable / deferred set — a later task fills the specific messages
-        // (combinators, kchain, etc.), mirroring density's refuse-don't-mislower
-        // stance for the sampling side.
-        _ => Err(refuse(
-            resolved,
-            m,
-            "sample lowering: unsupported measure construct",
-        )),
+        // Intractable (outside rand's tractable set, spec §07) / deferred
+        // (simply not built in this vertical) — see `classify_intractable_or_deferred`.
+        // This dispatch arm is reached when one of these ops is `lawof`'s direct
+        // argument, or a NOT-yet-drawn measure sitting in a record field (the
+        // uniform per-field fold in `lower_record_of_draws_sample`/
+        // `lower_shared_record_sample` calls back into this function for every
+        // field, regardless of what op the field's value resolves to). The far
+        // more common surface shape — `draw(weighted(...))`,
+        // `draw(truncate(...))`, etc. — is classified the SAME way from inside
+        // `lower_draw`, since that path never reaches this `match` at all (see
+        // that function's doc comment).
+        _ => Err(
+            classify_intractable_or_deferred(m, resolved).unwrap_or_else(|| {
+                refuse(
+                    resolved,
+                    m,
+                    "sample lowering: unsupported measure construct",
+                )
+            }),
+        ),
     }
 }
 
+/// Classify a RESOLVED measure node as one of the ops this sample vertical
+/// intentionally does not lower, or `None` if `resolved`'s builtin head is not
+/// one of them (the caller then falls back to its own generic refuse).
+///
+/// Two buckets, per spec §07's `rand` tractable set:
+/// * **Intractable** — `weighted`/`logweighted`/`bayesupdate` (a reweighted
+///   measure has no direct sampling recipe; realizing its law needs a
+///   change-of-measure algorithm — rejection/importance sampling, MCMC — which
+///   is out of scope for this MVP's exact, deterministic lowering), and a
+///   `truncate` whose base is CONFIRMED multivariate (no general sampling
+///   recipe for an arbitrary multivariate truncated region either).
+/// * **Deferred** — `jointchain`/`kchain`/`superpose`/`pushfwd`, and a
+///   univariate `truncate`: none of these are conceptually intractable (a
+///   later vertical could add inverse-CDF/rejection truncated sampling, or
+///   thread the rng through a Kleisli/joint chain), they are simply not built
+///   in this one (direct draws + record-of-draws + shared ancestors).
+///
+/// Shared by [`lower_measure_sample`]'s dispatcher and [`lower_draw`]'s
+/// constructor-shape fallback — see the latter's doc comment for why both call
+/// sites need it.
+fn classify_intractable_or_deferred(m: &Module, resolved: NodeId) -> Option<RefuseError> {
+    match builtin_name(m, resolved) {
+        Some("weighted") | Some("logweighted") | Some("bayesupdate") => {
+            Some(refuse_weighted_family(m, resolved))
+        }
+        Some("truncate") => Some(refuse_truncate(m, resolved)),
+        Some("jointchain") | Some("kchain") | Some("superpose") | Some("pushfwd") => {
+            Some(refuse_deferred_combinator(m, resolved))
+        }
+        _ => None,
+    }
+}
+
+/// `weighted`/`logweighted`/`bayesupdate`: outside `rand`'s tractable set
+/// (spec §07) — see [`classify_intractable_or_deferred`].
+fn refuse_weighted_family(m: &Module, id: NodeId) -> RefuseError {
+    refuse(
+        id,
+        m,
+        "sampling a weighted/logweighted/bayesupdate measure is intractable (spec §07: \
+         outside rand's tractable set — no direct sampling recipe for an arbitrary \
+         reweighted measure) — refuse rather than mislower",
+    )
+}
+
+/// `truncate(base, S)`: dispatch on whether `base`'s domain is CONFIRMED
+/// multivariate (intractable) or not (deferred — see
+/// [`classify_intractable_or_deferred`]).
+fn refuse_truncate(m: &Module, id: NodeId) -> RefuseError {
+    if truncate_is_confirmed_multivariate(m, id) {
+        refuse(
+            id,
+            m,
+            "sampling a multivariate truncated measure is intractable (spec §07: outside \
+             rand's tractable set — no general sampling recipe for an arbitrary multivariate \
+             truncation) — refuse rather than mislower",
+        )
+    } else {
+        refuse_deferred_combinator(m, id)
+    }
+}
+
+/// Is `truncate_node`'s inferred domain CONFIRMED multivariate (`Array`/
+/// `TVector`, e.g. a truncated `MvNormal`)? `truncate(base, S)` infers to
+/// `fresh_measure(arg_ty(base))` (`crates/infer/src/ops.rs`), so the truncate
+/// node's OWN domain already reflects `base`'s — no need to resolve `base`
+/// separately. `false` for a confirmed-scalar OR an unresolved/deferred domain:
+/// unlike the density-side cat-slice hazard this deliberately does NOT mirror
+/// (`lower_joint`'s fail-closed "unconfirmed ⇒ refuse too"), there is no silent
+/// mislowering risk here in either direction — an unresolved-domain `truncate`
+/// simply falls through to the (still-a-refusal) deferred-combinator message
+/// instead of the intractable one.
+fn truncate_is_confirmed_multivariate(m: &Module, truncate_node: NodeId) -> bool {
+    matches!(
+        m.type_of(truncate_node),
+        Some(Type::Measure { domain, .. })
+            if matches!(domain.as_ref(), Type::Array { .. } | Type::TVector { .. })
+    )
+}
+
+/// `jointchain`/`kchain`/`superpose`/`pushfwd`, and a univariate `truncate`
+/// (via [`refuse_truncate`]): sample lowering for these is simply not built in
+/// this vertical — see [`classify_intractable_or_deferred`].
+fn refuse_deferred_combinator(m: &Module, id: NodeId) -> RefuseError {
+    refuse(
+        id,
+        m,
+        "sample lowering for this combinator is deferred to the full sample path (this \
+         vertical covers direct draws + record-of-draws + shared ancestors)",
+    )
+}
+
 /// `draw(kernel(kwargs))` → `builtin_sample` leaf.
+///
+/// **`draw(<op>(...))` is the common surface shape for an intractable/deferred
+/// measure** — `draw(weighted(w, M))`, `draw(truncate(M, S))`,
+/// `draw(superpose(...))`, etc. — far more common than one of these ops
+/// appearing un-drawn (`lower_measure_sample`'s own dispatch arm, reached only
+/// when the op is `lawof`'s direct argument or an un-drawn record field). This
+/// function's inner measure is read straight off `draw`'s argument, never
+/// routed back through [`lower_measure_sample`]'s dispatcher, so WITHOUT the
+/// classification below, `draw(weighted(...))` would instead fall through to
+/// [`split_constructor`]'s generic "expected a built-in kernel constructor"
+/// message: true (a `weighted(...)` call is not a leaf constructor), but not
+/// the ACTIONABLE reason. Classify the resolved inner measure the same way
+/// [`lower_measure_sample`] does first, so this shape gets the same message.
 fn lower_draw(
     m: &mut Module,
     draw_node: NodeId,
@@ -89,6 +223,10 @@ fn lower_draw(
         }
         c.args[0]
     };
+    let (inner_resolved, _) = resolve_ref_one(m, inner_measure);
+    if let Some(err) = classify_intractable_or_deferred(m, inner_resolved) {
+        return Err(err);
+    }
     let (ctor, kernel_input) = split_constructor(m, inner_measure).ok_or_else(|| {
         refuse(
             inner_measure,
