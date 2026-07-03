@@ -15,7 +15,7 @@ use crate::density::{
     split_kernel_constructor,
 };
 use crate::refuse::RefuseError;
-use flatppl_core::{Module, Node, NodeId, Scalar, Symbol};
+use flatppl_core::{Module, NamedKind, Node, NodeId, Scalar, Symbol};
 
 /// `rand(rng, lawof(x))` → deterministic sample of x's generative subgraph.
 pub(crate) fn lower_rand(m: &mut Module, rand_node: NodeId) -> Result<NodeId, RefuseError> {
@@ -125,10 +125,21 @@ fn build_sample_term(
 }
 
 /// `record(f = <draw-ref>, …)`: sample each field's draw in field order,
-/// threading the rng, and reassemble the record of sampled values. (Task 1:
-/// single field verified end-to-end by the golden test; the loop already
-/// generalises to multiple fields — a later task adds shared-ancestor
-/// preservation via binding rewrite.)
+/// threading the rng, and reassemble the record of sampled values. Verified
+/// for >=2 independent draws (Task 2's golden): each field's sample consumes
+/// the *previous* field's advanced rng (`cur = next`), not the original `rng`
+/// re-read from scratch — a later task adds shared-ancestor preservation via
+/// binding rewrite.
+///
+/// Guards mirror `density::match_independent_record`'s defensive checks
+/// (refuse-don't-mislower discipline): a field-keyed measure record has no
+/// positional args and only `%field` named entries. The positional-args guard
+/// IS reachable via valid surface syntax (`record(a)` inside a `rand`/`lawof`,
+/// same as on the density side — see
+/// `tests/sample_golden.rs::positional_measure_record_sample_refuses`); the
+/// non-`%field` named-arg guard is not (the parser hardcodes `NamedKind::Field`
+/// for every named arg inside a `record(...)` call), but is kept so the
+/// function stays defensive as later tasks extend it.
 fn lower_record_of_draws_sample(
     m: &mut Module,
     record_node: NodeId,
@@ -137,7 +148,25 @@ fn lower_record_of_draws_sample(
     let fields: Vec<(Symbol, NodeId)> = {
         let c = expect_builtin_call(m, record_node, "record")
             .ok_or_else(|| refuse(record_node, m, "expected record"))?;
-        c.named.iter().map(|n| (n.name, n.value)).collect()
+        if !c.args.is_empty() {
+            return Err(refuse(
+                record_node,
+                m,
+                "record with positional args is not a field-keyed product",
+            ));
+        }
+        let mut fields = Vec::with_capacity(c.named.len());
+        for n in c.named.iter() {
+            if n.kind != NamedKind::Field {
+                return Err(refuse(
+                    record_node,
+                    m,
+                    "non-field named arg in measure record",
+                ));
+            }
+            fields.push((n.name, n.value));
+        }
+        fields
     };
     let mut cur = rng;
     let mut out_fields = Vec::with_capacity(fields.len());
