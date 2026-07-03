@@ -6,6 +6,7 @@ mod density;
 mod driver;
 mod marginal;
 mod refuse;
+mod sample;
 pub use conformance::is_flatpdl;
 pub use driver::determinize;
 pub use refuse::{NonConformKind, NonConformance, RefuseError};

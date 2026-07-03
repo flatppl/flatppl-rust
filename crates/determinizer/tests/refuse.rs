@@ -30,34 +30,12 @@ lp = logdensityof(pp, record(y = 0.5))";
     );
 }
 
-// `rand(rng, M)` is the sample-side slice (spec §07): it threads an RNG through
-// the measure algebra and returns a (value, new_rng) tuple. The determiniser
-// lowering is density-only for this MVP; sampling is a later slice. The refusal
-// must name `rand` and make clear that sampling is deferred, not that there is
-// a generic missing rule.
-#[test]
-fn rand_refuses_with_sampling_deferred_message() {
-    let src = "\
-s = rnginit(0)
-r = rand(s, lawof(draw(Normal(mu = 0.0, sigma = 1.0))))";
-    let m = parse_infer(src);
-    let err = determinize(&m).expect_err("rand must refuse in the density-only MVP");
-    assert!(
-        err.construct.contains("rand"),
-        "refusal names rand: {err:?}"
-    );
-    assert!(
-        err.reason.contains("sampling") || err.reason.contains("rand"),
-        "refusal mentions sampling/rand as the deferred construct: {err:?}"
-    );
-    // Must not be the generic fallback — the message must reference the later-slice deferral.
-    assert!(
-        err.reason.contains("later")
-            || err.reason.contains("slice")
-            || err.reason.contains("deferred"),
-        "refusal explains this is a later-slice / deferred construct: {err:?}"
-    );
-}
+// Note: `rand` no longer refuses unconditionally — a single-draw
+// `rand(rng, lawof(record(x = draw(M))))` now lowers to `builtin_sample`
+// (`tests/sample_golden.rs::single_draw_samples_via_builtin_sample`). The
+// construct-specific sample-side refuse tests (unsupported measure shapes,
+// malformed `rand`/`lawof` arity, etc.) are added alongside the combinator /
+// shared-ancestor sample lowering in a later task.
 
 // Note: a variate-dependent (function) `weighted`/`logweighted` weight is NO
 // LONGER refused — per §06 "Density of composed measures" the weight may be a function

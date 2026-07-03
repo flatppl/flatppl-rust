@@ -1283,6 +1283,39 @@ fn variate_kind(t: &Type) -> Option<VariateKind> {
     }
 }
 
+/// Read a primitive constructor call `Ctor(kw1 = v1, kw2 = v2, ...)` into its
+/// constructor symbol and keyword arguments. `None` if `node` is not a `Call`,
+/// not builtin-headed, carries positional args, or has a non-kwarg named arg —
+/// any of which means `node` is not a primitive distribution/kernel constructor
+/// eligible for `builtin_logdensityof` / `builtin_sample`.
+///
+/// Shared by [`build_density_term`] (the density-side kernel/kernel_input build)
+/// and the sample-side leaf (`sample::split_constructor`) — both need exactly
+/// this constructor-symbol-plus-kwargs read before building their respective
+/// `builtin_*` call.
+pub(crate) fn split_kernel_constructor(
+    m: &Module,
+    node: NodeId,
+) -> Option<(Symbol, Vec<(Symbol, NodeId)>)> {
+    let Node::Call(c) = m.node(node) else {
+        return None;
+    };
+    let CallHead::Builtin(sym) = c.head else {
+        return None;
+    };
+    if !c.args.is_empty() {
+        return None;
+    }
+    let mut kwargs = Vec::with_capacity(c.named.len());
+    for n in c.named.iter() {
+        if n.kind != NamedKind::Kwarg {
+            return None;
+        }
+        kwargs.push((n.name, n.value));
+    }
+    Some((sym, kwargs))
+}
+
 pub(crate) fn build_density_term(
     m: &mut Module,
     measure: NodeId,
@@ -1311,33 +1344,13 @@ pub(crate) fn build_density_term(
         }
     }
 
-    let (ctor_sym, kwargs): (Symbol, Vec<(Symbol, NodeId)>) = {
-        let Node::Call(c) = m.node(measure) else {
-            return Err(refuse(measure, m, "primitive measure must be a Call node"));
-        };
-        let CallHead::Builtin(sym) = c.head else {
-            return Err(refuse(
-                measure,
-                m,
-                "user / module-qualified constructor not yet supported",
-            ));
-        };
-        if !c.args.is_empty() {
-            return Err(refuse(
-                measure,
-                m,
-                "primitive constructor with positional args not supported",
-            ));
-        }
-        let mut kwargs = Vec::with_capacity(c.named.len());
-        for n in c.named.iter() {
-            if n.kind != NamedKind::Kwarg {
-                return Err(refuse(measure, m, "non-kwarg named arg in constructor"));
-            }
-            kwargs.push((n.name, n.value));
-        }
-        (sym, kwargs)
-    };
+    let (ctor_sym, kwargs) = split_kernel_constructor(m, measure).ok_or_else(|| {
+        refuse(
+            measure,
+            m,
+            "primitive measure must be a built-in constructor call with only keyword arguments",
+        )
+    })?;
 
     let kernel = m.alloc(Node::Const(ctor_sym));
     let kernel_input = build_record(m, &kwargs);
@@ -1419,7 +1432,7 @@ fn build_user_call(m: &mut Module, callee: NodeId, arg: NodeId) -> NodeId {
 }
 
 /// Allocate a `record(%field name value ...)` call from `(name, value)` pairs.
-fn build_record(m: &mut Module, fields: &[(Symbol, NodeId)]) -> NodeId {
+pub(crate) fn build_record(m: &mut Module, fields: &[(Symbol, NodeId)]) -> NodeId {
     let named: Vec<NamedArg> = fields
         .iter()
         .map(|&(name, value)| NamedArg {
@@ -1449,7 +1462,7 @@ fn fold_add(m: &mut Module, terms: &[NodeId]) -> NodeId {
 }
 
 /// If `id` is `draw(mᵢ)`, return `mᵢ`; otherwise `None`.
-fn draw_argument(m: &Module, id: NodeId) -> Option<NodeId> {
+pub(crate) fn draw_argument(m: &Module, id: NodeId) -> Option<NodeId> {
     let c = expect_builtin_call(m, id, "draw")?;
     if c.args.len() != 1 {
         return None;
@@ -1481,7 +1494,7 @@ pub(crate) fn expect_builtin_call<'a>(m: &'a Module, id: NodeId, name: &str) -> 
 }
 
 /// Return the builtin op name for `id`, or `None` if it is not a builtin call.
-fn builtin_name(m: &Module, id: NodeId) -> Option<&str> {
+pub(crate) fn builtin_name(m: &Module, id: NodeId) -> Option<&str> {
     if let Node::Call(c) = m.node(id) {
         if let CallHead::Builtin(sym) = c.head {
             return Some(m.resolve(sym));
@@ -1522,7 +1535,7 @@ pub(crate) fn refuse(id: NodeId, m: &Module, reason: &str) -> RefuseError {
 }
 
 /// A refusal for an unhandled measure op (for the combinator refused-list).
-fn refuse_op(id: NodeId, m: &Module) -> RefuseError {
+pub(crate) fn refuse_op(id: NodeId, m: &Module) -> RefuseError {
     let op = builtin_name(m, id).unwrap_or("unknown").to_string();
     RefuseError {
         node: id,
