@@ -3,19 +3,28 @@
 //! subgraph with each `draw(mᵢ)` replaced by `builtin_sample(rngᵢ, mᵢ, inputᵢ)`,
 //! threading one RNG state sequentially in dependency order.
 //!
-//! This task (single-draw leaf + entry) builds the sampled value as a fresh
-//! inline node rather than rewriting the `draw` binding in place — a later
-//! task adds binding rewrite for shared-ancestor preservation (a latent used
-//! twice sampled once and shared by name). A `record` field's `draw` (inline
-//! or reached via a `(%ref self x)` binding reference) is resolved uniformly
-//! by [`lower_measure_sample`]'s single `resolve_ref_one` call, mirroring
+//! Independent draws (a `record` of leaf draws each referenced once) are built
+//! as fresh inline sample nodes and the orphaned `draw` bindings are swept. A
+//! **shared latent** — a `draw`-binding referenced by more than one consumer
+//! (two record fields, or another draw's kernel input, i.e. a hierarchical
+//! model like `y = draw(Normal(mu = mu, …))`) — must be sampled ONCE and shared
+//! by name: [`lower_shared_record_sample`] rewrites each such latent's
+//! `draw`-BINDING in place to a single `builtin_sample` (via
+//! [`Module::set_binding_rhs`], mirroring `density::lower_record_of_draws`) and
+//! lets consumers reference it as `(%ref self mu)`. Inlining a shared latent
+//! per consumer would re-draw it and break shared-ancestor identity
+//! (measure-algebra-audit H7/M4). A `record` field's `draw` (inline or reached
+//! via a `(%ref self x)` binding reference) is resolved uniformly by
+//! [`lower_measure_sample`]'s single `resolve_ref_one` call, mirroring
 //! `density::lower_measure_density`'s dispatch.
 use crate::density::{
-    build_call, build_record, builtin_name, expect_builtin_call, refuse, resolve_ref_one,
-    split_kernel_constructor,
+    build_call, build_record, builtin_name, draw_argument, expect_builtin_call, refuse,
+    resolve_ref_one, split_kernel_constructor,
 };
 use crate::refuse::RefuseError;
-use flatppl_core::{Module, NamedKind, Node, NodeId, Scalar, Symbol};
+use flatppl_core::{
+    Binding, BindingId, Module, NamedKind, Node, NodeId, Ref, RefNs, Scalar, Symbol,
+};
 
 /// `rand(rng, lawof(x))` → deterministic sample of x's generative subgraph.
 pub(crate) fn lower_rand(m: &mut Module, rand_node: NodeId) -> Result<NodeId, RefuseError> {
@@ -124,12 +133,14 @@ fn build_sample_term(
     (value, new_rng)
 }
 
-/// `record(f = <draw-ref>, …)`: sample each field's draw in field order,
-/// threading the rng, and reassemble the record of sampled values. Verified
-/// for >=2 independent draws (Task 2's golden): each field's sample consumes
-/// the *previous* field's advanced rng (`cur = next`), not the original `rng`
-/// re-read from scratch — a later task adds shared-ancestor preservation via
-/// binding rewrite.
+/// `record(f = <draw-ref>, …)`: sample the record's draws, threading the rng, and
+/// reassemble the record of sampled values. If any latent is shared (a
+/// `draw`-binding used by two fields or by another draw's kernel input — see
+/// [`requires_shared_binding_rewrite`]) this delegates to
+/// [`lower_shared_record_sample`], which samples each latent ONCE. Otherwise the
+/// independent-draws fold suffices: each field's sample consumes the *previous*
+/// field's advanced rng (`cur = next`), not the original `rng` re-read from
+/// scratch (verified for >=2 independent draws — Task 2's golden).
 ///
 /// Guards mirror `density::match_independent_record`'s defensive checks
 /// (refuse-don't-mislower discipline): a field-keyed measure record has no
@@ -168,6 +179,22 @@ fn lower_record_of_draws_sample(
         }
         fields
     };
+    // A `draw`-binding referenced by more than one consumer (two fields here, or
+    // another draw's kernel input) is a SHARED latent: the per-field inline fold
+    // below would sample it once per consumer, re-drawing it and breaking
+    // shared-ancestor identity (measure-algebra-audit H7/M4). Detect that and route
+    // to the binding-rewrite path, which samples each latent once.
+    let field_bids: Vec<Option<BindingId>> = fields
+        .iter()
+        .map(|&(_, v)| field_draw_binding(m, v))
+        .collect();
+    if requires_shared_binding_rewrite(m, &field_bids) {
+        return lower_shared_record_sample(m, &fields, &field_bids, rng);
+    }
+
+    // Independent-draws fold (verified for >=2 independent draws): each field's
+    // sample consumes the *previous* field's advanced rng (`cur = next`), not the
+    // original `rng` re-read from scratch.
     let mut cur = rng;
     let mut out_fields = Vec::with_capacity(fields.len());
     for (name, val) in fields {
@@ -178,4 +205,223 @@ fn lower_record_of_draws_sample(
         cur = next;
     }
     Ok((build_record(m, &out_fields), cur))
+}
+
+/// If `value` is `(%ref self name)` pointing at a binding whose RHS is `draw(…)`,
+/// return that binding — the latent this field consumes. Inline-draw and
+/// non-draw-ref fields return `None` (they cannot be a *shared* ancestor: an
+/// inline draw has a single syntactic site).
+fn field_draw_binding(m: &Module, value: NodeId) -> Option<BindingId> {
+    if let Node::Ref(Ref {
+        ns: RefNs::SelfMod,
+        name,
+    }) = m.node(value)
+    {
+        let bid = m.binding_by_name(*name)?;
+        if draw_argument(m, m.binding(bid).rhs).is_some() {
+            return Some(bid);
+        }
+    }
+    None
+}
+
+/// Does this record need the shared-latent binding-rewrite path (rather than the
+/// independent-draws inline fold)? Yes iff either:
+///
+/// * a `draw`-binding is referenced by two or more fields (`record(a = mu, b =
+///   mu)`), or
+/// * a field's draw is *hierarchical* — its kernel input references another
+///   `draw`-binding (`y1 = draw(Normal(mu = mu, …))`), which then MUST stay a
+///   named binding rather than be inlined.
+///
+/// Either way the naive fold would re-draw the shared latent (or leave the
+/// referenced latent an un-lowered `draw`). Independent leaf draws hit neither.
+fn requires_shared_binding_rewrite(m: &Module, field_bids: &[Option<BindingId>]) -> bool {
+    let seeds: Vec<BindingId> = field_bids.iter().flatten().copied().collect();
+    // A latent referenced by two or more fields.
+    for (i, &a) in seeds.iter().enumerate() {
+        if seeds[i + 1..].contains(&a) {
+            return true;
+        }
+    }
+    // A hierarchical draw whose kernel input references another draw-binding.
+    seeds.iter().any(|&bid| {
+        draw_argument(m, m.binding(bid).rhs)
+            .map(|measure| !referenced_draw_bindings(m, measure).is_empty())
+            .unwrap_or(false)
+    })
+}
+
+/// Sample a record whose fields reference (possibly shared) `draw`-bindings,
+/// preserving shared-ancestor identity. Each latent in the generative cone is
+/// rewritten to a SINGLE `builtin_sample` bound to a fresh synthetic name; its
+/// value (`get0(sample, 0)`) replaces the latent's `draw`-binding RHS and its
+/// advanced rng (`get0(sample, 1)`) threads to the next latent. Consumers keep
+/// referencing the latent as `(%ref self mu)`, so the shared latent is sampled
+/// once and read by name everywhere.
+///
+/// Binding the full `(value, rng)` sample TUPLE to a name (and projecting both
+/// slots by-name-ref) is essential: the FlatPIR writer has no common-subexpression
+/// sharing, so an inline sample node shared by NodeId would be textually
+/// re-expanded at each `get0` site (re-drawing the latent, and inflating the
+/// `builtin_sample` count). This mirrors the parser's `lower_decomposition`, which
+/// binds a stochastic source to a shared synthetic name so its slot projections
+/// read the *same* draw.
+fn lower_shared_record_sample(
+    m: &mut Module,
+    fields: &[(Symbol, NodeId)],
+    field_bids: &[Option<BindingId>],
+    rng: NodeId,
+) -> Result<(NodeId, NodeId), RefuseError> {
+    // Latents in dependency (topological) order: a latent is sampled after every
+    // draw-binding its kernel input references (spec §07: thread one RNG state
+    // sequentially in dependency order).
+    let seeds: Vec<BindingId> = field_bids.iter().flatten().copied().collect();
+    let cone = topo_draw_cone(m, &seeds);
+
+    let mut cur = rng;
+    for &bid in &cone {
+        // Read the draw's inner measure BEFORE rewriting the binding (the measure
+        // node is a distinct arena node from the `draw` binding RHS, so it survives
+        // the rewrite; a later latent's `(%ref self mu)` resolves by name to the
+        // now-sampled value).
+        let measure = draw_argument(m, m.binding(bid).rhs)
+            .ok_or_else(|| refuse(m.binding(bid).rhs, m, "shared-sample: expected a draw"))?;
+        let (ctor, kernel_input) = split_constructor(m, measure).ok_or_else(|| {
+            refuse(
+                measure,
+                m,
+                "shared-sample latent: expected a built-in kernel constructor",
+            )
+        })?;
+
+        // sample = builtin_sample(rng_cur, ctor, input), bound to a fresh name so
+        // both slots reference it by name (no CSE re-expansion — see fn doc).
+        let sample = build_call(m, "builtin_sample", &[cur, ctor, kernel_input]);
+        let sample_name = fresh_sample_name(m, bid);
+        m.add_binding(Binding {
+            name: sample_name,
+            rhs: sample,
+            doc: None,
+            public: false,
+            synthetic: true,
+        });
+
+        // Rewrite the latent's draw-BINDING to the sampled value; consumers keep
+        // their `(%ref self <latent>)` and resolve to it by name.
+        let value = get_slot(m, sample_name, 0);
+        m.set_binding_rhs(bid, value);
+
+        // Thread the advanced rng from the SAME sample binding into the next latent.
+        cur = get_slot(m, sample_name, 1);
+    }
+
+    // Assemble the record. A field that references a (now-rewritten) latent keeps
+    // its `(%ref self <latent>)` — the shared sample, read by name. Any other field
+    // (an inline draw, or a ref to a non-draw binding) is sampled inline, threading
+    // the rng after the cone.
+    let mut out_fields = Vec::with_capacity(fields.len());
+    for (&(name, val), &bid_opt) in fields.iter().zip(field_bids) {
+        if bid_opt.is_some() {
+            out_fields.push((name, val));
+        } else {
+            let (v, next) = lower_measure_sample(m, val, cur)?;
+            out_fields.push((name, v));
+            cur = next;
+        }
+    }
+    Ok((build_record(m, &out_fields), cur))
+}
+
+/// `get0((%ref self <name>), slot)` — project slot `slot` of the sample tuple
+/// bound to `name`, referencing the binding BY NAME (so the writer does not
+/// re-expand the underlying `builtin_sample`). `get0` is the zero-based container
+/// accessor; there is no separate `get1` primitive (see [`build_sample_term`]).
+fn get_slot(m: &mut Module, name: Symbol, slot: i64) -> NodeId {
+    let sample_ref = m.alloc(Node::Ref(Ref {
+        ns: RefNs::SelfMod,
+        name,
+    }));
+    let idx = m.alloc(Node::Lit(Scalar::Int(slot)));
+    build_call(m, "get0", &[sample_ref, idx])
+}
+
+/// A fresh private synthetic binding name for a latent's sample tuple, following
+/// the parser's `__`-prefixed synthetic convention (`bind_name`) and deduped
+/// against existing names.
+fn fresh_sample_name(m: &mut Module, latent: BindingId) -> Symbol {
+    let latent_name = m.binding(latent).name;
+    let base = m.resolve(latent_name).to_string();
+    let mut candidate = format!("__sample_{base}");
+    let mut n = 1;
+    loop {
+        let sym = m.intern(&candidate);
+        if m.binding_by_name(sym).is_none() {
+            return sym;
+        }
+        candidate = format!("__sample_{base}_{n}");
+        n += 1;
+    }
+}
+
+/// The `draw`-bindings referenced by `(%ref self name)` anywhere in the subtree
+/// at `root` (a draw's kernel input), in first-encounter order. Only bindings
+/// whose RHS is a `draw(…)` count — a reference to a deterministic binding is not
+/// a latent dependency.
+fn referenced_draw_bindings(m: &Module, root: NodeId) -> Vec<BindingId> {
+    let mut found: Vec<BindingId> = Vec::new();
+    let mut queue = vec![root];
+    let mut qi = 0;
+    while qi < queue.len() {
+        let id = queue[qi];
+        qi += 1;
+        if let Node::Ref(Ref {
+            ns: RefNs::SelfMod,
+            name,
+        }) = m.node(id)
+        {
+            if let Some(bid) = m.binding_by_name(*name) {
+                if draw_argument(m, m.binding(bid).rhs).is_some() && !found.contains(&bid) {
+                    found.push(bid);
+                }
+            }
+        }
+        m.for_each_child(id, |c| queue.push(c));
+    }
+    found
+}
+
+/// The generative cone of draw-bindings reachable from `seeds` (the fields'
+/// latents), in dependency (topological) order — each latent appears AFTER every
+/// draw-binding its kernel input references, so RNG threading and the
+/// sample-once rewrite proceed dependencies-first. Bindings form a DAG (FlatPPL
+/// is single-assignment and control-flow-free); a repeated node is emitted once.
+fn topo_draw_cone(m: &Module, seeds: &[BindingId]) -> Vec<BindingId> {
+    let mut order: Vec<BindingId> = Vec::new();
+    let mut visited: Vec<BindingId> = Vec::new();
+    for &s in seeds {
+        visit_draw_cone(m, s, &mut order, &mut visited);
+    }
+    order
+}
+
+/// Post-order DFS helper for [`topo_draw_cone`]: mark `bid` visited on entry
+/// (so a shared latent reached by several dependents is emitted once), recurse
+/// into its kernel-input draw dependencies, then push `bid`.
+fn visit_draw_cone(
+    m: &Module,
+    bid: BindingId,
+    order: &mut Vec<BindingId>,
+    visited: &mut Vec<BindingId>,
+) {
+    if visited.contains(&bid) {
+        return;
+    }
+    visited.push(bid);
+    if let Some(measure) = draw_argument(m, m.binding(bid).rhs) {
+        for dep in referenced_draw_bindings(m, measure) {
+            visit_draw_cone(m, dep, order, visited);
+        }
+        order.push(bid);
+    }
 }
