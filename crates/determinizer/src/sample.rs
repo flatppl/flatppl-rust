@@ -27,7 +27,17 @@ use flatppl_core::{
 };
 
 /// `rand(rng, lawof(x))` → deterministic sample of x's generative subgraph.
-pub(crate) fn lower_rand(m: &mut Module, rand_node: NodeId) -> Result<NodeId, RefuseError> {
+///
+/// `bid` is the binding whose subtree contains `rand_node` (the driver's
+/// `apply_rule` already has it) — i.e. the name a `v, s2 = rand(...)`
+/// decomposition or a bare `draws = rand(...)` assignment binds the `rand`
+/// call to. It is used ONLY to check [`rand_result_is_destructured`] before
+/// lowering; see that function's doc for why.
+pub(crate) fn lower_rand(
+    m: &mut Module,
+    bid: BindingId,
+    rand_node: NodeId,
+) -> Result<NodeId, RefuseError> {
     let (rng, measure) = {
         let c = expect_builtin_call(m, rand_node, "rand")
             .ok_or_else(|| refuse(rand_node, m, "expected rand"))?;
@@ -36,6 +46,21 @@ pub(crate) fn lower_rand(m: &mut Module, rand_node: NodeId) -> Result<NodeId, Re
         }
         (c.args[0], c.args[1])
     };
+    // Refuse a DESTRUCTURED / rng-threaded `rand` before doing anything else —
+    // see `rand_result_is_destructured`'s doc for the mislowering this guards
+    // against. This vertical only supports the value-terminal convention
+    // (`draws = rand(...)` used as a value, or its record fields read by a
+    // STRING selector); the spec's full `(value, new_rstate)` tuple contract
+    // is deferred.
+    if rand_result_is_destructured(m, bid) {
+        return Err(refuse(
+            rand_node,
+            m,
+            "destructured / rng-threaded `rand` (consuming the returned rngstate) is not \
+             supported in this vertical — only a value-terminal `rand(...)`; the spec's \
+             `(value, new_rstate)` tuple form is deferred to the full sample path",
+        ));
+    }
     // Strip lawof: rand samples the LAW of a stochastic subgraph. Refuse lawof of
     // a non-stochastic (Dirac) argument (spec: lawof of a deterministic point).
     let inner = strip_lawof(m, measure)
@@ -59,6 +84,75 @@ pub(crate) fn lower_rand(m: &mut Module, rand_node: NodeId) -> Result<NodeId, Re
     }
     let (value, _rng_out) = lower_measure_sample(m, inner, rng)?;
     Ok(value)
+}
+
+/// Is `rand_bid`'s value DESTRUCTURED — read via an INTEGER-literal tuple
+/// projection (`get(_, k)` / `get0(_, k)`) rather than used as a bare value?
+///
+/// `rand(rng, lawof(x))` infers to `Tuple([domain(x), RngState])` (spec §07;
+/// `crates/infer/src/ops.rs`'s `"rand"` phase arm), but [`lower_rand`] only
+/// implements the VALUE-terminal convention: it returns the bare sampled value
+/// and drops the advanced rng (`_rng_out` above), never emitting the second
+/// tuple slot at all. The parser's `v, s2 = rand(...)` decomposition sugar
+/// (`lower_decomposition`, `crates/syntax/src/parser.rs`) lowers to exactly
+/// `__0x1 = rand(...); v = get(__0x1, 1); s2 = get(__0x1, 2)` — a synthetic
+/// tmp binding (name pattern `__0x<hex>`) plus 1-based integer-literal `get`
+/// projections off it. A user can write the same shape directly with the
+/// 0-based `get0(draws, 0)` / `get0(draws, 1)`. Either way, once `lower_rand` erases
+/// the tuple and substitutes the bare value in `rand_bid`'s place, a surviving
+/// `get(<rand-value>, 1)` (or `get0(<rand-value>, 0)`, etc.) indexes a
+/// NON-tuple — wrong/out-of-range FlatPDL emitted SILENTLY, since the
+/// determiniser does not re-infer after the rewrite and `is_flatpdl` is
+/// structural (whole-branch review finding: "silent mislowering"). Refuse
+/// rather than mislower.
+///
+/// A STRING-literal selector (`get(draws, "mu")` / `draws.mu`, record-field
+/// access) is a DIFFERENT selector shape — `get_type`'s `Type::Record` arm
+/// keys on `Node::Lit(Scalar::Str(_))`, never `Scalar::Int` — so it is not a
+/// tuple projection and must NOT trip this guard: the value-terminal
+/// convention (`draws` standing in for the record `lower_rand` returns) still
+/// needs its fields readable by name.
+fn rand_result_is_destructured(m: &Module, rand_bid: BindingId) -> bool {
+    let name = m.binding(rand_bid).name;
+    m.bindings()
+        .any(|(_, binding)| subtree_has_int_projection_of(m, binding.rhs, name))
+}
+
+/// BFS the subtree at `root` for a `get`/`get0` call whose first argument is
+/// `(%ref self name)` and whose selector argument is an integer literal — see
+/// [`rand_result_is_destructured`]. Mirrors the worklist-over-`for_each_child`
+/// idiom used throughout this crate (e.g. this file's own
+/// [`referenced_draw_bindings`], `driver.rs`'s `subtree_contains_ref`).
+fn subtree_has_int_projection_of(m: &Module, root: NodeId, name: Symbol) -> bool {
+    let mut queue = vec![root];
+    let mut qi = 0;
+    while qi < queue.len() {
+        let id = queue[qi];
+        qi += 1;
+        if is_int_projection_of(m, id, name) {
+            return true;
+        }
+        m.for_each_child(id, |c| queue.push(c));
+    }
+    false
+}
+
+/// True iff `id` is `get(subject, k)` or `get0(subject, k)` where `subject` is
+/// `(%ref self name)` and `k` is an integer literal — a tuple-slot projection
+/// of the binding named `name`, as opposed to a string-selector field access.
+fn is_int_projection_of(m: &Module, id: NodeId, name: Symbol) -> bool {
+    let Some(c) = expect_builtin_call(m, id, "get").or_else(|| expect_builtin_call(m, id, "get0"))
+    else {
+        return false;
+    };
+    if c.args.len() < 2 {
+        return false;
+    }
+    let subject_is_name = matches!(
+        m.node(c.args[0]),
+        Node::Ref(Ref { ns: RefNs::SelfMod, name: n }) if *n == name
+    );
+    subject_is_name && matches!(m.node(c.args[1]), Node::Lit(Scalar::Int(_)))
 }
 
 /// `lawof(?m)` → `?m`, resolving one level of `(%ref self x)` indirection first.

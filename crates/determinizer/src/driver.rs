@@ -202,7 +202,7 @@ fn apply_rule(m: &mut Module, bid: BindingId, target_node: NodeId) -> Result<(),
     // `rand(rng, lawof(M))` threads an RNG through M's generative subgraph,
     // replacing each `draw(mᵢ)` with `builtin_sample(rngᵢ, mᵢ, inputᵢ)` (spec §07).
     if is_op(m, target_node, "rand") {
-        let new_root = crate::sample::lower_rand(m, target_node)?;
+        let new_root = crate::sample::lower_rand(m, bid, target_node)?;
         let new_rhs = substitute_in_tree(m, m.binding(bid).rhs, target_node, new_root);
         m.set_binding_rhs(bid, new_rhs);
         // As with `logdensityof`, sampling a draw leaves its `x = draw(...)`

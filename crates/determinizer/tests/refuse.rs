@@ -796,3 +796,118 @@ draws = rand(s, lawof(record(c = draw(Normal(mu = mu, sigma = 1.0)))))";
         "refusal names the un-sampled mu draw binding: {err:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Sample path: destructured / rng-threaded `rand` refuses (whole-branch review
+// "silent mislowering" finding)
+// ---------------------------------------------------------------------------
+//
+// `lower_rand` only implements the VALUE-terminal convention: it returns the
+// bare sampled value and drops the advanced rngstate (spec §07 types
+// `rand(rstate, m)` as a tuple `(value, new_rstate)`, but this vertical never
+// builds the second slot). The parser's `v, s2 = rand(...)` multi-LHS sugar
+// (`lower_decomposition`, `crates/syntax/src/parser.rs`) lowers to `__0x1 =
+// rand(...); v = get(__0x1, 1); s2 = get(__0x1, 2)` — 1-based integer-literal
+// `get` projections off the synthetic tmp binding. Before this guard, once
+// `lower_rand` substituted the bare value in place of `__0x1`'s `rand(...)`
+// rhs, those `get(__0x1, 1)` / `get(__0x1, 2)` calls silently indexed a
+// NON-tuple: wrong/out-of-range FlatPDL emitted with no error, since the
+// determiniser does not re-infer after the rewrite and `is_flatpdl` is
+// structural. This is reachable from valid, in-tractable-set source — two
+// single-draw `rand`s threading the rng, the spec's own example shape
+// (07-functions.md). Refuse rather than mislower.
+#[test]
+fn destructured_rand_refuses() {
+    let src = "\
+s = rnginit(0)
+x = draw(Normal(mu = 0.0, sigma = 1.0))
+v, s2 = rand(s, lawof(record(x = x)))";
+    let m = parse_infer(src);
+    let err = determinize(&m).expect_err(
+        "a destructured rand (consuming the returned rngstate via get(_, k)) must refuse, not \
+         silently index the erased tuple",
+    );
+    assert!(
+        err.reason.contains("destructured") && err.reason.contains("rng-threaded"),
+        "refusal names the destructured/rng-threaded rand shape: {err:?}"
+    );
+    assert!(
+        err.reason.contains("value-terminal"),
+        "refusal points at the value-terminal convention this vertical does support: {err:?}"
+    );
+}
+
+// The same hazard reached via the realistic "thread the rng across two draws"
+// shape the spec's own §07 example uses: `s2` (the first `rand`'s advanced
+// rngstate) is destructured out and threaded into a second `rand`. Both draws
+// are individually within `rand`'s tractable set (single-draw records) — the
+// determiniser must still refuse, since it is the DESTRUCTURING of the first
+// `rand`'s result (not the tractability of either draw) that is unsupported.
+#[test]
+fn destructured_rand_rng_threaded_into_second_rand_refuses() {
+    let src = "\
+s = rnginit(0)
+x = draw(Normal(mu = 0.0, sigma = 1.0))
+v, s2 = rand(s, lawof(record(x = x)))
+y = draw(Normal(mu = 1.0, sigma = 1.0))
+w = rand(s2, lawof(record(y = y)))";
+    let m = parse_infer(src);
+    let err = determinize(&m).expect_err(
+        "threading a destructured rand's rngstate into a second rand must still refuse",
+    );
+    assert!(
+        err.reason.contains("destructured") && err.reason.contains("rng-threaded"),
+        "refusal names the destructured/rng-threaded rand shape: {err:?}"
+    );
+}
+
+// `get0(draws, 0)` / `get0(draws, 1)` — the 0-based spelling of the same
+// tuple-projection hazard a user could write directly (without the `v, s2 =`
+// decomposition sugar, which always emits 1-based `get`). Same guard, same
+// refusal.
+#[test]
+fn get0_tuple_projection_of_rand_refuses() {
+    let src = "\
+s = rnginit(0)
+x = draw(Normal(mu = 0.0, sigma = 1.0))
+draws = rand(s, lawof(record(x = x)))
+v = get0(draws, 0)";
+    let m = parse_infer(src);
+    let err = determinize(&m)
+        .expect_err("get0(draws, 0) is a tuple-slot projection and must refuse, not mislower");
+    assert!(
+        err.reason.contains("destructured") && err.reason.contains("rng-threaded"),
+        "refusal names the destructured/rng-threaded rand shape: {err:?}"
+    );
+}
+
+// A record-field STRING selector on a value-terminal rand's result
+// (`get(draws, "mu")` / `draws.mu`) is NOT a tuple projection — `get_type`
+// keys record-field access on `Node::Lit(Scalar::Str(_))`, never
+// `Scalar::Int` — so it must NOT trip the destructuring guard. This is the
+// "record fields accessed by string selector" shape the fix must not
+// over-refuse (the value-terminal convention must keep lowering).
+#[test]
+fn value_terminal_rand_field_access_by_string_still_lowers() {
+    let src = "\
+s = rnginit(0)
+mu = draw(Normal(mu = 0.0, sigma = 1.0))
+draws = rand(s, lawof(record(mu = mu)))
+out = draws.mu";
+    let m = parse_infer(src);
+    let out = determinize(&m)
+        .expect("a string-selector field access on a value-terminal rand must still lower");
+    let pir = flatppl_flatpir::write(&out);
+    assert!(
+        pir.contains("builtin_sample"),
+        "the single draw still lowers to builtin_sample:\n{pir}"
+    );
+    assert!(
+        !pir.contains("(draw ") && !pir.contains("(lawof ") && !pir.contains("(rand "),
+        "measure/sample-surface layer eliminated:\n{pir}"
+    );
+    assert!(
+        flatppl_determinizer::is_flatpdl(&out).is_ok(),
+        "must be FlatPDL:\n{pir}"
+    );
+}
