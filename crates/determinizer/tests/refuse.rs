@@ -6,20 +6,24 @@ fn parse_infer(src: &str) -> flatppl_core::Module {
     m
 }
 
-// kchain(M, K) with a CONTINUOUS latent (Normal) is a non-enumerable marginal —
-// the integral ∫ densityof(K(a), v) dM(a) has no closed form in this MVP. The
-// determiniser must REFUSE (naming `kchain` + "non-enumerable"), never emit a
-// Monte-Carlo / −logN approximation. (The conjugate closed-form table is a
-// later follow-on.)
+// kchain(M, K) with a CONTINUOUS latent that is NOT a recognised conjugate pair
+// stays a non-enumerable marginal — the integral ∫ densityof(K(a), v) dM(a) has
+// no closed form the determiniser handles. It must REFUSE (naming `kchain` +
+// "non-enumerable"), never emit a Monte-Carlo / −logN approximation.
+//
+// Here the latent feeds the likelihood's `sigma` (a Normal prior on a standard
+// deviation), which is NOT the Normal–Normal mean conjugacy the conjugate table
+// recognises — so it must still refuse. (The mean-conjugate case that DOES lower
+// in closed form is covered in `tests/conjugate_golden.rs`.)
 #[test]
-fn kchain_continuous_latent_refuses() {
+fn kchain_non_conjugate_continuous_latent_refuses() {
     let src = "\
 z = draw(Normal(mu = 0.0, sigma = 1.0))
-k = kernelof(record(y = draw(Normal(mu = z, sigma = 1.0))), z = z)
+k = kernelof(record(y = draw(Normal(mu = 1.0, sigma = z))), z = z)
 pp = kchain(lawof(record(z = z)), k)
 lp = logdensityof(pp, record(y = 0.5))";
     let m = parse_infer(src);
-    let err = determinize(&m).expect_err("continuous-latent kchain must refuse, not lower");
+    let err = determinize(&m).expect_err("non-conjugate continuous-latent kchain must refuse");
     assert!(
         err.construct.contains("kchain"),
         "refusal names kchain: {err:?}"

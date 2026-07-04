@@ -35,11 +35,15 @@
 //!   §07 "Measure kernel evaluation primitives"; valid only for a univariate-continuous-normalized
 //!   base — the transport is defined only for continuous built-in kernels and use
 //!   of an undefined transport is a static error, §07 "Measure kernel evaluation primitives");
+//!   when `M = logweighted(x → logdensityof(g2, x), g1)` is a pointwise product of
+//!   two Gaussians (`g1`, `g2` both `Normal`), → `sub(add(density(g1, v),
+//!   density(g2, v)), logZ)` with the Gaussian-overlap `logZ = density(Normal(mu =
+//!   μ2, sigma = sqrt(σ1² + σ2²)), μ1)` (§08 Normal);
 //!   **refuses** for any other `M` — a `truncate` whose `base` is unnormalized
 //!   (e.g. `Lebesgue`, where the CDF-Z identity does not hold), or normalized but
 //!   discrete (`Binomial`/`Poisson`/`Categorical`) or multivariate (`MvNormal`),
-//!   for which `touniform` is undefined (no closed-form mass rule; `totalmass` is
-//!   OUT of FlatPDL).
+//!   for which `touniform` is undefined, and any `logweighted` that is not a
+//!   Gaussian product (no closed-form mass rule; `totalmass` is OUT of FlatPDL).
 //! - `truncate(M, S)` → `ifelse(in(v, S), density(M, v), neg(inf))` (the `_ in R`
 //!   membership builtin, which infers to a boolean — `elementof` is a set-valued
 //!   parameter declaration, not a membership predicate).
@@ -100,8 +104,8 @@
 
 use crate::refuse::RefuseError;
 use flatppl_core::{
-    BindingId, Call, CallHead, Dim, Mass, Module, NamedArg, NamedKind, Node, NodeId, Ref, RefNs,
-    Scalar, ScalarType, Symbol, Type,
+    BindingId, Call, CallHead, Dim, Inputs, Mass, Module, NamedArg, NamedKind, Node, NodeId, Ref,
+    RefNs, Scalar, ScalarType, Symbol, Type,
 };
 
 // ---------------------------------------------------------------------------
@@ -727,9 +731,20 @@ fn lower_superpose(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Re
 ///     kernel, has no defined `touniform` head — it refuses with its OWN
 ///     leaf-constructor message ([`base_is_measure_combinator`]).
 ///
+/// * If `M = logweighted(x → logdensityof(g2, x), g1)` is a POINTWISE PRODUCT OF
+///   TWO GAUSSIANS (`g1`, `g2` both `Normal`), the normalizer is the Gaussian
+///   overlap integral — itself a Gaussian (§08 Normal):
+///   `Z = ∫ N(x; μ1, σ1)·N(x; μ2, σ2) dx = N(μ1; μ2, sqrt(σ1² + σ2²))`. So the
+///   density is `logdensityof(g1, v) + logdensityof(g2, v) − logZ`, with
+///   `logZ = logdensityof(Normal(mu = μ2, sigma = sqrt(σ1² + σ2²)), μ1)`
+///   ([`recognize_gaussian_product`]). Only this exact shape takes the path —
+///   any other `logweighted` base (a non-`Gaussian` factor, or ℓ scoring g2 at
+///   something other than the reified argument) falls through to the refuse.
+///
 /// Any other unnormalized `M` (`Finite`, `LocallyFinite`, a non-truncate
-/// combinator, …) has no closed-form mass rule here, so we **refuse** rather
-/// than emit `totalmass` (refuse-don't-mislower).
+/// combinator, a `logweighted` that is not a Gaussian product, …) has no
+/// closed-form mass rule here, so we **refuse** rather than emit `totalmass`
+/// (refuse-don't-mislower).
 ///
 /// The emitted `−logZ` inherits §06's `Z ≠ 0` precondition ("`normalize` … with
 /// `Z = totalmass(M)` finite and nonzero", §06 "Density of composed measures"): a
@@ -894,6 +909,46 @@ fn lower_normalize(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Re
         }
     }
 
+    // Closed-form Z for a POINTWISE PRODUCT OF TWO GAUSSIANS:
+    // `normalize(logweighted(x → logdensityof(g2, x), g1))` with `g1`, `g2` both
+    // `Normal` is `N(x; μ1, σ1)·N(x; μ2, σ2) / Z`, whose normalizer is the
+    // Gaussian overlap integral — itself a Gaussian (§08 Normal):
+    //   Z = ∫ N(x; μ1, σ1)·N(x; μ2, σ2) dx = N(μ1; μ2, sqrt(σ1² + σ2²)).
+    // So `logdensityof(prod, v)` = logdensityof(g1, v) + logdensityof(g2, v) −
+    // logZ, with logZ = logdensityof(Normal(mu = μ2, sigma = sqrt(σ1² + σ2²)), μ1)
+    // (symmetric in g1/g2). The recognizer below matches ONLY this exact shape
+    // (both factors `Normal`, ℓ a reified `x → logdensityof(g2, x)` scoring g2 AT
+    // the variate); any OTHER `logweighted` base falls through to the refuse (a
+    // non-Gaussian factor has no Gaussian-overlap Z — refuse-don't-mislower).
+    if let Some(gp) = recognize_gaussian_product(m, m_inner_resolved) {
+        // g1's density at the variate. `gp.g1` is the base's ORIGINAL (typed)
+        // `Normal` constructor, so `build_density_term`'s domain-kind guard fires
+        // if the variate is somehow not the Gaussians' scalar domain — the product
+        // here is over a scalar variate, so a non-scalar `v` refuses (both factors
+        // share `v`, so g1's guard suffices).
+        let t1 = build_density_term(m, gp.g1, v)?;
+        // g2's density at the variate. g2's factor is read as `(μ2, σ2)` value
+        // nodes (the reified body may already be lowered to `builtin_logdensityof`,
+        // so there is no g2 constructor node to reuse); rebuild the constructor.
+        let g2_ctor = build_normal_ctor(m, gp.mu2, gp.sigma2);
+        let t2 = build_density_term(m, g2_ctor, v)?;
+        // logZ stddev = sqrt(add(pow(σ1, 2), pow(σ2, 2))): the overlap variance is
+        // the SUM of the two variances (§08 Normal), not their difference.
+        let two_a = m.alloc(Node::Lit(Scalar::Real(2.0)));
+        let var1 = build_call(m, "pow", &[gp.sigma1, two_a]);
+        let two_b = m.alloc(Node::Lit(Scalar::Real(2.0)));
+        let var2 = build_call(m, "pow", &[gp.sigma2, two_b]);
+        let var_sum = build_call(m, "add", &[var1, var2]);
+        let overlap_sigma = build_call(m, "sqrt", &[var_sum]);
+        // logZ = logdensityof(Normal(mu = μ2, sigma = overlap_sigma), μ1). The
+        // synthetic constructor is freshly built (untyped) so `build_density_term`
+        // scores it as a leaf Normal at the scalar point μ1.
+        let overlap_normal = build_normal_ctor(m, gp.mu2, overlap_sigma);
+        let log_z = build_density_term(m, overlap_normal, gp.mu1)?;
+        let sum = build_call(m, "add", &[t1, t2]);
+        return Ok(build_call(m, "sub", &[sum, log_z]));
+    }
+
     // No closed-form mass rule for an unnormalized measure in this MVP.
     Err(RefuseError {
         node,
@@ -902,6 +957,189 @@ fn lower_normalize(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Re
                  `totalmass` is not FlatPDL"
             .to_string(),
     })
+}
+
+/// A recognized `normalize(logweighted(…))` pointwise product of two Gaussians.
+/// `g1` is the base's ORIGINAL (typed) `Normal` constructor node — scored at the
+/// variate directly, so its domain-kind guard applies. The four `mu`/`sigma`
+/// value nodes drive the closed-form overlap Z ([`lower_normalize`]); g2 is read
+/// as loose `(μ2, σ2)` nodes rather than a constructor because the reified body
+/// may already be lowered to `builtin_logdensityof` (no g2 constructor survives).
+struct GaussianProduct {
+    g1: NodeId,
+    mu1: NodeId,
+    sigma1: NodeId,
+    mu2: NodeId,
+    sigma2: NodeId,
+}
+
+/// Recognize `logweighted(ℓ, base)` as a pointwise product of two Gaussians:
+/// `base` a `Normal` constructor (g1) and `ℓ` a reified `x → logdensityof(g2, x)`
+/// with `g2` a `Normal` scored AT the reified argument `x`. Returns g1 and the
+/// two factors' `mu`/`sigma` nodes, or `None` if the shape does not match (any
+/// other `logweighted` base keeps [`lower_normalize`]'s refuse —
+/// refuse-don't-mislower). Purely structural (`&Module`); the caller builds IR.
+fn recognize_gaussian_product(m: &Module, logweighted: NodeId) -> Option<GaussianProduct> {
+    let c = expect_builtin_call(m, logweighted, "logweighted")?;
+    if c.args.len() != 2 {
+        return None;
+    }
+    let (lw_node, base) = (c.args[0], c.args[1]);
+
+    // Factor 1 (g1): the logweighted base is a `Normal` constructor.
+    let (g1, g1_kwargs) = normal_ctor(m, base)?;
+    let mu1 = find_kwarg(m, &g1_kwargs, "mu")?;
+    let sigma1 = find_kwarg(m, &g1_kwargs, "sigma")?;
+
+    // Factor 2 (g2): ℓ is a reified function `x → logdensityof(g2, x)` — a
+    // `functionof` whose single positional body scores a `Normal` AT the reified
+    // argument `x` (not at a constant, which would make ℓ a constant weight, not a
+    // second Gaussian factor).
+    let (lw_resolved, _) = resolve_ref_one(m, lw_node);
+    let f = expect_builtin_call(m, lw_resolved, "functionof")?;
+    if f.args.len() != 1 {
+        return None;
+    }
+    // The reified callable's single input placeholder (`x`); g2 must be scored at
+    // exactly this ref, so ℓ(x) = logdensityof(g2, x).
+    let arg_ref = match &f.inputs {
+        Some(Inputs::Spec(entries)) if entries.len() == 1 => entries[0].1,
+        _ => return None,
+    };
+    let (mu2, sigma2) = gaussian_factor_scored_at(m, f.args[0], arg_ref)?;
+
+    Some(GaussianProduct {
+        g1,
+        mu1,
+        sigma1,
+        mu2,
+        sigma2,
+    })
+}
+
+/// Read the `(mu, sigma)` of a `Normal` factor scored at the reified argument
+/// `arg_ref`, from the reified body — which may be in EITHER form, since the
+/// driver lowers the inner `logdensityof` independently and binding order does
+/// not fix which fires first:
+/// * not-yet-lowered `logdensityof(Normal(mu, sigma), arg)`, or
+/// * already-lowered `builtin_logdensityof(Normal, record(mu, sigma), arg)`.
+///
+/// In both forms the point the factor is scored at must be exactly `arg_ref`
+/// (the lambda argument) — scoring at anything else means ℓ is not the second
+/// Gaussian factor of a product, so we return `None` and the caller refuses.
+/// Likewise, `mu`/`sigma` themselves must NOT reference `arg_ref`: e.g.
+/// `Normal(mu = x, sigma = 1.0)` scored at `x` is `N(x; x, 1)`, a constant, not a
+/// second Gaussian *factor* of `x` — g1's params are checked outside the lambda,
+/// so only g2 needs the guard.
+fn gaussian_factor_scored_at(m: &Module, body: NodeId, arg_ref: Ref) -> Option<(NodeId, NodeId)> {
+    // Not-yet-lowered: logdensityof(Normal(...), arg).
+    if let Some(ld) = expect_builtin_call(m, body, "logdensityof") {
+        if ld.args.len() != 2 || !is_ref_to(m, ld.args[1], arg_ref) {
+            return None;
+        }
+        let (_g2, kwargs) = normal_ctor(m, ld.args[0])?;
+        let mu2 = find_kwarg(m, &kwargs, "mu")?;
+        let sigma2 = find_kwarg(m, &kwargs, "sigma")?;
+        if references_ref(m, mu2, arg_ref) || references_ref(m, sigma2, arg_ref) {
+            return None;
+        }
+        return Some((mu2, sigma2));
+    }
+    // Already-lowered: builtin_logdensityof(Normal, record(mu, sigma), arg).
+    if let Some(bl) = expect_builtin_call(m, body, "builtin_logdensityof") {
+        if bl.args.len() != 3
+            || !is_normal_const(m, bl.args[0])
+            || !is_ref_to(m, bl.args[2], arg_ref)
+        {
+            return None;
+        }
+        let mu2 = find_field(m, bl.args[1], "mu")?;
+        let sigma2 = find_field(m, bl.args[1], "sigma")?;
+        if references_ref(m, mu2, arg_ref) || references_ref(m, sigma2, arg_ref) {
+            return None;
+        }
+        return Some((mu2, sigma2));
+    }
+    None
+}
+
+/// If `node` (after one ref hop) is a bare-kwarg `Normal(...)` constructor,
+/// return `(constructor_node, kwargs)`; otherwise `None`.
+fn normal_ctor(m: &Module, node: NodeId) -> Option<(NodeId, Vec<(Symbol, NodeId)>)> {
+    let (resolved, _) = resolve_ref_one(m, node);
+    let (sym, kwargs) = split_kernel_constructor(m, resolved)?;
+    if m.resolve(sym) != "Normal" {
+        return None;
+    }
+    Some((resolved, kwargs))
+}
+
+/// True iff `node` is exactly the reference `target` (the reified argument).
+fn is_ref_to(m: &Module, node: NodeId, target: Ref) -> bool {
+    matches!(m.node(node), Node::Ref(r) if *r == target)
+}
+
+/// Does the subtree rooted at `node` reference `target` anywhere (mirrors
+/// `marginal::references_input`, but keyed on a `Ref` rather than a boundary-input
+/// `Symbol`)? Used to reject a g2 `mu`/`sigma` that still depends on the lambda
+/// argument — such a param is not a constant second Gaussian factor, it's an
+/// expression of the variate, so the "product of two Gaussians" shape doesn't apply.
+fn references_ref(m: &Module, node: NodeId, target: Ref) -> bool {
+    is_ref_to(m, node, target)
+        || m.node(node)
+            .children()
+            .into_iter()
+            .any(|child| references_ref(m, child, target))
+}
+
+/// True iff `node` is the `Normal` kernel constant (a lowered `builtin_logdensityof`'s arg 0).
+fn is_normal_const(m: &Module, node: NodeId) -> bool {
+    matches!(m.node(node), Node::Const(sym) if m.resolve(*sym) == "Normal")
+}
+
+/// The value of the `name` keyword argument in a constructor's kwargs, if present.
+fn find_kwarg(m: &Module, kwargs: &[(Symbol, NodeId)], name: &str) -> Option<NodeId> {
+    kwargs
+        .iter()
+        .find(|(sym, _)| m.resolve(*sym) == name)
+        .map(|&(_, value)| value)
+}
+
+/// The value of the `%field name` entry in a `record(...)` call node, if present.
+fn find_field(m: &Module, record: NodeId, name: &str) -> Option<NodeId> {
+    let Node::Call(c) = m.node(record) else {
+        return None;
+    };
+    c.named
+        .iter()
+        .find(|n| n.kind == NamedKind::Field && m.resolve(n.name) == name)
+        .map(|n| n.value)
+}
+
+/// Allocate a bare-kwarg `Normal(mu = mu, sigma = sigma)` constructor call — the
+/// shape [`split_kernel_constructor`] / [`build_density_term`] consume.
+fn build_normal_ctor(m: &mut Module, mu: NodeId, sigma: NodeId) -> NodeId {
+    let mu_sym = m.intern("mu");
+    let sigma_sym = m.intern("sigma");
+    let normal_sym = m.intern("Normal");
+    let named = vec![
+        NamedArg {
+            kind: NamedKind::Kwarg,
+            name: mu_sym,
+            value: mu,
+        },
+        NamedArg {
+            kind: NamedKind::Kwarg,
+            name: sigma_sym,
+            value: sigma,
+        },
+    ];
+    m.alloc(Node::Call(Call {
+        head: CallHead::Builtin(normal_sym),
+        args: Vec::<NodeId>::new().into(),
+        named: named.into(),
+        inputs: None,
+    }))
 }
 
 /// The measure-algebra combinator / operator heads. A `truncate` base whose
