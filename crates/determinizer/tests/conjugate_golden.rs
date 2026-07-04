@@ -10,6 +10,54 @@ fn determinize_src(src: &str) -> flatppl_core::Module {
     determinize(&parse_infer(src)).expect("must lower, not refuse")
 }
 
+/// Strip the transparent `(%meta (<triple>) <inner>)` type annotations the
+/// FlatPIR writer interleaves, leaving the bare S-expression — so a test can
+/// assert an exact nested structure without the type noise between nodes.
+fn strip_meta(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut drop_close: Vec<bool> = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if s[i..].starts_with("(%meta ") {
+            // Drop `(%meta ` + the balanced `(<triple>)` group + one space; the
+            // matching close paren is dropped when we reach it (drop_close = true).
+            i += "(%meta ".len();
+            let mut depth = 0i32;
+            loop {
+                match b[i] {
+                    b'(' => depth += 1,
+                    b')' => depth -= 1,
+                    _ => {}
+                }
+                i += 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            if i < b.len() && b[i] == b' ' {
+                i += 1;
+            }
+            drop_close.push(true);
+        } else {
+            match b[i] {
+                b'(' => {
+                    out.push('(');
+                    drop_close.push(false);
+                }
+                b')' => {
+                    if !drop_close.pop().unwrap_or(false) {
+                        out.push(')');
+                    }
+                }
+                c => out.push(c as char),
+            }
+            i += 1;
+        }
+    }
+    out
+}
+
 // kchain(M, K) with a CONTINUOUS latent that forms a Normal–Normal conjugate
 // pair marginalizes IN CLOSED FORM (no enumeration, no quadrature):
 //
@@ -217,5 +265,126 @@ lp = logdensityof(pp, record(y = 0.5))";
     assert!(
         err.reason.contains("non-enumerable"),
         "refusal explains the non-enumerable marginal: {err:?}"
+    );
+}
+
+// `normalize(logweighted(x -> logdensityof(g2, x), g1))` with `g1`, `g2` both
+// Normal is a POINTWISE PRODUCT OF TWO GAUSSIANS, which normalizes IN CLOSED
+// FORM (no quadrature): the overlap integral is itself a Gaussian
+//
+//   Z = ∫ N(x; μ1, σ1)·N(x; μ2, σ2) dx = N(μ1; μ2, sqrt(σ1² + σ2²)),
+//
+// so `logdensityof(prod, x)` = logdensityof(g1, x) + logdensityof(g2, x) − logZ,
+// with logZ = logdensityof(Normal(mu = μ2, sigma = sqrt(σ1² + σ2²)), μ1). Here
+// g1 = Normal(0.0, 1.0), g2 = Normal(1.0, 2.0), so the emitted density (scored
+// at the scalar variate 0.5) is three Normal density terms:
+//
+//   (sub (add (builtin_logdensityof Normal {mu 0.0, sigma 1.0} 0.5)
+//             (builtin_logdensityof Normal {mu 1.0, sigma 2.0} 0.5))
+//        (builtin_logdensityof Normal
+//           {mu 1.0, sigma (sqrt (add (pow 1.0 2.0) (pow 2.0 2.0)))} 0.0))
+//
+// and no `normalize` / `logweighted` / `functionof` / `draw` / measure may
+// survive.
+#[test]
+fn product_of_gaussians_normalize() {
+    let src = "\
+g1 = Normal(mu = 0.0, sigma = 1.0)
+g2 = Normal(mu = 1.0, sigma = 2.0)
+prod = normalize(logweighted(x -> logdensityof(g2, x), g1))
+lp = logdensityof(prod, 0.5)";
+    let out = determinize_src(src);
+    let pir = flatppl_flatpir::write(&out);
+    let bare = strip_meta(&pir);
+
+    // Three density terms: g1 at the variate, g2 at the variate, and the overlap
+    // Z (a Normal scored at μ1). Each is a Normal `builtin_logdensityof`.
+    assert_eq!(
+        pir.matches("builtin_logdensityof").count(),
+        3,
+        "product-of-Gaussians density is g1 + g2 − logZ (three Normal terms):\n{pir}"
+    );
+
+    // The two data terms score g1 / g2 at the SCALAR variate 0.5 (their exact
+    // Normal kwargs, pinned at 0.5) — the closed-form pointwise product.
+    assert!(
+        bare.contains(
+            "(builtin_logdensityof Normal (record (%field mu 0.0) (%field sigma 1.0)) 0.5)"
+        ),
+        "g1 (Normal 0.0, 1.0) scored at the scalar variate 0.5:\n{bare}"
+    );
+    assert!(
+        bare.contains(
+            "(builtin_logdensityof Normal (record (%field mu 1.0) (%field sigma 2.0)) 0.5)"
+        ),
+        "g2 (Normal 1.0, 2.0) scored at the scalar variate 0.5:\n{bare}"
+    );
+
+    // logZ = the Gaussian overlap: Normal(mu = μ2 = 1.0, sigma = sqrt(σ1² + σ2²) =
+    // sqrt(add(pow(1.0, 2), pow(2.0, 2)))) scored at μ1 = 0.0. The exact `pow`
+    // bases pin the variance SUM (not difference), and the scoring point μ1 = 0.0.
+    assert!(
+        bare.contains(
+            "(builtin_logdensityof Normal (record (%field mu 1.0) (%field sigma (sqrt (add (pow 1.0 2.0) (pow 2.0 2.0))))) 0.0)"
+        ),
+        "logZ is Normal(mu = μ2, sigma = sqrt(σ1² + σ2²)) scored at μ1 = 0.0:\n{bare}"
+    );
+
+    // Overall shape: sub(add(t1, t2), logZ) — the two data terms summed, minus the
+    // overlap logZ.
+    assert!(
+        bare.contains("(sub (add (builtin_logdensityof Normal (record (%field mu 0.0)"),
+        "closed form is sub(add(g1, g2), logZ):\n{bare}"
+    );
+
+    // The measure layer is fully gone.
+    assert!(
+        !pir.contains("normalize")
+            && !pir.contains("logweighted")
+            && !pir.contains("functionof")
+            && !pir.contains("(draw "),
+        "measure layer gone:\n{pir}"
+    );
+    assert!(
+        flatppl_determinizer::is_flatpdl(&out).is_ok(),
+        "is_flatpdl failed:\n{pir}"
+    );
+}
+
+// Refuse-don't-mislower: a `normalize(logweighted(…))` whose base is NOT a
+// Gaussian product must keep refusing (the closed-form Gaussian-overlap Z is not
+// valid there), never mislower to the product formula. Two shapes exercise the
+// two recognizer gates:
+//   (a) the base is not a Normal (`Exponential`), and
+//   (b) ℓ is a reified function but not `logdensityof(Normal, x)`
+//       (here `logdensityof(Exponential, x)`).
+#[test]
+fn product_normalize_refuses_non_gaussian_base() {
+    // (a) base is Exponential, ℓ scores a Normal — not a product of two Gaussians.
+    let src_a = "\
+g1 = Exponential(rate = 1.0)
+g2 = Normal(mu = 1.0, sigma = 2.0)
+prod = normalize(logweighted(x -> logdensityof(g2, x), g1))
+lp = logdensityof(prod, 0.5)";
+    let m_a = parse_infer(src_a);
+    let err_a =
+        determinize(&m_a).expect_err("logweighted base is not a product of two Gaussians — refuse");
+    assert!(
+        err_a.construct.contains("normalize"),
+        "refusal names normalize: {err_a:?}"
+    );
+
+    // (b) base is Normal but ℓ scores an Exponential — not two Gaussians.
+    let src_b = "\
+g1 = Normal(mu = 0.0, sigma = 1.0)
+g2 = Exponential(rate = 1.0)
+prod = normalize(logweighted(x -> logdensityof(g2, x), g1))
+lp = logdensityof(prod, 0.5)";
+    let m_b = parse_infer(src_b);
+    let err_b =
+        determinize(&m_b).expect_err("logweighted weight is not a Gaussian logdensityof — refuse");
+    assert!(
+        err_b.construct.contains("normalize"),
+        "refusal names normalize: {err_b:?}"
     );
 }
