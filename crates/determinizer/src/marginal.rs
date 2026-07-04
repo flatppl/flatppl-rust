@@ -51,6 +51,7 @@ use crate::density::{
     build_call, build_density_term, build_record, draw_argument, expect_builtin_call,
     lower_measure_density, refuse, resolve_ref_one, split_kernel_constructor,
 };
+use crate::kernel::{Kernel, resolve_kernel, substitute_ref};
 use crate::refuse::RefuseError;
 use flatppl_core::{
     Call, CallHead, Module, NamedArg, NamedKind, Node, NodeId, Ref, RefNs, Scalar, Symbol, ValueSet,
@@ -96,6 +97,15 @@ pub(crate) fn lower_kchain_marginal(
     // and the continuous conjugate path need the kernel body.
     let kernel = resolve_kernel(m, k_arg)
         .ok_or_else(|| refuse_kchain(node, "kchain kernel is not a recognisable kernelof(...)"))?;
+    // The kchain marginal path substitutes ONE latent into the kernel; a
+    // multi-input kernel is not the single-step shape it handles.
+    if kernel.inputs.len() != 1 {
+        return Err(refuse_kchain(
+            node,
+            "single-input kernel only; multi-input kchain kernels are out of scope",
+        ));
+    }
+    let kernel_input_sym = kernel.inputs[0].1.name;
 
     // --- 4. Classify the latent. A discrete-finite latent enumerates (below); a
     //        continuous / infinite-discrete latent first tries the closed-form
@@ -126,7 +136,7 @@ pub(crate) fn lower_kchain_marginal(
 
         // K(aᵢ): substitute the atom for the kernel's boundary-input ref inside a
         // fresh copy of the kernel body, then score that measure at `v`.
-        let applied_body = substitute_ref(m, kernel.body, kernel.input, atom_node);
+        let applied_body = substitute_ref(m, kernel.body, kernel_input_sym, atom_node);
         let kernel_term = lower_measure_density(m, applied_body, v)?;
 
         branches.push(build_call(m, "add", &[mass_term, kernel_term]));
@@ -301,111 +311,6 @@ fn static_int(m: &Module, id: NodeId) -> Option<i64> {
 }
 
 // ---------------------------------------------------------------------------
-// Kernel identification + application
-// ---------------------------------------------------------------------------
-
-/// A resolved kernel: its reified body and the single boundary-input symbol that
-/// `K(a)` substitutes.
-struct Kernel {
-    /// The reified body node (e.g. `record(y = draw(Normal(mu = z, …)))`).
-    body: NodeId,
-    /// The single boundary-input name (e.g. `z`); references to it inside the
-    /// body are `(%ref self z)` (or `(%ref %local z)`), substituted by `K(a)`.
-    input: Symbol,
-}
-
-/// Resolve `K` (the kchain's second argument) to a `kernelof(body, %specinputs([
-/// (input, _)]))` with exactly one boundary input. Returns `None` for a kernel
-/// with no / multiple boundary inputs (those need a record-shaped application we
-/// do not yet emit) or any non-`kernelof` shape.
-fn resolve_kernel(m: &Module, k_arg: NodeId) -> Option<Kernel> {
-    let (resolved, _) = resolve_ref_one(m, k_arg);
-    let Node::Call(c) = m.node(resolved) else {
-        return None;
-    };
-    let CallHead::Builtin(sym) = c.head else {
-        return None;
-    };
-    if m.resolve(sym) != "kernelof" || c.args.len() != 1 {
-        return None;
-    }
-    let body = c.args[0];
-    // Read the single boundary input from the `%specinputs` list.
-    let input = match &c.inputs {
-        Some(flatppl_core::Inputs::Spec(entries)) if entries.len() == 1 => entries[0].0,
-        _ => return None,
-    };
-    Some(Kernel { body, input })
-}
-
-/// Replace every `(%ref self name)` / `(%ref %local name)` in the subtree rooted
-/// at `root` with `new_id`, returning the (possibly new) root. Append-only: nodes
-/// that need no rewrite are reused; only rewritten `Call` ancestors are realloc'd.
-///
-/// This is `K(a)`: it pins the kernel's boundary input to the atom value `a`
-/// inside a fresh copy of the kernel body, so the body's draws score against the
-/// pinned latent and no reference to the (now marginalized) latent survives.
-///
-/// INVARIANT: this is scope-UNAWARE — it rewrites *every* matching `(%ref … name)`
-/// in the subtree, with no notion of an inner binder shadowing `name`. Sound only
-/// under the workspace no-shadowing assumption: the kernel-body substitution only
-/// ever targets the single boundary-input symbol, which is never rebound inside
-/// the body.
-fn substitute_ref(m: &mut Module, root: NodeId, name: Symbol, new_id: NodeId) -> NodeId {
-    if let Node::Ref(Ref { ns, name: rname }) = m.node(root) {
-        if matches!(ns, RefNs::SelfMod | RefNs::Local) && *rname == name {
-            return new_id;
-        }
-    }
-
-    let children: Vec<NodeId> = m.node(root).children();
-    if children.is_empty() {
-        return root;
-    }
-    let new_children: Vec<NodeId> = children
-        .iter()
-        .map(|&c| substitute_ref(m, c, name, new_id))
-        .collect();
-    if new_children == children {
-        return root;
-    }
-
-    // Rebuild the Call node with substituted children. Only `Call` nodes have
-    // children, so this is always a Call.
-    let Node::Call(orig) = m.node(root) else {
-        unreachable!("non-call node with children is impossible in this IR");
-    };
-    let head = orig.head;
-    let inputs = orig.inputs.clone();
-    let n_args = orig.args.len();
-
-    let (new_head, slice) = match head {
-        // children = [callee, args…, named-values…]
-        CallHead::User(_) => (CallHead::User(new_children[0]), &new_children[1..]),
-        CallHead::Builtin(s) => (CallHead::Builtin(s), &new_children[..]),
-    };
-    let new_args: Vec<NodeId> = slice[..n_args].to_vec();
-    let new_named_values = &slice[n_args..];
-    let new_named: Vec<NamedArg> = orig
-        .named
-        .iter()
-        .zip(new_named_values.iter())
-        .map(|(na, &val)| NamedArg {
-            kind: na.kind,
-            name: na.name,
-            value: val,
-        })
-        .collect();
-
-    m.alloc(Node::Call(Call {
-        head: new_head,
-        args: new_args.into(),
-        named: new_named.into(),
-        inputs,
-    }))
-}
-
-// ---------------------------------------------------------------------------
 // Continuous latent: closed-form conjugate marginal
 // ---------------------------------------------------------------------------
 //
@@ -500,11 +405,14 @@ fn try_conjugate_marginal(
         .find(|r| r.prior == prior_name && r.likelihood == lik_name)?;
 
     // (b) The conjugating parameter's value must be EXACTLY the boundary-input
-    // ref `(%ref self|%local kernel.input)` — the latent feeding that parameter,
-    // unresolved. Anything else (a constant, a derived expression) is not this
-    // conjugate shape.
+    // ref `(%ref self|%local kernel.inputs[0].1.name)` — the latent feeding that
+    // parameter, unresolved. Anything else (a constant, a derived expression) is
+    // not this conjugate shape. `try_conjugate_marginal` is only reached after
+    // the caller's single-input length check, so the single kernel input here is
+    // guaranteed.
+    let kernel_input_sym = kernel.inputs[0].1.name;
     let conj_val = find_kwarg(m, &lik_kwargs, row.conjugating_param)?;
-    if !is_input_ref(m, conj_val, kernel.input) {
+    if !is_input_ref(m, conj_val, kernel_input_sym) {
         return None;
     }
 
@@ -515,7 +423,7 @@ fn try_conjugate_marginal(
         if m.resolve(*psym) == row.conjugating_param {
             continue;
         }
-        if references_input(m, *pval, kernel.input) {
+        if references_input(m, *pval, kernel_input_sym) {
             return None;
         }
     }

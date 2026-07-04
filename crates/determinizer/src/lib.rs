@@ -4,6 +4,7 @@
 mod conformance;
 mod density;
 mod driver;
+mod kernel;
 mod marginal;
 mod refuse;
 mod sample;
