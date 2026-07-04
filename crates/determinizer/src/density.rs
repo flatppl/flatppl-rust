@@ -1027,6 +1027,10 @@ fn recognize_gaussian_product(m: &Module, logweighted: NodeId) -> Option<Gaussia
 /// In both forms the point the factor is scored at must be exactly `arg_ref`
 /// (the lambda argument) — scoring at anything else means ℓ is not the second
 /// Gaussian factor of a product, so we return `None` and the caller refuses.
+/// Likewise, `mu`/`sigma` themselves must NOT reference `arg_ref`: e.g.
+/// `Normal(mu = x, sigma = 1.0)` scored at `x` is `N(x; x, 1)`, a constant, not a
+/// second Gaussian *factor* of `x` — g1's params are checked outside the lambda,
+/// so only g2 needs the guard.
 fn gaussian_factor_scored_at(m: &Module, body: NodeId, arg_ref: Ref) -> Option<(NodeId, NodeId)> {
     // Not-yet-lowered: logdensityof(Normal(...), arg).
     if let Some(ld) = expect_builtin_call(m, body, "logdensityof") {
@@ -1034,10 +1038,12 @@ fn gaussian_factor_scored_at(m: &Module, body: NodeId, arg_ref: Ref) -> Option<(
             return None;
         }
         let (_g2, kwargs) = normal_ctor(m, ld.args[0])?;
-        return Some((
-            find_kwarg(m, &kwargs, "mu")?,
-            find_kwarg(m, &kwargs, "sigma")?,
-        ));
+        let mu2 = find_kwarg(m, &kwargs, "mu")?;
+        let sigma2 = find_kwarg(m, &kwargs, "sigma")?;
+        if references_ref(m, mu2, arg_ref) || references_ref(m, sigma2, arg_ref) {
+            return None;
+        }
+        return Some((mu2, sigma2));
     }
     // Already-lowered: builtin_logdensityof(Normal, record(mu, sigma), arg).
     if let Some(bl) = expect_builtin_call(m, body, "builtin_logdensityof") {
@@ -1047,10 +1053,12 @@ fn gaussian_factor_scored_at(m: &Module, body: NodeId, arg_ref: Ref) -> Option<(
         {
             return None;
         }
-        return Some((
-            find_field(m, bl.args[1], "mu")?,
-            find_field(m, bl.args[1], "sigma")?,
-        ));
+        let mu2 = find_field(m, bl.args[1], "mu")?;
+        let sigma2 = find_field(m, bl.args[1], "sigma")?;
+        if references_ref(m, mu2, arg_ref) || references_ref(m, sigma2, arg_ref) {
+            return None;
+        }
+        return Some((mu2, sigma2));
     }
     None
 }
@@ -1069,6 +1077,19 @@ fn normal_ctor(m: &Module, node: NodeId) -> Option<(NodeId, Vec<(Symbol, NodeId)
 /// True iff `node` is exactly the reference `target` (the reified argument).
 fn is_ref_to(m: &Module, node: NodeId, target: Ref) -> bool {
     matches!(m.node(node), Node::Ref(r) if *r == target)
+}
+
+/// Does the subtree rooted at `node` reference `target` anywhere (mirrors
+/// `marginal::references_input`, but keyed on a `Ref` rather than a boundary-input
+/// `Symbol`)? Used to reject a g2 `mu`/`sigma` that still depends on the lambda
+/// argument — such a param is not a constant second Gaussian factor, it's an
+/// expression of the variate, so the "product of two Gaussians" shape doesn't apply.
+fn references_ref(m: &Module, node: NodeId, target: Ref) -> bool {
+    is_ref_to(m, node, target)
+        || m.node(node)
+            .children()
+            .into_iter()
+            .any(|child| references_ref(m, child, target))
 }
 
 /// True iff `node` is the `Normal` kernel constant (a lowered `builtin_logdensityof`'s arg 0).

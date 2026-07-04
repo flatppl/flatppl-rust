@@ -388,3 +388,35 @@ lp = logdensityof(prod, 0.5)";
         "refusal names normalize: {err_b:?}"
     );
 }
+
+// g2's `mu`/`sigma` must not reference the lambda argument `x` itself: scoring
+// `Normal(mu = x, sigma = 1.0)` at `x` is `N(x; x, 1)`, a constant — not a second
+// Gaussian *factor* of `x` — so this is not a Gaussian-product overlap at all and
+// must refuse rather than emit a dangling `%local` ref to the vanished binder.
+#[test]
+fn product_normalize_refuses_g2_param_referencing_lambda_arg() {
+    // (a) mu2 = x.
+    let src_mu = "\
+g1 = Normal(mu = 0.0, sigma = 1.0)
+prod = normalize(logweighted(x -> logdensityof(Normal(mu = x, sigma = 1.0), x), g1))
+lp = logdensityof(prod, 0.5)";
+    let m_mu = parse_infer(src_mu);
+    let err_mu = determinize(&m_mu).expect_err("g2's mu references the lambda argument — refuse");
+    assert!(
+        err_mu.construct.contains("normalize"),
+        "refusal names normalize: {err_mu:?}"
+    );
+
+    // (b) sigma2 = x.
+    let src_sigma = "\
+g1 = Normal(mu = 0.0, sigma = 1.0)
+prod = normalize(logweighted(x -> logdensityof(Normal(mu = 0.0, sigma = x), x), g1))
+lp = logdensityof(prod, 0.5)";
+    let m_sigma = parse_infer(src_sigma);
+    let err_sigma =
+        determinize(&m_sigma).expect_err("g2's sigma references the lambda argument — refuse");
+    assert!(
+        err_sigma.construct.contains("normalize"),
+        "refusal names normalize: {err_sigma:?}"
+    );
+}
