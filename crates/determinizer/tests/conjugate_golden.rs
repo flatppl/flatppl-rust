@@ -118,6 +118,85 @@ lp = logdensityof(pp, record(y = 0.5))";
     );
 }
 
+// kchain(M, K) with a CONTINUOUS latent that forms a Gamma–Poisson conjugate
+// pair marginalizes IN CLOSED FORM: NegativeBinomial(alpha, beta) (§08) IS the
+// Gamma(shape=α, rate=β)–Poisson(rate=λ) mixture
+//
+//   ∫ Poisson(N; λ)·Gamma(λ; α, β) dλ = NegativeBinomial(α, β)
+//
+// so the marginal is an IDENTITY parameter map — no arithmetic. The prior
+// `z ~ Gamma(shape = 2.0, rate = 3.0)` feeds the likelihood rate
+// `y ~ Poisson(rate = z)`, so the marginal over `y` is
+// `NegativeBinomial(alpha = 2.0, beta = 3.0)`. The determiniser must emit
+// exactly ONE `builtin_logdensityof(NegativeBinomial, {alpha, beta}, obs)`
+// scoring that marginal at the scalar observation `5` — and no `kchain` /
+// `lawof` / `draw` / `kernelof` may survive.
+//
+// Emitted FlatPIR (density term):
+//   (builtin_logdensityof NegativeBinomial
+//     (record (%field alpha 2.0)
+//             (%field beta 3.0))
+//     5)
+#[test]
+fn gamma_poisson_conjugate_marginal() {
+    let src = "\
+z = draw(Gamma(shape = 2.0, rate = 3.0))
+k = kernelof(record(y = draw(Poisson(rate = z))), z = z)
+pp = kchain(lawof(record(z = z)), k)
+lp = logdensityof(pp, record(y = 5))";
+    let out = determinize_src(src);
+    let pir = flatppl_flatpir::write(&out);
+
+    // Exactly ONE density term: the closed-form marginal NegativeBinomial scored at obs.
+    assert_eq!(
+        pir.matches("builtin_logdensityof").count(),
+        1,
+        "closed-form marginal is a single density term:\n{pir}"
+    );
+    // The marginal is a NegativeBinomial.
+    assert!(
+        pir.contains("(builtin_logdensityof NegativeBinomial "),
+        "marginal is a NegativeBinomial:\n{pir}"
+    );
+    // Identity parameter map: alpha = prior shape (2.0), beta = prior rate (3.0).
+    assert!(
+        pir.contains("(%field alpha 2.0)"),
+        "marginal alpha is the prior shape (2.0):\n{pir}"
+    );
+    assert!(
+        pir.contains("(%field beta 3.0)"),
+        "marginal beta is the prior rate (3.0):\n{pir}"
+    );
+    // No arithmetic: the identity map reuses the prior's value nodes unchanged.
+    assert!(
+        !pir.contains("add") && !pir.contains("pow") && !pir.contains("sqrt"),
+        "identity map performs no arithmetic:\n{pir}"
+    );
+    // The exact marginal kwarg record: alpha then beta, in that order.
+    assert!(
+        pir.contains("(record (%field alpha 2.0) (%field beta 3.0))"),
+        "exact marginal kwarg shape:\n{pir}"
+    );
+    // Scored at the SCALAR observation 5 (the record's `y` field), not the
+    // record itself — the `y` field was consumed by the descent.
+    assert!(
+        pir.contains(" 5))") && !pir.contains("(%field y"),
+        "marginal is scored at the scalar obs 5, record variate consumed:\n{pir}"
+    );
+    // The measure layer is fully gone.
+    assert!(
+        !pir.contains("kchain")
+            && !pir.contains("lawof")
+            && !pir.contains("(draw ")
+            && !pir.contains("kernelof"),
+        "measure layer gone:\n{pir}"
+    );
+    assert!(
+        flatppl_determinizer::is_flatpdl(&out).is_ok(),
+        "is_flatpdl failed:\n{pir}"
+    );
+}
+
 // Refuse-don't-mislower (detection contract (a)): a continuous latent whose
 // prior family has NO conjugate row for the likelihood. A Gamma prior feeding a
 // Normal likelihood mean is not a table entry, so no row matches and the

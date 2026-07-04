@@ -446,13 +446,21 @@ struct ConjugateRow {
 }
 
 /// The conjugate-marginal table. Data-driven and extensible: a new conjugate
-/// pair is one more row (Gamma–Poisson is a follow-on task).
-const CONJUGATE_TABLE: &[ConjugateRow] = &[ConjugateRow {
-    prior: "Normal",
-    likelihood: "Normal",
-    conjugating_param: "mu",
-    build_marginal: build_normal_normal_marginal,
-}];
+/// pair is one more row.
+const CONJUGATE_TABLE: &[ConjugateRow] = &[
+    ConjugateRow {
+        prior: "Normal",
+        likelihood: "Normal",
+        conjugating_param: "mu",
+        build_marginal: build_normal_normal_marginal,
+    },
+    ConjugateRow {
+        prior: "Gamma",
+        likelihood: "Poisson",
+        conjugating_param: "rate",
+        build_marginal: build_gamma_poisson_marginal,
+    },
+];
 
 /// Try to lower a continuous-latent `kchain` as a closed-form conjugate marginal.
 ///
@@ -665,6 +673,26 @@ fn build_normal_normal_marginal(
         m,
         "Normal",
         &[("mu", mu0), ("sigma", sigma_marginal)],
+    ))
+}
+
+/// Gamma–Poisson (conjugate rate) marginal builder:
+/// `NegativeBinomial(alpha, beta)` (§08) IS the Gamma(shape=α, rate=β)–
+/// Poisson(rate=λ) mixture `∫ Poisson(N; λ)·Gamma(λ; α, β) dλ`, so the marginal
+/// is an IDENTITY parameter map — `alpha`/`beta` are the prior's `shape`/`rate`
+/// value nodes, reused unchanged, no arithmetic.
+fn build_gamma_poisson_marginal(
+    m: &mut Module,
+    prior_kwargs: &[(Symbol, NodeId)],
+    _lik_kwargs: &[(Symbol, NodeId)],
+) -> Option<NodeId> {
+    let alpha = find_kwarg(m, prior_kwargs, "shape")?;
+    let beta = find_kwarg(m, prior_kwargs, "rate")?;
+
+    Some(build_constructor(
+        m,
+        "NegativeBinomial",
+        &[("alpha", alpha), ("beta", beta)],
     ))
 }
 
