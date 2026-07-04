@@ -5,19 +5,24 @@
             bindings: [
                 // -- Distributions --
                 // Oracle-verified supports (scipy cross-check per task brief).
-                Binding(name: "CrystalBall",            sig: Distribution(domain: Scalar(Real), support: Reals,       mass: Normalized)),
-                Binding(name: "DoubleSidedCrystalBall", sig: Distribution(domain: Scalar(Real), support: Reals,       mass: Normalized)),
+                Binding(name: "CrystalBall",            sig: Distribution(domain: Scalar(Real), support: Reals,       mass: Normalized, params: ["m0", "sigma", "alpha", "n"])),
+                // DoubleSidedCrystalBall: param order is spec §09's grouped
+                // form (m0, sigmaL, sigmaR, alphaL, alphaR, nL, nR) — the JS
+                // engine REGISTRY interleaves as [m0, sigmaL, sigmaR, alphaL,
+                // nL, alphaR, nR], which disagrees with the spec's own prose
+                // ordering; §09 wins per authority order (maths > spec > code).
+                Binding(name: "DoubleSidedCrystalBall", sig: Distribution(domain: Scalar(Real), support: Reals,       mass: Normalized, params: ["m0", "sigmaL", "sigmaR", "alphaL", "alphaR", "nL", "nR"])),
                 // Argus: spec §09 support is interval(0, resonance); no parameter-dependent
                 // real bound in the type system → PosReals (sound superset).
-                Binding(name: "Argus",                  sig: Distribution(domain: Scalar(Real), support: PosReals,    mass: Normalized),
+                Binding(name: "Argus",                  sig: Distribution(domain: Scalar(Real), support: PosReals,    mass: Normalized, params: ["resonance", "slope", "power"]),
                     degraded: Some("§09 support is interval(0, resonance); no parameter-dependent real bound in the type system → PosReals (sound superset)")),
-                Binding(name: "RelativisticBreitWigner", sig: Distribution(domain: Scalar(Real), support: PosReals,   mass: Normalized)),
-                Binding(name: "Voigtian",               sig: Distribution(domain: Scalar(Real), support: Reals,       mass: Normalized)),
-                Binding(name: "Landau",                 sig: Distribution(domain: Scalar(Real), support: Reals,       mass: Normalized)),
-                Binding(name: "BifurcatedNormal",       sig: Distribution(domain: Scalar(Real), support: Reals,       mass: Normalized)),
+                Binding(name: "RelativisticBreitWigner", sig: Distribution(domain: Scalar(Real), support: PosReals,   mass: Normalized, params: ["mean", "width"])),
+                Binding(name: "Voigtian",               sig: Distribution(domain: Scalar(Real), support: Reals,       mass: Normalized, params: ["mean", "width", "sigma"])),
+                Binding(name: "Landau",                 sig: Distribution(domain: Scalar(Real), support: Reals,       mass: Normalized, params: ["loc", "scale"])),
+                Binding(name: "BifurcatedNormal",       sig: Distribution(domain: Scalar(Real), support: Reals,       mass: Normalized, params: ["mean", "sigmaL", "sigmaR"])),
                 // ContinuedPoisson: not a normalized probability measure (spec §09);
                 // mass is Finite (locally integrable unnormalized density).
-                Binding(name: "ContinuedPoisson",       sig: Distribution(domain: Scalar(Real), support: NonNegReals, mass: Finite),
+                Binding(name: "ContinuedPoisson",       sig: Distribution(domain: Scalar(Real), support: NonNegReals, mass: Finite, params: ["rate"]),
                     degraded: Some("spec §09: ContinuedPoisson is not normalized (mass Finite); rand is undefined in FlatPPL")),
 
                 // -- Three-point interpolation functions (spec §09) --

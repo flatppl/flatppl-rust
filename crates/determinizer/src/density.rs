@@ -411,7 +411,14 @@ pub(crate) fn lower_measure_density(
         // continuous / infinite-discrete / non-enumerable → refuse (Task 5).
         Some("kchain") => crate::marginal::lower_kchain_marginal(m, measure_node, v),
         Some("iid") => lower_iid(m, measure_node, v),
+        Some("broadcast") => lower_broadcast_kernel(m, measure_node, v),
         Some("joint") => lower_joint(m, measure_node, v),
+        // A reified measure (`functionof` / `kernelof`) used AS a measure — its
+        // body is the measure expression it reifies. Unwrap to the body and recurse
+        // so a `broadcast(K, params)` body reaches the broadcast-kernel arm and a
+        // bare constructor body reaches `build_density_term` (histfactory's
+        // `functionof(Poisson.(expected))` scored via `likelihoodof`).
+        Some("functionof") | Some("kernelof") => lower_reified_measure(m, measure_node, v),
         // Refused combinators — refused here rather than mis-lowered.
         // `likelihoodof` / `joint_likelihood` are normally unwrapped at the
         // `logdensityof` entry (their arg2 is θ, not a variate); reaching the
@@ -1172,6 +1179,157 @@ fn lower_iid(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseEr
     Ok(fold_add(m, &terms))
 }
 
+/// `logdensityof(broadcast(K, arg0, arg1, …), obs)` where `K` is a distribution
+/// **constructor** broadcast over per-cell parameter arrays — an array-of-kernels
+/// measure (§04 broadcasting; its inferred type is `Measure{Array{shape, cell}}`).
+/// Its density at the observed array `obs` is the sum over cells of the per-cell
+/// kernel log-density: `Σ_cell logdensityof(K(paramsᵢ), obsᵢ)` (§06 "Density of
+/// composed measures", the independent-product Σ rule lifted to an axis).
+///
+/// **Axis-native, no unroll.** The emitted density is a single axis-level
+/// expression — identical for length-3 or length-3000, static or dynamic — so it
+/// deliberately does NOT use the `get0`/`iid_static_size`/`fold_add` element
+/// unrolling of [`lower_iid`]:
+/// ```text
+/// kernel_inputs = broadcast(record, p0 = arg0, p1 = arg1, …)   # array-of-records, per cell {pᵢ: argᵢ}
+/// lp            = sum( broadcast(builtin_logdensityof, K, kernel_inputs, obs) )
+/// ```
+/// The positional data-args (`arg0, arg1, …`, everything after the head `K`) bind
+/// to `K`'s ordered constructor parameter names (§08, via
+/// [`flatppl_infer::distribution_param_names`]) IN ORDER; a data-arg passed by
+/// keyword (`broadcast(K, mu = arr)`) keeps its given name. In the outer
+/// broadcast, `builtin_logdensityof` is the broadcast head, `K` (the `Const`
+/// constructor tag) rides along scalar, and `kernel_inputs` (array of records)
+/// and `obs` (array) are zipped to per-cell log-densities; `sum` reduces to the
+/// scalar joint. `broadcast`/`record`/`sum` are §04/§07 ops legal in FlatPDL.
+///
+/// **Head shapes.** The broadcast head resolves to a constructor name from either
+/// a bare built-in `Const(sym)` (`broadcast(Poisson, …)`) or a standard-module
+/// member `Ref { ns: Module(_), name }` (`broadcast(hepphys.ContinuedPoisson, …)`,
+/// §09); both reduce to the member name and emit the BARE `Const(name)` kernel.
+///
+/// **Refuse-don't-mislower.** A value-broadcast (head a deterministic op like
+/// `add`, or any other head shape — a `%ref self`/`%ref %local` binding, a
+/// literal) is not a kernel — it is refused rather than treated as a measure. A
+/// head whose resolved name is not a known distribution constructor
+/// (`distribution_param_names` → `None`, e.g. a module *function* member) is
+/// likewise refused.
+fn lower_broadcast_kernel(
+    m: &mut Module,
+    measure: NodeId,
+    obs: NodeId,
+) -> Result<NodeId, RefuseError> {
+    // Read the broadcast: args[0] is the head being broadcast; args[1..] the
+    // positional data-args; `named` the keyword data-args.
+    let (head, pos_args, kw_args) = {
+        let c = expect_builtin_call(m, measure, "broadcast")
+            .ok_or_else(|| refuse(measure, m, "expected broadcast"))?;
+        let Some((&head, pos_args)) = c.args.split_first() else {
+            return Err(refuse(measure, m, "broadcast has no head argument"));
+        };
+        let pos_args = pos_args.to_vec();
+        let kw_args: Vec<(Symbol, NodeId)> = c.named.iter().map(|n| (n.name, n.value)).collect();
+        (head, pos_args, kw_args)
+    };
+
+    // The head must resolve to a distribution CONSTRUCTOR NAME. Two shapes carry
+    // one: a bare built-in `Node::Const(sym)` (`broadcast(Poisson, …)`), or a
+    // standard-module member `Node::Ref { ns: Module(_), name }`
+    // (`broadcast(hepphys.ContinuedPoisson, …)`, §09). Both reduce to the member
+    // name symbol; the kernel is emitted BARE as `Const(name)` (below) — the same
+    // tag the engine's kernel registry keys, module-qualified or not.
+    //
+    // A value-broadcast (`broadcast(add, a, b)`, head a deterministic op) reaching
+    // the measure dispatcher must NOT be mislowered as a kernel; nor must a
+    // non-module ref (`%ref self …` / `%ref %local …`, which are bindings, not
+    // constructors). Refuse.
+    let ctor_sym = match *m.node(head) {
+        Node::Const(sym) => sym,
+        Node::Ref(Ref {
+            ns: RefNs::Module(_),
+            name,
+        }) => name,
+        _ => {
+            return Err(refuse(
+                measure,
+                m,
+                "broadcast head is not a distribution constructor (value-broadcast used as a measure)",
+            ));
+        }
+    };
+
+    // Ordered constructor parameter names (spec §08). `None` ⇒ the head is not a
+    // known distribution constructor (e.g. a deterministic op) ⇒ refuse.
+    let param_names =
+        flatppl_infer::distribution_param_names(m.resolve(ctor_sym)).ok_or_else(|| {
+            refuse(
+                measure,
+                m,
+                "broadcast head is not a known distribution constructor",
+            )
+        })?;
+
+    // More positional data-args than the constructor has parameters cannot bind
+    // by position — refuse rather than drop or misname.
+    if pos_args.len() > param_names.len() {
+        return Err(refuse(
+            measure,
+            m,
+            "broadcast has more positional data-args than the constructor has parameters",
+        ));
+    }
+
+    // Per-cell record fields: positional args bind to param names in order; a
+    // keyword data-arg keeps its given name.
+    let mut fields: Vec<(Symbol, NodeId)> = Vec::with_capacity(pos_args.len() + kw_args.len());
+    for (i, &arg) in pos_args.iter().enumerate() {
+        let name = m.intern(&param_names[i]);
+        fields.push((name, arg));
+    }
+    fields.extend(kw_args);
+
+    // kernel_inputs = broadcast(record, p0 = arg0, p1 = arg1, …): the `record`
+    // constructor broadcast over the param arrays yields an array of per-cell
+    // records. The field bindings are `Kwarg` on the broadcast call (each cell's
+    // `record(pᵢ = argᵢ[cell])`).
+    let broadcast_sym = m.intern("broadcast");
+    let record_head = {
+        let record_sym = m.intern("record");
+        m.alloc(Node::Const(record_sym))
+    };
+    let record_kwargs: Vec<NamedArg> = fields
+        .iter()
+        .map(|&(name, value)| NamedArg {
+            kind: NamedKind::Kwarg,
+            name,
+            value,
+        })
+        .collect();
+    let kernel_inputs = m.alloc(Node::Call(Call {
+        head: CallHead::Builtin(broadcast_sym),
+        args: vec![record_head].into(),
+        named: record_kwargs.into(),
+        inputs: None,
+    }));
+
+    // lp = sum(broadcast(builtin_logdensityof, K, kernel_inputs, obs)): the
+    // `builtin_logdensityof` head is applied per cell to the scalar constructor
+    // tag `K` and the zipped (kernel_input, obs) pair; `sum` reduces the array of
+    // per-cell log-densities to the scalar joint density.
+    let kernel = m.alloc(Node::Const(ctor_sym));
+    let ldo_head = {
+        let ldo_sym = m.intern("builtin_logdensityof");
+        m.alloc(Node::Const(ldo_sym))
+    };
+    let per_cell = m.alloc(Node::Call(Call {
+        head: CallHead::Builtin(broadcast_sym),
+        args: vec![ldo_head, kernel, kernel_inputs, obs].into(),
+        named: Vec::<NamedArg>::new().into(),
+        inputs: None,
+    }));
+    Ok(build_call(m, "sum", &[per_cell]))
+}
+
 /// `logdensityof(joint(M₁,…,Mₖ), v)` = `Σ logdensityof(Mᵢ, get0(v, i))`
 /// (§06 "Density of composed measures"). The variate is the positional `cat` of the
 /// component variates.
@@ -1251,6 +1409,60 @@ fn lower_joint(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Refuse
         terms.push(lower_measure_density(m, mi, elem)?);
     }
     Ok(fold_add(m, &terms))
+}
+
+/// `functionof` / `kernelof` used AS a measure (spec §04 reification, §11 reified
+/// callables). A reification reifies one body expression — the measure it stands
+/// for (`broadcast(K, …)`, `Normal(…)`, a `record`-of-draws, …) — held as its
+/// single positional `args[0]`; its `Inputs` boundary maps each input name to a
+/// `Ref`. Scoring the reified measure is scoring its body, so we UNWRAP to `args[0]`
+/// and recurse through the dispatcher: a `broadcast(K, params)` body then reaches
+/// [`lower_broadcast_kernel`], a bare constructor body reaches [`build_density_term`]
+/// (histfactory's `model = functionof(Poisson.(expected))` applied via
+/// `likelihoodof` / `logdensityof(L, θ)`). This adds no new density emission — it
+/// only routes the reified body to the existing arm.
+///
+/// **Boundary threading (refuse-don't-mislower).** Histfactory's boundary is a
+/// SELF-REF (`(lam, %ref self lam)`): the body references the param as
+/// `(%ref self lam)` — exactly what the per-query θ-inliner
+/// ([`substitute_refs_by_name`]) rewrites — so unwrapping the wrapper and recursing
+/// binds the θ point unchanged (an `Inputs::Auto` boundary is auto-traced to the
+/// same self-refs). But a `Spec` entry whose `Ref` is a LOCAL placeholder
+/// (`(x, %ref local _x_)` — a genuine lambda argument) is NOT θ-inlinable: the
+/// SelfMod-keyed inliner cannot reach a `(%ref local _x_)` left in the body, and
+/// once the wrapper is unwrapped the [`subtree_has_theta_capturing_input`] guard
+/// (which scans for a SURVIVING reification's inputs) no longer sees the boundary.
+/// Rather than emit a density with a dangling placeholder, we REFUSE.
+fn lower_reified_measure(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseError> {
+    let body = {
+        let Node::Call(c) = m.node(node) else {
+            return Err(refuse(node, m, "expected functionof/kernelof"));
+        };
+        if c.args.len() != 1 {
+            return Err(refuse(
+                node,
+                m,
+                "functionof/kernelof reifies exactly one body expression",
+            ));
+        }
+        // A LOCAL placeholder boundary input is a genuine lambda argument the
+        // per-query θ-inliner (SelfMod-keyed) cannot reach once the wrapper is
+        // unwrapped — refuse rather than leave a dangling `(%ref local …)` in the
+        // scored density.
+        if let Some(flatppl_core::Inputs::Spec(entries)) = &c.inputs {
+            if entries.iter().any(|(_, r)| r.ns == RefNs::Local) {
+                return Err(refuse(
+                    node,
+                    m,
+                    "functionof/kernelof used as a measure has a placeholder boundary input that \
+                     cannot be inlined per query; this reified measure is not yet lowerable — \
+                     refuse rather than mislower",
+                ));
+            }
+        }
+        c.args[0]
+    };
+    lower_measure_density(m, body, v)
 }
 
 // ---------------------------------------------------------------------------

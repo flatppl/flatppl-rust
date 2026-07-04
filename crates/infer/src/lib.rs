@@ -44,6 +44,14 @@ pub fn builtin_catalogue() -> &'static Catalogue {
     catalogue::builtin()
 }
 
+/// Ordered constructor parameter names for a built-in distribution (spec
+/// §08/§09 "Parameters" column), e.g. `Normal` → `["mu", "sigma"]`. Looked up
+/// across base builtins and every standard module's bindings. `None` if
+/// `name` isn't a known distribution.
+pub fn distribution_param_names(name: &str) -> Option<Vec<String>> {
+    catalogue::builtin().distribution_param_names(name)
+}
+
 /// A message produced during inference. `Error` marks an ill-formed module
 /// (the offending nodes carry `(%failed …)` types); `Note` records an
 /// honest gap (op not yet in the catalogue, deferred feature).
