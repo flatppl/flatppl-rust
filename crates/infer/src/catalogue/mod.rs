@@ -53,6 +53,13 @@ pub(crate) enum Sig {
         domain: DomainSig,
         support: SupportTag,
         mass: MassTag,
+        /// Ordered constructor parameter names (spec §08/§09 "Parameters"
+        /// column), e.g. `Normal` → `["mu", "sigma"]`. Consumed by the
+        /// determiniser to build a density record's named fields from
+        /// positional call arguments. `#[serde(default)]` so parsing does not
+        /// break mid-migration — every row is expected to fill it in.
+        #[serde(default)]
+        params: Vec<String>,
     },
     Function {
         // Declared parameter types: parsed from RON for schema fidelity, but
@@ -323,6 +330,25 @@ impl Catalogue {
             .iter()
             .find(|m| m.name == module)
             .map(|m| m.bindings.iter().map(|b| b.name.as_str()))
+    }
+
+    /// Ordered constructor parameter names for a built-in distribution (spec
+    /// §08/§09 "Parameters" column), e.g. `Normal` → `["mu", "sigma"]`.
+    /// Checks base builtins first, then every standard module's bindings.
+    /// `None` if `name` isn't a distribution, or isn't found at all.
+    pub fn distribution_param_names(&self, name: &str) -> Option<Vec<String>> {
+        if let Some(Sig::Distribution { params, .. }) = self.base(name) {
+            return Some(params.clone());
+        }
+        self.modules.iter().find_map(|m| {
+            m.bindings
+                .iter()
+                .find(|b| b.name == name)
+                .and_then(|b| match &b.sig {
+                    Sig::Distribution { params, .. } => Some(params.clone()),
+                    Sig::Function { .. } => None,
+                })
+        })
     }
 }
 
@@ -805,6 +831,67 @@ mod tests {
             .collect();
         assert!(pp.contains(&"CrystalBall"));
         assert!(cat.module_binding_names("no-such-module").is_none());
+    }
+
+    /// `distribution_param_names` looks up the ordered constructor parameter
+    /// names (spec §08/§09 "Parameters" column) across both base builtins and
+    /// standard-module bindings, and returns `None` for non-distributions and
+    /// unknown names.
+    #[test]
+    fn distribution_param_names_looks_up_base_and_module() {
+        let cat = builtin();
+        // Base distribution.
+        assert_eq!(
+            cat.distribution_param_names("Normal"),
+            Some(vec!["mu".to_string(), "sigma".to_string()])
+        );
+        // Module distribution (particle-physics).
+        assert_eq!(
+            cat.distribution_param_names("CrystalBall"),
+            Some(vec![
+                "m0".to_string(),
+                "sigma".to_string(),
+                "alpha".to_string(),
+                "n".to_string(),
+            ])
+        );
+        // A base function (not a distribution) → None.
+        assert_eq!(cat.distribution_param_names("sqrt"), None);
+        // Unknown name → None.
+        assert_eq!(cat.distribution_param_names("NotARealBuiltin"), None);
+    }
+
+    /// Every `Sig::Distribution` in the base catalogue and every standard
+    /// module must carry a non-empty `params` list (spec §08/§09 "Parameters"
+    /// column) — mirrors `catalogue_faithful_to_legacy_ops`'s enumeration, but
+    /// scoped to param-name completeness rather than domain/support/mass
+    /// faithfulness.
+    #[test]
+    fn distribution_param_names_are_complete() {
+        let cat = builtin();
+
+        for b in &cat.base {
+            if let Sig::Distribution { params, .. } = &b.sig {
+                assert!(
+                    !params.is_empty(),
+                    "base distribution '{}' has empty params",
+                    b.name
+                );
+            }
+        }
+
+        for m in &cat.modules {
+            for binding in &m.bindings {
+                if let Sig::Distribution { params, .. } = &binding.sig {
+                    assert!(
+                        !params.is_empty(),
+                        "module '{}' distribution '{}' has empty params",
+                        m.name,
+                        binding.name
+                    );
+                }
+            }
+        }
     }
 
     #[test]

@@ -5,68 +5,68 @@
 Catalogue(
     base: [
         // ---- Continuous univariate, domain ⊆ ℝ ----
-        Builtin(name: "Normal",            sig: Distribution(domain: Scalar(Real), support: Reals,         mass: Normalized)),
-        Builtin(name: "GeneralizedNormal", sig: Distribution(domain: Scalar(Real), support: Reals,         mass: Normalized)),
-        Builtin(name: "Cauchy",            sig: Distribution(domain: Scalar(Real), support: Reals,         mass: Normalized)),
-        Builtin(name: "StudentT",          sig: Distribution(domain: Scalar(Real), support: Reals,         mass: Normalized)),
-        Builtin(name: "Logistic",          sig: Distribution(domain: Scalar(Real), support: Reals,         mass: Normalized)),
-        Builtin(name: "VonMises",          sig: Distribution(domain: Scalar(Real), support: Reals,         mass: Normalized)),
-        Builtin(name: "Laplace",           sig: Distribution(domain: Scalar(Real), support: Reals,         mass: Normalized)),
-        Builtin(name: "LogNormal",         sig: Distribution(domain: Scalar(Real), support: PosReals,      mass: Normalized)),
-        Builtin(name: "Gamma",             sig: Distribution(domain: Scalar(Real), support: PosReals,      mass: Normalized)),
-        Builtin(name: "InverseGamma",      sig: Distribution(domain: Scalar(Real), support: PosReals,      mass: Normalized)),
-        Builtin(name: "ChiSquared",        sig: Distribution(domain: Scalar(Real), support: PosReals,      mass: Normalized)),
-        Builtin(name: "Exponential",       sig: Distribution(domain: Scalar(Real), support: NonNegReals,   mass: Normalized)),
-        Builtin(name: "Weibull",           sig: Distribution(domain: Scalar(Real), support: NonNegReals,   mass: Normalized)),
-        Builtin(name: "Beta",              sig: Distribution(domain: Scalar(Real), support: UnitInterval,  mass: Normalized)),
+        Builtin(name: "Normal",            sig: Distribution(domain: Scalar(Real), support: Reals,         mass: Normalized, params: ["mu", "sigma"])),
+        Builtin(name: "GeneralizedNormal", sig: Distribution(domain: Scalar(Real), support: Reals,         mass: Normalized, params: ["mean", "alpha", "beta"])),
+        Builtin(name: "Cauchy",            sig: Distribution(domain: Scalar(Real), support: Reals,         mass: Normalized, params: ["location", "scale"])),
+        Builtin(name: "StudentT",          sig: Distribution(domain: Scalar(Real), support: Reals,         mass: Normalized, params: ["nu"])),
+        Builtin(name: "Logistic",          sig: Distribution(domain: Scalar(Real), support: Reals,         mass: Normalized, params: ["mu", "s"])),
+        Builtin(name: "VonMises",          sig: Distribution(domain: Scalar(Real), support: Reals,         mass: Normalized, params: ["mu", "kappa"])),
+        Builtin(name: "Laplace",           sig: Distribution(domain: Scalar(Real), support: Reals,         mass: Normalized, params: ["location", "scale"])),
+        Builtin(name: "LogNormal",         sig: Distribution(domain: Scalar(Real), support: PosReals,      mass: Normalized, params: ["mu", "sigma"])),
+        Builtin(name: "Gamma",             sig: Distribution(domain: Scalar(Real), support: PosReals,      mass: Normalized, params: ["shape", "rate"])),
+        Builtin(name: "InverseGamma",      sig: Distribution(domain: Scalar(Real), support: PosReals,      mass: Normalized, params: ["shape", "scale"])),
+        Builtin(name: "ChiSquared",        sig: Distribution(domain: Scalar(Real), support: PosReals,      mass: Normalized, params: ["k"])),
+        Builtin(name: "Exponential",       sig: Distribution(domain: Scalar(Real), support: NonNegReals,   mass: Normalized, params: ["rate"])),
+        Builtin(name: "Weibull",           sig: Distribution(domain: Scalar(Real), support: NonNegReals,   mass: Normalized, params: ["shape", "scale"])),
+        Builtin(name: "Beta",              sig: Distribution(domain: Scalar(Real), support: UnitInterval,  mass: Normalized, params: ["alpha", "beta"])),
         // Pareto: spec §08 — domain reals, support posreals (x >= x_m > 0).
         // Legacy ops.rs distribution_domain does not list Pareto (falls through
         // to %deferred); this row brings the catalogue into spec compliance.
-        Builtin(name: "Pareto",            sig: Distribution(domain: Scalar(Real), support: PosReals,      mass: Normalized)),
+        Builtin(name: "Pareto",            sig: Distribution(domain: Scalar(Real), support: PosReals,      mass: Normalized, params: ["shape", "scale"])),
         // Uniform(support): spec §08 — domain is `reals`, support is the set
         // expression passed as argument (structural, not a fixed tag).
         // SupportTag::Structural signals to Task-4 dispatch that the support
         // MUST be kept on the code path (ops.rs set_expr_valueset); the static
         // approximation is Unknown (the catalogue row is domain-only for Uniform).
-        Builtin(name: "Uniform",           sig: Distribution(domain: Scalar(Real), support: Structural,    mass: Normalized)),
+        Builtin(name: "Uniform",           sig: Distribution(domain: Scalar(Real), support: Structural,    mass: Normalized, params: ["support"])),
 
         // ---- Discrete univariate ----
         // Bernoulli: spec §08 "Domain/Support: integers/booleans" — density is
         // w.r.t. Counting(integers); the variate is integer-typed, support is
         // {0,1} = booleans. Legacy ops.rs returns Scalar(Boolean) for domain
         // (a legacy bug: domain should be integers per spec).
-        Builtin(name: "Bernoulli",         sig: Distribution(domain: Scalar(Integer), support: Booleans,       mass: Normalized)),
+        Builtin(name: "Bernoulli",         sig: Distribution(domain: Scalar(Integer), support: Booleans,       mass: Normalized, params: ["p"])),
         // Categorical/Categorical0/Binomial: spec §08 supports are param-bounded
         // integer intervals, but ValueSet::Interval takes only static literal
         // bounds — a parameter-dependent integer-bounded set is inexpressible, so
         // the sound named-set superset is used and flagged degraded (honest-degrade
         // policy). Support value is unchanged from legacy ops.rs.
-        Builtin(name: "Categorical",       sig: Distribution(domain: Scalar(Integer), support: PosIntegers,    mass: Normalized),
+        Builtin(name: "Categorical",       sig: Distribution(domain: Scalar(Integer), support: PosIntegers,    mass: Normalized, params: ["p"]),
             degraded: Some("spec §08 support is interval(1, n); type system has no parameter-dependent integer-bounded ValueSet → PosIntegers (sound superset)")),
-        Builtin(name: "Categorical0",      sig: Distribution(domain: Scalar(Integer), support: NonNegIntegers, mass: Normalized),
+        Builtin(name: "Categorical0",      sig: Distribution(domain: Scalar(Integer), support: NonNegIntegers, mass: Normalized, params: ["p"]),
             degraded: Some("spec §08 support is interval(0, n-1); type system has no parameter-dependent integer-bounded ValueSet → NonNegIntegers (sound superset)")),
-        Builtin(name: "Binomial",          sig: Distribution(domain: Scalar(Integer), support: NonNegIntegers, mass: Normalized),
+        Builtin(name: "Binomial",          sig: Distribution(domain: Scalar(Integer), support: NonNegIntegers, mass: Normalized, params: ["n", "p"]),
             degraded: Some("spec §08 support is interval(0, n); type system has no parameter-dependent integer-bounded ValueSet → NonNegIntegers (sound superset)")),
-        Builtin(name: "Geometric",         sig: Distribution(domain: Scalar(Integer), support: NonNegIntegers, mass: Normalized)),
-        Builtin(name: "NegativeBinomial",  sig: Distribution(domain: Scalar(Integer), support: NonNegIntegers, mass: Normalized)),
-        Builtin(name: "NegativeBinomial2", sig: Distribution(domain: Scalar(Integer), support: NonNegIntegers, mass: Normalized)),
-        Builtin(name: "Poisson",           sig: Distribution(domain: Scalar(Integer), support: NonNegIntegers, mass: Normalized)),
+        Builtin(name: "Geometric",         sig: Distribution(domain: Scalar(Integer), support: NonNegIntegers, mass: Normalized, params: ["p"])),
+        Builtin(name: "NegativeBinomial",  sig: Distribution(domain: Scalar(Integer), support: NonNegIntegers, mass: Normalized, params: ["alpha", "beta"])),
+        Builtin(name: "NegativeBinomial2", sig: Distribution(domain: Scalar(Integer), support: NonNegIntegers, mass: Normalized, params: ["mu", "psi"])),
+        Builtin(name: "Poisson",           sig: Distribution(domain: Scalar(Integer), support: NonNegIntegers, mass: Normalized, params: ["rate"])),
 
         // ---- Multivariate ----
         // MvNormal: domain ℝ^n, support CartPow(Reals, n) where n = length(mu).
-        Builtin(name: "MvNormal",    sig: Distribution(domain: VectorFromParam(elem: Real,    param: "mu"),    support: CartPowReals,          mass: Normalized)),
+        Builtin(name: "MvNormal",    sig: Distribution(domain: VectorFromParam(elem: Real,    param: "mu"),    support: CartPowReals,          mass: Normalized, params: ["mu", "cov"])),
         // Dirichlet: domain Δ^n (standard simplex), support StdSimplex(n) where n = length(alpha).
-        Builtin(name: "Dirichlet",   sig: Distribution(domain: VectorFromParam(elem: Real,    param: "alpha"), support: StdSimplex,            mass: Normalized)),
+        Builtin(name: "Dirichlet",   sig: Distribution(domain: VectorFromParam(elem: Real,    param: "alpha"), support: StdSimplex,            mass: Normalized, params: ["alpha"])),
         // Multinomial: domain ℕ^n, support CartPow(NonNegIntegers, n) where n = length(p).
-        Builtin(name: "Multinomial", sig: Distribution(domain: VectorFromParam(elem: Integer, param: "p"),     support: CartPowNonNegIntegers, mass: Normalized)),
+        Builtin(name: "Multinomial", sig: Distribution(domain: VectorFromParam(elem: Integer, param: "p"),     support: CartPowNonNegIntegers, mass: Normalized, params: ["n", "p"])),
 
         // ---- Matrix distributions ----
         // Legacy ops.rs does not enumerate these in distribution_support (falls
         // through to Unknown). Domain is always a dynamic real matrix.
-        Builtin(name: "Wishart",        sig: Distribution(domain: DynMatrix, support: Unknown, mass: Normalized)),
-        Builtin(name: "InverseWishart", sig: Distribution(domain: DynMatrix, support: Unknown, mass: Normalized)),
-        Builtin(name: "LKJ",            sig: Distribution(domain: DynMatrix, support: Unknown, mass: Normalized)),
-        Builtin(name: "LKJCholesky",    sig: Distribution(domain: DynMatrix, support: Unknown, mass: Normalized)),
+        Builtin(name: "Wishart",        sig: Distribution(domain: DynMatrix, support: Unknown, mass: Normalized, params: ["nu", "scale"])),
+        Builtin(name: "InverseWishart", sig: Distribution(domain: DynMatrix, support: Unknown, mass: Normalized, params: ["nu", "scale"])),
+        Builtin(name: "LKJ",            sig: Distribution(domain: DynMatrix, support: Unknown, mass: Normalized, params: ["n", "eta"])),
+        Builtin(name: "LKJCholesky",    sig: Distribution(domain: DynMatrix, support: Unknown, mass: Normalized, params: ["n", "eta"])),
 
         // ---- base per-name functions (spec §07) ----
         // Per-name signatures expressible via ResultSig: constant scalar output,

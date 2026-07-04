@@ -178,6 +178,7 @@ pub(crate) fn lower(sig: &Sig, ctx: &LowerCtx) -> (Type, ValueSet) {
             domain,
             support: sup,
             mass: m,
+            ..
         } => {
             let (dom, vset) = match domain {
                 DomainSig::Scalar(s) => (Type::Scalar(scalar(*s)), support(*sup)),
@@ -364,6 +365,7 @@ mod tests {
             domain: DomainSig::Scalar(ScalarTag::Real),
             support: SupportTag::Reals,
             mass: MassTag::Normalized,
+            params: vec!["mu".to_string(), "sigma".to_string()],
         };
         let cx = LowerCtx {
             arg_scalar: &|_| Some(ScalarType::Real),
