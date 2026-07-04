@@ -180,3 +180,127 @@ lp = logdensityof(lawof(broadcast(add, a, b)), [5.0, 5.0])";
         "refusal should name that the head is not a distribution constructor: {msg}"
     );
 }
+
+// histfactory scores a broadcast-kernel through a REIFIED measure: the model is a
+// `functionof` whose BODY is `broadcast(K, params)`, applied as a likelihood at a
+// θ point. `functionof(broadcast(Poisson, [lam, lam, lam]), lam = lam)` is a
+// kernel with input `lam`; `likelihoodof(k, obs)` then `logdensityof(L, θ)` scores
+// it at θ. The determiniser must UNWRAP the reification (its body is `args[0]`; the
+// `(lam, %ref self lam)` boundary is a self-ref that the per-query θ-inliner reaches
+// through the body's `(%ref self lam)`) so the body reaches the broadcast-kernel
+// arm — yielding the same axis-native `sum(broadcast(builtin_logdensityof, …))`, now
+// with θ inlined: each `(%ref self lam)` in the per-cell rate becomes 1.5.
+#[test]
+fn functionof_broadcast_kernel_scores_via_likelihood() {
+    let src = "\
+lam = elementof(posreals)
+k = functionof(broadcast(Poisson, [lam, lam, lam]), lam = lam)
+L = likelihoodof(k, [1, 2, 3])
+lp = logdensityof(L, record(lam = 1.5))";
+    let out = determinize_src(src);
+    let pir = flatppl_flatpir::write(&out);
+
+    // Same axis-native emission as the bare broadcast-kernel: one sum, one density
+    // term, the outer density broadcast over the Poisson tag, the inner per-cell
+    // record-broadcast keyed by the constructor's param name (`rate`).
+    assert!(pir.contains("(sum "), "sum reduction present:\n{pir}");
+    assert!(
+        pir.contains("(broadcast builtin_logdensityof Poisson"),
+        "outer broadcast zips builtin_logdensityof over the Poisson tag:\n{pir}"
+    );
+    assert!(
+        pir.contains("(broadcast record (%kwarg rate"),
+        "inner broadcast builds per-cell record(rate = …):\n{pir}"
+    );
+    assert_eq!(
+        pir.matches("builtin_logdensityof").count(),
+        1,
+        "one density term (not one-per-element):\n{pir}"
+    );
+
+    // The reification is UNWRAPPED — no `functionof` and no measure layer survive.
+    assert!(
+        !pir.contains("(functionof ") && !pir.contains("(kernelof "),
+        "reification unwrapped:\n{pir}"
+    );
+    assert!(
+        !pir.contains("(logdensityof ")
+            && !pir.contains("(likelihoodof ")
+            && !pir.contains("lawof"),
+        "measure/likelihood layer gone:\n{pir}"
+    );
+
+    // θ = record(lam = 1.5) is inlined through the self-ref boundary: each
+    // `(%ref self lam)` in the per-cell rate vector becomes 1.5, and no dangling
+    // `(%ref self lam)` survives in the scored density.
+    assert!(
+        pir.contains("(vector 1.5 1.5 1.5)"),
+        "θ value 1.5 inlined into the per-cell rate vector:\n{pir}"
+    );
+    assert!(
+        !pir.contains("(%ref self lam)"),
+        "no dangling free-param ref left in the density:\n{pir}"
+    );
+
+    assert!(is_flatpdl(&out).is_ok(), "is_flatpdl:\n{pir}");
+}
+
+// The unwrap generalizes beyond broadcast: a SCALAR reified measure
+// `functionof(Normal(mu = mu, sigma = 1.0), mu = mu)` scored via a likelihood
+// lowers exactly like the bare-kernel likelihood query — the body reaches
+// `build_density_term`, and θ = record(mu = 2.0) inlines into the `mu` field.
+#[test]
+fn functionof_scalar_measure_scores_via_likelihood() {
+    let src = "\
+mu = elementof(reals)
+k = functionof(Normal(mu = mu, sigma = 1.0), mu = mu)
+L = likelihoodof(k, 0.5)
+lp = logdensityof(L, record(mu = 2.0))";
+    let out = determinize_src(src);
+    let pir = flatppl_flatpir::write(&out);
+    assert!(
+        pir.contains("builtin_logdensityof"),
+        "kernel density present:\n{pir}"
+    );
+    assert!(
+        pir.contains("(%field mu 2.0)"),
+        "θ value 2.0 inlined into the mu field via the unwrapped reification:\n{pir}"
+    );
+    assert!(
+        !pir.contains("(functionof ") && !pir.contains("(kernelof "),
+        "reification unwrapped:\n{pir}"
+    );
+    assert!(
+        !pir.contains("(likelihoodof ") && !pir.contains("lawof"),
+        "measure/likelihood layer gone:\n{pir}"
+    );
+    assert!(is_flatpdl(&out).is_ok(), "is_flatpdl:\n{pir}");
+}
+
+// Refuse-don't-mislower survives the reified-measure unwrap. Unwrapping the
+// outer `functionof` measure does NOT bypass the θ-capture guard: here the
+// unwrapped body `weighted(w, Normal(…))` scores through `w`, and
+// `w = functionof(mul(coeff, _x_), …, coeff = coeff)` closes over the θ param
+// `coeff` as a reification INPUT — which the per-query θ-inliner cannot reach
+// (`substitute_refs_by_name` walks `children()`, excluding a `Call`'s `Inputs`).
+// The `subtree_has_theta_capturing_input` guard follows the density's
+// `(%ref self w)` into `w`'s RHS, sees the `(coeff, %ref self coeff)` boundary
+// entry, and HARD REFUSES rather than score at the free `coeff`.
+#[test]
+fn functionof_measure_wrapping_theta_capturing_weight_still_refuses() {
+    let src = "\
+coeff = elementof(reals)
+w = functionof(mul(coeff, _x_), x = _x_, coeff = coeff)
+k = functionof(weighted(w, Normal(mu = 0.0, sigma = 1.0)), coeff = coeff)
+L = likelihoodof(k, 0.5)
+lp = logdensityof(L, record(coeff = 2.0))";
+    let err = determinize(&parse_infer(src)).expect_err(
+        "a θ param captured inside a reification input must refuse even when reached \
+         through an unwrapped functionof-as-measure, not silently score at the free param",
+    );
+    assert!(
+        err.reason.contains("reification input")
+            && err.reason.contains("refuse rather than mislower"),
+        "refusal is the θ-in-reification-input guard: {err:?}"
+    );
+}

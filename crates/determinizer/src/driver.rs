@@ -530,14 +530,23 @@ fn is_eliminable_measure_rhs(m: &Module, rhs: NodeId) -> bool {
     is_combinator_rhs(m, rhs) || is_measure_typed_rhs(m, rhs)
 }
 
-/// True iff `rhs`'s inferred type is `Measure` or `Likelihood` — the residual
-/// measure-layer value types `is_flatpdl` rejects. Used to sweep an orphaned
-/// distribution-constructor binding (`gauss_x = Normal(…)`) whose op name is not
-/// on `COMBINATOR_OPS`.
+/// True iff `rhs`'s inferred type is `Measure`, `Likelihood`, or `Kernel` — the
+/// residual measure-layer value types `is_flatpdl` rejects (it flags a `Kernel`
+/// outside a `builtin_*` argument, so a bare `Kernel`-typed binding RHS is
+/// rejected exactly as a `Measure`/`Likelihood` one is). Used to sweep an orphaned
+/// distribution-constructor binding (`gauss_x = Normal(…)`) whose op name is not on
+/// `COMBINATOR_OPS`, and a dead reified-measure binding
+/// (`k = functionof(broadcast(Poisson, …), …)`, `Kernel`-typed) left behind once a
+/// likelihood query over it is lowered: `functionof` is deliberately NOT on
+/// `COMBINATOR_OPS` / `MEASURE_VOCAB` (a `functionof` over a deterministic body is
+/// a legal FlatPDL FUNCTION, `Function`-typed — never matched here), so the
+/// reified-MEASURE case (always `Kernel`-typed) is caught by this type arm instead.
 fn is_measure_typed_rhs(m: &Module, rhs: NodeId) -> bool {
     matches!(
         m.type_of(rhs),
-        Some(flatppl_core::Type::Measure { .. }) | Some(flatppl_core::Type::Likelihood { .. })
+        Some(flatppl_core::Type::Measure { .. })
+            | Some(flatppl_core::Type::Likelihood { .. })
+            | Some(flatppl_core::Type::Kernel { .. })
     )
 }
 

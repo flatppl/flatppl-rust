@@ -413,6 +413,12 @@ pub(crate) fn lower_measure_density(
         Some("iid") => lower_iid(m, measure_node, v),
         Some("broadcast") => lower_broadcast_kernel(m, measure_node, v),
         Some("joint") => lower_joint(m, measure_node, v),
+        // A reified measure (`functionof` / `kernelof`) used AS a measure — its
+        // body is the measure expression it reifies. Unwrap to the body and recurse
+        // so a `broadcast(K, params)` body reaches the broadcast-kernel arm and a
+        // bare constructor body reaches `build_density_term` (histfactory's
+        // `functionof(Poisson.(expected))` scored via `likelihoodof`).
+        Some("functionof") | Some("kernelof") => lower_reified_measure(m, measure_node, v),
         // Refused combinators — refused here rather than mis-lowered.
         // `likelihoodof` / `joint_likelihood` are normally unwrapped at the
         // `logdensityof` entry (their arg2 is θ, not a variate); reaching the
@@ -1381,6 +1387,60 @@ fn lower_joint(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Refuse
         terms.push(lower_measure_density(m, mi, elem)?);
     }
     Ok(fold_add(m, &terms))
+}
+
+/// `functionof` / `kernelof` used AS a measure (spec §04 reification, §11 reified
+/// callables). A reification reifies one body expression — the measure it stands
+/// for (`broadcast(K, …)`, `Normal(…)`, a `record`-of-draws, …) — held as its
+/// single positional `args[0]`; its `Inputs` boundary maps each input name to a
+/// `Ref`. Scoring the reified measure is scoring its body, so we UNWRAP to `args[0]`
+/// and recurse through the dispatcher: a `broadcast(K, params)` body then reaches
+/// [`lower_broadcast_kernel`], a bare constructor body reaches [`build_density_term`]
+/// (histfactory's `model = functionof(Poisson.(expected))` applied via
+/// `likelihoodof` / `logdensityof(L, θ)`). This adds no new density emission — it
+/// only routes the reified body to the existing arm.
+///
+/// **Boundary threading (refuse-don't-mislower).** Histfactory's boundary is a
+/// SELF-REF (`(lam, %ref self lam)`): the body references the param as
+/// `(%ref self lam)` — exactly what the per-query θ-inliner
+/// ([`substitute_refs_by_name`]) rewrites — so unwrapping the wrapper and recursing
+/// binds the θ point unchanged (an `Inputs::Auto` boundary is auto-traced to the
+/// same self-refs). But a `Spec` entry whose `Ref` is a LOCAL placeholder
+/// (`(x, %ref local _x_)` — a genuine lambda argument) is NOT θ-inlinable: the
+/// SelfMod-keyed inliner cannot reach a `(%ref local _x_)` left in the body, and
+/// once the wrapper is unwrapped the [`subtree_has_theta_capturing_input`] guard
+/// (which scans for a SURVIVING reification's inputs) no longer sees the boundary.
+/// Rather than emit a density with a dangling placeholder, we REFUSE.
+fn lower_reified_measure(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseError> {
+    let body = {
+        let Node::Call(c) = m.node(node) else {
+            return Err(refuse(node, m, "expected functionof/kernelof"));
+        };
+        if c.args.len() != 1 {
+            return Err(refuse(
+                node,
+                m,
+                "functionof/kernelof reifies exactly one body expression",
+            ));
+        }
+        // A LOCAL placeholder boundary input is a genuine lambda argument the
+        // per-query θ-inliner (SelfMod-keyed) cannot reach once the wrapper is
+        // unwrapped — refuse rather than leave a dangling `(%ref local …)` in the
+        // scored density.
+        if let Some(flatppl_core::Inputs::Spec(entries)) = &c.inputs {
+            if entries.iter().any(|(_, r)| r.ns == RefNs::Local) {
+                return Err(refuse(
+                    node,
+                    m,
+                    "functionof/kernelof used as a measure has a placeholder boundary input that \
+                     cannot be inlined per query; this reified measure is not yet lowerable — \
+                     refuse rather than mislower",
+                ));
+            }
+        }
+        c.args[0]
+    };
+    lower_measure_density(m, body, v)
 }
 
 // ---------------------------------------------------------------------------
