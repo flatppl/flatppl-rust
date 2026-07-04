@@ -32,10 +32,12 @@ fn determinize_refuses_with_exit_3() {
     let dir = std::env::temp_dir().join(format!("flatppl-det-cli-refuse-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let input = dir.join("r.flatppl");
-    // A continuous-latent kchain marginal is intractable → refuse.
+    // A continuous-latent kchain marginal where the latent feeds the likelihood
+    // SCALE (non-conjugate — no closed-form marginal) → refuse. (A latent feeding
+    // the Normal mean is the Normal–Normal conjugate case, which now lowers.)
     std::fs::write(
         &input,
-        "z = draw(Normal(mu = 0.0, sigma = 1.0))\nk = kernelof(record(y = draw(Normal(mu = z, sigma = 1.0))), z = z)\npp = kchain(lawof(record(z = z)), k)\nlp = logdensityof(pp, record(y = 0.5))\n",
+        "z = draw(Normal(mu = 0.0, sigma = 1.0))\nk = kernelof(record(y = draw(Normal(mu = 1.0, sigma = z))), z = z)\npp = kchain(lawof(record(z = z)), k)\nlp = logdensityof(pp, record(y = 0.5))\n",
     )
     .unwrap();
     let out = flatppl().arg("determinize").arg(&input).output().unwrap();
