@@ -115,6 +115,91 @@ lp = logdensityof(lawof(broadcast(Poisson, rates)), obs)";
     assert!(is_flatpdl(&out).is_ok(), "is_flatpdl:\n{pir}");
 }
 
+// A MODULE-QUALIFIED distribution head — `hepphys.ContinuedPoisson.(rates)` — is
+// resolved to its bare member name (`ContinuedPoisson`) exactly like a base
+// built-in constructor: the broadcast head is a `(%ref hepphys ContinuedPoisson)`
+// module-member ref, not a bare `Const`, but its member name is a known §09
+// distribution (`distribution_param_names` → `["rate"]`). The emitted kernel is
+// the BARE `Const(ContinuedPoisson)` tag — the same form the JS REGISTRY keys and
+// the same Poisson-shaped emission the broadcast arm already produces. This is the
+// histfactory `functionof(hepphys.ContinuedPoisson.(mcstat .* mcstat_tau))` shape.
+#[test]
+fn broadcast_module_qualified_head_resolves_to_bare_member_kernel() {
+    let src = "\
+hepphys = standard_module(\"particle-physics\", \"0.1\")
+rates = [2.0, 3.0]
+obs = [1.0, 2.0]
+lp = logdensityof(lawof(broadcast(hepphys.ContinuedPoisson, rates)), obs)";
+    let out = determinize_src(src);
+    let pir = flatppl_flatpir::write(&out);
+
+    // Same axis-native emission as the bare-Const broadcast-kernel, but keyed by
+    // the resolved member name: one sum, the outer density broadcast over the BARE
+    // `ContinuedPoisson` tag, the inner per-cell record keyed by the member's param
+    // name (`rate`).
+    assert!(pir.contains("(sum "), "sum reduction present:\n{pir}");
+    assert!(
+        pir.contains("(broadcast builtin_logdensityof ContinuedPoisson"),
+        "outer broadcast zips builtin_logdensityof over the bare ContinuedPoisson tag:\n{pir}"
+    );
+    assert!(
+        pir.contains("(broadcast record (%kwarg rate"),
+        "inner broadcast builds per-cell record(rate = …):\n{pir}"
+    );
+    assert_eq!(pir.matches("(sum ").count(), 1, "one sum:\n{pir}");
+    assert_eq!(
+        pir.matches("builtin_logdensityof").count(),
+        1,
+        "one density term (not one-per-element):\n{pir}"
+    );
+    assert_eq!(
+        pir.matches("broadcast").count(),
+        2,
+        "two broadcasts:\n{pir}"
+    );
+
+    // The kernel tag is emitted BARE — the module-qualified ref does not survive as
+    // the kernel head (the JS registry keys `ContinuedPoisson` bare).
+    assert!(
+        !pir.contains("(%ref hepphys ContinuedPoisson)"),
+        "module-qualified ref must not survive as the kernel tag:\n{pir}"
+    );
+    assert!(
+        !pir.contains("get0") && !pir.contains("(iid "),
+        "must be axis-native, not unrolled:\n{pir}"
+    );
+    assert!(
+        !pir.contains("lawof") && !pir.contains("(draw "),
+        "measure layer gone:\n{pir}"
+    );
+    assert!(is_flatpdl(&out).is_ok(), "is_flatpdl:\n{pir}");
+}
+
+// Refuse-don't-mislower survives the module-member generalization: a module
+// *function* member as a broadcast head (`hepphys.interp_poly6_exp`) resolves to a
+// name, but that name is NOT a distribution (`distribution_param_names` → `None`),
+// so it must still refuse — the module namespace does not by itself make a head a
+// kernel. Only a module member that resolves to a known §09 distribution lowers.
+#[test]
+fn broadcast_module_function_head_still_refuses() {
+    let src = "\
+hepphys = standard_module(\"particle-physics\", \"0.1\")
+lo = [0.9, 0.8]
+nom = [1.0, 1.0]
+hi = [1.1, 1.2]
+alpha = elementof(reals)
+lp = logdensityof(lawof(broadcast(hepphys.interp_poly6_exp, lo, nom, hi, alpha)), [1.0, 1.0])";
+    let err = determinize(&parse_infer(src)).expect_err(
+        "a module FUNCTION member used as a broadcast head is not a distribution constructor \
+         and must refuse, not mislower",
+    );
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("not a known distribution constructor"),
+        "refusal should name that the module member is not a known distribution constructor: {msg}"
+    );
+}
+
 // A multi-parameter kernel — `Normal.(mus, sigmas)` — binds its POSITIONAL
 // data-args to the constructor's ordered parameter names (`mu`, then `sigma`)
 // when building the per-cell record.

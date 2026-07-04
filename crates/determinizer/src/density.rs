@@ -1203,10 +1203,17 @@ fn lower_iid(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseEr
 /// and `obs` (array) are zipped to per-cell log-densities; `sum` reduces to the
 /// scalar joint. `broadcast`/`record`/`sum` are §04/§07 ops legal in FlatPDL.
 ///
+/// **Head shapes.** The broadcast head resolves to a constructor name from either
+/// a bare built-in `Const(sym)` (`broadcast(Poisson, …)`) or a standard-module
+/// member `Ref { ns: Module(_), name }` (`broadcast(hepphys.ContinuedPoisson, …)`,
+/// §09); both reduce to the member name and emit the BARE `Const(name)` kernel.
+///
 /// **Refuse-don't-mislower.** A value-broadcast (head a deterministic op like
-/// `add`, or any non-`Const` head) is not a kernel — it is refused rather than
-/// treated as a measure. A `Const` head whose name is not a known distribution
-/// constructor (`distribution_param_names` → `None`) is likewise refused.
+/// `add`, or any other head shape — a `%ref self`/`%ref %local` binding, a
+/// literal) is not a kernel — it is refused rather than treated as a measure. A
+/// head whose resolved name is not a known distribution constructor
+/// (`distribution_param_names` → `None`, e.g. a module *function* member) is
+/// likewise refused.
 fn lower_broadcast_kernel(
     m: &mut Module,
     measure: NodeId,
@@ -1225,15 +1232,30 @@ fn lower_broadcast_kernel(
         (head, pos_args, kw_args)
     };
 
-    // The head must be a distribution CONSTRUCTOR — a bare `Node::Const(sym)`. A
-    // value-broadcast (`broadcast(add, a, b)`, head a deterministic op) reaching
-    // the measure dispatcher must NOT be mislowered as a kernel: refuse.
-    let Node::Const(ctor_sym) = *m.node(head) else {
-        return Err(refuse(
-            measure,
-            m,
-            "broadcast head is not a distribution constructor (value-broadcast used as a measure)",
-        ));
+    // The head must resolve to a distribution CONSTRUCTOR NAME. Two shapes carry
+    // one: a bare built-in `Node::Const(sym)` (`broadcast(Poisson, …)`), or a
+    // standard-module member `Node::Ref { ns: Module(_), name }`
+    // (`broadcast(hepphys.ContinuedPoisson, …)`, §09). Both reduce to the member
+    // name symbol; the kernel is emitted BARE as `Const(name)` (below) — the same
+    // tag the engine's kernel registry keys, module-qualified or not.
+    //
+    // A value-broadcast (`broadcast(add, a, b)`, head a deterministic op) reaching
+    // the measure dispatcher must NOT be mislowered as a kernel; nor must a
+    // non-module ref (`%ref self …` / `%ref %local …`, which are bindings, not
+    // constructors). Refuse.
+    let ctor_sym = match *m.node(head) {
+        Node::Const(sym) => sym,
+        Node::Ref(Ref {
+            ns: RefNs::Module(_),
+            name,
+        }) => name,
+        _ => {
+            return Err(refuse(
+                measure,
+                m,
+                "broadcast head is not a distribution constructor (value-broadcast used as a measure)",
+            ));
+        }
     };
 
     // Ordered constructor parameter names (spec §08). `None` ⇒ the head is not a
