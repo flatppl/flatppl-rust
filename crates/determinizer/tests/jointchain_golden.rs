@@ -76,3 +76,20 @@ lp = logdensityof(j, record(prior = record(a = 0.3), fwd = record(b = 0.7)))";
         "explains keyword-form: {err:?}"
     );
 }
+
+// Record-form base + a bare-scalar kernel step is a malformed/mixed shape —
+// refuse (never panic). Regression for the jointchain.rs comp.field.expect bug.
+#[test]
+fn jointchain_record_base_scalar_kernel_refuses() {
+    let src = "\
+a = draw(Normal(mu = 0.0, sigma = 1.0))
+k = kernelof(draw(Normal(mu = a, sigma = 0.5)), a = a)
+j = jointchain(lawof(record(a = a)), k)
+lp = logdensityof(j, record(a = 0.3, b = 0.7))";
+    let m = parse_infer(src);
+    let err = determinize(&m).expect_err("record base + scalar kernel step must refuse, not panic");
+    assert!(
+        err.construct.contains("jointchain"),
+        "names jointchain: {err:?}"
+    );
+}

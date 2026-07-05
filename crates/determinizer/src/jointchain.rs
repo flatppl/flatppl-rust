@@ -24,15 +24,11 @@ use crate::refuse::RefuseError;
 use flatppl_core::{CallHead, Module, NamedKind, Node, NodeId, Symbol};
 
 /// A resolved single-draw component: its variate field name (record-form) or
-/// `None` (scalar-cat), the distribution constructor, and its kernel inputs
-/// (empty for the base measure).
+/// `None` (scalar-cat), and its distribution constructor. Kernel inputs are
+/// read from the `Kernel` directly (not carried here).
 struct Component {
     field: Option<Symbol>,
     dist: NodeId,
-    // Read by the scalar-cat family (Task 4); record-form binds via
-    // `Kernel.inputs` directly, so this field is unread here.
-    #[allow(dead_code)]
-    inputs: Vec<(Symbol, flatppl_core::Ref)>,
 }
 
 /// Lower `logdensityof(jointchain(C₀, …, Cₙ), v)`.
@@ -108,7 +104,12 @@ fn lower_record_family(
             .ok_or_else(|| refuse_jc(node, "jointchain kernel is not a kernelof(...)"))?;
         let comp = resolve_kernel_component(m, &kernel)
             .ok_or_else(|| refuse_jc(node, "kernel body is not a single-field-record draw"))?;
-        let fi = comp.field.expect("record family kernel has a field");
+        let fi = comp.field.ok_or_else(|| {
+            refuse_jc(
+                node,
+                "record-form jointchain kernel body is not a single-field-record draw",
+            )
+        })?;
 
         // Bind each input: match its NAME to a prior field, substitute its REF
         // SYMBOL in the constructor with that field's realized value.
@@ -141,22 +142,14 @@ fn resolve_base(m: &Module, base_arg: NodeId) -> Option<Component> {
         Some(_) => return None,
         None => resolved,
     };
-    resolve_single_draw(m, inner).map(|(field, dist)| Component {
-        field,
-        dist,
-        inputs: vec![],
-    })
+    resolve_single_draw(m, inner).map(|(field, dist)| Component { field, dist })
 }
 
 /// Resolve a kernel body to its single-draw `Component` (no `lawof`; the inputs
 /// come from the `Kernel`).
 fn resolve_kernel_component(m: &Module, kernel: &Kernel) -> Option<Component> {
     let (field, dist) = resolve_single_draw(m, kernel.body)?;
-    Some(Component {
-        field,
-        dist,
-        inputs: kernel.inputs.clone(),
-    })
+    Some(Component { field, dist })
 }
 
 /// Peel an optional single-field `record(f = X)` wrapper, then an optional
