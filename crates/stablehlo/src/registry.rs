@@ -78,7 +78,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
         "Gamma",
         DistLowering {
             logpdf: gamma_logpdf,
-            sample: None,
+            sample: Some(gamma_sample),
         },
     ),
     (
@@ -99,14 +99,14 @@ static REGISTRY: &[(&str, DistLowering)] = &[
         "InverseGamma",
         DistLowering {
             logpdf: inverse_gamma_logpdf,
-            sample: None,
+            sample: Some(inverse_gamma_sample),
         },
     ),
     (
         "ChiSquared",
         DistLowering {
             logpdf: chi_squared_logpdf,
-            sample: None,
+            sample: Some(chi_squared_sample),
         },
     ),
     (
@@ -127,21 +127,21 @@ static REGISTRY: &[(&str, DistLowering)] = &[
         "Beta",
         DistLowering {
             logpdf: beta_logpdf,
-            sample: None,
+            sample: Some(beta_sample),
         },
     ),
     (
         "StudentT",
         DistLowering {
             logpdf: studentt_logpdf,
-            sample: None,
+            sample: Some(studentt_sample),
         },
     ),
     (
         "GeneralizedNormal",
         DistLowering {
             logpdf: generalized_normal_logpdf,
-            sample: None,
+            sample: Some(generalized_normal_sample),
         },
     ),
     (
@@ -218,7 +218,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
         "Dirichlet",
         DistLowering {
             logpdf: dirichlet_logpdf,
-            sample: None,
+            sample: Some(dirichlet_sample),
         },
     ),
     (
@@ -646,9 +646,10 @@ fn laplace_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
 // elementary-op helpers. Task 14 gives Exponential/Weibull/Pareto/LogNormal a
 // straight-line inverse-CDF/reparam `@sample` builder (`sample: Some(..)`
 // below); Gamma/InverseGamma/ChiSquared have no such closed-form inverse-CDF
-// (their CDFs are the regularized incomplete gamma function, not
-// invertible in closed form), so they stay `sample: None` for a later
-// rejection-based task.
+// (their CDFs are the regularized incomplete gamma function, not invertible in
+// closed form), so Task 15 gives them a rejection-based `@sample` builder
+// instead — the shared Marsaglia–Tsang [`draw_gamma`] loop (see the Task-15
+// rejection batch at the end of this file).
 
 /// §08 Exponential, verbatim: `log f = log(rate) - rate * x`.
 fn exponential_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
@@ -676,9 +677,10 @@ fn exponential_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
 }
 
 /// §08 Gamma, verbatim: `log f = shape * log(rate) - lgamma(shape) +
-/// (shape - 1) * log(x) - rate * x`. No `@sample` builder yet (`sample:
-/// None`) — Gamma's CDF has no closed-form inverse (see the batch doc
-/// comment); a later task lands its rejection-based sampler.
+/// (shape - 1) * log(x) - rate * x`. Gamma's CDF has no closed-form inverse
+/// (see the batch doc comment), so its `@sample` builder ([`gamma_sample`],
+/// Task 15) is the Marsaglia–Tsang rejection loop [`draw_gamma`] rather than
+/// a straight-line inverse-CDF.
 fn gamma_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
     let shape = p.get(e, "shape")?;
     let rate = p.get(e, "rate")?;
@@ -788,9 +790,10 @@ fn pareto_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
 }
 
 /// §08 InverseGamma, verbatim: `log f = shape * log(scale) - lgamma(shape) -
-/// (shape + 1) * log(x) - scale / x`. No `@sample` builder yet (`sample:
-/// None`) — like Gamma, InverseGamma's CDF has no closed-form inverse (the
-/// batch doc comment); a later task lands its rejection-based sampler.
+/// (shape + 1) * log(x) - scale / x`. Its `@sample` builder
+/// ([`inverse_gamma_sample`], Task 15) is `1 / Gamma(shape, rate = scale)`,
+/// on the shared [`draw_gamma`] rejection core (like Gamma, no closed-form
+/// inverse-CDF — the batch doc comment).
 fn inverse_gamma_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
     let shape = p.get(e, "shape")?;
     let scale = p.get(e, "scale")?;
@@ -819,10 +822,10 @@ fn inverse_gamma_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value,
 /// log(2) - lgamma(half_k) + (half_k - 1) * log(x) - x / 2`. `log(2)` is a
 /// plain numeric constant (independent of `k`), so it is folded to a scalar
 /// literal (`std::f64::consts::LN_2`) rather than emitted as its own
-/// `stablehlo.log` — same reasoning as [`cauchy_logpdf`]'s `log(pi)` fold. No
-/// `@sample` builder yet (`sample: None`) — ChiSquared is `Gamma(k/2, 1/2)`
-/// and inherits the same no-closed-form-inverse-CDF limitation (the batch
-/// doc comment); a later task lands its sampler.
+/// `stablehlo.log` — same reasoning as [`cauchy_logpdf`]'s `log(pi)` fold.
+/// ChiSquared is `Gamma(k/2, 1/2)`, so its `@sample` builder
+/// ([`chi_squared_sample`], Task 15) is exactly that reduction on the shared
+/// [`draw_gamma`] rejection core.
 fn chi_squared_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
     let k = p.get(e, "k")?;
 
@@ -919,10 +922,13 @@ fn lognormal_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
 //
 // Task 14 gives Uniform a straight-line `@sample` builder (`sample:
 // Some(..)` below, reading the same statically-known interval bounds as
-// [`uniform_logpdf`]); Beta/StudentT/GeneralizedNormal/VonMises have no
-// closed-form inverse-CDF (Beta and StudentT are gamma-ratio-family
-// distributions, same limitation as Gamma/InverseGamma/ChiSquared above;
-// GeneralizedNormal and VonMises need rejection sampling), so they stay
+// [`uniform_logpdf`]); Beta/StudentT/GeneralizedNormal have no closed-form
+// inverse-CDF (Beta and StudentT are gamma-ratio-family distributions, same
+// limitation as Gamma/InverseGamma/ChiSquared above; GeneralizedNormal needs
+// rejection sampling), so Task 15 gives all three a rejection-based `@sample`
+// builder on the shared Marsaglia–Tsang [`draw_gamma`] core (see the Task-15
+// batch at the end of this file). VonMises also needs rejection sampling
+// (e.g. Best & Fisher) but is not part of Task 15's batch — it stays
 // `sample: None` for a later task.
 
 /// The Lebesgue measure `lambda(S)` of a value-set `S`, when `S` is a
@@ -1017,10 +1023,11 @@ fn uniform_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
 }
 
 /// §08 Beta, verbatim: `log f = (alpha - 1) * log(x) + (beta - 1) *
-/// log(1 - x) - [lgamma(alpha) + lgamma(beta) - lgamma(alpha + beta)]`. No
-/// `@sample` builder yet (`sample: None`) — Beta is a ratio of Gammas, same
-/// no-closed-form-inverse-CDF limitation as the gamma-family batch above; a
-/// later task lands its sampler.
+/// log(1 - x) - [lgamma(alpha) + lgamma(beta) - lgamma(alpha + beta)]`. Beta
+/// is a ratio of Gammas, so its `@sample` builder ([`beta_sample`], Task 15)
+/// is `X / (X + Y)` for `X ~ Gamma(alpha, 1)`, `Y ~ Gamma(beta, 1)` on the
+/// shared [`draw_gamma`] rejection core (no closed-form inverse-CDF — the
+/// gamma-family batch doc comment).
 fn beta_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
     let alpha = p.get(e, "alpha")?;
     let beta = p.get(e, "beta")?;
@@ -1054,9 +1061,9 @@ fn beta_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitErro
 /// and its [`Value`] reused for both `lgamma`'s argument and the trailing
 /// term's coefficient — the spec's `(nu + 1) / 2` appears in both positions
 /// verbatim, same reuse discipline as [`lognormal_logpdf`]'s shared `log(x)`.
-/// No `@sample` builder yet (`sample: None`) — StudentT is a Normal/ChiSquared
-/// ratio, same no-closed-form-inverse-CDF limitation as the gamma-family
-/// batch above; a later task lands its sampler.
+/// StudentT is a Normal/ChiSquared ratio, so its `@sample` builder
+/// ([`studentt_sample`], Task 15) is `Z / sqrt(V / nu)` for `Z ~ Normal(0, 1)`,
+/// `V ~ ChiSquared(nu)` on the shared [`draw_gamma`] rejection core.
 fn studentt_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
     let nu = p.get(e, "nu")?;
 
@@ -1090,9 +1097,10 @@ fn studentt_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, Emit
 }
 
 /// §08 GeneralizedNormal, verbatim: `log f = log(beta) - log(2 * alpha) -
-/// lgamma(1 / beta) - (|x - mean| / alpha)^beta`. No `@sample` builder yet
-/// (`sample: None`) — needs rejection sampling (no closed-form inverse-CDF
-/// for a general shape exponent `beta`); a later task lands its sampler.
+/// lgamma(1 / beta) - (|x - mean| / alpha)^beta`. Its `@sample` builder
+/// ([`generalized_normal_sample`], Task 15) is `mean + alpha * sgn(U - 1/2) *
+/// Gamma(1/beta, 1)^(1/beta)` on the shared [`draw_gamma`] rejection core (no
+/// closed-form inverse-CDF for a general shape exponent `beta`).
 fn generalized_normal_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
     let mean = p.get(e, "mean")?;
     let alpha = p.get(e, "alpha")?;
@@ -1515,9 +1523,10 @@ fn categorical0_logpdf(e: &mut Emitter, p: &Params, _v: &Value) -> Result<Value,
 // ---- §08/§09 multivariate vector batch (Task 12) ----------------------------
 //
 // MvNormal/Dirichlet/Multinomial, registered alongside the rest of §08 in
-// `REGISTRY` with `sample: None` (MvNormal's straight-line reparam sampler
-// lands in Task 14, Dirichlet's rejection sampler in Task 15, Multinomial's
-// in Task 16 — see the roadmap doc). Unlike every scalar builder above,
+// `REGISTRY` (MvNormal's straight-line reparam sampler landed in Task 14,
+// Dirichlet's per-component Gamma rejection sampler in Task 15 — see the
+// Task-15 batch at the end of this file; Multinomial's lands in Task 16, so it
+// stays `sample: None`). Unlike every scalar builder above,
 // `mu`/`cov`/`alpha`/`p`/`v` here are rank-1 (vector) or rank-2 (matrix)
 // `Value`s, not `Scalar`s: [`Emitter::lgamma`]/[`Emitter::log`]/
 // [`Emitter::neg`] are elementwise (same shape in, same shape out — see
@@ -1654,7 +1663,9 @@ fn mvnormal_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
 /// + sum((alpha - 1) * log(x))`. `alpha - 1` needs a vector-shaped `1`
 /// (`Emitter::constant(1.0, alpha.ty.clone())`, a splat — see the batch doc
 /// comment on why a bare `Emitter::scalar` cannot be subtracted from a
-/// vector directly). No `@sample` builder yet (`sample: None`; Task 15).
+/// vector directly). Its `@sample` builder ([`dirichlet_sample`], Task 15)
+/// draws `g_i ~ Gamma(alpha_i, 1)` per component (one [`draw_gamma`]
+/// rejection loop each) and returns `g / sum(g)`.
 fn dirichlet_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
     let alpha = p.get(e, "alpha")?;
 
@@ -2116,4 +2127,280 @@ fn lkj_cholesky_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, 
     let log_cn = log_cn_lkj(e, n, &eta);
     let neg_log_cn = e.neg(&log_cn);
     Ok(e.add(&sum_terms, &neg_log_cn))
+}
+
+// ---- §08 rejection-based continuous `@sample` batch (Task 15) ---------------
+//
+// Gamma/Beta/ChiSquared/StudentT/InverseGamma/GeneralizedNormal + Dirichlet:
+// the distributions whose sampler needs a rejection loop (no closed-form
+// inverse-CDF), built on the shared Marsaglia–Tsang Gamma core
+// [`draw_gamma`]. Every one of them reduces to Gamma draws (§08 equivalences):
+// Beta is a ratio of two Gammas, ChiSquared is `Gamma(k/2, 1/2)`, StudentT is
+// a Normal/ChiSquared ratio, InverseGamma is `1/Gamma`, GeneralizedNormal is a
+// signed Gamma power, and Dirichlet normalizes a vector of independent Gammas.
+//
+// [`draw_gamma`] emits a single `stablehlo.while` (via
+// [`Emitter::while_loop`]): it pre-draws a fixed-size candidate batch
+// (`MAXITER` standard-normal `Z` and uniform `U` values) OUTSIDE the loop and
+// indexes it by the loop counter with [`Emitter::dynamic_slice_scalar`],
+// because `stablehlo.rng` is XLA-seeded/stateless — an in-loop `rng` call
+// could repeat values (biasing or hanging the loop), and the no-arg `@sample`
+// surface deliberately threads no `rng_bit_generator` state. `MAXITER = 128`:
+// Marsaglia–Tsang's per-candidate acceptance is ≈95% (for the boosted shape
+// `>= 1` it targets), so P(all 128 candidates reject) ≈ 0.05^128 ≈ 1e-166 —
+// far below f32 rounding. On the (astronomically unlikely) all-reject path the
+// loop returns its LAST candidate rather than looping forever; the resulting
+// tail bias is ~1e-166, orders of magnitude below f32 epsilon (~1e-7) — an
+// acceptable, documented approximation, NOT a mislowering.
+//
+// The shape `alpha` may be a runtime (`elementof`-declared) parameter, so this
+// cannot branch structurally at emit time on `alpha < 1` (Marsaglia–Tsang
+// itself needs `alpha >= 1`). Instead it uses the standard boost: draw with
+// `alpha_boosted = select(alpha < 1, alpha + 1, alpha)` (always `>= 1`), then
+// multiply by `select(alpha < 1, U0^(1/alpha), 1)` for one extra uniform `U0`
+// — matching `jax.random.gamma`, correct for every `alpha > 0` with no
+// emit-time case split (verified distributionally, Task 15 report).
+//
+// Independence caveat (shared with every multi-`rng` sampler in this vertical,
+// e.g. Task 12's MvNormal): each `stablehlo.rng` op is assumed to yield
+// independent draws. Beta/StudentT/Dirichlet draw two-or-more Gammas, each
+// with its own `Z`/`U`/`U0` rng ops; their independence is XLA's concern at
+// execution time (this XLA-seeded vertical threads no explicit key), exactly
+// as the pre-drawn `Z` vs `U` batches within one Gamma already assume.
+
+/// The rejection loop's fixed candidate-batch size — see the batch doc
+/// comment for why 128 makes the all-reject tail bias negligible.
+const MAXITER: u64 = 128;
+
+/// Draw one scalar `Gamma(shape, rate)` variate via Marsaglia–Tsang rejection
+/// (the shared core every sampler in this batch reduces to). See the batch doc
+/// comment for the `MAXITER`/pre-drawn-batch/boost design. Emits exactly one
+/// `stablehlo.while`; the returned [`Value`] is a `Scalar`.
+///
+/// Marsaglia–Tsang for the boosted shape `a = alpha_boosted (>= 1)`: with
+/// `d = a - 1/3` and `c = 1/sqrt(9 d)`, each candidate `(Z, U)` forms
+/// `V = (1 + c Z)^3` and is accepted when both `V > 0` and
+/// `log U < 1/2 Z^2 + d - d*V + d*log(V)`, returning `d*V` (a `Gamma(a, 1)`
+/// variate). The loop carries `(i: i32 counter, accepted: i1, result: f32)`;
+/// its condition is `!accepted && i < MAXITER`, and — since the body runs only
+/// while `!accepted` — the body sets `accepted := accept_this` and
+/// `result := candidate` unconditionally (so `result` holds the accepted
+/// candidate on success, or the last candidate on the all-reject path). The
+/// final `Gamma(shape, rate)` is `result * boost / rate`, with `boost` the
+/// shape-`< 1` correction.
+fn draw_gamma(e: &mut Emitter, shape: &Value, rate: &Value) -> Value {
+    let zero = e.scalar(0.0);
+    let one = e.scalar(1.0);
+
+    // boost setup: alpha_boosted = select(shape < 1, shape + 1, shape).
+    let shape_lt_one = e.compare("LT", shape, &one);
+    let shape_plus_one = e.add(shape, &one);
+    let alpha_boosted = e.select(&shape_lt_one, &shape_plus_one, shape);
+
+    // d = alpha_boosted - 1/3 ; c = 1 / sqrt(9 d).
+    let third = e.scalar(1.0 / 3.0);
+    let d = e.sub(&alpha_boosted, &third);
+    let nine = e.scalar(9.0);
+    let nine_d = e.mul(&nine, &d);
+    let sqrt_nine_d = e.sqrt(&nine_d);
+    let c = e.div(&one, &sqrt_nine_d);
+
+    // Pre-draw the candidate batches OUTSIDE the loop (see the batch doc
+    // comment): Z ~ Normal(0, 1), U ~ Uniform(0, 1), each length MAXITER.
+    let batch_ty = MlirTy::Ranked(vec![Some(MAXITER)]);
+    let z_batch = e.rng("NORMAL", &zero, &one, &batch_ty);
+    let u_batch = e.rng("UNIFORM", &zero, &one, &batch_ty);
+
+    let i0 = e.int_const(0);
+    let acc0 = e.bool_const(false);
+    let res0 = e.scalar(0.0);
+    let float_ty = MlirTy::Scalar.render(e.dtype());
+    let carried_tys = [
+        "tensor<i32>".to_string(),
+        "tensor<i1>".to_string(),
+        float_ty,
+    ];
+
+    let results = e.while_loop(
+        &[i0, acc0, res0],
+        &carried_tys,
+        // cond: !accepted && i < MAXITER
+        |e, args| {
+            let max = e.int_const(MAXITER as i64);
+            let lt = e.int_compare("LT", &args[0], &max);
+            let not_acc = e.not(&args[1]);
+            e.and(&not_acc, &lt)
+        },
+        // do: draw candidate i, test acceptance, advance the counter
+        |e, args| {
+            let i = &args[0];
+            let z = e.dynamic_slice_scalar(&z_batch, i);
+            let u = e.dynamic_slice_scalar(&u_batch, i);
+
+            // V = (1 + c Z)^3
+            let cz = e.mul(&c, &z);
+            let base = e.add(&one, &cz);
+            let base_sq = e.mul(&base, &base);
+            let v = e.mul(&base_sq, &base);
+
+            // candidate = d V (the Gamma(alpha_boosted, 1) draw for this V)
+            let candidate = e.mul(&d, &v);
+
+            // accept: V > 0 && log U < 1/2 Z^2 + d - d V + d log V
+            let half = e.scalar(0.5);
+            let z_sq = e.mul(&z, &z);
+            let half_z_sq = e.mul(&half, &z_sq);
+            let d_v = e.mul(&d, &v);
+            let neg_d_v = e.neg(&d_v);
+            let log_v = e.log(&v);
+            let d_log_v = e.mul(&d, &log_v);
+            let rhs_a = e.add(&half_z_sq, &d);
+            let rhs_b = e.add(&rhs_a, &neg_d_v);
+            let rhs = e.add(&rhs_b, &d_log_v);
+            let log_u = e.log(&u);
+            let lt_test = e.compare("LT", &log_u, &rhs);
+            let v_pos = e.compare("GT", &v, &zero);
+            let accept_this = e.and(&lt_test, &v_pos);
+
+            let one_i = e.int_const(1);
+            let next_i = e.int_add(i, &one_i);
+            vec![next_i, accept_this, candidate]
+        },
+    );
+    let g0 = results[2].clone();
+
+    // boost = select(shape < 1, U0^(1/shape), 1) ; result = g0 * boost / rate.
+    let u0 = e.rng("UNIFORM", &zero, &one, &MlirTy::Scalar);
+    let inv_shape = e.div(&one, shape);
+    let boost_raw = e.pow(&u0, &inv_shape);
+    let boost = e.select(&shape_lt_one, &boost_raw, &one);
+    let g = e.mul(&g0, &boost);
+    e.div(&g, rate)
+}
+
+/// §08 Gamma's sampler: [`draw_gamma`] on the `shape`/`rate` kwargs directly.
+fn gamma_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
+    let shape = p.get(e, "shape")?;
+    let rate = p.get(e, "rate")?;
+    Ok(draw_gamma(e, &shape, &rate))
+}
+
+/// §08 Beta's sampler, verbatim: `X / (X + Y)`, `X ~ Gamma(alpha, 1)`, `Y ~
+/// Gamma(beta, 1)` — two independent [`draw_gamma`] draws (see the batch doc
+/// comment's independence caveat).
+fn beta_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
+    let alpha = p.get(e, "alpha")?;
+    let beta = p.get(e, "beta")?;
+    let one = e.scalar(1.0);
+    let x = draw_gamma(e, &alpha, &one);
+    let y = draw_gamma(e, &beta, &one);
+    let sum = e.add(&x, &y);
+    Ok(e.div(&x, &sum))
+}
+
+/// §08 ChiSquared's sampler, verbatim: `Gamma(k/2, 1/2)` (the §08
+/// equivalence — same reduction [`chi_squared_logpdf`] uses).
+fn chi_squared_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
+    let k = p.get(e, "k")?;
+    let half = e.scalar(0.5);
+    let half_k = e.mul(&half, &k);
+    let rate = e.scalar(0.5);
+    Ok(draw_gamma(e, &half_k, &rate))
+}
+
+/// §08 StudentT's sampler, verbatim: `Z / sqrt(V / nu)`, `Z ~ Normal(0, 1)`,
+/// `V ~ ChiSquared(nu) = Gamma(nu/2, 1/2)`.
+fn studentt_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
+    let nu = p.get(e, "nu")?;
+    let half = e.scalar(0.5);
+    let half_nu = e.mul(&half, &nu);
+    let rate = e.scalar(0.5);
+    let v = draw_gamma(e, &half_nu, &rate);
+
+    let zero = e.scalar(0.0);
+    let one = e.scalar(1.0);
+    let z = e.rng("NORMAL", &zero, &one, &MlirTy::Scalar);
+
+    let v_over_nu = e.div(&v, &nu);
+    let sqrt_term = e.sqrt(&v_over_nu);
+    Ok(e.div(&z, &sqrt_term))
+}
+
+/// §08 InverseGamma's sampler, verbatim: `1 / Gamma(shape, rate = scale)`
+/// (the §08 equivalence — `scale` is the underlying Gamma's RATE, mirroring
+/// how [`inverse_gamma_logpdf`] treats it).
+fn inverse_gamma_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
+    let shape = p.get(e, "shape")?;
+    let scale = p.get(e, "scale")?;
+    let g = draw_gamma(e, &shape, &scale);
+    let one = e.scalar(1.0);
+    Ok(e.div(&one, &g))
+}
+
+/// §08 GeneralizedNormal's sampler, verbatim: `mean + alpha * sgn(U - 1/2) *
+/// Gamma(1/beta, 1)^(1/beta)`, `U ~ Uniform(0, 1)`. `sgn(U - 1/2)` is composed
+/// via [`Emitter::compare`]/[`Emitter::select`] (`+1` when `U - 1/2 >= 0`,
+/// else `-1`), the same idiom [`laplace_sample`] uses; `1/beta` is computed
+/// once and reused for both the Gamma shape and the trailing power.
+fn generalized_normal_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
+    let mean = p.get(e, "mean")?;
+    let alpha = p.get(e, "alpha")?;
+    let beta = p.get(e, "beta")?;
+
+    let one = e.scalar(1.0);
+    let inv_beta = e.div(&one, &beta);
+    let g = draw_gamma(e, &inv_beta, &one);
+    let g_pow = e.pow(&g, &inv_beta);
+
+    let zero = e.scalar(0.0);
+    let u = e.rng("UNIFORM", &zero, &one, &MlirTy::Scalar);
+    let half = e.scalar(0.5);
+    let centered = e.sub(&u, &half);
+    let is_nonneg = e.compare("GE", &centered, &zero);
+    let pos_one = e.scalar(1.0);
+    let neg_one = e.scalar(-1.0);
+    let sgn = e.select(&is_nonneg, &pos_one, &neg_one);
+
+    let alpha_sgn = e.mul(&alpha, &sgn);
+    let term = e.mul(&alpha_sgn, &g_pow);
+    Ok(e.add(&mean, &term))
+}
+
+/// §08 Dirichlet's sampler, verbatim: `g_i ~ Gamma(alpha_i, 1)`, return
+/// `g / sum(g)`. The vector `alpha`'s length `n` must be statically known (to
+/// unroll the per-component Gamma draws at emit time — one [`draw_gamma`] and
+/// thus one `stablehlo.while` per component); each `alpha_i` is sliced out as
+/// a `Scalar` (the same slice+reshape idiom [`vector_elem`] uses), drawn, then
+/// the `n` scalar draws are packed back into a length-`n` vector via
+/// [`Emitter::vector`] and normalized by their broadcast sum. Refuses (never
+/// panics) a dynamic-length `alpha` — refuse-don't-mislower, mirroring
+/// [`static_vector_len`]'s discipline for MvNormal.
+fn dirichlet_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
+    let alpha_id = p.field_id(e, "alpha")?;
+    let alpha = e.lower_node(alpha_id)?;
+    let n = match &alpha.ty {
+        MlirTy::Ranked(dims) if dims.len() == 1 => dims[0].ok_or_else(|| {
+            EmitError::at(
+                alpha_id,
+                "Dirichlet sample needs a statically-known vector length for 'alpha'",
+            )
+        })?,
+        other => {
+            return Err(EmitError::at(
+                alpha_id,
+                format!("Dirichlet sample: 'alpha' must be a rank-1 vector, got {other:?}"),
+            ));
+        }
+    };
+
+    let one = e.scalar(1.0);
+    let mut gammas: Vec<Value> = Vec::with_capacity(n as usize);
+    for i in 0..n {
+        let alpha_i = vector_elem(e, &alpha, i);
+        gammas.push(draw_gamma(e, &alpha_i, &one));
+    }
+    let g_vec = e.vector(&gammas);
+    let sum = e.reduce_sum(&g_vec);
+    let sum_bc = e.broadcast_in_dim(&sum, &[], g_vec.ty.clone());
+    Ok(e.div(&g_vec, &sum_bc))
 }

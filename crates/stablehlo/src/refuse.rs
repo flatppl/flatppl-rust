@@ -81,14 +81,13 @@
 //! - a registered constructor with no `@sample` builder — "no @sample
 //!   lowering for '...'" — locked by
 //!   `builtin_sample_refuses_registered_ctor_without_sample_builder`
-//!   (`tests/golden.rs`), reached via `Gamma` (no closed-form inverse-CDF, so
-//!   Task 14's straight-line/inverse-CDF batch skips it; a later
-//!   rejection-sampling task lands its `@sample` builder — same reasoning
-//!   covers `InverseGamma`/`ChiSquared`/`Beta`/`StudentT`/
-//!   `GeneralizedNormal`/`VonMises`, and Task 15/16's still-pending
-//!   `Dirichlet`/`Multinomial`/discrete batch). `Cauchy`/`Logistic`/`Laplace`
-//!   (Task 8's `@logdensity`-only entries) no longer exercise this arm —
-//!   Task 14 gave all three straight-line `@sample` builders.
+//!   (`tests/golden.rs`), reached via `VonMises` (needs a dedicated rejection
+//!   sampler not in Task 15's batch; Task 15 gave `Gamma`/`InverseGamma`/
+//!   `ChiSquared`/`Beta`/`StudentT`/`GeneralizedNormal`/`Dirichlet` rejection
+//!   `@sample` builders, so — like `Cauchy`/`Logistic`/`Laplace` after Task
+//!   14 — they no longer exercise this arm). Task 16's still-pending discrete
+//!   batch (`Bernoulli`/`Poisson`/…/`Multinomial`) and the matrix batch
+//!   (`Wishart`/`InverseWishart`/`LKJ`/`LKJCholesky`) keep the arm reachable.
 //! - `Uniform`'s `support` parameter has no closed-form measurable
 //!   interval/box `ValueSet` (`registry::lebesgue_measure` returns `None`) —
 //!   "Uniform logpdf needs a measurable interval/box support" (Task 10).

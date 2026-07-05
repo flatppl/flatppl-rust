@@ -700,6 +700,265 @@ impl<'m> Emitter<'m> {
         }
     }
 
+    // ---- rejection sampling (Task 15) ---------------------------------------
+
+    /// The configured floating-point element type — a narrow accessor
+    /// (mirroring [`Emitter::node`]/[`Emitter::resolve`]) for
+    /// `crate::registry`'s rejection samplers, which must render the
+    /// float-typed carried variable of a [`Emitter::while_loop`] (its
+    /// `tensor<f32>`/`tensor<f64>` result) as text alongside the fixed
+    /// `tensor<i32>`/`tensor<i1>` loop-counter/accept-flag types — neither of
+    /// which [`MlirTy`] can express (see [`Emitter::int_const`]/
+    /// [`Emitter::bool_const`]).
+    pub(crate) fn dtype(&self) -> Dtype {
+        self.dtype
+    }
+
+    /// `%N = stablehlo.constant dense<x> : tensor<i32>` — a rank-0 signed
+    /// 32-bit integer constant. StableHLO's `while`-loop counter (and the
+    /// [`Emitter::dynamic_slice_scalar`] start index it feeds) is an INTEGER
+    /// tensor, never this emitter's `f32`/`f64` element dtype, so — like
+    /// [`Emitter::rng`]'s integer shape-constant — it is built as raw text
+    /// here rather than through the dtype-parameterized [`Emitter::constant`].
+    /// The returned [`Value`]'s `ty` is a placeholder [`MlirTy::Scalar`]: it
+    /// must only ever be fed to the integer-typed helpers below
+    /// ([`Emitter::int_add`]/[`Emitter::int_compare`]/
+    /// [`Emitter::dynamic_slice_scalar`]), never a float op — whose `render`
+    /// would (wrongly) spell it `tensor<f32>`.
+    pub fn int_const(&mut self, x: i64) -> Value {
+        let ssa = self.fresh();
+        self.push(&format!(
+            "{ssa} = stablehlo.constant dense<{x}> : tensor<i32>"
+        ));
+        Value {
+            ssa,
+            ty: MlirTy::Scalar,
+        }
+    }
+
+    /// `%N = stablehlo.constant dense<{true|false}> : tensor<i1>` — a rank-0
+    /// boolean constant (the accept-flag carried variable's initial `false`).
+    /// Same dtype-independent raw-text reasoning as [`Emitter::int_const`];
+    /// its `ty` placeholder must only reach the [`render_i1`]-based helpers
+    /// ([`Emitter::compare`]/[`Emitter::select`]/[`Emitter::and`]/
+    /// [`Emitter::not`]), never a float op.
+    pub fn bool_const(&mut self, b: bool) -> Value {
+        let ssa = self.fresh();
+        self.push(&format!(
+            "{ssa} = stablehlo.constant dense<{b}> : tensor<i1>"
+        ));
+        Value {
+            ssa,
+            ty: MlirTy::Scalar,
+        }
+    }
+
+    /// `%N = stablehlo.add %a, %b : tensor<i32>` — integer add (the loop
+    /// counter's `i + 1`). Separate from [`Emitter::add`] because that renders
+    /// its operand type via the float [`Dtype`]; both operands here are the
+    /// integer counter (see [`Emitter::int_const`]).
+    pub fn int_add(&mut self, a: &Value, b: &Value) -> Value {
+        let ssa = self.fresh();
+        self.push(&format!(
+            "{ssa} = stablehlo.add {}, {} : tensor<i32>",
+            a.ssa, b.ssa
+        ));
+        Value {
+            ssa,
+            ty: MlirTy::Scalar,
+        }
+    }
+
+    /// `%N = stablehlo.compare {dir}, %a, %b, SIGNED : (tensor<i32>,
+    /// tensor<i32>) -> tensor<i1>` — integer comparison (the loop counter's
+    /// `i < MAXITER`). Unlike [`Emitter::compare`]'s float form, an integer
+    /// comparison carries an explicit `SIGNED` `compare_type` (parser-
+    /// validated against the real StableHLO parser, jax 0.10.2). The result
+    /// is an `i1`, rendered like [`Emitter::compare`]'s.
+    pub fn int_compare(&mut self, dir: &str, a: &Value, b: &Value) -> Value {
+        let ssa = self.fresh();
+        self.push(&format!(
+            "{ssa} = stablehlo.compare {dir}, {}, {}, SIGNED : (tensor<i32>, tensor<i32>) -> tensor<i1>",
+            a.ssa, b.ssa
+        ));
+        Value {
+            ssa,
+            ty: MlirTy::Scalar,
+        }
+    }
+
+    /// `%N = stablehlo.and %a, %b : tensor<i1>` — boolean conjunction of two
+    /// `i1` predicates (the rejection test's `v > 0 && log(u) < ...`). Both
+    /// operands are [`Emitter::compare`]-shaped `i1`s; rendered via
+    /// [`render_i1`], like `compare`/`select`.
+    pub fn and(&mut self, a: &Value, b: &Value) -> Value {
+        let ssa = self.fresh();
+        let ty = render_i1(&a.ty);
+        self.push(&format!(
+            "{ssa} = stablehlo.and {}, {} : {ty}",
+            a.ssa, b.ssa
+        ));
+        Value {
+            ssa,
+            ty: a.ty.clone(),
+        }
+    }
+
+    /// `%N = stablehlo.not %a : tensor<i1>` — boolean negation of an `i1`
+    /// predicate (the loop condition's `!accepted`). Rendered via
+    /// [`render_i1`], like [`Emitter::and`].
+    pub fn not(&mut self, a: &Value) -> Value {
+        let ssa = self.fresh();
+        let ty = render_i1(&a.ty);
+        self.push(&format!("{ssa} = stablehlo.not {} : {ty}", a.ssa));
+        Value {
+            ssa,
+            ty: a.ty.clone(),
+        }
+    }
+
+    /// Extract element `index` (a runtime `i32` scalar — see
+    /// [`Emitter::int_const`]) of the rank-1 tensor `operand` as a `Scalar`,
+    /// via `stablehlo.dynamic_slice` + [`Emitter::reshape`] — the
+    /// runtime-index analogue of the static-index slice+reshape idiom
+    /// [`Emitter::slice`]/`registry::slice_indexed_prob` use.
+    /// `stablehlo.dynamic_slice` clamps its start index into
+    /// `[0, len - size]`, so an index at (or past) the batch length is safe —
+    /// the rejection loop's counter never exceeds its bound while the loop
+    /// runs, and even a clamped out-of-range read only re-reads the last batch
+    /// element (never out-of-bounds memory). Panics on a non-rank-1 operand
+    /// (an internal invariant violation, mirroring [`Emitter::diag`]/
+    /// [`Emitter::matvec`]).
+    pub fn dynamic_slice_scalar(&mut self, operand: &Value, index: &Value) -> Value {
+        match &operand.ty {
+            MlirTy::Ranked(dims) if dims.len() == 1 => {}
+            other => panic!("dynamic_slice_scalar expects a rank-1 operand, got {other:?}"),
+        }
+        let operand_ty = operand.ty.render(self.dtype);
+        let slice_ty = MlirTy::Ranked(vec![Some(1)]);
+        let slice_ty_text = slice_ty.render(self.dtype);
+        let ssa = self.fresh();
+        self.push(&format!(
+            "{ssa} = stablehlo.dynamic_slice {}, {}, sizes = [1] : ({operand_ty}, tensor<i32>) -> {slice_ty_text}",
+            operand.ssa, index.ssa
+        ));
+        let sliced = Value { ssa, ty: slice_ty };
+        self.reshape(&sliced, MlirTy::Scalar)
+    }
+
+    /// Emit a `stablehlo.while` carrying the [`Value`]s `inits` (one per
+    /// carried variable), with `carried_tys[k]` the rendered MLIR type text of
+    /// `inits[k]`. The types are passed explicitly because the loop counter's
+    /// `tensor<i32>` and the accept-flag's `tensor<i1>` are types [`MlirTy`]
+    /// cannot express (see [`Emitter::int_const`]/[`Emitter::bool_const`]).
+    ///
+    /// `cond` builds the loop-condition `i1` predicate from the carried
+    /// variables (passed as the regions' block arguments); `body` builds the
+    /// next carried-variable values (one per `inits` entry, same order). Both
+    /// closures may reference values defined BEFORE the loop —
+    /// `stablehlo.while` regions are not isolated-from-above — which is
+    /// exactly how the rejection samplers read their pre-drawn candidate
+    /// batches inside the loop body without redrawing (an in-loop
+    /// [`Emitter::rng`] could repeat values in this XLA-seeded vertical; see
+    /// the registry's `draw_gamma` doc comment).
+    ///
+    /// Returns the loop's results (`%r#0`, `%r#1`, …), each typed from its
+    /// `inits` entry. The two region bodies are emitted into a scratch buffer
+    /// (via `std::mem::take`/`replace` on `self.body`) so their op lines land
+    /// inside the `cond {…}`/`do {…}` blocks rather than the enclosing
+    /// function body; the shared `fresh()` counter keeps every SSA name
+    /// globally unique across the swap. Parser-validated (the header's
+    /// `%r:N = stablehlo.while(%arg = %init, …) : tys` form, the `cond`/`do`
+    /// region keywords, region-captured outer operands, and the `%r#k`
+    /// multi-result projection) against the real StableHLO parser, jax 0.10.2.
+    pub fn while_loop(
+        &mut self,
+        inits: &[Value],
+        carried_tys: &[String],
+        cond: impl FnOnce(&mut Self, &[Value]) -> Value,
+        body: impl FnOnce(&mut Self, &[Value]) -> Vec<Value>,
+    ) -> Vec<Value> {
+        assert_eq!(
+            inits.len(),
+            carried_tys.len(),
+            "while_loop: inits/carried_tys length mismatch"
+        );
+        assert!(
+            !inits.is_empty(),
+            "while_loop: expected at least one carried variable"
+        );
+
+        // Region block-argument names (the iterArgs), shared by cond and body.
+        let arg_names: Vec<String> = inits.iter().map(|_| self.fresh()).collect();
+        let arg_values: Vec<Value> = arg_names
+            .iter()
+            .zip(inits)
+            .map(|(n, init)| Value {
+                ssa: n.clone(),
+                ty: init.ty.clone(),
+            })
+            .collect();
+        // The multi-result group name (%r:N -> %r#0, %r#1, ...).
+        let result_name = self.fresh();
+
+        // cond region, captured into its own buffer.
+        let saved = std::mem::take(&mut self.body);
+        let pred = cond(&mut *self, &arg_values);
+        let cond_body = std::mem::replace(&mut self.body, saved);
+
+        // do region, captured into its own buffer.
+        let saved = std::mem::take(&mut self.body);
+        let next = body(&mut *self, &arg_values);
+        let do_body = std::mem::replace(&mut self.body, saved);
+        assert_eq!(
+            next.len(),
+            inits.len(),
+            "while_loop: body must return one value per carried variable"
+        );
+
+        let arity = inits.len();
+        let bindings = arg_names
+            .iter()
+            .zip(inits)
+            .map(|(n, init)| format!("{n} = {}", init.ssa))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let tys = carried_tys.join(", ");
+
+        let mut text = String::new();
+        text.push_str(&format!(
+            "{result_name}:{arity} = stablehlo.while({bindings}) : {tys}\n"
+        ));
+        text.push_str("cond {\n");
+        for line in cond_body.lines() {
+            text.push_str("  ");
+            text.push_str(line);
+            text.push('\n');
+        }
+        text.push_str(&format!("  stablehlo.return {} : tensor<i1>\n", pred.ssa));
+        text.push_str("} do {\n");
+        for line in do_body.lines() {
+            text.push_str("  ");
+            text.push_str(line);
+            text.push('\n');
+        }
+        let ret_ssas = next
+            .iter()
+            .map(|v| v.ssa.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        text.push_str(&format!("  stablehlo.return {ret_ssas} : {tys}\n"));
+        text.push('}');
+        self.push(&text);
+
+        (0..arity)
+            .map(|k| Value {
+                ssa: format!("{result_name}#{k}"),
+                ty: inits[k].ty.clone(),
+            })
+            .collect()
+    }
+
     /// If `args` is `get0`/`get`'s `[container, index]` pair and `container`
     /// resolves (see [`Emitter::resolves_to_builtin_sample`]) to a
     /// `builtin_sample(...)` call, return the requested slot's ZERO-based

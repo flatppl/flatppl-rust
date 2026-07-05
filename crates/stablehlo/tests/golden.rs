@@ -2893,32 +2893,31 @@ fn builtin_sample_refuses_unregistered_ctor() {
     assert_eq!(err.node, Some(node));
 }
 
-/// `builtin_sample(rng, Gamma, kernel_input)` — `Gamma` IS registered
-/// (Task 9's `@logdensity` builder) but has no `@sample` builder yet
-/// (`sample: None`: Gamma has no closed-form inverse-CDF, so Task 14's
-/// straight-line/inverse-CDF batch skips it — see `registry.rs`'s
-/// gamma-family batch doc comment; a later rejection-sampling task lands it)
-/// — must refuse with `lower_sample`'s OWN sample-specific message, `"no
-/// @sample lowering for '{ctor}'"` (`dist.sample.ok_or_else`), distinct from
-/// the unregistered-ctor message above. This arm was previously untested
-/// (`refuse.rs`'s taxonomy doc comment noted it as unreachable while every
-/// registered entry had `sample: Some(_)`) — now reachable via any of the
-/// registry's still-`sample: None` entries (originally exercised via
-/// `Cauchy`, before Task 14 gave Cauchy its own `@sample` builder).
+/// `builtin_sample(rng, VonMises, kernel_input)` — `VonMises` IS registered
+/// (Task 10's `@logdensity` builder) but has no `@sample` builder yet
+/// (`sample: None`: VonMises needs a dedicated rejection sampler, e.g. Best &
+/// Fisher — Task 15's rejection batch covers Gamma/Beta/ChiSquared/StudentT/
+/// InverseGamma/GeneralizedNormal + Dirichlet, but not VonMises) — must refuse
+/// with `lower_sample`'s OWN sample-specific message, `"no @sample lowering
+/// for '{ctor}'"` (`dist.sample.ok_or_else`), distinct from the
+/// unregistered-ctor message above. This arm stays reachable via any of the
+/// registry's still-`sample: None` entries (originally exercised via `Cauchy`,
+/// before Task 14 gave Cauchy a sampler; then `Gamma`, before Task 15 gave the
+/// rejection batch theirs).
 #[test]
 fn builtin_sample_refuses_registered_ctor_without_sample_builder() {
     let mut m = Module::new();
     let rng = real(&mut m, 0.0); // stand-in rng-state arg (never lowered)
-    let ctor = const_node(&mut m, "Gamma");
-    let shape = real(&mut m, 2.0);
-    let rate = real(&mut m, 1.0);
-    let kernel_input = record_node(&mut m, &[("shape", shape), ("rate", rate)]);
+    let ctor = const_node(&mut m, "VonMises");
+    let mu = real(&mut m, 0.0);
+    let kappa = real(&mut m, 1.0);
+    let kernel_input = record_node(&mut m, &[("mu", mu), ("kappa", kappa)]);
     let node = call(&mut m, "builtin_sample", &[rng, ctor, kernel_input]);
 
     let mut e = Emitter::new(&m, Dtype::F32);
     let err = e.lower_node(node).unwrap_err();
     assert!(
-        err.msg.contains("no @sample lowering for 'Gamma'"),
+        err.msg.contains("no @sample lowering for 'VonMises'"),
         "unexpected message: {}",
         err.msg
     );
@@ -4984,5 +4983,295 @@ fn emit_sample_mvnormal_matches_frozen_golden() {
     assert_eq!(
         out, golden,
         "emitted @sample drifted from the frozen golden (tests/goldens/mvnormal_sample.mlir)"
+    );
+}
+
+// ---- Task 15: rejection-based continuous `@sample` batch + Dirichlet -------
+//
+// Gamma/Beta/ChiSquared/StudentT/InverseGamma/GeneralizedNormal + Dirichlet
+// get a `@sample` builder for the first time: a hand-emitted Marsaglia–Tsang
+// Gamma rejection loop (`stablehlo.while`, via `Emitter::while_loop`) that
+// every one of them reduces to (§08 equivalences — see `registry.rs`'s Task-15
+// batch doc comment). Same anchor-fixture shape as `NORMAL_SAMPLE_SRC` (FIXED
+// literal hyperparameters via `s = rnginit(0)`/`draw(...)`/`rand(s, lawof(x))`,
+// so each `func.func @sample` is zero-arg) — except Dirichlet, whose `alpha`
+// stays a free (`elementof`-declared) length-3 vector parameter, exactly like
+// `DIRICHLET_DENSITY_SRC`, so it becomes a `tensor<3xf32>` func arg.
+//
+// The GAMMA-based ones assert exactly the `stablehlo.while` count (one per
+// underlying Gamma: 1 for Gamma/ChiSquared/StudentT/InverseGamma/
+// GeneralizedNormal, 2 for Beta's `X`/`Y`, 3 for Dirichlet's 3 components) plus
+// the frozen `.mlir` text; distributional correctness (KS statistic vs
+// scipy at N = 100k, plus Dirichlet per-component moments) is verified
+// out-of-band (Task 15 report), NOT re-derived here — same division of labour
+// as Task 14's straight-line batch (structure+text is what regresses
+// silently; formula correctness is an oracle derivation).
+
+const GAMMA_SAMPLE_SRC: &str = "\
+s = rnginit(0)
+x = draw(Gamma(shape = 2.0, rate = 1.0))
+draws = rand(s, lawof(x))
+";
+
+/// §08 Gamma's Marsaglia–Tsang rejection sampler: exactly one
+/// `stablehlo.while` (the rejection loop) and three `stablehlo.rng` (the
+/// pre-drawn `Z`/`U` candidate batches + the shape-`< 1` boost's `U0`).
+#[test]
+fn emit_sample_gamma_has_expected_structure() {
+    let d = determinize_src(GAMMA_SAMPLE_SRC);
+    let out = emit_sample(&d);
+
+    assert!(
+        out.contains("func.func @sample()"),
+        "missing func.func @sample() (no free params) in:\n{out}"
+    );
+    assert!(out.contains("-> tensor<f32>"));
+    assert_eq!(
+        out.matches("stablehlo.while").count(),
+        1,
+        "expected exactly one rejection loop, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.rng").count(),
+        3,
+        "expected Z + U candidate batches + boost U0, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.dynamic_slice").count(),
+        2,
+        "expected Z[i]/U[i] runtime indexing, in:\n{out}"
+    );
+    assert!(
+        out.contains("distribution = NORMAL") && out.contains("distribution = UNIFORM"),
+        "expected both a NORMAL (Z) and UNIFORM (U) batch, in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+#[test]
+fn emit_sample_gamma_matches_frozen_golden() {
+    let d = determinize_src(GAMMA_SAMPLE_SRC);
+    let out = emit_sample(&d);
+    let golden = include_str!("goldens/gamma_sample.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted @sample drifted from the frozen golden (tests/goldens/gamma_sample.mlir)"
+    );
+}
+
+const BETA_SAMPLE_SRC: &str = "\
+s = rnginit(0)
+x = draw(Beta(alpha = 2.0, beta = 3.0))
+draws = rand(s, lawof(x))
+";
+
+/// §08 Beta's `X / (X + Y)`, `X ~ Gamma(alpha, 1)`, `Y ~ Gamma(beta, 1)`: TWO
+/// `stablehlo.while` rejection loops (one per underlying Gamma), six
+/// `stablehlo.rng` (each Gamma's `Z`/`U`/`U0`).
+#[test]
+fn emit_sample_beta_has_expected_structure() {
+    let d = determinize_src(BETA_SAMPLE_SRC);
+    let out = emit_sample(&d);
+
+    assert!(out.contains("func.func @sample()"));
+    assert!(out.contains("-> tensor<f32>"));
+    assert_eq!(
+        out.matches("stablehlo.while").count(),
+        2,
+        "expected two rejection loops (X and Y Gammas), in:\n{out}"
+    );
+    assert_eq!(out.matches("stablehlo.rng").count(), 6);
+    assert!(is_delimiter_balanced(&out));
+}
+
+#[test]
+fn emit_sample_beta_matches_frozen_golden() {
+    let d = determinize_src(BETA_SAMPLE_SRC);
+    let out = emit_sample(&d);
+    let golden = include_str!("goldens/beta_sample.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted @sample drifted from the frozen golden (tests/goldens/beta_sample.mlir)"
+    );
+}
+
+const CHI_SQUARED_SAMPLE_SRC: &str = "\
+s = rnginit(0)
+x = draw(ChiSquared(k = 3.0))
+draws = rand(s, lawof(x))
+";
+
+/// §08 ChiSquared's `Gamma(k/2, 1/2)`: exactly one `stablehlo.while`.
+#[test]
+fn emit_sample_chi_squared_has_expected_structure() {
+    let d = determinize_src(CHI_SQUARED_SAMPLE_SRC);
+    let out = emit_sample(&d);
+
+    assert!(out.contains("func.func @sample()"));
+    assert!(out.contains("-> tensor<f32>"));
+    assert_eq!(out.matches("stablehlo.while").count(), 1);
+    assert_eq!(out.matches("stablehlo.rng").count(), 3);
+    assert!(is_delimiter_balanced(&out));
+}
+
+#[test]
+fn emit_sample_chi_squared_matches_frozen_golden() {
+    let d = determinize_src(CHI_SQUARED_SAMPLE_SRC);
+    let out = emit_sample(&d);
+    let golden = include_str!("goldens/chi_squared_sample.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted @sample drifted from the frozen golden (tests/goldens/chi_squared_sample.mlir)"
+    );
+}
+
+const STUDENTT_SAMPLE_SRC: &str = "\
+s = rnginit(0)
+x = draw(StudentT(nu = 5.0))
+draws = rand(s, lawof(x))
+";
+
+/// §08 StudentT's `Z / sqrt(V / nu)`, `V ~ ChiSquared(nu)`: exactly one
+/// `stablehlo.while` (the ChiSquared/Gamma loop) and four `stablehlo.rng`
+/// (the Gamma's `Z`/`U`/`U0` + StudentT's own standard-normal `Z`).
+#[test]
+fn emit_sample_studentt_has_expected_structure() {
+    let d = determinize_src(STUDENTT_SAMPLE_SRC);
+    let out = emit_sample(&d);
+
+    assert!(out.contains("func.func @sample()"));
+    assert!(out.contains("-> tensor<f32>"));
+    assert_eq!(out.matches("stablehlo.while").count(), 1);
+    assert_eq!(out.matches("stablehlo.rng").count(), 4);
+    assert!(is_delimiter_balanced(&out));
+}
+
+#[test]
+fn emit_sample_studentt_matches_frozen_golden() {
+    let d = determinize_src(STUDENTT_SAMPLE_SRC);
+    let out = emit_sample(&d);
+    let golden = include_str!("goldens/studentt_sample.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted @sample drifted from the frozen golden (tests/goldens/studentt_sample.mlir)"
+    );
+}
+
+const INVERSE_GAMMA_SAMPLE_SRC: &str = "\
+s = rnginit(0)
+x = draw(InverseGamma(shape = 3.0, scale = 1.0))
+draws = rand(s, lawof(x))
+";
+
+/// §08 InverseGamma's `1 / Gamma(shape, rate = scale)`: exactly one
+/// `stablehlo.while`, and the trailing reciprocal (`divide` of `1` by the
+/// Gamma draw).
+#[test]
+fn emit_sample_inverse_gamma_has_expected_structure() {
+    let d = determinize_src(INVERSE_GAMMA_SAMPLE_SRC);
+    let out = emit_sample(&d);
+
+    assert!(out.contains("func.func @sample()"));
+    assert!(out.contains("-> tensor<f32>"));
+    assert_eq!(out.matches("stablehlo.while").count(), 1);
+    assert_eq!(out.matches("stablehlo.rng").count(), 3);
+    assert!(is_delimiter_balanced(&out));
+}
+
+#[test]
+fn emit_sample_inverse_gamma_matches_frozen_golden() {
+    let d = determinize_src(INVERSE_GAMMA_SAMPLE_SRC);
+    let out = emit_sample(&d);
+    let golden = include_str!("goldens/inverse_gamma_sample.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted @sample drifted from the frozen golden (tests/goldens/inverse_gamma_sample.mlir)"
+    );
+}
+
+const GENERALIZED_NORMAL_SAMPLE_SRC: &str = "\
+s = rnginit(0)
+x = draw(GeneralizedNormal(mean = 0.0, alpha = 1.0, beta = 2.0))
+draws = rand(s, lawof(x))
+";
+
+/// §08 GeneralizedNormal's `mean + alpha * sgn(U - 1/2) * Gamma(1/beta,
+/// 1)^(1/beta)`: exactly one `stablehlo.while` (the Gamma loop), four
+/// `stablehlo.rng` (the Gamma's `Z`/`U`/`U0` + the sign's `U`), and `sgn`
+/// composed via one `compare`/`select` pair (like [`laplace_sample`]).
+#[test]
+fn emit_sample_generalized_normal_has_expected_structure() {
+    let d = determinize_src(GENERALIZED_NORMAL_SAMPLE_SRC);
+    let out = emit_sample(&d);
+
+    assert!(out.contains("func.func @sample()"));
+    assert!(out.contains("-> tensor<f32>"));
+    assert_eq!(out.matches("stablehlo.while").count(), 1);
+    assert_eq!(out.matches("stablehlo.rng").count(), 4);
+    assert!(is_delimiter_balanced(&out));
+}
+
+#[test]
+fn emit_sample_generalized_normal_matches_frozen_golden() {
+    let d = determinize_src(GENERALIZED_NORMAL_SAMPLE_SRC);
+    let out = emit_sample(&d);
+    let golden = include_str!("goldens/generalized_normal_sample.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted @sample drifted from the frozen golden (tests/goldens/generalized_normal_sample.mlir)"
+    );
+}
+
+/// The Task-15 Dirichlet anchor fixture: a free (`elementof`-declared)
+/// length-3 `alpha` (exactly [`DIRICHLET_DENSITY_SRC`]'s shape, minus the
+/// pinned observation — `@sample` scores no variate), so `alpha` becomes a
+/// `tensor<3xf32>` func arg and the sampler unrolls into one Gamma draw per
+/// component.
+const DIRICHLET_SAMPLE_SRC: &str = "\
+alpha = elementof(cartpow(posreals, 3))
+s = rnginit(0)
+x = draw(Dirichlet(alpha = alpha))
+draws = rand(s, lawof(x))
+";
+
+/// §08 Dirichlet's `g_i ~ Gamma(alpha_i, 1)`, return `g / sum(g)`: `alpha`
+/// becomes a `tensor<3xf32>` func arg, one `stablehlo.while` PER component
+/// (three, statically unrolled), returning a normalized `tensor<3xf32>`.
+#[test]
+fn emit_sample_dirichlet_has_expected_structure() {
+    let d = determinize_src(DIRICHLET_SAMPLE_SRC);
+    assert!(
+        flatppl_determinizer::is_flatpdl(&d).is_ok(),
+        "determinized module must be FlatPDL-conformant (no residual measure node)"
+    );
+
+    let out = emit_sample(&d);
+
+    assert!(
+        out.contains("%arg0: tensor<3xf32>"),
+        "alpha must become a length-3 vector func arg, in:\n{out}"
+    );
+    assert!(out.contains("-> tensor<3xf32>"));
+    assert_eq!(
+        out.matches("stablehlo.while").count(),
+        3,
+        "expected one rejection loop per Dirichlet component, in:\n{out}"
+    );
+    assert_eq!(out.matches("stablehlo.rng").count(), 9);
+    assert!(
+        out.contains("stablehlo.concatenate"),
+        "expected the per-component Gamma draws packed into a vector, in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+#[test]
+fn emit_sample_dirichlet_matches_frozen_golden() {
+    let d = determinize_src(DIRICHLET_SAMPLE_SRC);
+    let out = emit_sample(&d);
+    let golden = include_str!("goldens/dirichlet_sample.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted @sample drifted from the frozen golden (tests/goldens/dirichlet_sample.mlir)"
     );
 }
