@@ -35,6 +35,17 @@
 //! shape, though: the density expression (`lp = logdensityof(...)`, or
 //! equivalent) is the LAST public top-level binding in source order. This
 //! module relies on that convention rather than re-deriving one.
+//!
+//! That convention is silent-wrong-result-capable: [`Module`]'s own doc
+//! disclaims that binding order carries spec meaning, so a module with any
+//! public binding *after* the density expression (a diagnostic/auxiliary
+//! value) would otherwise have [`emit_logdensity`] lower that trailing
+//! binding instead — producing a well-formed `tensor<f32>` module with wrong
+//! semantics, no refusal. [`emit_logdensity`] therefore guards the selected
+//! output with a cheap structural check ([`contains_logdensityof_call`]):
+//! the binding's RHS subtree must contain at least one `builtin_logdensityof`
+//! call, or it refuses rather than mis-lower. `@sample` (Task 6) will need
+//! the analogous guard over `builtin_sample`.
 
 use flatppl_core::{CallHead, Module, Node, NodeId, Phase};
 
@@ -73,8 +84,36 @@ pub fn emit_logdensity(m: &Module, opts: &EmitOptions) -> Result<String, EmitErr
     let query = m.public_bindings().last().ok_or_else(|| {
         EmitError::whole("module has no public binding to emit as the logdensity query")
     })?;
-    let result = e.lower_node(query.1.rhs)?;
+    let query_rhs = query.1.rhs;
+
+    // Guard the "last public binding" convention (see module doc comment):
+    // refuse rather than silently lower a trailing non-density binding.
+    if !contains_logdensityof_call(m, query_rhs) {
+        return Err(EmitError::at(
+            query_rhs,
+            "selected query output contains no density term (builtin_logdensityof); \
+             FlatPDL has no query marker — cannot identify the logdensity output",
+        ));
+    }
+
+    let result = e.lower_node(query_rhs)?;
     Ok(e.finish("logdensity", &args, &result))
+}
+
+/// Whether the subtree rooted at `id` (the node itself, or any descendant
+/// reached via [`Module::for_each_child`]) contains a `Call` whose head is
+/// the builtin `builtin_logdensityof` — the structural signal that `id` is
+/// actually a density term. See the module doc comment on why
+/// [`emit_logdensity`] cannot trust binding order alone.
+fn contains_logdensityof_call(m: &Module, root: NodeId) -> bool {
+    let mut stack = vec![root];
+    while let Some(id) = stack.pop() {
+        if is_builtin_call(m, id, "builtin_logdensityof") {
+            return true;
+        }
+        m.for_each_child(id, |c| stack.push(c));
+    }
+    false
 }
 
 /// A free-parameter declaration: `Phase::Parameterized` (spec §04 "Phase of
@@ -82,15 +121,18 @@ pub fn emit_logdensity(m: &Module, opts: &EmitOptions) -> Result<String, EmitErr
 /// check alone is not enough — see the module doc comment on why phase is a
 /// taint over the whole dependent subtree, not a parameter-leaf marker.
 fn is_free_param(m: &Module, rhs: NodeId) -> bool {
-    m.phase_of(rhs) == Some(Phase::Parameterized) && is_elementof_call(m, rhs)
+    m.phase_of(rhs) == Some(Phase::Parameterized) && is_builtin_call(m, rhs, "elementof")
 }
 
-fn is_elementof_call(m: &Module, id: NodeId) -> bool {
+/// Whether `id` is (structurally) a `Call` whose head is the builtin named
+/// `name` — shared by [`is_free_param`]'s `elementof(...)` check and
+/// [`contains_logdensityof_call`]'s `builtin_logdensityof` check.
+fn is_builtin_call(m: &Module, id: NodeId, name: &str) -> bool {
     matches!(
         m.node(id),
         Node::Call(c) if matches!(
             c.head,
-            CallHead::Builtin(sym) if m.resolve(sym) == "elementof"
+            CallHead::Builtin(sym) if m.resolve(sym) == name
         )
     )
 }

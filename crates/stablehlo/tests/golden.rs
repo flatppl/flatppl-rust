@@ -32,7 +32,11 @@ fn is_delimiter_balanced(s: &str) -> bool {
 
 #[test]
 fn emit_stub_on_flatpdl_returns_module() {
-    let src = "flatppl_compat = \"0.1\"\nx = 1.0\n";
+    // A bare fixed-data binding with no density term (e.g. `x = 1.0`) is
+    // exactly the shape `emit_logdensity`'s query-output guard now refuses
+    // (see `crates/stablehlo/src/modes.rs`) — this smoke test needs a real
+    // `logdensityof` so it still exercises the success path.
+    let src = "flatppl_compat = \"0.1\"\na = draw(Normal(mu = 0.0, sigma = 1.0))\nlp = logdensityof(lawof(record(a = a)), record(a = 0.5))\n";
     let m = flatppl_syntax::parse(src).unwrap();
     let d = flatppl_determinizer::determinize(&m).unwrap();
     let out = flatppl_stablehlo::emit(&d, flatppl_stablehlo::Mode::LogDensity, &Default::default())
@@ -1322,4 +1326,41 @@ fn normal_logpdf_refuses_missing_kernel_input_field() {
     let mut e = Emitter::new(&m, Dtype::F32);
     let err = e.lower_node(node).unwrap_err();
     assert!(err.msg.contains("sigma"), "unexpected message: {}", err.msg);
+}
+
+/// A trailing public binding *after* the density expression (e.g. a
+/// diagnostic/auxiliary value) must not be silently lowered as the query
+/// output just because it happens to be the last public binding in source
+/// order — `Module`'s own doc disclaims that binding order carries spec
+/// meaning. `emit_logdensity` must refuse (precisely, naming the missing
+/// density term) rather than mis-lower it.
+#[test]
+fn emit_logdensity_refuses_trailing_binding_with_no_density_term() {
+    let mut m = Module::new();
+    let ctor = const_node(&mut m, "Normal");
+    let mu = real(&mut m, 0.0);
+    let sigma = real(&mut m, 1.0);
+    let kernel_input = record_node(&mut m, &[("mu", mu), ("sigma", sigma)]);
+    let v = real(&mut m, 0.5);
+    let density = call(&mut m, "builtin_logdensityof", &[ctor, kernel_input, v]);
+    top_level(&mut m, "lp", density);
+
+    // A diagnostic/auxiliary binding that happens to land after `lp` in
+    // source order — no density term anywhere in its subtree.
+    let diag = real(&mut m, 42.0);
+    top_level(&mut m, "diag", diag);
+
+    let err = flatppl_stablehlo::emit(
+        &m,
+        flatppl_stablehlo::Mode::LogDensity,
+        &flatppl_stablehlo::EmitOptions::default(),
+    )
+    .unwrap_err();
+    assert!(
+        err.msg
+            .contains("contains no density term (builtin_logdensityof)"),
+        "unexpected message: {}",
+        err.msg
+    );
+    assert_eq!(err.node, Some(diag));
 }
