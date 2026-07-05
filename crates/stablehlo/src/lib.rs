@@ -1,0 +1,57 @@
+//! `flatppl-stablehlo` — prints textual StableHLO from post-`determinize`
+//! FlatPDL.
+//!
+//! This crate only *emits*: it takes a FlatPDL [`Module`] (the deterministic
+//! profile produced by `flatppl-determinizer`, which has already eliminated
+//! the measure layer) and lowers it to StableHLO's textual MLIR dialect. It
+//! never determinizes on its own — callers run `flatppl_determinizer::determinize`
+//! first, and `emit` refuses (never mis-lowers) if the input still carries
+//! measure-layer constructs.
+//!
+//! This is Task 1 of the backend: crate scaffold only. `emit` is a stub that
+//! asserts FlatPDL-conformance and returns a minimal empty module; later tasks
+//! fill in the real emitter and op registry.
+
+mod refuse;
+
+pub use refuse::EmitError;
+
+use flatppl_core::Module;
+
+/// Which computation to emit: the model's log-density, or a sampling program.
+pub enum Mode {
+    LogDensity,
+    Sample,
+}
+
+/// Floating-point element type for emitted StableHLO tensors.
+#[derive(Clone, Copy)]
+pub enum Dtype {
+    F32,
+    F64,
+}
+
+/// Emitter configuration. `dtype` defaults to [`Dtype::F32`] — the emitter
+/// never assumes/hardcodes 64-bit floats.
+pub struct EmitOptions {
+    pub dtype: Dtype,
+}
+
+impl Default for EmitOptions {
+    fn default() -> Self {
+        Self { dtype: Dtype::F32 }
+    }
+}
+
+/// Emit textual StableHLO for `m`, which must already be FlatPDL-conformant
+/// (i.e. the output of `flatppl_determinizer::determinize`). Refuses (never
+/// mis-lowers) if `m` still carries measure-layer constructs.
+///
+/// Stub (Task 1): once FlatPDL-conformance is confirmed, returns a minimal
+/// valid empty module. `_mode` / `_opts` are threaded through the signature
+/// for later tasks and are not yet used.
+pub fn emit(m: &Module, _mode: Mode, _opts: &EmitOptions) -> Result<String, EmitError> {
+    flatppl_determinizer::is_flatpdl(m)
+        .map_err(|_| EmitError::whole("input is not FlatPDL (determinize first)"))?;
+    Ok("module {\n}\n".to_string())
+}

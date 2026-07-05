@@ -160,6 +160,9 @@ pub enum Failure {
     /// A determiniser refusal — a construct that cannot be legalized to FlatPDL.
     /// Distinct exit code (3) so callers classify refuse ≠ parse/IO error.
     Refuse(String),
+    /// A bad command-line argument value (e.g. an unrecognized `--mode`).
+    /// Distinct exit code (2), the conventional usage-error code.
+    Usage(String),
 }
 
 impl From<String> for Failure {
@@ -236,6 +239,10 @@ pub fn report(result: Result<(), Failure>) -> ExitCode {
         Err(Failure::Refuse(msg)) => {
             eprintln!("{msg}");
             ExitCode::from(3)
+        }
+        Err(Failure::Usage(msg)) => {
+            eprintln!("flatppl: {msg}");
+            ExitCode::from(2)
         }
     }
 }

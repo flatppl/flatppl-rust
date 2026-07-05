@@ -9,15 +9,26 @@
 
 use std::process::ExitCode;
 
-#[cfg(any(feature = "convert", feature = "infer", feature = "determinize"))]
+#[cfg(any(
+    feature = "convert",
+    feature = "infer",
+    feature = "determinize",
+    feature = "stablehlo"
+))]
 use std::fs;
-#[cfg(any(feature = "convert", feature = "infer", feature = "determinize"))]
+#[cfg(any(
+    feature = "convert",
+    feature = "infer",
+    feature = "determinize",
+    feature = "stablehlo"
+))]
 use std::path::Path;
 #[cfg(any(
     feature = "convert",
     feature = "infer",
     feature = "prepare",
-    feature = "determinize"
+    feature = "determinize",
+    feature = "stablehlo"
 ))]
 use std::path::PathBuf;
 
@@ -28,10 +39,16 @@ use clap::{CommandFactory, Parser, Subcommand};
     feature = "convert",
     feature = "infer",
     feature = "prepare",
-    feature = "determinize"
+    feature = "determinize",
+    feature = "stablehlo"
 ))]
 use flatppl_cli::Failure;
-#[cfg(any(feature = "convert", feature = "infer", feature = "determinize"))]
+#[cfg(any(
+    feature = "convert",
+    feature = "infer",
+    feature = "determinize",
+    feature = "stablehlo"
+))]
 use flatppl_cli::Format;
 #[cfg(feature = "convert")]
 use flatppl_cli::SyntaxLevel;
@@ -145,6 +162,23 @@ enum Command {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
+    /// Emit textual StableHLO for a FlatPPL model.
+    ///
+    /// Always determinizes first (eliminate the measure layer), then prints
+    /// StableHLO for the requested `--mode`. Refuses (exit 3) any construct
+    /// the determiniser or emitter cannot legalize, per refuse-don't-mislower;
+    /// an unrecognized `--mode` exits 2.
+    #[cfg(feature = "stablehlo")]
+    Stablehlo {
+        /// Input FlatPPL file.
+        input: PathBuf,
+        /// Computation to emit: `logdensity` or `sample`.
+        #[arg(long, default_value = "logdensity")]
+        mode: String,
+        /// Output file (`.mlir`); stdout if omitted.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
     /// Print a shell completion script to stdout.
     ///
     /// Covers every subcommand and flag. Install, e.g.:
@@ -246,6 +280,12 @@ fn main() -> ExitCode {
         Command::Prepare { files, update } => prepare_cmd(&files, update),
         #[cfg(feature = "determinize")]
         Command::Determinize { input, output } => determinize_cmd(&input, output.as_deref()),
+        #[cfg(feature = "stablehlo")]
+        Command::Stablehlo {
+            input,
+            mode,
+            output,
+        } => stablehlo_cmd(&input, &mode, output.as_deref()),
         Command::Completions { shell } => {
             let mut cmd = Cli::command();
             clap_complete::generate(shell, &mut cmd, "flatppl", &mut std::io::stdout());
@@ -488,6 +528,54 @@ fn determinize_cmd(input: &Path, output: Option<&Path>) -> Result<(), Failure> {
         ))
     })?;
     let rendered = flatppl_syntax::print(&lowered);
+    match output {
+        Some(path) => fs::write(path, rendered)
+            .map_err(|e| Failure::Plain(format!("writing `{}`: {e}", path.display())))?,
+        None => print!("{rendered}"),
+    }
+    Ok(())
+}
+
+/// `flatppl stablehlo <in.flatppl> [--mode logdensity|sample] [-o out]` —
+/// determinize a FlatPPL model to FlatPDL, then emit textual StableHLO for
+/// `mode`, printing to `output`/stdout. An unrecognized `--mode` exits 2
+/// (`Failure::Usage`); refuses (exit 3, via `Failure::Refuse`) any construct
+/// the determiniser or emitter cannot legalize — the same exit-code
+/// convention as `determinize`.
+#[cfg(feature = "stablehlo")]
+fn stablehlo_cmd(input: &Path, mode: &str, output: Option<&Path>) -> Result<(), Failure> {
+    let source =
+        fs::read_to_string(input).map_err(|e| format!("reading `{}`: {e}", input.display()))?;
+    let module = match flatppl_cli::read_module(Format::FlatPpl, &source) {
+        Ok(m) => m,
+        Err((message, line, span)) => {
+            return Err(Failure::Diagnostic {
+                path: input.to_path_buf(),
+                source,
+                message,
+                line,
+                span,
+            });
+        }
+    };
+    let lowered = flatppl_determinizer::determinize(&module).map_err(|e| {
+        Failure::Refuse(format!(
+            "determinize: refuse {} (node {:?}): {}",
+            e.construct, e.node, e.reason
+        ))
+    })?;
+    let mode = match mode {
+        "logdensity" => flatppl_stablehlo::Mode::LogDensity,
+        "sample" => flatppl_stablehlo::Mode::Sample,
+        other => {
+            return Err(Failure::Usage(format!(
+                "stablehlo: unrecognized `--mode {other}` (expected `logdensity` or `sample`)"
+            )));
+        }
+    };
+    let rendered =
+        flatppl_stablehlo::emit(&lowered, mode, &flatppl_stablehlo::EmitOptions::default())
+            .map_err(|e| Failure::Refuse(e.to_string()))?;
     match output {
         Some(path) => fs::write(path, rendered)
             .map_err(|e| Failure::Plain(format!("writing `{}`: {e}", path.display())))?,

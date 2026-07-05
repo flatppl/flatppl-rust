@@ -349,6 +349,7 @@ dependencies = [
  "flatppl-hs3",
  "flatppl-infer",
  "flatppl-lint",
+ "flatppl-stablehlo",
  "flatppl-syntax",
  "serde_json",
 ]
@@ -430,6 +431,17 @@ dependencies = [
  "lsp-types",
  "salsa",
  "serde_json",
+]
+
+[[package]]
+name = "flatppl-stablehlo"
+version = "0.1.0"
+dependencies = [
+ "flatppl-core",
+ "flatppl-determinizer",
+ "flatppl-flatpir",
+ "flatppl-infer",
+ "flatppl-syntax",
 ]
 
 [[package]]

@@ -1,0 +1,17 @@
+[package]
+name = "flatppl-stablehlo"
+description = "FlatPDL → textual StableHLO emitter."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+flatppl-core = { path = "../core" }
+flatppl-infer = { path = "../infer" }
+flatppl-determinizer = { path = "../determinizer" }
+
+[dev-dependencies]
+flatppl-syntax = { path = "../syntax" }
+flatppl-flatpir = { path = "../flatpir" }
