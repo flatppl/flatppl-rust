@@ -17,11 +17,12 @@
 //!     single input binds to the `cat` of all prior slices.
 
 use crate::density::{
-    build_density_term, draw_argument, expect_builtin_call, fold_add, refuse, resolve_ref_one,
+    build_call, build_density_term, draw_argument, expect_builtin_call, fold_add, refuse,
+    resolve_ref_one,
 };
 use crate::kernel::{Kernel, resolve_kernel, substitute_ref};
 use crate::refuse::RefuseError;
-use flatppl_core::{CallHead, Module, NamedKind, Node, NodeId, Symbol};
+use flatppl_core::{CallHead, Module, NamedKind, Node, NodeId, Scalar, Symbol};
 
 /// A resolved single-draw component: its variate field name (record-form) or
 /// `None` (scalar-cat), and its distribution constructor. Kernel inputs are
@@ -179,19 +180,99 @@ fn resolve_single_draw(m: &Module, expr: NodeId) -> Option<(Option<Symbol>, Node
     Some((field, dist))
 }
 
-/// Scalar-cat family — implemented in Task 4. Refuse for now so record-form is
-/// self-contained and independently reviewable.
+/// Scalar-cat: components are scalar draws; the point is a vector; slice i via
+/// `get0(v, i)`. A kernel has exactly ONE input, bound to the `cat` of all
+/// prior slices — the scalar `s₀` for one prior, `vector(s₀,…,s_{i-1})` for more.
 fn lower_scalar_family(
-    _m: &mut Module,
+    m: &mut Module,
     node: NodeId,
-    _args: &[NodeId],
-    _base: Component,
-    _v: NodeId,
+    args: &[NodeId],
+    base: Component,
+    v: NodeId,
 ) -> Result<NodeId, RefuseError> {
-    Err(refuse_jc(
-        node,
-        "scalar-cat jointchain lowering is not yet implemented",
-    ))
+    // Fail-closed: every component's variate must be CONFIRMED scalar, else a
+    // get0 slice would silently drop/misplace slots (cf. lower_joint's guard).
+    for &comp_arg in args {
+        if !component_is_scalar(m, comp_arg) {
+            return Err(refuse_jc(
+                node,
+                "scalar-cat component variate is not confirmed scalar",
+            ));
+        }
+    }
+
+    let mut env: Vec<NodeId> = Vec::with_capacity(args.len());
+    let mut terms: Vec<NodeId> = Vec::with_capacity(args.len());
+
+    // Base = slice 0.
+    let idx0 = m.alloc(Node::Lit(Scalar::Int(0)));
+    let s0 = build_call(m, "get0", &[v, idx0]);
+    terms.push(build_density_term(m, base.dist, s0)?);
+    env.push(s0);
+
+    for (i, &k_arg) in args[1..].iter().enumerate() {
+        let kernel = resolve_kernel(m, k_arg)
+            .ok_or_else(|| refuse_jc(node, "jointchain kernel is not a kernelof(...)"))?;
+        // Scalar-cat kernels take exactly one input: the cat of prior variates.
+        if kernel.inputs.len() != 1 {
+            return Err(refuse_jc(
+                node,
+                "scalar-cat kernel must take exactly one input (the cat of priors)",
+            ));
+        }
+        let comp = resolve_kernel_component(m, &kernel)
+            .ok_or_else(|| refuse_jc(node, "kernel body is not a single scalar draw"))?;
+        if comp.field.is_some() {
+            return Err(refuse_jc(
+                node,
+                "mixed families: record-form kernel in a scalar-cat chain",
+            ));
+        }
+
+        // Bind the single input to cat(env): the scalar itself for one prior,
+        // else a vector of all prior slices.
+        let cat = if env.len() == 1 {
+            env[0]
+        } else {
+            build_call(m, "vector", &env)
+        };
+        let target = kernel.inputs[0].1.name;
+        let dist_i = substitute_ref(m, comp.dist, target, cat);
+
+        let idx = m.alloc(Node::Lit(Scalar::Int((i + 1) as i64)));
+        let si = build_call(m, "get0", &[v, idx]);
+        terms.push(build_density_term(m, dist_i, si)?);
+        env.push(si);
+    }
+
+    Ok(fold_add(m, &terms))
+}
+
+/// Is the component argument (a base measure or a `kernelof`) confirmed to have
+/// a SCALAR variate? Reads the inferred measure/kernel domain; fail-closed on
+/// unknown/deferred (returns false → the caller refuses).
+fn component_is_scalar(m: &Module, comp_arg: NodeId) -> bool {
+    let (resolved, _) = resolve_ref_one(m, comp_arg);
+    match m.type_of(resolved) {
+        Some(flatppl_core::Type::Measure { domain, .. }) => {
+            matches!(domain.as_ref(), flatppl_core::Type::Scalar(_))
+        }
+        Some(flatppl_core::Type::Kernel { .. }) => {
+            // A kernel's variate is its body's domain; resolve the body's draw
+            // constructor and check its measure domain.
+            resolve_kernel(m, resolved)
+                .and_then(|k| resolve_single_draw(m, k.body))
+                .map(|(_, dist)| {
+                    matches!(
+                        m.type_of(dist),
+                        Some(flatppl_core::Type::Measure { domain, .. })
+                            if matches!(domain.as_ref(), flatppl_core::Type::Scalar(_))
+                    )
+                })
+                .unwrap_or(false)
+        }
+        _ => false,
+    }
 }
 
 fn refuse_jc(node: NodeId, reason: &str) -> RefuseError {

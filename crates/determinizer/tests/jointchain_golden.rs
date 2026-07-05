@@ -154,3 +154,87 @@ lp = logdensityof(j, record(a = 0.3, b = 0.7))";
         "explains the unbindable input: {err:?}"
     );
 }
+
+// Scalar-cat jointchain: output is a VECTOR variate; slices via get0. Base
+// `a ~ Normal(0,1)` scored at get0(v,0); kernel `b ~ Normal(mu = a, 0.5)`
+// scored at get0(v,1) with its input `a` bound to get0(v,0).
+#[test]
+fn jointchain_scalar_single_step() {
+    let src = "\
+a = draw(Normal(mu = 0.0, sigma = 1.0))
+k = kernelof(Normal(mu = a, sigma = 0.5), a = a)
+j = jointchain(lawof(a), k)
+lp = logdensityof(j, [0.3, 0.7])";
+    let out = determinize_src(src);
+    let pir = flatppl_flatpir::write(&out);
+
+    assert_eq!(
+        pir.matches("builtin_logdensityof").count(),
+        2,
+        "two terms:\n{pir}"
+    );
+    assert!(pir.contains("(%field mu 0.0)"), "base mean 0.0:\n{pir}");
+    // Slices are get0 of the point vector.
+    assert!(pir.contains("(get0 "), "scalar slices via get0:\n{pir}");
+    assert!(
+        !pir.contains("jointchain") && !pir.contains("kernelof") && !pir.contains("lawof"),
+        "measure layer gone:\n{pir}"
+    );
+    assert!(
+        flatppl_determinizer::is_flatpdl(&out).is_ok(),
+        "is_flatpdl:\n{pir}"
+    );
+}
+
+// Scalar-cat 3-step: c ~ K2([a,b]). The single input `_ab_` binds to
+// vector(get0(v,0), get0(v,1)); the body indexes it.
+#[test]
+fn jointchain_scalar_multi_step() {
+    let src = "\
+a = draw(Normal(mu = 0.0, sigma = 1.0))
+k1 = kernelof(Normal(mu = a, sigma = 0.5), a = a)
+k2 = kernelof(Normal(mu = add(get0(_ab_, 0), get0(_ab_, 1)), sigma = 0.25), ab = _ab_)
+j = jointchain(lawof(a), k1, k2)
+lp = logdensityof(j, [0.3, 0.7, 1.1])";
+    let out = determinize_src(src);
+    let pir = flatppl_flatpir::write(&out);
+    assert_eq!(
+        pir.matches("builtin_logdensityof").count(),
+        3,
+        "three terms:\n{pir}"
+    );
+    // The prior cat is a vector of the first two slices.
+    assert!(
+        pir.contains("(vector (get0 ") || pir.contains("(vector "),
+        "prior cat is a vector:\n{pir}"
+    );
+    assert!(
+        !pir.contains("_ab_"),
+        "placeholder substituted away:\n{pir}"
+    );
+    assert!(
+        flatppl_determinizer::is_flatpdl(&out).is_ok(),
+        "is_flatpdl:\n{pir}"
+    );
+}
+
+// A record-form kernel in a scalar-cat chain (base is scalar, kernel body is a
+// record draw) is a mixed family — refuse.
+#[test]
+fn jointchain_mixed_family_refuses() {
+    let src = "\
+a = draw(Normal(mu = 0.0, sigma = 1.0))
+k = kernelof(record(b = draw(Normal(mu = a, sigma = 0.5))), a = a)
+j = jointchain(lawof(a), k)
+lp = logdensityof(j, [0.3, 0.7])";
+    let m = parse_infer(src);
+    let err = determinize(&m).expect_err("mixed record/scalar families must refuse");
+    assert!(
+        err.construct.contains("jointchain"),
+        "names jointchain: {err:?}"
+    );
+    assert!(
+        err.reason.contains("mixed families"),
+        "explains mixed families: {err:?}"
+    );
+}
