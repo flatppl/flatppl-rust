@@ -11,10 +11,17 @@
 //! This is Task 1 of the backend: crate scaffold only. `emit` is a stub that
 //! asserts FlatPDL-conformance and returns a minimal empty module; later tasks
 //! fill in the real emitter and op registry.
+//!
+//! Task 2 adds the `Type`/`Dim` → MLIR `tensor<…>` mapping ([`mlir_type_of`],
+//! [`MlirTy`]) that every later emitter task builds SSA values on top of.
 
+mod mlir;
 mod refuse;
+mod types;
 
+pub use mlir::{MlirTy, Value};
 pub use refuse::EmitError;
+pub use types::mlir_type_of;
 
 use flatppl_core::Module;
 
