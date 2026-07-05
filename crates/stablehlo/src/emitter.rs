@@ -207,6 +207,15 @@ impl<'m> Emitter<'m> {
     pub fn sin(&mut self, a: &Value) -> Value {
         self.unary("stablehlo.sine", a)
     }
+    /// `stablehlo.floor` — a NEW op form for this crate (Task 16's Geometric
+    /// `@sample`, `floor(log(U) / log(1 - p))`, the only discrete sampler that
+    /// rounds a real-valued inverse-CDF down to an integer count). Elementwise,
+    /// shape-preserving, same plain `: ty` form as every other `stablehlo.*`
+    /// unary; parser-validated against the real StableHLO parser (jax 0.10.2),
+    /// same discipline as [`Emitter::sin`].
+    pub fn floor(&mut self, a: &Value) -> Value {
+        self.unary("stablehlo.floor", a)
+    }
 
     /// `%N = stablehlo.compare {dir}, %a, %b : (lhs, rhs) -> i1-shape`.
     /// `dir` is a StableHLO `comparison_direction` (`"LT"`, `"GE"`, `"EQ"`,

@@ -155,56 +155,56 @@ static REGISTRY: &[(&str, DistLowering)] = &[
         "Bernoulli",
         DistLowering {
             logpdf: bernoulli_logpdf,
-            sample: None,
+            sample: Some(bernoulli_sample),
         },
     ),
     (
         "Poisson",
         DistLowering {
             logpdf: poisson_logpdf,
-            sample: None,
+            sample: Some(poisson_sample),
         },
     ),
     (
         "Binomial",
         DistLowering {
             logpdf: binomial_logpdf,
-            sample: None,
+            sample: Some(binomial_sample),
         },
     ),
     (
         "Geometric",
         DistLowering {
             logpdf: geometric_logpdf,
-            sample: None,
+            sample: Some(geometric_sample),
         },
     ),
     (
         "NegativeBinomial",
         DistLowering {
             logpdf: negative_binomial_logpdf,
-            sample: None,
+            sample: Some(negative_binomial_sample),
         },
     ),
     (
         "NegativeBinomial2",
         DistLowering {
             logpdf: negative_binomial2_logpdf,
-            sample: None,
+            sample: Some(negative_binomial2_sample),
         },
     ),
     (
         "Categorical",
         DistLowering {
             logpdf: categorical_logpdf,
-            sample: None,
+            sample: Some(categorical_sample),
         },
     ),
     (
         "Categorical0",
         DistLowering {
             logpdf: categorical0_logpdf,
-            sample: None,
+            sample: Some(categorical0_sample),
         },
     ),
     (
@@ -225,7 +225,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
         "Multinomial",
         DistLowering {
             logpdf: multinomial_logpdf,
-            sample: None,
+            sample: Some(multinomial_sample),
         },
     ),
     (
@@ -1235,9 +1235,9 @@ fn horner(e: &mut Emitter, t: &Value, coeffs: &[f64]) -> Value {
 //
 // Bernoulli/Poisson/Binomial/Geometric/NegativeBinomial/NegativeBinomial2/
 // Categorical/Categorical0, registered alongside the rest of §08 in
-// `REGISTRY` with `sample: None` (discrete `@sample` builders land in Task
-// 16, alongside Multinomial and the finalized refuse-@sample set — see the
-// roadmap doc). Binomial needs `logC(n, k) = lgamma(n+1) -
+// `REGISTRY`. Their `@sample` builders (`sample: Some(..)`) land in Task 16's
+// discrete batch at the end of this file, alongside Multinomial's and the
+// finalized refuse-@sample set. Binomial needs `logC(n, k) = lgamma(n+1) -
 // lgamma(k+1) - lgamma(n-k+1)`, inlined directly in [`binomial_logpdf`] (the
 // task brief's general form; NegativeBinomial/NegativeBinomial2 below use
 // their own already-lgamma-reduced log-forms instead, so this closed form
@@ -1249,8 +1249,8 @@ fn horner(e: &mut Emitter, t: &Value, coeffs: &[f64]) -> Value {
 // a per-observation formula built from arithmetic on `v` — see
 // [`categorical_logpdf`]'s doc comment.
 
-/// §08 Bernoulli, verbatim: `log f = k * log(p) + (1 - k) * log(1 - p)`. No
-/// `@sample` builder yet (`sample: None`; Task 16).
+/// §08 Bernoulli, verbatim: `log f = k * log(p) + (1 - k) * log(1 - p)`. Its
+/// `@sample` builder is [`bernoulli_sample`] (Task 16).
 fn bernoulli_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
     let prob = p.get(e, "p")?;
 
@@ -1267,8 +1267,8 @@ fn bernoulli_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, Emi
 }
 
 /// §08 Poisson, verbatim: `log f = k * log(rate) - rate - lgamma(k + 1)`
-/// (`log(k!) = lgamma(k+1)`). No `@sample` builder yet (`sample: None`; Task
-/// 16).
+/// (`log(k!) = lgamma(k+1)`). Its `@sample` builder is [`poisson_sample`]
+/// (Task 16) — the bounded inverse-CDF [`draw_poisson`] loop.
 fn poisson_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
     let rate = p.get(e, "rate")?;
 
@@ -1291,7 +1291,8 @@ fn poisson_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitE
 /// `Value` reused for both `logC`'s `lgamma(n-k+1)` term and the trailing
 /// `(n-k) * log(1-p)` term — the spec's `n - k` appears in both positions
 /// verbatim, same reuse discipline as [`lognormal_logpdf`]'s shared `log(x)`.
-/// No `@sample` builder yet (`sample: None`; Task 16).
+/// Its `@sample` builder is [`binomial_sample`] (Task 16) — the exact sum of
+/// `n` Bernoulli indicators.
 fn binomial_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
     let n = p.get(e, "n")?;
     let prob = p.get(e, "p")?;
@@ -1327,8 +1328,9 @@ fn binomial_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, Emit
 /// §08 Geometric, verbatim: `log f = log(p) + k * log(1 - p)` — `k` is the
 /// number of FAILURES before the first success (0-based, `k in nonnegintegers`;
 /// see [`geometric_logpdf`]'s numeric verification against `scipy.stats.geom`
-/// in the Task 11 report, whose own `k` convention counts TRIALS, 1-based). No
-/// `@sample` builder yet (`sample: None`; Task 16).
+/// in the Task 11 report, whose own `k` convention counts TRIALS, 1-based).
+/// Its `@sample` builder is [`geometric_sample`] (Task 16) —
+/// `floor(log(U) / log(1 - p))`.
 fn geometric_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
     let prob = p.get(e, "p")?;
 
@@ -1349,8 +1351,8 @@ fn geometric_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, Emi
 /// = (k+alpha-1, alpha-1)` pair first and expanding `logC` from there, as
 /// [`binomial_logpdf`] does for its own `(n, k)` pair, would reach the same
 /// three lgammas via one extra `sub`/`add` pair; inlining the already-reduced
-/// form here is the smaller op count). No `@sample` builder yet (`sample:
-/// None`; Task 16).
+/// form here is the smaller op count). Its `@sample` builder is
+/// [`negative_binomial_sample`] (Task 16) — the Gamma–Poisson mixture.
 fn negative_binomial_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
     let alpha = p.get(e, "alpha")?;
     let beta = p.get(e, "beta")?;
@@ -1388,8 +1390,8 @@ fn negative_binomial_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Va
 /// comment. `log(mu + psi)` is computed once and its negation reused for both
 /// the `k`- and `psi`-weighted ratio terms (the spec's `mu + psi` denominator
 /// appears in both positions verbatim — same reuse discipline as
-/// `lognormal_logpdf`'s shared `log(x)`). No `@sample` builder yet (`sample:
-/// None`; Task 16).
+/// `lognormal_logpdf`'s shared `log(x)`). Its `@sample` builder is
+/// [`negative_binomial2_sample`] (Task 16) — the Gamma–Poisson mixture.
 fn negative_binomial2_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
     let mu = p.get(e, "mu")?;
     let psi = p.get(e, "psi")?;
@@ -1497,7 +1499,8 @@ fn literal_variate_index(e: &Emitter, p: &Params) -> Result<i64, EmitError> {
 /// unused here — unlike every arithmetic-formula builder above, this density
 /// is a lookup, not a function of `v`'s lowered tensor form; the un-lowered
 /// selector integer read via [`Params::variate_id`] is what actually drives
-/// the slice. No `@sample` builder yet (`sample: None`; Task 16 — `searchsorted(cumsum(p), U)`).
+/// the slice. Its `@sample` builder is [`categorical_sample`] (Task 16) — the
+/// shared [`draw_categorical`] inverse-CDF index draw, `base = 1.0`.
 fn categorical_logpdf(e: &mut Emitter, p: &Params, _v: &Value) -> Result<Value, EmitError> {
     let probs = p.get(e, "p")?;
     let variate = p.variate_id()?;
@@ -1525,8 +1528,8 @@ fn categorical0_logpdf(e: &mut Emitter, p: &Params, _v: &Value) -> Result<Value,
 // MvNormal/Dirichlet/Multinomial, registered alongside the rest of §08 in
 // `REGISTRY` (MvNormal's straight-line reparam sampler landed in Task 14,
 // Dirichlet's per-component Gamma rejection sampler in Task 15 — see the
-// Task-15 batch at the end of this file; Multinomial's lands in Task 16, so it
-// stays `sample: None`). Unlike every scalar builder above,
+// Task-15 batch at the end of this file; Multinomial's is [`multinomial_sample`]
+// in Task 16's discrete batch at the end of this file). Unlike every scalar builder above,
 // `mu`/`cov`/`alpha`/`p`/`v` here are rank-1 (vector) or rank-2 (matrix)
 // `Value`s, not `Scalar`s: [`Emitter::lgamma`]/[`Emitter::log`]/
 // [`Emitter::neg`] are elementwise (same shape in, same shape out — see
@@ -1690,7 +1693,8 @@ fn dirichlet_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, Emi
 /// sum(x * log(p))`. `x + 1` needs a vector-shaped `1`, same reasoning as
 /// [`dirichlet_logpdf`]'s `alpha - 1`; `n + 1` (the trial-count scalar
 /// parameter, unrelated to `x`'s vector shape) needs only the ordinary
-/// scalar one. No `@sample` builder yet (`sample: None`; Task 16).
+/// scalar one. Its `@sample` builder is [`multinomial_sample`] (Task 16) — a
+/// bounded `while` over `n` Categorical(p) draws accumulated into counts.
 fn multinomial_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
     let n = p.get(e, "n")?;
     let probs = p.get(e, "p")?;
@@ -1837,19 +1841,25 @@ fn require_matrix_dim(
 }
 
 /// The literal positive-integer value of the kernel-input field `field_name`
-/// — needed by [`lkj_logpdf`]/[`lkj_cholesky_logpdf`] to get their explicit
-/// `n` kwarg as a Rust `u64` at EMIT time, to unroll [`log_cn_lkj`]'s `k`
-/// sum. Follows at most one level of `(%ref self x)` indirection via
-/// [`Emitter::resolve_ref_one`] — a FIXED-phase field's use site is that
-/// indirection, not the literal inlined directly (see the batch doc
-/// comment) — then requires a positive `Node::Lit(Scalar::Int(_))`. Refuses
-/// (never panics) for anything else, e.g. a `%parameterized`
-/// (`elementof`-declared) `n`, which has no such literal to find.
+/// — needed by [`lkj_logpdf`]/[`lkj_cholesky_logpdf`] (to unroll
+/// [`log_cn_lkj`]'s `k` sum) and by [`binomial_sample`]/[`multinomial_sample`]
+/// (to size a static-length `stablehlo.rng` batch/`while` bound) to get their
+/// explicit `n` kwarg as a Rust `u64` at EMIT time. Follows at most one level
+/// of `(%ref self x)` indirection via [`Emitter::resolve_ref_one`] — a
+/// FIXED-phase field's use site is that indirection, not the literal inlined
+/// directly (see the batch doc comment) — then requires a positive
+/// `Node::Lit(Scalar::Int(_))`. Refuses (never panics) for anything else,
+/// e.g. a `%parameterized` (`elementof`-declared) `n`, which has no such
+/// literal to find. `mode` (`"logdensity"` or `"sample"`) names which side is
+/// asking, so the message accurately says which lowering needs the literal
+/// — LKJ/LKJCholesky's `logdensity` callers pass `"logdensity"`; Binomial/
+/// Multinomial's `sample` callers pass `"sample"`.
 fn literal_fixed_positive_int(
     e: &Emitter,
     p: &Params,
     field_name: &str,
     ctor: &str,
+    mode: &str,
 ) -> Result<u64, EmitError> {
     let field = p.field_id(e, field_name)?;
     let resolved = e.resolve_ref_one(field);
@@ -1858,7 +1868,7 @@ fn literal_fixed_positive_int(
         _ => Err(EmitError::at(
             field,
             format!(
-                "{ctor} logdensity needs a fixed-phase positive integer literal for '{field_name}'"
+                "{ctor} {mode} needs a fixed-phase positive integer literal for '{field_name}'"
             ),
         )),
     }
@@ -2078,7 +2088,7 @@ fn inverse_wishart_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Valu
 /// checked against it by [`require_matrix_dim`] before `cholesky` runs. No
 /// `@sample` builder (`sample: None`).
 fn lkj_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
-    let n = literal_fixed_positive_int(e, p, "n", "LKJ")?;
+    let n = literal_fixed_positive_int(e, p, "n", "LKJ", "logdensity")?;
     require_matrix_dim(p.variate_id()?, v, n, "LKJ", "C")?;
     let eta = p.get(e, "eta")?;
 
@@ -2102,7 +2112,7 @@ fn lkj_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError
 /// against `n` by [`require_matrix_dim`] before [`Emitter::diag`] runs. No
 /// `@sample` builder (`sample: None`).
 fn lkj_cholesky_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
-    let n = literal_fixed_positive_int(e, p, "n", "LKJCholesky")?;
+    let n = literal_fixed_positive_int(e, p, "n", "LKJCholesky", "logdensity")?;
     require_matrix_dim(p.variate_id()?, v, n, "LKJCholesky", "L")?;
     let eta = p.get(e, "eta")?;
 
@@ -2408,4 +2418,362 @@ fn dirichlet_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
     let sum = e.reduce_sum(&g_vec);
     let sum_bc = e.broadcast_in_dim(&sum, &[], g_vec.ty.clone());
     Ok(e.div(&g_vec, &sum_bc))
+}
+
+// ---- §08 discrete + Multinomial `@sample` batch (Task 16) -------------------
+//
+// The discrete distributions' samplers (Bernoulli/Geometric/Categorical/
+// Categorical0/Binomial/Poisson/NegativeBinomial/NegativeBinomial2) plus
+// Multinomial — the last `@sample` batch, completing the §08 sampler set. Every
+// one returns an f32-holding-integer variate (a `Scalar`, or a length-`k`
+// vector for Multinomial), matching how the `@logdensity` side already reads a
+// discrete variate: `Emitter::lower_node`'s `Lit(Int)` arm lowers an integer
+// literal to an f32 `stablehlo.constant`, never an `i32` tensor, so a sampled
+// count returned as an f32 whole number round-trips through the exact same
+// tensor type a scored count is read at (no `stablehlo.convert` needed — the
+// loop counters that ARE `i32` here, Multinomial's `while` index, are internal
+// bookkeeping that never leaves the loop).
+//
+// Three shapes of sampler here:
+//
+// - Straight-line (Bernoulli/Geometric/Categorical/Categorical0/Binomial): a
+//   fixed op sequence, no loop. Bernoulli/Geometric are one `stablehlo.rng`
+//   plus arithmetic; Categorical/Categorical0 unroll the `n - 1` inverse-CDF
+//   prefix-sum comparisons at emit time (`n` the statically-known length of
+//   `p`); Binomial draws a length-`n` uniform batch (`n` a FIXED literal) and
+//   sums the `select`-ed Bernoulli indicators.
+// - Poisson: a bounded inverse-CDF `stablehlo.while` ([`draw_poisson`]) — one
+//   uniform `U` drawn before the loop, the loop walking the incremental Poisson
+//   CDF until `U <= F(k)`. Same bounded-`MAXITER`/clamp design as
+//   [`draw_gamma`], but CDF inversion of a SINGLE uniform (no per-iteration
+//   randomness), so nothing is pre-drawn.
+// - Gamma–Poisson mixture (NegativeBinomial/NegativeBinomial2): a
+//   [`draw_gamma`] (Task 15) feeding a [`draw_poisson`] — the standard NegBin
+//   construction (§08 equivalence). Multinomial: a bounded `while` over `n`
+//   Categorical(p) draws (`n` FIXED), each incremented into a length-`k` count
+//   vector via a one-hot `compare`/`select` (`k` the statically-known length of
+//   `p`).
+
+/// §08 Bernoulli's sampler, verbatim: `select(U < p, 1, 0)`, `U ~ Uniform(0,
+/// 1)` drawn at `p`'s own shape (mirrors [`normal_sample`]'s `&mu.ty`
+/// convention). Returns an f32 `1.0`/`0.0` (see the batch doc comment on the
+/// f32-holding-integer convention).
+fn bernoulli_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
+    let prob = p.get(e, "p")?;
+    let zero = e.scalar(0.0);
+    let one = e.scalar(1.0);
+    let u = e.rng("UNIFORM", &zero, &one, &prob.ty);
+    let lt = e.compare("LT", &u, &prob);
+    Ok(e.select(&lt, &one, &zero))
+}
+
+/// §08 Geometric's sampler, verbatim: `floor(log(U) / log(1 - p))`, `U ~
+/// Uniform(0, 1)` drawn at `p`'s own shape — the inverse-CDF of the 0-based
+/// "number of failures before the first success" convention
+/// [`geometric_logpdf`] scores (`k in nonnegintegers`). The only discrete
+/// sampler needing [`Emitter::floor`].
+fn geometric_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
+    let prob = p.get(e, "p")?;
+    let zero = e.scalar(0.0);
+    let one = e.scalar(1.0);
+    let u = e.rng("UNIFORM", &zero, &one, &prob.ty);
+    let log_u = e.log(&u);
+    let one_minus_p = e.sub(&one, &prob);
+    let log_one_minus_p = e.log(&one_minus_p);
+    let ratio = e.div(&log_u, &log_one_minus_p);
+    Ok(e.floor(&ratio))
+}
+
+/// The shared Categorical inverse-CDF index draw: `base + Σ_{j=1}^{n-1}
+/// [cumsum(p)_j < U]`, `U ~ Uniform(0, 1)`, `n` the statically-known length of
+/// the probability vector `p`. `base` is `1.0` for [`categorical_sample`]
+/// (1-based) / `0.0` for [`categorical0_sample`] (0-based) — the only
+/// difference between the two, exactly mirroring how [`categorical_logpdf`]/
+/// [`categorical0_logpdf`] differ only by the `k - 1` vs `k` slice offset.
+/// The `n - 1` prefix sums `cumsum(p)_1 .. cumsum(p)_{n-1}` are built with
+/// running [`Emitter::add`]s (no cumsum op needed — the task brief) and each
+/// compared to `U`, its indicator folded into the running count via
+/// [`Emitter::select`] (`1.0`/`0.0`), so the returned index is an
+/// f32-holding-integer (batch doc comment). The count is clamped to
+/// `[base, base + n - 1]` by construction (`n - 1` indicators), so even a `U`
+/// rounding up to `1.0` lands in the last category — never out of range.
+/// Refuses (never panics) a dynamic-length or non-rank-1 `p`, mirroring
+/// [`dirichlet_sample`]'s discipline.
+fn draw_categorical(e: &mut Emitter, p: &Params, base: f64) -> Result<Value, EmitError> {
+    let probs_id = p.field_id(e, "p")?;
+    let probs = e.lower_node(probs_id)?;
+    let n = match &probs.ty {
+        MlirTy::Ranked(dims) if dims.len() == 1 => dims[0].ok_or_else(|| {
+            EmitError::at(
+                probs_id,
+                "Categorical sample needs a statically-known vector length for 'p'",
+            )
+        })?,
+        other => {
+            return Err(EmitError::at(
+                probs_id,
+                format!("Categorical sample: 'p' must be a rank-1 vector, got {other:?}"),
+            ));
+        }
+    };
+
+    let zero = e.scalar(0.0);
+    let one = e.scalar(1.0);
+    let u = e.rng("UNIFORM", &zero, &one, &MlirTy::Scalar);
+
+    let mut cum = e.scalar(0.0);
+    let mut count = e.scalar(base);
+    for j in 0..n.saturating_sub(1) {
+        let p_j = vector_elem(e, &probs, j);
+        cum = e.add(&cum, &p_j); // cumsum(p)_{j+1}
+        let lt = e.compare("LT", &cum, &u);
+        let inc = e.select(&lt, &one, &zero);
+        count = e.add(&count, &inc);
+    }
+    Ok(count)
+}
+
+/// §08 Categorical's sampler (1-based): [`draw_categorical`] with `base = 1.0`
+/// — the sampling mirror of [`categorical_logpdf`]'s 1-based `p_k` convention.
+fn categorical_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
+    draw_categorical(e, p, 1.0)
+}
+
+/// §08 Categorical0's sampler (0-based): [`draw_categorical`] with `base = 0.0`
+/// — the sampling mirror of [`categorical0_logpdf`]'s 0-based convention.
+fn categorical0_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
+    draw_categorical(e, p, 0.0)
+}
+
+/// §08 Binomial's sampler, verbatim: `sum of n Bernoulli(p)` —
+/// `reduce_sum(select(U < p, 1, 0))` over a length-`n` uniform batch, exact
+/// (not an approximation). `n` must be a FIXED-phase positive-integer literal
+/// (read via [`literal_fixed_positive_int`], the same helper LKJ's `n` uses):
+/// the uniform batch is a length-`n` `stablehlo.rng`, whose static shape needs
+/// `n` known at EMIT time, not merely well-typed. `p` (a scalar probability) is
+/// broadcast to the batch shape before the elementwise `compare` (StableHLO has
+/// no implicit scalar broadcast — see the multivariate batch's doc comment).
+fn binomial_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
+    let n = literal_fixed_positive_int(e, p, "n", "Binomial", "sample")?;
+    let prob = p.get(e, "p")?;
+
+    let zero = e.scalar(0.0);
+    let one = e.scalar(1.0);
+    let batch_ty = MlirTy::Ranked(vec![Some(n)]);
+    let u = e.rng("UNIFORM", &zero, &one, &batch_ty);
+
+    let p_bc = e.broadcast_in_dim(&prob, &[], batch_ty.clone());
+    let lt = e.compare("LT", &u, &p_bc);
+    let ones = e.constant(1.0, batch_ty.clone());
+    let zeros = e.constant(0.0, batch_ty);
+    let indicators = e.select(&lt, &ones, &zeros);
+    Ok(e.reduce_sum(&indicators))
+}
+
+/// The bounded inverse-CDF `Poisson(rate)` `MAXITER` — see [`draw_poisson`].
+/// Larger than [`MAXITER`] (the Gamma rejection loop's 128) because it bounds a
+/// COUNT (`k` walks `0, 1, 2, …` up the CDF), not a rejection-retry count:
+/// `F(256)` is `1.0` to f32 precision for every `rate` a NegBin Gamma-mixture
+/// or a direct Poisson prior realistically produces (`P(X >= 256)` for
+/// `rate ~ 12` is ~1e-180), so the clamp is never reached in practice.
+const POISSON_MAXITER: u64 = 256;
+
+/// Draw one scalar `Poisson(rate)` variate via bounded inverse-CDF (one
+/// `stablehlo.while`, via [`Emitter::while_loop`]) — the shared core Poisson
+/// itself and the NegativeBinomial Gamma–Poisson mixtures reduce to. One `U ~
+/// Uniform(0, 1)` is drawn BEFORE the loop; the loop then walks the incremental
+/// Poisson CDF until `U <= F(k)`, returning that `k`. Unlike [`draw_gamma`],
+/// this inverts a SINGLE uniform (no per-iteration randomness), so nothing is
+/// pre-drawn into a batch.
+///
+/// The loop carries `(k: f32, cum = F(k): f32, pmf = P(X = k): f32, done: i1,
+/// result: f32)`, initialized `k = 0`, `pmf = cum = exp(-rate)` (`= P(X = 0) =
+/// F(0)`). Its condition is `!done && k < MAXITER`; the body (running only
+/// while `!done`) sets `result := k` unconditionally and `done :=
+/// (U <= cum)` — so `result` holds the accepted `k` on success and, on the
+/// (astronomically unlikely) all-walk path, the last `k = MAXITER - 1` (a
+/// clamp to the tail, not a wrong `0`) — then advances `k += 1`, `pmf *=
+/// rate/(k+1)` (the Poisson recurrence `P(X=k+1) = P(X=k)·rate/(k+1)`), `cum +=
+/// pmf`. `k` is carried as an f32 (it is both the counter AND the returned
+/// value), so the `k < MAXITER` bound is a float compare and no `i32`/`convert`
+/// is needed at all.
+fn draw_poisson(e: &mut Emitter, rate: &Value) -> Value {
+    let zero = e.scalar(0.0);
+    let one = e.scalar(1.0);
+    let u = e.rng("UNIFORM", &zero, &one, &MlirTy::Scalar);
+
+    let neg_rate = e.neg(rate);
+    let exp_neg_rate = e.exp(&neg_rate); // P(X=0) = F(0) = exp(-rate)
+    let k0 = e.scalar(0.0);
+    let cum0 = exp_neg_rate.clone();
+    let pmf0 = exp_neg_rate;
+    let done0 = e.bool_const(false);
+    let res0 = e.scalar(0.0);
+
+    let float_ty = MlirTy::Scalar.render(e.dtype());
+    let carried_tys = [
+        float_ty.clone(),         // k
+        float_ty.clone(),         // cum = F(k)
+        float_ty.clone(),         // pmf = P(X = k)
+        "tensor<i1>".to_string(), // done
+        float_ty,                 // result
+    ];
+
+    let results = e.while_loop(
+        &[k0, cum0, pmf0, done0, res0],
+        &carried_tys,
+        // cond: !done && k < MAXITER
+        |e, args| {
+            let max = e.scalar(POISSON_MAXITER as f64);
+            let lt = e.compare("LT", &args[0], &max);
+            let not_done = e.not(&args[3]);
+            e.and(&not_done, &lt)
+        },
+        // do: result := k, done := (U <= cum); advance k/pmf/cum for next iter
+        |e, args| {
+            let k = &args[0];
+            let cum = &args[1];
+            let pmf = &args[2];
+
+            let accept = e.compare("LE", &u, cum);
+            let new_result = k.clone();
+
+            let one = e.scalar(1.0);
+            let k1 = e.add(k, &one);
+            let rate_over_k1 = e.div(rate, &k1);
+            let pmf_next = e.mul(pmf, &rate_over_k1);
+            let cum_next = e.add(cum, &pmf_next);
+            vec![k1, cum_next, pmf_next, accept, new_result]
+        },
+    );
+    results[4].clone()
+}
+
+/// §08 Poisson's sampler: [`draw_poisson`] on the `rate` kwarg directly.
+fn poisson_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
+    let rate = p.get(e, "rate")?;
+    Ok(draw_poisson(e, &rate))
+}
+
+/// §08 NegativeBinomial's sampler, verbatim: the Gamma–Poisson mixture `lambda
+/// ~ Gamma(shape = alpha, rate = beta)`, `k ~ Poisson(lambda)` — [`draw_gamma`]
+/// (Task 15) feeding [`draw_poisson`]. The `(alpha, beta)` → `Gamma(alpha,
+/// rate = beta)` mapping is exactly the mixture whose marginal is the
+/// `nbinom(n = alpha, p = beta/(beta+1))` [`negative_binomial_logpdf`] scores.
+fn negative_binomial_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
+    let alpha = p.get(e, "alpha")?;
+    let beta = p.get(e, "beta")?;
+    let lambda = draw_gamma(e, &alpha, &beta);
+    Ok(draw_poisson(e, &lambda))
+}
+
+/// §08 NegativeBinomial2's sampler, verbatim: the Gamma–Poisson mixture `lambda
+/// ~ Gamma(shape = psi, rate = psi/mu)`, `k ~ Poisson(lambda)`. `Gamma(psi,
+/// rate = psi/mu)` has mean `psi / (psi/mu) = mu`, so `E[k] = mu` — the
+/// mean-dispersion `(mu, psi)` parameterization [`negative_binomial2_logpdf`]
+/// scores (`nbinom(n = psi, p = psi/(mu+psi))`).
+fn negative_binomial2_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
+    let mu = p.get(e, "mu")?;
+    let psi = p.get(e, "psi")?;
+    let rate = e.div(&psi, &mu); // rate = psi / mu
+    let lambda = draw_gamma(e, &psi, &rate);
+    Ok(draw_poisson(e, &lambda))
+}
+
+/// §08 Multinomial's sampler, verbatim: `n` independent Categorical(p) draws
+/// accumulated into a length-`k` count vector, via a bounded `stablehlo.while`
+/// over the `n` draws. `n` must be a FIXED-phase positive-integer literal (read
+/// via [`literal_fixed_positive_int`], like Binomial's) — it is both the `while`
+/// bound and the length of the pre-drawn uniform batch; `k` is the
+/// statically-known length of `p` (the count-vector length). Refuses (never
+/// panics) a dynamic-length or non-rank-1 `p`.
+///
+/// The `n` uniforms are pre-drawn OUTSIDE the loop (same XLA-seeded/stateless
+/// reasoning as [`draw_gamma`]'s batches — an in-loop `rng` could repeat) and
+/// indexed by the counter. The bin boundaries `lower[j] = b_j`, `upper[j] =
+/// b_{j+1}` (`b_0 = 0`, `b_j = cumsum(p)_j`, `b_k = +inf`) are built ONCE before
+/// the loop (they do not change across draws); each iteration one-hots the draw
+/// into `[b_j, b_{j+1})` with an elementwise `compare`/`and`/`select` and adds
+/// that indicator vector into the running counts. `b_k = +inf` (not `1.0`)
+/// makes the last bin catch a `U` that floating-point rounding pushes to (or
+/// past) the probability vector's imperfect sum, so every draw lands in exactly
+/// one bin and the counts always sum to `n`.
+fn multinomial_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
+    let n = literal_fixed_positive_int(e, p, "n", "Multinomial", "sample")?;
+    let probs_id = p.field_id(e, "p")?;
+    let probs = e.lower_node(probs_id)?;
+    let k = match &probs.ty {
+        MlirTy::Ranked(dims) if dims.len() == 1 => dims[0].ok_or_else(|| {
+            EmitError::at(
+                probs_id,
+                "Multinomial sample needs a statically-known vector length for 'p'",
+            )
+        })?,
+        other => {
+            return Err(EmitError::at(
+                probs_id,
+                format!("Multinomial sample: 'p' must be a rank-1 vector, got {other:?}"),
+            ));
+        }
+    };
+
+    let zero = e.scalar(0.0);
+    let one = e.scalar(1.0);
+
+    // Pre-draw the n uniforms outside the loop (see the doc comment).
+    let batch_ty = MlirTy::Ranked(vec![Some(n)]);
+    let u_batch = e.rng("UNIFORM", &zero, &one, &batch_ty);
+
+    // Bin boundaries, built once: lower[j] = b_j, upper[j] = b_{j+1}, with
+    // b_0 = 0, b_j = cumsum(p)_j (j = 1..k-1), b_k = +inf (robust last bin).
+    let vec_ty = MlirTy::Ranked(vec![Some(k)]);
+    let mut cum = e.scalar(0.0);
+    let mut lowers: Vec<Value> = Vec::with_capacity(k as usize);
+    let mut uppers: Vec<Value> = Vec::with_capacity(k as usize);
+    for j in 0..k {
+        lowers.push(cum.clone()); // b_j
+        let p_j = vector_elem(e, &probs, j);
+        cum = e.add(&cum, &p_j); // b_{j+1}
+        if j + 1 < k {
+            uppers.push(cum.clone()); // b_{j+1} for j = 0..k-2
+        }
+    }
+    let inf = e.inf(MlirTy::Scalar);
+    uppers.push(inf); // b_k = +inf
+    let lower_vec = e.vector(&lowers);
+    let upper_vec = e.vector(&uppers);
+
+    let ones_k = e.constant(1.0, vec_ty.clone());
+    let zeros_k = e.constant(0.0, vec_ty.clone());
+    let counts0 = e.constant(0.0, vec_ty.clone());
+    let i0 = e.int_const(0);
+    let float_vec_ty = vec_ty.render(e.dtype());
+    let carried_tys = ["tensor<i32>".to_string(), float_vec_ty];
+
+    let results = e.while_loop(
+        &[i0, counts0],
+        &carried_tys,
+        // cond: i < n
+        |e, args| {
+            let max = e.int_const(n as i64);
+            e.int_compare("LT", &args[0], &max)
+        },
+        // do: one-hot draw i into its bin, add to counts, advance i
+        |e, args| {
+            let i = &args[0];
+            let counts = &args[1];
+            let u_i = e.dynamic_slice_scalar(&u_batch, i);
+            let u_bc = e.broadcast_in_dim(&u_i, &[], vec_ty.clone());
+            let ge_lower = e.compare("GE", &u_bc, &lower_vec);
+            let lt_upper = e.compare("LT", &u_bc, &upper_vec);
+            let in_bin = e.and(&ge_lower, &lt_upper);
+            let onehot = e.select(&in_bin, &ones_k, &zeros_k);
+            let counts_next = e.add(counts, &onehot);
+
+            let one_i = e.int_const(1);
+            let next_i = e.int_add(i, &one_i);
+            vec![next_i, counts_next]
+        },
+    );
+    Ok(results[1].clone())
 }

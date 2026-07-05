@@ -5340,3 +5340,630 @@ draws = rand(s, lawof(x))
         "expected the refusal localized to the 'alpha' node, got node: None"
     );
 }
+
+// ---- Task 16: discrete + Multinomial `@sample` batch, refuse-7 finalized ---
+//
+// Bernoulli/Geometric/Categorical/Categorical0/Binomial/Poisson/
+// NegativeBinomial/NegativeBinomial2 + Multinomial — the last `@sample`
+// batch, completing the §08 sampler set (see `registry.rs`'s Task-16 batch
+// doc comment for the three sampler shapes: straight-line, Poisson's bounded
+// inverse-CDF `while`, and the Gamma-Poisson mixture). Every fixture below
+// uses FIXED literal hyperparameters (no `elementof`), so `emit_sample`
+// produces a zero-arg `func.func @sample()` — same convention as
+// `NORMAL_SAMPLE_SRC`/`GAMMA_SAMPLE_SRC`, not the free-parameter convention
+// `MVNORMAL_SAMPLE_SRC`/`DIRICHLET_SAMPLE_SRC` use. Categorical/Categorical0's
+// `p` is a literal array (`[0.2, 0.3, 0.5]`), same reasoning as
+// `CATEGORICAL_DENSITY_SRC`'s (the `stdsimplex` typing gap noted there);
+// Binomial/Multinomial's `n` is a FIXED top-level literal binding (`n = 5`),
+// same convention as `LKJ_DENSITY_SRC`'s `n = 3` (`literal_fixed_positive_int`
+// needs it at EMIT time, not merely well-typed — see `registry.rs`'s doc
+// comment on that helper, fixed in this same batch to say "sample" rather
+// than a hardcoded "logdensity" when raised from these two builders).
+
+const BERNOULLI_SAMPLE_SRC: &str = "\
+s = rnginit(0)
+x = draw(Bernoulli(p = 0.3))
+draws = rand(s, lawof(x))
+";
+
+/// §08 Bernoulli's `select(U < p, 1, 0)`: exactly one `stablehlo.rng`
+/// (`distribution = UNIFORM`), one `stablehlo.compare`, one
+/// `stablehlo.select`.
+#[test]
+fn emit_sample_bernoulli_has_expected_structure() {
+    let d = determinize_src(BERNOULLI_SAMPLE_SRC);
+    let out = emit_sample(&d);
+
+    assert!(out.contains("func.func @sample()"));
+    assert!(out.contains("-> tensor<f32>"));
+    assert_eq!(out.matches("stablehlo.rng").count(), 1);
+    assert!(out.contains("distribution = UNIFORM"));
+    assert_eq!(out.matches("stablehlo.compare").count(), 1);
+    assert_eq!(out.matches("stablehlo.select").count(), 1);
+    assert!(is_delimiter_balanced(&out));
+}
+
+#[test]
+fn emit_sample_bernoulli_matches_frozen_golden() {
+    let d = determinize_src(BERNOULLI_SAMPLE_SRC);
+    let out = emit_sample(&d);
+    let golden = include_str!("goldens/bernoulli_sample.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted @sample drifted from the frozen golden (tests/goldens/bernoulli_sample.mlir)"
+    );
+}
+
+const GEOMETRIC_SAMPLE_SRC: &str = "\
+s = rnginit(0)
+x = draw(Geometric(p = 0.3))
+draws = rand(s, lawof(x))
+";
+
+/// §08 Geometric's `floor(log(U) / log(1 - p))`: exactly one `stablehlo.rng`
+/// (`distribution = UNIFORM`), two `stablehlo.log` (`log(U)`, `log(1-p)`),
+/// one `stablehlo.floor` — the only discrete sampler needing it.
+#[test]
+fn emit_sample_geometric_has_expected_structure() {
+    let d = determinize_src(GEOMETRIC_SAMPLE_SRC);
+    let out = emit_sample(&d);
+
+    assert!(out.contains("func.func @sample()"));
+    assert!(out.contains("-> tensor<f32>"));
+    assert_eq!(out.matches("stablehlo.rng").count(), 1);
+    assert!(out.contains("distribution = UNIFORM"));
+    assert_eq!(out.matches("stablehlo.log").count(), 2);
+    assert_eq!(out.matches("stablehlo.floor").count(), 1);
+    assert!(is_delimiter_balanced(&out));
+}
+
+#[test]
+fn emit_sample_geometric_matches_frozen_golden() {
+    let d = determinize_src(GEOMETRIC_SAMPLE_SRC);
+    let out = emit_sample(&d);
+    let golden = include_str!("goldens/geometric_sample.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted @sample drifted from the frozen golden (tests/goldens/geometric_sample.mlir)"
+    );
+}
+
+const CATEGORICAL_SAMPLE_SRC: &str = "\
+s = rnginit(0)
+x = draw(Categorical(p = [0.2, 0.3, 0.5]))
+draws = rand(s, lawof(x))
+";
+
+/// §08 Categorical's (1-based) shared [`draw_categorical`] inverse-CDF index
+/// draw: length-3 `p` unrolls into `n - 1 = 2` prefix-sum comparisons —
+/// exactly one `stablehlo.rng` (`distribution = UNIFORM`), two
+/// `stablehlo.compare`, two `stablehlo.select`.
+#[test]
+fn emit_sample_categorical_has_expected_structure() {
+    let d = determinize_src(CATEGORICAL_SAMPLE_SRC);
+    let out = emit_sample(&d);
+
+    assert!(out.contains("func.func @sample()"));
+    assert!(out.contains("-> tensor<f32>"));
+    assert_eq!(out.matches("stablehlo.rng").count(), 1);
+    assert!(out.contains("distribution = UNIFORM"));
+    assert_eq!(out.matches("stablehlo.compare").count(), 2);
+    assert_eq!(out.matches("stablehlo.select").count(), 2);
+    assert!(is_delimiter_balanced(&out));
+}
+
+#[test]
+fn emit_sample_categorical_matches_frozen_golden() {
+    let d = determinize_src(CATEGORICAL_SAMPLE_SRC);
+    let out = emit_sample(&d);
+    let golden = include_str!("goldens/categorical_sample.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted @sample drifted from the frozen golden (tests/goldens/categorical_sample.mlir)"
+    );
+}
+
+const CATEGORICAL0_SAMPLE_SRC: &str = "\
+s = rnginit(0)
+x = draw(Categorical0(p = [0.2, 0.3, 0.5]))
+draws = rand(s, lawof(x))
+";
+
+/// The `base = 0.0` mirror of [`emit_sample_categorical_has_expected_structure`]
+/// — identical op counts, differing only in the returned `base` constant
+/// (checked by the frozen-golden test below).
+#[test]
+fn emit_sample_categorical0_has_expected_structure() {
+    let d = determinize_src(CATEGORICAL0_SAMPLE_SRC);
+    let out = emit_sample(&d);
+
+    assert!(out.contains("func.func @sample()"));
+    assert!(out.contains("-> tensor<f32>"));
+    assert_eq!(out.matches("stablehlo.rng").count(), 1);
+    assert!(out.contains("distribution = UNIFORM"));
+    assert_eq!(out.matches("stablehlo.compare").count(), 2);
+    assert_eq!(out.matches("stablehlo.select").count(), 2);
+    assert!(is_delimiter_balanced(&out));
+}
+
+#[test]
+fn emit_sample_categorical0_matches_frozen_golden() {
+    let d = determinize_src(CATEGORICAL0_SAMPLE_SRC);
+    let out = emit_sample(&d);
+    let golden = include_str!("goldens/categorical0_sample.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted @sample drifted from the frozen golden (tests/goldens/categorical0_sample.mlir)"
+    );
+}
+
+const BINOMIAL_SAMPLE_SRC: &str = "\
+s = rnginit(0)
+n = 5
+x = draw(Binomial(n = n, p = 0.3))
+draws = rand(s, lawof(x))
+";
+
+/// §08 Binomial's exact `sum of n Bernoulli(p)`: a FIXED `n = 5` drives a
+/// single length-5 `stablehlo.rng` (`distribution = UNIFORM`), one
+/// `stablehlo.broadcast_in_dim` (`p` broadcast to the batch shape), one
+/// `stablehlo.compare`, one `stablehlo.select`, and one `stablehlo.reduce(`
+/// (the `reduce_sum`).
+#[test]
+fn emit_sample_binomial_has_expected_structure() {
+    let d = determinize_src(BINOMIAL_SAMPLE_SRC);
+    let out = emit_sample(&d);
+
+    assert!(out.contains("func.func @sample()"));
+    assert!(out.contains("-> tensor<f32>"));
+    assert_eq!(out.matches("stablehlo.rng").count(), 1);
+    assert!(out.contains("distribution = UNIFORM"));
+    assert!(out.contains("tensor<5xf32>"));
+    assert_eq!(out.matches("stablehlo.broadcast_in_dim").count(), 1);
+    assert_eq!(out.matches("stablehlo.compare").count(), 1);
+    assert_eq!(out.matches("stablehlo.select").count(), 1);
+    assert_eq!(out.matches("stablehlo.reduce(").count(), 1);
+    assert!(is_delimiter_balanced(&out));
+}
+
+#[test]
+fn emit_sample_binomial_matches_frozen_golden() {
+    let d = determinize_src(BINOMIAL_SAMPLE_SRC);
+    let out = emit_sample(&d);
+    let golden = include_str!("goldens/binomial_sample.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted @sample drifted from the frozen golden (tests/goldens/binomial_sample.mlir)"
+    );
+}
+
+/// A non-literal (`elementof`-declared) `n` must refuse precisely — Binomial
+/// sample's uniform batch needs `n` as a Rust `u64` at EMIT time to size a
+/// static-length `tensor<NxT>`, not merely a well-typed runtime value. Mirrors
+/// `lkj_logpdf_refuses_parameterized_n`'s guard on the `@logdensity` side.
+#[test]
+fn binomial_sample_refuses_parameterized_n() {
+    let src = "\
+n = elementof(posintegers)
+s = rnginit(0)
+x = draw(Binomial(n = n, p = 0.3))
+draws = rand(s, lawof(x))
+";
+    let d = determinize_src(src);
+    let err = flatppl_stablehlo::emit(
+        &d,
+        flatppl_stablehlo::Mode::Sample,
+        &flatppl_stablehlo::EmitOptions::default(),
+    )
+    .unwrap_err();
+    assert!(
+        err.msg
+            .contains("Binomial sample needs a fixed-phase positive integer literal"),
+        "unexpected message: {}",
+        err.msg
+    );
+}
+
+const POISSON_SAMPLE_SRC: &str = "\
+s = rnginit(0)
+x = draw(Poisson(rate = 4.0))
+draws = rand(s, lawof(x))
+";
+
+/// §08 Poisson's bounded inverse-CDF sampler ([`draw_poisson`]): exactly one
+/// `stablehlo.rng` (the single pre-loop `U`, `distribution = UNIFORM`) and
+/// exactly one `stablehlo.while` (the incremental-CDF walk) — no second `rng`
+/// inside the loop (CDF inversion of a SINGLE uniform, unlike the Gamma
+/// rejection loop's per-iteration batches).
+#[test]
+fn emit_sample_poisson_has_expected_structure() {
+    let d = determinize_src(POISSON_SAMPLE_SRC);
+    let out = emit_sample(&d);
+
+    assert!(out.contains("func.func @sample()"));
+    assert!(out.contains("-> tensor<f32>"));
+    assert_eq!(out.matches("stablehlo.rng").count(), 1);
+    assert!(out.contains("distribution = UNIFORM"));
+    assert_eq!(out.matches("stablehlo.while").count(), 1);
+    assert!(is_delimiter_balanced(&out));
+}
+
+#[test]
+fn emit_sample_poisson_matches_frozen_golden() {
+    let d = determinize_src(POISSON_SAMPLE_SRC);
+    let out = emit_sample(&d);
+    let golden = include_str!("goldens/poisson_sample.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted @sample drifted from the frozen golden (tests/goldens/poisson_sample.mlir)"
+    );
+}
+
+const NEGATIVE_BINOMIAL_SAMPLE_SRC: &str = "\
+s = rnginit(0)
+x = draw(NegativeBinomial(alpha = 5.0, beta = 2.0))
+draws = rand(s, lawof(x))
+";
+
+/// §08 NegativeBinomial's Gamma-Poisson mixture: [`draw_gamma`] (Task 15,
+/// three `stablehlo.rng` — `Z`/`U`/boost `U0` — plus one `stablehlo.while`)
+/// feeding [`draw_poisson`] (one more `stablehlo.rng` plus one more
+/// `stablehlo.while`) — four `stablehlo.rng` and two `stablehlo.while` total.
+#[test]
+fn emit_sample_negative_binomial_has_expected_structure() {
+    let d = determinize_src(NEGATIVE_BINOMIAL_SAMPLE_SRC);
+    let out = emit_sample(&d);
+
+    assert!(out.contains("func.func @sample()"));
+    assert!(out.contains("-> tensor<f32>"));
+    assert_eq!(
+        out.matches("stablehlo.rng").count(),
+        4,
+        "expected Gamma's Z/U/U0 + Poisson's U, in:\n{out}"
+    );
+    assert!(
+        out.contains("distribution = NORMAL") && out.contains("distribution = UNIFORM"),
+        "expected both a NORMAL (Gamma's Z) and UNIFORM batch, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.while").count(),
+        2,
+        "expected the Gamma rejection loop plus the Poisson inverse-CDF loop, in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+#[test]
+fn emit_sample_negative_binomial_matches_frozen_golden() {
+    let d = determinize_src(NEGATIVE_BINOMIAL_SAMPLE_SRC);
+    let out = emit_sample(&d);
+    let golden = include_str!("goldens/negative_binomial_sample.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted @sample drifted from the frozen golden (tests/goldens/negative_binomial_sample.mlir)"
+    );
+}
+
+const NEGATIVE_BINOMIAL2_SAMPLE_SRC: &str = "\
+s = rnginit(0)
+x = draw(NegativeBinomial2(mu = 3.0, psi = 5.0))
+draws = rand(s, lawof(x))
+";
+
+/// §08 NegativeBinomial2's Gamma-Poisson mixture: same op-count shape as
+/// [`emit_sample_negative_binomial_has_expected_structure`], plus the extra
+/// `stablehlo.divide` computing `rate = psi / mu` before [`draw_gamma`].
+#[test]
+fn emit_sample_negative_binomial2_has_expected_structure() {
+    let d = determinize_src(NEGATIVE_BINOMIAL2_SAMPLE_SRC);
+    let out = emit_sample(&d);
+
+    assert!(out.contains("func.func @sample()"));
+    assert!(out.contains("-> tensor<f32>"));
+    assert_eq!(out.matches("stablehlo.rng").count(), 4);
+    assert!(out.contains("distribution = NORMAL") && out.contains("distribution = UNIFORM"));
+    assert_eq!(out.matches("stablehlo.while").count(), 2);
+    assert!(
+        out.matches("stablehlo.divide").count() >= 1,
+        "expected at least the rate = psi / mu divide, in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+#[test]
+fn emit_sample_negative_binomial2_matches_frozen_golden() {
+    let d = determinize_src(NEGATIVE_BINOMIAL2_SAMPLE_SRC);
+    let out = emit_sample(&d);
+    let golden = include_str!("goldens/negative_binomial2_sample.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted @sample drifted from the frozen golden (tests/goldens/negative_binomial2_sample.mlir)"
+    );
+}
+
+const MULTINOMIAL_SAMPLE_SRC: &str = "\
+s = rnginit(0)
+n = 4
+x = draw(Multinomial(n = n, p = [0.2, 0.3, 0.5]))
+draws = rand(s, lawof(x))
+";
+
+/// §08 Multinomial's bounded `while` over `n = 4` Categorical(p) draws
+/// (`p` length-3, so a length-3 count vector): exactly one `stablehlo.rng`
+/// (the length-4 pre-drawn uniform batch, `distribution = UNIFORM`), one
+/// `stablehlo.while` (the `n`-bounded accumulation loop), one
+/// `stablehlo.dynamic_slice` (indexing the pre-drawn batch by the loop
+/// counter), returning a `tensor<3xf32>` count vector.
+#[test]
+fn emit_sample_multinomial_has_expected_structure() {
+    let d = determinize_src(MULTINOMIAL_SAMPLE_SRC);
+    let out = emit_sample(&d);
+
+    assert!(out.contains("func.func @sample()"));
+    assert!(
+        out.contains("-> tensor<3xf32>"),
+        "must return a length-3 count vector, in:\n{out}"
+    );
+    assert_eq!(out.matches("stablehlo.rng").count(), 1);
+    assert!(out.contains("distribution = UNIFORM"));
+    assert!(out.contains("tensor<4xf32>"));
+    assert_eq!(out.matches("stablehlo.while").count(), 1);
+    assert_eq!(out.matches("stablehlo.dynamic_slice").count(), 1);
+    assert!(is_delimiter_balanced(&out));
+}
+
+#[test]
+fn emit_sample_multinomial_matches_frozen_golden() {
+    let d = determinize_src(MULTINOMIAL_SAMPLE_SRC);
+    let out = emit_sample(&d);
+    let golden = include_str!("goldens/multinomial_sample.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted @sample drifted from the frozen golden (tests/goldens/multinomial_sample.mlir)"
+    );
+}
+
+/// A non-literal (`elementof`-declared) `n` must refuse precisely — same
+/// reasoning as [`binomial_sample_refuses_parameterized_n`]: Multinomial's `n`
+/// sizes both the pre-drawn uniform batch and the `while` bound, so it must
+/// be known at EMIT time.
+#[test]
+fn multinomial_sample_refuses_parameterized_n() {
+    let src = "\
+n = elementof(posintegers)
+s = rnginit(0)
+x = draw(Multinomial(n = n, p = [0.2, 0.3, 0.5]))
+draws = rand(s, lawof(x))
+";
+    let d = determinize_src(src);
+    let err = flatppl_stablehlo::emit(
+        &d,
+        flatppl_stablehlo::Mode::Sample,
+        &flatppl_stablehlo::EmitOptions::default(),
+    )
+    .unwrap_err();
+    assert!(
+        err.msg
+            .contains("Multinomial sample needs a fixed-phase positive integer literal"),
+        "unexpected message: {}",
+        err.msg
+    );
+}
+
+/// The `emit_sample` mirror of `dirichlet_sample_refuses_dynamic_vector_length`
+/// for [`multinomial_sample`]'s own vector-length guard (structurally the
+/// same "statically-known length" check [`draw_categorical`] uses, but a
+/// separate guard site in [`multinomial_sample`] itself): a `p` whose vector
+/// length is NOT statically known must refuse precisely, not reach
+/// [`vector_elem`] on an operand with no static length to unroll against.
+#[test]
+fn multinomial_sample_refuses_dynamic_vector_length() {
+    let src = "\
+n = 4
+m = elementof(posintegers)
+p = elementof(cartpow(unitinterval, m))
+s = rnginit(0)
+x = draw(Multinomial(n = n, p = p))
+draws = rand(s, lawof(x))
+";
+    let d = determinize_src(src);
+    let err = flatppl_stablehlo::emit(
+        &d,
+        flatppl_stablehlo::Mode::Sample,
+        &flatppl_stablehlo::EmitOptions::default(),
+    )
+    .unwrap_err();
+    assert!(
+        err.msg
+            .contains("Multinomial sample needs a statically-known vector length"),
+        "unexpected message: {}",
+        err.msg
+    );
+    assert!(
+        err.node.is_some(),
+        "expected the refusal localized to the 'p' node, got node: None"
+    );
+}
+
+/// The rank mirror of [`multinomial_sample_refuses_dynamic_vector_length`]: a
+/// rank-2 `p` must refuse precisely, not reach [`vector_elem`]'s slice+reshape
+/// idiom on an operand it was never built to accept.
+#[test]
+fn multinomial_sample_refuses_nonrank1_p() {
+    let src = "\
+n = 4
+p = elementof(cartpow(unitinterval, [3, 1]))
+s = rnginit(0)
+x = draw(Multinomial(n = n, p = p))
+draws = rand(s, lawof(x))
+";
+    let d = determinize_src(src);
+    let err = flatppl_stablehlo::emit(
+        &d,
+        flatppl_stablehlo::Mode::Sample,
+        &flatppl_stablehlo::EmitOptions::default(),
+    )
+    .unwrap_err();
+    assert!(
+        err.msg
+            .contains("Multinomial sample: 'p' must be a rank-1 vector"),
+        "unexpected message: {}",
+        err.msg
+    );
+    assert!(
+        err.node.is_some(),
+        "expected the refusal localized to the 'p' node, got node: None"
+    );
+}
+
+// ---- Task 16: refuse-7 finalized -------------------------------------------
+//
+// The seven distributions with NO `@sample` builder, confirmed final: five
+// registered-but-`sample: None` (VonMises, Wishart, InverseWishart, LKJ,
+// LKJCholesky — each needs its own dedicated sampler design, none planned in
+// this batch) plus two never registered at all (PoissonProcess/
+// BinnedPoissonProcess — point-process measures with no `@logdensity`
+// builder either; spec §08). `VonMises` already has a locking test
+// (`builtin_sample_refuses_registered_ctor_without_sample_builder`, Task 7)
+// for the SHARED `dist.sample.ok_or_else` code path — not duplicated here.
+// The six tests below each lock one of the remaining six distributions to
+// its own specific ctor name, so a future accidental sampler registration for
+// any ONE of them (not just the shared code path) is caught.
+
+/// `Wishart` is registered (`@logdensity`, Task 13) but has no `@sample`
+/// builder (`sample: None`).
+#[test]
+fn builtin_sample_refuses_wishart_without_sample_builder() {
+    let mut m = Module::new();
+    let rng = real(&mut m, 0.0);
+    let ctor = const_node(&mut m, "Wishart");
+    let nu = real(&mut m, 5.0);
+    let scale = real(&mut m, 1.0); // stand-in; lookup fails before params are read
+    let kernel_input = record_node(&mut m, &[("nu", nu), ("scale", scale)]);
+    let node = call(&mut m, "builtin_sample", &[rng, ctor, kernel_input]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    let err = e.lower_node(node).unwrap_err();
+    assert!(
+        err.msg.contains("no @sample lowering for 'Wishart'"),
+        "unexpected message: {}",
+        err.msg
+    );
+    assert_eq!(err.node, Some(node));
+}
+
+/// `InverseWishart` is registered (`@logdensity`, Task 13) but has no
+/// `@sample` builder (`sample: None`).
+#[test]
+fn builtin_sample_refuses_inverse_wishart_without_sample_builder() {
+    let mut m = Module::new();
+    let rng = real(&mut m, 0.0);
+    let ctor = const_node(&mut m, "InverseWishart");
+    let nu = real(&mut m, 5.0);
+    let psi = real(&mut m, 1.0);
+    let kernel_input = record_node(&mut m, &[("nu", nu), ("psi", psi)]);
+    let node = call(&mut m, "builtin_sample", &[rng, ctor, kernel_input]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    let err = e.lower_node(node).unwrap_err();
+    assert!(
+        err.msg.contains("no @sample lowering for 'InverseWishart'"),
+        "unexpected message: {}",
+        err.msg
+    );
+    assert_eq!(err.node, Some(node));
+}
+
+/// `LKJ` is registered (`@logdensity`, Task 13) but has no `@sample` builder
+/// (`sample: None`).
+#[test]
+fn builtin_sample_refuses_lkj_without_sample_builder() {
+    let mut m = Module::new();
+    let rng = real(&mut m, 0.0);
+    let ctor = const_node(&mut m, "LKJ");
+    let n = real(&mut m, 3.0);
+    let eta = real(&mut m, 1.0);
+    let kernel_input = record_node(&mut m, &[("n", n), ("eta", eta)]);
+    let node = call(&mut m, "builtin_sample", &[rng, ctor, kernel_input]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    let err = e.lower_node(node).unwrap_err();
+    assert!(
+        err.msg.contains("no @sample lowering for 'LKJ'"),
+        "unexpected message: {}",
+        err.msg
+    );
+    assert_eq!(err.node, Some(node));
+}
+
+/// `LKJCholesky` is registered (`@logdensity`, Task 13) but has no `@sample`
+/// builder (`sample: None`).
+#[test]
+fn builtin_sample_refuses_lkj_cholesky_without_sample_builder() {
+    let mut m = Module::new();
+    let rng = real(&mut m, 0.0);
+    let ctor = const_node(&mut m, "LKJCholesky");
+    let n = real(&mut m, 3.0);
+    let eta = real(&mut m, 1.0);
+    let kernel_input = record_node(&mut m, &[("n", n), ("eta", eta)]);
+    let node = call(&mut m, "builtin_sample", &[rng, ctor, kernel_input]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    let err = e.lower_node(node).unwrap_err();
+    assert!(
+        err.msg.contains("no @sample lowering for 'LKJCholesky'"),
+        "unexpected message: {}",
+        err.msg
+    );
+    assert_eq!(err.node, Some(node));
+}
+
+/// `PoissonProcess` (spec §08) is never registered at all — no
+/// `@logdensity` builder either, so it hits the SAME `registry::lookup` miss
+/// [`builtin_sample_refuses_unregistered_ctor`] exercises via `Bogus`, but
+/// pinned to this specific real distribution name so a future
+/// logdensity-only registration (which would leave `@sample` still
+/// unreachable via a DIFFERENT message, `"no @sample lowering for ..."`) is
+/// caught by this test starting to fail.
+#[test]
+fn builtin_sample_refuses_poisson_process_unregistered() {
+    let mut m = Module::new();
+    let rng = real(&mut m, 0.0);
+    let ctor = const_node(&mut m, "PoissonProcess");
+    let intensity = real(&mut m, 1.0);
+    let kernel_input = record_node(&mut m, &[("intensity", intensity)]);
+    let node = call(&mut m, "builtin_sample", &[rng, ctor, kernel_input]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    let err = e.lower_node(node).unwrap_err();
+    assert!(
+        err.msg
+            .contains("no lowering for distribution 'PoissonProcess'"),
+        "unexpected message: {}",
+        err.msg
+    );
+    assert_eq!(err.node, Some(node));
+}
+
+/// The `BinnedPoissonProcess` mirror of
+/// [`builtin_sample_refuses_poisson_process_unregistered`].
+#[test]
+fn builtin_sample_refuses_binned_poisson_process_unregistered() {
+    let mut m = Module::new();
+    let rng = real(&mut m, 0.0);
+    let ctor = const_node(&mut m, "BinnedPoissonProcess");
+    let bins = real(&mut m, 1.0);
+    let intensity = real(&mut m, 1.0);
+    let kernel_input = record_node(&mut m, &[("bins", bins), ("intensity", intensity)]);
+    let node = call(&mut m, "builtin_sample", &[rng, ctor, kernel_input]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    let err = e.lower_node(node).unwrap_err();
+    assert!(
+        err.msg
+            .contains("no lowering for distribution 'BinnedPoissonProcess'"),
+        "unexpected message: {}",
+        err.msg
+    );
+    assert_eq!(err.node, Some(node));
+}
