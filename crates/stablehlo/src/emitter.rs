@@ -594,10 +594,20 @@ impl<'m> Emitter<'m> {
     /// dtype-independent local render).
     ///
     /// Panics (an internal invariant violation, not a user-facing refusal —
-    /// mirrors `diag`/`matvec`'s panic-on-bad-shape discipline) if `out_ty`
-    /// has a dynamic dimension or is a `Tuple`: neither has a static
-    /// shape-constant form.
+    /// mirrors `diag`/`matvec`'s panic-on-bad-shape discipline) if `a`/`b`
+    /// is not rank-0 (`stablehlo.rng`'s bounds operands must be scalar,
+    /// regardless of `out_ty`'s shape — the shape constant, not `a`/`b`,
+    /// carries the output rank), or if `out_ty` has a dynamic dimension or
+    /// is a `Tuple`: neither has a static shape-constant form.
     pub fn rng(&mut self, dist: &str, a: &Value, b: &Value, out_ty: &MlirTy) -> Value {
+        match &a.ty {
+            MlirTy::Scalar => {}
+            other => panic!("rng expects a rank-0 (scalar) `a` operand, got {other:?}"),
+        }
+        match &b.ty {
+            MlirTy::Scalar => {}
+            other => panic!("rng expects a rank-0 (scalar) `b` operand, got {other:?}"),
+        }
         let dims: Vec<u64> = match out_ty {
             MlirTy::Scalar => Vec::new(),
             MlirTy::Ranked(dims) => dims

@@ -45,14 +45,24 @@
 //! output with a cheap structural check ([`contains_logdensityof_call`]):
 //! the binding's RHS subtree must contain at least one `builtin_logdensityof`
 //! call, or it refuses rather than mis-lower. [`emit_sample`] applies the
-//! analogous guard ([`contains_sample_call`]) over `builtin_sample`.
+//! analogous guard ([`contains_sample_call`]) over `builtin_sample` — but,
+//! unlike [`contains_logdensityof_call`], that guard must also follow
+//! `(%ref self x)` leaves to `x`'s bound RHS, TRANSITIVELY: a record/
+//! hierarchical `@sample` forward model's query is a `record(...)` whose
+//! fields are bare refs to bindings the determiniser has rewritten in place
+//! (`flatppl_determinizer::sample::lower_shared_record_sample`), with the
+//! actual `builtin_sample` call sitting one or more binding-hops away on
+//! each ref's resolved RHS — `Node::for_each_child` does not descend
+//! through a `Ref` at all, so a purely structural walk never reaches it.
+//! See [`contains_sample_call`]'s own doc comment for the walk.
 //!
 //! **`@sample`.** [`emit_sample`] mirrors [`emit_logdensity`]'s structure
 //! exactly — same free-parameter/fixed-data binding loop, same
-//! last-public-binding query convention, same structural query-output guard
-//! — but the query's RHS is not itself a bare `builtin_sample` call: a
-//! value-terminal `rand(rng, lawof(x))` (`flatppl_determinizer::sample`)
-//! lowers to `get0(builtin_sample(rng, ctor, kernel_input), 0)`, projecting
+//! last-public-binding query convention, an analogous (but ref-following,
+//! see above) query-output guard — but the query's RHS is not itself a bare
+//! `builtin_sample` call: a value-terminal `rand(rng, lawof(x))`
+//! (`flatppl_determinizer::sample`) lowers to
+//! `get0(builtin_sample(rng, ctor, kernel_input), 0)`, projecting
 //! the drawn-value slot of the sampled `(value, new_rngstate)` pair. Rather
 //! than special-casing that shape here, [`Emitter::lower_node`]'s dispatch
 //! (`emitter.rs`) recognizes a `get0`/`get` projection of a `builtin_sample`
@@ -61,7 +71,9 @@
 //! [`emit_sample`] can lower its query the same generic way
 //! [`emit_logdensity`] does.
 
-use flatppl_core::{CallHead, Module, Node, NodeId, Phase};
+use std::collections::HashSet;
+
+use flatppl_core::{CallHead, Module, Node, NodeId, Phase, Ref, RefNs};
 
 use crate::EmitOptions;
 use crate::emitter::Emitter;
@@ -185,11 +197,38 @@ pub fn emit_sample(m: &Module, opts: &EmitOptions) -> Result<String, EmitError> 
 /// Whether the subtree rooted at `id` contains a `Call` whose head is the
 /// builtin `builtin_sample` — the [`emit_sample`] analogue of
 /// [`contains_logdensityof_call`].
+///
+/// Unlike [`contains_logdensityof_call`], this walk also follows
+/// `(%ref self x)` leaves to `x`'s bound RHS (mirroring the ref-resolution
+/// rule in [`crate::emitter::Emitter::resolves_to_builtin_sample`]),
+/// TRANSITIVELY rather than one hop. A record/hierarchical `@sample` forward
+/// model's query is a `record(...)` whose fields are bare `(%ref self mu)`
+/// leaves — `Node::for_each_child` does not descend through a `Ref` at all,
+/// and the rewritten `builtin_sample` sits one OR MORE binding-hops away on
+/// `mu`'s (and, for a shared/hierarchical latent, `mu`'s own dependency's)
+/// RHS (`flatppl_determinizer::sample::lower_shared_record_sample`), so a
+/// single-hop resolution is not enough. A `HashSet` of already-visited
+/// `NodeId`s guards against a reference cycle (none should arise from a
+/// well-formed FlatPDL module — bindings form a DAG — but the guard costs
+/// nothing and this walk has no other termination proof).
 fn contains_sample_call(m: &Module, root: NodeId) -> bool {
     let mut stack = vec![root];
+    let mut seen: HashSet<NodeId> = HashSet::new();
     while let Some(id) = stack.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
         if is_builtin_call(m, id, "builtin_sample") {
             return true;
+        }
+        if let Node::Ref(Ref {
+            ns: RefNs::SelfMod,
+            name,
+        }) = m.node(id)
+        {
+            if let Some(bid) = m.binding_by_name(*name) {
+                stack.push(m.binding(bid).rhs);
+            }
         }
         m.for_each_child(id, |c| stack.push(c));
     }

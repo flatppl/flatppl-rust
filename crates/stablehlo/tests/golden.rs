@@ -1479,3 +1479,222 @@ fn emit_sample_refuses_trailing_binding_with_no_sample_term() {
     );
     assert_eq!(err.node, Some(diag));
 }
+
+// ---- Task 6 review fix: `contains_sample_call` ref-following (Finding 1) --
+//
+// `contains_sample_call`'s guard used to walk the query subtree via
+// `Node::for_each_child` alone, which does not descend through `Node::Ref` —
+// so a record/hierarchical `@sample` forward model, whose query is
+// `record(mu = (%ref self mu), y = (%ref self y))` with the rewritten
+// `builtin_sample` sitting one or more binding-hops away on each ref's
+// resolved RHS (`flatppl_determinizer::sample::lower_shared_record_sample`),
+// refused at the guard ("no sample term") before a real lowering attempt
+// ever ran. `modes.rs`'s `contains_sample_call` now follows `(%ref self x)`
+// leaves to `x`'s bound RHS TRANSITIVELY (a `HashSet` visited-set guards
+// against a cycle).
+
+/// Isolates just the ref-chasing fix, independent of the separate
+/// record-output limitation documented below: `query` refs `a` refs `b`
+/// refs `builtin_sample(...)`, TWO hops deep with no intervening `Call`
+/// wrapper — the old one-`for_each_child`-hop walk (and even a
+/// single-ref-hop resolution, mirroring `Emitter::resolves_to_builtin_sample`'s
+/// deliberately-one-hop rule) would not reach it. This must both pass the
+/// guard AND fully emit, since the query itself is a plain scalar sample
+/// (no record involved).
+#[test]
+fn emit_sample_query_reaches_sample_via_chained_self_refs() {
+    let mut m = Module::new();
+    let ctor = const_node(&mut m, "Normal");
+    let mu = real(&mut m, 0.0);
+    let sigma = real(&mut m, 1.0);
+    let kernel_input = record_node(&mut m, &[("mu", mu), ("sigma", sigma)]);
+    let rng = real(&mut m, 0.0); // stand-in rng-state arg (never lowered)
+    let sample = call(&mut m, "builtin_sample", &[rng, ctor, kernel_input]);
+    let zero_idx = int(&mut m, 0);
+    let value = call(&mut m, "get0", &[sample, zero_idx]);
+    top_level(&mut m, "b", value);
+
+    let b_ref = self_ref(&mut m, "b");
+    top_level(&mut m, "a", b_ref);
+
+    let query = self_ref(&mut m, "a");
+    top_level(&mut m, "query", query);
+
+    let out = flatppl_stablehlo::emit(&m, flatppl_stablehlo::Mode::Sample, &Default::default())
+        .expect("must emit @sample: query reaches builtin_sample via a 2-hop self-ref chain");
+    assert_eq!(
+        out.matches("stablehlo.rng").count(),
+        1,
+        "expected exactly one stablehlo.rng, in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// The review's canonical fixture: a genuinely hierarchical, record-output
+/// forward model (`y`'s Normal mean is `mu`, itself drawn; both are read
+/// back out via the output record) — `flatppl_determinizer::sample`'s
+/// `lower_shared_record_sample` path (verified via a throwaway determinize +
+/// `flatppl_flatpir::write` dump: `mu`'s and `y`'s draw-bindings are each
+/// rewritten in place to `get0((%ref self __sample_*), 0)`, and `draws`'s
+/// RHS is `record(mu = (%ref self mu), y = (%ref self y))`).
+const HIERARCHICAL_SAMPLE_SRC: &str = "\
+mu = draw(Normal(mu = 0.0, sigma = 1.0))
+y  = draw(Normal(mu = mu, sigma = 1.0))
+s  = rnginit(0)
+draws = rand(s, lawof(record(mu = mu, y = y)))
+";
+
+/// This fixture's query (`draws`'s RHS) now correctly PASSES
+/// `contains_sample_call`'s guard (it no longer refuses with "no sample
+/// term" — the false-negative Finding 1 reported). Emission then refuses
+/// for a DIFFERENT, genuine reason: the query is `record(...)`-typed, and
+/// `ops::lower_builtin`'s `"record"` arm has no tensor form for it — the
+/// mode builder has no structural decomposition for a record-SHAPED
+/// `@sample` OUTPUT (only for a record-shaped free-parameter *input*, via
+/// the `elementof` loop). Deciding that output ABI (multiple `func.func`
+/// results? a `stablehlo.tuple`? field order convention?) is a new-capability
+/// design decision outside a Task 6 review-findings fix, not forced here —
+/// see the fix-pass report for the concern writeup. This test locks in that
+/// the GUARD itself is fixed without overclaiming the record-output case
+/// fully emits.
+#[test]
+fn emit_sample_hierarchical_record_passes_guard_refuses_on_record_output() {
+    let d = determinize_src(HIERARCHICAL_SAMPLE_SRC);
+    assert!(
+        flatppl_determinizer::is_flatpdl(&d).is_ok(),
+        "determinized module must be FlatPDL-conformant (no residual measure node)"
+    );
+
+    let err = flatppl_stablehlo::emit(
+        &d,
+        flatppl_stablehlo::Mode::Sample,
+        &flatppl_stablehlo::EmitOptions::default(),
+    )
+    .unwrap_err();
+    assert!(
+        !err.msg.contains("no sample term"),
+        "the query-output guard must no longer refuse a record/hierarchical \
+         query that DOES contain a builtin_sample term (reached only via a \
+         chain of self-refs): {}",
+        err.msg
+    );
+    assert!(
+        err.msg.contains("record has no tensor form"),
+        "expected the record-output limitation, not a different refusal: {}",
+        err.msg
+    );
+}
+
+// ---- Task 6 review fix: `lower_sample` refuse tests (Finding 2) -----------
+//
+// Task 6 shipped `registry::lower_sample`'s three refuse-don't-mislower
+// guards (arity, non-const ctor, unregistered ctor) with no direct test
+// coverage — `lower_logdensityof`'s equivalent guards
+// (`builtin_logdensityof_refuses_unregistered_ctor` /
+// `_refuses_non_const_kernel`, Task 5 above) are the precedent these mirror.
+
+/// `builtin_sample(rng, Cauchy, kernel_input)` — a ctor with no registry
+/// entry at all (only `Normal` is registered, spec §08) — must refuse
+/// precisely, not panic or guess a lowering. This exercises the same
+/// `registry::lookup` miss `builtin_logdensityof_refuses_unregistered_ctor`
+/// does (shared code, not sample-specific text): `lower_sample`'s OWN
+/// sample-specific message, `"no @sample lowering for '{ctor}'"`
+/// (`dist.sample.ok_or_else`, for a ctor registered for `@logdensity` with
+/// no `@sample` builder yet), is currently unreachable by any real ctor
+/// name — every registered entry (just `Normal`) has both builders today —
+/// so it cannot be exercised without adding a fake registry entry purely
+/// for this test.
+#[test]
+fn builtin_sample_refuses_unregistered_ctor() {
+    let mut m = Module::new();
+    let rng = real(&mut m, 0.0); // stand-in rng-state arg (never lowered)
+    let ctor = const_node(&mut m, "Cauchy");
+    let mu_val = real(&mut m, 0.0);
+    let sigma_val = real(&mut m, 1.0);
+    let kernel_input = record_node(&mut m, &[("mu", mu_val), ("sigma", sigma_val)]);
+    let node = call(&mut m, "builtin_sample", &[rng, ctor, kernel_input]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    let err = e.lower_node(node).unwrap_err();
+    assert!(
+        err.msg.contains("no lowering for distribution 'Cauchy'"),
+        "unexpected message: {}",
+        err.msg
+    );
+    assert_eq!(err.node, Some(node));
+}
+
+/// `builtin_sample`'s ctor must be a bare `Const` distribution constructor
+/// (never a general expression) — mirrors
+/// `builtin_logdensityof_refuses_non_const_kernel`.
+#[test]
+fn builtin_sample_refuses_non_const_ctor() {
+    let mut m = Module::new();
+    let rng = real(&mut m, 0.0);
+    let ctor = local_ref(&mut m, "k");
+    let kernel_input = call(&mut m, "record", &[]);
+    let node = call(&mut m, "builtin_sample", &[rng, ctor, kernel_input]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    let err = e.lower_node(node).unwrap_err();
+    assert!(
+        err.msg.contains("bare distribution constructor"),
+        "unexpected message: {}",
+        err.msg
+    );
+    assert_eq!(err.node, Some(ctor));
+}
+
+/// `builtin_sample` with the wrong number of arguments must refuse (naming
+/// the exact expected/actual count), not panic on the
+/// `<[NodeId; 3]>::try_from`.
+#[test]
+fn builtin_sample_refuses_wrong_arity() {
+    let mut m = Module::new();
+    let rng = real(&mut m, 0.0);
+    let ctor = const_node(&mut m, "Normal");
+    let node = call(&mut m, "builtin_sample", &[rng, ctor]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    let err = e.lower_node(node).unwrap_err();
+    assert!(
+        err.msg
+            .contains("builtin_sample: expected 3 arguments, got 2"),
+        "unexpected message: {}",
+        err.msg
+    );
+    assert_eq!(err.node, Some(node));
+}
+
+// ---- Task 6 review fix: `Emitter::rng` defensive assert (Finding 3) -------
+
+/// `stablehlo.rng` requires rank-0 `a`/`b` bounds operands — a non-`Scalar`
+/// `a` must panic (an internal invariant violation caught before emitting
+/// ill-typed StableHLO), mirroring `diag`/`matvec`'s panic-on-bad-shape
+/// discipline in the same file.
+#[test]
+#[should_panic(expected = "rng expects a rank-0 (scalar) `a` operand")]
+fn emitter_rng_panics_on_non_scalar_a() {
+    let m = Module::new();
+    let mut e = Emitter::new(&m, Dtype::F32);
+    let a = flatppl_stablehlo::Value {
+        ssa: "%a".to_string(),
+        ty: MlirTy::Ranked(vec![Some(3)]),
+    };
+    let b = e.scalar(1.0);
+    e.rng("NORMAL", &a, &b, &MlirTy::Scalar);
+}
+
+/// The `b`-operand mirror of [`emitter_rng_panics_on_non_scalar_a`].
+#[test]
+#[should_panic(expected = "rng expects a rank-0 (scalar) `b` operand")]
+fn emitter_rng_panics_on_non_scalar_b() {
+    let m = Module::new();
+    let mut e = Emitter::new(&m, Dtype::F32);
+    let a = e.scalar(0.0);
+    let b = flatppl_stablehlo::Value {
+        ssa: "%b".to_string(),
+        ty: MlirTy::Ranked(vec![Some(3)]),
+    };
+    e.rng("NORMAL", &a, &b, &MlirTy::Scalar);
+}
