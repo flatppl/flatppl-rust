@@ -67,6 +67,55 @@ static REGISTRY: &[(&str, DistLowering)] = &[
             sample: None,
         },
     ),
+    (
+        "Exponential",
+        DistLowering {
+            logpdf: exponential_logpdf,
+            sample: None,
+        },
+    ),
+    (
+        "Gamma",
+        DistLowering {
+            logpdf: gamma_logpdf,
+            sample: None,
+        },
+    ),
+    (
+        "Weibull",
+        DistLowering {
+            logpdf: weibull_logpdf,
+            sample: None,
+        },
+    ),
+    (
+        "Pareto",
+        DistLowering {
+            logpdf: pareto_logpdf,
+            sample: None,
+        },
+    ),
+    (
+        "InverseGamma",
+        DistLowering {
+            logpdf: inverse_gamma_logpdf,
+            sample: None,
+        },
+    ),
+    (
+        "ChiSquared",
+        DistLowering {
+            logpdf: chi_squared_logpdf,
+            sample: None,
+        },
+    ),
+    (
+        "LogNormal",
+        DistLowering {
+            logpdf: lognormal_logpdf,
+            sample: None,
+        },
+    ),
 ];
 
 /// Look up a distribution's lowering by its constructor name (`"Normal"`,
@@ -316,4 +365,188 @@ fn laplace_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitE
     let neg_term = e.neg(&term);
 
     Ok(e.add(&neg_log_two_b, &neg_term))
+}
+
+// ---- §08 gamma-family / positive-support continuous batch -------------------
+//
+// Exponential/Gamma/Weibull/Pareto/InverseGamma/ChiSquared/LogNormal,
+// registered alongside Normal/Cauchy/Logistic/Laplace in `REGISTRY` with
+// `sample: None` (samplers land in Task 14). Gamma/InverseGamma/ChiSquared's
+// log-forms need the log-gamma special function, `chlo.lgamma`
+// ([`Emitter::lgamma`]); the others compose only the elementary-op helpers.
+
+/// §08 Exponential, verbatim: `log f = log(rate) - rate * x`. No `@sample`
+/// builder yet (`sample: None`; Task 14).
+fn exponential_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
+    let rate = p.get(e, "rate")?;
+
+    let log_rate = e.log(&rate);
+    let rate_x = e.mul(&rate, v);
+    let neg_rate_x = e.neg(&rate_x);
+
+    Ok(e.add(&log_rate, &neg_rate_x))
+}
+
+/// §08 Gamma, verbatim: `log f = shape * log(rate) - lgamma(shape) +
+/// (shape - 1) * log(x) - rate * x`. No `@sample` builder yet (`sample:
+/// None`; Task 14).
+fn gamma_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
+    let shape = p.get(e, "shape")?;
+    let rate = p.get(e, "rate")?;
+
+    let log_rate = e.log(&rate);
+    let shape_log_rate = e.mul(&shape, &log_rate);
+
+    let lgamma_shape = e.lgamma(&shape);
+    let neg_lgamma_shape = e.neg(&lgamma_shape);
+
+    let one = e.scalar(1.0);
+    let shape_minus_one = e.sub(&shape, &one);
+    let log_x = e.log(v);
+    let shape_minus_one_log_x = e.mul(&shape_minus_one, &log_x);
+
+    let rate_x = e.mul(&rate, v);
+    let neg_rate_x = e.neg(&rate_x);
+
+    let t1 = e.add(&shape_log_rate, &neg_lgamma_shape);
+    let t2 = e.add(&t1, &shape_minus_one_log_x);
+    Ok(e.add(&t2, &neg_rate_x))
+}
+
+/// §08 Weibull, verbatim: with `u = x / scale`, `log f = log(shape) -
+/// log(scale) + (shape - 1) * log(u) - u^shape`. No `@sample` builder yet
+/// (`sample: None`; Task 14).
+fn weibull_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
+    let shape = p.get(e, "shape")?;
+    let scale = p.get(e, "scale")?;
+
+    let log_shape = e.log(&shape);
+    let log_scale = e.log(&scale);
+    let neg_log_scale = e.neg(&log_scale);
+
+    let u = e.div(v, &scale);
+    let log_u = e.log(&u);
+    let one = e.scalar(1.0);
+    let shape_minus_one = e.sub(&shape, &one);
+    let shape_minus_one_log_u = e.mul(&shape_minus_one, &log_u);
+
+    let u_pow_shape = e.pow(&u, &shape);
+    let neg_u_pow_shape = e.neg(&u_pow_shape);
+
+    let t1 = e.add(&log_shape, &neg_log_scale);
+    let t2 = e.add(&t1, &shape_minus_one_log_u);
+    Ok(e.add(&t2, &neg_u_pow_shape))
+}
+
+/// §08 Pareto, verbatim: `log f = log(shape) + shape * log(scale) -
+/// (shape + 1) * log(x)`. No `@sample` builder yet (`sample: None`; Task
+/// 14).
+fn pareto_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
+    let shape = p.get(e, "shape")?;
+    let scale = p.get(e, "scale")?;
+
+    let log_shape = e.log(&shape);
+    let log_scale = e.log(&scale);
+    let shape_log_scale = e.mul(&shape, &log_scale);
+
+    let one = e.scalar(1.0);
+    let shape_plus_one = e.add(&shape, &one);
+    let log_x = e.log(v);
+    let shape_plus_one_log_x = e.mul(&shape_plus_one, &log_x);
+    let neg_shape_plus_one_log_x = e.neg(&shape_plus_one_log_x);
+
+    let t1 = e.add(&log_shape, &shape_log_scale);
+    Ok(e.add(&t1, &neg_shape_plus_one_log_x))
+}
+
+/// §08 InverseGamma, verbatim: `log f = shape * log(scale) - lgamma(shape) -
+/// (shape + 1) * log(x) - scale / x`. No `@sample` builder yet (`sample:
+/// None`; Task 14).
+fn inverse_gamma_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
+    let shape = p.get(e, "shape")?;
+    let scale = p.get(e, "scale")?;
+
+    let log_scale = e.log(&scale);
+    let shape_log_scale = e.mul(&shape, &log_scale);
+
+    let lgamma_shape = e.lgamma(&shape);
+    let neg_lgamma_shape = e.neg(&lgamma_shape);
+
+    let one = e.scalar(1.0);
+    let shape_plus_one = e.add(&shape, &one);
+    let log_x = e.log(v);
+    let shape_plus_one_log_x = e.mul(&shape_plus_one, &log_x);
+    let neg_shape_plus_one_log_x = e.neg(&shape_plus_one_log_x);
+
+    let scale_over_x = e.div(&scale, v);
+    let neg_scale_over_x = e.neg(&scale_over_x);
+
+    let t1 = e.add(&shape_log_scale, &neg_lgamma_shape);
+    let t2 = e.add(&t1, &neg_shape_plus_one_log_x);
+    Ok(e.add(&t2, &neg_scale_over_x))
+}
+
+/// §08 ChiSquared, verbatim: with `half_k = k / 2`, `log f = -half_k *
+/// log(2) - lgamma(half_k) + (half_k - 1) * log(x) - x / 2`. `log(2)` is a
+/// plain numeric constant (independent of `k`), so it is folded to a scalar
+/// literal (`std::f64::consts::LN_2`) rather than emitted as its own
+/// `stablehlo.log` — same reasoning as [`cauchy_logpdf`]'s `log(pi)` fold. No
+/// `@sample` builder yet (`sample: None`; Task 14).
+fn chi_squared_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
+    let k = p.get(e, "k")?;
+
+    let half = e.scalar(0.5);
+    let half_k = e.mul(&half, &k);
+
+    let ln_two = e.scalar(std::f64::consts::LN_2);
+    let half_k_ln_two = e.mul(&half_k, &ln_two);
+    let neg_half_k_ln_two = e.neg(&half_k_ln_two);
+
+    let lgamma_half_k = e.lgamma(&half_k);
+    let neg_lgamma_half_k = e.neg(&lgamma_half_k);
+
+    let one = e.scalar(1.0);
+    let half_k_minus_one = e.sub(&half_k, &one);
+    let log_x = e.log(v);
+    let half_k_minus_one_log_x = e.mul(&half_k_minus_one, &log_x);
+
+    let two = e.scalar(2.0);
+    let x_over_two = e.div(v, &two);
+    let neg_x_over_two = e.neg(&x_over_two);
+
+    let t1 = e.add(&neg_half_k_ln_two, &neg_lgamma_half_k);
+    let t2 = e.add(&t1, &half_k_minus_one_log_x);
+    Ok(e.add(&t2, &neg_x_over_two))
+}
+
+/// §08 LogNormal, verbatim: `log f = -log(x) - log(sigma) - 1/2 * log(2*pi) -
+/// (log(x) - mu)^2 / (2*sigma^2)`. The quadratic term is composed exactly
+/// like [`normal_logpdf`]'s (`z = (log(x) - mu) / sigma`, `-0.5 * z^2`), with
+/// `log(x)` in place of `x` — and the same `log(x)` [`Value`] is reused for
+/// both the leading `-log(x)` term and this quadratic term, rather than
+/// calling [`Emitter::log`] on `v` a second time (each call emits a fresh
+/// `stablehlo.log` op; unlike [`Emitter::lower_node`], these op helpers do
+/// not memoize by FlatPDL `NodeId`). No `@sample` builder yet (`sample:
+/// None`; Task 14).
+fn lognormal_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
+    let mu = p.get(e, "mu")?;
+    let sigma = p.get(e, "sigma")?;
+
+    let log_x = e.log(v);
+    let neg_log_x = e.neg(&log_x);
+
+    let log_sigma = e.log(&sigma);
+    let neg_log_sigma = e.neg(&log_sigma);
+
+    let c = e.scalar(-0.5 * (2.0 * std::f64::consts::PI).ln());
+
+    let diff = e.sub(&log_x, &mu);
+    let z = e.div(&diff, &sigma);
+    let neg_half = e.scalar(-0.5);
+    let z_sq = e.mul(&z, &z);
+    let quad = e.mul(&neg_half, &z_sq);
+
+    let t1 = e.add(&neg_log_x, &neg_log_sigma);
+    let t2 = e.add(&t1, &c);
+    Ok(e.add(&t2, &quad))
 }

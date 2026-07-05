@@ -1638,6 +1638,587 @@ fn emit_logdensity_laplace_matches_frozen_golden() {
     );
 }
 
+// ---- Task 9: gamma-family / positive-support continuous `@logdensity` batch
+//
+// Exponential/Gamma/Weibull/Pareto/InverseGamma/ChiSquared/LogNormal (§08),
+// registered alongside Normal/Cauchy/Logistic/Laplace in `registry.rs`'s
+// `REGISTRY` with `sample: None` (samplers land in Task 14). Same
+// anchor-fixture shape as `NORMAL_DENSITY_SRC`/`CAUCHY_DENSITY_SRC` above:
+// free (`elementof`-declared) parameters, scored at a pinned observation via
+// `logdensityof(lawof(record(...)), record(...))`. A drawn value's type is
+// always `scalar(Real)` regardless of the distribution's *support* (§08's
+// "Domain/Support" column lists `reals` as the domain for every one of these
+// — `posreals`/`nonnegreals` is the support, a density-positivity region, not
+// the type), so `record(a = 0.5)` type-checks against every one of them
+// exactly as it did for Cauchy/Logistic/Laplace.
+
+const EXPONENTIAL_DENSITY_SRC: &str = "\
+rate = elementof(posreals)
+a = draw(Exponential(rate = rate))
+lp = logdensityof(lawof(record(a = a)), record(a = 0.5))
+";
+
+const GAMMA_DENSITY_SRC: &str = "\
+shape = elementof(posreals)
+rate = elementof(posreals)
+a = draw(Gamma(shape = shape, rate = rate))
+lp = logdensityof(lawof(record(a = a)), record(a = 0.5))
+";
+
+const WEIBULL_DENSITY_SRC: &str = "\
+shape = elementof(posreals)
+scale = elementof(posreals)
+a = draw(Weibull(shape = shape, scale = scale))
+lp = logdensityof(lawof(record(a = a)), record(a = 0.5))
+";
+
+const PARETO_DENSITY_SRC: &str = "\
+shape = elementof(posreals)
+scale = elementof(posreals)
+a = draw(Pareto(shape = shape, scale = scale))
+lp = logdensityof(lawof(record(a = a)), record(a = 0.5))
+";
+
+const INVERSE_GAMMA_DENSITY_SRC: &str = "\
+shape = elementof(posreals)
+scale = elementof(posreals)
+a = draw(InverseGamma(shape = shape, scale = scale))
+lp = logdensityof(lawof(record(a = a)), record(a = 0.5))
+";
+
+const CHI_SQUARED_DENSITY_SRC: &str = "\
+k = elementof(posreals)
+a = draw(ChiSquared(k = k))
+lp = logdensityof(lawof(record(a = a)), record(a = 0.5))
+";
+
+const LOGNORMAL_DENSITY_SRC: &str = "\
+mu = elementof(reals)
+sigma = elementof(posreals)
+a = draw(LogNormal(mu = mu, sigma = sigma))
+lp = logdensityof(lawof(record(a = a)), record(a = 0.5))
+";
+
+/// §08 Exponential, verbatim: `log(rate) - rate * x`. Op counts: one `log`
+/// (`rate`), one `multiply` (`rate * x`), one `negate`, one `add`. No
+/// `chlo.*` needed.
+#[test]
+fn emit_logdensity_exponential_has_expected_structure() {
+    let d = determinize_src(EXPONENTIAL_DENSITY_SRC);
+    assert!(
+        flatppl_determinizer::is_flatpdl(&d).is_ok(),
+        "determinized module must be FlatPDL-conformant (no residual measure node)"
+    );
+
+    let out = emit_logdensity(&d);
+
+    assert!(
+        out.contains("func.func @logdensity"),
+        "missing func.func @logdensity in:\n{out}"
+    );
+    assert!(
+        out.contains("-> tensor<f32>"),
+        "must return tensor<f32> in:\n{out}"
+    );
+    assert!(
+        out.contains("%arg0: tensor<f32>"),
+        "rate must become a func arg, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.log").count(),
+        1,
+        "expected exactly one log, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.multiply").count(),
+        1,
+        "expected exactly one multiply, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.negate").count(),
+        1,
+        "expected exactly one negate, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.add").count(),
+        1,
+        "expected exactly one add, in:\n{out}"
+    );
+    assert!(
+        !out.contains("chlo."),
+        "Exponential needs no CHLO ops, in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// Freeze the exact emitted text: any drift (op count, ordering, arg naming,
+/// formula) must be a deliberate, reviewed change to this golden file.
+#[test]
+fn emit_logdensity_exponential_matches_frozen_golden() {
+    let d = determinize_src(EXPONENTIAL_DENSITY_SRC);
+    let out = emit_logdensity(&d);
+    let golden = include_str!("goldens/exponential_logdensity.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted @logdensity drifted from the frozen golden (tests/goldens/exponential_logdensity.mlir)"
+    );
+}
+
+/// §08 Gamma, verbatim: `shape * log(rate) - lgamma(shape) + (shape - 1) *
+/// log(x) - rate * x`. Op counts: two `log`s (`rate`, `x`), one `chlo.lgamma`
+/// (`shape`), two `negate`s (`-lgamma(shape)`, `-rate*x`), one `subtract`
+/// (`shape - 1`), three `multiply`s (`shape*log(rate)`, `(shape-1)*log(x)`,
+/// `rate*x`), three `add`s.
+#[test]
+fn emit_logdensity_gamma_has_expected_structure() {
+    let d = determinize_src(GAMMA_DENSITY_SRC);
+    assert!(
+        flatppl_determinizer::is_flatpdl(&d).is_ok(),
+        "determinized module must be FlatPDL-conformant (no residual measure node)"
+    );
+
+    let out = emit_logdensity(&d);
+
+    assert!(
+        out.contains("func.func @logdensity"),
+        "missing func.func @logdensity in:\n{out}"
+    );
+    assert!(
+        out.contains("-> tensor<f32>"),
+        "must return tensor<f32> in:\n{out}"
+    );
+    assert!(
+        out.contains("%arg0: tensor<f32>") && out.contains("%arg1: tensor<f32>"),
+        "shape/rate must become func args, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.log").count(),
+        2,
+        "expected exactly two logs, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("chlo.lgamma").count(),
+        1,
+        "expected exactly one lgamma, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.negate").count(),
+        2,
+        "expected exactly two negates, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.subtract").count(),
+        1,
+        "expected exactly one subtract, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.multiply").count(),
+        3,
+        "expected exactly three multiplies, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.add").count(),
+        3,
+        "expected exactly three adds, in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// Freeze the exact emitted text: any drift (op count, ordering, arg naming,
+/// formula) must be a deliberate, reviewed change to this golden file.
+#[test]
+fn emit_logdensity_gamma_matches_frozen_golden() {
+    let d = determinize_src(GAMMA_DENSITY_SRC);
+    let out = emit_logdensity(&d);
+    let golden = include_str!("goldens/gamma_logdensity.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted @logdensity drifted from the frozen golden (tests/goldens/gamma_logdensity.mlir)"
+    );
+}
+
+/// §08 Weibull, verbatim: with `u = x/scale`, `log(shape) - log(scale) +
+/// (shape - 1) * log(u) - u^shape`. Op counts: three `log`s (`shape`,
+/// `scale`, `u`), two `negate`s (`-log(scale)`, `-u^shape`), one `divide`
+/// (`u`), one `subtract` (`shape - 1`), one `multiply` (`(shape-1)*log(u)`),
+/// one `power` (`u^shape`), three `add`s. No `chlo.*` needed.
+#[test]
+fn emit_logdensity_weibull_has_expected_structure() {
+    let d = determinize_src(WEIBULL_DENSITY_SRC);
+    assert!(
+        flatppl_determinizer::is_flatpdl(&d).is_ok(),
+        "determinized module must be FlatPDL-conformant (no residual measure node)"
+    );
+
+    let out = emit_logdensity(&d);
+
+    assert!(
+        out.contains("func.func @logdensity"),
+        "missing func.func @logdensity in:\n{out}"
+    );
+    assert!(
+        out.contains("-> tensor<f32>"),
+        "must return tensor<f32> in:\n{out}"
+    );
+    assert!(
+        out.contains("%arg0: tensor<f32>") && out.contains("%arg1: tensor<f32>"),
+        "shape/scale must become func args, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.log").count(),
+        3,
+        "expected exactly three logs, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.negate").count(),
+        2,
+        "expected exactly two negates, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.divide").count(),
+        1,
+        "expected exactly one divide, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.subtract").count(),
+        1,
+        "expected exactly one subtract, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.multiply").count(),
+        1,
+        "expected exactly one multiply, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.power").count(),
+        1,
+        "expected exactly one power, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.add").count(),
+        3,
+        "expected exactly three adds, in:\n{out}"
+    );
+    assert!(
+        !out.contains("chlo."),
+        "Weibull needs no CHLO ops, in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// Freeze the exact emitted text: any drift (op count, ordering, arg naming,
+/// formula) must be a deliberate, reviewed change to this golden file.
+#[test]
+fn emit_logdensity_weibull_matches_frozen_golden() {
+    let d = determinize_src(WEIBULL_DENSITY_SRC);
+    let out = emit_logdensity(&d);
+    let golden = include_str!("goldens/weibull_logdensity.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted @logdensity drifted from the frozen golden (tests/goldens/weibull_logdensity.mlir)"
+    );
+}
+
+/// §08 Pareto, verbatim: `log(shape) + shape * log(scale) - (shape + 1) *
+/// log(x)`. Op counts: three `log`s (`shape`, `scale`, `x`), one `negate`
+/// (the trailing term), one `add` for `shape + 1`, two `multiply`s
+/// (`shape*log(scale)`, `(shape+1)*log(x)`), three `add`s total (including
+/// `shape + 1`). No `chlo.*` needed.
+#[test]
+fn emit_logdensity_pareto_has_expected_structure() {
+    let d = determinize_src(PARETO_DENSITY_SRC);
+    assert!(
+        flatppl_determinizer::is_flatpdl(&d).is_ok(),
+        "determinized module must be FlatPDL-conformant (no residual measure node)"
+    );
+
+    let out = emit_logdensity(&d);
+
+    assert!(
+        out.contains("func.func @logdensity"),
+        "missing func.func @logdensity in:\n{out}"
+    );
+    assert!(
+        out.contains("-> tensor<f32>"),
+        "must return tensor<f32> in:\n{out}"
+    );
+    assert!(
+        out.contains("%arg0: tensor<f32>") && out.contains("%arg1: tensor<f32>"),
+        "shape/scale must become func args, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.log").count(),
+        3,
+        "expected exactly three logs, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.negate").count(),
+        1,
+        "expected exactly one negate, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.multiply").count(),
+        2,
+        "expected exactly two multiplies, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.add").count(),
+        3,
+        "expected exactly three adds, in:\n{out}"
+    );
+    assert!(
+        !out.contains("chlo."),
+        "Pareto needs no CHLO ops, in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// Freeze the exact emitted text: any drift (op count, ordering, arg naming,
+/// formula) must be a deliberate, reviewed change to this golden file.
+#[test]
+fn emit_logdensity_pareto_matches_frozen_golden() {
+    let d = determinize_src(PARETO_DENSITY_SRC);
+    let out = emit_logdensity(&d);
+    let golden = include_str!("goldens/pareto_logdensity.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted @logdensity drifted from the frozen golden (tests/goldens/pareto_logdensity.mlir)"
+    );
+}
+
+/// §08 InverseGamma, verbatim: `shape * log(scale) - lgamma(shape) - (shape +
+/// 1) * log(x) - scale / x`. Op counts: two `log`s (`scale`, `x`), one
+/// `chlo.lgamma` (`shape`), three `negate`s (`-lgamma(shape)`,
+/// `-(shape+1)*log(x)`, `-scale/x`), one `divide` (`scale/x`), two
+/// `multiply`s (`shape*log(scale)`, `(shape+1)*log(x)`), four `add`s
+/// (including `shape + 1`).
+#[test]
+fn emit_logdensity_inverse_gamma_has_expected_structure() {
+    let d = determinize_src(INVERSE_GAMMA_DENSITY_SRC);
+    assert!(
+        flatppl_determinizer::is_flatpdl(&d).is_ok(),
+        "determinized module must be FlatPDL-conformant (no residual measure node)"
+    );
+
+    let out = emit_logdensity(&d);
+
+    assert!(
+        out.contains("func.func @logdensity"),
+        "missing func.func @logdensity in:\n{out}"
+    );
+    assert!(
+        out.contains("-> tensor<f32>"),
+        "must return tensor<f32> in:\n{out}"
+    );
+    assert!(
+        out.contains("%arg0: tensor<f32>") && out.contains("%arg1: tensor<f32>"),
+        "shape/scale must become func args, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.log").count(),
+        2,
+        "expected exactly two logs, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("chlo.lgamma").count(),
+        1,
+        "expected exactly one lgamma, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.negate").count(),
+        3,
+        "expected exactly three negates, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.divide").count(),
+        1,
+        "expected exactly one divide, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.multiply").count(),
+        2,
+        "expected exactly two multiplies, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.add").count(),
+        4,
+        "expected exactly four adds, in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// Freeze the exact emitted text: any drift (op count, ordering, arg naming,
+/// formula) must be a deliberate, reviewed change to this golden file.
+#[test]
+fn emit_logdensity_inverse_gamma_matches_frozen_golden() {
+    let d = determinize_src(INVERSE_GAMMA_DENSITY_SRC);
+    let out = emit_logdensity(&d);
+    let golden = include_str!("goldens/inverse_gamma_logdensity.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted @logdensity drifted from the frozen golden (tests/goldens/inverse_gamma_logdensity.mlir)"
+    );
+}
+
+/// §08 ChiSquared, verbatim: with `half_k = k/2`, `-half_k * log(2) -
+/// lgamma(half_k) + (half_k - 1) * log(x) - x/2`. `log(2)` folds to a scalar
+/// literal (no `stablehlo.log` op for it — see `chi_squared_logpdf`'s doc
+/// comment). Op counts: one `log` (`x`), one `chlo.lgamma` (`half_k`), three
+/// `negate`s, one `subtract` (`half_k - 1`), one `divide` (`x/2`), three
+/// `multiply`s (`half_k = k*0.5`, `half_k*log(2)`, `(half_k-1)*log(x)`),
+/// three `add`s.
+#[test]
+fn emit_logdensity_chi_squared_has_expected_structure() {
+    let d = determinize_src(CHI_SQUARED_DENSITY_SRC);
+    assert!(
+        flatppl_determinizer::is_flatpdl(&d).is_ok(),
+        "determinized module must be FlatPDL-conformant (no residual measure node)"
+    );
+
+    let out = emit_logdensity(&d);
+
+    assert!(
+        out.contains("func.func @logdensity"),
+        "missing func.func @logdensity in:\n{out}"
+    );
+    assert!(
+        out.contains("-> tensor<f32>"),
+        "must return tensor<f32> in:\n{out}"
+    );
+    assert!(
+        out.contains("%arg0: tensor<f32>"),
+        "k must become a func arg, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.log").count(),
+        1,
+        "expected exactly one log, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("chlo.lgamma").count(),
+        1,
+        "expected exactly one lgamma, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.negate").count(),
+        3,
+        "expected exactly three negates, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.subtract").count(),
+        1,
+        "expected exactly one subtract, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.divide").count(),
+        1,
+        "expected exactly one divide, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.multiply").count(),
+        3,
+        "expected exactly three multiplies, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.add").count(),
+        3,
+        "expected exactly three adds, in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// Freeze the exact emitted text: any drift (op count, ordering, arg naming,
+/// formula) must be a deliberate, reviewed change to this golden file.
+#[test]
+fn emit_logdensity_chi_squared_matches_frozen_golden() {
+    let d = determinize_src(CHI_SQUARED_DENSITY_SRC);
+    let out = emit_logdensity(&d);
+    let golden = include_str!("goldens/chi_squared_logdensity.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted @logdensity drifted from the frozen golden (tests/goldens/chi_squared_logdensity.mlir)"
+    );
+}
+
+/// §08 LogNormal, verbatim: `-log(x) - log(sigma) - 1/2*log(2*pi) -
+/// (log(x) - mu)^2/(2*sigma^2)`. Op counts: two `log`s (`x`, `sigma` — `x`'s
+/// single `log` [`Value`] is reused for both the leading term and the
+/// quadratic's `z`, see `lognormal_logpdf`'s doc comment), two `negate`s
+/// (`-log(x)`, `-log(sigma)`), one `subtract` (`log(x) - mu`), one `divide`
+/// (`/sigma`), two `multiply`s (`z*z`, `-0.5*z^2`), three `add`s. No
+/// `chlo.*` needed.
+#[test]
+fn emit_logdensity_lognormal_has_expected_structure() {
+    let d = determinize_src(LOGNORMAL_DENSITY_SRC);
+    assert!(
+        flatppl_determinizer::is_flatpdl(&d).is_ok(),
+        "determinized module must be FlatPDL-conformant (no residual measure node)"
+    );
+
+    let out = emit_logdensity(&d);
+
+    assert!(
+        out.contains("func.func @logdensity"),
+        "missing func.func @logdensity in:\n{out}"
+    );
+    assert!(
+        out.contains("-> tensor<f32>"),
+        "must return tensor<f32> in:\n{out}"
+    );
+    assert!(
+        out.contains("%arg0: tensor<f32>") && out.contains("%arg1: tensor<f32>"),
+        "mu/sigma must become func args, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.log").count(),
+        2,
+        "expected exactly two logs, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.negate").count(),
+        2,
+        "expected exactly two negates, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.subtract").count(),
+        1,
+        "expected exactly one subtract, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.divide").count(),
+        1,
+        "expected exactly one divide, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.multiply").count(),
+        2,
+        "expected exactly two multiplies, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.add").count(),
+        3,
+        "expected exactly three adds, in:\n{out}"
+    );
+    assert!(
+        !out.contains("chlo."),
+        "LogNormal needs no CHLO ops, in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// Freeze the exact emitted text: any drift (op count, ordering, arg naming,
+/// formula) must be a deliberate, reviewed change to this golden file.
+#[test]
+fn emit_logdensity_lognormal_matches_frozen_golden() {
+    let d = determinize_src(LOGNORMAL_DENSITY_SRC);
+    let out = emit_logdensity(&d);
+    let golden = include_str!("goldens/lognormal_logdensity.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted @logdensity drifted from the frozen golden (tests/goldens/lognormal_logdensity.mlir)"
+    );
+}
+
 // ---- Task 6: Normal `@sample` + `emit_sample` (sampling vertical slice) ----
 //
 // `Emitter::rng` (`stablehlo.rng`), Normal's `@sample` builder (§08's
