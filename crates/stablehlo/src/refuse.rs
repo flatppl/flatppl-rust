@@ -83,6 +83,22 @@
 //! - `Uniform`'s `support` parameter has no closed-form measurable
 //!   interval/box `ValueSet` (`registry::lebesgue_measure` returns `None`) —
 //!   "Uniform logpdf needs a measurable interval/box support" (Task 10).
+//! - `MvNormal`'s `mu` has no statically-known vector length — "MvNormal
+//!   logdensity needs a statically-known vector length for 'mu'" (Task 12).
+//! - `MvNormal`'s `cov` is not an `n`x`n` matrix matching `mu`'s length —
+//!   "MvNormal cov must be an ...x... matrix matching mu's length ..., got
+//!   ..." (Task 12).
+//! - a matrix-distribution (`Wishart`/`InverseWishart`) shape param with no
+//!   statically-known SQUARE matrix shape — "... logdensity needs a
+//!   statically-known square matrix for '...', got ..." /
+//!   "... logdensity: '...' must be a rank-2 square matrix, got ..."
+//!   (`registry::static_square_matrix_dim`, Task 13).
+//! - a matrix-distribution variate that mismatches its scale/`n`'s own
+//!   dimension — "... ... must be an NxN matrix, got ..."
+//!   (`registry::require_matrix_dim`, Task 13).
+//! - `LKJ`/`LKJCholesky`'s `n` kwarg is not a FIXED-phase positive integer
+//!   literal — "... logdensity needs a fixed-phase positive integer literal
+//!   for '...'" (`registry::literal_fixed_positive_int`, Task 13).
 //!
 //! **`types.rs`** (`mlir_type_of`):
 //! - a node with no inferred type at all — "node has no inferred type"

@@ -4093,3 +4093,433 @@ fn emit_logdensity_multinomial_matches_frozen_golden() {
         "emitted @logdensity drifted from the frozen golden (tests/goldens/multinomial_logdensity.mlir)"
     );
 }
+
+// ---- Task 13: matrix distribution `@logdensity` batch -----------------------
+//
+// Wishart/InverseWishart/LKJ/LKJCholesky. Every matrix-shaped kwarg (`scale`,
+// and the scored variate itself) is declared `elementof(cartpow(reals, [n,
+// n]))` — a free parameter, exactly like `MvNormal`'s own `mu`/`cov` (Task
+// 12) — rather than a literal nested-array constant (`[[..], [..]]`):
+// `Emitter::vector`'s pretty-printed concatenate lowering (Task 3/4) assumes
+// every element it is handed is itself a `Scalar` (it reshapes each element
+// to `tensor<1x...>` before concatenating), so a NESTED vector literal (a
+// vector of vectors, i.e. a literal matrix) silently lowers to the wrong
+// rank/shape instead of refusing — verified directly: scoring a Wishart
+// fixture at a literal `record(x = [[2.0, 0.3], [0.3, 1.5]])` reaches
+// `wishart_logpdf` with a `v` whose `MlirTy` is `Ranked([Some(2)])`, not
+// `Ranked([Some(2), Some(2)])`, which this batch's own `require_matrix_dim`
+// guard then (correctly) refuses. That gap is in Task 3/4's `Emitter::
+// vector`/`ops::lower_vector`, not this batch's own composition — flagged in
+// the Task 13 report as a follow-up (a matrix-shaped LITERAL variate should
+// either lower correctly or refuse, never silently mislower), worked around
+// here by using a free-parameter variate instead, which does not go through
+// `Emitter::vector` at all (it becomes an ordinary `%argN` via the same
+// free-parameter binding path `scale`/`cov`/`mu` already use).
+//
+// LKJ/LKJCholesky's `n` is spec's own explicit dimension kwarg and must be
+// FIXED phase (a plain literal binding, no `elementof`/`draw` ancestor —
+// spec §04) for `literal_fixed_positive_int` to read it as a Rust `u64` at
+// emit time; every fixture below binds `n` as a bare top-level literal
+// (`n = 3`), never `elementof(posintegers)` (which would make it
+// `%parameterized`, i.e. a runtime-only `%argN` with no compile-time value
+// to unroll `log_cn_lkj`'s `k` sum against — see
+// `lkj_logpdf_refuses_parameterized_n` below).
+
+/// The Task-13 Wishart anchor fixture: a free `2x2` `scale`, free `nu`, and a
+/// free `2x2` `x_obs` scored variate (see the batch doc comment for why the
+/// variate is a free parameter, not a literal matrix).
+const WISHART_DENSITY_SRC: &str = "\
+scale = elementof(cartpow(reals, [2, 2]))
+nu = elementof(posreals)
+x_obs = elementof(cartpow(reals, [2, 2]))
+x = draw(Wishart(nu = nu, scale = scale))
+lp = logdensityof(lawof(record(x = x)), record(x = x_obs))
+";
+
+/// §08 Wishart, verbatim: `((nu-n-1)/2) log|X| - (1/2) tr(V^-1 X) -
+/// (nu*n/2) log2 - (nu/2) log|V| - logGamma_n(nu/2)`, `n = 2` (read off
+/// `scale`'s own shape). Op counts: two `stablehlo.cholesky` (`L_V`, `L_X`),
+/// one (generic-form) `triangular_solve` (the Frobenius trace), four
+/// `stablehlo.iota`/two `compare`/two `select` (two `diag` calls, one per
+/// `log|.|` term — each `diag` lowers to its own iota/compare/select/reduce
+/// idiom, see `Emitter::diag`'s doc comment), six `stablehlo.reduce(` (two
+/// per `log|.|` term's `diag`-row-sum + final `reduce_sum`, plus two for the
+/// trace's full matrix `reduce_sum`), two `chlo.lgamma` (`log_mv_gamma`'s `n
+/// = 2` unrolled loop).
+#[test]
+fn emit_logdensity_wishart_has_expected_structure() {
+    let d = determinize_src(WISHART_DENSITY_SRC);
+    assert!(
+        flatppl_determinizer::is_flatpdl(&d).is_ok(),
+        "determinized module must be FlatPDL-conformant (no residual measure node)"
+    );
+
+    let out = emit_logdensity(&d);
+
+    assert!(
+        out.contains("func.func @logdensity"),
+        "missing func.func @logdensity in:\n{out}"
+    );
+    assert!(
+        out.contains("-> tensor<f32>"),
+        "must return tensor<f32> in:\n{out}"
+    );
+    assert!(
+        out.contains("%arg0: tensor<2x2xf32>")
+            && out.contains("%arg1: tensor<f32>")
+            && out.contains("%arg2: tensor<2x2xf32>"),
+        "scale/nu/x_obs must become matrix/scalar/matrix func args, in:\n{out}"
+    );
+    assert_eq!(out.matches("stablehlo.cholesky").count(), 2);
+    assert_eq!(out.matches("\"stablehlo.triangular_solve\"").count(), 1);
+    assert_eq!(out.matches("stablehlo.iota").count(), 4);
+    assert_eq!(out.matches("stablehlo.compare").count(), 2);
+    assert_eq!(out.matches("stablehlo.select").count(), 2);
+    assert_eq!(out.matches("stablehlo.reduce(").count(), 6);
+    assert_eq!(out.matches("chlo.lgamma").count(), 2);
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// Freeze the exact emitted text: any drift (op count, ordering, arg naming,
+/// formula) must be a deliberate, reviewed change to this golden file.
+#[test]
+fn emit_logdensity_wishart_matches_frozen_golden() {
+    let d = determinize_src(WISHART_DENSITY_SRC);
+    let out = emit_logdensity(&d);
+    let golden = include_str!("goldens/wishart_logdensity.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted @logdensity drifted from the frozen golden (tests/goldens/wishart_logdensity.mlir)"
+    );
+}
+
+/// A non-square `scale` (`[2, 3]`) must refuse precisely — `n` (the row/
+/// column count `static_square_matrix_dim` reads off `scale`) has no value
+/// to read at all, so this must never reach `stablehlo.cholesky` on a
+/// non-square operand.
+#[test]
+fn wishart_logpdf_refuses_nonsquare_scale() {
+    let src = "\
+scale = elementof(cartpow(reals, [2, 3]))
+nu = elementof(posreals)
+x_obs = elementof(cartpow(reals, [2, 2]))
+x = draw(Wishart(nu = nu, scale = scale))
+lp = logdensityof(lawof(record(x = x)), record(x = x_obs))
+";
+    let d = determinize_src(src);
+    let err = flatppl_stablehlo::emit(
+        &d,
+        flatppl_stablehlo::Mode::LogDensity,
+        &flatppl_stablehlo::EmitOptions::default(),
+    )
+    .unwrap_err();
+    assert!(
+        err.msg.contains("square matrix"),
+        "unexpected message: {}",
+        err.msg
+    );
+}
+
+/// The Task-13 InverseWishart anchor fixture — same shape as
+/// [`WISHART_DENSITY_SRC`], only the ctor differs.
+const INVERSE_WISHART_DENSITY_SRC: &str = "\
+scale = elementof(cartpow(reals, [2, 2]))
+nu = elementof(posreals)
+x_obs = elementof(cartpow(reals, [2, 2]))
+x = draw(InverseWishart(nu = nu, scale = scale))
+lp = logdensityof(lawof(record(x = x)), record(x = x_obs))
+";
+
+/// §08 InverseWishart, verbatim: `(nu/2) log|Psi| - ((nu+n+1)/2) log|X| -
+/// (1/2) tr(Psi X^-1) - (nu*n/2) log2 - logGamma_n(nu/2)`. Same op-count
+/// shape as [`emit_logdensity_wishart_has_expected_structure`] (the formula
+/// rearranges the same five terms; `tr(Psi X^-1)` is computed as `tr(X^-1
+/// Psi)` instead — see [`inverse_wishart_logpdf`]'s doc comment — but that
+/// is still exactly one `tri_solve`).
+#[test]
+fn emit_logdensity_inverse_wishart_has_expected_structure() {
+    let d = determinize_src(INVERSE_WISHART_DENSITY_SRC);
+    assert!(
+        flatppl_determinizer::is_flatpdl(&d).is_ok(),
+        "determinized module must be FlatPDL-conformant (no residual measure node)"
+    );
+
+    let out = emit_logdensity(&d);
+
+    assert!(
+        out.contains("func.func @logdensity"),
+        "missing func.func @logdensity in:\n{out}"
+    );
+    assert!(
+        out.contains("-> tensor<f32>"),
+        "must return tensor<f32> in:\n{out}"
+    );
+    assert!(
+        out.contains("%arg0: tensor<2x2xf32>")
+            && out.contains("%arg1: tensor<f32>")
+            && out.contains("%arg2: tensor<2x2xf32>"),
+        "scale/nu/x_obs must become matrix/scalar/matrix func args, in:\n{out}"
+    );
+    assert_eq!(out.matches("stablehlo.cholesky").count(), 2);
+    assert_eq!(out.matches("\"stablehlo.triangular_solve\"").count(), 1);
+    assert_eq!(out.matches("stablehlo.iota").count(), 4);
+    assert_eq!(out.matches("stablehlo.compare").count(), 2);
+    assert_eq!(out.matches("stablehlo.select").count(), 2);
+    assert_eq!(out.matches("stablehlo.reduce(").count(), 6);
+    assert_eq!(out.matches("chlo.lgamma").count(), 2);
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// Freeze the exact emitted text: any drift (op count, ordering, arg naming,
+/// formula) must be a deliberate, reviewed change to this golden file.
+#[test]
+fn emit_logdensity_inverse_wishart_matches_frozen_golden() {
+    let d = determinize_src(INVERSE_WISHART_DENSITY_SRC);
+    let out = emit_logdensity(&d);
+    let golden = include_str!("goldens/inverse_wishart_logdensity.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted @logdensity drifted from the frozen golden (tests/goldens/inverse_wishart_logdensity.mlir)"
+    );
+}
+
+/// A scored variate `X` (`[3, 3]`) that mismatches `scale`'s dimension (`n =
+/// 2`) must refuse precisely, not reach `stablehlo.cholesky` on a variate
+/// whose shape silently disagrees with `scale`'s.
+#[test]
+fn inverse_wishart_logpdf_refuses_mismatched_variate() {
+    let src = "\
+scale = elementof(cartpow(reals, [2, 2]))
+nu = elementof(posreals)
+x_obs = elementof(cartpow(reals, [3, 3]))
+x = draw(InverseWishart(nu = nu, scale = scale))
+lp = logdensityof(lawof(record(x = x)), record(x = x_obs))
+";
+    let d = determinize_src(src);
+    let err = flatppl_stablehlo::emit(
+        &d,
+        flatppl_stablehlo::Mode::LogDensity,
+        &flatppl_stablehlo::EmitOptions::default(),
+    )
+    .unwrap_err();
+    assert!(
+        err.msg.contains("InverseWishart X must be an 2x2 matrix"),
+        "unexpected message: {}",
+        err.msg
+    );
+}
+
+/// The Task-13 LKJ anchor fixture: a FIXED `n = 3`, free `eta`, and a free
+/// `3x3` `c_obs` scored variate.
+const LKJ_DENSITY_SRC: &str = "\
+n = 3
+eta = elementof(posreals)
+c_obs = elementof(cartpow(reals, [3, 3]))
+c = draw(LKJ(n = n, eta = eta))
+lp = logdensityof(lawof(record(c = c)), record(c = c_obs))
+";
+
+/// §08 LKJ, verbatim: `(eta-1) log det(C) - log c_n(eta)`, `n = 3` (spec's
+/// own fixed dimension kwarg). Op counts: one `stablehlo.cholesky` (`L_C`),
+/// no `triangular_solve` (LKJ needs no trace), two `stablehlo.iota`/one
+/// `compare`/one `select` (`diag`'s own idiom, called once), two
+/// `stablehlo.reduce(` (`diag`'s row-sum + `log_det_from_chol`'s
+/// `reduce_sum`), four `chlo.lgamma` (`log_cn_lkj`'s `k = 1..n-1` loop, `n =
+/// 3` so 2 iterations, 2 `lgamma`s each).
+#[test]
+fn emit_logdensity_lkj_has_expected_structure() {
+    let d = determinize_src(LKJ_DENSITY_SRC);
+    assert!(
+        flatppl_determinizer::is_flatpdl(&d).is_ok(),
+        "determinized module must be FlatPDL-conformant (no residual measure node)"
+    );
+
+    let out = emit_logdensity(&d);
+
+    assert!(
+        out.contains("func.func @logdensity"),
+        "missing func.func @logdensity in:\n{out}"
+    );
+    assert!(
+        out.contains("-> tensor<f32>"),
+        "must return tensor<f32> in:\n{out}"
+    );
+    assert!(
+        out.contains("%arg0: tensor<f32>") && out.contains("%arg1: tensor<3x3xf32>"),
+        "eta/c_obs must become scalar/matrix func args, in:\n{out}"
+    );
+    assert_eq!(out.matches("stablehlo.cholesky").count(), 1);
+    assert!(
+        !out.contains("triangular_solve"),
+        "LKJ needs no trace/tri_solve, in:\n{out}"
+    );
+    assert_eq!(out.matches("stablehlo.iota").count(), 2);
+    assert_eq!(out.matches("stablehlo.compare").count(), 1);
+    assert_eq!(out.matches("stablehlo.select").count(), 1);
+    assert_eq!(out.matches("stablehlo.reduce(").count(), 2);
+    assert_eq!(out.matches("chlo.lgamma").count(), 4);
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// Freeze the exact emitted text: any drift (op count, ordering, arg naming,
+/// formula) must be a deliberate, reviewed change to this golden file.
+#[test]
+fn emit_logdensity_lkj_matches_frozen_golden() {
+    let d = determinize_src(LKJ_DENSITY_SRC);
+    let out = emit_logdensity(&d);
+    let golden = include_str!("goldens/lkj_logdensity.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted @logdensity drifted from the frozen golden (tests/goldens/lkj_logdensity.mlir)"
+    );
+}
+
+/// A scored variate `C` (`[2, 2]`) that mismatches the FIXED `n = 3` kwarg
+/// must refuse precisely, not reach `stablehlo.cholesky` on a `[2, 2]`
+/// operand while `log_cn_lkj`'s Rust loop unrolls for `n = 3`.
+#[test]
+fn lkj_logpdf_refuses_mismatched_variate() {
+    let src = "\
+n = 3
+eta = elementof(posreals)
+c_obs = elementof(cartpow(reals, [2, 2]))
+c = draw(LKJ(n = n, eta = eta))
+lp = logdensityof(lawof(record(c = c)), record(c = c_obs))
+";
+    let d = determinize_src(src);
+    let err = flatppl_stablehlo::emit(
+        &d,
+        flatppl_stablehlo::Mode::LogDensity,
+        &flatppl_stablehlo::EmitOptions::default(),
+    )
+    .unwrap_err();
+    assert!(
+        err.msg.contains("LKJ C must be an 3x3 matrix"),
+        "unexpected message: {}",
+        err.msg
+    );
+}
+
+/// A `%parameterized` (`elementof`-declared) `n` — rather than a FIXED-phase
+/// literal binding — has no Rust `u64` to unroll `log_cn_lkj`'s `k` sum
+/// against and must refuse precisely, not panic reaching a `for k in 1..n`
+/// with no `n` at all. Exercises [`literal_fixed_positive_int`]'s refusal
+/// arm directly (distinct from every other guard in this batch, which all
+/// check a matrix *shape* — this one checks a scalar kwarg's *phase*).
+#[test]
+fn lkj_logpdf_refuses_parameterized_n() {
+    let src = "\
+n = elementof(posintegers)
+eta = elementof(posreals)
+c_obs = elementof(cartpow(reals, [3, 3]))
+c = draw(LKJ(n = n, eta = eta))
+lp = logdensityof(lawof(record(c = c)), record(c = c_obs))
+";
+    let d = determinize_src(src);
+    let err = flatppl_stablehlo::emit(
+        &d,
+        flatppl_stablehlo::Mode::LogDensity,
+        &flatppl_stablehlo::EmitOptions::default(),
+    )
+    .unwrap_err();
+    assert!(
+        err.msg.contains("fixed-phase positive integer literal"),
+        "unexpected message: {}",
+        err.msg
+    );
+}
+
+/// The Task-13 LKJCholesky anchor fixture: a FIXED `n = 3`, free `eta`, and a
+/// free `3x3` `l_obs` scored variate (already itself a Cholesky factor).
+const LKJ_CHOLESKY_DENSITY_SRC: &str = "\
+n = 3
+eta = elementof(posreals)
+l_obs = elementof(cartpow(reals, [3, 3]))
+l = draw(LKJCholesky(n = n, eta = eta))
+lp = logdensityof(lawof(record(l = l)), record(l = l_obs))
+";
+
+/// §08 LKJCholesky, verbatim: `sum_{i=2}^{n} (n-i+2*eta-2) log L_ii - log
+/// c_n(eta)`. Op counts: NO `stablehlo.cholesky` at all (the variate `L` is
+/// already the Cholesky factor — [`lkj_cholesky_logpdf`]'s doc comment), two
+/// `stablehlo.iota`/one `compare`/one `select` (one `diag` call, called
+/// directly rather than through `log_det_from_chol`), one `stablehlo.reduce(`
+/// (`diag`'s own row-sum; no further `reduce_sum` — [`vector_elem`] slices
+/// two of the three diagonal entries individually instead of summing all
+/// their logs), two `stablehlo.slice`/two `stablehlo.reshape` ([`vector_elem`]
+/// called for `i = 2, 3`), four `chlo.lgamma` (`log_cn_lkj`'s `n = 3` loop,
+/// same as [`emit_logdensity_lkj_has_expected_structure`]).
+#[test]
+fn emit_logdensity_lkj_cholesky_has_expected_structure() {
+    let d = determinize_src(LKJ_CHOLESKY_DENSITY_SRC);
+    assert!(
+        flatppl_determinizer::is_flatpdl(&d).is_ok(),
+        "determinized module must be FlatPDL-conformant (no residual measure node)"
+    );
+
+    let out = emit_logdensity(&d);
+
+    assert!(
+        out.contains("func.func @logdensity"),
+        "missing func.func @logdensity in:\n{out}"
+    );
+    assert!(
+        out.contains("-> tensor<f32>"),
+        "must return tensor<f32> in:\n{out}"
+    );
+    assert!(
+        out.contains("%arg0: tensor<f32>") && out.contains("%arg1: tensor<3x3xf32>"),
+        "eta/l_obs must become scalar/matrix func args, in:\n{out}"
+    );
+    assert!(
+        !out.contains("stablehlo.cholesky"),
+        "LKJCholesky's variate is already the Cholesky factor, in:\n{out}"
+    );
+    assert_eq!(out.matches("stablehlo.iota").count(), 2);
+    assert_eq!(out.matches("stablehlo.compare").count(), 1);
+    assert_eq!(out.matches("stablehlo.select").count(), 1);
+    assert_eq!(out.matches("stablehlo.reduce(").count(), 1);
+    assert_eq!(out.matches("stablehlo.slice").count(), 2);
+    assert_eq!(out.matches("stablehlo.reshape").count(), 2);
+    assert_eq!(out.matches("chlo.lgamma").count(), 4);
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// Freeze the exact emitted text: any drift (op count, ordering, arg naming,
+/// formula) must be a deliberate, reviewed change to this golden file.
+#[test]
+fn emit_logdensity_lkj_cholesky_matches_frozen_golden() {
+    let d = determinize_src(LKJ_CHOLESKY_DENSITY_SRC);
+    let out = emit_logdensity(&d);
+    let golden = include_str!("goldens/lkjcholesky_logdensity.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted @logdensity drifted from the frozen golden (tests/goldens/lkjcholesky_logdensity.mlir)"
+    );
+}
+
+/// A non-square scored variate `L` (`[2, 3]`) must refuse precisely, not
+/// reach `Emitter::diag` on a non-square operand (which only asserts rank 2,
+/// never squareness — see that function's doc comment).
+#[test]
+fn lkj_cholesky_logpdf_refuses_nonsquare_variate() {
+    let src = "\
+n = 3
+eta = elementof(posreals)
+l_obs = elementof(cartpow(reals, [2, 3]))
+l = draw(LKJCholesky(n = n, eta = eta))
+lp = logdensityof(lawof(record(l = l)), record(l = l_obs))
+";
+    let d = determinize_src(src);
+    let err = flatppl_stablehlo::emit(
+        &d,
+        flatppl_stablehlo::Mode::LogDensity,
+        &flatppl_stablehlo::EmitOptions::default(),
+    )
+    .unwrap_err();
+    assert!(
+        err.msg.contains("LKJCholesky L must be an 3x3 matrix"),
+        "unexpected message: {}",
+        err.msg
+    );
+}

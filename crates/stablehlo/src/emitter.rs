@@ -676,15 +676,22 @@ impl<'m> Emitter<'m> {
         }
     }
 
-    /// Whether `id` — resolved through at most one level of `(%ref self x)`
-    /// indirection (mirroring [`Emitter::lower_ref`]'s `SelfMod` case, and
-    /// the determinizer's own `resolve_ref_one`: a shared latent's
+    /// Resolve `id` through at most one level of `(%ref self x)` indirection
+    /// (mirroring [`Emitter::lower_ref`]'s `SelfMod` case, and the
+    /// determinizer's own `resolve_ref_one`: a shared latent's
     /// `builtin_sample` is bound to a name by
     /// `flatppl_determinizer::sample::lower_shared_record_sample`, an inline
-    /// single draw's is not, via that module's `build_sample_term`) — is a
-    /// `builtin_sample(...)` call.
-    fn resolves_to_builtin_sample(&self, id: NodeId) -> bool {
-        let resolved = match self.m.node(id) {
+    /// single draw's is not, via that module's `build_sample_term`) — a
+    /// narrow accessor shared by [`Emitter::resolves_to_builtin_sample`]
+    /// (below) and `crate::registry`'s matrix-distribution builders (Task
+    /// 13), which need it to read a FIXED-phase kwarg field (e.g. `LKJ`'s
+    /// `n`) down to its literal value: a fixed-phase binding's *use site* is
+    /// exactly this one-level `(%ref self n)` indirection to the literal
+    /// `(%bind n 3)`, never the literal inlined directly at the call site
+    /// (spec §04's phase system). Returns `id` unchanged when it is not this
+    /// shape (already a literal, a `Local`/`Module` ref, or any other node).
+    pub(crate) fn resolve_ref_one(&self, id: NodeId) -> NodeId {
+        match self.m.node(id) {
             Node::Ref(Ref {
                 ns: RefNs::SelfMod,
                 name,
@@ -694,7 +701,13 @@ impl<'m> Emitter<'m> {
                 .map(|bid| self.m.binding(bid).rhs)
                 .unwrap_or(id),
             _ => id,
-        };
+        }
+    }
+
+    /// Whether `id` — resolved via [`Emitter::resolve_ref_one`] — is a
+    /// `builtin_sample(...)` call.
+    fn resolves_to_builtin_sample(&self, id: NodeId) -> bool {
+        let resolved = self.resolve_ref_one(id);
         matches!(
             self.m.node(resolved),
             Node::Call(c) if matches!(

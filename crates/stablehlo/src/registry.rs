@@ -228,6 +228,34 @@ static REGISTRY: &[(&str, DistLowering)] = &[
             sample: None,
         },
     ),
+    (
+        "Wishart",
+        DistLowering {
+            logpdf: wishart_logpdf,
+            sample: None,
+        },
+    ),
+    (
+        "InverseWishart",
+        DistLowering {
+            logpdf: inverse_wishart_logpdf,
+            sample: None,
+        },
+    ),
+    (
+        "LKJ",
+        DistLowering {
+            logpdf: lkj_logpdf,
+            sample: None,
+        },
+    ),
+    (
+        "LKJCholesky",
+        DistLowering {
+            logpdf: lkj_cholesky_logpdf,
+            sample: None,
+        },
+    ),
 ];
 
 /// Look up a distribution's lowering by its constructor name (`"Normal"`,
@@ -1428,4 +1456,403 @@ fn multinomial_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, E
 
     let t1 = e.add(&lgamma_n1, &neg_sum_lgamma_x1);
     Ok(e.add(&t1, &sum_x_log_p))
+}
+
+// ---- §08 matrix distribution batch (Task 13) --------------------------------
+//
+// Wishart/InverseWishart/LKJ/LKJCholesky, registered alongside the rest of
+// §08 in `REGISTRY` with `sample: None` (no sampler is scheduled for this
+// batch). The hardest batch so far: matrix trace/log-determinant, the
+// multivariate gamma function, and the LKJ normalizer, composed entirely
+// from Task 3's matrix helpers (`cholesky`/`diag`/`tri_solve`/`reduce_sum`)
+// plus `lgamma` — never a full matrix inverse, which this emitter has no
+// helper for at all.
+//
+// Three shared building blocks, used across all four builders below:
+//
+// - `log|A|` for an SPD matrix `A`, from an already-computed Cholesky factor
+//   `L = cholesky(A)`: `2 * sum(log(diag(L)))` — the same identity
+//   [`mvnormal_logpdf`] (Task 12) already uses for `log|Sigma|`, factored out
+//   here as [`log_det_from_chol`] since every builder in this batch needs it
+//   at least once (Wishart/InverseWishart twice each, LKJ once).
+// - `tr(A^-1 B)`, from already-computed Cholesky factors `L_A`/`L_B`, via the
+//   Frobenius identity `tr(A^-1 B) = ||L_A^-1 L_B||_F^2` (task brief,
+//   verbatim): `W = tri_solve(L_A, L_B)` solves `L_A W = L_B` for the MATRIX
+//   right-hand side `L_B` (`tri_solve` is shape-generic — its result type is
+//   simply its r.h.s. operand's own type, vector or matrix alike; see its own
+//   doc comment), then `tr = sum(W .* W)` — [`trace_via_frobenius`]. Never a
+//   matrix inverse or a transposed solve.
+// - `log Γ_n(a) = (n(n-1)/4) log(pi) + sum_{j=1}^n lgamma(a + (1-j)/2)`
+//   (task brief, verbatim), the multivariate gamma function's log — §08's
+//   Wishart/InverseWishart normalizer, [`log_mv_gamma`]. `n` is the FIXED
+//   matrix dimension (already read off `scale`'s own shape by the caller —
+//   see [`static_square_matrix_dim`]), so the `j` sum unrolls into `n`
+//   `lgamma` calls at EMIT time (an ordinary Rust `for` loop), never a
+//   StableHLO-level reduction; `a` (`nu/2`) is an ordinary runtime `Value`.
+//
+// LKJ/LKJCholesky additionally share `log c_n(eta)` (§08's normalizer for
+// both, verbatim) — [`log_cn_lkj`] — whose own `k = 1..n-1` sum unrolls the
+// same way; `eta` is again an ordinary runtime `Value`, composed via op
+// helpers regardless of whether it happens to be a compile-time literal or a
+// free `elementof`-declared parameter (this emitter never special-cases a
+// `Value`'s origin — see e.g. [`normal_logpdf`]'s identical treatment of
+// `sigma`).
+//
+// Unlike Wishart/InverseWishart (whose dimension `n` is always the row/
+// column count of `scale`, a matrix-shaped kwarg — spec §08), LKJ/
+// LKJCholesky have an explicit `n` kwarg of their own (spec: `n =
+// elementof(posintegers)`) that must be spec's FIXED phase (no `elementof`/
+// `draw` ancestor — spec §04) for a Rust `u64` value to exist at emit time at
+// all. Verified against the real determinizer output: a fixed-phase
+// binding's use site is `(%ref self n)`, one level of `(%ref self x)`
+// indirection to the actual `(%bind n 3)` literal — never the literal
+// inlined directly at the call site, the way e.g. a `get`/`get0` selector
+// literal is (`ops::literal_index`). [`literal_fixed_positive_int`] follows
+// that one level via [`Emitter::resolve_ref_one`] before matching the
+// literal; a `%parameterized` (`elementof`-declared) `n` has no such literal
+// to find and refuses precisely, rather than reaching a Rust `for j in
+// 1..=n` with no `n` at all.
+
+/// The statically-known dimension `n` of a square matrix `Value` (`Ranked([n,
+/// n])`), or a precise refusal naming `ctor`/`param_name` — the square-matrix
+/// analogue of [`static_vector_len`] (Task 12's `mu`-length check), used by
+/// [`wishart_logpdf`]/[`inverse_wishart_logpdf`] to read `n` off `scale`'s own
+/// shape (spec §08: "the dimension n is the row/column count of scale").
+fn static_square_matrix_dim(
+    blame: NodeId,
+    m: &Value,
+    ctor: &str,
+    param_name: &str,
+) -> Result<u64, EmitError> {
+    match &m.ty {
+        MlirTy::Ranked(dims) if dims.len() == 2 => match (dims[0], dims[1]) {
+            (Some(a), Some(b)) if a == b => Ok(a),
+            _ => Err(EmitError::at(
+                blame,
+                format!(
+                    "{ctor} logdensity needs a statically-known square matrix for \
+                     '{param_name}', got {:?}",
+                    m.ty
+                ),
+            )),
+        },
+        other => Err(EmitError::at(
+            blame,
+            format!(
+                "{ctor} logdensity: '{param_name}' must be a rank-2 square matrix, got {other:?}"
+            ),
+        )),
+    }
+}
+
+/// `m`'s `MlirTy` must be exactly the square `n`x`n` matrix `param_name` is
+/// expected to be — a refusal, not a downstream panic (refuse-don't-
+/// mislower), mirroring [`require_square_cov`] (Task 12) for every
+/// cross-check this batch needs (a scored variate against `scale`'s/`n`'s own
+/// dimension): neither `cholesky`, `diag`, nor `tri_solve` validates a shape
+/// mismatch itself (see `require_square_cov`'s doc comment for the same
+/// reasoning), so every builder below must, before any matrix op runs.
+fn require_matrix_dim(
+    blame: NodeId,
+    m: &Value,
+    n: u64,
+    ctor: &str,
+    param_name: &str,
+) -> Result<(), EmitError> {
+    match &m.ty {
+        MlirTy::Ranked(dims) if dims.len() == 2 && dims[0] == Some(n) && dims[1] == Some(n) => {
+            Ok(())
+        }
+        other => Err(EmitError::at(
+            blame,
+            format!("{ctor} {param_name} must be an {n}x{n} matrix, got {other:?}"),
+        )),
+    }
+}
+
+/// The literal positive-integer value of the kernel-input field `field_name`
+/// — needed by [`lkj_logpdf`]/[`lkj_cholesky_logpdf`] to get their explicit
+/// `n` kwarg as a Rust `u64` at EMIT time, to unroll [`log_cn_lkj`]'s `k`
+/// sum. Follows at most one level of `(%ref self x)` indirection via
+/// [`Emitter::resolve_ref_one`] — a FIXED-phase field's use site is that
+/// indirection, not the literal inlined directly (see the batch doc
+/// comment) — then requires a positive `Node::Lit(Scalar::Int(_))`. Refuses
+/// (never panics) for anything else, e.g. a `%parameterized`
+/// (`elementof`-declared) `n`, which has no such literal to find.
+fn literal_fixed_positive_int(
+    e: &Emitter,
+    p: &Params,
+    field_name: &str,
+    ctor: &str,
+) -> Result<u64, EmitError> {
+    let field = p.field_id(e, field_name)?;
+    let resolved = e.resolve_ref_one(field);
+    match e.node(resolved) {
+        Node::Lit(Scalar::Int(i)) if *i > 0 => Ok(*i as u64),
+        _ => Err(EmitError::at(
+            field,
+            format!(
+                "{ctor} logdensity needs a fixed-phase positive integer literal for '{field_name}'"
+            ),
+        )),
+    }
+}
+
+/// `log|A|` for an SPD matrix `A`, from an already-computed Cholesky factor
+/// `l = cholesky(A)`: `2 * sum(log(diag(l)))` — see the batch doc comment.
+fn log_det_from_chol(e: &mut Emitter, l: &Value) -> Value {
+    let diag_l = e.diag(l);
+    let log_diag_l = e.log(&diag_l);
+    let sum_log_diag_l = e.reduce_sum(&log_diag_l);
+    let two = e.scalar(2.0);
+    e.mul(&two, &sum_log_diag_l)
+}
+
+/// `tr(A^-1 B)` via the Frobenius identity `tr(A^-1 B) = ||L_A^-1 L_B||_F^2`
+/// (task brief, verbatim): `l_a`/`l_b` are already-computed Cholesky factors
+/// of `A`/`B`. See the batch doc comment for why this needs no matrix
+/// inverse or transposed solve. [`wishart_logpdf`] calls this as
+/// `(l_v, l_x)` for `tr(V^-1 X)`; [`inverse_wishart_logpdf`] as `(l_x,
+/// l_psi)` for `tr(Psi X^-1) = tr(X^-1 Psi)` (trace is cyclic) — see that
+/// function's doc comment.
+fn trace_via_frobenius(e: &mut Emitter, l_a: &Value, l_b: &Value) -> Value {
+    let w = e.tri_solve(l_a, l_b);
+    let w_sq = e.mul(&w, &w);
+    e.reduce_sum(&w_sq)
+}
+
+/// `log Γ_n(a) = (n(n-1)/4) log(pi) + sum_{j=1}^n lgamma(a + (1-j)/2)` (task
+/// brief, verbatim) — see the batch doc comment.
+fn log_mv_gamma(e: &mut Emitter, n: u64, a: &Value) -> Value {
+    let mut acc = e.scalar((n * (n - 1)) as f64 / 4.0 * std::f64::consts::PI.ln());
+    for j in 1..=n {
+        let shift = e.scalar((1.0 - j as f64) / 2.0);
+        let a_j = e.add(a, &shift);
+        let lgamma_j = e.lgamma(&a_j);
+        acc = e.add(&acc, &lgamma_j);
+    }
+    acc
+}
+
+/// `log c_n(eta) = (sum_{k=1}^{n-1} (2 eta - 2 + n - k)(n - k)) log(2) +
+/// sum_{k=1}^{n-1} (n - k) log B(eta + (n-k-1)/2, eta + (n-k-1)/2)`, with
+/// `log B(a, a) = 2 lgamma(a) - lgamma(2a)` (task brief, verbatim) — the LKJ/
+/// LKJCholesky shared normalizer (see the batch doc comment for `n`/`eta`'s
+/// fixed/runtime split). The `log(2)`-exponent sum and the log-beta sum are
+/// accumulated separately across the loop and combined once at the end (one
+/// final `log(2)` multiply, rather than `n-1` of them). For `n = 1` (a
+/// degenerate 1x1 "correlation matrix", always exactly `[1]`) the loop runs
+/// zero times and this correctly returns `log(1) = 0`.
+fn log_cn_lkj(e: &mut Emitter, n: u64, eta: &Value) -> Value {
+    let two = e.scalar(2.0);
+    let two_eta = e.mul(&two, eta);
+
+    let mut pow2_exponent: Option<Value> = None;
+    let mut logbeta_sum: Option<Value> = None;
+    for k in 1..n {
+        let m = n - k;
+        let m_val = e.scalar(m as f64);
+
+        let base_shift = e.scalar(m as f64 - 2.0);
+        let base = e.add(&two_eta, &base_shift); // 2*eta - 2 + m
+        let term = e.mul(&base, &m_val); // (2*eta - 2 + m) * m
+        pow2_exponent = Some(match pow2_exponent {
+            None => term,
+            Some(acc) => e.add(&acc, &term),
+        });
+
+        let a_shift = e.scalar((m as f64 - 1.0) / 2.0);
+        let a = e.add(eta, &a_shift); // eta + (m-1)/2
+        let two_a = e.mul(&two, &a);
+        let lgamma_a = e.lgamma(&a);
+        let two_lgamma_a = e.mul(&two, &lgamma_a);
+        let lgamma_two_a = e.lgamma(&two_a);
+        let logbeta = e.sub(&two_lgamma_a, &lgamma_two_a); // 2 lgamma(a) - lgamma(2a)
+        let m_logbeta = e.mul(&m_val, &logbeta);
+        logbeta_sum = Some(match logbeta_sum {
+            None => m_logbeta,
+            Some(acc) => e.add(&acc, &m_logbeta),
+        });
+    }
+
+    let ln_two = e.scalar(std::f64::consts::LN_2);
+    let term1 = match pow2_exponent {
+        Some(exponent) => e.mul(&exponent, &ln_two),
+        None => e.scalar(0.0),
+    };
+    let term2 = logbeta_sum.unwrap_or_else(|| e.scalar(0.0));
+    e.add(&term1, &term2)
+}
+
+/// Extract element `idx` (0-based) of a rank-1 tensor `vec` as a `Scalar`,
+/// via `stablehlo.slice` + `stablehlo.reshape` — the same idiom
+/// [`slice_indexed_prob`] uses for `Categorical`/`Categorical0`,
+/// reimplemented narrowly here (no bounds-check/refuse plumbing) because
+/// [`lkj_cholesky_logpdf`]'s `idx` always ranges over `0..n` for the ALREADY
+/// statically-known `n` (its own caller's loop bound), never an arbitrary
+/// selector reachable from untrusted FlatPDL.
+fn vector_elem(e: &mut Emitter, vec: &Value, idx: u64) -> Value {
+    let sliced = e.slice(vec, &[idx], &[idx + 1], &[1]);
+    e.reshape(&sliced, MlirTy::Scalar)
+}
+
+/// §08 Wishart, verbatim: `((nu-n-1)/2) log|X| - (1/2) tr(V^-1 X) -
+/// (nu*n/2) log2 - (nu/2) log|V| - logGamma_n(nu/2)`. `n` (the row/column
+/// count of `scale`, i.e. `V`) comes from `scale`'s own statically-known
+/// shape ([`static_square_matrix_dim`]); the variate `X` is then checked
+/// against that same `n` by [`require_matrix_dim`] BEFORE any matrix op
+/// runs — same discipline as [`mvnormal_logpdf`]/[`require_square_cov`]
+/// (Task 12). `L_V = cholesky(V)`/`L_X = cholesky(X)` are each computed ONCE
+/// and reused for both their own `log|.|` term and
+/// [`trace_via_frobenius`]'s `tr(V^-1 X)`; `nu/2` is likewise computed once
+/// and reused for [`log_mv_gamma`]'s argument and its own `log|V|`
+/// coefficient. No `@sample` builder (`sample: None` — no sampler is
+/// planned for this batch).
+fn wishart_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
+    let scale_id = p.field_id(e, "scale")?;
+    let scale = e.lower_node(scale_id)?;
+    let n = static_square_matrix_dim(scale_id, &scale, "Wishart", "scale")?;
+    require_matrix_dim(p.variate_id()?, v, n, "Wishart", "X")?;
+    let nu = p.get(e, "nu")?;
+
+    let l_v = e.cholesky(&scale);
+    let l_x = e.cholesky(v);
+    let log_det_x = log_det_from_chol(e, &l_x);
+    let log_det_v = log_det_from_chol(e, &l_v);
+    let tr = trace_via_frobenius(e, &l_v, &l_x);
+
+    let half = e.scalar(0.5);
+    let n_plus_one = e.scalar(n as f64 + 1.0);
+    let nu_minus_n1 = e.sub(&nu, &n_plus_one); // nu - n - 1
+    let coef1 = e.mul(&half, &nu_minus_n1);
+    let term1 = e.mul(&coef1, &log_det_x); // (nu-n-1)/2 * log|X|
+
+    let neg_half = e.scalar(-0.5);
+    let term2 = e.mul(&neg_half, &tr); // -1/2 * tr(V^-1 X)
+
+    let n_val = e.scalar(n as f64);
+    let nu_n = e.mul(&nu, &n_val);
+    let ln_two = e.scalar(std::f64::consts::LN_2);
+    let nu_n_ln_two = e.mul(&nu_n, &ln_two);
+    let neg_half_nu_n_ln_two = e.mul(&neg_half, &nu_n_ln_two); // -(nu*n/2) * log2
+
+    let half_nu = e.mul(&half, &nu);
+    let neg_half_nu = e.neg(&half_nu);
+    let term4 = e.mul(&neg_half_nu, &log_det_v); // -(nu/2) * log|V|
+
+    let log_mvgamma = log_mv_gamma(e, n, &half_nu);
+    let neg_log_mvgamma = e.neg(&log_mvgamma);
+
+    let t1 = e.add(&term1, &term2);
+    let t2 = e.add(&t1, &neg_half_nu_n_ln_two);
+    let t3 = e.add(&t2, &term4);
+    Ok(e.add(&t3, &neg_log_mvgamma))
+}
+
+/// §08 InverseWishart, verbatim: `(nu/2) log|Psi| - ((nu+n+1)/2) log|X| -
+/// (1/2) tr(Psi X^-1) - (nu*n/2) log2 - logGamma_n(nu/2)`. Same `n`/shape-
+/// guard discipline as [`wishart_logpdf`], reading `n` off `scale` (i.e.
+/// `Psi`) and checking the variate `X` against it. `tr(Psi X^-1)` is
+/// computed as `tr(X^-1 Psi)` instead (trace is cyclic: `tr(AB) = tr(BA)`),
+/// via [`trace_via_frobenius`]`(l_x, l_psi)` — exactly the task brief's
+/// "symmetric" `tr(Psi X^-1) = ||L_X^-1 L_Psi||_F^2` form, so `L_X` (needed
+/// anyway for `log|X|`) doubles as the trace's left Cholesky factor instead
+/// of computing a third one. `nu/2` is reused for [`log_mv_gamma`]'s
+/// argument and the leading `log|Psi|` coefficient, same reuse discipline as
+/// [`wishart_logpdf`]. No `@sample` builder (`sample: None`).
+fn inverse_wishart_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
+    let scale_id = p.field_id(e, "scale")?;
+    let psi = e.lower_node(scale_id)?;
+    let n = static_square_matrix_dim(scale_id, &psi, "InverseWishart", "scale")?;
+    require_matrix_dim(p.variate_id()?, v, n, "InverseWishart", "X")?;
+    let nu = p.get(e, "nu")?;
+
+    let l_psi = e.cholesky(&psi);
+    let l_x = e.cholesky(v);
+    let log_det_psi = log_det_from_chol(e, &l_psi);
+    let log_det_x = log_det_from_chol(e, &l_x);
+    let tr = trace_via_frobenius(e, &l_x, &l_psi); // tr(X^-1 Psi) = tr(Psi X^-1)
+
+    let half = e.scalar(0.5);
+    let half_nu = e.mul(&half, &nu);
+    let term1 = e.mul(&half_nu, &log_det_psi); // (nu/2) * log|Psi|
+
+    let n_plus_one = e.scalar(n as f64 + 1.0);
+    let nu_plus_n1 = e.add(&nu, &n_plus_one); // nu + n + 1
+    let neg_half = e.scalar(-0.5);
+    let neg_half_nu_n1 = e.mul(&neg_half, &nu_plus_n1);
+    let term2 = e.mul(&neg_half_nu_n1, &log_det_x); // -(nu+n+1)/2 * log|X|
+
+    let term3 = e.mul(&neg_half, &tr); // -1/2 * tr(...)
+
+    let n_val = e.scalar(n as f64);
+    let nu_n = e.mul(&nu, &n_val);
+    let ln_two = e.scalar(std::f64::consts::LN_2);
+    let nu_n_ln_two = e.mul(&nu_n, &ln_two);
+    let neg_half_nu_n_ln_two = e.mul(&neg_half, &nu_n_ln_two); // -(nu*n/2) * log2
+
+    let log_mvgamma = log_mv_gamma(e, n, &half_nu);
+    let neg_log_mvgamma = e.neg(&log_mvgamma);
+
+    let t1 = e.add(&term1, &term2);
+    let t2 = e.add(&t1, &term3);
+    let t3 = e.add(&t2, &neg_half_nu_n_ln_two);
+    Ok(e.add(&t3, &neg_log_mvgamma))
+}
+
+/// §08 LKJ, verbatim: `log f = (eta-1) log det(C) - log c_n(eta)`. `n`
+/// (fixed, spec's own explicit dimension kwarg — see the batch doc comment)
+/// is read via [`literal_fixed_positive_int`], then the variate `C` is
+/// checked against it by [`require_matrix_dim`] before `cholesky` runs. No
+/// `@sample` builder (`sample: None`).
+fn lkj_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
+    let n = literal_fixed_positive_int(e, p, "n", "LKJ")?;
+    require_matrix_dim(p.variate_id()?, v, n, "LKJ", "C")?;
+    let eta = p.get(e, "eta")?;
+
+    let l_c = e.cholesky(v);
+    let log_det_c = log_det_from_chol(e, &l_c);
+
+    let one = e.scalar(1.0);
+    let eta_minus_one = e.sub(&eta, &one);
+    let term1 = e.mul(&eta_minus_one, &log_det_c);
+
+    let log_cn = log_cn_lkj(e, n, &eta);
+    let neg_log_cn = e.neg(&log_cn);
+    Ok(e.add(&term1, &neg_log_cn))
+}
+
+/// §08 LKJCholesky, verbatim: `log f = sum_{i=2}^{n} (n-i+2*eta-2) log L_ii -
+/// log c_n(eta)`, `L_ii = diag(L)` (`i` 1-based, spec's own convention — its
+/// 0-based array position is `i-1`, read via [`vector_elem`]). The variate
+/// `L` (already itself the Cholesky factor — unlike [`lkj_logpdf`]'s `C`,
+/// nothing here calls [`Emitter::cholesky`] at all) is checked square/sized
+/// against `n` by [`require_matrix_dim`] before [`Emitter::diag`] runs. No
+/// `@sample` builder (`sample: None`).
+fn lkj_cholesky_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
+    let n = literal_fixed_positive_int(e, p, "n", "LKJCholesky")?;
+    require_matrix_dim(p.variate_id()?, v, n, "LKJCholesky", "L")?;
+    let eta = p.get(e, "eta")?;
+
+    let diag_l = e.diag(v);
+    let two = e.scalar(2.0);
+    let two_eta = e.mul(&two, &eta);
+
+    let mut acc: Option<Value> = None;
+    for i in 2..=n {
+        let l_ii = vector_elem(e, &diag_l, i - 1);
+        let log_l_ii = e.log(&l_ii);
+        let coef_shift = e.scalar(n as f64 - i as f64 - 2.0);
+        let coef = e.add(&two_eta, &coef_shift); // n - i + 2*eta - 2
+        let term = e.mul(&coef, &log_l_ii);
+        acc = Some(match acc {
+            None => term,
+            Some(a) => e.add(&a, &term),
+        });
+    }
+    let sum_terms = acc.unwrap_or_else(|| e.scalar(0.0));
+
+    let log_cn = log_cn_lkj(e, n, &eta);
+    let neg_log_cn = e.neg(&log_cn);
+    Ok(e.add(&sum_terms, &neg_log_cn))
 }
