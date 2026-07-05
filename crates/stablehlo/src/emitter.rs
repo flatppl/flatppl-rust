@@ -26,7 +26,7 @@
 
 use std::collections::HashMap;
 
-use flatppl_core::{CallHead, Module, Node, NodeId, Ref, RefNs, Scalar, Symbol};
+use flatppl_core::{CallHead, Module, Node, NodeId, Ref, RefNs, Scalar, Symbol, ValueSet};
 
 use crate::Dtype;
 use crate::mlir::{MlirTy, Value};
@@ -729,6 +729,19 @@ impl<'m> Emitter<'m> {
     /// Resolve an interned name. A narrow accessor mirroring [`Emitter::node`].
     pub(crate) fn resolve(&self, sym: Symbol) -> &str {
         self.m.resolve(sym)
+    }
+
+    /// Resolve a node's statically-known [`ValueSet`] (spec §03), read
+    /// straight from the FlatPDL module's `Module::valueset_of` side table.
+    /// A narrow accessor mirroring [`Emitter::node`]/[`Emitter::resolve`] —
+    /// used by `registry::uniform_logpdf` to inspect a `support` set
+    /// expression's closed-form Lebesgue measure (e.g. an `interval(lo,
+    /// hi)` call's inferred `ValueSet::Interval(lo, hi)`) without lowering
+    /// it as a tensor: a set expression has no tensor form of its own (see
+    /// `ops::lower_in`'s identical structural, not-a-tensor treatment of
+    /// `in`'s second argument).
+    pub(crate) fn valueset_of(&self, id: NodeId) -> Option<&ValueSet> {
+        self.m.valueset_of(id)
     }
 
     /// Lower one FlatPDL node to a [`Value`], memoizing the result so a

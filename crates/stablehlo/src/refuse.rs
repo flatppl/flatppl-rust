@@ -80,6 +80,9 @@
 //!   (`tests/golden.rs`), reached via any of `Cauchy`/`Logistic`/`Laplace`
 //!   (Task 8's `@logdensity`-only entries; their `@sample` builders land in
 //!   Task 14).
+//! - `Uniform`'s `support` parameter has no closed-form measurable
+//!   interval/box `ValueSet` (`registry::lebesgue_measure` returns `None`) —
+//!   "Uniform logpdf needs a measurable interval/box support" (Task 10).
 //!
 //! **`types.rs`** (`mlir_type_of`):
 //! - a node with no inferred type at all — "node has no inferred type"
