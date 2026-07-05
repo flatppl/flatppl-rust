@@ -605,14 +605,18 @@ impl<'m> Emitter<'m> {
     }
 
     /// Solve the lower-triangular system `l @ y = b` for `y`, via
-    /// `stablehlo.triangular_solve` (`l: [n, n]`, `b: [n]` -> `y: [n]`).
-    /// Shape-generic in `b`: `stablehlo.triangular_solve` also accepts a
-    /// MATRIX right-hand side (`b: [n, n]` -> `y: [n, n]`, solving `l @ Y =
-    /// B` column-by-column) — `y`'s result type is always `b.ty` unchanged,
-    /// never hardcoded to rank-1, which is what lets `registry.rs`'s
-    /// `trace_via_frobenius` (Task 13, Wishart/InverseWishart) call this
-    /// with a matrix `b` to compute `W = tri_solve(L_A, L_B)` for `tr(A^-1
-    /// B)`. `triangular_solve` has no pretty form, so this emits its parser-
+    /// `stablehlo.triangular_solve` (`l: [n, n]`, `b: [n, k]` -> `y: [n,
+    /// k]`). `b` must be a rank-2 MATRIX right-hand side — the real
+    /// StableHLO parser (jax 0.10.2's `ir.Module.parse`) rejects a rank-1 `b`
+    /// outright, unlike genuinely rank-generic ops such as [`Emitter::mul`];
+    /// `k = n` solves `l @ Y = B` column-by-column (`registry.rs`'s
+    /// `trace_via_frobenius`, Task 13 Wishart/InverseWishart, calls this with
+    /// a square matrix `b`), and `k = 1` solves for a single vector reshaped
+    /// to a `[n, 1]` column (`registry.rs`'s `mvnormal_logpdf`, Task 12,
+    /// reshapes `x-mu` to `[n, 1]` before calling this and reshapes the
+    /// `[n, 1]` result back to `[n]` afterwards — this fn does not reshape
+    /// for the caller). `y`'s result type is always `b.ty` unchanged.
+    /// `triangular_solve` has no pretty form, so this emits its parser-
     /// validated *generic* form verbatim (quoted op name, `<{...}>`
     /// properties dict: `left_side`/`lower`/`unit_diagonal`/`transpose_a`).
     pub fn tri_solve(&mut self, l: &Value, b: &Value) -> Value {

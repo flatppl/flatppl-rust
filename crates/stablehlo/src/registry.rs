@@ -1605,6 +1605,17 @@ fn require_square_cov(blame: NodeId, cov: &Value, n: u64) -> Result<(), EmitErro
 /// `n` by [`require_square_cov`] BEFORE any matrix op runs — neither
 /// `cholesky` nor `tri_solve` validates `cov`'s shape itself (see that
 /// function's doc comment), so this builder must.
+///
+/// `stablehlo.triangular_solve`'s real parser (jax 0.10.2's `ir.Module.parse`)
+/// rejects a rank-1 RHS outright — unlike [`Emitter::matvec`]/[`Emitter::mul`],
+/// which are genuinely rank-generic, `triangular_solve` requires its `b`
+/// operand to be a MATRIX (`[n, k]`), even when solving for a single vector
+/// (`k = 1`). So `x-mu` (a `[n]` vector) is [`Emitter::reshape`]d to `[n, 1]`
+/// before `tri_solve`, and the `[n, 1]` result reshaped straight back to
+/// `[n]` before squaring/summing — the quadratic form is otherwise unchanged,
+/// and reshaping `y` back to rank-1 (rather than reducing the `[n, 1]` result
+/// directly) keeps `reduce_sum`'s single-`reduce_axis` shape, matching this
+/// builder's frozen golden/structural op counts exactly.
 fn mvnormal_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
     let mu_id = p.field_id(e, "mu")?;
     let mu = e.lower_node(mu_id)?;
@@ -1623,7 +1634,11 @@ fn mvnormal_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, Emit
     let neg_half_log_det = e.mul(&neg_half, &log_det);
 
     let diff = e.sub(v, &mu);
-    let y = e.tri_solve(&l, &diff);
+    let vec_ty = MlirTy::Ranked(vec![Some(n)]);
+    let col_ty = MlirTy::Ranked(vec![Some(n), Some(1)]);
+    let diff_col = e.reshape(&diff, col_ty);
+    let y_col = e.tri_solve(&l, &diff_col);
+    let y = e.reshape(&y_col, vec_ty);
     let y_sq = e.mul(&y, &y);
     let quad = e.reduce_sum(&y_sq);
     let neg_half_quad = e.mul(&neg_half, &quad);

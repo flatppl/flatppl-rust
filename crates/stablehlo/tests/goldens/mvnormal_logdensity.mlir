@@ -21,14 +21,16 @@ module {
     %18 = stablehlo.constant dense<-0.5> : tensor<f32>
     %19 = stablehlo.multiply %18, %17 : tensor<f32>
     %20 = stablehlo.subtract %4, %arg0 : tensor<2xf32>
-    %21 = "stablehlo.triangular_solve"(%5, %20) <{left_side = true, lower = true, unit_diagonal = false, transpose_a = #stablehlo<transpose NO_TRANSPOSE>}> : (tensor<2x2xf32>, tensor<2xf32>) -> tensor<2xf32>
-    %22 = stablehlo.multiply %21, %21 : tensor<2xf32>
-    %23 = stablehlo.constant dense<0.000000e+00> : tensor<f32>
-    %24 = stablehlo.reduce(%22 init: %23) applies stablehlo.add across dimensions = [0] : (tensor<2xf32>, tensor<f32>) -> tensor<f32>
-    %25 = stablehlo.multiply %18, %24 : tensor<f32>
-    %26 = stablehlo.constant dense<-1.8378770664093453> : tensor<f32>
-    %27 = stablehlo.add %26, %19 : tensor<f32>
-    %28 = stablehlo.add %27, %25 : tensor<f32>
-    return %28 : tensor<f32>
+    %21 = stablehlo.reshape %20 : (tensor<2xf32>) -> tensor<2x1xf32>
+    %22 = "stablehlo.triangular_solve"(%5, %21) <{left_side = true, lower = true, unit_diagonal = false, transpose_a = #stablehlo<transpose NO_TRANSPOSE>}> : (tensor<2x2xf32>, tensor<2x1xf32>) -> tensor<2x1xf32>
+    %23 = stablehlo.reshape %22 : (tensor<2x1xf32>) -> tensor<2xf32>
+    %24 = stablehlo.multiply %23, %23 : tensor<2xf32>
+    %25 = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+    %26 = stablehlo.reduce(%24 init: %25) applies stablehlo.add across dimensions = [0] : (tensor<2xf32>, tensor<f32>) -> tensor<f32>
+    %27 = stablehlo.multiply %18, %26 : tensor<f32>
+    %28 = stablehlo.constant dense<-1.8378770664093453> : tensor<f32>
+    %29 = stablehlo.add %28, %19 : tensor<f32>
+    %30 = stablehlo.add %29, %27 : tensor<f32>
+    return %30 : tensor<f32>
   }
 }
