@@ -3907,6 +3907,59 @@ lp = logdensityof(lawof(record(a = a)), record(a = [0.2, 0.1]))
     );
 }
 
+/// A `cov` that is square but the WRONG size for `mu`'s length (`mu`: length
+/// 2, `cov`: `[3, 3]`) must refuse precisely, not emit
+/// operand-shape-incompatible `stablehlo.triangular_solve` (the previous
+/// behavior: `cholesky`/`diag` both accept a `[3, 3]` operand — `cholesky`
+/// validates nothing, `diag` only checks rank 2 — so the mismatch only
+/// surfaced at the final `tri_solve(L, x-mu)` against a length-2 `x-mu`).
+#[test]
+fn mvnormal_logpdf_refuses_wrong_size_square_cov() {
+    let src = "\
+mu = elementof(cartpow(reals, 2))
+cov = elementof(cartpow(reals, [3, 3]))
+a = draw(MvNormal(mu = mu, cov = cov))
+lp = logdensityof(lawof(record(a = a)), record(a = [0.2, 0.1]))
+";
+    let d = determinize_src(src);
+    let err = flatppl_stablehlo::emit(
+        &d,
+        flatppl_stablehlo::Mode::LogDensity,
+        &flatppl_stablehlo::EmitOptions::default(),
+    )
+    .unwrap_err();
+    assert!(
+        err.msg.contains("MvNormal cov must be an"),
+        "unexpected message: {}",
+        err.msg
+    );
+}
+
+/// A non-square `cov` (`mu`: length 2, `cov`: `[2, 3]`) must refuse
+/// precisely, not reach `stablehlo.cholesky` on a non-square operand (no
+/// real StableHLO consumer accepts that).
+#[test]
+fn mvnormal_logpdf_refuses_nonsquare_cov() {
+    let src = "\
+mu = elementof(cartpow(reals, 2))
+cov = elementof(cartpow(reals, [2, 3]))
+a = draw(MvNormal(mu = mu, cov = cov))
+lp = logdensityof(lawof(record(a = a)), record(a = [0.2, 0.1]))
+";
+    let d = determinize_src(src);
+    let err = flatppl_stablehlo::emit(
+        &d,
+        flatppl_stablehlo::Mode::LogDensity,
+        &flatppl_stablehlo::EmitOptions::default(),
+    )
+    .unwrap_err();
+    assert!(
+        err.msg.contains("MvNormal cov must be an"),
+        "unexpected message: {}",
+        err.msg
+    );
+}
+
 /// The Task-12 Dirichlet anchor fixture: a length-3 free `alpha`, scored at a
 /// pinned length-3 observation on the simplex.
 const DIRICHLET_DENSITY_SRC: &str = "\

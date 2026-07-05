@@ -1311,6 +1311,31 @@ fn static_vector_len(blame: NodeId, v: &Value) -> Result<u64, EmitError> {
     }
 }
 
+/// `cov`'s `MlirTy` must be a square `n`x`n` matrix, matching `mu`'s own
+/// statically-known length `n` — a refusal, not a downstream panic
+/// (refuse-don't-mislower). Neither [`Emitter::cholesky`] nor
+/// [`Emitter::tri_solve`] checks this: `cholesky` renders `a.ty` verbatim
+/// with no shape validation at all, and [`Emitter::diag`] only asserts rank
+/// 2 (`dims.len() == 2`), never `dims[0] == dims[1]` — so a wrong-size square
+/// `cov` (e.g. `[3, 3]` against a length-2 `mu`) sails through `cholesky`/
+/// `diag` and only produces operand-shape-incompatible StableHLO at the
+/// final `tri_solve(L, x-mu)`, and a non-square `cov` (e.g. `[2, 3]`) reaches
+/// `stablehlo.cholesky` on a non-square operand — neither is valid input to
+/// any real StableHLO consumer. This guard catches both shapes up front.
+fn require_square_cov(blame: NodeId, cov: &Value, n: u64) -> Result<(), EmitError> {
+    match &cov.ty {
+        MlirTy::Ranked(dims) if dims.len() == 2 && dims[0] == Some(n) && dims[1] == Some(n) => {
+            Ok(())
+        }
+        other => Err(EmitError::at(
+            blame,
+            format!(
+                "MvNormal cov must be an {n}x{n} matrix matching mu's length {n}, got {other:?}"
+            ),
+        )),
+    }
+}
+
 /// §08 MvNormal, verbatim: `log f = -(n/2)*log(2*pi) - 1/2*log|Sigma| -
 /// 1/2*(x-mu)^T Sigma^-1 (x-mu)`, with `L = cholesky(Sigma)` (lower),
 /// `log|Sigma| = 2 * sum(log(diag(L)))`, and the quadratic form via `y =
@@ -1319,15 +1344,18 @@ fn static_vector_len(blame: NodeId, v: &Value) -> Result<u64, EmitError> {
 /// matrix inverse has no `Emitter` helper, and solving the triangular system
 /// `L y = (x-mu)` is the numerically standard way to get the same quadratic
 /// form). `n`, the vector length, comes from `mu`'s own statically-known
-/// shape ([`static_vector_len`]) — not `cov`'s: [`Emitter::diag`] already
-/// panics on a non-square `cov` (an internal invariant violation, per that
-/// method's own doc comment), so this builder does not re-check `cov`
-/// separately. No `@sample` builder yet (`sample: None`; Task 14).
+/// shape ([`static_vector_len`]); `cov` is then checked against that same
+/// `n` by [`require_square_cov`] BEFORE any matrix op runs — neither
+/// `cholesky` nor `tri_solve` validates `cov`'s shape itself (see that
+/// function's doc comment), so this builder must. No `@sample` builder yet
+/// (`sample: None`; Task 14).
 fn mvnormal_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
     let mu_id = p.field_id(e, "mu")?;
     let mu = e.lower_node(mu_id)?;
-    let cov = p.get(e, "cov")?;
+    let cov_id = p.field_id(e, "cov")?;
+    let cov = e.lower_node(cov_id)?;
     let n = static_vector_len(mu_id, &mu)?;
+    require_square_cov(cov_id, &cov, n)?;
 
     let l = e.cholesky(&cov);
     let diag_l = e.diag(&l);
