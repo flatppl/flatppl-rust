@@ -14,11 +14,18 @@
 //!
 //! Task 2 adds the `Type`/`Dim` → MLIR `tensor<…>` mapping ([`mlir_type_of`],
 //! [`MlirTy`]) that every later emitter task builds SSA values on top of.
+//!
+//! Task 3 adds [`Emitter`]: SSA bookkeeping, the `NodeId` → `Value` memo map,
+//! and the typed op-helper API (elementary ops, CHLO special functions,
+//! reductions, matrix helpers, and `finish`'s module/func assembly) that
+//! Task 4's node-dispatch lowering is built on top of.
 
+mod emitter;
 mod mlir;
 mod refuse;
 mod types;
 
+pub use emitter::Emitter;
 pub use mlir::{MlirTy, Value};
 pub use refuse::EmitError;
 pub use types::mlir_type_of;
