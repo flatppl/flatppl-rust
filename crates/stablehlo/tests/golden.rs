@@ -139,3 +139,16 @@ fn mlir_type_of_refuses_residual_measure_layer_types() {
     assert!(err.msg.contains("residual measure-layer type in FlatPDL"));
     assert_eq!(err.node, Some(id));
 }
+
+#[test]
+fn mlir_type_of_refuses_other_types_naming_the_type() {
+    // `RngState` hits the catch-all arm (neither aggregate nor
+    // measure-layer) — the refusal must name the offending type via its
+    // `Debug` form, not just say "no MLIR tensor form" with no detail.
+    let mut m = Module::new();
+    let id = placeholder(&mut m, Type::RngState);
+    let err = mlir_type_of(&m, id, Dtype::F32).unwrap_err();
+    assert!(err.msg.contains("type has no MLIR tensor form"));
+    assert!(err.msg.contains("RngState"));
+    assert_eq!(err.node, Some(id));
+}

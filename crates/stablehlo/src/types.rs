@@ -43,14 +43,7 @@ pub fn mlir_type_of(m: &Module, id: NodeId, _dtype: Dtype) -> Result<MlirTy, Emi
             flatten_elem(id, elem, &mut dims)?;
             Ok(MlirTy::Ranked(dims))
         }
-        Type::Record(_) | Type::Tuple(_) | Type::Table { .. } => Err(EmitError::at(
-            id,
-            "aggregate type has no tensor form; must be destructured",
-        )),
-        Type::Measure { .. } | Type::Kernel { .. } | Type::Likelihood { .. } => {
-            Err(EmitError::at(id, "residual measure-layer type in FlatPDL"))
-        }
-        _ => Err(EmitError::at(id, "type has no MLIR tensor form")),
+        _ => Err(refuse_non_tensor(id, ty)),
     }
 }
 
@@ -69,14 +62,26 @@ fn flatten_elem(id: NodeId, elem: &Type, dims: &mut Vec<Option<u64>>) -> Result<
             dims.push(dim_to_mlir(len));
             flatten_elem(id, elem, dims)
         }
-        Type::Record(_) | Type::Tuple(_) | Type::Table { .. } => Err(EmitError::at(
+        _ => Err(refuse_non_tensor(id, elem)),
+    }
+}
+
+/// Shared refusal for any FlatPDL `Type` with no MLIR tensor form, localized
+/// to `id`. Used by both [`mlir_type_of`] and [`flatten_elem`] so the three
+/// diagnostics (aggregate / residual measure-layer / catch-all) stay in one
+/// place. The catch-all names the offending type via `Debug` — `Type`
+/// carries no interner-backed names, so this is the only precise identifier
+/// available without a `Module` reference.
+fn refuse_non_tensor(id: NodeId, ty: &Type) -> EmitError {
+    match ty {
+        Type::Record(_) | Type::Tuple(_) | Type::Table { .. } => EmitError::at(
             id,
             "aggregate type has no tensor form; must be destructured",
-        )),
+        ),
         Type::Measure { .. } | Type::Kernel { .. } | Type::Likelihood { .. } => {
-            Err(EmitError::at(id, "residual measure-layer type in FlatPDL"))
+            EmitError::at(id, "residual measure-layer type in FlatPDL")
         }
-        _ => Err(EmitError::at(id, "type has no MLIR tensor form")),
+        _ => EmitError::at(id, format!("type has no MLIR tensor form: {ty:?}")),
     }
 }
 
