@@ -635,6 +635,128 @@ fn lower_logsumexp_emits_stable_shift_by_max_formula_in_order() {
     assert!(is_delimiter_balanced(&out));
 }
 
+/// The REAL shape the determiniser emits (superpose/discrete-marginal):
+/// `logsumexp(vector(t1, t2))`, built as an actual `vector(...)` call node —
+/// not a pre-`bind`ed synthetic tensor. Must emit `stablehlo.concatenate`
+/// (packing the two scalar elements into a length-2 tensor) before the
+/// stable logsumexp formula.
+#[test]
+fn lower_logsumexp_of_vector_emits_concatenate_then_stable_formula() {
+    let mut m = Module::new();
+    let t1 = local_ref(&mut m, "t1");
+    let t2 = local_ref(&mut m, "t2");
+    let vec_node = call(&mut m, "vector", &[t1, t2]);
+    let node = call(&mut m, "logsumexp", &[vec_node]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    e.bind(
+        t1,
+        Value {
+            ssa: "%arg0".to_string(),
+            ty: MlirTy::Scalar,
+        },
+    );
+    e.bind(
+        t2,
+        Value {
+            ssa: "%arg1".to_string(),
+            ty: MlirTy::Scalar,
+        },
+    );
+    let result = e.lower_node(node).unwrap();
+    assert_eq!(result.ty, MlirTy::Scalar);
+    let out = e.finish(
+        "f",
+        &[
+            ("%arg0".to_string(), MlirTy::Scalar),
+            ("%arg1".to_string(), MlirTy::Scalar),
+        ],
+        &result,
+    );
+
+    let concat_pos = out
+        .find("stablehlo.concatenate")
+        .expect("missing concatenate");
+    let max_pos = out
+        .find("applies stablehlo.maximum across dimensions")
+        .expect("missing max reduce");
+    let sub_pos = out.find("stablehlo.subtract").expect("missing subtract");
+    let exp_pos = out
+        .find("stablehlo.exponential")
+        .expect("missing exponential");
+    let sum_pos = out
+        .find("applies stablehlo.add across dimensions")
+        .expect("missing sum reduce");
+    let log_pos = out.find("stablehlo.log").expect("missing log");
+
+    assert!(concat_pos < max_pos, "concatenate before max, in:\n{out}");
+    assert!(max_pos < sub_pos, "max before subtract, in:\n{out}");
+    assert!(sub_pos < exp_pos, "subtract before exp, in:\n{out}");
+    assert!(exp_pos < sum_pos, "exp before sum reduce, in:\n{out}");
+    assert!(sum_pos < log_pos, "sum reduce before log, in:\n{out}");
+    assert!(
+        out.contains("dim = 0"),
+        "missing concatenate dim attr in:\n{out}"
+    );
+    assert!(
+        out.contains("-> tensor<2xf32>"),
+        "missing concatenate result shape in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// `sum(a)` (histfactory's `sum(broadcast(builtin_logdensityof, …))`) is a
+/// full reduction to a scalar, identical to `Emitter::reduce_sum`.
+#[test]
+fn lower_sum_reduces_to_scalar_via_reduce_sum() {
+    let mut m = Module::new();
+    let v = local_ref(&mut m, "v");
+    let node = call(&mut m, "sum", &[v]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    e.bind(
+        v,
+        Value {
+            ssa: "%arg0".to_string(),
+            ty: MlirTy::Ranked(vec![Some(3)]),
+        },
+    );
+    let result = e.lower_node(node).unwrap();
+    assert_eq!(result.ty, MlirTy::Scalar);
+    let out = e.finish(
+        "f",
+        &[("%arg0".to_string(), MlirTy::Ranked(vec![Some(3)]))],
+        &result,
+    );
+    assert!(
+        out.contains("applies stablehlo.add across dimensions"),
+        "missing pretty-form add reduce in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// `ifelse(true, a, b)` — a bare bool-literal condition, not an `in`/
+/// `compare` predicate — must refuse rather than let `select` render an
+/// ill-typed `i1` predicate operand against a `Lit(Bool)`'s actual
+/// `tensor<f32>` lowering.
+#[test]
+fn lower_ifelse_refuses_non_predicate_condition() {
+    let mut m = Module::new();
+    let cond = m.alloc(Node::Lit(Scalar::Bool(true)));
+    let a = real(&mut m, 1.0);
+    let b = real(&mut m, 2.0);
+    let node = call(&mut m, "ifelse", &[cond, a, b]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    let err = e.lower_node(node).unwrap_err();
+    assert!(
+        err.msg.contains("boolean predicate"),
+        "unexpected message: {}",
+        err.msg
+    );
+    assert_eq!(err.node, Some(cond));
+}
+
 /// `in(v, interval(lo, hi))` with a scalar `v` (matching lo/hi's shape)
 /// reduces to a single `compare` — two `subtract`s and one `multiply`, no
 /// `broadcast_in_dim` (shapes already match).

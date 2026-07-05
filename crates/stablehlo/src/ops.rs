@@ -52,6 +52,8 @@ pub(crate) fn lower_builtin(
         "ifelse" => lower_ifelse(e, id, args),
         "inf" => lower_inf(e, id, args),
         "logsumexp" => lower_logsumexp(e, id, args),
+        "vector" => lower_vector(e, id, args),
+        "sum" => unary(e, id, args, Emitter::reduce_sum),
         "get0" => lower_get(e, id, args, 0),
         "get" => lower_get(e, id, args, 1),
         "in" => lower_in(e, id, args),
@@ -101,10 +103,38 @@ fn binary<'m>(
 
 fn lower_ifelse(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
     let [c, a, b] = args_exact(id, args)?;
+    require_predicate_head(e, c)?;
     let c = e.lower_node(c)?;
     let a = e.lower_node(a)?;
     let b = e.lower_node(b)?;
     Ok(e.select(&c, &a, &b))
+}
+
+/// `ifelse`'s condition must be a predicate-producing builtin call (`in`, or
+/// a future `compare`) — [`Emitter::select`] unconditionally renders its
+/// predicate operand as `i1`, so handing it any other node (e.g. a bare
+/// `Lit(Bool)`, which lowers as a plain `tensor<f32>` `dense<1.0>` via
+/// `constant`) would make `select`'s declared `i1` operand disagree with
+/// `c`'s actual emitted type, producing ill-typed StableHLO. Same
+/// narrow-and-refuse discipline as `get`/`get0`'s literal-selector check:
+/// checked structurally against the *unlowered* condition node, before
+/// `lower_node` ever runs on it.
+fn require_predicate_head(e: &Emitter, cond: NodeId) -> Result<(), EmitError> {
+    let is_predicate = matches!(
+        e.node(cond),
+        Node::Call(c) if matches!(
+            c.head,
+            CallHead::Builtin(sym) if matches!(e.resolve(sym), "in" | "compare")
+        )
+    );
+    if is_predicate {
+        Ok(())
+    } else {
+        Err(EmitError::at(
+            cond,
+            "ifelse condition must be a boolean predicate (in/compare)",
+        ))
+    }
 }
 
 fn lower_inf(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
@@ -114,11 +144,13 @@ fn lower_inf(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, Emit
 
 // ---- logsumexp ---------------------------------------------------------------
 
-/// `logsumexp(v)` (spec §07; the determiniser always wraps its argument in a
-/// single real vector literal, `logsumexp([v])`, but that is just how `v`'s
-/// `NodeId` was built upstream — this only ever sees the one already-
-/// resolved argument node) via the numerically-stable shift-by-max identity:
-/// `log(Σ exp(v - max(v))) + max(v)`. `max(v)`/`Σ` reduce to a `Scalar`;
+/// `logsumexp(v)` (spec §07) via the numerically-stable shift-by-max
+/// identity: `log(Σ exp(v - max(v))) + max(v)`. The determiniser always
+/// wraps its argument in a `vector(t1, …, tk)` call (superpose/discrete-
+/// marginal); `lower_node`'s `"vector"` head (below, [`Emitter::vector`])
+/// is what turns that into the rank-1 tensor `v` this function reduces
+/// over — this function itself only ever sees the one already-resolved
+/// argument node, whatever built it. `max(v)`/`Σ` reduce to a `Scalar`;
 /// `v - max(v)` needs `max(v)` broadcast back up to `v`'s shape first
 /// (StableHLO's elementwise ops require identical operand shapes — no
 /// implicit scalar broadcast).
@@ -153,6 +185,25 @@ fn broadcast_to(e: &mut Emitter, id: NodeId, a: &Value, ty: &MlirTy) -> Result<V
             format!("shape mismatch: cannot broadcast {:?} to {ty:?}", a.ty),
         ))
     }
+}
+
+// ---- vector -------------------------------------------------------------------
+
+/// `vector(t1, …, tk)` (spec §07 vector literal): packs `k` already-lowered
+/// scalar elements into a rank-1 tensor via [`Emitter::vector`]. The
+/// determiniser emits this wrapping a `logsumexp` argument (superpose/
+/// discrete-marginal); refuses on zero elements (`concatenate` needs at
+/// least one operand, and `Emitter::vector` asserts on that as an internal
+/// invariant, not a well-formed-but-empty case worth tolerating here).
+fn lower_vector(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
+    if args.is_empty() {
+        return Err(EmitError::at(id, "vector: expected at least one element"));
+    }
+    let elems: Vec<Value> = args
+        .iter()
+        .map(|&a| e.lower_node(a))
+        .collect::<Result<_, _>>()?;
+    Ok(e.vector(&elems))
 }
 
 // ---- get / get0 ---------------------------------------------------------------

@@ -324,6 +324,41 @@ impl<'m> Emitter<'m> {
         Value { ssa, ty }
     }
 
+    /// `%N = stablehlo.concatenate %a, %b, ..., dim = 0 : (op1_ty, op2_ty,
+    /// ...) -> result_ty` — packs `elems` (each expected to be a `Scalar`)
+    /// into a rank-1 tensor of length `elems.len()`: every element is first
+    /// `reshape`d to `tensor<1x...>`, then concatenated along dim 0. Used by
+    /// `logsumexp(vector(t1, …, tk))` (superpose/discrete-marginal) to build
+    /// the rank-1 tensor `logsumexp` reduces over. Parser-validated against
+    /// the real StableHLO parser (jax 0.10.2): `stablehlo.concatenate %a,
+    /// %b, dim = 0 : (tensor<1xf32>, tensor<1xf32>) -> tensor<2xf32>`.
+    pub fn vector(&mut self, elems: &[Value]) -> Value {
+        assert!(!elems.is_empty(), "vector: expected at least one element");
+        let reshaped: Vec<Value> = elems
+            .iter()
+            .map(|v| self.reshape(v, MlirTy::Ranked(vec![Some(1)])))
+            .collect();
+        let result_ty = MlirTy::Ranked(vec![Some(reshaped.len() as u64)]);
+
+        let operand_ssas = reshaped
+            .iter()
+            .map(|v| v.ssa.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let operand_tys = reshaped
+            .iter()
+            .map(|v| v.ty.render(self.dtype))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let result_ty_text = result_ty.render(self.dtype);
+
+        let ssa = self.fresh();
+        self.push(&format!(
+            "{ssa} = stablehlo.concatenate {operand_ssas}, dim = 0 : ({operand_tys}) -> {result_ty_text}"
+        ));
+        Value { ssa, ty: result_ty }
+    }
+
     // ---- CHLO special functions ------------------------------------------
 
     /// `%N = chlo.lgamma %a : in_ty -> out_ty` — the log-gamma function.
