@@ -17,12 +17,12 @@
 //!     single input binds to the `cat` of all prior slices.
 
 use crate::density::{
-    build_call, build_density_term, draw_argument, expect_builtin_call, fold_add, refuse,
-    resolve_ref_one,
+    MEASURE_COMBINATOR_OPS, build_call, build_density_term, builtin_name, draw_argument,
+    expect_builtin_call, fold_add, resolve_ref_one,
 };
 use crate::kernel::{Kernel, resolve_kernel, substitute_ref};
 use crate::refuse::RefuseError;
-use flatppl_core::{CallHead, Module, NamedKind, Node, NodeId, Scalar, Symbol};
+use flatppl_core::{Module, NamedKind, Node, NodeId, Scalar, Symbol};
 
 /// A resolved single-draw component: its variate field name (record-form) or
 /// `None` (scalar-cat), and its distribution constructor. Kernel inputs are
@@ -40,7 +40,7 @@ pub(crate) fn lower_jointchain(
 ) -> Result<NodeId, RefuseError> {
     let args: Vec<NodeId> = {
         let c = expect_builtin_call(m, node, "jointchain")
-            .ok_or_else(|| refuse(node, m, "expected jointchain"))?;
+            .ok_or_else(|| refuse_jc(node, "expected jointchain"))?;
         if !c.named.is_empty() {
             return Err(refuse_jc(
                 node,
@@ -134,8 +134,8 @@ fn lower_record_family(
 }
 
 /// Resolve the jointchain base `args[0]` to a `Component`. Accepts
-/// `lawof(record(f = <draw>))` (record family) or `lawof(<draw>)` /
-/// `lawof(record())`-free scalar draw (scalar family).
+/// `lawof(record(f = <draw>))` (record family) or `lawof(<draw>)` — a bare
+/// scalar draw with no record wrapper (scalar family).
 fn resolve_base(m: &Module, base_arg: NodeId) -> Option<Component> {
     let (resolved, _) = resolve_ref_one(m, base_arg);
     let inner = match expect_builtin_call(m, resolved, "lawof") {
@@ -156,7 +156,13 @@ fn resolve_kernel_component(m: &Module, kernel: &Kernel) -> Option<Component> {
 /// Peel an optional single-field `record(f = X)` wrapper, then an optional
 /// `draw(dist)`, to a builtin distribution constructor. Returns
 /// `(Some(field), dist)` for the record form, `(None, dist)` for a bare scalar
-/// draw. `None` for a multi-field record, positional record, or non-constructor.
+/// draw. `None` for a multi-field record, positional record, non-constructor,
+/// or a measure-COMBINATOR call (e.g. `superpose(...)`) — a combinator is a
+/// builtin call too, but it is not a single primitive draw, so treating it as
+/// one here would let a `resolve_base`/`resolve_kernel_component` caller
+/// silently mis-lower it as a leaf distribution instead of refusing (and,
+/// worse, a downstream refusal would then name the inner combinator instead
+/// of `jointchain`).
 fn resolve_single_draw(m: &Module, expr: NodeId) -> Option<(Option<Symbol>, NodeId)> {
     let (resolved, _) = resolve_ref_one(m, expr);
     let (inner, field) = if let Some(rec) = expect_builtin_call(m, resolved, "record") {
@@ -174,7 +180,8 @@ fn resolve_single_draw(m: &Module, expr: NodeId) -> Option<(Option<Symbol>, Node
         Some(d) => resolve_ref_one(m, d).0,
         None => inner,
     };
-    if !matches!(m.node(dist), Node::Call(c) if matches!(c.head, CallHead::Builtin(_))) {
+    let name = builtin_name(m, dist)?;
+    if MEASURE_COMBINATOR_OPS.contains(&name) {
         return None;
     }
     Some((field, dist))
