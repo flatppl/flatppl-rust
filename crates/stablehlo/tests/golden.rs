@@ -5275,3 +5275,68 @@ fn emit_sample_dirichlet_matches_frozen_golden() {
         "emitted @sample drifted from the frozen golden (tests/goldens/dirichlet_sample.mlir)"
     );
 }
+
+/// The `emit_sample` mirror of `mvnormal_logpdf_refuses_dynamic_vector_length`:
+/// an `alpha` whose vector length is NOT statically known (`cartpow(posreals,
+/// m)` for a free `m`, not a literal size) must refuse precisely — `n` is
+/// unrolled into `n` separate Gamma draws at emit time (one [`draw_gamma`]
+/// call per component), so a dynamic length has no lowering, not merely an
+/// inconvenient one.
+#[test]
+fn dirichlet_sample_refuses_dynamic_vector_length() {
+    let src = "\
+m = elementof(posintegers)
+alpha = elementof(cartpow(posreals, m))
+s = rnginit(0)
+x = draw(Dirichlet(alpha = alpha))
+draws = rand(s, lawof(x))
+";
+    let d = determinize_src(src);
+    let err = flatppl_stablehlo::emit(
+        &d,
+        flatppl_stablehlo::Mode::Sample,
+        &flatppl_stablehlo::EmitOptions::default(),
+    )
+    .unwrap_err();
+    assert!(
+        err.msg
+            .contains("Dirichlet sample needs a statically-known vector length"),
+        "unexpected message: {}",
+        err.msg
+    );
+    assert!(
+        err.node.is_some(),
+        "expected the refusal localized to the 'alpha' node, got node: None"
+    );
+}
+
+/// The `emit_sample` mirror of `mvnormal_logpdf_refuses_dynamic_vector_length`
+/// for rank, not length: a rank-2 `alpha` (`cartpow(posreals, [2, 2])`) must
+/// refuse precisely, not reach [`vector_elem`]'s slice+reshape idiom on an
+/// operand it was never built to accept.
+#[test]
+fn dirichlet_sample_refuses_nonrank1_alpha() {
+    let src = "\
+alpha = elementof(cartpow(posreals, [2, 2]))
+s = rnginit(0)
+x = draw(Dirichlet(alpha = alpha))
+draws = rand(s, lawof(x))
+";
+    let d = determinize_src(src);
+    let err = flatppl_stablehlo::emit(
+        &d,
+        flatppl_stablehlo::Mode::Sample,
+        &flatppl_stablehlo::EmitOptions::default(),
+    )
+    .unwrap_err();
+    assert!(
+        err.msg
+            .contains("Dirichlet sample: 'alpha' must be a rank-1 vector"),
+        "unexpected message: {}",
+        err.msg
+    );
+    assert!(
+        err.node.is_some(),
+        "expected the refusal localized to the 'alpha' node, got node: None"
+    );
+}

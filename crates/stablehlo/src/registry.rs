@@ -2161,12 +2161,17 @@ fn lkj_cholesky_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, 
 // — matching `jax.random.gamma`, correct for every `alpha > 0` with no
 // emit-time case split (verified distributionally, Task 15 report).
 //
-// Independence caveat (shared with every multi-`rng` sampler in this vertical,
-// e.g. Task 12's MvNormal): each `stablehlo.rng` op is assumed to yield
-// independent draws. Beta/StudentT/Dirichlet draw two-or-more Gammas, each
-// with its own `Z`/`U`/`U0` rng ops; their independence is XLA's concern at
-// execution time (this XLA-seeded vertical threads no explicit key), exactly
-// as the pre-drawn `Z` vs `U` batches within one Gamma already assume.
+// Independence caveat: Beta/StudentT/Dirichlet draw two-or-more Gammas, each
+// with its own `Z`/`U`/`U0` `stablehlo.rng` ops, and assume those draws are
+// mutually independent — a cross-instruction property, unlike Task 12's
+// MvNormal, which issues exactly one `rng` call and so never faces it. The
+// assumption rests on distinct `stablehlo.rng` ops producing independent
+// streams: RNG ops are conventionally excluded from CSE/DCE in HLO-family
+// compilers precisely because they are stateful-by-design, and this
+// XLA-seeded vertical threads no explicit key (the same property the
+// pre-drawn `Z` vs `U` batches within one Gamma already lean on). That is
+// DEFENSIBLE but not proven in-crate — it is verified numerically by the
+// flatppl-testsuite JAX gate (Task 17), not derived here.
 
 /// The rejection loop's fixed candidate-batch size — see the batch doc
 /// comment for why 128 makes the all-reject tail bias negligible.
