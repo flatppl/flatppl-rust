@@ -31,12 +31,17 @@ use flatppl_core::{Module, NodeId};
 use crate::Dtype;
 use crate::mlir::{MlirTy, Value};
 
-/// A finite stand-in for "negative infinity" as the `stablehlo.reduce`
-/// identity for `stablehlo.maximum`: comfortably below any realistic
-/// log-density magnitude and finite in both `f32` and `f64`, avoiding the
-/// need to hand-encode dtype-specific infinity bit patterns for a reduction
-/// identity before real values are flowing through this lowering.
-const REDUCE_MAX_IDENTITY: f64 = -1.0e30;
+/// The dtype-exact `stablehlo.reduce` identity for `stablehlo.maximum`: real
+/// negative infinity, spelled as the raw bit pattern MLIR's float-attribute
+/// hex-literal syntax expects (`0xFF800000` / `0xFFF0000000000000`). A finite
+/// stand-in like `-1e30` is silently wrong for any input at or below it
+/// (e.g. `log(0)`), since it would then compare as the (wrong) max.
+fn reduce_max_identity(dtype: Dtype) -> &'static str {
+    match dtype {
+        Dtype::F32 => "0xFF800000",
+        Dtype::F64 => "0xFFF0000000000000",
+    }
+}
 
 /// Emits textual StableHLO into an internal buffer while assigning fresh SSA
 /// names and tracking which FlatPDL [`NodeId`]s have already been lowered.
@@ -204,33 +209,46 @@ impl<'m> Emitter<'m> {
 
     // ---- CHLO special functions ------------------------------------------
 
-    /// `%N = chlo.lgamma %a : ty` — the log-gamma function.
+    /// `%N = chlo.lgamma %a : in_ty -> out_ty` — the log-gamma function.
+    /// Unlike the `stablehlo.*` elementary unary ops, `chlo.lgamma` is a
+    /// function-type op (its operand and result types are separated by
+    /// `->`, both spelled out) rather than the single-`: ty` form `unary`
+    /// emits — elementwise here, so `in_ty == out_ty`, but both must still
+    /// be written for the op to parse.
     pub fn lgamma(&mut self, a: &Value) -> Value {
-        self.unary("chlo.lgamma", a)
+        let ssa = self.fresh();
+        let ty_text = a.ty.render(self.dtype);
+        self.push(&format!(
+            "{ssa} = chlo.lgamma {} : {ty_text} -> {ty_text}",
+            a.ssa
+        ));
+        Value {
+            ssa,
+            ty: a.ty.clone(),
+        }
     }
 
-    /// `%N = chlo.bessel_i0e %a : ty` — the exponentially-scaled modified
-    /// Bessel function of the first kind, order 0.
-    pub fn bessel_i0e(&mut self, a: &Value) -> Value {
-        self.unary("chlo.bessel_i0e", a)
-    }
+    // VonMises log-I₀ (Task 10) must inline a polynomial approximation —
+    // `chlo.bessel_i0e` is not a real CHLO op (no pretty or generic form
+    // parses), so there is no op helper for it here.
 
     // ---- reductions -------------------------------------------------------
 
     /// Full reduction (all axes) to a scalar via repeated `stablehlo.add`.
     pub fn reduce_sum(&mut self, a: &Value) -> Value {
-        self.reduce_full("stablehlo.add", 0.0, a)
+        self.reduce_full("stablehlo.add", "0.000000e+00", a)
     }
 
     /// Full reduction (all axes) to a scalar via repeated `stablehlo.maximum`.
     pub fn reduce_max(&mut self, a: &Value) -> Value {
-        self.reduce_full("stablehlo.maximum", REDUCE_MAX_IDENTITY, a)
+        let identity = reduce_max_identity(self.dtype);
+        self.reduce_full("stablehlo.maximum", identity, a)
     }
 
     /// Shared full-reduction lowering: reduces axis 0 with [`reduce_axis`]
     /// once per rank, which collapses an `n`-D tensor to a scalar (an
     /// already-`Scalar` operand takes the zero-iteration path unchanged).
-    fn reduce_full(&mut self, combine_op: &str, identity: f64, a: &Value) -> Value {
+    fn reduce_full(&mut self, combine_op: &str, identity_lit: &str, a: &Value) -> Value {
         let rank = match &a.ty {
             MlirTy::Scalar => 0,
             MlirTy::Ranked(dims) => dims.len(),
@@ -238,21 +256,28 @@ impl<'m> Emitter<'m> {
         };
         let mut cur = a.clone();
         for _ in 0..rank {
-            cur = self.reduce_axis(combine_op, identity, &cur, 0);
+            cur = self.reduce_axis(combine_op, identity_lit, &cur, 0);
         }
         cur
     }
 
     /// A single-axis reduction: reduces `axis` of the `n`-D `Ranked` operand
     /// `a`, leaving an `(n-1)`-D tensor (or a `Scalar` when `n == 1`), via
-    /// `stablehlo.reduce`'s generic region form (a fresh two-argument region
-    /// applying `combine_op`, seeded with `identity`).
+    /// `stablehlo.reduce`'s pretty form: `stablehlo.reduce(%in init: %init)
+    /// applies {combine_op} across dimensions = [axis] : (in_ty, init_ty) ->
+    /// out_ty` — no region block needed (unlike the generic form).
     ///
     /// Private: used by [`Emitter::reduce_full`] (repeatedly, to reach a
     /// scalar) and by [`Emitter::diag`]'s row-sum. The public reduction API
     /// (`reduce_sum`/`reduce_max`) always fully reduces to a scalar; a
     /// partial per-axis reduction is not yet part of the typed op-helper API.
-    fn reduce_axis(&mut self, combine_op: &str, identity: f64, a: &Value, axis: usize) -> Value {
+    fn reduce_axis(
+        &mut self,
+        combine_op: &str,
+        identity_lit: &str,
+        a: &Value,
+        axis: usize,
+    ) -> Value {
         let dims = match &a.ty {
             MlirTy::Ranked(dims) => dims.clone(),
             other => panic!("reduce_axis expects a ranked operand, got {other:?}"),
@@ -271,26 +296,14 @@ impl<'m> Emitter<'m> {
 
         let init_ssa = self.fresh();
         self.push(&format!(
-            "{init_ssa} = stablehlo.constant dense<{}> : {elem_ty}",
-            render_float_literal(identity)
+            "{init_ssa} = stablehlo.constant dense<{identity_lit}> : {elem_ty}"
         ));
 
         let ssa = self.fresh();
-        let arg0 = self.fresh();
-        let arg1 = self.fresh();
-        let combined = self.fresh();
-        let region = [
-            format!(
-                "{ssa} = \"stablehlo.reduce\"({}, {init_ssa}) <{{dimensions = array<i64: {axis}>}}> ({{",
-                a.ssa
-            ),
-            format!("  ^bb0({arg0}: {elem_ty}, {arg1}: {elem_ty}):"),
-            format!("    {combined} = {combine_op} {arg0}, {arg1} : {elem_ty}"),
-            format!("    stablehlo.return {combined} : {elem_ty}"),
-            format!("}}) : ({operand_ty}, {elem_ty}) -> {result_ty_text}"),
-        ]
-        .join("\n");
-        self.push(&region);
+        self.push(&format!(
+            "{ssa} = stablehlo.reduce({} init: {init_ssa}) applies {combine_op} across dimensions = [{axis}] : ({operand_ty}, {elem_ty}) -> {result_ty_text}",
+            a.ssa
+        ));
         Value { ssa, ty: result_ty }
     }
 
@@ -349,20 +362,39 @@ impl<'m> Emitter<'m> {
         let zero = self.constant(0.0, mat_ty);
         let masked = self.select(&mask, a, &zero);
 
-        self.reduce_axis("stablehlo.add", 0.0, &masked, 1)
+        self.reduce_axis("stablehlo.add", "0.000000e+00", &masked, 1)
     }
 
-    /// Matrix-vector product `a @ b` via `stablehlo.dot_general`, contracting
-    /// `a`'s last dimension against `b`'s only dimension (`a: [n, n]`,
-    /// `b: [n]` -> result `[n]`; no batch dimensions).
+    /// Matrix-vector product `a @ b` via `stablehlo.dot_general`'s pretty
+    /// form, contracting `a`'s (rank-2, `[m, n]`) last dimension against `b`'s
+    /// (rank-1, `[n]`) only dimension: `a, b, contracting_dims = [1] x [0],
+    /// precision = [DEFAULT, DEFAULT] : (a_ty, b_ty) -> r_ty`. The result
+    /// takes `a`'s leading dimension (`[m]`), *not* `b`'s type — a `[m, n]`
+    /// times `[n]` product has shape `[m]`, which only coincides with `b`'s
+    /// `[n]` shape in the square (`m == n`) case.
     pub fn matvec(&mut self, a: &Value, b: &Value) -> Value {
+        let a_dims = match &a.ty {
+            MlirTy::Ranked(dims) if dims.len() == 2 => dims.clone(),
+            other => panic!("matvec expects a rank-2 (matrix) lhs operand, got {other:?}"),
+        };
+        let b_dims = match &b.ty {
+            MlirTy::Ranked(dims) if dims.len() == 1 => dims.clone(),
+            other => panic!("matvec expects a rank-1 (vector) rhs operand, got {other:?}"),
+        };
+        if a_dims[1] != b_dims[0] {
+            panic!(
+                "matvec: lhs trailing dim {:?} does not match rhs length {:?}",
+                a_dims[1], b_dims[0]
+            );
+        }
+
         let ssa = self.fresh();
         let a_ty = a.ty.render(self.dtype);
         let b_ty = b.ty.render(self.dtype);
-        let result_ty = b.ty.clone();
+        let result_ty = MlirTy::Ranked(vec![a_dims[0]]);
         let result_ty_text = result_ty.render(self.dtype);
         self.push(&format!(
-            "{ssa} = \"stablehlo.dot_general\"({}, {}) <{{dot_dimension_numbers = #stablehlo.dot<lhs_contracting_dimensions = [1], rhs_contracting_dimensions = [0]>}}> : ({a_ty}, {b_ty}) -> {result_ty_text}",
+            "{ssa} = stablehlo.dot_general {}, {}, contracting_dims = [1] x [0], precision = [DEFAULT, DEFAULT] : ({a_ty}, {b_ty}) -> {result_ty_text}",
             a.ssa, b.ssa
         ));
         Value { ssa, ty: result_ty }
@@ -370,6 +402,9 @@ impl<'m> Emitter<'m> {
 
     /// Solve the lower-triangular system `l @ y = b` for `y`, via
     /// `stablehlo.triangular_solve` (`l: [n, n]`, `b: [n]` -> `y: [n]`).
+    /// `triangular_solve` has no pretty form, so this emits its parser-
+    /// validated *generic* form verbatim (quoted op name, `<{...}>`
+    /// properties dict: `left_side`/`lower`/`unit_diagonal`/`transpose_a`).
     pub fn tri_solve(&mut self, l: &Value, b: &Value) -> Value {
         let ssa = self.fresh();
         let l_ty = l.ty.render(self.dtype);

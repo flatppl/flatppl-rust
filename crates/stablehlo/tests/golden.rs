@@ -226,13 +226,36 @@ fn emitter_elementary_wrappers_emit_expected_ops() {
         (e.sqrt(&a), "stablehlo.sqrt"),
         (e.abs(&a), "stablehlo.abs"),
         (e.cos(&a), "stablehlo.cosine"),
-        (e.lgamma(&a), "chlo.lgamma"),
-        (e.bessel_i0e(&a), "chlo.bessel_i0e"),
     ];
     let out = e.finish("f", &[], &cases[0].0);
     for (_, op) in &cases {
         assert!(out.contains(op), "missing {op} in:\n{out}");
     }
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// `chlo.lgamma` is a function-type op (`in_ty -> out_ty`), not the plain
+/// `: ty` form the `stablehlo.*` elementary unaries use — the real
+/// StableHLO+CHLO MLIR parser rejects `chlo.lgamma %a : ty` ("expected
+/// '->'"). Pin both the op name and the `->` so a regression back to the
+/// single-type form is caught.
+#[test]
+fn emitter_lgamma_emits_function_type_form() {
+    let m = Module::new();
+    let mut e = Emitter::new(&m, Dtype::F32);
+    let a = e.scalar(1.0);
+    let r = e.lgamma(&a);
+    let out = e.finish("f", &[], &r);
+
+    assert!(
+        out.contains("chlo.lgamma %"),
+        "missing chlo.lgamma in:\n{out}"
+    );
+    let lgamma_line = out.lines().find(|l| l.contains("chlo.lgamma")).unwrap();
+    assert!(
+        lgamma_line.contains(" -> "),
+        "chlo.lgamma line missing '->' function-type arrow:\n{lgamma_line}"
+    );
     assert!(is_delimiter_balanced(&out));
 }
 
@@ -252,6 +275,13 @@ fn emitter_compare_and_select_type_check() {
     assert!(is_delimiter_balanced(&out));
 }
 
+/// `reduce_sum`/`reduce_max` must emit `stablehlo.reduce`'s *pretty* form
+/// (`stablehlo.reduce(%in init: %init) applies stablehlo.OP across
+/// dimensions = [D] : (...) -> ...`) — the real parser rejects the generic
+/// `"stablehlo.reduce"(...) <{dimensions=...}> ({region})` form this crate
+/// used to emit. `reduce_max`'s identity must be real dtype-exact negative
+/// infinity (`0xFF800000` for f32), not a finite `-1e30` stand-in that is
+/// silently wrong for inputs at or below it.
 #[test]
 fn emitter_reduce_sum_and_max_reduce_to_scalar() {
     let m = Module::new();
@@ -264,11 +294,39 @@ fn emitter_reduce_sum_and_max_reduce_to_scalar() {
     assert_eq!(mx.ty, MlirTy::Scalar);
 
     let out = e.finish("f", &[], &mx);
-    assert!(out.contains("stablehlo.reduce"));
-    assert!(out.contains("stablehlo.add"));
-    assert!(out.contains("stablehlo.maximum"));
-    assert!(out.contains("stablehlo.return"));
+    assert!(out.contains("stablehlo.reduce("));
+    assert!(
+        out.contains("applies stablehlo.add across dimensions"),
+        "missing pretty-form add reduce in:\n{out}"
+    );
+    assert!(
+        out.contains("applies stablehlo.maximum across dimensions"),
+        "missing pretty-form maximum reduce in:\n{out}"
+    );
+    assert!(
+        out.contains("dense<0xFF800000>"),
+        "missing dtype-exact -inf reduce_max identity in:\n{out}"
+    );
+    assert!(
+        !out.contains("stablehlo.return"),
+        "no region form expected:\n{out}"
+    );
     assert!(is_delimiter_balanced(&out));
+}
+
+/// Same dtype-exact `-inf` identity check, pinned for `f64` too — the bit
+/// pattern (not just the presence of *a* hex literal) is dtype-dependent.
+#[test]
+fn emitter_reduce_max_f64_identity_is_dtype_exact_neg_inf() {
+    let m = Module::new();
+    let mut e = Emitter::new(&m, Dtype::F64);
+    let v = e.constant(1.0, MlirTy::Ranked(vec![Some(3)]));
+    let mx = e.reduce_max(&v);
+    let out = e.finish("f", &[], &mx);
+    assert!(
+        out.contains("dense<0xFFF0000000000000>"),
+        "missing f64 -inf identity in:\n{out}"
+    );
 }
 
 #[test]
@@ -303,8 +361,45 @@ fn emitter_matrix_helpers_emit_expected_ops() {
     assert!(out.contains("stablehlo.cholesky"));
     assert!(out.contains("stablehlo.iota"));
     assert!(out.contains("stablehlo.dot_general"));
-    assert!(out.contains("stablehlo.triangular_solve"));
+    assert!(
+        out.contains("contracting_dims = [1] x [0]"),
+        "missing dot_general pretty-form contracting_dims in:\n{out}"
+    );
+    assert!(out.contains("precision = [DEFAULT, DEFAULT]"));
+    assert!(
+        out.contains("\"stablehlo.triangular_solve\"("),
+        "missing triangular_solve generic-form head in:\n{out}"
+    );
     assert!(is_delimiter_balanced(&out));
+}
+
+/// `matvec`'s result type must be `a`'s leading dimension, not `b`'s type —
+/// those only coincide in the square case the other test exercises. A
+/// rectangular `[m, n] @ [n]` product must produce `[m]`.
+#[test]
+fn emitter_matvec_result_type_is_lhs_leading_dim() {
+    let m = Module::new();
+    let mut e = Emitter::new(&m, Dtype::F32);
+    let mat = e.constant(1.0, MlirTy::Ranked(vec![Some(5), Some(3)]));
+    let vec3 = e.constant(1.0, MlirTy::Ranked(vec![Some(3)]));
+
+    let mv = e.matvec(&mat, &vec3);
+    assert_eq!(mv.ty, MlirTy::Ranked(vec![Some(5)]));
+    assert_ne!(mv.ty, vec3.ty);
+}
+
+/// `matvec` panics rather than mis-lowering when the shapes don't line up
+/// (mirrors the panic-on-bad-shape discipline `diag`/`reduce_axis` already
+/// follow) — a mismatched trailing dim is an internal invariant violation
+/// upstream type-checking should have already ruled out.
+#[test]
+#[should_panic(expected = "does not match rhs length")]
+fn emitter_matvec_panics_on_shape_mismatch() {
+    let m = Module::new();
+    let mut e = Emitter::new(&m, Dtype::F32);
+    let mat = e.constant(1.0, MlirTy::Ranked(vec![Some(5), Some(3)]));
+    let vec4 = e.constant(1.0, MlirTy::Ranked(vec![Some(4)]));
+    e.matvec(&mat, &vec4);
 }
 
 #[test]
