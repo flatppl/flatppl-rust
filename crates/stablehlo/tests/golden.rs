@@ -1268,13 +1268,15 @@ fn record_node(m: &mut Module, fields: &[(&str, NodeId)]) -> NodeId {
     }))
 }
 
-/// `builtin_logdensityof(Cauchy, ..., v)` — a distribution with no registry
+/// `builtin_logdensityof(Bogus, ..., v)` — a distribution with no registry
 /// entry — must refuse precisely (refuse-don't-mislower), not panic or guess
-/// a lowering.
+/// a lowering. `Bogus` (not a real §08/§09/§12/§13 constructor name) is used
+/// rather than a real not-yet-registered distribution so this test stays
+/// stable as later tasks register more of them.
 #[test]
 fn builtin_logdensityof_refuses_unregistered_ctor() {
     let mut m = Module::new();
-    let ctor = const_node(&mut m, "Cauchy");
+    let ctor = const_node(&mut m, "Bogus");
     let field_val = real(&mut m, 0.0);
     let kernel_input = record_node(&mut m, &[("x0", field_val)]);
     let v = real(&mut m, 1.0);
@@ -1283,7 +1285,7 @@ fn builtin_logdensityof_refuses_unregistered_ctor() {
     let mut e = Emitter::new(&m, Dtype::F32);
     let err = e.lower_node(node).unwrap_err();
     assert!(
-        err.msg.contains("no lowering for distribution 'Cauchy'"),
+        err.msg.contains("no lowering for distribution 'Bogus'"),
         "unexpected message: {}",
         err.msg
     );
@@ -1363,6 +1365,277 @@ fn emit_logdensity_refuses_trailing_binding_with_no_density_term() {
         err.msg
     );
     assert_eq!(err.node, Some(diag));
+}
+
+// ---- Task 8: location-scale continuous `@logdensity` batch -----------------
+//
+// Cauchy/Logistic/Laplace (§08), registered alongside Normal in
+// `registry.rs`'s `REGISTRY` with `sample: None` (samplers land in Task 14).
+// Same anchor-fixture shape as `NORMAL_DENSITY_SRC` above: free
+// (`elementof`-declared) parameters, scored at a pinned observation via
+// `logdensityof(lawof(record(...)), record(...))`.
+
+const CAUCHY_DENSITY_SRC: &str = "\
+location = elementof(reals)
+scale = elementof(posreals)
+a = draw(Cauchy(location = location, scale = scale))
+lp = logdensityof(lawof(record(a = a)), record(a = 0.5))
+";
+
+const LOGISTIC_DENSITY_SRC: &str = "\
+mu = elementof(reals)
+s = elementof(posreals)
+a = draw(Logistic(mu = mu, s = s))
+lp = logdensityof(lawof(record(a = a)), record(a = 0.5))
+";
+
+const LAPLACE_DENSITY_SRC: &str = "\
+location = elementof(reals)
+scale = elementof(posreals)
+a = draw(Laplace(location = location, scale = scale))
+lp = logdensityof(lawof(record(a = a)), record(a = 0.5))
+";
+
+/// §08 Cauchy, verbatim: `-log(pi) - log(scale) - log(1 + ((x -
+/// location)/scale)^2)`. Op counts: two `log`s (scale, and the `1 + z^2`
+/// term), two `negate`s (each log's negation), one `subtract` (`x -
+/// location`), one `divide` (`/scale`), one `multiply` (`z * z`), three
+/// `add`s (`1 + z^2`, and the two outer sums). No `chlo.*` needed.
+#[test]
+fn emit_logdensity_cauchy_has_expected_structure() {
+    let d = determinize_src(CAUCHY_DENSITY_SRC);
+    assert!(
+        flatppl_determinizer::is_flatpdl(&d).is_ok(),
+        "determinized module must be FlatPDL-conformant (no residual measure node)"
+    );
+
+    let out = emit_logdensity(&d);
+
+    assert!(
+        out.contains("func.func @logdensity"),
+        "missing func.func @logdensity in:\n{out}"
+    );
+    assert!(
+        out.contains("-> tensor<f32>"),
+        "must return tensor<f32> in:\n{out}"
+    );
+    assert!(
+        out.contains("%arg0: tensor<f32>") && out.contains("%arg1: tensor<f32>"),
+        "location/scale must become func args, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.log").count(),
+        2,
+        "expected exactly two logs, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.negate").count(),
+        2,
+        "expected exactly two negates, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.subtract").count(),
+        1,
+        "expected exactly one subtract, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.divide").count(),
+        1,
+        "expected exactly one divide, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.multiply").count(),
+        1,
+        "expected exactly one multiply, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.add").count(),
+        3,
+        "expected exactly three adds, in:\n{out}"
+    );
+    assert!(
+        !out.contains("chlo."),
+        "Cauchy needs no CHLO ops, in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// Freeze the exact emitted text: any drift (op count, ordering, arg naming,
+/// formula) must be a deliberate, reviewed change to this golden file.
+#[test]
+fn emit_logdensity_cauchy_matches_frozen_golden() {
+    let d = determinize_src(CAUCHY_DENSITY_SRC);
+    let out = emit_logdensity(&d);
+    let golden = include_str!("goldens/cauchy_logdensity.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted @logdensity drifted from the frozen golden (tests/goldens/cauchy_logdensity.mlir)"
+    );
+}
+
+/// §08 Logistic, verbatim: with `u = (x - mu)/s`, `-u - log(s) -
+/// 2*log(1 + exp(-u))`. Op counts: one `subtract` (`x - mu`), one `divide`
+/// (`/s`), three `negate`s (`-u`, `-log(s)`, the final `-2*log(...)`), two
+/// `log`s (`log(s)`, `log(1 + exp(-u))`), one `exponential` (`exp(-u)`), one
+/// `multiply` (`2 * log(...)`), three `add`s (`1 + exp(-u)`, and the two
+/// outer sums). No `chlo.*` needed.
+#[test]
+fn emit_logdensity_logistic_has_expected_structure() {
+    let d = determinize_src(LOGISTIC_DENSITY_SRC);
+    assert!(
+        flatppl_determinizer::is_flatpdl(&d).is_ok(),
+        "determinized module must be FlatPDL-conformant (no residual measure node)"
+    );
+
+    let out = emit_logdensity(&d);
+
+    assert!(
+        out.contains("func.func @logdensity"),
+        "missing func.func @logdensity in:\n{out}"
+    );
+    assert!(
+        out.contains("-> tensor<f32>"),
+        "must return tensor<f32> in:\n{out}"
+    );
+    assert!(
+        out.contains("%arg0: tensor<f32>") && out.contains("%arg1: tensor<f32>"),
+        "mu/s must become func args, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.subtract").count(),
+        1,
+        "expected exactly one subtract, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.divide").count(),
+        1,
+        "expected exactly one divide, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.negate").count(),
+        3,
+        "expected exactly three negates, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.log").count(),
+        2,
+        "expected exactly two logs, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.exponential").count(),
+        1,
+        "expected exactly one exponential, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.multiply").count(),
+        1,
+        "expected exactly one multiply, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.add").count(),
+        3,
+        "expected exactly three adds, in:\n{out}"
+    );
+    assert!(
+        !out.contains("chlo."),
+        "Logistic needs no CHLO ops, in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// Freeze the exact emitted text: any drift (op count, ordering, arg naming,
+/// formula) must be a deliberate, reviewed change to this golden file.
+#[test]
+fn emit_logdensity_logistic_matches_frozen_golden() {
+    let d = determinize_src(LOGISTIC_DENSITY_SRC);
+    let out = emit_logdensity(&d);
+    let golden = include_str!("goldens/logistic_logdensity.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted @logdensity drifted from the frozen golden (tests/goldens/logistic_logdensity.mlir)"
+    );
+}
+
+/// §08 Laplace, verbatim: `-log(2*scale) - |x - location|/scale`. Op
+/// counts: one `multiply` (`2 * scale`), one `log` (`log(2*scale)`), two
+/// `negate`s (`-log(2*scale)`, the final `-|.../scale`), one `subtract` (`x -
+/// location`), one `abs`, one `divide` (`/scale`), one `add` (the final
+/// sum). No `chlo.*` needed.
+#[test]
+fn emit_logdensity_laplace_has_expected_structure() {
+    let d = determinize_src(LAPLACE_DENSITY_SRC);
+    assert!(
+        flatppl_determinizer::is_flatpdl(&d).is_ok(),
+        "determinized module must be FlatPDL-conformant (no residual measure node)"
+    );
+
+    let out = emit_logdensity(&d);
+
+    assert!(
+        out.contains("func.func @logdensity"),
+        "missing func.func @logdensity in:\n{out}"
+    );
+    assert!(
+        out.contains("-> tensor<f32>"),
+        "must return tensor<f32> in:\n{out}"
+    );
+    assert!(
+        out.contains("%arg0: tensor<f32>") && out.contains("%arg1: tensor<f32>"),
+        "location/scale must become func args, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.multiply").count(),
+        1,
+        "expected exactly one multiply, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.log").count(),
+        1,
+        "expected exactly one log, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.negate").count(),
+        2,
+        "expected exactly two negates, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.subtract").count(),
+        1,
+        "expected exactly one subtract, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.abs").count(),
+        1,
+        "expected exactly one abs, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.divide").count(),
+        1,
+        "expected exactly one divide, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.add").count(),
+        1,
+        "expected exactly one add, in:\n{out}"
+    );
+    assert!(
+        !out.contains("chlo."),
+        "Laplace needs no CHLO ops, in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// Freeze the exact emitted text: any drift (op count, ordering, arg naming,
+/// formula) must be a deliberate, reviewed change to this golden file.
+#[test]
+fn emit_logdensity_laplace_matches_frozen_golden() {
+    let d = determinize_src(LAPLACE_DENSITY_SRC);
+    let out = emit_logdensity(&d);
+    let golden = include_str!("goldens/laplace_logdensity.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted @logdensity drifted from the frozen golden (tests/goldens/laplace_logdensity.mlir)"
+    );
 }
 
 // ---- Task 6: Normal `@sample` + `emit_sample` (sampling vertical slice) ----
@@ -1593,22 +1866,21 @@ fn emit_sample_hierarchical_record_passes_guard_refuses_on_record_output() {
 // (`builtin_logdensityof_refuses_unregistered_ctor` /
 // `_refuses_non_const_kernel`, Task 5 above) are the precedent these mirror.
 
-/// `builtin_sample(rng, Cauchy, kernel_input)` — a ctor with no registry
-/// entry at all (only `Normal` is registered, spec §08) — must refuse
-/// precisely, not panic or guess a lowering. This exercises the same
-/// `registry::lookup` miss `builtin_logdensityof_refuses_unregistered_ctor`
-/// does (shared code, not sample-specific text): `lower_sample`'s OWN
-/// sample-specific message, `"no @sample lowering for '{ctor}'"`
-/// (`dist.sample.ok_or_else`, for a ctor registered for `@logdensity` with
-/// no `@sample` builder yet), is currently unreachable by any real ctor
-/// name — every registered entry (just `Normal`) has both builders today —
-/// so it cannot be exercised without adding a fake registry entry purely
-/// for this test.
+/// `builtin_sample(rng, Bogus, kernel_input)` — a ctor with no registry
+/// entry at all — must refuse precisely, not panic or guess a lowering.
+/// This exercises the same `registry::lookup` miss
+/// `builtin_logdensityof_refuses_unregistered_ctor` does (shared code, not
+/// sample-specific text) — distinct from
+/// `builtin_sample_refuses_registered_ctor_without_sample_builder` below,
+/// which exercises a ctor that IS registered but has no `@sample` builder.
+/// `Bogus` (not a real §08/§09/§12/§13 constructor name) is used rather than
+/// a real not-yet-registered distribution so this test stays stable as later
+/// tasks register more of them.
 #[test]
 fn builtin_sample_refuses_unregistered_ctor() {
     let mut m = Module::new();
     let rng = real(&mut m, 0.0); // stand-in rng-state arg (never lowered)
-    let ctor = const_node(&mut m, "Cauchy");
+    let ctor = const_node(&mut m, "Bogus");
     let mu_val = real(&mut m, 0.0);
     let sigma_val = real(&mut m, 1.0);
     let kernel_input = record_node(&mut m, &[("mu", mu_val), ("sigma", sigma_val)]);
@@ -1617,7 +1889,36 @@ fn builtin_sample_refuses_unregistered_ctor() {
     let mut e = Emitter::new(&m, Dtype::F32);
     let err = e.lower_node(node).unwrap_err();
     assert!(
-        err.msg.contains("no lowering for distribution 'Cauchy'"),
+        err.msg.contains("no lowering for distribution 'Bogus'"),
+        "unexpected message: {}",
+        err.msg
+    );
+    assert_eq!(err.node, Some(node));
+}
+
+/// `builtin_sample(rng, Cauchy, kernel_input)` — `Cauchy` IS registered
+/// (Task 8's `@logdensity` builder) but has no `@sample` builder yet
+/// (`sample: None`; Task 14) — must refuse with `lower_sample`'s OWN
+/// sample-specific message, `"no @sample lowering for '{ctor}'"`
+/// (`dist.sample.ok_or_else`), distinct from the unregistered-ctor message
+/// above. This arm was previously untested (`refuse.rs`'s taxonomy doc
+/// comment noted it as unreachable while every registered entry had
+/// `sample: Some(_)`) — now reachable via any of Task 8's three
+/// `sample: None` entries.
+#[test]
+fn builtin_sample_refuses_registered_ctor_without_sample_builder() {
+    let mut m = Module::new();
+    let rng = real(&mut m, 0.0); // stand-in rng-state arg (never lowered)
+    let ctor = const_node(&mut m, "Cauchy");
+    let location = real(&mut m, 0.0);
+    let scale = real(&mut m, 1.0);
+    let kernel_input = record_node(&mut m, &[("location", location), ("scale", scale)]);
+    let node = call(&mut m, "builtin_sample", &[rng, ctor, kernel_input]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    let err = e.lower_node(node).unwrap_err();
+    assert!(
+        err.msg.contains("no @sample lowering for 'Cauchy'"),
         "unexpected message: {}",
         err.msg
     );
@@ -1706,11 +2007,12 @@ fn emitter_rng_panics_on_non_scalar_b() {
 // already covered by a Task 2/4/5/6 test EXCEPT the ones below — each new
 // test here locks exactly one previously-untested site, with no duplication
 // of an existing case. `registry.rs`'s "no @sample lowering for '{ctor}'"
-// site (a registered ctor with `sample: None`) remains untested: it is
-// genuinely unreachable today (only `Normal` is registered, and it has
-// `sample: Some(_)`), and `REGISTRY`/`DistLowering` are crate-private, so no
-// external test can fabricate a sample-less entry to reach it through — see
-// the doc comment for the plan to add its test once a real one exists.
+// site (a registered ctor with `sample: None`) was untested at Task 7 time:
+// it was genuinely unreachable then (only `Normal` was registered, and it has
+// `sample: Some(_)`). Task 8 registers `Cauchy`/`Logistic`/`Laplace` with
+// `sample: None`, making the site reachable — see
+// `builtin_sample_refuses_registered_ctor_without_sample_builder` above,
+// alongside the Task 6-review `lower_sample` refuse tests it extends.
 
 /// `mlir_type_of` on a node with no inferred type at all (never
 /// `set_type`-ed) — a distinct site from the aggregate/measure-layer/catch-all

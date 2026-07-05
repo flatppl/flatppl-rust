@@ -38,13 +38,36 @@ pub struct DistLowering {
 /// full registry stays well under a hundred entries end-to-end (spec
 /// §08/§09/§12/§13), so this beats the bookkeeping of a `HashMap`/`phf` for
 /// no measurable runtime cost.
-static REGISTRY: &[(&str, DistLowering)] = &[(
-    "Normal",
-    DistLowering {
-        logpdf: normal_logpdf,
-        sample: Some(normal_sample),
-    },
-)];
+static REGISTRY: &[(&str, DistLowering)] = &[
+    (
+        "Normal",
+        DistLowering {
+            logpdf: normal_logpdf,
+            sample: Some(normal_sample),
+        },
+    ),
+    (
+        "Cauchy",
+        DistLowering {
+            logpdf: cauchy_logpdf,
+            sample: None,
+        },
+    ),
+    (
+        "Logistic",
+        DistLowering {
+            logpdf: logistic_logpdf,
+            sample: None,
+        },
+    ),
+    (
+        "Laplace",
+        DistLowering {
+            logpdf: laplace_logpdf,
+            sample: None,
+        },
+    ),
+];
 
 /// Look up a distribution's lowering by its constructor name (`"Normal"`,
 /// …). `None` for an unregistered ctor — the caller turns that into a
@@ -220,4 +243,77 @@ fn normal_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
 
     let sigma_z = e.mul(&sigma, &z);
     Ok(e.add(&mu, &sigma_z))
+}
+
+// ---- §08 Cauchy -------------------------------------------------------------
+
+/// §08 Cauchy, verbatim: `log f = -log(pi) - log(gamma) - log(1 + ((x -
+/// x0) / gamma)^2)`. No `@sample` builder yet (`sample: None`; Task 14).
+fn cauchy_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
+    let location = p.get(e, "location")?;
+    let scale = p.get(e, "scale")?;
+
+    let neg_log_pi = e.scalar(-std::f64::consts::PI.ln());
+    let log_scale = e.log(&scale);
+    let neg_log_scale = e.neg(&log_scale);
+
+    let diff = e.sub(v, &location);
+    let z = e.div(&diff, &scale);
+    let z_sq = e.mul(&z, &z);
+    let one = e.scalar(1.0);
+    let one_plus_z_sq = e.add(&one, &z_sq);
+    let log_one_plus_z_sq = e.log(&one_plus_z_sq);
+    let neg_log_one_plus_z_sq = e.neg(&log_one_plus_z_sq);
+
+    let neg_log_pi_scale = e.add(&neg_log_pi, &neg_log_scale);
+    Ok(e.add(&neg_log_pi_scale, &neg_log_one_plus_z_sq))
+}
+
+// ---- §08 Logistic -----------------------------------------------------------
+
+/// §08 Logistic, verbatim: with `u = (x - mu) / s`, `log f = -u - log(s) -
+/// 2 * log(1 + exp(-u))`. No `@sample` builder yet (`sample: None`; Task
+/// 14).
+fn logistic_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
+    let mu = p.get(e, "mu")?;
+    let s = p.get(e, "s")?;
+
+    let diff = e.sub(v, &mu);
+    let u = e.div(&diff, &s);
+    let neg_u = e.neg(&u);
+
+    let log_s = e.log(&s);
+    let neg_log_s = e.neg(&log_s);
+
+    let exp_neg_u = e.exp(&neg_u);
+    let one = e.scalar(1.0);
+    let one_plus_exp_neg_u = e.add(&one, &exp_neg_u);
+    let log_term = e.log(&one_plus_exp_neg_u);
+    let two = e.scalar(2.0);
+    let two_log_term = e.mul(&two, &log_term);
+    let neg_two_log_term = e.neg(&two_log_term);
+
+    let neg_u_minus_log_s = e.add(&neg_u, &neg_log_s);
+    Ok(e.add(&neg_u_minus_log_s, &neg_two_log_term))
+}
+
+// ---- §08 Laplace ------------------------------------------------------------
+
+/// §08 Laplace, verbatim: `log f = -log(2 * b) - |x - mu| / b`. No
+/// `@sample` builder yet (`sample: None`; Task 14).
+fn laplace_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
+    let location = p.get(e, "location")?;
+    let scale = p.get(e, "scale")?;
+
+    let two = e.scalar(2.0);
+    let two_b = e.mul(&two, &scale);
+    let log_two_b = e.log(&two_b);
+    let neg_log_two_b = e.neg(&log_two_b);
+
+    let diff = e.sub(v, &location);
+    let abs_diff = e.abs(&diff);
+    let term = e.div(&abs_diff, &scale);
+    let neg_term = e.neg(&term);
+
+    Ok(e.add(&neg_log_two_b, &neg_term))
 }

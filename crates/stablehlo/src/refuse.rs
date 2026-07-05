@@ -75,14 +75,11 @@
 //!   be a bare distribution constructor"
 //! - an unregistered constructor name — "no lowering for distribution '...'"
 //! - a registered constructor with no `@sample` builder — "no @sample
-//!   lowering for '...'" — **currently unreachable, and so untested**: every
-//!   registered entry (only `Normal` today) has `sample: Some(_)`. This arm
-//!   exists for when the first sample-less distribution (e.g. one with a
-//!   closed-form `logpdf` but no `jax.random`-style sampler) is registered
-//!   with `sample: None` — add its locking test alongside that
-//!   registration, not before: `REGISTRY`/`DistLowering`/`Params` are
-//!   crate-private, so there is no way to exercise this arm from an
-//!   external test without a real registered entry to reach it through.
+//!   lowering for '...'" — locked by
+//!   `builtin_sample_refuses_registered_ctor_without_sample_builder`
+//!   (`tests/golden.rs`), reached via any of `Cauchy`/`Logistic`/`Laplace`
+//!   (Task 8's `@logdensity`-only entries; their `@sample` builders land in
+//!   Task 14).
 //!
 //! **`types.rs`** (`mlir_type_of`):
 //! - a node with no inferred type at all — "node has no inferred type"
