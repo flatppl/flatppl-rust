@@ -4,6 +4,8 @@
 mod conformance;
 mod density;
 mod driver;
+mod jointchain;
+mod kernel;
 mod marginal;
 mod refuse;
 mod sample;

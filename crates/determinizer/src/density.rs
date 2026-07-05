@@ -414,6 +414,7 @@ pub(crate) fn lower_measure_density(
         // kchain marginal: discrete-finite latent → mass-weighted logsumexp;
         // continuous / infinite-discrete / non-enumerable → refuse (Task 5).
         Some("kchain") => crate::marginal::lower_kchain_marginal(m, measure_node, v),
+        Some("jointchain") => crate::jointchain::lower_jointchain(m, measure_node, v),
         Some("iid") => lower_iid(m, measure_node, v),
         Some("broadcast") => lower_broadcast_kernel(m, measure_node, v),
         Some("joint") => lower_joint(m, measure_node, v),
@@ -430,7 +431,6 @@ pub(crate) fn lower_measure_density(
         // (safety net) rather than emit `builtin_logdensityof(joint_likelihood, …)`.
         Some("markovchain")
         | Some("kscan")
-        | Some("jointchain")
         | Some("bayesupdate")
         | Some("disintegrate")
         | Some("restrict")
@@ -1902,7 +1902,7 @@ pub(crate) fn build_record(m: &mut Module, fields: &[(Symbol, NodeId)]) -> NodeI
 
 /// Combine density terms with `add`: a single term passes through; two or more
 /// fold left into nested binary `add(acc, term)` calls.
-fn fold_add(m: &mut Module, terms: &[NodeId]) -> NodeId {
+pub(crate) fn fold_add(m: &mut Module, terms: &[NodeId]) -> NodeId {
     debug_assert!(!terms.is_empty(), "fold_add requires at least one term");
     let mut acc = terms[0];
     for &t in &terms[1..] {
