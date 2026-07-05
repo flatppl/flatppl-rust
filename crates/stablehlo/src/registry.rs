@@ -1527,6 +1527,17 @@ fn static_square_matrix_dim(
     match &m.ty {
         MlirTy::Ranked(dims) if dims.len() == 2 => match (dims[0], dims[1]) {
             (Some(a), Some(b)) if a == b => Ok(a),
+            // Both dims ARE statically known here — just unequal (e.g.
+            // `[2, 3]`) — so this must not reuse the "not statically known"
+            // wording below; that would misreport a perfectly well-known,
+            // merely non-square shape as an unknown one.
+            (Some(_), Some(_)) => Err(EmitError::at(
+                blame,
+                format!(
+                    "{ctor} logdensity: '{param_name}' must be a square matrix, got {:?}",
+                    m.ty
+                ),
+            )),
             _ => Err(EmitError::at(
                 blame,
                 format!(
@@ -1622,8 +1633,14 @@ fn trace_via_frobenius(e: &mut Emitter, l_a: &Value, l_b: &Value) -> Value {
 }
 
 /// `log Γ_n(a) = (n(n-1)/4) log(pi) + sum_{j=1}^n lgamma(a + (1-j)/2)` (task
-/// brief, verbatim) — see the batch doc comment.
+/// brief, verbatim) — see the batch doc comment. `n` is always
+/// [`static_square_matrix_dim`]'s return value (a matrix's own row/column
+/// count), so `n >= 1` in every real caller; asserted rather than silently
+/// trusted, since `n * (n - 1)` on `u64` would otherwise underflow (wrap in
+/// release, panic with an opaque message in debug) for a hypothetical
+/// `n == 0`.
 fn log_mv_gamma(e: &mut Emitter, n: u64, a: &Value) -> Value {
+    assert!(n >= 1, "log_mv_gamma: n must be >= 1, got {n}");
     let mut acc = e.scalar((n * (n - 1)) as f64 / 4.0 * std::f64::consts::PI.ln());
     for j in 1..=n {
         let shift = e.scalar((1.0 - j as f64) / 2.0);

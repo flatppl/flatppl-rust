@@ -191,11 +191,19 @@ fn broadcast_to(e: &mut Emitter, id: NodeId, a: &Value, ty: &MlirTy) -> Result<V
 // ---- vector -------------------------------------------------------------------
 
 /// `vector(t1, …, tk)` (spec §07 vector literal): packs `k` already-lowered
-/// scalar elements into a rank-1 tensor via [`Emitter::vector`]. The
-/// determiniser emits this wrapping a `logsumexp` argument (superpose/
-/// discrete-marginal); refuses on zero elements (`concatenate` needs at
+/// elements into a tensor one rank higher than the elements via
+/// [`Emitter::vector`] — scalar elements (the determiniser's own shape,
+/// wrapping a `logsumexp` argument for superpose/discrete-marginal) stack
+/// into a rank-1 tensor; same-shape ARRAY elements (a legal
+/// vector-of-vectors, spec §03 — distinct from a matrix) stack into a
+/// rank-2-or-higher tensor. Refuses on zero elements (`concatenate` needs at
 /// least one operand, and `Emitter::vector` asserts on that as an internal
-/// invariant, not a well-formed-but-empty case worth tolerating here).
+/// invariant, not a well-formed-but-empty case worth tolerating here) and on
+/// RAGGED elements (not all the same `MlirTy` — e.g. vector-of-vectors whose
+/// inner vectors have different lengths): §03 arrays are fixed-size/
+/// rectangular, so a ragged `vector(...)` has no tensor form at all —
+/// refused here, before `Emitter::vector`, rather than let its own
+/// identical-shape assertion fire as an internal-invariant panic.
 fn lower_vector(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
     if args.is_empty() {
         return Err(EmitError::at(id, "vector: expected at least one element"));
@@ -204,6 +212,13 @@ fn lower_vector(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, E
         .iter()
         .map(|&a| e.lower_node(a))
         .collect::<Result<_, _>>()?;
+    let elem_ty = &elems[0].ty;
+    if elems.iter().any(|v| &v.ty != elem_ty) {
+        return Err(EmitError::at(
+            id,
+            "vector elements must have identical shape; ragged vector-of-vectors has no tensor form",
+        ));
+    }
     Ok(e.vector(&elems))
 }
 

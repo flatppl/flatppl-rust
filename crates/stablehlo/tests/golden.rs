@@ -3150,6 +3150,97 @@ fn lower_vector_refuses_empty_element_list() {
     assert_eq!(err.node, Some(node));
 }
 
+/// A `vector(...)` whose elements are themselves rank-1 tensors (not
+/// scalars) — a vector-of-vectors (spec §03: legal, distinct from a matrix,
+/// since matrices only come from `array`/`rowstack`/`colstack`/`eye`) —
+/// must lower to a rank-2 tensor via reshape-then-concatenate at the
+/// element's own rank, not silently truncate to rank-1 by assuming a scalar
+/// element (the confirmed Task-13-review `Emitter::vector` mis-lowering
+/// bug: `reshape` performs no validation, so a non-scalar element used to
+/// reshape down to a wrong-rank `tensor<1x…>` without ever refusing).
+#[test]
+fn lower_vector_of_vectors_lowers_to_rank2_tensor() {
+    let mut m = Module::new();
+    let t1 = local_ref(&mut m, "t1");
+    let t2 = local_ref(&mut m, "t2");
+    let node = call(&mut m, "vector", &[t1, t2]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    e.bind(
+        t1,
+        Value {
+            ssa: "%arg0".to_string(),
+            ty: MlirTy::Ranked(vec![Some(3)]),
+        },
+    );
+    e.bind(
+        t2,
+        Value {
+            ssa: "%arg1".to_string(),
+            ty: MlirTy::Ranked(vec![Some(3)]),
+        },
+    );
+    let result = e.lower_node(node).unwrap();
+    assert_eq!(
+        result.ty,
+        MlirTy::Ranked(vec![Some(2), Some(3)]),
+        "vector-of-two-length-3-vectors must be rank-2 [2, 3], not rank-1"
+    );
+    let out = e.finish(
+        "f",
+        &[
+            ("%arg0".to_string(), MlirTy::Ranked(vec![Some(3)])),
+            ("%arg1".to_string(), MlirTy::Ranked(vec![Some(3)])),
+        ],
+        &result,
+    );
+    assert!(
+        out.contains("stablehlo.concatenate"),
+        "missing concatenate, in:\n{out}"
+    );
+    assert!(
+        out.contains("-> tensor<2x3xf32>"),
+        "result must be a rank-2 tensor<2x3xf32>, in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// A `vector(...)` whose elements are rank-1 tensors of DIFFERENT lengths —
+/// a RAGGED vector-of-vectors — has no rectangular tensor form (spec §03:
+/// arrays are fixed-size/rectangular). Must refuse precisely, not mis-lower
+/// via `Emitter::reshape`'s lack of shape validation.
+#[test]
+fn lower_vector_refuses_ragged_elements() {
+    let mut m = Module::new();
+    let t1 = local_ref(&mut m, "t1");
+    let t2 = local_ref(&mut m, "t2");
+    let node = call(&mut m, "vector", &[t1, t2]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    e.bind(
+        t1,
+        Value {
+            ssa: "%arg0".to_string(),
+            ty: MlirTy::Ranked(vec![Some(2)]),
+        },
+    );
+    e.bind(
+        t2,
+        Value {
+            ssa: "%arg1".to_string(),
+            ty: MlirTy::Ranked(vec![Some(3)]),
+        },
+    );
+    let err = e.lower_node(node).unwrap_err();
+    assert!(
+        err.msg
+            .contains("ragged vector-of-vectors has no tensor form"),
+        "unexpected message: {}",
+        err.msg
+    );
+    assert_eq!(err.node, Some(node));
+}
+
 /// `in(v, interval(lo, hi))` where `lo` is itself a ranked (non-scalar) value
 /// of a DIFFERENT shape than `v` — `broadcast_to` only knows how to broadcast
 /// a `Scalar` up to a bigger shape, so a ranked/ranked mismatch must refuse

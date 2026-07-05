@@ -50,6 +50,10 @@
 //!   cannot broadcast ... to ..."
 //! - `vector()` with zero elements — "vector: expected at least one
 //!   element"
+//! - `vector()` whose elements are not all the same `MlirTy` (a RAGGED
+//!   vector-of-vectors, e.g. inner vectors of different lengths) —
+//!   "vector elements must have identical shape; ragged vector-of-vectors
+//!   has no tensor form"
 //! - `get`/`get0` whose computed 0-based index is negative (a selector
 //!   below `get`'s 1-based floor) — "get/get0: index out of range"
 //! - `get`/`get0` on a non-rank-1 container — "get/get0: only
@@ -89,9 +93,13 @@
 //!   "MvNormal cov must be an ...x... matrix matching mu's length ..., got
 //!   ..." (Task 12).
 //! - a matrix-distribution (`Wishart`/`InverseWishart`) shape param with no
-//!   statically-known SQUARE matrix shape — "... logdensity needs a
-//!   statically-known square matrix for '...', got ..." /
-//!   "... logdensity: '...' must be a rank-2 square matrix, got ..."
+//!   statically-known SQUARE matrix shape — three distinct wordings for
+//!   three distinct shapes, so a known-but-non-square shape is never
+//!   misreported as unknown: "... logdensity needs a statically-known
+//!   square matrix for '...', got ..." (a dynamic dim present) / "...
+//!   logdensity: '...' must be a square matrix, got ..." (both dims
+//!   statically known, just unequal, e.g. `[2, 3]`) / "... logdensity:
+//!   '...' must be a rank-2 square matrix, got ..." (wrong rank entirely)
 //!   (`registry::static_square_matrix_dim`, Task 13).
 //! - a matrix-distribution variate that mismatches its scale/`n`'s own
 //!   dimension — "... ... must be an NxN matrix, got ..."

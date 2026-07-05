@@ -325,20 +325,54 @@ impl<'m> Emitter<'m> {
     }
 
     /// `%N = stablehlo.concatenate %a, %b, ..., dim = 0 : (op1_ty, op2_ty,
-    /// ...) -> result_ty` — packs `elems` (each expected to be a `Scalar`)
-    /// into a rank-1 tensor of length `elems.len()`: every element is first
-    /// `reshape`d to `tensor<1x...>`, then concatenated along dim 0. Used by
-    /// `logsumexp(vector(t1, …, tk))` (superpose/discrete-marginal) to build
-    /// the rank-1 tensor `logsumexp` reduces over. Parser-validated against
-    /// the real StableHLO parser (jax 0.10.2): `stablehlo.concatenate %a,
-    /// %b, dim = 0 : (tensor<1xf32>, tensor<1xf32>) -> tensor<2xf32>`.
+    /// ...) -> result_ty` — packs `elems` into a tensor one rank higher than
+    /// each element, of length `elems.len()` along the new leading dim:
+    /// every element is first `reshape`d to add a length-1 leading axis
+    /// (`tensor<1x...>`, `...` being the element's own shape), then
+    /// concatenated along dim 0. Rank-generic because spec §03 arrays may
+    /// nest (a `vector(...)` of scalars is the common case — used by
+    /// `logsumexp(vector(t1, …, tk))`, superpose/discrete-marginal — but a
+    /// `vector(...)` of same-shape ARRAY elements, a legal vector-of-vectors
+    /// distinct from a matrix, is equally valid and must lower to a rank-2
+    /// tensor, not silently truncate to rank-1 by assuming a scalar
+    /// element). Every `elems[i].ty` must be identical — checked by the
+    /// caller (`ops::lower_vector`, which has the `NodeId` to blame and
+    /// returns a precise refusal for a ragged vector-of-vectors); a shape
+    /// mismatch reaching this point is an internal invariant violation, per
+    /// this module's doc comment. Parser-validated against the real
+    /// StableHLO parser (jax 0.10.2) for both the scalar-element rank-1 case
+    /// (`stablehlo.concatenate %a, %b, dim = 0 : (tensor<1xf32>,
+    /// tensor<1xf32>) -> tensor<2xf32>`) and the vector-element rank-2 case
+    /// (`stablehlo.concatenate %a, %b, dim = 0 : (tensor<1x3xf32>,
+    /// tensor<1x3xf32>) -> tensor<2x3xf32>`).
     pub fn vector(&mut self, elems: &[Value]) -> Value {
         assert!(!elems.is_empty(), "vector: expected at least one element");
+        let elem_ty = elems[0].ty.clone();
+        assert!(
+            elems.iter().all(|v| v.ty == elem_ty),
+            "vector: elements must have identical shape (ragged vector-of-vectors \
+             must be refused by the caller before this is reached)"
+        );
+        let inner_dims: Vec<Option<u64>> = match &elem_ty {
+            MlirTy::Scalar => Vec::new(),
+            MlirTy::Ranked(dims) => dims.clone(),
+            MlirTy::Tuple(_) => panic!("vector: tuple elements have no tensor form"),
+        };
+        let stacked_elem_ty = {
+            let mut dims = Vec::with_capacity(inner_dims.len() + 1);
+            dims.push(Some(1));
+            dims.extend(inner_dims.iter().copied());
+            MlirTy::Ranked(dims)
+        };
         let reshaped: Vec<Value> = elems
             .iter()
-            .map(|v| self.reshape(v, MlirTy::Ranked(vec![Some(1)])))
+            .map(|v| self.reshape(v, stacked_elem_ty.clone()))
             .collect();
-        let result_ty = MlirTy::Ranked(vec![Some(reshaped.len() as u64)]);
+
+        let mut result_dims = Vec::with_capacity(inner_dims.len() + 1);
+        result_dims.push(Some(reshaped.len() as u64));
+        result_dims.extend(inner_dims.iter().copied());
+        let result_ty = MlirTy::Ranked(result_dims);
 
         let operand_ssas = reshaped
             .iter()
@@ -554,7 +588,13 @@ impl<'m> Emitter<'m> {
 
     /// Solve the lower-triangular system `l @ y = b` for `y`, via
     /// `stablehlo.triangular_solve` (`l: [n, n]`, `b: [n]` -> `y: [n]`).
-    /// `triangular_solve` has no pretty form, so this emits its parser-
+    /// Shape-generic in `b`: `stablehlo.triangular_solve` also accepts a
+    /// MATRIX right-hand side (`b: [n, n]` -> `y: [n, n]`, solving `l @ Y =
+    /// B` column-by-column) — `y`'s result type is always `b.ty` unchanged,
+    /// never hardcoded to rank-1, which is what lets `registry.rs`'s
+    /// `trace_via_frobenius` (Task 13, Wishart/InverseWishart) call this
+    /// with a matrix `b` to compute `W = tri_solve(L_A, L_B)` for `tr(A^-1
+    /// B)`. `triangular_solve` has no pretty form, so this emits its parser-
     /// validated *generic* form verbatim (quoted op name, `<{...}>`
     /// properties dict: `left_side`/`lower`/`unit_diagonal`/`transpose_a`).
     pub fn tri_solve(&mut self, l: &Value, b: &Value) -> Value {
