@@ -1698,3 +1698,240 @@ fn emitter_rng_panics_on_non_scalar_b() {
     };
     e.rng("NORMAL", &a, &b, &MlirTy::Scalar);
 }
+
+// ---- Task 7: refuse taxonomy — closing coverage gaps -----------------------
+//
+// Task 7's audit (see `crates/stablehlo/src/refuse.rs`'s module doc comment
+// for the full enumerated taxonomy) found every `EmitError` construction site
+// already covered by a Task 2/4/5/6 test EXCEPT the ones below — each new
+// test here locks exactly one previously-untested site, with no duplication
+// of an existing case. `registry.rs`'s "no @sample lowering for '{ctor}'"
+// site (a registered ctor with `sample: None`) remains untested: it is
+// genuinely unreachable today (only `Normal` is registered, and it has
+// `sample: Some(_)`), and `REGISTRY`/`DistLowering` are crate-private, so no
+// external test can fabricate a sample-less entry to reach it through — see
+// the doc comment for the plan to add its test once a real one exists.
+
+/// `mlir_type_of` on a node with no inferred type at all (never
+/// `set_type`-ed) — a distinct site from the aggregate/measure-layer/catch-all
+/// refusals below it in `types.rs`, all of which require a type to already be
+/// present in the side table.
+#[test]
+fn mlir_type_of_refuses_node_with_no_inferred_type() {
+    let mut m = Module::new();
+    let id = m.alloc(Node::Lit(Scalar::Real(0.0))); // no `m.set_type` call
+    let err = mlir_type_of(&m, id, Dtype::F32).unwrap_err();
+    assert!(
+        err.msg.contains("no inferred type"),
+        "unexpected message: {}",
+        err.msg
+    );
+    assert_eq!(err.node, Some(id));
+}
+
+/// `emit`'s own up-front `is_flatpdl` gate (`lib.rs`) — a module still
+/// carrying a residual measure-layer type must refuse with the module-level
+/// "not FlatPDL" message (`EmitError::whole`, `node: None`), distinct from
+/// `mlir_type_of`'s own (node-localized) "residual measure-layer type"
+/// refusal: this one is reached before the emitter ever starts walking the
+/// query, on `flatppl_determinizer::is_flatpdl`'s own conformance check.
+#[test]
+fn emit_refuses_input_that_is_not_flatpdl() {
+    let mut m = Module::new();
+    let id = placeholder(
+        &mut m,
+        Type::Measure {
+            domain: Box::new(Type::Scalar(ScalarType::Real)),
+            mass: Mass::Normalized,
+        },
+    );
+    top_level(&mut m, "x", id);
+
+    let err = flatppl_stablehlo::emit(
+        &m,
+        flatppl_stablehlo::Mode::LogDensity,
+        &flatppl_stablehlo::EmitOptions::default(),
+    )
+    .unwrap_err();
+    assert!(
+        err.msg.contains("is not FlatPDL"),
+        "unexpected message: {}",
+        err.msg
+    );
+    assert_eq!(
+        err.node, None,
+        "module-level refusal has no localizing node"
+    );
+}
+
+/// `emit_logdensity` on a module with no public binding at all (not even a
+/// trailing non-density one) — distinct from
+/// `emit_logdensity_refuses_trailing_binding_with_no_density_term`, which
+/// exercises the query-CONTENT guard on a module that DOES have a public
+/// binding.
+#[test]
+fn emit_logdensity_refuses_module_with_no_public_binding() {
+    let m = Module::new();
+    let err = flatppl_stablehlo::emit(
+        &m,
+        flatppl_stablehlo::Mode::LogDensity,
+        &flatppl_stablehlo::EmitOptions::default(),
+    )
+    .unwrap_err();
+    assert!(
+        err.msg
+            .contains("no public binding to emit as the logdensity query"),
+        "unexpected message: {}",
+        err.msg
+    );
+    assert_eq!(err.node, None);
+}
+
+/// The `emit_sample` mirror of
+/// [`emit_logdensity_refuses_module_with_no_public_binding`].
+#[test]
+fn emit_sample_refuses_module_with_no_public_binding() {
+    let m = Module::new();
+    let err = flatppl_stablehlo::emit(
+        &m,
+        flatppl_stablehlo::Mode::Sample,
+        &flatppl_stablehlo::EmitOptions::default(),
+    )
+    .unwrap_err();
+    assert!(
+        err.msg
+            .contains("no public binding to emit as the sample query"),
+        "unexpected message: {}",
+        err.msg
+    );
+    assert_eq!(err.node, None);
+}
+
+/// `get0(builtin_sample(...), 1)` — projecting the ADVANCED RNG-STATE slot
+/// (index 1) of a sampled `(value, new_rngstate)` tuple, as opposed to the
+/// drawn-value slot (index 0, the ordinary case every other sample test
+/// projects). This vertical is XLA-seeded (`stablehlo.rng` takes no explicit
+/// rng key), so that slot has no tensor form at all — refuses, rather than
+/// trying to slice a nonexistent tensor.
+#[test]
+fn lower_get_of_sampled_tuple_refuses_rng_state_slot() {
+    let mut m = Module::new();
+    let rng = real(&mut m, 0.0); // stand-in rng-state arg (never lowered)
+    let ctor = const_node(&mut m, "Normal");
+    let mu = real(&mut m, 0.0);
+    let sigma = real(&mut m, 1.0);
+    let kernel_input = record_node(&mut m, &[("mu", mu), ("sigma", sigma)]);
+    let sample = call(&mut m, "builtin_sample", &[rng, ctor, kernel_input]);
+    let one_idx = int(&mut m, 1);
+    let node = call(&mut m, "get0", &[sample, one_idx]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    let err = e.lower_node(node).unwrap_err();
+    assert!(
+        err.msg.contains("sampled rng state has no tensor form"),
+        "unexpected message: {}",
+        err.msg
+    );
+    assert_eq!(err.node, Some(node));
+}
+
+/// `vector()` with zero elements — `concatenate` needs at least one operand;
+/// refuses rather than asserting inside `Emitter::vector`.
+#[test]
+fn lower_vector_refuses_empty_element_list() {
+    let mut m = Module::new();
+    let node = call(&mut m, "vector", &[]);
+    let mut e = Emitter::new(&m, Dtype::F32);
+    let err = e.lower_node(node).unwrap_err();
+    assert!(
+        err.msg.contains("vector: expected at least one element"),
+        "unexpected message: {}",
+        err.msg
+    );
+    assert_eq!(err.node, Some(node));
+}
+
+/// `in(v, interval(lo, hi))` where `lo` is itself a ranked (non-scalar) value
+/// of a DIFFERENT shape than `v` — `broadcast_to` only knows how to broadcast
+/// a `Scalar` up to a bigger shape, so a ranked/ranked mismatch must refuse
+/// rather than emit an ill-shaped op. Distinct from
+/// `lower_in_interval_reduces_to_one_compare` (matching scalar shapes, no
+/// broadcast needed at all).
+#[test]
+fn lower_in_refuses_shape_mismatched_bound() {
+    let mut m = Module::new();
+    let v = local_ref(&mut m, "v");
+    let e0 = real(&mut m, 0.0);
+    let e1 = real(&mut m, 1.0);
+    let lo = call(&mut m, "vector", &[e0, e1]); // Ranked([Some(2)])
+    let hi = real(&mut m, 5.0); // Scalar
+    let interval = call(&mut m, "interval", &[lo, hi]);
+    let node = call(&mut m, "in", &[v, interval]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    e.bind(
+        v,
+        Value {
+            ssa: "%arg0".to_string(),
+            ty: MlirTy::Ranked(vec![Some(3)]), // different length than lo's
+        },
+    );
+    let err = e.lower_node(node).unwrap_err();
+    assert!(
+        err.msg.contains("shape mismatch"),
+        "unexpected message: {}",
+        err.msg
+    );
+    assert_eq!(err.node, Some(node));
+}
+
+/// `get(v, 0)` — 1-based `get` with a selector of `0` computes a negative
+/// 0-based index (`0 - 1 = -1`) BEFORE the container is ever lowered or its
+/// length checked — a distinct guard from
+/// `lower_get0_refuses_out_of_range_index` (which trips the separate
+/// known-length check on an already-lowered container), even though both
+/// report the same "index out of range" text.
+#[test]
+fn lower_get_refuses_selector_below_one_based_floor() {
+    let mut m = Module::new();
+    let v = local_ref(&mut m, "v");
+    let idx = int(&mut m, 0);
+    let node = call(&mut m, "get", &[v, idx]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    e.bind(
+        v,
+        Value {
+            ssa: "%arg0".to_string(),
+            ty: MlirTy::Ranked(vec![Some(5)]),
+        },
+    );
+    let err = e.lower_node(node).unwrap_err();
+    assert!(
+        err.msg.contains("out of range"),
+        "unexpected message: {}",
+        err.msg
+    );
+    assert_eq!(err.node, Some(node));
+}
+
+/// `builtin_logdensityof` with the wrong number of arguments must refuse
+/// (naming the exact expected/actual count), not panic on the
+/// `<[NodeId; 3]>::try_from` — mirrors `builtin_sample_refuses_wrong_arity`.
+#[test]
+fn builtin_logdensityof_refuses_wrong_arity() {
+    let mut m = Module::new();
+    let ctor = const_node(&mut m, "Normal");
+    let kernel_input = call(&mut m, "record", &[]);
+    let node = call(&mut m, "builtin_logdensityof", &[ctor, kernel_input]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    let err = e.lower_node(node).unwrap_err();
+    assert!(
+        err.msg
+            .contains("builtin_logdensityof: expected 3 arguments, got 2"),
+        "unexpected message: {}",
+        err.msg
+    );
+    assert_eq!(err.node, Some(node));
+}
