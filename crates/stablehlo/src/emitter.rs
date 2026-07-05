@@ -643,7 +643,15 @@ impl<'m> Emitter<'m> {
             Node::Call(call) => match call.head {
                 CallHead::Builtin(sym) => {
                     let name = m.resolve(sym).to_string();
-                    crate::ops::lower_builtin(self, id, &name, &call.args)
+                    // The registry gate: `builtin_logdensityof` dispatches to
+                    // the distribution registry (`crate::registry`), never to
+                    // `ops::lower_builtin`'s deterministic (non-distribution)
+                    // map — see that module's doc comment.
+                    if name == "builtin_logdensityof" {
+                        crate::registry::lower_logdensityof(self, id, &call.args)
+                    } else {
+                        crate::ops::lower_builtin(self, id, &name, &call.args)
+                    }
                 }
                 CallHead::User(_) => Err(EmitError::at(
                     id,

@@ -25,11 +25,19 @@
 //! every non-distribution `Call`): together they turn any post-determinize
 //! FlatPDL expression graph into a [`Value`], composing only Task 3's
 //! op-helper API.
+//!
+//! Task 5 adds the distribution registry (`registry.rs`: a ctor-name-keyed
+//! table from a distribution constructor, e.g. `Normal`, to its closed-form
+//! `logpdf`/`sample` builders) and the first mode builder (`modes.rs`'s
+//! `emit_logdensity`), wired up as `emit`'s `Mode::LogDensity` route — the
+//! first complete emitted StableHLO module (the density vertical slice).
 
 mod emitter;
 mod mlir;
+mod modes;
 mod ops;
 mod refuse;
+mod registry;
 mod types;
 
 pub use emitter::Emitter;
@@ -68,11 +76,14 @@ impl Default for EmitOptions {
 /// (i.e. the output of `flatppl_determinizer::determinize`). Refuses (never
 /// mis-lowers) if `m` still carries measure-layer constructs.
 ///
-/// Stub (Task 1): once FlatPDL-conformance is confirmed, returns a minimal
-/// valid empty module. `_mode` / `_opts` are threaded through the signature
-/// for later tasks and are not yet used.
-pub fn emit(m: &Module, _mode: Mode, _opts: &EmitOptions) -> Result<String, EmitError> {
+/// Routes to the mode builder for `mode`: [`Mode::LogDensity`] →
+/// [`modes::emit_logdensity`] (Task 5). [`Mode::Sample`] has no builder yet
+/// (Task 6) and refuses.
+pub fn emit(m: &Module, mode: Mode, opts: &EmitOptions) -> Result<String, EmitError> {
     flatppl_determinizer::is_flatpdl(m)
         .map_err(|_| EmitError::whole("input is not FlatPDL (determinize first)"))?;
-    Ok("module {\n}\n".to_string())
+    match mode {
+        Mode::LogDensity => modes::emit_logdensity(m, opts),
+        Mode::Sample => Err(EmitError::whole("@sample mode has no builder yet (Task 6)")),
+    }
 }

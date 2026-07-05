@@ -1123,3 +1123,203 @@ fn lower_const_inf_emits_dtype_exact_positive_infinity() {
         "missing dtype-exact +inf in:\n{out}"
     );
 }
+
+// ---- Task 5: distribution registry + Normal `@logdensity` -------------------
+//
+// The registry framework (`registry.rs`: ctor-name-keyed `DistLowering`
+// table + `Params`), the §08 Normal `logpdf` builder, and the `emit_logdensity`
+// mode builder (`modes.rs`) — the first fully emitted StableHLO module (the
+// density vertical slice). `Emitter::lower_node`'s `builtin_logdensityof`
+// head now dispatches through the registry instead of falling through to
+// `ops::lower_builtin`'s catch-all refusal.
+
+/// The Task-5 anchor fixture: a scalar Normal with free (`elementof`-declared)
+/// `mu`/`sigma`, scored at a pinned observation via
+/// `logdensityof(lawof(record(...)), record(...))` — the same record-of-draws
+/// shape every `flatppl-determinizer` density golden uses
+/// (`crates/determinizer/tests/density_golden.rs`), just with `elementof`
+/// parameters (not literals) so `mu`/`sigma` survive determinize as free
+/// parameters rather than being folded away.
+const NORMAL_DENSITY_SRC: &str = "\
+mu = elementof(reals)
+sigma = elementof(posreals)
+a = draw(Normal(mu = mu, sigma = sigma))
+lp = logdensityof(lawof(record(a = a)), record(a = 0.5))
+";
+
+/// Parse, infer, and determinize `src`, panicking (with the diagnostics/
+/// refusal) if any step fails — the shared setup for every Task-5 test below.
+fn determinize_src(src: &str) -> Module {
+    let mut m = flatppl_syntax::parse(src).expect("parse");
+    let diags = flatppl_infer::infer(&mut m);
+    assert!(diags.is_empty(), "infer diagnostics: {diags:?}");
+    flatppl_determinizer::determinize(&m).expect("must determinize, not refuse")
+}
+
+fn emit_logdensity(m: &Module) -> String {
+    flatppl_stablehlo::emit(
+        m,
+        flatppl_stablehlo::Mode::LogDensity,
+        &flatppl_stablehlo::EmitOptions::default(),
+    )
+    .expect("must emit @logdensity")
+}
+
+/// The brief's Step-1 structural test: `mu`/`sigma` become `func.func` args
+/// (free parameters), the pinned observation is walked to a
+/// `stablehlo.constant` (no special-casing needed — `Lit` dispatch already
+/// handles it), and the Normal formula's op counts are exact. Normal needs no
+/// `chlo.*` special function.
+#[test]
+fn emit_logdensity_normal_has_expected_structure() {
+    let d = determinize_src(NORMAL_DENSITY_SRC);
+    assert!(
+        flatppl_determinizer::is_flatpdl(&d).is_ok(),
+        "determinized module must be FlatPDL-conformant (no residual measure node)"
+    );
+
+    let out = emit_logdensity(&d);
+
+    assert!(
+        out.contains("func.func @logdensity"),
+        "missing func.func @logdensity in:\n{out}"
+    );
+    assert!(
+        out.contains("-> tensor<f32>"),
+        "must return tensor<f32> in:\n{out}"
+    );
+    assert!(
+        out.contains("%arg0: tensor<f32>") && out.contains("%arg1: tensor<f32>"),
+        "mu/sigma must become func args, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.log").count(),
+        1,
+        "expected exactly one log, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.negate").count(),
+        1,
+        "expected exactly one negate, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.subtract").count(),
+        1,
+        "expected exactly one subtract, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.divide").count(),
+        1,
+        "expected exactly one divide, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.multiply").count(),
+        2,
+        "expected exactly two multiplies, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.add").count(),
+        2,
+        "expected exactly two adds, in:\n{out}"
+    );
+    assert!(
+        !out.contains("chlo."),
+        "Normal needs no CHLO ops, in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// Freeze the exact emitted text: any drift (op count, ordering, arg naming,
+/// formula) must be a deliberate, reviewed change to this golden file.
+#[test]
+fn emit_logdensity_normal_matches_frozen_golden() {
+    let d = determinize_src(NORMAL_DENSITY_SRC);
+    let out = emit_logdensity(&d);
+    let golden = include_str!("goldens/normal_logdensity.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted @logdensity drifted from the frozen golden (tests/goldens/normal_logdensity.mlir)"
+    );
+}
+
+/// Build a `record(%field name1 = value1, ...)` call node — a hand-built
+/// `kernel_input` for the `builtin_logdensityof` refuse tests below (mirrors
+/// `flatppl_determinizer::density::build_record`, which this crate cannot
+/// depend on directly).
+fn record_node(m: &mut Module, fields: &[(&str, NodeId)]) -> NodeId {
+    let head = m.intern("record");
+    let named: Vec<flatppl_core::NamedArg> = fields
+        .iter()
+        .map(|&(name, value)| flatppl_core::NamedArg {
+            kind: flatppl_core::NamedKind::Field,
+            name: m.intern(name),
+            value,
+        })
+        .collect();
+    m.alloc(Node::Call(Call {
+        head: CallHead::Builtin(head),
+        args: Vec::<NodeId>::new().into(),
+        named: named.into(),
+        inputs: None,
+    }))
+}
+
+/// `builtin_logdensityof(Cauchy, ..., v)` — a distribution with no registry
+/// entry — must refuse precisely (refuse-don't-mislower), not panic or guess
+/// a lowering.
+#[test]
+fn builtin_logdensityof_refuses_unregistered_ctor() {
+    let mut m = Module::new();
+    let ctor = const_node(&mut m, "Cauchy");
+    let field_val = real(&mut m, 0.0);
+    let kernel_input = record_node(&mut m, &[("x0", field_val)]);
+    let v = real(&mut m, 1.0);
+    let node = call(&mut m, "builtin_logdensityof", &[ctor, kernel_input, v]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    let err = e.lower_node(node).unwrap_err();
+    assert!(
+        err.msg.contains("no lowering for distribution 'Cauchy'"),
+        "unexpected message: {}",
+        err.msg
+    );
+    assert_eq!(err.node, Some(node));
+}
+
+/// `builtin_logdensityof`'s kernel must be a bare `Const` distribution
+/// constructor (never a general expression) — a `Ref` in that position
+/// refuses rather than being silently mis-resolved.
+#[test]
+fn builtin_logdensityof_refuses_non_const_kernel() {
+    let mut m = Module::new();
+    let kernel = local_ref(&mut m, "k");
+    let kernel_input = call(&mut m, "record", &[]);
+    let v = real(&mut m, 1.0);
+    let node = call(&mut m, "builtin_logdensityof", &[kernel, kernel_input, v]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    let err = e.lower_node(node).unwrap_err();
+    assert!(
+        err.msg.contains("bare distribution constructor"),
+        "unexpected message: {}",
+        err.msg
+    );
+    assert_eq!(err.node, Some(kernel));
+}
+
+/// A `builtin_logdensityof(Normal, kernel_input, v)` whose `kernel_input`
+/// record is missing a parameter the registry entry needs (`sigma`) must
+/// refuse, naming the missing field, rather than panicking on the `None`.
+#[test]
+fn normal_logpdf_refuses_missing_kernel_input_field() {
+    let mut m = Module::new();
+    let ctor = const_node(&mut m, "Normal");
+    let mu_val = real(&mut m, 0.0);
+    let kernel_input = record_node(&mut m, &[("mu", mu_val)]);
+    let v = real(&mut m, 1.0);
+    let node = call(&mut m, "builtin_logdensityof", &[ctor, kernel_input, v]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    let err = e.lower_node(node).unwrap_err();
+    assert!(err.msg.contains("sigma"), "unexpected message: {}", err.msg);
+}

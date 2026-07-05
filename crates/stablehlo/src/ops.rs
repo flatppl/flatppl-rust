@@ -13,12 +13,13 @@
 //! A `builtin_*` primitive (`builtin_logdensityof`, `builtin_sample`,
 //! `builtin_touniform`, `builtin_fromuniform`, `builtin_tonormal`,
 //! `builtin_fromnormal`) or a bare distribution constructor name (`Normal`,
-//! …) is §08/registry territory — Task 5's job, not this one's. There is no
-//! registry to consult yet, so those heads simply fall through to the
-//! catch-all "unsupported builtin head" refusal below; once Task 5 adds a
-//! registry, `lower_node` is expected to gain a head-recognized-by-the-
-//! registry check *before* calling here (per the implementation plan), at
-//! which point this catch-all only ever sees genuinely unknown heads.
+//! …) is §08/registry territory. As of Task 5, `Emitter::lower_node`'s `Call`
+//! dispatch recognizes `builtin_logdensityof` itself and routes it to
+//! `crate::registry::lower_logdensityof` *before* ever calling into this
+//! module, so the catch-all "unsupported builtin head" refusal below only
+//! ever sees a genuinely unknown head (or one of the other `builtin_*`
+//! primitives, still unimplemented until a later task adds a matching
+//! registry gate for it).
 
 use flatppl_core::{CallHead, Node, NodeId, Scalar};
 
