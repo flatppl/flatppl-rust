@@ -19,9 +19,16 @@
 //! and the typed op-helper API (elementary ops, CHLO special functions,
 //! reductions, matrix helpers, and `finish`'s module/func assembly) that
 //! Task 4's node-dispatch lowering is built on top of.
+//!
+//! Task 4 adds [`Emitter::lower_node`] (leaf/call dispatch + memoization)
+//! and `ops::lower_builtin` (the deterministic builtin-head → op map for
+//! every non-distribution `Call`): together they turn any post-determinize
+//! FlatPDL expression graph into a [`Value`], composing only Task 3's
+//! op-helper API.
 
 mod emitter;
 mod mlir;
+mod ops;
 mod refuse;
 mod types;
 

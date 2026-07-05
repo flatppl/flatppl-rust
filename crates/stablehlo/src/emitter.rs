@@ -26,10 +26,11 @@
 
 use std::collections::HashMap;
 
-use flatppl_core::{Module, NodeId};
+use flatppl_core::{CallHead, Module, Node, NodeId, Ref, RefNs, Scalar, Symbol};
 
 use crate::Dtype;
 use crate::mlir::{MlirTy, Value};
+use crate::refuse::EmitError;
 
 /// The dtype-exact `stablehlo.reduce` identity for `stablehlo.maximum`: real
 /// negative infinity, spelled as the raw bit pattern MLIR's float-attribute
@@ -43,21 +44,32 @@ fn reduce_max_identity(dtype: Dtype) -> &'static str {
     }
 }
 
+/// The dtype-exact StableHLO literal for **positive** infinity — the mirror
+/// of [`reduce_max_identity`] (same magnitude bit pattern, sign bit
+/// cleared). See [`Emitter::inf`] for why the decimal-literal path
+/// (`render_float_literal`) can't be used instead.
+fn pos_inf_literal(dtype: Dtype) -> &'static str {
+    match dtype {
+        Dtype::F32 => "0x7F800000",
+        Dtype::F64 => "0x7FF0000000000000",
+    }
+}
+
 /// Emits textual StableHLO into an internal buffer while assigning fresh SSA
 /// names and tracking which FlatPDL [`NodeId`]s have already been lowered.
 pub struct Emitter<'m> {
-    /// The FlatPDL module being lowered. Unused by the op helpers in this
-    /// file (they operate on already-typed [`Value`]s, not on `Module`
-    /// nodes); read by Task 4's `lower_node` dispatch to resolve node
-    /// structure/types via `self.m`.
-    #[allow(dead_code)]
+    /// The FlatPDL module being lowered. Read by [`Emitter::lower_node`]'s
+    /// dispatch (node structure) and by [`Emitter::node`]/[`Emitter::resolve`]
+    /// (narrow accessors `crate::ops::lower_builtin` uses to inspect a call's
+    /// structure from outside this module).
     m: &'m Module,
     dtype: Dtype,
     next: u32,
     /// Memoizes `NodeId -> Value` so a shared sub-expression is lowered (and
-    /// its op line emitted) once. Populated and consulted by Task 4's
-    /// `lower_node`, not by this file's op helpers.
-    #[allow(dead_code)]
+    /// its op line emitted) once — see [`Emitter::lower_node`]. Also the seed
+    /// point for a caller-bound leaf (a function/kernel argument's `NodeId`
+    /// pre-bound to its `%argN` `Value` via [`Emitter::bind`]) before the body
+    /// graph that references it is walked.
     memo: HashMap<NodeId, Value>,
     body: String,
 }
@@ -106,6 +118,25 @@ impl<'m> Emitter<'m> {
     /// A scalar-literal convenience: `constant(x, MlirTy::Scalar)`.
     pub fn scalar(&mut self, x: f64) -> Value {
         self.constant(x, MlirTy::Scalar)
+    }
+
+    /// `%N = stablehlo.constant dense<+inf> : ty` — positive infinity (the
+    /// `ifelse`/`neg(inf)` "outside the support" log-density floor). Cannot
+    /// go through [`Emitter::constant`]: that renders `x` as a *decimal*
+    /// literal (`render_float_literal`), and `f64::INFINITY` prints as `inf`,
+    /// which — like the bare `-inf` a decimal `f64::NEG_INFINITY` would
+    /// produce — is not a valid MLIR float-attribute token (verified against
+    /// the real StableHLO parser, jax 0.10.2); only the dtype-exact hex bit
+    /// pattern parses. Same reasoning as [`reduce_max_identity`]'s negative
+    /// infinity, sign bit cleared.
+    pub fn inf(&mut self, ty: MlirTy) -> Value {
+        let ssa = self.fresh();
+        let ty_text = ty.render(self.dtype);
+        let lit = pos_inf_literal(self.dtype);
+        self.push(&format!(
+            "{ssa} = stablehlo.constant dense<{lit}> : {ty_text}"
+        ));
+        Value { ssa, ty }
     }
 
     /// One elementwise unary op: `%N = {op} %a : ty`. Result type copies the
@@ -205,6 +236,92 @@ impl<'m> Emitter<'m> {
             ssa,
             ty: a.ty.clone(),
         }
+    }
+
+    // ---- shape ops (Task 4: `get`/`get0`, `logsumexp`/`in` broadcasting) ---
+
+    /// `%N = stablehlo.slice %a [s0:l0, s1:l1:t1, ...] : (operand_ty) ->
+    /// result_ty` — a static per-axis slice (`starts`/`limits`/`strides`,
+    /// one triple per `a`'s rank; StableHLO's pretty form omits `:stride`
+    /// when it's `1`). Each result dimension is `(limit - start).div_ceil(stride)`.
+    pub fn slice(&mut self, a: &Value, starts: &[u64], limits: &[u64], strides: &[u64]) -> Value {
+        let dims = match &a.ty {
+            MlirTy::Ranked(dims) => dims,
+            other => panic!("slice expects a ranked operand, got {other:?}"),
+        };
+        assert_eq!(dims.len(), starts.len(), "slice: starts rank mismatch");
+        assert_eq!(dims.len(), limits.len(), "slice: limits rank mismatch");
+        assert_eq!(dims.len(), strides.len(), "slice: strides rank mismatch");
+
+        let ranges: Vec<String> = starts
+            .iter()
+            .zip(limits)
+            .zip(strides)
+            .map(|((s, l), t)| {
+                if *t == 1 {
+                    format!("{s}:{l}")
+                } else {
+                    format!("{s}:{l}:{t}")
+                }
+            })
+            .collect();
+        let result_dims: Vec<Option<u64>> = starts
+            .iter()
+            .zip(limits)
+            .zip(strides)
+            .map(|((s, l), t)| Some((l - s).div_ceil(*t)))
+            .collect();
+        let result_ty = MlirTy::Ranked(result_dims);
+
+        let ssa = self.fresh();
+        let operand_ty = a.ty.render(self.dtype);
+        let result_ty_text = result_ty.render(self.dtype);
+        self.push(&format!(
+            "{ssa} = stablehlo.slice {} [{}] : ({operand_ty}) -> {result_ty_text}",
+            a.ssa,
+            ranges.join(", ")
+        ));
+        Value { ssa, ty: result_ty }
+    }
+
+    /// `%N = stablehlo.reshape %a : (operand_ty) -> result_ty` — reinterprets
+    /// `a`'s elements (same element count) under a different static shape,
+    /// e.g. dropping `get0`/`get`'s now-length-1 sliced axis down to a
+    /// `Scalar`.
+    pub fn reshape(&mut self, a: &Value, ty: MlirTy) -> Value {
+        let ssa = self.fresh();
+        let operand_ty = a.ty.render(self.dtype);
+        let result_ty_text = ty.render(self.dtype);
+        self.push(&format!(
+            "{ssa} = stablehlo.reshape {} : ({operand_ty}) -> {result_ty_text}",
+            a.ssa
+        ));
+        Value { ssa, ty }
+    }
+
+    /// `%N = stablehlo.broadcast_in_dim %a, dims = [...] : (operand_ty) ->
+    /// ty` — broadcasts `a` up to the (larger) shape `ty`, mapping `a`'s
+    /// existing dimensions onto the `dims` positions of the result, in
+    /// order. A rank-0 (`Scalar`) operand takes `dims = []`, StableHLO's
+    /// documented scalar-broadcast form — the only shape this emitter's
+    /// callers need today (`logsumexp`'s reduced max, `in`'s interval bounds,
+    /// broadcast back up to the input vector/variate's shape; StableHLO's
+    /// elementwise ops require identical operand shapes, no implicit
+    /// broadcast).
+    pub fn broadcast_in_dim(&mut self, a: &Value, dims: &[u64], ty: MlirTy) -> Value {
+        let ssa = self.fresh();
+        let operand_ty = a.ty.render(self.dtype);
+        let result_ty_text = ty.render(self.dtype);
+        let dims_text = dims
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.push(&format!(
+            "{ssa} = stablehlo.broadcast_in_dim {}, dims = [{dims_text}] : ({operand_ty}) -> {result_ty_text}",
+            a.ssa
+        ));
+        Value { ssa, ty }
     }
 
     // ---- CHLO special functions ------------------------------------------
@@ -416,6 +533,119 @@ impl<'m> Emitter<'m> {
             l.ssa, b.ssa
         ));
         Value { ssa, ty: result_ty }
+    }
+
+    // ---- node dispatch (Task 4) ---------------------------------------------
+
+    /// Pre-bind `id` to `value` in the memo map, without emitting any op.
+    /// Used by the mode builder (Task 5+) to seed a model input's `NodeId`
+    /// with its already-allocated `%argN` value before the body graph that
+    /// references it is walked — [`Emitter::lower_node`]'s `Ref{Local, ..}`
+    /// case (a `%local` function/kernel argument) refuses precisely because
+    /// it expects the caller to have done this first, rather than guessing an
+    /// argument's `Value` itself.
+    pub fn bind(&mut self, id: NodeId, value: Value) {
+        self.memo.insert(id, value);
+    }
+
+    /// Read a node from the underlying module. A narrow accessor for
+    /// `crate::ops::lower_builtin` (a sibling module, so it cannot reach the
+    /// private `m` field directly) to inspect a call's structure — e.g. a
+    /// `get`/`get0` selector, which must be a literal, not a general
+    /// expression to recursively lower.
+    pub(crate) fn node(&self, id: NodeId) -> &Node {
+        self.m.node(id)
+    }
+
+    /// Resolve an interned name. A narrow accessor mirroring [`Emitter::node`].
+    pub(crate) fn resolve(&self, sym: Symbol) -> &str {
+        self.m.resolve(sym)
+    }
+
+    /// Lower one FlatPDL node to a [`Value`], memoizing the result so a
+    /// shared sub-expression — reached from more than one parent, e.g. a
+    /// `Ref`ed top-level binding used twice, or a caller-[`Emitter::bind`]-
+    /// bound argument read at several sites — is only ever emitted once:
+    /// later calls for the same `id` return the *same* `Value` (same SSA
+    /// name) without appending any further op text.
+    pub fn lower_node(&mut self, id: NodeId) -> Result<Value, EmitError> {
+        if let Some(v) = self.memo.get(&id) {
+            return Ok(v.clone());
+        }
+        let value = self.lower_node_uncached(id)?;
+        self.memo.insert(id, value.clone());
+        Ok(value)
+    }
+
+    /// The uncached half of [`Emitter::lower_node`]'s dispatch: every FlatPDL
+    /// leaf/call kind that can reach this emitter, matched once. `self.m` is
+    /// read out as a plain `&'m Module` up front — an ordinary reference
+    /// value copied out of the field, not a borrow of `self` — so the match
+    /// arms below stay free to call back into `&mut self` (e.g. `self.add`,
+    /// `self.lower_node`) while still holding a node/child reference derived
+    /// from it.
+    fn lower_node_uncached(&mut self, id: NodeId) -> Result<Value, EmitError> {
+        let m: &'m Module = self.m;
+        match m.node(id) {
+            Node::Lit(Scalar::Int(i)) => Ok(self.constant(*i as f64, MlirTy::Scalar)),
+            Node::Lit(Scalar::Real(x)) => Ok(self.constant(*x, MlirTy::Scalar)),
+            Node::Lit(Scalar::Bool(b)) => {
+                Ok(self.constant(if *b { 1.0 } else { 0.0 }, MlirTy::Scalar))
+            }
+            Node::Lit(Scalar::Str(_)) => {
+                Err(EmitError::at(id, "string literal has no tensor form"))
+            }
+            // A bare built-in constant (`inf`, `pi`, ...) — dispatched through
+            // the same builtin-head map as a zero-arg call, so `inf`'s entry
+            // there is the single source of truth for both spellings.
+            Node::Const(sym) => {
+                let name = m.resolve(*sym).to_string();
+                crate::ops::lower_builtin(self, id, &name, &[])
+            }
+            Node::Ref(r) => self.lower_ref(id, *r),
+            Node::Hole => Err(EmitError::at(id, "bare hole has no tensor form")),
+            Node::Axis(_) => Err(EmitError::at(id, "axis label has no tensor form")),
+            Node::Call(call) => match call.head {
+                CallHead::Builtin(sym) => {
+                    let name = m.resolve(sym).to_string();
+                    crate::ops::lower_builtin(self, id, &name, &call.args)
+                }
+                CallHead::User(_) => Err(EmitError::at(
+                    id,
+                    "user-callable application has no lowering (expected to be inlined by determinize)",
+                )),
+            },
+        }
+    }
+
+    /// Resolve a `Ref` leaf. `SelfMod` dereferences through the module's
+    /// top-level binding table and recurses (memoized, so re-`Ref`ing the
+    /// same binding from several call sites still emits its RHS only once).
+    /// `Local` (a `%local` function/kernel argument) refuses: the caller is
+    /// expected to have pre-bound it via [`Emitter::bind`] before this node
+    /// is ever visited, so reaching here means it didn't. `Module` (a
+    /// standard-module member reference) has no lowering yet.
+    fn lower_ref(&mut self, id: NodeId, r: Ref) -> Result<Value, EmitError> {
+        match r.ns {
+            RefNs::SelfMod => {
+                let bid = self.m.binding_by_name(r.name).ok_or_else(|| {
+                    EmitError::at(
+                        id,
+                        format!("unresolved reference '{}'", self.m.resolve(r.name)),
+                    )
+                })?;
+                let rhs = self.m.binding(bid).rhs;
+                self.lower_node(rhs)
+            }
+            RefNs::Local => Err(EmitError::at(
+                id,
+                "unbound %local reference (expected to be pre-bound by the caller via Emitter::bind)",
+            )),
+            RefNs::Module(_) => Err(EmitError::at(
+                id,
+                "module-member reference has no lowering yet",
+            )),
+        }
     }
 
     // ---- module assembly ----------------------------------------------------

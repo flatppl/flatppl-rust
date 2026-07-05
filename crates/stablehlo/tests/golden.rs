@@ -7,8 +7,10 @@
 //! `set_type` the type under test) rather than parsing + inferring source,
 //! since only the type side-table matters for this mapping.
 
-use flatppl_core::{Dim, Mass, Module, Node, Scalar, ScalarType, Type};
-use flatppl_stablehlo::{Dtype, Emitter, MlirTy, mlir_type_of};
+use flatppl_core::{
+    Binding, Call, CallHead, Dim, Mass, Module, Node, NodeId, Ref, RefNs, Scalar, ScalarType, Type,
+};
+use flatppl_stablehlo::{Dtype, Emitter, MlirTy, Value, mlir_type_of};
 
 /// Every physical `{`/`(`/`[` in `s` has a matching close, and vice versa —
 /// a cheap structural well-formedness check for hand-assembled MLIR text
@@ -415,4 +417,587 @@ fn emitter_fresh_ssa_names_never_repeat() {
     names.sort();
     names.dedup();
     assert_eq!(names.len(), 3);
+}
+
+// ---- Task 4: node dispatch + deterministic op map -------------------------
+//
+// All of these build tiny FlatPDL fragments by hand (no parse/infer pass —
+// `Emitter::lower_node`'s dispatch never consults the type side-table, only
+// node structure and already-lowered operand shapes) mirroring Task 2/3's
+// hand-built-`Module` test style.
+
+fn top_level(m: &mut Module, name: &str, rhs: NodeId) {
+    let sym = m.intern(name);
+    m.add_binding(Binding {
+        name: sym,
+        rhs,
+        doc: None,
+        public: true,
+        synthetic: false,
+    });
+}
+
+fn call(m: &mut Module, head: &str, args: &[NodeId]) -> NodeId {
+    let sym = m.intern(head);
+    m.alloc(Node::Call(Call {
+        head: CallHead::Builtin(sym),
+        args: args.to_vec().into(),
+        named: Vec::new().into(),
+        inputs: None,
+    }))
+}
+
+fn self_ref(m: &mut Module, name: &str) -> NodeId {
+    let sym = m.intern(name);
+    m.alloc(Node::Ref(Ref {
+        ns: RefNs::SelfMod,
+        name: sym,
+    }))
+}
+
+fn local_ref(m: &mut Module, name: &str) -> NodeId {
+    let sym = m.intern(name);
+    m.alloc(Node::Ref(Ref {
+        ns: RefNs::Local,
+        name: sym,
+    }))
+}
+
+fn const_node(m: &mut Module, name: &str) -> NodeId {
+    let sym = m.intern(name);
+    m.alloc(Node::Const(sym))
+}
+
+fn real(m: &mut Module, x: f64) -> NodeId {
+    m.alloc(Node::Lit(Scalar::Real(x)))
+}
+
+fn int(m: &mut Module, i: i64) -> NodeId {
+    m.alloc(Node::Lit(Scalar::Int(i)))
+}
+
+/// The brief's Step-1 fragment, verbatim: `add(mul(x, 2.0), 1.0)` must emit
+/// one `stablehlo.multiply` before one `stablehlo.add` (`x` a top-level
+/// binding, reached via `Ref`).
+#[test]
+fn lower_node_add_mul_emits_multiply_before_add() {
+    let mut m = Module::new();
+    let x = real(&mut m, 3.0);
+    top_level(&mut m, "x", x);
+    let x_ref = self_ref(&mut m, "x");
+    let two = real(&mut m, 2.0);
+    let one = real(&mut m, 1.0);
+    let mul_node = call(&mut m, "mul", &[x_ref, two]);
+    let add_node = call(&mut m, "add", &[mul_node, one]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    let result = e.lower_node(add_node).unwrap();
+    let out = e.finish("logdensity", &[], &result);
+
+    let mul_pos = out.find("stablehlo.multiply").expect("missing multiply");
+    let add_pos = out.find("stablehlo.add").expect("missing add");
+    assert!(mul_pos < add_pos, "expected multiply before add in:\n{out}");
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// Every named head in the Step-2 map dispatches through `lower_builtin` to
+/// the StableHLO op its `Emitter` helper emits.
+#[test]
+fn lower_builtin_head_map_dispatches_expected_ops() {
+    let cases: &[(&str, &str, usize)] = &[
+        ("add", "stablehlo.add", 2),
+        ("sub", "stablehlo.subtract", 2),
+        ("mul", "stablehlo.multiply", 2),
+        ("div", "stablehlo.divide", 2),
+        ("pow", "stablehlo.power", 2),
+        ("neg", "stablehlo.negate", 1),
+        ("log", "stablehlo.log", 1),
+        ("exp", "stablehlo.exponential", 1),
+        ("sqrt", "stablehlo.sqrt", 1),
+        ("abs", "stablehlo.abs", 1),
+        ("cos", "stablehlo.cosine", 1),
+    ];
+    for &(head, op, arity) in cases {
+        let mut m = Module::new();
+        let a = real(&mut m, 2.0);
+        let b = real(&mut m, 3.0);
+        let args: Vec<NodeId> = if arity == 1 { vec![a] } else { vec![a, b] };
+        let node = call(&mut m, head, &args);
+
+        let mut e = Emitter::new(&m, Dtype::F32);
+        let result = e.lower_node(node).unwrap();
+        let out = e.finish("f", &[], &result);
+        assert!(out.contains(op), "head '{head}': missing {op} in:\n{out}");
+        assert!(is_delimiter_balanced(&out));
+    }
+}
+
+/// `ifelse(in(v, interval(lo, hi)), a, neg(inf))` — the exact shape the
+/// determiniser's `truncate` lowering builds — must lower to a single
+/// `compare` feeding a `select`, and `inf` must use the dtype-exact `+inf`
+/// bit pattern (a decimal `f64::INFINITY` literal does not parse as an MLIR
+/// float attribute).
+#[test]
+fn lower_ifelse_of_in_interval_selects_via_stablehlo_select() {
+    let mut m = Module::new();
+    let v = local_ref(&mut m, "v");
+    let lo = real(&mut m, 0.0);
+    let hi = real(&mut m, 1.0);
+    let interval = call(&mut m, "interval", &[lo, hi]);
+    let cond = call(&mut m, "in", &[v, interval]);
+    let a = real(&mut m, 2.0);
+    let inf_node = const_node(&mut m, "inf");
+    let neg_inf = call(&mut m, "neg", &[inf_node]);
+    let ifelse_node = call(&mut m, "ifelse", &[cond, a, neg_inf]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    e.bind(
+        v,
+        Value {
+            ssa: "%arg0".to_string(),
+            ty: MlirTy::Scalar,
+        },
+    );
+    let result = e.lower_node(ifelse_node).unwrap();
+    let out = e.finish(
+        "logdensity",
+        &[("%arg0".to_string(), MlirTy::Scalar)],
+        &result,
+    );
+
+    assert!(
+        out.contains("stablehlo.compare GE"),
+        "missing compare in:\n{out}"
+    );
+    assert!(
+        out.contains("stablehlo.select"),
+        "missing select in:\n{out}"
+    );
+    assert!(
+        out.contains("dense<0x7F800000>"),
+        "missing dtype-exact +inf in:\n{out}"
+    );
+    let compare_pos = out.find("stablehlo.compare").unwrap();
+    let select_pos = out.find("stablehlo.select").unwrap();
+    assert!(compare_pos < select_pos);
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// `logsumexp(v)` must emit the numerically-stable shift-by-max formula in
+/// order: `max` reduce, broadcast the max back up to `v`'s shape, subtract,
+/// `exp`, `sum` reduce, `log`, then the final `+ max`.
+#[test]
+fn lower_logsumexp_emits_stable_shift_by_max_formula_in_order() {
+    let mut m = Module::new();
+    let v = local_ref(&mut m, "v");
+    let node = call(&mut m, "logsumexp", &[v]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    e.bind(
+        v,
+        Value {
+            ssa: "%arg0".to_string(),
+            ty: MlirTy::Ranked(vec![Some(3)]),
+        },
+    );
+    let result = e.lower_node(node).unwrap();
+    assert_eq!(result.ty, MlirTy::Scalar);
+    let out = e.finish(
+        "f",
+        &[("%arg0".to_string(), MlirTy::Ranked(vec![Some(3)]))],
+        &result,
+    );
+
+    let max_pos = out
+        .find("applies stablehlo.maximum across dimensions")
+        .expect("missing max reduce");
+    let bc_pos = out
+        .find("stablehlo.broadcast_in_dim")
+        .expect("missing broadcast");
+    let sub_pos = out.find("stablehlo.subtract").expect("missing subtract");
+    let exp_pos = out
+        .find("stablehlo.exponential")
+        .expect("missing exponential");
+    let sum_pos = out
+        .find("applies stablehlo.add across dimensions")
+        .expect("missing sum reduce");
+    let log_pos = out.find("stablehlo.log").expect("missing log");
+    // The outer `log_sum + m` add, distinguished from the sum-reduce's
+    // "applies stablehlo.add across ..." text by the `%`-operand form.
+    let final_add_pos = out.find("stablehlo.add %").expect("missing final add");
+
+    assert!(max_pos < bc_pos, "max before broadcast, in:\n{out}");
+    assert!(bc_pos < sub_pos, "broadcast before subtract, in:\n{out}");
+    assert!(sub_pos < exp_pos, "subtract before exp, in:\n{out}");
+    assert!(exp_pos < sum_pos, "exp before sum reduce, in:\n{out}");
+    assert!(sum_pos < log_pos, "sum reduce before log, in:\n{out}");
+    assert!(log_pos < final_add_pos, "log before final add, in:\n{out}");
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// `in(v, interval(lo, hi))` with a scalar `v` (matching lo/hi's shape)
+/// reduces to a single `compare` — two `subtract`s and one `multiply`, no
+/// `broadcast_in_dim` (shapes already match).
+#[test]
+fn lower_in_interval_reduces_to_one_compare() {
+    let mut m = Module::new();
+    let v = local_ref(&mut m, "v");
+    let lo = real(&mut m, 0.0);
+    let hi = real(&mut m, 1.0);
+    let interval = call(&mut m, "interval", &[lo, hi]);
+    let node = call(&mut m, "in", &[v, interval]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    e.bind(
+        v,
+        Value {
+            ssa: "%arg0".to_string(),
+            ty: MlirTy::Scalar,
+        },
+    );
+    let result = e.lower_node(node).unwrap();
+    let out = e.finish("f", &[("%arg0".to_string(), MlirTy::Scalar)], &result);
+
+    assert_eq!(
+        out.matches("stablehlo.subtract").count(),
+        2,
+        "expected v-lo and hi-v subtracts, in:\n{out}"
+    );
+    assert_eq!(out.matches("stablehlo.multiply").count(), 1);
+    assert!(out.contains("stablehlo.compare GE"));
+    assert!(
+        !out.contains("broadcast_in_dim"),
+        "scalar operands need no broadcast, in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+#[test]
+fn lower_in_refuses_non_interval_set() {
+    let mut m = Module::new();
+    let v = local_ref(&mut m, "v");
+    let reals = const_node(&mut m, "reals");
+    let node = call(&mut m, "in", &[v, reals]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    e.bind(
+        v,
+        Value {
+            ssa: "%arg0".to_string(),
+            ty: MlirTy::Scalar,
+        },
+    );
+    let err = e.lower_node(node).unwrap_err();
+    assert!(
+        err.msg.contains("interval"),
+        "unexpected message: {}",
+        err.msg
+    );
+}
+
+/// `get0(v, 2)` on a length-5 rank-1 `v` slices out element 2 then reshapes
+/// the length-1 result down to a `Scalar`.
+#[test]
+fn lower_get0_slices_and_reshapes_to_scalar() {
+    let mut m = Module::new();
+    let v = local_ref(&mut m, "v");
+    let idx = int(&mut m, 2);
+    let node = call(&mut m, "get0", &[v, idx]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    e.bind(
+        v,
+        Value {
+            ssa: "%arg0".to_string(),
+            ty: MlirTy::Ranked(vec![Some(5)]),
+        },
+    );
+    let result = e.lower_node(node).unwrap();
+    assert_eq!(result.ty, MlirTy::Scalar);
+    let out = e.finish(
+        "f",
+        &[("%arg0".to_string(), MlirTy::Ranked(vec![Some(5)]))],
+        &result,
+    );
+
+    assert!(
+        out.contains("stablehlo.slice %arg0 [2:3]"),
+        "unexpected slice bounds in:\n{out}"
+    );
+    assert!(out.contains("stablehlo.reshape"));
+    let slice_pos = out.find("stablehlo.slice").unwrap();
+    let reshape_pos = out.find("stablehlo.reshape").unwrap();
+    assert!(slice_pos < reshape_pos);
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// `get(v, 1)` (1-based) must slice the *same* element as `get0(v, 0)`.
+#[test]
+fn lower_get_is_one_based() {
+    let mut m = Module::new();
+    let v = local_ref(&mut m, "v");
+    let idx = int(&mut m, 1);
+    let node = call(&mut m, "get", &[v, idx]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    e.bind(
+        v,
+        Value {
+            ssa: "%arg0".to_string(),
+            ty: MlirTy::Ranked(vec![Some(5)]),
+        },
+    );
+    let result = e.lower_node(node).unwrap();
+    let out = e.finish(
+        "f",
+        &[("%arg0".to_string(), MlirTy::Ranked(vec![Some(5)]))],
+        &result,
+    );
+    assert!(
+        out.contains("stablehlo.slice %arg0 [0:1]"),
+        "expected 1-based get(v, 1) to slice index 0, in:\n{out}"
+    );
+}
+
+#[test]
+fn lower_get0_refuses_non_rank1_container() {
+    let mut m = Module::new();
+    let v = local_ref(&mut m, "v");
+    let idx = int(&mut m, 0);
+    let node = call(&mut m, "get0", &[v, idx]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    e.bind(
+        v,
+        Value {
+            ssa: "%arg0".to_string(),
+            ty: MlirTy::Scalar,
+        },
+    );
+    let err = e.lower_node(node).unwrap_err();
+    assert!(
+        err.msg.contains("rank-1"),
+        "unexpected message: {}",
+        err.msg
+    );
+}
+
+#[test]
+fn lower_get0_refuses_non_literal_index() {
+    let mut m = Module::new();
+    let v = local_ref(&mut m, "v");
+    let idx = local_ref(&mut m, "i");
+    let node = call(&mut m, "get0", &[v, idx]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    e.bind(
+        v,
+        Value {
+            ssa: "%arg0".to_string(),
+            ty: MlirTy::Ranked(vec![Some(5)]),
+        },
+    );
+    let err = e.lower_node(node).unwrap_err();
+    assert!(
+        err.msg.contains("literal integer"),
+        "unexpected message: {}",
+        err.msg
+    );
+}
+
+#[test]
+fn lower_get0_refuses_out_of_range_index() {
+    let mut m = Module::new();
+    let v = local_ref(&mut m, "v");
+    let idx = int(&mut m, 5);
+    let node = call(&mut m, "get0", &[v, idx]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    e.bind(
+        v,
+        Value {
+            ssa: "%arg0".to_string(),
+            ty: MlirTy::Ranked(vec![Some(3)]),
+        },
+    );
+    let err = e.lower_node(node).unwrap_err();
+    assert!(
+        err.msg.contains("out of range"),
+        "unexpected message: {}",
+        err.msg
+    );
+}
+
+/// A `Ref`ed top-level binding used from two call sites must be lowered
+/// once: the shared ancestor's op(s) appear exactly once in the output, and
+/// both use sites reuse the same SSA name.
+#[test]
+fn lower_node_memoizes_shared_ancestor() {
+    let mut m = Module::new();
+    let x = real(&mut m, 5.0);
+    top_level(&mut m, "x", x);
+    let x_ref1 = self_ref(&mut m, "x");
+    let x_ref2 = self_ref(&mut m, "x");
+    let two = real(&mut m, 2.0);
+    let doubled = call(&mut m, "mul", &[x_ref2, two]);
+    let node = call(&mut m, "add", &[x_ref1, doubled]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    let result = e.lower_node(node).unwrap();
+    let out = e.finish("f", &[], &result);
+
+    assert_eq!(
+        out.matches("dense<5").count(),
+        1,
+        "x re-emitted instead of reused, in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+#[test]
+fn lower_builtin_refuses_unknown_head() {
+    let mut m = Module::new();
+    let a = real(&mut m, 1.0);
+    let node = call(&mut m, "frobnicate", &[a]);
+    let mut e = Emitter::new(&m, Dtype::F32);
+    let err = e.lower_node(node).unwrap_err();
+    assert!(
+        err.msg.contains("unsupported builtin head 'frobnicate'"),
+        "{}",
+        err.msg
+    );
+    assert_eq!(err.node, Some(node));
+}
+
+#[test]
+fn lower_builtin_refuses_wrong_arity() {
+    let mut m = Module::new();
+    let a = real(&mut m, 1.0);
+    let node = call(&mut m, "add", &[a]);
+    let mut e = Emitter::new(&m, Dtype::F32);
+    let err = e.lower_node(node).unwrap_err();
+    assert!(
+        err.msg.contains("expected 2 argument"),
+        "unexpected message: {}",
+        err.msg
+    );
+}
+
+#[test]
+fn lower_builtin_refuses_record_in_tensor_position() {
+    let mut m = Module::new();
+    let node = call(&mut m, "record", &[]);
+    let mut e = Emitter::new(&m, Dtype::F32);
+    let err = e.lower_node(node).unwrap_err();
+    assert!(err.msg.contains("record has no tensor form"));
+}
+
+#[test]
+fn lower_node_refuses_user_callable_application() {
+    let mut m = Module::new();
+    let callee = self_ref(&mut m, "f");
+    let arg = real(&mut m, 1.0);
+    let node = m.alloc(Node::Call(Call {
+        head: CallHead::User(callee),
+        args: vec![arg].into(),
+        named: Vec::new().into(),
+        inputs: None,
+    }));
+    let mut e = Emitter::new(&m, Dtype::F32);
+    let err = e.lower_node(node).unwrap_err();
+    assert!(err.msg.contains("user-callable"));
+}
+
+#[test]
+fn lower_node_refuses_unresolved_self_reference() {
+    let mut m = Module::new();
+    let node = self_ref(&mut m, "nope");
+    let mut e = Emitter::new(&m, Dtype::F32);
+    let err = e.lower_node(node).unwrap_err();
+    assert!(err.msg.contains("unresolved reference"));
+}
+
+#[test]
+fn lower_node_refuses_unbound_local_reference() {
+    let mut m = Module::new();
+    let node = local_ref(&mut m, "theta");
+    let mut e = Emitter::new(&m, Dtype::F32);
+    let err = e.lower_node(node).unwrap_err();
+    assert!(err.msg.contains("%local"));
+}
+
+#[test]
+fn lower_node_refuses_module_member_reference() {
+    let mut m = Module::new();
+    let alias = m.intern("hepphys");
+    let name = m.intern("foo");
+    let node = m.alloc(Node::Ref(Ref {
+        ns: RefNs::Module(alias),
+        name,
+    }));
+    let mut e = Emitter::new(&m, Dtype::F32);
+    let err = e.lower_node(node).unwrap_err();
+    assert!(err.msg.contains("module-member"));
+}
+
+#[test]
+fn lower_node_refuses_bare_hole() {
+    let mut m = Module::new();
+    let node = m.alloc(Node::Hole);
+    let mut e = Emitter::new(&m, Dtype::F32);
+    let err = e.lower_node(node).unwrap_err();
+    assert!(err.msg.contains("hole"));
+}
+
+#[test]
+fn lower_node_refuses_axis_label() {
+    let mut m = Module::new();
+    let name = m.intern("i");
+    let node = m.alloc(Node::Axis(flatppl_core::Axis {
+        name,
+        variance: None,
+    }));
+    let mut e = Emitter::new(&m, Dtype::F32);
+    let err = e.lower_node(node).unwrap_err();
+    assert!(err.msg.contains("axis"));
+}
+
+#[test]
+fn lower_node_refuses_string_literal() {
+    let mut m = Module::new();
+    let node = m.alloc(Node::Lit(Scalar::Str("hi".into())));
+    let mut e = Emitter::new(&m, Dtype::F32);
+    let err = e.lower_node(node).unwrap_err();
+    assert!(err.msg.contains("string literal"));
+}
+
+#[test]
+fn lower_node_lowers_int_and_bool_literals_as_scalars() {
+    let mut m = Module::new();
+    let i = int(&mut m, 7);
+    let b = m.alloc(Node::Lit(Scalar::Bool(true)));
+    let mut e = Emitter::new(&m, Dtype::F32);
+    let iv = e.lower_node(i).unwrap();
+    let bv = e.lower_node(b).unwrap();
+    assert_eq!(iv.ty, MlirTy::Scalar);
+    assert_eq!(bv.ty, MlirTy::Scalar);
+    let out = e.finish("f", &[], &bv);
+    assert!(out.contains("dense<7"));
+    assert!(out.contains("dense<1"));
+}
+
+/// A bare `Const` symbol (`inf`) is dispatched through the same builtin-head
+/// map as a zero-arg call, and must use the dtype-exact `+inf` bit pattern.
+#[test]
+fn lower_const_inf_emits_dtype_exact_positive_infinity() {
+    let mut m = Module::new();
+    let node = const_node(&mut m, "inf");
+    let mut e = Emitter::new(&m, Dtype::F32);
+    let result = e.lower_node(node).unwrap();
+    assert_eq!(result.ty, MlirTy::Scalar);
+    let out = e.finish("f", &[], &result);
+    assert!(
+        out.contains("dense<0x7F800000>"),
+        "missing dtype-exact +inf in:\n{out}"
+    );
 }
