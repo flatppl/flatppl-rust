@@ -3797,3 +3797,246 @@ fn categorical0_logpdf_at_floor_slices_first_element() {
         "expected k=0 to slice 0-based index 0, in:\n{out}"
     );
 }
+
+// ---- Task 12: multivariate vector `@logdensity` batch -----------------------
+//
+// MvNormal/Dirichlet/Multinomial, registered alongside the rest of §08 in
+// `REGISTRY` with `sample: None` (samplers land in Tasks 14/15/16 — see
+// `registry.rs`'s batch doc comment). Unlike every Task 8/9/10/11 fixture,
+// `mu`/`cov`/`alpha`/`p` here are vector/matrix-typed free parameters:
+// `elementof(cartpow(reals, n))` for a length-`n` vector, `elementof(cartpow
+// (reals, [n, n]))` for an `n`x`n` matrix (both real, tested syntax — spec
+// `flatppl-design/docs/10-examples.md`'s own worked MvNormal example uses
+// exactly this shape: `some_mean = elementof(cartpow(reals, 3))`, `some_cov =
+// elementof(cartpow(reals, [3, 3]))`). `crates/infer`'s `cartpow` type rule
+// (unlike `stdsimplex`'s — see Task 11's report on why `Categorical`/
+// `Categorical0` fall back to a literal `p`) is fully implemented, so these
+// fixtures determinize with zero diagnostics and reach the registry as
+// ordinary free-parameter func args, exactly like every scalar fixture above.
+
+/// The Task-12 MvNormal anchor fixture: a length-2 free `mu`/`cov`, scored at
+/// a pinned length-2 observation.
+const MVNORMAL_DENSITY_SRC: &str = "\
+mu = elementof(cartpow(reals, 2))
+cov = elementof(cartpow(reals, [2, 2]))
+a = draw(MvNormal(mu = mu, cov = cov))
+lp = logdensityof(lawof(record(a = a)), record(a = [0.2, 0.1]))
+";
+
+/// §08 MvNormal, verbatim: `-(n/2)*log(2*pi) - 1/2*log|Sigma| -
+/// 1/2*(x-mu)^T Sigma^-1 (x-mu)`, via `L = cholesky(Sigma)`, `log|Sigma| = 2 *
+/// sum(log(diag(L)))`, and the quadratic form via `tri_solve` + `reduce_sum`
+/// (never a full matrix inverse). Structural check: exactly one
+/// `stablehlo.cholesky` and one (generic-form) `triangular_solve`, the
+/// `iota`/`compare`/`select`/`reduce` idiom `Emitter::diag` lowers to, `mu`/
+/// `cov` become `tensor<2xf32>`/`tensor<2x2xf32>` func args (not
+/// `tensor<f32>` — the free-parameter binding loop in `modes.rs` reads each
+/// binding's real inferred shape via `mlir_type_of`, not a scalar default).
+#[test]
+fn emit_logdensity_mvnormal_has_expected_structure() {
+    let d = determinize_src(MVNORMAL_DENSITY_SRC);
+    assert!(
+        flatppl_determinizer::is_flatpdl(&d).is_ok(),
+        "determinized module must be FlatPDL-conformant (no residual measure node)"
+    );
+
+    let out = emit_logdensity(&d);
+
+    assert!(
+        out.contains("func.func @logdensity"),
+        "missing func.func @logdensity in:\n{out}"
+    );
+    assert!(
+        out.contains("-> tensor<f32>"),
+        "must return tensor<f32> in:\n{out}"
+    );
+    assert!(
+        out.contains("%arg0: tensor<2xf32>") && out.contains("%arg1: tensor<2x2xf32>"),
+        "mu/cov must become vector/matrix func args, in:\n{out}"
+    );
+    assert_eq!(out.matches("stablehlo.cholesky").count(), 1);
+    assert_eq!(out.matches("\"stablehlo.triangular_solve\"").count(), 1);
+    assert_eq!(
+        out.matches("stablehlo.iota").count(),
+        2,
+        "diag's row/col index tensors, in:\n{out}"
+    );
+    assert_eq!(out.matches("stablehlo.compare").count(), 1);
+    assert_eq!(out.matches("stablehlo.select").count(), 1);
+    assert_eq!(out.matches("stablehlo.reduce(").count(), 3);
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// Freeze the exact emitted text: any drift (op count, ordering, arg naming,
+/// formula) must be a deliberate, reviewed change to this golden file.
+#[test]
+fn emit_logdensity_mvnormal_matches_frozen_golden() {
+    let d = determinize_src(MVNORMAL_DENSITY_SRC);
+    let out = emit_logdensity(&d);
+    let golden = include_str!("goldens/mvnormal_logdensity.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted @logdensity drifted from the frozen golden (tests/goldens/mvnormal_logdensity.mlir)"
+    );
+}
+
+/// A `mu`/`cov` whose vector length is NOT statically known (`cartpow(reals,
+/// m)` for a free `m`, not a literal size) must refuse precisely — `n` is
+/// baked into a scalar literal constant at emit time, so a dynamic length has
+/// no lowering, not merely an inconvenient one.
+#[test]
+fn mvnormal_logpdf_refuses_dynamic_vector_length() {
+    let src = "\
+m = elementof(posintegers)
+mu = elementof(cartpow(reals, m))
+cov = elementof(cartpow(reals, [m, m]))
+a = draw(MvNormal(mu = mu, cov = cov))
+lp = logdensityof(lawof(record(a = a)), record(a = [0.2, 0.1]))
+";
+    let d = determinize_src(src);
+    let err = flatppl_stablehlo::emit(
+        &d,
+        flatppl_stablehlo::Mode::LogDensity,
+        &flatppl_stablehlo::EmitOptions::default(),
+    )
+    .unwrap_err();
+    assert!(
+        err.msg.contains("statically-known vector length"),
+        "unexpected message: {}",
+        err.msg
+    );
+}
+
+/// The Task-12 Dirichlet anchor fixture: a length-3 free `alpha`, scored at a
+/// pinned length-3 observation on the simplex.
+const DIRICHLET_DENSITY_SRC: &str = "\
+alpha = elementof(cartpow(posreals, 3))
+a = draw(Dirichlet(alpha = alpha))
+lp = logdensityof(lawof(record(a = a)), record(a = [0.2, 0.3, 0.5]))
+";
+
+/// §08 Dirichlet, verbatim: `lgamma(sum(alpha)) - sum(lgamma(alpha)) +
+/// sum((alpha - 1) * log(x))`. Op counts: two `chlo.lgamma`s (one on the
+/// reduced sum, one elementwise on the length-3 `alpha` vector itself), three
+/// `stablehlo.reduce`s (`sum(alpha)`, `sum(lgamma(alpha))`, the final
+/// `sum((alpha-1)*log(x))`), one `subtract` (`alpha - 1`, a same-shape
+/// splat constant per the batch's doc comment in `registry.rs`), one
+/// `multiply`. No `cholesky`/`triangular_solve`/`iota` — Dirichlet needs no
+/// matrix ops, only reductions.
+#[test]
+fn emit_logdensity_dirichlet_has_expected_structure() {
+    let d = determinize_src(DIRICHLET_DENSITY_SRC);
+    assert!(
+        flatppl_determinizer::is_flatpdl(&d).is_ok(),
+        "determinized module must be FlatPDL-conformant (no residual measure node)"
+    );
+
+    let out = emit_logdensity(&d);
+
+    assert!(
+        out.contains("func.func @logdensity"),
+        "missing func.func @logdensity in:\n{out}"
+    );
+    assert!(
+        out.contains("-> tensor<f32>"),
+        "must return tensor<f32> in:\n{out}"
+    );
+    assert!(
+        out.contains("%arg0: tensor<3xf32>"),
+        "alpha must become a length-3 vector func arg, in:\n{out}"
+    );
+    assert_eq!(out.matches("chlo.lgamma").count(), 2);
+    assert_eq!(out.matches("stablehlo.reduce(").count(), 3);
+    assert_eq!(out.matches("stablehlo.subtract").count(), 1);
+    assert_eq!(out.matches("stablehlo.multiply").count(), 1);
+    assert!(
+        !out.contains("stablehlo.cholesky")
+            && !out.contains("triangular_solve")
+            && !out.contains("stablehlo.iota"),
+        "Dirichlet needs no matrix ops, in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// Freeze the exact emitted text: any drift (op count, ordering, arg naming,
+/// formula) must be a deliberate, reviewed change to this golden file.
+#[test]
+fn emit_logdensity_dirichlet_matches_frozen_golden() {
+    let d = determinize_src(DIRICHLET_DENSITY_SRC);
+    let out = emit_logdensity(&d);
+    let golden = include_str!("goldens/dirichlet_logdensity.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted @logdensity drifted from the frozen golden (tests/goldens/dirichlet_logdensity.mlir)"
+    );
+}
+
+/// The Task-12 Multinomial anchor fixture: a free scalar trial count `n` and
+/// a free length-3 `p`, scored at a pinned length-3 count observation.
+const MULTINOMIAL_DENSITY_SRC: &str = "\
+n = elementof(posintegers)
+p = elementof(cartpow(unitinterval, 3))
+a = draw(Multinomial(n = n, p = p))
+lp = logdensityof(lawof(record(a = a)), record(a = [2, 3, 5]))
+";
+
+/// §08 Multinomial, verbatim: `lgamma(n+1) - sum(lgamma(x+1)) + sum(x *
+/// log(p))`. Op counts: two `chlo.lgamma`s (`lgamma(n+1)` scalar, `lgamma(x+1)`
+/// elementwise on the length-3 `x` vector), two `stablehlo.reduce`s
+/// (`sum(lgamma(x+1))`, `sum(x*log(p))`), four `add`s (`n+1`, `x+1` — the
+/// latter a same-shape splat constant per the batch's doc comment in
+/// `registry.rs` — plus the two final-combination adds), one `multiply` (`x *
+/// log(p)`), one `negate`. The `add` count is asserted via the tighter `"=
+/// stablehlo.add "` pattern, not a bare `"stablehlo.add"` substring: each
+/// `stablehlo.reduce(...)` line's own pretty form embeds the literal text
+/// `"applies stablehlo.add across dimensions"` (the combine-op name), which
+/// would otherwise double-count as a spurious `add` for every `reduce_sum`
+/// call in this formula.
+#[test]
+fn emit_logdensity_multinomial_has_expected_structure() {
+    let d = determinize_src(MULTINOMIAL_DENSITY_SRC);
+    assert!(
+        flatppl_determinizer::is_flatpdl(&d).is_ok(),
+        "determinized module must be FlatPDL-conformant (no residual measure node)"
+    );
+
+    let out = emit_logdensity(&d);
+
+    assert!(
+        out.contains("func.func @logdensity"),
+        "missing func.func @logdensity in:\n{out}"
+    );
+    assert!(
+        out.contains("-> tensor<f32>"),
+        "must return tensor<f32> in:\n{out}"
+    );
+    assert!(
+        out.contains("%arg0: tensor<f32>") && out.contains("%arg1: tensor<3xf32>"),
+        "n/p must become scalar/vector func args, in:\n{out}"
+    );
+    assert_eq!(out.matches("chlo.lgamma").count(), 2);
+    assert_eq!(out.matches("stablehlo.reduce(").count(), 2);
+    assert_eq!(out.matches("= stablehlo.add ").count(), 4);
+    assert_eq!(out.matches("stablehlo.multiply").count(), 1);
+    assert_eq!(out.matches("stablehlo.negate").count(), 1);
+    assert!(
+        !out.contains("stablehlo.cholesky")
+            && !out.contains("triangular_solve")
+            && !out.contains("stablehlo.iota"),
+        "Multinomial needs no matrix ops, in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// Freeze the exact emitted text: any drift (op count, ordering, arg naming,
+/// formula) must be a deliberate, reviewed change to this golden file.
+#[test]
+fn emit_logdensity_multinomial_matches_frozen_golden() {
+    let d = determinize_src(MULTINOMIAL_DENSITY_SRC);
+    let out = emit_logdensity(&d);
+    let golden = include_str!("goldens/multinomial_logdensity.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted @logdensity drifted from the frozen golden (tests/goldens/multinomial_logdensity.mlir)"
+    );
+}

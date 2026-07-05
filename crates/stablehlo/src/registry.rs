@@ -207,6 +207,27 @@ static REGISTRY: &[(&str, DistLowering)] = &[
             sample: None,
         },
     ),
+    (
+        "MvNormal",
+        DistLowering {
+            logpdf: mvnormal_logpdf,
+            sample: None,
+        },
+    ),
+    (
+        "Dirichlet",
+        DistLowering {
+            logpdf: dirichlet_logpdf,
+            sample: None,
+        },
+    ),
+    (
+        "Multinomial",
+        DistLowering {
+            logpdf: multinomial_logpdf,
+            sample: None,
+        },
+    ),
 ];
 
 /// Look up a distribution's lowering by its constructor name (`"Normal"`,
@@ -1244,4 +1265,139 @@ fn categorical0_logpdf(e: &mut Emitter, p: &Params, _v: &Value) -> Result<Value,
     let k = literal_variate_index(e, p)?;
     let elem = slice_indexed_prob(e, variate, &probs, k)?;
     Ok(e.log(&elem))
+}
+
+// ---- §08/§09 multivariate vector batch (Task 12) ----------------------------
+//
+// MvNormal/Dirichlet/Multinomial, registered alongside the rest of §08 in
+// `REGISTRY` with `sample: None` (MvNormal's straight-line reparam sampler
+// lands in Task 14, Dirichlet's rejection sampler in Task 15, Multinomial's
+// in Task 16 — see the roadmap doc). Unlike every scalar builder above,
+// `mu`/`cov`/`alpha`/`p`/`v` here are rank-1 (vector) or rank-2 (matrix)
+// `Value`s, not `Scalar`s: [`Emitter::lgamma`]/[`Emitter::log`]/
+// [`Emitter::neg`] are elementwise (same shape in, same shape out — see
+// their own doc comments), so they apply to a vector operand exactly as they
+// do to a scalar one; only the FINAL combination (after a
+// [`Emitter::reduce_sum`] has collapsed a vector term to a `Scalar`) ever
+// mixes shapes. A vector/matrix-shaped additive identity (e.g. Dirichlet's
+// `alpha - 1`) needs a same-shape constant, not a bare [`Emitter::scalar`]:
+// StableHLO's elementwise ops require identical operand *types* (no implicit
+// scalar broadcast — see `ops::broadcast_to`'s doc comment for the same
+// constraint elsewhere in this crate), so [`Emitter::constant`] is called
+// directly with the operand's own `MlirTy` to get an already-shaped splat
+// constant instead.
+
+/// The statically-known length of a rank-1 vector `Value`, or a precise
+/// refusal naming `blame` — [`mvnormal_logpdf`]'s `n` (task brief: "the
+/// vector length, a static dim of `mu`/`x`") is baked into a scalar literal
+/// constant (`-(n/2) * log(2*pi)`), which needs `n` known at EMIT time, not
+/// merely well-typed. A `Dim::Dynamic` vector length is a legitimate FlatPDL
+/// type elsewhere in the language (`elementof(cartpow(reals, m))` with an
+/// unbound `m`), so this refuses precisely — refuse-don't-mislower — rather
+/// than only surfacing as a downstream panic from some later op that assumes
+/// a static shape.
+fn static_vector_len(blame: NodeId, v: &Value) -> Result<u64, EmitError> {
+    match &v.ty {
+        MlirTy::Ranked(dims) if dims.len() == 1 => dims[0].ok_or_else(|| {
+            EmitError::at(
+                blame,
+                "MvNormal logdensity needs a statically-known vector length for 'mu'",
+            )
+        }),
+        other => Err(EmitError::at(
+            blame,
+            format!("MvNormal logdensity: 'mu' must be a rank-1 vector, got {other:?}"),
+        )),
+    }
+}
+
+/// §08 MvNormal, verbatim: `log f = -(n/2)*log(2*pi) - 1/2*log|Sigma| -
+/// 1/2*(x-mu)^T Sigma^-1 (x-mu)`, with `L = cholesky(Sigma)` (lower),
+/// `log|Sigma| = 2 * sum(log(diag(L)))`, and the quadratic form via `y =
+/// tri_solve(L, x-mu)`, `(x-mu)^T Sigma^-1 (x-mu) = y^T y = sum(y*y)` — the
+/// task brief's closed form exactly (never `Sigma^-1` explicitly: a full
+/// matrix inverse has no `Emitter` helper, and solving the triangular system
+/// `L y = (x-mu)` is the numerically standard way to get the same quadratic
+/// form). `n`, the vector length, comes from `mu`'s own statically-known
+/// shape ([`static_vector_len`]) — not `cov`'s: [`Emitter::diag`] already
+/// panics on a non-square `cov` (an internal invariant violation, per that
+/// method's own doc comment), so this builder does not re-check `cov`
+/// separately. No `@sample` builder yet (`sample: None`; Task 14).
+fn mvnormal_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
+    let mu_id = p.field_id(e, "mu")?;
+    let mu = e.lower_node(mu_id)?;
+    let cov = p.get(e, "cov")?;
+    let n = static_vector_len(mu_id, &mu)?;
+
+    let l = e.cholesky(&cov);
+    let diag_l = e.diag(&l);
+    let log_diag_l = e.log(&diag_l);
+    let sum_log_diag_l = e.reduce_sum(&log_diag_l);
+    let two = e.scalar(2.0);
+    let log_det = e.mul(&two, &sum_log_diag_l);
+    let neg_half = e.scalar(-0.5);
+    let neg_half_log_det = e.mul(&neg_half, &log_det);
+
+    let diff = e.sub(v, &mu);
+    let y = e.tri_solve(&l, &diff);
+    let y_sq = e.mul(&y, &y);
+    let quad = e.reduce_sum(&y_sq);
+    let neg_half_quad = e.mul(&neg_half, &quad);
+
+    let c = e.scalar(-0.5 * n as f64 * (2.0 * std::f64::consts::PI).ln());
+
+    let t1 = e.add(&c, &neg_half_log_det);
+    Ok(e.add(&t1, &neg_half_quad))
+}
+
+/// §08 Dirichlet, verbatim: `log f = lgamma(sum(alpha)) - sum(lgamma(alpha))
+/// + sum((alpha - 1) * log(x))`. `alpha - 1` needs a vector-shaped `1`
+/// (`Emitter::constant(1.0, alpha.ty.clone())`, a splat — see the batch doc
+/// comment on why a bare `Emitter::scalar` cannot be subtracted from a
+/// vector directly). No `@sample` builder yet (`sample: None`; Task 15).
+fn dirichlet_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
+    let alpha = p.get(e, "alpha")?;
+
+    let sum_alpha = e.reduce_sum(&alpha);
+    let lgamma_sum_alpha = e.lgamma(&sum_alpha);
+
+    let lgamma_alpha = e.lgamma(&alpha);
+    let sum_lgamma_alpha = e.reduce_sum(&lgamma_alpha);
+    let neg_sum_lgamma_alpha = e.neg(&sum_lgamma_alpha);
+
+    let one_vec = e.constant(1.0, alpha.ty.clone());
+    let alpha_minus_one = e.sub(&alpha, &one_vec);
+    let log_x = e.log(v);
+    let term = e.mul(&alpha_minus_one, &log_x);
+    let sum_term = e.reduce_sum(&term);
+
+    let t1 = e.add(&lgamma_sum_alpha, &neg_sum_lgamma_alpha);
+    Ok(e.add(&t1, &sum_term))
+}
+
+/// §08 Multinomial, verbatim: `log f = lgamma(n+1) - sum(lgamma(x+1)) +
+/// sum(x * log(p))`. `x + 1` needs a vector-shaped `1`, same reasoning as
+/// [`dirichlet_logpdf`]'s `alpha - 1`; `n + 1` (the trial-count scalar
+/// parameter, unrelated to `x`'s vector shape) needs only the ordinary
+/// scalar one. No `@sample` builder yet (`sample: None`; Task 16).
+fn multinomial_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
+    let n = p.get(e, "n")?;
+    let probs = p.get(e, "p")?;
+
+    let one = e.scalar(1.0);
+    let n_plus_one = e.add(&n, &one);
+    let lgamma_n1 = e.lgamma(&n_plus_one);
+
+    let one_vec = e.constant(1.0, v.ty.clone());
+    let x_plus_one = e.add(v, &one_vec);
+    let lgamma_x1 = e.lgamma(&x_plus_one);
+    let sum_lgamma_x1 = e.reduce_sum(&lgamma_x1);
+    let neg_sum_lgamma_x1 = e.neg(&sum_lgamma_x1);
+
+    let log_p = e.log(&probs);
+    let x_log_p = e.mul(v, &log_p);
+    let sum_x_log_p = e.reduce_sum(&x_log_p);
+
+    let t1 = e.add(&lgamma_n1, &neg_sum_lgamma_x1);
+    Ok(e.add(&t1, &sum_x_log_p))
 }
