@@ -81,9 +81,14 @@
 //! - a registered constructor with no `@sample` builder — "no @sample
 //!   lowering for '...'" — locked by
 //!   `builtin_sample_refuses_registered_ctor_without_sample_builder`
-//!   (`tests/golden.rs`), reached via any of `Cauchy`/`Logistic`/`Laplace`
-//!   (Task 8's `@logdensity`-only entries; their `@sample` builders land in
-//!   Task 14).
+//!   (`tests/golden.rs`), reached via `Gamma` (no closed-form inverse-CDF, so
+//!   Task 14's straight-line/inverse-CDF batch skips it; a later
+//!   rejection-sampling task lands its `@sample` builder — same reasoning
+//!   covers `InverseGamma`/`ChiSquared`/`Beta`/`StudentT`/
+//!   `GeneralizedNormal`/`VonMises`, and Task 15/16's still-pending
+//!   `Dirichlet`/`Multinomial`/discrete batch). `Cauchy`/`Logistic`/`Laplace`
+//!   (Task 8's `@logdensity`-only entries) no longer exercise this arm —
+//!   Task 14 gave all three straight-line `@sample` builders.
 //! - `Uniform`'s `support` parameter has no closed-form measurable
 //!   interval/box `ValueSet` (`registry::lebesgue_measure` returns `None`) —
 //!   "Uniform logpdf needs a measurable interval/box support" (Task 10).

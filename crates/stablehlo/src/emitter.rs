@@ -198,6 +198,15 @@ impl<'m> Emitter<'m> {
     pub fn cos(&mut self, a: &Value) -> Value {
         self.unary("stablehlo.cosine", a)
     }
+    /// `stablehlo.sine` — a NEW op form for this crate (Task 14's Cauchy
+    /// `@sample`, which needs `tan(t) = sin(t) / cos(t)`; no `chlo`/
+    /// `stablehlo` `tan` op is used, mirroring [`Emitter::cos`]'s existing
+    /// `stablehlo.cosine`). Parser-validated against the real StableHLO
+    /// parser (jax 0.10.2, `jax._src.interpreters.mlir.make_ir_context`),
+    /// same discipline as every other op text this module emits.
+    pub fn sin(&mut self, a: &Value) -> Value {
+        self.unary("stablehlo.sine", a)
+    }
 
     /// `%N = stablehlo.compare {dir}, %a, %b : (lhs, rhs) -> i1-shape`.
     /// `dir` is a StableHLO `comparison_direction` (`"LT"`, `"GE"`, `"EQ"`,

@@ -50,28 +50,28 @@ static REGISTRY: &[(&str, DistLowering)] = &[
         "Cauchy",
         DistLowering {
             logpdf: cauchy_logpdf,
-            sample: None,
+            sample: Some(cauchy_sample),
         },
     ),
     (
         "Logistic",
         DistLowering {
             logpdf: logistic_logpdf,
-            sample: None,
+            sample: Some(logistic_sample),
         },
     ),
     (
         "Laplace",
         DistLowering {
             logpdf: laplace_logpdf,
-            sample: None,
+            sample: Some(laplace_sample),
         },
     ),
     (
         "Exponential",
         DistLowering {
             logpdf: exponential_logpdf,
-            sample: None,
+            sample: Some(exponential_sample),
         },
     ),
     (
@@ -85,14 +85,14 @@ static REGISTRY: &[(&str, DistLowering)] = &[
         "Weibull",
         DistLowering {
             logpdf: weibull_logpdf,
-            sample: None,
+            sample: Some(weibull_sample),
         },
     ),
     (
         "Pareto",
         DistLowering {
             logpdf: pareto_logpdf,
-            sample: None,
+            sample: Some(pareto_sample),
         },
     ),
     (
@@ -113,14 +113,14 @@ static REGISTRY: &[(&str, DistLowering)] = &[
         "LogNormal",
         DistLowering {
             logpdf: lognormal_logpdf,
-            sample: None,
+            sample: Some(lognormal_sample),
         },
     ),
     (
         "Uniform",
         DistLowering {
             logpdf: uniform_logpdf,
-            sample: None,
+            sample: Some(uniform_sample),
         },
     ),
     (
@@ -211,7 +211,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
         "MvNormal",
         DistLowering {
             logpdf: mvnormal_logpdf,
-            sample: None,
+            sample: Some(mvnormal_sample),
         },
     ),
     (
@@ -484,7 +484,7 @@ fn normal_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
 // ---- §08 Cauchy -------------------------------------------------------------
 
 /// §08 Cauchy, verbatim: `log f = -log(pi) - log(gamma) - log(1 + ((x -
-/// x0) / gamma)^2)`. No `@sample` builder yet (`sample: None`; Task 14).
+/// x0) / gamma)^2)`.
 fn cauchy_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
     let location = p.get(e, "location")?;
     let scale = p.get(e, "scale")?;
@@ -505,11 +505,38 @@ fn cauchy_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitEr
     Ok(e.add(&neg_log_pi_scale, &neg_log_one_plus_z_sq))
 }
 
+/// §08 Cauchy's sampling transform, verbatim: `x0 + gamma * tan(pi * (U -
+/// 1/2))`, `U ~ Uniform(0, 1)`. No native `tan` op exists in `stablehlo`/
+/// `chlo` (unlike `chlo.lgamma`, a real special-function op — see
+/// [`Emitter::sin`]'s doc comment), so `tan(t)` is composed as `sin(t) /
+/// cos(t)`, exactly the task brief's fallback. `U` is drawn at `location`'s
+/// own shape, mirroring [`normal_sample`]'s `&mu.ty` convention (the
+/// FIRST parameter [`cauchy_logpdf`] itself reads).
+fn cauchy_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
+    let location = p.get(e, "location")?;
+    let scale = p.get(e, "scale")?;
+
+    let zero = e.scalar(0.0);
+    let one = e.scalar(1.0);
+    let u = e.rng("UNIFORM", &zero, &one, &location.ty);
+
+    let half = e.scalar(0.5);
+    let centered = e.sub(&u, &half);
+    let pi = e.scalar(std::f64::consts::PI);
+    let t = e.mul(&pi, &centered);
+
+    let sin_t = e.sin(&t);
+    let cos_t = e.cos(&t);
+    let tan_t = e.div(&sin_t, &cos_t);
+
+    let scale_tan = e.mul(&scale, &tan_t);
+    Ok(e.add(&location, &scale_tan))
+}
+
 // ---- §08 Logistic -----------------------------------------------------------
 
 /// §08 Logistic, verbatim: with `u = (x - mu) / s`, `log f = -u - log(s) -
-/// 2 * log(1 + exp(-u))`. No `@sample` builder yet (`sample: None`; Task
-/// 14).
+/// 2 * log(1 + exp(-u))`.
 fn logistic_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
     let mu = p.get(e, "mu")?;
     let s = p.get(e, "s")?;
@@ -533,10 +560,28 @@ fn logistic_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, Emit
     Ok(e.add(&neg_u_minus_log_s, &neg_two_log_term))
 }
 
+/// §08 Logistic's sampling transform, verbatim: `mu + s * log(U / (1 -
+/// U))`, `U ~ Uniform(0, 1)`, drawn at `mu`'s own shape (mirrors
+/// [`normal_sample`]).
+fn logistic_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
+    let mu = p.get(e, "mu")?;
+    let s = p.get(e, "s")?;
+
+    let zero = e.scalar(0.0);
+    let one = e.scalar(1.0);
+    let u = e.rng("UNIFORM", &zero, &one, &mu.ty);
+
+    let one_minus_u = e.sub(&one, &u);
+    let ratio = e.div(&u, &one_minus_u);
+    let log_ratio = e.log(&ratio);
+
+    let s_log_ratio = e.mul(&s, &log_ratio);
+    Ok(e.add(&mu, &s_log_ratio))
+}
+
 // ---- §08 Laplace ------------------------------------------------------------
 
-/// §08 Laplace, verbatim: `log f = -log(2 * b) - |x - mu| / b`. No
-/// `@sample` builder yet (`sample: None`; Task 14).
+/// §08 Laplace, verbatim: `log f = -log(2 * b) - |x - mu| / b`.
 fn laplace_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
     let location = p.get(e, "location")?;
     let scale = p.get(e, "scale")?;
@@ -554,16 +599,58 @@ fn laplace_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitE
     Ok(e.add(&neg_log_two_b, &neg_term))
 }
 
+/// §08 Laplace's sampling transform, verbatim: `mu - b * sgn(U - 1/2) *
+/// log(1 - 2 * |U - 1/2|)`, `U ~ Uniform(0, 1)`, drawn at `location`'s own
+/// shape (mirrors [`normal_sample`]). `sgn(U - 1/2)` is composed via
+/// [`Emitter::compare`]/[`Emitter::select`] (`+1` when `U - 1/2 >= 0`, else
+/// `-1`) rather than a `stablehlo.sign` op — the task brief's own preferred
+/// fallback (mirroring [`log_bessel_i0`]'s existing branch-via-`select`
+/// idiom); the `U = 1/2` boundary is a measure-zero tie broken toward `+1`,
+/// where `log(1 - 2*|U - 1/2|) = log(1) = 0` either way, so the branch
+/// choice there is immaterial to the transform's value.
+fn laplace_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
+    let location = p.get(e, "location")?;
+    let scale = p.get(e, "scale")?;
+
+    let zero = e.scalar(0.0);
+    let one = e.scalar(1.0);
+    let u = e.rng("UNIFORM", &zero, &one, &location.ty);
+
+    let half = e.scalar(0.5);
+    let centered = e.sub(&u, &half);
+
+    let is_nonneg = e.compare("GE", &centered, &zero);
+    let pos_one = e.scalar(1.0);
+    let neg_one = e.scalar(-1.0);
+    let sign = e.select(&is_nonneg, &pos_one, &neg_one);
+
+    let abs_centered = e.abs(&centered);
+    let two = e.scalar(2.0);
+    let two_abs_centered = e.mul(&two, &abs_centered);
+    let one_minus_two_abs = e.sub(&one, &two_abs_centered);
+    let log_term = e.log(&one_minus_two_abs);
+
+    let sign_log_term = e.mul(&sign, &log_term);
+    let b_sign_log_term = e.mul(&scale, &sign_log_term);
+    let neg_b_sign_log_term = e.neg(&b_sign_log_term);
+
+    Ok(e.add(&location, &neg_b_sign_log_term))
+}
+
 // ---- §08 gamma-family / positive-support continuous batch -------------------
 //
 // Exponential/Gamma/Weibull/Pareto/InverseGamma/ChiSquared/LogNormal,
-// registered alongside Normal/Cauchy/Logistic/Laplace in `REGISTRY` with
-// `sample: None` (samplers land in Task 14). Gamma/InverseGamma/ChiSquared's
-// log-forms need the log-gamma special function, `chlo.lgamma`
-// ([`Emitter::lgamma`]); the others compose only the elementary-op helpers.
+// registered alongside Normal/Cauchy/Logistic/Laplace in `REGISTRY`.
+// Gamma/InverseGamma/ChiSquared's log-forms need the log-gamma special
+// function, `chlo.lgamma` ([`Emitter::lgamma`]); the others compose only the
+// elementary-op helpers. Task 14 gives Exponential/Weibull/Pareto/LogNormal a
+// straight-line inverse-CDF/reparam `@sample` builder (`sample: Some(..)`
+// below); Gamma/InverseGamma/ChiSquared have no such closed-form inverse-CDF
+// (their CDFs are the regularized incomplete gamma function, not
+// invertible in closed form), so they stay `sample: None` for a later
+// rejection-based task.
 
-/// §08 Exponential, verbatim: `log f = log(rate) - rate * x`. No `@sample`
-/// builder yet (`sample: None`; Task 14).
+/// §08 Exponential, verbatim: `log f = log(rate) - rate * x`.
 fn exponential_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
     let rate = p.get(e, "rate")?;
 
@@ -574,9 +661,24 @@ fn exponential_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, E
     Ok(e.add(&log_rate, &neg_rate_x))
 }
 
+/// §08 Exponential's sampling transform, verbatim: `-log(U) / rate`, `U ~
+/// Uniform(0, 1)`, drawn at `rate`'s own shape (mirrors [`normal_sample`]).
+fn exponential_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
+    let rate = p.get(e, "rate")?;
+
+    let zero = e.scalar(0.0);
+    let one = e.scalar(1.0);
+    let u = e.rng("UNIFORM", &zero, &one, &rate.ty);
+
+    let log_u = e.log(&u);
+    let neg_log_u = e.neg(&log_u);
+    Ok(e.div(&neg_log_u, &rate))
+}
+
 /// §08 Gamma, verbatim: `log f = shape * log(rate) - lgamma(shape) +
 /// (shape - 1) * log(x) - rate * x`. No `@sample` builder yet (`sample:
-/// None`; Task 14).
+/// None`) — Gamma's CDF has no closed-form inverse (see the batch doc
+/// comment); a later task lands its rejection-based sampler.
 fn gamma_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
     let shape = p.get(e, "shape")?;
     let rate = p.get(e, "rate")?;
@@ -601,8 +703,7 @@ fn gamma_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitErr
 }
 
 /// §08 Weibull, verbatim: with `u = x / scale`, `log f = log(shape) -
-/// log(scale) + (shape - 1) * log(u) - u^shape`. No `@sample` builder yet
-/// (`sample: None`; Task 14).
+/// log(scale) + (shape - 1) * log(u) - u^shape`.
 fn weibull_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
     let shape = p.get(e, "shape")?;
     let scale = p.get(e, "scale")?;
@@ -625,9 +726,30 @@ fn weibull_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitE
     Ok(e.add(&t2, &neg_u_pow_shape))
 }
 
+/// §08 Weibull's sampling transform, verbatim: `scale * (-log(U))^(1 /
+/// shape)`, `U ~ Uniform(0, 1)`, drawn at `shape`'s own shape (mirrors
+/// [`normal_sample`]; `shape` here is the distribution PARAMETER, not a
+/// [`crate::mlir::MlirTy`] — same overloaded English word [`weibull_logpdf`]
+/// already lives with).
+fn weibull_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
+    let shape = p.get(e, "shape")?;
+    let scale = p.get(e, "scale")?;
+
+    let zero = e.scalar(0.0);
+    let one = e.scalar(1.0);
+    let u = e.rng("UNIFORM", &zero, &one, &shape.ty);
+
+    let log_u = e.log(&u);
+    let neg_log_u = e.neg(&log_u);
+
+    let inv_shape = e.div(&one, &shape);
+    let powered = e.pow(&neg_log_u, &inv_shape);
+
+    Ok(e.mul(&scale, &powered))
+}
+
 /// §08 Pareto, verbatim: `log f = log(shape) + shape * log(scale) -
-/// (shape + 1) * log(x)`. No `@sample` builder yet (`sample: None`; Task
-/// 14).
+/// (shape + 1) * log(x)`.
 fn pareto_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
     let shape = p.get(e, "shape")?;
     let scale = p.get(e, "scale")?;
@@ -646,9 +768,29 @@ fn pareto_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitEr
     Ok(e.add(&t1, &neg_shape_plus_one_log_x))
 }
 
+/// §08 Pareto's sampling transform, verbatim: `scale * U^(-1 / shape)`
+/// (the task brief's `x_m * U^(-1/alpha)`, spelled in this registry's own
+/// `shape`/`scale` field names — see [`pareto_logpdf`]), `U ~ Uniform(0,
+/// 1)`, drawn at `shape`'s own shape (mirrors [`normal_sample`]).
+fn pareto_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
+    let shape = p.get(e, "shape")?;
+    let scale = p.get(e, "scale")?;
+
+    let zero = e.scalar(0.0);
+    let one = e.scalar(1.0);
+    let u = e.rng("UNIFORM", &zero, &one, &shape.ty);
+
+    let neg_one = e.scalar(-1.0);
+    let neg_inv_shape = e.div(&neg_one, &shape);
+    let powered = e.pow(&u, &neg_inv_shape);
+
+    Ok(e.mul(&scale, &powered))
+}
+
 /// §08 InverseGamma, verbatim: `log f = shape * log(scale) - lgamma(shape) -
 /// (shape + 1) * log(x) - scale / x`. No `@sample` builder yet (`sample:
-/// None`; Task 14).
+/// None`) — like Gamma, InverseGamma's CDF has no closed-form inverse (the
+/// batch doc comment); a later task lands its rejection-based sampler.
 fn inverse_gamma_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
     let shape = p.get(e, "shape")?;
     let scale = p.get(e, "scale")?;
@@ -678,7 +820,9 @@ fn inverse_gamma_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value,
 /// plain numeric constant (independent of `k`), so it is folded to a scalar
 /// literal (`std::f64::consts::LN_2`) rather than emitted as its own
 /// `stablehlo.log` — same reasoning as [`cauchy_logpdf`]'s `log(pi)` fold. No
-/// `@sample` builder yet (`sample: None`; Task 14).
+/// `@sample` builder yet (`sample: None`) — ChiSquared is `Gamma(k/2, 1/2)`
+/// and inherits the same no-closed-form-inverse-CDF limitation (the batch
+/// doc comment); a later task lands its sampler.
 fn chi_squared_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
     let k = p.get(e, "k")?;
 
@@ -713,8 +857,7 @@ fn chi_squared_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, E
 /// both the leading `-log(x)` term and this quadratic term, rather than
 /// calling [`Emitter::log`] on `v` a second time (each call emits a fresh
 /// `stablehlo.log` op; unlike [`Emitter::lower_node`], these op helpers do
-/// not memoize by FlatPDL `NodeId`). No `@sample` builder yet (`sample:
-/// None`; Task 14).
+/// not memoize by FlatPDL `NodeId`).
 fn lognormal_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
     let mu = p.get(e, "mu")?;
     let sigma = p.get(e, "sigma")?;
@@ -738,13 +881,29 @@ fn lognormal_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, Emi
     Ok(e.add(&t2, &quad))
 }
 
+/// §08 LogNormal's sampling transform, verbatim: `exp(mu + sigma * Z)`, `Z ~
+/// Normal(0, 1)` — [`normal_sample`]'s own transform, with a trailing
+/// [`Emitter::exp`]. Drawn at `mu`'s own shape, same convention as
+/// [`normal_sample`].
+fn lognormal_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
+    let mu = p.get(e, "mu")?;
+    let sigma = p.get(e, "sigma")?;
+
+    let zero = e.scalar(0.0);
+    let one = e.scalar(1.0);
+    let z = e.rng("NORMAL", &zero, &one, &mu.ty);
+
+    let sigma_z = e.mul(&sigma, &z);
+    let mu_plus_sigma_z = e.add(&mu, &sigma_z);
+    Ok(e.exp(&mu_plus_sigma_z))
+}
+
 // ---- §08 remaining univariate continuous batch (Task 10) --------------------
 //
 // Uniform/Beta/StudentT/GeneralizedNormal/VonMises, registered alongside the
-// rest of §08 in `REGISTRY` with `sample: None` (samplers land in Task 14).
-// Beta/StudentT/GeneralizedNormal need only `chlo.lgamma` and the elementary
-// op helpers, same as Task 9's gamma-family batch. Uniform and VonMises are
-// each a special case in their own way:
+// rest of §08 in `REGISTRY`. Beta/StudentT/GeneralizedNormal need only
+// `chlo.lgamma` and the elementary op helpers, same as Task 9's gamma-family
+// batch. Uniform and VonMises are each a special case in their own way:
 //
 // - Uniform's `-log(lambda(S))` needs `S`'s statically-known LENGTH, not a
 //   per-observation formula in `v` at all (`v` is unused: `S`-membership
@@ -757,6 +916,14 @@ fn lognormal_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, Emi
 //   (`chlo.bessel_i0e` does not exist; no pretty or generic form parses), so
 //   [`log_bessel_i0`] inlines the Abramowitz & Stegun 9.8.1/9.8.2 rational
 //   approximations instead of emitting a nonexistent op.
+//
+// Task 14 gives Uniform a straight-line `@sample` builder (`sample:
+// Some(..)` below, reading the same statically-known interval bounds as
+// [`uniform_logpdf`]); Beta/StudentT/GeneralizedNormal/VonMises have no
+// closed-form inverse-CDF (Beta and StudentT are gamma-ratio-family
+// distributions, same limitation as Gamma/InverseGamma/ChiSquared above;
+// GeneralizedNormal and VonMises need rejection sampling), so they stay
+// `sample: None` for a later task.
 
 /// The Lebesgue measure `lambda(S)` of a value-set `S`, when `S` is a
 /// closed-form measurable interval: a plain `ValueSet::Interval(lo, hi)`
@@ -774,11 +941,24 @@ fn lognormal_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, Emi
 /// set could never actually bind a usable variate downstream; refusing it
 /// here rather than lowering a `-log(box-volume)` nobody could reach is the
 /// refuse-don't-mislower call. [`uniform_logpdf`] turns `None` into a
-/// precise refusal.
+/// precise refusal. A thin wrapper over [`uniform_bounds`] (`hi - lo`);
+/// [`uniform_sample`] needs the two bounds themselves, not just their
+/// difference, so it calls [`uniform_bounds`] directly instead.
 fn lebesgue_measure(vs: &ValueSet) -> Option<f64> {
+    uniform_bounds(vs).map(|(lo, hi)| hi - lo)
+}
+
+/// The `(lo, hi)` bounds of a value-set `S`, under the exact same
+/// closed-form-measurable-interval criteria as [`lebesgue_measure`] (whose
+/// doc comment this shares) — split out as its own function because
+/// [`uniform_sample`]'s affine transform `a + (b - a) * U` needs `lo`/`hi`
+/// individually, not merely their difference.
+fn uniform_bounds(vs: &ValueSet) -> Option<(f64, f64)> {
     match vs {
-        ValueSet::Interval(lo, hi) if lo.is_finite() && hi.is_finite() && hi > lo => Some(hi - lo),
-        ValueSet::UnitInterval => Some(1.0),
+        ValueSet::Interval(lo, hi) if lo.is_finite() && hi.is_finite() && hi > lo => {
+            Some((*lo, *hi))
+        }
+        ValueSet::UnitInterval => Some((0.0, 1.0)),
         _ => None,
     }
 }
@@ -789,8 +969,7 @@ fn lebesgue_measure(vs: &ValueSet) -> Option<f64> {
 /// like `interval(lo, hi)` has no tensor form of its own, see
 /// `Emitter::valueset_of`'s doc comment — is read via [`Params::field_id`],
 /// then its statically-known [`ValueSet`] via [`Emitter::valueset_of`] and
-/// reduced to a length via [`lebesgue_measure`]. No `@sample` builder yet
-/// (`sample: None`; Task 14).
+/// reduced to a length via [`lebesgue_measure`].
 fn uniform_logpdf(e: &mut Emitter, p: &Params, _v: &Value) -> Result<Value, EmitError> {
     let support = p.field_id(e, "support")?;
     let measure = e
@@ -805,9 +984,43 @@ fn uniform_logpdf(e: &mut Emitter, p: &Params, _v: &Value) -> Result<Value, Emit
     Ok(e.scalar(-measure.ln()))
 }
 
+/// §08 Uniform's sampling transform, verbatim: `a + (b - a) * U`, `U ~
+/// Uniform(0, 1)`, `[a, b]` the `support` interval — read exactly like
+/// [`uniform_logpdf`] reads it (via [`Params::field_id`] +
+/// [`Emitter::valueset_of`]), but through [`uniform_bounds`] rather than
+/// [`lebesgue_measure`] (this needs `a`/`b` individually, not just `b - a`).
+/// Drawn at `MlirTy::Scalar`, not any kwarg's own shape: `support` has no
+/// tensor form to read a shape from (same reason [`uniform_logpdf`] takes
+/// `_v` unused), and Uniform's FlatPDL domain is hardcoded to `scalar(real)`
+/// regardless of `support`'s own shape (see [`lebesgue_measure`]'s doc
+/// comment).
+fn uniform_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
+    let support = p.field_id(e, "support")?;
+    let (lo, hi) = e
+        .valueset_of(support)
+        .and_then(uniform_bounds)
+        .ok_or_else(|| {
+            EmitError::at(
+                support,
+                "Uniform sample needs a measurable interval/box support",
+            )
+        })?;
+
+    let zero = e.scalar(0.0);
+    let one = e.scalar(1.0);
+    let u = e.rng("UNIFORM", &zero, &one, &MlirTy::Scalar);
+
+    let a = e.scalar(lo);
+    let width = e.scalar(hi - lo);
+    let width_u = e.mul(&width, &u);
+    Ok(e.add(&a, &width_u))
+}
+
 /// §08 Beta, verbatim: `log f = (alpha - 1) * log(x) + (beta - 1) *
 /// log(1 - x) - [lgamma(alpha) + lgamma(beta) - lgamma(alpha + beta)]`. No
-/// `@sample` builder yet (`sample: None`; Task 14).
+/// `@sample` builder yet (`sample: None`) — Beta is a ratio of Gammas, same
+/// no-closed-form-inverse-CDF limitation as the gamma-family batch above; a
+/// later task lands its sampler.
 fn beta_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
     let alpha = p.get(e, "alpha")?;
     let beta = p.get(e, "beta")?;
@@ -841,7 +1054,9 @@ fn beta_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitErro
 /// and its [`Value`] reused for both `lgamma`'s argument and the trailing
 /// term's coefficient — the spec's `(nu + 1) / 2` appears in both positions
 /// verbatim, same reuse discipline as [`lognormal_logpdf`]'s shared `log(x)`.
-/// No `@sample` builder yet (`sample: None`; Task 14).
+/// No `@sample` builder yet (`sample: None`) — StudentT is a Normal/ChiSquared
+/// ratio, same no-closed-form-inverse-CDF limitation as the gamma-family
+/// batch above; a later task lands its sampler.
 fn studentt_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
     let nu = p.get(e, "nu")?;
 
@@ -876,7 +1091,8 @@ fn studentt_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, Emit
 
 /// §08 GeneralizedNormal, verbatim: `log f = log(beta) - log(2 * alpha) -
 /// lgamma(1 / beta) - (|x - mean| / alpha)^beta`. No `@sample` builder yet
-/// (`sample: None`; Task 14).
+/// (`sample: None`) — needs rejection sampling (no closed-form inverse-CDF
+/// for a general shape exponent `beta`); a later task lands its sampler.
 fn generalized_normal_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
     let mean = p.get(e, "mean")?;
     let alpha = p.get(e, "alpha")?;
@@ -908,7 +1124,8 @@ fn generalized_normal_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<V
 /// §08 VonMises, verbatim: `log f = kappa * cos(x - mu) - log(2 * pi) -
 /// log(I_0(kappa))`. `log(I_0(kappa))` is [`log_bessel_i0`]'s inlined A&S
 /// approximation (no `chlo.bessel_i0e` op exists — see the batch doc
-/// comment). No `@sample` builder yet (`sample: None`; Task 14).
+/// comment). No `@sample` builder yet (`sample: None`) — needs rejection
+/// sampling (e.g. Best & Fisher's algorithm); a later task lands its sampler.
 fn von_mises_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
     let mu = p.get(e, "mu")?;
     let kappa = p.get(e, "kappa")?;
@@ -1375,8 +1592,7 @@ fn require_square_cov(blame: NodeId, cov: &Value, n: u64) -> Result<(), EmitErro
 /// shape ([`static_vector_len`]); `cov` is then checked against that same
 /// `n` by [`require_square_cov`] BEFORE any matrix op runs — neither
 /// `cholesky` nor `tri_solve` validates `cov`'s shape itself (see that
-/// function's doc comment), so this builder must. No `@sample` builder yet
-/// (`sample: None`; Task 14).
+/// function's doc comment), so this builder must.
 fn mvnormal_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
     let mu_id = p.field_id(e, "mu")?;
     let mu = e.lower_node(mu_id)?;
@@ -1404,6 +1620,34 @@ fn mvnormal_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, Emit
 
     let t1 = e.add(&c, &neg_half_log_det);
     Ok(e.add(&t1, &neg_half_quad))
+}
+
+/// §08 MvNormal's sampling transform, verbatim: `mu + L @ z`, `L =
+/// cholesky(cov)` (lower, [`Emitter::cholesky`] — reused rather than
+/// recomputed via a second `stablehlo.cholesky` op, mirroring
+/// [`lognormal_sample`]'s reuse of [`normal_sample`]'s own transform), `z` a
+/// length-`n` `Z ~ Normal(0, 1)` vector, `n` `mu`'s own statically-known
+/// length. Same [`static_vector_len`]/[`require_square_cov`] shape guards as
+/// [`mvnormal_logpdf`], applied BEFORE any matrix op runs, for the identical
+/// reason: neither `cholesky` nor [`Emitter::matvec`] validates `cov`'s
+/// shape itself.
+fn mvnormal_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
+    let mu_id = p.field_id(e, "mu")?;
+    let mu = e.lower_node(mu_id)?;
+    let cov_id = p.field_id(e, "cov")?;
+    let cov = e.lower_node(cov_id)?;
+    let n = static_vector_len(mu_id, &mu)?;
+    require_square_cov(cov_id, &cov, n)?;
+
+    let l = e.cholesky(&cov);
+
+    let zero = e.scalar(0.0);
+    let one = e.scalar(1.0);
+    let vec_ty = MlirTy::Ranked(vec![Some(n)]);
+    let z = e.rng("NORMAL", &zero, &one, &vec_ty);
+
+    let l_z = e.matvec(&l, &z);
+    Ok(e.add(&mu, &l_z))
 }
 
 /// §08 Dirichlet, verbatim: `log f = lgamma(sum(alpha)) - sum(lgamma(alpha))

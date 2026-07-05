@@ -2893,29 +2893,32 @@ fn builtin_sample_refuses_unregistered_ctor() {
     assert_eq!(err.node, Some(node));
 }
 
-/// `builtin_sample(rng, Cauchy, kernel_input)` — `Cauchy` IS registered
-/// (Task 8's `@logdensity` builder) but has no `@sample` builder yet
-/// (`sample: None`; Task 14) — must refuse with `lower_sample`'s OWN
-/// sample-specific message, `"no @sample lowering for '{ctor}'"`
-/// (`dist.sample.ok_or_else`), distinct from the unregistered-ctor message
-/// above. This arm was previously untested (`refuse.rs`'s taxonomy doc
-/// comment noted it as unreachable while every registered entry had
-/// `sample: Some(_)`) — now reachable via any of Task 8's three
-/// `sample: None` entries.
+/// `builtin_sample(rng, Gamma, kernel_input)` — `Gamma` IS registered
+/// (Task 9's `@logdensity` builder) but has no `@sample` builder yet
+/// (`sample: None`: Gamma has no closed-form inverse-CDF, so Task 14's
+/// straight-line/inverse-CDF batch skips it — see `registry.rs`'s
+/// gamma-family batch doc comment; a later rejection-sampling task lands it)
+/// — must refuse with `lower_sample`'s OWN sample-specific message, `"no
+/// @sample lowering for '{ctor}'"` (`dist.sample.ok_or_else`), distinct from
+/// the unregistered-ctor message above. This arm was previously untested
+/// (`refuse.rs`'s taxonomy doc comment noted it as unreachable while every
+/// registered entry had `sample: Some(_)`) — now reachable via any of the
+/// registry's still-`sample: None` entries (originally exercised via
+/// `Cauchy`, before Task 14 gave Cauchy its own `@sample` builder).
 #[test]
 fn builtin_sample_refuses_registered_ctor_without_sample_builder() {
     let mut m = Module::new();
     let rng = real(&mut m, 0.0); // stand-in rng-state arg (never lowered)
-    let ctor = const_node(&mut m, "Cauchy");
-    let location = real(&mut m, 0.0);
-    let scale = real(&mut m, 1.0);
-    let kernel_input = record_node(&mut m, &[("location", location), ("scale", scale)]);
+    let ctor = const_node(&mut m, "Gamma");
+    let shape = real(&mut m, 2.0);
+    let rate = real(&mut m, 1.0);
+    let kernel_input = record_node(&mut m, &[("shape", shape), ("rate", rate)]);
     let node = call(&mut m, "builtin_sample", &[rng, ctor, kernel_input]);
 
     let mut e = Emitter::new(&m, Dtype::F32);
     let err = e.lower_node(node).unwrap_err();
     assert!(
-        err.msg.contains("no @sample lowering for 'Cauchy'"),
+        err.msg.contains("no @sample lowering for 'Gamma'"),
         "unexpected message: {}",
         err.msg
     );
@@ -4612,5 +4615,374 @@ lp = logdensityof(lawof(record(l = l)), record(l = l_obs))
         err.msg.contains("LKJCholesky L must be an 3x3 matrix"),
         "unexpected message: {}",
         err.msg
+    );
+}
+
+// ---- Task 14: straight-line continuous `@sample` batch + MvNormal ----------
+//
+// LogNormal/Exponential/Uniform/Cauchy/Logistic/Laplace/Weibull/Pareto give
+// `registry.rs`'s "gamma-family"/"location-scale"/"remaining univariate"
+// batches a straight-line inverse-CDF or reparameterization `@sample`
+// builder (Gamma/InverseGamma/ChiSquared/Beta/StudentT/GeneralizedNormal/
+// VonMises stay `sample: None` — no closed-form inverse-CDF, or need
+// rejection sampling — see each batch's own doc comment); MvNormal gets
+// `mu + cholesky(cov) @ z`. Same anchor-fixture shape as `NORMAL_SAMPLE_SRC`
+// above: FIXED (literal, not `elementof`) hyperparameters via `s =
+// rnginit(0)`/`draw(...)`/`rand(s, lawof(x))`, so every `func.func @sample`
+// below is zero-arg — except MvNormal, whose `mu`/`cov` stay free
+// (`elementof`-declared) parameters, exactly like `MVNORMAL_DENSITY_SRC`
+// (Task 12), sidestepping any question about a literal nested-array (matrix)
+// nested-vector lowering.
+//
+// Distributional correctness (KS statistic / moment match against scipy, at
+// N = 100k draws per transform) is verified out-of-band (Task 14 report),
+// NOT re-derived here: these tests only lock the STRUCTURE (op counts/kinds)
+// and the frozen `.mlir` text, mirroring every `emit_logdensity_*` golden
+// test's own division of labour (formula correctness is a paper/oracle
+// derivation, structure+text is what regresses silently).
+
+const LOGNORMAL_SAMPLE_SRC: &str = "\
+s = rnginit(0)
+x = draw(LogNormal(mu = 0.0, sigma = 1.0))
+draws = rand(s, lawof(x))
+";
+
+/// §08 LogNormal's `exp(mu + sigma * Z)` transform: exactly one
+/// `stablehlo.rng` with `distribution = NORMAL`, and exactly one
+/// `stablehlo.exponential` (the trailing `exp`).
+#[test]
+fn emit_sample_lognormal_has_expected_structure() {
+    let d = determinize_src(LOGNORMAL_SAMPLE_SRC);
+    let out = emit_sample(&d);
+
+    assert!(
+        out.contains("func.func @sample()"),
+        "missing func.func @sample() (no free params) in:\n{out}"
+    );
+    assert!(out.contains("-> tensor<f32>"));
+    assert_eq!(out.matches("stablehlo.rng").count(), 1);
+    assert!(out.contains("distribution = NORMAL"));
+    assert_eq!(
+        out.matches("stablehlo.exponential").count(),
+        1,
+        "expected exactly one exp (the trailing exp(...)), in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+#[test]
+fn emit_sample_lognormal_matches_frozen_golden() {
+    let d = determinize_src(LOGNORMAL_SAMPLE_SRC);
+    let out = emit_sample(&d);
+    let golden = include_str!("goldens/lognormal_sample.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted @sample drifted from the frozen golden (tests/goldens/lognormal_sample.mlir)"
+    );
+}
+
+const EXPONENTIAL_SAMPLE_SRC: &str = "\
+s = rnginit(0)
+x = draw(Exponential(rate = 1.0))
+draws = rand(s, lawof(x))
+";
+
+/// §08 Exponential's `-log(U) / rate` transform: exactly one
+/// `stablehlo.rng` with `distribution = UNIFORM`.
+#[test]
+fn emit_sample_exponential_has_expected_structure() {
+    let d = determinize_src(EXPONENTIAL_SAMPLE_SRC);
+    let out = emit_sample(&d);
+
+    assert!(out.contains("func.func @sample()"));
+    assert!(out.contains("-> tensor<f32>"));
+    assert_eq!(out.matches("stablehlo.rng").count(), 1);
+    assert!(out.contains("distribution = UNIFORM"));
+    assert_eq!(out.matches("stablehlo.log").count(), 1);
+    assert_eq!(out.matches("stablehlo.negate").count(), 1);
+    assert_eq!(out.matches("stablehlo.divide").count(), 1);
+    assert!(is_delimiter_balanced(&out));
+}
+
+#[test]
+fn emit_sample_exponential_matches_frozen_golden() {
+    let d = determinize_src(EXPONENTIAL_SAMPLE_SRC);
+    let out = emit_sample(&d);
+    let golden = include_str!("goldens/exponential_sample.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted @sample drifted from the frozen golden (tests/goldens/exponential_sample.mlir)"
+    );
+}
+
+const UNIFORM_SAMPLE_SRC: &str = "\
+s = rnginit(0)
+x = draw(Uniform(support = interval(-1.0, 3.0)))
+draws = rand(s, lawof(x))
+";
+
+/// §08 Uniform's `a + (b - a) * U` transform: exactly one `stablehlo.rng`
+/// with `distribution = UNIFORM`, and the two folded bound constants
+/// (`-1.0`, `4.0` = `3.0 - (-1.0)`) alongside it.
+#[test]
+fn emit_sample_uniform_has_expected_structure() {
+    let d = determinize_src(UNIFORM_SAMPLE_SRC);
+    let out = emit_sample(&d);
+
+    assert!(out.contains("func.func @sample()"));
+    assert!(out.contains("-> tensor<f32>"));
+    assert_eq!(out.matches("stablehlo.rng").count(), 1);
+    assert!(out.contains("distribution = UNIFORM"));
+    assert_eq!(out.matches("stablehlo.multiply").count(), 1);
+    assert_eq!(out.matches("stablehlo.add").count(), 1);
+    assert!(is_delimiter_balanced(&out));
+}
+
+#[test]
+fn emit_sample_uniform_matches_frozen_golden() {
+    let d = determinize_src(UNIFORM_SAMPLE_SRC);
+    let out = emit_sample(&d);
+    let golden = include_str!("goldens/uniform_sample.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted @sample drifted from the frozen golden (tests/goldens/uniform_sample.mlir)"
+    );
+}
+
+const CAUCHY_SAMPLE_SRC: &str = "\
+s = rnginit(0)
+x = draw(Cauchy(location = 0.0, scale = 1.0))
+draws = rand(s, lawof(x))
+";
+
+/// §08 Cauchy's `x0 + gamma * tan(pi * (U - 1/2))` transform: exactly one
+/// `stablehlo.rng` with `distribution = UNIFORM`, and `tan` composed as
+/// exactly one `stablehlo.sine` / `stablehlo.cosine` pair (no native `tan`
+/// op — see [`Emitter::sin`]'s doc comment).
+#[test]
+fn emit_sample_cauchy_has_expected_structure() {
+    let d = determinize_src(CAUCHY_SAMPLE_SRC);
+    let out = emit_sample(&d);
+
+    assert!(out.contains("func.func @sample()"));
+    assert!(out.contains("-> tensor<f32>"));
+    assert_eq!(out.matches("stablehlo.rng").count(), 1);
+    assert!(out.contains("distribution = UNIFORM"));
+    assert_eq!(
+        out.matches("stablehlo.sine").count(),
+        1,
+        "expected exactly one sine (tan = sin/cos), in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.cosine").count(),
+        1,
+        "expected exactly one cosine (tan = sin/cos), in:\n{out}"
+    );
+    assert_eq!(out.matches("stablehlo.divide").count(), 1);
+    assert!(is_delimiter_balanced(&out));
+}
+
+#[test]
+fn emit_sample_cauchy_matches_frozen_golden() {
+    let d = determinize_src(CAUCHY_SAMPLE_SRC);
+    let out = emit_sample(&d);
+    let golden = include_str!("goldens/cauchy_sample.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted @sample drifted from the frozen golden (tests/goldens/cauchy_sample.mlir)"
+    );
+}
+
+const LOGISTIC_SAMPLE_SRC: &str = "\
+s = rnginit(0)
+x = draw(Logistic(mu = 0.0, s = 1.0))
+draws = rand(s, lawof(x))
+";
+
+/// §08 Logistic's `mu + s * log(U / (1 - U))` transform: exactly one
+/// `stablehlo.rng` with `distribution = UNIFORM`.
+#[test]
+fn emit_sample_logistic_has_expected_structure() {
+    let d = determinize_src(LOGISTIC_SAMPLE_SRC);
+    let out = emit_sample(&d);
+
+    assert!(out.contains("func.func @sample()"));
+    assert!(out.contains("-> tensor<f32>"));
+    assert_eq!(out.matches("stablehlo.rng").count(), 1);
+    assert!(out.contains("distribution = UNIFORM"));
+    assert_eq!(out.matches("stablehlo.log").count(), 1);
+    assert_eq!(out.matches("stablehlo.divide").count(), 1);
+    assert!(is_delimiter_balanced(&out));
+}
+
+#[test]
+fn emit_sample_logistic_matches_frozen_golden() {
+    let d = determinize_src(LOGISTIC_SAMPLE_SRC);
+    let out = emit_sample(&d);
+    let golden = include_str!("goldens/logistic_sample.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted @sample drifted from the frozen golden (tests/goldens/logistic_sample.mlir)"
+    );
+}
+
+const LAPLACE_SAMPLE_SRC: &str = "\
+s = rnginit(0)
+x = draw(Laplace(location = 0.0, scale = 1.0))
+draws = rand(s, lawof(x))
+";
+
+/// §08 Laplace's `mu - b * sgn(U - 1/2) * log(1 - 2|U - 1/2|)` transform:
+/// exactly one `stablehlo.rng` with `distribution = UNIFORM`, and `sgn`
+/// composed via exactly one `stablehlo.compare`/`stablehlo.select` pair (no
+/// `stablehlo.sign` op — see [`laplace_sample`]'s doc comment).
+#[test]
+fn emit_sample_laplace_has_expected_structure() {
+    let d = determinize_src(LAPLACE_SAMPLE_SRC);
+    let out = emit_sample(&d);
+
+    assert!(out.contains("func.func @sample()"));
+    assert!(out.contains("-> tensor<f32>"));
+    assert_eq!(out.matches("stablehlo.rng").count(), 1);
+    assert!(out.contains("distribution = UNIFORM"));
+    assert_eq!(
+        out.matches("stablehlo.compare").count(),
+        1,
+        "expected exactly one compare (sgn's U - 1/2 >= 0 branch), in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.select").count(),
+        1,
+        "expected exactly one select (sgn's +-1 branch), in:\n{out}"
+    );
+    assert_eq!(out.matches("stablehlo.abs").count(), 1);
+    assert!(is_delimiter_balanced(&out));
+}
+
+#[test]
+fn emit_sample_laplace_matches_frozen_golden() {
+    let d = determinize_src(LAPLACE_SAMPLE_SRC);
+    let out = emit_sample(&d);
+    let golden = include_str!("goldens/laplace_sample.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted @sample drifted from the frozen golden (tests/goldens/laplace_sample.mlir)"
+    );
+}
+
+const WEIBULL_SAMPLE_SRC: &str = "\
+s = rnginit(0)
+x = draw(Weibull(shape = 2.0, scale = 3.0))
+draws = rand(s, lawof(x))
+";
+
+/// §08 Weibull's `scale * (-log(U))^(1 / shape)` transform: exactly one
+/// `stablehlo.rng` with `distribution = UNIFORM`, and exactly one
+/// `stablehlo.power`.
+#[test]
+fn emit_sample_weibull_has_expected_structure() {
+    let d = determinize_src(WEIBULL_SAMPLE_SRC);
+    let out = emit_sample(&d);
+
+    assert!(out.contains("func.func @sample()"));
+    assert!(out.contains("-> tensor<f32>"));
+    assert_eq!(out.matches("stablehlo.rng").count(), 1);
+    assert!(out.contains("distribution = UNIFORM"));
+    assert_eq!(out.matches("stablehlo.power").count(), 1);
+    assert!(is_delimiter_balanced(&out));
+}
+
+#[test]
+fn emit_sample_weibull_matches_frozen_golden() {
+    let d = determinize_src(WEIBULL_SAMPLE_SRC);
+    let out = emit_sample(&d);
+    let golden = include_str!("goldens/weibull_sample.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted @sample drifted from the frozen golden (tests/goldens/weibull_sample.mlir)"
+    );
+}
+
+const PARETO_SAMPLE_SRC: &str = "\
+s = rnginit(0)
+x = draw(Pareto(shape = 3.0, scale = 1.0))
+draws = rand(s, lawof(x))
+";
+
+/// §08 Pareto's `scale * U^(-1 / shape)` transform: exactly one
+/// `stablehlo.rng` with `distribution = UNIFORM`, and exactly one
+/// `stablehlo.power`.
+#[test]
+fn emit_sample_pareto_has_expected_structure() {
+    let d = determinize_src(PARETO_SAMPLE_SRC);
+    let out = emit_sample(&d);
+
+    assert!(out.contains("func.func @sample()"));
+    assert!(out.contains("-> tensor<f32>"));
+    assert_eq!(out.matches("stablehlo.rng").count(), 1);
+    assert!(out.contains("distribution = UNIFORM"));
+    assert_eq!(out.matches("stablehlo.power").count(), 1);
+    assert!(is_delimiter_balanced(&out));
+}
+
+#[test]
+fn emit_sample_pareto_matches_frozen_golden() {
+    let d = determinize_src(PARETO_SAMPLE_SRC);
+    let out = emit_sample(&d);
+    let golden = include_str!("goldens/pareto_sample.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted @sample drifted from the frozen golden (tests/goldens/pareto_sample.mlir)"
+    );
+}
+
+/// The Task-14 MvNormal anchor fixture: a length-2 free `mu`/`cov` (exactly
+/// [`MVNORMAL_DENSITY_SRC`]'s shape, minus the pinned observation — `@sample`
+/// scores no variate), so `mu`/`cov` become `tensor<2xf32>`/`tensor<2x2xf32>`
+/// func args rather than a literal nested-array (matrix) constant — see the
+/// batch doc comment above.
+const MVNORMAL_SAMPLE_SRC: &str = "\
+mu = elementof(cartpow(reals, 2))
+cov = elementof(cartpow(reals, [2, 2]))
+s = rnginit(0)
+x = draw(MvNormal(mu = mu, cov = cov))
+draws = rand(s, lawof(x))
+";
+
+/// §08 MvNormal's `mu + cholesky(cov) @ z` transform: `mu`/`cov` become
+/// `tensor<2xf32>`/`tensor<2x2xf32>` func args, exactly one `stablehlo.rng`
+/// with `distribution = NORMAL` drawing a length-2 `z`, exactly one
+/// `stablehlo.cholesky`, and exactly one `stablehlo.dot_general` (the
+/// `matvec`).
+#[test]
+fn emit_sample_mvnormal_has_expected_structure() {
+    let d = determinize_src(MVNORMAL_SAMPLE_SRC);
+    assert!(
+        flatppl_determinizer::is_flatpdl(&d).is_ok(),
+        "determinized module must be FlatPDL-conformant (no residual measure node)"
+    );
+
+    let out = emit_sample(&d);
+
+    assert!(
+        out.contains("%arg0: tensor<2xf32>") && out.contains("%arg1: tensor<2x2xf32>"),
+        "mu/cov must become vector/matrix func args, in:\n{out}"
+    );
+    assert!(out.contains("-> tensor<2xf32>"));
+    assert_eq!(out.matches("stablehlo.rng").count(), 1);
+    assert!(out.contains("distribution = NORMAL"));
+    assert_eq!(out.matches("stablehlo.cholesky").count(), 1);
+    assert_eq!(out.matches("stablehlo.dot_general").count(), 1);
+    assert!(is_delimiter_balanced(&out));
+}
+
+#[test]
+fn emit_sample_mvnormal_matches_frozen_golden() {
+    let d = determinize_src(MVNORMAL_SAMPLE_SRC);
+    let out = emit_sample(&d);
+    let golden = include_str!("goldens/mvnormal_sample.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted @sample drifted from the frozen golden (tests/goldens/mvnormal_sample.mlir)"
     );
 }
