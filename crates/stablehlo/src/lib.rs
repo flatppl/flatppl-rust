@@ -31,6 +31,11 @@
 //! `logpdf`/`sample` builders) and the first mode builder (`modes.rs`'s
 //! `emit_logdensity`), wired up as `emit`'s `Mode::LogDensity` route — the
 //! first complete emitted StableHLO module (the density vertical slice).
+//!
+//! Task 6 adds `Emitter::rng` (`stablehlo.rng`, XLA-seeded — no explicit rng
+//! key), Normal's `@sample` builder (§08's `mu + sigma * Z` transform), and
+//! `modes.rs`'s `emit_sample`, wired up as `emit`'s `Mode::Sample` route —
+//! the sampling vertical slice.
 
 mod emitter;
 mod mlir;
@@ -77,13 +82,13 @@ impl Default for EmitOptions {
 /// mis-lowers) if `m` still carries measure-layer constructs.
 ///
 /// Routes to the mode builder for `mode`: [`Mode::LogDensity`] →
-/// [`modes::emit_logdensity`] (Task 5). [`Mode::Sample`] has no builder yet
-/// (Task 6) and refuses.
+/// [`modes::emit_logdensity`] (Task 5), [`Mode::Sample`] →
+/// [`modes::emit_sample`] (Task 6).
 pub fn emit(m: &Module, mode: Mode, opts: &EmitOptions) -> Result<String, EmitError> {
     flatppl_determinizer::is_flatpdl(m)
         .map_err(|_| EmitError::whole("input is not FlatPDL (determinize first)"))?;
     match mode {
         Mode::LogDensity => modes::emit_logdensity(m, opts),
-        Mode::Sample => Err(EmitError::whole("@sample mode has no builder yet (Task 6)")),
+        Mode::Sample => modes::emit_sample(m, opts),
     }
 }

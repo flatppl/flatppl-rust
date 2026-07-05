@@ -570,6 +570,130 @@ impl<'m> Emitter<'m> {
         Value { ssa, ty: result_ty }
     }
 
+    // ---- sampling (Task 6) --------------------------------------------------
+
+    /// `%sh = stablehlo.constant dense<...> : tensor<Kxi64>` then `%N =
+    /// stablehlo.rng %a, %b, %sh, distribution = {NORMAL|UNIFORM} : (a_ty,
+    /// b_ty, tensor<Kxi64>) -> out_ty` — parser-validated verbatim against
+    /// the real StableHLO parser (jax 0.10.2). `dist` is a StableHLO
+    /// `rng_distribution` (`"NORMAL"`/`"UNIFORM"`); no explicit RNG key is
+    /// threaded (this vertical is XLA-seeded — see
+    /// `registry::lower_sample`'s doc comment on why `builtin_sample`'s
+    /// threaded rng-state argument is simply never lowered).
+    ///
+    /// `K` is `out_ty`'s rank and the shape constant's `K` elements are its
+    /// own per-axis dimension sizes: `K = 0` (`tensor<0xi64>`, `dense<>`) for
+    /// a `Scalar` result, `K = 1` (`tensor<1xi64>`, `dense<N>` — a bare
+    /// scalar literal, not `dense<[N]>`) for a length-`N` vector result.
+    /// `stablehlo.rng`'s shape operand is always an INTEGER tensor (a static
+    /// output-shape descriptor), never this emitter's `f32`/`f64` element
+    /// dtype — unlike every other constant this emitter builds, it cannot go
+    /// through [`Emitter::constant`]/`MlirTy::render` (both
+    /// dtype-parameterized), so it is built as raw text here instead
+    /// (mirroring [`render_i1`]'s reasoning for the same kind of
+    /// dtype-independent local render).
+    ///
+    /// Panics (an internal invariant violation, not a user-facing refusal —
+    /// mirrors `diag`/`matvec`'s panic-on-bad-shape discipline) if `out_ty`
+    /// has a dynamic dimension or is a `Tuple`: neither has a static
+    /// shape-constant form.
+    pub fn rng(&mut self, dist: &str, a: &Value, b: &Value, out_ty: &MlirTy) -> Value {
+        let dims: Vec<u64> = match out_ty {
+            MlirTy::Scalar => Vec::new(),
+            MlirTy::Ranked(dims) => dims
+                .iter()
+                .map(|d| {
+                    d.unwrap_or_else(|| {
+                        panic!("rng: dynamic output dimension has no static shape-constant form")
+                    })
+                })
+                .collect(),
+            MlirTy::Tuple(_) => panic!("rng: tuple output type has no shape-constant form"),
+        };
+        let shape_ty_text = format!("tensor<{}xi64>", dims.len());
+        let shape_lit = match dims.len() {
+            0 => String::new(),
+            1 => dims[0].to_string(),
+            _ => format!(
+                "[{}]",
+                dims.iter()
+                    .map(u64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        };
+        let shape_ssa = self.fresh();
+        self.push(&format!(
+            "{shape_ssa} = stablehlo.constant dense<{shape_lit}> : {shape_ty_text}"
+        ));
+
+        let a_ty = a.ty.render(self.dtype);
+        let b_ty = b.ty.render(self.dtype);
+        let out_ty_text = out_ty.render(self.dtype);
+        let ssa = self.fresh();
+        self.push(&format!(
+            "{ssa} = stablehlo.rng {}, {}, {shape_ssa}, distribution = {dist} : ({a_ty}, {b_ty}, {shape_ty_text}) -> {out_ty_text}",
+            a.ssa, b.ssa
+        ));
+        Value {
+            ssa,
+            ty: out_ty.clone(),
+        }
+    }
+
+    /// If `args` is `get0`/`get`'s `[container, index]` pair and `container`
+    /// resolves (see [`Emitter::resolves_to_builtin_sample`]) to a
+    /// `builtin_sample(...)` call, return the requested slot's ZERO-based
+    /// index: `0` is the drawn-value slot — exactly what
+    /// [`crate::registry::lower_sample`]'s dispatch already computes for the
+    /// `builtin_sample` node itself, so `lower_node_uncached` reads it
+    /// straight through rather than trying to tensor-slice a sampled
+    /// `(value, new_rngstate)` pair, which has no rank-1-tensor form. `1` is
+    /// the advanced rng-state slot, which has no tensor form at all in this
+    /// vertical (see [`Emitter::rng`]'s doc comment). `base` distinguishes
+    /// `get0` (0-based) from `get` (1-based), mirroring
+    /// `ops::lower_builtin`'s own dispatch. `None` when `container` is not a
+    /// sampled-tuple projection at all — the caller falls back to
+    /// `ops::lower_builtin`'s ordinary rank-1-tensor `get`/`get0`.
+    fn sample_tuple_slot(&self, args: &[NodeId], base: i64) -> Option<i64> {
+        let [container, index] = <[NodeId; 2]>::try_from(args).ok()?;
+        if !self.resolves_to_builtin_sample(container) {
+            return None;
+        }
+        match self.m.node(index) {
+            Node::Lit(Scalar::Int(i)) => Some(i - base),
+            _ => None,
+        }
+    }
+
+    /// Whether `id` — resolved through at most one level of `(%ref self x)`
+    /// indirection (mirroring [`Emitter::lower_ref`]'s `SelfMod` case, and
+    /// the determinizer's own `resolve_ref_one`: a shared latent's
+    /// `builtin_sample` is bound to a name by
+    /// `flatppl_determinizer::sample::lower_shared_record_sample`, an inline
+    /// single draw's is not, via that module's `build_sample_term`) — is a
+    /// `builtin_sample(...)` call.
+    fn resolves_to_builtin_sample(&self, id: NodeId) -> bool {
+        let resolved = match self.m.node(id) {
+            Node::Ref(Ref {
+                ns: RefNs::SelfMod,
+                name,
+            }) => self
+                .m
+                .binding_by_name(*name)
+                .map(|bid| self.m.binding(bid).rhs)
+                .unwrap_or(id),
+            _ => id,
+        };
+        matches!(
+            self.m.node(resolved),
+            Node::Call(c) if matches!(
+                c.head,
+                CallHead::Builtin(sym) if self.m.resolve(sym) == "builtin_sample"
+            )
+        )
+    }
+
     // ---- node dispatch (Task 4) ---------------------------------------------
 
     /// Pre-bind `id` to `value` in the memo map, without emitting any op.
@@ -643,12 +767,33 @@ impl<'m> Emitter<'m> {
             Node::Call(call) => match call.head {
                 CallHead::Builtin(sym) => {
                     let name = m.resolve(sym).to_string();
-                    // The registry gate: `builtin_logdensityof` dispatches to
-                    // the distribution registry (`crate::registry`), never to
-                    // `ops::lower_builtin`'s deterministic (non-distribution)
-                    // map — see that module's doc comment.
+                    // The registry gate: `builtin_logdensityof`/`builtin_sample`
+                    // dispatch to the distribution registry (`crate::registry`),
+                    // never to `ops::lower_builtin`'s deterministic
+                    // (non-distribution) map — see that module's doc comment.
                     if name == "builtin_logdensityof" {
                         crate::registry::lower_logdensityof(self, id, &call.args)
+                    } else if name == "builtin_sample" {
+                        crate::registry::lower_sample(self, id, &call.args)
+                    } else if matches!(name.as_str(), "get0" | "get") {
+                        // `get0(builtin_sample(...), 0)` / `get((%ref self
+                        // <shared-latent>), 1)`: a projection of a sampled
+                        // `(value, new_rngstate)` tuple, not a real rank-1
+                        // tensor — see `Emitter::sample_tuple_slot`'s doc
+                        // comment. Anything else (the ordinary case) falls
+                        // through to `ops::lower_builtin`'s generic
+                        // rank-1-tensor `get`/`get0`.
+                        let base = if name == "get0" { 0 } else { 1 };
+                        match self.sample_tuple_slot(&call.args, base) {
+                            Some(0) => self.lower_node(call.args[0]),
+                            Some(_) => Err(EmitError::at(
+                                id,
+                                "sampled rng state has no tensor form (this vertical is \
+                                 XLA-seeded: stablehlo.rng takes no explicit rng key, so the \
+                                 threaded rng-state slot of a sampled tuple is never lowered)",
+                            )),
+                            None => crate::ops::lower_builtin(self, id, &name, &call.args),
+                        }
                     } else {
                         crate::ops::lower_builtin(self, id, &name, &call.args)
                     }

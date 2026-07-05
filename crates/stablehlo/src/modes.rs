@@ -44,8 +44,22 @@
 //! semantics, no refusal. [`emit_logdensity`] therefore guards the selected
 //! output with a cheap structural check ([`contains_logdensityof_call`]):
 //! the binding's RHS subtree must contain at least one `builtin_logdensityof`
-//! call, or it refuses rather than mis-lower. `@sample` (Task 6) will need
-//! the analogous guard over `builtin_sample`.
+//! call, or it refuses rather than mis-lower. [`emit_sample`] applies the
+//! analogous guard ([`contains_sample_call`]) over `builtin_sample`.
+//!
+//! **`@sample`.** [`emit_sample`] mirrors [`emit_logdensity`]'s structure
+//! exactly — same free-parameter/fixed-data binding loop, same
+//! last-public-binding query convention, same structural query-output guard
+//! — but the query's RHS is not itself a bare `builtin_sample` call: a
+//! value-terminal `rand(rng, lawof(x))` (`flatppl_determinizer::sample`)
+//! lowers to `get0(builtin_sample(rng, ctor, kernel_input), 0)`, projecting
+//! the drawn-value slot of the sampled `(value, new_rngstate)` pair. Rather
+//! than special-casing that shape here, [`Emitter::lower_node`]'s dispatch
+//! (`emitter.rs`) recognizes a `get0`/`get` projection of a `builtin_sample`
+//! call structurally and reads the registry's already-computed drawn value
+//! straight through — see `Emitter::sample_tuple_slot`'s doc comment — so
+//! [`emit_sample`] can lower its query the same generic way
+//! [`emit_logdensity`] does.
 
 use flatppl_core::{CallHead, Module, Node, NodeId, Phase};
 
@@ -109,6 +123,72 @@ fn contains_logdensityof_call(m: &Module, root: NodeId) -> bool {
     let mut stack = vec![root];
     while let Some(id) = stack.pop() {
         if is_builtin_call(m, id, "builtin_logdensityof") {
+            return true;
+        }
+        m.for_each_child(id, |c| stack.push(c));
+    }
+    false
+}
+
+/// Emit `@sample` for a determinized module `m` — see the module doc comment
+/// for how this mirrors [`emit_logdensity`] (free-param/fixed-data binding
+/// loop, last-public-binding query convention, structural query-output
+/// guard) and how its query's `get0(builtin_sample(...), 0)` shape is
+/// resolved generically via [`Emitter::lower_node`]'s dispatch. `m` is
+/// assumed already FlatPDL-conformant — [`crate::emit`] (the mode router)
+/// checks that once, up front.
+pub fn emit_sample(m: &Module, opts: &EmitOptions) -> Result<String, EmitError> {
+    let mut e = Emitter::new(m, opts.dtype);
+
+    // Free parameters, in binding (source) order — identical to
+    // `emit_logdensity`'s loop (see the module doc comment): a `@sample`
+    // forward model can still have `elementof`-declared hyperparameters, in
+    // which case they become func args just as they do for `@logdensity`.
+    // A fixed-hyperparameter prior (the common case) simply yields no args.
+    let mut args: Vec<(String, MlirTy)> = Vec::new();
+    for (_, binding) in m.bindings() {
+        if !is_free_param(m, binding.rhs) {
+            continue;
+        }
+        let name = format!("%arg{}", args.len());
+        let ty = mlir_type_of(m, binding.rhs, opts.dtype)?;
+        e.bind(
+            binding.rhs,
+            Value {
+                ssa: name.clone(),
+                ty: ty.clone(),
+            },
+        );
+        args.push((name, ty));
+    }
+
+    let query = m.public_bindings().last().ok_or_else(|| {
+        EmitError::whole("module has no public binding to emit as the sample query")
+    })?;
+    let query_rhs = query.1.rhs;
+
+    // Guard the "last public binding" convention (see the module doc
+    // comment): refuse rather than silently lower a trailing non-sample
+    // binding.
+    if !contains_sample_call(m, query_rhs) {
+        return Err(EmitError::at(
+            query_rhs,
+            "selected query output contains no sample term (builtin_sample); \
+             FlatPDL has no query marker — cannot identify the @sample output",
+        ));
+    }
+
+    let result = e.lower_node(query_rhs)?;
+    Ok(e.finish("sample", &args, &result))
+}
+
+/// Whether the subtree rooted at `id` contains a `Call` whose head is the
+/// builtin `builtin_sample` — the [`emit_sample`] analogue of
+/// [`contains_logdensityof_call`].
+fn contains_sample_call(m: &Module, root: NodeId) -> bool {
+    let mut stack = vec![root];
+    while let Some(id) = stack.pop() {
+        if is_builtin_call(m, id, "builtin_sample") {
             return true;
         }
         m.for_each_child(id, |c| stack.push(c));

@@ -1,14 +1,14 @@
 //! The distribution registry: the ctor-name-keyed dispatch table
-//! `builtin_logdensityof` (and, from Task 6 on, `builtin_sample`) uses to
-//! reach a distribution's closed-form builder. Adding a distribution is a
-//! new table entry here — never an [`Emitter`] or [`crate::ops`] edit.
+//! `builtin_logdensityof` and `builtin_sample` use to reach a distribution's
+//! closed-form builder. Adding a distribution is a new table entry here —
+//! never an [`Emitter`] or [`crate::ops`] edit.
 //!
 //! [`Emitter::lower_node`](crate::emitter::Emitter::lower_node)'s `Call`
-//! dispatch (`emitter.rs`) recognizes the `builtin_logdensityof` head itself
-//! and routes it to [`lower_logdensityof`] here, rather than letting it fall
-//! through to `crate::ops::lower_builtin`'s catch-all "unsupported builtin
-//! head" refusal — see that module's doc comment for the before/after this
-//! task changes.
+//! dispatch (`emitter.rs`) recognizes the `builtin_logdensityof`/
+//! `builtin_sample` heads itself and routes them to [`lower_logdensityof`]/
+//! [`lower_sample`] here, rather than letting either fall through to
+//! `crate::ops::lower_builtin`'s catch-all "unsupported builtin head"
+//! refusal — see that module's doc comment.
 
 use flatppl_core::{NamedKind, Node, NodeId};
 
@@ -21,20 +21,16 @@ use crate::refuse::EmitError;
 pub type LogpdfBuilder = fn(&mut Emitter, &Params, &Value) -> Result<Value, EmitError>;
 
 /// `fn(emitter, params) -> a drawn variate` — a distribution's sampling
-/// builder (Task 6+; `stablehlo.rng` for straight-line dists, a hand-written
+/// builder (`stablehlo.rng` for straight-line dists, a hand-written
 /// `stablehlo.while` for rejection-based ones).
 pub type SampleBuilder = fn(&mut Emitter, &Params) -> Result<Value, EmitError>;
 
 /// One registered distribution's builders. `sample` is `None` until that
 /// distribution's `@sample` builder is added — reaching `@sample` for such a
-/// distribution refuses precisely, rather than silently reusing `logpdf` or
-/// guessing a sampler.
+/// distribution refuses precisely (see [`lower_sample`]), rather than
+/// silently reusing `logpdf` or guessing a sampler.
 pub struct DistLowering {
     pub logpdf: LogpdfBuilder,
-    /// Read by the `@sample` mode builder (Task 6) — every entry sets this
-    /// today (`None`, since no distribution has a sampler yet), but nothing
-    /// reads it back until that mode builder exists.
-    #[allow(dead_code)]
     pub sample: Option<SampleBuilder>,
 }
 
@@ -46,7 +42,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[(
     "Normal",
     DistLowering {
         logpdf: normal_logpdf,
-        sample: None, // Task 6
+        sample: Some(normal_sample),
     },
 )];
 
@@ -132,6 +128,51 @@ pub(crate) fn lower_logdensityof(
     (dist.logpdf)(e, &params, &value)
 }
 
+/// `builtin_sample(rng, ctor, kernel_input)` (`flatppl_determinizer::sample`'s
+/// `build_sample_term`/`lower_shared_record_sample`): `rng` is the threaded
+/// RNG-state argument — deliberately UNUSED (bound as `_rng` below): this
+/// vertical lowers to `stablehlo.rng`, which is XLA-seeded and takes no
+/// explicit rng key, so there is nothing to lower it to (spec §07's
+/// `builtin_sample` returns a `(value, new_rngstate)` pair; the advanced
+/// rng-state half has no tensor form here either — see
+/// `Emitter::sample_tuple_slot`'s doc comment for how a `get0(_, 1)`
+/// projection of it is refused rather than mis-lowered). `ctor` is a bare
+/// `Const(ctor)` distribution constructor symbol, `kernel_input` its kwargs
+/// record — otherwise the same shape as [`lower_logdensityof`]'s `kernel`/
+/// `kernel_input`. Dispatches to `lookup(ctor).sample`, refusing precisely
+/// for a malformed call shape, an unregistered ctor, or a registered ctor
+/// with no `@sample` builder yet — never guessed.
+pub(crate) fn lower_sample(
+    e: &mut Emitter,
+    id: NodeId,
+    args: &[NodeId],
+) -> Result<Value, EmitError> {
+    let [_rng, ctor, kernel_input] = <[NodeId; 3]>::try_from(args).map_err(|_| {
+        EmitError::at(
+            id,
+            format!("builtin_sample: expected 3 arguments, got {}", args.len()),
+        )
+    })?;
+
+    let ctor_name = match e.node(ctor) {
+        Node::Const(sym) => e.resolve(*sym).to_string(),
+        _ => {
+            return Err(EmitError::at(
+                ctor,
+                "builtin_sample: ctor must be a bare distribution constructor",
+            ));
+        }
+    };
+    let dist = lookup(&ctor_name)
+        .ok_or_else(|| EmitError::at(id, format!("no lowering for distribution '{ctor_name}'")))?;
+    let sample = dist
+        .sample
+        .ok_or_else(|| EmitError::at(id, format!("no @sample lowering for '{ctor_name}'")))?;
+
+    let params = Params { kernel_input };
+    sample(e, &params)
+}
+
 // ---- §08 Normal -------------------------------------------------------------
 
 /// §08 Normal, verbatim: `log f = -log(sigma) - 1/2 * log(2*pi) - (x -
@@ -159,4 +200,24 @@ fn normal_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitEr
 
     let neg_log_sigma_plus_c = e.add(&neg_log_sigma, &c);
     Ok(e.add(&neg_log_sigma_plus_c, &quad))
+}
+
+/// §08 Normal's sampling transform, verbatim: `mu + sigma * Z`, `Z ~
+/// Normal(0, 1)`. `Z` is drawn at `mu`'s own shape (`&mu.ty`) — the variate
+/// shape a scalar or (later) vector-valued Normal draw needs, mirroring how
+/// [`normal_logpdf`] reads its parameters via [`Params::get`]. Same
+/// let-per-intermediate discipline as [`normal_logpdf`] (nested `&mut
+/// Emitter` calls do not borrow-check) — the brief's `e.add(&mu,
+/// &e.mul(&sigma, &z))` sketch is illustrative of the arithmetic, not
+/// literal executable Rust.
+fn normal_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
+    let mu = p.get(e, "mu")?;
+    let sigma = p.get(e, "sigma")?;
+
+    let zero = e.scalar(0.0);
+    let one = e.scalar(1.0);
+    let z = e.rng("NORMAL", &zero, &one, &mu.ty);
+
+    let sigma_z = e.mul(&sigma, &z);
+    Ok(e.add(&mu, &sigma_z))
 }

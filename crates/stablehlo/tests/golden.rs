@@ -1364,3 +1364,118 @@ fn emit_logdensity_refuses_trailing_binding_with_no_density_term() {
     );
     assert_eq!(err.node, Some(diag));
 }
+
+// ---- Task 6: Normal `@sample` + `emit_sample` (sampling vertical slice) ----
+//
+// `Emitter::rng` (`stablehlo.rng`), Normal's `@sample` builder (§08's
+// `mu + sigma * Z` transform), and the `emit_sample` mode builder
+// (`modes.rs`), wired up as `emit`'s `Mode::Sample` route.
+
+/// The Task-6 anchor fixture: a fixed-hyperparameter scalar Normal forward
+/// model, sampled via the value-terminal `rand(rng, lawof(x))` convention
+/// (`flatppl_determinizer::sample`). Verified (via a throwaway determinize +
+/// `flatppl_flatpir::write` dump) to determinize to `draws`'s RHS being
+/// exactly `get0(builtin_sample(s, Normal, record(mu=0.0, sigma=1.0)), 0)` —
+/// no wrapping `record(...)` around the single draw, unlike
+/// `crates/determinizer/tests/sample_golden.rs`'s `record(x = x)` fixtures
+/// (this is `lawof(x)` directly, not `lawof(record(x = x))`, so
+/// `lower_measure_sample` dispatches straight to `lower_draw`, never
+/// `lower_record_of_draws_sample`). Fixed (not `elementof`) hyperparameters,
+/// so `emit_sample` should produce a `func.func @sample()` with no args.
+const NORMAL_SAMPLE_SRC: &str = "\
+s = rnginit(0)
+x = draw(Normal(mu = 0.0, sigma = 1.0))
+draws = rand(s, lawof(x))
+";
+
+fn emit_sample(m: &Module) -> String {
+    flatppl_stablehlo::emit(
+        m,
+        flatppl_stablehlo::Mode::Sample,
+        &flatppl_stablehlo::EmitOptions::default(),
+    )
+    .expect("must emit @sample")
+}
+
+/// The brief's Step-1 structural test: `func.func @sample` with no args (a
+/// fixed-hyperparameter prior), exactly one `stablehlo.rng` with
+/// `distribution = NORMAL`, returning the drawn `tensor<f32>` variate.
+#[test]
+fn emit_sample_normal_has_expected_structure() {
+    let d = determinize_src(NORMAL_SAMPLE_SRC);
+    assert!(
+        flatppl_determinizer::is_flatpdl(&d).is_ok(),
+        "determinized module must be FlatPDL-conformant (no residual measure node)"
+    );
+
+    let out = emit_sample(&d);
+
+    assert!(
+        out.contains("func.func @sample()"),
+        "missing func.func @sample() (no free params) in:\n{out}"
+    );
+    assert!(
+        out.contains("-> tensor<f32>"),
+        "must return tensor<f32> in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.rng").count(),
+        1,
+        "expected exactly one stablehlo.rng, in:\n{out}"
+    );
+    assert!(
+        out.contains("distribution = NORMAL"),
+        "missing NORMAL distribution attr, in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// Freeze the exact emitted text: any drift (op count, ordering, arg naming,
+/// formula) must be a deliberate, reviewed change to this golden file.
+#[test]
+fn emit_sample_normal_matches_frozen_golden() {
+    let d = determinize_src(NORMAL_SAMPLE_SRC);
+    let out = emit_sample(&d);
+    let golden = include_str!("goldens/normal_sample.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted @sample drifted from the frozen golden (tests/goldens/normal_sample.mlir)"
+    );
+}
+
+/// The `emit_sample` analogue of
+/// `emit_logdensity_refuses_trailing_binding_with_no_density_term`: a
+/// trailing public binding with no `builtin_sample` anywhere in its subtree
+/// must refuse rather than be silently lowered just because it is the last
+/// public binding in source order.
+#[test]
+fn emit_sample_refuses_trailing_binding_with_no_sample_term() {
+    let mut m = Module::new();
+    let ctor = const_node(&mut m, "Normal");
+    let mu = real(&mut m, 0.0);
+    let sigma = real(&mut m, 1.0);
+    let kernel_input = record_node(&mut m, &[("mu", mu), ("sigma", sigma)]);
+    let rng = real(&mut m, 0.0); // stand-in rng-state arg (never lowered)
+    let sample = call(&mut m, "builtin_sample", &[rng, ctor, kernel_input]);
+    let zero_idx = int(&mut m, 0);
+    let draws = call(&mut m, "get0", &[sample, zero_idx]);
+    top_level(&mut m, "draws", draws);
+
+    // A diagnostic/auxiliary binding that happens to land after `draws` in
+    // source order — no sample term anywhere in its subtree.
+    let diag = real(&mut m, 42.0);
+    top_level(&mut m, "diag", diag);
+
+    let err = flatppl_stablehlo::emit(
+        &m,
+        flatppl_stablehlo::Mode::Sample,
+        &flatppl_stablehlo::EmitOptions::default(),
+    )
+    .unwrap_err();
+    assert!(
+        err.msg.contains("contains no sample term (builtin_sample)"),
+        "unexpected message: {}",
+        err.msg
+    );
+    assert_eq!(err.node, Some(diag));
+}
