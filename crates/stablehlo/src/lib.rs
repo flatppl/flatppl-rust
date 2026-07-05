@@ -8,34 +8,20 @@
 //! first, and `emit` refuses (never mis-lowers) if the input still carries
 //! measure-layer constructs.
 //!
-//! This is Task 1 of the backend: crate scaffold only. `emit` is a stub that
-//! asserts FlatPDL-conformance and returns a minimal empty module; later tasks
-//! fill in the real emitter and op registry.
+//! The crate is a walk-and-print emitter: [`mlir_type_of`]/[`MlirTy`] map
+//! FlatPDL `Type`/`Dim` to MLIR `tensor<…>` types, [`Emitter`] does SSA
+//! bookkeeping (the `NodeId` → `Value` memo map, `stablehlo.rng`, and a typed
+//! op-helper API — elementary ops, CHLO special functions, reductions, matrix
+//! helpers, and `finish`'s module/func assembly), `ops::lower_builtin` maps
+//! every non-distribution `Call` head to its op sequence, and `registry.rs`
+//! holds the distribution registry: a ctor-name-keyed table from a
+//! distribution constructor (e.g. `Normal`) to its closed-form `logpdf` and
+//! `sample` builders, covering every distribution in the spec's base catalogue.
 //!
-//! Task 2 adds the `Type`/`Dim` → MLIR `tensor<…>` mapping ([`mlir_type_of`],
-//! [`MlirTy`]) that every later emitter task builds SSA values on top of.
-//!
-//! Task 3 adds [`Emitter`]: SSA bookkeeping, the `NodeId` → `Value` memo map,
-//! and the typed op-helper API (elementary ops, CHLO special functions,
-//! reductions, matrix helpers, and `finish`'s module/func assembly) that
-//! Task 4's node-dispatch lowering is built on top of.
-//!
-//! Task 4 adds [`Emitter::lower_node`] (leaf/call dispatch + memoization)
-//! and `ops::lower_builtin` (the deterministic builtin-head → op map for
-//! every non-distribution `Call`): together they turn any post-determinize
-//! FlatPDL expression graph into a [`Value`], composing only Task 3's
-//! op-helper API.
-//!
-//! Task 5 adds the distribution registry (`registry.rs`: a ctor-name-keyed
-//! table from a distribution constructor, e.g. `Normal`, to its closed-form
-//! `logpdf`/`sample` builders) and the first mode builder (`modes.rs`'s
-//! `emit_logdensity`), wired up as `emit`'s `Mode::LogDensity` route — the
-//! first complete emitted StableHLO module (the density vertical slice).
-//!
-//! Task 6 adds `Emitter::rng` (`stablehlo.rng`, XLA-seeded — no explicit rng
-//! key), Normal's `@sample` builder (§08's `mu + sigma * Z` transform), and
-//! `modes.rs`'s `emit_sample`, wired up as `emit`'s `Mode::Sample` route —
-//! the sampling vertical slice.
+//! `modes.rs` builds the two emitted programs `emit` routes to:
+//! `emit_logdensity` (`Mode::LogDensity`, the `@logdensity` function) and
+//! `emit_sample` (`Mode::Sample`, the `@sample` function, `mu + sigma * Z`-style
+//! reparameterised sampling seeded via `Emitter::rng`).
 
 mod emitter;
 mod mlir;
@@ -82,8 +68,7 @@ impl Default for EmitOptions {
 /// mis-lowers) if `m` still carries measure-layer constructs.
 ///
 /// Routes to the mode builder for `mode`: [`Mode::LogDensity`] →
-/// [`modes::emit_logdensity`] (Task 5), [`Mode::Sample`] →
-/// [`modes::emit_sample`] (Task 6).
+/// [`modes::emit_logdensity`], [`Mode::Sample`] → [`modes::emit_sample`].
 pub fn emit(m: &Module, mode: Mode, opts: &EmitOptions) -> Result<String, EmitError> {
     flatppl_determinizer::is_flatpdl(m)
         .map_err(|_| EmitError::whole("input is not FlatPDL (determinize first)"))?;

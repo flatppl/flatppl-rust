@@ -1,11 +1,12 @@
-//! Smoke test: the Task-1 stub `emit` accepts a determinized (FlatPDL) module
-//! and returns a minimal valid StableHLO module string. Later tasks replace
-//! this with real golden output comparisons.
+//! Golden tests for `flatppl-stablehlo`'s `emit`: parse + infer + determinize
+//! a FlatPPL source, emit textual StableHLO for both `Mode::LogDensity` and
+//! `Mode::Sample`, and check the emitted MLIR against expectations (including
+//! per-distribution logpdf/sample coverage in `registry.rs`).
 //!
-//! Task 2 adds `mlir_type_of`: the `Type`/`Dim` → MLIR `tensor<…>` mapping.
-//! These tests build tiny `Module`s by hand (`alloc` a placeholder node,
-//! `set_type` the type under test) rather than parsing + inferring source,
-//! since only the type side-table matters for this mapping.
+//! The `mlir_type_of` tests (the `Type`/`Dim` → MLIR `tensor<…>` mapping)
+//! build tiny `Module`s by hand (`alloc` a placeholder node, `set_type` the
+//! type under test) rather than parsing + inferring source, since only the
+//! type side-table matters for this mapping.
 
 use flatppl_core::{
     Binding, Call, CallHead, Dim, Mass, Module, Node, NodeId, Ref, RefNs, Scalar, ScalarType, Type,

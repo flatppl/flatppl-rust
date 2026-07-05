@@ -9,9 +9,9 @@ repository.workspace = true
 
 [dependencies]
 flatppl-core = { path = "../core" }
-flatppl-infer = { path = "../infer" }
 flatppl-determinizer = { path = "../determinizer" }
 
 [dev-dependencies]
+flatppl-infer = { path = "../infer" }
 flatppl-syntax = { path = "../syntax" }
 flatppl-flatpir = { path = "../flatpir" }
