@@ -3234,3 +3234,566 @@ fn builtin_logdensityof_refuses_wrong_arity() {
     );
     assert_eq!(err.node, Some(node));
 }
+
+// ---- Task 11: univariate discrete `@logdensity` batch ----------------------
+//
+// Bernoulli/Poisson/Binomial/Geometric/NegativeBinomial/NegativeBinomial2/
+// Categorical/Categorical0 (§08), registered alongside the rest of §08 in
+// `registry.rs`'s `REGISTRY` with `sample: None` (no discrete `@sample`
+// builder is planned). Same anchor-fixture shape as the Task 8/9/10
+// batches — free (`elementof`-declared) parameters, scored at a pinned
+// LITERAL-INTEGER observation (unlike the continuous batches' `record(a =
+// 0.5)`: a discrete density's formula is a function of the observed COUNT,
+// and Categorical/Categorical0 additionally need that literal to drive a
+// static `get`/`get0` slice — see `registry::categorical_logpdf`'s doc
+// comment). Categorical/Categorical0's `p` is a literal array (`[0.2, 0.3,
+// 0.5]`), not an `elementof`-declared free parameter, same reasoning as
+// `UNIFORM_DENSITY_SRC`'s literal `support`: `elementof(stdsimplex(N))`
+// currently leaves `stdsimplex` typed `%deferred` with a `Severity::Note`
+// diagnostic (`crates/infer`'s `stdsimplex` type rule is not yet
+// implemented — see `crates/infer/tests/spec_coverage_shape_gaps.rs`'s
+// `stdsimplex_size_from_fixed_ref` for the same gap acknowledged there),
+// which trips this file's `determinize_src` helper's strict `diags.is_empty()`
+// assert; a literal `p` sidesteps the gap entirely and keeps `a` a zero-arg
+// `func.func @logdensity()`, mirroring `UNIFORM_DENSITY_SRC`.
+
+const BERNOULLI_DENSITY_SRC: &str = "\
+p = elementof(unitinterval)
+a = draw(Bernoulli(p = p))
+lp = logdensityof(lawof(record(a = a)), record(a = 1))
+";
+
+const POISSON_DENSITY_SRC: &str = "\
+rate = elementof(nonnegreals)
+a = draw(Poisson(rate = rate))
+lp = logdensityof(lawof(record(a = a)), record(a = 3))
+";
+
+const BINOMIAL_DENSITY_SRC: &str = "\
+n = elementof(posintegers)
+p = elementof(unitinterval)
+a = draw(Binomial(n = n, p = p))
+lp = logdensityof(lawof(record(a = a)), record(a = 2))
+";
+
+const GEOMETRIC_DENSITY_SRC: &str = "\
+p = elementof(unitinterval)
+a = draw(Geometric(p = p))
+lp = logdensityof(lawof(record(a = a)), record(a = 4))
+";
+
+const NEGATIVE_BINOMIAL_DENSITY_SRC: &str = "\
+alpha = elementof(posreals)
+beta = elementof(posreals)
+a = draw(NegativeBinomial(alpha = alpha, beta = beta))
+lp = logdensityof(lawof(record(a = a)), record(a = 2))
+";
+
+const NEGATIVE_BINOMIAL2_DENSITY_SRC: &str = "\
+mu = elementof(posreals)
+psi = elementof(posreals)
+a = draw(NegativeBinomial2(mu = mu, psi = psi))
+lp = logdensityof(lawof(record(a = a)), record(a = 2))
+";
+
+const CATEGORICAL_DENSITY_SRC: &str = "\
+a = draw(Categorical(p = [0.2, 0.3, 0.5]))
+lp = logdensityof(lawof(record(a = a)), record(a = 2))
+";
+
+const CATEGORICAL0_DENSITY_SRC: &str = "\
+a = draw(Categorical0(p = [0.2, 0.3, 0.5]))
+lp = logdensityof(lawof(record(a = a)), record(a = 1))
+";
+
+/// §08 Bernoulli, verbatim: `k * log(p) + (1 - k) * log(1 - p)`. Op counts:
+/// two `log`s (`p`, `1-p`), two `multiply`s, two `subtract`s (`1-k`, `1-p`),
+/// one `add`. No `chlo.*`.
+#[test]
+fn emit_logdensity_bernoulli_has_expected_structure() {
+    let d = determinize_src(BERNOULLI_DENSITY_SRC);
+    assert!(
+        flatppl_determinizer::is_flatpdl(&d).is_ok(),
+        "determinized module must be FlatPDL-conformant (no residual measure node)"
+    );
+
+    let out = emit_logdensity(&d);
+
+    assert!(
+        out.contains("func.func @logdensity"),
+        "missing func.func @logdensity in:\n{out}"
+    );
+    assert!(
+        out.contains("-> tensor<f32>"),
+        "must return tensor<f32> in:\n{out}"
+    );
+    assert!(
+        out.contains("%arg0: tensor<f32>"),
+        "p must become a func arg, in:\n{out}"
+    );
+    assert_eq!(out.matches("stablehlo.log").count(), 2);
+    assert_eq!(out.matches("stablehlo.multiply").count(), 2);
+    assert_eq!(out.matches("stablehlo.subtract").count(), 2);
+    assert_eq!(out.matches("stablehlo.add").count(), 1);
+    assert!(
+        !out.contains("chlo."),
+        "Bernoulli needs no CHLO ops, in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// Freeze the exact emitted text: any drift (op count, ordering, arg naming,
+/// formula) must be a deliberate, reviewed change to this golden file.
+#[test]
+fn emit_logdensity_bernoulli_matches_frozen_golden() {
+    let d = determinize_src(BERNOULLI_DENSITY_SRC);
+    let out = emit_logdensity(&d);
+    let golden = include_str!("goldens/bernoulli_logdensity.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted @logdensity drifted from the frozen golden (tests/goldens/bernoulli_logdensity.mlir)"
+    );
+}
+
+/// §08 Poisson, verbatim: `k * log(rate) - rate - lgamma(k + 1)`. Op counts:
+/// one `log`, one `multiply`, two `negate`s (`-rate`'s own, `-lgamma(k+1)`),
+/// three `add`s, one `chlo.lgamma`.
+#[test]
+fn emit_logdensity_poisson_has_expected_structure() {
+    let d = determinize_src(POISSON_DENSITY_SRC);
+    assert!(
+        flatppl_determinizer::is_flatpdl(&d).is_ok(),
+        "determinized module must be FlatPDL-conformant (no residual measure node)"
+    );
+
+    let out = emit_logdensity(&d);
+
+    assert!(
+        out.contains("func.func @logdensity"),
+        "missing func.func @logdensity in:\n{out}"
+    );
+    assert!(
+        out.contains("-> tensor<f32>"),
+        "must return tensor<f32> in:\n{out}"
+    );
+    assert!(
+        out.contains("%arg0: tensor<f32>"),
+        "rate must become a func arg, in:\n{out}"
+    );
+    assert_eq!(out.matches("stablehlo.log").count(), 1);
+    assert_eq!(out.matches("stablehlo.multiply").count(), 1);
+    assert_eq!(out.matches("stablehlo.negate").count(), 2);
+    assert_eq!(out.matches("stablehlo.add").count(), 3);
+    assert_eq!(out.matches("chlo.lgamma").count(), 1);
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// Freeze the exact emitted text: any drift (op count, ordering, arg naming,
+/// formula) must be a deliberate, reviewed change to this golden file.
+#[test]
+fn emit_logdensity_poisson_matches_frozen_golden() {
+    let d = determinize_src(POISSON_DENSITY_SRC);
+    let out = emit_logdensity(&d);
+    let golden = include_str!("goldens/poisson_logdensity.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted @logdensity drifted from the frozen golden (tests/goldens/poisson_logdensity.mlir)"
+    );
+}
+
+/// §08 Binomial, verbatim: `logC(n, k) + k * log(p) + (n - k) * log(1 - p)`,
+/// `logC(n, k) = lgamma(n+1) - lgamma(k+1) - lgamma(n-k+1)`. Op counts: two
+/// `log`s, two `multiply`s, two `subtract`s (`n-k`, `1-p`), seven `add`s, two
+/// `negate`s, three `chlo.lgamma`s.
+#[test]
+fn emit_logdensity_binomial_has_expected_structure() {
+    let d = determinize_src(BINOMIAL_DENSITY_SRC);
+    assert!(
+        flatppl_determinizer::is_flatpdl(&d).is_ok(),
+        "determinized module must be FlatPDL-conformant (no residual measure node)"
+    );
+
+    let out = emit_logdensity(&d);
+
+    assert!(
+        out.contains("func.func @logdensity"),
+        "missing func.func @logdensity in:\n{out}"
+    );
+    assert!(
+        out.contains("-> tensor<f32>"),
+        "must return tensor<f32> in:\n{out}"
+    );
+    assert!(
+        out.contains("%arg0: tensor<f32>") && out.contains("%arg1: tensor<f32>"),
+        "n/p must become func args, in:\n{out}"
+    );
+    assert_eq!(out.matches("stablehlo.log").count(), 2);
+    assert_eq!(out.matches("stablehlo.multiply").count(), 2);
+    assert_eq!(out.matches("stablehlo.subtract").count(), 2);
+    assert_eq!(out.matches("stablehlo.add").count(), 7);
+    assert_eq!(out.matches("stablehlo.negate").count(), 2);
+    assert_eq!(out.matches("chlo.lgamma").count(), 3);
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// Freeze the exact emitted text: any drift (op count, ordering, arg naming,
+/// formula) must be a deliberate, reviewed change to this golden file.
+#[test]
+fn emit_logdensity_binomial_matches_frozen_golden() {
+    let d = determinize_src(BINOMIAL_DENSITY_SRC);
+    let out = emit_logdensity(&d);
+    let golden = include_str!("goldens/binomial_logdensity.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted @logdensity drifted from the frozen golden (tests/goldens/binomial_logdensity.mlir)"
+    );
+}
+
+/// §08 Geometric, verbatim: `log(p) + k * log(1 - p)`. Op counts: two `log`s,
+/// one `multiply`, one `subtract` (`1-p`), one `add`. No `chlo.*`.
+#[test]
+fn emit_logdensity_geometric_has_expected_structure() {
+    let d = determinize_src(GEOMETRIC_DENSITY_SRC);
+    assert!(
+        flatppl_determinizer::is_flatpdl(&d).is_ok(),
+        "determinized module must be FlatPDL-conformant (no residual measure node)"
+    );
+
+    let out = emit_logdensity(&d);
+
+    assert!(
+        out.contains("func.func @logdensity"),
+        "missing func.func @logdensity in:\n{out}"
+    );
+    assert!(
+        out.contains("-> tensor<f32>"),
+        "must return tensor<f32> in:\n{out}"
+    );
+    assert!(
+        out.contains("%arg0: tensor<f32>"),
+        "p must become a func arg, in:\n{out}"
+    );
+    assert_eq!(out.matches("stablehlo.log").count(), 2);
+    assert_eq!(out.matches("stablehlo.multiply").count(), 1);
+    assert_eq!(out.matches("stablehlo.subtract").count(), 1);
+    assert_eq!(out.matches("stablehlo.add").count(), 1);
+    assert!(
+        !out.contains("chlo."),
+        "Geometric needs no CHLO ops, in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// Freeze the exact emitted text: any drift (op count, ordering, arg naming,
+/// formula) must be a deliberate, reviewed change to this golden file.
+#[test]
+fn emit_logdensity_geometric_matches_frozen_golden() {
+    let d = determinize_src(GEOMETRIC_DENSITY_SRC);
+    let out = emit_logdensity(&d);
+    let golden = include_str!("goldens/geometric_logdensity.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted @logdensity drifted from the frozen golden (tests/goldens/geometric_logdensity.mlir)"
+    );
+}
+
+/// §08 NegativeBinomial, verbatim: `[lgamma(k+alpha) - lgamma(alpha) -
+/// lgamma(k+1)] + alpha * (log(beta) - log(beta+1)) - k * log(beta+1)`. Op
+/// counts: two `log`s, two `multiply`s, four `negate`s, eight `add`s, three
+/// `chlo.lgamma`s, no `subtract` (every term is additive/negated, not
+/// subtracted).
+#[test]
+fn emit_logdensity_negative_binomial_has_expected_structure() {
+    let d = determinize_src(NEGATIVE_BINOMIAL_DENSITY_SRC);
+    assert!(
+        flatppl_determinizer::is_flatpdl(&d).is_ok(),
+        "determinized module must be FlatPDL-conformant (no residual measure node)"
+    );
+
+    let out = emit_logdensity(&d);
+
+    assert!(
+        out.contains("func.func @logdensity"),
+        "missing func.func @logdensity in:\n{out}"
+    );
+    assert!(
+        out.contains("-> tensor<f32>"),
+        "must return tensor<f32> in:\n{out}"
+    );
+    assert!(
+        out.contains("%arg0: tensor<f32>") && out.contains("%arg1: tensor<f32>"),
+        "alpha/beta must become func args, in:\n{out}"
+    );
+    assert_eq!(out.matches("stablehlo.log").count(), 2);
+    assert_eq!(out.matches("stablehlo.multiply").count(), 2);
+    assert_eq!(out.matches("stablehlo.negate").count(), 4);
+    assert_eq!(out.matches("stablehlo.add").count(), 8);
+    assert_eq!(out.matches("chlo.lgamma").count(), 3);
+    assert!(
+        !out.contains("stablehlo.subtract"),
+        "NegativeBinomial's log-form has no subtraction, in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// Freeze the exact emitted text: any drift (op count, ordering, arg naming,
+/// formula) must be a deliberate, reviewed change to this golden file.
+#[test]
+fn emit_logdensity_negative_binomial_matches_frozen_golden() {
+    let d = determinize_src(NEGATIVE_BINOMIAL_DENSITY_SRC);
+    let out = emit_logdensity(&d);
+    let golden = include_str!("goldens/negative_binomial_logdensity.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted @logdensity drifted from the frozen golden (tests/goldens/negative_binomial_logdensity.mlir)"
+    );
+}
+
+/// §08 NegativeBinomial2, verbatim: `[lgamma(k+psi) - lgamma(psi) -
+/// lgamma(k+1)] + k * (log(mu) - log(mu+psi)) + psi * (log(psi) -
+/// log(mu+psi))`. Op counts: three `log`s, two `multiply`s, three `negate`s,
+/// nine `add`s, three `chlo.lgamma`s, no `subtract`.
+#[test]
+fn emit_logdensity_negative_binomial2_has_expected_structure() {
+    let d = determinize_src(NEGATIVE_BINOMIAL2_DENSITY_SRC);
+    assert!(
+        flatppl_determinizer::is_flatpdl(&d).is_ok(),
+        "determinized module must be FlatPDL-conformant (no residual measure node)"
+    );
+
+    let out = emit_logdensity(&d);
+
+    assert!(
+        out.contains("func.func @logdensity"),
+        "missing func.func @logdensity in:\n{out}"
+    );
+    assert!(
+        out.contains("-> tensor<f32>"),
+        "must return tensor<f32> in:\n{out}"
+    );
+    assert!(
+        out.contains("%arg0: tensor<f32>") && out.contains("%arg1: tensor<f32>"),
+        "mu/psi must become func args, in:\n{out}"
+    );
+    assert_eq!(out.matches("stablehlo.log").count(), 3);
+    assert_eq!(out.matches("stablehlo.multiply").count(), 2);
+    assert_eq!(out.matches("stablehlo.negate").count(), 3);
+    assert_eq!(out.matches("stablehlo.add").count(), 9);
+    assert_eq!(out.matches("chlo.lgamma").count(), 3);
+    assert!(
+        !out.contains("stablehlo.subtract"),
+        "NegativeBinomial2's log-form has no subtraction, in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// Freeze the exact emitted text: any drift (op count, ordering, arg naming,
+/// formula) must be a deliberate, reviewed change to this golden file.
+#[test]
+fn emit_logdensity_negative_binomial2_matches_frozen_golden() {
+    let d = determinize_src(NEGATIVE_BINOMIAL2_DENSITY_SRC);
+    let out = emit_logdensity(&d);
+    let golden = include_str!("goldens/negative_binomial2_logdensity.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted @logdensity drifted from the frozen golden (tests/goldens/negative_binomial2_logdensity.mlir)"
+    );
+}
+
+/// §08 Categorical, verbatim: `log(p_k)`, `k` 1-based. `p`'s literal array
+/// lowers via `vector(...)` (one `concatenate` of three reshaped scalars,
+/// spec §07), then the 1-based selector `k=2` slices 0-based array position
+/// `k-1=1` (the `[1:2]` slice bound) — a zero-arg `func.func @logdensity()`
+/// (no free parameters: `p` is a literal, and the observed `k` is consumed
+/// structurally, never lowered as an arithmetic operand). Exactly one
+/// `slice`, one final `log`, and four `reshape`s (three packing `vector`'s
+/// elements + one unpacking the sliced length-1 result to a `Scalar`) — no
+/// `chlo.*`, `negate`, `subtract`, `multiply`, or `add`: the density is a
+/// pure lookup.
+#[test]
+fn emit_logdensity_categorical_has_expected_structure() {
+    let d = determinize_src(CATEGORICAL_DENSITY_SRC);
+    assert!(
+        flatppl_determinizer::is_flatpdl(&d).is_ok(),
+        "determinized module must be FlatPDL-conformant (no residual measure node)"
+    );
+
+    let out = emit_logdensity(&d);
+
+    assert!(
+        out.contains("func.func @logdensity()"),
+        "missing func.func @logdensity() (no free params) in:\n{out}"
+    );
+    assert!(
+        out.contains("-> tensor<f32>"),
+        "must return tensor<f32> in:\n{out}"
+    );
+    assert!(
+        out.contains("stablehlo.concatenate"),
+        "missing concatenate (p's vector literal), in:\n{out}"
+    );
+    assert!(
+        out.contains("stablehlo.slice") && out.contains("[1:2]"),
+        "expected 1-based k=2 to slice 0-based index 1, in:\n{out}"
+    );
+    assert_eq!(out.matches("stablehlo.slice").count(), 1);
+    assert_eq!(out.matches("stablehlo.reshape").count(), 4);
+    assert_eq!(out.matches("stablehlo.log").count(), 1);
+    assert!(
+        !out.contains("chlo.")
+            && !out.contains("stablehlo.negate")
+            && !out.contains("stablehlo.subtract")
+            && !out.contains("stablehlo.multiply")
+            && !out.contains("stablehlo.add"),
+        "Categorical's density is a pure lookup, no arithmetic, in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// Freeze the exact emitted text: any drift (op count, ordering, arg naming,
+/// formula) must be a deliberate, reviewed change to this golden file.
+#[test]
+fn emit_logdensity_categorical_matches_frozen_golden() {
+    let d = determinize_src(CATEGORICAL_DENSITY_SRC);
+    let out = emit_logdensity(&d);
+    let golden = include_str!("goldens/categorical_logdensity.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted @logdensity drifted from the frozen golden (tests/goldens/categorical_logdensity.mlir)"
+    );
+}
+
+/// §08 Categorical0, verbatim: `log(p_{k+1})`, `k` 0-based — the 0-based
+/// selector `k=1` slices the SAME 0-based array position (`[1:2]`) as
+/// `CATEGORICAL_DENSITY_SRC`'s 1-based `k=2` (see
+/// `registry::categorical0_logpdf`'s doc comment for why `p_{k+1}` and
+/// `get0(p, k)` coincide), which is why both fixtures are pinned to
+/// numerically identical `log(0.3)` results — cross-checked against SciPy in
+/// the Task 11 report.
+#[test]
+fn emit_logdensity_categorical0_has_expected_structure() {
+    let d = determinize_src(CATEGORICAL0_DENSITY_SRC);
+    assert!(
+        flatppl_determinizer::is_flatpdl(&d).is_ok(),
+        "determinized module must be FlatPDL-conformant (no residual measure node)"
+    );
+
+    let out = emit_logdensity(&d);
+
+    assert!(
+        out.contains("func.func @logdensity()"),
+        "missing func.func @logdensity() (no free params) in:\n{out}"
+    );
+    assert!(
+        out.contains("stablehlo.slice") && out.contains("[1:2]"),
+        "expected 0-based k=1 to slice 0-based index 1, in:\n{out}"
+    );
+    assert_eq!(out.matches("stablehlo.slice").count(), 1);
+    assert_eq!(out.matches("stablehlo.reshape").count(), 4);
+    assert_eq!(out.matches("stablehlo.log").count(), 1);
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// Freeze the exact emitted text: any drift (op count, ordering, arg naming,
+/// formula) must be a deliberate, reviewed change to this golden file.
+#[test]
+fn emit_logdensity_categorical0_matches_frozen_golden() {
+    let d = determinize_src(CATEGORICAL0_DENSITY_SRC);
+    let out = emit_logdensity(&d);
+    let golden = include_str!("goldens/categorical0_logdensity.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted @logdensity drifted from the frozen golden (tests/goldens/categorical0_logdensity.mlir)"
+    );
+}
+
+/// `Categorical(p)` scored at a NON-literal `k` — a `Ref` to a top-level
+/// binding, not an integer literal `Node` itself — must refuse precisely
+/// (refuse-don't-mislower) rather than attempt a `stablehlo.gather`-shaped
+/// dynamic selector this emitter has no helper for: the task brief's
+/// explicit "dynamic gather is not supported" case. `v` here still lowers
+/// fine as an ordinary scalar (`lower_logdensityof` eagerly lowers `v` for
+/// every registry entry, before ever reaching `categorical_logpdf` — see
+/// `Params::variate`'s doc comment); what makes it "non-literal" is
+/// structural, not numeric: [`literal_variate_index`]'s check (mirroring
+/// `ops::literal_index`'s identical no-ref-chasing discipline for an
+/// ordinary `get`/`get0` selector) only accepts a bare `Node::Lit(Scalar::
+/// Int(_))`, not a `Ref` that happens to resolve to one. Hand-built (not
+/// `determinize_src`): the determiniser's own discrete-marginal expansion
+/// never produces this shape (every real `builtin_logdensityof(Categorical,
+/// ...)` it emits scores a literal atom directly — see
+/// `crates/determinizer/tests/density_golden.rs`'s
+/// `kchain_discrete_categorical_latent_lowers_to_mass_weighted_logsumexp`),
+/// so this exercises the registry's defensive check directly.
+#[test]
+fn categorical_logpdf_refuses_non_literal_selector() {
+    let mut m = Module::new();
+    let ctor = const_node(&mut m, "Categorical");
+    let e0 = real(&mut m, 0.2);
+    let e1 = real(&mut m, 0.3);
+    let e2 = real(&mut m, 0.5);
+    let probs = call(&mut m, "vector", &[e0, e1, e2]);
+    let kernel_input = record_node(&mut m, &[("p", probs)]);
+    let k_val = int(&mut m, 2);
+    top_level(&mut m, "k", k_val);
+    let v = self_ref(&mut m, "k");
+    let node = call(&mut m, "builtin_logdensityof", &[ctor, kernel_input, v]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    let err = e.lower_node(node).unwrap_err();
+    assert!(
+        err.msg.contains("dynamic gather is not supported"),
+        "unexpected message: {}",
+        err.msg
+    );
+}
+
+/// `Categorical(p)` scored at an in-range-looking but too-large literal `k`
+/// (`4`, `p` only length 3) must refuse with an "out of range" message
+/// naming the mismatch, not slice past `p`'s statically-known length.
+#[test]
+fn categorical_logpdf_refuses_out_of_range_category() {
+    let mut m = Module::new();
+    let ctor = const_node(&mut m, "Categorical");
+    let e0 = real(&mut m, 0.2);
+    let e1 = real(&mut m, 0.3);
+    let e2 = real(&mut m, 0.5);
+    let probs = call(&mut m, "vector", &[e0, e1, e2]);
+    let kernel_input = record_node(&mut m, &[("p", probs)]);
+    let v = int(&mut m, 4);
+    let node = call(&mut m, "builtin_logdensityof", &[ctor, kernel_input, v]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    let err = e.lower_node(node).unwrap_err();
+    assert!(
+        err.msg.contains("out of range"),
+        "unexpected message: {}",
+        err.msg
+    );
+}
+
+/// `Categorical0(p)` scored at literal `k = 0` (the FLOOR of its 0-based
+/// support) must slice 0-based array position 0 — the boundary opposite
+/// `CATEGORICAL0_DENSITY_SRC`'s interior `k = 1` case, and distinct from
+/// `Categorical`'s own `k = 1` floor (one-based, `get`'s convention already
+/// covered by `lower_get_refuses_selector_below_one_based_floor`).
+#[test]
+fn categorical0_logpdf_at_floor_slices_first_element() {
+    let mut m = Module::new();
+    let ctor = const_node(&mut m, "Categorical0");
+    let e0 = real(&mut m, 0.2);
+    let e1 = real(&mut m, 0.3);
+    let e2 = real(&mut m, 0.5);
+    let probs = call(&mut m, "vector", &[e0, e1, e2]);
+    let kernel_input = record_node(&mut m, &[("p", probs)]);
+    let v = int(&mut m, 0);
+    let node = call(&mut m, "builtin_logdensityof", &[ctor, kernel_input, v]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    let result = e.lower_node(node).unwrap();
+    let out = e.finish("f", &[], &result);
+    assert!(
+        out.contains("stablehlo.slice") && out.contains("[0:1]"),
+        "expected k=0 to slice 0-based index 0, in:\n{out}"
+    );
+}

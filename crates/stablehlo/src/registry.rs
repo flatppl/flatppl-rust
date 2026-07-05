@@ -10,10 +10,10 @@
 //! `crate::ops::lower_builtin`'s catch-all "unsupported builtin head"
 //! refusal — see that module's doc comment.
 
-use flatppl_core::{NamedKind, Node, NodeId, ValueSet};
+use flatppl_core::{NamedKind, Node, NodeId, Scalar, ValueSet};
 
 use crate::emitter::Emitter;
-use crate::mlir::Value;
+use crate::mlir::{MlirTy, Value};
 use crate::refuse::EmitError;
 
 /// `fn(emitter, params, variate) -> log f(variate; params)` — a
@@ -151,6 +151,62 @@ static REGISTRY: &[(&str, DistLowering)] = &[
             sample: None,
         },
     ),
+    (
+        "Bernoulli",
+        DistLowering {
+            logpdf: bernoulli_logpdf,
+            sample: None,
+        },
+    ),
+    (
+        "Poisson",
+        DistLowering {
+            logpdf: poisson_logpdf,
+            sample: None,
+        },
+    ),
+    (
+        "Binomial",
+        DistLowering {
+            logpdf: binomial_logpdf,
+            sample: None,
+        },
+    ),
+    (
+        "Geometric",
+        DistLowering {
+            logpdf: geometric_logpdf,
+            sample: None,
+        },
+    ),
+    (
+        "NegativeBinomial",
+        DistLowering {
+            logpdf: negative_binomial_logpdf,
+            sample: None,
+        },
+    ),
+    (
+        "NegativeBinomial2",
+        DistLowering {
+            logpdf: negative_binomial2_logpdf,
+            sample: None,
+        },
+    ),
+    (
+        "Categorical",
+        DistLowering {
+            logpdf: categorical_logpdf,
+            sample: None,
+        },
+    ),
+    (
+        "Categorical0",
+        DistLowering {
+            logpdf: categorical0_logpdf,
+            sample: None,
+        },
+    ),
 ];
 
 /// Look up a distribution's lowering by its constructor name (`"Normal"`,
@@ -170,6 +226,16 @@ pub fn lookup(ctor: &str) -> Option<&'static DistLowering> {
 /// field at a time.
 pub struct Params {
     kernel_input: NodeId,
+    /// The raw (pre-[`Emitter::lower_node`]) [`NodeId`] of the scored variate
+    /// `v`, when there is one. [`lower_logdensityof`] already lowers `v` to
+    /// the `&Value` every `LogpdfBuilder` receives directly (so the ordinary
+    /// arithmetic builders above never need this field), but
+    /// [`categorical_logpdf`]/[`categorical0_logpdf`] need the pre-lowered
+    /// NodeId too: their `get`/`get0` selector into `p` must be a literal
+    /// integer, and a lowered `Value` (an opaque SSA name) carries no such
+    /// structural information — see [`Params::variate_id`]. `None` for a
+    /// [`lower_sample`]-built `Params` (`@sample` scores no variate).
+    variate: Option<NodeId>,
 }
 
 impl Params {
@@ -207,6 +273,26 @@ impl Params {
             )
         })
     }
+
+    /// The raw (pre-[`Emitter::lower_node`]) [`NodeId`] of the scored variate
+    /// `v` — the variate-side mirror of [`Params::field_id`]. Needed by
+    /// [`categorical_logpdf`]/[`categorical0_logpdf`], whose `get`/`get0`
+    /// selector into `p` must be inspected structurally (is it a literal
+    /// integer?) before it can be used as a static slice bound; see
+    /// `ops::literal_index`'s identical discipline for an ordinary `get`/
+    /// `get0` call's selector. Refuses (rather than panicking) if this
+    /// `Params` was built by [`lower_sample`], which has no scored variate at
+    /// all — an internal-contract violation (only a `@logdensity` builder
+    /// should ever call this), reported the same way as every other
+    /// caller-contract mismatch in this module.
+    pub fn variate_id(&self) -> Result<NodeId, EmitError> {
+        self.variate.ok_or_else(|| {
+            EmitError::at(
+                self.kernel_input,
+                "no scored variate in this context (only builtin_logdensityof provides one)",
+            )
+        })
+    }
 }
 
 /// `builtin_logdensityof(kernel, kernel_input, v)` (`density.rs`'s
@@ -241,7 +327,10 @@ pub(crate) fn lower_logdensityof(
     let dist = lookup(&ctor)
         .ok_or_else(|| EmitError::at(id, format!("no lowering for distribution '{ctor}'")))?;
 
-    let params = Params { kernel_input };
+    let params = Params {
+        kernel_input,
+        variate: Some(v),
+    };
     let value = e.lower_node(v)?;
     (dist.logpdf)(e, &params, &value)
 }
@@ -287,7 +376,10 @@ pub(crate) fn lower_sample(
         .sample
         .ok_or_else(|| EmitError::at(id, format!("no @sample lowering for '{ctor_name}'")))?;
 
-    let params = Params { kernel_input };
+    let params = Params {
+        kernel_input,
+        variate: None,
+    };
     sample(e, &params)
 }
 
@@ -863,4 +955,293 @@ fn horner(e: &mut Emitter, t: &Value, coeffs: &[f64]) -> Value {
         acc = e.add(&scaled, &c_val);
     }
     acc
+}
+
+// ---- §08 univariate discrete batch (Task 11) --------------------------------
+//
+// Bernoulli/Poisson/Binomial/Geometric/NegativeBinomial/NegativeBinomial2/
+// Categorical/Categorical0, registered alongside the rest of §08 in
+// `REGISTRY` with `sample: None` (discrete `@sample` builders land in Task
+// 16, alongside Multinomial and the finalized refuse-@sample set — see the
+// roadmap doc). Binomial needs `logC(n, k) = lgamma(n+1) -
+// lgamma(k+1) - lgamma(n-k+1)`, inlined directly in [`binomial_logpdf`] (the
+// task brief's general form; NegativeBinomial/NegativeBinomial2 below use
+// their own already-lgamma-reduced log-forms instead, so this closed form
+// has only the one call site — no shared helper). Poisson/NegativeBinomial/
+// NegativeBinomial2 also need `log(k!) = lgamma(k+1)` directly. Categorical/
+// Categorical0 are a special case in their own way, same division as
+// Uniform/VonMises in the continuous batches above: their density is `log
+// p_k`, a `get`/`get0` selector into the probability vector `p` rather than
+// a per-observation formula built from arithmetic on `v` — see
+// [`categorical_logpdf`]'s doc comment.
+
+/// §08 Bernoulli, verbatim: `log f = k * log(p) + (1 - k) * log(1 - p)`. No
+/// `@sample` builder yet (`sample: None`; Task 16).
+fn bernoulli_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
+    let prob = p.get(e, "p")?;
+
+    let log_p = e.log(&prob);
+    let k_log_p = e.mul(v, &log_p);
+
+    let one = e.scalar(1.0);
+    let one_minus_k = e.sub(&one, v);
+    let one_minus_p = e.sub(&one, &prob);
+    let log_one_minus_p = e.log(&one_minus_p);
+    let term2 = e.mul(&one_minus_k, &log_one_minus_p);
+
+    Ok(e.add(&k_log_p, &term2))
+}
+
+/// §08 Poisson, verbatim: `log f = k * log(rate) - rate - lgamma(k + 1)`
+/// (`log(k!) = lgamma(k+1)`). No `@sample` builder yet (`sample: None`; Task
+/// 16).
+fn poisson_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
+    let rate = p.get(e, "rate")?;
+
+    let log_rate = e.log(&rate);
+    let k_log_rate = e.mul(v, &log_rate);
+    let neg_rate = e.neg(&rate);
+
+    let one = e.scalar(1.0);
+    let k_plus_one = e.add(v, &one);
+    let lgamma_k1 = e.lgamma(&k_plus_one);
+    let neg_lgamma_k1 = e.neg(&lgamma_k1);
+
+    let t1 = e.add(&k_log_rate, &neg_rate);
+    Ok(e.add(&t1, &neg_lgamma_k1))
+}
+
+/// §08 Binomial, verbatim: `log f = logC(n, k) + k * log(p) + (n - k) *
+/// log(1 - p)`, with `logC(n, k) = lgamma(n+1) - lgamma(k+1) -
+/// lgamma(n-k+1)` (task brief, verbatim). `n - k` is computed once and its
+/// `Value` reused for both `logC`'s `lgamma(n-k+1)` term and the trailing
+/// `(n-k) * log(1-p)` term — the spec's `n - k` appears in both positions
+/// verbatim, same reuse discipline as [`lognormal_logpdf`]'s shared `log(x)`.
+/// No `@sample` builder yet (`sample: None`; Task 16).
+fn binomial_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
+    let n = p.get(e, "n")?;
+    let prob = p.get(e, "p")?;
+
+    let one = e.scalar(1.0);
+
+    let n_plus_one = e.add(&n, &one);
+    let lgamma_n1 = e.lgamma(&n_plus_one);
+
+    let k_plus_one = e.add(v, &one);
+    let lgamma_k1 = e.lgamma(&k_plus_one);
+    let neg_lgamma_k1 = e.neg(&lgamma_k1);
+
+    let n_minus_k = e.sub(&n, v);
+    let n_minus_k_plus_one = e.add(&n_minus_k, &one);
+    let lgamma_nmk1 = e.lgamma(&n_minus_k_plus_one);
+    let neg_lgamma_nmk1 = e.neg(&lgamma_nmk1);
+
+    let t1 = e.add(&lgamma_n1, &neg_lgamma_k1);
+    let log_choose_nk = e.add(&t1, &neg_lgamma_nmk1);
+
+    let log_p = e.log(&prob);
+    let k_log_p = e.mul(v, &log_p);
+
+    let one_minus_p = e.sub(&one, &prob);
+    let log_one_minus_p = e.log(&one_minus_p);
+    let n_minus_k_log_one_minus_p = e.mul(&n_minus_k, &log_one_minus_p);
+
+    let t2 = e.add(&log_choose_nk, &k_log_p);
+    Ok(e.add(&t2, &n_minus_k_log_one_minus_p))
+}
+
+/// §08 Geometric, verbatim: `log f = log(p) + k * log(1 - p)` — `k` is the
+/// number of FAILURES before the first success (0-based, `k in nonnegintegers`;
+/// see [`geometric_logpdf`]'s numeric verification against `scipy.stats.geom`
+/// in the Task 11 report, whose own `k` convention counts TRIALS, 1-based). No
+/// `@sample` builder yet (`sample: None`; Task 16).
+fn geometric_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
+    let prob = p.get(e, "p")?;
+
+    let log_p = e.log(&prob);
+
+    let one = e.scalar(1.0);
+    let one_minus_p = e.sub(&one, &prob);
+    let log_one_minus_p = e.log(&one_minus_p);
+    let k_log_one_minus_p = e.mul(v, &log_one_minus_p);
+
+    Ok(e.add(&log_p, &k_log_one_minus_p))
+}
+
+/// §08 NegativeBinomial, verbatim: `log f = logC(k + alpha - 1, alpha - 1) +
+/// alpha * (log(beta) - log(beta + 1)) - k * log(beta + 1)`, with `logC(k +
+/// alpha - 1, alpha - 1) = lgamma(k + alpha) - lgamma(alpha) - lgamma(k + 1)`
+/// (the task brief's already-reduced closed form — computing the raw `(n, k)
+/// = (k+alpha-1, alpha-1)` pair first and expanding `logC` from there, as
+/// [`binomial_logpdf`] does for its own `(n, k)` pair, would reach the same
+/// three lgammas via one extra `sub`/`add` pair; inlining the already-reduced
+/// form here is the smaller op count). No `@sample` builder yet (`sample:
+/// None`; Task 16).
+fn negative_binomial_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
+    let alpha = p.get(e, "alpha")?;
+    let beta = p.get(e, "beta")?;
+
+    let k_plus_alpha = e.add(v, &alpha);
+    let lgamma_k_alpha = e.lgamma(&k_plus_alpha);
+    let lgamma_alpha = e.lgamma(&alpha);
+    let neg_lgamma_alpha = e.neg(&lgamma_alpha);
+    let one = e.scalar(1.0);
+    let k_plus_one = e.add(v, &one);
+    let lgamma_k1 = e.lgamma(&k_plus_one);
+    let neg_lgamma_k1 = e.neg(&lgamma_k1);
+
+    let t1 = e.add(&lgamma_k_alpha, &neg_lgamma_alpha);
+    let t2 = e.add(&t1, &neg_lgamma_k1);
+
+    let log_beta = e.log(&beta);
+    let beta_plus_one = e.add(&beta, &one);
+    let log_beta_plus_one = e.log(&beta_plus_one);
+    let neg_log_beta_plus_one = e.neg(&log_beta_plus_one);
+    let log_ratio = e.add(&log_beta, &neg_log_beta_plus_one);
+    let alpha_log_ratio = e.mul(&alpha, &log_ratio);
+
+    let k_log_beta_plus_one = e.mul(v, &log_beta_plus_one);
+    let neg_k_log_beta_plus_one = e.neg(&k_log_beta_plus_one);
+
+    let t3 = e.add(&t2, &alpha_log_ratio);
+    Ok(e.add(&t3, &neg_k_log_beta_plus_one))
+}
+
+/// §08 NegativeBinomial2, verbatim: `log f = logC(k + psi - 1, k) + k *
+/// (log(mu) - log(mu + psi)) + psi * (log(psi) - log(mu + psi))`, with
+/// `logC(k + psi - 1, k) = lgamma(k + psi) - lgamma(psi) - lgamma(k + 1)` —
+/// same already-reduced-form reasoning as [`negative_binomial_logpdf`]'s doc
+/// comment. `log(mu + psi)` is computed once and its negation reused for both
+/// the `k`- and `psi`-weighted ratio terms (the spec's `mu + psi` denominator
+/// appears in both positions verbatim — same reuse discipline as
+/// `lognormal_logpdf`'s shared `log(x)`). No `@sample` builder yet (`sample:
+/// None`; Task 16).
+fn negative_binomial2_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
+    let mu = p.get(e, "mu")?;
+    let psi = p.get(e, "psi")?;
+
+    let k_plus_psi = e.add(v, &psi);
+    let lgamma_k_psi = e.lgamma(&k_plus_psi);
+    let lgamma_psi = e.lgamma(&psi);
+    let neg_lgamma_psi = e.neg(&lgamma_psi);
+    let one = e.scalar(1.0);
+    let k_plus_one = e.add(v, &one);
+    let lgamma_k1 = e.lgamma(&k_plus_one);
+    let neg_lgamma_k1 = e.neg(&lgamma_k1);
+
+    let t1 = e.add(&lgamma_k_psi, &neg_lgamma_psi);
+    let t2 = e.add(&t1, &neg_lgamma_k1);
+
+    let mu_plus_psi = e.add(&mu, &psi);
+    let log_mu_plus_psi = e.log(&mu_plus_psi);
+    let neg_log_mu_plus_psi = e.neg(&log_mu_plus_psi);
+
+    let log_mu = e.log(&mu);
+    let log_ratio_mu = e.add(&log_mu, &neg_log_mu_plus_psi);
+    let k_log_ratio_mu = e.mul(v, &log_ratio_mu);
+
+    let log_psi = e.log(&psi);
+    let log_ratio_psi = e.add(&log_psi, &neg_log_mu_plus_psi);
+    let psi_log_ratio_psi = e.mul(&psi, &log_ratio_psi);
+
+    let t3 = e.add(&t2, &k_log_ratio_mu);
+    Ok(e.add(&t3, &psi_log_ratio_psi))
+}
+
+/// Extract element `idx` (0-based, into the underlying `p` array) of the
+/// rank-1 tensor `probs` as a `Scalar`, via `stablehlo.slice` + `stablehlo.
+/// reshape` — the same slice+reshape idiom `ops::lower_get` uses for an
+/// ordinary `get`/`get0` call, reimplemented here (rather than calling that
+/// private-to-`ops.rs` function) because this caller already has the integer
+/// index in hand, not an unlowered selector `NodeId` to re-derive it from.
+/// Refuses (never panics) on a negative or out-of-(statically-known-)range
+/// index, or a `probs` that isn't rank-1 — reachable from arbitrary
+/// FlatPDL, not just the determiniser's own well-formed output.
+fn slice_indexed_prob(
+    e: &mut Emitter,
+    blame: NodeId,
+    probs: &Value,
+    idx: i64,
+) -> Result<Value, EmitError> {
+    if idx < 0 {
+        return Err(EmitError::at(
+            blame,
+            "Categorical/Categorical0 logdensity: category index out of range",
+        ));
+    }
+    let idx = idx as u64;
+    let len = match &probs.ty {
+        MlirTy::Ranked(dims) if dims.len() == 1 => dims[0],
+        other => {
+            return Err(EmitError::at(
+                blame,
+                format!(
+                    "Categorical/Categorical0 logdensity: 'p' must be a rank-1 tensor, got {other:?}"
+                ),
+            ));
+        }
+    };
+    if let Some(len) = len {
+        if idx >= len {
+            return Err(EmitError::at(
+                blame,
+                "Categorical/Categorical0 logdensity: category index out of range",
+            ));
+        }
+    }
+    let sliced = e.slice(probs, &[idx], &[idx + 1], &[1]);
+    Ok(e.reshape(&sliced, MlirTy::Scalar))
+}
+
+/// The literal-integer value of the scored variate `k`, or a precise refusal
+/// naming the unsupported dynamic-gather case — [`categorical_logpdf`]/
+/// [`categorical0_logpdf`]'s shared selector check, mirroring `ops::
+/// literal_index`'s identical literal-only discipline for an ordinary `get`/
+/// `get0` call (the determiniser's own discrete-marginal expansion,
+/// `flatppl_determinizer::marginal`, always scores a `Categorical`/
+/// `Categorical0` mass term at a literal atom value — see that module's doc
+/// comment — so this is the shape every real caller reaching this registry
+/// entry already has; a *dynamic* `k` would need a `stablehlo.gather` this
+/// emitter has no helper for yet).
+fn literal_variate_index(e: &Emitter, p: &Params) -> Result<i64, EmitError> {
+    let id = p.variate_id()?;
+    match e.node(id) {
+        Node::Lit(Scalar::Int(i)) => Ok(*i),
+        _ => Err(EmitError::at(
+            id,
+            "Categorical/Categorical0 logdensity: observed category must be a literal integer \
+             (dynamic gather is not supported)",
+        )),
+    }
+}
+
+/// §08 Categorical, verbatim: `log f = log(p_k)`, `k` 1-based (`p_k` = `get(p,
+/// k)`'s convention, spec-matching: `ops::lower_get`'s `get` head is already
+/// 1-based, so `k`'s 1-based selector reduces to the same 0-based array
+/// position `k - 1` that `get(p, k)` itself would slice). `v` (the eagerly-
+/// [`Emitter::lower_node`]d variate `Value` every `LogpdfBuilder` receives) is
+/// unused here — unlike every arithmetic-formula builder above, this density
+/// is a lookup, not a function of `v`'s lowered tensor form; the un-lowered
+/// selector integer read via [`Params::variate_id`] is what actually drives
+/// the slice. No `@sample` builder yet (`sample: None`; Task 16 — `searchsorted(cumsum(p), U)`).
+fn categorical_logpdf(e: &mut Emitter, p: &Params, _v: &Value) -> Result<Value, EmitError> {
+    let probs = p.get(e, "p")?;
+    let variate = p.variate_id()?;
+    let k = literal_variate_index(e, p)?;
+    let elem = slice_indexed_prob(e, variate, &probs, k - 1)?;
+    Ok(e.log(&elem))
+}
+
+/// §08 Categorical0, verbatim: `log f = log(p_{k+1})`, `k` 0-based. Under
+/// `Categorical`'s 1-based `p_j` numbering, `p_{k+1}` is exactly `get(p, k +
+/// 1)`'s slice, i.e. array position `(k + 1) - 1 = k` — the same 0-based
+/// array position `get0(p, k)` would slice directly. See
+/// [`categorical_logpdf`]'s doc comment for the shared `v`-unused /
+/// selector-read shape.
+fn categorical0_logpdf(e: &mut Emitter, p: &Params, _v: &Value) -> Result<Value, EmitError> {
+    let probs = p.get(e, "p")?;
+    let variate = p.variate_id()?;
+    let k = literal_variate_index(e, p)?;
+    let elem = slice_indexed_prob(e, variate, &probs, k)?;
+    Ok(e.log(&elem))
 }
