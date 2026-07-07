@@ -6,6 +6,35 @@ fn parse_infer(src: &str) -> flatppl_core::Module {
     m
 }
 
+// A DESTRUCTURED rand (`v, s2 = rand(...)`) now lowers to the full spec §07
+// `tuple(value, advanced_rng)` — the parser's `v, s2 = rand(...)` sugar
+// desugars to `__0x1 = rand(...); v = get(__0x1, 1); s2 = get(__0x1, 2)`
+// (1-based integer-literal `get` projections), which now resolve against a
+// real tuple instead of hitting the (former) destructure refusal.
+#[test]
+fn destructured_rand_lowers_to_tuple() {
+    let src = "\
+s = rnginit(0)
+x = draw(Normal(mu = 0.0, sigma = 1.0))
+v, s2 = rand(s, lawof(record(x = x)))
+out = v";
+    let m = parse_infer(src);
+    let out = determinize(&m).expect("destructured rand must lower to a tuple");
+    let pir = flatppl_flatpir::write(&out);
+    assert!(
+        pir.contains("(tuple "),
+        "expected tuple(value, advanced_rng) for a destructured rand:\n{pir}"
+    );
+    assert!(
+        pir.contains("builtin_sample"),
+        "expected a builtin_sample under the tuple:\n{pir}"
+    );
+    assert!(
+        flatppl_determinizer::is_flatpdl(&out).is_ok(),
+        "must be FlatPDL:\n{pir}"
+    );
+}
+
 // rand(rng, lawof(record(x = draw(Normal)))) samples the one draw via
 // builtin_sample, threads the rng, and eliminates the measure/stochastic layer.
 #[test]
