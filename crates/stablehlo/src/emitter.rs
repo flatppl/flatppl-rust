@@ -154,6 +154,15 @@ impl<'m> Emitter<'m> {
         self.batch_shape = None;
     }
 
+    /// The current fan-out batch shape, if a batched `builtin_sample` set one.
+    /// `crate::registry`'s rejection samplers read this to switch a scalar
+    /// [`draw_gamma`]-style `while` to its batched `[n]` form (Tier 2 fan-out):
+    /// they must ALSO size their pre-drawn candidate batches at `[MAXITER, n]`,
+    /// which needs the concrete `n` here, not just the `Emitter::rng` override.
+    pub(crate) fn batch_shape(&self) -> Option<Vec<u64>> {
+        self.batch_shape.clone()
+    }
+
     /// Allocate a fresh SSA name (`%0`, `%1`, ...).
     fn fresh(&mut self) -> String {
         let name = format!("%{}", self.next);
@@ -315,11 +324,24 @@ impl<'m> Emitter<'m> {
 
     /// `%N = stablehlo.compare {dir}, %a, %b : (lhs, rhs) -> i1-shape`.
     /// `dir` is a StableHLO `comparison_direction` (`"LT"`, `"GE"`, `"EQ"`,
-    /// ...). The result is logically an `i1` tensor of `a`'s shape — see the
-    /// module doc comment for why that is rendered via [`render_i1`] rather
-    /// than through `MlirTy`/`Dtype`; the returned `Value`'s `ty` still
-    /// carries `a`'s shape so a later [`Emitter::select`] can reuse it.
+    /// ...). The result is logically an `i1` tensor of the operands' shape —
+    /// see the module doc comment for why that is rendered via [`render_i1`]
+    /// rather than through `MlirTy`/`Dtype`; the returned `Value`'s `ty` still
+    /// carries that shape so a later [`Emitter::select`] can reuse it.
+    ///
+    /// A `Scalar`-vs-`Ranked` operand pair auto-broadcasts the scalar up to the
+    /// ranked shape FIRST (StableHLO's `compare` requires identical operand
+    /// shapes), exactly as [`Emitter::binary`] does — the mechanism a batched
+    /// (Tier-2 fan-out) rejection sampler leans on to test a `[n]` candidate
+    /// against a scalar bound. When the shapes already match (every scalar
+    /// `@sample` / `@logdensity` path, inference-unified upstream), no broadcast
+    /// is emitted and the output is byte-identical to before.
     pub fn compare(&mut self, dir: &str, a: &Value, b: &Value) -> Value {
+        let (a, b) = match (&a.ty, &b.ty) {
+            (MlirTy::Scalar, MlirTy::Ranked(_)) => (self.broadcast_scalar(a, &b.ty), b.clone()),
+            (MlirTy::Ranked(_), MlirTy::Scalar) => (a.clone(), self.broadcast_scalar(b, &a.ty)),
+            _ => (a.clone(), b.clone()),
+        };
         let ssa = self.fresh();
         let lhs_ty = a.ty.render(self.dtype);
         let rhs_ty = b.ty.render(self.dtype);
@@ -328,17 +350,38 @@ impl<'m> Emitter<'m> {
             "{ssa} = stablehlo.compare {dir}, {}, {} : ({lhs_ty}, {rhs_ty}) -> {result_ty}",
             a.ssa, b.ssa
         ));
-        Value {
-            ssa,
-            ty: a.ty.clone(),
-        }
+        Value { ssa, ty: a.ty }
     }
 
     /// `%N = stablehlo.select %pred, %a, %b : (i1-shape, ty, ty) -> ty`.
     /// `c` is treated as an `i1` tensor of its own `MlirTy` shape (typically
     /// an [`Emitter::compare`] result) regardless of what element type its
     /// `MlirTy` would otherwise render as — see the module doc comment.
+    ///
+    /// A mixed `Scalar`/`Ranked` operand set auto-broadcasts every scalar VALUE
+    /// operand up to the ranked shape (StableHLO's `select` requires
+    /// `on_true`/`on_false` to share the result shape) — the mechanism a
+    /// batched (Tier-2 fan-out) rejection sampler uses to fold a `[n]`
+    /// candidate against a scalar fallback, or pick a per-lane sign. The
+    /// PREDICATE is left as-is: StableHLO accepts a rank-0 `pred` with ranked
+    /// operands (parse-validated), so a scalar predicate does not need
+    /// broadcasting (and an `i1` operand has no float-rendered
+    /// [`Emitter::broadcast_scalar`] form). When all three already share a
+    /// shape (every scalar path, inference-unified upstream), no broadcast is
+    /// emitted and the output is byte-identical to before.
     pub fn select(&mut self, c: &Value, a: &Value, b: &Value) -> Value {
+        // Target the ranked shape among {pred, on_true, on_false}, if any.
+        let target = [&c.ty, &a.ty, &b.ty]
+            .into_iter()
+            .find(|t| matches!(t, MlirTy::Ranked(_)))
+            .cloned();
+        let (a, b) = match &target {
+            Some(shape) => (
+                self.broadcast_scalar(a, shape),
+                self.broadcast_scalar(b, shape),
+            ),
+            None => (a.clone(), b.clone()),
+        };
         let ssa = self.fresh();
         let pred_ty = render_i1(&c.ty);
         let ty_text = a.ty.render(self.dtype);
@@ -346,10 +389,7 @@ impl<'m> Emitter<'m> {
             "{ssa} = stablehlo.select {}, {}, {} : ({pred_ty}, {ty_text}, {ty_text}) -> {ty_text}",
             c.ssa, a.ssa, b.ssa
         ));
-        Value {
-            ssa,
-            ty: a.ty.clone(),
-        }
+        Value { ssa, ty: a.ty }
     }
 
     // ---- shape ops (Task 4: `get`/`get0`, `logsumexp`/`in` broadcasting) ---
@@ -1025,6 +1065,22 @@ impl<'m> Emitter<'m> {
         }
     }
 
+    /// `%N = stablehlo.or %a, %b : tensor<i1>` — boolean disjunction of two
+    /// `i1` predicates. Added for the batched (Tier-2 fan-out) rejection loop's
+    /// per-lane `accepted := accepted || accept_this` carry (a lane latches
+    /// once it first accepts). Same [`render_i1`] shape-rendering as
+    /// [`Emitter::and`]; both operands share `a`'s shape (`tensor<i1>` scalar
+    /// or `tensor<Nxi1>` batch).
+    pub fn or(&mut self, a: &Value, b: &Value) -> Value {
+        let ssa = self.fresh();
+        let ty = render_i1(&a.ty);
+        self.push(&format!("{ssa} = stablehlo.or {}, {} : {ty}", a.ssa, b.ssa));
+        Value {
+            ssa,
+            ty: a.ty.clone(),
+        }
+    }
+
     /// `%N = stablehlo.not %a : tensor<i1>` — boolean negation of an `i1`
     /// predicate (the loop condition's `!accepted`). Rendered via
     /// [`render_i1`], like [`Emitter::and`].
@@ -1035,6 +1091,56 @@ impl<'m> Emitter<'m> {
         Value {
             ssa,
             ty: a.ty.clone(),
+        }
+    }
+
+    /// `%N = stablehlo.constant dense<{b}> : tensor<Nxi1>` — a rank-1 boolean
+    /// (splat) constant, the batched (Tier-2 fan-out) rejection loop's initial
+    /// per-lane `accepted` flags (all `false`). The `[n]` analogue of
+    /// [`Emitter::bool_const`]: same dtype-independent raw-text reasoning (`i1`
+    /// is never this emitter's float dtype), but its `ty` carries the `[n]`
+    /// shape so the loop's [`Emitter::and`]/[`Emitter::or`]/[`Emitter::not`]
+    /// render `tensor<Nxi1>`.
+    pub fn bool_batch_const(&mut self, n: u64, b: bool) -> Value {
+        let ty = MlirTy::Ranked(vec![Some(n)]);
+        let ty_text = render_i1(&ty);
+        let ssa = self.fresh();
+        self.push(&format!(
+            "{ssa} = stablehlo.constant dense<{b}> : {ty_text}"
+        ));
+        Value { ssa, ty }
+    }
+
+    /// Reduce a rank-1 `[n]` boolean (`i1`) tensor to a scalar `i1` via
+    /// `stablehlo.reduce` with a `stablehlo.and` combine and a `true` identity
+    /// — the "all lanes accepted" test the batched (Tier-2 fan-out) rejection
+    /// loop's condition needs (`!all(accepted)`; `stablehlo` has no scalar
+    /// boolean all-reduce op). Mirrors [`Emitter::reduce_axis`]'s pretty
+    /// `stablehlo.reduce(... init: ...) applies ... across dimensions = [0]`
+    /// form, but over `i1` (rendered via [`render_i1`], since [`MlirTy`] carries
+    /// no boolean element type — see [`Emitter::and`]) rather than the float
+    /// dtype. Returns a `Scalar`-shaped `i1` placeholder (like
+    /// [`Emitter::bool_const`]); panics on a non-rank-1 operand (an internal
+    /// invariant violation, mirroring the other shape-typed helpers).
+    pub fn reduce_all(&mut self, a: &Value) -> Value {
+        match &a.ty {
+            MlirTy::Ranked(dims) if dims.len() == 1 => {}
+            other => panic!("reduce_all expects a rank-1 (boolean vector) operand, got {other:?}"),
+        }
+        let operand_ty = render_i1(&a.ty);
+        let scalar_i1 = render_i1(&MlirTy::Scalar);
+        let init_ssa = self.fresh();
+        self.push(&format!(
+            "{init_ssa} = stablehlo.constant dense<true> : {scalar_i1}"
+        ));
+        let ssa = self.fresh();
+        self.push(&format!(
+            "{ssa} = stablehlo.reduce({} init: {init_ssa}) applies stablehlo.and across dimensions = [0] : ({operand_ty}, {scalar_i1}) -> {scalar_i1}",
+            a.ssa
+        ));
+        Value {
+            ssa,
+            ty: MlirTy::Scalar,
         }
     }
 
@@ -1065,6 +1171,37 @@ impl<'m> Emitter<'m> {
         ));
         let sliced = Value { ssa, ty: slice_ty };
         self.reshape(&sliced, MlirTy::Scalar)
+    }
+
+    /// Extract row `index` (a runtime `i32` scalar — see [`Emitter::int_const`])
+    /// of a rank-2 `[m, n]` tensor `operand` as a rank-1 `[n]` vector, via
+    /// `stablehlo.dynamic_slice` (`sizes = [1, n]`, a zero start on the trailing
+    /// axis) + [`Emitter::reshape`] dropping the length-1 leading axis. The
+    /// rank-2 analogue of [`Emitter::dynamic_slice_scalar`]: a batched (Tier-2
+    /// fan-out) rejection loop reads its `[MAXITER, n]` pre-drawn candidate
+    /// batch one `[n]` row per iteration this way (drawing the whole batch
+    /// OUTSIDE the loop keeps the key advance fixed and the draw reproducible).
+    /// Like `dynamic_slice`, the leading start index is clamped into range, so a
+    /// counter at/past `MAXITER` only re-reads the last row (never out of
+    /// bounds). Panics on a non-rank-2 (or dynamic-trailing-dim) operand — an
+    /// internal invariant violation, mirroring [`Emitter::dynamic_slice_scalar`].
+    pub fn dynamic_slice_row(&mut self, operand: &Value, index: &Value) -> Value {
+        let n = match &operand.ty {
+            MlirTy::Ranked(dims) if dims.len() == 2 => dims[1]
+                .expect("dynamic_slice_row: trailing dim must be static (no dynamic ui32 form)"),
+            other => panic!("dynamic_slice_row expects a rank-2 operand, got {other:?}"),
+        };
+        let operand_ty = operand.ty.render(self.dtype);
+        let zero_i = self.int_const(0);
+        let slice_ty = MlirTy::Ranked(vec![Some(1), Some(n)]);
+        let slice_ty_text = slice_ty.render(self.dtype);
+        let ssa = self.fresh();
+        self.push(&format!(
+            "{ssa} = stablehlo.dynamic_slice {}, {}, {}, sizes = [1, {n}] : ({operand_ty}, tensor<i32>, tensor<i32>) -> {slice_ty_text}",
+            operand.ssa, index.ssa, zero_i.ssa
+        ));
+        let sliced = Value { ssa, ty: slice_ty };
+        self.reshape(&sliced, MlirTy::Ranked(vec![Some(n)]))
     }
 
     /// Emit a `stablehlo.while` carrying the [`Value`]s `inits` (one per

@@ -6204,21 +6204,183 @@ fn emit_sample_exponential_iid_matches_frozen_golden() {
     );
 }
 
-/// Fan-out for a rejection-based sampler (Gamma reduces to the
-/// Marsaglia–Tsang `stablehlo.while`, which is not shape-generic over a batch
-/// dim) is fan-out Tier 2 — it must REFUSE precisely, not mislower. The
-/// scalar `Gamma` sample still lowers (only the fanned form refuses).
+// ---- Task 10a: fan-out Tier 2 (batched rejection — Gamma family) ------------
+//
+// A fanned `iid(K, n)` sample whose kernel `K` is a Marsaglia–Tsang rejection
+// sampler (Gamma, or a reducer that composes it — ChiSquared/StudentT/
+// InverseGamma/Beta/GeneralizedNormal) draws `n` iid values via
+// `draw_gamma_batched`'s PER-LANE masked `stablehlo.while`: a `tensor<n×i1>`
+// accept mask keeps each lane's FIRST accepted candidate and redraws only the
+// still-rejected lanes, looping until `all(accepted)` (or MAXITER). Candidates
+// are pre-drawn OUTSIDE the loop at `[MAXITER, n]` (fixed key advance →
+// reproducible), read one `[n]` row per iteration by `dynamic_slice_row`. Both
+// frozen goldens below are parse-validated against the real StableHLO parser
+// (jax 0.10.2). Vector-variate (Dirichlet/MvNormal → Task 10b) and the discrete
+// samplers still refuse.
+
+/// A fanned rejection draw: `iid(Gamma(shape=2, rate=1), 4)`, value-terminal.
+const GAMMA_IID_SAMPLE_SRC: &str = "\
+s = rnginit(0)
+xs ~ iid(Gamma(shape = 2.0, rate = 1.0), 4)
+draws = rand(s, lawof(xs))
+";
+
+/// The strongest reducer: `X / (X + Y)`, TWO independent batched Gamma draws
+/// (→ TWO masked `while`s) plus the elementwise ratio, all at `[4]`.
+const BETA_IID_SAMPLE_SRC: &str = "\
+s = rnginit(0)
+xs ~ iid(Beta(alpha = 2.0, beta = 3.0), 4)
+draws = rand(s, lawof(xs))
+";
+
+/// The batched Gamma draw returns a `tensor<4xf32>` (not a scalar) alongside
+/// the advanced key, via exactly ONE masked `stablehlo.while` carrying a
+/// `tensor<4xi1>` per-lane accept mask, reading its pre-drawn `[MAXITER, 4]`
+/// candidate batch with `dynamic_slice`.
 #[test]
-fn emit_sample_iid_gamma_refuses_tier2() {
+fn emit_sample_gamma_iid_has_expected_structure() {
+    let d = determinize_src(GAMMA_IID_SAMPLE_SRC);
+    let out = emit_sample(&d);
+
+    assert!(
+        out.contains("func.func @sample(%key: tensor<2xui64>)"),
+        "missing @sample(%key) (no free params) in:\n{out}"
+    );
+    assert!(
+        out.contains("-> (tensor<4xf32>, tensor<2xui64>)"),
+        "batched Gamma must return the [4] batch + advanced key, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.while").count(),
+        1,
+        "one masked while for the whole [4] batch, in:\n{out}"
+    );
+    assert!(
+        out.contains("tensor<4xi1>"),
+        "per-lane accept mask must be tensor<4xi1>, in:\n{out}"
+    );
+    assert!(
+        out.contains("stablehlo.reduce(") && out.contains("stablehlo.or "),
+        "the masked loop needs an all-reduce over the accept mask + an OR carry, in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// Freeze the exact emitted text (parse-validated against the real StableHLO
+/// parser): any drift must be a deliberate, reviewed change to this golden.
+#[test]
+fn emit_sample_gamma_iid_matches_frozen_golden() {
+    let d = determinize_src(GAMMA_IID_SAMPLE_SRC);
+    let out = emit_sample(&d);
+    let golden = include_str!("goldens/gamma_iid_sample.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted batched-Gamma @sample drifted from tests/goldens/gamma_iid_sample.mlir"
+    );
+}
+
+/// Beta fans out to TWO batched Gammas (its `X / (X + Y)`): two masked
+/// `while`s, one `[4]` value return, one advanced key.
+#[test]
+fn emit_sample_beta_iid_matches_frozen_golden() {
+    let d = determinize_src(BETA_IID_SAMPLE_SRC);
+    let out = emit_sample(&d);
+
+    assert!(
+        out.contains("-> (tensor<4xf32>, tensor<2xui64>)"),
+        "batched Beta must return the [4] batch + advanced key, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.while").count(),
+        2,
+        "two masked whiles (Beta = ratio of two batched Gammas), in:\n{out}"
+    );
+
+    let golden = include_str!("goldens/beta_iid_sample.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted batched-Beta @sample drifted from tests/goldens/beta_iid_sample.mlir"
+    );
+}
+
+/// Every reducer that composes `draw_gamma_batched` fans out to a `[4]` batch
+/// value with a `tensor<4xi1>` per-lane accept mask — proving the WHOLE
+/// rejection family (not just Gamma/Beta) is batch-correct. GeneralizedNormal
+/// additionally exercises the now-auto-broadcasting `compare`/`select` (its
+/// per-lane `sgn`).
+#[test]
+fn emit_sample_iid_gamma_reducers_fan_out() {
+    let cases = [
+        (
+            "ChiSquared",
+            "s = rnginit(0)\nxs ~ iid(ChiSquared(k = 3.0), 4)\ndraws = rand(s, lawof(xs))\n",
+        ),
+        (
+            "StudentT",
+            "s = rnginit(0)\nxs ~ iid(StudentT(nu = 5.0), 4)\ndraws = rand(s, lawof(xs))\n",
+        ),
+        (
+            "InverseGamma",
+            "s = rnginit(0)\nxs ~ iid(InverseGamma(shape = 3.0, scale = 1.0), 4)\ndraws = rand(s, lawof(xs))\n",
+        ),
+        (
+            "GeneralizedNormal",
+            "s = rnginit(0)\nxs ~ iid(GeneralizedNormal(mean = 0.0, alpha = 1.0, beta = 2.0), 4)\ndraws = rand(s, lawof(xs))\n",
+        ),
+    ];
+    for (name, src) in cases {
+        let d = determinize_src(src);
+        let out = emit_sample(&d);
+        assert!(
+            out.contains("-> (tensor<4xf32>, tensor<2xui64>)"),
+            "{name} iid must return the [4] batch + advanced key, in:\n{out}"
+        );
+        assert!(
+            out.contains("tensor<4xi1>"),
+            "{name} iid must carry a [4] per-lane accept mask, in:\n{out}"
+        );
+        assert!(is_delimiter_balanced(&out), "{name} iid unbalanced:\n{out}");
+    }
+}
+
+/// Fan-out for a VECTOR-variate sampler (Dirichlet draws a whole vector per
+/// draw — batched multivariate is Task 10b) is out of scope and must REFUSE,
+/// not mislower. (It refuses whether the determiniser or the emitter catches
+/// it first; either way `emit` errors rather than producing a wrong lowering.)
+#[test]
+fn emit_sample_iid_dirichlet_refuses() {
+    let src = "s = rnginit(0)\nxs ~ iid(Dirichlet(alpha = [1.0, 1.0, 1.0]), 4)\ndraws = rand(s, lawof(xs))\n";
+    let m = flatppl_syntax::parse(src).expect("parse");
+    let mut m = m;
+    let _ = flatppl_infer::infer(&mut m);
+    let determinized = flatppl_determinizer::determinize(&m);
+    let refused = match determinized {
+        Err(_) => true,
+        Ok(d) => flatppl_stablehlo::emit(&d, flatppl_stablehlo::Mode::Sample, &Default::default())
+            .is_err(),
+    };
+    assert!(
+        refused,
+        "iid(Dirichlet, n) (vector variate) must refuse, not mislower"
+    );
+}
+
+/// A still-excluded DISCRETE sampler (Poisson) — a scalar variate that
+/// determinizes to `builtin_sample(rng, ctor, input, n)` like Gamma did, but is
+/// not yet batched — refuses at `lower_sample` with the precise deferred
+/// message (guarding the refuse path a scalar-variate non-`FANOUT_SAFE` ctor
+/// takes).
+#[test]
+fn emit_sample_iid_poisson_refuses() {
     let d = determinize_src(
-        "s = rnginit(0)\nxs ~ iid(Gamma(shape = 2.0, rate = 1.0), 4)\ndraws = rand(s, lawof(xs))\n",
+        "s = rnginit(0)\nxs ~ iid(Poisson(rate = 2.0), 4)\ndraws = rand(s, lawof(xs))\n",
     );
     let err = flatppl_stablehlo::emit(&d, flatppl_stablehlo::Mode::Sample, &Default::default())
         .unwrap_err();
     assert!(
         err.msg
-            .contains("fan-out (iid) @sample for 'Gamma' not yet supported")
-            && err.msg.contains("Tier-2"),
+            .contains("fan-out (iid) @sample for 'Poisson' not yet supported")
+            && err.msg.contains("deferred"),
         "unexpected message: {}",
         err.msg
     );
