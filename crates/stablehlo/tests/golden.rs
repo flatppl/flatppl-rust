@@ -206,7 +206,7 @@ fn emitter_scalar_add_produces_well_formed_module() {
     let a = e.scalar(2.0);
     let b = e.scalar(3.0);
     let c = e.add(&a, &b);
-    let out = e.finish("logdensity", &[], &c);
+    let out = e.finish("logdensity", &[], &[&c]);
 
     assert!(out.contains("stablehlo.add"));
     assert!(out.contains("func.func @logdensity"));
@@ -223,7 +223,7 @@ fn emitter_finish_wraps_args_and_return_type() {
         ty: MlirTy::Scalar,
     };
     let doubled = e.add(&arg, &arg);
-    let out = e.finish("f", &[("%arg0".to_string(), MlirTy::Scalar)], &doubled);
+    let out = e.finish("f", &[("%arg0".to_string(), MlirTy::Scalar)], &[&doubled]);
     assert!(out.starts_with("module {\n"));
     assert!(out.contains("func.func @f(%arg0: tensor<f64>) -> tensor<f64> {"));
     assert!(out.trim_end().ends_with('}'));
@@ -251,7 +251,7 @@ fn emitter_elementary_wrappers_emit_expected_ops() {
         (e.abs(&a), "stablehlo.abs"),
         (e.cos(&a), "stablehlo.cosine"),
     ];
-    let out = e.finish("f", &[], &cases[0].0);
+    let out = e.finish("f", &[], &[&cases[0].0]);
     for (_, op) in &cases {
         assert!(out.contains(op), "missing {op} in:\n{out}");
     }
@@ -269,7 +269,7 @@ fn emitter_lgamma_emits_function_type_form() {
     let mut e = Emitter::new(&m, Dtype::F32);
     let a = e.scalar(1.0);
     let r = e.lgamma(&a);
-    let out = e.finish("f", &[], &r);
+    let out = e.finish("f", &[], &[&r]);
 
     assert!(
         out.contains("chlo.lgamma %"),
@@ -291,7 +291,7 @@ fn emitter_compare_and_select_type_check() {
     let b = e.scalar(2.0);
     let pred = e.compare("LT", &a, &b);
     let picked = e.select(&pred, &a, &b);
-    let out = e.finish("f", &[], &picked);
+    let out = e.finish("f", &[], &[&picked]);
 
     assert!(out.contains("stablehlo.compare LT"));
     assert!(out.contains("tensor<i1>"));
@@ -317,7 +317,7 @@ fn emitter_reduce_sum_and_max_reduce_to_scalar() {
     let mx = e.reduce_max(&v);
     assert_eq!(mx.ty, MlirTy::Scalar);
 
-    let out = e.finish("f", &[], &mx);
+    let out = e.finish("f", &[], &[&mx]);
     assert!(out.contains("stablehlo.reduce("));
     assert!(
         out.contains("applies stablehlo.add across dimensions"),
@@ -346,7 +346,7 @@ fn emitter_reduce_max_f64_identity_is_dtype_exact_neg_inf() {
     let mut e = Emitter::new(&m, Dtype::F64);
     let v = e.constant(1.0, MlirTy::Ranked(vec![Some(3)]));
     let mx = e.reduce_max(&v);
-    let out = e.finish("f", &[], &mx);
+    let out = e.finish("f", &[], &[&mx]);
     assert!(
         out.contains("dense<0xFFF0000000000000>"),
         "missing f64 -inf identity in:\n{out}"
@@ -381,7 +381,7 @@ fn emitter_matrix_helpers_emit_expected_ops() {
     let y = e.tri_solve(&l, &vec3);
     assert_eq!(y.ty, vec3.ty);
 
-    let out = e.finish("f", &[], &y);
+    let out = e.finish("f", &[], &[&y]);
     assert!(out.contains("stablehlo.cholesky"));
     assert!(out.contains("stablehlo.iota"));
     assert!(out.contains("stablehlo.dot_general"));
@@ -514,7 +514,7 @@ fn lower_node_add_mul_emits_multiply_before_add() {
 
     let mut e = Emitter::new(&m, Dtype::F32);
     let result = e.lower_node(add_node).unwrap();
-    let out = e.finish("logdensity", &[], &result);
+    let out = e.finish("logdensity", &[], &[&result]);
 
     let mul_pos = out.find("stablehlo.multiply").expect("missing multiply");
     let add_pos = out.find("stablehlo.add").expect("missing add");
@@ -548,7 +548,7 @@ fn lower_builtin_head_map_dispatches_expected_ops() {
 
         let mut e = Emitter::new(&m, Dtype::F32);
         let result = e.lower_node(node).unwrap();
-        let out = e.finish("f", &[], &result);
+        let out = e.finish("f", &[], &[&result]);
         assert!(out.contains(op), "head '{head}': missing {op} in:\n{out}");
         assert!(is_delimiter_balanced(&out));
     }
@@ -584,7 +584,7 @@ fn lower_ifelse_of_in_interval_selects_via_stablehlo_select() {
     let out = e.finish(
         "logdensity",
         &[("%arg0".to_string(), MlirTy::Scalar)],
-        &result,
+        &[&result],
     );
 
     assert!(
@@ -627,7 +627,7 @@ fn lower_logsumexp_emits_stable_shift_by_max_formula_in_order() {
     let out = e.finish(
         "f",
         &[("%arg0".to_string(), MlirTy::Ranked(vec![Some(3)]))],
-        &result,
+        &[&result],
     );
 
     let max_pos = out
@@ -693,7 +693,7 @@ fn lower_logsumexp_of_vector_emits_concatenate_then_stable_formula() {
             ("%arg0".to_string(), MlirTy::Scalar),
             ("%arg1".to_string(), MlirTy::Scalar),
         ],
-        &result,
+        &[&result],
     );
 
     let concat_pos = out
@@ -748,7 +748,7 @@ fn lower_sum_reduces_to_scalar_via_reduce_sum() {
     let out = e.finish(
         "f",
         &[("%arg0".to_string(), MlirTy::Ranked(vec![Some(3)]))],
-        &result,
+        &[&result],
     );
     assert!(
         out.contains("applies stablehlo.add across dimensions"),
@@ -800,7 +800,7 @@ fn lower_in_interval_reduces_to_one_compare() {
         },
     );
     let result = e.lower_node(node).unwrap();
-    let out = e.finish("f", &[("%arg0".to_string(), MlirTy::Scalar)], &result);
+    let out = e.finish("f", &[("%arg0".to_string(), MlirTy::Scalar)], &[&result]);
 
     assert_eq!(
         out.matches("stablehlo.subtract").count(),
@@ -861,7 +861,7 @@ fn lower_get0_slices_and_reshapes_to_scalar() {
     let out = e.finish(
         "f",
         &[("%arg0".to_string(), MlirTy::Ranked(vec![Some(5)]))],
-        &result,
+        &[&result],
     );
 
     assert!(
@@ -895,7 +895,7 @@ fn lower_get_is_one_based() {
     let out = e.finish(
         "f",
         &[("%arg0".to_string(), MlirTy::Ranked(vec![Some(5)]))],
-        &result,
+        &[&result],
     );
     assert!(
         out.contains("stablehlo.slice %arg0 [0:1]"),
@@ -988,7 +988,7 @@ fn lower_node_memoizes_shared_ancestor() {
 
     let mut e = Emitter::new(&m, Dtype::F32);
     let result = e.lower_node(node).unwrap();
-    let out = e.finish("f", &[], &result);
+    let out = e.finish("f", &[], &[&result]);
 
     assert_eq!(
         out.matches("dense<5").count(),
@@ -1125,7 +1125,7 @@ fn lower_node_lowers_int_and_bool_literals_as_scalars() {
     let bv = e.lower_node(b).unwrap();
     assert_eq!(iv.ty, MlirTy::Scalar);
     assert_eq!(bv.ty, MlirTy::Scalar);
-    let out = e.finish("f", &[], &bv);
+    let out = e.finish("f", &[], &[&bv]);
     assert!(out.contains("dense<7"));
     assert!(out.contains("dense<1"));
 }
@@ -1139,7 +1139,7 @@ fn lower_const_inf_emits_dtype_exact_positive_infinity() {
     let mut e = Emitter::new(&m, Dtype::F32);
     let result = e.lower_node(node).unwrap();
     assert_eq!(result.ty, MlirTy::Scalar);
-    let out = e.finish("f", &[], &result);
+    let out = e.finish("f", &[], &[&result]);
     assert!(
         out.contains("dense<0x7F800000>"),
         "missing dtype-exact +inf in:\n{out}"
@@ -2699,21 +2699,21 @@ fn emit_sample_normal_has_expected_structure() {
     let out = emit_sample(&d);
 
     assert!(
-        out.contains("func.func @sample()"),
-        "missing func.func @sample() (no free params) in:\n{out}"
+        out.contains("func.func @sample(%key: tensor<2xui64>)"),
+        "missing func.func @sample(%key: tensor<2xui64>) (no free params) in:\n{out}"
     );
     assert!(
-        out.contains("-> tensor<f32>"),
-        "must return tensor<f32> in:\n{out}"
+        out.contains("-> (tensor<f32>, tensor<2xui64>)"),
+        "must return the (value, advanced-key) pair in:\n{out}"
     );
     assert_eq!(
-        out.matches("stablehlo.rng").count(),
+        out.matches("stablehlo.rng_bit_generator").count(),
         1,
-        "expected exactly one stablehlo.rng, in:\n{out}"
+        "expected exactly one threaded rng_bit_generator draw, in:\n{out}"
     );
     assert!(
-        out.contains("distribution = NORMAL"),
-        "missing NORMAL distribution attr, in:\n{out}"
+        out.contains("chlo.erf_inv"),
+        "NORMAL draws through the erf_inv probit, in:\n{out}"
     );
     assert!(is_delimiter_balanced(&out));
 }
@@ -3127,15 +3127,15 @@ fn emit_sample_refuses_module_with_no_public_binding() {
 }
 
 /// `get0(builtin_sample(...), 1)` — projecting the ADVANCED RNG-STATE slot
-/// (index 1) of a sampled `(value, new_rngstate)` tuple, as opposed to the
-/// drawn-value slot (index 0, the ordinary case every other sample test
-/// projects). This vertical is XLA-seeded (`stablehlo.rng` takes no explicit
-/// rng key), so that slot has no tensor form at all — refuses, rather than
-/// trying to slice a nonexistent tensor.
+/// (index 1) of a sampled `(value, new_rngstate)` pair (spec §07), as opposed
+/// to the drawn-value slot (index 0, the ordinary case every other sample
+/// test projects). Under the threaded-key rng ABI this slot resolves to the
+/// key `stablehlo.rng_bit_generator` advanced (typed `MlirTy::Key`) — the
+/// mechanism a chained `rand` threads onward — rather than refusing.
 #[test]
-fn lower_get_of_sampled_tuple_refuses_rng_state_slot() {
+fn lower_get_of_sampled_tuple_yields_advanced_rng_key() {
     let mut m = Module::new();
-    let rng = real(&mut m, 0.0); // stand-in rng-state arg (never lowered)
+    let rng = real(&mut m, 0.0); // stand-in rng source (bound to the key below)
     let ctor = const_node(&mut m, "Normal");
     let mu = real(&mut m, 0.0);
     let sigma = real(&mut m, 1.0);
@@ -3145,13 +3145,22 @@ fn lower_get_of_sampled_tuple_refuses_rng_state_slot() {
     let node = call(&mut m, "get0", &[sample, one_idx]);
 
     let mut e = Emitter::new(&m, Dtype::F32);
-    let err = e.lower_node(node).unwrap_err();
-    assert!(
-        err.msg.contains("sampled rng state has no tensor form"),
-        "unexpected message: {}",
-        err.msg
+    // Seed the source rng arg with `%key`, as `emit_sample` would.
+    e.bind(
+        rng,
+        Value {
+            ssa: "%key".to_string(),
+            ty: MlirTy::Key,
+        },
     );
-    assert_eq!(err.node, Some(node));
+    let v = e
+        .lower_node(node)
+        .expect("advanced rng-state slot must project to the advanced key");
+    assert_eq!(
+        v.ty,
+        MlirTy::Key,
+        "slot 1 is the advanced rng-state key, not a tensor value"
+    );
 }
 
 /// `vector()` with zero elements — `concatenate` needs at least one operand;
@@ -3212,7 +3221,7 @@ fn lower_vector_of_vectors_lowers_to_rank2_tensor() {
             ("%arg0".to_string(), MlirTy::Ranked(vec![Some(3)])),
             ("%arg1".to_string(), MlirTy::Ranked(vec![Some(3)])),
         ],
-        &result,
+        &[&result],
     );
     assert!(
         out.contains("stablehlo.concatenate"),
@@ -3902,7 +3911,7 @@ fn categorical0_logpdf_at_floor_slices_first_element() {
 
     let mut e = Emitter::new(&m, Dtype::F32);
     let result = e.lower_node(node).unwrap();
-    let out = e.finish("f", &[], &result);
+    let out = e.finish("f", &[], &[&result]);
     assert!(
         out.contains("stablehlo.slice") && out.contains("[0:1]"),
         "expected k=0 to slice 0-based index 0, in:\n{out}"
@@ -4673,12 +4682,12 @@ fn emit_sample_lognormal_has_expected_structure() {
     let out = emit_sample(&d);
 
     assert!(
-        out.contains("func.func @sample()"),
-        "missing func.func @sample() (no free params) in:\n{out}"
+        out.contains("func.func @sample(%key: tensor<2xui64>)"),
+        "missing func.func @sample(%key: tensor<2xui64>) (no free params) in:\n{out}"
     );
-    assert!(out.contains("-> tensor<f32>"));
+    assert!(out.contains("-> (tensor<f32>, tensor<2xui64>)"));
     assert_eq!(out.matches("stablehlo.rng").count(), 1);
-    assert!(out.contains("distribution = NORMAL"));
+    assert!(out.contains("chlo.erf_inv"));
     assert_eq!(
         out.matches("stablehlo.exponential").count(),
         1,
@@ -4711,10 +4720,10 @@ fn emit_sample_exponential_has_expected_structure() {
     let d = determinize_src(EXPONENTIAL_SAMPLE_SRC);
     let out = emit_sample(&d);
 
-    assert!(out.contains("func.func @sample()"));
-    assert!(out.contains("-> tensor<f32>"));
+    assert!(out.contains("func.func @sample(%key: tensor<2xui64>)"));
+    assert!(out.contains("-> (tensor<f32>, tensor<2xui64>)"));
     assert_eq!(out.matches("stablehlo.rng").count(), 1);
-    assert!(out.contains("distribution = UNIFORM"));
+    assert!(out.contains("stablehlo.rng_bit_generator"));
     assert_eq!(out.matches("stablehlo.log").count(), 1);
     assert_eq!(out.matches("stablehlo.negate").count(), 1);
     assert_eq!(out.matches("stablehlo.divide").count(), 1);
@@ -4746,12 +4755,15 @@ fn emit_sample_uniform_has_expected_structure() {
     let d = determinize_src(UNIFORM_SAMPLE_SRC);
     let out = emit_sample(&d);
 
-    assert!(out.contains("func.func @sample()"));
-    assert!(out.contains("-> tensor<f32>"));
+    assert!(out.contains("func.func @sample(%key: tensor<2xui64>)"));
+    assert!(out.contains("-> (tensor<f32>, tensor<2xui64>)"));
     assert_eq!(out.matches("stablehlo.rng").count(), 1);
-    assert!(out.contains("distribution = UNIFORM"));
-    assert_eq!(out.matches("stablehlo.multiply").count(), 1);
-    assert_eq!(out.matches("stablehlo.add").count(), 1);
+    assert!(out.contains("stablehlo.rng_bit_generator"));
+    // Three multiplies (bits→uniform scale, the rng affine's `(b-a)*u`, the
+    // Uniform transform's `4.0 * u`) and two adds (rng affine `+ a`, transform
+    // `-1.0 + …`) — the exact text is pinned by the frozen golden.
+    assert_eq!(out.matches("stablehlo.multiply").count(), 3);
+    assert_eq!(out.matches("stablehlo.add").count(), 2);
     assert!(is_delimiter_balanced(&out));
 }
 
@@ -4781,10 +4793,10 @@ fn emit_sample_cauchy_has_expected_structure() {
     let d = determinize_src(CAUCHY_SAMPLE_SRC);
     let out = emit_sample(&d);
 
-    assert!(out.contains("func.func @sample()"));
-    assert!(out.contains("-> tensor<f32>"));
+    assert!(out.contains("func.func @sample(%key: tensor<2xui64>)"));
+    assert!(out.contains("-> (tensor<f32>, tensor<2xui64>)"));
     assert_eq!(out.matches("stablehlo.rng").count(), 1);
-    assert!(out.contains("distribution = UNIFORM"));
+    assert!(out.contains("stablehlo.rng_bit_generator"));
     assert_eq!(
         out.matches("stablehlo.sine").count(),
         1,
@@ -4823,10 +4835,10 @@ fn emit_sample_logistic_has_expected_structure() {
     let d = determinize_src(LOGISTIC_SAMPLE_SRC);
     let out = emit_sample(&d);
 
-    assert!(out.contains("func.func @sample()"));
-    assert!(out.contains("-> tensor<f32>"));
+    assert!(out.contains("func.func @sample(%key: tensor<2xui64>)"));
+    assert!(out.contains("-> (tensor<f32>, tensor<2xui64>)"));
     assert_eq!(out.matches("stablehlo.rng").count(), 1);
-    assert!(out.contains("distribution = UNIFORM"));
+    assert!(out.contains("stablehlo.rng_bit_generator"));
     assert_eq!(out.matches("stablehlo.log").count(), 1);
     assert_eq!(out.matches("stablehlo.divide").count(), 1);
     assert!(is_delimiter_balanced(&out));
@@ -4858,10 +4870,10 @@ fn emit_sample_laplace_has_expected_structure() {
     let d = determinize_src(LAPLACE_SAMPLE_SRC);
     let out = emit_sample(&d);
 
-    assert!(out.contains("func.func @sample()"));
-    assert!(out.contains("-> tensor<f32>"));
+    assert!(out.contains("func.func @sample(%key: tensor<2xui64>)"));
+    assert!(out.contains("-> (tensor<f32>, tensor<2xui64>)"));
     assert_eq!(out.matches("stablehlo.rng").count(), 1);
-    assert!(out.contains("distribution = UNIFORM"));
+    assert!(out.contains("stablehlo.rng_bit_generator"));
     assert_eq!(
         out.matches("stablehlo.compare").count(),
         1,
@@ -4901,10 +4913,10 @@ fn emit_sample_weibull_has_expected_structure() {
     let d = determinize_src(WEIBULL_SAMPLE_SRC);
     let out = emit_sample(&d);
 
-    assert!(out.contains("func.func @sample()"));
-    assert!(out.contains("-> tensor<f32>"));
+    assert!(out.contains("func.func @sample(%key: tensor<2xui64>)"));
+    assert!(out.contains("-> (tensor<f32>, tensor<2xui64>)"));
     assert_eq!(out.matches("stablehlo.rng").count(), 1);
-    assert!(out.contains("distribution = UNIFORM"));
+    assert!(out.contains("stablehlo.rng_bit_generator"));
     assert_eq!(out.matches("stablehlo.power").count(), 1);
     assert!(is_delimiter_balanced(&out));
 }
@@ -4934,10 +4946,10 @@ fn emit_sample_pareto_has_expected_structure() {
     let d = determinize_src(PARETO_SAMPLE_SRC);
     let out = emit_sample(&d);
 
-    assert!(out.contains("func.func @sample()"));
-    assert!(out.contains("-> tensor<f32>"));
+    assert!(out.contains("func.func @sample(%key: tensor<2xui64>)"));
+    assert!(out.contains("-> (tensor<f32>, tensor<2xui64>)"));
     assert_eq!(out.matches("stablehlo.rng").count(), 1);
-    assert!(out.contains("distribution = UNIFORM"));
+    assert!(out.contains("stablehlo.rng_bit_generator"));
     assert_eq!(out.matches("stablehlo.power").count(), 1);
     assert!(is_delimiter_balanced(&out));
 }
@@ -4985,9 +4997,9 @@ fn emit_sample_mvnormal_has_expected_structure() {
         out.contains("%arg0: tensor<2xf32>") && out.contains("%arg1: tensor<2x2xf32>"),
         "mu/cov must become vector/matrix func args, in:\n{out}"
     );
-    assert!(out.contains("-> tensor<2xf32>"));
+    assert!(out.contains("-> (tensor<2xf32>, tensor<2xui64>)"));
     assert_eq!(out.matches("stablehlo.rng").count(), 1);
-    assert!(out.contains("distribution = NORMAL"));
+    assert!(out.contains("chlo.erf_inv"));
     assert_eq!(out.matches("stablehlo.cholesky").count(), 1);
     assert_eq!(out.matches("stablehlo.dot_general").count(), 1);
     assert!(is_delimiter_balanced(&out));
@@ -5040,10 +5052,10 @@ fn emit_sample_gamma_has_expected_structure() {
     let out = emit_sample(&d);
 
     assert!(
-        out.contains("func.func @sample()"),
-        "missing func.func @sample() (no free params) in:\n{out}"
+        out.contains("func.func @sample(%key: tensor<2xui64>)"),
+        "missing func.func @sample(%key: tensor<2xui64>) (no free params) in:\n{out}"
     );
-    assert!(out.contains("-> tensor<f32>"));
+    assert!(out.contains("-> (tensor<f32>, tensor<2xui64>)"));
     assert_eq!(
         out.matches("stablehlo.while").count(),
         1,
@@ -5060,7 +5072,7 @@ fn emit_sample_gamma_has_expected_structure() {
         "expected Z[i]/U[i] runtime indexing, in:\n{out}"
     );
     assert!(
-        out.contains("distribution = NORMAL") && out.contains("distribution = UNIFORM"),
+        out.contains("chlo.erf_inv") && out.contains("stablehlo.rng_bit_generator"),
         "expected both a NORMAL (Z) and UNIFORM (U) batch, in:\n{out}"
     );
     assert!(is_delimiter_balanced(&out));
@@ -5091,8 +5103,8 @@ fn emit_sample_beta_has_expected_structure() {
     let d = determinize_src(BETA_SAMPLE_SRC);
     let out = emit_sample(&d);
 
-    assert!(out.contains("func.func @sample()"));
-    assert!(out.contains("-> tensor<f32>"));
+    assert!(out.contains("func.func @sample(%key: tensor<2xui64>)"));
+    assert!(out.contains("-> (tensor<f32>, tensor<2xui64>)"));
     assert_eq!(
         out.matches("stablehlo.while").count(),
         2,
@@ -5125,8 +5137,8 @@ fn emit_sample_chi_squared_has_expected_structure() {
     let d = determinize_src(CHI_SQUARED_SAMPLE_SRC);
     let out = emit_sample(&d);
 
-    assert!(out.contains("func.func @sample()"));
-    assert!(out.contains("-> tensor<f32>"));
+    assert!(out.contains("func.func @sample(%key: tensor<2xui64>)"));
+    assert!(out.contains("-> (tensor<f32>, tensor<2xui64>)"));
     assert_eq!(out.matches("stablehlo.while").count(), 1);
     assert_eq!(out.matches("stablehlo.rng").count(), 3);
     assert!(is_delimiter_balanced(&out));
@@ -5157,8 +5169,8 @@ fn emit_sample_studentt_has_expected_structure() {
     let d = determinize_src(STUDENTT_SAMPLE_SRC);
     let out = emit_sample(&d);
 
-    assert!(out.contains("func.func @sample()"));
-    assert!(out.contains("-> tensor<f32>"));
+    assert!(out.contains("func.func @sample(%key: tensor<2xui64>)"));
+    assert!(out.contains("-> (tensor<f32>, tensor<2xui64>)"));
     assert_eq!(out.matches("stablehlo.while").count(), 1);
     assert_eq!(out.matches("stablehlo.rng").count(), 4);
     assert!(is_delimiter_balanced(&out));
@@ -5189,8 +5201,8 @@ fn emit_sample_inverse_gamma_has_expected_structure() {
     let d = determinize_src(INVERSE_GAMMA_SAMPLE_SRC);
     let out = emit_sample(&d);
 
-    assert!(out.contains("func.func @sample()"));
-    assert!(out.contains("-> tensor<f32>"));
+    assert!(out.contains("func.func @sample(%key: tensor<2xui64>)"));
+    assert!(out.contains("-> (tensor<f32>, tensor<2xui64>)"));
     assert_eq!(out.matches("stablehlo.while").count(), 1);
     assert_eq!(out.matches("stablehlo.rng").count(), 3);
     assert!(is_delimiter_balanced(&out));
@@ -5222,8 +5234,8 @@ fn emit_sample_generalized_normal_has_expected_structure() {
     let d = determinize_src(GENERALIZED_NORMAL_SAMPLE_SRC);
     let out = emit_sample(&d);
 
-    assert!(out.contains("func.func @sample()"));
-    assert!(out.contains("-> tensor<f32>"));
+    assert!(out.contains("func.func @sample(%key: tensor<2xui64>)"));
+    assert!(out.contains("-> (tensor<f32>, tensor<2xui64>)"));
     assert_eq!(out.matches("stablehlo.while").count(), 1);
     assert_eq!(out.matches("stablehlo.rng").count(), 4);
     assert!(is_delimiter_balanced(&out));
@@ -5269,7 +5281,7 @@ fn emit_sample_dirichlet_has_expected_structure() {
         out.contains("%arg0: tensor<3xf32>"),
         "alpha must become a length-3 vector func arg, in:\n{out}"
     );
-    assert!(out.contains("-> tensor<3xf32>"));
+    assert!(out.contains("-> (tensor<3xf32>, tensor<2xui64>)"));
     assert_eq!(
         out.matches("stablehlo.while").count(),
         3,
@@ -5392,10 +5404,10 @@ fn emit_sample_bernoulli_has_expected_structure() {
     let d = determinize_src(BERNOULLI_SAMPLE_SRC);
     let out = emit_sample(&d);
 
-    assert!(out.contains("func.func @sample()"));
-    assert!(out.contains("-> tensor<f32>"));
+    assert!(out.contains("func.func @sample(%key: tensor<2xui64>)"));
+    assert!(out.contains("-> (tensor<f32>, tensor<2xui64>)"));
     assert_eq!(out.matches("stablehlo.rng").count(), 1);
-    assert!(out.contains("distribution = UNIFORM"));
+    assert!(out.contains("stablehlo.rng_bit_generator"));
     assert_eq!(out.matches("stablehlo.compare").count(), 1);
     assert_eq!(out.matches("stablehlo.select").count(), 1);
     assert!(is_delimiter_balanced(&out));
@@ -5426,10 +5438,10 @@ fn emit_sample_geometric_has_expected_structure() {
     let d = determinize_src(GEOMETRIC_SAMPLE_SRC);
     let out = emit_sample(&d);
 
-    assert!(out.contains("func.func @sample()"));
-    assert!(out.contains("-> tensor<f32>"));
+    assert!(out.contains("func.func @sample(%key: tensor<2xui64>)"));
+    assert!(out.contains("-> (tensor<f32>, tensor<2xui64>)"));
     assert_eq!(out.matches("stablehlo.rng").count(), 1);
-    assert!(out.contains("distribution = UNIFORM"));
+    assert!(out.contains("stablehlo.rng_bit_generator"));
     assert_eq!(out.matches("stablehlo.log").count(), 2);
     assert_eq!(out.matches("stablehlo.floor").count(), 1);
     assert!(is_delimiter_balanced(&out));
@@ -5461,10 +5473,10 @@ fn emit_sample_categorical_has_expected_structure() {
     let d = determinize_src(CATEGORICAL_SAMPLE_SRC);
     let out = emit_sample(&d);
 
-    assert!(out.contains("func.func @sample()"));
-    assert!(out.contains("-> tensor<f32>"));
+    assert!(out.contains("func.func @sample(%key: tensor<2xui64>)"));
+    assert!(out.contains("-> (tensor<f32>, tensor<2xui64>)"));
     assert_eq!(out.matches("stablehlo.rng").count(), 1);
-    assert!(out.contains("distribution = UNIFORM"));
+    assert!(out.contains("stablehlo.rng_bit_generator"));
     assert_eq!(out.matches("stablehlo.compare").count(), 2);
     assert_eq!(out.matches("stablehlo.select").count(), 2);
     assert!(is_delimiter_balanced(&out));
@@ -5495,10 +5507,10 @@ fn emit_sample_categorical0_has_expected_structure() {
     let d = determinize_src(CATEGORICAL0_SAMPLE_SRC);
     let out = emit_sample(&d);
 
-    assert!(out.contains("func.func @sample()"));
-    assert!(out.contains("-> tensor<f32>"));
+    assert!(out.contains("func.func @sample(%key: tensor<2xui64>)"));
+    assert!(out.contains("-> (tensor<f32>, tensor<2xui64>)"));
     assert_eq!(out.matches("stablehlo.rng").count(), 1);
-    assert!(out.contains("distribution = UNIFORM"));
+    assert!(out.contains("stablehlo.rng_bit_generator"));
     assert_eq!(out.matches("stablehlo.compare").count(), 2);
     assert_eq!(out.matches("stablehlo.select").count(), 2);
     assert!(is_delimiter_balanced(&out));
@@ -5532,12 +5544,14 @@ fn emit_sample_binomial_has_expected_structure() {
     let d = determinize_src(BINOMIAL_SAMPLE_SRC);
     let out = emit_sample(&d);
 
-    assert!(out.contains("func.func @sample()"));
-    assert!(out.contains("-> tensor<f32>"));
+    assert!(out.contains("func.func @sample(%key: tensor<2xui64>)"));
+    assert!(out.contains("-> (tensor<f32>, tensor<2xui64>)"));
     assert_eq!(out.matches("stablehlo.rng").count(), 1);
-    assert!(out.contains("distribution = UNIFORM"));
+    assert!(out.contains("stablehlo.rng_bit_generator"));
     assert!(out.contains("tensor<5xf32>"));
-    assert_eq!(out.matches("stablehlo.broadcast_in_dim").count(), 1);
+    // Three broadcast_in_dim: the two scalar rng-affine bounds lifted to the
+    // length-5 batch shape, plus `p` broadcast to the batch by the sampler.
+    assert_eq!(out.matches("stablehlo.broadcast_in_dim").count(), 3);
     assert_eq!(out.matches("stablehlo.compare").count(), 1);
     assert_eq!(out.matches("stablehlo.select").count(), 1);
     assert_eq!(out.matches("stablehlo.reduce(").count(), 1);
@@ -5598,10 +5612,10 @@ fn emit_sample_poisson_has_expected_structure() {
     let d = determinize_src(POISSON_SAMPLE_SRC);
     let out = emit_sample(&d);
 
-    assert!(out.contains("func.func @sample()"));
-    assert!(out.contains("-> tensor<f32>"));
+    assert!(out.contains("func.func @sample(%key: tensor<2xui64>)"));
+    assert!(out.contains("-> (tensor<f32>, tensor<2xui64>)"));
     assert_eq!(out.matches("stablehlo.rng").count(), 1);
-    assert!(out.contains("distribution = UNIFORM"));
+    assert!(out.contains("stablehlo.rng_bit_generator"));
     assert_eq!(out.matches("stablehlo.while").count(), 1);
     assert!(is_delimiter_balanced(&out));
 }
@@ -5632,15 +5646,15 @@ fn emit_sample_negative_binomial_has_expected_structure() {
     let d = determinize_src(NEGATIVE_BINOMIAL_SAMPLE_SRC);
     let out = emit_sample(&d);
 
-    assert!(out.contains("func.func @sample()"));
-    assert!(out.contains("-> tensor<f32>"));
+    assert!(out.contains("func.func @sample(%key: tensor<2xui64>)"));
+    assert!(out.contains("-> (tensor<f32>, tensor<2xui64>)"));
     assert_eq!(
         out.matches("stablehlo.rng").count(),
         4,
         "expected Gamma's Z/U/U0 + Poisson's U, in:\n{out}"
     );
     assert!(
-        out.contains("distribution = NORMAL") && out.contains("distribution = UNIFORM"),
+        out.contains("chlo.erf_inv") && out.contains("stablehlo.rng_bit_generator"),
         "expected both a NORMAL (Gamma's Z) and UNIFORM batch, in:\n{out}"
     );
     assert_eq!(
@@ -5676,10 +5690,10 @@ fn emit_sample_negative_binomial2_has_expected_structure() {
     let d = determinize_src(NEGATIVE_BINOMIAL2_SAMPLE_SRC);
     let out = emit_sample(&d);
 
-    assert!(out.contains("func.func @sample()"));
-    assert!(out.contains("-> tensor<f32>"));
+    assert!(out.contains("func.func @sample(%key: tensor<2xui64>)"));
+    assert!(out.contains("-> (tensor<f32>, tensor<2xui64>)"));
     assert_eq!(out.matches("stablehlo.rng").count(), 4);
-    assert!(out.contains("distribution = NORMAL") && out.contains("distribution = UNIFORM"));
+    assert!(out.contains("chlo.erf_inv") && out.contains("stablehlo.rng_bit_generator"));
     assert_eq!(out.matches("stablehlo.while").count(), 2);
     assert!(
         out.matches("stablehlo.divide").count() >= 1,
@@ -5717,13 +5731,13 @@ fn emit_sample_multinomial_has_expected_structure() {
     let d = determinize_src(MULTINOMIAL_SAMPLE_SRC);
     let out = emit_sample(&d);
 
-    assert!(out.contains("func.func @sample()"));
+    assert!(out.contains("func.func @sample(%key: tensor<2xui64>)"));
     assert!(
-        out.contains("-> tensor<3xf32>"),
+        out.contains("-> (tensor<3xf32>, tensor<2xui64>)"),
         "must return a length-3 count vector, in:\n{out}"
     );
     assert_eq!(out.matches("stablehlo.rng").count(), 1);
-    assert!(out.contains("distribution = UNIFORM"));
+    assert!(out.contains("stablehlo.rng_bit_generator"));
     assert!(out.contains("tensor<4xf32>"));
     assert_eq!(out.matches("stablehlo.while").count(), 1);
     assert_eq!(out.matches("stablehlo.dynamic_slice").count(), 1);

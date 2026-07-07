@@ -72,6 +72,19 @@ pub struct Emitter<'m> {
     /// graph that references it is walked.
     memo: HashMap<NodeId, Value>,
     body: String,
+    /// The threaded rng-state key (spec §07 rng ABI). Set by
+    /// [`crate::registry::lower_sample`] from a `builtin_sample`'s rng arg
+    /// before the distribution builder draws; each [`Emitter::rng`] call
+    /// advances it via `stablehlo.rng_bit_generator`. `None` until the first
+    /// sample seeds it — a draw with no key set is an internal invariant
+    /// violation (see [`Emitter::cur_key`]).
+    cur_key: Option<Value>,
+    /// The advanced key each `builtin_sample` node produced, keyed by that
+    /// node's [`NodeId`] — the tensor-side realization of spec §07's
+    /// `(value, new_rngstate)` pair's second slot. Read by
+    /// [`Emitter::lower_node`]'s `get0(sample, 1)`/`get(sample, 2)` arm so a
+    /// chained `rand` threads the advanced key onward without re-drawing.
+    sample_keys: HashMap<NodeId, Value>,
 }
 
 impl<'m> Emitter<'m> {
@@ -82,7 +95,41 @@ impl<'m> Emitter<'m> {
             next: 0,
             memo: HashMap::new(),
             body: String::new(),
+            cur_key: None,
+            sample_keys: HashMap::new(),
         }
+    }
+
+    // ---- rng-key threading (spec §07 rng ABI) -------------------------------
+
+    /// Seed the threaded rng key — [`crate::registry::lower_sample`] calls this
+    /// with a `builtin_sample`'s (already-lowered) rng argument before running
+    /// the distribution builder, so every [`Emitter::rng`] draw the builder
+    /// makes advances from this key.
+    pub(crate) fn set_cur_key(&mut self, k: Value) {
+        self.cur_key = Some(k);
+    }
+
+    /// The current threaded rng key. Panics if no key has been set — a draw
+    /// reaching [`Emitter::rng`] outside a `builtin_sample` (which is the only
+    /// thing that seeds a key) is an internal invariant violation, mirroring
+    /// this module's other panic-on-bad-state discipline.
+    pub(crate) fn cur_key(&self) -> Value {
+        self.cur_key
+            .clone()
+            .expect("rng draw with no threaded key (builtin_sample must set_cur_key first)")
+    }
+
+    /// Record the advanced key `k` a `builtin_sample` node `id` produced, for
+    /// the `get0(sample, 1)`/`get(sample, 2)` projection to read back.
+    pub(crate) fn record_sample_key(&mut self, id: NodeId, k: Value) {
+        self.sample_keys.insert(id, k);
+    }
+
+    /// The advanced key recorded for `builtin_sample` node `id`, or `None` if
+    /// that node has not been lowered yet.
+    pub(crate) fn sample_key(&self, id: NodeId) -> Option<Value> {
+        self.sample_keys.get(&id).cloned()
     }
 
     /// Allocate a fresh SSA name (`%0`, `%1`, ...).
@@ -636,33 +683,28 @@ impl<'m> Emitter<'m> {
 
     // ---- sampling (Task 6) --------------------------------------------------
 
-    /// `%sh = stablehlo.constant dense<...> : tensor<Kxi64>` then `%N =
-    /// stablehlo.rng %a, %b, %sh, distribution = {NORMAL|UNIFORM} : (a_ty,
-    /// b_ty, tensor<Kxi64>) -> out_ty` — parser-validated verbatim against
-    /// the real StableHLO parser (jax 0.10.2). `dist` is a StableHLO
-    /// `rng_distribution` (`"NORMAL"`/`"UNIFORM"`); no explicit RNG key is
-    /// threaded (this vertical is XLA-seeded — see
-    /// `registry::lower_sample`'s doc comment on why `builtin_sample`'s
-    /// threaded rng-state argument is simply never lowered).
+    /// Draw an `out_ty`-shaped variate from the threaded rng key (spec §07
+    /// rng ABI), advancing [`Emitter::cur_key`]. `dist` is the sampling family
+    /// (`"NORMAL"`/`"UNIFORM"`); `a`/`b` are its affine bounds
+    /// (`a = mean/lo`, `b = std/hi`), applied to a standard draw exactly as
+    /// before so the 26 distribution builders that call this are unchanged.
     ///
-    /// `K` is `out_ty`'s rank and the shape constant's `K` elements are its
-    /// own per-axis dimension sizes: `K = 0` (`tensor<0xi64>`, `dense<>`) for
-    /// a `Scalar` result, `K = 1` (`tensor<1xi64>`, `dense<N>` — a bare
-    /// scalar literal, not `dense<[N]>`) for a length-`N` vector result.
-    /// `stablehlo.rng`'s shape operand is always an INTEGER tensor (a static
-    /// output-shape descriptor), never this emitter's `f32`/`f64` element
-    /// dtype — unlike every other constant this emitter builds, it cannot go
-    /// through [`Emitter::constant`]/`MlirTy::render` (both
-    /// dtype-parameterized), so it is built as raw text here instead
-    /// (mirroring [`render_i1`]'s reasoning for the same kind of
-    /// dtype-independent local render).
+    /// Threaded, not XLA-seeded: raw bits come from
+    /// `stablehlo.rng_bit_generator` on `self.cur_key` (which this call then
+    /// replaces with the generator's advanced state), mapped to a uniform in
+    /// `[0, 1)` and — for `NORMAL` — through the `chlo.erf_inv` probit. Every
+    /// op form is the exact text pinned in the rng-threaded-rand plan's Task-1
+    /// spike (parse-validated against the real StableHLO parser, jax 0.10.2,
+    /// and Enzyme-executed). See [`Emitter::rng_bit_generator_uniform`] /
+    /// [`Emitter::uniform_to_normal`].
     ///
     /// Panics (an internal invariant violation, not a user-facing refusal —
     /// mirrors `diag`/`matvec`'s panic-on-bad-shape discipline) if `a`/`b`
-    /// is not rank-0 (`stablehlo.rng`'s bounds operands must be scalar,
-    /// regardless of `out_ty`'s shape — the shape constant, not `a`/`b`,
-    /// carries the output rank), or if `out_ty` has a dynamic dimension or
-    /// is a `Tuple`: neither has a static shape-constant form.
+    /// is not rank-0 (the affine bounds must be scalar, regardless of
+    /// `out_ty`'s shape; a scalar bound is broadcast up to the batch via
+    /// [`Emitter::broadcast_scalar`]), if `out_ty` has a dynamic dimension or
+    /// is a `Tuple`/`Key` (no static bits-tensor form), or if `dist` is not a
+    /// supported family — and, via [`Emitter::cur_key`], if no key is threaded.
     pub fn rng(&mut self, dist: &str, a: &Value, b: &Value, out_ty: &MlirTy) -> Value {
         match &a.ty {
             MlirTy::Scalar => {}
@@ -672,47 +714,144 @@ impl<'m> Emitter<'m> {
             MlirTy::Scalar => {}
             other => panic!("rng expects a rank-0 (scalar) `b` operand, got {other:?}"),
         }
-        let dims: Vec<u64> = match out_ty {
-            MlirTy::Scalar => Vec::new(),
-            MlirTy::Ranked(dims) => dims
-                .iter()
-                .map(|d| {
-                    d.unwrap_or_else(|| {
-                        panic!("rng: dynamic output dimension has no static shape-constant form")
-                    })
-                })
-                .collect(),
-            MlirTy::Tuple(_) => panic!("rng: tuple output type has no shape-constant form"),
-            MlirTy::Key => panic!("rng: an rng key output type has no shape-constant form"),
-        };
-        let shape_ty_text = format!("tensor<{}xi64>", dims.len());
-        let shape_lit = match dims.len() {
-            0 => String::new(),
-            1 => dims[0].to_string(),
-            _ => format!(
-                "[{}]",
-                dims.iter()
-                    .map(u64::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-        };
-        let shape_ssa = self.fresh();
-        self.push(&format!(
-            "{shape_ssa} = stablehlo.constant dense<{shape_lit}> : {shape_ty_text}"
-        ));
 
-        let a_ty = a.ty.render(self.dtype);
-        let b_ty = b.ty.render(self.dtype);
-        let out_ty_text = out_ty.render(self.dtype);
+        // Draw uniform bits from (and advance) the threaded key.
+        let (new_key, u01) = self.rng_bit_generator_uniform(out_ty);
+        self.cur_key = Some(new_key);
+
+        match dist {
+            "UNIFORM" => {
+                // a + (b - a) * u01
+                let span = self.sub(b, a);
+                let span_bc = self.broadcast_scalar(&span, out_ty);
+                let a_bc = self.broadcast_scalar(a, out_ty);
+                let scaled = self.mul(&u01, &span_bc);
+                self.add(&scaled, &a_bc)
+            }
+            "NORMAL" => {
+                // a + b * Z, Z standard normal via the erf_inv probit.
+                let z = self.uniform_to_normal(&u01);
+                let b_bc = self.broadcast_scalar(b, out_ty);
+                let a_bc = self.broadcast_scalar(a, out_ty);
+                let scaled = self.mul(&z, &b_bc);
+                self.add(&scaled, &a_bc)
+            }
+            other => panic!("rng: unsupported distribution family {other:?}"),
+        }
+    }
+
+    /// Emit a `stablehlo.constant` with the verbatim literal text `lit` (not a
+    /// re-formatted `f64`) at `ty`'s shape — for the rng math's pinned
+    /// dtype-exact float constants (`2^-23`, `√2`), whose spike-validated
+    /// spellings must be reproduced exactly rather than round-tripped through
+    /// [`render_float_literal`].
+    fn const_lit(&mut self, lit: &str, ty: MlirTy) -> Value {
         let ssa = self.fresh();
+        let ty_text = ty.render(self.dtype);
         self.push(&format!(
-            "{ssa} = stablehlo.rng {}, {}, {shape_ssa}, distribution = {dist} : ({a_ty}, {b_ty}, {shape_ty_text}) -> {out_ty_text}",
-            a.ssa, b.ssa
+            "{ssa} = stablehlo.constant dense<{lit}> : {ty_text}"
+        ));
+        Value { ssa, ty }
+    }
+
+    /// Draw `out_ty`-shaped raw bits from the threaded key and map them to a
+    /// uniform in `[0, 1)`, returning `(advanced_key, uniform)`. Emits EXACTLY
+    /// the plan's Task-1-pinned op forms: `stablehlo.rng_bit_generator` in its
+    /// custom-assembly `THREE_FRY` spelling (the attribute-dict form is
+    /// rejected by the parser; the pretty-printer's two spaces after
+    /// `algorithm =` are the exact round-tripped text), then the
+    /// shift-right-9 / `convert` / multiply-by-`2^-23` bits→uniform sequence.
+    /// The bits tensor is always `ui32` (the generator's output element type,
+    /// independent of this emitter's float `dtype`); its shape follows
+    /// `out_ty` (rank-0 `tensor<ui32>` for a scalar draw, `tensor<Nxui32>` for
+    /// a length-`N` batch). Panics on a dynamic/`Tuple`/`Key` `out_ty`
+    /// ([`render_ui32`] has no such form).
+    fn rng_bit_generator_uniform(&mut self, out_ty: &MlirTy) -> (Value, Value) {
+        let key = self.cur_key();
+        let key_ty_text = MlirTy::Key.render(self.dtype);
+        let bits_ty_text = render_ui32(out_ty);
+        let float_ty_text = out_ty.render(self.dtype);
+
+        let state_ssa = self.fresh();
+        let bits_ssa = self.fresh();
+        self.push(&format!(
+            "{state_ssa}, {bits_ssa} = stablehlo.rng_bit_generator {}, algorithm =  THREE_FRY : ({key_ty_text}) -> ({key_ty_text}, {bits_ty_text})",
+            key.ssa
+        ));
+        let new_key = Value {
+            ssa: state_ssa,
+            ty: MlirTy::Key,
+        };
+
+        let c9_ssa = self.fresh();
+        self.push(&format!(
+            "{c9_ssa} = stablehlo.constant dense<9> : {bits_ty_text}"
+        ));
+        let hi_ssa = self.fresh();
+        self.push(&format!(
+            "{hi_ssa} = stablehlo.shift_right_logical {bits_ssa}, {c9_ssa} : {bits_ty_text}"
+        ));
+        let f_ssa = self.fresh();
+        self.push(&format!(
+            "{f_ssa} = stablehlo.convert {hi_ssa} : ({bits_ty_text}) -> {float_ty_text}"
+        ));
+        // 2^-23 (the pinned f32-exact spelling; renders at this emitter's dtype).
+        let scale = self.const_lit("1.1920929E-7", out_ty.clone());
+        let u_ssa = self.fresh();
+        self.push(&format!(
+            "{u_ssa} = stablehlo.multiply {f_ssa}, {} : {float_ty_text}",
+            scale.ssa
+        ));
+        let u = Value {
+            ssa: u_ssa,
+            ty: out_ty.clone(),
+        };
+        (new_key, u)
+    }
+
+    /// Map a uniform-in-`[0, 1)` draw `u` to a standard normal via the plan's
+    /// Task-1-pinned probit path (Path A, which won over Box–Muller):
+    /// `z = √2 · erf_inv(2u − 1)`. Shape-preserving; `chlo.erf_inv` is the
+    /// CHLO function-type op (`operand-ty -> result-ty`), same assembly shape
+    /// as [`Emitter::lgamma`].
+    fn uniform_to_normal(&mut self, u: &Value) -> Value {
+        let two = self.constant(2.0, u.ty.clone());
+        let one = self.constant(1.0, u.ty.clone());
+        let t = self.mul(u, &two);
+        let s = self.sub(&t, &one);
+        let e = self.erf_inv(&s);
+        let sqrt2 = self.const_lit("1.4142135", u.ty.clone());
+        self.mul(&e, &sqrt2)
+    }
+
+    /// `%N = chlo.erf_inv %a : ty -> ty` — the inverse error function (the
+    /// probit's core), a CHLO function-type op like [`Emitter::lgamma`]. Pinned
+    /// in the plan's Task-1 spike (parses + Enzyme-executes; a golden using it
+    /// must therefore carry the `chlo` dialect). Private: only
+    /// [`Emitter::uniform_to_normal`] needs it.
+    fn erf_inv(&mut self, a: &Value) -> Value {
+        let ssa = self.fresh();
+        let ty_text = a.ty.render(self.dtype);
+        self.push(&format!(
+            "{ssa} = chlo.erf_inv {} : {ty_text} -> {ty_text}",
+            a.ssa
         ));
         Value {
             ssa,
-            ty: out_ty.clone(),
+            ty: a.ty.clone(),
+        }
+    }
+
+    /// Broadcast a `Scalar` operand `s` up to `out_ty` (a no-op clone when
+    /// `out_ty` is itself scalar), so [`Emitter::rng`]'s affine can lift a
+    /// scalar bound onto a shaped (batched) draw — StableHLO's elementwise ops
+    /// require identical operand shapes. Delegates to
+    /// [`Emitter::broadcast_in_dim`]'s documented scalar form (`dims = []`).
+    fn broadcast_scalar(&mut self, s: &Value, out_ty: &MlirTy) -> Value {
+        if &s.ty == out_ty {
+            s.clone()
+        } else {
+            self.broadcast_in_dim(s, &[], out_ty.clone())
         }
     }
 
@@ -1000,6 +1139,39 @@ impl<'m> Emitter<'m> {
         }
     }
 
+    /// If `args` is `get`/`get0`'s `[container, index]` pair and `container`
+    /// resolves (one `(%ref self x)` hop, [`Emitter::resolve_ref_one`]) to a
+    /// literal `tuple(...)` call with a literal-integer `index`, return the
+    /// projected element's [`NodeId`]. The determiniser builds a
+    /// `tuple(value, advanced_rng)` for a DESTRUCTURED `rand` (spec §07's full
+    /// `(value, new_rstate)` contract) and then projects it with the parser's
+    /// 1-based `get(_, 1)`/`get(_, 2)` (or a user's 0-based `get0`); this lets
+    /// [`Emitter::lower_node`] follow that projection straight to the element
+    /// (itself a `get0(builtin_sample, j)`), so a chained `rand` resolves
+    /// value/advanced-key through the tuple without a tensor `get`. `None`
+    /// when `container` is not a tuple literal (the caller then tries
+    /// [`Emitter::sample_tuple_slot`], else the ordinary tensor `get`).
+    fn tuple_projection(&self, args: &[NodeId], base: i64) -> Option<NodeId> {
+        let [container, index] = <[NodeId; 2]>::try_from(args).ok()?;
+        let resolved = self.resolve_ref_one(container);
+        let elems = match self.m.node(resolved) {
+            Node::Call(c) => match c.head {
+                CallHead::Builtin(sym) if self.m.resolve(sym) == "tuple" => &c.args,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let selector = match self.m.node(index) {
+            Node::Lit(Scalar::Int(i)) => *i,
+            _ => return None,
+        };
+        let idx = selector - base;
+        if idx < 0 || idx as usize >= elems.len() {
+            return None;
+        }
+        Some(elems[idx as usize])
+    }
+
     /// Resolve `id` through at most one level of `(%ref self x)` indirection
     /// (mirroring [`Emitter::lower_ref`]'s `SelfMod` case, and the
     /// determinizer's own `resolve_ref_one`: a shared latent's
@@ -1136,21 +1308,39 @@ impl<'m> Emitter<'m> {
                     } else if name == "builtin_sample" {
                         crate::registry::lower_sample(self, id, &call.args)
                     } else if matches!(name.as_str(), "get0" | "get") {
-                        // `get0(builtin_sample(...), 0)` / `get((%ref self
-                        // <shared-latent>), 1)`: a projection of a sampled
-                        // `(value, new_rngstate)` tuple, not a real rank-1
-                        // tensor — see `Emitter::sample_tuple_slot`'s doc
-                        // comment. Anything else (the ordinary case) falls
-                        // through to `ops::lower_builtin`'s generic
-                        // rank-1-tensor `get`/`get0`.
+                        // `get0(builtin_sample(...), k)` / `get((%ref self
+                        // <shared-latent>), k)`: a projection of a sampled
+                        // `(value, new_rngstate)` pair (slot 0 = drawn value,
+                        // slot 1 = advanced rng key), or a `get`/`get0` of a
+                        // `tuple(value, advanced_rng)` the determiniser built
+                        // for a destructured `rand` — neither is a real rank-1
+                        // tensor. See `Emitter::sample_tuple_slot` /
+                        // `Emitter::tuple_projection`. Anything else (the
+                        // ordinary case) falls through to `ops::lower_builtin`'s
+                        // generic rank-1-tensor `get`/`get0`.
                         let base = if name == "get0" { 0 } else { 1 };
+                        if let Some(elem) = self.tuple_projection(&call.args, base) {
+                            return self.lower_node(elem);
+                        }
                         match self.sample_tuple_slot(&call.args, base) {
                             Some(0) => self.lower_node(call.args[0]),
+                            Some(1) => {
+                                // Advanced rng key: lower the sample first
+                                // (populating `sample_keys` — a `get0(_, 1)` may
+                                // be visited before its `get0(_, 0)`), then read
+                                // the recorded key.
+                                let sample_node = self.resolve_ref_one(call.args[0]);
+                                self.lower_node(call.args[0])?;
+                                self.sample_key(sample_node).ok_or_else(|| {
+                                    EmitError::at(
+                                        id,
+                                        "advanced rng key not recorded for this sample",
+                                    )
+                                })
+                            }
                             Some(_) => Err(EmitError::at(
                                 id,
-                                "sampled rng state has no tensor form (this vertical is \
-                                 XLA-seeded: stablehlo.rng takes no explicit rng key, so the \
-                                 threaded rng-state slot of a sampled tuple is never lowered)",
+                                "sample tuple has only slots 0 (value) and 1 (rng)",
                             )),
                             None => crate::ops::lower_builtin(self, id, &name, &call.args),
                         }
@@ -1199,17 +1389,35 @@ impl<'m> Emitter<'m> {
     // ---- module assembly ----------------------------------------------------
 
     /// Wrap the accumulated body in `module { func.func @{name}(<args>) ->
-    /// {ret.ty} { <body> return {ret.ssa} : {ret.ty} } }`, 2-space indented
-    /// per nesting level (mirroring `flatppl_flatpir::writer`'s
-    /// canonical-text formatting style).
-    pub fn finish(self, func_name: &str, args: &[(String, MlirTy)], ret: &Value) -> String {
+    /// <ret-tys> { <body> return <ret-ssas> : <ret-tys> } }`, 2-space indented
+    /// per nesting level (mirroring `flatppl_flatpir::writer`'s canonical-text
+    /// formatting style).
+    ///
+    /// `rets` is a slice so this serves both the single-result `@logdensity`
+    /// output and the multi-result `@sample` `(value, new_key)` ABI (and
+    /// buffy #107's record-output `@sample` later). A single-element slice
+    /// renders `-> T` / `return %x : T` (no parenthesized tuple), byte-for-byte
+    /// identical to the previous single-`ret` output; two-or-more render the
+    /// parenthesized result-type list and comma-joined return.
+    pub fn finish(self, func_name: &str, args: &[(String, MlirTy)], rets: &[&Value]) -> String {
         let dtype = self.dtype;
         let arg_list = args
             .iter()
             .map(|(name, ty)| format!("{name}: {}", ty.render(dtype)))
             .collect::<Vec<_>>()
             .join(", ");
-        let ret_ty_text = ret.ty.render(dtype);
+        let ret_tys: Vec<String> = rets.iter().map(|r| r.ty.render(dtype)).collect();
+        let ret_tys_joined = ret_tys.join(", ");
+        let ret_ty_text = if ret_tys.len() == 1 {
+            ret_tys_joined.clone()
+        } else {
+            format!("({ret_tys_joined})")
+        };
+        let ret_ssas = rets
+            .iter()
+            .map(|r| r.ssa.clone())
+            .collect::<Vec<_>>()
+            .join(", ");
 
         let mut out = String::from("module {\n");
         out.push_str(&format!(
@@ -1220,7 +1428,7 @@ impl<'m> Emitter<'m> {
             out.push_str(line);
             out.push('\n');
         }
-        out.push_str(&format!("    return {} : {ret_ty_text}\n", ret.ssa));
+        out.push_str(&format!("    return {ret_ssas} : {ret_tys_joined}\n"));
         out.push_str("  }\n");
         out.push_str("}\n");
         out
@@ -1262,5 +1470,31 @@ fn render_i1(ty: &MlirTy) -> String {
         }
         MlirTy::Tuple(_) => panic!("compare/select over a tuple type has no i1 rendering"),
         MlirTy::Key => panic!("compare/select over an rng key has no i1 rendering"),
+    }
+}
+
+/// Render `ty`'s shape as a `ui32`-element MLIR tensor type — the raw-bits
+/// tensor `stablehlo.rng_bit_generator` produces (spec §07 rng ABI). `MlirTy`
+/// carries no element dtype, and `ui32` is never this emitter's float dtype,
+/// so — exactly like [`render_i1`] — this dtype-independent render is done
+/// locally rather than through `MlirTy::render`.
+fn render_ui32(ty: &MlirTy) -> String {
+    match ty {
+        MlirTy::Scalar => "tensor<ui32>".to_string(),
+        MlirTy::Ranked(dims) => {
+            let mut out = String::from("tensor<");
+            for dim in dims {
+                match dim {
+                    Some(n) => out.push_str(&n.to_string()),
+                    None => panic!("rng bits over a dynamic dimension has no static ui32 form"),
+                }
+                out.push('x');
+            }
+            out.push_str("ui32");
+            out.push('>');
+            out
+        }
+        MlirTy::Tuple(_) => panic!("rng bits over a tuple type have no ui32 rendering"),
+        MlirTy::Key => panic!("rng bits over an rng key have no ui32 rendering"),
     }
 }

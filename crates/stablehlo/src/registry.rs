@@ -386,13 +386,13 @@ pub(crate) fn lower_logdensityof(
 
 /// `builtin_sample(rng, ctor, kernel_input)` (`flatppl_determinizer::sample`'s
 /// `build_sample_term`/`lower_shared_record_sample`): `rng` is the threaded
-/// RNG-state argument — deliberately UNUSED (bound as `_rng` below): this
-/// vertical lowers to `stablehlo.rng`, which is XLA-seeded and takes no
-/// explicit rng key, so there is nothing to lower it to (spec §07's
-/// `builtin_sample` returns a `(value, new_rngstate)` pair; the advanced
-/// rng-state half has no tensor form here either — see
-/// `Emitter::sample_tuple_slot`'s doc comment for how a `get0(_, 1)`
-/// projection of it is refused rather than mis-lowered). `ctor` is a bare
+/// RNG-state argument (spec §07 rng ABI). It is lowered to the current key and
+/// [`Emitter::set_cur_key`]-seeded BEFORE the distribution builder runs, so
+/// every `Emitter::rng` draw the builder makes advances from it; after the
+/// builder, the advanced key ([`Emitter::cur_key`]) is recorded on this node
+/// ([`Emitter::record_sample_key`]) so a `get0(sample, 1)`/`get(sample, 2)`
+/// projection can thread it onward (the `(value, new_rngstate)` pair's second
+/// slot — see the `get0/get` arm in `emitter.rs`). `ctor` is a bare
 /// `Const(ctor)` distribution constructor symbol, `kernel_input` its kwargs
 /// record — otherwise the same shape as [`lower_logdensityof`]'s `kernel`/
 /// `kernel_input`. Dispatches to `lookup(ctor).sample`, refusing precisely
@@ -403,7 +403,7 @@ pub(crate) fn lower_sample(
     id: NodeId,
     args: &[NodeId],
 ) -> Result<Value, EmitError> {
-    let [_rng, ctor, kernel_input] = <[NodeId; 3]>::try_from(args).map_err(|_| {
+    let [rng, ctor, kernel_input] = <[NodeId; 3]>::try_from(args).map_err(|_| {
         EmitError::at(
             id,
             format!("builtin_sample: expected 3 arguments, got {}", args.len()),
@@ -425,11 +425,23 @@ pub(crate) fn lower_sample(
         .sample
         .ok_or_else(|| EmitError::at(id, format!("no @sample lowering for '{ctor_name}'")))?;
 
+    // Seed the threaded key from this sample's rng arg (the source sample's
+    // arg is pre-bound to `%key` by `modes::emit_sample`; a chained sample's
+    // resolves to the previous sample's recorded advanced key).
+    let key = e.lower_node(rng)?;
+    e.set_cur_key(key);
+
     let params = Params {
         kernel_input,
         variate: None,
     };
-    sample(e, &params)
+    let value = sample(e, &params)?;
+
+    // The builder advanced the key via `Emitter::rng`; record it for this
+    // node's advanced-rng slot.
+    let advanced = e.cur_key();
+    e.record_sample_key(id, advanced);
+    Ok(value)
 }
 
 // ---- §08 Normal -------------------------------------------------------------
