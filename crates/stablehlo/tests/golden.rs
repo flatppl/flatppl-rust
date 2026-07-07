@@ -5950,6 +5950,113 @@ fn builtin_sample_refuses_lkj_cholesky_without_sample_builder() {
     assert_eq!(err.node, Some(node));
 }
 
+// ---- rng-threaded rand: chained @sample regression golden ------------------
+//
+// Two SEPARATE destructured `rand`s where the second consumes the first's
+// advanced rng (`crates/determinizer/tests/sample_golden.rs`'s
+// `chained_rand_threads_advanced_rng_not_source`, minus the record wrapping —
+// bare `lawof(x)` destructures the same way, see `lower_measure_sample`'s
+// "draw" dispatch arm). Guards the threaded-key ABI (Tasks 6-7) against a
+// regression where the second sample re-reads the source `%key` instead of
+// the first sample's advanced state.
+const CHAINED_RAND_SAMPLE_SRC: &str = "\
+s = rnginit(0)
+x = draw(Normal(mu = 0.0, sigma = 1.0))
+y = draw(Normal(mu = 1.0, sigma = 1.0))
+d1, s2 = rand(s, lawof(x))
+d2, s3 = rand(s2, lawof(y))
+out = d2
+";
+
+/// Freeze the exact emitted text: any drift (op count, ordering, key
+/// threading, arg naming) must be a deliberate, reviewed change to this
+/// golden file.
+#[test]
+fn emit_sample_chained_rand_matches_frozen_golden() {
+    let d = determinize_src(CHAINED_RAND_SAMPLE_SRC);
+    let out = emit_sample(&d);
+    let golden = include_str!("goldens/chained_rand_sample.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted chained @sample drifted from the frozen golden (tests/goldens/chained_rand_sample.mlir)"
+    );
+}
+
+/// The structural threading guarantee the golden above freezes textually:
+/// TWO `rng_bit_generator` draws (one per `rand`), and the SECOND's key
+/// operand is the FIRST's advanced `%state` result — not the original
+/// `%key` func argument — which is what proves the chain actually threads
+/// rather than each sample independently reading the source key. The
+/// `func.func` also returns that same advanced state as its final key
+/// result (spec §07: `@sample` returns the LAST advanced rngstate).
+#[test]
+fn emit_sample_chained_rand_second_draw_consumes_first_advanced_key() {
+    let d = determinize_src(CHAINED_RAND_SAMPLE_SRC);
+    let out = emit_sample(&d);
+
+    let gens: Vec<&str> = out
+        .lines()
+        .filter(|l| l.contains("stablehlo.rng_bit_generator"))
+        .collect();
+    assert_eq!(
+        gens.len(),
+        2,
+        "expected exactly two threaded rng_bit_generator draws, in:\n{out}"
+    );
+
+    // `%state, %bits = stablehlo.rng_bit_generator %keyoperand, algorithm = ...`
+    // — the key operand is the token right after the op name.
+    fn key_operand(line: &str) -> &str {
+        line.split("stablehlo.rng_bit_generator ")
+            .nth(1)
+            .unwrap()
+            .split(',')
+            .next()
+            .unwrap()
+    }
+    // `%state, %bits = stablehlo.rng_bit_generator ...` — the state result is
+    // the first of the two comma-separated SSA names before `=`.
+    fn state_result(line: &str) -> &str {
+        line.trim_start()
+            .split(" =")
+            .next()
+            .unwrap()
+            .split(',')
+            .next()
+            .unwrap()
+            .trim()
+    }
+
+    assert_eq!(
+        key_operand(gens[0]),
+        "%key",
+        "first draw must consume the source %key, in:\n{out}"
+    );
+    let first_state = state_result(gens[0]);
+    let second_key_operand = key_operand(gens[1]);
+    assert_eq!(
+        second_key_operand, first_state,
+        "second draw must consume the FIRST draw's advanced state, not the \
+         source %key, in:\n{out}"
+    );
+    assert_ne!(
+        second_key_operand, "%key",
+        "second draw must NOT re-read the source %key, in:\n{out}"
+    );
+
+    // The func's final key result is the SECOND (last) draw's advanced state.
+    let return_line = out
+        .lines()
+        .find(|l| l.trim_start().starts_with("return"))
+        .expect("missing return");
+    let second_state = state_result(gens[1]);
+    assert!(
+        return_line.contains(second_state),
+        "return must thread out the LAST draw's advanced key ({second_state}), in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
 /// `PoissonProcess` (spec §08) is never registered at all — no
 /// `@logdensity` builder either, so it hits the SAME `registry::lookup` miss
 /// [`builtin_sample_refuses_unregistered_ctor`] exercises via `Bogus`, but
