@@ -742,6 +742,49 @@ impl<'m> Emitter<'m> {
         Value { ssa, ty: result_ty }
     }
 
+    /// Batched row-wise mat-vec: apply the shared `[d, d]` matrix `l` to every
+    /// row of `z` (`[n, d]`), yielding `[n, d]` whose row `i` is `l @ z_i` —
+    /// the fanned MvNormal transform (Task 10b: `mu + L·z` over `n` independent
+    /// standard-normal rows at once). Equal to `z @ lᵀ`: `result[i, j] = Σ_k
+    /// z[i, k] · l[j, k] = (l @ z_i)[j]`, so it contracts `z`'s trailing dim
+    /// against `l`'s TRAILING dim (`lᵀ`) — `stablehlo.dot_general`'s pretty form
+    /// with `contracting_dims = [1] x [1]` (cf. [`Emitter::matvec`]'s `[1] x
+    /// [0]` for the un-batched `l @ z`). The result takes `z`'s leading dim
+    /// (`[n]`) then `l`'s leading dim (`[d]`). Panics on bad ranks / a
+    /// contracting-dim mismatch (an internal invariant violation, mirroring
+    /// [`Emitter::matvec`]).
+    pub fn batched_row_matvec(&mut self, z: &Value, l: &Value) -> Value {
+        let z_dims = match &z.ty {
+            MlirTy::Ranked(dims) if dims.len() == 2 => dims.clone(),
+            other => {
+                panic!("batched_row_matvec expects a rank-2 (batch) lhs operand, got {other:?}")
+            }
+        };
+        let l_dims = match &l.ty {
+            MlirTy::Ranked(dims) if dims.len() == 2 => dims.clone(),
+            other => {
+                panic!("batched_row_matvec expects a rank-2 (matrix) rhs operand, got {other:?}")
+            }
+        };
+        if z_dims[1] != l_dims[1] {
+            panic!(
+                "batched_row_matvec: lhs trailing dim {:?} does not match rhs trailing dim {:?}",
+                z_dims[1], l_dims[1]
+            );
+        }
+
+        let ssa = self.fresh();
+        let z_ty = z.ty.render(self.dtype);
+        let l_ty = l.ty.render(self.dtype);
+        let result_ty = MlirTy::Ranked(vec![z_dims[0], l_dims[0]]);
+        let result_ty_text = result_ty.render(self.dtype);
+        self.push(&format!(
+            "{ssa} = stablehlo.dot_general {}, {}, contracting_dims = [1] x [1], precision = [DEFAULT, DEFAULT] : ({z_ty}, {l_ty}) -> {result_ty_text}",
+            z.ssa, l.ssa
+        ));
+        Value { ssa, ty: result_ty }
+    }
+
     /// Solve the lower-triangular system `l @ y = b` for `y`, via
     /// `stablehlo.triangular_solve` (`l: [n, n]`, `b: [n, k]` -> `y: [n,
     /// k]`). `b` must be a rank-2 MATRIX right-hand side — the real

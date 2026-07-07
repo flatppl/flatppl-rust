@@ -6343,10 +6343,95 @@ fn emit_sample_iid_gamma_reducers_fan_out() {
     }
 }
 
-/// Fan-out for a VECTOR-variate sampler (Dirichlet draws a whole vector per
-/// draw — batched multivariate is Task 10b) is out of scope and must REFUSE,
-/// not mislower. (It refuses whether the determiniser or the emitter catches
-/// it first; either way `emit` errors rather than producing a wrong lowering.)
+// ---- Task 10b: fan-out Tier 2 (batched multivariate — MvNormal) -------------
+//
+// A fanned `iid(MvNormal(mu, cov), n)` draws `n` iid `d`-vectors as a rank-2
+// `[n, d]` batch: ONE `stablehlo.cholesky` on the shared `[d, d]` cov, ONE
+// `rng_bit_generator` advance sized to `[n, d]` (a genuine `tensor<n×d>` draw —
+// the n rows are independent, NOT a `[d]` draw broadcast across n), and the
+// row-wise affine `mu + L·z_i` for all rows as a batched `dot_general`
+// (`z · Lᵀ`, `contracting_dims = [1] x [1]`), with `mu` broadcast across the
+// rows (`broadcast_in_dim dims = [1]`). The frozen golden below is
+// parse-validated against the real StableHLO parser (jax 0.10.2). The scalar
+// MvNormal path (`emit_sample_mvnormal_*`) is byte-identical to before.
+// Dirichlet (the other vector-variate sampler) still refuses.
+
+/// A fanned multivariate draw: `iid(MvNormal(mu, cov), 3)` at `d = 2`, with
+/// free `mu`/`cov` (so `@sample(%key, %arg0, %arg1)`).
+const MVNORMAL_IID_SAMPLE_SRC: &str = "\
+mu = elementof(cartpow(reals, 2))
+cov = elementof(cartpow(reals, [2, 2]))
+s = rnginit(0)
+xs ~ iid(MvNormal(mu = mu, cov = cov), 3)
+draws = rand(s, lawof(xs))
+";
+
+/// The batched MvNormal draw returns a `tensor<3x2xf32>` (`[n, d]`, not a bare
+/// `[d]` vector) alongside the advanced key, via exactly ONE
+/// `stablehlo.cholesky` and ONE `rng_bit_generator` sized to the `[3, 2]` batch
+/// (row-independence), plus the batched affine (`dot_general` + `mu`
+/// broadcast).
+#[test]
+fn emit_sample_mvnormal_iid_has_expected_structure() {
+    let d = determinize_src(MVNORMAL_IID_SAMPLE_SRC);
+    let out = emit_sample(&d);
+
+    assert!(
+        out.contains(
+            "func.func @sample(%key: tensor<2xui64>, %arg0: tensor<2xf32>, %arg1: tensor<2x2xf32>)"
+        ),
+        "mu/cov must become vector/matrix func args after %key, in:\n{out}"
+    );
+    assert!(
+        out.contains("-> (tensor<3x2xf32>, tensor<2xui64>)"),
+        "fanned MvNormal must return the [3, 2] batch + advanced key, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.cholesky").count(),
+        1,
+        "one shared cholesky on the [2, 2] cov, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.rng_bit_generator").count(),
+        1,
+        "one rng_bit_generator advance for the whole [3, 2] batch, in:\n{out}"
+    );
+    assert!(
+        out.contains("-> (tensor<2xui64>, tensor<3x2xui32>)"),
+        "the single rng_bit_generator must be sized to the [3, 2] batch (a genuine tensor<3x2> draw, not a [2] broadcast), in:\n{out}"
+    );
+    assert!(
+        out.contains("contracting_dims = [1] x [1]"),
+        "the row-wise L·z affine must be a batched dot_general (z · Lᵀ), in:\n{out}"
+    );
+    assert!(
+        out.contains("stablehlo.broadcast_in_dim %arg0, dims = [1]"),
+        "mu must broadcast across the n rows, in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// Freeze the exact emitted text (parse-validated against the real StableHLO
+/// parser): any drift must be a deliberate, reviewed change to this golden.
+#[test]
+fn emit_sample_mvnormal_iid_matches_frozen_golden() {
+    let d = determinize_src(MVNORMAL_IID_SAMPLE_SRC);
+    let out = emit_sample(&d);
+    let golden = include_str!("goldens/mvnormal_iid_sample.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted batched-MvNormal @sample drifted from tests/goldens/mvnormal_iid_sample.mlir"
+    );
+}
+
+/// Fan-out for Dirichlet (the OTHER vector-variate sampler) still REFUSES, not
+/// mislowers: its scalar `@sample` draws `d` scalar Gammas in a Rust loop (via
+/// the scalar `draw_gamma`) and stacks them on axis 0, so fanning to `[n, d]`
+/// needs machinery beyond the Task-10a rejection batch (a rank-3 masked
+/// rejection, or a new `stablehlo.transpose` — see `FANOUT_SAFE`'s doc). MvNormal
+/// (Task 10b) is the only batched-multivariate sampler for now. (Dirichlet
+/// refuses whether the determiniser or the emitter catches it first; either way
+/// `emit` errors rather than producing a wrong lowering.)
 #[test]
 fn emit_sample_iid_dirichlet_refuses() {
     let src = "s = rnginit(0)\nxs ~ iid(Dirichlet(alpha = [1.0, 1.0, 1.0]), 4)\ndraws = rand(s, lawof(xs))\n";

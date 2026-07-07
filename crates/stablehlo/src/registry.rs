@@ -511,11 +511,26 @@ pub(crate) fn lower_sample(
 ///   auto-broadcast a scalar operand over a `[n]` batch, like
 ///   [`Emitter::binary`] already did — GeneralizedNormal's per-lane sign and
 ///   the Gamma boost need it.)
+/// - Fan-out **Tier 2 (multivariate)** — MvNormal, whose variate is itself a
+///   `d`-vector: the fanned draw is a rank-2 `[n, d]` batch of iid draws. One
+///   `rng_bit_generator` advance sized to `[n, d]` (a genuine `tensor<n×d>`
+///   draw — the n rows are independent), one shared `stablehlo.cholesky` on the
+///   `[d, d]` cov, and the row-wise affine `mu + L·z_i` for all rows as a
+///   batched [`Emitter::batched_row_matvec`] (`z · Lᵀ`), with `mu` broadcast
+///   across the rows. See [`mvnormal_sample`].
 ///
 /// Deliberately EXCLUDED (fan-out for these still refuses):
-/// - Multivariate / vector-variate samplers (MvNormal/Dirichlet): already
-///   vector-valued per draw — fanning them is a rank-2 `[n, d]` draw, Task 10b
-///   (batched multivariate), out of scope here.
+/// - Dirichlet: its scalar `@sample` ([`dirichlet_sample`]) draws `d` SCALAR
+///   Gammas in a Rust `for` loop (via the scalar [`draw_gamma`], not the
+///   batched [`draw_gamma_batched`]) and stacks them along axis 0. Fanning to
+///   `[n, d]` needs machinery beyond what the rejection batch (Task 10a) gives:
+///   either a rank-3 `[MAXITER, n, d]` masked rejection with a per-component
+///   (`[d]`) shape parameter (generalizing [`draw_gamma_batched`], which is
+///   1-D `[n]`-only, its candidate pre-draw / accept mask / [`Emitter::
+///   dynamic_slice_row`] all rank-2), or `d` separate `[n]` batched Gammas plus
+///   a NEW `stablehlo.transpose` op form to reorient the axis-0 stack
+///   `[d, n]` → `[n, d]` (the emitter has no transpose today). Refused rather
+///   than mislowered — a clean follow-up.
 /// - The discrete `while`/inverse-CDF samplers ([`draw_poisson`] /
 ///   [`draw_categorical`]): Poisson/NegativeBinomial/NegativeBinomial2/
 ///   Binomial/Multinomial/Categorical/Categorical0/Bernoulli/Geometric — not
@@ -542,6 +557,8 @@ const FANOUT_SAFE: &[&str] = &[
     "InverseGamma",
     "Beta",
     "GeneralizedNormal",
+    // Tier 2 (batched multivariate — mvnormal_sample)
+    "MvNormal",
 ];
 
 // ---- §08 Normal -------------------------------------------------------------
@@ -1775,18 +1792,46 @@ fn mvnormal_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
     let mu = e.lower_node(mu_id)?;
     let cov_id = p.field_id(e, "cov")?;
     let cov = e.lower_node(cov_id)?;
-    let n = static_vector_len(mu_id, &mu)?;
-    require_square_cov(cov_id, &cov, n)?;
+    let d = static_vector_len(mu_id, &mu)?;
+    require_square_cov(cov_id, &cov, d)?;
 
+    // Cholesky ONCE on the `[d, d]` cov, shared across every draw (scalar or
+    // fanned): `L` is a deterministic function of `cov`, not of the rng.
     let l = e.cholesky(&cov);
 
     let zero = e.scalar(0.0);
     let one = e.scalar(1.0);
-    let vec_ty = MlirTy::Ranked(vec![Some(n)]);
-    let z = e.rng("NORMAL", &zero, &one, &vec_ty);
+    let vec_ty = MlirTy::Ranked(vec![Some(d)]);
 
-    let l_z = e.matvec(&l, &z);
-    Ok(e.add(&mu, &l_z))
+    match e.batch_shape() {
+        // Scalar MvNormal — UNCHANGED (byte-identical to the pre-Task-10b path):
+        // draw one `[d]` standard normal `z`, return `mu + L·z`.
+        None => {
+            let z = e.rng("NORMAL", &zero, &one, &vec_ty);
+            let l_z = e.matvec(&l, &z);
+            Ok(e.add(&mu, &l_z))
+        }
+        // Fanned iid `[n, d]` (Task 10b): `n` independent draws of the whole
+        // `d`-vector. `lower_sample` set the batch shape to `[n]`; MvNormal's
+        // variate is itself a `d`-vector, so the draw is a rank-2 `[n, d]`.
+        Some(batch) => {
+            let n = batch[0];
+            let batch_ty = MlirTy::Ranked(vec![Some(n), Some(d)]);
+            // One `rng_bit_generator` advance sized to `[n, d]` — a GENUINE
+            // `tensor<n×d>` draw (each of the n·d elements is a distinct rng
+            // bit, so the n rows are independent), NOT a `[d]` draw broadcast
+            // across n. `Emitter::rng` sizes to the batch shape, so widen it to
+            // `[n, d]` for the draw, then restore `lower_sample`'s `[n]`.
+            e.set_batch_shape(vec![n, d]);
+            let z = e.rng("NORMAL", &zero, &one, &vec_ty);
+            e.set_batch_shape(vec![n]);
+            // Row-wise `L·z_i` for all rows = `z · Lᵀ` → `[n, d]`.
+            let l_z = e.batched_row_matvec(&z, &l);
+            // `mu` (a `[d]` vector) broadcasts across the `n` rows → `[n, d]`.
+            let mu_bc = e.broadcast_in_dim(&mu, &[1], batch_ty);
+            Ok(e.add(&mu_bc, &l_z))
+        }
+    }
 }
 
 /// §08 Dirichlet, verbatim: `log f = lgamma(sum(alpha)) - sum(lgamma(alpha))
