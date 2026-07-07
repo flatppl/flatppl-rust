@@ -18,8 +18,8 @@
 //! [`lower_measure_sample`]'s single `resolve_ref_one` call, mirroring
 //! `density::lower_measure_density`'s dispatch.
 use crate::density::{
-    build_call, build_record, builtin_name, draw_argument, expect_builtin_call, refuse,
-    resolve_ref_one, split_kernel_constructor,
+    build_call, build_record, builtin_name, draw_argument, expect_builtin_call, iid_static_size,
+    refuse, resolve_ref_one, split_kernel_constructor,
 };
 use crate::refuse::RefuseError;
 use flatppl_core::{
@@ -316,6 +316,36 @@ fn lower_draw(
     if let Some(err) = classify_intractable_or_deferred(m, inner_resolved) {
         return Err(err);
     }
+    // Fan-out: `draw(iid(K, n))` with a FIXED kernel `K` and a static length `n`
+    // → ONE batched `builtin_sample(rng, ctor, input, n)` (spec §07
+    // measure-eval-prims: `builtin_sample`'s size-dims form returns an IID array
+    // `X` of size `n` with a SINGLE advanced `new_rngstate`, not one per
+    // element). `split_iid` only matches the `iid(K, n)` shape itself;
+    // `split_constructor` below is what rejects a kernel that is not a bare
+    // built-in constructor call — in particular a `broadcast(K, arr0, arr1, …)`
+    // kernel (an array-of-kernels measure with DIFFERING per-element params,
+    // §04 broadcasting) has positional args, so it is refused here rather than
+    // mislowered as a fixed-kernel fan-out.
+    if let Some((kernel, iid_node)) = split_iid(m, inner_measure) {
+        let n = iid_static_size(m, iid_node).ok_or_else(|| {
+            refuse(
+                iid_node,
+                m,
+                "iid sample length is not a statically-resolved 1-D count (dynamic, \
+                 multi-axis, or unresolved domain); only a 1-D static fan-out is built",
+            )
+        })?;
+        let (ctor, kernel_input) = split_constructor(m, kernel).ok_or_else(|| {
+            refuse(
+                kernel,
+                m,
+                "iid sample: inner kernel must be a built-in constructor (a broadcast/\
+                 array-of-kernels measure has differing per-element params — not a \
+                 fixed-kernel fan-out; refuse rather than mislower)",
+            )
+        })?;
+        return Ok(build_iid_sample_term(m, ctor, kernel_input, n, rng));
+    }
     let (ctor, kernel_input) = split_constructor(m, inner_measure).ok_or_else(|| {
         refuse(
             inner_measure,
@@ -324,6 +354,18 @@ fn lower_draw(
         )
     })?;
     Ok(build_sample_term(m, ctor, kernel_input, rng))
+}
+
+/// `iid(K, n)` → `(K, iid_node)`, resolving one level of ref indirection first
+/// (mirroring `split_constructor`'s convention). The repeat count is read from
+/// `iid_node`'s own inferred domain shape by `density::iid_static_size` — NOT
+/// the raw `n` argument here — since a shape-dependent size (`lengthof(obs)`,
+/// arithmetic, …) is already const-folded onto the type (see that function's
+/// doc); callers pass `iid_node` straight to it.
+fn split_iid(m: &Module, measure: NodeId) -> Option<(NodeId, NodeId)> {
+    let (resolved, _) = resolve_ref_one(m, measure);
+    let c = expect_builtin_call(m, resolved, "iid")?;
+    (c.args.len() == 2).then_some((c.args[0], resolved))
 }
 
 /// A primitive constructor call `Normal(mu=…, sigma=…)` → (ctor Const node,
@@ -353,6 +395,27 @@ fn build_sample_term(
     rng: NodeId,
 ) -> (NodeId, NodeId) {
     let sample = build_call(m, "builtin_sample", &[rng, ctor, kernel_input]);
+    let zero = m.alloc(Node::Lit(Scalar::Int(0)));
+    let one = m.alloc(Node::Lit(Scalar::Int(1)));
+    let value = build_call(m, "get0", &[sample, zero]);
+    let new_rng = build_call(m, "get0", &[sample, one]);
+    (value, new_rng)
+}
+
+/// Emit `builtin_sample(rng, ctor, kernel_input, n)` → `(get0(sample, 0)` = the
+/// length-`n` IID array, `get0(sample, 1)` = new rng`)` — the spec §07
+/// size-dims form of `builtin_sample`: ONE call over the fixed kernel
+/// `ctor(kernel_input)` produces `n` iid draws and ONE advanced rngstate
+/// (mirrors [`build_sample_term`]'s single-draw shape, plus the trailing `n`).
+fn build_iid_sample_term(
+    m: &mut Module,
+    ctor: NodeId,
+    kernel_input: NodeId,
+    n: usize,
+    rng: NodeId,
+) -> (NodeId, NodeId) {
+    let n_lit = m.alloc(Node::Lit(Scalar::Int(n as i64)));
+    let sample = build_call(m, "builtin_sample", &[rng, ctor, kernel_input, n_lit]);
     let zero = m.alloc(Node::Lit(Scalar::Int(0)));
     let one = m.alloc(Node::Lit(Scalar::Int(1)));
     let value = build_call(m, "get0", &[sample, zero]);

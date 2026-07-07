@@ -391,3 +391,84 @@ out = record(v = v, w = w)";
         "__0x1 (the tuple s2 projects from) is seeded from the raw source rng `s`:\n{pir}"
     );
 }
+
+// `draw(iid(K, n))` with a FIXED kernel `K` and a STATIC length `n` fans out to
+// ONE batched `builtin_sample(rng, ctor, input, n)` — the spec §07
+// measure-eval-prims size-dims form: a SINGLE call over the fixed kernel
+// produces the length-`n` iid array and ONE advanced rngstate, not one
+// `builtin_sample` per element. The writer has no common-subexpression
+// sharing (see `lower_shared_record_sample`'s doc), so the ONE logical sample
+// node re-expands textually at each `get0` projection (value slot, rng
+// slot) — hence the substring count below is 2, not 1, exactly like the
+// existing single-scalar destructured-rand goldens.
+#[test]
+fn iid_fixed_kernel_sample_fans_out() {
+    let src = "\
+s = rnginit(0)
+xs ~ iid(Normal(mu = 0.0, sigma = 1.0), 10)
+draws, s2 = rand(s, lawof(xs))
+out = draws";
+    let m = parse_infer(src);
+    let out = determinize(&m).expect("iid(K,n) sample must fan out to one builtin_sample");
+    let pir = flatppl_flatpir::write(&out);
+    assert_eq!(
+        pir.matches("builtin_sample").count(),
+        2,
+        "the single iid fan-out sample re-expands at each get0 projection (no CSE in \
+         the writer):\n{pir}"
+    );
+    assert!(
+        pir.contains("(builtin_sample (%ref self s) Normal"),
+        "expected a Normal builtin_sample seeded by the source rng:\n{pir}"
+    );
+    assert!(
+        pir.contains("1.0))) 10))"),
+        "expected the size dim 10 as builtin_sample's trailing arg, right after the \
+         kernel_input record:\n{pir}"
+    );
+    assert!(
+        !pir.contains("(draw ")
+            && !pir.contains("(iid ")
+            && !pir.contains("(lawof ")
+            && !pir.contains("(rand "),
+        "measure/sample-surface layer eliminated:\n{pir}"
+    );
+    assert!(
+        flatppl_determinizer::is_flatpdl(&out).is_ok(),
+        "must be FlatPDL:\n{pir}"
+    );
+}
+
+// A genuinely non-static `n` (an `external` count) has no compile-time length
+// to unroll/batch by — refuse rather than guess a size (refuse-don't-mislower),
+// mirroring `density::iid_dynamic_size_refuses`'s density-side counterpart.
+#[test]
+fn iid_nonstatic_n_sample_refuses() {
+    let src = "\
+s = rnginit(0)
+n = external(posintegers)
+xs ~ iid(Normal(mu = 0.0, sigma = 1.0), n)
+draws, s2 = rand(s, lawof(xs))
+out = draws";
+    let m = parse_infer(src);
+    determinize(&m).expect_err("non-static iid length must refuse rather than mislower");
+}
+
+// `draw(iid(broadcast(Normal, mus, 1.0), n))` — a per-element-differing-params
+// kernel (Tier 3, spec §04 broadcasting: an array-of-kernels measure, NOT a
+// fixed kernel) — must refuse rather than be silently fanned out as if every
+// row drew from the SAME kernel input. `split_constructor` rejects the
+// `broadcast(...)` head (it carries positional args, so it is not a bare
+// built-in constructor call), which is what turns this into a refusal.
+#[test]
+fn iid_broadcast_kernel_sample_refuses() {
+    let src = "\
+s = rnginit(0)
+mus = [0.0, 1.0, 2.0]
+xs ~ iid(broadcast(Normal, mus, 1.0), 3)
+draws, s2 = rand(s, lawof(xs))
+out = draws";
+    let m = parse_infer(src);
+    determinize(&m)
+        .expect_err("iid over a broadcast (differing per-element params) kernel must refuse");
+}
