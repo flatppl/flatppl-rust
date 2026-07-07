@@ -129,6 +129,22 @@ fn mlir_type_of_tvector_renders_ranked_tensor() {
 }
 
 #[test]
+fn rngstate_maps_to_key_type() {
+    // The rng-state key tensor (spec §07 rng ABI) is a fixed `ui64` type,
+    // independent of `Dtype` — unlike every other `Type::Scalar`/`Array`
+    // mapping in this file, `MlirTy::Key`'s rendering must NOT vary with the
+    // emitter's f32/f64 element dtype.
+    assert_eq!(MlirTy::Key.render(Dtype::F32), "tensor<2xui64>");
+    assert_eq!(MlirTy::Key.render(Dtype::F64), "tensor<2xui64>");
+
+    let mut m = Module::new();
+    let id = placeholder(&mut m, Type::RngState);
+    let ty = mlir_type_of(&m, id, Dtype::F32).unwrap();
+    assert_eq!(ty, MlirTy::Key);
+    assert_eq!(ty.render(Dtype::F64), "tensor<2xui64>");
+}
+
+#[test]
 fn mlir_type_of_dtype_is_configurable_not_hardcoded() {
     let mut m = Module::new();
     let id = placeholder(&mut m, Type::Scalar(ScalarType::Real));
@@ -167,14 +183,15 @@ fn mlir_type_of_refuses_residual_measure_layer_types() {
 
 #[test]
 fn mlir_type_of_refuses_other_types_naming_the_type() {
-    // `RngState` hits the catch-all arm (neither aggregate nor
-    // measure-layer) — the refusal must name the offending type via its
-    // `Debug` form, not just say "no MLIR tensor form" with no detail.
+    // `Module` hits the catch-all arm (neither aggregate nor measure-layer,
+    // and not `RngState` — which now maps to `MlirTy::Key`) — the refusal
+    // must name the offending type via its `Debug` form, not just say "no
+    // MLIR tensor form" with no detail.
     let mut m = Module::new();
-    let id = placeholder(&mut m, Type::RngState);
+    let id = placeholder(&mut m, Type::Module);
     let err = mlir_type_of(&m, id, Dtype::F32).unwrap_err();
     assert!(err.msg.contains("type has no MLIR tensor form"));
-    assert!(err.msg.contains("RngState"));
+    assert!(err.msg.contains("Module"));
     assert_eq!(err.node, Some(id));
 }
 

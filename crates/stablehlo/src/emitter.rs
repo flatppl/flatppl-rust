@@ -375,6 +375,7 @@ impl<'m> Emitter<'m> {
             MlirTy::Scalar => Vec::new(),
             MlirTy::Ranked(dims) => dims.clone(),
             MlirTy::Tuple(_) => panic!("vector: tuple elements have no tensor form"),
+            MlirTy::Key => panic!("vector: an rng key has no tensor form to stack"),
         };
         let stacked_elem_ty = {
             let mut dims = Vec::with_capacity(inner_dims.len() + 1);
@@ -457,6 +458,7 @@ impl<'m> Emitter<'m> {
             MlirTy::Scalar => 0,
             MlirTy::Ranked(dims) => dims.len(),
             MlirTy::Tuple(_) => panic!("reduce over a tuple type has no lowering"),
+            MlirTy::Key => panic!("reduce over an rng key has no lowering"),
         };
         let mut cur = a.clone();
         for _ in 0..rank {
@@ -681,6 +683,7 @@ impl<'m> Emitter<'m> {
                 })
                 .collect(),
             MlirTy::Tuple(_) => panic!("rng: tuple output type has no shape-constant form"),
+            MlirTy::Key => panic!("rng: an rng key output type has no shape-constant form"),
         };
         let shape_ty_text = format!("tensor<{}xi64>", dims.len());
         let shape_lit = match dims.len() {
@@ -1258,5 +1261,6 @@ fn render_i1(ty: &MlirTy) -> String {
             out
         }
         MlirTy::Tuple(_) => panic!("compare/select over a tuple type has no i1 rendering"),
+        MlirTy::Key => panic!("compare/select over an rng key has no i1 rendering"),
     }
 }

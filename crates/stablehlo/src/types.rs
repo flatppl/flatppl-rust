@@ -43,6 +43,7 @@ pub fn mlir_type_of(m: &Module, id: NodeId, _dtype: Dtype) -> Result<MlirTy, Emi
             flatten_elem(id, elem, &mut dims)?;
             Ok(MlirTy::Ranked(dims))
         }
+        Type::RngState => Ok(MlirTy::Key),
         _ => Err(refuse_non_tensor(id, ty)),
     }
 }

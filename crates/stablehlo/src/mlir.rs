@@ -18,6 +18,9 @@ pub enum MlirTy {
     Ranked(Vec<Option<u64>>),
     /// A tuple of MLIR types (`tuple<...>`).
     Tuple(Vec<MlirTy>),
+    /// The rng-state key tensor (spec §07 rng ABI) — always `tensor<2xui64>`,
+    /// independent of [`Dtype`] (the key is never a float).
+    Key,
 }
 
 /// One SSA value: its name (`%0`, `%arg0`, …) and MLIR type.
@@ -57,6 +60,9 @@ impl MlirTy {
                 let inner: Vec<String> = parts.iter().map(|p| p.render(dtype)).collect();
                 format!("tuple<{}>", inner.join(", "))
             }
+            // Pinned in the rng-threaded-rand plan's Task-1 spike: dtype-
+            // independent, always `ui64` (never `f32`/`f64`).
+            MlirTy::Key => "tensor<2xui64>".to_string(),
         }
     }
 }
