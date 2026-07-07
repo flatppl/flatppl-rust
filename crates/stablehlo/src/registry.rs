@@ -403,12 +403,38 @@ pub(crate) fn lower_sample(
     id: NodeId,
     args: &[NodeId],
 ) -> Result<Value, EmitError> {
-    let [rng, ctor, kernel_input] = <[NodeId; 3]>::try_from(args).map_err(|_| {
-        EmitError::at(
-            id,
-            format!("builtin_sample: expected 3 arguments, got {}", args.len()),
-        )
-    })?;
+    // The scalar form is `builtin_sample(rng, ctor, kernel_input)`; the fanned
+    // iid form (spec §07 size dims) appends a trailing static count `n`,
+    // `builtin_sample(rng, ctor, kernel_input, n)` — the determiniser's
+    // `iid(K, n)` fan-out (see `flatppl_determinizer::sample`).
+    let (rng, ctor, kernel_input, batch_n) = match *args {
+        [rng, ctor, kernel_input] => (rng, ctor, kernel_input, None),
+        [rng, ctor, kernel_input, n_arg] => {
+            // Read `n` straight from the trailing literal: `infer`'s
+            // builtin_sample rule ignores the n dim (the inferred variate type
+            // is wrongly scalar), so the literal is the ONLY trustworthy source
+            // — a non-literal (or non-positive) count refuses, never guesses.
+            let n = match e.node(n_arg) {
+                Node::Lit(Scalar::Int(i)) if *i > 0 => *i as u64,
+                _ => {
+                    return Err(EmitError::at(
+                        n_arg,
+                        "builtin_sample fan-out size must be a positive integer literal",
+                    ));
+                }
+            };
+            (rng, ctor, kernel_input, Some(n))
+        }
+        _ => {
+            return Err(EmitError::at(
+                id,
+                format!(
+                    "builtin_sample: expected 3 or 4 arguments, got {}",
+                    args.len()
+                ),
+            ));
+        }
+    };
 
     let ctor_name = match e.node(ctor) {
         Node::Const(sym) => e.resolve(*sym).to_string(),
@@ -425,6 +451,22 @@ pub(crate) fn lower_sample(
         .sample
         .ok_or_else(|| EmitError::at(id, format!("no @sample lowering for '{ctor_name}'")))?;
 
+    // Fan-out (iid) is Tier 1 only: a straight-line (purely elementwise)
+    // builder draws a `[n]` batch with ONE `rng_bit_generator` advance and
+    // broadcasts its scalar params over it (see `FANOUT_SAFE`). A rejection- or
+    // multivariate-based builder cannot be batched this way (its `while` loop /
+    // matrix ops are not shape-generic over an added batch dim) — that is
+    // fan-out Tier 2, deferred; refuse here rather than mislower.
+    if batch_n.is_some() && !FANOUT_SAFE.contains(&ctor_name.as_str()) {
+        return Err(EmitError::at(
+            id,
+            format!(
+                "fan-out (iid) @sample for '{ctor_name}' not yet supported \
+                 (Tier-2: rejection/multivariate — deferred)"
+            ),
+        ));
+    }
+
     // Seed the threaded key from this sample's rng arg (the source sample's
     // arg is pre-bound to `%key` by `modes::emit_sample`; a chained sample's
     // resolves to the previous sample's recorded advanced key).
@@ -435,14 +477,53 @@ pub(crate) fn lower_sample(
         kernel_input,
         variate: None,
     };
-    let value = sample(e, &params)?;
+    // Size the draw by the batch dim for a fanned iid sample; clear it after
+    // (even on a builder error) so a later scalar sample is unaffected.
+    if let Some(n) = batch_n {
+        e.set_batch_shape(vec![n]);
+    }
+    let result = sample(e, &params);
+    e.clear_batch_shape();
+    let value = result?;
 
     // The builder advanced the key via `Emitter::rng`; record it for this
-    // node's advanced-rng slot.
+    // node's advanced-rng slot. Fan-out draws ONE `[n]` batch, so a fanned
+    // sample records exactly one advanced key too (spec §07: a size-dims
+    // builtin_sample returns one new_rngstate for the whole batch).
     let advanced = e.cur_key();
     e.record_sample_key(id, advanced);
     Ok(value)
 }
+
+/// Constructors whose `@sample` builder is purely elementwise — only
+/// [`Emitter::rng`] plus shape-preserving unary / [`Emitter::binary`] ops — so
+/// a fanned iid draw sizes one `rng_bit_generator` to the batch and broadcasts
+/// its scalar params over it (fan-out Tier 1). Confirmed by reading each
+/// builder below.
+///
+/// Deliberately EXCLUDED (fan-out for these refuses, pending Tier 2):
+/// - Rejection-loop samplers (`stablehlo.while` — [`draw_gamma`] /
+///   [`draw_poisson`] / [`draw_categorical`]): Gamma/Beta/ChiSquared/StudentT/
+///   InverseGamma/**GeneralizedNormal** (all reduce to [`draw_gamma`]),
+///   Poisson/NegativeBinomial/NegativeBinomial2, Binomial/Multinomial. A
+///   `while`'s carried-variable types are not shape-generic over an added batch
+///   dim.
+/// - Multivariate samplers (MvNormal/Dirichlet): already vector-valued.
+/// - [`laplace_sample`]: elementwise in spirit, but reaches
+///   [`Emitter::compare`]/[`Emitter::select`], which (unlike [`Emitter::binary`])
+///   do NOT auto-broadcast a scalar predicate/operand over a batch — so a
+///   fanned Laplace would shape-mismatch. Left out (refuse is safe) rather than
+///   widen the broadcast surface beyond `binary` in this task.
+const FANOUT_SAFE: &[&str] = &[
+    "Normal",
+    "Exponential",
+    "Uniform",
+    "Cauchy",
+    "Logistic",
+    "Pareto",
+    "Weibull",
+    "LogNormal",
+];
 
 // ---- §08 Normal -------------------------------------------------------------
 

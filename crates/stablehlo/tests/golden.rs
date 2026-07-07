@@ -2964,8 +2964,9 @@ fn builtin_sample_refuses_non_const_ctor() {
 }
 
 /// `builtin_sample` with the wrong number of arguments must refuse (naming
-/// the exact expected/actual count), not panic on the
-/// `<[NodeId; 3]>::try_from`.
+/// the exact expected/actual count), not panic on the arg-count match. The
+/// scalar form takes 3 args and the fanned iid form 4 (spec §07 size dims),
+/// so a 2-arg call refuses with the "3 or 4 arguments" message.
 #[test]
 fn builtin_sample_refuses_wrong_arity() {
     let mut m = Module::new();
@@ -2977,7 +2978,7 @@ fn builtin_sample_refuses_wrong_arity() {
     let err = e.lower_node(node).unwrap_err();
     assert!(
         err.msg
-            .contains("builtin_sample: expected 3 arguments, got 2"),
+            .contains("builtin_sample: expected 3 or 4 arguments, got 2"),
         "unexpected message: {}",
         err.msg
     );
@@ -6105,4 +6106,120 @@ fn builtin_sample_refuses_binned_poisson_process_unregistered() {
         err.msg
     );
     assert_eq!(err.node, Some(node));
+}
+// ---- Task 9: fan-out Tier 1 (shaped iid straight-line draws) ----------------
+//
+// A fanned `iid(K, n)` sample (fixed straight-line kernel `K`, static `n`)
+// draws `n` iid values with ONE `rng_bit_generator` advance sized to `[n]`
+// (spec §07 size dims): the determiniser emits `builtin_sample(rng, ctor,
+// input, n)` (Task 4), `lower_sample` sets a `[n]` batch shape around the
+// straight-line builder, `Emitter::rng` draws the batch, and the builder's
+// scalar params broadcast over it via `Emitter::binary`'s auto-broadcast. Both
+// goldens below are parse-validated against the real StableHLO parser
+// (jax 0.10.2). Rejection/multivariate fan-out (Tier 2) refuses here.
+
+/// A fanned scalar-Normal iid draw: `iid(Normal(mu=0, sigma=1), 4)`, sampled
+/// value-terminal (`draws = rand(s, lawof(xs))`). Fixed hyperparameters, so no
+/// free-param args beyond `%key`.
+const NORMAL_IID_SAMPLE_SRC: &str = "\
+s = rnginit(0)
+xs ~ iid(Normal(mu = 0.0, sigma = 1.0), 4)
+draws = rand(s, lawof(xs))
+";
+
+/// A fanned inverse-CDF iid draw: `iid(Exponential(rate=2), 4)` (`-log(U)/rate`).
+const EXPONENTIAL_IID_SAMPLE_SRC: &str = "\
+s = rnginit(0)
+xs ~ iid(Exponential(rate = 2.0), 4)
+draws = rand(s, lawof(xs))
+";
+
+/// The brief's Step-2 structural check: the fanned draw returns a
+/// `tensor<4xf32>` value (not a scalar) alongside the advanced key, with
+/// EXACTLY ONE `rng_bit_generator` — sized to the `[4]` batch — for the whole
+/// iid array, and the scalar params broadcast over that batch.
+#[test]
+fn emit_sample_normal_iid_has_expected_structure() {
+    let d = determinize_src(NORMAL_IID_SAMPLE_SRC);
+    let out = emit_sample(&d);
+
+    assert!(
+        out.contains("func.func @sample(%key: tensor<2xui64>)"),
+        "missing @sample(%key) (no free params) in:\n{out}"
+    );
+    assert!(
+        out.contains("-> (tensor<4xf32>, tensor<2xui64>)"),
+        "fanned draw must return the [4] batch + advanced key, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.rng_bit_generator").count(),
+        1,
+        "one rng_bit_generator advance for the whole [4] batch, in:\n{out}"
+    );
+    assert!(
+        out.contains("-> (tensor<2xui64>, tensor<4xui32>)"),
+        "the single rng_bit_generator must be sized to the [4] batch, in:\n{out}"
+    );
+    assert!(
+        out.contains("stablehlo.broadcast_in_dim"),
+        "scalar params must broadcast over the batch, in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// Freeze the exact emitted text (parse-validated against the real StableHLO
+/// parser): any drift must be a deliberate, reviewed change to this golden.
+#[test]
+fn emit_sample_normal_iid_matches_frozen_golden() {
+    let d = determinize_src(NORMAL_IID_SAMPLE_SRC);
+    let out = emit_sample(&d);
+    let golden = include_str!("goldens/normal_iid_sample.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted fanned @sample drifted from tests/goldens/normal_iid_sample.mlir"
+    );
+}
+
+/// The inverse-CDF fan-out mirror of the Normal case: `Exponential`'s
+/// `-log(U)/rate` batched to `[4]` with one rng_bit_generator advance.
+#[test]
+fn emit_sample_exponential_iid_matches_frozen_golden() {
+    let d = determinize_src(EXPONENTIAL_IID_SAMPLE_SRC);
+    let out = emit_sample(&d);
+
+    assert!(
+        out.contains("-> (tensor<4xf32>, tensor<2xui64>)"),
+        "fanned Exponential must return the [4] batch + advanced key, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.rng_bit_generator").count(),
+        1,
+        "one rng_bit_generator advance for the whole [4] batch, in:\n{out}"
+    );
+
+    let golden = include_str!("goldens/exponential_iid_sample.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted fanned @sample drifted from tests/goldens/exponential_iid_sample.mlir"
+    );
+}
+
+/// Fan-out for a rejection-based sampler (Gamma reduces to the
+/// Marsaglia–Tsang `stablehlo.while`, which is not shape-generic over a batch
+/// dim) is fan-out Tier 2 — it must REFUSE precisely, not mislower. The
+/// scalar `Gamma` sample still lowers (only the fanned form refuses).
+#[test]
+fn emit_sample_iid_gamma_refuses_tier2() {
+    let d = determinize_src(
+        "s = rnginit(0)\nxs ~ iid(Gamma(shape = 2.0, rate = 1.0), 4)\ndraws = rand(s, lawof(xs))\n",
+    );
+    let err = flatppl_stablehlo::emit(&d, flatppl_stablehlo::Mode::Sample, &Default::default())
+        .unwrap_err();
+    assert!(
+        err.msg
+            .contains("fan-out (iid) @sample for 'Gamma' not yet supported")
+            && err.msg.contains("Tier-2"),
+        "unexpected message: {}",
+        err.msg
+    );
 }

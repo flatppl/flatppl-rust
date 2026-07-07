@@ -85,6 +85,14 @@ pub struct Emitter<'m> {
     /// [`Emitter::lower_node`]'s `get0(sample, 1)`/`get(sample, 2)` arm so a
     /// chained `rand` threads the advanced key onward without re-drawing.
     sample_keys: HashMap<NodeId, Value>,
+    /// The fan-out batch shape, set by [`crate::registry::lower_sample`] around
+    /// a batched `builtin_sample(rng, ctor, input, n)` (spec §07 size dims).
+    /// When `Some`, [`Emitter::rng`] OVERRIDES the per-element `out_ty` the
+    /// distribution builder passes and draws one `[n]`-shaped batch with a
+    /// single `rng_bit_generator` advance; the builder's scalar params/constants
+    /// then broadcast over that batch via [`Emitter::binary`]'s auto-broadcast.
+    /// `None` (the scalar case) leaves every draw sized exactly as before.
+    batch_shape: Option<Vec<u64>>,
 }
 
 impl<'m> Emitter<'m> {
@@ -97,6 +105,7 @@ impl<'m> Emitter<'m> {
             body: String::new(),
             cur_key: None,
             sample_keys: HashMap::new(),
+            batch_shape: None,
         }
     }
 
@@ -130,6 +139,19 @@ impl<'m> Emitter<'m> {
     /// that node has not been lowered yet.
     pub(crate) fn sample_key(&self, id: NodeId) -> Option<Value> {
         self.sample_keys.get(&id).cloned()
+    }
+
+    /// Set the fan-out batch shape [`Emitter::rng`] draws at — called by
+    /// [`crate::registry::lower_sample`] with `[n]` around a batched iid
+    /// `builtin_sample`, then [`Emitter::clear_batch_shape`]ed (even on error)
+    /// so a later scalar sample in the same module is unaffected.
+    pub(crate) fn set_batch_shape(&mut self, dims: Vec<u64>) {
+        self.batch_shape = Some(dims);
+    }
+
+    /// Clear the fan-out batch shape — see [`Emitter::set_batch_shape`].
+    pub(crate) fn clear_batch_shape(&mut self) {
+        self.batch_shape = None;
     }
 
     /// Allocate a fresh SSA name (`%0`, `%1`, ...).
@@ -198,16 +220,43 @@ impl<'m> Emitter<'m> {
         }
     }
 
-    /// One elementwise binary op: `%N = {op} %a, %b : ty`. Result type
-    /// copies `a`'s `MlirTy` (operands are assumed already shape-unified by
-    /// inference, upstream of this emitter).
-    pub fn binary(&mut self, op: &str, a: &Value, b: &Value) -> Value {
+    /// Emit one elementwise binary op at `a`'s shape, with NO broadcasting —
+    /// the raw text primitive [`Emitter::binary`] wraps. Both operands are
+    /// assumed to already share `a`'s shape (the caller has broadcast a scalar
+    /// operand up first, if needed).
+    fn emit_binary(&mut self, op: &str, a: &Value, b: &Value) -> Value {
         let ssa = self.fresh();
         let ty_text = a.ty.render(self.dtype);
         self.push(&format!("{ssa} = {op} {}, {} : {ty_text}", a.ssa, b.ssa));
         Value {
             ssa,
             ty: a.ty.clone(),
+        }
+    }
+
+    /// One elementwise binary op: `%N = {op} %a, %b : ty`. When one operand is
+    /// a `Scalar` and the other a `Ranked` tensor, the scalar is
+    /// [`Emitter::broadcast_scalar`]d up to the ranked shape FIRST (StableHLO's
+    /// elementwise ops require identical operand shapes) — the mechanism a
+    /// fan-out Tier-1 iid draw relies on to mix a batched `[n]` draw with the
+    /// distribution's scalar parameters/constants. When the shapes already
+    /// match (every `@logdensity` path and every scalar `@sample` — inference
+    /// has shape-unified their operands upstream), no broadcast is emitted and
+    /// the output is byte-identical to before. Ranked-vs-Ranked mismatches are
+    /// left as-is (not a Tier-1 case) — an internal invariant violation
+    /// upstream type-checking should have ruled out, per this module's doc
+    /// comment.
+    pub fn binary(&mut self, op: &str, a: &Value, b: &Value) -> Value {
+        match (&a.ty, &b.ty) {
+            (MlirTy::Scalar, MlirTy::Ranked(_)) => {
+                let a_bc = self.broadcast_scalar(a, &b.ty);
+                self.emit_binary(op, &a_bc, b)
+            }
+            (MlirTy::Ranked(_), MlirTy::Scalar) => {
+                let b_bc = self.broadcast_scalar(b, &a.ty);
+                self.emit_binary(op, a, &b_bc)
+            }
+            _ => self.emit_binary(op, a, b),
         }
     }
 
@@ -689,6 +738,14 @@ impl<'m> Emitter<'m> {
     /// (`a = mean/lo`, `b = std/hi`), applied to a standard draw exactly as
     /// before so the 26 distribution builders that call this are unchanged.
     ///
+    /// Fan-out (Tier 1): when [`Emitter::set_batch_shape`] has set a `[n]`
+    /// batch shape, the draw is sized to `[n]` instead of `out_ty` (one
+    /// `rng_bit_generator` advance for the whole iid batch — spec §07 size
+    /// dims); the scalar `a`/`b` bounds broadcast over it, and the calling
+    /// straight-line builder's own scalar params broadcast via
+    /// [`Emitter::binary`]. This is why the builders stay unchanged for both
+    /// the scalar and the fanned draw.
+    ///
     /// Threaded, not XLA-seeded: raw bits come from
     /// `stablehlo.rng_bit_generator` on `self.cur_key` (which this call then
     /// replaces with the generator's advanced state), mapped to a uniform in
@@ -715,24 +772,33 @@ impl<'m> Emitter<'m> {
             other => panic!("rng expects a rank-0 (scalar) `b` operand, got {other:?}"),
         }
 
+        // Fan-out override (spec §07 size dims): a batched iid draw sizes the
+        // draw by `batch_shape`, ignoring the per-element `out_ty` the builder
+        // passed — one `rng_bit_generator` advance yields the whole `[n]` batch.
+        // A `None` batch shape (the scalar case) leaves the draw at `out_ty`.
+        let draw_ty = match &self.batch_shape {
+            Some(dims) => MlirTy::Ranked(dims.iter().map(|d| Some(*d)).collect()),
+            None => out_ty.clone(),
+        };
+
         // Draw uniform bits from (and advance) the threaded key.
-        let (new_key, u01) = self.rng_bit_generator_uniform(out_ty);
+        let (new_key, u01) = self.rng_bit_generator_uniform(&draw_ty);
         self.cur_key = Some(new_key);
 
         match dist {
             "UNIFORM" => {
                 // a + (b - a) * u01
                 let span = self.sub(b, a);
-                let span_bc = self.broadcast_scalar(&span, out_ty);
-                let a_bc = self.broadcast_scalar(a, out_ty);
+                let span_bc = self.broadcast_scalar(&span, &draw_ty);
+                let a_bc = self.broadcast_scalar(a, &draw_ty);
                 let scaled = self.mul(&u01, &span_bc);
                 self.add(&scaled, &a_bc)
             }
             "NORMAL" => {
                 // a + b * Z, Z standard normal via the erf_inv probit.
                 let z = self.uniform_to_normal(&u01);
-                let b_bc = self.broadcast_scalar(b, out_ty);
-                let a_bc = self.broadcast_scalar(a, out_ty);
+                let b_bc = self.broadcast_scalar(b, &draw_ty);
+                let a_bc = self.broadcast_scalar(a, &draw_ty);
                 let scaled = self.mul(&z, &b_bc);
                 self.add(&scaled, &a_bc)
             }
