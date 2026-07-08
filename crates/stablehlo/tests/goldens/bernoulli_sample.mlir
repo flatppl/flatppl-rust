@@ -9,11 +9,8 @@ module {
     %7 = stablehlo.convert %6 : (tensor<ui32>) -> tensor<f32>
     %8 = stablehlo.constant dense<1.1920929E-7> : tensor<f32>
     %9 = stablehlo.multiply %7, %8 : tensor<f32>
-    %10 = stablehlo.subtract %2, %1 : tensor<f32>
-    %11 = stablehlo.multiply %9, %10 : tensor<f32>
-    %12 = stablehlo.add %11, %1 : tensor<f32>
-    %13 = stablehlo.compare LT, %12, %0 : (tensor<f32>, tensor<f32>) -> tensor<i1>
-    %14 = stablehlo.select %13, %2, %1 : (tensor<i1>, tensor<f32>, tensor<f32>) -> tensor<f32>
-    return %14, %3 : tensor<f32>, tensor<2xui64>
+    %10 = stablehlo.compare LT, %9, %0 : (tensor<f32>, tensor<f32>) -> tensor<i1>
+    %11 = stablehlo.select %10, %2, %1 : (tensor<i1>, tensor<f32>, tensor<f32>) -> tensor<f32>
+    return %11, %3 : tensor<f32>, tensor<2xui64>
   }
 }

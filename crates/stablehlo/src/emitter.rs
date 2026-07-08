@@ -815,19 +815,22 @@ impl<'m> Emitter<'m> {
 
     // ---- sampling (Task 6) --------------------------------------------------
 
-    /// Draw an `out_ty`-shaped variate from the threaded rng key (spec §07
-    /// rng ABI), advancing [`Emitter::cur_key`]. `dist` is the sampling family
-    /// (`"NORMAL"`/`"UNIFORM"`); `a`/`b` are its affine bounds
-    /// (`a = mean/lo`, `b = std/hi`), applied to a standard draw exactly as
-    /// before so the 26 distribution builders that call this are unchanged.
+    /// Draw a standard `out_ty`-shaped variate from the threaded rng key
+    /// (spec §07 rng ABI), advancing [`Emitter::cur_key`]. `dist` is the
+    /// sampling family (`"NORMAL"`/`"UNIFORM"`), returning a standard normal
+    /// or a uniform in `[0, 1)` — every one of the 26 distribution builders
+    /// that call this applies its OWN location/scale to the standard draw
+    /// (e.g. `normal_sample`'s `mu + sigma * z`, in `crate::registry`), so
+    /// there is no affine `a`/`b` here to duplicate that: an earlier revision
+    /// threaded `a`/`b` bounds through this call and had every builder pass
+    /// the identity `(0, 1)`, making the affine dead ops on every single draw.
     ///
     /// Fan-out (Tier 1): when [`Emitter::set_batch_shape`] has set a `[n]`
     /// batch shape, the draw is sized to `[n]` instead of `out_ty` (one
     /// `rng_bit_generator` advance for the whole iid batch — spec §07 size
-    /// dims); the scalar `a`/`b` bounds broadcast over it, and the calling
-    /// straight-line builder's own scalar params broadcast via
-    /// [`Emitter::binary`]. This is why the builders stay unchanged for both
-    /// the scalar and the fanned draw.
+    /// dims); the calling straight-line builder's own scalar params broadcast
+    /// over it via [`Emitter::binary`]. This is why the builders stay
+    /// unchanged for both the scalar and the fanned draw.
     ///
     /// Threaded, not XLA-seeded: raw bits come from
     /// `stablehlo.rng_bit_generator` on `self.cur_key` (which this call then
@@ -839,22 +842,11 @@ impl<'m> Emitter<'m> {
     /// [`Emitter::uniform_to_normal`].
     ///
     /// Panics (an internal invariant violation, not a user-facing refusal —
-    /// mirrors `diag`/`matvec`'s panic-on-bad-shape discipline) if `a`/`b`
-    /// is not rank-0 (the affine bounds must be scalar, regardless of
-    /// `out_ty`'s shape; a scalar bound is broadcast up to the batch via
-    /// [`Emitter::broadcast_scalar`]), if `out_ty` has a dynamic dimension or
-    /// is a `Tuple`/`Key` (no static bits-tensor form), or if `dist` is not a
-    /// supported family — and, via [`Emitter::cur_key`], if no key is threaded.
-    pub fn rng(&mut self, dist: &str, a: &Value, b: &Value, out_ty: &MlirTy) -> Value {
-        match &a.ty {
-            MlirTy::Scalar => {}
-            other => panic!("rng expects a rank-0 (scalar) `a` operand, got {other:?}"),
-        }
-        match &b.ty {
-            MlirTy::Scalar => {}
-            other => panic!("rng expects a rank-0 (scalar) `b` operand, got {other:?}"),
-        }
-
+    /// mirrors `diag`/`matvec`'s panic-on-bad-shape discipline) if `out_ty`
+    /// has a dynamic dimension or is a `Tuple`/`Key` (no static bits-tensor
+    /// form), or if `dist` is not a supported family — and, via
+    /// [`Emitter::cur_key`], if no key is threaded.
+    pub fn rng(&mut self, dist: &str, out_ty: &MlirTy) -> Value {
         // Fan-out override (spec §07 size dims): a batched iid draw sizes the
         // draw by `batch_shape`, ignoring the per-element `out_ty` the builder
         // passed — one `rng_bit_generator` advance yields the whole `[n]` batch.
@@ -869,22 +861,8 @@ impl<'m> Emitter<'m> {
         self.cur_key = Some(new_key);
 
         match dist {
-            "UNIFORM" => {
-                // a + (b - a) * u01
-                let span = self.sub(b, a);
-                let span_bc = self.broadcast_scalar(&span, &draw_ty);
-                let a_bc = self.broadcast_scalar(a, &draw_ty);
-                let scaled = self.mul(&u01, &span_bc);
-                self.add(&scaled, &a_bc)
-            }
-            "NORMAL" => {
-                // a + b * Z, Z standard normal via the erf_inv probit.
-                let z = self.uniform_to_normal(&u01);
-                let b_bc = self.broadcast_scalar(b, &draw_ty);
-                let a_bc = self.broadcast_scalar(a, &draw_ty);
-                let scaled = self.mul(&z, &b_bc);
-                self.add(&scaled, &a_bc)
-            }
+            "UNIFORM" => u01,
+            "NORMAL" => self.uniform_to_normal(&u01),
             other => panic!("rng: unsupported distribution family {other:?}"),
         }
     }
@@ -904,21 +882,32 @@ impl<'m> Emitter<'m> {
     }
 
     /// Draw `out_ty`-shaped raw bits from the threaded key and map them to a
-    /// uniform in `[0, 1)`, returning `(advanced_key, uniform)`. Emits EXACTLY
-    /// the plan's Task-1-pinned op forms: `stablehlo.rng_bit_generator` in its
+    /// uniform in `[0, 1)`, returning `(advanced_key, uniform)`. Emits the
+    /// plan's Task-1-pinned op forms: `stablehlo.rng_bit_generator` in its
     /// custom-assembly `THREE_FRY` spelling (the attribute-dict form is
     /// rejected by the parser; the pretty-printer's two spaces after
-    /// `algorithm =` are the exact round-tripped text), then the
-    /// shift-right-9 / `convert` / multiply-by-`2^-23` bits→uniform sequence.
-    /// The bits tensor is always `ui32` (the generator's output element type,
-    /// independent of this emitter's float `dtype`); its shape follows
-    /// `out_ty` (rank-0 `tensor<ui32>` for a scalar draw, `tensor<Nxui32>` for
-    /// a length-`N` batch). Panics on a dynamic/`Tuple`/`Key` `out_ty`
-    /// ([`render_ui32`] has no such form).
+    /// `algorithm =` are the exact round-tripped text), then a shift-right /
+    /// `convert` / multiply-by-scale bits→uniform sequence — DTYPE-AWARE, not
+    /// a fixed f32-mantissa pipeline hardwired regardless of the emitter's
+    /// configured precision: `Dtype::F32` draws `ui32` bits, shifts right 9
+    /// (keeping the top `32 - 9 = 23` bits, an f32 mantissa's width) and
+    /// scales by `2^-23`; `Dtype::F64` draws `ui64` bits, shifts right 12
+    /// (keeping the top `64 - 12 = 52` bits, an f64 mantissa's width) and
+    /// scales by `2^-52`. Using the f32 pipeline unconditionally for an
+    /// `F64` emitter would silently quantize every `@sample` draw to ~2^23
+    /// levels regardless of `dtype`; matching the shift to the mantissa width
+    /// (so the shifted integer's range is exactly `[0, 2^mantissa)`) is also
+    /// what keeps the scaled result inside `[0, 1)` — a shift one bit
+    /// shallower would let the integer reach `2^mantissa` and the draw touch
+    /// `1.0`. The bits tensor's element type is always `ui32`/`ui64` per the
+    /// above (the generator's raw output width, never this emitter's float
+    /// `dtype`); its shape follows `out_ty` (rank-0 for a scalar draw,
+    /// `tensor<N x {ui32,ui64}>` for a length-`N` batch). Panics on a
+    /// dynamic/`Tuple`/`Key` `out_ty` ([`render_bits_ty`] has no such form).
     fn rng_bit_generator_uniform(&mut self, out_ty: &MlirTy) -> (Value, Value) {
         let key = self.cur_key();
         let key_ty_text = MlirTy::Key.render(self.dtype);
-        let bits_ty_text = render_ui32(out_ty);
+        let bits_ty_text = render_bits_ty(out_ty, self.dtype);
         let float_ty_text = out_ty.render(self.dtype);
 
         let state_ssa = self.fresh();
@@ -932,20 +921,26 @@ impl<'m> Emitter<'m> {
             ty: MlirTy::Key,
         };
 
-        let c9_ssa = self.fresh();
+        // (shift, scale) per dtype: shift keeps the top `mantissa_bits` of the
+        // raw integer (`32 - 9 = 23` for f32, `64 - 12 = 52` for f64); scale
+        // is `2^-mantissa_bits`, the pinned exact spellings.
+        let (shift, scale_lit) = match self.dtype {
+            Dtype::F32 => (9, "1.1920929E-7"),           // 2^-23
+            Dtype::F64 => (12, "2.220446049250313E-16"), // 2^-52
+        };
+        let c_shift_ssa = self.fresh();
         self.push(&format!(
-            "{c9_ssa} = stablehlo.constant dense<9> : {bits_ty_text}"
+            "{c_shift_ssa} = stablehlo.constant dense<{shift}> : {bits_ty_text}"
         ));
         let hi_ssa = self.fresh();
         self.push(&format!(
-            "{hi_ssa} = stablehlo.shift_right_logical {bits_ssa}, {c9_ssa} : {bits_ty_text}"
+            "{hi_ssa} = stablehlo.shift_right_logical {bits_ssa}, {c_shift_ssa} : {bits_ty_text}"
         ));
         let f_ssa = self.fresh();
         self.push(&format!(
             "{f_ssa} = stablehlo.convert {hi_ssa} : ({bits_ty_text}) -> {float_ty_text}"
         ));
-        // 2^-23 (the pinned f32-exact spelling; renders at this emitter's dtype).
-        let scale = self.const_lit("1.1920929E-7", out_ty.clone());
+        let scale = self.const_lit(scale_lit, out_ty.clone());
         let u_ssa = self.fresh();
         self.push(&format!(
             "{u_ssa} = stablehlo.multiply {f_ssa}, {} : {float_ty_text}",
@@ -1719,28 +1714,35 @@ fn render_i1(ty: &MlirTy) -> String {
     }
 }
 
-/// Render `ty`'s shape as a `ui32`-element MLIR tensor type — the raw-bits
-/// tensor `stablehlo.rng_bit_generator` produces (spec §07 rng ABI). `MlirTy`
-/// carries no element dtype, and `ui32` is never this emitter's float dtype,
-/// so — exactly like [`render_i1`] — this dtype-independent render is done
-/// locally rather than through `MlirTy::render`.
-fn render_ui32(ty: &MlirTy) -> String {
+/// Render `ty`'s shape as a `ui32`- or `ui64`-element MLIR tensor type — the
+/// raw-bits tensor `stablehlo.rng_bit_generator` produces (spec §07 rng ABI),
+/// `ui32` for `Dtype::F32` and `ui64` for `Dtype::F64` (see
+/// [`Emitter::rng_bit_generator_uniform`]'s doc comment on why the bits width
+/// tracks `dtype`). `MlirTy` carries no element dtype, and the bits element
+/// (`ui32`/`ui64`) is never this emitter's float dtype (`f32`/`f64`) either,
+/// so — exactly like [`render_i1`] — this render is done locally rather than
+/// through `MlirTy::render`.
+fn render_bits_ty(ty: &MlirTy, dtype: Dtype) -> String {
+    let elem = match dtype {
+        Dtype::F32 => "ui32",
+        Dtype::F64 => "ui64",
+    };
     match ty {
-        MlirTy::Scalar => "tensor<ui32>".to_string(),
+        MlirTy::Scalar => format!("tensor<{elem}>"),
         MlirTy::Ranked(dims) => {
             let mut out = String::from("tensor<");
             for dim in dims {
                 match dim {
                     Some(n) => out.push_str(&n.to_string()),
-                    None => panic!("rng bits over a dynamic dimension has no static ui32 form"),
+                    None => panic!("rng bits over a dynamic dimension has no static {elem} form"),
                 }
                 out.push('x');
             }
-            out.push_str("ui32");
+            out.push_str(elem);
             out.push('>');
             out
         }
-        MlirTy::Tuple(_) => panic!("rng bits over a tuple type have no ui32 rendering"),
-        MlirTy::Key => panic!("rng bits over an rng key have no ui32 rendering"),
+        MlirTy::Tuple(_) => panic!("rng bits over a tuple type have no {elem} rendering"),
+        MlirTy::Key => panic!("rng bits over an rng key have no {elem} rendering"),
     }
 }

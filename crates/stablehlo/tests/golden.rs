@@ -2985,39 +2985,6 @@ fn builtin_sample_refuses_wrong_arity() {
     assert_eq!(err.node, Some(node));
 }
 
-// ---- Task 6 review fix: `Emitter::rng` defensive assert (Finding 3) -------
-
-/// `stablehlo.rng` requires rank-0 `a`/`b` bounds operands — a non-`Scalar`
-/// `a` must panic (an internal invariant violation caught before emitting
-/// ill-typed StableHLO), mirroring `diag`/`matvec`'s panic-on-bad-shape
-/// discipline in the same file.
-#[test]
-#[should_panic(expected = "rng expects a rank-0 (scalar) `a` operand")]
-fn emitter_rng_panics_on_non_scalar_a() {
-    let m = Module::new();
-    let mut e = Emitter::new(&m, Dtype::F32);
-    let a = flatppl_stablehlo::Value {
-        ssa: "%a".to_string(),
-        ty: MlirTy::Ranked(vec![Some(3)]),
-    };
-    let b = e.scalar(1.0);
-    e.rng("NORMAL", &a, &b, &MlirTy::Scalar);
-}
-
-/// The `b`-operand mirror of [`emitter_rng_panics_on_non_scalar_a`].
-#[test]
-#[should_panic(expected = "rng expects a rank-0 (scalar) `b` operand")]
-fn emitter_rng_panics_on_non_scalar_b() {
-    let m = Module::new();
-    let mut e = Emitter::new(&m, Dtype::F32);
-    let a = e.scalar(0.0);
-    let b = flatppl_stablehlo::Value {
-        ssa: "%b".to_string(),
-        ty: MlirTy::Ranked(vec![Some(3)]),
-    };
-    e.rng("NORMAL", &a, &b, &MlirTy::Scalar);
-}
-
 // ---- Task 7: refuse taxonomy — closing coverage gaps -----------------------
 //
 // Task 7's audit (see `crates/stablehlo/src/refuse.rs`'s module doc comment
@@ -4760,11 +4727,13 @@ fn emit_sample_uniform_has_expected_structure() {
     assert!(out.contains("-> (tensor<f32>, tensor<2xui64>)"));
     assert_eq!(out.matches("stablehlo.rng").count(), 1);
     assert!(out.contains("stablehlo.rng_bit_generator"));
-    // Three multiplies (bits→uniform scale, the rng affine's `(b-a)*u`, the
-    // Uniform transform's `4.0 * u`) and two adds (rng affine `+ a`, transform
-    // `-1.0 + …`) — the exact text is pinned by the frozen golden.
-    assert_eq!(out.matches("stablehlo.multiply").count(), 3);
-    assert_eq!(out.matches("stablehlo.add").count(), 2);
+    // Two multiplies (bits→uniform scale, the Uniform transform's `4.0 * u`)
+    // and one add (the transform's `-1.0 + …`) — `Emitter::rng` returns the
+    // standard uniform directly (no rng-affine identity ops), so the only
+    // arithmetic left is Uniform's own transform. The exact text is pinned
+    // by the frozen golden.
+    assert_eq!(out.matches("stablehlo.multiply").count(), 2);
+    assert_eq!(out.matches("stablehlo.add").count(), 1);
     assert!(is_delimiter_balanced(&out));
 }
 
@@ -5550,9 +5519,10 @@ fn emit_sample_binomial_has_expected_structure() {
     assert_eq!(out.matches("stablehlo.rng").count(), 1);
     assert!(out.contains("stablehlo.rng_bit_generator"));
     assert!(out.contains("tensor<5xf32>"));
-    // Three broadcast_in_dim: the two scalar rng-affine bounds lifted to the
-    // length-5 batch shape, plus `p` broadcast to the batch by the sampler.
-    assert_eq!(out.matches("stablehlo.broadcast_in_dim").count(), 3);
+    // One broadcast_in_dim: `p` broadcast to the batch shape by the sampler.
+    // `Emitter::rng` returns the standard uniform directly, so there are no
+    // rng-affine scalar bounds left to lift onto the batch.
+    assert_eq!(out.matches("stablehlo.broadcast_in_dim").count(), 1);
     assert_eq!(out.matches("stablehlo.compare").count(), 1);
     assert_eq!(out.matches("stablehlo.select").count(), 1);
     assert_eq!(out.matches("stablehlo.reduce(").count(), 1);

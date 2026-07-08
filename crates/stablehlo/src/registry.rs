@@ -602,9 +602,7 @@ fn normal_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
     let mu = p.get(e, "mu")?;
     let sigma = p.get(e, "sigma")?;
 
-    let zero = e.scalar(0.0);
-    let one = e.scalar(1.0);
-    let z = e.rng("NORMAL", &zero, &one, &mu.ty);
+    let z = e.rng("NORMAL", &mu.ty);
 
     let sigma_z = e.mul(&sigma, &z);
     Ok(e.add(&mu, &sigma_z))
@@ -645,9 +643,7 @@ fn cauchy_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
     let location = p.get(e, "location")?;
     let scale = p.get(e, "scale")?;
 
-    let zero = e.scalar(0.0);
-    let one = e.scalar(1.0);
-    let u = e.rng("UNIFORM", &zero, &one, &location.ty);
+    let u = e.rng("UNIFORM", &location.ty);
 
     let half = e.scalar(0.5);
     let centered = e.sub(&u, &half);
@@ -696,9 +692,8 @@ fn logistic_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
     let mu = p.get(e, "mu")?;
     let s = p.get(e, "s")?;
 
-    let zero = e.scalar(0.0);
     let one = e.scalar(1.0);
-    let u = e.rng("UNIFORM", &zero, &one, &mu.ty);
+    let u = e.rng("UNIFORM", &mu.ty);
 
     let one_minus_u = e.sub(&one, &u);
     let ratio = e.div(&u, &one_minus_u);
@@ -743,7 +738,7 @@ fn laplace_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
 
     let zero = e.scalar(0.0);
     let one = e.scalar(1.0);
-    let u = e.rng("UNIFORM", &zero, &one, &location.ty);
+    let u = e.rng("UNIFORM", &location.ty);
 
     let half = e.scalar(0.5);
     let centered = e.sub(&u, &half);
@@ -796,9 +791,7 @@ fn exponential_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, E
 fn exponential_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
     let rate = p.get(e, "rate")?;
 
-    let zero = e.scalar(0.0);
-    let one = e.scalar(1.0);
-    let u = e.rng("UNIFORM", &zero, &one, &rate.ty);
+    let u = e.rng("UNIFORM", &rate.ty);
 
     let log_u = e.log(&u);
     let neg_log_u = e.neg(&log_u);
@@ -866,9 +859,8 @@ fn weibull_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
     let shape = p.get(e, "shape")?;
     let scale = p.get(e, "scale")?;
 
-    let zero = e.scalar(0.0);
     let one = e.scalar(1.0);
-    let u = e.rng("UNIFORM", &zero, &one, &shape.ty);
+    let u = e.rng("UNIFORM", &shape.ty);
 
     let log_u = e.log(&u);
     let neg_log_u = e.neg(&log_u);
@@ -907,9 +899,7 @@ fn pareto_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
     let shape = p.get(e, "shape")?;
     let scale = p.get(e, "scale")?;
 
-    let zero = e.scalar(0.0);
-    let one = e.scalar(1.0);
-    let u = e.rng("UNIFORM", &zero, &one, &shape.ty);
+    let u = e.rng("UNIFORM", &shape.ty);
 
     let neg_one = e.scalar(-1.0);
     let neg_inv_shape = e.div(&neg_one, &shape);
@@ -1021,9 +1011,7 @@ fn lognormal_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
     let mu = p.get(e, "mu")?;
     let sigma = p.get(e, "sigma")?;
 
-    let zero = e.scalar(0.0);
-    let one = e.scalar(1.0);
-    let z = e.rng("NORMAL", &zero, &one, &mu.ty);
+    let z = e.rng("NORMAL", &mu.ty);
 
     let sigma_z = e.mul(&sigma, &z);
     let mu_plus_sigma_z = e.add(&mu, &sigma_z);
@@ -1141,9 +1129,7 @@ fn uniform_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
             )
         })?;
 
-    let zero = e.scalar(0.0);
-    let one = e.scalar(1.0);
-    let u = e.rng("UNIFORM", &zero, &one, &MlirTy::Scalar);
+    let u = e.rng("UNIFORM", &MlirTy::Scalar);
 
     let a = e.scalar(lo);
     let width = e.scalar(hi - lo);
@@ -1799,15 +1785,13 @@ fn mvnormal_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
     // fanned): `L` is a deterministic function of `cov`, not of the rng.
     let l = e.cholesky(&cov);
 
-    let zero = e.scalar(0.0);
-    let one = e.scalar(1.0);
     let vec_ty = MlirTy::Ranked(vec![Some(d)]);
 
     match e.batch_shape() {
         // Scalar MvNormal — UNCHANGED (byte-identical to the pre-Task-10b path):
         // draw one `[d]` standard normal `z`, return `mu + L·z`.
         None => {
-            let z = e.rng("NORMAL", &zero, &one, &vec_ty);
+            let z = e.rng("NORMAL", &vec_ty);
             let l_z = e.matvec(&l, &z);
             Ok(e.add(&mu, &l_z))
         }
@@ -1823,7 +1807,7 @@ fn mvnormal_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
             // across n. `Emitter::rng` sizes to the batch shape, so widen it to
             // `[n, d]` for the draw, then restore `lower_sample`'s `[n]`.
             e.set_batch_shape(vec![n, d]);
-            let z = e.rng("NORMAL", &zero, &one, &vec_ty);
+            let z = e.rng("NORMAL", &vec_ty);
             e.set_batch_shape(vec![n]);
             // Row-wise `L·z_i` for all rows = `z · Lᵀ` → `[n, d]`.
             let l_z = e.batched_row_matvec(&z, &l);
@@ -2410,8 +2394,8 @@ fn draw_gamma_scalar(e: &mut Emitter, shape: &Value, rate: &Value) -> Value {
     // Pre-draw the candidate batches OUTSIDE the loop (see the batch doc
     // comment): Z ~ Normal(0, 1), U ~ Uniform(0, 1), each length MAXITER.
     let batch_ty = MlirTy::Ranked(vec![Some(MAXITER)]);
-    let z_batch = e.rng("NORMAL", &zero, &one, &batch_ty);
-    let u_batch = e.rng("UNIFORM", &zero, &one, &batch_ty);
+    let z_batch = e.rng("NORMAL", &batch_ty);
+    let u_batch = e.rng("UNIFORM", &batch_ty);
 
     let i0 = e.int_const(0);
     let acc0 = e.bool_const(false);
@@ -2472,7 +2456,7 @@ fn draw_gamma_scalar(e: &mut Emitter, shape: &Value, rate: &Value) -> Value {
     let g0 = results[2].clone();
 
     // boost = select(shape < 1, U0^(1/shape), 1) ; result = g0 * boost / rate.
-    let u0 = e.rng("UNIFORM", &zero, &one, &MlirTy::Scalar);
+    let u0 = e.rng("UNIFORM", &MlirTy::Scalar);
     let inv_shape = e.div(&one, shape);
     let boost_raw = e.pow(&u0, &inv_shape);
     let boost = e.select(&shape_lt_one, &boost_raw, &one);
@@ -2518,8 +2502,8 @@ fn draw_gamma_batched(e: &mut Emitter, shape: &Value, rate: &Value, n: u64) -> V
     // advance → reproducible). Size them via a temporary [MAXITER, n] batch
     // shape, then restore the [n] fan-out shape for the trailing boost uniform.
     e.set_batch_shape(vec![MAXITER, n]);
-    let z_batch = e.rng("NORMAL", &zero, &one, &MlirTy::Scalar);
-    let u_batch = e.rng("UNIFORM", &zero, &one, &MlirTy::Scalar);
+    let z_batch = e.rng("NORMAL", &MlirTy::Scalar);
+    let u_batch = e.rng("UNIFORM", &MlirTy::Scalar);
     e.set_batch_shape(vec![n]);
 
     let i0 = e.int_const(0);
@@ -2594,7 +2578,7 @@ fn draw_gamma_batched(e: &mut Emitter, shape: &Value, rate: &Value, n: u64) -> V
     // boost = select(shape < 1, U0^(1/shape), 1) ; result = g0 * boost / rate.
     // U0 is now a [n] per-lane uniform (batch shape restored above); the scalar
     // `shape_lt_one` predicate and scalar `1` broadcast over the [n] boost.
-    let u0 = e.rng("UNIFORM", &zero, &one, &MlirTy::Scalar);
+    let u0 = e.rng("UNIFORM", &MlirTy::Scalar);
     let inv_shape = e.div(&one, shape);
     let boost_raw = e.pow(&u0, &inv_shape);
     let boost = e.select(&shape_lt_one, &boost_raw, &one);
@@ -2641,9 +2625,7 @@ fn studentt_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
     let rate = e.scalar(0.5);
     let v = draw_gamma(e, &half_nu, &rate);
 
-    let zero = e.scalar(0.0);
-    let one = e.scalar(1.0);
-    let z = e.rng("NORMAL", &zero, &one, &MlirTy::Scalar);
+    let z = e.rng("NORMAL", &MlirTy::Scalar);
 
     let v_over_nu = e.div(&v, &nu);
     let sqrt_term = e.sqrt(&v_over_nu);
@@ -2677,7 +2659,7 @@ fn generalized_normal_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitE
     let g_pow = e.pow(&g, &inv_beta);
 
     let zero = e.scalar(0.0);
-    let u = e.rng("UNIFORM", &zero, &one, &MlirTy::Scalar);
+    let u = e.rng("UNIFORM", &MlirTy::Scalar);
     let half = e.scalar(0.5);
     let centered = e.sub(&u, &half);
     let is_nonneg = e.compare("GE", &centered, &zero);
@@ -2771,7 +2753,7 @@ fn bernoulli_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
     let prob = p.get(e, "p")?;
     let zero = e.scalar(0.0);
     let one = e.scalar(1.0);
-    let u = e.rng("UNIFORM", &zero, &one, &prob.ty);
+    let u = e.rng("UNIFORM", &prob.ty);
     let lt = e.compare("LT", &u, &prob);
     Ok(e.select(&lt, &one, &zero))
 }
@@ -2783,9 +2765,8 @@ fn bernoulli_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
 /// sampler needing [`Emitter::floor`].
 fn geometric_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
     let prob = p.get(e, "p")?;
-    let zero = e.scalar(0.0);
     let one = e.scalar(1.0);
-    let u = e.rng("UNIFORM", &zero, &one, &prob.ty);
+    let u = e.rng("UNIFORM", &prob.ty);
     let log_u = e.log(&u);
     let one_minus_p = e.sub(&one, &prob);
     let log_one_minus_p = e.log(&one_minus_p);
@@ -2828,7 +2809,7 @@ fn draw_categorical(e: &mut Emitter, p: &Params, base: f64) -> Result<Value, Emi
 
     let zero = e.scalar(0.0);
     let one = e.scalar(1.0);
-    let u = e.rng("UNIFORM", &zero, &one, &MlirTy::Scalar);
+    let u = e.rng("UNIFORM", &MlirTy::Scalar);
 
     let mut cum = e.scalar(0.0);
     let mut count = e.scalar(base);
@@ -2866,10 +2847,8 @@ fn binomial_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
     let n = literal_fixed_positive_int(e, p, "n", "Binomial", "sample")?;
     let prob = p.get(e, "p")?;
 
-    let zero = e.scalar(0.0);
-    let one = e.scalar(1.0);
     let batch_ty = MlirTy::Ranked(vec![Some(n)]);
-    let u = e.rng("UNIFORM", &zero, &one, &batch_ty);
+    let u = e.rng("UNIFORM", &batch_ty);
 
     let p_bc = e.broadcast_in_dim(&prob, &[], batch_ty.clone());
     let lt = e.compare("LT", &u, &p_bc);
@@ -2907,9 +2886,7 @@ const POISSON_MAXITER: u64 = 256;
 /// value), so the `k < MAXITER` bound is a float compare and no `i32`/`convert`
 /// is needed at all.
 fn draw_poisson(e: &mut Emitter, rate: &Value) -> Value {
-    let zero = e.scalar(0.0);
-    let one = e.scalar(1.0);
-    let u = e.rng("UNIFORM", &zero, &one, &MlirTy::Scalar);
+    let u = e.rng("UNIFORM", &MlirTy::Scalar);
 
     let neg_rate = e.neg(rate);
     let exp_neg_rate = e.exp(&neg_rate); // P(X=0) = F(0) = exp(-rate)
@@ -3026,12 +3003,9 @@ fn multinomial_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
         }
     };
 
-    let zero = e.scalar(0.0);
-    let one = e.scalar(1.0);
-
     // Pre-draw the n uniforms outside the loop (see the doc comment).
     let batch_ty = MlirTy::Ranked(vec![Some(n)]);
-    let u_batch = e.rng("UNIFORM", &zero, &one, &batch_ty);
+    let u_batch = e.rng("UNIFORM", &batch_ty);
 
     // Bin boundaries, built once: lower[j] = b_j, upper[j] = b_{j+1}, with
     // b_0 = 0, b_j = cumsum(p)_j (j = 1..k-1), b_k = +inf (robust last bin).
