@@ -84,6 +84,36 @@ draws = rand(s, lawof(record(x = x)))";
     );
 }
 
+// A positional-arg constructor `Normal(0.0, 1.0)` is equivalent to the keyword
+// form `Normal(mu = 0.0, sigma = 1.0)` (spec §04 calling conventions: positional
+// args bind to the ordered parameter names). The sample leaf must lower it —
+// producing the identical FlatPDL as the keyword form — not refuse. Regression
+// for buffy #143 (@sample path).
+#[test]
+fn sample_draw_positional_constructor_lowers_same_as_keyword() {
+    let positional = "\
+s = rnginit(0)
+x = draw(Normal(0.0, 1.0))
+draws = rand(s, lawof(record(x = x)))";
+    let keyword = "\
+s = rnginit(0)
+x = draw(Normal(mu = 0.0, sigma = 1.0))
+draws = rand(s, lawof(record(x = x)))";
+    let out_pos = determinize(&parse_infer(positional)).expect("positional sample leaf must lower");
+    let out_kw = determinize(&parse_infer(keyword)).expect("keyword sample leaf must lower");
+    let pir_pos = flatppl_flatpir::write(&out_pos);
+    let pir_kw = flatppl_flatpir::write(&out_kw);
+    assert!(
+        pir_pos.contains("builtin_sample")
+            && pir_pos.contains("(record (%field mu 0.0) (%field sigma 1.0))"),
+        "positional lowers to builtin_sample with the named kernel-input record:\n{pir_pos}"
+    );
+    assert_eq!(
+        pir_pos, pir_kw,
+        "positional and keyword forms lower to identical FlatPDL:\npositional:\n{pir_pos}\nkeyword:\n{pir_kw}"
+    );
+}
+
 // Two independent draws: two builtin_sample calls (field `a`, field `b`), the
 // second consuming the first's advanced rng — sequential threading, not two
 // fresh streams. There is no separate `get1` primitive in this codebase (see

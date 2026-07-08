@@ -388,21 +388,26 @@ fn try_conjugate_marginal(
     kernel: &Kernel,
     v: NodeId,
 ) -> Option<Result<NodeId, RefuseError>> {
-    // (a) The prior must be a bare distribution constructor (kwargs only).
+    // (a) The prior must be a bare distribution constructor (positional or
+    // keyword arguments).
     let (prior_sym, prior_kwargs) = split_kernel_constructor(m, latent_dist)?;
-    let prior_name = m.resolve(prior_sym);
 
     // Resolve the likelihood constructor from the kernel body, remembering any
     // single-field record wrapper so the marginal is scored at the SAME variate
     // shape as the kernel (a record `{y}` vs. a bare scalar).
     let lik = resolve_likelihood(m, kernel.body)?;
     let (lik_sym, lik_kwargs) = split_kernel_constructor(m, lik.dist)?;
-    let lik_name = m.resolve(lik_sym);
+
+    // Resolve the constructor names to owned strings (the `split_*` calls above
+    // borrow `m` mutably to intern positional-arg names, so we cannot hold a
+    // `resolve` borrow across them).
+    let prior_name = m.resolve(prior_sym).to_string();
+    let lik_name = m.resolve(lik_sym).to_string();
 
     // Find the row whose prior + likelihood families both match.
     let row = CONJUGATE_TABLE
         .iter()
-        .find(|r| r.prior == prior_name && r.likelihood == lik_name)?;
+        .find(|r| r.prior == prior_name.as_str() && r.likelihood == lik_name.as_str())?;
 
     // (b) The conjugating parameter's value must be EXACTLY the boundary-input
     // ref `(%ref self|%local kernel.inputs[0].1.name)` — the latent feeding that
