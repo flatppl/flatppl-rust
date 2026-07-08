@@ -548,6 +548,43 @@ impl<'m> Emitter<'m> {
         Value { ssa, ty: result_ty }
     }
 
+    /// `%N = stablehlo.transpose %a, dims = [perm...] : (operand_ty) ->
+    /// result_ty` — permutes `a`'s axes so result axis `k` is operand axis
+    /// `perm[k]` (result dim sizes reordered to match). Used by the fanned
+    /// Dirichlet draw to reorient the axis-0 column stack `[d, m]` (the d
+    /// per-component `[m]` Gamma columns [`Emitter::vector`] stacks on dim 0)
+    /// into the `[m, d]` batch of simplex rows. Panics on a non-`Ranked`
+    /// operand or a permutation whose length differs from the operand rank —
+    /// an internal invariant violation, per this module's doc comment.
+    /// Parser-validated against the real StableHLO parser (jax 0.10.2) for the
+    /// rank-2 `[d, m] -> [m, d]` case (`dims = [1, 0]`).
+    pub fn transpose(&mut self, a: &Value, perm: &[u64]) -> Value {
+        let in_dims = match &a.ty {
+            MlirTy::Ranked(dims) => dims.clone(),
+            other => panic!("transpose expects a ranked operand, got {other:?}"),
+        };
+        assert_eq!(
+            perm.len(),
+            in_dims.len(),
+            "transpose: permutation length must equal operand rank"
+        );
+        let out_dims: Vec<Option<u64>> = perm.iter().map(|&p| in_dims[p as usize]).collect();
+        let result_ty = MlirTy::Ranked(out_dims);
+        let operand_ty = a.ty.render(self.dtype);
+        let result_ty_text = result_ty.render(self.dtype);
+        let dims_text = perm
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let ssa = self.fresh();
+        self.push(&format!(
+            "{ssa} = stablehlo.transpose {}, dims = [{dims_text}] : ({operand_ty}) -> {result_ty_text}",
+            a.ssa
+        ));
+        Value { ssa, ty: result_ty }
+    }
+
     // ---- CHLO special functions ------------------------------------------
 
     /// `%N = chlo.lgamma %a : in_ty -> out_ty` — the log-gamma function.

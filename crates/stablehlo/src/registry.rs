@@ -517,13 +517,23 @@ pub(crate) fn lower_sample(
 ///   auto-broadcast a scalar operand over a `[n]` batch, like
 ///   [`Emitter::binary`] already did — GeneralizedNormal's per-lane sign and
 ///   the Gamma boost need it.)
-/// - Fan-out **Tier 2 (multivariate)** — MvNormal, whose variate is itself a
-///   `d`-vector: the fanned draw is a rank-2 `[n, d]` batch of iid draws. One
-///   `rng_bit_generator` advance sized to `[n, d]` (a genuine `tensor<n×d>`
-///   draw — the n rows are independent), one shared `stablehlo.cholesky` on the
-///   `[d, d]` cov, and the row-wise affine `mu + L·z_i` for all rows as a
-///   batched [`Emitter::batched_row_matvec`] (`z · Lᵀ`), with `mu` broadcast
-///   across the rows. See [`mvnormal_sample`].
+/// - Fan-out **Tier 2 (multivariate)** — the two vector-variate samplers,
+///   whose variate is itself a `d`-vector, so the fanned draw is a rank-2
+///   `[m, d]` batch of iid draws:
+///   - MvNormal ([`mvnormal_sample`]): one `rng_bit_generator` advance sized to
+///     `[m, d]` (a genuine `tensor<m×d>` draw — the m rows are independent), one
+///     shared `stablehlo.cholesky` on the `[d, d]` cov, and the row-wise affine
+///     `mu + L·z_i` for all rows as a batched [`Emitter::batched_row_matvec`]
+///     (`z · Lᵀ`), with `mu` broadcast across the rows.
+///   - Dirichlet ([`dirichlet_sample`]): its per-component `g_j ~ Gamma(α_j, 1)`
+///     unroll (one [`draw_gamma`] per component) fans out with NO rank-3
+///     machinery — under the `[m]` fan-out shape each [`draw_gamma`] dispatches
+///     to [`draw_gamma_batched`], yielding an `[m]` column per component. The
+///     `d` columns stack on axis 0 ([`Emitter::vector`]) → `[d, m]`, reoriented
+///     to `[m, d]` by ONE new [`Emitter::transpose`] (`dims = [1, 0]`), then
+///     each row is normalized by its row-sum via
+///     [`Emitter::reduce_sum_last_axis`] then broadcast then divide — so
+///     `[m, d]`, each row a simplex, the m rows independent.
 /// - Fan-out **Tier 3 (discrete, non-elementwise)** — two discrete samplers
 ///   whose scalar draw is NOT purely elementwise, so neither belongs on the
 ///   Tier-1 list above, yet each fans out cleanly without a `while`:
@@ -551,17 +561,6 @@ pub(crate) fn lower_sample(
 ///   accepts as its `[m]` rate.
 ///
 /// Deliberately EXCLUDED (fan-out for these still refuses):
-/// - Dirichlet: its scalar `@sample` ([`dirichlet_sample`]) draws `d` SCALAR
-///   Gammas in a Rust `for` loop (via the scalar [`draw_gamma`], not the
-///   batched [`draw_gamma_batched`]) and stacks them along axis 0. Fanning to
-///   `[n, d]` needs machinery beyond what the rejection batch (Task 10a) gives:
-///   either a rank-3 `[MAXITER, n, d]` masked rejection with a per-component
-///   (`[d]`) shape parameter (generalizing [`draw_gamma_batched`], which is
-///   1-D `[n]`-only, its candidate pre-draw / accept mask / [`Emitter::
-///   dynamic_slice_row`] all rank-2), or `d` separate `[n]` batched Gammas plus
-///   a NEW `stablehlo.transpose` op form to reorient the axis-0 stack
-///   `[d, n]` → `[n, d]` (the emitter has no transpose today). Refused rather
-///   than mislowered — a clean follow-up.
 /// - The one `while` discrete sampler still not batched: Multinomial (a bounded
 ///   `while` over `n` Categorical draws) — its `while` shape is not covered by
 ///   the masked-lane loops. (Bernoulli/Geometric look like they belong on this
@@ -590,8 +589,9 @@ const FANOUT_SAFE: &[&str] = &[
     "InverseGamma",
     "Beta",
     "GeneralizedNormal",
-    // Tier 2 (batched multivariate — mvnormal_sample)
+    // Tier 2 (batched multivariate — mvnormal_sample / dirichlet_sample)
     "MvNormal",
+    "Dirichlet",
     // Tier 3 (batched discrete NON-elementwise — inner-axis reduce / broadcast):
     // each already owns (or lacks) an inner axis a plain `[m]` fan-out cannot
     // express, so neither is Tier 1. Binomial draws a rank-2 `[m, n]` uniform
@@ -2727,18 +2727,35 @@ fn generalized_normal_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitE
 }
 
 /// §08 Dirichlet's sampler, verbatim: `g_i ~ Gamma(alpha_i, 1)`, return
-/// `g / sum(g)`. The vector `alpha`'s length `n` must be statically known (to
+/// `g / sum(g)`. The vector `alpha`'s length `d` must be statically known (to
 /// unroll the per-component Gamma draws at emit time — one [`draw_gamma`] and
 /// thus one `stablehlo.while` per component); each `alpha_i` is sliced out as
 /// a `Scalar` (the same slice+reshape idiom [`vector_elem`] uses), drawn, then
-/// the `n` scalar draws are packed back into a length-`n` vector via
-/// [`Emitter::vector`] and normalized by their broadcast sum. Refuses (never
-/// panics) a dynamic-length `alpha` — refuse-don't-mislower, mirroring
-/// [`static_vector_len`]'s discipline for MvNormal.
+/// the `d` draws are packed back and normalized by their (broadcast) sum.
+/// Refuses (never panics) a dynamic-length `alpha` — refuse-don't-mislower,
+/// mirroring [`static_vector_len`]'s discipline for MvNormal.
+///
+/// Dispatches on the [`Emitter::batch_shape`] fan-out override (like every
+/// other batched sampler):
+/// - Scalar (`None`) — UNCHANGED (byte-identical): each [`draw_gamma`] is a
+///   scalar draw, the `d` scalars stack into a `[d]` vector via
+///   [`Emitter::vector`], normalized by their scalar sum.
+/// - Fanned iid `[m, d]` (`Some([m])`) — `m` independent simplex rows.
+///   [`draw_gamma`] then dispatches PER COMPONENT to [`draw_gamma_batched`],
+///   so each of the `d` components is an `[m]` column (one masked-lane
+///   `stablehlo.while` each, `d` in all — the same per-component unroll the
+///   scalar path uses, just batched over the `m` lanes; the columns are
+///   independent, each drawn from its own `stablehlo.rng` stream). The `d`
+///   columns stack on axis 0 via [`Emitter::vector`] → `[d, m]`, then a
+///   [`Emitter::transpose`] `[1, 0]` reorients to `[m, d]` (rows = draws,
+///   cols = components). Each row is normalized by its own row-sum:
+///   [`Emitter::reduce_sum_last_axis`] collapses the component axis to `[m]`,
+///   broadcast back to `[m, d]`, divide — so every row sums to 1 and the `m`
+///   rows are mutually independent (their Gamma entries are).
 fn dirichlet_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
     let alpha_id = p.field_id(e, "alpha")?;
     let alpha = e.lower_node(alpha_id)?;
-    let n = match &alpha.ty {
+    let d = match &alpha.ty {
         MlirTy::Ranked(dims) if dims.len() == 1 => dims[0].ok_or_else(|| {
             EmitError::at(
                 alpha_id,
@@ -2754,15 +2771,37 @@ fn dirichlet_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
     };
 
     let one = e.scalar(1.0);
-    let mut gammas: Vec<Value> = Vec::with_capacity(n as usize);
-    for i in 0..n {
-        let alpha_i = vector_elem(e, &alpha, i);
-        gammas.push(draw_gamma(e, &alpha_i, &one));
+    // Draw g_j ~ Gamma(alpha_j, 1) per component. `draw_gamma` reads the
+    // fan-out batch shape: scalar (None) → a scalar Gamma; fanned (Some([m])) →
+    // an `[m]` batched-Gamma column.
+    let mut gammas: Vec<Value> = Vec::with_capacity(d as usize);
+    for j in 0..d {
+        let alpha_j = vector_elem(e, &alpha, j);
+        gammas.push(draw_gamma(e, &alpha_j, &one));
     }
-    let g_vec = e.vector(&gammas);
-    let sum = e.reduce_sum(&g_vec);
-    let sum_bc = e.broadcast_in_dim(&sum, &[], g_vec.ty.clone());
-    Ok(e.div(&g_vec, &sum_bc))
+
+    match e.batch_shape() {
+        // Scalar Dirichlet — UNCHANGED (byte-identical to the pre-fan-out path):
+        // stack the `d` scalar Gammas into `[d]` and normalize by their sum.
+        None => {
+            let g_vec = e.vector(&gammas);
+            let sum = e.reduce_sum(&g_vec);
+            let sum_bc = e.broadcast_in_dim(&sum, &[], g_vec.ty.clone());
+            Ok(e.div(&g_vec, &sum_bc))
+        }
+        // Fanned iid `[m, d]`: `Emitter::vector` stacks the `d` `[m]`-columns on
+        // axis 0 → `[d, m]`; transpose to `[m, d]` (rows = draws), then normalize
+        // each row by its row-sum.
+        Some(batch) => {
+            let m = batch[0];
+            let stacked = e.vector(&gammas); // [d, m]
+            let g_mat = e.transpose(&stacked, &[1, 0]); // [m, d]
+            let row_sum = e.reduce_sum_last_axis(&g_mat); // [m]
+            let batch_ty = MlirTy::Ranked(vec![Some(m), Some(d)]);
+            let sum_bc = e.broadcast_in_dim(&row_sum, &[0], batch_ty);
+            Ok(e.div(&g_mat, &sum_bc))
+        }
+    }
 }
 
 // ---- §08 discrete + Multinomial `@sample` batch (Task 16) -------------------

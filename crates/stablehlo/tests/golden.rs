@@ -6185,9 +6185,10 @@ fn emit_sample_exponential_iid_matches_frozen_golden() {
 // are pre-drawn OUTSIDE the loop at `[MAXITER, n]` (fixed key advance →
 // reproducible), read one `[n]` row per iteration by `dynamic_slice_row`. Both
 // frozen goldens below are parse-validated against the real StableHLO parser
-// (jax 0.10.2). Vector-variate Dirichlet still refuses; the discrete samplers
-// were still refusing at this point in the file (they are batched in the later
-// Tier-3/Tier-4 batches below).
+// (jax 0.10.2). Vector-variate Dirichlet and the discrete samplers were still
+// refusing at this point in the file (Dirichlet is batched in the Tier-2
+// multivariate batch, the discrete ones in the later Tier-3/Tier-4 batches,
+// both below).
 
 /// A fanned rejection draw: `iid(Gamma(shape=2, rate=1), 4)`, value-terminal.
 const GAMMA_IID_SAMPLE_SRC: &str = "\
@@ -6325,7 +6326,8 @@ fn emit_sample_iid_gamma_reducers_fan_out() {
 // rows (`broadcast_in_dim dims = [1]`). The frozen golden below is
 // parse-validated against the real StableHLO parser (jax 0.10.2). The scalar
 // MvNormal path (`emit_sample_mvnormal_*`) is byte-identical to before.
-// Dirichlet (the other vector-variate sampler) still refuses.
+// Dirichlet (the other vector-variate sampler) is batched just below, reusing
+// the batched Gamma per component + a new `stablehlo.transpose`.
 
 /// A fanned multivariate draw: `iid(MvNormal(mu, cov), 3)` at `d = 2`, with
 /// free `mu`/`cov` (so `@sample(%key, %arg0, %arg1)`).
@@ -6395,29 +6397,77 @@ fn emit_sample_mvnormal_iid_matches_frozen_golden() {
     );
 }
 
-/// Fan-out for Dirichlet (the OTHER vector-variate sampler) still REFUSES, not
-/// mislowers: its scalar `@sample` draws `d` scalar Gammas in a Rust loop (via
-/// the scalar `draw_gamma`) and stacks them on axis 0, so fanning to `[n, d]`
-/// needs machinery beyond the Task-10a rejection batch (a rank-3 masked
-/// rejection, or a new `stablehlo.transpose` — see `FANOUT_SAFE`'s doc). MvNormal
-/// (Task 10b) is the only batched-multivariate sampler for now. (Dirichlet
-/// refuses whether the determiniser or the emitter catches it first; either way
-/// `emit` errors rather than producing a wrong lowering.)
+/// A fanned Dirichlet draw: `iid(Dirichlet(alpha = [2, 3, 4]), 5)` — the OTHER
+/// vector-variate sampler (cf. MvNormal). Its per-component `g_j ~ Gamma(α_j,
+/// 1)` unroll fans out with NO rank-3 machinery: under the `[5]` fan-out shape
+/// each component's `draw_gamma` dispatches to the batched Marsaglia–Tsang
+/// `draw_gamma_batched` (an `[5]` column, one masked `while` per component),
+/// the `d = 3` columns stack on axis 0 → `[3, 5]`, ONE new `stablehlo.transpose`
+/// reorients to `[5, 3]` (rows = draws), then each row is normalized by its
+/// row-sum (`reduce_sum_last_axis` over the component axis + broadcast +
+/// divide) — `[5, 3]`, each row a simplex, the 5 rows independent. The frozen
+/// golden below is parse-validated against the real StableHLO parser (jax
+/// 0.10.2). The scalar Dirichlet path (`emit_sample_dirichlet_*`) is
+/// byte-identical to before.
+const DIRICHLET_IID_SAMPLE_SRC: &str = "\
+s = rnginit(0)
+xs ~ iid(Dirichlet(alpha = [2.0, 3.0, 4.0]), 5)
+draws = rand(s, lawof(xs))
+";
+
+/// The fanned Dirichlet draw returns a `tensor<5x3xf32>` (`[m, d]`, not a bare
+/// `[d]` simplex) alongside the advanced key, via one masked `stablehlo.while`
+/// PER component (three, each carrying a `tensor<5xi1>` per-lane accept mask),
+/// the `[3, 5]` column stack reoriented by a `stablehlo.transpose dims = [1, 0]`
+/// to `[5, 3]`, then the per-row normalize (last-axis reduce + `dims = [0]`
+/// row-broadcast + divide).
 #[test]
-fn emit_sample_iid_dirichlet_refuses() {
-    let src = "s = rnginit(0)\nxs ~ iid(Dirichlet(alpha = [1.0, 1.0, 1.0]), 4)\ndraws = rand(s, lawof(xs))\n";
-    let m = flatppl_syntax::parse(src).expect("parse");
-    let mut m = m;
-    let _ = flatppl_infer::infer(&mut m);
-    let determinized = flatppl_determinizer::determinize(&m);
-    let refused = match determinized {
-        Err(_) => true,
-        Ok(d) => flatppl_stablehlo::emit(&d, flatppl_stablehlo::Mode::Sample, &Default::default())
-            .is_err(),
-    };
+fn emit_sample_dirichlet_iid_has_expected_structure() {
+    let d = determinize_src(DIRICHLET_IID_SAMPLE_SRC);
+    let out = emit_sample(&d);
+
     assert!(
-        refused,
-        "iid(Dirichlet, n) (vector variate) must refuse, not mislower"
+        out.contains("func.func @sample(%key: tensor<2xui64>)"),
+        "missing @sample(%key) (literal alpha → no free params) in:\n{out}"
+    );
+    assert!(
+        out.contains("-> (tensor<5x3xf32>, tensor<2xui64>)"),
+        "fanned Dirichlet must return the [5, 3] batch + advanced key, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.while").count(),
+        3,
+        "one masked batched rejection loop per Dirichlet component, in:\n{out}"
+    );
+    assert!(
+        out.contains("tensor<5xi1>"),
+        "each component's per-lane accept mask must be tensor<5xi1>, in:\n{out}"
+    );
+    assert!(
+        out.contains("stablehlo.transpose") && out.contains("dims = [1, 0]"),
+        "the axis-0 [3, 5] column stack must be transposed to the [5, 3] batch, in:\n{out}"
+    );
+    assert!(
+        out.contains("applies stablehlo.add across dimensions = [1] : (tensor<5x3xf32>"),
+        "each row's Gamma sum reduces the INNER component axis (the m rows survive), in:\n{out}"
+    );
+    assert!(
+        out.contains("dims = [0] : (tensor<5xf32>) -> tensor<5x3xf32>"),
+        "the row-sum [5] must broadcast back across the component axis → [5, 3], in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// Freeze the exact emitted text (parse-validated against the real StableHLO
+/// parser): any drift must be a deliberate, reviewed change to this golden.
+#[test]
+fn emit_sample_dirichlet_iid_matches_frozen_golden() {
+    let d = determinize_src(DIRICHLET_IID_SAMPLE_SRC);
+    let out = emit_sample(&d);
+    let golden = include_str!("goldens/dirichlet_iid_sample.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted fanned Dirichlet @sample drifted from tests/goldens/dirichlet_iid_sample.mlir"
     );
 }
 
