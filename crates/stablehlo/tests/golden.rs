@@ -6642,6 +6642,18 @@ xs ~ iid(Categorical0(p = [0.2, 0.3, 0.5]), 4)
 draws = rand(s, lawof(xs))
 ";
 
+/// A fanned SINGLE-CATEGORY Categorical draw: `iid(Categorical(p=[1.0]), 4)`.
+/// `n = 1` runs the inverse-CDF unroll zero times (`n - 1 = 0` iterations), so
+/// `count` never leaves the scalar `base` — this exercises `draw_categorical`'s
+/// degenerate-guard broadcast (`registry.rs`), which must still lift it to the
+/// `[4]` batch: a fanned draw is `[m]`-shaped like every other count, even for
+/// this constant one-category variate.
+const CATEGORICAL_SINGLE_IID_SAMPLE_SRC: &str = "\
+s = rnginit(0)
+xs ~ iid(Categorical(p = [1.0]), 4)
+draws = rand(s, lawof(xs))
+";
+
 /// The fanned Binomial draw returns a `tensor<4xf32>` (not a scalar) alongside
 /// the advanced key, drawn as a GENUINE rank-2 `[4, 5]` batch (one
 /// `rng_bit_generator` sized to `tensor<4x5xui32>` — 4 independent variates,
@@ -6757,4 +6769,58 @@ fn emit_sample_categorical0_iid_has_expected_structure() {
     assert_eq!(out.matches("stablehlo.compare").count(), 2);
     assert_eq!(out.matches("stablehlo.select").count(), 2);
     assert!(is_delimiter_balanced(&out));
+}
+
+/// The degenerate `n = 1` case: the inverse-CDF unroll runs ZERO iterations
+/// (`n - 1 = 0`), so `count` never leaves the scalar `base` — this is the one
+/// path `draw_categorical`'s fan-out relies on an explicit
+/// `broadcast_in_dim` guard for (see `registry.rs`) rather than the unroll's
+/// auto-broadcasting compare/select/add. Must still return the `[4]` batch,
+/// NOT a scalar `tensor<f32>` — a fanned draw is `[m]`-shaped like every
+/// other count, even for this constant one-category variate.
+#[test]
+fn emit_sample_categorical_single_category_iid_has_expected_structure() {
+    let d = determinize_src(CATEGORICAL_SINGLE_IID_SAMPLE_SRC);
+    let out = emit_sample(&d);
+
+    assert!(
+        out.contains("-> (tensor<4xf32>, tensor<2xui64>)"),
+        "fanned single-category Categorical must return the [4] batch (not a \
+         scalar) + advanced key, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.rng_bit_generator").count(),
+        1,
+        "one rng_bit_generator advance for the whole [4] batch, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.compare").count(),
+        0,
+        "n - 1 = 0 comparisons: the unroll never runs, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.select").count(),
+        0,
+        "n - 1 = 0 selects: the unroll never runs, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.broadcast_in_dim").count(),
+        1,
+        "the degenerate guard's explicit broadcast of the scalar base to [4], \
+         in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// Freeze the exact emitted text (parse-validated against the real StableHLO
+/// parser): any drift must be a deliberate, reviewed change to this golden.
+#[test]
+fn emit_sample_categorical_single_category_iid_matches_frozen_golden() {
+    let d = determinize_src(CATEGORICAL_SINGLE_IID_SAMPLE_SRC);
+    let out = emit_sample(&d);
+    let golden = include_str!("goldens/categorical_single_iid_sample.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted fanned @sample drifted from tests/goldens/categorical_single_iid_sample.mlir"
+    );
 }
