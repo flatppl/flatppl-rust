@@ -100,6 +100,20 @@ fn builtin_sample_hepphys_argus_variate() {
 }
 
 #[test]
+fn builtin_sample_fanned_variate_is_array() {
+    let m = meta_of(
+        "state = rnginit(0)\nxs, s2 = builtin_sample(state, Normal, record(mu = 0.0, sigma = 1.0), 5)",
+        "builtin_sample",
+    );
+    // A trailing size arg array-ifies the variate into an IID array of that shape
+    // (spec §07 builtin_sample): (X, new_rngstate) with X of size (n, m, …).
+    assert!(
+        m.contains("(%tuple (%array 1 (5) (%scalar real)) %rngstate)"),
+        "fanned builtin_sample variate must be array[5] of real in the result tuple; got: {m}"
+    );
+}
+
+#[test]
 fn builtin_transports_are_variate_typed() {
     for op in [
         "builtin_touniform",

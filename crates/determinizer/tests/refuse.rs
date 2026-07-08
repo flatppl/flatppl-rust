@@ -821,7 +821,7 @@ draws = rand(s, lawof(record(c = draw(Normal(mu = mu, sigma = 1.0)))))";
 // here since they are the exact shapes the former refusal guarded; full
 // tuple-lowering coverage lives in `tests/sample_golden.rs`.
 #[test]
-fn destructured_rand_lowers_to_tuple() {
+fn destructured_rand_in_refuse_suite_lowers_to_tuple() {
     let src = "\
 s = rnginit(0)
 x = draw(Normal(mu = 0.0, sigma = 1.0))
@@ -832,6 +832,10 @@ v, s2 = rand(s, lawof(record(x = x)))";
     assert!(
         pir.contains("(tuple "),
         "expected tuple(value, advanced_rng):\n{pir}"
+    );
+    assert!(
+        pir.contains("builtin_sample"),
+        "expected a builtin_sample under the tuple:\n{pir}"
     );
     assert!(
         flatppl_determinizer::is_flatpdl(&out).is_ok(),
@@ -886,6 +890,10 @@ v = get0(draws, 0)";
     assert!(
         pir.contains("(tuple "),
         "expected tuple(value, advanced_rng):\n{pir}"
+    );
+    assert!(
+        pir.contains("builtin_sample"),
+        "expected a builtin_sample under the tuple:\n{pir}"
     );
     assert!(
         flatppl_determinizer::is_flatpdl(&out).is_ok(),

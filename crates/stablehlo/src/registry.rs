@@ -410,10 +410,9 @@ pub(crate) fn lower_sample(
     let (rng, ctor, kernel_input, batch_n) = match *args {
         [rng, ctor, kernel_input] => (rng, ctor, kernel_input, None),
         [rng, ctor, kernel_input, n_arg] => {
-            // Read `n` straight from the trailing literal: `infer`'s
-            // builtin_sample rule ignores the n dim (the inferred variate type
-            // is wrongly scalar), so the literal is the ONLY trustworthy source
-            // — a non-literal (or non-positive) count refuses, never guesses.
+            // Read `n` from the trailing literal — a static positive-integer
+            // invariant the batched draw shape needs at emit time (refuses a
+            // non-literal `n` below), independent of the inferred variate type.
             let n = match e.node(n_arg) {
                 Node::Lit(Scalar::Int(i)) if *i > 0 => *i as u64,
                 _ => {
@@ -500,8 +499,15 @@ pub(crate) fn lower_sample(
 /// reading the builder below):
 ///
 /// - Fan-out **Tier 1** — purely elementwise builders (only [`Emitter::rng`]
-///   plus shape-preserving unary / [`Emitter::binary`] ops): Normal/Exponential/
-///   Uniform/Cauchy/Logistic/Pareto/Weibull/LogNormal.
+///   plus shape-preserving unary / [`Emitter::binary`] ops, and — since 10a's
+///   auto-broadcasting [`Emitter::compare`]/[`Emitter::select`] — the
+///   `select`-on-a-`compare` idiom too): Normal/Exponential/Uniform/Cauchy/
+///   Logistic/Pareto/Weibull/LogNormal (continuous); [`laplace_sample`] (its
+///   `sgn(U - 1/2)` composed from that same `compare`/`select` pair); and two
+///   DISCRETE samplers that happen to be straight-line elementwise rather than
+///   `while`/unrolled — [`bernoulli_sample`] (`select(U < p, 1, 0)`) and
+///   [`geometric_sample`] (`floor(log(U) / log(1 - p))`, the only Tier-1
+///   builder needing [`Emitter::floor`], itself shape-preserving).
 /// - Fan-out **Tier 2** — the Marsaglia–Tsang rejection family, batched via
 ///   [`draw_gamma_batched`]'s per-lane masked `stablehlo.while` (a
 ///   `tensor<n×i1>` accept mask redraws only rejected lanes): Gamma and every
@@ -511,37 +517,59 @@ pub(crate) fn lower_sample(
 ///   auto-broadcast a scalar operand over a `[n]` batch, like
 ///   [`Emitter::binary`] already did — GeneralizedNormal's per-lane sign and
 ///   the Gamma boost need it.)
-/// - Fan-out **Tier 2 (multivariate)** — MvNormal, whose variate is itself a
-///   `d`-vector: the fanned draw is a rank-2 `[n, d]` batch of iid draws. One
-///   `rng_bit_generator` advance sized to `[n, d]` (a genuine `tensor<n×d>`
-///   draw — the n rows are independent), one shared `stablehlo.cholesky` on the
-///   `[d, d]` cov, and the row-wise affine `mu + L·z_i` for all rows as a
-///   batched [`Emitter::batched_row_matvec`] (`z · Lᵀ`), with `mu` broadcast
-///   across the rows. See [`mvnormal_sample`].
+/// - Fan-out **Tier 2 (multivariate)** — the two vector-variate samplers,
+///   whose variate is itself a `d`-vector, so the fanned draw is a rank-2
+///   `[m, d]` batch of iid draws:
+///   - MvNormal ([`mvnormal_sample`]): one `rng_bit_generator` advance sized to
+///     `[m, d]` (a genuine `tensor<m×d>` draw — the m rows are independent), one
+///     shared `stablehlo.cholesky` on the `[d, d]` cov, and the row-wise affine
+///     `mu + L·z_i` for all rows as a batched [`Emitter::batched_row_matvec`]
+///     (`z · Lᵀ`), with `mu` broadcast across the rows.
+///   - Dirichlet ([`dirichlet_sample`]): its per-component `g_j ~ Gamma(α_j, 1)`
+///     unroll (one [`draw_gamma`] per component) fans out with NO rank-3
+///     machinery — under the `[m]` fan-out shape each [`draw_gamma`] dispatches
+///     to [`draw_gamma_batched`], yielding an `[m]` column per component. The
+///     `d` columns stack on axis 0 ([`Emitter::vector`]) → `[d, m]`, reoriented
+///     to `[m, d]` by ONE new [`Emitter::transpose`] (`dims = [1, 0]`), then
+///     each row is normalized by its row-sum via
+///     [`Emitter::reduce_sum_last_axis`] then broadcast then divide — so
+///     `[m, d]`, each row a simplex, the m rows independent.
+/// - Fan-out **Tier 3 (discrete, non-elementwise)** — two discrete samplers
+///   whose scalar draw is NOT purely elementwise, so neither belongs on the
+///   Tier-1 list above, yet each fans out cleanly without a `while`:
+///   - Binomial ([`binomial_sample`]): its scalar draw already owns an inner
+///     axis — the `n` Bernoulli trials it `reduce_sum`s to one count. The fanned
+///     draw is a rank-2 `[m, n]` uniform batch (`m` independent variates, each
+///     an `n`-Bernoulli row — a genuine `[m, n]` `rng_bit_generator` output, one
+///     advance, rows independent) reduced over the INNER count axis to `[m]` by
+///     the NEW [`Emitter::reduce_sum_last_axis`] (the outer `m` lanes survive,
+///     unlike the scalar path's full [`Emitter::reduce_sum`]).
+///   - Categorical/Categorical0 ([`draw_categorical`]): NO new primitive — one
+///     scalar `U` becomes a `[m]` draw under the fan-out batch shape, and the
+///     inverse-CDF unroll's running count is promoted to `[m]` by the
+///     auto-broadcasting [`Emitter::compare`]/[`Emitter::select`]/
+///     [`Emitter::add`] (a single-category `p` — an empty unroll — is lifted to
+///     `[m]` explicitly, see [`draw_categorical`]).
+/// - Fan-out **Tier 4 (discrete inverse-CDF `while`)** — Poisson and the two
+///   NegativeBinomial Gamma–Poisson mixtures, batched via
+///   [`draw_poisson_batched`]'s PER-LANE bounded CDF walk (the same masked-while
+///   plus [`Emitter::reduce_all`] pattern [`draw_gamma_batched`] uses): one
+///   scalar counter `k` walked in lockstep across `[m]` per-lane
+///   `cum`/`pmf`/`done`/`result`, latching each lane's first `U <= F(k)`. The
+///   NegativeBinomial mixtures need NO extra machinery — [`draw_gamma_batched`]
+///   already yields the `[m]` per-lane `lambda`, which [`draw_poisson_batched`]
+///   accepts as its `[m]` rate.
 ///
 /// Deliberately EXCLUDED (fan-out for these still refuses):
-/// - Dirichlet: its scalar `@sample` ([`dirichlet_sample`]) draws `d` SCALAR
-///   Gammas in a Rust `for` loop (via the scalar [`draw_gamma`], not the
-///   batched [`draw_gamma_batched`]) and stacks them along axis 0. Fanning to
-///   `[n, d]` needs machinery beyond what the rejection batch (Task 10a) gives:
-///   either a rank-3 `[MAXITER, n, d]` masked rejection with a per-component
-///   (`[d]`) shape parameter (generalizing [`draw_gamma_batched`], which is
-///   1-D `[n]`-only, its candidate pre-draw / accept mask / [`Emitter::
-///   dynamic_slice_row`] all rank-2), or `d` separate `[n]` batched Gammas plus
-///   a NEW `stablehlo.transpose` op form to reorient the axis-0 stack
-///   `[d, n]` → `[n, d]` (the emitter has no transpose today). Refused rather
-///   than mislowered — a clean follow-up.
-/// - The discrete `while`/inverse-CDF samplers ([`draw_poisson`] /
-///   [`draw_categorical`]): Poisson/NegativeBinomial/NegativeBinomial2/
-///   Binomial/Multinomial/Categorical/Categorical0/Bernoulli/Geometric — not
-///   yet batched (a later tier); their `while`/unroll shapes are not covered by
-///   [`draw_gamma_batched`]'s masked-lane loop.
-/// - [`laplace_sample`]: now elementwise-batchable too (its `sgn` uses the same
-///   auto-broadcasting [`Emitter::compare`]/[`Emitter::select`] as
-///   GeneralizedNormal) — left refused here only to keep this change scoped to
-///   the rejection family; a trivial Tier-1 follow-up.
+/// - The one `while` discrete sampler still not batched: Multinomial (a bounded
+///   `while` over `n` Categorical draws) — its `while` shape is not covered by
+///   the masked-lane loops. (Bernoulli/Geometric look like they belong on this
+///   list too — they're discrete — but their builders are straight-line
+///   elementwise, so they're Tier 1 above; Binomial and Categorical/Categorical0
+///   are the discrete Tier-3 cases; Poisson and the NegativeBinomial mixtures
+///   are the Tier-4 cases just admitted.)
 const FANOUT_SAFE: &[&str] = &[
-    // Tier 1 (elementwise)
+    // Tier 1 (elementwise continuous)
     "Normal",
     "Exponential",
     "Uniform",
@@ -550,6 +578,10 @@ const FANOUT_SAFE: &[&str] = &[
     "Pareto",
     "Weibull",
     "LogNormal",
+    "Laplace",
+    // Tier 1 (elementwise discrete — straight-line, not while/unroll)
+    "Bernoulli",
+    "Geometric",
     // Tier 2 (batched Marsaglia–Tsang rejection — draw_gamma_batched)
     "Gamma",
     "ChiSquared",
@@ -557,8 +589,30 @@ const FANOUT_SAFE: &[&str] = &[
     "InverseGamma",
     "Beta",
     "GeneralizedNormal",
-    // Tier 2 (batched multivariate — mvnormal_sample)
+    // Tier 2 (batched multivariate — mvnormal_sample / dirichlet_sample)
     "MvNormal",
+    "Dirichlet",
+    // Tier 3 (batched discrete NON-elementwise — inner-axis reduce / broadcast):
+    // each already owns (or lacks) an inner axis a plain `[m]` fan-out cannot
+    // express, so neither is Tier 1. Binomial draws a rank-2 `[m, n]` uniform
+    // (m lanes × n Bernoulli trials) reduced over the inner count axis to `[m]`
+    // by `reduce_sum_last_axis` (see `binomial_sample`); Categorical/Categorical0
+    // fan out with NO new primitive — their scalar-vs-batch running count is
+    // promoted to `[m]` by the auto-broadcasting `compare`/`select`/`add`
+    // (see `draw_categorical`).
+    "Binomial",
+    "Categorical",
+    "Categorical0",
+    // Tier 4 (batched discrete inverse-CDF `while` — draw_poisson_batched):
+    // Poisson's bounded CDF walk done PER LANE (`[m]` cum/pmf/done/result, one
+    // scalar counter, `reduce_all` over the done mask — the `draw_gamma_batched`
+    // masked-while pattern), plus the two NegativeBinomial Gamma–Poisson
+    // mixtures, which reduce with NO extra machinery to `draw_gamma_batched`
+    // (the `[m]` per-lane `lambda`) feeding `draw_poisson_batched` (that `[m]`
+    // rate).
+    "Poisson",
+    "NegativeBinomial",
+    "NegativeBinomial2",
 ];
 
 // ---- §08 Normal -------------------------------------------------------------
@@ -602,9 +656,7 @@ fn normal_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
     let mu = p.get(e, "mu")?;
     let sigma = p.get(e, "sigma")?;
 
-    let zero = e.scalar(0.0);
-    let one = e.scalar(1.0);
-    let z = e.rng("NORMAL", &zero, &one, &mu.ty);
+    let z = e.rng("NORMAL", &mu.ty);
 
     let sigma_z = e.mul(&sigma, &z);
     Ok(e.add(&mu, &sigma_z))
@@ -645,9 +697,7 @@ fn cauchy_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
     let location = p.get(e, "location")?;
     let scale = p.get(e, "scale")?;
 
-    let zero = e.scalar(0.0);
-    let one = e.scalar(1.0);
-    let u = e.rng("UNIFORM", &zero, &one, &location.ty);
+    let u = e.rng("UNIFORM", &location.ty);
 
     let half = e.scalar(0.5);
     let centered = e.sub(&u, &half);
@@ -696,9 +746,8 @@ fn logistic_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
     let mu = p.get(e, "mu")?;
     let s = p.get(e, "s")?;
 
-    let zero = e.scalar(0.0);
     let one = e.scalar(1.0);
-    let u = e.rng("UNIFORM", &zero, &one, &mu.ty);
+    let u = e.rng("UNIFORM", &mu.ty);
 
     let one_minus_u = e.sub(&one, &u);
     let ratio = e.div(&u, &one_minus_u);
@@ -743,7 +792,7 @@ fn laplace_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
 
     let zero = e.scalar(0.0);
     let one = e.scalar(1.0);
-    let u = e.rng("UNIFORM", &zero, &one, &location.ty);
+    let u = e.rng("UNIFORM", &location.ty);
 
     let half = e.scalar(0.5);
     let centered = e.sub(&u, &half);
@@ -796,9 +845,7 @@ fn exponential_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, E
 fn exponential_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
     let rate = p.get(e, "rate")?;
 
-    let zero = e.scalar(0.0);
-    let one = e.scalar(1.0);
-    let u = e.rng("UNIFORM", &zero, &one, &rate.ty);
+    let u = e.rng("UNIFORM", &rate.ty);
 
     let log_u = e.log(&u);
     let neg_log_u = e.neg(&log_u);
@@ -866,9 +913,8 @@ fn weibull_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
     let shape = p.get(e, "shape")?;
     let scale = p.get(e, "scale")?;
 
-    let zero = e.scalar(0.0);
     let one = e.scalar(1.0);
-    let u = e.rng("UNIFORM", &zero, &one, &shape.ty);
+    let u = e.rng("UNIFORM", &shape.ty);
 
     let log_u = e.log(&u);
     let neg_log_u = e.neg(&log_u);
@@ -907,9 +953,7 @@ fn pareto_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
     let shape = p.get(e, "shape")?;
     let scale = p.get(e, "scale")?;
 
-    let zero = e.scalar(0.0);
-    let one = e.scalar(1.0);
-    let u = e.rng("UNIFORM", &zero, &one, &shape.ty);
+    let u = e.rng("UNIFORM", &shape.ty);
 
     let neg_one = e.scalar(-1.0);
     let neg_inv_shape = e.div(&neg_one, &shape);
@@ -1021,9 +1065,7 @@ fn lognormal_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
     let mu = p.get(e, "mu")?;
     let sigma = p.get(e, "sigma")?;
 
-    let zero = e.scalar(0.0);
-    let one = e.scalar(1.0);
-    let z = e.rng("NORMAL", &zero, &one, &mu.ty);
+    let z = e.rng("NORMAL", &mu.ty);
 
     let sigma_z = e.mul(&sigma, &z);
     let mu_plus_sigma_z = e.add(&mu, &sigma_z);
@@ -1141,9 +1183,7 @@ fn uniform_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
             )
         })?;
 
-    let zero = e.scalar(0.0);
-    let one = e.scalar(1.0);
-    let u = e.rng("UNIFORM", &zero, &one, &MlirTy::Scalar);
+    let u = e.rng("UNIFORM", &MlirTy::Scalar);
 
     let a = e.scalar(lo);
     let width = e.scalar(hi - lo);
@@ -1799,15 +1839,13 @@ fn mvnormal_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
     // fanned): `L` is a deterministic function of `cov`, not of the rng.
     let l = e.cholesky(&cov);
 
-    let zero = e.scalar(0.0);
-    let one = e.scalar(1.0);
     let vec_ty = MlirTy::Ranked(vec![Some(d)]);
 
     match e.batch_shape() {
         // Scalar MvNormal — UNCHANGED (byte-identical to the pre-Task-10b path):
         // draw one `[d]` standard normal `z`, return `mu + L·z`.
         None => {
-            let z = e.rng("NORMAL", &zero, &one, &vec_ty);
+            let z = e.rng("NORMAL", &vec_ty);
             let l_z = e.matvec(&l, &z);
             Ok(e.add(&mu, &l_z))
         }
@@ -1823,7 +1861,7 @@ fn mvnormal_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
             // across n. `Emitter::rng` sizes to the batch shape, so widen it to
             // `[n, d]` for the draw, then restore `lower_sample`'s `[n]`.
             e.set_batch_shape(vec![n, d]);
-            let z = e.rng("NORMAL", &zero, &one, &vec_ty);
+            let z = e.rng("NORMAL", &vec_ty);
             e.set_batch_shape(vec![n]);
             // Row-wise `L·z_i` for all rows = `z · Lᵀ` → `[n, d]`.
             let l_z = e.batched_row_matvec(&z, &l);
@@ -2410,8 +2448,8 @@ fn draw_gamma_scalar(e: &mut Emitter, shape: &Value, rate: &Value) -> Value {
     // Pre-draw the candidate batches OUTSIDE the loop (see the batch doc
     // comment): Z ~ Normal(0, 1), U ~ Uniform(0, 1), each length MAXITER.
     let batch_ty = MlirTy::Ranked(vec![Some(MAXITER)]);
-    let z_batch = e.rng("NORMAL", &zero, &one, &batch_ty);
-    let u_batch = e.rng("UNIFORM", &zero, &one, &batch_ty);
+    let z_batch = e.rng("NORMAL", &batch_ty);
+    let u_batch = e.rng("UNIFORM", &batch_ty);
 
     let i0 = e.int_const(0);
     let acc0 = e.bool_const(false);
@@ -2472,7 +2510,7 @@ fn draw_gamma_scalar(e: &mut Emitter, shape: &Value, rate: &Value) -> Value {
     let g0 = results[2].clone();
 
     // boost = select(shape < 1, U0^(1/shape), 1) ; result = g0 * boost / rate.
-    let u0 = e.rng("UNIFORM", &zero, &one, &MlirTy::Scalar);
+    let u0 = e.rng("UNIFORM", &MlirTy::Scalar);
     let inv_shape = e.div(&one, shape);
     let boost_raw = e.pow(&u0, &inv_shape);
     let boost = e.select(&shape_lt_one, &boost_raw, &one);
@@ -2518,8 +2556,8 @@ fn draw_gamma_batched(e: &mut Emitter, shape: &Value, rate: &Value, n: u64) -> V
     // advance → reproducible). Size them via a temporary [MAXITER, n] batch
     // shape, then restore the [n] fan-out shape for the trailing boost uniform.
     e.set_batch_shape(vec![MAXITER, n]);
-    let z_batch = e.rng("NORMAL", &zero, &one, &MlirTy::Scalar);
-    let u_batch = e.rng("UNIFORM", &zero, &one, &MlirTy::Scalar);
+    let z_batch = e.rng("NORMAL", &MlirTy::Scalar);
+    let u_batch = e.rng("UNIFORM", &MlirTy::Scalar);
     e.set_batch_shape(vec![n]);
 
     let i0 = e.int_const(0);
@@ -2594,7 +2632,7 @@ fn draw_gamma_batched(e: &mut Emitter, shape: &Value, rate: &Value, n: u64) -> V
     // boost = select(shape < 1, U0^(1/shape), 1) ; result = g0 * boost / rate.
     // U0 is now a [n] per-lane uniform (batch shape restored above); the scalar
     // `shape_lt_one` predicate and scalar `1` broadcast over the [n] boost.
-    let u0 = e.rng("UNIFORM", &zero, &one, &MlirTy::Scalar);
+    let u0 = e.rng("UNIFORM", &MlirTy::Scalar);
     let inv_shape = e.div(&one, shape);
     let boost_raw = e.pow(&u0, &inv_shape);
     let boost = e.select(&shape_lt_one, &boost_raw, &one);
@@ -2641,9 +2679,7 @@ fn studentt_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
     let rate = e.scalar(0.5);
     let v = draw_gamma(e, &half_nu, &rate);
 
-    let zero = e.scalar(0.0);
-    let one = e.scalar(1.0);
-    let z = e.rng("NORMAL", &zero, &one, &MlirTy::Scalar);
+    let z = e.rng("NORMAL", &MlirTy::Scalar);
 
     let v_over_nu = e.div(&v, &nu);
     let sqrt_term = e.sqrt(&v_over_nu);
@@ -2677,7 +2713,7 @@ fn generalized_normal_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitE
     let g_pow = e.pow(&g, &inv_beta);
 
     let zero = e.scalar(0.0);
-    let u = e.rng("UNIFORM", &zero, &one, &MlirTy::Scalar);
+    let u = e.rng("UNIFORM", &MlirTy::Scalar);
     let half = e.scalar(0.5);
     let centered = e.sub(&u, &half);
     let is_nonneg = e.compare("GE", &centered, &zero);
@@ -2691,18 +2727,35 @@ fn generalized_normal_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitE
 }
 
 /// §08 Dirichlet's sampler, verbatim: `g_i ~ Gamma(alpha_i, 1)`, return
-/// `g / sum(g)`. The vector `alpha`'s length `n` must be statically known (to
+/// `g / sum(g)`. The vector `alpha`'s length `d` must be statically known (to
 /// unroll the per-component Gamma draws at emit time — one [`draw_gamma`] and
 /// thus one `stablehlo.while` per component); each `alpha_i` is sliced out as
 /// a `Scalar` (the same slice+reshape idiom [`vector_elem`] uses), drawn, then
-/// the `n` scalar draws are packed back into a length-`n` vector via
-/// [`Emitter::vector`] and normalized by their broadcast sum. Refuses (never
-/// panics) a dynamic-length `alpha` — refuse-don't-mislower, mirroring
-/// [`static_vector_len`]'s discipline for MvNormal.
+/// the `d` draws are packed back and normalized by their (broadcast) sum.
+/// Refuses (never panics) a dynamic-length `alpha` — refuse-don't-mislower,
+/// mirroring [`static_vector_len`]'s discipline for MvNormal.
+///
+/// Dispatches on the [`Emitter::batch_shape`] fan-out override (like every
+/// other batched sampler):
+/// - Scalar (`None`) — UNCHANGED (byte-identical): each [`draw_gamma`] is a
+///   scalar draw, the `d` scalars stack into a `[d]` vector via
+///   [`Emitter::vector`], normalized by their scalar sum.
+/// - Fanned iid `[m, d]` (`Some([m])`) — `m` independent simplex rows.
+///   [`draw_gamma`] then dispatches PER COMPONENT to [`draw_gamma_batched`],
+///   so each of the `d` components is an `[m]` column (one masked-lane
+///   `stablehlo.while` each, `d` in all — the same per-component unroll the
+///   scalar path uses, just batched over the `m` lanes; the columns are
+///   independent, each drawn from its own `stablehlo.rng` stream). The `d`
+///   columns stack on axis 0 via [`Emitter::vector`] → `[d, m]`, then a
+///   [`Emitter::transpose`] `[1, 0]` reorients to `[m, d]` (rows = draws,
+///   cols = components). Each row is normalized by its own row-sum:
+///   [`Emitter::reduce_sum_last_axis`] collapses the component axis to `[m]`,
+///   broadcast back to `[m, d]`, divide — so every row sums to 1 and the `m`
+///   rows are mutually independent (their Gamma entries are).
 fn dirichlet_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
     let alpha_id = p.field_id(e, "alpha")?;
     let alpha = e.lower_node(alpha_id)?;
-    let n = match &alpha.ty {
+    let d = match &alpha.ty {
         MlirTy::Ranked(dims) if dims.len() == 1 => dims[0].ok_or_else(|| {
             EmitError::at(
                 alpha_id,
@@ -2718,15 +2771,37 @@ fn dirichlet_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
     };
 
     let one = e.scalar(1.0);
-    let mut gammas: Vec<Value> = Vec::with_capacity(n as usize);
-    for i in 0..n {
-        let alpha_i = vector_elem(e, &alpha, i);
-        gammas.push(draw_gamma(e, &alpha_i, &one));
+    // Draw g_j ~ Gamma(alpha_j, 1) per component. `draw_gamma` reads the
+    // fan-out batch shape: scalar (None) → a scalar Gamma; fanned (Some([m])) →
+    // an `[m]` batched-Gamma column.
+    let mut gammas: Vec<Value> = Vec::with_capacity(d as usize);
+    for j in 0..d {
+        let alpha_j = vector_elem(e, &alpha, j);
+        gammas.push(draw_gamma(e, &alpha_j, &one));
     }
-    let g_vec = e.vector(&gammas);
-    let sum = e.reduce_sum(&g_vec);
-    let sum_bc = e.broadcast_in_dim(&sum, &[], g_vec.ty.clone());
-    Ok(e.div(&g_vec, &sum_bc))
+
+    match e.batch_shape() {
+        // Scalar Dirichlet — UNCHANGED (byte-identical to the pre-fan-out path):
+        // stack the `d` scalar Gammas into `[d]` and normalize by their sum.
+        None => {
+            let g_vec = e.vector(&gammas);
+            let sum = e.reduce_sum(&g_vec);
+            let sum_bc = e.broadcast_in_dim(&sum, &[], g_vec.ty.clone());
+            Ok(e.div(&g_vec, &sum_bc))
+        }
+        // Fanned iid `[m, d]`: `Emitter::vector` stacks the `d` `[m]`-columns on
+        // axis 0 → `[d, m]`; transpose to `[m, d]` (rows = draws), then normalize
+        // each row by its row-sum.
+        Some(batch) => {
+            let m = batch[0];
+            let stacked = e.vector(&gammas); // [d, m]
+            let g_mat = e.transpose(&stacked, &[1, 0]); // [m, d]
+            let row_sum = e.reduce_sum_last_axis(&g_mat); // [m]
+            let batch_ty = MlirTy::Ranked(vec![Some(m), Some(d)]);
+            let sum_bc = e.broadcast_in_dim(&row_sum, &[0], batch_ty);
+            Ok(e.div(&g_mat, &sum_bc))
+        }
+    }
 }
 
 // ---- §08 discrete + Multinomial `@sample` batch (Task 16) -------------------
@@ -2771,7 +2846,7 @@ fn bernoulli_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
     let prob = p.get(e, "p")?;
     let zero = e.scalar(0.0);
     let one = e.scalar(1.0);
-    let u = e.rng("UNIFORM", &zero, &one, &prob.ty);
+    let u = e.rng("UNIFORM", &prob.ty);
     let lt = e.compare("LT", &u, &prob);
     Ok(e.select(&lt, &one, &zero))
 }
@@ -2783,9 +2858,8 @@ fn bernoulli_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
 /// sampler needing [`Emitter::floor`].
 fn geometric_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
     let prob = p.get(e, "p")?;
-    let zero = e.scalar(0.0);
     let one = e.scalar(1.0);
-    let u = e.rng("UNIFORM", &zero, &one, &prob.ty);
+    let u = e.rng("UNIFORM", &prob.ty);
     let log_u = e.log(&u);
     let one_minus_p = e.sub(&one, &prob);
     let log_one_minus_p = e.log(&one_minus_p);
@@ -2828,7 +2902,7 @@ fn draw_categorical(e: &mut Emitter, p: &Params, base: f64) -> Result<Value, Emi
 
     let zero = e.scalar(0.0);
     let one = e.scalar(1.0);
-    let u = e.rng("UNIFORM", &zero, &one, &MlirTy::Scalar);
+    let u = e.rng("UNIFORM", &MlirTy::Scalar);
 
     let mut cum = e.scalar(0.0);
     let mut count = e.scalar(base);
@@ -2838,6 +2912,20 @@ fn draw_categorical(e: &mut Emitter, p: &Params, base: f64) -> Result<Value, Emi
         let lt = e.compare("LT", &cum, &u);
         let inc = e.select(&lt, &one, &zero);
         count = e.add(&count, &inc);
+    }
+
+    // Fan-out (iid): this draw needs no new primitive — under a `[m]` fan-out
+    // batch shape, `u` above is drawn `[m]` (`Emitter::rng` sizes by the batch
+    // shape, ignoring the scalar `out_ty`), and the loop's auto-broadcasting
+    // `compare`/`select`/`add` promote the running `count` to `[m]` at the first
+    // category. The one exception is a single-category `p` (the loop runs zero
+    // times): `count` is left the scalar `base`, so lift it to the `[m]` batch
+    // here — a fanned draw must be `[m]`-shaped like every other count, and a
+    // 1-category Categorical is a valid (if degenerate) draw of the constant
+    // `base`. The scalar path (`batch_shape = None`) leaves `count` untouched.
+    if let (Some(dims), MlirTy::Scalar) = (e.batch_shape(), &count.ty) {
+        let batch_ty = MlirTy::Ranked(dims.iter().map(|d| Some(*d)).collect());
+        count = e.broadcast_in_dim(&count, &[], batch_ty);
     }
     Ok(count)
 }
@@ -2862,21 +2950,62 @@ fn categorical0_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> 
 /// `n` known at EMIT time, not merely well-typed. `p` (a scalar probability) is
 /// broadcast to the batch shape before the elementwise `compare` (StableHLO has
 /// no implicit scalar broadcast — see the multivariate batch's doc comment).
+///
+/// Fan-out (iid): unlike the elementwise Tier-1 discrete samplers, Binomial's
+/// scalar draw already OWNS an inner axis — its `n` Bernoulli trials, summed
+/// away by [`Emitter::reduce_sum`]. So a fanned `iid(Binomial, m)` draw is a
+/// rank-2 `[m, n]` batch (`m` independent variates, each an `n`-Bernoulli row),
+/// reduced over the INNER count axis to `[m]` by [`Emitter::reduce_sum_last_axis`]
+/// (not the scalar path's full `reduce_sum`, which would collapse the `m` lanes
+/// too). The `[m]` outer fan-out must be part of the `rng` draw SHAPE — a
+/// genuine `[m, n]` `rng_bit_generator` output whose rows are independent, NOT a
+/// broadcast of one `[n]` draw — so the draw is sized to `[m, n]` here rather
+/// than left to `Emitter::rng`'s default `[m]` fan-out (which sizes by the
+/// caller's `[m]` batch shape alone, missing Binomial's own inner axis). The
+/// batch shape is briefly extended to `[m, n]` over the `rng` call, then
+/// restored to the `[m]` `lower_sample` set (so the recorded advanced key sees
+/// the fan-out shape). The scalar path (`batch_shape = None`) is unchanged.
 fn binomial_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
     let n = literal_fixed_positive_int(e, p, "n", "Binomial", "sample")?;
     let prob = p.get(e, "p")?;
 
-    let zero = e.scalar(0.0);
-    let one = e.scalar(1.0);
-    let batch_ty = MlirTy::Ranked(vec![Some(n)]);
-    let u = e.rng("UNIFORM", &zero, &one, &batch_ty);
+    match e.batch_shape() {
+        // Scalar draw: an internal length-`n` uniform batch summed to a scalar.
+        None => {
+            let batch_ty = MlirTy::Ranked(vec![Some(n)]);
+            let u = e.rng("UNIFORM", &batch_ty);
 
-    let p_bc = e.broadcast_in_dim(&prob, &[], batch_ty.clone());
-    let lt = e.compare("LT", &u, &p_bc);
-    let ones = e.constant(1.0, batch_ty.clone());
-    let zeros = e.constant(0.0, batch_ty);
-    let indicators = e.select(&lt, &ones, &zeros);
-    Ok(e.reduce_sum(&indicators))
+            let p_bc = e.broadcast_in_dim(&prob, &[], batch_ty.clone());
+            let lt = e.compare("LT", &u, &p_bc);
+            let ones = e.constant(1.0, batch_ty.clone());
+            let zeros = e.constant(0.0, batch_ty);
+            let indicators = e.select(&lt, &ones, &zeros);
+            Ok(e.reduce_sum(&indicators))
+        }
+        // Fanned draw: a rank-2 `[m, n]` uniform batch, reduced over the inner
+        // count axis (last) to one Binomial count per outer fan-out lane → `[m]`.
+        Some(m_dims) => {
+            let mut draw_dims: Vec<Option<u64>> = m_dims.iter().map(|d| Some(*d)).collect();
+            draw_dims.push(Some(n));
+            let draw_ty = MlirTy::Ranked(draw_dims);
+
+            // Extend the fan-out shape over the draw so `rng` sizes it to the
+            // full `[m, n]` (m fan-out lanes × n Bernoulli trials), then restore
+            // the outer `[m]` for the recorded advanced key and any later draw.
+            let mut full = m_dims.clone();
+            full.push(n);
+            e.set_batch_shape(full);
+            let u = e.rng("UNIFORM", &draw_ty);
+            e.set_batch_shape(m_dims);
+
+            let p_bc = e.broadcast_in_dim(&prob, &[], draw_ty.clone());
+            let lt = e.compare("LT", &u, &p_bc);
+            let ones = e.constant(1.0, draw_ty.clone());
+            let zeros = e.constant(0.0, draw_ty);
+            let indicators = e.select(&lt, &ones, &zeros);
+            Ok(e.reduce_sum_last_axis(&indicators))
+        }
+    }
 }
 
 /// The bounded inverse-CDF `Poisson(rate)` `MAXITER` — see [`draw_poisson`].
@@ -2887,13 +3016,29 @@ fn binomial_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
 /// `rate ~ 12` is ~1e-180), so the clamp is never reached in practice.
 const POISSON_MAXITER: u64 = 256;
 
+/// Draw a `Poisson(rate)` variate via bounded inverse-CDF (the shared core
+/// Poisson itself and the NegativeBinomial Gamma–Poisson mixtures reduce to).
+/// Dispatches on the [`Emitter::batch_shape`] fan-out override: a scalar draw
+/// (`None`) takes the unchanged [`draw_poisson_scalar`] path (one scalar
+/// `Value`, byte-identical to before); a batched `iid(K, m)` draw (`Some([m])`)
+/// takes the per-lane [`draw_poisson_batched`] path (a `tensor<m×f32>` of iid
+/// draws). `rate` is a `Scalar` for a direct `Poisson` prior (broadcast over
+/// the `[m]` lanes) or already a `[m]` per-lane vector for the NegativeBinomial
+/// Gamma–Poisson mixture (each lane its own `lambda_i` from
+/// [`draw_gamma_batched`]) — [`draw_poisson_batched`] handles both.
+fn draw_poisson(e: &mut Emitter, rate: &Value) -> Value {
+    match e.batch_shape() {
+        Some(dims) if dims.len() == 1 => draw_poisson_batched(e, rate, dims[0]),
+        _ => draw_poisson_scalar(e, rate),
+    }
+}
+
 /// Draw one scalar `Poisson(rate)` variate via bounded inverse-CDF (one
-/// `stablehlo.while`, via [`Emitter::while_loop`]) — the shared core Poisson
-/// itself and the NegativeBinomial Gamma–Poisson mixtures reduce to. One `U ~
-/// Uniform(0, 1)` is drawn BEFORE the loop; the loop then walks the incremental
-/// Poisson CDF until `U <= F(k)`, returning that `k`. Unlike [`draw_gamma`],
-/// this inverts a SINGLE uniform (no per-iteration randomness), so nothing is
-/// pre-drawn into a batch.
+/// `stablehlo.while`, via [`Emitter::while_loop`]). One `U ~ Uniform(0, 1)` is
+/// drawn BEFORE the loop; the loop then walks the incremental Poisson CDF until
+/// `U <= F(k)`, returning that `k`. Unlike [`draw_gamma`], this inverts a
+/// SINGLE uniform (no per-iteration randomness), so nothing is pre-drawn into a
+/// batch.
 ///
 /// The loop carries `(k: f32, cum = F(k): f32, pmf = P(X = k): f32, done: i1,
 /// result: f32)`, initialized `k = 0`, `pmf = cum = exp(-rate)` (`= P(X = 0) =
@@ -2906,10 +3051,8 @@ const POISSON_MAXITER: u64 = 256;
 /// pmf`. `k` is carried as an f32 (it is both the counter AND the returned
 /// value), so the `k < MAXITER` bound is a float compare and no `i32`/`convert`
 /// is needed at all.
-fn draw_poisson(e: &mut Emitter, rate: &Value) -> Value {
-    let zero = e.scalar(0.0);
-    let one = e.scalar(1.0);
-    let u = e.rng("UNIFORM", &zero, &one, &MlirTy::Scalar);
+fn draw_poisson_scalar(e: &mut Emitter, rate: &Value) -> Value {
+    let u = e.rng("UNIFORM", &MlirTy::Scalar);
 
     let neg_rate = e.neg(rate);
     let exp_neg_rate = e.exp(&neg_rate); // P(X=0) = F(0) = exp(-rate)
@@ -2953,6 +3096,99 @@ fn draw_poisson(e: &mut Emitter, rate: &Value) -> Value {
             let pmf_next = e.mul(pmf, &rate_over_k1);
             let cum_next = e.add(cum, &pmf_next);
             vec![k1, cum_next, pmf_next, accept, new_result]
+        },
+    );
+    results[4].clone()
+}
+
+/// The batched (fan-out) bounded inverse-CDF draw: `m` iid `Poisson(rate)`
+/// variates as a `tensor<m×f32>`, one `stablehlo.while`. Same maths as
+/// [`draw_poisson_scalar`]; the difference is the CDF walk is done PER LANE.
+/// One `U` is drawn as a genuine `tensor<m>` (one `rng_bit_generator` advance,
+/// the `[m]` lanes independent — [`Emitter::rng`]'s size-dims override), and the
+/// per-lane state `cum = F_i(k)`, `pmf = P_i(X = k)`, `done`, `result` are each
+/// `[m]`. The loop counter `k` stays a SCALAR: every lane walks the SAME
+/// `k = 0, 1, 2, …` in lockstep, and a lane latches its `result` on its FIRST
+/// hit exactly as [`draw_gamma_batched`]'s accept mask latches its candidate
+/// (`result := select(done, result, k)`, `done := done || (U <= cum)`) — so an
+/// unfinished all-walk lane ends on the last-walked `k = MAXITER - 1`, matching
+/// [`draw_poisson_scalar`]'s bounded-tail clamp, not a spurious `0`. The loop
+/// runs until `all(done)` (via [`Emitter::reduce_all`] over the `[m]` mask) or
+/// `MAXITER`.
+///
+/// `rate` may be a `Scalar` (a direct `Poisson` prior — the same rate on every
+/// lane) or already a `[m]` per-lane vector (the NegativeBinomial Gamma–Poisson
+/// mixture's `lambda_i` from [`draw_gamma_batched`]). It is broadcast to `[m]`
+/// up front so the per-lane `cum`/`pmf` recurrence is uniform either way.
+fn draw_poisson_batched(e: &mut Emitter, rate: &Value, m: u64) -> Value {
+    let batch_ty = MlirTy::Ranked(vec![Some(m)]);
+
+    // U as a genuine [m] draw (one rng_bit_generator advance; batch_shape is
+    // already [m] here, so `rng` sizes the draw to the batch — the lanes are
+    // independent, NOT a scalar broadcast).
+    let u = e.rng("UNIFORM", &MlirTy::Scalar);
+
+    // Broadcast `rate` to [m]: a scalar prior rate is the same on every lane; a
+    // NegBin per-lane `lambda` is already [m] (used as-is). Either way the
+    // per-lane cum/pmf recurrence below is uniformly [m].
+    let rate_m = match &rate.ty {
+        MlirTy::Scalar => e.broadcast_in_dim(rate, &[], batch_ty.clone()),
+        _ => rate.clone(),
+    };
+
+    let neg_rate = e.neg(&rate_m);
+    let exp_neg_rate = e.exp(&neg_rate); // P_i(X=0) = F_i(0) = exp(-rate_i), [m]
+    let k0 = e.scalar(0.0); // scalar counter (all lanes walk k together)
+    let cum0 = exp_neg_rate.clone();
+    let pmf0 = exp_neg_rate;
+    let done0 = e.bool_batch_const(m, false);
+    let res0 = e.constant(0.0, batch_ty.clone());
+
+    let float_scalar = MlirTy::Scalar.render(e.dtype());
+    let batch_i1 = format!("tensor<{m}xi1>");
+    let batch_f = batch_ty.render(e.dtype());
+    let carried_tys = [
+        float_scalar,    // k (scalar counter)
+        batch_f.clone(), // cum = F(k) per lane
+        batch_f.clone(), // pmf = P(X = k) per lane
+        batch_i1,        // done per lane
+        batch_f,         // result per lane
+    ];
+
+    let results = e.while_loop(
+        &[k0, cum0, pmf0, done0, res0],
+        &carried_tys,
+        // cond: k < MAXITER && !all(done)
+        |e, args| {
+            let max = e.scalar(POISSON_MAXITER as f64);
+            let lt = e.compare("LT", &args[0], &max);
+            let all_done = e.reduce_all(&args[3]);
+            let not_all = e.not(&all_done);
+            e.and(&lt, &not_all)
+        },
+        // do: test U <= F(k) per lane, latch each lane's first hit; advance
+        // k/pmf/cum for the next iteration (the Poisson recurrence, per lane).
+        |e, args| {
+            let k = &args[0];
+            let cum = &args[1];
+            let pmf = &args[2];
+            let done = &args[3];
+            let result = &args[4];
+
+            let hit = e.compare("LE", &u, cum);
+            // Per-lane latch (`done` is the OLD flag): a lane already done keeps
+            // its FIRST accepted `k`; a not-yet-done lane tracks the current `k`
+            // (so an all-walk lane ends on the last k — matching the scalar
+            // path's tail clamp). `k` (scalar) broadcasts over the [m] result.
+            let new_result = e.select(done, result, k);
+            let new_done = e.or(done, &hit);
+
+            let one = e.scalar(1.0);
+            let k1 = e.add(k, &one);
+            let rate_over_k1 = e.div(&rate_m, &k1);
+            let pmf_next = e.mul(pmf, &rate_over_k1);
+            let cum_next = e.add(cum, &pmf_next);
+            vec![k1, cum_next, pmf_next, new_done, new_result]
         },
     );
     results[4].clone()
@@ -3026,12 +3262,9 @@ fn multinomial_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
         }
     };
 
-    let zero = e.scalar(0.0);
-    let one = e.scalar(1.0);
-
     // Pre-draw the n uniforms outside the loop (see the doc comment).
     let batch_ty = MlirTy::Ranked(vec![Some(n)]);
-    let u_batch = e.rng("UNIFORM", &zero, &one, &batch_ty);
+    let u_batch = e.rng("UNIFORM", &batch_ty);
 
     // Bin boundaries, built once: lower[j] = b_j, upper[j] = b_{j+1}, with
     // b_0 = 0, b_j = cumsum(p)_j (j = 1..k-1), b_k = +inf (robust last bin).

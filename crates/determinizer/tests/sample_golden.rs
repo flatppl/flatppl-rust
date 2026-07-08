@@ -411,6 +411,11 @@ out = draws";
     let m = parse_infer(src);
     let out = determinize(&m).expect("iid(K,n) sample must fan out to one builtin_sample");
     let pir = flatppl_flatpir::write(&out);
+    assert!(
+        pir.contains("(%array 1 (10) (%scalar real))"),
+        "the fanned variate must carry the array type (not a wrongly-scalar one), \
+         mirroring infer's builtin_sample_fanned_variate_is_array:\n{pir}"
+    );
     assert_eq!(
         pir.matches("builtin_sample").count(),
         2,

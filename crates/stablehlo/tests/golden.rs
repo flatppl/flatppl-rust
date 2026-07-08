@@ -2985,39 +2985,6 @@ fn builtin_sample_refuses_wrong_arity() {
     assert_eq!(err.node, Some(node));
 }
 
-// ---- Task 6 review fix: `Emitter::rng` defensive assert (Finding 3) -------
-
-/// `stablehlo.rng` requires rank-0 `a`/`b` bounds operands — a non-`Scalar`
-/// `a` must panic (an internal invariant violation caught before emitting
-/// ill-typed StableHLO), mirroring `diag`/`matvec`'s panic-on-bad-shape
-/// discipline in the same file.
-#[test]
-#[should_panic(expected = "rng expects a rank-0 (scalar) `a` operand")]
-fn emitter_rng_panics_on_non_scalar_a() {
-    let m = Module::new();
-    let mut e = Emitter::new(&m, Dtype::F32);
-    let a = flatppl_stablehlo::Value {
-        ssa: "%a".to_string(),
-        ty: MlirTy::Ranked(vec![Some(3)]),
-    };
-    let b = e.scalar(1.0);
-    e.rng("NORMAL", &a, &b, &MlirTy::Scalar);
-}
-
-/// The `b`-operand mirror of [`emitter_rng_panics_on_non_scalar_a`].
-#[test]
-#[should_panic(expected = "rng expects a rank-0 (scalar) `b` operand")]
-fn emitter_rng_panics_on_non_scalar_b() {
-    let m = Module::new();
-    let mut e = Emitter::new(&m, Dtype::F32);
-    let a = e.scalar(0.0);
-    let b = flatppl_stablehlo::Value {
-        ssa: "%b".to_string(),
-        ty: MlirTy::Ranked(vec![Some(3)]),
-    };
-    e.rng("NORMAL", &a, &b, &MlirTy::Scalar);
-}
-
 // ---- Task 7: refuse taxonomy — closing coverage gaps -----------------------
 //
 // Task 7's audit (see `crates/stablehlo/src/refuse.rs`'s module doc comment
@@ -4760,11 +4727,13 @@ fn emit_sample_uniform_has_expected_structure() {
     assert!(out.contains("-> (tensor<f32>, tensor<2xui64>)"));
     assert_eq!(out.matches("stablehlo.rng").count(), 1);
     assert!(out.contains("stablehlo.rng_bit_generator"));
-    // Three multiplies (bits→uniform scale, the rng affine's `(b-a)*u`, the
-    // Uniform transform's `4.0 * u`) and two adds (rng affine `+ a`, transform
-    // `-1.0 + …`) — the exact text is pinned by the frozen golden.
-    assert_eq!(out.matches("stablehlo.multiply").count(), 3);
-    assert_eq!(out.matches("stablehlo.add").count(), 2);
+    // Two multiplies (bits→uniform scale, the Uniform transform's `4.0 * u`)
+    // and one add (the transform's `-1.0 + …`) — `Emitter::rng` returns the
+    // standard uniform directly (no rng-affine identity ops), so the only
+    // arithmetic left is Uniform's own transform. The exact text is pinned
+    // by the frozen golden.
+    assert_eq!(out.matches("stablehlo.multiply").count(), 2);
+    assert_eq!(out.matches("stablehlo.add").count(), 1);
     assert!(is_delimiter_balanced(&out));
 }
 
@@ -5550,9 +5519,10 @@ fn emit_sample_binomial_has_expected_structure() {
     assert_eq!(out.matches("stablehlo.rng").count(), 1);
     assert!(out.contains("stablehlo.rng_bit_generator"));
     assert!(out.contains("tensor<5xf32>"));
-    // Three broadcast_in_dim: the two scalar rng-affine bounds lifted to the
-    // length-5 batch shape, plus `p` broadcast to the batch by the sampler.
-    assert_eq!(out.matches("stablehlo.broadcast_in_dim").count(), 3);
+    // One broadcast_in_dim: `p` broadcast to the batch shape by the sampler.
+    // `Emitter::rng` returns the standard uniform directly, so there are no
+    // rng-affine scalar bounds left to lift onto the batch.
+    assert_eq!(out.matches("stablehlo.broadcast_in_dim").count(), 1);
     assert_eq!(out.matches("stablehlo.compare").count(), 1);
     assert_eq!(out.matches("stablehlo.select").count(), 1);
     assert_eq!(out.matches("stablehlo.reduce(").count(), 1);
@@ -6215,8 +6185,10 @@ fn emit_sample_exponential_iid_matches_frozen_golden() {
 // are pre-drawn OUTSIDE the loop at `[MAXITER, n]` (fixed key advance →
 // reproducible), read one `[n]` row per iteration by `dynamic_slice_row`. Both
 // frozen goldens below are parse-validated against the real StableHLO parser
-// (jax 0.10.2). Vector-variate (Dirichlet/MvNormal → Task 10b) and the discrete
-// samplers still refuse.
+// (jax 0.10.2). Vector-variate Dirichlet and the discrete samplers were still
+// refusing at this point in the file (Dirichlet is batched in the Tier-2
+// multivariate batch, the discrete ones in the later Tier-3/Tier-4 batches,
+// both below).
 
 /// A fanned rejection draw: `iid(Gamma(shape=2, rate=1), 4)`, value-terminal.
 const GAMMA_IID_SAMPLE_SRC: &str = "\
@@ -6354,7 +6326,8 @@ fn emit_sample_iid_gamma_reducers_fan_out() {
 // rows (`broadcast_in_dim dims = [1]`). The frozen golden below is
 // parse-validated against the real StableHLO parser (jax 0.10.2). The scalar
 // MvNormal path (`emit_sample_mvnormal_*`) is byte-identical to before.
-// Dirichlet (the other vector-variate sampler) still refuses.
+// Dirichlet (the other vector-variate sampler) is batched just below, reusing
+// the batched Gamma per component + a new `stablehlo.transpose`.
 
 /// A fanned multivariate draw: `iid(MvNormal(mu, cov), 3)` at `d = 2`, with
 /// free `mu`/`cov` (so `@sample(%key, %arg0, %arg1)`).
@@ -6424,49 +6397,606 @@ fn emit_sample_mvnormal_iid_matches_frozen_golden() {
     );
 }
 
-/// Fan-out for Dirichlet (the OTHER vector-variate sampler) still REFUSES, not
-/// mislowers: its scalar `@sample` draws `d` scalar Gammas in a Rust loop (via
-/// the scalar `draw_gamma`) and stacks them on axis 0, so fanning to `[n, d]`
-/// needs machinery beyond the Task-10a rejection batch (a rank-3 masked
-/// rejection, or a new `stablehlo.transpose` — see `FANOUT_SAFE`'s doc). MvNormal
-/// (Task 10b) is the only batched-multivariate sampler for now. (Dirichlet
-/// refuses whether the determiniser or the emitter catches it first; either way
-/// `emit` errors rather than producing a wrong lowering.)
+/// A fanned Dirichlet draw: `iid(Dirichlet(alpha = [2, 3, 4]), 5)` — the OTHER
+/// vector-variate sampler (cf. MvNormal). Its per-component `g_j ~ Gamma(α_j,
+/// 1)` unroll fans out with NO rank-3 machinery: under the `[5]` fan-out shape
+/// each component's `draw_gamma` dispatches to the batched Marsaglia–Tsang
+/// `draw_gamma_batched` (an `[5]` column, one masked `while` per component),
+/// the `d = 3` columns stack on axis 0 → `[3, 5]`, ONE new `stablehlo.transpose`
+/// reorients to `[5, 3]` (rows = draws), then each row is normalized by its
+/// row-sum (`reduce_sum_last_axis` over the component axis + broadcast +
+/// divide) — `[5, 3]`, each row a simplex, the 5 rows independent. The frozen
+/// golden below is parse-validated against the real StableHLO parser (jax
+/// 0.10.2). The scalar Dirichlet path (`emit_sample_dirichlet_*`) is
+/// byte-identical to before.
+const DIRICHLET_IID_SAMPLE_SRC: &str = "\
+s = rnginit(0)
+xs ~ iid(Dirichlet(alpha = [2.0, 3.0, 4.0]), 5)
+draws = rand(s, lawof(xs))
+";
+
+/// The fanned Dirichlet draw returns a `tensor<5x3xf32>` (`[m, d]`, not a bare
+/// `[d]` simplex) alongside the advanced key, via one masked `stablehlo.while`
+/// PER component (three, each carrying a `tensor<5xi1>` per-lane accept mask),
+/// the `[3, 5]` column stack reoriented by a `stablehlo.transpose dims = [1, 0]`
+/// to `[5, 3]`, then the per-row normalize (last-axis reduce + `dims = [0]`
+/// row-broadcast + divide).
 #[test]
-fn emit_sample_iid_dirichlet_refuses() {
-    let src = "s = rnginit(0)\nxs ~ iid(Dirichlet(alpha = [1.0, 1.0, 1.0]), 4)\ndraws = rand(s, lawof(xs))\n";
-    let m = flatppl_syntax::parse(src).expect("parse");
-    let mut m = m;
-    let _ = flatppl_infer::infer(&mut m);
-    let determinized = flatppl_determinizer::determinize(&m);
-    let refused = match determinized {
-        Err(_) => true,
-        Ok(d) => flatppl_stablehlo::emit(&d, flatppl_stablehlo::Mode::Sample, &Default::default())
-            .is_err(),
-    };
+fn emit_sample_dirichlet_iid_has_expected_structure() {
+    let d = determinize_src(DIRICHLET_IID_SAMPLE_SRC);
+    let out = emit_sample(&d);
+
     assert!(
-        refused,
-        "iid(Dirichlet, n) (vector variate) must refuse, not mislower"
+        out.contains("func.func @sample(%key: tensor<2xui64>)"),
+        "missing @sample(%key) (literal alpha → no free params) in:\n{out}"
+    );
+    assert!(
+        out.contains("-> (tensor<5x3xf32>, tensor<2xui64>)"),
+        "fanned Dirichlet must return the [5, 3] batch + advanced key, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.while").count(),
+        3,
+        "one masked batched rejection loop per Dirichlet component, in:\n{out}"
+    );
+    assert!(
+        out.contains("tensor<5xi1>"),
+        "each component's per-lane accept mask must be tensor<5xi1>, in:\n{out}"
+    );
+    assert!(
+        out.contains("stablehlo.transpose") && out.contains("dims = [1, 0]"),
+        "the axis-0 [3, 5] column stack must be transposed to the [5, 3] batch, in:\n{out}"
+    );
+    assert!(
+        out.contains("applies stablehlo.add across dimensions = [1] : (tensor<5x3xf32>"),
+        "each row's Gamma sum reduces the INNER component axis (the m rows survive), in:\n{out}"
+    );
+    assert!(
+        out.contains("dims = [0] : (tensor<5xf32>) -> tensor<5x3xf32>"),
+        "the row-sum [5] must broadcast back across the component axis → [5, 3], in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// Freeze the exact emitted text (parse-validated against the real StableHLO
+/// parser): any drift must be a deliberate, reviewed change to this golden.
+#[test]
+fn emit_sample_dirichlet_iid_matches_frozen_golden() {
+    let d = determinize_src(DIRICHLET_IID_SAMPLE_SRC);
+    let out = emit_sample(&d);
+    let golden = include_str!("goldens/dirichlet_iid_sample.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted fanned Dirichlet @sample drifted from tests/goldens/dirichlet_iid_sample.mlir"
     );
 }
 
-/// A still-excluded DISCRETE sampler (Poisson) — a scalar variate that
-/// determinizes to `builtin_sample(rng, ctor, input, n)` like Gamma did, but is
-/// not yet batched — refuses at `lower_sample` with the precise deferred
-/// message (guarding the refuse path a scalar-variate non-`FANOUT_SAFE` ctor
-/// takes).
+// ---- fan-out for discrete inverse-CDF Poisson + NegativeBinomial (buffy #148,
+// #156b) ---------------------------------------------------------------------
+//
+// Poisson's scalar draw is a bounded inverse-CDF `stablehlo.while` (walk the CDF
+// until `U <= F(k)`). The fanned draw batches that walk PER LANE via
+// `draw_poisson_batched`: one `U` drawn as a genuine `[m]` tensor, `[m]` per-lane
+// `cum`/`pmf`/`done`/`result`, ONE scalar counter `k` walked in lockstep, and a
+// per-lane latch (the `draw_gamma_batched` masked-while + `reduce_all(done)`
+// pattern). The two NegativeBinomial Gamma–Poisson mixtures fan out with NO
+// extra machinery — `draw_gamma_batched` yields the `[m]` per-lane `lambda`,
+// which `draw_poisson_batched` accepts as its `[m]` rate (so a NegBin fan-out is
+// the batched Gamma `while` feeding the batched Poisson `while`). All three
+// goldens are parse-validated against the real StableHLO parser (jax 0.10.2).
+// The one `while` discrete sampler still refusing is Multinomial.
+
+/// A fanned Poisson draw: `iid(Poisson(rate=3), 4)`, the discrete inverse-CDF
+/// batched-walk case.
+const POISSON_IID_SAMPLE_SRC: &str = "\
+s = rnginit(0)
+xs ~ iid(Poisson(rate = 3.0), 4)
+draws = rand(s, lawof(xs))
+";
+
+/// A fanned NegativeBinomial draw: `iid(NegativeBinomial(alpha=5, beta=2), 4)`,
+/// the Gamma–Poisson mixture — batched Gamma `while` feeding batched Poisson
+/// `while`.
+const NEGATIVE_BINOMIAL_IID_SAMPLE_SRC: &str = "\
+s = rnginit(0)
+xs ~ iid(NegativeBinomial(alpha = 5.0, beta = 2.0), 4)
+draws = rand(s, lawof(xs))
+";
+
+/// A fanned NegativeBinomial2 draw: `iid(NegativeBinomial2(mu=3, psi=5), 4)`,
+/// the mean-dispersion mixture (same shape as the `NegativeBinomial` case, with
+/// the `rate = psi/mu` reparameterization).
+const NEGATIVE_BINOMIAL2_IID_SAMPLE_SRC: &str = "\
+s = rnginit(0)
+xs ~ iid(NegativeBinomial2(mu = 3.0, psi = 5.0), 4)
+draws = rand(s, lawof(xs))
+";
+
+/// The fanned Poisson draw returns a `tensor<4xf32>` (not a scalar) alongside
+/// the advanced key, drawn from EXACTLY ONE `rng_bit_generator` sized to the
+/// `[4]` batch (a genuine `tensor<4xui32>` output — one advance, one advanced
+/// key returned — not a scalar broadcast), via ONE masked `stablehlo.while`
+/// carrying a `tensor<4xi1>` per-lane `done` mask, with `reduce_all(done)` in
+/// the loop condition and an `or` carry.
 #[test]
-fn emit_sample_iid_poisson_refuses() {
-    let d = determinize_src(
-        "s = rnginit(0)\nxs ~ iid(Poisson(rate = 2.0), 4)\ndraws = rand(s, lawof(xs))\n",
-    );
-    let err = flatppl_stablehlo::emit(&d, flatppl_stablehlo::Mode::Sample, &Default::default())
-        .unwrap_err();
+fn emit_sample_poisson_iid_has_expected_structure() {
+    let d = determinize_src(POISSON_IID_SAMPLE_SRC);
+    let out = emit_sample(&d);
+
     assert!(
-        err.msg
-            .contains("fan-out (iid) @sample for 'Poisson' not yet supported")
-            && err.msg.contains("deferred"),
-        "unexpected message: {}",
-        err.msg
+        out.contains("func.func @sample(%key: tensor<2xui64>)"),
+        "missing @sample(%key) (no free params) in:\n{out}"
+    );
+    assert!(
+        out.contains("-> (tensor<4xf32>, tensor<2xui64>)"),
+        "fanned Poisson must return the [4] batch + advanced key, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.rng_bit_generator").count(),
+        1,
+        "one rng_bit_generator advance (one advanced key) for the whole [4] batch, in:\n{out}"
+    );
+    assert!(
+        out.contains("-> (tensor<2xui64>, tensor<4xui32>)"),
+        "the single rng_bit_generator must be sized to the [4] batch (genuine tensor<4> draw), in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.while").count(),
+        1,
+        "one masked while for the whole [4] batch, in:\n{out}"
+    );
+    assert!(
+        out.contains("tensor<4xi1>"),
+        "per-lane done mask must be tensor<4xi1>, in:\n{out}"
+    );
+    assert!(
+        out.contains("stablehlo.reduce(") && out.contains("stablehlo.or "),
+        "the batched walk needs an all-reduce over the done mask + an OR carry, in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// Freeze the exact emitted text (parse-validated against the real StableHLO
+/// parser): any drift must be a deliberate, reviewed change to this golden.
+#[test]
+fn emit_sample_poisson_iid_matches_frozen_golden() {
+    let d = determinize_src(POISSON_IID_SAMPLE_SRC);
+    let out = emit_sample(&d);
+    let golden = include_str!("goldens/poisson_iid_sample.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted fanned @sample drifted from tests/goldens/poisson_iid_sample.mlir"
+    );
+}
+
+/// NegativeBinomial fans out to the batched Gamma `while` (its `[4]` per-lane
+/// `lambda`) feeding the batched Poisson `while` (that `[4]` rate): TWO
+/// `stablehlo.while`s, one `[4]` value return, one advanced key.
+#[test]
+fn emit_sample_negative_binomial_iid_has_expected_structure() {
+    let d = determinize_src(NEGATIVE_BINOMIAL_IID_SAMPLE_SRC);
+    let out = emit_sample(&d);
+
+    assert!(
+        out.contains("-> (tensor<4xf32>, tensor<2xui64>)"),
+        "fanned NegativeBinomial must return the [4] batch + advanced key, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.while").count(),
+        2,
+        "the batched Gamma while feeding the batched Poisson while, in:\n{out}"
+    );
+    assert!(
+        out.contains("tensor<4xi1>"),
+        "both batched loops carry a tensor<4xi1> per-lane mask, in:\n{out}"
+    );
+
+    let golden = include_str!("goldens/negative_binomial_iid_sample.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted fanned @sample drifted from tests/goldens/negative_binomial_iid_sample.mlir"
+    );
+}
+
+/// The `rate = psi/mu` mirror of the NegativeBinomial fan-out: same
+/// batched-Gamma-then-batched-Poisson shape, frozen against its golden.
+#[test]
+fn emit_sample_negative_binomial2_iid_matches_frozen_golden() {
+    let d = determinize_src(NEGATIVE_BINOMIAL2_IID_SAMPLE_SRC);
+    let out = emit_sample(&d);
+    assert_eq!(
+        out.matches("stablehlo.while").count(),
+        2,
+        "the batched Gamma while feeding the batched Poisson while, in:\n{out}"
+    );
+    let golden = include_str!("goldens/negative_binomial2_iid_sample.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted fanned @sample drifted from tests/goldens/negative_binomial2_iid_sample.mlir"
+    );
+}
+
+// ---- fan-out for elementwise Laplace/Bernoulli/Geometric (buffy #148, #155,
+// #156a) --------------------------------------------------------------------
+//
+// Bernoulli/Geometric were left off `FANOUT_SAFE` alongside the genuinely
+// `while`/unrolled discrete samplers, and Laplace was left off scoped to Task
+// 10a's rejection-family change (see the doc comment above `FANOUT_SAFE`), but
+// all three are straight-line elementwise: Laplace's `sgn` and Bernoulli's
+// indicator both compose from the auto-broadcasting `compare`/`select` pair
+// Task 10a already gave `Emitter`, and Geometric's `floor` is shape-preserving
+// like every other Tier-1 unary. No new primitive needed — this batch just
+// admits them to `FANOUT_SAFE`. Both goldens are parse-validated against the
+// real StableHLO parser (jax 0.10.2). The genuinely `while` discrete samplers
+// (Poisson + the NegativeBinomial mixtures) are batched in the Tier-4 section
+// below; only Multinomial still refuses.
+
+/// A fanned Laplace draw: `iid(Laplace(location=0, scale=1), 4)`, exercising
+/// the `compare`/`select` `sgn` idiom under a `[4]` batch.
+const LAPLACE_IID_SAMPLE_SRC: &str = "\
+s = rnginit(0)
+xs ~ iid(Laplace(location = 0.0, scale = 1.0), 4)
+draws = rand(s, lawof(xs))
+";
+
+/// A fanned Bernoulli draw: `iid(Bernoulli(p=0.3), 4)`, exercising the
+/// `select(U < p, 1, 0)` idiom under a `[4]` batch.
+const BERNOULLI_IID_SAMPLE_SRC: &str = "\
+s = rnginit(0)
+xs ~ iid(Bernoulli(p = 0.3), 4)
+draws = rand(s, lawof(xs))
+";
+
+/// A fanned Geometric draw: `iid(Geometric(p=0.3), 4)`, exercising `floor`
+/// under a `[4]` batch.
+const GEOMETRIC_IID_SAMPLE_SRC: &str = "\
+s = rnginit(0)
+xs ~ iid(Geometric(p = 0.3), 4)
+draws = rand(s, lawof(xs))
+";
+
+/// The fanned Laplace draw returns a `tensor<4xf32>` (not a scalar) alongside
+/// the advanced key, with exactly ONE `rng_bit_generator` sized to `[4]`, one
+/// `compare`/`select` pair for `sgn`, and the scalar params broadcast over the
+/// batch.
+#[test]
+fn emit_sample_laplace_iid_has_expected_structure() {
+    let d = determinize_src(LAPLACE_IID_SAMPLE_SRC);
+    let out = emit_sample(&d);
+
+    assert!(
+        out.contains("-> (tensor<4xf32>, tensor<2xui64>)"),
+        "fanned Laplace must return the [4] batch + advanced key, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.rng_bit_generator").count(),
+        1,
+        "one rng_bit_generator advance for the whole [4] batch, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.compare").count(),
+        1,
+        "sgn(U - 1/2) needs exactly one compare, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.select").count(),
+        1,
+        "sgn(U - 1/2) needs exactly one select, in:\n{out}"
+    );
+    assert!(
+        out.contains("stablehlo.broadcast_in_dim"),
+        "scalar params must broadcast over the batch, in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// Freeze the exact emitted text (parse-validated against the real StableHLO
+/// parser): any drift must be a deliberate, reviewed change to this golden.
+#[test]
+fn emit_sample_laplace_iid_matches_frozen_golden() {
+    let d = determinize_src(LAPLACE_IID_SAMPLE_SRC);
+    let out = emit_sample(&d);
+    let golden = include_str!("goldens/laplace_iid_sample.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted fanned @sample drifted from tests/goldens/laplace_iid_sample.mlir"
+    );
+}
+
+/// The fanned Bernoulli draw returns a `tensor<4xf32>` alongside the advanced
+/// key, with exactly ONE `rng_bit_generator` sized to `[4]`, one `compare`,
+/// one `select`.
+#[test]
+fn emit_sample_bernoulli_iid_has_expected_structure() {
+    let d = determinize_src(BERNOULLI_IID_SAMPLE_SRC);
+    let out = emit_sample(&d);
+
+    assert!(
+        out.contains("-> (tensor<4xf32>, tensor<2xui64>)"),
+        "fanned Bernoulli must return the [4] batch + advanced key, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.rng_bit_generator").count(),
+        1,
+        "one rng_bit_generator advance for the whole [4] batch, in:\n{out}"
+    );
+    assert_eq!(out.matches("stablehlo.compare").count(), 1);
+    assert_eq!(out.matches("stablehlo.select").count(), 1);
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// Freeze the exact emitted text (parse-validated against the real StableHLO
+/// parser): any drift must be a deliberate, reviewed change to this golden.
+#[test]
+fn emit_sample_bernoulli_iid_matches_frozen_golden() {
+    let d = determinize_src(BERNOULLI_IID_SAMPLE_SRC);
+    let out = emit_sample(&d);
+    let golden = include_str!("goldens/bernoulli_iid_sample.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted fanned @sample drifted from tests/goldens/bernoulli_iid_sample.mlir"
+    );
+}
+
+/// The fanned Geometric draw returns a `tensor<4xf32>` alongside the advanced
+/// key, with exactly ONE `rng_bit_generator` sized to `[4]`, two `log`s, one
+/// `floor`.
+#[test]
+fn emit_sample_geometric_iid_has_expected_structure() {
+    let d = determinize_src(GEOMETRIC_IID_SAMPLE_SRC);
+    let out = emit_sample(&d);
+
+    assert!(
+        out.contains("-> (tensor<4xf32>, tensor<2xui64>)"),
+        "fanned Geometric must return the [4] batch + advanced key, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.rng_bit_generator").count(),
+        1,
+        "one rng_bit_generator advance for the whole [4] batch, in:\n{out}"
+    );
+    assert_eq!(out.matches("stablehlo.log").count(), 2);
+    assert_eq!(out.matches("stablehlo.floor").count(), 1);
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// Freeze the exact emitted text (parse-validated against the real StableHLO
+/// parser): any drift must be a deliberate, reviewed change to this golden.
+#[test]
+fn emit_sample_geometric_iid_matches_frozen_golden() {
+    let d = determinize_src(GEOMETRIC_IID_SAMPLE_SRC);
+    let out = emit_sample(&d);
+    let golden = include_str!("goldens/geometric_iid_sample.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted fanned @sample drifted from tests/goldens/geometric_iid_sample.mlir"
+    );
+}
+
+// ---- fan-out for discrete non-elementwise Binomial + Categorical (buffy #148,
+// #156b) ---------------------------------------------------------------------
+//
+// Unlike the Tier-1 elementwise discrete samplers (Bernoulli/Geometric), these
+// two have a scalar draw that is NOT purely elementwise, yet each fans out
+// without a `while`:
+//   - Binomial's scalar draw already owns an inner axis (its `n` Bernoulli
+//     trials, `reduce_sum`ed to one count). The fanned draw is a rank-2 `[m, n]`
+//     uniform — a genuine `rng_bit_generator` output, ONE advance, rows
+//     independent — reduced over the INNER count axis (last) to `[m]` by the new
+//     `Emitter::reduce_sum_last_axis` (the outer `m` lanes survive, unlike the
+//     scalar path's full `reduce_sum`).
+//   - Categorical/Categorical0 fan out with NO new primitive: one scalar `U`
+//     becomes a `[m]` draw under the batch shape, and the inverse-CDF unroll's
+//     running count is promoted to `[m]` by the auto-broadcasting
+//     `compare`/`select`/`add`.
+// Both goldens are parse-validated against the real StableHLO parser (jax
+// 0.10.2). Poisson + the NegativeBinomial mixtures are batched in the Tier-4
+// section below.
+
+/// A fanned Binomial draw: `iid(Binomial(n=5, p=0.3), 4)`, `n` the FIXED inner
+/// count, `4` the outer fan-out — the `[4, 5]` uniform, inner-axis reduce case.
+const BINOMIAL_IID_SAMPLE_SRC: &str = "\
+s = rnginit(0)
+n = 5
+xs ~ iid(Binomial(n = n, p = 0.3), 4)
+draws = rand(s, lawof(xs))
+";
+
+/// A fanned Categorical draw: `iid(Categorical(p=[0.2,0.3,0.5]), 4)`, exercising
+/// the inverse-CDF unroll broadcasting its running count over a `[4]` batch.
+const CATEGORICAL_IID_SAMPLE_SRC: &str = "\
+s = rnginit(0)
+xs ~ iid(Categorical(p = [0.2, 0.3, 0.5]), 4)
+draws = rand(s, lawof(xs))
+";
+
+/// A fanned Categorical0 draw (0-based): same as the Categorical case but with
+/// `base = 0.0` — the only difference is the initial count constant.
+const CATEGORICAL0_IID_SAMPLE_SRC: &str = "\
+s = rnginit(0)
+xs ~ iid(Categorical0(p = [0.2, 0.3, 0.5]), 4)
+draws = rand(s, lawof(xs))
+";
+
+/// A fanned SINGLE-CATEGORY Categorical draw: `iid(Categorical(p=[1.0]), 4)`.
+/// `n = 1` runs the inverse-CDF unroll zero times (`n - 1 = 0` iterations), so
+/// `count` never leaves the scalar `base` — this exercises `draw_categorical`'s
+/// degenerate-guard broadcast (`registry.rs`), which must still lift it to the
+/// `[4]` batch: a fanned draw is `[m]`-shaped like every other count, even for
+/// this constant one-category variate.
+const CATEGORICAL_SINGLE_IID_SAMPLE_SRC: &str = "\
+s = rnginit(0)
+xs ~ iid(Categorical(p = [1.0]), 4)
+draws = rand(s, lawof(xs))
+";
+
+/// The fanned Binomial draw returns a `tensor<4xf32>` (not a scalar) alongside
+/// the advanced key, drawn as a GENUINE rank-2 `[4, 5]` batch (one
+/// `rng_bit_generator` sized to `tensor<4x5xui32>` — 4 independent variates,
+/// each 5 Bernoulli trials — not a broadcast of a `[5]` draw), then reduced over
+/// the inner count axis by EXACTLY ONE `stablehlo.reduce` over
+/// `dimensions = [1]` → `[4]`.
+#[test]
+fn emit_sample_binomial_iid_has_expected_structure() {
+    let d = determinize_src(BINOMIAL_IID_SAMPLE_SRC);
+    let out = emit_sample(&d);
+
+    assert!(
+        out.contains("-> (tensor<4xf32>, tensor<2xui64>)"),
+        "fanned Binomial must return the [4] batch + advanced key, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.rng_bit_generator").count(),
+        1,
+        "one rng_bit_generator advance for the whole [4, 5] batch, in:\n{out}"
+    );
+    assert!(
+        out.contains("-> (tensor<2xui64>, tensor<4x5xui32>)"),
+        "the draw must be a genuine rank-2 [4, 5] rng output (rows independent), in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.reduce(").count(),
+        1,
+        "exactly one reduce (the inner-count-axis sum), in:\n{out}"
+    );
+    assert!(
+        out.contains("across dimensions = [1] : (tensor<4x5xf32>, tensor<f32>) -> tensor<4xf32>"),
+        "the reduce must be over the LAST axis only ([4, 5] -> [4]), in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// Freeze the exact emitted text (parse-validated against the real StableHLO
+/// parser): any drift must be a deliberate, reviewed change to this golden.
+#[test]
+fn emit_sample_binomial_iid_matches_frozen_golden() {
+    let d = determinize_src(BINOMIAL_IID_SAMPLE_SRC);
+    let out = emit_sample(&d);
+    let golden = include_str!("goldens/binomial_iid_sample.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted fanned @sample drifted from tests/goldens/binomial_iid_sample.mlir"
+    );
+}
+
+/// The fanned Categorical draw returns a `tensor<4xf32>` alongside the advanced
+/// key, with exactly ONE `rng_bit_generator` sized to `[4]` and NO new
+/// primitive — the running count broadcasts over the batch via the length-3
+/// `p`'s `n - 1 = 2` compare/select prefix-sum comparisons.
+#[test]
+fn emit_sample_categorical_iid_has_expected_structure() {
+    let d = determinize_src(CATEGORICAL_IID_SAMPLE_SRC);
+    let out = emit_sample(&d);
+
+    assert!(
+        out.contains("-> (tensor<4xf32>, tensor<2xui64>)"),
+        "fanned Categorical must return the [4] batch + advanced key, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.rng_bit_generator").count(),
+        1,
+        "one rng_bit_generator advance for the whole [4] batch, in:\n{out}"
+    );
+    assert!(
+        out.contains("-> (tensor<2xui64>, tensor<4xui32>)"),
+        "the single rng_bit_generator must be sized to the [4] batch, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.reduce(").count(),
+        0,
+        "Categorical fans out via broadcast, not a reduce, in:\n{out}"
+    );
+    assert_eq!(out.matches("stablehlo.compare").count(), 2);
+    assert_eq!(out.matches("stablehlo.select").count(), 2);
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// Freeze the exact emitted text (parse-validated against the real StableHLO
+/// parser): any drift must be a deliberate, reviewed change to this golden.
+#[test]
+fn emit_sample_categorical_iid_matches_frozen_golden() {
+    let d = determinize_src(CATEGORICAL_IID_SAMPLE_SRC);
+    let out = emit_sample(&d);
+    let golden = include_str!("goldens/categorical_iid_sample.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted fanned @sample drifted from tests/goldens/categorical_iid_sample.mlir"
+    );
+}
+
+/// The `base = 0.0` mirror of the Categorical fan-out: same `[4]` batch, same op
+/// counts, differing only in the initial count constant (checked structurally —
+/// the difference is exercised by the 1-based golden above).
+#[test]
+fn emit_sample_categorical0_iid_has_expected_structure() {
+    let d = determinize_src(CATEGORICAL0_IID_SAMPLE_SRC);
+    let out = emit_sample(&d);
+
+    assert!(
+        out.contains("-> (tensor<4xf32>, tensor<2xui64>)"),
+        "fanned Categorical0 must return the [4] batch + advanced key, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.rng_bit_generator").count(),
+        1,
+        "one rng_bit_generator advance for the whole [4] batch, in:\n{out}"
+    );
+    assert_eq!(out.matches("stablehlo.reduce(").count(), 0);
+    assert_eq!(out.matches("stablehlo.compare").count(), 2);
+    assert_eq!(out.matches("stablehlo.select").count(), 2);
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// The degenerate `n = 1` case: the inverse-CDF unroll runs ZERO iterations
+/// (`n - 1 = 0`), so `count` never leaves the scalar `base` — this is the one
+/// path `draw_categorical`'s fan-out relies on an explicit
+/// `broadcast_in_dim` guard for (see `registry.rs`) rather than the unroll's
+/// auto-broadcasting compare/select/add. Must still return the `[4]` batch,
+/// NOT a scalar `tensor<f32>` — a fanned draw is `[m]`-shaped like every
+/// other count, even for this constant one-category variate.
+#[test]
+fn emit_sample_categorical_single_category_iid_has_expected_structure() {
+    let d = determinize_src(CATEGORICAL_SINGLE_IID_SAMPLE_SRC);
+    let out = emit_sample(&d);
+
+    assert!(
+        out.contains("-> (tensor<4xf32>, tensor<2xui64>)"),
+        "fanned single-category Categorical must return the [4] batch (not a \
+         scalar) + advanced key, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.rng_bit_generator").count(),
+        1,
+        "one rng_bit_generator advance for the whole [4] batch, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.compare").count(),
+        0,
+        "n - 1 = 0 comparisons: the unroll never runs, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.select").count(),
+        0,
+        "n - 1 = 0 selects: the unroll never runs, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.broadcast_in_dim").count(),
+        1,
+        "the degenerate guard's explicit broadcast of the scalar base to [4], \
+         in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// Freeze the exact emitted text (parse-validated against the real StableHLO
+/// parser): any drift must be a deliberate, reviewed change to this golden.
+#[test]
+fn emit_sample_categorical_single_category_iid_matches_frozen_golden() {
+    let d = determinize_src(CATEGORICAL_SINGLE_IID_SAMPLE_SRC);
+    let out = emit_sample(&d);
+    let golden = include_str!("goldens/categorical_single_iid_sample.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted fanned @sample drifted from tests/goldens/categorical_single_iid_sample.mlir"
     );
 }

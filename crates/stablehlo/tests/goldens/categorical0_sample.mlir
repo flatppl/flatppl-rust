@@ -15,23 +15,20 @@ module {
     %13 = stablehlo.convert %12 : (tensor<ui32>) -> tensor<f32>
     %14 = stablehlo.constant dense<1.1920929E-7> : tensor<f32>
     %15 = stablehlo.multiply %13, %14 : tensor<f32>
-    %16 = stablehlo.subtract %8, %7 : tensor<f32>
-    %17 = stablehlo.multiply %15, %16 : tensor<f32>
-    %18 = stablehlo.add %17, %7 : tensor<f32>
-    %19 = stablehlo.constant dense<0.0> : tensor<f32>
-    %20 = stablehlo.constant dense<0.0> : tensor<f32>
-    %21 = stablehlo.slice %6 [0:1] : (tensor<3xf32>) -> tensor<1xf32>
-    %22 = stablehlo.reshape %21 : (tensor<1xf32>) -> tensor<f32>
-    %23 = stablehlo.add %19, %22 : tensor<f32>
-    %24 = stablehlo.compare LT, %23, %18 : (tensor<f32>, tensor<f32>) -> tensor<i1>
-    %25 = stablehlo.select %24, %8, %7 : (tensor<i1>, tensor<f32>, tensor<f32>) -> tensor<f32>
+    %16 = stablehlo.constant dense<0.0> : tensor<f32>
+    %17 = stablehlo.constant dense<0.0> : tensor<f32>
+    %18 = stablehlo.slice %6 [0:1] : (tensor<3xf32>) -> tensor<1xf32>
+    %19 = stablehlo.reshape %18 : (tensor<1xf32>) -> tensor<f32>
+    %20 = stablehlo.add %16, %19 : tensor<f32>
+    %21 = stablehlo.compare LT, %20, %15 : (tensor<f32>, tensor<f32>) -> tensor<i1>
+    %22 = stablehlo.select %21, %8, %7 : (tensor<i1>, tensor<f32>, tensor<f32>) -> tensor<f32>
+    %23 = stablehlo.add %17, %22 : tensor<f32>
+    %24 = stablehlo.slice %6 [1:2] : (tensor<3xf32>) -> tensor<1xf32>
+    %25 = stablehlo.reshape %24 : (tensor<1xf32>) -> tensor<f32>
     %26 = stablehlo.add %20, %25 : tensor<f32>
-    %27 = stablehlo.slice %6 [1:2] : (tensor<3xf32>) -> tensor<1xf32>
-    %28 = stablehlo.reshape %27 : (tensor<1xf32>) -> tensor<f32>
+    %27 = stablehlo.compare LT, %26, %15 : (tensor<f32>, tensor<f32>) -> tensor<i1>
+    %28 = stablehlo.select %27, %8, %7 : (tensor<i1>, tensor<f32>, tensor<f32>) -> tensor<f32>
     %29 = stablehlo.add %23, %28 : tensor<f32>
-    %30 = stablehlo.compare LT, %29, %18 : (tensor<f32>, tensor<f32>) -> tensor<i1>
-    %31 = stablehlo.select %30, %8, %7 : (tensor<i1>, tensor<f32>, tensor<f32>) -> tensor<f32>
-    %32 = stablehlo.add %26, %31 : tensor<f32>
-    return %32, %9 : tensor<f32>, tensor<2xui64>
+    return %29, %9 : tensor<f32>, tensor<2xui64>
   }
 }
