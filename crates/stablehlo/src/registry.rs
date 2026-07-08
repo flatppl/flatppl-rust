@@ -499,8 +499,15 @@ pub(crate) fn lower_sample(
 /// reading the builder below):
 ///
 /// - Fan-out **Tier 1** — purely elementwise builders (only [`Emitter::rng`]
-///   plus shape-preserving unary / [`Emitter::binary`] ops): Normal/Exponential/
-///   Uniform/Cauchy/Logistic/Pareto/Weibull/LogNormal.
+///   plus shape-preserving unary / [`Emitter::binary`] ops, and — since 10a's
+///   auto-broadcasting [`Emitter::compare`]/[`Emitter::select`] — the
+///   `select`-on-a-`compare` idiom too): Normal/Exponential/Uniform/Cauchy/
+///   Logistic/Pareto/Weibull/LogNormal (continuous); [`laplace_sample`] (its
+///   `sgn(U - 1/2)` composed from that same `compare`/`select` pair); and two
+///   DISCRETE samplers that happen to be straight-line elementwise rather than
+///   `while`/unrolled — [`bernoulli_sample`] (`select(U < p, 1, 0)`) and
+///   [`geometric_sample`] (`floor(log(U) / log(1 - p))`, the only Tier-1
+///   builder needing [`Emitter::floor`], itself shape-preserving).
 /// - Fan-out **Tier 2** — the Marsaglia–Tsang rejection family, batched via
 ///   [`draw_gamma_batched`]'s per-lane masked `stablehlo.while` (a
 ///   `tensor<n×i1>` accept mask redraws only rejected lanes): Gamma and every
@@ -532,15 +539,13 @@ pub(crate) fn lower_sample(
 ///   than mislowered — a clean follow-up.
 /// - The discrete `while`/inverse-CDF samplers ([`draw_poisson`] /
 ///   [`draw_categorical`]): Poisson/NegativeBinomial/NegativeBinomial2/
-///   Binomial/Multinomial/Categorical/Categorical0/Bernoulli/Geometric — not
-///   yet batched (a later tier); their `while`/unroll shapes are not covered by
-///   [`draw_gamma_batched`]'s masked-lane loop.
-/// - [`laplace_sample`]: now elementwise-batchable too (its `sgn` uses the same
-///   auto-broadcasting [`Emitter::compare`]/[`Emitter::select`] as
-///   GeneralizedNormal) — left refused here only to keep this change scoped to
-///   the rejection family; a trivial Tier-1 follow-up.
+///   Binomial/Multinomial/Categorical/Categorical0 — not yet batched (a later
+///   tier); their `while`/unroll shapes are not covered by
+///   [`draw_gamma_batched`]'s masked-lane loop. (Bernoulli/Geometric look like
+///   they belong on this list too — they're discrete — but their builders are
+///   straight-line elementwise, not `while`/unroll, so they're Tier 1 above.)
 const FANOUT_SAFE: &[&str] = &[
-    // Tier 1 (elementwise)
+    // Tier 1 (elementwise continuous)
     "Normal",
     "Exponential",
     "Uniform",
@@ -549,6 +554,10 @@ const FANOUT_SAFE: &[&str] = &[
     "Pareto",
     "Weibull",
     "LogNormal",
+    "Laplace",
+    // Tier 1 (elementwise discrete — straight-line, not while/unroll)
+    "Bernoulli",
+    "Geometric",
     // Tier 2 (batched Marsaglia–Tsang rejection — draw_gamma_batched)
     "Gamma",
     "ChiSquared",

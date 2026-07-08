@@ -6440,3 +6440,160 @@ fn emit_sample_iid_poisson_refuses() {
         err.msg
     );
 }
+
+// ---- fan-out for elementwise Laplace/Bernoulli/Geometric (buffy #148, #155,
+// #156a) --------------------------------------------------------------------
+//
+// Bernoulli/Geometric were left off `FANOUT_SAFE` alongside the genuinely
+// `while`/unrolled discrete samplers, and Laplace was left off scoped to Task
+// 10a's rejection-family change (see the doc comment above `FANOUT_SAFE`), but
+// all three are straight-line elementwise: Laplace's `sgn` and Bernoulli's
+// indicator both compose from the auto-broadcasting `compare`/`select` pair
+// Task 10a already gave `Emitter`, and Geometric's `floor` is shape-preserving
+// like every other Tier-1 unary. No new primitive needed — this batch just
+// admits them to `FANOUT_SAFE`. Both goldens are parse-validated against the
+// real StableHLO parser (jax 0.10.2). The genuinely `while`/unrolled discrete
+// samplers (Poisson etc.) still refuse — see
+// `emit_sample_iid_poisson_refuses` below.
+
+/// A fanned Laplace draw: `iid(Laplace(location=0, scale=1), 4)`, exercising
+/// the `compare`/`select` `sgn` idiom under a `[4]` batch.
+const LAPLACE_IID_SAMPLE_SRC: &str = "\
+s = rnginit(0)
+xs ~ iid(Laplace(location = 0.0, scale = 1.0), 4)
+draws = rand(s, lawof(xs))
+";
+
+/// A fanned Bernoulli draw: `iid(Bernoulli(p=0.3), 4)`, exercising the
+/// `select(U < p, 1, 0)` idiom under a `[4]` batch.
+const BERNOULLI_IID_SAMPLE_SRC: &str = "\
+s = rnginit(0)
+xs ~ iid(Bernoulli(p = 0.3), 4)
+draws = rand(s, lawof(xs))
+";
+
+/// A fanned Geometric draw: `iid(Geometric(p=0.3), 4)`, exercising `floor`
+/// under a `[4]` batch.
+const GEOMETRIC_IID_SAMPLE_SRC: &str = "\
+s = rnginit(0)
+xs ~ iid(Geometric(p = 0.3), 4)
+draws = rand(s, lawof(xs))
+";
+
+/// The fanned Laplace draw returns a `tensor<4xf32>` (not a scalar) alongside
+/// the advanced key, with exactly ONE `rng_bit_generator` sized to `[4]`, one
+/// `compare`/`select` pair for `sgn`, and the scalar params broadcast over the
+/// batch.
+#[test]
+fn emit_sample_laplace_iid_has_expected_structure() {
+    let d = determinize_src(LAPLACE_IID_SAMPLE_SRC);
+    let out = emit_sample(&d);
+
+    assert!(
+        out.contains("-> (tensor<4xf32>, tensor<2xui64>)"),
+        "fanned Laplace must return the [4] batch + advanced key, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.rng_bit_generator").count(),
+        1,
+        "one rng_bit_generator advance for the whole [4] batch, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.compare").count(),
+        1,
+        "sgn(U - 1/2) needs exactly one compare, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.select").count(),
+        1,
+        "sgn(U - 1/2) needs exactly one select, in:\n{out}"
+    );
+    assert!(
+        out.contains("stablehlo.broadcast_in_dim"),
+        "scalar params must broadcast over the batch, in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// Freeze the exact emitted text (parse-validated against the real StableHLO
+/// parser): any drift must be a deliberate, reviewed change to this golden.
+#[test]
+fn emit_sample_laplace_iid_matches_frozen_golden() {
+    let d = determinize_src(LAPLACE_IID_SAMPLE_SRC);
+    let out = emit_sample(&d);
+    let golden = include_str!("goldens/laplace_iid_sample.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted fanned @sample drifted from tests/goldens/laplace_iid_sample.mlir"
+    );
+}
+
+/// The fanned Bernoulli draw returns a `tensor<4xf32>` alongside the advanced
+/// key, with exactly ONE `rng_bit_generator` sized to `[4]`, one `compare`,
+/// one `select`.
+#[test]
+fn emit_sample_bernoulli_iid_has_expected_structure() {
+    let d = determinize_src(BERNOULLI_IID_SAMPLE_SRC);
+    let out = emit_sample(&d);
+
+    assert!(
+        out.contains("-> (tensor<4xf32>, tensor<2xui64>)"),
+        "fanned Bernoulli must return the [4] batch + advanced key, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.rng_bit_generator").count(),
+        1,
+        "one rng_bit_generator advance for the whole [4] batch, in:\n{out}"
+    );
+    assert_eq!(out.matches("stablehlo.compare").count(), 1);
+    assert_eq!(out.matches("stablehlo.select").count(), 1);
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// Freeze the exact emitted text (parse-validated against the real StableHLO
+/// parser): any drift must be a deliberate, reviewed change to this golden.
+#[test]
+fn emit_sample_bernoulli_iid_matches_frozen_golden() {
+    let d = determinize_src(BERNOULLI_IID_SAMPLE_SRC);
+    let out = emit_sample(&d);
+    let golden = include_str!("goldens/bernoulli_iid_sample.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted fanned @sample drifted from tests/goldens/bernoulli_iid_sample.mlir"
+    );
+}
+
+/// The fanned Geometric draw returns a `tensor<4xf32>` alongside the advanced
+/// key, with exactly ONE `rng_bit_generator` sized to `[4]`, two `log`s, one
+/// `floor`.
+#[test]
+fn emit_sample_geometric_iid_has_expected_structure() {
+    let d = determinize_src(GEOMETRIC_IID_SAMPLE_SRC);
+    let out = emit_sample(&d);
+
+    assert!(
+        out.contains("-> (tensor<4xf32>, tensor<2xui64>)"),
+        "fanned Geometric must return the [4] batch + advanced key, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.rng_bit_generator").count(),
+        1,
+        "one rng_bit_generator advance for the whole [4] batch, in:\n{out}"
+    );
+    assert_eq!(out.matches("stablehlo.log").count(), 2);
+    assert_eq!(out.matches("stablehlo.floor").count(), 1);
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// Freeze the exact emitted text (parse-validated against the real StableHLO
+/// parser): any drift must be a deliberate, reviewed change to this golden.
+#[test]
+fn emit_sample_geometric_iid_matches_frozen_golden() {
+    let d = determinize_src(GEOMETRIC_IID_SAMPLE_SRC);
+    let out = emit_sample(&d);
+    let golden = include_str!("goldens/geometric_iid_sample.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted fanned @sample drifted from tests/goldens/geometric_iid_sample.mlir"
+    );
+}
