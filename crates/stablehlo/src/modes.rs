@@ -73,7 +73,7 @@
 
 use std::collections::HashSet;
 
-use flatppl_core::{CallHead, Module, Node, NodeId, Phase, Ref, RefNs};
+use flatppl_core::{CallHead, Module, Node, NodeId, Phase, Ref, RefNs, Scalar};
 
 use crate::EmitOptions;
 use crate::emitter::Emitter;
@@ -123,7 +123,7 @@ pub fn emit_logdensity(m: &Module, opts: &EmitOptions) -> Result<String, EmitErr
     }
 
     let result = e.lower_node(query_rhs)?;
-    Ok(e.finish("logdensity", &args, &result))
+    Ok(e.finish("logdensity", &args, &[&result]))
 }
 
 /// Whether the subtree rooted at `id` (the node itself, or any descendant
@@ -152,17 +152,58 @@ fn contains_logdensityof_call(m: &Module, root: NodeId) -> bool {
 pub fn emit_sample(m: &Module, opts: &EmitOptions) -> Result<String, EmitError> {
     let mut e = Emitter::new(m, opts.dtype);
 
+    let query = m.public_bindings().last().ok_or_else(|| {
+        EmitError::whole("module has no public binding to emit as the sample query")
+    })?;
+    let query_rhs = query.1.rhs;
+
+    // Guard the "last public binding" convention (see the module doc
+    // comment): refuse rather than silently lower a trailing non-sample
+    // binding. Checked BEFORE `find_rng_source` so a non-sample query gets
+    // the precise "no sample term" refusal, not "no rng source".
+    if !contains_sample_call(m, query_rhs) {
+        return Err(EmitError::at(
+            query_rhs,
+            "selected query output contains no sample term (builtin_sample); \
+             FlatPDL has no query marker — cannot identify the @sample output",
+        ));
+    }
+
+    // Bind the FlatPDL rng source to `%key` (spec §07 rng ABI: `rnginit`'s
+    // seed→state math is NOT lowered — the source binds directly to the
+    // threaded key). `%key` is func arg 0.
+    let key_ty = MlirTy::Key;
+    let key_name = "%key".to_string();
+    let src = find_rng_source(m, query_rhs).ok_or_else(|| {
+        EmitError::at(
+            query_rhs,
+            "no rng source to bind to %key: every builtin_sample's rng arg \
+             resolves to another sample's advanced key, so there is no \
+             rnginit/external(rngstates) source to thread from",
+        )
+    })?;
+    e.bind(
+        src,
+        Value {
+            ssa: key_name.clone(),
+            ty: key_ty.clone(),
+        },
+    );
+    let mut args: Vec<(String, MlirTy)> = vec![(key_name, key_ty)];
+
     // Free parameters, in binding (source) order — identical to
     // `emit_logdensity`'s loop (see the module doc comment): a `@sample`
     // forward model can still have `elementof`-declared hyperparameters, in
-    // which case they become func args just as they do for `@logdensity`.
-    // A fixed-hyperparameter prior (the common case) simply yields no args.
-    let mut args: Vec<(String, MlirTy)> = Vec::new();
+    // which case they become `%argN` func args (numbered independently of
+    // `%key`) just as they do for `@logdensity`. A fixed-hyperparameter prior
+    // (the common case) simply yields no extra args.
+    let mut nfree = 0;
     for (_, binding) in m.bindings() {
         if !is_free_param(m, binding.rhs) {
             continue;
         }
-        let name = format!("%arg{}", args.len());
+        let name = format!("%arg{nfree}");
+        nfree += 1;
         let ty = mlir_type_of(m, binding.rhs, opts.dtype)?;
         e.bind(
             binding.rhs,
@@ -174,24 +215,154 @@ pub fn emit_sample(m: &Module, opts: &EmitOptions) -> Result<String, EmitError> 
         args.push((name, ty));
     }
 
-    let query = m.public_bindings().last().ok_or_else(|| {
-        EmitError::whole("module has no public binding to emit as the sample query")
-    })?;
-    let query_rhs = query.1.rhs;
+    // Lower the query's value component (spec §07: `rand` yields
+    // `(value, new_rstate)`; a destructured query is a bare `tuple(v, r)`, of
+    // which only `v` is the drawn value), then thread out the final advanced
+    // key (`Emitter::cur_key` after the whole draw chain) as the second result.
+    let value = e.lower_node(query_value_component(m, query_rhs))?;
+    let final_key = e.cur_key();
+    Ok(e.finish("sample", &args, &[&value, &final_key]))
+}
 
-    // Guard the "last public binding" convention (see the module doc
-    // comment): refuse rather than silently lower a trailing non-sample
-    // binding.
-    if !contains_sample_call(m, query_rhs) {
-        return Err(EmitError::at(
-            query_rhs,
-            "selected query output contains no sample term (builtin_sample); \
-             FlatPDL has no query marker — cannot identify the @sample output",
-        ));
+/// The value component of a `@sample` query. A destructured `rand` whose
+/// binding is used directly as the output is a bare `tuple(value, advanced_rng)`
+/// (the determiniser's [`flatppl_determinizer::sample`] shape) — lower only the
+/// `value` slot; every other query shape (a value-terminal `get0(sample, 0)`,
+/// a `record(...)`, a bare ref) is already the value and is returned unchanged.
+fn query_value_component(m: &Module, query_rhs: NodeId) -> NodeId {
+    if let Node::Call(c) = m.node(query_rhs) {
+        if let CallHead::Builtin(sym) = c.head {
+            if m.resolve(sym) == "tuple" && c.args.len() == 2 {
+                return c.args[0];
+            }
+        }
     }
+    query_rhs
+}
 
-    let result = e.lower_node(query_rhs)?;
-    Ok(e.finish("sample", &args, &result))
+/// Find the FlatPDL rng SOURCE reachable from the `@sample` query — the
+/// `builtin_sample` whose rng argument does NOT (transitively) resolve to
+/// another sample's advanced-key slot, i.e. the `rnginit(...)`/
+/// `external(rngstates)` that seeds the whole threaded chain (spec §07). The
+/// returned [`NodeId`] is that source sample's rng-argument node, which
+/// [`emit_sample`] binds to `%key` so [`crate::registry::lower_sample`]'s
+/// `e.lower_node(rng)` resolves straight to the func argument (the `rnginit`
+/// node itself is never lowered — its seed→state math is out of scope).
+///
+/// `None` when no such source exists (every sample's rng arg is another
+/// sample's advanced key — a cycle, or a model whose only rng comes from a
+/// slot with no root): [`emit_sample`] then refuses rather than silently
+/// dropping the key. In a well-formed threaded chain there is exactly one
+/// source; the first found (in reachability-walk order) is returned.
+fn find_rng_source(m: &Module, query_rhs: NodeId) -> Option<NodeId> {
+    for sample in collect_sample_calls(m, query_rhs) {
+        if let Node::Call(c) = m.node(sample) {
+            if let Some(&rng_arg) = c.args.first() {
+                if !derives_from_sample(m, rng_arg) {
+                    return Some(rng_arg);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Collect every `builtin_sample` [`NodeId`] reachable from `root`, following
+/// `(%ref self x)` leaves to their bound RHS (transitively) as well as
+/// [`Module::for_each_child`] — the same reach as [`contains_sample_call`]
+/// (a record/hierarchical query's samples sit one or more binding-hops away on
+/// ref-resolved RHSs). Deduplicated (a sample projected as both
+/// `get0(s, 0)` and `get0(s, 1)` is one node) via the visited set.
+fn collect_sample_calls(m: &Module, root: NodeId) -> Vec<NodeId> {
+    let mut stack = vec![root];
+    let mut seen: HashSet<NodeId> = HashSet::new();
+    let mut samples = Vec::new();
+    while let Some(id) = stack.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        if is_builtin_call(m, id, "builtin_sample") {
+            samples.push(id);
+        }
+        if let Node::Ref(Ref {
+            ns: RefNs::SelfMod,
+            name,
+        }) = m.node(id)
+        {
+            if let Some(bid) = m.binding_by_name(*name) {
+                stack.push(m.binding(bid).rhs);
+            }
+        }
+        m.for_each_child(id, |c| stack.push(c));
+    }
+    samples
+}
+
+/// Whether `id` — resolved through `(%ref self x)` hops and literal `tuple`/
+/// `get`/`get0` projections — ultimately derives from a `builtin_sample`
+/// (i.e. is some sample's drawn value or advanced key). Used by
+/// [`find_rng_source`] to distinguish a chained sample's rng arg (a prior
+/// sample's advanced-key slot, `get0(sample, 1)` — possibly via a
+/// `tuple(...)` the determiniser built and a 1-based `get(_, 2)`) from a true
+/// source (`rnginit`/`external`, which is not sample-derived).
+fn derives_from_sample(m: &Module, id: NodeId) -> bool {
+    let id = resolve_self_ref(m, id);
+    let Node::Call(c) = m.node(id) else {
+        return false;
+    };
+    let head = match c.head {
+        CallHead::Builtin(sym) => m.resolve(sym),
+        CallHead::User(_) => return false,
+    };
+    let base = match head {
+        "get0" => 0,
+        "get" => 1,
+        _ => return false,
+    };
+    let [container, index] = match <[NodeId; 2]>::try_from(&c.args[..]) {
+        Ok(pair) => pair,
+        Err(_) => return false,
+    };
+    let container = resolve_self_ref(m, container);
+    if is_builtin_call(m, container, "builtin_sample") {
+        return true;
+    }
+    // `get`/`get0` of a literal `tuple(...)` → recurse into the projected slot.
+    if let Node::Call(tc) = m.node(container) {
+        if let CallHead::Builtin(sym) = tc.head {
+            if m.resolve(sym) == "tuple" {
+                if let Node::Lit(Scalar::Int(sel)) = m.node(index) {
+                    let idx = sel - base;
+                    if idx >= 0 && (idx as usize) < tc.args.len() {
+                        return derives_from_sample(m, tc.args[idx as usize]);
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Resolve `id` through `(%ref self x)` hops transitively (a cycle-guarded
+/// generalization of the emitter's one-hop `resolve_ref_one`), returning the
+/// first non-`SelfMod`-ref node. Used by [`derives_from_sample`] to see
+/// through the determiniser's binding chains (`s2 = get(__0x1, 2)`, etc.).
+fn resolve_self_ref(m: &Module, id: NodeId) -> NodeId {
+    let mut cur = id;
+    let mut seen: HashSet<NodeId> = HashSet::new();
+    while seen.insert(cur) {
+        match m.node(cur) {
+            Node::Ref(Ref {
+                ns: RefNs::SelfMod,
+                name,
+            }) => match m.binding_by_name(*name) {
+                Some(bid) => cur = m.binding(bid).rhs,
+                None => return cur,
+            },
+            _ => return cur,
+        }
+    }
+    cur
 }
 
 /// Whether the subtree rooted at `id` contains a `Call` whose head is the

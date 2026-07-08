@@ -1338,7 +1338,11 @@ fn lower_pushfwd(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Refu
 /// A `%deferred` iid type (inference did not resolve `M`'s domain, so
 /// `iid_type` returned `Type::Deferred`) also yields `None` — refuse, never
 /// guess a size.
-fn iid_static_size(m: &Module, iid_node: NodeId) -> Option<usize> {
+///
+/// Shared with `sample::lower_draw`'s `iid(K, n)` sample fan-out, which needs
+/// the identical static-length read before batching a `builtin_sample` over
+/// `n` — see that call site for why it reuses this rather than re-deriving it.
+pub(crate) fn iid_static_size(m: &Module, iid_node: NodeId) -> Option<usize> {
     let Some(Type::Measure { domain, .. }) = m.type_of(iid_node) else {
         return None;
     };

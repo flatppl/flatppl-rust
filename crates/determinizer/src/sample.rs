@@ -18,8 +18,8 @@
 //! [`lower_measure_sample`]'s single `resolve_ref_one` call, mirroring
 //! `density::lower_measure_density`'s dispatch.
 use crate::density::{
-    build_call, build_record, builtin_name, draw_argument, expect_builtin_call, refuse,
-    resolve_ref_one, split_kernel_constructor,
+    build_call, build_record, builtin_name, draw_argument, expect_builtin_call, iid_static_size,
+    refuse, resolve_ref_one, split_kernel_constructor,
 };
 use crate::refuse::RefuseError;
 use flatppl_core::{
@@ -31,8 +31,9 @@ use flatppl_core::{
 /// `bid` is the binding whose subtree contains `rand_node` (the driver's
 /// `apply_rule` already has it) — i.e. the name a `v, s2 = rand(...)`
 /// decomposition or a bare `draws = rand(...)` assignment binds the `rand`
-/// call to. It is used ONLY to check [`rand_result_is_destructured`] before
-/// lowering; see that function's doc for why.
+/// call to. It is used ONLY to check [`rand_result_is_destructured`], which
+/// dispatches the result shape (tuple vs bare value); see that function's doc
+/// for why.
 pub(crate) fn lower_rand(
     m: &mut Module,
     bid: BindingId,
@@ -46,21 +47,6 @@ pub(crate) fn lower_rand(
         }
         (c.args[0], c.args[1])
     };
-    // Refuse a DESTRUCTURED / rng-threaded `rand` before doing anything else —
-    // see `rand_result_is_destructured`'s doc for the mislowering this guards
-    // against. This vertical only supports the value-terminal convention
-    // (`draws = rand(...)` used as a value, or its record fields read by a
-    // STRING selector); the spec's full `(value, new_rstate)` tuple contract
-    // is deferred.
-    if rand_result_is_destructured(m, bid) {
-        return Err(refuse(
-            rand_node,
-            m,
-            "destructured / rng-threaded `rand` (consuming the returned rngstate) is not \
-             supported in this vertical — only a value-terminal `rand(...)`; the spec's \
-             `(value, new_rstate)` tuple form is deferred to the full sample path",
-        ));
-    }
     // Strip lawof: rand samples the LAW of a stochastic subgraph. Refuse lawof of
     // a non-stochastic (Dirac) argument (spec: lawof of a deterministic point).
     let inner = strip_lawof(m, measure)
@@ -82,34 +68,43 @@ pub(crate) fn lower_rand(
              generative draw to sample; refuse rather than mislower",
         ));
     }
-    let (value, _rng_out) = lower_measure_sample(m, inner, rng)?;
-    Ok(value)
+    let (value, rng_out) = lower_measure_sample(m, inner, rng)?;
+    if rand_result_is_destructured(m, bid) {
+        // Full spec §07 (value, new_rstate) contract: the caller destructures
+        // both slots (or feeds s2 into another rand). Build the 2-tuple so the
+        // parser's `get(_,1)`/`get(_,2)` (1-based) project value/rng.
+        Ok(build_call(m, "tuple", &[value, rng_out]))
+    } else {
+        // Value-terminal shortcut: `draws = rand(...)` used as a bare value /
+        // read by string selector — return the bare value (unchanged).
+        Ok(value)
+    }
 }
 
 /// Is `rand_bid`'s value DESTRUCTURED — read via an INTEGER-literal tuple
 /// projection (`get(_, k)` / `get0(_, k)`) rather than used as a bare value?
 ///
 /// `rand(rng, lawof(x))` infers to `Tuple([domain(x), RngState])` (spec §07;
-/// `crates/infer/src/ops.rs`'s `"rand"` phase arm), but [`lower_rand`] only
-/// implements the VALUE-terminal convention: it returns the bare sampled value
-/// and drops the advanced rng (`_rng_out` above), never emitting the second
-/// tuple slot at all. The parser's `v, s2 = rand(...)` decomposition sugar
+/// `crates/infer/src/ops.rs`'s `"rand"` phase arm). [`lower_rand`] uses this
+/// predicate to DISPATCH the result shape: true builds the full 2-tuple
+/// `tuple(value, advanced_rng)`; false returns the bare sampled value, dropping
+/// the advanced rng. The parser's `v, s2 = rand(...)` decomposition sugar
 /// (`lower_decomposition`, `crates/syntax/src/parser.rs`) lowers to exactly
 /// `__0x1 = rand(...); v = get(__0x1, 1); s2 = get(__0x1, 2)` — a synthetic
 /// tmp binding (name pattern `__0x<hex>`) plus 1-based integer-literal `get`
 /// projections off it. A user can write the same shape directly with the
-/// 0-based `get0(draws, 0)` / `get0(draws, 1)`. Either way, once `lower_rand` erases
-/// the tuple and substitutes the bare value in `rand_bid`'s place, a surviving
-/// `get(<rand-value>, 1)` (or `get0(<rand-value>, 0)`, etc.) indexes a
-/// NON-tuple — wrong/out-of-range FlatPDL emitted SILENTLY, since the
-/// determiniser does not re-infer after the rewrite and `is_flatpdl` is
-/// structural (whole-branch review finding: "silent mislowering"). Refuse
-/// rather than mislower.
+/// 0-based `get0(draws, 0)` / `get0(draws, 1)`. Getting this dispatch wrong in
+/// the value-terminal direction would erase the tuple and substitute the bare
+/// value in `rand_bid`'s place, leaving a surviving `get(<rand-value>, 1)` (or
+/// `get0(<rand-value>, 0)`, etc.) indexing a NON-tuple — wrong/out-of-range
+/// FlatPDL emitted SILENTLY, since the determiniser does not re-infer after the
+/// rewrite and `is_flatpdl` is structural (whole-branch review finding:
+/// "silent mislowering"). This predicate is what keeps the two paths sound.
 ///
 /// A STRING-literal selector (`get(draws, "mu")` / `draws.mu`, record-field
 /// access) is a DIFFERENT selector shape — `get_type`'s `Type::Record` arm
 /// keys on `Node::Lit(Scalar::Str(_))`, never `Scalar::Int` — so it is not a
-/// tuple projection and must NOT trip this guard: the value-terminal
+/// tuple projection and must NOT trip this predicate: the value-terminal
 /// convention (`draws` standing in for the record `lower_rand` returns) still
 /// needs its fields readable by name.
 fn rand_result_is_destructured(m: &Module, rand_bid: BindingId) -> bool {
@@ -321,6 +316,36 @@ fn lower_draw(
     if let Some(err) = classify_intractable_or_deferred(m, inner_resolved) {
         return Err(err);
     }
+    // Fan-out: `draw(iid(K, n))` with a FIXED kernel `K` and a static length `n`
+    // → ONE batched `builtin_sample(rng, ctor, input, n)` (spec §07
+    // measure-eval-prims: `builtin_sample`'s size-dims form returns an IID array
+    // `X` of size `n` with a SINGLE advanced `new_rngstate`, not one per
+    // element). `split_iid` only matches the `iid(K, n)` shape itself;
+    // `split_constructor` below is what rejects a kernel that is not a bare
+    // built-in constructor call — in particular a `broadcast(K, arr0, arr1, …)`
+    // kernel (an array-of-kernels measure with DIFFERING per-element params,
+    // §04 broadcasting) has positional args, so it is refused here rather than
+    // mislowered as a fixed-kernel fan-out.
+    if let Some((kernel, iid_node)) = split_iid(m, inner_measure) {
+        let n = iid_static_size(m, iid_node).ok_or_else(|| {
+            refuse(
+                iid_node,
+                m,
+                "iid sample length is not a statically-resolved 1-D count (dynamic, \
+                 multi-axis, or unresolved domain); only a 1-D static fan-out is built",
+            )
+        })?;
+        let (ctor, kernel_input) = split_constructor(m, kernel).ok_or_else(|| {
+            refuse(
+                kernel,
+                m,
+                "iid sample: inner kernel must be a built-in constructor (a broadcast/\
+                 array-of-kernels measure has differing per-element params — not a \
+                 fixed-kernel fan-out; refuse rather than mislower)",
+            )
+        })?;
+        return Ok(build_iid_sample_term(m, ctor, kernel_input, n, rng));
+    }
     let (ctor, kernel_input) = split_constructor(m, inner_measure).ok_or_else(|| {
         refuse(
             inner_measure,
@@ -329,6 +354,18 @@ fn lower_draw(
         )
     })?;
     Ok(build_sample_term(m, ctor, kernel_input, rng))
+}
+
+/// `iid(K, n)` → `(K, iid_node)`, resolving one level of ref indirection first
+/// (mirroring `split_constructor`'s convention). The repeat count is read from
+/// `iid_node`'s own inferred domain shape by `density::iid_static_size` — NOT
+/// the raw `n` argument here — since a shape-dependent size (`lengthof(obs)`,
+/// arithmetic, …) is already const-folded onto the type (see that function's
+/// doc); callers pass `iid_node` straight to it.
+fn split_iid(m: &Module, measure: NodeId) -> Option<(NodeId, NodeId)> {
+    let (resolved, _) = resolve_ref_one(m, measure);
+    let c = expect_builtin_call(m, resolved, "iid")?;
+    (c.args.len() == 2).then_some((c.args[0], resolved))
 }
 
 /// A primitive constructor call `Normal(mu=…, sigma=…)` → (ctor Const node,
@@ -358,6 +395,27 @@ fn build_sample_term(
     rng: NodeId,
 ) -> (NodeId, NodeId) {
     let sample = build_call(m, "builtin_sample", &[rng, ctor, kernel_input]);
+    let zero = m.alloc(Node::Lit(Scalar::Int(0)));
+    let one = m.alloc(Node::Lit(Scalar::Int(1)));
+    let value = build_call(m, "get0", &[sample, zero]);
+    let new_rng = build_call(m, "get0", &[sample, one]);
+    (value, new_rng)
+}
+
+/// Emit `builtin_sample(rng, ctor, kernel_input, n)` → `(get0(sample, 0)` = the
+/// length-`n` IID array, `get0(sample, 1)` = new rng`)` — the spec §07
+/// size-dims form of `builtin_sample`: ONE call over the fixed kernel
+/// `ctor(kernel_input)` produces `n` iid draws and ONE advanced rngstate
+/// (mirrors [`build_sample_term`]'s single-draw shape, plus the trailing `n`).
+fn build_iid_sample_term(
+    m: &mut Module,
+    ctor: NodeId,
+    kernel_input: NodeId,
+    n: usize,
+    rng: NodeId,
+) -> (NodeId, NodeId) {
+    let n_lit = m.alloc(Node::Lit(Scalar::Int(n as i64)));
+    let sample = build_call(m, "builtin_sample", &[rng, ctor, kernel_input, n_lit]);
     let zero = m.alloc(Node::Lit(Scalar::Int(0)));
     let one = m.alloc(Node::Lit(Scalar::Int(1)));
     let value = build_call(m, "get0", &[sample, zero]);

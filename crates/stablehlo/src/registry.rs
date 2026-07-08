@@ -386,13 +386,13 @@ pub(crate) fn lower_logdensityof(
 
 /// `builtin_sample(rng, ctor, kernel_input)` (`flatppl_determinizer::sample`'s
 /// `build_sample_term`/`lower_shared_record_sample`): `rng` is the threaded
-/// RNG-state argument — deliberately UNUSED (bound as `_rng` below): this
-/// vertical lowers to `stablehlo.rng`, which is XLA-seeded and takes no
-/// explicit rng key, so there is nothing to lower it to (spec §07's
-/// `builtin_sample` returns a `(value, new_rngstate)` pair; the advanced
-/// rng-state half has no tensor form here either — see
-/// `Emitter::sample_tuple_slot`'s doc comment for how a `get0(_, 1)`
-/// projection of it is refused rather than mis-lowered). `ctor` is a bare
+/// RNG-state argument (spec §07 rng ABI). It is lowered to the current key and
+/// [`Emitter::set_cur_key`]-seeded BEFORE the distribution builder runs, so
+/// every `Emitter::rng` draw the builder makes advances from it; after the
+/// builder, the advanced key ([`Emitter::cur_key`]) is recorded on this node
+/// ([`Emitter::record_sample_key`]) so a `get0(sample, 1)`/`get(sample, 2)`
+/// projection can thread it onward (the `(value, new_rngstate)` pair's second
+/// slot — see the `get0/get` arm in `emitter.rs`). `ctor` is a bare
 /// `Const(ctor)` distribution constructor symbol, `kernel_input` its kwargs
 /// record — otherwise the same shape as [`lower_logdensityof`]'s `kernel`/
 /// `kernel_input`. Dispatches to `lookup(ctor).sample`, refusing precisely
@@ -403,12 +403,38 @@ pub(crate) fn lower_sample(
     id: NodeId,
     args: &[NodeId],
 ) -> Result<Value, EmitError> {
-    let [_rng, ctor, kernel_input] = <[NodeId; 3]>::try_from(args).map_err(|_| {
-        EmitError::at(
-            id,
-            format!("builtin_sample: expected 3 arguments, got {}", args.len()),
-        )
-    })?;
+    // The scalar form is `builtin_sample(rng, ctor, kernel_input)`; the fanned
+    // iid form (spec §07 size dims) appends a trailing static count `n`,
+    // `builtin_sample(rng, ctor, kernel_input, n)` — the determiniser's
+    // `iid(K, n)` fan-out (see `flatppl_determinizer::sample`).
+    let (rng, ctor, kernel_input, batch_n) = match *args {
+        [rng, ctor, kernel_input] => (rng, ctor, kernel_input, None),
+        [rng, ctor, kernel_input, n_arg] => {
+            // Read `n` straight from the trailing literal: `infer`'s
+            // builtin_sample rule ignores the n dim (the inferred variate type
+            // is wrongly scalar), so the literal is the ONLY trustworthy source
+            // — a non-literal (or non-positive) count refuses, never guesses.
+            let n = match e.node(n_arg) {
+                Node::Lit(Scalar::Int(i)) if *i > 0 => *i as u64,
+                _ => {
+                    return Err(EmitError::at(
+                        n_arg,
+                        "builtin_sample fan-out size must be a positive integer literal",
+                    ));
+                }
+            };
+            (rng, ctor, kernel_input, Some(n))
+        }
+        _ => {
+            return Err(EmitError::at(
+                id,
+                format!(
+                    "builtin_sample: expected 3 or 4 arguments, got {}",
+                    args.len()
+                ),
+            ));
+        }
+    };
 
     let ctor_name = match e.node(ctor) {
         Node::Const(sym) => e.resolve(*sym).to_string(),
@@ -425,12 +451,115 @@ pub(crate) fn lower_sample(
         .sample
         .ok_or_else(|| EmitError::at(id, format!("no @sample lowering for '{ctor_name}'")))?;
 
+    // Fan-out (iid) covers Tier 1 (elementwise) + Tier 2 (the Marsaglia–Tsang
+    // rejection family, batched per-lane in `draw_gamma_batched`) — see
+    // `FANOUT_SAFE`. Anything else (multivariate/vector-variate samplers, the
+    // discrete `while`/inverse-CDF samplers) is not yet batch-shape-generic and
+    // refuses here rather than mislower.
+    if batch_n.is_some() && !FANOUT_SAFE.contains(&ctor_name.as_str()) {
+        return Err(EmitError::at(
+            id,
+            format!(
+                "fan-out (iid) @sample for '{ctor_name}' not yet supported \
+                 (multivariate/discrete fan-out — deferred)"
+            ),
+        ));
+    }
+
+    // Seed the threaded key from this sample's rng arg (the source sample's
+    // arg is pre-bound to `%key` by `modes::emit_sample`; a chained sample's
+    // resolves to the previous sample's recorded advanced key).
+    let key = e.lower_node(rng)?;
+    e.set_cur_key(key);
+
     let params = Params {
         kernel_input,
         variate: None,
     };
-    sample(e, &params)
+    // Size the draw by the batch dim for a fanned iid sample; clear it after
+    // (even on a builder error) so a later scalar sample is unaffected.
+    if let Some(n) = batch_n {
+        e.set_batch_shape(vec![n]);
+    }
+    let result = sample(e, &params);
+    e.clear_batch_shape();
+    let value = result?;
+
+    // The builder advanced the key via `Emitter::rng`; record it for this
+    // node's advanced-rng slot. Fan-out draws ONE `[n]` batch, so a fanned
+    // sample records exactly one advanced key too (spec §07: a size-dims
+    // builtin_sample returns one new_rngstate for the whole batch).
+    let advanced = e.cur_key();
+    e.record_sample_key(id, advanced);
+    Ok(value)
 }
+
+/// Constructors whose `@sample` builder produces a `[n]` fanned iid draw with
+/// one `rng_bit_generator` advance (spec §07 size dims), broadcasting its
+/// scalar params over the batch. Two families qualify (each confirmed by
+/// reading the builder below):
+///
+/// - Fan-out **Tier 1** — purely elementwise builders (only [`Emitter::rng`]
+///   plus shape-preserving unary / [`Emitter::binary`] ops): Normal/Exponential/
+///   Uniform/Cauchy/Logistic/Pareto/Weibull/LogNormal.
+/// - Fan-out **Tier 2** — the Marsaglia–Tsang rejection family, batched via
+///   [`draw_gamma_batched`]'s per-lane masked `stablehlo.while` (a
+///   `tensor<n×i1>` accept mask redraws only rejected lanes): Gamma and every
+///   reducer that composes it with elementwise ops — ChiSquared/StudentT/
+///   InverseGamma/Beta/GeneralizedNormal. Each draws one masked `while` sized
+///   to `[n]`. (This tier is what made [`Emitter::compare`]/[`Emitter::select`]
+///   auto-broadcast a scalar operand over a `[n]` batch, like
+///   [`Emitter::binary`] already did — GeneralizedNormal's per-lane sign and
+///   the Gamma boost need it.)
+/// - Fan-out **Tier 2 (multivariate)** — MvNormal, whose variate is itself a
+///   `d`-vector: the fanned draw is a rank-2 `[n, d]` batch of iid draws. One
+///   `rng_bit_generator` advance sized to `[n, d]` (a genuine `tensor<n×d>`
+///   draw — the n rows are independent), one shared `stablehlo.cholesky` on the
+///   `[d, d]` cov, and the row-wise affine `mu + L·z_i` for all rows as a
+///   batched [`Emitter::batched_row_matvec`] (`z · Lᵀ`), with `mu` broadcast
+///   across the rows. See [`mvnormal_sample`].
+///
+/// Deliberately EXCLUDED (fan-out for these still refuses):
+/// - Dirichlet: its scalar `@sample` ([`dirichlet_sample`]) draws `d` SCALAR
+///   Gammas in a Rust `for` loop (via the scalar [`draw_gamma`], not the
+///   batched [`draw_gamma_batched`]) and stacks them along axis 0. Fanning to
+///   `[n, d]` needs machinery beyond what the rejection batch (Task 10a) gives:
+///   either a rank-3 `[MAXITER, n, d]` masked rejection with a per-component
+///   (`[d]`) shape parameter (generalizing [`draw_gamma_batched`], which is
+///   1-D `[n]`-only, its candidate pre-draw / accept mask / [`Emitter::
+///   dynamic_slice_row`] all rank-2), or `d` separate `[n]` batched Gammas plus
+///   a NEW `stablehlo.transpose` op form to reorient the axis-0 stack
+///   `[d, n]` → `[n, d]` (the emitter has no transpose today). Refused rather
+///   than mislowered — a clean follow-up.
+/// - The discrete `while`/inverse-CDF samplers ([`draw_poisson`] /
+///   [`draw_categorical`]): Poisson/NegativeBinomial/NegativeBinomial2/
+///   Binomial/Multinomial/Categorical/Categorical0/Bernoulli/Geometric — not
+///   yet batched (a later tier); their `while`/unroll shapes are not covered by
+///   [`draw_gamma_batched`]'s masked-lane loop.
+/// - [`laplace_sample`]: now elementwise-batchable too (its `sgn` uses the same
+///   auto-broadcasting [`Emitter::compare`]/[`Emitter::select`] as
+///   GeneralizedNormal) — left refused here only to keep this change scoped to
+///   the rejection family; a trivial Tier-1 follow-up.
+const FANOUT_SAFE: &[&str] = &[
+    // Tier 1 (elementwise)
+    "Normal",
+    "Exponential",
+    "Uniform",
+    "Cauchy",
+    "Logistic",
+    "Pareto",
+    "Weibull",
+    "LogNormal",
+    // Tier 2 (batched Marsaglia–Tsang rejection — draw_gamma_batched)
+    "Gamma",
+    "ChiSquared",
+    "StudentT",
+    "InverseGamma",
+    "Beta",
+    "GeneralizedNormal",
+    // Tier 2 (batched multivariate — mvnormal_sample)
+    "MvNormal",
+];
 
 // ---- §08 Normal -------------------------------------------------------------
 
@@ -1663,18 +1792,46 @@ fn mvnormal_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
     let mu = e.lower_node(mu_id)?;
     let cov_id = p.field_id(e, "cov")?;
     let cov = e.lower_node(cov_id)?;
-    let n = static_vector_len(mu_id, &mu)?;
-    require_square_cov(cov_id, &cov, n)?;
+    let d = static_vector_len(mu_id, &mu)?;
+    require_square_cov(cov_id, &cov, d)?;
 
+    // Cholesky ONCE on the `[d, d]` cov, shared across every draw (scalar or
+    // fanned): `L` is a deterministic function of `cov`, not of the rng.
     let l = e.cholesky(&cov);
 
     let zero = e.scalar(0.0);
     let one = e.scalar(1.0);
-    let vec_ty = MlirTy::Ranked(vec![Some(n)]);
-    let z = e.rng("NORMAL", &zero, &one, &vec_ty);
+    let vec_ty = MlirTy::Ranked(vec![Some(d)]);
 
-    let l_z = e.matvec(&l, &z);
-    Ok(e.add(&mu, &l_z))
+    match e.batch_shape() {
+        // Scalar MvNormal — UNCHANGED (byte-identical to the pre-Task-10b path):
+        // draw one `[d]` standard normal `z`, return `mu + L·z`.
+        None => {
+            let z = e.rng("NORMAL", &zero, &one, &vec_ty);
+            let l_z = e.matvec(&l, &z);
+            Ok(e.add(&mu, &l_z))
+        }
+        // Fanned iid `[n, d]` (Task 10b): `n` independent draws of the whole
+        // `d`-vector. `lower_sample` set the batch shape to `[n]`; MvNormal's
+        // variate is itself a `d`-vector, so the draw is a rank-2 `[n, d]`.
+        Some(batch) => {
+            let n = batch[0];
+            let batch_ty = MlirTy::Ranked(vec![Some(n), Some(d)]);
+            // One `rng_bit_generator` advance sized to `[n, d]` — a GENUINE
+            // `tensor<n×d>` draw (each of the n·d elements is a distinct rng
+            // bit, so the n rows are independent), NOT a `[d]` draw broadcast
+            // across n. `Emitter::rng` sizes to the batch shape, so widen it to
+            // `[n, d]` for the draw, then restore `lower_sample`'s `[n]`.
+            e.set_batch_shape(vec![n, d]);
+            let z = e.rng("NORMAL", &zero, &one, &vec_ty);
+            e.set_batch_shape(vec![n]);
+            // Row-wise `L·z_i` for all rows = `z · Lᵀ` → `[n, d]`.
+            let l_z = e.batched_row_matvec(&z, &l);
+            // `mu` (a `[d]` vector) broadcasts across the `n` rows → `[n, d]`.
+            let mu_bc = e.broadcast_in_dim(&mu, &[1], batch_ty);
+            Ok(e.add(&mu_bc, &l_z))
+        }
+    }
 }
 
 /// §08 Dirichlet, verbatim: `log f = lgamma(sum(alpha)) - sum(lgamma(alpha))
@@ -2202,9 +2359,24 @@ fn lkj_cholesky_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, 
 /// comment for why 128 makes the all-reject tail bias negligible.
 const MAXITER: u64 = 128;
 
-/// Draw one scalar `Gamma(shape, rate)` variate via Marsaglia–Tsang rejection
-/// (the shared core every sampler in this batch reduces to). See the batch doc
-/// comment for the `MAXITER`/pre-drawn-batch/boost design. Emits exactly one
+/// Draw a `Gamma(shape, rate)` variate via Marsaglia–Tsang rejection (the
+/// shared core every sampler in this batch reduces to). Dispatches on the
+/// [`Emitter::batch_shape`] fan-out override: a scalar draw (`None`) takes the
+/// unchanged [`draw_gamma_scalar`] path (one scalar `Value`, byte-identical to
+/// before); a batched `iid(K, n)` draw (`Some([n])`) takes the masked-lane
+/// [`draw_gamma_batched`] path (a `tensor<n×f32>` of iid draws). `shape`/`rate`
+/// stay scalar (the same for every lane of an `iid(Gamma(...), n)`) and
+/// broadcast over the `[n]` batch via [`Emitter::binary`]/[`Emitter::compare`]/
+/// [`Emitter::select`]'s auto-broadcast.
+fn draw_gamma(e: &mut Emitter, shape: &Value, rate: &Value) -> Value {
+    match e.batch_shape() {
+        Some(dims) if dims.len() == 1 => draw_gamma_batched(e, shape, rate, dims[0]),
+        _ => draw_gamma_scalar(e, shape, rate),
+    }
+}
+
+/// The scalar Marsaglia–Tsang rejection draw — see the batch doc comment for
+/// the `MAXITER`/pre-drawn-batch/boost design. Emits exactly one
 /// `stablehlo.while`; the returned [`Value`] is a `Scalar`.
 ///
 /// Marsaglia–Tsang for the boosted shape `a = alpha_boosted (>= 1)`: with
@@ -2218,7 +2390,7 @@ const MAXITER: u64 = 128;
 /// candidate on success, or the last candidate on the all-reject path). The
 /// final `Gamma(shape, rate)` is `result * boost / rate`, with `boost` the
 /// shape-`< 1` correction.
-fn draw_gamma(e: &mut Emitter, shape: &Value, rate: &Value) -> Value {
+fn draw_gamma_scalar(e: &mut Emitter, shape: &Value, rate: &Value) -> Value {
     let zero = e.scalar(0.0);
     let one = e.scalar(1.0);
 
@@ -2300,6 +2472,128 @@ fn draw_gamma(e: &mut Emitter, shape: &Value, rate: &Value) -> Value {
     let g0 = results[2].clone();
 
     // boost = select(shape < 1, U0^(1/shape), 1) ; result = g0 * boost / rate.
+    let u0 = e.rng("UNIFORM", &zero, &one, &MlirTy::Scalar);
+    let inv_shape = e.div(&one, shape);
+    let boost_raw = e.pow(&u0, &inv_shape);
+    let boost = e.select(&shape_lt_one, &boost_raw, &one);
+    let g = e.mul(&g0, &boost);
+    e.div(&g, rate)
+}
+
+/// The batched (Tier-2 fan-out) Marsaglia–Tsang draw: `n` iid
+/// `Gamma(shape, rate)` variates as a `tensor<n×f32>`, one masked
+/// `stablehlo.while`. Same maths as [`draw_gamma_scalar`]; the difference is
+/// the rejection is done PER LANE with a `tensor<n×i1>` accept mask. Each
+/// iteration keeps an already-accepted lane's value and takes the current
+/// candidate for a not-yet-accepted lane (`result := select(accepted, result,
+/// candidate)`, `accepted := accepted || accept_this`) — so a lane latches on
+/// its FIRST accepted candidate, and an all-reject lane ends on the last
+/// candidate exactly as [`draw_gamma_scalar`] does. The loop runs until
+/// `all(accepted)` (or `MAXITER`). `shape`/`rate` are scalar (identical across
+/// the iid batch) and broadcast over the `[n]` lanes.
+///
+/// The candidate batches are pre-drawn OUTSIDE the loop at `[MAXITER, n]` (via
+/// a temporary `[MAXITER, n]` [`Emitter::batch_shape`], restored to `[n]` for
+/// the trailing per-lane boost uniform) — the same fixed-key-advance discipline
+/// [`draw_gamma_scalar`] uses (a `[n]` row read per iteration by
+/// [`Emitter::dynamic_slice_row`]), so the whole draw stays reproducible.
+fn draw_gamma_batched(e: &mut Emitter, shape: &Value, rate: &Value, n: u64) -> Value {
+    let zero = e.scalar(0.0);
+    let one = e.scalar(1.0);
+
+    // boost setup (scalar: shape/rate are identical across the iid batch).
+    let shape_lt_one = e.compare("LT", shape, &one);
+    let shape_plus_one = e.add(shape, &one);
+    let alpha_boosted = e.select(&shape_lt_one, &shape_plus_one, shape);
+
+    // d = alpha_boosted - 1/3 ; c = 1 / sqrt(9 d)  (all scalar).
+    let third = e.scalar(1.0 / 3.0);
+    let d = e.sub(&alpha_boosted, &third);
+    let nine = e.scalar(9.0);
+    let nine_d = e.mul(&nine, &d);
+    let sqrt_nine_d = e.sqrt(&nine_d);
+    let c = e.div(&one, &sqrt_nine_d);
+
+    // Pre-draw the [MAXITER, n] candidate batches OUTSIDE the loop (fixed key
+    // advance → reproducible). Size them via a temporary [MAXITER, n] batch
+    // shape, then restore the [n] fan-out shape for the trailing boost uniform.
+    e.set_batch_shape(vec![MAXITER, n]);
+    let z_batch = e.rng("NORMAL", &zero, &one, &MlirTy::Scalar);
+    let u_batch = e.rng("UNIFORM", &zero, &one, &MlirTy::Scalar);
+    e.set_batch_shape(vec![n]);
+
+    let i0 = e.int_const(0);
+    let acc0 = e.bool_batch_const(n, false);
+    let res0 = e.constant(0.0, MlirTy::Ranked(vec![Some(n)]));
+    // The `[n]×i1` accept-mask and `[n]×f32` result carried-variable types
+    // (MlirTy carries no i1 element type — see `Emitter::bool_batch_const`).
+    let batch_i1 = format!("tensor<{n}xi1>");
+    let batch_f = MlirTy::Ranked(vec![Some(n)]).render(e.dtype());
+    let carried_tys = ["tensor<i32>".to_string(), batch_i1, batch_f];
+
+    let results = e.while_loop(
+        &[i0, acc0, res0],
+        &carried_tys,
+        // cond: i < MAXITER && !all(accepted)
+        |e, args| {
+            let max = e.int_const(MAXITER as i64);
+            let lt = e.int_compare("LT", &args[0], &max);
+            let all_acc = e.reduce_all(&args[1]);
+            let not_all = e.not(&all_acc);
+            e.and(&lt, &not_all)
+        },
+        // do: draw the [n] candidate row i, test per lane, keep first accepts
+        |e, args| {
+            let i = &args[0];
+            let accepted = &args[1];
+            let result = &args[2];
+            let z = e.dynamic_slice_row(&z_batch, i);
+            let u = e.dynamic_slice_row(&u_batch, i);
+
+            // V = (1 + c Z)^3  (c scalar broadcasts over the [n] row)
+            let cz = e.mul(&c, &z);
+            let base = e.add(&one, &cz);
+            let base_sq = e.mul(&base, &base);
+            let v = e.mul(&base_sq, &base);
+
+            // candidate = d V (the Gamma(alpha_boosted, 1) draw for this V)
+            let candidate = e.mul(&d, &v);
+
+            // accept: V > 0 && log U < 1/2 Z^2 + d - d V + d log V  (per lane)
+            let half = e.scalar(0.5);
+            let z_sq = e.mul(&z, &z);
+            let half_z_sq = e.mul(&half, &z_sq);
+            let d_v = e.mul(&d, &v);
+            let neg_d_v = e.neg(&d_v);
+            let log_v = e.log(&v);
+            let d_log_v = e.mul(&d, &log_v);
+            let rhs_a = e.add(&half_z_sq, &d);
+            let rhs_b = e.add(&rhs_a, &neg_d_v);
+            let rhs = e.add(&rhs_b, &d_log_v);
+            let log_u = e.log(&u);
+            let lt_test = e.compare("LT", &log_u, &rhs);
+            let v_pos = e.compare("GT", &v, &zero);
+            let accept_this = e.and(&lt_test, &v_pos);
+
+            // Per-lane latch (`accepted` is the OLD flag): a lane that has
+            // already accepted keeps its FIRST accepted candidate; a lane not
+            // yet accepted takes THIS iteration's candidate (so it tracks the
+            // latest candidate until it accepts, and an all-reject lane ends on
+            // the last candidate — matching `draw_gamma_scalar`'s fallback, not
+            // a spurious 0). `accepted := accepted || accept_this`.
+            let new_result = e.select(accepted, result, &candidate);
+            let new_accepted = e.or(accepted, &accept_this);
+
+            let one_i = e.int_const(1);
+            let next_i = e.int_add(i, &one_i);
+            vec![next_i, new_accepted, new_result]
+        },
+    );
+    let g0 = results[2].clone();
+
+    // boost = select(shape < 1, U0^(1/shape), 1) ; result = g0 * boost / rate.
+    // U0 is now a [n] per-lane uniform (batch shape restored above); the scalar
+    // `shape_lt_one` predicate and scalar `1` broadcast over the [n] boost.
     let u0 = e.rng("UNIFORM", &zero, &one, &MlirTy::Scalar);
     let inv_shape = e.div(&one, shape);
     let boost_raw = e.pow(&u0, &inv_shape);

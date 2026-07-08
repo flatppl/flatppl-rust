@@ -6,6 +6,35 @@ fn parse_infer(src: &str) -> flatppl_core::Module {
     m
 }
 
+// A DESTRUCTURED rand (`v, s2 = rand(...)`) now lowers to the full spec §07
+// `tuple(value, advanced_rng)` — the parser's `v, s2 = rand(...)` sugar
+// desugars to `__0x1 = rand(...); v = get(__0x1, 1); s2 = get(__0x1, 2)`
+// (1-based integer-literal `get` projections), which now resolve against a
+// real tuple instead of hitting the (former) destructure refusal.
+#[test]
+fn destructured_rand_lowers_to_tuple() {
+    let src = "\
+s = rnginit(0)
+x = draw(Normal(mu = 0.0, sigma = 1.0))
+v, s2 = rand(s, lawof(record(x = x)))
+out = v";
+    let m = parse_infer(src);
+    let out = determinize(&m).expect("destructured rand must lower to a tuple");
+    let pir = flatppl_flatpir::write(&out);
+    assert!(
+        pir.contains("(tuple "),
+        "expected tuple(value, advanced_rng) for a destructured rand:\n{pir}"
+    );
+    assert!(
+        pir.contains("builtin_sample"),
+        "expected a builtin_sample under the tuple:\n{pir}"
+    );
+    assert!(
+        flatppl_determinizer::is_flatpdl(&out).is_ok(),
+        "must be FlatPDL:\n{pir}"
+    );
+}
+
 // rand(rng, lawof(record(x = draw(Normal)))) samples the one draw via
 // builtin_sample, threads the rng, and eliminates the measure/stochastic layer.
 #[test]
@@ -262,4 +291,184 @@ draws = rand(s, lawof(record(a = mu, b = mu)))";
         flatppl_determinizer::is_flatpdl(&out).is_ok(),
         "FlatPDL:\n{pir}"
     );
+}
+
+// CHAINED rand CALLS (not chained draws under one rand): the second `rand`'s
+// draw must consume the FIRST `rand`'s *advanced* rng (destructured out as
+// `s2`), never the original `rnginit(...)` source. `refuse.rs`'s
+// `destructured_rand_rng_threaded_into_second_rand_lowers` already proves a
+// chain of this shape LOWERS (builtin_sample count == 3), but its second
+// `rand` is value-terminal and it asserts no threading structure beyond that
+// count. This test destructures BOTH rands (spec §07's (value, new_rstate)
+// contract applied twice in a row) and proves the load-bearing structural
+// piece: the second sample's rng argument resolves through a `get0(...)`
+// projection of the FIRST sample, not a second read of `s`.
+//
+// This is architecturally distinct from `two_independent_draws_thread_the_rng`
+// above, which threads rng across two DRAWS folded under a single `rand(...)`
+// call (one `lower_rand` invocation, record-fold path); here there are two
+// separate top-level `rand(...)` surface calls (two `lower_rand` invocations),
+// and the driver's fixpoint (`driver.rs`'s re-scan for `rand` nodes) is what
+// must pick up the second one once the first has lowered.
+#[test]
+fn chained_rand_threads_advanced_rng_not_source() {
+    let src = "\
+s = rnginit(0)
+x = draw(Normal(mu = 0.0, sigma = 1.0))
+v, s2 = rand(s, lawof(record(x = x)))
+y = draw(Normal(mu = 1.0, sigma = 1.0))
+w, s3 = rand(s2, lawof(record(y = y)))
+out = record(v = v, w = w)";
+    let m = parse_infer(src);
+    let out = determinize(&m).expect("chained destructured rand must lower");
+    let pir = flatppl_flatpir::write(&out);
+    assert!(
+        flatppl_determinizer::is_flatpdl(&out).is_ok(),
+        "must be FlatPDL:\n{pir}"
+    );
+    // 2 logical samples, 4 textual occurrences — NOT the 3 seen in
+    // `two_independent_draws_thread_the_rng`. There, only the VALUE-terminal
+    // `rand(...)` result is queried, so a's sample is inlined at just 2 sites
+    // (its own value, and where its rng threads into b). HERE both rands are
+    // DESTRUCTURED, so `lower_rand` builds `tuple(value, rng_out)` per Task 2
+    // — and since the writer has no CSE, materialising a tuple's own two
+    // slots (get0(_,0) for value, get0(_,1) for rng) already re-expands its
+    // underlying `builtin_sample` TWICE, independent of how many times `v`/
+    // `s2` are used downstream. Two destructured rands => 2×2 = 4.
+    assert_eq!(
+        pir.matches("builtin_sample").count(),
+        4,
+        "2 destructured rands, each re-expanded twice building its own tuple:\n{pir}"
+    );
+    // The FIRST sample is the only one seeded from the raw source rng `s` —
+    // both occurrences are its own tuple's value/rng slot expansions; `s` is
+    // never threaded past this point.
+    assert_eq!(
+        pir.matches("(builtin_sample (%ref self s) Normal").count(),
+        2,
+        "only the first sample ever reads the raw source rng `s`:\n{pir}"
+    );
+    // The SECOND sample's builtin_sample calls all read `s2` — the FIRST
+    // rand's destructured advanced-rng output — never `s` directly. Because
+    // `s2` is itself a genuine top-level binding (not an anonymous internal
+    // projection), the writer treats `(%ref self s2)` as an atomic leaf and
+    // prints it bare at the use site (no further inlining there); the proof
+    // that `s2` really is the first sample's advanced rng lives in `s2`'s own
+    // `%bind` line, checked below.
+    assert_eq!(
+        pir.matches("(builtin_sample (%ref self s2) Normal").count(),
+        2,
+        "the second sample's rng argument is always `s2`, never the raw source `s`:\n{pir}"
+    );
+    // The two counts above must exhaust the total: no third, independent rng
+    // source ever feeds a builtin_sample call.
+    assert_eq!(
+        pir.matches("(builtin_sample (%ref self s) Normal").count()
+            + pir.matches("(builtin_sample (%ref self s2) Normal").count(),
+        pir.matches("builtin_sample").count(),
+        "every builtin_sample call reads either `s` (first sample) or `s2` (second):\n{pir}"
+    );
+    // The anti-mislowering guard: `s2` is not a fresh/independent rngstate —
+    // it is defined as slot 2 (1-based `get`) of `__0x1`, the FIRST rand's
+    // own tuple binding. This is the load-bearing check that the second
+    // `rand`'s draw is threaded through the first `rand`'s *returned*
+    // rngstate, never re-forking from the source `s`.
+    assert!(
+        pir.contains("(%bind s2 (%meta (%rngstate %fixed rngstates) (get (%ref self __0x1) 2)))"),
+        "s2 must be defined as slot 2 (the advanced rng) of the first rand's own tuple:\n{pir}"
+    );
+    // And `__0x1` (the tuple `s2` projects from) is itself built from a
+    // builtin_sample seeded by the raw source `s` — closing the chain
+    // s -> __0x1 -> s2 -> (second sample's rng argument).
+    let first_tuple_start = pir
+        .find("(%bind __0x1 ")
+        .expect("the first rand's tuple binding is present");
+    let first_tuple_end = pir
+        .find("(%bind v ")
+        .expect("the tuple binding is followed by v's binding");
+    assert!(
+        pir[first_tuple_start..first_tuple_end].contains("(builtin_sample (%ref self s) Normal"),
+        "__0x1 (the tuple s2 projects from) is seeded from the raw source rng `s`:\n{pir}"
+    );
+}
+
+// `draw(iid(K, n))` with a FIXED kernel `K` and a STATIC length `n` fans out to
+// ONE batched `builtin_sample(rng, ctor, input, n)` — the spec §07
+// measure-eval-prims size-dims form: a SINGLE call over the fixed kernel
+// produces the length-`n` iid array and ONE advanced rngstate, not one
+// `builtin_sample` per element. The writer has no common-subexpression
+// sharing (see `lower_shared_record_sample`'s doc), so the ONE logical sample
+// node re-expands textually at each `get0` projection (value slot, rng
+// slot) — hence the substring count below is 2, not 1, exactly like the
+// existing single-scalar destructured-rand goldens.
+#[test]
+fn iid_fixed_kernel_sample_fans_out() {
+    let src = "\
+s = rnginit(0)
+xs ~ iid(Normal(mu = 0.0, sigma = 1.0), 10)
+draws, s2 = rand(s, lawof(xs))
+out = draws";
+    let m = parse_infer(src);
+    let out = determinize(&m).expect("iid(K,n) sample must fan out to one builtin_sample");
+    let pir = flatppl_flatpir::write(&out);
+    assert_eq!(
+        pir.matches("builtin_sample").count(),
+        2,
+        "the single iid fan-out sample re-expands at each get0 projection (no CSE in \
+         the writer):\n{pir}"
+    );
+    assert!(
+        pir.contains("(builtin_sample (%ref self s) Normal"),
+        "expected a Normal builtin_sample seeded by the source rng:\n{pir}"
+    );
+    assert!(
+        pir.contains("1.0))) 10))"),
+        "expected the size dim 10 as builtin_sample's trailing arg, right after the \
+         kernel_input record:\n{pir}"
+    );
+    assert!(
+        !pir.contains("(draw ")
+            && !pir.contains("(iid ")
+            && !pir.contains("(lawof ")
+            && !pir.contains("(rand "),
+        "measure/sample-surface layer eliminated:\n{pir}"
+    );
+    assert!(
+        flatppl_determinizer::is_flatpdl(&out).is_ok(),
+        "must be FlatPDL:\n{pir}"
+    );
+}
+
+// A genuinely non-static `n` (an `external` count) has no compile-time length
+// to unroll/batch by — refuse rather than guess a size (refuse-don't-mislower),
+// mirroring `density::iid_dynamic_size_refuses`'s density-side counterpart.
+#[test]
+fn iid_nonstatic_n_sample_refuses() {
+    let src = "\
+s = rnginit(0)
+n = external(posintegers)
+xs ~ iid(Normal(mu = 0.0, sigma = 1.0), n)
+draws, s2 = rand(s, lawof(xs))
+out = draws";
+    let m = parse_infer(src);
+    determinize(&m).expect_err("non-static iid length must refuse rather than mislower");
+}
+
+// `draw(iid(broadcast(Normal, mus, 1.0), n))` — a per-element-differing-params
+// kernel (Tier 3, spec §04 broadcasting: an array-of-kernels measure, NOT a
+// fixed kernel) — must refuse rather than be silently fanned out as if every
+// row drew from the SAME kernel input. `split_constructor` rejects the
+// `broadcast(...)` head (it carries positional args, so it is not a bare
+// built-in constructor call), which is what turns this into a refusal.
+#[test]
+fn iid_broadcast_kernel_sample_refuses() {
+    let src = "\
+s = rnginit(0)
+mus = [0.0, 1.0, 2.0]
+xs ~ iid(broadcast(Normal, mus, 1.0), 3)
+draws, s2 = rand(s, lawof(xs))
+out = draws";
+    let m = parse_infer(src);
+    determinize(&m)
+        .expect_err("iid over a broadcast (differing per-element params) kernel must refuse");
 }
