@@ -22,7 +22,7 @@ flatppl-infer = { path = "../infer" }
 # LSP never fetches (no protocol-level trust prompt); URL-dep content arrives as
 # client-pushed salsa inputs. `default-features = false` ⇒ no sha2/serde/TLS.
 flatppl-fileaccess = { path = "../fileaccess", default-features = false }
-salsa = "0.26"
+salsa = "0.27"
 crossbeam-channel = "0.5"
 lsp-server = "0.7"
 lsp-types = "0.97"
