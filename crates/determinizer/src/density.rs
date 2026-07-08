@@ -978,13 +978,16 @@ struct GaussianProduct {
 /// with `g2` a `Normal` scored AT the reified argument `x`. Returns g1 and the
 /// two factors' `mu`/`sigma` nodes, or `None` if the shape does not match (any
 /// other `logweighted` base keeps [`lower_normalize`]'s refuse —
-/// refuse-don't-mislower). Purely structural (`&Module`); the caller builds IR.
-fn recognize_gaussian_product(m: &Module, logweighted: NodeId) -> Option<GaussianProduct> {
-    let c = expect_builtin_call(m, logweighted, "logweighted")?;
-    if c.args.len() != 2 {
-        return None;
-    }
-    let (lw_node, base) = (c.args[0], c.args[1]);
+/// refuse-don't-mislower). Structural matching; takes `&mut` only so the shared
+/// [`normal_ctor`]/[`split_kernel_constructor`] can intern positional-arg names.
+fn recognize_gaussian_product(m: &mut Module, logweighted: NodeId) -> Option<GaussianProduct> {
+    let (lw_node, base) = {
+        let c = expect_builtin_call(m, logweighted, "logweighted")?;
+        if c.args.len() != 2 {
+            return None;
+        }
+        (c.args[0], c.args[1])
+    };
 
     // Factor 1 (g1): the logweighted base is a `Normal` constructor.
     let (g1, g1_kwargs) = normal_ctor(m, base)?;
@@ -996,17 +999,21 @@ fn recognize_gaussian_product(m: &Module, logweighted: NodeId) -> Option<Gaussia
     // argument `x` (not at a constant, which would make ℓ a constant weight, not a
     // second Gaussian factor).
     let (lw_resolved, _) = resolve_ref_one(m, lw_node);
-    let f = expect_builtin_call(m, lw_resolved, "functionof")?;
-    if f.args.len() != 1 {
-        return None;
-    }
-    // The reified callable's single input placeholder (`x`); g2 must be scored at
-    // exactly this ref, so ℓ(x) = logdensityof(g2, x).
-    let arg_ref = match &f.inputs {
-        Some(Inputs::Spec(entries)) if entries.len() == 1 => entries[0].1,
-        _ => return None,
+    // Read the reified callable's single body and input placeholder (`x`), then
+    // drop the `&Call` borrow before `gaussian_factor_scored_at` reborrows `&mut`.
+    let (g2_body, arg_ref) = {
+        let f = expect_builtin_call(m, lw_resolved, "functionof")?;
+        if f.args.len() != 1 {
+            return None;
+        }
+        // g2 must be scored at exactly this ref, so ℓ(x) = logdensityof(g2, x).
+        let arg_ref = match &f.inputs {
+            Some(Inputs::Spec(entries)) if entries.len() == 1 => entries[0].1,
+            _ => return None,
+        };
+        (f.args[0], arg_ref)
     };
-    let (mu2, sigma2) = gaussian_factor_scored_at(m, f.args[0], arg_ref)?;
+    let (mu2, sigma2) = gaussian_factor_scored_at(m, g2_body, arg_ref)?;
 
     Some(GaussianProduct {
         g1,
@@ -1031,13 +1038,23 @@ fn recognize_gaussian_product(m: &Module, logweighted: NodeId) -> Option<Gaussia
 /// `Normal(mu = x, sigma = 1.0)` scored at `x` is `N(x; x, 1)`, a constant, not a
 /// second Gaussian *factor* of `x` — g1's params are checked outside the lambda,
 /// so only g2 needs the guard.
-fn gaussian_factor_scored_at(m: &Module, body: NodeId, arg_ref: Ref) -> Option<(NodeId, NodeId)> {
-    // Not-yet-lowered: logdensityof(Normal(...), arg).
-    if let Some(ld) = expect_builtin_call(m, body, "logdensityof") {
-        if ld.args.len() != 2 || !is_ref_to(m, ld.args[1], arg_ref) {
-            return None;
+fn gaussian_factor_scored_at(
+    m: &mut Module,
+    body: NodeId,
+    arg_ref: Ref,
+) -> Option<(NodeId, NodeId)> {
+    // Not-yet-lowered: logdensityof(Normal(...), arg). Read the scored ctor node
+    // out of the `&Call` (and check it is scored at `arg_ref`) before handing it
+    // to the `&mut`-borrowing `normal_ctor`.
+    let g2_ctor = {
+        match expect_builtin_call(m, body, "logdensityof") {
+            Some(ld) if ld.args.len() == 2 && is_ref_to(m, ld.args[1], arg_ref) => Some(ld.args[0]),
+            Some(_) => return None,
+            None => None,
         }
-        let (_g2, kwargs) = normal_ctor(m, ld.args[0])?;
+    };
+    if let Some(g2_ctor) = g2_ctor {
+        let (_g2, kwargs) = normal_ctor(m, g2_ctor)?;
         let mu2 = find_kwarg(m, &kwargs, "mu")?;
         let sigma2 = find_kwarg(m, &kwargs, "sigma")?;
         if references_ref(m, mu2, arg_ref) || references_ref(m, sigma2, arg_ref) {
@@ -1063,9 +1080,10 @@ fn gaussian_factor_scored_at(m: &Module, body: NodeId, arg_ref: Ref) -> Option<(
     None
 }
 
-/// If `node` (after one ref hop) is a bare-kwarg `Normal(...)` constructor,
-/// return `(constructor_node, kwargs)`; otherwise `None`.
-fn normal_ctor(m: &Module, node: NodeId) -> Option<(NodeId, Vec<(Symbol, NodeId)>)> {
+/// If `node` (after one ref hop) is a `Normal(...)` constructor (positional or
+/// keyword arguments), return `(constructor_node, args)` with each argument
+/// bound to its parameter name; otherwise `None`.
+fn normal_ctor(m: &mut Module, node: NodeId) -> Option<(NodeId, Vec<(Symbol, NodeId)>)> {
     let (resolved, _) = resolve_ref_one(m, node);
     let (sym, kwargs) = split_kernel_constructor(m, resolved)?;
     if m.resolve(sym) != "Normal" {
@@ -1737,18 +1755,38 @@ fn variate_kind(t: &Type) -> Option<VariateKind> {
     }
 }
 
-/// Read a primitive constructor call `Ctor(kw1 = v1, kw2 = v2, ...)` into its
-/// constructor symbol and keyword arguments. `None` if `node` is not a `Call`,
-/// not builtin-headed, carries positional args, or has a non-kwarg named arg —
-/// any of which means `node` is not a primitive distribution/kernel constructor
-/// eligible for `builtin_logdensityof` / `builtin_sample`.
+/// Read a primitive constructor call into its constructor symbol and the
+/// arguments as `(param_name, value)` pairs, accepting BOTH surface calling
+/// conventions (spec §04 "Calling conventions": every built-in ordinary
+/// callable has a defined input order and accepts positional and keyword
+/// arguments):
+///
+/// * keyword form `Ctor(mu = m, sigma = s)` → the named args verbatim;
+/// * positional form `Ctor(m, s)` → each positional arg bound to the
+///   constructor's ordered parameter name (§08 parameter order, via
+///   [`flatppl_infer::distribution_param_names`]);
+/// * mixed form `Ctor(m, sigma = s)` → positional args bound by order, then the
+///   keyword args.
+///
+/// This only *reads* the call; it does not rewrite `node` — the surface form
+/// (positional preferred for term-rewriting) is left intact. The name mapping
+/// exists so the caller can build the by-name `record` kernel_input that
+/// `builtin_logdensityof` / `builtin_sample` require (a `record` takes named
+/// fields, §04).
+///
+/// `None` (⇒ the caller refuses, per refuse-don't-mislower) if `node` is not a
+/// `Call`, not builtin-headed, has a non-kwarg named arg, or — when positional
+/// args are present — the head is not a known distribution constructor, carries
+/// more positional args than the constructor has parameters, or binds a
+/// parameter both positionally and by keyword (a §04 double-bind).
 ///
 /// Shared by [`build_density_term`] (the density-side kernel/kernel_input build)
 /// and the sample-side leaf (`sample::split_constructor`) — both need exactly
-/// this constructor-symbol-plus-kwargs read before building their respective
-/// `builtin_*` call.
+/// this constructor-symbol-plus-arguments read before building their respective
+/// `builtin_*` call. Needs `&mut` only to intern parameter-name symbols for the
+/// positional mapping; the keyword-only fast path is non-mutating.
 pub(crate) fn split_kernel_constructor(
-    m: &Module,
+    m: &mut Module,
     node: NodeId,
 ) -> Option<(Symbol, Vec<(Symbol, NodeId)>)> {
     let Node::Call(c) = m.node(node) else {
@@ -1757,9 +1795,9 @@ pub(crate) fn split_kernel_constructor(
     let CallHead::Builtin(sym) = c.head else {
         return None;
     };
-    if !c.args.is_empty() {
-        return None;
-    }
+    // Snapshot positional args and keyword args (NodeId/Symbol are Copy) so the
+    // `&Call` borrow ends before interning parameter names below needs `&mut`.
+    let pos_args: Vec<NodeId> = c.args.to_vec();
     let mut kwargs = Vec::with_capacity(c.named.len());
     for n in c.named.iter() {
         if n.kind != NamedKind::Kwarg {
@@ -1767,7 +1805,34 @@ pub(crate) fn split_kernel_constructor(
         }
         kwargs.push((n.name, n.value));
     }
-    Some((sym, kwargs))
+
+    // Keyword-only form (the common case): return the named args verbatim.
+    if pos_args.is_empty() {
+        return Some((sym, kwargs));
+    }
+
+    // Positional / mixed form: bind positional args to the constructor's ordered
+    // parameter names. A head that is not a known distribution constructor, or
+    // more positional args than it has parameters, is not a well-formed
+    // positional constructor call → None.
+    let param_names = flatppl_infer::distribution_param_names(m.resolve(sym))?;
+    if pos_args.len() > param_names.len() {
+        return None;
+    }
+    let mut args: Vec<(Symbol, NodeId)> = Vec::with_capacity(pos_args.len() + kwargs.len());
+    for (i, &arg) in pos_args.iter().enumerate() {
+        args.push((m.intern(&param_names[i]), arg));
+    }
+    // A parameter bound BOTH positionally and by keyword is a §04 double-bind
+    // (static error) — refuse rather than emit a record with duplicate fields.
+    if kwargs
+        .iter()
+        .any(|(kw_name, _)| args.iter().any(|(pos_name, _)| pos_name == kw_name))
+    {
+        return None;
+    }
+    args.extend(kwargs);
+    Some((sym, args))
 }
 
 pub(crate) fn build_density_term(
@@ -1802,7 +1867,7 @@ pub(crate) fn build_density_term(
         refuse(
             measure,
             m,
-            "primitive measure must be a built-in constructor call with only keyword arguments",
+            "primitive measure must be a built-in constructor call with well-formed positional or keyword arguments",
         )
     })?;
 

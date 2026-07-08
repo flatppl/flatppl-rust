@@ -27,6 +27,32 @@ lp = logdensityof(lawof(record(a = a, b = b)), record(a = 0.5, b = 0.5))";
     assert!(flatppl_determinizer::is_flatpdl(&out).is_ok());
 }
 
+// A positional-arg constructor `Normal(0.0, 1.0)` is equivalent to the keyword
+// form `Normal(mu = 0.0, sigma = 1.0)` (spec §04 calling conventions: positional
+// args bind to the ordered parameter names). The density side must lower it —
+// producing the identical FlatPDL as the keyword form — not refuse. Regression
+// for buffy #143 (@logdensity path).
+#[test]
+fn positional_constructor_lowers_same_as_keyword() {
+    let positional = "\
+a = draw(Normal(0.0, 1.0))
+lp = logdensityof(lawof(record(a = a)), record(a = 0.5))";
+    let keyword = "\
+a = draw(Normal(mu = 0.0, sigma = 1.0))
+lp = logdensityof(lawof(record(a = a)), record(a = 0.5))";
+    let pir_pos = flatppl_flatpir::write(&determinize_src(positional));
+    let pir_kw = flatppl_flatpir::write(&determinize_src(keyword));
+    assert!(
+        pir_pos.contains("builtin_logdensityof")
+            && pir_pos.contains("(record (%field mu 0.0) (%field sigma 1.0))"),
+        "positional lowers to builtin_logdensityof with the named kernel-input record:\n{pir_pos}"
+    );
+    assert_eq!(
+        pir_pos, pir_kw,
+        "positional and keyword forms lower to identical FlatPDL:\npositional:\n{pir_pos}\nkeyword:\n{pir_kw}"
+    );
+}
+
 // weighted(w, M): logdensityof → log(w) + logdensityof(M, v)
 #[test]
 fn weighted_lowers_to_log_w_plus_density() {

@@ -741,20 +741,41 @@ draws = rand(s, lawof(record(x = x)))";
     );
 }
 
-// `draw(M)` where `M` is a constructor call with POSITIONAL args
-// (`Normal(0.0, 1.0)`, valid surface syntax) — `split_kernel_constructor`
-// builds the kernel-input record from named kwargs only (mirroring the
-// density side's identical guard), so a positional-arg constructor has no
-// kwargs to read and must refuse rather than emit a missing-parameter input.
+// `draw(M)` where `M` is a constructor call with MORE positional args than the
+// constructor has parameters (`Normal(0.0, 1.0, 2.0)` — 3 args, 2 params) cannot
+// bind by position, so `split_kernel_constructor` returns `None` and the sample
+// leaf refuses rather than dropping the extra arg. (A well-formed positional
+// constructor DOES lower — see
+// `sample_golden::sample_draw_positional_constructor_lowers_same_as_keyword`.)
 #[test]
-fn sample_draw_positional_constructor_refuses() {
+fn sample_draw_over_arity_positional_constructor_refuses() {
     let src = "\
 s = rnginit(0)
-x = draw(Normal(0.0, 1.0))
+x = draw(Normal(0.0, 1.0, 2.0))
 draws = rand(s, lawof(record(x = x)))";
     let m = parse_infer(src);
     let err = determinize(&m)
-        .expect_err("a positional-arg constructor is not a valid sample leaf — refuse");
+        .expect_err("more positional args than parameters is not a valid sample leaf — refuse");
+    assert!(
+        err.reason.contains("built-in kernel constructor"),
+        "refusal explains the constructor-shape requirement: {err:?}"
+    );
+}
+
+// `draw(M)` where `M` binds a parameter BOTH positionally and by keyword
+// (`Normal(0.0, mu = 1.0)` — `mu` bound twice) is a §04 double-bind (static
+// error); `split_kernel_constructor` refuses rather than emit a record with
+// duplicate `mu` fields.
+#[test]
+fn sample_draw_double_bound_constructor_refuses() {
+    let src = "\
+s = rnginit(0)
+x = draw(Normal(0.0, mu = 1.0))
+draws = rand(s, lawof(record(x = x)))";
+    let m = parse_infer(src);
+    let err = determinize(&m).expect_err(
+        "a parameter bound positionally and by keyword is not a valid sample leaf — refuse",
+    );
     assert!(
         err.reason.contains("built-in kernel constructor"),
         "refusal explains the constructor-shape requirement: {err:?}"
