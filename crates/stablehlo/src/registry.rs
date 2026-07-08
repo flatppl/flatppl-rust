@@ -410,10 +410,9 @@ pub(crate) fn lower_sample(
     let (rng, ctor, kernel_input, batch_n) = match *args {
         [rng, ctor, kernel_input] => (rng, ctor, kernel_input, None),
         [rng, ctor, kernel_input, n_arg] => {
-            // Read `n` straight from the trailing literal: `infer`'s
-            // builtin_sample rule ignores the n dim (the inferred variate type
-            // is wrongly scalar), so the literal is the ONLY trustworthy source
-            // — a non-literal (or non-positive) count refuses, never guesses.
+            // Read `n` from the trailing literal — a static positive-integer
+            // invariant the batched draw shape needs at emit time (refuses a
+            // non-literal `n` below), independent of the inferred variate type.
             let n = match e.node(n_arg) {
                 Node::Lit(Scalar::Int(i)) if *i > 0 => *i as u64,
                 _ => {
