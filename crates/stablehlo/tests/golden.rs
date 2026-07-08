@@ -6185,8 +6185,9 @@ fn emit_sample_exponential_iid_matches_frozen_golden() {
 // are pre-drawn OUTSIDE the loop at `[MAXITER, n]` (fixed key advance →
 // reproducible), read one `[n]` row per iteration by `dynamic_slice_row`. Both
 // frozen goldens below are parse-validated against the real StableHLO parser
-// (jax 0.10.2). Vector-variate (Dirichlet/MvNormal → Task 10b) and the discrete
-// samplers still refuse.
+// (jax 0.10.2). Vector-variate Dirichlet still refuses; the discrete samplers
+// were still refusing at this point in the file (they are batched in the later
+// Tier-3/Tier-4 batches below).
 
 /// A fanned rejection draw: `iid(Gamma(shape=2, rate=1), 4)`, value-terminal.
 const GAMMA_IID_SAMPLE_SRC: &str = "\
@@ -6420,24 +6421,148 @@ fn emit_sample_iid_dirichlet_refuses() {
     );
 }
 
-/// A still-excluded DISCRETE sampler (Poisson) — a scalar variate that
-/// determinizes to `builtin_sample(rng, ctor, input, n)` like Gamma did, but is
-/// not yet batched — refuses at `lower_sample` with the precise deferred
-/// message (guarding the refuse path a scalar-variate non-`FANOUT_SAFE` ctor
-/// takes).
+// ---- fan-out for discrete inverse-CDF Poisson + NegativeBinomial (buffy #148,
+// #156b) ---------------------------------------------------------------------
+//
+// Poisson's scalar draw is a bounded inverse-CDF `stablehlo.while` (walk the CDF
+// until `U <= F(k)`). The fanned draw batches that walk PER LANE via
+// `draw_poisson_batched`: one `U` drawn as a genuine `[m]` tensor, `[m]` per-lane
+// `cum`/`pmf`/`done`/`result`, ONE scalar counter `k` walked in lockstep, and a
+// per-lane latch (the `draw_gamma_batched` masked-while + `reduce_all(done)`
+// pattern). The two NegativeBinomial Gamma–Poisson mixtures fan out with NO
+// extra machinery — `draw_gamma_batched` yields the `[m]` per-lane `lambda`,
+// which `draw_poisson_batched` accepts as its `[m]` rate (so a NegBin fan-out is
+// the batched Gamma `while` feeding the batched Poisson `while`). All three
+// goldens are parse-validated against the real StableHLO parser (jax 0.10.2).
+// The one `while` discrete sampler still refusing is Multinomial.
+
+/// A fanned Poisson draw: `iid(Poisson(rate=3), 4)`, the discrete inverse-CDF
+/// batched-walk case.
+const POISSON_IID_SAMPLE_SRC: &str = "\
+s = rnginit(0)
+xs ~ iid(Poisson(rate = 3.0), 4)
+draws = rand(s, lawof(xs))
+";
+
+/// A fanned NegativeBinomial draw: `iid(NegativeBinomial(alpha=5, beta=2), 4)`,
+/// the Gamma–Poisson mixture — batched Gamma `while` feeding batched Poisson
+/// `while`.
+const NEGATIVE_BINOMIAL_IID_SAMPLE_SRC: &str = "\
+s = rnginit(0)
+xs ~ iid(NegativeBinomial(alpha = 5.0, beta = 2.0), 4)
+draws = rand(s, lawof(xs))
+";
+
+/// A fanned NegativeBinomial2 draw: `iid(NegativeBinomial2(mu=3, psi=5), 4)`,
+/// the mean-dispersion mixture (same shape as the `NegativeBinomial` case, with
+/// the `rate = psi/mu` reparameterization).
+const NEGATIVE_BINOMIAL2_IID_SAMPLE_SRC: &str = "\
+s = rnginit(0)
+xs ~ iid(NegativeBinomial2(mu = 3.0, psi = 5.0), 4)
+draws = rand(s, lawof(xs))
+";
+
+/// The fanned Poisson draw returns a `tensor<4xf32>` (not a scalar) alongside
+/// the advanced key, drawn from EXACTLY ONE `rng_bit_generator` sized to the
+/// `[4]` batch (a genuine `tensor<4xui32>` output — one advance, one advanced
+/// key returned — not a scalar broadcast), via ONE masked `stablehlo.while`
+/// carrying a `tensor<4xi1>` per-lane `done` mask, with `reduce_all(done)` in
+/// the loop condition and an `or` carry.
 #[test]
-fn emit_sample_iid_poisson_refuses() {
-    let d = determinize_src(
-        "s = rnginit(0)\nxs ~ iid(Poisson(rate = 2.0), 4)\ndraws = rand(s, lawof(xs))\n",
-    );
-    let err = flatppl_stablehlo::emit(&d, flatppl_stablehlo::Mode::Sample, &Default::default())
-        .unwrap_err();
+fn emit_sample_poisson_iid_has_expected_structure() {
+    let d = determinize_src(POISSON_IID_SAMPLE_SRC);
+    let out = emit_sample(&d);
+
     assert!(
-        err.msg
-            .contains("fan-out (iid) @sample for 'Poisson' not yet supported")
-            && err.msg.contains("deferred"),
-        "unexpected message: {}",
-        err.msg
+        out.contains("func.func @sample(%key: tensor<2xui64>)"),
+        "missing @sample(%key) (no free params) in:\n{out}"
+    );
+    assert!(
+        out.contains("-> (tensor<4xf32>, tensor<2xui64>)"),
+        "fanned Poisson must return the [4] batch + advanced key, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.rng_bit_generator").count(),
+        1,
+        "one rng_bit_generator advance (one advanced key) for the whole [4] batch, in:\n{out}"
+    );
+    assert!(
+        out.contains("-> (tensor<2xui64>, tensor<4xui32>)"),
+        "the single rng_bit_generator must be sized to the [4] batch (genuine tensor<4> draw), in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.while").count(),
+        1,
+        "one masked while for the whole [4] batch, in:\n{out}"
+    );
+    assert!(
+        out.contains("tensor<4xi1>"),
+        "per-lane done mask must be tensor<4xi1>, in:\n{out}"
+    );
+    assert!(
+        out.contains("stablehlo.reduce(") && out.contains("stablehlo.or "),
+        "the batched walk needs an all-reduce over the done mask + an OR carry, in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// Freeze the exact emitted text (parse-validated against the real StableHLO
+/// parser): any drift must be a deliberate, reviewed change to this golden.
+#[test]
+fn emit_sample_poisson_iid_matches_frozen_golden() {
+    let d = determinize_src(POISSON_IID_SAMPLE_SRC);
+    let out = emit_sample(&d);
+    let golden = include_str!("goldens/poisson_iid_sample.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted fanned @sample drifted from tests/goldens/poisson_iid_sample.mlir"
+    );
+}
+
+/// NegativeBinomial fans out to the batched Gamma `while` (its `[4]` per-lane
+/// `lambda`) feeding the batched Poisson `while` (that `[4]` rate): TWO
+/// `stablehlo.while`s, one `[4]` value return, one advanced key.
+#[test]
+fn emit_sample_negative_binomial_iid_has_expected_structure() {
+    let d = determinize_src(NEGATIVE_BINOMIAL_IID_SAMPLE_SRC);
+    let out = emit_sample(&d);
+
+    assert!(
+        out.contains("-> (tensor<4xf32>, tensor<2xui64>)"),
+        "fanned NegativeBinomial must return the [4] batch + advanced key, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.while").count(),
+        2,
+        "the batched Gamma while feeding the batched Poisson while, in:\n{out}"
+    );
+    assert!(
+        out.contains("tensor<4xi1>"),
+        "both batched loops carry a tensor<4xi1> per-lane mask, in:\n{out}"
+    );
+
+    let golden = include_str!("goldens/negative_binomial_iid_sample.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted fanned @sample drifted from tests/goldens/negative_binomial_iid_sample.mlir"
+    );
+}
+
+/// The `rate = psi/mu` mirror of the NegativeBinomial fan-out: same
+/// batched-Gamma-then-batched-Poisson shape, frozen against its golden.
+#[test]
+fn emit_sample_negative_binomial2_iid_matches_frozen_golden() {
+    let d = determinize_src(NEGATIVE_BINOMIAL2_IID_SAMPLE_SRC);
+    let out = emit_sample(&d);
+    assert_eq!(
+        out.matches("stablehlo.while").count(),
+        2,
+        "the batched Gamma while feeding the batched Poisson while, in:\n{out}"
+    );
+    let golden = include_str!("goldens/negative_binomial2_iid_sample.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted fanned @sample drifted from tests/goldens/negative_binomial2_iid_sample.mlir"
     );
 }
 
@@ -6452,9 +6577,9 @@ fn emit_sample_iid_poisson_refuses() {
 // Task 10a already gave `Emitter`, and Geometric's `floor` is shape-preserving
 // like every other Tier-1 unary. No new primitive needed — this batch just
 // admits them to `FANOUT_SAFE`. Both goldens are parse-validated against the
-// real StableHLO parser (jax 0.10.2). The genuinely `while`/unrolled discrete
-// samplers (Poisson etc.) still refuse — see
-// `emit_sample_iid_poisson_refuses` below.
+// real StableHLO parser (jax 0.10.2). The genuinely `while` discrete samplers
+// (Poisson + the NegativeBinomial mixtures) are batched in the Tier-4 section
+// below; only Multinomial still refuses.
 
 /// A fanned Laplace draw: `iid(Laplace(location=0, scale=1), 4)`, exercising
 /// the `compare`/`select` `sgn` idiom under a `[4]` batch.
@@ -6615,7 +6740,8 @@ fn emit_sample_geometric_iid_matches_frozen_golden() {
 //     running count is promoted to `[m]` by the auto-broadcasting
 //     `compare`/`select`/`add`.
 // Both goldens are parse-validated against the real StableHLO parser (jax
-// 0.10.2). Poisson still refuses (`emit_sample_iid_poisson_refuses`).
+// 0.10.2). Poisson + the NegativeBinomial mixtures are batched in the Tier-4
+// section below.
 
 /// A fanned Binomial draw: `iid(Binomial(n=5, p=0.3), 4)`, `n` the FIXED inner
 /// count, `4` the outer fan-out — the `[4, 5]` uniform, inner-axis reduce case.

@@ -540,6 +540,15 @@ pub(crate) fn lower_sample(
 ///     auto-broadcasting [`Emitter::compare`]/[`Emitter::select`]/
 ///     [`Emitter::add`] (a single-category `p` — an empty unroll — is lifted to
 ///     `[m]` explicitly, see [`draw_categorical`]).
+/// - Fan-out **Tier 4 (discrete inverse-CDF `while`)** — Poisson and the two
+///   NegativeBinomial Gamma–Poisson mixtures, batched via
+///   [`draw_poisson_batched`]'s PER-LANE bounded CDF walk (the same masked-while
+///   plus [`Emitter::reduce_all`] pattern [`draw_gamma_batched`] uses): one
+///   scalar counter `k` walked in lockstep across `[m]` per-lane
+///   `cum`/`pmf`/`done`/`result`, latching each lane's first `U <= F(k)`. The
+///   NegativeBinomial mixtures need NO extra machinery — [`draw_gamma_batched`]
+///   already yields the `[m]` per-lane `lambda`, which [`draw_poisson_batched`]
+///   accepts as its `[m]` rate.
 ///
 /// Deliberately EXCLUDED (fan-out for these still refuses):
 /// - Dirichlet: its scalar `@sample` ([`dirichlet_sample`]) draws `d` SCALAR
@@ -553,14 +562,13 @@ pub(crate) fn lower_sample(
 ///   a NEW `stablehlo.transpose` op form to reorient the axis-0 stack
 ///   `[d, n]` → `[n, d]` (the emitter has no transpose today). Refused rather
 ///   than mislowered — a clean follow-up.
-/// - The `while`/inverse-CDF discrete samplers still not batched: Poisson
-///   ([`draw_poisson`]'s bounded `while`), the NegativeBinomial/NegativeBinomial2
-///   Gamma–Poisson mixtures built on it, and Multinomial (a bounded `while` over
-///   `n` Categorical draws) — their `while` shapes are not covered by
-///   [`draw_gamma_batched`]'s masked-lane loop. (Bernoulli/Geometric look like
-///   they belong on this list too — they're discrete — but their builders are
-///   straight-line elementwise, so they're Tier 1 above; Binomial and
-///   Categorical/Categorical0 are the discrete Tier-3 cases just admitted.)
+/// - The one `while` discrete sampler still not batched: Multinomial (a bounded
+///   `while` over `n` Categorical draws) — its `while` shape is not covered by
+///   the masked-lane loops. (Bernoulli/Geometric look like they belong on this
+///   list too — they're discrete — but their builders are straight-line
+///   elementwise, so they're Tier 1 above; Binomial and Categorical/Categorical0
+///   are the discrete Tier-3 cases; Poisson and the NegativeBinomial mixtures
+///   are the Tier-4 cases just admitted.)
 const FANOUT_SAFE: &[&str] = &[
     // Tier 1 (elementwise continuous)
     "Normal",
@@ -595,6 +603,16 @@ const FANOUT_SAFE: &[&str] = &[
     "Binomial",
     "Categorical",
     "Categorical0",
+    // Tier 4 (batched discrete inverse-CDF `while` — draw_poisson_batched):
+    // Poisson's bounded CDF walk done PER LANE (`[m]` cum/pmf/done/result, one
+    // scalar counter, `reduce_all` over the done mask — the `draw_gamma_batched`
+    // masked-while pattern), plus the two NegativeBinomial Gamma–Poisson
+    // mixtures, which reduce with NO extra machinery to `draw_gamma_batched`
+    // (the `[m]` per-lane `lambda`) feeding `draw_poisson_batched` (that `[m]`
+    // rate).
+    "Poisson",
+    "NegativeBinomial",
+    "NegativeBinomial2",
 ];
 
 // ---- §08 Normal -------------------------------------------------------------
@@ -2959,13 +2977,29 @@ fn binomial_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
 /// `rate ~ 12` is ~1e-180), so the clamp is never reached in practice.
 const POISSON_MAXITER: u64 = 256;
 
+/// Draw a `Poisson(rate)` variate via bounded inverse-CDF (the shared core
+/// Poisson itself and the NegativeBinomial Gamma–Poisson mixtures reduce to).
+/// Dispatches on the [`Emitter::batch_shape`] fan-out override: a scalar draw
+/// (`None`) takes the unchanged [`draw_poisson_scalar`] path (one scalar
+/// `Value`, byte-identical to before); a batched `iid(K, m)` draw (`Some([m])`)
+/// takes the per-lane [`draw_poisson_batched`] path (a `tensor<m×f32>` of iid
+/// draws). `rate` is a `Scalar` for a direct `Poisson` prior (broadcast over
+/// the `[m]` lanes) or already a `[m]` per-lane vector for the NegativeBinomial
+/// Gamma–Poisson mixture (each lane its own `lambda_i` from
+/// [`draw_gamma_batched`]) — [`draw_poisson_batched`] handles both.
+fn draw_poisson(e: &mut Emitter, rate: &Value) -> Value {
+    match e.batch_shape() {
+        Some(dims) if dims.len() == 1 => draw_poisson_batched(e, rate, dims[0]),
+        _ => draw_poisson_scalar(e, rate),
+    }
+}
+
 /// Draw one scalar `Poisson(rate)` variate via bounded inverse-CDF (one
-/// `stablehlo.while`, via [`Emitter::while_loop`]) — the shared core Poisson
-/// itself and the NegativeBinomial Gamma–Poisson mixtures reduce to. One `U ~
-/// Uniform(0, 1)` is drawn BEFORE the loop; the loop then walks the incremental
-/// Poisson CDF until `U <= F(k)`, returning that `k`. Unlike [`draw_gamma`],
-/// this inverts a SINGLE uniform (no per-iteration randomness), so nothing is
-/// pre-drawn into a batch.
+/// `stablehlo.while`, via [`Emitter::while_loop`]). One `U ~ Uniform(0, 1)` is
+/// drawn BEFORE the loop; the loop then walks the incremental Poisson CDF until
+/// `U <= F(k)`, returning that `k`. Unlike [`draw_gamma`], this inverts a
+/// SINGLE uniform (no per-iteration randomness), so nothing is pre-drawn into a
+/// batch.
 ///
 /// The loop carries `(k: f32, cum = F(k): f32, pmf = P(X = k): f32, done: i1,
 /// result: f32)`, initialized `k = 0`, `pmf = cum = exp(-rate)` (`= P(X = 0) =
@@ -2978,7 +3012,7 @@ const POISSON_MAXITER: u64 = 256;
 /// pmf`. `k` is carried as an f32 (it is both the counter AND the returned
 /// value), so the `k < MAXITER` bound is a float compare and no `i32`/`convert`
 /// is needed at all.
-fn draw_poisson(e: &mut Emitter, rate: &Value) -> Value {
+fn draw_poisson_scalar(e: &mut Emitter, rate: &Value) -> Value {
     let u = e.rng("UNIFORM", &MlirTy::Scalar);
 
     let neg_rate = e.neg(rate);
@@ -3023,6 +3057,99 @@ fn draw_poisson(e: &mut Emitter, rate: &Value) -> Value {
             let pmf_next = e.mul(pmf, &rate_over_k1);
             let cum_next = e.add(cum, &pmf_next);
             vec![k1, cum_next, pmf_next, accept, new_result]
+        },
+    );
+    results[4].clone()
+}
+
+/// The batched (fan-out) bounded inverse-CDF draw: `m` iid `Poisson(rate)`
+/// variates as a `tensor<m×f32>`, one `stablehlo.while`. Same maths as
+/// [`draw_poisson_scalar`]; the difference is the CDF walk is done PER LANE.
+/// One `U` is drawn as a genuine `tensor<m>` (one `rng_bit_generator` advance,
+/// the `[m]` lanes independent — [`Emitter::rng`]'s size-dims override), and the
+/// per-lane state `cum = F_i(k)`, `pmf = P_i(X = k)`, `done`, `result` are each
+/// `[m]`. The loop counter `k` stays a SCALAR: every lane walks the SAME
+/// `k = 0, 1, 2, …` in lockstep, and a lane latches its `result` on its FIRST
+/// hit exactly as [`draw_gamma_batched`]'s accept mask latches its candidate
+/// (`result := select(done, result, k)`, `done := done || (U <= cum)`) — so an
+/// unfinished all-walk lane ends on the last-walked `k = MAXITER - 1`, matching
+/// [`draw_poisson_scalar`]'s bounded-tail clamp, not a spurious `0`. The loop
+/// runs until `all(done)` (via [`Emitter::reduce_all`] over the `[m]` mask) or
+/// `MAXITER`.
+///
+/// `rate` may be a `Scalar` (a direct `Poisson` prior — the same rate on every
+/// lane) or already a `[m]` per-lane vector (the NegativeBinomial Gamma–Poisson
+/// mixture's `lambda_i` from [`draw_gamma_batched`]). It is broadcast to `[m]`
+/// up front so the per-lane `cum`/`pmf` recurrence is uniform either way.
+fn draw_poisson_batched(e: &mut Emitter, rate: &Value, m: u64) -> Value {
+    let batch_ty = MlirTy::Ranked(vec![Some(m)]);
+
+    // U as a genuine [m] draw (one rng_bit_generator advance; batch_shape is
+    // already [m] here, so `rng` sizes the draw to the batch — the lanes are
+    // independent, NOT a scalar broadcast).
+    let u = e.rng("UNIFORM", &MlirTy::Scalar);
+
+    // Broadcast `rate` to [m]: a scalar prior rate is the same on every lane; a
+    // NegBin per-lane `lambda` is already [m] (used as-is). Either way the
+    // per-lane cum/pmf recurrence below is uniformly [m].
+    let rate_m = match &rate.ty {
+        MlirTy::Scalar => e.broadcast_in_dim(rate, &[], batch_ty.clone()),
+        _ => rate.clone(),
+    };
+
+    let neg_rate = e.neg(&rate_m);
+    let exp_neg_rate = e.exp(&neg_rate); // P_i(X=0) = F_i(0) = exp(-rate_i), [m]
+    let k0 = e.scalar(0.0); // scalar counter (all lanes walk k together)
+    let cum0 = exp_neg_rate.clone();
+    let pmf0 = exp_neg_rate;
+    let done0 = e.bool_batch_const(m, false);
+    let res0 = e.constant(0.0, batch_ty.clone());
+
+    let float_scalar = MlirTy::Scalar.render(e.dtype());
+    let batch_i1 = format!("tensor<{m}xi1>");
+    let batch_f = batch_ty.render(e.dtype());
+    let carried_tys = [
+        float_scalar,    // k (scalar counter)
+        batch_f.clone(), // cum = F(k) per lane
+        batch_f.clone(), // pmf = P(X = k) per lane
+        batch_i1,        // done per lane
+        batch_f,         // result per lane
+    ];
+
+    let results = e.while_loop(
+        &[k0, cum0, pmf0, done0, res0],
+        &carried_tys,
+        // cond: k < MAXITER && !all(done)
+        |e, args| {
+            let max = e.scalar(POISSON_MAXITER as f64);
+            let lt = e.compare("LT", &args[0], &max);
+            let all_done = e.reduce_all(&args[3]);
+            let not_all = e.not(&all_done);
+            e.and(&lt, &not_all)
+        },
+        // do: test U <= F(k) per lane, latch each lane's first hit; advance
+        // k/pmf/cum for the next iteration (the Poisson recurrence, per lane).
+        |e, args| {
+            let k = &args[0];
+            let cum = &args[1];
+            let pmf = &args[2];
+            let done = &args[3];
+            let result = &args[4];
+
+            let hit = e.compare("LE", &u, cum);
+            // Per-lane latch (`done` is the OLD flag): a lane already done keeps
+            // its FIRST accepted `k`; a not-yet-done lane tracks the current `k`
+            // (so an all-walk lane ends on the last k — matching the scalar
+            // path's tail clamp). `k` (scalar) broadcasts over the [m] result.
+            let new_result = e.select(done, result, k);
+            let new_done = e.or(done, &hit);
+
+            let one = e.scalar(1.0);
+            let k1 = e.add(k, &one);
+            let rate_over_k1 = e.div(&rate_m, &k1);
+            let pmf_next = e.mul(pmf, &rate_over_k1);
+            let cum_next = e.add(cum, &pmf_next);
+            vec![k1, cum_next, pmf_next, new_done, new_result]
         },
     );
     results[4].clone()
