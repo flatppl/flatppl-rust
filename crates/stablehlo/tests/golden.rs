@@ -6597,3 +6597,164 @@ fn emit_sample_geometric_iid_matches_frozen_golden() {
         "emitted fanned @sample drifted from tests/goldens/geometric_iid_sample.mlir"
     );
 }
+
+// ---- fan-out for discrete non-elementwise Binomial + Categorical (buffy #148,
+// #156b) ---------------------------------------------------------------------
+//
+// Unlike the Tier-1 elementwise discrete samplers (Bernoulli/Geometric), these
+// two have a scalar draw that is NOT purely elementwise, yet each fans out
+// without a `while`:
+//   - Binomial's scalar draw already owns an inner axis (its `n` Bernoulli
+//     trials, `reduce_sum`ed to one count). The fanned draw is a rank-2 `[m, n]`
+//     uniform — a genuine `rng_bit_generator` output, ONE advance, rows
+//     independent — reduced over the INNER count axis (last) to `[m]` by the new
+//     `Emitter::reduce_sum_last_axis` (the outer `m` lanes survive, unlike the
+//     scalar path's full `reduce_sum`).
+//   - Categorical/Categorical0 fan out with NO new primitive: one scalar `U`
+//     becomes a `[m]` draw under the batch shape, and the inverse-CDF unroll's
+//     running count is promoted to `[m]` by the auto-broadcasting
+//     `compare`/`select`/`add`.
+// Both goldens are parse-validated against the real StableHLO parser (jax
+// 0.10.2). Poisson still refuses (`emit_sample_iid_poisson_refuses`).
+
+/// A fanned Binomial draw: `iid(Binomial(n=5, p=0.3), 4)`, `n` the FIXED inner
+/// count, `4` the outer fan-out — the `[4, 5]` uniform, inner-axis reduce case.
+const BINOMIAL_IID_SAMPLE_SRC: &str = "\
+s = rnginit(0)
+n = 5
+xs ~ iid(Binomial(n = n, p = 0.3), 4)
+draws = rand(s, lawof(xs))
+";
+
+/// A fanned Categorical draw: `iid(Categorical(p=[0.2,0.3,0.5]), 4)`, exercising
+/// the inverse-CDF unroll broadcasting its running count over a `[4]` batch.
+const CATEGORICAL_IID_SAMPLE_SRC: &str = "\
+s = rnginit(0)
+xs ~ iid(Categorical(p = [0.2, 0.3, 0.5]), 4)
+draws = rand(s, lawof(xs))
+";
+
+/// A fanned Categorical0 draw (0-based): same as the Categorical case but with
+/// `base = 0.0` — the only difference is the initial count constant.
+const CATEGORICAL0_IID_SAMPLE_SRC: &str = "\
+s = rnginit(0)
+xs ~ iid(Categorical0(p = [0.2, 0.3, 0.5]), 4)
+draws = rand(s, lawof(xs))
+";
+
+/// The fanned Binomial draw returns a `tensor<4xf32>` (not a scalar) alongside
+/// the advanced key, drawn as a GENUINE rank-2 `[4, 5]` batch (one
+/// `rng_bit_generator` sized to `tensor<4x5xui32>` — 4 independent variates,
+/// each 5 Bernoulli trials — not a broadcast of a `[5]` draw), then reduced over
+/// the inner count axis by EXACTLY ONE `stablehlo.reduce` over
+/// `dimensions = [1]` → `[4]`.
+#[test]
+fn emit_sample_binomial_iid_has_expected_structure() {
+    let d = determinize_src(BINOMIAL_IID_SAMPLE_SRC);
+    let out = emit_sample(&d);
+
+    assert!(
+        out.contains("-> (tensor<4xf32>, tensor<2xui64>)"),
+        "fanned Binomial must return the [4] batch + advanced key, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.rng_bit_generator").count(),
+        1,
+        "one rng_bit_generator advance for the whole [4, 5] batch, in:\n{out}"
+    );
+    assert!(
+        out.contains("-> (tensor<2xui64>, tensor<4x5xui32>)"),
+        "the draw must be a genuine rank-2 [4, 5] rng output (rows independent), in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.reduce(").count(),
+        1,
+        "exactly one reduce (the inner-count-axis sum), in:\n{out}"
+    );
+    assert!(
+        out.contains("across dimensions = [1] : (tensor<4x5xf32>, tensor<f32>) -> tensor<4xf32>"),
+        "the reduce must be over the LAST axis only ([4, 5] -> [4]), in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// Freeze the exact emitted text (parse-validated against the real StableHLO
+/// parser): any drift must be a deliberate, reviewed change to this golden.
+#[test]
+fn emit_sample_binomial_iid_matches_frozen_golden() {
+    let d = determinize_src(BINOMIAL_IID_SAMPLE_SRC);
+    let out = emit_sample(&d);
+    let golden = include_str!("goldens/binomial_iid_sample.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted fanned @sample drifted from tests/goldens/binomial_iid_sample.mlir"
+    );
+}
+
+/// The fanned Categorical draw returns a `tensor<4xf32>` alongside the advanced
+/// key, with exactly ONE `rng_bit_generator` sized to `[4]` and NO new
+/// primitive — the running count broadcasts over the batch via the length-3
+/// `p`'s `n - 1 = 2` compare/select prefix-sum comparisons.
+#[test]
+fn emit_sample_categorical_iid_has_expected_structure() {
+    let d = determinize_src(CATEGORICAL_IID_SAMPLE_SRC);
+    let out = emit_sample(&d);
+
+    assert!(
+        out.contains("-> (tensor<4xf32>, tensor<2xui64>)"),
+        "fanned Categorical must return the [4] batch + advanced key, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.rng_bit_generator").count(),
+        1,
+        "one rng_bit_generator advance for the whole [4] batch, in:\n{out}"
+    );
+    assert!(
+        out.contains("-> (tensor<2xui64>, tensor<4xui32>)"),
+        "the single rng_bit_generator must be sized to the [4] batch, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.reduce(").count(),
+        0,
+        "Categorical fans out via broadcast, not a reduce, in:\n{out}"
+    );
+    assert_eq!(out.matches("stablehlo.compare").count(), 2);
+    assert_eq!(out.matches("stablehlo.select").count(), 2);
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// Freeze the exact emitted text (parse-validated against the real StableHLO
+/// parser): any drift must be a deliberate, reviewed change to this golden.
+#[test]
+fn emit_sample_categorical_iid_matches_frozen_golden() {
+    let d = determinize_src(CATEGORICAL_IID_SAMPLE_SRC);
+    let out = emit_sample(&d);
+    let golden = include_str!("goldens/categorical_iid_sample.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted fanned @sample drifted from tests/goldens/categorical_iid_sample.mlir"
+    );
+}
+
+/// The `base = 0.0` mirror of the Categorical fan-out: same `[4]` batch, same op
+/// counts, differing only in the initial count constant (checked structurally —
+/// the difference is exercised by the 1-based golden above).
+#[test]
+fn emit_sample_categorical0_iid_has_expected_structure() {
+    let d = determinize_src(CATEGORICAL0_IID_SAMPLE_SRC);
+    let out = emit_sample(&d);
+
+    assert!(
+        out.contains("-> (tensor<4xf32>, tensor<2xui64>)"),
+        "fanned Categorical0 must return the [4] batch + advanced key, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.rng_bit_generator").count(),
+        1,
+        "one rng_bit_generator advance for the whole [4] batch, in:\n{out}"
+    );
+    assert_eq!(out.matches("stablehlo.reduce(").count(), 0);
+    assert_eq!(out.matches("stablehlo.compare").count(), 2);
+    assert_eq!(out.matches("stablehlo.select").count(), 2);
+    assert!(is_delimiter_balanced(&out));
+}

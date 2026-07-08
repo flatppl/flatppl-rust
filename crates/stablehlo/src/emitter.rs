@@ -586,6 +586,33 @@ impl<'m> Emitter<'m> {
         self.reduce_full("stablehlo.maximum", identity, a)
     }
 
+    /// Reduce ONLY the innermost (last) axis via `stablehlo.add`, leaving every
+    /// outer axis intact: `[m, n] → [m]`, `[m, n, d] → [m, n]`, `[n] → Scalar`.
+    /// Unlike [`Emitter::reduce_sum`] (which collapses EVERY axis to a scalar
+    /// via [`Emitter::reduce_full`]), this reduces the single last dimension —
+    /// the per-lane reduction a fanned discrete draw needs, where the outer
+    /// `[m]` fan-out axis must SURVIVE while the distribution's own inner axis
+    /// (a Binomial's `n` Bernoulli trials, [`binomial_sample`]) is summed away
+    /// to one count per lane. For a rank-1 `[n]` operand the last axis is axis
+    /// 0, so this emits the identical `stablehlo.reduce(... dimensions = [0]
+    /// ...)` [`Emitter::reduce_sum`] does — the scalar Binomial path is
+    /// unchanged whichever it calls. Emits one `stablehlo.reduce` over
+    /// `dimensions = [<last>]` (via [`Emitter::reduce_axis`]). Panics on a
+    /// rank-0 (`Scalar`) or non-`Ranked` operand — no inner axis to reduce, an
+    /// internal invariant violation mirroring [`Emitter::reduce_axis`]'s
+    /// panic-on-bad-shape discipline.
+    pub fn reduce_sum_last_axis(&mut self, a: &Value) -> Value {
+        let rank = match &a.ty {
+            MlirTy::Ranked(dims) => dims.len(),
+            other => panic!("reduce_sum_last_axis expects a ranked operand, got {other:?}"),
+        };
+        assert!(
+            rank >= 1,
+            "reduce_sum_last_axis: operand must have rank >= 1 (a last axis to reduce)"
+        );
+        self.reduce_axis("stablehlo.add", "0.000000e+00", a, rank - 1)
+    }
+
     /// Shared full-reduction lowering: reduces axis 0 with [`reduce_axis`]
     /// once per rank, which collapses an `n`-D tensor to a scalar (an
     /// already-`Scalar` operand takes the zero-iteration path unchanged).

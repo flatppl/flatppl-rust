@@ -524,6 +524,22 @@ pub(crate) fn lower_sample(
 ///   `[d, d]` cov, and the row-wise affine `mu + L·z_i` for all rows as a
 ///   batched [`Emitter::batched_row_matvec`] (`z · Lᵀ`), with `mu` broadcast
 ///   across the rows. See [`mvnormal_sample`].
+/// - Fan-out **Tier 3 (discrete, non-elementwise)** — two discrete samplers
+///   whose scalar draw is NOT purely elementwise, so neither belongs on the
+///   Tier-1 list above, yet each fans out cleanly without a `while`:
+///   - Binomial ([`binomial_sample`]): its scalar draw already owns an inner
+///     axis — the `n` Bernoulli trials it `reduce_sum`s to one count. The fanned
+///     draw is a rank-2 `[m, n]` uniform batch (`m` independent variates, each
+///     an `n`-Bernoulli row — a genuine `[m, n]` `rng_bit_generator` output, one
+///     advance, rows independent) reduced over the INNER count axis to `[m]` by
+///     the NEW [`Emitter::reduce_sum_last_axis`] (the outer `m` lanes survive,
+///     unlike the scalar path's full [`Emitter::reduce_sum`]).
+///   - Categorical/Categorical0 ([`draw_categorical`]): NO new primitive — one
+///     scalar `U` becomes a `[m]` draw under the fan-out batch shape, and the
+///     inverse-CDF unroll's running count is promoted to `[m]` by the
+///     auto-broadcasting [`Emitter::compare`]/[`Emitter::select`]/
+///     [`Emitter::add`] (a single-category `p` — an empty unroll — is lifted to
+///     `[m]` explicitly, see [`draw_categorical`]).
 ///
 /// Deliberately EXCLUDED (fan-out for these still refuses):
 /// - Dirichlet: its scalar `@sample` ([`dirichlet_sample`]) draws `d` SCALAR
@@ -537,13 +553,14 @@ pub(crate) fn lower_sample(
 ///   a NEW `stablehlo.transpose` op form to reorient the axis-0 stack
 ///   `[d, n]` → `[n, d]` (the emitter has no transpose today). Refused rather
 ///   than mislowered — a clean follow-up.
-/// - The discrete `while`/inverse-CDF samplers ([`draw_poisson`] /
-///   [`draw_categorical`]): Poisson/NegativeBinomial/NegativeBinomial2/
-///   Binomial/Multinomial/Categorical/Categorical0 — not yet batched (a later
-///   tier); their `while`/unroll shapes are not covered by
+/// - The `while`/inverse-CDF discrete samplers still not batched: Poisson
+///   ([`draw_poisson`]'s bounded `while`), the NegativeBinomial/NegativeBinomial2
+///   Gamma–Poisson mixtures built on it, and Multinomial (a bounded `while` over
+///   `n` Categorical draws) — their `while` shapes are not covered by
 ///   [`draw_gamma_batched`]'s masked-lane loop. (Bernoulli/Geometric look like
 ///   they belong on this list too — they're discrete — but their builders are
-///   straight-line elementwise, not `while`/unroll, so they're Tier 1 above.)
+///   straight-line elementwise, so they're Tier 1 above; Binomial and
+///   Categorical/Categorical0 are the discrete Tier-3 cases just admitted.)
 const FANOUT_SAFE: &[&str] = &[
     // Tier 1 (elementwise continuous)
     "Normal",
@@ -567,6 +584,17 @@ const FANOUT_SAFE: &[&str] = &[
     "GeneralizedNormal",
     // Tier 2 (batched multivariate — mvnormal_sample)
     "MvNormal",
+    // Tier 3 (batched discrete NON-elementwise — inner-axis reduce / broadcast):
+    // each already owns (or lacks) an inner axis a plain `[m]` fan-out cannot
+    // express, so neither is Tier 1. Binomial draws a rank-2 `[m, n]` uniform
+    // (m lanes × n Bernoulli trials) reduced over the inner count axis to `[m]`
+    // by `reduce_sum_last_axis` (see `binomial_sample`); Categorical/Categorical0
+    // fan out with NO new primitive — their scalar-vs-batch running count is
+    // promoted to `[m]` by the auto-broadcasting `compare`/`select`/`add`
+    // (see `draw_categorical`).
+    "Binomial",
+    "Categorical",
+    "Categorical0",
 ];
 
 // ---- §08 Normal -------------------------------------------------------------
@@ -2828,6 +2856,20 @@ fn draw_categorical(e: &mut Emitter, p: &Params, base: f64) -> Result<Value, Emi
         let inc = e.select(&lt, &one, &zero);
         count = e.add(&count, &inc);
     }
+
+    // Fan-out (iid): this draw needs no new primitive — under a `[m]` fan-out
+    // batch shape, `u` above is drawn `[m]` (`Emitter::rng` sizes by the batch
+    // shape, ignoring the scalar `out_ty`), and the loop's auto-broadcasting
+    // `compare`/`select`/`add` promote the running `count` to `[m]` at the first
+    // category. The one exception is a single-category `p` (the loop runs zero
+    // times): `count` is left the scalar `base`, so lift it to the `[m]` batch
+    // here — a fanned draw must be `[m]`-shaped like every other count, and a
+    // 1-category Categorical is a valid (if degenerate) draw of the constant
+    // `base`. The scalar path (`batch_shape = None`) leaves `count` untouched.
+    if let (Some(dims), MlirTy::Scalar) = (e.batch_shape(), &count.ty) {
+        let batch_ty = MlirTy::Ranked(dims.iter().map(|d| Some(*d)).collect());
+        count = e.broadcast_in_dim(&count, &[], batch_ty);
+    }
     Ok(count)
 }
 
@@ -2851,19 +2893,62 @@ fn categorical0_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> 
 /// `n` known at EMIT time, not merely well-typed. `p` (a scalar probability) is
 /// broadcast to the batch shape before the elementwise `compare` (StableHLO has
 /// no implicit scalar broadcast — see the multivariate batch's doc comment).
+///
+/// Fan-out (iid): unlike the elementwise Tier-1 discrete samplers, Binomial's
+/// scalar draw already OWNS an inner axis — its `n` Bernoulli trials, summed
+/// away by [`Emitter::reduce_sum`]. So a fanned `iid(Binomial, m)` draw is a
+/// rank-2 `[m, n]` batch (`m` independent variates, each an `n`-Bernoulli row),
+/// reduced over the INNER count axis to `[m]` by [`Emitter::reduce_sum_last_axis`]
+/// (not the scalar path's full `reduce_sum`, which would collapse the `m` lanes
+/// too). The `[m]` outer fan-out must be part of the `rng` draw SHAPE — a
+/// genuine `[m, n]` `rng_bit_generator` output whose rows are independent, NOT a
+/// broadcast of one `[n]` draw — so the draw is sized to `[m, n]` here rather
+/// than left to `Emitter::rng`'s default `[m]` fan-out (which sizes by the
+/// caller's `[m]` batch shape alone, missing Binomial's own inner axis). The
+/// batch shape is briefly extended to `[m, n]` over the `rng` call, then
+/// restored to the `[m]` `lower_sample` set (so the recorded advanced key sees
+/// the fan-out shape). The scalar path (`batch_shape = None`) is unchanged.
 fn binomial_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
     let n = literal_fixed_positive_int(e, p, "n", "Binomial", "sample")?;
     let prob = p.get(e, "p")?;
 
-    let batch_ty = MlirTy::Ranked(vec![Some(n)]);
-    let u = e.rng("UNIFORM", &batch_ty);
+    match e.batch_shape() {
+        // Scalar draw: an internal length-`n` uniform batch summed to a scalar.
+        None => {
+            let batch_ty = MlirTy::Ranked(vec![Some(n)]);
+            let u = e.rng("UNIFORM", &batch_ty);
 
-    let p_bc = e.broadcast_in_dim(&prob, &[], batch_ty.clone());
-    let lt = e.compare("LT", &u, &p_bc);
-    let ones = e.constant(1.0, batch_ty.clone());
-    let zeros = e.constant(0.0, batch_ty);
-    let indicators = e.select(&lt, &ones, &zeros);
-    Ok(e.reduce_sum(&indicators))
+            let p_bc = e.broadcast_in_dim(&prob, &[], batch_ty.clone());
+            let lt = e.compare("LT", &u, &p_bc);
+            let ones = e.constant(1.0, batch_ty.clone());
+            let zeros = e.constant(0.0, batch_ty);
+            let indicators = e.select(&lt, &ones, &zeros);
+            Ok(e.reduce_sum(&indicators))
+        }
+        // Fanned draw: a rank-2 `[m, n]` uniform batch, reduced over the inner
+        // count axis (last) to one Binomial count per outer fan-out lane → `[m]`.
+        Some(m_dims) => {
+            let mut draw_dims: Vec<Option<u64>> = m_dims.iter().map(|d| Some(*d)).collect();
+            draw_dims.push(Some(n));
+            let draw_ty = MlirTy::Ranked(draw_dims);
+
+            // Extend the fan-out shape over the draw so `rng` sizes it to the
+            // full `[m, n]` (m fan-out lanes × n Bernoulli trials), then restore
+            // the outer `[m]` for the recorded advanced key and any later draw.
+            let mut full = m_dims.clone();
+            full.push(n);
+            e.set_batch_shape(full);
+            let u = e.rng("UNIFORM", &draw_ty);
+            e.set_batch_shape(m_dims);
+
+            let p_bc = e.broadcast_in_dim(&prob, &[], draw_ty.clone());
+            let lt = e.compare("LT", &u, &p_bc);
+            let ones = e.constant(1.0, draw_ty.clone());
+            let zeros = e.constant(0.0, draw_ty);
+            let indicators = e.select(&lt, &ones, &zeros);
+            Ok(e.reduce_sum_last_axis(&indicators))
+        }
+    }
 }
 
 /// The bounded inverse-CDF `Poisson(rate)` `MAXITER` — see [`draw_poisson`].
