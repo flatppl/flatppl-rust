@@ -1641,6 +1641,10 @@ impl<'m> Emitter<'m> {
     /// identical to the previous single-`ret` output; two-or-more render the
     /// parenthesized result-type list and comma-joined return.
     pub fn finish(self, func_name: &str, args: &[(String, MlirTy)], rets: &[&Value]) -> String {
+        debug_assert!(
+            !rets.is_empty(),
+            "finish requires at least one return value"
+        );
         let dtype = self.dtype;
         let arg_list = args
             .iter()

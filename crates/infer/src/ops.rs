@@ -494,9 +494,10 @@ pub(crate) fn call_rule(
         // `builtin_sample(rngstate, kernel, kernel_input, n, m, …)` → `(variate,
         // new_rngstate)`. Kernel = arg 1, kernel_input = arg 2. The variate comes from
         // `component_variate` (reified kernels — the accessor `kchain` uses) or, for a
-        // bare distribution constructor, from `kernel_variate` (the catalogue). The
-        // no-dims case is typed here; the optional `n, m, …` dims that array-ify the
-        // variate are a follow-up.
+        // bare distribution constructor, from `kernel_variate` (the catalogue). Any
+        // trailing `n, m, …` args (arg 3 on) are size dims: per spec §07, they array-ify
+        // the variate into an IID array of shape `(n, m, …)` (no dims → the bare variate,
+        // unchanged from before).
         "builtin_sample" => {
             let k = args.get(1);
             let variate = k
@@ -505,7 +506,21 @@ pub(crate) fn call_rule(
                     k.and_then(|(n, _, _)| kernel_variate(inf, *n, args.get(2).map(|a| a.0)))
                 });
             match variate {
-                Some(v) => Type::Tuple(Box::new([v, Type::RngState])),
+                Some(v) => {
+                    let size_args = args.get(3..).unwrap_or(&[]);
+                    let variate = if size_args.is_empty() {
+                        v
+                    } else {
+                        Type::Array {
+                            shape: size_args
+                                .iter()
+                                .map(|(n, _, _)| resolve_dim(inf, *n))
+                                .collect(),
+                            elem: Box::new(v),
+                        }
+                    };
+                    Type::Tuple(Box::new([variate, Type::RngState]))
+                }
                 None => non_kernel_or_defer(inf, k, "builtin_sample", "argument 2"),
             }
         }
