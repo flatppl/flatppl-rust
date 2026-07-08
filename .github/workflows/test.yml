@@ -39,10 +39,10 @@ jobs:
     env:
       FLATPPL_JS_DIR: ${{ github.workspace }}/.flatppl-js
     steps:
-      - uses: actions/checkout@v6.0.2
+      - uses: actions/checkout@v6.0.3
 
       - name: Check out flatppl-js (cross-engine parity reference)
-        uses: actions/checkout@v6.0.2
+        uses: actions/checkout@v6.0.3
         with:
           repository: flatppl/flatppl-js
           ref: main
@@ -68,7 +68,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@v2.79.14
+        uses: taiki-e/install-action@v2.81.8
         with:
           tool: cargo-llvm-cov
 
