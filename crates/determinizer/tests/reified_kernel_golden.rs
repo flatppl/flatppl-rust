@@ -87,3 +87,18 @@ lp = logdensityof(dist, 0.7)";
         "refuse reason must name the intractable-marginal / residual-draw cause; got: {msg}"
     );
 }
+
+#[test]
+fn functionof_measure_application_lowers() {
+    // `functionof(Normal(mu = _m_, sigma = 1.0), arg1 = _arg1_)` reifies a measure
+    // to a kernel (spec §04 "Reification to functions and kernels"); applying it
+    // at a POSITIONAL argument `0.0` binds that argument to the sole boundary
+    // input by position (unlike the kernelof case, where the argument is a
+    // `record(...)` bound by field name).
+    let src = "\
+mk = fn(Normal(mu = _, sigma = 1.0))
+dist = mk(0.0)
+lp = logdensityof(dist, 0.3)";
+    let pir = flatppl_flatpir::write(&determinize(&parse_infer(src)).expect("must lower"));
+    assert!(pir.contains("builtin_logdensityof"), "got:\n{pir}");
+}
