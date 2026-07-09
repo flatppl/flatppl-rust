@@ -29,3 +29,18 @@ lp = logdensityof(dist, 0.7)";
         "kernel body's Normal(mu=1.5, sigma=2.0) must survive reduction; got:\n{pir}"
     );
 }
+
+#[test]
+fn non_kernel_user_call_does_not_reduce() {
+    // `f` is a plain function, not a kernel → application must NOT be treated
+    // as a measure; the query refuses (a function is not a measure).
+    let src = "\
+f = x -> x + 1.0
+z = f(2.0)
+lp = logdensityof(z, 0.5)";
+    let err = determinize(&parse_infer(src)).expect_err("a function value is not a measure");
+    assert!(
+        format!("{err:?}").contains("primitive measure"),
+        "got: {err:?}"
+    );
+}
