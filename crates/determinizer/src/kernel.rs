@@ -9,7 +9,7 @@
 //! _b_))`) for an intermediate-variate input. Substitution replaces the `Ref`'s
 //! symbol, so callers apply `substitute_ref(body, ref.name, value)`.
 
-use crate::density::resolve_ref_one;
+use crate::density::{draw_argument, resolve_ref_one};
 use flatppl_core::{Call, CallHead, Inputs, Module, NamedArg, Node, NodeId, Ref, RefNs, Symbol};
 
 /// A resolved kernel: its reified body and its boundary inputs as
@@ -93,4 +93,57 @@ pub(crate) fn substitute_ref(m: &mut Module, root: NodeId, name: Symbol, new_id:
         named: new_named.into(),
         inputs,
     }))
+}
+
+/// If `node` is a kernel application `k(input)` where `k` resolves to a
+/// `kernelof(body, %specinputs([(name, ref), …]))`, β-reduce it: substitute
+/// each boundary input's body-ref with the matching field of `input`, and
+/// return the reduced measure body. `None` for any other shape.
+///
+/// `body` is commonly a bare `(%ref self x)` pointing at a `draw`-bound
+/// stochastic value — the `x ~ Dist(...); k = kernelof(x, ...)` idiom (see
+/// `fixtures/flatppl/minimal.flatppl`) — rather than an inline measure
+/// expression. `substitute_ref` only rewrites literal descendants of its
+/// root, so it cannot see through that ref into `x`'s own binding; resolve
+/// one level of ref indirection and, if present, one level of `draw(...)`
+/// unwrapping to reach the actual measure/law BEFORE substituting.
+pub(crate) fn reduce_kernel_application(m: &mut Module, node: NodeId) -> Option<NodeId> {
+    let Node::Call(c) = m.node(node) else {
+        return None;
+    };
+    let CallHead::User(callee) = c.head else {
+        return None;
+    };
+    if c.args.len() != 1 {
+        return None;
+    }
+    let input = c.args[0];
+    let kernel = resolve_kernel(m, callee)?;
+
+    let (resolved, _) = resolve_ref_one(m, kernel.body);
+    let mut body = match draw_argument(m, resolved) {
+        Some(law) => resolve_ref_one(m, law).0,
+        None => resolved,
+    };
+    for (name, target) in kernel.inputs {
+        let value = record_field(m, input, name)?;
+        body = substitute_ref(m, body, target.name, value);
+    }
+    Some(body)
+}
+
+/// Look up field `name` in a `record(%field … )` node; `None` if `rec` is not
+/// a record literal or lacks the field.
+fn record_field(m: &Module, rec: NodeId, name: Symbol) -> Option<NodeId> {
+    let (resolved, _) = resolve_ref_one(m, rec);
+    let Node::Call(c) = m.node(resolved) else {
+        return None;
+    };
+    let CallHead::Builtin(sym) = c.head else {
+        return None;
+    };
+    if m.resolve(sym) != "record" {
+        return None;
+    }
+    c.named.iter().find(|na| na.name == name).map(|na| na.value)
 }

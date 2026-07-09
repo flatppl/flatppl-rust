@@ -400,6 +400,12 @@ pub(crate) fn lower_measure_density(
     // Resolve a single level of `(%ref self x)` indirection on the measure side.
     let (measure_node, _binding_opt) = resolve_ref_one(m, measure_expr);
 
+    // A reified-kernel *application* `k(input)` (a `%call(User(k), [input])`)
+    // is not a builtin-named op; β-reduce it to its measure body and recurse.
+    if let Some(reduced) = crate::kernel::reduce_kernel_application(m, measure_node) {
+        return lower_measure_density(m, reduced, v);
+    }
+
     // Dispatch on the measure op.
     let op = builtin_name(m, measure_node);
 
