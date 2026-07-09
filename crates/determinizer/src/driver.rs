@@ -11,6 +11,7 @@
 
 use crate::refuse::RefuseError;
 use flatppl_core::{BindingId, CallHead, Module, Node, NodeId, Ref, RefNs, Scalar, Symbol};
+use flatppl_infer::ModuleBundle;
 
 /// The measure-algebra vocabulary: op names whose presence signals a node that
 /// must be eliminated before the module is FlatPDL-conformant. This list matches
@@ -49,8 +50,24 @@ const MEASURE_VOCAB: &[&str] = &[
 /// Transform `m` into a FlatPDL-conformant module, or return the first construct
 /// that cannot be legalized.
 ///
-/// Works on a clone of `m`; the original is not modified.
+/// Works on a clone of `m`; the original is not modified. Resolves only
+/// same-module refs — a cross-module (`load_module`) measure ref refuses. For a
+/// model with loaded dependencies, use [`determinize_with`] and supply the
+/// dependency bundle.
 pub fn determinize(m: &Module) -> Result<Module, RefuseError> {
+    determinize_with(m, &ModuleBundle::new())
+}
+
+/// Like [`determinize`], but resolves cross-module (`load_module`) measure refs
+/// against `bundle` — the same `ModuleBundle` the host assembled for inference
+/// (path → parsed dependency `Module`). A `(%ref <alias> member)` reaching a
+/// measure/likelihood-kernel position is grafted from the loaded submodule into
+/// the host and then lowered like any local measure (see
+/// [`crate::crossmodule`]). With an empty bundle this is byte-identical to
+/// [`determinize`] for every self-contained model.
+///
+/// Works on a clone of `m`; the original is not modified.
+pub fn determinize_with(m: &Module, bundle: &ModuleBundle) -> Result<Module, RefuseError> {
     let mut work = m.clone();
 
     loop {
@@ -80,7 +97,7 @@ pub fn determinize(m: &Module) -> Result<Module, RefuseError> {
                 }
             }
             Some((bid, node_id)) => {
-                apply_rule(&mut work, bid, node_id)?;
+                apply_rule(&mut work, bid, node_id, bundle)?;
                 // Loop: re-scan after the rewrite.
             }
         }
@@ -183,10 +200,15 @@ fn is_measure_layer(m: &Module, id: NodeId) -> bool {
 /// node (β-law replaces a `lawof(draw ?m)` with a reference to `?m`'s node —
 /// zero new nodes since we reuse the existing `?m` NodeId). Each rewrite
 /// strictly lowers the count of measure-layer nodes, guaranteeing termination.
-fn apply_rule(m: &mut Module, bid: BindingId, target_node: NodeId) -> Result<(), RefuseError> {
+fn apply_rule(
+    m: &mut Module,
+    bid: BindingId,
+    target_node: NodeId,
+    bundle: &ModuleBundle,
+) -> Result<(), RefuseError> {
     // --- density disintegration: logdensityof(lawof(M), v) → deterministic density ---
     if is_op(m, target_node, "logdensityof") {
-        let new_root = crate::density::lower_logdensityof(m, target_node)?;
+        let new_root = crate::density::lower_logdensityof(m, target_node, bundle)?;
         let new_rhs = substitute_in_tree(m, m.binding(bid).rhs, target_node, new_root);
         m.set_binding_rhs(bid, new_rhs);
         // After lowering a logdensityof query, some measure bindings (e.g.

@@ -107,6 +107,7 @@ use flatppl_core::{
     BindingId, Call, CallHead, Dim, Inputs, Mass, Module, NamedArg, NamedKind, Node, NodeId, Ref,
     RefNs, Scalar, ScalarType, Symbol, Type,
 };
+use flatppl_infer::ModuleBundle;
 
 // ---------------------------------------------------------------------------
 // Public entry point
@@ -118,7 +119,11 @@ use flatppl_core::{
 /// Side effect: each `draw` binding consumed by the density query is pinned to its
 /// scored value (its binding's RHS is redirected to the pinned variate), so no
 /// stochastic `draw` survives.
-pub(crate) fn lower_logdensityof(m: &mut Module, query: NodeId) -> Result<NodeId, RefuseError> {
+pub(crate) fn lower_logdensityof(
+    m: &mut Module,
+    query: NodeId,
+    bundle: &ModuleBundle,
+) -> Result<NodeId, RefuseError> {
     let (arg1, arg2) = {
         let q = expect_builtin_call(m, query, "logdensityof")
             .ok_or_else(|| refuse(query, m, "expected logdensityof"))?;
@@ -140,7 +145,7 @@ pub(crate) fn lower_logdensityof(m: &mut Module, query: NodeId) -> Result<NodeId
             Some("likelihoodof") | Some("joint_likelihood")
         )
     {
-        return lower_likelihood_density(m, resolved, arg2);
+        return lower_likelihood_density(m, resolved, arg2, bundle);
     }
     // Measure query: arg2 is the variate (existing path).
     let (measure_expr, v) = extract_logdensityof_args(m, query)?;
@@ -166,10 +171,11 @@ fn lower_likelihood_density(
     m: &mut Module,
     resolved: NodeId,
     theta: NodeId,
+    bundle: &ModuleBundle,
 ) -> Result<NodeId, RefuseError> {
     match builtin_name(m, resolved) {
-        Some("joint_likelihood") => lower_joint_likelihood(m, resolved, theta),
-        _ => lower_likelihood_query(m, resolved, theta),
+        Some("joint_likelihood") => lower_joint_likelihood(m, resolved, theta, bundle),
+        _ => lower_likelihood_query(m, resolved, theta, bundle),
     }
 }
 
@@ -191,6 +197,7 @@ fn lower_joint_likelihood(
     m: &mut Module,
     node: NodeId,
     theta: NodeId,
+    bundle: &ModuleBundle,
 ) -> Result<NodeId, RefuseError> {
     let components: Vec<NodeId> = {
         let c = expect_builtin_call(m, node, "joint_likelihood")
@@ -217,7 +224,7 @@ fn lower_joint_likelihood(
         // hop and reuse the per-likelihood dispatch (also handles a nested
         // joint_likelihood).
         let (comp_resolved, _) = resolve_ref_one(m, comp);
-        terms.push(lower_likelihood_density(m, comp_resolved, theta)?);
+        terms.push(lower_likelihood_density(m, comp_resolved, theta, bundle)?);
     }
     Ok(fold_add(m, &terms))
 }
@@ -233,10 +240,58 @@ fn lower_joint_likelihood(
 /// score at ITS OWN θ point, not the last θ written globally. Leaving the
 /// `mu = elementof(...)` param decls in place is valid FlatPDL (`is_flatpdl`
 /// allows `elementof` parameter declarations); they become unused free params.
+/// If `k` (a likelihood kernel argument) is a cross-module ref
+/// `(%ref <alias> member)` — directly, or via one `(%ref self …)` hop — resolve
+/// it against `bundle` and graft the referenced submodule kernel subtree into the
+/// host, returning the grafted host node. A same-module `k` is returned
+/// unchanged. An unresolvable cross-module ref (dependency or member absent from
+/// the bundle) **refuses** rather than falling through to a mislowering.
+///
+/// The graft (see [`crate::crossmodule`]) also pulls the kernel's own parameter
+/// bindings into the host, so the caller's `theta_field_map` and the density
+/// lowering both run on a self-contained node with no further bundle access.
+fn resolve_cross_module_kernel(
+    m: &mut Module,
+    bundle: &ModuleBundle,
+    k: NodeId,
+) -> Result<NodeId, RefuseError> {
+    let module_ref = if is_module_ref(m, k) {
+        k
+    } else {
+        let (candidate, _) = resolve_ref_one(m, k);
+        if is_module_ref(m, candidate) {
+            candidate
+        } else {
+            return Ok(k); // same-module kernel — existing path, unchanged
+        }
+    };
+    match crate::crossmodule::resolve_module_ref(bundle, m, module_ref) {
+        Some((sub, sub_node)) => Ok(crate::crossmodule::graft_subtree(m, sub, sub_node)),
+        None => Err(refuse(
+            module_ref,
+            m,
+            "cross-module kernel ref could not be resolved against the module bundle \
+             (missing dependency or member); refuse rather than mislower",
+        )),
+    }
+}
+
+/// True iff `id` is a `(%ref <alias> …)` cross-module reference.
+fn is_module_ref(m: &Module, id: NodeId) -> bool {
+    matches!(
+        m.node(id),
+        Node::Ref(Ref {
+            ns: RefNs::Module(_),
+            ..
+        })
+    )
+}
+
 fn lower_likelihood_query(
     m: &mut Module,
     likelihoodof_node: NodeId,
     theta: NodeId,
+    bundle: &ModuleBundle,
 ) -> Result<NodeId, RefuseError> {
     let (k, obs) = {
         let c = expect_builtin_call(m, likelihoodof_node, "likelihoodof")
@@ -250,6 +305,13 @@ fn lower_likelihood_query(
         }
         (c.args[0], c.args[1])
     };
+    // Cross-module kernel ref (`(%ref <alias> member)` into a loaded submodule):
+    // graft the referenced kernel subtree into the host so the density lowering
+    // below runs on a self-contained node (spec §04 — a measure/kernel crosses
+    // module boundaries freely). Grafting brings the kernel's own parameter
+    // bindings into the host too, so `theta_field_map` (next line) can resolve
+    // the θ field names. A same-module `k` is returned unchanged.
+    let k = resolve_cross_module_kernel(m, bundle, k)?;
     let theta_map = theta_field_map(m, theta)?;
     let density = lower_measure_density(m, k, obs)?;
     // Refuse-don't-mislower: a θ param captured as a `functionof` / `kernelof`
