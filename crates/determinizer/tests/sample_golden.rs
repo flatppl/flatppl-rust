@@ -114,6 +114,37 @@ draws = rand(s, lawof(record(x = x)))";
     );
 }
 
+// Generality across distributions on the @sample path: `Beta` has params
+// ["alpha", "beta"], so `Beta(2.0, 5.0)` positional binds alpha=2.0, beta=5.0 and
+// samples via the same builtin_sample as the keyword form. Confirms the sample
+// leaf is not Normal-specific. Regression for buffy #143 (non-Gaussian sample
+// leaf).
+#[test]
+fn sample_draw_positional_beta_lowers_same_as_keyword() {
+    let positional = "\
+s = rnginit(0)
+x = draw(Beta(2.0, 5.0))
+draws = rand(s, lawof(record(x = x)))";
+    let keyword = "\
+s = rnginit(0)
+x = draw(Beta(alpha = 2.0, beta = 5.0))
+draws = rand(s, lawof(record(x = x)))";
+    let out_pos =
+        determinize(&parse_infer(positional)).expect("positional Beta sample leaf must lower");
+    let out_kw = determinize(&parse_infer(keyword)).expect("keyword Beta sample leaf must lower");
+    let pir_pos = flatppl_flatpir::write(&out_pos);
+    let pir_kw = flatppl_flatpir::write(&out_kw);
+    assert!(
+        pir_pos.contains("builtin_sample")
+            && pir_pos.contains("(record (%field alpha 2.0) (%field beta 5.0))"),
+        "positional Beta binds to its ordered params alpha/beta:\n{pir_pos}"
+    );
+    assert_eq!(
+        pir_pos, pir_kw,
+        "positional and keyword Beta lower to identical FlatPDL:\npositional:\n{pir_pos}\nkeyword:\n{pir_kw}"
+    );
+}
+
 // Two independent draws: two builtin_sample calls (field `a`, field `b`), the
 // second consuming the first's advanced rng — sequential threading, not two
 // fresh streams. There is no separate `get1` primitive in this codebase (see

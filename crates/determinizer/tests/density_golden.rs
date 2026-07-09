@@ -53,6 +53,56 @@ lp = logdensityof(lawof(record(a = a)), record(a = 0.5))";
     );
 }
 
+// The positional→keyword equivalence is NOT Normal-specific: it binds positional
+// args to the distribution's ordered §08 parameter names from the catalogue.
+// `Gamma` has params ["shape", "rate"] (two, differently named than Normal's
+// mu/sigma), so `Gamma(2.0, 3.0)` must bind `shape=2.0, rate=3.0`. Regression for
+// buffy #143 (generality across distributions, @logdensity path).
+#[test]
+fn positional_gamma_constructor_lowers_same_as_keyword() {
+    let positional = "\
+a = draw(Gamma(2.0, 3.0))
+lp = logdensityof(lawof(record(a = a)), record(a = 0.5))";
+    let keyword = "\
+a = draw(Gamma(shape = 2.0, rate = 3.0))
+lp = logdensityof(lawof(record(a = a)), record(a = 0.5))";
+    let pir_pos = flatppl_flatpir::write(&determinize_src(positional));
+    let pir_kw = flatppl_flatpir::write(&determinize_src(keyword));
+    assert!(
+        pir_pos.contains("builtin_logdensityof")
+            && pir_pos.contains("(record (%field shape 2.0) (%field rate 3.0))"),
+        "positional Gamma binds to its ordered params shape/rate:\n{pir_pos}"
+    );
+    assert_eq!(
+        pir_pos, pir_kw,
+        "positional and keyword Gamma lower to identical FlatPDL:\npositional:\n{pir_pos}\nkeyword:\n{pir_kw}"
+    );
+}
+
+// Single-parameter arity: `Exponential` has params ["rate"], so a one-positional
+// call `Exponential(1.5)` binds `rate=1.5`. Confirms the positional mapping is not
+// tied to the two-parameter shape. Regression for buffy #143 (single-arg
+// positional constructor, @logdensity path).
+#[test]
+fn positional_exponential_single_arg_lowers_same_as_keyword() {
+    let positional = "\
+a = draw(Exponential(1.5))
+lp = logdensityof(lawof(record(a = a)), record(a = 0.5))";
+    let keyword = "\
+a = draw(Exponential(rate = 1.5))
+lp = logdensityof(lawof(record(a = a)), record(a = 0.5))";
+    let pir_pos = flatppl_flatpir::write(&determinize_src(positional));
+    let pir_kw = flatppl_flatpir::write(&determinize_src(keyword));
+    assert!(
+        pir_pos.contains("builtin_logdensityof") && pir_pos.contains("(record (%field rate 1.5))"),
+        "positional Exponential binds its single param rate:\n{pir_pos}"
+    );
+    assert_eq!(
+        pir_pos, pir_kw,
+        "positional and keyword Exponential lower to identical FlatPDL:\npositional:\n{pir_pos}\nkeyword:\n{pir_kw}"
+    );
+}
+
 // weighted(w, M): logdensityof → log(w) + logdensityof(M, v)
 #[test]
 fn weighted_lowers_to_log_w_plus_density() {
