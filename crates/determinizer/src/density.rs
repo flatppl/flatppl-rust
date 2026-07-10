@@ -244,8 +244,15 @@ fn lower_joint_likelihood(
 /// `(%ref <alias> member)` — directly, or via one `(%ref self …)` hop — resolve
 /// it against `bundle` and graft the referenced submodule kernel subtree into the
 /// host, returning the grafted host node. A same-module `k` is returned
-/// unchanged. An unresolvable cross-module ref (dependency or member absent from
-/// the bundle) **refuses** rather than falling through to a mislowering.
+/// unchanged. The graft honors the `load_module` `%assign` load-time
+/// substitutions (a substituted submodule parameter is replaced by the host
+/// expression it was bound to).
+///
+/// **Refuses** (rather than mislowering) when: the cross-module ref is
+/// unresolvable (dependency or member absent from the bundle); or a grafted
+/// submodule dependency's name collides with an unrelated pre-existing host
+/// binding (independent namespaces — reusing the host binding would score against
+/// the wrong value).
 ///
 /// The graft (see [`crate::crossmodule`]) also pulls the kernel's own parameter
 /// bindings into the host, so the caller's `theta_field_map` and the density
@@ -266,7 +273,8 @@ fn resolve_cross_module_kernel(
         }
     };
     match crate::crossmodule::resolve_module_ref(bundle, m, module_ref) {
-        Some((sub, sub_node)) => Ok(crate::crossmodule::graft_subtree(m, sub, sub_node)),
+        Some(resolved) => crate::crossmodule::graft_subtree(m, &resolved)
+            .map_err(|reason| refuse(module_ref, m, &reason)),
         None => Err(refuse(
             module_ref,
             m,
