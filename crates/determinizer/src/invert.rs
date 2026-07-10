@@ -1,29 +1,63 @@
-//! Analytic `(f_inv, logvol)` synthesis for known-bijection forward builtins
+//! Analytic `(f_inv, logvol)` synthesis for known-bijection forward functions
 //! (spec §06 case 1: the engine MUST recognise the standard invertible maps —
-//! exp/log, affine, pow, cis, matrix-affine — analytically). Used by
-//! [`lower_pushfwd`] when a `pushfwd`'s forward argument is a bare builtin or a
-//! one-op lambda rather than an explicit `bijection(f, f_inv, logvol)` node.
+//! exp/log, affine, pow — and their scalar COMPOSITIONS analytically). Used by
+//! [`lower_pushfwd`] when a `pushfwd`'s forward argument is a bare builtin, a
+//! one-op lambda, or a chain/affine lambda rather than an explicit
+//! `bijection(f, f_inv, logvol)` node.
 //!
 //! `logvol` is the FORWARD log-volume element — `log|f'(x)|` as a function of the
 //! forward input `x` — matching the explicit-bijection convention consumed by
 //! `lower_pushfwd` (`logdensityof(M, f_inv(v)) - logvol(f_inv(v))`, §06 line 457).
 //!
+//! ## Scalar-chain inversion
+//!
+//! The forward body is a linear chain of ops `f = gₙ∘…∘g₁` terminating at the
+//! single input placeholder — each op either a registry unary (`exp`/`log`/`neg`)
+//! or an AFFINE node with ONE literal operand `c` and ONE sub-expression `u`
+//! (`mul`/`divide`/`add`/`sub`). We invert it by:
+//!
+//! * **`f_inv(y) = g₁_inv(…(gₙ_inv(y))…)`** — apply the per-op inverses
+//!   outermost-first to a fresh placeholder (undo `gₙ` first, `g₁` last).
+//! * **`logvol(x) = Σᵢ logvolᵢ(gᵢ₋₁∘…∘g₁(x))`** — the chain rule
+//!   `log|f'| = Σᵢ log|gᵢ'|`, with each op's LOCAL forward log-derivative
+//!   evaluated at its PARTIAL-FORWARD input `gᵢ₋₁∘…∘g₁(x)`. That partial-forward
+//!   point is exactly `gᵢ`'s own sub-expression node in the forward body (already
+//!   an expression in the input placeholder), so we reuse it directly rather than
+//!   re-deriving the composition — only the non-constant local logvols reference
+//!   it (`exp`: `z`; `log`: `−log z`); the affine ops contribute a constant
+//!   (`mul`: `log|c|`; `divide`: `−log|c|`) or zero (`add`/`sub`, `neg`), so
+//!   zero terms are dropped and an all-zero sum collapses to the literal `0`.
+//!
+//! Per-op table (`acc` = the accumulating inverse argument, `z` = the op's
+//! partial-forward input; local logvol = FORWARD `log|gᵢ'|` at `z`):
+//! | op            | inverse of `acc`   | local logvol        |
+//! |---------------|--------------------|---------------------|
+//! | `exp`         | `log(acc)`         | `z`                 |
+//! | `log`         | `exp(acc)`         | `neg(log(z))`       |
+//! | `neg`         | `neg(acc)`         | `0`                 |
+//! | `mul(c, u)`   | `divide(acc, c)`   | `log(abs(c))`       |
+//! | `divide(u, c)`| `mul(acc, c)`      | `neg(log(abs(c)))`  |
+//! | `add(c, u)`   | `sub(acc, c)`      | `0`                 |
+//! | `sub(u, c)`   | `add(acc, c)`      | `0`                 |
+//! | `sub(c, u)`   | `sub(c, acc)`      | `0`  (g'(z) = −1)   |
+//!
+//! Closed-form checks: `x -> 2·x + 1` ⇒ `f_inv = (y−1)/2`, `f'(x) = 2`, `logvol =
+//! log 2`. `x -> exp(2·x)` ⇒ `f_inv = log(y)/2`, `f'(x) = 2·e^{2x}`, `logvol =
+//! 2x + log 2` (the `2x` is `exp`'s partial-forward point).
+//!
 //! Refuse-don't-mislower: an UNRECOGNISED forward function returns `Ok(None)`
-//! (the caller tries other cases / refuses); a RECOGNISED-but-non-invertible use
-//! (`pow` with exponent 0, `pow` on a non-positive domain) returns `Err`
-//! (refuse). A wrong `(f_inv, logvol)` is never synthesised.
+//! (the caller refuses); a RECOGNISED-but-non-invertible shape returns `Err`
+//! (refuse) — a non-affine `mul`/`add`/`sub` (both operands non-literal, e.g.
+//! `x*x`, or both literal), a `divide` without a literal denominator, a `pow`
+//! inside a composition (its input domain is not verifiable here), or any other
+//! recognised builtin op. A wrong `(f_inv, logvol)` is never synthesised.
 //!
-//! Task-1 registry (single builtin; verified against the closed-form derivative):
-//! | forward   | `f_inv`            | `logvol` (in forward input `x`)          |
-//! |-----------|--------------------|------------------------------------------|
-//! | `exp`     | `log`              | `x`                    (d/dx eˣ = eˣ)    |
-//! | `log`     | `exp`              | `neg(log(x))`          (d/dx ln x = 1/x) |
-//! | `neg`     | `neg`              | `0`                    (log|−1| = 0)     |
-//! | `pow(_,k)`| `x -> pow(x, 1/k)` | `add(log(abs(k)), mul(k-1, log(x)))`     |
-//!
-//! (Affine, matrix, and `cis` forms are later tasks.)
+//! Single-op `pow(_, k)` (`x -> pow(x, k)`) keeps its Task-1 domain-restricted
+//! derivation ([`derive_pow`]); a bare builtin value (`pushfwd(exp, M)`) keeps
+//! its Task-1 single-op form ([`bare_bijection`], byte-equality-pinned against the
+//! explicit `bijection(exp, log, x -> x)`).
 
-use crate::density::{build_call, refuse, resolve_ref_one};
+use crate::density::{build_call, fold_add, refuse, resolve_ref_one};
 use crate::refuse::RefuseError;
 use flatppl_core::{
     Call, CallHead, Inputs, Module, NamedArg, Node, NodeId, Ref, RefNs, Scalar, Symbol, Type,
@@ -38,59 +72,316 @@ pub(crate) struct Bijection {
     pub logvol: NodeId,
 }
 
-/// The recognised forward op denoted by a `pushfwd`'s forward argument.
-enum Forward {
-    Exp,
-    Log,
+/// One op `gᵢ` in a scalar chain, carrying what its inverse and local logvol
+/// need: for the two non-constant-logvol unary ops (`exp`/`log`) the PARTIAL-
+/// FORWARD sub-expression node (`z`), for the affine ops the literal operand `c`.
+enum ChainOp {
+    /// `exp(z)`: inverse `log(acc)`; local logvol `z` (the partial-forward node).
+    Exp(NodeId),
+    /// `log(z)`: inverse `exp(acc)`; local logvol `neg(log(z))`.
+    Log(NodeId),
+    /// `neg(z)`: inverse `neg(acc)`; local logvol `0`.
     Neg,
-    /// `pow(_, k)` with the literal exponent node `k`.
-    Pow(NodeId),
+    /// `c·z`: inverse `divide(acc, c)`; local logvol `log(abs(c))`.
+    MulByLit(NodeId),
+    /// `z/c`: inverse `mul(acc, c)`; local logvol `neg(log(abs(c)))`.
+    DivByLit(NodeId),
+    /// `z+c`: inverse `sub(acc, c)`; local logvol `0`.
+    AddLit(NodeId),
+    /// `z−c`: inverse `add(acc, c)`; local logvol `0`.
+    SubLit(NodeId),
+    /// `c−z`: inverse `sub(c, acc)`; local logvol `0` (derivative −1, log|−1| = 0).
+    RSubLit(NodeId),
+}
+
+/// The recognised surface shape of a `pushfwd`'s forward argument.
+enum Recognized {
+    /// A bare builtin value used as a function (`pushfwd(exp, M)`).
+    BareConst(String),
+    /// A one-input `functionof` lambda `x -> body` (chain / affine / single op).
+    Lambda {
+        body: NodeId,
+        input_name: Symbol,
+        ph: Symbol,
+    },
+    /// Anything else — not a recognised forward function.
+    Unrecognized,
 }
 
 /// Derive `(f_inv, logvol)` for the forward function `f` of a `pushfwd` over a
 /// base measure whose variate domain is `domain`.
 ///
-/// * `Ok(Some(_))` — `f` is a recognised, invertible forward map; the derived
+/// * `Ok(Some(_))` — `f` is a recognised, invertible forward map (bare builtin,
+///   single-op `pow`, or a scalar chain of unary/affine ops); the derived
 ///   change-of-variables is returned.
-/// * `Ok(None)` — `f` is not a recognised forward function (the caller tries
-///   other cases, or refuses).
+/// * `Ok(None)` — `f` is not a recognised forward function (the caller refuses).
 /// * `Err(_)` — `f` is recognised but not invertible here (refuse).
 pub(crate) fn derive_bijection(
     m: &mut Module,
     f: NodeId,
     domain: &Type,
 ) -> Result<Option<Bijection>, RefuseError> {
-    let Some(fwd) = recognise_forward(m, f) else {
-        return Ok(None);
-    };
-    let bij = match fwd {
+    // Resolve one level of self-ref (`pushfwd(g, M)` where `g = exp`).
+    let (f_resolved, _) = resolve_ref_one(m, f);
+    match recognise(m, f_resolved) {
+        // Bare builtin value: Task-1 single-op form (byte-equality-pinned).
+        Recognized::BareConst(name) => Ok(bare_bijection(m, &name)),
+        Recognized::Lambda {
+            body,
+            input_name,
+            ph,
+        } => {
+            // Single-op `pow(x, k)` keeps its Task-1 domain-restricted derivation;
+            // a `pow` anywhere else in a chain is refused by the chain walk (its
+            // input domain is not verifiable here).
+            if let Some(k_node) = single_pow(m, body, ph) {
+                return derive_pow(m, f, k_node, domain);
+            }
+            derive_chain(m, body, input_name, ph)
+        }
+        Recognized::Unrecognized => Ok(None),
+    }
+}
+
+/// The Task-1 single-builtin bijections for a bare builtin value
+/// (`pushfwd(exp, M)`): the `f_inv`/`logvol` forms whose byte-equality against
+/// `bijection(exp, log, x -> x)` pins the forward-log-volume convention. Any
+/// other bare builtin (including bare `pow`, which needs an exponent) is not a
+/// recognised bare bijection → `None`.
+fn bare_bijection(m: &mut Module, name: &str) -> Option<Bijection> {
+    match name {
         // d/dx eˣ = eˣ ⇒ log|f'| = x (identity).
-        Forward::Exp => Bijection {
+        "exp" => Some(Bijection {
             f_inv: bare_builtin(m, "log"),
             logvol: identity_lambda(m),
-        },
+        }),
         // d/dx ln x = 1/x ⇒ log|f'| = −ln x.
-        Forward::Log => {
+        "log" => {
             let logvol = lambda(m, |m, ph| {
                 let logx = build_call(m, "log", &[ph]);
                 build_call(m, "neg", &[logx])
             });
-            Bijection {
+            Some(Bijection {
                 f_inv: bare_builtin(m, "exp"),
                 logvol,
-            }
+            })
         }
         // f'(x) = −1 ⇒ log|f'| = 0.
-        Forward::Neg => {
+        "neg" => {
             let logvol = lambda(m, |m, _ph| m.alloc(Node::Lit(Scalar::Real(0.0))));
-            Bijection {
+            Some(Bijection {
                 f_inv: bare_builtin(m, "neg"),
                 logvol,
-            }
+            })
         }
-        Forward::Pow(k_node) => return derive_pow(m, f, k_node, domain),
+        _ => None,
+    }
+}
+
+/// Derive the change-of-variables for a scalar-chain forward body `f = gₙ∘…∘g₁`
+/// (`input_name`/`ph` are the forward lambda's boundary — reused verbatim on the
+/// `logvol` so the partial-forward sub-expressions, which reference `ph`, resolve
+/// inside it). See the module docs for the inverse / chain-rule construction.
+///
+/// * `Ok(Some(_))` — every op in the chain is invertible.
+/// * `Ok(None)` — the chain hit an unrecognised shape (a non-builtin head, or a
+///   leaf that is not the input placeholder).
+/// * `Err(_)` — the chain hit a recognised-but-non-invertible op (refuse).
+fn derive_chain(
+    m: &mut Module,
+    body: NodeId,
+    input_name: Symbol,
+    ph: Symbol,
+) -> Result<Option<Bijection>, RefuseError> {
+    let Some(ops) = flatten_chain(m, body, ph)? else {
+        return Ok(None);
     };
-    Ok(Some(bij))
+
+    // f_inv(y) = g₁_inv(…(gₙ_inv(y))…): thread the per-op inverses through a fresh
+    // placeholder, outermost-first (the chain is stored outermost-first).
+    let f_inv = lambda(m, |m, y| {
+        let mut acc = y;
+        for op in &ops {
+            acc = apply_inverse(m, op, acc);
+        }
+        acc
+    });
+
+    // logvol(x) = Σᵢ logvolᵢ(partial-forward point). Drop the zero contributions
+    // (neg / add / sub); an all-zero sum is the constant 0.
+    let mut terms = Vec::new();
+    for op in &ops {
+        if let Some(term) = local_logvol(m, op) {
+            terms.push(term);
+        }
+    }
+    let logvol_body = if terms.is_empty() {
+        m.alloc(Node::Lit(Scalar::Real(0.0)))
+    } else {
+        fold_add(m, &terms)
+    };
+    // Reuse the forward lambda's own input name + placeholder so the reused
+    // partial-forward sub-expressions (which reference `ph`) resolve here.
+    let logvol = wrap_functionof(m, input_name, ph, logvol_body);
+
+    Ok(Some(Bijection { f_inv, logvol }))
+}
+
+/// Flatten the linear forward chain rooted at `body` into its ops, OUTERMOST-
+/// FIRST, walking down each op's single sub-expression until the input `ph`.
+///
+/// * `Ok(Some(ops))` — reached `ph`; every intermediate op was invertible.
+/// * `Ok(None)` — hit an unrecognised shape (a non-builtin head or a non-`ph`
+///   leaf): the whole forward function is not recognised.
+/// * `Err(_)` — hit a recognised-but-non-invertible op (refuse).
+fn flatten_chain(
+    m: &Module,
+    body: NodeId,
+    ph: Symbol,
+) -> Result<Option<Vec<ChainOp>>, RefuseError> {
+    let mut ops = Vec::new();
+    let mut cur = body;
+    // The forward body is a finite tree; each step descends to a strict subterm.
+    loop {
+        if is_placeholder_ref(m, cur, ph) {
+            return Ok(Some(ops));
+        }
+        match classify(m, cur)? {
+            Some((op, child)) => {
+                ops.push(op);
+                cur = child;
+            }
+            None => return Ok(None),
+        }
+    }
+}
+
+/// Classify the single op at `cur`: `Ok(Some((op, child)))` for an invertible
+/// unary/affine op (with its sub-expression `child` to descend into), `Ok(None)`
+/// for an unrecognised head (a user-function call, or a non-call leaf that is not
+/// the placeholder), `Err` for a recognised builtin with no analytic inverse
+/// here (refuse-don't-mislower).
+fn classify(m: &Module, cur: NodeId) -> Result<Option<(ChainOp, NodeId)>, RefuseError> {
+    let (name, args) = match m.node(cur) {
+        Node::Call(c) => match c.head {
+            CallHead::Builtin(sym) => (m.resolve(sym).to_string(), c.args.to_vec()),
+            // A user-function application is not a recognised builtin forward op.
+            CallHead::User(_) => return Ok(None),
+        },
+        // A non-call leaf that is not the placeholder: the chain does not
+        // terminate at the input, so this is not a recognised forward function.
+        _ => return Ok(None),
+    };
+    match name.as_str() {
+        "exp" if args.len() == 1 => Ok(Some((ChainOp::Exp(args[0]), args[0]))),
+        "log" if args.len() == 1 => Ok(Some((ChainOp::Log(args[0]), args[0]))),
+        "neg" if args.len() == 1 => Ok(Some((ChainOp::Neg, args[0]))),
+        // Affine multiply: exactly one literal operand (the scale `c`).
+        "mul" if args.len() == 2 => match (is_lit(m, args[0]), is_lit(m, args[1])) {
+            (true, false) => Ok(Some((ChainOp::MulByLit(args[0]), args[1]))),
+            (false, true) => Ok(Some((ChainOp::MulByLit(args[1]), args[0]))),
+            _ => Err(refuse(
+                cur,
+                m,
+                "mul with two non-literal (or two literal) operands is not an invertible \
+                 affine map — refuse rather than mislower",
+            )),
+        },
+        // Affine divide: only `u / c` (literal denominator) is affine; `c / u`
+        // (reciprocal) is out of the grammar.
+        "divide" if args.len() == 2 => match (is_lit(m, args[0]), is_lit(m, args[1])) {
+            (false, true) => Ok(Some((ChainOp::DivByLit(args[1]), args[0]))),
+            _ => Err(refuse(
+                cur,
+                m,
+                "divide is an invertible affine map only with a literal denominator (u / c) \
+                 — refuse rather than mislower",
+            )),
+        },
+        // Affine add: exactly one literal operand (the shift `c`).
+        "add" if args.len() == 2 => match (is_lit(m, args[0]), is_lit(m, args[1])) {
+            (true, false) => Ok(Some((ChainOp::AddLit(args[0]), args[1]))),
+            (false, true) => Ok(Some((ChainOp::AddLit(args[1]), args[0]))),
+            _ => Err(refuse(
+                cur,
+                m,
+                "add with two non-literal (or two literal) operands is not an invertible \
+                 affine map — refuse rather than mislower",
+            )),
+        },
+        // Affine subtract: `u − c` (shift) or `c − u` (reflect+shift).
+        "sub" if args.len() == 2 => match (is_lit(m, args[0]), is_lit(m, args[1])) {
+            (false, true) => Ok(Some((ChainOp::SubLit(args[1]), args[0]))),
+            (true, false) => Ok(Some((ChainOp::RSubLit(args[0]), args[1]))),
+            _ => Err(refuse(
+                cur,
+                m,
+                "sub with two non-literal (or two literal) operands is not an invertible \
+                 affine map — refuse rather than mislower",
+            )),
+        },
+        // `pow` is invertible only as the single top-level op over a strictly-
+        // positive base domain ([`derive_pow`], handled before the chain walk); a
+        // `pow` reached inside a composition has an unverifiable input domain.
+        "pow" => Err(refuse(
+            cur,
+            m,
+            "pow inside a composition is not an invertible shape here (its input domain is \
+             not verifiable) — refuse rather than mislower",
+        )),
+        // A recognised builtin with no analytic inverse in this grammar.
+        _ => Err(refuse(
+            cur,
+            m,
+            "forward op is a recognised builtin with no analytic inverse — refuse rather \
+             than mislower",
+        )),
+    }
+}
+
+/// Apply `op`'s per-op inverse to the accumulating argument `acc` (see the module
+/// per-op table).
+fn apply_inverse(m: &mut Module, op: &ChainOp, acc: NodeId) -> NodeId {
+    match op {
+        ChainOp::Exp(_) => build_call(m, "log", &[acc]),
+        ChainOp::Log(_) => build_call(m, "exp", &[acc]),
+        ChainOp::Neg => build_call(m, "neg", &[acc]),
+        ChainOp::MulByLit(c) => build_call(m, "divide", &[acc, *c]),
+        ChainOp::DivByLit(c) => build_call(m, "mul", &[acc, *c]),
+        ChainOp::AddLit(c) => build_call(m, "sub", &[acc, *c]),
+        ChainOp::SubLit(c) => build_call(m, "add", &[acc, *c]),
+        ChainOp::RSubLit(c) => build_call(m, "sub", &[*c, acc]),
+    }
+}
+
+/// `op`'s LOCAL forward log-derivative at its partial-forward input, or `None`
+/// when it is identically zero (`neg` / affine shift). The non-constant terms
+/// (`exp`/`log`) reuse the partial-forward sub-expression node directly — it is
+/// already the forward composition of the inner ops, expressed in the input
+/// placeholder, which is exactly the point `gᵢ`'s derivative is evaluated at.
+fn local_logvol(m: &mut Module, op: &ChainOp) -> Option<NodeId> {
+    match op {
+        // log|d/dz eᶻ| = z, evaluated at the partial-forward point (= the node).
+        ChainOp::Exp(z) => Some(*z),
+        // log|d/dz ln z| = −log z.
+        ChainOp::Log(z) => {
+            let logz = build_call(m, "log", &[*z]);
+            Some(build_call(m, "neg", &[logz]))
+        }
+        // log|d/dz (c·z)| = log|c|.
+        ChainOp::MulByLit(c) => {
+            let absc = build_call(m, "abs", &[*c]);
+            Some(build_call(m, "log", &[absc]))
+        }
+        // log|d/dz (z/c)| = −log|c|.
+        ChainOp::DivByLit(c) => {
+            let absc = build_call(m, "abs", &[*c]);
+            let logabs = build_call(m, "log", &[absc]);
+            Some(build_call(m, "neg", &[logabs]))
+        }
+        // Derivative ±1 ⇒ log|g'| = 0: contributes nothing to the sum.
+        ChainOp::Neg | ChainOp::AddLit(_) | ChainOp::SubLit(_) | ChainOp::RSubLit(_) => None,
+    }
 }
 
 /// `pow(_, k)`: f_inv `x -> pow(x, 1/k)`; logvol `x -> add(log(abs(k)), mul(k-1, log(x)))`.
@@ -134,82 +425,58 @@ fn derive_pow(
     Ok(Some(Bijection { f_inv, logvol }))
 }
 
-/// Recognise the forward op denoted by a `pushfwd`'s forward argument `f`:
-/// a bare builtin ref/const (`pushfwd(exp, M)`), or a one-op lambda whose body
-/// is exactly one registry builtin applied to the single input placeholder
-/// (`pushfwd(x -> exp(x), M)`). Anything else → `None`.
-fn recognise_forward(m: &Module, f: NodeId) -> Option<Forward> {
-    // Resolve one level of self-ref (`pushfwd(g, M)` where `g = exp`).
-    let (f, _) = resolve_ref_one(m, f);
+/// Recognise the surface shape of a `pushfwd`'s (ref-resolved) forward argument:
+/// a bare builtin value (`Const`), or a one-input `functionof` lambda `x -> body`
+/// whose boundary is exactly one `%local` placeholder.
+fn recognise(m: &Module, f: NodeId) -> Recognized {
     match m.node(f) {
-        // (a) bare builtin used as a value (`exp` / `log` / `neg`).
-        Node::Const(sym) => {
-            let name = m.resolve(*sym).to_string();
-            builtin_forward(&name, None)
+        Node::Const(sym) => Recognized::BareConst(m.resolve(*sym).to_string()),
+        Node::Call(c) => {
+            if let CallHead::Builtin(sym) = c.head {
+                if m.resolve(sym) == "functionof" && c.args.len() == 1 {
+                    if let Some(Inputs::Spec(entries)) = &c.inputs {
+                        if entries.len() == 1 && entries[0].1.ns == RefNs::Local {
+                            return Recognized::Lambda {
+                                body: c.args[0],
+                                input_name: entries[0].0,
+                                ph: entries[0].1.name,
+                            };
+                        }
+                    }
+                }
+            }
+            Recognized::Unrecognized
         }
-        // (b) one-op lambda `x -> op(x)` / `x -> pow(x, k)`.
-        Node::Call(c) => recognise_lambda(m, c),
-        _ => None,
+        _ => Recognized::Unrecognized,
     }
 }
 
-/// Recognise a single-op `functionof` lambda `x -> op(x)` (or `x -> pow(x, k)`),
-/// where `op(...)`'s first argument is exactly the lambda's placeholder.
-fn recognise_lambda(m: &Module, c: &Call) -> Option<Forward> {
+/// If `body` is exactly `pow(<ph>, k)` — a single top-level `pow` applied to the
+/// input placeholder — return its exponent node `k`; otherwise `None`.
+fn single_pow(m: &Module, body: NodeId, ph: Symbol) -> Option<NodeId> {
+    let Node::Call(c) = m.node(body) else {
+        return None;
+    };
     let CallHead::Builtin(sym) = c.head else {
         return None;
     };
-    if m.resolve(sym) != "functionof" || c.args.len() != 1 {
+    if m.resolve(sym) != "pow" || c.args.len() != 2 {
         return None;
     }
-    let ph = single_placeholder(c)?;
-    let Node::Call(body) = m.node(c.args[0]) else {
-        return None;
-    };
-    let CallHead::Builtin(op) = body.head else {
-        return None;
-    };
-    let op_name = m.resolve(op).to_string();
-    // The op's first positional argument must be the placeholder itself.
-    let first = *body.args.first()?;
-    if !is_placeholder_ref(m, first, ph) {
+    if !is_placeholder_ref(m, c.args[0], ph) {
         return None;
     }
-    match op_name.as_str() {
-        "exp" | "log" | "neg" if body.args.len() == 1 => builtin_forward(&op_name, None),
-        "pow" if body.args.len() == 2 => Some(Forward::Pow(body.args[1])),
-        _ => None,
-    }
-}
-
-/// Map a registry builtin name to its [`Forward`]. `pow` needs an exponent, so a
-/// bare `pow` (no exponent) is not a recognised invertible form.
-fn builtin_forward(name: &str, pow_exp: Option<NodeId>) -> Option<Forward> {
-    match name {
-        "exp" => Some(Forward::Exp),
-        "log" => Some(Forward::Log),
-        "neg" => Some(Forward::Neg),
-        "pow" => pow_exp.map(Forward::Pow),
-        _ => None,
-    }
-}
-
-/// The placeholder name of a single-input `functionof` `Spec` boundary
-/// (`((x (%ref %local _x_)))` → `_x_`), or `None` if not exactly one `%local`
-/// input.
-fn single_placeholder(c: &Call) -> Option<Symbol> {
-    match &c.inputs {
-        Some(Inputs::Spec(entries)) if entries.len() == 1 => {
-            let (_input_name, r) = &entries[0];
-            (r.ns == RefNs::Local).then_some(r.name)
-        }
-        _ => None,
-    }
+    Some(c.args[1])
 }
 
 /// Is `id` the placeholder ref `(%ref %local <ph>)`?
 fn is_placeholder_ref(m: &Module, id: NodeId, ph: Symbol) -> bool {
     matches!(m.node(id), Node::Ref(Ref { ns: RefNs::Local, name }) if *name == ph)
+}
+
+/// Is `id` a numeric literal (an affine-operand `c`)?
+fn is_lit(m: &Module, id: NodeId) -> bool {
+    literal_real(m, id).is_some()
 }
 
 /// A bare builtin symbol node (`exp` / `log` / `neg`) usable directly as `f_inv`.
@@ -218,25 +485,17 @@ fn bare_builtin(m: &mut Module, name: &str) -> NodeId {
     m.alloc(Node::Const(sym))
 }
 
-/// Build a single-input `functionof` lambda `x -> <body>`, spelled exactly as the
-/// parser emits `x -> …` (input name `x`, placeholder `_x_`). `body(m, ph)`
-/// receives the placeholder node id.
-fn lambda(m: &mut Module, body: impl FnOnce(&mut Module, NodeId) -> NodeId) -> NodeId {
+/// Build a `functionof` lambda `<input_name> -> <body>` with the given boundary
+/// (input name + `%local` placeholder symbol).
+fn wrap_functionof(m: &mut Module, input_name: Symbol, ph: Symbol, body: NodeId) -> NodeId {
     let functionof = m.intern("functionof");
-    let x = m.intern("x");
-    let ph = m.intern("_x_");
-    let ph_node = m.alloc(Node::Ref(Ref {
-        ns: RefNs::Local,
-        name: ph,
-    }));
-    let body_node = body(m, ph_node);
     m.alloc(Node::Call(Call {
         head: CallHead::Builtin(functionof),
-        args: vec![body_node].into(),
+        args: vec![body].into(),
         named: Vec::<NamedArg>::new().into(),
         inputs: Some(Inputs::Spec(
             vec![(
-                x,
+                input_name,
                 Ref {
                     ns: RefNs::Local,
                     name: ph,
@@ -245,6 +504,20 @@ fn lambda(m: &mut Module, body: impl FnOnce(&mut Module, NodeId) -> NodeId) -> N
             .into(),
         )),
     }))
+}
+
+/// Build a single-input `functionof` lambda `x -> <body>`, spelled exactly as the
+/// parser emits `x -> …` (input name `x`, placeholder `_x_`). `body(m, ph)`
+/// receives the placeholder node id.
+fn lambda(m: &mut Module, body: impl FnOnce(&mut Module, NodeId) -> NodeId) -> NodeId {
+    let x = m.intern("x");
+    let ph = m.intern("_x_");
+    let ph_node = m.alloc(Node::Ref(Ref {
+        ns: RefNs::Local,
+        name: ph,
+    }));
+    let body_node = body(m, ph_node);
+    wrap_functionof(m, x, ph, body_node)
 }
 
 /// The identity lambda `x -> x` (body IS the placeholder) — the forward
