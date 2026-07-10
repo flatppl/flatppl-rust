@@ -144,20 +144,13 @@ pub(crate) fn lower_logdensityof(
         }
         (q.args[0], q.args[1])
     };
-    // Cross-module *direct query target*. When arg1 is — or resolves via one
-    // `(%ref self …)` hop to — a `(%ref <alias> member)` into a loaded submodule
-    // (a submodule likelihood handle `m.L` or a bare measure handle `m.d`), graft
-    // the referenced subtree into the host so the dispatch below runs on a
-    // self-contained node. Spec §04 "Reification and module scope": a
-    // measure/likelihood handle crosses module boundaries freely
-    // (`lawof(draw(m)) ≡ m`), so this SHOULD lower. Reuses the SAME graft path the
-    // likelihood-KERNEL case uses ([`graft_cross_module_target`] →
-    // `crossmodule::resolve_module_ref` + `graft_subtree`), preserving the
-    // `load_module` `%assign` load-time substitution and the namespace-collision
-    // safety. A same-module arg1 is `None` and left unchanged; dispatch then
-    // continues on the GRAFTED node (a `likelihoodof` / `joint_likelihood` /
-    // measure, each handled by the existing paths below).
-    let arg1 = graft_cross_module_target(m, arg1, bundle)?.unwrap_or(arg1);
+    // A cross-module *direct query target* (a submodule likelihood handle
+    // `m.L` or a bare measure handle `m.d`) is already grafted to a local host
+    // node by the time this runs: the driver's `apply_rule` calls
+    // [`graft_query_target`] on the SAME target first and only reaches this
+    // function once that returned `Ok(None)` (same-module target — nothing to
+    // graft), so `arg1` here is always already local. No graft happens in
+    // this function.
     // Likelihood query: arg2 is the PARAMETER point θ; the variate is the
     // observed data baked into the likelihood (§06 "densityof(likelihoodof(K,obs),θ)").
     // Both `likelihoodof` and `joint_likelihood` are likelihood-layer ops (each
@@ -311,7 +304,10 @@ fn resolve_cross_module_kernel(
 /// * a likelihood KERNEL argument (`likelihoodof(m.kernel, obs)`) via
 ///   [`resolve_cross_module_kernel`], and
 /// * a direct `logdensityof` query TARGET (`logdensityof(m.L, θ)` /
-///   `logdensityof(m.d, v)`) via [`lower_logdensityof`].
+///   `logdensityof(m.d, v)`) via [`graft_query_target`], called by the driver
+///   BEFORE [`lower_logdensityof`] ever runs on that query — so by the time
+///   `lower_logdensityof` sees a query, its target is already local and does
+///   no grafting of its own.
 ///
 /// It does NOT reimplement grafting — it calls `crossmodule::resolve_module_ref`
 /// then `graft_subtree` — so the `load_module` `%assign` load-time substitution

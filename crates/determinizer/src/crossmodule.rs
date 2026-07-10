@@ -151,9 +151,12 @@ struct GraftCtx<'a> {
 ///   namespaces, so reusing the host binding would score against the wrong value.
 ///
 /// Placeholder (`%local`) refs and boundary-input entries are re-interned in
-/// place; a nested cross-module (`%ref <alias> …`) ref is re-interned but left
-/// unresolved (there is no bundle here — an unresolved nested module ref simply
-/// refuses downstream, never mislowers).
+/// place; a nested cross-module (`%ref <alias> …`) ref — i.e. the submodule
+/// being grafted itself contains a `load_module` and the grafted body
+/// references that nested alias — is **refused outright** at the graft site
+/// (there is no bundle here to resolve it against, and re-interning the alias
+/// as-is risks it silently colliding with an unrelated same-named host
+/// binding instead of dangling — see the `RefNs::Module` arm of `graft_ref`).
 pub(crate) fn graft_subtree(
     host: &mut Module,
     resolved: &ResolvedRef<'_>,
@@ -253,6 +256,11 @@ fn graft_node(
 /// the submodule binding it names so the host is self-contained (refusing on an
 /// unrelated-host-binding collision). `%assign`-substituted names are handled by
 /// the caller ([`graft_node`]) before this is reached.
+///
+/// A `Module`-namespace ref is a NESTED cross-module reference: the submodule
+/// being grafted itself has its own `load_module` and the grafted body names
+/// that nested alias. This is refused outright (see the `RefNs::Module` arm
+/// below) rather than re-interned.
 fn graft_ref(
     host: &mut Module,
     src: &Module,
@@ -273,11 +281,23 @@ fn graft_ref(
             })
         }
         RefNs::Module(alias) => {
-            let halias = host.intern(src.resolve(alias));
-            Ok(Ref {
-                ns: RefNs::Module(halias),
-                name: hname,
-            })
+            // Re-interning `alias` as-is would produce a host-local `Module`
+            // ref that LOOKS resolvable — but there is no bundle here to
+            // resolve it against, and the re-interned alias string can
+            // coincidentally match an unrelated host binding of the same
+            // name, in which case the caller's later re-resolution attempt
+            // would silently score against that WRONG (unrelated) submodule
+            // instead of the one this nested `load_module` actually names, or
+            // (absent such a collision) dangle with `is_flatpdl` never
+            // checking ref liveness. Neither outcome is refuse-don't-mislower,
+            // so fail closed here instead: refuse rather than risk mislowering
+            // a two-level-nested cross-module reference we cannot resolve.
+            let name = src.resolve(alias);
+            Err(format!(
+                "grafting a cross-module ref that itself references another loaded module \
+                 (nested load_module, alias `{name}`) is not supported; refuse rather than \
+                 mislower"
+            ))
         }
     }
 }

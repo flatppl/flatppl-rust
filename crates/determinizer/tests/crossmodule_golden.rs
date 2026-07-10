@@ -418,3 +418,70 @@ lp = logdensityof(L, record(center = 0.0))";
             .unwrap_or_default()
     );
 }
+
+/// Refuse-don't-mislower for a TWO-LEVEL nested cross-module ref: the host
+/// loads `mid` (`middle.flatppl`), whose queried handle `d` is itself just a
+/// reference `nested.val` into a SECOND loaded module (`middle.flatppl`'s own
+/// `nested = load_module("leaf.flatppl")`). The host's bundle is flat (keyed
+/// by path string) and has no entry for `leaf.flatppl` at all — it cannot see
+/// past `middle.flatppl`'s own dependency — so the nested `nested.val` ref
+/// can never be resolved against the submodule it actually names.
+///
+/// Critically, the host ALSO happens to define its own, wholly UNRELATED
+/// binding named `nested` (`load_module("unrelated.flatppl")`). Before the
+/// fix, grafting `mid.d` re-interned the nested ref's alias string `nested`
+/// as-is; re-interning happened to collide with the host's own `nested`
+/// binding, so the next driver iteration silently resolved the grafted ref
+/// against `unrelated.flatppl`'s `val = Normal(mu = 999.0, …)` instead of
+/// `leaf.flatppl`'s `val = Normal(mu = 0.0, …)` — a wrong density with no
+/// diagnostic at all (`determinize_with` returned `Ok`). The fix refuses as
+/// soon as the graft walk meets the nested `RefNs::Module` ref, before any
+/// such collision can bite.
+#[test]
+fn cross_module_nested_load_module_ref_refuses() {
+    let leaf = "\
+flatppl_compat = \"0.1\"
+val = Normal(mu = 0.0, sigma = 1.0)";
+    let unrelated = "\
+flatppl_compat = \"0.1\"
+val = Normal(mu = 999.0, sigma = 1.0)";
+    let middle = "\
+flatppl_compat = \"0.1\"
+nested = load_module(\"leaf.flatppl\")
+d = nested.val";
+    let model = "\
+flatppl_compat = \"0.1\"
+nested = load_module(\"unrelated.flatppl\")
+mid = load_module(\"middle.flatppl\")
+lp = logdensityof(mid.d, 0.5)";
+
+    let mut leaf_mod = parse(leaf);
+    let _ = flatppl_infer::infer(&mut leaf_mod);
+    let mut unrelated_mod = parse(unrelated);
+    let _ = flatppl_infer::infer(&mut unrelated_mod);
+    let mut middle_mod = parse(middle);
+    let _ = flatppl_infer::infer(&mut middle_mod);
+
+    // The bundle is flat and keyed by path: it carries `middle.flatppl` and
+    // `unrelated.flatppl` (both direct host dependencies) but deliberately NOT
+    // `leaf.flatppl` — `middle.flatppl`'s own nested dependency is invisible
+    // to the host's bundle, exactly as it would be from a real loader that
+    // only resolves one `load_module` hop per bundle.
+    let mut bundle = ModuleBundle::new();
+    bundle.insert("middle.flatppl", Arc::new(middle_mod));
+    bundle.insert("unrelated.flatppl", Arc::new(unrelated_mod));
+
+    let mut mmod = parse(model);
+    let _ = flatppl_infer::infer_module(&mut mmod, &bundle, flatppl_infer::Level::Shape);
+
+    let result = determinize_with(&mmod, &bundle);
+    assert!(
+        result.is_err(),
+        "a queried handle whose grafted body itself references a SECOND loaded module \
+         (a 2-level-nested load_module) must refuse, never silently lower against an \
+         unrelated same-named host binding and never panic; got:\n{}",
+        result
+            .map(|l| flatppl_flatpir::write(&l))
+            .unwrap_or_default()
+    );
+}

@@ -145,6 +145,13 @@ pub(crate) fn substitute_ref(m: &mut Module, root: NodeId, name: Symbol, new_id:
 ///   i-th `%specinputs` entry (the `mk(0.0)` idiom). Arity must match the
 ///   input count exactly; a mismatch refuses (`None`) rather than guessing.
 ///
+/// Note the record form binds BY FIELD NAME even when the kernel has exactly
+/// one boundary input: `k(record(mu = 1.5))` looks up the input's own name as
+/// a field of the record — it never binds the record as a whole positionally
+/// to that single input. A field-name mismatch (the record lacks a field
+/// matching the input's name) cleanly refuses (`None`) via `record_field`'s
+/// `?`, rather than falling back to binding the whole record positionally.
+///
 /// An `%autoinputs` (keyword-only, boundary-less) reification is out of
 /// scope here — `resolve_reified` already refuses it, since its traced input
 /// order is inference metadata this module doesn't have access to.
