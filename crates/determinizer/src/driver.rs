@@ -200,6 +200,11 @@ fn is_measure_layer(m: &Module, id: NodeId) -> bool {
 /// node (β-law replaces a `lawof(draw ?m)` with a reference to `?m`'s node —
 /// zero new nodes since we reuse the existing `?m` NodeId). Each rewrite
 /// strictly lowers the count of measure-layer nodes, guaranteeing termination.
+/// The cross-module-graft branch (`graft_query_target`) is the exception — it
+/// can add many nodes and leaves the `logdensityof` in place for the next
+/// iteration — and instead relies on the progress invariant documented at
+/// `graft_query_target`: the query target goes from a module-ref to a local
+/// node, so a given query can graft at most once.
 fn apply_rule(
     m: &mut Module,
     bid: BindingId,

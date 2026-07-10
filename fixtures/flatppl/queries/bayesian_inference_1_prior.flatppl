@@ -1,0 +1,4 @@
+flatppl_compat = "0.1"
+# Keyword/record joint prior across a module boundary: prior = joint(theta1=…, theta2=…).
+m = load_module("../bayesian_inference/bayesian_inference_1.flatppl")
+lp = logdensityof(m.prior, record(theta1 = 0.5, theta2 = 1.0))

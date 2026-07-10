@@ -1,0 +1,5 @@
+flatppl_compat = "0.1"
+# Positional-constructor normalize (tau = normalize(truncate(Cauchy(0, 5), …)))
+# + positional Normal(0, 5) across a module boundary.
+m = load_module("../eight-schools.flatppl")
+lp = logdensityof(m.prior, record(mu = 0.0, tau = 1.0, theta = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]))

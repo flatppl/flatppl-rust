@@ -1,0 +1,5 @@
+flatppl_compat = "0.1"
+# Cross-module likelihood handle: logdensityof(m.L, θ) resolves m.L across the
+# load_module boundary, grafts the submodule kernel, and lowers (iid unrolled).
+m = load_module("../bayesian_inference/bayesian_inference_1.flatppl")
+lp = logdensityof(m.L, record(theta1 = 0.5, theta2 = 1.0))
