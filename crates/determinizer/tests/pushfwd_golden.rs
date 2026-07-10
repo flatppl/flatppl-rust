@@ -90,3 +90,74 @@ fn pushfwd_noninvertible_lambda_refuses() {
     .expect_err("non-injective must refuse");
     assert!(format!("{e:?}").contains("refuse"), "got: {e:?}");
 }
+
+#[test]
+fn pushfwd_zero_scale_affine_refuses() {
+    // x -> 0.0*x + 1.0 collapses to the constant 1.0 — not injective, so the
+    // literal-zero "scale" must refuse rather than synthesize a degenerate
+    // f_inv = divide(acc, 0.0) / logvol = log(abs(0.0)) = -inf.
+    let e = determinize(&parse_infer(
+        "d = pushfwd(x -> 0.0 * x + 1.0, Normal(mu = 0.0, sigma = 1.0))\nlp = logdensityof(d, 0.5)",
+    ))
+    .expect_err("literal-zero mul scale must refuse");
+    assert!(format!("{e:?}").contains("refuse"), "got: {e:?}");
+}
+
+#[test]
+fn pushfwd_zero_divisor_affine_refuses() {
+    // x -> x / 0.0 is undefined everywhere — the literal-zero divisor must
+    // refuse rather than synthesize f_inv = mul(acc, 0.0) / logvol = -inf.
+    let e = determinize(&parse_infer(
+        "d = pushfwd(x -> x / 0.0, Normal(mu = 0.0, sigma = 1.0))\nlp = logdensityof(d, 0.5)",
+    ))
+    .expect_err("literal-zero divide denominator must refuse");
+    assert!(format!("{e:?}").contains("refuse"), "got: {e:?}");
+}
+
+#[test]
+fn pushfwd_pow_in_composition_refuses() {
+    // pow nested inside a composition (not the single top-level op) has an
+    // unverifiable input domain — the chain walk unconditionally refuses it.
+    let e = determinize(&parse_infer(
+        "d = pushfwd(x -> exp(pow(x, 2.0)), Normal(mu = 0.0, sigma = 1.0))\nlp = logdensityof(d, 0.5)",
+    ))
+    .expect_err("pow inside a composition must refuse");
+    assert!(format!("{e:?}").contains("refuse"), "got: {e:?}");
+}
+
+#[test]
+fn pushfwd_divide_chain_lowers() {
+    // x -> x/2 : f_inv(y) = mul(y, 2.0) ; logvol = neg(log(abs(2.0))) = -log 2.
+    let p =
+        pir("d = pushfwd(x -> x / 2.0, Normal(mu = 0.0, sigma = 1.0))\nlp = logdensityof(d, 0.5)");
+    assert!(p.contains("builtin_logdensityof"), "got:\n{p}");
+    // Inverse is mul(y, 2.0):
+    assert!(
+        p.contains("(mul (%ref %local _x_) 2.0)"),
+        "divide inverse (* 2) present:\n{p}"
+    );
+    // logvol is neg(log(abs(2.0))) — the DivByLit sign (negative contribution);
+    // leaf substrings (the printer wedges `%meta` type annotations between ops):
+    assert!(
+        p.contains("(neg") && p.contains("(abs 2.0)"),
+        "logvol -log(2) present:\n{p}"
+    );
+}
+
+#[test]
+fn pushfwd_three_op_interior_exp_lowers() {
+    // x -> 2*exp(x) + 1 : f = 2e^x+1, f' = 2e^x, log|f'| = log 2 + x. The exp op
+    // is INTERIOR (not outermost) — locks that its local logvol is evaluated at
+    // its own partial-forward point (x), not a shallow/wrong depth.
+    let p = pir(
+        "d = pushfwd(x -> 2.0 * exp(x) + 1.0, Normal(mu = 0.0, sigma = 1.0))\nlp = logdensityof(d, 0.5)",
+    );
+    assert!(
+        p.contains("builtin_logdensityof") && p.contains("log"),
+        "got:\n{p}"
+    );
+    // Chain-rule logvol: exp's partial-forward point is the bare placeholder x
+    // (no other ops sit between exp and the input here), contributing the term
+    // `x`; the mul-by-2 contributes log|2| = log(abs(2)):
+    assert!(p.contains("(abs 2.0)"), "logvol log(2) term present:\n{p}");
+}

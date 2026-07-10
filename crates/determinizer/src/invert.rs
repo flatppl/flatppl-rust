@@ -48,9 +48,11 @@
 //! Refuse-don't-mislower: an UNRECOGNISED forward function returns `Ok(None)`
 //! (the caller refuses); a RECOGNISED-but-non-invertible shape returns `Err`
 //! (refuse) — a non-affine `mul`/`add`/`sub` (both operands non-literal, e.g.
-//! `x*x`, or both literal), a `divide` without a literal denominator, a `pow`
-//! inside a composition (its input domain is not verifiable here), or any other
-//! recognised builtin op. A wrong `(f_inv, logvol)` is never synthesised.
+//! `x*x`, or both literal), a `mul`/`divide` whose literal coefficient is
+//! ZERO (`0.0 * u` collapses to the constant 0; `u / 0.0` is undefined), a
+//! `divide` without a literal denominator, a `pow` inside a composition (its
+//! input domain is not verifiable here), or any other recognised builtin op.
+//! A wrong `(f_inv, logvol)` is never synthesised.
 //!
 //! Single-op `pow(_, k)` (`x -> pow(x, k)`) keeps its Task-1 domain-restricted
 //! derivation ([`derive_pow`]); a bare builtin value (`pushfwd(exp, M)`) keeps
@@ -276,26 +278,33 @@ fn classify(m: &Module, cur: NodeId) -> Result<Option<(ChainOp, NodeId)>, Refuse
         "exp" if args.len() == 1 => Ok(Some((ChainOp::Exp(args[0]), args[0]))),
         "log" if args.len() == 1 => Ok(Some((ChainOp::Log(args[0]), args[0]))),
         "neg" if args.len() == 1 => Ok(Some((ChainOp::Neg, args[0]))),
-        // Affine multiply: exactly one literal operand (the scale `c`).
-        "mul" if args.len() == 2 => match (is_lit(m, args[0]), is_lit(m, args[1])) {
-            (true, false) => Ok(Some((ChainOp::MulByLit(args[0]), args[1]))),
-            (false, true) => Ok(Some((ChainOp::MulByLit(args[1]), args[0]))),
-            _ => Err(refuse(
-                cur,
-                m,
-                "mul with two non-literal (or two literal) operands is not an invertible \
-                 affine map — refuse rather than mislower",
-            )),
-        },
+        // Affine multiply: exactly one literal operand (the scale `c`), and that
+        // literal must be nonzero — `0.0 * u` collapses the forward map to the
+        // constant 0, which is not injective (refuse rather than synthesize a
+        // degenerate `f_inv = divide(acc, 0.0)`).
+        "mul" if args.len() == 2 => {
+            match (is_nonzero_lit(m, args[0]), is_nonzero_lit(m, args[1])) {
+                (true, false) => Ok(Some((ChainOp::MulByLit(args[0]), args[1]))),
+                (false, true) => Ok(Some((ChainOp::MulByLit(args[1]), args[0]))),
+                _ => Err(refuse(
+                    cur,
+                    m,
+                    "mul with two non-literal (or two literal, or a literal-zero scale) \
+                     operands is not an invertible affine map — refuse rather than mislower",
+                )),
+            }
+        }
         // Affine divide: only `u / c` (literal denominator) is affine; `c / u`
-        // (reciprocal) is out of the grammar.
-        "divide" if args.len() == 2 => match (is_lit(m, args[0]), is_lit(m, args[1])) {
+        // (reciprocal) is out of the grammar. The literal denominator must also
+        // be nonzero — `u / 0.0` is undefined everywhere (refuse rather than
+        // synthesize a degenerate `f_inv = mul(acc, 0.0)`).
+        "divide" if args.len() == 2 => match (is_lit(m, args[0]), is_nonzero_lit(m, args[1])) {
             (false, true) => Ok(Some((ChainOp::DivByLit(args[1]), args[0]))),
             _ => Err(refuse(
                 cur,
                 m,
-                "divide is an invertible affine map only with a literal denominator (u / c) \
-                 — refuse rather than mislower",
+                "divide is an invertible affine map only with a literal, nonzero denominator \
+                 (u / c) — refuse rather than mislower",
             )),
         },
         // Affine add: exactly one literal operand (the shift `c`).
@@ -477,6 +486,16 @@ fn is_placeholder_ref(m: &Module, id: NodeId, ph: Symbol) -> bool {
 /// Is `id` a numeric literal (an affine-operand `c`)?
 fn is_lit(m: &Module, id: NodeId) -> bool {
     literal_real(m, id).is_some()
+}
+
+/// Is `id` a numeric literal that is also nonzero (an affine `mul`/`divide`
+/// coefficient `c`)? `c != 0.0` also rejects `-0.0` — in Rust `f64`,
+/// `-0.0 == 0.0`, so a literal-zero-with-negative-sign is caught too. A
+/// literal-zero scale/divisor is not a Task-1 recognised invertible affine
+/// map: `mul(0.0, u)` collapses to the constant 0 (not injective) and
+/// `divide(u, 0.0)` is undefined everywhere.
+fn is_nonzero_lit(m: &Module, id: NodeId) -> bool {
+    literal_real(m, id).is_some_and(|c| c != 0.0)
 }
 
 /// A bare builtin symbol node (`exp` / `log` / `neg`) usable directly as `f_inv`.
