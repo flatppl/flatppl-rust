@@ -63,6 +63,26 @@
 //! summed over the vector axes). See [`derive_matrix_affine`] for the MvNormal
 //! change-of-variables cross-check.
 //!
+//! ## Multivariate elementwise (vector variate) — diagonal Jacobian
+//!
+//! Over a VECTOR variate, a forward body `broadcast(g, x)` (a single scalar-
+//! invertible `g` applied to every cell of `x`; spec §06 case 1, the user-requested
+//! elementwise extension) has a DIAGONAL Jacobian `diag(g'(x₁), …, g'(xₙ))`, so its
+//! log-det is the SUM of the per-cell scalar forward log-derivatives. We derive
+//! `(g_inv, g_logvol)` by RECURSING [`derive_bijection`] on the scalar `g` over the
+//! vector's ELEMENT domain (`g` then takes the bare-builtin / scalar-chain path —
+//! a scalar domain is not a vector, so the recursion never re-enters this arm) and
+//! wrap:
+//! * **`f_inv(y) = broadcast(g_inv, y)`** — apply the scalar inverse cell-wise;
+//! * **`logvol(x) = sum(broadcast(g_logvol, x))`** — `Σᵢ log|g'(xᵢ)|`, the diagonal
+//!   log-det (§07 `sum` reduces a real vector to a scalar).
+//!
+//! A COUPLED broadcast mixing two or more variate slots (`broadcast(add, x, x)`,
+//! `broadcast(mul, x, x)`) is refused (Err) — its Jacobian is not diagonal in the
+//! single-variate sense; a non-`broadcast(g, x)` vector body returns `Ok(None)`
+//! (the caller refuses). See [`derive_elementwise`] for the LogNormal-vector
+//! cross-check.
+//!
 //! Refuse-don't-mislower: an UNRECOGNISED forward function returns `Ok(None)`
 //! (the caller refuses); a RECOGNISED-but-non-invertible shape returns `Err`
 //! (refuse) — a non-affine `mul`/`add`/`sub` (both operands non-literal, e.g.
@@ -77,7 +97,7 @@
 //! its Task-1 single-op form ([`bare_bijection`], byte-equality-pinned against the
 //! explicit `bijection(exp, log, x -> x)`).
 
-use crate::density::{build_call, fold_add, refuse, resolve_ref_one};
+use crate::density::{build_call, expect_builtin_call, fold_add, refuse, resolve_ref_one};
 use crate::refuse::RefuseError;
 use flatppl_core::{
     Call, CallHead, Dim, Inputs, Module, NamedArg, Node, NodeId, Ref, RefNs, Scalar, Symbol, Type,
@@ -157,20 +177,32 @@ pub(crate) fn derive_bijection(
             // domain being a vector (1-D array) — this is the MvNormal construction
             // (§08 MvNormal), distinct from the scalar chain below.
             if domain_is_vector(domain) {
-                return match derive_matrix_affine(m, body, ph)? {
-                    Some(bij) => Ok(Some(bij)),
-                    // A vector-variate forward body that is not a recognised
-                    // matrix-affine map: refuse rather than fall through to the
-                    // scalar chain, whose per-op log-volume is not summed over the
-                    // vector's axes and would silently mislower (a scalar-scale
-                    // `k·x` over a vector has log-volume `n·log|k|`, not `log|k|`).
-                    None => Err(refuse(
-                        f,
-                        m,
-                        "forward map over a vector variate is not a recognised matrix-affine \
-                         map (mu + L * x) — refuse rather than mislower",
-                    )),
-                };
+                // Matrix-vector affine map `mu + L * x` (the MvNormal construction).
+                if let Some(bij) = derive_matrix_affine(m, body, ph)? {
+                    return Ok(Some(bij));
+                }
+                // Multivariate ELEMENTWISE unary map `broadcast(g, x)` with `g`
+                // scalar-invertible: a DIAGONAL Jacobian, so `logvol` is the SUM of
+                // the per-cell scalar forward log-derivatives. `g` is derived by
+                // recursing over the vector's ELEMENT domain (scalar path), then
+                // wrapped in `broadcast` + `sum` (§06 case 1 elementwise extension;
+                // see [`derive_elementwise`]).
+                let elem_domain = vector_elem_domain(domain);
+                if let Some(bij) = derive_elementwise(m, body, ph, &elem_domain)? {
+                    return Ok(Some(bij));
+                }
+                // A vector-variate forward body that is neither a recognised
+                // matrix-affine nor elementwise map: refuse rather than fall through
+                // to the scalar chain, whose per-op log-volume is not summed over the
+                // vector's axes and would silently mislower (a scalar-scale `k·x` over
+                // a vector has log-volume `n·log|k|`, not `log|k|`).
+                return Err(refuse(
+                    f,
+                    m,
+                    "forward map over a vector variate is not a recognised matrix-affine \
+                     (mu + L * x) or elementwise (broadcast(g, x)) map — refuse rather \
+                     than mislower",
+                ));
             }
             // Single-op `pow(x, k)` keeps its Task-1 domain-restricted derivation;
             // a `pow` anywhere else in a chain is refused by the chain walk (its
@@ -553,6 +585,111 @@ fn derive_matrix_affine(
     // logvol(_) = logabsdet(L) — constant; the argument is ignored.
     let logvol = lambda(m, |m, _y| build_call(m, "logabsdet", &[l]));
     Ok(Some(Bijection { f_inv, logvol }))
+}
+
+/// Derive `(f_inv, logvol)` for a multivariate ELEMENTWISE unary forward body
+/// `broadcast(g, x)` over a VECTOR variate — a single scalar-invertible `g`
+/// applied to EVERY cell of `x` (spec §06 case 1, the user-requested elementwise
+/// extension). The forward Jacobian is DIAGONAL (`J_f = diag(g'(x₁), …, g'(xₙ))`),
+/// so its log-det is the SUM of the per-cell scalar forward log-derivatives:
+///
+/// * **`f_inv(y) = broadcast(g_inv, y)`** — apply `g`'s scalar inverse cell-wise.
+/// * **`logvol(x) = sum(broadcast(g_logvol, x))`** — `log|det J_f| = Σᵢ log|g'(xᵢ)|`
+///   (§07 `sum` reduces a real vector to a scalar; `broadcast` lifts the scalar
+///   `g_logvol` over the cells).
+///
+/// `(g_inv, g_logvol)` are obtained by RECURSING [`derive_bijection`] on the
+/// scalar operator `g` over the vector's ELEMENT `domain` — `g` then takes the
+/// bare-builtin / scalar-chain path (a scalar domain is not a vector, so the
+/// recursion never re-enters this arm), reusing every scalar inversion verbatim.
+///
+/// LogNormal-vector cross-check: for `g = exp` over an n-vector of iid `N(0,1)`,
+/// `g_inv = log`, `g_logvol = identity` (`log|d/dx eˣ| = x`). The caller emits
+/// `logdensityof(iid N(0,1), broadcast(log, v)) − sum(broadcast(id, broadcast(log,
+/// v)))` = `Σᵢ [logN(0,1)(log vᵢ) − log vᵢ]` — exactly n independent LogNormals
+/// (the standard-normal density at `log vᵢ` minus the per-cell `log vᵢ`
+/// change-of-variables term, summed by the diagonal log-det). A logvol that failed
+/// to `sum` (a vector, not the scalar log-det) or summed at the wrong point would
+/// be a silently wrong density; `sum(broadcast(g_logvol, x))` is the correct
+/// forward log-volume.
+///
+/// * `Ok(Some(_))` — `body` is `broadcast(g, x)` with `x` the bare input
+///   placeholder and `g` scalar-invertible.
+/// * `Ok(None)` — the arm does not apply (not a `broadcast`, a keyword-arg
+///   broadcast, a single operand that is not the bare placeholder, or `g` is not a
+///   recognised scalar map): the caller refuses via the vector guard.
+/// * `Err(_)` — a COUPLED broadcast mixing TWO OR MORE variate slots
+///   (`broadcast(add, x, x)`, `broadcast(mul, x, x)`) whose Jacobian is not diagonal
+///   in the single-variate sense (refuse); or a recognised-but-non-invertible
+///   scalar `g` (the recursion's refuse, propagated).
+fn derive_elementwise(
+    m: &mut Module,
+    body: NodeId,
+    ph: Symbol,
+    elem_domain: &Type,
+) -> Result<Option<Bijection>, RefuseError> {
+    // Structural read (immutable) BEFORE the recursion / mutable builds. Only the
+    // pure positional `broadcast(g, operand…)` form is this arm; a keyword data-arg
+    // or a headless broadcast is not the recognised elementwise shape.
+    let operands: Vec<NodeId> = {
+        let Some(c) = expect_builtin_call(m, body, "broadcast") else {
+            return Ok(None); // not a broadcast — this arm does not apply
+        };
+        if !c.named.is_empty() || c.args.is_empty() {
+            return Ok(None);
+        }
+        c.args.to_vec()
+    };
+    let g = operands[0];
+    let data = &operands[1..];
+    // Coupled map: the input feeds two OR MORE distinct broadcast operand slots
+    // (`broadcast(add, x, x)` = x .+ x, `broadcast(mul, x, x)` = x .* x). Such a map
+    // is not a single-input elementwise unary — its Jacobian is not diagonal in the
+    // single-variate sense (a slot-coupling / squaring) — so refuse rather than
+    // synthesize a wrong per-cell diagonal log-det.
+    let variate_slots = data.iter().filter(|&&a| refs_placeholder(m, a, ph)).count();
+    if variate_slots >= 2 {
+        return Err(refuse(
+            body,
+            m,
+            "coupled multivariate broadcast (the input feeds two or more operand slots, \
+             e.g. broadcast(add, x, x) / broadcast(mul, x, x)) is not a single-input \
+             elementwise unary map with a diagonal Jacobian — refuse rather than mislower",
+        ));
+    }
+    // The recognised shape is exactly `broadcast(g, x)`: one operand that IS the
+    // bare input placeholder. Anything else (zero operands, a non-placeholder
+    // operand such as `broadcast(exp, add(x, 1.0))`, or a lone constant) is not this
+    // arm — Ok(None), the caller refuses.
+    if data.len() != 1 || !is_placeholder_ref(m, data[0], ph) {
+        return Ok(None);
+    }
+    // Recurse on the scalar operator `g` over the vector's element domain. `None` →
+    // arm does not apply; `Err` → propagate (a recognised-but-non-invertible `g`).
+    let Some(g_bij) = derive_bijection(m, g, elem_domain)? else {
+        return Ok(None);
+    };
+    let (g_inv, g_logvol) = (g_bij.f_inv, g_bij.logvol);
+    // f_inv(y) = broadcast(g_inv, y): apply the scalar inverse cell-wise.
+    let f_inv = lambda(m, |m, y| build_call(m, "broadcast", &[g_inv, y]));
+    // logvol(x) = sum(broadcast(g_logvol, x)): the diagonal Jacobian's log-det —
+    // Σᵢ log|g'(xᵢ)|.
+    let logvol = lambda(m, |m, x| {
+        let per_cell = build_call(m, "broadcast", &[g_logvol, x]);
+        build_call(m, "sum", &[per_cell])
+    });
+    Ok(Some(Bijection { f_inv, logvol }))
+}
+
+/// The element type of a vector (1-D array) `domain` — the SCALAR domain a
+/// `broadcast(g, x)`'s per-cell operator `g` acts on (recursed into by
+/// [`derive_elementwise`]). Falls back to `Any` for a non-array domain
+/// (unreachable here — guarded by [`domain_is_vector`]).
+fn vector_elem_domain(domain: &Type) -> Type {
+    match domain {
+        Type::Array { elem, .. } => (**elem).clone(),
+        _ => Type::Any,
+    }
 }
 
 /// The two summands of a plain `add(x, y)` or a `broadcast(add, x, y)` forward

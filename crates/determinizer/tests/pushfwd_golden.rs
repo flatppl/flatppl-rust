@@ -272,6 +272,44 @@ fn pushfwd_three_op_interior_exp_lowers() {
 }
 
 #[test]
+fn pushfwd_elementwise_exp_lowers() {
+    // broadcast(exp, _) over a 3-vector → elementwise LogNormal, DIAGONAL Jacobian.
+    // (The `_` hole is only legal inside `fn(…)`, so the forward is spelled
+    // `fn(broadcast(exp, _))` — a one-input lambda `arg1 -> broadcast(exp, arg1)`.)
+    // f_inv(y) = broadcast(log, y); logvol(x) = sum(broadcast(<id>, x)) = Σ xᵢ, so
+    // the pushfwd emits  logdensityof(iid N(0,1), broadcast(log, v))
+    //   − sum(broadcast(<id>, broadcast(log, v)))  = Σᵢ [logN(0,1)(log vᵢ) − log vᵢ]
+    // — n independent LogNormals (per-cell change-of-variables, log-det summed).
+    let p = pir(
+        "d = pushfwd(fn(broadcast(exp, _)), iid(Normal(mu = 0.0, sigma = 1.0), 3))\nlp = logdensityof(d, [0.5, 0.6, 0.7])",
+    );
+    assert!(
+        p.contains("builtin_logdensityof") && p.contains("sum"),
+        "got:\n{p}"
+    );
+    // The per-cell inverse is broadcast(log, y): the inner iid density is scored at
+    // it, so `broadcast log` must appear.
+    assert!(
+        p.contains("(broadcast log"),
+        "f_inv = broadcast(log, y) present:\n{p}"
+    );
+}
+
+#[test]
+fn pushfwd_elementwise_coupled_refuses() {
+    // A COUPLED broadcast mixing TWO variate slots — `broadcast(add, x, x)` (= x .+ x)
+    // — is a single-input lambda whose Jacobian is NOT diagonal in the single-variate
+    // sense (the input feeds two operand slots). Refuse rather than mislower with a
+    // per-cell diagonal log-det.
+    let e = determinize(&parse_infer(
+        "d = pushfwd(x -> broadcast(add, x, x), iid(Normal(mu = 0.0, sigma = 1.0), 3))\n\
+         lp = logdensityof(d, [0.5, 0.6, 0.7])",
+    ))
+    .expect_err("coupled 2-slot broadcast must refuse");
+    assert!(format!("{e:?}").contains("refuse"), "got: {e:?}");
+}
+
+#[test]
 fn pushfwd_matrix_affine_non_square_refuses() {
     // A 2x3 bracket-literal L infers to the NESTED vec-of-vec matrix shape
     // (Array{shape:[2], elem: Array{shape:[3], elem: Real}}) — not the flat
