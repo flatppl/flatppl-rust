@@ -112,6 +112,141 @@ lp = logdensityof(L, record(center = 0.0))";
     );
 }
 
+/// GAP C — a cross-module ref that is ITSELF the direct `logdensityof` target: a
+/// submodule LIKELIHOOD handle `m.L`. The whole `likelihoodof(K, obs)` lives in
+/// the submodule; the host merely `load_module`s it and queries `logdensityof(m.L,
+/// θ)`. Spec §04 "Reification and module scope": a likelihood handle crosses
+/// module boundaries freely, so this SHOULD lower. Before the fix the bare
+/// `(%ref helpers L)` target refused ("primitive measure must be a built-in
+/// constructor call"); now the entry grafts the referenced likelihood subtree and
+/// dispatches on the grafted node through the existing likelihood path.
+///
+/// Mirrors [`cross_module_likelihood_lowers`], but the cross-module ref is the
+/// TARGET (`logdensityof(helpers.L, …)`), not a kernel inside a host-built
+/// `likelihoodof`. Same `load_module("helpers.flatppl", center = a)` %assign, so
+/// θ names host `a` and the value `a = 0.0` inlines into the distribution `mu`.
+#[test]
+fn cross_module_likelihood_handle_lowers() {
+    let helpers = "\
+flatppl_compat = \"0.1\"
+center = elementof(reals)
+input_data = 2.5
+L = likelihoodof(functionof(Normal(mu = center, sigma = 1.0), center = center), input_data)";
+    let model = "\
+flatppl_compat = \"0.1\"
+a = elementof(reals)
+helpers = load_module(\"helpers.flatppl\", center = a)
+lp = logdensityof(helpers.L, record(a = 0.0))";
+
+    let mut hmod = parse(helpers);
+    let _ = flatppl_infer::infer(&mut hmod);
+    let mut bundle = ModuleBundle::new();
+    bundle.insert("helpers.flatppl", Arc::new(hmod));
+
+    let mut mmod = parse(model);
+    let _ = flatppl_infer::infer_module(&mut mmod, &bundle, flatppl_infer::Level::Shape);
+
+    let lowered = determinize_with(&mmod, &bundle)
+        .expect("cross-module likelihood HANDLE target must lower, not refuse");
+    let pir = flatppl_flatpir::write(&lowered);
+    assert!(
+        pir.contains("builtin_logdensityof"),
+        "cross-module likelihood-handle target did not lower to builtin_logdensityof; got:\n{pir}"
+    );
+    // θ field `a = 0.0` inlines into the distribution's `mu` (honoring the
+    // load-time `center = a` substitution): a fully-determined kernel.
+    assert!(
+        pir.contains("(%field mu 0.0)"),
+        "θ value did not inline into the distribution `mu`; got:\n{pir}"
+    );
+    // The observed data baked into the submodule likelihood is the variate.
+    assert!(
+        pir.contains("input_data"),
+        "submodule observed data (input_data) is not referenced as the variate; got:\n{pir}"
+    );
+}
+
+/// GAP C — a cross-module bare MEASURE handle `m.d` as the direct `logdensityof`
+/// target (no likelihood layer, no θ). The submodule defines a fully-concrete
+/// `d = Normal(mu = 0.0, sigma = 1.0)`; the host scores it at a scalar variate:
+/// `logdensityof(m.d, 0.5)`. Spec §04: a measure crosses module boundaries freely
+/// (`lawof(draw(m)) ≡ m`). The entry grafts the `Normal` constructor into the host
+/// and the existing measure path emits one `builtin_logdensityof`.
+#[test]
+fn cross_module_measure_handle_lowers() {
+    let helpers = "\
+flatppl_compat = \"0.1\"
+d = Normal(mu = 0.0, sigma = 1.0)";
+    let model = "\
+flatppl_compat = \"0.1\"
+helpers = load_module(\"helpers.flatppl\")
+lp = logdensityof(helpers.d, 0.5)";
+
+    let mut hmod = parse(helpers);
+    let _ = flatppl_infer::infer(&mut hmod);
+    let mut bundle = ModuleBundle::new();
+    bundle.insert("helpers.flatppl", Arc::new(hmod));
+
+    let mut mmod = parse(model);
+    let _ = flatppl_infer::infer_module(&mut mmod, &bundle, flatppl_infer::Level::Shape);
+
+    let lowered = determinize_with(&mmod, &bundle)
+        .expect("cross-module bare-measure HANDLE target must lower, not refuse");
+    let pir = flatppl_flatpir::write(&lowered);
+    assert!(
+        pir.contains("builtin_logdensityof"),
+        "cross-module measure-handle target did not lower to builtin_logdensityof; got:\n{pir}"
+    );
+    // The concrete submodule kernel `Normal(mu = 0.0, sigma = 1.0)` survives the
+    // graft into the emitted density term.
+    assert!(
+        pir.contains("(%field mu 0.0)") && pir.contains("(%field sigma 1.0)"),
+        "submodule Normal(mu = 0.0, sigma = 1.0) did not survive the graft; got:\n{pir}"
+    );
+}
+
+/// GAP C, refuse-don't-mislower: a cross-module direct query TARGET whose graft
+/// hits a submodule-dependency name collision with an unrelated host binding still
+/// refuses cleanly (mirrors [`cross_module_name_collision_refuses`], but the
+/// colliding submodule likelihood is the `logdensityof` target `helpers.L`, not a
+/// kernel inside a host `likelihoodof`). The submodule kernel depends on an
+/// internal `scale = 2.0` whose name collides with an unrelated host `scale =
+/// 10.0`; grafting must NOT reuse the host binding — it refuses.
+#[test]
+fn cross_module_target_name_collision_refuses() {
+    let helpers = "\
+flatppl_compat = \"0.1\"
+center = elementof(reals)
+scale = 2.0
+obs_kernel = functionof(Normal(mu = center, sigma = scale), center = center)
+input_data = 2.5
+L = likelihoodof(obs_kernel, input_data)";
+    let model = "\
+flatppl_compat = \"0.1\"
+center = elementof(reals)
+scale = 10.0
+helpers = load_module(\"helpers.flatppl\", center = center)
+lp = logdensityof(helpers.L, record(center = 0.0))";
+
+    let mut hmod = parse(helpers);
+    let _ = flatppl_infer::infer(&mut hmod);
+    let mut bundle = ModuleBundle::new();
+    bundle.insert("helpers.flatppl", Arc::new(hmod));
+
+    let mut mmod = parse(model);
+    let _ = flatppl_infer::infer_module(&mut mmod, &bundle, flatppl_infer::Level::Shape);
+
+    let result = determinize_with(&mmod, &bundle);
+    assert!(
+        result.is_err(),
+        "a cross-module TARGET whose graft collides with an unrelated host binding must refuse, \
+         not silently reuse the host binding; got:\n{}",
+        result
+            .map(|l| flatppl_flatpir::write(&l))
+            .unwrap_or_default()
+    );
+}
+
 /// FIX for silent mislowering on a binding-name collision (refuse-don't-mislower):
 /// a submodule kernel depends on an INTERNAL binding (`scale = 2.0`) whose name
 /// collides with an UNRELATED host binding (`scale = 10.0`). Modules are

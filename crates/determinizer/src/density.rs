@@ -144,6 +144,20 @@ pub(crate) fn lower_logdensityof(
         }
         (q.args[0], q.args[1])
     };
+    // Cross-module *direct query target*. When arg1 is — or resolves via one
+    // `(%ref self …)` hop to — a `(%ref <alias> member)` into a loaded submodule
+    // (a submodule likelihood handle `m.L` or a bare measure handle `m.d`), graft
+    // the referenced subtree into the host so the dispatch below runs on a
+    // self-contained node. Spec §04 "Reification and module scope": a
+    // measure/likelihood handle crosses module boundaries freely
+    // (`lawof(draw(m)) ≡ m`), so this SHOULD lower. Reuses the SAME graft path the
+    // likelihood-KERNEL case uses ([`graft_cross_module_target`] →
+    // `crossmodule::resolve_module_ref` + `graft_subtree`), preserving the
+    // `load_module` `%assign` load-time substitution and the namespace-collision
+    // safety. A same-module arg1 is `None` and left unchanged; dispatch then
+    // continues on the GRAFTED node (a `likelihoodof` / `joint_likelihood` /
+    // measure, each handled by the existing paths below).
+    let arg1 = graft_cross_module_target(m, arg1, bundle)?.unwrap_or(arg1);
     // Likelihood query: arg2 is the PARAMETER point θ; the variate is the
     // observed data baked into the likelihood (§06 "densityof(likelihoodof(K,obs),θ)").
     // Both `likelihoodof` and `joint_likelihood` are likelihood-layer ops (each
@@ -159,9 +173,10 @@ pub(crate) fn lower_logdensityof(
     {
         return lower_likelihood_density(m, resolved, arg2, bundle);
     }
-    // Measure query: arg2 is the variate (existing path).
-    let (measure_expr, v) = extract_logdensityof_args(m, query)?;
-    lower_measure_density(m, measure_expr, v)
+    // Measure query: arg2 is the variate. Strip a `lawof` wrapper on the
+    // (possibly grafted) measure node and hand it to the recursive dispatcher.
+    let measure_expr = measure_of_arg(m, arg1)?;
+    lower_measure_density(m, measure_expr, arg2)
 }
 
 /// True iff `id` infers to a `Likelihood` type.
@@ -274,23 +289,57 @@ fn resolve_cross_module_kernel(
     bundle: &ModuleBundle,
     k: NodeId,
 ) -> Result<NodeId, RefuseError> {
-    let module_ref = if is_module_ref(m, k) {
-        k
+    // Same graft path as the direct-query-target case; a same-module `k`
+    // (`Ok(None)`) is returned unchanged.
+    Ok(graft_cross_module_target(m, k, bundle)?.unwrap_or(k))
+}
+
+/// If `target` is — or resolves via one `(%ref self …)` hop to — a cross-module
+/// `(%ref <alias> member)` into a loaded submodule, resolve it against `bundle`
+/// and GRAFT the referenced submodule subtree into the host, returning
+/// `Some(grafted_host_node)`. Returns `Ok(None)` when `target` is a same-module
+/// (local) reference — the caller keeps its original node and dispatches
+/// unchanged.
+///
+/// **Refuses** (`Err`, refuse-don't-mislower) when the cross-module ref is
+/// unresolvable (dependency or member absent from the bundle), or when the graft
+/// itself refuses (a grafted submodule dependency whose name collides with an
+/// unrelated pre-existing host binding — see
+/// [`crate::crossmodule::graft_subtree`]).
+///
+/// This is the ONE graft entry point shared by both cross-module cases:
+/// * a likelihood KERNEL argument (`likelihoodof(m.kernel, obs)`) via
+///   [`resolve_cross_module_kernel`], and
+/// * a direct `logdensityof` query TARGET (`logdensityof(m.L, θ)` /
+///   `logdensityof(m.d, v)`) via [`lower_logdensityof`].
+///
+/// It does NOT reimplement grafting — it calls `crossmodule::resolve_module_ref`
+/// then `graft_subtree` — so the `load_module` `%assign` load-time substitution
+/// and the namespace-collision safety (§04 "Multi-file models") are preserved
+/// unchanged.
+fn graft_cross_module_target(
+    m: &mut Module,
+    target: NodeId,
+    bundle: &ModuleBundle,
+) -> Result<Option<NodeId>, RefuseError> {
+    let module_ref = if is_module_ref(m, target) {
+        target
     } else {
-        let (candidate, _) = resolve_ref_one(m, k);
+        let (candidate, _) = resolve_ref_one(m, target);
         if is_module_ref(m, candidate) {
             candidate
         } else {
-            return Ok(k); // same-module kernel — existing path, unchanged
+            return Ok(None); // same-module target — no graft
         }
     };
     match crate::crossmodule::resolve_module_ref(bundle, m, module_ref) {
         Some(resolved) => crate::crossmodule::graft_subtree(m, &resolved)
+            .map(Some)
             .map_err(|reason| refuse(module_ref, m, &reason)),
         None => Err(refuse(
             module_ref,
             m,
-            "cross-module kernel ref could not be resolved against the module bundle \
+            "cross-module ref could not be resolved against the module bundle \
              (missing dependency or member); refuse rather than mislower",
         )),
     }
@@ -2035,46 +2084,39 @@ pub(crate) fn build_density_term(
 }
 
 // ---------------------------------------------------------------------------
-// Helper: extract (measure_expr, v) from logdensityof(lawof(M), v)
+// Helper: reduce a logdensityof measure argument to its underlying measure
 // ---------------------------------------------------------------------------
 
-/// Extract `(measure_expr, v)` from `logdensityof(measure, v)`.
+/// Reduce a `logdensityof` measure argument to the measure expression the
+/// recursive dispatcher expects.
 ///
-/// The first argument is the measure whose density we score. It comes in two
-/// shapes that both reduce to "the underlying measure":
+/// The measure argument comes in two shapes that both reduce to "the underlying
+/// measure":
 ///
 /// * `lawof(M_value)` — `lawof` reifies a (stochastic) value to its law; we
 ///   score the value's law, i.e. `M_value` (a record-of-draws, a combinator,
 ///   …). This is the inline form the Task-3/4 record/combinator goldens use.
 /// * a bare measure expression — e.g. `(%ref self pp)` where `pp = kchain(…)`
-///   (or any combinator binding). Here the measure is already a measure; there
-///   is no `lawof` wrapper to strip.
+///   (or any combinator binding), or a grafted cross-module measure handle
+///   (`logdensityof(m.d, v)`). Here the measure is already a measure; there is
+///   no `lawof` wrapper to strip.
 ///
 /// We resolve one level of ref indirection and strip a `lawof` if present;
-/// otherwise we hand the (resolved) measure node straight to the dispatcher,
-/// which classifies it by op.
-fn extract_logdensityof_args(m: &Module, query: NodeId) -> Result<(NodeId, NodeId), RefuseError> {
-    let q = expect_builtin_call(m, query, "logdensityof")
-        .ok_or_else(|| refuse(query, m, "expected logdensityof"))?;
-    if q.args.len() != 2 {
-        return Err(refuse(query, m, "logdensityof expects 2 args"));
-    }
-    let measure_arg = q.args[0];
-    let v = q.args[1];
-
-    // Resolve a single level of `(%ref self x)` indirection so a measure bound by
-    // name (`pp = kchain(…)`) is classified by its constructor, and a `lawof`
-    // wrapper is visible whether inline or behind a ref.
+/// otherwise we hand the (original, unresolved) measure node straight to the
+/// dispatcher, which itself resolves one ref level and dispatches by op.
+///
+/// Takes the measure argument node directly (not the enclosing `logdensityof`
+/// query), so it works on a grafted node the caller substituted for the original
+/// cross-module ref.
+fn measure_of_arg(m: &Module, measure_arg: NodeId) -> Result<NodeId, RefuseError> {
     let (resolved, _) = resolve_ref_one(m, measure_arg);
     if let Some(law) = expect_builtin_call(m, resolved, "lawof") {
         if law.args.len() != 1 {
             return Err(refuse(resolved, m, "lawof expects 1 arg"));
         }
-        return Ok((law.args[0], v));
+        return Ok(law.args[0]);
     }
-    // Bare measure expression: hand the original (unresolved) node to the
-    // dispatcher, which itself resolves one ref level and dispatches by op.
-    Ok((measure_arg, v))
+    Ok(measure_arg)
 }
 
 // ---------------------------------------------------------------------------
