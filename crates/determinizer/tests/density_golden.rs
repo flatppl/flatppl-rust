@@ -640,6 +640,103 @@ lp = logdensityof(L, record(mu = 2.0))";
     );
 }
 
+// Keyword/record `joint(x = M1, y = M2)` (§04 example, §06 "joint and iid
+// (independent products)"): the variate is a RECORD keyed by the same field
+// names, and the density is the sum of each component scored at its matching
+// record field — `logdensityof(joint(x = M1, y = M2), record(x = vx, y = vy))`
+// = `logdensityof(M1, vx) + logdensityof(M2, vy)`. Unlike positional `joint`
+// (which slices a flat `cat` vector via `get0` and so needs a scalar-component
+// guard), a record field can be ANY shape — no such guard applies here.
+#[test]
+fn keyword_joint_lowers_to_sum_of_field_densities() {
+    let src = "\
+j = joint(x = Normal(mu = 0.0, sigma = 1.0), y = Exponential(rate = 1.0))
+lp = logdensityof(j, record(x = 0.5, y = 1.0))";
+    let out = determinize_src(src);
+    let pir = flatppl_flatpir::write(&out);
+    assert_eq!(
+        pir.matches("builtin_logdensityof").count(),
+        2,
+        "two component densities (one per field):\n{pir}"
+    );
+    assert!(!pir.contains("(joint "), "no joint left:\n{pir}");
+    assert!(
+        pir.contains("(%field mu 0.0) (%field sigma 1.0)"),
+        "x component scores Normal(mu=0,sigma=1):\n{pir}"
+    );
+    assert!(
+        pir.contains("(%field rate 1.0)"),
+        "y component scores Exponential(rate=1):\n{pir}"
+    );
+    assert!(
+        flatppl_determinizer::is_flatpdl(&out).is_ok(),
+        "is_flatpdl failed:\n{pir}"
+    );
+}
+
+// A keyword-joint value record MISSING one of the joint's component fields is
+// malformed — refuse rather than silently drop the missing component's
+// density term. Pins whichever stage actually rejects it (inference may
+// reject the mismatched record shape before determinize ever sees it, or the
+// determinizer's own field lookup may refuse first).
+#[test]
+fn keyword_joint_missing_value_field_refuses() {
+    let src = "\
+j = joint(x = Normal(mu = 0.0, sigma = 1.0), y = Exponential(rate = 1.0))
+lp = logdensityof(j, record(x = 0.5))";
+    let mut m = flatppl_syntax::parse(src).unwrap();
+    let diagnostics = flatppl_infer::infer(&mut m);
+    if diagnostics
+        .iter()
+        .any(|d| d.severity == flatppl_infer::Severity::Error)
+    {
+        // Inference itself rejects the shape-mismatched value record — pin
+        // that as the actual refusal point rather than proceeding to
+        // determinize (which would then be exercising an already-invalid
+        // module).
+        return;
+    }
+    let err =
+        determinize(&m).expect_err("a joint value record missing a component field must refuse");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("missing field") || msg.contains("record"),
+        "refusal should name the missing field / record shape: {msg}"
+    );
+}
+
+// A `joint` mixing positional and keyword components is neither the
+// positional `cat`-variate form nor the keyword record-variate form — refuse
+// rather than guess which one was meant. Pins whichever stage actually
+// rejects the mixed call (the parser/inference may already reject a call
+// mixing positional args after keyword args, or the determinizer's own
+// `lower_joint` dispatch may refuse first).
+#[test]
+fn mixed_positional_keyword_joint_refuses() {
+    let src = "\
+j = joint(Normal(mu = 0.0, sigma = 1.0), y = Exponential(rate = 1.0))
+lp = logdensityof(j, record(x = 0.5, y = 1.0))";
+    let parsed = flatppl_syntax::parse(src);
+    let mut m = match parsed {
+        Err(_) => return, // the parser itself rejects mixed positional/keyword args
+        Ok(m) => m,
+    };
+    let diagnostics = flatppl_infer::infer(&mut m);
+    if diagnostics
+        .iter()
+        .any(|d| d.severity == flatppl_infer::Severity::Error)
+    {
+        // Inference rejects the mixed-form joint before determinize sees it.
+        return;
+    }
+    let err = determinize(&m).expect_err("a mixed positional/keyword joint must refuse");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("joint"),
+        "refusal should name the joint construct: {msg}"
+    );
+}
+
 fn determinize_src(src: &str) -> flatppl_core::Module {
     let m = {
         let mut m = flatppl_syntax::parse(src).unwrap();

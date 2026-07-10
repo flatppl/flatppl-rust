@@ -58,18 +58,28 @@
 //!   `iid(M, [2, 3])` — a valid §06 shape), is **refused** (the O(N) unroll
 //!   handles only 1-D `N`; the vectorized broadcast+reduce over a multi-axis
 //!   shape is the noted scale path, not built).
-//! - `joint(M₁,…,Mₖ)` (**positional only**) → `Σᵢ density(Mᵢ, get0(v, i))` —
+//! - `joint(M₁,…,Mₖ)` (**positional**) → `Σᵢ density(Mᵢ, get0(v, i))` —
 //!   **scalar-variate components only**; a component is accepted ONLY when its
 //!   measure-domain kind is CONFIRMED `Scalar` — a component whose domain is
 //!   confirmed non-scalar (e.g. `iid(Normal, 2)`) OR whose domain kind is
 //!   unknown/`%deferred` (inference did not resolve it) is **refused up
 //!   front**, fail-closed, by inspecting each component's measure-domain kind,
 //!   NOT via the downstream recursive call (whose `get0(v, i)` value is
-//!   `%deferred`/`%unknown`, so its domain guard is skipped). Keyword
-//!   `joint(name = M, …)` (named components → record variate) shares the
-//!   `joint` op name so it reaches the same dispatch arm, but its components
-//!   live in `named` with an empty positional `args`, so it is **refused**
-//!   rather than mislowered.
+//!   `%deferred`/`%unknown`, so its domain guard is skipped).
+//! - `joint(name₁ = M₁, …, nameₖ = Mₖ)` (**keyword/record**) → `Σᵢ
+//!   density(Mᵢ, v.nameᵢ)` — the variate is a RECORD keyed by the SAME field
+//!   names as the joint's components (§04 example, §06 "joint and iid
+//!   (independent products)"); the value must itself be a `record(...)` node,
+//!   and every field the joint names must be present in it (refuses
+//!   otherwise — refuse-don't-mislower). Unlike positional `joint`, there is
+//!   **no scalar-component restriction**: a record field may itself be any
+//!   shape (vector, nested record, …) — the recursive
+//!   `lower_measure_density`/`build_density_term` call already domain-checks
+//!   each component against its own pinned field value, so no upfront kind
+//!   guard is needed here the way it is for the flat `cat` slicing of the
+//!   positional form. A `joint` call mixing BOTH positional and keyword
+//!   components is neither form — **refused** rather than guessing which one
+//!   was meant.
 //!
 //! **Likelihood query** (measure-algebra-audit.md H2): `logdensityof(likelihoodof(K, obs), θ)` is
 //! handled at the `logdensityof` *entry* (not via `lower_measure_density`). Its
@@ -88,13 +98,15 @@
 //! recursing through the per-likelihood dispatch at the shared θ. Positional
 //! components only (§06 form); a keyword `joint_likelihood` refuses.
 //!
-//! **Refused:** `kchain` marginals, keyword `joint`, keyword `joint_likelihood`,
+//! **Refused:** `kchain` marginals, keyword `joint_likelihood`,
 //! `bayesupdate`, `disintegrate`,
 //! `restrict`, `pushfwd` with a non-bijection argument, `iid` with a genuinely
 //! dynamic size (not statically resolvable from its const-evaluated domain
-//! shape) or a multi-axis / vector size, `joint` with a component whose measure-domain kind
+//! shape) or a multi-axis / vector size, positional `joint` with a component whose measure-domain kind
 //! is not CONFIRMED scalar (refused up front — a confirmed-non-scalar OR an
-//! unknown/`%deferred` domain both refuse, fail-closed),
+//! unknown/`%deferred` domain both refuse, fail-closed), a keyword `joint` whose
+//! value is not a record or is missing a named component's field, and any
+//! `joint` mixing positional and keyword components,
 //! `normalize(truncate(base, …))`
 //! whose `base` is not a univariate-continuous-normalized measure (an unnormalized
 //! base, or a normalized-but-discrete/multivariate base — each with its own refuse
@@ -1663,29 +1675,39 @@ fn lower_broadcast_kernel(
 /// downstream recursive call: `build_density_term`'s domain check compares the
 /// measure domain against the value `get0(v, i)`, which infers to
 /// `%deferred`/`%unknown`, so that guard would be skipped and the extra slots
-/// silently dropped. Keyword `joint(name₁ = M₁, …)` (named components → record variate)
-/// is out of scope: it shares the `joint` op name with the positional form, so
-/// it does reach this function, but it carries its components in `named`
-/// rather than `args`. That is checked explicitly, first, with its own
-/// distinct refuse message — not left to fall through to the positional
-/// arg-count guard, which would misname a keyword `joint` as merely
-/// under-sized.
+/// silently dropped.
+///
+/// Keyword `joint(name₁ = M₁, …)` (named components → RECORD variate) shares
+/// the `joint` op name with the positional form, so it also reaches this
+/// function — its components live in `named` rather than `args`, so the
+/// dispatch below reads which of `args`/`named` is populated and routes to
+/// [`lower_keyword_joint`] for the record form. A call with BOTH populated
+/// (mixing positional and keyword components) is neither form — refused,
+/// rather than guessing which one was meant.
 fn lower_joint(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseError> {
-    let inner: Vec<NodeId> = {
+    let (positional, named): (Vec<NodeId>, Vec<NamedArg>) = {
         let c = expect_builtin_call(m, node, "joint")
             .ok_or_else(|| refuse(node, m, "expected joint"))?;
-        if !c.named.is_empty() {
-            return Err(refuse(
-                node,
-                m,
-                "keyword joint (named components) is not yet lowered",
-            ));
-        }
-        if c.args.len() < 2 {
-            return Err(refuse(node, m, "joint needs at least 2 components"));
-        }
-        c.args.to_vec()
+        (c.args.to_vec(), c.named.to_vec())
     };
+
+    if !positional.is_empty() && !named.is_empty() {
+        return Err(refuse(
+            node,
+            m,
+            "joint mixes positional and keyword components; a joint is either the \
+             positional cat-variate form or the keyword record-variate form, not both",
+        ));
+    }
+
+    if !named.is_empty() {
+        return lower_keyword_joint(m, node, &named, v);
+    }
+
+    let inner = positional;
+    if inner.len() < 2 {
+        return Err(refuse(node, m, "joint needs at least 2 components"));
+    }
     // Guard the scalar-only restriction HERE, before the recursion. `get0(v, i)`
     // assigns each component ONE scalar slot of the positional `cat` variate; a
     // non-scalar component (e.g. `iid(Normal, 2)`, domain array[2] → Vector) would
@@ -1725,6 +1747,66 @@ fn lower_joint(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Refuse
         let idx = m.alloc(Node::Lit(Scalar::Int(i as i64)));
         let elem = build_call(m, "get0", &[v, idx]);
         terms.push(lower_measure_density(m, mi, elem)?);
+    }
+    Ok(fold_add(m, &terms))
+}
+
+/// `logdensityof(joint(name₁ = M₁, …, nameₖ = Mₖ), v)` = `Σᵢ
+/// logdensityof(Mᵢ, v.nameᵢ)` — the keyword/record form of `joint` (§04
+/// example: `prior = joint(theta1 = Normal(...), theta2 = Exponential(...))`;
+/// §06 "joint and iid (independent products)"). The variate `v` is a RECORD
+/// keyed by the SAME field names as the joint's named components — unlike the
+/// positional form's flat `cat` vector, so there is no `get0`-slicing and
+/// (consequently) no scalar-component restriction: each component is matched
+/// to its OWN record field by name and scored there directly, whatever shape
+/// that field's value has. The downstream `lower_measure_density` /
+/// `build_density_term` recursion already domain-checks each component
+/// against its own pinned field value, which is exactly the guard a
+/// non-scalar component needs — no upfront kind inspection required (contrast
+/// [`lower_joint`]'s positional path, which DOES need one because `get0(v,
+/// i)`'s value infers to `%deferred` and so bypasses that same check).
+///
+/// Called only from [`lower_joint`] once it has confirmed `named` is
+/// non-empty and `args` is empty, so `named` here is always non-empty.
+///
+/// **Refuses** (rather than mislowering) when: a named component is not a
+/// `%field` (a malformed named arg); the value `v` is not a `record(...)`
+/// node; or `v`'s record is missing a field that one of the joint's named
+/// components expects.
+fn lower_keyword_joint(
+    m: &mut Module,
+    node: NodeId,
+    named: &[NamedArg],
+    v: NodeId,
+) -> Result<NodeId, RefuseError> {
+    for n in named {
+        if n.kind != NamedKind::Field {
+            return Err(refuse(
+                node,
+                m,
+                "non-field named arg in keyword joint (expected `name = measure` components)",
+            ));
+        }
+    }
+
+    let vrec_named: Vec<NamedArg> = expect_builtin_call(m, v, "record")
+        .ok_or_else(|| refuse(v, m, "joint value must be a record"))?
+        .named
+        .to_vec();
+
+    let mut terms = Vec::with_capacity(named.len());
+    for field in named {
+        let pinned = lookup_field(m, &vrec_named, field.name).ok_or_else(|| {
+            refuse(
+                v,
+                m,
+                &format!(
+                    "missing field {} in joint value record",
+                    m.resolve(field.name)
+                ),
+            )
+        })?;
+        terms.push(lower_measure_density(m, field.value, pinned)?);
     }
     Ok(fold_add(m, &terms))
 }
