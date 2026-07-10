@@ -247,6 +247,137 @@ lp = logdensityof(helpers.L, record(center = 0.0))";
     );
 }
 
+/// GAP D (Symptom 1 — iid size on a freshly-grafted target): a cross-module
+/// likelihood HANDLE `m.L` whose kernel wraps a STATIC-size `iid(Normal, 3)`,
+/// with the kernel bound SEPARATELY in the submodule (`k = functionof(iid(...),
+/// center = center)`). Scoring `logdensityof(m.L, θ)` must unroll the iid into 3
+/// per-element density terms. Before the fix, grafting `m.L` inlined the iid
+/// subtree UNTYPED and the very same lowering call read `iid_static_size` off the
+/// (still type-less) iid node → `None` → refuse ("iid size is not a
+/// statically-resolved 1-D count"), even though the identical model lowers fine
+/// same-module (where inference had already typed the iid). The defer-and-reloop
+/// fix grafts first, reloops so inference types the grafted iid domain, then
+/// lowers with a resolved static size.
+#[test]
+fn cross_module_iid_kernel_handle_lowers() {
+    let helpers = "\
+flatppl_compat = \"0.1\"
+center = elementof(reals)
+obs_data = [1.0, 2.0, 3.0]
+k = functionof(iid(Normal(mu = center, sigma = 1.0), 3), center = center)
+L = likelihoodof(k, obs_data)";
+    let model = "\
+flatppl_compat = \"0.1\"
+a = elementof(reals)
+helpers = load_module(\"helpers.flatppl\", center = a)
+lp = logdensityof(helpers.L, record(a = 0.0))";
+
+    let mut hmod = parse(helpers);
+    let _ = flatppl_infer::infer(&mut hmod);
+    let mut bundle = ModuleBundle::new();
+    bundle.insert("helpers.flatppl", Arc::new(hmod));
+
+    let mut mmod = parse(model);
+    let _ = flatppl_infer::infer_module(&mut mmod, &bundle, flatppl_infer::Level::Shape);
+
+    let lowered = determinize_with(&mmod, &bundle)
+        .expect("cross-module iid-kernel HANDLE target must lower, not refuse on iid size");
+    let pir = flatppl_flatpir::write(&lowered);
+    assert!(
+        pir.contains("builtin_logdensityof"),
+        "cross-module iid-kernel handle did not lower to builtin_logdensityof; got:\n{pir}"
+    );
+    // The static-size-3 iid unrolls to exactly three per-element density terms.
+    let n_terms = pir.matches("builtin_logdensityof").count();
+    assert_eq!(
+        n_terms, 3,
+        "iid(Normal, 3) must unroll to 3 builtin_logdensityof terms; got {n_terms}:\n{pir}"
+    );
+}
+
+/// GAP D (Symptom 2 — dead grafted kernel binding): a cross-module likelihood
+/// HANDLE `m.L` whose kernel is a SEPARATELY-NAMED submodule binding
+/// (`obs_kernel = functionof(Normal(...), center = center)`; `L =
+/// likelihoodof(obs_kernel, obs)`). Grafting `m.L` pulls `obs_kernel` in as its
+/// own standalone host binding; after the query lowers, that binding is dead but
+/// (before the fix) survived the sweep — the sweep ran inside the same
+/// graft+lower call, BEFORE re-inference typed `obs_kernel` as `Kernel`, so the
+/// type-based sweep arm did not catch it, and `is_flatpdl` then refused it as
+/// `KernelNotBuiltinArg`. The defer-and-reloop fix reloops so inference types the
+/// grafted kernel binding before the post-lowering sweep, which then removes it.
+#[test]
+fn cross_module_named_kernel_handle_lowers() {
+    let helpers = "\
+flatppl_compat = \"0.1\"
+center = elementof(reals)
+input_data = 2.5
+obs_kernel = functionof(Normal(mu = center, sigma = 1.0), center = center)
+L = likelihoodof(obs_kernel, input_data)";
+    let model = "\
+flatppl_compat = \"0.1\"
+a = elementof(reals)
+helpers = load_module(\"helpers.flatppl\", center = a)
+lp = logdensityof(helpers.L, record(a = 0.0))";
+
+    let mut hmod = parse(helpers);
+    let _ = flatppl_infer::infer(&mut hmod);
+    let mut bundle = ModuleBundle::new();
+    bundle.insert("helpers.flatppl", Arc::new(hmod));
+
+    let mut mmod = parse(model);
+    let _ = flatppl_infer::infer_module(&mut mmod, &bundle, flatppl_infer::Level::Shape);
+
+    let lowered = determinize_with(&mmod, &bundle).expect(
+        "cross-module named-kernel HANDLE target must lower, not refuse (KernelNotBuiltinArg)",
+    );
+    let pir = flatppl_flatpir::write(&lowered);
+    assert!(
+        pir.contains("builtin_logdensityof"),
+        "cross-module named-kernel handle did not lower to builtin_logdensityof; got:\n{pir}"
+    );
+    // θ field `a = 0.0` inlines into the distribution's `mu` (honoring the
+    // load-time `center = a` substitution): a fully-determined kernel.
+    assert!(
+        pir.contains("(%field mu 0.0)"),
+        "θ value did not inline into the distribution `mu`; got:\n{pir}"
+    );
+}
+
+/// GAP D deferred minor (refuse-don't-mislower, TARGET-ref form): a bare
+/// `logdensityof(m.MissingThing, θ)` whose module ref is the DIRECT target and
+/// whose member is absent from the bundle must refuse cleanly (`Err`), never
+/// panic. Mirrors [`cross_module_missing_bundle_refuses`] (which puts the missing
+/// ref inside a host `likelihoodof`) but exercises the direct-target graft path.
+#[test]
+fn cross_module_missing_dependency_target_refuses() {
+    // The submodule exists in the bundle but has NO `MissingThing` member.
+    let helpers = "\
+flatppl_compat = \"0.1\"
+d = Normal(mu = 0.0, sigma = 1.0)";
+    let model = "\
+flatppl_compat = \"0.1\"
+helpers = load_module(\"helpers.flatppl\")
+lp = logdensityof(helpers.MissingThing, record(a = 0.0))";
+
+    let mut hmod = parse(helpers);
+    let _ = flatppl_infer::infer(&mut hmod);
+    let mut bundle = ModuleBundle::new();
+    bundle.insert("helpers.flatppl", Arc::new(hmod));
+
+    let mut mmod = parse(model);
+    let _ = flatppl_infer::infer_module(&mut mmod, &bundle, flatppl_infer::Level::Shape);
+
+    let result = determinize_with(&mmod, &bundle);
+    assert!(
+        result.is_err(),
+        "a cross-module direct TARGET whose member is absent from the bundle must refuse, \
+         not lower; got:\n{}",
+        result
+            .map(|l| flatppl_flatpir::write(&l))
+            .unwrap_or_default()
+    );
+}
+
 /// FIX for silent mislowering on a binding-name collision (refuse-don't-mislower):
 /// a submodule kernel depends on an INTERNAL binding (`scale = 2.0`) whose name
 /// collides with an UNRELATED host binding (`scale = 10.0`). Modules are

@@ -208,6 +208,29 @@ fn apply_rule(
 ) -> Result<(), RefuseError> {
     // --- density disintegration: logdensityof(lawof(M), v) → deterministic density ---
     if is_op(m, target_node, "logdensityof") {
+        // Defer-and-reloop for a cross-module query TARGET (GAP D). When the
+        // query's measure target is (or resolves via one `(%ref self …)` hop to)
+        // a cross-module `(%ref <alias> member)`, graft the referenced submodule
+        // subtree into the host and rewrite the query to point at the LOCAL
+        // grafted node — WITHOUT lowering yet. Returning here lets the driver loop
+        // re-run inference at the top of the NEXT iteration, which types the
+        // freshly-grafted subtree (crucially an `iid`'s const-evaluated domain
+        // shape). The re-scan then finds this same query with a now-local, typed
+        // target, `graft_query_target` returns `None`, and it lowers fully with a
+        // resolvable `iid_static_size`; the post-lowering sweep likewise runs
+        // after the grafted (now-typed) dead kernel binding has been classified,
+        // so it is swept rather than surviving into the conformance check. Without
+        // this deferral the old inline graft-then-lower ran on still-untyped nodes
+        // in a single call (iid-size refuse / KernelNotBuiltinArg refuse).
+        if let Some(new_query) = crate::density::graft_query_target(m, target_node, bundle)? {
+            let new_rhs = substitute_in_tree(m, m.binding(bid).rhs, target_node, new_query);
+            m.set_binding_rhs(bid, new_rhs);
+            // The intermediate `x = m.L` self-ref binding (if any) and the
+            // `helpers = load_module(…)` binding may now be dead; sweep the
+            // measure-typed ones so the next scan is clean.
+            sweep_dead_measure_bindings(m);
+            return Ok(());
+        }
         let new_root = crate::density::lower_logdensityof(m, target_node, bundle)?;
         let new_rhs = substitute_in_tree(m, m.binding(bid).rhs, target_node, new_root);
         m.set_binding_rhs(bid, new_rhs);

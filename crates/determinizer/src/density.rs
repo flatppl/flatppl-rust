@@ -345,6 +345,52 @@ fn graft_cross_module_target(
     }
 }
 
+/// Defer-and-reloop support for a cross-module `logdensityof` query TARGET
+/// (GAP D). If `query`'s measure target (arg 0) is — or resolves via one `(%ref
+/// self …)` hop to — a cross-module `(%ref <alias> member)` into a loaded
+/// submodule, graft the referenced subtree into the host and return
+/// `Some(new_query)`: a freshly-built `logdensityof` whose target arg is the
+/// LOCAL grafted node (arg 1, the variate / θ, is carried over unchanged).
+///
+/// The driver rewrites the binding to `new_query` and RETURNS WITHOUT lowering.
+/// It then reloops, re-runs inference (typing the grafted subtree — crucially an
+/// `iid`'s const-evaluated domain shape, which [`iid_static_size`] reads), and
+/// re-scans: it finds this SAME query, now with a local, typed target, for which
+/// this function returns `Ok(None)` (nothing to graft) so the driver lowers it
+/// fully. Deferring the lowering to after a re-infer is what makes the grafted
+/// `iid` size statically resolvable and the grafted (now-typed) dead kernel
+/// binding sweepable — both were untyped when the old inline graft-then-lower
+/// ran within a single call, before the next re-infer.
+///
+/// `Ok(None)`: same-module target — nothing grafted; the driver lowers normally.
+/// `Err`: the cross-module ref is unresolvable, or the graft itself refuses (a
+/// grafted submodule dependency colliding with an unrelated host binding —
+/// refuse-don't-mislower).
+///
+/// Termination: a graft here fires AT MOST ONCE per query. It rewrites the
+/// target from a `(%ref <alias> …)` (or a self-ref reaching one) to a local
+/// grafted node, so on the next scan `graft_cross_module_target` sees a local
+/// node and returns `Ok(None)` — the query then lowers (strictly reducing the
+/// measure-node count) rather than grafting again.
+pub(crate) fn graft_query_target(
+    m: &mut Module,
+    query: NodeId,
+    bundle: &ModuleBundle,
+) -> Result<Option<NodeId>, RefuseError> {
+    let (arg1, arg2) = {
+        let q = expect_builtin_call(m, query, "logdensityof")
+            .ok_or_else(|| refuse(query, m, "expected logdensityof"))?;
+        if q.args.len() != 2 {
+            return Err(refuse(query, m, "logdensityof expects 2 args"));
+        }
+        (q.args[0], q.args[1])
+    };
+    match graft_cross_module_target(m, arg1, bundle)? {
+        None => Ok(None), // same-module target — driver lowers normally
+        Some(grafted) => Ok(Some(build_call(m, "logdensityof", &[grafted, arg2]))),
+    }
+}
+
 /// True iff `id` is a `(%ref <alias> …)` cross-module reference.
 fn is_module_ref(m: &Module, id: NodeId) -> bool {
     matches!(
