@@ -1771,8 +1771,14 @@ fn lower_joint(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Refuse
 ///
 /// **Refuses** (rather than mislowering) when: a named component is not a
 /// `%field` (a malformed named arg); the value `v` is not a `record(...)`
-/// node; or `v`'s record is missing a field that one of the joint's named
-/// components expects.
+/// node; `v`'s record carries a positional (non-named) element alongside its
+/// named fields; or `v`'s record is missing a field that one of the joint's
+/// named components expects.
+///
+/// An extra value-record field NOT named by the joint (e.g. `record(x=.., y=..,
+/// z=..)` against `joint(x=.., y=..)`) is silently ignored — this matches the
+/// pre-existing leniency of the record-of-draws helper
+/// ([`match_independent_record`]) and is not tightened here.
 fn lower_keyword_joint(
     m: &mut Module,
     node: NodeId,
@@ -1789,10 +1795,16 @@ fn lower_keyword_joint(
         }
     }
 
-    let vrec_named: Vec<NamedArg> = expect_builtin_call(m, v, "record")
-        .ok_or_else(|| refuse(v, m, "joint value must be a record"))?
-        .named
-        .to_vec();
+    let vrec = expect_builtin_call(m, v, "record")
+        .ok_or_else(|| refuse(v, m, "joint value must be a record"))?;
+    // A stray positional element mixed with the named fields (e.g. `record(0.9,
+    // x = 0.5, y = 1.0)`) is not a well-formed field-keyed value record — refuse
+    // rather than silently drop the positional slot, mirroring the equivalent
+    // guard on `match_independent_record` ("value record with positional args").
+    if !vrec.args.is_empty() {
+        return Err(refuse(v, m, "joint value record carries positional args"));
+    }
+    let vrec_named: Vec<NamedArg> = vrec.named.to_vec();
 
     let mut terms = Vec::with_capacity(named.len());
     for field in named {

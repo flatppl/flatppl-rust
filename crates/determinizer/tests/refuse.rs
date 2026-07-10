@@ -478,9 +478,10 @@ lp = logdensityof(lawof(record(a = a)), record(0.5))";
 
 // `joint_likelihood` combines a POSITIONAL list of likelihoods (§06 "Combining
 // likelihoods": `log L(θ) = Σᵢ log Lᵢ(θ)`). A KEYWORD form (`joint_likelihood(a
-// = L1, b = L2)`, named components) has no §06 meaning — mirroring how a keyword
-// `joint(name = M, …)` is refused — so it must refuse, not silently drop the
-// named components or guess a combination order.
+// = L1, b = L2)`, named components) has no §06 meaning of its own — unlike a
+// keyword `joint(name = M, …)`, which DOES lower (§04/§06 record-variate
+// form) — so it must refuse, not silently drop the named components or guess
+// a combination order.
 #[test]
 fn joint_likelihood_keyword_form_refuses() {
     let src = "\
