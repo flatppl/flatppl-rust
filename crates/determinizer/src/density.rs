@@ -1448,7 +1448,11 @@ fn lower_truncate(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Ref
 /// `logdensityof(pushfwd(bij, M), v)` = `logdensityof(M, f_inv(v)) - logvol(f_inv(v))`
 /// where `bij = bijection(f, f_inv, logvol)`.
 ///
-/// Refuses if `bij` is not a `bijection(...)` node (directly or via one level of ref).
+/// The forward map may be given explicitly as a `bijection(f, f_inv, logvol)`
+/// node (directly or via one level of ref), OR — per §06 case 1 — as a known
+/// invertible builtin (`pushfwd(exp, M)`, `pushfwd(x -> exp(x), M)`), for which
+/// `(f_inv, logvol)` is synthesised analytically by [`crate::invert`]. Anything
+/// else refuses.
 fn lower_pushfwd(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseError> {
     let (bij_node, m_inner) = {
         let c = expect_builtin_call(m, node, "pushfwd")
@@ -1462,24 +1466,37 @@ fn lower_pushfwd(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Refu
     // Resolve `bij_node` through one level of ref indirection.
     let (bij_resolved, _) = resolve_ref_one(m, bij_node);
 
-    // Extract f_inv and logvol from the bijection node.
-    let (f_inv_node, logvol_node) = {
-        let bij = expect_builtin_call(m, bij_resolved, "bijection").ok_or_else(|| {
-            refuse(
-                bij_resolved,
-                m,
-                "pushfwd bijection arg must be a bijection(f, f_inv, logvol) node",
-            )
-        })?;
-        if bij.args.len() != 3 {
-            return Err(refuse(
-                bij_resolved,
-                m,
-                "bijection expects 3 args (f, f_inv, logvol)",
-            ));
-        }
-        (bij.args[1], bij.args[2])
-    };
+    // Extract f_inv and logvol: from an explicit bijection node if present,
+    // otherwise synthesise them for a known invertible forward builtin.
+    let (f_inv_node, logvol_node) =
+        if let Some(bij) = expect_builtin_call(m, bij_resolved, "bijection") {
+            if bij.args.len() != 3 {
+                return Err(refuse(
+                    bij_resolved,
+                    m,
+                    "bijection expects 3 args (f, f_inv, logvol)",
+                ));
+            }
+            (bij.args[1], bij.args[2])
+        } else {
+            // Not an explicit bijection: try analytic synthesis (§06 case 1). Pass
+            // `M`'s variate domain (needed for domain-restricted maps like `pow`);
+            // an unknown domain defaults to `%any`, which those maps refuse.
+            let domain = match m.type_of(m_inner) {
+                Some(Type::Measure { domain, .. }) => (**domain).clone(),
+                _ => Type::Any,
+            };
+            match crate::invert::derive_bijection(m, bij_node, &domain)? {
+                Some(bij) => (bij.f_inv, bij.logvol),
+                None => {
+                    return Err(refuse(
+                        bij_resolved,
+                        m,
+                        "pushfwd bijection arg must be a bijection(f, f_inv, logvol) node",
+                    ));
+                }
+            }
+        };
 
     // preimage = f_inv(v)
     let preimage = build_user_call(m, f_inv_node, v);
