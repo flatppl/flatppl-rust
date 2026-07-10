@@ -58,18 +58,28 @@
 //!   `iid(M, [2, 3])` — a valid §06 shape), is **refused** (the O(N) unroll
 //!   handles only 1-D `N`; the vectorized broadcast+reduce over a multi-axis
 //!   shape is the noted scale path, not built).
-//! - `joint(M₁,…,Mₖ)` (**positional only**) → `Σᵢ density(Mᵢ, get0(v, i))` —
+//! - `joint(M₁,…,Mₖ)` (**positional**) → `Σᵢ density(Mᵢ, get0(v, i))` —
 //!   **scalar-variate components only**; a component is accepted ONLY when its
 //!   measure-domain kind is CONFIRMED `Scalar` — a component whose domain is
 //!   confirmed non-scalar (e.g. `iid(Normal, 2)`) OR whose domain kind is
 //!   unknown/`%deferred` (inference did not resolve it) is **refused up
 //!   front**, fail-closed, by inspecting each component's measure-domain kind,
 //!   NOT via the downstream recursive call (whose `get0(v, i)` value is
-//!   `%deferred`/`%unknown`, so its domain guard is skipped). Keyword
-//!   `joint(name = M, …)` (named components → record variate) shares the
-//!   `joint` op name so it reaches the same dispatch arm, but its components
-//!   live in `named` with an empty positional `args`, so it is **refused**
-//!   rather than mislowered.
+//!   `%deferred`/`%unknown`, so its domain guard is skipped).
+//! - `joint(name₁ = M₁, …, nameₖ = Mₖ)` (**keyword/record**) → `Σᵢ
+//!   density(Mᵢ, v.nameᵢ)` — the variate is a RECORD keyed by the SAME field
+//!   names as the joint's components (§04 example, §06 "joint and iid
+//!   (independent products)"); the value must itself be a `record(...)` node,
+//!   and every field the joint names must be present in it (refuses
+//!   otherwise — refuse-don't-mislower). Unlike positional `joint`, there is
+//!   **no scalar-component restriction**: a record field may itself be any
+//!   shape (vector, nested record, …) — the recursive
+//!   `lower_measure_density`/`build_density_term` call already domain-checks
+//!   each component against its own pinned field value, so no upfront kind
+//!   guard is needed here the way it is for the flat `cat` slicing of the
+//!   positional form. A `joint` call mixing BOTH positional and keyword
+//!   components is neither form — **refused** rather than guessing which one
+//!   was meant.
 //!
 //! **Likelihood query** (measure-algebra-audit.md H2): `logdensityof(likelihoodof(K, obs), θ)` is
 //! handled at the `logdensityof` *entry* (not via `lower_measure_density`). Its
@@ -88,13 +98,15 @@
 //! recursing through the per-likelihood dispatch at the shared θ. Positional
 //! components only (§06 form); a keyword `joint_likelihood` refuses.
 //!
-//! **Refused:** `kchain` marginals, keyword `joint`, keyword `joint_likelihood`,
+//! **Refused:** `kchain` marginals, keyword `joint_likelihood`,
 //! `bayesupdate`, `disintegrate`,
 //! `restrict`, `pushfwd` with a non-bijection argument, `iid` with a genuinely
 //! dynamic size (not statically resolvable from its const-evaluated domain
-//! shape) or a multi-axis / vector size, `joint` with a component whose measure-domain kind
+//! shape) or a multi-axis / vector size, positional `joint` with a component whose measure-domain kind
 //! is not CONFIRMED scalar (refused up front — a confirmed-non-scalar OR an
-//! unknown/`%deferred` domain both refuse, fail-closed),
+//! unknown/`%deferred` domain both refuse, fail-closed), a keyword `joint` whose
+//! value is not a record or is missing a named component's field, and any
+//! `joint` mixing positional and keyword components,
 //! `normalize(truncate(base, …))`
 //! whose `base` is not a univariate-continuous-normalized measure (an unnormalized
 //! base, or a normalized-but-discrete/multivariate base — each with its own refuse
@@ -107,6 +119,7 @@ use flatppl_core::{
     BindingId, Call, CallHead, Dim, Inputs, Mass, Module, NamedArg, NamedKind, Node, NodeId, Ref,
     RefNs, Scalar, ScalarType, Symbol, Type,
 };
+use flatppl_infer::ModuleBundle;
 
 // ---------------------------------------------------------------------------
 // Public entry point
@@ -118,7 +131,11 @@ use flatppl_core::{
 /// Side effect: each `draw` binding consumed by the density query is pinned to its
 /// scored value (its binding's RHS is redirected to the pinned variate), so no
 /// stochastic `draw` survives.
-pub(crate) fn lower_logdensityof(m: &mut Module, query: NodeId) -> Result<NodeId, RefuseError> {
+pub(crate) fn lower_logdensityof(
+    m: &mut Module,
+    query: NodeId,
+    bundle: &ModuleBundle,
+) -> Result<NodeId, RefuseError> {
     let (arg1, arg2) = {
         let q = expect_builtin_call(m, query, "logdensityof")
             .ok_or_else(|| refuse(query, m, "expected logdensityof"))?;
@@ -127,6 +144,13 @@ pub(crate) fn lower_logdensityof(m: &mut Module, query: NodeId) -> Result<NodeId
         }
         (q.args[0], q.args[1])
     };
+    // A cross-module *direct query target* (a submodule likelihood handle
+    // `m.L` or a bare measure handle `m.d`) is already grafted to a local host
+    // node by the time this runs: the driver's `apply_rule` calls
+    // [`graft_query_target`] on the SAME target first and only reaches this
+    // function once that returned `Ok(None)` (same-module target — nothing to
+    // graft), so `arg1` here is always already local. No graft happens in
+    // this function.
     // Likelihood query: arg2 is the PARAMETER point θ; the variate is the
     // observed data baked into the likelihood (§06 "densityof(likelihoodof(K,obs),θ)").
     // Both `likelihoodof` and `joint_likelihood` are likelihood-layer ops (each
@@ -140,11 +164,12 @@ pub(crate) fn lower_logdensityof(m: &mut Module, query: NodeId) -> Result<NodeId
             Some("likelihoodof") | Some("joint_likelihood")
         )
     {
-        return lower_likelihood_density(m, resolved, arg2);
+        return lower_likelihood_density(m, resolved, arg2, bundle);
     }
-    // Measure query: arg2 is the variate (existing path).
-    let (measure_expr, v) = extract_logdensityof_args(m, query)?;
-    lower_measure_density(m, measure_expr, v)
+    // Measure query: arg2 is the variate. Strip a `lawof` wrapper on the
+    // (possibly grafted) measure node and hand it to the recursive dispatcher.
+    let measure_expr = measure_of_arg(m, arg1)?;
+    lower_measure_density(m, measure_expr, arg2)
 }
 
 /// True iff `id` infers to a `Likelihood` type.
@@ -166,10 +191,11 @@ fn lower_likelihood_density(
     m: &mut Module,
     resolved: NodeId,
     theta: NodeId,
+    bundle: &ModuleBundle,
 ) -> Result<NodeId, RefuseError> {
     match builtin_name(m, resolved) {
-        Some("joint_likelihood") => lower_joint_likelihood(m, resolved, theta),
-        _ => lower_likelihood_query(m, resolved, theta),
+        Some("joint_likelihood") => lower_joint_likelihood(m, resolved, theta, bundle),
+        _ => lower_likelihood_query(m, resolved, theta, bundle),
     }
 }
 
@@ -191,6 +217,7 @@ fn lower_joint_likelihood(
     m: &mut Module,
     node: NodeId,
     theta: NodeId,
+    bundle: &ModuleBundle,
 ) -> Result<NodeId, RefuseError> {
     let components: Vec<NodeId> = {
         let c = expect_builtin_call(m, node, "joint_likelihood")
@@ -217,7 +244,7 @@ fn lower_joint_likelihood(
         // hop and reuse the per-likelihood dispatch (also handles a nested
         // joint_likelihood).
         let (comp_resolved, _) = resolve_ref_one(m, comp);
-        terms.push(lower_likelihood_density(m, comp_resolved, theta)?);
+        terms.push(lower_likelihood_density(m, comp_resolved, theta, bundle)?);
     }
     Ok(fold_add(m, &terms))
 }
@@ -233,10 +260,149 @@ fn lower_joint_likelihood(
 /// score at ITS OWN θ point, not the last θ written globally. Leaving the
 /// `mu = elementof(...)` param decls in place is valid FlatPDL (`is_flatpdl`
 /// allows `elementof` parameter declarations); they become unused free params.
+/// If `k` (a likelihood kernel argument) is a cross-module ref
+/// `(%ref <alias> member)` — directly, or via one `(%ref self …)` hop — resolve
+/// it against `bundle` and graft the referenced submodule kernel subtree into the
+/// host, returning the grafted host node. A same-module `k` is returned
+/// unchanged. The graft honors the `load_module` `%assign` load-time
+/// substitutions (a substituted submodule parameter is replaced by the host
+/// expression it was bound to).
+///
+/// **Refuses** (rather than mislowering) when: the cross-module ref is
+/// unresolvable (dependency or member absent from the bundle); or a grafted
+/// submodule dependency's name collides with an unrelated pre-existing host
+/// binding (independent namespaces — reusing the host binding would score against
+/// the wrong value).
+///
+/// The graft (see [`crate::crossmodule`]) also pulls the kernel's own parameter
+/// bindings into the host, so the caller's `theta_field_map` and the density
+/// lowering both run on a self-contained node with no further bundle access.
+fn resolve_cross_module_kernel(
+    m: &mut Module,
+    bundle: &ModuleBundle,
+    k: NodeId,
+) -> Result<NodeId, RefuseError> {
+    // Same graft path as the direct-query-target case; a same-module `k`
+    // (`Ok(None)`) is returned unchanged.
+    Ok(graft_cross_module_target(m, k, bundle)?.unwrap_or(k))
+}
+
+/// If `target` is — or resolves via one `(%ref self …)` hop to — a cross-module
+/// `(%ref <alias> member)` into a loaded submodule, resolve it against `bundle`
+/// and GRAFT the referenced submodule subtree into the host, returning
+/// `Some(grafted_host_node)`. Returns `Ok(None)` when `target` is a same-module
+/// (local) reference — the caller keeps its original node and dispatches
+/// unchanged.
+///
+/// **Refuses** (`Err`, refuse-don't-mislower) when the cross-module ref is
+/// unresolvable (dependency or member absent from the bundle), or when the graft
+/// itself refuses (a grafted submodule dependency whose name collides with an
+/// unrelated pre-existing host binding — see
+/// [`crate::crossmodule::graft_subtree`]).
+///
+/// This is the ONE graft entry point shared by both cross-module cases:
+/// * a likelihood KERNEL argument (`likelihoodof(m.kernel, obs)`) via
+///   [`resolve_cross_module_kernel`], and
+/// * a direct `logdensityof` query TARGET (`logdensityof(m.L, θ)` /
+///   `logdensityof(m.d, v)`) via [`graft_query_target`], called by the driver
+///   BEFORE [`lower_logdensityof`] ever runs on that query — so by the time
+///   `lower_logdensityof` sees a query, its target is already local and does
+///   no grafting of its own.
+///
+/// It does NOT reimplement grafting — it calls `crossmodule::resolve_module_ref`
+/// then `graft_subtree` — so the `load_module` `%assign` load-time substitution
+/// and the namespace-collision safety (§04 "Multi-file models") are preserved
+/// unchanged.
+fn graft_cross_module_target(
+    m: &mut Module,
+    target: NodeId,
+    bundle: &ModuleBundle,
+) -> Result<Option<NodeId>, RefuseError> {
+    let module_ref = if is_module_ref(m, target) {
+        target
+    } else {
+        let (candidate, _) = resolve_ref_one(m, target);
+        if is_module_ref(m, candidate) {
+            candidate
+        } else {
+            return Ok(None); // same-module target — no graft
+        }
+    };
+    match crate::crossmodule::resolve_module_ref(bundle, m, module_ref) {
+        Some(resolved) => crate::crossmodule::graft_subtree(m, &resolved)
+            .map(Some)
+            .map_err(|reason| refuse(module_ref, m, &reason)),
+        None => Err(refuse(
+            module_ref,
+            m,
+            "cross-module ref could not be resolved against the module bundle \
+             (missing dependency or member); refuse rather than mislower",
+        )),
+    }
+}
+
+/// Defer-and-reloop support for a cross-module `logdensityof` query TARGET
+/// (GAP D). If `query`'s measure target (arg 0) is — or resolves via one `(%ref
+/// self …)` hop to — a cross-module `(%ref <alias> member)` into a loaded
+/// submodule, graft the referenced subtree into the host and return
+/// `Some(new_query)`: a freshly-built `logdensityof` whose target arg is the
+/// LOCAL grafted node (arg 1, the variate / θ, is carried over unchanged).
+///
+/// The driver rewrites the binding to `new_query` and RETURNS WITHOUT lowering.
+/// It then reloops, re-runs inference (typing the grafted subtree — crucially an
+/// `iid`'s const-evaluated domain shape, which [`iid_static_size`] reads), and
+/// re-scans: it finds this SAME query, now with a local, typed target, for which
+/// this function returns `Ok(None)` (nothing to graft) so the driver lowers it
+/// fully. Deferring the lowering to after a re-infer is what makes the grafted
+/// `iid` size statically resolvable and the grafted (now-typed) dead kernel
+/// binding sweepable — both were untyped when the old inline graft-then-lower
+/// ran within a single call, before the next re-infer.
+///
+/// `Ok(None)`: same-module target — nothing grafted; the driver lowers normally.
+/// `Err`: the cross-module ref is unresolvable, or the graft itself refuses (a
+/// grafted submodule dependency colliding with an unrelated host binding —
+/// refuse-don't-mislower).
+///
+/// Termination: a graft here fires AT MOST ONCE per query. It rewrites the
+/// target from a `(%ref <alias> …)` (or a self-ref reaching one) to a local
+/// grafted node, so on the next scan `graft_cross_module_target` sees a local
+/// node and returns `Ok(None)` — the query then lowers (strictly reducing the
+/// measure-node count) rather than grafting again.
+pub(crate) fn graft_query_target(
+    m: &mut Module,
+    query: NodeId,
+    bundle: &ModuleBundle,
+) -> Result<Option<NodeId>, RefuseError> {
+    let (arg1, arg2) = {
+        let q = expect_builtin_call(m, query, "logdensityof")
+            .ok_or_else(|| refuse(query, m, "expected logdensityof"))?;
+        if q.args.len() != 2 {
+            return Err(refuse(query, m, "logdensityof expects 2 args"));
+        }
+        (q.args[0], q.args[1])
+    };
+    match graft_cross_module_target(m, arg1, bundle)? {
+        None => Ok(None), // same-module target — driver lowers normally
+        Some(grafted) => Ok(Some(build_call(m, "logdensityof", &[grafted, arg2]))),
+    }
+}
+
+/// True iff `id` is a `(%ref <alias> …)` cross-module reference.
+fn is_module_ref(m: &Module, id: NodeId) -> bool {
+    matches!(
+        m.node(id),
+        Node::Ref(Ref {
+            ns: RefNs::Module(_),
+            ..
+        })
+    )
+}
+
 fn lower_likelihood_query(
     m: &mut Module,
     likelihoodof_node: NodeId,
     theta: NodeId,
+    bundle: &ModuleBundle,
 ) -> Result<NodeId, RefuseError> {
     let (k, obs) = {
         let c = expect_builtin_call(m, likelihoodof_node, "likelihoodof")
@@ -250,6 +416,13 @@ fn lower_likelihood_query(
         }
         (c.args[0], c.args[1])
     };
+    // Cross-module kernel ref (`(%ref <alias> member)` into a loaded submodule):
+    // graft the referenced kernel subtree into the host so the density lowering
+    // below runs on a self-contained node (spec §04 — a measure/kernel crosses
+    // module boundaries freely). Grafting brings the kernel's own parameter
+    // bindings into the host too, so `theta_field_map` (next line) can resolve
+    // the θ field names. A same-module `k` is returned unchanged.
+    let k = resolve_cross_module_kernel(m, bundle, k)?;
     let theta_map = theta_field_map(m, theta)?;
     let density = lower_measure_density(m, k, obs)?;
     // Refuse-don't-mislower: a θ param captured as a `functionof` / `kernelof`
@@ -399,6 +572,12 @@ pub(crate) fn lower_measure_density(
 ) -> Result<NodeId, RefuseError> {
     // Resolve a single level of `(%ref self x)` indirection on the measure side.
     let (measure_node, _binding_opt) = resolve_ref_one(m, measure_expr);
+
+    // A reified-kernel *application* `k(input)` (a `%call(User(k), [input])`)
+    // is not a builtin-named op; β-reduce it to its measure body and recurse.
+    if let Some(reduced) = crate::kernel::reduce_kernel_application(m, measure_node) {
+        return lower_measure_density(m, reduced, v);
+    }
 
     // Dispatch on the measure op.
     let op = builtin_name(m, measure_node);
@@ -1209,40 +1388,22 @@ fn base_is_measure_combinator(m: &Module, base: NodeId) -> bool {
 /// base bound by name (`g = Normal(...); truncate(g, ...)`) is classified by
 /// its constructor.
 ///
-/// **Defense-in-depth: rejects positional constructor args.** This builds the
-/// kernel input record from `c.named` only, exactly like [`build_density_term`]'s
-/// primitive-constructor path — a positionally-written base (`Normal(0.0,
-/// 1.0)`) has no `named` entries, so silently proceeding would emit
-/// `builtin_touniform(Normal, record(), hi)`, a wrong (missing-parameter)
-/// input record, rather than refusing. In the current call graph this cannot
-/// actually fire: [`lower_normalize`] always lowers the base's own density
-/// term via `build_density_term` first (which already refuses
-/// `!c.args.is_empty()`) before reaching `kernel_and_input`, so a positional
-/// base is refused upstream. But that ordering is not enforced by this
-/// function's own signature, so the guard is repeated here rather than left
-/// implicit/order-dependent on the caller.
+/// **Positional-first-class.** Delegates to [`split_kernel_constructor`] — the
+/// same helper [`build_density_term`] and `sample::split_constructor` use — so
+/// a positionally-written base (`Normal(0.0, 1.0)`), a keyword base, or a mixed
+/// form all read to the identical `(ctor_sym, kwargs)` pair (spec §04 calling
+/// conventions: positional args bind to the constructor's ordered §08
+/// parameter names). `None` (not a builtin constructor call, or a malformed
+/// positional/keyword mix) refuses cleanly rather than mislowering.
 fn kernel_and_input(m: &mut Module, ctor: NodeId) -> Result<(NodeId, NodeId), RefuseError> {
     let (ctor_resolved, _) = resolve_ref_one(m, ctor);
-    let (ctor_sym, kwargs): (Symbol, Vec<(Symbol, NodeId)>) = {
-        let Node::Call(c) = m.node(ctor_resolved) else {
-            return Err(refuse(
-                ctor_resolved,
-                m,
-                "truncation base must be a primitive constructor",
-            ));
-        };
-        let CallHead::Builtin(sym) = c.head else {
-            return Err(refuse(ctor_resolved, m, "non-builtin truncation base"));
-        };
-        if !c.args.is_empty() {
-            return Err(refuse(
-                ctor_resolved,
-                m,
-                "primitive constructor with positional args not supported",
-            ));
-        }
-        (sym, c.named.iter().map(|n| (n.name, n.value)).collect())
-    };
+    let (ctor_sym, kwargs) = split_kernel_constructor(m, ctor_resolved).ok_or_else(|| {
+        refuse(
+            ctor_resolved,
+            m,
+            "truncation base must be a built-in constructor call with well-formed positional or keyword arguments",
+        )
+    })?;
     let kernel = m.alloc(Node::Const(ctor_sym));
     let input = build_record(m, &kwargs);
     Ok((kernel, input))
@@ -1605,29 +1766,39 @@ fn lower_broadcast_kernel(
 /// downstream recursive call: `build_density_term`'s domain check compares the
 /// measure domain against the value `get0(v, i)`, which infers to
 /// `%deferred`/`%unknown`, so that guard would be skipped and the extra slots
-/// silently dropped. Keyword `joint(name₁ = M₁, …)` (named components → record variate)
-/// is out of scope: it shares the `joint` op name with the positional form, so
-/// it does reach this function, but it carries its components in `named`
-/// rather than `args`. That is checked explicitly, first, with its own
-/// distinct refuse message — not left to fall through to the positional
-/// arg-count guard, which would misname a keyword `joint` as merely
-/// under-sized.
+/// silently dropped.
+///
+/// Keyword `joint(name₁ = M₁, …)` (named components → RECORD variate) shares
+/// the `joint` op name with the positional form, so it also reaches this
+/// function — its components live in `named` rather than `args`, so the
+/// dispatch below reads which of `args`/`named` is populated and routes to
+/// [`lower_keyword_joint`] for the record form. A call with BOTH populated
+/// (mixing positional and keyword components) is neither form — refused,
+/// rather than guessing which one was meant.
 fn lower_joint(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseError> {
-    let inner: Vec<NodeId> = {
+    let (positional, named): (Vec<NodeId>, Vec<NamedArg>) = {
         let c = expect_builtin_call(m, node, "joint")
             .ok_or_else(|| refuse(node, m, "expected joint"))?;
-        if !c.named.is_empty() {
-            return Err(refuse(
-                node,
-                m,
-                "keyword joint (named components) is not yet lowered",
-            ));
-        }
-        if c.args.len() < 2 {
-            return Err(refuse(node, m, "joint needs at least 2 components"));
-        }
-        c.args.to_vec()
+        (c.args.to_vec(), c.named.to_vec())
     };
+
+    if !positional.is_empty() && !named.is_empty() {
+        return Err(refuse(
+            node,
+            m,
+            "joint mixes positional and keyword components; a joint is either the \
+             positional cat-variate form or the keyword record-variate form, not both",
+        ));
+    }
+
+    if !named.is_empty() {
+        return lower_keyword_joint(m, node, &named, v);
+    }
+
+    let inner = positional;
+    if inner.len() < 2 {
+        return Err(refuse(node, m, "joint needs at least 2 components"));
+    }
     // Guard the scalar-only restriction HERE, before the recursion. `get0(v, i)`
     // assigns each component ONE scalar slot of the positional `cat` variate; a
     // non-scalar component (e.g. `iid(Normal, 2)`, domain array[2] → Vector) would
@@ -1667,6 +1838,78 @@ fn lower_joint(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Refuse
         let idx = m.alloc(Node::Lit(Scalar::Int(i as i64)));
         let elem = build_call(m, "get0", &[v, idx]);
         terms.push(lower_measure_density(m, mi, elem)?);
+    }
+    Ok(fold_add(m, &terms))
+}
+
+/// `logdensityof(joint(name₁ = M₁, …, nameₖ = Mₖ), v)` = `Σᵢ
+/// logdensityof(Mᵢ, v.nameᵢ)` — the keyword/record form of `joint` (§04
+/// example: `prior = joint(theta1 = Normal(...), theta2 = Exponential(...))`;
+/// §06 "joint and iid (independent products)"). The variate `v` is a RECORD
+/// keyed by the SAME field names as the joint's named components — unlike the
+/// positional form's flat `cat` vector, so there is no `get0`-slicing and
+/// (consequently) no scalar-component restriction: each component is matched
+/// to its OWN record field by name and scored there directly, whatever shape
+/// that field's value has. The downstream `lower_measure_density` /
+/// `build_density_term` recursion already domain-checks each component
+/// against its own pinned field value, which is exactly the guard a
+/// non-scalar component needs — no upfront kind inspection required (contrast
+/// [`lower_joint`]'s positional path, which DOES need one because `get0(v,
+/// i)`'s value infers to `%deferred` and so bypasses that same check).
+///
+/// Called only from [`lower_joint`] once it has confirmed `named` is
+/// non-empty and `args` is empty, so `named` here is always non-empty.
+///
+/// **Refuses** (rather than mislowering) when: a named component is not a
+/// `%field` (a malformed named arg); the value `v` is not a `record(...)`
+/// node; `v`'s record carries a positional (non-named) element alongside its
+/// named fields; or `v`'s record is missing a field that one of the joint's
+/// named components expects.
+///
+/// An extra value-record field NOT named by the joint (e.g. `record(x=.., y=..,
+/// z=..)` against `joint(x=.., y=..)`) is silently ignored — this matches the
+/// pre-existing leniency of the record-of-draws helper
+/// ([`match_independent_record`]) and is not tightened here.
+fn lower_keyword_joint(
+    m: &mut Module,
+    node: NodeId,
+    named: &[NamedArg],
+    v: NodeId,
+) -> Result<NodeId, RefuseError> {
+    for n in named {
+        if n.kind != NamedKind::Field {
+            return Err(refuse(
+                node,
+                m,
+                "non-field named arg in keyword joint (expected `name = measure` components)",
+            ));
+        }
+    }
+
+    let vrec = expect_builtin_call(m, v, "record")
+        .ok_or_else(|| refuse(v, m, "joint value must be a record"))?;
+    // A stray positional element mixed with the named fields (e.g. `record(0.9,
+    // x = 0.5, y = 1.0)`) is not a well-formed field-keyed value record — refuse
+    // rather than silently drop the positional slot, mirroring the equivalent
+    // guard on `match_independent_record` ("value record with positional args").
+    if !vrec.args.is_empty() {
+        return Err(refuse(v, m, "joint value record carries positional args"));
+    }
+    let vrec_named: Vec<NamedArg> = vrec.named.to_vec();
+
+    let mut terms = Vec::with_capacity(named.len());
+    for field in named {
+        let pinned = lookup_field(m, &vrec_named, field.name).ok_or_else(|| {
+            refuse(
+                v,
+                m,
+                &format!(
+                    "missing field {} in joint value record",
+                    m.resolve(field.name)
+                ),
+            )
+        })?;
+        terms.push(lower_measure_density(m, field.value, pinned)?);
     }
     Ok(fold_add(m, &terms))
 }
@@ -1883,46 +2126,39 @@ pub(crate) fn build_density_term(
 }
 
 // ---------------------------------------------------------------------------
-// Helper: extract (measure_expr, v) from logdensityof(lawof(M), v)
+// Helper: reduce a logdensityof measure argument to its underlying measure
 // ---------------------------------------------------------------------------
 
-/// Extract `(measure_expr, v)` from `logdensityof(measure, v)`.
+/// Reduce a `logdensityof` measure argument to the measure expression the
+/// recursive dispatcher expects.
 ///
-/// The first argument is the measure whose density we score. It comes in two
-/// shapes that both reduce to "the underlying measure":
+/// The measure argument comes in two shapes that both reduce to "the underlying
+/// measure":
 ///
 /// * `lawof(M_value)` — `lawof` reifies a (stochastic) value to its law; we
 ///   score the value's law, i.e. `M_value` (a record-of-draws, a combinator,
 ///   …). This is the inline form the Task-3/4 record/combinator goldens use.
 /// * a bare measure expression — e.g. `(%ref self pp)` where `pp = kchain(…)`
-///   (or any combinator binding). Here the measure is already a measure; there
-///   is no `lawof` wrapper to strip.
+///   (or any combinator binding), or a grafted cross-module measure handle
+///   (`logdensityof(m.d, v)`). Here the measure is already a measure; there is
+///   no `lawof` wrapper to strip.
 ///
 /// We resolve one level of ref indirection and strip a `lawof` if present;
-/// otherwise we hand the (resolved) measure node straight to the dispatcher,
-/// which classifies it by op.
-fn extract_logdensityof_args(m: &Module, query: NodeId) -> Result<(NodeId, NodeId), RefuseError> {
-    let q = expect_builtin_call(m, query, "logdensityof")
-        .ok_or_else(|| refuse(query, m, "expected logdensityof"))?;
-    if q.args.len() != 2 {
-        return Err(refuse(query, m, "logdensityof expects 2 args"));
-    }
-    let measure_arg = q.args[0];
-    let v = q.args[1];
-
-    // Resolve a single level of `(%ref self x)` indirection so a measure bound by
-    // name (`pp = kchain(…)`) is classified by its constructor, and a `lawof`
-    // wrapper is visible whether inline or behind a ref.
+/// otherwise we hand the (original, unresolved) measure node straight to the
+/// dispatcher, which itself resolves one ref level and dispatches by op.
+///
+/// Takes the measure argument node directly (not the enclosing `logdensityof`
+/// query), so it works on a grafted node the caller substituted for the original
+/// cross-module ref.
+fn measure_of_arg(m: &Module, measure_arg: NodeId) -> Result<NodeId, RefuseError> {
     let (resolved, _) = resolve_ref_one(m, measure_arg);
     if let Some(law) = expect_builtin_call(m, resolved, "lawof") {
         if law.args.len() != 1 {
             return Err(refuse(resolved, m, "lawof expects 1 arg"));
         }
-        return Ok((law.args[0], v));
+        return Ok(law.args[0]);
     }
-    // Bare measure expression: hand the original (unresolved) node to the
-    // dispatcher, which itself resolves one ref level and dispatches by op.
-    Ok((measure_arg, v))
+    Ok(measure_arg)
 }
 
 // ---------------------------------------------------------------------------

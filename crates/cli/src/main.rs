@@ -501,15 +501,19 @@ fn prepare_cmd(files: &[PathBuf], update: bool) -> Result<(), Failure> {
     flatppl_cli::resolve::fetch_graph(&locations, &resolver)
 }
 
-/// `flatppl determinize <in.flatppl> [-o out]` — legalize a FlatPPL model to
-/// the deterministic FlatPDL profile (eliminate the measure layer), printing
-/// canonical FlatPPL syntax to `output`/stdout. Refuses (exit 3, via
-/// `Failure::Refuse`) any construct the determiniser cannot legalize.
-#[cfg(feature = "determinize")]
-fn determinize_cmd(input: &Path, output: Option<&Path>) -> Result<(), Failure> {
+/// Parse `input` and assemble its cross-module bundle, then run the type/shape
+/// trace over it — the common front end for `determinize`/`stablehlo` before
+/// legalizing to FlatPDL. Mirrors `infer_cmd`'s bundle-building (same
+/// cache-only resolver, same `Level::Shape`) so `load_module` refs resolve
+/// identically across verbs; surfaces inference errors as a `Failure` so a
+/// mistyped model refuses loudly instead of being lowered blind.
+#[cfg(any(feature = "determinize", feature = "stablehlo"))]
+fn load_and_infer(
+    input: &Path,
+) -> Result<(flatppl_core::Module, flatppl_infer::ModuleBundle), Failure> {
     let source =
         fs::read_to_string(input).map_err(|e| format!("reading `{}`: {e}", input.display()))?;
-    let module = match flatppl_cli::read_module(Format::FlatPpl, &source) {
+    let mut module = match flatppl_cli::read_module(Format::FlatPpl, &source) {
         Ok(m) => m,
         Err((message, line, span)) => {
             return Err(Failure::Diagnostic {
@@ -521,7 +525,42 @@ fn determinize_cmd(input: &Path, output: Option<&Path>) -> Result<(), Failure> {
             });
         }
     };
-    let lowered = flatppl_determinizer::determinize(&module).map_err(|e| {
+
+    // Assemble the cross-module bundle: resolve the model's transitive
+    // `load_module` dependencies from the local cache (+ local files) so the
+    // determiniser can graft in cross-module measure refs, same as `infer`.
+    let resolver = CliResolver::cache_only();
+    let in_loc = Location::Local(input.to_path_buf());
+    let (bundle, _data_sources) = flatppl_cli::resolve::build_bundle(&module, &in_loc, &resolver)?;
+    let diags = flatppl_infer::infer_module(&mut module, &bundle, flatppl_infer::Level::Shape);
+    let mut errors = 0u32;
+    for d in &diags {
+        match d.severity {
+            flatppl_infer::Severity::Error => {
+                errors += 1;
+                eprintln!("error: {}", d.message);
+            }
+            flatppl_infer::Severity::Note => eprintln!("note: {}", d.message),
+        }
+    }
+    if errors > 0 {
+        return Err(Failure::Plain(format!(
+            "inference found {errors} error(s) in `{}`",
+            input.display()
+        )));
+    }
+
+    Ok((module, bundle))
+}
+
+/// `flatppl determinize <in.flatppl> [-o out]` — legalize a FlatPPL model to
+/// the deterministic FlatPDL profile (eliminate the measure layer), printing
+/// canonical FlatPPL syntax to `output`/stdout. Refuses (exit 3, via
+/// `Failure::Refuse`) any construct the determiniser cannot legalize.
+#[cfg(feature = "determinize")]
+fn determinize_cmd(input: &Path, output: Option<&Path>) -> Result<(), Failure> {
+    let (module, bundle) = load_and_infer(input)?;
+    let lowered = flatppl_determinizer::determinize_with(&module, &bundle).map_err(|e| {
         Failure::Refuse(format!(
             "determinize: refuse {} (node {:?}): {}",
             e.construct, e.node, e.reason
@@ -544,21 +583,8 @@ fn determinize_cmd(input: &Path, output: Option<&Path>) -> Result<(), Failure> {
 /// convention as `determinize`.
 #[cfg(feature = "stablehlo")]
 fn stablehlo_cmd(input: &Path, mode: &str, output: Option<&Path>) -> Result<(), Failure> {
-    let source =
-        fs::read_to_string(input).map_err(|e| format!("reading `{}`: {e}", input.display()))?;
-    let module = match flatppl_cli::read_module(Format::FlatPpl, &source) {
-        Ok(m) => m,
-        Err((message, line, span)) => {
-            return Err(Failure::Diagnostic {
-                path: input.to_path_buf(),
-                source,
-                message,
-                line,
-                span,
-            });
-        }
-    };
-    let lowered = flatppl_determinizer::determinize(&module).map_err(|e| {
+    let (module, bundle) = load_and_infer(input)?;
+    let lowered = flatppl_determinizer::determinize_with(&module, &bundle).map_err(|e| {
         Failure::Refuse(format!(
             "determinize: refuse {} (node {:?}): {}",
             e.construct, e.node, e.reason

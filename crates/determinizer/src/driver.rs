@@ -11,6 +11,7 @@
 
 use crate::refuse::RefuseError;
 use flatppl_core::{BindingId, CallHead, Module, Node, NodeId, Ref, RefNs, Scalar, Symbol};
+use flatppl_infer::ModuleBundle;
 
 /// The measure-algebra vocabulary: op names whose presence signals a node that
 /// must be eliminated before the module is FlatPDL-conformant. This list matches
@@ -49,8 +50,24 @@ const MEASURE_VOCAB: &[&str] = &[
 /// Transform `m` into a FlatPDL-conformant module, or return the first construct
 /// that cannot be legalized.
 ///
-/// Works on a clone of `m`; the original is not modified.
+/// Works on a clone of `m`; the original is not modified. Resolves only
+/// same-module refs — a cross-module (`load_module`) measure ref refuses. For a
+/// model with loaded dependencies, use [`determinize_with`] and supply the
+/// dependency bundle.
 pub fn determinize(m: &Module) -> Result<Module, RefuseError> {
+    determinize_with(m, &ModuleBundle::new())
+}
+
+/// Like [`determinize`], but resolves cross-module (`load_module`) measure refs
+/// against `bundle` — the same `ModuleBundle` the host assembled for inference
+/// (path → parsed dependency `Module`). A `(%ref <alias> member)` reaching a
+/// measure/likelihood-kernel position is grafted from the loaded submodule into
+/// the host and then lowered like any local measure (see
+/// [`crate::crossmodule`]). With an empty bundle this is byte-identical to
+/// [`determinize`] for every self-contained model.
+///
+/// Works on a clone of `m`; the original is not modified.
+pub fn determinize_with(m: &Module, bundle: &ModuleBundle) -> Result<Module, RefuseError> {
     let mut work = m.clone();
 
     loop {
@@ -80,7 +97,7 @@ pub fn determinize(m: &Module) -> Result<Module, RefuseError> {
                 }
             }
             Some((bid, node_id)) => {
-                apply_rule(&mut work, bid, node_id)?;
+                apply_rule(&mut work, bid, node_id, bundle)?;
                 // Loop: re-scan after the rewrite.
             }
         }
@@ -183,10 +200,43 @@ fn is_measure_layer(m: &Module, id: NodeId) -> bool {
 /// node (β-law replaces a `lawof(draw ?m)` with a reference to `?m`'s node —
 /// zero new nodes since we reuse the existing `?m` NodeId). Each rewrite
 /// strictly lowers the count of measure-layer nodes, guaranteeing termination.
-fn apply_rule(m: &mut Module, bid: BindingId, target_node: NodeId) -> Result<(), RefuseError> {
+/// The cross-module-graft branch (`graft_query_target`) is the exception — it
+/// can add many nodes and leaves the `logdensityof` in place for the next
+/// iteration — and instead relies on the progress invariant documented at
+/// `graft_query_target`: the query target goes from a module-ref to a local
+/// node, so a given query can graft at most once.
+fn apply_rule(
+    m: &mut Module,
+    bid: BindingId,
+    target_node: NodeId,
+    bundle: &ModuleBundle,
+) -> Result<(), RefuseError> {
     // --- density disintegration: logdensityof(lawof(M), v) → deterministic density ---
     if is_op(m, target_node, "logdensityof") {
-        let new_root = crate::density::lower_logdensityof(m, target_node)?;
+        // Defer-and-reloop for a cross-module query TARGET (GAP D). When the
+        // query's measure target is (or resolves via one `(%ref self …)` hop to)
+        // a cross-module `(%ref <alias> member)`, graft the referenced submodule
+        // subtree into the host and rewrite the query to point at the LOCAL
+        // grafted node — WITHOUT lowering yet. Returning here lets the driver loop
+        // re-run inference at the top of the NEXT iteration, which types the
+        // freshly-grafted subtree (crucially an `iid`'s const-evaluated domain
+        // shape). The re-scan then finds this same query with a now-local, typed
+        // target, `graft_query_target` returns `None`, and it lowers fully with a
+        // resolvable `iid_static_size`; the post-lowering sweep likewise runs
+        // after the grafted (now-typed) dead kernel binding has been classified,
+        // so it is swept rather than surviving into the conformance check. Without
+        // this deferral the old inline graft-then-lower ran on still-untyped nodes
+        // in a single call (iid-size refuse / KernelNotBuiltinArg refuse).
+        if let Some(new_query) = crate::density::graft_query_target(m, target_node, bundle)? {
+            let new_rhs = substitute_in_tree(m, m.binding(bid).rhs, target_node, new_query);
+            m.set_binding_rhs(bid, new_rhs);
+            // The intermediate `x = m.L` self-ref binding (if any) and the
+            // `helpers = load_module(…)` binding may now be dead; sweep the
+            // measure-typed ones so the next scan is clean.
+            sweep_dead_measure_bindings(m);
+            return Ok(());
+        }
+        let new_root = crate::density::lower_logdensityof(m, target_node, bundle)?;
         let new_rhs = substitute_in_tree(m, m.binding(bid).rhs, target_node, new_root);
         m.set_binding_rhs(bid, new_rhs);
         // After lowering a logdensityof query, some measure bindings (e.g.

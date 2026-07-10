@@ -48,26 +48,14 @@ lp = logdensityof(pp, record(y = 0.5))";
 // live in `tests/numeric.rs` (`weighted_function_weight_oracle`,
 // `logweighted_function_weight_oracle`).
 
-// Keyword `joint(name = M, …)` (named components, record variate) shares the
-// `joint` op name with the positional form but is deliberately out of scope:
-// its components live in `named`, not `args`, so it must not fall through to
-// the positional arg-count guard (which would misreport it as an under-sized
-// positional `joint`). The determiniser must refuse with a distinct message
-// naming keyword joint specifically.
-#[test]
-fn keyword_joint_refuses_with_distinct_message() {
-    let src = "\
-a = Normal(mu = 0.0, sigma = 1.0)
-b = Normal(mu = 1.0, sigma = 2.0)
-d = joint(x = a, y = b)
-lp = logdensityof(d, record(x = 0.5, y = 0.5))";
-    let m = parse_infer(src);
-    let err = determinize(&m).expect_err("keyword joint must refuse, not lower");
-    assert!(
-        err.reason.contains("keyword joint"),
-        "refusal names keyword joint distinctly: {err:?}"
-    );
-}
+// Note: keyword `joint(name = M, …)` (named components, record variate) is NO
+// LONGER refused — it now lowers to `Σᵢ logdensityof(Mᵢ, v.nameᵢ)`, matching
+// the positional form's independent-product rule but scored through the
+// value record's fields rather than a `get0`-sliced `cat` vector (§04
+// example, §06 "joint and iid"). The lowering-path tests live in
+// `tests/density_golden.rs` (`keyword_joint_lowers_to_sum_of_field_densities`,
+// `keyword_joint_missing_value_field_refuses`,
+// `mixed_positional_keyword_joint_refuses`).
 
 // A positional `joint` whose component is NON-SCALAR (here `iid(Normal, 2)`,
 // measure domain array[2]) cannot use the `get0(v, i)` one-slot-per-component
@@ -490,9 +478,10 @@ lp = logdensityof(lawof(record(a = a)), record(0.5))";
 
 // `joint_likelihood` combines a POSITIONAL list of likelihoods (§06 "Combining
 // likelihoods": `log L(θ) = Σᵢ log Lᵢ(θ)`). A KEYWORD form (`joint_likelihood(a
-// = L1, b = L2)`, named components) has no §06 meaning — mirroring how a keyword
-// `joint(name = M, …)` is refused — so it must refuse, not silently drop the
-// named components or guess a combination order.
+// = L1, b = L2)`, named components) has no §06 meaning of its own — unlike a
+// keyword `joint(name = M, …)`, which DOES lower (§04/§06 record-variate
+// form) — so it must refuse, not silently drop the named components or guess
+// a combination order.
 #[test]
 fn joint_likelihood_keyword_form_refuses() {
     let src = "\

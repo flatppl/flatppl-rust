@@ -286,6 +286,66 @@ lp = logdensityof(lawof(record(a = a)), record(a = 0.5))";
     );
 }
 
+// normalize(truncate(Ctor, S)) takes the CDF-Z transport path (`kernel_and_input`
+// builds a `builtin_touniform(kernel, kernel_input, ·)` pair for the closed-form
+// Z). A POSITIONAL-arg base constructor (`Normal(0.0, 1.0)`) is equivalent to the
+// keyword form (spec §04 calling conventions) and must lower to the identical
+// FlatPDL, not refuse. Regression for buffy gap A: `kernel_and_input` was the one
+// remaining keyword-only site post-#143 (`split_kernel_constructor` positional
+// support), refusing with "primitive constructor with positional args not
+// supported" on a positional truncation base.
+#[test]
+fn normalize_truncate_positional_ctor_lowers_same_as_keyword() {
+    let positional = "\
+hn = normalize(truncate(Normal(0.0, 1.0), interval(0.0, inf)))
+lp = logdensityof(hn, 0.5)";
+    let keyword = "\
+hn = normalize(truncate(Normal(mu = 0.0, sigma = 1.0), interval(0.0, inf)))
+lp = logdensityof(hn, 0.5)";
+    let pir_pos = flatppl_flatpir::write(&determinize_src(positional));
+    let pir_kw = flatppl_flatpir::write(&determinize_src(keyword));
+    assert!(
+        pir_pos.contains("builtin_touniform"),
+        "CDF-Z transport present:\n{pir_pos}"
+    );
+    assert!(
+        pir_pos.contains("builtin_logdensityof"),
+        "inner density present:\n{pir_pos}"
+    );
+    assert_eq!(
+        pir_pos, pir_kw,
+        "positional and keyword truncation bases lower to identical FlatPDL:\npositional:\n{pir_pos}\nkeyword:\n{pir_kw}"
+    );
+}
+
+// The same positional≡keyword equivalence for a non-Normal constructor, in the
+// eight-schools shape (`tau ~ normalize(truncate(Cauchy(0, 5), interval(0, inf)))`).
+// `Cauchy` has params ["location", "scale"] (§08), differently named/ordered from
+// Normal's mu/sigma — confirms the fix is not Normal-specific.
+#[test]
+fn normalize_truncate_positional_cauchy_lowers_same_as_keyword() {
+    let positional = "\
+hn = normalize(truncate(Cauchy(0.0, 5.0), interval(0.0, inf)))
+lp = logdensityof(hn, 1.0)";
+    let keyword = "\
+hn = normalize(truncate(Cauchy(location = 0.0, scale = 5.0), interval(0.0, inf)))
+lp = logdensityof(hn, 1.0)";
+    let pir_pos = flatppl_flatpir::write(&determinize_src(positional));
+    let pir_kw = flatppl_flatpir::write(&determinize_src(keyword));
+    assert!(
+        pir_pos.contains("builtin_touniform"),
+        "CDF-Z transport present:\n{pir_pos}"
+    );
+    assert!(
+        pir_pos.contains("builtin_logdensityof"),
+        "inner density present:\n{pir_pos}"
+    );
+    assert_eq!(
+        pir_pos, pir_kw,
+        "positional and keyword Cauchy truncation bases lower to identical FlatPDL:\npositional:\n{pir_pos}\nkeyword:\n{pir_kw}"
+    );
+}
+
 // pushfwd(bijection(exp, log, identity), M): logdensityof → density(M, log(v)) - identity(log(v))
 #[test]
 fn pushfwd_bijection_lowers_to_sub_density_logvol() {
@@ -573,6 +633,188 @@ lp = logdensityof(L, record(mu = 2.0))";
     assert!(
         !pir.contains("likelihoodof") && !pir.contains("lawof") && !pir.contains("(draw "),
         "measure layer gone:\n{pir}"
+    );
+    assert!(
+        flatppl_determinizer::is_flatpdl(&out).is_ok(),
+        "is_flatpdl failed:\n{pir}"
+    );
+}
+
+// Keyword/record `joint(x = M1, y = M2)` (§04 example, §06 "joint and iid
+// (independent products)"): the variate is a RECORD keyed by the same field
+// names, and the density is the sum of each component scored at its matching
+// record field — `logdensityof(joint(x = M1, y = M2), record(x = vx, y = vy))`
+// = `logdensityof(M1, vx) + logdensityof(M2, vy)`. Unlike positional `joint`
+// (which slices a flat `cat` vector via `get0` and so needs a scalar-component
+// guard), a record field can be ANY shape — no such guard applies here.
+#[test]
+fn keyword_joint_lowers_to_sum_of_field_densities() {
+    let src = "\
+j = joint(x = Normal(mu = 0.0, sigma = 1.0), y = Exponential(rate = 1.0))
+lp = logdensityof(j, record(x = 0.5, y = 1.0))";
+    let out = determinize_src(src);
+    let pir = flatppl_flatpir::write(&out);
+    assert_eq!(
+        pir.matches("builtin_logdensityof").count(),
+        2,
+        "two component densities (one per field):\n{pir}"
+    );
+    assert!(!pir.contains("(joint "), "no joint left:\n{pir}");
+    assert!(
+        pir.contains("(%field mu 0.0) (%field sigma 1.0)"),
+        "x component scores Normal(mu=0,sigma=1):\n{pir}"
+    );
+    assert!(
+        pir.contains("(%field rate 1.0)"),
+        "y component scores Exponential(rate=1):\n{pir}"
+    );
+    assert!(
+        flatppl_determinizer::is_flatpdl(&out).is_ok(),
+        "is_flatpdl failed:\n{pir}"
+    );
+}
+
+// A keyword-joint value record MISSING one of the joint's component fields is
+// malformed — refuse rather than silently drop the missing component's
+// density term. Pins whichever stage actually rejects it (inference may
+// reject the mismatched record shape before determinize ever sees it, or the
+// determinizer's own field lookup may refuse first).
+#[test]
+fn keyword_joint_missing_value_field_refuses() {
+    let src = "\
+j = joint(x = Normal(mu = 0.0, sigma = 1.0), y = Exponential(rate = 1.0))
+lp = logdensityof(j, record(x = 0.5))";
+    let mut m = flatppl_syntax::parse(src).unwrap();
+    let diagnostics = flatppl_infer::infer(&mut m);
+    if diagnostics
+        .iter()
+        .any(|d| d.severity == flatppl_infer::Severity::Error)
+    {
+        // Inference itself rejects the shape-mismatched value record — pin
+        // that as the actual refusal point rather than proceeding to
+        // determinize (which would then be exercising an already-invalid
+        // module).
+        return;
+    }
+    let err =
+        determinize(&m).expect_err("a joint value record missing a component field must refuse");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("missing field") || msg.contains("record"),
+        "refusal should name the missing field / record shape: {msg}"
+    );
+}
+
+// A `joint` mixing positional and keyword components is neither the
+// positional `cat`-variate form nor the keyword record-variate form — refuse
+// rather than guess which one was meant. Pins whichever stage actually
+// rejects the mixed call (the parser/inference may already reject a call
+// mixing positional args after keyword args, or the determinizer's own
+// `lower_joint` dispatch may refuse first).
+#[test]
+fn mixed_positional_keyword_joint_refuses() {
+    let src = "\
+j = joint(Normal(mu = 0.0, sigma = 1.0), y = Exponential(rate = 1.0))
+lp = logdensityof(j, record(x = 0.5, y = 1.0))";
+    let parsed = flatppl_syntax::parse(src);
+    let mut m = match parsed {
+        Err(_) => return, // the parser itself rejects mixed positional/keyword args
+        Ok(m) => m,
+    };
+    let diagnostics = flatppl_infer::infer(&mut m);
+    if diagnostics
+        .iter()
+        .any(|d| d.severity == flatppl_infer::Severity::Error)
+    {
+        // Inference rejects the mixed-form joint before determinize sees it.
+        return;
+    }
+    let err = determinize(&m).expect_err("a mixed positional/keyword joint must refuse");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("joint"),
+        "refusal should name the joint construct: {msg}"
+    );
+}
+
+// A keyword-joint VALUE record carrying a stray positional element mixed with
+// its named fields (`record(0.9, x = 0.5, y = 1.0)`) must refuse — not
+// silently drop the positional slot and score only the named fields. Mirrors
+// the equivalent guard already on `match_independent_record` ("value record
+// with positional args").
+#[test]
+fn keyword_joint_value_record_with_positional_args_refuses() {
+    let src = "\
+j = joint(x = Normal(mu = 0.0, sigma = 1.0), y = Exponential(rate = 1.0))
+lp = logdensityof(j, record(0.9, x = 0.5, y = 1.0))";
+    let mut m = flatppl_syntax::parse(src).unwrap();
+    let diagnostics = flatppl_infer::infer(&mut m);
+    if diagnostics
+        .iter()
+        .any(|d| d.severity == flatppl_infer::Severity::Error)
+    {
+        // Inference itself rejects the value record shape before determinize
+        // ever sees it — pin that as the actual refusal point.
+        return;
+    }
+    let err = determinize(&m).expect_err(
+        "a joint value record with a stray positional arg must refuse, not silently drop it",
+    );
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("positional"),
+        "refusal should name the positional arg in the value record: {msg}"
+    );
+}
+
+// Field-name matching must be truly name-based, not an accident of the value
+// record's field ORDER matching the joint declaration's order. Score the same
+// joint at a REORDERED value record (`y` before `x`) and assert the emitted
+// FlatPIR is byte-identical to scoring the in-order record — since
+// name-matching is order-independent, the two must produce exactly the same
+// pairing (Normal density at 0.5, Exponential density at 1.0), not a
+// positional-index regression that would swap the values.
+#[test]
+fn keyword_joint_matches_fields_by_name_not_order() {
+    let in_order = "\
+j = joint(x = Normal(mu = 0.0, sigma = 1.0), y = Exponential(rate = 1.0))
+lp = logdensityof(j, record(x = 0.5, y = 1.0))";
+    let reordered = "\
+j = joint(x = Normal(mu = 0.0, sigma = 1.0), y = Exponential(rate = 1.0))
+lp = logdensityof(j, record(y = 1.0, x = 0.5))";
+    let pir_in_order = flatppl_flatpir::write(&determinize_src(in_order));
+    let pir_reordered = flatppl_flatpir::write(&determinize_src(reordered));
+    assert_eq!(
+        pir_in_order, pir_reordered,
+        "name-based field matching must be order-independent:\nin-order:\n{pir_in_order}\nreordered:\n{pir_reordered}"
+    );
+}
+
+// The design rationale's core claim for keyword `joint` is "no scalar
+// restriction — build_density_term domain-checks the component". Exercise a
+// joint mixing a scalar component (`Normal`) with a NON-SCALAR component
+// (`MvNormal`, vector domain) and confirm both lower to their own
+// builtin_logdensityof term rather than being refused or mis-sliced.
+#[test]
+fn keyword_joint_lowers_non_scalar_component() {
+    let src = "\
+j = joint(x = Normal(mu = 0.0, sigma = 1.0), y = MvNormal(mu = [0.0, 0.0], cov = eye(2)))
+lp = logdensityof(j, record(x = 0.5, y = [0.2, 0.3]))";
+    let out = determinize_src(src);
+    let pir = flatppl_flatpir::write(&out);
+    assert_eq!(
+        pir.matches("builtin_logdensityof").count(),
+        2,
+        "two component densities, one scalar and one non-scalar:\n{pir}"
+    );
+    assert!(!pir.contains("(joint "), "no joint left:\n{pir}");
+    assert!(
+        pir.contains("(%field mu 0.0) (%field sigma 1.0)"),
+        "x component scores Normal(mu=0,sigma=1):\n{pir}"
+    );
+    assert!(
+        pir.contains("MvNormal"),
+        "y component scores the non-scalar MvNormal:\n{pir}"
     );
     assert!(
         flatppl_determinizer::is_flatpdl(&out).is_ok(),
