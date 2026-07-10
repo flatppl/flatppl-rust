@@ -172,6 +172,73 @@ fn pushfwd_matrix_affine_lowers() {
 }
 
 #[test]
+fn pushfwd_matrix_affine_nonidentity_logdet() {
+    // pushfwd_matrix_affine_lowers uses an IDENTITY L, so log|det L| = 0 — that
+    // can't distinguish a correct log-det from a wrong one (added instead of
+    // subtracted, or L vs L^-1 would ALSO give 0). A non-identity L with a
+    // nonzero mu pins a numerically-meaningful log-det. Byte-equal against the
+    // explicit bijection(f, f_inv, logvol) form (cleaner than substring-matching
+    // through the printer's wedged `%meta` annotations, and pins the WHOLE
+    // synthesized change-of-variables, not just that `logabsdet` appears
+    // somewhere).
+    let synth = pir("mu = [1.0, 2.0]\n\
+         L = [[2.0, 0.0], [0.0, 3.0]]\n\
+         d = pushfwd(x -> mu + L * x, iid(Normal(0.0, 1.0), 2))\n\
+         lp = logdensityof(d, [0.5, 0.5])");
+    let explicit = pir("mu = [1.0, 2.0]\n\
+         L = [[2.0, 0.0], [0.0, 3.0]]\n\
+         d = pushfwd(bijection(x -> mu + L * x, x -> linsolve(L, x - mu), x -> logabsdet(L)), iid(Normal(0.0, 1.0), 2))\n\
+         lp = logdensityof(d, [0.5, 0.5])");
+    assert!(synth.contains("builtin_logdensityof"), "got:\n{synth}");
+    assert_eq!(
+        synth, explicit,
+        "synthesized non-identity matrix-affine bijection must match the explicit \
+         bijection(f, x -> linsolve(L, x - mu), x -> logabsdet(L)) form"
+    );
+}
+
+#[test]
+fn pushfwd_matrix_affine_broadcast_add_lowers() {
+    // pushfwd_matrix_affine_lowers exercises the plain `add` outer form
+    // (`mu + L * x`); this pins the OTHER pinned outer form, the dotted/
+    // broadcast `mu .+ L * x` (`broadcast(Const("add"), mu, mul(L, x))`),
+    // recognised by affine_add_operands's `broadcast` arm. Byte-equal against
+    // the plain-`add` version with identical mu/L: both outer forms must
+    // synthesize the exact same change-of-variables.
+    let broadcast = pir("mu = [0.0, 0.0]\n\
+         L = [[1.0, 0.0], [0.0, 1.0]]\n\
+         d = pushfwd(x -> mu .+ L * x, iid(Normal(0.0, 1.0), 2))\n\
+         lp = logdensityof(d, [0.5, 0.5])");
+    let plain = pir("mu = [0.0, 0.0]\n\
+         L = [[1.0, 0.0], [0.0, 1.0]]\n\
+         d = pushfwd(x -> mu + L * x, iid(Normal(0.0, 1.0), 2))\n\
+         lp = logdensityof(d, [0.5, 0.5])");
+    assert!(
+        broadcast.contains("builtin_logdensityof"),
+        "got:\n{broadcast}"
+    );
+    assert_eq!(
+        broadcast, plain,
+        "broadcast (.+) and plain (+) matrix-affine outer forms must lower identically"
+    );
+}
+
+#[test]
+fn pushfwd_scalar_scale_over_vector_refuses() {
+    // A SCALAR affine map (2.0 * x, no matrix) over a VECTOR variate: its true
+    // log-volume is n*log|2| (summed over all n axes), not the scalar chain's
+    // single log|2| — the module doc calls this exact danger out (§ vector-
+    // variate guard). Must refuse rather than fall through to the scalar-chain
+    // path and silently emit the wrong (too-small) log-volume.
+    let e = determinize(&parse_infer(
+        "d = pushfwd(x -> 2.0 * x, iid(Normal(mu = 0.0, sigma = 1.0), 3))\n\
+         lp = logdensityof(d, [0.1, 0.2, 0.3])",
+    ))
+    .expect_err("scalar affine over a vector variate must refuse, not scalar-chain-lower");
+    assert!(format!("{e:?}").contains("refuse"), "got: {e:?}");
+}
+
+#[test]
 fn pushfwd_coupled_nonlinear_multivariate_refuses() {
     // x -> exp(x) + L * x is a COUPLED NONLINEAR multivariate map: the additive
     // term exp(x) depends on the input, so the forward Jacobian is not the
@@ -202,4 +269,21 @@ fn pushfwd_three_op_interior_exp_lowers() {
     // (no other ops sit between exp and the input here), contributing the term
     // `x`; the mul-by-2 contributes log|2| = log(abs(2)):
     assert!(p.contains("(abs 2.0)"), "logvol log(2) term present:\n{p}");
+}
+
+#[test]
+fn pushfwd_matrix_affine_non_square_refuses() {
+    // A 2x3 bracket-literal L infers to the NESTED vec-of-vec matrix shape
+    // (Array{shape:[2], elem: Array{shape:[3], elem: Real}}) — not the flat
+    // rank-2 shape rowstack/colstack/lower_cholesky produce. linsolve/logabsdet
+    // need a square matrix; the non-square guard must recognise this nested
+    // form too, or a genuine non-square L silently lowers instead of refusing.
+    let e = determinize(&parse_infer(
+        "mu = [0.0, 0.0]\n\
+         L = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]\n\
+         d = pushfwd(x -> mu .+ L * x, iid(Normal(mu = 0.0, sigma = 1.0), 3))\n\
+         lp = logdensityof(d, [0.5, 0.5])",
+    ))
+    .expect_err("non-square bracket-literal L must refuse");
+    assert!(format!("{e:?}").contains("refuse"), "got: {e:?}");
 }

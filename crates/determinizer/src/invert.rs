@@ -610,19 +610,43 @@ fn refs_placeholder(m: &Module, id: NodeId, ph: Symbol) -> bool {
     false
 }
 
-/// Is `l`'s inferred type a matrix (2-D array) with CONFIRMED unequal static
-/// row/column counts? Such an `L` is not invertible. A matrix with
-/// dynamic/unknown dims, or an unresolved type, is NOT confirmed non-square (the
-/// standard MvNormal factor is square by construction) and is not over-refused.
+/// Is `l`'s inferred type a matrix with CONFIRMED unequal static row/column
+/// counts? Such an `L` is not invertible. A matrix with dynamic/unknown dims,
+/// or an unresolved type, is NOT confirmed non-square (the standard MvNormal
+/// factor is square by construction) and is not over-refused.
+///
+/// Two matrix representations are recognised:
+/// * the FLAT rank-2 array `Array{shape: [rows, cols], elem: Real}` — produced
+///   by `rowstack`/`colstack`/`lower_cholesky`;
+/// * the NESTED vec-of-vec array `Array{shape: [rows], elem: Array{shape:
+///   [cols], ..}}` — produced by a bracket-literal matrix `[[..], [..]]`
+///   (mirrors how `rowstack_type`, `crates/infer/src/ops.rs`, recognises the
+///   same nested shape when converting an array-of-vectors to a matrix).
 fn matrix_confirmed_non_square(m: &Module, l: NodeId) -> bool {
-    if let Some(Type::Array { shape, .. }) = m.type_of(l) {
-        if shape.len() == 2 {
-            if let (Dim::Static(rows), Dim::Static(cols)) = (shape[0], shape[1]) {
-                return rows != cols;
-            }
+    let Some(ty) = m.type_of(l) else {
+        return false;
+    };
+    match ty {
+        // Flat rank-2 matrix: shape = [rows, cols].
+        Type::Array { shape, .. } if shape.len() == 2 => {
+            matches!((shape[0], shape[1]), (Dim::Static(rows), Dim::Static(cols)) if rows != cols)
         }
+        // Nested vec-of-vec matrix: outer shape = [rows], element is itself an
+        // Array whose own shape = [cols].
+        Type::Array { shape, elem } if shape.len() == 1 => {
+            let Dim::Static(rows) = shape[0] else {
+                return false;
+            };
+            let Type::Array { shape: inner, .. } = elem.as_ref() else {
+                return false;
+            };
+            if inner.len() != 1 {
+                return false;
+            }
+            matches!(inner[0], Dim::Static(cols) if rows != cols)
+        }
+        _ => false,
     }
-    false
 }
 
 /// Is the base measure's variate domain a VECTOR — a 1-D array? The matrix-
