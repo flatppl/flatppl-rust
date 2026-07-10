@@ -38,11 +38,15 @@ prepare = ["dep:flatppl-fileaccess", "dep:flatppl-flatpir", "flatppl-fileaccess/
 hs3 = ["dep:flatppl-hs3", "dep:flatppl-flatpir"]
 fmtlint = ["dep:flatppl-lint"]
 # `determinize` legalizes a FlatPPL model to the deterministic FlatPDL profile
-# (eliminate the measure layer), refusing constructs it cannot lower.
-determinize = ["dep:flatppl-determinizer"]
+# (eliminate the measure layer), refusing constructs it cannot lower. It needs
+# `infer` too: before lowering it assembles the cross-module bundle (resolve
+# `load_module` refs from the cache) and runs the type/shape trace so a
+# mistyped model refuses loudly instead of being lowered blind.
+determinize = ["dep:flatppl-determinizer", "infer"]
 # `stablehlo` prints textual StableHLO from post-`determinize` FlatPDL; it
-# always determinizes first, so it pulls in the determiniser too.
-stablehlo = ["dep:flatppl-stablehlo", "dep:flatppl-determinizer"]
+# always determinizes first, so it pulls in the determiniser and (like
+# `determinize`) `infer` for cross-module bundle assembly too.
+stablehlo = ["dep:flatppl-stablehlo", "dep:flatppl-determinizer", "infer"]
 
 [dependencies]
 flatppl-core = { path = "../core" }
