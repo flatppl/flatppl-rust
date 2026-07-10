@@ -1285,40 +1285,22 @@ fn base_is_measure_combinator(m: &Module, base: NodeId) -> bool {
 /// base bound by name (`g = Normal(...); truncate(g, ...)`) is classified by
 /// its constructor.
 ///
-/// **Defense-in-depth: rejects positional constructor args.** This builds the
-/// kernel input record from `c.named` only, exactly like [`build_density_term`]'s
-/// primitive-constructor path — a positionally-written base (`Normal(0.0,
-/// 1.0)`) has no `named` entries, so silently proceeding would emit
-/// `builtin_touniform(Normal, record(), hi)`, a wrong (missing-parameter)
-/// input record, rather than refusing. In the current call graph this cannot
-/// actually fire: [`lower_normalize`] always lowers the base's own density
-/// term via `build_density_term` first (which already refuses
-/// `!c.args.is_empty()`) before reaching `kernel_and_input`, so a positional
-/// base is refused upstream. But that ordering is not enforced by this
-/// function's own signature, so the guard is repeated here rather than left
-/// implicit/order-dependent on the caller.
+/// **Positional-first-class.** Delegates to [`split_kernel_constructor`] — the
+/// same helper [`build_density_term`] and `sample::split_constructor` use — so
+/// a positionally-written base (`Normal(0.0, 1.0)`), a keyword base, or a mixed
+/// form all read to the identical `(ctor_sym, kwargs)` pair (spec §04 calling
+/// conventions: positional args bind to the constructor's ordered §08
+/// parameter names). `None` (not a builtin constructor call, or a malformed
+/// positional/keyword mix) refuses cleanly rather than mislowering.
 fn kernel_and_input(m: &mut Module, ctor: NodeId) -> Result<(NodeId, NodeId), RefuseError> {
     let (ctor_resolved, _) = resolve_ref_one(m, ctor);
-    let (ctor_sym, kwargs): (Symbol, Vec<(Symbol, NodeId)>) = {
-        let Node::Call(c) = m.node(ctor_resolved) else {
-            return Err(refuse(
-                ctor_resolved,
-                m,
-                "truncation base must be a primitive constructor",
-            ));
-        };
-        let CallHead::Builtin(sym) = c.head else {
-            return Err(refuse(ctor_resolved, m, "non-builtin truncation base"));
-        };
-        if !c.args.is_empty() {
-            return Err(refuse(
-                ctor_resolved,
-                m,
-                "primitive constructor with positional args not supported",
-            ));
-        }
-        (sym, c.named.iter().map(|n| (n.name, n.value)).collect())
-    };
+    let (ctor_sym, kwargs) = split_kernel_constructor(m, ctor_resolved).ok_or_else(|| {
+        refuse(
+            ctor_resolved,
+            m,
+            "truncation base must be a built-in constructor call with well-formed positional or keyword arguments",
+        )
+    })?;
     let kernel = m.alloc(Node::Const(ctor_sym));
     let input = build_record(m, &kwargs);
     Ok((kernel, input))

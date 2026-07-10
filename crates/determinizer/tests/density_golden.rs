@@ -286,6 +286,66 @@ lp = logdensityof(lawof(record(a = a)), record(a = 0.5))";
     );
 }
 
+// normalize(truncate(Ctor, S)) takes the CDF-Z transport path (`kernel_and_input`
+// builds a `builtin_touniform(kernel, kernel_input, ·)` pair for the closed-form
+// Z). A POSITIONAL-arg base constructor (`Normal(0.0, 1.0)`) is equivalent to the
+// keyword form (spec §04 calling conventions) and must lower to the identical
+// FlatPDL, not refuse. Regression for buffy gap A: `kernel_and_input` was the one
+// remaining keyword-only site post-#143 (`split_kernel_constructor` positional
+// support), refusing with "primitive constructor with positional args not
+// supported" on a positional truncation base.
+#[test]
+fn normalize_truncate_positional_ctor_lowers_same_as_keyword() {
+    let positional = "\
+hn = normalize(truncate(Normal(0.0, 1.0), interval(0.0, inf)))
+lp = logdensityof(hn, 0.5)";
+    let keyword = "\
+hn = normalize(truncate(Normal(mu = 0.0, sigma = 1.0), interval(0.0, inf)))
+lp = logdensityof(hn, 0.5)";
+    let pir_pos = flatppl_flatpir::write(&determinize_src(positional));
+    let pir_kw = flatppl_flatpir::write(&determinize_src(keyword));
+    assert!(
+        pir_pos.contains("builtin_touniform"),
+        "CDF-Z transport present:\n{pir_pos}"
+    );
+    assert!(
+        pir_pos.contains("builtin_logdensityof"),
+        "inner density present:\n{pir_pos}"
+    );
+    assert_eq!(
+        pir_pos, pir_kw,
+        "positional and keyword truncation bases lower to identical FlatPDL:\npositional:\n{pir_pos}\nkeyword:\n{pir_kw}"
+    );
+}
+
+// The same positional≡keyword equivalence for a non-Normal constructor, in the
+// eight-schools shape (`tau ~ normalize(truncate(Cauchy(0, 5), interval(0, inf)))`).
+// `Cauchy` has params ["location", "scale"] (§08), differently named/ordered from
+// Normal's mu/sigma — confirms the fix is not Normal-specific.
+#[test]
+fn normalize_truncate_positional_cauchy_lowers_same_as_keyword() {
+    let positional = "\
+hn = normalize(truncate(Cauchy(0.0, 5.0), interval(0.0, inf)))
+lp = logdensityof(hn, 1.0)";
+    let keyword = "\
+hn = normalize(truncate(Cauchy(location = 0.0, scale = 5.0), interval(0.0, inf)))
+lp = logdensityof(hn, 1.0)";
+    let pir_pos = flatppl_flatpir::write(&determinize_src(positional));
+    let pir_kw = flatppl_flatpir::write(&determinize_src(keyword));
+    assert!(
+        pir_pos.contains("builtin_touniform"),
+        "CDF-Z transport present:\n{pir_pos}"
+    );
+    assert!(
+        pir_pos.contains("builtin_logdensityof"),
+        "inner density present:\n{pir_pos}"
+    );
+    assert_eq!(
+        pir_pos, pir_kw,
+        "positional and keyword Cauchy truncation bases lower to identical FlatPDL:\npositional:\n{pir_pos}\nkeyword:\n{pir_kw}"
+    );
+}
+
 // pushfwd(bijection(exp, log, identity), M): logdensityof → density(M, log(v)) - identity(log(v))
 #[test]
 fn pushfwd_bijection_lowers_to_sub_density_logvol() {
