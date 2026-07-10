@@ -145,6 +145,48 @@ fn pushfwd_divide_chain_lowers() {
 }
 
 #[test]
+fn pushfwd_matrix_affine_lowers() {
+    // MvNormal construction (§06 case 1, §08 MvNormal `mu + lower_cholesky(cov) * _`):
+    // the forward map `mu + L * x` over a 2-vector standard normal
+    // `iid(Normal(0,1), 2)` is a matrix-vector affine bijection.
+    //   f_inv(y) = linsolve(L, y - mu)   (solve L x = y - mu)
+    //   logvol   = logabsdet(L)          (CONSTANT: a linear map's Jacobian is L)
+    // Cross-check (Σ = L Lᵀ): logdensityof(iid N(0,1), f_inv(v)) - logabsdet(L)
+    // = -n/2·log 2π - ½‖L⁻¹(v-mu)‖² - log|det L|
+    // = -n/2·log 2π - ½(v-mu)ᵀΣ⁻¹(v-mu) - ½·log|det Σ|  ≡  log N(v; mu, Σ).
+    let p = pir("mu = [0.0, 0.0]\n\
+         L = [[1.0, 0.0], [0.0, 1.0]]\n\
+         d = pushfwd(x -> mu + L * x, iid(Normal(0.0, 1.0), 2))\n\
+         lp = logdensityof(d, [0.5, 0.5])");
+    assert!(p.contains("builtin_logdensityof"), "got:\n{p}");
+    // f_inv(y) = linsolve(L, y - mu): the preimage solve (with its y - mu RHS).
+    assert!(
+        p.contains("(linsolve") && p.contains("(sub"),
+        "f_inv = linsolve(L, y - mu) present:\n{p}"
+    );
+    // logvol = logabsdet(L): the CONSTANT forward log-volume.
+    assert!(
+        p.contains("(logabsdet"),
+        "logvol = logabsdet(L) present:\n{p}"
+    );
+}
+
+#[test]
+fn pushfwd_coupled_nonlinear_multivariate_refuses() {
+    // x -> exp(x) + L * x is a COUPLED NONLINEAR multivariate map: the additive
+    // term exp(x) depends on the input, so the forward Jacobian is not the
+    // constant L and logabsdet(L) would be the wrong log-volume. Refuse rather
+    // than mislower (the shift `mu` must not reference the input placeholder).
+    let e = determinize(&parse_infer(
+        "L = [[1.0, 0.0], [0.0, 1.0]]\n\
+         d = pushfwd(x -> exp(x) + L * x, iid(Normal(0.0, 1.0), 2))\n\
+         lp = logdensityof(d, [0.5, 0.5])",
+    ))
+    .expect_err("coupled nonlinear multivariate map must refuse");
+    assert!(format!("{e:?}").contains("refuse"), "got: {e:?}");
+}
+
+#[test]
 fn pushfwd_three_op_interior_exp_lowers() {
     // x -> 2*exp(x) + 1 : f = 2e^x+1, f' = 2e^x, log|f'| = log 2 + x. The exp op
     // is INTERIOR (not outermost) — locks that its local logvol is evaluated at

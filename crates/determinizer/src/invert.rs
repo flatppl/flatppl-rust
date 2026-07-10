@@ -45,6 +45,24 @@
 //! log 2`. `x -> exp(2·x)` ⇒ `f_inv = log(y)/2`, `f'(x) = 2·e^{2x}`, `logvol =
 //! 2x + log 2` (the `2x` is `exp`'s partial-forward point).
 //!
+//! ## Matrix-affine (vector variate) — the MvNormal construction
+//!
+//! Over a VECTOR variate, a forward body `mu + L * x` (plain `add`) or `mu .+ L *
+//! x` (`broadcast(add, …)`) is a matrix-vector affine map (spec §06 case 1
+//! mandates recognising `mu + lower_cholesky(cov) * _`; §08 `MvNormal(mu, cov) ≡
+//! pushfwd(fn(mu + lower_cholesky(cov) * _), iid(Normal(0,1), n))`). We synthesise
+//! * **`f_inv(y) = linsolve(L, y − mu)`** — solve `L x = y − mu` for `x =
+//!   L⁻¹(y − mu)` (§07 `linsolve`), and
+//! * **`logvol = logabsdet(L)`** — the forward log-volume `log|det L|`, CONSTANT
+//!   in `x` (§07 `logabsdet`), emitted as an argument-ignoring lambda.
+//!
+//! The map is refused (Err) when `mu` or `L` references the input (a
+//! coupled/nonlinear map — Jacobian ≠ constant `L`) or `L` is confirmed
+//! non-square; a vector-variate body that is not this shape is also refused
+//! (not fallen through to the scalar chain, whose per-op log-volume would not be
+//! summed over the vector axes). See [`derive_matrix_affine`] for the MvNormal
+//! change-of-variables cross-check.
+//!
 //! Refuse-don't-mislower: an UNRECOGNISED forward function returns `Ok(None)`
 //! (the caller refuses); a RECOGNISED-but-non-invertible shape returns `Err`
 //! (refuse) — a non-affine `mul`/`add`/`sub` (both operands non-literal, e.g.
@@ -62,7 +80,7 @@
 use crate::density::{build_call, fold_add, refuse, resolve_ref_one};
 use crate::refuse::RefuseError;
 use flatppl_core::{
-    Call, CallHead, Inputs, Module, NamedArg, Node, NodeId, Ref, RefNs, Scalar, Symbol, Type,
+    Call, CallHead, Dim, Inputs, Module, NamedArg, Node, NodeId, Ref, RefNs, Scalar, Symbol, Type,
     ValueSet,
 };
 
@@ -133,6 +151,27 @@ pub(crate) fn derive_bijection(
             input_name,
             ph,
         } => {
+            // Matrix-vector affine map `mu + L * x` over a VECTOR variate (§06
+            // case 1: the engine MUST recognise maps such as
+            // `mu + lower_cholesky(cov) * _`). Keyed on the base measure's variate
+            // domain being a vector (1-D array) — this is the MvNormal construction
+            // (§08 MvNormal), distinct from the scalar chain below.
+            if domain_is_vector(domain) {
+                return match derive_matrix_affine(m, body, ph)? {
+                    Some(bij) => Ok(Some(bij)),
+                    // A vector-variate forward body that is not a recognised
+                    // matrix-affine map: refuse rather than fall through to the
+                    // scalar chain, whose per-op log-volume is not summed over the
+                    // vector's axes and would silently mislower (a scalar-scale
+                    // `k·x` over a vector has log-volume `n·log|k|`, not `log|k|`).
+                    None => Err(refuse(
+                        f,
+                        m,
+                        "forward map over a vector variate is not a recognised matrix-affine \
+                         map (mu + L * x) — refuse rather than mislower",
+                    )),
+                };
+            }
             // Single-op `pow(x, k)` keeps its Task-1 domain-restricted derivation;
             // a `pow` anywhere else in a chain is refused by the chain walk (its
             // input domain is not verifiable here).
@@ -432,6 +471,166 @@ fn derive_pow(
         build_call(m, "add", &[log_abs_k, term])
     });
     Ok(Some(Bijection { f_inv, logvol }))
+}
+
+/// Derive `(f_inv, logvol)` for a matrix-vector affine forward body
+/// `mu + L * x` (plain `add`) or `mu .+ L * x` (`broadcast(add, …)`) over a
+/// VECTOR variate — the MvNormal construction (§06 case 1; §08
+/// `MvNormal(mu, cov)` ≡ `pushfwd(fn(mu + lower_cholesky(cov) * _), iid(Normal(0,1), n))`).
+///
+/// * **`f_inv(y) = linsolve(L, y − mu)`** — solve `L x = y − mu` for the preimage
+///   `x = L⁻¹(y − mu)` (spec §07 `linsolve`: square `A`, vector `b`; `inv(L)` is
+///   avoided in favour of the direct solve).
+/// * **`logvol = logabsdet(L)`** — the FORWARD log-volume `log|det J_f| =
+///   log|det L|`, CONSTANT in `x` (a linear map has constant Jacobian `L`; spec
+///   §07 `logabsdet(A) = log|det A|`, square matrix → real scalar). Emitted as a
+///   lambda that IGNORES its argument, consistent with Tasks 1-2's logvol shape;
+///   the caller applies it at the preimage (`logvol(f_inv(v))`), which β-reduces
+///   to the constant.
+///
+/// MvNormal cross-check (Σ = L Lᵀ): the caller emits `logdensityof(iid N(0,1),
+/// f_inv(v)) − logvol(f_inv(v))` (§06 line 457) =
+/// `−n/2·log 2π − ½‖L⁻¹(v−mu)‖² − log|det L|`. With `‖L⁻¹u‖² = uᵀ(LLᵀ)⁻¹u =
+/// uᵀΣ⁻¹u` and `log|det L| = ½·log|det Σ|`, this is exactly
+/// `log N(v; mu, Σ)` — the standard-normal inner density plus `−logabsdet(L)`
+/// reproduces both the quadratic form AND the `−½log|det Σ|` normaliser. A
+/// wrong/absent log-det would be a silently wrong density; `logabsdet(L)`
+/// (neither doubled nor halved) is the correct forward log-volume.
+///
+/// * `Ok(Some(_))` — a recognised, invertible matrix-affine map.
+/// * `Ok(None)` — `body` is not an `add`/`broadcast(add, …)` of a shift and a
+///   `mul(L, x)` (the caller refuses).
+/// * `Err(_)` — recognised-but-non-invertible (refuse): the shift `mu` or the
+///   matrix `L` REFERENCES the input placeholder (a coupled/nonlinear map whose
+///   Jacobian is not the constant `L`), or `L` is a CONFIRMED non-square matrix
+///   (`linsolve`/`logabsdet` need a square matrix).
+fn derive_matrix_affine(
+    m: &mut Module,
+    body: NodeId,
+    ph: Symbol,
+) -> Result<Option<Bijection>, RefuseError> {
+    // All structural reads (immutable) BEFORE the mutable f_inv/logvol builds.
+    let Some((a, b)) = affine_add_operands(m, body) else {
+        return Ok(None);
+    };
+    // Identify the linear term `mul(L, x)` (matrix first, placeholder second) and
+    // take the OTHER summand as the shift `mu`.
+    let (mu, l) = if let Some(l) = matrix_times_ph(m, b, ph) {
+        (a, l)
+    } else if let Some(l) = matrix_times_ph(m, a, ph) {
+        (b, l)
+    } else {
+        return Ok(None);
+    };
+    // Coupled/nonlinear guard: a fixed matrix-affine map has `mu` and `L`
+    // independent of the input. If either references the placeholder, the
+    // forward Jacobian is not the constant `L` — refuse rather than emit a
+    // wrong `logabsdet(L)`.
+    if refs_placeholder(m, mu, ph) || refs_placeholder(m, l, ph) {
+        return Err(refuse(
+            body,
+            m,
+            "coupled/nonlinear multivariate forward map (the shift or matrix depends on the \
+             input) is not a fixed matrix-affine map — refuse rather than mislower",
+        ));
+    }
+    // Non-square guard: `linsolve`/`logabsdet` require a square `L` (§07). Only a
+    // CONFIRMED non-square matrix refuses; unknown/dynamic dims are the standard
+    // (square-by-construction) MvNormal factor and are not over-refused.
+    if matrix_confirmed_non_square(m, l) {
+        return Err(refuse(
+            body,
+            m,
+            "matrix factor L is not square (linsolve/logabsdet need a square matrix) — \
+             refuse rather than mislower",
+        ));
+    }
+    // f_inv(y) = linsolve(L, sub(y, mu)) — solve L x = y − mu.
+    let f_inv = lambda(m, |m, y| {
+        let diff = build_call(m, "sub", &[y, mu]);
+        build_call(m, "linsolve", &[l, diff])
+    });
+    // logvol(_) = logabsdet(L) — constant; the argument is ignored.
+    let logvol = lambda(m, |m, _y| build_call(m, "logabsdet", &[l]));
+    Ok(Some(Bijection { f_inv, logvol }))
+}
+
+/// The two summands of a plain `add(x, y)` or a `broadcast(add, x, y)` forward
+/// body (the two pinned matrix-affine outer forms); `None` for any other head.
+/// A `broadcast`'s first arg is the operator constant `(%const add)`.
+fn affine_add_operands(m: &Module, body: NodeId) -> Option<(NodeId, NodeId)> {
+    let Node::Call(c) = m.node(body) else {
+        return None;
+    };
+    let CallHead::Builtin(sym) = c.head else {
+        return None;
+    };
+    match m.resolve(sym) {
+        "add" if c.args.len() == 2 => Some((c.args[0], c.args[1])),
+        "broadcast" if c.args.len() == 3 && is_const_named(m, c.args[0], "add") => {
+            Some((c.args[1], c.args[2]))
+        }
+        _ => None,
+    }
+}
+
+/// If `id` is `mul(L, x)` — a matrix-vector product whose SECOND operand is the
+/// input placeholder `x` — return the matrix operand `L`; otherwise `None`. (The
+/// pinned forward product is `L * x` = `mul(L, ph)`, matrix first.)
+fn matrix_times_ph(m: &Module, id: NodeId, ph: Symbol) -> Option<NodeId> {
+    let Node::Call(c) = m.node(id) else {
+        return None;
+    };
+    let CallHead::Builtin(sym) = c.head else {
+        return None;
+    };
+    if m.resolve(sym) != "mul" || c.args.len() != 2 {
+        return None;
+    }
+    is_placeholder_ref(m, c.args[1], ph).then_some(c.args[0])
+}
+
+/// Is `id` the bare builtin-operator constant `(%const <name>)` (e.g. the `add`
+/// operator passed as `broadcast`'s first argument)?
+fn is_const_named(m: &Module, id: NodeId, name: &str) -> bool {
+    matches!(m.node(id), Node::Const(sym) if m.resolve(*sym) == name)
+}
+
+/// Does the subtree at `id` reference the input placeholder `(%ref %local ph)`
+/// anywhere? A shift `mu` or matrix `L` that does is input-dependent — the map
+/// is coupled/nonlinear, not a fixed matrix-affine map.
+fn refs_placeholder(m: &Module, id: NodeId, ph: Symbol) -> bool {
+    let mut stack = vec![id];
+    while let Some(cur) = stack.pop() {
+        if is_placeholder_ref(m, cur, ph) {
+            return true;
+        }
+        m.for_each_child(cur, |c| stack.push(c));
+    }
+    false
+}
+
+/// Is `l`'s inferred type a matrix (2-D array) with CONFIRMED unequal static
+/// row/column counts? Such an `L` is not invertible. A matrix with
+/// dynamic/unknown dims, or an unresolved type, is NOT confirmed non-square (the
+/// standard MvNormal factor is square by construction) and is not over-refused.
+fn matrix_confirmed_non_square(m: &Module, l: NodeId) -> bool {
+    if let Some(Type::Array { shape, .. }) = m.type_of(l) {
+        if shape.len() == 2 {
+            if let (Dim::Static(rows), Dim::Static(cols)) = (shape[0], shape[1]) {
+                return rows != cols;
+            }
+        }
+    }
+    false
+}
+
+/// Is the base measure's variate domain a VECTOR — a 1-D array? The matrix-
+/// affine arm applies only over a vector variate (`mu + L * x`); a scalar domain
+/// takes the scalar-chain path, and a higher-rank array is not a recognised
+/// matrix-affine variate here.
+fn domain_is_vector(domain: &Type) -> bool {
+    matches!(domain, Type::Array { shape, .. } if shape.len() == 1)
 }
 
 /// Recognise the surface shape of a `pushfwd`'s (ref-resolved) forward argument:
