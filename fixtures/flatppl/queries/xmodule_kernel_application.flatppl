@@ -1,0 +1,6 @@
+flatppl_compat = "0.1"
+# Cross-module kernel APPLICATION: apply a kernel that lives in another module
+# (`m.obs_kernel(...)`) and score the result. Lowering requires grafting the
+# cross-module callee before beta-reducing the application.
+m = load_module("xmodule_kernel_helper.flatppl")
+lp = logdensityof(m.obs_kernel(record(center = 0.0)), 0.5)

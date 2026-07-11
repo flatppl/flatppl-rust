@@ -419,24 +419,24 @@ lp = logdensityof(L, record(center = 0.0))";
     );
 }
 
-/// Refuse-don't-mislower for a TWO-LEVEL nested cross-module ref: the host
-/// loads `mid` (`middle.flatppl`), whose queried handle `d` is itself just a
-/// reference `nested.val` into a SECOND loaded module (`middle.flatppl`'s own
-/// `nested = load_module("leaf.flatppl")`). The host's bundle is flat (keyed
-/// by path string) and has no entry for `leaf.flatppl` at all — it cannot see
-/// past `middle.flatppl`'s own dependency — so the nested `nested.val` ref
-/// can never be resolved against the submodule it actually names.
+/// Refuse-don't-mislower for a TWO-LEVEL nested cross-module ref whose second
+/// module is ABSENT from the bundle: the host loads `mid` (`middle.flatppl`),
+/// whose queried handle `d` is itself just a reference `nested.val` into a
+/// SECOND loaded module (`middle.flatppl`'s own `nested =
+/// load_module("leaf.flatppl")`). The host's bundle carries `middle.flatppl`
+/// and `unrelated.flatppl` but deliberately NOT `leaf.flatppl` — so when the
+/// recursive graft resolves `middle.flatppl`'s OWN `nested` alias against the
+/// bundle it finds no entry and refuses (`resolve_src_module_ref` → `None`).
 ///
 /// Critically, the host ALSO happens to define its own, wholly UNRELATED
-/// binding named `nested` (`load_module("unrelated.flatppl")`). Before the
-/// fix, grafting `mid.d` re-interned the nested ref's alias string `nested`
-/// as-is; re-interning happened to collide with the host's own `nested`
-/// binding, so the next driver iteration silently resolved the grafted ref
-/// against `unrelated.flatppl`'s `val = Normal(mu = 999.0, …)` instead of
-/// `leaf.flatppl`'s `val = Normal(mu = 0.0, …)` — a wrong density with no
-/// diagnostic at all (`determinize_with` returned `Ok`). The fix refuses as
-/// soon as the graft walk meets the nested `RefNs::Module` ref, before any
-/// such collision can bite.
+/// binding named `nested` (`load_module("unrelated.flatppl")`). The recursive
+/// graft reads `middle.flatppl`'s OWN `nested` binding (not the host's), so it
+/// can NEVER be fooled into scoring against `unrelated.flatppl`'s `val =
+/// Normal(mu = 999.0, …)` — the missing `leaf.flatppl` makes it refuse cleanly,
+/// with no diagnostic-free mislowering possible. (This is the nested analogue of
+/// [`cross_module_missing_bundle_refuses`]: a nested `load_module` whose target
+/// module is not in the bundle refuses rather than lower against a wrong or a
+/// same-named-but-unrelated module.)
 #[test]
 fn cross_module_nested_load_module_ref_refuses() {
     let leaf = "\
@@ -480,6 +480,446 @@ lp = logdensityof(mid.d, 0.5)";
         "a queried handle whose grafted body itself references a SECOND loaded module \
          (a 2-level-nested load_module) must refuse, never silently lower against an \
          unrelated same-named host binding and never panic; got:\n{}",
+        result
+            .map(|l| flatppl_flatpir::write(&l))
+            .unwrap_or_default()
+    );
+}
+
+/// A TWO-LEVEL nested cross-module ref RESOLVES and lowers when every module on
+/// the chain is present in the bundle (spec §04 "Reification and module scope":
+/// a measure crosses module boundaries transitively). The host loads `A`
+/// (`a.flatppl`); `A`'s queried handle `x` is itself a cross-module ref
+/// `inner.d` into `A`'s OWN loaded module `B` (`b.flatppl`); `B` defines a
+/// concrete `d = Normal(mu = 0.0, sigma = 1.0)`. Scoring `logdensityof(A.x, 0.5)`
+/// must chase both hops — graft `A`'s subtree into the host, and when that graft
+/// meets the nested `inner.d` ref, recursively graft `B`'s `d` — so the query
+/// lowers to a fully-formed `builtin_logdensityof`. Before the fix the graft
+/// walk refused outright at the nested `RefNs::Module` ref ("nested load_module
+/// … not supported"); the recursive graft resolves it instead.
+#[test]
+fn nested_cross_module_ref_lowers() {
+    let leaf = "\
+flatppl_compat = \"0.1\"
+d = Normal(mu = 0.0, sigma = 1.0)";
+    let mid = "\
+flatppl_compat = \"0.1\"
+inner = load_module(\"b.flatppl\")
+x = inner.d";
+    let model = "\
+flatppl_compat = \"0.1\"
+outer = load_module(\"a.flatppl\")
+lp = logdensityof(outer.x, 0.5)";
+
+    let mut leaf_mod = parse(leaf);
+    let _ = flatppl_infer::infer(&mut leaf_mod);
+    let mut mid_mod = parse(mid);
+    let _ = flatppl_infer::infer(&mut mid_mod);
+
+    // Both modules on the chain are present: `a.flatppl` (the host's direct
+    // dependency) and `b.flatppl` (`a.flatppl`'s own nested dependency).
+    let mut bundle = ModuleBundle::new();
+    bundle.insert("a.flatppl", Arc::new(mid_mod));
+    bundle.insert("b.flatppl", Arc::new(leaf_mod));
+
+    let mut mmod = parse(model);
+    let _ = flatppl_infer::infer_module(&mut mmod, &bundle, flatppl_infer::Level::Shape);
+
+    let lowered = determinize_with(&mmod, &bundle).expect(
+        "a 2-level-nested cross-module ref with every module present must lower, not refuse",
+    );
+    let pir = flatppl_flatpir::write(&lowered);
+    assert!(
+        pir.contains("builtin_logdensityof"),
+        "nested cross-module ref did not lower to builtin_logdensityof; got:\n{pir}"
+    );
+    // The leaf module's concrete kernel `Normal(mu = 0.0, sigma = 1.0)` survives
+    // both graft hops into the emitted density term.
+    assert!(
+        pir.contains("(%field mu 0.0)") && pir.contains("(%field sigma 1.0)"),
+        "leaf Normal(mu = 0.0, sigma = 1.0) did not survive the recursive graft; got:\n{pir}"
+    );
+}
+
+/// Refuse-don't-mislower: a nested cross-module ref whose SECOND module is absent
+/// from the bundle refuses. Same chain as [`nested_cross_module_ref_lowers`] but
+/// the bundle carries only `a.flatppl`; when the recursive graft resolves
+/// `a.flatppl`'s own `inner = load_module("b.flatppl")` it finds no `b.flatppl`
+/// entry and refuses rather than lower against a missing dependency.
+#[test]
+fn nested_ref_missing_module_refuses() {
+    let mid = "\
+flatppl_compat = \"0.1\"
+inner = load_module(\"b.flatppl\")
+x = inner.d";
+    let model = "\
+flatppl_compat = \"0.1\"
+outer = load_module(\"a.flatppl\")
+lp = logdensityof(outer.x, 0.5)";
+
+    let mut mid_mod = parse(mid);
+    let _ = flatppl_infer::infer(&mut mid_mod);
+
+    // Only `a.flatppl` is present; its own nested `b.flatppl` dependency is not.
+    let mut bundle = ModuleBundle::new();
+    bundle.insert("a.flatppl", Arc::new(mid_mod));
+
+    let mut mmod = parse(model);
+    let _ = flatppl_infer::infer_module(&mut mmod, &bundle, flatppl_infer::Level::Shape);
+
+    let result = determinize_with(&mmod, &bundle);
+    assert!(
+        result.is_err(),
+        "a nested cross-module ref whose second module is absent from the bundle must refuse, \
+         not lower; got:\n{}",
+        result
+            .map(|l| flatppl_flatpir::write(&l))
+            .unwrap_or_default()
+    );
+}
+
+/// Refuse-don't-mislower at the NESTED level: a binding pulled in by the
+/// recursive nested graft whose name collides with an unrelated host binding
+/// refuses (the #75 namespace-independence guard applies at every nesting level).
+/// The leaf module's `d = Normal(mu = 0.0, sigma = scale)` depends on an internal
+/// `scale = 2.0`; the host defines a wholly UNRELATED `scale = 10.0`. Grafting
+/// `A.x` chases the nested `inner.d` ref into the leaf and must graft its `scale`
+/// dependency — whose name collides with the host `scale` — so it refuses rather
+/// than silently score `sigma = 10.0` instead of the leaf's `2.0`.
+#[test]
+fn nested_graft_name_collision_refuses() {
+    let leaf = "\
+flatppl_compat = \"0.1\"
+scale = 2.0
+d = Normal(mu = 0.0, sigma = scale)";
+    let mid = "\
+flatppl_compat = \"0.1\"
+inner = load_module(\"b.flatppl\")
+x = inner.d";
+    let model = "\
+flatppl_compat = \"0.1\"
+scale = 10.0
+outer = load_module(\"a.flatppl\")
+lp = logdensityof(outer.x, 0.5)";
+
+    let mut leaf_mod = parse(leaf);
+    let _ = flatppl_infer::infer(&mut leaf_mod);
+    let mut mid_mod = parse(mid);
+    let _ = flatppl_infer::infer(&mut mid_mod);
+
+    let mut bundle = ModuleBundle::new();
+    bundle.insert("a.flatppl", Arc::new(mid_mod));
+    bundle.insert("b.flatppl", Arc::new(leaf_mod));
+
+    let mut mmod = parse(model);
+    let _ = flatppl_infer::infer_module(&mut mmod, &bundle, flatppl_infer::Level::Shape);
+
+    let result = determinize_with(&mmod, &bundle);
+    assert!(
+        result.is_err(),
+        "a nested grafted binding colliding with an unrelated host binding must refuse, \
+         not silently reuse the host binding; got:\n{}",
+        result
+            .map(|l| flatppl_flatpir::write(&l))
+            .unwrap_or_default()
+    );
+}
+
+/// CRITICAL fix (silent-wrong-density): the recursive nested graft used to
+/// dedup grafted submodule bindings by BARE NAME alone (`ctx.grafted` as a
+/// `HashSet<String>`), with no record of which submodule a name came from. Once
+/// a single graft chain can pull bindings from MULTIPLE DISTINCT submodules
+/// (here: `mid.flatppl` directly, and `leaf.flatppl` nested underneath it via
+/// `mid`'s own `load_module`), two independent submodules that each define an
+/// UNRELATED binding of the same bare name (`scale`) collided: the second graft
+/// saw `scale` already recorded and DAG-deduped onto the FIRST submodule's
+/// value, returning `Ok` with no diagnostic — silently scoring against the
+/// wrong submodule's `scale`.
+///
+/// `mid.flatppl`'s `d = Normal(mu = inner.val, sigma = scale)` references BOTH:
+/// nested `leaf.flatppl`'s `val` (which itself resolves to `leaf`'s OWN `scale =
+/// 99.0`) via `mu`, and `mid`'s OWN `scale = 2.0` via `sigma`. Grafting `mu`
+/// first pulls `leaf`'s `scale` in under the name `scale`; grafting `sigma`
+/// second then requests `scale` again, but from a DIFFERENT origin (`mid`, not
+/// `leaf`). Neither the host-vs-submodule `preexisting` guard (host defines no
+/// `scale`) nor the old bare-name DAG-dedup catches this — only origin-tracking
+/// does. This must REFUSE (`Err`), not silently lower.
+#[test]
+fn nested_two_submodules_same_name_binding_refuses() {
+    let leaf = "\
+flatppl_compat = \"0.1\"
+scale = 99.0
+val = scale";
+    let mid = "\
+flatppl_compat = \"0.1\"
+scale = 2.0
+inner = load_module(\"leaf.flatppl\")
+d = Normal(mu = inner.val, sigma = scale)";
+    let model = "\
+flatppl_compat = \"0.1\"
+outer = load_module(\"mid.flatppl\")
+lp = logdensityof(outer.d, 0.5)";
+
+    let mut leaf_mod = parse(leaf);
+    let _ = flatppl_infer::infer(&mut leaf_mod);
+    let mut mid_mod = parse(mid);
+    let _ = flatppl_infer::infer(&mut mid_mod);
+
+    let mut bundle = ModuleBundle::new();
+    bundle.insert("mid.flatppl", Arc::new(mid_mod));
+    bundle.insert("leaf.flatppl", Arc::new(leaf_mod));
+
+    let mut mmod = parse(model);
+    let _ = flatppl_infer::infer_module(&mut mmod, &bundle, flatppl_infer::Level::Shape);
+
+    let result = determinize_with(&mmod, &bundle);
+    assert!(
+        result.is_err(),
+        "two distinct nested submodules each defining an unrelated binding named `scale` must \
+         refuse rather than DAG-dedup the second submodule's binding onto the first's value; \
+         got:\n{}",
+        result
+            .map(|l| flatppl_flatpir::write(&l))
+            .unwrap_or_default()
+    );
+}
+
+/// Companion to [`nested_two_submodules_same_name_binding_refuses`]: a
+/// LEGITIMATE diamond — the SAME nested submodule binding (`leaf.flatppl`'s
+/// `val`) reached TWICE via two independent paths in one graft — must STILL
+/// dedup validly and lower. This guards the origin-tracking fix against
+/// over-refusing: a same-origin re-visit is real sharing, not a collision, so
+/// it must not be confused with the distinct-origin case above.
+#[test]
+fn nested_same_module_diamond_still_lowers() {
+    let leaf = "\
+flatppl_compat = \"0.1\"
+val = 1.0";
+    let mid = "\
+flatppl_compat = \"0.1\"
+inner = load_module(\"leaf.flatppl\")
+d = Normal(mu = inner.val, sigma = inner.val)";
+    let model = "\
+flatppl_compat = \"0.1\"
+outer = load_module(\"mid.flatppl\")
+lp = logdensityof(outer.d, 0.5)";
+
+    let mut leaf_mod = parse(leaf);
+    let _ = flatppl_infer::infer(&mut leaf_mod);
+    let mut mid_mod = parse(mid);
+    let _ = flatppl_infer::infer(&mut mid_mod);
+
+    let mut bundle = ModuleBundle::new();
+    bundle.insert("mid.flatppl", Arc::new(mid_mod));
+    bundle.insert("leaf.flatppl", Arc::new(leaf_mod));
+
+    let mut mmod = parse(model);
+    let _ = flatppl_infer::infer_module(&mut mmod, &bundle, flatppl_infer::Level::Shape);
+
+    let lowered = determinize_with(&mmod, &bundle).expect(
+        "a legitimate diamond (the SAME nested submodule binding reached twice via two paths) \
+         must still lower, not be mistaken for a cross-module name collision",
+    );
+    let pir = flatppl_flatpir::write(&lowered);
+    assert!(
+        pir.contains("builtin_logdensityof"),
+        "diamond-shared nested binding did not lower to builtin_logdensityof; got:\n{pir}"
+    );
+    // The nested `val` binding is grafted exactly ONCE (dedup, not a refuse and
+    // not a duplicate copy) and both `mu` and `sigma` reference it, resolving to
+    // the leaf's `1.0`.
+    assert_eq!(
+        pir.matches("(%bind val ").count(),
+        1,
+        "the diamond-shared nested binding must be grafted exactly once (dedup); got:\n{pir}"
+    );
+    assert!(
+        pir.contains("(%bind val 1.0)"),
+        "diamond-shared leaf `val = 1.0` did not survive the graft; got:\n{pir}"
+    );
+    assert_eq!(
+        pir.matches("(%ref self val)").count(),
+        2,
+        "both `mu` and `sigma` must reference the SAME deduped `val` binding; got:\n{pir}"
+    );
+}
+
+/// Termination: a CYCLIC module graph refuses rather than recursing forever.
+/// `A` (`a.flatppl`) loads `B` and defines `x = b.d`; `B` (`b.flatppl`) loads `A`
+/// and defines `d = a.x` — so resolving `A.x` chases `x → B.d → A.x → …`. The
+/// recursive graft's cycle guard (`GraftCtx::in_progress`, keyed on
+/// (submodule-path, member)) detects the re-entry into a `(path, member)` still
+/// on the graft stack and refuses; it does not hang.
+#[test]
+fn cyclic_module_graph_refuses() {
+    let a = "\
+flatppl_compat = \"0.1\"
+b = load_module(\"b.flatppl\")
+x = b.d";
+    let b = "\
+flatppl_compat = \"0.1\"
+a = load_module(\"a.flatppl\")
+d = a.x";
+    let model = "\
+flatppl_compat = \"0.1\"
+outer = load_module(\"a.flatppl\")
+lp = logdensityof(outer.x, 0.5)";
+
+    let mut a_mod = parse(a);
+    let _ = flatppl_infer::infer(&mut a_mod);
+    let mut b_mod = parse(b);
+    let _ = flatppl_infer::infer(&mut b_mod);
+
+    let mut bundle = ModuleBundle::new();
+    bundle.insert("a.flatppl", Arc::new(a_mod));
+    bundle.insert("b.flatppl", Arc::new(b_mod));
+
+    let mut mmod = parse(model);
+    let _ = flatppl_infer::infer_module(&mut mmod, &bundle, flatppl_infer::Level::Shape);
+
+    let result = determinize_with(&mmod, &bundle);
+    assert!(
+        result.is_err(),
+        "a cyclic module graph (A loads B, B loads A) must refuse (terminate with Err), \
+         not recurse forever; got:\n{}",
+        result
+            .map(|l| flatppl_flatpir::write(&l))
+            .unwrap_or_default()
+    );
+}
+
+/// GAP #194 — a cross-module kernel APPLICATION as the `logdensityof` target:
+/// the submodule defines a reified SCALAR kernel `k = functionof(Normal(mu =
+/// center, sigma = 1.0), center = center)`, the host `load_module`s it and
+/// scores the APPLIED kernel `logdensityof(m.k(record(center = 0.0)), 0.5)`.
+/// The target is `%call { head: User((%ref m k)), args: [record(center = 0.0)] }`
+/// — a `%call` whose CALLEE is a cross-module ref. Spec §04: a kernelof
+/// application and a cross-module measure both cross module boundaries, so this
+/// SHOULD lower.
+///
+/// Before the fix the bare cross-module callee `(%ref m k)` could not be
+/// resolved by `reduce_kernel_application`'s same-module `resolve_reified`
+/// (`resolve_ref_one` only resolves `RefNs::SelfMod`), so the reduction returned
+/// `None` and the query refused ("primitive measure must be a built-in
+/// constructor"). The fix grafts the callee into the host FIRST (via the same
+/// cross-module graft used for a direct target), rebuilds the `%call` with the
+/// grafted LOCAL callee, and defers: the driver re-infers (typing the grafted
+/// kernel) and `reduce_kernel_application` β-reduces the now-local application
+/// on the next iteration, binding the applied `center = 0.0` into the law.
+#[test]
+fn cross_module_kernel_application_lowers() {
+    let helpers = "\
+flatppl_compat = \"0.1\"
+center = elementof(reals)
+k = functionof(Normal(mu = center, sigma = 1.0), center = center)";
+    let model = "\
+flatppl_compat = \"0.1\"
+m = load_module(\"helpers.flatppl\")
+lp = logdensityof(m.k(record(center = 0.0)), 0.5)";
+
+    let mut hmod = parse(helpers);
+    let _ = flatppl_infer::infer(&mut hmod);
+    let mut bundle = ModuleBundle::new();
+    bundle.insert("helpers.flatppl", Arc::new(hmod));
+
+    let mut mmod = parse(model);
+    let _ = flatppl_infer::infer_module(&mut mmod, &bundle, flatppl_infer::Level::Shape);
+
+    let lowered = determinize_with(&mmod, &bundle)
+        .expect("cross-module kernel APPLICATION target must lower, not refuse");
+    let pir = flatppl_flatpir::write(&lowered);
+    assert!(
+        pir.contains("builtin_logdensityof"),
+        "cross-module kernel application did not lower to builtin_logdensityof; got:\n{pir}"
+    );
+    // The applied `center = 0.0` β-reduces into the kernel body's `mu`, and the
+    // submodule's `sigma = 1.0` survives the graft — a fully-determined law.
+    assert!(
+        pir.contains("(%field mu 0.0)") && pir.contains("(%field sigma 1.0)"),
+        "applied `center = 0.0` did not β-reduce into the kernel body's Normal(mu = 0.0, \
+         sigma = 1.0); got:\n{pir}"
+    );
+}
+
+/// GAP #194, refuse-don't-mislower: a cross-module kernel APPLICATION whose
+/// callee graft collides with an unrelated host binding refuses cleanly. The
+/// submodule kernel `k` depends on an internal `scale = 2.0` whose name collides
+/// with an UNRELATED host `scale = 10.0`. Modules are independent namespaces, so
+/// grafting the callee must NOT reuse the host binding (which would silently
+/// score `sigma = 10.0` instead of the submodule's `2.0`) — the graft refuses,
+/// and that refuse propagates out of the application-graft path.
+#[test]
+fn cross_module_kernel_application_collision_refuses() {
+    let helpers = "\
+flatppl_compat = \"0.1\"
+center = elementof(reals)
+scale = 2.0
+k = functionof(Normal(mu = center, sigma = scale), center = center)";
+    let model = "\
+flatppl_compat = \"0.1\"
+scale = 10.0
+m = load_module(\"helpers.flatppl\")
+lp = logdensityof(m.k(record(center = 0.0)), 0.5)";
+
+    let mut hmod = parse(helpers);
+    let _ = flatppl_infer::infer(&mut hmod);
+    let mut bundle = ModuleBundle::new();
+    bundle.insert("helpers.flatppl", Arc::new(hmod));
+
+    let mut mmod = parse(model);
+    let _ = flatppl_infer::infer_module(&mut mmod, &bundle, flatppl_infer::Level::Shape);
+
+    let result = determinize_with(&mmod, &bundle);
+    assert!(
+        result.is_err(),
+        "a cross-module kernel APPLICATION whose callee graft collides with an unrelated host \
+         binding must refuse, not silently reuse the host binding; got:\n{}",
+        result
+            .map(|l| flatppl_flatpir::write(&l))
+            .unwrap_or_default()
+    );
+}
+
+/// GAP #194 FIX 1, refuse-don't-mislower (CRITICAL — reproduces a silent wrong
+/// density): a cross-module kernel APPLICATION whose ARGUMENT is itself a
+/// cross-module ref (`logdensityof(m.k(m.rec), pt)`, where `m.rec` is a record
+/// defined in the submodule) must refuse rather than lower. The doc comment on
+/// `graft_kernel_application_callee` claims the application's args are
+/// host-local and carries them over unchanged when rebuilding the `%call` — but
+/// `m.rec` is NOT host-local. Only the callee (`m.k`) is grafted; the raw
+/// unresolved `(%ref m rec)` argument would be spliced as-is into the rebuilt
+/// call. `reduce_kernel_application` (structural; `resolve_ref_one` follows
+/// only `SelfMod` refs) cannot see through it, so it splices the dangling ref
+/// into the kernel body — `determinize_with` must NOT return `Ok` with that
+/// dangling, `Type::Failed("cross-module resolution")`-tagged node standing in
+/// for a resolved value.
+#[test]
+fn cross_module_kernel_application_with_module_arg_refuses() {
+    let helpers = "\
+flatppl_compat = \"0.1\"
+center = elementof(reals)
+k = functionof(Normal(mu = center, sigma = 1.0), center = center)
+rec = record(center = 0.0)";
+    let model = "\
+flatppl_compat = \"0.1\"
+m = load_module(\"helpers.flatppl\")
+lp = logdensityof(m.k(m.rec), 0.5)";
+
+    let mut hmod = parse(helpers);
+    let _ = flatppl_infer::infer(&mut hmod);
+    let mut bundle = ModuleBundle::new();
+    bundle.insert("helpers.flatppl", Arc::new(hmod));
+
+    let mut mmod = parse(model);
+    let _ = flatppl_infer::infer_module(&mut mmod, &bundle, flatppl_infer::Level::Shape);
+
+    let result = determinize_with(&mmod, &bundle);
+    assert!(
+        result.is_err(),
+        "a cross-module kernel APPLICATION whose ARGUMENT is itself a cross-module ref must \
+         refuse (only the callee is grafted; the argument crosses the module boundary too) \
+         rather than splice an unresolved dangling ref into the kernel body — a silent wrong \
+         density; got:\n{}",
         result
             .map(|l| flatppl_flatpir::write(&l))
             .unwrap_or_default()

@@ -93,6 +93,8 @@ fn fixture_query_corpus_lowers_or_documented_refuse() {
         ("eight_schools_prior.flatppl", Expect::Lowers),
         ("pushfwd_exp_lognormal.flatppl", Expect::Lowers),
         ("pushfwd_arbitrary_f_refuses.flatppl", Expect::RefusesExit3),
+        ("nested_crossmodule.flatppl", Expect::Lowers),
+        ("xmodule_kernel_application.flatppl", Expect::Lowers),
     ];
     for (filename, expect) in cases {
         let path = corpus_dir.join(filename);
