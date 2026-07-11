@@ -1,5 +1,0 @@
-flatppl_compat = "0.1"
-# SPEC-CORRECT REFUSE: pushfwd with a raw lambda (no inverse/log-jacobian) has
-# no density — §06 requires a bijection(f, f_inv, logvol). Determiniser must refuse.
-ln = pushfwd(x -> exp(x), Normal(mu = 0.0, sigma = 1.0))
-lp = logdensityof(ln, 0.5)

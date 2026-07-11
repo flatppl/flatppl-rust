@@ -608,14 +608,17 @@ pub(crate) fn lower_measure_density(
         // `logdensityof` entry (their arg2 is θ, not a variate); reaching the
         // measure dispatcher means they were entered as a bare measure — refuse
         // (safety net) rather than emit `builtin_logdensityof(joint_likelihood, …)`.
+        // `locscale(m, shift, scale)` = `pushfwd(x -> scale * x + shift, m)`
+        // (§06 line 369/402): the affine change-of-variables, reusing the same
+        // scalar / matrix-affine synthesis as `pushfwd` (Task 5).
+        Some("locscale") => lower_locscale(m, measure_node, v),
         Some("markovchain")
         | Some("kscan")
         | Some("bayesupdate")
         | Some("disintegrate")
         | Some("restrict")
         | Some("likelihoodof")
-        | Some("joint_likelihood")
-        | Some("locscale") => Err(refuse_op(measure_node, m)),
+        | Some("joint_likelihood") => Err(refuse_op(measure_node, m)),
         // Fallthrough: treat as a primitive distribution constructor.
         _ => build_density_term(m, measure_node, v),
     }
@@ -1448,7 +1451,11 @@ fn lower_truncate(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Ref
 /// `logdensityof(pushfwd(bij, M), v)` = `logdensityof(M, f_inv(v)) - logvol(f_inv(v))`
 /// where `bij = bijection(f, f_inv, logvol)`.
 ///
-/// Refuses if `bij` is not a `bijection(...)` node (directly or via one level of ref).
+/// The forward map may be given explicitly as a `bijection(f, f_inv, logvol)`
+/// node (directly or via one level of ref), OR — per §06 case 1 — as a known
+/// invertible builtin (`pushfwd(exp, M)`, `pushfwd(x -> exp(x), M)`), for which
+/// `(f_inv, logvol)` is synthesised analytically by [`crate::invert`]. Anything
+/// else refuses.
 fn lower_pushfwd(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseError> {
     let (bij_node, m_inner) = {
         let c = expect_builtin_call(m, node, "pushfwd")
@@ -1462,24 +1469,46 @@ fn lower_pushfwd(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Refu
     // Resolve `bij_node` through one level of ref indirection.
     let (bij_resolved, _) = resolve_ref_one(m, bij_node);
 
-    // Extract f_inv and logvol from the bijection node.
-    let (f_inv_node, logvol_node) = {
-        let bij = expect_builtin_call(m, bij_resolved, "bijection").ok_or_else(|| {
-            refuse(
-                bij_resolved,
-                m,
-                "pushfwd bijection arg must be a bijection(f, f_inv, logvol) node",
-            )
-        })?;
-        if bij.args.len() != 3 {
-            return Err(refuse(
-                bij_resolved,
-                m,
-                "bijection expects 3 args (f, f_inv, logvol)",
-            ));
-        }
-        (bij.args[1], bij.args[2])
-    };
+    // Extract f_inv and logvol: from an explicit bijection node if present,
+    // otherwise synthesise them for a known invertible forward builtin.
+    // Structural projection (§06 case 2): `pushfwd(fn(get(_, [fields])), M)` is a
+    // MARGINALIZATION, not a bijection — `get` has no inverse, so it never reaches
+    // the change-of-variables path. Recognise it up front and lower the closed-form
+    // marginal over the SELECTED components (the unselected components integrate to
+    // 1 and drop). Only over an explicit field-keyed product; otherwise refuse.
+    if let Some(fields) = recognize_get_projection(m, bij_resolved) {
+        return lower_projection_pushfwd(m, m_inner, &fields, v);
+    }
+
+    let (f_inv_node, logvol_node) =
+        if let Some(bij) = expect_builtin_call(m, bij_resolved, "bijection") {
+            if bij.args.len() != 3 {
+                return Err(refuse(
+                    bij_resolved,
+                    m,
+                    "bijection expects 3 args (f, f_inv, logvol)",
+                ));
+            }
+            (bij.args[1], bij.args[2])
+        } else {
+            // Not an explicit bijection: try analytic synthesis (§06 case 1). Pass
+            // `M`'s variate domain (needed for domain-restricted maps like `pow`);
+            // an unknown domain defaults to `%any`, which those maps refuse.
+            let domain = match m.type_of(m_inner) {
+                Some(Type::Measure { domain, .. }) => (**domain).clone(),
+                _ => Type::Any,
+            };
+            match crate::invert::derive_bijection(m, bij_node, &domain)? {
+                Some(bij) => (bij.f_inv, bij.logvol),
+                None => {
+                    return Err(refuse(
+                        bij_resolved,
+                        m,
+                        "pushfwd bijection arg must be a bijection(f, f_inv, logvol) node",
+                    ));
+                }
+            }
+        };
 
     // preimage = f_inv(v)
     let preimage = build_user_call(m, f_inv_node, v);
@@ -1488,6 +1517,309 @@ fn lower_pushfwd(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Refu
     // logvol_val = logvol(preimage)
     let logvol_val = build_user_call(m, logvol_node, preimage);
     Ok(build_call(m, "sub", &[inner_density, logvol_val]))
+}
+
+/// `logdensityof(locscale(m, shift, scale), v)` — the affine (location-scale)
+/// pushforward `pushfwd(x -> scale * x + shift, m)` (§06 line 369/402). We derive
+/// the change-of-variables `(f_inv, logvol)` from the affine parameters directly
+/// ([`crate::invert::derive_locscale`], which reuses the same scalar / matrix-
+/// affine emission as [`lower_pushfwd`]'s synthesis path) and apply the §06
+/// change-of-variables formula `logdensityof(m, f_inv(v)) − logvol(f_inv(v))` —
+/// structurally identical to [`lower_pushfwd`]'s tail.
+fn lower_locscale(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseError> {
+    let (m_inner, shift, scale) = {
+        let c = expect_builtin_call(m, node, "locscale")
+            .ok_or_else(|| refuse(node, m, "expected locscale"))?;
+        if c.args.len() != 3 {
+            return Err(refuse(
+                node,
+                m,
+                "locscale expects 3 positional args (m, shift, scale)",
+            ));
+        }
+        (c.args[0], c.args[1], c.args[2])
+    };
+    // The affine form is keyed on `m`'s variate domain (scalar vs vector); read it
+    // from the inner measure's inferred type (an unknown domain → `%any`, which
+    // `derive_locscale` refuses).
+    let domain = match m.type_of(m_inner) {
+        Some(Type::Measure { domain, .. }) => (**domain).clone(),
+        _ => Type::Any,
+    };
+    let bij = crate::invert::derive_locscale(m, shift, scale, &domain)?;
+    // §06 change-of-variables: logdensityof(m, f_inv(v)) − logvol(f_inv(v)).
+    let preimage = build_user_call(m, bij.f_inv, v);
+    let inner_density = lower_measure_density(m, m_inner, preimage)?;
+    let logvol_val = build_user_call(m, bij.logvol, preimage);
+    Ok(build_call(m, "sub", &[inner_density, logvol_val]))
+}
+
+/// Recognise a **pure structural-projection** forward function
+/// `fn(get(_, ["a", "c", …]))` — a one-input `functionof` lambda whose body is
+/// exactly `get(<the input placeholder>, vector("a", "c", …))` (§06 case 2). On
+/// a match, return the selected field-name strings, in selection order.
+///
+/// The projection must be PURE: the `get`'s first argument is the bare input
+/// placeholder (no wrapping transform) and its second argument is a `vector`
+/// literal of field-name strings. A `get` that also transforms, indexes by
+/// position, or selects via a computed key is NOT this pattern (`None`) — the
+/// caller then treats the forward as a bijection candidate / refuses.
+///
+/// Field names are returned as owned strings (not interned `Symbol`s) so this
+/// stays an immutable read; the caller matches them against the product's
+/// component names by resolving each component symbol to its string.
+fn recognize_get_projection(m: &Module, f: NodeId) -> Option<Vec<Box<str>>> {
+    // f = functionof with exactly one %local placeholder input.
+    let Node::Call(c) = m.node(f) else {
+        return None;
+    };
+    let CallHead::Builtin(sym) = c.head else {
+        return None;
+    };
+    if m.resolve(sym) != "functionof" || c.args.len() != 1 {
+        return None;
+    }
+    let Some(Inputs::Spec(entries)) = &c.inputs else {
+        return None;
+    };
+    if entries.len() != 1 || entries[0].1.ns != RefNs::Local {
+        return None;
+    }
+    let ph = entries[0].1.name;
+
+    // body = get(<ph>, vector("a", …)) — a pure field selection.
+    let get = expect_builtin_call(m, c.args[0], "get")?;
+    if get.args.len() != 2 || !get.named.is_empty() {
+        return None;
+    }
+    // First arg is EXACTLY the input placeholder (no transform).
+    if !matches!(m.node(get.args[0]), Node::Ref(Ref { ns: RefNs::Local, name }) if *name == ph) {
+        return None;
+    }
+    // Second arg is a non-empty `vector` of string literals (the selected fields).
+    let vec = expect_builtin_call(m, get.args[1], "vector")?;
+    if !vec.named.is_empty() || vec.args.is_empty() {
+        return None;
+    }
+    let mut fields = Vec::with_capacity(vec.args.len());
+    for &a in vec.args.iter() {
+        let Node::Lit(Scalar::Str(s)) = m.node(a) else {
+            return None; // a non-string selector is not a field projection
+        };
+        fields.push(s.clone());
+    }
+    Some(fields)
+}
+
+/// Lower `pushfwd(fn(get(_, [fields])), M)` — the §06 case-2 structural
+/// projection — as the closed-form MARGINAL over the SELECTED components of an
+/// explicit field-keyed product `M`. The marginal density is the density of the
+/// SUB-PRODUCT over just the selected fields: for an independent product the
+/// unselected components integrate to 1, so they drop cleanly and the marginal
+/// is the sum of the kept components' densities at the projected point's matching
+/// fields (§06 "joint and iid (independent products)").
+///
+/// We realise this by building the field-keyed SUB-PRODUCT (a keyword `joint`
+/// or a record-of-draws over the selected fields) and re-dispatching it through
+/// [`lower_measure_density`] against the projected point `v` (a record over the
+/// selected fields) — reusing the exact keyword-joint / record-of-draws
+/// machinery ([`lower_keyword_joint`] / [`lower_record_of_draws`]) rather than
+/// re-deriving the marginal.
+///
+/// **Scope (refuse-don't-mislower).** Closed-form only over an explicit
+/// FIELD-KEYED product (keyword `joint`, record-of-draws). A positional `joint`
+/// (no field labels), an `iid` / `jointchain` / `relabel` (index-keyed product
+/// needing index remapping — a follow-up), or a NON-product measure has no
+/// closed-form field-keyed marginal here, so it refuses (§06 case 2 permits
+/// "compute numerically or report a static error").
+fn lower_projection_pushfwd(
+    m: &mut Module,
+    m_inner_expr: NodeId,
+    fields: &[Box<str>],
+    v: NodeId,
+) -> Result<NodeId, RefuseError> {
+    let (m_inner, _) = resolve_ref_one(m, m_inner_expr);
+    match builtin_name(m, m_inner) {
+        // Keyword `joint(a = Mₐ, …)`: the selected components form a sub-joint.
+        Some("joint") => {
+            let named = {
+                let c = expect_builtin_call(m, m_inner, "joint")
+                    .ok_or_else(|| refuse(m_inner, m, "expected joint"))?;
+                if !c.args.is_empty() {
+                    return Err(refuse(
+                        m_inner,
+                        m,
+                        "structural projection needs a FIELD-KEYED product; a positional joint has \
+                         no field labels to select — refuse rather than mislower",
+                    ));
+                }
+                c.named.to_vec()
+            };
+            // A joint field's value IS its component measure directly.
+            refuse_unnormalized_dropped_fields(m, m_inner, &named, fields, |_m, value| {
+                Some(value)
+            })?;
+            let selected = select_projection_fields(m, m_inner, &named, fields)?;
+            let joint_sym = m.intern("joint");
+            let sub = m.alloc(Node::Call(Call {
+                head: CallHead::Builtin(joint_sym),
+                args: Vec::<NodeId>::new().into(),
+                named: selected.into(),
+                inputs: None,
+            }));
+            lower_measure_density(m, sub, v)
+        }
+        // Record-of-draws `record(a = draw(Mₐ), …)`: the selected draws form a
+        // sub-record.
+        Some("record") => {
+            let named = {
+                let c = expect_builtin_call(m, m_inner, "record")
+                    .ok_or_else(|| refuse(m_inner, m, "expected record"))?;
+                if !c.args.is_empty() {
+                    return Err(refuse(
+                        m_inner,
+                        m,
+                        "structural projection needs a field-keyed record; positional args present \
+                         — refuse rather than mislower",
+                    ));
+                }
+                c.named.to_vec()
+            };
+            // A record field's value is `draw(Mₐ)` (or a ref to one) — unwrap to
+            // the underlying measure argument before reading its mass.
+            refuse_unnormalized_dropped_fields(m, m_inner, &named, fields, |m, value| {
+                resolve_component_draw(m, value).map(|(measure, _)| measure)
+            })?;
+            let selected = select_projection_fields(m, m_inner, &named, fields)?;
+            let record_sym = m.intern("record");
+            let sub = m.alloc(Node::Call(Call {
+                head: CallHead::Builtin(record_sym),
+                args: Vec::<NodeId>::new().into(),
+                named: selected.into(),
+                inputs: None,
+            }));
+            lower_measure_density(m, sub, v)
+        }
+        other => Err(refuse(
+            m_inner,
+            m,
+            &format!(
+                "structural projection (§06 case 2) is closed-form only over an explicit \
+                 FIELD-KEYED product (keyword `joint` / record-of-draws); got `{}` — projection \
+                 over iid/jointchain/relabel (index remapping) is a follow-up, and a non-product \
+                 measure has no closed-form field-keyed marginal here — refuse rather than mislower",
+                other.unwrap_or("<non-builtin>")
+            ),
+        )),
+    }
+}
+
+/// Refuse if any DROPPED field of a field-keyed product (a component in
+/// `named` whose name is NOT in the selected `fields`) is not a CONFIRMED
+/// `Mass::Normalized` probability measure.
+///
+/// §06 case 2's closed-form marginal ("the unselected components integrate to
+/// 1 and drop") is an identity of an INDEPENDENT PRODUCT OF PROBABILITY
+/// MEASURES: `∫ M_dropped = 1` only when `M_dropped`'s total mass is exactly 1.
+/// An unnormalized dropped component — `weighted(c, M)` with `c ≠ 1`
+/// (`Mass::Finite`), an unbounded `Lebesgue` (`Mass::LocallyFinite`), or an
+/// unresolved/`%deferred` mass (`None`/`Mass::Unknown`/`Mass::Deferred`) —
+/// integrates to its OWN total mass, not 1; dropping it unchecked would
+/// silently omit that mass as a multiplicative (additive in log-space) factor
+/// from the marginal. Refuse rather than mislower (a wrong marginal is the
+/// worst outcome) — mirroring [`lower_normalize`]'s own reading of the mass
+/// via `resolve_ref_one` + `Module::type_of`.
+///
+/// `measure_of` extracts the scored measure node from a field's raw value:
+/// for a keyword `joint` the value IS the measure; for a record-of-draws it is
+/// `draw(Mₐ)` (or a ref to one), unwrapped via [`resolve_component_draw`]. A
+/// field whose value does not resolve to a recognisable measure component is
+/// left to the caller's own subsequent match (e.g. [`select_projection_fields`]
+/// / the density dispatcher) to refuse.
+fn refuse_unnormalized_dropped_fields(
+    m: &Module,
+    node: NodeId,
+    named: &[NamedArg],
+    fields: &[Box<str>],
+    measure_of: impl Fn(&Module, NodeId) -> Option<NodeId>,
+) -> Result<(), RefuseError> {
+    for field in named {
+        if field.kind != NamedKind::Field {
+            continue; // a non-field named arg is refused elsewhere by the caller
+        }
+        let name = m.resolve(field.name);
+        if fields.iter().any(|f| f.as_ref() == name) {
+            continue; // selected — kept, not dropped
+        }
+        let Some(measure) = measure_of(m, field.value) else {
+            continue;
+        };
+        let (resolved, _) = resolve_ref_one(m, measure);
+        let mass = match m.type_of(resolved) {
+            Some(Type::Measure { mass, .. }) => Some(*mass),
+            _ => None,
+        };
+        if mass != Some(Mass::Normalized) {
+            return Err(refuse(
+                node,
+                m,
+                &format!(
+                    "projection drops a non-normalized component (field `{name}`); the marginal \
+                     is not closed-form here (§06 case 2 requires each dropped component to be a \
+                     normalized probability measure) — refuse rather than mislower",
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Pick, in `fields` order, the `%field` component of `source` whose name
+/// resolves to each selected field string. Refuse (rather than silently drop) a
+/// selected field with no matching component — a projection that names a field
+/// the product does not carry is malformed.
+///
+/// Also refuse a DUPLICATE selected field (`get(_, ["a", "a"])`): building a
+/// sub-joint/sub-record with the same `%field a` twice would make
+/// [`lower_keyword_joint`] / [`lower_record_of_draws`] sum ONE density term
+/// per named entry — double-counting `a`'s contribution to the marginal.
+/// Refuse rather than silently double-count.
+fn select_projection_fields(
+    m: &Module,
+    node: NodeId,
+    source: &[NamedArg],
+    fields: &[Box<str>],
+) -> Result<Vec<NamedArg>, RefuseError> {
+    let mut seen: Vec<&str> = Vec::with_capacity(fields.len());
+    let mut out = Vec::with_capacity(fields.len());
+    for f in fields {
+        if seen.contains(&f.as_ref()) {
+            return Err(refuse(
+                node,
+                m,
+                &format!(
+                    "projection selects a duplicate field `{f}` — the sub-product would score it \
+                     twice, double-counting its density term — refuse rather than mislower"
+                ),
+            ));
+        }
+        seen.push(f.as_ref());
+        let found = source
+            .iter()
+            .find(|n| n.kind == NamedKind::Field && m.resolve(n.name) == f.as_ref())
+            .ok_or_else(|| {
+                refuse(
+                    node,
+                    m,
+                    &format!(
+                        "projection selects field `{f}` that is not a component of the product \
+                         measure — refuse rather than mislower"
+                    ),
+                )
+            })?;
+        out.push(*found);
+    }
+    Ok(out)
 }
 
 /// Resolve the static repeat count `N` of an `iid(M, size)` from the iid node's

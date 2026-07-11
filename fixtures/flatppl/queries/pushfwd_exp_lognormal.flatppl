@@ -1,0 +1,6 @@
+flatppl_compat = "0.1"
+# pushfwd(exp)-style forward function over a builtin now lowers to the LogNormal
+# change-of-variables density (§06 known-bijection registry). Was previously
+# (incorrectly) documented as a refuse.
+ln = pushfwd(x -> exp(x), Normal(mu = 0.0, sigma = 1.0))
+lp = logdensityof(ln, 0.5)

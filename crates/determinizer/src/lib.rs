@@ -5,6 +5,7 @@ mod conformance;
 mod crossmodule;
 mod density;
 mod driver;
+mod invert;
 mod jointchain;
 mod kernel;
 mod marginal;
