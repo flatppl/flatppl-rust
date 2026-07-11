@@ -53,11 +53,15 @@
 //!   bare name (e.g. both define `scale`) are just as unrelated as a
 //!   host/submodule pair — deduping the second graft onto the first submodule's
 //!   value by bare name alone would silently score against the wrong value. So
-//!   [`GraftCtx::grafted`] records not just the name but the ORIGIN (the
-//!   bundle-path of the submodule that owns the binding) it was grafted from: a
-//!   re-request of the same name from the SAME origin (a diamond — the same
-//!   submodule binding reached twice) dedups validly, but a re-request from a
-//!   DIFFERENT origin **refuses** rather than mislower.
+//!   [`GraftCtx::grafted`] records not just the name but a COMPOSITE ORIGIN key
+//!   (`origin-path\0member-name`) it was grafted from: a re-request of the same
+//!   name from the SAME composite origin (a diamond — the same submodule binding
+//!   reached twice) dedups validly, but a re-request from a DIFFERENT one
+//!   **refuses** rather than mislower. The member name is part of the key because
+//!   the origin path alone is NOT enough to distinguish two re-exports of DIFFERENT
+//!   members of the SAME submodule under one host name (`a.foo = priors.x` and
+//!   `b.foo = priors.y` both have path `priors.flatppl` but score distinct values)
+//!   — dedup by path alone silently collapses them (a reopened #77 hole).
 //!
 //!   `preexisting` and `grafted` stay two separate checks: `preexisting` is
 //!   host-vs-submodule (a bare `HashSet`, since the host is a single fixed
@@ -252,14 +256,18 @@ struct GraftCtx<'a> {
     /// dependency whose name collides with one of these (and is not `%assign`-
     /// linked) is an unrelated host binding: refuse rather than reuse it.
     preexisting: HashSet<String>,
-    /// Submodule-binding names grafted so far this pass, mapped to the ORIGIN
-    /// (bundle-path string of the submodule that owns the binding) they were
-    /// grafted from. A re-request of a name already present with the SAME
-    /// origin is a diamond — the same submodule binding reached twice — and
-    /// dedups validly (`Ok`, skip re-graft). A re-request with a DIFFERENT
-    /// origin means two distinct submodules define the same bare name: refuse
-    /// (submodules are independent namespaces, same as the host/submodule
-    /// case, but here neither name owns `preexisting` status).
+    /// Grafted host-binding names → the COMPOSITE ORIGIN key
+    /// (`origin-path\0member-name`) they were grafted from. For a directly-grafted
+    /// member the key is `ctx.origin\0name`; for a re-export it is the TARGET's
+    /// `target-path\0target-member` (a re-export IS the target's value, §04). A
+    /// re-request of a name already present with the SAME composite origin is a
+    /// diamond — the same underlying binding reached twice — and dedups validly
+    /// (`Ok`, skip re-graft). A re-request with a DIFFERENT one means two distinct
+    /// submodule members define the same host name: refuse (independent namespaces,
+    /// same as the host/submodule case, but here neither name owns `preexisting`
+    /// status). The member name is IN the key because the path alone cannot tell
+    /// apart two re-exports of different members of one submodule (see the module
+    /// docs' #77 note) — dedup by path alone silently mislowers.
     grafted: HashMap<String, String>,
     /// The bundle-path string of the submodule CURRENTLY being grafted — the
     /// origin key recorded into `grafted` for any binding grafted at this
@@ -585,8 +593,16 @@ fn graft_binding(
             }
         }
     }
+    // Origin key is COMPOSITE (`origin-path\0member-name`), matching the composite
+    // key `graft_reexport` records for a re-export's target. Here the grafted
+    // binding's name IS the real member name, so the composite is `ctx.origin\0name`
+    // — same behaviour as a bare-origin key for these sites (same name + same origin
+    // still same key; same name + different origin still differs), but comparable
+    // against a re-export's `target-path\0target-member` key so the two collision
+    // guards agree (see [`GraftCtx::grafted`]).
+    let origin_key = format!("{}\u{0}{}", ctx.origin, name);
     if let Some(existing_origin) = ctx.grafted.get(&name) {
-        if *existing_origin == ctx.origin {
+        if *existing_origin == origin_key {
             return Ok(()); // already grafted this pass, same origin (diamond)
         }
         return Err(format!(
@@ -594,7 +610,7 @@ fn graft_binding(
              collision is not yet namespaced — refuse rather than mislower"
         ));
     }
-    ctx.grafted.insert(name.clone(), ctx.origin.clone());
+    ctx.grafted.insert(name.clone(), origin_key);
     if ctx.preexisting.contains(&name) {
         return Err(format!(
             "grafted submodule kernel depends on a binding `{name}` whose name collides with an \
@@ -653,8 +669,11 @@ fn graft_module_member(
             return graft_reexport(host, src, name, alias, target, ctx);
         }
     }
+    // Composite origin key (`ctx.origin\0name`), consistent with `graft_binding`
+    // and `graft_reexport` so the three collision guards compare like-for-like.
+    let origin_key = format!("{}\u{0}{}", ctx.origin, name);
     if let Some(existing_origin) = ctx.grafted.get(name) {
-        if *existing_origin == ctx.origin {
+        if *existing_origin == origin_key {
             return Ok(()); // already grafted this pass, same origin (diamond)
         }
         return Err(format!(
@@ -662,7 +681,7 @@ fn graft_module_member(
              collision is not yet namespaced — refuse rather than mislower"
         ));
     }
-    ctx.grafted.insert(name.to_string(), ctx.origin.clone());
+    ctx.grafted.insert(name.to_string(), origin_key);
     if ctx.preexisting.contains(name) {
         return Err(format!(
             "nested grafted submodule member `{name}` collides with an unrelated pre-existing \
@@ -700,7 +719,14 @@ fn graft_module_member(
 /// origin, cycle guard) but ADDS the grafted value under `host_name` (which may
 /// differ from `target` for a renamed re-export) rather than under the target's
 /// own name. The #77 origin-dedup and #75 host-collision refuses both still apply,
-/// now keyed on `host_name` + the target origin.
+/// now keyed on `host_name` + the target's COMPOSITE origin (`path\0member`).
+///
+/// Chained re-exports (a re-export OF a re-export, `a.d = b.d`, `b.d = c.d`) are
+/// resolved THROUGH transitively: when the resolved target's own rhs is itself a
+/// pure re-export, this recurses to the next hop (under that hop's `%assign` +
+/// origin, guarded against a cyclic chain) and only the TERMINAL real binding is
+/// grafted and recorded — so the dedup key lands on the ULTIMATE origin
+/// consistently, and the chain lowers instead of refusing on an origin mismatch.
 fn graft_reexport(
     host: &mut Module,
     src: &Module,
@@ -722,11 +748,66 @@ fn graft_reexport(
              the bundle, or the member is absent); refuse rather than mislower"
         ));
     };
-    let target_origin = resolved.path.clone();
-    // Origin-aware dedup keyed on the HOST name and the TARGET's origin (the
-    // re-export's effective origin). Same target origin → diamond (the same
+    // Chained re-export (a re-export OF a re-export): if the resolved target's OWN
+    // rhs is itself a pure re-export that resolves, the whole chain is transitively
+    // ONE value (§04 "a re-exported cross-module binding is the same value"). Resolve
+    // THROUGH it: do this hop's nested `%assign` + origin swap + cycle guard, then
+    // recurse to the next hop, which records the ULTIMATE composite origin under
+    // `host_name`. (Taking a single hop and grafting the inner re-export via the
+    // ordinary nested path lands it on the ULTIMATE origin, which mismatches the
+    // NEARER origin recorded here — exactly what made a chain wrongly refuse.)
+    if let Some((next_alias, next_target)) = as_pure_reexport(resolved.sub, resolved.member_rhs)
+        .filter(|(a2, t2)| resolve_src_module_ref(bundle, resolved.sub, *a2, *t2).is_some())
+    {
+        // Cycle guard on THIS hop's `(path, member)`, matching the terminal path: a
+        // re-export loop (`a.d = b.d`, `b.d = a.d`) re-enters the same key and
+        // refuses rather than recurse forever.
+        let cycle_key = format!("{}\u{0}{}", resolved.path, target_name);
+        if !ctx.in_progress.insert(cycle_key.clone()) {
+            return Err(format!(
+                "cyclic module graph: cross-module re-export chain `{host_name} = \
+                 {alias_name}.{target_name}` re-enters `{}` while it is still being grafted; \
+                 refuse rather than recurse forever",
+                resolved.path
+            ));
+        }
+        // Graft this hop's `%assign` values under the CURRENT context, then recurse
+        // under the NESTED assign + origin (mirrors the terminal path below).
+        let mut nested_assign: Vec<(String, NodeId)> =
+            Vec::with_capacity(resolved.assign_src.len());
+        for (name, src_val) in resolved.assign_src.iter() {
+            match graft_node(host, src, *src_val, ctx) {
+                Ok(hval) => nested_assign.push((name.clone(), hval)),
+                Err(e) => {
+                    ctx.in_progress.remove(&cycle_key);
+                    return Err(e);
+                }
+            }
+        }
+        let saved_assign = std::mem::replace(&mut ctx.assign, nested_assign);
+        let saved_origin = std::mem::replace(&mut ctx.origin, resolved.path.clone());
+        let res = graft_reexport(host, resolved.sub, host_name, next_alias, next_target, ctx);
+        ctx.origin = saved_origin;
+        ctx.assign = saved_assign;
+        ctx.in_progress.remove(&cycle_key);
+        return res;
+    }
+    // COMPOSITE origin key: the target's bundle-path AND the target member name.
+    // Path alone is NOT enough (CRITICAL — reopens the #77 silent-wrong-density
+    // hole): two INDEPENDENT re-exports of DIFFERENT members of the SAME submodule
+    // (`a.foo = priors.x` and `b.foo = priors.y`) share the path `priors.flatppl`
+    // but resolve to distinct values `x` and `y`. Keyed on path alone the second
+    // would dedup onto the first under the shared host name `foo` and silently
+    // score the wrong value. The composite (`path\0target-member`) distinguishes
+    // them (`priors.flatppl\0x` vs `priors.flatppl\0y`) so the second refuses. It
+    // also matches the composite key `graft_binding`/`graft_module_member` record
+    // for a directly-grafted member, so a legitimate diamond (a re-export and a
+    // direct ref to the SAME member) still dedups.
+    let target_origin = format!("{}\u{0}{}", resolved.path, target_name);
+    // Origin-aware dedup keyed on the HOST name and the TARGET's composite origin
+    // (the re-export's effective origin). Same target origin → diamond (the same
     // underlying binding reached twice) → dedup validly, skipping the re-graft.
-    // A different origin → two distinct modules define this name → refuse (#77).
+    // A different origin → two distinct modules/members define this name → refuse.
     if let Some(existing_origin) = ctx.grafted.get(host_name) {
         if *existing_origin == target_origin {
             return Ok(());
