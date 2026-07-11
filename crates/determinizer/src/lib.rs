@@ -4,6 +4,7 @@
 mod conformance;
 mod crossmodule;
 mod density;
+mod disintegrate;
 mod driver;
 mod invert;
 mod jointchain;
@@ -12,5 +13,6 @@ mod marginal;
 mod refuse;
 mod sample;
 pub use conformance::is_flatpdl;
+pub use disintegrate::split_disintegrate;
 pub use driver::{determinize, determinize_with};
 pub use refuse::{NonConformKind, NonConformance, RefuseError};
