@@ -5,14 +5,14 @@
 //!
 //! Task 3 delivers the structural split (`split_disintegrate`, unit-tested in
 //! isolation inside `src/disintegrate.rs`, which can reach the `pub(crate)`
-//! function). This integration file pins the END-TO-END driver behavior:
-//! - `refuses_until_get_disintegrate_is_eliminated` is GREEN now — it
-//!   characterizes the pre-wiring state (the driver has no rule for
-//!   `get(disintegrate, i)`, so it refuses at that `get`).
-//! - `lowers_bi3_posterior_to_builtin_logdensityof` is the Task-4 target
-//!   (`#[ignore]`d until the driver eliminates `get(disintegrate, i)` via
-//!   `split_disintegrate`); un-ignore it and delete the characterization test
-//!   when Task 4 lands.
+//! function). Task 4 wires it into the driver: `get(disintegrate(…), 1)` /
+//! `get(disintegrate(…), 2)` are eliminated into the split kernel/marginal, so
+//! the downstream `likelihoodof` / `bayesupdate` / `logdensityof` lower via the
+//! existing paths. This integration file pins the END-TO-END driver behavior:
+//! - `lowers_bi3_posterior_to_builtin_logdensityof` — the bi3 posterior lowers to
+//!   `builtin_logdensityof` (the prior over {theta1, theta2} + the obs-likelihood).
+//! - `refuses_disintegrate_over_non_lawof_record` /
+//!   `refuses_get_disintegrate_out_of_range` — refuse-don't-mislower guards.
 
 use flatppl_determinizer::determinize;
 
@@ -35,29 +35,53 @@ posterior = bayesupdate(L, prior)
 lp = logdensityof(posterior, record(theta1 = 0.5, theta2 = 1.0))";
 
 #[test]
-fn refuses_until_get_disintegrate_is_eliminated() {
-    // Pre-Task-4 characterization: the driver has no rule to eliminate
-    // `get(disintegrate, i)` (the `forward_kernel = get(__0xN, 1)` /
-    // `prior = get(__0xN, 2)` bindings), so it refuses at that `get` node
-    // rather than mislowering. Task 4 wires `split_disintegrate` into the
-    // driver to eliminate the `get`s; this assertion then flips.
-    let err = determinize(&parse_infer(BI3_POSTERIOR))
-        .expect_err("disintegrate/get elimination is not wired until Task 4");
-    let msg = format!("{err:?}");
-    assert!(
-        msg.contains("get") || msg.contains("primitive measure") || msg.contains("disintegrate"),
-        "refuse reason must name the unhandled `get(disintegrate, …)`; got: {msg}"
-    );
-}
-
-#[test]
-#[ignore = "Task 4 wires split_disintegrate into the driver to eliminate get(disintegrate, i)"]
 fn lowers_bi3_posterior_to_builtin_logdensityof() {
-    // Task-4 target: with `get(disintegrate, i)` eliminated via the structural
-    // split, the posterior density lowers to the prior over {theta1, theta2}
-    // plus the obs-likelihood — a FlatPDL module carrying `builtin_logdensityof`.
+    // With `get(disintegrate, i)` eliminated via the structural split, the
+    // posterior density lowers to the prior over {theta1, theta2} plus the
+    // obs-likelihood — a FlatPDL module carrying `builtin_logdensityof`, and with
+    // no residual `disintegrate` / `get`-on-a-disintegrate scaffold.
     let pir = flatppl_flatpir::write(
         &determinize(&parse_infer(BI3_POSTERIOR)).expect("bi3 posterior must lower once wired"),
     );
     assert!(pir.contains("builtin_logdensityof"), "got:\n{pir}");
+    assert!(
+        !pir.contains("disintegrate"),
+        "the disintegrate scaffold must be eliminated; got:\n{pir}"
+    );
+}
+
+#[test]
+fn refuses_disintegrate_over_non_lawof_record() {
+    // `split_disintegrate` only handles the explicit `lawof(record(…))` DAG case;
+    // a `disintegrate` over a bare measure (here a plain `Normal`) yields `None`,
+    // so the driver refuses the `get(disintegrate, i)` rather than mislowering.
+    let src = "\
+d = Normal(mu = 0, sigma = 1)
+fk, pr = disintegrate([\"obs\"], d)";
+    let err = determinize(&parse_infer(src))
+        .expect_err("disintegrate over a non-lawof(record) measure must refuse");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("disintegrate") || msg.contains("get"),
+        "refuse must name the non-explicit disintegrate; got: {msg}"
+    );
+}
+
+#[test]
+fn refuses_get_disintegrate_out_of_range() {
+    // A `get(disintegrate(…), i)` with `i` outside the 1-based (kernel, marginal)
+    // pair is out of range for the 2-tuple; the driver refuses rather than
+    // mislowering. `a, b, c = disintegrate(…)` desugars a third `get(_, 3)`.
+    let src = "\
+theta1 ~ Normal(mu = 0, sigma = 1)
+obs ~ Normal(mu = theta1, sigma = 1)
+joint_model = lawof(record(theta1 = theta1, obs = obs))
+a, b, c = disintegrate([\"obs\"], joint_model)";
+    let err = determinize(&parse_infer(src))
+        .expect_err("get(disintegrate, 3) is out of range and must refuse");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("out of range"),
+        "refuse must report the out-of-range get index; got: {msg}"
+    );
 }

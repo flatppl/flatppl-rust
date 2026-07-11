@@ -13,6 +13,5 @@ mod marginal;
 mod refuse;
 mod sample;
 pub use conformance::is_flatpdl;
-pub use disintegrate::split_disintegrate;
 pub use driver::{determinize, determinize_with};
 pub use refuse::{NonConformKind, NonConformance, RefuseError};

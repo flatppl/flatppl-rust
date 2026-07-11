@@ -39,7 +39,7 @@ use flatppl_core::{
 /// - the selected or the non-selected set is empty (a vacuous split);
 /// - a NON-selected field's value is not a bare `%ref` (its boundary-input
 ///   `Ref` cannot be formed — outside the explicit-DAG shape).
-pub fn split_disintegrate(m: &mut Module, disint_node: NodeId) -> Option<(NodeId, NodeId)> {
+pub(crate) fn split_disintegrate(m: &mut Module, disint_node: NodeId) -> Option<(NodeId, NodeId)> {
     // 1. Recognize `disintegrate(selector, M)` with exactly two arguments.
     let c = expect_builtin_call(m, disint_node, "disintegrate")?;
     if c.args.len() != 2 {
