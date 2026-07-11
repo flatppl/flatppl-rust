@@ -95,6 +95,7 @@ fn fixture_query_corpus_lowers_or_documented_refuse() {
         ("pushfwd_arbitrary_f_refuses.flatppl", Expect::RefusesExit3),
         ("nested_crossmodule.flatppl", Expect::Lowers),
         ("xmodule_kernel_application.flatppl", Expect::Lowers),
+        ("bayesian_inference_1_posterior.flatppl", Expect::Lowers),
     ];
     for (filename, expect) in cases {
         let path = corpus_dir.join(filename);

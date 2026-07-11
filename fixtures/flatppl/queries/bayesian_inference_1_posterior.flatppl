@@ -1,0 +1,8 @@
+flatppl_compat = "0.1"
+# The non-normalized posterior — the inference target for HMC. bi1's
+# `posterior = bayesupdate(L, prior)` lowers to log-likelihood + log-prior
+# (§06 "Likelihoods and posteriors": bayesupdate lowers to
+# `logweighted(fn(logdensityof(L, _)), prior)`): 10 iid-likelihood terms + 2
+# joint-prior terms.
+m = load_module("../bayesian_inference/bayesian_inference_1.flatppl")
+lp = logdensityof(m.posterior, record(theta1 = 0.5, theta2 = 1.0))
