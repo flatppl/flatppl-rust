@@ -765,6 +765,15 @@ pub(crate) fn lower_measure_density(
 
     match op {
         Some("record") => lower_record_of_draws(m, measure_node, v),
+        // A `lawof`-wrapped measure reached as a SUB-measure (e.g. a
+        // `bayesupdate` prior — `lower_bayesupdate` hands its prior straight to
+        // this dispatcher, unlike the `logdensityof(lawof(M), v)` query ENTRY
+        // point, which strips a top-level `lawof` via `measure_of_arg` before
+        // ever reaching here). Unwrap to `M` and recurse — idempotent-safe: an
+        // already-stripped `lawof` never re-enters this arm, since the entry
+        // point's strip means `measure_node` is `M` itself by the time it's
+        // dispatched, so there's no double count.
+        Some("lawof") => lower_lawof(m, measure_node, v),
         Some("weighted") => lower_weighted(m, measure_node, v),
         Some("logweighted") => lower_logweighted(m, measure_node, v),
         Some("superpose") => lower_superpose(m, measure_node, v),
@@ -805,6 +814,26 @@ pub(crate) fn lower_measure_density(
         // Fallthrough: treat as a primitive distribution constructor.
         _ => build_density_term(m, measure_node, v),
     }
+}
+
+/// `lawof(M)` reached as a sub-measure (e.g. a `bayesupdate` prior): unwrap to
+/// `M` and recurse through [`lower_measure_density`] (spec §06: `lawof` names
+/// the law of its argument without changing it — `lawof(draw m) ≡ m`, and a
+/// `lawof` over a record of `~`-bound draws is the joint law of those draws, so
+/// the unwrapped `M` reaching `lower_record_of_draws` via the `"record"` arm is
+/// exactly the shape that arm already scores).
+///
+/// A `lawof` with anything but exactly one argument refuses (refuse-don't-mislower).
+fn lower_lawof(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseError> {
+    let arg = {
+        let c = expect_builtin_call(m, node, "lawof")
+            .ok_or_else(|| refuse(node, m, "expected lawof"))?;
+        if c.args.len() != 1 {
+            return Err(refuse(node, m, "lawof expects 1 arg"));
+        }
+        c.args[0]
+    };
+    lower_measure_density(m, arg, v)
 }
 
 // ---------------------------------------------------------------------------

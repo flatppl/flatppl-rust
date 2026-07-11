@@ -1073,3 +1073,30 @@ lp = logdensityof(post, record(mu = 0.3))";
         "refusal should propagate the prior's sub-lowering failure: {msg}"
     );
 }
+
+// A `bayesupdate` prior that is a `lawof`-wrapped record of `~`-bound draws
+// (the bi2/eight-schools shape: `prior = lawof(record(mu = mu, tau = tau, ...))`)
+// must lower, not refuse. `lower_bayesupdate` hands its prior straight to
+// `lower_measure_density`, whose dispatch has no `lawof` arm — unlike the
+// `logdensityof(lawof(M), v)` query ENTRY point, which strips a top-level
+// `lawof` before ever reaching the dispatcher. A `lawof` reaching the
+// dispatcher as a SUB-measure (here, bayesupdate's prior argument) needs its
+// own unwrap-and-recurse arm.
+#[test]
+fn bayesupdate_with_lawof_record_prior_lowers() {
+    let src = "\
+a = draw(Normal(mu = 0.0, sigma = 1.0))
+b = draw(Exponential(rate = 1.0))
+prior = lawof(record(a = a, b = b))
+model = functionof(Normal(mu = a, sigma = b), a = a, b = b)
+L = likelihoodof(model, 0.5)
+post = bayesupdate(L, prior)
+lp = logdensityof(post, record(a = 0.3, b = 1.0))";
+    let pir = flatppl_flatpir::write(&determinize_src(src));
+    // prior (lawof-record) scored: a Normal + b Exponential term, plus the likelihood.
+    assert!(pir.contains("builtin_logdensityof"), "got:\n{pir}");
+    assert!(
+        pir.matches("builtin_logdensityof").count() >= 3,
+        "loglik + 2 prior fields, got:\n{pir}"
+    );
+}
