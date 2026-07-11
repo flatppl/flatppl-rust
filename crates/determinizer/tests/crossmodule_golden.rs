@@ -879,3 +879,49 @@ lp = logdensityof(m.k(record(center = 0.0)), 0.5)";
             .unwrap_or_default()
     );
 }
+
+/// GAP #194 FIX 1, refuse-don't-mislower (CRITICAL — reproduces a silent wrong
+/// density): a cross-module kernel APPLICATION whose ARGUMENT is itself a
+/// cross-module ref (`logdensityof(m.k(m.rec), pt)`, where `m.rec` is a record
+/// defined in the submodule) must refuse rather than lower. The doc comment on
+/// `graft_kernel_application_callee` claims the application's args are
+/// host-local and carries them over unchanged when rebuilding the `%call` — but
+/// `m.rec` is NOT host-local. Only the callee (`m.k`) is grafted; the raw
+/// unresolved `(%ref m rec)` argument would be spliced as-is into the rebuilt
+/// call. `reduce_kernel_application` (structural; `resolve_ref_one` follows
+/// only `SelfMod` refs) cannot see through it, so it splices the dangling ref
+/// into the kernel body — `determinize_with` must NOT return `Ok` with that
+/// dangling, `Type::Failed("cross-module resolution")`-tagged node standing in
+/// for a resolved value.
+#[test]
+fn cross_module_kernel_application_with_module_arg_refuses() {
+    let helpers = "\
+flatppl_compat = \"0.1\"
+center = elementof(reals)
+k = functionof(Normal(mu = center, sigma = 1.0), center = center)
+rec = record(center = 0.0)";
+    let model = "\
+flatppl_compat = \"0.1\"
+m = load_module(\"helpers.flatppl\")
+lp = logdensityof(m.k(m.rec), 0.5)";
+
+    let mut hmod = parse(helpers);
+    let _ = flatppl_infer::infer(&mut hmod);
+    let mut bundle = ModuleBundle::new();
+    bundle.insert("helpers.flatppl", Arc::new(hmod));
+
+    let mut mmod = parse(model);
+    let _ = flatppl_infer::infer_module(&mut mmod, &bundle, flatppl_infer::Level::Shape);
+
+    let result = determinize_with(&mmod, &bundle);
+    assert!(
+        result.is_err(),
+        "a cross-module kernel APPLICATION whose ARGUMENT is itself a cross-module ref must \
+         refuse (only the callee is grafted; the argument crosses the module boundary too) \
+         rather than splice an unresolved dangling ref into the kernel body — a silent wrong \
+         density; got:\n{}",
+        result
+            .map(|l| flatppl_flatpir::write(&l))
+            .unwrap_or_default()
+    );
+}
