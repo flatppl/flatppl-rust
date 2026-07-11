@@ -100,7 +100,7 @@
 //!
 //! **Refused:** `kchain` marginals, keyword `joint_likelihood`,
 //! `disintegrate`,
-//! `restrict`, `pushfwd` with a non-bijection argument, `iid` with a genuinely
+//! `pushfwd` with a non-bijection argument, `iid` with a genuinely
 //! dynamic size (not statically resolvable from its const-evaluated domain
 //! shape) or a multi-axis / vector size, positional `joint` with a component whose measure-domain kind
 //! is not CONFIRMED scalar (refused up front — a confirmed-non-scalar OR an
@@ -114,7 +114,11 @@
 //! (`likelihoodof` and `bayesupdate` reaching `lower_measure_density` still
 //! refuse there as a safety net — both are normally intercepted and lowered at
 //! the `logdensityof` entry above: `bayesupdate(L, prior)` to
-//! `logdensityof(L, θ) + logdensityof(prior, θ)`, §06 "Likelihoods and posteriors".)
+//! `logdensityof(L, θ) + logdensityof(prior, θ)`, §06 "Likelihoods and posteriors".
+//! `restrict` likewise still refuses as a safety net here — it is normally
+//! intercepted BEFORE the density query, at the driver's `restrict` scan, and
+//! desugared into `bayesupdate(likelihoodof(kernel, x), marginal)` over the
+//! disintegration on `x`'s field names, §06 "Measure restriction".)
 
 use crate::refuse::RefuseError;
 use flatppl_core::{
@@ -799,7 +803,12 @@ pub(crate) fn lower_measure_density(
         // lower their likelihood term is in scope; `bayesupdate`'s arg2 and
         // `likelihoodof`'s are θ, not a variate); reaching the measure dispatcher
         // means they were entered as a bare measure — refuse (safety net) rather
-        // than emit `builtin_logdensityof(joint_likelihood, …)`.
+        // than emit `builtin_logdensityof(joint_likelihood, …)`. `restrict` is
+        // likewise normally intercepted BEFORE the density query, at the driver's
+        // `restrict` scan (desugared into `bayesupdate(likelihoodof(kernel, x),
+        // marginal)`, §06 "Measure restriction"); reaching here means the
+        // desugaring did not fire, so refuse rather than treat `restrict` as a
+        // primitive constructor via the fallthrough below.
         // `locscale(m, shift, scale)` = `pushfwd(x -> scale * x + shift, m)`
         // (§06 line 369/402): the affine change-of-variables, reusing the same
         // scalar / matrix-affine synthesis as `pushfwd` (Task 5).

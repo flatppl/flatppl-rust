@@ -130,6 +130,16 @@ fn find_measure_node(m: &Module) -> Option<(BindingId, NodeId)> {
     if let Some(hit) = find_get_disintegrate(m) {
         return Some(hit);
     }
+    // `restrict(M, x)` is desugared (§06 "Measure restriction") into
+    // `bayesupdate(likelihoodof(kernel, x), marginal)` over the disintegration on
+    // `x`'s field names. Like `get(disintegrate, i)`, it must fire BEFORE a
+    // `logdensityof` consumes it: a `logdensityof(restrict(…), θ)` would otherwise
+    // reach the primitive-constructor refuse in `lower_measure_density` (which
+    // keeps a `restrict` safety-net arm). Eliminating the `restrict` first leaves
+    // a `bayesupdate` the density query lowers via the existing posterior path.
+    if let Some(hit) = find_op_node(m, "restrict") {
+        return Some(hit);
+    }
     if let Some(hit) = find_op_node(m, "logdensityof") {
         return Some(hit);
     }
@@ -308,6 +318,37 @@ fn apply_rule(
         // general scan never reaches the bare `disintegrate` and refuses — this is
         // what makes each rewrite strictly remove a `get`/`disintegrate` node and
         // the driver terminate.
+        sweep_dead_measure_bindings(m);
+        return Ok(());
+    }
+
+    // --- measure restriction: restrict(M, x) → bayesupdate(likelihoodof(kernel, x), marginal) ---
+    // Spec §06 "Measure restriction": the non-normalized conditional of `M` given
+    // the observed values `x` desugars — via structural disintegration on `x`'s
+    // field names — into `bayesupdate(likelihoodof(kernel, x), marginal)` where
+    // `(kernel, marginal) = disintegrate([field-names of x], M)`. This arm fires
+    // before the `logdensityof` arm (`find_measure_node` returns the `restrict`
+    // first), so the downstream `bayesupdate` lowers via the existing posterior
+    // path. A shape the desugaring cannot handle (`x` not a record, a field of `x`
+    // naming no variate of `M`, or a non-`lawof(record)` `M`) yields `None` →
+    // refuse, don't mislower.
+    if is_op(m, target_node, "restrict") {
+        let desugared =
+            crate::disintegrate::rewrite_restrict(m, target_node).ok_or_else(|| RefuseError {
+                node: target_node,
+                construct: "restrict".to_string(),
+                reason: "restrict(M, x) is not the explicit structural case: x must be a \
+                         record of observed values whose fields are all variates of a \
+                         lawof(record(…)) M"
+                    .to_string(),
+            })?;
+        let new_rhs = substitute_in_tree(m, m.binding(bid).rhs, target_node, desugared);
+        m.set_binding_rhs(bid, new_rhs);
+        // The desugared `bayesupdate` carries the split kernel/marginal, whose
+        // verbatim `(%ref self …)` value nodes reach the draws directly, so the
+        // `M = lawof(record(…))` joint binding is now unreferenced (dead
+        // scaffold). Sweep it (`lawof` is on `COMBINATOR_OPS`) so the general scan
+        // never reaches the bare `lawof(record(…))` and refuses.
         sweep_dead_measure_bindings(m);
         return Ok(());
     }

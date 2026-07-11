@@ -59,6 +59,70 @@ fn lowers_bi3_posterior_to_builtin_logdensityof() {
     );
 }
 
+/// A self-contained bi4-shape posterior built via `restrict` (spec §06 "Measure
+/// restriction"): `restrict(joint, record(obs = data))` is the non-normalized
+/// conditional of the joint given the observed `obs`. It desugars into
+/// `bayesupdate(likelihoodof(kernel, record(obs = data)), marginal)` over the
+/// disintegration on `x`'s field names — the SAME (kernel, marginal), and so the
+/// SAME posterior density, as the bi3 explicit `disintegrate` case above.
+const BI4_RESTRICT_POSTERIOR: &str = "\
+theta1 ~ Normal(mu = 0, sigma = 1)
+theta2 ~ Exponential(rate = 1)
+obs ~ iid(Normal(mu = theta1, sigma = theta2), 10)
+joint_model = lawof(record(theta1 = theta1, theta2 = theta2, obs = obs))
+observed_data = [1.2, 3.4, 5.1, 2.8, 4.0, 3.7, 5.5, 2.1, 4.3, 3.9]
+post = restrict(joint_model, record(obs = observed_data))
+lp = logdensityof(post, record(theta1 = 0.5, theta2 = 1.0))";
+
+#[test]
+fn restrict_lowers_same_as_bi3_disintegrate() {
+    // `restrict(M, x)` desugars into `bayesupdate(likelihoodof(kernel, x),
+    // marginal)` over `disintegrate([field-names of x], M)`, so the bi4 posterior
+    // lowers to the SAME deterministic density as the bi3 explicit-disintegrate
+    // case — a FlatPDL module carrying `builtin_logdensityof`, with no residual
+    // `restrict` node.
+    let pir = flatppl_flatpir::write(
+        &determinize(&parse_infer(BI4_RESTRICT_POSTERIOR))
+            .expect("bi4 restrict posterior must lower via the restrict desugaring"),
+    );
+    // The SAME 12 terms as the bi3 disintegrate case: 10 obs-likelihood terms
+    // (iid(Normal, 10)) + 2 prior terms (theta1 Normal, theta2 Exponential). This
+    // pins `restrict ≡ bayesupdate(likelihoodof(kernel, x), marginal)` for the
+    // model — a dropped term, a kernel/marginal swap, or a wrong desugaring would
+    // change the count.
+    assert_eq!(
+        pir.matches("builtin_logdensityof").count(),
+        12,
+        "expected 10 obs-likelihood + 2 prior terms; got:\n{pir}"
+    );
+    assert!(
+        !pir.contains("restrict"),
+        "the restrict node must be desugared away; got:\n{pir}"
+    );
+}
+
+#[test]
+fn refuses_restrict_with_field_not_in_variate() {
+    // `restrict(M, record(nonexistent = …))` names a field that is not a variate
+    // of `M`; the disintegration selector would name a non-field, so the
+    // structural split returns `None` and the driver refuses rather than
+    // mislowering (refuse-don't-mislower).
+    let src = "\
+theta1 ~ Normal(mu = 0, sigma = 1)
+obs ~ Normal(mu = theta1, sigma = 1)
+joint_model = lawof(record(theta1 = theta1, obs = obs))
+observed_data = 2.5
+post = restrict(joint_model, record(nonexistent = observed_data))
+lp = logdensityof(post, record(theta1 = 0.5))";
+    let err = determinize(&parse_infer(src))
+        .expect_err("restrict naming a non-variate field must refuse");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("restrict"),
+        "refuse must name the restrict; got: {msg}"
+    );
+}
+
 #[test]
 fn refuses_disintegrate_over_non_lawof_record() {
     // `split_disintegrate` only handles the explicit `lawof(record(…))` DAG case;

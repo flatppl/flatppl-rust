@@ -48,6 +48,27 @@ pub(crate) fn split_disintegrate(m: &mut Module, disint_node: NodeId) -> Option<
     let selector = c.args[0];
     let measure = c.args[1];
 
+    // 2. Parse the selector into the SELECTED field-name set, then run the shared
+    //    structural split on `M`.
+    let selected_names = selector_names(m, selector)?;
+    split_law_record(m, &selected_names, measure)
+}
+
+/// The core structural split (spec §06 "Structural disintegration"), factored out
+/// of [`split_disintegrate`] so the `restrict` desugaring
+/// ([`rewrite_restrict`]) can reuse it directly with the field-names of the
+/// observed record — without fabricating a synthetic `disintegrate(vector(…), M)`
+/// node. `selected_names` are the already-parsed SELECTED field names; `measure`
+/// is `M` (resolved one ref hop below to `lawof(record(field…))`).
+///
+/// Returns the same `(kernel, marginal)` pair as [`split_disintegrate`], and
+/// `None` (caller refuses) for every shape outside the explicit DAG case — see
+/// [`split_disintegrate`]'s doc for the exhaustive list.
+fn split_law_record(
+    m: &mut Module,
+    selected_names: &[Box<str>],
+    measure: NodeId,
+) -> Option<(NodeId, NodeId)> {
     // Resolve `M` one ref hop to `lawof(record(field…))`.
     let (measure_resolved, _) = resolve_ref_one(m, measure);
     let lawof = expect_builtin_call(m, measure_resolved, "lawof")?;
@@ -74,9 +95,6 @@ pub(crate) fn split_disintegrate(m: &mut Module, disint_node: NodeId) -> Option<
         return None;
     }
 
-    // 2. Parse the selector into the SELECTED field-name set.
-    let selected_names = selector_names(m, selector)?;
-
     // Every selected name must be a field of the record.
     let is_selected = |name: Symbol| selected_names.iter().any(|s| m.resolve(name) == &**s);
     let all_present = selected_names
@@ -86,7 +104,7 @@ pub(crate) fn split_disintegrate(m: &mut Module, disint_node: NodeId) -> Option<
         return None;
     }
 
-    // 3. Partition the record fields into SELECTED and NON-selected, preserving
+    // Partition the record fields into SELECTED and NON-selected, preserving
     //    record order within each group.
     let mut selected_fields: Vec<(Symbol, NodeId)> = Vec::new();
     let mut nonselected_fields: Vec<(Symbol, NodeId)> = Vec::new();
@@ -115,7 +133,7 @@ pub(crate) fn split_disintegrate(m: &mut Module, disint_node: NodeId) -> Option<
         spec_inputs.push((name, *r));
     }
 
-    // 4. Build the kernel: `kernelof(record(<selected fields>), %specinputs(…))`.
+    // Build the kernel: `kernelof(record(<selected fields>), %specinputs(…))`.
     let record_sym = m.intern("record");
     let kernel_body = m.alloc(Node::Call(Call {
         head: CallHead::Builtin(record_sym),
@@ -139,7 +157,7 @@ pub(crate) fn split_disintegrate(m: &mut Module, disint_node: NodeId) -> Option<
         inputs: Some(Inputs::Spec(spec_inputs.into())),
     }));
 
-    // 5. Build the marginal: `lawof(record(<non-selected fields>))`.
+    // Build the marginal: `lawof(record(<non-selected fields>))`.
     let marginal_body = m.alloc(Node::Call(Call {
         head: CallHead::Builtin(record_sym),
         args: Vec::<NodeId>::new().into(),
@@ -163,6 +181,86 @@ pub(crate) fn split_disintegrate(m: &mut Module, disint_node: NodeId) -> Option<
     }));
 
     Some((kernel, marginal))
+}
+
+/// Desugar `restrict(M, x)` into `bayesupdate(likelihoodof(kernel, x), marginal)`
+/// where `(kernel, marginal) = disintegrate([field-names of x], M)` (spec §06
+/// "Measure restriction": `restrict(M, x)` is the non-normalized conditional of
+/// `M` given the observed values `x`). Returns the desugared node — the driver
+/// substitutes it for the `restrict` binding's RHS, and the resulting
+/// `bayesupdate` lowers via the existing posterior path.
+///
+/// The selector is exactly the `%field` names of `x`: the observed record names
+/// which variates of `M` are conditioned on (bi4 ⇒ `["obs"]`), so the split is
+/// the SAME `(kernel, marginal)` the bi3 explicit `disintegrate(["obs"], M)`
+/// produces, and the emitted `likelihoodof(kernel, x)` scores that kernel at the
+/// observed `x`.
+///
+/// Returns `None` (caller refuses — refuse-don't-mislower) for any shape outside
+/// the explicit-DAG case this handles:
+/// - `restrict_node` is not a 2-arg `restrict` call;
+/// - `x` (arg1) is not a `record(field…)` of observed values (positional args or
+///   a non-`%field` named entry refuse);
+/// - the disintegration on `x`'s field names does not split
+///   ([`split_law_record`] returns `None`) — `M` is not a `lawof(record(…))`, or
+///   a field of `x` names no variate of `M`.
+pub(crate) fn rewrite_restrict(m: &mut Module, restrict_node: NodeId) -> Option<NodeId> {
+    // 1. Recognize `restrict(M, x)` with exactly two arguments.
+    let (measure, x) = {
+        let c = expect_builtin_call(m, restrict_node, "restrict")?;
+        if c.args.len() != 2 {
+            return None;
+        }
+        (c.args[0], c.args[1])
+    };
+
+    // 2. `x` must be a `record(field…)`; the disintegration selector is its
+    //    field-names (resolve one ref hop, in case `x` is bound by name).
+    let (x_resolved, _) = resolve_ref_one(m, x);
+    let x_field_names = record_field_names(m, x_resolved)?;
+
+    // 3. Split `M` on `x`'s field-names → the SAME (kernel, marginal) the
+    //    equivalent `disintegrate([field-names of x], M)` yields. A field of `x`
+    //    that is not a variate of `M`, or a non-`lawof(record)` `M`, refuses here.
+    let (kernel, marginal) = split_law_record(m, &x_field_names, measure)?;
+
+    // 4. Build `bayesupdate(likelihoodof(kernel, x), marginal)`. `likelihoodof`
+    //    scores the kernel at the observed values `x` (the original arg1 node,
+    //    verbatim); `bayesupdate` reweights the marginal by that likelihood.
+    let likelihoodof_sym = m.intern("likelihoodof");
+    let likelihood = m.alloc(Node::Call(Call {
+        head: CallHead::Builtin(likelihoodof_sym),
+        args: vec![kernel, x].into(),
+        named: Vec::<NamedArg>::new().into(),
+        inputs: None,
+    }));
+    let bayesupdate_sym = m.intern("bayesupdate");
+    let posterior = m.alloc(Node::Call(Call {
+        head: CallHead::Builtin(bayesupdate_sym),
+        args: vec![likelihood, marginal].into(),
+        named: Vec::<NamedArg>::new().into(),
+        inputs: None,
+    }));
+    Some(posterior)
+}
+
+/// The `%field` names of a `record(field…)` node, in order (as `Box<str>`, to
+/// feed [`split_law_record`]'s selector). `None` when `id` is not a `record`
+/// builtin call, carries positional args, or has a non-`%field` named entry —
+/// the caller refuses (the observed `x` must be a clean field-keyed record).
+fn record_field_names(m: &Module, id: NodeId) -> Option<Vec<Box<str>>> {
+    let rec = expect_builtin_call(m, id, "record")?;
+    if !rec.args.is_empty() {
+        return None;
+    }
+    let mut names = Vec::with_capacity(rec.named.len());
+    for na in rec.named.iter() {
+        if na.kind != NamedKind::Field {
+            return None;
+        }
+        names.push(Box::from(m.resolve(na.name)));
+    }
+    Some(names)
 }
 
 /// The field names a `disintegrate` selector picks (spec §06: works like `get`
