@@ -625,6 +625,125 @@ lp = logdensityof(outer.x, 0.5)";
     );
 }
 
+/// CRITICAL fix (silent-wrong-density): the recursive nested graft used to
+/// dedup grafted submodule bindings by BARE NAME alone (`ctx.grafted` as a
+/// `HashSet<String>`), with no record of which submodule a name came from. Once
+/// a single graft chain can pull bindings from MULTIPLE DISTINCT submodules
+/// (here: `mid.flatppl` directly, and `leaf.flatppl` nested underneath it via
+/// `mid`'s own `load_module`), two independent submodules that each define an
+/// UNRELATED binding of the same bare name (`scale`) collided: the second graft
+/// saw `scale` already recorded and DAG-deduped onto the FIRST submodule's
+/// value, returning `Ok` with no diagnostic — silently scoring against the
+/// wrong submodule's `scale`.
+///
+/// `mid.flatppl`'s `d = Normal(mu = inner.val, sigma = scale)` references BOTH:
+/// nested `leaf.flatppl`'s `val` (which itself resolves to `leaf`'s OWN `scale =
+/// 99.0`) via `mu`, and `mid`'s OWN `scale = 2.0` via `sigma`. Grafting `mu`
+/// first pulls `leaf`'s `scale` in under the name `scale`; grafting `sigma`
+/// second then requests `scale` again, but from a DIFFERENT origin (`mid`, not
+/// `leaf`). Neither the host-vs-submodule `preexisting` guard (host defines no
+/// `scale`) nor the old bare-name DAG-dedup catches this — only origin-tracking
+/// does. This must REFUSE (`Err`), not silently lower.
+#[test]
+fn nested_two_submodules_same_name_binding_refuses() {
+    let leaf = "\
+flatppl_compat = \"0.1\"
+scale = 99.0
+val = scale";
+    let mid = "\
+flatppl_compat = \"0.1\"
+scale = 2.0
+inner = load_module(\"leaf.flatppl\")
+d = Normal(mu = inner.val, sigma = scale)";
+    let model = "\
+flatppl_compat = \"0.1\"
+outer = load_module(\"mid.flatppl\")
+lp = logdensityof(outer.d, 0.5)";
+
+    let mut leaf_mod = parse(leaf);
+    let _ = flatppl_infer::infer(&mut leaf_mod);
+    let mut mid_mod = parse(mid);
+    let _ = flatppl_infer::infer(&mut mid_mod);
+
+    let mut bundle = ModuleBundle::new();
+    bundle.insert("mid.flatppl", Arc::new(mid_mod));
+    bundle.insert("leaf.flatppl", Arc::new(leaf_mod));
+
+    let mut mmod = parse(model);
+    let _ = flatppl_infer::infer_module(&mut mmod, &bundle, flatppl_infer::Level::Shape);
+
+    let result = determinize_with(&mmod, &bundle);
+    assert!(
+        result.is_err(),
+        "two distinct nested submodules each defining an unrelated binding named `scale` must \
+         refuse rather than DAG-dedup the second submodule's binding onto the first's value; \
+         got:\n{}",
+        result
+            .map(|l| flatppl_flatpir::write(&l))
+            .unwrap_or_default()
+    );
+}
+
+/// Companion to [`nested_two_submodules_same_name_binding_refuses`]: a
+/// LEGITIMATE diamond — the SAME nested submodule binding (`leaf.flatppl`'s
+/// `val`) reached TWICE via two independent paths in one graft — must STILL
+/// dedup validly and lower. This guards the origin-tracking fix against
+/// over-refusing: a same-origin re-visit is real sharing, not a collision, so
+/// it must not be confused with the distinct-origin case above.
+#[test]
+fn nested_same_module_diamond_still_lowers() {
+    let leaf = "\
+flatppl_compat = \"0.1\"
+val = 1.0";
+    let mid = "\
+flatppl_compat = \"0.1\"
+inner = load_module(\"leaf.flatppl\")
+d = Normal(mu = inner.val, sigma = inner.val)";
+    let model = "\
+flatppl_compat = \"0.1\"
+outer = load_module(\"mid.flatppl\")
+lp = logdensityof(outer.d, 0.5)";
+
+    let mut leaf_mod = parse(leaf);
+    let _ = flatppl_infer::infer(&mut leaf_mod);
+    let mut mid_mod = parse(mid);
+    let _ = flatppl_infer::infer(&mut mid_mod);
+
+    let mut bundle = ModuleBundle::new();
+    bundle.insert("mid.flatppl", Arc::new(mid_mod));
+    bundle.insert("leaf.flatppl", Arc::new(leaf_mod));
+
+    let mut mmod = parse(model);
+    let _ = flatppl_infer::infer_module(&mut mmod, &bundle, flatppl_infer::Level::Shape);
+
+    let lowered = determinize_with(&mmod, &bundle).expect(
+        "a legitimate diamond (the SAME nested submodule binding reached twice via two paths) \
+         must still lower, not be mistaken for a cross-module name collision",
+    );
+    let pir = flatppl_flatpir::write(&lowered);
+    assert!(
+        pir.contains("builtin_logdensityof"),
+        "diamond-shared nested binding did not lower to builtin_logdensityof; got:\n{pir}"
+    );
+    // The nested `val` binding is grafted exactly ONCE (dedup, not a refuse and
+    // not a duplicate copy) and both `mu` and `sigma` reference it, resolving to
+    // the leaf's `1.0`.
+    assert_eq!(
+        pir.matches("(%bind val ").count(),
+        1,
+        "the diamond-shared nested binding must be grafted exactly once (dedup); got:\n{pir}"
+    );
+    assert!(
+        pir.contains("(%bind val 1.0)"),
+        "diamond-shared leaf `val = 1.0` did not survive the graft; got:\n{pir}"
+    );
+    assert_eq!(
+        pir.matches("(%ref self val)").count(),
+        2,
+        "both `mu` and `sigma` must reference the SAME deduped `val` binding; got:\n{pir}"
+    );
+}
+
 /// Termination: a CYCLIC module graph refuses rather than recursing forever.
 /// `A` (`a.flatppl`) loads `B` and defines `x = b.d`; `B` (`b.flatppl`) loads `A`
 /// and defines `d = a.x` — so resolving `A.x` chases `x → B.d → A.x → …`. The

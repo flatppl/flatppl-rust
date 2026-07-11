@@ -45,8 +45,26 @@
 //!   submodule dependency whose name collides with an unrelated pre-existing host
 //!   binding must NOT reuse the host binding (that would silently score against
 //!   the wrong value) — the graft **refuses** instead.
+//!
+//! * **Distinct submodules are independent namespaces too.** A single graft
+//!   chain can now pull in bindings from more than one submodule (a NESTED
+//!   cross-module ref: host → A → B, with A and B distinct modules). Two
+//!   independent submodules that each define an unrelated binding of the SAME
+//!   bare name (e.g. both define `scale`) are just as unrelated as a
+//!   host/submodule pair — deduping the second graft onto the first submodule's
+//!   value by bare name alone would silently score against the wrong value. So
+//!   [`GraftCtx::grafted`] records not just the name but the ORIGIN (the
+//!   bundle-path of the submodule that owns the binding) it was grafted from: a
+//!   re-request of the same name from the SAME origin (a diamond — the same
+//!   submodule binding reached twice) dedups validly, but a re-request from a
+//!   DIFFERENT origin **refuses** rather than mislower.
+//!
+//!   `preexisting` and `grafted` stay two separate checks: `preexisting` is
+//!   host-vs-submodule (a bare `HashSet`, since the host is a single fixed
+//!   namespace this pass), while `grafted` is submodule-vs-submodule (needs the
+//!   extra origin key because multiple submodule namespaces are in play).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use flatppl_core::{
     Axis, Binding, Call, CallHead, Inputs, Module, NamedArg, NamedKind, Node, NodeId, Ref, RefNs,
@@ -63,6 +81,9 @@ pub(crate) struct ResolvedRef<'a> {
     /// `(submodule-parameter-name, host-expr-node)` for each `%assign` on the
     /// `load_module` call. The node ids are HOST nodes (already interned).
     pub assign: Vec<(String, NodeId)>,
+    /// The bundle path string `sub` was loaded from — the ORIGIN key for
+    /// [`GraftCtx::grafted`]'s submodule-vs-submodule collision guard.
+    pub path: String,
 }
 
 /// For a `Node::Ref { ns: RefNs::Module(alias), name: member }` at `id` in
@@ -120,6 +141,7 @@ pub(crate) fn resolve_module_ref<'a>(
         sub,
         member_rhs,
         assign,
+        path,
     })
 }
 
@@ -212,8 +234,22 @@ struct GraftCtx<'a> {
     /// dependency whose name collides with one of these (and is not `%assign`-
     /// linked) is an unrelated host binding: refuse rather than reuse it.
     preexisting: HashSet<String>,
-    /// Submodule-binding names grafted so far this pass (DAG-dedup guard).
-    grafted: HashSet<String>,
+    /// Submodule-binding names grafted so far this pass, mapped to the ORIGIN
+    /// (bundle-path string of the submodule that owns the binding) they were
+    /// grafted from. A re-request of a name already present with the SAME
+    /// origin is a diamond — the same submodule binding reached twice — and
+    /// dedups validly (`Ok`, skip re-graft). A re-request with a DIFFERENT
+    /// origin means two distinct submodules define the same bare name: refuse
+    /// (submodules are independent namespaces, same as the host/submodule
+    /// case, but here neither name owns `preexisting` status).
+    grafted: HashMap<String, String>,
+    /// The bundle-path string of the submodule CURRENTLY being grafted — the
+    /// origin key recorded into `grafted` for any binding grafted at this
+    /// recursion depth. Swapped (alongside `assign`) when the recursion
+    /// descends into a NESTED module via [`graft_nested_module_ref`], and
+    /// restored on return so the caller's own bindings are attributed to the
+    /// caller's origin, not the callee's.
+    origin: String,
     /// `(submodule-path, member)` pairs for the nested cross-module members
     /// currently ON the recursion stack. Re-entering one is a cyclic module graph
     /// (A loads B, B loads A): refuse rather than recurse forever. A completed
@@ -261,7 +297,8 @@ pub(crate) fn graft_subtree(
         bundle,
         assign: resolved.assign.clone(),
         preexisting,
-        grafted: HashSet::new(),
+        grafted: HashMap::new(),
+        origin: resolved.path.clone(),
         in_progress: HashSet::new(),
     };
     graft_node(host, resolved.sub, resolved.member_rhs, &mut ctx)
@@ -443,8 +480,10 @@ fn graft_nested_module_ref(
         }
     }
     // Graft the nested member (and its transitive submodule deps) with the nested
-    // assign context; #75 safety (host collision / DAG-dedup) still applies.
+    // assign context AND the nested origin; #75 safety (host collision /
+    // DAG-dedup) still applies, now origin-aware (see `GraftCtx::grafted`).
     let saved_assign = std::mem::replace(&mut ctx.assign, nested_assign);
+    let saved_origin = std::mem::replace(&mut ctx.origin, resolved.path.clone());
     let graft_res = graft_module_member(
         host,
         resolved.sub,
@@ -453,6 +492,7 @@ fn graft_nested_module_ref(
         resolved.member_public,
         ctx,
     );
+    ctx.origin = saved_origin;
     ctx.assign = saved_assign;
     ctx.in_progress.remove(&cycle_key);
     graft_res?;
@@ -493,7 +533,11 @@ fn graft_input_ref(
 
 /// Graft the submodule binding named `name_sym` (a `src` symbol) into `host`.
 ///
-/// * Already grafted this pass → nothing to do (cycle/repeat guard).
+/// * Already grafted this pass from the SAME origin (`ctx.origin`) → nothing to
+///   do (diamond/repeat guard — legitimate sharing).
+/// * Already grafted this pass from a DIFFERENT origin → **refuse**: two
+///   distinct loaded modules define a binding of this name, and cross-module
+///   name collision is not yet namespaced (see [`GraftCtx::grafted`]).
 /// * Name collides with a pre-existing host binding → **refuse**: modules are
 ///   independent namespaces and this binding is not `%assign`-linked (those are
 ///   substituted before reaching here), so reusing the host binding would score
@@ -508,9 +552,16 @@ fn graft_binding(
     ctx: &mut GraftCtx<'_>,
 ) -> Result<(), String> {
     let name = src.resolve(name_sym).to_string();
-    if !ctx.grafted.insert(name.clone()) {
-        return Ok(()); // already grafted this pass
+    if let Some(existing_origin) = ctx.grafted.get(&name) {
+        if *existing_origin == ctx.origin {
+            return Ok(()); // already grafted this pass, same origin (diamond)
+        }
+        return Err(format!(
+            "two distinct loaded modules define a binding named `{name}`; cross-module name \
+             collision is not yet namespaced — refuse rather than mislower"
+        ));
     }
+    ctx.grafted.insert(name.clone(), ctx.origin.clone());
     if ctx.preexisting.contains(&name) {
         return Err(format!(
             "grafted submodule kernel depends on a binding `{name}` whose name collides with an \
@@ -540,14 +591,17 @@ fn graft_binding(
 /// Graft a NESTED cross-module member `name` (its rhs `rhs` living in the nested
 /// submodule `src`) into the host as a standalone binding, then return via a
 /// host-local `SelfMod` ref (built by the caller). Mirrors [`graft_binding`]'s
-/// #75 safety — DAG-dedup (`grafted`) and host-collision refuse (`preexisting`) —
-/// but the rhs is supplied directly (the member is known to exist, so there is no
-/// dangling case) and the source is the NESTED submodule.
+/// #75 safety — origin-aware DAG-dedup (`grafted`) and host-collision refuse
+/// (`preexisting`) — but the rhs is supplied directly (the member is known to
+/// exist, so there is no dangling case) and the source is the NESTED submodule.
 ///
 /// The nested cross-module cycle guard is the caller's responsibility
-/// ([`graft_nested_module_ref`] pushes/pops `ctx.in_progress`); this only guards
-/// against re-grafting the same binding name (a legitimate diamond) and against a
-/// name collision with an unrelated host binding.
+/// ([`graft_nested_module_ref`] pushes/pops `ctx.in_progress`, and swaps
+/// `ctx.origin` to this nested submodule's bundle path before calling here);
+/// this only guards against re-grafting the same (name, origin) pair (a
+/// legitimate diamond), a DIFFERENT origin already having grafted this name
+/// (two distinct submodules colliding — refuse), and a name collision with an
+/// unrelated host binding.
 fn graft_module_member(
     host: &mut Module,
     src: &Module,
@@ -556,9 +610,16 @@ fn graft_module_member(
     public: bool,
     ctx: &mut GraftCtx<'_>,
 ) -> Result<(), String> {
-    if !ctx.grafted.insert(name.to_string()) {
-        return Ok(()); // already grafted this pass (DAG dedup)
+    if let Some(existing_origin) = ctx.grafted.get(name) {
+        if *existing_origin == ctx.origin {
+            return Ok(()); // already grafted this pass, same origin (diamond)
+        }
+        return Err(format!(
+            "two distinct loaded modules define a binding named `{name}`; cross-module name \
+             collision is not yet namespaced — refuse rather than mislower"
+        ));
     }
+    ctx.grafted.insert(name.to_string(), ctx.origin.clone());
     if ctx.preexisting.contains(name) {
         return Err(format!(
             "nested grafted submodule member `{name}` collides with an unrelated pre-existing \
