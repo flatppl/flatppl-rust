@@ -43,7 +43,16 @@ fn lowers_bi3_posterior_to_builtin_logdensityof() {
     let pir = flatppl_flatpir::write(
         &determinize(&parse_infer(BI3_POSTERIOR)).expect("bi3 posterior must lower once wired"),
     );
-    assert!(pir.contains("builtin_logdensityof"), "got:\n{pir}");
+    // Pin the term structure: 10 obs-likelihood terms (iid(Normal, 10)) + 2 prior
+    // terms (theta1 Normal, theta2 Exponential) = 12 — the SAME density bi1
+    // (explicit joint) and bi2 (lawof prior) produce for this model. A dropped
+    // prior term, a kernel/marginal swap, or a wrong distribution would change this
+    // count.
+    assert_eq!(
+        pir.matches("builtin_logdensityof").count(),
+        12,
+        "expected 10 obs-likelihood + 2 prior terms; got:\n{pir}"
+    );
     assert!(
         !pir.contains("disintegrate"),
         "the disintegrate scaffold must be eliminated; got:\n{pir}"

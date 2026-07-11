@@ -1,0 +1,7 @@
+flatppl_compat = "0.1"
+# bi3 builds the joint law then splits it with `disintegrate(["obs"], joint_model)`
+# into a forward kernel + prior (§06 "Structural disintegration"). Determinizing
+# `posterior = bayesupdate(L, prior)` structurally eliminates the disintegrate into
+# an explicit kernel/marginal, giving the SAME log-posterior as bi1/bi2 (same model).
+m = load_module("../bayesian_inference/bayesian_inference_3.flatppl")
+lp = logdensityof(m.posterior, record(theta1 = 0.5, theta2 = 1.0))
