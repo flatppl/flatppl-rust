@@ -965,3 +965,55 @@ fn locscale_matrix_equals_affine_pushfwd() {
         "matrix locscale must lower identically to pushfwd(x -> L*x + mu, m)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// `derive_locscale` refuse boundaries (invert.rs ~371-434). These are
+// CHARACTERIZATION tests: they lock in behavior the code ALREADY refuses
+// (not RED→GREEN) — the happy-path tests above never exercised the 5
+// documented refuse conditions or the new `type_is_matrix` helper.
+// ---------------------------------------------------------------------------
+
+fn ls_refuse(src: &str) -> String {
+    let mut m = flatppl_syntax::parse(src).unwrap();
+    let _ = flatppl_infer::infer(&mut m);
+    let err = determinize(&m).expect_err("must refuse, not lower");
+    format!("{err:?}")
+}
+
+#[test]
+fn locscale_scalar_variate_matrix_scale_refuses() {
+    // A SCALAR-variate base (`Normal`) paired with a MATRIX `scale`: variate-
+    // incompatible (a scalar variate has no matrix affine map). Must refuse
+    // rather than mislower.
+    let msg = ls_refuse(
+        "d = locscale(Normal(mu = 0.0, sigma = 1.0), 1.0, [[1.0, 0.0], [0.0, 1.0]])\n\
+         lp = logdensityof(d, 0.5)",
+    );
+    assert!(msg.contains("refuse"), "got: {msg}");
+}
+
+#[test]
+fn locscale_vector_variate_scalar_scale_refuses() {
+    // A VECTOR-variate base (`MvNormal`) paired with a SCALAR `scale`: the true
+    // forward log-volume would be n*log|scale| (summed over all n axes), not
+    // the scalar form's single log|scale| — the same danger the vector-variate
+    // guard closes for plain `pushfwd`. Must refuse rather than mislower.
+    let msg = ls_refuse(
+        "d = locscale(MvNormal(mu = [0.0, 0.0], cov = [[1.0, 0.0], [0.0, 1.0]]), [1.0, 2.0], 3.0)\n\
+         lp = logdensityof(d, [0.5, 0.5])",
+    );
+    assert!(msg.contains("refuse"), "got: {msg}");
+}
+
+#[test]
+fn locscale_zero_scalar_scale_refuses() {
+    // A literal-zero scalar scale collapses the forward map to the constant
+    // `shift` (not injective) and makes `log|scale| = -inf`; must refuse rather
+    // than synthesize a degenerate change-of-variables (mirrors the affine-`mul`
+    // literal-zero guard in `classify`/`derive_chain`).
+    let msg = ls_refuse(
+        "d = locscale(Normal(mu = 0.0, sigma = 1.0), 1.0, 0.0)\n\
+         lp = logdensityof(d, 0.5)",
+    );
+    assert!(msg.contains("refuse"), "got: {msg}");
+}

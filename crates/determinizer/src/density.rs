@@ -1655,6 +1655,10 @@ fn lower_projection_pushfwd(
                 }
                 c.named.to_vec()
             };
+            // A joint field's value IS its component measure directly.
+            refuse_unnormalized_dropped_fields(m, m_inner, &named, fields, |_m, value| {
+                Some(value)
+            })?;
             let selected = select_projection_fields(m, m_inner, &named, fields)?;
             let joint_sym = m.intern("joint");
             let sub = m.alloc(Node::Call(Call {
@@ -1681,6 +1685,11 @@ fn lower_projection_pushfwd(
                 }
                 c.named.to_vec()
             };
+            // A record field's value is `draw(Mₐ)` (or a ref to one) — unwrap to
+            // the underlying measure argument before reading its mass.
+            refuse_unnormalized_dropped_fields(m, m_inner, &named, fields, |m, value| {
+                resolve_component_draw(m, value).map(|(measure, _)| measure)
+            })?;
             let selected = select_projection_fields(m, m_inner, &named, fields)?;
             let record_sym = m.intern("record");
             let sub = m.alloc(Node::Call(Call {
@@ -1705,18 +1714,96 @@ fn lower_projection_pushfwd(
     }
 }
 
+/// Refuse if any DROPPED field of a field-keyed product (a component in
+/// `named` whose name is NOT in the selected `fields`) is not a CONFIRMED
+/// `Mass::Normalized` probability measure.
+///
+/// §06 case 2's closed-form marginal ("the unselected components integrate to
+/// 1 and drop") is an identity of an INDEPENDENT PRODUCT OF PROBABILITY
+/// MEASURES: `∫ M_dropped = 1` only when `M_dropped`'s total mass is exactly 1.
+/// An unnormalized dropped component — `weighted(c, M)` with `c ≠ 1`
+/// (`Mass::Finite`), an unbounded `Lebesgue` (`Mass::LocallyFinite`), or an
+/// unresolved/`%deferred` mass (`None`/`Mass::Unknown`/`Mass::Deferred`) —
+/// integrates to its OWN total mass, not 1; dropping it unchecked would
+/// silently omit that mass as a multiplicative (additive in log-space) factor
+/// from the marginal. Refuse rather than mislower (a wrong marginal is the
+/// worst outcome) — mirroring [`lower_normalize`]'s own reading of the mass
+/// via `resolve_ref_one` + `Module::type_of`.
+///
+/// `measure_of` extracts the scored measure node from a field's raw value:
+/// for a keyword `joint` the value IS the measure; for a record-of-draws it is
+/// `draw(Mₐ)` (or a ref to one), unwrapped via [`resolve_component_draw`]. A
+/// field whose value does not resolve to a recognisable measure component is
+/// left to the caller's own subsequent match (e.g. [`select_projection_fields`]
+/// / the density dispatcher) to refuse.
+fn refuse_unnormalized_dropped_fields(
+    m: &Module,
+    node: NodeId,
+    named: &[NamedArg],
+    fields: &[Box<str>],
+    measure_of: impl Fn(&Module, NodeId) -> Option<NodeId>,
+) -> Result<(), RefuseError> {
+    for field in named {
+        if field.kind != NamedKind::Field {
+            continue; // a non-field named arg is refused elsewhere by the caller
+        }
+        let name = m.resolve(field.name);
+        if fields.iter().any(|f| f.as_ref() == name) {
+            continue; // selected — kept, not dropped
+        }
+        let Some(measure) = measure_of(m, field.value) else {
+            continue;
+        };
+        let (resolved, _) = resolve_ref_one(m, measure);
+        let mass = match m.type_of(resolved) {
+            Some(Type::Measure { mass, .. }) => Some(*mass),
+            _ => None,
+        };
+        if mass != Some(Mass::Normalized) {
+            return Err(refuse(
+                node,
+                m,
+                &format!(
+                    "projection drops a non-normalized component (field `{name}`); the marginal \
+                     is not closed-form here (§06 case 2 requires each dropped component to be a \
+                     normalized probability measure) — refuse rather than mislower",
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Pick, in `fields` order, the `%field` component of `source` whose name
 /// resolves to each selected field string. Refuse (rather than silently drop) a
 /// selected field with no matching component — a projection that names a field
 /// the product does not carry is malformed.
+///
+/// Also refuse a DUPLICATE selected field (`get(_, ["a", "a"])`): building a
+/// sub-joint/sub-record with the same `%field a` twice would make
+/// [`lower_keyword_joint`] / [`lower_record_of_draws`] sum ONE density term
+/// per named entry — double-counting `a`'s contribution to the marginal.
+/// Refuse rather than silently double-count.
 fn select_projection_fields(
     m: &Module,
     node: NodeId,
     source: &[NamedArg],
     fields: &[Box<str>],
 ) -> Result<Vec<NamedArg>, RefuseError> {
+    let mut seen: Vec<&str> = Vec::with_capacity(fields.len());
     let mut out = Vec::with_capacity(fields.len());
     for f in fields {
+        if seen.contains(&f.as_ref()) {
+            return Err(refuse(
+                node,
+                m,
+                &format!(
+                    "projection selects a duplicate field `{f}` — the sub-product would score it \
+                     twice, double-counting its density term — refuse rather than mislower"
+                ),
+            ));
+        }
+        seen.push(f.as_ref());
         let found = source
             .iter()
             .find(|n| n.kind == NamedKind::Field && m.resolve(n.name) == f.as_ref())

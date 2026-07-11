@@ -414,3 +414,40 @@ fn projection_over_iid_refuses() {
     .expect_err("projection over iid must refuse (scoped to field-keyed products)");
     assert!(format!("{e:?}").contains("refuse"), "got: {e:?}");
 }
+
+#[test]
+fn projection_drops_unnormalized_component_refuses() {
+    // §06 case 2's closed-form marginal ("unselected components integrate to 1
+    // and drop") holds ONLY when each DROPPED component is a NORMALIZED
+    // probability measure. Here the dropped field `b` is
+    // `weighted(2.0, Exponential(rate=1.0))`, whose total mass is 2 (Mass::Finite,
+    // not Mass::Normalized) — the true {a} marginal is
+    // `logdensityof(Normal, a) + log(2.0)`, but dropping `b` unchecked would
+    // silently omit the `+log(2.0)` factor. Refuse rather than mislower.
+    let e = determinize(&parse_infer(
+        "j = joint(a = Normal(mu = 0.0, sigma = 1.0), \
+                   b = weighted(2.0, Exponential(rate = 1.0)))\n\
+         pr = pushfwd(fn(get(_, [\"a\"])), j)\n\
+         lp = logdensityof(pr, record(a = 0.5))",
+    ))
+    .expect_err(
+        "projection dropping a non-normalized component must refuse, not silently \
+         drop the log-mass",
+    );
+    assert!(format!("{e:?}").contains("refuse"), "got: {e:?}");
+}
+
+#[test]
+fn projection_duplicate_field_refuses() {
+    // `get(_, ["a", "a"])` selects the SAME field twice: building a sub-joint
+    // with two `%field a` entries would double-count `a`'s density term
+    // (`lower_keyword_joint` sums one term per named entry). Refuse rather than
+    // silently double-count.
+    let e = determinize(&parse_infer(
+        "j = joint(a = Normal(mu = 0.0, sigma = 1.0), b = Exponential(rate = 1.0))\n\
+         pr = pushfwd(fn(get(_, [\"a\", \"a\"])), j)\n\
+         lp = logdensityof(pr, record(a = 0.5))",
+    ))
+    .expect_err("duplicate selected field must refuse, not double-count");
+    assert!(format!("{e:?}").contains("refuse"), "got: {e:?}");
+}
