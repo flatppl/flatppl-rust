@@ -99,7 +99,7 @@
 //! components only (§06 form); a keyword `joint_likelihood` refuses.
 //!
 //! **Refused:** `kchain` marginals, keyword `joint_likelihood`,
-//! `bayesupdate`, `disintegrate`,
+//! `disintegrate`,
 //! `restrict`, `pushfwd` with a non-bijection argument, `iid` with a genuinely
 //! dynamic size (not statically resolvable from its const-evaluated domain
 //! shape) or a multi-axis / vector size, positional `joint` with a component whose measure-domain kind
@@ -111,8 +111,10 @@
 //! whose `base` is not a univariate-continuous-normalized measure (an unnormalized
 //! base, or a normalized-but-discrete/multivariate base — each with its own refuse
 //! message), and any unrecognised shape.
-//! (`likelihoodof` reaching `lower_measure_density` still refuses there as a
-//! safety net — it is normally unwrapped at the `logdensityof` entry above.)
+//! (`likelihoodof` and `bayesupdate` reaching `lower_measure_density` still
+//! refuse there as a safety net — both are normally intercepted and lowered at
+//! the `logdensityof` entry above: `bayesupdate(L, prior)` to
+//! `logdensityof(L, θ) + logdensityof(prior, θ)`, §06 "Likelihoods and posteriors".)
 
 use crate::refuse::RefuseError;
 use flatppl_core::{
