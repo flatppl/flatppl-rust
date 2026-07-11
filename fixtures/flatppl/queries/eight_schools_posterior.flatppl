@@ -1,0 +1,7 @@
+flatppl_compat = "0.1"
+# Eight-schools (Rubin 1981) posterior: `bayesupdate(L, prior)` with
+# `prior = lawof(record(mu = mu, tau = tau, theta = theta))` over the stochastic
+# `~` bindings (including `tau = normalize(truncate(Cauchy(0, 5), interval(0, inf)))`
+# and `theta = iid(Normal(mu, tau), J)`). Lowers to log-likelihood + log-prior.
+m = load_module("../eight-schools.flatppl")
+lp = logdensityof(m.posterior, record(mu = 0.0, tau = 1.0, theta = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]))
