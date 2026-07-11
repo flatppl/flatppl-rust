@@ -1,0 +1,5 @@
+flatppl_compat = "0.1"
+# Helper module (NOT a standalone query — loaded by xmodule_kernel_application).
+# A simple %specinputs reified kernel over a scalar Normal.
+center = elementof(reals)
+obs_kernel = functionof(Normal(mu = center, sigma = 1.0), center = center)

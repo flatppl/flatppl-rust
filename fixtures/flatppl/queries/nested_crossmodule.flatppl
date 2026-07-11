@@ -1,0 +1,8 @@
+flatppl_compat = "0.1"
+# Nested (2-level) cross-module reference: this loads bayesian_inference_common,
+# whose `theta1_dist = priors.theta1_dist` is itself a cross-module ref into a
+# THIRD module (bayesian_inference_priors, loaded by common). Resolving it
+# requires the recursive nested graft (§04 — a measure crosses module boundaries
+# transitively).
+m = load_module("../bayesian_inference/bayesian_inference_common.flatppl")
+lp = logdensityof(m.theta1_dist, 0.5)
