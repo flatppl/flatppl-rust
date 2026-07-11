@@ -880,6 +880,153 @@ lp = logdensityof(m.k(record(center = 0.0)), 0.5)";
     );
 }
 
+/// A pure cross-module RE-EXPORT under the SAME name must resolve THROUGH to the
+/// target, not be refused as a name collision. The middle module `A`
+/// (`a.flatppl`) re-exports its own loaded module `B`'s (`b.flatppl`) binding `d`
+/// UNCHANGED: `d = inner.d`. `A` also exposes a measure `m = d` that the host
+/// queries: `logdensityof(A.m, 0.5)`.
+///
+/// Grafting `A.m` reaches `A.d` via a `(%ref self d)` (so `graft_binding` runs on
+/// `d`), whose rhs is the pure re-export `(%ref inner d)`. Before the fix,
+/// `graft_binding` recorded `d` under origin=A, then the nested resolution grafted
+/// `B.d` under origin=B → the #77 origin guard saw two origins for `d` and REFUSED
+/// ("two distinct loaded modules define a binding named `d`"). But `A.d` IS `B.d`
+/// (same underlying value, §04 "a re-exported cross-module binding is the same
+/// value"), so this is a FALSE collision. The fix detects the pure re-export and
+/// resolves it through to `B`'s `d` (origin = B's path) with NO distinct-origin
+/// record under `A`, so the same-origin dedup applies and the query lowers.
+#[test]
+fn cross_module_reexport_same_name_lowers() {
+    let leaf = "\
+flatppl_compat = \"0.1\"
+d = Normal(mu = 0.0, sigma = 1.0)";
+    let mid = "\
+flatppl_compat = \"0.1\"
+inner = load_module(\"b.flatppl\")
+d = inner.d
+m = d";
+    let model = "\
+flatppl_compat = \"0.1\"
+outer = load_module(\"a.flatppl\")
+lp = logdensityof(outer.m, 0.5)";
+
+    let mut leaf_mod = parse(leaf);
+    let _ = flatppl_infer::infer(&mut leaf_mod);
+    let mut mid_mod = parse(mid);
+    let _ = flatppl_infer::infer(&mut mid_mod);
+
+    let mut bundle = ModuleBundle::new();
+    bundle.insert("a.flatppl", Arc::new(mid_mod));
+    bundle.insert("b.flatppl", Arc::new(leaf_mod));
+
+    let mut mmod = parse(model);
+    let _ = flatppl_infer::infer_module(&mut mmod, &bundle, flatppl_infer::Level::Shape);
+
+    let lowered = determinize_with(&mmod, &bundle).expect(
+        "a pure same-name cross-module re-export IS the target's binding (§04), so it must \
+         resolve through and lower, not refuse as a name collision",
+    );
+    let pir = flatppl_flatpir::write(&lowered);
+    assert!(
+        pir.contains("builtin_logdensityof"),
+        "same-name cross-module re-export did not lower to builtin_logdensityof; got:\n{pir}"
+    );
+    // The re-export resolves through to the leaf's concrete kernel.
+    assert!(
+        pir.contains("(%field mu 0.0)") && pir.contains("(%field sigma 1.0)"),
+        "re-exported leaf Normal(mu = 0.0, sigma = 1.0) did not survive the resolve-through; \
+         got:\n{pir}"
+    );
+}
+
+/// A RENAMED pure cross-module re-export (`A.m = inner.leaf_d`, different name from
+/// the target `B.leaf_d`) also resolves through and lowers. Different names never
+/// collide either way, but this guards that the resolve-through binds the host
+/// name (`m`) to the grafted target correctly (not to a dangling ref).
+#[test]
+fn cross_module_reexport_renamed_lowers() {
+    let leaf = "\
+flatppl_compat = \"0.1\"
+leaf_d = Normal(mu = 0.0, sigma = 1.0)";
+    let mid = "\
+flatppl_compat = \"0.1\"
+inner = load_module(\"b.flatppl\")
+m = inner.leaf_d";
+    let model = "\
+flatppl_compat = \"0.1\"
+outer = load_module(\"a.flatppl\")
+lp = logdensityof(outer.m, 0.5)";
+
+    let mut leaf_mod = parse(leaf);
+    let _ = flatppl_infer::infer(&mut leaf_mod);
+    let mut mid_mod = parse(mid);
+    let _ = flatppl_infer::infer(&mut mid_mod);
+
+    let mut bundle = ModuleBundle::new();
+    bundle.insert("a.flatppl", Arc::new(mid_mod));
+    bundle.insert("b.flatppl", Arc::new(leaf_mod));
+
+    let mut mmod = parse(model);
+    let _ = flatppl_infer::infer_module(&mut mmod, &bundle, flatppl_infer::Level::Shape);
+
+    let lowered = determinize_with(&mmod, &bundle)
+        .expect("a renamed pure cross-module re-export must resolve through and lower");
+    let pir = flatppl_flatpir::write(&lowered);
+    assert!(
+        pir.contains("builtin_logdensityof")
+            && pir.contains("(%field mu 0.0)")
+            && pir.contains("(%field sigma 1.0)"),
+        "renamed cross-module re-export did not resolve through to the leaf kernel; got:\n{pir}"
+    );
+}
+
+/// Guards the re-export fix against OVER-relaxing the #77 origin guard: two
+/// GENUINELY-DISTINCT submodules that each define an UNRELATED binding of the same
+/// bare name `d` (NOT a re-export — one is `99.0`, the other `2.0`) must STILL
+/// refuse. `mid.flatppl`'s `combo = Normal(mu = inner.d, sigma = d)` references
+/// both nested `leaf.flatppl`'s `d = 99.0` (via `mu`, origin=leaf) and `mid`'s OWN
+/// `d = 2.0` (via `sigma`, origin=mid). Neither rhs is a pure `(%ref M X)`
+/// re-export, so both keep their own origin → distinct-origin collision → refuse.
+/// (Sibling of the existing [`nested_two_submodules_same_name_binding_refuses`],
+/// pinned on the bare name `d` the re-export fix touches.)
+#[test]
+fn two_genuinely_distinct_same_name_still_refuses() {
+    let leaf = "\
+flatppl_compat = \"0.1\"
+d = 99.0";
+    let mid = "\
+flatppl_compat = \"0.1\"
+d = 2.0
+inner = load_module(\"leaf.flatppl\")
+combo = Normal(mu = inner.d, sigma = d)";
+    let model = "\
+flatppl_compat = \"0.1\"
+outer = load_module(\"mid.flatppl\")
+lp = logdensityof(outer.combo, 0.5)";
+
+    let mut leaf_mod = parse(leaf);
+    let _ = flatppl_infer::infer(&mut leaf_mod);
+    let mut mid_mod = parse(mid);
+    let _ = flatppl_infer::infer(&mut mid_mod);
+
+    let mut bundle = ModuleBundle::new();
+    bundle.insert("mid.flatppl", Arc::new(mid_mod));
+    bundle.insert("leaf.flatppl", Arc::new(leaf_mod));
+
+    let mut mmod = parse(model);
+    let _ = flatppl_infer::infer_module(&mut mmod, &bundle, flatppl_infer::Level::Shape);
+
+    let result = determinize_with(&mmod, &bundle);
+    assert!(
+        result.is_err(),
+        "two genuinely-distinct submodules each defining an UNRELATED binding named `d` (not a \
+         re-export) must still refuse rather than DAG-dedup onto the wrong origin; got:\n{}",
+        result
+            .map(|l| flatppl_flatpir::write(&l))
+            .unwrap_or_default()
+    );
+}
+
 /// GAP #194 FIX 1, refuse-don't-mislower (CRITICAL — reproduces a silent wrong
 /// density): a cross-module kernel APPLICATION whose ARGUMENT is itself a
 /// cross-module ref (`logdensityof(m.k(m.rec), pt)`, where `m.rec` is a record

@@ -219,6 +219,24 @@ fn string_literal(m: &Module, id: NodeId) -> Option<String> {
     }
 }
 
+/// If `rhs` (a node in `src`) is EXACTLY a single cross-module ref
+/// `(%ref alias target)`, return `(alias, target)`. A submodule binding whose rhs
+/// is such a bare module ref (`common.theta1_dist = priors.theta1_dist`) is a
+/// candidate PURE RE-EXPORT: the same underlying value as the target module's
+/// `target` (§04 "a re-exported cross-module binding is the same value"), NOT an
+/// independent definition. The caller confirms it resolves to a real nested member
+/// (via [`resolve_src_module_ref`]) before treating it as a re-export — anything
+/// with a non-trivial rhs is not a re-export and keeps its own origin.
+fn as_pure_reexport(src: &Module, rhs: NodeId) -> Option<(Symbol, Symbol)> {
+    match *src.node(rhs) {
+        Node::Ref(Ref {
+            ns: RefNs::Module(alias),
+            name: target,
+        }) => Some((alias, target)),
+        _ => None,
+    }
+}
+
 /// State threaded through the recursive graft.
 struct GraftCtx<'a> {
     /// The host's dependency bundle (path → parsed submodule). Threaded so the
@@ -552,6 +570,21 @@ fn graft_binding(
     ctx: &mut GraftCtx<'_>,
 ) -> Result<(), String> {
     let name = src.resolve(name_sym).to_string();
+    // Pure re-export? A submodule binding `name = other.member` whose rhs is
+    // EXACTLY a cross-module ref that resolves to a real nested member is the SAME
+    // underlying value as `other.member` (§04), not an independent definition.
+    // Resolve it THROUGH to the target (origin = the target module's path) so the
+    // same-origin dedup applies and it does NOT false-collide with the target
+    // under THIS (re-exporting) module's origin. A non-trivial rhs is not a
+    // re-export and falls through to the origin guard below unchanged.
+    if let Some(src_bid) = src.binding_by_name(name_sym) {
+        let rhs = src.binding(src_bid).rhs;
+        if let Some((alias, target)) = as_pure_reexport(src, rhs) {
+            if resolve_src_module_ref(ctx.bundle, src, alias, target).is_some() {
+                return graft_reexport(host, src, &name, alias, target, ctx);
+            }
+        }
+    }
     if let Some(existing_origin) = ctx.grafted.get(&name) {
         if *existing_origin == ctx.origin {
             return Ok(()); // already grafted this pass, same origin (diamond)
@@ -610,6 +643,16 @@ fn graft_module_member(
     public: bool,
     ctx: &mut GraftCtx<'_>,
 ) -> Result<(), String> {
+    // Pure re-export at the nested level too: a nested member `name = other.member`
+    // is the same value as `other.member` (§04). Resolve it THROUGH to the target's
+    // origin rather than record a distinct origin here (which would false-collide
+    // with the target). `public` (the re-exporting binding's own visibility) is not
+    // used on this branch — the resolve-through carries the target's visibility.
+    if let Some((alias, target)) = as_pure_reexport(src, rhs) {
+        if resolve_src_module_ref(ctx.bundle, src, alias, target).is_some() {
+            return graft_reexport(host, src, name, alias, target, ctx);
+        }
+    }
     if let Some(existing_origin) = ctx.grafted.get(name) {
         if *existing_origin == ctx.origin {
             return Ok(()); // already grafted this pass, same origin (diamond)
@@ -634,6 +677,115 @@ fn graft_module_member(
         rhs: host_rhs,
         doc: None,
         public,
+        synthetic: false,
+    });
+    Ok(())
+}
+
+/// Graft a PURE RE-EXPORT `host_name = alias.target` — a submodule binding whose
+/// rhs is exactly a cross-module ref `(%ref alias target)` resolving to a real
+/// nested member — by resolving it THROUGH to the target and binding the grafted
+/// target value under `host_name` in the host.
+///
+/// The key correctness property (fixes the #77 false positive): a re-export IS the
+/// target's binding (§04 "a re-exported cross-module binding is the same value"),
+/// so its effective ORIGIN is the target module's path, NOT the re-exporting
+/// module's. Recording `host_name` under the target origin means a re-export and
+/// its target (`common.theta1_dist` and `priors.theta1_dist`) share an origin →
+/// the diamond/same-origin dedup applies → no false collision. Two GENUINELY-
+/// distinct same-name bindings (neither a bare re-export) keep their own origins
+/// and STILL refuse via [`graft_binding`] / [`graft_module_member`].
+///
+/// Mirrors [`graft_nested_module_ref`]'s recursion (nested `%assign`, nested
+/// origin, cycle guard) but ADDS the grafted value under `host_name` (which may
+/// differ from `target` for a renamed re-export) rather than under the target's
+/// own name. The #77 origin-dedup and #75 host-collision refuses both still apply,
+/// now keyed on `host_name` + the target origin.
+fn graft_reexport(
+    host: &mut Module,
+    src: &Module,
+    host_name: &str,
+    alias: Symbol,
+    target: Symbol,
+    ctx: &mut GraftCtx<'_>,
+) -> Result<(), String> {
+    let bundle = ctx.bundle;
+    let alias_name = src.resolve(alias).to_string();
+    let target_name = src.resolve(target).to_string();
+    // The caller detected the re-export by resolving `(alias, target)`; re-resolve
+    // to read the target's origin/rhs. An unresolvable ref is refused, not
+    // mislowered (defensive — the caller only reaches here when this resolves).
+    let Some(resolved) = resolve_src_module_ref(bundle, src, alias, target) else {
+        return Err(format!(
+            "cross-module re-export `{host_name} = {alias_name}.{target_name}` is unresolvable \
+             (the alias is not a `load_module` in the source submodule, its path is absent from \
+             the bundle, or the member is absent); refuse rather than mislower"
+        ));
+    };
+    let target_origin = resolved.path.clone();
+    // Origin-aware dedup keyed on the HOST name and the TARGET's origin (the
+    // re-export's effective origin). Same target origin → diamond (the same
+    // underlying binding reached twice) → dedup validly, skipping the re-graft.
+    // A different origin → two distinct modules define this name → refuse (#77).
+    if let Some(existing_origin) = ctx.grafted.get(host_name) {
+        if *existing_origin == target_origin {
+            return Ok(());
+        }
+        return Err(format!(
+            "two distinct loaded modules define a binding named `{host_name}`; cross-module name \
+             collision is not yet namespaced — refuse rather than mislower"
+        ));
+    }
+    ctx.grafted
+        .insert(host_name.to_string(), target_origin.clone());
+    if ctx.preexisting.contains(host_name) {
+        return Err(format!(
+            "grafted submodule kernel depends on a binding `{host_name}` whose name collides with \
+             an unrelated pre-existing host binding (modules are independent namespaces, and this \
+             dependency is not linked by a load_module `%assign`); refuse rather than reuse the \
+             host binding and mislower"
+        ));
+    }
+    // Cycle guard on the TARGET `(submodule-path, member)`, matching
+    // `graft_nested_module_ref`: a re-export chain that loops (A re-exports B's `d`,
+    // B re-exports A's `d`) re-enters the same key and refuses, not recurse forever.
+    let cycle_key = format!("{}\u{0}{}", resolved.path, target_name);
+    if !ctx.in_progress.insert(cycle_key.clone()) {
+        return Err(format!(
+            "cyclic module graph: cross-module re-export `{host_name} = {alias_name}.{target_name}` \
+             re-enters `{}` while it is still being grafted; refuse rather than recurse forever",
+            resolved.path
+        ));
+    }
+    // The target's nested `load_module` `%assign` values are expressions in `src`;
+    // graft them under the CURRENT context, then graft the target member's rhs
+    // under the NESTED assign + origin (mirrors `graft_nested_module_ref`).
+    let mut nested_assign: Vec<(String, NodeId)> = Vec::with_capacity(resolved.assign_src.len());
+    for (name, src_val) in resolved.assign_src.iter() {
+        match graft_node(host, src, *src_val, ctx) {
+            Ok(hval) => nested_assign.push((name.clone(), hval)),
+            Err(e) => {
+                ctx.in_progress.remove(&cycle_key);
+                return Err(e);
+            }
+        }
+    }
+    let saved_assign = std::mem::replace(&mut ctx.assign, nested_assign);
+    let saved_origin = std::mem::replace(&mut ctx.origin, resolved.path.clone());
+    let host_rhs = graft_node(host, resolved.sub, resolved.member_rhs, ctx);
+    ctx.origin = saved_origin;
+    ctx.assign = saved_assign;
+    ctx.in_progress.remove(&cycle_key);
+    // Bind the resolved-through value under the HOST name (which may differ from
+    // the target name for a renamed re-export). The visibility carried is the
+    // target's — a re-export IS the target's value.
+    let host_rhs = host_rhs?;
+    let hname = host.intern(host_name);
+    host.add_binding(Binding {
+        name: hname,
+        rhs: host_rhs,
+        doc: None,
+        public: resolved.member_public,
         synthetic: false,
     });
     Ok(())
