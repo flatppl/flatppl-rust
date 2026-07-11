@@ -166,6 +166,16 @@ pub(crate) fn lower_logdensityof(
     {
         return lower_likelihood_density(m, resolved, arg2, bundle);
     }
+    // Unnormalized-posterior query: `bayesupdate(L, prior)` scores its
+    // log-likelihood term via [`lower_likelihood_density`], which needs the
+    // `bundle` (a cross-module L in a posterior). Intercept it HERE, where the
+    // bundle is in scope, rather than in the bundle-less [`lower_measure_density`]
+    // dispatcher (which keeps a refuse arm for it as a safety net). arg2 is the
+    // parameter point θ, shared by both the likelihood and the prior (§06
+    // "Likelihoods and posteriors").
+    if matches!(builtin_name(m, resolved), Some("bayesupdate")) {
+        return lower_bayesupdate(m, resolved, arg2, bundle);
+    }
     // Measure query: arg2 is the variate. Strip a `lawof` wrapper on the
     // (possibly grafted) measure node and hand it to the recursive dispatcher.
     let measure_expr = measure_of_arg(m, arg1)?;
@@ -247,6 +257,61 @@ fn lower_joint_likelihood(
         terms.push(lower_likelihood_density(m, comp_resolved, theta, bundle)?);
     }
     Ok(fold_add(m, &terms))
+}
+
+/// `logdensityof(bayesupdate(L, prior), θ)` = `logdensityof(L, θ) +
+/// logdensityof(prior, θ)` — the UNNORMALIZED posterior `dν(θ) = L(θ)·dπ(θ)`
+/// (§06 "Likelihoods and posteriors": `bayesupdate(L, prior)` lowers to
+/// `logweighted(fn(logdensityof(L, _)), prior)` — the prior reweighted by the
+/// log-likelihood). This is the HMC inference target: the log-posterior up to the
+/// (constant, dropped) evidence.
+///
+/// arg0 `L` is a likelihood-typed handle (`likelihoodof(K, obs)` /
+/// `joint_likelihood`); arg1 `prior` is a measure (typically a keyword `joint`
+/// over the same θ fields). Both are scored at the SAME parameter point θ (= `v`,
+/// a record over the parameter fields):
+/// * the **prior** via [`lower_measure_density`] — θ is its variate; and
+/// * the **log-likelihood** via [`lower_likelihood_density`] — θ is its parameter
+///   point, and each θ field is inlined into the likelihood's own density subtree.
+///
+/// The two log-densities are summed, mirroring [`lower_logweighted`]
+/// (`add(weight_scored, inner_density)`) whose "weight" here is the log-likelihood
+/// term. The emitted density is therefore two `builtin_logdensityof` terms (one
+/// from L's kernel scored at `obs`, one from the prior scored at θ) under an
+/// `add`.
+///
+/// **Refuse-don't-mislower:** a non-lowerable `prior` (e.g. one marginalizing an
+/// internal continuous latent — a non-enumerable `kchain`) or a non-lowerable `L`
+/// (an intractable kernel) propagates its `Err`, so the whole posterior refuses
+/// rather than emit a partial density.
+fn lower_bayesupdate(
+    m: &mut Module,
+    node: NodeId,
+    v: NodeId,
+    bundle: &ModuleBundle,
+) -> Result<NodeId, RefuseError> {
+    let (l_arg, prior_arg) = {
+        let c = expect_builtin_call(m, node, "bayesupdate")
+            .ok_or_else(|| refuse(node, m, "expected bayesupdate"))?;
+        if c.args.len() != 2 {
+            return Err(refuse(
+                node,
+                m,
+                "bayesupdate expects 2 args (likelihood, prior)",
+            ));
+        }
+        (c.args[0], c.args[1])
+    };
+    // Prior density: θ (= v) is the prior's variate. A non-lowerable prior
+    // propagates its Err (refuse-don't-mislower).
+    let prior_d = lower_measure_density(m, prior_arg, v)?;
+    // Log-likelihood: θ (= v) is the likelihood's parameter point. Resolve one
+    // `(%ref self L)` hop to the likelihood op (likelihoodof / joint_likelihood)
+    // and reuse the shared per-likelihood lowering (which threads the bundle so a
+    // cross-module kernel in the posterior also lowers).
+    let l_d = lower_likelihood_density(m, resolve_ref_one(m, l_arg).0, v, bundle)?;
+    // Unnormalized log-posterior = log-likelihood + log-prior.
+    Ok(build_call(m, "add", &[l_d, prior_d]))
 }
 
 /// `logdensityof(likelihoodof(K, obs), θ)` = density of `K` at the observed `obs`,
@@ -718,10 +783,12 @@ pub(crate) fn lower_measure_density(
         // `functionof(Poisson.(expected))` scored via `likelihoodof`).
         Some("functionof") | Some("kernelof") => lower_reified_measure(m, measure_node, v),
         // Refused combinators — refused here rather than mis-lowered.
-        // `likelihoodof` / `joint_likelihood` are normally unwrapped at the
-        // `logdensityof` entry (their arg2 is θ, not a variate); reaching the
-        // measure dispatcher means they were entered as a bare measure — refuse
-        // (safety net) rather than emit `builtin_logdensityof(joint_likelihood, …)`.
+        // `likelihoodof` / `joint_likelihood` / `bayesupdate` are normally
+        // intercepted at the `logdensityof` entry (where the `bundle` needed to
+        // lower their likelihood term is in scope; `bayesupdate`'s arg2 and
+        // `likelihoodof`'s are θ, not a variate); reaching the measure dispatcher
+        // means they were entered as a bare measure — refuse (safety net) rather
+        // than emit `builtin_logdensityof(joint_likelihood, …)`.
         // `locscale(m, shift, scale)` = `pushfwd(x -> scale * x + shift, m)`
         // (§06 line 369/402): the affine change-of-variables, reusing the same
         // scalar / matrix-affine synthesis as `pushfwd` (Task 5).

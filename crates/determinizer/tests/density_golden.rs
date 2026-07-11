@@ -1017,3 +1017,59 @@ fn locscale_zero_scalar_scale_refuses() {
     );
     assert!(msg.contains("refuse"), "got: {msg}");
 }
+
+// Unnormalized posterior: `bayesupdate(L, prior)` = `dν(θ) = L(θ)·dπ(θ)`, so
+//   logdensityof(bayesupdate(L, prior), θ)
+//     = logdensityof(L, θ) + logdensityof(prior, θ)   (§06 "Likelihoods and
+//   posteriors": lowers to `logweighted(fn(logdensityof(L, _)), prior)`).
+// This is the HMC inference target — the log-posterior up to the dropped
+// (constant) evidence. Must lower to TWO builtin_logdensityof terms (L's kernel
+// scored at obs, the prior scored at θ) combined with `add`, not refuse.
+#[test]
+fn bayesupdate_lowers_to_loglik_plus_logprior() {
+    let src = "\
+mu = elementof(reals)
+prior = joint(mu = Normal(mu = 0.0, sigma = 1.0))
+model = functionof(Normal(mu = mu, sigma = 1.0), mu = mu)
+L = likelihoodof(model, 0.5)
+post = bayesupdate(L, prior)
+lp = logdensityof(post, record(mu = 0.3))";
+    let pir = flatppl_flatpir::write(&determinize_src(src));
+    // Two builtin_logdensityof terms (one for L's kernel, one for the prior),
+    // combined with `add`.
+    assert!(pir.contains("builtin_logdensityof"), "got:\n{pir}");
+    assert!(
+        pir.matches("builtin_logdensityof").count() >= 2,
+        "loglik + logprior, got:\n{pir}"
+    );
+    assert!(pir.contains("(add "), "log-posterior is a sum, got:\n{pir}");
+}
+
+// Refuse-don't-mislower: a `bayesupdate` whose PRIOR cannot lower (here a prior
+// that marginalizes an internal CONTINUOUS non-conjugate latent — a
+// non-enumerable `kchain` marginal) must propagate that sub-lowering Err and
+// refuse the whole posterior, never emit a partial density.
+#[test]
+fn bayesupdate_with_non_lowerable_prior_refuses() {
+    let src = "\
+mu = elementof(reals)
+z = draw(Normal(mu = 0.0, sigma = 1.0))
+k = kernelof(record(mu = draw(Normal(mu = 0.0, sigma = z))), z = z)
+badprior = kchain(lawof(record(z = z)), k)
+model = functionof(Normal(mu = mu, sigma = 1.0), mu = mu)
+L = likelihoodof(model, 0.5)
+post = bayesupdate(L, badprior)
+lp = logdensityof(post, record(mu = 0.3))";
+    let m = {
+        let mut m = flatppl_syntax::parse(src).unwrap();
+        let _ = flatppl_infer::infer(&mut m);
+        m
+    };
+    let err =
+        determinize(&m).expect_err("a bayesupdate whose prior cannot lower must refuse, not lower");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("kchain") || msg.contains("non-enumerable"),
+        "refusal should propagate the prior's sub-lowering failure: {msg}"
+    );
+}
