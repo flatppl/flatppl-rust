@@ -91,7 +91,8 @@ fn fixture_query_corpus_lowers_or_documented_refuse() {
         ("bayesian_inference_1_likelihood.flatppl", Expect::Lowers),
         ("bayesian_inference_1_prior.flatppl", Expect::Lowers),
         ("eight_schools_prior.flatppl", Expect::Lowers),
-        ("pushfwd_raw_lambda_refuses.flatppl", Expect::RefusesExit3),
+        ("pushfwd_exp_lognormal.flatppl", Expect::Lowers),
+        ("pushfwd_arbitrary_f_refuses.flatppl", Expect::RefusesExit3),
     ];
     for (filename, expect) in cases {
         let path = corpus_dir.join(filename);

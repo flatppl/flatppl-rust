@@ -1,0 +1,6 @@
+flatppl_compat = "0.1"
+# SPEC-CORRECT REFUSE (§06 case 3): a non-injective forward function (x*x) has no
+# well-defined density without an explicit bijection(f, f_inv, logvol). Determiniser
+# must refuse, not mislower.
+d = pushfwd(x -> x * x, Normal(mu = 0.0, sigma = 1.0))
+lp = logdensityof(d, 0.5)

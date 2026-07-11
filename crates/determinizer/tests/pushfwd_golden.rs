@@ -284,7 +284,8 @@ fn pushfwd_elementwise_exp_lowers() {
         "d = pushfwd(fn(broadcast(exp, _)), iid(Normal(mu = 0.0, sigma = 1.0), 3))\nlp = logdensityof(d, [0.5, 0.6, 0.7])",
     );
     assert!(
-        p.contains("builtin_logdensityof") && p.contains("sum"),
+        p.contains("builtin_logdensityof")
+            && p.contains("(sum (%meta (%deferred %parameterized %unknown) (broadcast"),
         "got:\n{p}"
     );
     // The per-cell inverse is broadcast(log, y): the inner iid density is scored at
@@ -306,7 +307,12 @@ fn pushfwd_elementwise_coupled_refuses() {
          lp = logdensityof(d, [0.5, 0.6, 0.7])",
     ))
     .expect_err("coupled 2-slot broadcast must refuse");
-    assert!(format!("{e:?}").contains("refuse"), "got: {e:?}");
+    let msg = format!("{e:?}");
+    assert!(msg.contains("refuse"), "got: {e:?}");
+    assert!(
+        msg.contains("coupled"),
+        "expected the specific coupled-broadcast branch reason, got: {e:?}"
+    );
 }
 
 #[test]
