@@ -165,7 +165,7 @@ pub(crate) fn derive_bijection(
     let (f_resolved, _) = resolve_ref_one(m, f);
     match recognise(m, f_resolved) {
         // Bare builtin value: Task-1 single-op form (byte-equality-pinned).
-        Recognized::BareConst(name) => Ok(bare_bijection(m, &name)),
+        Recognized::BareConst(name) => bare_bijection(m, &name, f, domain),
         Recognized::Lambda {
             body,
             input_name,
@@ -210,7 +210,7 @@ pub(crate) fn derive_bijection(
             if let Some(k_node) = single_pow(m, body, ph) {
                 return derive_pow(m, f, k_node, domain);
             }
-            derive_chain(m, body, input_name, ph)
+            derive_chain(m, body, input_name, ph, domain)
         }
         Recognized::Unrecognized => Ok(None),
     }
@@ -220,34 +220,56 @@ pub(crate) fn derive_bijection(
 /// (`pushfwd(exp, M)`): the `f_inv`/`logvol` forms whose byte-equality against
 /// `bijection(exp, log, x -> x)` pins the forward-log-volume convention. Any
 /// other bare builtin (including bare `pow`, which needs an exponent) is not a
-/// recognised bare bijection → `None`.
-fn bare_bijection(m: &mut Module, name: &str) -> Option<Bijection> {
+/// recognised bare bijection → `Ok(None)`.
+///
+/// `exp`/`neg` are defined and injective over the whole real line, so they take
+/// no domain guard. `log` is undefined for `x ≤ 0` (spec §06 log defined on
+/// positive reals): over a base measure `M` whose support is not PROVABLY
+/// positive, `f_inv = exp` / `logvol = neg(log(x))` would still typecheck and
+/// "lower", but the resulting density is valid only on the positive half of
+/// `M`'s support — a silently SUB-probability measure (integrates to less than
+/// 1). Refuse rather than mislower (mirrors [`derive_pow`]'s
+/// `is_positive_domain` guard).
+fn bare_bijection(
+    m: &mut Module,
+    name: &str,
+    f: NodeId,
+    domain: &Type,
+) -> Result<Option<Bijection>, RefuseError> {
     match name {
         // d/dx eˣ = eˣ ⇒ log|f'| = x (identity).
-        "exp" => Some(Bijection {
+        "exp" => Ok(Some(Bijection {
             f_inv: bare_builtin(m, "log"),
             logvol: identity_lambda(m),
-        }),
+        })),
         // d/dx ln x = 1/x ⇒ log|f'| = −ln x.
         "log" => {
+            if !is_positive_domain(domain) {
+                return Err(refuse(
+                    f,
+                    m,
+                    "pushfwd(log, M) requires M to have positive support; refuse rather than \
+                     mislower a sub-probability measure",
+                ));
+            }
             let logvol = lambda(m, |m, ph| {
                 let logx = build_call(m, "log", &[ph]);
                 build_call(m, "neg", &[logx])
             });
-            Some(Bijection {
+            Ok(Some(Bijection {
                 f_inv: bare_builtin(m, "exp"),
                 logvol,
-            })
+            }))
         }
         // f'(x) = −1 ⇒ log|f'| = 0.
         "neg" => {
             let logvol = lambda(m, |m, _ph| m.alloc(Node::Lit(Scalar::Real(0.0))));
-            Some(Bijection {
+            Ok(Some(Bijection {
                 f_inv: bare_builtin(m, "neg"),
                 logvol,
-            })
+            }))
         }
-        _ => None,
+        _ => Ok(None),
     }
 }
 
@@ -259,16 +281,38 @@ fn bare_bijection(m: &mut Module, name: &str) -> Option<Bijection> {
 /// * `Ok(Some(_))` — every op in the chain is invertible.
 /// * `Ok(None)` — the chain hit an unrecognised shape (a non-builtin head, or a
 ///   leaf that is not the input placeholder).
-/// * `Err(_)` — the chain hit a recognised-but-non-invertible op (refuse).
+/// * `Err(_)` — the chain hit a recognised-but-non-invertible op (refuse), or a
+///   `log` anywhere in the chain over a base whose domain is not provably
+///   positive (see the guard below).
 fn derive_chain(
     m: &mut Module,
     body: NodeId,
     input_name: Symbol,
     ph: Symbol,
+    domain: &Type,
 ) -> Result<Option<Bijection>, RefuseError> {
     let Some(ops) = flatten_chain(m, body, ph)? else {
         return Ok(None);
     };
+
+    // A `log` ANYWHERE in the chain is undefined unless its own input is
+    // positive (spec §06 log defined on positive reals) — the same silent
+    // sub-probability danger [`bare_bijection`]'s `log` case guards against.
+    // Proving positivity of an INTERIOR op's input (rather than the chain's
+    // overall base domain) is out of scope here, so this guard is
+    // CONSERVATIVE: it refuses the whole chain unless the base `domain` is
+    // provably positive, even though a `log` deep in a chain might in fact
+    // always receive a positive intermediate value from a wider base. Refuse
+    // rather than mislower (mirrors [`derive_pow`]'s `is_positive_domain`
+    // guard).
+    if ops.iter().any(|op| matches!(op, ChainOp::Log(_))) && !is_positive_domain(domain) {
+        return Err(refuse(
+            body,
+            m,
+            "a chain containing log requires the base measure to have positive support; \
+             refuse rather than mislower a sub-probability measure",
+        ));
+    }
 
     // f_inv(y) = g₁_inv(…(gₙ_inv(y))…): thread the per-op inverses through a fresh
     // placeholder, outermost-first (the chain is stored outermost-first).

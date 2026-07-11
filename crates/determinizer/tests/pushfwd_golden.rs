@@ -115,6 +115,36 @@ fn pushfwd_zero_divisor_affine_refuses() {
 }
 
 #[test]
+fn pushfwd_log_over_unrestricted_domain_refuses() {
+    // `ln x` is undefined for x <= 0; Normal(mu=0, sigma=1)'s support is all of
+    // ℝ, not positive. Lowering `pushfwd(log, Normal)` would synthesize a
+    // well-formed-looking `(f_inv=exp, logvol=neg(log(x)))` change-of-variables
+    // that is only valid on the positive half of the base support — silently a
+    // SUB-probability measure (integrates to ~0.5, not 1). Refuse rather than
+    // mislower (mirrors derive_pow's is_positive_domain guard; §06 log defined
+    // on positive reals).
+    let e = determinize(&parse_infer(
+        "d = pushfwd(log, Normal(mu = 0.0, sigma = 1.0))\nlp = logdensityof(d, 0.5)",
+    ))
+    .expect_err("pushfwd(log, Normal) over a non-positive-support base must refuse");
+    assert!(format!("{e:?}").contains("refuse"), "got: {e:?}");
+}
+
+#[test]
+fn pushfwd_log_chain_over_unrestricted_domain_refuses() {
+    // Same silent-sub-probability danger as the bare-log case, but with `log`
+    // appearing inside a scalar-chain forward body (`2.0*log(x)`) rather than
+    // as the bare builtin. The chain-walk guard is conservative: it refuses
+    // ANY chain containing `log` unless the base domain is provably positive,
+    // regardless of where in the chain `log` sits.
+    let e = determinize(&parse_infer(
+        "d = pushfwd(x -> 2.0 * log(x), Normal(mu = 0.0, sigma = 1.0))\nlp = logdensityof(d, 0.5)",
+    ))
+    .expect_err("a chain containing log over a non-positive-support base must refuse");
+    assert!(format!("{e:?}").contains("refuse"), "got: {e:?}");
+}
+
+#[test]
 fn pushfwd_pow_in_composition_refuses() {
     // pow nested inside a composition (not the single top-level op) has an
     // unverifiable input domain — the chain walk unconditionally refuses it.
@@ -293,6 +323,43 @@ fn pushfwd_elementwise_exp_lowers() {
     assert!(
         p.contains("(broadcast log"),
         "f_inv = broadcast(log, y) present:\n{p}"
+    );
+}
+
+#[test]
+fn pushfwd_elementwise_byte_equals_explicit() {
+    // pushfwd_elementwise_exp_lowers only substring-matches (`(sum ...`,
+    // `(broadcast log`); the matrix arm added a non-degenerate byte-equal test
+    // (pushfwd_matrix_affine_nonidentity_logdet) specifically because substring
+    // matches can miss a sign/shape bug that a full structural pin catches.
+    // Byte-equal the synthesized elementwise bijection against the explicit
+    // `bijection(f, f_inv, logvol)` form it should be identical to:
+    //   f_inv(y)   = broadcast(log, y)          (per-cell scalar inverse)
+    //   logvol(x)  = sum(broadcast(x -> x, x))  (diagonal log-det: g_logvol for
+    //                                             exp is the identity, per-cell,
+    //                                             summed)
+    // `f_inv`/`logvol` are spelled `x -> ...` (not `fn(_)`) because the
+    // synthesizer always names its emitted lambdas' boundary "x"/"_x_"
+    // ([`lambda`] in invert.rs) — spelling the explicit comparison form with
+    // `fn(_)` sugar (which names its placeholder differently) would break byte
+    // equality for a reason unrelated to the change-of-variables, exactly as
+    // pushfwd_bare_exp_lowers_like_explicit_bijection's doc comment notes for
+    // the dead-binding pitfall. The explicit bijection is inlined (not bound to
+    // a name) for the same reason.
+    let synth = pir(
+        "d = pushfwd(fn(broadcast(exp, _)), iid(Normal(mu = 0.0, sigma = 1.0), 3))\n\
+         lp = logdensityof(d, [0.5, 0.6, 0.7])",
+    );
+    let explicit = pir(
+        "d = pushfwd(bijection(fn(broadcast(exp, _)), x -> broadcast(log, x), \
+         x -> sum(broadcast(x -> x, x))), iid(Normal(mu = 0.0, sigma = 1.0), 3))\n\
+         lp = logdensityof(d, [0.5, 0.6, 0.7])",
+    );
+    assert!(synth.contains("builtin_logdensityof"), "got:\n{synth}");
+    assert_eq!(
+        synth, explicit,
+        "synthesized elementwise bijection must match the explicit \
+         bijection(f, x -> broadcast(log, x), x -> sum(broadcast(x -> x, x))) form"
     );
 }
 
