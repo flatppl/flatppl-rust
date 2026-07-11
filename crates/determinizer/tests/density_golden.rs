@@ -871,3 +871,97 @@ lp = logdensityof(lawof(record(a = a)), record(a = [0.1, 0.2, 0.3]))";
         "refusal should name the variate/domain mismatch: {msg}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// locscale (§06 line 369/402): `locscale(m, shift, scale)` is shorthand for
+// `pushfwd(x -> scale * x + shift, m)`. Density lowering reuses the affine
+// change-of-variables: scalar scale → f_inv(y) = (y - shift)/scale,
+// logvol = log|scale|; matrix scale (the MvNormal Cholesky case) →
+// f_inv(y) = linsolve(scale, y - shift), logvol = logabsdet(scale).
+// ---------------------------------------------------------------------------
+
+fn ls_pir(src: &str) -> String {
+    let mut m = flatppl_syntax::parse(src).unwrap();
+    let _ = flatppl_infer::infer(&mut m);
+    flatppl_flatpir::write(&determinize(&m).expect("locscale must lower"))
+}
+
+#[test]
+fn locscale_scalar_lowers() {
+    // locscale(Normal(0,1), 2.0, 3.0) ≡ Normal(2, 3): the affine change of
+    // variables f(x) = 3x + 2, f_inv(y) = (y - 2)/3, logvol = log|3|. Density:
+    //   logdensityof(Normal(0,1), (y - 2)/3) - log|3|
+    // = -½log2π - ½((y-2)/3)² - log 3  ≡  log N(y; 2, 3).
+    let p =
+        ls_pir("d = locscale(Normal(mu = 0.0, sigma = 1.0), 2.0, 3.0)\nlp = logdensityof(d, 0.5)");
+    assert!(p.contains("builtin_logdensityof"), "got:\n{p}");
+    // f_inv preimage (y - 2)/3 = divide(sub(y, 2.0), 3.0):
+    assert!(
+        p.contains("(divide") && p.contains("(sub (%ref %local _x_) 2.0)"),
+        "f_inv = (y - 2)/3 present:\n{p}"
+    );
+    // logvol = log|3| = log(abs(3.0)):
+    assert!(p.contains("(abs 3.0)"), "logvol log|3| present:\n{p}");
+}
+
+#[test]
+fn locscale_scalar_equals_affine_pushfwd() {
+    // The defining identity (§06): locscale(m, shift, scale) ==
+    // pushfwd(x -> scale * x + shift, m). Byte-equal FlatPDL proves it — the two
+    // surfaces must lower to the exact same change-of-variables.
+    let locscale =
+        ls_pir("d = locscale(Normal(mu = 0.0, sigma = 1.0), 2.0, 3.0)\nlp = logdensityof(d, 0.5)");
+    let affine = ls_pir(
+        "d = pushfwd(x -> 3.0 * x + 2.0, Normal(mu = 0.0, sigma = 1.0))\nlp = logdensityof(d, 0.5)",
+    );
+    assert_eq!(
+        locscale, affine,
+        "locscale(m, shift, scale) must lower identically to pushfwd(x -> scale*x + shift, m)"
+    );
+}
+
+#[test]
+fn locscale_matrix_lowers() {
+    // locscale(MvNormal(0, I), mu, L) with L a square (Cholesky) matrix ≡
+    // MvNormal(mu, L Lᵀ). Matrix-affine change of variables:
+    //   f_inv(y) = linsolve(L, y - mu),  logvol = logabsdet(L).
+    let p = ls_pir(
+        "cov = [[4.0, 1.0], [1.0, 3.0]]\n\
+         d = locscale(MvNormal(mu = [0.0, 0.0], cov = [[1.0, 0.0], [0.0, 1.0]]), \
+                      [1.0, 2.0], lower_cholesky(cov))\n\
+         lp = logdensityof(d, [0.5, 0.5])",
+    );
+    assert!(p.contains("builtin_logdensityof"), "got:\n{p}");
+    // f_inv = linsolve(L, y - mu): the preimage solve with its y - mu RHS.
+    assert!(
+        p.contains("(linsolve") && p.contains("(sub"),
+        "f_inv = linsolve(L, y - mu) present:\n{p}"
+    );
+    // logvol = logabsdet(L): the constant forward log-volume.
+    assert!(
+        p.contains("(logabsdet"),
+        "logvol = logabsdet(L) present:\n{p}"
+    );
+}
+
+#[test]
+fn locscale_matrix_equals_affine_pushfwd() {
+    // Matrix defining identity: locscale(MvNormal(0,I), mu, L) ==
+    // pushfwd(x -> L * x + mu, MvNormal(0,I)). Byte-equal FlatPDL.
+    let locscale = ls_pir(
+        "cov = [[4.0, 1.0], [1.0, 3.0]]\n\
+         L = lower_cholesky(cov)\n\
+         d = locscale(MvNormal(mu = [0.0, 0.0], cov = [[1.0, 0.0], [0.0, 1.0]]), [1.0, 2.0], L)\n\
+         lp = logdensityof(d, [0.5, 0.5])",
+    );
+    let affine = ls_pir(
+        "cov = [[4.0, 1.0], [1.0, 3.0]]\n\
+         L = lower_cholesky(cov)\n\
+         d = pushfwd(x -> L * x + [1.0, 2.0], MvNormal(mu = [0.0, 0.0], cov = [[1.0, 0.0], [0.0, 1.0]]))\n\
+         lp = logdensityof(d, [0.5, 0.5])",
+    );
+    assert_eq!(
+        locscale, affine,
+        "matrix locscale must lower identically to pushfwd(x -> L*x + mu, m)"
+    );
+}

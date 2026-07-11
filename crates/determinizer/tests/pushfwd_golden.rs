@@ -325,3 +325,92 @@ fn pushfwd_matrix_affine_non_square_refuses() {
     .expect_err("non-square bracket-literal L must refuse");
     assert!(format!("{e:?}").contains("refuse"), "got: {e:?}");
 }
+
+// ---------------------------------------------------------------------------
+// Structural projection (§06 case 2): pushfwd(fn(get(_, [fields])), M) is a
+// MARGINALIZATION. For an explicit field-keyed product (keyword `joint` /
+// record-of-draws), the marginal density is closed-form: the sum of just the
+// SELECTED components' densities at the projected point (the unselected
+// components integrate to 1 and drop). Non-product M, or iid/jointchain/relabel
+// (index-remapping, out of scope), refuse.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn projection_over_keyword_joint_marginalizes() {
+    // pushfwd(fn(get(_, ["a"])), joint(a = Normal, b = Exponential)) projects to
+    // the {a} marginal: the Normal component only. b (Exponential) is
+    // marginalized out — it must NOT contribute a density term.
+    // Closed form: logdensityof(marginal, record(a = 0.5)) = logdensityof(Normal(0,1), 0.5).
+    let p = pir(
+        "j = joint(a = Normal(mu = 0.0, sigma = 1.0), b = Exponential(rate = 1.0))\n\
+         pr = pushfwd(fn(get(_, [\"a\"])), j)\n\
+         lp = logdensityof(pr, record(a = 0.5))",
+    );
+    // Exactly ONE scored component (the Normal), not two.
+    assert_eq!(
+        p.matches("builtin_logdensityof").count(),
+        1,
+        "marginal keeps only the selected Normal component:\n{p}"
+    );
+    // The kept Normal component is present; the marginalized-out Exponential is
+    // gone entirely (its dead measure binding is swept to 0.0).
+    assert!(
+        p.contains("Normal"),
+        "Normal (kept) component present:\n{p}"
+    );
+    assert!(
+        !p.contains("Exponential"),
+        "Exponential (marginalized-out) component absent:\n{p}"
+    );
+    // The projected point's field value (0.5) is scored — the marginal is the
+    // Normal density at a = 0.5.
+    assert!(p.contains("0.5"), "projected point 0.5 scored:\n{p}");
+}
+
+#[test]
+fn projection_over_keyword_joint_two_fields_marginalizes_middle() {
+    // Select {a, c} from a 3-field joint — the middle field b is marginalized
+    // out. Two kept components (Normal + Gamma), the dropped one (Exponential)
+    // absent.
+    let p = pir("j = joint(a = Normal(mu = 0.0, sigma = 1.0), \
+                           b = Exponential(rate = 1.0), \
+                           c = Gamma(shape = 2.0, rate = 1.0))\n\
+         pr = pushfwd(fn(get(_, [\"a\", \"c\"])), j)\n\
+         lp = logdensityof(pr, record(a = 0.5, c = 0.7))");
+    assert_eq!(
+        p.matches("builtin_logdensityof").count(),
+        2,
+        "marginal keeps the two selected components (a, c):\n{p}"
+    );
+    assert!(
+        !p.contains("Exponential"),
+        "middle field b (Exponential) marginalized out:\n{p}"
+    );
+}
+
+#[test]
+fn projection_over_nonproduct_refuses() {
+    // A projection over a NON-product measure (a bare Normal) has no explicit
+    // product structure, so the marginal is not closed-form here — refuse
+    // (§06 case 2 permits "numerically or static error"; we refuse).
+    let e = determinize(&parse_infer(
+        "pr = pushfwd(fn(get(_, [\"a\"])), Normal(mu = 0.0, sigma = 1.0))\n\
+         lp = logdensityof(pr, record(a = 0.5))",
+    ))
+    .expect_err("projection over a non-product measure must refuse");
+    assert!(format!("{e:?}").contains("refuse"), "got: {e:?}");
+}
+
+#[test]
+fn projection_over_iid_refuses() {
+    // A projection over `iid` (positional / index-keyed product) needs index
+    // remapping — out of scope for the field-keyed marginal here. Refuse with a
+    // clear reason rather than mislower (noted follow-up).
+    let e = determinize(&parse_infer(
+        "m = iid(Normal(mu = 0.0, sigma = 1.0), 3)\n\
+         pr = pushfwd(fn(get(_, [\"a\"])), m)\n\
+         lp = logdensityof(pr, record(a = 0.5))",
+    ))
+    .expect_err("projection over iid must refuse (scoped to field-keyed products)");
+    assert!(format!("{e:?}").contains("refuse"), "got: {e:?}");
+}

@@ -587,6 +587,125 @@ fn derive_matrix_affine(
     Ok(Some(Bijection { f_inv, logvol }))
 }
 
+/// Derive the change-of-variables for `locscale(m, shift, scale)` — the
+/// affine (location-scale) pushforward `pushfwd(x -> scale * x + shift, m)`
+/// (spec §06 line 369/402). Rather than materialise the forward node and
+/// re-recognise it, we emit `(f_inv, logvol)` directly, which reuses the exact
+/// two affine forms [`derive_chain`] (scalar) and [`derive_matrix_affine`]
+/// (matrix) synthesise — but WITHOUT their forward-recognition literal
+/// constraints, so a SYMBOLIC `shift`/`scale` (a model parameter) lowers too.
+///
+/// The scalar-vs-matrix split is keyed on `m`'s variate `domain` (mirroring
+/// [`derive_bijection`]'s own dispatch), so it stays consistent with the
+/// pushfwd path:
+///
+/// * **Scalar variate** — `f_inv(y) = (y − shift) / scale`, `logvol =
+///   log|scale|` (constant; a scalar affine map's forward derivative is
+///   `scale`). Cross-check: `locscale(Normal(0,1), s, c)` emits
+///   `logdensityof(Normal(0,1), (y−s)/c) − log|c|` = `log N(y; s, c)`.
+/// * **Vector variate** — the MvNormal Cholesky case: `scale` must be a square
+///   matrix `L`, `f_inv(y) = linsolve(L, y − shift)`, `logvol = logabsdet(L)`
+///   (constant; §07). Identical emission to [`derive_matrix_affine`].
+///
+/// Refuse (never mislower) when: the base variate domain is neither confirmed
+/// scalar nor a vector; a vector variate is paired with a non-matrix `scale`
+/// (a scalar scale over an n-vector has forward log-volume `n·log|scale|`, not
+/// `log|scale|` — the same danger [`derive_bijection`]'s vector guard closes);
+/// the matrix `scale` is a CONFIRMED non-square matrix; or a scalar variate is
+/// paired with a matrix `scale`. A literal-zero scalar `scale` (a non-injective
+/// collapse) also refuses, matching [`classify`]'s affine-`mul` guard.
+///
+/// `shift` and `scale` are the raw `locscale` argument nodes; they are shared
+/// (not cloned) into the emitted callables, exactly as [`derive_matrix_affine`]
+/// shares `mu`/`L`.
+pub(crate) fn derive_locscale(
+    m: &mut Module,
+    shift: NodeId,
+    scale: NodeId,
+    domain: &Type,
+) -> Result<Bijection, RefuseError> {
+    if domain_is_vector(domain) {
+        // Matrix-affine (MvNormal construction): scale is a square matrix L.
+        if !type_is_matrix(m, scale) {
+            return Err(refuse(
+                scale,
+                m,
+                "locscale over a vector variate requires a matrix scale; a scalar scale would give \
+                 the wrong forward log-volume (n·log|scale|, not log|scale|) — refuse rather than mislower",
+            ));
+        }
+        if matrix_confirmed_non_square(m, scale) {
+            return Err(refuse(
+                scale,
+                m,
+                "locscale matrix scale is not square (linsolve/logabsdet need a square matrix) — \
+                 refuse rather than mislower",
+            ));
+        }
+        // f_inv(y) = linsolve(scale, y − shift); logvol(_) = logabsdet(scale).
+        let f_inv = lambda(m, |m, y| {
+            let diff = build_call(m, "sub", &[y, shift]);
+            build_call(m, "linsolve", &[scale, diff])
+        });
+        let logvol = lambda(m, |m, _y| build_call(m, "logabsdet", &[scale]));
+        return Ok(Bijection { f_inv, logvol });
+    }
+    if matches!(domain, Type::Scalar(_)) {
+        // Scalar affine. A matrix scale is variate-incompatible here — refuse.
+        if type_is_matrix(m, scale) {
+            return Err(refuse(
+                scale,
+                m,
+                "locscale over a scalar variate requires a scalar scale, not a matrix — \
+                 refuse rather than mislower",
+            ));
+        }
+        // A literal-zero scale collapses the forward map to the constant `shift`
+        // (not injective) and makes `log|scale| = −∞`; refuse (mirrors the
+        // affine-`mul` literal-zero guard in `classify`). A symbolic scale is
+        // trusted (as the matrix branch trusts `det L ≠ 0`).
+        if literal_real(m, scale) == Some(0.0) {
+            return Err(refuse(
+                scale,
+                m,
+                "locscale with a literal-zero scale is not an injective affine map — refuse",
+            ));
+        }
+        // f_inv(y) = (y − shift) / scale; logvol(_) = log|scale|.
+        let f_inv = lambda(m, |m, y| {
+            let diff = build_call(m, "sub", &[y, shift]);
+            build_call(m, "divide", &[diff, scale])
+        });
+        let logvol = lambda(m, |m, _y| {
+            let abss = build_call(m, "abs", &[scale]);
+            build_call(m, "log", &[abss])
+        });
+        return Ok(Bijection { f_inv, logvol });
+    }
+    Err(refuse(
+        scale,
+        m,
+        "locscale base measure variate domain is not confirmed scalar or vector — refuse rather \
+         than guess the affine form",
+    ))
+}
+
+/// Is `id`'s inferred type a MATRIX — a flat rank-2 array `Array{shape:[r, c]}`
+/// or a nested vec-of-vec `Array{shape:[r], elem: Array}`? (Recognises the same
+/// two representations as [`matrix_confirmed_non_square`].) A vector
+/// (`Array{shape:[n], elem: Scalar}`) or scalar is NOT a matrix; an unresolved
+/// type is conservatively NOT a matrix (so a vector-variate `locscale` with an
+/// untyped `scale` refuses rather than assumes a matrix).
+fn type_is_matrix(m: &Module, id: NodeId) -> bool {
+    match m.type_of(id) {
+        Some(Type::Array { shape, .. }) if shape.len() == 2 => true,
+        Some(Type::Array { shape, elem }) if shape.len() == 1 => {
+            matches!(elem.as_ref(), Type::Array { .. })
+        }
+        _ => false,
+    }
+}
+
 /// Derive `(f_inv, logvol)` for a multivariate ELEMENTWISE unary forward body
 /// `broadcast(g, x)` over a VECTOR variate — a single scalar-invertible `g`
 /// applied to EVERY cell of `x` (spec §06 case 1, the user-requested elementwise
