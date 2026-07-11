@@ -787,3 +787,95 @@ lp = logdensityof(outer.x, 0.5)";
             .unwrap_or_default()
     );
 }
+
+/// GAP #194 — a cross-module kernel APPLICATION as the `logdensityof` target:
+/// the submodule defines a reified SCALAR kernel `k = functionof(Normal(mu =
+/// center, sigma = 1.0), center = center)`, the host `load_module`s it and
+/// scores the APPLIED kernel `logdensityof(m.k(record(center = 0.0)), 0.5)`.
+/// The target is `%call { head: User((%ref m k)), args: [record(center = 0.0)] }`
+/// — a `%call` whose CALLEE is a cross-module ref. Spec §04: a kernelof
+/// application and a cross-module measure both cross module boundaries, so this
+/// SHOULD lower.
+///
+/// Before the fix the bare cross-module callee `(%ref m k)` could not be
+/// resolved by `reduce_kernel_application`'s same-module `resolve_reified`
+/// (`resolve_ref_one` only resolves `RefNs::SelfMod`), so the reduction returned
+/// `None` and the query refused ("primitive measure must be a built-in
+/// constructor"). The fix grafts the callee into the host FIRST (via the same
+/// cross-module graft used for a direct target), rebuilds the `%call` with the
+/// grafted LOCAL callee, and defers: the driver re-infers (typing the grafted
+/// kernel) and `reduce_kernel_application` β-reduces the now-local application
+/// on the next iteration, binding the applied `center = 0.0` into the law.
+#[test]
+fn cross_module_kernel_application_lowers() {
+    let helpers = "\
+flatppl_compat = \"0.1\"
+center = elementof(reals)
+k = functionof(Normal(mu = center, sigma = 1.0), center = center)";
+    let model = "\
+flatppl_compat = \"0.1\"
+m = load_module(\"helpers.flatppl\")
+lp = logdensityof(m.k(record(center = 0.0)), 0.5)";
+
+    let mut hmod = parse(helpers);
+    let _ = flatppl_infer::infer(&mut hmod);
+    let mut bundle = ModuleBundle::new();
+    bundle.insert("helpers.flatppl", Arc::new(hmod));
+
+    let mut mmod = parse(model);
+    let _ = flatppl_infer::infer_module(&mut mmod, &bundle, flatppl_infer::Level::Shape);
+
+    let lowered = determinize_with(&mmod, &bundle)
+        .expect("cross-module kernel APPLICATION target must lower, not refuse");
+    let pir = flatppl_flatpir::write(&lowered);
+    assert!(
+        pir.contains("builtin_logdensityof"),
+        "cross-module kernel application did not lower to builtin_logdensityof; got:\n{pir}"
+    );
+    // The applied `center = 0.0` β-reduces into the kernel body's `mu`, and the
+    // submodule's `sigma = 1.0` survives the graft — a fully-determined law.
+    assert!(
+        pir.contains("(%field mu 0.0)") && pir.contains("(%field sigma 1.0)"),
+        "applied `center = 0.0` did not β-reduce into the kernel body's Normal(mu = 0.0, \
+         sigma = 1.0); got:\n{pir}"
+    );
+}
+
+/// GAP #194, refuse-don't-mislower: a cross-module kernel APPLICATION whose
+/// callee graft collides with an unrelated host binding refuses cleanly. The
+/// submodule kernel `k` depends on an internal `scale = 2.0` whose name collides
+/// with an UNRELATED host `scale = 10.0`. Modules are independent namespaces, so
+/// grafting the callee must NOT reuse the host binding (which would silently
+/// score `sigma = 10.0` instead of the submodule's `2.0`) — the graft refuses,
+/// and that refuse propagates out of the application-graft path.
+#[test]
+fn cross_module_kernel_application_collision_refuses() {
+    let helpers = "\
+flatppl_compat = \"0.1\"
+center = elementof(reals)
+scale = 2.0
+k = functionof(Normal(mu = center, sigma = scale), center = center)";
+    let model = "\
+flatppl_compat = \"0.1\"
+scale = 10.0
+m = load_module(\"helpers.flatppl\")
+lp = logdensityof(m.k(record(center = 0.0)), 0.5)";
+
+    let mut hmod = parse(helpers);
+    let _ = flatppl_infer::infer(&mut hmod);
+    let mut bundle = ModuleBundle::new();
+    bundle.insert("helpers.flatppl", Arc::new(hmod));
+
+    let mut mmod = parse(model);
+    let _ = flatppl_infer::infer_module(&mut mmod, &bundle, flatppl_infer::Level::Shape);
+
+    let result = determinize_with(&mmod, &bundle);
+    assert!(
+        result.is_err(),
+        "a cross-module kernel APPLICATION whose callee graft collides with an unrelated host \
+         binding must refuse, not silently reuse the host binding; got:\n{}",
+        result
+            .map(|l| flatppl_flatpir::write(&l))
+            .unwrap_or_default()
+    );
+}

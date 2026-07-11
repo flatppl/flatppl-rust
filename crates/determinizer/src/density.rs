@@ -381,10 +381,87 @@ pub(crate) fn graft_query_target(
         }
         (q.args[0], q.args[1])
     };
-    match graft_cross_module_target(m, arg1, bundle)? {
-        None => Ok(None), // same-module target — driver lowers normally
-        Some(grafted) => Ok(Some(build_call(m, "logdensityof", &[grafted, arg2]))),
+    // Case 1: the target IS (or resolves via one `(%ref self …)` hop to) a
+    // cross-module measure / likelihood HANDLE — graft it directly.
+    if let Some(grafted) = graft_cross_module_target(m, arg1, bundle)? {
+        return Ok(Some(build_call(m, "logdensityof", &[grafted, arg2])));
     }
+    // Case 2 (#194): the target is a cross-module kernel APPLICATION — a
+    // `%call { head: User(callee), args: [input] }` whose CALLEE is a cross-module
+    // ref (`logdensityof(m.k(input), pt)`). Graft the callee into the host and
+    // rebuild the call with the grafted LOCAL callee, so the driver's re-infer
+    // types the grafted kernel and `reduce_kernel_application` β-reduces the
+    // now-local application next iteration.
+    if let Some(new_call) = graft_kernel_application_callee(m, arg1, bundle)? {
+        return Ok(Some(build_call(m, "logdensityof", &[new_call, arg2])));
+    }
+    Ok(None) // same-module target — driver lowers normally
+}
+
+/// If the `logdensityof` target `arg1` is — or resolves via one `(%ref self …)`
+/// hop to — a reified-kernel APPLICATION `%call { head: User(callee), args }`
+/// whose `callee` (after one ref hop) is a cross-module `(%ref <alias> member)`
+/// ref, GRAFT the callee subtree into the host (via [`graft_cross_module_target`],
+/// which carries the load-time `%assign`, the host-collision refuse, and the
+/// nested-ref handling), rebuild the `%call` with the grafted LOCAL callee as its
+/// head, and return `Some(rebuilt_call)`.
+///
+/// The application's arguments (`args` / `named` / reification `inputs`) already
+/// live in the host query — the applied `input` record is host-local — so they
+/// are carried over unchanged; only the callee crosses the module boundary.
+///
+/// The rebuilt call is returned to [`graft_query_target`], which wraps it in a
+/// fresh `logdensityof` for the driver to substitute for this query's target.
+/// The driver then defers (re-infers) and, on the next scan, sees a now-LOCAL
+/// application whose callee is no longer a module ref — so this returns `Ok(None)`
+/// and `reduce_kernel_application` β-reduces it (the GAP-D defer-and-reloop). The
+/// callee going from a module-ref to a local grafted node bounds the graft to AT
+/// MOST ONCE per query (termination).
+///
+/// `Ok(None)`: `arg1` is not a user-call application, or its callee is a LOCAL
+/// (same-module) ref — the existing same-module `reduce_kernel_application`
+/// handles that untouched (no regression).
+///
+/// `Err` (refuse-don't-mislower): the callee is an unresolvable / colliding
+/// cross-module ref (or — downstream — grafts to a non-kernel) — the graft's own
+/// `Err` propagates.
+fn graft_kernel_application_callee(
+    m: &mut Module,
+    arg1: NodeId,
+    bundle: &ModuleBundle,
+) -> Result<Option<NodeId>, RefuseError> {
+    // The target may be inline (`logdensityof(m.k(input), pt)`) or bound by name
+    // (`ka = m.k(input); logdensityof(ka, pt)`); resolve one ref hop to the call.
+    let (call_node, _) = resolve_ref_one(m, arg1);
+    let (callee, args, named, inputs) = {
+        let Node::Call(c) = m.node(call_node) else {
+            return Ok(None);
+        };
+        let CallHead::User(callee) = c.head else {
+            return Ok(None); // a builtin-headed measure op, not a kernel application
+        };
+        (callee, c.args.clone(), c.named.clone(), c.inputs.clone())
+    };
+    // Only a CROSS-MODULE callee triggers the graft. A local callee (directly, or
+    // via one `(%ref self …)` hop) is left for `reduce_kernel_application`.
+    let (callee_resolved, _) = resolve_ref_one(m, callee);
+    if !is_module_ref(m, callee) && !is_module_ref(m, callee_resolved) {
+        return Ok(None);
+    }
+    // Graft the cross-module callee into the host. `graft_cross_module_target`
+    // returns `None` only for a same-module ref (excluded by the guard above), so
+    // treat that defensively as "nothing to graft".
+    let Some(grafted_callee) = graft_cross_module_target(m, callee, bundle)? else {
+        return Ok(None);
+    };
+    // Rebuild the `%call` with the grafted local callee as its head; the
+    // host-local args / named / reification inputs carry over unchanged.
+    Ok(Some(m.alloc(Node::Call(Call {
+        head: CallHead::User(grafted_callee),
+        args,
+        named,
+        inputs,
+    }))))
 }
 
 /// True iff `id` is a `(%ref <alias> …)` cross-module reference.
