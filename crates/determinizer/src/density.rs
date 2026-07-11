@@ -329,7 +329,7 @@ fn graft_cross_module_target(
         }
     };
     match crate::crossmodule::resolve_module_ref(bundle, m, module_ref) {
-        Some(resolved) => crate::crossmodule::graft_subtree(m, &resolved)
+        Some(resolved) => crate::crossmodule::graft_subtree(m, &resolved, bundle)
             .map(Some)
             .map_err(|reason| refuse(module_ref, m, &reason)),
         None => Err(refuse(

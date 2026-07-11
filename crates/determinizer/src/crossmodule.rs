@@ -10,7 +10,7 @@
 //! reification built in the host, not a reference to a submodule's own reified
 //! kernel, which is what we resolve here.)
 //!
-//! ## Why graft rather than thread the bundle everywhere
+//! ## Why graft rather than thread the bundle through the lowering
 //!
 //! The referenced node lives in the *submodule's* arena and interner; the
 //! density lowering mutates (and interns into) the *host*. Rather than thread
@@ -20,6 +20,14 @@
 //! re-interning every symbol and recursively grafting the submodule bindings it
 //! closes over. The result is an ordinary host-local node; everything downstream
 //! runs unchanged and needs no bundle.
+//!
+//! The graft *itself* does carry the bundle ([`GraftCtx::bundle`]) — but only so
+//! it can resolve a NESTED cross-module ref (a submodule being grafted that has
+//! its own `load_module` and references it): that nested member is resolved
+//! against the bundle and grafted recursively, so a measure that crosses two or
+//! more module boundaries (§04 "measure crosses module boundaries transitively")
+//! still collapses to a self-contained host node the downstream lowering needs no
+//! bundle for.
 //!
 //! ## Load-time substitution and namespace independence (refuse-don't-mislower)
 //!
@@ -115,6 +123,72 @@ pub(crate) fn resolve_module_ref<'a>(
     })
 }
 
+/// A resolved NESTED cross-module ref: the nested submodule (`sub`) named by the
+/// CURRENT submodule's own `load_module(alias)`, the referenced member's node id
+/// and visibility in `sub`, and the nested `load_module` `%assign` substitutions
+/// as `(param-name, SRC node id)` — where the SRC nodes live in the submodule
+/// that owns the `load_module` call and must be grafted into the host by the
+/// caller before use.
+struct NestedResolved<'a> {
+    sub: &'a Module,
+    member_rhs: NodeId,
+    member_public: bool,
+    /// `(submodule-parameter-name, SRC node id of the `%assign` value)`.
+    assign_src: Vec<(String, NodeId)>,
+    /// Bundle path string of the nested submodule (the cycle-guard key uses it).
+    path: String,
+}
+
+/// Like [`resolve_module_ref`], but resolves a NESTED cross-module ref against
+/// the submodule `src` that is currently being grafted: `alias_sym` names `src`'s
+/// OWN `load_module("path", …)` binding, `path` → `bundle.get(path)` → the nested
+/// submodule's `member_sym` binding. Returns the nested submodule, the member's
+/// rhs + visibility, the nested `%assign` (values as SRC nodes — the caller
+/// grafts them), and `path` (for the cycle key).
+///
+/// `None` (⇒ caller refuses) when `alias_sym` is not a `load_module` binding in
+/// `src`, its path is absent from the bundle, or the nested submodule has no such
+/// member. The member is matched by STRING (cross-interner), like
+/// [`resolve_module_ref`].
+fn resolve_src_module_ref<'a>(
+    bundle: &'a ModuleBundle,
+    src: &Module,
+    alias_sym: Symbol,
+    member_sym: Symbol,
+) -> Option<NestedResolved<'a>> {
+    let bid = src.binding_by_name(alias_sym)?;
+    let load = src.binding(bid).rhs;
+    let Node::Call(c) = src.node(load) else {
+        return None;
+    };
+    let CallHead::Builtin(sym) = c.head else {
+        return None;
+    };
+    if src.resolve(sym) != "load_module" {
+        return None;
+    }
+    let path = string_literal(src, *c.args.first()?)?;
+    let assign_src: Vec<(String, NodeId)> = c
+        .named
+        .iter()
+        .filter(|na| na.kind == NamedKind::Assign)
+        .map(|na| (src.resolve(na.name).to_string(), na.value))
+        .collect();
+    let sub = bundle.get(&path)?;
+    let member_name = src.resolve(member_sym);
+    let (member_rhs, member_public) = sub
+        .bindings()
+        .find(|(_, b)| sub.resolve(b.name) == member_name)
+        .map(|(_, b)| (b.rhs, b.public))?;
+    Some(NestedResolved {
+        sub,
+        member_rhs,
+        member_public,
+        assign_src,
+        path,
+    })
+}
+
 /// The `Box<str>` payload of a `Node::Lit(Scalar::Str(_))`, else `None`.
 fn string_literal(m: &Module, id: NodeId) -> Option<String> {
     match m.node(id) {
@@ -125,14 +199,27 @@ fn string_literal(m: &Module, id: NodeId) -> Option<String> {
 
 /// State threaded through the recursive graft.
 struct GraftCtx<'a> {
-    /// Load-time `%assign` substitutions (submodule-parameter name → host node).
-    assign: &'a [(String, NodeId)],
+    /// The host's dependency bundle (path → parsed submodule). Threaded so the
+    /// graft can resolve a NESTED cross-module ref — a `RefNs::Module(alias)` in
+    /// the submodule currently being grafted, naming that submodule's OWN
+    /// `load_module(alias)` — against the bundle and recursively graft it.
+    bundle: &'a ModuleBundle,
+    /// Load-time `%assign` substitutions for the CURRENT module level
+    /// (submodule-parameter name → host node). Owned so it can be swapped for the
+    /// nested level's own `%assign` context while recursing (and restored after).
+    assign: Vec<(String, NodeId)>,
     /// Names of host bindings that existed BEFORE the graft began. A submodule
     /// dependency whose name collides with one of these (and is not `%assign`-
     /// linked) is an unrelated host binding: refuse rather than reuse it.
     preexisting: HashSet<String>,
-    /// Submodule-binding names grafted so far this pass (cycle/repeat guard).
+    /// Submodule-binding names grafted so far this pass (DAG-dedup guard).
     grafted: HashSet<String>,
+    /// `(submodule-path, member)` pairs for the nested cross-module members
+    /// currently ON the recursion stack. Re-entering one is a cyclic module graph
+    /// (A loads B, B loads A): refuse rather than recurse forever. A completed
+    /// member is popped, so a legitimate diamond (the same nested member reached
+    /// twice) is not mistaken for a cycle.
+    in_progress: HashSet<String>,
 }
 
 /// Deep-copy the subtree rooted at `root` from `src` into `host`, re-interning
@@ -153,22 +240,29 @@ struct GraftCtx<'a> {
 /// Placeholder (`%local`) refs and boundary-input entries are re-interned in
 /// place; a nested cross-module (`%ref <alias> …`) ref — i.e. the submodule
 /// being grafted itself contains a `load_module` and the grafted body
-/// references that nested alias — is **refused outright** at the graft site
-/// (there is no bundle here to resolve it against, and re-interning the alias
-/// as-is risks it silently colliding with an unrelated same-named host
-/// binding instead of dangling — see the `RefNs::Module` arm of `graft_ref`).
+/// references that nested alias — is resolved against `bundle` and grafted
+/// **recursively** (see the `RefNs::Module` arm of `graft_ref`): the nested
+/// member and its transitive submodule dependencies land in the host too, with
+/// the nested module's OWN `%assign`, the host-collision refuse, and a cycle
+/// guard all applying at that level (a measure crosses module boundaries
+/// transitively, §04). A nested ref that cannot be resolved (the alias is not a
+/// `load_module`, its path is absent from `bundle`, or the member is absent), or
+/// a cyclic module graph, is **refused** (`Err`) rather than mislowered.
 pub(crate) fn graft_subtree(
     host: &mut Module,
     resolved: &ResolvedRef<'_>,
+    bundle: &ModuleBundle,
 ) -> Result<NodeId, String> {
     let preexisting: HashSet<String> = host
         .bindings()
         .map(|(_, b)| host.resolve(b.name).to_string())
         .collect();
     let mut ctx = GraftCtx {
-        assign: &resolved.assign,
+        bundle,
+        assign: resolved.assign.clone(),
         preexisting,
         grafted: HashSet::new(),
+        in_progress: HashSet::new(),
     };
     graft_node(host, resolved.sub, resolved.member_rhs, &mut ctx)
 }
@@ -258,9 +352,15 @@ fn graft_node(
 /// the caller ([`graft_node`]) before this is reached.
 ///
 /// A `Module`-namespace ref is a NESTED cross-module reference: the submodule
-/// being grafted itself has its own `load_module` and the grafted body names
-/// that nested alias. This is refused outright (see the `RefNs::Module` arm
-/// below) rather than re-interned.
+/// being grafted itself has its own `load_module`, and the grafted body names
+/// that nested alias. It is resolved against the bundle (`ctx.bundle`) via
+/// [`resolve_src_module_ref`] — reading the CURRENT submodule's own
+/// `load_module(alias)` binding — and the referenced nested member is grafted
+/// **recursively** into the host, returning a host-local `SelfMod` ref to it.
+/// The nested module's OWN `%assign` context, the host-collision refuse
+/// (`preexisting`), and the DAG-dedup (`grafted`) all apply at the nested level,
+/// and a cyclic module graph is caught by `in_progress` (refuse, not recurse
+/// forever). An unresolvable nested ref is refused (`Err`).
 fn graft_ref(
     host: &mut Module,
     src: &Module,
@@ -280,26 +380,86 @@ fn graft_ref(
                 name: hname,
             })
         }
-        RefNs::Module(alias) => {
-            // Re-interning `alias` as-is would produce a host-local `Module`
-            // ref that LOOKS resolvable — but there is no bundle here to
-            // resolve it against, and the re-interned alias string can
-            // coincidentally match an unrelated host binding of the same
-            // name, in which case the caller's later re-resolution attempt
-            // would silently score against that WRONG (unrelated) submodule
-            // instead of the one this nested `load_module` actually names, or
-            // (absent such a collision) dangle with `is_flatpdl` never
-            // checking ref liveness. Neither outcome is refuse-don't-mislower,
-            // so fail closed here instead: refuse rather than risk mislowering
-            // a two-level-nested cross-module reference we cannot resolve.
-            let name = src.resolve(alias);
-            Err(format!(
-                "grafting a cross-module ref that itself references another loaded module \
-                 (nested load_module, alias `{name}`) is not supported; refuse rather than \
-                 mislower"
-            ))
+        RefNs::Module(alias) => graft_nested_module_ref(host, src, alias, r.name, ctx),
+    }
+}
+
+/// Resolve and RECURSIVELY graft a NESTED cross-module ref `(%ref <alias> member)`
+/// found inside the submodule `src` currently being grafted — where `alias` names
+/// `src`'s OWN `load_module(alias)` — returning a host-local `SelfMod` ref to the
+/// grafted nested member.
+///
+/// The measure crosses one more module boundary (§04 "measure crosses module
+/// boundaries transitively"): resolve `alias` against `ctx.bundle` via
+/// [`resolve_src_module_ref`], graft the nested `load_module`'s own `%assign`
+/// values into the host under the CURRENT assign context, then graft the nested
+/// member (and its transitive submodule deps) under the NESTED assign context.
+///
+/// Refuse-don't-mislower, at this level too:
+/// * unresolvable nested ref (alias not a `load_module` in `src`, its path absent
+///   from the bundle, or the member absent) → `Err`;
+/// * a nested grafted binding whose name collides with an unrelated pre-existing
+///   host binding → `Err` (via [`graft_module_member`] / [`graft_binding`]);
+/// * a cyclic module graph (this `(path, member)` is already on the graft stack)
+///   → `Err`, guaranteeing termination.
+fn graft_nested_module_ref(
+    host: &mut Module,
+    src: &Module,
+    alias: Symbol,
+    member: Symbol,
+    ctx: &mut GraftCtx<'_>,
+) -> Result<Ref, String> {
+    let bundle = ctx.bundle;
+    let alias_name = src.resolve(alias).to_string();
+    let member_name = src.resolve(member).to_string();
+    let Some(resolved) = resolve_src_module_ref(bundle, src, alias, member) else {
+        return Err(format!(
+            "nested cross-module ref `{alias_name}.{member_name}` is unresolvable (the alias is \
+             not a `load_module` in the source submodule, its path is absent from the bundle, or \
+             the member is absent); refuse rather than mislower"
+        ));
+    };
+    // Cycle guard: a `(submodule-path, member)` already on the graft stack means
+    // the module graph loops (A loads B, B loads A). Refuse rather than recurse.
+    let cycle_key = format!("{}\u{0}{}", resolved.path, member_name);
+    if !ctx.in_progress.insert(cycle_key.clone()) {
+        return Err(format!(
+            "cyclic module graph: nested cross-module ref `{alias_name}.{member_name}` re-enters \
+             `{}` while it is still being grafted; refuse rather than recurse forever",
+            resolved.path
+        ));
+    }
+    // The nested `load_module`'s `%assign` values are expressions in `src`; graft
+    // them into the host under the CURRENT assign context so they become host
+    // nodes, then use them as the assign context for the nested subtree.
+    let mut nested_assign: Vec<(String, NodeId)> = Vec::with_capacity(resolved.assign_src.len());
+    for (name, src_val) in resolved.assign_src.iter() {
+        match graft_node(host, src, *src_val, ctx) {
+            Ok(hval) => nested_assign.push((name.clone(), hval)),
+            Err(e) => {
+                ctx.in_progress.remove(&cycle_key);
+                return Err(e);
+            }
         }
     }
+    // Graft the nested member (and its transitive submodule deps) with the nested
+    // assign context; #75 safety (host collision / DAG-dedup) still applies.
+    let saved_assign = std::mem::replace(&mut ctx.assign, nested_assign);
+    let graft_res = graft_module_member(
+        host,
+        resolved.sub,
+        &member_name,
+        resolved.member_rhs,
+        resolved.member_public,
+        ctx,
+    );
+    ctx.assign = saved_assign;
+    ctx.in_progress.remove(&cycle_key);
+    graft_res?;
+    Ok(Ref {
+        ns: RefNs::SelfMod,
+        name: host.intern(&member_name),
+    })
 }
 
 /// Re-intern a reification boundary-input SOURCE ref (an [`Inputs::Spec`] entry).
@@ -367,6 +527,47 @@ fn graft_binding(
     let public = src_binding.public;
     let host_rhs = graft_node(host, src, src_rhs, ctx)?;
     let hname = host.intern(&name);
+    host.add_binding(Binding {
+        name: hname,
+        rhs: host_rhs,
+        doc: None,
+        public,
+        synthetic: false,
+    });
+    Ok(())
+}
+
+/// Graft a NESTED cross-module member `name` (its rhs `rhs` living in the nested
+/// submodule `src`) into the host as a standalone binding, then return via a
+/// host-local `SelfMod` ref (built by the caller). Mirrors [`graft_binding`]'s
+/// #75 safety — DAG-dedup (`grafted`) and host-collision refuse (`preexisting`) —
+/// but the rhs is supplied directly (the member is known to exist, so there is no
+/// dangling case) and the source is the NESTED submodule.
+///
+/// The nested cross-module cycle guard is the caller's responsibility
+/// ([`graft_nested_module_ref`] pushes/pops `ctx.in_progress`); this only guards
+/// against re-grafting the same binding name (a legitimate diamond) and against a
+/// name collision with an unrelated host binding.
+fn graft_module_member(
+    host: &mut Module,
+    src: &Module,
+    name: &str,
+    rhs: NodeId,
+    public: bool,
+    ctx: &mut GraftCtx<'_>,
+) -> Result<(), String> {
+    if !ctx.grafted.insert(name.to_string()) {
+        return Ok(()); // already grafted this pass (DAG dedup)
+    }
+    if ctx.preexisting.contains(name) {
+        return Err(format!(
+            "nested grafted submodule member `{name}` collides with an unrelated pre-existing \
+             host binding (modules are independent namespaces, and this member is not linked by a \
+             load_module `%assign`); refuse rather than reuse the host binding and mislower"
+        ));
+    }
+    let host_rhs = graft_node(host, src, rhs, ctx)?;
+    let hname = host.intern(name);
     host.add_binding(Binding {
         name: hname,
         rhs: host_rhs,
