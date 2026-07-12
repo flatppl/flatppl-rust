@@ -227,6 +227,149 @@ fn restrict_on_upstream_params_refuses() {
     );
 }
 
+/// The reversed selector defeating the guard via FIELD ALIASING: the record
+/// labels the upstream roots with names (`mu_param`, `sigma_param`) that differ
+/// from their bindings (`theta1`, `theta2`), and the selector names those
+/// LABELS. A guard that intersected the non-selected closure (binding names)
+/// against the selector's surface labels would see an empty intersection and
+/// wrongly LOWER — a reopened silent-wrong-density. The fix compares resolved
+/// binding names on both sides: selected {mu_param→theta1, sigma_param→theta2}
+/// ⇒ {theta1, theta2}; non-selected `obs` closure {obs, theta1, theta2};
+/// intersection {theta1, theta2} ≠ ∅ → REFUSE.
+const REVERSED_DISINTEGRATE_ALIASED: &str = "\
+theta1 ~ Normal(mu = 0, sigma = 1)
+theta2 ~ Exponential(rate = 1)
+obs ~ iid(Normal(mu = theta1, sigma = theta2), 10)
+joint_model = lawof(record(mu_param = theta1, sigma_param = theta2, obs = obs))
+forward_kernel, prior = disintegrate([\"mu_param\", \"sigma_param\"], joint_model)
+L = likelihoodof(forward_kernel, record(mu_param = 0.5, sigma_param = 1.0))
+posterior = bayesupdate(L, prior)
+lp = logdensityof(posterior, record(obs = [1.2, 3.4, 5.1, 2.8, 4.0, 3.7, 5.5, 2.1, 4.3, 3.9]))";
+
+#[test]
+fn disintegrate_reversed_selector_with_aliased_fields_refuses() {
+    // Field aliasing (`mu_param = theta1`) must NOT defeat the closed-marginal
+    // guard: selecting the upstream roots under aliased labels still leaves a
+    // non-closed marginal over the downstream {obs} and must refuse. Before the
+    // namespace fix (comparing surface labels, not resolved binding names) this
+    // returned Ok with a silently wrong split.
+    let err = determinize(&parse_infer(REVERSED_DISINTEGRATE_ALIASED)).expect_err(
+        "a causally-reversed disintegrate under field aliasing (non-closed marginal) must refuse",
+    );
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("disintegrate") || msg.contains("get"),
+        "refuse must name the reversed disintegrate; got: {msg}"
+    );
+}
+
+/// The `restrict` mirror of the aliased reversed direction: conditioning on the
+/// upstream params under aliased labels (`record(mu_param = …, sigma_param = …)`
+/// where those fields resolve to `theta1`/`theta2`). The disintegration on
+/// {mu_param, sigma_param} leaves a non-closed marginal over {obs} →
+/// `rewrite_restrict` (via the shared `split_law_record`) must refuse.
+const REVERSED_RESTRICT_ALIASED: &str = "\
+theta1 ~ Normal(mu = 0, sigma = 1)
+theta2 ~ Exponential(rate = 1)
+obs ~ iid(Normal(mu = theta1, sigma = theta2), 10)
+joint_model = lawof(record(mu_param = theta1, sigma_param = theta2, obs = obs))
+post = restrict(joint_model, record(mu_param = 0.5, sigma_param = 1.0))
+lp = logdensityof(post, record(obs = [1.2, 3.4, 5.1, 2.8, 4.0, 3.7, 5.5, 2.1, 4.3, 3.9]))";
+
+#[test]
+fn restrict_upstream_params_aliased_refuses() {
+    // `restrict` conditioning on the upstream params under aliased field labels
+    // is the reversed direction; the marginal over the downstream {obs} is not
+    // closed, so the restrict desugaring must refuse rather than mislower.
+    let err = determinize(&parse_infer(REVERSED_RESTRICT_ALIASED)).expect_err(
+        "restrict on the upstream params under field aliasing (non-closed marginal) must refuse",
+    );
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("restrict"),
+        "refuse must name the restrict; got: {msg}"
+    );
+}
+
+/// The VALID direction WITH field aliasing: the downstream `obs` is labeled
+/// `data` in the record, and the selector names that label. This is a genuine
+/// (closed-marginal) disintegration — selected field `data` RESOLVES to binding
+/// `obs`; non-selected {theta1, theta2} closure {theta1, theta2}; intersection
+/// ∅ → LOWER. It guards against the namespace fix OVER-refusing aliased fields:
+/// the fix must compare resolved binding names, not merely "refuse whenever a
+/// field label differs from its binding". (The split-level proof for the shape
+/// where the MARGINAL fields are also aliased — `record(mu_param = theta1,
+/// sigma_param = theta2, data = obs)` — lives in `src/disintegrate.rs`'s unit
+/// tests as `splits_valid_aliased_marginal_fields`: that shape splits correctly
+/// but its posterior θ point cannot lower through the likelihood path, which
+/// still requires θ field names to name module bindings — a separate,
+/// out-of-scope likelihood-path limitation, not a disintegration defect.)
+const VALID_DISINTEGRATE_ALIASED: &str = "\
+theta1 ~ Normal(mu = 0, sigma = 1)
+theta2 ~ Exponential(rate = 1)
+obs ~ iid(Normal(mu = theta1, sigma = theta2), 10)
+joint_model = lawof(record(theta1 = theta1, theta2 = theta2, data = obs))
+forward_kernel, prior = disintegrate([\"data\"], joint_model)
+observed_data = [1.2, 3.4, 5.1, 2.8, 4.0, 3.7, 5.5, 2.1, 4.3, 3.9]
+L = likelihoodof(forward_kernel, record(data = observed_data))
+posterior = bayesupdate(L, prior)
+lp = logdensityof(posterior, record(theta1 = 0.5, theta2 = 1.0))";
+
+#[test]
+fn disintegrate_valid_aliased_fields_lowers() {
+    // The valid direction must still lower when the SELECTED field is aliased
+    // (`data = obs`): 10 obs-likelihood terms + 2 prior terms = 12, the SAME
+    // density as the non-aliased bi3 case. The fix resolves the selected field
+    // `data` to its binding `obs` (not the label `data`), so the closed-marginal
+    // guard sees selected {obs} ∩ non-selected {theta1, theta2} = ∅ and does not
+    // over-refuse. Proves the namespace fix is binding-name-correct, not
+    // "refuse-more".
+    let pir = flatppl_flatpir::write(
+        &determinize(&parse_infer(VALID_DISINTEGRATE_ALIASED))
+            .expect("the valid direction with aliased fields must still lower"),
+    );
+    assert_eq!(
+        pir.matches("builtin_logdensityof").count(),
+        12,
+        "expected 10 obs-likelihood + 2 prior terms; got:\n{pir}"
+    );
+    assert!(
+        !pir.contains("disintegrate"),
+        "the disintegrate scaffold must be eliminated; got:\n{pir}"
+    );
+}
+
+/// A TRANSITIVE reversed dependency: the downstream `obs` depends on an
+/// intermediate latent `a`, and `a` depends on the selected root `theta1`. The
+/// closed-marginal walk must follow the closure transitively (obs → a → theta1)
+/// and catch that the non-selected marginal reaches a selected binding →
+/// REFUSE. Confirms the generative-closure walk is transitive, not one-level.
+const REVERSED_DISINTEGRATE_TRANSITIVE: &str = "\
+theta1 ~ Normal(mu = 0, sigma = 1)
+theta2 ~ Exponential(rate = 1)
+a ~ Normal(mu = theta1, sigma = 1)
+obs ~ iid(Normal(mu = a, sigma = theta2), 10)
+joint_model = lawof(record(mu_param = theta1, sigma_param = theta2, obs = obs))
+forward_kernel, prior = disintegrate([\"mu_param\", \"sigma_param\"], joint_model)
+L = likelihoodof(forward_kernel, record(mu_param = 0.5, sigma_param = 1.0))
+posterior = bayesupdate(L, prior)
+lp = logdensityof(posterior, record(obs = [1.2, 3.4, 5.1, 2.8, 4.0, 3.7, 5.5, 2.1, 4.3, 3.9]))";
+
+#[test]
+fn disintegrate_reversed_transitive_dep_refuses() {
+    // obs depends on `a`, `a` depends on the selected `theta1`: the non-selected
+    // closure {obs, a, theta1, theta2} reaches the selected {theta1, theta2}
+    // transitively → refuse. Guards that the walk is transitive over deep deps.
+    let err = determinize(&parse_infer(REVERSED_DISINTEGRATE_TRANSITIVE)).expect_err(
+        "a reversed disintegrate whose non-selected closure reaches a selected root transitively must refuse",
+    );
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("disintegrate") || msg.contains("get"),
+        "refuse must name the reversed disintegrate; got: {msg}"
+    );
+}
+
 #[test]
 fn refuses_disintegrate_over_non_lawof_record() {
     // `split_disintegrate` only handles the explicit `lawof(record(…))` DAG case;

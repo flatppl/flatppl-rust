@@ -141,17 +141,42 @@ fn split_law_record(
     // the split is valid only when `jointchain(marginal, kernel) ≡ joint`). The
     // NON-selected fields form the marginal; for that equivalence the SELECTED
     // fields must be causally DOWNSTREAM — so no NON-selected field may
-    // (transitively) DEPEND on a SELECTED field. Walk each non-selected field's
-    // generative closure (following `(%ref self …)` into each referenced binding's
-    // rhs); if it reaches ANY selected field's binding, the marginal is not closed
+    // (transitively) DEPEND on a SELECTED variate.
+    //
+    // The comparison is between RESOLVED BINDING NAMES on both sides, NOT the
+    // selector's surface field LABELS. A record may alias a variate under a field
+    // whose label differs from its binding (`(%field mu_param (%ref self theta1))`);
+    // intersecting the non-selected closure (a set of BINDING names) against the
+    // selector's field-name strings — a DIFFERENT namespace — would then miss the
+    // dependency and wrongly emit a vacuous kernel + non-closed marginal for a
+    // causally REVERSED selector (a silent-wrong-density). So compare like with
+    // like:
+    //   - `selected_bindings`: the binding names each SELECTED field's value
+    //     DIRECTLY references (one hop — a transform value's whole subtree is
+    //     scanned, but a referenced binding's rhs is NOT descended into, since we
+    //     want the selected variates themselves, not their upstream closure).
+    //     `(%field mu_param (%ref self theta1))` ⇒ `theta1`.
+    //   - `reachable`: the transitive generative closure of the NON-selected
+    //     fields (following `(%ref self …)` into each binding's rhs AND across a
+    //     reified callable's `%specinputs` cut).
+    // Symbols come from the same module interner on both sides, so a bare-name
+    // intersection is exact. If it is non-empty, a non-selected field
+    // (transitively) depends on a selected variate → the marginal is not closed
     // and the selector is causally REVERSED → refuse (fail-closed,
     // refuse-don't-mislower). The reverse-direction disintegrate (§06 "two
     // formulations") is a separate follow-up, out of scope here.
+    let mut selected_bindings: HashSet<Symbol> = HashSet::new();
+    for &(_, value) in &selected_fields {
+        collect_selected_bindings(m, value, &mut selected_bindings);
+    }
     let mut reachable: HashSet<Symbol> = HashSet::new();
     for &(_, value) in &nonselected_fields {
         collect_reachable_bindings(m, value, &mut reachable);
     }
-    if reachable.iter().any(|&name| is_selected(name)) {
+    if reachable
+        .iter()
+        .any(|name| selected_bindings.contains(name))
+    {
         return None;
     }
 
@@ -210,20 +235,31 @@ fn split_law_record(
 /// referenced binding's rhs — the generative closure of `start` (spec §06,
 /// the sub-DAG a field depends on). Used by [`split_law_record`] to test the
 /// closed-marginal invariant: the non-selected marginal is closed iff none of
-/// its fields' closures reach a selected field's binding.
+/// its fields' closures reach a selected variate's binding.
 ///
 /// `out` doubles as the visited-set for bindings, so a binding's rhs is walked
 /// at most once — the walk terminates even on a (malformed) cyclic self-ref
 /// graph. Only `(%ref self …)` edges are followed (module/local refs cannot name
 /// a top-level selected field of this record, so ignoring them is sound and
 /// conservative).
+///
+/// The walk also follows a `Call`'s reification boundary inputs
+/// (`Inputs::Spec` — the `%specinputs`/`kernelof`/`functionof` cut). Those
+/// `(Symbol, Ref)` source refs are a real dependency edge but are NOT visited by
+/// `Node::children()` (core `node.rs`, `for_each_child` — the `Inputs` bucket is
+/// name/ref leaves, not child sub-nodes). Without following them, a non-selected
+/// field whose closure passes through a reified callable whose cut references a
+/// SELECTED variate would be invisible here → under-refuse. Each boundary
+/// `Ref(SelfMod, …)` is treated exactly like a `(%ref self …)` edge (a `%local`
+/// placeholder is not a binding ref, so it is skipped).
 fn collect_reachable_bindings(m: &Module, start: NodeId, out: &mut HashSet<Symbol>) {
     let mut stack = vec![start];
     while let Some(id) = stack.pop() {
+        let node = m.node(id);
         if let Node::Ref(Ref {
             ns: RefNs::SelfMod,
             name,
-        }) = m.node(id)
+        }) = node
         {
             let name = *name;
             // First visit of this binding: record it, then descend into its rhs.
@@ -232,10 +268,65 @@ fn collect_reachable_bindings(m: &Module, start: NodeId, out: &mut HashSet<Symbo
                     stack.push(m.binding(bid).rhs);
                 }
             }
-        } else {
-            for c in m.node(id).children() {
-                stack.push(c);
+            continue;
+        }
+        // Follow a reification's `%specinputs` boundary source refs (invisible to
+        // `children()`), enqueuing each `(%ref self …)` cut like a body edge.
+        if let Node::Call(c) = node {
+            if let Some(Inputs::Spec(entries)) = &c.inputs {
+                for (_, r) in entries.iter() {
+                    if r.ns == RefNs::SelfMod && out.insert(r.name) {
+                        if let Some(bid) = m.binding_by_name(r.name) {
+                            stack.push(m.binding(bid).rhs);
+                        }
+                    }
+                }
             }
+        }
+        for c in node.children() {
+            stack.push(c);
+        }
+    }
+}
+
+/// Collect (into `out`) the binding names a SELECTED field's value DIRECTLY
+/// references — the selected variates themselves. Unlike
+/// [`collect_reachable_bindings`], this does NOT descend into a referenced
+/// binding's rhs: it scans only the syntactic subtree of `start`, recording each
+/// `(%ref self …)` name (and each `%specinputs` boundary `Ref(SelfMod, …)`) as a
+/// leaf. Descending would fold the selected variate's own upstream closure into
+/// the set and OVER-refuse the valid direction (e.g. selecting the downstream
+/// `obs` whose rhs references the non-selected `theta1`/`theta2` would then
+/// wrongly intersect them). `seen` bounds the syntactic walk against shared DAG
+/// nodes.
+fn collect_selected_bindings(m: &Module, start: NodeId, out: &mut HashSet<Symbol>) {
+    let mut stack = vec![start];
+    let mut seen: HashSet<NodeId> = HashSet::new();
+    while let Some(id) = stack.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        let node = m.node(id);
+        if let Node::Ref(Ref {
+            ns: RefNs::SelfMod,
+            name,
+        }) = node
+        {
+            // A selected variate: record it, but do NOT descend into its rhs.
+            out.insert(*name);
+            continue;
+        }
+        if let Node::Call(c) = node {
+            if let Some(Inputs::Spec(entries)) = &c.inputs {
+                for (_, r) in entries.iter() {
+                    if r.ns == RefNs::SelfMod {
+                        out.insert(r.name);
+                    }
+                }
+            }
+        }
+        for c in node.children() {
+            stack.push(c);
         }
     }
 }
@@ -571,5 +662,101 @@ fk, pr = disintegrate([\"theta1\", \"obs\"], joint_model)";
             split_disintegrate(&mut m, disint).is_none(),
             "selecting all fields (empty conditioning set) must refuse"
         );
+    }
+
+    #[test]
+    fn refuses_reversed_selector_under_field_aliasing() {
+        // The record ALIASES the upstream roots under labels (`mu_param`,
+        // `sigma_param`) that differ from their bindings (`theta1`, `theta2`),
+        // and the selector names those LABELS. The closed-marginal guard must
+        // compare RESOLVED BINDING NAMES: selected {mu_param→theta1,
+        // sigma_param→theta2} ⇒ {theta1, theta2}; non-selected `obs` closure
+        // {obs, theta1, theta2}; intersection {theta1, theta2} ≠ ∅ → REFUSE. A
+        // guard comparing surface labels would see an empty intersection and
+        // wrongly split (a reopened silent-wrong-density).
+        let src = "\
+theta1 ~ Normal(mu = 0, sigma = 1)
+theta2 ~ Exponential(rate = 1)
+obs ~ iid(Normal(mu = theta1, sigma = theta2), 10)
+joint_model = lawof(record(mu_param = theta1, sigma_param = theta2, obs = obs))
+fk, pr = disintegrate([\"mu_param\", \"sigma_param\"], joint_model)";
+        let mut m = parse_infer(src);
+        let disint = find_disintegrate(&m);
+        assert!(
+            split_disintegrate(&mut m, disint).is_none(),
+            "a reversed selector under field aliasing (non-closed marginal) must refuse"
+        );
+    }
+
+    #[test]
+    fn splits_valid_aliased_marginal_fields() {
+        // The VALID direction with the MARGINAL fields aliased too
+        // (`mu_param = theta1`, `sigma_param = theta2`, `data = obs`), selecting
+        // the downstream `obs` under the label `data`. The fix must NOT
+        // over-refuse: selected {data→obs} ⇒ {obs}; non-selected
+        // {mu_param→theta1, sigma_param→theta2} closure {theta1, theta2};
+        // intersection ∅ → SPLIT. (This shape splits correctly but does not lower
+        // end-to-end — its posterior θ point over the aliased marginal cannot bind
+        // in the likelihood path, which still requires θ field names to name
+        // module bindings; that is a separate, out-of-scope likelihood-path limit,
+        // so this asserts at the split level.)
+        let src = "\
+theta1 ~ Normal(mu = 0, sigma = 1)
+theta2 ~ Exponential(rate = 1)
+obs ~ iid(Normal(mu = theta1, sigma = theta2), 10)
+joint_model = lawof(record(mu_param = theta1, sigma_param = theta2, data = obs))
+fk, pr = disintegrate([\"data\"], joint_model)";
+        let mut m = parse_infer(src);
+        let disint = find_disintegrate(&m);
+        let (kernel, marginal) = split_disintegrate(&mut m, disint)
+            .expect("the valid direction with aliased marginal fields must split, not over-refuse");
+
+        // Kernel body = the selected `data` field (aliasing `obs`); its boundary
+        // inputs are the non-selected aliased fields, bound to their value refs.
+        let k = expect_call(&m, kernel, "kernelof");
+        let body_fields = record_fields(&m, k.args[0]);
+        assert_eq!(
+            body_fields
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .collect::<Vec<_>>(),
+            vec!["data"],
+            "kernel body must be exactly the selected aliased field `data`"
+        );
+        assert_eq!(
+            self_ref_name(&m, body_fields[0].1),
+            "obs",
+            "the selected field `data` must carry the verbatim `(%ref self obs)`"
+        );
+        let Some(Inputs::Spec(entries)) = &k.inputs else {
+            panic!("kernel must carry %specinputs");
+        };
+        let got: Vec<(String, String)> = entries
+            .iter()
+            .map(|(nm, r)| (m.resolve(*nm).to_string(), m.resolve(r.name).to_string()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("mu_param".into(), "theta1".into()),
+                ("sigma_param".into(), "theta2".into()),
+            ],
+            "boundary inputs keep the aliased field labels, sourced from their binding refs"
+        );
+
+        // Marginal = lawof(record(mu_param = …, sigma_param = …)) over the
+        // non-selected aliased fields.
+        let law = expect_call(&m, marginal, "lawof");
+        let marg_fields = record_fields(&m, law.args[0]);
+        assert_eq!(
+            marg_fields
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .collect::<Vec<_>>(),
+            vec!["mu_param", "sigma_param"],
+            "marginal must carry exactly the non-selected aliased fields, in order"
+        );
+        assert_eq!(self_ref_name(&m, marg_fields[0].1), "theta1");
+        assert_eq!(self_ref_name(&m, marg_fields[1].1), "theta2");
     }
 }
