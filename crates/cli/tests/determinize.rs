@@ -103,6 +103,47 @@ fn determinize_resolves_cross_module_load_module() {
     );
 }
 
+/// `determinize` resolves a `load_module` cross-module `%autoinputs`
+/// (keyword/auto-traced) kernel APPLICATION: the submodule's boundary-less
+/// `k = functionof(Normal(mu = center, sigma = 1.0))` auto-traces its input
+/// `center`, and the host scores the keyword application `logdensityof(m.k(center
+/// = 0.0), 0.5)`. Mirrors `determinize_resolves_cross_module_load_module`, but the
+/// grafted kernel is keyword-only (§04): the CLI must graft, re-infer (repopulating
+/// `auto_inputs_of` on the grafted node), and β-reduce the keyword bind — or this
+/// refuses on the auto-traced boundary instead of lowering.
+#[test]
+fn determinize_resolves_cross_module_autoinputs_kernel() {
+    let dir =
+        std::env::temp_dir().join(format!("flatppl-det-cli-autoinputs-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("helpers.flatppl"),
+        "flatppl_compat = \"0.1\"\n\
+         center = elementof(reals)\n\
+         k = functionof(Normal(mu = center, sigma = 1.0))\n",
+    )
+    .unwrap();
+    let input = dir.join("model.flatppl");
+    std::fs::write(
+        &input,
+        "flatppl_compat = \"0.1\"\n\
+         m = load_module(\"helpers.flatppl\")\n\
+         lp = logdensityof(m.k(center = 0.0), 0.5)\n",
+    )
+    .unwrap();
+    let out = flatppl().arg("determinize").arg(&input).output().unwrap();
+    assert!(
+        out.status.success(),
+        "exit 0; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("builtin_logdensityof"),
+        "emitted FlatPDL did not resolve the cross-module %autoinputs kernel application:\n{stdout}"
+    );
+}
+
 /// Expected outcome for a fixture in the checked-in query corpus below.
 enum Expect {
     /// `determinize` exits 0 and the emitted FlatPDL contains `builtin_logdensityof`.
