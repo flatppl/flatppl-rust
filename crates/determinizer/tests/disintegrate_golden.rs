@@ -101,6 +101,40 @@ fn restrict_lowers_same_as_bi3_disintegrate() {
     );
 }
 
+/// The SAME bi4 shape as `BI4_RESTRICT_POSTERIOR` above, but with `x` given as
+/// the spec's idiomatic keyword-splat (spec §06 "Measure restriction":
+/// `restrict(M, a = …, b = …)` is auto-splat-equivalent to `restrict(M, record(a
+/// = …, b = …))`) instead of an explicit `record(...)` argument.
+const BI4_RESTRICT_KEYWORD_SPLAT: &str = "\
+theta1 ~ Normal(mu = 0, sigma = 1)
+theta2 ~ Exponential(rate = 1)
+obs ~ iid(Normal(mu = theta1, sigma = theta2), 10)
+joint_model = lawof(record(theta1 = theta1, theta2 = theta2, obs = obs))
+observed_data = [1.2, 3.4, 5.1, 2.8, 4.0, 3.7, 5.5, 2.1, 4.3, 3.9]
+post = restrict(joint_model, obs = observed_data)
+lp = logdensityof(post, record(theta1 = 0.5, theta2 = 1.0))";
+
+#[test]
+fn restrict_keyword_splat_lowers() {
+    // `restrict(joint_model, obs = observed_data)` — the keyword-splat form, no
+    // explicit `record(...)` — must desugar and lower identically to the
+    // explicit-record form above: the SAME 12 `builtin_logdensityof` terms (10
+    // obs-likelihood + 2 prior), proving the two forms are equivalent.
+    let pir = flatppl_flatpir::write(
+        &determinize(&parse_infer(BI4_RESTRICT_KEYWORD_SPLAT))
+            .expect("bi4 restrict keyword-splat posterior must lower via the restrict desugaring"),
+    );
+    assert_eq!(
+        pir.matches("builtin_logdensityof").count(),
+        12,
+        "expected 10 obs-likelihood + 2 prior terms (same as the explicit-record form); got:\n{pir}"
+    );
+    assert!(
+        !pir.contains("restrict"),
+        "the restrict node must be desugared away; got:\n{pir}"
+    );
+}
+
 #[test]
 fn refuses_restrict_with_field_not_in_variate() {
     // `restrict(M, record(nonexistent = …))` names a field that is not a variate

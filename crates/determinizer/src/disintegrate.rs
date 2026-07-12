@@ -190,6 +190,17 @@ fn split_law_record(
 /// substitutes it for the `restrict` binding's RHS, and the resulting
 /// `bayesupdate` lowers via the existing posterior path.
 ///
+/// `x` may be given either as an explicit `record(field…)` positional argument,
+/// or as the spec's idiomatic keyword-splat — `restrict(M, a = …, b = …)`,
+/// auto-splat-equivalent to `restrict(M, record(a = …, b = …))` (spec §06
+/// "Measure restriction"). The parser leaves a splat's `field = value` pairs as
+/// bare `%kwarg` entries directly on the `restrict` call (`named_kind_for` in
+/// `crates/syntax/src/parser.rs` only tags `%field` for
+/// record/table/joint/jointchain/cartprod, not `restrict`) rather than
+/// synthesizing a `record(...)` node, so this normalizes them into one,
+/// re-tagged `NamedKind::Field`, before the rest of the desugar runs — both
+/// forms then share the same downstream path.
+///
 /// The selector is exactly the `%field` names of `x`: the observed record names
 /// which variates of `M` are conditioned on (bi4 ⇒ `["obs"]`), so the split is
 /// the SAME `(kernel, marginal)` the bi3 explicit `disintegrate(["obs"], M)`
@@ -198,24 +209,67 @@ fn split_law_record(
 ///
 /// Returns `None` (caller refuses — refuse-don't-mislower) for any shape outside
 /// the explicit-DAG case this handles:
-/// - `restrict_node` is not a 2-arg `restrict` call;
-/// - `x` (arg1) is not a `record(field…)` of observed values (positional args or
-///   a non-`%field` named entry refuse);
+/// - `restrict_node` is not a 2-arg `restrict` call, AND not a 1-arg `restrict`
+///   call carrying at least one keyword-splat entry;
+/// - `x` (arg1, explicit form) is not a `record(field…)` of observed values
+///   (positional args or a non-`%field` named entry refuse);
 /// - the disintegration on `x`'s field names does not split
 ///   ([`split_law_record`] returns `None`) — `M` is not a `lawof(record(…))`, or
 ///   a field of `x` names no variate of `M`.
 pub(crate) fn rewrite_restrict(m: &mut Module, restrict_node: NodeId) -> Option<NodeId> {
-    // 1. Recognize `restrict(M, x)` with exactly two arguments.
-    let (measure, x) = {
+    /// The observed argument `x`, before normalization: either the explicit
+    /// positional node, or the keyword-splat's `(name, value)` pairs (owned,
+    /// copied out of the `restrict` call's `named` entries).
+    enum XArg {
+        Explicit(NodeId),
+        Splat(Vec<(Symbol, NodeId)>),
+    }
+
+    // 1. Recognize `restrict(M, x)` (explicit form, 2 positional args) or
+    //    `restrict(M, a = …, b = …)` (keyword-splat form: 1 positional arg +
+    //    at least one `%kwarg`).
+    let (measure, x_arg) = {
         let c = expect_builtin_call(m, restrict_node, "restrict")?;
-        if c.args.len() != 2 {
+        if c.args.len() == 2 {
+            (c.args[0], XArg::Explicit(c.args[1]))
+        } else if c.args.len() == 1 && !c.named.is_empty() {
+            (
+                c.args[0],
+                XArg::Splat(c.named.iter().map(|na| (na.name, na.value)).collect()),
+            )
+        } else {
             return None;
         }
-        (c.args[0], c.args[1])
     };
 
-    // 2. `x` must be a `record(field…)`; the disintegration selector is its
-    //    field-names (resolve one ref hop, in case `x` is bound by name).
+    // 2. `x` must be a `record(field…)` — either the explicit positional node,
+    //    or synthesized here from the keyword-splat's pairs, re-tagged
+    //    `NamedKind::Field` (the SAME shape `record_field_names` expects from an
+    //    explicit `record(...)` argument, so the rest of the desugar —
+    //    selector = field-names, `likelihoodof(kernel, x)`, `bayesupdate` — is
+    //    unchanged for both forms). The disintegration selector is `x`'s
+    //    field-names (resolve one ref hop for the explicit form, in case `x` is
+    //    bound by name).
+    let x = match x_arg {
+        XArg::Explicit(x) => x,
+        XArg::Splat(fields) => {
+            let record_sym = m.intern("record");
+            m.alloc(Node::Call(Call {
+                head: CallHead::Builtin(record_sym),
+                args: Vec::<NodeId>::new().into(),
+                named: fields
+                    .into_iter()
+                    .map(|(name, value)| NamedArg {
+                        kind: NamedKind::Field,
+                        name,
+                        value,
+                    })
+                    .collect::<Vec<_>>()
+                    .into(),
+                inputs: None,
+            }))
+        }
+    };
     let (x_resolved, _) = resolve_ref_one(m, x);
     let x_field_names = record_field_names(m, x_resolved)?;
 
