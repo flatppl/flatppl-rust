@@ -1920,7 +1920,17 @@ fn lower_pushfwd(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Refu
                 Some(Type::Measure { domain, .. }) => (**domain).clone(),
                 _ => Type::Any,
             };
-            match crate::invert::derive_bijection(m, bij_node, &domain)? {
+            // Also thread `M`'s refined SUPPORT (`valueset_of`, e.g. `posreals`
+            // for `Gamma`, `nonnegreals` for `Exponential`): the coarse variate
+            // type is `scalar real` (natural extent `reals`), which would refuse
+            // every positive-support base for `log`/`pow`. `None`/`%unknown`
+            // support falls back to `Unknown` — conservatively refused by the
+            // positivity guard (refuse-don't-mislower), NOT defaulted to positive.
+            let support = m
+                .valueset_of(m_inner)
+                .cloned()
+                .unwrap_or(flatppl_core::ValueSet::Unknown);
+            match crate::invert::derive_bijection(m, bij_node, &domain, &support)? {
                 Some(bij) => (bij.f_inv, bij.logvol),
                 None => {
                     return Err(refuse(

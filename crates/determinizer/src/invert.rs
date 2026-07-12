@@ -160,12 +160,13 @@ pub(crate) fn derive_bijection(
     m: &mut Module,
     f: NodeId,
     domain: &Type,
+    support: &ValueSet,
 ) -> Result<Option<Bijection>, RefuseError> {
     // Resolve one level of self-ref (`pushfwd(g, M)` where `g = exp`).
     let (f_resolved, _) = resolve_ref_one(m, f);
     match recognise(m, f_resolved) {
         // Bare builtin value: Task-1 single-op form (byte-equality-pinned).
-        Recognized::BareConst(name) => bare_bijection(m, &name, f, domain),
+        Recognized::BareConst(name) => bare_bijection(m, &name, f, support),
         Recognized::Lambda {
             body,
             input_name,
@@ -188,7 +189,8 @@ pub(crate) fn derive_bijection(
                 // wrapped in `broadcast` + `sum` (§06 case 1 elementwise extension;
                 // see [`derive_elementwise`]).
                 let elem_domain = vector_elem_domain(domain);
-                if let Some(bij) = derive_elementwise(m, body, ph, &elem_domain)? {
+                let elem_sup = elem_support(support);
+                if let Some(bij) = derive_elementwise(m, body, ph, &elem_domain, &elem_sup)? {
                     return Ok(Some(bij));
                 }
                 // A vector-variate forward body that is neither a recognised
@@ -208,9 +210,9 @@ pub(crate) fn derive_bijection(
             // a `pow` anywhere else in a chain is refused by the chain walk (its
             // input domain is not verifiable here).
             if let Some(k_node) = single_pow(m, body, ph) {
-                return derive_pow(m, f, k_node, domain);
+                return derive_pow(m, f, k_node, support);
             }
-            derive_chain(m, body, input_name, ph, domain)
+            derive_chain(m, body, input_name, ph, support)
         }
         Recognized::Unrecognized => Ok(None),
     }
@@ -234,7 +236,7 @@ fn bare_bijection(
     m: &mut Module,
     name: &str,
     f: NodeId,
-    domain: &Type,
+    support: &ValueSet,
 ) -> Result<Option<Bijection>, RefuseError> {
     match name {
         // d/dx eˣ = eˣ ⇒ log|f'| = x (identity).
@@ -244,7 +246,7 @@ fn bare_bijection(
         })),
         // d/dx ln x = 1/x ⇒ log|f'| = −ln x.
         "log" => {
-            if !is_positive_domain(domain) {
+            if !is_positive_domain(support) {
                 return Err(refuse(
                     f,
                     m,
@@ -282,14 +284,14 @@ fn bare_bijection(
 /// * `Ok(None)` — the chain hit an unrecognised shape (a non-builtin head, or a
 ///   leaf that is not the input placeholder).
 /// * `Err(_)` — the chain hit a recognised-but-non-invertible op (refuse), or a
-///   `log` anywhere in the chain over a base whose domain is not provably
+///   `log` anywhere in the chain over a base whose `support` is not provably
 ///   positive (see the guard below).
 fn derive_chain(
     m: &mut Module,
     body: NodeId,
     input_name: Symbol,
     ph: Symbol,
-    domain: &Type,
+    support: &ValueSet,
 ) -> Result<Option<Bijection>, RefuseError> {
     let Some(ops) = flatten_chain(m, body, ph)? else {
         return Ok(None);
@@ -299,13 +301,13 @@ fn derive_chain(
     // positive (spec §06 log defined on positive reals) — the same silent
     // sub-probability danger [`bare_bijection`]'s `log` case guards against.
     // Proving positivity of an INTERIOR op's input (rather than the chain's
-    // overall base domain) is out of scope here, so this guard is
-    // CONSERVATIVE: it refuses the whole chain unless the base `domain` is
+    // overall base support) is out of scope here, so this guard is
+    // CONSERVATIVE: it refuses the whole chain unless the base `support` is
     // provably positive, even though a `log` deep in a chain might in fact
     // always receive a positive intermediate value from a wider base. Refuse
     // rather than mislower (mirrors [`derive_pow`]'s `is_positive_domain`
     // guard).
-    if ops.iter().any(|op| matches!(op, ChainOp::Log(_))) && !is_positive_domain(domain) {
+    if ops.iter().any(|op| matches!(op, ChainOp::Log(_))) && !is_positive_domain(support) {
         return Err(refuse(
             body,
             m,
@@ -509,14 +511,15 @@ fn local_logvol(m: &mut Module, op: &ChainOp) -> Option<NodeId> {
 }
 
 /// `pow(_, k)`: f_inv `x -> pow(x, 1/k)`; logvol `x -> add(log(abs(k)), mul(k-1, log(x)))`.
-/// Requires a nonzero literal exponent and a strictly-positive domain — the
-/// inverse `x^{1/k}` and the log-volume's `log x` are defined only there
+/// Requires a nonzero literal exponent and a base whose `support` is a.e.
+/// positive ([`is_positive_domain`]) — the inverse `x^{1/k}` and the
+/// log-volume's `log x` are defined only there
 /// (d/dx xᵏ = k·xᵏ⁻¹ ⇒ log|f'| = log|k| + (k−1)·log x).
 fn derive_pow(
     m: &mut Module,
     f: NodeId,
     k_node: NodeId,
-    domain: &Type,
+    support: &ValueSet,
 ) -> Result<Option<Bijection>, RefuseError> {
     let Some(k) = literal_real(m, k_node) else {
         // A non-literal exponent is not a Task-1 recognised invertible form.
@@ -525,7 +528,7 @@ fn derive_pow(
     if k == 0.0 {
         return Err(refuse(f, m, "pow with exponent 0 is not invertible"));
     }
-    if !is_positive_domain(domain) {
+    if !is_positive_domain(support) {
         return Err(refuse(
             f,
             m,
@@ -790,6 +793,7 @@ fn derive_elementwise(
     body: NodeId,
     ph: Symbol,
     elem_domain: &Type,
+    elem_support: &ValueSet,
 ) -> Result<Option<Bijection>, RefuseError> {
     // Structural read (immutable) BEFORE the recursion / mutable builds. Only the
     // pure positional `broadcast(g, operand…)` form is this arm; a keyword data-arg
@@ -827,9 +831,11 @@ fn derive_elementwise(
     if data.len() != 1 || !is_placeholder_ref(m, data[0], ph) {
         return Ok(None);
     }
-    // Recurse on the scalar operator `g` over the vector's element domain. `None` →
-    // arm does not apply; `Err` → propagate (a recognised-but-non-invertible `g`).
-    let Some(g_bij) = derive_bijection(m, g, elem_domain)? else {
+    // Recurse on the scalar operator `g` over the vector's element domain +
+    // element support (the per-cell scalar support the positivity guard reads for
+    // a `log`/`pow` cell op). `None` → arm does not apply; `Err` → propagate (a
+    // recognised-but-non-invertible `g`).
+    let Some(g_bij) = derive_bijection(m, g, elem_domain, elem_support)? else {
         return Ok(None);
     };
     let (g_inv, g_logvol) = (g_bij.f_inv, g_bij.logvol);
@@ -852,6 +858,18 @@ fn vector_elem_domain(domain: &Type) -> Type {
     match domain {
         Type::Array { elem, .. } => (**elem).clone(),
         _ => Type::Any,
+    }
+}
+
+/// The per-cell SUPPORT of a vector value-set — the scalar support the
+/// elementwise operator `g` acts on (`cartpow(elem, n)` → `elem`), threaded into
+/// the scalar recursion's positivity guard. Conservative `Unknown` for any
+/// non-power support (so a `log`/`pow` cell op over an unrefined vector base
+/// refuses rather than mislowers).
+fn elem_support(support: &ValueSet) -> ValueSet {
+    match support {
+        ValueSet::CartPow(elem, _) => (**elem).clone(),
+        _ => ValueSet::Unknown,
     }
 }
 
@@ -1077,13 +1095,38 @@ fn literal_real(m: &Module, id: NodeId) -> Option<f64> {
     }
 }
 
-/// Is the domain's natural extent strictly positive (so `x^{1/k}` and `log x`
-/// are defined)? Conservative: only sets that exclude zero and negatives count;
-/// an unknown / real / non-negative domain does not.
-fn is_positive_domain(domain: &Type) -> bool {
-    match ValueSet::natural_of(domain) {
-        ValueSet::PosReals | ValueSet::PosIntegers => true,
-        ValueSet::Interval(lo, _) => lo > 0.0,
+/// Is `log x` / `x^{1/k}` defined a.e. with full mass over a base whose refined
+/// SUPPORT is `support`? This reads the base measure's inferred support
+/// (`Module::valueset_of`), NOT the coarse structural type of its variate — a
+/// `scalar real` variate has natural extent `reals`, which would refuse EVERY
+/// scalar base, so the caller threads the refined support here instead.
+///
+/// True when the support is CONTINUOUS, excludes negatives, AND any boundary at
+/// 0 carries no probability mass:
+///   - strictly-positive continuous sets (`posreals`, `interval(lo>0, _)`) — 0
+///     is excluded outright;
+///   - continuous non-negative sets (`nonnegreals`, `unitinterval`,
+///     `interval(0, _)`) — 0 is a measure-zero boundary of a continuous base (no
+///     probability atom there), so `exp` maps −∞ ↦ 0 and the pushforward keeps
+///     full mass. (`Exponential`'s spec §08 support is `nonnegreals`, `Gamma`'s
+///     is `posreals`; both are continuous a.e.-positive bases, so the guard
+///     accepts either and they lower alike.)
+///
+/// Conservative everywhere else — refuse-don't-mislower: sets containing
+/// negatives (`reals`, `integers`), and EVERY discrete support regardless of
+/// whether it excludes 0 — `posintegers` (`Categorical`), `nonnegintegers`
+/// (`Poisson`), `booleans` — because a discrete measure has no Jacobian: a
+/// `log`/`pow` change-of-variables over it would silently synthesize a spurious
+/// density term. Every unproven support (`%unknown`, `anything`, `%deferred`,
+/// and the caller's `None → Unknown` fallback) also refuses.
+fn is_positive_domain(support: &ValueSet) -> bool {
+    use ValueSet::*;
+    match support {
+        // NOTE: CONTINUOUS supports only — a discrete support (e.g. `posintegers`,
+        // `Categorical`'s support) has no Jacobian, so `log`/`pow` pushforward of a
+        // discrete measure must refuse, not silently add a change-of-variables term.
+        PosReals | NonNegReals | UnitInterval => true,
+        Interval(lo, _) => *lo >= 0.0,
         _ => false,
     }
 }
