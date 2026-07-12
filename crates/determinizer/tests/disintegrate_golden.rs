@@ -157,6 +157,76 @@ lp = logdensityof(post, record(theta1 = 0.5))";
     );
 }
 
+/// The CAUSALLY-REVERSED disintegrate: selecting the UPSTREAM roots
+/// (`["theta1", "theta2"]`) leaves the DOWNSTREAM `obs` as the non-selected
+/// marginal. `obs ~ iid(Normal(mu = theta1, sigma = theta2), 10)` depends on
+/// theta1/theta2, so the marginal `lawof(record(obs = …))` is NOT closed (it
+/// references the external theta1/theta2 draws not in the marginal), and
+/// `jointchain(marginal, kernel) ≢ joint` (§06 "Structural disintegration").
+/// The structural split must REFUSE (fail-closed) rather than emit the
+/// vacuous-boundary kernel + non-closed marginal that would silently score a
+/// WRONG density. The reverse-direction disintegrate (§06 "two formulations") is
+/// out of scope. Consumed like bi3 (`likelihoodof` / `bayesupdate` /
+/// `logdensityof`) so the driver reaches the split; before the closed-marginal
+/// guard this lowered to 12 `builtin_logdensityof` terms (silently wrong).
+const REVERSED_DISINTEGRATE: &str = "\
+theta1 ~ Normal(mu = 0, sigma = 1)
+theta2 ~ Exponential(rate = 1)
+obs ~ iid(Normal(mu = theta1, sigma = theta2), 10)
+joint_model = lawof(record(theta1 = theta1, theta2 = theta2, obs = obs))
+forward_kernel, prior = disintegrate([\"theta1\", \"theta2\"], joint_model)
+L = likelihoodof(forward_kernel, record(theta1 = 0.5, theta2 = 1.0))
+posterior = bayesupdate(L, prior)
+lp = logdensityof(posterior, record(obs = [1.2, 3.4, 5.1, 2.8, 4.0, 3.7, 5.5, 2.1, 4.3, 3.9]))";
+
+#[test]
+fn disintegrate_reversed_selector_refuses() {
+    // Selecting the upstream roots {theta1, theta2} leaves a non-closed marginal
+    // over the downstream {obs}: the split is measure-theoretically invalid and
+    // must refuse (refuse-don't-mislower). Before the closed-marginal guard this
+    // returned Ok with a silently wrong split (12 terms).
+    let err = determinize(&parse_infer(REVERSED_DISINTEGRATE))
+        .expect_err("a causally-reversed disintegrate (non-closed marginal) must refuse");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("disintegrate") || msg.contains("get"),
+        "refuse must name the reversed disintegrate; got: {msg}"
+    );
+}
+
+/// The `restrict` mirror of the reversed direction: conditioning on the UPSTREAM
+/// params (`record(theta1 = …, theta2 = …)`) instead of the downstream `obs`.
+/// This is exactly `bayesian_inference_4.flatppl`'s `pars_predictive =
+/// restrict(joint_model, default_pars)` landmine (default_pars = the theta1/theta2
+/// params, here bound by name to mirror the fixture). The disintegration on
+/// {theta1, theta2} leaves a non-closed marginal over {obs} → `rewrite_restrict`
+/// must refuse. Before the guard this lowered silently.
+const REVERSED_RESTRICT_PARS_PREDICTIVE: &str = "\
+theta1 ~ Normal(mu = 0, sigma = 1)
+theta2 ~ Exponential(rate = 1)
+obs ~ iid(Normal(mu = theta1, sigma = theta2), 10)
+joint_model = lawof(record(theta1 = theta1, theta2 = theta2, obs = obs))
+default_pars = record(theta1 = 0.5, theta2 = 1.0)
+pars_predictive = restrict(joint_model, default_pars)
+lp = logdensityof(pars_predictive, record(obs = [1.2, 3.4, 5.1, 2.8, 4.0, 3.7, 5.5, 2.1, 4.3, 3.9]))";
+
+#[test]
+fn restrict_on_upstream_params_refuses() {
+    // `restrict(joint, record(theta1 = …, theta2 = …))` conditions on the upstream
+    // params — the reversed direction. The marginal over the downstream {obs} is
+    // not closed (references the external theta1/theta2), so the restrict
+    // desugaring must refuse rather than mislower. This pins the
+    // `bayesian_inference_4.flatppl` `pars_predictive` query as fail-closed.
+    let err = determinize(&parse_infer(REVERSED_RESTRICT_PARS_PREDICTIVE)).expect_err(
+        "restrict conditioning on the upstream params (non-closed marginal) must refuse",
+    );
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("restrict"),
+        "refuse must name the restrict; got: {msg}"
+    );
+}
+
 #[test]
 fn refuses_disintegrate_over_non_lawof_record() {
     // `split_disintegrate` only handles the explicit `lawof(record(…))` DAG case;

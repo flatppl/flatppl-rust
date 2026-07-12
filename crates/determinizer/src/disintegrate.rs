@@ -15,8 +15,9 @@
 
 use crate::density::{expect_builtin_call, resolve_ref_one};
 use flatppl_core::{
-    Call, CallHead, Inputs, Module, NamedArg, NamedKind, Node, NodeId, Ref, Scalar, Symbol,
+    Call, CallHead, Inputs, Module, NamedArg, NamedKind, Node, NodeId, Ref, RefNs, Scalar, Symbol,
 };
+use std::collections::HashSet;
 
 /// Split `disint_node = disintegrate(selector, lawof(record(fields)))` into a
 /// `(kernel, marginal)` pair, structurally (spec §06 "Structural
@@ -38,7 +39,10 @@ use flatppl_core::{
 ///   empty selector, refuses);
 /// - the selected or the non-selected set is empty (a vacuous split);
 /// - a NON-selected field's value is not a bare `%ref` (its boundary-input
-///   `Ref` cannot be formed — outside the explicit-DAG shape).
+///   `Ref` cannot be formed — outside the explicit-DAG shape);
+/// - the NON-selected marginal is not closed: some non-selected field
+///   transitively DEPENDS on a selected field (a causally REVERSED selector), so
+///   `jointchain(marginal, kernel) ≢ joint` (§06 "Structural disintegration").
 pub(crate) fn split_disintegrate(m: &mut Module, disint_node: NodeId) -> Option<(NodeId, NodeId)> {
     // 1. Recognize `disintegrate(selector, M)` with exactly two arguments.
     let c = expect_builtin_call(m, disint_node, "disintegrate")?;
@@ -133,6 +137,24 @@ fn split_law_record(
         spec_inputs.push((name, *r));
     }
 
+    // Enforce the closed-marginal invariant (spec §06 "Structural disintegration":
+    // the split is valid only when `jointchain(marginal, kernel) ≡ joint`). The
+    // NON-selected fields form the marginal; for that equivalence the SELECTED
+    // fields must be causally DOWNSTREAM — so no NON-selected field may
+    // (transitively) DEPEND on a SELECTED field. Walk each non-selected field's
+    // generative closure (following `(%ref self …)` into each referenced binding's
+    // rhs); if it reaches ANY selected field's binding, the marginal is not closed
+    // and the selector is causally REVERSED → refuse (fail-closed,
+    // refuse-don't-mislower). The reverse-direction disintegrate (§06 "two
+    // formulations") is a separate follow-up, out of scope here.
+    let mut reachable: HashSet<Symbol> = HashSet::new();
+    for &(_, value) in &nonselected_fields {
+        collect_reachable_bindings(m, value, &mut reachable);
+    }
+    if reachable.iter().any(|&name| is_selected(name)) {
+        return None;
+    }
+
     // Build the kernel: `kernelof(record(<selected fields>), %specinputs(…))`.
     let record_sym = m.intern("record");
     let kernel_body = m.alloc(Node::Call(Call {
@@ -181,6 +203,41 @@ fn split_law_record(
     }));
 
     Some((kernel, marginal))
+}
+
+/// Collect (into `out`) the names of every top-level binding transitively
+/// reachable from `start` by following `(%ref self …)` edges into each
+/// referenced binding's rhs — the generative closure of `start` (spec §06,
+/// the sub-DAG a field depends on). Used by [`split_law_record`] to test the
+/// closed-marginal invariant: the non-selected marginal is closed iff none of
+/// its fields' closures reach a selected field's binding.
+///
+/// `out` doubles as the visited-set for bindings, so a binding's rhs is walked
+/// at most once — the walk terminates even on a (malformed) cyclic self-ref
+/// graph. Only `(%ref self …)` edges are followed (module/local refs cannot name
+/// a top-level selected field of this record, so ignoring them is sound and
+/// conservative).
+fn collect_reachable_bindings(m: &Module, start: NodeId, out: &mut HashSet<Symbol>) {
+    let mut stack = vec![start];
+    while let Some(id) = stack.pop() {
+        if let Node::Ref(Ref {
+            ns: RefNs::SelfMod,
+            name,
+        }) = m.node(id)
+        {
+            let name = *name;
+            // First visit of this binding: record it, then descend into its rhs.
+            if out.insert(name) {
+                if let Some(bid) = m.binding_by_name(name) {
+                    stack.push(m.binding(bid).rhs);
+                }
+            }
+        } else {
+            for c in m.node(id).children() {
+                stack.push(c);
+            }
+        }
+    }
 }
 
 /// Desugar `restrict(M, x)` into `bayesupdate(likelihoodof(kernel, x), marginal)`
