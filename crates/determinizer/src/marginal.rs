@@ -97,6 +97,21 @@ pub(crate) fn lower_kchain_marginal(
     // and the continuous conjugate path need the kernel body.
     let kernel = resolve_kernel(m, k_arg)
         .ok_or_else(|| refuse_kchain(node, "kchain kernel is not a recognisable kernelof(...)"))?;
+    // The kchain marginal substitutes the enumerated latent's atoms into
+    // `kernel.inputs[0]`, ASSUMING that boundary input IS the latent dependency —
+    // which holds only for a `%specinputs` boundary. An `%autoinputs` boundary
+    // traces the reified body's `elementof` FREE parameters (never the
+    // `draw`-bound latent), so substituting the latent's atoms into it would
+    // replace the WRONG node — a free parameter that must stay symbolic — and
+    // emit a `logsumexp` that silently eliminates it (a wrong density
+    // `is_flatpdl` cannot catch). Refuse rather than mislower.
+    if kernel.auto {
+        return Err(refuse_kchain(
+            node,
+            "kchain marginal over an %autoinputs kernel: the auto-traced boundary is a free \
+             parameter, not the enumerated latent — refuse rather than mislower",
+        ));
+    }
     // The kchain marginal path substitutes ONE latent into the kernel; a
     // multi-input kernel is not the single-step shape it handles.
     if kernel.inputs.len() != 1 {
