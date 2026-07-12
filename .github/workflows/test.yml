@@ -93,7 +93,7 @@ jobs:
         # For public repos the upload works without CODECOV_TOKEN; set the
         # secret if rate-limited. fail_ci_if_error stays off so a Codecov
         # outage doesn't mask a green test run.
-        uses: codecov/codecov-action@v6.0.1
+        uses: codecov/codecov-action@v7.0.0
         with:
           files: lcov.info
           fail_ci_if_error: false
