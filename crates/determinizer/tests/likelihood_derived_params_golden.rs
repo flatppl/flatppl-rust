@@ -143,3 +143,128 @@ fn bi1_posterior_lp_density_is_self_contained_wrt_theta() {
         "is_flatpdl failed:\n{pir}"
     );
 }
+
+/// Two-hop derived kernel param: `a1 = g(theta2)`, `a2 = h(a1)`, kernel mean `a2`
+/// depends on θ only THROUGH `a1` (sigma is a plain constant). Regression-pins
+/// that `substitute_refs_by_name` inlines through TWO intermediate derived
+/// bindings, not just the one hop `BI1_POSTERIOR` exercises (`a = f_a(theta2)`
+/// directly). Confirmed via scratch `flatppl determinize`: the emitted `lp` reads
+/// `mu = h(g(1.0))` — both `a2` and its dependency `a1` inlined, `g`/`h` (θ-free)
+/// left as shared refs.
+const TWOHOP_POSTERIOR: &str = "\
+flatppl_compat = \"0.1\"
+theta1_dist = Normal(0, 1)
+theta2_dist = Exponential(1)
+prior = joint(theta1 = theta1_dist, theta2 = theta2_dist)
+theta1 = elementof(reals)
+theta2 = elementof(reals)
+c = 5
+d = 2
+g = par -> c * par
+h = par2 -> d * par2
+a1 = g(theta2)
+a2 = h(a1)
+obs ~ iid(Normal(mu = a2, sigma = 1.0), 10)
+forward_kernel = kernelof(record(obs = obs))
+observed_data = [1.2, 3.4, 5.1, 2.8, 4.0, 3.7, 5.5, 2.1, 4.3, 3.9]
+L = likelihoodof(forward_kernel, record(obs = observed_data))
+posterior = bayesupdate(L, prior)
+lp = logdensityof(posterior, record(theta1 = 0.5, theta2 = 1.0))";
+
+#[test]
+fn twohop_posterior_lp_density_is_self_contained_wrt_theta() {
+    // The two-hop posterior must lower (Ok), not refuse.
+    let out = determinize(&parse_infer(TWOHOP_POSTERIOR))
+        .expect("two-hop derived kernel param posterior must lower, not refuse");
+    let pir = flatppl_flatpir::write(&out);
+
+    // Same 12 terms as BI1_POSTERIOR: 10 obs-likelihood + 2 prior.
+    assert_eq!(
+        pir.matches("builtin_logdensityof").count(),
+        12,
+        "expected 10 obs-likelihood + 2 prior terms; got:\n{pir}"
+    );
+
+    // The heart of the fix, exercised through TWO hops: `a2`'s RHS references
+    // `a1`, which references `theta2`. Both must inline so the `lp` closure never
+    // reaches the unbound `elementof(reals)` param bindings.
+    assert!(
+        !closure_reaches_elementof(&out, binding_rhs(&out, "lp")),
+        "the lp density must be self-contained w.r.t. theta through BOTH hops \
+         (a2 -> a1 -> theta2); got:\n{pir}"
+    );
+
+    // The measure/likelihood layer is fully eliminated.
+    assert!(
+        !pir.contains("likelihoodof") && !pir.contains("bayesupdate") && !pir.contains("(draw "),
+        "measure/likelihood layer gone:\n{pir}"
+    );
+    assert!(
+        flatppl_determinizer::is_flatpdl(&out).is_ok(),
+        "is_flatpdl failed:\n{pir}"
+    );
+}
+
+/// Diamond dependency: two kernel params (`p`, `q`) share a common θ-dependent
+/// intermediate `cc = k(theta1)` (`p = f(cc)` feeds `mu`, `q = gg(cc)` feeds
+/// `sigma`). Regression-pins that the memoized θ-inline of a shared derived
+/// binding is applied CONSISTENTLY at both use sites (not inlined once and left
+/// dangling at the other). Confirmed via scratch `flatppl determinize`: the
+/// emitted `lp` reads `mu = f(k(0.5)), sigma = gg(k(0.5))` — `cc`'s θ-inlined copy
+/// `k(0.5)` appears at both sites.
+const DIAMOND_POSTERIOR: &str = "\
+flatppl_compat = \"0.1\"
+theta1_dist = Normal(0, 1)
+theta2_dist = Exponential(1)
+prior = joint(theta1 = theta1_dist, theta2 = theta2_dist)
+theta1 = elementof(reals)
+theta2 = elementof(reals)
+c = 5
+d = 2
+k = par -> c * par
+f = par2 -> par2 + 1
+gg = par3 -> par3 * d
+cc = k(theta1)
+p = f(cc)
+q = gg(cc)
+obs ~ iid(Normal(mu = p, sigma = q), 10)
+forward_kernel = kernelof(record(obs = obs))
+observed_data = [1.2, 3.4, 5.1, 2.8, 4.0, 3.7, 5.5, 2.1, 4.3, 3.9]
+L = likelihoodof(forward_kernel, record(obs = observed_data))
+posterior = bayesupdate(L, prior)
+lp = logdensityof(posterior, record(theta1 = 0.5, theta2 = 1.0))";
+
+#[test]
+fn diamond_posterior_lp_density_is_self_contained_wrt_theta() {
+    // The diamond-dependency posterior must lower (Ok), not refuse.
+    let out = determinize(&parse_infer(DIAMOND_POSTERIOR))
+        .expect("diamond-dependency posterior must lower, not refuse");
+    let pir = flatppl_flatpir::write(&out);
+
+    // Same 12 terms as BI1_POSTERIOR: 10 obs-likelihood + 2 prior.
+    assert_eq!(
+        pir.matches("builtin_logdensityof").count(),
+        12,
+        "expected 10 obs-likelihood + 2 prior terms; got:\n{pir}"
+    );
+
+    // The heart of the fix, exercised on a SHARED derived binding: `cc` is
+    // referenced by both `p` (mu) and `q` (sigma), so its memoized θ-inlined copy
+    // must be substituted at both use sites for the closure to be free of
+    // `elementof`.
+    assert!(
+        !closure_reaches_elementof(&out, binding_rhs(&out, "lp")),
+        "the lp density must be self-contained w.r.t. theta at BOTH diamond branches \
+         (p and q via shared cc); got:\n{pir}"
+    );
+
+    // The measure/likelihood layer is fully eliminated.
+    assert!(
+        !pir.contains("likelihoodof") && !pir.contains("bayesupdate") && !pir.contains("(draw "),
+        "measure/likelihood layer gone:\n{pir}"
+    );
+    assert!(
+        flatppl_determinizer::is_flatpdl(&out).is_ok(),
+        "is_flatpdl failed:\n{pir}"
+    );
+}

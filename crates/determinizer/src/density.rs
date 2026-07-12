@@ -700,6 +700,11 @@ fn theta_field_map(m: &Module, theta: NodeId) -> Result<Vec<(Symbol, NodeId)>, R
 /// captured through a derived binding is caught too. The through-binding inline
 /// here does not bypass it: it runs only on a density subtree already cleared of
 /// θ-capturing reification inputs.
+// NOTE: a θ-dependent derived binding both inlined here and captured as a
+// `%specinputs` boundary entry leaves a vestigial specinput on the dangling
+// binding (density value still correct, `is_flatpdl` passes, but an eager
+// evaluator could choke; no fixture triggers this). `infer` rejects reference
+// cycles among θ-dependent bindings upstream, so `building` below is defensive.
 fn substitute_refs_by_name(m: &mut Module, root: NodeId, map: &[(Symbol, NodeId)]) -> NodeId {
     // Pre-build the θ-inlined copy of every θ-dependent binding referenced as a
     // `(%ref self …)` leaf anywhere in `root`'s syntactic (children) tree — the
