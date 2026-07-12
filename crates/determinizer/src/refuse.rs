@@ -22,4 +22,9 @@ pub enum NonConformKind {
     LikelihoodTyped,
     StochasticPhase,
     KernelNotBuiltinArg,
+    /// A node `flatppl-infer` could not type (`Type::Failed` — "inference
+    /// attempted but failed; the module is ill-formed", `flatppl_core::ty`)
+    /// survived into what should be FlatPDL output. Generic backstop: an
+    /// ill-formed node must never pass as valid FlatPDL, whatever produced it.
+    Failed,
 }
