@@ -27,6 +27,41 @@ fn determinize_lowers_a_gaussian_to_stdout() {
     );
 }
 
+/// `densityof` has no dedicated `builtin_*` primitive (§07 lists six
+/// `builtin_*`, only `builtin_logdensityof` for density); it lowers as
+/// `exp(<the logdensityof lowering>)` (§06). Self-contained CLI-corpus
+/// regression: a `densityof` query over a record-of-draws prior must lower
+/// (exit 0) to FlatPDL containing both `exp(` and `builtin_logdensityof`,
+/// mirroring `determinize_lowers_a_gaussian_to_stdout` above but for the
+/// plain-density query form.
+#[test]
+fn determinize_lowers_a_densityof_query_to_stdout() {
+    let dir =
+        std::env::temp_dir().join(format!("flatppl-det-cli-densityof-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let input = dir.join("d.flatppl");
+    std::fs::write(
+        &input,
+        "a = draw(Normal(mu = 0.0, sigma = 1.0))\nd = densityof(lawof(record(a = a)), record(a = 0.5))\n",
+    )
+    .unwrap();
+    let out = flatppl().arg("determinize").arg(&input).output().unwrap();
+    assert!(
+        out.status.success(),
+        "exit 0; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("builtin_logdensityof"),
+        "emitted FlatPDL:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("exp("),
+        "densityof must lower to exp(<logdensity>); emitted FlatPDL:\n{stdout}"
+    );
+}
+
 /// `determinize` resolves a `load_module` cross-module measure ref: the CLI
 /// must assemble the `ModuleBundle` (same cache-only resolver as `infer`) and
 /// pass it to `determinize_with`, or this refuses on an unresolved module ref

@@ -1,8 +1,13 @@
 //! Density disintegration — the independent-record, combinator, and primitive cases
 //! (spec §06, "Density of composed measures").
 //!
-//! Entry point: [`lower_logdensityof`], which lowers a `logdensityof(lawof(M), v)` node
-//! to a deterministic expression.
+//! Entry points: [`lower_logdensityof`], which lowers a `logdensityof(lawof(M), v)`
+//! node to a deterministic expression, and [`lower_densityof`], which lowers the
+//! plain-density form `densityof(lawof(M), v)` to `exp(<the same log-density
+//! node>)` — FlatPPL has no separate `builtin_densityof` primitive (§07 lists six
+//! `builtin_*` primitives, only one of them a density: `builtin_logdensityof`), so
+//! `densityof` is defined as `exp(logdensityof(...))` (§06) and reuses the shared
+//! [`lower_density_core`] dispatch rather than reimplementing it.
 //!
 //! ## Supported measure shapes
 //!
@@ -144,14 +149,54 @@ pub(crate) fn lower_logdensityof(
     query: NodeId,
     bundle: &ModuleBundle,
 ) -> Result<NodeId, RefuseError> {
-    let (arg1, arg2) = {
-        let q = expect_builtin_call(m, query, "logdensityof")
-            .ok_or_else(|| refuse(query, m, "expected logdensityof"))?;
-        if q.args.len() != 2 {
-            return Err(refuse(query, m, "logdensityof expects 2 args"));
-        }
-        (q.args[0], q.args[1])
-    };
+    let (arg1, arg2) = parse_density_query_args(m, query, "logdensityof")?;
+    lower_density_core(m, arg1, arg2, bundle)
+}
+
+/// Lower `densityof(M, x)` at `query` into a deterministic expression: the
+/// PLAIN density, `exp(logdensityof(M, x))` (spec §06: `densityof` is the
+/// density, `logdensityof` its log — FlatPPL has no separate `builtin_densityof`
+/// primitive, §07's six `builtin_*` primitives include only the log form). Reuses
+/// [`lower_density_core`] — the same dispatch [`lower_logdensityof`] uses — so
+/// `densityof` refuses in EXACTLY the cases `logdensityof` would (the core's
+/// `Err` propagates unchanged), and shares the same `draw`-pinning side effect.
+pub(crate) fn lower_densityof(
+    m: &mut Module,
+    query: NodeId,
+    bundle: &ModuleBundle,
+) -> Result<NodeId, RefuseError> {
+    let (arg1, arg2) = parse_density_query_args(m, query, "densityof")?;
+    let log_density = lower_density_core(m, arg1, arg2, bundle)?;
+    Ok(build_call(m, "exp", &[log_density]))
+}
+
+/// Parse `op(arg1, arg2)`'s two positional args at `query` (`op` is
+/// `"logdensityof"` or `"densityof"`), refusing when `query` is not a
+/// well-formed 2-arg call to `op`.
+fn parse_density_query_args(
+    m: &Module,
+    query: NodeId,
+    op: &str,
+) -> Result<(NodeId, NodeId), RefuseError> {
+    let q = expect_builtin_call(m, query, op)
+        .ok_or_else(|| refuse(query, m, &format!("expected {op}")))?;
+    if q.args.len() != 2 {
+        return Err(refuse(query, m, &format!("{op} expects 2 args")));
+    }
+    Ok((q.args[0], q.args[1]))
+}
+
+/// Shared core behind [`lower_logdensityof`] / [`lower_densityof`]: dispatches
+/// on the measure/likelihood-layer shape of `arg1` and returns the LOG-density
+/// node scored at `arg2`. [`lower_logdensityof`] returns this unchanged;
+/// [`lower_densityof`] wraps it in `exp` (§06:
+/// `densityof(M,x) = exp(logdensityof(M,x))`).
+fn lower_density_core(
+    m: &mut Module,
+    arg1: NodeId,
+    arg2: NodeId,
+    bundle: &ModuleBundle,
+) -> Result<NodeId, RefuseError> {
     // A cross-module *direct query target* (a submodule likelihood handle
     // `m.L` or a bare measure handle `m.d`) is already grafted to a local host
     // node by the time this runs: the driver's `apply_rule` calls
@@ -446,18 +491,23 @@ pub(crate) fn graft_query_target(
     query: NodeId,
     bundle: &ModuleBundle,
 ) -> Result<Option<NodeId>, RefuseError> {
+    // `query` may be either a `logdensityof(...)` or a `densityof(...)` — both
+    // share this grafting logic; rebuild with the SAME op name the query
+    // actually used (not a hard-coded `"logdensityof"`), so a grafted
+    // `densityof` query stays a `densityof` for the driver's next scan.
+    let op = density_query_op_name(m, query)?;
     let (arg1, arg2) = {
-        let q = expect_builtin_call(m, query, "logdensityof")
-            .ok_or_else(|| refuse(query, m, "expected logdensityof"))?;
+        let q = expect_builtin_call(m, query, op)
+            .ok_or_else(|| refuse(query, m, &format!("expected {op}")))?;
         if q.args.len() != 2 {
-            return Err(refuse(query, m, "logdensityof expects 2 args"));
+            return Err(refuse(query, m, &format!("{op} expects 2 args")));
         }
         (q.args[0], q.args[1])
     };
     // Case 1: the target IS (or resolves via one `(%ref self …)` hop to) a
     // cross-module measure / likelihood HANDLE — graft it directly.
     if let Some(grafted) = graft_cross_module_target(m, arg1, bundle)? {
-        return Ok(Some(build_call(m, "logdensityof", &[grafted, arg2])));
+        return Ok(Some(build_call(m, op, &[grafted, arg2])));
     }
     // Case 2 (#194): the target is a cross-module kernel APPLICATION — a
     // `%call { head: User(callee), args: [input] }` whose CALLEE is a cross-module
@@ -466,9 +516,20 @@ pub(crate) fn graft_query_target(
     // types the grafted kernel and `reduce_kernel_application` β-reduces the
     // now-local application next iteration.
     if let Some(new_call) = graft_kernel_application_callee(m, arg1, bundle)? {
-        return Ok(Some(build_call(m, "logdensityof", &[new_call, arg2])));
+        return Ok(Some(build_call(m, op, &[new_call, arg2])));
     }
     Ok(None) // same-module target — driver lowers normally
+}
+
+/// The density-query op name at `query` — `"logdensityof"` or `"densityof"` —
+/// or a refusal when `query` is neither. Returns a `'static` string (not
+/// borrowed from `m`) so callers can freely mix reads/writes of `m` afterward.
+fn density_query_op_name(m: &Module, query: NodeId) -> Result<&'static str, RefuseError> {
+    match builtin_name(m, query) {
+        Some("logdensityof") => Ok("logdensityof"),
+        Some("densityof") => Ok("densityof"),
+        _ => Err(refuse(query, m, "expected logdensityof or densityof")),
+    }
 }
 
 /// If the `logdensityof` target `arg1` is — or resolves via one `(%ref self …)`

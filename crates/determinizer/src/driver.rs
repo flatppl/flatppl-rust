@@ -107,15 +107,17 @@ pub fn determinize_with(m: &Module, bundle: &ModuleBundle) -> Result<Module, Ref
 /// Scan bindings for the next measure-layer node to reduce. Returns
 /// `(binding_id, node_id)` of the chosen node.
 ///
-/// **Two-pass, query-first.** A `logdensityof` query pins the latent `draw`s it
-/// scores (it rewrites their bindings to the scored value), so it must fire
-/// *before* those bare `draw` bindings are reached and refused: a draw consumed
-/// by a density query is reducible *through* that query, not on its own. So we
-/// first look for any `logdensityof` node (scanning bindings in source order,
-/// outermost-first), and only if none exists fall back to the general
-/// outermost-measure scan (β-law `lawof`, or a refusal target). Without this,
-/// the source-order scan would hit a `draw` binding first and refuse before the
-/// query that would have legalised it.
+/// **Two-pass, query-first.** A `logdensityof`/`densityof` query pins the latent
+/// `draw`s it scores (it rewrites their bindings to the scored value), so it must
+/// fire *before* those bare `draw` bindings are reached and refused: a draw
+/// consumed by a density query is reducible *through* that query, not on its own.
+/// So we first look for any `logdensityof`/`densityof` node (scanning bindings in
+/// source order, outermost-first), and only if neither exists fall back to the
+/// general outermost-measure scan (β-law `lawof`, or a refusal target). Without
+/// this, the source-order scan would hit a `draw` binding first and refuse before
+/// the query that would have legalised it — the exact misleading-refuse-citing-
+/// `draw` regression a `densityof` query over a `draw` binding hit before this
+/// probe covered it too (only `logdensityof` was probed).
 ///
 /// **`rand` gets the same early-probe treatment**, for the identical reason: a
 /// `rand(rng, lawof(record(x = x)))` query samples (and thereby legalises) the
@@ -137,13 +139,17 @@ fn find_measure_node(m: &Module) -> Option<(BindingId, NodeId)> {
     // reach the primitive-constructor refuse in `lower_measure_density` (which
     // keeps a `restrict` safety-net arm). Eliminating the `restrict` first leaves
     // a `bayesupdate` the density query lowers via the existing posterior path.
-    if let Some(hit) = find_op_node(m, "restrict") {
+    if let Some(hit) = find_op_node(m, &["restrict"]) {
         return Some(hit);
     }
-    if let Some(hit) = find_op_node(m, "logdensityof") {
+    // `logdensityof` and `densityof` share the same query-first priority: a
+    // `densityof(M, v)` pins latent draws exactly like `logdensityof(M, v)` does
+    // (`densityof` lowers via the same core dispatch, wrapped in `exp`), so both
+    // op names must be probed here before the general scan reaches a `draw`.
+    if let Some(hit) = find_op_node(m, &["logdensityof", "densityof"]) {
         return Some(hit);
     }
-    if let Some(hit) = find_op_node(m, "rand") {
+    if let Some(hit) = find_op_node(m, &["rand"]) {
         return Some(hit);
     }
     for (bid, binding) in m.bindings() {
@@ -154,9 +160,9 @@ fn find_measure_node(m: &Module) -> Option<(BindingId, NodeId)> {
     None
 }
 
-/// Find the first node (outermost, BFS) whose builtin head is named `op`,
-/// scanning bindings in source order.
-fn find_op_node(m: &Module, op: &str) -> Option<(BindingId, NodeId)> {
+/// Find the first node (outermost, BFS) whose builtin head is named one of
+/// `ops`, scanning bindings in source order.
+fn find_op_node(m: &Module, ops: &[&str]) -> Option<(BindingId, NodeId)> {
     for (bid, binding) in m.bindings() {
         let mut queue = vec![binding.rhs];
         let mut qi = 0;
@@ -165,7 +171,7 @@ fn find_op_node(m: &Module, op: &str) -> Option<(BindingId, NodeId)> {
             qi += 1;
             if let Node::Call(c) = m.node(id) {
                 if let CallHead::Builtin(sym) = c.head {
-                    if m.resolve(sym) == op {
+                    if ops.contains(&m.resolve(sym)) {
                         return Some((bid, id));
                     }
                 }
@@ -353,8 +359,14 @@ fn apply_rule(
         return Ok(());
     }
 
-    // --- density disintegration: logdensityof(lawof(M), v) → deterministic density ---
-    if is_op(m, target_node, "logdensityof") {
+    // --- density disintegration: logdensityof(lawof(M), v) / densityof(lawof(M), v) → deterministic density ---
+    // `densityof` shares this whole arm with `logdensityof` (it lowers via the
+    // same [`crate::density::lower_density_core`] dispatch, wrapped in `exp` —
+    // §06: `densityof(M,x) = exp(logdensityof(M,x))`); only the final lowering
+    // call differs.
+    let is_logdensityof = is_op(m, target_node, "logdensityof");
+    let is_densityof = is_op(m, target_node, "densityof");
+    if is_logdensityof || is_densityof {
         // Defer-and-reloop for a cross-module query TARGET (GAP D). When the
         // query's measure target is (or resolves via one `(%ref self …)` hop to)
         // a cross-module `(%ref <alias> member)`, graft the referenced submodule
@@ -369,6 +381,8 @@ fn apply_rule(
         // so it is swept rather than surviving into the conformance check. Without
         // this deferral the old inline graft-then-lower ran on still-untyped nodes
         // in a single call (iid-size refuse / KernelNotBuiltinArg refuse).
+        // `graft_query_target` rebuilds the deferred query with the SAME op name
+        // (`logdensityof` or `densityof`) it was given, so this branch is shared.
         if let Some(new_query) = crate::density::graft_query_target(m, target_node, bundle)? {
             let new_rhs = substitute_in_tree(m, m.binding(bid).rhs, target_node, new_query);
             m.set_binding_rhs(bid, new_rhs);
@@ -378,14 +392,18 @@ fn apply_rule(
             sweep_dead_measure_bindings(m);
             return Ok(());
         }
-        let new_root = crate::density::lower_logdensityof(m, target_node, bundle)?;
+        let new_root = if is_logdensityof {
+            crate::density::lower_logdensityof(m, target_node, bundle)?
+        } else {
+            crate::density::lower_densityof(m, target_node, bundle)?
+        };
         let new_rhs = substitute_in_tree(m, m.binding(bid).rhs, target_node, new_root);
         m.set_binding_rhs(bid, new_rhs);
-        // After lowering a logdensityof query, some measure bindings (e.g.
-        // `m = weighted(...)`) may now be dead code — the draw was pinned and
-        // the combinator binding is no longer referenced.  Sweep them out now so
-        // the outer scan loop does not encounter them as unhandled measure-layer
-        // nodes on the next iteration.
+        // After lowering a logdensityof/densityof query, some measure bindings
+        // (e.g. `m = weighted(...)`) may now be dead code — the draw was pinned
+        // and the combinator binding is no longer referenced.  Sweep them out now
+        // so the outer scan loop does not encounter them as unhandled
+        // measure-layer nodes on the next iteration.
         sweep_dead_measure_bindings(m);
         return Ok(());
     }
