@@ -118,3 +118,35 @@ lp = logdensityof(dist, 0.7)";
         .expect_err("a keyword name not matching the auto-traced boundary must refuse");
     let _ = format!("{err:?}");
 }
+
+/// A TWO-input `%autoinputs` kernel (`Normal(mu = mu, sigma = sigma)`, both
+/// auto-traced) applied with its kwargs supplied in the OPPOSITE order to the
+/// auto-traced (name-sorted) boundary `[mu, sigma]`: `k(sigma = 2.0, mu =
+/// 1.0)`. `reduce_kernel_application` must bind each value BY NAME — `mu` ends
+/// up `1.0` and `sigma` ends up `2.0` — regardless of the kwargs' surface
+/// order. `mu` and `sigma` are given DISTINCT values precisely so a
+/// name/position mix-up is visible: a POSITIONAL zip of the kwargs as
+/// authored (`sigma = 2.0` first, `mu = 1.0` second) against the boundary
+/// order (`mu` first, `sigma` second) would instead swap them, producing
+/// `Normal(mu = 2.0, sigma = 1.0)` — a silent wrong density this golden must
+/// catch.
+#[test]
+fn autoinputs_multiinput_out_of_order_kwargs_bind_by_name() {
+    let src = "\
+mu = elementof(reals)
+sigma = elementof(reals)
+y = draw(Normal(mu = mu, sigma = sigma))
+k = kernelof(y)
+dist = k(sigma = 2.0, mu = 1.0)
+lp = logdensityof(dist, 0.7)";
+    let pir = flatppl_flatpir::write(&determinize(&parse_infer(src)).expect("must lower"));
+    assert!(pir.contains("builtin_logdensityof"), "got:\n{pir}");
+    assert!(
+        pir.contains("(%field mu 1.0)") && pir.contains("(%field sigma 2.0)"),
+        "out-of-order keyword application must bind BY NAME (mu = 1.0, sigma = 2.0); got:\n{pir}"
+    );
+    assert!(
+        !pir.contains("(%field mu 2.0)") && !pir.contains("(%field sigma 1.0)"),
+        "a positional zip of the reversed kwargs would mis-bind mu = 2.0, sigma = 1.0; got:\n{pir}"
+    );
+}
