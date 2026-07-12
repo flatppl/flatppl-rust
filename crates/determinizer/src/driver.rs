@@ -122,6 +122,24 @@ pub fn determinize_with(m: &Module, bundle: &ModuleBundle) -> Result<Module, Ref
 /// `x = draw(...)` binding it closes over, so it must fire before the
 /// source-order scan reaches that `draw` binding on its own and refuses it.
 fn find_measure_node(m: &Module) -> Option<(BindingId, NodeId)> {
+    // `get(disintegrate(…), i)` gets the highest priority (see
+    // `find_get_disintegrate`): the `get` must be eliminated into the structural
+    // split *before* a `logdensityof`/`bayesupdate` consumes it (and hits the
+    // primitive-constructor refuse in `lower_measure_density`) or the general scan
+    // reaches the bare `disintegrate` and refuses it.
+    if let Some(hit) = find_get_disintegrate(m) {
+        return Some(hit);
+    }
+    // `restrict(M, x)` is desugared (§06 "Measure restriction") into
+    // `bayesupdate(likelihoodof(kernel, x), marginal)` over the disintegration on
+    // `x`'s field names. Like `get(disintegrate, i)`, it must fire BEFORE a
+    // `logdensityof` consumes it: a `logdensityof(restrict(…), θ)` would otherwise
+    // reach the primitive-constructor refuse in `lower_measure_density` (which
+    // keeps a `restrict` safety-net arm). Eliminating the `restrict` first leaves
+    // a `bayesupdate` the density query lowers via the existing posterior path.
+    if let Some(hit) = find_op_node(m, "restrict") {
+        return Some(hit);
+    }
     if let Some(hit) = find_op_node(m, "logdensityof") {
         return Some(hit);
     }
@@ -156,6 +174,54 @@ fn find_op_node(m: &Module, op: &str) -> Option<(BindingId, NodeId)> {
         }
     }
     None
+}
+
+/// Scan bindings (source order) for the first `get(disintegrate(…), i)` node —
+/// the highest-priority driver target. Eliminating this `get` into the structural
+/// disintegration split (`split_disintegrate`) must precede the `logdensityof`
+/// scan: a `disintegrate` tuple is consumed by `forward_kernel = get(D, 1)` /
+/// `prior = get(D, 2)`, and if the density query lowered first it would reach the
+/// still-present `get` through the primitive-constructor path and refuse.
+fn find_get_disintegrate(m: &Module) -> Option<(BindingId, NodeId)> {
+    for (bid, binding) in m.bindings() {
+        let mut queue = vec![binding.rhs];
+        let mut qi = 0;
+        while qi < queue.len() {
+            let id = queue[qi];
+            qi += 1;
+            if match_get_disintegrate(m, id).is_some() {
+                return Some((bid, id));
+            }
+            m.for_each_child(id, |c| queue.push(c));
+        }
+    }
+    None
+}
+
+/// Match `get(D, i)` where `D` resolves (one `(%ref self …)` hop) to a
+/// `disintegrate(…)` call. Returns `(disintegrate_node, i)` — the resolved
+/// disintegrate call node and the 1-based tuple index literal — or `None` when
+/// the node is not a well-formed `get` over a disintegrate.
+fn match_get_disintegrate(m: &Module, node: NodeId) -> Option<(NodeId, i64)> {
+    let Node::Call(c) = m.node(node) else {
+        return None;
+    };
+    let CallHead::Builtin(sym) = c.head else {
+        return None;
+    };
+    if m.resolve(sym) != "get" || c.args.len() != 2 || !c.named.is_empty() {
+        return None;
+    }
+    // arg0 must resolve (one hop) to a `disintegrate(…)` call.
+    let (target, _) = crate::density::resolve_ref_one(m, c.args[0]);
+    if crate::density::builtin_name(m, target) != Some("disintegrate") {
+        return None;
+    }
+    // arg1 is the 1-based tuple index literal (`get(tmp, k+1)`, syntax/parser.rs).
+    let Node::Lit(Scalar::Int(i)) = m.node(c.args[1]) else {
+        return None;
+    };
+    Some((target, *i))
 }
 
 /// Walk the subtree rooted at `root`, returning the outermost measure-layer
@@ -211,6 +277,82 @@ fn apply_rule(
     target_node: NodeId,
     bundle: &ModuleBundle,
 ) -> Result<(), RefuseError> {
+    // --- structural disintegration: get(disintegrate(sel, lawof(record …)), i) ---
+    // The pinned bi3 IR consumes a `disintegrate` tuple through two `get`s —
+    // `forward_kernel = get(D, 1)` (the KERNEL, tuple elem 1) and
+    // `prior = get(D, 2)` (the MARGINAL, tuple elem 2), 1-based per the tuple-
+    // destructuring desugar (`get(tmp, k+1)`, syntax/parser.rs:437). Replace the
+    // `get` with the matching component of the structural split so the downstream
+    // `likelihoodof(kernel, obs)` / `bayesupdate(L, marginal)` lower via the
+    // existing paths (spec §06 "Structural disintegration"). This arm fires before
+    // the `logdensityof` arm because `find_measure_node` returns the `get` first.
+    if let Some((disint_node, index)) = match_get_disintegrate(m, target_node) {
+        // Only the 1-based kernel (1) / marginal (2) projections of the pair are
+        // meaningful; any other index is out of range — refuse, don't mislower.
+        if index != 1 && index != 2 {
+            return Err(RefuseError {
+                node: target_node,
+                construct: "get".to_string(),
+                reason: format!(
+                    "get index {index} out of range for a disintegrate (kernel, marginal) tuple"
+                ),
+            });
+        }
+        // Structural split; a non-explicit-DAG disintegrate (§06 permits refusing
+        // intractable / non-`lawof(record)` disintegrations) yields None → refuse.
+        let (kernel, marginal) = crate::disintegrate::split_disintegrate(m, disint_node)
+            .ok_or_else(|| RefuseError {
+                node: disint_node,
+                construct: "disintegrate".to_string(),
+                reason: "disintegrate is not an explicit `lawof(record(…))` structural split"
+                    .to_string(),
+            })?;
+        let replacement = if index == 1 { kernel } else { marginal };
+        let new_rhs = substitute_in_tree(m, m.binding(bid).rhs, target_node, replacement);
+        m.set_binding_rhs(bid, new_rhs);
+        // Once BOTH gets are eliminated the `D = disintegrate(…)` binding (and the
+        // `joint_model = lawof(record(…))` it consumes) are unreferenced. The split
+        // components carry verbatim `(%ref self …)` value nodes to the draws, so the
+        // draw bindings stay referenced and survive; only the disintegrate/joint
+        // scaffold is dead. Sweep it (disintegrate is on `COMBINATOR_OPS`) so the
+        // general scan never reaches the bare `disintegrate` and refuses — this is
+        // what makes each rewrite strictly remove a `get`/`disintegrate` node and
+        // the driver terminate.
+        sweep_dead_measure_bindings(m);
+        return Ok(());
+    }
+
+    // --- measure restriction: restrict(M, x) → bayesupdate(likelihoodof(kernel, x), marginal) ---
+    // Spec §06 "Measure restriction": the non-normalized conditional of `M` given
+    // the observed values `x` desugars — via structural disintegration on `x`'s
+    // field names — into `bayesupdate(likelihoodof(kernel, x), marginal)` where
+    // `(kernel, marginal) = disintegrate([field-names of x], M)`. This arm fires
+    // before the `logdensityof` arm (`find_measure_node` returns the `restrict`
+    // first), so the downstream `bayesupdate` lowers via the existing posterior
+    // path. A shape the desugaring cannot handle (`x` not a record, a field of `x`
+    // naming no variate of `M`, or a non-`lawof(record)` `M`) yields `None` →
+    // refuse, don't mislower.
+    if is_op(m, target_node, "restrict") {
+        let desugared =
+            crate::disintegrate::rewrite_restrict(m, target_node).ok_or_else(|| RefuseError {
+                node: target_node,
+                construct: "restrict".to_string(),
+                reason: "restrict(M, x) is not the explicit structural case: x must be a \
+                         record of observed values whose fields are all variates of a \
+                         lawof(record(…)) M"
+                    .to_string(),
+            })?;
+        let new_rhs = substitute_in_tree(m, m.binding(bid).rhs, target_node, desugared);
+        m.set_binding_rhs(bid, new_rhs);
+        // The desugared `bayesupdate` carries the split kernel/marginal, whose
+        // verbatim `(%ref self …)` value nodes reach the draws directly, so the
+        // `M = lawof(record(…))` joint binding is now unreferenced (dead
+        // scaffold). Sweep it (`lawof` is on `COMBINATOR_OPS`) so the general scan
+        // never reaches the bare `lawof(record(…))` and refuses.
+        sweep_dead_measure_bindings(m);
+        return Ok(());
+    }
+
     // --- density disintegration: logdensityof(lawof(M), v) → deterministic density ---
     if is_op(m, target_node, "logdensityof") {
         // Defer-and-reloop for a cross-module query TARGET (GAP D). When the
@@ -481,6 +623,14 @@ const COMBINATOR_OPS: &[&str] = &[
     // baked-in `data`), so a binding referenced only by the now-lowered
     // `logdensityof` query is orphaned the same way.
     "likelihoodof",
+    // Structural-disintegration scaffold (Task 4): after `get(D, 1)` / `get(D, 2)`
+    // are eliminated into the split kernel/marginal, the `D = disintegrate(…)`
+    // binding is unreferenced. It types to a `%tuple`, not a `Measure`, so the
+    // type arm below does not catch it — the op-name arm sweeps the dead scaffold
+    // (its `lawof(record(…))` joint argument is caught by the existing `lawof`
+    // entry once `D` is gone). Only zeroed when unreferenced, so a `disintegrate`
+    // whose `get`s are still present is never swept.
+    "disintegrate",
     // Likelihood-combining op (§06 "Combining likelihoods"): a
     // `L = joint_likelihood(L1, …, Lk)` binding is unwrapped at the
     // `logdensityof` entry (each component scored at the shared θ and summed), so

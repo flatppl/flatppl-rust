@@ -4,6 +4,7 @@
 mod conformance;
 mod crossmodule;
 mod density;
+mod disintegrate;
 mod driver;
 mod invert;
 mod jointchain;
