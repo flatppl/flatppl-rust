@@ -4,8 +4,9 @@ use flatppl_core::{CallHead, Module, Node, NodeId, Phase, Type};
 /// FlatPDL conformance over `flatppl-infer` output: no `Measure`/`Likelihood`-typed node;
 /// `Kernel` type only as an argument of a `builtin_*` primitive (the constructor-tag arg —
 /// its position varies: arg 0 for `builtin_logdensityof` and the transports, arg 1 for
-/// `builtin_sample`); no `Stochastic` phase. Pure read of the inferred side-tables — run
-/// `infer` first.
+/// `builtin_sample`); no `Stochastic` phase; and no residual `Type::Failed` node (a
+/// generic backstop — any node `flatppl-infer` could not type is ill-formed, whatever
+/// produced it). Pure read of the inferred side-tables — run `infer` first.
 pub fn is_flatpdl(m: &Module) -> Result<(), Vec<NonConformance>> {
     let mut bad = Vec::new();
     for (_bid, binding) in m.bindings() {
@@ -45,6 +46,11 @@ fn visit(m: &Module, id: NodeId, parent_builtin: Option<&str>, bad: &mut Vec<Non
                 reason: "kernel outside a builtin_* argument".into(),
             })
         }
+        Some(Type::Failed(reason)) => bad.push(NonConformance {
+            node: id,
+            kind: NonConformKind::Failed,
+            reason: reason.to_string(),
+        }),
         _ => {}
     }
 

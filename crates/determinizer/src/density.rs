@@ -1,8 +1,13 @@
 //! Density disintegration — the independent-record, combinator, and primitive cases
 //! (spec §06, "Density of composed measures").
 //!
-//! Entry point: [`lower_logdensityof`], which lowers a `logdensityof(lawof(M), v)` node
-//! to a deterministic expression.
+//! Entry points: [`lower_logdensityof`], which lowers a `logdensityof(lawof(M), v)`
+//! node to a deterministic expression, and [`lower_densityof`], which lowers the
+//! plain-density form `densityof(lawof(M), v)` to `exp(<the same log-density
+//! node>)` — FlatPPL has no separate `builtin_densityof` primitive (§07 lists six
+//! `builtin_*` primitives, only one of them a density: `builtin_logdensityof`), so
+//! `densityof` is defined as `exp(logdensityof(...))` (§06) and reuses the shared
+//! [`lower_density_core`] dispatch rather than reimplementing it.
 //!
 //! ## Supported measure shapes
 //!
@@ -144,14 +149,54 @@ pub(crate) fn lower_logdensityof(
     query: NodeId,
     bundle: &ModuleBundle,
 ) -> Result<NodeId, RefuseError> {
-    let (arg1, arg2) = {
-        let q = expect_builtin_call(m, query, "logdensityof")
-            .ok_or_else(|| refuse(query, m, "expected logdensityof"))?;
-        if q.args.len() != 2 {
-            return Err(refuse(query, m, "logdensityof expects 2 args"));
-        }
-        (q.args[0], q.args[1])
-    };
+    let (arg1, arg2) = parse_density_query_args(m, query, "logdensityof")?;
+    lower_density_core(m, arg1, arg2, bundle)
+}
+
+/// Lower `densityof(M, x)` at `query` into a deterministic expression: the
+/// PLAIN density, `exp(logdensityof(M, x))` (spec §06: `densityof` is the
+/// density, `logdensityof` its log — FlatPPL has no separate `builtin_densityof`
+/// primitive, §07's six `builtin_*` primitives include only the log form). Reuses
+/// [`lower_density_core`] — the same dispatch [`lower_logdensityof`] uses — so
+/// `densityof` refuses in EXACTLY the cases `logdensityof` would (the core's
+/// `Err` propagates unchanged), and shares the same `draw`-pinning side effect.
+pub(crate) fn lower_densityof(
+    m: &mut Module,
+    query: NodeId,
+    bundle: &ModuleBundle,
+) -> Result<NodeId, RefuseError> {
+    let (arg1, arg2) = parse_density_query_args(m, query, "densityof")?;
+    let log_density = lower_density_core(m, arg1, arg2, bundle)?;
+    Ok(build_call(m, "exp", &[log_density]))
+}
+
+/// Parse `op(arg1, arg2)`'s two positional args at `query` (`op` is
+/// `"logdensityof"` or `"densityof"`), refusing when `query` is not a
+/// well-formed 2-arg call to `op`.
+fn parse_density_query_args(
+    m: &Module,
+    query: NodeId,
+    op: &str,
+) -> Result<(NodeId, NodeId), RefuseError> {
+    let q = expect_builtin_call(m, query, op)
+        .ok_or_else(|| refuse(query, m, &format!("expected {op}")))?;
+    if q.args.len() != 2 {
+        return Err(refuse(query, m, &format!("{op} expects 2 args")));
+    }
+    Ok((q.args[0], q.args[1]))
+}
+
+/// Shared core behind [`lower_logdensityof`] / [`lower_densityof`]: dispatches
+/// on the measure/likelihood-layer shape of `arg1` and returns the LOG-density
+/// node scored at `arg2`. [`lower_logdensityof`] returns this unchanged;
+/// [`lower_densityof`] wraps it in `exp` (§06:
+/// `densityof(M,x) = exp(logdensityof(M,x))`).
+fn lower_density_core(
+    m: &mut Module,
+    arg1: NodeId,
+    arg2: NodeId,
+    bundle: &ModuleBundle,
+) -> Result<NodeId, RefuseError> {
     // A cross-module *direct query target* (a submodule likelihood handle
     // `m.L` or a bare measure handle `m.d`) is already grafted to a local host
     // node by the time this runs: the driver's `apply_rule` calls
@@ -446,18 +491,23 @@ pub(crate) fn graft_query_target(
     query: NodeId,
     bundle: &ModuleBundle,
 ) -> Result<Option<NodeId>, RefuseError> {
+    // `query` may be either a `logdensityof(...)` or a `densityof(...)` — both
+    // share this grafting logic; rebuild with the SAME op name the query
+    // actually used (not a hard-coded `"logdensityof"`), so a grafted
+    // `densityof` query stays a `densityof` for the driver's next scan.
+    let op = density_query_op_name(m, query)?;
     let (arg1, arg2) = {
-        let q = expect_builtin_call(m, query, "logdensityof")
-            .ok_or_else(|| refuse(query, m, "expected logdensityof"))?;
+        let q = expect_builtin_call(m, query, op)
+            .ok_or_else(|| refuse(query, m, &format!("expected {op}")))?;
         if q.args.len() != 2 {
-            return Err(refuse(query, m, "logdensityof expects 2 args"));
+            return Err(refuse(query, m, &format!("{op} expects 2 args")));
         }
         (q.args[0], q.args[1])
     };
     // Case 1: the target IS (or resolves via one `(%ref self …)` hop to) a
     // cross-module measure / likelihood HANDLE — graft it directly.
     if let Some(grafted) = graft_cross_module_target(m, arg1, bundle)? {
-        return Ok(Some(build_call(m, "logdensityof", &[grafted, arg2])));
+        return Ok(Some(build_call(m, op, &[grafted, arg2])));
     }
     // Case 2 (#194): the target is a cross-module kernel APPLICATION — a
     // `%call { head: User(callee), args: [input] }` whose CALLEE is a cross-module
@@ -466,9 +516,20 @@ pub(crate) fn graft_query_target(
     // types the grafted kernel and `reduce_kernel_application` β-reduces the
     // now-local application next iteration.
     if let Some(new_call) = graft_kernel_application_callee(m, arg1, bundle)? {
-        return Ok(Some(build_call(m, "logdensityof", &[new_call, arg2])));
+        return Ok(Some(build_call(m, op, &[new_call, arg2])));
     }
     Ok(None) // same-module target — driver lowers normally
+}
+
+/// The density-query op name at `query` — `"logdensityof"` or `"densityof"` —
+/// or a refusal when `query` is neither. Returns a `'static` string (not
+/// borrowed from `m`) so callers can freely mix reads/writes of `m` afterward.
+fn density_query_op_name(m: &Module, query: NodeId) -> Result<&'static str, RefuseError> {
+    match builtin_name(m, query) {
+        Some("logdensityof") => Ok("logdensityof"),
+        Some("densityof") => Ok("densityof"),
+        _ => Err(refuse(query, m, "expected logdensityof or densityof")),
+    }
 }
 
 /// If the `logdensityof` target `arg1` is — or resolves via one `(%ref self …)`
@@ -1859,7 +1920,17 @@ fn lower_pushfwd(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Refu
                 Some(Type::Measure { domain, .. }) => (**domain).clone(),
                 _ => Type::Any,
             };
-            match crate::invert::derive_bijection(m, bij_node, &domain)? {
+            // Also thread `M`'s refined SUPPORT (`valueset_of`, e.g. `posreals`
+            // for `Gamma`, `nonnegreals` for `Exponential`): the coarse variate
+            // type is `scalar real` (natural extent `reals`), which would refuse
+            // every positive-support base for `log`/`pow`. `None`/`%unknown`
+            // support falls back to `Unknown` — conservatively refused by the
+            // positivity guard (refuse-don't-mislower), NOT defaulted to positive.
+            let support = m
+                .valueset_of(m_inner)
+                .cloned()
+                .unwrap_or(flatppl_core::ValueSet::Unknown);
+            match crate::invert::derive_bijection(m, bij_node, &domain, &support)? {
                 Some(bij) => (bij.f_inv, bij.logvol),
                 None => {
                     return Err(refuse(
@@ -1958,18 +2029,27 @@ fn recognize_get_projection(m: &Module, f: NodeId) -> Option<Vec<Box<str>>> {
         return None;
     }
     // Second arg is a non-empty `vector` of string literals (the selected fields).
-    let vec = expect_builtin_call(m, get.args[1], "vector")?;
+    string_literal_vector(m, get.args[1])
+}
+
+/// Read a `vector("a", "b", …)` node as owned STRING-literal strings, in order,
+/// or `None` if it is not a non-empty positional vector of string literals. Shared
+/// by [`recognize_get_projection`] (the projected FIELD names) and the
+/// `relabel(_, [labels])` arm of [`lower_projection_pushfwd`] (the component
+/// LABELS) — both read the identical `[ "a", "b", … ]` surface form.
+fn string_literal_vector(m: &Module, node: NodeId) -> Option<Vec<Box<str>>> {
+    let vec = expect_builtin_call(m, node, "vector")?;
     if !vec.named.is_empty() || vec.args.is_empty() {
         return None;
     }
-    let mut fields = Vec::with_capacity(vec.args.len());
+    let mut out = Vec::with_capacity(vec.args.len());
     for &a in vec.args.iter() {
         let Node::Lit(Scalar::Str(s)) = m.node(a) else {
-            return None; // a non-string selector is not a field projection
+            return None; // a non-string entry is not a field/label list
         };
-        fields.push(s.clone());
+        out.push(s.clone());
     }
-    Some(fields)
+    Some(out)
 }
 
 /// Lower `pushfwd(fn(get(_, [fields])), M)` — the §06 case-2 structural
@@ -1987,12 +2067,23 @@ fn recognize_get_projection(m: &Module, f: NodeId) -> Option<Vec<Box<str>>> {
 /// machinery ([`lower_keyword_joint`] / [`lower_record_of_draws`]) rather than
 /// re-deriving the marginal.
 ///
-/// **Scope (refuse-don't-mislower).** Closed-form only over an explicit
-/// FIELD-KEYED product (keyword `joint`, record-of-draws). A positional `joint`
-/// (no field labels), an `iid` / `jointchain` / `relabel` (index-keyed product
-/// needing index remapping — a follow-up), or a NON-product measure has no
-/// closed-form field-keyed marginal here, so it refuses (§06 case 2 permits
-/// "compute numerically or report a static error").
+/// **Index-keyed products via `relabel`.** An `iid(M, n)` or a positional
+/// `joint(M₁, …, Mₖ)` carries no field labels, but `relabel(product, [labels])`
+/// (§06) names its component slots. The `relabel` arm materialises that named
+/// product as a keyword `joint(label₀ = M₀, …)` and re-dispatches through THIS
+/// function's keyword-joint arm, so the labels supply the field names and the
+/// selected-name projection, the mass-preservation drop guard, and the sub-joint
+/// density all reuse the field-keyed path (the §06 canonical example
+/// `pushfwd(fn(get(_, ["a","c"])), relabel(iid(Normal(0,1),3), ["a","b","c"]))`).
+///
+/// **Scope (refuse-don't-mislower).** `jointchain` is a DEPENDENT product — a
+/// component's kernel reads earlier variates, so marginalizing one is a `kchain`
+/// integral, not the free drop the independent-product identity permits; it
+/// REFUSES (naming jointchain), both directly and through `relabel`. A bare
+/// `iid` / positional `joint` projected by field NAME (no `relabel` to name its
+/// slots), or a NON-product measure, likewise has no closed-form field-keyed
+/// marginal here and refuses (§06 case 2 permits "compute numerically or report a
+/// static error").
 fn lower_projection_pushfwd(
     m: &mut Module,
     m_inner_expr: NodeId,
@@ -2061,14 +2152,172 @@ fn lower_projection_pushfwd(
             }));
             lower_measure_density(m, sub, v)
         }
+        // `relabel(product, [labels])`: the labels name an index-keyed product's
+        // component slots (§06). Materialise the named product as a keyword
+        // `joint(label₀ = M₀, …)` and re-dispatch through the keyword-joint arm
+        // above — reusing the field-keyed projection, the drop guard, and the
+        // sub-joint density rather than re-deriving an index-remapped marginal.
+        Some("relabel") => {
+            let (inner, labels_node) = {
+                let c = expect_builtin_call(m, m_inner, "relabel")
+                    .ok_or_else(|| refuse(m_inner, m, "expected relabel"))?;
+                if c.args.len() != 2 {
+                    return Err(refuse(
+                        m_inner,
+                        m,
+                        "relabel expects 2 args (measure, labels)",
+                    ));
+                }
+                (c.args[0], c.args[1])
+            };
+            let labels = string_literal_vector(m, labels_node).ok_or_else(|| {
+                refuse(
+                    m_inner,
+                    m,
+                    "relabel labels must be a vector of string literals to name the \
+                     projected product's component slots",
+                )
+            })?;
+            let components = independent_product_components(m, inner)?;
+            if labels.len() != components.len() {
+                return Err(refuse(
+                    m_inner,
+                    m,
+                    &format!(
+                        "relabel gives {} label(s) for a {}-component product — a relabel \
+                         names each component slot exactly once — refuse rather than mislower",
+                        labels.len(),
+                        components.len()
+                    ),
+                ));
+            }
+            let mut named = Vec::with_capacity(labels.len());
+            for (label, &comp) in labels.iter().zip(components.iter()) {
+                let name = m.intern(label.as_ref());
+                named.push(NamedArg {
+                    kind: NamedKind::Field,
+                    name,
+                    value: comp,
+                });
+            }
+            let joint_sym = m.intern("joint");
+            let materialized = m.alloc(Node::Call(Call {
+                head: CallHead::Builtin(joint_sym),
+                args: Vec::<NodeId>::new().into(),
+                named: named.into(),
+                inputs: None,
+            }));
+            lower_projection_pushfwd(m, materialized, fields, v)
+        }
+        // `jointchain` is a DEPENDENT product: a component's kernel reads earlier
+        // variates, so marginalizing one is a `kchain` integral — refuse (naming
+        // jointchain). Only dependency-respecting prefix keeps are closed-form
+        // (a bounded follow-up). Reached for a bare jointchain projected by name;
+        // the `relabel(jointchain, …)` case refuses identically via
+        // `independent_product_components`.
+        Some("jointchain") => Err(refuse_jointchain_projection(m, m_inner)),
         other => Err(refuse(
             m_inner,
             m,
             &format!(
                 "structural projection (§06 case 2) is closed-form only over an explicit \
-                 FIELD-KEYED product (keyword `joint` / record-of-draws); got `{}` — projection \
-                 over iid/jointchain/relabel (index remapping) is a follow-up, and a non-product \
-                 measure has no closed-form field-keyed marginal here — refuse rather than mislower",
+                 FIELD-KEYED product (keyword `joint` / record-of-draws) or an index-keyed \
+                 product named by `relabel` (iid / positional joint); got `{}` — a bare \
+                 index-keyed product projected by field name, or a non-product measure, has \
+                 no closed-form field-keyed marginal here — refuse rather than mislower",
+                other.unwrap_or("<non-builtin>")
+            ),
+        )),
+    }
+}
+
+/// The precise refusal for a structural projection over a `jointchain` — shared
+/// by the direct `Some("jointchain")` arm and the `relabel(jointchain, …)` path
+/// so both name jointchain and its dependency structure identically.
+fn refuse_jointchain_projection(m: &Module, node: NodeId) -> RefuseError {
+    refuse(
+        node,
+        m,
+        "structural projection over a `jointchain` is unsupported: jointchain is a \
+         DEPENDENT product (a component's kernel reads earlier variates), so marginalizing \
+         a component is a `kchain` integral, not the free drop the independent-product \
+         identity permits — only dependency-respecting prefix keeps are closed-form (a \
+         bounded follow-up) — refuse rather than mislower",
+    )
+}
+
+/// Extract the ordered component measures of an INDEPENDENT index-keyed product
+/// `inner` under a `relabel(inner, [labels])` projection: `iid(M, n)` yields `n`
+/// copies of the SAME `M` node (its independent repeats); a positional
+/// `joint(M₁, …, Mₖ)` yields its positional args in order. These are the ONLY two
+/// forms whose components are independent AND positionally addressable, so a
+/// relabel can name each slot and the unselected slots drop cleanly.
+///
+/// **Refuses (refuse-don't-mislower):**
+/// * `jointchain` — a DEPENDENT product; marginalizing a component is a `kchain`
+///   integral (see [`refuse_jointchain_projection`]).
+/// * a KEYWORD `joint` — already field-keyed; project it by name directly rather
+///   than relabeling.
+/// * an `iid` whose size is not a statically-resolved 1-D count — a
+///   dynamic/multi-axis product's components can't be named slot-by-slot here.
+/// * any other measure — not an index-keyed product with nameable slots.
+fn independent_product_components(m: &Module, inner: NodeId) -> Result<Vec<NodeId>, RefuseError> {
+    let (inner_resolved, _) = resolve_ref_one(m, inner);
+    match builtin_name(m, inner_resolved) {
+        Some("iid") => {
+            let n = iid_static_size(m, inner_resolved).ok_or_else(|| {
+                refuse(
+                    inner_resolved,
+                    m,
+                    "relabel over an iid whose size is not a statically-resolved 1-D count \
+                     (dynamic / multi-axis / unresolved) — its components cannot be named \
+                     slot-by-slot — refuse rather than mislower",
+                )
+            })?;
+            let mm = {
+                let c = expect_builtin_call(m, inner_resolved, "iid")
+                    .ok_or_else(|| refuse(inner_resolved, m, "expected iid"))?;
+                if c.args.len() != 2 {
+                    return Err(refuse(
+                        inner_resolved,
+                        m,
+                        "iid expects 2 args (measure, size)",
+                    ));
+                }
+                c.args[0]
+            };
+            // `n` copies of the SAME measure node — the independent repeats of the
+            // iid. Sharing one NodeId across the materialised joint fields is safe:
+            // lowering reads the constructor, it does not mutate it per field.
+            Ok(vec![mm; n])
+        }
+        Some("joint") => {
+            let c = expect_builtin_call(m, inner_resolved, "joint")
+                .ok_or_else(|| refuse(inner_resolved, m, "expected joint"))?;
+            if !c.named.is_empty() {
+                return Err(refuse(
+                    inner_resolved,
+                    m,
+                    "relabel over a KEYWORD joint (already field-keyed) — project it by name \
+                     directly rather than relabeling — refuse rather than mislower",
+                ));
+            }
+            if c.args.len() < 2 {
+                return Err(refuse(
+                    inner_resolved,
+                    m,
+                    "joint needs at least 2 components",
+                ));
+            }
+            Ok(c.args.to_vec())
+        }
+        Some("jointchain") => Err(refuse_jointchain_projection(m, inner_resolved)),
+        other => Err(refuse(
+            inner_resolved,
+            m,
+            &format!(
+                "relabel base `{}` is not an INDEPENDENT index-keyed product (iid / positional \
+                 joint) — no closed-form field-keyed marginal here — refuse rather than mislower",
                 other.unwrap_or("<non-builtin>")
             ),
         )),

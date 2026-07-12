@@ -1111,14 +1111,21 @@ fn set_element_type(inf: &mut Inferencer<'_, '_>, node: Option<NodeId>) -> Type 
                     // would give (the legacy `cartpow(S, d1, d2, …)` arity is
                     // not in the spec; only arg 1 is the size).
                     let (set_arg, size_arg) = (c.args.first().copied(), c.args.get(1).copied());
-                    let elem = set_element_type(inf, set_arg);
-                    let shape = size_arg.map_or_else(
-                        || Box::new([Dim::Dynamic]) as Box<[Dim]>,
-                        |n| count_dims(inf, n),
-                    );
-                    Type::Array {
-                        shape,
-                        elem: Box::new(elem),
+                    // The size is required (§03 "Cartesian power"); a missing
+                    // size is ill-formed — reject it here too, consistent with
+                    // the `cartpow` type arm and `set_call_valueset` (an omitted
+                    // size is not a dynamic size; a dynamic size is written
+                    // `cartpow(S, n)` with a non-literal `n`).
+                    match size_arg {
+                        None => Type::Failed("cartpow expects (set, size)".into()),
+                        Some(size_arg) => {
+                            let elem = set_element_type(inf, set_arg);
+                            let shape = count_dims(inf, size_arg);
+                            Type::Array {
+                                shape,
+                                elem: Box::new(elem),
+                            }
+                        }
                     }
                 }
                 "stdsimplex" => {
@@ -2994,14 +3001,19 @@ fn set_call_valueset(inf: &mut Inferencer<'_, '_>, c: &Call) -> ValueSet {
                 .map_or(Dim::Dynamic, |&n| resolve_dim(inf, n)),
         ),
         "cartpow" => {
+            // The size is REQUIRED (spec §03 "Cartesian power") — the type
+            // arm already fails 1-arg `cartpow(S)` (`Type::Failed`, above);
+            // agree here rather than defaulting the missing size to
+            // `%dynamic` and synthesizing a plausible-looking value-set for
+            // an ill-formed call.
+            let Some(&size_arg) = c.args.get(1) else {
+                return ValueSet::Unknown;
+            };
             let elem = set_expr_valueset(inf, c.args.first().copied());
             if elem == ValueSet::Unknown {
                 return ValueSet::Unknown;
             }
-            let shape = c.args.get(1).map_or_else(
-                || Box::new([Dim::Dynamic]) as Box<[Dim]>,
-                |&n| count_dims(inf, n),
-            );
+            let shape = count_dims(inf, size_arg);
             flatppl_core::ty::cartpow_over(elem, &shape)
         }
         "cartprod" => {

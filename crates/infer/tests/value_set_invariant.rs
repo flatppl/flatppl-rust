@@ -14,7 +14,7 @@
 //! A producer that disagrees with the natural extent (as `load_data` did with
 //! the pre-fix `natural_of(Table)`) fails here.
 
-use flatppl_core::ValueSet;
+use flatppl_core::{Type, ValueSet};
 use flatppl_infer::infer;
 
 fn check_invariant(src: &str) {
@@ -77,4 +77,43 @@ fn value_sets_are_refinements_of_natural_extent() {
     ] {
         check_invariant(src);
     }
+}
+
+/// spec §03 "Cartesian power": `cartpow(S, size)` REQUIRES the size — 1-arg
+/// `cartpow(S)` is invalid. The type arm already rejects it (`Type::Failed`,
+/// `infer/src/ops.rs`'s `cartpow` arm); `set_call_valueset` must agree rather
+/// than leniently default the missing size to `%dynamic` and synthesize a
+/// plausible `CartPow(_, Dynamic)` value-set for an ill-formed call.
+/// `cartpow(S, size)` (2-arg) is unaffected.
+#[test]
+fn cartpow_one_arg_fails_type_and_valueset_consistently() {
+    let mut bad = flatppl_syntax::parse("s = cartpow(reals)").unwrap();
+    let _ = infer(&mut bad);
+    let rhs = bad.binding(bad.bindings().next().unwrap().0).rhs;
+    assert!(
+        matches!(bad.type_of(rhs), Some(Type::Failed(_))),
+        "1-arg cartpow must fail the type arm (spec §03 requires the size), got {:?}",
+        bad.type_of(rhs)
+    );
+    assert_eq!(
+        bad.valueset_of(rhs),
+        Some(&ValueSet::Unknown),
+        "1-arg cartpow's value-set must not default to a plausible CartPow(_, Dynamic) for \
+         an ill-formed call, got {:?}",
+        bad.valueset_of(rhs)
+    );
+
+    let mut ok = flatppl_syntax::parse("s = cartpow(reals, 3)").unwrap();
+    let _ = infer(&mut ok);
+    let rhs_ok = ok.binding(ok.bindings().next().unwrap().0).rhs;
+    assert!(
+        !matches!(ok.type_of(rhs_ok), Some(Type::Failed(_))),
+        "cartpow(reals, 3) must type-check, got {:?}",
+        ok.type_of(rhs_ok)
+    );
+    assert!(
+        matches!(ok.valueset_of(rhs_ok), Some(ValueSet::CartPow(_, _))),
+        "cartpow(reals, 3) must still yield a concrete CartPow value-set, got {:?}",
+        ok.valueset_of(rhs_ok)
+    );
 }

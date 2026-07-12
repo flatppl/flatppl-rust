@@ -16,19 +16,57 @@
 //! stays `kernelof`-only since `marginal.rs`/`jointchain.rs` depend on that.
 
 use crate::density::{draw_argument, resolve_ref_one};
-use flatppl_core::{Call, CallHead, Inputs, Module, NamedArg, Node, NodeId, Ref, RefNs, Symbol};
+use flatppl_core::{
+    Call, CallHead, Inputs, Module, NamedArg, NamedKind, Node, NodeId, Ref, RefNs, Symbol,
+};
 
 /// A resolved kernel: its reified body and its boundary inputs as
-/// `(name, body-target-ref)` pairs, in `%specinputs` order.
+/// `(name, body-target-ref)` pairs. For a `%specinputs` boundary the pairs are
+/// in the authored (positional) order; for an `%autoinputs` boundary they are
+/// the auto-traced `elementof` leaves in canonical (name-sorted) order.
+/// `auto` distinguishes the two: an `%autoinputs` boundary is keyword-only
+/// (spec §04 "no argument order can be inferred"), so a positional application
+/// of it refuses.
 pub(crate) struct Kernel {
     pub body: NodeId,
     pub inputs: Vec<(Symbol, Ref)>,
+    pub auto: bool,
 }
 
-/// Resolve `k_arg` to a `kernelof(body, %specinputs([(name, ref), …]))`.
-/// `None` for any non-`kernelof` shape or a `kernelof` without a `%specinputs`
-/// boundary. Returns ALL inputs; callers that require exactly one check the
-/// length themselves.
+/// Read a reification's boundary inputs as `(name, body-target-ref)` pairs,
+/// mirroring `infer`'s `input_entries` dual dispatch (`infer/src/ops.rs`): a
+/// `%specinputs` boundary carries them inline; an `%autoinputs` (keyword-only)
+/// boundary reads them from the module's auto-inputs side-table
+/// ([`Module::auto_inputs_of`], filled by phase inference). Returns the inputs
+/// and whether the boundary is `%autoinputs`. `None` for a reification with no
+/// boundary, an empty boundary, or an `%autoinputs` boundary whose side-table
+/// entry has not been filled (callers requiring exactly one input check the
+/// length themselves).
+fn boundary_inputs(
+    m: &Module,
+    reif_id: NodeId,
+    inputs: &Option<Inputs>,
+) -> Option<(Vec<(Symbol, Ref)>, bool)> {
+    match inputs.as_ref()? {
+        Inputs::Spec(entries) if !entries.is_empty() => {
+            Some((entries.iter().map(|(nm, r)| (*nm, *r)).collect(), false))
+        }
+        Inputs::Spec(_) => None,
+        Inputs::Auto => {
+            let entries = m.auto_inputs_of(reif_id)?;
+            if entries.is_empty() {
+                return None;
+            }
+            Some((entries.iter().map(|(nm, r)| (*nm, *r)).collect(), true))
+        }
+    }
+}
+
+/// Resolve `k_arg` to a `kernelof(body, <boundary>)`. `None` for any
+/// non-`kernelof` shape or a `kernelof` with no boundary inputs. The boundary
+/// may be `%specinputs` (inline) OR `%autoinputs` (auto-traced, keyword-only) —
+/// both are read via [`boundary_inputs`]. Returns ALL inputs; callers that
+/// require exactly one check the length themselves.
 pub(crate) fn resolve_kernel(m: &Module, k_arg: NodeId) -> Option<Kernel> {
     let (resolved, _) = resolve_ref_one(m, k_arg);
     let Node::Call(c) = m.node(resolved) else {
@@ -41,21 +79,18 @@ pub(crate) fn resolve_kernel(m: &Module, k_arg: NodeId) -> Option<Kernel> {
         return None;
     }
     let body = c.args[0];
-    let inputs: Vec<(Symbol, Ref)> = match &c.inputs {
-        Some(Inputs::Spec(entries)) if !entries.is_empty() => {
-            entries.iter().map(|(nm, r)| (*nm, *r)).collect()
-        }
-        _ => return None,
-    };
-    Some(Kernel { body, inputs })
+    let (inputs, auto) = boundary_inputs(m, resolved, &c.inputs)?;
+    Some(Kernel { body, inputs, auto })
 }
 
 /// Resolve `k_arg` to a reified callable — `kernelof` OR `functionof` — as a
 /// `(body, boundary-inputs)` pair. `None` for any other shape, a call with
-/// more than one positional argument, or a reification without a
-/// `%specinputs` boundary (an `%autoinputs`/keyword-only reification is not
-/// handled here — see `reduce_kernel_application`'s doc comment). Returns ALL
-/// inputs; callers that require exactly one check the length themselves.
+/// more than one positional argument, or a reification with no boundary inputs.
+/// The boundary may be `%specinputs` (inline) OR `%autoinputs` (auto-traced,
+/// keyword-only) — both are read via [`boundary_inputs`], and the resolved
+/// `Kernel::auto` flag records which, so [`reduce_kernel_application`] can hold
+/// an `%autoinputs` callable to keyword-only application. Returns ALL inputs;
+/// callers that require exactly one check the length themselves.
 pub(crate) fn resolve_reified(m: &Module, k_arg: NodeId) -> Option<Kernel> {
     let (resolved, _) = resolve_ref_one(m, k_arg);
     let Node::Call(c) = m.node(resolved) else {
@@ -69,13 +104,8 @@ pub(crate) fn resolve_reified(m: &Module, k_arg: NodeId) -> Option<Kernel> {
         return None;
     }
     let body = c.args[0];
-    let inputs: Vec<(Symbol, Ref)> = match &c.inputs {
-        Some(Inputs::Spec(entries)) if !entries.is_empty() => {
-            entries.iter().map(|(nm, r)| (*nm, *r)).collect()
-        }
-        _ => return None,
-    };
-    Some(Kernel { body, inputs })
+    let (inputs, auto) = boundary_inputs(m, resolved, &c.inputs)?;
+    Some(Kernel { body, inputs, auto })
 }
 
 /// Replace every `(%ref self name)` / `(%ref %local name)` in the subtree at
@@ -136,14 +166,25 @@ pub(crate) fn substitute_ref(m: &mut Module, root: NodeId, name: Symbol, new_id:
 /// body-ref with the bound argument, and return the reduced measure body.
 /// `None` for any other shape.
 ///
-/// Two application forms are recognized, distinguished structurally by the
+/// Three application forms are recognized, distinguished structurally by the
 /// application's own argument shape (not by which reifier produced `k` —
 /// spec §04 does not tie the reifier name to the argument form):
+/// - KEYWORD arguments (`k(name = value)`): each boundary input is bound BY
+///   NAME to the supplied keyword of the same name. This is the only form an
+///   `%autoinputs` (keyword-only) kernel supports (§04: "no argument order can
+///   be inferred"), and a `%specinputs` kernel supports it too (§04: an
+///   explicit boundary supports keyword args in addition to positional).
+///   Binding is an exact bijection: every boundary input supplied once, and no
+///   keyword without a matching boundary name — a missing or extra name refuses
+///   (`None`), never leaving a boundary input free (a silent wrong density).
 /// - a single `record(...)` argument: each boundary input is bound BY FIELD
 ///   NAME (the `k(record(mu = 1.5))` idiom — `record_field`).
 /// - one or more POSITIONAL arguments: bound BY POSITION, arg\[i\] → the
-///   i-th `%specinputs` entry (the `mk(0.0)` idiom). Arity must match the
-///   input count exactly; a mismatch refuses (`None`) rather than guessing.
+///   i-th boundary entry (the `mk(0.0)` idiom). Positional binding is
+///   `%specinputs`-ONLY: an `%autoinputs` kernel is keyword-only (§04), so a
+///   positional application of one refuses rather than attach an argument to an
+///   arbitrarily-ordered traced input. Arity must match the input count
+///   exactly; a mismatch refuses (`None`) rather than guessing.
 ///
 /// Note the record form binds BY FIELD NAME even when the kernel has exactly
 /// one boundary input: `k(record(mu = 1.5))` looks up the input's own name as
@@ -152,9 +193,10 @@ pub(crate) fn substitute_ref(m: &mut Module, root: NodeId, name: Symbol, new_id:
 /// matching the input's name) cleanly refuses (`None`) via `record_field`'s
 /// `?`, rather than falling back to binding the whole record positionally.
 ///
-/// An `%autoinputs` (keyword-only, boundary-less) reification is out of
-/// scope here — `resolve_reified` already refuses it, since its traced input
-/// order is inference metadata this module doesn't have access to.
+/// An `%autoinputs` (keyword-only, boundary-less) reification IS handled: its
+/// auto-traced boundary names + refs are read from the module's auto-inputs
+/// side-table via [`boundary_inputs`] ([`Module::auto_inputs_of`]), so the
+/// keyword form binds them by name and the positional form refuses.
 ///
 /// `body` is commonly a bare `(%ref self x)` pointing at a `draw`-bound
 /// stochastic value — the `x ~ Dist(...); k = kernelof(x, ...)` idiom (see
@@ -170,10 +212,17 @@ pub(crate) fn reduce_kernel_application(m: &mut Module, node: NodeId) -> Option<
     let CallHead::User(callee) = c.head else {
         return None;
     };
-    if c.args.is_empty() {
+    let args: Vec<NodeId> = c.args.to_vec();
+    // Keyword arguments supplied at the application site (`k(name = value)`).
+    let kwargs: Vec<(Symbol, NodeId)> = c
+        .named
+        .iter()
+        .filter(|na| na.kind == NamedKind::Kwarg)
+        .map(|na| (na.name, na.value))
+        .collect();
+    if args.is_empty() && kwargs.is_empty() {
         return None;
     }
-    let args: Vec<NodeId> = c.args.to_vec();
     let kernel = resolve_reified(m, callee)?;
 
     let (resolved, _) = resolve_ref_one(m, kernel.body);
@@ -181,19 +230,38 @@ pub(crate) fn reduce_kernel_application(m: &mut Module, node: NodeId) -> Option<
         Some(law) => resolve_ref_one(m, law).0,
         None => resolved,
     };
+
+    // KEYWORD application: bind each boundary input by name. The only form an
+    // `%autoinputs` (keyword-only) kernel supports (§04); a `%specinputs` kernel
+    // supports it too. Refuse a keyword/positional mix, or any bijection failure
+    // (arity mismatch, or a boundary input with no matching keyword) rather than
+    // leave a boundary input free — a silent wrong density.
+    if !kwargs.is_empty() {
+        if !args.is_empty() || kwargs.len() != kernel.inputs.len() {
+            return None;
+        }
+        for (name, target) in &kernel.inputs {
+            let value = kwargs.iter().find(|(n, _)| n == name).map(|(_, v)| *v)?;
+            body = substitute_ref(m, body, target.name, value);
+        }
+        return Some(body);
+    }
+
     if args.len() == 1 && is_record(m, args[0]) {
         for (name, target) in kernel.inputs {
             let value = record_field(m, args[0], name)?;
             body = substitute_ref(m, body, target.name, value);
         }
-    } else if args.len() == kernel.inputs.len() {
+    } else if !kernel.auto && args.len() == kernel.inputs.len() {
+        // POSITIONAL binding — `%specinputs`-only. An `%autoinputs` kernel is
+        // keyword-only (§04), so a positional application of one falls through to
+        // the refuse below rather than binding by an uninferable position.
         for (arg, (_, target)) in args.iter().zip(kernel.inputs.iter()) {
             body = substitute_ref(m, body, target.name, *arg);
         }
     } else {
-        // Arity mismatch (more/fewer positional args than boundary inputs,
-        // with no record to bind by name instead) — refuse rather than
-        // mis-lower.
+        // Arity mismatch, or a positional application of a keyword-only
+        // `%autoinputs` kernel — refuse rather than mis-lower.
         return None;
     }
     Some(body)

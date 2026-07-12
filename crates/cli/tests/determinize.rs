@@ -27,6 +27,41 @@ fn determinize_lowers_a_gaussian_to_stdout() {
     );
 }
 
+/// `densityof` has no dedicated `builtin_*` primitive (§07 lists six
+/// `builtin_*`, only `builtin_logdensityof` for density); it lowers as
+/// `exp(<the logdensityof lowering>)` (§06). Self-contained CLI-corpus
+/// regression: a `densityof` query over a record-of-draws prior must lower
+/// (exit 0) to FlatPDL containing both `exp(` and `builtin_logdensityof`,
+/// mirroring `determinize_lowers_a_gaussian_to_stdout` above but for the
+/// plain-density query form.
+#[test]
+fn determinize_lowers_a_densityof_query_to_stdout() {
+    let dir =
+        std::env::temp_dir().join(format!("flatppl-det-cli-densityof-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let input = dir.join("d.flatppl");
+    std::fs::write(
+        &input,
+        "a = draw(Normal(mu = 0.0, sigma = 1.0))\nd = densityof(lawof(record(a = a)), record(a = 0.5))\n",
+    )
+    .unwrap();
+    let out = flatppl().arg("determinize").arg(&input).output().unwrap();
+    assert!(
+        out.status.success(),
+        "exit 0; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("builtin_logdensityof"),
+        "emitted FlatPDL:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("exp("),
+        "densityof must lower to exp(<logdensity>); emitted FlatPDL:\n{stdout}"
+    );
+}
+
 /// `determinize` resolves a `load_module` cross-module measure ref: the CLI
 /// must assemble the `ModuleBundle` (same cache-only resolver as `infer`) and
 /// pass it to `determinize_with`, or this refuses on an unresolved module ref
@@ -65,6 +100,47 @@ fn determinize_resolves_cross_module_load_module() {
     assert!(
         stdout.contains("builtin_logdensityof"),
         "emitted FlatPDL did not resolve the cross-module kernel:\n{stdout}"
+    );
+}
+
+/// `determinize` resolves a `load_module` cross-module `%autoinputs`
+/// (keyword/auto-traced) kernel APPLICATION: the submodule's boundary-less
+/// `k = functionof(Normal(mu = center, sigma = 1.0))` auto-traces its input
+/// `center`, and the host scores the keyword application `logdensityof(m.k(center
+/// = 0.0), 0.5)`. Mirrors `determinize_resolves_cross_module_load_module`, but the
+/// grafted kernel is keyword-only (§04): the CLI must graft, re-infer (repopulating
+/// `auto_inputs_of` on the grafted node), and β-reduce the keyword bind — or this
+/// refuses on the auto-traced boundary instead of lowering.
+#[test]
+fn determinize_resolves_cross_module_autoinputs_kernel() {
+    let dir =
+        std::env::temp_dir().join(format!("flatppl-det-cli-autoinputs-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("helpers.flatppl"),
+        "flatppl_compat = \"0.1\"\n\
+         center = elementof(reals)\n\
+         k = functionof(Normal(mu = center, sigma = 1.0))\n",
+    )
+    .unwrap();
+    let input = dir.join("model.flatppl");
+    std::fs::write(
+        &input,
+        "flatppl_compat = \"0.1\"\n\
+         m = load_module(\"helpers.flatppl\")\n\
+         lp = logdensityof(m.k(center = 0.0), 0.5)\n",
+    )
+    .unwrap();
+    let out = flatppl().arg("determinize").arg(&input).output().unwrap();
+    assert!(
+        out.status.success(),
+        "exit 0; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("builtin_logdensityof"),
+        "emitted FlatPDL did not resolve the cross-module %autoinputs kernel application:\n{stdout}"
     );
 }
 
