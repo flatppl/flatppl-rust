@@ -157,6 +157,28 @@ lp = logdensityof(post, record(theta1 = 0.5))";
     );
 }
 
+#[test]
+fn refuses_restrict_explicit_form_with_stray_kwarg() {
+    // `restrict(M, record(obs = …), bogus = 1.0)` carries the explicit 2-arg form
+    // PLUS a stray `%kwarg` the desugaring does not understand. Silently taking
+    // the 2 positional args and dropping `bogus` would mislower a malformed call;
+    // `rewrite_restrict` must refuse instead (refuse-don't-mislower).
+    let src = "\
+theta1 ~ Normal(mu = 0, sigma = 1)
+obs ~ Normal(mu = theta1, sigma = 1)
+joint_model = lawof(record(theta1 = theta1, obs = obs))
+observed_data = 2.5
+post = restrict(joint_model, record(obs = observed_data), bogus = 1.0)
+lp = logdensityof(post, record(theta1 = 0.5))";
+    let err = determinize(&parse_infer(src))
+        .expect_err("restrict's explicit 2-arg form with a stray kwarg must refuse");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("restrict"),
+        "refuse must name the restrict; got: {msg}"
+    );
+}
+
 /// The CAUSALLY-REVERSED disintegrate: selecting the UPSTREAM roots
 /// (`["theta1", "theta2"]`) leaves the DOWNSTREAM `obs` as the non-selected
 /// marginal. `obs ~ iid(Normal(mu = theta1, sigma = theta2), 10)` depends on
@@ -362,6 +384,41 @@ fn disintegrate_reversed_transitive_dep_refuses() {
     // transitively → refuse. Guards that the walk is transitive over deep deps.
     let err = determinize(&parse_infer(REVERSED_DISINTEGRATE_TRANSITIVE)).expect_err(
         "a reversed disintegrate whose non-selected closure reaches a selected root transitively must refuse",
+    );
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("disintegrate") || msg.contains("get"),
+        "refuse must name the reversed disintegrate; got: {msg}"
+    );
+}
+
+/// A reversed dependency that reaches the selected root ONLY through a
+/// `kernelof(...)`'s `%specinputs` boundary, NOT through the ordinary
+/// `children()` walk: `k`'s reified body (`record(dummy = 0.0)`) carries no
+/// reference to `theta1` at all — the only edge to `theta1` is the boundary
+/// input `boundary = theta1`. The non-selected field `k_field` (aliasing `k`)
+/// reaches `theta1` exclusively via that `%specinputs` cut, so
+/// `collect_reachable_bindings` must follow `Inputs::Spec` entries (not just
+/// plain child nodes) to see it — otherwise the guard would judge the split
+/// closed (wrongly) and lower a reversed selector.
+const REVERSED_DISINTEGRATE_VIA_SPECINPUTS: &str = "\
+theta1 ~ Normal(mu = 0, sigma = 1)
+theta2 ~ Exponential(rate = 1)
+k = kernelof(record(dummy = 0.0), boundary = theta1)
+obs ~ iid(Normal(mu = theta2, sigma = 1), 10)
+joint_model = lawof(record(theta1 = theta1, k_field = k, obs = obs))
+forward_kernel, prior = disintegrate([\"theta1\"], joint_model)";
+
+#[test]
+fn disintegrate_reversed_via_specinputs_boundary_refuses() {
+    // The non-selected `k_field` reaches the selected `theta1` ONLY via `k`'s
+    // `%specinputs` boundary (`boundary = theta1`), never via a body child ref —
+    // so this is sensitive to `collect_reachable_bindings` following
+    // `Inputs::Spec` entries. Regression coverage for that branch: delete the
+    // `Inputs::Spec`-following arm in `collect_reachable_bindings`
+    // (`src/disintegrate.rs`) and this test fails (the split wrongly succeeds).
+    let err = determinize(&parse_infer(REVERSED_DISINTEGRATE_VIA_SPECINPUTS)).expect_err(
+        "a reversed disintegrate reaching the selected root only through a %specinputs boundary must refuse",
     );
     let msg = format!("{err:?}");
     assert!(

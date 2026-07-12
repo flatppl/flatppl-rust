@@ -165,6 +165,10 @@ fn split_law_record(
     // and the selector is causally REVERSED → refuse (fail-closed,
     // refuse-don't-mislower). The reverse-direction disintegrate (§06 "two
     // formulations") is a separate follow-up, out of scope here.
+    // NOTE: one-hop resolution here can miss a chain-alias selected field (a
+    // bare-ref binding to another draw), so this guard alone isn't sufficient.
+    // Fail-closed by composition: `resolve_component_draw` (density.rs) refuses
+    // a selected field that is not a draw or a reference to a draw.
     let mut selected_bindings: HashSet<Symbol> = HashSet::new();
     for &(_, value) in &selected_fields {
         collect_selected_bindings(m, value, &mut selected_bindings);
@@ -357,8 +361,10 @@ fn collect_selected_bindings(m: &Module, start: NodeId, out: &mut HashSet<Symbol
 ///
 /// Returns `None` (caller refuses — refuse-don't-mislower) for any shape outside
 /// the explicit-DAG case this handles:
-/// - `restrict_node` is not a 2-arg `restrict` call, AND not a 1-arg `restrict`
-///   call carrying at least one keyword-splat entry;
+/// - `restrict_node` is not a 2-arg `restrict` call with no stray named args,
+///   AND not a 1-arg `restrict` call carrying at least one keyword-splat entry
+///   (a 2-arg call that ALSO carries a named arg — e.g. a malformed `restrict(M,
+///   x, bogus = …)` — refuses rather than silently dropping `bogus`);
 /// - `x` (arg1, explicit form) is not a `record(field…)` of observed values
 ///   (positional args or a non-`%field` named entry refuse);
 /// - the disintegration on `x`'s field names does not split
@@ -373,12 +379,14 @@ pub(crate) fn rewrite_restrict(m: &mut Module, restrict_node: NodeId) -> Option<
         Splat(Vec<(Symbol, NodeId)>),
     }
 
-    // 1. Recognize `restrict(M, x)` (explicit form, 2 positional args) or
-    //    `restrict(M, a = …, b = …)` (keyword-splat form: 1 positional arg +
-    //    at least one `%kwarg`).
+    // 1. Recognize `restrict(M, x)` (explicit form, 2 positional args, and NO
+    //    stray named args — a `restrict(M, x, bogus = …)` carries a kwarg this
+    //    desugaring does not understand, and silently taking just the 2
+    //    positionals would mislower the malformed call) or `restrict(M, a = …, b
+    //    = …)` (keyword-splat form: 1 positional arg + at least one `%kwarg`).
     let (measure, x_arg) = {
         let c = expect_builtin_call(m, restrict_node, "restrict")?;
-        if c.args.len() == 2 {
+        if c.args.len() == 2 && c.named.is_empty() {
             (c.args[0], XArg::Explicit(c.args[1]))
         } else if c.args.len() == 1 && !c.named.is_empty() {
             (
