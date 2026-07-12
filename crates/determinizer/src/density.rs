@@ -86,9 +86,11 @@
 //! arg2 is the parameter point θ (a record), NOT the variate; the variate is the
 //! `obs` baked into the likelihood. `K` is scored at `obs`, then each θ field is
 //! inlined into THIS query's density subtree only — a per-query substitution of
-//! `(%ref self <name>)` for the θ value (never a mutation of the shared module
-//! binding, so two likelihood queries over the same params keep distinct θ
-//! points) — §06 "Likelihood construction":
+//! `(%ref self <name>)` for the θ value, reaching THROUGH θ-dependent derived
+//! bindings (a kernel param `a = f_a(theta2)` is inlined as `f_a(<θ.theta2>)`, so
+//! a `builtin_logdensityof` term never dangles on an unbound `elementof` param) —
+//! never a mutation of the shared module binding, so two likelihood queries over
+//! the same params keep distinct θ points — §06 "Likelihood construction":
 //! `densityof(likelihoodof(K, obs), θ) = pdf(κ(θ), obs)`.
 //!
 //! **Joint likelihood** (§06 "Combining likelihoods"):
@@ -628,10 +630,13 @@ fn lower_likelihood_query(
         ));
     }
     // Inline this query's θ values into ITS OWN density subtree: substitute each
-    // `(%ref self <name>)` matching a θ field with that field's value node. No
-    // shared binding is mutated, so sibling queries over the same params keep
-    // their own θ points (fixes the cross-query parameter leak: two likelihood
-    // queries over shared params would otherwise clobber each other's θ).
+    // `(%ref self <name>)` matching a θ field with that field's value node, and
+    // reach THROUGH θ-dependent derived bindings (`a = f_a(theta2)`) by inlining a
+    // θ-substituted copy of their RHS. No shared binding is mutated, so sibling
+    // queries over the same params keep their own θ points (fixes the cross-query
+    // parameter leak: two likelihood queries over shared params would otherwise
+    // clobber each other's θ), and the density becomes self-contained w.r.t. θ —
+    // no `builtin_logdensityof` term is left reading an unbound `elementof` param.
     Ok(substitute_refs_by_name(m, density, &theta_map))
 }
 
@@ -662,38 +667,168 @@ fn theta_field_map(m: &Module, theta: NodeId) -> Result<Vec<(Symbol, NodeId)>, R
     Ok(fields)
 }
 
-/// Replace every `(%ref self <name>)` in the subtree at `root` with the node
-/// mapped from `<name>` in `map`, returning the (possibly new) root node id.
+/// Inline this query's θ into the density subtree at `root`, reaching THROUGH
+/// θ-dependent derived bindings, and return the (possibly new) root node id.
 ///
-/// Thin wrapper over the shared bottom-up rebuild [`crate::driver::map_tree`]
-/// (which also backs `driver::substitute_in_tree`): both walk the same
-/// `children()` enumeration and rebuild only-if-changed. This one keys on a
-/// `Ref(SelfMod, name)` leaf rather than a target NodeId — so one pass inlines
-/// ALL θ fields at once. A matched self-ref is a leaf, replaced wholesale before
-/// its (nonexistent) children recurse.
+/// Two leaf cases are inlined (everything else is left as a shared `(%ref self
+/// …)`, so no non-θ binding is duplicated):
+/// * a `(%ref self <name>)` where `<name>` is a θ FIELD → replaced by that field's
+///   value node (the original per-query substitution); and
+/// * a `(%ref self <x>)` where binding `x`'s RHS TRANSITIVELY depends on a θ param
+///   (a realistic forward model's kernel params are DERIVED — `a = f_a(theta2)`,
+///   `b = f_b(theta1, theta2)`) → replaced by a θ-inlined COPY of `x`'s RHS
+///   ([`theta_inlined_binding`]), so e.g. `a` becomes `f_a(<θ.theta2>)`. Without
+///   this, the density's `builtin_logdensityof(Normal, record(mu = a, sigma = b),
+///   …)` would read `a`/`b`, whose definitions dangle on the unbound
+///   `elementof(reals)` param bindings — an unevaluable ("no derivation for lp")
+///   density, a silent failure.
 ///
-/// **Scope limit (θ-capturing reification inputs).** `map_tree` walks
-/// `children()`, which does NOT include a `Call`'s [`flatppl_core::Inputs`] — the
-/// `(Symbol, Ref)` boundary entries of a `functionof` / `kernelof` reification.
-/// Such an entry's `Ref` CAN be `Ref(SelfMod, name)`, so a θ param captured as a
-/// reification boundary input would NOT be inlined by this walk (and an `Inputs`
-/// slot cannot hold a value node anyway — it is a name reference). The caller
-/// [`lower_likelihood_query`] therefore HARD REFUSES (in every build profile)
-/// when [`subtree_has_theta_capturing_input`] reports such a capture, so this
-/// walk is only ever reached for a density subtree free of θ-capturing inputs.
+/// A binding that is NOT θ-dependent (`f_a`, `c`, `observed_data`) stays a shared
+/// `(%ref self …)` ref — those bindings survive in the FlatPDL and evaluate on
+/// their own, so the density becomes self-contained w.r.t. θ WITHOUT mutating any
+/// shared binding (leak-free: two `logdensityof` queries over the same params keep
+/// distinct θ points — a global pin on `a`/`b` would clobber one with the other).
+///
+/// **Scope limit (θ-capturing reification inputs).** [`crate::driver::map_tree`]
+/// walks `children()`, which does NOT include a `Call`'s [`flatppl_core::Inputs`] —
+/// the `(Symbol, Ref)` boundary entries of a `functionof` / `kernelof`
+/// reification. A θ param captured there would NOT be inlined by this walk (and an
+/// `Inputs` slot cannot hold a value node anyway). The caller
+/// [`lower_likelihood_query`] therefore HARD REFUSES (in every build profile,
+/// BEFORE this runs) when [`subtree_has_theta_capturing_input`] reports such a
+/// capture — that guard follows `(%ref self …)` edges into bindings, so a θ param
+/// captured through a derived binding is caught too. The through-binding inline
+/// here does not bypass it: it runs only on a density subtree already cleared of
+/// θ-capturing reification inputs.
 fn substitute_refs_by_name(m: &mut Module, root: NodeId, map: &[(Symbol, NodeId)]) -> NodeId {
+    // Pre-build the θ-inlined copy of every θ-dependent binding referenced as a
+    // `(%ref self …)` leaf anywhere in `root`'s syntactic (children) tree — the
+    // exact set of self-refs the `map_tree` pass below will meet. Each build
+    // recurses into its own θ-dependent dependencies first, so `memo` is fully
+    // populated (deps before dependents) by the time the top-level pass reads it.
+    // `memo[name] = Some(sub)` marks a θ-dependent binding (inline `sub`);
+    // `None` marks a binding that does not depend on θ (leave the ref).
+    let mut memo: std::collections::HashMap<Symbol, Option<NodeId>> =
+        std::collections::HashMap::new();
+    let mut building: std::collections::HashSet<Symbol> = std::collections::HashSet::new();
+    for name in syntactic_self_ref_names(m, root) {
+        if !map.iter().any(|(n, _)| *n == name) {
+            theta_inlined_binding(m, name, map, &mut memo, &mut building);
+        }
+    }
     crate::driver::map_tree(m, root, &mut |m, id| {
         if let Node::Ref(Ref {
             ns: RefNs::SelfMod,
             name,
         }) = m.node(id)
         {
+            // A θ field → its value node (the original per-query substitution).
             if let Some((_, value)) = map.iter().find(|(n, _)| n == name) {
                 return Some(*value);
+            }
+            // A θ-dependent derived binding → its θ-inlined RHS copy.
+            if let Some(Some(sub)) = memo.get(name) {
+                return Some(*sub);
             }
         }
         None
     })
+}
+
+/// The distinct `(%ref self <name>)` names appearing in `root`'s SYNTACTIC subtree
+/// — the `children()` walk only, NOT descending into referenced bindings nor into
+/// reification `Inputs` — i.e. exactly the self-ref leaves
+/// [`crate::driver::map_tree`] will encounter when rewriting `root`. `seen` guards
+/// shared DAG nodes.
+fn syntactic_self_ref_names(m: &Module, root: NodeId) -> Vec<Symbol> {
+    let mut out: Vec<Symbol> = Vec::new();
+    let mut seen: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
+    let mut stack = vec![root];
+    while let Some(id) = stack.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        if let Node::Ref(Ref {
+            ns: RefNs::SelfMod,
+            name,
+        }) = m.node(id)
+        {
+            if !out.contains(name) {
+                out.push(*name);
+            }
+            continue; // a ref is a leaf — it has no children
+        }
+        for c in m.node(id).children() {
+            stack.push(c);
+        }
+    }
+    out
+}
+
+/// Build (memoized) the θ-inlined copy of binding `name`'s RHS, returning
+/// `Some(sub)` when `name` is θ-DEPENDENT (its RHS transitively references a θ
+/// param, so `sub != rhs`) and `None` when it is not (leave the shared ref).
+///
+/// θ-dependence is detected structurally: after θ-inlining `name`'s RHS (θ fields
+/// → θ values, and nested θ-dependent binding refs → their memoized copies), the
+/// node is UNCHANGED iff no θ influence was reachable. So a plain `c = 5` / `f_a =
+/// par -> c * par` maps to `None` (untouched), while `a = f_a(theta2)` maps to
+/// `Some(f_a(<θ.theta2>))`.
+///
+/// Only `children()`-reachable self-refs are followed (matching
+/// [`crate::driver::map_tree`]); a self-ref sitting solely in a reification
+/// `Inputs` boundary is left to the [`subtree_has_theta_capturing_input`] refuse
+/// (a θ-capturing boundary already refused upstream). `building` bounds the
+/// recursion against reference cycles: a binding met while it is still being built
+/// (a malformed non-DAG cycle) yields `None` (left as a ref) rather than looping.
+fn theta_inlined_binding(
+    m: &mut Module,
+    name: Symbol,
+    map: &[(Symbol, NodeId)],
+    memo: &mut std::collections::HashMap<Symbol, Option<NodeId>>,
+    building: &mut std::collections::HashSet<Symbol>,
+) -> Option<NodeId> {
+    if let Some(done) = memo.get(&name) {
+        return *done;
+    }
+    let Some(bid) = m.binding_by_name(name) else {
+        return None; // unbound self-ref: nothing to inline
+    };
+    let rhs = m.binding(bid).rhs;
+    if !building.insert(name) {
+        // Reference cycle — terminate rather than recurse. A well-formed FlatPPL
+        // module's bindings are a DAG, so this only guards a malformed input.
+        return None;
+    }
+    // Populate `memo` for every θ-dependent binding referenced (as a child leaf)
+    // by this RHS, so the `map_tree` pass below can inline them wholesale.
+    for r in syntactic_self_ref_names(m, rhs) {
+        if !map.iter().any(|(n, _)| *n == r) {
+            theta_inlined_binding(m, r, map, memo, building);
+        }
+    }
+    let sub = crate::driver::map_tree(m, rhs, &mut |m, id| {
+        if let Node::Ref(Ref {
+            ns: RefNs::SelfMod,
+            name: n,
+        }) = m.node(id)
+        {
+            if let Some((_, value)) = map.iter().find(|(nm, _)| nm == n) {
+                return Some(*value);
+            }
+            if let Some(Some(inner)) = memo.get(n) {
+                return Some(*inner);
+            }
+        }
+        None
+    });
+    building.remove(&name);
+    // `map_tree` returns the ORIGINAL node id when nothing changed → not
+    // θ-dependent; a fresh id → θ-dependent (some θ value / dependent binding was
+    // inlined).
+    let result = (sub != rhs).then_some(sub);
+    memo.insert(name, result);
+    result
 }
 
 /// True iff some `functionof` / `kernelof` reification reachable from `root`
