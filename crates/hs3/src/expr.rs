@@ -13,7 +13,7 @@
 //!   ternary     = or ( '?' ternary ':' ternary )?   — right-associative
 //!   or          = and ( '||' and )*
 //!   and         = equality ( '&&' equality )*
-//!   equality    = cmp ( ('==' | '!=' | '===' | '!==') cmp )?  — always rejected
+//!   equality    = cmp ( ('==' | '!=' | '===' | '!==') … )?  — rejected at operator detection (RHS not parsed)
 //!   cmp         = add ( ('<' | '<=' | '>' | '>=') add )?      — non-associative
 //!   add_expr    = mul_expr ( ('+' | '-') mul_expr )*
 //!   mul_expr    = unary   ( ('*' | '/') unary   )*
@@ -568,8 +568,9 @@ impl<'b, 'm> Parser<'b, 'm> {
     }
 
     // cmp = add ( ('<'|'<='|'>'|'>=') add )?   — NON-associative: chaining
-    // like `a < b < c` compares a boolean to a real, ill-typed in both
-    // languages, so it is rejected outright.
+    // like `a < b < c` is almost always a modeling error (the C reading
+    // compares the boolean `a < b` to a real) and has no faithful FlatPPL
+    // lowering, so it is rejected outright.
     fn parse_cmp(&mut self) -> Result<NodeId> {
         let lhs = self.parse_add()?;
         let op = match self.peek() {
