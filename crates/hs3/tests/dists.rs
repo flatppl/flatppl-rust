@@ -451,7 +451,7 @@ fn mixture_nonextended_converts() {
 }
 
 // ---------------------------------------------------------------------------
-// relativistic_breit_wigner_dist → still deferred (Unsupported)
+// relativistic_breit_wigner_dist → still deferred (Unimplemented)
 // ---------------------------------------------------------------------------
 
 const RBW_JSON: &str = r#"{
@@ -695,7 +695,7 @@ fn bincounts_extended_edges_form_converts() {
 }
 
 // ---------------------------------------------------------------------------
-// bincounts multi-axis → Err(Unsupported)
+// bincounts multi-axis → Err(Unimplemented)
 // ---------------------------------------------------------------------------
 
 const BINCOUNTS_MULTIAXIS_JSON: &str = r#"{

@@ -16,6 +16,8 @@ use std::collections::BTreeMap;
 ///     the N iid scalar observations (06-measure-algebra.md). A multi-axis
 ///     dataset is observed against the table itself: each row is one event over
 ///     the observable axes (spec §03: a multivariate event sample IS a table).
+///     A scalar (`point`) datum is observed as the binding itself (`self_ref`),
+///     with no `iid` plate.
 ///   - a number: a scalar observation literal (no plate).
 ///   - any other string resolves to no dataset (binned/histfactory observations
 ///     are consumed by the channel-assembly path, never reached by name here),
@@ -27,6 +29,12 @@ pub fn emit_likelihood(
     lk: &Likelihood,
     data_shapes: &BTreeMap<String, DataShape>,
 ) -> Result<()> {
+    if !lk.aux_distributions.is_empty() {
+        return Err(Error::Unimplemented(format!(
+            "likelihood `{}` declares aux_distributions (auxiliary likelihood terms)",
+            lk.name
+        )));
+    }
     if lk.distributions.is_empty() {
         return Ok(());
     }
@@ -43,17 +51,23 @@ pub fn emit_likelihood(
                         lk.name
                     ))
                 })?;
-                iid_n = Some(shape.n_rows);
-                let table = b.self_ref(name);
-                if shape.columns.len() == 1 {
-                    // Single observable: observe the column vector `<name>.<axis>`
-                    // (`get(table, "axis")` prints as `<name>.<axis>`; a table
-                    // column is a vector, spec §03) — N iid scalar observations.
-                    let key = b.str_lit(&shape.columns[0]);
-                    b.call("get", &[table, key])
+                if shape.scalar {
+                    // A `point` datum: scalar binding, no iid plate.
+                    b.self_ref(name)
                 } else {
-                    // Multivariate event sample: observe the table directly.
-                    table
+                    iid_n = Some(shape.n_rows);
+                    let table = b.self_ref(name);
+                    if shape.columns.len() == 1 {
+                        // Single observable: observe the column vector
+                        // `<name>.<axis>` (`get(table, "axis")` prints as
+                        // `<name>.<axis>`; a table column is a vector, spec
+                        // §03) — N iid scalar observations.
+                        let key = b.str_lit(&shape.columns[0]);
+                        b.call("get", &[table, key])
+                    } else {
+                        // Multivariate event sample: observe the table directly.
+                        table
+                    }
                 }
             }
             Some(serde_json::Value::Number(n)) => b.lit_real(n.as_f64().unwrap_or(0.0)),
@@ -93,6 +107,7 @@ mod tests {
         DataShape {
             columns: columns.iter().map(|s| s.to_string()).collect(),
             n_rows,
+            scalar: false,
         }
     }
 
@@ -110,6 +125,7 @@ mod tests {
             name: "L".into(),
             distributions: vec!["obs_model".into(), "aux_model".into()],
             data: vec![serde_json::json!("obs_data"), serde_json::json!("aux_obs")],
+            aux_distributions: vec![],
         };
         let mut shapes = BTreeMap::new();
         shapes.insert("obs_data".to_string(), shape(&["x"], 1));
@@ -135,6 +151,7 @@ mod tests {
             name: "L".into(),
             distributions: vec!["model".into()],
             data: vec![serde_json::json!("d")],
+            aux_distributions: vec![],
         };
         let mut shapes = BTreeMap::new();
         shapes.insert("d".to_string(), shape(&["x"], 3));
@@ -163,6 +180,7 @@ mod tests {
             name: "L".into(),
             distributions: vec!["model".into()],
             data: vec![serde_json::json!("d")],
+            aux_distributions: vec![],
         };
         let mut shapes = BTreeMap::new();
         shapes.insert("d".to_string(), shape(&["x", "y"], 5));
@@ -191,6 +209,7 @@ mod tests {
             distributions: vec!["model".into()],
             // `nowhere` is not a known dataset — a dangling reference.
             data: vec![serde_json::json!("nowhere")],
+            aux_distributions: vec![],
         };
         let empty = BTreeMap::new();
         let mut b = Builder::new(&mut m);
@@ -223,6 +242,7 @@ mod tests {
             name: "L".into(),
             distributions: vec!["model".into()],
             data: vec![serde_json::json!("decoy")],
+            aux_distributions: vec![],
         };
         let empty = BTreeMap::new();
         let mut b = Builder::new(&mut m);

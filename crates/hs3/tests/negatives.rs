@@ -17,6 +17,29 @@ fn assert_err_hs3(label: &str, json: &str, needle: &str) {
     }
 }
 
+/// Assert that `read_hs3(json)` errors with the `Error::Unimplemented` prefix
+/// (never `Unsupported`) AND that the message contains `needle`. Use this for
+/// silently-dropped-field rejections: the testsuite classifies the
+/// `unimplemented HS3 construct:` prefix as a clean skip, so a site that
+/// flips to `Unsupported` must fail this assertion even if the body text is
+/// unchanged.
+fn assert_unimplemented_hs3(label: &str, json: &str, needle: &str) {
+    match flatppl_hs3::read_hs3(json) {
+        Ok(_) => panic!("{label}: expected Err, got Ok"),
+        Err(e) => {
+            let msg = e.to_string();
+            assert!(
+                msg.starts_with("unimplemented HS3 construct:"),
+                "{label}: error should use the `unimplemented HS3 construct:` prefix, got: {msg}"
+            );
+            assert!(
+                msg.contains(needle),
+                "{label}: error message should mention `{needle}`, got: {msg}"
+            );
+        }
+    }
+}
+
 /// Assert that `read_pyhf(json)` errors and the message contains `needle`.
 fn assert_err_pyhf(label: &str, json: &str, needle: &str) {
     match flatppl_hs3::read_pyhf(json) {
@@ -452,5 +475,108 @@ fn same_variate_three_factor_product_mixed_measures_errs() {
             {"name":"m2","value":0.0},{"name":"s2","value":1.0},{"name":"lam","value":3.0}
         ]}]}"#,
         "reference measure",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Not-yet-implemented constructs use the `unimplemented HS3 construct:` prefix
+// (Error::Unimplemented) so the testsuite can classify them as clean skips;
+// invalid documents keep `unsupported HS3 construct:` (Error::Unsupported).
+// ---------------------------------------------------------------------------
+#[test]
+fn multi_axis_bincounts_is_unimplemented_prefix() {
+    assert_err_hs3(
+        "multi_axis_bincounts_prefix",
+        r#"{"distributions":[{"name":"b","type":"bincounts_extended_dist",
+            "rate":"r","distribution":"inner",
+            "axes":[{"nbins":2,"min":0.0,"max":1.0},{"nbins":2,"min":0.0,"max":1.0}]},
+            {"name":"inner","type":"gaussian_dist","mean":"mu","sigma":"s","x":"x"}],
+            "parameter_points":[]}"#,
+        "unimplemented HS3 construct:",
+    );
+}
+
+#[test]
+fn invalid_document_keeps_unsupported_prefix() {
+    assert_err_hs3(
+        "duplicate_name_prefix",
+        r#"{"distributions":[
+            {"name":"dup","type":"gaussian_dist","mean":"mu","sigma":"s","x":"x1"},
+            {"name":"dup","type":"gaussian_dist","mean":"mu2","sigma":"s2","x":"x2"}],
+            "parameter_points":[]}"#,
+        "unsupported HS3 construct:",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Fields the converter previously DESERIALIZED PAST silently — a weighted
+// dataset became an unweighted model, aux likelihood terms vanished. Presence
+// must now fail loud (Unimplemented) until actually lowered.
+// ---------------------------------------------------------------------------
+#[test]
+fn aux_distributions_errs() {
+    assert_unimplemented_hs3(
+        "aux_distributions",
+        r#"{"distributions":[{"name":"g","type":"gaussian_dist","mean":"mu","sigma":"s","x":"x"}],
+            "data":[{"name":"d","type":"unbinned","entries":[[1.0]],
+                     "axes":[{"name":"x","min":0.0,"max":5.0}]}],
+            "likelihoods":[{"name":"L","distributions":["g"],"data":["d"],
+                            "aux_distributions":["g"]}],
+            "parameter_points":[]}"#,
+        "aux_distributions",
+    );
+}
+
+#[test]
+fn weighted_unbinned_data_errs() {
+    assert_unimplemented_hs3(
+        "weighted_data",
+        r#"{"distributions":[{"name":"g","type":"gaussian_dist","mean":"mu","sigma":"s","x":"x"}],
+            "data":[{"name":"d","type":"unbinned","entries":[[1.0],[2.0]],
+                     "weights":[0.5,0.5],"axes":[{"name":"x","min":0.0,"max":5.0}]}],
+            "parameter_points":[]}"#,
+        "weights",
+    );
+}
+
+#[test]
+fn entries_uncertainties_errs() {
+    assert_unimplemented_hs3(
+        "entries_uncertainties",
+        r#"{"distributions":[{"name":"g","type":"gaussian_dist","mean":"mu","sigma":"s","x":"x"}],
+            "data":[{"name":"d","type":"unbinned","entries":[[1.0]],
+                     "entries_uncertainties":[[0.1]],
+                     "axes":[{"name":"x","min":0.0,"max":5.0}]}],
+            "parameter_points":[]}"#,
+        "entries_uncertainties",
+    );
+}
+
+#[test]
+fn binned_uncertainty_block_errs() {
+    assert_unimplemented_hs3(
+        "binned_uncertainty",
+        r#"{"distributions":[{"name":"g","type":"gaussian_dist","mean":"mu","sigma":"s","x":"x"}],
+            "data":[{"name":"d","type":"binned","contents":[3.0,4.0],
+                     "uncertainty":{"type":"gaussian_uncertainty","sigma":[0.5,0.5]},
+                     "axes":[{"name":"x","min":0.0,"max":2.0}]}],
+            "parameter_points":[]}"#,
+        "uncertainty",
+    );
+}
+
+/// A `point` datum carrying an `uncertainty` block must still be rejected: this
+/// pins the datum_columns-before-value ordering in build_table/data_shapes (the
+/// rejection must fire before the scalar `value` branch short-circuits it).
+#[test]
+fn point_uncertainty_errs() {
+    assert_unimplemented_hs3(
+        "point_uncertainty",
+        r#"{"distributions":[{"name":"g","type":"gaussian_dist","mean":"mu","sigma":"s","x":"x"}],
+            "data":[{"name":"d","type":"point","value":1.27,
+                     "uncertainty":{"type":"gaussian_uncertainty","sigma":0.1}}],
+            "likelihoods":[{"name":"L","distributions":["g"],"data":["d"]}],
+            "parameter_points":[]}"#,
+        "uncertainty",
     );
 }

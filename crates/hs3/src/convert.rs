@@ -837,7 +837,7 @@ fn emit_histfactory_channels(m: &mut Module, doc: &Document) -> Result<()> {
             .iter()
             .any(|s| s.modifiers.iter().any(|mo| mo.kind == "lumi"))
         {
-            return Err(Error::Unsupported(format!(
+            return Err(Error::Unimplemented(format!(
                 "channel `{}`: native histfactory lumi modifier requires a measurement \
                  lumi-config (sigma); not supported on the native HS3 path",
                 d.name
@@ -1182,7 +1182,7 @@ mod tests {
     #[test]
     fn native_histfactory_lumi_modifier_errors() {
         let err = crate::read(NATIVE_LUMI_JSON).expect_err("native lumi must be rejected");
-        assert!(matches!(err, crate::Error::Unsupported(_)), "got: {err}");
+        assert!(matches!(err, crate::Error::Unimplemented(_)), "got: {err}");
         let msg = err.to_string();
         assert!(
             msg.contains("lumi") && msg.contains("lumi-config"),
