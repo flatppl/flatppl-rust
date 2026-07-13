@@ -68,6 +68,21 @@ pub struct Datum {
     /// and ignores any extra keys (e.g. `nbins`).
     #[serde(default)]
     pub axes: Vec<DomainAxis>,
+    /// Per-event weights (unbinned data). Parsed so presence fails loud — a
+    /// weighted sample lowered without its weights is a silently wrong model.
+    #[serde(default)]
+    pub weights: Option<serde_json::Value>,
+    /// Per-event coordinate uncertainties (unbinned data). Parsed to fail loud.
+    #[serde(default)]
+    pub entries_uncertainties: Option<serde_json::Value>,
+    /// Uncertainty block (binned data / point data). Parsed to fail loud.
+    #[serde(default)]
+    pub uncertainty: Option<serde_json::Value>,
+    /// A `point` datum's scalar observation value. Not yet consumed by any
+    /// lowering — Task 3 (point-data lowering) reads it.
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub value: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -118,6 +133,11 @@ pub struct Likelihood {
     pub distributions: Vec<String>,
     #[serde(default)]
     pub data: Vec<serde_json::Value>,
+    /// Auxiliary distributions (regularizer/penalty likelihood terms with
+    /// implicit observations). Parsed so presence fails loud instead of
+    /// silently dropping likelihood terms.
+    #[serde(default)]
+    pub aux_distributions: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]

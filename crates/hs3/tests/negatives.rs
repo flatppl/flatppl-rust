@@ -484,3 +484,60 @@ fn invalid_document_keeps_unsupported_prefix() {
         "unsupported HS3 construct:",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Fields the converter previously DESERIALIZED PAST silently — a weighted
+// dataset became an unweighted model, aux likelihood terms vanished. Presence
+// must now fail loud (Unimplemented) until actually lowered.
+// ---------------------------------------------------------------------------
+#[test]
+fn aux_distributions_errs() {
+    assert_err_hs3(
+        "aux_distributions",
+        r#"{"distributions":[{"name":"g","type":"gaussian_dist","mean":"mu","sigma":"s","x":"x"}],
+            "data":[{"name":"d","type":"unbinned","entries":[[1.0]],
+                     "axes":[{"name":"x","min":0.0,"max":5.0}]}],
+            "likelihoods":[{"name":"L","distributions":["g"],"data":["d"],
+                            "aux_distributions":["g"]}],
+            "parameter_points":[]}"#,
+        "aux_distributions",
+    );
+}
+
+#[test]
+fn weighted_unbinned_data_errs() {
+    assert_err_hs3(
+        "weighted_data",
+        r#"{"distributions":[{"name":"g","type":"gaussian_dist","mean":"mu","sigma":"s","x":"x"}],
+            "data":[{"name":"d","type":"unbinned","entries":[[1.0],[2.0]],
+                     "weights":[0.5,0.5],"axes":[{"name":"x","min":0.0,"max":5.0}]}],
+            "parameter_points":[]}"#,
+        "weights",
+    );
+}
+
+#[test]
+fn entries_uncertainties_errs() {
+    assert_err_hs3(
+        "entries_uncertainties",
+        r#"{"distributions":[{"name":"g","type":"gaussian_dist","mean":"mu","sigma":"s","x":"x"}],
+            "data":[{"name":"d","type":"unbinned","entries":[[1.0]],
+                     "entries_uncertainties":[[0.1]],
+                     "axes":[{"name":"x","min":0.0,"max":5.0}]}],
+            "parameter_points":[]}"#,
+        "entries_uncertainties",
+    );
+}
+
+#[test]
+fn binned_uncertainty_block_errs() {
+    assert_err_hs3(
+        "binned_uncertainty",
+        r#"{"distributions":[{"name":"g","type":"gaussian_dist","mean":"mu","sigma":"s","x":"x"}],
+            "data":[{"name":"d","type":"binned","contents":[3.0,4.0],
+                     "uncertainty":{"type":"gaussian_uncertainty","sigma":[0.5,0.5]},
+                     "axes":[{"name":"x","min":0.0,"max":2.0}]}],
+            "parameter_points":[]}"#,
+        "uncertainty",
+    );
+}

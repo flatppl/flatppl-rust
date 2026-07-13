@@ -46,6 +46,24 @@ pub(crate) fn emit_data(m: &mut Module, doc: &Document) -> Result<()> {
 /// unbinned sample or an axis-count/arity mismatch (either would silently drop
 /// or mislabel columns).
 pub(crate) fn datum_columns(d: &Datum) -> Result<Vec<String>> {
+    if d.weights.is_some() {
+        return Err(Error::Unimplemented(format!(
+            "datum `{}` carries per-event weights",
+            d.name
+        )));
+    }
+    if d.entries_uncertainties.is_some() {
+        return Err(Error::Unimplemented(format!(
+            "datum `{}` carries entries_uncertainties",
+            d.name
+        )));
+    }
+    if d.uncertainty.is_some() {
+        return Err(Error::Unimplemented(format!(
+            "datum `{}` carries an uncertainty block",
+            d.name
+        )));
+    }
     if !d.entries.is_empty() {
         let arity = d.entries[0].len();
         for (i, e) in d.entries.iter().enumerate() {

@@ -27,6 +27,12 @@ pub fn emit_likelihood(
     lk: &Likelihood,
     data_shapes: &BTreeMap<String, DataShape>,
 ) -> Result<()> {
+    if !lk.aux_distributions.is_empty() {
+        return Err(Error::Unimplemented(format!(
+            "likelihood `{}` declares aux_distributions (auxiliary likelihood terms)",
+            lk.name
+        )));
+    }
     if lk.distributions.is_empty() {
         return Ok(());
     }
@@ -110,6 +116,7 @@ mod tests {
             name: "L".into(),
             distributions: vec!["obs_model".into(), "aux_model".into()],
             data: vec![serde_json::json!("obs_data"), serde_json::json!("aux_obs")],
+            aux_distributions: vec![],
         };
         let mut shapes = BTreeMap::new();
         shapes.insert("obs_data".to_string(), shape(&["x"], 1));
@@ -135,6 +142,7 @@ mod tests {
             name: "L".into(),
             distributions: vec!["model".into()],
             data: vec![serde_json::json!("d")],
+            aux_distributions: vec![],
         };
         let mut shapes = BTreeMap::new();
         shapes.insert("d".to_string(), shape(&["x"], 3));
@@ -163,6 +171,7 @@ mod tests {
             name: "L".into(),
             distributions: vec!["model".into()],
             data: vec![serde_json::json!("d")],
+            aux_distributions: vec![],
         };
         let mut shapes = BTreeMap::new();
         shapes.insert("d".to_string(), shape(&["x", "y"], 5));
@@ -191,6 +200,7 @@ mod tests {
             distributions: vec!["model".into()],
             // `nowhere` is not a known dataset — a dangling reference.
             data: vec![serde_json::json!("nowhere")],
+            aux_distributions: vec![],
         };
         let empty = BTreeMap::new();
         let mut b = Builder::new(&mut m);
@@ -223,6 +233,7 @@ mod tests {
             name: "L".into(),
             distributions: vec!["model".into()],
             data: vec![serde_json::json!("decoy")],
+            aux_distributions: vec![],
         };
         let empty = BTreeMap::new();
         let mut b = Builder::new(&mut m);
