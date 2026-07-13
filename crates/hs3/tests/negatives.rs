@@ -541,3 +541,19 @@ fn binned_uncertainty_block_errs() {
         "uncertainty",
     );
 }
+
+/// A `point` datum carrying an `uncertainty` block must still be rejected: this
+/// pins the datum_columns-before-value ordering in build_table/data_shapes (the
+/// rejection must fire before the scalar `value` branch short-circuits it).
+#[test]
+fn point_uncertainty_errs() {
+    assert_err_hs3(
+        "point_uncertainty",
+        r#"{"distributions":[{"name":"g","type":"gaussian_dist","mean":"mu","sigma":"s","x":"x"}],
+            "data":[{"name":"d","type":"point","value":1.27,
+                     "uncertainty":{"type":"gaussian_uncertainty","sigma":0.1}}],
+            "likelihoods":[{"name":"L","distributions":["g"],"data":["d"]}],
+            "parameter_points":[]}"#,
+        "uncertainty",
+    );
+}
