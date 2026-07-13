@@ -13,9 +13,13 @@ Catalogue(
         Builtin(name: "VonMises",          sig: Distribution(domain: Scalar(Real), support: Reals,         mass: Normalized, params: ["mu", "kappa"])),
         Builtin(name: "Laplace",           sig: Distribution(domain: Scalar(Real), support: Reals,         mass: Normalized, params: ["location", "scale"])),
         Builtin(name: "LogNormal",         sig: Distribution(domain: Scalar(Real), support: PosReals,      mass: Normalized, params: ["mu", "sigma"])),
-        Builtin(name: "Gamma",             sig: Distribution(domain: Scalar(Real), support: PosReals,      mass: Normalized, params: ["shape", "rate"])),
+        // Gamma/ChiSquared: spec §08 — support `nonnegreals`, not `posreals`.
+        // The density is nonzero at x=0 whenever shape <= 1 (Exponential IS
+        // Gamma(1, rate); ChiSquared(k) = Gamma(k/2, 1/2), so ChiSquared(2) =
+        // Exponential(1/2)) — scipy oracle: Gamma(1,1)@0=1.0, ChiSquared(2)@0=0.5.
+        Builtin(name: "Gamma",             sig: Distribution(domain: Scalar(Real), support: NonNegReals,   mass: Normalized, params: ["shape", "rate"])),
         Builtin(name: "InverseGamma",      sig: Distribution(domain: Scalar(Real), support: PosReals,      mass: Normalized, params: ["shape", "scale"])),
-        Builtin(name: "ChiSquared",        sig: Distribution(domain: Scalar(Real), support: PosReals,      mass: Normalized, params: ["k"])),
+        Builtin(name: "ChiSquared",        sig: Distribution(domain: Scalar(Real), support: NonNegReals,   mass: Normalized, params: ["k"])),
         Builtin(name: "Exponential",       sig: Distribution(domain: Scalar(Real), support: NonNegReals,   mass: Normalized, params: ["rate"])),
         Builtin(name: "Weibull",           sig: Distribution(domain: Scalar(Real), support: NonNegReals,   mass: Normalized, params: ["shape", "scale"])),
         Builtin(name: "Beta",              sig: Distribution(domain: Scalar(Real), support: UnitInterval,  mass: Normalized, params: ["alpha", "beta"])),
