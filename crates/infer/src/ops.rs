@@ -3427,8 +3427,8 @@ pub(crate) fn distribution_support_static(name: &str, param_dim: &dyn Fn(&str) -
         "Uniform" => Unknown,
         "Normal" | "GeneralizedNormal" | "Cauchy" | "StudentT" | "Logistic" | "VonMises"
         | "Laplace" => Reals,
-        "LogNormal" | "Gamma" | "InverseGamma" | "ChiSquared" | "Pareto" => PosReals,
-        "Exponential" | "Weibull" => NonNegReals,
+        "LogNormal" | "InverseGamma" | "Pareto" => PosReals,
+        "Exponential" | "Weibull" | "Gamma" | "ChiSquared" => NonNegReals,
         "Beta" => UnitInterval,
         "Bernoulli" => Booleans,
         "Categorical" => PosIntegers,

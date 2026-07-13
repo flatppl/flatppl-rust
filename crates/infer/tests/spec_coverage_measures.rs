@@ -222,6 +222,52 @@ fn exponential_weibull_support_nonnegreals() {
     );
 }
 
+/// Gamma and ChiSquared both have support `nonnegreals`, not `posreals`: the
+/// density is nonzero at x=0 whenever shape <= 1 (Exponential IS Gamma(1,
+/// rate) — scipy oracle Gamma(shape=1,rate=1)@0 = 1.0; ChiSquared(k) =
+/// Gamma(k/2, 1/2), so ChiSquared(2) = Exponential(1/2) — scipy oracle
+/// ChiSquared(2)@0 = 0.5). §08 lists `nonnegreals` for both.
+#[test]
+fn gamma_chisquared_support_nonnegreals() {
+    let src_gamma = "m = Gamma(shape = 2.0, rate = 1.0)";
+    let out_gamma = ir(src_gamma);
+    println!("Gamma:\n{out_gamma}");
+    assert!(
+        out_gamma.contains("nonnegreals"),
+        "Gamma support must be nonnegreals; got:\n{out_gamma}"
+    );
+
+    let src_chisq = "m = ChiSquared(k = 2.0)";
+    let out_chisq = ir(src_chisq);
+    println!("ChiSquared:\n{out_chisq}");
+    assert!(
+        out_chisq.contains("nonnegreals"),
+        "ChiSquared support must be nonnegreals; got:\n{out_chisq}"
+    );
+}
+
+/// Negative control for the Gamma/ChiSquared nonnegreals change: InverseGamma
+/// and LogNormal have density 0 at x=0 (scipy oracle: both @0 = 0.0) and MUST
+/// stay `posreals` — the fix is surgical to Gamma/ChiSquared only.
+#[test]
+fn inversegamma_lognormal_support_stays_posreals() {
+    let src_ig = "m = InverseGamma(shape = 2.0, scale = 1.0)";
+    let out_ig = ir(src_ig);
+    println!("InverseGamma:\n{out_ig}");
+    assert!(
+        out_ig.contains("posreals"),
+        "InverseGamma support must stay posreals; got:\n{out_ig}"
+    );
+
+    let src_ln = "m = LogNormal(mu = 0.0, sigma = 1.0)";
+    let out_ln = ir(src_ln);
+    println!("LogNormal:\n{out_ln}");
+    assert!(
+        out_ln.contains("posreals"),
+        "LogNormal support must stay posreals; got:\n{out_ln}"
+    );
+}
+
 /// Pareto(1,1) has domain %scalar real, support `posreals`, mass %normalized.
 #[test]
 fn pareto_support_is_posreals() {

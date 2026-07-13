@@ -43,16 +43,16 @@ fn pushfwd_log_over_positive_support_lowers() {
 
 #[test]
 fn pushfwd_log_over_gamma_lowers_like_exponential() {
-    // `Gamma`'s inferred support is `posreals`; `Exponential`'s is `nonnegreals`.
-    // `Exponential` ≡ `Gamma(shape = 1)`, so the two MUST lower alike: both are
-    // continuous a.e.-positive bases. This pins that the guard accepts BOTH the
-    // strictly-positive `posreals` and the continuous-nonneg `nonnegreals` cases,
-    // not just one of them.
+    // `Gamma` and `Exponential` both have inferred support `nonnegreals`
+    // (`Exponential` ≡ `Gamma(shape = 1)`), so the two MUST lower alike: both
+    // are continuous a.e.-positive bases. This pins that the guard accepts the
+    // continuous-nonneg `nonnegreals` case regardless of which distribution
+    // produced it.
     let p =
         pir("d = pushfwd(fn(log(_)), Gamma(shape = 2.0, rate = 1.0))\nlp = logdensityof(d, 0.5)");
     assert!(
         p.contains("builtin_logdensityof") && p.contains("(sub ") && p.contains("(exp "),
-        "Gamma (posreals) must lower like Exponential (nonnegreals):\n{p}"
+        "Gamma (nonnegreals) must lower like Exponential (nonnegreals):\n{p}"
     );
 }
 
@@ -86,8 +86,8 @@ fn pushfwd_log_over_real_support_still_refuses() {
 fn pushfwd_pow_over_positive_support_lowers() {
     // `pow` with a literal exponent over a positive-support base: f_inv =
     // pow(_, 1/k), logvol = log|k| + (k−1)·log x — defined on a positive support.
-    // `Gamma` (`posreals`) now lowers (was conservatively refused by the coarse
-    // structural type).
+    // `Gamma` (`nonnegreals`) now lowers (was conservatively refused by the
+    // coarse structural type).
     let p = pir(
         "d = pushfwd(fn(pow(_, 2.0)), Gamma(shape = 2.0, rate = 1.0))\nlp = logdensityof(d, 0.5)",
     );
