@@ -17,6 +17,29 @@ fn assert_err_hs3(label: &str, json: &str, needle: &str) {
     }
 }
 
+/// Assert that `read_hs3(json)` errors with the `Error::Unimplemented` prefix
+/// (never `Unsupported`) AND that the message contains `needle`. Use this for
+/// silently-dropped-field rejections: the testsuite classifies the
+/// `unimplemented HS3 construct:` prefix as a clean skip, so a site that
+/// flips to `Unsupported` must fail this assertion even if the body text is
+/// unchanged.
+fn assert_unimplemented_hs3(label: &str, json: &str, needle: &str) {
+    match flatppl_hs3::read_hs3(json) {
+        Ok(_) => panic!("{label}: expected Err, got Ok"),
+        Err(e) => {
+            let msg = e.to_string();
+            assert!(
+                msg.starts_with("unimplemented HS3 construct:"),
+                "{label}: error should use the `unimplemented HS3 construct:` prefix, got: {msg}"
+            );
+            assert!(
+                msg.contains(needle),
+                "{label}: error message should mention `{needle}`, got: {msg}"
+            );
+        }
+    }
+}
+
 /// Assert that `read_pyhf(json)` errors and the message contains `needle`.
 fn assert_err_pyhf(label: &str, json: &str, needle: &str) {
     match flatppl_hs3::read_pyhf(json) {
@@ -492,7 +515,7 @@ fn invalid_document_keeps_unsupported_prefix() {
 // ---------------------------------------------------------------------------
 #[test]
 fn aux_distributions_errs() {
-    assert_err_hs3(
+    assert_unimplemented_hs3(
         "aux_distributions",
         r#"{"distributions":[{"name":"g","type":"gaussian_dist","mean":"mu","sigma":"s","x":"x"}],
             "data":[{"name":"d","type":"unbinned","entries":[[1.0]],
@@ -506,7 +529,7 @@ fn aux_distributions_errs() {
 
 #[test]
 fn weighted_unbinned_data_errs() {
-    assert_err_hs3(
+    assert_unimplemented_hs3(
         "weighted_data",
         r#"{"distributions":[{"name":"g","type":"gaussian_dist","mean":"mu","sigma":"s","x":"x"}],
             "data":[{"name":"d","type":"unbinned","entries":[[1.0],[2.0]],
@@ -518,7 +541,7 @@ fn weighted_unbinned_data_errs() {
 
 #[test]
 fn entries_uncertainties_errs() {
-    assert_err_hs3(
+    assert_unimplemented_hs3(
         "entries_uncertainties",
         r#"{"distributions":[{"name":"g","type":"gaussian_dist","mean":"mu","sigma":"s","x":"x"}],
             "data":[{"name":"d","type":"unbinned","entries":[[1.0]],
@@ -531,7 +554,7 @@ fn entries_uncertainties_errs() {
 
 #[test]
 fn binned_uncertainty_block_errs() {
-    assert_err_hs3(
+    assert_unimplemented_hs3(
         "binned_uncertainty",
         r#"{"distributions":[{"name":"g","type":"gaussian_dist","mean":"mu","sigma":"s","x":"x"}],
             "data":[{"name":"d","type":"binned","contents":[3.0,4.0],
@@ -547,7 +570,7 @@ fn binned_uncertainty_block_errs() {
 /// rejection must fire before the scalar `value` branch short-circuits it).
 #[test]
 fn point_uncertainty_errs() {
-    assert_err_hs3(
+    assert_unimplemented_hs3(
         "point_uncertainty",
         r#"{"distributions":[{"name":"g","type":"gaussian_dist","mean":"mu","sigma":"s","x":"x"}],
             "data":[{"name":"d","type":"point","value":1.27,

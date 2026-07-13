@@ -16,6 +16,8 @@ use std::collections::BTreeMap;
 ///     the N iid scalar observations (06-measure-algebra.md). A multi-axis
 ///     dataset is observed against the table itself: each row is one event over
 ///     the observable axes (spec §03: a multivariate event sample IS a table).
+///     A scalar (`point`) datum is observed as the binding itself (`self_ref`),
+///     with no `iid` plate.
 ///   - a number: a scalar observation literal (no plate).
 ///   - any other string resolves to no dataset (binned/histfactory observations
 ///     are consumed by the channel-assembly path, never reached by name here),
