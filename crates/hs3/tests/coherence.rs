@@ -47,7 +47,8 @@ const RECOGNIZED_DIST_KINDS: &[&str] = &[
     "chebychev_dist",
     "efficiency_product_pdf_dist",
     // Tabulated-but-deferred: these have an explicit dispatch arm that returns
-    // Error::Unsupported (NOT UnknownDistType), so they belong in the guard.
+    // Error::Unimplemented or Error::Unsupported (NOT UnknownDistType), so
+    // they belong in the guard.
     "relativistic_breit_wigner_dist",
     "histfactory_dist",
 ];

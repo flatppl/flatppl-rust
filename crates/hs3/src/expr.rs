@@ -23,9 +23,9 @@
 //!             `min max pow` (2-arg)
 //!   Constants: `PI` → lit_real(π), `EULER` → lit_real(e)
 //!
-//! NOT supported (rejected with `Error::Unsupported`, never silently parsed):
-//!   comparisons `== != < <= > >=`, boolean `&& || !`, and the ternary
-//!   conditional `a ? b : c` — there is no ternary/ifelse parse rule.
+//! NOT YET supported (rejected with `Error::Unimplemented`, never silently
+//! parsed): comparisons `== != < <= > >=`, boolean `&& || !`, and the ternary
+//! conditional `a ? b : c` — there is no ternary/ifelse parse rule.
 
 use crate::builder::Builder;
 use crate::error::{Error, Result};
@@ -451,37 +451,37 @@ impl<'b, 'm> Parser<'b, 'm> {
 
     fn check_unsupported(&self, t: &Tok) -> Result<()> {
         match t {
-            Tok::EqEq => Err(Error::Unsupported(
+            Tok::EqEq => Err(Error::Unimplemented(
                 "expression operator '==' not supported".into(),
             )),
-            Tok::BangEq => Err(Error::Unsupported(
+            Tok::BangEq => Err(Error::Unimplemented(
                 "expression operator '!=' not supported".into(),
             )),
-            Tok::Lt => Err(Error::Unsupported(
+            Tok::Lt => Err(Error::Unimplemented(
                 "expression operator '<' not supported".into(),
             )),
-            Tok::Le => Err(Error::Unsupported(
+            Tok::Le => Err(Error::Unimplemented(
                 "expression operator '<=' not supported".into(),
             )),
-            Tok::Gt => Err(Error::Unsupported(
+            Tok::Gt => Err(Error::Unimplemented(
                 "expression operator '>' not supported".into(),
             )),
-            Tok::Ge => Err(Error::Unsupported(
+            Tok::Ge => Err(Error::Unimplemented(
                 "expression operator '>=' not supported".into(),
             )),
-            Tok::AmpAmp => Err(Error::Unsupported(
+            Tok::AmpAmp => Err(Error::Unimplemented(
                 "expression operator '&&' not supported".into(),
             )),
-            Tok::PipePipe => Err(Error::Unsupported(
+            Tok::PipePipe => Err(Error::Unimplemented(
                 "expression operator '||' not supported".into(),
             )),
-            Tok::Bang => Err(Error::Unsupported(
+            Tok::Bang => Err(Error::Unimplemented(
                 "expression operator '!' not supported".into(),
             )),
-            Tok::Question => Err(Error::Unsupported(
+            Tok::Question => Err(Error::Unimplemented(
                 "expression operator '?' (ternary) not supported".into(),
             )),
-            Tok::Colon => Err(Error::Unsupported(
+            Tok::Colon => Err(Error::Unimplemented(
                 "expression operator ':' (ternary) not supported".into(),
             )),
             _ => Ok(()),
@@ -830,8 +830,8 @@ mod tests {
         let mut b = Builder::new(&mut m);
         let result = parse_expr_inline(&mut b, "x == 1");
         assert!(
-            matches!(result, Err(Error::Unsupported(_))),
-            "expected Unsupported error for `==`, got: {:?}",
+            matches!(result, Err(Error::Unimplemented(_))),
+            "expected Unimplemented error for `==`, got: {:?}",
             result
         );
     }
@@ -864,8 +864,8 @@ mod tests {
         let mut b = Builder::new(&mut m);
         let result = parse_expr_inline(&mut b, "x > 0 ? x : 0");
         assert!(
-            matches!(result, Err(Error::Unsupported(_))),
-            "expected Unsupported error for ternary, got: {:?}",
+            matches!(result, Err(Error::Unimplemented(_))),
+            "expected Unimplemented error for ternary, got: {:?}",
             result
         );
     }

@@ -15,6 +15,11 @@ pub enum Error {
     UnresolvedRef(String),
     /// A construct outside this importer's supported subset.
     Unsupported(String),
+    /// A valid HS3 construct the importer does not lower YET (distinct from
+    /// `Unsupported`, which marks invalid/ill-defined documents). The display
+    /// prefix `unimplemented HS3 construct: ` is a stable marker the
+    /// conversion testsuite matches to classify a clean SKIP.
+    Unimplemented(String),
     /// Same-named modifiers declare incompatible constraint types.
     IncompatibleConstraint { parameter: String },
     /// No observation data found for the named channel.
@@ -39,6 +44,7 @@ impl fmt::Display for Error {
             Error::UnknownModifier(t) => write!(f, "unsupported histfactory modifier: {t}"),
             Error::UnresolvedRef(n) => write!(f, "unresolved reference: {n}"),
             Error::Unsupported(w) => write!(f, "unsupported HS3 construct: {w}"),
+            Error::Unimplemented(w) => write!(f, "unimplemented HS3 construct: {w}"),
             Error::IncompatibleConstraint { parameter } => {
                 write!(
                     f,

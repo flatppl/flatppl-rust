@@ -676,7 +676,7 @@ pub fn emit_distribution(
         }
 
         // HS3 RBW uses a multi-channel parameterization; no 1:1 FlatPPL map yet
-        "relativistic_breit_wigner_dist" => Err(Error::Unsupported(
+        "relativistic_breit_wigner_dist" => Err(Error::Unimplemented(
             "relativistic_breit_wigner_dist: HS3 uses a multi-channel parameterization with no 1:1 FlatPPL map".into(),
         )),
         "histfactory_dist" => Err(Error::Unsupported(
@@ -691,10 +691,11 @@ pub fn emit_distribution(
 /// Axis forms:
 ///   `{nbins: N, min: lo, max: hi}` → linear edge vector with N+1 edges.
 ///   `{edges: [...]}` → literal edge vector.
-/// Multi-axis (>1 element) is unsupported and returns `Err(Error::Unsupported)`.
+/// Multi-axis (>1 element) is not yet implemented and returns
+/// `Err(Error::Unimplemented)`.
 fn build_bins(b: &mut Builder, axes: &[serde_json::Value]) -> Result<NodeId> {
     if axes.len() != 1 {
-        return Err(Error::Unsupported(
+        return Err(Error::Unimplemented(
             "multi-axis bincounts not yet supported".into(),
         ));
     }

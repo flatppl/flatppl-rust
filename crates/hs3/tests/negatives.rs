@@ -454,3 +454,33 @@ fn same_variate_three_factor_product_mixed_measures_errs() {
         "reference measure",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Not-yet-implemented constructs use the `unimplemented HS3 construct:` prefix
+// (Error::Unimplemented) so the testsuite can classify them as clean skips;
+// invalid documents keep `unsupported HS3 construct:` (Error::Unsupported).
+// ---------------------------------------------------------------------------
+#[test]
+fn multi_axis_bincounts_is_unimplemented_prefix() {
+    assert_err_hs3(
+        "multi_axis_bincounts_prefix",
+        r#"{"distributions":[{"name":"b","type":"bincounts_extended_dist",
+            "rate":"r","distribution":"inner",
+            "axes":[{"nbins":2,"min":0.0,"max":1.0},{"nbins":2,"min":0.0,"max":1.0}]},
+            {"name":"inner","type":"gaussian_dist","mean":"mu","sigma":"s","x":"x"}],
+            "parameter_points":[]}"#,
+        "unimplemented HS3 construct:",
+    );
+}
+
+#[test]
+fn invalid_document_keeps_unsupported_prefix() {
+    assert_err_hs3(
+        "duplicate_name_prefix",
+        r#"{"distributions":[
+            {"name":"dup","type":"gaussian_dist","mean":"mu","sigma":"s","x":"x1"},
+            {"name":"dup","type":"gaussian_dist","mean":"mu2","sigma":"s2","x":"x2"}],
+            "parameter_points":[]}"#,
+        "unsupported HS3 construct:",
+    );
+}
