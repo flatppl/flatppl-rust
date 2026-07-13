@@ -21,7 +21,8 @@
 //!   unary `-` → `neg`
 //!   Math fns: `exp log sqrt abs sin cos tan asin acos atan` (1-arg)
 //!             `min max pow` (2-arg)
-//!   Constants: `PI` → lit_real(π), `EULER` → lit_real(e)
+//!   Constants: `PI` → lit_real(π), `EULER` → lit_real(e),
+//!              `TRUE`/`FALSE` → lit_bool
 //!
 //! NOT YET supported (rejected with `Error::Unimplemented`, never silently
 //! parsed): comparisons `== != < <= > >=`, boolean `&& || !`, and the ternary
@@ -71,7 +72,8 @@ pub fn parse_expr_inline(b: &mut Builder, src: &str) -> Result<NodeId> {
 /// reference, never a function call (`sqrt`, `abs`, `sin`, …). Results are
 /// deduplicated, preserving first-occurrence order.
 ///
-/// The constants `PI`/`Pi`/`pi` and `EULER`/`Euler` are inlined as literals by
+/// The constants `PI`/`Pi`/`pi`, `EULER`/`Euler`, and the boolean literals
+/// `TRUE`/`True`/`true`/`FALSE`/`False`/`false` are inlined as literals by
 /// the parser (never module references), so they are excluded here too.
 ///
 /// A malformed expression that fails to tokenize yields an empty list rather
@@ -89,7 +91,19 @@ pub fn free_identifiers(src: &str) -> Vec<String> {
                 continue;
             }
             // Parser-inlined constants are never module references.
-            if matches!(name.as_str(), "PI" | "Pi" | "pi" | "EULER" | "Euler") {
+            if matches!(
+                name.as_str(),
+                "PI" | "Pi"
+                    | "pi"
+                    | "EULER"
+                    | "Euler"
+                    | "TRUE"
+                    | "True"
+                    | "true"
+                    | "FALSE"
+                    | "False"
+                    | "false"
+            ) {
                 continue;
             }
             if !out.iter().any(|s| s == name) {
@@ -615,12 +629,15 @@ impl<'b, 'm> Parser<'b, 'm> {
     }
 
     /// Map an identifier to a FlatPPL node.
-    /// Constants `PI` and `EULER` are inlined as real literals.
+    /// Constants `PI` and `EULER` are inlined as real literals; `TRUE`/`FALSE`
+    /// (and their case variants) are inlined as boolean literals.
     /// All other identifiers become `self_ref` nodes.
     fn ident_node(&mut self, name: &str) -> NodeId {
         match name {
             "PI" | "Pi" | "pi" => self.b.lit_real(std::f64::consts::PI),
             "EULER" | "Euler" => self.b.lit_real(std::f64::consts::E),
+            "TRUE" | "True" | "true" => self.b.lit_bool(true),
+            "FALSE" | "False" | "false" => self.b.lit_bool(false),
             other => self.b.self_ref(other),
         }
     }
@@ -777,6 +794,28 @@ mod tests {
         );
         let rt = parse(&text);
         assert!(rt.is_ok(), "round-trip failed: {:?}\n{text}", rt.err());
+    }
+
+    // HS3 §3.1 boolean literals lower to FlatPPL booleans, never free params.
+    #[test]
+    fn boolean_literals_lower() {
+        let text = parsed_text("TRUE");
+        assert!(text.contains("result = true"), "got:\n{text}");
+        let text = parsed_text("FALSE");
+        assert!(text.contains("result = false"), "got:\n{text}");
+    }
+
+    #[test]
+    fn boolean_literals_are_not_free_identifiers() {
+        assert!(free_identifiers("TRUE + x").iter().all(|s| s != "TRUE"));
+        assert!(free_identifiers("FALSE").is_empty());
+        // All accepted spellings, mirroring the PI/Pi/pi precedent.
+        for s in ["TRUE", "True", "true", "FALSE", "False", "false"] {
+            assert!(
+                free_identifiers(s).is_empty(),
+                "`{s}` must not be a free identifier"
+            );
+        }
     }
 
     #[test]
