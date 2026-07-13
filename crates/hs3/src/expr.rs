@@ -9,24 +9,36 @@
 //! in `generic_function`).
 //!
 //! Grammar summary (precedence, lowest to highest):
-//!   expr        = add_expr
+//!   expr        = ternary
+//!   ternary     = or ( '?' ternary ':' ternary )?   — right-associative
+//!   or          = and ( '||' and )*
+//!   and         = equality ( '&&' equality )*
+//!   equality    = cmp ( ('==' | '!=' | '===' | '!==') cmp )?  — always rejected
+//!   cmp         = add ( ('<' | '<=' | '>' | '>=') add )?      — non-associative
 //!   add_expr    = mul_expr ( ('+' | '-') mul_expr )*
 //!   mul_expr    = unary   ( ('*' | '/') unary   )*
-//!   unary       = '-' unary  |  pow_expr
+//!   unary       = '-' unary  |  '!' unary  |  pow_expr
 //!   pow_expr    = atom ('^' unary)*    — right-associative
 //!   atom        = NUMBER | IDENT | '(' expr ')' | IDENT '(' args ')'
 //!
 //! FlatPPL builtin mapping:
 //!   `+` → `add`, `-` → `sub`, `*` → `mul`, `/` → `divide`, `^` → `pow`
-//!   unary `-` → `neg`
+//!   unary `-` → `neg`, unary `!` → `lnot`
+//!   `<` → `lt`, `<=` → `le`, `>` → `gt`, `>=` → `ge`
+//!   `&&` → `land`, `||` → `lor`
+//!   `a ? b : c` → `ifelse(a, b, c)`
 //!   Math fns: `exp log sqrt abs sin cos tan asin acos atan` (1-arg)
 //!             `min max pow` (2-arg)
 //!   Constants: `PI` → lit_real(π), `EULER` → lit_real(e),
 //!              `TRUE`/`FALSE` → lit_bool
 //!
-//! NOT YET supported (rejected with `Error::Unimplemented`, never silently
-//! parsed): comparisons `== != < <= > >=`, boolean `&& || !`, and the ternary
-//! conditional `a ? b : c` — there is no ternary/ifelse parse rule.
+//! NOT supported (rejected with `Error::Unimplemented`, never silently
+//! parsed): equality `== != === !==` — FlatPPL restricts `equal`/`unequal` to
+//! discrete domains (§07 "Comparison functions") and HS3 expression operands
+//! are untyped reals, so no honest lowering exists. Chained comparisons
+//! (`a < b < c`) are rejected too (`Error::Unsupported`): the grammar is
+//! non-associative at the `cmp` level, so this is a genuine parse error, not
+//! an unimplemented-but-valid construct.
 
 use crate::builder::Builder;
 use crate::error::{Error, Result};
@@ -223,9 +235,11 @@ enum Tok {
     LParen,
     RParen,
     Comma,
-    // error tokens for unsupported operators
+    // comparison / logic / ternary operators
     EqEq,
     BangEq,
+    EqEqEq,
+    BangEqEq,
     Lt,
     Le,
     Gt,
@@ -251,6 +265,8 @@ fn token_repr(t: &Tok) -> &'static str {
         Tok::Comma => ",",
         Tok::EqEq => "==",
         Tok::BangEq => "!=",
+        Tok::EqEqEq => "===",
+        Tok::BangEqEq => "!==",
         Tok::Lt => "<",
         Tok::Le => "<=",
         Tok::Gt => ">",
@@ -337,7 +353,10 @@ fn tokenize(src: &str) -> Result<Vec<Tok>> {
                 i += 1;
             }
             '=' => {
-                if i + 1 < chars.len() && chars[i + 1] == '=' {
+                if i + 2 < chars.len() && chars[i + 1] == '=' && chars[i + 2] == '=' {
+                    toks.push(Tok::EqEqEq);
+                    i += 3;
+                } else if i + 1 < chars.len() && chars[i + 1] == '=' {
                     toks.push(Tok::EqEq);
                     i += 2;
                 } else {
@@ -347,7 +366,10 @@ fn tokenize(src: &str) -> Result<Vec<Tok>> {
                 }
             }
             '!' => {
-                if i + 1 < chars.len() && chars[i + 1] == '=' {
+                if i + 2 < chars.len() && chars[i + 1] == '=' && chars[i + 2] == '=' {
+                    toks.push(Tok::BangEqEq);
+                    i += 3;
+                } else if i + 1 < chars.len() && chars[i + 1] == '=' {
                     toks.push(Tok::BangEq);
                     i += 2;
                 } else {
@@ -415,6 +437,22 @@ fn tokenize(src: &str) -> Result<Vec<Tok>> {
 // Pratt / recursive-descent parser
 // ---------------------------------------------------------------------------
 
+/// Free helper (not a method): the spec-grounded equality rejection.
+/// HS3 `==`/`!=` are approx-equal on floats (implementation-defined ULP
+/// tolerance) and `===`/`!==` exact; FlatPPL restricts `equal`/`unequal`
+/// to discrete domains (§07 "Comparison functions") and HS3 expressions
+/// are untyped, so no honest lowering exists. `Unimplemented` (not
+/// `Unsupported`): a document using them is valid HS3 — the testsuite
+/// must SKIP it, never hard-fail it.
+fn equality_unsupported(op: &str) -> Error {
+    Error::Unimplemented(format!(
+        "expression operator '{op}' cannot be lowered: FlatPPL restricts \
+         equality to discrete domains and HS3 expression operands are \
+         untyped reals — use <, <=, >, >= or a discrete cast \
+         (round/floor/ceil)"
+    ))
+}
+
 struct Parser<'b, 'm> {
     tokens: &'b [Tok],
     pos: usize,
@@ -463,53 +501,97 @@ impl<'b, 'm> Parser<'b, 'm> {
         }
     }
 
-    fn check_unsupported(&self, t: &Tok) -> Result<()> {
-        match t {
-            Tok::EqEq => Err(Error::Unimplemented(
-                "expression operator '==' not supported".into(),
-            )),
-            Tok::BangEq => Err(Error::Unimplemented(
-                "expression operator '!=' not supported".into(),
-            )),
-            Tok::Lt => Err(Error::Unimplemented(
-                "expression operator '<' not supported".into(),
-            )),
-            Tok::Le => Err(Error::Unimplemented(
-                "expression operator '<=' not supported".into(),
-            )),
-            Tok::Gt => Err(Error::Unimplemented(
-                "expression operator '>' not supported".into(),
-            )),
-            Tok::Ge => Err(Error::Unimplemented(
-                "expression operator '>=' not supported".into(),
-            )),
-            Tok::AmpAmp => Err(Error::Unimplemented(
-                "expression operator '&&' not supported".into(),
-            )),
-            Tok::PipePipe => Err(Error::Unimplemented(
-                "expression operator '||' not supported".into(),
-            )),
-            Tok::Bang => Err(Error::Unimplemented(
-                "expression operator '!' not supported".into(),
-            )),
-            Tok::Question => Err(Error::Unimplemented(
-                "expression operator '?' (ternary) not supported".into(),
-            )),
-            Tok::Colon => Err(Error::Unimplemented(
-                "expression operator ':' (ternary) not supported".into(),
-            )),
-            _ => Ok(()),
+    // expr = ternary
+    //
+    // §07 note ("Logic and conditionals"): `ifelse` and `land`/`lor` do NOT
+    // guarantee short-circuit evaluation; HS3 §3.1 makes no laziness promise
+    // either, so the lowering is semantics-preserving on values.
+    fn parse_expr(&mut self) -> Result<NodeId> {
+        self.parse_ternary()
+    }
+
+    // ternary = or ( '?' ternary ':' ternary )?   — right-associative
+    fn parse_ternary(&mut self) -> Result<NodeId> {
+        let cond = self.parse_or()?;
+        if !matches!(self.peek(), Some(Tok::Question)) {
+            return Ok(cond);
+        }
+        self.advance();
+        let then_branch = self.parse_ternary()?;
+        match self.peek() {
+            Some(Tok::Colon) => {
+                self.advance();
+            }
+            _ => {
+                return Err(Error::Unsupported(
+                    "expression parser: ternary `?` without matching `:`".into(),
+                ));
+            }
+        }
+        let else_branch = self.parse_ternary()?;
+        Ok(self.b.call("ifelse", &[cond, then_branch, else_branch]))
+    }
+
+    // or = and ( '||' and )*
+    fn parse_or(&mut self) -> Result<NodeId> {
+        let mut lhs = self.parse_and()?;
+        while matches!(self.peek(), Some(Tok::PipePipe)) {
+            self.advance();
+            let rhs = self.parse_and()?;
+            lhs = self.b.call("lor", &[lhs, rhs]);
+        }
+        Ok(lhs)
+    }
+
+    // and = equality ( '&&' equality )*
+    fn parse_and(&mut self) -> Result<NodeId> {
+        let mut lhs = self.parse_equality()?;
+        while matches!(self.peek(), Some(Tok::AmpAmp)) {
+            self.advance();
+            let rhs = self.parse_equality()?;
+            lhs = self.b.call("land", &[lhs, rhs]);
+        }
+        Ok(lhs)
+    }
+
+    // equality = cmp — the four HS3 equality operators are recognized here
+    // and rejected (see `equality_unsupported`).
+    fn parse_equality(&mut self) -> Result<NodeId> {
+        let lhs = self.parse_cmp()?;
+        match self.peek() {
+            Some(Tok::EqEq) => Err(equality_unsupported("==")),
+            Some(Tok::BangEq) => Err(equality_unsupported("!=")),
+            Some(Tok::EqEqEq) => Err(equality_unsupported("===")),
+            Some(Tok::BangEqEq) => Err(equality_unsupported("!==")),
+            _ => Ok(lhs),
         }
     }
 
-    // expr = add_expr
-    fn parse_expr(&mut self) -> Result<NodeId> {
-        let node = self.parse_add()?;
-        // Reject unsupported trailing operators
-        if let Some(t) = self.peek() {
-            self.check_unsupported(t)?;
+    // cmp = add ( ('<'|'<='|'>'|'>=') add )?   — NON-associative: chaining
+    // like `a < b < c` compares a boolean to a real, ill-typed in both
+    // languages, so it is rejected outright.
+    fn parse_cmp(&mut self) -> Result<NodeId> {
+        let lhs = self.parse_add()?;
+        let op = match self.peek() {
+            Some(Tok::Lt) => "lt",
+            Some(Tok::Le) => "le",
+            Some(Tok::Gt) => "gt",
+            Some(Tok::Ge) => "ge",
+            _ => return Ok(lhs),
+        };
+        self.advance();
+        let rhs = self.parse_add()?;
+        if matches!(
+            self.peek(),
+            Some(Tok::Lt) | Some(Tok::Le) | Some(Tok::Gt) | Some(Tok::Ge)
+        ) {
+            return Err(Error::Unsupported(
+                "expression parser: chained comparison (a < b < c) is not \
+                 well-formed — split into `a < b && b < c`"
+                    .into(),
+            ));
         }
-        Ok(node)
+        Ok(self.b.call(op, &[lhs, rhs]))
     }
 
     // add_expr = mul_expr ( ('+' | '-') mul_expr )*
@@ -527,11 +609,7 @@ impl<'b, 'm> Parser<'b, 'm> {
                     let rhs = self.parse_mul()?;
                     lhs = self.b.call("sub", &[lhs, rhs]);
                 }
-                Some(t) => {
-                    self.check_unsupported(t)?;
-                    break;
-                }
-                None => break,
+                _ => break,
             }
         }
         Ok(lhs)
@@ -558,14 +636,20 @@ impl<'b, 'm> Parser<'b, 'm> {
         Ok(lhs)
     }
 
-    // unary = '-' unary | pow_expr
+    // unary = '-' unary | '!' unary | pow_expr
     fn parse_unary(&mut self) -> Result<NodeId> {
-        if matches!(self.peek(), Some(Tok::Minus)) {
-            self.advance();
-            let operand = self.parse_unary()?;
-            Ok(self.b.call("neg", &[operand]))
-        } else {
-            self.parse_pow()
+        match self.peek() {
+            Some(Tok::Minus) => {
+                self.advance();
+                let operand = self.parse_unary()?;
+                Ok(self.b.call("neg", &[operand]))
+            }
+            Some(Tok::Bang) => {
+                self.advance();
+                let operand = self.parse_unary()?;
+                Ok(self.b.call("lnot", &[operand]))
+            }
+            _ => self.parse_pow(),
         }
     }
 
@@ -897,16 +981,86 @@ mod tests {
         assert!(free_identifiers("@@@").is_empty());
     }
 
+    // §07 lowerings: comparisons → lt/le/gt/ge, booleans → land/lor/lnot,
+    // ternary → ifelse. Spec: docs 07-functions.md "Comparison functions",
+    // "Logic and conditionals".
     #[test]
-    fn unsupported_ternary_fails_loud() {
-        let mut m = Module::new();
-        let mut b = Builder::new(&mut m);
-        let result = parse_expr_inline(&mut b, "x > 0 ? x : 0");
+    fn comparison_operators_lower() {
+        for (src, call) in [
+            ("x < 1.0", "lt(x, 1"),
+            ("x <= 1.0", "le(x, 1"),
+            ("x > 1.0", "gt(x, 1"),
+            ("x >= 1.0", "ge(x, 1"),
+        ] {
+            let text = parsed_text(src);
+            assert!(
+                text.contains(call),
+                "`{src}` should contain `{call}`, got:\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn boolean_operators_lower() {
+        let text = parsed_text("x < 1.0 && y > 2.0");
+        assert!(text.contains("land(lt(x, 1"), "got:\n{text}");
+        let text = parsed_text("x < 1.0 || y > 2.0");
+        assert!(text.contains("lor(lt(x, 1"), "got:\n{text}");
+        let text = parsed_text("!(x < 1.0)");
+        assert!(text.contains("lnot(lt(x, 1"), "got:\n{text}");
+    }
+
+    #[test]
+    fn ternary_lowers_to_ifelse_right_assoc() {
+        let text = parsed_text("x > 0.0 ? 1.0 : x > -1.0 ? 2.0 : 3.0");
+        // Right-associative: else-branch nests another ifelse.
+        assert!(text.contains("ifelse(gt(x, 0"), "got:\n{text}");
+        assert!(text.matches("ifelse(").count() == 2, "got:\n{text}");
+    }
+
+    #[test]
+    fn precedence_and_binds_tighter_than_or() {
+        // a || b && c  ≡  a || (b && c)
+        let text = parsed_text("x > 0.0 || y > 0.0 && z > 0.0");
+        assert!(text.contains("lor(gt(x, 0"), "got:\n{text}");
+        assert!(text.contains("land(gt(y, 0"), "got:\n{text}");
+    }
+
+    #[test]
+    fn comparison_is_non_associative() {
+        let err = {
+            let mut m = Module::new();
+            let mut b = Builder::new(&mut m);
+            parse_expr_inline(&mut b, "1.0 < x < 3.0").unwrap_err()
+        };
+        let msg = err.to_string();
         assert!(
-            matches!(result, Err(Error::Unimplemented(_))),
-            "expected Unimplemented error for ternary, got: {:?}",
-            result
+            msg.contains("chained comparison"),
+            "chained comparison must be rejected, got: {msg}"
         );
+    }
+
+    #[test]
+    fn equality_operators_reject_with_spec_grounds() {
+        for (src, op) in [
+            ("x == 1.0", "=="),
+            ("x != 1.0", "!="),
+            ("x === 1.0", "==="),
+            ("x !== 1.0", "!=="),
+        ] {
+            let err = {
+                let mut m = Module::new();
+                let mut b = Builder::new(&mut m);
+                parse_expr_inline(&mut b, src).unwrap_err()
+            };
+            let msg = err.to_string();
+            assert!(
+                msg.starts_with("unimplemented HS3 construct:")
+                    && msg.contains(op)
+                    && msg.contains("discrete"),
+                "`{src}`: expected prefixed spec-grounded rejection naming `{op}`, got: {msg}"
+            );
+        }
     }
 
     #[test]
