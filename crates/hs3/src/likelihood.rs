@@ -49,17 +49,23 @@ pub fn emit_likelihood(
                         lk.name
                     ))
                 })?;
-                iid_n = Some(shape.n_rows);
-                let table = b.self_ref(name);
-                if shape.columns.len() == 1 {
-                    // Single observable: observe the column vector `<name>.<axis>`
-                    // (`get(table, "axis")` prints as `<name>.<axis>`; a table
-                    // column is a vector, spec §03) — N iid scalar observations.
-                    let key = b.str_lit(&shape.columns[0]);
-                    b.call("get", &[table, key])
+                if shape.scalar {
+                    // A `point` datum: scalar binding, no iid plate.
+                    b.self_ref(name)
                 } else {
-                    // Multivariate event sample: observe the table directly.
-                    table
+                    iid_n = Some(shape.n_rows);
+                    let table = b.self_ref(name);
+                    if shape.columns.len() == 1 {
+                        // Single observable: observe the column vector
+                        // `<name>.<axis>` (`get(table, "axis")` prints as
+                        // `<name>.<axis>`; a table column is a vector, spec
+                        // §03) — N iid scalar observations.
+                        let key = b.str_lit(&shape.columns[0]);
+                        b.call("get", &[table, key])
+                    } else {
+                        // Multivariate event sample: observe the table directly.
+                        table
+                    }
                 }
             }
             Some(serde_json::Value::Number(n)) => b.lit_real(n.as_f64().unwrap_or(0.0)),
@@ -99,6 +105,7 @@ mod tests {
         DataShape {
             columns: columns.iter().map(|s| s.to_string()).collect(),
             n_rows,
+            scalar: false,
         }
     }
 

@@ -104,6 +104,26 @@ fn axisless_multidim_unbinned_synthesizes_columns() {
     );
 }
 
+// A `point` datum is a single scalar observation: bound as a bare literal and
+// observed without an iid plate (HS3 §2.3 "point" data).
+#[test]
+fn point_datum_scalar_observation() {
+    let json = r#"{"distributions":[{"name":"g","type":"gaussian_dist","mean":"mu","sigma":"s","x":"x"}],
+        "data":[{"name":"d","type":"point","value":1.27}],
+        "likelihoods":[{"name":"L","distributions":["g"],"data":["d"]}],
+        "parameter_points":[]}"#;
+    let m = flatppl_hs3::read_hs3(json).expect("bare point datum converts");
+    let out = print_with(&m, Syntax::Minimal);
+    assert!(
+        out.contains("d = 1.27"),
+        "scalar binding expected, got:\n{out}"
+    );
+    assert!(
+        out.contains("likelihoodof(g, d)"),
+        "un-plated scalar observation expected, got:\n{out}"
+    );
+}
+
 /// Binned data is embedded as a single `counts` column; its axes still yield a
 /// companion domain.
 #[test]

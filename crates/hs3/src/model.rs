@@ -78,9 +78,8 @@ pub struct Datum {
     /// Uncertainty block (binned data / point data). Parsed to fail loud.
     #[serde(default)]
     pub uncertainty: Option<serde_json::Value>,
-    /// A `point` datum's scalar observation value. Not yet consumed by any
-    /// lowering — Task 3 (point-data lowering) reads it.
-    #[allow(dead_code)]
+    /// A `point` datum's scalar observation value (HS3 §2.3): a bare scalar
+    /// observation, bound as a literal and observed without an `iid` plate.
     #[serde(default)]
     pub value: Option<f64>,
 }

@@ -23,6 +23,9 @@ use std::collections::BTreeMap;
 pub(crate) struct DataShape {
     pub columns: Vec<String>,
     pub n_rows: usize,
+    /// A `point` datum: the binding is a bare scalar, observed without an
+    /// `iid` plate.
+    pub scalar: bool,
 }
 
 /// Step 3b: emit every `data` entry as `<name> = table(...)` plus, when it
@@ -98,6 +101,10 @@ pub(crate) fn datum_columns(d: &Datum) -> Result<Vec<String>> {
 /// observations (neither `entries` nor `contents`).
 fn build_table(b: &mut Builder, d: &Datum) -> Result<Option<NodeId>> {
     let columns = datum_columns(d)?;
+    // A `point` datum: one scalar observation, bound as a bare literal.
+    if let Some(v) = d.value {
+        return Ok(Some(b.lit_real(v)));
+    }
     if columns.is_empty() {
         return Ok(None);
     }
@@ -125,14 +132,27 @@ fn build_table(b: &mut Builder, d: &Datum) -> Result<Option<NodeId>> {
 /// `get(<name>, "<col>")` reference always names a real column.
 pub(crate) fn data_shapes(doc: &Document) -> Result<BTreeMap<String, DataShape>> {
     let mut out = BTreeMap::new();
-    for d in doc.data.iter().filter(|d| !d.entries.is_empty()) {
-        out.insert(
-            d.name.clone(),
-            DataShape {
-                columns: datum_columns(d)?,
-                n_rows: d.entries.len(),
-            },
-        );
+    for d in &doc.data {
+        if !d.entries.is_empty() {
+            out.insert(
+                d.name.clone(),
+                DataShape {
+                    columns: datum_columns(d)?,
+                    n_rows: d.entries.len(),
+                    scalar: false,
+                },
+            );
+        } else if d.value.is_some() {
+            datum_columns(d)?; // run the Task-2 rejections (uncertainty on a point)
+            out.insert(
+                d.name.clone(),
+                DataShape {
+                    columns: Vec::new(),
+                    n_rows: 1,
+                    scalar: true,
+                },
+            );
+        }
     }
     Ok(out)
 }
