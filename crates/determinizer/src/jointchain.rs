@@ -65,6 +65,70 @@ pub(crate) fn lower_jointchain(
     }
 }
 
+/// The ordered variate field names of a RECORD-FAMILY `jointchain` `node` — the
+/// base variate's field first, then each kernel's field, in chain order. `None`
+/// if `node` is not a positional `jointchain` whose base and every kernel resolve
+/// to single-field-record draws (e.g. the scalar-cat family, a keyword-form
+/// jointchain, or a malformed chain) — such a chain has no field-keyed variates
+/// to project by name.
+///
+/// Used by the determiniser's structural-projection prefix-keep guard
+/// ([`crate::density`]): a projection keeping a leading PREFIX of these fields is
+/// closed-form (jointchain kernels read only PRIOR variates, so the dropped
+/// trailing kernels are normalized Markov kernels that integrate to 1 and drop);
+/// any other keep drops a depended-upon variate — the intractable `kchain`
+/// integral — and must refuse.
+pub(crate) fn record_variate_fields(m: &Module, node: NodeId) -> Option<Vec<Symbol>> {
+    let args: Vec<NodeId> = {
+        let c = expect_builtin_call(m, node, "jointchain")?;
+        if !c.named.is_empty() || c.args.len() < 2 {
+            return None;
+        }
+        c.args.to_vec()
+    };
+    let base = resolve_base(m, args[0])?;
+    let mut fields = Vec::with_capacity(args.len());
+    fields.push(base.field?);
+    for &k_arg in &args[1..] {
+        let kernel = resolve_kernel(m, k_arg)?;
+        let comp = resolve_kernel_component(m, &kernel)?;
+        fields.push(comp.field?);
+    }
+    Some(fields)
+}
+
+/// True iff the jointchain kernel argument `k_arg` resolves to a single-draw body
+/// whose distribution constructor is a **confirmed normalized probability
+/// measure** — its OWN inferred `Mass` is `Normalized` (a §08 distribution like
+/// `Normal`/`Gamma`), NOT a reference/base measure `Lebesgue`/`Counting` (which
+/// carry `LocallyFinite`/`Finite`/`Unknown` mass — the reference measures, not
+/// probability measures) and NOT an un-normalized combinator (which
+/// [`resolve_single_draw`] already rejects, so this returns `false` for those).
+///
+/// The determiniser's prefix-keep projection ([`crate::density`]) uses this to
+/// decide whether a DROPPED trailing kernel integrates to 1. It must NOT trust the
+/// kernel-TYPE mass: inference types EVERY `kernelof(...)` as `Mass::Normalized`
+/// unconditionally, ignoring the body (`crates/infer/src/ops.rs`), so an
+/// improper-body kernel would falsely pass a kernel-type mass check and be dropped
+/// as if it had unit mass — silently lowering an infinite-mass marginal to a
+/// finite WRONG density. Reading the BODY measure's own mass closes that hole
+/// (refuse-don't-mislower).
+pub(crate) fn kernel_body_is_normalized(m: &Module, k_arg: NodeId) -> bool {
+    let Some(kernel) = resolve_kernel(m, k_arg) else {
+        return false;
+    };
+    let Some(comp) = resolve_kernel_component(m, &kernel) else {
+        return false;
+    };
+    matches!(
+        m.type_of(comp.dist),
+        Some(flatppl_core::Type::Measure {
+            mass: flatppl_core::Mass::Normalized,
+            ..
+        })
+    )
+}
+
 /// Record-form: components are single-field-record draws; the point is a record
 /// literal; kernel inputs bind to prior fields by name.
 fn lower_record_family(

@@ -122,11 +122,12 @@ fn relabel_projection_keeps_correct_nonadjacent_indices() {
 
 #[test]
 fn jointchain_projection_refuses() {
-    // `jointchain` is a DEPENDENT product: kernel `k` reads the base variate `a`,
-    // so marginalizing a component is a `kchain` integral, not the free drop the
-    // independent-product identity allows. Projection over it (even via `relabel`)
-    // must REFUSE — only dependency-respecting prefix keeps are closed-form, a
-    // bounded follow-up (§06 case 2 "report a static error").
+    // A `jointchain` relabeled to NAMES THAT DIFFER from its internal variate
+    // fields (`x`/`y` vs the chain's `a`/`b`) is an ill-formed rename — inference
+    // keeps the domain `record(a, b)`, so a point keyed by `x` does not match, and
+    // the relabel cannot be aligned to the chain's dependency structure. Refuse
+    // (naming jointchain) rather than guess a remap: only an IDENTITY relabel (or
+    // a bare jointchain) exposes a well-defined prefix keep.
     let e = determinize(&parse_infer(
         "a = draw(Normal(mu = 0.0, sigma = 1.0))\n\
          k = kernelof(record(b = draw(Normal(mu = a, sigma = 0.5))), a = a)\n\
@@ -142,4 +143,127 @@ fn jointchain_projection_refuses() {
         msg.contains("jointchain"),
         "message must name jointchain as the unsupported dependent product: {msg}"
     );
+}
+
+#[test]
+fn jointchain_prefix_keep_projection_lowers() {
+    // A 2-stage jointchain `a → b` (b's kernel reads the base variate a). Keeping
+    // the LEADING prefix {a} and dropping the trailing b is a dependency-
+    // respecting prefix keep: b's kernel is a normalized Markov kernel that
+    // integrates to 1 and drops cleanly, so the marginal is just the base density
+    // `logdensityof(Normal(0,1), 0.3)`. The relabel is the IDENTITY (labels
+    // `[a, b]` = the chain's variate fields), so it re-dispatches to the bare
+    // jointchain prefix keep. Distinct distributions (base Normal, kernel
+    // Exponential) make a wrong keep detectable — only the Normal term may
+    // survive; the trailing Exponential (b) term must be absent.
+    let p = pir("a = draw(Normal(mu = 0.0, sigma = 1.0))\n\
+         k = kernelof(record(b = draw(Exponential(rate = a))), a = a)\n\
+         jc = jointchain(lawof(record(a = a)), k)\n\
+         m = relabel(jc, [\"a\", \"b\"])\n\
+         lp = logdensityof(pushfwd(fn(get(_, [\"a\"])), m), record(a = 0.3))");
+    assert_eq!(
+        p.matches("builtin_logdensityof").count(),
+        1,
+        "prefix keep {{a}} scores only the base term; trailing b dropped:\n{p}"
+    );
+    assert!(p.contains("Normal"), "kept base (Normal) present:\n{p}");
+    assert!(
+        !p.contains("Exponential"),
+        "dropped trailing b (Exponential) marginalized out:\n{p}"
+    );
+    assert!(
+        p.contains("0.3"),
+        "base scored at the projected value 0.3:\n{p}"
+    );
+}
+
+#[test]
+fn jointchain_prefix_keep_improper_trailing_kernel_refuses() {
+    // A 2-stage jointchain a → b whose trailing kernel's BODY is an IMPROPER
+    // (infinite-mass) measure `Lebesgue(reals)` — a reference measure, NOT a
+    // probability measure. Keeping the leading prefix {a} and dropping the
+    // trailing b is closed-form ONLY if the dropped kernel integrates to 1; here
+    // ∫ Lebesgue(reals) = ∞, so the true marginal is φ(a)·∞, NOT φ(a). Inference
+    // types EVERY kernelof(...) as Mass::Normalized regardless of body, so the
+    // drop guard must NOT trust the kernel-TYPE mass — it must read the kernel
+    // BODY's own measure mass and refuse an improper body rather than silently
+    // lower to a finite WRONG density.
+    let e = determinize(&parse_infer(
+        "a = draw(Normal(mu = 0.0, sigma = 1.0))\n\
+         kb = kernelof(record(b = draw(Lebesgue(support = reals))), a = a)\n\
+         jc = jointchain(lawof(record(a = a)), kb)\n\
+         lp = logdensityof(pushfwd(fn(get(_, [\"a\"])), jc), record(a = 0.3))",
+    ))
+    .expect_err("dropping a trailing kernel with an improper (infinite-mass) body must refuse");
+    let msg = format!("{e:?}");
+    assert!(msg.contains("refuse"), "must be a refusal: {msg}");
+    assert!(msg.contains("jointchain"), "names jointchain: {msg}");
+}
+
+#[test]
+fn jointchain_nonprefix_keep_refuses() {
+    // Same 2-stage chain, but keep only {b}, DROPPING the leading a. b's kernel
+    // READS a, so marginalizing a out is the intractable `kchain` integral
+    // `∫ densityof(K(a), b) dM(a)`, not a free trailing-suffix drop. {b} is not a
+    // leading prefix — refuse rather than mislower.
+    let e = determinize(&parse_infer(
+        "a = draw(Normal(mu = 0.0, sigma = 1.0))\n\
+         k = kernelof(record(b = draw(Exponential(rate = a))), a = a)\n\
+         jc = jointchain(lawof(record(a = a)), k)\n\
+         m = relabel(jc, [\"a\", \"b\"])\n\
+         lp = logdensityof(pushfwd(fn(get(_, [\"b\"])), m), record(b = 0.5))",
+    ))
+    .expect_err("dropping the depended-upon leading variate must refuse");
+    let msg = format!("{e:?}");
+    assert!(msg.contains("refuse"), "must be a refusal: {msg}");
+    assert!(msg.contains("jointchain"), "names jointchain: {msg}");
+    assert!(msg.contains("kchain"), "names the kchain integral: {msg}");
+}
+
+#[test]
+fn jointchain_three_stage_prefix_keep_lowers() {
+    // 3-stage chain `a → b(reads a) → c(reads b)`, bare (no relabel). Keep the
+    // 2-prefix {a, b}, drop the trailing c: c's kernel is a normalized Markov
+    // kernel integrating to 1, so the marginal is the sub-jointchain density over
+    // {a, b} — the base Normal term + the b|a Exponential term; the trailing c
+    // (Gamma) term is absent. Distinct distributions at every stage lock the keep.
+    let p = pir("a = draw(Normal(mu = 0.0, sigma = 1.0))\n\
+         b = draw(Exponential(rate = a))\n\
+         kb = kernelof(record(b = b), a = a)\n\
+         kc = kernelof(record(c = draw(Gamma(shape = 2.0, rate = b))), b = b)\n\
+         jc = jointchain(lawof(record(a = a)), kb, kc)\n\
+         lp = logdensityof(pushfwd(fn(get(_, [\"a\", \"b\"])), jc), record(a = 0.3, b = 0.5))");
+    assert_eq!(
+        p.matches("builtin_logdensityof").count(),
+        2,
+        "2-prefix {{a, b}} keeps the base + b|a terms; trailing c dropped:\n{p}"
+    );
+    assert!(p.contains("Normal"), "base (Normal) present:\n{p}");
+    assert!(
+        p.contains("Exponential"),
+        "kept b|a (Exponential) present:\n{p}"
+    );
+    assert!(
+        !p.contains("Gamma"),
+        "dropped trailing c (Gamma) marginalized out:\n{p}"
+    );
+}
+
+#[test]
+fn jointchain_three_stage_middle_drop_refuses() {
+    // Same 3-stage chain. Keep {a, c}, dropping the MIDDLE b. c's kernel READS b,
+    // so dropping b is the intractable kchain integral, not a trailing-suffix
+    // drop. {a, c} is not a leading prefix (b is interior) — refuse.
+    let e = determinize(&parse_infer(
+        "a = draw(Normal(mu = 0.0, sigma = 1.0))\n\
+         b = draw(Exponential(rate = a))\n\
+         kb = kernelof(record(b = b), a = a)\n\
+         kc = kernelof(record(c = draw(Gamma(shape = 2.0, rate = b))), b = b)\n\
+         jc = jointchain(lawof(record(a = a)), kb, kc)\n\
+         lp = logdensityof(pushfwd(fn(get(_, [\"a\", \"c\"])), jc), record(a = 0.3, c = 0.7))",
+    ))
+    .expect_err("dropping the depended-upon interior variate must refuse");
+    let msg = format!("{e:?}");
+    assert!(msg.contains("refuse"), "must be a refusal: {msg}");
+    assert!(msg.contains("jointchain"), "names jointchain: {msg}");
 }

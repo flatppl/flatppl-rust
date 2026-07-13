@@ -2178,6 +2178,30 @@ fn lower_projection_pushfwd(
                      projected product's component slots",
                 )
             })?;
+            // `relabel(jointchain, [labels])`: a jointchain is a DEPENDENT product
+            // whose variates are ALREADY field-keyed (the base variate's field,
+            // then each kernel's field). A relabel here does not rename the chain's
+            // record domain — inference leaves it unchanged — so labels that DIFFER
+            // from the chain's own variate fields are an ill-formed rename with no
+            // well-defined point mapping (refuse). An IDENTITY relabel (labels equal
+            // the chain's variate fields, in order) is a no-op wrapper: strip it and
+            // re-dispatch to the bare `jointchain` prefix-keep arm below — the
+            // projected names and the point are already keyed by the internal
+            // field names.
+            let (inner_resolved, _) = resolve_ref_one(m, inner);
+            if builtin_name(m, inner_resolved) == Some("jointchain") {
+                let chain_fields = crate::jointchain::record_variate_fields(m, inner_resolved)
+                    .ok_or_else(|| refuse_jointchain_projection(m, inner_resolved))?;
+                let identity = chain_fields.len() == labels.len()
+                    && chain_fields
+                        .iter()
+                        .zip(labels.iter())
+                        .all(|(sym, label)| m.resolve(*sym) == label.as_ref());
+                if !identity {
+                    return Err(refuse_jointchain_relabel_rename(m, inner_resolved));
+                }
+                return lower_projection_pushfwd(m, inner, fields, v);
+            }
             let components = independent_product_components(m, inner)?;
             if labels.len() != components.len() {
                 return Err(refuse(
@@ -2210,12 +2234,14 @@ fn lower_projection_pushfwd(
             lower_projection_pushfwd(m, materialized, fields, v)
         }
         // `jointchain` is a DEPENDENT product: a component's kernel reads earlier
-        // variates, so marginalizing one is a `kchain` integral — refuse (naming
-        // jointchain). Only dependency-respecting prefix keeps are closed-form
-        // (a bounded follow-up). Reached for a bare jointchain projected by name;
-        // the `relabel(jointchain, …)` case refuses identically via
-        // `independent_product_components`.
-        Some("jointchain") => Err(refuse_jointchain_projection(m, m_inner)),
+        // variates. A projection keeping a dependency-respecting LEADING PREFIX of
+        // the chain is closed-form (the dropped trailing kernels are normalized
+        // Markov kernels that integrate to 1 and drop, so the marginal is the
+        // sub-jointchain over the kept prefix); ANY other keep drops a
+        // depended-upon variate — the intractable `kchain` integral — and refuses.
+        // Reached for a bare jointchain projected by name and for the identity
+        // `relabel(jointchain, …)` re-dispatch above.
+        Some("jointchain") => lower_jointchain_projection(m, m_inner, fields, v),
         other => Err(refuse(
             m_inner,
             m,
@@ -2231,19 +2257,159 @@ fn lower_projection_pushfwd(
     }
 }
 
-/// The precise refusal for a structural projection over a `jointchain` — shared
-/// by the direct `Some("jointchain")` arm and the `relabel(jointchain, …)` path
-/// so both name jointchain and its dependency structure identically.
+/// The refusal for a structural projection over a `jointchain` whose shape is not
+/// a record-family single-draw chain (scalar-cat family, keyword-form, or
+/// malformed) — there are no field-keyed variates to project by name.
 fn refuse_jointchain_projection(m: &Module, node: NodeId) -> RefuseError {
     refuse(
         node,
         m,
-        "structural projection over a `jointchain` is unsupported: jointchain is a \
-         DEPENDENT product (a component's kernel reads earlier variates), so marginalizing \
-         a component is a `kchain` integral, not the free drop the independent-product \
-         identity permits — only dependency-respecting prefix keeps are closed-form (a \
-         bounded follow-up) — refuse rather than mislower",
+        "structural projection over a `jointchain` is unsupported here: jointchain is a \
+         DEPENDENT product (a component's kernel reads earlier variates), and this chain has \
+         no field-keyed variates to select by name (scalar-cat / keyword-form / malformed) — \
+         marginalizing a component is otherwise a `kchain` integral — refuse rather than \
+         mislower",
     )
+}
+
+/// The refusal for a NON-PREFIX keep over a `jointchain`: the kept field set is
+/// not a leading prefix, so it drops a leading or interior variate that a kept or
+/// later kernel depends on — the intractable `kchain` integral, not the free drop
+/// a dependency-respecting prefix keep permits.
+fn refuse_jointchain_nonprefix(m: &Module, node: NodeId) -> RefuseError {
+    refuse(
+        node,
+        m,
+        "structural projection over a `jointchain` keeps a NON-PREFIX field set: it drops a \
+         leading or interior variate that a kept or later kernel depends on, so marginalizing \
+         it is the intractable `kchain` integral, not the free drop a dependency-respecting \
+         prefix keep permits — only a leading prefix of the chain's variates is closed-form — \
+         refuse rather than mislower",
+    )
+}
+
+/// The refusal for `relabel(jointchain, [labels])` whose labels DIFFER from the
+/// chain's own variate fields — an ill-formed rename (inference leaves the
+/// jointchain's record domain unchanged, so the relabeled names have no
+/// well-defined point mapping onto the dependent chain).
+fn refuse_jointchain_relabel_rename(m: &Module, node: NodeId) -> RefuseError {
+    refuse(
+        node,
+        m,
+        "structural projection over a `relabel(jointchain, …)` whose labels differ from the \
+         chain's own variate fields is an ill-formed rename: inference keeps the jointchain's \
+         record domain unchanged, so the relabeled names have no well-defined mapping onto the \
+         dependent chain — only an identity relabel (or a bare jointchain) exposes a \
+         dependency-respecting prefix keep; marginalizing a depended-upon variate is otherwise \
+         the `kchain` integral — refuse rather than mislower",
+    )
+}
+
+/// Lower a structural projection over a record-family `jointchain` `node` that
+/// keeps a **dependency-respecting leading prefix** of the chain's variates
+/// (§06 "Density of composed measures").
+///
+/// jointchain kernels read only PRIOR variates, so keeping the first `k` variate
+/// fields is dependency-closed: the dropped trailing kernels are normalized
+/// Markov kernels that integrate to 1 and drop, and the marginal is exactly the
+/// SUB-jointchain over the kept prefix. We recover the chain's ordered variate
+/// fields ([`crate::jointchain::record_variate_fields`]), confirm the kept set is
+/// the leading `{0, …, k-1}` (else it drops a depended-upon variate — the
+/// intractable `kchain` integral — and refuses), verify each dropped trailing
+/// kernel's BODY is a confirmed normalized probability measure
+/// ([`crate::jointchain::kernel_body_is_normalized`] — reading the body measure's
+/// OWN mass, NOT the kernel-type mass, which inference types as `Normalized`
+/// unconditionally; a non-normalized dropped body would silently omit mass,
+/// mirroring [`refuse_unnormalized_dropped_fields`] for the independent-product
+/// arms), then re-dispatch: the base measure alone for a length-1 prefix, else the
+/// sub-`jointchain(base, K₁, …, K_{k-1})` through the existing jointchain density
+/// lowering.
+fn lower_jointchain_projection(
+    m: &mut Module,
+    node: NodeId,
+    fields: &[Box<str>],
+    v: NodeId,
+) -> Result<NodeId, RefuseError> {
+    // The chain's ordered variate fields (base field, then each kernel's field).
+    // `None` ⇒ not a record-family single-draw chain — no field-keyed projection.
+    let chain_fields = crate::jointchain::record_variate_fields(m, node)
+        .ok_or_else(|| refuse_jointchain_projection(m, node))?;
+    let chain_names: Vec<&str> = chain_fields.iter().map(|s| m.resolve(*s)).collect();
+
+    // Map each kept field to its position in the chain; a kept name that is not a
+    // chain variate is a mis-projection — refuse.
+    let mut kept_idx = Vec::with_capacity(fields.len());
+    for f in fields {
+        let idx = chain_names
+            .iter()
+            .position(|n| *n == f.as_ref())
+            .ok_or_else(|| {
+                refuse(
+                    node,
+                    m,
+                    &format!(
+                        "structural projection keeps field `{f}` which is not a variate of this \
+                         jointchain — refuse rather than mislower"
+                    ),
+                )
+            })?;
+        kept_idx.push(idx);
+    }
+    let k = kept_idx.len();
+    // Dependency-respecting PREFIX keep ⇔ the kept indices are exactly the leading
+    // {0, …, k-1}. Anything else (a dropped leading/interior variate) is the
+    // intractable kchain integral.
+    kept_idx.sort_unstable();
+    if !kept_idx.iter().copied().eq(0..k) {
+        return Err(refuse_jointchain_nonprefix(m, node));
+    }
+
+    let args: Vec<NodeId> = {
+        let c = expect_builtin_call(m, node, "jointchain")
+            .ok_or_else(|| refuse_jointchain_projection(m, node))?;
+        c.args.to_vec()
+    };
+    // The dropped components are the trailing kernels `args[k..]`; each must be a
+    // confirmed normalized Markov kernel (∫ K = 1) to drop cleanly. We must NOT
+    // read the kernel-TYPE mass here: inference types EVERY `kernelof(...)` as
+    // `Mass::Normalized` regardless of body (crates/infer/src/ops.rs), so a
+    // trailing kernel whose BODY is an improper (infinite-mass) measure —
+    // `Lebesgue`/`Counting` or an un-normalized combinator — would falsely pass a
+    // kernel-type mass check and be dropped as if it integrated to 1, silently
+    // lowering to a finite WRONG density. Verify the kernel BODY's own output
+    // measure is a confirmed normalized probability measure instead.
+    for &dropped in &args[k..] {
+        if !crate::jointchain::kernel_body_is_normalized(m, dropped) {
+            return Err(refuse(
+                node,
+                m,
+                "structural projection over a `jointchain` drops a trailing kernel whose body is \
+                 not a confirmed normalized probability measure (its output measure's own mass is \
+                 not `Normalized` — e.g. a base/reference measure `Lebesgue`/`Counting`, or an \
+                 un-normalized combinator, whose total mass is infinite or unknown); the \
+                 kernel-TYPE mass is unreliable here (inference types every `kernelof` as \
+                 normalized regardless of body), and dropping such a kernel would silently omit \
+                 mass from the marginal — refuse rather than mislower",
+            ));
+        }
+    }
+
+    if k == 1 {
+        // Keep only the base variate: the marginal is the base measure's density.
+        lower_measure_density(m, args[0], v)
+    } else {
+        // Keep a ≥2-length prefix: the marginal is the sub-jointchain over the
+        // first `k` components (base + first `k-1` kernels). Re-dispatch through
+        // the existing jointchain density lowering rather than re-deriving it.
+        let jointchain_sym = m.intern("jointchain");
+        let sub = m.alloc(Node::Call(Call {
+            head: CallHead::Builtin(jointchain_sym),
+            args: args[..k].to_vec().into(),
+            named: Vec::<NamedArg>::new().into(),
+            inputs: None,
+        }));
+        crate::jointchain::lower_jointchain(m, sub, v)
+    }
 }
 
 /// Extract the ordered component measures of an INDEPENDENT index-keyed product
