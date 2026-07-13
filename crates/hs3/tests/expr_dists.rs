@@ -502,3 +502,49 @@ fn expr_erfc_lowers_to_special_functions() {
     );
     flatppl_syntax::parse(&text).expect("re-parse");
 }
+
+// ---------------------------------------------------------------------------
+// generic_dist: piecewise ternary (RooGenericPdf idiom)
+//
+// A piecewise density via the ternary — the RooGenericPdf idiom this operator
+// support exists for. Structural + round-trip only: no corpus fixture
+// exercises these operators, so there is no numeric gate.
+// ---------------------------------------------------------------------------
+
+const PIECEWISE_TERNARY_JSON: &str = r#"{
+  "distributions": [
+    {"name": "pw", "type": "generic_dist",
+     "expression": "x > 0.0 ? exp(-x) : 0.0"}
+  ],
+  "domains": [
+    {"name": "default_domain", "type": "product_domain",
+     "axes": [{"name": "x", "min": -5.0, "max": 5.0}]}
+  ],
+  "parameter_points": []
+}"#;
+
+#[test]
+fn generic_dist_piecewise_ternary_converts() {
+    let m = flatppl_hs3::read_hs3(PIECEWISE_TERNARY_JSON).expect("read_hs3 must succeed");
+    let text = print_with(&m, Syntax::Minimal);
+    eprintln!("=== piecewise ternary generic_dist ===\n{text}\n=== end ===");
+
+    // The ternary lowers to ifelse(gt(...), ..., ...); the comparison operand
+    // lowers to gt(x, 0.0).
+    assert!(
+        text.contains("ifelse(gt("),
+        "ternary must lower to ifelse(gt(...)), got:\n{text}"
+    );
+    // The "then" branch keeps the exp(...) call form.
+    assert!(
+        text.contains("exp("),
+        "missing exp(...) branch, got:\n{text}"
+    );
+
+    let parsed = parse(&text);
+    assert!(
+        parsed.is_ok(),
+        "round-trip parse failed: {:?}\n\nEmitted:\n{text}",
+        parsed.err()
+    );
+}
