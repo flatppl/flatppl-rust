@@ -53,6 +53,10 @@ impl<'m> Builder<'m> {
         self.m.alloc(Node::Lit(Scalar::Int(v)))
     }
 
+    pub(crate) fn lit_bool(&mut self, v: bool) -> NodeId {
+        self.m.alloc(Node::Lit(Scalar::Bool(v)))
+    }
+
     pub(crate) fn str_lit(&mut self, s: &str) -> NodeId {
         self.m.alloc(Node::Lit(Scalar::Str(s.into())))
     }

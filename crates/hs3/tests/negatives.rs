@@ -236,12 +236,14 @@ fn shapefactor_modifier_path_converts() {
 }
 
 // ---------------------------------------------------------------------------
-// Unsupported expression operators in a generic_dist expression.
+// HS3 equality operators in a generic_dist expression → Err (Unimplemented).
 //
-// FlatPPL's deterministic-expression sublanguage has no boolean/comparison
-// operators; the importer must reject each rather than emit a bogus call. We
-// parameterize over all eight comparison/logical binary operators plus the
-// logical-not prefix. Each must produce an Err that names the operator.
+// FlatPPL restricts equality to discrete domains (§07), and HS3 expression
+// operands are untyped reals, so `==`/`!=` (approx-equal) and `===`/`!==`
+// (exact) have no honest lowering. They are valid HS3, hence the
+// `unimplemented HS3 construct:` prefix (testsuite SKIP, never hard-fail).
+// Comparisons/booleans/ternary now LOWER (lt/le/gt/ge, land/lor/lnot,
+// ifelse) — positive coverage lives in src/expr.rs tests and expr_dists.rs.
 // ---------------------------------------------------------------------------
 
 /// Build a generic_dist whose expression uses `expr`.
@@ -252,48 +254,15 @@ fn generic_dist_with(expr: &str) -> String {
 }
 
 #[test]
-fn unsupported_binary_operators_err() {
-    // (expression-snippet, operator-token-the-message-must-name)
-    let cases = [
+fn equality_operators_err_unimplemented() {
+    for (expr, op) in [
         ("x == 1.0", "=="),
         ("x != 1.0", "!="),
-        ("x < 1.0", "<"),
-        ("x <= 1.0", "<="),
-        ("x > 1.0", ">"),
-        ("x >= 1.0", ">="),
-        ("x && y", "&&"),
-        ("x || y", "||"),
-    ];
-    for (expr, op) in cases {
+        ("x === 1.0", "==="),
+        ("x !== 1.0", "!=="),
+    ] {
         let json = generic_dist_with(expr);
-        match flatppl_hs3::read_hs3(&json) {
-            Ok(_) => panic!("operator `{op}` (expr `{expr}`) must be rejected, got Ok"),
-            Err(e) => {
-                let msg = e.to_string();
-                assert!(
-                    msg.contains(op) && msg.contains("not supported"),
-                    "operator `{op}`: message should name the op and say `not supported`, got: {msg}"
-                );
-            }
-        }
-    }
-}
-
-/// The logical-not prefix `!` is rejected too — it surfaces as a parse-level
-/// error (unexpected atom) rather than the trailing-operator check, so we assert
-/// only that conversion fails and the message references `!`.
-#[test]
-fn unsupported_logical_not_errs() {
-    let json = generic_dist_with("!x");
-    match flatppl_hs3::read_hs3(&json) {
-        Ok(_) => panic!("logical-not `!` must be rejected, got Ok"),
-        Err(e) => {
-            let msg = e.to_string();
-            assert!(
-                msg.contains('!'),
-                "logical-not error should reference `!`, got: {msg}"
-            );
-        }
+        assert_unimplemented_hs3(&format!("equality `{op}`"), &json, op);
     }
 }
 
