@@ -499,11 +499,14 @@ lp = logdensityof(lawof(record(a = a)), record(a = 0.5))";
         "one density term per mixand (Normal + Gamma):\n{pir}"
     );
     // The Z = Σ wᵢ normalizer: `sub(<superpose density>, log(add(0.3, 0.5)))`.
-    // The literal weights sum in a bare `(add 0.3 0.5)` (FlatPIR leaves literals
-    // un-`%meta`-wrapped) — distinct from the per-mixand `(add (log 0.3) …)`.
+    // Canon Pass 1 const-folds the literal `add(0.3, 0.5)` to `0.8` (the four
+    // basic arithmetic ops are IEEE-754-exact, so this is safe/bit-identical);
+    // `log` itself is deliberately left unevaluated (Buffy #263 Pass 1: no
+    // transcendental folding), so the normalizer surfaces as a bare `(log 0.8)`
+    // — distinct from the per-mixand `(add (log 0.3) …)` terms.
     assert!(
-        pir.contains("(add 0.3 0.5)"),
-        "log(Σ wᵢ) additive-mass normalizer sums the weights:\n{pir}"
+        pir.contains("(log 0.8)"),
+        "log(Σ wᵢ) additive-mass normalizer sums the weights to the folded 0.8:\n{pir}"
     );
     assert!(
         !pir.contains("normalize")
@@ -549,11 +552,15 @@ lp = logdensityof(lawof(record(a = a)), record(a = 0.5))";
         2,
         "one density term per mixand:\n{pir}"
     );
-    // Z = add(p, 1 - p): the sum starts with the bare weight ref `p`, distinct
-    // from the per-mixand `(add (log (%ref self p)) …)` which starts with a `log`.
+    // Z = add(p, 1 - p) with p = 0.4 a literal: canon Pass 1's
+    // `resolve_alias_refs` inlines the trivial alias `(%ref self p)` to `0.4`,
+    // then const-fold reduces `add(0.4, sub(1.0, 0.4))` to the literal `1.0`
+    // (the basic arithmetic ops are IEEE-754-exact, so this is bit-identical
+    // to evaluating it at run time) — the normalizer surfaces as a bare
+    // `(log 1.0)`, distinct from the per-mixand `(add (log 0.4) …)` terms.
     assert!(
-        pir.contains("(add (%ref self p)"),
-        "log(p + (1 - p)) additive-mass normalizer sums the weights:\n{pir}"
+        pir.contains("(log 1.0)"),
+        "log(p + (1 - p)) additive-mass normalizer folds the weights to 1.0:\n{pir}"
     );
     assert!(
         !pir.contains("normalize") && !pir.contains("superpose") && !pir.contains("weighted"),
