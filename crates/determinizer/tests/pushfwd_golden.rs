@@ -323,8 +323,15 @@ fn pushfwd_elementwise_exp_lowers() {
     // the pushfwd emits  logdensityof(iid N(0,1), broadcast(log, v))
     //   − sum(broadcast(<id>, broadcast(log, v)))  = Σᵢ [logN(0,1)(log vᵢ) − log vᵢ]
     // — n independent LogNormals (per-cell change-of-variables, log-det summed).
-    let p = pir(
-        "d = pushfwd(fn(broadcast(exp, _)), iid(Normal(mu = 0.0, sigma = 1.0), 3))\nlp = logdensityof(d, [0.5, 0.6, 0.7])",
+    let src = "d = pushfwd(fn(broadcast(exp, _)), iid(Normal(mu = 0.0, sigma = 1.0), 3))\nlp = logdensityof(d, [0.5, 0.6, 0.7])";
+    let out = determinize(&parse_infer(src)).expect("must lower");
+    let p = flatppl_flatpir::write(&out);
+    // This is the capture-fix golden: the nested identity map's own `_x_`
+    // (asserted below) only survives un-substituted if `is_flatpdl` — one of
+    // the pass's four hard invariants — actually holds on the result.
+    assert!(
+        flatppl_determinizer::is_flatpdl(&out).is_ok(),
+        "is_flatpdl:\n{p}"
     );
     // Before Buffy #263 Pass 2, the f_inv- and logvol-applying `%call`s were
     // left un-reduced, so `sum`'s argument type inferred `%deferred` (a

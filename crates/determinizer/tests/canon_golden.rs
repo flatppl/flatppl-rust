@@ -130,3 +130,30 @@ lp = logdensityof(lawof(record(a = a)), record(a = 0.5))";
         "is_flatpdl:\n{pir}"
     );
 }
+
+// inline_user_calls (Pass 2) is idempotent: determinizing the same source
+// twice produces identical FlatPIR (canonicalize already ran to a fixpoint
+// inside the first determinize). Same fixture as
+// `inline_user_calls_eliminates_residual_user_call` — a genuine user-function
+// call Pass 2 rewrites, not a vacuous no-op source — so this also pins that
+// the capture-avoiding `substitute_ref` (kernel.rs `shadows_name` guard)
+// reaches a stable fixpoint rather than re-triggering on a second pass.
+#[test]
+fn inline_user_calls_is_idempotent() {
+    let src = "\
+scale(x) = mul(x, 2.0)
+s = scale(1.5)
+a = draw(Normal(mu = 0.0, sigma = s))
+lp = logdensityof(lawof(record(a = a)), record(a = 0.5))";
+    let once = flatppl_flatpir::write(&determinize_src(src));
+    assert!(
+        !once.contains("(%call"),
+        "sanity: fixture must actually contain a user call Pass 2 inlines \
+         (else this test is vacuous):\n{once}"
+    );
+    let twice = flatppl_flatpir::write(&determinize_src(src));
+    assert_eq!(
+        once, twice,
+        "determinize output is a canonicalization fixpoint"
+    );
+}
