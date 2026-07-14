@@ -737,10 +737,16 @@ lp = logdensityof(outer.d, 0.5)";
         pir.contains("(%bind val 1.0)"),
         "diamond-shared leaf `val = 1.0` did not survive the graft; got:\n{pir}"
     );
-    assert_eq!(
-        pir.matches("(%ref self val)").count(),
-        2,
-        "both `mu` and `sigma` must reference the SAME deduped `val` binding; got:\n{pir}"
+    // Canon Pass 1's `resolve_alias_refs` inlines the trivial literal alias
+    // `val = 1.0`, so `mu`/`sigma` no longer carry `(%ref self val)` — both
+    // fields hold the literal `1.0` directly. That inlining is only sound
+    // because the graft deduped `val` onto ONE shared binding in the first
+    // place (the `(%bind val ` count == 1 assertion above); if the graft had
+    // silently duplicated it, dedup would not be provable from the output at
+    // all once inlined, which is exactly why that assertion stays load-bearing.
+    assert!(
+        pir.contains("(%field mu 1.0)") && pir.contains("(%field sigma 1.0)"),
+        "both `mu` and `sigma` must resolve to the SAME deduped `val` value (1.0); got:\n{pir}"
     );
 }
 
@@ -1201,11 +1207,14 @@ lp = logdensityof(outer.combo, 0.5)";
         1,
         "the re-export and the direct ref must share ONE grafted `d` binding; got:\n{pir}"
     );
-    // Both `mu` and `sigma` reference that single deduped `d`.
-    assert_eq!(
-        pir.matches("(%ref self d)").count(),
-        2,
-        "both `mu` and `sigma` must reference the SAME deduped `d` binding; got:\n{pir}"
+    // Canon Pass 1's `resolve_alias_refs` inlines the trivial literal alias
+    // `d = 3.0`, so `mu`/`sigma` no longer carry `(%ref self d)` — both fields
+    // hold the literal `3.0` directly. Sound only because the graft deduped
+    // `d` onto ONE shared binding first (the `(%bind d ` count == 1 assertion
+    // above remains the load-bearing dedup proof).
+    assert!(
+        pir.contains("(%field mu 3.0)") && pir.contains("(%field sigma 3.0)"),
+        "both `mu` and `sigma` must resolve to the SAME deduped `d` value (3.0); got:\n{pir}"
     );
 }
 

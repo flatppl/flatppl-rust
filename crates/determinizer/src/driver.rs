@@ -79,7 +79,9 @@ pub fn determinize_with(m: &Module, bundle: &ModuleBundle) -> Result<Module, Ref
 
         match target {
             None => {
-                // No measure-layer nodes remain.
+                // Measure layer gone — canonicalize the FlatPDL before the
+                // conformance check and return (Buffy #263).
+                crate::canon::canonicalize(&mut work);
                 match crate::is_flatpdl(&work) {
                     Ok(()) => return Ok(work),
                     Err(violations) => {
@@ -780,7 +782,13 @@ fn is_combinator_rhs(m: &Module, rhs: NodeId) -> bool {
 
 /// True iff any binding (other than `bid` itself) contains a `(%ref self name)`
 /// node that refers to `name_sym`.
-fn binding_is_referenced(m: &Module, bid: BindingId, name_sym: Symbol) -> bool {
+///
+/// `pub(crate)`: also called by `canon::fold::sweep_dead_bindings`, which needs
+/// the identical reification-input-boundary-aware referenced-check for its own
+/// (non-measure-typed) dead-binding sweep — shared rather than duplicated so the
+/// two sweeps can never drift and so `sweep_preserves_binding_referenced_only_via_reification_input`
+/// below covers both callers.
+pub(crate) fn binding_is_referenced(m: &Module, bid: BindingId, name_sym: Symbol) -> bool {
     for (other_bid, binding) in m.bindings() {
         if other_bid == bid {
             continue;
@@ -807,7 +815,10 @@ fn binding_is_referenced(m: &Module, bid: BindingId, name_sym: Symbol) -> bool {
 /// bindings — a sound tightening. This `Inputs`-scanning behaviour is scoped to
 /// the sweep, which is `subtree_contains_ref`'s only caller
 /// ([`binding_is_referenced`]).
-fn subtree_contains_ref(m: &Module, root: NodeId, name_sym: Symbol) -> bool {
+///
+/// `pub(crate)`: shared with `canon::fold::sweep_dead_bindings` — see
+/// [`binding_is_referenced`].
+pub(crate) fn subtree_contains_ref(m: &Module, root: NodeId, name_sym: Symbol) -> bool {
     let mut queue = vec![root];
     let mut qi = 0;
     while qi < queue.len() {
