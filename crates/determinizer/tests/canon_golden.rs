@@ -108,3 +108,52 @@ __score__ = logdensityof(lawof(record(a = a)), record(a = 0.5))";
     );
     assert!(flatppl_determinizer::is_flatpdl(&out).is_ok());
 }
+
+// A user-defined function used deterministically must be INLINED in FlatPDL:
+// no residual `(%call ...)` reaches consumers (flatppl-js can't evaluate one —
+// Buffy #261). Buffy #263 Pass 2.
+#[test]
+fn inline_user_calls_eliminates_residual_user_call() {
+    let src = "\
+scale(x) = mul(x, 2.0)
+s = scale(1.5)
+a = draw(Normal(mu = 0.0, sigma = s))
+lp = logdensityof(lawof(record(a = a)), record(a = 0.5))";
+    let out = determinize_src(src);
+    let pir = flatppl_flatpir::write(&out);
+    assert!(
+        !pir.contains("(%call"),
+        "no residual user-function call in FlatPDL:\n{pir}"
+    );
+    assert!(
+        flatppl_determinizer::is_flatpdl(&out).is_ok(),
+        "is_flatpdl:\n{pir}"
+    );
+}
+
+// inline_user_calls (Pass 2) is idempotent: determinizing the same source
+// twice produces identical FlatPIR (canonicalize already ran to a fixpoint
+// inside the first determinize). Same fixture as
+// `inline_user_calls_eliminates_residual_user_call` — a genuine user-function
+// call Pass 2 rewrites, not a vacuous no-op source — so this also pins that
+// the capture-avoiding `substitute_ref` (kernel.rs `shadows_name` guard)
+// reaches a stable fixpoint rather than re-triggering on a second pass.
+#[test]
+fn inline_user_calls_is_idempotent() {
+    let src = "\
+scale(x) = mul(x, 2.0)
+s = scale(1.5)
+a = draw(Normal(mu = 0.0, sigma = s))
+lp = logdensityof(lawof(record(a = a)), record(a = 0.5))";
+    let once = flatppl_flatpir::write(&determinize_src(src));
+    assert!(
+        !once.contains("(%call"),
+        "sanity: fixture must actually contain a user call Pass 2 inlines \
+         (else this test is vacuous):\n{once}"
+    );
+    let twice = flatppl_flatpir::write(&determinize_src(src));
+    assert_eq!(
+        once, twice,
+        "determinize output is a canonicalization fixpoint"
+    );
+}

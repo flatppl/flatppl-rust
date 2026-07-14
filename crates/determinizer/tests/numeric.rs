@@ -353,24 +353,27 @@ lp = logdensityof(d, 0.5)";
         "must be FlatPDL"
     );
     let pir = flatppl_flatpir::write(&out);
-    // One density term (g); the applied weight is `log((%call w v))`, not a
-    // `builtin_logdensityof`.
+    // One density term (g); the applied weight is `log(w(0.5))`, not a
+    // `builtin_logdensityof`. The weight application itself is a residual
+    // user-function `%call` beta-reduced away by canon Pass 2 (Buffy #263) —
+    // `w(0.5) = exp(0.5)` (unfolded: `exp` is excluded from const-fold, see
+    // `canon/fold.rs`), so no `(%call` survives.
     assert_eq!(
         pir.matches("builtin_logdensityof").count(),
         1,
         "single density term:\n{pir}"
     );
     assert!(
-        !pir.contains("(weighted ") && !pir.contains("(logdensityof "),
-        "measure layer gone:\n{pir}"
+        !pir.contains("(weighted ") && !pir.contains("(logdensityof ") && !pir.contains("(%call"),
+        "measure layer gone and no residual user-call:\n{pir}"
     );
     // Structural: `add(log(w(0.5)), density(g, 0.5))`. The weight is APPLIED at
-    // the variate (a `%call ... 0.5`) and wrapped in an OUTER `log` (distinguishes
+    // the variate (inlined to `exp(0.5)`) and wrapped in an OUTER `log` (distinguishes
     // `weighted` from `logweighted`); g is scored at the same variate 0.5.
     assert!(pir.contains("(add "), "add(logw, density):\n{pir}");
     assert!(
-        pir.contains("(log ") && pir.contains("(%call "),
-        "weight applied at v then log-wrapped: log((%call w 0.5)):\n{pir}"
+        pir.contains("(log ") && pir.contains("(exp 0.5)"),
+        "weight applied at v then log-wrapped: log(exp(0.5)):\n{pir}"
     );
     assert!(
         pir.contains("(%field mu 0.0) (%field sigma 1.0)"),
@@ -403,21 +406,24 @@ lp = logdensityof(d, 0.5)";
         "g1 + g2 terms:\n{pir}"
     );
     assert!(
-        !pir.contains("(logweighted ") && !pir.contains("(logdensityof "),
-        "measure layer gone:\n{pir}"
+        !pir.contains("(logweighted ")
+            && !pir.contains("(logdensityof ")
+            && !pir.contains("(%call"),
+        "measure layer gone and no residual user-call:\n{pir}"
     );
-    // Structural: `add(ℓ(0.5), density(g1, 0.5))`. The log-weight is applied at v
-    // (a `%call ... 0.5`) and, being already in log space, is NOT wrapped in a
-    // top-level `log` — the emitted expression starts with `add`, not `add(log(…`.
+    // Structural: `add(ℓ(0.5), density(g1, 0.5))`. The log-weight application
+    // is a residual user-function `%call` beta-reduced away by canon Pass 2
+    // (Buffy #263): `ℓ(0.5) = logdensityof(g2, 0.5)` had ALREADY lowered to a
+    // `builtin_logdensityof` term before the `%call` wrapping it was inlined,
+    // so it now sits directly as a second `add` operand — being already in
+    // log space, it is NOT wrapped in a top-level `log` — the emitted
+    // expression starts with `add`, not `add(log(…`.
     assert!(pir.contains("(add "), "add(logweight, density):\n{pir}");
+    // No `(log (builtin_logdensityof` — that would be the `weighted` shape
+    // (a spurious outer log around the inlined log-weight term).
     assert!(
-        pir.contains("(%call "),
-        "log-weight applied at v: (%call ℓ 0.5):\n{pir}"
-    );
-    // No `(log (%call ` — that would be the `weighted` shape (a spurious outer log).
-    assert!(
-        !pir.contains("(log (%call "),
-        "logweighted must NOT wrap the applied log-weight in an outer log:\n{pir}"
+        !pir.contains("(log (builtin_logdensityof"),
+        "logweighted must NOT wrap the inlined log-weight term in an outer log:\n{pir}"
     );
     // Both Gaussians are scored: g1 = N(0,1) directly, g2 = N(1,2) inside ℓ.
     assert!(

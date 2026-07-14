@@ -529,11 +529,22 @@ pub(crate) fn map_tree(
         return root;
     }
 
-    // Rebuild the Call node with mapped children. Only `Call` nodes have
-    // children (see `Node::for_each_child`), so this arm is always reached.
-    let Node::Call(orig_call) = m.node(root) else {
-        // Non-call nodes have no children — the map would have returned early
-        // above (no children, so new_children == children == []).
+    rebuild_with_children(m, root, &new_children)
+}
+
+/// Rebuild the `Call` node at `id` with `new_children` standing in for its
+/// current children (callee first for a `CallHead::User` head, then positional
+/// args, then named values — the same partition `Node::for_each_child` visits
+/// in). Shared by [`map_tree`] (mapped-child rebuild) and
+/// `canon::inline::inline_walk` (bottom-up inline rebuild) so both stay
+/// byte-for-byte consistent in how a `Call`'s children slice decodes back into
+/// head/args/named. Only `Call` nodes have children (see
+/// [`Node::for_each_child`]), so callers must only invoke this for a node that
+/// is actually a `Call` with `new_children.len()` matching its child count.
+pub(crate) fn rebuild_with_children(m: &mut Module, id: NodeId, new_children: &[NodeId]) -> NodeId {
+    let Node::Call(orig_call) = m.node(id) else {
+        // Non-call nodes have no children — a caller that reaches here despite
+        // that contract violates it, not this function's own invariant.
         unreachable!("non-call node with children is impossible in this IR");
     };
     let head = orig_call.head;
@@ -545,7 +556,7 @@ pub(crate) fn map_tree(
     // then named values — mirror that partition here.
     let (new_head, child_slice) = match head {
         CallHead::User(_) => (CallHead::User(new_children[0]), &new_children[1..]),
-        CallHead::Builtin(s) => (CallHead::Builtin(s), &new_children[..]),
+        CallHead::Builtin(s) => (CallHead::Builtin(s), new_children),
     };
 
     let new_args: Vec<NodeId> = child_slice[..pos_count].to_vec();

@@ -109,14 +109,22 @@ pub(crate) fn resolve_reified(m: &Module, k_arg: NodeId) -> Option<Kernel> {
 }
 
 /// Replace every `(%ref self name)` / `(%ref %local name)` in the subtree at
-/// `root` with `new_id`. Append-only. Scope-UNAWARE: sound under the workspace
-/// no-shadowing assumption (a substituted symbol is never rebound inside the
-/// subtree).
+/// `root` with `new_id`. Append-only. Shadow-aware over ONE hazard: a nested
+/// `functionof`/`kernelof` reification whose OWN boundary re-declares `name`
+/// as one of its inputs (see [`shadows_name`]) is left untouched — descending
+/// into it would rewrite a reference that belongs to that reification's OWN
+/// scope, not the outer substitution (variable capture). Beyond that one
+/// hazard this is still scope-UNAWARE: sound under the workspace no-shadowing
+/// assumption for every other binding form (a substituted symbol is never
+/// rebound by anything besides a reification boundary inside the subtree).
 pub(crate) fn substitute_ref(m: &mut Module, root: NodeId, name: Symbol, new_id: NodeId) -> NodeId {
     if let Node::Ref(Ref { ns, name: rname }) = m.node(root) {
         if matches!(ns, RefNs::SelfMod | RefNs::Local) && *rname == name {
             return new_id;
         }
+    }
+    if shadows_name(m, root, name) {
+        return root;
     }
     let children: Vec<NodeId> = m.node(root).children();
     if children.is_empty() {
@@ -157,6 +165,31 @@ pub(crate) fn substitute_ref(m: &mut Module, root: NodeId, name: Symbol, new_id:
         named: new_named.into(),
         inputs,
     }))
+}
+
+/// True iff `id` is a reification (`functionof`/`kernelof`) whose OWN
+/// boundary declares `name` as one of its inputs' body-target refs — i.e.
+/// `id`'s body re-binds `name` for itself. Checked via the node's `Inputs`:
+/// an explicit `%specinputs` list inline, or an `%autoinputs` boundary via the
+/// module's auto-inputs side-table ([`Module::auto_inputs_of`], filled by
+/// phase inference). Exists because the same synthesized placeholder name
+/// (commonly `_x_`, minted uniformly by `flatppl-syntax`'s single-arg lambda
+/// lowering, `lower_lambda`) is reused across UNRELATED reifications rather
+/// than gensym'd fresh per occurrence; two of them can end up nested (an
+/// outer reification's body containing an inert, uninvoked inner one) with
+/// the SAME boundary name, and [`substitute_ref`] must stop at the inner
+/// one's edge rather than rewrite a reference that belongs to its own scope.
+fn shadows_name(m: &Module, id: NodeId, name: Symbol) -> bool {
+    let Node::Call(c) = m.node(id) else {
+        return false;
+    };
+    match &c.inputs {
+        Some(Inputs::Spec(entries)) => entries.iter().any(|(_, r)| r.name == name),
+        Some(Inputs::Auto) => m
+            .auto_inputs_of(id)
+            .is_some_and(|entries| entries.iter().any(|(_, r)| r.name == name)),
+        None => false,
+    }
 }
 
 /// If `node` is a reified-callable application `k(input)` / `k(a, b, …)`
