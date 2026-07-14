@@ -52,6 +52,32 @@ pub fn distribution_param_names(name: &str) -> Option<Vec<String>> {
     catalogue::builtin().distribution_param_names(name)
 }
 
+/// Ordered constructor parameter names for a §06 *fundamental measure* —
+/// `Dirac(value)`, `Lebesgue(support)`, `Counting(support)` (spec §06
+/// "Fundamental measures" table). These are built-in measure constructors that
+/// are deliberately NOT in the §08 distribution catalogue (they have their own
+/// inference handling in `ops.rs`), so `distribution_param_names` returns `None`
+/// for them. `None` if `name` is not a fundamental measure.
+pub fn fundamental_measure_param_names(name: &str) -> Option<Vec<String>> {
+    match name {
+        "Dirac" => Some(vec!["value".to_string()]),
+        "Lebesgue" | "Counting" => Some(vec!["support".to_string()]),
+        _ => None,
+    }
+}
+
+/// Ordered constructor parameter names for any built-in *measure* constructor
+/// that may appear as a primitive measure the determiniser positionalizes: a
+/// §08/§09 distribution ([`distribution_param_names`]) or a §06 fundamental
+/// measure ([`fundamental_measure_param_names`]). This is the union the
+/// determiniser needs to map a positional constructor call
+/// (`Dirac(0)`, `Normal(0, 1)`) onto its by-name `record` kernel-input; a
+/// distribution catalogue lookup alone misses `Dirac`/`Lebesgue`/`Counting`.
+/// `None` if `name` is neither.
+pub fn constructor_param_names(name: &str) -> Option<Vec<String>> {
+    distribution_param_names(name).or_else(|| fundamental_measure_param_names(name))
+}
+
 /// A message produced during inference. `Error` marks an ill-formed module
 /// (the offending nodes carry `(%failed …)` types); `Note` records an
 /// honest gap (op not yet in the catalogue, deferred feature).
@@ -192,6 +218,38 @@ mod infer_module_entry_tests {
         let (_id, ba) = a.bindings().next().unwrap();
         let (_id2, bb) = b.bindings().next().unwrap();
         assert_eq!(a.type_of(ba.rhs), b.type_of(bb.rhs));
+    }
+
+    // §06 fundamental measures are NOT in the §08 distribution catalogue, so
+    // `distribution_param_names` misses them, but `constructor_param_names`
+    // (the union the determiniser uses to positionalize a primitive-measure
+    // call) must resolve their spec §06 "Fundamental measures" param order.
+    #[test]
+    fn constructor_param_names_covers_fundamental_measures() {
+        assert_eq!(distribution_param_names("Dirac"), None);
+        assert_eq!(
+            fundamental_measure_param_names("Dirac"),
+            Some(vec!["value".to_string()])
+        );
+        assert_eq!(
+            fundamental_measure_param_names("Lebesgue"),
+            Some(vec!["support".to_string()])
+        );
+        assert_eq!(
+            fundamental_measure_param_names("Counting"),
+            Some(vec!["support".to_string()])
+        );
+        assert_eq!(fundamental_measure_param_names("Normal"), None);
+        // The union resolves both a distribution and a fundamental measure.
+        assert_eq!(
+            constructor_param_names("Normal"),
+            Some(vec!["mu".to_string(), "sigma".to_string()])
+        );
+        assert_eq!(
+            constructor_param_names("Dirac"),
+            Some(vec!["value".to_string()])
+        );
+        assert_eq!(constructor_param_names("NotAMeasure"), None);
     }
 }
 

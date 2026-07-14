@@ -442,22 +442,36 @@ pub(crate) fn call_rule(
         // `weighted(weight, base)` / `logweighted(logweight, base)` (spec
         // §06): the measure is the SECOND argument.
         "weighted" | "logweighted" => fresh_measure(arg_ty(args, 1)),
-        // Reference measures (spec §06): measures over their support set.
-        "Lebesgue" | "Counting" => Type::Measure {
-            domain: Box::new(set_element_type(inf, args.first().map(|a| a.0))),
-            mass: Mass::Deferred,
-        },
+        // Reference measures (spec §06): measures over their support set. The
+        // `support` set is given as the named kwarg, auto-splatted from a
+        // positional `record(support = S)` (§04), or as the plain positional set.
+        "Lebesgue" | "Counting" => {
+            let support_node = named
+                .iter()
+                .find(|(n, _, _, _)| inf.module.resolve(*n) == "support")
+                .map(|(_, node, _, _)| *node)
+                .or_else(|| splat_field(inf, args, named, "support"))
+                .or_else(|| args.first().map(|a| a.0));
+            Type::Measure {
+                domain: Box::new(set_element_type(inf, support_node)),
+                mass: Mass::Deferred,
+            }
+        }
         // `Dirac(value = v)` (spec §06) is the point-mass probability measure at
         // `v`, for any variate type: the domain is `v`'s type. `value` is given
-        // as the named kwarg (spec form) or positionally. Mass is normalized
-        // (total mass 1) — set in `fill_mass`.
+        // as the named kwarg (spec form), auto-splatted from a positional
+        // `record(value = v)` (§04 — so `Dirac(record(value = v))` is a point
+        // mass at `v`, NOT at the record), or as a plain positional value. Mass
+        // is normalized (total mass 1) — set in `fill_mass`.
         "Dirac" => {
-            let v = arg_ty(args, 0).cloned().or_else(|| {
-                named
-                    .iter()
-                    .find(|(n, _, _, _)| inf.module.resolve(*n) == "value")
-                    .map(|(_, _, t, _)| t.clone())
-            });
+            let v = named
+                .iter()
+                .find(|(n, _, _, _)| inf.module.resolve(*n) == "value")
+                .map(|(_, _, t, _)| t.clone())
+                .or_else(|| {
+                    splat_field(inf, args, named, "value").and_then(|n| inf.lookup_type(n).cloned())
+                })
+                .or_else(|| arg_ty(args, 0).cloned());
             match v {
                 Some(t) => Type::Measure {
                     domain: Box::new(t),
@@ -2713,6 +2727,39 @@ fn record_field_dim(inf: &Inferencer<'_, '_>, rec: Option<NodeId>, kwarg: &str) 
         }
     }
     Dim::Dynamic
+}
+
+/// The value NODE of `field` when a call auto-splats a positional record (§04
+/// "Calling conventions"): auto-splat fires ONLY when a record is the call's
+/// SOLE argument, so this returns `None` unless there are no keyword arguments,
+/// exactly one positional argument, and that argument is a `record(...)` call
+/// carrying `field`. A record alongside other arguments, or bound to a
+/// parameter by keyword, is an ordinary value and is not splatted.
+///
+/// The §06 fundamental measures (`Dirac`/`Lebesgue`/`Counting`) resolve their
+/// single argument by hand (they are not in the §08 catalogue), so they consult
+/// this to splat a sole positional record the way the catalogue param path does
+/// for distributions — `Dirac(record(value = v))` binds `value = v`, not the
+/// whole record.
+fn splat_field(
+    inf: &Inferencer<'_, '_>,
+    args: &[ArgInfo],
+    named: &[NamedInfo],
+    field: &str,
+) -> Option<NodeId> {
+    if !named.is_empty() || args.len() != 1 {
+        return None;
+    }
+    let Node::Call(c) = inf.module.node(args[0].0) else {
+        return None;
+    };
+    if !matches!(c.head, CallHead::Builtin(op) if inf.module.resolve(op) == "record") {
+        return None;
+    }
+    c.named
+        .iter()
+        .find(|na| inf.module.resolve(na.name) == field)
+        .map(|na| na.value)
 }
 
 /// A dummy `SupportTag::Structural` check helper so `distribution_support` can
