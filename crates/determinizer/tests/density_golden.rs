@@ -473,6 +473,200 @@ lp = logdensityof(lawof(record(a = a)), record(a = 0.5))";
     );
 }
 
+// normalize(superpose(weighted(w₁, A₁), …)) of NORMALIZED mixands with
+// variate-independent scalar weights is a convex superposition: by §06 the total
+// mass is additive/multiplicative, Z = Σ wᵢ · totalmass(Aᵢ) = Σ wᵢ (a closed-form
+// scalar), so it lowers to the superpose density minus `log(Σ wᵢ)`, NOT a refuse.
+// Weights need NOT sum to one — here 0.3 + 0.5 = 0.8 — the normalizer is the
+// general `log(add w₁ w₂)`. Regression for buffy #262 (dissimilar-mixture).
+#[test]
+fn normalize_superpose_convex_mixture_lowers_with_sum_weights_normalizer() {
+    let src = "\
+m = normalize(superpose(\
+weighted(0.3, Normal(mu = 0.0, sigma = 1.0)), \
+weighted(0.5, Gamma(shape = 2.0, rate = 1.0))))
+a = draw(m)
+lp = logdensityof(lawof(record(a = a)), record(a = 0.5))";
+    let out = determinize_src(src);
+    let pir = flatppl_flatpir::write(&out);
+    assert!(
+        pir.contains("logsumexp"),
+        "mixture logsumexp present:\n{pir}"
+    );
+    assert_eq!(
+        pir.matches("builtin_logdensityof").count(),
+        2,
+        "one density term per mixand (Normal + Gamma):\n{pir}"
+    );
+    // The Z = Σ wᵢ normalizer: `sub(<superpose density>, log(add(0.3, 0.5)))`.
+    // The literal weights sum in a bare `(add 0.3 0.5)` (FlatPIR leaves literals
+    // un-`%meta`-wrapped) — distinct from the per-mixand `(add (log 0.3) …)`.
+    assert!(
+        pir.contains("(add 0.3 0.5)"),
+        "log(Σ wᵢ) additive-mass normalizer sums the weights:\n{pir}"
+    );
+    assert!(
+        !pir.contains("normalize")
+            && !pir.contains("superpose")
+            && !pir.contains("weighted")
+            && !pir.contains("lawof")
+            && !pir.contains("(draw "),
+        "measure layer gone:\n{pir}"
+    );
+    assert!(
+        !pir.contains("totalmass"),
+        "no totalmass query op emitted:\n{pir}"
+    );
+    assert!(
+        flatppl_determinizer::is_flatpdl(&out).is_ok(),
+        "is_flatpdl failed:\n{pir}"
+    );
+}
+
+// The spec's canonical mixture idiom (§06 "Additive superposition"):
+// `normalize(superpose(weighted(p, M1), weighted(1 - p, M2)))` with weights p and
+// `1 - p`. It lowers via the SAME convex-superposition rule — the weights-sum-to-
+// one case is Z = add(p, sub(1, p)) with no symbolic sum-to-one proof (the
+// backend evaluates log Z → log 1 = 0). Proves the dissimilar-mixture shape
+// unblocks. Regression for buffy #262.
+#[test]
+fn normalize_superpose_one_minus_p_mixture_idiom_lowers() {
+    let src = "\
+p = 0.4
+m = normalize(superpose(\
+weighted(p, Normal(mu = 0.0, sigma = 1.0)), \
+weighted(1.0 - p, Gamma(shape = 2.0, rate = 1.0))))
+a = draw(m)
+lp = logdensityof(lawof(record(a = a)), record(a = 0.5))";
+    let out = determinize_src(src);
+    let pir = flatppl_flatpir::write(&out);
+    assert!(
+        pir.contains("logsumexp"),
+        "mixture logsumexp present:\n{pir}"
+    );
+    assert_eq!(
+        pir.matches("builtin_logdensityof").count(),
+        2,
+        "one density term per mixand:\n{pir}"
+    );
+    // Z = add(p, 1 - p): the sum starts with the bare weight ref `p`, distinct
+    // from the per-mixand `(add (log (%ref self p)) …)` which starts with a `log`.
+    assert!(
+        pir.contains("(add (%ref self p)"),
+        "log(p + (1 - p)) additive-mass normalizer sums the weights:\n{pir}"
+    );
+    assert!(
+        !pir.contains("normalize") && !pir.contains("superpose") && !pir.contains("weighted"),
+        "measure layer gone:\n{pir}"
+    );
+    assert!(
+        flatppl_determinizer::is_flatpdl(&out).is_ok(),
+        "is_flatpdl failed:\n{pir}"
+    );
+}
+
+// Recognizer boundary (refuse-don't-mislower): a superposition of BARE
+// (unweighted) mixands is NOT the convex-combination shape the rule handles —
+// each component must be an explicit `weighted(wᵢ, Aᵢ)` so the weights `wᵢ` are
+// available to form Z = Σ wᵢ. A bare `superpose(A, B)` keeps the unnormalized
+// refuse. (Its Z = 2 is closed-form too, but out of the chosen scope.)
+#[test]
+fn normalize_superpose_bare_mixands_refuses() {
+    let src = "\
+m = normalize(superpose(Normal(mu = 0.0, sigma = 1.0), Normal(mu = 1.0, sigma = 1.0)))
+a = draw(m)
+lp = logdensityof(lawof(record(a = a)), record(a = 0.5))";
+    let m = {
+        let mut m = flatppl_syntax::parse(src).unwrap();
+        let _ = flatppl_infer::infer(&mut m);
+        m
+    };
+    let err = determinize(&m).expect_err("bare-mixand superpose must refuse, not lower");
+    assert_eq!(
+        err.construct, "normalize",
+        "refusal names normalize: {err:?}"
+    );
+    assert!(
+        err.reason.contains("closed-form mass rule"),
+        "refusal explains the missing mass rule: {err:?}"
+    );
+}
+
+// Recognizer boundary: a weighted mixand whose base is NOT a probability measure
+// (here `Lebesgue`, locally-finite) has no unit total mass, so Z ≠ Σ wᵢ and the
+// convex-superposition rule does not apply — refuse rather than mislower.
+#[test]
+fn normalize_superpose_non_normalized_mixand_refuses() {
+    let src = "\
+m = normalize(superpose(\
+weighted(0.5, Lebesgue(support = reals)), \
+weighted(0.5, Normal(mu = 0.0, sigma = 1.0))))
+a = draw(m)
+lp = logdensityof(lawof(record(a = a)), record(a = 0.5))";
+    let m = {
+        let mut m = flatppl_syntax::parse(src).unwrap();
+        let _ = flatppl_infer::infer(&mut m);
+        m
+    };
+    let err = determinize(&m).expect_err("non-normalized mixand must refuse, not lower");
+    assert_eq!(
+        err.construct, "normalize",
+        "refusal names normalize: {err:?}"
+    );
+}
+
+// The scored VALUE of a record-variate density may be a NAMED binding referring
+// to a record literal (`theta = record(...)`, a `Ref(SelfMod, theta)`), not an
+// inline `record(...)`. `match_independent_record` resolves one ref level (as the
+// measure side does) so the ref form lowers the same as the inline form — no
+// "value must be a record" refuse. Regression for buffy #264 (surfaced verifying
+// #262: dissimilar-mixture's `theta = record(...)` posterior score).
+#[test]
+fn record_variate_score_value_by_ref_lowers() {
+    let src = "\
+a = draw(Normal(0.0, 1.0))
+b = draw(Normal(1.0, 2.0))
+theta = record(a = 0.5, b = 0.5)
+lp = logdensityof(lawof(record(a = a, b = b)), theta)";
+    let out = determinize_src(src);
+    let pir = flatppl_flatpir::write(&out);
+    assert_eq!(
+        pir.matches("builtin_logdensityof").count(),
+        2,
+        "both record components lower through the ref-valued theta:\n{pir}"
+    );
+    assert!(
+        !pir.contains("lawof") && !pir.contains("(draw "),
+        "measure layer gone:\n{pir}"
+    );
+    assert!(
+        flatppl_determinizer::is_flatpdl(&out).is_ok(),
+        "is_flatpdl failed:\n{pir}"
+    );
+}
+
+// Same ref-valued-score fix on the keyword-`joint` value path
+// (`lower_keyword_joint`): a `joint(x = …, y = …)` scored at a `theta = record(x
+// = …, y = …)` ref lowers, not "joint value must be a record". Regression for
+// buffy #264.
+#[test]
+fn keyword_joint_score_value_by_ref_lowers() {
+    let src = "\
+theta = record(x = 0.5, y = 1.0)
+lp = logdensityof(joint(x = Normal(0.0, 1.0), y = Normal(1.0, 2.0)), theta)";
+    let out = determinize_src(src);
+    let pir = flatppl_flatpir::write(&out);
+    assert_eq!(
+        pir.matches("builtin_logdensityof").count(),
+        2,
+        "both joint components lower through the ref-valued theta:\n{pir}"
+    );
+    assert!(
+        flatppl_determinizer::is_flatpdl(&out).is_ok(),
+        "is_flatpdl failed:\n{pir}"
+    );
+}
+
 // truncate(M, S): logdensityof → ifelse(in(v, S), density(M, v), neg(inf)).
 // The gate is the `_ in R` membership builtin (FlatPIR head `in`), which infers
 // to a boolean — NOT `elementof` (a set-valued param-decl that would type to

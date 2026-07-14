@@ -44,6 +44,13 @@
 //!   two Gaussians (`g1`, `g2` both `Normal`), → `sub(add(density(g1, v),
 //!   density(g2, v)), logZ)` with the Gaussian-overlap `logZ = density(Normal(mu =
 //!   μ2, sigma = sqrt(σ1² + σ2²)), μ1)` (§08 Normal);
+//!   when `M = superpose(weighted(w₁, A₁), …, weighted(wₖ, Aₖ))` is a convex
+//!   superposition of normalized mixands (each `Aᵢ` a probability measure, each
+//!   `wᵢ` a variate-independent scalar), → `sub(density(M, v), log(Σ wᵢ))` with
+//!   the additive-mass normalizer `Z = Σ wᵢ · totalmass(Aᵢ) = Σ wᵢ` (§06
+//!   "Additive superposition", "Density reweighting"); the weights-sum-to-one
+//!   mixture idiom the spec names as canonical is the `Z = 1` (`log Σ wᵢ = 0`)
+//!   special case;
 //!   **refuses** for any other `M` — a `truncate` whose `base` is unnormalized
 //!   (e.g. `Lebesgue`, where the CDF-Z identity does not hold), or normalized but
 //!   discrete (`Binomial`/`Poisson`/`Categorical`) or multivariate (`MvNormal`),
@@ -1133,6 +1140,13 @@ fn match_independent_record(
         ));
     }
 
+    // The scored value may be a NAMED binding referring to a record literal
+    // (`theta = record(...)`, i.e. a `Ref(SelfMod, theta)`), not an inline
+    // `record(...)`. Resolve one ref level — as the measure side does in
+    // `lower_measure_density` — so a ref-to-record variate destructures the same
+    // as the inline form. A deeper ref-to-ref chain still refuses (one level,
+    // matching the measure side).
+    let (v, _) = resolve_ref_one(m, v);
     let vrec = expect_builtin_call(m, v, "record")
         .ok_or_else(|| refuse(v, m, "value must be a record"))?;
     if !vrec.args.is_empty() {
@@ -1624,6 +1638,36 @@ fn lower_normalize(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Re
         return Ok(build_call(m, "sub", &[sum, log_z]));
     }
 
+    // Closed-form Z for a CONVEX SUPERPOSITION OF NORMALIZED MIXANDS:
+    // `normalize(superpose(weighted(w₁, A₁), …, weighted(wₖ, Aₖ)))` where every
+    // mixand Aᵢ is a probability measure and every weight wᵢ is a
+    // variate-independent scalar. Total mass is additive over the superposition
+    // and multiplicative under `weighted` (§06 "Additive superposition",
+    // "Density reweighting"):
+    //   Z = totalmass(superpose(weighted(wᵢ, Aᵢ)))
+    //     = Σ wᵢ · totalmass(Aᵢ) = Σ wᵢ           (Aᵢ normalized ⇒ totalmass = 1).
+    // So Z = Σ wᵢ is a closed-form deterministic scalar, and (reusing the
+    // existing `superpose`/`weighted` density lowering for the numerator)
+    //   logdensityof(normalize(sup), v)
+    //     = logdensityof(sup, v) − log(Σ wᵢ)
+    //     = logsumexp([log wᵢ + logdensityof(Aᵢ, v)]) − log(Σ wᵢ).
+    // The weights-sum-to-one mixture idiom the spec names as canonical (§06
+    // "Additive superposition": `normalize(superpose(weighted(w1, M1),
+    // weighted(w2, M2)))`) is the Z = 1 special case — `log(Σ wᵢ) = log 1 = 0` —
+    // handled by the SAME rule, with no symbolic sum-to-one proof. A
+    // variate-DEPENDENT weight makes `totalmass(weighted(w, A)) = ∫ w(x) dA(x)` a
+    // v-dependent integral with no scalar closed form, so such a superposition
+    // falls through to the refuse below (refuse-don't-mislower). A degenerate
+    // Z (all weights zero → `log(0) = −∞`; an infinite weight → `log(inf) = ∞`)
+    // violates §06's Z finite & nonzero precondition and is the backend's runtime
+    // concern, consistent with the truncate and Gaussian-product arms above.
+    if let Some(weights) = recognize_convex_superposition(m, m_inner_resolved) {
+        let sup_density = lower_measure_density(m, m_inner, v)?;
+        let z = fold_add(m, &weights);
+        let log_z = build_call(m, "log", &[z]);
+        return Ok(build_call(m, "sub", &[sup_density, log_z]));
+    }
+
     // No closed-form mass rule for an unnormalized measure in this MVP.
     Err(RefuseError {
         node,
@@ -1632,6 +1676,64 @@ fn lower_normalize(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Re
                  `totalmass` is not FlatPDL"
             .to_string(),
     })
+}
+
+/// Recognize `superpose(weighted(w₁, A₁), …, weighted(wₖ, Aₖ))` (k ≥ 2) as a
+/// convex superposition of normalized mixands: every component is a `weighted`
+/// whose base measure Aᵢ is a probability measure (`Mass::Normalized`) and whose
+/// weight wᵢ is a variate-INDEPENDENT scalar. Returns the weight nodes
+/// (w₁ … wₖ) in order — their sum is the closed-form normalizer Z = Σ wᵢ (see
+/// [`lower_normalize`]) — or `None` if any component does not match, in which
+/// case `normalize` keeps its refuse (refuse-don't-mislower).
+///
+/// Each mixand's normalized-ness is read from its INFERRED type: a leaf §08
+/// distribution, a `lawof`, a `Dirac`, or a normalized combinator all carry
+/// `Mass::Normalized` (`fill_mass`). A bare (unweighted) component, a mixand that
+/// is not statically normalized, or a variate-dependent weight all yield `None` —
+/// the recognizer never assumes a mass it cannot read off the type. Structural,
+/// immutable read of `m`.
+fn recognize_convex_superposition(m: &Module, node: NodeId) -> Option<Vec<NodeId>> {
+    let components: Vec<NodeId> = {
+        let sup = expect_builtin_call(m, node, "superpose")?;
+        if sup.args.len() < 2 {
+            return None;
+        }
+        sup.args.to_vec()
+    };
+    let mut weights = Vec::with_capacity(components.len());
+    for comp in components {
+        let (comp_resolved, _) = resolve_ref_one(m, comp);
+        let (weight, base) = {
+            let w = expect_builtin_call(m, comp_resolved, "weighted")?;
+            if w.args.len() != 2 {
+                return None;
+            }
+            (w.args[0], w.args[1])
+        };
+        // The mixand must be a probability measure — its Z contribution is then
+        // wᵢ · totalmass(Aᵢ) = wᵢ. Read the mass off the inferred type; anything
+        // not statically `Mass::Normalized` (Finite/LocallyFinite/Unknown) has no
+        // closed-form unit mass, so bail.
+        let (base_resolved, _) = resolve_ref_one(m, base);
+        let base_normalized = matches!(
+            m.type_of(base_resolved),
+            Some(Type::Measure {
+                mass: Mass::Normalized,
+                ..
+            })
+        );
+        if !base_normalized {
+            return None;
+        }
+        // The weight must be variate-independent: a v-dependent weight makes
+        // `totalmass(weighted(w, A)) = ∫ w(x) dA(x)` a v-dependent integral, not
+        // the scalar Σ wᵢ closed form.
+        if weight_is_variate_dependent(m, weight) {
+            return None;
+        }
+        weights.push(weight);
+    }
+    Some(weights)
 }
 
 /// A recognized `normalize(logweighted(…))` pointwise product of two Gaussians.
@@ -3066,6 +3168,10 @@ fn lower_keyword_joint(
         }
     }
 
+    // As in `match_independent_record`: the scored value may be a ref to a record
+    // binding (`theta = record(...)`), not an inline `record(...)`. Resolve one
+    // ref level before destructuring.
+    let (v, _) = resolve_ref_one(m, v);
     let vrec = expect_builtin_call(m, v, "record")
         .ok_or_else(|| refuse(v, m, "joint value must be a record"))?;
     // A stray positional element mixed with the named fields (e.g. `record(0.9,
