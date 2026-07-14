@@ -164,6 +164,40 @@ lp = logdensityof(lawof(record(a = a)), record(a = 0.5))";
     assert!(flatppl_determinizer::is_flatpdl(&determinize_src(src)).is_ok());
 }
 
+// §04 auto-splat applies at ANY arity: a positional record whose field names
+// match the callable's parameter names splats — including a single-param
+// callable. `Dirac`'s sole `value` param: `Dirac(record(value = 5.0))` splats to
+// `Dirac(value = 5.0)` (a point mass at the SCALAR, extracted via `get`), NOT at
+// the record. Both engines agree — inference types the variate scalar and the
+// determiniser extracts the field. The record-VALUE form is the keyword
+// `Dirac(value = record(...))`, which is not a positional splat. Regression for
+// the §04-literal auto-splat arity semantics.
+#[test]
+fn positional_record_auto_splats_at_any_arity_keyword_record_is_the_value() {
+    // Positional record → splat → `value` bound to the record's `value` field
+    // (via `get`); the scored variate is the scalar.
+    let splat = "\
+a = draw(Dirac(record(value = 5.0)))
+lp = logdensityof(lawof(record(a = a)), record(a = 5.0))";
+    let out_splat = determinize_src(splat);
+    let pir_splat = flatppl_flatpir::write(&out_splat);
+    assert!(
+        pir_splat.contains("builtin_logdensityof Dirac") && pir_splat.contains("(get "),
+        "positional Dirac(record(value=v)) auto-splats (value pulled via get):\n{pir_splat}"
+    );
+    assert!(flatppl_determinizer::is_flatpdl(&out_splat).is_ok());
+
+    // Keyword record → NOT a splat → `value` bound to the whole record.
+    let value = "\
+a = draw(Dirac(value = record(value = 5.0)))
+lp = logdensityof(lawof(record(a = a)), record(a = record(value = 5.0)))";
+    let pir_value = flatppl_flatpir::write(&determinize_src(value));
+    assert!(
+        pir_value.contains("builtin_logdensityof Dirac") && !pir_value.contains("(get "),
+        "keyword Dirac(value = record(...)) is the record value, not a splat:\n{pir_value}"
+    );
+}
+
 // A record-of-draws prior with a BIJECTION-TRANSFORMED field
 // (`sigma = sqrt(sigma2)`, `sigma2` a draw) lowers the field's marginal as the
 // pushforward of the inner draw's law under the transform (§06 pushfwd

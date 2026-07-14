@@ -3253,6 +3253,15 @@ pub(crate) fn split_kernel_constructor(
     // is pulled with `get(arg, "field")` (the same lowering as `arg.field`,
     // §07). Regression for buffy #247. A single positional arg that is NOT a
     // param-matching record falls through to positional index-binding below.
+    // §04 auto-splat applies at ANY arity: a positional `record(...)` whose
+    // field names match the callable's parameter names binds those fields to
+    // the parameters, so `Dirac(record(value = v))` is `Dirac(value = v)` (a
+    // point mass at `v`, NOT at the record). The record-VALUE form is the
+    // keyword `Dirac(value = record(...))`, which is not a positional splat and
+    // reaches the index-binding path below. Inference resolves the same way (it
+    // splats a positional record for §08 distributions and, via the
+    // fundamental-measure arms, for `Dirac`/`Lebesgue`/`Counting`), so the two
+    // engines stay in step.
     if kwargs.is_empty() && pos_args.len() == 1 {
         let arg = pos_args[0];
         let record_field_names: Option<Vec<String>> = match m.type_of(arg) {
