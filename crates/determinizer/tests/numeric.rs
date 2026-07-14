@@ -124,9 +124,21 @@ fn iid_normal_sum_structure() {
     // logdensityof(iid(Normal(0,1), 3), [0.5, -0.3, 1.2]) = Σ_{i<3} log N(get0(v,i);0,1)
     // Static unroll: each term scores the SAME Normal(0,1) at a distinct index of
     // the variate `get0(v, i)`, i = 0, 1, 2.
+    //
+    // The variate is a NAMED binding (`data`), not an inline literal: canon
+    // Pass 3 (`flatten_structural`, buffy #263) only resolves `get0` over a
+    // LITERAL `vector(...)` constructor, never through a `Ref` — so naming the
+    // data here (matching `iid_lengthof_sized_lowers` below) keeps the `get0`
+    // projection structure this test pins intact. An inline-literal variate
+    // would be flattened away entirely by canon, which would make this test's
+    // per-index `get0` shape check vacuous (the term-by-term sum is invariant
+    // to `get0` index assignment here, since all three terms share the
+    // identical Normal(0,1) kernel, so a wrong/transposed index could not be
+    // caught once the literals are substituted in).
     let src = "\
+data = [0.5, -0.3, 1.2]
 d = iid(Normal(mu = 0.0, sigma = 1.0), 3)
-lp = logdensityof(d, [0.5, -0.3, 1.2])";
+lp = logdensityof(d, data)";
     let m = parse_infer(src);
     let out = determinize(&m).expect("iid must lower");
     assert!(
@@ -245,11 +257,22 @@ lp = logdensityof(d, data)";
 // Model: iid(iid(Normal(0,1), 2), 3) scored at a shape-[3,2] array literal.
 // Expected: 3×2 = 6 `builtin_logdensityof` terms, each reached by a NESTED
 // projection get0(get0(v, i), j), and no residual measure layer.
+//
+// The variate is a NAMED binding (`data`), not an inline literal array: canon
+// Pass 3 (`flatten_structural`, buffy #263) only resolves `get0` over a
+// LITERAL `vector(...)` constructor, never through a `Ref`, so naming the
+// data keeps the nested `get0` shape below intact. All six terms here share
+// the identical Normal(0,1) kernel, so the sum is invariant to how the six
+// literal values are assigned to slots — an inline-literal variate would let
+// canon flatten every projection away, making the nested-shape assertions
+// below vacuous (a row/column transposition bug in the nested-iid lowering
+// would go undetected once the literals are substituted in).
 #[test]
 fn iid_nonscalar_inner_measure_lowers_with_nested_get0() {
     let src = "\
+data = [[0.5, -0.3], [1.2, 0.1], [-0.7, 0.9]]
 d = iid(iid(Normal(mu = 0.0, sigma = 1.0), 2), 3)
-lp = logdensityof(d, [[0.5, -0.3], [1.2, 0.1], [-0.7, 0.9]])";
+lp = logdensityof(d, data)";
     let m = parse_infer(src);
     let out = determinize(&m).expect("iid over a non-scalar M must lower, not refuse");
     assert!(
@@ -302,9 +325,16 @@ lp = logdensityof(d, [[0.5, -0.3], [1.2, 0.1], [-0.7, 0.9]])";
 fn joint_two_gaussians_structure() {
     // logdensityof(joint(Normal(0,1), Normal(1,2)), [0.5, 0.5]) →
     //   add(density(Normal(0,1), get0(v,0)), density(Normal(1,2), get0(v,1)))
+    //
+    // The variate is a NAMED binding (`data`), not an inline literal: canon
+    // Pass 3 (`flatten_structural`, buffy #263) only resolves `get0` over a
+    // LITERAL `vector(...)` constructor, never through a `Ref`, so naming the
+    // data keeps the per-component `get0` slot structure this test pins
+    // intact (an inline-literal variate would flatten both projections away).
     let src = "\
+data = [0.5, 0.5]
 d = joint(Normal(mu = 0.0, sigma = 1.0), Normal(mu = 1.0, sigma = 2.0))
-lp = logdensityof(d, [0.5, 0.5])";
+lp = logdensityof(d, data)";
     let m = parse_infer(src);
     let out = determinize(&m).expect("joint must lower");
     assert!(flatppl_determinizer::is_flatpdl(&out).is_ok());
