@@ -1055,12 +1055,23 @@ fn lower_lawof(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Refuse
 /// value node from `v`, and — when the component reached us through a binding
 /// reference — that binding, so the driver can pin it to the scored value.
 struct Component {
-    /// The distribution-constructor (or combinator) node `mᵢ`.
+    /// The distribution-constructor (or combinator) node `mᵢ`. For a
+    /// bijection-transformed field (`transform = Some(g)`), this is the INNER
+    /// draw's measure `Mᵢ`; the driver wraps it as `pushfwd(g, Mᵢ)` before
+    /// scoring.
     measure: NodeId,
     /// The matching part of `v` to score `mᵢ` at.
     pinned: NodeId,
-    /// `Some(bid)` when the component is `(%ref self x)` pointing to a draw binding.
+    /// `Some(bid)` when the component reached us through a `(%ref self x)`
+    /// binding, so the driver can pin that binding to the scored value. For a
+    /// transformed field this is the OUTER binding (`sigma` in `sigma =
+    /// sqrt(sigma2)`) — pinning it to the scored value feeds sibling measures
+    /// and the likelihood that reference `sigma`.
     draw_binding: Option<BindingId>,
+    /// `Some(g)` when the field is a unary bijection `g(draw)` (spec §06
+    /// pushfwd) rather than a bare `draw`: the field's law is the pushforward
+    /// of the inner draw's law under the built-in `g` (e.g. `sqrt`).
+    transform: Option<Symbol>,
 }
 
 /// Lower `record(a = draw(Mₐ), ...)` at `record_node` with value `v`.
@@ -1078,10 +1089,21 @@ fn lower_record_of_draws(
         return Ok(m.alloc(Node::Lit(Scalar::Real(0.0))));
     }
 
-    // Build density terms per component.
+    // Build density terms per component. A bijection-transformed field
+    // (`transform = Some(g)`) is scored as the pushforward `pushfwd(g, Mᵢ)` of
+    // the inner draw's law under `g` — `lower_pushfwd` applies the §06
+    // change-of-variables (`logdensityof(Mᵢ, g⁻¹(y)) − logvol(g⁻¹(y))`),
+    // reusing the recorded/derived inverse; a non-invertible `g` refuses there.
     let mut terms: Vec<NodeId> = Vec::with_capacity(components.len());
     for comp in &components {
-        terms.push(lower_measure_density(m, comp.measure, comp.pinned)?);
+        let measure = match comp.transform {
+            None => comp.measure,
+            Some(g) => {
+                let fwd = m.alloc(Node::Const(g));
+                build_call(m, "pushfwd", &[fwd, comp.measure])
+            }
+        };
+        terms.push(lower_measure_density(m, measure, comp.pinned)?);
     }
 
     // Pin each referenced draw binding to its scored value.
@@ -1129,43 +1151,92 @@ fn match_independent_record(
         let pinned = lookup_field(m, &vrec.named, field.name)
             .ok_or_else(|| refuse(v, m, "missing field in value record"))?;
 
-        let (measure, draw_binding) = resolve_component_draw(m, field.value).ok_or_else(|| {
-            refuse(
-                field.value,
-                m,
-                "field is not a draw or a reference to a draw",
-            )
-        })?;
+        let (measure, draw_binding, transform) = resolve_component_draw(m, field.value)
+            .ok_or_else(|| {
+                refuse(
+                    field.value,
+                    m,
+                    "field is not a draw, a reference to a draw, or a bijection of a draw",
+                )
+            })?;
         components.push(Component {
             measure,
             pinned,
             draw_binding,
+            transform,
         });
     }
 
     Ok(components)
 }
 
-/// Resolve a record-field value to its underlying draw's measure argument.
-/// Returns `(measure_node, draw_binding)` where `draw_binding` is the binding
-/// whose RHS is the `draw(...)`, if reached through a ref.
-fn resolve_component_draw(m: &Module, value: NodeId) -> Option<(NodeId, Option<BindingId>)> {
-    // Case A: `(%ref self x)` → look up binding `x`; its RHS must be `draw(mᵢ)`.
-    if let Node::Ref(Ref {
-        ns: RefNs::SelfMod,
-        name,
-    }) = m.node(value)
-    {
-        let bid = m.binding_by_name(*name)?;
-        let rhs = m.binding(bid).rhs;
-        let measure = draw_argument(m, rhs)?;
-        return Some((measure, Some(bid)));
+/// Resolve a record-field value to the measure to score it at. Returns
+/// `(measure_node, outer_binding, transform)`:
+/// * `measure_node` — the inner draw's measure argument `Mᵢ` (the
+///   distribution-constructor node);
+/// * `outer_binding` — `Some(bid)` when the field reached us through a
+///   `(%ref self x)` binding, so the driver can pin `x` to the scored value;
+/// * `transform` — `Some(g)` when the field is a unary bijection `g(draw)`
+///   (§06 pushfwd) rather than a bare draw; the driver wraps `Mᵢ` as
+///   `pushfwd(g, Mᵢ)` before scoring.
+///
+/// Cases: **A** `(%ref self x)` whose binding RHS is `draw(Mᵢ)`; **B** inline
+/// `draw(Mᵢ)`; **C** a unary builtin call `g(inner)` (either inline or the RHS
+/// of a `(%ref self x)` binding) where `inner` resolves — one further ref hop —
+/// to a `draw(Mᵢ)`. `sigma = sqrt(sigma2)` is Case C: `outer_binding` is
+/// `sigma`'s binding and `transform = sqrt`.
+fn resolve_component_draw(
+    m: &Module,
+    value: NodeId,
+) -> Option<(NodeId, Option<BindingId>, Option<Symbol>)> {
+    // One `(%ref self x)` hop: the field either IS a self-ref to a binding
+    // (Cases A / ref-C) or is spelled inline (Cases B / inline-C).
+    let (effective, outer_binding) = match m.node(value) {
+        Node::Ref(Ref {
+            ns: RefNs::SelfMod,
+            name,
+        }) => {
+            let bid = m.binding_by_name(*name)?;
+            (m.binding(bid).rhs, Some(bid))
+        }
+        _ => (value, None),
+    };
+
+    // Cases A / B: the effective RHS is a bare `draw(Mᵢ)`.
+    if let Some(measure) = draw_argument(m, effective) {
+        return Some((measure, outer_binding, None));
     }
-    // Case B: inline `draw(mᵢ)` as the field value.
-    if let Some(measure) = draw_argument(m, value) {
-        return Some((measure, None));
+
+    // Case C: the effective RHS is a unary built-in call `g(inner)` where
+    // `inner` resolves (one more ref hop) to a `draw(Mᵢ)`. The field's law is
+    // the pushforward of the inner draw's law under `g`. `g` need not be a
+    // recognised bijection here — the driver's `pushfwd(g, Mᵢ)` lowering
+    // refuses a non-invertible `g` (refuse-don't-mislower).
+    if let Node::Call(c) = m.node(effective) {
+        if let CallHead::Builtin(g) = c.head {
+            if c.args.len() == 1 && c.named.is_empty() {
+                if let Some(inner_measure) = resolve_inner_draw_measure(m, c.args[0]) {
+                    return Some((inner_measure, outer_binding, Some(g)));
+                }
+            }
+        }
     }
     None
+}
+
+/// The inner half of Case C: resolve `node` — one `(%ref self x)` hop or inline
+/// — to the measure argument of a `draw(Mᵢ)`. Returns just the measure; the
+/// inner draw's binding is NOT pinned (in the transformed-field models it is
+/// referenced only to define the outer binding, which the driver pins instead).
+fn resolve_inner_draw_measure(m: &Module, node: NodeId) -> Option<NodeId> {
+    let effective = match m.node(node) {
+        Node::Ref(Ref {
+            ns: RefNs::SelfMod,
+            name,
+        }) => m.binding(m.binding_by_name(*name)?).rhs,
+        _ => node,
+    };
+    draw_argument(m, effective)
 }
 
 // ---------------------------------------------------------------------------
@@ -2140,7 +2211,7 @@ fn lower_projection_pushfwd(
             // A record field's value is `draw(Mₐ)` (or a ref to one) — unwrap to
             // the underlying measure argument before reading its mass.
             refuse_unnormalized_dropped_fields(m, m_inner, &named, fields, |m, value| {
-                resolve_component_draw(m, value).map(|(measure, _)| measure)
+                resolve_component_draw(m, value).map(|(measure, _, _)| measure)
             })?;
             let selected = select_projection_fields(m, m_inner, &named, fields)?;
             let record_sym = m.intern("record");
@@ -2787,10 +2858,11 @@ fn lower_broadcast_kernel(
         }
     };
 
-    // Ordered constructor parameter names (spec §08). `None` ⇒ the head is not a
-    // known distribution constructor (e.g. a deterministic op) ⇒ refuse.
+    // Ordered constructor parameter names (spec §08 distributions + §06
+    // fundamental measures). `None` ⇒ the head is not a known measure
+    // constructor (e.g. a deterministic op) ⇒ refuse.
     let param_names =
-        flatppl_infer::distribution_param_names(m.resolve(ctor_sym)).ok_or_else(|| {
+        flatppl_infer::constructor_param_names(m.resolve(ctor_sym)).ok_or_else(|| {
             refuse(
                 measure,
                 m,
@@ -3114,8 +3186,9 @@ fn variate_kind(t: &Type) -> Option<VariateKind> {
 ///
 /// * keyword form `Ctor(mu = m, sigma = s)` → the named args verbatim;
 /// * positional form `Ctor(m, s)` → each positional arg bound to the
-///   constructor's ordered parameter name (§08 parameter order, via
-///   [`flatppl_infer::distribution_param_names`]);
+///   constructor's ordered parameter name (§08 distribution / §06
+///   fundamental-measure parameter order, via
+///   [`flatppl_infer::constructor_param_names`]);
 /// * mixed form `Ctor(m, sigma = s)` → positional args bound by order, then the
 ///   keyword args.
 ///
@@ -3166,7 +3239,48 @@ pub(crate) fn split_kernel_constructor(
     // parameter names. A head that is not a known distribution constructor, or
     // more positional args than it has parameters, is not a well-formed
     // positional constructor call → None.
-    let param_names = flatppl_infer::distribution_param_names(m.resolve(sym))?;
+    let param_names = flatppl_infer::constructor_param_names(m.resolve(sym))?;
+
+    // §04 "Calling conventions" auto-splatting: `Ctor(record(p1 = …, p2 = …))`
+    // is equivalent to `Ctor(p1 = …, p2 = …)`. When the sole positional arg is
+    // a RECORD whose field names match the constructor's parameter names,
+    // distribute its fields across the params instead of (mis)binding the whole
+    // record to `param_names[0]` and dropping the rest. §04 keys auto-splat off
+    // the argument's TYPE, not its surface syntax, so this fires for both a
+    // literal `record(…)` and an opaque multi-output call returning a record
+    // (e.g. `gamma_shape_rate(μ, σ)` whose body is `record(shape = …, rate =
+    // …)`) — the latter can't be read field-wise from the node, so each field
+    // is pulled with `get(arg, "field")` (the same lowering as `arg.field`,
+    // §07). Regression for buffy #247. A single positional arg that is NOT a
+    // param-matching record falls through to positional index-binding below.
+    if kwargs.is_empty() && pos_args.len() == 1 {
+        let arg = pos_args[0];
+        let record_field_names: Option<Vec<String>> = match m.type_of(arg) {
+            Some(Type::Record(fields)) => Some(
+                fields
+                    .iter()
+                    .map(|(s, _)| m.resolve(*s).to_string())
+                    .collect(),
+            ),
+            _ => None,
+        };
+        if let Some(field_names) = record_field_names {
+            let params: std::collections::BTreeSet<&str> =
+                param_names.iter().map(String::as_str).collect();
+            let fields: std::collections::BTreeSet<&str> =
+                field_names.iter().map(String::as_str).collect();
+            if params == fields {
+                let mut args: Vec<(Symbol, NodeId)> = Vec::with_capacity(param_names.len());
+                for p in &param_names {
+                    let key = m.alloc(Node::Lit(Scalar::Str(p.clone().into_boxed_str())));
+                    let getter = build_call(m, "get", &[arg, key]);
+                    args.push((m.intern(p), getter));
+                }
+                return Some((sym, args));
+            }
+        }
+    }
+
     if pos_args.len() > param_names.len() {
         return None;
     }

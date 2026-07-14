@@ -271,6 +271,16 @@ fn bare_bijection(
                 logvol,
             }))
         }
+        // `sqrt(x) = pow(x, 0.5)` — spec §06 "Known-bijection registry" lists
+        // `pow` with a literal exponent among the mandated built-in bijections,
+        // and `sqrt` is exactly that with `k = 0.5`. Delegate to `derive_pow`
+        // (which carries the oracle-verified inverse `pow(x, 1/k)`, log-volume,
+        // and the strictly-positive-domain guard) rather than hand-deriving a
+        // parallel change-of-variables that could diverge from `pow`'s.
+        "sqrt" => {
+            let half = m.alloc(Node::Lit(Scalar::Real(0.5)));
+            derive_pow(m, f, half, support)
+        }
         _ => Ok(None),
     }
 }

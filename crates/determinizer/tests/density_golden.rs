@@ -103,6 +103,135 @@ lp = logdensityof(lawof(record(a = a)), record(a = 0.5))";
     );
 }
 
+// The positional→keyword mapping must also cover §06 *fundamental measures*
+// (`Dirac`/`Lebesgue`/`Counting`), which are NOT in the §08 distribution
+// catalogue — so `constructor_param_names` (not `distribution_param_names`)
+// must resolve `Dirac`'s ordered param `["value"]`. `Dirac(0)` (positional)
+// therefore binds `value=0` and lowers to the identical FlatPDL as the keyword
+// form `Dirac(value = 0)`. Regression for buffy #246 (positional Dirac was
+// refused because the distribution catalogue has no Dirac row).
+#[test]
+fn positional_dirac_constructor_lowers_same_as_keyword() {
+    let positional = "\
+a = draw(Dirac(0.0))
+lp = logdensityof(lawof(record(a = a)), record(a = 0.0))";
+    let keyword = "\
+a = draw(Dirac(value = 0.0))
+lp = logdensityof(lawof(record(a = a)), record(a = 0.0))";
+    let pir_pos = flatppl_flatpir::write(&determinize_src(positional));
+    let pir_kw = flatppl_flatpir::write(&determinize_src(keyword));
+    assert!(
+        pir_pos.contains("builtin_logdensityof") && pir_pos.contains("(record (%field value 0.0))"),
+        "positional Dirac binds its single §06 param value:\n{pir_pos}"
+    );
+    assert_eq!(
+        pir_pos, pir_kw,
+        "positional and keyword Dirac lower to identical FlatPDL:\npositional:\n{pir_pos}\nkeyword:\n{pir_kw}"
+    );
+}
+
+// §04 auto-splatting: a multi-output function whose body is a record
+// (`gamma_shape_rate(μ,σ) = record(shape = …, rate = …)`) called as the sole
+// positional argument to a constructor whose params match those fields
+// (`Gamma(gamma_shape_rate(…))`) must distribute the record's fields across the
+// constructor's params — NOT bind the whole record to `shape` and drop `rate`.
+// The record arrives as an opaque CALL (not a literal record), so each field is
+// pulled with `get(arg, "field")`. Regression for buffy #247 (the splat wasn't
+// firing → emitted `record(shape = gamma_shape_rate(…))` with `rate` missing).
+#[test]
+fn multi_output_record_call_auto_splats_into_constructor() {
+    let src = "\
+gamma_shape_rate(mu, sigma) = record(shape = mu, rate = sigma)
+a = draw(Gamma(gamma_shape_rate(2.0, 1.0)))
+lp = logdensityof(lawof(record(a = a)), record(a = 0.5))";
+    let pir = flatppl_flatpir::write(&determinize_src(src));
+    // Both constructor params are bound — `rate` is not dropped.
+    assert!(
+        pir.contains("(%field shape ") && pir.contains("(%field rate "),
+        "both Gamma params bound after auto-splat (rate not dropped):\n{pir}"
+    );
+    // Each field is a `get` on the (shared) multi-output call — the splat did
+    // not bind the whole record to `shape`.
+    assert_eq!(
+        pir.matches("(get ").count(),
+        2,
+        "each splatted field is a get(call, \"field\") accessor:\n{pir}"
+    );
+    assert!(
+        !pir.contains("(%field shape (%call") && !pir.contains("(%field shape (record"),
+        "shape must NOT hold the whole record (the pre-fix bug):\n{pir}"
+    );
+    assert!(flatppl_determinizer::is_flatpdl(&determinize_src(src)).is_ok());
+}
+
+// A record-of-draws prior with a BIJECTION-TRANSFORMED field
+// (`sigma = sqrt(sigma2)`, `sigma2` a draw) lowers the field's marginal as the
+// pushforward of the inner draw's law under the transform (§06 pushfwd
+// change-of-variables), NOT a refuse. `sqrt` is `pow(_, 0.5)`, a spec §06
+// "Known-bijection registry" member. Regression for buffy #245: the
+// record-of-draws path used to reject any field that was not a bare draw.
+#[test]
+fn transformed_draw_prior_field_lowers_as_pushfwd() {
+    let src = "\
+sigma2 ~ InverseGamma(2, 2)
+sigma = sqrt(sigma2)
+prior = lawof(record(sigma = sigma))
+lp = logdensityof(prior, record(sigma = 1.5))";
+    let out = determinize_src(src);
+    let pir = flatppl_flatpir::write(&out);
+    // Scored as the inner InverseGamma law at the sqrt-preimage, minus the
+    // change-of-variables log-volume: `sub(builtin_logdensityof(InverseGamma,
+    // …, pow(1.5, 2)), logvol(pow(1.5, 2)))`.
+    assert!(
+        pir.contains("builtin_logdensityof") && pir.contains("InverseGamma"),
+        "inner InverseGamma density present:\n{pir}"
+    );
+    assert!(
+        pir.contains("(sub "),
+        "pushfwd change-of-variables subtracts the log-volume:\n{pir}"
+    );
+    assert!(
+        !pir.contains("(draw ") && !pir.contains("lawof"),
+        "measure layer eliminated:\n{pir}"
+    );
+    assert!(flatppl_determinizer::is_flatpdl(&out).is_ok());
+}
+
+// The transformed-draw field composes with a DEPENDENT prior: `sigma =
+// sqrt(sigma2)` and siblings whose measure references `sigma`
+// (`alpha ~ Normal(0, sigma * 3)`) — the linear-regression shape. Both the
+// transformed field and the dependent siblings must lower (three density
+// terms), with the sibling measures referencing the pinned `sigma`. Guards the
+// combined transform+dependency case flagged during the #245 investigation.
+#[test]
+fn dependent_and_transformed_prior_fields_lower() {
+    let src = "\
+sigma2 ~ InverseGamma(5, 5)
+sigma = sqrt(sigma2)
+alpha ~ Normal(0, sigma * 3)
+beta ~ Normal(0, sigma * 3)
+prior = lawof(record(alpha = alpha, beta = beta, sigma = sigma))
+lp = logdensityof(prior, record(alpha = 0.55, beta = 2.34, sigma = 0.11))";
+    let out = determinize_src(src);
+    let pir = flatppl_flatpir::write(&out);
+    // Three density terms: two Normal (alpha, beta) + one InverseGamma (the
+    // sqrt-pushfwd of sigma2).
+    assert_eq!(
+        pir.matches("builtin_logdensityof").count(),
+        3,
+        "alpha + beta + sigma density terms:\n{pir}"
+    );
+    assert!(
+        pir.contains("InverseGamma") && pir.contains("Normal"),
+        "both the transformed InverseGamma marginal and the dependent Normals present:\n{pir}"
+    );
+    assert!(
+        !pir.contains("(draw ") && !pir.contains("lawof"),
+        "measure layer eliminated:\n{pir}"
+    );
+    assert!(flatppl_determinizer::is_flatpdl(&out).is_ok());
+}
+
 // weighted(w, M): logdensityof → log(w) + logdensityof(M, v)
 #[test]
 fn weighted_lowers_to_log_w_plus_density() {
