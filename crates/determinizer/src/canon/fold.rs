@@ -3,9 +3,9 @@
 
 use std::collections::HashMap;
 
-use flatppl_core::{CallHead, Module, Node, NodeId, Scalar};
+use flatppl_core::{CallHead, Module, Node, NodeId, Ref, RefNs, Scalar};
 
-use crate::driver::map_tree;
+use crate::driver::{binding_is_referenced, map_tree};
 
 /// Fold builtin arithmetic on literal operands. Two-phase: `map_tree`'s closure
 /// only gets `&Module` (no `alloc`), so phase 1 walks each binding's RHS
@@ -141,8 +141,8 @@ pub(crate) fn resolve_alias_refs(m: &mut Module) -> bool {
         m.bindings().map(|(bid, b)| (bid, b.rhs, b.name)).collect();
     for (bid, root, self_name) in pairs {
         let new = map_tree(m, root, &mut |m, id| {
-            if let Node::Ref(flatppl_core::Ref {
-                ns: flatppl_core::RefNs::SelfMod,
+            if let Node::Ref(Ref {
+                ns: RefNs::SelfMod,
                 name,
             }) = m.node(id)
             {
@@ -163,6 +163,7 @@ pub(crate) fn resolve_alias_refs(m: &mut Module) -> bool {
     }
     changed
 }
+
 /// Zero any unreferenced, engine-generated (`synthetic`) binding to a
 /// fixpoint — a generalization of `driver::sweep_dead_measure_bindings`
 /// (which only sweeps measure/likelihood-typed dead bindings during the
@@ -227,50 +228,4 @@ pub(crate) fn sweep_dead_bindings(m: &mut Module) -> bool {
 /// a source-level `= 0.0`, which is output-identical either way).
 fn is_zeroed_sentinel(m: &Module, rhs: NodeId) -> bool {
     matches!(m.node(rhs), Node::Lit(Scalar::Real(z)) if *z == 0.0)
-}
-
-/// True iff any binding OTHER than `bid` contains a `(%ref self name_sym)` —
-/// as a body sub-node OR as a `functionof`/`kernelof` reification INPUT (the
-/// `Inputs` bucket is invisible to `children()`/`for_each_child`, so a binding
-/// referenced only through a reification boundary would otherwise look dead).
-/// Mirrors `driver::binding_is_referenced`/`driver::subtree_contains_ref` for
-/// this general (non-measure-typed) sweep.
-fn binding_is_referenced(
-    m: &Module,
-    bid: flatppl_core::BindingId,
-    name_sym: flatppl_core::Symbol,
-) -> bool {
-    m.bindings()
-        .filter(|(other_bid, _)| *other_bid != bid)
-        .any(|(_, binding)| subtree_contains_ref(m, binding.rhs, name_sym))
-}
-
-/// BFS subtree search: true iff the subtree at `root` contains a
-/// `Ref(SelfMod, name_sym)` node, as a body sub-node or a reification `Inputs`
-/// boundary entry.
-fn subtree_contains_ref(m: &Module, root: NodeId, name_sym: flatppl_core::Symbol) -> bool {
-    let mut queue = vec![root];
-    let mut qi = 0;
-    while qi < queue.len() {
-        let id = queue[qi];
-        qi += 1;
-        match m.node(id) {
-            Node::Ref(flatppl_core::Ref {
-                ns: flatppl_core::RefNs::SelfMod,
-                name,
-            }) if *name == name_sym => return true,
-            Node::Call(c) => {
-                if let Some(flatppl_core::Inputs::Spec(entries)) = &c.inputs {
-                    for (_, r) in entries.iter() {
-                        if r.ns == flatppl_core::RefNs::SelfMod && r.name == name_sym {
-                            return true;
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-        m.for_each_child(id, |c| queue.push(c));
-    }
-    false
 }
