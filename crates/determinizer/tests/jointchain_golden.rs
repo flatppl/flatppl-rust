@@ -157,7 +157,13 @@ lp = logdensityof(j, record(a = 0.3, b = 0.7))";
 
 // Scalar-cat jointchain: output is a VECTOR variate; slices via get0. Base
 // `a ~ Normal(0,1)` scored at get0(v,0); kernel `b ~ Normal(mu = a, 0.5)`
-// scored at get0(v,1) with its input `a` bound to get0(v,0).
+// scored at get0(v,1) with its input `a` bound to get0(v,0). The scored
+// variate here is the LITERAL point vector `[0.3, 0.7]`, so canon Pass 3
+// (`flatten_structural`) resolves every get0 slice all the way down to a bare
+// literal — re-baselined for buffy #263 Pass 3 (this test used to pin the
+// unresolved `get0(v, i)` shape; the flattened literals are a stronger pin,
+// not a weaker one, since they also verify the kernel's mean correctly picks
+// up the base slice's value).
 #[test]
 fn jointchain_scalar_single_step() {
     let src = "\
@@ -174,8 +180,17 @@ lp = logdensityof(j, [0.3, 0.7])";
         "two terms:\n{pir}"
     );
     assert!(pir.contains("(%field mu 0.0)"), "base mean 0.0:\n{pir}");
-    // Slices are get0 of the point vector.
-    assert!(pir.contains("(get0 "), "scalar slices via get0:\n{pir}");
+    // canon Pass 3 flattens the get0 slices of the literal point vector all
+    // the way down: the kernel's mean (bound to the base slice) resolves to
+    // the literal 0.3, and no residual get0 accessor survives.
+    assert!(
+        !pir.contains("(get0 "),
+        "get0 slices of the literal vector are fully flattened:\n{pir}"
+    );
+    assert!(
+        pir.contains("(%field mu 0.3)"),
+        "kernel mean is the flattened base slice (0.3):\n{pir}"
+    );
     assert!(
         !pir.contains("jointchain") && !pir.contains("kernelof") && !pir.contains("lawof"),
         "measure layer gone:\n{pir}"
@@ -187,7 +202,14 @@ lp = logdensityof(j, [0.3, 0.7])";
 }
 
 // Scalar-cat 3-step: c ~ K2([a,b]). The single input `_ab_` binds to
-// vector(get0(v,0), get0(v,1)); the body indexes it.
+// vector(get0(v,0), get0(v,1)); the body indexes it. The scored variate here
+// is the LITERAL point vector `[0.3, 0.7, 1.1]`, so canon Pass 3
+// (`flatten_structural`), together with Pass 1's const-fold, resolves the
+// get0/vector wrapping and the resulting `add` all the way down to bare
+// literals (`k2`'s mean folds to `0.3 + 0.7 = 1.0`) — re-baselined for buffy
+// #263 Pass 3 (this test used to pin the unresolved `vector(get0(...),
+// get0(...))` shape; the fully-flattened literal is a stronger pin, since it
+// also verifies the arithmetic).
 #[test]
 fn jointchain_scalar_multi_step() {
     let src = "\
@@ -203,10 +225,16 @@ lp = logdensityof(j, [0.3, 0.7, 1.1])";
         3,
         "three terms:\n{pir}"
     );
-    // The prior cat is a vector of the first two slices.
+    // canon flattens the prior cat's get0/vector wrapping (and folds the
+    // resulting sum) down to the literal 1.0 mean for k2 — no residual get0
+    // or vector call survives.
     assert!(
-        pir.contains("(vector (get0 ") || pir.contains("(vector "),
-        "prior cat is a vector:\n{pir}"
+        !pir.contains("(get0 ") && !pir.contains("(vector "),
+        "get0/vector wrapping of the literal point vector is fully flattened:\n{pir}"
+    );
+    assert!(
+        pir.contains("(%field mu 1.0)"),
+        "k2's mean folds the flattened base+kernel-1 slices (0.3 + 0.7 = 1.0):\n{pir}"
     );
     assert!(
         !pir.contains("_ab_"),

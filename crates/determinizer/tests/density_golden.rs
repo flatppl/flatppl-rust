@@ -135,55 +135,73 @@ lp = logdensityof(lawof(record(a = a)), record(a = 0.0))";
 // positional argument to a constructor whose params match those fields
 // (`Gamma(gamma_shape_rate(…))`) must distribute the record's fields across the
 // constructor's params — NOT bind the whole record to `shape` and drop `rate`.
-// The record arrives as an opaque CALL (not a literal record), so each field is
-// pulled with `get(arg, "field")`. Regression for buffy #247 (the splat wasn't
-// firing → emitted `record(shape = gamma_shape_rate(…))` with `rate` missing).
+// The record arrives as an opaque CALL (not a literal record) at build time,
+// so each field is pulled with `get(arg, "field")`; canon Pass 2
+// (`inline_user_calls`) then beta-reduces the call into a literal record and
+// Pass 3 (`flatten_structural`) resolves the resulting static `get` to the
+// literal field value directly — no residual `get` accessor survives.
+// Regression for buffy #247 (the splat wasn't firing → emitted `record(shape =
+// gamma_shape_rate(…))` with `rate` missing) AND re-baselined for buffy #263
+// Pass 3 (this test used to pin the unresolved `get(call, "field")` shape;
+// that shape is now flattened away, not weakened — both literal values still
+// land on the correct params).
 #[test]
 fn multi_output_record_call_auto_splats_into_constructor() {
     let src = "\
 gamma_shape_rate(mu, sigma) = record(shape = mu, rate = sigma)
 a = draw(Gamma(gamma_shape_rate(2.0, 1.0)))
 lp = logdensityof(lawof(record(a = a)), record(a = 0.5))";
-    let pir = flatppl_flatpir::write(&determinize_src(src));
-    // Both constructor params are bound — `rate` is not dropped.
+    let out = determinize_src(src);
+    let pir = flatppl_flatpir::write(&out);
+    // Both constructor params are bound to their resolved literal values —
+    // `rate` is not dropped.
     assert!(
-        pir.contains("(%field shape ") && pir.contains("(%field rate "),
-        "both Gamma params bound after auto-splat (rate not dropped):\n{pir}"
+        pir.contains("(%field shape 2.0)") && pir.contains("(%field rate 1.0)"),
+        "both Gamma params bound to their resolved literal values after auto-splat + flatten (rate not dropped):\n{pir}"
     );
-    // Each field is a `get` on the (shared) multi-output call — the splat did
-    // not bind the whole record to `shape`.
-    assert_eq!(
-        pir.matches("(get ").count(),
-        2,
-        "each splatted field is a get(call, \"field\") accessor:\n{pir}"
+    // Pass 3 has flattened the splat's `get(call, "field")` accessors to the
+    // literal fields directly — no residual `get` remains.
+    assert!(
+        !pir.contains("(get "),
+        "canon Pass 3 (flatten_structural) resolves the splat's static get accessor:\n{pir}"
     );
     assert!(
         !pir.contains("(%field shape (%call") && !pir.contains("(%field shape (record"),
         "shape must NOT hold the whole record (the pre-fix bug):\n{pir}"
     );
-    assert!(flatppl_determinizer::is_flatpdl(&determinize_src(src)).is_ok());
+    assert!(flatppl_determinizer::is_flatpdl(&out).is_ok());
 }
 
 // §04 auto-splat applies at ANY arity: a positional record whose field names
 // match the callable's parameter names splats — including a single-param
 // callable. `Dirac`'s sole `value` param: `Dirac(record(value = 5.0))` splats to
-// `Dirac(value = 5.0)` (a point mass at the SCALAR, extracted via `get`), NOT at
-// the record. Both engines agree — inference types the variate scalar and the
-// determiniser extracts the field. The record-VALUE form is the keyword
-// `Dirac(value = record(...))`, which is not a positional splat. Regression for
-// the §04-literal auto-splat arity semantics.
+// `Dirac(value = 5.0)` (a point mass at the SCALAR, extracted via `get` at
+// build time), NOT at the record. Both engines agree — inference types the
+// variate scalar and the determiniser extracts the field. The record-VALUE
+// form is the keyword `Dirac(value = record(...))`, which is not a positional
+// splat. Regression for the §04-literal auto-splat arity semantics AND
+// re-baselined for buffy #263 Pass 3: the splat's container here is ALREADY a
+// literal `record(...)`, so `flatten_structural` resolves the `get` this test
+// used to pin immediately — the determinized FlatPDL shows the literal `5.0`
+// directly, not a `get` accessor.
 #[test]
 fn positional_record_auto_splats_at_any_arity_keyword_record_is_the_value() {
-    // Positional record → splat → `value` bound to the record's `value` field
-    // (via `get`); the scored variate is the scalar.
+    // Positional record → splat → `value` bound to the record's `value`
+    // field, which canon Pass 3 flattens directly to the literal `5.0` (no
+    // residual `get`); the scored variate is the scalar.
     let splat = "\
 a = draw(Dirac(record(value = 5.0)))
 lp = logdensityof(lawof(record(a = a)), record(a = 5.0))";
     let out_splat = determinize_src(splat);
     let pir_splat = flatppl_flatpir::write(&out_splat);
     assert!(
-        pir_splat.contains("builtin_logdensityof Dirac") && pir_splat.contains("(get "),
-        "positional Dirac(record(value=v)) auto-splats (value pulled via get):\n{pir_splat}"
+        pir_splat.contains("builtin_logdensityof Dirac")
+            && pir_splat.contains("(%field value 5.0)"),
+        "positional Dirac(record(value=v)) auto-splats to the literal value field:\n{pir_splat}"
+    );
+    assert!(
+        !pir_splat.contains("(get "),
+        "canon Pass 3 (flatten_structural) resolves the splat's static get accessor:\n{pir_splat}"
     );
     assert!(flatppl_determinizer::is_flatpdl(&out_splat).is_ok());
 

@@ -157,3 +157,94 @@ lp = logdensityof(lawof(record(a = a)), record(a = 0.5))";
         "determinize output is a canonicalization fixpoint"
     );
 }
+
+// A positional `joint(M1, M2)` scored at a literal vector variate lowers each
+// component's density term via `get0(v, i)` where `v` IS the literal
+// `vector(0.5, 0.5)` variate itself (density.rs `lower_joint`). Since the
+// container is a literal constructor and the index is a literal int,
+// `flatten_structural` must resolve each `get0` to the projected element
+// directly — no residual `(get0 ` over a literal vector may remain. Buffy
+// #263 Pass 3.
+#[test]
+fn flatten_structural_resolves_static_get0_vector_projection() {
+    let src = "\
+d = joint(Normal(mu = 0.0, sigma = 1.0), Normal(mu = 1.0, sigma = 2.0))
+lp = logdensityof(d, [0.5, 0.5])";
+    let out = determinize_src(src);
+    let pir = flatppl_flatpir::write(&out);
+    assert!(
+        !pir.contains("(get0 "),
+        "static get0(vector(...), i) must resolve to the projected element:\n{pir}"
+    );
+    assert!(
+        pir.contains("(%field mu 0.0) (%field sigma 1.0)") && pir.matches("0.5").count() >= 2,
+        "both density terms score 0.5 directly, not via a residual get0:\n{pir}"
+    );
+    assert!(flatppl_determinizer::is_flatpdl(&out).is_ok());
+}
+
+// `flatten_structural` (isolated on the get0/vector fixture) is idempotent:
+// determinizing the same source twice produces identical FlatPIR.
+#[test]
+fn flatten_structural_get0_is_idempotent() {
+    let src = "\
+d = joint(Normal(mu = 0.0, sigma = 1.0), Normal(mu = 1.0, sigma = 2.0))
+lp = logdensityof(d, [0.5, 0.5])";
+    let once = flatppl_flatpir::write(&determinize_src(src));
+    assert!(
+        !once.contains("(get0 "),
+        "sanity: fixture must actually contain a static get0 flatten_structural \
+         resolves (else this test is vacuous):\n{once}"
+    );
+    let twice = flatppl_flatpir::write(&determinize_src(src));
+    assert_eq!(
+        once, twice,
+        "determinize output is a canonicalization fixpoint"
+    );
+}
+
+// §04 auto-splat (buffy #247) pulls each field of an opaque multi-output
+// record call via `get(arg, "field")`. Once Pass 2 (`inline_user_calls`)
+// beta-reduces the call away, the call site becomes a LITERAL
+// `record(shape = 2.0, rate = 1.0)` — a static `get(record(...), "field")`
+// that `flatten_structural` must resolve to the literal field value directly.
+// Buffy #263 Pass 3.
+#[test]
+fn flatten_structural_resolves_static_get_record_projection() {
+    let src = "\
+gamma_shape_rate(mu, sigma) = record(shape = mu, rate = sigma)
+a = draw(Gamma(gamma_shape_rate(2.0, 1.0)))
+lp = logdensityof(lawof(record(a = a)), record(a = 0.5))";
+    let out = determinize_src(src);
+    let pir = flatppl_flatpir::write(&out);
+    assert!(
+        !pir.contains("(get "),
+        "static get(record(...), \"field\") must resolve to the literal field value:\n{pir}"
+    );
+    assert!(
+        pir.contains("(%field shape 2.0)") && pir.contains("(%field rate 1.0)"),
+        "Gamma's shape/rate are bound directly to the resolved literals:\n{pir}"
+    );
+    assert!(flatppl_determinizer::is_flatpdl(&out).is_ok());
+}
+
+// `flatten_structural` (isolated on the get/record fixture) is idempotent:
+// determinizing the same source twice produces identical FlatPIR.
+#[test]
+fn flatten_structural_get_record_is_idempotent() {
+    let src = "\
+gamma_shape_rate(mu, sigma) = record(shape = mu, rate = sigma)
+a = draw(Gamma(gamma_shape_rate(2.0, 1.0)))
+lp = logdensityof(lawof(record(a = a)), record(a = 0.5))";
+    let once = flatppl_flatpir::write(&determinize_src(src));
+    assert!(
+        !once.contains("(get "),
+        "sanity: fixture must actually contain a static get flatten_structural \
+         resolves (else this test is vacuous):\n{once}"
+    );
+    let twice = flatppl_flatpir::write(&determinize_src(src));
+    assert_eq!(
+        once, twice,
+        "determinize output is a canonicalization fixpoint"
+    );
+}
