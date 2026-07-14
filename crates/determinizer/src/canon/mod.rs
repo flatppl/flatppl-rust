@@ -5,6 +5,7 @@
 
 use flatppl_core::Module;
 
+mod flatten;
 mod fold;
 mod inline;
 
@@ -28,6 +29,7 @@ pub(crate) fn canonicalize(m: &mut Module) {
         changed |= fold::resolve_alias_refs(m);
         changed |= fold::sweep_dead_bindings(m);
         changed |= inline::inline_user_calls(m);
+        changed |= flatten::flatten_structural(m);
         if !changed {
             break;
         }
