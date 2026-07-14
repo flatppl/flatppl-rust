@@ -232,6 +232,68 @@ lp = logdensityof(prior, record(alpha = 0.55, beta = 2.34, sigma = 0.11))";
     assert!(flatppl_determinizer::is_flatpdl(&out).is_ok());
 }
 
+// The §06 known-bijection registry, broadened to the monotone §07 elementary
+// functions whose inverse is itself a built-in: each, as a transformed-draw
+// prior field over a base whose support lies in the function's domain, lowers
+// as a pushforward change-of-variables (`sub(logdensityof(M, f_inv(y)),
+// logvol(f_inv(y)))`) rather than refusing. (Numeric correctness of each
+// log-volume is verified against a scipy oracle in the testsuite; here we pin
+// the structural lowering.)
+#[test]
+fn extended_bijection_registry_lowers_transformed_draw_priors() {
+    // (forward, base with support ⊆ forward's domain).
+    let cases = [
+        ("log1p", "Exponential(1.0)"),     // domain (−1, ∞) ⊇ nonnegreals
+        ("expm1", "Normal(0.0, 1.0)"),     // domain ℝ
+        ("log10", "Exponential(1.0)"),     // domain posreals ⊇ nonnegreals a.e.
+        ("logit", "Beta(2.0, 2.0)"),       // domain (0, 1)
+        ("invlogit", "Normal(0.0, 1.0)"),  // domain ℝ
+        ("probit", "Beta(2.0, 2.0)"),      // domain (0, 1)
+        ("invprobit", "Normal(0.0, 1.0)"), // domain ℝ
+        ("atan", "Normal(0.0, 1.0)"),      // domain ℝ
+        ("sinh", "Normal(0.0, 1.0)"),      // domain ℝ
+        ("asinh", "Normal(0.0, 1.0)"),     // domain ℝ
+        ("tanh", "Normal(0.0, 1.0)"),      // domain ℝ
+    ];
+    for (f, base) in cases {
+        let src = format!(
+            "raw ~ {base}\nt = {f}(raw)\nprior = lawof(record(t = t))\n\
+             lp = logdensityof(prior, record(t = 0.3))"
+        );
+        let out = determinize_src(&src);
+        let pir = flatppl_flatpir::write(&out);
+        assert!(
+            pir.contains("builtin_logdensityof") && pir.contains("(sub "),
+            "pushfwd({f}, {base}) must lower as a change-of-variables:\n{pir}"
+        );
+        assert!(
+            !pir.contains("(draw ") && !pir.contains("lawof"),
+            "pushfwd({f}, {base}) measure layer must be eliminated:\n{pir}"
+        );
+        assert!(
+            flatppl_determinizer::is_flatpdl(&out).is_ok(),
+            "pushfwd({f}, {base}) must be valid FlatPDL"
+        );
+    }
+}
+
+// Domain guard (refuse-don't-mislower): a bijection whose domain constrains the
+// base support refuses when the base can fall outside it. `logit`'s domain is
+// (0, 1); a `Normal` base (support ℝ) puts mass outside — lowering would
+// synthesise a sub-probability measure. Must refuse.
+#[test]
+fn logit_prior_over_real_support_base_refuses() {
+    let src = "raw ~ Normal(0.0, 1.0)\nt = logit(raw)\nprior = lawof(record(t = t))\n\
+               lp = logdensityof(prior, record(t = 0.3))";
+    let m = {
+        let mut m = flatppl_syntax::parse(src).unwrap();
+        let _ = flatppl_infer::infer(&mut m);
+        m
+    };
+    let e = determinize(&m).expect_err("logit over a real-support base must refuse");
+    assert!(format!("{e:?}").contains("refuse"), "got: {e:?}");
+}
+
 // weighted(w, M): logdensityof → log(w) + logdensityof(M, v)
 #[test]
 fn weighted_lowers_to_log_w_plus_density() {

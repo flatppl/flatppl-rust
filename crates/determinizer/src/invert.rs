@@ -281,6 +281,203 @@ fn bare_bijection(
             let half = m.alloc(Node::Lit(Scalar::Real(0.5)));
             derive_pow(m, f, half, support)
         }
+        // The remaining arms extend the §06 known-bijection registry to the
+        // monotone §07 elementary functions whose inverse is itself a built-in
+        // and whose forward log-volume `log|f'|` is analytic. Each `logvol`
+        // below was cross-checked against numerical differentiation. Grouped by
+        // whether the forward's domain (spec §07 "Domains") constrains the base
+        // measure's support (guarded) or is all of ℝ (unguarded).
+
+        // log10(x) = ln x / ln 10 ⇒ log|f'| = −ln x − ln(ln 10); inverse
+        // 10ˣ = pow(10, x). Domain posreals (same guard as `log`).
+        "log10" => {
+            if !is_positive_domain(support) {
+                return Err(refuse(
+                    f,
+                    m,
+                    "pushfwd(log10, M) requires M to have positive support; refuse rather than \
+                     mislower a sub-probability measure",
+                ));
+            }
+            let f_inv = lambda(m, |m, ph| {
+                let ten = m.alloc(Node::Lit(Scalar::Real(10.0)));
+                build_call(m, "pow", &[ten, ph])
+            });
+            let logvol = lambda(m, |m, ph| {
+                let logx = build_call(m, "log", &[ph]);
+                let ten = m.alloc(Node::Lit(Scalar::Real(10.0)));
+                let ln10 = build_call(m, "log", &[ten]);
+                let ln_ln10 = build_call(m, "log", &[ln10]);
+                let s = build_call(m, "add", &[logx, ln_ln10]);
+                build_call(m, "neg", &[s])
+            });
+            Ok(Some(Bijection { f_inv, logvol }))
+        }
+        // log1p(x) = ln(1 + x) ⇒ log|f'| = −ln(1 + x) = −log1p(x); inverse
+        // expm1. Domain (−1, ∞).
+        "log1p" => {
+            if !is_gt_neg_one_domain(support) {
+                return Err(refuse(
+                    f,
+                    m,
+                    "pushfwd(log1p, M) requires M support within (−1, ∞); refuse rather than \
+                     mislower a sub-probability measure",
+                ));
+            }
+            let logvol = lambda(m, |m, ph| {
+                let l = build_call(m, "log1p", &[ph]);
+                build_call(m, "neg", &[l])
+            });
+            Ok(Some(Bijection {
+                f_inv: bare_builtin(m, "expm1"),
+                logvol,
+            }))
+        }
+        // expm1(x) = eˣ − 1 ⇒ log|f'| = x (identity); inverse log1p. Domain ℝ.
+        "expm1" => Ok(Some(Bijection {
+            f_inv: bare_builtin(m, "log1p"),
+            logvol: identity_lambda(m),
+        })),
+        // logit(p) = ln(p / (1 − p)) ⇒ log|f'| = −ln p − ln(1 − p); inverse
+        // invlogit. Domain (0, 1).
+        "logit" => {
+            if !is_unit_domain(support) {
+                return Err(refuse(
+                    f,
+                    m,
+                    "pushfwd(logit, M) requires M support within (0, 1); refuse rather than \
+                     mislower a sub-probability measure",
+                ));
+            }
+            let logvol = lambda(m, |m, ph| {
+                let logp = build_call(m, "log", &[ph]);
+                let one = m.alloc(Node::Lit(Scalar::Real(1.0)));
+                let omp = build_call(m, "sub", &[one, ph]);
+                let log_omp = build_call(m, "log", &[omp]);
+                let s = build_call(m, "add", &[logp, log_omp]);
+                build_call(m, "neg", &[s])
+            });
+            Ok(Some(Bijection {
+                f_inv: bare_builtin(m, "invlogit"),
+                logvol,
+            }))
+        }
+        // invlogit(x) = 1 / (1 + e⁻ˣ) ⇒ log|f'| = ln σ(x) + ln(1 − σ(x));
+        // inverse logit. Domain ℝ.
+        "invlogit" => {
+            let logvol = lambda(m, |m, ph| {
+                let s = build_call(m, "invlogit", &[ph]);
+                let log_s = build_call(m, "log", &[s]);
+                let one = m.alloc(Node::Lit(Scalar::Real(1.0)));
+                let oms = build_call(m, "sub", &[one, s]);
+                let log_oms = build_call(m, "log", &[oms]);
+                build_call(m, "add", &[log_s, log_oms])
+            });
+            Ok(Some(Bijection {
+                f_inv: bare_builtin(m, "logit"),
+                logvol,
+            }))
+        }
+        // probit(p) = Φ⁻¹(p) ⇒ log|f'| = ½ln(2π) + ½·probit(p)²; inverse
+        // invprobit (Φ). Domain (0, 1).
+        "probit" => {
+            if !is_unit_domain(support) {
+                return Err(refuse(
+                    f,
+                    m,
+                    "pushfwd(probit, M) requires M support within (0, 1); refuse rather than \
+                     mislower a sub-probability measure",
+                ));
+            }
+            let logvol = lambda(m, |m, ph| {
+                let half_ln2pi = half_ln_two_pi(m);
+                let pr = build_call(m, "probit", &[ph]);
+                let two = m.alloc(Node::Lit(Scalar::Real(2.0)));
+                let sq = build_call(m, "pow", &[pr, two]);
+                let half = m.alloc(Node::Lit(Scalar::Real(0.5)));
+                let half_sq = build_call(m, "mul", &[half, sq]);
+                build_call(m, "add", &[half_ln2pi, half_sq])
+            });
+            Ok(Some(Bijection {
+                f_inv: bare_builtin(m, "invprobit"),
+                logvol,
+            }))
+        }
+        // invprobit(x) = Φ(x) ⇒ log|f'| = ln φ(x) = −½ln(2π) − ½x²; inverse
+        // probit. Domain ℝ.
+        "invprobit" => {
+            let logvol = lambda(m, |m, ph| {
+                let half_ln2pi = half_ln_two_pi(m);
+                let two = m.alloc(Node::Lit(Scalar::Real(2.0)));
+                let sq = build_call(m, "pow", &[ph, two]);
+                let half = m.alloc(Node::Lit(Scalar::Real(0.5)));
+                let half_sq = build_call(m, "mul", &[half, sq]);
+                let s = build_call(m, "add", &[half_ln2pi, half_sq]);
+                build_call(m, "neg", &[s])
+            });
+            Ok(Some(Bijection {
+                f_inv: bare_builtin(m, "probit"),
+                logvol,
+            }))
+        }
+        // atan(x) ⇒ log|f'| = −ln(1 + x²); inverse tan (valid on atan's range
+        // (−π/2, π/2), where tan is the single-valued inverse). Domain ℝ.
+        "atan" => {
+            let logvol = lambda(m, |m, ph| {
+                let two = m.alloc(Node::Lit(Scalar::Real(2.0)));
+                let sq = build_call(m, "pow", &[ph, two]);
+                let one = m.alloc(Node::Lit(Scalar::Real(1.0)));
+                let onepx2 = build_call(m, "add", &[one, sq]);
+                let l = build_call(m, "log", &[onepx2]);
+                build_call(m, "neg", &[l])
+            });
+            Ok(Some(Bijection {
+                f_inv: bare_builtin(m, "tan"),
+                logvol,
+            }))
+        }
+        // sinh(x) ⇒ log|f'| = ln cosh(x); inverse asinh. Domain ℝ.
+        "sinh" => {
+            let logvol = lambda(m, |m, ph| {
+                let ch = build_call(m, "cosh", &[ph]);
+                build_call(m, "log", &[ch])
+            });
+            Ok(Some(Bijection {
+                f_inv: bare_builtin(m, "asinh"),
+                logvol,
+            }))
+        }
+        // asinh(x) ⇒ log|f'| = −½ln(1 + x²); inverse sinh. Domain ℝ.
+        "asinh" => {
+            let logvol = lambda(m, |m, ph| {
+                let two = m.alloc(Node::Lit(Scalar::Real(2.0)));
+                let sq = build_call(m, "pow", &[ph, two]);
+                let one = m.alloc(Node::Lit(Scalar::Real(1.0)));
+                let onepx2 = build_call(m, "add", &[one, sq]);
+                let l = build_call(m, "log", &[onepx2]);
+                let mhalf = m.alloc(Node::Lit(Scalar::Real(-0.5)));
+                build_call(m, "mul", &[mhalf, l])
+            });
+            Ok(Some(Bijection {
+                f_inv: bare_builtin(m, "sinh"),
+                logvol,
+            }))
+        }
+        // tanh(x) ⇒ log|f'| = ln(1 − tanh(x)²); inverse atanh. Domain ℝ.
+        "tanh" => {
+            let logvol = lambda(m, |m, ph| {
+                let th = build_call(m, "tanh", &[ph]);
+                let two = m.alloc(Node::Lit(Scalar::Real(2.0)));
+                let sq = build_call(m, "pow", &[th, two]);
+                let one = m.alloc(Node::Lit(Scalar::Real(1.0)));
+                let omsq = build_call(m, "sub", &[one, sq]);
+                build_call(m, "log", &[omsq])
+            });
+            Ok(Some(Bijection {
+                f_inv: bare_builtin(m, "atanh"),
+                logvol,
+            }))
+        }
         _ => Ok(None),
     }
 }
@@ -1139,4 +1336,41 @@ fn is_positive_domain(support: &ValueSet) -> bool {
         Interval(lo, _) => *lo >= 0.0,
         _ => false,
     }
+}
+
+/// `support ⊆ (−1, ∞)` — the domain of `log1p` (spec §07: `interval(-1, inf)`).
+/// Continuous supports only, mirroring [`is_positive_domain`]'s discrete
+/// exclusion. The `lo == −1` boundary is a measure-zero point (`log1p(−1) =
+/// −inf`), admitted for the same reason `is_positive_domain` admits `lo == 0`.
+fn is_gt_neg_one_domain(support: &ValueSet) -> bool {
+    use ValueSet::*;
+    match support {
+        PosReals | NonNegReals | UnitInterval => true,
+        Interval(lo, _) => *lo >= -1.0,
+        _ => false,
+    }
+}
+
+/// `support ⊆ (0, 1)` — the domain of `logit` / `probit` (spec §07:
+/// `interval(0, 1)`). Continuous supports only; the `0`/`1` boundaries are the
+/// measure-zero points where `logit`/`probit` are `±inf`.
+fn is_unit_domain(support: &ValueSet) -> bool {
+    use ValueSet::*;
+    match support {
+        UnitInterval => true,
+        Interval(lo, hi) => *lo >= 0.0 && *hi <= 1.0,
+        _ => false,
+    }
+}
+
+/// The node `½·ln(2π) = mul(0.5, log(mul(2, pi)))` — the Gaussian
+/// log-normalizing constant, shared by the `probit` / `invprobit` log-volumes.
+fn half_ln_two_pi(m: &mut Module) -> NodeId {
+    let two = m.alloc(Node::Lit(Scalar::Real(2.0)));
+    let pi_sym = m.intern("pi");
+    let pi = m.alloc(Node::Const(pi_sym));
+    let two_pi = build_call(m, "mul", &[two, pi]);
+    let ln_2pi = build_call(m, "log", &[two_pi]);
+    let half = m.alloc(Node::Lit(Scalar::Real(0.5)));
+    build_call(m, "mul", &[half, ln_2pi])
 }
