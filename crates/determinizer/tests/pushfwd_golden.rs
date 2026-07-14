@@ -48,13 +48,15 @@ fn pushfwd_affine_lambda_lowers() {
         "d = pushfwd(x -> 2.0 * x + 1.0, Normal(mu = 0.0, sigma = 1.0))\nlp = logdensityof(d, 0.5)",
     );
     assert!(p.contains("builtin_logdensityof"), "got:\n{p}");
-    // f_inv is the composed affine inverse (y-1)/2 = divide(sub(y, 1.0), 2.0)
-    // (leaf substrings; the printer wedges `%meta` type annotations between ops):
+    // f_inv = (y-1)/2, applied at the literal query point y = 0.5, is now
+    // beta-reduced AND const-folded to the literal -0.25 (Buffy #263 Pass 2
+    // inlines the residual `%call` that used to carry `divide(sub(_x_, 1.0), 2.0)`
+    // unapplied; const-fold then reduces the folded arithmetic to one literal):
     assert!(
-        p.contains("(divide") && p.contains("(sub (%ref %local _x_) 1.0)"),
-        "affine inverse (y-1)/2 present:\n{p}"
+        p.contains("(builtin_logdensityof Normal") && p.contains(") -0.25)"),
+        "f_inv(0.5) = (0.5 - 1)/2 = -0.25, inlined + folded:\n{p}"
     );
-    // logvol is the constant log|2| = log(abs(2)):
+    // logvol is the constant log|2| = log(abs(2)) — unaffected by inlining:
     assert!(p.contains("(abs 2.0)"), "logvol log(2) present:\n{p}");
 }
 
@@ -68,16 +70,23 @@ fn pushfwd_composition_exp_affine_lowers() {
         p.contains("builtin_logdensityof") && p.contains("log"),
         "got:\n{p}"
     );
-    // Composed inverse log(y)/2 = divide(log(y), 2.0):
+    // Composed inverse log(y)/2, applied at the literal query point y = 0.5,
+    // is beta-reduced (Buffy #263 Pass 2) to divide(log(0.5), 2.0) — `log` is
+    // excluded from const-fold (see `canon/fold.rs`), so the `log(0.5)` leaf
+    // stays unevaluated and the `divide` around it does too (const-fold
+    // requires BOTH operands literal):
     assert!(
-        p.contains("(divide") && p.contains("(log (%ref %local _x_))"),
-        "inverse log(y)/2 present:\n{p}"
+        p.contains("(divide") && p.contains("(log 0.5)"),
+        "inverse log(0.5)/2 present:\n{p}"
     );
-    // Chain-rule logvol: the exp term contributes the partial-forward 2x =
-    // mul(2.0, x); the affine term contributes log|2| = log(abs(2)).
+    // Chain-rule logvol: the exp term contributes the partial-forward 2x,
+    // evaluated at x = f_inv(0.5) = log(0.5)/2 (the SAME inlined inverse
+    // expression, consistently substituted — `mul(2.0, divide(log(0.5), 2.0))`);
+    // the affine term contributes log|2| = log(abs(2)).
     assert!(
-        p.contains("(mul 2.0 (%ref %local _x_))") && p.contains("(abs 2.0)"),
-        "chain-rule logvol (2x + log 2) present:\n{p}"
+        p.contains("(mul 2.0 (%meta ((%scalar real) %fixed reals) (divide")
+            && p.contains("(abs 2.0)"),
+        "chain-rule logvol (2*f_inv(0.5) + log 2) present:\n{p}"
     );
 }
 
@@ -161,13 +170,17 @@ fn pushfwd_divide_chain_lowers() {
     let p =
         pir("d = pushfwd(x -> x / 2.0, Normal(mu = 0.0, sigma = 1.0))\nlp = logdensityof(d, 0.5)");
     assert!(p.contains("builtin_logdensityof"), "got:\n{p}");
-    // Inverse is mul(y, 2.0):
+    // Inverse mul(y, 2.0), applied at the literal query point y = 0.5, is now
+    // beta-reduced AND const-folded to the literal 1.0 (Buffy #263 Pass 2
+    // inlines the residual `%call` that used to carry `mul(_x_, 2.0)` unapplied;
+    // both operands are then literal reals, so const-fold reduces it further):
     assert!(
-        p.contains("(mul (%ref %local _x_) 2.0)"),
-        "divide inverse (* 2) present:\n{p}"
+        p.contains("(builtin_logdensityof Normal") && p.contains(") 1.0)"),
+        "f_inv(0.5) = 0.5 * 2 = 1.0, inlined + folded:\n{p}"
     );
-    // logvol is neg(log(abs(2.0))) — the DivByLit sign (negative contribution);
-    // leaf substrings (the printer wedges `%meta` type annotations between ops):
+    // logvol is neg(log(abs(2.0))) — the DivByLit sign (negative contribution),
+    // a constant unaffected by inlining; leaf substrings (the printer wedges
+    // `%meta` type annotations between ops):
     assert!(
         p.contains("(neg") && p.contains("(abs 2.0)"),
         "logvol -log(2) present:\n{p}"
@@ -313,9 +326,16 @@ fn pushfwd_elementwise_exp_lowers() {
     let p = pir(
         "d = pushfwd(fn(broadcast(exp, _)), iid(Normal(mu = 0.0, sigma = 1.0), 3))\nlp = logdensityof(d, [0.5, 0.6, 0.7])",
     );
+    // Before Buffy #263 Pass 2, the f_inv- and logvol-applying `%call`s were
+    // left un-reduced, so `sum`'s argument type inferred `%deferred` (a
+    // residual user-call, not yet a concrete array shape). Pass 2 inlines
+    // both calls, so `sum`'s argument (the per-cell `broadcast`) now infers
+    // concretely as the 3-array `cartpow reals 3` it actually is.
     assert!(
         p.contains("builtin_logdensityof")
-            && p.contains("(sum (%meta (%deferred %parameterized %unknown) (broadcast"),
+            && p.contains(
+                "(sum (%meta ((%array 1 (3) (%scalar real)) %fixed (cartpow reals 3)) (broadcast"
+            ),
         "got:\n{p}"
     );
     // The per-cell inverse is broadcast(log, y): the inner iid density is scored at
@@ -323,6 +343,17 @@ fn pushfwd_elementwise_exp_lowers() {
     assert!(
         p.contains("(broadcast log"),
         "f_inv = broadcast(log, y) present:\n{p}"
+    );
+    // The per-cell logvol identity map `x -> x` is a NESTED reification
+    // (`functionof(_x_ -> _x_)`, boundary name `_x_`) sitting INSIDE the body
+    // of the OUTER logvol reification (also boundary name `_x_`, per the
+    // synthesizer's uniform placeholder naming — see `kernel::shadows_name`).
+    // Pass 2 must inline the outer call WITHOUT capturing the inner one's own
+    // `_x_`: the inner identity's body must survive as the bare placeholder
+    // ref, not get rewritten to the outer's substituted value.
+    assert!(
+        p.contains("(functionof (%ref %local _x_) %specinputs ((x (%ref %local _x_))))"),
+        "nested per-cell identity map must keep its OWN _x_ unsubstituted (no capture):\n{p}"
     );
 }
 

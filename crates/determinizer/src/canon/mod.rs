@@ -6,6 +6,7 @@
 use flatppl_core::Module;
 
 mod fold;
+mod inline;
 
 /// The `FLATPPL_DETERMINIZE_NO_CANON` env escape hatch: when set (to any value),
 /// `canonicalize` is a no-op. Used to determinize a model both ways for the
@@ -26,6 +27,7 @@ pub(crate) fn canonicalize(m: &mut Module) {
         changed |= fold::const_fold(m);
         changed |= fold::resolve_alias_refs(m);
         changed |= fold::sweep_dead_bindings(m);
+        changed |= inline::inline_user_calls(m);
         if !changed {
             break;
         }

@@ -1321,12 +1321,15 @@ fn locscale_scalar_lowers() {
     let p =
         ls_pir("d = locscale(Normal(mu = 0.0, sigma = 1.0), 2.0, 3.0)\nlp = logdensityof(d, 0.5)");
     assert!(p.contains("builtin_logdensityof"), "got:\n{p}");
-    // f_inv preimage (y - 2)/3 = divide(sub(y, 2.0), 3.0):
+    // f_inv preimage (y - 2)/3, applied at the literal query point y = 0.5, is
+    // now beta-reduced AND const-folded to the literal -0.5 (Buffy #263 Pass 2
+    // inlines the residual `%call` that used to carry `divide(sub(_x_, 2.0), 3.0)`
+    // unapplied; const-fold then reduces the folded arithmetic to one literal):
     assert!(
-        p.contains("(divide") && p.contains("(sub (%ref %local _x_) 2.0)"),
-        "f_inv = (y - 2)/3 present:\n{p}"
+        p.contains("(builtin_logdensityof Normal") && p.contains(") -0.5)"),
+        "f_inv(0.5) = (0.5 - 2)/3 = -0.5, inlined + folded:\n{p}"
     );
-    // logvol = log|3| = log(abs(3.0)):
+    // logvol = log|3| = log(abs(3.0)) — a constant, unaffected by inlining:
     assert!(p.contains("(abs 3.0)"), "logvol log|3| present:\n{p}");
 }
 

@@ -108,3 +108,25 @@ __score__ = logdensityof(lawof(record(a = a)), record(a = 0.5))";
     );
     assert!(flatppl_determinizer::is_flatpdl(&out).is_ok());
 }
+
+// A user-defined function used deterministically must be INLINED in FlatPDL:
+// no residual `(%call ...)` reaches consumers (flatppl-js can't evaluate one —
+// Buffy #261). Buffy #263 Pass 2.
+#[test]
+fn inline_user_calls_eliminates_residual_user_call() {
+    let src = "\
+scale(x) = mul(x, 2.0)
+s = scale(1.5)
+a = draw(Normal(mu = 0.0, sigma = s))
+lp = logdensityof(lawof(record(a = a)), record(a = 0.5))";
+    let out = determinize_src(src);
+    let pir = flatppl_flatpir::write(&out);
+    assert!(
+        !pir.contains("(%call"),
+        "no residual user-function call in FlatPDL:\n{pir}"
+    );
+    assert!(
+        flatppl_determinizer::is_flatpdl(&out).is_ok(),
+        "is_flatpdl:\n{pir}"
+    );
+}
