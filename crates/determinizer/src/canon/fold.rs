@@ -163,22 +163,37 @@ pub(crate) fn resolve_alias_refs(m: &mut Module) -> bool {
     }
     changed
 }
-/// Zero any unreferenced `%private` binding to a fixpoint — a generalization of
-/// `driver::sweep_dead_measure_bindings` (which only sweeps measure/likelihood-
-/// typed dead bindings during the greedy legalizer loop) to ANY value-typed
-/// dead binding left over after `const_fold`/`resolve_alias_refs` orphan it
-/// (e.g. a literal alias inlined by `resolve_alias_refs` leaves its own
-/// now-dead `%private` binding). Never touches a `%public` binding — a public
-/// name is part of the model's declared interface even if nothing internal
-/// refers to it. Mirrors the existing sweep's convention of zeroing the RHS to
-/// `Lit(Real(0.0))` rather than removing the binding: `Module` has no
-/// binding-removal API, and downstream code / golden tests already expect a
-/// swept binding to survive as `(%bind name 0.0)`.
+/// Zero any unreferenced, engine-generated (`synthetic`) binding to a
+/// fixpoint — a generalization of `driver::sweep_dead_measure_bindings`
+/// (which only sweeps measure/likelihood-typed dead bindings during the
+/// greedy legalizer loop) to ANY value-typed dead SYNTHETIC binding orphaned
+/// by `const_fold`/`resolve_alias_refs`.
+///
+/// **Deliberately requires `synthetic`, not just `!public`.** `Binding::public`
+/// is purely a name-shape convention ("does not start with `_`") — it says
+/// nothing about whether a binding is a meaningful, externally-queryable
+/// value. A scoring harness's `__score__` binding (the flatppl-testsuite/CLI
+/// convention: append `__score__ = logdensityof(...)` and query it by name)
+/// is `!public` under that convention yet is exactly the value an external
+/// caller wants read back. An earlier cut of this sweep used `!public` alone
+/// as the eligibility guard and silently zeroed `__score__` to `0.0` — caught
+/// by the Buffy #263 numeric det-js equivalence gate (canon vs. no-canon
+/// scores diverged), not by any existing golden, because no prior test named
+/// a binding with a leading underscore. `synthetic` (set only by the parser,
+/// for a lifted anon / `%mlhs` split, and by determinizer-internal scaffolding
+/// — never by a user-chosen or harness-chosen name) is the correct predicate:
+/// no external caller can be depending on a name it never chose. Never
+/// touches a `%public` binding either, for the same reason `sweep_dead_measure_bindings`
+/// doesn't: a public name is part of the model's declared interface even if
+/// nothing internal refers to it. Mirrors the existing sweep's convention of
+/// zeroing the RHS to `Lit(Real(0.0))` rather than removing the binding:
+/// `Module` has no binding-removal API, and downstream code / golden tests
+/// already expect a swept binding to survive as `(%bind name 0.0)`.
 pub(crate) fn sweep_dead_bindings(m: &mut Module) -> bool {
     let mut changed = false;
     loop {
         // `is_zeroed_sentinel` excludes a binding already swept: without it, a
-        // zeroed private/unreferenced binding is STILL private and STILL
+        // zeroed synthetic/unreferenced binding is STILL synthetic and STILL
         // unreferenced (zeroing its RHS doesn't change either), so it would
         // match the filter again next iteration and get re-zeroed forever —
         // an infinite loop (unlike `driver::sweep_dead_measure_bindings`, whose
@@ -189,6 +204,7 @@ pub(crate) fn sweep_dead_bindings(m: &mut Module) -> bool {
             .bindings()
             .filter(|(bid, b)| {
                 !b.public
+                    && b.synthetic
                     && !is_zeroed_sentinel(m, b.rhs)
                     && !binding_is_referenced(m, *bid, b.name)
             })
