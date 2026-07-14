@@ -79,7 +79,9 @@ pub fn determinize_with(m: &Module, bundle: &ModuleBundle) -> Result<Module, Ref
 
         match target {
             None => {
-                // No measure-layer nodes remain.
+                // Measure layer gone — canonicalize the FlatPDL before the
+                // conformance check and return (Buffy #263).
+                crate::canon::canonicalize(&mut work);
                 match crate::is_flatpdl(&work) {
                     Ok(()) => return Ok(work),
                     Err(violations) => {
