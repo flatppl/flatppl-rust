@@ -85,6 +85,14 @@ fn collect_folds(m: &mut Module, id: NodeId, out: &mut HashMap<NodeId, NodeId>) 
                 "add" => Some(a.checked_add(*b)),
                 "sub" => Some(a.checked_sub(*b)),
                 "mul" => Some(a.checked_mul(*b)),
+                // Int^Int with a small NON-NEGATIVE exponent stays Int
+                // (`checked_pow`; overflow leaves it unfolded), matching the
+                // `Integer ⊔ Integer = Integer` promotion rule (`infer::promote2`)
+                // that add/sub/mul also honor. A NEGATIVE exponent is real
+                // (`2 ^ -1 = 0.5`) → fall through to the f64 path below.
+                "pow" if *b >= 0 && *b <= 64 => {
+                    Some(u32::try_from(*b).ok().and_then(|e| a.checked_pow(e)))
+                }
                 _ => None,
             };
             if let Some(checked) = folded {
@@ -145,9 +153,11 @@ fn collect_folds(m: &mut Module, id: NodeId, out: &mut HashMap<NodeId, NodeId>) 
 }
 
 /// A whole number in the small range where `f64::powi` (repeated multiplication)
-/// is exact and cheap — the only `pow` exponents `collect_folds` folds. A
-/// non-whole or large exponent is left for the evaluating engine (transcendental
-/// / avoid a huge unrolled product).
+/// is exact and cheap — the only `pow` exponents `collect_folds` folds. Its
+/// result is bit-identical to the JS engine's `Math.pow` (flatppl-js
+/// `value-ops.ts`), whose V8 integer-exponent fast path coincides with `powi`
+/// (verified across the ±64 range). A non-whole or large exponent is left for
+/// the evaluating engine (transcendental / avoid a huge unrolled product).
 fn is_whole_small(x: f64) -> bool {
     x.fract() == 0.0 && x.abs() <= 64.0
 }

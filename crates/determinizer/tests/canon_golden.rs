@@ -82,6 +82,28 @@ lp = logdensityof(lawof(record(a = a)), record(a = 0.5))";
     );
 }
 
+// Int^Int with a non-negative exponent folds to an Int literal (not Real),
+// matching `promote2`'s `Integer ⊔ Integer = Integer` — so a genuinely-Int
+// parameter like Binomial's `n` keeps its integer literal (`8`, not `8.0`).
+// Pins the Pass 4-B pow type-fidelity fix.
+#[test]
+fn const_fold_integer_pow_of_ints_stays_int() {
+    let src = "\
+a = draw(Binomial(n = 2 ^ 3, p = 0.5))
+lp = logdensityof(lawof(record(a = a)), record(a = 4))";
+    let out = determinize_src(src);
+    let pir = flatppl_flatpir::write(&out);
+    assert!(
+        pir.contains("(%field n 8)"),
+        "2 ^ 3 (Int^Int) folds to the Int literal 8:\n{pir}"
+    );
+    assert!(
+        !pir.contains("(%field n 8.0)"),
+        "not widened to Real 8.0:\n{pir}"
+    );
+    assert!(flatppl_determinizer::is_flatpdl(&out).is_ok());
+}
+
 // `resolve_alias_refs`, isolated from `const_fold`: `w` is a literal-alias
 // mixture weight (a top-level `%bind` whose RHS is a bare `Lit`, referenced
 // via `(%ref self w)` from `weighted(w, ...)`), not a bare literal like the
