@@ -1573,6 +1573,70 @@ impl<'m> Emitter<'m> {
         Ok(value)
     }
 
+    /// Lower `broadcast(f, rest...)` (§04 sec:broadcasting): apply the bare
+    /// callable `f` (`args[0]`, a `Const` builtin name) elementwise over `rest`,
+    /// scalars auto-broadcasting. `Emitter::binary` and the registry logpdf
+    /// builders are rank-agnostic (scalar↔rank-1 auto-broadcast), so the
+    /// `broadcast`+`f` wrapper is stripped and `rest` routed to the SAME handler
+    /// the un-broadcast form uses — the batch shape flows through the arithmetic.
+    /// `broadcast(add, s, vec)` → `ops::lower_builtin("add", …)` (a rank-1 add);
+    /// the dotted density `broadcast(builtin_logdensityof, Dist,
+    /// broadcast(record, …), vec)` → `registry::lower_logdensityof` over the
+    /// batched record + vector variate, yielding a rank-1 vector of
+    /// log-densities (its `sum` caller reduces it to the iid log-likelihood).
+    fn lower_broadcast(&mut self, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
+        let f = *args
+            .first()
+            .ok_or_else(|| EmitError::at(id, "broadcast: missing callable"))?;
+        let fname = match self.m.node(f) {
+            Node::Const(sym) => self.m.resolve(*sym).to_string(),
+            _ => {
+                return Err(EmitError::at(
+                    f,
+                    "broadcast: callable must be a bare builtin name",
+                ));
+            }
+        };
+        let rest = &args[1..];
+        if fname == "builtin_logdensityof" {
+            // Batched density: `Params::field_id` reads the batched
+            // `broadcast(record, %kwarg…)` kernel input; a rank-agnostic logpdf
+            // builder auto-broadcasts over the rank-1 variate → a rank-1
+            // log-density vec. GUARD: only a rank-agnostic (pure-arithmetic
+            // univariate) distribution is sound here — a structural builder
+            // (matrix/gather/reduce/`support`) would drive the batched inputs to
+            // shape-inconsistent StableHLO. Refuse a non-batch-safe dist rather
+            // than mislower (refuse-don't-mislower). See `registry::is_batch_safe`.
+            let dist = rest.first().and_then(|&d| match self.m.node(d) {
+                Node::Const(sym) => Some(self.m.resolve(*sym).to_string()),
+                _ => None,
+            });
+            match dist {
+                Some(d) if crate::registry::is_batch_safe(&d) => {
+                    crate::registry::lower_logdensityof(self, id, rest)
+                }
+                Some(d) => Err(EmitError::at(
+                    id,
+                    format!(
+                        "broadcast over builtin_logdensityof of '{d}' is unsupported: \
+                         its density builder is not rank-agnostic (batched density is \
+                         sound only for univariate pure-arithmetic distributions)"
+                    ),
+                )),
+                None => Err(EmitError::at(
+                    id,
+                    "broadcast(builtin_logdensityof, …): distribution must be a bare constructor",
+                )),
+            }
+        } else {
+            // Elementwise arithmetic/unary (`add`/`mul`/… from `.+`/`.*`): the
+            // op's `Emitter::binary`/`unary` auto-broadcasts scalar↔rank-1. An op
+            // this emitter doesn't lower (e.g. `divide`) refuses there — same
+            // message as its non-broadcast form.
+            crate::ops::lower_builtin(self, id, &fname, rest)
+        }
+    }
+
     /// The uncached half of [`Emitter::lower_node`]'s dispatch: every FlatPDL
     /// leaf/call kind that can reach this emitter, matched once. `self.m` is
     /// read out as a plain `&'m Module` up front — an ordinary reference
@@ -1612,6 +1676,8 @@ impl<'m> Emitter<'m> {
                         crate::registry::lower_logdensityof(self, id, &call.args)
                     } else if name == "builtin_sample" {
                         crate::registry::lower_sample(self, id, &call.args)
+                    } else if name == "broadcast" {
+                        self.lower_broadcast(id, &call.args)
                     } else if matches!(name.as_str(), "get0" | "get") {
                         // `get0(builtin_sample(...), k)` / `get((%ref self
                         // <shared-latent>), k)`: a projection of a sampled

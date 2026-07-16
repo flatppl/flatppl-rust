@@ -10,7 +10,7 @@
 //! `crate::ops::lower_builtin`'s catch-all "unsupported builtin head"
 //! refusal — see that module's doc comment.
 
-use flatppl_core::{NamedKind, Node, NodeId, Scalar, ValueSet};
+use flatppl_core::{CallHead, NamedKind, Node, NodeId, Scalar, ValueSet};
 
 use crate::emitter::Emitter;
 use crate::mlir::{MlirTy, Value};
@@ -310,9 +310,27 @@ impl Params {
     /// [`Emitter::valueset_of`]'s doc comment).
     pub fn field_id(&self, e: &Emitter, name: &str) -> Result<NodeId, EmitError> {
         let field = match e.node(self.kernel_input) {
-            Node::Call(c) => c.named.iter().find_map(|n| {
-                (n.kind == NamedKind::Field && e.resolve(n.name) == name).then_some(n.value)
-            }),
+            Node::Call(c) => {
+                // Two kernel-input shapes carry the params as named entries keyed
+                // by field name: a plain `record(%field name val ...)`, and a
+                // batched `broadcast(record, %kwarg name val, ...)` — the
+                // per-observation kernel of a dotted `builtin_logdensityof.(Dist,
+                // broadcast(record, ...), vec)` (§04 sec:broadcasting), whose
+                // vector-valued fields drive the batched density. The plain form
+                // uses `%field`; the broadcast form uses `%kwarg`.
+                let is_broadcast_record = matches!(c.head, CallHead::Builtin(s) if e.resolve(s) == "broadcast")
+                    && c.args.first().is_some_and(
+                        |&a| matches!(e.node(a), Node::Const(rs) if e.resolve(*rs) == "record"),
+                    );
+                let want = if is_broadcast_record {
+                    NamedKind::Kwarg
+                } else {
+                    NamedKind::Field
+                };
+                c.named
+                    .iter()
+                    .find_map(|n| (n.kind == want && e.resolve(n.name) == name).then_some(n.value))
+            }
             _ => None,
         };
         field.ok_or_else(|| {
@@ -349,6 +367,46 @@ impl Params {
 /// constructor symbol, `kernel_input` its kwargs record, `v` the scored
 /// variate. Dispatches to `lookup(ctor).logpdf`, refusing precisely for a
 /// malformed call shape or an unregistered ctor — never guessed.
+/// Whether distribution `ctor`'s `logpdf` builder is **rank-agnostic** — pure
+/// `Emitter::binary`-style per-element arithmetic over `Params::get` fields and
+/// the variate, so feeding it rank-1 (batched) inputs yields a rank-1
+/// log-density vector via auto-broadcast, with no shape-specific machinery.
+/// The gate for the broadcast-density path (`Emitter::lower_broadcast`): a
+/// dotted `builtin_logdensityof.(Dist, broadcast(record, …), vec)` is only sound
+/// for these dists. **Default-deny**: everything not listed — the structural
+/// builders (Categorical/Categorical0's literal-index gather; MvNormal /
+/// Wishart / InverseWishart / LKJ / LKJCholesky / Multinomial's matrix /
+/// Cholesky / static-vector ops; Dirichlet / Multinomial's simplex reductions;
+/// NegativeBinomial2's `get0`/`reshape`; Uniform's set-valued `support`) AND any
+/// FUTURE registry addition — refuses under broadcast rather than risk emitting
+/// shape-inconsistent StableHLO (refuse-don't-mislower). Enable a new dist here
+/// only after verifying its builder uses no shape-specific ops.
+pub(crate) fn is_batch_safe(ctor: &str) -> bool {
+    matches!(
+        ctor,
+        "Normal"
+            | "Cauchy"
+            | "Logistic"
+            | "Laplace"
+            | "Exponential"
+            | "Gamma"
+            | "Weibull"
+            | "Pareto"
+            | "InverseGamma"
+            | "ChiSquared"
+            | "LogNormal"
+            | "Beta"
+            | "StudentT"
+            | "GeneralizedNormal"
+            | "VonMises"
+            | "Bernoulli"
+            | "Poisson"
+            | "Binomial"
+            | "Geometric"
+            | "NegativeBinomial"
+    )
+}
+
 pub(crate) fn lower_logdensityof(
     e: &mut Emitter,
     id: NodeId,
@@ -3318,4 +3376,52 @@ fn multinomial_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
         },
     );
     Ok(results[1].clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_batch_safe;
+
+    #[test]
+    fn batch_safe_allows_univariate_arithmetic_dists() {
+        for d in [
+            "Normal",
+            "Cauchy",
+            "Exponential",
+            "Gamma",
+            "Beta",
+            "StudentT",
+            "Bernoulli",
+            "Poisson",
+            "Binomial",
+            "Geometric",
+            "NegativeBinomial",
+        ] {
+            assert!(is_batch_safe(d), "{d} should be batch-safe");
+        }
+    }
+
+    #[test]
+    fn batch_safe_denies_structural_multivariate_and_unknown_dists() {
+        // Gather/index (Categorical), matrix/Cholesky (MvNormal/Wishart/LKJ),
+        // simplex reductions (Dirichlet/Multinomial), get0/reshape
+        // (NegativeBinomial2), set-valued support (Uniform), and any future/
+        // unknown ctor are NOT rank-agnostic and must refuse under broadcast.
+        for d in [
+            "Categorical",
+            "Categorical0",
+            "MvNormal",
+            "Dirichlet",
+            "Multinomial",
+            "Wishart",
+            "InverseWishart",
+            "LKJ",
+            "LKJCholesky",
+            "Uniform",
+            "NegativeBinomial2",
+            "SomeFutureDistribution",
+        ] {
+            assert!(!is_batch_safe(d), "{d} must not be batch-safe");
+        }
+    }
 }
