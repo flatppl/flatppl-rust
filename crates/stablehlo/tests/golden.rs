@@ -45,6 +45,42 @@ fn emit_stub_on_flatpdl_returns_module() {
     assert!(out.contains("module {"));
 }
 
+// A broadcast/iid likelihood (`mu = a .+ x`, `y ~ Normal.(mu, 0.5)`) determinizes
+// to `sum(broadcast(builtin_logdensityof, Normal, broadcast(record, mu = <vec>,
+// sigma = 0.5), y_obs))` — the batched-density path (§04 sec:broadcasting). The
+// emitter's `broadcast` lowering must run the rank-agnostic Normal logpdf over
+// the rank-1 (`3x`) batch, scalars auto-broadcasting, then reduce. Verified
+// out-of-tree to IREE-execute == scipy oracle (linear_regression/partial_pooling);
+// this golden pins the emit + the batched shape. Buffy #303 (broadcast gap).
+#[test]
+fn broadcast_iid_likelihood_lowers_to_batched_density() {
+    let src = "flatppl_compat = \"0.1\"\n\
+x = [1.0, 2.0, 3.0]\n\
+y_obs = [1.1, 2.2, 2.9]\n\
+a = draw(Normal(mu = 0.0, sigma = 1.0))\n\
+mu = a .+ x\n\
+y = draw(Normal.(mu, 0.5))\n\
+L = likelihoodof(kernelof(record(y = y), a = a), record(y = y_obs))\n\
+post = bayesupdate(L, lawof(record(a = a)))\n\
+score = logdensityof(post, record(a = 0.5))\n";
+    let m = flatppl_syntax::parse(src).unwrap();
+    let d = flatppl_determinizer::determinize(&m).unwrap();
+    let out = flatppl_stablehlo::emit(&d, flatppl_stablehlo::Mode::LogDensity, &Default::default())
+        .unwrap();
+    assert!(out.contains("module {") && is_delimiter_balanced(&out));
+    // The 3-observation batch survives as a rank-1 tensor, is reduced (the iid
+    // sum), and scalars are broadcast to it.
+    assert!(out.contains("tensor<3xf32>"), "batch dim present:\n{out}");
+    assert!(
+        out.contains("stablehlo.reduce"),
+        "iid sum reduces the batch:\n{out}"
+    );
+    assert!(
+        out.contains("stablehlo.broadcast"),
+        "scalar auto-broadcast:\n{out}"
+    );
+}
+
 /// A placeholder node to hang a `set_type` on — its `Node` payload is
 /// irrelevant to `mlir_type_of`, which only reads the type side-table.
 fn placeholder(m: &mut Module, ty: Type) -> flatppl_core::NodeId {

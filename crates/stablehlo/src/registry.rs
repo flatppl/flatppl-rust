@@ -10,7 +10,7 @@
 //! `crate::ops::lower_builtin`'s catch-all "unsupported builtin head"
 //! refusal — see that module's doc comment.
 
-use flatppl_core::{NamedKind, Node, NodeId, Scalar, ValueSet};
+use flatppl_core::{CallHead, NamedKind, Node, NodeId, Scalar, ValueSet};
 
 use crate::emitter::Emitter;
 use crate::mlir::{MlirTy, Value};
@@ -310,9 +310,27 @@ impl Params {
     /// [`Emitter::valueset_of`]'s doc comment).
     pub fn field_id(&self, e: &Emitter, name: &str) -> Result<NodeId, EmitError> {
         let field = match e.node(self.kernel_input) {
-            Node::Call(c) => c.named.iter().find_map(|n| {
-                (n.kind == NamedKind::Field && e.resolve(n.name) == name).then_some(n.value)
-            }),
+            Node::Call(c) => {
+                // Two kernel-input shapes carry the params as named entries keyed
+                // by field name: a plain `record(%field name val ...)`, and a
+                // batched `broadcast(record, %kwarg name val, ...)` — the
+                // per-observation kernel of a dotted `builtin_logdensityof.(Dist,
+                // broadcast(record, ...), vec)` (§04 sec:broadcasting), whose
+                // vector-valued fields drive the batched density. The plain form
+                // uses `%field`; the broadcast form uses `%kwarg`.
+                let is_broadcast_record = matches!(c.head, CallHead::Builtin(s) if e.resolve(s) == "broadcast")
+                    && c.args.first().is_some_and(
+                        |&a| matches!(e.node(a), Node::Const(rs) if e.resolve(*rs) == "record"),
+                    );
+                let want = if is_broadcast_record {
+                    NamedKind::Kwarg
+                } else {
+                    NamedKind::Field
+                };
+                c.named
+                    .iter()
+                    .find_map(|n| (n.kind == want && e.resolve(n.name) == name).then_some(n.value))
+            }
             _ => None,
         };
         field.ok_or_else(|| {
