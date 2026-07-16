@@ -27,4 +27,10 @@ pub enum NonConformKind {
     /// survived into what should be FlatPDL output. Generic backstop: an
     /// ill-formed node must never pass as valid FlatPDL, whatever produced it.
     Failed,
+    /// A `(%ref self <name>)` — as an ordinary body sub-node OR a `functionof`/
+    /// `kernelof` reification `Inputs` boundary entry — names a binding that is
+    /// not present in the module. Permanent self-check against any
+    /// binding-removal pass (root-based DCE, Buffy #263 Pass 4-A, is the first
+    /// one) dropping a binding something still points at.
+    DanglingSelfRef,
 }

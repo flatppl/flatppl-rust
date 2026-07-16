@@ -119,6 +119,16 @@ impl Module {
         self.bindings.get_mut(id).rhs = rhs;
     }
 
+    /// Keep only the bindings in `keep`, in their existing source order; drop the
+    /// rest from iteration (`order`) and name lookup (`by_name`). The dropped
+    /// bindings' arena slots are not reclaimed (the arena has no removal), but they
+    /// become unreachable: `bindings()`, the writer, and `binding_by_name` no
+    /// longer see them. Used by the determiniser's root-based DCE (Pass 4 / #263).
+    pub fn retain_bindings(&mut self, keep: &std::collections::HashSet<BindingId>) {
+        self.order.retain(|id| keep.contains(id));
+        self.by_name.retain(|_name, id| keep.contains(id));
+    }
+
     // ---- read ----
 
     pub fn node(&self, id: NodeId) -> &Node {
@@ -407,6 +417,41 @@ mod tests {
     use super::*;
     use crate::node::{Call, CallHead, Node, Scalar};
     use crate::ty::{ScalarType, Type};
+
+    #[test]
+    fn retain_bindings_drops_unlisted_from_order_and_by_name() {
+        let mut m = Module::new();
+        let a_name = m.intern("a");
+        let b_name = m.intern("b");
+        let n0 = m.alloc(Node::Lit(Scalar::Real(1.0)));
+        let a = m.add_binding(Binding {
+            name: a_name,
+            rhs: n0,
+            doc: None,
+            public: true,
+            synthetic: false,
+        });
+        let n1 = m.alloc(Node::Lit(Scalar::Real(2.0)));
+        let _b = m.add_binding(Binding {
+            name: b_name,
+            rhs: n1,
+            doc: None,
+            public: false,
+            synthetic: false,
+        });
+        let keep: std::collections::HashSet<BindingId> = [a].into_iter().collect();
+        m.retain_bindings(&keep);
+        assert_eq!(
+            m.bindings().count(),
+            1,
+            "only `a` remains in iteration order"
+        );
+        assert!(m.binding_by_name(a_name).is_some());
+        assert!(
+            m.binding_by_name(b_name).is_none(),
+            "b dropped from by_name"
+        );
+    }
 
     #[test]
     fn node_at_offset_returns_innermost() {

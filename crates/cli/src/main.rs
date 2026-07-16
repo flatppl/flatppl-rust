@@ -161,6 +161,11 @@ enum Command {
         /// Output file (`.flatppl`); stdout if omitted.
         #[arg(short, long)]
         output: Option<PathBuf>,
+        /// Requested-output binding name to keep (repeatable). Bindings not
+        /// reachable from any `--keep` root are removed. With no `--keep`, all
+        /// bindings are kept (backward-compatible).
+        #[arg(long = "keep")]
+        keep: Vec<String>,
     },
     /// Emit textual StableHLO for a FlatPPL model.
     ///
@@ -279,7 +284,11 @@ fn main() -> ExitCode {
         #[cfg(feature = "prepare")]
         Command::Prepare { files, update } => prepare_cmd(&files, update),
         #[cfg(feature = "determinize")]
-        Command::Determinize { input, output } => determinize_cmd(&input, output.as_deref()),
+        Command::Determinize {
+            input,
+            output,
+            keep,
+        } => determinize_cmd(&input, output.as_deref(), &keep),
         #[cfg(feature = "stablehlo")]
         Command::Stablehlo {
             input,
@@ -553,19 +562,29 @@ fn load_and_infer(
     Ok((module, bundle))
 }
 
-/// `flatppl determinize <in.flatppl> [-o out]` — legalize a FlatPPL model to
-/// the deterministic FlatPDL profile (eliminate the measure layer), printing
-/// canonical FlatPPL syntax to `output`/stdout. Refuses (exit 3, via
+/// `flatppl determinize <in.flatppl> [-o out] [--keep name]…` — legalize a
+/// FlatPPL model to the deterministic FlatPDL profile (eliminate the measure
+/// layer), printing canonical FlatPPL syntax to `output`/stdout. With one or
+/// more `--keep <name>`, only bindings reachable from those requested-output
+/// roots survive (root-based DCE, Buffy #263 Pass 4-A); with none, every
+/// binding is kept (unchanged behavior). Refuses (exit 3, via
 /// `Failure::Refuse`) any construct the determiniser cannot legalize.
 #[cfg(feature = "determinize")]
-fn determinize_cmd(input: &Path, output: Option<&Path>) -> Result<(), Failure> {
-    let (module, bundle) = load_and_infer(input)?;
-    let lowered = flatppl_determinizer::determinize_with(&module, &bundle).map_err(|e| {
-        Failure::Refuse(format!(
-            "determinize: refuse {} (node {:?}): {}",
-            e.construct, e.node, e.reason
-        ))
-    })?;
+fn determinize_cmd(input: &Path, output: Option<&Path>, keep: &[String]) -> Result<(), Failure> {
+    let (mut module, bundle) = load_and_infer(input)?;
+    let syms: Vec<flatppl_core::Symbol> = keep.iter().map(|name| module.intern(name)).collect();
+    let roots = if syms.is_empty() {
+        None
+    } else {
+        Some(syms.as_slice())
+    };
+    let lowered =
+        flatppl_determinizer::determinize_with_roots(&module, &bundle, roots).map_err(|e| {
+            Failure::Refuse(format!(
+                "determinize: refuse {} (node {:?}): {}",
+                e.construct, e.node, e.reason
+            ))
+        })?;
     let rendered = flatppl_syntax::print(&lowered);
     match output {
         Some(path) => fs::write(path, rendered)

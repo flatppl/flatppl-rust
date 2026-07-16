@@ -3,8 +3,9 @@
 //! `flatpdl.flatprof` conformance AND exact semantics (Buffy #263). Each pass
 //! is idempotent and refuse-free; the driver runs them to a combined fixpoint.
 
-use flatppl_core::Module;
+use flatppl_core::{Module, Symbol};
 
+mod dce;
 mod flatten;
 mod fold;
 mod inline;
@@ -16,10 +17,17 @@ fn no_canon() -> bool {
     std::env::var_os("FLATPPL_DETERMINIZE_NO_CANON").is_some()
 }
 
-/// Run every canonicalization pass to a combined fixpoint. Re-infers between
-/// sweeps because a reduction can shift inferred types/phases that a later pass
-/// reads. A no-op if `FLATPPL_DETERMINIZE_NO_CANON` is set.
-pub(crate) fn canonicalize(m: &mut Module) {
+/// Run every canonicalization pass to a combined fixpoint, then — if `roots` is
+/// given — root-based dead-code elimination (Pass 4-A, Buffy #263): only
+/// bindings reachable from the requested-output `roots` survive. Re-infers
+/// between sweeps because a reduction can shift inferred types/phases that a
+/// later pass reads. A no-op if `FLATPPL_DETERMINIZE_NO_CANON` is set.
+///
+/// DCE runs ONCE, after the fixpoint — the dead-set is only stable once
+/// inline/fold/flatten have converged; running it mid-fixpoint could drop a
+/// binding a later pass would still have rewritten through. `roots = None`
+/// preserves keep-all (backward-compatible).
+pub(crate) fn canonicalize(m: &mut Module, roots: Option<&[Symbol]>) {
     if no_canon() {
         return;
     }
@@ -34,5 +42,8 @@ pub(crate) fn canonicalize(m: &mut Module) {
             break;
         }
         let _ = flatppl_infer::infer(m);
+    }
+    if let Some(roots) = roots {
+        dce::retain_reachable(m, roots);
     }
 }
