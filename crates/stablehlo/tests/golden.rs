@@ -509,10 +509,15 @@ fn emitter_fresh_ssa_names_never_repeat() {
 
 // ---- Task 4: node dispatch + deterministic op map -------------------------
 //
-// All of these build tiny FlatPDL fragments by hand (no parse/infer pass —
-// `Emitter::lower_node`'s dispatch never consults the type side-table, only
-// node structure and already-lowered operand shapes) mirroring Task 2/3's
-// hand-built-`Module` test style.
+// Most of these build tiny FlatPDL fragments by hand (no parse/infer pass),
+// mirroring Task 2/3's hand-built-`Module` test style — node structure and
+// already-lowered operand shapes drive `Emitter::lower_node`'s dispatch.
+// Since Task A2, the deterministic op map's kind-polymorphic/real-domain
+// coercion (`ops::lower_builtin`) DOES consult the type side-table
+// (`Emitter::node_kind`), but every fragment below never calls `set_type` on
+// its call nodes, so it falls back to `ElemKind::Real` exactly as before —
+// a hand-built fragment that needs a NON-`Real` result kind sets it
+// explicitly (see `lower_node_mixed_int_real_add_converts_before_add`).
 
 fn top_level(m: &mut Module, name: &str, rhs: NodeId) {
     let sym = m.intern(name);
@@ -617,6 +622,94 @@ fn lower_builtin_head_map_dispatches_expected_ops() {
         let out = e.finish("f", &[], &[&result]);
         assert!(out.contains(op), "head '{head}': missing {op} in:\n{out}");
         assert!(is_delimiter_balanced(&out));
+    }
+}
+
+/// Task A2 Step 1: `add(int_literal, real_binding)`, with the `add` node's
+/// OWN inferred type set to `Real` (mixed-kind inference has already decided
+/// the result, exactly as `flatppl-infer` would for `3 + mu` with `mu:
+/// reals`) — must render the int literal as an `i32` tensor, insert exactly
+/// one `stablehlo.convert` (the canonical `integers ⊂ reals` embedding, spec
+/// §03) immediately before the `stablehlo.add` it feeds, and the add itself
+/// renders `f32`. Types are set directly on the hand-built `Module`
+/// (mirroring `mlir_type_of`'s `placeholder` helper) rather than run through
+/// a full parse+infer pass — only the type side-table `node_kind` reads
+/// matters here.
+#[test]
+fn lower_node_mixed_int_real_add_converts_before_add() {
+    let mut m = Module::new();
+    let i = int(&mut m, 3);
+    m.set_type(i, Type::Scalar(ScalarType::Integer));
+    let x = real(&mut m, 2.5);
+    m.set_type(x, Type::Scalar(ScalarType::Real));
+    let add_node = call(&mut m, "add", &[i, x]);
+    m.set_type(add_node, Type::Scalar(ScalarType::Real));
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    let result = e.lower_node(add_node).unwrap();
+    assert_eq!(result.ty, MlirTy::Scalar);
+    assert_eq!(result.elem, ElemKind::Real);
+    let out = e.finish("f", &[], &[&result]);
+
+    assert!(
+        out.contains("tensor<i32>"),
+        "int literal renders as an i32 scalar tensor:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.convert").count(),
+        1,
+        "expected exactly one stablehlo.convert (the int->real embedding):\n{out}"
+    );
+    let convert_pos = out.find("stablehlo.convert").expect("missing convert");
+    let add_pos = out.find("stablehlo.add").expect("missing add");
+    assert!(
+        convert_pos < add_pos,
+        "convert must precede the add it feeds:\n{out}"
+    );
+    let add_line = out
+        .lines()
+        .find(|l| l.contains("stablehlo.add"))
+        .expect("missing add line");
+    assert!(
+        add_line.contains("tensor<f32>"),
+        "add renders f32 operands:\n{add_line}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// Task A2 regression: a CONTINUOUS distribution invoked with literal
+/// INTEGER parameters (`Gamma(2, 1)`, fully idiomatic FlatPPL — same style as
+/// `Normal(0, 1)`) must still emit well-typed StableHLO. `crate::registry`'s
+/// `gamma_logpdf` calls `Emitter::log`/`Emitter::lgamma` directly on `rate`/
+/// `shape` — real-only ops with no `NodeId` to coerce against an inferred
+/// result kind, since registry.rs never goes through `crate::ops`'s dispatch
+/// table — so every `stablehlo.log`/`chlo.lgamma` operand must be converted
+/// to `f32` FIRST, never applied directly to the literals' native `i32`.
+/// (Caught by running `poisson-model.flatppl`'s `Gamma(2, 1)` prior through
+/// the emitter during Task A2's Step-8 numeric re-verify — no golden here
+/// exercised a literal-parameter continuous distribution before.)
+#[test]
+fn literal_int_params_on_continuous_distribution_convert_before_real_only_ops() {
+    let src = "flatppl_compat = \"0.1\"\n\
+lambda = draw(Gamma(shape = 2, rate = 1))\n\
+lp = logdensityof(lawof(record(lambda = lambda)), record(lambda = 2.5))\n";
+    let m = flatppl_syntax::parse(src).unwrap();
+    let d = flatppl_determinizer::determinize(&m).unwrap();
+    let out = flatppl_stablehlo::emit(&d, flatppl_stablehlo::Mode::LogDensity, &Default::default())
+        .unwrap();
+    assert!(out.contains("module {") && is_delimiter_balanced(&out));
+    assert!(
+        out.contains("tensor<i32>"),
+        "the literal shape/rate params render as i32:\n{out}"
+    );
+    for line in out.lines() {
+        if line.contains("stablehlo.log") || line.contains("chlo.lgamma") {
+            assert!(
+                !line.contains("i32"),
+                "a real-only op must never see an i32 operand directly \
+                 (missing a convert):\n{line}\nfull module:\n{out}"
+            );
+        }
     }
 }
 
@@ -1193,6 +1286,10 @@ fn lower_node_refuses_string_literal() {
     assert!(err.msg.contains("string literal"));
 }
 
+/// Task A2: an int/bool literal lowers as a rank-0 tensor at its OWN kind —
+/// `Int`/`Bool`, not `Real` — regardless of any inferred type (`Node::Lit`
+/// dispatch never consults the type side-table, only the literal's own
+/// `Scalar` tag; see [`Emitter::int_value_const`]/[`Emitter::bool_value_const`]).
 #[test]
 fn lower_node_lowers_int_and_bool_literals_as_scalars() {
     let mut m = Module::new();
@@ -1202,10 +1299,12 @@ fn lower_node_lowers_int_and_bool_literals_as_scalars() {
     let iv = e.lower_node(i).unwrap();
     let bv = e.lower_node(b).unwrap();
     assert_eq!(iv.ty, MlirTy::Scalar);
+    assert_eq!(iv.elem, ElemKind::Int);
     assert_eq!(bv.ty, MlirTy::Scalar);
-    let out = e.finish("f", &[], &[&bv]);
-    assert!(out.contains("dense<7"));
-    assert!(out.contains("dense<1"));
+    assert_eq!(bv.elem, ElemKind::Bool);
+    let out = e.finish("f", &[], &[&iv, &bv]);
+    assert!(out.contains("dense<7> : tensor<i32>"));
+    assert!(out.contains("dense<true> : tensor<i1>"));
 }
 
 /// A bare `Const` symbol (`inf`) is dispatched through the same builtin-head

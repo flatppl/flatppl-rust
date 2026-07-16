@@ -55,6 +55,20 @@ fn pos_inf_literal(dtype: Dtype) -> &'static str {
     }
 }
 
+/// The canonical spec §03 embedding order `booleans ⊂ integers ⊂ reals`, as
+/// a rank: [`Emitter::binary`]'s mismatched-operand-kind widening converges
+/// on whichever of its two operands' kinds has the HIGHER rank (e.g. a
+/// `bool`-vs-`int` mismatch widens to `int`, an `int`-vs-`real` mismatch to
+/// `real`), never the other way — the embedding only ever goes "up" the
+/// inclusion chain.
+fn elem_rank(k: ElemKind) -> u8 {
+    match k {
+        ElemKind::Bool => 0,
+        ElemKind::Int => 1,
+        ElemKind::Real => 2,
+    }
+}
+
 /// Emits textual StableHLO into an internal buffer while assigning fresh SSA
 /// names and tracking which FlatPDL [`NodeId`]s have already been lowered.
 pub struct Emitter<'m> {
@@ -226,7 +240,12 @@ impl<'m> Emitter<'m> {
     }
 
     /// One elementwise unary op: `%N = {op} %a : ty`. Result type copies the
-    /// operand's `MlirTy` — elementwise ops are shape-preserving.
+    /// operand's `MlirTy` — elementwise ops are shape-preserving. The result
+    /// `elem` copies `a`'s (kind-polymorphic `neg`/`abs` pass their operand's
+    /// own `Int`/`Real` through unchanged; every real-only caller
+    /// (`log`/`exp`/`sqrt`/`cos`/`invlogit`/…) only ever reaches this with an
+    /// already-`Real` `a` — the caller converted it first — so the pass-
+    /// through is equally correct there).
     pub fn unary(&mut self, op: &str, a: &Value) -> Value {
         let ssa = self.fresh();
         let ty_text = a.ty.render(self.dtype, a.elem);
@@ -234,14 +253,16 @@ impl<'m> Emitter<'m> {
         Value {
             ssa,
             ty: a.ty.clone(),
-            elem: ElemKind::Real,
+            elem: a.elem,
         }
     }
 
     /// Emit one elementwise binary op at `a`'s shape, with NO broadcasting —
     /// the raw text primitive [`Emitter::binary`] wraps. Both operands are
     /// assumed to already share `a`'s shape (the caller has broadcast a scalar
-    /// operand up first, if needed).
+    /// operand up first, if needed) AND `a`'s `elem` (the caller has
+    /// reconciled a kind mismatch first, if needed) — the result `elem`
+    /// copies `a`'s.
     fn emit_binary(&mut self, op: &str, a: &Value, b: &Value) -> Value {
         let ssa = self.fresh();
         let ty_text = a.ty.render(self.dtype, a.elem);
@@ -249,33 +270,55 @@ impl<'m> Emitter<'m> {
         Value {
             ssa,
             ty: a.ty.clone(),
-            elem: ElemKind::Real,
+            elem: a.elem,
         }
     }
 
-    /// One elementwise binary op: `%N = {op} %a, %b : ty`. When one operand is
-    /// a `Scalar` and the other a `Ranked` tensor, the scalar is
-    /// [`Emitter::broadcast_scalar`]d up to the ranked shape FIRST (StableHLO's
-    /// elementwise ops require identical operand shapes) — the mechanism a
-    /// fan-out Tier-1 iid draw relies on to mix a batched `[n]` draw with the
-    /// distribution's scalar parameters/constants. When the shapes already
-    /// match (every `@logdensity` path and every scalar `@sample` — inference
-    /// has shape-unified their operands upstream), no broadcast is emitted and
-    /// the output is byte-identical to before. Ranked-vs-Ranked mismatches are
-    /// left as-is (not a Tier-1 case) — an internal invariant violation
-    /// upstream type-checking should have ruled out, per this module's doc
-    /// comment.
+    /// One elementwise binary op: `%N = {op} %a, %b : ty`. Two operand
+    /// mismatches are reconciled before emitting, so every direct caller
+    /// (both `crate::ops`'s dispatch table AND `crate::registry`'s
+    /// distribution builders, which call `add`/`sub`/`mul`/`neg`/`abs`
+    /// directly — those never carry a `NodeId` to coerce against an inferred
+    /// result kind) gets well-typed StableHLO with no extra ceremony:
+    ///
+    /// - **Elem-kind** (spec §03 `booleans ⊂ integers ⊂ reals`): a mismatched
+    ///   pair widens the narrower operand up to the wider (via
+    ///   [`Emitter::convert`], [`elem_rank`]'s ordering) BEFORE anything else —
+    ///   e.g. an `Int` `k` mixed with a `Real` parameter (a discrete
+    ///   distribution's logpdf, `k * log(rate)`) converts `k` to `Real`
+    ///   first. A matching pair (both `Int`, e.g. Binomial's `n - k`) is left
+    ///   alone, so an all-integer expression stays integer end to end.
+    /// - **Shape**: when one operand is a `Scalar` and the other `Ranked`, the
+    ///   scalar is [`Emitter::broadcast_scalar`]d up to the ranked shape
+    ///   (StableHLO's elementwise ops require identical operand shapes) — the
+    ///   mechanism a fan-out Tier-1 iid draw relies on to mix a batched `[n]`
+    ///   draw with the distribution's scalar parameters/constants.
+    ///
+    /// When both already match (every `@logdensity` path and every scalar
+    /// `@sample` this emitter built before Task A2 — inference has kind- and
+    /// shape-unified their operands upstream), neither reconciliation emits
+    /// anything and the output is byte-identical to before. Ranked-vs-Ranked
+    /// shape mismatches are left as-is (not a Tier-1 case) — an internal
+    /// invariant violation upstream type-checking should have ruled out, per
+    /// this module's doc comment.
     pub fn binary(&mut self, op: &str, a: &Value, b: &Value) -> Value {
+        let target = if elem_rank(a.elem) >= elem_rank(b.elem) {
+            a.elem
+        } else {
+            b.elem
+        };
+        let a = self.convert(a, target);
+        let b = self.convert(b, target);
         match (&a.ty, &b.ty) {
             (MlirTy::Scalar, MlirTy::Ranked(_)) => {
-                let a_bc = self.broadcast_scalar(a, &b.ty);
-                self.emit_binary(op, &a_bc, b)
+                let a_bc = self.broadcast_scalar(&a, &b.ty);
+                self.emit_binary(op, &a_bc, &b)
             }
             (MlirTy::Ranked(_), MlirTy::Scalar) => {
-                let b_bc = self.broadcast_scalar(b, &a.ty);
-                self.emit_binary(op, a, &b_bc)
+                let b_bc = self.broadcast_scalar(&b, &a.ty);
+                self.emit_binary(op, &a, &b_bc)
             }
-            _ => self.emit_binary(op, a, b),
+            _ => self.emit_binary(op, &a, &b),
         }
     }
 
@@ -288,30 +331,61 @@ impl<'m> Emitter<'m> {
     pub fn mul(&mut self, a: &Value, b: &Value) -> Value {
         self.binary("stablehlo.multiply", a, b)
     }
+    /// A binary op that ONLY has real semantics (`divide`/`power`): both
+    /// operands are [`Emitter::convert`]ed to [`ElemKind::Real`] first,
+    /// unconditionally — unlike [`Emitter::binary`]'s kind-polymorphic
+    /// widening (which would leave a matching `Int`/`Int` pair alone),
+    /// `divide(3, 4)` must still be the real division `0.75`, never an
+    /// integer floor division (that's the separate, unimplemented `div`
+    /// head). Both callers (`crate::ops`'s dispatch table AND
+    /// `crate::registry`'s distribution builders, e.g. a literal-parameter
+    /// `Gamma(2, 1)`'s `rate^shape`) get this for free with no extra
+    /// ceremony at the call site.
+    fn binary_real(&mut self, op: &str, a: &Value, b: &Value) -> Value {
+        let a = self.convert(a, ElemKind::Real);
+        let b = self.convert(b, ElemKind::Real);
+        self.binary(op, &a, &b)
+    }
+
+    /// A unary op that ONLY has real semantics (`log`/`exp`/`sqrt`/`cos`/
+    /// `invlogit`/`sin`/`floor` — none of these are meaningful StableHLO
+    /// integer ops): the operand is [`Emitter::convert`]ed to
+    /// [`ElemKind::Real`] first, unconditionally. Unlike [`Emitter::unary`]
+    /// (kind-polymorphic `neg`/`abs`, which pass an `Int` operand through),
+    /// this fixes e.g. `crate::registry::gamma_logpdf`'s `log(&rate)`/
+    /// `lgamma(&shape)` for a literal-parameter `Gamma(2, 1)` — `shape`/
+    /// `rate` are `Int` value constants there, with no `NodeId` for the
+    /// caller to coerce against an inferred result kind (registry.rs calls
+    /// these directly, never through `crate::ops`'s dispatch table).
+    fn unary_real(&mut self, op: &str, a: &Value) -> Value {
+        let a = self.convert(a, ElemKind::Real);
+        self.unary(op, &a)
+    }
+
     pub fn div(&mut self, a: &Value, b: &Value) -> Value {
-        self.binary("stablehlo.divide", a, b)
+        self.binary_real("stablehlo.divide", a, b)
     }
     pub fn pow(&mut self, a: &Value, b: &Value) -> Value {
-        self.binary("stablehlo.power", a, b)
+        self.binary_real("stablehlo.power", a, b)
     }
 
     pub fn neg(&mut self, a: &Value) -> Value {
         self.unary("stablehlo.negate", a)
     }
     pub fn log(&mut self, a: &Value) -> Value {
-        self.unary("stablehlo.log", a)
+        self.unary_real("stablehlo.log", a)
     }
     pub fn exp(&mut self, a: &Value) -> Value {
-        self.unary("stablehlo.exponential", a)
+        self.unary_real("stablehlo.exponential", a)
     }
     pub fn sqrt(&mut self, a: &Value) -> Value {
-        self.unary("stablehlo.sqrt", a)
+        self.unary_real("stablehlo.sqrt", a)
     }
     pub fn abs(&mut self, a: &Value) -> Value {
         self.unary("stablehlo.abs", a)
     }
     pub fn cos(&mut self, a: &Value) -> Value {
-        self.unary("stablehlo.cosine", a)
+        self.unary_real("stablehlo.cosine", a)
     }
     /// `invlogit(x) = 1/(1+exp(-x))` (the logistic sigmoid, §07) — emitted as the
     /// native `stablehlo.logistic`, which is numerically stable (no `exp`
@@ -319,7 +393,7 @@ impl<'m> Emitter<'m> {
     /// naive composition. Rank-preserving, so it batches under `broadcast`
     /// (`invlogit.(linear_predictor)`) via the shared unary path.
     pub fn invlogit(&mut self, a: &Value) -> Value {
-        self.unary("stablehlo.logistic", a)
+        self.unary_real("stablehlo.logistic", a)
     }
     /// `stablehlo.sine` — a NEW op form for this crate (Task 14's Cauchy
     /// `@sample`, which needs `tan(t) = sin(t) / cos(t)`; no `chlo`/
@@ -328,7 +402,7 @@ impl<'m> Emitter<'m> {
     /// parser (jax 0.10.2, `jax._src.interpreters.mlir.make_ir_context`),
     /// same discipline as every other op text this module emits.
     pub fn sin(&mut self, a: &Value) -> Value {
-        self.unary("stablehlo.sine", a)
+        self.unary_real("stablehlo.sine", a)
     }
     /// `stablehlo.floor` — a NEW op form for this crate (Task 16's Geometric
     /// `@sample`, `floor(log(U) / log(1 - p))`, the only discrete sampler that
@@ -337,7 +411,7 @@ impl<'m> Emitter<'m> {
     /// unary; parser-validated against the real StableHLO parser (jax 0.10.2),
     /// same discipline as [`Emitter::sin`].
     pub fn floor(&mut self, a: &Value) -> Value {
-        self.unary("stablehlo.floor", a)
+        self.unary_real("stablehlo.floor", a)
     }
 
     /// `%N = stablehlo.compare {dir}, %a, %b : (lhs, rhs) -> i1-shape`.
@@ -371,7 +445,7 @@ impl<'m> Emitter<'m> {
         Value {
             ssa,
             ty: a.ty,
-            elem: ElemKind::Real,
+            elem: ElemKind::Bool,
         }
     }
 
@@ -418,12 +492,40 @@ impl<'m> Emitter<'m> {
         }
     }
 
+    /// `%N = stablehlo.convert %a : (from) -> to` — a canonical scalar-kind
+    /// embedding (spec §03 `booleans ⊂ integers ⊂ reals`), e.g. widening an
+    /// `i32` operand up to `f32` at a real-only op's boundary. Numerically
+    /// exact for every embedding this emitter ever performs (an integer or
+    /// boolean value has an exact real representation). A no-op — returns
+    /// `v` unchanged, emits no line — when `v` is already at `target`, so
+    /// callers can convert unconditionally without checking first.
+    pub fn convert(&mut self, v: &Value, target: ElemKind) -> Value {
+        if v.elem == target {
+            return v.clone();
+        }
+        let ssa = self.fresh();
+        let from = v.ty.render(self.dtype, v.elem);
+        let to = v.ty.render(self.dtype, target);
+        self.push(&format!(
+            "{ssa} = stablehlo.convert {} : ({from}) -> {to}",
+            v.ssa
+        ));
+        Value {
+            ssa,
+            ty: v.ty.clone(),
+            elem: target,
+        }
+    }
+
     // ---- shape ops (Task 4: `get`/`get0`, `logsumexp`/`in` broadcasting) ---
 
     /// `%N = stablehlo.slice %a [s0:l0, s1:l1:t1, ...] : (operand_ty) ->
     /// result_ty` — a static per-axis slice (`starts`/`limits`/`strides`,
     /// one triple per `a`'s rank; StableHLO's pretty form omits `:stride`
     /// when it's `1`). Each result dimension is `(limit - start).div_ceil(stride)`.
+    /// Shape-only — StableHLO requires a slice's result element type to
+    /// match its operand's exactly, so the result `elem` copies `a`'s (an
+    /// `Int`-array `get`/`get0` slices out an `Int` scalar, not a `Real` one).
     pub fn slice(&mut self, a: &Value, starts: &[u64], limits: &[u64], strides: &[u64]) -> Value {
         let dims = match &a.ty {
             MlirTy::Ranked(dims) => dims,
@@ -455,7 +557,7 @@ impl<'m> Emitter<'m> {
 
         let ssa = self.fresh();
         let operand_ty = a.ty.render(self.dtype, a.elem);
-        let result_ty_text = result_ty.render(self.dtype, ElemKind::Real);
+        let result_ty_text = result_ty.render(self.dtype, a.elem);
         self.push(&format!(
             "{ssa} = stablehlo.slice {} [{}] : ({operand_ty}) -> {result_ty_text}",
             a.ssa,
@@ -464,18 +566,19 @@ impl<'m> Emitter<'m> {
         Value {
             ssa,
             ty: result_ty,
-            elem: ElemKind::Real,
+            elem: a.elem,
         }
     }
 
     /// `%N = stablehlo.reshape %a : (operand_ty) -> result_ty` — reinterprets
     /// `a`'s elements (same element count) under a different static shape,
     /// e.g. dropping `get0`/`get`'s now-length-1 sliced axis down to a
-    /// `Scalar`.
+    /// `Scalar`. Shape-only — same element-type-preserving contract as
+    /// [`Emitter::slice`], so the result `elem` copies `a`'s.
     pub fn reshape(&mut self, a: &Value, ty: MlirTy) -> Value {
         let ssa = self.fresh();
         let operand_ty = a.ty.render(self.dtype, a.elem);
-        let result_ty_text = ty.render(self.dtype, ElemKind::Real);
+        let result_ty_text = ty.render(self.dtype, a.elem);
         self.push(&format!(
             "{ssa} = stablehlo.reshape {} : ({operand_ty}) -> {result_ty_text}",
             a.ssa
@@ -483,7 +586,7 @@ impl<'m> Emitter<'m> {
         Value {
             ssa,
             ty,
-            elem: ElemKind::Real,
+            elem: a.elem,
         }
     }
 
@@ -495,11 +598,12 @@ impl<'m> Emitter<'m> {
     /// callers need today (`logsumexp`'s reduced max, `in`'s interval bounds,
     /// broadcast back up to the input vector/variate's shape; StableHLO's
     /// elementwise ops require identical operand shapes, no implicit
-    /// broadcast).
+    /// broadcast). Shape-only — same element-type-preserving contract as
+    /// [`Emitter::slice`], so the result `elem` copies `a`'s.
     pub fn broadcast_in_dim(&mut self, a: &Value, dims: &[u64], ty: MlirTy) -> Value {
         let ssa = self.fresh();
         let operand_ty = a.ty.render(self.dtype, a.elem);
-        let result_ty_text = ty.render(self.dtype, ElemKind::Real);
+        let result_ty_text = ty.render(self.dtype, a.elem);
         let dims_text = dims
             .iter()
             .map(u64::to_string)
@@ -512,7 +616,7 @@ impl<'m> Emitter<'m> {
         Value {
             ssa,
             ty,
-            elem: ElemKind::Real,
+            elem: a.elem,
         }
     }
 
@@ -540,10 +644,16 @@ impl<'m> Emitter<'m> {
     pub fn vector(&mut self, elems: &[Value]) -> Value {
         assert!(!elems.is_empty(), "vector: expected at least one element");
         let elem_ty = elems[0].ty.clone();
+        let elem_kind = elems[0].elem;
         assert!(
             elems.iter().all(|v| v.ty == elem_ty),
             "vector: elements must have identical shape (ragged vector-of-vectors \
              must be refused by the caller before this is reached)"
+        );
+        assert!(
+            elems.iter().all(|v| v.elem == elem_kind),
+            "vector: elements must share one elem kind (the caller reconciles a kind \
+             mismatch — e.g. via node_kind — before this is reached)"
         );
         let inner_dims: Vec<Option<u64>> = match &elem_ty {
             MlirTy::Scalar => Vec::new(),
@@ -577,7 +687,7 @@ impl<'m> Emitter<'m> {
             .map(|v| v.ty.render(self.dtype, v.elem))
             .collect::<Vec<_>>()
             .join(", ");
-        let result_ty_text = result_ty.render(self.dtype, ElemKind::Real);
+        let result_ty_text = result_ty.render(self.dtype, elem_kind);
 
         let ssa = self.fresh();
         self.push(&format!(
@@ -586,7 +696,7 @@ impl<'m> Emitter<'m> {
         Value {
             ssa,
             ty: result_ty,
-            elem: ElemKind::Real,
+            elem: elem_kind,
         }
     }
 
@@ -599,7 +709,9 @@ impl<'m> Emitter<'m> {
     /// operand or a permutation whose length differs from the operand rank —
     /// an internal invariant violation, per this module's doc comment.
     /// Parser-validated against the real StableHLO parser (jax 0.10.2) for the
-    /// rank-2 `[d, m] -> [m, d]` case (`dims = [1, 0]`).
+    /// rank-2 `[d, m] -> [m, d]` case (`dims = [1, 0]`). Shape-only — same
+    /// element-type-preserving contract as [`Emitter::slice`], so the result
+    /// `elem` copies `a`'s.
     pub fn transpose(&mut self, a: &Value, perm: &[u64]) -> Value {
         let in_dims = match &a.ty {
             MlirTy::Ranked(dims) => dims.clone(),
@@ -613,7 +725,7 @@ impl<'m> Emitter<'m> {
         let out_dims: Vec<Option<u64>> = perm.iter().map(|&p| in_dims[p as usize]).collect();
         let result_ty = MlirTy::Ranked(out_dims);
         let operand_ty = a.ty.render(self.dtype, a.elem);
-        let result_ty_text = result_ty.render(self.dtype, ElemKind::Real);
+        let result_ty_text = result_ty.render(self.dtype, a.elem);
         let dims_text = perm
             .iter()
             .map(u64::to_string)
@@ -627,7 +739,7 @@ impl<'m> Emitter<'m> {
         Value {
             ssa,
             ty: result_ty,
-            elem: ElemKind::Real,
+            elem: a.elem,
         }
     }
 
@@ -638,8 +750,15 @@ impl<'m> Emitter<'m> {
     /// function-type op (its operand and result types are separated by
     /// `->`, both spelled out) rather than the single-`: ty` form `unary`
     /// emits — elementwise here, so `in_ty == out_ty`, but both must still
-    /// be written for the op to parse.
+    /// be written for the op to parse. Real-only (like [`Emitter::log`]):
+    /// `a` is [`Emitter::convert`]ed to [`ElemKind::Real`] first — e.g. a
+    /// literal-parameter `Gamma(2, 1)`'s `shape` reaches
+    /// `crate::registry::gamma_logpdf`'s `lgamma(&shape)` as a bare `Int`
+    /// value constant, with no `NodeId` for the caller to coerce against an
+    /// inferred result kind (`crate::registry` calls this directly, never
+    /// through `crate::ops`'s dispatch table).
     pub fn lgamma(&mut self, a: &Value) -> Value {
+        let a = &self.convert(a, ElemKind::Real);
         let ssa = self.fresh();
         let ty_text = a.ty.render(self.dtype, a.elem);
         self.push(&format!(
@@ -1191,6 +1310,44 @@ impl<'m> Emitter<'m> {
         }
     }
 
+    /// `%N = stablehlo.constant dense<{i}> : tensor<i32|i64>` — a rank-0
+    /// VALUE-path integer literal (`Node::Lit(Scalar::Int(_))`, spec §03),
+    /// rendered at [`ElemKind::Int`] via [`MlirTy::render`] (dtype-configurable
+    /// `i32`/`i64`, unlike the fixed-`i32` control-flow [`Emitter::int_const`]
+    /// this is deliberately distinct from — that one is a loop counter, never
+    /// reaching a FlatPDL value; this is the FlatPDL integer VALUE itself).
+    pub fn int_value_const(&mut self, i: i64) -> Value {
+        let ssa = self.fresh();
+        let ty_text = MlirTy::Scalar.render(self.dtype, ElemKind::Int);
+        self.push(&format!(
+            "{ssa} = stablehlo.constant dense<{i}> : {ty_text}"
+        ));
+        Value {
+            ssa,
+            ty: MlirTy::Scalar,
+            elem: ElemKind::Int,
+        }
+    }
+
+    /// `%N = stablehlo.constant dense<{true|false}> : tensor<i1>` — a rank-0
+    /// VALUE-path boolean literal (`Node::Lit(Scalar::Bool(_))`, spec §03).
+    /// Textually identical to [`Emitter::bool_const`] (`i1` is dtype-
+    /// independent either way) but distinct in *kind*: the returned
+    /// [`Value`]'s `elem` is [`ElemKind::Bool`], not the control-flow
+    /// placeholder's [`ElemKind::Real`] — this is the FlatPDL boolean VALUE
+    /// itself, not a loop's accept-flag.
+    pub fn bool_value_const(&mut self, b: bool) -> Value {
+        let ssa = self.fresh();
+        self.push(&format!(
+            "{ssa} = stablehlo.constant dense<{b}> : tensor<i1>"
+        ));
+        Value {
+            ssa,
+            ty: MlirTy::Scalar,
+            elem: ElemKind::Bool,
+        }
+    }
+
     /// `%N = stablehlo.add %a, %b : tensor<i32>` — integer add (the loop
     /// counter's `i + 1`). Separate from [`Emitter::add`] because that renders
     /// its operand type via the float [`Dtype`]; both operands here are the
@@ -1653,6 +1810,24 @@ impl<'m> Emitter<'m> {
         self.m.valueset_of(id)
     }
 
+    /// `id`'s inferred scalar kind (spec §03 boolean/integer/real), via
+    /// [`crate::types::mlir_type_of`] — the downstream contract a value-
+    /// producing op's result `elem` must satisfy (`crate::ops`'s operand-
+    /// coercion arms read this to decide the target kind their operands
+    /// convert to). Falls back to [`ElemKind::Real`] when `id` has no
+    /// inferred type recorded (a hand-built test `Module` that never called
+    /// `set_type` — every such existing test predates per-kind tensors and
+    /// is built entirely from `Real` operands, so the fallback reproduces
+    /// its prior all-`Real` behaviour exactly) or when the type has no
+    /// tensor form at all (e.g. a residual measure-layer type): either way,
+    /// a bare bool is not a meaningful signal to propagate as an
+    /// [`EmitError`] from a `Result`-less accessor.
+    pub(crate) fn node_kind(&self, id: NodeId) -> ElemKind {
+        crate::types::mlir_type_of(self.m, id, self.dtype)
+            .map(|(_, k)| k)
+            .unwrap_or(ElemKind::Real)
+    }
+
     /// Lower one FlatPDL node to a [`Value`], memoizing the result so a
     /// shared sub-expression — reached from more than one parent, e.g. a
     /// `Ref`ed top-level binding used twice, or a caller-[`Emitter::bind`]-
@@ -1742,11 +1917,9 @@ impl<'m> Emitter<'m> {
     fn lower_node_uncached(&mut self, id: NodeId) -> Result<Value, EmitError> {
         let m: &'m Module = self.m;
         match m.node(id) {
-            Node::Lit(Scalar::Int(i)) => Ok(self.constant(*i as f64, MlirTy::Scalar)),
+            Node::Lit(Scalar::Int(i)) => Ok(self.int_value_const(*i)),
             Node::Lit(Scalar::Real(x)) => Ok(self.constant(*x, MlirTy::Scalar)),
-            Node::Lit(Scalar::Bool(b)) => {
-                Ok(self.constant(if *b { 1.0 } else { 0.0 }, MlirTy::Scalar))
-            }
+            Node::Lit(Scalar::Bool(b)) => Ok(self.bool_value_const(*b)),
             Node::Lit(Scalar::Str(_)) => {
                 Err(EmitError::at(id, "string literal has no tensor form"))
             }

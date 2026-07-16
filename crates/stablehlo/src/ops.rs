@@ -207,7 +207,13 @@ fn broadcast_to(e: &mut Emitter, id: NodeId, a: &Value, ty: &MlirTy) -> Result<V
 /// inner vectors have different lengths): §03 arrays are fixed-size/
 /// rectangular, so a ragged `vector(...)` has no tensor form at all —
 /// refused here, before `Emitter::vector`, rather than let its own
-/// identical-shape assertion fire as an internal-invariant panic.
+/// identical-shape assertion fire as an internal-invariant panic. Each
+/// element is [`Emitter::convert`]ed to `id`'s own inferred elem kind first
+/// (e.g. a homogeneous-`Int` literal array like `[2, 3, 5]` stays `Int`
+/// throughout; a mixed literal array — individually-tagged `Lit` nodes that
+/// inference has already unified to one array element type — converges on
+/// that unified kind) so `Emitter::vector`'s own elem-uniformity invariant
+/// always holds by construction, never by luck.
 fn lower_vector(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
     if args.is_empty() {
         return Err(EmitError::at(id, "vector: expected at least one element"));
@@ -223,6 +229,8 @@ fn lower_vector(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, E
             "vector elements must have identical shape; ragged vector-of-vectors has no tensor form",
         ));
     }
+    let target = e.node_kind(id);
+    let elems: Vec<Value> = elems.iter().map(|v| e.convert(v, target)).collect();
     Ok(e.vector(&elems))
 }
 
