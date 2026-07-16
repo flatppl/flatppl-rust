@@ -55,7 +55,7 @@ const MEASURE_VOCAB: &[&str] = &[
 /// model with loaded dependencies, use [`determinize_with`] and supply the
 /// dependency bundle.
 pub fn determinize(m: &Module) -> Result<Module, RefuseError> {
-    determinize_with(m, &ModuleBundle::new())
+    determinize_with_roots(m, &ModuleBundle::new(), None)
 }
 
 /// Like [`determinize`], but resolves cross-module (`load_module`) measure refs
@@ -68,6 +68,21 @@ pub fn determinize(m: &Module) -> Result<Module, RefuseError> {
 ///
 /// Works on a clone of `m`; the original is not modified.
 pub fn determinize_with(m: &Module, bundle: &ModuleBundle) -> Result<Module, RefuseError> {
+    determinize_with_roots(m, bundle, None)
+}
+
+/// Like [`determinize_with`], but when `roots` is `Some`, runs root-based DCE
+/// (Buffy #263 Pass 4-A) after canonicalization: only bindings reachable from
+/// the requested-output `roots` survive in the returned module. `roots = None`
+/// keeps every binding — byte-identical to [`determinize_with`]
+/// (backward-compatible).
+///
+/// Works on a clone of `m`; the original is not modified.
+pub fn determinize_with_roots(
+    m: &Module,
+    bundle: &ModuleBundle,
+    roots: Option<&[Symbol]>,
+) -> Result<Module, RefuseError> {
     let mut work = m.clone();
 
     loop {
@@ -79,9 +94,10 @@ pub fn determinize_with(m: &Module, bundle: &ModuleBundle) -> Result<Module, Ref
 
         match target {
             None => {
-                // Measure layer gone — canonicalize the FlatPDL before the
-                // conformance check and return (Buffy #263).
-                crate::canon::canonicalize(&mut work);
+                // Measure layer gone — canonicalize the FlatPDL (and, if
+                // `roots` is given, drop bindings unreachable from them) before
+                // the conformance check and return (Buffy #263).
+                crate::canon::canonicalize(&mut work, roots);
                 match crate::is_flatpdl(&work) {
                     Ok(()) => return Ok(work),
                     Err(violations) => {
@@ -811,25 +827,32 @@ pub(crate) fn binding_is_referenced(m: &Module, bid: BindingId, name_sym: Symbol
     false
 }
 
-/// BFS subtree search: returns true iff the subtree at `root` contains a
-/// `Ref(SelfMod, name_sym)` node — as a body sub-node OR as a `functionof` /
-/// `kernelof` reification *input* boundary entry.
+/// Collect every `%ref self <name>` reachable in `root`'s subtree — as a body
+/// sub-node OR as a `functionof` / `kernelof` reification *input* boundary
+/// entry — into `out`.
 ///
-/// **`Inputs`-aware (sweep-only).** `for_each_child` / `children()` deliberately
-/// EXCLUDE a `Call`'s [`flatppl_core::Inputs`] bucket (core `node.rs`), so a
+/// **`Inputs`-aware.** `for_each_child` / `children()` deliberately EXCLUDE a
+/// `Call`'s [`flatppl_core::Inputs`] bucket (core `node.rs`), so a
 /// constructor/kernel binding referenced ONLY through a `(name, %ref self <name>)`
 /// reification input — e.g. `k = kernelof(pushfwd(f, g), …)` closing over `g =
-/// Normal(…)` — would look UNREFERENCED to a body-only walk, and the dead-binding
-/// sweep would zero it, leaving the live reification closing over a zeroed
-/// constructor. So this walk additionally scans each `Call`'s `inputs` entries.
-/// It only makes "referenced" MORE inclusive, so the sweep zeroes strictly fewer
-/// bindings — a sound tightening. This `Inputs`-scanning behaviour is scoped to
-/// the sweep, which is `subtree_contains_ref`'s only caller
-/// ([`binding_is_referenced`]).
+/// Normal(…)` — would look UNREFERENCED to a body-only walk. A body-only walk
+/// would let the dead-binding sweep zero it, leaving the live reification closing
+/// over a zeroed constructor, and would let root-based DCE drop it despite the
+/// still-live reification needing it. So this walk additionally scans each
+/// `Call`'s `inputs` entries. It only makes "referenced" MORE inclusive, so a
+/// caller keying eligibility on this (sweep, or DCE reachability) is sound.
 ///
-/// `pub(crate)`: shared with `canon::fold::sweep_dead_bindings` — see
-/// [`binding_is_referenced`].
-pub(crate) fn subtree_contains_ref(m: &Module, root: NodeId, name_sym: Symbol) -> bool {
+/// The forward-reachability primitive for root-based DCE
+/// ([`crate::canon::dce::retain_reachable`]); shares its traversal with
+/// [`subtree_contains_ref`] (below) so the Inputs-awareness lives in one place.
+///
+/// `pub(crate)`: shared with `canon::fold::sweep_dead_bindings` (via
+/// [`binding_is_referenced`]) and `canon::dce::retain_reachable`.
+pub(crate) fn collect_referenced_names(
+    m: &Module,
+    root: NodeId,
+    out: &mut std::collections::HashSet<Symbol>,
+) {
     let mut queue = vec![root];
     let mut qi = 0;
     while qi < queue.len() {
@@ -839,14 +862,16 @@ pub(crate) fn subtree_contains_ref(m: &Module, root: NodeId, name_sym: Symbol) -
             Node::Ref(Ref {
                 ns: RefNs::SelfMod,
                 name,
-            }) if *name == name_sym => return true,
+            }) => {
+                out.insert(*name);
+            }
             Node::Call(c) => {
                 // A reification input `(name, %ref self <name>)` references the
                 // binding just as a body ref does — but lives outside `children()`.
                 if let Some(flatppl_core::Inputs::Spec(entries)) = &c.inputs {
                     for (_, r) in entries.iter() {
-                        if r.ns == RefNs::SelfMod && r.name == name_sym {
-                            return true;
+                        if r.ns == RefNs::SelfMod {
+                            out.insert(r.name);
                         }
                     }
                 }
@@ -855,7 +880,19 @@ pub(crate) fn subtree_contains_ref(m: &Module, root: NodeId, name_sym: Symbol) -
         }
         m.for_each_child(id, |c| queue.push(c));
     }
-    false
+}
+
+/// BFS subtree search: returns true iff the subtree at `root` contains a
+/// `Ref(SelfMod, name_sym)` node — as a body sub-node OR as a `functionof` /
+/// `kernelof` reification *input* boundary entry.
+///
+/// `pub(crate)`: shared with `canon::fold::sweep_dead_bindings` — see
+/// [`binding_is_referenced`]. Delegates to [`collect_referenced_names`] so the
+/// `Inputs`-aware traversal lives in exactly one place.
+pub(crate) fn subtree_contains_ref(m: &Module, root: NodeId, name_sym: Symbol) -> bool {
+    let mut names = std::collections::HashSet::new();
+    collect_referenced_names(m, root, &mut names);
+    names.contains(&name_sym)
 }
 
 #[cfg(test)]
