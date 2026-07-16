@@ -86,3 +86,94 @@ fn bare_likelihoodof_of_kernel_reports_likelihood_and_kernel_violations() {
         "the kernelof node is Kernel-typed outside a builtin_* arg => KernelNotBuiltinArg; got: {v:?}"
     );
 }
+
+// --- Pass 4 Task A review Fix 3: dangling-ref self-check ---
+//
+// Root-based DCE (Buffy #263 Pass 4-A, `canon::dce::retain_reachable`) is the
+// FIRST capability that removes bindings outright. A latent miss in its
+// reachability walk (`driver::collect_referenced_names`) could drop a binding
+// something else still points at, leaving a `(%ref self <name>)` — as an
+// ordinary body sub-node or a `functionof`/`kernelof` reification `Inputs`
+// boundary entry — dangling. `is_flatpdl` is the conformance gate every
+// determinized module passes through, so it is the permanent, always-on place
+// to catch this: these tests hand-build a `Module` (bypassing the parser,
+// which cannot produce a dangling ref by construction) with each dangling-ref
+// shape and assert `is_flatpdl` reports `NonConformKind::DanglingSelfRef`.
+
+#[test]
+fn dangling_self_ref_in_body_is_flagged() {
+    use flatppl_core::{Binding, Module, Node, Ref, RefNs};
+
+    let mut m = Module::new();
+    let missing = m.intern("missing");
+    // `x = (%ref self missing)` — `missing` names no binding in the module.
+    let dangling = m.alloc(Node::Ref(Ref {
+        ns: RefNs::SelfMod,
+        name: missing,
+    }));
+    let x_name = m.intern("x");
+    m.add_binding(Binding {
+        name: x_name,
+        rhs: dangling,
+        doc: None,
+        public: true,
+        synthetic: false,
+    });
+
+    let v = is_flatpdl(&m).expect_err("a dangling body self-ref must be non-conformant");
+    assert!(
+        v.iter().any(|n| matches!(
+            n.kind,
+            flatppl_determinizer::NonConformKind::DanglingSelfRef
+        )),
+        "expected a DanglingSelfRef violation; got: {v:?}"
+    );
+}
+
+#[test]
+fn dangling_self_ref_in_reification_input_is_flagged() {
+    use flatppl_core::{Binding, Call, CallHead, Inputs, Module, Node, Ref, RefNs};
+
+    let mut m = Module::new();
+    // k = functionof(2.0, g = g) — `g` names no binding in the module. This is
+    // exactly the shape `canon::dce::retain_reachable` must keep alive when `g`
+    // IS present (see `canon_dce_golden.rs`'s
+    // `dce_keeps_binding_referenced_only_via_reification_input`); here `g` is
+    // simply absent from the start, standing in for "DCE dropped it".
+    let two = m.alloc(Node::Lit(flatppl_core::Scalar::Real(2.0)));
+    let g_name = m.intern("g");
+    let functionof = m.intern("functionof");
+    let k_rhs = m.alloc(Node::Call(Call {
+        head: CallHead::Builtin(functionof),
+        args: vec![two].into(),
+        named: Vec::new().into(),
+        inputs: Some(Inputs::Spec(
+            vec![(
+                g_name,
+                Ref {
+                    ns: RefNs::SelfMod,
+                    name: g_name,
+                },
+            )]
+            .into(),
+        )),
+    }));
+    let k_name = m.intern("k");
+    m.add_binding(Binding {
+        name: k_name,
+        rhs: k_rhs,
+        doc: None,
+        public: true,
+        synthetic: false,
+    });
+
+    let v =
+        is_flatpdl(&m).expect_err("a dangling reification Inputs self-ref must be non-conformant");
+    assert!(
+        v.iter().any(|n| matches!(
+            n.kind,
+            flatppl_determinizer::NonConformKind::DanglingSelfRef
+        )),
+        "expected a DanglingSelfRef violation for the dangling reification input; got: {v:?}"
+    );
+}
