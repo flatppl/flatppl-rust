@@ -63,29 +63,63 @@ fn collect_folds(m: &mut Module, id: NodeId, out: &mut HashMap<NodeId, NodeId>) 
     };
     let op = m.resolve(sym).to_string();
     let nargs = c.args.len();
-    // Binary real arithmetic on two literal reals. Restricted to the four basic
-    // ops: IEEE-754 mandates these be correctly rounded, so `f64` arithmetic is
-    // bit-identical across any conforming implementation (Rust's compiled
-    // arithmetic vs. the JS engine's) — required for the det-js numeric
-    // equivalence gate (Buffy #263 verification). `pow` is deliberately
-    // EXCLUDED: general real exponentiation is not rounding-mandated by
-    // IEEE-754 (it is transcendental for non-integer exponents) and libm
-    // implementations are known to disagree in the last bit; extend to `pow`
-    // only if a corpus model needs it AND the numeric gate stays green.
+    // Binary arithmetic on two literal operands. IEEE-754-EXACT cases only, so
+    // the folded literal is bit-identical to what the JS engine computes (the
+    // det-js numeric equivalence gate, Buffy #263):
+    // * Int × Int for add/sub/mul → Int (exact integer arithmetic; `checked_*`
+    //   leaves an overflowing fold un-done rather than falling back to an
+    //   inexact `f64`).
+    // * mixed Int/Real or Real × Real for add/sub/mul/divide → Real (all four are
+    //   IEEE-754 correctly rounded; `divide` is real division, so an Int operand
+    //   promotes to `f64` and the result is Real).
+    // * `pow` ONLY with a small WHOLE exponent → `powi` (repeated multiplication,
+    //   exact). A non-integer exponent stays UNFOLDED: general real
+    //   exponentiation is transcendental, not rounding-mandated, and libm/JS can
+    //   disagree in the last bit — folding it would break the bit-identical gate.
     if nargs == 2 && c.named.is_empty() {
-        if let (Some(Scalar::Real(a)), Some(Scalar::Real(b))) =
-            (&child_scalars[0], &child_scalars[1])
-        {
-            let r = match op.as_str() {
+        let (l, r) = (&child_scalars[0], &child_scalars[1]);
+        // Int × Int add/sub/mul → exact Int; divide/pow on ints fall through to
+        // the f64 path (divide is real division; pow uses `powi`).
+        if let (Some(Scalar::Int(a)), Some(Scalar::Int(b))) = (l, r) {
+            let folded = match op.as_str() {
+                "add" => Some(a.checked_add(*b)),
+                "sub" => Some(a.checked_sub(*b)),
+                "mul" => Some(a.checked_mul(*b)),
+                // Int^Int with a small NON-NEGATIVE exponent stays Int
+                // (`checked_pow`; overflow leaves it unfolded), matching the
+                // `Integer ⊔ Integer = Integer` promotion rule (`infer::promote2`)
+                // that add/sub/mul also honor. A NEGATIVE exponent is real
+                // (`2 ^ -1 = 0.5`) → fall through to the f64 path below.
+                "pow" if *b >= 0 && *b <= 64 => {
+                    Some(u32::try_from(*b).ok().and_then(|e| a.checked_pow(e)))
+                }
+                _ => None,
+            };
+            if let Some(checked) = folded {
+                let v = checked?; // overflow → leave unfolded (no f64 fallback)
+                let lit = m.alloc(Node::Lit(Scalar::Int(v)));
+                out.insert(id, lit);
+                return Some(Scalar::Int(v));
+            }
+        }
+        // Promote Int→f64; fold mixed/real (and int divide/pow) to a Real literal.
+        let as_f = |s: &Option<Scalar>| match s {
+            Some(Scalar::Int(i)) => Some(*i as f64),
+            Some(Scalar::Real(x)) => Some(*x),
+            _ => None,
+        };
+        if let (Some(a), Some(b)) = (as_f(l), as_f(r)) {
+            let rf = match op.as_str() {
                 "add" => a + b,
                 "sub" => a - b,
                 "mul" => a * b,
                 "divide" => a / b,
+                "pow" if is_whole_small(b) => a.powi(b as i32),
                 _ => return None,
             };
-            let lit = m.alloc(Node::Lit(Scalar::Real(r)));
+            let lit = m.alloc(Node::Lit(Scalar::Real(rf)));
             out.insert(id, lit);
-            return Some(Scalar::Real(r));
+            return Some(Scalar::Real(rf));
         }
     }
     // Unary ops on one literal real. `neg` is exact (sign flip only, no
@@ -116,6 +150,16 @@ fn collect_folds(m: &mut Module, id: NodeId, out: &mut HashMap<NodeId, NodeId>) 
         }
     }
     None
+}
+
+/// A whole number in the small range where `f64::powi` (repeated multiplication)
+/// is exact and cheap — the only `pow` exponents `collect_folds` folds. Its
+/// result is bit-identical to the JS engine's `Math.pow` (flatppl-js
+/// `value-ops.ts`), whose V8 integer-exponent fast path coincides with `powi`
+/// (verified across the ±64 range). A non-whole or large exponent is left for
+/// the evaluating engine (transcendental / avoid a huge unrolled product).
+fn is_whole_small(x: f64) -> bool {
+    x.fract() == 0.0 && x.abs() <= 64.0
 }
 
 /// Replace `(%ref self x)` where `x` binds a trivial value — another ref leaf,
