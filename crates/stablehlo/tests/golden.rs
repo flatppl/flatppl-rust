@@ -589,7 +589,7 @@ fn lower_builtin_head_map_dispatches_expected_ops() {
         ("add", "stablehlo.add", 2),
         ("sub", "stablehlo.subtract", 2),
         ("mul", "stablehlo.multiply", 2),
-        ("div", "stablehlo.divide", 2),
+        ("divide", "stablehlo.divide", 2),
         ("pow", "stablehlo.power", 2),
         ("neg", "stablehlo.negate", 1),
         ("log", "stablehlo.log", 1),
