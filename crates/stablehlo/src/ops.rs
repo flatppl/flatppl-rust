@@ -42,7 +42,10 @@ pub(crate) fn lower_builtin(
         "add" => binary(e, id, args, Emitter::add),
         "sub" => binary(e, id, args, Emitter::sub),
         "mul" => binary(e, id, args, Emitter::mul),
-        "div" => binary(e, id, args, Emitter::div),
+        // §07 `divide` (real division `a / b`) — what the parser emits for `/`
+        // and `./`. NOT §07 `div` (integer floor division ⌊a/b⌋), which has no
+        // real-division lowering here and refuses via the catch-all below.
+        "divide" => binary(e, id, args, Emitter::div),
         "pow" => binary(e, id, args, Emitter::pow),
         "neg" => unary(e, id, args, Emitter::neg),
         "log" => unary(e, id, args, Emitter::log),
