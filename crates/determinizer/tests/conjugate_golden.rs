@@ -101,25 +101,16 @@ lp = logdensityof(pp, record(y = 0.5))";
         pir.contains("(%field mu 0.0)"),
         "marginal mean is the prior mu (0.0):\n{pir}"
     );
-    // Marginal sigma = sqrt(add(pow(σ0, 2), pow(σ, 2))) with σ0 = 2.0 (prior),
-    // σ = 1.0 (likelihood). The exact `pow` bases pin the variance sum σ0² + σ².
-    assert!(pir.contains("(sqrt "), "marginal sigma uses sqrt:\n{pir}");
+    // Marginal sigma = sqrt(σ0² + σ²) with σ0 = 2.0 (prior), σ = 1.0 (likelihood)
+    // → sqrt(2.0² + 1.0²) = sqrt(5). Both params are literal, so the whole
+    // formula `sqrt(add(pow(2.0, 2), pow(1.0, 2)))` const-folds (Pass 4-B: pow
+    // with an integer exponent, add, and sqrt are all IEEE-754-exact) to the
+    // constant marginal stddev 2.23606797749979. A WRONG conjugate formula (e.g.
+    // σ0² − σ², or a missing term) would fold to a DIFFERENT constant, so this
+    // literal still pins the variance-sum correctness.
     assert!(
-        pir.contains("(add "),
-        "marginal variance sums the two variances:\n{pir}"
-    );
-    assert_eq!(
-        pir.matches("(pow ").count(),
-        2,
-        "each stddev is squared via pow:\n{pir}"
-    );
-    assert!(
-        pir.contains("(pow 2.0 2.0)"),
-        "prior variance is σ0² = 2.0²:\n{pir}"
-    );
-    assert!(
-        pir.contains("(pow 1.0 2.0)"),
-        "likelihood variance is σ² = 1.0²:\n{pir}"
+        pir.contains("(%field sigma 2.23606797749979)"),
+        "marginal sigma folds to sqrt(σ0² + σ²) = sqrt(5) = 2.23606797749979:\n{pir}"
     );
     // Scored at the SCALAR observation 0.5 (the record's `y` field), not the
     // record itself — the `y` field was consumed by the descent.
@@ -282,7 +273,7 @@ lp = logdensityof(pp, record(y = 0.5))";
 //   (sub (add (builtin_logdensityof Normal {mu 0.0, sigma 1.0} 0.5)
 //             (builtin_logdensityof Normal {mu 1.0, sigma 2.0} 0.5))
 //        (builtin_logdensityof Normal
-//           {mu 1.0, sigma (sqrt (add (pow 1.0 2.0) (pow 2.0 2.0)))} 0.0))
+//           {mu 1.0, sigma 2.23606797749979} 0.0))   // sqrt(σ1²+σ2²)=sqrt(5), const-folded
 //
 // and no `normalize` / `logweighted` / `functionof` / `draw` / measure may
 // survive.
@@ -320,14 +311,16 @@ lp = logdensityof(prod, 0.5)";
         "g2 (Normal 1.0, 2.0) scored at the scalar variate 0.5:\n{bare}"
     );
 
-    // logZ = the Gaussian overlap: Normal(mu = μ2 = 1.0, sigma = sqrt(σ1² + σ2²) =
-    // sqrt(add(pow(1.0, 2), pow(2.0, 2)))) scored at μ1 = 0.0. The exact `pow`
-    // bases pin the variance SUM (not difference), and the scoring point μ1 = 0.0.
+    // logZ = the Gaussian overlap: Normal(mu = μ2 = 1.0, sigma = sqrt(σ1² + σ2²))
+    // scored at μ1 = 0.0. With literal σ1 = 1.0, σ2 = 2.0 the overlap sigma
+    // `sqrt(add(pow(1.0, 2), pow(2.0, 2)))` = sqrt(5) const-folds (Pass 4-B) to
+    // 2.23606797749979 — the variance SUM (a difference or missing term would
+    // fold to a different constant), scored at μ1 = 0.0.
     assert!(
         bare.contains(
-            "(builtin_logdensityof Normal (record (%field mu 1.0) (%field sigma (sqrt (add (pow 1.0 2.0) (pow 2.0 2.0))))) 0.0)"
+            "(builtin_logdensityof Normal (record (%field mu 1.0) (%field sigma 2.23606797749979)) 0.0)"
         ),
-        "logZ is Normal(mu = μ2, sigma = sqrt(σ1² + σ2²)) scored at μ1 = 0.0:\n{bare}"
+        "logZ is Normal(mu = μ2, sigma = sqrt(σ1² + σ2²) = sqrt(5)) scored at μ1 = 0.0:\n{bare}"
     );
 
     // Overall shape: sub(add(t1, t2), logZ) — the two data terms summed, minus the

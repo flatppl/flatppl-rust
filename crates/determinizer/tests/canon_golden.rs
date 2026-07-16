@@ -47,6 +47,41 @@ lp = logdensityof(lawof(record(a = a)), record(a = 0.5))";
     );
 }
 
+// Pass 4-B completes the folder over the EXACT arithmetic Pass 1 skipped:
+// int/real-mixed (`1 - 0.4`, where `1` is an Int) and integer-exponent `pow`
+// (`2.0 ^ 2`). Both IEEE-exact, structural-around-density (a weight and a
+// distribution parameter). The mixed `sub` folds to 0.6, the integer `pow` to
+// 4.0 — no residual `(sub 1 0.4)` / `(pow ` remains. Buffy #263 Pass 4-B.
+#[test]
+fn const_fold_completes_int_real_mixed_and_integer_pow() {
+    let src = "\
+w = 1 - 0.4
+k = 2.0 ^ 2
+m = normalize(superpose(\
+weighted(0.4, Normal(mu = 0.0, sigma = 1.0)), \
+weighted(w, Gamma(shape = k, rate = 1.0))))
+a = draw(m)
+lp = logdensityof(lawof(record(a = a)), record(a = 0.5))";
+    let out = determinize_src(src);
+    let pir = flatppl_flatpir::write(&out);
+    assert!(
+        pir.contains("0.6"),
+        "int/real-mixed `1 - 0.4` folds to 0.6:\n{pir}"
+    );
+    assert!(
+        pir.contains("(%field shape 4.0)"),
+        "integer `2.0 ^ 2` folds to the Gamma shape 4.0:\n{pir}"
+    );
+    assert!(
+        !pir.contains("(sub 1 0.4)") && !pir.contains("(pow "),
+        "no un-folded mixed sub / integer pow remains:\n{pir}"
+    );
+    assert!(
+        flatppl_determinizer::is_flatpdl(&out).is_ok(),
+        "is_flatpdl:\n{pir}"
+    );
+}
+
 // `resolve_alias_refs`, isolated from `const_fold`: `w` is a literal-alias
 // mixture weight (a top-level `%bind` whose RHS is a bare `Lit`, referenced
 // via `(%ref self w)` from `weighted(w, ...)`), not a bare literal like the
