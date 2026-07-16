@@ -5,7 +5,7 @@
 
 use flatppl_core::{Module, Symbol};
 
-pub(crate) mod dce;
+mod dce;
 mod flatten;
 mod fold;
 mod inline;
