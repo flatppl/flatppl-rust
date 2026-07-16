@@ -81,6 +81,29 @@ score = logdensityof(post, record(a = 0.5))\n";
     );
 }
 
+// `invlogit(x)` (§07 logistic sigmoid, e.g. a logit-link GLM's inverse link)
+// lowers to the native, numerically-stable `stablehlo.logistic` op. Verified
+// out-of-tree to IREE-execute == scipy `expit` oracle (Δ≈2e-8). Buffy #303.
+#[test]
+fn invlogit_lowers_to_stablehlo_logistic() {
+    let src = "flatppl_compat = \"0.1\"\n\
+a = draw(Normal(mu = 0.0, sigma = 1.0))\n\
+p = invlogit(a)\n\
+y = draw(Bernoulli(p))\n\
+L = likelihoodof(kernelof(record(y = y), a = a), record(y = 1))\n\
+post = bayesupdate(L, lawof(record(a = a)))\n\
+score = logdensityof(post, record(a = 0.7))\n";
+    let m = flatppl_syntax::parse(src).unwrap();
+    let d = flatppl_determinizer::determinize(&m).unwrap();
+    let out = flatppl_stablehlo::emit(&d, flatppl_stablehlo::Mode::LogDensity, &Default::default())
+        .unwrap();
+    assert!(out.contains("module {") && is_delimiter_balanced(&out));
+    assert!(
+        out.contains("stablehlo.logistic"),
+        "invlogit emits the native logistic op:\n{out}"
+    );
+}
+
 /// A placeholder node to hang a `set_type` on — its `Node` payload is
 /// irrelevant to `mlir_type_of`, which only reads the type side-table.
 fn placeholder(m: &mut Module, ty: Type) -> flatppl_core::NodeId {
