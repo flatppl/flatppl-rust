@@ -210,6 +210,63 @@ fn fixture_query_corpus_lowers_or_documented_refuse() {
     }
 }
 
+/// Pass 4 Task A review Fix 2: `--keep <name>` (repeatable) runs root-based DCE
+/// (Buffy #263 Pass 4-A) through the real CLI binary. Without `--keep`, the
+/// unreachable `dead1 = 42.0` binding survives (zeroed-or-as-is, current
+/// keep-all behavior); with `--keep __score__`, only `__score__` (and its
+/// transitive deps — here none, since it lowers to a self-contained
+/// `builtin_logdensityof` call) survives, and the unreachable `dead1` binding
+/// is dropped entirely from the emitted FlatPPL.
+#[test]
+fn determinize_keep_flag_drops_unreachable_binding() {
+    let dir = std::env::temp_dir().join(format!("flatppl-det-cli-keep-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let input = dir.join("m.flatppl");
+    std::fs::write(
+        &input,
+        "a = draw(Normal(mu = 0.0, sigma = 1.0))\n\
+         dead1 = 42.0\n\
+         __score__ = logdensityof(lawof(record(a = a)), record(a = 0.5))\n",
+    )
+    .unwrap();
+
+    // No `--keep`: today's keep-all behavior — the unreachable binding survives.
+    let out_all = flatppl().arg("determinize").arg(&input).output().unwrap();
+    assert!(
+        out_all.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out_all.stderr)
+    );
+    let stdout_all = String::from_utf8_lossy(&out_all.stdout);
+    assert!(
+        stdout_all.contains("dead1"),
+        "control: no --keep must retain the unreachable binding:\n{stdout_all}"
+    );
+
+    // `--keep __score__`: root-based DCE drops `dead1`, keeps the requested root.
+    let out_keep = flatppl()
+        .arg("determinize")
+        .arg("--keep")
+        .arg("__score__")
+        .arg(&input)
+        .output()
+        .unwrap();
+    assert!(
+        out_keep.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out_keep.stderr)
+    );
+    let stdout_keep = String::from_utf8_lossy(&out_keep.stdout);
+    assert!(
+        stdout_keep.contains("__score__") && stdout_keep.contains("builtin_logdensityof"),
+        "--keep __score__ must keep the requested root:\n{stdout_keep}"
+    );
+    assert!(
+        !stdout_keep.contains("dead1"),
+        "--keep __score__ must drop the unreachable binding:\n{stdout_keep}"
+    );
+}
+
 #[test]
 fn determinize_refuses_with_exit_3() {
     let dir = std::env::temp_dir().join(format!("flatppl-det-cli-refuse-{}", std::process::id()));
