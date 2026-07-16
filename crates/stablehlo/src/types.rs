@@ -17,33 +17,39 @@
 use flatppl_core::{Dim, Module, NodeId, Type};
 
 use crate::Dtype;
-use crate::mlir::MlirTy;
+use crate::mlir::{ElemKind, MlirTy};
 use crate::refuse::EmitError;
 
 /// Map the FlatPDL type of `id` (looked up via [`Module::type_of`]) to its
-/// MLIR tensor form.
+/// MLIR tensor form and element kind.
 ///
 /// `dtype` is accepted for signature symmetry with the rest of the emitter's
 /// `Dtype` threading, but is unused here: the tensor *shape* never depends on
 /// the element dtype — that is only applied at [`MlirTy::render`] time, never
-/// baked into a FlatPPL `Type` (FlatPPL never mandates a precision).
-pub fn mlir_type_of(m: &Module, id: NodeId, _dtype: Dtype) -> Result<MlirTy, EmitError> {
+/// baked into a FlatPPL `Type` (FlatPPL never mandates a precision). The
+/// returned [`ElemKind`] is always [`ElemKind::Real`] for now — reading the
+/// node's actual scalar kind (spec §03 boolean/integer/real) is a later task.
+pub fn mlir_type_of(
+    m: &Module,
+    id: NodeId,
+    _dtype: Dtype,
+) -> Result<(MlirTy, ElemKind), EmitError> {
     let ty = m
         .type_of(id)
         .ok_or_else(|| EmitError::at(id, "node has no inferred type"))?;
     match ty {
-        Type::Scalar(_) => Ok(MlirTy::Scalar),
+        Type::Scalar(_) => Ok((MlirTy::Scalar, ElemKind::Real)),
         Type::Array { shape, elem } => {
             let mut dims: Vec<Option<u64>> = shape.iter().map(dim_to_mlir).collect();
             flatten_elem(id, elem, &mut dims)?;
-            Ok(MlirTy::Ranked(dims))
+            Ok((MlirTy::Ranked(dims), ElemKind::Real))
         }
         Type::TVector { len, elem } => {
             let mut dims = vec![dim_to_mlir(len)];
             flatten_elem(id, elem, &mut dims)?;
-            Ok(MlirTy::Ranked(dims))
+            Ok((MlirTy::Ranked(dims), ElemKind::Real))
         }
-        Type::RngState => Ok(MlirTy::Key),
+        Type::RngState => Ok((MlirTy::Key, ElemKind::Real)),
         _ => Err(refuse_non_tensor(id, ty)),
     }
 }

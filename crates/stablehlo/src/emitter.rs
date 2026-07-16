@@ -29,7 +29,7 @@ use std::collections::HashMap;
 use flatppl_core::{CallHead, Module, Node, NodeId, Ref, RefNs, Scalar, Symbol, ValueSet};
 
 use crate::Dtype;
-use crate::mlir::{MlirTy, Value};
+use crate::mlir::{ElemKind, MlirTy, Value};
 use crate::refuse::EmitError;
 
 /// The dtype-exact `stablehlo.reduce` identity for `stablehlo.maximum`: real
@@ -185,12 +185,16 @@ impl<'m> Emitter<'m> {
     /// non-scalar `ty`) constant.
     pub fn constant(&mut self, x: f64, ty: MlirTy) -> Value {
         let ssa = self.fresh();
-        let ty_text = ty.render(self.dtype);
+        let ty_text = ty.render(self.dtype, ElemKind::Real);
         let lit = render_float_literal(x);
         self.push(&format!(
             "{ssa} = stablehlo.constant dense<{lit}> : {ty_text}"
         ));
-        Value { ssa, ty }
+        Value {
+            ssa,
+            ty,
+            elem: ElemKind::Real,
+        }
     }
 
     /// A scalar-literal convenience: `constant(x, MlirTy::Scalar)`.
@@ -209,23 +213,28 @@ impl<'m> Emitter<'m> {
     /// infinity, sign bit cleared.
     pub fn inf(&mut self, ty: MlirTy) -> Value {
         let ssa = self.fresh();
-        let ty_text = ty.render(self.dtype);
+        let ty_text = ty.render(self.dtype, ElemKind::Real);
         let lit = pos_inf_literal(self.dtype);
         self.push(&format!(
             "{ssa} = stablehlo.constant dense<{lit}> : {ty_text}"
         ));
-        Value { ssa, ty }
+        Value {
+            ssa,
+            ty,
+            elem: ElemKind::Real,
+        }
     }
 
     /// One elementwise unary op: `%N = {op} %a : ty`. Result type copies the
     /// operand's `MlirTy` — elementwise ops are shape-preserving.
     pub fn unary(&mut self, op: &str, a: &Value) -> Value {
         let ssa = self.fresh();
-        let ty_text = a.ty.render(self.dtype);
+        let ty_text = a.ty.render(self.dtype, a.elem);
         self.push(&format!("{ssa} = {op} {} : {ty_text}", a.ssa));
         Value {
             ssa,
             ty: a.ty.clone(),
+            elem: ElemKind::Real,
         }
     }
 
@@ -235,11 +244,12 @@ impl<'m> Emitter<'m> {
     /// operand up first, if needed).
     fn emit_binary(&mut self, op: &str, a: &Value, b: &Value) -> Value {
         let ssa = self.fresh();
-        let ty_text = a.ty.render(self.dtype);
+        let ty_text = a.ty.render(self.dtype, a.elem);
         self.push(&format!("{ssa} = {op} {}, {} : {ty_text}", a.ssa, b.ssa));
         Value {
             ssa,
             ty: a.ty.clone(),
+            elem: ElemKind::Real,
         }
     }
 
@@ -351,14 +361,18 @@ impl<'m> Emitter<'m> {
             _ => (a.clone(), b.clone()),
         };
         let ssa = self.fresh();
-        let lhs_ty = a.ty.render(self.dtype);
-        let rhs_ty = b.ty.render(self.dtype);
+        let lhs_ty = a.ty.render(self.dtype, a.elem);
+        let rhs_ty = b.ty.render(self.dtype, b.elem);
         let result_ty = render_i1(&a.ty);
         self.push(&format!(
             "{ssa} = stablehlo.compare {dir}, {}, {} : ({lhs_ty}, {rhs_ty}) -> {result_ty}",
             a.ssa, b.ssa
         ));
-        Value { ssa, ty: a.ty }
+        Value {
+            ssa,
+            ty: a.ty,
+            elem: ElemKind::Real,
+        }
     }
 
     /// `%N = stablehlo.select %pred, %a, %b : (i1-shape, ty, ty) -> ty`.
@@ -392,12 +406,16 @@ impl<'m> Emitter<'m> {
         };
         let ssa = self.fresh();
         let pred_ty = render_i1(&c.ty);
-        let ty_text = a.ty.render(self.dtype);
+        let ty_text = a.ty.render(self.dtype, a.elem);
         self.push(&format!(
             "{ssa} = stablehlo.select {}, {}, {} : ({pred_ty}, {ty_text}, {ty_text}) -> {ty_text}",
             c.ssa, a.ssa, b.ssa
         ));
-        Value { ssa, ty: a.ty }
+        Value {
+            ssa,
+            ty: a.ty,
+            elem: ElemKind::Real,
+        }
     }
 
     // ---- shape ops (Task 4: `get`/`get0`, `logsumexp`/`in` broadcasting) ---
@@ -436,14 +454,18 @@ impl<'m> Emitter<'m> {
         let result_ty = MlirTy::Ranked(result_dims);
 
         let ssa = self.fresh();
-        let operand_ty = a.ty.render(self.dtype);
-        let result_ty_text = result_ty.render(self.dtype);
+        let operand_ty = a.ty.render(self.dtype, a.elem);
+        let result_ty_text = result_ty.render(self.dtype, ElemKind::Real);
         self.push(&format!(
             "{ssa} = stablehlo.slice {} [{}] : ({operand_ty}) -> {result_ty_text}",
             a.ssa,
             ranges.join(", ")
         ));
-        Value { ssa, ty: result_ty }
+        Value {
+            ssa,
+            ty: result_ty,
+            elem: ElemKind::Real,
+        }
     }
 
     /// `%N = stablehlo.reshape %a : (operand_ty) -> result_ty` — reinterprets
@@ -452,13 +474,17 @@ impl<'m> Emitter<'m> {
     /// `Scalar`.
     pub fn reshape(&mut self, a: &Value, ty: MlirTy) -> Value {
         let ssa = self.fresh();
-        let operand_ty = a.ty.render(self.dtype);
-        let result_ty_text = ty.render(self.dtype);
+        let operand_ty = a.ty.render(self.dtype, a.elem);
+        let result_ty_text = ty.render(self.dtype, ElemKind::Real);
         self.push(&format!(
             "{ssa} = stablehlo.reshape {} : ({operand_ty}) -> {result_ty_text}",
             a.ssa
         ));
-        Value { ssa, ty }
+        Value {
+            ssa,
+            ty,
+            elem: ElemKind::Real,
+        }
     }
 
     /// `%N = stablehlo.broadcast_in_dim %a, dims = [...] : (operand_ty) ->
@@ -472,8 +498,8 @@ impl<'m> Emitter<'m> {
     /// broadcast).
     pub fn broadcast_in_dim(&mut self, a: &Value, dims: &[u64], ty: MlirTy) -> Value {
         let ssa = self.fresh();
-        let operand_ty = a.ty.render(self.dtype);
-        let result_ty_text = ty.render(self.dtype);
+        let operand_ty = a.ty.render(self.dtype, a.elem);
+        let result_ty_text = ty.render(self.dtype, ElemKind::Real);
         let dims_text = dims
             .iter()
             .map(u64::to_string)
@@ -483,7 +509,11 @@ impl<'m> Emitter<'m> {
             "{ssa} = stablehlo.broadcast_in_dim {}, dims = [{dims_text}] : ({operand_ty}) -> {result_ty_text}",
             a.ssa
         ));
-        Value { ssa, ty }
+        Value {
+            ssa,
+            ty,
+            elem: ElemKind::Real,
+        }
     }
 
     /// `%N = stablehlo.concatenate %a, %b, ..., dim = 0 : (op1_ty, op2_ty,
@@ -544,16 +574,20 @@ impl<'m> Emitter<'m> {
             .join(", ");
         let operand_tys = reshaped
             .iter()
-            .map(|v| v.ty.render(self.dtype))
+            .map(|v| v.ty.render(self.dtype, v.elem))
             .collect::<Vec<_>>()
             .join(", ");
-        let result_ty_text = result_ty.render(self.dtype);
+        let result_ty_text = result_ty.render(self.dtype, ElemKind::Real);
 
         let ssa = self.fresh();
         self.push(&format!(
             "{ssa} = stablehlo.concatenate {operand_ssas}, dim = 0 : ({operand_tys}) -> {result_ty_text}"
         ));
-        Value { ssa, ty: result_ty }
+        Value {
+            ssa,
+            ty: result_ty,
+            elem: ElemKind::Real,
+        }
     }
 
     /// `%N = stablehlo.transpose %a, dims = [perm...] : (operand_ty) ->
@@ -578,8 +612,8 @@ impl<'m> Emitter<'m> {
         );
         let out_dims: Vec<Option<u64>> = perm.iter().map(|&p| in_dims[p as usize]).collect();
         let result_ty = MlirTy::Ranked(out_dims);
-        let operand_ty = a.ty.render(self.dtype);
-        let result_ty_text = result_ty.render(self.dtype);
+        let operand_ty = a.ty.render(self.dtype, a.elem);
+        let result_ty_text = result_ty.render(self.dtype, ElemKind::Real);
         let dims_text = perm
             .iter()
             .map(u64::to_string)
@@ -590,7 +624,11 @@ impl<'m> Emitter<'m> {
             "{ssa} = stablehlo.transpose {}, dims = [{dims_text}] : ({operand_ty}) -> {result_ty_text}",
             a.ssa
         ));
-        Value { ssa, ty: result_ty }
+        Value {
+            ssa,
+            ty: result_ty,
+            elem: ElemKind::Real,
+        }
     }
 
     // ---- CHLO special functions ------------------------------------------
@@ -603,7 +641,7 @@ impl<'m> Emitter<'m> {
     /// be written for the op to parse.
     pub fn lgamma(&mut self, a: &Value) -> Value {
         let ssa = self.fresh();
-        let ty_text = a.ty.render(self.dtype);
+        let ty_text = a.ty.render(self.dtype, a.elem);
         self.push(&format!(
             "{ssa} = chlo.lgamma {} : {ty_text} -> {ty_text}",
             a.ssa
@@ -611,6 +649,7 @@ impl<'m> Emitter<'m> {
         Value {
             ssa,
             ty: a.ty.clone(),
+            elem: ElemKind::Real,
         }
     }
 
@@ -704,9 +743,9 @@ impl<'m> Emitter<'m> {
             MlirTy::Ranked(result_dims)
         };
 
-        let elem_ty = MlirTy::Scalar.render(self.dtype);
-        let operand_ty = a.ty.render(self.dtype);
-        let result_ty_text = result_ty.render(self.dtype);
+        let elem_ty = MlirTy::Scalar.render(self.dtype, ElemKind::Real);
+        let operand_ty = a.ty.render(self.dtype, a.elem);
+        let result_ty_text = result_ty.render(self.dtype, ElemKind::Real);
 
         let init_ssa = self.fresh();
         self.push(&format!(
@@ -718,7 +757,11 @@ impl<'m> Emitter<'m> {
             "{ssa} = stablehlo.reduce({} init: {init_ssa}) applies {combine_op} across dimensions = [{axis}] : ({operand_ty}, {elem_ty}) -> {result_ty_text}",
             a.ssa
         ));
-        Value { ssa, ty: result_ty }
+        Value {
+            ssa,
+            ty: result_ty,
+            elem: ElemKind::Real,
+        }
     }
 
     // ---- matrix helpers -----------------------------------------------------
@@ -727,7 +770,7 @@ impl<'m> Emitter<'m> {
     /// Cholesky factor of `a` (shape-preserving: same square-matrix `MlirTy`).
     pub fn cholesky(&mut self, a: &Value) -> Value {
         let ssa = self.fresh();
-        let ty_text = a.ty.render(self.dtype);
+        let ty_text = a.ty.render(self.dtype, a.elem);
         self.push(&format!(
             "{ssa} = stablehlo.cholesky {}, lower = true : {ty_text}",
             a.ssa
@@ -735,6 +778,7 @@ impl<'m> Emitter<'m> {
         Value {
             ssa,
             ty: a.ty.clone(),
+            elem: ElemKind::Real,
         }
     }
 
@@ -752,7 +796,7 @@ impl<'m> Emitter<'m> {
             other => panic!("diag expects a rank-2 (square matrix) operand, got {other:?}"),
         }
         let mat_ty = a.ty.clone();
-        let mat_ty_text = mat_ty.render(self.dtype);
+        let mat_ty_text = mat_ty.render(self.dtype, ElemKind::Real);
 
         let row_ssa = self.fresh();
         self.push(&format!(
@@ -761,6 +805,7 @@ impl<'m> Emitter<'m> {
         let row = Value {
             ssa: row_ssa,
             ty: mat_ty.clone(),
+            elem: ElemKind::Real,
         };
 
         let col_ssa = self.fresh();
@@ -770,6 +815,7 @@ impl<'m> Emitter<'m> {
         let col = Value {
             ssa: col_ssa,
             ty: mat_ty.clone(),
+            elem: ElemKind::Real,
         };
 
         let mask = self.compare("EQ", &row, &col);
@@ -803,15 +849,19 @@ impl<'m> Emitter<'m> {
         }
 
         let ssa = self.fresh();
-        let a_ty = a.ty.render(self.dtype);
-        let b_ty = b.ty.render(self.dtype);
+        let a_ty = a.ty.render(self.dtype, a.elem);
+        let b_ty = b.ty.render(self.dtype, b.elem);
         let result_ty = MlirTy::Ranked(vec![a_dims[0]]);
-        let result_ty_text = result_ty.render(self.dtype);
+        let result_ty_text = result_ty.render(self.dtype, ElemKind::Real);
         self.push(&format!(
             "{ssa} = stablehlo.dot_general {}, {}, contracting_dims = [1] x [0], precision = [DEFAULT, DEFAULT] : ({a_ty}, {b_ty}) -> {result_ty_text}",
             a.ssa, b.ssa
         ));
-        Value { ssa, ty: result_ty }
+        Value {
+            ssa,
+            ty: result_ty,
+            elem: ElemKind::Real,
+        }
     }
 
     /// Batched row-wise mat-vec: apply the shared `[d, d]` matrix `l` to every
@@ -846,15 +896,19 @@ impl<'m> Emitter<'m> {
         }
 
         let ssa = self.fresh();
-        let z_ty = z.ty.render(self.dtype);
-        let l_ty = l.ty.render(self.dtype);
+        let z_ty = z.ty.render(self.dtype, z.elem);
+        let l_ty = l.ty.render(self.dtype, l.elem);
         let result_ty = MlirTy::Ranked(vec![z_dims[0], l_dims[0]]);
-        let result_ty_text = result_ty.render(self.dtype);
+        let result_ty_text = result_ty.render(self.dtype, ElemKind::Real);
         self.push(&format!(
             "{ssa} = stablehlo.dot_general {}, {}, contracting_dims = [1] x [1], precision = [DEFAULT, DEFAULT] : ({z_ty}, {l_ty}) -> {result_ty_text}",
             z.ssa, l.ssa
         ));
-        Value { ssa, ty: result_ty }
+        Value {
+            ssa,
+            ty: result_ty,
+            elem: ElemKind::Real,
+        }
     }
 
     /// Solve the lower-triangular system `l @ y = b` for `y`, via
@@ -874,15 +928,19 @@ impl<'m> Emitter<'m> {
     /// properties dict: `left_side`/`lower`/`unit_diagonal`/`transpose_a`).
     pub fn tri_solve(&mut self, l: &Value, b: &Value) -> Value {
         let ssa = self.fresh();
-        let l_ty = l.ty.render(self.dtype);
-        let b_ty = b.ty.render(self.dtype);
+        let l_ty = l.ty.render(self.dtype, l.elem);
+        let b_ty = b.ty.render(self.dtype, b.elem);
         let result_ty = b.ty.clone();
-        let result_ty_text = result_ty.render(self.dtype);
+        let result_ty_text = result_ty.render(self.dtype, ElemKind::Real);
         self.push(&format!(
             "{ssa} = \"stablehlo.triangular_solve\"({}, {}) <{{left_side = true, lower = true, unit_diagonal = false, transpose_a = #stablehlo<transpose NO_TRANSPOSE>}}> : ({l_ty}, {b_ty}) -> {result_ty_text}",
             l.ssa, b.ssa
         ));
-        Value { ssa, ty: result_ty }
+        Value {
+            ssa,
+            ty: result_ty,
+            elem: ElemKind::Real,
+        }
     }
 
     // ---- sampling (Task 6) --------------------------------------------------
@@ -946,11 +1004,15 @@ impl<'m> Emitter<'m> {
     /// [`render_float_literal`].
     fn const_lit(&mut self, lit: &str, ty: MlirTy) -> Value {
         let ssa = self.fresh();
-        let ty_text = ty.render(self.dtype);
+        let ty_text = ty.render(self.dtype, ElemKind::Real);
         self.push(&format!(
             "{ssa} = stablehlo.constant dense<{lit}> : {ty_text}"
         ));
-        Value { ssa, ty }
+        Value {
+            ssa,
+            ty,
+            elem: ElemKind::Real,
+        }
     }
 
     /// Draw `out_ty`-shaped raw bits from the threaded key and map them to a
@@ -978,9 +1040,9 @@ impl<'m> Emitter<'m> {
     /// dynamic/`Tuple`/`Key` `out_ty` ([`render_bits_ty`] has no such form).
     fn rng_bit_generator_uniform(&mut self, out_ty: &MlirTy) -> (Value, Value) {
         let key = self.cur_key();
-        let key_ty_text = MlirTy::Key.render(self.dtype);
+        let key_ty_text = MlirTy::Key.render(self.dtype, ElemKind::Real);
         let bits_ty_text = render_bits_ty(out_ty, self.dtype);
-        let float_ty_text = out_ty.render(self.dtype);
+        let float_ty_text = out_ty.render(self.dtype, ElemKind::Real);
 
         let state_ssa = self.fresh();
         let bits_ssa = self.fresh();
@@ -991,6 +1053,7 @@ impl<'m> Emitter<'m> {
         let new_key = Value {
             ssa: state_ssa,
             ty: MlirTy::Key,
+            elem: ElemKind::Real,
         };
 
         // (shift, scale) per dtype: shift keeps the top `mantissa_bits` of the
@@ -1021,6 +1084,7 @@ impl<'m> Emitter<'m> {
         let u = Value {
             ssa: u_ssa,
             ty: out_ty.clone(),
+            elem: ElemKind::Real,
         };
         (new_key, u)
     }
@@ -1047,7 +1111,7 @@ impl<'m> Emitter<'m> {
     /// [`Emitter::uniform_to_normal`] needs it.
     fn erf_inv(&mut self, a: &Value) -> Value {
         let ssa = self.fresh();
-        let ty_text = a.ty.render(self.dtype);
+        let ty_text = a.ty.render(self.dtype, a.elem);
         self.push(&format!(
             "{ssa} = chlo.erf_inv {} : {ty_text} -> {ty_text}",
             a.ssa
@@ -1055,6 +1119,7 @@ impl<'m> Emitter<'m> {
         Value {
             ssa,
             ty: a.ty.clone(),
+            elem: ElemKind::Real,
         }
     }
 
@@ -1104,6 +1169,7 @@ impl<'m> Emitter<'m> {
         Value {
             ssa,
             ty: MlirTy::Scalar,
+            elem: ElemKind::Real,
         }
     }
 
@@ -1121,6 +1187,7 @@ impl<'m> Emitter<'m> {
         Value {
             ssa,
             ty: MlirTy::Scalar,
+            elem: ElemKind::Real,
         }
     }
 
@@ -1137,6 +1204,7 @@ impl<'m> Emitter<'m> {
         Value {
             ssa,
             ty: MlirTy::Scalar,
+            elem: ElemKind::Real,
         }
     }
 
@@ -1155,6 +1223,7 @@ impl<'m> Emitter<'m> {
         Value {
             ssa,
             ty: MlirTy::Scalar,
+            elem: ElemKind::Real,
         }
     }
 
@@ -1172,6 +1241,7 @@ impl<'m> Emitter<'m> {
         Value {
             ssa,
             ty: a.ty.clone(),
+            elem: ElemKind::Real,
         }
     }
 
@@ -1188,6 +1258,7 @@ impl<'m> Emitter<'m> {
         Value {
             ssa,
             ty: a.ty.clone(),
+            elem: ElemKind::Real,
         }
     }
 
@@ -1201,6 +1272,7 @@ impl<'m> Emitter<'m> {
         Value {
             ssa,
             ty: a.ty.clone(),
+            elem: ElemKind::Real,
         }
     }
 
@@ -1218,7 +1290,11 @@ impl<'m> Emitter<'m> {
         self.push(&format!(
             "{ssa} = stablehlo.constant dense<{b}> : {ty_text}"
         ));
-        Value { ssa, ty }
+        Value {
+            ssa,
+            ty,
+            elem: ElemKind::Real,
+        }
     }
 
     /// Reduce a rank-1 `[n]` boolean (`i1`) tensor to a scalar `i1` via
@@ -1251,6 +1327,7 @@ impl<'m> Emitter<'m> {
         Value {
             ssa,
             ty: MlirTy::Scalar,
+            elem: ElemKind::Real,
         }
     }
 
@@ -1271,15 +1348,19 @@ impl<'m> Emitter<'m> {
             MlirTy::Ranked(dims) if dims.len() == 1 => {}
             other => panic!("dynamic_slice_scalar expects a rank-1 operand, got {other:?}"),
         }
-        let operand_ty = operand.ty.render(self.dtype);
+        let operand_ty = operand.ty.render(self.dtype, operand.elem);
         let slice_ty = MlirTy::Ranked(vec![Some(1)]);
-        let slice_ty_text = slice_ty.render(self.dtype);
+        let slice_ty_text = slice_ty.render(self.dtype, ElemKind::Real);
         let ssa = self.fresh();
         self.push(&format!(
             "{ssa} = stablehlo.dynamic_slice {}, {}, sizes = [1] : ({operand_ty}, tensor<i32>) -> {slice_ty_text}",
             operand.ssa, index.ssa
         ));
-        let sliced = Value { ssa, ty: slice_ty };
+        let sliced = Value {
+            ssa,
+            ty: slice_ty,
+            elem: ElemKind::Real,
+        };
         self.reshape(&sliced, MlirTy::Scalar)
     }
 
@@ -1301,16 +1382,20 @@ impl<'m> Emitter<'m> {
                 .expect("dynamic_slice_row: trailing dim must be static (no dynamic ui32 form)"),
             other => panic!("dynamic_slice_row expects a rank-2 operand, got {other:?}"),
         };
-        let operand_ty = operand.ty.render(self.dtype);
+        let operand_ty = operand.ty.render(self.dtype, operand.elem);
         let zero_i = self.int_const(0);
         let slice_ty = MlirTy::Ranked(vec![Some(1), Some(n)]);
-        let slice_ty_text = slice_ty.render(self.dtype);
+        let slice_ty_text = slice_ty.render(self.dtype, ElemKind::Real);
         let ssa = self.fresh();
         self.push(&format!(
             "{ssa} = stablehlo.dynamic_slice {}, {}, {}, sizes = [1, {n}] : ({operand_ty}, tensor<i32>, tensor<i32>) -> {slice_ty_text}",
             operand.ssa, index.ssa, zero_i.ssa
         ));
-        let sliced = Value { ssa, ty: slice_ty };
+        let sliced = Value {
+            ssa,
+            ty: slice_ty,
+            elem: ElemKind::Real,
+        };
         self.reshape(&sliced, MlirTy::Ranked(vec![Some(n)]))
     }
 
@@ -1364,6 +1449,7 @@ impl<'m> Emitter<'m> {
             .map(|(n, init)| Value {
                 ssa: n.clone(),
                 ty: init.ty.clone(),
+                elem: ElemKind::Real,
             })
             .collect();
         // The multi-result group name (%r:N -> %r#0, %r#1, ...).
@@ -1423,6 +1509,7 @@ impl<'m> Emitter<'m> {
             .map(|k| Value {
                 ssa: format!("{result_name}#{k}"),
                 ty: inits[k].ty.clone(),
+                elem: ElemKind::Real,
             })
             .collect()
     }
@@ -1786,10 +1873,10 @@ impl<'m> Emitter<'m> {
         let dtype = self.dtype;
         let arg_list = args
             .iter()
-            .map(|(name, ty)| format!("{name}: {}", ty.render(dtype)))
+            .map(|(name, ty)| format!("{name}: {}", ty.render(dtype, ElemKind::Real)))
             .collect::<Vec<_>>()
             .join(", ");
-        let ret_tys: Vec<String> = rets.iter().map(|r| r.ty.render(dtype)).collect();
+        let ret_tys: Vec<String> = rets.iter().map(|r| r.ty.render(dtype, r.elem)).collect();
         let ret_tys_joined = ret_tys.join(", ");
         let ret_ty_text = if ret_tys.len() == 1 {
             ret_tys_joined.clone()

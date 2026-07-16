@@ -11,7 +11,7 @@
 use flatppl_core::{
     Binding, Call, CallHead, Dim, Mass, Module, Node, NodeId, Ref, RefNs, Scalar, ScalarType, Type,
 };
-use flatppl_stablehlo::{Dtype, Emitter, MlirTy, Value, mlir_type_of};
+use flatppl_stablehlo::{Dtype, ElemKind, Emitter, MlirTy, Value, mlir_type_of};
 
 /// Every physical `{`/`(`/`[` in `s` has a matching close, and vice versa —
 /// a cheap structural well-formedness check for hand-assembled MLIR text
@@ -116,9 +116,9 @@ fn placeholder(m: &mut Module, ty: Type) -> flatppl_core::NodeId {
 fn mlir_type_of_scalar_renders_rank0_tensor() {
     let mut m = Module::new();
     let id = placeholder(&mut m, Type::Scalar(ScalarType::Real));
-    let ty = mlir_type_of(&m, id, Dtype::F32).unwrap();
+    let (ty, elem) = mlir_type_of(&m, id, Dtype::F32).unwrap();
     assert_eq!(ty, MlirTy::Scalar);
-    assert_eq!(ty.render(Dtype::F32), "tensor<f32>");
+    assert_eq!(ty.render(Dtype::F32, elem), "tensor<f32>");
 }
 
 #[test]
@@ -131,9 +131,9 @@ fn mlir_type_of_flat_array_renders_ranked_tensor() {
             elem: Box::new(Type::Scalar(ScalarType::Real)),
         },
     );
-    let ty = mlir_type_of(&m, id, Dtype::F32).unwrap();
+    let (ty, elem) = mlir_type_of(&m, id, Dtype::F32).unwrap();
     assert_eq!(ty, MlirTy::Ranked(vec![Some(2), Some(3)]));
-    assert_eq!(ty.render(Dtype::F32), "tensor<2x3xf32>");
+    assert_eq!(ty.render(Dtype::F32, elem), "tensor<2x3xf32>");
 }
 
 #[test]
@@ -152,9 +152,9 @@ fn mlir_type_of_nested_array_flattens_to_one_tensor_shape() {
             }),
         },
     );
-    let ty = mlir_type_of(&m, id, Dtype::F32).unwrap();
+    let (ty, elem) = mlir_type_of(&m, id, Dtype::F32).unwrap();
     assert_eq!(ty, MlirTy::Ranked(vec![Some(2), Some(3)]));
-    assert_eq!(ty.render(Dtype::F32), "tensor<2x3xf32>");
+    assert_eq!(ty.render(Dtype::F32, elem), "tensor<2x3xf32>");
 }
 
 #[test]
@@ -167,9 +167,9 @@ fn mlir_type_of_dynamic_dim_renders_question_mark() {
             elem: Box::new(Type::Scalar(ScalarType::Real)),
         },
     );
-    let ty = mlir_type_of(&m, id, Dtype::F32).unwrap();
+    let (ty, elem) = mlir_type_of(&m, id, Dtype::F32).unwrap();
     assert_eq!(ty, MlirTy::Ranked(vec![None, Some(3)]));
-    assert_eq!(ty.render(Dtype::F32), "tensor<?x3xf32>");
+    assert_eq!(ty.render(Dtype::F32, elem), "tensor<?x3xf32>");
 }
 
 #[test]
@@ -182,9 +182,9 @@ fn mlir_type_of_tvector_renders_ranked_tensor() {
             elem: Box::new(Type::Scalar(ScalarType::Real)),
         },
     );
-    let ty = mlir_type_of(&m, id, Dtype::F32).unwrap();
+    let (ty, elem) = mlir_type_of(&m, id, Dtype::F32).unwrap();
     assert_eq!(ty, MlirTy::Ranked(vec![Some(4)]));
-    assert_eq!(ty.render(Dtype::F32), "tensor<4xf32>");
+    assert_eq!(ty.render(Dtype::F32, elem), "tensor<4xf32>");
 }
 
 #[test]
@@ -193,22 +193,28 @@ fn rngstate_maps_to_key_type() {
     // independent of `Dtype` — unlike every other `Type::Scalar`/`Array`
     // mapping in this file, `MlirTy::Key`'s rendering must NOT vary with the
     // emitter's f32/f64 element dtype.
-    assert_eq!(MlirTy::Key.render(Dtype::F32), "tensor<2xui64>");
-    assert_eq!(MlirTy::Key.render(Dtype::F64), "tensor<2xui64>");
+    assert_eq!(
+        MlirTy::Key.render(Dtype::F32, ElemKind::Real),
+        "tensor<2xui64>"
+    );
+    assert_eq!(
+        MlirTy::Key.render(Dtype::F64, ElemKind::Real),
+        "tensor<2xui64>"
+    );
 
     let mut m = Module::new();
     let id = placeholder(&mut m, Type::RngState);
-    let ty = mlir_type_of(&m, id, Dtype::F32).unwrap();
+    let (ty, elem) = mlir_type_of(&m, id, Dtype::F32).unwrap();
     assert_eq!(ty, MlirTy::Key);
-    assert_eq!(ty.render(Dtype::F64), "tensor<2xui64>");
+    assert_eq!(ty.render(Dtype::F64, elem), "tensor<2xui64>");
 }
 
 #[test]
 fn mlir_type_of_dtype_is_configurable_not_hardcoded() {
     let mut m = Module::new();
     let id = placeholder(&mut m, Type::Scalar(ScalarType::Real));
-    let ty = mlir_type_of(&m, id, Dtype::F64).unwrap();
-    assert_eq!(ty.render(Dtype::F64), "tensor<f64>");
+    let (ty, elem) = mlir_type_of(&m, id, Dtype::F64).unwrap();
+    assert_eq!(ty.render(Dtype::F64, elem), "tensor<f64>");
 }
 
 #[test]
@@ -280,6 +286,7 @@ fn emitter_finish_wraps_args_and_return_type() {
     let arg = flatppl_stablehlo::Value {
         ssa: "%arg0".to_string(),
         ty: MlirTy::Scalar,
+        elem: ElemKind::Real,
     };
     let doubled = e.add(&arg, &arg);
     let out = e.finish("f", &[("%arg0".to_string(), MlirTy::Scalar)], &[&doubled]);
@@ -637,6 +644,7 @@ fn lower_ifelse_of_in_interval_selects_via_stablehlo_select() {
         Value {
             ssa: "%arg0".to_string(),
             ty: MlirTy::Scalar,
+            elem: ElemKind::Real,
         },
     );
     let result = e.lower_node(ifelse_node).unwrap();
@@ -679,6 +687,7 @@ fn lower_logsumexp_emits_stable_shift_by_max_formula_in_order() {
         Value {
             ssa: "%arg0".to_string(),
             ty: MlirTy::Ranked(vec![Some(3)]),
+            elem: ElemKind::Real,
         },
     );
     let result = e.lower_node(node).unwrap();
@@ -735,6 +744,7 @@ fn lower_logsumexp_of_vector_emits_concatenate_then_stable_formula() {
         Value {
             ssa: "%arg0".to_string(),
             ty: MlirTy::Scalar,
+            elem: ElemKind::Real,
         },
     );
     e.bind(
@@ -742,6 +752,7 @@ fn lower_logsumexp_of_vector_emits_concatenate_then_stable_formula() {
         Value {
             ssa: "%arg1".to_string(),
             ty: MlirTy::Scalar,
+            elem: ElemKind::Real,
         },
     );
     let result = e.lower_node(node).unwrap();
@@ -800,6 +811,7 @@ fn lower_sum_reduces_to_scalar_via_reduce_sum() {
         Value {
             ssa: "%arg0".to_string(),
             ty: MlirTy::Ranked(vec![Some(3)]),
+            elem: ElemKind::Real,
         },
     );
     let result = e.lower_node(node).unwrap();
@@ -856,6 +868,7 @@ fn lower_in_interval_reduces_to_one_compare() {
         Value {
             ssa: "%arg0".to_string(),
             ty: MlirTy::Scalar,
+            elem: ElemKind::Real,
         },
     );
     let result = e.lower_node(node).unwrap();
@@ -888,6 +901,7 @@ fn lower_in_refuses_non_interval_set() {
         Value {
             ssa: "%arg0".to_string(),
             ty: MlirTy::Scalar,
+            elem: ElemKind::Real,
         },
     );
     let err = e.lower_node(node).unwrap_err();
@@ -913,6 +927,7 @@ fn lower_get0_slices_and_reshapes_to_scalar() {
         Value {
             ssa: "%arg0".to_string(),
             ty: MlirTy::Ranked(vec![Some(5)]),
+            elem: ElemKind::Real,
         },
     );
     let result = e.lower_node(node).unwrap();
@@ -948,6 +963,7 @@ fn lower_get_is_one_based() {
         Value {
             ssa: "%arg0".to_string(),
             ty: MlirTy::Ranked(vec![Some(5)]),
+            elem: ElemKind::Real,
         },
     );
     let result = e.lower_node(node).unwrap();
@@ -975,6 +991,7 @@ fn lower_get0_refuses_non_rank1_container() {
         Value {
             ssa: "%arg0".to_string(),
             ty: MlirTy::Scalar,
+            elem: ElemKind::Real,
         },
     );
     let err = e.lower_node(node).unwrap_err();
@@ -998,6 +1015,7 @@ fn lower_get0_refuses_non_literal_index() {
         Value {
             ssa: "%arg0".to_string(),
             ty: MlirTy::Ranked(vec![Some(5)]),
+            elem: ElemKind::Real,
         },
     );
     let err = e.lower_node(node).unwrap_err();
@@ -1021,6 +1039,7 @@ fn lower_get0_refuses_out_of_range_index() {
         Value {
             ssa: "%arg0".to_string(),
             ty: MlirTy::Ranked(vec![Some(3)]),
+            elem: ElemKind::Real,
         },
     );
     let err = e.lower_node(node).unwrap_err();
@@ -3178,6 +3197,7 @@ fn lower_get_of_sampled_tuple_yields_advanced_rng_key() {
         Value {
             ssa: "%key".to_string(),
             ty: MlirTy::Key,
+            elem: ElemKind::Real,
         },
     );
     let v = e
@@ -3227,6 +3247,7 @@ fn lower_vector_of_vectors_lowers_to_rank2_tensor() {
         Value {
             ssa: "%arg0".to_string(),
             ty: MlirTy::Ranked(vec![Some(3)]),
+            elem: ElemKind::Real,
         },
     );
     e.bind(
@@ -3234,6 +3255,7 @@ fn lower_vector_of_vectors_lowers_to_rank2_tensor() {
         Value {
             ssa: "%arg1".to_string(),
             ty: MlirTy::Ranked(vec![Some(3)]),
+            elem: ElemKind::Real,
         },
     );
     let result = e.lower_node(node).unwrap();
@@ -3278,6 +3300,7 @@ fn lower_vector_refuses_ragged_elements() {
         Value {
             ssa: "%arg0".to_string(),
             ty: MlirTy::Ranked(vec![Some(2)]),
+            elem: ElemKind::Real,
         },
     );
     e.bind(
@@ -3285,6 +3308,7 @@ fn lower_vector_refuses_ragged_elements() {
         Value {
             ssa: "%arg1".to_string(),
             ty: MlirTy::Ranked(vec![Some(3)]),
+            elem: ElemKind::Real,
         },
     );
     let err = e.lower_node(node).unwrap_err();
@@ -3320,6 +3344,7 @@ fn lower_in_refuses_shape_mismatched_bound() {
         Value {
             ssa: "%arg0".to_string(),
             ty: MlirTy::Ranked(vec![Some(3)]), // different length than lo's
+            elem: ElemKind::Real,
         },
     );
     let err = e.lower_node(node).unwrap_err();
@@ -3350,6 +3375,7 @@ fn lower_get_refuses_selector_below_one_based_floor() {
         Value {
             ssa: "%arg0".to_string(),
             ty: MlirTy::Ranked(vec![Some(5)]),
+            elem: ElemKind::Real,
         },
     );
     let err = e.lower_node(node).unwrap_err();
