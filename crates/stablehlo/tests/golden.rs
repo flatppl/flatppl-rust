@@ -713,6 +713,141 @@ lp = logdensityof(lawof(record(lambda = lambda)), record(lambda = 2.5))\n";
     }
 }
 
+/// Fix-up regression (post-A2 review): `sum` over an `Int`-typed array
+/// (§07: sum-of-integers is integer) must reduce with an `Int` init constant
+/// AND `Int` result — `Emitter::reduce_axis` used to hardcode `Real` for
+/// both, which would emit an `Int` operand against an `f32` init/result
+/// (invalid: `stablehlo.reduce`'s operand/init/result element types must all
+/// agree). Hand-built (mirroring `mlir_type_of`'s `placeholder`-style tests):
+/// `set_type` on the `vector(...)` call gives `ops::lower_vector` a
+/// `node_kind` to convert its (already-`Int`) elements against, so this
+/// exercises `reduce_axis` exactly, with no dependency on the determinizer's
+/// const-fold or `modes.rs`'s free-parameter binding.
+#[test]
+fn sum_over_int_array_reduces_with_int_init_and_result() {
+    let mut m = Module::new();
+    let e1 = int(&mut m, 2);
+    let e2 = int(&mut m, 3);
+    let e3 = int(&mut m, 7);
+    let xs = call(&mut m, "vector", &[e1, e2, e3]);
+    m.set_type(
+        xs,
+        Type::Array {
+            shape: Box::new([Dim::Static(3)]),
+            elem: Box::new(Type::Scalar(ScalarType::Integer)),
+        },
+    );
+    let total = call(&mut m, "sum", &[xs]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    let result = e.lower_node(total).unwrap();
+    assert_eq!(result.ty, MlirTy::Scalar);
+    assert_eq!(result.elem, ElemKind::Int);
+    let out = e.finish("f", &[], &[&result]);
+    assert!(is_delimiter_balanced(&out));
+
+    let reduce_line = out
+        .lines()
+        .find(|l| l.contains("stablehlo.reduce("))
+        .expect("missing stablehlo.reduce line");
+    assert!(
+        reduce_line.contains("tensor<i32>") && !reduce_line.contains("f32"),
+        "sum over an int array must reduce entirely in i32 (operand+init+result):\n{reduce_line}"
+    );
+    let init_line = out
+        .lines()
+        .find(|l| l.contains("stablehlo.constant") && l.contains("dense<0>"))
+        .expect("missing the int-typed additive-identity init constant");
+    assert!(
+        init_line.contains("tensor<i32>"),
+        "the reduce's init constant must be i32, not the old hardcoded f32:\n{init_line}"
+    );
+}
+
+/// Fix-up regression (post-A2 review): an all-integer `in(k, interval(0,
+/// 10))` must still emit a well-typed `stablehlo.compare`. `ops::lower_in`'s
+/// `below`/`above`/`product` chain (`sub`/`mul`, kind-polymorphic) stays
+/// `Int` throughout since every operand here is a literal `Int`, but
+/// `lower_in`'s own `zero` constant is unconditionally `Real`
+/// (`Emitter::constant(0.0, ...)`) — so `Emitter::compare` must reconcile the
+/// mismatched pair (widening the `Int` product up to `Real`, per
+/// `elem_rank`'s order) rather than emitting `stablehlo.compare` over a
+/// declared-mismatched `(tensor<i32>, tensor<f32>)` operand pair. Every
+/// operand is a plain `Lit(Int)` (not a free/bound arg), so this needs no
+/// determinizer pass and cannot be const-folded (this test calls
+/// `Emitter::lower_node` directly, never `flatppl_determinizer::determinize`).
+#[test]
+fn all_integer_in_interval_reconciles_compare_operand_kinds() {
+    let mut m = Module::new();
+    let k = int(&mut m, 5);
+    let lo = int(&mut m, 0);
+    let hi = int(&mut m, 10);
+    let interval = call(&mut m, "interval", &[lo, hi]);
+    let cond = call(&mut m, "in", &[k, interval]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    let result = e.lower_node(cond).unwrap();
+    assert_eq!(result.ty, MlirTy::Scalar);
+    assert_eq!(result.elem, ElemKind::Bool);
+    let out = e.finish("f", &[], &[&result]);
+    assert!(is_delimiter_balanced(&out));
+
+    let compare_line = out
+        .lines()
+        .find(|l| l.contains("stablehlo.compare"))
+        .expect("missing stablehlo.compare line");
+    // Both operand types in the `(lhs, rhs) -> result` signature must agree
+    // with each other (both widened to f32) — a `(tensor<i32>, tensor<f32>)`
+    // pair would be the exact bug this test pins.
+    assert!(
+        !compare_line.contains("i32"),
+        "compare's product operand must be widened to real (matching the zero \
+         constant it's compared against), not left i32:\n{compare_line}"
+    );
+    // Task A2 (Bool result) must still hold.
+    assert!(
+        compare_line.contains("-> tensor<i1>"),
+        "compare's result stays i1:\n{compare_line}"
+    );
+}
+
+/// Fix-up regression (post-A2 review): an `ifelse` selecting between two
+/// `Int` (literal) branches must return an `Int`-tagged `Value` whose tag
+/// matches the emitted `i32` `stablehlo.select` — `Emitter::select` used to
+/// hardcode its result `elem: Real` regardless of the branches' actual kind.
+/// Reuses the all-`Int` `in(...)` predicate above as `ifelse`'s condition, so
+/// this also exercises `lower_ifelse`/`require_predicate_head` end to end
+/// over an all-integer expression.
+#[test]
+fn int_ifelse_select_returns_int_tagged_value() {
+    let mut m = Module::new();
+    let k = int(&mut m, 5);
+    let lo = int(&mut m, 0);
+    let hi = int(&mut m, 10);
+    let interval = call(&mut m, "interval", &[lo, hi]);
+    let cond = call(&mut m, "in", &[k, interval]);
+    let a = int(&mut m, 3);
+    let b = int(&mut m, 7);
+    let ifelse_node = call(&mut m, "ifelse", &[cond, a, b]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    let result = e.lower_node(ifelse_node).unwrap();
+    assert_eq!(result.ty, MlirTy::Scalar);
+    assert_eq!(result.elem, ElemKind::Int);
+    let out = e.finish("f", &[], &[&result]);
+    assert!(is_delimiter_balanced(&out));
+
+    let select_line = out
+        .lines()
+        .find(|l| l.contains("stablehlo.select"))
+        .expect("missing stablehlo.select line");
+    assert!(
+        select_line.contains("tensor<i32>") && !select_line.contains("f32"),
+        "an int ifelse must emit an i32 select (on_true/on_false/result), not the \
+         old hardcoded f32:\n{select_line}"
+    );
+}
+
 /// `ifelse(in(v, interval(lo, hi)), a, neg(inf))` — the exact shape the
 /// determiniser's `truncate` lowering builds — must lower to a single
 /// `compare` feeding a `select`, and `inf` must use the dtype-exact `+inf`

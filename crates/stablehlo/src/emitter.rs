@@ -428,11 +428,29 @@ impl<'m> Emitter<'m> {
     /// against a scalar bound. When the shapes already match (every scalar
     /// `@sample` / `@logdensity` path, inference-unified upstream), no broadcast
     /// is emitted and the output is byte-identical to before.
+    ///
+    /// A mismatched-elem-kind operand pair is ALSO reconciled first, same
+    /// widening rule as [`Emitter::binary`] ([`elem_rank`]'s order, via
+    /// [`Emitter::convert`]) — e.g. `ops::lower_in`'s `compare(int_product,
+    /// real_zero)` (an all-integer `in(k, interval(0, 10))`) widens the
+    /// product to `Real` before comparing. A matching pair (both operands
+    /// already the same kind — every existing caller, all-`Real`) converts
+    /// nothing, so the output stays byte-identical to before.
     pub fn compare(&mut self, dir: &str, a: &Value, b: &Value) -> Value {
+        let target = if elem_rank(a.elem) >= elem_rank(b.elem) {
+            a.elem
+        } else {
+            b.elem
+        };
+        let a = self.convert(a, target);
+        let b = self.convert(b, target);
         let (a, b) = match (&a.ty, &b.ty) {
-            (MlirTy::Scalar, MlirTy::Ranked(_)) => (self.broadcast_scalar(a, &b.ty), b.clone()),
-            (MlirTy::Ranked(_), MlirTy::Scalar) => (a.clone(), self.broadcast_scalar(b, &a.ty)),
-            _ => (a.clone(), b.clone()),
+            (MlirTy::Scalar, MlirTy::Ranked(_)) => (self.broadcast_scalar(&a, &b.ty), b),
+            (MlirTy::Ranked(_), MlirTy::Scalar) => {
+                let a_ty = a.ty.clone();
+                (a, self.broadcast_scalar(&b, &a_ty))
+            }
+            _ => (a, b),
         };
         let ssa = self.fresh();
         let lhs_ty = a.ty.render(self.dtype, a.elem);
@@ -465,18 +483,32 @@ impl<'m> Emitter<'m> {
     /// [`Emitter::broadcast_scalar`] form). When all three already share a
     /// shape (every scalar path, inference-unified upstream), no broadcast is
     /// emitted and the output is byte-identical to before.
+    ///
+    /// `a`/`b` are ALSO reconciled to one elem kind first, same widening rule
+    /// as [`Emitter::binary`]/[`Emitter::compare`] ([`elem_rank`]'s order, via
+    /// [`Emitter::convert`]) — an `ifelse` over two `Int` branches must return
+    /// an `Int`-tagged value whose tag matches the emitted `i32` SSA, not a
+    /// hardcoded `Real`. A matching pair (every existing caller, all-`Real`)
+    /// converts nothing, so the output stays byte-identical to before.
     pub fn select(&mut self, c: &Value, a: &Value, b: &Value) -> Value {
+        let elem_target = if elem_rank(a.elem) >= elem_rank(b.elem) {
+            a.elem
+        } else {
+            b.elem
+        };
+        let a = self.convert(a, elem_target);
+        let b = self.convert(b, elem_target);
         // Target the ranked shape among {pred, on_true, on_false}, if any.
-        let target = [&c.ty, &a.ty, &b.ty]
+        let shape_target = [&c.ty, &a.ty, &b.ty]
             .into_iter()
             .find(|t| matches!(t, MlirTy::Ranked(_)))
             .cloned();
-        let (a, b) = match &target {
+        let (a, b) = match &shape_target {
             Some(shape) => (
-                self.broadcast_scalar(a, shape),
-                self.broadcast_scalar(b, shape),
+                self.broadcast_scalar(&a, shape),
+                self.broadcast_scalar(&b, shape),
             ),
-            None => (a.clone(), b.clone()),
+            None => (a, b),
         };
         let ssa = self.fresh();
         let pred_ty = render_i1(&c.ty);
@@ -488,7 +520,7 @@ impl<'m> Emitter<'m> {
         Value {
             ssa,
             ty: a.ty,
-            elem: ElemKind::Real,
+            elem: elem_target,
         }
     }
 
@@ -843,6 +875,22 @@ impl<'m> Emitter<'m> {
     /// scalar) and by [`Emitter::diag`]'s row-sum. The public reduction API
     /// (`reduce_sum`/`reduce_max`) always fully reduces to a scalar; a
     /// partial per-axis reduction is not yet part of the typed op-helper API.
+    ///
+    /// The init constant and result carry `a`'s own `elem` (e.g. `sum` over
+    /// an `Int`-typed array stays `Int` end to end) rather than a hardcoded
+    /// `Real` — StableHLO requires a `stablehlo.reduce`'s operand/init/result
+    /// element types to all agree. `identity_lit` is used verbatim only for a
+    /// `Real` operand (byte-identical to before this fix — every existing
+    /// caller); a non-`Real` operand needs its OWN identity literal in that
+    /// kind's own syntax, not `identity_lit`'s float formatting (`"0"`/
+    /// `"false"`, never the float-only `"0.000000e+00"` or a dtype-exact
+    /// -inf bit pattern). Only the additive (`stablehlo.add`) identity has a
+    /// non-`Real` form implemented — `reduce_max` is only ever reached via
+    /// `ops::lower_logsumexp`, whose vector argument is always `Real` by
+    /// construction (see its own doc comment: every element is a
+    /// `logdensityof` term), so a non-`Real` operand reaching the `maximum`
+    /// combine is an internal invariant violation, not a case this emitter
+    /// has a literal for.
     fn reduce_axis(
         &mut self,
         combine_op: &str,
@@ -862,13 +910,26 @@ impl<'m> Emitter<'m> {
             MlirTy::Ranked(result_dims)
         };
 
-        let elem_ty = MlirTy::Scalar.render(self.dtype, ElemKind::Real);
+        let elem_ty = MlirTy::Scalar.render(self.dtype, a.elem);
         let operand_ty = a.ty.render(self.dtype, a.elem);
-        let result_ty_text = result_ty.render(self.dtype, ElemKind::Real);
+        let result_ty_text = result_ty.render(self.dtype, a.elem);
+
+        let init_lit: &str = match a.elem {
+            ElemKind::Real => identity_lit,
+            ElemKind::Int => "0",
+            ElemKind::Bool => "false",
+        };
+        assert!(
+            a.elem == ElemKind::Real || combine_op == "stablehlo.add",
+            "reduce_axis: a non-Real reduction identity is only implemented for the \
+             additive (stablehlo.add) combine — reduce_max's dtype-exact -inf bit \
+             pattern is only ever reached via logsumexp, whose vector argument is \
+             always Real by construction"
+        );
 
         let init_ssa = self.fresh();
         self.push(&format!(
-            "{init_ssa} = stablehlo.constant dense<{identity_lit}> : {elem_ty}"
+            "{init_ssa} = stablehlo.constant dense<{init_lit}> : {elem_ty}"
         ));
 
         let ssa = self.fresh();
@@ -879,7 +940,7 @@ impl<'m> Emitter<'m> {
         Value {
             ssa,
             ty: result_ty,
-            elem: ElemKind::Real,
+            elem: a.elem,
         }
     }
 
