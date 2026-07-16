@@ -50,6 +50,7 @@ pub(crate) fn lower_builtin(
         "sqrt" => unary(e, id, args, Emitter::sqrt),
         "abs" => unary(e, id, args, Emitter::abs),
         "cos" => unary(e, id, args, Emitter::cos),
+        "invlogit" => unary(e, id, args, Emitter::invlogit),
         "ifelse" => lower_ifelse(e, id, args),
         "inf" => lower_inf(e, id, args),
         "logsumexp" => lower_logsumexp(e, id, args),

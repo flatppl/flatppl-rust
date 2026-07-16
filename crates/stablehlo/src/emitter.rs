@@ -303,6 +303,14 @@ impl<'m> Emitter<'m> {
     pub fn cos(&mut self, a: &Value) -> Value {
         self.unary("stablehlo.cosine", a)
     }
+    /// `invlogit(x) = 1/(1+exp(-x))` (the logistic sigmoid, §07) — emitted as the
+    /// native `stablehlo.logistic`, which is numerically stable (no `exp`
+    /// overflow for large-magnitude `x`) and IREE-supported, rather than the
+    /// naive composition. Rank-preserving, so it batches under `broadcast`
+    /// (`invlogit.(linear_predictor)`) via the shared unary path.
+    pub fn invlogit(&mut self, a: &Value) -> Value {
+        self.unary("stablehlo.logistic", a)
+    }
     /// `stablehlo.sine` — a NEW op form for this crate (Task 14's Cauchy
     /// `@sample`, which needs `tan(t) = sin(t) / cos(t)`; no `chlo`/
     /// `stablehlo` `tan` op is used, mirroring [`Emitter::cos`]'s existing
