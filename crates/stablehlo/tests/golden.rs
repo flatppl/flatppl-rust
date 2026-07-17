@@ -4662,6 +4662,64 @@ fn emit_logdensity_dirac_matches_frozen_golden() {
     );
 }
 
+/// §06 Dirac `@sample`: `rand(rng, Dirac(value = v))` returns the atom `v`
+/// deterministically, consuming NO randomness. Fixed-hyperparameter forward
+/// model (`value = 3.0`), so — like `NORMAL_SAMPLE_SRC` — `emit_sample`
+/// produces a `func.func @sample(%key)` with no free params. The single draw
+/// is `dirac_sample`'s identity `value`.
+const DIRAC_SAMPLE_SRC: &str = "\
+s = rnginit(0)
+x = draw(Dirac(value = 3.0))
+draws = rand(s, lawof(x))
+";
+
+/// The deterministic-draw structural test: exactly ZERO `rng_bit_generator`
+/// draws (Dirac consumes no randomness), the drawn value is the `value` atom,
+/// and the `(value, advanced-key)` pair returns the seeded `%key` UNTOUCHED —
+/// the RNG state threads through unchanged (spec §07 rng ABI).
+#[test]
+fn emit_sample_dirac_has_expected_structure() {
+    let d = determinize_src(DIRAC_SAMPLE_SRC);
+    assert!(
+        flatppl_determinizer::is_flatpdl(&d).is_ok(),
+        "determinized module must be FlatPDL-conformant (no residual measure node)"
+    );
+
+    let out = emit_sample(&d);
+
+    assert!(
+        out.contains("func.func @sample(%key: tensor<2xui64>)"),
+        "missing func.func @sample(%key: tensor<2xui64>) (no free params) in:\n{out}"
+    );
+    assert!(
+        out.contains("-> (tensor<f32>, tensor<2xui64>)"),
+        "must return the (value, advanced-key) pair in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.rng_bit_generator").count(),
+        0,
+        "Dirac consumes no randomness — expected zero rng_bit_generator draws, in:\n{out}"
+    );
+    assert!(
+        out.contains("return %0, %key :"),
+        "the seeded %key must thread through untouched as the advanced rng state, in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// Freeze the exact emitted text: any drift (op count, ordering, key-threading)
+/// must be a deliberate, reviewed change to this golden file.
+#[test]
+fn emit_sample_dirac_matches_frozen_golden() {
+    let d = determinize_src(DIRAC_SAMPLE_SRC);
+    let out = emit_sample(&d);
+    let golden = include_str!("goldens/dirac_sample.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted @sample drifted from the frozen golden (tests/goldens/dirac_sample.mlir)"
+    );
+}
+
 /// `Categorical(p)` scored at a NON-literal `k` — a `Ref` to a top-level
 /// binding, not an integer literal `Node` itself — must refuse precisely
 /// (refuse-don't-mislower) rather than attempt a `stablehlo.gather`-shaped

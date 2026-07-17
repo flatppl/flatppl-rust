@@ -304,7 +304,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
         "Dirac",
         DistLowering {
             logpdf: dirac_logpdf,
-            sample: None,
+            sample: Some(dirac_sample),
             touniform: None,
         },
     ),
@@ -1706,8 +1706,8 @@ fn binomial_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, Emit
 /// listed in [`is_batch_safe`] alongside the other §08 discrete arithmetic
 /// dists — needed for e.g. `iid(superpose(weighted(w, Binomial(..)),
 /// weighted(1-w, Dirac(0))), n)`'s batched mixture density (the zero-inflated
-/// binomial idiom). No `@sample` builder yet (not needed by any caller so
-/// far; a future one would just be the identity `value`).
+/// binomial idiom). Its `@sample` builder is [`dirac_sample`] — the identity
+/// `value`.
 fn dirac_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
     let value = p.get(e, "value")?;
     let eq = e.compare("EQ", v, &value);
@@ -1715,6 +1715,17 @@ fn dirac_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitErr
     let pos_inf = e.inf(MlirTy::Scalar);
     let neg_inf = e.neg(&pos_inf);
     Ok(e.select(&eq, &zero, &neg_inf))
+}
+
+/// §06 Dirac's sampling transform: `rand(rng, Dirac(value = v))` returns the
+/// atom `v` deterministically, consuming NO randomness — the point mass is
+/// supported only at `v`, so a draw is `v` with probability 1. The builder
+/// simply lowers the `value` param and returns it; it makes no [`Emitter::rng`]
+/// call, so [`lower_sample`]'s post-builder [`Emitter::cur_key`] is the seeded
+/// key untouched — the `(value, new_rngstate)` pair threads the RNG state
+/// through unchanged (spec §07 rng ABI: a deterministic draw advances no key).
+fn dirac_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
+    p.get(e, "value")
 }
 
 /// §08 Geometric, verbatim: `log f = log(p) + k * log(1 - p)` — `k` is the
