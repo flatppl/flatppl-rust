@@ -256,6 +256,13 @@ static REGISTRY: &[(&str, DistLowering)] = &[
             sample: None,
         },
     ),
+    (
+        "Dirac",
+        DistLowering {
+            logpdf: dirac_logpdf,
+            sample: None,
+        },
+    ),
 ];
 
 /// Look up a distribution's lowering by its constructor name (`"Normal"`,
@@ -404,6 +411,7 @@ pub(crate) fn is_batch_safe(ctor: &str) -> bool {
             | "Binomial"
             | "Geometric"
             | "NegativeBinomial"
+            | "Dirac"
     )
 }
 
@@ -1550,6 +1558,27 @@ fn binomial_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, Emit
 
     let t2 = e.add(&log_choose_nk, &k_log_p);
     Ok(e.add(&t2, &n_minus_k_log_one_minus_p))
+}
+
+/// §06 Dirac (the measure monad's unit, `Dirac(value = v)`), verbatim: the
+/// point-mass measure at `value` — density 1 (log 0) at `v == value`, 0 (log
+/// -inf) elsewhere, w.r.t. whatever reference measure the surrounding
+/// combinator shares it against (e.g. `Counting` in a mixture over an integer
+/// variate, per `06-measure-algebra.md`'s "`Dirac(value = v)` — point-mass
+/// probability measure at `v` for any variate type"). Rank-agnostic (pure
+/// `compare`/`select`, no matrix/gather/literal-index machinery), so it is
+/// listed in [`is_batch_safe`] alongside the other §08 discrete arithmetic
+/// dists — needed for e.g. `iid(superpose(weighted(w, Binomial(..)),
+/// weighted(1-w, Dirac(0))), n)`'s batched mixture density (the zero-inflated
+/// binomial idiom). No `@sample` builder yet (not needed by any caller so
+/// far; a future one would just be the identity `value`).
+fn dirac_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
+    let value = p.get(e, "value")?;
+    let eq = e.compare("EQ", v, &value);
+    let zero = e.scalar(0.0);
+    let pos_inf = e.inf(MlirTy::Scalar);
+    let neg_inf = e.neg(&pos_inf);
+    Ok(e.select(&eq, &zero, &neg_inf))
 }
 
 /// §08 Geometric, verbatim: `log f = log(p) + k * log(1 - p)` — `k` is the
@@ -3396,6 +3425,7 @@ mod tests {
             "Binomial",
             "Geometric",
             "NegativeBinomial",
+            "Dirac",
         ] {
             assert!(is_batch_safe(d), "{d} should be batch-safe");
         }

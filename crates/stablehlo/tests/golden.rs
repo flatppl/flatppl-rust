@@ -4134,6 +4134,21 @@ a = draw(Categorical0(p = [0.2, 0.3, 0.5]))
 lp = logdensityof(lawof(record(a = a)), record(a = 1))
 ";
 
+/// §06 `Dirac(value = value)` (the measure monad's unit, not a §08 catalog
+/// distribution): the point mass at a free `value`, scored at the literal
+/// atom `a = 3`. Mirrors the discrete-batch fixtures above (a free
+/// `elementof`-declared parameter, scored at a pinned literal observation) —
+/// the zero-inflated-binomial idiom's own `Dirac(0)` pins `value` to a
+/// literal instead, but the registry builder (`compare`/`select`) is
+/// identical either way; a free `value` here exercises it as an ordinary
+/// `func.func` argument, same discipline as `BERNOULLI_DENSITY_SRC`'s free
+/// `p`.
+const DIRAC_DENSITY_SRC: &str = "\
+value = elementof(integers)
+a = draw(Dirac(value = value))
+lp = logdensityof(lawof(record(a = a)), record(a = 3))
+";
+
 /// §08 Bernoulli, verbatim: `k * log(p) + (1 - k) * log(1 - p)`. Op counts:
 /// two `log`s (`p`, `1-p`), two `multiply`s, two `subtract`s (`1-k`, `1-p`),
 /// one `add`. No `chlo.*`.
@@ -4532,6 +4547,63 @@ fn emit_logdensity_categorical0_matches_frozen_golden() {
     assert_eq!(
         out, golden,
         "emitted @logdensity drifted from the frozen golden (tests/goldens/categorical0_logdensity.mlir)"
+    );
+}
+
+/// §06 Dirac, verbatim: `select(v == value, 0.0, -inf)`. Op counts: one
+/// `stablehlo.compare` (`"EQ"`), one `stablehlo.negate` (`-inf`), one
+/// `stablehlo.select`. No `log`/`multiply`/`add`/`chlo.*` — Dirac's density
+/// is a pure indicator, not an arithmetic formula. `value` becomes an f32
+/// (not i32) func arg — every free scalar parameter emits at the target
+/// `Dtype` regardless of its declared FlatPPL domain (same as every other
+/// discrete distribution's real-valued PARAMETERS here, e.g. Bernoulli's
+/// `p`); the pinned literal `v = 3` is `stablehlo.convert`ed up to match at
+/// the `compare`, via `Emitter::compare`'s elem-kind widening.
+#[test]
+fn emit_logdensity_dirac_has_expected_structure() {
+    let d = determinize_src(DIRAC_DENSITY_SRC);
+    assert!(
+        flatppl_determinizer::is_flatpdl(&d).is_ok(),
+        "determinized module must be FlatPDL-conformant (no residual measure node)"
+    );
+
+    let out = emit_logdensity(&d);
+
+    assert!(
+        out.contains("func.func @logdensity"),
+        "missing func.func @logdensity in:\n{out}"
+    );
+    assert!(
+        out.contains("-> tensor<f32>"),
+        "must return tensor<f32> in:\n{out}"
+    );
+    assert!(
+        out.contains("%arg0: tensor<f32>"),
+        "value must become a func arg, in:\n{out}"
+    );
+    assert_eq!(out.matches("stablehlo.compare").count(), 1);
+    assert!(out.contains("EQ"), "must compare EQ, in:\n{out}");
+    assert_eq!(out.matches("stablehlo.negate").count(), 1);
+    assert_eq!(out.matches("stablehlo.select").count(), 1);
+    assert_eq!(out.matches("stablehlo.log").count(), 0);
+    assert_eq!(out.matches("stablehlo.multiply").count(), 0);
+    assert!(
+        !out.contains("chlo."),
+        "Dirac needs no CHLO ops, in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// Freeze the exact emitted text: any drift (op count, ordering, arg naming,
+/// formula) must be a deliberate, reviewed change to this golden file.
+#[test]
+fn emit_logdensity_dirac_matches_frozen_golden() {
+    let d = determinize_src(DIRAC_DENSITY_SRC);
+    let out = emit_logdensity(&d);
+    let golden = include_str!("goldens/dirac_logdensity.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted @logdensity drifted from the frozen golden (tests/goldens/dirac_logdensity.mlir)"
     );
 }
 
