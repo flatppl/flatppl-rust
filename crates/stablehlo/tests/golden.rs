@@ -81,6 +81,61 @@ score = logdensityof(post, record(a = 0.5))\n";
     );
 }
 
+// A `broadcast` whose callable is a USER FUNCTION (not a bare builtin): a
+// Poisson GLM with a named linear predictor `predict(i,s,x)=i+s*x` broadcast
+// over the covariate array and a named inverse-link `rate(eta)=exp(eta)`
+// dot-called elementwise (§04 sec:broadcasting; §05 "Named functions"). The
+// determiniser keeps these as `broadcast((%ref self predict), intercept=…,
+// slope=…, xi=<vec>)` / `rate.(<vec>)` — a callable in higher-order position is
+// NOT inlined (unlike a direct user call). The emitter must monomorphise the
+// reified `functionof` elementwise: bind each input (by keyword name / position)
+// and lower the body, whose arithmetic auto-broadcasts scalar↔rank-1. This is
+// the ex_poisson_glm_link posterior; verified out-of-tree to Enzyme-execute ==
+// scipy oracle (Δ≈2.5e-6 f32) at the corpus theta points. Buffy #328.
+#[test]
+fn broadcast_of_user_function_monomorphises_elementwise() {
+    let src = "flatppl_compat = \"0.1\"\n\
+x = [-1.0, 0.2, 0.5, 1.3, 2.1]\n\
+y_obs = [0, 1, 2, 3, 8]\n\
+a = draw(Normal(mu = 0.0, sigma = 1.0))\n\
+b = draw(Normal(mu = 0.0, sigma = 1.0))\n\
+predict(intercept, slope, xi) = intercept + slope * xi\n\
+rate(eta) = exp(eta)\n\
+eta = broadcast(predict, intercept = a, slope = b, xi = x)\n\
+mu = rate.(eta)\n\
+y = draw(Poisson.(mu))\n\
+L = likelihoodof(kernelof(record(y = y), a = a, b = b), record(y = y_obs))\n\
+post = bayesupdate(L, lawof(record(a = a, b = b)))\n\
+score = logdensityof(post, record(a = 0.0, b = 0.0))\n";
+    let m = flatppl_syntax::parse(src).unwrap();
+    let d = flatppl_determinizer::determinize(&m).unwrap();
+    // Pin that this actually exercises the user-function broadcast path: the
+    // determinised FlatPDL keeps the reified `functionof`s the query broadcasts.
+    let pdl = flatppl_syntax::print(&d);
+    assert!(
+        pdl.contains("broadcast(predict") && pdl.contains("rate.("),
+        "determinised query broadcasts the user functions:\n{pdl}"
+    );
+    let out = flatppl_stablehlo::emit(&d, flatppl_stablehlo::Mode::LogDensity, &Default::default())
+        .unwrap();
+    assert!(out.contains("module {") && is_delimiter_balanced(&out));
+    // predict's body inlined over the length-5 covariate batch (rank-1), rate's
+    // `exp` applied elementwise, then the iid Poisson log-likelihood reduced.
+    assert!(out.contains("tensor<5xf32>"), "batch dim present:\n{out}");
+    assert!(
+        out.contains("stablehlo.multiply") && out.contains("stablehlo.add"),
+        "predict body (i + s*x) inlined:\n{out}"
+    );
+    assert!(
+        out.contains("stablehlo.exponential"),
+        "rate body (exp) inlined elementwise:\n{out}"
+    );
+    assert!(
+        out.contains("stablehlo.reduce"),
+        "iid Poisson sum reduces the batch:\n{out}"
+    );
+}
+
 // `invlogit(x)` (§07 logistic sigmoid, e.g. a logit-link GLM's inverse link)
 // lowers to the native, numerically-stable `stablehlo.logistic` op. Verified
 // out-of-tree to IREE-execute == scipy `expit` oracle (Δ≈2e-8). Buffy #303.
@@ -4134,6 +4189,21 @@ a = draw(Categorical0(p = [0.2, 0.3, 0.5]))
 lp = logdensityof(lawof(record(a = a)), record(a = 1))
 ";
 
+/// §06 `Dirac(value = value)` (the measure monad's unit, not a §08 catalog
+/// distribution): the point mass at a free `value`, scored at the literal
+/// atom `a = 3`. Mirrors the discrete-batch fixtures above (a free
+/// `elementof`-declared parameter, scored at a pinned literal observation) —
+/// the zero-inflated-binomial idiom's own `Dirac(0)` pins `value` to a
+/// literal instead, but the registry builder (`compare`/`select`) is
+/// identical either way; a free `value` here exercises it as an ordinary
+/// `func.func` argument, same discipline as `BERNOULLI_DENSITY_SRC`'s free
+/// `p`.
+const DIRAC_DENSITY_SRC: &str = "\
+value = elementof(integers)
+a = draw(Dirac(value = value))
+lp = logdensityof(lawof(record(a = a)), record(a = 3))
+";
+
 /// §08 Bernoulli, verbatim: `k * log(p) + (1 - k) * log(1 - p)`. Op counts:
 /// two `log`s (`p`, `1-p`), two `multiply`s, two `subtract`s (`1-k`, `1-p`),
 /// one `add`. No `chlo.*`.
@@ -4532,6 +4602,121 @@ fn emit_logdensity_categorical0_matches_frozen_golden() {
     assert_eq!(
         out, golden,
         "emitted @logdensity drifted from the frozen golden (tests/goldens/categorical0_logdensity.mlir)"
+    );
+}
+
+/// §06 Dirac, verbatim: `select(v == value, 0.0, -inf)`. Op counts: one
+/// `stablehlo.compare` (`"EQ"`), one `stablehlo.negate` (`-inf`), one
+/// `stablehlo.select`. No `log`/`multiply`/`add`/`chlo.*` — Dirac's density
+/// is a pure indicator, not an arithmetic formula. `value` becomes an f32
+/// (not i32) func arg — every free scalar parameter emits at the target
+/// `Dtype` regardless of its declared FlatPPL domain (same as every other
+/// discrete distribution's real-valued PARAMETERS here, e.g. Bernoulli's
+/// `p`); the pinned literal `v = 3` is `stablehlo.convert`ed up to match at
+/// the `compare`, via `Emitter::compare`'s elem-kind widening.
+#[test]
+fn emit_logdensity_dirac_has_expected_structure() {
+    let d = determinize_src(DIRAC_DENSITY_SRC);
+    assert!(
+        flatppl_determinizer::is_flatpdl(&d).is_ok(),
+        "determinized module must be FlatPDL-conformant (no residual measure node)"
+    );
+
+    let out = emit_logdensity(&d);
+
+    assert!(
+        out.contains("func.func @logdensity"),
+        "missing func.func @logdensity in:\n{out}"
+    );
+    assert!(
+        out.contains("-> tensor<f32>"),
+        "must return tensor<f32> in:\n{out}"
+    );
+    assert!(
+        out.contains("%arg0: tensor<f32>"),
+        "value must become a func arg, in:\n{out}"
+    );
+    assert_eq!(out.matches("stablehlo.compare").count(), 1);
+    assert!(out.contains("EQ"), "must compare EQ, in:\n{out}");
+    assert_eq!(out.matches("stablehlo.negate").count(), 1);
+    assert_eq!(out.matches("stablehlo.select").count(), 1);
+    assert_eq!(out.matches("stablehlo.log").count(), 0);
+    assert_eq!(out.matches("stablehlo.multiply").count(), 0);
+    assert!(
+        !out.contains("chlo."),
+        "Dirac needs no CHLO ops, in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// Freeze the exact emitted text: any drift (op count, ordering, arg naming,
+/// formula) must be a deliberate, reviewed change to this golden file.
+#[test]
+fn emit_logdensity_dirac_matches_frozen_golden() {
+    let d = determinize_src(DIRAC_DENSITY_SRC);
+    let out = emit_logdensity(&d);
+    let golden = include_str!("goldens/dirac_logdensity.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted @logdensity drifted from the frozen golden (tests/goldens/dirac_logdensity.mlir)"
+    );
+}
+
+/// §06 Dirac `@sample`: `rand(rng, Dirac(value = v))` returns the atom `v`
+/// deterministically, consuming NO randomness. Fixed-hyperparameter forward
+/// model (`value = 3.0`), so — like `NORMAL_SAMPLE_SRC` — `emit_sample`
+/// produces a `func.func @sample(%key)` with no free params. The single draw
+/// is `dirac_sample`'s identity `value`.
+const DIRAC_SAMPLE_SRC: &str = "\
+s = rnginit(0)
+x = draw(Dirac(value = 3.0))
+draws = rand(s, lawof(x))
+";
+
+/// The deterministic-draw structural test: exactly ZERO `rng_bit_generator`
+/// draws (Dirac consumes no randomness), the drawn value is the `value` atom,
+/// and the `(value, advanced-key)` pair returns the seeded `%key` UNTOUCHED —
+/// the RNG state threads through unchanged (spec §07 rng ABI).
+#[test]
+fn emit_sample_dirac_has_expected_structure() {
+    let d = determinize_src(DIRAC_SAMPLE_SRC);
+    assert!(
+        flatppl_determinizer::is_flatpdl(&d).is_ok(),
+        "determinized module must be FlatPDL-conformant (no residual measure node)"
+    );
+
+    let out = emit_sample(&d);
+
+    assert!(
+        out.contains("func.func @sample(%key: tensor<2xui64>)"),
+        "missing func.func @sample(%key: tensor<2xui64>) (no free params) in:\n{out}"
+    );
+    assert!(
+        out.contains("-> (tensor<f32>, tensor<2xui64>)"),
+        "must return the (value, advanced-key) pair in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.rng_bit_generator").count(),
+        0,
+        "Dirac consumes no randomness — expected zero rng_bit_generator draws, in:\n{out}"
+    );
+    assert!(
+        out.contains("return %0, %key :"),
+        "the seeded %key must thread through untouched as the advanced rng state, in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// Freeze the exact emitted text: any drift (op count, ordering, key-threading)
+/// must be a deliberate, reviewed change to this golden file.
+#[test]
+fn emit_sample_dirac_matches_frozen_golden() {
+    let d = determinize_src(DIRAC_SAMPLE_SRC);
+    let out = emit_sample(&d);
+    let golden = include_str!("goldens/dirac_sample.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted @sample drifted from the frozen golden (tests/goldens/dirac_sample.mlir)"
     );
 }
 
@@ -8042,4 +8227,167 @@ outputs = q1
         "expected an ABI-pointing refusal naming `mu_ext`, got: {}",
         err.msg
     );
+}
+
+// ---- Buffy #327: `builtin_touniform` (univariate continuous CDF) ------------
+//
+// Spec §07 "Measure kernel evaluation primitives": for kernels of univariate
+// continuous measures, `builtin_touniform(kernel, kernel_input, x)` is the
+// cumulative distribution function `F`. The determiniser emits it as the
+// truncation normaliser `F(hi) - F(lo)` — e.g. a `normalize(truncate(Normal /
+// Cauchy, interval(0, inf)))` prior — so these anchor fixtures reach the CDF
+// builders through that route rather than a bare `builtin_touniform` call.
+// Only Normal (`chlo.erf`) and Cauchy (`stablehlo.atan2`) carry a CDF builder;
+// every other distribution refuses (refuse-don't-mislower). Numeric end-to-end
+// correctness against the scipy oracle lives in `flatppl-testsuite`'s
+// stablehlo/examples gates (ex_eight_schools uses the Cauchy CDF).
+
+const NORMAL_TRUNC_TOUNIFORM_SRC: &str = "\
+mu = elementof(reals)
+sigma = elementof(posreals)
+a = draw(normalize(truncate(Normal(mu = mu, sigma = sigma), interval(0, inf))))
+lp = logdensityof(lawof(record(a = a)), record(a = 0.5))
+";
+
+const CAUCHY_TRUNC_TOUNIFORM_SRC: &str = "\
+location = elementof(reals)
+scale = elementof(posreals)
+a = draw(normalize(truncate(Cauchy(location = location, scale = scale), interval(0, inf))))
+lp = logdensityof(lawof(record(a = a)), record(a = 0.5))
+";
+
+/// The Normal CDF `F(x) = ½·(1 + erf((x − μ)/(σ·√2)))` reaches the emitter via
+/// the truncation normaliser: `chlo.erf` must appear (exactly twice — `F(inf)`
+/// and `F(0)`), and no `stablehlo.atan2` (that is Cauchy's CDF, not Normal's).
+#[test]
+fn emit_touniform_normal_via_truncation_has_expected_structure() {
+    let d = determinize_src(NORMAL_TRUNC_TOUNIFORM_SRC);
+    assert!(
+        flatppl_determinizer::is_flatpdl(&d).is_ok(),
+        "determinized module must be FlatPDL-conformant (no residual measure node)"
+    );
+    let out = emit_logdensity(&d);
+    assert_eq!(
+        out.matches("chlo.erf ").count(),
+        2,
+        "Normal CDF must emit two chlo.erf (F(hi), F(lo)), in:\n{out}"
+    );
+    assert!(
+        !out.contains("stablehlo.atan2"),
+        "Normal CDF must not use atan2 (that is Cauchy's CDF), in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// The Cauchy CDF `F(x) = ½ + (1/π)·atan((x − x₀)/γ)` reaches the emitter via
+/// the truncation normaliser: `stablehlo.atan2` must appear (exactly twice —
+/// `F(inf)` and `F(0)`), and no `chlo.erf` (that is Normal's CDF).
+#[test]
+fn emit_touniform_cauchy_via_truncation_has_expected_structure() {
+    let d = determinize_src(CAUCHY_TRUNC_TOUNIFORM_SRC);
+    assert!(
+        flatppl_determinizer::is_flatpdl(&d).is_ok(),
+        "determinized module must be FlatPDL-conformant (no residual measure node)"
+    );
+    let out = emit_logdensity(&d);
+    assert_eq!(
+        out.matches("stablehlo.atan2").count(),
+        2,
+        "Cauchy CDF must emit two stablehlo.atan2 (F(hi), F(lo)), in:\n{out}"
+    );
+    assert!(
+        !out.contains("chlo.erf "),
+        "Cauchy CDF must not use chlo.erf (that is Normal's CDF), in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// Freeze the exact emitted text for the Normal-CDF truncation path.
+#[test]
+fn emit_touniform_normal_matches_frozen_golden() {
+    let d = determinize_src(NORMAL_TRUNC_TOUNIFORM_SRC);
+    let out = emit_logdensity(&d);
+    let golden = include_str!("goldens/normal_touniform_logdensity.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted @logdensity drifted from goldens/normal_touniform_logdensity.mlir"
+    );
+}
+
+/// Freeze the exact emitted text for the Cauchy-CDF truncation path.
+#[test]
+fn emit_touniform_cauchy_matches_frozen_golden() {
+    let d = determinize_src(CAUCHY_TRUNC_TOUNIFORM_SRC);
+    let out = emit_logdensity(&d);
+    let golden = include_str!("goldens/cauchy_touniform_logdensity.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted @logdensity drifted from goldens/cauchy_touniform_logdensity.mlir"
+    );
+}
+
+/// `builtin_touniform(Beta, ...)` — a registered distribution with NO CDF
+/// builder (spec §07: transport is defined only for continuous kernels whose
+/// canonical transport is specified; Beta's is not rendered here) — must
+/// refuse precisely, not guess a lowering.
+#[test]
+fn builtin_touniform_refuses_dist_without_cdf() {
+    let mut m = Module::new();
+    let ctor = const_node(&mut m, "Beta");
+    let alpha = real(&mut m, 2.0);
+    let beta = real(&mut m, 2.0);
+    let kernel_input = record_node(&mut m, &[("alpha", alpha), ("beta", beta)]);
+    let x = real(&mut m, 0.5);
+    let node = call(&mut m, "builtin_touniform", &[ctor, kernel_input, x]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    let err = e.lower_node(node).unwrap_err();
+    assert!(
+        err.msg
+            .contains("builtin_touniform (CDF) not defined for distribution 'Beta'"),
+        "unexpected message: {}",
+        err.msg
+    );
+    assert_eq!(err.node, Some(node));
+}
+
+/// `builtin_touniform(Bogus, ...)` — an unregistered constructor — refuses via
+/// the same `lookup` gate as `builtin_logdensityof`, before the CDF check.
+#[test]
+fn builtin_touniform_refuses_unregistered_ctor() {
+    let mut m = Module::new();
+    let ctor = const_node(&mut m, "Bogus");
+    let field_val = real(&mut m, 0.0);
+    let kernel_input = record_node(&mut m, &[("x0", field_val)]);
+    let x = real(&mut m, 1.0);
+    let node = call(&mut m, "builtin_touniform", &[ctor, kernel_input, x]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    let err = e.lower_node(node).unwrap_err();
+    assert!(
+        err.msg.contains("no lowering for distribution 'Bogus'"),
+        "unexpected message: {}",
+        err.msg
+    );
+}
+
+/// `builtin_touniform`'s kernel must be a bare `Const` distribution
+/// constructor — a `Ref` in that position refuses rather than being silently
+/// mis-resolved (mirrors `builtin_logdensityof`'s identical gate).
+#[test]
+fn builtin_touniform_refuses_non_const_kernel() {
+    let mut m = Module::new();
+    let kernel = local_ref(&mut m, "k");
+    let kernel_input = call(&mut m, "record", &[]);
+    let x = real(&mut m, 1.0);
+    let node = call(&mut m, "builtin_touniform", &[kernel, kernel_input, x]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    let err = e.lower_node(node).unwrap_err();
+    assert!(
+        err.msg.contains("bare distribution constructor"),
+        "unexpected message: {}",
+        err.msg
+    );
+    assert_eq!(err.node, Some(kernel));
 }

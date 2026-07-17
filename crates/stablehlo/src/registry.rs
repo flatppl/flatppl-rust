@@ -25,13 +25,26 @@ pub type LogpdfBuilder = fn(&mut Emitter, &Params, &Value) -> Result<Value, Emit
 /// `stablehlo.while` for rejection-based ones).
 pub type SampleBuilder = fn(&mut Emitter, &Params) -> Result<Value, EmitError>;
 
+/// `fn(emitter, params, x) -> F(x; params)` — a univariate continuous
+/// distribution's closed-form cumulative distribution function `F`, i.e. the
+/// canonical measurable transport to the standard uniform reference (spec §07
+/// "Measure kernel evaluation primitives": for kernels of univariate
+/// continuous measures, `builtin_touniform` *is* the CDF `F`). Only the
+/// distributions whose CDF has a closed form the emitter can render carry one;
+/// see [`lower_touniform`].
+pub type CdfBuilder = fn(&mut Emitter, &Params, &Value) -> Result<Value, EmitError>;
+
 /// One registered distribution's builders. `sample` is `None` until that
 /// distribution's `@sample` builder is added — reaching `@sample` for such a
 /// distribution refuses precisely (see [`lower_sample`]), rather than
-/// silently reusing `logpdf` or guessing a sampler.
+/// silently reusing `logpdf` or guessing a sampler. `touniform` is likewise
+/// `None` except for the univariate continuous distributions whose CDF the
+/// emitter renders in closed form — reaching `builtin_touniform` for any other
+/// distribution refuses precisely (see [`lower_touniform`]), never mislowered.
 pub struct DistLowering {
     pub logpdf: LogpdfBuilder,
     pub sample: Option<SampleBuilder>,
+    pub touniform: Option<CdfBuilder>,
 }
 
 /// The ctor-name-keyed table: a linear scan over a short static list. The
@@ -44,6 +57,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
         DistLowering {
             logpdf: normal_logpdf,
             sample: Some(normal_sample),
+            touniform: Some(normal_cdf),
         },
     ),
     (
@@ -51,6 +65,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
         DistLowering {
             logpdf: cauchy_logpdf,
             sample: Some(cauchy_sample),
+            touniform: Some(cauchy_cdf),
         },
     ),
     (
@@ -58,6 +73,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
         DistLowering {
             logpdf: logistic_logpdf,
             sample: Some(logistic_sample),
+            touniform: None,
         },
     ),
     (
@@ -65,6 +81,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
         DistLowering {
             logpdf: laplace_logpdf,
             sample: Some(laplace_sample),
+            touniform: None,
         },
     ),
     (
@@ -72,6 +89,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
         DistLowering {
             logpdf: exponential_logpdf,
             sample: Some(exponential_sample),
+            touniform: None,
         },
     ),
     (
@@ -79,6 +97,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
         DistLowering {
             logpdf: gamma_logpdf,
             sample: Some(gamma_sample),
+            touniform: None,
         },
     ),
     (
@@ -86,6 +105,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
         DistLowering {
             logpdf: weibull_logpdf,
             sample: Some(weibull_sample),
+            touniform: None,
         },
     ),
     (
@@ -93,6 +113,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
         DistLowering {
             logpdf: pareto_logpdf,
             sample: Some(pareto_sample),
+            touniform: None,
         },
     ),
     (
@@ -100,6 +121,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
         DistLowering {
             logpdf: inverse_gamma_logpdf,
             sample: Some(inverse_gamma_sample),
+            touniform: None,
         },
     ),
     (
@@ -107,6 +129,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
         DistLowering {
             logpdf: chi_squared_logpdf,
             sample: Some(chi_squared_sample),
+            touniform: None,
         },
     ),
     (
@@ -114,6 +137,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
         DistLowering {
             logpdf: lognormal_logpdf,
             sample: Some(lognormal_sample),
+            touniform: None,
         },
     ),
     (
@@ -121,6 +145,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
         DistLowering {
             logpdf: uniform_logpdf,
             sample: Some(uniform_sample),
+            touniform: None,
         },
     ),
     (
@@ -128,6 +153,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
         DistLowering {
             logpdf: beta_logpdf,
             sample: Some(beta_sample),
+            touniform: None,
         },
     ),
     (
@@ -135,6 +161,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
         DistLowering {
             logpdf: studentt_logpdf,
             sample: Some(studentt_sample),
+            touniform: None,
         },
     ),
     (
@@ -142,6 +169,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
         DistLowering {
             logpdf: generalized_normal_logpdf,
             sample: Some(generalized_normal_sample),
+            touniform: None,
         },
     ),
     (
@@ -149,6 +177,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
         DistLowering {
             logpdf: von_mises_logpdf,
             sample: None,
+            touniform: None,
         },
     ),
     (
@@ -156,6 +185,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
         DistLowering {
             logpdf: bernoulli_logpdf,
             sample: Some(bernoulli_sample),
+            touniform: None,
         },
     ),
     (
@@ -163,6 +193,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
         DistLowering {
             logpdf: poisson_logpdf,
             sample: Some(poisson_sample),
+            touniform: None,
         },
     ),
     (
@@ -170,6 +201,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
         DistLowering {
             logpdf: binomial_logpdf,
             sample: Some(binomial_sample),
+            touniform: None,
         },
     ),
     (
@@ -177,6 +209,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
         DistLowering {
             logpdf: geometric_logpdf,
             sample: Some(geometric_sample),
+            touniform: None,
         },
     ),
     (
@@ -184,6 +217,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
         DistLowering {
             logpdf: negative_binomial_logpdf,
             sample: Some(negative_binomial_sample),
+            touniform: None,
         },
     ),
     (
@@ -191,6 +225,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
         DistLowering {
             logpdf: negative_binomial2_logpdf,
             sample: Some(negative_binomial2_sample),
+            touniform: None,
         },
     ),
     (
@@ -198,6 +233,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
         DistLowering {
             logpdf: categorical_logpdf,
             sample: Some(categorical_sample),
+            touniform: None,
         },
     ),
     (
@@ -205,6 +241,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
         DistLowering {
             logpdf: categorical0_logpdf,
             sample: Some(categorical0_sample),
+            touniform: None,
         },
     ),
     (
@@ -212,6 +249,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
         DistLowering {
             logpdf: mvnormal_logpdf,
             sample: Some(mvnormal_sample),
+            touniform: None,
         },
     ),
     (
@@ -219,6 +257,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
         DistLowering {
             logpdf: dirichlet_logpdf,
             sample: Some(dirichlet_sample),
+            touniform: None,
         },
     ),
     (
@@ -226,6 +265,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
         DistLowering {
             logpdf: multinomial_logpdf,
             sample: Some(multinomial_sample),
+            touniform: None,
         },
     ),
     (
@@ -233,6 +273,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
         DistLowering {
             logpdf: wishart_logpdf,
             sample: None,
+            touniform: None,
         },
     ),
     (
@@ -240,6 +281,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
         DistLowering {
             logpdf: inverse_wishart_logpdf,
             sample: None,
+            touniform: None,
         },
     ),
     (
@@ -247,6 +289,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
         DistLowering {
             logpdf: lkj_logpdf,
             sample: None,
+            touniform: None,
         },
     ),
     (
@@ -254,6 +297,15 @@ static REGISTRY: &[(&str, DistLowering)] = &[
         DistLowering {
             logpdf: lkj_cholesky_logpdf,
             sample: None,
+            touniform: None,
+        },
+    ),
+    (
+        "Dirac",
+        DistLowering {
+            logpdf: dirac_logpdf,
+            sample: Some(dirac_sample),
+            touniform: None,
         },
     ),
 ];
@@ -404,6 +456,7 @@ pub(crate) fn is_batch_safe(ctor: &str) -> bool {
             | "Binomial"
             | "Geometric"
             | "NegativeBinomial"
+            | "Dirac"
     )
 }
 
@@ -440,6 +493,60 @@ pub(crate) fn lower_logdensityof(
     };
     let value = e.lower_node(v)?;
     (dist.logpdf)(e, &params, &value)
+}
+
+/// `builtin_touniform(kernel, kernel_input, x)` (spec §07 "Measure kernel
+/// evaluation primitives") — the canonical measurable transport of
+/// `kernel(kernel_input)` to the standard uniform reference. For kernels of
+/// univariate continuous measures this *is* the cumulative distribution
+/// function `F`, evaluated at `x`; the determiniser emits it as the
+/// truncation/normalisation normaliser `F(hi) - F(lo)` (e.g.
+/// `normalize(truncate(Cauchy(0, 5), interval(0, inf)))`). Same call shape as
+/// [`lower_logdensityof`] — `kernel` a bare `Const(ctor)` constructor,
+/// `kernel_input` its kwargs record, `x` the transported value — dispatched to
+/// `lookup(ctor).touniform`. Refuses precisely for a malformed call shape, an
+/// unregistered ctor, or a registered ctor with **no** closed-form CDF builder
+/// (spec §07: "use of an undefined transport function is a static error"):
+/// refuse-don't-mislower, never a guessed transport.
+pub(crate) fn lower_touniform(
+    e: &mut Emitter,
+    id: NodeId,
+    args: &[NodeId],
+) -> Result<Value, EmitError> {
+    let [kernel, kernel_input, x] = <[NodeId; 3]>::try_from(args).map_err(|_| {
+        EmitError::at(
+            id,
+            format!(
+                "builtin_touniform: expected 3 arguments, got {}",
+                args.len()
+            ),
+        )
+    })?;
+
+    let ctor = match e.node(kernel) {
+        Node::Const(sym) => e.resolve(*sym).to_string(),
+        _ => {
+            return Err(EmitError::at(
+                kernel,
+                "builtin_touniform: kernel must be a bare distribution constructor",
+            ));
+        }
+    };
+    let dist = lookup(&ctor)
+        .ok_or_else(|| EmitError::at(id, format!("no lowering for distribution '{ctor}'")))?;
+    let cdf = dist.touniform.ok_or_else(|| {
+        EmitError::at(
+            id,
+            format!("builtin_touniform (CDF) not defined for distribution '{ctor}'"),
+        )
+    })?;
+
+    let params = Params {
+        kernel_input,
+        variate: Some(x),
+    };
+    let value = e.lower_node(x)?;
+    cdf(e, &params, &value)
 }
 
 /// `builtin_sample(rng, ctor, kernel_input)` (`flatppl_determinizer::sample`'s
@@ -702,6 +809,25 @@ fn normal_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitEr
     Ok(e.add(&neg_log_sigma_plus_c, &quad))
 }
 
+/// Normal CDF (spec §07 `builtin_touniform` for a univariate continuous
+/// kernel): `F(x) = ½·(1 + erf((x − μ) / (σ·√2)))`. `erf(±inf) = ±1` yields the
+/// correct `F(±inf) = {1, 0}` limits, so the determiniser's `F(inf)`/`F(0)`
+/// truncation normaliser evaluates without special-casing.
+fn normal_cdf(e: &mut Emitter, p: &Params, x: &Value) -> Result<Value, EmitError> {
+    let mu = p.get(e, "mu")?;
+    let sigma = p.get(e, "sigma")?;
+
+    let diff = e.sub(x, &mu);
+    let sqrt2 = e.scalar(std::f64::consts::SQRT_2);
+    let denom = e.mul(&sigma, &sqrt2);
+    let z = e.div(&diff, &denom);
+    let erf_z = e.erf(&z);
+    let one = e.scalar(1.0);
+    let one_plus = e.add(&one, &erf_z);
+    let half = e.scalar(0.5);
+    Ok(e.mul(&half, &one_plus))
+}
+
 /// §08 Normal's sampling transform, verbatim: `mu + sigma * Z`, `Z ~
 /// Normal(0, 1)`. `Z` is drawn at `mu`'s own shape (`&mu.ty`) — the variate
 /// shape a scalar or (later) vector-valued Normal draw needs, mirroring how
@@ -742,6 +868,24 @@ fn cauchy_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitEr
 
     let neg_log_pi_scale = e.add(&neg_log_pi, &neg_log_scale);
     Ok(e.add(&neg_log_pi_scale, &neg_log_one_plus_z_sq))
+}
+
+/// Cauchy CDF (spec §07 `builtin_touniform` for a univariate continuous
+/// kernel): `F(x) = ½ + (1/π)·atan((x − x₀) / γ)`, with location `x₀` and scale
+/// `γ`. `atan(±inf) = ±π/2` yields the correct `F(±inf) = {1, 0}` limits, so
+/// the determiniser's `F(inf)`/`F(0)` truncation normaliser evaluates without
+/// special-casing.
+fn cauchy_cdf(e: &mut Emitter, p: &Params, x: &Value) -> Result<Value, EmitError> {
+    let location = p.get(e, "location")?;
+    let scale = p.get(e, "scale")?;
+
+    let diff = e.sub(x, &location);
+    let z = e.div(&diff, &scale);
+    let atan_z = e.atan(&z);
+    let inv_pi = e.scalar(std::f64::consts::FRAC_1_PI);
+    let scaled = e.mul(&inv_pi, &atan_z);
+    let half = e.scalar(0.5);
+    Ok(e.add(&half, &scaled))
 }
 
 /// §08 Cauchy's sampling transform, verbatim: `x0 + gamma * tan(pi * (U -
@@ -1550,6 +1694,38 @@ fn binomial_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, Emit
 
     let t2 = e.add(&log_choose_nk, &k_log_p);
     Ok(e.add(&t2, &n_minus_k_log_one_minus_p))
+}
+
+/// §06 Dirac (the measure monad's unit, `Dirac(value = v)`), verbatim: the
+/// point-mass measure at `value` — density 1 (log 0) at `v == value`, 0 (log
+/// -inf) elsewhere, w.r.t. whatever reference measure the surrounding
+/// combinator shares it against (e.g. `Counting` in a mixture over an integer
+/// variate, per `06-measure-algebra.md`'s "`Dirac(value = v)` — point-mass
+/// probability measure at `v` for any variate type"). Rank-agnostic (pure
+/// `compare`/`select`, no matrix/gather/literal-index machinery), so it is
+/// listed in [`is_batch_safe`] alongside the other §08 discrete arithmetic
+/// dists — needed for e.g. `iid(superpose(weighted(w, Binomial(..)),
+/// weighted(1-w, Dirac(0))), n)`'s batched mixture density (the zero-inflated
+/// binomial idiom). Its `@sample` builder is [`dirac_sample`] — the identity
+/// `value`.
+fn dirac_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
+    let value = p.get(e, "value")?;
+    let eq = e.compare("EQ", v, &value);
+    let zero = e.scalar(0.0);
+    let pos_inf = e.inf(MlirTy::Scalar);
+    let neg_inf = e.neg(&pos_inf);
+    Ok(e.select(&eq, &zero, &neg_inf))
+}
+
+/// §06 Dirac's sampling transform: `rand(rng, Dirac(value = v))` returns the
+/// atom `v` deterministically, consuming NO randomness — the point mass is
+/// supported only at `v`, so a draw is `v` with probability 1. The builder
+/// simply lowers the `value` param and returns it; it makes no [`Emitter::rng`]
+/// call, so [`lower_sample`]'s post-builder [`Emitter::cur_key`] is the seeded
+/// key untouched — the `(value, new_rngstate)` pair threads the RNG state
+/// through unchanged (spec §07 rng ABI: a deterministic draw advances no key).
+fn dirac_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
+    p.get(e, "value")
 }
 
 /// §08 Geometric, verbatim: `log f = log(p) + k * log(1 - p)` — `k` is the
@@ -3396,6 +3572,7 @@ mod tests {
             "Binomial",
             "Geometric",
             "NegativeBinomial",
+            "Dirac",
         ] {
             assert!(is_batch_safe(d), "{d} should be batch-safe");
         }
