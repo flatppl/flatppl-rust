@@ -24,7 +24,7 @@
 use flatppl_core::{CallHead, Node, NodeId, Scalar};
 
 use crate::emitter::Emitter;
-use crate::mlir::{MlirTy, Value};
+use crate::mlir::{ElemKind, MlirTy, Value};
 use crate::refuse::EmitError;
 
 /// Lower one FlatPDL builtin call to a [`Value`]. `id` is the call (or
@@ -244,18 +244,38 @@ fn lower_vector(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, E
 // ---- get / get0 ---------------------------------------------------------------
 
 /// `get0(container, index)` / `get(container, index)` (spec §07): zero- vs
-/// one-based single-selector element access. Only the case the determiniser
-/// itself emits is implemented here — a **rank-1 tensor** container with a
-/// **literal-integer** selector — via `slice` (extract the one element) +
-/// `reshape` (drop the now-length-1 axis, yielding a `Scalar`). Multi-
-/// selector / named-field / `all`/`only` forms (record, table, tuple, or
-/// multi-dimensional array access, spec §07) are refused, not guessed: `get`/
-/// `get0` can also reach this map from user-authored FlatPDL, not just the
-/// determiniser's own output, and none of those forms has an obvious
-/// single-op tensor lowering.
+/// one-based element access. Two cases are implemented:
+///
+/// - A **literal-integer** selector into a rank-1 tensor container (the
+///   shape the determiniser itself emits) — [`lower_get_literal`], via
+///   `slice` (extract the one element) + `reshape` (drop the now-length-1
+///   axis, yielding a `Scalar`).
+/// - A **runtime rank-1 `Int`-tensor** selector into a rank-1 tensor
+///   container (the `theta[person]`-style vector-index case) —
+///   [`lower_get_gather`], via [`Emitter::gather`].
+///
+/// Multi-selector / named-field / `all`/`only` forms (record, table, tuple),
+/// multi-dimensional array access, and a non-`Int` runtime index (spec §07)
+/// are refused, not guessed: `get`/`get0` can also reach this map from
+/// user-authored FlatPDL, not just the determiniser's own output, and none
+/// of those forms has an obvious single-op tensor lowering.
 fn lower_get(e: &mut Emitter, id: NodeId, args: &[NodeId], base: i64) -> Result<Value, EmitError> {
     let [container, index] = args_exact(id, args)?;
-    let selector = literal_index(e, id, index)?;
+
+    if let Ok(selector) = literal_index(e, id, index) {
+        return lower_get_literal(e, id, container, selector, base);
+    }
+    lower_get_gather(e, id, container, index, base)
+}
+
+/// The literal-selector fast path — see [`lower_get`].
+fn lower_get_literal(
+    e: &mut Emitter,
+    id: NodeId,
+    container: NodeId,
+    selector: i64,
+    base: i64,
+) -> Result<Value, EmitError> {
     let idx = selector - base;
     if idx < 0 {
         return Err(EmitError::at(id, "get/get0: index out of range"));
@@ -282,6 +302,36 @@ fn lower_get(e: &mut Emitter, id: NodeId, args: &[NodeId], base: i64) -> Result<
 
     let sliced = e.slice(&v, &[idx], &[idx + 1], &[1]);
     Ok(e.reshape(&sliced, MlirTy::Scalar))
+}
+
+/// The runtime-index fallback — see [`lower_get`]. Reached once
+/// `literal_index` fails on `index`; supported ONLY for a rank-1 `container`
+/// indexed by a runtime rank-1 `Int` tensor. Every other shape (multi-
+/// selector, record/table/tuple, rank-2+ operand, a non-`Int` index) is
+/// refused here rather than mislowered.
+fn lower_get_gather(
+    e: &mut Emitter,
+    id: NodeId,
+    container: NodeId,
+    index: NodeId,
+    base: i64,
+) -> Result<Value, EmitError> {
+    let operand = e.lower_node(container)?;
+    let idx = e.lower_node(index)?;
+
+    let is_rank1 = |ty: &MlirTy| matches!(ty, MlirTy::Ranked(dims) if dims.len() == 1);
+    if !is_rank1(&operand.ty) || !is_rank1(&idx.ty) || idx.elem != ElemKind::Int {
+        return Err(EmitError::at(
+            id,
+            format!(
+                "get/get0: selector must be a literal integer, or (for a runtime index) \
+                 a rank-1 Int tensor indexing a rank-1 tensor container; got container \
+                 {:?} index {:?} ({:?})",
+                operand.ty, idx.ty, idx.elem
+            ),
+        ));
+    }
+    Ok(e.gather(&operand, &idx, base))
 }
 
 /// `get`/`get0`'s selector must be a literal integer (matching how the

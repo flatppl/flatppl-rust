@@ -1336,6 +1336,11 @@ fn lower_get0_refuses_non_rank1_container() {
     );
 }
 
+/// A non-literal selector that ALSO isn't a runtime rank-1 `Int` tensor (here
+/// a bound scalar `Real`, e.g. `get0(v, some_real_expr)`) still refuses —
+/// falling through both the literal-index fast path AND the
+/// `lower_get_gather` fallback (see `lower_get0_gather_lowers_runtime_index`
+/// below for the case that fallback DOES accept).
 #[test]
 fn lower_get0_refuses_non_literal_index() {
     let mut m = Module::new();
@@ -1350,6 +1355,251 @@ fn lower_get0_refuses_non_literal_index() {
             ssa: "%arg0".to_string(),
             ty: MlirTy::Ranked(vec![Some(5)]),
             elem: ElemKind::Real,
+        },
+    );
+    e.bind(
+        idx,
+        Value {
+            ssa: "%arg1".to_string(),
+            ty: MlirTy::Scalar,
+            elem: ElemKind::Real,
+        },
+    );
+    let err = e.lower_node(node).unwrap_err();
+    assert!(
+        err.msg.contains("literal integer"),
+        "unexpected message: {}",
+        err.msg
+    );
+}
+
+/// `get0(container, index)` with a RUNTIME rank-1 `Int` `index` (the
+/// `theta[person]`-style vector-index case) lowers to `stablehlo.gather`:
+/// `base = 0` (`get0`) is subtracted from `index` (a no-op numerically, but
+/// still emitted — `Emitter::gather` doesn't special-case `base == 0`), the
+/// result reshaped `[N] -> [N, 1]`, then gathered against the authoritative
+/// JAX/XLA `dimension_numbers`/`slice_sizes` for a single-scalar-slice-per-
+/// index gather along a rank-1 operand's only axis.
+#[test]
+fn lower_get0_gather_lowers_runtime_index() {
+    let mut m = Module::new();
+    let vals = local_ref(&mut m, "vals");
+    let idx = local_ref(&mut m, "idx");
+    let node = call(&mut m, "get0", &[vals, idx]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    e.bind(
+        vals,
+        Value {
+            ssa: "%arg0".to_string(),
+            ty: MlirTy::Ranked(vec![Some(4)]),
+            elem: ElemKind::Real,
+        },
+    );
+    e.bind(
+        idx,
+        Value {
+            ssa: "%arg1".to_string(),
+            ty: MlirTy::Ranked(vec![Some(3)]),
+            elem: ElemKind::Int,
+        },
+    );
+    let result = e.lower_node(node).unwrap();
+    assert_eq!(result.ty, MlirTy::Ranked(vec![Some(3)]));
+    assert_eq!(result.elem, ElemKind::Real);
+    let out = e.finish(
+        "f",
+        &[
+            ("%arg0".to_string(), MlirTy::Ranked(vec![Some(4)])),
+            ("%arg1".to_string(), MlirTy::Ranked(vec![Some(3)])),
+        ],
+        &[&result],
+    );
+
+    assert!(
+        out.contains("stablehlo.constant dense<0> : tensor<i32>"),
+        "get0's base-0 constant missing in:\n{out}"
+    );
+    assert!(
+        out.contains("stablehlo.subtract"),
+        "base subtraction missing in:\n{out}"
+    );
+    assert!(
+        out.contains("stablehlo.reshape") && out.contains("tensor<3x1xi32>"),
+        "index reshape to Nx1 missing in:\n{out}"
+    );
+    assert!(
+        out.contains("\"stablehlo.gather\"(%arg0,"),
+        "generic-form gather over the operand missing in:\n{out}"
+    );
+    assert!(
+        out.contains(
+            "dimension_numbers = #stablehlo.gather<collapsed_slice_dims = [0], \
+             start_index_map = [0], index_vector_dim = 1>"
+        ),
+        "dimension_numbers must match the JAX/XLA reference verbatim:\n{out}"
+    );
+    assert!(
+        out.contains("indices_are_sorted = false"),
+        "missing indices_are_sorted in:\n{out}"
+    );
+    assert!(
+        out.contains("slice_sizes = array<i64: 1>"),
+        "missing slice_sizes in:\n{out}"
+    );
+    assert!(
+        out.contains("(tensor<4xf32>, tensor<3x1xi32>) -> tensor<3xf32>"),
+        "gather operand/index/result types wrong in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// `get(container, index)` (1-based) with the same runtime rank-1 `Int`
+/// index subtracts `base = 1` before the gather — the dense constant, unlike
+/// `get0`'s, is `1`.
+#[test]
+fn lower_get_gather_uses_base_one() {
+    let mut m = Module::new();
+    let vals = local_ref(&mut m, "vals");
+    let idx = local_ref(&mut m, "idx");
+    let node = call(&mut m, "get", &[vals, idx]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    e.bind(
+        vals,
+        Value {
+            ssa: "%arg0".to_string(),
+            ty: MlirTy::Ranked(vec![Some(4)]),
+            elem: ElemKind::Real,
+        },
+    );
+    e.bind(
+        idx,
+        Value {
+            ssa: "%arg1".to_string(),
+            ty: MlirTy::Ranked(vec![Some(3)]),
+            elem: ElemKind::Int,
+        },
+    );
+    let result = e.lower_node(node).unwrap();
+    let out = e.finish(
+        "f",
+        &[
+            ("%arg0".to_string(), MlirTy::Ranked(vec![Some(4)])),
+            ("%arg1".to_string(), MlirTy::Ranked(vec![Some(3)])),
+        ],
+        &[&result],
+    );
+    assert!(
+        out.contains("stablehlo.constant dense<1> : tensor<i32>"),
+        "get's base-1 constant missing in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// An `Int` operand (e.g. an integer-valued array) gathers to an `Int`
+/// result — the gather's result `elem` copies the OPERAND's, not the index's.
+#[test]
+fn lower_get_gather_preserves_int_operand_elem() {
+    let mut m = Module::new();
+    let vals = local_ref(&mut m, "vals");
+    let idx = local_ref(&mut m, "idx");
+    let node = call(&mut m, "get", &[vals, idx]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    e.bind(
+        vals,
+        Value {
+            ssa: "%arg0".to_string(),
+            ty: MlirTy::Ranked(vec![Some(4)]),
+            elem: ElemKind::Int,
+        },
+    );
+    e.bind(
+        idx,
+        Value {
+            ssa: "%arg1".to_string(),
+            ty: MlirTy::Ranked(vec![Some(3)]),
+            elem: ElemKind::Int,
+        },
+    );
+    let result = e.lower_node(node).unwrap();
+    assert_eq!(result.elem, ElemKind::Int);
+    let out = e.finish(
+        "f",
+        &[
+            ("%arg0".to_string(), MlirTy::Ranked(vec![Some(4)])),
+            ("%arg1".to_string(), MlirTy::Ranked(vec![Some(3)])),
+        ],
+        &[&result],
+    );
+    assert!(
+        out.contains("(tensor<4xi32>, tensor<3x1xi32>) -> tensor<3xi32>"),
+        "Int operand must gather to an Int result, in:\n{out}"
+    );
+}
+
+/// A runtime index that is `Real`, not `Int`, refuses (spec §07 `get`/`get0`
+/// selectors are integer-valued) — the `lower_get_gather` fallback's own
+/// elem-kind check, distinct from the container-shape check
+/// `lower_get0_refuses_non_rank1_container` exercises.
+#[test]
+fn lower_get_gather_refuses_non_int_index() {
+    let mut m = Module::new();
+    let vals = local_ref(&mut m, "vals");
+    let idx = local_ref(&mut m, "idx");
+    let node = call(&mut m, "get", &[vals, idx]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    e.bind(
+        vals,
+        Value {
+            ssa: "%arg0".to_string(),
+            ty: MlirTy::Ranked(vec![Some(4)]),
+            elem: ElemKind::Real,
+        },
+    );
+    e.bind(
+        idx,
+        Value {
+            ssa: "%arg1".to_string(),
+            ty: MlirTy::Ranked(vec![Some(3)]),
+            elem: ElemKind::Real,
+        },
+    );
+    let err = e.lower_node(node).unwrap_err();
+    assert!(
+        err.msg.contains("literal integer"),
+        "unexpected message: {}",
+        err.msg
+    );
+}
+
+/// A rank-2+ operand with a runtime `Int` index refuses rather than
+/// mislowering a multi-dimensional gather (out of scope: only a rank-1
+/// operand is supported).
+#[test]
+fn lower_get_gather_refuses_rank2_operand() {
+    let mut m = Module::new();
+    let vals = local_ref(&mut m, "vals");
+    let idx = local_ref(&mut m, "idx");
+    let node = call(&mut m, "get", &[vals, idx]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    e.bind(
+        vals,
+        Value {
+            ssa: "%arg0".to_string(),
+            ty: MlirTy::Ranked(vec![Some(4), Some(4)]),
+            elem: ElemKind::Real,
+        },
+    );
+    e.bind(
+        idx,
+        Value {
+            ssa: "%arg1".to_string(),
+            ty: MlirTy::Ranked(vec![Some(3)]),
+            elem: ElemKind::Int,
         },
     );
     let err = e.lower_node(node).unwrap_err();
