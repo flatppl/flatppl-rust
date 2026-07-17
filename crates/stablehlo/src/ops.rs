@@ -43,10 +43,17 @@ pub(crate) fn lower_builtin(
         "sub" => binary(e, id, args, Emitter::sub),
         "mul" => binary(e, id, args, Emitter::mul),
         // §07 `divide` (real division `a / b`) — what the parser emits for `/`
-        // and `./`. NOT §07 `div` (integer floor division ⌊a/b⌋), which has no
-        // real-division lowering here and refuses via the catch-all below.
+        // and `./`. Distinct from §07 `div` (integer floor division, below):
+        // `divide` always forces Real via `Emitter::div` (`binary_real`),
+        // never the floored integer semantics.
         "divide" => binary(e, id, args, Emitter::div),
         "pow" => binary(e, id, args, Emitter::pow),
+        // §07 `div`/`mod` (integer floor division ⌊a/b⌋ / floored modulo,
+        // `Int` operands) — StableHLO's native `divide`/`remainder` truncate
+        // toward zero, so `Emitter::floor_div`/`floor_mod` sign-correct them
+        // (see their doc comments).
+        "div" => binary(e, id, args, Emitter::floor_div),
+        "mod" => binary(e, id, args, Emitter::floor_mod),
         "neg" => unary(e, id, args, Emitter::neg),
         "log" => unary(e, id, args, Emitter::log),
         "exp" => unary(e, id, args, Emitter::exp),

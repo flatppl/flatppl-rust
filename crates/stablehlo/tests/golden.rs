@@ -848,6 +848,112 @@ fn int_ifelse_select_returns_int_tagged_value() {
     );
 }
 
+/// Task B1 CRITICAL fix (PR-A whole-branch review, Minor #1): the
+/// value-path `Emitter::compare` must append `compare_type = SIGNED` when
+/// its (reconciled) operand kind is `Int` — StableHLO requires an explicit
+/// signedness for an integer compare, and this emitter's integer values are
+/// always signed (`i32`/`i64`). A `Real` (or `Bool`) operand pair must stay
+/// byte-identical to before (no `compare_type` attribute at all) — booleans
+/// must NOT carry one per the StableHLO spec, and every pre-existing caller
+/// here is `Real`.
+#[test]
+fn compare_adds_signed_compare_type_for_int_operands_only() {
+    let m = Module::new();
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    let a = e.int_value_const(3);
+    let b = e.int_value_const(5);
+    let cmp = e.compare("LT", &a, &b);
+    let out = e.finish("f", &[], &[&cmp]);
+    let line = out
+        .lines()
+        .find(|l| l.contains("stablehlo.compare"))
+        .expect("missing compare line");
+    assert!(
+        line.contains(", SIGNED :"),
+        "an Int compare must carry compare_type = SIGNED:\n{line}"
+    );
+
+    let mut e2 = Emitter::new(&m, Dtype::F32);
+    let x = e2.scalar(1.0);
+    let y = e2.scalar(2.0);
+    let cmp2 = e2.compare("LT", &x, &y);
+    let out2 = e2.finish("f", &[], &[&cmp2]);
+    let line2 = out2
+        .lines()
+        .find(|l| l.contains("stablehlo.compare"))
+        .expect("missing compare line");
+    assert!(
+        !line2.contains("SIGNED"),
+        "a Real compare must stay byte-identical (no compare_type):\n{line2}"
+    );
+}
+
+/// Task B1: `div(a, b) = ⌊a/b⌋` (spec §07 integer floor division) over `Int`
+/// literals — mirroring the A2-fix goldens' hand-built-`Module` style, so
+/// this bypasses the determiniser and cannot const-fold. Before this task
+/// `div` has no arm in `ops::lower_builtin`'s dispatch and refuses via the
+/// catch-all "unsupported builtin head". After: StableHLO's truncating
+/// integer `divide` plus the sign-correction idiom (`compare`+`and`+
+/// `select`), returning `Int` — never `stablehlo.remainder` (that's `mod`'s
+/// op, not `div`'s).
+#[test]
+fn div_lowers_to_floor_corrected_integer_divide() {
+    let mut m = Module::new();
+    let a = int(&mut m, 7);
+    let b = int(&mut m, 2);
+    let node = call(&mut m, "div", &[a, b]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    let result = e.lower_node(node).unwrap();
+    assert_eq!(result.ty, MlirTy::Scalar);
+    assert_eq!(result.elem, ElemKind::Int);
+    let out = e.finish("f", &[], &[&result]);
+    assert!(is_delimiter_balanced(&out));
+
+    for op in [
+        "stablehlo.divide",
+        "stablehlo.compare",
+        "stablehlo.and",
+        "stablehlo.select",
+    ] {
+        assert!(out.contains(op), "div: missing {op} in:\n{out}");
+    }
+    assert!(
+        !out.contains("stablehlo.remainder"),
+        "div must not use stablehlo.remainder (that's mod's op):\n{out}"
+    );
+}
+
+/// Task B1: `mod(a, b) = a − b·⌊a/b⌋` (spec §07 floored modulo) over `Int`
+/// literals — same hand-built-`Module` style as `div`'s golden above. Before
+/// this task `mod` refuses via the same catch-all as `div`. After: StableHLO's
+/// truncating integer `remainder` plus the sign-correction idiom, returning
+/// `Int`.
+#[test]
+fn mod_lowers_to_floor_corrected_integer_remainder() {
+    let mut m = Module::new();
+    let a = int(&mut m, 7);
+    let b = int(&mut m, 2);
+    let node = call(&mut m, "mod", &[a, b]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    let result = e.lower_node(node).unwrap();
+    assert_eq!(result.ty, MlirTy::Scalar);
+    assert_eq!(result.elem, ElemKind::Int);
+    let out = e.finish("f", &[], &[&result]);
+    assert!(is_delimiter_balanced(&out));
+
+    for op in [
+        "stablehlo.remainder",
+        "stablehlo.compare",
+        "stablehlo.and",
+        "stablehlo.select",
+    ] {
+        assert!(out.contains(op), "mod: missing {op} in:\n{out}");
+    }
+}
+
 /// `ifelse(in(v, interval(lo, hi)), a, neg(inf))` — the exact shape the
 /// determiniser's `truncate` lowering builds — must lower to a single
 /// `compare` feeding a `select`, and `inf` must use the dtype-exact `+inf`
