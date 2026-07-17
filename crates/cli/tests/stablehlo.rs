@@ -133,6 +133,44 @@ fn stablehlo_abi_load_data_pins_tensor_arg_from_file_length() {
     );
 }
 
+/// PR-2 review follow-up (refuse, don't mis-lower): the `load_data` shape pin
+/// dispatches by file format and REFUSES an unsupported one rather than blindly
+/// line-counting it (which would silently mis-shape the arg). A `.json`
+/// `load_data` ABI input therefore exits 3 with a format message, not a bogus
+/// `tensor<N×f32>`. (`.csv` / `.wsv` are the supported delimited-text formats.)
+#[test]
+fn stablehlo_abi_load_data_refuses_unsupported_format() {
+    let dir = std::env::temp_dir().join(format!(
+        "flatppl-stablehlo-cli-load-data-json-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("data.json"), "[1.0, 2.0, 3.0]\n").unwrap();
+    let input = dir.join("m.flatppl");
+    std::fs::write(
+        &input,
+        "a = elementof(reals)\n\
+         y = load_data(\"data.json\", reals)\n\
+         m = lawof(record(a = draw(Normal(mu = 0.0, sigma = 1.0))))\n\
+         q1 = logdensityof(m, record(a = a))\n\
+         inputs = (a, y)\n\
+         outputs = q1\n",
+    )
+    .unwrap();
+    let out = flatppl().arg("stablehlo").arg(&input).output().unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "a .json load_data shape pin must refuse (exit 3); stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("unsupported format") && stderr.contains(".json"),
+        "expected an unsupported-format refusal naming .json, got: {stderr}"
+    );
+}
+
 /// `b` is reachable from `q1` (root-DCE keeps it — the query needs it) but is
 /// not listed in `inputs` (which declares only `a`): the exhaustiveness check
 /// (design doc: `inputs` is "authoritative and exhaustive") must refuse this

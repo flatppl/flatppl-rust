@@ -758,6 +758,27 @@ fn abi_input_names(module: &flatppl_core::Module) -> Vec<String> {
 /// row as the column header, and count the remaining data rows.
 #[cfg(feature = "stablehlo")]
 fn load_data_vector_len(path: &Path) -> Result<usize, Failure> {
+    // Dispatch by extension, mirroring the reference engine (`flatppl-js`
+    // `dataload.ts`): only the delimited TEXT formats (`.csv` comma-separated,
+    // `.wsv` whitespace-separated) are supported for the compile-time shape pin.
+    // Any other format (`.json`, Arrow IPC, or no/unknown extension) is REFUSED
+    // rather than blindly line-counted — a blind count would silently mis-shape
+    // the emitted `tensor<N×f32>` argument (refuse, don't mis-lower). Pinning a
+    // `.json`/Arrow length is a follow-up.
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    if !matches!(ext.as_deref(), Some("csv") | Some("wsv")) {
+        return Err(Failure::Refuse(format!(
+            "load_data shape pin: unsupported format {} for `{}` — a `load_data` ABI input's \
+             shape can be pinned only from `.csv` / `.wsv` (matching the reference engine; \
+             `.json` / Arrow IPC not yet supported)",
+            ext.map(|e| format!("`.{e}`"))
+                .unwrap_or_else(|| "(no extension)".into()),
+            path.display()
+        )));
+    }
     let text = fs::read_to_string(path).map_err(|e| {
         Failure::Plain(format!(
             "reading load_data source `{}` for its shape: {e}",
