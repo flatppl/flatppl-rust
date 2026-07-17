@@ -2053,6 +2053,71 @@ fn emit_logdensity_refuses_trailing_binding_with_no_density_term() {
     assert_eq!(err.node, Some(diag));
 }
 
+/// With `EmitOptions::query` naming the density binding, `emit_logdensity`
+/// emits THAT binding even though an inert binding (`diag`) sorts after it in
+/// source order. This is the cross-module-grafting case (a `load_module` query
+/// scoring a foreign `posterior`): determinization splices the foreign model's
+/// data / pinned-draw residue in after the query, so the query's position is
+/// not stable but its name is. The SAME module refuses without the designation
+/// — see `emit_logdensity_refuses_trailing_binding_with_no_density_term`.
+#[test]
+fn emit_logdensity_designated_query_skips_trailing_binding() {
+    let mut m = Module::new();
+    let ctor = const_node(&mut m, "Normal");
+    let mu = real(&mut m, 0.0);
+    let sigma = real(&mut m, 1.0);
+    let kernel_input = record_node(&mut m, &[("mu", mu), ("sigma", sigma)]);
+    let v = real(&mut m, 0.5);
+    let density = call(&mut m, "builtin_logdensityof", &[ctor, kernel_input, v]);
+    top_level(&mut m, "lp", density);
+
+    // A diagnostic/auxiliary binding after `lp` in source order — exactly the
+    // shape that makes the positional (`query: None`) path refuse.
+    let diag = real(&mut m, 42.0);
+    top_level(&mut m, "diag", diag);
+
+    let opts = flatppl_stablehlo::EmitOptions {
+        query: Some("lp".to_string()),
+        ..Default::default()
+    };
+    let out = flatppl_stablehlo::emit(&m, flatppl_stablehlo::Mode::LogDensity, &opts)
+        .expect("designated query `lp` emits despite the trailing `diag` binding");
+    // The standard-normal `logpdf` normalizing constant `-0.5*ln(2π)` — the
+    // structural signal that `lp`'s Normal density (not `diag = 42`) was lowered.
+    assert!(
+        out.contains("-0.9189385332046727"),
+        "expected the Normal logpdf normalizing constant, got:\n{out}"
+    );
+}
+
+/// An `EmitOptions::query` naming a binding that is not a public binding of the
+/// (determinized) module refuses with a precise message rather than silently
+/// falling back to a positional guess — a mis-designation by the host is a bug
+/// to surface, not to paper over.
+#[test]
+fn emit_logdensity_refuses_unknown_designated_query() {
+    let mut m = Module::new();
+    let ctor = const_node(&mut m, "Normal");
+    let mu = real(&mut m, 0.0);
+    let sigma = real(&mut m, 1.0);
+    let kernel_input = record_node(&mut m, &[("mu", mu), ("sigma", sigma)]);
+    let v = real(&mut m, 0.5);
+    let density = call(&mut m, "builtin_logdensityof", &[ctor, kernel_input, v]);
+    top_level(&mut m, "lp", density);
+
+    let opts = flatppl_stablehlo::EmitOptions {
+        query: Some("nope".to_string()),
+        ..Default::default()
+    };
+    let err = flatppl_stablehlo::emit(&m, flatppl_stablehlo::Mode::LogDensity, &opts).unwrap_err();
+    assert!(
+        err.msg
+            .contains("designated logdensity query binding `nope` is not a public binding"),
+        "unexpected message: {}",
+        err.msg
+    );
+}
+
 // ---- Task 8: location-scale continuous `@logdensity` batch -----------------
 //
 // Cauchy/Logistic/Laplace (§08), registered alongside Normal in

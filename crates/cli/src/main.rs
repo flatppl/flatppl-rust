@@ -603,7 +603,27 @@ fn determinize_cmd(input: &Path, output: Option<&Path>, keep: &[String]) -> Resu
 #[cfg(feature = "stablehlo")]
 fn stablehlo_cmd(input: &Path, mode: &str, output: Option<&Path>) -> Result<(), Failure> {
     let (module, bundle) = load_and_infer(input)?;
-    let lowered = flatppl_determinizer::determinize_with(&module, &bundle).map_err(|e| {
+
+    // The query is the LAST public binding of the *surface* model (the
+    // "query last" convention). Read its identity here, before determinization:
+    // a `load_module` query that scores a foreign model's `posterior` gets that
+    // model's bindings grafted in during determinization, and its inert
+    // data/pinned-draw residue can sort AFTER the query — so its position is
+    // not stable, but its name is. Use the name as the DCE root (Buffy #263
+    // Pass 4-A) so bindings the query does not reach are pruned (required when
+    // a grafted forward-only draw would otherwise refuse to determinize), and
+    // hand the same name to the emitter (`EmitOptions::query`) so it emits the
+    // query binding rather than a positional guess.
+    let query_sym = module.public_bindings().last().map(|(_, b)| b.name);
+    let query_name = query_sym.map(|s| module.resolve(s).to_string());
+    let roots = query_sym.map(|s| [s]);
+
+    let lowered = flatppl_determinizer::determinize_with_roots(
+        &module,
+        &bundle,
+        roots.as_ref().map(|r| r.as_slice()),
+    )
+    .map_err(|e| {
         Failure::Refuse(format!(
             "determinize: refuse {} (node {:?}): {}",
             e.construct, e.node, e.reason
@@ -618,9 +638,12 @@ fn stablehlo_cmd(input: &Path, mode: &str, output: Option<&Path>) -> Result<(), 
             )));
         }
     };
-    let rendered =
-        flatppl_stablehlo::emit(&lowered, mode, &flatppl_stablehlo::EmitOptions::default())
-            .map_err(|e| Failure::Refuse(e.to_string()))?;
+    let opts = flatppl_stablehlo::EmitOptions {
+        query: query_name,
+        ..Default::default()
+    };
+    let rendered = flatppl_stablehlo::emit(&lowered, mode, &opts)
+        .map_err(|e| Failure::Refuse(e.to_string()))?;
     match output {
         Some(path) => fs::write(path, rendered)
             .map_err(|e| Failure::Plain(format!("writing `{}`: {e}", path.display())))?,

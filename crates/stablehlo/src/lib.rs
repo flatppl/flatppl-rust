@@ -55,11 +55,23 @@ pub enum Dtype {
 /// never assumes/hardcodes 64-bit floats.
 pub struct EmitOptions {
     pub dtype: Dtype,
+    /// The public binding to emit as the query, designated by name. FlatPDL
+    /// carries no query marker (see [`modes`]); the host (the CLI verb / the
+    /// testsuite harness) picks the query binding and names it here. `None`
+    /// falls back to the "last public binding" convention — correct for a
+    /// self-contained hand-written scoring model, but ambiguous once
+    /// cross-module grafting (`load_module`) splices a foreign model's inert
+    /// data/residue bindings in *after* the query in source order. Naming the
+    /// query keeps it identifiable regardless of grafted trailing bindings.
+    pub query: Option<String>,
 }
 
 impl Default for EmitOptions {
     fn default() -> Self {
-        Self { dtype: Dtype::F32 }
+        Self {
+            dtype: Dtype::F32,
+            query: None,
+        }
     }
 }
 

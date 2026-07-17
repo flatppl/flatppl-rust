@@ -73,7 +73,7 @@
 
 use std::collections::HashSet;
 
-use flatppl_core::{CallHead, Module, Node, NodeId, Phase, Ref, RefNs, Scalar};
+use flatppl_core::{Binding, BindingId, CallHead, Module, Node, NodeId, Phase, Ref, RefNs, Scalar};
 
 use crate::EmitOptions;
 use crate::emitter::Emitter;
@@ -108,13 +108,14 @@ pub fn emit_logdensity(m: &Module, opts: &EmitOptions) -> Result<String, EmitErr
         args.push((name, ty));
     }
 
-    let query = m.public_bindings().last().ok_or_else(|| {
-        EmitError::whole("module has no public binding to emit as the logdensity query")
-    })?;
+    let query = select_query(m, opts, "logdensity")?;
     let query_rhs = query.1.rhs;
 
-    // Guard the "last public binding" convention (see module doc comment):
-    // refuse rather than silently lower a trailing non-density binding.
+    // Guard the selected query (see module doc comment): refuse rather than
+    // silently lower a binding with no density term. Applies whether the query
+    // was designated by name or fell back to the "last public binding"
+    // convention — a mis-designated / trailing non-density binding is caught
+    // either way.
     if !contains_logdensityof_call(m, query_rhs) {
         return Err(EmitError::at(
             query_rhs,
@@ -125,6 +126,42 @@ pub fn emit_logdensity(m: &Module, opts: &EmitOptions) -> Result<String, EmitErr
 
     let result = e.lower_node(query_rhs)?;
     Ok(e.finish("logdensity", &args, &[&result]))
+}
+
+/// Select the public binding to emit as the query. When `opts.query` names a
+/// binding, that public binding is used regardless of its source position —
+/// which is the whole point of naming it: cross-module grafting (`load_module`
+/// scoring a foreign `posterior`) splices the foreign model's inert data /
+/// pinned-draw residue bindings into the determinized module *after* the query
+/// in source order, so a positional "last" would select one of those. When
+/// `opts.query` is `None`, the LAST public binding is used — the
+/// self-contained-model convention documented in the module doc comment. The
+/// caller applies the mode-specific content guard
+/// ([`contains_logdensityof_call`] / [`contains_sample_call`]) to the result,
+/// so a designated-but-wrong or trailing non-query binding still refuses rather
+/// than mis-lowering. `kind` (`"logdensity"` / `"sample"`) appears only in the
+/// diagnostics.
+fn select_query<'m>(
+    m: &'m Module,
+    opts: &EmitOptions,
+    kind: &str,
+) -> Result<(BindingId, &'m Binding), EmitError> {
+    match &opts.query {
+        Some(name) => m
+            .public_bindings()
+            .find(|(_, b)| m.resolve(b.name) == name.as_str())
+            .ok_or_else(|| {
+                EmitError::whole(format!(
+                    "designated {kind} query binding `{name}` is not a public binding of \
+                     the determinized module"
+                ))
+            }),
+        None => m.public_bindings().last().ok_or_else(|| {
+            EmitError::whole(format!(
+                "module has no public binding to emit as the {kind} query"
+            ))
+        }),
+    }
 }
 
 /// Whether the subtree rooted at `id` (the node itself, or any descendant
@@ -153,15 +190,13 @@ fn contains_logdensityof_call(m: &Module, root: NodeId) -> bool {
 pub fn emit_sample(m: &Module, opts: &EmitOptions) -> Result<String, EmitError> {
     let mut e = Emitter::new(m, opts.dtype);
 
-    let query = m.public_bindings().last().ok_or_else(|| {
-        EmitError::whole("module has no public binding to emit as the sample query")
-    })?;
+    let query = select_query(m, opts, "sample")?;
     let query_rhs = query.1.rhs;
 
-    // Guard the "last public binding" convention (see the module doc
-    // comment): refuse rather than silently lower a trailing non-sample
-    // binding. Checked BEFORE `find_rng_source` so a non-sample query gets
-    // the precise "no sample term" refusal, not "no rng source".
+    // Guard the selected query (see the module doc comment): refuse rather than
+    // silently lower a binding with no sample term. Checked BEFORE
+    // `find_rng_source` so a non-sample query gets the precise "no sample term"
+    // refusal, not "no rng source".
     if !contains_sample_call(m, query_rhs) {
         return Err(EmitError::at(
             query_rhs,
