@@ -85,6 +85,17 @@ pub fn determinize_with_roots(
 ) -> Result<Module, RefuseError> {
     let mut work = m.clone();
 
+    // Cross-module alias resolution pre-pass (Buffy #359): resolve every top-level
+    // host binding whose RHS is a bare cross-module `(%ref <alias> member)` ref IN
+    // PLACE — graft the referenced submodule subtree into the host and rewrite the
+    // alias binding's RHS to the grafted-local root, deduplicated across the whole
+    // pass. This makes the host self-contained (no `RefNs::Module` ref among the
+    // resolved aliases) BEFORE the measure-reduction loop, so the loop and the
+    // density lowering (including the variate destructuring, which follows only
+    // `SelfMod` refs) run collision-free. A self-contained model has no such
+    // bindings, so this is a no-op there.
+    crate::crossmodule::resolve_crossmodule_aliases(&mut work, bundle)?;
+
     loop {
         // Re-run inference (idempotent) so type / phase tables are fresh.
         let _ = flatppl_infer::infer(&mut work);
