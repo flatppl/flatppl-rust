@@ -1419,6 +1419,37 @@ impl<'m> Emitter<'m> {
         self.mul(&e, &sqrt2)
     }
 
+    /// `%N = chlo.erf %a : ty -> ty` — the error function, a CHLO function-type
+    /// op like [`Emitter::erf_inv`]/[`Emitter::lgamma`] (parses + Enzyme-
+    /// executes; a golden using it must therefore carry the `chlo` dialect).
+    /// The Normal CDF's core (spec §07 `builtin_touniform`, see
+    /// [`crate::registry::normal_cdf`]).
+    pub(crate) fn erf(&mut self, a: &Value) -> Value {
+        let ssa = self.fresh();
+        let ty_text = a.ty.render(self.dtype, a.elem);
+        self.push(&format!(
+            "{ssa} = chlo.erf {} : {ty_text} -> {ty_text}",
+            a.ssa
+        ));
+        Value {
+            ssa,
+            ty: a.ty.clone(),
+            elem: ElemKind::Real,
+        }
+    }
+
+    /// `atan(a)` (the arctangent, `(-π/2, π/2)`), via the core StableHLO binary
+    /// `stablehlo.atan2(a, 1)` — `atan2(y, x)` is `atan(y/x)` in the correct
+    /// quadrant, so `atan2(a, 1) = atan(a)`. Preferred over a unary `chlo.atan`
+    /// because `stablehlo.atan2` is a core StableHLO op (guaranteed parse +
+    /// Enzyme-differentiable). The Cauchy CDF's core (spec §07
+    /// `builtin_touniform`, see [`crate::registry::cauchy_cdf`]); `atan(±inf) =
+    /// ±π/2` gives the correct `F(±inf) = {1, 0}` limits.
+    pub(crate) fn atan(&mut self, a: &Value) -> Value {
+        let one = self.constant(1.0, a.ty.clone());
+        self.binary("stablehlo.atan2", a, &one)
+    }
+
     /// `%N = chlo.erf_inv %a : ty -> ty` — the inverse error function (the
     /// probit's core), a CHLO function-type op like [`Emitter::lgamma`]. Pinned
     /// in the plan's Task-1 spike (parses + Enzyme-executes; a golden using it
@@ -2338,6 +2369,8 @@ impl<'m> Emitter<'m> {
                         crate::registry::lower_logdensityof(self, id, &call.args)
                     } else if name == "builtin_sample" {
                         crate::registry::lower_sample(self, id, &call.args)
+                    } else if name == "builtin_touniform" {
+                        crate::registry::lower_touniform(self, id, &call.args)
                     } else if name == "broadcast" {
                         self.lower_broadcast(id, &call.args)
                     } else if matches!(name.as_str(), "get0" | "get") {

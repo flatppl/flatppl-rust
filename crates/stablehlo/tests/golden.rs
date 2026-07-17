@@ -8170,3 +8170,166 @@ outputs = q1
         err.msg
     );
 }
+
+// ---- Buffy #327: `builtin_touniform` (univariate continuous CDF) ------------
+//
+// Spec §07 "Measure kernel evaluation primitives": for kernels of univariate
+// continuous measures, `builtin_touniform(kernel, kernel_input, x)` is the
+// cumulative distribution function `F`. The determiniser emits it as the
+// truncation normaliser `F(hi) - F(lo)` — e.g. a `normalize(truncate(Normal /
+// Cauchy, interval(0, inf)))` prior — so these anchor fixtures reach the CDF
+// builders through that route rather than a bare `builtin_touniform` call.
+// Only Normal (`chlo.erf`) and Cauchy (`stablehlo.atan2`) carry a CDF builder;
+// every other distribution refuses (refuse-don't-mislower). Numeric end-to-end
+// correctness against the scipy oracle lives in `flatppl-testsuite`'s
+// stablehlo/examples gates (ex_eight_schools uses the Cauchy CDF).
+
+const NORMAL_TRUNC_TOUNIFORM_SRC: &str = "\
+mu = elementof(reals)
+sigma = elementof(posreals)
+a = draw(normalize(truncate(Normal(mu = mu, sigma = sigma), interval(0, inf))))
+lp = logdensityof(lawof(record(a = a)), record(a = 0.5))
+";
+
+const CAUCHY_TRUNC_TOUNIFORM_SRC: &str = "\
+location = elementof(reals)
+scale = elementof(posreals)
+a = draw(normalize(truncate(Cauchy(location = location, scale = scale), interval(0, inf))))
+lp = logdensityof(lawof(record(a = a)), record(a = 0.5))
+";
+
+/// The Normal CDF `F(x) = ½·(1 + erf((x − μ)/(σ·√2)))` reaches the emitter via
+/// the truncation normaliser: `chlo.erf` must appear (exactly twice — `F(inf)`
+/// and `F(0)`), and no `stablehlo.atan2` (that is Cauchy's CDF, not Normal's).
+#[test]
+fn emit_touniform_normal_via_truncation_has_expected_structure() {
+    let d = determinize_src(NORMAL_TRUNC_TOUNIFORM_SRC);
+    assert!(
+        flatppl_determinizer::is_flatpdl(&d).is_ok(),
+        "determinized module must be FlatPDL-conformant (no residual measure node)"
+    );
+    let out = emit_logdensity(&d);
+    assert_eq!(
+        out.matches("chlo.erf ").count(),
+        2,
+        "Normal CDF must emit two chlo.erf (F(hi), F(lo)), in:\n{out}"
+    );
+    assert!(
+        !out.contains("stablehlo.atan2"),
+        "Normal CDF must not use atan2 (that is Cauchy's CDF), in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// The Cauchy CDF `F(x) = ½ + (1/π)·atan((x − x₀)/γ)` reaches the emitter via
+/// the truncation normaliser: `stablehlo.atan2` must appear (exactly twice —
+/// `F(inf)` and `F(0)`), and no `chlo.erf` (that is Normal's CDF).
+#[test]
+fn emit_touniform_cauchy_via_truncation_has_expected_structure() {
+    let d = determinize_src(CAUCHY_TRUNC_TOUNIFORM_SRC);
+    assert!(
+        flatppl_determinizer::is_flatpdl(&d).is_ok(),
+        "determinized module must be FlatPDL-conformant (no residual measure node)"
+    );
+    let out = emit_logdensity(&d);
+    assert_eq!(
+        out.matches("stablehlo.atan2").count(),
+        2,
+        "Cauchy CDF must emit two stablehlo.atan2 (F(hi), F(lo)), in:\n{out}"
+    );
+    assert!(
+        !out.contains("chlo.erf "),
+        "Cauchy CDF must not use chlo.erf (that is Normal's CDF), in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// Freeze the exact emitted text for the Normal-CDF truncation path.
+#[test]
+fn emit_touniform_normal_matches_frozen_golden() {
+    let d = determinize_src(NORMAL_TRUNC_TOUNIFORM_SRC);
+    let out = emit_logdensity(&d);
+    let golden = include_str!("goldens/normal_touniform_logdensity.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted @logdensity drifted from goldens/normal_touniform_logdensity.mlir"
+    );
+}
+
+/// Freeze the exact emitted text for the Cauchy-CDF truncation path.
+#[test]
+fn emit_touniform_cauchy_matches_frozen_golden() {
+    let d = determinize_src(CAUCHY_TRUNC_TOUNIFORM_SRC);
+    let out = emit_logdensity(&d);
+    let golden = include_str!("goldens/cauchy_touniform_logdensity.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted @logdensity drifted from goldens/cauchy_touniform_logdensity.mlir"
+    );
+}
+
+/// `builtin_touniform(Beta, ...)` — a registered distribution with NO CDF
+/// builder (spec §07: transport is defined only for continuous kernels whose
+/// canonical transport is specified; Beta's is not rendered here) — must
+/// refuse precisely, not guess a lowering.
+#[test]
+fn builtin_touniform_refuses_dist_without_cdf() {
+    let mut m = Module::new();
+    let ctor = const_node(&mut m, "Beta");
+    let alpha = real(&mut m, 2.0);
+    let beta = real(&mut m, 2.0);
+    let kernel_input = record_node(&mut m, &[("alpha", alpha), ("beta", beta)]);
+    let x = real(&mut m, 0.5);
+    let node = call(&mut m, "builtin_touniform", &[ctor, kernel_input, x]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    let err = e.lower_node(node).unwrap_err();
+    assert!(
+        err.msg
+            .contains("builtin_touniform (CDF) not defined for distribution 'Beta'"),
+        "unexpected message: {}",
+        err.msg
+    );
+    assert_eq!(err.node, Some(node));
+}
+
+/// `builtin_touniform(Bogus, ...)` — an unregistered constructor — refuses via
+/// the same `lookup` gate as `builtin_logdensityof`, before the CDF check.
+#[test]
+fn builtin_touniform_refuses_unregistered_ctor() {
+    let mut m = Module::new();
+    let ctor = const_node(&mut m, "Bogus");
+    let field_val = real(&mut m, 0.0);
+    let kernel_input = record_node(&mut m, &[("x0", field_val)]);
+    let x = real(&mut m, 1.0);
+    let node = call(&mut m, "builtin_touniform", &[ctor, kernel_input, x]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    let err = e.lower_node(node).unwrap_err();
+    assert!(
+        err.msg.contains("no lowering for distribution 'Bogus'"),
+        "unexpected message: {}",
+        err.msg
+    );
+}
+
+/// `builtin_touniform`'s kernel must be a bare `Const` distribution
+/// constructor — a `Ref` in that position refuses rather than being silently
+/// mis-resolved (mirrors `builtin_logdensityof`'s identical gate).
+#[test]
+fn builtin_touniform_refuses_non_const_kernel() {
+    let mut m = Module::new();
+    let kernel = local_ref(&mut m, "k");
+    let kernel_input = call(&mut m, "record", &[]);
+    let x = real(&mut m, 1.0);
+    let node = call(&mut m, "builtin_touniform", &[kernel, kernel_input, x]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    let err = e.lower_node(node).unwrap_err();
+    assert!(
+        err.msg.contains("bare distribution constructor"),
+        "unexpected message: {}",
+        err.msg
+    );
+    assert_eq!(err.node, Some(kernel));
+}
