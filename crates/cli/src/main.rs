@@ -604,31 +604,6 @@ fn determinize_cmd(input: &Path, output: Option<&Path>, keep: &[String]) -> Resu
 fn stablehlo_cmd(input: &Path, mode: &str, output: Option<&Path>) -> Result<(), Failure> {
     let (module, bundle) = load_and_infer(input)?;
 
-    // The query is the LAST public binding of the *surface* model (the
-    // "query last" convention). Read its identity here, before determinization:
-    // a `load_module` query that scores a foreign model's `posterior` gets that
-    // model's bindings grafted in during determinization, and its inert
-    // data/pinned-draw residue can sort AFTER the query — so its position is
-    // not stable, but its name is. Use the name as the DCE root (Buffy #263
-    // Pass 4-A) so bindings the query does not reach are pruned (required when
-    // a grafted forward-only draw would otherwise refuse to determinize), and
-    // hand the same name to the emitter (`EmitOptions::query`) so it emits the
-    // query binding rather than a positional guess.
-    let query_sym = module.public_bindings().last().map(|(_, b)| b.name);
-    let query_name = query_sym.map(|s| module.resolve(s).to_string());
-    let roots = query_sym.map(|s| [s]);
-
-    let lowered = flatppl_determinizer::determinize_with_roots(
-        &module,
-        &bundle,
-        roots.as_ref().map(|r| r.as_slice()),
-    )
-    .map_err(|e| {
-        Failure::Refuse(format!(
-            "determinize: refuse {} (node {:?}): {}",
-            e.construct, e.node, e.reason
-        ))
-    })?;
     let mode = match mode {
         "logdensity" => flatppl_stablehlo::Mode::LogDensity,
         "sample" => flatppl_stablehlo::Mode::Sample,
@@ -638,8 +613,96 @@ fn stablehlo_cmd(input: &Path, mode: &str, output: Option<&Path>) -> Result<(), 
             )));
         }
     };
+
+    // Recognize the `inputs`/`outputs` ABI (design doc
+    // `docs/superpowers/specs/2026-07-17-inputs-outputs-abi-design.md`) on the
+    // SURFACE module: if it declares either reserved binding, DCE roots on
+    // both present names (so the outputs' backward cone AND the declared
+    // inputs survive — an unused declared input is still a stable ABI arg,
+    // not pruned) and the emitter reads the ABI itself from the determinized
+    // module (`EmitOptions::query` is not needed in this path). Otherwise
+    // fall back to the legacy "last public binding is the query" convention,
+    // with a deprecation warning: the ABI is additive/opt-in during
+    // migration (design doc "Fallback + migration").
+    //
+    // The ABI is LogDensity-only in PR-1: `sample` mode never engages it (it
+    // ignores `inputs`/`outputs` at emission) and so always uses the legacy
+    // path — and does NOT emit the logdensity-migration deprecation warning.
+    let abi_syms: Vec<flatppl_core::Symbol> = if matches!(mode, flatppl_stablehlo::Mode::LogDensity)
+    {
+        ["inputs", "outputs"]
+            .iter()
+            .filter_map(|name| {
+                module
+                    .public_bindings()
+                    .find(|(_, b)| module.resolve(b.name) == *name)
+                    .map(|(_, b)| b.name)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let abi_present = !abi_syms.is_empty();
+    let (roots, query_name) = if abi_present {
+        (Some(abi_syms), None)
+    } else {
+        if matches!(mode, flatppl_stablehlo::Mode::LogDensity) {
+            eprintln!(
+                "warning: no inputs/outputs bindings; using the legacy last-public-binding \
+                 query — declare inputs/outputs for an explicit ABI"
+            );
+        }
+        // The query is the LAST public binding of the *surface* model (the
+        // "query last" convention). Read its identity here, before
+        // determinization: a `load_module` query that scores a foreign
+        // model's `posterior` gets that model's bindings grafted in during
+        // determinization, and its inert data/pinned-draw residue can sort
+        // AFTER the query — so its position is not stable, but its name is.
+        // Use the name as the DCE root (Buffy #263 Pass 4-A) so bindings the
+        // query does not reach are pruned (required when a grafted
+        // forward-only draw would otherwise refuse to determinize), and hand
+        // the same name to the emitter (`EmitOptions::query`) so it emits the
+        // query binding rather than a positional guess.
+        let query_sym = module.public_bindings().last().map(|(_, b)| b.name);
+        let query_name = query_sym.map(|s| module.resolve(s).to_string());
+        (query_sym.map(|s| vec![s]), query_name)
+    };
+
+    // Compile-time shape pins for `load_data` ABI inputs (design doc
+    // "load_data — shape, not values"): read each `load_data` binding named in
+    // `inputs` for its LENGTH only, so the emitter types it `tensor<N×f32>`
+    // rather than an unusable `tensor<?×f32>`. The values are NOT read here —
+    // they are the runtime argument, never baked. Only when the ABI is engaged
+    // (`abi_syms` non-empty, LogDensity); the legacy path bakes nothing new.
+    let input_shapes = if !abi_present {
+        std::collections::HashMap::new()
+    } else {
+        let input_names = abi_input_names(&module);
+        let in_loc = Location::Local(input.to_path_buf());
+        let resolver = CliResolver::cache_only();
+        let mut shapes: std::collections::HashMap<String, Vec<u64>> =
+            std::collections::HashMap::new();
+        for (name, loc) in flatppl_cli::resolve::load_data_bindings_of(&module, &in_loc) {
+            if input_names.iter().any(|n| n == &name) {
+                let path = resolver.resolve_path(&loc)?;
+                let n = load_data_vector_len(&path)?;
+                shapes.insert(name, vec![n as u64]);
+            }
+        }
+        shapes
+    };
+
+    let lowered = flatppl_determinizer::determinize_with_roots(&module, &bundle, roots.as_deref())
+        .map_err(|e| {
+            Failure::Refuse(format!(
+                "determinize: refuse {} (node {:?}): {}",
+                e.construct, e.node, e.reason
+            ))
+        })?;
     let opts = flatppl_stablehlo::EmitOptions {
         query: query_name,
+        input_shapes,
         ..Default::default()
     };
     let rendered = flatppl_stablehlo::emit(&lowered, mode, &opts)
@@ -650,4 +713,85 @@ fn stablehlo_cmd(input: &Path, mode: &str, output: Option<&Path>) -> Result<(), 
         None => print!("{rendered}"),
     }
     Ok(())
+}
+
+/// The binding names listed in a surface model's reserved `inputs` binding, in
+/// declared order — the elements of an `inputs = (a, b, …)` tuple (or a single
+/// `inputs = a`) resolved through `(%ref self x)` to their names. Used by
+/// [`stablehlo_cmd`] to decide which `load_data` bindings need a compile-time
+/// shape pin (a `load_data` NOT in `inputs` is not an ABI argument). A
+/// non-`ref` element is skipped (the StableHLO emitter's own `read_abi` applies
+/// the authoritative checks).
+#[cfg(feature = "stablehlo")]
+fn abi_input_names(module: &flatppl_core::Module) -> Vec<String> {
+    use flatppl_core::{CallHead, Node, Ref, RefNs};
+    let Some((_, b)) = module
+        .public_bindings()
+        .find(|(_, b)| module.resolve(b.name) == "inputs")
+    else {
+        return Vec::new();
+    };
+    let elems: Vec<flatppl_core::NodeId> = match module.node(b.rhs) {
+        Node::Call(c) if matches!(c.head, CallHead::Builtin(s) if module.resolve(s) == "tuple") => {
+            c.args.to_vec()
+        }
+        _ => vec![b.rhs],
+    };
+    elems
+        .iter()
+        .filter_map(|&e| match module.node(e) {
+            Node::Ref(Ref {
+                ns: RefNs::SelfMod,
+                name,
+            }) => Some(module.resolve(*name).to_string()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The element count of a 1-D `load_data` vector (spec §07), read from the
+/// resolved delimited file (CSV/WSV) — used ONLY for the compile-time shape pin
+/// of a `load_data` ABI input (`tensor<N×f32>`); the values themselves are
+/// never read here (they are the runtime argument, never baked). Mirrors the
+/// reference engine's delimited single-column rule (`flatppl-js`
+/// `dataload.ts`): skip blank and `#`-comment lines, treat the first remaining
+/// row as the column header, and count the remaining data rows.
+#[cfg(feature = "stablehlo")]
+fn load_data_vector_len(path: &Path) -> Result<usize, Failure> {
+    // Dispatch by extension, mirroring the reference engine (`flatppl-js`
+    // `dataload.ts`): only the delimited TEXT formats (`.csv` comma-separated,
+    // `.wsv` whitespace-separated) are supported for the compile-time shape pin.
+    // Any other format (`.json`, Arrow IPC, or no/unknown extension) is REFUSED
+    // rather than blindly line-counted — a blind count would silently mis-shape
+    // the emitted `tensor<N×f32>` argument (refuse, don't mis-lower). Pinning a
+    // `.json`/Arrow length is a follow-up.
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    if !matches!(ext.as_deref(), Some("csv") | Some("wsv")) {
+        return Err(Failure::Refuse(format!(
+            "load_data shape pin: unsupported format {} for `{}` — a `load_data` ABI input's \
+             shape can be pinned only from `.csv` / `.wsv` (matching the reference engine; \
+             `.json` / Arrow IPC not yet supported)",
+            ext.map(|e| format!("`.{e}`"))
+                .unwrap_or_else(|| "(no extension)".into()),
+            path.display()
+        )));
+    }
+    let text = fs::read_to_string(path).map_err(|e| {
+        Failure::Plain(format!(
+            "reading load_data source `{}` for its shape: {e}",
+            path.display()
+        ))
+    })?;
+    let data_rows = text
+        .lines()
+        .filter(|l| {
+            let t = l.trim();
+            !t.is_empty() && !t.starts_with('#')
+        })
+        .count();
+    // Drop the header row (present when there is at least one line).
+    Ok(data_rows.saturating_sub(1))
 }

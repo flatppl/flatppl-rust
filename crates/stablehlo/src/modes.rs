@@ -73,7 +73,9 @@
 
 use std::collections::HashSet;
 
-use flatppl_core::{Binding, BindingId, CallHead, Module, Node, NodeId, Phase, Ref, RefNs, Scalar};
+use flatppl_core::{
+    Binding, BindingId, CallHead, Module, Node, NodeId, Phase, Ref, RefNs, Scalar, Symbol,
+};
 
 use crate::EmitOptions;
 use crate::emitter::Emitter;
@@ -126,6 +128,201 @@ pub fn emit_logdensity(m: &Module, opts: &EmitOptions) -> Result<String, EmitErr
 
     let result = e.lower_node(query_rhs)?;
     Ok(e.finish("logdensity", &args, &[&result]))
+}
+
+/// The compilation ABI declared by the reserved `inputs = …` / `outputs = …`
+/// top-level bindings (design doc
+/// `docs/superpowers/specs/2026-07-17-inputs-outputs-abi-design.md`): an
+/// explicit, ordered argument/result list for the emitted `func.func`,
+/// superseding [`is_free_param`]'s source-order convention and
+/// [`select_query`]'s last-public-binding convention. `inputs` are resolved
+/// to the referenced binding's [`Symbol`] (in declared order, PR-1 scope:
+/// each must be an `elementof` parameter — see [`emit_logdensity_abi`]);
+/// `outputs` are the declared query [`NodeId`]s (in declared order — already
+/// reduced to deterministic density expressions by determinization, per the
+/// module doc comment's "Finding the query").
+pub(crate) struct Abi {
+    pub inputs: Vec<Symbol>,
+    pub outputs: Vec<NodeId>,
+}
+
+/// Read the `inputs`/`outputs` ABI off `m`, if declared. Returns `None` when
+/// NEITHER reserved binding is present — the caller then falls back to the
+/// legacy last-public-binding/source-order conventions. `inputs`/`outputs`
+/// survive determinization (they are the DCE roots, design doc "Dead-code
+/// elimination"), so this reads them straight off the determinized module by
+/// binding name; no new IR field is needed.
+///
+/// Each reserved binding's RHS is a single value or a `tuple(...)` call (the
+/// surface `(v1, v2, …)` sugar) — [`tuple_elems`] normalizes both to a
+/// `Vec<NodeId>` in source order. `inputs` elements are further resolved
+/// through `(%ref self x)` to the referenced binding's [`Symbol`]; a
+/// non-ref element (a malformed `inputs` entry) is dropped rather than
+/// guessed at — [`emit_logdensity_abi`]'s exhaustiveness check (every
+/// `elementof` binding must appear in `inputs`) then refuses rather than
+/// silently mis-binding an argument.
+pub(crate) fn read_abi(m: &Module) -> Option<Abi> {
+    let inputs_binding = m.bindings().find(|(_, b)| m.resolve(b.name) == "inputs");
+    let outputs_binding = m.bindings().find(|(_, b)| m.resolve(b.name) == "outputs");
+    if inputs_binding.is_none() && outputs_binding.is_none() {
+        return None;
+    }
+    let inputs = inputs_binding
+        .map(|(_, b)| tuple_elems(m, b.rhs))
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|elem| match m.node(elem) {
+            Node::Ref(Ref {
+                ns: RefNs::SelfMod,
+                name,
+            }) => Some(*name),
+            _ => None,
+        })
+        .collect();
+    let outputs = outputs_binding
+        .map(|(_, b)| tuple_elems(m, b.rhs))
+        .unwrap_or_default();
+    Some(Abi { inputs, outputs })
+}
+
+/// Normalize a reserved `inputs`/`outputs` binding's RHS — a single value, or
+/// a `tuple(...)` call (the surface `(v1, v2, …)` sugar, see
+/// [`crate::modes`]'s design-doc reference) — to its element [`NodeId`]s in
+/// declared order.
+fn tuple_elems(m: &Module, rhs: NodeId) -> Vec<NodeId> {
+    if is_builtin_call(m, rhs, "tuple") {
+        if let Node::Call(c) = m.node(rhs) {
+            return c.args.to_vec();
+        }
+    }
+    vec![rhs]
+}
+
+/// Emit `@logdensity` for a determinized module `m` that declares the
+/// `inputs`/`outputs` ABI (see [`Abi`]/[`read_abi`]) — the PR-1 elementof-only,
+/// `LogDensity`-mode ABI path. Supersedes [`emit_logdensity`]'s free-param
+/// source-order loop and last-public-binding query convention: arguments are
+/// built from `abi.inputs` in declared order and results from `abi.outputs`
+/// in declared order (multi-result via [`Emitter::finish`], already
+/// multi-result for [`emit_sample`]'s two rets).
+///
+/// Scope (PR-2): an ABI input is either an `elementof` parameter or a
+/// fixed-phase input construct — `external(S)` (a scalar/shaped runtime arg
+/// typed from `S`) or `load_data(...)` (a `tensor<N×f32>` whose length `N` is
+/// pinned from a compile-time file read, threaded via
+/// [`EmitOptions::input_shapes`]; values are never baked). Any other binding
+/// named in `inputs` (a literal, a computed value) refuses. `inputs` is
+/// authoritative and exhaustive for `elementof`: every `elementof` binding in
+/// `m` must appear in `abi.inputs`, else this refuses naming the missing
+/// parameter. A fixed-phase binding (`external`/`load_data`) that an output
+/// reaches but that is NOT listed in `inputs` also refuses, pointing at the
+/// ABI — data is passed as a runtime argument, never baked (design doc
+/// phase→ABI table).
+pub(crate) fn emit_logdensity_abi(
+    m: &Module,
+    abi: &Abi,
+    opts: &EmitOptions,
+) -> Result<String, EmitError> {
+    let mut e = Emitter::new(m, opts.dtype);
+
+    // Exhaustiveness: every `elementof` parameter in the module must be
+    // listed in `inputs` (design doc: "inputs ... is authoritative and
+    // exhaustive"). Checked before building any args — a missing parameter
+    // is a malformed ABI, refuse rather than emit a partial signature.
+    for (_, binding) in m.bindings() {
+        if is_free_param(m, binding.rhs) && !abi.inputs.contains(&binding.name) {
+            return Err(EmitError::at(
+                binding.rhs,
+                format!(
+                    "elementof parameter `{}` is not listed in `inputs`; the inputs \
+                     ABI is exhaustive — every elementof parameter must appear in `inputs`",
+                    m.resolve(binding.name)
+                ),
+            ));
+        }
+    }
+
+    // A fixed-phase input construct (`external`/`load_data`) that survived
+    // root-DCE (i.e. an output reaches it) but is NOT declared in `inputs`
+    // refuses, pointing at the ABI: fixed data becomes a runtime argument only
+    // by being listed in `inputs`; its values are never baked (design doc
+    // phase→ABI table + "load_data — shape, not values"). A fixed binding no
+    // output reaches was already pruned by DCE, so it never gets here — the
+    // refusal fires exactly when the value would actually be needed.
+    for (_, binding) in m.bindings() {
+        if is_fixed_input(m, binding.rhs) && !abi.inputs.contains(&binding.name) {
+            return Err(EmitError::at(
+                binding.rhs,
+                format!(
+                    "fixed-phase binding `{}` is reached by an output but is not listed in \
+                     `inputs`; list it in inputs to pass it as a runtime argument (its shape \
+                     is pinned at compile time; its values are never baked)",
+                    m.resolve(binding.name)
+                ),
+            ));
+        }
+    }
+
+    if abi.outputs.is_empty() {
+        return Err(EmitError::whole(
+            "`outputs` ABI binding is missing or empty; at least one output is required",
+        ));
+    }
+
+    let mut args: Vec<(String, MlirTy)> = Vec::with_capacity(abi.inputs.len());
+    for &sym in &abi.inputs {
+        let bid = m.binding_by_name(sym).ok_or_else(|| {
+            EmitError::whole(format!(
+                "`inputs` names `{}`, which is not a binding of the determinized module",
+                m.resolve(sym)
+            ))
+        })?;
+        let binding = m.binding(bid);
+        // Accept `elementof` (parameterized) and the fixed-phase input
+        // constructs `external`/`load_data`; anything else (a literal, a
+        // computed value) cannot be an ABI argument and refuses. The message
+        // keeps "not an elementof parameter" for the literal/computed case.
+        if !is_free_param(m, binding.rhs) && !is_fixed_input(m, binding.rhs) {
+            return Err(EmitError::at(
+                binding.rhs,
+                format!(
+                    "`inputs` entry `{}` is not an elementof parameter, external, or \
+                     load_data input — only these constructs can be ABI arguments",
+                    m.resolve(sym)
+                ),
+            ));
+        }
+        let name = format!("%arg{}", args.len());
+        let (mut ty, elem) = mlir_type_of(m, binding.rhs, opts.dtype)?;
+        // Shape-pin a fixed-phase input whose FlatPDL type carries a dynamic
+        // dim (`load_data` → `tensor<?×f32>`) from the compile-time length map
+        // (design doc "load_data — shape, not values"): `tensor<N×f32>`. A `?`
+        // dim would be unusable downstream. `elementof`/statically-shaped
+        // inputs need no pin and keep their inferred type.
+        if let Some(shape) = opts.input_shapes.get(m.resolve(sym)) {
+            ty = MlirTy::Ranked(shape.iter().map(|&n| Some(n)).collect());
+        }
+        // Use the inferred element kind (not a hardcoded `Real`): an integer /
+        // boolean `elementof` (or int `load_data`) input must arrive as an
+        // int/bool tensor arg so the value-path widening reconciles correctly.
+        // For a real input this is `ElemKind::Real` — byte-identical to before.
+        e.bind(
+            binding.rhs,
+            Value {
+                ssa: name.clone(),
+                ty: ty.clone(),
+                elem,
+            },
+        );
+        args.push((name, ty));
+    }
+
+    let mut rets_vals: Vec<Value> = Vec::with_capacity(abi.outputs.len());
+    for &node in &abi.outputs {
+        rets_vals.push(e.lower_node(node)?);
+    }
+    let rets: Vec<&Value> = rets_vals.iter().collect();
+    Ok(e.finish("logdensity", &args, &rets))
 }
 
 /// Select the public binding to emit as the query. When `opts.query` names a
@@ -450,6 +647,18 @@ fn contains_sample_call(m: &Module, root: NodeId) -> bool {
 /// taint over the whole dependent subtree, not a parameter-leaf marker.
 fn is_free_param(m: &Module, rhs: NodeId) -> bool {
     m.phase_of(rhs) == Some(Phase::Parameterized) && is_builtin_call(m, rhs, "elementof")
+}
+
+/// A fixed-phase input construct: structurally a bare `external(...)` or
+/// `load_data(...)` call (spec §04 "fixed" phase — set at initialization,
+/// immutable after). Listed in `inputs`, such a binding becomes a runtime
+/// argument (the values are NOT baked; `load_data`'s shape is pinned from a
+/// compile-time file read — design doc "load_data — shape, not values"); NOT
+/// listed, [`emit_logdensity_abi`] refuses. A purely structural check (like
+/// [`is_free_param`]'s `elementof` test) — the phase taint is not needed to
+/// distinguish these declarations.
+fn is_fixed_input(m: &Module, rhs: NodeId) -> bool {
+    is_builtin_call(m, rhs, "external") || is_builtin_call(m, rhs, "load_data")
 }
 
 /// Whether `id` is (structurally) a `Call` whose head is the builtin named
