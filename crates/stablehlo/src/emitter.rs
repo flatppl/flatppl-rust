@@ -369,6 +369,70 @@ impl<'m> Emitter<'m> {
         self.binary_real("stablehlo.power", a, b)
     }
 
+    /// `%N = stablehlo.divide %a, %b : ty` — the raw, KIND-POLYMORPHIC divide
+    /// [`Emitter::binary`] wraps, unlike [`Emitter::div`]'s `binary_real`
+    /// (which unconditionally forces both operands to `Real`). [`Emitter::
+    /// floor_div`]'s correction algorithm needs StableHLO's native INTEGER
+    /// `divide` — truncating toward zero — so it must stay off `div`'s
+    /// real-forcing path entirely; every caller here already has both
+    /// operands `Int` (spec §07 `div`'s domain, from inference), so
+    /// `binary`'s kind-polymorphic widening is a no-op and this simply emits
+    /// the same op text at `Int`.
+    fn trunc_div(&mut self, a: &Value, b: &Value) -> Value {
+        self.binary("stablehlo.divide", a, b)
+    }
+
+    /// `%N = stablehlo.remainder %a, %b : ty` — StableHLO's native truncated
+    /// remainder (sign of the dividend `a`), kind-polymorphic via
+    /// [`Emitter::binary`] like [`Emitter::trunc_div`]. Used by [`Emitter::
+    /// floor_mod`]'s correction algorithm; unlike `div`, `mod` has no
+    /// real-only counterpart to stay off — nothing else in this emitter
+    /// needs a real remainder.
+    fn rem(&mut self, a: &Value, b: &Value) -> Value {
+        self.binary("stablehlo.remainder", a, b)
+    }
+
+    /// `div(a, b) = ⌊a/b⌋` (spec §07 integer floor division, `Int` operands,
+    /// `b ≠ 0`). StableHLO's integer `divide` ([`Emitter::trunc_div`])
+    /// truncates TOWARD ZERO, not down, so the two disagree exactly when the
+    /// truncated remainder `r = a - q_t*b` is nonzero AND its sign differs
+    /// from the divisor's — the one case corrected here by stepping the
+    /// truncated quotient down by one. `signs_differ` is a boolean XOR,
+    /// computed as `r_neg != b_neg` via [`Emitter::compare`]'s `"NE"`
+    /// direction (valid for `i1` operands, unlike an ordering compare).
+    pub fn floor_div(&mut self, a: &Value, b: &Value) -> Value {
+        let q_t = self.trunc_div(a, b);
+        let prod = self.mul(&q_t, b);
+        let r = self.sub(a, &prod);
+        let zero = self.int_value_const(0);
+        let r_nz = self.compare("NE", &r, &zero);
+        let r_neg = self.compare("LT", &r, &zero);
+        let b_neg = self.compare("LT", b, &zero);
+        let signs_differ = self.compare("NE", &r_neg, &b_neg);
+        let need_fix = self.and(&r_nz, &signs_differ);
+        let one = self.int_value_const(1);
+        let q_minus1 = self.sub(&q_t, &one);
+        self.select(&need_fix, &q_minus1, &q_t)
+    }
+
+    /// `mod(a, b) = a − b·⌊a/b⌋` (spec §07 floored modulo, `Int` operands,
+    /// `b ≠ 0`; the result takes the DIVISOR's sign — Python `%`, not C `%`).
+    /// Same sign-correction shape as [`Emitter::floor_div`], applied to
+    /// StableHLO's truncated `remainder` ([`Emitter::rem`], sign of the
+    /// dividend `a`) instead: nonzero and sign-disagreeing with `b` means the
+    /// floored remainder is `r_t + b`.
+    pub fn floor_mod(&mut self, a: &Value, b: &Value) -> Value {
+        let r_t = self.rem(a, b);
+        let zero = self.int_value_const(0);
+        let r_nz = self.compare("NE", &r_t, &zero);
+        let r_neg = self.compare("LT", &r_t, &zero);
+        let b_neg = self.compare("LT", b, &zero);
+        let signs_differ = self.compare("NE", &r_neg, &b_neg);
+        let need_fix = self.and(&r_nz, &signs_differ);
+        let r_plus_b = self.add(&r_t, b);
+        self.select(&need_fix, &r_plus_b, &r_t)
+    }
+
     pub fn neg(&mut self, a: &Value) -> Value {
         self.unary("stablehlo.negate", a)
     }
@@ -456,8 +520,19 @@ impl<'m> Emitter<'m> {
         let lhs_ty = a.ty.render(self.dtype, a.elem);
         let rhs_ty = b.ty.render(self.dtype, b.elem);
         let result_ty = render_i1(&a.ty);
+        // StableHLO requires an explicit `compare_type` only to disambiguate
+        // integer signedness (a `Bool` operand must NOT carry one; a `Real`
+        // operand pair is left to its FLOAT default) — this emitter's `Int`
+        // values are always signed (`i32`/`i64`), so a reconciled `Int` pair
+        // appends `SIGNED` (matching `Emitter::int_compare`'s raw form); a
+        // `Real`/`Bool` pair emits exactly as before, byte-identical.
+        let compare_type = if a.elem == ElemKind::Int {
+            ", SIGNED"
+        } else {
+            ""
+        };
         self.push(&format!(
-            "{ssa} = stablehlo.compare {dir}, {}, {} : ({lhs_ty}, {rhs_ty}) -> {result_ty}",
+            "{ssa} = stablehlo.compare {dir}, {}, {}{compare_type} : ({lhs_ty}, {rhs_ty}) -> {result_ty}",
             a.ssa, b.ssa
         ));
         Value {
