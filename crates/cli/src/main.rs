@@ -604,31 +604,56 @@ fn determinize_cmd(input: &Path, output: Option<&Path>, keep: &[String]) -> Resu
 fn stablehlo_cmd(input: &Path, mode: &str, output: Option<&Path>) -> Result<(), Failure> {
     let (module, bundle) = load_and_infer(input)?;
 
-    // The query is the LAST public binding of the *surface* model (the
-    // "query last" convention). Read its identity here, before determinization:
-    // a `load_module` query that scores a foreign model's `posterior` gets that
-    // model's bindings grafted in during determinization, and its inert
-    // data/pinned-draw residue can sort AFTER the query — so its position is
-    // not stable, but its name is. Use the name as the DCE root (Buffy #263
-    // Pass 4-A) so bindings the query does not reach are pruned (required when
-    // a grafted forward-only draw would otherwise refuse to determinize), and
-    // hand the same name to the emitter (`EmitOptions::query`) so it emits the
-    // query binding rather than a positional guess.
-    let query_sym = module.public_bindings().last().map(|(_, b)| b.name);
-    let query_name = query_sym.map(|s| module.resolve(s).to_string());
-    let roots = query_sym.map(|s| [s]);
+    // Recognize the `inputs`/`outputs` ABI (design doc
+    // `docs/superpowers/specs/2026-07-17-inputs-outputs-abi-design.md`) on the
+    // SURFACE module: if it declares either reserved binding, DCE roots on
+    // both present names (so the outputs' backward cone AND the declared
+    // inputs survive — an unused declared input is still a stable ABI arg,
+    // not pruned) and the emitter reads the ABI itself from the determinized
+    // module (`EmitOptions::query` is not needed in this path). Otherwise
+    // fall back to the legacy "last public binding is the query" convention,
+    // with a deprecation warning: the ABI is additive/opt-in during
+    // migration (design doc "Fallback + migration").
+    let abi_syms: Vec<flatppl_core::Symbol> = ["inputs", "outputs"]
+        .iter()
+        .filter_map(|name| {
+            module
+                .public_bindings()
+                .find(|(_, b)| module.resolve(b.name) == *name)
+                .map(|(_, b)| b.name)
+        })
+        .collect();
 
-    let lowered = flatppl_determinizer::determinize_with_roots(
-        &module,
-        &bundle,
-        roots.as_ref().map(|r| r.as_slice()),
-    )
-    .map_err(|e| {
-        Failure::Refuse(format!(
-            "determinize: refuse {} (node {:?}): {}",
-            e.construct, e.node, e.reason
-        ))
-    })?;
+    let (roots, query_name) = if !abi_syms.is_empty() {
+        (Some(abi_syms), None)
+    } else {
+        eprintln!(
+            "warning: no inputs/outputs bindings; using the legacy last-public-binding \
+             query — declare inputs/outputs for an explicit ABI"
+        );
+        // The query is the LAST public binding of the *surface* model (the
+        // "query last" convention). Read its identity here, before
+        // determinization: a `load_module` query that scores a foreign
+        // model's `posterior` gets that model's bindings grafted in during
+        // determinization, and its inert data/pinned-draw residue can sort
+        // AFTER the query — so its position is not stable, but its name is.
+        // Use the name as the DCE root (Buffy #263 Pass 4-A) so bindings the
+        // query does not reach are pruned (required when a grafted
+        // forward-only draw would otherwise refuse to determinize), and hand
+        // the same name to the emitter (`EmitOptions::query`) so it emits the
+        // query binding rather than a positional guess.
+        let query_sym = module.public_bindings().last().map(|(_, b)| b.name);
+        let query_name = query_sym.map(|s| module.resolve(s).to_string());
+        (query_sym.map(|s| vec![s]), query_name)
+    };
+
+    let lowered = flatppl_determinizer::determinize_with_roots(&module, &bundle, roots.as_deref())
+        .map_err(|e| {
+            Failure::Refuse(format!(
+                "determinize: refuse {} (node {:?}): {}",
+                e.construct, e.node, e.reason
+            ))
+        })?;
     let mode = match mode {
         "logdensity" => flatppl_stablehlo::Mode::LogDensity,
         "sample" => flatppl_stablehlo::Mode::Sample,

@@ -73,7 +73,9 @@
 
 use std::collections::HashSet;
 
-use flatppl_core::{Binding, BindingId, CallHead, Module, Node, NodeId, Phase, Ref, RefNs, Scalar};
+use flatppl_core::{
+    Binding, BindingId, CallHead, Module, Node, NodeId, Phase, Ref, RefNs, Scalar, Symbol,
+};
 
 use crate::EmitOptions;
 use crate::emitter::Emitter;
@@ -126,6 +128,157 @@ pub fn emit_logdensity(m: &Module, opts: &EmitOptions) -> Result<String, EmitErr
 
     let result = e.lower_node(query_rhs)?;
     Ok(e.finish("logdensity", &args, &[&result]))
+}
+
+/// The compilation ABI declared by the reserved `inputs = …` / `outputs = …`
+/// top-level bindings (design doc
+/// `docs/superpowers/specs/2026-07-17-inputs-outputs-abi-design.md`): an
+/// explicit, ordered argument/result list for the emitted `func.func`,
+/// superseding [`is_free_param`]'s source-order convention and
+/// [`select_query`]'s last-public-binding convention. `inputs` are resolved
+/// to the referenced binding's [`Symbol`] (in declared order, PR-1 scope:
+/// each must be an `elementof` parameter — see [`emit_logdensity_abi`]);
+/// `outputs` are the declared query [`NodeId`]s (in declared order — already
+/// reduced to deterministic density expressions by determinization, per the
+/// module doc comment's "Finding the query").
+pub(crate) struct Abi {
+    pub inputs: Vec<Symbol>,
+    pub outputs: Vec<NodeId>,
+}
+
+/// Read the `inputs`/`outputs` ABI off `m`, if declared. Returns `None` when
+/// NEITHER reserved binding is present — the caller then falls back to the
+/// legacy last-public-binding/source-order conventions. `inputs`/`outputs`
+/// survive determinization (they are the DCE roots, design doc "Dead-code
+/// elimination"), so this reads them straight off the determinized module by
+/// binding name; no new IR field is needed.
+///
+/// Each reserved binding's RHS is a single value or a `tuple(...)` call (the
+/// surface `(v1, v2, …)` sugar) — [`tuple_elems`] normalizes both to a
+/// `Vec<NodeId>` in source order. `inputs` elements are further resolved
+/// through `(%ref self x)` to the referenced binding's [`Symbol`]; a
+/// non-ref element (a malformed `inputs` entry) is dropped rather than
+/// guessed at — [`emit_logdensity_abi`]'s exhaustiveness check (every
+/// `elementof` binding must appear in `inputs`) then refuses rather than
+/// silently mis-binding an argument.
+pub(crate) fn read_abi(m: &Module) -> Option<Abi> {
+    let inputs_binding = m.bindings().find(|(_, b)| m.resolve(b.name) == "inputs");
+    let outputs_binding = m.bindings().find(|(_, b)| m.resolve(b.name) == "outputs");
+    if inputs_binding.is_none() && outputs_binding.is_none() {
+        return None;
+    }
+    let inputs = inputs_binding
+        .map(|(_, b)| tuple_elems(m, b.rhs))
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|elem| match m.node(elem) {
+            Node::Ref(Ref {
+                ns: RefNs::SelfMod,
+                name,
+            }) => Some(*name),
+            _ => None,
+        })
+        .collect();
+    let outputs = outputs_binding
+        .map(|(_, b)| tuple_elems(m, b.rhs))
+        .unwrap_or_default();
+    Some(Abi { inputs, outputs })
+}
+
+/// Normalize a reserved `inputs`/`outputs` binding's RHS — a single value, or
+/// a `tuple(...)` call (the surface `(v1, v2, …)` sugar, see
+/// [`crate::modes`]'s design-doc reference) — to its element [`NodeId`]s in
+/// declared order.
+fn tuple_elems(m: &Module, rhs: NodeId) -> Vec<NodeId> {
+    if is_builtin_call(m, rhs, "tuple") {
+        if let Node::Call(c) = m.node(rhs) {
+            return c.args.to_vec();
+        }
+    }
+    vec![rhs]
+}
+
+/// Emit `@logdensity` for a determinized module `m` that declares the
+/// `inputs`/`outputs` ABI (see [`Abi`]/[`read_abi`]) — the PR-1 elementof-only,
+/// `LogDensity`-mode ABI path. Supersedes [`emit_logdensity`]'s free-param
+/// source-order loop and last-public-binding query convention: arguments are
+/// built from `abi.inputs` in declared order and results from `abi.outputs`
+/// in declared order (multi-result via [`Emitter::finish`], already
+/// multi-result for [`emit_sample`]'s two rets).
+///
+/// Scope (PR-1): every ABI input must be an `elementof` parameter — a fixed-
+/// phase input (`external`/`load_data`) refuses (PR-2 work, not implemented
+/// here). `inputs` is authoritative and exhaustive: every `elementof`
+/// binding in `m` must appear in `abi.inputs`, else this refuses naming the
+/// missing parameter, rather than silently leaving it unbound.
+pub(crate) fn emit_logdensity_abi(
+    m: &Module,
+    abi: &Abi,
+    opts: &EmitOptions,
+) -> Result<String, EmitError> {
+    let mut e = Emitter::new(m, opts.dtype);
+
+    // Exhaustiveness: every `elementof` parameter in the module must be
+    // listed in `inputs` (design doc: "inputs ... is authoritative and
+    // exhaustive"). Checked before building any args — a missing parameter
+    // is a malformed ABI, refuse rather than emit a partial signature.
+    for (_, binding) in m.bindings() {
+        if is_free_param(m, binding.rhs) && !abi.inputs.contains(&binding.name) {
+            return Err(EmitError::at(
+                binding.rhs,
+                format!(
+                    "elementof parameter `{}` is not listed in `inputs`; the inputs \
+                     ABI is exhaustive — every elementof parameter must appear in `inputs`",
+                    m.resolve(binding.name)
+                ),
+            ));
+        }
+    }
+
+    if abi.outputs.is_empty() {
+        return Err(EmitError::whole(
+            "`outputs` ABI binding is missing or empty; at least one output is required",
+        ));
+    }
+
+    let mut args: Vec<(String, MlirTy)> = Vec::with_capacity(abi.inputs.len());
+    for &sym in &abi.inputs {
+        let bid = m.binding_by_name(sym).ok_or_else(|| {
+            EmitError::whole(format!(
+                "`inputs` names `{}`, which is not a binding of the determinized module",
+                m.resolve(sym)
+            ))
+        })?;
+        let binding = m.binding(bid);
+        if !is_free_param(m, binding.rhs) {
+            return Err(EmitError::at(
+                binding.rhs,
+                format!(
+                    "`inputs` entry `{}` is not an elementof parameter — external/load_data \
+                     ABI inputs are not yet supported (PR-2 work)",
+                    m.resolve(sym)
+                ),
+            ));
+        }
+        let name = format!("%arg{}", args.len());
+        let (ty, _elem) = mlir_type_of(m, binding.rhs, opts.dtype)?;
+        e.bind(
+            binding.rhs,
+            Value {
+                ssa: name.clone(),
+                ty: ty.clone(),
+                elem: ElemKind::Real,
+            },
+        );
+        args.push((name, ty));
+    }
+
+    let mut rets_vals: Vec<Value> = Vec::with_capacity(abi.outputs.len());
+    for &node in &abi.outputs {
+        rets_vals.push(e.lower_node(node)?);
+    }
+    let rets: Vec<&Value> = rets_vals.iter().collect();
+    Ok(e.finish("logdensity", &args, &rets))
 }
 
 /// Select the public binding to emit as the query. When `opts.query` names a

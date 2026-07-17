@@ -79,13 +79,23 @@ impl Default for EmitOptions {
 /// (i.e. the output of `flatppl_determinizer::determinize`). Refuses (never
 /// mis-lowers) if `m` still carries measure-layer constructs.
 ///
-/// Routes to the mode builder for `mode`: [`Mode::LogDensity`] →
-/// [`modes::emit_logdensity`], [`Mode::Sample`] → [`modes::emit_sample`].
+/// Routes to the mode builder for `mode`: [`Mode::LogDensity`] → the
+/// `inputs`/`outputs` ABI path ([`modes::emit_logdensity_abi`], PR-1) when
+/// `m` declares the ABI ([`modes::read_abi`] is `Some`), else the legacy
+/// last-public-binding/source-order path ([`modes::emit_logdensity`]);
+/// [`Mode::Sample`] → [`modes::emit_sample`] (the ABI is PR-1
+/// `LogDensity`-mode-only — a `Sample`-mode module carrying `inputs`/
+/// `outputs` is not specially routed and falls through to the existing
+/// query-finding convention, which refuses if that convention's guard is not
+/// met rather than mis-lowering).
 pub fn emit(m: &Module, mode: Mode, opts: &EmitOptions) -> Result<String, EmitError> {
     flatppl_determinizer::is_flatpdl(m)
         .map_err(|_| EmitError::whole("input is not FlatPDL (determinize first)"))?;
     match mode {
-        Mode::LogDensity => modes::emit_logdensity(m, opts),
+        Mode::LogDensity => match modes::read_abi(m) {
+            Some(abi) => modes::emit_logdensity_abi(m, &abi, opts),
+            None => modes::emit_logdensity(m, opts),
+        },
         Mode::Sample => modes::emit_sample(m, opts),
     }
 }

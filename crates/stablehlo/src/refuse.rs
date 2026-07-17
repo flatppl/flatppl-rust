@@ -37,6 +37,21 @@
 //!   "selected query output contains no density/sample term (...)" (guards
 //!   the "last public binding is the query" convention)
 //!
+//! **`modes.rs`** (`emit_logdensity_abi`, the `inputs`/`outputs` ABI path,
+//! PR-1 — see [`crate::modes::Abi`]/[`crate::modes::read_abi`]):
+//! - an `elementof` parameter not listed in `inputs` — "elementof parameter
+//!   '...' is not listed in `inputs`; the inputs ABI is exhaustive ..."
+//!   (`inputs` is authoritative + exhaustive, design doc)
+//! - `outputs` missing or empty — "`outputs` ABI binding is missing or
+//!   empty; at least one output is required" (`EmitError::whole`)
+//! - an `inputs` entry naming a binding absent from the determinized module
+//!   — "`inputs` names '...', which is not a binding of the determinized
+//!   module" (`EmitError::whole`)
+//! - an `inputs` entry that is not an `elementof` parameter (i.e.
+//!   `external`/`load_data`) — "`inputs` entry '...' is not an elementof
+//!   parameter — external/load_data ABI inputs are not yet supported (PR-2
+//!   work)"
+//!
 //! **`ops.rs`** (the deterministic builtin-head map):
 //! - `record(...)` reached in tensor position — "record has no tensor form"
 //! - an unknown builtin head — "unsupported builtin head '...'"
