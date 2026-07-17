@@ -81,6 +81,61 @@ score = logdensityof(post, record(a = 0.5))\n";
     );
 }
 
+// A `broadcast` whose callable is a USER FUNCTION (not a bare builtin): a
+// Poisson GLM with a named linear predictor `predict(i,s,x)=i+s*x` broadcast
+// over the covariate array and a named inverse-link `rate(eta)=exp(eta)`
+// dot-called elementwise (§04 sec:broadcasting; §05 "Named functions"). The
+// determiniser keeps these as `broadcast((%ref self predict), intercept=…,
+// slope=…, xi=<vec>)` / `rate.(<vec>)` — a callable in higher-order position is
+// NOT inlined (unlike a direct user call). The emitter must monomorphise the
+// reified `functionof` elementwise: bind each input (by keyword name / position)
+// and lower the body, whose arithmetic auto-broadcasts scalar↔rank-1. This is
+// the ex_poisson_glm_link posterior; verified out-of-tree to Enzyme-execute ==
+// scipy oracle (Δ≈2.5e-6 f32) at the corpus theta points. Buffy #328.
+#[test]
+fn broadcast_of_user_function_monomorphises_elementwise() {
+    let src = "flatppl_compat = \"0.1\"\n\
+x = [-1.0, 0.2, 0.5, 1.3, 2.1]\n\
+y_obs = [0, 1, 2, 3, 8]\n\
+a = draw(Normal(mu = 0.0, sigma = 1.0))\n\
+b = draw(Normal(mu = 0.0, sigma = 1.0))\n\
+predict(intercept, slope, xi) = intercept + slope * xi\n\
+rate(eta) = exp(eta)\n\
+eta = broadcast(predict, intercept = a, slope = b, xi = x)\n\
+mu = rate.(eta)\n\
+y = draw(Poisson.(mu))\n\
+L = likelihoodof(kernelof(record(y = y), a = a, b = b), record(y = y_obs))\n\
+post = bayesupdate(L, lawof(record(a = a, b = b)))\n\
+score = logdensityof(post, record(a = 0.0, b = 0.0))\n";
+    let m = flatppl_syntax::parse(src).unwrap();
+    let d = flatppl_determinizer::determinize(&m).unwrap();
+    // Pin that this actually exercises the user-function broadcast path: the
+    // determinised FlatPDL keeps the reified `functionof`s the query broadcasts.
+    let pdl = flatppl_syntax::print(&d);
+    assert!(
+        pdl.contains("broadcast(predict") && pdl.contains("rate.("),
+        "determinised query broadcasts the user functions:\n{pdl}"
+    );
+    let out = flatppl_stablehlo::emit(&d, flatppl_stablehlo::Mode::LogDensity, &Default::default())
+        .unwrap();
+    assert!(out.contains("module {") && is_delimiter_balanced(&out));
+    // predict's body inlined over the length-5 covariate batch (rank-1), rate's
+    // `exp` applied elementwise, then the iid Poisson log-likelihood reduced.
+    assert!(out.contains("tensor<5xf32>"), "batch dim present:\n{out}");
+    assert!(
+        out.contains("stablehlo.multiply") && out.contains("stablehlo.add"),
+        "predict body (i + s*x) inlined:\n{out}"
+    );
+    assert!(
+        out.contains("stablehlo.exponential"),
+        "rate body (exp) inlined elementwise:\n{out}"
+    );
+    assert!(
+        out.contains("stablehlo.reduce"),
+        "iid Poisson sum reduces the batch:\n{out}"
+    );
+}
+
 // `invlogit(x)` (§07 logistic sigmoid, e.g. a logit-link GLM's inverse link)
 // lowers to the native, numerically-stable `stablehlo.logistic` op. Verified
 // out-of-tree to IREE-execute == scipy `expit` oracle (Δ≈2e-8). Buffy #303.

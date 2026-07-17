@@ -24,9 +24,11 @@
 //! ([`render_i1`]) rather than extending `MlirTy` — [`Emitter::select`] does
 //! the same for its predicate operand.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use flatppl_core::{CallHead, Module, Node, NodeId, Ref, RefNs, Scalar, Symbol, ValueSet};
+use flatppl_core::{
+    CallHead, Inputs, Module, NamedKind, Node, NodeId, Ref, RefNs, Scalar, Symbol, ValueSet,
+};
 
 use crate::Dtype;
 use crate::mlir::{ElemKind, MlirTy, Value};
@@ -2037,15 +2039,26 @@ impl<'m> Emitter<'m> {
         Ok(value)
     }
 
-    /// Lower `broadcast(f, rest...)` (§04 sec:broadcasting): apply the bare
-    /// callable `f` (`args[0]`, a `Const` builtin name) elementwise over `rest`,
-    /// scalars auto-broadcasting. `Emitter::binary` and the registry logpdf
-    /// builders are rank-agnostic (scalar↔rank-1 auto-broadcast), so the
-    /// `broadcast`+`f` wrapper is stripped and `rest` routed to the SAME handler
-    /// the un-broadcast form uses — the batch shape flows through the arithmetic.
+    /// Lower `broadcast(f, rest...)` (§04 sec:broadcasting): apply the callable
+    /// `f` (`args[0]`) elementwise over `rest`, scalars auto-broadcasting.
+    ///
+    /// `f` is either a bare builtin name (`Const`) — `Emitter::binary` and the
+    /// registry logpdf builders are rank-agnostic (scalar↔rank-1 auto-broadcast),
+    /// so the `broadcast`+`f` wrapper is stripped and `rest` routed to the SAME
+    /// handler the un-broadcast form uses, the batch shape flowing through the
+    /// arithmetic — or a **reified user function** (`functionof`, reached via a
+    /// `SelfMod` ref to a top-level fn binding or inline). FlatPPL is loop-free,
+    /// so a `functionof` under `broadcast` is a deterministic elementwise map:
+    /// it is monomorphised by binding each declared input to the (already-
+    /// lowered, possibly rank-1) broadcast argument and lowering the body — the
+    /// body's own pure-arithmetic ops then auto-broadcast, exactly as the bare-
+    /// builtin path relies on (`crate::ops::lower_builtin`). See
+    /// [`Emitter::lower_broadcast_userfn`].
+    ///
     /// `broadcast(add, s, vec)` → `ops::lower_builtin("add", …)` (a rank-1 add);
-    /// the dotted density `broadcast(builtin_logdensityof, Dist,
-    /// broadcast(record, …), vec)` → `registry::lower_logdensityof` over the
+    /// `broadcast(predict, a=…, b=…, x=vec)` with `predict(a,b,x)=a+b*x` inlines
+    /// to a rank-1 `a + b*x`; the dotted density `broadcast(builtin_logdensityof,
+    /// Dist, broadcast(record, …), vec)` → `registry::lower_logdensityof` over the
     /// batched record + vector variate, yielding a rank-1 vector of
     /// log-densities (its `sum` caller reduces it to the iid log-likelihood).
     fn lower_broadcast(&mut self, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
@@ -2055,9 +2068,18 @@ impl<'m> Emitter<'m> {
         let fname = match self.m.node(f) {
             Node::Const(sym) => self.m.resolve(*sym).to_string(),
             _ => {
+                // Not a bare builtin: the only other lowerable callable is a
+                // reified `functionof` (a user function passed in higher-order
+                // position — the determiniser inlines direct user calls, but a
+                // callable under `broadcast` survives as a first-class value).
+                // Anything else (a kernel, a `%local`, an unresolved ref) is
+                // genuinely un-lowerable and refuses — refuse-don't-mislower.
+                if let Some(fn_id) = self.resolve_functionof(f) {
+                    return self.lower_broadcast_userfn(id, fn_id, &args[1..]);
+                }
                 return Err(EmitError::at(
                     f,
-                    "broadcast: callable must be a bare builtin name",
+                    "broadcast: callable must be a bare builtin name or a reified function",
                 ));
             }
         };
@@ -2099,6 +2121,184 @@ impl<'m> Emitter<'m> {
             // message as its non-broadcast form.
             crate::ops::lower_builtin(self, id, &fname, rest)
         }
+    }
+
+    /// Resolve a `broadcast` callable node (`args[0]`) to a reified
+    /// `functionof`, following a `SelfMod` ref to its top-level binding rhs
+    /// (the common `predict = (a,b,x) -> …` case) or accepting an inline
+    /// reification directly. Returns the reification node's [`NodeId`], or
+    /// `None` for anything that is not a `functionof` (a bare builtin `Const`,
+    /// a kernel, a `%local`, …) — the caller handles / refuses those.
+    fn resolve_functionof(&self, callable: NodeId) -> Option<NodeId> {
+        let mut id = callable;
+        // Follow `SelfMod` ref hops (a fn bound to a name); bounded so a
+        // pathological self-referential binding can't spin forever.
+        for _ in 0..64 {
+            match self.m.node(id) {
+                Node::Ref(Ref {
+                    ns: RefNs::SelfMod,
+                    name,
+                }) => {
+                    id = self.m.binding(self.m.binding_by_name(*name)?).rhs;
+                }
+                Node::Call(c) => {
+                    let is_functionof = matches!(
+                        c.head,
+                        CallHead::Builtin(s) if self.m.resolve(s) == "functionof"
+                    );
+                    return (is_functionof && c.inputs.is_some()).then_some(id);
+                }
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    /// Lower `broadcast(f, rest...)` where `f` is a reified `functionof`
+    /// (`fn_id`) by monomorphising it elementwise (§04 sec:broadcasting; §05
+    /// "Named functions" — a named function is sugar for `functionof`). FlatPPL
+    /// is loop-free, so this application is a deterministic map: each declared
+    /// input is bound to its broadcast argument (positional in `rest`, or by
+    /// keyword name from the call's `%kwarg` entries, per §04 "Keyword arguments
+    /// bind inputs by name … positional binding is also permitted"), then the
+    /// body is lowered. The body's arithmetic ops auto-broadcast scalar↔rank-1
+    /// exactly as the bare-builtin `broadcast` path relies on, so a scalar-and-
+    /// vector mix (`a + b*x` with scalar `a`,`b` and rank-1 `x`) yields the
+    /// right rank-1 result with no explicit iteration.
+    ///
+    /// Inputs are bound by seeding each body `%local` ref's `NodeId` in the memo
+    /// (via [`Emitter::bind`], the same mechanism the mode builder uses for model
+    /// arguments). The body subtree's memo entries are snapshotted and restored
+    /// around the lowering, so the SAME `functionof` broadcast at two sites with
+    /// different arguments re-lowers freshly rather than reusing a stale memo.
+    fn lower_broadcast_userfn(
+        &mut self,
+        id: NodeId,
+        fn_id: NodeId,
+        positional_rest: &[NodeId],
+    ) -> Result<Value, EmitError> {
+        // The reified callable: `functionof(body, %specinputs ((param placeholder)…))`.
+        // Read its body + ordered input list out up front (dropping the borrow
+        // before the `&mut self` lowering below).
+        let (body, entries) = match self.m.node(fn_id) {
+            Node::Call(c) => {
+                let body = *c.args.first().ok_or_else(|| {
+                    EmitError::at(fn_id, "broadcast: reified function has no body")
+                })?;
+                let entries: Vec<(Symbol, Ref)> = match &c.inputs {
+                    Some(Inputs::Spec(es)) => es.to_vec(),
+                    Some(Inputs::Auto) => self
+                        .m
+                        .auto_inputs_of(fn_id)
+                        .ok_or_else(|| {
+                            EmitError::at(
+                                fn_id,
+                                "broadcast: reified function has an unresolved (%autoinputs) \
+                                 input list",
+                            )
+                        })?
+                        .to_vec(),
+                    None => {
+                        return Err(EmitError::at(
+                            fn_id,
+                            "broadcast: callable is not a reified function (no input list)",
+                        ));
+                    }
+                };
+                (body, entries)
+            }
+            _ => {
+                return Err(EmitError::at(
+                    fn_id,
+                    "broadcast: callable did not resolve to a reified function",
+                ));
+            }
+        };
+
+        // The broadcast call's `%kwarg` entries — the by-name argument binding.
+        let kwargs: Vec<(Symbol, NodeId)> = match self.m.node(id) {
+            Node::Call(c) => c
+                .named
+                .iter()
+                .filter(|n| n.kind == NamedKind::Kwarg)
+                .map(|n| (n.name, n.value))
+                .collect(),
+            _ => Vec::new(),
+        };
+
+        // Bind each declared input to its argument, keyed by the body-side
+        // `%local` placeholder name (`entry.1.name`), lowering the argument now
+        // (it lives outside the body subtree — the caller's own expression).
+        let mut local_values: HashMap<Symbol, Value> = HashMap::new();
+        for (i, (param, placeholder)) in entries.iter().enumerate() {
+            let arg = kwargs
+                .iter()
+                .find(|(k, _)| k == param)
+                .map(|(_, v)| *v)
+                .or_else(|| positional_rest.get(i).copied())
+                .ok_or_else(|| {
+                    EmitError::at(
+                        id,
+                        format!(
+                            "broadcast: no argument for input '{}'",
+                            self.m.resolve(*param)
+                        ),
+                    )
+                })?;
+            let value = self.lower_node(arg)?;
+            local_values.insert(placeholder.name, value);
+        }
+
+        // Collect the body subtree's `NodeId`s (the walk stops at ref/lit leaves
+        // — `for_each_child` yields nothing for a non-`Call`, so a `SelfMod` ref
+        // is a leaf and its target binding is NOT pulled in and stays memoized).
+        let mut subtree = Vec::new();
+        let mut seen = HashSet::new();
+        let mut stack = vec![body];
+        while let Some(n) = stack.pop() {
+            if !seen.insert(n) {
+                continue;
+            }
+            subtree.push(n);
+            self.m.node(n).for_each_child(|c| stack.push(c));
+        }
+
+        // Snapshot the subtree's prior memo state, then seed each body `%local`
+        // ref with its bound argument value.
+        let snapshot: Vec<(NodeId, Option<Value>)> = subtree
+            .iter()
+            .map(|&n| (n, self.memo.get(&n).cloned()))
+            .collect();
+        for &n in &subtree {
+            if let Node::Ref(Ref {
+                ns: RefNs::Local,
+                name,
+            }) = self.m.node(n)
+            {
+                if let Some(v) = local_values.get(name) {
+                    self.bind(n, v.clone());
+                }
+                // A `%local` not among the declared inputs is a malformed
+                // reification; leaving it unbound lets the body walk hit
+                // `lower_ref`'s `Local` refusal — refuse-don't-mislower.
+            }
+        }
+
+        let result = self.lower_node(body);
+
+        // Restore memo isolation (whatever the outcome) so a second application
+        // of the same `functionof` re-lowers against its own arguments.
+        for (n, prev) in snapshot {
+            match prev {
+                Some(v) => {
+                    self.memo.insert(n, v);
+                }
+                None => {
+                    self.memo.remove(&n);
+                }
+            }
+        }
+        result
     }
 
     /// The uncached half of [`Emitter::lower_node`]'s dispatch: every FlatPDL
