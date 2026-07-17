@@ -7866,6 +7866,37 @@ outputs = q1
     );
 }
 
+/// PR-1 is elementof-only: a fixed-phase binding listed in `inputs` (here a
+/// literal array `y`, standing in for `external`/`load_data` — the emitter's
+/// arg mechanism was elementof-only before this ABI) must REFUSE rather than
+/// emit a partial signature. Fixed-phase ABI inputs are PR-2 work. `mu` is a
+/// listed `elementof` so the model determinizes as a standard parameterized
+/// density (isolating the non-elementof-input refusal from the exhaustiveness
+/// check, which passes here).
+#[test]
+fn emit_logdensity_abi_refuses_non_elementof_input() {
+    let src = "\
+mu = elementof(reals)
+y = [1.0, 2.0]
+m = lawof(record(a = draw(Normal(mu = 0.0, sigma = 1.0))))
+q1 = logdensityof(m, record(a = mu))
+inputs = (mu, y)
+outputs = q1
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let err = flatppl_stablehlo::emit(
+        &d,
+        flatppl_stablehlo::Mode::LogDensity,
+        &flatppl_stablehlo::EmitOptions::default(),
+    )
+    .unwrap_err();
+    assert!(
+        err.msg.contains("not an elementof parameter") && err.msg.contains('y'),
+        "expected a non-elementof-input refusal naming `y`, got: {}",
+        err.msg
+    );
+}
+
 /// Fallback (design doc "Fallback + migration"): a model declaring NEITHER
 /// `inputs` nor `outputs` still emits via the legacy last-public-binding
 /// path, byte-for-byte the same as before this PR (every other golden test

@@ -604,6 +604,16 @@ fn determinize_cmd(input: &Path, output: Option<&Path>, keep: &[String]) -> Resu
 fn stablehlo_cmd(input: &Path, mode: &str, output: Option<&Path>) -> Result<(), Failure> {
     let (module, bundle) = load_and_infer(input)?;
 
+    let mode = match mode {
+        "logdensity" => flatppl_stablehlo::Mode::LogDensity,
+        "sample" => flatppl_stablehlo::Mode::Sample,
+        other => {
+            return Err(Failure::Usage(format!(
+                "stablehlo: unrecognized `--mode {other}` (expected `logdensity` or `sample`)"
+            )));
+        }
+    };
+
     // Recognize the `inputs`/`outputs` ABI (design doc
     // `docs/superpowers/specs/2026-07-17-inputs-outputs-abi-design.md`) on the
     // SURFACE module: if it declares either reserved binding, DCE roots on
@@ -614,23 +624,34 @@ fn stablehlo_cmd(input: &Path, mode: &str, output: Option<&Path>) -> Result<(), 
     // fall back to the legacy "last public binding is the query" convention,
     // with a deprecation warning: the ABI is additive/opt-in during
     // migration (design doc "Fallback + migration").
-    let abi_syms: Vec<flatppl_core::Symbol> = ["inputs", "outputs"]
-        .iter()
-        .filter_map(|name| {
-            module
-                .public_bindings()
-                .find(|(_, b)| module.resolve(b.name) == *name)
-                .map(|(_, b)| b.name)
-        })
-        .collect();
+    //
+    // The ABI is LogDensity-only in PR-1: `sample` mode never engages it (it
+    // ignores `inputs`/`outputs` at emission) and so always uses the legacy
+    // path — and does NOT emit the logdensity-migration deprecation warning.
+    let abi_syms: Vec<flatppl_core::Symbol> = if matches!(mode, flatppl_stablehlo::Mode::LogDensity)
+    {
+        ["inputs", "outputs"]
+            .iter()
+            .filter_map(|name| {
+                module
+                    .public_bindings()
+                    .find(|(_, b)| module.resolve(b.name) == *name)
+                    .map(|(_, b)| b.name)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     let (roots, query_name) = if !abi_syms.is_empty() {
         (Some(abi_syms), None)
     } else {
-        eprintln!(
-            "warning: no inputs/outputs bindings; using the legacy last-public-binding \
-             query — declare inputs/outputs for an explicit ABI"
-        );
+        if matches!(mode, flatppl_stablehlo::Mode::LogDensity) {
+            eprintln!(
+                "warning: no inputs/outputs bindings; using the legacy last-public-binding \
+                 query — declare inputs/outputs for an explicit ABI"
+            );
+        }
         // The query is the LAST public binding of the *surface* model (the
         // "query last" convention). Read its identity here, before
         // determinization: a `load_module` query that scores a foreign
@@ -654,15 +675,6 @@ fn stablehlo_cmd(input: &Path, mode: &str, output: Option<&Path>) -> Result<(), 
                 e.construct, e.node, e.reason
             ))
         })?;
-    let mode = match mode {
-        "logdensity" => flatppl_stablehlo::Mode::LogDensity,
-        "sample" => flatppl_stablehlo::Mode::Sample,
-        other => {
-            return Err(Failure::Usage(format!(
-                "stablehlo: unrecognized `--mode {other}` (expected `logdensity` or `sample`)"
-            )));
-        }
-    };
     let opts = flatppl_stablehlo::EmitOptions {
         query: query_name,
         ..Default::default()
