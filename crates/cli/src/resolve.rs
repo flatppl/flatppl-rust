@@ -234,6 +234,32 @@ pub fn data_sources_of(module: &Module, base: &Location) -> Vec<Location> {
         .collect()
 }
 
+/// Each top-level binding whose RHS is a `load_data(...)` call, as
+/// `(binding-name, resolved source Location)` with the source resolved relative
+/// to `base`. The binding NAME (unlike [`data_sources_of`], which drops it) lets
+/// the StableHLO `inputs`/`outputs` ABI key a compile-time shape pin to the
+/// argument (`stablehlo_cmd` reads the file only for its length →
+/// `tensor<N×f32>`; the values stay the runtime argument). Non-literal sources
+/// are skipped — they cannot be resolved statically.
+pub fn load_data_bindings_of(module: &Module, base: &Location) -> Vec<(String, Location)> {
+    let mut out = Vec::new();
+    for (_, b) in module.bindings() {
+        let Node::Call(call) = module.node(b.rhs) else {
+            continue;
+        };
+        let CallHead::Builtin(h) = call.head else {
+            continue;
+        };
+        if module.resolve(h) != "load_data" {
+            continue;
+        }
+        if let Some(source) = source_of(module, call) {
+            out.push((module.resolve(b.name).to_string(), base.join(source)));
+        }
+    }
+    out
+}
+
 /// Discover and resolve a model's references for inference. Walks the
 /// `load_module` graph breadth-first, resolving + parsing each dependency
 /// through `resolver` into a [`ModuleBundle`] keyed by the directive string the

@@ -643,7 +643,8 @@ fn stablehlo_cmd(input: &Path, mode: &str, output: Option<&Path>) -> Result<(), 
         Vec::new()
     };
 
-    let (roots, query_name) = if !abi_syms.is_empty() {
+    let abi_present = !abi_syms.is_empty();
+    let (roots, query_name) = if abi_present {
         (Some(abi_syms), None)
     } else {
         if matches!(mode, flatppl_stablehlo::Mode::LogDensity) {
@@ -668,6 +669,30 @@ fn stablehlo_cmd(input: &Path, mode: &str, output: Option<&Path>) -> Result<(), 
         (query_sym.map(|s| vec![s]), query_name)
     };
 
+    // Compile-time shape pins for `load_data` ABI inputs (design doc
+    // "load_data — shape, not values"): read each `load_data` binding named in
+    // `inputs` for its LENGTH only, so the emitter types it `tensor<N×f32>`
+    // rather than an unusable `tensor<?×f32>`. The values are NOT read here —
+    // they are the runtime argument, never baked. Only when the ABI is engaged
+    // (`abi_syms` non-empty, LogDensity); the legacy path bakes nothing new.
+    let input_shapes = if !abi_present {
+        std::collections::HashMap::new()
+    } else {
+        let input_names = abi_input_names(&module);
+        let in_loc = Location::Local(input.to_path_buf());
+        let resolver = CliResolver::cache_only();
+        let mut shapes: std::collections::HashMap<String, Vec<u64>> =
+            std::collections::HashMap::new();
+        for (name, loc) in flatppl_cli::resolve::load_data_bindings_of(&module, &in_loc) {
+            if input_names.iter().any(|n| n == &name) {
+                let path = resolver.resolve_path(&loc)?;
+                let n = load_data_vector_len(&path)?;
+                shapes.insert(name, vec![n as u64]);
+            }
+        }
+        shapes
+    };
+
     let lowered = flatppl_determinizer::determinize_with_roots(&module, &bundle, roots.as_deref())
         .map_err(|e| {
             Failure::Refuse(format!(
@@ -677,6 +702,7 @@ fn stablehlo_cmd(input: &Path, mode: &str, output: Option<&Path>) -> Result<(), 
         })?;
     let opts = flatppl_stablehlo::EmitOptions {
         query: query_name,
+        input_shapes,
         ..Default::default()
     };
     let rendered = flatppl_stablehlo::emit(&lowered, mode, &opts)
@@ -687,4 +713,64 @@ fn stablehlo_cmd(input: &Path, mode: &str, output: Option<&Path>) -> Result<(), 
         None => print!("{rendered}"),
     }
     Ok(())
+}
+
+/// The binding names listed in a surface model's reserved `inputs` binding, in
+/// declared order — the elements of an `inputs = (a, b, …)` tuple (or a single
+/// `inputs = a`) resolved through `(%ref self x)` to their names. Used by
+/// [`stablehlo_cmd`] to decide which `load_data` bindings need a compile-time
+/// shape pin (a `load_data` NOT in `inputs` is not an ABI argument). A
+/// non-`ref` element is skipped (the StableHLO emitter's own `read_abi` applies
+/// the authoritative checks).
+#[cfg(feature = "stablehlo")]
+fn abi_input_names(module: &flatppl_core::Module) -> Vec<String> {
+    use flatppl_core::{CallHead, Node, Ref, RefNs};
+    let Some((_, b)) = module
+        .public_bindings()
+        .find(|(_, b)| module.resolve(b.name) == "inputs")
+    else {
+        return Vec::new();
+    };
+    let elems: Vec<flatppl_core::NodeId> = match module.node(b.rhs) {
+        Node::Call(c) if matches!(c.head, CallHead::Builtin(s) if module.resolve(s) == "tuple") => {
+            c.args.to_vec()
+        }
+        _ => vec![b.rhs],
+    };
+    elems
+        .iter()
+        .filter_map(|&e| match module.node(e) {
+            Node::Ref(Ref {
+                ns: RefNs::SelfMod,
+                name,
+            }) => Some(module.resolve(*name).to_string()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The element count of a 1-D `load_data` vector (spec §07), read from the
+/// resolved delimited file (CSV/WSV) — used ONLY for the compile-time shape pin
+/// of a `load_data` ABI input (`tensor<N×f32>`); the values themselves are
+/// never read here (they are the runtime argument, never baked). Mirrors the
+/// reference engine's delimited single-column rule (`flatppl-js`
+/// `dataload.ts`): skip blank and `#`-comment lines, treat the first remaining
+/// row as the column header, and count the remaining data rows.
+#[cfg(feature = "stablehlo")]
+fn load_data_vector_len(path: &Path) -> Result<usize, Failure> {
+    let text = fs::read_to_string(path).map_err(|e| {
+        Failure::Plain(format!(
+            "reading load_data source `{}` for its shape: {e}",
+            path.display()
+        ))
+    })?;
+    let data_rows = text
+        .lines()
+        .filter(|l| {
+            let t = l.trim();
+            !t.is_empty() && !t.starts_with('#')
+        })
+        .count();
+    // Drop the header row (present when there is at least one line).
+    Ok(data_rows.saturating_sub(1))
 }

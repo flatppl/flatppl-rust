@@ -64,6 +64,20 @@ pub struct EmitOptions {
     /// data/residue bindings in *after* the query in source order. Naming the
     /// query keeps it identifiable regardless of grafted trailing bindings.
     pub query: Option<String>,
+    /// Compile-time shape pins for fixed-phase ABI inputs whose FlatPDL type
+    /// carries a dynamic dim — `load_data(...)` (typed `CartPow(set,
+    /// Dim::Dynamic)`, so `tensor<?×f32>`) and a shaped `external(...)` — keyed
+    /// by the input binding's name. The design doc (`docs/superpowers/specs/
+    /// 2026-07-17-inputs-outputs-abi-design.md`, "`load_data` — shape, not
+    /// values") pins the length from a compile-time read of the resolved file
+    /// *only* for its shape; the values remain the runtime argument (never
+    /// baked). The CLI (`stablehlo_cmd`) reads each `load_data` ABI-input file's
+    /// length and populates this map; [`modes::emit_logdensity_abi`] uses it to
+    /// override the dynamic dim so the argument types `tensor<N×f32>` — a `?`
+    /// dim would be unusable downstream (the executor requires a static shape
+    /// for the density's reduce/broadcast). Empty (the default) means no pin:
+    /// an input with a dynamic dim then types as-is (a `?` arg).
+    pub input_shapes: std::collections::HashMap<String, Vec<u64>>,
 }
 
 impl Default for EmitOptions {
@@ -71,6 +85,7 @@ impl Default for EmitOptions {
         Self {
             dtype: Dtype::F32,
             query: None,
+            input_shapes: std::collections::HashMap::new(),
         }
     }
 }

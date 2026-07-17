@@ -7749,10 +7749,11 @@ fn emit_sample_categorical_single_category_iid_matches_frozen_golden() {
 // `func.func` an explicit, ordered arg/result list — superseding
 // `is_free_param`'s source-order convention and `select_query`'s
 // last-public-binding convention. PR-1 scope: `elementof` inputs only,
-// `Mode::LogDensity` only (a fixed-phase `external`/`load_data` ABI input is
-// PR-2 work and refuses here — see `emit_logdensity_abi_refuses_non_elementof_input`
-// below, once one exists; PR-1 has no fixed-phase-input construct to test since
-// the emitter's arg mechanism is elementof-only regardless of the ABI).
+// `Mode::LogDensity` only. PR-2 extends the arg path to the fixed-phase input
+// constructs `external`/`load_data` (see the "PR-2" section below); a binding
+// named in `inputs` that is neither `elementof` nor a fixed-phase input
+// construct (a literal, a computed value) still refuses — see
+// `emit_logdensity_abi_refuses_non_elementof_input`.
 
 /// Parse + infer `src`, then `determinize_with_roots` rooted on `roots` (the
 /// `inputs`/`outputs` binding names) — mirrors
@@ -7866,13 +7867,14 @@ outputs = q1
     );
 }
 
-/// PR-1 is elementof-only: a fixed-phase binding listed in `inputs` (here a
-/// literal array `y`, standing in for `external`/`load_data` — the emitter's
-/// arg mechanism was elementof-only before this ABI) must REFUSE rather than
-/// emit a partial signature. Fixed-phase ABI inputs are PR-2 work. `mu` is a
-/// listed `elementof` so the model determinizes as a standard parameterized
-/// density (isolating the non-elementof-input refusal from the exhaustiveness
-/// check, which passes here).
+/// A binding named in `inputs` that is neither an `elementof` parameter nor a
+/// fixed-phase input construct (`external`/`load_data`) must REFUSE rather than
+/// emit a partial signature: here a literal array `y = [1.0, 2.0]` (not a data
+/// construct — its values ARE known, but it is not an ABI-argument construct).
+/// `mu` is a listed `elementof` so the model determinizes as a standard
+/// parameterized density (isolating the non-input-construct refusal from the
+/// exhaustiveness check, which passes here). Fixed-phase `external`/`load_data`
+/// inputs are now accepted (PR-2) — see the PR-2 section.
 #[test]
 fn emit_logdensity_abi_refuses_non_elementof_input() {
     let src = "\
@@ -7923,4 +7925,121 @@ fn inputs_outputs_bindings_parse_and_infer_without_error() {
     let mut m = flatppl_syntax::parse(ABI_TWO_OUTPUT_SRC).expect("parse");
     let diags = flatppl_infer::infer(&mut m);
     assert!(diags.is_empty(), "infer diagnostics: {diags:?}");
+}
+
+// ---- PR-2: fixed-phase inputs (`external`, `load_data`) as runtime args -----
+//
+// A fixed-phase binding (`external(S)` / `load_data(...)`) listed in `inputs`
+// becomes a `func.func` argument instead of refusing (PR-1) — extending the
+// SAME ABI arg path PR-1 built for `elementof`. `external(S)` types from `S`
+// (scalar first); `load_data(...)` types `tensor<N×f32>` with `N` pinned from
+// the compile-time file read threaded via `EmitOptions::input_shapes` (design
+// doc "load_data — shape, not values": only the shape is pinned, the values are
+// the runtime argument, never baked). A fixed-phase binding NOT in `inputs`
+// still refuses, pointing at the ABI.
+
+/// Emit `@logdensity` with a compile-time shape-pin map (the CLI's
+/// [`EmitOptions::input_shapes`], populated from a `load_data` file read).
+fn emit_logdensity_with_shapes(m: &Module, shapes: &[(&str, Vec<u64>)]) -> String {
+    let opts = flatppl_stablehlo::EmitOptions {
+        input_shapes: shapes
+            .iter()
+            .map(|(name, dims)| (name.to_string(), dims.clone()))
+            .collect(),
+        ..Default::default()
+    };
+    flatppl_stablehlo::emit(m, flatppl_stablehlo::Mode::LogDensity, &opts)
+        .expect("must emit @logdensity")
+}
+
+/// Step 2 (external, scalar): a scalar `external(reals)` listed in `inputs`
+/// becomes a scalar `func.func` argument (`tensor<f32>`), NOT a PR-1 refusal.
+/// `mu_ext` is used as the Normal's mean so the output reaches it; `a` is the
+/// elementof variate. Args are in `inputs` order: `a` → `%arg0`,
+/// `mu_ext` → `%arg1`.
+#[test]
+fn emit_logdensity_abi_external_scalar_becomes_arg() {
+    let src = "\
+a = elementof(reals)
+mu_ext = external(reals)
+m = lawof(record(a = draw(Normal(mu = mu_ext, sigma = 1.0))))
+q1 = logdensityof(m, record(a = a))
+inputs = (a, mu_ext)
+outputs = q1
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let out = emit_logdensity(&d);
+    assert!(
+        out.contains(
+            "func.func @logdensity(%arg0: tensor<f32>, %arg1: tensor<f32>) -> tensor<f32>"
+        ),
+        "scalar external `mu_ext` must become `%arg1: tensor<f32>`, in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// Step 3 (load_data): a `load_data(...)` binding listed in `inputs` emits a
+/// ranked-tensor argument whose length is the compile-time-pinned `N`
+/// (`tensor<3×f32>` here) — NOT a `tensor<?×f32>` (unusable downstream), NOT a
+/// refusal, and NOT a baked `stablehlo.constant` (its values are the runtime
+/// argument). `y` is a declared-but-unused input (a stable ABI arg is not
+/// DCE'd), isolating the shape-pin from any density-over-vector lowering.
+#[test]
+fn emit_logdensity_abi_load_data_pinned_tensor_arg() {
+    let src = "\
+a = elementof(reals)
+y = load_data(\"data.csv\", reals)
+m = lawof(record(a = draw(Normal(mu = 0.0, sigma = 1.0))))
+q1 = logdensityof(m, record(a = a))
+inputs = (a, y)
+outputs = q1
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let out = emit_logdensity_with_shapes(&d, &[("y", vec![3])]);
+    assert!(
+        out.contains(
+            "func.func @logdensity(%arg0: tensor<f32>, %arg1: tensor<3xf32>) -> tensor<f32>"
+        ),
+        "load_data `y` must become a shape-pinned `%arg1: tensor<3xf32>`, in:\n{out}"
+    );
+    assert!(
+        !out.contains("tensor<?x"),
+        "the pinned load_data arg must not carry a dynamic `?` dim, in:\n{out}"
+    );
+    // Values are the runtime argument, never inlined: no data constant for `y`.
+    assert!(
+        !out.contains("dense<[") && !out.contains("data.csv"),
+        "load_data values must not be baked as a constant, in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// Step 4 (refuse when not in `inputs`): a fixed-phase binding that an output
+/// reaches (so root-DCE keeps it) but that is NOT listed in `inputs` refuses,
+/// with a message pointing at the ABI (`list it in inputs …`) — fixed data
+/// becomes a runtime argument only by being declared, never baked. `mu_ext`
+/// (a scalar `external`) feeds the Normal's mean but is absent from
+/// `inputs = a`.
+#[test]
+fn emit_logdensity_abi_refuses_fixed_input_not_in_inputs() {
+    let src = "\
+a = elementof(reals)
+mu_ext = external(reals)
+m = lawof(record(a = draw(Normal(mu = mu_ext, sigma = 1.0))))
+q1 = logdensityof(m, record(a = a))
+inputs = a
+outputs = q1
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let err = flatppl_stablehlo::emit(
+        &d,
+        flatppl_stablehlo::Mode::LogDensity,
+        &flatppl_stablehlo::EmitOptions::default(),
+    )
+    .unwrap_err();
+    assert!(
+        err.msg.contains("list it in inputs") && err.msg.contains("mu_ext"),
+        "expected an ABI-pointing refusal naming `mu_ext`, got: {}",
+        err.msg
+    );
 }

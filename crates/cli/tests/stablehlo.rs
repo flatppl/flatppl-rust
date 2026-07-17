@@ -87,6 +87,52 @@ fn stablehlo_abi_model_emits_ordered_signature_with_no_warning() {
     );
 }
 
+/// PR-2: a `load_data(...)` binding listed in `inputs` becomes a shape-pinned
+/// tensor argument end-to-end through the real CLI binary — `stablehlo_cmd`
+/// reads the resolved data file for its LENGTH only (here `data.csv` has 4 data
+/// rows) and types the argument `tensor<4xf32>`, NOT `tensor<?xf32>` and NOT a
+/// baked constant (design doc "load_data — shape, not values"). Both the model
+/// and its `data.csv` are written to the same dir so the relative source
+/// resolves.
+#[test]
+fn stablehlo_abi_load_data_pins_tensor_arg_from_file_length() {
+    let dir = std::env::temp_dir().join(format!(
+        "flatppl-stablehlo-cli-load-data-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    // Header row + 4 data rows → a length-4 vector.
+    std::fs::write(dir.join("data.csv"), "y\n1.0\n2.0\n3.0\n4.0\n").unwrap();
+    let input = dir.join("m.flatppl");
+    std::fs::write(
+        &input,
+        "a = elementof(reals)\n\
+         y = load_data(\"data.csv\", reals)\n\
+         m = lawof(record(a = draw(Normal(mu = 0.0, sigma = 1.0))))\n\
+         q1 = logdensityof(m, record(a = a))\n\
+         inputs = (a, y)\n\
+         outputs = q1\n",
+    )
+    .unwrap();
+    let out = flatppl().arg("stablehlo").arg(&input).output().unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(
+            "func.func @logdensity(%arg0: tensor<f32>, %arg1: tensor<4xf32>) -> tensor<f32>"
+        ),
+        "expected `y` pinned to `%arg1: tensor<4xf32>` from the file length:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("tensor<?x"),
+        "the pinned load_data arg must not carry a dynamic `?` dim:\n{stdout}"
+    );
+}
+
 /// `b` is reachable from `q1` (root-DCE keeps it — the query needs it) but is
 /// not listed in `inputs` (which declares only `a`): the exhaustiveness check
 /// (design doc: `inputs` is "authoritative and exhaustive") must refuse this
