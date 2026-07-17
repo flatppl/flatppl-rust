@@ -77,7 +77,7 @@ use flatppl_core::{CallHead, Module, Node, NodeId, Phase, Ref, RefNs, Scalar};
 
 use crate::EmitOptions;
 use crate::emitter::Emitter;
-use crate::mlir::{MlirTy, Value};
+use crate::mlir::{ElemKind, MlirTy, Value};
 use crate::refuse::EmitError;
 use crate::types::mlir_type_of;
 
@@ -96,12 +96,13 @@ pub fn emit_logdensity(m: &Module, opts: &EmitOptions) -> Result<String, EmitErr
             continue;
         }
         let name = format!("%arg{}", args.len());
-        let ty = mlir_type_of(m, binding.rhs, opts.dtype)?;
+        let (ty, _elem) = mlir_type_of(m, binding.rhs, opts.dtype)?;
         e.bind(
             binding.rhs,
             Value {
                 ssa: name.clone(),
                 ty: ty.clone(),
+                elem: ElemKind::Real,
             },
         );
         args.push((name, ty));
@@ -187,6 +188,7 @@ pub fn emit_sample(m: &Module, opts: &EmitOptions) -> Result<String, EmitError> 
         Value {
             ssa: key_name.clone(),
             ty: key_ty.clone(),
+            elem: ElemKind::Real,
         },
     );
     let mut args: Vec<(String, MlirTy)> = vec![(key_name, key_ty)];
@@ -204,12 +206,13 @@ pub fn emit_sample(m: &Module, opts: &EmitOptions) -> Result<String, EmitError> 
         }
         let name = format!("%arg{nfree}");
         nfree += 1;
-        let ty = mlir_type_of(m, binding.rhs, opts.dtype)?;
+        let (ty, _elem) = mlir_type_of(m, binding.rhs, opts.dtype)?;
         e.bind(
             binding.rhs,
             Value {
                 ssa: name.clone(),
                 ty: ty.clone(),
+                elem: ElemKind::Real,
             },
         );
         args.push((name, ty));

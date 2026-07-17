@@ -32,7 +32,7 @@ mod registry;
 mod types;
 
 pub use emitter::Emitter;
-pub use mlir::{MlirTy, Value};
+pub use mlir::{ElemKind, MlirTy, Value};
 pub use refuse::EmitError;
 pub use types::mlir_type_of;
 

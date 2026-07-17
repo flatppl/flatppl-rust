@@ -11,7 +11,7 @@
 use flatppl_core::{
     Binding, Call, CallHead, Dim, Mass, Module, Node, NodeId, Ref, RefNs, Scalar, ScalarType, Type,
 };
-use flatppl_stablehlo::{Dtype, Emitter, MlirTy, Value, mlir_type_of};
+use flatppl_stablehlo::{Dtype, ElemKind, Emitter, MlirTy, Value, mlir_type_of};
 
 /// Every physical `{`/`(`/`[` in `s` has a matching close, and vice versa —
 /// a cheap structural well-formedness check for hand-assembled MLIR text
@@ -116,9 +116,9 @@ fn placeholder(m: &mut Module, ty: Type) -> flatppl_core::NodeId {
 fn mlir_type_of_scalar_renders_rank0_tensor() {
     let mut m = Module::new();
     let id = placeholder(&mut m, Type::Scalar(ScalarType::Real));
-    let ty = mlir_type_of(&m, id, Dtype::F32).unwrap();
+    let (ty, elem) = mlir_type_of(&m, id, Dtype::F32).unwrap();
     assert_eq!(ty, MlirTy::Scalar);
-    assert_eq!(ty.render(Dtype::F32), "tensor<f32>");
+    assert_eq!(ty.render(Dtype::F32, elem), "tensor<f32>");
 }
 
 #[test]
@@ -131,9 +131,9 @@ fn mlir_type_of_flat_array_renders_ranked_tensor() {
             elem: Box::new(Type::Scalar(ScalarType::Real)),
         },
     );
-    let ty = mlir_type_of(&m, id, Dtype::F32).unwrap();
+    let (ty, elem) = mlir_type_of(&m, id, Dtype::F32).unwrap();
     assert_eq!(ty, MlirTy::Ranked(vec![Some(2), Some(3)]));
-    assert_eq!(ty.render(Dtype::F32), "tensor<2x3xf32>");
+    assert_eq!(ty.render(Dtype::F32, elem), "tensor<2x3xf32>");
 }
 
 #[test]
@@ -152,9 +152,9 @@ fn mlir_type_of_nested_array_flattens_to_one_tensor_shape() {
             }),
         },
     );
-    let ty = mlir_type_of(&m, id, Dtype::F32).unwrap();
+    let (ty, elem) = mlir_type_of(&m, id, Dtype::F32).unwrap();
     assert_eq!(ty, MlirTy::Ranked(vec![Some(2), Some(3)]));
-    assert_eq!(ty.render(Dtype::F32), "tensor<2x3xf32>");
+    assert_eq!(ty.render(Dtype::F32, elem), "tensor<2x3xf32>");
 }
 
 #[test]
@@ -167,9 +167,9 @@ fn mlir_type_of_dynamic_dim_renders_question_mark() {
             elem: Box::new(Type::Scalar(ScalarType::Real)),
         },
     );
-    let ty = mlir_type_of(&m, id, Dtype::F32).unwrap();
+    let (ty, elem) = mlir_type_of(&m, id, Dtype::F32).unwrap();
     assert_eq!(ty, MlirTy::Ranked(vec![None, Some(3)]));
-    assert_eq!(ty.render(Dtype::F32), "tensor<?x3xf32>");
+    assert_eq!(ty.render(Dtype::F32, elem), "tensor<?x3xf32>");
 }
 
 #[test]
@@ -182,9 +182,9 @@ fn mlir_type_of_tvector_renders_ranked_tensor() {
             elem: Box::new(Type::Scalar(ScalarType::Real)),
         },
     );
-    let ty = mlir_type_of(&m, id, Dtype::F32).unwrap();
+    let (ty, elem) = mlir_type_of(&m, id, Dtype::F32).unwrap();
     assert_eq!(ty, MlirTy::Ranked(vec![Some(4)]));
-    assert_eq!(ty.render(Dtype::F32), "tensor<4xf32>");
+    assert_eq!(ty.render(Dtype::F32, elem), "tensor<4xf32>");
 }
 
 #[test]
@@ -193,22 +193,28 @@ fn rngstate_maps_to_key_type() {
     // independent of `Dtype` — unlike every other `Type::Scalar`/`Array`
     // mapping in this file, `MlirTy::Key`'s rendering must NOT vary with the
     // emitter's f32/f64 element dtype.
-    assert_eq!(MlirTy::Key.render(Dtype::F32), "tensor<2xui64>");
-    assert_eq!(MlirTy::Key.render(Dtype::F64), "tensor<2xui64>");
+    assert_eq!(
+        MlirTy::Key.render(Dtype::F32, ElemKind::Real),
+        "tensor<2xui64>"
+    );
+    assert_eq!(
+        MlirTy::Key.render(Dtype::F64, ElemKind::Real),
+        "tensor<2xui64>"
+    );
 
     let mut m = Module::new();
     let id = placeholder(&mut m, Type::RngState);
-    let ty = mlir_type_of(&m, id, Dtype::F32).unwrap();
+    let (ty, elem) = mlir_type_of(&m, id, Dtype::F32).unwrap();
     assert_eq!(ty, MlirTy::Key);
-    assert_eq!(ty.render(Dtype::F64), "tensor<2xui64>");
+    assert_eq!(ty.render(Dtype::F64, elem), "tensor<2xui64>");
 }
 
 #[test]
 fn mlir_type_of_dtype_is_configurable_not_hardcoded() {
     let mut m = Module::new();
     let id = placeholder(&mut m, Type::Scalar(ScalarType::Real));
-    let ty = mlir_type_of(&m, id, Dtype::F64).unwrap();
-    assert_eq!(ty.render(Dtype::F64), "tensor<f64>");
+    let (ty, elem) = mlir_type_of(&m, id, Dtype::F64).unwrap();
+    assert_eq!(ty.render(Dtype::F64, elem), "tensor<f64>");
 }
 
 #[test]
@@ -280,6 +286,7 @@ fn emitter_finish_wraps_args_and_return_type() {
     let arg = flatppl_stablehlo::Value {
         ssa: "%arg0".to_string(),
         ty: MlirTy::Scalar,
+        elem: ElemKind::Real,
     };
     let doubled = e.add(&arg, &arg);
     let out = e.finish("f", &[("%arg0".to_string(), MlirTy::Scalar)], &[&doubled]);
@@ -502,10 +509,15 @@ fn emitter_fresh_ssa_names_never_repeat() {
 
 // ---- Task 4: node dispatch + deterministic op map -------------------------
 //
-// All of these build tiny FlatPDL fragments by hand (no parse/infer pass —
-// `Emitter::lower_node`'s dispatch never consults the type side-table, only
-// node structure and already-lowered operand shapes) mirroring Task 2/3's
-// hand-built-`Module` test style.
+// Most of these build tiny FlatPDL fragments by hand (no parse/infer pass),
+// mirroring Task 2/3's hand-built-`Module` test style — node structure and
+// already-lowered operand shapes drive `Emitter::lower_node`'s dispatch.
+// Since Task A2, the deterministic op map's kind-polymorphic/real-domain
+// coercion (`ops::lower_builtin`) DOES consult the type side-table
+// (`Emitter::node_kind`), but every fragment below never calls `set_type` on
+// its call nodes, so it falls back to `ElemKind::Real` exactly as before —
+// a hand-built fragment that needs a NON-`Real` result kind sets it
+// explicitly (see `lower_node_mixed_int_real_add_converts_before_add`).
 
 fn top_level(m: &mut Module, name: &str, rhs: NodeId) {
     let sym = m.intern(name);
@@ -613,6 +625,229 @@ fn lower_builtin_head_map_dispatches_expected_ops() {
     }
 }
 
+/// Task A2 Step 1: `add(int_literal, real_binding)`, with the `add` node's
+/// OWN inferred type set to `Real` (mixed-kind inference has already decided
+/// the result, exactly as `flatppl-infer` would for `3 + mu` with `mu:
+/// reals`) — must render the int literal as an `i32` tensor, insert exactly
+/// one `stablehlo.convert` (the canonical `integers ⊂ reals` embedding, spec
+/// §03) immediately before the `stablehlo.add` it feeds, and the add itself
+/// renders `f32`. Types are set directly on the hand-built `Module`
+/// (mirroring `mlir_type_of`'s `placeholder` helper) rather than run through
+/// a full parse+infer pass — only the type side-table `node_kind` reads
+/// matters here.
+#[test]
+fn lower_node_mixed_int_real_add_converts_before_add() {
+    let mut m = Module::new();
+    let i = int(&mut m, 3);
+    m.set_type(i, Type::Scalar(ScalarType::Integer));
+    let x = real(&mut m, 2.5);
+    m.set_type(x, Type::Scalar(ScalarType::Real));
+    let add_node = call(&mut m, "add", &[i, x]);
+    m.set_type(add_node, Type::Scalar(ScalarType::Real));
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    let result = e.lower_node(add_node).unwrap();
+    assert_eq!(result.ty, MlirTy::Scalar);
+    assert_eq!(result.elem, ElemKind::Real);
+    let out = e.finish("f", &[], &[&result]);
+
+    assert!(
+        out.contains("tensor<i32>"),
+        "int literal renders as an i32 scalar tensor:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.convert").count(),
+        1,
+        "expected exactly one stablehlo.convert (the int->real embedding):\n{out}"
+    );
+    let convert_pos = out.find("stablehlo.convert").expect("missing convert");
+    let add_pos = out.find("stablehlo.add").expect("missing add");
+    assert!(
+        convert_pos < add_pos,
+        "convert must precede the add it feeds:\n{out}"
+    );
+    let add_line = out
+        .lines()
+        .find(|l| l.contains("stablehlo.add"))
+        .expect("missing add line");
+    assert!(
+        add_line.contains("tensor<f32>"),
+        "add renders f32 operands:\n{add_line}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// Task A2 regression: a CONTINUOUS distribution invoked with literal
+/// INTEGER parameters (`Gamma(2, 1)`, fully idiomatic FlatPPL — same style as
+/// `Normal(0, 1)`) must still emit well-typed StableHLO. `crate::registry`'s
+/// `gamma_logpdf` calls `Emitter::log`/`Emitter::lgamma` directly on `rate`/
+/// `shape` — real-only ops with no `NodeId` to coerce against an inferred
+/// result kind, since registry.rs never goes through `crate::ops`'s dispatch
+/// table — so every `stablehlo.log`/`chlo.lgamma` operand must be converted
+/// to `f32` FIRST, never applied directly to the literals' native `i32`.
+/// (Caught by running `poisson-model.flatppl`'s `Gamma(2, 1)` prior through
+/// the emitter during Task A2's Step-8 numeric re-verify — no golden here
+/// exercised a literal-parameter continuous distribution before.)
+#[test]
+fn literal_int_params_on_continuous_distribution_convert_before_real_only_ops() {
+    let src = "flatppl_compat = \"0.1\"\n\
+lambda = draw(Gamma(shape = 2, rate = 1))\n\
+lp = logdensityof(lawof(record(lambda = lambda)), record(lambda = 2.5))\n";
+    let m = flatppl_syntax::parse(src).unwrap();
+    let d = flatppl_determinizer::determinize(&m).unwrap();
+    let out = flatppl_stablehlo::emit(&d, flatppl_stablehlo::Mode::LogDensity, &Default::default())
+        .unwrap();
+    assert!(out.contains("module {") && is_delimiter_balanced(&out));
+    assert!(
+        out.contains("tensor<i32>"),
+        "the literal shape/rate params render as i32:\n{out}"
+    );
+    for line in out.lines() {
+        if line.contains("stablehlo.log") || line.contains("chlo.lgamma") {
+            assert!(
+                !line.contains("i32"),
+                "a real-only op must never see an i32 operand directly \
+                 (missing a convert):\n{line}\nfull module:\n{out}"
+            );
+        }
+    }
+}
+
+/// Fix-up regression (post-A2 review): `sum` over an `Int`-typed array
+/// (§07: sum-of-integers is integer) must reduce with an `Int` init constant
+/// AND `Int` result — `Emitter::reduce_axis` used to hardcode `Real` for
+/// both, which would emit an `Int` operand against an `f32` init/result
+/// (invalid: `stablehlo.reduce`'s operand/init/result element types must all
+/// agree). Hand-built (mirroring `mlir_type_of`'s `placeholder`-style tests):
+/// `set_type` on the `vector(...)` call gives `ops::lower_vector` a
+/// `node_kind` to convert its (already-`Int`) elements against, so this
+/// exercises `reduce_axis` exactly, with no dependency on the determinizer's
+/// const-fold or `modes.rs`'s free-parameter binding.
+#[test]
+fn sum_over_int_array_reduces_with_int_init_and_result() {
+    let mut m = Module::new();
+    let e1 = int(&mut m, 2);
+    let e2 = int(&mut m, 3);
+    let e3 = int(&mut m, 7);
+    let xs = call(&mut m, "vector", &[e1, e2, e3]);
+    m.set_type(
+        xs,
+        Type::Array {
+            shape: Box::new([Dim::Static(3)]),
+            elem: Box::new(Type::Scalar(ScalarType::Integer)),
+        },
+    );
+    let total = call(&mut m, "sum", &[xs]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    let result = e.lower_node(total).unwrap();
+    assert_eq!(result.ty, MlirTy::Scalar);
+    assert_eq!(result.elem, ElemKind::Int);
+    let out = e.finish("f", &[], &[&result]);
+    assert!(is_delimiter_balanced(&out));
+
+    let reduce_line = out
+        .lines()
+        .find(|l| l.contains("stablehlo.reduce("))
+        .expect("missing stablehlo.reduce line");
+    assert!(
+        reduce_line.contains("tensor<i32>") && !reduce_line.contains("f32"),
+        "sum over an int array must reduce entirely in i32 (operand+init+result):\n{reduce_line}"
+    );
+    let init_line = out
+        .lines()
+        .find(|l| l.contains("stablehlo.constant") && l.contains("dense<0>"))
+        .expect("missing the int-typed additive-identity init constant");
+    assert!(
+        init_line.contains("tensor<i32>"),
+        "the reduce's init constant must be i32, not the old hardcoded f32:\n{init_line}"
+    );
+}
+
+/// Fix-up regression (post-A2 review): an all-integer `in(k, interval(0,
+/// 10))` must still emit a well-typed `stablehlo.compare`. `ops::lower_in`'s
+/// `below`/`above`/`product` chain (`sub`/`mul`, kind-polymorphic) stays
+/// `Int` throughout since every operand here is a literal `Int`, but
+/// `lower_in`'s own `zero` constant is unconditionally `Real`
+/// (`Emitter::constant(0.0, ...)`) — so `Emitter::compare` must reconcile the
+/// mismatched pair (widening the `Int` product up to `Real`, per
+/// `elem_rank`'s order) rather than emitting `stablehlo.compare` over a
+/// declared-mismatched `(tensor<i32>, tensor<f32>)` operand pair. Every
+/// operand is a plain `Lit(Int)` (not a free/bound arg), so this needs no
+/// determinizer pass and cannot be const-folded (this test calls
+/// `Emitter::lower_node` directly, never `flatppl_determinizer::determinize`).
+#[test]
+fn all_integer_in_interval_reconciles_compare_operand_kinds() {
+    let mut m = Module::new();
+    let k = int(&mut m, 5);
+    let lo = int(&mut m, 0);
+    let hi = int(&mut m, 10);
+    let interval = call(&mut m, "interval", &[lo, hi]);
+    let cond = call(&mut m, "in", &[k, interval]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    let result = e.lower_node(cond).unwrap();
+    assert_eq!(result.ty, MlirTy::Scalar);
+    assert_eq!(result.elem, ElemKind::Bool);
+    let out = e.finish("f", &[], &[&result]);
+    assert!(is_delimiter_balanced(&out));
+
+    let compare_line = out
+        .lines()
+        .find(|l| l.contains("stablehlo.compare"))
+        .expect("missing stablehlo.compare line");
+    // Both operand types in the `(lhs, rhs) -> result` signature must agree
+    // with each other (both widened to f32) — a `(tensor<i32>, tensor<f32>)`
+    // pair would be the exact bug this test pins.
+    assert!(
+        !compare_line.contains("i32"),
+        "compare's product operand must be widened to real (matching the zero \
+         constant it's compared against), not left i32:\n{compare_line}"
+    );
+    // Task A2 (Bool result) must still hold.
+    assert!(
+        compare_line.contains("-> tensor<i1>"),
+        "compare's result stays i1:\n{compare_line}"
+    );
+}
+
+/// Fix-up regression (post-A2 review): an `ifelse` selecting between two
+/// `Int` (literal) branches must return an `Int`-tagged `Value` whose tag
+/// matches the emitted `i32` `stablehlo.select` — `Emitter::select` used to
+/// hardcode its result `elem: Real` regardless of the branches' actual kind.
+/// Reuses the all-`Int` `in(...)` predicate above as `ifelse`'s condition, so
+/// this also exercises `lower_ifelse`/`require_predicate_head` end to end
+/// over an all-integer expression.
+#[test]
+fn int_ifelse_select_returns_int_tagged_value() {
+    let mut m = Module::new();
+    let k = int(&mut m, 5);
+    let lo = int(&mut m, 0);
+    let hi = int(&mut m, 10);
+    let interval = call(&mut m, "interval", &[lo, hi]);
+    let cond = call(&mut m, "in", &[k, interval]);
+    let a = int(&mut m, 3);
+    let b = int(&mut m, 7);
+    let ifelse_node = call(&mut m, "ifelse", &[cond, a, b]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    let result = e.lower_node(ifelse_node).unwrap();
+    assert_eq!(result.ty, MlirTy::Scalar);
+    assert_eq!(result.elem, ElemKind::Int);
+    let out = e.finish("f", &[], &[&result]);
+    assert!(is_delimiter_balanced(&out));
+
+    let select_line = out
+        .lines()
+        .find(|l| l.contains("stablehlo.select"))
+        .expect("missing stablehlo.select line");
+    assert!(
+        select_line.contains("tensor<i32>") && !select_line.contains("f32"),
+        "an int ifelse must emit an i32 select (on_true/on_false/result), not the \
+         old hardcoded f32:\n{select_line}"
+    );
+}
+
 /// `ifelse(in(v, interval(lo, hi)), a, neg(inf))` — the exact shape the
 /// determiniser's `truncate` lowering builds — must lower to a single
 /// `compare` feeding a `select`, and `inf` must use the dtype-exact `+inf`
@@ -637,6 +872,7 @@ fn lower_ifelse_of_in_interval_selects_via_stablehlo_select() {
         Value {
             ssa: "%arg0".to_string(),
             ty: MlirTy::Scalar,
+            elem: ElemKind::Real,
         },
     );
     let result = e.lower_node(ifelse_node).unwrap();
@@ -679,6 +915,7 @@ fn lower_logsumexp_emits_stable_shift_by_max_formula_in_order() {
         Value {
             ssa: "%arg0".to_string(),
             ty: MlirTy::Ranked(vec![Some(3)]),
+            elem: ElemKind::Real,
         },
     );
     let result = e.lower_node(node).unwrap();
@@ -735,6 +972,7 @@ fn lower_logsumexp_of_vector_emits_concatenate_then_stable_formula() {
         Value {
             ssa: "%arg0".to_string(),
             ty: MlirTy::Scalar,
+            elem: ElemKind::Real,
         },
     );
     e.bind(
@@ -742,6 +980,7 @@ fn lower_logsumexp_of_vector_emits_concatenate_then_stable_formula() {
         Value {
             ssa: "%arg1".to_string(),
             ty: MlirTy::Scalar,
+            elem: ElemKind::Real,
         },
     );
     let result = e.lower_node(node).unwrap();
@@ -800,6 +1039,7 @@ fn lower_sum_reduces_to_scalar_via_reduce_sum() {
         Value {
             ssa: "%arg0".to_string(),
             ty: MlirTy::Ranked(vec![Some(3)]),
+            elem: ElemKind::Real,
         },
     );
     let result = e.lower_node(node).unwrap();
@@ -856,6 +1096,7 @@ fn lower_in_interval_reduces_to_one_compare() {
         Value {
             ssa: "%arg0".to_string(),
             ty: MlirTy::Scalar,
+            elem: ElemKind::Real,
         },
     );
     let result = e.lower_node(node).unwrap();
@@ -888,6 +1129,7 @@ fn lower_in_refuses_non_interval_set() {
         Value {
             ssa: "%arg0".to_string(),
             ty: MlirTy::Scalar,
+            elem: ElemKind::Real,
         },
     );
     let err = e.lower_node(node).unwrap_err();
@@ -913,6 +1155,7 @@ fn lower_get0_slices_and_reshapes_to_scalar() {
         Value {
             ssa: "%arg0".to_string(),
             ty: MlirTy::Ranked(vec![Some(5)]),
+            elem: ElemKind::Real,
         },
     );
     let result = e.lower_node(node).unwrap();
@@ -948,6 +1191,7 @@ fn lower_get_is_one_based() {
         Value {
             ssa: "%arg0".to_string(),
             ty: MlirTy::Ranked(vec![Some(5)]),
+            elem: ElemKind::Real,
         },
     );
     let result = e.lower_node(node).unwrap();
@@ -975,6 +1219,7 @@ fn lower_get0_refuses_non_rank1_container() {
         Value {
             ssa: "%arg0".to_string(),
             ty: MlirTy::Scalar,
+            elem: ElemKind::Real,
         },
     );
     let err = e.lower_node(node).unwrap_err();
@@ -998,6 +1243,7 @@ fn lower_get0_refuses_non_literal_index() {
         Value {
             ssa: "%arg0".to_string(),
             ty: MlirTy::Ranked(vec![Some(5)]),
+            elem: ElemKind::Real,
         },
     );
     let err = e.lower_node(node).unwrap_err();
@@ -1021,6 +1267,7 @@ fn lower_get0_refuses_out_of_range_index() {
         Value {
             ssa: "%arg0".to_string(),
             ty: MlirTy::Ranked(vec![Some(3)]),
+            elem: ElemKind::Real,
         },
     );
     let err = e.lower_node(node).unwrap_err();
@@ -1174,6 +1421,10 @@ fn lower_node_refuses_string_literal() {
     assert!(err.msg.contains("string literal"));
 }
 
+/// Task A2: an int/bool literal lowers as a rank-0 tensor at its OWN kind —
+/// `Int`/`Bool`, not `Real` — regardless of any inferred type (`Node::Lit`
+/// dispatch never consults the type side-table, only the literal's own
+/// `Scalar` tag; see [`Emitter::int_value_const`]/[`Emitter::bool_value_const`]).
 #[test]
 fn lower_node_lowers_int_and_bool_literals_as_scalars() {
     let mut m = Module::new();
@@ -1183,10 +1434,12 @@ fn lower_node_lowers_int_and_bool_literals_as_scalars() {
     let iv = e.lower_node(i).unwrap();
     let bv = e.lower_node(b).unwrap();
     assert_eq!(iv.ty, MlirTy::Scalar);
+    assert_eq!(iv.elem, ElemKind::Int);
     assert_eq!(bv.ty, MlirTy::Scalar);
-    let out = e.finish("f", &[], &[&bv]);
-    assert!(out.contains("dense<7"));
-    assert!(out.contains("dense<1"));
+    assert_eq!(bv.elem, ElemKind::Bool);
+    let out = e.finish("f", &[], &[&iv, &bv]);
+    assert!(out.contains("dense<7> : tensor<i32>"));
+    assert!(out.contains("dense<true> : tensor<i1>"));
 }
 
 /// A bare `Const` symbol (`inf`) is dispatched through the same builtin-head
@@ -3178,6 +3431,7 @@ fn lower_get_of_sampled_tuple_yields_advanced_rng_key() {
         Value {
             ssa: "%key".to_string(),
             ty: MlirTy::Key,
+            elem: ElemKind::Real,
         },
     );
     let v = e
@@ -3227,6 +3481,7 @@ fn lower_vector_of_vectors_lowers_to_rank2_tensor() {
         Value {
             ssa: "%arg0".to_string(),
             ty: MlirTy::Ranked(vec![Some(3)]),
+            elem: ElemKind::Real,
         },
     );
     e.bind(
@@ -3234,6 +3489,7 @@ fn lower_vector_of_vectors_lowers_to_rank2_tensor() {
         Value {
             ssa: "%arg1".to_string(),
             ty: MlirTy::Ranked(vec![Some(3)]),
+            elem: ElemKind::Real,
         },
     );
     let result = e.lower_node(node).unwrap();
@@ -3278,6 +3534,7 @@ fn lower_vector_refuses_ragged_elements() {
         Value {
             ssa: "%arg0".to_string(),
             ty: MlirTy::Ranked(vec![Some(2)]),
+            elem: ElemKind::Real,
         },
     );
     e.bind(
@@ -3285,6 +3542,7 @@ fn lower_vector_refuses_ragged_elements() {
         Value {
             ssa: "%arg1".to_string(),
             ty: MlirTy::Ranked(vec![Some(3)]),
+            elem: ElemKind::Real,
         },
     );
     let err = e.lower_node(node).unwrap_err();
@@ -3320,6 +3578,7 @@ fn lower_in_refuses_shape_mismatched_bound() {
         Value {
             ssa: "%arg0".to_string(),
             ty: MlirTy::Ranked(vec![Some(3)]), // different length than lo's
+            elem: ElemKind::Real,
         },
     );
     let err = e.lower_node(node).unwrap_err();
@@ -3350,6 +3609,7 @@ fn lower_get_refuses_selector_below_one_based_floor() {
         Value {
             ssa: "%arg0".to_string(),
             ty: MlirTy::Ranked(vec![Some(5)]),
+            elem: ElemKind::Real,
         },
     );
     let err = e.lower_node(node).unwrap_err();

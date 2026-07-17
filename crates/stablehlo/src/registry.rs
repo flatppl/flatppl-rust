@@ -13,7 +13,7 @@
 use flatppl_core::{CallHead, NamedKind, Node, NodeId, Scalar, ValueSet};
 
 use crate::emitter::Emitter;
-use crate::mlir::{MlirTy, Value};
+use crate::mlir::{ElemKind, MlirTy, Value};
 use crate::refuse::EmitError;
 
 /// `fn(emitter, params, variate) -> log f(variate; params)` — a
@@ -2512,7 +2512,7 @@ fn draw_gamma_scalar(e: &mut Emitter, shape: &Value, rate: &Value) -> Value {
     let i0 = e.int_const(0);
     let acc0 = e.bool_const(false);
     let res0 = e.scalar(0.0);
-    let float_ty = MlirTy::Scalar.render(e.dtype());
+    let float_ty = MlirTy::Scalar.render(e.dtype(), ElemKind::Real);
     let carried_tys = [
         "tensor<i32>".to_string(),
         "tensor<i1>".to_string(),
@@ -2624,7 +2624,7 @@ fn draw_gamma_batched(e: &mut Emitter, shape: &Value, rate: &Value, n: u64) -> V
     // The `[n]×i1` accept-mask and `[n]×f32` result carried-variable types
     // (MlirTy carries no i1 element type — see `Emitter::bool_batch_const`).
     let batch_i1 = format!("tensor<{n}xi1>");
-    let batch_f = MlirTy::Ranked(vec![Some(n)]).render(e.dtype());
+    let batch_f = MlirTy::Ranked(vec![Some(n)]).render(e.dtype(), ElemKind::Real);
     let carried_tys = ["tensor<i32>".to_string(), batch_i1, batch_f];
 
     let results = e.while_loop(
@@ -3120,7 +3120,7 @@ fn draw_poisson_scalar(e: &mut Emitter, rate: &Value) -> Value {
     let done0 = e.bool_const(false);
     let res0 = e.scalar(0.0);
 
-    let float_ty = MlirTy::Scalar.render(e.dtype());
+    let float_ty = MlirTy::Scalar.render(e.dtype(), ElemKind::Real);
     let carried_tys = [
         float_ty.clone(),         // k
         float_ty.clone(),         // cum = F(k)
@@ -3202,9 +3202,9 @@ fn draw_poisson_batched(e: &mut Emitter, rate: &Value, m: u64) -> Value {
     let done0 = e.bool_batch_const(m, false);
     let res0 = e.constant(0.0, batch_ty.clone());
 
-    let float_scalar = MlirTy::Scalar.render(e.dtype());
+    let float_scalar = MlirTy::Scalar.render(e.dtype(), ElemKind::Real);
     let batch_i1 = format!("tensor<{m}xi1>");
-    let batch_f = batch_ty.render(e.dtype());
+    let batch_f = batch_ty.render(e.dtype(), ElemKind::Real);
     let carried_tys = [
         float_scalar,    // k (scalar counter)
         batch_f.clone(), // cum = F(k) per lane
@@ -3347,7 +3347,7 @@ fn multinomial_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
     let zeros_k = e.constant(0.0, vec_ty.clone());
     let counts0 = e.constant(0.0, vec_ty.clone());
     let i0 = e.int_const(0);
-    let float_vec_ty = vec_ty.render(e.dtype());
+    let float_vec_ty = vec_ty.render(e.dtype(), ElemKind::Real);
     let carried_tys = ["tensor<i32>".to_string(), float_vec_ty];
 
     let results = e.while_loop(
