@@ -2542,8 +2542,8 @@ fn emit_logdensity_exponential_has_expected_structure() {
     );
     assert_eq!(
         out.matches("stablehlo.negate").count(),
-        1,
-        "expected exactly one negate, in:\n{out}"
+        2,
+        "expected exactly two negates (1 formula + 1 off-support -inf)"
     );
     assert_eq!(
         out.matches("stablehlo.add").count(),
@@ -2553,6 +2553,20 @@ fn emit_logdensity_exponential_has_expected_structure() {
     assert!(
         !out.contains("chlo."),
         "Exponential needs no CHLO ops, in:\n{out}"
+    );
+    // Constrained support (§08 support `nonnegreals`): masked to `-inf`
+    // off-support — a `compare` guards the variate into the support and two
+    // `select`s (guard, then off-support pick) wrap the formula, with `-inf`
+    // the negated `+inf` (`0x7F800000`) bit pattern. The in-support formula
+    // op counts above are unchanged (numerically identical in-support).
+    assert_eq!(
+        out.matches("stablehlo.select").count(),
+        2,
+        "expected exactly two selects (variate guard + off-support mask), in:\n{out}"
+    );
+    assert!(
+        out.contains("stablehlo.constant dense<0x7F800000>"),
+        "off-support -inf floor (negated +inf) missing, in:\n{out}"
     );
     assert!(is_delimiter_balanced(&out));
 }
@@ -2609,8 +2623,8 @@ fn emit_logdensity_gamma_has_expected_structure() {
     );
     assert_eq!(
         out.matches("stablehlo.negate").count(),
-        2,
-        "expected exactly two negates, in:\n{out}"
+        3,
+        "expected exactly three negates (2 formula + 1 off-support -inf)"
     );
     assert_eq!(
         out.matches("stablehlo.subtract").count(),
@@ -2626,6 +2640,20 @@ fn emit_logdensity_gamma_has_expected_structure() {
         out.matches("stablehlo.add").count(),
         3,
         "expected exactly three adds, in:\n{out}"
+    );
+    // Constrained support (§08 support `posreals`): masked to `-inf`
+    // off-support — a `compare` guards the variate into the support and two
+    // `select`s (guard, then off-support pick) wrap the formula, with `-inf`
+    // the negated `+inf` (`0x7F800000`) bit pattern. The in-support formula
+    // op counts above are unchanged (numerically identical in-support).
+    assert_eq!(
+        out.matches("stablehlo.select").count(),
+        2,
+        "expected exactly two selects (variate guard + off-support mask), in:\n{out}"
+    );
+    assert!(
+        out.contains("stablehlo.constant dense<0x7F800000>"),
+        "off-support -inf floor (negated +inf) missing, in:\n{out}"
     );
     assert!(is_delimiter_balanced(&out));
 }
@@ -2677,8 +2705,8 @@ fn emit_logdensity_weibull_has_expected_structure() {
     );
     assert_eq!(
         out.matches("stablehlo.negate").count(),
-        2,
-        "expected exactly two negates, in:\n{out}"
+        3,
+        "expected exactly three negates (2 formula + 1 off-support -inf)"
     );
     assert_eq!(
         out.matches("stablehlo.divide").count(),
@@ -2708,6 +2736,20 @@ fn emit_logdensity_weibull_has_expected_structure() {
     assert!(
         !out.contains("chlo."),
         "Weibull needs no CHLO ops, in:\n{out}"
+    );
+    // Constrained support (§08 support `nonnegreals`): masked to `-inf`
+    // off-support — a `compare` guards the variate into the support and two
+    // `select`s (guard, then off-support pick) wrap the formula, with `-inf`
+    // the negated `+inf` (`0x7F800000`) bit pattern. The in-support formula
+    // op counts above are unchanged (numerically identical in-support).
+    assert_eq!(
+        out.matches("stablehlo.select").count(),
+        2,
+        "expected exactly two selects (variate guard + off-support mask), in:\n{out}"
+    );
+    assert!(
+        out.contains("stablehlo.constant dense<0x7F800000>"),
+        "off-support -inf floor (negated +inf) missing, in:\n{out}"
     );
     assert!(is_delimiter_balanced(&out));
 }
@@ -2759,8 +2801,8 @@ fn emit_logdensity_pareto_has_expected_structure() {
     );
     assert_eq!(
         out.matches("stablehlo.negate").count(),
-        1,
-        "expected exactly one negate, in:\n{out}"
+        2,
+        "expected exactly two negates (1 formula + 1 off-support -inf)"
     );
     assert_eq!(
         out.matches("stablehlo.multiply").count(),
@@ -2775,6 +2817,20 @@ fn emit_logdensity_pareto_has_expected_structure() {
     assert!(
         !out.contains("chlo."),
         "Pareto needs no CHLO ops, in:\n{out}"
+    );
+    // Constrained support (§08 support `x >= scale`): masked to `-inf`
+    // off-support — a `compare` guards the variate into the support and two
+    // `select`s (guard, then off-support pick) wrap the formula, with `-inf`
+    // the negated `+inf` (`0x7F800000`) bit pattern. The in-support formula
+    // op counts above are unchanged (numerically identical in-support).
+    assert_eq!(
+        out.matches("stablehlo.select").count(),
+        2,
+        "expected exactly two selects (variate guard + off-support mask), in:\n{out}"
+    );
+    assert!(
+        out.contains("stablehlo.constant dense<0x7F800000>"),
+        "off-support -inf floor (negated +inf) missing, in:\n{out}"
     );
     assert!(is_delimiter_balanced(&out));
 }
@@ -2832,8 +2888,8 @@ fn emit_logdensity_inverse_gamma_has_expected_structure() {
     );
     assert_eq!(
         out.matches("stablehlo.negate").count(),
-        3,
-        "expected exactly three negates, in:\n{out}"
+        4,
+        "expected exactly four negates (3 formula + 1 off-support -inf)"
     );
     assert_eq!(
         out.matches("stablehlo.divide").count(),
@@ -2849,6 +2905,20 @@ fn emit_logdensity_inverse_gamma_has_expected_structure() {
         out.matches("stablehlo.add").count(),
         4,
         "expected exactly four adds, in:\n{out}"
+    );
+    // Constrained support (§08 support `posreals`): masked to `-inf`
+    // off-support — a `compare` guards the variate into the support and two
+    // `select`s (guard, then off-support pick) wrap the formula, with `-inf`
+    // the negated `+inf` (`0x7F800000`) bit pattern. The in-support formula
+    // op counts above are unchanged (numerically identical in-support).
+    assert_eq!(
+        out.matches("stablehlo.select").count(),
+        2,
+        "expected exactly two selects (variate guard + off-support mask), in:\n{out}"
+    );
+    assert!(
+        out.contains("stablehlo.constant dense<0x7F800000>"),
+        "off-support -inf floor (negated +inf) missing, in:\n{out}"
     );
     assert!(is_delimiter_balanced(&out));
 }
@@ -2907,8 +2977,8 @@ fn emit_logdensity_chi_squared_has_expected_structure() {
     );
     assert_eq!(
         out.matches("stablehlo.negate").count(),
-        3,
-        "expected exactly three negates, in:\n{out}"
+        4,
+        "expected exactly four negates (3 formula + 1 off-support -inf)"
     );
     assert_eq!(
         out.matches("stablehlo.subtract").count(),
@@ -2929,6 +2999,20 @@ fn emit_logdensity_chi_squared_has_expected_structure() {
         out.matches("stablehlo.add").count(),
         3,
         "expected exactly three adds, in:\n{out}"
+    );
+    // Constrained support (§08 support `posreals`): masked to `-inf`
+    // off-support — a `compare` guards the variate into the support and two
+    // `select`s (guard, then off-support pick) wrap the formula, with `-inf`
+    // the negated `+inf` (`0x7F800000`) bit pattern. The in-support formula
+    // op counts above are unchanged (numerically identical in-support).
+    assert_eq!(
+        out.matches("stablehlo.select").count(),
+        2,
+        "expected exactly two selects (variate guard + off-support mask), in:\n{out}"
+    );
+    assert!(
+        out.contains("stablehlo.constant dense<0x7F800000>"),
+        "off-support -inf floor (negated +inf) missing, in:\n{out}"
     );
     assert!(is_delimiter_balanced(&out));
 }
@@ -2982,8 +3066,8 @@ fn emit_logdensity_lognormal_has_expected_structure() {
     );
     assert_eq!(
         out.matches("stablehlo.negate").count(),
-        2,
-        "expected exactly two negates, in:\n{out}"
+        3,
+        "expected exactly three negates (2 formula + 1 off-support -inf)"
     );
     assert_eq!(
         out.matches("stablehlo.subtract").count(),
@@ -3008,6 +3092,20 @@ fn emit_logdensity_lognormal_has_expected_structure() {
     assert!(
         !out.contains("chlo."),
         "LogNormal needs no CHLO ops, in:\n{out}"
+    );
+    // Constrained support (§08 support `posreals`): masked to `-inf`
+    // off-support — a `compare` guards the variate into the support and two
+    // `select`s (guard, then off-support pick) wrap the formula, with `-inf`
+    // the negated `+inf` (`0x7F800000`) bit pattern. The in-support formula
+    // op counts above are unchanged (numerically identical in-support).
+    assert_eq!(
+        out.matches("stablehlo.select").count(),
+        2,
+        "expected exactly two selects (variate guard + off-support mask), in:\n{out}"
+    );
+    assert!(
+        out.contains("stablehlo.constant dense<0x7F800000>"),
+        "off-support -inf floor (negated +inf) missing, in:\n{out}"
     );
     assert!(is_delimiter_balanced(&out));
 }
@@ -3191,13 +3289,27 @@ fn emit_logdensity_beta_has_expected_structure() {
     );
     assert_eq!(
         out.matches("stablehlo.negate").count(),
-        2,
-        "expected exactly two negates, in:\n{out}"
+        3,
+        "expected exactly three negates (2 formula + 1 off-support -inf)"
     );
     assert_eq!(
         out.matches("stablehlo.add").count(),
         5,
         "expected exactly five adds, in:\n{out}"
+    );
+    // Constrained support (§08 support `unitinterval`): masked to `-inf`
+    // off-support — a `compare` guards the variate into the support and two
+    // `select`s (guard, then off-support pick) wrap the formula, with `-inf`
+    // the negated `+inf` (`0x7F800000`) bit pattern. The in-support formula
+    // op counts above are unchanged (numerically identical in-support).
+    assert_eq!(
+        out.matches("stablehlo.select").count(),
+        2,
+        "expected exactly two selects (variate guard + off-support mask), in:\n{out}"
+    );
+    assert!(
+        out.contains("stablehlo.constant dense<0x7F800000>"),
+        "off-support -inf floor (negated +inf) missing, in:\n{out}"
     );
     assert!(is_delimiter_balanced(&out));
 }
