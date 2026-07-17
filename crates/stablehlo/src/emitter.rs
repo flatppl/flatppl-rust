@@ -727,6 +727,64 @@ impl<'m> Emitter<'m> {
         }
     }
 
+    /// `get(operand, idx)` / `get0(...)` (spec §07) with a RUNTIME rank-1
+    /// `Int` selector `idx` (the `theta[person]`-style vector-index case —
+    /// `crate::ops::lower_get`'s fallback once its compile-time
+    /// `literal_index` fast path fails) — lowers `operand[idx]` (`operand`
+    /// rank-1, length `K`) at every position of `idx` (rank-1, length `N`,
+    /// `base`-based) to a rank-1 result of length `N`, via
+    /// `stablehlo.gather`. `base` (1 for `get`, 0 for `get0`) is subtracted
+    /// from `idx` first ([`Emitter::sub`], kind-polymorphic — stays `Int`,
+    /// auto-broadcasting the scalar `base` over `idx`'s shape) to land on
+    /// StableHLO's 0-based convention; FlatPPL indices are valid
+    /// `posintegers`, so the result is always in range after subtraction
+    /// (`stablehlo.gather` also clamps internally, but no explicit clamp is
+    /// needed here). The 1-D index vector is then reshaped `[N] -> [N, 1]`
+    /// (`index_vector_dim = 1`) before the generic-form `stablehlo.gather`
+    /// (no pretty form — same reasoning as [`Emitter::tri_solve`]): one
+    /// scalar slice per index (`slice_sizes = [1]`, `collapsed_slice_dims =
+    /// [0]`), gathered along `operand`'s only axis (`start_index_map =
+    /// [0]`). Dimension numbers are pinned VERBATIM against JAX/XLA's own
+    /// emission for `operand[idx]` — do not deviate. Result `elem` copies
+    /// `operand`'s (a gather of reals stays real, of ints stays int); both
+    /// `operand` and `idx` must already be rank-1 — `crate::ops::lower_get`'s
+    /// job to check before calling this.
+    pub fn gather(&mut self, operand: &Value, idx: &Value, base: i64) -> Value {
+        assert!(
+            matches!(&operand.ty, MlirTy::Ranked(dims) if dims.len() == 1),
+            "gather expects a rank-1 operand, got {:?}",
+            operand.ty
+        );
+        let n = match &idx.ty {
+            MlirTy::Ranked(dims) if dims.len() == 1 => dims[0],
+            other => panic!("gather expects a rank-1 index, got {other:?}"),
+        };
+        assert_eq!(
+            idx.elem,
+            ElemKind::Int,
+            "gather: index must be an Int tensor"
+        );
+
+        let base_const = self.int_value_const(base);
+        let idx0 = self.sub(idx, &base_const);
+        let idx2d = self.reshape(&idx0, MlirTy::Ranked(vec![n, Some(1)]));
+
+        let result_ty = MlirTy::Ranked(vec![n]);
+        let ssa = self.fresh();
+        let operand_ty = operand.ty.render(self.dtype, operand.elem);
+        let idx_ty = idx2d.ty.render(self.dtype, idx2d.elem);
+        let result_ty_text = result_ty.render(self.dtype, operand.elem);
+        self.push(&format!(
+            "{ssa} = \"stablehlo.gather\"({}, {}) <{{dimension_numbers = #stablehlo.gather<collapsed_slice_dims = [0], start_index_map = [0], index_vector_dim = 1>, indices_are_sorted = false, slice_sizes = array<i64: 1>}}> : ({operand_ty}, {idx_ty}) -> {result_ty_text}",
+            operand.ssa, idx2d.ssa
+        ));
+        Value {
+            ssa,
+            ty: result_ty,
+            elem: operand.elem,
+        }
+    }
+
     /// `%N = stablehlo.concatenate %a, %b, ..., dim = 0 : (op1_ty, op2_ty,
     /// ...) -> result_ty` — packs `elems` into a tensor one rank higher than
     /// each element, of length `elems.len()` along the new leading dim:
