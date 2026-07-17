@@ -305,6 +305,7 @@ static REGISTRY: &[(&str, DistLowering)] = &[
         DistLowering {
             logpdf: dirac_logpdf,
             sample: None,
+            touniform: None,
         },
     ),
 ];
