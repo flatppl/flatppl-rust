@@ -293,7 +293,7 @@ pub(crate) fn emit_logdensity_abi(
             ));
         }
         let name = format!("%arg{}", args.len());
-        let (mut ty, _elem) = mlir_type_of(m, binding.rhs, opts.dtype)?;
+        let (mut ty, elem) = mlir_type_of(m, binding.rhs, opts.dtype)?;
         // Shape-pin a fixed-phase input whose FlatPDL type carries a dynamic
         // dim (`load_data` → `tensor<?×f32>`) from the compile-time length map
         // (design doc "load_data — shape, not values"): `tensor<N×f32>`. A `?`
@@ -302,12 +302,16 @@ pub(crate) fn emit_logdensity_abi(
         if let Some(shape) = opts.input_shapes.get(m.resolve(sym)) {
             ty = MlirTy::Ranked(shape.iter().map(|&n| Some(n)).collect());
         }
+        // Use the inferred element kind (not a hardcoded `Real`): an integer /
+        // boolean `elementof` (or int `load_data`) input must arrive as an
+        // int/bool tensor arg so the value-path widening reconciles correctly.
+        // For a real input this is `ElemKind::Real` — byte-identical to before.
         e.bind(
             binding.rhs,
             Value {
                 ssa: name.clone(),
                 ty: ty.clone(),
-                elem: ElemKind::Real,
+                elem,
             },
         );
         args.push((name, ty));

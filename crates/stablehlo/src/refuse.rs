@@ -37,20 +37,30 @@
 //!   "selected query output contains no density/sample term (...)" (guards
 //!   the "last public binding is the query" convention)
 //!
-//! **`modes.rs`** (`emit_logdensity_abi`, the `inputs`/`outputs` ABI path,
-//! PR-1 — see [`crate::modes::Abi`]/[`crate::modes::read_abi`]):
+//! **`modes.rs`** (`emit_logdensity_abi`, the `inputs`/`outputs` ABI path —
+//! see [`crate::modes::Abi`]/[`crate::modes::read_abi`]):
 //! - an `elementof` parameter not listed in `inputs` — "elementof parameter
 //!   '...' is not listed in `inputs`; the inputs ABI is exhaustive ..."
 //!   (`inputs` is authoritative + exhaustive, design doc)
+//! - a fixed-phase input (`external`/`load_data`) reached by an output but
+//!   not listed in `inputs` — "fixed-phase binding '...' is reached by an
+//!   output but is not listed in `inputs`; list it in inputs to pass it as a
+//!   runtime argument (...)"
 //! - `outputs` missing or empty — "`outputs` ABI binding is missing or
 //!   empty; at least one output is required" (`EmitError::whole`)
 //! - an `inputs` entry naming a binding absent from the determinized module
 //!   — "`inputs` names '...', which is not a binding of the determinized
 //!   module" (`EmitError::whole`)
-//! - an `inputs` entry that is not an `elementof` parameter (i.e.
-//!   `external`/`load_data`) — "`inputs` entry '...' is not an elementof
-//!   parameter — external/load_data ABI inputs are not yet supported (PR-2
-//!   work)"
+//! - an `inputs` entry that is neither an `elementof` parameter nor a fixed
+//!   input (`external`/`load_data`) — e.g. a literal or a derived/computed
+//!   binding — "`inputs` entry '...' is not an elementof parameter, external,
+//!   or load_data input — only these constructs can be ABI arguments"
+//!
+//! (`external`/`load_data` inputs LISTED in `inputs` are supported — they
+//! become function arguments, `load_data` shape-pinned from
+//! [`crate::EmitOptions::input_shapes`], values never baked. The CLI-level
+//! refusal for an unsupported `load_data` file format is a `Failure::Refuse`
+//! in `crates/cli`, not an `EmitError`, so it is not cataloged here.)
 //!
 //! **`ops.rs`** (the deterministic builtin-head map):
 //! - `record(...)` reached in tensor position — "record has no tensor form"
