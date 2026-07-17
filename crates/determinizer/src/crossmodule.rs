@@ -71,10 +71,12 @@
 use std::collections::{HashMap, HashSet};
 
 use flatppl_core::{
-    Axis, Binding, Call, CallHead, Inputs, Module, NamedArg, NamedKind, Node, NodeId, Ref, RefNs,
-    Scalar, Symbol,
+    Axis, Binding, BindingId, Call, CallHead, Inputs, Module, NamedArg, NamedKind, Node, NodeId,
+    Ref, RefNs, Scalar, Symbol,
 };
 use flatppl_infer::ModuleBundle;
+
+use crate::refuse::RefuseError;
 
 /// A resolved cross-module kernel reference: the submodule that owns it, the
 /// member's node id in that submodule, and the host's load-time `%assign`
@@ -315,19 +317,186 @@ pub(crate) fn graft_subtree(
     resolved: &ResolvedRef<'_>,
     bundle: &ModuleBundle,
 ) -> Result<NodeId, String> {
-    let preexisting: HashSet<String> = host
-        .bindings()
-        .map(|(_, b)| host.resolve(b.name).to_string())
-        .collect();
+    let mut state = GraftState::new(host);
+    graft_subtree_with(host, resolved, bundle, &mut state)
+}
+
+/// Cross-module graft state that can OUTLIVE a single [`graft_subtree_with`] call
+/// so several grafts (the whole [`resolve_crossmodule_aliases`] pre-pass) share
+/// ONE dedup + collision + cycle registry (Buffy #359). The per-call
+/// [`graft_subtree`] builds a fresh one; the pre-pass threads a single instance
+/// across every alias graft so a shared submodule dependency (`theta1_dist`, or a
+/// `prior` reached from both the `prior` and the `posterior` alias) is grafted
+/// once and reused rather than colliding with the earlier graft's copy.
+///
+/// The three fields are exactly the [`GraftCtx`] fields whose LIFETIME the fix
+/// lifts from per-call to per-pass; `bundle`, `assign`, and `origin` stay per-call
+/// (each alias graft has its own `load_module` `%assign` context and origin path)
+/// and are rebuilt inside [`graft_subtree_with`].
+pub(crate) struct GraftState {
+    grafted: HashMap<String, String>,
+    preexisting: HashSet<String>,
+    in_progress: HashSet<String>,
+}
+
+impl GraftState {
+    /// Seed `preexisting` from the host bindings present when the pass begins — a
+    /// grafted submodule dependency whose name collides with one of these (and is
+    /// not `%assign`-linked or an alias slot) is an unrelated host binding: refuse.
+    pub(crate) fn new(host: &Module) -> Self {
+        let preexisting = host
+            .bindings()
+            .map(|(_, b)| host.resolve(b.name).to_string())
+            .collect();
+        GraftState {
+            grafted: HashMap::new(),
+            preexisting,
+            in_progress: HashSet::new(),
+        }
+    }
+
+    /// Record that host binding `host_name` already holds the value of submodule
+    /// member `member_name` loaded from `path`, so a later graft reaching the same
+    /// member DEDUPS onto this host binding (a diamond) instead of re-grafting or
+    /// refusing on the pre-existing host name. The composite origin key matches the
+    /// `origin-path\0member-name` key [`graft_binding`] computes for a directly-
+    /// grafted member (see [`GraftCtx::grafted`]).
+    pub(crate) fn seed_alias(&mut self, host_name: &str, path: &str, member_name: &str) {
+        self.grafted
+            .insert(host_name.to_string(), format!("{path}\u{0}{member_name}"));
+    }
+}
+
+/// Like [`graft_subtree`], but the dedup/collision/cycle registry (`state`) is
+/// supplied by the caller so it can PERSIST across several grafts. `state`'s
+/// `grafted`/`preexisting`/`in_progress` are moved into a fresh [`GraftCtx`] for
+/// this graft (alongside the per-call `bundle`/`assign`/`origin`) and moved back
+/// out on return, so the accumulated dedup state carries to the next graft. With a
+/// freshly-`new`'d `state` this is byte-identical to the old per-call
+/// [`graft_subtree`].
+pub(crate) fn graft_subtree_with(
+    host: &mut Module,
+    resolved: &ResolvedRef<'_>,
+    bundle: &ModuleBundle,
+    state: &mut GraftState,
+) -> Result<NodeId, String> {
     let mut ctx = GraftCtx {
         bundle,
         assign: resolved.assign.clone(),
-        preexisting,
-        grafted: HashMap::new(),
+        preexisting: std::mem::take(&mut state.preexisting),
+        grafted: std::mem::take(&mut state.grafted),
         origin: resolved.path.clone(),
-        in_progress: HashSet::new(),
+        in_progress: std::mem::take(&mut state.in_progress),
     };
-    graft_node(host, resolved.sub, resolved.member_rhs, &mut ctx)
+    let out = graft_node(host, resolved.sub, resolved.member_rhs, &mut ctx);
+    // Flush the (possibly grown) registry back so the next graft sees it.
+    state.grafted = ctx.grafted;
+    state.preexisting = ctx.preexisting;
+    state.in_progress = ctx.in_progress;
+    out
+}
+
+/// Determiniser PRE-PASS (Buffy #359): resolve every top-level host binding whose
+/// RHS is a bare cross-module `(%ref <alias> member)` ref IN PLACE, once, before
+/// the measure-reduction loop. For each such alias, graft the referenced submodule
+/// member's subtree into the host and REWRITE the alias binding's RHS to the
+/// grafted-local root (never a fresh orphan copy), threading ONE shared
+/// [`GraftState`] so a dependency shared across aliases is grafted once and reused.
+///
+/// After this pass no `RefNs::Module` ref remains among the resolved aliases, so
+/// the measure-reduction loop and the density lowering run on a self-contained
+/// host — collision-free, and the density variate destructuring (which follows
+/// only `SelfMod` refs) now sees a local record where it used to hit a dangling
+/// module ref (`joint value must be a record`).
+///
+/// Closes four gaps that all stem from grafting being copy-per-query with
+/// per-call dedup: the variate is now local (not just the measure), the alias
+/// binding is rewritten rather than orphaned (no dangling module ref under
+/// no-roots), a shared dependency reached from two queries dedups instead of
+/// colliding, and an alias whose name equals its submodule member (`prior =
+/// model.prior`) becomes that member's local slot with no self-collision.
+///
+/// Bindings whose RHS is a bare module ref that does NOT resolve to a
+/// `load_module` member (e.g. a `standard_module` ref, or a missing dependency)
+/// are left untouched for the existing lowering / conformance path.
+pub(crate) fn resolve_crossmodule_aliases(
+    host: &mut Module,
+    bundle: &ModuleBundle,
+) -> Result<(), RefuseError> {
+    // 1. Collect top-level bindings whose RHS is a bare cross-module ref.
+    let alias_refs: Vec<(BindingId, NodeId)> = host
+        .bindings()
+        .filter_map(|(bid, b)| match host.node(b.rhs) {
+            Node::Ref(Ref {
+                ns: RefNs::Module(_),
+                ..
+            }) => Some((bid, b.rhs)),
+            _ => None,
+        })
+        .collect();
+    if alias_refs.is_empty() {
+        return Ok(());
+    }
+
+    // 2. Resolve each alias against the bundle. `ResolvedRef` borrows only the
+    //    bundle (its `assign` node ids are owned host ids), so the plans outlive
+    //    the host reads below and coexist with the host mutation in step 4.
+    struct AliasPlan<'a> {
+        bid: BindingId,
+        ref_id: NodeId,
+        host_name: String,
+        member: String,
+        resolved: ResolvedRef<'a>,
+    }
+    let mut plans: Vec<AliasPlan<'_>> = Vec::new();
+    for (bid, ref_id) in alias_refs {
+        let (host_name, member) = {
+            let Node::Ref(Ref { name: member, .. }) = *host.node(ref_id) else {
+                continue;
+            };
+            (
+                host.resolve(host.binding(bid).name).to_string(),
+                host.resolve(member).to_string(),
+            )
+        };
+        // A ref that does not resolve to a `load_module` member (standard_module,
+        // missing dependency, absent member) is left for the existing path.
+        if let Some(resolved) = resolve_module_ref(bundle, host, ref_id) {
+            plans.push(AliasPlan {
+                bid,
+                ref_id,
+                host_name,
+                member,
+                resolved,
+            });
+        }
+    }
+    if plans.is_empty() {
+        return Ok(());
+    }
+
+    // 3. Seed the shared registry with the host slot each alias occupies BEFORE any
+    //    grafting, so a cross-reference from one alias's subtree to a sibling
+    //    alias's member (`posterior`'s body referencing the submodule `prior`)
+    //    dedups onto the sibling host alias binding instead of re-grafting it or
+    //    refusing on the pre-existing host name. Only a same-name alias (`prior =
+    //    model.prior`) can be reached this way: a grafted `(%ref self <member>)`
+    //    resolves to a host binding named `<member>`, which for a same-name alias
+    //    IS the alias binding.
+    let mut state = GraftState::new(host);
+    for p in &plans {
+        if p.host_name == p.member {
+            state.seed_alias(&p.host_name, &p.resolved.path, &p.member);
+        }
+    }
+
+    // 4. Graft each alias's subtree and rewrite its binding RHS in place.
+    for p in &plans {
+        let root = graft_subtree_with(host, &p.resolved, bundle, &mut state)
+            .map_err(|reason| crate::density::refuse(p.ref_id, host, &reason))?;
+        host.set_binding_rhs(p.bid, root);
+    }
+    Ok(())
 }
 
 fn graft_node(

@@ -1,7 +1,7 @@
 //! Cross-module measure-ref lowering: a `logdensityof`/`likelihoodof` whose
 //! measure resolves through a `(%ref <loaded-module> member)` into a loaded
 //! submodule graph carried by a [`flatppl_infer::ModuleBundle`].
-use flatppl_determinizer::determinize_with;
+use flatppl_determinizer::{determinize_with, determinize_with_roots};
 use flatppl_infer::ModuleBundle;
 use std::sync::Arc;
 
@@ -1323,5 +1323,196 @@ lp = logdensityof(outer.m, 0.5)";
         result
             .map(|l| flatppl_flatpir::write(&l))
             .unwrap_or_default()
+    );
+}
+
+// ===========================================================================
+// Buffy #359 — cross-module QUERY MODULE resolution (the pre-pass).
+//
+// A query module `load_module`s a model and scores its `prior`/`posterior` at a
+// cross-module VALUE (`model.default_pars`) via top-level ALIAS bindings
+// (`prior = model.prior`, `x = model.default_pars`). The determiniser pre-pass
+// resolves every such alias IN PLACE before the measure-reduction loop, so the
+// host is self-contained and both `flatppl determinize` (no roots) and the
+// with-roots path lower it. These are the four gaps closed:
+//   1. the VARIATE (arg2, `x`) is grafted, not just the measure — the variate
+//      destructuring sees a local `record` instead of `joint value must be a
+//      record`;
+//   2. the alias binding is rewritten in place, not orphaned — no dangling
+//      module ref survives under no roots;
+//   3. a dependency shared across two queries (`theta1_dist`, and `prior`
+//      reached from both `prior` and `posterior`) is grafted ONCE (shared dedup
+//      registry), not re-grafted into a collision;
+//   4. an alias whose name equals its submodule member (`prior = model.prior`)
+//      is that member's local slot — no self-collision.
+// ===========================================================================
+
+/// The scored model, mirroring `flatppl-examples/bayesian_inference_1.flatppl`:
+/// two independent priors assembled with `joint`, an IID-Normal forward model,
+/// a likelihood/posterior, and a `default_pars` record used as the query point.
+const BI1_SUB: &str = "flatppl_compat = \"0.1\"
+theta1_dist = Normal(0, 1)
+theta2_dist = Exponential(1)
+prior = joint(theta1 = theta1_dist, theta2 = theta2_dist)
+theta1 = elementof(reals)
+theta2 = elementof(reals)
+c = 5
+f_a = par -> c * par
+f_b = fn(abs(_) * _)
+a = f_a(theta2)
+b = f_b(theta1, theta2)
+obs ~ iid(Normal(mu = a, sigma = b), 10)
+forward_kernel = kernelof(record(obs = obs))
+observed_data = [1.2, 3.4, 5.1, 2.8, 4.0, 3.7, 5.5, 2.1, 4.3, 3.9]
+L = likelihoodof(forward_kernel, record(obs = observed_data))
+posterior = bayesupdate(L, prior)
+default_pars = record(theta1 = 0.5, theta2 = 1.0)";
+
+/// Build the `m.flatppl`-keyed bundle for [`BI1_SUB`] and the inferred host.
+fn bi1_host(host_src: &str) -> (flatppl_core::Module, ModuleBundle) {
+    let mut sub = parse(BI1_SUB);
+    let _ = flatppl_infer::infer(&mut sub);
+    let mut bundle = ModuleBundle::new();
+    bundle.insert("m.flatppl", Arc::new(sub));
+    let mut host = parse(host_src);
+    let _ = flatppl_infer::infer_module(&mut host, &bundle, flatppl_infer::Level::Shape);
+    (host, bundle)
+}
+
+/// Gaps 1, 2, 4 + numeric: a query module that scores the loaded model's `prior`
+/// at its `default_pars` via same-name alias bindings determinizes with NO roots
+/// (plain `flatppl determinize`) — the variate is grafted (no "joint value must
+/// be a record" refuse) and the alias is rewritten in place (no orphaned module
+/// ref survives the conformance check).
+///
+/// NUMERIC: the lowered `l1` is
+///   add(builtin_logdensityof(Normal, {mu=0,sigma=1}, 0.5),
+///       builtin_logdensityof(Exponential, {rate=1}, 1.0))
+/// which an INDEPENDENT scipy/closed-form oracle evaluates to
+///   Normal.logpdf(0.5;0,1) + Exponential.logpdf(1.0;rate=1) = -2.0439385…
+/// (the determiniser is symbolic-only; the oracle value pins the emitted terms).
+#[test]
+fn crossmodule_query_module_alias_lowers_no_roots() {
+    let host = "flatppl_compat = \"0.1\"
+model = load_module(\"m.flatppl\")
+prior = model.prior
+x = model.default_pars
+l1 = logdensityof(prior, x)";
+    let (h, bundle) = bi1_host(host);
+
+    let lowered = determinize_with(&h, &bundle).expect(
+        "a cross-module query module (prior = model.prior, x = model.default_pars) must \
+         determinize with no roots",
+    );
+    let pir = flatppl_flatpir::write(&lowered);
+
+    // Gap 1: the VARIATE `x` was grafted to a local record (not a dangling module
+    // ref), so the variate destructuring saw a record.
+    assert!(
+        pir.contains("(%field theta1 0.5)") && pir.contains("(%field theta2 1.0)"),
+        "the cross-module variate `x = model.default_pars` was not grafted to a local \
+         record; got:\n{pir}"
+    );
+    // Numeric structure: the two prior terms scored at the default point (oracle
+    // -2.0439385…). `mu=0,sigma=1` scored at 0.5; `rate=1` scored at 1.0.
+    assert!(
+        pir.contains("(builtin_logdensityof Normal")
+            && pir.contains("(%field mu 0) (%field sigma 1))) 0.5)"),
+        "l1's Normal prior term did not lower to builtin_logdensityof at 0.5; got:\n{pir}"
+    );
+    assert!(
+        pir.contains("(builtin_logdensityof Exponential") && pir.contains("(%field rate 1))) 1.0)"),
+        "l1's Exponential prior term did not lower to builtin_logdensityof at 1.0; got:\n{pir}"
+    );
+    // Gap 2 (no orphan): no residual cross-module ref — success already implies
+    // conformance, but assert the alias RHS is a local `joint`/record, not a
+    // module ref, by checking the module carries no `(%ref <alias> …)` form.
+    // (A surviving module ref renders with the loaded-module alias name.)
+    assert!(
+        !pir.contains("(%ref model "),
+        "an orphaned cross-module ref into `model` survived the pre-pass; got:\n{pir}"
+    );
+}
+
+/// Gap 3 (the crux): TWO queries sharing dependencies. `prior` and `posterior`
+/// are both cross-module aliases into the SAME loaded model; `posterior`'s body
+/// (`bayesupdate(L, prior)`) references the submodule `prior`, and both aliases
+/// transitively reach `theta1_dist`/`theta2_dist`. The shared per-pass dedup
+/// registry grafts each shared dependency ONCE and dedups the second reach — the
+/// pre-fix per-call registry re-grafted and collided (an "unrelated host binding"
+/// refuse). Determinizes with no roots, and the shared `theta1_dist` is bound
+/// exactly once.
+#[test]
+fn crossmodule_multi_query_shared_dep_dedups() {
+    let host = "flatppl_compat = \"0.1\"
+model = load_module(\"m.flatppl\")
+prior = model.prior
+posterior = model.posterior
+x = model.default_pars
+l1 = logdensityof(prior, x)
+l2 = logdensityof(posterior, x)";
+    let (h, bundle) = bi1_host(host);
+
+    let lowered = determinize_with(&h, &bundle).expect(
+        "two cross-module queries sharing dependencies (prior + posterior over the same \
+         loaded model) must determinize — the shared dep is grafted once, not collided",
+    );
+    let pir = flatppl_flatpir::write(&lowered);
+
+    // Both queries lowered.
+    assert!(
+        pir.contains("(%bind l1 ") && pir.contains("(%bind l2 "),
+        "both l1 and l2 must lower; got:\n{pir}"
+    );
+    assert!(
+        pir.contains("(builtin_logdensityof Normal")
+            && pir.contains("(builtin_logdensityof Exponential"),
+        "the shared prior terms must lower to builtin_logdensityof; got:\n{pir}"
+    );
+    // Shared-dep dedup: `theta1_dist`, reached via both `prior` and `posterior`,
+    // is grafted into the host EXACTLY ONCE (a re-graft would have collided/refused).
+    assert_eq!(
+        pir.matches("(%bind theta1_dist ").count(),
+        1,
+        "the shared submodule dependency `theta1_dist` must be grafted exactly once \
+         (deduped across the two queries); got:\n{pir}"
+    );
+}
+
+/// The same query module determinizes WITH roots too (root-based DCE): keeping
+/// only `l1`, the `load_module` handle and all unreferenced grafted scaffolding
+/// are dropped, leaving the self-contained scored density.
+#[test]
+fn crossmodule_query_module_alias_lowers_with_roots() {
+    let host = "flatppl_compat = \"0.1\"
+model = load_module(\"m.flatppl\")
+prior = model.prior
+posterior = model.posterior
+x = model.default_pars
+l1 = logdensityof(prior, x)
+l2 = logdensityof(posterior, x)";
+    let (mut h, bundle) = bi1_host(host);
+    let l1 = h.intern("l1");
+
+    let lowered = determinize_with_roots(&h, &bundle, Some(&[l1]))
+        .expect("the cross-module query module must determinize with roots (keep l1)");
+    let pir = flatppl_flatpir::write(&lowered);
+
+    // DCE dropped the load_module handle and every binding unreachable from l1.
+    assert!(
+        !pir.contains("load_module"),
+        "root-based DCE must drop the dead `model = load_module(…)` handle; got:\n{pir}"
+    );
+    assert!(
+        !pir.contains("(%bind l2 ") && !pir.contains("(%bind posterior "),
+        "only l1 and its dependencies should survive; got:\n{pir}"
+    );
+    // l1 still carries the two scored prior terms (oracle -2.0439385…).
+    assert!(
+        pir.contains("(builtin_logdensityof Normal")
+            && pir.contains("(%field mu 0) (%field sigma 1))) 0.5)")
+            && pir.contains("(builtin_logdensityof Exponential")
+            && pir.contains("(%field rate 1))) 1.0)"),
+        "l1 must retain both builtin_logdensityof prior terms under roots; got:\n{pir}"
     );
 }
