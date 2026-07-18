@@ -164,11 +164,25 @@ lp = logdensityof(d, data)";
         !pir.contains("(iid ") && !pir.contains("(logdensityof "),
         "no measure layer:\n{pir}"
     );
-    // The scalar params record scored per cell: Normal(mu=0.0, sigma=1.0), once.
+    // The params record scored per cell: Normal(mu=0.0, sigma=1.0), broadcast
+    // from a length-1 array-of-records (a bare record is not a legal broadcast
+    // input, §04 "Broadcasting" — see `lower_iid`'s primitive-kernel fast
+    // path), so each param is itself a singleton `vector(...)` fed through an
+    // inner `broadcast(record, …)`, once.
     assert_eq!(
-        pir.matches("(%field mu 0.0) (%field sigma 1.0)").count(),
+        pir.matches("(broadcast record (%kwarg mu").count(),
         1,
-        "one scalar Normal(0,1) params record, broadcast across the axis:\n{pir}"
+        "one length-1 array-of-records Normal(0,1) params, broadcast across the axis:\n{pir}"
+    );
+    assert_eq!(
+        pir.matches("(vector 0.0)").count(),
+        1,
+        "mu = 0.0 lifted to a length-1 vector once:\n{pir}"
+    );
+    assert_eq!(
+        pir.matches("(vector 1.0)").count(),
+        1,
+        "sigma = 1.0 lifted to a length-1 vector once:\n{pir}"
     );
 }
 
@@ -244,11 +258,23 @@ lp = logdensityof(d, data)";
         !pir.contains("(iid ") && !pir.contains("(logdensityof "),
         "no residual measure layer:\n{pir}"
     );
-    // The scalar params record scored per cell: Normal(mu=0.0, sigma=1.0), once.
+    // The params record scored per cell: Normal(mu=0.0, sigma=1.0), broadcast
+    // from a length-1 array-of-records, once (see the identical comment in
+    // `iid_normal_sum_structure` above).
     assert_eq!(
-        pir.matches("(%field mu 0.0) (%field sigma 1.0)").count(),
+        pir.matches("(broadcast record (%kwarg mu").count(),
         1,
-        "one scalar Normal(0,1) params record, broadcast across the axis:\n{pir}"
+        "one length-1 array-of-records Normal(0,1) params, broadcast across the axis:\n{pir}"
+    );
+    assert_eq!(
+        pir.matches("(vector 0.0)").count(),
+        1,
+        "mu = 0.0 lifted to a length-1 vector once:\n{pir}"
+    );
+    assert_eq!(
+        pir.matches("(vector 1.0)").count(),
+        1,
+        "sigma = 1.0 lifted to a length-1 vector once:\n{pir}"
     );
 }
 
@@ -354,11 +380,23 @@ lp = logdensityof(d, data)";
         3,
         "each outer get0 projects a full inner-iid ROW (array[2]), not a scalar:\n{pir}"
     );
-    // All three outer rows score the SAME leaf kernel/params: Normal(mu=0.0, sigma=1.0).
+    // All three outer rows score the SAME leaf kernel/params: Normal(mu=0.0,
+    // sigma=1.0), each broadcast from its own length-1 array-of-records (see
+    // the identical comment in `iid_normal_sum_structure` above).
     assert_eq!(
-        pir.matches("(%field mu 0.0) (%field sigma 1.0)").count(),
+        pir.matches("(broadcast record (%kwarg mu").count(),
         3,
         "all three outer rows score Normal(0,1):\n{pir}"
+    );
+    assert_eq!(
+        pir.matches("(vector 0.0)").count(),
+        3,
+        "mu = 0.0 lifted to a length-1 vector once per outer row:\n{pir}"
+    );
+    assert_eq!(
+        pir.matches("(vector 1.0)").count(),
+        3,
+        "sigma = 1.0 lifted to a length-1 vector once per outer row:\n{pir}"
     );
 }
 

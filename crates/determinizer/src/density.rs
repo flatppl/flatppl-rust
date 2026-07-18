@@ -2834,13 +2834,19 @@ pub(crate) fn iid_static_size(m: &Module, iid_node: NodeId) -> Option<usize> {
 /// **Axis-native fast path for a PRIMITIVE `M`.** When `M` is a bare
 /// distribution constructor (`split_kernel_constructor` succeeds — e.g.
 /// `Normal(mu = a, sigma = b)`), the Σ is emitted as ONE axis-level expression
-/// — `sum(broadcast(builtin_logdensityof, K, record(params), v))` — identical
-/// for `N = 3` or `N = 3000`, rather than `N` unrolled `get0`/`add` terms (see
-/// [`emit_kernel_broadcast_density`], shared with [`lower_broadcast_kernel`]'s
-/// value-broadcast case). `M`'s params are scored as a SCALAR record that
-/// `broadcast` replicates across the obs axis, since a primitive `iid`'s
-/// per-copy kernel is the SAME distribution at every index (unlike a
-/// value-broadcast's per-cell param arrays).
+/// — `sum(broadcast(builtin_logdensityof, K, broadcast(record, p = vector(a),
+/// …), v))` — identical for `N = 3` or `N = 3000`, rather than `N` unrolled
+/// `get0`/`add` terms (see [`emit_kernel_broadcast_density`], shared with
+/// [`lower_broadcast_kernel`]'s value-broadcast case). `M`'s params are a
+/// length-1 ARRAY-of-records (a bare record is not a legal broadcast input,
+/// §04 "Broadcasting", "Disallowed inputs") that singleton-expands across the
+/// obs axis, since a primitive `iid`'s per-copy kernel is the SAME
+/// distribution at every index (unlike a value-broadcast's per-cell param
+/// arrays). Each scalar param is lifted to a length-1 `vector(param)` first —
+/// `vector(record(…))` directly is rejected by §03's array-literal-element
+/// restriction, so the array-of-records is synthesized the same way
+/// [`lower_broadcast_kernel`] does, via `broadcast(record, …)` over length-1
+/// arrays rather than the `vector` literal constructor.
 ///
 /// **Composed-`M` fallback: static unroll.** When `M` is not a bare
 /// constructor (a `joint`, `pushfwd`, nested `iid`, …), `split_kernel_constructor`
@@ -2893,10 +2899,45 @@ fn lower_iid(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseEr
 
     // Primitive-kernel fast path: M is a bare distribution constructor
     // (`split_kernel_constructor` succeeds). Emit the axis-native broadcast form
-    // — a SCALAR params record broadcast across the obs axis `v`, summed. This is
-    // the card's target and reuses the tested `lower_broadcast_kernel` tail.
+    // — a length-1 array-of-params-record singleton-expanded across the obs
+    // axis `v`, summed. This is the card's target and reuses the tested
+    // `lower_broadcast_kernel` tail.
     if let Some((ctor_sym, kwargs)) = split_kernel_constructor(m, m_inner) {
-        let kernel_input = build_record(m, &kwargs);
+        // `broadcast` disallows a bare record/tuple input (§04 "Broadcasting",
+        // "Disallowed inputs"): the params must be a COLLECTION. Building
+        // `vector(record(...))` directly does NOT work — §03 forbids a record
+        // as an array LITERAL element (`vector_type` in
+        // `flatppl-infer::ops::vector_type` rejects it outright), so a
+        // `vector`-of-records is not constructible that way. Instead reuse
+        // exactly the mechanism [`lower_broadcast_kernel`] uses to produce its
+        // (real, multi-cell) array-of-records: `broadcast(record, p0 = arr0,
+        // …)` synthesizes `Array{elem: Record}` structurally in
+        // `broadcast_type`, which is NOT subject to the literal-vector element
+        // restriction. Each scalar param is first lifted to a length-1
+        // `vector(param)`, so `broadcast(record, …)` sees length-1 array
+        // arguments and produces a length-1 array-of-records that
+        // singleton-expands across the obs axis (§04 "Size-one array axes are
+        // implicitly expanded by repetition to match the size of the other
+        // collection arguments") — the same per-copy kernel at every index.
+        let broadcast_sym = m.intern("broadcast");
+        let record_head = {
+            let record_sym = m.intern("record");
+            m.alloc(Node::Const(record_sym))
+        };
+        let record_kwargs: Vec<NamedArg> = kwargs
+            .iter()
+            .map(|&(name, value)| NamedArg {
+                kind: NamedKind::Kwarg,
+                name,
+                value: build_call(m, "vector", &[value]),
+            })
+            .collect();
+        let kernel_input = m.alloc(Node::Call(Call {
+            head: CallHead::Builtin(broadcast_sym),
+            args: vec![record_head].into(),
+            named: record_kwargs.into(),
+            inputs: None,
+        }));
         return Ok(emit_kernel_broadcast_density(m, ctor_sym, kernel_input, v));
     }
 
