@@ -3019,6 +3019,26 @@ fn lower_broadcast_kernel(
     // `builtin_logdensityof` head is applied per cell to the scalar constructor
     // tag `K` and the zipped (kernel_input, obs) pair; `sum` reduces the array of
     // per-cell log-densities to the scalar joint density.
+    Ok(emit_kernel_broadcast_density(
+        m,
+        ctor_sym,
+        kernel_inputs,
+        obs,
+    ))
+}
+
+/// Emit `sum(broadcast(builtin_logdensityof, K, kernel_input, obs))` — the
+/// axis-native kernel-broadcast density tail. `kernel_input` is the per-cell
+/// constructor record (an array-of-records for a value-broadcast, or a SCALAR
+/// record for `iid`, which broadcast replicates across the obs axis). Shared by
+/// [`lower_broadcast_kernel`] and [`lower_iid`]'s primitive fast path.
+fn emit_kernel_broadcast_density(
+    m: &mut Module,
+    ctor_sym: Symbol,
+    kernel_input: NodeId,
+    obs: NodeId,
+) -> NodeId {
+    let broadcast_sym = m.intern("broadcast");
     let kernel = m.alloc(Node::Const(ctor_sym));
     let ldo_head = {
         let ldo_sym = m.intern("builtin_logdensityof");
@@ -3026,11 +3046,11 @@ fn lower_broadcast_kernel(
     };
     let per_cell = m.alloc(Node::Call(Call {
         head: CallHead::Builtin(broadcast_sym),
-        args: vec![ldo_head, kernel, kernel_inputs, obs].into(),
+        args: vec![ldo_head, kernel, kernel_input, obs].into(),
         named: Vec::<NamedArg>::new().into(),
         inputs: None,
     }));
-    Ok(build_call(m, "sum", &[per_cell]))
+    build_call(m, "sum", &[per_cell])
 }
 
 /// `logdensityof(joint(M₁,…,Mₖ), v)` = `Σ logdensityof(Mᵢ, get0(v, i))`
