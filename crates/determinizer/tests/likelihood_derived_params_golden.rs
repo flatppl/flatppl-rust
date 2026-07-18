@@ -111,13 +111,15 @@ fn bi1_posterior_lp_density_is_self_contained_wrt_theta() {
         .expect("bi1 posterior with derived kernel params must lower, not refuse");
     let pir = flatppl_flatpir::write(&out);
 
-    // SAME 12 terms as bi2/bi3/bi4: 10 obs-likelihood (iid(Normal, 10)) + 2 prior
-    // (theta1 Normal, theta2 Exponential). The through-binding θ-inline changes the
-    // SHAPE of the kernel-param record (a/b get inlined) but NOT the term count.
+    // The obs-likelihood (iid(Normal(mu=a, sigma=b), 10), a PRIMITIVE kernel)
+    // lowers to ONE axis-native broadcast term, not 10 unrolled terms (see
+    // `lower_iid`'s primitive-kernel fast path) + 2 prior terms (theta1 Normal,
+    // theta2 Exponential) = 3. The through-binding θ-inline changes the SHAPE of
+    // the kernel-param record (a/b get inlined) but NOT the term count.
     assert_eq!(
         pir.matches("builtin_logdensityof").count(),
-        12,
-        "expected 10 obs-likelihood + 2 prior terms; got:\n{pir}"
+        3,
+        "expected 1 obs-likelihood broadcast head + 2 prior terms; got:\n{pir}"
     );
 
     // The heart of the fix: the `lp` density subtree's transitive dependency
@@ -178,11 +180,11 @@ fn twohop_posterior_lp_density_is_self_contained_wrt_theta() {
         .expect("two-hop derived kernel param posterior must lower, not refuse");
     let pir = flatppl_flatpir::write(&out);
 
-    // Same 12 terms as BI1_POSTERIOR: 10 obs-likelihood + 2 prior.
+    // Same 3 terms as BI1_POSTERIOR: 1 obs-likelihood broadcast head + 2 prior.
     assert_eq!(
         pir.matches("builtin_logdensityof").count(),
-        12,
-        "expected 10 obs-likelihood + 2 prior terms; got:\n{pir}"
+        3,
+        "expected 1 obs-likelihood broadcast head + 2 prior terms; got:\n{pir}"
     );
 
     // The heart of the fix, exercised through TWO hops: `a2`'s RHS references
@@ -241,11 +243,11 @@ fn diamond_posterior_lp_density_is_self_contained_wrt_theta() {
         .expect("diamond-dependency posterior must lower, not refuse");
     let pir = flatppl_flatpir::write(&out);
 
-    // Same 12 terms as BI1_POSTERIOR: 10 obs-likelihood + 2 prior.
+    // Same 3 terms as BI1_POSTERIOR: 1 obs-likelihood broadcast head + 2 prior.
     assert_eq!(
         pir.matches("builtin_logdensityof").count(),
-        12,
-        "expected 10 obs-likelihood + 2 prior terms; got:\n{pir}"
+        3,
+        "expected 1 obs-likelihood broadcast head + 2 prior terms; got:\n{pir}"
     );
 
     // The heart of the fix, exercised on a SHARED derived binding: `cc` is

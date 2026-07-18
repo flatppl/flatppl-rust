@@ -43,15 +43,18 @@ fn lowers_bi3_posterior_to_builtin_logdensityof() {
     let pir = flatppl_flatpir::write(
         &determinize(&parse_infer(BI3_POSTERIOR)).expect("bi3 posterior must lower once wired"),
     );
-    // Pin the term structure: 10 obs-likelihood terms (iid(Normal, 10)) + 2 prior
-    // terms (theta1 Normal, theta2 Gamma) = 12 — the SAME density bi1
+    // Pin the term structure: the obs-likelihood (iid(Normal(mu=theta1,
+    // sigma=theta2), 10), a PRIMITIVE kernel) lowers to ONE axis-native
+    // broadcast term (`sum(broadcast(builtin_logdensityof, Normal, …))`, not 10
+    // unrolled terms — see `lower_iid`'s primitive-kernel fast path) + 2 prior
+    // terms (theta1 Normal, theta2 Gamma) = 3 — the SAME density bi1
     // (explicit joint) and bi2 (lawof prior) produce for this model. A dropped
     // prior term, a kernel/marginal swap, or a wrong distribution would change this
     // count.
     assert_eq!(
         pir.matches("builtin_logdensityof").count(),
-        12,
-        "expected 10 obs-likelihood + 2 prior terms; got:\n{pir}"
+        3,
+        "expected 1 obs-likelihood broadcast head + 2 prior terms; got:\n{pir}"
     );
     assert!(
         !pir.contains("disintegrate"),
@@ -85,15 +88,15 @@ fn restrict_lowers_same_as_bi3_disintegrate() {
         &determinize(&parse_infer(BI4_RESTRICT_POSTERIOR))
             .expect("bi4 restrict posterior must lower via the restrict desugaring"),
     );
-    // The SAME 12 terms as the bi3 disintegrate case: 10 obs-likelihood terms
-    // (iid(Normal, 10)) + 2 prior terms (theta1 Normal, theta2 Exponential). This
-    // pins `restrict ≡ bayesupdate(likelihoodof(kernel, x), marginal)` for the
-    // model — a dropped term, a kernel/marginal swap, or a wrong desugaring would
-    // change the count.
+    // The SAME 3 terms as the bi3 disintegrate case: the obs-likelihood
+    // (iid(Normal, 10), primitive kernel) as 1 axis-native broadcast head + 2
+    // prior terms (theta1 Normal, theta2 Exponential). This pins `restrict ≡
+    // bayesupdate(likelihoodof(kernel, x), marginal)` for the model — a dropped
+    // term, a kernel/marginal swap, or a wrong desugaring would change the count.
     assert_eq!(
         pir.matches("builtin_logdensityof").count(),
-        12,
-        "expected 10 obs-likelihood + 2 prior terms; got:\n{pir}"
+        3,
+        "expected 1 obs-likelihood broadcast head + 2 prior terms; got:\n{pir}"
     );
     assert!(
         !pir.contains("restrict"),
@@ -118,16 +121,17 @@ lp = logdensityof(post, record(theta1 = 0.5, theta2 = 1.0))";
 fn restrict_keyword_splat_lowers() {
     // `restrict(joint_model, obs = observed_data)` — the keyword-splat form, no
     // explicit `record(...)` — must desugar and lower identically to the
-    // explicit-record form above: the SAME 12 `builtin_logdensityof` terms (10
-    // obs-likelihood + 2 prior), proving the two forms are equivalent.
+    // explicit-record form above: the SAME 3 `builtin_logdensityof` terms (1
+    // obs-likelihood broadcast head + 2 prior), proving the two forms are
+    // equivalent.
     let pir = flatppl_flatpir::write(
         &determinize(&parse_infer(BI4_RESTRICT_KEYWORD_SPLAT))
             .expect("bi4 restrict keyword-splat posterior must lower via the restrict desugaring"),
     );
     assert_eq!(
         pir.matches("builtin_logdensityof").count(),
-        12,
-        "expected 10 obs-likelihood + 2 prior terms (same as the explicit-record form); got:\n{pir}"
+        3,
+        "expected 1 obs-likelihood broadcast head + 2 prior terms (same as the explicit-record form); got:\n{pir}"
     );
     assert!(
         !pir.contains("restrict"),
@@ -340,10 +344,11 @@ lp = logdensityof(posterior, record(theta1 = 0.5, theta2 = 1.0))";
 #[test]
 fn disintegrate_valid_aliased_fields_lowers() {
     // The valid direction must still lower when the SELECTED field is aliased
-    // (`data = obs`): 10 obs-likelihood terms + 2 prior terms = 12, the SAME
-    // density as the non-aliased bi3 case. The fix resolves the selected field
-    // `data` to its binding `obs` (not the label `data`), so the closed-marginal
-    // guard sees selected {obs} ∩ non-selected {theta1, theta2} = ∅ and does not
+    // (`data = obs`): the obs-likelihood (primitive iid kernel) as 1
+    // axis-native broadcast head + 2 prior terms = 3, the SAME density as the
+    // non-aliased bi3 case. The fix resolves the selected field `data` to its
+    // binding `obs` (not the label `data`), so the closed-marginal guard sees
+    // selected {obs} ∩ non-selected {theta1, theta2} = ∅ and does not
     // over-refuse. Proves the namespace fix is binding-name-correct, not
     // "refuse-more".
     let pir = flatppl_flatpir::write(
@@ -352,8 +357,8 @@ fn disintegrate_valid_aliased_fields_lowers() {
     );
     assert_eq!(
         pir.matches("builtin_logdensityof").count(),
-        12,
-        "expected 10 obs-likelihood + 2 prior terms; got:\n{pir}"
+        3,
+        "expected 1 obs-likelihood broadcast head + 2 prior terms; got:\n{pir}"
     );
     assert!(
         !pir.contains("disintegrate"),

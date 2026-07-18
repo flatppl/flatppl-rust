@@ -2826,11 +2826,28 @@ pub(crate) fn iid_static_size(m: &Module, iid_node: NodeId) -> Option<usize> {
 /// literal), since `flatppl_infer` (at `Level::Shape`) has already folded the
 /// size into that static shape. A genuinely dynamic size, or a multi-axis /
 /// vector `size` (e.g. `[2, 3]`), is refused ([`iid_static_size`] returns
-/// `None`). Static unroll (corpus N small; broadcast+reduce is the noted scale
-/// path, not built).
+/// `None`).
 /// `N == 0` is the empty independent product: Σ over an empty index set is 0, so
 /// it lowers to the log-density literal `0.0` (consistent with the empty measure
 /// `record()`), not a refusal.
+///
+/// **Axis-native fast path for a PRIMITIVE `M`.** When `M` is a bare
+/// distribution constructor (`split_kernel_constructor` succeeds — e.g.
+/// `Normal(mu = a, sigma = b)`), the Σ is emitted as ONE axis-level expression
+/// — `sum(broadcast(builtin_logdensityof, K, record(params), v))` — identical
+/// for `N = 3` or `N = 3000`, rather than `N` unrolled `get0`/`add` terms (see
+/// [`emit_kernel_broadcast_density`], shared with [`lower_broadcast_kernel`]'s
+/// value-broadcast case). `M`'s params are scored as a SCALAR record that
+/// `broadcast` replicates across the obs axis, since a primitive `iid`'s
+/// per-copy kernel is the SAME distribution at every index (unlike a
+/// value-broadcast's per-cell param arrays).
+///
+/// **Composed-`M` fallback: static unroll.** When `M` is not a bare
+/// constructor (a `joint`, `pushfwd`, nested `iid`, …), `split_kernel_constructor`
+/// fails and this falls back to the `get0`/`fold_add` unroll below (corpus N
+/// small). This is a TEMPORARY fallback — the axis-native
+/// functionof-broadcast-lambda path for composed kernels is a follow-up, not
+/// this one.
 ///
 /// **No scalar-`M` guard — deliberate asymmetry with [`lower_joint`].** `iid(M,
 /// size)` is the product `M^⊗N` over ARRAYS of shape `size`, i.e. a NESTED variate
@@ -2838,8 +2855,9 @@ pub(crate) fn iid_static_size(m: &Module, iid_node: NodeId) -> Option<usize> {
 /// `iid` bullet). So `get0(v, i)` recovers the full i-th
 /// `M`-variate (an entire row), which is exactly what this rule scores `M` at —
 /// correct for ANY `M`, scalar or not (a non-scalar `M`, e.g. `iid(MvNormal, n)`
-/// or a nested `iid(iid(…), n)`, lowers correctly, its inner variate reached by a
-/// further `get0`). `joint`, by contrast, has a HETEROGENEOUS variate: the flat
+/// or a nested `iid(iid(…), n)`, lowers correctly via the unroll fallback, its
+/// inner variate reached by a further `get0`). `joint`, by contrast, has a
+/// HETEROGENEOUS variate: the flat
 /// `cat` of its component variates, so `joint`'s positional `get0(v, i)` only
 /// aligns when every component is scalar — hence the scalar-component guard in
 /// [`lower_joint`]. Adding that guard here would WRONGLY refuse valid non-scalar
@@ -2872,6 +2890,19 @@ fn lower_iid(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseEr
     if n == 0 {
         return Ok(m.alloc(Node::Lit(Scalar::Real(0.0))));
     }
+
+    // Primitive-kernel fast path: M is a bare distribution constructor
+    // (`split_kernel_constructor` succeeds). Emit the axis-native broadcast form
+    // — a SCALAR params record broadcast across the obs axis `v`, summed. This is
+    // the card's target and reuses the tested `lower_broadcast_kernel` tail.
+    if let Some((ctor_sym, kwargs)) = split_kernel_constructor(m, m_inner) {
+        let kernel_input = build_record(m, &kwargs);
+        return Ok(emit_kernel_broadcast_density(m, ctor_sym, kernel_input, v));
+    }
+
+    // Composed inner measure (joint / pushfwd / nested iid): temporary fallback to
+    // the per-element `get0` unroll. Replaced by the functionof-broadcast lambda
+    // path in a follow-up task.
     let mut terms = Vec::with_capacity(n);
     for i in 0..n {
         let idx = m.alloc(Node::Lit(Scalar::Int(i as i64)));

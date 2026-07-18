@@ -250,14 +250,15 @@ lp = logdensityof(helpers.L, record(center = 0.0))";
 /// GAP D (Symptom 1 — iid size on a freshly-grafted target): a cross-module
 /// likelihood HANDLE `m.L` whose kernel wraps a STATIC-size `iid(Normal, 3)`,
 /// with the kernel bound SEPARATELY in the submodule (`k = functionof(iid(...),
-/// center = center)`). Scoring `logdensityof(m.L, θ)` must unroll the iid into 3
-/// per-element density terms. Before the fix, grafting `m.L` inlined the iid
-/// subtree UNTYPED and the very same lowering call read `iid_static_size` off the
-/// (still type-less) iid node → `None` → refuse ("iid size is not a
-/// statically-resolved 1-D count"), even though the identical model lowers fine
-/// same-module (where inference had already typed the iid). The defer-and-reloop
-/// fix grafts first, reloops so inference types the grafted iid domain, then
-/// lowers with a resolved static size.
+/// center = center)`). Scoring `logdensityof(m.L, θ)` must lower the iid to its
+/// axis-native broadcast density (a PRIMITIVE `Normal` kernel — see
+/// `lower_iid`'s primitive-kernel fast path). Before the fix, grafting `m.L`
+/// inlined the iid subtree UNTYPED and the very same lowering call read
+/// `iid_static_size` off the (still type-less) iid node → `None` → refuse ("iid
+/// size is not a statically-resolved 1-D count"), even though the identical
+/// model lowers fine same-module (where inference had already typed the iid).
+/// The defer-and-reloop fix grafts first, reloops so inference types the
+/// grafted iid domain, then lowers with a resolved static size.
 #[test]
 fn cross_module_iid_kernel_handle_lowers() {
     let helpers = "\
@@ -287,11 +288,16 @@ lp = logdensityof(helpers.L, record(a = 0.0))";
         pir.contains("builtin_logdensityof"),
         "cross-module iid-kernel handle did not lower to builtin_logdensityof; got:\n{pir}"
     );
-    // The static-size-3 iid unrolls to exactly three per-element density terms.
+    // The static-size-3 iid over a primitive Normal kernel lowers to ONE
+    // axis-native broadcast head, not 3 unrolled terms.
     let n_terms = pir.matches("builtin_logdensityof").count();
     assert_eq!(
-        n_terms, 3,
-        "iid(Normal, 3) must unroll to 3 builtin_logdensityof terms; got {n_terms}:\n{pir}"
+        n_terms, 1,
+        "iid(Normal, 3) must lower to one broadcast head; got {n_terms}:\n{pir}"
+    );
+    assert!(
+        pir.contains("(broadcast builtin_logdensityof Normal") && pir.contains("(sum "),
+        "iid density is sum(broadcast(builtin_logdensityof, Normal, …)):\n{pir}"
     );
 }
 
