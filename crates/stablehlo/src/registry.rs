@@ -780,6 +780,50 @@ const FANOUT_SAFE: &[&str] = &[
     "NegativeBinomial2",
 ];
 
+// ---- constrained-support masking -------------------------------------------
+
+/// Mask a constrained-support continuous log-density to the measure-theoretic
+/// `-inf` off-support (spec §08 "Variate domain and support": "outside the
+/// support the density is zero"; a zero density is a `-inf` log-density). Two
+/// distinct concerns, both handled here:
+///
+/// 1. **Value.** A distribution's density is only defined on its support; a
+///    builder's closed-form log-density formula returns a finite but *wrong*
+///    number (Exponential: `log(rate) - rate*x` at `x < 0`) or a `nan`
+///    (anything reading `log(x)`/`log(1-x)`/`scale/x` off-support) there.
+///    `superpose` mixtures make this observable: `logsumexp` evaluates *every*
+///    mixand at the *same* point, so a `Gamma` mixand seen at a `Normal`
+///    sibling's `x <= 0` must contribute `-inf` (density 0), never a wrong
+///    number or a `nan` that poisons the whole sum.
+///
+/// 2. **Gradient (reverse-mode / HMC).** `stablehlo.select` is *elementwise*,
+///    not short-circuit: a `nan` in the unused branch is discarded for the
+///    forward VALUE but still poisons the reverse-mode gradient. So it is not
+///    enough to wrap `select(in_support, formula(x), -inf)` around a `formula`
+///    that still computes `log(x)` on a negative `x`. Instead the formula is
+///    evaluated at `x' = select(in_support, x, safe)`, where `safe` is a
+///    constant strictly inside the support — so no `log`/division in `body`
+///    ever sees an off-support input, keeping BOTH the value and the gradient
+///    `nan`-free — and only then masked: `select(in_support, body(x'), -inf)`.
+///
+/// `in_support` is an `i1` predicate at `v`'s shape (an [`Emitter::compare`]/
+/// [`Emitter::and`] result); `safe` a constant in the support; `body` the
+/// distribution's existing closed-form log-density, computed on the guarded
+/// variate `x'` this passes it (NOT the raw `v`).
+fn mask_support(
+    e: &mut Emitter,
+    v: &Value,
+    in_support: &Value,
+    safe: &Value,
+    body: impl FnOnce(&mut Emitter, &Value) -> Result<Value, EmitError>,
+) -> Result<Value, EmitError> {
+    let v_safe = e.select(in_support, v, safe);
+    let dens = body(e, &v_safe)?;
+    let pos_inf = e.inf(dens.ty.clone());
+    let neg_inf = e.neg(&pos_inf);
+    Ok(e.select(in_support, &dens, &neg_inf))
+}
+
 // ---- §08 Normal -------------------------------------------------------------
 
 /// §08 Normal, verbatim: `log f = -log(sigma) - 1/2 * log(2*pi) - (x -
@@ -1035,11 +1079,18 @@ fn laplace_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
 fn exponential_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
     let rate = p.get(e, "rate")?;
 
-    let log_rate = e.log(&rate);
-    let rate_x = e.mul(&rate, v);
-    let neg_rate_x = e.neg(&rate_x);
+    // §08 Exponential support is `nonnegreals`: `-inf` off-support (a wrong
+    // finite value otherwise, since the formula has no `log(x)` to `nan` on).
+    let zero = e.scalar(0.0);
+    let in_support = e.compare("GE", v, &zero);
+    let safe = e.scalar(1.0);
+    mask_support(e, v, &in_support, &safe, |e, v| {
+        let log_rate = e.log(&rate);
+        let rate_x = e.mul(&rate, v);
+        let neg_rate_x = e.neg(&rate_x);
 
-    Ok(e.add(&log_rate, &neg_rate_x))
+        Ok(e.add(&log_rate, &neg_rate_x))
+    })
 }
 
 /// §08 Exponential's sampling transform, verbatim: `-log(U) / rate`, `U ~
@@ -1063,23 +1114,30 @@ fn gamma_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitErr
     let shape = p.get(e, "shape")?;
     let rate = p.get(e, "rate")?;
 
-    let log_rate = e.log(&rate);
-    let shape_log_rate = e.mul(&shape, &log_rate);
+    // §08 Gamma support is `posreals`: `-inf` off-support (`log(x)` would `nan`
+    // at `x <= 0`); the formula is evaluated at a guarded `x > 0`.
+    let zero = e.scalar(0.0);
+    let in_support = e.compare("GT", v, &zero);
+    let safe = e.scalar(1.0);
+    mask_support(e, v, &in_support, &safe, |e, v| {
+        let log_rate = e.log(&rate);
+        let shape_log_rate = e.mul(&shape, &log_rate);
 
-    let lgamma_shape = e.lgamma(&shape);
-    let neg_lgamma_shape = e.neg(&lgamma_shape);
+        let lgamma_shape = e.lgamma(&shape);
+        let neg_lgamma_shape = e.neg(&lgamma_shape);
 
-    let one = e.scalar(1.0);
-    let shape_minus_one = e.sub(&shape, &one);
-    let log_x = e.log(v);
-    let shape_minus_one_log_x = e.mul(&shape_minus_one, &log_x);
+        let one = e.scalar(1.0);
+        let shape_minus_one = e.sub(&shape, &one);
+        let log_x = e.log(v);
+        let shape_minus_one_log_x = e.mul(&shape_minus_one, &log_x);
 
-    let rate_x = e.mul(&rate, v);
-    let neg_rate_x = e.neg(&rate_x);
+        let rate_x = e.mul(&rate, v);
+        let neg_rate_x = e.neg(&rate_x);
 
-    let t1 = e.add(&shape_log_rate, &neg_lgamma_shape);
-    let t2 = e.add(&t1, &shape_minus_one_log_x);
-    Ok(e.add(&t2, &neg_rate_x))
+        let t1 = e.add(&shape_log_rate, &neg_lgamma_shape);
+        let t2 = e.add(&t1, &shape_minus_one_log_x);
+        Ok(e.add(&t2, &neg_rate_x))
+    })
 }
 
 /// §08 Weibull, verbatim: with `u = x / scale`, `log f = log(shape) -
@@ -1088,22 +1146,30 @@ fn weibull_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitE
     let shape = p.get(e, "shape")?;
     let scale = p.get(e, "scale")?;
 
-    let log_shape = e.log(&shape);
-    let log_scale = e.log(&scale);
-    let neg_log_scale = e.neg(&log_scale);
+    // §08 Weibull support is `nonnegreals`: `-inf` off-support. `log(x/scale)`
+    // would `nan` at `x <= 0` (and diverge at the measure-zero boundary `x = 0`
+    // for `shape != 1`), so the formula is evaluated at a guarded `x > 0`.
+    let zero = e.scalar(0.0);
+    let in_support = e.compare("GT", v, &zero);
+    let safe = e.scalar(1.0);
+    mask_support(e, v, &in_support, &safe, |e, v| {
+        let log_shape = e.log(&shape);
+        let log_scale = e.log(&scale);
+        let neg_log_scale = e.neg(&log_scale);
 
-    let u = e.div(v, &scale);
-    let log_u = e.log(&u);
-    let one = e.scalar(1.0);
-    let shape_minus_one = e.sub(&shape, &one);
-    let shape_minus_one_log_u = e.mul(&shape_minus_one, &log_u);
+        let u = e.div(v, &scale);
+        let log_u = e.log(&u);
+        let one = e.scalar(1.0);
+        let shape_minus_one = e.sub(&shape, &one);
+        let shape_minus_one_log_u = e.mul(&shape_minus_one, &log_u);
 
-    let u_pow_shape = e.pow(&u, &shape);
-    let neg_u_pow_shape = e.neg(&u_pow_shape);
+        let u_pow_shape = e.pow(&u, &shape);
+        let neg_u_pow_shape = e.neg(&u_pow_shape);
 
-    let t1 = e.add(&log_shape, &neg_log_scale);
-    let t2 = e.add(&t1, &shape_minus_one_log_u);
-    Ok(e.add(&t2, &neg_u_pow_shape))
+        let t1 = e.add(&log_shape, &neg_log_scale);
+        let t2 = e.add(&t1, &shape_minus_one_log_u);
+        Ok(e.add(&t2, &neg_u_pow_shape))
+    })
 }
 
 /// §08 Weibull's sampling transform, verbatim: `scale * (-log(U))^(1 /
@@ -1133,18 +1199,25 @@ fn pareto_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitEr
     let shape = p.get(e, "shape")?;
     let scale = p.get(e, "scale")?;
 
-    let log_shape = e.log(&shape);
-    let log_scale = e.log(&scale);
-    let shape_log_scale = e.mul(&shape, &log_scale);
+    // §08 Pareto's density is defined only for `x >= x_m` (the `scale`
+    // parameter, "the minimum value of the support"): `-inf` below `scale` (a
+    // wrong finite value otherwise). `scale > 0`, so it is itself a valid
+    // in-support guard value (`log(scale)` is finite).
+    let in_support = e.compare("GE", v, &scale);
+    mask_support(e, v, &in_support, &scale, |e, v| {
+        let log_shape = e.log(&shape);
+        let log_scale = e.log(&scale);
+        let shape_log_scale = e.mul(&shape, &log_scale);
 
-    let one = e.scalar(1.0);
-    let shape_plus_one = e.add(&shape, &one);
-    let log_x = e.log(v);
-    let shape_plus_one_log_x = e.mul(&shape_plus_one, &log_x);
-    let neg_shape_plus_one_log_x = e.neg(&shape_plus_one_log_x);
+        let one = e.scalar(1.0);
+        let shape_plus_one = e.add(&shape, &one);
+        let log_x = e.log(v);
+        let shape_plus_one_log_x = e.mul(&shape_plus_one, &log_x);
+        let neg_shape_plus_one_log_x = e.neg(&shape_plus_one_log_x);
 
-    let t1 = e.add(&log_shape, &shape_log_scale);
-    Ok(e.add(&t1, &neg_shape_plus_one_log_x))
+        let t1 = e.add(&log_shape, &shape_log_scale);
+        Ok(e.add(&t1, &neg_shape_plus_one_log_x))
+    })
 }
 
 /// §08 Pareto's sampling transform, verbatim: `scale * U^(-1 / shape)`
@@ -1173,24 +1246,31 @@ fn inverse_gamma_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value,
     let shape = p.get(e, "shape")?;
     let scale = p.get(e, "scale")?;
 
-    let log_scale = e.log(&scale);
-    let shape_log_scale = e.mul(&shape, &log_scale);
+    // §08 InverseGamma support is `posreals`: `-inf` off-support (`log(x)` and
+    // `scale/x` would `nan`/diverge at `x <= 0`); formula guarded at `x > 0`.
+    let zero = e.scalar(0.0);
+    let in_support = e.compare("GT", v, &zero);
+    let safe = e.scalar(1.0);
+    mask_support(e, v, &in_support, &safe, |e, v| {
+        let log_scale = e.log(&scale);
+        let shape_log_scale = e.mul(&shape, &log_scale);
 
-    let lgamma_shape = e.lgamma(&shape);
-    let neg_lgamma_shape = e.neg(&lgamma_shape);
+        let lgamma_shape = e.lgamma(&shape);
+        let neg_lgamma_shape = e.neg(&lgamma_shape);
 
-    let one = e.scalar(1.0);
-    let shape_plus_one = e.add(&shape, &one);
-    let log_x = e.log(v);
-    let shape_plus_one_log_x = e.mul(&shape_plus_one, &log_x);
-    let neg_shape_plus_one_log_x = e.neg(&shape_plus_one_log_x);
+        let one = e.scalar(1.0);
+        let shape_plus_one = e.add(&shape, &one);
+        let log_x = e.log(v);
+        let shape_plus_one_log_x = e.mul(&shape_plus_one, &log_x);
+        let neg_shape_plus_one_log_x = e.neg(&shape_plus_one_log_x);
 
-    let scale_over_x = e.div(&scale, v);
-    let neg_scale_over_x = e.neg(&scale_over_x);
+        let scale_over_x = e.div(&scale, v);
+        let neg_scale_over_x = e.neg(&scale_over_x);
 
-    let t1 = e.add(&shape_log_scale, &neg_lgamma_shape);
-    let t2 = e.add(&t1, &neg_shape_plus_one_log_x);
-    Ok(e.add(&t2, &neg_scale_over_x))
+        let t1 = e.add(&shape_log_scale, &neg_lgamma_shape);
+        let t2 = e.add(&t1, &neg_shape_plus_one_log_x);
+        Ok(e.add(&t2, &neg_scale_over_x))
+    })
 }
 
 /// §08 ChiSquared, verbatim: with `half_k = k / 2`, `log f = -half_k *
@@ -1204,28 +1284,35 @@ fn inverse_gamma_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value,
 fn chi_squared_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
     let k = p.get(e, "k")?;
 
-    let half = e.scalar(0.5);
-    let half_k = e.mul(&half, &k);
+    // §08 ChiSquared support is `posreals`: `-inf` off-support (`log(x)` would
+    // `nan` at `x <= 0`); formula guarded at `x > 0`.
+    let zero = e.scalar(0.0);
+    let in_support = e.compare("GT", v, &zero);
+    let safe = e.scalar(1.0);
+    mask_support(e, v, &in_support, &safe, |e, v| {
+        let half = e.scalar(0.5);
+        let half_k = e.mul(&half, &k);
 
-    let ln_two = e.scalar(std::f64::consts::LN_2);
-    let half_k_ln_two = e.mul(&half_k, &ln_two);
-    let neg_half_k_ln_two = e.neg(&half_k_ln_two);
+        let ln_two = e.scalar(std::f64::consts::LN_2);
+        let half_k_ln_two = e.mul(&half_k, &ln_two);
+        let neg_half_k_ln_two = e.neg(&half_k_ln_two);
 
-    let lgamma_half_k = e.lgamma(&half_k);
-    let neg_lgamma_half_k = e.neg(&lgamma_half_k);
+        let lgamma_half_k = e.lgamma(&half_k);
+        let neg_lgamma_half_k = e.neg(&lgamma_half_k);
 
-    let one = e.scalar(1.0);
-    let half_k_minus_one = e.sub(&half_k, &one);
-    let log_x = e.log(v);
-    let half_k_minus_one_log_x = e.mul(&half_k_minus_one, &log_x);
+        let one = e.scalar(1.0);
+        let half_k_minus_one = e.sub(&half_k, &one);
+        let log_x = e.log(v);
+        let half_k_minus_one_log_x = e.mul(&half_k_minus_one, &log_x);
 
-    let two = e.scalar(2.0);
-    let x_over_two = e.div(v, &two);
-    let neg_x_over_two = e.neg(&x_over_two);
+        let two = e.scalar(2.0);
+        let x_over_two = e.div(v, &two);
+        let neg_x_over_two = e.neg(&x_over_two);
 
-    let t1 = e.add(&neg_half_k_ln_two, &neg_lgamma_half_k);
-    let t2 = e.add(&t1, &half_k_minus_one_log_x);
-    Ok(e.add(&t2, &neg_x_over_two))
+        let t1 = e.add(&neg_half_k_ln_two, &neg_lgamma_half_k);
+        let t2 = e.add(&t1, &half_k_minus_one_log_x);
+        Ok(e.add(&t2, &neg_x_over_two))
+    })
 }
 
 /// §08 LogNormal, verbatim: `log f = -log(x) - log(sigma) - 1/2 * log(2*pi) -
@@ -1240,23 +1327,30 @@ fn lognormal_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, Emi
     let mu = p.get(e, "mu")?;
     let sigma = p.get(e, "sigma")?;
 
-    let log_x = e.log(v);
-    let neg_log_x = e.neg(&log_x);
+    // §08 LogNormal support is `posreals`: `-inf` off-support (`log(x)` would
+    // `nan` at `x <= 0`); formula guarded at `x > 0`.
+    let zero = e.scalar(0.0);
+    let in_support = e.compare("GT", v, &zero);
+    let safe = e.scalar(1.0);
+    mask_support(e, v, &in_support, &safe, |e, v| {
+        let log_x = e.log(v);
+        let neg_log_x = e.neg(&log_x);
 
-    let log_sigma = e.log(&sigma);
-    let neg_log_sigma = e.neg(&log_sigma);
+        let log_sigma = e.log(&sigma);
+        let neg_log_sigma = e.neg(&log_sigma);
 
-    let c = e.scalar(-0.5 * (2.0 * std::f64::consts::PI).ln());
+        let c = e.scalar(-0.5 * (2.0 * std::f64::consts::PI).ln());
 
-    let diff = e.sub(&log_x, &mu);
-    let z = e.div(&diff, &sigma);
-    let neg_half = e.scalar(-0.5);
-    let z_sq = e.mul(&z, &z);
-    let quad = e.mul(&neg_half, &z_sq);
+        let diff = e.sub(&log_x, &mu);
+        let z = e.div(&diff, &sigma);
+        let neg_half = e.scalar(-0.5);
+        let z_sq = e.mul(&z, &z);
+        let quad = e.mul(&neg_half, &z_sq);
 
-    let t1 = e.add(&neg_log_x, &neg_log_sigma);
-    let t2 = e.add(&t1, &c);
-    Ok(e.add(&t2, &quad))
+        let t1 = e.add(&neg_log_x, &neg_log_sigma);
+        let t2 = e.add(&t1, &c);
+        Ok(e.add(&t2, &quad))
+    })
 }
 
 /// §08 LogNormal's sampling transform, verbatim: `exp(mu + sigma * Z)`, `Z ~
@@ -1403,27 +1497,39 @@ fn beta_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitErro
     let alpha = p.get(e, "alpha")?;
     let beta = p.get(e, "beta")?;
 
-    let one = e.scalar(1.0);
-    let alpha_minus_one = e.sub(&alpha, &one);
-    let log_x = e.log(v);
-    let t1 = e.mul(&alpha_minus_one, &log_x);
+    // §08 Beta support is `unitinterval`: `-inf` outside `0 < x < 1` (both
+    // `log(x)` and `log(1 - x)` would `nan`); formula guarded to that interval
+    // (the endpoints are a measure-zero boundary where `x^{a-1}` diverges for
+    // `a < 1`, so the strict `<`/`>` guard also avoids a `nan` there).
+    let zero = e.scalar(0.0);
+    let one_bound = e.scalar(1.0);
+    let above_zero = e.compare("GT", v, &zero);
+    let below_one = e.compare("LT", v, &one_bound);
+    let in_support = e.and(&above_zero, &below_one);
+    let safe = e.scalar(0.5);
+    mask_support(e, v, &in_support, &safe, |e, v| {
+        let one = e.scalar(1.0);
+        let alpha_minus_one = e.sub(&alpha, &one);
+        let log_x = e.log(v);
+        let t1 = e.mul(&alpha_minus_one, &log_x);
 
-    let beta_minus_one = e.sub(&beta, &one);
-    let one_minus_x = e.sub(&one, v);
-    let log_one_minus_x = e.log(&one_minus_x);
-    let t2 = e.mul(&beta_minus_one, &log_one_minus_x);
+        let beta_minus_one = e.sub(&beta, &one);
+        let one_minus_x = e.sub(&one, v);
+        let log_one_minus_x = e.log(&one_minus_x);
+        let t2 = e.mul(&beta_minus_one, &log_one_minus_x);
 
-    let lgamma_alpha = e.lgamma(&alpha);
-    let neg_lgamma_alpha = e.neg(&lgamma_alpha);
-    let lgamma_beta = e.lgamma(&beta);
-    let neg_lgamma_beta = e.neg(&lgamma_beta);
-    let alpha_plus_beta = e.add(&alpha, &beta);
-    let lgamma_alpha_plus_beta = e.lgamma(&alpha_plus_beta);
+        let lgamma_alpha = e.lgamma(&alpha);
+        let neg_lgamma_alpha = e.neg(&lgamma_alpha);
+        let lgamma_beta = e.lgamma(&beta);
+        let neg_lgamma_beta = e.neg(&lgamma_beta);
+        let alpha_plus_beta = e.add(&alpha, &beta);
+        let lgamma_alpha_plus_beta = e.lgamma(&alpha_plus_beta);
 
-    let t3 = e.add(&t1, &t2);
-    let t4 = e.add(&neg_lgamma_alpha, &neg_lgamma_beta);
-    let t5 = e.add(&t4, &lgamma_alpha_plus_beta);
-    Ok(e.add(&t3, &t5))
+        let t3 = e.add(&t1, &t2);
+        let t4 = e.add(&neg_lgamma_alpha, &neg_lgamma_beta);
+        let t5 = e.add(&t4, &lgamma_alpha_plus_beta);
+        Ok(e.add(&t3, &t5))
+    })
 }
 
 /// §08 StudentT, verbatim: with `half_nu_plus_one = (nu + 1) / 2`, `log f =
