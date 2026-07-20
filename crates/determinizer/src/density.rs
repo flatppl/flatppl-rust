@@ -2851,9 +2851,33 @@ pub(crate) fn iid_static_size(m: &Module, iid_node: NodeId) -> Option<usize> {
 /// **Composed-`M` fallback: static unroll.** When `M` is not a bare
 /// constructor (a `joint`, `pushfwd`, nested `iid`, …), `split_kernel_constructor`
 /// fails and this falls back to the `get0`/`fold_add` unroll below (corpus N
-/// small). This is a TEMPORARY fallback — the axis-native
-/// functionof-broadcast-lambda path for composed kernels is a follow-up, not
-/// this one.
+/// small).
+///
+/// **Axis-native functionof-broadcast was tried and REJECTED for this case —
+/// StableHLO cannot lower it.** The natural generalization of the primitive
+/// fast path — lower `density(M, x)` once against a fresh `%local`
+/// placeholder `x`, wrap it in a one-input `functionof`, and
+/// `sum(broadcast(functionof(...), v))` — round-trips fine through
+/// `flatppl-js` (scipy oracle == exact) but crashes `crates/stablehlo`'s
+/// emitter: `Emitter::lower_broadcast_userfn`
+/// (`crates/stablehlo/src/emitter.rs:2296`) binds the placeholder to the
+/// *whole* collection value (rank `[N, …M-shape]`) and relies on the body's
+/// own arithmetic auto-broadcasting against it — a fusion model that only
+/// works for a SIMPLE scalar-arithmetic body. A COMPOSED `M`'s density body
+/// contains its own nested `sum(broadcast(...))` (e.g. `M = iid(Normal, k)`'s
+/// own primitive fast path), whose inner `broadcast_pair` then reconciles its
+/// own rank-1 kernel-param shape against the OUTER placeholder still bound to
+/// the full multi-row collection — a genuine rank mismatch, not a missing
+/// `broadcast_in_dim`: `Emitter::broadcast_pair` (emitter.rs:1527) panics
+/// (`rank mismatch ([Some(3), Some(2)] vs [Some(1)])`) rather than silently
+/// mislowering. This is an architectural gap (no notion of "evaluate the body
+/// once per top-level slice" in `lower_broadcast_userfn`), not a one-line
+/// fix, so the composed case keeps the unroll below rather than shipping a
+/// form that fails the StableHLO leg of the three-way gate. Reproduced with
+/// `logdensityof(iid(iid(Normal(mu = 0.0, sigma = 1.0), 2), 3), <shape-[3,2]
+/// literal>)`; fixing `lower_broadcast_userfn` to evaluate a reified body
+/// once per top-level slice (rather than once against the whole collection)
+/// is an open `crates/stablehlo` follow-up, not attempted here.
 ///
 /// **No scalar-`M` guard — deliberate asymmetry with [`lower_joint`].** `iid(M,
 /// size)` is the product `M^⊗N` over ARRAYS of shape `size`, i.e. a NESTED variate
@@ -2942,8 +2966,13 @@ fn lower_iid(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseEr
     }
 
     // Composed inner measure (joint / pushfwd / nested iid): temporary fallback to
-    // the per-element `get0` unroll. Replaced by the functionof-broadcast lambda
-    // path in a follow-up task.
+    // the per-element `get0` unroll. The axis-native functionof-broadcast lambda
+    // path was implemented and three-way tested for this case and REJECTED — see
+    // the doc comment above ("Axis-native functionof-broadcast was tried and
+    // REJECTED for this case") — StableHLO's `lower_broadcast_userfn` cannot
+    // lower a reified body that itself contains a nested `sum(broadcast(...))`
+    // (a genuine rank-mismatch panic in `Emitter::broadcast_pair`, not a missing
+    // `broadcast_in_dim`). Keep unrolling here until that emitter gap is fixed.
     let mut terms = Vec::with_capacity(n);
     for i in 0..n {
         let idx = m.alloc(Node::Lit(Scalar::Int(i as i64)));
