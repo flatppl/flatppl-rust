@@ -178,24 +178,42 @@ fn lower_logsumexp(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value
     Ok(e.add(&log_sum, &m))
 }
 
-/// Broadcast a `Scalar` value `a` up to `ty`'s shape via
-/// [`Emitter::broadcast_in_dim`] when the shapes differ; returns `a`
-/// unchanged (no op emitted) when they already match — e.g. `logsumexp`
-/// over a length-1 vector, or `in`'s bound already matching a scalar
-/// variate. Refuses rather than mis-emitting a shape-mismatched op if `a`
-/// isn't a `Scalar` to begin with: broadcasting a *ranked* operand up to a
-/// bigger shape needs an explicit dimension mapping this emitter has no
-/// caller for yet.
+/// Broadcast a value `a` up to `ty`'s shape via [`Emitter::broadcast_in_dim`]
+/// when the shapes differ; returns `a` unchanged (no op emitted) when they
+/// already match — e.g. `logsumexp` over a length-1 vector, or `in`'s bound
+/// already matching a scalar variate. Two shape-mismatched forms are
+/// supported, both under an IDENTITY dimension mapping (spec §04
+/// "Broadcasting" — size-1 axes expand by repetition, never NumPy-style
+/// rank-prepending):
+///
+/// - `a` is a `Scalar`: the established rank-0 `dims = []` broadcast form
+///   (`logsumexp`'s reduced max, `in`'s interval bounds — both callers'
+///   existing case, unchanged);
+/// - `a` is `Ranked` with the SAME RANK as `ty` and every axis either
+///   already matches `ty`'s or is size-1 (a length-1 `iid(Dist, n)`
+///   parameter broadcasting up to the length-`n` variate's shape, reached
+///   here if a future caller passes a ranked size-1 operand — today's two
+///   callers only ever pass a `Scalar` `a`, so this arm is not yet
+///   exercised but is no longer refused).
+///
+/// Refuses (rather than mis-emitting a shape-mismatched op) for anything
+/// else — a rank mismatch, or an axis that is neither equal nor size-1.
 fn broadcast_to(e: &mut Emitter, id: NodeId, a: &Value, ty: &MlirTy) -> Result<Value, EmitError> {
     if &a.ty == ty {
-        Ok(a.clone())
-    } else if a.ty == MlirTy::Scalar {
-        Ok(e.broadcast_in_dim(a, &[], ty.clone()))
-    } else {
-        Err(EmitError::at(
+        return Ok(a.clone());
+    }
+    match (&a.ty, ty) {
+        (MlirTy::Scalar, _) => Ok(e.broadcast_in_dim(a, &[], ty.clone())),
+        (MlirTy::Ranked(da), MlirTy::Ranked(db))
+            if da.len() == db.len() && da.iter().zip(db).all(|(x, y)| x == y || *x == Some(1)) =>
+        {
+            let dims: Vec<u64> = (0..da.len() as u64).collect();
+            Ok(e.broadcast_in_dim(a, &dims, ty.clone()))
+        }
+        _ => Err(EmitError::at(
             id,
             format!("shape mismatch: cannot broadcast {:?} to {ty:?}", a.ty),
-        ))
+        )),
     }
 }
 
