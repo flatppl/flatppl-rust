@@ -81,6 +81,80 @@ score = logdensityof(post, record(a = 0.5))\n";
     );
 }
 
+// `iid(Dist, n)` axis-native density with SCALAR kernel params: the determiniser
+// lifts each scalar param to a length-1 array-of-records
+// (`sum(broadcast(builtin_logdensityof, K, <length-1 Array{Record} params>, obs))`),
+// distinct from `broadcast_iid_likelihood_lowers_to_batched_density` above whose
+// per-cell `mu` is itself already length-`n` (`a .+ x`). Here the iid kernel is
+// `Normal(mu = a, sigma = 1.0)` — `mu` the sole `elementof` parameter, `sigma`
+// a scalar constant — scored against the length-3 observation `y_obs`. The
+// per-cell `builtin_logdensityof` therefore combines a `tensor<1xf32>` param
+// with the `tensor<3xf32>` variate — a Ranked/Ranked pair StableHLO's raw
+// elementwise ops cannot take directly (operand shapes must be IDENTICAL; no
+// implicit broadcast). `Emitter::broadcast_pair` must reconcile the size-1 axis
+// via an explicit `stablehlo.broadcast_in_dim`; before that fix the emitter
+// silently produced mismatched-shape op text, which only `MLIRError: Unable to
+// parse module assembly` (IREE/Enzyme-JAX execution in `flatppl-testsuite`)
+// caught — never in-tree, since this crate's other goldens only
+// `.contains(...)`-check substrings rather than parse-validate the MLIR.
+//
+// The query is designated by the `inputs`/`outputs` ABI (order-agnostic —
+// FlatPPL is not order-dependent), NOT by binding position.
+#[test]
+fn iid_density_broadcasts_size_one_params_to_batch_shape() {
+    let src = "\
+y_obs = [0.5, -0.3, 1.2]
+a = elementof(reals)
+m = lawof(record(y = draw(iid(Normal(mu = a, sigma = 1.0), 3))))
+q = logdensityof(m, record(y = y_obs))
+inputs = (a)
+outputs = (q)
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let mlir = emit_logdensity(&d);
+    assert!(
+        mlir.contains("module {") && is_delimiter_balanced(&mlir),
+        "well-formed module:\n{mlir}"
+    );
+    // The length-1 params broadcast up to the length-3 batch via an explicit
+    // `stablehlo.broadcast_in_dim` under an IDENTITY dimension map (`dims =
+    // [0]`, the only axis) — NOT a raw op left on mismatched
+    // `tensor<1xf32>`/`tensor<3xf32>` operands.
+    assert!(
+        mlir.contains("tensor<1xf32>") && mlir.contains("tensor<3xf32>"),
+        "both the length-1 param shape and the length-3 batch shape appear:\n{mlir}"
+    );
+    assert!(
+        mlir.contains("stablehlo.broadcast_in_dim") && mlir.contains("dims = [0]"),
+        "size-1 axis expands via an explicit identity broadcast_in_dim:\n{mlir}"
+    );
+    // No ELEMENTWISE arithmetic op may mix a `tensor<1xf32>` with a
+    // `tensor<3xf32>` operand (the raw-mismatch bug this test guards against) —
+    // a size-1 param must be `broadcast_in_dim`-expanded to the batch shape
+    // FIRST. Shape ops legitimately combine the two: `broadcast_in_dim` IS the
+    // expansion, and `concatenate` stacks the three length-1 literals into the
+    // length-3 observation vector.
+    const ELEMENTWISE: &[&str] = &[
+        "stablehlo.add",
+        "stablehlo.subtract",
+        "stablehlo.multiply",
+        "stablehlo.divide",
+        "stablehlo.power",
+        "stablehlo.maximum",
+        "stablehlo.minimum",
+    ];
+    for line in mlir.lines() {
+        if !line.contains("tensor<1xf32>") || !line.contains("tensor<3xf32>") {
+            continue;
+        }
+        assert!(
+            !ELEMENTWISE.iter().any(|op| line.contains(op)),
+            "an elementwise op must not mix tensor<1xf32> and tensor<3xf32> operands \
+             (a size-1 param was not broadcast_in_dim-expanded first):\n{line}"
+        );
+    }
+}
+
 // A `broadcast` whose callable is a USER FUNCTION (not a bare builtin): a
 // Poisson GLM with a named linear predictor `predict(i,s,x)=i+s*x` broadcast
 // over the covariate array and a named inverse-link `rate(eta)=exp(eta)`

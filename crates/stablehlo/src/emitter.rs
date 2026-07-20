@@ -290,19 +290,25 @@ impl<'m> Emitter<'m> {
     ///   distribution's logpdf, `k * log(rate)`) converts `k` to `Real`
     ///   first. A matching pair (both `Int`, e.g. Binomial's `n - k`) is left
     ///   alone, so an all-integer expression stays integer end to end.
-    /// - **Shape**: when one operand is a `Scalar` and the other `Ranked`, the
-    ///   scalar is [`Emitter::broadcast_scalar`]d up to the ranked shape
-    ///   (StableHLO's elementwise ops require identical operand shapes) — the
-    ///   mechanism a fan-out Tier-1 iid draw relies on to mix a batched `[n]`
-    ///   draw with the distribution's scalar parameters/constants.
+    /// - **Shape** ([`Emitter::broadcast_pair`], spec §04 "Broadcasting"):
+    ///   when one operand is a `Scalar` and the other `Ranked`, the scalar is
+    ///   [`Emitter::broadcast_scalar`]d up to the ranked shape (StableHLO's
+    ///   elementwise ops require identical operand shapes) — the mechanism a
+    ///   fan-out Tier-1 iid draw relies on to mix a batched `[n]` draw with
+    ///   the distribution's scalar parameters/constants. When BOTH operands
+    ///   are `Ranked` but their shapes differ, each size-1 axis expands to
+    ///   the other side's size via [`Emitter::broadcast_in_dim`] — the
+    ///   mechanism an `iid(Dist, n)` density's length-1 array-of-records
+    ///   parameters need to combine with the length-`n` observation vector.
     ///
     /// When both already match (every `@logdensity` path and every scalar
     /// `@sample` this emitter built before Task A2 — inference has kind- and
-    /// shape-unified their operands upstream), neither reconciliation emits
-    /// anything and the output is byte-identical to before. Ranked-vs-Ranked
-    /// shape mismatches are left as-is (not a Tier-1 case) — an internal
-    /// invariant violation upstream type-checking should have ruled out, per
-    /// this module's doc comment.
+    /// shape-unified their operands upstream, plus every same-length batched
+    /// pair), neither reconciliation emits anything and the output is
+    /// byte-identical to before. A genuinely incompatible Ranked-vs-Ranked
+    /// pair (different rank, or an axis neither equal nor size-1) panics — an
+    /// internal invariant violation upstream type-checking should have ruled
+    /// out, per this module's doc comment.
     pub fn binary(&mut self, op: &str, a: &Value, b: &Value) -> Value {
         let target = if elem_rank(a.elem) >= elem_rank(b.elem) {
             a.elem
@@ -311,17 +317,8 @@ impl<'m> Emitter<'m> {
         };
         let a = self.convert(a, target);
         let b = self.convert(b, target);
-        match (&a.ty, &b.ty) {
-            (MlirTy::Scalar, MlirTy::Ranked(_)) => {
-                let a_bc = self.broadcast_scalar(&a, &b.ty);
-                self.emit_binary(op, &a_bc, &b)
-            }
-            (MlirTy::Ranked(_), MlirTy::Scalar) => {
-                let b_bc = self.broadcast_scalar(&b, &a.ty);
-                self.emit_binary(op, &a, &b_bc)
-            }
-            _ => self.emit_binary(op, &a, &b),
-        }
+        let (a, b) = self.broadcast_pair(&a, &b);
+        self.emit_binary(op, &a, &b)
     }
 
     pub fn add(&mut self, a: &Value, b: &Value) -> Value {
@@ -487,13 +484,16 @@ impl<'m> Emitter<'m> {
     /// rather than through `MlirTy`/`Dtype`; the returned `Value`'s `ty` still
     /// carries that shape so a later [`Emitter::select`] can reuse it.
     ///
-    /// A `Scalar`-vs-`Ranked` operand pair auto-broadcasts the scalar up to the
-    /// ranked shape FIRST (StableHLO's `compare` requires identical operand
-    /// shapes), exactly as [`Emitter::binary`] does — the mechanism a batched
+    /// Shape reconciliation is [`Emitter::broadcast_pair`], the same
+    /// mechanism [`Emitter::binary`] uses (StableHLO's `compare` requires
+    /// identical operand shapes, no implicit broadcast): a `Scalar`-vs-
+    /// `Ranked` pair splats the scalar up first — the mechanism a batched
     /// (Tier-2 fan-out) rejection sampler leans on to test a `[n]` candidate
-    /// against a scalar bound. When the shapes already match (every scalar
-    /// `@sample` / `@logdensity` path, inference-unified upstream), no broadcast
-    /// is emitted and the output is byte-identical to before.
+    /// against a scalar bound — and a `Ranked`-vs-`Ranked` pair with a size-1
+    /// axis expands it to the other side's size. When the shapes already
+    /// match (every scalar `@sample` / `@logdensity` path, inference-unified
+    /// upstream, plus every same-length batched pair), no broadcast is
+    /// emitted and the output is byte-identical to before.
     ///
     /// A mismatched-elem-kind operand pair is ALSO reconciled first, same
     /// widening rule as [`Emitter::binary`] ([`elem_rank`]'s order, via
@@ -510,14 +510,7 @@ impl<'m> Emitter<'m> {
         };
         let a = self.convert(a, target);
         let b = self.convert(b, target);
-        let (a, b) = match (&a.ty, &b.ty) {
-            (MlirTy::Scalar, MlirTy::Ranked(_)) => (self.broadcast_scalar(&a, &b.ty), b),
-            (MlirTy::Ranked(_), MlirTy::Scalar) => {
-                let a_ty = a.ty.clone();
-                (a, self.broadcast_scalar(&b, &a_ty))
-            }
-            _ => (a, b),
-        };
+        let (a, b) = self.broadcast_pair(&a, &b);
         let ssa = self.fresh();
         let lhs_ty = a.ty.render(self.dtype, a.elem);
         let rhs_ty = b.ty.render(self.dtype, b.elem);
@@ -553,13 +546,18 @@ impl<'m> Emitter<'m> {
     /// operand up to the ranked shape (StableHLO's `select` requires
     /// `on_true`/`on_false` to share the result shape) — the mechanism a
     /// batched (Tier-2 fan-out) rejection sampler uses to fold a `[n]`
-    /// candidate against a scalar fallback, or pick a per-lane sign. The
-    /// PREDICATE is left as-is: StableHLO accepts a rank-0 `pred` with ranked
-    /// operands (parse-validated), so a scalar predicate does not need
-    /// broadcasting (and an `i1` operand has no float-rendered
-    /// [`Emitter::broadcast_scalar`] form). When all three already share a
-    /// shape (every scalar path, inference-unified upstream), no broadcast is
-    /// emitted and the output is byte-identical to before.
+    /// candidate against a scalar fallback, or pick a per-lane sign. `a`/`b`
+    /// are first reconciled to each other via [`Emitter::broadcast_pair`]
+    /// (so a `Ranked`-vs-`Ranked` size-1 mismatch between the two VALUE
+    /// branches expands, same as [`Emitter::binary`]); a second pass then
+    /// picks up the PREDICATE's shape too, for the case broadcast_pair alone
+    /// can't see — `a`/`b` both `Scalar` but `c` `Ranked` (`floor_div`/
+    /// `floor_mod`'s `need_fix` compare result against scalar-arithmetic
+    /// branches). StableHLO accepts a rank-0 `pred` with ranked operands
+    /// (parse-validated), so a scalar predicate itself never needs
+    /// broadcasting. When all three already share a shape (every scalar
+    /// path, inference-unified upstream), no broadcast is emitted and the
+    /// output is byte-identical to before.
     ///
     /// `a`/`b` are ALSO reconciled to one elem kind first, same widening rule
     /// as [`Emitter::binary`]/[`Emitter::compare`] ([`elem_rank`]'s order, via
@@ -575,7 +573,12 @@ impl<'m> Emitter<'m> {
         };
         let a = self.convert(a, elem_target);
         let b = self.convert(b, elem_target);
-        // Target the ranked shape among {pred, on_true, on_false}, if any.
+        let (a, b) = self.broadcast_pair(&a, &b);
+        // Target the ranked shape among {pred, on_true, on_false}, if any —
+        // `a`/`b` already share a shape (just above); this second pass only
+        // does anything when that shared shape is `Scalar` but `c` is
+        // `Ranked` (`broadcast_scalar`'s no-op guard makes it a pure no-op
+        // otherwise, since `a`/`b` already equal any ranked shape it'd pick).
         let shape_target = [&c.ty, &a.ty, &b.ty]
             .into_iter()
             .find(|t| matches!(t, MlirTy::Ranked(_)))
@@ -1479,6 +1482,94 @@ impl<'m> Emitter<'m> {
             s.clone()
         } else {
             self.broadcast_in_dim(s, &[], out_ty.clone())
+        }
+    }
+
+    /// Reconcile two operands' SHAPES to a common broadcast shape (spec §04
+    /// "Broadcasting": collections share RANK — no NumPy-style rank-
+    /// prepending — and each axis either already matches or one side is
+    /// size-1 and expands by repetition). Element KIND is assumed already
+    /// reconciled by the caller — [`Emitter::binary`]/[`Emitter::compare`]/
+    /// [`Emitter::select`] each [`Emitter::convert`] both operands to one
+    /// [`ElemKind`] before calling this, exactly as they did before this
+    /// helper existed. Returns both operands re-expressed at the common
+    /// shape:
+    ///
+    /// - equal shapes (the overwhelming common case — every scalar
+    ///   `@sample`/`@logdensity` path, inference-unified upstream, plus a
+    ///   same-length batched pair) → both returned unchanged, no op
+    ///   emitted: byte-identical to this crate's behavior before this
+    ///   helper existed;
+    /// - `(Scalar, Ranked)` / `(Ranked, Scalar)` → the scalar side is
+    ///   splatted up via [`Emitter::broadcast_scalar`] (the existing
+    ///   mechanism, unchanged) — a Tier-1/Tier-2 fan-out mixing a batched
+    ///   draw with a scalar parameter/constant/bound;
+    /// - `(Ranked(da), Ranked(db))` of equal rank, NOT already equal → the
+    ///   axis-wise common size (both concrete and equal → that size; one
+    ///   side `Some(1)` → the other; both `None` → `None`), then whichever
+    ///   operand's shape differs from that common shape is broadcast up via
+    ///   [`Emitter::broadcast_in_dim`] under the IDENTITY dimension map `[0,
+    ///   1, …, rank-1]` (StableHLO's `broadcast_in_dim` expands a size-1
+    ///   axis to the target size under an identity mapping) — the mechanism
+    ///   an `iid(Dist, n)` density's length-1 array-of-records parameters
+    ///   need to combine with the length-`n` observation vector
+    ///   (`crate::registry`'s `Params::get`, feeding a rank-agnostic logpdf
+    ///   builder's `Emitter::sub`/`div`/... calls).
+    ///
+    /// Panics on a genuinely incompatible pair (different rank, or an axis
+    /// pair that is neither equal nor size-1-vs-concrete) rather than
+    /// silently emitting a shape-mismatched op — an internal invariant
+    /// upstream shape/type inference should have ruled out, matching
+    /// [`Emitter::slice`]/[`Emitter::gather`]'s established
+    /// refuse(panic)-don't-mislower discipline for this crate's infallible
+    /// helpers (`binary`/`compare`/`select` have no `Result` to propagate a
+    /// caller-facing [`EmitError`] through — see their own doc comments).
+    fn broadcast_pair(&mut self, a: &Value, b: &Value) -> (Value, Value) {
+        if a.ty == b.ty {
+            return (a.clone(), b.clone());
+        }
+        match (&a.ty, &b.ty) {
+            (MlirTy::Scalar, MlirTy::Ranked(_)) => (self.broadcast_scalar(a, &b.ty), b.clone()),
+            (MlirTy::Ranked(_), MlirTy::Scalar) => (a.clone(), self.broadcast_scalar(b, &a.ty)),
+            (MlirTy::Ranked(da), MlirTy::Ranked(db)) => {
+                assert_eq!(
+                    da.len(),
+                    db.len(),
+                    "broadcast_pair: rank mismatch ({da:?} vs {db:?}) — §04 broadcasting \
+                     requires equal rank (addaxes handles rank differences upstream)"
+                );
+                let common: Vec<Option<u64>> = da
+                    .iter()
+                    .zip(db.iter())
+                    .map(|(&x, &y)| match (x, y) {
+                        (Some(m), Some(n)) if m == n => Some(m),
+                        (Some(1), Some(n)) => Some(n),
+                        (Some(m), Some(1)) => Some(m),
+                        (None, None) => None,
+                        _ => panic!(
+                            "broadcast_pair: incompatible axis sizes ({x:?} vs {y:?}) in \
+                             {da:?} vs {db:?} — neither equal nor size-1 (§04 broadcasting \
+                             invariant violated upstream)"
+                        ),
+                    })
+                    .collect();
+                let common_ty = MlirTy::Ranked(common);
+                let dims: Vec<u64> = (0..da.len() as u64).collect();
+                let a_out = if a.ty == common_ty {
+                    a.clone()
+                } else {
+                    self.broadcast_in_dim(a, &dims, common_ty.clone())
+                };
+                let b_out = if b.ty == common_ty {
+                    b.clone()
+                } else {
+                    self.broadcast_in_dim(b, &dims, common_ty)
+                };
+                (a_out, b_out)
+            }
+            (ta, tb) => panic!(
+                "broadcast_pair: unsupported shape pair ({ta:?}, {tb:?}) — no broadcast form"
+            ),
         }
     }
 
