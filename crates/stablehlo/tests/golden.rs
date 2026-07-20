@@ -155,6 +155,87 @@ outputs = (q)
     }
 }
 
+// Nested `iid(iid(Dist, k), n)` axis-native FLATTEN, rank-2: the SAME
+// single-axis broadcast form as the rank-1 golden above
+// (`iid_density_broadcasts_size_one_params_to_batch_shape`), but the innermost
+// kernel is peeled through TWO `iid` layers (`depth = 2` in `lower_iid`'s
+// nested fast path) and scored against a RANK-2 `[3, 2]` observation rather
+// than rank-1 — previously only the rank-1 primitive case had an in-tree
+// parse-validating golden; the rank-2 nested case rested solely on the
+// external IREE gate (`flatppl-testsuite`). Verified out-of-tree to
+// IREE-execute == the closed-form oracle
+// (`iid(iid(Normal(0,1),2),3)@[[0.5,-0.3],[1.2,0.1],[-0.7,0.9]] ==
+// -7.058631199228036`); this golden pins the emit + parse-validates the
+// rank-2 MLIR in-tree.
+#[test]
+fn iid_density_flattens_nested_iid_to_rank2_batch_shape() {
+    let src = "\
+y_obs = [[0.5, -0.3], [1.2, 0.1], [-0.7, 0.9]]
+a = elementof(reals)
+m = lawof(record(y = draw(iid(iid(Normal(mu = a, sigma = 1.0), 2), 3))))
+q = logdensityof(m, record(y = y_obs))
+inputs = (a)
+outputs = (q)
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    // A SINGLE `builtin_logdensityof` broadcast head lowers the WHOLE nested
+    // product (the flatten from `lower_iid`'s nested fast path) — not two
+    // separate per-layer broadcasts from a rank-by-rank `get0` recursion, and
+    // no `get0` unroll at all (the safe fallback this fast path bypasses).
+    let pir = flatppl_flatpir::write(&d);
+    assert_eq!(
+        pir.matches("builtin_logdensityof").count(),
+        1,
+        "exactly one flattened broadcast head, not a per-layer recursion:\n{pir}"
+    );
+    assert!(
+        !pir.contains("get0"),
+        "the flatten fast path must not fall back to the get0 unroll:\n{pir}"
+    );
+
+    let mlir = emit_logdensity(&d);
+    assert!(
+        mlir.contains("module {") && is_delimiter_balanced(&mlir),
+        "well-formed module:\n{mlir}"
+    );
+    // The depth-2 nested params (each a `vector(vector(param))`, shape
+    // `[1, 1]`, §04 "Size-one array axes are implicitly expanded by
+    // repetition") broadcast up to the rank-2 `[3, 2]` batch shape.
+    assert!(
+        mlir.contains("tensor<1x1xf32>") && mlir.contains("tensor<3x2xf32>"),
+        "both the depth-2 size-1 param shape and the rank-2 batch shape appear:\n{mlir}"
+    );
+    // The size-1 axes expand via an explicit `stablehlo.broadcast_in_dim`
+    // under a RANK-2 IDENTITY dimension map (`dims = [0, 1]`, both axes) — not
+    // a raw op left on mismatched `tensor<1x1xf32>`/`tensor<3x2xf32>` operands.
+    assert!(
+        mlir.contains("stablehlo.broadcast_in_dim") && mlir.contains("dims = [0, 1]"),
+        "rank-2 axes expand via an explicit identity broadcast_in_dim:\n{mlir}"
+    );
+    // No ELEMENTWISE arithmetic op may mix a `tensor<1x1xf32>` with a
+    // `tensor<3x2xf32>` operand (mirrors the rank-1 golden's guard) — a size-1
+    // param must be `broadcast_in_dim`-expanded to the batch shape FIRST.
+    const ELEMENTWISE: &[&str] = &[
+        "stablehlo.add",
+        "stablehlo.subtract",
+        "stablehlo.multiply",
+        "stablehlo.divide",
+        "stablehlo.power",
+        "stablehlo.maximum",
+        "stablehlo.minimum",
+    ];
+    for line in mlir.lines() {
+        if !line.contains("tensor<1x1xf32>") || !line.contains("tensor<3x2xf32>") {
+            continue;
+        }
+        assert!(
+            !ELEMENTWISE.iter().any(|op| line.contains(op)),
+            "an elementwise op must not mix tensor<1x1xf32> and tensor<3x2xf32> operands \
+             (a size-1 axis was not broadcast_in_dim-expanded first):\n{line}"
+        );
+    }
+}
+
 // A `broadcast` whose callable is a USER FUNCTION (not a bare builtin): a
 // Poisson GLM with a named linear predictor `predict(i,s,x)=i+s*x` broadcast
 // over the covariate array and a named inverse-link `rate(eta)=exp(eta)`

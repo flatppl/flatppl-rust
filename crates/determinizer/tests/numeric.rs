@@ -385,6 +385,63 @@ lp = logdensityof(d, data)";
     );
 }
 
+// `iid(M, n)` where `M` is a BARE constructor with a NON-SCALAR variate
+// domain (`MvNormal`, vector domain) must NOT take the axis-native broadcast
+// fast path: `emit_kernel_broadcast_density`'s size-1-array-of-records
+// flatten is verified only for a SCALAR-domain kernel (each scalar param
+// lifted to a length-1 `vector`) — a non-scalar-domain kernel has its own
+// compound parameters (e.g. MvNormal's rank-1 `mu`) that would need a
+// genuinely different wrap the flatten does not build. `is_scalar_domain_kernel`
+// gates both `lower_iid` fast-path entries on the kernel's own inferred
+// domain being CONFIRMED scalar, so a bare `MvNormal` structurally matches
+// `split_kernel_constructor` but fails that gate and falls through —
+// unchanged — to the `get0`/`fold_add` unroll fallback (the same path this
+// took before the axis-native fast path existed). Regression guard for the
+// whole-branch review: confirms the gate re-routes MvNormal to the safe
+// unroll rather than refusing or (worse) mislowering it through the flatten.
+#[test]
+fn iid_nonscalar_domain_kernel_uses_unroll_not_broadcast_flatten() {
+    let src = "\
+data = [[0.2, 0.3], [0.4, -0.1], [0.0, 0.5]]
+d = iid(MvNormal(mu = [0.0, 0.0], cov = eye(2)), 3)
+lp = logdensityof(d, data)";
+    let m = parse_infer(src);
+    let out = determinize(&m)
+        .expect("iid over a non-scalar-domain kernel must lower via unroll, not refuse/panic");
+    assert!(
+        flatppl_determinizer::is_flatpdl(&out).is_ok(),
+        "emitted FlatPDL must be conformant"
+    );
+    let pir = flatppl_flatpir::write(&out);
+    // Unroll fallback: one `get0` per iid element (3), NOT the size-1-broadcast
+    // flatten form.
+    assert_eq!(
+        pir.matches("(get0 ").count(),
+        3,
+        "unroll fallback: one get0 per iid element, not the broadcast flatten:\n{pir}"
+    );
+    assert_eq!(
+        pir.matches("builtin_logdensityof").count(),
+        3,
+        "one MvNormal density term per unrolled element:\n{pir}"
+    );
+    assert!(
+        pir.contains("MvNormal"),
+        "each term scores MvNormal directly:\n{pir}"
+    );
+    // The broadcast-flatten form this gate must NOT take: no `broadcast record`
+    // synthesizing a singleton params array, and no bare axis-native
+    // `(broadcast builtin_logdensityof MvNormal ...)` head.
+    assert!(
+        !pir.contains("(broadcast record"),
+        "must not build the singleton-broadcast kernel_input:\n{pir}"
+    );
+    assert!(
+        !pir.contains("(broadcast builtin_logdensityof"),
+        "must not take the axis-native broadcast fast path for a non-scalar-domain kernel:\n{pir}"
+    );
+}
+
 #[test]
 fn joint_two_gaussians_structure() {
     // logdensityof(joint(Normal(0,1), Normal(1,2)), [0.5, 0.5]) →

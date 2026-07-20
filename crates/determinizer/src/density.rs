@@ -2832,8 +2832,12 @@ pub(crate) fn iid_static_size(m: &Module, iid_node: NodeId) -> Option<usize> {
 /// `record()`), not a refusal.
 ///
 /// **Axis-native fast path for a PRIMITIVE `M`.** When `M` is a bare
-/// distribution constructor (`split_kernel_constructor` succeeds — e.g.
-/// `Normal(mu = a, sigma = b)`), the Σ is emitted as ONE axis-level expression
+/// distribution constructor with a CONFIRMED SCALAR variate domain
+/// (`split_kernel_constructor` succeeds AND [`is_scalar_domain_kernel`]
+/// confirms `Some(VariateKind::Scalar)` — e.g. `Normal(mu = a, sigma = b)`; a
+/// bare NON-scalar-domain constructor like `MvNormal` structurally matches
+/// `split_kernel_constructor` but fails the domain gate and falls through to
+/// the unroll fallback below instead), the Σ is emitted as ONE axis-level expression
 /// — `sum(broadcast(builtin_logdensityof, K, broadcast(record, p = vector(a),
 /// …), v))` — identical for `N = 3` or `N = 3000`, rather than `N` unrolled
 /// `get0`/`add` terms (see [`emit_kernel_broadcast_density`], shared with
@@ -2850,8 +2854,10 @@ pub(crate) fn iid_static_size(m: &Module, iid_node: NodeId) -> Option<usize> {
 ///
 /// **Nested-`iid`-of-primitive-kernel fast path (flatten, no unroll).** When
 /// `M` is not itself a bare constructor but is a further `iid(K, size)` (or a
-/// chain of them) bottoming out at a bare constructor `K`
-/// (`split_kernel_constructor` succeeds on the innermost measure), the WHOLE
+/// chain of them) bottoming out at a bare constructor `K` with a CONFIRMED
+/// SCALAR variate domain (`split_kernel_constructor` succeeds on the innermost
+/// measure AND [`is_scalar_domain_kernel`] confirms it — same gate as the
+/// primitive fast path above), the WHOLE
 /// nested product `iid(iid(…iid(K, size_d)…, size_2), size_1)` is flattened
 /// to the SAME single axis-level expression as the primitive fast path above,
 /// reusing [`emit_kernel_broadcast_density`] unchanged: `Σ` over every leaf
@@ -2867,9 +2873,9 @@ pub(crate) fn iid_static_size(m: &Module, iid_node: NodeId) -> Option<usize> {
 /// rank-`d` shape, one axis per peeled `iid` layer (verified rank-generic:
 /// `Emitter::vector`, `crates/stablehlo/src/emitter.rs:814`, is documented to
 /// lower a vector-of-vectors to a rank-2+ tensor; `Emitter::broadcast_pair`,
-/// `emitter.rs:1541`, reconciles size-1 axes per-axis for ANY equal rank —
+/// `emitter.rs:1527`, reconciles size-1 axes per-axis for ANY equal rank —
 /// the `f6abc85` fix generalized by construction; `Emitter::reduce_full`,
-/// `emitter.rs:989`, fully reduces any rank to a scalar). This peel-and-flatten
+/// `emitter.rs:992`, fully reduces any rank to a scalar). This peel-and-flatten
 /// only fires when EVERY peeled layer is itself a statically-sized `iid`
 /// (`iid_static_size` resolves at each layer, matching the outer size's own
 /// static requirement above) and the innermost measure is a bare constructor;
@@ -2912,19 +2918,38 @@ pub(crate) fn iid_static_size(m: &Module, iid_node: NodeId) -> Option<usize> {
 /// still take the unroll below; see `.superpowers/sdd/task-3-spike.md` for
 /// the fuller comparison of alternatives.
 ///
-/// **No scalar-`M` guard — deliberate asymmetry with [`lower_joint`].** `iid(M,
+/// **Fast-path scalar-domain gate — orthogonal to the unroll fallback's own
+/// unrestricted `M`.** Both axis-native fast paths above additionally require
+/// the innermost bare constructor `K`'s OWN inferred variate domain to be
+/// CONFIRMED scalar ([`is_scalar_domain_kernel`]) — not because `get0`/the
+/// unroll needs it, but because the size-1-array-of-records broadcast flatten
+/// ([`emit_kernel_broadcast_density`]) has only been verified for a
+/// scalar-domain kernel. A non-scalar-domain kernel (`MvNormal`, `Dirichlet`,
+/// `Multinomial`, `Wishart`, `LKJ`, …) has its own compound parameters (e.g.
+/// `MvNormal`'s rank-1 `mu`) that would need a DIFFERENT, deeper wrap the
+/// flatten does not build — treating it as a scalar leaf would silently
+/// mislower the rank rather than refuse. A bare non-scalar constructor (e.g.
+/// `iid(MvNormal(...), n)`) structurally matches `split_kernel_constructor`
+/// but fails this gate, so it falls through — unchanged — to the
+/// `get0`/`fold_add` unroll below. An unknown/deferred domain also fails the
+/// gate (fail-closed: never fast-path on an unconfirmed domain), the same
+/// discipline [`lower_joint`]'s component guard uses.
+///
+/// **No scalar-`M` guard on the UNROLL fallback itself — deliberate asymmetry
+/// with [`lower_joint`].** `iid(M,
 /// size)` is the product `M^⊗N` over ARRAYS of shape `size`, i.e. a NESTED variate
 /// with a leading repeat axis `[N, …M-shape]` (§06 "Independent composition", the
 /// `iid` bullet). So `get0(v, i)` recovers the full i-th
 /// `M`-variate (an entire row), which is exactly what this rule scores `M` at —
 /// correct for ANY `M`, scalar or not (a non-scalar `M`, e.g. `iid(MvNormal, n)`
-/// or a nested `iid(iid(…), n)`, lowers correctly via the unroll fallback, its
+/// or a nested `iid(iid(…), n)`, lowers correctly via the unroll fallback —
+/// which is exactly where the scalar-domain gate above sends it — its
 /// inner variate reached by a further `get0`). `joint`, by contrast, has a
 /// HETEROGENEOUS variate: the flat
 /// `cat` of its component variates, so `joint`'s positional `get0(v, i)` only
 /// aligns when every component is scalar — hence the scalar-component guard in
-/// [`lower_joint`]. Adding that guard here would WRONGLY refuse valid non-scalar
-/// `iid`, so it is intentionally absent.
+/// [`lower_joint`]. Adding that guard to the UNROLL fallback here would WRONGLY
+/// refuse valid non-scalar `iid`, so it is intentionally absent from that path.
 fn lower_iid(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseError> {
     // The repeat count comes from the iid node's own const-evaluated domain shape
     // (see `iid_static_size`), so a `lengthof(obs)` / `sizeof(M)` / arithmetic
@@ -2955,13 +2980,19 @@ fn lower_iid(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseEr
     }
 
     // Primitive-kernel fast path: M is a bare distribution constructor
-    // (`split_kernel_constructor` succeeds). Emit the axis-native broadcast form
+    // (`split_kernel_constructor` succeeds) with a CONFIRMED SCALAR variate
+    // domain (`is_scalar_domain_kernel`) — a non-scalar-domain bare constructor
+    // (e.g. `MvNormal`) structurally matches `split_kernel_constructor` but
+    // fails the domain gate and falls through to the unroll fallback below
+    // (see the doc comment above for why). Emit the axis-native broadcast form
     // — a length-1 array-of-params-record singleton-expanded across the obs
     // axis `v`, summed. This is the card's target and reuses the tested
     // `lower_broadcast_kernel` tail.
     if let Some((ctor_sym, kwargs)) = split_kernel_constructor(m, m_inner) {
-        let kernel_input = singleton_kernel_input(m, &kwargs, 1);
-        return Ok(emit_kernel_broadcast_density(m, ctor_sym, kernel_input, v));
+        if is_scalar_domain_kernel(m, m_inner) {
+            let kernel_input = singleton_kernel_input(m, &kwargs, 1);
+            return Ok(emit_kernel_broadcast_density(m, ctor_sym, kernel_input, v));
+        }
     }
 
     // Nested-`iid`-of-primitive-kernel fast path: peel through as many further
@@ -2988,6 +3019,9 @@ fn lower_iid(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseEr
             break;
         }
         if let Some((ctor_sym, kwargs)) = split_kernel_constructor(m, next_inner) {
+            if !is_scalar_domain_kernel(m, next_inner) {
+                break;
+            }
             let kernel_input = singleton_kernel_input(m, &kwargs, depth + 1);
             return Ok(emit_kernel_broadcast_density(m, ctor_sym, kernel_input, v));
         }
@@ -3486,6 +3520,25 @@ fn variate_kind(t: &Type) -> Option<VariateKind> {
         Type::Table { .. } => Some(VariateKind::Table),
         _ => None,
     }
+}
+
+/// `true` only when `measure_node`'s OWN inferred type is a CONFIRMED
+/// scalar-domain measure — `Some(Type::Measure { domain, .. })` with
+/// `variate_kind(domain) == Some(VariateKind::Scalar)`. Used by [`lower_iid`]
+/// to gate its axis-native broadcast fast paths: a non-scalar-domain kernel
+/// (`MvNormal`, `Dirichlet`, `Multinomial`, `Wishart`, `LKJ`, …) must NOT take
+/// the size-1-array-of-records flatten (verified only for a scalar-domain
+/// kernel's scalar params), so it needs to fail this check and fall through to
+/// the `get0` unroll fallback instead. **Fail-closed**: an unknown/deferred
+/// domain (`m.type_of` not yet `Some(Type::Measure { .. })`, or `variate_kind`
+/// returning `None` for the domain) is NOT scalar — never fast-path on an
+/// unconfirmed domain, per refuse-don't-mislower (same discipline as
+/// [`lower_joint`]'s component guard, which fails closed the same way).
+fn is_scalar_domain_kernel(m: &Module, measure_node: NodeId) -> bool {
+    matches!(
+        m.type_of(measure_node),
+        Some(Type::Measure { domain, .. }) if variate_kind(domain) == Some(VariateKind::Scalar)
+    )
 }
 
 /// Read a primitive constructor call into its constructor symbol and the
