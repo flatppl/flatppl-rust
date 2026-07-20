@@ -2848,17 +2848,50 @@ pub(crate) fn iid_static_size(m: &Module, iid_node: NodeId) -> Option<usize> {
 /// [`lower_broadcast_kernel`] does, via `broadcast(record, …)` over length-1
 /// arrays rather than the `vector` literal constructor.
 ///
-/// **Composed-`M` fallback: static unroll.** When `M` is not a bare
-/// constructor (a `joint`, `pushfwd`, nested `iid`, …), `split_kernel_constructor`
-/// fails and this falls back to the `get0`/`fold_add` unroll below (corpus N
-/// small).
+/// **Nested-`iid`-of-primitive-kernel fast path (flatten, no unroll).** When
+/// `M` is not itself a bare constructor but is a further `iid(K, size)` (or a
+/// chain of them) bottoming out at a bare constructor `K`
+/// (`split_kernel_constructor` succeeds on the innermost measure), the WHOLE
+/// nested product `iid(iid(…iid(K, size_d)…, size_2), size_1)` is flattened
+/// to the SAME single axis-level expression as the primitive fast path above,
+/// reusing [`emit_kernel_broadcast_density`] unchanged: `Σ` over every leaf
+/// of a nested independent product is order-independent (§06 "Independent
+/// composition" — each axis contributes an independent Σ, and Σ commutes), so
+/// scoring `K` once per leaf of the FULL rank-`d` variate `v` (rather than
+/// recursing rank-by-rank) is exact. Each of `K`'s scalar params is lifted to
+/// a `d`-deep nested `vector(vector(…vector(param)…))` (depth = the total
+/// number of peeled `iid` layers, 2 for `iid(iid(K, 2), 3)`) instead of the
+/// single-deep `vector(param)` the primitive case uses — this is a legal
+/// rank-`d` array-of-records whose `d` size-1 axes broadcast (§04 "Size-one
+/// array axes are implicitly expanded by repetition") against `v`'s full
+/// rank-`d` shape, one axis per peeled `iid` layer (verified rank-generic:
+/// `Emitter::vector`, `crates/stablehlo/src/emitter.rs:814`, is documented to
+/// lower a vector-of-vectors to a rank-2+ tensor; `Emitter::broadcast_pair`,
+/// `emitter.rs:1541`, reconciles size-1 axes per-axis for ANY equal rank —
+/// the `f6abc85` fix generalized by construction; `Emitter::reduce_full`,
+/// `emitter.rs:989`, fully reduces any rank to a scalar). This peel-and-flatten
+/// only fires when EVERY peeled layer is itself a statically-sized `iid`
+/// (`iid_static_size` resolves at each layer, matching the outer size's own
+/// static requirement above) and the innermost measure is a bare constructor;
+/// anything else (a `joint`, `pushfwd`, or a dynamic/multi-axis nested size)
+/// falls through unchanged to the composed fallback below.
 ///
-/// **Axis-native functionof-broadcast was tried and REJECTED for this case —
-/// StableHLO cannot lower it.** The natural generalization of the primitive
-/// fast path — lower `density(M, x)` once against a fresh `%local`
-/// placeholder `x`, wrap it in a one-input `functionof`, and
-/// `sum(broadcast(functionof(...), v))` — round-trips fine through
-/// `flatppl-js` (scipy oracle == exact) but crashes `crates/stablehlo`'s
+/// **Composed-`M` fallback: static unroll.** When `M` is neither a bare
+/// constructor nor a peelable nested-`iid`-of-constructor (a `joint`,
+/// `pushfwd`, an `iid` whose own inner measure is itself composed, …),
+/// `split_kernel_constructor` fails at every peeled layer and this falls back
+/// to the `get0`/`fold_add` unroll below (corpus N small). This is also the
+/// safe floor when the peel loop finds a non-static inner size — never
+/// mislower a dynamic shape into a size-1-broadcast form that assumes a known
+/// rank.
+///
+/// **Why the earlier `functionof`-broadcast candidate was rejected instead —
+/// StableHLO could not lower it (superseded by the flatten above for the
+/// nested-`iid` case).** A previous attempt generalized the primitive fast
+/// path by lowering `density(M, x)` once against a fresh `%local` placeholder
+/// `x`, wrapping it in a one-input `functionof`, and emitting
+/// `sum(broadcast(functionof(...), v))`. That form round-tripped through
+/// `flatppl-js` (scipy oracle == exact) but crashed `crates/stablehlo`'s
 /// emitter: `Emitter::lower_broadcast_userfn`
 /// (`crates/stablehlo/src/emitter.rs:2296`) binds the placeholder to the
 /// *whole* collection value (rank `[N, …M-shape]`) and relies on the body's
@@ -2870,14 +2903,14 @@ pub(crate) fn iid_static_size(m: &Module, iid_node: NodeId) -> Option<usize> {
 /// the full multi-row collection — a genuine rank mismatch, not a missing
 /// `broadcast_in_dim`: `Emitter::broadcast_pair` (emitter.rs:1527) panics
 /// (`rank mismatch ([Some(3), Some(2)] vs [Some(1)])`) rather than silently
-/// mislowering. This is an architectural gap (no notion of "evaluate the body
-/// once per top-level slice" in `lower_broadcast_userfn`), not a one-line
-/// fix, so the composed case keeps the unroll below rather than shipping a
-/// form that fails the StableHLO leg of the three-way gate. Reproduced with
-/// `logdensityof(iid(iid(Normal(mu = 0.0, sigma = 1.0), 2), 3), <shape-[3,2]
-/// literal>)`; fixing `lower_broadcast_userfn` to evaluate a reified body
-/// once per top-level slice (rather than once against the whole collection)
-/// is an open `crates/stablehlo` follow-up, not attempted here.
+/// mislowering. That is an architectural gap in `lower_broadcast_userfn`
+/// itself (no notion of "evaluate the body once per top-level slice"), which
+/// the determiniser-side flatten above sidesteps entirely — it never
+/// constructs a `functionof` at all, so `lower_broadcast_userfn` is never
+/// reached for this case. `functionof`-broadcast remains unimplemented for
+/// the genuinely non-flattenable composed shapes (`joint`, `pushfwd`) that
+/// still take the unroll below; see `.superpowers/sdd/task-3-spike.md` for
+/// the fuller comparison of alternatives.
 ///
 /// **No scalar-`M` guard — deliberate asymmetry with [`lower_joint`].** `iid(M,
 /// size)` is the product `M^⊗N` over ARRAYS of shape `size`, i.e. a NESTED variate
@@ -2927,52 +2960,51 @@ fn lower_iid(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseEr
     // axis `v`, summed. This is the card's target and reuses the tested
     // `lower_broadcast_kernel` tail.
     if let Some((ctor_sym, kwargs)) = split_kernel_constructor(m, m_inner) {
-        // `broadcast` disallows a bare record/tuple input (§04 "Broadcasting",
-        // "Disallowed inputs"): the params must be a COLLECTION. Building
-        // `vector(record(...))` directly does NOT work — §03 forbids a record
-        // as an array LITERAL element (`vector_type` in
-        // `flatppl-infer::ops::vector_type` rejects it outright), so a
-        // `vector`-of-records is not constructible that way. Instead reuse
-        // exactly the mechanism [`lower_broadcast_kernel`] uses to produce its
-        // (real, multi-cell) array-of-records: `broadcast(record, p0 = arr0,
-        // …)` synthesizes `Array{elem: Record}` structurally in
-        // `broadcast_type`, which is NOT subject to the literal-vector element
-        // restriction. Each scalar param is first lifted to a length-1
-        // `vector(param)`, so `broadcast(record, …)` sees length-1 array
-        // arguments and produces a length-1 array-of-records that
-        // singleton-expands across the obs axis (§04 "Size-one array axes are
-        // implicitly expanded by repetition to match the size of the other
-        // collection arguments") — the same per-copy kernel at every index.
-        let broadcast_sym = m.intern("broadcast");
-        let record_head = {
-            let record_sym = m.intern("record");
-            m.alloc(Node::Const(record_sym))
-        };
-        let record_kwargs: Vec<NamedArg> = kwargs
-            .iter()
-            .map(|&(name, value)| NamedArg {
-                kind: NamedKind::Kwarg,
-                name,
-                value: build_call(m, "vector", &[value]),
-            })
-            .collect();
-        let kernel_input = m.alloc(Node::Call(Call {
-            head: CallHead::Builtin(broadcast_sym),
-            args: vec![record_head].into(),
-            named: record_kwargs.into(),
-            inputs: None,
-        }));
+        let kernel_input = singleton_kernel_input(m, &kwargs, 1);
         return Ok(emit_kernel_broadcast_density(m, ctor_sym, kernel_input, v));
     }
 
-    // Composed inner measure (joint / pushfwd / nested iid): temporary fallback to
-    // the per-element `get0` unroll. The axis-native functionof-broadcast lambda
-    // path was implemented and three-way tested for this case and REJECTED — see
-    // the doc comment above ("Axis-native functionof-broadcast was tried and
-    // REJECTED for this case") — StableHLO's `lower_broadcast_userfn` cannot
-    // lower a reified body that itself contains a nested `sum(broadcast(...))`
-    // (a genuine rank-mismatch panic in `Emitter::broadcast_pair`, not a missing
-    // `broadcast_in_dim`). Keep unrolling here until that emitter gap is fixed.
+    // Nested-`iid`-of-primitive-kernel fast path: peel through as many further
+    // `iid(K, size)` layers as are themselves statically sized, stopping at
+    // either a bare constructor (flatten — see the doc comment above) or
+    // anything else (fall through to the unroll below unchanged). `depth`
+    // counts the peeled layers (the outer `iid` itself is layer 1), which is
+    // exactly how many `vector(...)` wraps each kernel param needs — one
+    // size-1 axis per peeled layer, singleton-broadcasting against `v`'s own
+    // full rank-`depth` shape.
+    let mut depth = 1usize;
+    let mut cur = m_inner;
+    while let Some(c) = expect_builtin_call(m, cur, "iid") {
+        if c.args.len() != 2 {
+            break;
+        }
+        let next_inner = c.args[0];
+        // Every peeled layer must itself be a statically-resolved 1-D size —
+        // the same discipline as the outer size above — before its axis can
+        // be folded into the flattened broadcast; a dynamic/multi-axis inner
+        // size falls through to the safe unroll fallback instead of guessing
+        // a rank.
+        if iid_static_size(m, cur).is_none() {
+            break;
+        }
+        if let Some((ctor_sym, kwargs)) = split_kernel_constructor(m, next_inner) {
+            let kernel_input = singleton_kernel_input(m, &kwargs, depth + 1);
+            return Ok(emit_kernel_broadcast_density(m, ctor_sym, kernel_input, v));
+        }
+        depth += 1;
+        cur = next_inner;
+    }
+
+    // Composed inner measure (joint / pushfwd / an iid whose own inner measure
+    // is itself composed): fallback to the per-element `get0` unroll. The
+    // axis-native `functionof`-broadcast lambda path was implemented and
+    // three-way tested for this case and REJECTED — see the doc comment above
+    // ("Why the earlier `functionof`-broadcast candidate was rejected
+    // instead") — StableHLO's `lower_broadcast_userfn` cannot lower a reified
+    // body that itself contains a nested `sum(broadcast(...))` (a genuine
+    // rank-mismatch panic in `Emitter::broadcast_pair`, not a missing
+    // `broadcast_in_dim`). Keep unrolling here for the shapes the flatten
+    // above does not reach.
     let mut terms = Vec::with_capacity(n);
     for i in 0..n {
         let idx = m.alloc(Node::Lit(Scalar::Int(i as i64)));
@@ -3126,6 +3158,55 @@ fn lower_broadcast_kernel(
         kernel_inputs,
         obs,
     ))
+}
+
+/// Build the singleton (all-size-1-axes) kernel-params array-of-records for
+/// [`lower_iid`]'s primitive and nested-`iid` fast paths: `broadcast(record,
+/// p0 = vector^depth(arg0), …)`, where `vector^depth` is `depth` nested
+/// `vector(...)` wraps (`vector(arg)` for `depth == 1`, `vector(vector(arg))`
+/// for `depth == 2`, …). `depth` is the number of `iid` layers being
+/// flattened together — one size-1 axis per layer — so the result is a
+/// rank-`depth` array-of-records whose every axis broadcasts (§04 "Size-one
+/// array axes are implicitly expanded by repetition") against the
+/// corresponding axis of the full-rank obs collection.
+///
+/// `broadcast` disallows a bare record/tuple input (§04 "Broadcasting",
+/// "Disallowed inputs"): the params must be a COLLECTION. Building
+/// `vector(record(...))` directly does NOT work — §03 forbids a record as an
+/// array LITERAL element (`vector_type` in `flatppl_infer::ops::vector_type`
+/// rejects it outright), so a `vector`-of-records is not constructible that
+/// way. Instead this reuses exactly the mechanism [`lower_broadcast_kernel`]
+/// uses to produce its (real, multi-cell) array-of-records: `broadcast(record,
+/// p0 = arr0, …)` synthesizes `Array{elem: Record}` structurally in
+/// `broadcast_type`, which is NOT subject to the literal-vector element
+/// restriction.
+fn singleton_kernel_input(m: &mut Module, kwargs: &[(Symbol, NodeId)], depth: usize) -> NodeId {
+    debug_assert!(depth >= 1, "singleton_kernel_input: depth must be >= 1");
+    let broadcast_sym = m.intern("broadcast");
+    let record_head = {
+        let record_sym = m.intern("record");
+        m.alloc(Node::Const(record_sym))
+    };
+    let record_kwargs: Vec<NamedArg> = kwargs
+        .iter()
+        .map(|&(name, value)| {
+            let mut wrapped = value;
+            for _ in 0..depth {
+                wrapped = build_call(m, "vector", &[wrapped]);
+            }
+            NamedArg {
+                kind: NamedKind::Kwarg,
+                name,
+                value: wrapped,
+            }
+        })
+        .collect();
+    m.alloc(Node::Call(Call {
+        head: CallHead::Builtin(broadcast_sym),
+        args: vec![record_head].into(),
+        named: record_kwargs.into(),
+        inputs: None,
+    }))
 }
 
 /// Emit `sum(broadcast(builtin_logdensityof, K, kernel_input, obs))` — the

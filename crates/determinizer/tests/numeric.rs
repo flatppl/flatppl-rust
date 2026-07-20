@@ -289,36 +289,22 @@ lp = logdensityof(d, data)";
 //
 // Model: iid(iid(Normal(0,1), 2), 3) scored at a shape-[3,2] array literal.
 //
-// **Outer unroll + inner broadcast (not a full 6-term unroll).** The OUTER `M`
+// **Flattened single broadcast+reduce (not an outer unroll).** The OUTER `M`
 // here is `iid(Normal(0,1), 2)` — a COMPOSED (non-primitive) inner measure, so
-// `lower_iid`'s primitive-kernel fast path does not fire at the outer level:
-// it falls back to the `get0`/`fold_add` unroll, one term per outer row (3
-// terms, `get0(data, i)` for i = 0, 1, 2). But each unrolled term recurses
-// through `lower_measure_density` back into `lower_iid` for the INNER
-// `iid(Normal(0,1), 2)` — and `Normal` IS a primitive kernel, so that inner
-// call DOES take the axis-native fast path: each outer term becomes
-// `sum(broadcast(builtin_logdensityof, Normal, record(0,1), get0(data, i)))`,
-// scoring the full shape-[2] row in one broadcast rather than two further
-// unrolled `get0` terms. Total: 3 `builtin_logdensityof` calls (one per outer
-// row) and 3 `get0` projections (one per outer row, none nested) — down from
-// the pre-fast-path 6 terms / 12 nested `get0`s, but the SAME total density
-// (Σ over all 6 leaf values, now grouped as 3 row-sums instead of 6 flat
-// terms). This is a correct, if incidental, consequence of the primitive fast
-// path applying recursively to every primitive-kernel `iid`, including one
-// reached through a composed outer unroll — not itself axis-native at the
-// outer level (that is Task 3's job for composed kernels), but not a
-// regression either.
-//
-// The variate is a NAMED binding (`data`), not an inline literal array: canon
-// Pass 3 (`flatten_structural`, buffy #263) only resolves `get0` over a
-// LITERAL `vector(...)` constructor, never through a `Ref`, so naming the
-// data keeps the outer `get0` shape below intact. All three outer rows share
-// the identical Normal(0,1) kernel, so the sum is invariant to how the six
-// literal values are assigned to slots — an inline-literal variate would let
-// canon flatten every projection away, making the shape assertions below
-// vacuous.
+// `lower_iid`'s primitive-kernel fast path does not fire directly on it. But
+// `lower_iid` peels through this one further `iid` layer (`Normal` bottoms out
+// as a bare constructor at depth 2) and flattens the WHOLE nested product to
+// ONE axis-native expression — `sum(broadcast(builtin_logdensityof, Normal,
+// <rank-2 [1,1] singleton params>, data))` — reusing the same
+// `emit_kernel_broadcast_density` tail as the primitive (depth-1) fast path,
+// just with each scalar param lifted through 2 nested `vector(...)` wraps
+// instead of 1. This scores all 6 leaves (Σ over the full `[3,2]` array) in a
+// single broadcast+reduce: no `get0` at all, no `functionof`, and no residual
+// measure layer. (Σ over a nested independent product is order-independent,
+// §06 "Independent composition" — grouping by row vs scoring the flat array
+// in one broadcast is the same total density.)
 #[test]
-fn iid_nonscalar_inner_measure_lowers_with_nested_get0() {
+fn iid_nonscalar_inner_measure_flattens_to_single_reduce() {
     let src = "\
 data = [[0.5, -0.3], [1.2, 0.1], [-0.7, 0.9]]
 d = iid(iid(Normal(mu = 0.0, sigma = 1.0), 2), 3)
@@ -330,73 +316,72 @@ lp = logdensityof(d, data)";
         "emitted FlatPDL must be conformant"
     );
     let pir = flatppl_flatpir::write(&out);
-    // 3 outer rows, each an axis-native broadcast over its shape-[2] row (see
-    // comment above — the inner Normal kernel is primitive, so it takes the
-    // fast path even though the outer `iid(iid(...), 3)` is composed).
+    // Exactly ONE broadcast head, scoring the full [3,2] array in one shot —
+    // not 3 outer-row broadcasts, not a 6-term flat unroll.
     assert_eq!(
         pir.matches("builtin_logdensityof").count(),
-        3,
-        "3 outer-row broadcast heads (not a flat 3×2 unroll):\n{pir}"
+        1,
+        "exactly one flattened broadcast head (not a per-row or per-leaf unroll):\n{pir}"
     );
     assert_eq!(
         pir.matches("(broadcast builtin_logdensityof Normal")
             .count(),
-        3,
-        "each outer row is scored via sum(broadcast(builtin_logdensityof, Normal, …)):\n{pir}"
+        1,
+        "the single broadcast scores Normal directly:\n{pir}"
     );
     assert_eq!(
         pir.matches("(sum ").count(),
-        3,
-        "each outer row's broadcast is reduced by its own sum:\n{pir}"
+        1,
+        "one full reduce over the whole array:\n{pir}"
     );
     // No residual measure layer: neither the nested `iid` nor the query survives.
     assert!(
         !pir.contains("(iid ") && !pir.contains("(logdensityof "),
         "no measure layer:\n{pir}"
     );
-    // Exactly one `get0` per outer row (i = 0, 1, 2) — no nested nested get0,
-    // since the inner iid is now scored as a row-broadcast, not unrolled.
-    assert_eq!(
-        pir.matches("(get0 ").count(),
-        3,
-        "one outer get0 per row, no nested get0:\n{pir}"
+    // No `get0` unroll and no `functionof` — the flatten replaces both
+    // candidates the composed case previously considered.
+    assert!(
+        !pir.contains("(get0 "),
+        "flattened form has no get0 projection at all:\n{pir}"
     );
-    for i in 0..3 {
-        assert!(
-            pir.contains(&format!(") {i})")),
-            "outer term must index the variate at row {i}:\n{pir}"
-        );
-    }
-    // Each outer `get0` still recovers the FULL shape-[2] row (not a scalar):
-    // FlatPIR annotates the get0 result `(%array 1 (2) (%scalar real)) … (get0
-    // (%ref self data) i)` — one per outer row (3 total). This is the
-    // discriminating evidence that the outer projection recovers a full row,
-    // which is exactly the array `broadcast` then scores per cell.
-    assert_eq!(
-        pir.matches(
-            "(%array 1 (2) (%scalar real)) %fixed (cartpow reals 2)) (get0 (%ref self data)"
-        )
-        .count(),
-        3,
-        "each outer get0 projects a full inner-iid ROW (array[2]), not a scalar:\n{pir}"
+    assert!(
+        !pir.contains("(functionof "),
+        "flattened form never reifies a functionof body:\n{pir}"
     );
-    // All three outer rows score the SAME leaf kernel/params: Normal(mu=0.0,
-    // sigma=1.0), each broadcast from its own length-1 array-of-records (see
-    // the identical comment in `iid_normal_sum_structure` above).
-    assert_eq!(
-        pir.matches("(broadcast record (%kwarg mu").count(),
-        3,
-        "all three outer rows score Normal(0,1):\n{pir}"
+    // The obs is the FULL, un-projected `data` array (bound once, no per-row
+    // slicing) — the broadcast's zipped collection argument is a direct
+    // reference to `data`, not a `get0` of it.
+    assert!(
+        pir.contains("(%ref self data)"),
+        "the broadcast scores the full data array directly:\n{pir}"
     );
+    // Each scalar param is lifted through 2 nested `vector(...)` wraps — one
+    // size-1 axis per peeled `iid` layer — giving a rank-2 [1,1] singleton
+    // params array (FlatPIR's `%meta` type annotation prints this as a
+    // rank-2 `(%array 1 (1) (%array 1 (1) (%scalar real)))`, i.e. an
+    // array-of-arrays, one nesting level per peeled `iid`) that broadcasts
+    // against data's full [3,2] shape.
     assert_eq!(
         pir.matches("(vector 0.0)").count(),
-        3,
-        "mu = 0.0 lifted to a length-1 vector once per outer row:\n{pir}"
+        1,
+        "mu = 0.0 lifted to the innermost length-1 vector once:\n{pir}"
     );
     assert_eq!(
         pir.matches("(vector 1.0)").count(),
-        3,
-        "sigma = 1.0 lifted to a length-1 vector once per outer row:\n{pir}"
+        1,
+        "sigma = 1.0 lifted to the innermost length-1 vector once:\n{pir}"
+    );
+    assert_eq!(
+        pir.matches("(%array 1 (1) (%array 1 (1) (%scalar real)))")
+            .count(),
+        2,
+        "mu and sigma both wrapped through 2 nested size-1 array axes (rank-2 [1,1], one per peeled iid layer):\n{pir}"
+    );
+    assert_eq!(
+        pir.matches("(broadcast record (%kwarg mu").count(),
+        1,
+        "a single record broadcast synthesizes the [1,1] params array:\n{pir}"
     );
 }
 
