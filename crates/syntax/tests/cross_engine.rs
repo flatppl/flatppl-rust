@@ -151,6 +151,10 @@ const KNOWN_DIVERGENCES: &[(&str, &str)] = &[
         "JS folds `neg` of a literal into a negative literal",
     ),
     (
+        "js:bat-signal-background",
+        "JS eta-expands dotted-op `broadcast(mul, …)` heads",
+    ),
+    (
         "js:polyeval-iid-broadcast",
         "JS eta-expands dotted-op `broadcast(mul, …)` heads",
     ),
