@@ -3100,10 +3100,12 @@ fn lower_broadcast_kernel(
 }
 
 /// Emit `sum(broadcast(builtin_logdensityof, K, kernel_input, obs))` — the
-/// axis-native kernel-broadcast density tail. `kernel_input` is the per-cell
-/// constructor record (an array-of-records for a value-broadcast, or a SCALAR
-/// record for `iid`, which broadcast replicates across the obs axis). Shared by
-/// [`lower_broadcast_kernel`] and [`lower_iid`]'s primitive fast path.
+/// axis-native kernel-broadcast density tail. `kernel_input` is the array of
+/// per-cell constructor records — a length-`n` array for a value-broadcast, or a
+/// length-1 array for `iid`'s primitive fast path, whose size-1 axis broadcast
+/// replicates across the obs axis (a bare record is NOT a legal broadcast input,
+/// §04; see [`lower_iid`]). Shared by [`lower_broadcast_kernel`] and
+/// [`lower_iid`]'s primitive fast path.
 fn emit_kernel_broadcast_density(
     m: &mut Module,
     ctor_sym: Symbol,
