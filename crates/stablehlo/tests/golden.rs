@@ -8658,3 +8658,59 @@ fn builtin_touniform_refuses_non_const_kernel() {
     );
     assert_eq!(err.node, Some(kernel));
 }
+
+// Regression (Buffy #376): a `table(...)` / `record(...)` field access
+// `t.field` lowers as `get(t, "field")` (a string selector). The emitter must
+// project the named COLUMN of the table/record literal — not try to lower the
+// aggregate as a tensor, which refuses `unsupported builtin head 'table'`
+// (surfaced by the rosetta HEP model's `datasets = table(...)`). This pins that
+// the RIGHT column is selected: `picked = t.bb` at index 1 must fold to bb[1]
+// (21.0), and the unused `aa` column (11.0/12.0) must be absent (DCE'd).
+#[test]
+fn table_field_access_projects_named_column() {
+    let src = "flatppl_compat = \"0.1\"\n\
+t = table(aa = [11.0, 12.0], bb = [21.0, 22.0])\n\
+picked = t.bb\n\
+mu = elementof(reals)\n\
+x = draw(Normal(mu = mu, sigma = 1.0))\n\
+lp = logdensityof(lawof(record(x = x)), record(x = picked[1]))\n";
+    let m = flatppl_syntax::parse(src).unwrap();
+    let d = flatppl_determinizer::determinize(&m).unwrap();
+    let out = flatppl_stablehlo::emit(&d, flatppl_stablehlo::Mode::LogDensity, &Default::default())
+        .expect("table field access must emit, not refuse the `table` head");
+    assert!(out.contains("module {"));
+    assert!(
+        out.contains("21.0"),
+        "bb[1] = 21.0 (the projected column) must appear:\n{out}"
+    );
+    assert!(
+        !out.contains("11.0") && !out.contains("12.0"),
+        "the unused `aa` column (11.0/12.0) must not appear — wrong column projected:\n{out}"
+    );
+}
+
+// Regression (Buffy #377): a query whose EVERY density term is the axis-native
+// broadcast form `sum(broadcast(builtin_logdensityof, ...))` (here two iid
+// priors + an iid Bernoulli likelihood, all dotted — the rasch-1pl shape) must
+// pass `emit_logdensity`'s query-output guard. The guard's
+// `contains_logdensityof_call` previously matched `builtin_logdensityof` only
+// as a call HEAD; in broadcast form it is a bare-atom `broadcast` operand, so
+// an all-broadcast query false-negatived as "no density term". The lowering
+// itself was always correct — only the guard was wrong.
+#[test]
+fn all_broadcast_density_query_passes_guard() {
+    let src = "flatppl_compat = \"0.1\"\n\
+theta = draw(iid(Normal(0.0, 1.5), 2))\n\
+b = draw(iid(Normal(0.0, 1.5), 2))\n\
+prob = invlogit.(theta .- b)\n\
+y = draw(Bernoulli.(prob))\n\
+fk = kernelof(record(y = y), theta = theta, b = b)\n\
+L = likelihoodof(fk, record(y = [true, false]))\n\
+post = bayesupdate(L, lawof(record(theta = theta, b = b)))\n\
+lp = logdensityof(post, record(theta = [0.1, 0.2], b = [0.3, 0.4]))\n";
+    let m = flatppl_syntax::parse(src).unwrap();
+    let d = flatppl_determinizer::determinize(&m).unwrap();
+    let out = flatppl_stablehlo::emit(&d, flatppl_stablehlo::Mode::LogDensity, &Default::default())
+        .expect("an all-broadcast-form density query must not refuse as 'no density term'");
+    assert!(out.contains("module {"));
+}

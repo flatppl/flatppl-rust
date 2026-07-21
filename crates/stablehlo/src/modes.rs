@@ -369,7 +369,7 @@ fn select_query<'m>(
 fn contains_logdensityof_call(m: &Module, root: NodeId) -> bool {
     let mut stack = vec![root];
     while let Some(id) = stack.pop() {
-        if is_builtin_call(m, id, "builtin_logdensityof") {
+        if is_builtin_atom(m, id, "builtin_logdensityof") {
             return true;
         }
         m.for_each_child(id, |c| stack.push(c));
@@ -672,4 +672,22 @@ fn is_builtin_call(m: &Module, id: NodeId, name: &str) -> bool {
             CallHead::Builtin(sym) if m.resolve(sym) == name
         )
     )
+}
+
+/// Whether `id` is the builtin named `name` in EITHER position it can occupy:
+/// a `Call` head (the scalar form `builtin_logdensityof(K, params, obs)`), or a
+/// bare atom (`Node::Const`) — the function operand of a
+/// `broadcast(builtin_logdensityof, …)` axis-native term (spec §04
+/// broadcasting; the determiniser lowers a scalar-kernel `iid(K, n)` density to
+/// `sum(broadcast(builtin_logdensityof, K, …, obs))`, decisions-log 2026-07-20).
+/// [`contains_logdensityof_call`] must match both: a query whose EVERY density
+/// term is broadcast-form (e.g. rasch-1pl — iid priors + iid likelihood, all
+/// dotted) carries the head only as a broadcast operand, never as a call head,
+/// and matching solely the head false-negatives it.
+fn is_builtin_atom(m: &Module, id: NodeId, name: &str) -> bool {
+    match m.node(id) {
+        Node::Call(c) => matches!(c.head, CallHead::Builtin(sym) if m.resolve(sym) == name),
+        Node::Const(sym) => m.resolve(*sym) == name,
+        _ => false,
+    }
 }
