@@ -434,7 +434,12 @@ pub(crate) fn resolve_crossmodule_aliases(
             _ => None,
         })
         .collect();
-    if alias_refs.is_empty() {
+    // Nothing to do only when there are NO cross-module refs at all — neither a
+    // top-level alias binding nor a ref nested inside a binding subtree (the
+    // common single-file case). A nested-only case (`x ~ m.dist`, where `m` is a
+    // `load_module(...)` binding, not a bare alias ref) has `alias_refs` empty
+    // but is handled by phase 5 below.
+    if alias_refs.is_empty() && collect_draw_measure_module_refs(host).is_empty() {
         return Ok(());
     }
 
@@ -471,9 +476,8 @@ pub(crate) fn resolve_crossmodule_aliases(
             });
         }
     }
-    if plans.is_empty() {
-        return Ok(());
-    }
+    // (No early return on empty `plans`: a nested-only model has no alias plans
+    // but still needs phase 5. `state` + step 4 are no-ops when `plans` empty.)
 
     // 3. Seed the shared registry with the host slot each alias occupies BEFORE any
     //    grafting, so a cross-reference from one alias's subtree to a sibling
@@ -496,7 +500,80 @@ pub(crate) fn resolve_crossmodule_aliases(
             .map_err(|reason| crate::density::refuse(p.ref_id, host, &reason))?;
         host.set_binding_rhs(p.bid, root);
     }
+
+    // 5. Graft cross-module refs NESTED inside binding subtrees — the ones the
+    //    alias-binding rewrite (step 4) does not reach, e.g. `x ~ m.dist`
+    //    (`x = draw((%ref m dist))`) or `iid(m.dist, n)`. Collected AFTER step 4
+    //    (the already-rewritten alias roots are grafted-local by now, so only
+    //    genuinely-nested refs remain). Each resolvable ref is grafted through
+    //    the SAME shared `state` (dedup/collision-safe with the alias grafts),
+    //    then every binding RHS is rebuilt substituting the ref node for its
+    //    grafted-local root ([`crate::driver::map_tree`]). A ref that does not
+    //    resolve to a `load_module` member (standard_module, missing dependency)
+    //    is left untouched for the downstream module-member path.
+    let mut replacements: HashMap<NodeId, NodeId> = HashMap::new();
+    for ref_id in collect_draw_measure_module_refs(host) {
+        if let Some(resolved) = resolve_module_ref(bundle, host, ref_id) {
+            let root = graft_subtree_with(host, &resolved, bundle, &mut state)
+                .map_err(|reason| crate::density::refuse(ref_id, host, &reason))?;
+            replacements.insert(ref_id, root);
+        }
+    }
+    if !replacements.is_empty() {
+        let pairs: Vec<(BindingId, NodeId)> =
+            host.bindings().map(|(bid, b)| (bid, b.rhs)).collect();
+        for (bid, root) in pairs {
+            let new =
+                crate::driver::map_tree(host, root, &mut |_m, id| replacements.get(&id).copied());
+            if new != root {
+                host.set_binding_rhs(bid, new);
+            }
+        }
+    }
     Ok(())
+}
+
+/// Every distinct module-namespace ref (`(%ref <alias> member)`) reachable
+/// inside a `draw(...)`'s MEASURE-argument subtree, anywhere in a binding RHS.
+/// Finds cross-module refs nested in a draw's primitive measure — `x ~ m.dist`
+/// (`x = draw((%ref m dist))`), `x ~ iid(m.dist, n)` — which the top-level
+/// alias-binding rewrite in [`resolve_crossmodule_aliases`] does not reach.
+///
+/// Scoped to draw-measure subtrees on purpose (spec §04): a cross-module
+/// *measure* ref grafts freely, but a cross-module *value* ref — a call
+/// argument or a reification input, which is NOT under a `draw` — must not be
+/// grafted here (it is left for the existing refuse / graft-query-target path;
+/// e.g. `m.k(m.rec)`'s value argument `m.rec` must refuse rather than splice a
+/// dangling ref). A module ref is a leaf (its graft replaces it wholesale), so
+/// the walk does not descend past one.
+fn collect_draw_measure_module_refs(host: &Module) -> Vec<NodeId> {
+    let mut seen: HashSet<NodeId> = HashSet::new();
+    let mut out: Vec<NodeId> = Vec::new();
+    let mut stack: Vec<(NodeId, bool)> = host.bindings().map(|(_, b)| (b.rhs, false)).collect();
+    while let Some((id, under_draw)) = stack.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        let is_draw = matches!(
+            host.node(id),
+            Node::Call(c) if matches!(c.head, CallHead::Builtin(sym) if host.resolve(sym) == "draw")
+        );
+        let now_under = under_draw || is_draw;
+        if now_under
+            && matches!(
+                host.node(id),
+                Node::Ref(Ref {
+                    ns: RefNs::Module(_),
+                    ..
+                })
+            )
+        {
+            out.push(id);
+            continue;
+        }
+        host.for_each_child(id, |c| stack.push((c, now_under)));
+    }
+    out
 }
 
 fn graft_node(
