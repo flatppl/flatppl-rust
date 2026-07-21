@@ -96,6 +96,25 @@ pub fn determinize_with_roots(
     // bindings, so this is a no-op there.
     crate::crossmodule::resolve_crossmodule_aliases(&mut work, bundle)?;
 
+    // Cross-module FUNCTION/kernel APPLICATION callees in regular bindings
+    // (`a = m.f(theta)`): graft the cross-module callee to a local node so the
+    // now-local application β-reduces normally in the loop below. This reuses the
+    // query-target grafter (`graft_kernel_application_callee` — which grafts only
+    // the callee and REFUSES a cross-module value argument, preserving the
+    // `m.k(m.rec)` refusal). Top-level alias bindings whose RHS IS a bare
+    // module ref, and cross-module refs in draw-measure position, are already
+    // handled by `resolve_crossmodule_aliases`; this covers a module-ref CALLEE
+    // nested inside a binding's application RHS, which that pass does not reach.
+    let app_bindings: Vec<(flatppl_core::BindingId, NodeId)> =
+        work.bindings().map(|(bid, b)| (bid, b.rhs)).collect();
+    for (bid, rhs) in app_bindings {
+        if let Some(rebuilt) =
+            crate::density::graft_kernel_application_callee(&mut work, rhs, bundle)?
+        {
+            work.set_binding_rhs(bid, rebuilt);
+        }
+    }
+
     loop {
         // Re-run inference (idempotent) so type / phase tables are fresh.
         let _ = flatppl_infer::infer(&mut work);
