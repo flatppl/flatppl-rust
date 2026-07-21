@@ -1522,3 +1522,35 @@ l2 = logdensityof(posterior, x)";
         "l1 must retain both builtin_logdensityof prior terms under roots; got:\n{pir}"
     );
 }
+
+// Regression (Buffy #379): a `~` whose primitive measure is a cross-module
+// distribution ref — `x ~ h.d` (`x = draw((%ref h d))`) — must graft the
+// submodule distribution and determinize, not refuse. The module ref is NESTED
+// inside `draw(...)`, so the top-level alias-binding rewrite doesn't reach it;
+// `resolve_crossmodule_aliases`'s phase 5 (draw-measure-scoped) grafts it. Only
+// MEASURE-position refs graft this way — a cross-module VALUE argument still
+// refuses (see `cross_module_kernel_application_with_module_arg_refuses`).
+#[test]
+fn cross_module_draw_measure_ref_grafts_and_determinizes() {
+    let helpers = "flatppl_compat = \"0.1\"\nd = Normal(mu = 0.0, sigma = 1.0)";
+    let model = "flatppl_compat = \"0.1\"\n\
+h = load_module(\"helpers.flatppl\")\n\
+x ~ h.d\n\
+lp = logdensityof(lawof(record(x = x)), record(x = 0.5))";
+
+    let mut hmod = parse(helpers);
+    let _ = flatppl_infer::infer(&mut hmod);
+    let mut bundle = ModuleBundle::new();
+    bundle.insert("helpers.flatppl", Arc::new(hmod));
+
+    let mut mmod = parse(model);
+    let _ = flatppl_infer::infer_module(&mut mmod, &bundle, flatppl_infer::Level::Shape);
+
+    let lowered = determinize_with(&mmod, &bundle)
+        .expect("cross-module draw-measure ref must graft + determinize, not refuse");
+    let ir = flatppl_flatpir::write(&lowered);
+    assert!(
+        ir.contains("builtin_logdensityof") && ir.contains("Normal"),
+        "expected a grafted Normal density term:\n{ir}"
+    );
+}
