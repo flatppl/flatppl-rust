@@ -2047,6 +2047,44 @@ impl<'m> Emitter<'m> {
         Some(elems[idx as usize])
     }
 
+    /// If `args` is `get`/`get0`'s `[container, selector]` pair and
+    /// `container` resolves (one `(%ref self x)` hop,
+    /// [`Emitter::resolve_ref_one`]) to a `table(...)` or `record(...)`
+    /// literal with a named entry matching the `selector`, return that
+    /// entry's value [`NodeId`]. The parser lowers field access `obj.name`
+    /// to `get(obj, "name")` with a string-literal selector
+    /// (`flatppl_syntax::parser`); a bare-atom `Node::Const` selector is
+    /// accepted too. A `table`/`record` has no monolithic tensor form
+    /// (`ops::lower_builtin` refuses the `table`/`record` head), but a
+    /// named-field projection selects one column/field — itself lowerable —
+    /// so `datasets.exposure` reaches the column node directly instead of
+    /// trying to lower the whole aggregate. `None` when `container` is not a
+    /// table/record literal, the selector is not a field name, or no field
+    /// matches (the caller then tries [`Emitter::tuple_projection`], else the
+    /// ordinary tensor `get`).
+    fn named_field_projection(&self, args: &[NodeId]) -> Option<NodeId> {
+        let [container, selector] = <[NodeId; 2]>::try_from(args).ok()?;
+        let resolved = self.resolve_ref_one(container);
+        let named = match self.m.node(resolved) {
+            Node::Call(c) => match c.head {
+                CallHead::Builtin(sym) if matches!(self.m.resolve(sym), "table" | "record") => {
+                    &c.named
+                }
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let field = match self.m.node(selector) {
+            Node::Lit(Scalar::Str(s)) => s.as_ref(),
+            Node::Const(sym) => self.m.resolve(*sym),
+            _ => return None,
+        };
+        named
+            .iter()
+            .find(|na| self.m.resolve(na.name) == field)
+            .map(|na| na.value)
+    }
+
     /// Resolve `id` through at most one level of `(%ref self x)` indirection
     /// (mirroring [`Emitter::lower_ref`]'s `SelfMod` case, and the
     /// determinizer's own `resolve_ref_one`: a shared latent's
@@ -2476,6 +2514,9 @@ impl<'m> Emitter<'m> {
                         // ordinary case) falls through to `ops::lower_builtin`'s
                         // generic rank-1-tensor `get`/`get0`.
                         let base = if name == "get0" { 0 } else { 1 };
+                        if let Some(field) = self.named_field_projection(&call.args) {
+                            return self.lower_node(field);
+                        }
                         if let Some(elem) = self.tuple_projection(&call.args, base) {
                             return self.lower_node(elem);
                         }
