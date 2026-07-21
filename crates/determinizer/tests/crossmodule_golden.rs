@@ -1554,3 +1554,38 @@ lp = logdensityof(lawof(record(x = x)), record(x = 0.5))";
         "expected a grafted Normal density term:\n{ir}"
     );
 }
+
+// Regression (Buffy #379, function-callee): a REGULAR binding whose RHS applies
+// a cross-module FUNCTION to a HOST value — `shifted = h.g(mu0)` — must graft
+// the callee `h.g` and determinize (the applied function feeds a distribution
+// parameter). Previously the module-ref callee nested in the application (not a
+// top-level alias, not a draw measure) was left dangling → a
+// `Type::Failed("cross-module resolution")` node. The driver pre-pass now grafts
+// such callees via `graft_kernel_application_callee` — which still REFUSES a
+// cross-module value ARGUMENT (`cross_module_kernel_application_with_module_arg_refuses`).
+#[test]
+fn cross_module_function_callee_in_binding_grafts() {
+    let helpers = "flatppl_compat = \"0.1\"\ng = par -> par + 1.0";
+    let model = "flatppl_compat = \"0.1\"\n\
+h = load_module(\"helpers.flatppl\")\n\
+mu0 = elementof(reals)\n\
+shifted = h.g(mu0)\n\
+x ~ Normal(mu = shifted, sigma = 1.0)\n\
+lp = logdensityof(lawof(record(x = x)), record(x = 0.5))";
+
+    let mut hmod = parse(helpers);
+    let _ = flatppl_infer::infer(&mut hmod);
+    let mut bundle = ModuleBundle::new();
+    bundle.insert("helpers.flatppl", Arc::new(hmod));
+
+    let mut mmod = parse(model);
+    let _ = flatppl_infer::infer_module(&mut mmod, &bundle, flatppl_infer::Level::Shape);
+
+    let lowered = determinize_with(&mmod, &bundle)
+        .expect("a cross-module function callee applied to a host value must graft, not refuse");
+    let ir = flatppl_flatpir::write(&lowered);
+    assert!(
+        ir.contains("builtin_logdensityof") && ir.contains("Normal"),
+        "expected a Normal density term with the grafted-function-derived mean:\n{ir}"
+    );
+}

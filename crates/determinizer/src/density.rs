@@ -572,7 +572,7 @@ fn density_query_op_name(m: &Module, query: NodeId) -> Result<&'static str, Refu
 /// itself a cross-module ref (only the callee is grafted, so a cross-module
 /// argument would splice a dangling, unresolvable ref into the kernel body —
 /// a silent wrong density — rather than lower correctly).
-fn graft_kernel_application_callee(
+pub(crate) fn graft_kernel_application_callee(
     m: &mut Module,
     arg1: NodeId,
     bundle: &ModuleBundle,
