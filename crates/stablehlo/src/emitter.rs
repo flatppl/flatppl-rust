@@ -2597,7 +2597,12 @@ impl<'m> Emitter<'m> {
     /// renders `-> T` / `return %x : T` (no parenthesized tuple), byte-for-byte
     /// identical to the previous single-`ret` output; two-or-more render the
     /// parenthesized result-type list and comma-joined return.
-    pub fn finish(self, func_name: &str, args: &[(String, MlirTy)], rets: &[&Value]) -> String {
+    pub fn finish(
+        self,
+        func_name: &str,
+        args: &[(String, MlirTy, ElemKind)],
+        rets: &[&Value],
+    ) -> String {
         debug_assert!(
             !rets.is_empty(),
             "finish requires at least one return value"
@@ -2605,7 +2610,7 @@ impl<'m> Emitter<'m> {
         let dtype = self.dtype;
         let arg_list = args
             .iter()
-            .map(|(name, ty)| format!("{name}: {}", ty.render(dtype, ElemKind::Real)))
+            .map(|(name, ty, elem)| format!("{name}: {}", ty.render(dtype, *elem)))
             .collect::<Vec<_>>()
             .join(", ");
         let ret_tys: Vec<String> = rets.iter().map(|r| r.ty.render(dtype, r.elem)).collect();

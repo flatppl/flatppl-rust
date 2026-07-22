@@ -614,70 +614,42 @@ fn stablehlo_cmd(input: &Path, mode: &str, output: Option<&Path>) -> Result<(), 
         }
     };
 
-    // Recognize the `inputs`/`outputs` ABI (design doc
-    // `docs/superpowers/specs/2026-07-17-inputs-outputs-abi-design.md`) on the
-    // SURFACE module: if it declares either reserved binding, DCE roots on
-    // both present names (so the outputs' backward cone AND the declared
-    // inputs survive — an unused declared input is still a stable ABI arg,
-    // not pruned) and the emitter reads the ABI itself from the determinized
-    // module (`EmitOptions::query` is not needed in this path). Otherwise
-    // fall back to the legacy "last public binding is the query" convention,
-    // with a deprecation warning: the ABI is additive/opt-in during
-    // migration (design doc "Fallback + migration").
-    //
-    // The ABI is LogDensity-only in PR-1: `sample` mode never engages it (it
-    // ignores `inputs`/`outputs` at emission) and so always uses the legacy
-    // path — and does NOT emit the logdensity-migration deprecation warning.
-    let abi_syms: Vec<flatppl_core::Symbol> = if matches!(mode, flatppl_stablehlo::Mode::LogDensity)
-    {
-        ["inputs", "outputs"]
-            .iter()
-            .filter_map(|name| {
-                module
-                    .public_bindings()
-                    .find(|(_, b)| module.resolve(b.name) == *name)
-                    .map(|(_, b)| b.name)
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
+    // The `inputs`/`outputs` compilation ABI (design doc
+    // `docs/superpowers/specs/2026-07-17-inputs-outputs-abi-design.md`) is
+    // REQUIRED, both modes: the last-public-binding query heuristic has been
+    // removed. DCE roots on both present reserved names (so the outputs'
+    // backward cone AND the declared inputs survive — an unused declared input
+    // is still a stable ABI arg, not pruned); the emitter reads the ABI itself
+    // off the determinized module (`modes::read_abi`). A surface model that
+    // declares neither reserved binding is refused here — the compiled
+    // function's arguments and results must be designated explicitly.
+    let abi_syms: Vec<flatppl_core::Symbol> = ["inputs", "outputs"]
+        .iter()
+        .filter_map(|name| {
+            module
+                .public_bindings()
+                .find(|(_, b)| module.resolve(b.name) == *name)
+                .map(|(_, b)| b.name)
+        })
+        .collect();
 
-    let abi_present = !abi_syms.is_empty();
-    let (roots, query_name) = if abi_present {
-        (Some(abi_syms), None)
-    } else {
-        if matches!(mode, flatppl_stablehlo::Mode::LogDensity) {
-            eprintln!(
-                "warning: no inputs/outputs bindings; using the legacy last-public-binding \
-                 query — declare inputs/outputs for an explicit ABI"
-            );
-        }
-        // The query is the LAST public binding of the *surface* model (the
-        // "query last" convention). Read its identity here, before
-        // determinization: a `load_module` query that scores a foreign
-        // model's `posterior` gets that model's bindings grafted in during
-        // determinization, and its inert data/pinned-draw residue can sort
-        // AFTER the query — so its position is not stable, but its name is.
-        // Use the name as the DCE root (Buffy #263 Pass 4-A) so bindings the
-        // query does not reach are pruned (required when a grafted
-        // forward-only draw would otherwise refuse to determinize), and hand
-        // the same name to the emitter (`EmitOptions::query`) so it emits the
-        // query binding rather than a positional guess.
-        let query_sym = module.public_bindings().last().map(|(_, b)| b.name);
-        let query_name = query_sym.map(|s| module.resolve(s).to_string());
-        (query_sym.map(|s| vec![s]), query_name)
-    };
+    if abi_syms.is_empty() {
+        return Err(Failure::Refuse(
+            "stablehlo: no inputs/outputs ABI declared; the last-public-binding \
+             query heuristic has been removed — declare `inputs = (…)` and \
+             `outputs = (…)` (typically in a query module) to designate the \
+             compiled function's arguments and results"
+                .to_string(),
+        ));
+    }
+    let roots = Some(abi_syms);
 
     // Compile-time shape pins for `load_data` ABI inputs (design doc
     // "load_data — shape, not values"): read each `load_data` binding named in
     // `inputs` for its LENGTH only, so the emitter types it `tensor<N×f32>`
     // rather than an unusable `tensor<?×f32>`. The values are NOT read here —
-    // they are the runtime argument, never baked. Only when the ABI is engaged
-    // (`abi_syms` non-empty, LogDensity); the legacy path bakes nothing new.
-    let input_shapes = if !abi_present {
-        std::collections::HashMap::new()
-    } else {
+    // they are the runtime argument, never baked.
+    let input_shapes = {
         let input_names = abi_input_names(&module);
         let in_loc = Location::Local(input.to_path_buf());
         let resolver = CliResolver::cache_only();
@@ -701,7 +673,6 @@ fn stablehlo_cmd(input: &Path, mode: &str, output: Option<&Path>) -> Result<(), 
             ))
         })?;
     let opts = flatppl_stablehlo::EmitOptions {
-        query: query_name,
         input_shapes,
         ..Default::default()
     };
