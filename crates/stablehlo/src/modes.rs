@@ -325,6 +325,118 @@ pub(crate) fn emit_logdensity_abi(
     Ok(e.finish("logdensity", &args, &rets))
 }
 
+/// Emit `@sample` for a determinized module `m` that declares the
+/// `inputs`/`outputs` ABI — the Sample-mode analogue of
+/// [`emit_logdensity_abi`]. The single declared output is the sample query
+/// (a value-terminal `rand(rstate, M)` / `builtin_sample`-bearing binding).
+/// `%key` (the threaded rng state, spec §07's `rand(rstate, m) -> (value,
+/// new_rstate)`) is arg 0, found from the output via [`find_rng_source`] —
+/// NOT drawn from `inputs`; the rng-source binding is exempt from the
+/// inputs-exhaustiveness check. `abi.inputs` supplies the additional free
+/// params (`elementof`) / fixed inputs as `%arg1..`, in declared order.
+/// Returns the two-result `(value, new_key)` function.
+#[allow(dead_code)] // wired into `emit` in Task 2; built but unreachable here.
+pub(crate) fn emit_sample_abi(
+    m: &Module,
+    abi: &Abi,
+    opts: &EmitOptions,
+) -> Result<String, EmitError> {
+    let mut e = Emitter::new(m, opts.dtype);
+
+    // Exactly one sample output.
+    let output = match abi.outputs.as_slice() {
+        [one] => *one,
+        _ => {
+            return Err(EmitError::whole(
+                "`outputs` for a sample query must name exactly one output (the \
+                 sampled value)",
+            ));
+        }
+    };
+
+    // %key = arg 0, bound from the rng source reachable from the output.
+    let src = find_rng_source(m, output).ok_or_else(|| {
+        EmitError::at(
+            output,
+            "no rng source to bind to %key: the declared sample output reaches \
+             no rnginit/external(rngstates) source to thread from",
+        )
+    })?;
+    let key_name = "%key".to_string();
+    e.bind(
+        src,
+        Value {
+            ssa: key_name.clone(),
+            ty: MlirTy::Key,
+            elem: ElemKind::Real,
+        },
+    );
+    let mut args: Vec<(String, MlirTy)> = vec![(key_name, MlirTy::Key)];
+
+    // Exhaustiveness over the additional params — same as emit_logdensity_abi,
+    // EXCEPT the rng source binding (bound to %key above) is exempt.
+    for (_, binding) in m.bindings() {
+        if binding.rhs == src {
+            continue; // the rng source is %key, not a listed input
+        }
+        if is_free_param(m, binding.rhs) && !abi.inputs.contains(&binding.name) {
+            return Err(EmitError::at(
+                binding.rhs,
+                format!(
+                    "elementof parameter `{}` is not listed in `inputs`; the inputs \
+                     ABI is exhaustive",
+                    m.resolve(binding.name)
+                ),
+            ));
+        }
+    }
+
+    // Bind declared inputs as %arg1.. (in declared order).
+    for &sym in &abi.inputs {
+        let bid = m.binding_by_name(sym).ok_or_else(|| {
+            EmitError::whole(format!(
+                "`inputs` names `{}`, which is not a binding of the determinized module",
+                m.resolve(sym)
+            ))
+        })?;
+        let binding = m.binding(bid);
+        if !is_free_param(m, binding.rhs) && !is_fixed_input(m, binding.rhs) {
+            return Err(EmitError::at(
+                binding.rhs,
+                format!(
+                    "`inputs` entry `{}` is not an elementof parameter, external, or \
+                     load_data input",
+                    m.resolve(sym)
+                ),
+            ));
+        }
+        let name = format!("%arg{}", args.len());
+        let (mut ty, elem) = mlir_type_of(m, binding.rhs, opts.dtype)?;
+        if let Some(shape) = opts.input_shapes.get(m.resolve(sym)) {
+            ty = MlirTy::Ranked(shape.iter().map(|&n| Some(n)).collect());
+        }
+        e.bind(
+            binding.rhs,
+            Value {
+                ssa: name.clone(),
+                ty: ty.clone(),
+                elem,
+            },
+        );
+        args.push((name, ty));
+    }
+
+    // The declared output is a `(%ref self draws)` node (ABI outputs are refs,
+    // unlike the legacy path's binding RHS); resolve it to the underlying
+    // `rand`/tuple before extracting the value component, so `@sample` returns
+    // the drawn value — not the `tuple(value, advanced_rng)` — as its first
+    // result (spec §07 `rand -> (value, new_rstate)`; keeps parity with
+    // `emit_sample`'s `query.1.rhs`).
+    let value = e.lower_node(query_value_component(m, resolve_self_ref(m, output)))?;
+    let final_key = e.cur_key();
+    Ok(e.finish("sample", &args, &[&value, &final_key]))
+}
+
 /// Select the public binding to emit as the query. When `opts.query` names a
 /// binding, that public binding is used regardless of its source position —
 /// which is the whole point of naming it: cross-module grafting (`load_module`

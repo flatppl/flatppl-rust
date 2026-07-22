@@ -8714,3 +8714,22 @@ lp = logdensityof(post, record(theta = [0.1, 0.2], b = [0.3, 0.4]))\n";
         .expect("an all-broadcast-form density query must not refuse as 'no density term'");
     assert!(out.contains("module {"));
 }
+
+// emit_sample_abi: a declared `outputs = (draws)` sample query emits the
+// two-result (value, new_key) @sample with %key as arg 0, matching the
+// pre-purge legacy emit.
+#[ignore = "exercises emit_sample_abi only after Task 2 routes Sample mode to the ABI path"]
+#[test]
+fn emit_sample_abi_emits_threaded_key_two_result() {
+    let src = "flatppl_compat = \"0.1\"\n\
+s = rnginit(0)\n\
+x = draw(Beta(alpha = 2.0, beta = 3.0))\n\
+draws = rand(s, lawof(x))\n\
+outputs = (draws)\n";
+    let m = flatppl_syntax::parse(src).unwrap();
+    let d = flatppl_determinizer::determinize(&m).unwrap();
+    let out = flatppl_stablehlo::emit(&d, flatppl_stablehlo::Mode::Sample, &Default::default())
+        .expect("declared sample output must emit via emit_sample_abi");
+    assert!(out.contains("func.func @sample"));
+    assert!(out.contains("tensor<2xui64>"), "leading %key arg:\n{out}");
+}
