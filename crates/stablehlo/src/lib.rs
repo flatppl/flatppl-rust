@@ -19,34 +19,30 @@
 //! `sample` builders, covering every distribution in the spec's base catalogue.
 //!
 //! `modes.rs` builds the two emitted programs `emit` routes to:
-//! `emit_logdensity` (`Mode::LogDensity`, the `@logdensity` function) and
-//! `emit_sample` (`Mode::Sample`, the `@sample` function, `mu + sigma * Z`-style
-//! reparameterised sampling seeded via `Emitter::rng`).
+//! `modes::emit_logdensity_abi` (`Mode::LogDensity`, the `@logdensity`
+//! function) and `modes::emit_sample_abi` (`Mode::Sample`, the `@sample`
+//! function, `mu + sigma * Z`-style reparameterised sampling seeded via
+//! `Emitter::rng`).
 //!
 //! # The `inputs` / `outputs` compilation ABI
 //!
 //! FlatPDL carries no marker for "which binding is a function argument" or
-//! "which is the result", so by default `emit_logdensity` falls back to a
-//! convention: the emitted `@logdensity` takes every `elementof` parameter as
-//! an argument (in source order) and returns the *last public binding* as its
-//! single result. That is fine for a self-contained scoring model but fragile
-//! once cross-module grafting (a `load_module` query scoring a foreign
-//! `posterior`) reorders bindings, and it bakes observed data in as constants.
-//!
-//! A model can instead declare an explicit, ordered ABI with two reserved
-//! top-level bindings — `inputs = …` and `outputs = …`, each a single value or
-//! a tuple. **Tuple order is the ABI order** of the emitted function. When a
-//! model declares them, the host (`flatppl stablehlo`) roots dead-code
-//! elimination on `{inputs, outputs}` (keeping the outputs' backward cone plus
-//! the declared inputs) and the emitter reads the ABI off the determinized
-//! module (`modes::read_abi` → `modes::emit_logdensity_abi`) rather than
-//! guessing. Absent both bindings, the legacy convention above runs unchanged
-//! (with a one-line deprecation warning from the CLI). The ABI is
-//! `Mode::LogDensity`-only; `Mode::Sample` never engages it.
+//! "which is the result", so a model designates them explicitly with two
+//! reserved top-level bindings — `inputs = …` and `outputs = …`, each a single
+//! value or a tuple. **Tuple order is the ABI order** of the emitted function.
+//! The host (`flatppl stablehlo`) roots dead-code elimination on
+//! `{inputs, outputs}` (keeping the outputs' backward cone plus the declared
+//! inputs) and the emitter reads the ABI off the determinized module
+//! (`modes::read_abi` → `modes::emit_logdensity_abi` / `emit_sample_abi`). The
+//! ABI is **required for both modes**: a module declaring neither reserved
+//! binding is refused — the older last-public-binding / source-order query
+//! heuristic has been removed, so there is no fallback.
 //!
 //! Each `inputs` entry becomes a `func.func` argument, typed by phase (spec
 //! §04):
-//! - an `elementof` parameter → an argument (its inferred element kind);
+//! - an `elementof` parameter → an argument in its inferred element kind (an
+//!   integer-domain parameter such as `posintegers` arrives as a `tensor<i32>`
+//!   argument and is converted to float only where it enters real-valued math);
 //! - an `external(S)` input → an argument typed from `S`;
 //! - a `load_data(…)` input → a `tensor<N×f32>` argument whose length `N` is
 //!   pinned from a compile-time read of the file's row count (`.csv` / `.wsv`;
@@ -56,8 +52,11 @@
 //!
 //! `inputs` is authoritative and exhaustive: every `elementof` parameter in
 //! the module must be listed, or emission refuses. Each `outputs` entry is a
-//! `logdensityof(M, point)` query (already reduced to a deterministic density
-//! expression by determinization); the results appear in declared order.
+//! deterministic FlatPDL result in declared order — a `logdensityof(M, point)`
+//! density query, or (`Mode::Sample`) a sampled value: the emitted `@sample`
+//! threads a leading `%key : tensor<2xui64>` rng argument (spec §07 `rand`) and
+//! returns the `(value, new_key)` pair, so its single `outputs` entry names the
+//! sampled binding rather than a density.
 //!
 //! ## Worked examples
 //!
@@ -113,7 +112,7 @@
 //! map them onto the variate field names in the `outputs` `record(…)`.
 //!
 //! See `crates/stablehlo/docs/inputs-outputs-abi.md` for the full reference —
-//! the default convention, every refusal rule, and query-module usage.
+//! every refusal rule and query-module usage.
 
 mod emitter;
 mod mlir;
@@ -147,15 +146,6 @@ pub enum Dtype {
 /// never assumes/hardcodes 64-bit floats.
 pub struct EmitOptions {
     pub dtype: Dtype,
-    /// The public binding to emit as the query, designated by name. FlatPDL
-    /// carries no query marker (see [`modes`]); the host (the CLI verb / the
-    /// testsuite harness) picks the query binding and names it here. `None`
-    /// falls back to the "last public binding" convention — correct for a
-    /// self-contained hand-written scoring model, but ambiguous once
-    /// cross-module grafting (`load_module`) splices a foreign model's inert
-    /// data/residue bindings in *after* the query in source order. Naming the
-    /// query keeps it identifiable regardless of grafted trailing bindings.
-    pub query: Option<String>,
     /// Compile-time shape pins for fixed-phase ABI inputs whose FlatPDL type
     /// carries a dynamic dim — `load_data(...)` (typed `CartPow(set,
     /// Dim::Dynamic)`, so `tensor<?×f32>`) and a shaped `external(...)` — keyed
@@ -176,7 +166,6 @@ impl Default for EmitOptions {
     fn default() -> Self {
         Self {
             dtype: Dtype::F32,
-            query: None,
             input_shapes: std::collections::HashMap::new(),
         }
     }
@@ -186,23 +175,25 @@ impl Default for EmitOptions {
 /// (i.e. the output of `flatppl_determinizer::determinize`). Refuses (never
 /// mis-lowers) if `m` still carries measure-layer constructs.
 ///
-/// Routes to the mode builder for `mode`: [`Mode::LogDensity`] → the
-/// `inputs`/`outputs` ABI path ([`modes::emit_logdensity_abi`], PR-1) when
-/// `m` declares the ABI ([`modes::read_abi`] is `Some`), else the legacy
-/// last-public-binding/source-order path ([`modes::emit_logdensity`]);
-/// [`Mode::Sample`] → [`modes::emit_sample`] (the ABI is PR-1
-/// `LogDensity`-mode-only — a `Sample`-mode module carrying `inputs`/
-/// `outputs` is not specially routed and falls through to the existing
-/// query-finding convention, which refuses if that convention's guard is not
-/// met rather than mis-lowering).
+/// Requires the `inputs`/`outputs` compilation ABI (`modes::read_abi` is
+/// `Some`) and routes to the mode builder for `mode`: [`Mode::LogDensity`] →
+/// `modes::emit_logdensity_abi`, [`Mode::Sample`] → `modes::emit_sample_abi`.
+/// A module declaring neither reserved binding is refused — the older
+/// last-public-binding/source-order query heuristic has been removed, so there
+/// is no fallback.
 pub fn emit(m: &Module, mode: Mode, opts: &EmitOptions) -> Result<String, EmitError> {
     flatppl_determinizer::is_flatpdl(m)
         .map_err(|_| EmitError::whole("input is not FlatPDL (determinize first)"))?;
-    match mode {
-        Mode::LogDensity => match modes::read_abi(m) {
-            Some(abi) => modes::emit_logdensity_abi(m, &abi, opts),
-            None => modes::emit_logdensity(m, opts),
+    match modes::read_abi(m) {
+        Some(abi) => match mode {
+            Mode::LogDensity => modes::emit_logdensity_abi(m, &abi, opts),
+            Mode::Sample => modes::emit_sample_abi(m, &abi, opts),
         },
-        Mode::Sample => modes::emit_sample(m, opts),
+        None => Err(EmitError::whole(
+            "no inputs/outputs ABI declared; the last-public-binding query \
+             heuristic has been removed — declare `inputs = (…)` and \
+             `outputs = (…)` (typically in a query module) to designate the \
+             compiled function's arguments and results",
+        )),
     }
 }

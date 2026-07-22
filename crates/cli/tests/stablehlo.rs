@@ -23,31 +23,27 @@ fn write_model(name: &str, src: &str) -> std::path::PathBuf {
     input
 }
 
-/// A model with no `inputs`/`outputs` bindings: `stablehlo_cmd` falls back to
-/// the legacy last-public-binding query AND prints a one-line deprecation
-/// warning to stderr (design doc "Fallback + migration"; brief step 3).
+/// A model with no `inputs`/`outputs` bindings is refused (exit 3): the
+/// last-public-binding query heuristic has been removed, so the ABI must be
+/// declared explicitly — there is no fallback.
 #[test]
-fn stablehlo_legacy_model_emits_deprecation_warning() {
+fn stablehlo_model_without_abi_refuses_with_exit_3() {
     let input = write_model(
-        "legacy",
+        "no-abi",
         "a = draw(Normal(mu = 0.0, sigma = 1.0))\n\
          lp = logdensityof(lawof(record(a = a)), record(a = 0.5))\n",
     );
     let out = flatppl().arg("stablehlo").arg(&input).output().unwrap();
-    assert!(
-        out.status.success(),
-        "stderr: {}",
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "expected exit 3 (refuse); stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("no inputs/outputs bindings") && stderr.contains("declare inputs/outputs"),
-        "expected a deprecation warning on stderr, got:\n{stderr}"
-    );
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("func.func @logdensity"),
-        "legacy path must still emit:\n{stdout}"
+        stderr.contains("no inputs/outputs ABI declared"),
+        "expected the ABI-required refusal on stderr, got:\n{stderr}"
     );
 }
 

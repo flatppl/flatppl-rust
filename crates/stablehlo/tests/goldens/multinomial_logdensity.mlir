@@ -1,5 +1,5 @@
 module {
-  func.func @logdensity(%arg0: tensor<f32>, %arg1: tensor<3xf32>) -> tensor<f32> {
+  func.func @logdensity(%arg0: tensor<i32>, %arg1: tensor<3xf32>) -> tensor<f32> {
     %0 = stablehlo.constant dense<2> : tensor<i32>
     %1 = stablehlo.constant dense<3> : tensor<i32>
     %2 = stablehlo.constant dense<5> : tensor<i32>
@@ -8,22 +8,23 @@ module {
     %5 = stablehlo.reshape %2 : (tensor<i32>) -> tensor<1xi32>
     %6 = stablehlo.concatenate %3, %4, %5, dim = 0 : (tensor<1xi32>, tensor<1xi32>, tensor<1xi32>) -> tensor<3xi32>
     %7 = stablehlo.constant dense<1.0> : tensor<f32>
-    %8 = stablehlo.add %arg0, %7 : tensor<f32>
-    %9 = chlo.lgamma %8 : tensor<f32> -> tensor<f32>
-    %10 = stablehlo.constant dense<1.0> : tensor<3xf32>
-    %11 = stablehlo.convert %6 : (tensor<3xi32>) -> tensor<3xf32>
-    %12 = stablehlo.add %11, %10 : tensor<3xf32>
-    %13 = chlo.lgamma %12 : tensor<3xf32> -> tensor<3xf32>
-    %14 = stablehlo.constant dense<0.000000e+00> : tensor<f32>
-    %15 = stablehlo.reduce(%13 init: %14) applies stablehlo.add across dimensions = [0] : (tensor<3xf32>, tensor<f32>) -> tensor<f32>
-    %16 = stablehlo.negate %15 : tensor<f32>
-    %17 = stablehlo.log %arg1 : tensor<3xf32>
-    %18 = stablehlo.convert %6 : (tensor<3xi32>) -> tensor<3xf32>
-    %19 = stablehlo.multiply %18, %17 : tensor<3xf32>
-    %20 = stablehlo.constant dense<0.000000e+00> : tensor<f32>
-    %21 = stablehlo.reduce(%19 init: %20) applies stablehlo.add across dimensions = [0] : (tensor<3xf32>, tensor<f32>) -> tensor<f32>
-    %22 = stablehlo.add %9, %16 : tensor<f32>
-    %23 = stablehlo.add %22, %21 : tensor<f32>
-    return %23 : tensor<f32>
+    %8 = stablehlo.convert %arg0 : (tensor<i32>) -> tensor<f32>
+    %9 = stablehlo.add %8, %7 : tensor<f32>
+    %10 = chlo.lgamma %9 : tensor<f32> -> tensor<f32>
+    %11 = stablehlo.constant dense<1.0> : tensor<3xf32>
+    %12 = stablehlo.convert %6 : (tensor<3xi32>) -> tensor<3xf32>
+    %13 = stablehlo.add %12, %11 : tensor<3xf32>
+    %14 = chlo.lgamma %13 : tensor<3xf32> -> tensor<3xf32>
+    %15 = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+    %16 = stablehlo.reduce(%14 init: %15) applies stablehlo.add across dimensions = [0] : (tensor<3xf32>, tensor<f32>) -> tensor<f32>
+    %17 = stablehlo.negate %16 : tensor<f32>
+    %18 = stablehlo.log %arg1 : tensor<3xf32>
+    %19 = stablehlo.convert %6 : (tensor<3xi32>) -> tensor<3xf32>
+    %20 = stablehlo.multiply %19, %18 : tensor<3xf32>
+    %21 = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+    %22 = stablehlo.reduce(%20 init: %21) applies stablehlo.add across dimensions = [0] : (tensor<3xf32>, tensor<f32>) -> tensor<f32>
+    %23 = stablehlo.add %10, %17 : tensor<f32>
+    %24 = stablehlo.add %23, %22 : tensor<f32>
+    return %24 : tensor<f32>
   }
 }

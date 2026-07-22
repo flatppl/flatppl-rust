@@ -37,7 +37,7 @@ fn emit_stub_on_flatpdl_returns_module() {
     // exactly the shape `emit_logdensity`'s query-output guard now refuses
     // (see `crates/stablehlo/src/modes.rs`) — this smoke test needs a real
     // `logdensityof` so it still exercises the success path.
-    let src = "flatppl_compat = \"0.1\"\na = draw(Normal(mu = 0.0, sigma = 1.0))\nlp = logdensityof(lawof(record(a = a)), record(a = 0.5))\n";
+    let src = "flatppl_compat = \"0.1\"\na = draw(Normal(mu = 0.0, sigma = 1.0))\nlp = logdensityof(lawof(record(a = a)), record(a = 0.5))\noutputs = (lp)\n";
     let m = flatppl_syntax::parse(src).unwrap();
     let d = flatppl_determinizer::determinize(&m).unwrap();
     let out = flatppl_stablehlo::emit(&d, flatppl_stablehlo::Mode::LogDensity, &Default::default())
@@ -502,7 +502,11 @@ fn emitter_finish_wraps_args_and_return_type() {
         elem: ElemKind::Real,
     };
     let doubled = e.add(&arg, &arg);
-    let out = e.finish("f", &[("%arg0".to_string(), MlirTy::Scalar)], &[&doubled]);
+    let out = e.finish(
+        "f",
+        &[("%arg0".to_string(), MlirTy::Scalar, ElemKind::Real)],
+        &[&doubled],
+    );
     assert!(out.starts_with("module {\n"));
     assert!(out.contains("func.func @f(%arg0: tensor<f64>) -> tensor<f64> {"));
     assert!(out.trim_end().ends_with('}'));
@@ -1198,7 +1202,7 @@ fn lower_ifelse_of_in_interval_selects_via_stablehlo_select() {
     let result = e.lower_node(ifelse_node).unwrap();
     let out = e.finish(
         "logdensity",
-        &[("%arg0".to_string(), MlirTy::Scalar)],
+        &[("%arg0".to_string(), MlirTy::Scalar, ElemKind::Real)],
         &[&result],
     );
 
@@ -1242,7 +1246,11 @@ fn lower_logsumexp_emits_stable_shift_by_max_formula_in_order() {
     assert_eq!(result.ty, MlirTy::Scalar);
     let out = e.finish(
         "f",
-        &[("%arg0".to_string(), MlirTy::Ranked(vec![Some(3)]))],
+        &[(
+            "%arg0".to_string(),
+            MlirTy::Ranked(vec![Some(3)]),
+            ElemKind::Real,
+        )],
         &[&result],
     );
 
@@ -1308,8 +1316,8 @@ fn lower_logsumexp_of_vector_emits_concatenate_then_stable_formula() {
     let out = e.finish(
         "f",
         &[
-            ("%arg0".to_string(), MlirTy::Scalar),
-            ("%arg1".to_string(), MlirTy::Scalar),
+            ("%arg0".to_string(), MlirTy::Scalar, ElemKind::Real),
+            ("%arg1".to_string(), MlirTy::Scalar, ElemKind::Real),
         ],
         &[&result],
     );
@@ -1366,7 +1374,11 @@ fn lower_sum_reduces_to_scalar_via_reduce_sum() {
     assert_eq!(result.ty, MlirTy::Scalar);
     let out = e.finish(
         "f",
-        &[("%arg0".to_string(), MlirTy::Ranked(vec![Some(3)]))],
+        &[(
+            "%arg0".to_string(),
+            MlirTy::Ranked(vec![Some(3)]),
+            ElemKind::Real,
+        )],
         &[&result],
     );
     assert!(
@@ -1420,7 +1432,11 @@ fn lower_in_interval_reduces_to_one_compare() {
         },
     );
     let result = e.lower_node(node).unwrap();
-    let out = e.finish("f", &[("%arg0".to_string(), MlirTy::Scalar)], &[&result]);
+    let out = e.finish(
+        "f",
+        &[("%arg0".to_string(), MlirTy::Scalar, ElemKind::Real)],
+        &[&result],
+    );
 
     assert_eq!(
         out.matches("stablehlo.subtract").count(),
@@ -1482,7 +1498,11 @@ fn lower_get0_slices_and_reshapes_to_scalar() {
     assert_eq!(result.ty, MlirTy::Scalar);
     let out = e.finish(
         "f",
-        &[("%arg0".to_string(), MlirTy::Ranked(vec![Some(5)]))],
+        &[(
+            "%arg0".to_string(),
+            MlirTy::Ranked(vec![Some(5)]),
+            ElemKind::Real,
+        )],
         &[&result],
     );
 
@@ -1517,7 +1537,11 @@ fn lower_get_is_one_based() {
     let result = e.lower_node(node).unwrap();
     let out = e.finish(
         "f",
-        &[("%arg0".to_string(), MlirTy::Ranked(vec![Some(5)]))],
+        &[(
+            "%arg0".to_string(),
+            MlirTy::Ranked(vec![Some(5)]),
+            ElemKind::Real,
+        )],
         &[&result],
     );
     assert!(
@@ -1624,8 +1648,16 @@ fn lower_get0_gather_lowers_runtime_index() {
     let out = e.finish(
         "f",
         &[
-            ("%arg0".to_string(), MlirTy::Ranked(vec![Some(4)])),
-            ("%arg1".to_string(), MlirTy::Ranked(vec![Some(3)])),
+            (
+                "%arg0".to_string(),
+                MlirTy::Ranked(vec![Some(4)]),
+                ElemKind::Real,
+            ),
+            (
+                "%arg1".to_string(),
+                MlirTy::Ranked(vec![Some(3)]),
+                ElemKind::Real,
+            ),
         ],
         &[&result],
     );
@@ -1699,8 +1731,16 @@ fn lower_get_gather_uses_base_one() {
     let out = e.finish(
         "f",
         &[
-            ("%arg0".to_string(), MlirTy::Ranked(vec![Some(4)])),
-            ("%arg1".to_string(), MlirTy::Ranked(vec![Some(3)])),
+            (
+                "%arg0".to_string(),
+                MlirTy::Ranked(vec![Some(4)]),
+                ElemKind::Real,
+            ),
+            (
+                "%arg1".to_string(),
+                MlirTy::Ranked(vec![Some(3)]),
+                ElemKind::Real,
+            ),
         ],
         &[&result],
     );
@@ -1742,8 +1782,16 @@ fn lower_get_gather_preserves_int_operand_elem() {
     let out = e.finish(
         "f",
         &[
-            ("%arg0".to_string(), MlirTy::Ranked(vec![Some(4)])),
-            ("%arg1".to_string(), MlirTy::Ranked(vec![Some(3)])),
+            (
+                "%arg0".to_string(),
+                MlirTy::Ranked(vec![Some(4)]),
+                ElemKind::Real,
+            ),
+            (
+                "%arg1".to_string(),
+                MlirTy::Ranked(vec![Some(3)]),
+                ElemKind::Real,
+            ),
         ],
         &[&result],
     );
@@ -2230,108 +2278,6 @@ fn normal_logpdf_refuses_missing_kernel_input_field() {
     let mut e = Emitter::new(&m, Dtype::F32);
     let err = e.lower_node(node).unwrap_err();
     assert!(err.msg.contains("sigma"), "unexpected message: {}", err.msg);
-}
-
-/// A trailing public binding *after* the density expression (e.g. a
-/// diagnostic/auxiliary value) must not be silently lowered as the query
-/// output just because it happens to be the last public binding in source
-/// order — `Module`'s own doc disclaims that binding order carries spec
-/// meaning. `emit_logdensity` must refuse (precisely, naming the missing
-/// density term) rather than mis-lower it.
-#[test]
-fn emit_logdensity_refuses_trailing_binding_with_no_density_term() {
-    let mut m = Module::new();
-    let ctor = const_node(&mut m, "Normal");
-    let mu = real(&mut m, 0.0);
-    let sigma = real(&mut m, 1.0);
-    let kernel_input = record_node(&mut m, &[("mu", mu), ("sigma", sigma)]);
-    let v = real(&mut m, 0.5);
-    let density = call(&mut m, "builtin_logdensityof", &[ctor, kernel_input, v]);
-    top_level(&mut m, "lp", density);
-
-    // A diagnostic/auxiliary binding that happens to land after `lp` in
-    // source order — no density term anywhere in its subtree.
-    let diag = real(&mut m, 42.0);
-    top_level(&mut m, "diag", diag);
-
-    let err = flatppl_stablehlo::emit(
-        &m,
-        flatppl_stablehlo::Mode::LogDensity,
-        &flatppl_stablehlo::EmitOptions::default(),
-    )
-    .unwrap_err();
-    assert!(
-        err.msg
-            .contains("contains no density term (builtin_logdensityof)"),
-        "unexpected message: {}",
-        err.msg
-    );
-    assert_eq!(err.node, Some(diag));
-}
-
-/// With `EmitOptions::query` naming the density binding, `emit_logdensity`
-/// emits THAT binding even though an inert binding (`diag`) sorts after it in
-/// source order. This is the cross-module-grafting case (a `load_module` query
-/// scoring a foreign `posterior`): determinization splices the foreign model's
-/// data / pinned-draw residue in after the query, so the query's position is
-/// not stable but its name is. The SAME module refuses without the designation
-/// — see `emit_logdensity_refuses_trailing_binding_with_no_density_term`.
-#[test]
-fn emit_logdensity_designated_query_skips_trailing_binding() {
-    let mut m = Module::new();
-    let ctor = const_node(&mut m, "Normal");
-    let mu = real(&mut m, 0.0);
-    let sigma = real(&mut m, 1.0);
-    let kernel_input = record_node(&mut m, &[("mu", mu), ("sigma", sigma)]);
-    let v = real(&mut m, 0.5);
-    let density = call(&mut m, "builtin_logdensityof", &[ctor, kernel_input, v]);
-    top_level(&mut m, "lp", density);
-
-    // A diagnostic/auxiliary binding after `lp` in source order — exactly the
-    // shape that makes the positional (`query: None`) path refuse.
-    let diag = real(&mut m, 42.0);
-    top_level(&mut m, "diag", diag);
-
-    let opts = flatppl_stablehlo::EmitOptions {
-        query: Some("lp".to_string()),
-        ..Default::default()
-    };
-    let out = flatppl_stablehlo::emit(&m, flatppl_stablehlo::Mode::LogDensity, &opts)
-        .expect("designated query `lp` emits despite the trailing `diag` binding");
-    // The standard-normal `logpdf` normalizing constant `-0.5*ln(2π)` — the
-    // structural signal that `lp`'s Normal density (not `diag = 42`) was lowered.
-    assert!(
-        out.contains("-0.9189385332046727"),
-        "expected the Normal logpdf normalizing constant, got:\n{out}"
-    );
-}
-
-/// An `EmitOptions::query` naming a binding that is not a public binding of the
-/// (determinized) module refuses with a precise message rather than silently
-/// falling back to a positional guess — a mis-designation by the host is a bug
-/// to surface, not to paper over.
-#[test]
-fn emit_logdensity_refuses_unknown_designated_query() {
-    let mut m = Module::new();
-    let ctor = const_node(&mut m, "Normal");
-    let mu = real(&mut m, 0.0);
-    let sigma = real(&mut m, 1.0);
-    let kernel_input = record_node(&mut m, &[("mu", mu), ("sigma", sigma)]);
-    let v = real(&mut m, 0.5);
-    let density = call(&mut m, "builtin_logdensityof", &[ctor, kernel_input, v]);
-    top_level(&mut m, "lp", density);
-
-    let opts = flatppl_stablehlo::EmitOptions {
-        query: Some("nope".to_string()),
-        ..Default::default()
-    };
-    let err = flatppl_stablehlo::emit(&m, flatppl_stablehlo::Mode::LogDensity, &opts).unwrap_err();
-    assert!(
-        err.msg
-            .contains("designated logdensity query binding `nope` is not a public binding"),
-        "unexpected message: {}",
-        err.msg
-    );
 }
 
 // ---- Task 8: location-scale continuous `@logdensity` batch -----------------
@@ -3822,43 +3768,6 @@ fn emit_sample_normal_matches_frozen_golden() {
     );
 }
 
-/// The `emit_sample` analogue of
-/// `emit_logdensity_refuses_trailing_binding_with_no_density_term`: a
-/// trailing public binding with no `builtin_sample` anywhere in its subtree
-/// must refuse rather than be silently lowered just because it is the last
-/// public binding in source order.
-#[test]
-fn emit_sample_refuses_trailing_binding_with_no_sample_term() {
-    let mut m = Module::new();
-    let ctor = const_node(&mut m, "Normal");
-    let mu = real(&mut m, 0.0);
-    let sigma = real(&mut m, 1.0);
-    let kernel_input = record_node(&mut m, &[("mu", mu), ("sigma", sigma)]);
-    let rng = real(&mut m, 0.0); // stand-in rng-state arg (never lowered)
-    let sample = call(&mut m, "builtin_sample", &[rng, ctor, kernel_input]);
-    let zero_idx = int(&mut m, 0);
-    let draws = call(&mut m, "get0", &[sample, zero_idx]);
-    top_level(&mut m, "draws", draws);
-
-    // A diagnostic/auxiliary binding that happens to land after `draws` in
-    // source order — no sample term anywhere in its subtree.
-    let diag = real(&mut m, 42.0);
-    top_level(&mut m, "diag", diag);
-
-    let err = flatppl_stablehlo::emit(
-        &m,
-        flatppl_stablehlo::Mode::Sample,
-        &flatppl_stablehlo::EmitOptions::default(),
-    )
-    .unwrap_err();
-    assert!(
-        err.msg.contains("contains no sample term (builtin_sample)"),
-        "unexpected message: {}",
-        err.msg
-    );
-    assert_eq!(err.node, Some(diag));
-}
-
 // ---- Task 6 review fix: `contains_sample_call` ref-following (Finding 1) --
 //
 // `contains_sample_call`'s guard used to walk the query subtree via
@@ -3898,6 +3807,10 @@ fn emit_sample_query_reaches_sample_via_chained_self_refs() {
 
     let query = self_ref(&mut m, "a");
     top_level(&mut m, "query", query);
+
+    // Designate the sample query via the ABI (the last-binding heuristic is gone).
+    let outputs_ref = self_ref(&mut m, "query");
+    top_level(&mut m, "outputs", outputs_ref);
 
     let out = flatppl_stablehlo::emit(&m, flatppl_stablehlo::Mode::Sample, &Default::default())
         .expect("must emit @sample: query reaches builtin_sample via a 2-hop self-ref chain");
@@ -4143,49 +4056,6 @@ fn emit_refuses_input_that_is_not_flatpdl() {
     );
 }
 
-/// `emit_logdensity` on a module with no public binding at all (not even a
-/// trailing non-density one) — distinct from
-/// `emit_logdensity_refuses_trailing_binding_with_no_density_term`, which
-/// exercises the query-CONTENT guard on a module that DOES have a public
-/// binding.
-#[test]
-fn emit_logdensity_refuses_module_with_no_public_binding() {
-    let m = Module::new();
-    let err = flatppl_stablehlo::emit(
-        &m,
-        flatppl_stablehlo::Mode::LogDensity,
-        &flatppl_stablehlo::EmitOptions::default(),
-    )
-    .unwrap_err();
-    assert!(
-        err.msg
-            .contains("no public binding to emit as the logdensity query"),
-        "unexpected message: {}",
-        err.msg
-    );
-    assert_eq!(err.node, None);
-}
-
-/// The `emit_sample` mirror of
-/// [`emit_logdensity_refuses_module_with_no_public_binding`].
-#[test]
-fn emit_sample_refuses_module_with_no_public_binding() {
-    let m = Module::new();
-    let err = flatppl_stablehlo::emit(
-        &m,
-        flatppl_stablehlo::Mode::Sample,
-        &flatppl_stablehlo::EmitOptions::default(),
-    )
-    .unwrap_err();
-    assert!(
-        err.msg
-            .contains("no public binding to emit as the sample query"),
-        "unexpected message: {}",
-        err.msg
-    );
-    assert_eq!(err.node, None);
-}
-
 /// `get0(builtin_sample(...), 1)` — projecting the ADVANCED RNG-STATE slot
 /// (index 1) of a sampled `(value, new_rngstate)` pair (spec §07), as opposed
 /// to the drawn-value slot (index 0, the ordinary case every other sample
@@ -4281,8 +4151,16 @@ fn lower_vector_of_vectors_lowers_to_rank2_tensor() {
     let out = e.finish(
         "f",
         &[
-            ("%arg0".to_string(), MlirTy::Ranked(vec![Some(3)])),
-            ("%arg1".to_string(), MlirTy::Ranked(vec![Some(3)])),
+            (
+                "%arg0".to_string(),
+                MlirTy::Ranked(vec![Some(3)]),
+                ElemKind::Real,
+            ),
+            (
+                "%arg1".to_string(),
+                MlirTy::Ranked(vec![Some(3)]),
+                ElemKind::Real,
+            ),
         ],
         &[&result],
     );
@@ -4465,6 +4343,8 @@ n = elementof(posintegers)
 p = elementof(unitinterval)
 a = draw(Binomial(n = n, p = p))
 lp = logdensityof(lawof(record(a = a)), record(a = 2))
+outputs = (lp)
+inputs = (n, p)
 ";
 
 const GEOMETRIC_DENSITY_SRC: &str = "\
@@ -4518,6 +4398,8 @@ const DIRAC_DENSITY_SRC: &str = "\
 value = elementof(integers)
 a = draw(Dirac(value = value))
 lp = logdensityof(lawof(record(a = a)), record(a = 3))
+outputs = (lp)
+inputs = (value)
 ";
 
 /// §08 Bernoulli, verbatim: `k * log(p) + (1 - k) * log(1 - p)`. Op counts:
@@ -4638,8 +4520,8 @@ fn emit_logdensity_binomial_has_expected_structure() {
         "must return tensor<f32> in:\n{out}"
     );
     assert!(
-        out.contains("%arg0: tensor<f32>") && out.contains("%arg1: tensor<f32>"),
-        "n/p must become func args, in:\n{out}"
+        out.contains("%arg0: tensor<i32>") && out.contains("%arg1: tensor<f32>"),
+        "n (integer) / p must become func args, in:\n{out}"
     );
     assert_eq!(out.matches("stablehlo.log").count(), 2);
     assert_eq!(out.matches("stablehlo.multiply").count(), 2);
@@ -4949,8 +4831,8 @@ fn emit_logdensity_dirac_has_expected_structure() {
         "must return tensor<f32> in:\n{out}"
     );
     assert!(
-        out.contains("%arg0: tensor<f32>"),
-        "value must become a func arg, in:\n{out}"
+        out.contains("%arg0: tensor<i32>"),
+        "value (integer) must become a func arg, in:\n{out}"
     );
     assert_eq!(out.matches("stablehlo.compare").count(), 1);
     assert!(out.contains("EQ"), "must compare EQ, in:\n{out}");
@@ -5371,6 +5253,8 @@ n = elementof(posintegers)
 p = elementof(cartpow(unitinterval, 3))
 a = draw(Multinomial(n = n, p = p))
 lp = logdensityof(lawof(record(a = a)), record(a = [2, 3, 5]))
+outputs = (lp)
+inputs = (n, p)
 ";
 
 /// §08 Multinomial, verbatim: `lgamma(n+1) - sum(lgamma(x+1)) + sum(x *
@@ -5404,8 +5288,8 @@ fn emit_logdensity_multinomial_has_expected_structure() {
         "must return tensor<f32> in:\n{out}"
     );
     assert!(
-        out.contains("%arg0: tensor<f32>") && out.contains("%arg1: tensor<3xf32>"),
-        "n/p must become scalar/vector func args, in:\n{out}"
+        out.contains("%arg0: tensor<i32>") && out.contains("%arg1: tensor<3xf32>"),
+        "n (integer) / p must become scalar/vector func args, in:\n{out}"
     );
     assert_eq!(out.matches("chlo.lgamma").count(), 2);
     assert_eq!(out.matches("stablehlo.reduce(").count(), 2);
@@ -7599,19 +7483,19 @@ fn emit_sample_iid_gamma_reducers_fan_out() {
     let cases = [
         (
             "ChiSquared",
-            "s = rnginit(0)\nxs ~ iid(ChiSquared(k = 3.0), 4)\ndraws = rand(s, lawof(xs))\n",
+            "s = rnginit(0)\nxs ~ iid(ChiSquared(k = 3.0), 4)\ndraws = rand(s, lawof(xs))\noutputs = (draws)\n",
         ),
         (
             "StudentT",
-            "s = rnginit(0)\nxs ~ iid(StudentT(nu = 5.0), 4)\ndraws = rand(s, lawof(xs))\n",
+            "s = rnginit(0)\nxs ~ iid(StudentT(nu = 5.0), 4)\ndraws = rand(s, lawof(xs))\noutputs = (draws)\n",
         ),
         (
             "InverseGamma",
-            "s = rnginit(0)\nxs ~ iid(InverseGamma(shape = 3.0, scale = 1.0), 4)\ndraws = rand(s, lawof(xs))\n",
+            "s = rnginit(0)\nxs ~ iid(InverseGamma(shape = 3.0, scale = 1.0), 4)\ndraws = rand(s, lawof(xs))\noutputs = (draws)\n",
         ),
         (
             "GeneralizedNormal",
-            "s = rnginit(0)\nxs ~ iid(GeneralizedNormal(mean = 0.0, alpha = 1.0, beta = 2.0), 4)\ndraws = rand(s, lawof(xs))\n",
+            "s = rnginit(0)\nxs ~ iid(GeneralizedNormal(mean = 0.0, alpha = 1.0, beta = 2.0), 4)\ndraws = rand(s, lawof(xs))\noutputs = (draws)\n",
         ),
     ];
     for (name, src) in cases {
@@ -8486,23 +8370,6 @@ outputs = q1
     );
 }
 
-/// Fallback (design doc "Fallback + migration"): a model declaring NEITHER
-/// `inputs` nor `outputs` still emits via the legacy last-public-binding
-/// path, byte-for-byte the same as before this PR (every other golden test
-/// in this file exercises the same fallback; this test exists to name it
-/// explicitly as the ABI's negative case). The CLI-level deprecation warning
-/// is a `stablehlo_cmd` concern, not this crate's `emit` — see
-/// `crates/cli/tests/stablehlo.rs`.
-#[test]
-fn emit_logdensity_legacy_path_unaffected_when_abi_absent() {
-    let d = determinize_src(NORMAL_DENSITY_SRC);
-    let out = emit_logdensity(&d);
-    assert!(
-        out.contains("func.func @logdensity"),
-        "legacy last-public-binding path must still emit, in:\n{out}"
-    );
-}
-
 /// Rust-side ABI tolerance (brief step 6(c), full JS tolerance is PR-3): a
 /// model carrying `inputs`/`outputs` parses and infers without diagnostics —
 /// the reserved names are ordinary top-level bindings to the rest of the
@@ -8860,7 +8727,6 @@ outputs = (lp)\n";
 // emit_sample_abi: a declared `outputs = (draws)` sample query emits the
 // two-result (value, new_key) @sample with %key as arg 0, matching the
 // pre-purge legacy emit.
-#[ignore = "exercises emit_sample_abi only after Task 2 routes Sample mode to the ABI path"]
 #[test]
 fn emit_sample_abi_emits_threaded_key_two_result() {
     let src = "flatppl_compat = \"0.1\"\n\
@@ -8874,4 +8740,26 @@ outputs = (draws)\n";
         .expect("declared sample output must emit via emit_sample_abi");
     assert!(out.contains("func.func @sample"));
     assert!(out.contains("tensor<2xui64>"), "leading %key arg:\n{out}");
+}
+
+// After the purge, a determinized module with no inputs/outputs ABI is
+// refused (both modes) with an actionable message — no last-binding guess.
+#[test]
+fn no_abi_module_refuses_both_modes() {
+    let src = "flatppl_compat = \"0.1\"\n\
+a = draw(Normal(mu = 0.0, sigma = 1.0))\n\
+lp = logdensityof(lawof(record(a = a)), record(a = 0.5))\n";
+    let m = flatppl_syntax::parse(src).unwrap();
+    let d = flatppl_determinizer::determinize(&m).unwrap();
+    for mode in [
+        flatppl_stablehlo::Mode::LogDensity,
+        flatppl_stablehlo::Mode::Sample,
+    ] {
+        let err = flatppl_stablehlo::emit(&d, mode, &Default::default()).unwrap_err();
+        assert!(
+            err.msg.contains("no inputs/outputs ABI"),
+            "expected the ABI-required refusal, got: {}",
+            err.msg
+        );
+    }
 }

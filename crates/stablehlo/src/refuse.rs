@@ -29,16 +29,15 @@
 //!   (determinize first)" (`EmitError::whole`: a module-level check, not a
 //!   single-node defect)
 //!
-//! **`modes.rs`** (`emit_logdensity`/`emit_sample`):
-//! - no public binding at all — "module has no public binding to emit as
-//!   the logdensity/sample query" (`EmitError::whole`)
-//! - the selected (last-public-binding) query contains no
-//!   `builtin_logdensityof`/`builtin_sample` term anywhere in its subtree —
-//!   "selected query output contains no density/sample term (...)" (guards
-//!   the "last public binding is the query" convention)
+//! **`lib.rs`** ([`crate::emit`]):
+//! - no `inputs`/`outputs` ABI declared (neither reserved binding present) —
+//!   "no inputs/outputs ABI declared; the last-public-binding query heuristic
+//!   has been removed — declare `inputs = (…)` and `outputs = (…)` ..."
+//!   (`EmitError::whole`; both modes — the ABI is the sole query designation)
 //!
-//! **`modes.rs`** (`emit_logdensity_abi`, the `inputs`/`outputs` ABI path —
-//! see [`crate::modes::Abi`]/[`crate::modes::read_abi`]):
+//! **`modes.rs`** (`emit_logdensity_abi`/`emit_sample_abi`, the
+//! `inputs`/`outputs` ABI path — see
+//! [`crate::modes::Abi`]/[`crate::modes::read_abi`]):
 //! - an `elementof` parameter not listed in `inputs` — "elementof parameter
 //!   '...' is not listed in `inputs`; the inputs ABI is exhaustive ..."
 //!   (`inputs` is authoritative + exhaustive, design doc)
@@ -55,6 +54,12 @@
 //!   input (`external`/`load_data`) — e.g. a literal or a derived/computed
 //!   binding — "`inputs` entry '...' is not an elementof parameter, external,
 //!   or load_data input — only these constructs can be ABI arguments"
+//! - (`emit_sample_abi`) `outputs` naming other than exactly one output —
+//!   "`outputs` for a sample query must name exactly one output (the sampled
+//!   value)" (`EmitError::whole`)
+//! - (`emit_sample_abi`) the declared sample output reaches no rng source —
+//!   "no rng source to bind to %key: the declared sample output reaches no
+//!   rnginit/external(rngstates) source to thread from"
 //!
 //! (`external`/`load_data` inputs LISTED in `inputs` are supported — they
 //! become function arguments, `load_data` shape-pinned from
