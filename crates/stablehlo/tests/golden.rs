@@ -62,7 +62,8 @@ mu = a .+ x\n\
 y = draw(Normal.(mu, 0.5))\n\
 L = likelihoodof(kernelof(record(y = y), a = a), record(y = y_obs))\n\
 post = bayesupdate(L, lawof(record(a = a)))\n\
-score = logdensityof(post, record(a = 0.5))\n";
+score = logdensityof(post, record(a = 0.5))\n\
+outputs = (score)\n";
     let m = flatppl_syntax::parse(src).unwrap();
     let d = flatppl_determinizer::determinize(&m).unwrap();
     let out = flatppl_stablehlo::emit(&d, flatppl_stablehlo::Mode::LogDensity, &Default::default())
@@ -261,7 +262,8 @@ mu = rate.(eta)\n\
 y = draw(Poisson.(mu))\n\
 L = likelihoodof(kernelof(record(y = y), a = a, b = b), record(y = y_obs))\n\
 post = bayesupdate(L, lawof(record(a = a, b = b)))\n\
-score = logdensityof(post, record(a = 0.0, b = 0.0))\n";
+score = logdensityof(post, record(a = 0.0, b = 0.0))\n\
+outputs = (score)\n";
     let m = flatppl_syntax::parse(src).unwrap();
     let d = flatppl_determinizer::determinize(&m).unwrap();
     // Pin that this actually exercises the user-function broadcast path: the
@@ -302,7 +304,8 @@ p = invlogit(a)\n\
 y = draw(Bernoulli(p))\n\
 L = likelihoodof(kernelof(record(y = y), a = a), record(y = 1))\n\
 post = bayesupdate(L, lawof(record(a = a)))\n\
-score = logdensityof(post, record(a = 0.7))\n";
+score = logdensityof(post, record(a = 0.7))\n\
+outputs = (score)\n";
     let m = flatppl_syntax::parse(src).unwrap();
     let d = flatppl_determinizer::determinize(&m).unwrap();
     let out = flatppl_stablehlo::emit(&d, flatppl_stablehlo::Mode::LogDensity, &Default::default())
@@ -902,7 +905,8 @@ fn lower_node_mixed_int_real_add_converts_before_add() {
 fn literal_int_params_on_continuous_distribution_convert_before_real_only_ops() {
     let src = "flatppl_compat = \"0.1\"\n\
 lambda = draw(Gamma(shape = 2, rate = 1))\n\
-lp = logdensityof(lawof(record(lambda = lambda)), record(lambda = 2.5))\n";
+lp = logdensityof(lawof(record(lambda = lambda)), record(lambda = 2.5))\n\
+outputs = (lp)\n";
     let m = flatppl_syntax::parse(src).unwrap();
     let d = flatppl_determinizer::determinize(&m).unwrap();
     let out = flatppl_stablehlo::emit(&d, flatppl_stablehlo::Mode::LogDensity, &Default::default())
@@ -2045,6 +2049,8 @@ mu = elementof(reals)
 sigma = elementof(posreals)
 a = draw(Normal(mu = mu, sigma = sigma))
 lp = logdensityof(lawof(record(a = a)), record(a = 0.5))
+inputs = (mu, sigma)
+outputs = (lp)
 ";
 
 /// Parse, infer, and determinize `src`, panicking (with the diagnostics/
@@ -2341,6 +2347,8 @@ location = elementof(reals)
 scale = elementof(posreals)
 a = draw(Cauchy(location = location, scale = scale))
 lp = logdensityof(lawof(record(a = a)), record(a = 0.5))
+inputs = (location, scale)
+outputs = (lp)
 ";
 
 const LOGISTIC_DENSITY_SRC: &str = "\
@@ -2348,6 +2356,8 @@ mu = elementof(reals)
 s = elementof(posreals)
 a = draw(Logistic(mu = mu, s = s))
 lp = logdensityof(lawof(record(a = a)), record(a = 0.5))
+inputs = (mu, s)
+outputs = (lp)
 ";
 
 const LAPLACE_DENSITY_SRC: &str = "\
@@ -2355,6 +2365,8 @@ location = elementof(reals)
 scale = elementof(posreals)
 a = draw(Laplace(location = location, scale = scale))
 lp = logdensityof(lawof(record(a = a)), record(a = 0.5))
+inputs = (location, scale)
+outputs = (lp)
 ";
 
 /// §08 Cauchy, verbatim: `-log(pi) - log(scale) - log(1 + ((x -
@@ -2617,6 +2629,8 @@ const EXPONENTIAL_DENSITY_SRC: &str = "\
 rate = elementof(posreals)
 a = draw(Exponential(rate = rate))
 lp = logdensityof(lawof(record(a = a)), record(a = 0.5))
+inputs = (rate)
+outputs = (lp)
 ";
 
 const GAMMA_DENSITY_SRC: &str = "\
@@ -2624,6 +2638,8 @@ shape = elementof(posreals)
 rate = elementof(posreals)
 a = draw(Gamma(shape = shape, rate = rate))
 lp = logdensityof(lawof(record(a = a)), record(a = 0.5))
+inputs = (shape, rate)
+outputs = (lp)
 ";
 
 const WEIBULL_DENSITY_SRC: &str = "\
@@ -2631,6 +2647,8 @@ shape = elementof(posreals)
 scale = elementof(posreals)
 a = draw(Weibull(shape = shape, scale = scale))
 lp = logdensityof(lawof(record(a = a)), record(a = 0.5))
+inputs = (shape, scale)
+outputs = (lp)
 ";
 
 const PARETO_DENSITY_SRC: &str = "\
@@ -2638,6 +2656,8 @@ shape = elementof(posreals)
 scale = elementof(posreals)
 a = draw(Pareto(shape = shape, scale = scale))
 lp = logdensityof(lawof(record(a = a)), record(a = 0.5))
+inputs = (shape, scale)
+outputs = (lp)
 ";
 
 const INVERSE_GAMMA_DENSITY_SRC: &str = "\
@@ -2645,12 +2665,16 @@ shape = elementof(posreals)
 scale = elementof(posreals)
 a = draw(InverseGamma(shape = shape, scale = scale))
 lp = logdensityof(lawof(record(a = a)), record(a = 0.5))
+inputs = (shape, scale)
+outputs = (lp)
 ";
 
 const CHI_SQUARED_DENSITY_SRC: &str = "\
 k = elementof(posreals)
 a = draw(ChiSquared(k = k))
 lp = logdensityof(lawof(record(a = a)), record(a = 0.5))
+inputs = (k)
+outputs = (lp)
 ";
 
 const LOGNORMAL_DENSITY_SRC: &str = "\
@@ -2658,6 +2682,8 @@ mu = elementof(reals)
 sigma = elementof(posreals)
 a = draw(LogNormal(mu = mu, sigma = sigma))
 lp = logdensityof(lawof(record(a = a)), record(a = 0.5))
+inputs = (mu, sigma)
+outputs = (lp)
 ";
 
 /// §08 Exponential, verbatim: `log(rate) - rate * x`. Op counts: one `log`
@@ -3291,6 +3317,7 @@ fn emit_logdensity_lognormal_matches_frozen_golden() {
 const UNIFORM_DENSITY_SRC: &str = "\
 a = draw(Uniform(support = interval(-1.0, 3.0)))
 lp = logdensityof(lawof(record(a = a)), record(a = 0.5))
+outputs = (lp)
 ";
 
 const BETA_DENSITY_SRC: &str = "\
@@ -3298,12 +3325,16 @@ alpha = elementof(posreals)
 beta = elementof(posreals)
 a = draw(Beta(alpha = alpha, beta = beta))
 lp = logdensityof(lawof(record(a = a)), record(a = 0.5))
+inputs = (alpha, beta)
+outputs = (lp)
 ";
 
 const STUDENTT_DENSITY_SRC: &str = "\
 nu = elementof(posreals)
 a = draw(StudentT(nu = nu))
 lp = logdensityof(lawof(record(a = a)), record(a = 0.5))
+inputs = (nu)
+outputs = (lp)
 ";
 
 const GENERALIZED_NORMAL_DENSITY_SRC: &str = "\
@@ -3312,6 +3343,8 @@ alpha = elementof(posreals)
 beta = elementof(posreals)
 a = draw(GeneralizedNormal(mean = mean, alpha = alpha, beta = beta))
 lp = logdensityof(lawof(record(a = a)), record(a = 0.5))
+inputs = (mean, alpha, beta)
+outputs = (lp)
 ";
 
 const VON_MISES_DENSITY_SRC: &str = "\
@@ -3319,6 +3352,8 @@ mu = elementof(reals)
 kappa = elementof(posreals)
 a = draw(VonMises(mu = mu, kappa = kappa))
 lp = logdensityof(lawof(record(a = a)), record(a = 0.5))
+inputs = (mu, kappa)
+outputs = (lp)
 ";
 
 /// §08 Uniform, verbatim: `-log(lambda(S))`, a compile-time constant once
@@ -3729,6 +3764,7 @@ const NORMAL_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 x = draw(Normal(mu = 0.0, sigma = 1.0))
 draws = rand(s, lawof(x))
+outputs = (draws)
 ";
 
 fn emit_sample(m: &Module) -> String {
@@ -3885,6 +3921,7 @@ mu = draw(Normal(mu = 0.0, sigma = 1.0))
 y  = draw(Normal(mu = mu, sigma = 1.0))
 s  = rnginit(0)
 draws = rand(s, lawof(record(mu = mu, y = y)))
+outputs = (draws)
 ";
 
 /// This fixture's query (`draws`'s RHS) now correctly PASSES
@@ -4411,12 +4448,16 @@ const BERNOULLI_DENSITY_SRC: &str = "\
 p = elementof(unitinterval)
 a = draw(Bernoulli(p = p))
 lp = logdensityof(lawof(record(a = a)), record(a = 1))
+inputs = (p)
+outputs = (lp)
 ";
 
 const POISSON_DENSITY_SRC: &str = "\
 rate = elementof(nonnegreals)
 a = draw(Poisson(rate = rate))
 lp = logdensityof(lawof(record(a = a)), record(a = 3))
+inputs = (rate)
+outputs = (lp)
 ";
 
 const BINOMIAL_DENSITY_SRC: &str = "\
@@ -4430,6 +4471,8 @@ const GEOMETRIC_DENSITY_SRC: &str = "\
 p = elementof(unitinterval)
 a = draw(Geometric(p = p))
 lp = logdensityof(lawof(record(a = a)), record(a = 4))
+inputs = (p)
+outputs = (lp)
 ";
 
 const NEGATIVE_BINOMIAL_DENSITY_SRC: &str = "\
@@ -4437,6 +4480,8 @@ alpha = elementof(posreals)
 beta = elementof(posreals)
 a = draw(NegativeBinomial(alpha = alpha, beta = beta))
 lp = logdensityof(lawof(record(a = a)), record(a = 2))
+inputs = (alpha, beta)
+outputs = (lp)
 ";
 
 const NEGATIVE_BINOMIAL2_DENSITY_SRC: &str = "\
@@ -4444,16 +4489,20 @@ mu = elementof(posreals)
 psi = elementof(posreals)
 a = draw(NegativeBinomial2(mu = mu, psi = psi))
 lp = logdensityof(lawof(record(a = a)), record(a = 2))
+inputs = (mu, psi)
+outputs = (lp)
 ";
 
 const CATEGORICAL_DENSITY_SRC: &str = "\
 a = draw(Categorical(p = [0.2, 0.3, 0.5]))
 lp = logdensityof(lawof(record(a = a)), record(a = 2))
+outputs = (lp)
 ";
 
 const CATEGORICAL0_DENSITY_SRC: &str = "\
 a = draw(Categorical0(p = [0.2, 0.3, 0.5]))
 lp = logdensityof(lawof(record(a = a)), record(a = 1))
+outputs = (lp)
 ";
 
 /// §06 `Dirac(value = value)` (the measure monad's unit, not a §08 catalog
@@ -4938,6 +4987,7 @@ const DIRAC_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 x = draw(Dirac(value = 3.0))
 draws = rand(s, lawof(x))
+outputs = (draws)
 ";
 
 /// The deterministic-draw structural test: exactly ZERO `rng_bit_generator`
@@ -5101,6 +5151,8 @@ mu = elementof(cartpow(reals, 2))
 cov = elementof(cartpow(reals, [2, 2]))
 a = draw(MvNormal(mu = mu, cov = cov))
 lp = logdensityof(lawof(record(a = a)), record(a = [0.2, 0.1]))
+inputs = (mu, cov)
+outputs = (lp)
 ";
 
 /// §08 MvNormal, verbatim: `-(n/2)*log(2*pi) - 1/2*log|Sigma| -
@@ -5172,6 +5224,8 @@ mu = elementof(cartpow(reals, m))
 cov = elementof(cartpow(reals, [m, m]))
 a = draw(MvNormal(mu = mu, cov = cov))
 lp = logdensityof(lawof(record(a = a)), record(a = [0.2, 0.1]))
+inputs = (m, mu, cov)
+outputs = (lp)
 ";
     let d = determinize_src(src);
     let err = flatppl_stablehlo::emit(
@@ -5200,6 +5254,8 @@ mu = elementof(cartpow(reals, 2))
 cov = elementof(cartpow(reals, [3, 3]))
 a = draw(MvNormal(mu = mu, cov = cov))
 lp = logdensityof(lawof(record(a = a)), record(a = [0.2, 0.1]))
+inputs = (mu, cov)
+outputs = (lp)
 ";
     let d = determinize_src(src);
     let err = flatppl_stablehlo::emit(
@@ -5225,6 +5281,8 @@ mu = elementof(cartpow(reals, 2))
 cov = elementof(cartpow(reals, [2, 3]))
 a = draw(MvNormal(mu = mu, cov = cov))
 lp = logdensityof(lawof(record(a = a)), record(a = [0.2, 0.1]))
+inputs = (mu, cov)
+outputs = (lp)
 ";
     let d = determinize_src(src);
     let err = flatppl_stablehlo::emit(
@@ -5246,6 +5304,8 @@ const DIRICHLET_DENSITY_SRC: &str = "\
 alpha = elementof(cartpow(posreals, 3))
 a = draw(Dirichlet(alpha = alpha))
 lp = logdensityof(lawof(record(a = a)), record(a = [0.2, 0.3, 0.5]))
+inputs = (alpha)
+outputs = (lp)
 ";
 
 /// §08 Dirichlet, verbatim: `lgamma(sum(alpha)) - sum(lgamma(alpha)) +
@@ -5414,6 +5474,8 @@ nu = elementof(posreals)
 x_obs = elementof(cartpow(reals, [2, 2]))
 x = draw(Wishart(nu = nu, scale = scale))
 lp = logdensityof(lawof(record(x = x)), record(x = x_obs))
+inputs = (scale, nu, x_obs)
+outputs = (lp)
 ";
 
 /// §08 Wishart, verbatim: `((nu-n-1)/2) log|X| - (1/2) tr(V^-1 X) -
@@ -5485,6 +5547,8 @@ nu = elementof(posreals)
 x_obs = elementof(cartpow(reals, [2, 2]))
 x = draw(Wishart(nu = nu, scale = scale))
 lp = logdensityof(lawof(record(x = x)), record(x = x_obs))
+inputs = (scale, nu, x_obs)
+outputs = (lp)
 ";
     let d = determinize_src(src);
     let err = flatppl_stablehlo::emit(
@@ -5508,6 +5572,8 @@ nu = elementof(posreals)
 x_obs = elementof(cartpow(reals, [2, 2]))
 x = draw(InverseWishart(nu = nu, scale = scale))
 lp = logdensityof(lawof(record(x = x)), record(x = x_obs))
+inputs = (scale, nu, x_obs)
+outputs = (lp)
 ";
 
 /// §08 InverseWishart, verbatim: `(nu/2) log|Psi| - ((nu+n+1)/2) log|X| -
@@ -5574,6 +5640,8 @@ nu = elementof(posreals)
 x_obs = elementof(cartpow(reals, [3, 3]))
 x = draw(InverseWishart(nu = nu, scale = scale))
 lp = logdensityof(lawof(record(x = x)), record(x = x_obs))
+inputs = (scale, nu, x_obs)
+outputs = (lp)
 ";
     let d = determinize_src(src);
     let err = flatppl_stablehlo::emit(
@@ -5597,6 +5665,8 @@ eta = elementof(posreals)
 c_obs = elementof(cartpow(reals, [3, 3]))
 c = draw(LKJ(n = n, eta = eta))
 lp = logdensityof(lawof(record(c = c)), record(c = c_obs))
+inputs = (eta, c_obs)
+outputs = (lp)
 ";
 
 /// §08 LKJ, verbatim: `(eta-1) log det(C) - log c_n(eta)`, `n = 3` (spec's
@@ -5665,6 +5735,8 @@ eta = elementof(posreals)
 c_obs = elementof(cartpow(reals, [2, 2]))
 c = draw(LKJ(n = n, eta = eta))
 lp = logdensityof(lawof(record(c = c)), record(c = c_obs))
+inputs = (eta, c_obs)
+outputs = (lp)
 ";
     let d = determinize_src(src);
     let err = flatppl_stablehlo::emit(
@@ -5694,6 +5766,8 @@ eta = elementof(posreals)
 c_obs = elementof(cartpow(reals, [3, 3]))
 c = draw(LKJ(n = n, eta = eta))
 lp = logdensityof(lawof(record(c = c)), record(c = c_obs))
+inputs = (n, eta, c_obs)
+outputs = (lp)
 ";
     let d = determinize_src(src);
     let err = flatppl_stablehlo::emit(
@@ -5717,6 +5791,8 @@ eta = elementof(posreals)
 l_obs = elementof(cartpow(reals, [3, 3]))
 l = draw(LKJCholesky(n = n, eta = eta))
 lp = logdensityof(lawof(record(l = l)), record(l = l_obs))
+inputs = (eta, l_obs)
+outputs = (lp)
 ";
 
 /// §08 LKJCholesky, verbatim: `sum_{i=2}^{n} (n-i+2*eta-2) log L_ii - log
@@ -5789,6 +5865,8 @@ eta = elementof(posreals)
 l_obs = elementof(cartpow(reals, [2, 3]))
 l = draw(LKJCholesky(n = n, eta = eta))
 lp = logdensityof(lawof(record(l = l)), record(l = l_obs))
+inputs = (eta, l_obs)
+outputs = (lp)
 ";
     let d = determinize_src(src);
     let err = flatppl_stablehlo::emit(
@@ -5831,6 +5909,7 @@ const LOGNORMAL_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 x = draw(LogNormal(mu = 0.0, sigma = 1.0))
 draws = rand(s, lawof(x))
+outputs = (draws)
 ";
 
 /// §08 LogNormal's `exp(mu + sigma * Z)` transform: exactly one
@@ -5871,6 +5950,7 @@ const EXPONENTIAL_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 x = draw(Exponential(rate = 1.0))
 draws = rand(s, lawof(x))
+outputs = (draws)
 ";
 
 /// §08 Exponential's `-log(U) / rate` transform: exactly one
@@ -5905,6 +5985,7 @@ const UNIFORM_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 x = draw(Uniform(support = interval(-1.0, 3.0)))
 draws = rand(s, lawof(x))
+outputs = (draws)
 ";
 
 /// §08 Uniform's `a + (b - a) * U` transform: exactly one `stablehlo.rng`
@@ -5944,6 +6025,7 @@ const CAUCHY_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 x = draw(Cauchy(location = 0.0, scale = 1.0))
 draws = rand(s, lawof(x))
+outputs = (draws)
 ";
 
 /// §08 Cauchy's `x0 + gamma * tan(pi * (U - 1/2))` transform: exactly one
@@ -5988,6 +6070,7 @@ const LOGISTIC_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 x = draw(Logistic(mu = 0.0, s = 1.0))
 draws = rand(s, lawof(x))
+outputs = (draws)
 ";
 
 /// §08 Logistic's `mu + s * log(U / (1 - U))` transform: exactly one
@@ -6021,6 +6104,7 @@ const LAPLACE_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 x = draw(Laplace(location = 0.0, scale = 1.0))
 draws = rand(s, lawof(x))
+outputs = (draws)
 ";
 
 /// §08 Laplace's `mu - b * sgn(U - 1/2) * log(1 - 2|U - 1/2|)` transform:
@@ -6065,6 +6149,7 @@ const WEIBULL_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 x = draw(Weibull(shape = 2.0, scale = 3.0))
 draws = rand(s, lawof(x))
+outputs = (draws)
 ";
 
 /// §08 Weibull's `scale * (-log(U))^(1 / shape)` transform: exactly one
@@ -6098,6 +6183,7 @@ const PARETO_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 x = draw(Pareto(shape = 3.0, scale = 1.0))
 draws = rand(s, lawof(x))
+outputs = (draws)
 ";
 
 /// §08 Pareto's `scale * U^(-1 / shape)` transform: exactly one
@@ -6138,6 +6224,8 @@ cov = elementof(cartpow(reals, [2, 2]))
 s = rnginit(0)
 x = draw(MvNormal(mu = mu, cov = cov))
 draws = rand(s, lawof(x))
+inputs = (mu, cov)
+outputs = (draws)
 ";
 
 /// §08 MvNormal's `mu + cholesky(cov) @ z` transform: `mu`/`cov` become
@@ -6203,6 +6291,7 @@ const GAMMA_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 x = draw(Gamma(shape = 2.0, rate = 1.0))
 draws = rand(s, lawof(x))
+outputs = (draws)
 ";
 
 /// §08 Gamma's Marsaglia–Tsang rejection sampler: exactly one
@@ -6255,6 +6344,7 @@ const BETA_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 x = draw(Beta(alpha = 2.0, beta = 3.0))
 draws = rand(s, lawof(x))
+outputs = (draws)
 ";
 
 /// §08 Beta's `X / (X + Y)`, `X ~ Gamma(alpha, 1)`, `Y ~ Gamma(beta, 1)`: TWO
@@ -6291,6 +6381,7 @@ const CHI_SQUARED_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 x = draw(ChiSquared(k = 3.0))
 draws = rand(s, lawof(x))
+outputs = (draws)
 ";
 
 /// §08 ChiSquared's `Gamma(k/2, 1/2)`: exactly one `stablehlo.while`.
@@ -6321,6 +6412,7 @@ const STUDENTT_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 x = draw(StudentT(nu = 5.0))
 draws = rand(s, lawof(x))
+outputs = (draws)
 ";
 
 /// §08 StudentT's `Z / sqrt(V / nu)`, `V ~ ChiSquared(nu)`: exactly one
@@ -6353,6 +6445,7 @@ const INVERSE_GAMMA_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 x = draw(InverseGamma(shape = 3.0, scale = 1.0))
 draws = rand(s, lawof(x))
+outputs = (draws)
 ";
 
 /// §08 InverseGamma's `1 / Gamma(shape, rate = scale)`: exactly one
@@ -6385,6 +6478,7 @@ const GENERALIZED_NORMAL_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 x = draw(GeneralizedNormal(mean = 0.0, alpha = 1.0, beta = 2.0))
 draws = rand(s, lawof(x))
+outputs = (draws)
 ";
 
 /// §08 GeneralizedNormal's `mean + alpha * sgn(U - 1/2) * Gamma(1/beta,
@@ -6424,6 +6518,8 @@ alpha = elementof(cartpow(posreals, 3))
 s = rnginit(0)
 x = draw(Dirichlet(alpha = alpha))
 draws = rand(s, lawof(x))
+inputs = (alpha)
+outputs = (draws)
 ";
 
 /// §08 Dirichlet's `g_i ~ Gamma(alpha_i, 1)`, return `g / sum(g)`: `alpha`
@@ -6482,6 +6578,8 @@ alpha = elementof(cartpow(posreals, m))
 s = rnginit(0)
 x = draw(Dirichlet(alpha = alpha))
 draws = rand(s, lawof(x))
+inputs = (m, alpha)
+outputs = (draws)
 ";
     let d = determinize_src(src);
     let err = flatppl_stablehlo::emit(
@@ -6513,6 +6611,8 @@ alpha = elementof(cartpow(posreals, [2, 2]))
 s = rnginit(0)
 x = draw(Dirichlet(alpha = alpha))
 draws = rand(s, lawof(x))
+inputs = (alpha)
+outputs = (draws)
 ";
     let d = determinize_src(src);
     let err = flatppl_stablehlo::emit(
@@ -6556,6 +6656,7 @@ const BERNOULLI_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 x = draw(Bernoulli(p = 0.3))
 draws = rand(s, lawof(x))
+outputs = (draws)
 ";
 
 /// §08 Bernoulli's `select(U < p, 1, 0)`: exactly one `stablehlo.rng`
@@ -6590,6 +6691,7 @@ const GEOMETRIC_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 x = draw(Geometric(p = 0.3))
 draws = rand(s, lawof(x))
+outputs = (draws)
 ";
 
 /// §08 Geometric's `floor(log(U) / log(1 - p))`: exactly one `stablehlo.rng`
@@ -6624,6 +6726,7 @@ const CATEGORICAL_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 x = draw(Categorical(p = [0.2, 0.3, 0.5]))
 draws = rand(s, lawof(x))
+outputs = (draws)
 ";
 
 /// §08 Categorical's (1-based) shared [`draw_categorical`] inverse-CDF index
@@ -6659,6 +6762,7 @@ const CATEGORICAL0_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 x = draw(Categorical0(p = [0.2, 0.3, 0.5]))
 draws = rand(s, lawof(x))
+outputs = (draws)
 ";
 
 /// The `base = 0.0` mirror of [`emit_sample_categorical_has_expected_structure`]
@@ -6694,6 +6798,7 @@ s = rnginit(0)
 n = 5
 x = draw(Binomial(n = n, p = 0.3))
 draws = rand(s, lawof(x))
+outputs = (draws)
 ";
 
 /// §08 Binomial's exact `sum of n Bernoulli(p)`: a FIXED `n = 5` drives a
@@ -6743,6 +6848,8 @@ n = elementof(posintegers)
 s = rnginit(0)
 x = draw(Binomial(n = n, p = 0.3))
 draws = rand(s, lawof(x))
+inputs = (n)
+outputs = (draws)
 ";
     let d = determinize_src(src);
     let err = flatppl_stablehlo::emit(
@@ -6763,6 +6870,7 @@ const POISSON_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 x = draw(Poisson(rate = 4.0))
 draws = rand(s, lawof(x))
+outputs = (draws)
 ";
 
 /// §08 Poisson's bounded inverse-CDF sampler ([`draw_poisson`]): exactly one
@@ -6798,6 +6906,7 @@ const NEGATIVE_BINOMIAL_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 x = draw(NegativeBinomial(alpha = 5.0, beta = 2.0))
 draws = rand(s, lawof(x))
+outputs = (draws)
 ";
 
 /// §08 NegativeBinomial's Gamma-Poisson mixture: [`draw_gamma`] (Task 15,
@@ -6843,6 +6952,7 @@ const NEGATIVE_BINOMIAL2_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 x = draw(NegativeBinomial2(mu = 3.0, psi = 5.0))
 draws = rand(s, lawof(x))
+outputs = (draws)
 ";
 
 /// §08 NegativeBinomial2's Gamma-Poisson mixture: same op-count shape as
@@ -6881,6 +6991,7 @@ s = rnginit(0)
 n = 4
 x = draw(Multinomial(n = n, p = [0.2, 0.3, 0.5]))
 draws = rand(s, lawof(x))
+outputs = (draws)
 ";
 
 /// §08 Multinomial's bounded `while` over `n = 4` Categorical(p) draws
@@ -6929,6 +7040,8 @@ n = elementof(posintegers)
 s = rnginit(0)
 x = draw(Multinomial(n = n, p = [0.2, 0.3, 0.5]))
 draws = rand(s, lawof(x))
+inputs = (n)
+outputs = (draws)
 ";
     let d = determinize_src(src);
     let err = flatppl_stablehlo::emit(
@@ -6960,6 +7073,8 @@ p = elementof(cartpow(unitinterval, m))
 s = rnginit(0)
 x = draw(Multinomial(n = n, p = p))
 draws = rand(s, lawof(x))
+inputs = (m, p)
+outputs = (draws)
 ";
     let d = determinize_src(src);
     let err = flatppl_stablehlo::emit(
@@ -6991,6 +7106,8 @@ p = elementof(cartpow(unitinterval, [3, 1]))
 s = rnginit(0)
 x = draw(Multinomial(n = n, p = p))
 draws = rand(s, lawof(x))
+inputs = (p)
+outputs = (draws)
 ";
     let d = determinize_src(src);
     let err = flatppl_stablehlo::emit(
@@ -7129,6 +7246,7 @@ y = draw(Normal(mu = 1.0, sigma = 1.0))
 d1, s2 = rand(s, lawof(x))
 d2, s3 = rand(s2, lawof(y))
 out = d2
+outputs = (out)
 ";
 
 /// Freeze the exact emitted text: any drift (op count, ordering, key
@@ -7287,6 +7405,7 @@ const NORMAL_IID_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 xs ~ iid(Normal(mu = 0.0, sigma = 1.0), 4)
 draws = rand(s, lawof(xs))
+outputs = (draws)
 ";
 
 /// A fanned inverse-CDF iid draw: `iid(Exponential(rate=2), 4)` (`-log(U)/rate`).
@@ -7294,6 +7413,7 @@ const EXPONENTIAL_IID_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 xs ~ iid(Exponential(rate = 2.0), 4)
 draws = rand(s, lawof(xs))
+outputs = (draws)
 ";
 
 /// The brief's Step-2 structural check: the fanned draw returns a
@@ -7387,6 +7507,7 @@ const GAMMA_IID_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 xs ~ iid(Gamma(shape = 2.0, rate = 1.0), 4)
 draws = rand(s, lawof(xs))
+outputs = (draws)
 ";
 
 /// The strongest reducer: `X / (X + Y)`, TWO independent batched Gamma draws
@@ -7395,6 +7516,7 @@ const BETA_IID_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 xs ~ iid(Beta(alpha = 2.0, beta = 3.0), 4)
 draws = rand(s, lawof(xs))
+outputs = (draws)
 ";
 
 /// The batched Gamma draw returns a `tensor<4xf32>` (not a scalar) alongside
@@ -7529,6 +7651,8 @@ cov = elementof(cartpow(reals, [2, 2]))
 s = rnginit(0)
 xs ~ iid(MvNormal(mu = mu, cov = cov), 3)
 draws = rand(s, lawof(xs))
+inputs = (mu, cov)
+outputs = (draws)
 ";
 
 /// The batched MvNormal draw returns a `tensor<3x2xf32>` (`[n, d]`, not a bare
@@ -7605,6 +7729,7 @@ const DIRICHLET_IID_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 xs ~ iid(Dirichlet(alpha = [2.0, 3.0, 4.0]), 5)
 draws = rand(s, lawof(xs))
+outputs = (draws)
 ";
 
 /// The fanned Dirichlet draw returns a `tensor<5x3xf32>` (`[m, d]`, not a bare
@@ -7684,6 +7809,7 @@ const POISSON_IID_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 xs ~ iid(Poisson(rate = 3.0), 4)
 draws = rand(s, lawof(xs))
+outputs = (draws)
 ";
 
 /// A fanned NegativeBinomial draw: `iid(NegativeBinomial(alpha=5, beta=2), 4)`,
@@ -7693,6 +7819,7 @@ const NEGATIVE_BINOMIAL_IID_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 xs ~ iid(NegativeBinomial(alpha = 5.0, beta = 2.0), 4)
 draws = rand(s, lawof(xs))
+outputs = (draws)
 ";
 
 /// A fanned NegativeBinomial2 draw: `iid(NegativeBinomial2(mu=3, psi=5), 4)`,
@@ -7702,6 +7829,7 @@ const NEGATIVE_BINOMIAL2_IID_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 xs ~ iid(NegativeBinomial2(mu = 3.0, psi = 5.0), 4)
 draws = rand(s, lawof(xs))
+outputs = (draws)
 ";
 
 /// The fanned Poisson draw returns a `tensor<4xf32>` (not a scalar) alongside
@@ -7829,6 +7957,7 @@ const LAPLACE_IID_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 xs ~ iid(Laplace(location = 0.0, scale = 1.0), 4)
 draws = rand(s, lawof(xs))
+outputs = (draws)
 ";
 
 /// A fanned Bernoulli draw: `iid(Bernoulli(p=0.3), 4)`, exercising the
@@ -7837,6 +7966,7 @@ const BERNOULLI_IID_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 xs ~ iid(Bernoulli(p = 0.3), 4)
 draws = rand(s, lawof(xs))
+outputs = (draws)
 ";
 
 /// A fanned Geometric draw: `iid(Geometric(p=0.3), 4)`, exercising `floor`
@@ -7845,6 +7975,7 @@ const GEOMETRIC_IID_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 xs ~ iid(Geometric(p = 0.3), 4)
 draws = rand(s, lawof(xs))
+outputs = (draws)
 ";
 
 /// The fanned Laplace draw returns a `tensor<4xf32>` (not a scalar) alongside
@@ -7992,6 +8123,7 @@ s = rnginit(0)
 n = 5
 xs ~ iid(Binomial(n = n, p = 0.3), 4)
 draws = rand(s, lawof(xs))
+outputs = (draws)
 ";
 
 /// A fanned Categorical draw: `iid(Categorical(p=[0.2,0.3,0.5]), 4)`, exercising
@@ -8000,6 +8132,7 @@ const CATEGORICAL_IID_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 xs ~ iid(Categorical(p = [0.2, 0.3, 0.5]), 4)
 draws = rand(s, lawof(xs))
+outputs = (draws)
 ";
 
 /// A fanned Categorical0 draw (0-based): same as the Categorical case but with
@@ -8008,6 +8141,7 @@ const CATEGORICAL0_IID_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 xs ~ iid(Categorical0(p = [0.2, 0.3, 0.5]), 4)
 draws = rand(s, lawof(xs))
+outputs = (draws)
 ";
 
 /// A fanned SINGLE-CATEGORY Categorical draw: `iid(Categorical(p=[1.0]), 4)`.
@@ -8020,6 +8154,7 @@ const CATEGORICAL_SINGLE_IID_SAMPLE_SRC: &str = "\
 s = rnginit(0)
 xs ~ iid(Categorical(p = [1.0]), 4)
 draws = rand(s, lawof(xs))
+outputs = (draws)
 ";
 
 /// The fanned Binomial draw returns a `tensor<4xf32>` (not a scalar) alongside
@@ -8514,6 +8649,8 @@ mu = elementof(reals)
 sigma = elementof(posreals)
 a = draw(normalize(truncate(Normal(mu = mu, sigma = sigma), interval(0, inf))))
 lp = logdensityof(lawof(record(a = a)), record(a = 0.5))
+inputs = (mu, sigma)
+outputs = (lp)
 ";
 
 const CAUCHY_TRUNC_TOUNIFORM_SRC: &str = "\
@@ -8521,6 +8658,8 @@ location = elementof(reals)
 scale = elementof(posreals)
 a = draw(normalize(truncate(Cauchy(location = location, scale = scale), interval(0, inf))))
 lp = logdensityof(lawof(record(a = a)), record(a = 0.5))
+inputs = (location, scale)
+outputs = (lp)
 ";
 
 /// The Normal CDF `F(x) = ½·(1 + erf((x − μ)/(σ·√2)))` reaches the emitter via
@@ -8673,7 +8812,9 @@ t = table(aa = [11.0, 12.0], bb = [21.0, 22.0])\n\
 picked = t.bb\n\
 mu = elementof(reals)\n\
 x = draw(Normal(mu = mu, sigma = 1.0))\n\
-lp = logdensityof(lawof(record(x = x)), record(x = picked[1]))\n";
+lp = logdensityof(lawof(record(x = x)), record(x = picked[1]))\n\
+inputs = (mu)\n\
+outputs = (lp)\n";
     let m = flatppl_syntax::parse(src).unwrap();
     let d = flatppl_determinizer::determinize(&m).unwrap();
     let out = flatppl_stablehlo::emit(&d, flatppl_stablehlo::Mode::LogDensity, &Default::default())
@@ -8707,7 +8848,8 @@ y = draw(Bernoulli.(prob))\n\
 fk = kernelof(record(y = y), theta = theta, b = b)\n\
 L = likelihoodof(fk, record(y = [true, false]))\n\
 post = bayesupdate(L, lawof(record(theta = theta, b = b)))\n\
-lp = logdensityof(post, record(theta = [0.1, 0.2], b = [0.3, 0.4]))\n";
+lp = logdensityof(post, record(theta = [0.1, 0.2], b = [0.3, 0.4]))\n\
+outputs = (lp)\n";
     let m = flatppl_syntax::parse(src).unwrap();
     let d = flatppl_determinizer::determinize(&m).unwrap();
     let out = flatppl_stablehlo::emit(&d, flatppl_stablehlo::Mode::LogDensity, &Default::default())
