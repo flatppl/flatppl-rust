@@ -110,7 +110,7 @@ jobs:
           merge-multiple: true
 
       - name: Update nightly release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@v3.0.1
         with:
           tag_name: nightly
           name: Nightly Build
