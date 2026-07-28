@@ -483,11 +483,11 @@ fn apply_rule(
 
     // --- No rule matched: refuse with the op name ---
     let construct = op_name(m, target_node);
+    let reason = format!("no determinization rule for the `{construct}` measure-layer construct");
     Err(RefuseError {
         node: target_node,
         construct,
-        reason: "no determinization rule for this measure-layer construct (Task 3+ needed)"
-            .to_string(),
+        reason,
     })
 }
 

@@ -433,8 +433,9 @@ fn lower_measure_sample(
     match op {
         Some("record") => lower_record_of_draws_sample(m, resolved, rng),
         Some("draw") => lower_draw(m, resolved, rng),
-        // Intractable (outside rand's tractable set, spec §07) / deferred
-        // (simply not built in this vertical) — see `classify_intractable_or_deferred`.
+        // Intractable (§07's `rand` exclusion clause + §13 "Refused constructs") /
+        // deferred (simply not built in this vertical) — see
+        // `classify_intractable_or_deferred`.
         // This dispatch arm is reached when one of these ops is `lawof`'s direct
         // argument, or a NOT-yet-drawn measure sitting in a record field (the
         // uniform per-field fold in `lower_record_of_draws_sample`/
@@ -460,17 +461,27 @@ fn lower_measure_sample(
 /// intentionally does not lower, or `None` if `resolved`'s builtin head is not
 /// one of them (the caller then falls back to its own generic refuse).
 ///
-/// Two buckets, per spec §07's `rand` tractable set:
-/// * **Intractable** — `weighted`/`logweighted`/`bayesupdate` (a reweighted
+/// Two buckets. There is no enumerated "tractable set" in the spec to check
+/// against — §07 "rand" states a CRITERION: "`rand` does not support measures
+/// for which [efficient IID generation] is an intractable problem, especially
+/// measures involving non-constant weighting (via `weighted(f, base)`,
+/// `logweighted(g, base)`, or `bayesupdate(L, prior)`) or multivariate
+/// truncation" — "especially" introduces examples, not a whitelist. §13
+/// "Refused constructs" separately and explicitly names the same two shapes as
+/// refused for a sampled output. Only those two are classified **intractable**
+/// here; everything else this function refuses is **deferred** (not
+/// spec-excluded, simply unbuilt):
+/// * **Intractable** (§07 "rand"'s exclusion clause; §13 "Refused
+///   constructs") — `weighted`/`logweighted`/`bayesupdate` (a reweighted
 ///   measure has no direct sampling recipe; realizing its law needs a
 ///   change-of-measure algorithm — rejection/importance sampling, MCMC — which
 ///   is out of scope for this MVP's exact, deterministic lowering), and a
 ///   `truncate` whose base is CONFIRMED multivariate (no general sampling
 ///   recipe for an arbitrary multivariate truncated region either).
 /// * **Deferred** — `jointchain`/`kchain`/`superpose`, and a univariate
-///   `truncate`: none of these are conceptually intractable (a later vertical
-///   could add inverse-CDF/rejection truncated sampling, or thread the rng
-///   through a Kleisli/joint chain), they are simply not built in this one
+///   `truncate`: none of these are spec-excluded (a later vertical could add
+///   inverse-CDF/rejection truncated sampling, or thread the rng through a
+///   Kleisli/joint chain), they are simply not built in this one
 ///   (direct draws + record-of-draws + shared ancestors + pushforwards).
 ///
 /// `pushfwd` is deliberately NOT in either bucket: in measure position it is
@@ -531,14 +542,15 @@ fn refuse_draw_of_pushfwd(m: &Module, id: NodeId) -> RefuseError {
     )
 }
 
-/// `weighted`/`logweighted`/`bayesupdate`: outside `rand`'s tractable set
-/// (spec §07) — see [`classify_intractable_or_deferred`].
+/// `weighted`/`logweighted`/`bayesupdate`: refused per §07 "rand"'s exclusion
+/// clause and §13 "Refused constructs" — see [`classify_intractable_or_deferred`].
 fn refuse_weighted_family(m: &Module, id: NodeId) -> RefuseError {
     refuse(
         id,
         m,
-        "sampling a weighted/logweighted/bayesupdate measure is intractable (spec §07: \
-         outside rand's tractable set — no direct sampling recipe for an arbitrary \
+        "sampling a weighted/logweighted/bayesupdate measure is intractable (§07 \"rand\": \
+         non-constant weighting is named as an intractable-to-sample case; §13 \"Refused \
+         constructs\" names it explicitly — no direct sampling recipe for an arbitrary \
          reweighted measure) — refuse rather than mislower",
     )
 }
@@ -551,9 +563,10 @@ fn refuse_truncate(m: &Module, id: NodeId) -> RefuseError {
         refuse(
             id,
             m,
-            "sampling a multivariate truncated measure is intractable (spec §07: outside \
-             rand's tractable set — no general sampling recipe for an arbitrary multivariate \
-             truncation) — refuse rather than mislower",
+            "sampling a multivariate truncated measure is intractable (§07 \"rand\": \
+             multivariate truncation is named as an intractable-to-sample case; §13 \"Refused \
+             constructs\" names it explicitly — no general sampling recipe for an arbitrary \
+             multivariate truncation) — refuse rather than mislower",
         )
     } else {
         refuse_deferred_combinator(m, id)
