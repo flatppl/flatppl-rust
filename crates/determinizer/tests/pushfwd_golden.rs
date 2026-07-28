@@ -130,8 +130,8 @@ fn pushfwd_log_over_unrestricted_domain_refuses() {
     // well-formed-looking `(f_inv=exp, logvol=neg(log(x)))` change-of-variables
     // that is only valid on the positive half of the base support — silently a
     // SUB-probability measure (integrates to ~0.5, not 1). Refuse rather than
-    // mislower (mirrors derive_pow's is_positive_domain guard; §06 log defined
-    // on positive reals).
+    // mislower (the registry entry's `Domain::PosReals` guard; §06 puts `log` on
+    // `posreals`).
     let e = determinize(&parse_infer(
         "d = pushfwd(log, Normal(mu = 0.0, sigma = 1.0))\nlp = logdensityof(d, 0.5)",
     ))

@@ -319,10 +319,24 @@ enum LogVol {
 /// requires the base measure's support to lie within that domain; where it does
 /// not, density evaluation is refused rather than yielding a silently
 /// sub-probability measure."
+///
+/// One variant per §06 set, so an entry carries the domain §06 gives it and no
+/// other. Containment is decided against the base's refined SUPPORT, and an
+/// endpoint the forward sends to ±inf reads differently by measure class: it is a
+/// measure-zero boundary under a CONTINUOUS base (full mass survives) but a
+/// positive-mass ATOM under a discrete one (that mass is lost), so a discrete
+/// support must exclude it outright. Discrete supports are otherwise admitted —
+/// `nonnegintegers ⊆ nonnegreals`, and since the pushforward of a discrete base
+/// carries no volume element (`crate::density::reference_measure`) there is no
+/// Jacobian over it to be wrong.
 #[derive(Clone, Copy)]
 enum Domain {
-    /// The positive reals — `log`, `log10`, `sqrt`/`pow`.
-    Positive,
+    /// `posreals` — `log`, `log10`, and `pow` with a NEGATIVE exponent (`x^k` is
+    /// undefined at 0 there). 0 is outside the domain.
+    PosReals,
+    /// `nonnegreals` — `sqrt`, and `pow` with a positive exponent. 0 is INSIDE
+    /// the domain, so a discrete atom at 0 is admitted (`sqrt(0) = 0`).
+    NonNegReals,
     /// `interval(-1, inf)` — `log1p`.
     AboveMinusOne,
     /// `interval(0, 1)` — `logit`, `probit`.
@@ -330,22 +344,75 @@ enum Domain {
 }
 
 impl Domain {
-    /// Does a base measure whose refined support is `support` lie within this
-    /// domain? (Conservative — see [`is_positive_domain`].)
+    /// Is a base measure whose refined support is `support` PROVABLY inside this
+    /// domain? Conservative: every support that does not prove containment
+    /// refuses, including `%unknown`/`anything`/`%deferred` and the caller's
+    /// `None → Unknown` fallback (refuse-don't-mislower). This reads the inferred
+    /// support (`Module::valueset_of`), NOT the coarse structural type of the
+    /// variate — a `scalar real` variate has natural extent `reals`, which would
+    /// refuse every scalar base, so the caller threads the refined support here.
     fn admits(self, support: &ValueSet) -> bool {
+        use ValueSet::*;
         match self {
-            Domain::Positive => is_positive_domain(support),
-            Domain::AboveMinusOne => is_gt_neg_one_domain(support),
-            Domain::Unit => is_unit_domain(support),
+            // `log 0 = −inf`: a continuous base may touch 0 (measure-zero
+            // boundary), a discrete one may not, so only the strictly-positive
+            // integers qualify among the discrete supports.
+            Domain::PosReals => match support {
+                PosReals | NonNegReals | UnitInterval => true,
+                Interval(lo, _) => *lo >= 0.0,
+                PosIntegers => true,
+                _ => false,
+            },
+            // 0 is in the domain, so `nonnegintegers` (`Poisson`, `Binomial`,
+            // `Geometric`) and `booleans` (`Bernoulli`) are admitted alongside the
+            // continuous non-negative sets.
+            Domain::NonNegReals => match support {
+                PosReals | NonNegReals | UnitInterval => true,
+                Interval(lo, _) => *lo >= 0.0,
+                PosIntegers | NonNegIntegers | Booleans => true,
+                _ => false,
+            },
+            // `log1p(−1) = −inf`; no integer support has −1 as its least element
+            // (`integers` is unbounded below and refuses anyway), so the discrete
+            // sets need no endpoint carve-out here.
+            Domain::AboveMinusOne => match support {
+                PosReals | NonNegReals | UnitInterval => true,
+                Interval(lo, _) => *lo >= -1.0,
+                PosIntegers | NonNegIntegers | Booleans => true,
+                _ => false,
+            },
+            // `logit`/`probit` are ±inf at BOTH endpoints. A continuous base may
+            // touch them; `booleans` is exactly {0, 1} — both atoms — so no
+            // discrete support lies inside this domain.
+            Domain::Unit => match support {
+                UnitInterval => true,
+                Interval(lo, hi) => *lo >= 0.0 && *hi <= 1.0,
+                _ => false,
+            },
         }
     }
 
-    /// How the domain reads inside a refusal message.
-    fn describe(self) -> &'static str {
+    /// The §06 set, for a message that only names the domain.
+    fn set(self) -> &'static str {
         match self {
-            Domain::Positive => "the positive reals",
+            Domain::PosReals => "the positive reals",
+            Domain::NonNegReals => "the non-negative reals",
             Domain::AboveMinusOne => "(−1, ∞)",
             Domain::Unit => "(0, 1)",
+        }
+    }
+
+    /// The §06 set PLUS what [`admits`](Self::admits) actually allows at an
+    /// endpoint the forward sends to ±inf — for a message reporting a failed
+    /// containment check, where the endpoint rule is usually why it failed.
+    fn describe(self) -> &'static str {
+        match self {
+            Domain::PosReals => {
+                "the positive reals (a continuous base may touch 0, a discrete one may not)"
+            }
+            Domain::NonNegReals => "the non-negative reals",
+            Domain::AboveMinusOne => "(−1, ∞) (a continuous base may touch −1)",
+            Domain::Unit => "(0, 1) (a continuous base may touch 0 or 1)",
         }
     }
 }
@@ -387,7 +454,7 @@ static REGISTRY: &[(&str, UnaryEntry)] = &[
                 let logx = build_call(m, "log", &[x]);
                 build_call(m, "neg", &[logx])
             }),
-            domain: Some(Domain::Positive),
+            domain: Some(Domain::PosReals),
         },
     ),
     // f'(x) = −1 ⇒ log|f'| = 0.
@@ -401,7 +468,8 @@ static REGISTRY: &[(&str, UnaryEntry)] = &[
     ),
     // sqrt(x) = pow(x, 0.5) — §06's literal-exponent `pow` case, so the inverse
     // `pow(y, 1/k)` and log-volume `log|k| + (k−1)·log x` come from the shared
-    // `pow` builders at k = 0.5. Domain nonnegreals (the same guard `pow` takes).
+    // `pow` builders at k = 0.5. Domain nonnegreals, §06's own set for `sqrt`
+    // (`pow` at a positive exponent takes the same one, see `derive_pow`).
     (
         "sqrt",
         UnaryEntry {
@@ -410,7 +478,7 @@ static REGISTRY: &[(&str, UnaryEntry)] = &[
                 let k_node = m.alloc(Node::Lit(Scalar::Real(SQRT_EXPONENT)));
                 pow_logvol(m, k_node, SQRT_EXPONENT, x)
             }),
-            domain: Some(Domain::Positive),
+            domain: Some(Domain::NonNegReals),
         },
     ),
     // log10(x) = ln x / ln 10 ⇒ log|f'| = −ln x − ln(ln 10); inverse
@@ -430,7 +498,7 @@ static REGISTRY: &[(&str, UnaryEntry)] = &[
                 let s = build_call(m, "add", &[logx, ln_ln10]);
                 build_call(m, "neg", &[s])
             }),
-            domain: Some(Domain::Positive),
+            domain: Some(Domain::PosReals),
         },
     ),
     // log1p(x) = ln(1 + x) ⇒ log|f'| = −ln(1 + x) = −log1p(x); inverse expm1.
@@ -623,7 +691,7 @@ fn bare_bijection(
                 f,
                 m,
                 &format!(
-                    "pushfwd({op}, M) requires M's support to lie within {} ({op}'s domain); \
+                    "pushfwd({op}, M) requires M's support to lie within {op}'s domain, {}; \
                      refuse rather than mislower a sub-probability measure",
                     domain.describe()
                 ),
@@ -698,7 +766,7 @@ fn derive_chain(
                     "{name} is restricted to {} and sits inside a composition, where its input \
                      is an intermediate value this pass cannot bound — refuse rather than \
                      mislower a sub-probability measure",
-                    domain.describe()
+                    domain.set()
                 ),
             ));
         }
@@ -708,7 +776,7 @@ fn derive_chain(
                 m,
                 &format!(
                     "a forward map through {name} requires the base measure's support to lie \
-                     within {} ({name}'s domain); refuse rather than mislower a sub-probability \
+                     within {name}'s domain, {}; refuse rather than mislower a sub-probability \
                      measure",
                     domain.describe()
                 ),
@@ -920,10 +988,18 @@ fn local_logvol(m: &mut Module, op: &ChainOp) -> Option<NodeId> {
 }
 
 /// `pow(_, k)`: f_inv `x -> pow(x, 1/k)`; logvol `x -> add(log(abs(k)), mul(k-1, log(x)))`.
-/// Requires a nonzero literal exponent and a base whose `support` is a.e.
-/// positive ([`is_positive_domain`]) — the inverse `x^{1/k}` and the
-/// log-volume's `log x` are defined only there
-/// (d/dx xᵏ = k·xᵏ⁻¹ ⇒ log|f'| = log|k| + (k−1)·log x).
+/// Requires a nonzero literal exponent and a base whose `support` lies inside
+/// `pow`'s §06 domain — the inverse `x^{1/k}` and the log-volume's `log x` are
+/// defined only there (d/dx xᵏ = k·xᵏ⁻¹ ⇒ log|f'| = log|k| + (k−1)·log x).
+///
+/// §06 gives that domain as `nonnegreals`. A NEGATIVE exponent needs the stricter
+/// `posreals`: `x^k` is undefined at 0, so an atom there is not mapped anywhere
+/// and its mass is lost (under a continuous base 0 is a measure-zero boundary and
+/// either domain admits it, so the split only bites on a discrete base). No
+/// spelling currently reaches it — `pow(_, -1.0)` parses as `pow(_, neg(1.0))`,
+/// which [`literal_real`] rejects, so the exponent is not a literal and this
+/// returns `Ok(None)` first; the split is what keeps `nonnegreals` from becoming
+/// wrong if that folds.
 fn derive_pow(
     m: &mut Module,
     f: NodeId,
@@ -937,11 +1013,20 @@ fn derive_pow(
     if k == 0.0 {
         return Err(refuse(f, m, "pow with exponent 0 is not invertible"));
     }
-    if !is_positive_domain(support) {
+    let domain = if k < 0.0 {
+        Domain::PosReals
+    } else {
+        Domain::NonNegReals
+    };
+    if !domain.admits(support) {
         return Err(refuse(
             f,
             m,
-            "pow forward is invertible (with this log-volume) only on a strictly-positive domain",
+            &format!(
+                "pow(_, {k}) requires M's support to lie within its domain, {}; refuse rather \
+                 than mislower a sub-probability measure",
+                domain.describe()
+            ),
         ));
     }
     let f_inv = lambda(m, |m, ph| pow_inverse(m, k, ph));
@@ -1249,8 +1334,8 @@ fn derive_elementwise(
         return Ok(None);
     }
     // Recurse on the scalar operator `g` over the vector's element domain +
-    // element support (the per-cell scalar support the positivity guard reads for
-    // a `log`/`pow` cell op). `None` → arm does not apply; `Err` → propagate (a
+    // element support (the per-cell scalar support the domain guard reads for a
+    // `log`/`pow` cell op). `None` → arm does not apply; `Err` → propagate (a
     // recognised-but-non-invertible `g`).
     let Some(g_bij) = derive_bijection(m, g, elem_domain, elem_support)? else {
         return Ok(None);
@@ -1280,7 +1365,7 @@ fn vector_elem_domain(domain: &Type) -> Type {
 
 /// The per-cell SUPPORT of a vector value-set — the scalar support the
 /// elementwise operator `g` acts on (`cartpow(elem, n)` → `elem`), threaded into
-/// the scalar recursion's positivity guard. Conservative `Unknown` for any
+/// the scalar recursion's [`Domain`] guard. Conservative `Unknown` for any
 /// non-power support (so a `log`/`pow` cell op over an unrefined vector base
 /// refuses rather than mislowers).
 fn elem_support(support: &ValueSet) -> ValueSet {
@@ -1506,67 +1591,6 @@ fn literal_real(m: &Module, id: NodeId) -> Option<f64> {
         Node::Lit(Scalar::Real(r)) => Some(*r),
         Node::Lit(Scalar::Int(i)) => Some(*i as f64),
         _ => None,
-    }
-}
-
-/// Is `log x` / `x^{1/k}` defined a.e. with full mass over a base whose refined
-/// SUPPORT is `support`? This reads the base measure's inferred support
-/// (`Module::valueset_of`), NOT the coarse structural type of its variate — a
-/// `scalar real` variate has natural extent `reals`, which would refuse EVERY
-/// scalar base, so the caller threads the refined support here instead.
-///
-/// True when the support is CONTINUOUS, excludes negatives, AND any boundary at
-/// 0 carries no probability mass:
-///   - strictly-positive continuous sets (`posreals`, `interval(lo>0, _)`) — 0
-///     is excluded outright;
-///   - continuous non-negative sets (`nonnegreals`, `unitinterval`,
-///     `interval(0, _)`) — 0 is a measure-zero boundary of a continuous base (no
-///     probability atom there), so `exp` maps −∞ ↦ 0 and the pushforward keeps
-///     full mass. (`Exponential`'s spec §08 support is `nonnegreals`, `Gamma`'s
-///     is `posreals`; both are continuous a.e.-positive bases, so the guard
-///     accepts either and they lower alike.)
-///
-/// Conservative everywhere else — refuse-don't-mislower: sets containing
-/// negatives (`reals`, `integers`), and EVERY discrete support regardless of
-/// whether it excludes 0 — `posintegers` (`Categorical`), `nonnegintegers`
-/// (`Poisson`), `booleans` — because a discrete measure has no Jacobian: a
-/// `log`/`pow` change-of-variables over it would silently synthesize a spurious
-/// density term. Every unproven support (`%unknown`, `anything`, `%deferred`,
-/// and the caller's `None → Unknown` fallback) also refuses.
-fn is_positive_domain(support: &ValueSet) -> bool {
-    use ValueSet::*;
-    match support {
-        // NOTE: CONTINUOUS supports only — a discrete support (e.g. `posintegers`,
-        // `Categorical`'s support) has no Jacobian, so `log`/`pow` pushforward of a
-        // discrete measure must refuse, not silently add a change-of-variables term.
-        PosReals | NonNegReals | UnitInterval => true,
-        Interval(lo, _) => *lo >= 0.0,
-        _ => false,
-    }
-}
-
-/// `support ⊆ (−1, ∞)` — the domain of `log1p` (spec §07: `interval(-1, inf)`).
-/// Continuous supports only, mirroring [`is_positive_domain`]'s discrete
-/// exclusion. The `lo == −1` boundary is a measure-zero point (`log1p(−1) =
-/// −inf`), admitted for the same reason `is_positive_domain` admits `lo == 0`.
-fn is_gt_neg_one_domain(support: &ValueSet) -> bool {
-    use ValueSet::*;
-    match support {
-        PosReals | NonNegReals | UnitInterval => true,
-        Interval(lo, _) => *lo >= -1.0,
-        _ => false,
-    }
-}
-
-/// `support ⊆ (0, 1)` — the domain of `logit` / `probit` (spec §07:
-/// `interval(0, 1)`). Continuous supports only; the `0`/`1` boundaries are the
-/// measure-zero points where `logit`/`probit` are `±inf`.
-fn is_unit_domain(support: &ValueSet) -> bool {
-    use ValueSet::*;
-    match support {
-        UnitInterval => true,
-        Interval(lo, hi) => *lo >= 0.0 && *hi <= 1.0,
-        _ => false,
     }
 }
 
