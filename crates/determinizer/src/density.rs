@@ -4309,7 +4309,7 @@ pub(crate) fn build_call(m: &mut Module, head: &str, args: &[NodeId]) -> NodeId 
 }
 
 /// Allocate a user-function call `(%call callee arg)`.
-fn build_user_call(m: &mut Module, callee: NodeId, arg: NodeId) -> NodeId {
+pub(crate) fn build_user_call(m: &mut Module, callee: NodeId, arg: NodeId) -> NodeId {
     m.alloc(Node::Call(Call {
         head: CallHead::User(callee),
         args: vec![arg].into(),

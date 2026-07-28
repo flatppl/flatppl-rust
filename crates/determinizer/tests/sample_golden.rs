@@ -538,3 +538,87 @@ out = draws";
     determinize(&m)
         .expect_err("iid over a broadcast (differing per-element params) kernel must refuse");
 }
+
+// ---------------------------------------------------------------------------
+// Sample path: composed measures in measure position, and derived record fields
+// ---------------------------------------------------------------------------
+
+// §07 `rand(rstate, m)`: "generates a random value from a closed measure `m`".
+// A primitive constructor call is a nullary kernel — a CLOSED measure (§06
+// "Fundamental measures and measure algebra": operations that map measures to
+// values "require closed measures (i.e. nullary kernels)") — so it needs no
+// `lawof` wrapper, and §07's only stated exclusions are non-constant weighting
+// and multivariate truncation. A `refuse.rs` test previously pinned the
+// opposite ("its second argument must be a lawof(...)"), which was the gate
+// defect stated as a requirement. This is also the base case that terminates
+// the `pushfwd` arm's recursion on its base.
+#[test]
+fn rand_of_a_bare_closed_measure_samples() {
+    let src = "\
+s = rnginit([42, 0, 0, 0])
+draws = rand(s, Normal(mu = 0.0, sigma = 1.0))";
+    let m = parse_infer(src);
+    let out = determinize(&m).expect("a bare closed measure is admissible per §07");
+    let pir = flatppl_flatpir::write(&out);
+    assert_eq!(
+        pir.matches("builtin_sample").count(),
+        1,
+        "one sample from the closed measure:\n{pir}"
+    );
+    assert!(flatppl_determinizer::is_flatpdl(&out).is_ok());
+}
+
+// §07 types `rand`'s second argument as a "closed measure", and §06 makes
+// `pushfwd(f, M)` of a closed measure closed. Sampling a pushforward is the
+// textbook easy case — sample the base, apply the map, no inverse and no Jacobian
+// — but `lower_rand` gated on a literal `lawof` head before dispatching, so no
+// composed measure was reachable. This is §06's own log-normal example.
+#[test]
+fn rand_of_pushfwd_samples_base_then_applies_map() {
+    let src = "\
+s = rnginit([42, 0, 0, 0])
+draws = rand(s, pushfwd(exp, Normal(mu = 0.0, sigma = 1.0)))";
+    let m = parse_infer(src);
+    let out = determinize(&m).expect("rand of a pushfwd must lower");
+    let pir = flatppl_flatpir::write(&out);
+    assert_eq!(
+        pir.matches("builtin_sample").count(),
+        1,
+        "one base sample:\n{pir}"
+    );
+    assert!(pir.contains("exp"), "map applied forward:\n{pir}");
+    assert!(
+        !pir.contains("pushfwd") && !pir.contains("lawof"),
+        "measure layer gone:\n{pir}"
+    );
+    assert!(flatppl_determinizer::is_flatpdl(&out).is_ok());
+}
+
+// §13 "Output reduction": "A sampled output resolves its measure's `draw` nodes
+// through `rand`" and "Other deterministic expressions pass through unchanged".
+// A derived field over two sampled latents is exactly such an expression. Note the
+// shared `mu` must still be sampled ONCE (shared-ancestor identity) — three latents
+// means three `builtin_sample` calls, not four.
+#[test]
+fn derived_record_field_samples_over_shared_latents() {
+    let src = "\
+s = rnginit([42, 0, 0, 0])
+mu = draw(Normal(mu = 0.0, sigma = 10.0))
+y1 = draw(Normal(mu = mu, sigma = 1.0))
+y2 = draw(Normal(mu = mu, sigma = 1.0))
+d = y1 - y2
+draws = rand(s, lawof(record(mu = mu, y1 = y1, y2 = y2, d = d)))";
+    let m = parse_infer(src);
+    let out = determinize(&m).expect("a derived record field must sample");
+    let pir = flatppl_flatpir::write(&out);
+    assert_eq!(
+        pir.matches("builtin_sample").count(),
+        3,
+        "mu sampled ONCE and shared by y1/y2; d is deterministic:\n{pir}"
+    );
+    assert!(
+        !pir.contains("lawof") && !pir.contains("(draw "),
+        "measure layer gone:\n{pir}"
+    );
+    assert!(flatppl_determinizer::is_flatpdl(&out).is_ok());
+}

@@ -17,16 +17,34 @@
 //! via a `(%ref self x)` binding reference) is resolved uniformly by
 //! [`lower_measure_sample`]'s single `resolve_ref_one` call, mirroring
 //! `density::lower_measure_density`'s dispatch.
+//!
+//! **Two dispatchers, two admissible sets.** [`lower_closed_measure_sample`]
+//! handles MEASURE position — `rand`'s second argument, which §07 types as "a
+//! closed measure `m`", so a bare `Normal(…)` or a `pushfwd(f, M)` is admissible
+//! there, not just a `lawof`. [`lower_measure_sample`] handles FIELD position,
+//! where §04 says a record field is a declared variate or a deterministic
+//! expression — so an un-drawn measure in a field keeps refusing rather than
+//! fabricating a draw. A derived field (`d = y1 - y2`) passes through unchanged
+//! (§13 "Output reduction") with the latents it reads sampled once each and
+//! referenced by name.
 use crate::density::{
-    build_call, build_record, builtin_name, draw_argument, expect_builtin_call, iid_static_size,
-    refuse, resolve_ref_one, split_kernel_constructor,
+    build_call, build_record, build_user_call, builtin_name, draw_argument, expect_builtin_call,
+    iid_static_size, refuse, resolve_ref_one, split_kernel_constructor,
 };
 use crate::refuse::RefuseError;
 use flatppl_core::{
     Binding, BindingId, Module, NamedKind, Node, NodeId, Phase, Ref, RefNs, Scalar, Symbol, Type,
 };
 
-/// `rand(rng, lawof(x))` → deterministic sample of x's generative subgraph.
+/// `rand(rng, m)` → a deterministic sample of the closed measure `m`.
+///
+/// The measure is handed straight to [`lower_closed_measure_sample`], which
+/// dispatches on its head — `lawof(x)` (re-run `x`'s generative subgraph),
+/// `pushfwd(f, M)`, a `record`/`draw`, or a bare primitive constructor. §07 types
+/// this argument as "a closed measure `m`", so `lawof` is one admissible spelling
+/// among several rather than a requirement; gating on a literal `lawof` head
+/// before dispatching is what used to make every other closed measure
+/// unreachable.
 ///
 /// `bid` is the binding whose subtree contains `rand_node` (the driver's
 /// `apply_rule` already has it) — i.e. the name a `v, s2 = rand(...)`
@@ -47,28 +65,7 @@ pub(crate) fn lower_rand(
         }
         (c.args[0], c.args[1])
     };
-    // Strip lawof: rand samples the LAW of a stochastic subgraph. Refuse lawof of
-    // a non-stochastic (Dirac) argument (spec: lawof of a deterministic point).
-    let inner = strip_lawof(m, measure)
-        .ok_or_else(|| refuse(measure, m, "rand's measure must be lawof(<stochastic>)"))?;
-    // `lawof(?x)` itself infers to a DETERMINISTIC phase (spec §04 "Phase of the
-    // reified law": lawof absorbs its argument's stochasticity rather than
-    // propagating it — `crates/infer/src/ops.rs`'s `"lawof"` phase arm traces
-    // `law_phase(?x)`, never `Phase::Stochastic`). So the phase that matters here
-    // is `?x`'s own, not `lawof(?x)`'s: a `?x` that is not Stochastic-phase (e.g.
-    // `lawof(3.0)`, or `lawof(record(a = a))` where `a` is a plain constant, not a
-    // draw) has no generative `draw` subgraph for `rand` to re-run — refuse rather
-    // than silently echo the constant back out as a "sample".
-    if !matches!(m.phase_of(inner), Some(Phase::Stochastic)) {
-        return Err(refuse(
-            inner,
-            m,
-            "lawof's argument is not stochastic-phase (a Dirac/deterministic point) — rand \
-             samples the law of a STOCHASTIC subgraph, so lawof(<non-stochastic>) has no \
-             generative draw to sample; refuse rather than mislower",
-        ));
-    }
-    let (value, rng_out) = lower_measure_sample(m, inner, rng)?;
+    let (value, rng_out) = lower_closed_measure_sample(m, measure, rng)?;
     if rand_result_is_destructured(m, bid) {
         // Full spec §07 (value, new_rstate) contract: the caller destructures
         // both slots (or feeds s2 into another rand). Build the 2-tuple so the
@@ -157,7 +154,228 @@ fn strip_lawof(m: &Module, node: NodeId) -> Option<NodeId> {
     (c.args.len() == 1).then(|| c.args[0])
 }
 
+/// Sample a MEASURE-POSITION measure — `rand`'s second argument, or the base of
+/// a `pushfwd` — threading `rng`; returns `(value_node, advanced_rng_node)`.
+///
+/// §07 `rand(rstate, m)` types this argument as "a closed measure `m`", and §06
+/// ("Fundamental measures and measure algebra") makes a primitive constructor
+/// call a nullary kernel, i.e. closed; measure-to-measure operations preserve
+/// arity, so `pushfwd(f, <closed>)` is closed too. §07's only stated exclusions
+/// are "measures involving non-constant weighting … or multivariate truncation",
+/// both still refused via [`classify_intractable_or_deferred`].
+///
+/// **Why this is a separate entry point from [`lower_measure_sample`].** That
+/// function doubles as the per-FIELD dispatcher for a record law (both record
+/// folds call it for every field, whatever the field's head), and the two
+/// positions admit different sets — §04's distinction between a variate and a
+/// measure. A record field is a declared variate or a deterministic expression;
+/// `rand`'s argument is a closed measure. Putting the primitive-constructor leaf
+/// case in the shared dispatcher would make `lawof(record(a = Normal(…)))`
+/// silently *sample* a field the model never declared as a variate — fabricating
+/// a draw (`tests/refuse.rs::undrawn_measure_in_a_record_field_still_refuses`
+/// pins that it keeps refusing).
+fn lower_closed_measure_sample(
+    m: &mut Module,
+    measure: NodeId,
+    rng: NodeId,
+) -> Result<(NodeId, NodeId), RefuseError> {
+    let (resolved, _) = resolve_ref_one(m, measure);
+    match builtin_name(m, resolved) {
+        Some("lawof") => {
+            let inner = strip_lawof(m, resolved)
+                .ok_or_else(|| refuse(resolved, m, "lawof expects 1 arg"))?;
+            // `lawof(?x)` itself infers to a DETERMINISTIC phase (spec §04 "Phase
+            // of the reified law": lawof absorbs its argument's stochasticity
+            // rather than propagating it — `crates/infer/src/ops.rs`'s `"lawof"`
+            // phase arm traces `law_phase(?x)`, never `Phase::Stochastic`). So the
+            // phase that matters here is `?x`'s own, not `lawof(?x)`'s: a `?x`
+            // that is not Stochastic-phase (e.g. `lawof(3.0)`, or
+            // `lawof(record(a = a))` where `a` is a plain constant, not a draw)
+            // has no generative `draw` subgraph for `rand` to re-run — refuse
+            // rather than silently echo the constant back out as a "sample".
+            //
+            // This check belongs to the `lawof` ARM, not to `rand` as a whole: a
+            // bare `Normal(…)` or `pushfwd(f, Normal(…))` in measure position is
+            // a measure, so its own phase is deterministic too, and a
+            // rand-level phase check would refuse every composed measure.
+            if !matches!(m.phase_of(inner), Some(Phase::Stochastic)) {
+                return Err(refuse(
+                    inner,
+                    m,
+                    "lawof's argument is not stochastic-phase (a Dirac/deterministic point) — \
+                     rand samples the law of a STOCHASTIC subgraph, so lawof(<non-stochastic>) \
+                     has no generative draw to sample; refuse rather than mislower",
+                ));
+            }
+            lower_closed_measure_sample(m, inner, rng)
+        }
+        Some("pushfwd") => lower_pushfwd_sample(m, resolved, rng),
+        Some("record") => lower_record_of_draws_sample(m, resolved, rng),
+        Some("draw") => lower_draw(m, resolved, rng),
+        _ => {
+            // The intractable/deferred set first — `weighted(w, M)` and friends
+            // carry positional args, so `split_constructor` would reject them
+            // anyway, but with the generic "not a constructor" message instead of
+            // the actionable §07 one.
+            if let Some(err) = classify_intractable_or_deferred(m, resolved) {
+                return Err(err);
+            }
+            // The leaf: a primitive constructor call IS a closed measure (§06), so
+            // `rand(s, Normal(mu = 0.0, sigma = 1.0))` samples it directly with no
+            // `lawof` wrapper. This is also what terminates [`lower_pushfwd_sample`]'s
+            // recursion on its base.
+            if let Some((ctor, kernel_input)) = split_constructor(m, resolved) {
+                return Ok(build_sample_term(m, ctor, kernel_input, rng));
+            }
+            Err(refuse(
+                resolved,
+                m,
+                "sample lowering: unsupported measure construct",
+            ))
+        }
+    }
+}
+
+/// `pushfwd(f, M)` in measure position → sample `M`, then apply `f` FORWARD to the
+/// sampled value; the rng is the one `M`'s sample advanced.
+///
+/// This is the textbook easy direction: $X \sim M \Rightarrow f(X) \sim f_* M$ by
+/// the definition of the pushforward (§06 `pushfwd`: $(f_* M)(Y) = M(f^{-1}(Y))$),
+/// so sampling needs **no inverse and no Jacobian** — this path must never touch
+/// `crate::invert` or the bijection registry the density side uses. `f` need not
+/// even be injective. Nested `pushfwd`s work by the same recursion, and the base
+/// case that terminates it is [`lower_closed_measure_sample`]'s
+/// primitive-constructor leaf.
+///
+/// The forward application is emitted as `(%call f <sampled value>)`, which must
+/// then actually resolve to FlatPDL — a surviving `%call` is neither a
+/// deterministic op nor a `builtin_*` primitive. Two forms resolve, and this
+/// function admits exactly those two:
+///
+/// * a **bare builtin** callee (`pushfwd(exp, …)`, where the map is a
+///   [`Node::Const`]) — `canon::inline`'s `builtin_callee_head` rewrites the head
+///   to a direct builtin call;
+/// * a **reified** `functionof`/lambda map that beta-reduces under
+///   [`crate::kernel::reduce_kernel_application`] — applied here rather than left
+///   to the driver's fixpoint, so that a map which does NOT reduce is a refusal
+///   instead of an unreduced `%call` emitted at exit 0.
+///
+/// The check matters because `is_flatpdl` is phase/type-based and does not flag a
+/// surviving `CallHead::User`, so an unreduced application would leave the module
+/// silently non-conformant.
+fn lower_pushfwd_sample(
+    m: &mut Module,
+    pushfwd_node: NodeId,
+    rng: NodeId,
+) -> Result<(NodeId, NodeId), RefuseError> {
+    let (map, base) = {
+        let c = expect_builtin_call(m, pushfwd_node, "pushfwd")
+            .ok_or_else(|| refuse(pushfwd_node, m, "expected pushfwd"))?;
+        if c.args.len() != 2 {
+            return Err(refuse(
+                pushfwd_node,
+                m,
+                "pushfwd expects 2 args (map, base measure)",
+            ));
+        }
+        // `pushfwd(f, M)` is function-FIRST (§06): the map is arg 0, the base
+        // measure arg 1.
+        (c.args[0], c.args[1])
+    };
+    let (value, rng_out) = lower_closed_measure_sample(m, base, rng)?;
+    // A bare builtin map needs no reduction — the head rewrite handles it — EXCEPT
+    // over a record variate, where the application is §04 auto-splatting against
+    // that operator's own parameter names. This vertical does not resolve those, and
+    // nothing downstream would catch the mismatch: `infer` reports no diagnostic for
+    // `pushfwd(exp, lawof(record(y = …)))` and `is_flatpdl` is structural, so
+    // `exp(record(y = …))` would pass every gate and fail only in the engine.
+    if matches!(m.node(map), Node::Const(_)) {
+        if expect_builtin_call(m, value, "record").is_some() {
+            return Err(refuse(
+                pushfwd_node,
+                m,
+                "pushfwd's map is a bare built-in operator and its base measure's variate is a \
+                 record: applying it is §04 auto-splatting against the operator's own parameter \
+                 names, which this vertical does not resolve — write the map as a functionof \
+                 whose parameter names are the record's field names",
+            ));
+        }
+        return Ok((build_user_call(m, map, value), rng_out));
+    }
+    // For a RECORD-valued variate the forward application is an auto-splatting
+    // call, whose §04 correspondence rule the reducer does not enforce — check it
+    // before reducing (see [`record_splat_mismatch`]).
+    if let Some(kernel) = crate::kernel::resolve_reified(m, map) {
+        if let Some(why) = record_splat_mismatch(m, value, &kernel.inputs) {
+            return Err(refuse(
+                pushfwd_node,
+                m,
+                &format!(
+                    "pushfwd's map does not apply to the record variate of its base measure: \
+                     {why}. §04 \"Calling conventions\" makes a record argument whose field \
+                     names do not match the callable's argument names a static error, and \
+                     binding only the parameters that DO match would silently project the \
+                     variate onto those coordinates — refuse rather than drop the rest"
+                ),
+            ));
+        }
+    }
+    let applied = build_user_call(m, map, value);
+    let reduced = crate::kernel::reduce_kernel_application(m, applied).ok_or_else(|| {
+        refuse(
+            pushfwd_node,
+            m,
+            "pushfwd's map does not reduce when applied to the sampled variate: its parameter \
+             list does not bind against the base measure's domain (for a record-valued base, \
+             application binds the map's parameters by field name). The forward application \
+             would survive as an unreduced call, which is not FlatPDL — refuse rather than \
+             emit it",
+        )
+    })?;
+    Ok((reduced, rng_out))
+}
+
+/// Do the map's parameter names correspond EXACTLY to the fields of a
+/// record-valued variate? Returns `None` when they do, or when `value` is not a
+/// record literal (there is nothing to splat); otherwise the offending name, for
+/// the refusal message.
+///
+/// §04 "Calling conventions" (auto-splatting): "`f(record(a = x, b = y, ...))` …
+/// [is] equivalent to `f(a = x, b = y, ...)`" and "A call with field or column
+/// names that do not match the callable's argument names is a static error". The
+/// forward application of a `pushfwd` map to a record variate is exactly such a
+/// call. [`crate::kernel::reduce_kernel_application`]'s record branch binds each of
+/// the callable's inputs from a like-named field and stops there — it never checks
+/// that every FIELD was consumed — so a map declaring a strict SUBSET of the
+/// record's fields reduces to a projection of the variate, silently dropping the
+/// other coordinates. Since a marginalizing projection and a full transform are
+/// different measures, that difference is a wrong sample, not a cosmetic one.
+fn record_splat_mismatch(m: &Module, value: NodeId, inputs: &[(Symbol, Ref)]) -> Option<String> {
+    let fields: Vec<Symbol> = {
+        let c = expect_builtin_call(m, value, "record")?;
+        c.named.iter().map(|n| n.name).collect()
+    };
+    let params: Vec<Symbol> = inputs.iter().map(|&(n, _)| n).collect();
+    if let Some(f) = fields.iter().find(|f| !params.contains(f)) {
+        return Some(format!(
+            "variate field `{}` binds no map parameter",
+            m.resolve(*f)
+        ));
+    }
+    if let Some(p) = params.iter().find(|p| !fields.contains(p)) {
+        return Some(format!(
+            "map parameter `{}` names no variate field",
+            m.resolve(*p)
+        ));
+    }
+    None
+}
+
 /// Sample `measure`, threading `rng`; returns `(value_node, advanced_rng_node)`.
+///
+/// This is the per-FIELD dispatcher for a record law — see
+/// [`lower_closed_measure_sample`] for why measure position has its own entry
+/// point and why the primitive-constructor leaf must not be added here.
 fn lower_measure_sample(
     m: &mut Module,
     measure: NodeId,
@@ -204,26 +422,68 @@ fn lower_measure_sample(
 ///   is out of scope for this MVP's exact, deterministic lowering), and a
 ///   `truncate` whose base is CONFIRMED multivariate (no general sampling
 ///   recipe for an arbitrary multivariate truncated region either).
-/// * **Deferred** — `jointchain`/`kchain`/`superpose`/`pushfwd`, and a
-///   univariate `truncate`: none of these are conceptually intractable (a
-///   later vertical could add inverse-CDF/rejection truncated sampling, or
-///   thread the rng through a Kleisli/joint chain), they are simply not built
-///   in this one (direct draws + record-of-draws + shared ancestors).
+/// * **Deferred** — `jointchain`/`kchain`/`superpose`, and a univariate
+///   `truncate`: none of these are conceptually intractable (a later vertical
+///   could add inverse-CDF/rejection truncated sampling, or thread the rng
+///   through a Kleisli/joint chain), they are simply not built in this one
+///   (direct draws + record-of-draws + shared ancestors + pushforwards).
 ///
-/// Shared by [`lower_measure_sample`]'s dispatcher and [`lower_draw`]'s
-/// constructor-shape fallback — see the latter's doc comment for why both call
-/// sites need it.
+/// `pushfwd` is deliberately NOT in either bucket: in measure position it is
+/// sampled ([`lower_pushfwd_sample`]), and in `draw` position it is refused for a
+/// different, semantic reason ([`refuse_draw_of_pushfwd`]).
+///
+/// Shared by [`lower_measure_sample`]'s dispatcher,
+/// [`lower_closed_measure_sample`]'s fallback, and (via
+/// [`classify_drawn_measure`]) the two places a `draw`'s inner measure is read.
 fn classify_intractable_or_deferred(m: &Module, resolved: NodeId) -> Option<RefuseError> {
     match builtin_name(m, resolved) {
         Some("weighted") | Some("logweighted") | Some("bayesupdate") => {
             Some(refuse_weighted_family(m, resolved))
         }
         Some("truncate") => Some(refuse_truncate(m, resolved)),
-        Some("jointchain") | Some("kchain") | Some("superpose") | Some("pushfwd") => {
+        Some("jointchain") | Some("kchain") | Some("superpose") => {
             Some(refuse_deferred_combinator(m, resolved))
         }
         _ => None,
     }
+}
+
+/// Classify the inner measure of a `draw` — [`classify_intractable_or_deferred`]
+/// plus the `pushfwd` case, which is refused in DRAW position (a fresh draw whose
+/// base law shares latents with the surrounding model) even though it is sampled
+/// in MEASURE position. Shared by [`lower_draw`] and [`lower_shared_record_sample`]'s
+/// latent loop — the two places a `draw`'s measure is read.
+fn classify_drawn_measure(m: &Module, resolved: NodeId) -> Option<RefuseError> {
+    if matches!(builtin_name(m, resolved), Some("pushfwd")) {
+        return Some(refuse_draw_of_pushfwd(m, resolved));
+    }
+    classify_intractable_or_deferred(m, resolved)
+}
+
+/// `draw(pushfwd(f, M))`: refused — and NOT because a pushforward is hard to
+/// sample (in measure position it is the easy case; see
+/// [`lower_pushfwd_sample`]).
+///
+/// Per §04 a `draw` introduces a **fresh** stochastic node, so
+/// `d = draw(pushfwd(f, lawof(record(y1 = y1, y2 = y2))))` is a NEW draw,
+/// independent of the existing `y1`/`y2`, not a spelling of `d = f(record(y1 =
+/// y1, y2 = y2))`. Lowering it by reusing those samples would emit a joint that
+/// is silently wrong in the opposite direction — perfectly dependent where the
+/// model asked for independence. Drawing it correctly means sampling the base law
+/// a SECOND time, independently of the surrounding model's copies of the same
+/// latents, which this vertical does not build. The message points at the
+/// deterministic spelling for the (common) case where that is what was meant.
+fn refuse_draw_of_pushfwd(m: &Module, id: NodeId) -> RefuseError {
+    refuse(
+        id,
+        m,
+        "draw(pushfwd(f, M)) denotes a fresh, independent draw from the pushforward law, not a \
+         deterministic function of the draws inside M — reusing those draws would emit a wrong \
+         (perfectly dependent) joint, and drawing M a second time independently of the \
+         surrounding model's own copies of its latents is not built in this vertical; if you \
+         meant a deterministic function of the existing draws, write the field as that \
+         expression instead",
+    )
 }
 
 /// `weighted`/`logweighted`/`bayesupdate`: outside `rand`'s tractable set
@@ -273,9 +533,9 @@ fn truncate_is_confirmed_multivariate(m: &Module, truncate_node: NodeId) -> bool
     )
 }
 
-/// `jointchain`/`kchain`/`superpose`/`pushfwd`, and a univariate `truncate`
-/// (via [`refuse_truncate`]): sample lowering for these is simply not built in
-/// this vertical — see [`classify_intractable_or_deferred`].
+/// `jointchain`/`kchain`/`superpose`, and a univariate `truncate` (via
+/// [`refuse_truncate`]): sample lowering for these is simply not built in this
+/// vertical — see [`classify_intractable_or_deferred`].
 fn refuse_deferred_combinator(m: &Module, id: NodeId) -> RefuseError {
     refuse(
         id,
@@ -313,7 +573,7 @@ fn lower_draw(
         c.args[0]
     };
     let (inner_resolved, _) = resolve_ref_one(m, inner_measure);
-    if let Some(err) = classify_intractable_or_deferred(m, inner_resolved) {
+    if let Some(err) = classify_drawn_measure(m, inner_resolved) {
         return Err(err);
     }
     // Fan-out: `draw(iid(K, n))` with a FIXED kernel `K` and a static length `n`
@@ -478,8 +738,14 @@ fn lower_record_of_draws_sample(
         .iter()
         .map(|&(_, v)| field_draw_binding(m, v))
         .collect();
-    if requires_shared_binding_rewrite(m, &field_bids) {
-        return lower_shared_record_sample(m, &fields, &field_bids, rng);
+    // A DERIVED field (`d = y1 - y2`) is not a variate at all — §13 "Output
+    // reduction": "Other deterministic expressions pass through unchanged". It
+    // still forces the binding-rewrite path whenever it reads latents, even if no
+    // field is itself shared: the inline fold below would leave those latents as
+    // un-lowered `draw` bindings for the derived expression to reference.
+    let derived_latents = derived_field_latents(m, &fields, &field_bids);
+    if requires_shared_binding_rewrite(m, &field_bids) || !derived_latents.is_empty() {
+        return lower_shared_record_sample(m, &fields, &field_bids, &derived_latents, rng);
     }
 
     // Independent-draws fold (verified for >=2 independent draws): each field's
@@ -488,6 +754,13 @@ fn lower_record_of_draws_sample(
     let mut cur = rng;
     let mut out_fields = Vec::with_capacity(fields.len());
     for (name, val) in fields {
+        // A derived field that reads NO latent (a constant, or an expression over
+        // deterministic bindings only) needs nothing sampled — pass it through.
+        // One that does read latents took the shared path above.
+        if is_derived_value_field(m, val) {
+            out_fields.push((name, val));
+            continue;
+        }
         // `val` is a `(%ref self <draw-binding>)` or an inline draw;
         // `lower_measure_sample` resolves either uniformly.
         let (v, next) = lower_measure_sample(m, val, cur)?;
@@ -495,6 +768,111 @@ fn lower_record_of_draws_sample(
         cur = next;
     }
     Ok((build_record(m, &out_fields), cur))
+}
+
+/// Is this record field a DETERMINISTIC value expression — §13 "Output reduction":
+/// "Other deterministic expressions pass through unchanged" — rather than a
+/// variate or a measure?
+///
+/// §04's variate/measure distinction is what separates the three field kinds: a
+/// `draw` (inline or via a binding) declares a variate and a `record` is a nested
+/// measure product — both are [`lower_measure_sample`]'s business — while anything
+/// whose inferred type is a confirmed VALUE type is an ordinary expression that
+/// passes through, reading its sampled latents by name.
+///
+/// Fail-closed on the type: an unresolved/`%deferred` type is NOT confirmed, so a
+/// field inference never typed keeps its current refusal instead of being passed
+/// through as if deterministic. In particular an un-drawn measure in a field
+/// (`record(a = Normal(…))`) is `Type::Measure` and so still refuses — admitting
+/// the constructor leaf in measure position must not fabricate a draw here.
+fn is_derived_value_field(m: &Module, value: NodeId) -> bool {
+    let (resolved, _) = resolve_ref_one(m, value);
+    if matches!(builtin_name(m, resolved), Some("draw") | Some("record")) {
+        return false;
+    }
+    m.type_of(resolved).is_some_and(is_confirmed_value_type)
+}
+
+/// Is `ty` a confirmed VALUE type (§03 "Value types")? Excludes the measure-layer
+/// types (`Measure`/`Kernel`/`Likelihood`), functions and modules, and every
+/// unresolved form (`%deferred`/`%failed`/`%any`/type variable) — see
+/// [`is_derived_value_field`] for why the unresolved cases must fail closed.
+fn is_confirmed_value_type(ty: &Type) -> bool {
+    matches!(
+        ty,
+        Type::Scalar(_)
+            | Type::Array { .. }
+            | Type::TVector { .. }
+            | Type::Record(_)
+            | Type::Tuple(_)
+            | Type::Table { .. }
+    )
+}
+
+/// The draw-bindings read by the record's DERIVED value fields, in
+/// first-encounter order.
+///
+/// These are latents the record's own field list may never name (`record(d = d)`
+/// with `d = y1 - y2` names neither `y1` nor `y2`), but which must still be
+/// sampled — once each, in dependency order — for the derived expression to read
+/// them by name. They join the field seeds in [`lower_shared_record_sample`];
+/// [`topo_draw_cone`]'s visited set dedupes the overlap.
+fn derived_field_latents(
+    m: &Module,
+    fields: &[(Symbol, NodeId)],
+    field_bids: &[Option<BindingId>],
+) -> Vec<BindingId> {
+    let mut found: Vec<BindingId> = Vec::new();
+    for (&(_, val), &bid) in fields.iter().zip(field_bids) {
+        if bid.is_some() || !is_derived_value_field(m, val) {
+            continue;
+        }
+        let (resolved, _) = resolve_ref_one(m, val);
+        for latent in transitive_draw_bindings(m, resolved) {
+            if !found.contains(&latent) {
+                found.push(latent);
+            }
+        }
+    }
+    found
+}
+
+/// The draw-bindings reachable from `root` THROUGH deterministic bindings, in
+/// first-encounter order.
+///
+/// [`referenced_draw_bindings`] stops at the subtree it is handed, which is enough
+/// for a draw's own kernel input — that names its latents directly. A derived
+/// field sits one indirection further out (the field value is `(%ref self d)`,
+/// and `d`'s RHS is what names `y1`/`y2`) and may chain (`e = d * 2.0`), so this
+/// version follows a non-draw binding's RHS as well. A draw binding terminates the
+/// walk: its own kernel-input latents are pulled in by [`topo_draw_cone`].
+fn transitive_draw_bindings(m: &Module, root: NodeId) -> Vec<BindingId> {
+    let mut found: Vec<BindingId> = Vec::new();
+    let mut seen: Vec<BindingId> = Vec::new();
+    let mut queue = vec![root];
+    let mut qi = 0;
+    while qi < queue.len() {
+        let id = queue[qi];
+        qi += 1;
+        if let Node::Ref(Ref {
+            ns: RefNs::SelfMod,
+            name,
+        }) = m.node(id)
+        {
+            if let Some(bid) = m.binding_by_name(*name) {
+                if !seen.contains(&bid) {
+                    seen.push(bid);
+                    if draw_argument(m, m.binding(bid).rhs).is_some() {
+                        found.push(bid);
+                    } else {
+                        queue.push(m.binding(bid).rhs);
+                    }
+                }
+            }
+        }
+        m.for_each_child(id, |c| queue.push(c));
+    }
+    found
 }
 
 /// If `value` is `(%ref self name)` pointing at a binding whose RHS is `draw(…)`,
@@ -561,12 +939,16 @@ fn lower_shared_record_sample(
     m: &mut Module,
     fields: &[(Symbol, NodeId)],
     field_bids: &[Option<BindingId>],
+    derived_latents: &[BindingId],
     rng: NodeId,
 ) -> Result<(NodeId, NodeId), RefuseError> {
     // Latents in dependency (topological) order: a latent is sampled after every
     // draw-binding its kernel input references (spec §07: thread one RNG state
-    // sequentially in dependency order).
-    let seeds: Vec<BindingId> = field_bids.iter().flatten().copied().collect();
+    // sequentially in dependency order). The seeds are the fields' own latents plus
+    // those only a DERIVED field reads (`derived_field_latents`), which the field
+    // list may never name; `topo_draw_cone` dedupes the overlap.
+    let mut seeds: Vec<BindingId> = field_bids.iter().flatten().copied().collect();
+    seeds.extend(derived_latents.iter().copied());
     let cone = topo_draw_cone(m, &seeds);
 
     let mut cur = rng;
@@ -577,6 +959,14 @@ fn lower_shared_record_sample(
         // now-sampled value).
         let measure = draw_argument(m, m.binding(bid).rhs)
             .ok_or_else(|| refuse(m.binding(bid).rhs, m, "shared-sample: expected a draw"))?;
+        // Same classification `lower_draw` applies to its own inner measure, so a
+        // shared latent drawing an intractable/deferred measure (or a `pushfwd`)
+        // gets the ACTIONABLE reason rather than the generic "not a constructor"
+        // one below.
+        let (measure_resolved, _) = resolve_ref_one(m, measure);
+        if let Some(err) = classify_drawn_measure(m, measure_resolved) {
+            return Err(err);
+        }
         let (ctor, kernel_input) = split_constructor(m, measure).ok_or_else(|| {
             refuse(
                 measure,
@@ -607,12 +997,15 @@ fn lower_shared_record_sample(
     }
 
     // Assemble the record. A field that references a (now-rewritten) latent keeps
-    // its `(%ref self <latent>)` — the shared sample, read by name. Any other field
-    // (an inline draw, or a ref to a non-draw binding) is sampled inline, threading
-    // the rng after the cone.
+    // its `(%ref self <latent>)` — the shared sample, read by name. So does a
+    // DERIVED field: §13 "Other deterministic expressions pass through unchanged",
+    // and its expression now reads the sampled latents by name, which is exactly
+    // what makes it a deterministic function of the SAME draws rather than a
+    // re-draw. Any other field (an inline draw, or a ref to a non-draw binding) is
+    // sampled inline, threading the rng after the cone.
     let mut out_fields = Vec::with_capacity(fields.len());
     for (&(name, val), &bid_opt) in fields.iter().zip(field_bids) {
-        if bid_opt.is_some() {
+        if bid_opt.is_some() || is_derived_value_field(m, val) {
             out_fields.push((name, val));
         } else {
             let (v, next) = lower_measure_sample(m, val, cur)?;
