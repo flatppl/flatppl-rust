@@ -2328,3 +2328,86 @@ y = A * x + b
         "bare and record spellings of one measure must lower identically:\n{bare}\n---\n{record}"
     );
 }
+
+// `lower_value_law` sits on the measure dispatcher's FALLTHROUGH, so a bare
+// stochastic value serves in ANY measure position, not only as a query's own target.
+// The two tests below pin that composition for `weighted` and `superpose`: neither
+// arm was taught about value laws, both compose with them, and nothing else in the
+// suite would notice if a refactor took the composition away — the combinator tests
+// above all use a primitive constructor as the inner measure.
+//
+// `weighted(w, lawof(y))`: §06 `weighted` gives `log(w) + logdensityof(lawof(y), v)`,
+// where the inner term is `y`'s own draw scored at the query's variate.
+#[test]
+fn weighted_over_a_value_law_lowers_to_log_w_plus_the_value_density() {
+    let src = "\
+y = draw(Normal(mu = 0.0, sigma = 1.0))
+lp = logdensityof(weighted(0.5, lawof(y)), 0.3)";
+    let out = determinize_src(src);
+    let pir = flatppl_flatpir::write(&out);
+    let lp = pir_binding(&pir, "lp");
+    // `(log 0.5)` as a call head, not a bare "log" substring, which
+    // `builtin_logdensityof` would satisfy tautologically.
+    assert!(
+        lp.contains("(add ") && lp.contains("(log 0.5)"),
+        "log(w) added to the inner density:\n{lp}"
+    );
+    assert_eq!(
+        lp.matches("builtin_logdensityof").count(),
+        1,
+        "exactly one inner density — the value law's own draw:\n{lp}"
+    );
+    // The inner density is scored at the QUERY's variate. A value law that pinned its
+    // draw and then scored somewhere else is the failure this rules out.
+    assert!(
+        lp.contains(" 0.3)"),
+        "the inner density is scored at the query's variate:\n{lp}"
+    );
+    assert!(
+        !pir.contains("weighted") && !pir.contains("lawof") && !pir.contains("(draw "),
+        "measure layer gone:\n{pir}"
+    );
+    assert!(
+        flatppl_determinizer::is_flatpdl(&out).is_ok(),
+        "is_flatpdl failed:\n{pir}"
+    );
+}
+
+// `superpose(lawof(y), Normal(...))`: a value law and an ordinary primitive measure
+// mixed in one §06 measure sum. Both mixands are scored at the query's variate and
+// combined with `logsumexp` over a vector, the same shape
+// `superpose_lowers_to_logsumexp_of_densities` requires of two constructors.
+#[test]
+fn superpose_of_a_value_law_and_a_constructor_lowers_to_logsumexp() {
+    let src = "\
+y = draw(Normal(mu = 0.0, sigma = 1.0))
+lp = logdensityof(superpose(lawof(y), Normal(mu = 1.0, sigma = 1.0)), 0.3)";
+    let out = determinize_src(src);
+    let pir = flatppl_flatpir::write(&out);
+    let lp = pir_binding(&pir, "lp");
+    assert!(
+        lp.contains("(logsumexp (%meta ((%array"),
+        "logsumexp must take a single vector (array-typed) argument, not variadic \
+         scalars (§07):\n{lp}"
+    );
+    assert_eq!(
+        lp.matches("builtin_logdensityof").count(),
+        2,
+        "one density per mixand — the value law and the constructor:\n{lp}"
+    );
+    // The mixands keep their OWN parameters. Collapsing both onto one kernel input
+    // would still emit two density terms and still pass `is_flatpdl`, so assert the
+    // two `mu`s separately rather than trusting the term count.
+    assert!(
+        lp.contains("(%field mu 0.0)") && lp.contains("(%field mu 1.0)"),
+        "each mixand keeps its own parameters:\n{lp}"
+    );
+    assert!(
+        !pir.contains("superpose") && !pir.contains("lawof") && !pir.contains("(draw "),
+        "measure layer gone:\n{pir}"
+    );
+    assert!(
+        flatppl_determinizer::is_flatpdl(&out).is_ok(),
+        "is_flatpdl failed:\n{pir}"
+    );
+}
