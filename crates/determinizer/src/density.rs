@@ -59,7 +59,12 @@
 //! - `truncate(M, S)` → `ifelse(in(v, S), density(M, v), neg(inf))` (the `_ in R`
 //!   membership builtin, which infers to a boolean — `elementof` is a set-valued
 //!   parameter declaration, not a membership predicate).
-//! - `pushfwd(bijection(f, f_inv, logvol), M)` → `sub(density(M, f_inv(v)), logvol(f_inv(v)))`
+//! - `pushfwd(bijection(f, f_inv, logvol), M)` → `sub(density(M, f_inv(v)),
+//!   logvol(f_inv(v)))` over a CONTINUOUS base; over a discrete one the volume
+//!   term is dropped (`density(M, f_inv(v))` alone) — a counting-measure density
+//!   has no volume element, §06 "Density convention". Same split for `locscale`.
+//!   A base whose variate proves neither reference measure is **refused**
+//!   ([`reference_measure`]).
 //! - `iid(M, N)` → `Σ_{i<N} density(M, get0(v, i))` — **`N` is the static
 //!   1-D repeat count read from the iid node's own const-evaluated domain
 //!   shape** (`iid_static_size`), so a shape-dependent size (`iid(M,
@@ -2567,7 +2572,10 @@ fn lower_truncate(
 }
 
 /// `logdensityof(pushfwd(bij, M), v)` = `logdensityof(M, f_inv(v)) - logvol(f_inv(v))`
-/// where `bij = bijection(f, f_inv, logvol)`.
+/// where `bij = bijection(f, f_inv, logvol)`, over a base with a LEBESGUE
+/// reference. Over a discrete (counting-reference) base the volume term is
+/// dropped — see [`reference_measure`], which also refuses a base whose variate
+/// proves neither reference.
 ///
 /// The forward map may be given explicitly as a `bijection(f, f_inv, logvol)`
 /// node (directly or via one level of ref), OR — per §06 case 1 — as a known
@@ -2603,6 +2611,15 @@ fn lower_pushfwd(
         return lower_projection_pushfwd(m, m_inner, &fields, v);
     }
 
+    // `M`'s variate domain: what the analytic synthesis dispatches its
+    // scalar/vector forms on, and what §06's density convention reads to decide
+    // whether a volume element applies at all ([`reference_measure`]). An unknown
+    // domain defaults to `%any` — refused by both.
+    let domain = match m.type_of(m_inner) {
+        Some(Type::Measure { domain, .. }) => (**domain).clone(),
+        _ => Type::Any,
+    };
+
     let (f_inv_node, logvol_node) =
         if let Some(bij) = expect_builtin_call(m, bij_resolved, "bijection") {
             if bij.args.len() != 3 {
@@ -2614,19 +2631,13 @@ fn lower_pushfwd(
             }
             (bij.args[1], bij.args[2])
         } else {
-            // Not an explicit bijection: try analytic synthesis (§06 case 1). Pass
-            // `M`'s variate domain (needed for domain-restricted maps like `pow`);
-            // an unknown domain defaults to `%any`, which those maps refuse.
-            let domain = match m.type_of(m_inner) {
-                Some(Type::Measure { domain, .. }) => (**domain).clone(),
-                _ => Type::Any,
-            };
-            // Also thread `M`'s refined SUPPORT (`valueset_of`, e.g. `posreals`
-            // for `Gamma`, `nonnegreals` for `Exponential`): the coarse variate
-            // type is `scalar real` (natural extent `reals`), which would refuse
-            // every positive-support base for `log`/`pow`. `None`/`%unknown`
-            // support falls back to `Unknown` — conservatively refused by the
-            // positivity guard (refuse-don't-mislower), NOT defaulted to positive.
+            // Not an explicit bijection: try analytic synthesis (§06 case 1). Also
+            // thread `M`'s refined SUPPORT (`valueset_of`, e.g. `posreals` for
+            // `Gamma`, `nonnegreals` for `Exponential`): the coarse variate type is
+            // `scalar real` (natural extent `reals`), which would refuse every
+            // positive-support base for `log`/`pow`. `None`/`%unknown` support falls
+            // back to `Unknown` — conservatively refused by the domain guard
+            // (refuse-don't-mislower), NOT defaulted to positive.
             let support = m
                 .valueset_of(m_inner)
                 .cloned()
@@ -2647,9 +2658,74 @@ fn lower_pushfwd(
     let preimage = apply_change_of_variables(m, bij_resolved, f_inv_node, v, "f_inv")?;
     // inner_density = logdensityof(M, preimage)
     let inner_density = lower_measure_density_at(m, m_inner, preimage, origin)?;
-    // logvol_val = logvol(preimage)
-    let logvol_val = apply_change_of_variables(m, bij_resolved, logvol_node, preimage, "logvol")?;
-    Ok(build_call(m, "sub", &[inner_density, logvol_val]))
+    // Decided AFTER the base has lowered, so a base that refuses for its own
+    // reason reports that reason rather than this one.
+    match reference_measure(&domain).ok_or_else(|| refuse_unproven_reference(node, m))? {
+        // Counting reference: no volume element (§06 "Density convention"). The
+        // pushforward density IS the base's pmf at the preimage.
+        Reference::Counting => Ok(inner_density),
+        // logvol_val = logvol(preimage)
+        Reference::Lebesgue => {
+            let logvol_val =
+                apply_change_of_variables(m, bij_resolved, logvol_node, preimage, "logvol")?;
+            Ok(build_call(m, "sub", &[inner_density, logvol_val]))
+        }
+    }
+}
+
+/// The reference measure a base measure's density is taken with respect to, which
+/// decides whether a pushforward carries a volume element at all. §06 "Density
+/// convention": "All density formulas in this section are with respect to a
+/// reference measure implied by the constituent distribution types: Lebesgue for
+/// continuous variates, counting measure for discrete variates."
+enum Reference {
+    /// Continuous variate — Lebesgue reference; the §06 change of variables
+    /// subtracts `logvol(f_inv(v))`.
+    Lebesgue,
+    /// Discrete variate — counting reference. A counting-measure density has NO
+    /// volume element, so an injective `f` gives `(f_*M)({y}) = M({f⁻¹(y)})` —
+    /// §06's `(f_*M)(Y) = M(f⁻¹(Y))` at a singleton — i.e. the base's pmf at the
+    /// preimage, unscaled. Subtracting a `logvol` there rescales every atom and
+    /// the result is not a probability measure: `pushfwd(exp, Poisson(3))` would
+    /// total `exp(−3 + 3/e) ≈ 0.150`, `locscale(Poisson(3), 1, 2)` exactly ½.
+    Counting,
+}
+
+/// §06's reference measure for a base measure whose VARIATE type is `variate` —
+/// the slot §06's density convention keys on, declared per distribution in the
+/// infer catalogue (`Poisson`: `domain: Scalar(Integer)`, `Normal`:
+/// `Scalar(Real)`).
+///
+/// `None` where the variate does not prove one reference or the other, and the
+/// caller then refuses: `%any`/`%deferred` (an inference gap — e.g. a base that
+/// is itself a `pushfwd`, whose codomain this pass does not track), and a
+/// record/tuple variate, whose components may mix the two references (§06
+/// "Reference measure for product measures" gives such a joint the product
+/// reference `Lebesgue ⊗ Counting`, over which a single volume element is not the
+/// change of variables).
+fn reference_measure(variate: &Type) -> Option<Reference> {
+    match variate {
+        Type::Scalar(ScalarType::Real | ScalarType::Complex) => Some(Reference::Lebesgue),
+        Type::Scalar(ScalarType::Integer | ScalarType::Boolean) => Some(Reference::Counting),
+        // A homogeneous product shares its cells' reference measure.
+        Type::Array { elem, .. } => reference_measure(elem),
+        Type::TVector { elem, .. } => reference_measure(elem),
+        _ => None,
+    }
+}
+
+/// The refusal for a base measure whose reference measure is not proven — shared
+/// by the `pushfwd` and `locscale` change-of-variables tails, which must not
+/// guess it. See [`reference_measure`].
+fn refuse_unproven_reference(node: NodeId, m: &Module) -> RefuseError {
+    refuse(
+        node,
+        m,
+        "the base measure's variate does not prove its reference measure (§06 \"Density \
+         convention\": Lebesgue for a continuous variate, counting for a discrete one), so \
+         whether the change of variables carries a volume element is undecided — refuse rather \
+         than guess continuous and rescale a discrete measure's atoms",
+    )
 }
 
 /// Apply a change-of-variables callable (`f_inv` or `logvol`) at `point`, requiring
@@ -2713,7 +2789,8 @@ fn apply_change_of_variables(
 /// ([`crate::invert::derive_locscale`], which reuses the same scalar / matrix-
 /// affine emission as [`lower_pushfwd`]'s synthesis path) and apply the §06
 /// change-of-variables formula `logdensityof(m, f_inv(v)) − logvol(f_inv(v))` —
-/// structurally identical to [`lower_pushfwd`]'s tail.
+/// structurally identical to [`lower_pushfwd`]'s tail, including its
+/// [`reference_measure`] split (no volume term over a discrete base).
 fn lower_locscale(
     m: &mut Module,
     node: NodeId,
@@ -2745,8 +2822,16 @@ fn lower_locscale(
     // tail — this shares that tail's shape, so it shares its residual-`%call` risk.
     let preimage = apply_change_of_variables(m, node, bij.f_inv, v, "f_inv")?;
     let inner_density = lower_measure_density_at(m, m_inner, preimage, origin)?;
-    let logvol_val = apply_change_of_variables(m, node, bij.logvol, preimage, "logvol")?;
-    Ok(build_call(m, "sub", &[inner_density, logvol_val]))
+    match reference_measure(&domain).ok_or_else(|| refuse_unproven_reference(node, m))? {
+        // Counting reference: no volume element (§06 "Density convention"). An
+        // affine map over a discrete base relabels its atoms and preserves their
+        // mass; `log|scale|` would rescale it. See [`reference_measure`].
+        Reference::Counting => Ok(inner_density),
+        Reference::Lebesgue => {
+            let logvol_val = apply_change_of_variables(m, node, bij.logvol, preimage, "logvol")?;
+            Ok(build_call(m, "sub", &[inner_density, logvol_val]))
+        }
+    }
 }
 
 /// Recognise a **pure structural-projection** forward function
