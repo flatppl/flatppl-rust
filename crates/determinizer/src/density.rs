@@ -242,7 +242,7 @@ fn lower_density_core(
     // queried value's OWN variate here, which is what licenses `lower_value_law`
     // to pin it back onto the binding.
     let measure_expr = measure_of_arg(m, arg1)?;
-    lower_measure_density_at_query(m, measure_expr, arg2)
+    lower_measure_density_at_point(m, measure_expr, arg2)
 }
 
 /// True iff `id` infers to a `Likelihood` type.
@@ -682,7 +682,7 @@ fn lower_likelihood_query(
     // the θ field names. A same-module `k` is returned unchanged.
     let k = resolve_cross_module_kernel(m, bundle, k)?;
     let theta_map = theta_field_map(m, theta)?;
-    let density = lower_measure_density(m, k, obs)?;
+    let density = lower_measure_density_at_point(m, k, obs)?;
     // Refuse-don't-mislower: a θ param captured as a `functionof` / `kernelof`
     // reification *input* (a `(name, %ref self <name>)` boundary entry) cannot be
     // reached by the `substitute_refs_by_name` inliner below — `map_tree` walks
@@ -958,55 +958,65 @@ fn subtree_has_theta_capturing_input(m: &Module, root: NodeId, map: &[(Symbol, N
 // Core recursive dispatcher
 // ---------------------------------------------------------------------------
 
-/// Where in a query a measure sits: is it the thing the query names, or a
-/// sub-measure some combinator holds?
+/// Does the query's explicit point determine the variate `v` of the measure being
+/// lowered?
 ///
-/// Only [`lower_value_law`] reads this, and only to decide whether pinning the
-/// scored value back onto its binding is sound. `v` is the variate of THIS
-/// measure, but a nested measure's variate is not the value whose law reached it:
-/// for `y = draw(truncate(lawof(z), S))` the `lawof(z)` sub-measure is scored at
-/// `y`'s variate, so pinning `z` to it would assert a value for a draw the query
-/// never mentioned. At the query's own measure the two coincide, and the pin is
-/// what lets the driver sweep the now-unreferenced `draw`.
+/// §13 "Determinization" fixes the convention this encodes: "`draw` nodes take
+/// their values from the explicit `point`, unless marginalized out." So when the
+/// point determines a draw's value — directly, or through an invertible transform —
+/// pinning that draw is spec-mandated, and a downstream `w = y + 1.0` correctly
+/// evaluates at the query point. When it does not, pinning fabricates a value for a
+/// draw the query never mentioned: for `y = draw(truncate(lawof(z), S))` the
+/// `lawof(z)` sub-measure is scored at `y`'s point, but `z` is an INDEPENDENT draw
+/// and that number was never `z`'s value.
+///
+/// Only [`lower_value_law`] reads this, and only to decide whether to pin.
+/// Variate-preserving positions propagate it (a `lawof` unwrap, `truncate`'s base,
+/// a `joint` field, a `likelihoodof` kernel, a reified body, a pushforward's
+/// invertible preimage); a record field resets it, since a record field's measure
+/// describes the FIELD's draw and any `lawof` inside it names some third value.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum MeasurePosition {
-    /// The measure the query itself names — `v` is this value's own variate.
-    Query,
-    /// A sub-measure reached through a combinator, a record field, a `bayesupdate`
-    /// prior, a reified body … — `v` belongs to the enclosing measure.
-    Nested,
+enum VariateOrigin {
+    /// `v` is this measure's own variate, supplied by the query point.
+    Point,
+    /// `v` belongs to some other value; this measure's draw is independent of it.
+    Other,
 }
 
 /// Compute the log-density of `measure_expr` at `v`, returning a deterministic node.
 /// `measure_expr` may be a record-of-draws, a combinator, a `(%ref self x)` pointing
 /// to one of those, or a bare primitive constructor.
 ///
-/// Entry point for a measure in NESTED position. The measure a query itself names
-/// goes through [`lower_measure_density_at_query`] instead; see
-/// [`MeasurePosition`] for what turns on the difference.
+/// Entry point for a measure whose variate the query point does NOT determine.
+/// A measure the point does determine goes through
+/// [`lower_measure_density_at_point`]; see [`VariateOrigin`].
 pub(crate) fn lower_measure_density(
     m: &mut Module,
     measure_expr: NodeId,
     v: NodeId,
 ) -> Result<NodeId, RefuseError> {
-    lower_measure_density_at(m, measure_expr, v, MeasurePosition::Nested)
+    lower_measure_density_at(m, measure_expr, v, VariateOrigin::Other)
 }
 
-/// [`lower_measure_density`] for the measure a `logdensityof` / `densityof` query
-/// names directly — the one position where `v` is the scored value's own variate.
-pub(crate) fn lower_measure_density_at_query(
+/// [`lower_measure_density`] for a measure whose variate IS the query point —
+/// the query's own measure, and every variate-preserving position under it.
+pub(crate) fn lower_measure_density_at_point(
     m: &mut Module,
     measure_expr: NodeId,
     v: NodeId,
 ) -> Result<NodeId, RefuseError> {
-    lower_measure_density_at(m, measure_expr, v, MeasurePosition::Query)
+    lower_measure_density_at(m, measure_expr, v, VariateOrigin::Point)
 }
 
+/// The dispatcher proper. A variate-PRESERVING position calls this directly,
+/// passing its own caller's `origin` through unchanged, so the point's reach is
+/// neither lost nor invented; every other position goes through
+/// [`lower_measure_density`].
 fn lower_measure_density_at(
     m: &mut Module,
     measure_expr: NodeId,
     v: NodeId,
-    position: MeasurePosition,
+    origin: VariateOrigin,
 ) -> Result<NodeId, RefuseError> {
     // Resolve a single level of `(%ref self x)` indirection on the measure side.
     let (measure_node, _binding_opt) = resolve_ref_one(m, measure_expr);
@@ -1015,7 +1025,7 @@ fn lower_measure_density_at(
     // is not a builtin-named op; β-reduce it to its measure body and recurse.
     // β-reduction does not move the measure, so the position carries over.
     if let Some(reduced) = crate::kernel::reduce_kernel_application(m, measure_node) {
-        return lower_measure_density_at(m, reduced, v, position);
+        return lower_measure_density_at(m, reduced, v, origin);
     }
 
     // Dispatch on the measure op.
@@ -1031,26 +1041,26 @@ fn lower_measure_density_at(
         // already-stripped `lawof` never re-enters this arm, since the entry
         // point's strip means `measure_node` is `M` itself by the time it's
         // dispatched, so there's no double count.
-        Some("lawof") => lower_lawof(m, measure_node, v),
+        Some("lawof") => lower_lawof(m, measure_node, v, origin),
         Some("weighted") => lower_weighted(m, measure_node, v),
         Some("logweighted") => lower_logweighted(m, measure_node, v),
         Some("superpose") => lower_superpose(m, measure_node, v),
         Some("normalize") => lower_normalize(m, measure_node, v),
-        Some("truncate") => lower_truncate(m, measure_node, v),
-        Some("pushfwd") => lower_pushfwd(m, measure_node, v),
+        Some("truncate") => lower_truncate(m, measure_node, v, origin),
+        Some("pushfwd") => lower_pushfwd(m, measure_node, v, origin),
         // kchain marginal: discrete-finite latent → mass-weighted logsumexp;
         // continuous / infinite-discrete / non-enumerable → refuse (Task 5).
         Some("kchain") => crate::marginal::lower_kchain_marginal(m, measure_node, v),
         Some("jointchain") => crate::jointchain::lower_jointchain(m, measure_node, v),
         Some("iid") => lower_iid(m, measure_node, v),
         Some("broadcast") => lower_broadcast_kernel(m, measure_node, v),
-        Some("joint") => lower_joint(m, measure_node, v),
+        Some("joint") => lower_joint(m, measure_node, v, origin),
         // A reified measure (`functionof` / `kernelof`) used AS a measure — its
         // body is the measure expression it reifies. Unwrap to the body and recurse
         // so a `broadcast(K, params)` body reaches the broadcast-kernel arm and a
         // bare constructor body reaches `build_density_term` (histfactory's
         // `functionof(Poisson.(expected))` scored via `likelihoodof`).
-        Some("functionof") | Some("kernelof") => lower_reified_measure(m, measure_node, v),
+        Some("functionof") | Some("kernelof") => lower_reified_measure(m, measure_node, v, origin),
         // Refused combinators — refused here rather than mis-lowered.
         // `likelihoodof` / `joint_likelihood` / `bayesupdate` are normally
         // intercepted at the `logdensityof` entry (where the `bundle` needed to
@@ -1066,7 +1076,7 @@ fn lower_measure_density_at(
         // `locscale(m, shift, scale)` = `pushfwd(x -> scale * x + shift, m)`
         // (§06 line 369/402): the affine change-of-variables, reusing the same
         // scalar / matrix-affine synthesis as `pushfwd` (Task 5).
-        Some("locscale") => lower_locscale(m, measure_node, v),
+        Some("locscale") => lower_locscale(m, measure_node, v, origin),
         Some("markovchain")
         | Some("kscan")
         | Some("bayesupdate")
@@ -1102,7 +1112,7 @@ fn lower_measure_density_at(
             Ok(term) => Ok(term),
             // `measure_expr`, NOT the ref-resolved `measure_node`: the value law
             // pins the binding its value came from, which the resolution discards.
-            Err(not_a_constructor) => match lower_value_law(m, measure_expr, v, position) {
+            Err(not_a_constructor) => match lower_value_law(m, measure_expr, v, origin) {
                 Some(scored) => scored,
                 None => Err(not_a_constructor),
             },
@@ -1118,7 +1128,12 @@ fn lower_measure_density_at(
 /// exactly the shape that arm already scores).
 ///
 /// A `lawof` with anything but exactly one argument refuses (refuse-don't-mislower).
-fn lower_lawof(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseError> {
+fn lower_lawof(
+    m: &mut Module,
+    node: NodeId,
+    v: NodeId,
+    origin: VariateOrigin,
+) -> Result<NodeId, RefuseError> {
     let arg = {
         let c = expect_builtin_call(m, node, "lawof")
             .ok_or_else(|| refuse(node, m, "expected lawof"))?;
@@ -1127,7 +1142,45 @@ fn lower_lawof(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Refuse
         }
         c.args[0]
     };
-    lower_measure_density(m, arg, v)
+    refuse_stochastic_measure_law(m, arg)?;
+    lower_measure_density_at(m, arg, v, origin)
+}
+
+/// Refuse `lawof(<measure expression>)` whose measure is parameterized by a draw —
+/// `lawof(Normal(mu = a, sigma = 1))` with `a` latent, whose total law is the
+/// marginal `N(0, √2)`, not `N(a, 1)` at whatever value `a` later takes.
+///
+/// This is the measure-expression half of the marginalization guard;
+/// [`lower_value_law`] covers the half where `lawof`'s argument is a VALUE. Both
+/// are needed, and neither subsumes the other: a measure argument is unwrapped and
+/// scored by `build_density_term`, which succeeds, so `lower_value_law` is never
+/// entered and its guard never runs. Called from both places a `lawof` is stripped —
+/// here, and [`measure_of_arg`] at the query entry, which strips the top-level one
+/// before the dispatcher ever sees it.
+///
+/// **The discriminator is value-versus-measure-expression, and it has to be.**
+/// Running [`measure_reaches_draw`] on a VALUE argument would report every
+/// `lawof(z)` over a `~`-bound draw as stochastic and refuse the §06 stochastic-node
+/// form outright. Only a `Type::Measure` argument is checked, which is also why the
+/// record path is untouched: `lawof(record(z = z, y = y))`'s argument is a Record,
+/// so a dependent component `Normal(mu = z, …)` stays the chain-rule product it is.
+/// An argument whose type inference did not resolve is left alone rather than
+/// refused on a guess (the driver re-infers each iteration, so a real measure
+/// expression carries its type by the time this runs).
+fn refuse_stochastic_measure_law(m: &Module, arg: NodeId) -> Result<(), RefuseError> {
+    let (resolved, _) = resolve_ref_one(m, arg);
+    let is_measure_expr = matches!(m.type_of(arg), Some(Type::Measure { .. }))
+        || matches!(m.type_of(resolved), Some(Type::Measure { .. }));
+    if is_measure_expr && measure_reaches_draw(m, resolved) {
+        return Err(refuse(
+            resolved,
+            m,
+            "lawof of a measure parameterized by a draw is that value's MARGINAL law \
+             (§04: lawof reifies the TOTAL law), which is a kchain marginal — refuse rather \
+             than score the conditional at a pinned latent",
+        ));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1599,7 +1652,7 @@ fn lower_value_law(
     m: &mut Module,
     value: NodeId,
     v: NodeId,
-    position: MeasurePosition,
+    origin: VariateOrigin,
 ) -> Option<Result<NodeId, RefuseError>> {
     let (measure, binding, transform, draw_site) = resolve_component_draw(m, value)?;
     if measure_reaches_draw(m, measure) {
@@ -1614,12 +1667,28 @@ fn lower_value_law(
     let law = match transform {
         None => measure,
         Some(call) => {
+            // A transform whose own type inference did not resolve is not a value
+            // map this path can read — `mixture(record(w = …, m = lawof(z)))` is an
+            // unimplemented MEASURE op left `%deferred`, and synthesizing a forward
+            // map for it sends it to `crate::invert`, which then reports "no
+            // analytic inverse". True of the inverse, but the wrong diagnosis: the
+            // op has no type rule, so nothing here knows it is a map at all. Say
+            // that instead. (`Failed` is inference's own error; leave it to speak.)
+            if matches!(m.type_of(call), Some(Type::Deferred) | None) {
+                return Some(Err(refuse(
+                    call,
+                    m,
+                    "this value's law is a transform whose op has no type rule yet, so it \
+                     cannot be read as either a map of the draw or a measure over it — \
+                     refuse rather than mislower",
+                )));
+            }
             let fwd = build_forward_map(m, call, draw_site);
             build_call(m, "pushfwd", &[fwd, measure])
         }
     };
     let scored = lower_measure_density(m, law, v);
-    if scored.is_ok() && position == MeasurePosition::Query {
+    if scored.is_ok() && origin == VariateOrigin::Point {
         if let Some(bid) = binding {
             m.set_binding_rhs(bid, v);
         }
@@ -2454,7 +2523,12 @@ fn build_touniform(m: &mut Module, kernel: NodeId, input: NodeId, x: NodeId) -> 
 /// is a *set-valued parameter declaration* (`elementof(R)`), not a 2-arg
 /// membership predicate, so it must not be used here (a 2-arg `elementof` infers
 /// to `%deferred`, an ill-typed `ifelse` condition).
-fn lower_truncate(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseError> {
+fn lower_truncate(
+    m: &mut Module,
+    node: NodeId,
+    v: NodeId,
+    origin: VariateOrigin,
+) -> Result<NodeId, RefuseError> {
     let (m_inner, s_node) = {
         let c = expect_builtin_call(m, node, "truncate")
             .ok_or_else(|| refuse(node, m, "expected truncate"))?;
@@ -2464,7 +2538,7 @@ fn lower_truncate(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Ref
         (c.args[0], c.args[1])
     };
 
-    let inner_density = lower_measure_density(m, m_inner, v)?;
+    let inner_density = lower_measure_density_at(m, m_inner, v, origin)?;
     let gate = build_call(m, "in", &[v, s_node]);
     let inf_sym = m.intern("inf");
     let inf_node = m.alloc(Node::Const(inf_sym));
@@ -2480,7 +2554,12 @@ fn lower_truncate(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Ref
 /// invertible builtin (`pushfwd(exp, M)`, `pushfwd(x -> exp(x), M)`), for which
 /// `(f_inv, logvol)` is synthesised analytically by [`crate::invert`]. Anything
 /// else refuses.
-fn lower_pushfwd(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseError> {
+fn lower_pushfwd(
+    m: &mut Module,
+    node: NodeId,
+    v: NodeId,
+    origin: VariateOrigin,
+) -> Result<NodeId, RefuseError> {
     let (bij_node, m_inner) = {
         let c = expect_builtin_call(m, node, "pushfwd")
             .ok_or_else(|| refuse(node, m, "expected pushfwd"))?;
@@ -2547,7 +2626,7 @@ fn lower_pushfwd(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Refu
     // preimage = f_inv(v)
     let preimage = build_user_call(m, f_inv_node, v);
     // inner_density = logdensityof(M, preimage)
-    let inner_density = lower_measure_density(m, m_inner, preimage)?;
+    let inner_density = lower_measure_density_at(m, m_inner, preimage, origin)?;
     // logvol_val = logvol(preimage)
     let logvol_val = build_user_call(m, logvol_node, preimage);
     Ok(build_call(m, "sub", &[inner_density, logvol_val]))
@@ -2560,7 +2639,12 @@ fn lower_pushfwd(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Refu
 /// affine emission as [`lower_pushfwd`]'s synthesis path) and apply the §06
 /// change-of-variables formula `logdensityof(m, f_inv(v)) − logvol(f_inv(v))` —
 /// structurally identical to [`lower_pushfwd`]'s tail.
-fn lower_locscale(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseError> {
+fn lower_locscale(
+    m: &mut Module,
+    node: NodeId,
+    v: NodeId,
+    origin: VariateOrigin,
+) -> Result<NodeId, RefuseError> {
     let (m_inner, shift, scale) = {
         let c = expect_builtin_call(m, node, "locscale")
             .ok_or_else(|| refuse(node, m, "expected locscale"))?;
@@ -2583,7 +2667,7 @@ fn lower_locscale(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Ref
     let bij = crate::invert::derive_locscale(m, shift, scale, &domain)?;
     // §06 change-of-variables: logdensityof(m, f_inv(v)) − logvol(f_inv(v)).
     let preimage = build_user_call(m, bij.f_inv, v);
-    let inner_density = lower_measure_density(m, m_inner, preimage)?;
+    let inner_density = lower_measure_density_at(m, m_inner, preimage, origin)?;
     let logvol_val = build_user_call(m, bij.logvol, preimage);
     Ok(build_call(m, "sub", &[inner_density, logvol_val]))
 }
@@ -3724,7 +3808,12 @@ fn emit_kernel_broadcast_density(
 /// [`lower_keyword_joint`] for the record form. A call with BOTH populated
 /// (mixing positional and keyword components) is neither form — refused,
 /// rather than guessing which one was meant.
-fn lower_joint(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseError> {
+fn lower_joint(
+    m: &mut Module,
+    node: NodeId,
+    v: NodeId,
+    origin: VariateOrigin,
+) -> Result<NodeId, RefuseError> {
     let (positional, named): (Vec<NodeId>, Vec<NamedArg>) = {
         let c = expect_builtin_call(m, node, "joint")
             .ok_or_else(|| refuse(node, m, "expected joint"))?;
@@ -3741,7 +3830,7 @@ fn lower_joint(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Refuse
     }
 
     if !named.is_empty() {
-        return lower_keyword_joint(m, node, &named, v);
+        return lower_keyword_joint(m, node, &named, v, origin);
     }
 
     let inner = positional;
@@ -3824,6 +3913,7 @@ fn lower_keyword_joint(
     node: NodeId,
     named: &[NamedArg],
     v: NodeId,
+    origin: VariateOrigin,
 ) -> Result<NodeId, RefuseError> {
     for n in named {
         if n.kind != NamedKind::Field {
@@ -3862,7 +3952,7 @@ fn lower_keyword_joint(
                 ),
             )
         })?;
-        terms.push(lower_measure_density(m, field.value, pinned)?);
+        terms.push(lower_measure_density_at(m, field.value, pinned, origin)?);
     }
     Ok(fold_add(m, &terms))
 }
@@ -3889,7 +3979,12 @@ fn lower_keyword_joint(
 /// once the wrapper is unwrapped the [`subtree_has_theta_capturing_input`] guard
 /// (which scans for a SURVIVING reification's inputs) no longer sees the boundary.
 /// Rather than emit a density with a dangling placeholder, we REFUSE.
-fn lower_reified_measure(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseError> {
+fn lower_reified_measure(
+    m: &mut Module,
+    node: NodeId,
+    v: NodeId,
+    origin: VariateOrigin,
+) -> Result<NodeId, RefuseError> {
     let body = {
         let Node::Call(c) = m.node(node) else {
             return Err(refuse(node, m, "expected functionof/kernelof"));
@@ -3918,7 +4013,7 @@ fn lower_reified_measure(m: &mut Module, node: NodeId, v: NodeId) -> Result<Node
         }
         c.args[0]
     };
-    lower_measure_density(m, body, v)
+    lower_measure_density_at(m, body, v, origin)
 }
 
 // ---------------------------------------------------------------------------
@@ -4179,6 +4274,11 @@ fn measure_of_arg(m: &Module, measure_arg: NodeId) -> Result<NodeId, RefuseError
         if law.args.len() != 1 {
             return Err(refuse(resolved, m, "lawof expects 1 arg"));
         }
+        // This strip bypasses the dispatcher's `"lawof"` arm entirely, so the
+        // marginalization guard has to run here too — `logdensityof(lawof(Normal(mu
+        // = a, …)), 0.5)` with `a` latent reaches `build_density_term` directly and
+        // would otherwise score the conditional.
+        refuse_stochastic_measure_law(m, law.args[0])?;
         return Ok(law.args[0]);
     }
     Ok(measure_arg)

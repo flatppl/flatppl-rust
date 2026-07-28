@@ -1857,7 +1857,8 @@ lp = logdensityof(lawof(d), 0.25)";
 // scores with `z` pinned, but it also satisfies the value law's shape test (it
 // reaches exactly one draw, `z`'s), so a reversed order would hand it to
 // `pushfwd` as the map `x -> Normal(mu = x, sigma = 1.0)` — which refuses in
-// `crate::invert`, since a capitalized constructor head is in no inverse grammar.
+// `crate::invert`, since `Normal` appears in neither its unary-bijection registry
+// nor its affine grammar (capitalization is correlated convention, not the reason).
 // The cost of losing the order is therefore that every dependent product stops
 // lowering; this asserts it still does, with `z` pinned into the second term.
 #[test]
@@ -2091,5 +2092,186 @@ lp = logdensityof(lawof(record(y = y)), record(y = 0.3))";
     assert!(
         pir.contains("(ifelse") && !pir.contains("lawof"),
         "the truncated law still lowers:\n{pir}"
+    );
+}
+
+// C1: the marginalization guard has a measure-expression half, and it is NOT
+// reachable from `lower_value_law`. When `lawof`'s argument is a MEASURE rather
+// than a value, the `lawof` is simply stripped and `build_density_term` scores the
+// constructor — so `lawof(Normal(mu = a, sigma = 1))` with `a` latent emitted the
+// conditional `N(a, 1)` at whatever value a later query pinned `a` to, where §04's
+// total law is the marginal `N(0, √2)`. Verified against Distributions.jl: the
+// emitted number was -1.4989385332046727 (`logpdf(Normal(0.1, 1), exp(0.5))`) and
+// the marginal is -1.8280121234846454 (`logpdf(Normal(0, √2), exp(0.5))`) — wrong
+// by 0.329 nats, conformance-passing, and precisely the later-query ordering the
+// value-side guard exists to stop.
+//
+// Both places a `lawof` is stripped must check: the dispatcher's arm, and
+// `measure_of_arg` at the query entry (which is why the third case here, a DIRECT
+// query on such a law, is included — it bypasses the dispatcher entirely and was
+// wrong before the value-side guard existed too).
+#[test]
+fn lawof_of_a_draw_parameterized_measure_refuses() {
+    for src in [
+        // Through the dispatcher: a pushforward whose base is the stochastic law.
+        "\
+a = draw(Normal(mu = 0.0, sigma = 1.0))
+y = draw(pushfwd(exp, lawof(Normal(mu = a, sigma = 1.0))))
+lp_y = logdensityof(lawof(y), 1.6487212707001282)
+lp_a = logdensityof(lawof(a), 0.1)",
+        // Same, through `truncate`.
+        "\
+a = draw(Normal(mu = 0.0, sigma = 1.0))
+y = draw(truncate(lawof(Normal(mu = a, sigma = 1.0)), interval(0.0, inf)))
+lp_y = logdensityof(lawof(y), 0.3)
+lp_a = logdensityof(lawof(a), 0.1)",
+        // Named, so the check cannot depend on the argument being inline.
+        "\
+a = draw(Normal(mu = 0.0, sigma = 1.0))
+ml = lawof(Normal(mu = a, sigma = 1.0))
+y = draw(pushfwd(exp, ml))
+lp_y = logdensityof(lawof(y), 1.6487212707001282)
+lp_a = logdensityof(lawof(a), 0.1)",
+        // Direct query on the stochastic law — strips at `measure_of_arg`, never
+        // reaching the dispatcher's `lawof` arm.
+        "\
+a = draw(Normal(mu = 0.0, sigma = 1.0))
+lp_m = logdensityof(lawof(Normal(mu = a, sigma = 1.0)), 0.5)
+lp_a = logdensityof(lawof(a), 0.1)",
+    ] {
+        let mut m = flatppl_syntax::parse(src).unwrap();
+        let _ = flatppl_infer::infer(&mut m);
+        let err = determinize(&m).expect_err(
+            "the law of a draw-parameterized measure is a marginal — refuse, do not \
+             score the conditional",
+        );
+        assert!(
+            err.reason.contains("MARGINAL law"),
+            "must refuse as a marginal: {}",
+            err.reason
+        );
+    }
+
+    // Control: a measure argument whose parameters are FIXED is not stochastic, and
+    // `lawof(lawof(z))` / `lawof(truncate(lawof(z), …))` are deterministic measures
+    // built from another law — none of these may be caught.
+    for src in [
+        "\
+p = elementof(reals)
+lp = logdensityof(lawof(Normal(mu = p, sigma = 1.0)), 0.5)",
+        "\
+z = draw(Normal(mu = 0.0, sigma = 1.0))
+lp = logdensityof(lawof(lawof(z)), 0.3)",
+        "\
+z = draw(Normal(mu = 0.0, sigma = 1.0))
+lp = logdensityof(lawof(truncate(lawof(z), interval(0.0, inf))), 0.3)",
+    ] {
+        let pir = flatppl_flatpir::write(&determinize_src(src));
+        assert!(
+            pir.contains("builtin_logdensityof"),
+            "a deterministic measure's law must still lower:\n{pir}"
+        );
+    }
+}
+
+// §13 "Determinization": "`draw` nodes take their values from the explicit `point`,
+// unless marginalized out." So wherever the point determines a draw's value —
+// directly, or through an invertible transform — the draw must be PINNED, and a
+// downstream consumer evaluates at the query point. Confining the pin to the
+// query's own measure was too narrow: every position below preserves the variate,
+// so the point reaches the draw, yet each refused with the uninformative
+// `refuse draw … no determinization rule` once a live consumer kept the draw alive.
+//
+// The boundary is recorded in BOTH directions on purpose. The next contributor who
+// sees `joint(a = lawof(y))` refusing must not widen the pin to record fields as
+// well — `a_nested_value_law_does_not_pin_the_enclosing_variate` is the other side,
+// and a record field's measure describes the FIELD's draw, so a `lawof` inside it
+// names a third value the point says nothing about.
+#[test]
+fn variate_preserving_positions_pin_the_draw_from_the_point() {
+    for (src, expect) in [
+        // `joint` field: `v.a` is the field measure's own variate.
+        (
+            "\
+y = draw(Normal(mu = 0.0, sigma = 1.0))
+w = y + 1.0
+lp = logdensityof(joint(a = lawof(y)), record(a = 0.3))",
+            "(%bind w 1.3)",
+        ),
+        // `truncate`'s base is scored at the same point.
+        (
+            "\
+y = draw(Normal(mu = 0.0, sigma = 1.0))
+w = y + 1.0
+lp = logdensityof(truncate(lawof(y), interval(0.0, inf)), 0.3)",
+            "(%bind w 1.3)",
+        ),
+        // `lawof(lawof(y))` — the unwrap must carry the point through.
+        (
+            "\
+y = draw(Normal(mu = 0.0, sigma = 1.0))
+w = y + 1.0
+lp = logdensityof(lawof(lawof(y)), 0.3)",
+            "(%bind w 1.3)",
+        ),
+        // A reified body.
+        (
+            "\
+y = draw(Normal(mu = 0.0, sigma = 1.0))
+w = y + 1.0
+lp = logdensityof(functionof(lawof(y)), 0.3)",
+            "(%bind w 1.3)",
+        ),
+        // A `likelihoodof` kernel, scored at the baked observation.
+        (
+            "\
+mu = elementof(reals)
+y = draw(Normal(mu = 0.0, sigma = 1.0))
+w = y + 1.0
+L = likelihoodof(lawof(y), 0.3)
+lp = logdensityof(L, record(mu = 2.0))",
+            "(%bind w 1.3)",
+        ),
+    ] {
+        let pir = flatppl_flatpir::write(&determinize_src(src));
+        assert!(
+            pir.contains(expect),
+            "§13: the point determines this draw, so `w` evaluates at it — expected \
+             `{expect}`:\n{pir}"
+        );
+        assert!(!pir.contains("(draw "), "no draw survives:\n{pir}");
+    }
+
+    // A pushforward's preimage is "through an invertible transform", so the draw is
+    // determined too — here `y = log(exp(0.5)) = 0.5`, not swept to a placeholder.
+    let pir = flatppl_flatpir::write(&determinize_src(
+        "\
+y = draw(Normal(mu = 0.0, sigma = 1.0))
+w = y + 1.0
+lp = logdensityof(pushfwd(exp, lawof(y)), 1.6487212707001282)",
+    ));
+    assert!(
+        pir.contains("(%bind y (%meta") && pir.contains("(log 1.6487212707001282)"),
+        "y takes the invertible preimage of the point:\n{pir}"
+    );
+}
+
+// An op with no type rule is not a value map, and must not be reported as one. The
+// value-law path used to hand `mixture(record(w = 0.5, m = lawof(z)))` — an
+// unimplemented MEASURE combinator left `%deferred` — to `crate::invert`, which
+// answered "no analytic inverse": true of the inverse, wrong about the problem.
+#[test]
+fn a_deferred_transform_refuses_as_untyped_not_as_non_invertible() {
+    let src = "\
+z = draw(Normal(mu = 0.0, sigma = 1.0))
+y = draw(mixture(record(w = 0.5, m = lawof(z))))
+lp = logdensityof(lawof(y), 0.3)";
+    let mut m = flatppl_syntax::parse(src).unwrap();
+    let _ = flatppl_infer::infer(&mut m);
+    let err = determinize(&m).expect_err("an op with no type rule must refuse");
+    assert!(
+        err.reason.contains("no type rule"),
+        "the diagnosis must be the missing type rule, not a missing inverse: {}",
+        err.reason
     );
 }
