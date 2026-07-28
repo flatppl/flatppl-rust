@@ -2644,12 +2644,67 @@ fn lower_pushfwd(
         };
 
     // preimage = f_inv(v)
-    let preimage = build_user_call(m, f_inv_node, v);
+    let preimage = apply_change_of_variables(m, bij_resolved, f_inv_node, v, "f_inv")?;
     // inner_density = logdensityof(M, preimage)
     let inner_density = lower_measure_density_at(m, m_inner, preimage, origin)?;
     // logvol_val = logvol(preimage)
-    let logvol_val = build_user_call(m, logvol_node, preimage);
+    let logvol_val = apply_change_of_variables(m, bij_resolved, logvol_node, preimage, "logvol")?;
     Ok(build_call(m, "sub", &[inner_density, logvol_val]))
+}
+
+/// Apply a change-of-variables callable (`f_inv` or `logvol`) at `point`, requiring
+/// the application to actually resolve to FlatPDL. The density-side counterpart of
+/// the check [`crate::sample::lower_pushfwd_sample`] performs on its FORWARD
+/// application, and it exists for the same reason.
+///
+/// [`build_user_call`] emits `(%call callee point)`, and a `CallHead::User` that
+/// survives to exit is neither a deterministic op nor a `builtin_*` primitive, so it
+/// is not FlatPDL — while `is_flatpdl` is phase/type-based and does not flag the
+/// shape (`canon::inline`'s module header records exactly this blind spot). Two
+/// forms resolve, and this admits exactly those two:
+///
+/// * a **bare builtin** callee — directly a [`Node::Const`], or a `(%ref self f)`
+///   whose binding is one (`f = log`), which `canon::fold`'s alias resolution
+///   inlines before `canon::inline`'s `builtin_callee_head` rewrites the head to a
+///   direct builtin call. There is nothing to beta-reduce, so the application is
+///   emitted as written and those two passes finish it;
+/// * a **reified** `functionof`/lambda that beta-reduces under
+///   [`crate::kernel::reduce_kernel_application`].
+///
+/// Anything else refuses. Reducing HERE rather than leaving it to
+/// `canon::inline`'s later sweep is what makes a refusal possible at all: that pass
+/// leaves a call it cannot reduce in place by design, so the residual would reach
+/// exit 0 silently. The shape this actually catches is a map applied to a variate it
+/// cannot bind against — a record-valued variate scored against a scalar-domain law,
+/// where the splat has no field to match the map's parameter.
+fn apply_change_of_variables(
+    m: &mut Module,
+    node: NodeId,
+    callee: NodeId,
+    point: NodeId,
+    role: &str,
+) -> Result<NodeId, RefuseError> {
+    let applied = build_user_call(m, callee, point);
+    // A bare operator (possibly reached through one alias hop) has no body to
+    // substitute into; `canon`'s head rewrite is what lands it on a direct builtin
+    // call, so admit it unreduced exactly as the sample side does.
+    if matches!(m.node(resolve_ref_one(m, callee).0), Node::Const(_)) {
+        return Ok(applied);
+    }
+    crate::kernel::reduce_kernel_application(m, applied).ok_or_else(|| {
+        refuse(
+            node,
+            m,
+            &format!(
+                "the change of variables' `{role}` does not reduce when applied to the variate: \
+                 its parameter list does not bind against the value being scored (for a \
+                 record-valued variate, application binds the map's parameters by field name, so \
+                 a scalar-domain law scored at a record has nothing to bind). The application \
+                 would survive as an unreduced `%call`, which is not FlatPDL — refuse rather than \
+                 emit it"
+            ),
+        )
+    })
 }
 
 /// `logdensityof(locscale(m, shift, scale), v)` — the affine (location-scale)
@@ -2685,10 +2740,12 @@ fn lower_locscale(
         _ => Type::Any,
     };
     let bij = crate::invert::derive_locscale(m, shift, scale, &domain)?;
-    // §06 change-of-variables: logdensityof(m, f_inv(v)) − logvol(f_inv(v)).
-    let preimage = build_user_call(m, bij.f_inv, v);
+    // §06 change-of-variables: logdensityof(m, f_inv(v)) − logvol(f_inv(v)). Both
+    // applications go through the same reduce-or-refuse check as [`lower_pushfwd`]'s
+    // tail — this shares that tail's shape, so it shares its residual-`%call` risk.
+    let preimage = apply_change_of_variables(m, node, bij.f_inv, v, "f_inv")?;
     let inner_density = lower_measure_density_at(m, m_inner, preimage, origin)?;
-    let logvol_val = build_user_call(m, bij.logvol, preimage);
+    let logvol_val = apply_change_of_variables(m, node, bij.logvol, preimage, "logvol")?;
     Ok(build_call(m, "sub", &[inner_density, logvol_val]))
 }
 
