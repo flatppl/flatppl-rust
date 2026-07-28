@@ -1168,12 +1168,13 @@ fn lower_lawof(
 /// **The discriminator is value-versus-measure-expression, and it has to be.**
 /// Running [`measure_reaches_draw`] on a VALUE argument would report every
 /// `lawof(z)` over a `~`-bound draw as stochastic and refuse the §06 stochastic-node
-/// form outright. Only a MEASURE-EXPRESSION argument is checked, which is also why
-/// the record path is untouched: `lawof(record(z = z, y = y))`'s argument is a
-/// Record, so a dependent component `Normal(mu = z, …)` stays the chain-rule product
-/// it is. An argument whose type inference did not resolve is left alone rather than
-/// refused on a guess (the driver re-infers each iteration, so a real measure
-/// expression carries its type by the time this runs).
+/// form outright. Only a MEASURE-EXPRESSION argument is checked. An argument whose
+/// type inference did not resolve is left alone rather than refused on a guess (the
+/// driver re-infers each iteration, so a real measure expression carries its type by
+/// the time this runs). A RECORD argument gets its own check
+/// ([`refuse_stochastic_record_law`]), which is not this one: a dependent component
+/// `Normal(mu = z, …)` is the chain-rule product `lower_record_of_draws` scores when
+/// `z` is a sibling FIELD, and only a marginal when it is not.
 ///
 /// **A reification counts as a measure expression.** `F = functionof(Normal(mu = a,
 /// sigma = 1.0))` types as `Kernel`, not `Measure`, so a `Type::Measure`-only test
@@ -1191,13 +1192,14 @@ fn lower_lawof(
 /// machinery this guard does not have.
 fn refuse_stochastic_measure_law(m: &Module, arg: NodeId) -> Result<(), RefuseError> {
     let (resolved, _) = resolve_ref_one(m, arg);
+    refuse_stochastic_record_law(m, resolved)?;
     let is_measure_expr = is_measure_expr_type(m, arg)
         || is_measure_expr_type(m, resolved)
         || matches!(
             builtin_name(m, resolved),
             Some("functionof") | Some("kernelof")
         );
-    if is_measure_expr && measure_reaches_draw(m, resolved) {
+    if is_measure_expr && measure_reaches_draw(m, resolved, &[]) {
         return Err(refuse(
             resolved,
             m,
@@ -1205,6 +1207,67 @@ fn refuse_stochastic_measure_law(m: &Module, arg: NodeId) -> Result<(), RefuseEr
              (§04: lawof reifies the TOTAL law), which is a kchain marginal — refuse rather \
              than score the conditional at a pinned latent",
         ));
+    }
+    Ok(())
+}
+
+/// Refuse `lawof(record(…))` one of whose fields' laws is parameterized by a draw the
+/// record does not carry — `lawof(record(y = y))` with `y ~ Normal(mu = z, sigma = 1)`
+/// and `z` a latent of the model but no field here.
+///
+/// §04 "Reification to measures" makes `lawof(x)` the TOTAL law and, on its worked
+/// `prior_predictive = lawof(record(obs = obs))`, says which ancestors get integrated
+/// out: "they are internal stochastic nodes in the traced sub-DAG, **not boundary
+/// inputs**, so `lawof` integrates them out". A SIBLING field's draw is neither — it
+/// is scored by the same product, and `lower_record_of_draws` pins it to its own field
+/// of the query point, so `lawof(record(z = z, y = y))` is the chain-rule joint and
+/// must keep lowering. Only an ancestor the record does not carry needs the `kchain`
+/// integral, and scoring it emits the conditional at whatever value that latent
+/// takes: `lawof(record(y = y))` emitted `p(y | z)` at a `z` a sibling query pinned,
+/// in EITHER statement order.
+///
+/// **This belongs to `lawof`, not to the record lowering.** `lower_record_of_draws`
+/// also scores the body of a `kernelof` / `functionof`, and a reification does not
+/// integrate its free stochastic params out — it CONDITIONS on them as boundary
+/// inputs, which is exactly §04's exception. `forward_kernel =
+/// kernelof(record(obs = obs), theta1 = theta1, theta2 = theta2)` with
+/// `obs ~ iid(Normal(mu = a, sigma = b), 10)` over derived `a`, `b` is that shape, and
+/// a guard placed in the record lowering refused it
+/// (`fixtures/flatppl/queries/bayesian_inference_2_posterior.flatppl`). Sited at the
+/// `lawof` strip points, it fires only where §04 asks for the total law.
+///
+/// A field the record lowering will refuse anyway (not a draw, or reaching two draws)
+/// makes the sibling set incomplete, so the check stands down entirely rather than
+/// mistake a sibling for an outsider — that refusal is the caller's, with its own
+/// reason.
+fn refuse_stochastic_record_law(m: &Module, record_node: NodeId) -> Result<(), RefuseError> {
+    let Some(rec) = expect_builtin_call(m, record_node, "record") else {
+        return Ok(());
+    };
+    let mut fields = Vec::with_capacity(rec.named.len());
+    for field in rec.named.iter() {
+        match resolve_component_draw(m, field.value) {
+            Some((measure, _, transform, draw_site)) => {
+                fields.push((measure, transform, draw_site))
+            }
+            None => return Ok(()),
+        }
+    }
+    let siblings: Vec<NodeId> = fields.iter().map(|&(_, _, site)| site).collect();
+    for &(measure, transform, _) in &fields {
+        // The transform is walked as well as the measure: for `b = y + z` the outside
+        // ancestor is in the MAP, which `build_forward_map` would read as a constant.
+        let reaches = |node| measure_reaches_draw(m, node, &siblings);
+        if reaches(measure) || transform.is_some_and(reaches) {
+            return Err(refuse(
+                measure,
+                m,
+                "lawof of a record whose field law is parameterized by a draw the record does \
+                 not carry is that field's MARGINAL law (§04: lawof reifies the TOTAL law), \
+                 which is a kchain marginal — refuse rather than score the conditional at a \
+                 latent pinned by another query",
+            ));
+        }
     }
     Ok(())
 }
@@ -1289,10 +1352,12 @@ fn lower_record_of_draws(
         terms.push(lower_measure_density(m, measure, comp.pinned)?);
     }
 
-    // Pin each referenced draw binding to its scored value.
+    // Pin each referenced draw binding to its scored value, recording that a QUERY
+    // put the literal there — a later query must not read it as a model constant
+    // (see [`measure_reaches_draw`]).
     for comp in &components {
         if let Some(bid) = comp.draw_binding {
-            m.set_binding_rhs(bid, comp.pinned);
+            m.pin_binding_to_query_point(bid, comp.pinned);
         }
     }
 
@@ -1681,13 +1746,14 @@ fn abstract_over_draw(
 ///
 /// **What that guard is worth, precisely.** With the latent still latent, the
 /// query already refused without it, via the driver's residual-`draw` scan — so
-/// there the guard only improves the diagnosis. With the latent pinned by an
-/// EARLIER query it cannot fire at all (nothing then distinguishes `mu = 0.1` from
-/// a genuinely fixed parameter; that limitation is tracked separately). Its real
-/// justification is the LATER-query ordering — score `lawof(y)` first, then a
-/// second query that pins `z` — where nothing downstream refuses and the
-/// conditional density escaped as a finished number.
-/// `bare_lawof_scored_before_a_later_query_pins_the_latent_refuses` names it.
+/// there the guard only improves the diagnosis. Its own justification is the
+/// LATER-query ordering — score `lawof(y)` first, then a second query that pins `z` —
+/// where nothing downstream refuses and the conditional density escaped as a finished
+/// number (`bare_lawof_scored_before_a_later_query_pins_the_latent_refuses`). The
+/// EARLIER-query ordering it reaches only through the pin provenance
+/// [`measure_reaches_draw`] reads: once `z = 0.3` nothing in the binding is left to
+/// test, so the pin itself has to record that it was a latent
+/// (`a_pinned_latent_is_not_a_fixed_parameter_bare_spelling`).
 ///
 /// Pinning the binding `x` came from is what keeps the residual `x = draw(M)`
 /// from surviving into the conformance check: the driver sweeps a draw binding
@@ -1704,7 +1770,7 @@ fn lower_value_law(
     origin: VariateOrigin,
 ) -> Option<Result<NodeId, RefuseError>> {
     let (measure, binding, transform, draw_site) = resolve_component_draw(m, value)?;
-    if measure_reaches_draw(m, measure) {
+    if measure_reaches_draw(m, measure, &[]) {
         return Some(Err(refuse(
             measure,
             m,
@@ -1738,7 +1804,7 @@ fn lower_value_law(
     let scored = lower_measure_density(m, law, v);
     if scored.is_ok() && origin == VariateOrigin::Point {
         if let Some(bid) = binding {
-            m.set_binding_rhs(bid, v);
+            m.pin_binding_to_query_point(bid, v);
         }
     }
     Some(scored)
@@ -1747,6 +1813,21 @@ fn lower_value_law(
 /// Does the measure expression at `node` reach a `draw` — i.e. is its law
 /// parameterized by a value that is itself random, so that [`lower_value_law`]
 /// would have to marginalize?
+///
+/// **A binding an earlier query pinned counts as a draw**
+/// ([`Module::is_query_pinned`]). Pinning rewrites `z = draw(Normal(0, 1))` to
+/// `z = 0.3`, after which nothing in the binding tells it from a genuinely fixed
+/// `mu = elementof(reals)` — so `y ~ Normal(mu = z, sigma = 1)` scored by a LATER
+/// query emitted the conditional `p(y | z = 0.3)` where §04 asks for y's marginal.
+/// The provenance is what makes that decidable; without it there is nothing left to
+/// test, which is why no local shape check can close this.
+///
+/// `exempt` lists draw sites the CALLER accounts for itself — the sibling fields of
+/// a record product, whose dependence is the chain rule
+/// [`lower_record_of_draws`] already scores with the sibling pinned. Every other
+/// caller passes `&[]`. An exempt draw is not descended into, for
+/// [`field_draw_sites`]'s reason: its own parameters are checked when that component
+/// is walked in its turn.
 ///
 /// Deliberately NOT [`field_draw_sites`], which the shape test uses and must keep
 /// its own semantics: this walk stops at a `lawof(…)` ARGUMENT, because `lawof`
@@ -1773,8 +1854,8 @@ fn lower_value_law(
 /// combinator's non-measure operands (`w` in `weighted(w, lawof(z))`) and a
 /// pushforward's forward map (`pushfwd(functionof(u -> u + z), M)`), where a
 /// reachable draw genuinely does randomize the resulting law.
-fn measure_reaches_draw(m: &Module, node: NodeId) -> bool {
-    fn walk(m: &Module, node: NodeId, path: &mut Vec<BindingId>) -> bool {
+fn measure_reaches_draw(m: &Module, node: NodeId, exempt: &[NodeId]) -> bool {
+    fn walk(m: &Module, node: NodeId, exempt: &[NodeId], path: &mut Vec<BindingId>) -> bool {
         match m.node(node) {
             Node::Ref(Ref {
                 ns: RefNs::SelfMod,
@@ -1783,29 +1864,32 @@ fn measure_reaches_draw(m: &Module, node: NodeId) -> bool {
                 let Some(bid) = m.binding_by_name(*name) else {
                     return false;
                 };
+                if m.is_query_pinned(bid) {
+                    return true; // a latent an earlier query replaced with its point
+                }
                 if path.contains(&bid) {
                     return false; // cyclic definition — stop rather than recurse forever
                 }
                 path.push(bid);
-                let found = walk(m, m.binding(bid).rhs, path);
+                let found = walk(m, m.binding(bid).rhs, exempt, path);
                 path.pop();
                 found
             }
             Node::Call(c) => {
                 // A `draw` IS the stochastic ancestor; no need to look inside it.
                 if draw_argument(m, node).is_some() {
-                    return true;
+                    return !exempt.contains(&node);
                 }
                 if matches!(builtin_name(m, node), Some("lawof")) {
                     return false;
                 }
-                c.args.iter().any(|&arg| walk(m, arg, path))
-                    || c.named.iter().any(|n| walk(m, n.value, path))
+                c.args.iter().any(|&arg| walk(m, arg, exempt, path))
+                    || c.named.iter().any(|n| walk(m, n.value, exempt, path))
             }
             _ => false,
         }
     }
-    walk(m, node, &mut Vec::new())
+    walk(m, node, exempt, &mut Vec::new())
 }
 
 // ---------------------------------------------------------------------------

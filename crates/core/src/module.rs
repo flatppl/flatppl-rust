@@ -52,6 +52,12 @@ pub struct Module {
     /// (`flatppl-infer`, phase inference). Inference metadata: projected into
     /// the `%autoinputs` slot on FlatPIR write, dropped on FlatPPL write.
     auto_inputs: SecondaryMap<NodeId, Box<[(Symbol, Ref)]>>,
+    /// Bindings a determinization query replaced with the point it was scored at
+    /// (`flatppl-determinizer`). The RHS is then a literal indistinguishable from a
+    /// model constant, and a later query reading it as fixed would emit a
+    /// CONDITIONAL density where §04 asks for the total law — so the pin records
+    /// that it was a latent. Not projected into any output format.
+    query_pinned: std::collections::HashSet<BindingId>,
 }
 
 /// A top-level binding `name = rhs`.
@@ -117,6 +123,25 @@ impl Module {
     /// with another inside an already-built module.
     pub fn set_binding_rhs(&mut self, id: BindingId, rhs: NodeId) {
         self.bindings.get_mut(id).rhs = rhs;
+    }
+
+    /// [`Module::set_binding_rhs`] for a determinization query pinning a latent to
+    /// the point it scored (§13: "`draw` nodes take their values from the explicit
+    /// `point`"), recording that provenance. One call rather than a set-then-mark
+    /// pair so a pin cannot be made without it: after the rewrite nothing in the
+    /// binding distinguishes the literal from a model constant, and that is exactly
+    /// what a later query must not read as fixed.
+    pub fn pin_binding_to_query_point(&mut self, id: BindingId, point: NodeId) {
+        self.set_binding_rhs(id, point);
+        self.query_pinned.insert(id);
+    }
+
+    /// Did a determinization query pin this binding
+    /// ([`Module::pin_binding_to_query_point`])? A binding whose literal RHS came
+    /// from a query point is still a stochastic node of the model; a measure
+    /// parameterized by it has that node as an ancestor to marginalize over.
+    pub fn is_query_pinned(&self, id: BindingId) -> bool {
+        self.query_pinned.contains(&id)
     }
 
     /// Keep only the bindings in `keep`, in their existing source order; drop the

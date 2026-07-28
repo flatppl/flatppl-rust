@@ -1063,9 +1063,13 @@ fn lower_shared_record_sample(
         });
 
         // Rewrite the latent's draw-BINDING to the sampled value; consumers keep
-        // their `(%ref self <latent>)` and resolve to it by name.
+        // their `(%ref self <latent>)` and resolve to it by name. Recorded as
+        // query-pinned for the same reason a density query's pin is
+        // (`density::measure_reaches_draw`): the binding is no longer a `draw` and a
+        // LATER density query must not read the realization as a model constant and
+        // score the conditional at it.
         let value = get_slot(m, sample_name, 0);
-        m.set_binding_rhs(bid, value);
+        m.pin_binding_to_query_point(bid, value);
 
         // Thread the advanced rng from the SAME sample binding into the next latent.
         cur = get_slot(m, sample_name, 1);

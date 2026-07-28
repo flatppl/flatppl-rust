@@ -1896,13 +1896,11 @@ lp = logdensityof(lawof(record(z = z, y = y)), record(z = 0.1, y = 0.2))";
 // This case, with the latent still latent, already refused before the guard — via
 // the driver's residual-`draw` scan — so what the guard adds HERE is only a reason
 // that names the cause. The ordering it actually rescues is the sibling test
-// `bare_lawof_scored_before_a_later_query_pins_the_latent_refuses`. And it does NOT
-// see a latent an EARLIER query already pinned to a literal: nothing then
-// distinguishes the pinned `mu = 0.1` from a genuinely fixed one, which needs the
-// pre-pinning phase that only the driver has. That multi-query hazard belongs to
-// sequential pinning and is not specific to this path (the record spelling
-// `lawof(record(y = y))` has it too, and had it before this path existed); it is
-// tracked separately, so do not read this test as covering it.
+// `bare_lawof_scored_before_a_later_query_pins_the_latent_refuses`. A latent an
+// EARLIER query already pinned to a literal is a third thing again: nothing in the
+// binding then distinguishes `mu = 0.1` from a genuinely fixed one, so that ordering
+// is caught by the pin's own provenance, in
+// `query_pinned_latent_golden.rs`. Do not read this test as covering either.
 #[test]
 fn bare_lawof_of_a_draw_with_a_latent_parameter_refuses() {
     let latent = "\
