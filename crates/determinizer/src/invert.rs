@@ -193,6 +193,16 @@ pub(crate) fn derive_bijection(
 ) -> Result<Option<Bijection>, RefuseError> {
     // Resolve one level of self-ref (`pushfwd(g, M)` where `g = exp`).
     let (f_resolved, _) = resolve_ref_one(m, f);
+    // The VECTOR variate dispatch comes BEFORE the bare/lambda split, because the
+    // bare spelling of an elementwise map is still an elementwise map (§06 nowhere
+    // distinguishes `pushfwd(g, M)` from `pushfwd(x -> broadcast(g, x), M)` over a
+    // vector base) and its Jacobian is DIAGONAL. Reached after the split, a bare
+    // operator took the SCALAR derivation and emitted that op's scalar log-volume
+    // against an n-vector — `sub(<scalar>, log(y))` with a vector `log(y)` — where
+    // the log-det is `Σᵢ log|g'(yᵢ)|`.
+    if domain_is_vector(domain) {
+        return derive_vector_bijection(m, f, f_resolved, domain, support);
+    }
     match recognise(m, f_resolved) {
         // Bare builtin value: Task-1 single-op form (byte-equality-pinned).
         Recognized::BareConst(name) => bare_bijection(m, &name, f, support),
@@ -201,40 +211,6 @@ pub(crate) fn derive_bijection(
             input_name,
             ph,
         } => {
-            // Matrix-vector affine map `mu + L * x` over a VECTOR variate (§06
-            // case 1: the engine MUST recognise maps such as
-            // `mu + lower_cholesky(cov) * _`). Keyed on the base measure's variate
-            // domain being a vector (1-D array) — this is the MvNormal construction
-            // (§08 MvNormal), distinct from the scalar chain below.
-            if domain_is_vector(domain) {
-                // Matrix-vector affine map `mu + L * x` (the MvNormal construction).
-                if let Some(bij) = derive_matrix_affine(m, body, ph)? {
-                    return Ok(Some(bij));
-                }
-                // Multivariate ELEMENTWISE unary map `broadcast(g, x)` with `g`
-                // scalar-invertible: a DIAGONAL Jacobian, so `logvol` is the SUM of
-                // the per-cell scalar forward log-derivatives. `g` is derived by
-                // recursing over the vector's ELEMENT domain (scalar path), then
-                // wrapped in `broadcast` + `sum` (§06 case 1 elementwise extension;
-                // see [`derive_elementwise`]).
-                let elem_domain = vector_elem_domain(domain);
-                let elem_sup = elem_support(support);
-                if let Some(bij) = derive_elementwise(m, body, ph, &elem_domain, &elem_sup)? {
-                    return Ok(Some(bij));
-                }
-                // A vector-variate forward body that is neither a recognised
-                // matrix-affine nor elementwise map: refuse rather than fall through
-                // to the scalar chain, whose per-op log-volume is not summed over the
-                // vector's axes and would silently mislower (a scalar-scale `k·x` over
-                // a vector has log-volume `n·log|k|`, not `log|k|`).
-                return Err(refuse(
-                    f,
-                    m,
-                    "forward map over a vector variate is not a recognised matrix-affine \
-                     (mu + L * x) or elementwise (broadcast(g, x)) map — refuse rather \
-                     than mislower",
-                ));
-            }
             // Single-op `pow(x, k)` keeps its Task-1 domain-restricted derivation;
             // a `pow` anywhere else in a chain is refused by the chain walk (its
             // input domain is not verifiable here).
@@ -245,6 +221,78 @@ pub(crate) fn derive_bijection(
         }
         Recognized::Unrecognized => Ok(None),
     }
+}
+
+/// Derive `(f_inv, logvol)` for a forward map over a VECTOR variate — the two
+/// vector forms §06 case 1 mandates, and nothing else:
+///
+/// * a matrix-vector affine map `mu + L * x` ([`derive_matrix_affine`], the
+///   MvNormal construction, §08 `MvNormal`);
+/// * an ELEMENTWISE unary map, whose diagonal Jacobian makes `logvol` the SUM of
+///   the per-cell scalar forward log-derivatives. Both its spellings land here: the
+///   bare operator (`pushfwd(exp, MvNormal)`) derives the per-cell map over the
+///   vector's ELEMENT domain and support, and `broadcast(g, x)` recurses on `g` the
+///   same way ([`derive_elementwise`]); both then go through [`wrap_elementwise`],
+///   so the two emit the identical term.
+///
+/// Anything else refuses rather than falling through to the scalar chain, whose
+/// per-op log-volume is not summed over the vector's axes and would silently
+/// mislower (a scalar scale `k·x` over an n-vector has log-volume `n·log|k|`, not
+/// `log|k|`).
+fn derive_vector_bijection(
+    m: &mut Module,
+    f: NodeId,
+    f_resolved: NodeId,
+    domain: &Type,
+    support: &ValueSet,
+) -> Result<Option<Bijection>, RefuseError> {
+    let elem_domain = vector_elem_domain(domain);
+    let elem_sup = elem_support(support);
+    match recognise(m, f_resolved) {
+        // The bare operator IS the per-cell map, so the §06 domain restriction is
+        // checked against the ELEMENT support — the same support the `broadcast`
+        // spelling's recursion reads.
+        Recognized::BareConst(name) => match bare_bijection(m, &name, f, &elem_sup)? {
+            Some(per_cell) => Ok(Some(wrap_elementwise(m, &per_cell))),
+            None => Ok(None),
+        },
+        Recognized::Lambda { body, ph, .. } => {
+            if let Some(bij) = derive_matrix_affine(m, body, ph)? {
+                return Ok(Some(bij));
+            }
+            if let Some(bij) = derive_elementwise(m, body, ph, &elem_domain, &elem_sup)? {
+                return Ok(Some(bij));
+            }
+            Err(refuse(
+                f,
+                m,
+                "forward map over a vector variate is not a recognised matrix-affine \
+                 (mu + L * x) or elementwise (broadcast(g, x)) map — refuse rather \
+                 than mislower",
+            ))
+        }
+        Recognized::Unrecognized => Ok(None),
+    }
+}
+
+/// Lift a PER-CELL scalar change of variables to a vector variate whose forward
+/// Jacobian is diagonal:
+///
+/// * **`f_inv(y) = broadcast(g_inv, y)`** — the scalar inverse applied cell-wise;
+/// * **`logvol(x) = sum(broadcast(g_logvol, x))`** — `log|det J_f| = Σᵢ log|g'(xᵢ)|`
+///   (§07 `sum` reduces a real vector to a scalar).
+///
+/// The single emission site for both spellings of the elementwise map, so neither
+/// can drift from the other. A logvol that failed to `sum` would be a vector where
+/// a scalar log-det belongs.
+fn wrap_elementwise(m: &mut Module, per_cell: &Bijection) -> Bijection {
+    let (g_inv, g_logvol) = (per_cell.f_inv, per_cell.logvol);
+    let f_inv = lambda(m, |m, y| build_call(m, "broadcast", &[g_inv, y]));
+    let logvol = lambda(m, |m, x| {
+        let per_cell = build_call(m, "broadcast", &[g_logvol, x]);
+        build_call(m, "sum", &[per_cell])
+    });
+    Bijection { f_inv, logvol }
 }
 
 /// The IMAGE of a `pushfwd`'s forward map `f`, as a §03 set node for an `in(y, S)`
@@ -1524,16 +1572,7 @@ fn derive_elementwise(
     let Some(g_bij) = derive_bijection(m, g, elem_domain, elem_support)? else {
         return Ok(None);
     };
-    let (g_inv, g_logvol) = (g_bij.f_inv, g_bij.logvol);
-    // f_inv(y) = broadcast(g_inv, y): apply the scalar inverse cell-wise.
-    let f_inv = lambda(m, |m, y| build_call(m, "broadcast", &[g_inv, y]));
-    // logvol(x) = sum(broadcast(g_logvol, x)): the diagonal Jacobian's log-det —
-    // Σᵢ log|g'(xᵢ)|.
-    let logvol = lambda(m, |m, x| {
-        let per_cell = build_call(m, "broadcast", &[g_logvol, x]);
-        build_call(m, "sum", &[per_cell])
-    });
-    Ok(Some(Bijection { f_inv, logvol }))
+    Ok(Some(wrap_elementwise(m, &g_bij)))
 }
 
 /// The element type of a vector (1-D array) `domain` — the SCALAR domain a
