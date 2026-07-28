@@ -664,6 +664,47 @@ fn registry_op_inside_a_composition_lowers_with_the_chain_rule() {
     );
 }
 
+// REGRESSION for a silent wrong density that lowered on main at 9ac4ae7. §06 case
+// 1's domain restriction is about the forward's INPUT, but the guard used to test
+// only the BASE support — so a composition whose base support satisfied `log`'s
+// domain while the intervening op pushed the input OUT of it lowered, emitting a
+// density for a map that is undefined there. Each case below scored a value
+// through flatppl-js on main: `log(x - 5.0)` gave a clean finite -4.254296724642763
+// with no error, when the pushforward of the full Gamma under a map undefined on
+// x <= 5 carries total mass 0.0404 — a sub-probability measure whose properly
+// normalised density is -1.046, so main was wrong by 3.21 nats. `log(log(x))` gave
+// -1.402883223389705 the same way; the other two gave -Infinity.
+//
+// These four must refuse over a base whose support DOES satisfy the op's domain,
+// and refuse for a reason naming that op and its domain — a bare "refuses" would
+// also pass on an unrelated refusal (an unrecognised head, say), which would hide
+// the defect coming back. The op-and-domain core is asserted rather than the exact
+// branch wording because these same four must still refuse once interval
+// propagation lands (the propagated input fails containment in `log`'s domain), and
+// the wording will improve then.
+#[test]
+fn domain_restricted_forward_undefined_on_the_base_support_refuses() {
+    for body in [
+        "log(neg(x))",  // negates a positive base: log undefined on all of it
+        "log(x - 5.0)", // undefined on x <= 5, ~96% of the Gamma(2,1) mass
+        "log(log(x))",  // inner log is negative for x < 1
+        "log(0.0 - x)", // reflected-sub spelling of the first case
+    ] {
+        let src = format!(
+            "d = pushfwd(x -> {body}, Gamma(shape = 2.0, rate = 1.0))\n\
+             lp = logdensityof(d, 0.5)"
+        );
+        let e = determinize(&parse_infer(&src)).expect_err(&format!(
+            "`x -> {body}` over a positive base must refuse, not emit a density"
+        ));
+        let msg = format!("{e:?}");
+        assert!(
+            msg.contains("log") && msg.contains("the positive reals"),
+            "`x -> {body}` must refuse for `log`'s domain, not some unrelated cause: {e:?}"
+        );
+    }
+}
+
 #[test]
 fn domain_restricted_registry_op_inside_a_composition_refuses() {
     // §06 case 1's domain restriction is about the forward's INPUT. The base

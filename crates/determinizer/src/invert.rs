@@ -664,14 +664,24 @@ fn derive_chain(
     // op (`log`, `log10`, `log1p`, `logit`, `probit`, `sqrt`) is undefined outside
     // its domain, and lowering it there yields a silently SUB-probability measure.
     // The base measure's support bounds only the INNERMOST op's input; an interior
-    // op receives an intermediate value this pass does not bound (proving
-    // `2.0 * x > 0` from `x > 0`, let alone `log(x) > 0`, would need interval
-    // propagation through the chain). So a domain-restricted op is admitted ONLY
-    // where its input IS the base variate — innermost, the last element of the
-    // outermost-first chain — and there the base `support` decides. Anywhere else
-    // it refuses. This over-refuses maps that are in fact well-defined
-    // (`x -> log(2.0 * x)` over a positive base), which is the direction §06
+    // op receives an intermediate value this pass does not bound. So a
+    // domain-restricted op is admitted ONLY where its input IS the base variate —
+    // innermost, the last element of the outermost-first chain — and there the base
+    // `support` decides. Anywhere else it refuses, which is the direction §06
     // sanctions: "refused rather than yielding a silently sub-probability measure".
+    //
+    // DELIBERATELY CONSERVATIVE, PENDING INTERVAL PROPAGATION THROUGH THE CHAIN.
+    // This rule refuses maps that are in fact perfectly well-defined, whenever the
+    // base support already lies inside the op's domain and the intervening ops
+    // preserve that: `x -> log(2.0 * x)`, `x -> log(x / 2.0)`, `x -> log(x + 1.0)`,
+    // `x -> log(exp(x))`, `x -> sqrt(2.0 * x)` over a positive base are all sound
+    // and all refused here. Recovering them needs the propagated input interval at
+    // each op (every registry forward is monotone on its own domain, so this is
+    // endpoint mapping with orientation tracking, not general interval arithmetic)
+    // checked for CONTAINMENT in that op's domain. That containment check is also
+    // what keeps `x -> log(neg(x))` refusing once propagation exists — its
+    // propagated input lands in the negatives. Until then, read a refusal from this
+    // branch as "not proven", NOT as "unsound".
     for (i, op) in ops.iter().enumerate() {
         let ChainOp::Registry {
             op: name, entry, ..
