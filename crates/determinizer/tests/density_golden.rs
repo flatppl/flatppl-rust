@@ -1573,3 +1573,35 @@ lp = logdensityof(lawof(record(a = y1, b = y2)), record(a = 0.5, b = 0.25))";
     );
     assert!(flatppl_determinizer::is_flatpdl(&out).is_ok());
 }
+
+// §06 "Engine contract for pushfwd density evaluation" case 1 mandates a registry
+// including "affine maps composed from add/sub/neg/mul/divide (with positive
+// scaling)". `invert.rs::derive_chain` already implements it, but the record-field
+// guard's unary-only shape test could never route a BINARY call to it, so this
+// spelling refused while the explicit `pushfwd(x -> 2.0*x + 1.0, Normal(0,1))`
+// spelling lowered correctly — two spellings §06 calls equivalent.
+#[test]
+fn affine_transformed_field_lowers() {
+    let src = "\
+x = draw(Normal(mu = 0.0, sigma = 1.0))
+y = 2.0 * x + 1.0
+lp = logdensityof(lawof(record(y = y)), record(y = 2.0))";
+    let m = {
+        let mut m = flatppl_syntax::parse(src).unwrap();
+        let _ = flatppl_infer::infer(&mut m);
+        m
+    };
+    let out = determinize(&m).expect("registry-mandated affine map must lower");
+    let pir = flatppl_flatpir::write(&out);
+    assert_eq!(
+        pir.matches("builtin_logdensityof").count(),
+        1,
+        "one density term:\n{pir}"
+    );
+    assert!(
+        pir.contains("log"),
+        "change-of-variables log-volume term present:\n{pir}"
+    );
+    assert!(!pir.contains("lawof"), "measure layer gone:\n{pir}");
+    assert!(flatppl_determinizer::is_flatpdl(&out).is_ok());
+}

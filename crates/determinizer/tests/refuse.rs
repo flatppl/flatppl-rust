@@ -997,3 +997,23 @@ lp = logdensityof(lawof(record(a = y1, b = y2, d = d)), record(a = 0.5, b = 0.25
     let m = parse_infer(src);
     determinize(&m).expect_err("k=3 > n=2 has no density — must refuse");
 }
+
+// A field reaching TWO draws breaks the diagonality that makes the distinct-draw
+// check equivalent to a rank check: `record(a = s, b = s)` with `s = y1 + y2` is
+// k = n = 2 with rank J_Φ = 1, so no density exists — yet the two fields resolve
+// to different sites under a naive reading. Until the guard computes a real rank,
+// a multi-draw field must refuse.
+#[test]
+fn field_over_two_draws_refuses() {
+    let src = "\
+y1 = draw(Normal(mu = 0.0, sigma = 1.0))
+y2 = draw(Normal(mu = 0.0, sigma = 1.0))
+s = y1 + y2
+lp = logdensityof(lawof(record(a = s, b = y1)), record(a = 0.5, b = 0.25))";
+    let m = parse_infer(src);
+    let err = determinize(&m).expect_err("a field over two draws needs a rank test — must refuse");
+    assert!(
+        err.reason.contains("rank") || err.reason.contains("more than one draw"),
+        "refusal explains the multi-draw field, not invertibility: {err:?}"
+    );
+}

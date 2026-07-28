@@ -1253,8 +1253,17 @@ fn bare_builtin(m: &mut Module, name: &str) -> NodeId {
 }
 
 /// Build a `functionof` lambda `<input_name> -> <body>` with the given boundary
-/// (input name + `%local` placeholder symbol).
-fn wrap_functionof(m: &mut Module, input_name: Symbol, ph: Symbol, body: NodeId) -> NodeId {
+/// (input name + `%local` placeholder symbol). This is the exact shape
+/// [`recognise`] admits as `Recognized::Lambda`, and the shape the parser emits
+/// for surface `x -> …`; the density path's record-field pushforward wrapper
+/// builds its composed forward maps with it so the two `pushfwd` spellings §06
+/// declares equivalent are byte-identical here.
+pub(crate) fn wrap_functionof(
+    m: &mut Module,
+    input_name: Symbol,
+    ph: Symbol,
+    body: NodeId,
+) -> NodeId {
     let functionof = m.intern("functionof");
     m.alloc(Node::Call(Call {
         head: CallHead::Builtin(functionof),

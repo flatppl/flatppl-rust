@@ -1063,9 +1063,8 @@ fn lower_lawof(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Refuse
 /// reference — that binding, so the driver can pin it to the scored value.
 struct Component {
     /// The distribution-constructor (or combinator) node `mᵢ`. For a
-    /// bijection-transformed field (`transform = Some(g)`), this is the INNER
-    /// draw's measure `Mᵢ`; the driver wraps it as `pushfwd(g, Mᵢ)` before
-    /// scoring.
+    /// transformed field (`transform = Some(call)`), this is the INNER draw's
+    /// measure `Mᵢ`; the driver wraps it as `pushfwd(g, Mᵢ)` before scoring.
     measure: NodeId,
     /// The matching part of `v` to score `mᵢ` at.
     pinned: NodeId,
@@ -1075,10 +1074,13 @@ struct Component {
     /// sqrt(sigma2)`) — pinning it to the scored value feeds sibling measures
     /// and the likelihood that reference `sigma`.
     draw_binding: Option<BindingId>,
-    /// `Some(g)` when the field is a unary bijection `g(draw)` (spec §06
-    /// pushfwd) rather than a bare `draw`: the field's law is the pushforward
-    /// of the inner draw's law under the built-in `g` (e.g. `sqrt`).
-    transform: Option<Symbol>,
+    /// `Some(call)` when the field is a built-in call over its draw (spec §06
+    /// pushfwd) rather than a bare `draw`: the field's law is the pushforward of
+    /// the inner draw's law under that call read as a function of the draw. The
+    /// WHOLE call node is carried, not just its head symbol, because a composed
+    /// map (`2.0 * x + 1.0`) is not named by any single builtin;
+    /// [`build_forward_map`] turns it into the forward map `pushfwd` consumes.
+    transform: Option<NodeId>,
     /// The `draw(Mᵢ)` node this field's law comes from — the identity of the
     /// UNDERLYING draw, which `draw_binding` is not: for a transformed field
     /// `b = exp(y)` the binding is `b` while the draw site is `y`'s. Used to
@@ -1102,8 +1104,8 @@ fn lower_record_of_draws(
         return Ok(m.alloc(Node::Lit(Scalar::Real(0.0))));
     }
 
-    // Build density terms per component. A bijection-transformed field
-    // (`transform = Some(g)`) is scored as the pushforward `pushfwd(g, Mᵢ)` of
+    // Build density terms per component. A transformed field
+    // (`transform = Some(call)`) is scored as the pushforward `pushfwd(g, Mᵢ)` of
     // the inner draw's law under `g` — `lower_pushfwd` applies the §06
     // change-of-variables (`logdensityof(Mᵢ, g⁻¹(y)) − logvol(g⁻¹(y))`),
     // reusing the recorded/derived inverse; a non-invertible `g` refuses there.
@@ -1111,8 +1113,8 @@ fn lower_record_of_draws(
     for comp in &components {
         let measure = match comp.transform {
             None => comp.measure,
-            Some(g) => {
-                let fwd = m.alloc(Node::Const(g));
+            Some(call) => {
+                let fwd = build_forward_map(m, call, comp.draw_site);
                 build_call(m, "pushfwd", &[fwd, comp.measure])
             }
         };
@@ -1171,14 +1173,37 @@ fn match_independent_record(
         let pinned = lookup_field(m, &vrec.named, field.name)
             .ok_or_else(|| refuse(v, m, "missing field in value record"))?;
 
-        let (measure, draw_binding, transform, draw_site) = resolve_component_draw(m, field.value)
-            .ok_or_else(|| {
-                refuse(
-                    field.value,
-                    m,
-                    "field is not a draw, a reference to a draw, or a bijection of a draw",
-                )
-            })?;
+        let (measure, draw_binding, transform, draw_site) =
+            match resolve_component_draw(m, field.value) {
+                Some(resolved) => resolved,
+                // A field whose expression reaches TWO OR MORE draws is refused with
+                // its own reason: the rank check below counts DISTINCT draws, which
+                // equals rank J_Φ only while every field is a map of a single draw
+                // (Φ block-diagonal). A multi-draw field breaks that — `a = y1 + y2`
+                // and `b = y1 + y2` reach two distinct draws each, pass any pairwise
+                // distinctness test, and still have rank 1 — so admitting one would
+                // need a real rank computation on J_Φ, not a draw count. Nothing here
+                // says the map is non-invertible: §06 case 2 requires density support
+                // for the non-injective structural projections, so invertibility is
+                // not the criterion.
+                None if field_draw_sites(m, field.value).len() > 1 => {
+                    return Err(refuse(
+                        field.value,
+                        m,
+                        "record field reaches more than one draw; the guard counts distinct \
+                     draws, which equals the rank of the joint map only when each field \
+                     is a map of a single draw — admitting this needs a real rank test \
+                     on the joint map, so refuse rather than mislower",
+                    ));
+                }
+                None => {
+                    return Err(refuse(
+                        field.value,
+                        m,
+                        "field is not a draw, a reference to a draw, or a bijection of a draw",
+                    ));
+                }
+            };
         components.push(Component {
             measure,
             pinned,
@@ -1221,23 +1246,30 @@ fn match_independent_record(
 ///   distribution-constructor node);
 /// * `outer_binding` — `Some(bid)` when the field reached us through a
 ///   `(%ref self x)` binding, so the driver can pin `x` to the scored value;
-/// * `transform` — `Some(g)` when the field is a unary bijection `g(draw)`
-///   (§06 pushfwd) rather than a bare draw; the driver wraps `Mᵢ` as
-///   `pushfwd(g, Mᵢ)` before scoring.
+/// * `transform` — `Some(call)` when the field is a built-in call over its draw
+///   (§06 pushfwd) rather than a bare draw; the driver turns that call into a
+///   forward map and wraps `Mᵢ` as `pushfwd(g, Mᵢ)` before scoring.
 /// * `draw_site` — the `draw(Mᵢ)` node itself, i.e. the underlying draw's
 ///   identity (NOT `outer_binding`: for `b = exp(y)`, `outer_binding` is `b`'s
 ///   binding while `draw_site` is `y`'s `draw(...)` node). Used by the caller
 ///   to detect two fields resolving to the same draw.
 ///
 /// Cases: **A** `(%ref self x)` whose binding RHS is `draw(Mᵢ)`; **B** inline
-/// `draw(Mᵢ)`; **C** a unary builtin call `g(inner)` (either inline or the RHS
-/// of a `(%ref self x)` binding) where `inner` resolves — one further ref hop —
-/// to a `draw(Mᵢ)`. `sigma = sqrt(sigma2)` is Case C: `outer_binding` is
-/// `sigma`'s binding and `transform = sqrt`.
+/// `draw(Mᵢ)`; **C** a builtin call (either inline or the RHS of a
+/// `(%ref self x)` binding) whose operands reach EXACTLY ONE distinct draw.
+/// `sigma = sqrt(sigma2)` and `y = 2.0 * x + 1.0` are both Case C.
+///
+/// Case C tests the SHAPE only — how many draws the field's expression is a
+/// function of — never which maps are invertible. §06 case 1's known-bijection
+/// registry is implemented once, in [`crate::invert`], and reached through the
+/// `pushfwd(g, Mᵢ)` the driver builds; mirroring it here would duplicate the
+/// table and drift from it. A map outside the registry refuses there (as `abs`
+/// does today), so widening the shape test cannot mislower, and every future
+/// registry entry is admitted here for free.
 fn resolve_component_draw(
     m: &Module,
     value: NodeId,
-) -> Option<(NodeId, Option<BindingId>, Option<Symbol>, NodeId)> {
+) -> Option<(NodeId, Option<BindingId>, Option<NodeId>, NodeId)> {
     // One `(%ref self x)` hop: the field either IS a self-ref to a binding
     // (Cases A / ref-C) or is spelled inline (Cases B / inline-C).
     let (effective, outer_binding) = match m.node(value) {
@@ -1257,39 +1289,193 @@ fn resolve_component_draw(
         return Some((measure, outer_binding, None, effective));
     }
 
-    // Case C: the effective RHS is a unary built-in call `g(inner)` where
-    // `inner` resolves (one more ref hop) to a `draw(Mᵢ)`. The field's law is
-    // the pushforward of the inner draw's law under `g`. `g` need not be a
-    // recognised bijection here — the driver's `pushfwd(g, Mᵢ)` lowering
-    // refuses a non-invertible `g` (refuse-don't-mislower).
+    // Case C: the effective RHS is a built-in call whose operands reach EXACTLY
+    // ONE distinct draw `draw(Mᵢ)` (literal / draw-free operands alongside are
+    // fine). The field's law is the pushforward of that draw's law under the call
+    // read as a function of the draw. The call need not be a recognised bijection
+    // here — the driver's `pushfwd(g, Mᵢ)` lowering refuses a non-invertible `g`
+    // (refuse-don't-mislower).
     if let Node::Call(c) = m.node(effective) {
-        if let CallHead::Builtin(g) = c.head {
-            if c.args.len() == 1 && c.named.is_empty() {
-                if let Some((inner_measure, inner_site)) = resolve_inner_draw_measure(m, c.args[0])
-                {
-                    return Some((inner_measure, outer_binding, Some(g), inner_site));
-                }
+        if matches!(c.head, CallHead::Builtin(_)) {
+            let sites = field_draw_sites(m, effective);
+            if let [site] = sites[..] {
+                let measure = draw_argument(m, site)?;
+                return Some((measure, outer_binding, Some(effective), site));
             }
         }
     }
     None
 }
 
-/// The inner half of Case C: resolve `node` — one `(%ref self x)` hop or inline
-/// — to a `draw(Mᵢ)`. Returns `(measure, draw_site)`, where `draw_site` is the
-/// `draw(...)` node itself; the inner draw's binding is NOT pinned (in the
-/// transformed-field models it is referenced only to define the outer binding,
-/// which the driver pins instead).
-fn resolve_inner_draw_measure(m: &Module, node: NodeId) -> Option<(NodeId, NodeId)> {
-    let effective = match m.node(node) {
+/// Every DISTINCT `draw(…)` node the expression at `node` is a function of, in
+/// first-reached order.
+///
+/// Walks call operands (positional AND named, under either head kind) and hops
+/// through `(%ref self x)` bindings, stopping at each `draw(…)`: a draw's own
+/// measure ARGUMENT is deliberately not entered, because a draw whose parameters
+/// reference a sibling draw (`y = draw(Normal(mu = z, …))`) is a dependent
+/// product the caller scores by the chain rule with `z` pinned, not a map of `z`.
+///
+/// Exhaustive on purpose. A draw the walk failed to see would be treated as a
+/// fixed operand, which is how a coupled joint could get scored as if one of its
+/// draws were a constant — `derive_matrix_affine` accepts `mu + L * x` whenever
+/// `mu` does not mention the map's input, so a random `mu` must be caught HERE.
+/// The `path` guard makes a cyclic binding graph terminate (it then reports the
+/// draws found before the cycle, and the leftover self-ref refuses downstream).
+fn field_draw_sites(m: &Module, node: NodeId) -> Vec<NodeId> {
+    let mut sites = Vec::new();
+    let mut path = Vec::new();
+    collect_draw_sites(m, node, &mut path, &mut sites);
+    sites
+}
+
+/// [`field_draw_sites`]'s recursor. `path` is the chain of bindings currently
+/// being expanded (the cycle guard); `sites` accumulates the distinct draws.
+fn collect_draw_sites(
+    m: &Module,
+    node: NodeId,
+    path: &mut Vec<BindingId>,
+    sites: &mut Vec<NodeId>,
+) {
+    match m.node(node) {
         Node::Ref(Ref {
             ns: RefNs::SelfMod,
             name,
-        }) => m.binding(m.binding_by_name(*name)?).rhs,
+        }) => {
+            let Some(bid) = m.binding_by_name(*name) else {
+                return;
+            };
+            if path.contains(&bid) {
+                return; // cyclic definition — stop rather than recurse forever
+            }
+            path.push(bid);
+            collect_draw_sites(m, m.binding(bid).rhs, path, sites);
+            path.pop();
+        }
+        Node::Call(c) => {
+            if draw_argument(m, node).is_some() {
+                if !sites.contains(&node) {
+                    sites.push(node);
+                }
+                return;
+            }
+            for &arg in c.args.iter() {
+                collect_draw_sites(m, arg, path, sites);
+            }
+            for named in c.named.iter() {
+                collect_draw_sites(m, named.value, path, sites);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Build the forward map `g` for `pushfwd(g, Mᵢ)` from a transformed field's
+/// `call` over its single `draw_site`, in the spelling a user would write —
+/// exactly the two surface forms [`lower_pushfwd`] already consumes, so the
+/// `lawof(record(…))` and explicit-`pushfwd` spellings §06 declares equivalent
+/// reach `crate::invert` identically:
+///
+/// * a bare builtin value (`pushfwd(sqrt, Mᵢ)`) when the call is a lone unary
+///   application to the draw — `crate::invert`'s bare-builtin registry covers
+///   the whole §07 monotone-elementary set (`sqrt`, `logit`, `log1p`, …), which
+///   is WIDER than the lambda path's scalar-chain grammar, so this form must be
+///   kept for the shape that already used it;
+/// * otherwise the lambda `x -> <call with the draw replaced by x>`
+///   (`pushfwd(x -> 2.0 * x + 1.0, Mᵢ)`), which is what carries a composed
+///   multi-operand map.
+fn build_forward_map(m: &mut Module, call: NodeId, draw_site: NodeId) -> NodeId {
+    if let Node::Call(c) = m.node(call) {
+        if let CallHead::Builtin(g) = c.head {
+            // A lone unary application whose operand IS the draw (directly or
+            // through one ref hop): the bare-builtin form names it exactly. A
+            // unary call over a NESTED expression (`log1p(2.0 * x)`) must not take
+            // this path — `pushfwd(log1p, Mᵢ)` would silently drop the inner map.
+            if c.args.len() == 1 && c.named.is_empty() && resolves_to(m, c.args[0], draw_site) {
+                return m.alloc(Node::Const(g));
+            }
+        }
+    }
+    let x = m.intern("x");
+    let ph = m.intern("_x_");
+    let mut path = Vec::new();
+    let body = abstract_over_draw(m, call, draw_site, ph, &mut path);
+    crate::invert::wrap_functionof(m, x, ph, body)
+}
+
+/// Does `node` denote `draw_site` — either being it, or a `(%ref self x)` whose
+/// binding RHS is it?
+fn resolves_to(m: &Module, node: NodeId, draw_site: NodeId) -> bool {
+    let (effective, _) = resolve_ref_one(m, node);
+    effective == draw_site
+}
+
+/// Rebuild `node` as an expression in the lambda placeholder `ph`, replacing
+/// `draw_site` with `(%ref %local ph)`. Subtrees that do not reach the draw are
+/// returned unchanged (shared, not copied); a `(%ref self x)` whose binding does
+/// reach the draw is INLINED, since a lambda body may not reach its input through
+/// a module-level binding. Mirrors [`collect_draw_sites`]'s walk, including its
+/// `path` guard: an unrelated self-ref is left in place and refused downstream by
+/// `crate::invert` (it is neither the placeholder nor a literal).
+fn abstract_over_draw(
+    m: &mut Module,
+    node: NodeId,
+    draw_site: NodeId,
+    ph: Symbol,
+    path: &mut Vec<BindingId>,
+) -> NodeId {
+    if node == draw_site {
+        return m.alloc(Node::Ref(Ref {
+            ns: RefNs::Local,
+            name: ph,
+        }));
+    }
+    match m.node(node).clone() {
+        Node::Ref(Ref {
+            ns: RefNs::SelfMod,
+            name,
+        }) => {
+            let Some(bid) = m.binding_by_name(name) else {
+                return node;
+            };
+            if path.contains(&bid) {
+                return node;
+            }
+            path.push(bid);
+            let rhs = m.binding(bid).rhs;
+            let rebuilt = abstract_over_draw(m, rhs, draw_site, ph, path);
+            path.pop();
+            if rebuilt == rhs { node } else { rebuilt }
+        }
+        Node::Call(c) => {
+            let mut changed = false;
+            let mut args: Vec<NodeId> = Vec::with_capacity(c.args.len());
+            for &arg in c.args.iter() {
+                let rebuilt = abstract_over_draw(m, arg, draw_site, ph, path);
+                changed |= rebuilt != arg;
+                args.push(rebuilt);
+            }
+            let mut named: Vec<NamedArg> = Vec::with_capacity(c.named.len());
+            for entry in c.named.iter() {
+                let rebuilt = abstract_over_draw(m, entry.value, draw_site, ph, path);
+                changed |= rebuilt != entry.value;
+                named.push(NamedArg {
+                    value: rebuilt,
+                    ..*entry
+                });
+            }
+            if !changed {
+                return node;
+            }
+            m.alloc(Node::Call(Call {
+                head: c.head,
+                args: args.into(),
+                named: named.into(),
+                inputs: c.inputs,
+            }))
+        }
         _ => node,
-    };
-    let measure = draw_argument(m, effective)?;
-    Some((measure, effective))
+    }
 }
 
 // ---------------------------------------------------------------------------
