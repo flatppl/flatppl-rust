@@ -1037,9 +1037,19 @@ pub(crate) fn lower_measure_density(
         // (`Normal(mu = z, sigma = 1.0)`) is a dependent product the chain rule
         // scores with `z` pinned, yet it also passes the value-law shape test
         // (one distinct draw reached), so offering it to the value law first
-        // would read the whole dependent product as a map of `z`. Reusing
-        // `build_density_term`'s own refusal as the gate keeps the two paths'
-        // precedence exact without a second copy of
+        // would read the whole dependent product as a map of `z`.
+        //
+        // What a reversed order costs is COVERAGE, not a wrong number: the map
+        // the value law would synthesize is `x -> Normal(mu = x, sigma = 1.0)`,
+        // and a constructor head is capitalized, so it matches nothing in
+        // `crate::invert`'s grammar and refuses there ("no analytic inverse").
+        // Every dependent product would stop lowering — loudly. The precision
+        // matters because it is the whole reason for the ordering, and
+        // `dependent_constructor_is_read_as_a_product_not_a_map` is the test that
+        // holds it.
+        //
+        // Reusing `build_density_term`'s own refusal as the gate keeps the two
+        // paths' precedence exact without a second copy of
         // [`split_kernel_constructor`]'s notion of a well-formed constructor
         // call. When neither matches, the primitive refusal is the one reported.
         _ => match build_density_term(m, measure_node, v) {
@@ -1514,12 +1524,36 @@ fn abstract_over_draw(
 /// value drops the last reference to `x`. This mirrors `lower_record_of_draws`,
 /// including its ordering — pin only AFTER the density is built, since
 /// [`build_forward_map`] recovers `g` by inlining through that very binding.
+///
+/// **`M`'s own parameters must reach no draw.** §04 "Reification to measures"
+/// defines `lawof(x)` as the **TOTAL** law of `x`, and spells the consequence out
+/// on its worked `prior_predictive = lawof(record(obs = obs))`: a stochastic
+/// ancestor is "obtained by marginalizing over" — "they are internal stochastic
+/// nodes in the traced sub-DAG, not boundary inputs, so `lawof` integrates them
+/// out", the measure-algebra equivalent being `kchain(prior, forward_kernel)`. So
+/// for `y ~ Normal(mu = z, sigma = 1)` with `z` latent, `lawof(y)` is the MARGINAL
+/// of `y`, not `Normal(mu = z, …)`: scoring the latter would emit the conditional
+/// density at whatever value some other query happened to pin `z` to — a wrong
+/// number, not a refusal. Marginalizing is `crate::marginal`'s job and it is
+/// closed-form only for a discrete-finite latent, so refuse here. A merely FIXED
+/// or parametric parameter (`mu = elementof(reals)`) is not a stochastic ancestor
+/// and lowers unaffected — the guard tests for a reachable `draw`, not for a
+/// non-literal parameter.
 fn lower_value_law(
     m: &mut Module,
     value: NodeId,
     v: NodeId,
 ) -> Option<Result<NodeId, RefuseError>> {
     let (measure, binding, transform, draw_site) = resolve_component_draw(m, value)?;
+    if !field_draw_sites(m, measure).is_empty() {
+        return Some(Err(refuse(
+            measure,
+            m,
+            "the law of this value marginalizes over a stochastic ancestor of its own measure \
+             (§04: lawof reifies the TOTAL law), which is a kchain marginal — refuse rather than \
+             emit the conditional density at a pinned latent",
+        )));
+    }
     let law = match transform {
         None => measure,
         Some(call) => {

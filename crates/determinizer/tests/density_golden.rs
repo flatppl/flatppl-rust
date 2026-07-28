@@ -1791,3 +1791,137 @@ lp = logdensityof(lawof(x), 0.5)";
         "no change of variables for an untransformed draw:\n{pir}"
     );
 }
+
+// §06 "Transformation and projection" prints the stochastic-node form with `~`
+// and a NAMED `lawof` binding, not with `draw(...)` inline and `lawof` inside the
+// query — so pin the spec's own program text verbatim. The `~`/named-binding
+// route resolves through different code (a binding hop on both the measure side
+// and `measure_of_arg`), so a regression in it would not be caught by the
+// inline spelling above.
+#[test]
+fn spec_literal_stochastic_node_form_lowers() {
+    let spec_text = "\
+mu = Normal(mu = 0.0, sigma = 1.0)
+x ~ mu
+y = exp(x)
+nu = lawof(y)
+lp = logdensityof(nu, 1.6487212707001282)";
+    let pushfwd_form = "\
+mu = Normal(mu = 0.0, sigma = 1.0)
+nu = pushfwd(exp, mu)
+lp = logdensityof(nu, 1.6487212707001282)";
+    let pir = flatppl_flatpir::write(&determinize_src(spec_text));
+    let pir_pf = flatppl_flatpir::write(&determinize_src(pushfwd_form));
+    assert_eq!(
+        pir_binding(&pir, "lp"),
+        pir_binding(&pir_pf, "lp"),
+        "§06's two spellings, as the spec writes them, must emit one expression"
+    );
+    assert!(!pir.contains("lawof"), "measure layer gone:\n{pir}");
+}
+
+// A value reaching TWO distinct draws is refused, and that refusal is what makes
+// the single-draw shape test safe: `resolve_component_draw` admits a transformed
+// value only when it is a function of exactly one draw, so a coupled joint can
+// never be read as a map of one of its draws. `x1 - x2` is §06 case 3 (a
+// dimension-reducing map that is not a coordinate projection), where a static
+// error is the default and symbolic/numeric fallbacks are explicitly optional —
+// so refusing is conformant, not a gap.
+#[test]
+fn bare_lawof_of_a_two_draw_value_refuses() {
+    let src = "\
+x1 = draw(Normal(mu = 0.0, sigma = 1.0))
+x2 = draw(Normal(mu = 0.0, sigma = 1.0))
+d = x1 - x2
+lp = logdensityof(lawof(d), 0.25)";
+    let mut m = flatppl_syntax::parse(src).unwrap();
+    let _ = flatppl_infer::infer(&mut m);
+    let err = determinize(&m).expect_err("a value reaching two draws must refuse, not mislower");
+    assert!(
+        err.reason
+            .contains("primitive measure must be a built-in constructor call"),
+        "must be the primitive-measure refusal — a CHANGED reason here means the \
+         single-draw shape test was widened, so check what now lowers: {}",
+        err.reason
+    );
+}
+
+// The dispatcher's constructor fallthrough reads a constructor BEFORE offering
+// the node to the value law, and this is the test that holds that order. A
+// dependent prior's `Normal(mu = z, sigma = 1.0)` is a product the chain rule
+// scores with `z` pinned, but it also satisfies the value law's shape test (it
+// reaches exactly one draw, `z`'s), so a reversed order would hand it to
+// `pushfwd` as the map `x -> Normal(mu = x, sigma = 1.0)` — which refuses in
+// `crate::invert`, since a capitalized constructor head is in no inverse grammar.
+// The cost of losing the order is therefore that every dependent product stops
+// lowering; this asserts it still does, with `z` pinned into the second term.
+#[test]
+fn dependent_constructor_is_read_as_a_product_not_a_map() {
+    let src = "\
+z = draw(Normal(mu = 0.0, sigma = 1.0))
+y = draw(Normal(mu = z, sigma = 1.0))
+lp = logdensityof(lawof(record(z = z, y = y)), record(z = 0.1, y = 0.2))";
+    let pir = flatppl_flatpir::write(&determinize_src(src));
+    assert_eq!(
+        pir.matches("builtin_logdensityof").count(),
+        2,
+        "chain rule: p(z) * p(y | z), two terms:\n{pir}"
+    );
+    assert!(
+        pir.contains("(%field mu 0.1)"),
+        "y's measure keeps its dependent mu, pinned to z's scored value:\n{pir}"
+    );
+    assert!(
+        !pir.contains("(pushfwd") && !pir.contains("(sub "),
+        "a dependent product carries no change of variables:\n{pir}"
+    );
+}
+
+// §04 "Reification to measures": `lawof(x)` is the **TOTAL** law of `x`, and §04's
+// worked `prior_predictive = lawof(record(obs = obs))` states the consequence —
+// stochastic ancestors "are internal stochastic nodes in the traced sub-DAG, not
+// boundary inputs, so `lawof` integrates them out", equivalently
+// `kchain(prior, forward_kernel)`. So for `y ~ Normal(mu = z, sigma = 1)` with `z`
+// latent, `lawof(y)` is y's MARGINAL, and scoring `Normal(mu = z, …)` instead
+// emits the conditional density — a wrong number rather than a refusal, which is
+// why this must refuse until `crate::marginal` covers it. A FIXED parameter is not
+// a stochastic ancestor and must still lower: that half is the control.
+//
+// The guard reads the residual draw, so it holds for a module whose latent is
+// still latent when this query is lowered. It does NOT see a latent that an
+// EARLIER query in the same module already pinned to a literal — at that point
+// nothing distinguishes the pinned `mu = 0.1` from a genuinely fixed one, and
+// telling them apart needs the pre-pinning phase, which only the driver has. That
+// multi-query hazard is a property of sequential pinning and is not specific to
+// this path (the record spelling `lawof(record(y = y))` has it too, and had it
+// before this path existed); it is tracked separately, so do not read this test as
+// covering it.
+#[test]
+fn bare_lawof_of_a_draw_with_a_latent_parameter_refuses() {
+    let latent = "\
+z = draw(Normal(mu = 0.0, sigma = 1.0))
+y = draw(Normal(mu = z, sigma = 1.0))
+lp_y = logdensityof(lawof(y), 0.3)";
+    let mut m = flatppl_syntax::parse(latent).unwrap();
+    let _ = flatppl_infer::infer(&mut m);
+    let err = determinize(&m)
+        .expect_err("a law requiring marginalization must refuse, not score the conditional");
+    assert!(
+        err.reason
+            .contains("marginalizes over a stochastic ancestor"),
+        "must refuse as a marginal, not for an incidental reason: {}",
+        err.reason
+    );
+
+    // Control: a fixed/parametric parameter needs no marginalization.
+    let fixed = "\
+zz = elementof(reals)
+y = draw(Normal(mu = zz, sigma = 1.0))
+lp = logdensityof(lawof(y), 0.3)";
+    let pir = flatppl_flatpir::write(&determinize_src(fixed));
+    assert_eq!(
+        pir.matches("builtin_logdensityof").count(),
+        1,
+        "a fixed parameter is no stochastic ancestor — must still lower:\n{pir}"
+    );
+}
