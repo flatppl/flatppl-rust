@@ -2174,6 +2174,112 @@ lp = logdensityof(lawof(truncate(lawof(z), interval(0.0, inf))), 0.3)",
     }
 }
 
+// The measure-expression guard tested `Type::Measure`, and a REIFICATION types as
+// `Kernel` — so `F = functionof(Normal(mu = a, sigma = 1.0))` with `a` latent slipped
+// past it and `logdensityof(lawof(F), 0.5)` emitted `builtin_logdensityof(Normal,
+// record(mu = 0.1, sigma = 1.0), 0.5)`, the conditional at whatever value a later
+// query pinned `a` to. §04 "Reification to measures" makes `lawof(x)` the TOTAL law
+// and states the consequence on its worked `prior_predictive = lawof(record(obs =
+// obs))`: a stochastic ancestor is "obtained by marginalizing over" — "they are
+// internal stochastic nodes in the traced sub-DAG, not boundary inputs, so `lawof`
+// integrates them out", equivalently `kchain(prior, forward_kernel)`. Here that
+// marginal is `Normal(0, √2)`; the emitted conditional was `Normal(0.1, 1)`, a
+// finished conformance-passing number wrong by 0.329 nats.
+//
+// Refusing rather than marginalizing is the call: the `kchain` is closed-form only
+// for a discrete-finite latent (`crate::marginal`'s scope), and synthesizing it from
+// the reification is machinery the guard does not have.
+#[test]
+fn lawof_of_a_draw_parameterized_reification_refuses() {
+    for src in [
+        // Direct query on the reification's law — the shape that emitted the number.
+        "\
+a = draw(Normal(mu = 0.0, sigma = 1.0))
+F = functionof(Normal(mu = a, sigma = 1.0))
+lp = logdensityof(lawof(F), 0.5)
+lp_a = logdensityof(lawof(record(a = a)), record(a = 0.1))",
+        // Inline, so the check cannot depend on the reification being named.
+        "\
+a = draw(Normal(mu = 0.0, sigma = 1.0))
+lp = logdensityof(lawof(functionof(Normal(mu = a, sigma = 1.0))), 0.5)
+lp_a = logdensityof(lawof(record(a = a)), record(a = 0.1))",
+        // `kernelof` reifies the same way and must be caught the same way.
+        "\
+a = draw(Normal(mu = 0.0, sigma = 1.0))
+K = kernelof(Normal(mu = a, sigma = 1.0))
+lp = logdensityof(lawof(K), 0.5)
+lp_a = logdensityof(lawof(record(a = a)), record(a = 0.1))",
+    ] {
+        let mut m = flatppl_syntax::parse(src).unwrap();
+        let _ = flatppl_infer::infer(&mut m);
+        let err = determinize(&m).expect_err(
+            "the law of a draw-parameterized reification is a marginal — refuse, do not \
+             score the conditional",
+        );
+        assert!(
+            err.reason.contains("MARGINAL law"),
+            "must refuse as a marginal: {}",
+            err.reason
+        );
+    }
+
+    // A `draw` OF the reification reaches the same conclusion by the value-side half
+    // of the guard, whose reason names the ancestor rather than the law. Asserted
+    // separately so neither half is credited with the other's coverage.
+    for src in [
+        "\
+a = draw(Normal(mu = 0.0, sigma = 1.0))
+F = functionof(Normal(mu = a, sigma = 1.0))
+w = draw(F)
+lp = logdensityof(lawof(w), 0.5)
+lp_a = logdensityof(lawof(record(a = a)), record(a = 0.1))",
+        "\
+a = draw(Normal(mu = 0.0, sigma = 1.0))
+F = functionof(Normal(mu = a, sigma = 1.0))
+y = draw(pushfwd(exp, F))
+lp = logdensityof(lawof(y), 1.6487212707001282)
+lp_a = logdensityof(lawof(record(a = a)), record(a = 0.1))",
+    ] {
+        let mut m = flatppl_syntax::parse(src).unwrap();
+        let _ = flatppl_infer::infer(&mut m);
+        let err = determinize(&m)
+            .expect_err("a draw of a draw-parameterized reification must refuse too");
+        assert!(
+            err.reason
+                .contains("marginalizes over a stochastic ancestor"),
+            "must refuse as a marginal: {}",
+            err.reason
+        );
+    }
+
+    // Control: what makes this a guard and not a ban on `lawof(<reification>)`. A
+    // reification over FIXED or literal parameters has no stochastic ancestor to
+    // integrate out and must still lower to its one density term.
+    for src in [
+        "\
+p = elementof(reals)
+F = functionof(Normal(mu = p, sigma = 1.0))
+lp = logdensityof(lawof(F), 0.5)",
+        "\
+F = functionof(Normal(mu = 0.0, sigma = 1.0))
+lp = logdensityof(lawof(F), 0.5)",
+    ] {
+        let out = determinize_src(src);
+        let pir = flatppl_flatpir::write(&out);
+        assert_eq!(
+            pir_binding(&pir, "lp")
+                .matches("builtin_logdensityof")
+                .count(),
+            1,
+            "a reification over fixed parameters must still lower:\n{pir}"
+        );
+        assert!(
+            flatppl_determinizer::is_flatpdl(&out).is_ok(),
+            "is_flatpdl failed:\n{pir}"
+        );
+    }
+}
+
 // §13 "Determinization": "`draw` nodes take their values from the explicit `point`,
 // unless marginalized out." So wherever the point determines a draw's value —
 // directly, or through an invertible transform — the draw must be PINNED, and a

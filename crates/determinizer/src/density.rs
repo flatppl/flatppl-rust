@@ -1168,16 +1168,35 @@ fn lower_lawof(
 /// **The discriminator is value-versus-measure-expression, and it has to be.**
 /// Running [`measure_reaches_draw`] on a VALUE argument would report every
 /// `lawof(z)` over a `~`-bound draw as stochastic and refuse the §06 stochastic-node
-/// form outright. Only a `Type::Measure` argument is checked, which is also why the
-/// record path is untouched: `lawof(record(z = z, y = y))`'s argument is a Record,
-/// so a dependent component `Normal(mu = z, …)` stays the chain-rule product it is.
-/// An argument whose type inference did not resolve is left alone rather than
+/// form outright. Only a MEASURE-EXPRESSION argument is checked, which is also why
+/// the record path is untouched: `lawof(record(z = z, y = y))`'s argument is a
+/// Record, so a dependent component `Normal(mu = z, …)` stays the chain-rule product
+/// it is. An argument whose type inference did not resolve is left alone rather than
 /// refused on a guess (the driver re-infers each iteration, so a real measure
 /// expression carries its type by the time this runs).
+///
+/// **A reification counts as a measure expression.** `F = functionof(Normal(mu = a,
+/// sigma = 1.0))` types as `Kernel`, not `Measure`, so a `Type::Measure`-only test
+/// let `lawof(F)` through and emitted the conditional at a later-pinned `a`. The
+/// reification is admitted by its head as well as its type, since a `functionof`
+/// over a deterministic body types as `Function`: `lawof` of a reified FUNCTION is
+/// ill-formed and `lawof` of a reified MEASURE is the marginal, so refusing serves
+/// both readings. What keeps this from over-refusing is [`measure_reaches_draw`] —
+/// `lawof(functionof(Normal(mu = elementof(reals), …)))` reaches no draw and lowers.
+///
+/// Refusing rather than marginalizing is deliberate: the marginal is
+/// `kchain(lawof(a), a -> Normal(mu = a, …))`, closed-form only for a discrete-finite
+/// latent ([`crate::marginal`]'s scope), and synthesizing that `kchain` from the
+/// reification — rewriting the captured self-ref into a kernel boundary — is
+/// machinery this guard does not have.
 fn refuse_stochastic_measure_law(m: &Module, arg: NodeId) -> Result<(), RefuseError> {
     let (resolved, _) = resolve_ref_one(m, arg);
-    let is_measure_expr = matches!(m.type_of(arg), Some(Type::Measure { .. }))
-        || matches!(m.type_of(resolved), Some(Type::Measure { .. }));
+    let is_measure_expr = is_measure_expr_type(m, arg)
+        || is_measure_expr_type(m, resolved)
+        || matches!(
+            builtin_name(m, resolved),
+            Some("functionof") | Some("kernelof")
+        );
     if is_measure_expr && measure_reaches_draw(m, resolved) {
         return Err(refuse(
             resolved,
@@ -1188,6 +1207,18 @@ fn refuse_stochastic_measure_law(m: &Module, arg: NodeId) -> Result<(), RefuseEr
         ));
     }
     Ok(())
+}
+
+/// Is `node`'s inferred type a measure EXPRESSION's — a measure, or a reification
+/// standing for one? A reified measure is `Kernel`-typed (`driver::is_measure_typed_rhs`
+/// relies on the same fact to sweep a dead `functionof` measure binding), never a
+/// value type, so admitting `Kernel` here cannot capture the VALUE argument the
+/// value-versus-measure discriminator depends on excluding.
+fn is_measure_expr_type(m: &Module, node: NodeId) -> bool {
+    matches!(
+        m.type_of(node),
+        Some(Type::Measure { .. }) | Some(Type::Kernel { .. })
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1733,11 +1764,10 @@ fn lower_value_law(
 /// When it is a measure EXPRESSION, `lower_lawof` unwraps it, `build_density_term`
 /// succeeds, and this function is never entered — which silently emitted the
 /// conditional density for `lawof(Normal(mu = a, …))` at a later-pinned latent `a`.
-/// [`refuse_stochastic_measure_law`] now catches that at the `lawof` strip sites.
-/// It tests `Type::Measure`, so a `Kernel`-typed argument — `lawof(functionof(…))`,
-/// `lawof(kernelof(…))` — is still unguarded and still emits the conditional; that
-/// gap predates this path and is tracked. Do not restore the "nothing is skipped"
-/// wording: it is how this conclusion gets re-derived wrongly.
+/// [`refuse_stochastic_measure_law`] now catches that at the `lawof` strip sites,
+/// for a `Kernel`-typed reification argument (`lawof(functionof(…))`) as well as a
+/// `Measure`-typed one. Do not restore the "nothing is skipped" wording: it is how
+/// this conclusion gets re-derived wrongly.
 ///
 /// Only the `lawof` argument is skipped. Everything else is walked, including a
 /// combinator's non-measure operands (`w` in `weighted(w, lawof(z))`) and a
