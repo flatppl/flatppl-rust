@@ -36,6 +36,12 @@ fn lp(src: &str) -> String {
     pir_binding(&pir, "lp")
 }
 
+fn refusal(src: &str) -> String {
+    let mut m = flatppl_syntax::parse(src).unwrap();
+    let _ = flatppl_infer::infer(&mut m);
+    determinize(&m).expect_err("must refuse, not lower").reason
+}
+
 #[test]
 fn bare_and_broadcast_spellings_are_byte_identical_over_a_vector_base() {
     // Over an `iid` base and over `MvNormal` — the second confirms the dispatch keys
@@ -150,6 +156,48 @@ fn discrete_vector_base_carries_no_volume_term_either_way() {
         assert!(
             !out.contains("(sub ") && out.contains("(broadcast log "),
             "`{map}`: no volume term, elementwise preimage:\n{out}"
+        );
+    }
+}
+
+#[test]
+fn a_matrix_variate_refuses_rather_than_taking_the_scalar_derivation() {
+    // `domain_is_vector` tests `shape.len() == 1`, so a rank-2 variate (`Wishart`,
+    // `LKJ`) fell through to the SCALAR derivation: a bare `exp` emitted
+    // `log(<matrix>)` with one scalar volume term where the diagonal log-det sums
+    // over every cell, and the image gate emitted `in(<matrix>, posreals)` — §07 `in`
+    // requires "The type of `x` must match the element type of set `S`". `is_flatpdl`
+    // is phase/type-based and accepted both. §06 case 1 names no matrix-variate
+    // forward map, so refuse.
+    for base in [
+        "Wishart(nu = 5.0, scale = [[1.0, 0.0], [0.0, 1.0]])",
+        "LKJ(n = 2, eta = 1.5)",
+    ] {
+        let reason = refusal(&format!(
+            "d = pushfwd(exp, {base})\nlp = logdensityof(d, [[1.0, 0.0], [0.0, 1.0]])"
+        ));
+        assert!(
+            reason.contains("variate is a matrix"),
+            "`{base}` must refuse on the matrix variate, got: {reason}"
+        );
+    }
+}
+
+#[test]
+fn the_matrix_refusal_leaves_the_scalar_and_vector_ranks_alone() {
+    // The regression half: the guard keys on rank 2, so rank 0 and rank 1 must still
+    // lower. Without this the refusal could be unconditional and the test above would
+    // still pass.
+    for (base, point) in [
+        ("Normal(mu = 0.0, sigma = 1.0)", "0.5"),
+        ("iid(Normal(mu = 0.0, sigma = 1.0), 3)", "[0.5, 0.6, 0.7]"),
+    ] {
+        let out = lp(&format!(
+            "d = pushfwd(exp, {base})\nlp = logdensityof(d, {point})"
+        ));
+        assert!(
+            out.contains("builtin_logdensityof Normal"),
+            "`{base}` must still lower:\n{out}"
         );
     }
 }

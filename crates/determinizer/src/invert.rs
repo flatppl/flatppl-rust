@@ -184,7 +184,8 @@ enum Recognized {
 ///   single-op `pow`, or a scalar chain of unary/affine ops); the derived
 ///   change-of-variables is returned.
 /// * `Ok(None)` — `f` is not a recognised forward function (the caller refuses).
-/// * `Err(_)` — `f` is recognised but not invertible here (refuse).
+/// * `Err(_)` — `f` is recognised but not invertible here, or `domain` is a rank the
+///   §06 case-1 forms do not cover (a matrix) — refuse.
 pub(crate) fn derive_bijection(
     m: &mut Module,
     f: NodeId,
@@ -193,6 +194,21 @@ pub(crate) fn derive_bijection(
 ) -> Result<Option<Bijection>, RefuseError> {
     // Resolve one level of self-ref (`pushfwd(g, M)` where `g = exp`).
     let (f_resolved, _) = resolve_ref_one(m, f);
+    // A MATRIX variate has no recognised forward map here: §06 case 1's set is
+    // scalar, elementwise-over-a-vector, and matrix-VECTOR affine (`mu + L * x`).
+    // Unrefused it took the scalar derivation, which emits one scalar log-volume
+    // against the whole matrix — the rank-2 analogue of the vector defect the
+    // dispatch below closes, where the log-det is the SUM over all r·c cells.
+    if domain_is_matrix(domain) {
+        return Err(refuse(
+            f,
+            m,
+            "the pushforward base measure's variate is a matrix, and no recognised forward map \
+             applies to one (§06 case 1 gives scalar, elementwise-over-a-vector and \
+             matrix-vector affine maps): the scalar derivation would emit a single scalar \
+             log-volume where the log-det sums over every cell — refuse rather than mislower",
+        ));
+    }
     // The VECTOR variate dispatch comes BEFORE the bare/lambda split, because the
     // bare spelling of an elementwise map is still an elementwise map (§06 nowhere
     // distinguishes `pushfwd(g, M)` from `pushfwd(x -> broadcast(g, x), M)` over a
@@ -311,6 +327,13 @@ fn wrap_elementwise(m: &mut Module, per_cell: &Bijection) -> Bijection {
 /// interval propagation the chain domain guard is also waiting on.
 pub(crate) fn forward_image(m: &mut Module, f: NodeId, domain: &Type) -> Option<NodeId> {
     let (f_resolved, _) = resolve_ref_one(m, f);
+    // A matrix variate reaches here only through an explicit `bijection` (the
+    // synthesis refuses it), and the scalar image would gate a matrix against a
+    // scalar set — §07 `in` requires "The type of `x` must match the element type
+    // of set `S`". No gate rather than an ill-typed one.
+    if domain_is_matrix(domain) {
+        return None;
+    }
     if domain_is_vector(domain) {
         // An elementwise map applies one scalar `g` per cell, so its image is `g`'s
         // in every cell — `cartpow(image(g), n)` (§03). A dynamic length has no
@@ -1698,6 +1721,22 @@ fn matrix_confirmed_non_square(m: &Module, l: NodeId) -> bool {
 /// matrix-affine variate here.
 fn domain_is_vector(domain: &Type) -> bool {
     matches!(domain, Type::Array { shape, .. } if shape.len() == 1)
+}
+
+/// Is the base measure's variate domain a MATRIX — rank 2 or higher? Recognises
+/// the same two representations as [`type_is_matrix`]: a flat rank-2+ array
+/// (`Wishart`, `LKJ`: `Array{shape:[dyn, dyn]}`) and a nested array of arrays.
+/// An UNRESOLVED domain is conservatively not a matrix, so the callers' existing
+/// unknown-domain paths (refused later by `density::reference_measure`) are
+/// unchanged.
+fn domain_is_matrix(domain: &Type) -> bool {
+    match domain {
+        Type::Array { shape, .. } if shape.len() >= 2 => true,
+        Type::Array { shape, elem } if shape.len() == 1 => {
+            matches!(elem.as_ref(), Type::Array { .. })
+        }
+        _ => false,
+    }
 }
 
 /// Recognise the surface shape of a `pushfwd`'s (ref-resolved) forward argument:
