@@ -1446,10 +1446,21 @@ fn resolve_component_draw(
 /// reference a sibling draw (`y = draw(Normal(mu = z, …))`) is a dependent
 /// product the caller scores by the chain rule with `z` pinned, not a map of `z`.
 ///
-/// Exhaustive on purpose. A draw the walk failed to see would be treated as a
-/// fixed operand, which is how a coupled joint could get scored as if one of its
-/// draws were a constant — `derive_matrix_affine` accepts `mu + L * x` whenever
-/// `mu` does not mention the map's input, so a random `mu` must be caught HERE.
+/// Missing a draw is unsound, not merely imprecise: one the walk failed to see
+/// would be treated as a fixed operand, which is how a coupled joint could get
+/// scored as if one of its draws were a constant — `derive_matrix_affine` accepts
+/// `mu + L * x` whenever `mu` does not mention the map's input, so a random `mu`
+/// must be caught HERE.
+///
+/// Exhaustive over the positions it can be reached with, but NOT over every child
+/// of a call node: it descends `args` and `named` under either head kind, and does
+/// NOT descend the CALLEE expression of a `CallHead::User` head. What makes that
+/// omission safe lives in the caller, not here — [`resolve_component_draw`] admits
+/// a transformed field only when its head is `CallHead::Builtin`, so a User-headed
+/// field never reaches this walk as an admitted map; it refuses instead. Widening
+/// that head-kind gate therefore requires teaching this walk to enter callees
+/// first, or the draws inside a callee would go unseen.
+///
 /// The `path` guard makes a cyclic binding graph terminate (it then reports the
 /// draws found before the cycle, and the leftover self-ref refuses downstream).
 fn field_draw_sites(m: &Module, node: NodeId) -> Vec<NodeId> {
