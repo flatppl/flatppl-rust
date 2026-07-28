@@ -1547,3 +1547,29 @@ lp = logdensityof(post, record(a = 0.3, b = 1.0))";
         "loglik + 2 prior fields, got:\n{pir}"
     );
 }
+
+// The control for `refuse.rs::duplicate_draw_across_fields_refuses`: two
+// INDEPENDENT draws are k = n = 2 with a full-rank (identity) Jacobian, so the
+// density exists and is the product of marginals. This must keep lowering — the
+// distinctness guard has to distinguish this from the duplicate case, which before
+// the fix produced byte-identical FlatPDL.
+#[test]
+fn distinct_draws_still_lower_to_sum() {
+    let src = "\
+y1 = draw(Normal(mu = 0.0, sigma = 1.0))
+y2 = draw(Normal(mu = 0.0, sigma = 1.0))
+lp = logdensityof(lawof(record(a = y1, b = y2)), record(a = 0.5, b = 0.25))";
+    let m = {
+        let mut m = flatppl_syntax::parse(src).unwrap();
+        let _ = flatppl_infer::infer(&mut m);
+        m
+    };
+    let out = determinize(&m).expect("distinct draws must lower");
+    let pir = flatppl_flatpir::write(&out);
+    assert_eq!(
+        pir.matches("builtin_logdensityof").count(),
+        2,
+        "two independent density terms:\n{pir}"
+    );
+    assert!(flatppl_determinizer::is_flatpdl(&out).is_ok());
+}

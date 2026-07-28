@@ -941,3 +941,59 @@ out = draws.mu";
         "must be FlatPDL:\n{pir}"
     );
 }
+
+// A record law whose fields are functions of FEWER distinct draws than there are
+// fields has NO density, and the determiniser must say so rather than invent a
+// number. `record(a = y, b = y)` is the pushforward of a 1-D absolutely continuous
+// measure under t -> (t, t): its law is carried by the diagonal of R^2, a
+// lambda_2-null set, so it is not absolutely continuous w.r.t. lambda_2 and by
+// Radon-Nikodym no density exists. Before this guard the determiniser emitted
+// `add(builtin_logdensityof(...), builtin_logdensityof(...))` and exited 0 —
+// byte-identical to the output for two INDEPENDENT draws (see
+// `density_golden.rs::distinct_draws_still_lower_to_sum`).
+#[test]
+fn duplicate_draw_across_fields_refuses() {
+    let src = "\
+y = draw(Normal(mu = 0.0, sigma = 1.0))
+lp = logdensityof(lawof(record(a = y, b = y)), record(a = 0.5, b = 0.5))";
+    let m = parse_infer(src);
+    let err = determinize(&m).expect_err("k > n record law has no density — must refuse");
+    assert!(
+        err.reason.contains("distinct draw"),
+        "refusal explains fewer distinct draws than fields: {err:?}"
+    );
+}
+
+// Same defect reached through a transformed field: `record(a = y, b = exp(y))` is
+// carried by the curve {(t, e^t)} in R^2, also lambda_2-null. The transform makes
+// no difference — what matters is that both fields resolve to the SAME draw.
+#[test]
+fn duplicate_draw_via_transformed_field_refuses() {
+    let src = "\
+y = draw(Normal(mu = 0.0, sigma = 1.0))
+s = exp(y)
+lp = logdensityof(lawof(record(a = y, b = s)), record(a = 0.5, b = 1.6487212707001282))";
+    let m = parse_infer(src);
+    let err = determinize(&m).expect_err("transformed duplicate is still k > n — must refuse");
+    assert!(
+        err.reason.contains("distinct draw"),
+        "refusal explains fewer distinct draws than fields: {err:?}"
+    );
+}
+
+// GUARDRAIL, must stay green for the life of this branch. A derived field over two
+// draws is k=3 > n=2, rank-deficient, and §06 "Engine contract for pushfwd density
+// evaluation" case 3 independently mandates a static error for a map that is
+// neither in the known-bijection registry nor a structural projection. Task 3
+// widens the field-shape test; this test is what proves the widening did not
+// legitimise a singular joint.
+#[test]
+fn derived_field_over_two_draws_still_refuses() {
+    let src = "\
+y1 = draw(Normal(mu = 0.0, sigma = 1.0))
+y2 = draw(Normal(mu = 0.0, sigma = 1.0))
+d = y1 - y2
+lp = logdensityof(lawof(record(a = y1, b = y2, d = d)), record(a = 0.5, b = 0.25, d = 0.25))";
+    let m = parse_infer(src);
+    determinize(&m).expect_err("k=3 > n=2 has no density — must refuse");
+}

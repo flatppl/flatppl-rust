@@ -1079,6 +1079,12 @@ struct Component {
     /// pushfwd) rather than a bare `draw`: the field's law is the pushforward
     /// of the inner draw's law under the built-in `g` (e.g. `sqrt`).
     transform: Option<Symbol>,
+    /// The `draw(Mᵢ)` node this field's law comes from — the identity of the
+    /// UNDERLYING draw, which `draw_binding` is not: for a transformed field
+    /// `b = exp(y)` the binding is `b` while the draw site is `y`'s. Used to
+    /// detect two fields resolving to the same draw, which makes the record law
+    /// rank-deficient and hence density-free.
+    draw_site: NodeId,
 }
 
 /// Lower `record(a = draw(Mₐ), ...)` at `record_node` with value `v`.
@@ -1165,7 +1171,7 @@ fn match_independent_record(
         let pinned = lookup_field(m, &vrec.named, field.name)
             .ok_or_else(|| refuse(v, m, "missing field in value record"))?;
 
-        let (measure, draw_binding, transform) = resolve_component_draw(m, field.value)
+        let (measure, draw_binding, transform, draw_site) = resolve_component_draw(m, field.value)
             .ok_or_else(|| {
                 refuse(
                     field.value,
@@ -1178,14 +1184,39 @@ fn match_independent_record(
             pinned,
             draw_binding,
             transform,
+            draw_site,
         });
+    }
+
+    // Rank check. Within the shapes this guard admits, each field is a map of
+    // exactly ONE draw, so Φ (draws → fields) is diagonal and
+    // rank J_Φ = the number of DISTINCT draws reached. A density w.r.t. the
+    // product base measure exists iff rank J_Φ = k (Φ an a.e. submersion), so
+    // fewer distinct draws than fields means the law is carried by a
+    // lower-dimensional set and has no density at all — refuse rather than emit
+    // a product of marginals, which is the density of a DIFFERENT (mutually
+    // singular) measure. Holds because FlatPPL field expressions are smooth; for
+    // a merely Borel map the dimension argument would not apply.
+    for (i, c) in components.iter().enumerate() {
+        if components[i + 1..]
+            .iter()
+            .any(|o| o.draw_site == c.draw_site)
+        {
+            return Err(refuse(
+                record_node,
+                m,
+                "record law has fewer distinct draws than fields, so its joint is \
+                 carried by a lower-dimensional set and has no density (two fields \
+                 resolve to the same draw)",
+            ));
+        }
     }
 
     Ok(components)
 }
 
 /// Resolve a record-field value to the measure to score it at. Returns
-/// `(measure_node, outer_binding, transform)`:
+/// `(measure_node, outer_binding, transform, draw_site)`:
 /// * `measure_node` — the inner draw's measure argument `Mᵢ` (the
 ///   distribution-constructor node);
 /// * `outer_binding` — `Some(bid)` when the field reached us through a
@@ -1193,6 +1224,10 @@ fn match_independent_record(
 /// * `transform` — `Some(g)` when the field is a unary bijection `g(draw)`
 ///   (§06 pushfwd) rather than a bare draw; the driver wraps `Mᵢ` as
 ///   `pushfwd(g, Mᵢ)` before scoring.
+/// * `draw_site` — the `draw(Mᵢ)` node itself, i.e. the underlying draw's
+///   identity (NOT `outer_binding`: for `b = exp(y)`, `outer_binding` is `b`'s
+///   binding while `draw_site` is `y`'s `draw(...)` node). Used by the caller
+///   to detect two fields resolving to the same draw.
 ///
 /// Cases: **A** `(%ref self x)` whose binding RHS is `draw(Mᵢ)`; **B** inline
 /// `draw(Mᵢ)`; **C** a unary builtin call `g(inner)` (either inline or the RHS
@@ -1202,7 +1237,7 @@ fn match_independent_record(
 fn resolve_component_draw(
     m: &Module,
     value: NodeId,
-) -> Option<(NodeId, Option<BindingId>, Option<Symbol>)> {
+) -> Option<(NodeId, Option<BindingId>, Option<Symbol>, NodeId)> {
     // One `(%ref self x)` hop: the field either IS a self-ref to a binding
     // (Cases A / ref-C) or is spelled inline (Cases B / inline-C).
     let (effective, outer_binding) = match m.node(value) {
@@ -1216,9 +1251,10 @@ fn resolve_component_draw(
         _ => (value, None),
     };
 
-    // Cases A / B: the effective RHS is a bare `draw(Mᵢ)`.
+    // Cases A / B: the effective RHS is a bare `draw(Mᵢ)` — `effective` IS the
+    // draw site.
     if let Some(measure) = draw_argument(m, effective) {
-        return Some((measure, outer_binding, None));
+        return Some((measure, outer_binding, None, effective));
     }
 
     // Case C: the effective RHS is a unary built-in call `g(inner)` where
@@ -1229,8 +1265,9 @@ fn resolve_component_draw(
     if let Node::Call(c) = m.node(effective) {
         if let CallHead::Builtin(g) = c.head {
             if c.args.len() == 1 && c.named.is_empty() {
-                if let Some(inner_measure) = resolve_inner_draw_measure(m, c.args[0]) {
-                    return Some((inner_measure, outer_binding, Some(g)));
+                if let Some((inner_measure, inner_site)) = resolve_inner_draw_measure(m, c.args[0])
+                {
+                    return Some((inner_measure, outer_binding, Some(g), inner_site));
                 }
             }
         }
@@ -1239,10 +1276,11 @@ fn resolve_component_draw(
 }
 
 /// The inner half of Case C: resolve `node` — one `(%ref self x)` hop or inline
-/// — to the measure argument of a `draw(Mᵢ)`. Returns just the measure; the
-/// inner draw's binding is NOT pinned (in the transformed-field models it is
-/// referenced only to define the outer binding, which the driver pins instead).
-fn resolve_inner_draw_measure(m: &Module, node: NodeId) -> Option<NodeId> {
+/// — to a `draw(Mᵢ)`. Returns `(measure, draw_site)`, where `draw_site` is the
+/// `draw(...)` node itself; the inner draw's binding is NOT pinned (in the
+/// transformed-field models it is referenced only to define the outer binding,
+/// which the driver pins instead).
+fn resolve_inner_draw_measure(m: &Module, node: NodeId) -> Option<(NodeId, NodeId)> {
     let effective = match m.node(node) {
         Node::Ref(Ref {
             ns: RefNs::SelfMod,
@@ -1250,7 +1288,8 @@ fn resolve_inner_draw_measure(m: &Module, node: NodeId) -> Option<NodeId> {
         }) => m.binding(m.binding_by_name(*name)?).rhs,
         _ => node,
     };
-    draw_argument(m, effective)
+    let measure = draw_argument(m, effective)?;
+    Some((measure, effective))
 }
 
 // ---------------------------------------------------------------------------
@@ -2313,7 +2352,7 @@ fn lower_projection_pushfwd(
             // A record field's value is `draw(Mₐ)` (or a ref to one) — unwrap to
             // the underlying measure argument before reading its mass.
             refuse_unnormalized_dropped_fields(m, m_inner, &named, fields, |m, value| {
-                resolve_component_draw(m, value).map(|(measure, _, _)| measure)
+                resolve_component_draw(m, value).map(|(measure, _, _, _)| measure)
             })?;
             let selected = select_projection_fields(m, m_inner, &named, fields)?;
             let record_sym = m.intern("record");
