@@ -210,6 +210,15 @@ fn lower_closed_measure_sample(
             lower_closed_measure_sample(m, inner, rng)
         }
         Some("pushfwd") => lower_pushfwd_sample(m, resolved, rng),
+        // §07's own worked `rand` example is `rand(rstate, iid(Normal(0, 1), 10))`:
+        // a fixed-kernel `iid` is a nullary kernel, hence closed. Routes to the
+        // SAME [`lower_iid_sample`] as the `draw(iid(K, n))` spelling, so both emit
+        // the identical batched term.
+        Some("iid") => {
+            let (kernel, iid_node) = split_iid(m, resolved)
+                .ok_or_else(|| refuse(resolved, m, "iid expects 2 args (kernel, count)"))?;
+            lower_iid_sample(m, kernel, iid_node, rng)
+        }
         Some("record") => lower_record_of_draws_sample(m, resolved, rng),
         Some("draw") => lower_draw(m, resolved, rng),
         _ => {
@@ -576,35 +585,10 @@ fn lower_draw(
     if let Some(err) = classify_drawn_measure(m, inner_resolved) {
         return Err(err);
     }
-    // Fan-out: `draw(iid(K, n))` with a FIXED kernel `K` and a static length `n`
-    // → ONE batched `builtin_sample(rng, ctor, input, n)` (spec §07
-    // measure-eval-prims: `builtin_sample`'s size-dims form returns an IID array
-    // `X` of size `n` with a SINGLE advanced `new_rngstate`, not one per
-    // element). `split_iid` only matches the `iid(K, n)` shape itself;
-    // `split_constructor` below is what rejects a kernel that is not a bare
-    // built-in constructor call — in particular a `broadcast(K, arr0, arr1, …)`
-    // kernel (an array-of-kernels measure with DIFFERING per-element params,
-    // §04 broadcasting) has positional args, so it is refused here rather than
-    // mislowered as a fixed-kernel fan-out.
+    // Fan-out: `draw(iid(K, n))` → ONE batched `builtin_sample`, via the same
+    // [`lower_iid_sample`] the measure-position `rand(s, iid(K, n))` spelling uses.
     if let Some((kernel, iid_node)) = split_iid(m, inner_measure) {
-        let n = iid_static_size(m, iid_node).ok_or_else(|| {
-            refuse(
-                iid_node,
-                m,
-                "iid sample length is not a statically-resolved 1-D count (dynamic, \
-                 multi-axis, or unresolved domain); only a 1-D static fan-out is built",
-            )
-        })?;
-        let (ctor, kernel_input) = split_constructor(m, kernel).ok_or_else(|| {
-            refuse(
-                kernel,
-                m,
-                "iid sample: inner kernel must be a built-in constructor (a broadcast/\
-                 array-of-kernels measure has differing per-element params — not a \
-                 fixed-kernel fan-out; refuse rather than mislower)",
-            )
-        })?;
-        return Ok(build_iid_sample_term(m, ctor, kernel_input, n, rng));
+        return lower_iid_sample(m, kernel, iid_node, rng);
     }
     let (ctor, kernel_input) = split_constructor(m, inner_measure).ok_or_else(|| {
         refuse(
@@ -614,6 +598,48 @@ fn lower_draw(
         )
     })?;
     Ok(build_sample_term(m, ctor, kernel_input, rng))
+}
+
+/// `iid(K, n)` with a FIXED kernel `K` and a static length `n` → ONE batched
+/// `builtin_sample(rng, ctor, input, n)` (spec §07 measure-eval-prims:
+/// `builtin_sample`'s size-dims form returns an IID array `X` of size `n` with a
+/// SINGLE advanced `new_rngstate`, not one per element).
+///
+/// Shared by BOTH spellings of the same measure, so they emit the identical term:
+/// [`lower_draw`]'s `draw(iid(K, n))` and [`lower_closed_measure_sample`]'s
+/// measure-position `rand(s, iid(K, n))` — §07's own worked `rand` example
+/// (`random_data, rstate2 = rand(rstate, iid(Normal(0, 1), 10))`), admissible
+/// because a fixed-kernel `iid` is itself a nullary kernel, i.e. a closed measure.
+///
+/// [`split_constructor`] is what rejects a kernel that is not a bare built-in
+/// constructor call — in particular a `broadcast(K, arr0, arr1, …)` kernel (an
+/// array-of-kernels measure with DIFFERING per-element params, §04 broadcasting)
+/// has positional args, so it is refused rather than mislowered as a fixed-kernel
+/// fan-out.
+fn lower_iid_sample(
+    m: &mut Module,
+    kernel: NodeId,
+    iid_node: NodeId,
+    rng: NodeId,
+) -> Result<(NodeId, NodeId), RefuseError> {
+    let n = iid_static_size(m, iid_node).ok_or_else(|| {
+        refuse(
+            iid_node,
+            m,
+            "iid sample length is not a statically-resolved 1-D count (dynamic, \
+             multi-axis, or unresolved domain); only a 1-D static fan-out is built",
+        )
+    })?;
+    let (ctor, kernel_input) = split_constructor(m, kernel).ok_or_else(|| {
+        refuse(
+            kernel,
+            m,
+            "iid sample: inner kernel must be a built-in constructor (a broadcast/\
+             array-of-kernels measure has differing per-element params — not a \
+             fixed-kernel fan-out; refuse rather than mislower)",
+        )
+    })?;
+    Ok(build_iid_sample_term(m, ctor, kernel_input, n, rng))
 }
 
 /// `iid(K, n)` → `(K, iid_node)`, resolving one level of ref indirection first

@@ -622,3 +622,106 @@ draws = rand(s, lawof(record(mu = mu, y1 = y1, y2 = y2, d = d)))";
     );
     assert!(flatppl_determinizer::is_flatpdl(&out).is_ok());
 }
+
+// §07's own worked `rand` example is a bare `iid` in measure position:
+//
+//   random_data, rstate2 = rand(rstate, iid(Normal(0, 1), 10))
+//   more_random_data, rstate3 = rand(rstate2, iid(Exponential(1), 5))
+//
+// A fixed-kernel `iid(K, n)` is itself a nullary kernel, hence a closed measure —
+// the same §07 clause that admits a bare constructor. It must lower, and it must
+// lower to the SAME batched term as the `xs ~ iid(...); rand(s, lawof(xs))`
+// spelling: ONE `builtin_sample` carrying the size dim, with a SINGLE advanced
+// rngstate (§07 measure-eval-prims), never one sample per element.
+#[test]
+fn rand_of_bare_iid_matches_the_draw_spelling() {
+    let measure_position = "\
+s = rnginit(0)
+draws, s2 = rand(s, iid(Normal(mu = 0.0, sigma = 1.0), 10))
+out = draws";
+    let draw_position = "\
+s = rnginit(0)
+xs ~ iid(Normal(mu = 0.0, sigma = 1.0), 10)
+draws, s2 = rand(s, lawof(xs))
+out = draws";
+
+    let pir_of = |src: &str| {
+        let m = parse_infer(src);
+        let out = determinize(&m).expect("a fixed-kernel iid must sample in either spelling");
+        assert!(
+            flatppl_determinizer::is_flatpdl(&out).is_ok(),
+            "must be FlatPDL:\n{}",
+            flatppl_flatpir::write(&out)
+        );
+        flatppl_flatpir::write(&out)
+    };
+    let measure_pir = pir_of(measure_position);
+    let draw_pir = pir_of(draw_position);
+
+    // The emitted sample term must be byte-identical between the two spellings —
+    // same kernel, same kernel_input record, same trailing size dim, same rng, and
+    // (since the `%meta` annotations are compared too) the same inferred types.
+    // Both spellings route through `sample.rs`'s single `lower_iid_sample`; this is
+    // what would catch them drifting apart.
+    let measure_term = first_sample_term(&measure_pir);
+    let draw_term = first_sample_term(&draw_pir);
+    assert_eq!(
+        measure_term, draw_term,
+        "the two spellings must emit the identical batched sample term"
+    );
+    assert!(
+        measure_term.contains("(builtin_sample (%ref self s) Normal"),
+        "seeded by the source rng:\n{measure_term}"
+    );
+    assert!(
+        measure_term.ends_with(" 10)"),
+        "the size dim 10 is builtin_sample's trailing arg:\n{measure_term}"
+    );
+
+    // ONE batched sample, not ten. The count is 2 rather than 1 because the
+    // writer has no CSE, so the single sample node re-expands at each of the two
+    // `get0` projections (value + advanced rng) — exactly what the pre-existing
+    // `iid_fixed_kernel_sample_fans_out` golden pins for the draw spelling.
+    assert_eq!(
+        measure_pir.matches("builtin_sample").count(),
+        draw_pir.matches("builtin_sample").count(),
+        "the two spellings must emit the same number of samples:\n{measure_pir}\n---\n{draw_pir}"
+    );
+    assert_eq!(
+        measure_pir.matches("builtin_sample").count(),
+        2,
+        "one batched fan-out sample, re-expanded at its two get0 projections — NOT \
+         one sample per element:\n{measure_pir}"
+    );
+    assert!(
+        measure_pir.contains("(%array 1 (10) (%scalar real))"),
+        "the fanned variate carries the array type:\n{measure_pir}"
+    );
+    assert!(
+        !measure_pir.contains("(iid ") && !measure_pir.contains("(rand "),
+        "measure layer gone:\n{measure_pir}"
+    );
+}
+
+/// The first `(builtin_sample …)` sub-term of `pir`, as a balanced substring —
+/// used to compare what two spellings of the same measure actually emitted,
+/// including their `%meta` type annotations.
+fn first_sample_term(pir: &str) -> String {
+    let start = pir
+        .find("(builtin_sample")
+        .unwrap_or_else(|| panic!("no builtin_sample term in:\n{pir}"));
+    let mut depth = 0usize;
+    for (i, b) in pir.bytes().enumerate().skip(start) {
+        match b {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return pir[start..=i].to_string();
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("unbalanced builtin_sample term in:\n{pir}");
+}
