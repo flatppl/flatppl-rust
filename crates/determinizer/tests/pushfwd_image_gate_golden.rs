@@ -19,7 +19,7 @@
 use flatppl_determinizer::{determinize, is_flatpdl};
 
 mod common;
-use common::pir_binding;
+use common::{call_arg, pir_binding, pir_head};
 
 fn determinize_src(src: &str) -> flatppl_core::Module {
     let mut m = flatppl_syntax::parse(src).unwrap();
@@ -249,8 +249,9 @@ fn discrete_base_is_gated_too() {
         out.contains("posreals") && out.contains("(neg inf)"),
         "a discrete base is gated on the image as well:\n{out}"
     );
-    assert!(
-        !out.contains("(sub "),
+    assert_eq!(
+        pir_head(&call_arg(&out, "ifelse", 1)),
+        "builtin_logdensityof",
         "and still carries no volume element:\n{out}"
     );
 }

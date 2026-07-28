@@ -20,7 +20,7 @@
 use flatppl_determinizer::{determinize, is_flatpdl};
 
 mod common;
-use common::pir_binding;
+use common::{call_arg, pir_binding, pir_head};
 
 fn determinize_src(src: &str) -> flatppl_core::Module {
     let mut m = flatppl_syntax::parse(src).unwrap();
@@ -154,8 +154,13 @@ fn discrete_vector_base_carries_no_volume_term_either_way() {
              lp = logdensityof(d, [1.0, 4.0])"
         ));
         assert!(
-            !out.contains("(sub ") && out.contains("(broadcast log "),
-            "`{map}`: no volume term, elementwise preimage:\n{out}"
+            out.contains("(broadcast log "),
+            "`{map}`: elementwise preimage:\n{out}"
+        );
+        assert_eq!(
+            pir_head(&call_arg(&out, "ifelse", 1)),
+            "builtin_logdensityof",
+            "`{map}`: no volume term over a discrete vector variate:\n{out}"
         );
     }
 }

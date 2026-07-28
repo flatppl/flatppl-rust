@@ -14,6 +14,9 @@
 //! f_inv(v)), logvol(f_inv(v)))` over a continuous base) vs a clean refuse.
 use flatppl_determinizer::determinize;
 
+mod common;
+use common::{call_arg, pir_head};
+
 fn parse_infer(src: &str) -> flatppl_core::Module {
     let mut m = flatppl_syntax::parse(src).unwrap();
     let _ = flatppl_infer::infer(&mut m);
@@ -21,6 +24,13 @@ fn parse_infer(src: &str) -> flatppl_core::Module {
 }
 fn pir(src: &str) -> String {
     flatppl_flatpir::write(&determinize(&parse_infer(src)).expect("must lower"))
+}
+
+/// The density inside a gate — the `ifelse`'s taken arm. Over a discrete base the
+/// lattice gate's own condition subtracts, so a bare `(sub` search over the emission no
+/// longer isolates a volume term.
+fn gated_density(out: &str) -> String {
+    call_arg(out, "ifelse", 1)
 }
 
 #[test]
@@ -133,8 +143,9 @@ fn pushfwd_log_over_discrete_positive_integer_support_lowers_without_a_jacobian(
         p.contains("builtin_logdensityof Categorical") && p.contains("(exp 0.5)"),
         "the base pmf is scored at the preimage exp(y):\n{p}"
     );
-    assert!(
-        !p.contains("(sub "),
+    assert_eq!(
+        pir_head(&gated_density(&p)),
+        "builtin_logdensityof",
         "a discrete base carries no volume element — no `+log k`:\n{p}"
     );
 }
@@ -168,7 +179,11 @@ fn pushfwd_sqrt_over_discrete_nonnegative_support_lowers() {
         p.contains("builtin_logdensityof Poisson") && p.contains("(pow ") && p.contains(" 2.0)"),
         "the base pmf is scored at the preimage y²:\n{p}"
     );
-    assert!(!p.contains("(sub "), "no volume element over an atom:\n{p}");
+    assert_eq!(
+        pir_head(&gated_density(&p)),
+        "builtin_logdensityof",
+        "no volume element over an atom:\n{p}"
+    );
 }
 
 #[test]
@@ -181,7 +196,11 @@ fn pushfwd_pow_over_discrete_nonnegative_support_lowers() {
         p.contains("builtin_logdensityof Poisson") && p.contains("(pow ") && p.contains(" 0.5)"),
         "the base pmf is scored at the preimage y^(1/2):\n{p}"
     );
-    assert!(!p.contains("(sub "), "no volume element over an atom:\n{p}");
+    assert_eq!(
+        pir_head(&gated_density(&p)),
+        "builtin_logdensityof",
+        "no volume element over an atom:\n{p}"
+    );
 }
 
 #[test]

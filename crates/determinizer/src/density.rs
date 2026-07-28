@@ -2856,18 +2856,25 @@ fn lower_pushfwd(
     let inner_density = lower_measure_density_at(m, m_inner, preimage, origin)?;
     // Decided AFTER the base has lowered, so a base that refuses for its own
     // reason reports that reason rather than this one.
-    let density =
-        match reference_measure(&domain).ok_or_else(|| refuse_unproven_reference(node, m))? {
-            // Counting reference: no volume element (§06 "Density convention"). The
-            // pushforward density IS the base's pmf at the preimage.
-            Reference::Counting => inner_density,
-            // logvol_val = logvol(preimage)
-            Reference::Lebesgue => {
-                let logvol_val =
-                    apply_change_of_variables(m, bij_resolved, logvol_node, preimage, "logvol")?;
-                build_call(m, "sub", &[inner_density, logvol_val])
-            }
-        };
+    let (density, lattice) = match reference_measure(&domain)
+        .ok_or_else(|| refuse_unproven_reference(node, m))?
+    {
+        // Counting reference: no volume element (§06 "Density convention"). The
+        // pushforward density IS the base's pmf at the preimage — SNAPPED to the
+        // lattice, and gated on the snap being faithful.
+        Reference::Counting => {
+            let snapped = snap_to_lattice(m, preimage, &domain);
+            let lattice = on_lattice(m, bij_resolved, forward, v, snapped, &domain)?;
+            let at_atom = crate::driver::substitute_in_tree(m, inner_density, preimage, snapped);
+            (at_atom, Some(lattice))
+        }
+        // logvol_val = logvol(preimage)
+        Reference::Lebesgue => {
+            let logvol_val =
+                apply_change_of_variables(m, bij_resolved, logvol_node, preimage, "logvol")?;
+            (build_call(m, "sub", &[inner_density, logvol_val]), None)
+        }
+    };
     // The image gate. §06 `(f_*M)(Y) = M(f⁻¹(Y))`: outside the image the preimage is
     // empty, so the measure is 0 and the log-density −∞ — a computable value, not an
     // intractable one, hence a gate and not a refusal. Ungated, `f⁻¹` is read at a
@@ -2883,14 +2890,96 @@ fn lower_pushfwd(
     // there is no mass to weigh. The sanitised point is substituted into the emitted arm
     // rather than fed to the change of variables, so a §13 pin still records the raw
     // preimage (`crate::driver::substitute_in_tree`, as in [`lower_truncate`]).
-    match crate::invert::forward_image(m, forward, &domain, v, &support) {
-        Some(g) => {
-            let point = gate_point(m, g.cond, v, g.witness);
+    //
+    // The image and lattice conditions are ONE gate: they exclude the same kind of
+    // point (one with no preimage, one whose preimage is no atom), so they take one
+    // sanitisation and one selection rather than a nested pair.
+    let image = crate::invert::forward_image(m, forward, &domain, v, &support);
+    let cond = match (image.as_ref().map(|g| g.cond), lattice) {
+        (Some(a), Some(b)) => Some(build_call(m, "land", &[a, b])),
+        (Some(c), None) | (None, Some(c)) => Some(c),
+        (None, None) => None,
+    };
+    match cond {
+        Some(cond) => {
+            let point = gate_point(m, cond, v, image.and_then(|g| g.witness));
             let arm = crate::driver::substitute_in_tree(m, density, v, point);
-            Ok(gate_density(m, g.cond, arm))
+            Ok(gate_density(m, cond, arm))
         }
         None => Ok(density),
     }
+}
+
+/// The preimage SNAPPED to the integer lattice — `round(x)`, cell-wise over a vector
+/// variate (§07 `round`: "nearest integer, half to even").
+///
+/// A discrete base's pmf is nonzero only at integers, and the preimage of an ATOM of
+/// the pushforward need not be exactly one in floating point: `pushfwd(sqrt,
+/// Poisson(3))` at the atom `√2` has preimage `2.0000000000000004`, where the pmf is 0
+/// and the density read as −∞ instead of `logpmf(2, 3)`. The `exp` spelling agreed with
+/// the truth only by float luck (`log(e²)` is exactly `2.0`), so this is not
+/// `sqrt`-specific and must not be fixed per operator. Snapping restores the atom;
+/// [`on_lattice`] is what keeps a genuinely off-lattice query at −∞.
+///
+/// Wrapped in §07 `real` ("returns `x` for real `x`") because `round` types as
+/// `integers`, and an integer-typed operand under the forward would let a backend
+/// materialise `exp(round(x))` in integer arithmetic — truncating the atom's image and
+/// failing [`on_lattice`] for a point that IS an atom. The wrapper is value-identity.
+fn snap_to_lattice(m: &mut Module, x: NodeId, domain: &Type) -> NodeId {
+    let snapped = if variate_is_vector(domain) {
+        let round = m.intern("round");
+        let round = m.alloc(Node::Const(round));
+        build_call(m, "broadcast", &[round, x])
+    } else {
+        build_call(m, "round", &[x])
+    };
+    build_call(m, "real", &[snapped])
+}
+
+/// The lattice test: is the query point EXACTLY the forward image of the snapped
+/// preimage? The pushforward of a counting measure through an injective `f` has atoms
+/// only at `{f(k)}`, so this is the membership test on that set, and it is the test
+/// [`snap_to_lattice`] must be paired with — snapping alone would score the nearest
+/// atom at an off-lattice point, where the truth is −∞.
+///
+/// Round-TRIP through the forward rather than a tolerance on `|x − round(x)|`: an atom
+/// of the pushforward is produced by evaluating `f` at an integer, so `f(round(f⁻¹(y)))`
+/// reproduces it bit for bit, while the inverse leg alone need not land on the integer
+/// (the `√2` case above). §07's `iszero` is the exact-zero test that admits reals
+/// ("`iszero(x)`, unlike `x == 0`, allows non-discrete inputs"; `equal` is restricted to
+/// discrete domains). Over a vector variate the per-cell differences are reduced first —
+/// `sum(abs(·))` is zero exactly when every cell is.
+fn on_lattice(
+    m: &mut Module,
+    node: NodeId,
+    forward: NodeId,
+    v: NodeId,
+    snapped: NodeId,
+    domain: &Type,
+) -> Result<NodeId, RefuseError> {
+    let back = apply_change_of_variables(m, node, forward, snapped, "f")?;
+    Ok(lattice_test(m, v, back, domain))
+}
+
+/// [`on_lattice`]'s comparison, over a `back` the caller built — shared with
+/// [`lower_locscale`], whose affine forward is `scale · x + shift` rather than a
+/// callable.
+fn lattice_test(m: &mut Module, v: NodeId, back: NodeId, domain: &Type) -> NodeId {
+    let diff = build_call(m, "sub", &[v, back]);
+    let scalar = if variate_is_vector(domain) {
+        let mag = build_call(m, "abs", &[diff]);
+        build_call(m, "sum", &[mag])
+    } else {
+        diff
+    };
+    build_call(m, "iszero", &[scalar])
+}
+
+/// Is the base measure's variate a VECTOR — a 1-D array? The elementwise spellings of
+/// the discrete lattice gate key on this (`crate::invert::domain_is_vector`'s
+/// counterpart on the density side; a matrix variate is refused there).
+fn variate_is_vector(domain: &Type) -> bool {
+    matches!(domain, Type::Array { shape, .. } if shape.len() == 1)
 }
 
 /// Refuse a query point whose structural KIND differs from the base measure's
@@ -3109,7 +3198,20 @@ fn lower_locscale(
         // Counting reference: no volume element (§06 "Density convention"). An
         // affine map over a discrete base relabels its atoms and preserves their
         // mass; `log|scale|` would rescale it. See [`reference_measure`].
-        Reference::Counting => Ok(inner_density),
+        //
+        // The relabelled atoms still need the lattice treatment [`lower_pushfwd`]
+        // gives them — `(y − shift)/scale` need not land exactly on an integer — so
+        // the preimage is snapped and gated on the round trip through the affine
+        // forward, built here from `shift`/`scale` directly.
+        Reference::Counting => {
+            let snapped = snap_to_lattice(m, preimage, &domain);
+            let scaled = build_call(m, "mul", &[scale, snapped]);
+            let back = build_call(m, "add", &[scaled, shift]);
+            let cond = lattice_test(m, v, back, &domain);
+            let at_atom = crate::driver::substitute_in_tree(m, inner_density, preimage, snapped);
+            // No image gate to share a witness with: an affine map is onto.
+            Ok(gate_density(m, cond, at_atom))
+        }
         Reference::Lebesgue => {
             let logvol_val = apply_change_of_variables(m, node, bij.logvol, preimage, "logvol")?;
             Ok(build_call(m, "sub", &[inner_density, logvol_val]))
