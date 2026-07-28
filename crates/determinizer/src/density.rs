@@ -2653,6 +2653,35 @@ fn lower_pushfwd(
         _ => Type::Any,
     };
 
+    // The query point's structural KIND against the base's variate kind, on the
+    // ORIGINAL `v` — before the preimage is synthesised. Every forward map that
+    // reaches the change of variables below is kind-PRESERVING (a scalar chain, a
+    // matrix-affine or an elementwise map over a vector; §06 case 2's projection,
+    // the one kind-changing form, returned above), so a scalar law scored at a
+    // record/vector is ill-formed and there is no correct value to emit.
+    //
+    // [`build_density_term`]'s downstream guard cannot see this: by the time the
+    // base is scored, the point is `f_inv(v)` — a node inference never typed — so
+    // `variate_kind` is `None` there and its conservative unknown-passes branch
+    // no-ops. Hence the check here, on the typed original.
+    //
+    // An explicit `bijection` between kinds (a scalar and a one-field record) is
+    // over-refused: nothing in the annotation lets this pass verify such a map, and
+    // an unchecked mismatch emits `op(record(…))` that no gate rejects.
+    if let (Some(dk), Some(vk)) = (variate_kind(&domain), m.type_of(v).and_then(variate_kind)) {
+        if dk != vk {
+            return Err(refuse(
+                v,
+                m,
+                "the query point's type does not match the kind of the pushforward base \
+                 measure's variate, and every recognised forward map here preserves that kind \
+                 — a scalar-domain law scored at a record or vector has no change of variables \
+                 (§06 \"Engine contract for pushfwd density evaluation\"): refuse rather than \
+                 emit an ill-typed application of the inverse",
+            ));
+        }
+    }
+
     // `forward` is the map itself, kept beside the change of variables for the image
     // gate ([`gate_to_image`]) — arg 0 of an explicit `bijection`, else the whole
     // forward argument.
@@ -2783,7 +2812,9 @@ fn refuse_unproven_reference(node: NodeId, m: &Module) -> RefuseError {
 ///   whose binding is one (`f = log`), which `canon::fold`'s alias resolution
 ///   inlines before `canon::inline`'s `builtin_callee_head` rewrites the head to a
 ///   direct builtin call. There is nothing to beta-reduce, so the application is
-///   emitted as written and those two passes finish it;
+///   emitted as written and those two passes finish it — EXCEPT at a record point,
+///   which refuses for the reason [`crate::sample::lower_pushfwd_sample`]'s bare
+///   arm gives;
 /// * a **reified** `functionof`/lambda that beta-reduces under
 ///   [`crate::kernel::reduce_kernel_application`].
 ///
@@ -2805,6 +2836,27 @@ fn apply_change_of_variables(
     // substitute into; `canon`'s head rewrite is what lands it on a direct builtin
     // call, so admit it unreduced exactly as the sample side does.
     if matches!(m.node(resolve_ref_one(m, callee).0), Node::Const(_)) {
+        // At a RECORD point the application is §04 auto-splatting against that
+        // operator's own argument names, and those names are not available here (a
+        // deterministic builtin's catalogue row carries argument TYPES only), so the
+        // correspondence cannot be checked — the same wall `lower_pushfwd_sample`'s
+        // bare arm hits on the forward application. Unchecked it emits
+        // `op(record(…))`, which no gate rejects.
+        if expect_builtin_call(m, point, "record").is_some() {
+            return Err(refuse(
+                node,
+                m,
+                &format!(
+                    "the change of variables' `{role}` is a bare built-in operator applied to a \
+                     record, which is §04 auto-splatting against that operator's argument names \
+                     — and those names are not available to the determiniser (only measure \
+                     constructors carry ordered parameter names in the catalogue). This may be a \
+                     well-formed call, but an unchecked mismatch would emit `op(record(…))` that \
+                     no gate rejects — write the map as a functionof or lambda whose parameter \
+                     names are the record's field names, which IS checkable"
+                ),
+            ));
+        }
         return Ok(applied);
     }
     crate::kernel::reduce_kernel_application(m, applied).ok_or_else(|| {
