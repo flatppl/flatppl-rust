@@ -1710,3 +1710,84 @@ lp = logdensityof(d, [1.5, 2.5])";
         "the two §06-equivalent spellings must emit the same scored expression"
     );
 }
+
+// §06 "Transformation and projection" prints these two programs adjacently and
+// calls them the same measure, the second under "The equivalent in stochastic-node
+// form is:":
+//     mu = Normal(mu = 0, sigma = 1); nu = pushfwd(exp, mu)
+//     mu = Normal(mu = 0, sigma = 1); x ~ mu; y = exp(x); nu = lawof(y)
+// The first lowered; the second refused at the primitive-measure path, because a
+// bare scalar `lawof(<derived>)` never reaches the record-field guard. Both must
+// now lower, and to the SAME density.
+#[test]
+fn bare_lawof_of_derived_scalar_lowers_like_pushfwd() {
+    let node_form = "\
+mu = Normal(mu = 0.0, sigma = 1.0)
+x = draw(mu)
+y = exp(x)
+lp = logdensityof(lawof(y), 1.6487212707001282)";
+    let pushfwd_form = "\
+mu = Normal(mu = 0.0, sigma = 1.0)
+nu = pushfwd(exp, mu)
+lp = logdensityof(nu, 1.6487212707001282)";
+    let lower = |src: &str| {
+        let mut m = flatppl_syntax::parse(src).unwrap();
+        let _ = flatppl_infer::infer(&mut m);
+        let out = determinize(&m).expect("both §06 spellings must lower");
+        assert!(flatppl_determinizer::is_flatpdl(&out).is_ok());
+        flatppl_flatpir::write(&out)
+    };
+    let a = lower(node_form);
+    let b = lower(pushfwd_form);
+    assert_eq!(
+        a.matches("builtin_logdensityof").count(),
+        1,
+        "stochastic-node form has one density term:\n{a}"
+    );
+    assert!(!a.contains("lawof"), "measure layer gone:\n{a}");
+    assert_eq!(
+        a.matches("builtin_logdensityof").count(),
+        b.matches("builtin_logdensityof").count(),
+        "both §06 spellings lower to the same shape:\n{a}\n---\n{b}"
+    );
+    // §06 declares the two spellings the same measure, so the scored binding must
+    // be the identical expression, not merely a numerically equal one — the same
+    // bar `matrix_affine_transformed_field_lowers` holds the record spelling to.
+    assert_eq!(
+        pir_binding(&a, "lp"),
+        pir_binding(&b, "lp"),
+        "the two §06-equivalent spellings must emit the same scored expression"
+    );
+}
+
+// §04 "Reification to measures", **Identity law**: "`lawof(draw(m))` is
+// equivalent to `m`." The UNtransformed sibling of the case above — a bare
+// scalar `lawof(x)` over a `~`-bound draw — reached the same primitive-measure
+// refusal, because the law of a scalar draw is not itself a constructor call.
+// It must score as `m` directly, with no change-of-variables term.
+#[test]
+fn bare_lawof_of_draw_scores_the_drawn_measure() {
+    let src = "\
+mu = Normal(mu = 0.0, sigma = 1.0)
+x = draw(mu)
+lp = logdensityof(lawof(x), 0.5)";
+    let mut m = flatppl_syntax::parse(src).unwrap();
+    let _ = flatppl_infer::infer(&mut m);
+    let out = determinize(&m).expect("§04 identity law: lawof(draw(m)) is m");
+    assert!(flatppl_determinizer::is_flatpdl(&out).is_ok());
+    let pir = flatppl_flatpir::write(&out);
+    assert_eq!(
+        pir.matches("builtin_logdensityof").count(),
+        1,
+        "one density term, the drawn measure's own:\n{pir}"
+    );
+    assert!(
+        !pir.contains("lawof") && !pir.contains("(draw "),
+        "measure layer gone:\n{pir}"
+    );
+    // The identity law adds no volume element: `m` is scored at the variate as-is.
+    assert!(
+        !pir.contains("(sub ") && !pir.contains("(log "),
+        "no change of variables for an untransformed draw:\n{pir}"
+    );
+}

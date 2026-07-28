@@ -1028,8 +1028,29 @@ pub(crate) fn lower_measure_density(
         | Some("restrict")
         | Some("likelihoodof")
         | Some("joint_likelihood") => Err(refuse_op(measure_node, m)),
-        // Fallthrough: treat as a primitive distribution constructor.
-        _ => build_density_term(m, measure_node, v),
+        // Fallthrough: treat as a primitive distribution constructor — and, only
+        // if that refuses, as a stochastic VALUE whose law a bare `lawof(x)`
+        // reified ([`lower_value_law`]).
+        //
+        // The constructor read goes FIRST, and that order is load-bearing: a
+        // constructor whose parameters reference a draw
+        // (`Normal(mu = z, sigma = 1.0)`) is a dependent product the chain rule
+        // scores with `z` pinned, yet it also passes the value-law shape test
+        // (one distinct draw reached), so offering it to the value law first
+        // would read the whole dependent product as a map of `z`. Reusing
+        // `build_density_term`'s own refusal as the gate keeps the two paths'
+        // precedence exact without a second copy of
+        // [`split_kernel_constructor`]'s notion of a well-formed constructor
+        // call. When neither matches, the primitive refusal is the one reported.
+        _ => match build_density_term(m, measure_node, v) {
+            Ok(term) => Ok(term),
+            // `measure_expr`, NOT the ref-resolved `measure_node`: the value law
+            // pins the binding its value came from, which the resolution discards.
+            Err(not_a_constructor) => match lower_value_law(m, measure_expr, v) {
+                Some(scored) => scored,
+                None => Err(not_a_constructor),
+            },
+        },
     }
 }
 
@@ -1455,6 +1476,64 @@ fn abstract_over_draw(
         }
         _ => node,
     }
+}
+
+/// Score the law of a single stochastic VALUE — the bare, non-record `lawof(x)`
+/// spelling — at `v`. `None` means the shape did not match (`x` is not the law of
+/// exactly one draw), leaving the caller's own refusal in force.
+///
+/// `logdensityof(lawof(x), v)` strips its `lawof` at the query entry
+/// ([`measure_of_arg`]), so what reaches the measure dispatcher is `x` itself: a
+/// value expression, not a measure. A record-valued `x` lands on the `"record"`
+/// arm and is scored as a product of fields; a SCALAR `x` names no measure op at
+/// all and reaches the dispatcher's constructor fallthrough, which is where this
+/// is called from.
+///
+/// The two spellings §06 "Transformation and projection" declares equivalent then
+/// share one lowering:
+///
+/// * `x = draw(M)` — §04 "Reification to measures", *Identity law*:
+///   "`lawof(draw(m))` is equivalent to `m`". Score `M` at `v` unchanged; no
+///   volume element enters.
+/// * `y = g(x)` over a single draw — §06's stochastic-node form of a
+///   pushforward, printed under "The equivalent in stochastic-node form is:".
+///   Score `pushfwd(g, M)`, so [`lower_pushfwd`] applies the change of variables
+///   and `crate::invert` supplies the inverse from the §06 case-1 registry. A map
+///   outside that registry refuses there rather than being mislowered.
+///
+/// The shape test is [`resolve_component_draw`]'s, unmodified: a value reaching
+/// two or more distinct draws (`x1 - x2`) returns `None`, so no coupled joint can
+/// be read as a map of one draw. The record path's rank check is deliberately NOT
+/// reused — it compares the number of distinct draws against the number of
+/// FIELDS, and a bare scalar law has one field by construction, so the comparison
+/// is vacuous here.
+///
+/// Pinning the binding `x` came from is what keeps the residual `x = draw(M)`
+/// from surviving into the conformance check: the driver sweeps a draw binding
+/// once nothing references it, and for `y = g(x)` only pinning `y` to the scored
+/// value drops the last reference to `x`. This mirrors `lower_record_of_draws`,
+/// including its ordering — pin only AFTER the density is built, since
+/// [`build_forward_map`] recovers `g` by inlining through that very binding.
+fn lower_value_law(
+    m: &mut Module,
+    value: NodeId,
+    v: NodeId,
+) -> Option<Result<NodeId, RefuseError>> {
+    let (measure, binding, transform, draw_site) = resolve_component_draw(m, value)?;
+    let law = match transform {
+        None => measure,
+        Some(call) => {
+            let fwd = build_forward_map(m, call, draw_site);
+            build_call(m, "pushfwd", &[fwd, measure])
+        }
+    };
+    let scored = lower_measure_density(m, law, v);
+    if scored.is_ok() {
+        if let Some(bid) = binding {
+            m.set_binding_rhs(bid, v);
+        }
+    }
+    Some(scored)
 }
 
 // ---------------------------------------------------------------------------
