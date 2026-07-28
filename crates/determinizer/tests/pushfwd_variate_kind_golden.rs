@@ -16,6 +16,9 @@
 //! sample-side rule in `sample::lower_pushfwd_sample`).
 use flatppl_determinizer::determinize;
 
+mod common;
+use common::pir_binding;
+
 fn parse_infer(src: &str) -> flatppl_core::Module {
     let mut m = flatppl_syntax::parse(src).unwrap();
     let _ = flatppl_infer::infer(&mut m);
@@ -25,6 +28,12 @@ fn parse_infer(src: &str) -> flatppl_core::Module {
 fn refusal(src: &str) -> String {
     let e = determinize(&parse_infer(src)).expect_err("must refuse, not lower");
     e.reason
+}
+
+/// The lowered `lp` binding's FlatPIR text.
+fn lp(src: &str) -> String {
+    let out = determinize(&parse_infer(src)).expect("must lower, not refuse");
+    pir_binding(&flatppl_flatpir::write(&out), "lp")
 }
 
 #[test]
@@ -88,9 +97,8 @@ fn matching_variate_kinds_still_lower() {
             "builtin_logdensityof Normal",
         ),
     ] {
-        let out = determinize(&parse_infer(src)).expect("must lower, not refuse");
-        let pir = flatppl_flatpir::write(&out);
-        assert!(pir.contains(expect), "expected `{expect}` in:\n{pir}");
+        let out = lp(src);
+        assert!(out.contains(expect), "expected `{expect}` in:\n{out}");
     }
 }
 

@@ -1,5 +1,8 @@
 use flatppl_determinizer::determinize;
 
+mod common;
+use common::pir_binding;
+
 // A two-independent-Gaussian product scored at data: logdensityof(lawof(record(...)), v)
 // must lower to a SUM of two builtin_logdensityof terms, no `lawof`/`draw`/`joint` left.
 #[test]
@@ -1635,31 +1638,6 @@ lp = logdensityof(b, 2.0)";
         pir_binding(&pir_pf, "lp"),
         "the two §06-equivalent spellings must emit the same scored expression"
     );
-}
-
-/// The `(%bind <name> …)` form for `name` in FlatPIR text, delimited by its OWN
-/// matching parenthesis. Scoped to the binding rather than taken as the rest of
-/// the file, so anything emitted after it cannot make two of these differ for an
-/// unrelated reason.
-fn pir_binding(pir: &str, name: &str) -> String {
-    let open = format!("(%bind {name} ");
-    let start = pir
-        .find(&open)
-        .unwrap_or_else(|| panic!("no `{name}` binding in:\n{pir}"));
-    let mut depth = 0usize;
-    for (i, ch) in pir[start..].char_indices() {
-        match ch {
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return pir[start..start + i + 1].to_string();
-                }
-            }
-            _ => {}
-        }
-    }
-    panic!("unterminated `{name}` binding in:\n{pir}")
 }
 
 // The §06 case-1 registry entry the record-field guard's unary-only shape test

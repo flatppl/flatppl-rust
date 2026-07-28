@@ -18,6 +18,9 @@
 //! element everywhere fails here rather than passing vacuously.
 use flatppl_determinizer::{determinize, is_flatpdl};
 
+mod common;
+use common::pir_binding;
+
 fn determinize_src(src: &str) -> flatppl_core::Module {
     let mut m = flatppl_syntax::parse(src).unwrap();
     let _ = flatppl_infer::infer(&mut m);
@@ -32,28 +35,6 @@ fn lp(src: &str) -> String {
     let pir = flatppl_flatpir::write(&out);
     assert!(is_flatpdl(&out).is_ok(), "is_flatpdl failed:\n{pir}");
     pir_binding(&pir, "lp")
-}
-
-/// The `(%bind <name> …)` form for `name`, delimited by its own matching paren.
-fn pir_binding(pir: &str, name: &str) -> String {
-    let open = format!("(%bind {name} ");
-    let start = pir
-        .find(&open)
-        .unwrap_or_else(|| panic!("no `{name}` binding in:\n{pir}"));
-    let mut depth = 0usize;
-    for (i, ch) in pir[start..].char_indices() {
-        match ch {
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return pir[start..start + i + 1].to_string();
-                }
-            }
-            _ => {}
-        }
-    }
-    panic!("unterminated `{name}` binding in:\n{pir}")
 }
 
 #[test]
