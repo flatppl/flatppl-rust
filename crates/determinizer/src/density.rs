@@ -2962,7 +2962,7 @@ fn on_lattice(
 }
 
 /// [`on_lattice`]'s comparison, over a `back` the caller built — shared with
-/// [`lower_locscale`], whose affine forward is `scale · x + shift` rather than a
+/// [`lower_locscale`], whose forward is §06's `scale * x + shift` rather than a
 /// callable.
 fn lattice_test(m: &mut Module, v: NodeId, back: NodeId, domain: &Type) -> NodeId {
     let diff = build_call(m, "sub", &[v, back]);
@@ -3201,15 +3201,15 @@ fn lower_locscale(
         //
         // The relabelled atoms still need the lattice treatment [`lower_pushfwd`]
         // gives them — `(y − shift)/scale` need not land exactly on an integer — so
-        // the preimage is snapped and gated on the round trip through the affine
-        // forward, built here from `shift`/`scale` directly.
+        // the preimage is snapped and gated on the round trip through §06's
+        // `scale * x + shift`, built here from `shift`/`scale` directly.
         Reference::Counting => {
             let snapped = snap_to_lattice(m, preimage, &domain);
             let scaled = build_call(m, "mul", &[scale, snapped]);
             let back = build_call(m, "add", &[scaled, shift]);
             let cond = lattice_test(m, v, back, &domain);
             let at_atom = crate::driver::substitute_in_tree(m, inner_density, preimage, snapped);
-            // No image gate to share a witness with: an affine map is onto.
+            // No image gate to share a witness with: `scale * x + shift` is onto.
             Ok(gate_density(m, cond, at_atom))
         }
         Reference::Lebesgue => {

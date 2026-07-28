@@ -311,7 +311,7 @@ fn locscale_over_a_discrete_base_is_snapped_and_gated_too() {
     let out = lp("d = locscale(Poisson(rate = 3.0), 1.0, 2.0)\nlp = logdensityof(d, 0.5)");
     assert!(
         out.contains("(round ") && out.contains("(iszero ") && out.contains("(neg inf)"),
-        "the affine preimage is snapped and gated:\n{out}"
+        "the location-scale preimage is snapped and gated:\n{out}"
     );
     let continuous = lp("d = locscale(Normal(mu = 0.0, sigma = 1.0), 1.0, 2.0)\n\
                          lp = logdensityof(d, 0.5)");
