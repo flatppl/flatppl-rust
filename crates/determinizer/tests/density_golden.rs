@@ -1605,3 +1605,58 @@ lp = logdensityof(lawof(record(y = y)), record(y = 2.0))";
     assert!(!pir.contains("lawof"), "measure layer gone:\n{pir}");
     assert!(flatppl_determinizer::is_flatpdl(&out).is_ok());
 }
+
+// The §06 case-1 registry entry the record-field guard's unary-only shape test
+// most conspicuously could not reach: the matrix-vector affine map
+// `mu + lower_cholesky(cov) * _` (the MvNormal construction, §08). `add`/`mul`
+// over a VECTOR draw is a binary call, so this spelling refused; now it routes to
+// `invert::derive_matrix_affine` and lowers to the matrix change of variables
+// `logdensityof(M, linsolve(L, y - mu)) - logabsdet(L)`. Verified numerically
+// against `logpdf(MvNormal(mu, L Lᵀ), y)` (Distributions.jl): both this spelling
+// and the explicit `pushfwd(x -> L * x + mu, M)` score -2.9244728372492634.
+#[test]
+fn matrix_affine_transformed_field_lowers() {
+    let record_spelling = "\
+cov = rowstack([[4.0, 2.0], [2.0, 3.0]])
+L = lower_cholesky(cov)
+z = draw(MvNormal(mu = [0.0, 0.0], cov = eye(2)))
+y = L * z + [1.0, 2.0]
+lp = logdensityof(lawof(record(y = y)), record(y = [1.5, 2.5]))";
+    let pushfwd_spelling = "\
+cov = rowstack([[4.0, 2.0], [2.0, 3.0]])
+L = lower_cholesky(cov)
+d = pushfwd(x -> L * x + [1.0, 2.0], MvNormal(mu = [0.0, 0.0], cov = eye(2)))
+lp = logdensityof(d, [1.5, 2.5])";
+    let pir = {
+        let mut m = flatppl_syntax::parse(record_spelling).unwrap();
+        let _ = flatppl_infer::infer(&mut m);
+        let out = determinize(&m).expect("registry-mandated matrix-affine map must lower");
+        assert!(flatppl_determinizer::is_flatpdl(&out).is_ok());
+        flatppl_flatpir::write(&out)
+    };
+    assert!(
+        pir.contains("(linsolve") && pir.contains("(logabsdet"),
+        "matrix change of variables f_inv = linsolve(L, y - mu), logvol = logabsdet(L):\n{pir}"
+    );
+    assert!(!pir.contains("lawof"), "measure layer gone:\n{pir}");
+
+    // §06 declares the two spellings the same measure, so the scored binding must
+    // be the identical expression, not merely a numerically equal one.
+    let pir_pf = {
+        let mut m = flatppl_syntax::parse(pushfwd_spelling).unwrap();
+        let _ = flatppl_infer::infer(&mut m);
+        let out = determinize(&m).expect("explicit pushfwd spelling must lower");
+        flatppl_flatpir::write(&out)
+    };
+    let lp_of = |s: &str| {
+        s.lines()
+            .position(|l| l.contains("(%bind lp"))
+            .map(|i| s.lines().skip(i).collect::<Vec<_>>().join("\n"))
+            .expect("lp binding present")
+    };
+    assert_eq!(
+        lp_of(&pir),
+        lp_of(&pir_pf),
+        "the two §06-equivalent spellings must emit the same scored expression"
+    );
+}
