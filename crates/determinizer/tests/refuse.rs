@@ -553,14 +553,19 @@ lp = logdensityof(L, record(mu = 0.0))";
 }
 
 // ---------------------------------------------------------------------------
-// Sample path: the intractable / deferred set (spec §07 `rand` tractable set)
+// Sample path: the intractable / deferred split (§07 "rand"'s exclusion clause)
 // ---------------------------------------------------------------------------
 //
 // `sample.rs`'s `lower_measure_sample` dispatcher used to fall through every
 // unhandled measure-algebra op to one generic "unsupported measure construct"
 // message. These tests pin EXPLICIT, distinct refusals instead, so a refusal
-// tells the author WHY (outside rand's tractable set vs. simply not built
-// yet), not just THAT.
+// tells the author WHY (spec-excluded as intractable vs. simply not built
+// yet), not just THAT. §07 "rand" states a CRITERION, not a whitelist — it
+// "does not support measures for which [efficient IID generation] is an
+// intractable problem, especially measures involving non-constant weighting
+// … or multivariate truncation" — and §13 "Refused constructs" names those
+// same two shapes explicitly. Everything else this file pins as refused is
+// deferred: not spec-excluded, simply unbuilt in this vertical.
 //
 // `weighted`/`logweighted`/`bayesupdate`, `truncate`, and the deferred
 // combinators (`jointchain`/`kchain`/`superpose`/`pushfwd`) all reach their
@@ -588,7 +593,7 @@ draws = rand(s, lawof(record(d = d)))";
     let err = determinize(&m).expect_err("sampling a weighted measure is intractable — refuse");
     assert!(
         err.reason.contains("weighted") || err.reason.contains("intractable"),
-        "refusal explains weighted is outside rand's tractable set: {err:?}"
+        "refusal explains weighted's non-constant weighting is intractable to sample: {err:?}"
     );
 }
 
@@ -630,7 +635,7 @@ draws = rand(s, lawof(record(d = d)))";
         .expect_err("sampling a multivariate truncated measure is intractable — refuse");
     assert!(
         err.reason.contains("multivariate") && err.reason.contains("intractable"),
-        "refusal explains the multivariate truncation is outside rand's tractable set: {err:?}"
+        "refusal explains the multivariate truncation is intractable to sample: {err:?}"
     );
 }
 
@@ -853,9 +858,10 @@ v, s2 = rand(s, lawof(record(x = x)))";
 
 // The realistic "thread the rng across two draws" shape the spec's own §07
 // example uses: `s2` (the first `rand`'s advanced rngstate) is destructured
-// out and threaded into a second `rand`. Both draws are individually within
-// `rand`'s tractable set (single-draw records), and now the destructuring of
-// the first `rand`'s result lowers too, so the whole chain lowers.
+// out and threaded into a second `rand`. Neither draw trips §07 "rand"'s
+// exclusion clause, and both are shapes this vertical builds (single-draw
+// records); now the destructuring of the first `rand`'s result lowers too, so
+// the whole chain lowers.
 #[test]
 fn destructured_rand_rng_threaded_into_second_rand_lowers() {
     let src = "\
@@ -997,23 +1003,37 @@ lp = logdensityof(lawof(record(a = y1, b = y2, d = d)), record(a = 0.5, b = 0.25
 }
 
 // A field reaching TWO draws breaks the diagonality that makes the distinct-draw
-// check equivalent to a rank check: `record(a = s, b = s)` with `s = y1 + y2` is
-// k = n = 2 with rank J_Φ = 1, so no density exists — yet the two fields resolve
-// to different sites under a naive reading. Until the guard computes a real rank,
-// a multi-draw field must refuse.
+// check equivalent to a rank check, so it must refuse until the guard computes a
+// real rank. Both spellings below are k = n = 2 with rank J_Φ < 2 over
+// `s = y1 + y2`, so no density exists in either:
+//
+// * `record(a = s, b = y1)` — `a` is a map of BOTH draws while `b` is a map of
+//   `y1` alone, so a naive per-field reading that resolved `a` to a single site
+//   would see two DISTINCT sites and admit a singular joint;
+// * `record(a = s, b = s)` — the rank-1 case: both fields are the same map of both
+//   draws, so J_Φ has rank 1 against n = 2.
 #[test]
 fn field_over_two_draws_refuses() {
-    let src = "\
+    for query in [
+        "lp = logdensityof(lawof(record(a = s, b = y1)), record(a = 0.5, b = 0.25))",
+        "lp = logdensityof(lawof(record(a = s, b = s)), record(a = 0.5, b = 0.25))",
+    ] {
+        let src = format!(
+            "\
 y1 = draw(Normal(mu = 0.0, sigma = 1.0))
 y2 = draw(Normal(mu = 0.0, sigma = 1.0))
 s = y1 + y2
-lp = logdensityof(lawof(record(a = s, b = y1)), record(a = 0.5, b = 0.25))";
-    let m = parse_infer(src);
-    let err = determinize(&m).expect_err("a field over two draws needs a rank test — must refuse");
-    assert!(
-        err.reason.contains("rank") || err.reason.contains("more than one draw"),
-        "refusal explains the multi-draw field, not invertibility: {err:?}"
-    );
+{query}"
+        );
+        let m = parse_infer(&src);
+        let err = determinize(&m).expect_err(&format!(
+            "a field over two draws needs a rank test — must refuse: {query}"
+        ));
+        assert!(
+            err.reason.contains("rank") || err.reason.contains("more than one draw"),
+            "refusal explains the multi-draw field, not invertibility ({query}): {err:?}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
