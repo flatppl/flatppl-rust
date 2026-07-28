@@ -64,7 +64,9 @@
 //!   term is dropped (`density(M, f_inv(v))` alone) — a counting-measure density
 //!   has no volume element, §06 "Density convention". Same split for `locscale`.
 //!   A base whose variate proves neither reference measure is **refused**
-//!   ([`reference_measure`]).
+//!   ([`reference_measure`]). Where `f`'s IMAGE is known, the whole change of
+//!   variables is wrapped in the same `ifelse` gate `truncate` emits — outside the
+//!   image the preimage is empty and the density −∞ ([`gate_to_image`]).
 //! - `iid(M, N)` → `Σ_{i<N} density(M, get0(v, i))` — **`N` is the static
 //!   1-D repeat count read from the iid node's own const-evaluated domain
 //!   shape** (`iid_static_size`), so a shape-dependent size (`iid(M,
@@ -2564,11 +2566,42 @@ fn lower_truncate(
     };
 
     let inner_density = lower_measure_density_at(m, m_inner, v, origin)?;
-    let gate = build_call(m, "in", &[v, s_node]);
+    Ok(gate_outside_set(m, v, s_node, inner_density))
+}
+
+/// `ifelse(in(v, S), density, neg(inf))` — `density` where `v` lies in the set `S`,
+/// −∞ outside it. The emitted shape of [`lower_truncate`], shared with
+/// [`lower_pushfwd`]'s image gate so the two cannot drift (see [`gate_to_image`]).
+fn gate_outside_set(m: &mut Module, v: NodeId, set: NodeId, density: NodeId) -> NodeId {
+    let gate = build_call(m, "in", &[v, set]);
     let inf_sym = m.intern("inf");
     let inf_node = m.alloc(Node::Const(inf_sym));
     let neg_inf = build_call(m, "neg", &[inf_node]);
-    Ok(build_call(m, "ifelse", &[gate, inner_density, neg_inf]))
+    build_call(m, "ifelse", &[gate, density, neg_inf])
+}
+
+/// Gate a pushforward density on the query point lying inside the forward map's
+/// IMAGE. §06 `(f_*M)(Y) = M(f⁻¹(Y))`: outside the image the preimage is empty, so
+/// the measure is 0 and the log-density −∞ — a computable value, not an
+/// intractable one, hence a gate and not a refusal. Ungated, `f⁻¹` is read at a
+/// point that has no preimage and the query returns a finite number
+/// (`pushfwd(exp, Normal)` at `y ≤ 0` scores the base at `log y`).
+///
+/// `None` from [`crate::invert::forward_image`] leaves `density` unwrapped — the
+/// image is not determinable for every forward map (an explicit `bijection` over an
+/// unrecognised `f`, a dynamic-length elementwise map), and the gate is an addition
+/// to the change of variables, not a precondition for it.
+fn gate_to_image(
+    m: &mut Module,
+    forward: NodeId,
+    domain: &Type,
+    v: NodeId,
+    density: NodeId,
+) -> NodeId {
+    match crate::invert::forward_image(m, forward, domain) {
+        Some(set) => gate_outside_set(m, v, set, density),
+        None => density,
+    }
 }
 
 /// `logdensityof(pushfwd(bij, M), v)` = `logdensityof(M, f_inv(v)) - logvol(f_inv(v))`
@@ -2620,7 +2653,10 @@ fn lower_pushfwd(
         _ => Type::Any,
     };
 
-    let (f_inv_node, logvol_node) =
+    // `forward` is the map itself, kept beside the change of variables for the image
+    // gate ([`gate_to_image`]) — arg 0 of an explicit `bijection`, else the whole
+    // forward argument.
+    let (f_inv_node, logvol_node, forward) =
         if let Some(bij) = expect_builtin_call(m, bij_resolved, "bijection") {
             if bij.args.len() != 3 {
                 return Err(refuse(
@@ -2629,7 +2665,7 @@ fn lower_pushfwd(
                     "bijection expects 3 args (f, f_inv, logvol)",
                 ));
             }
-            (bij.args[1], bij.args[2])
+            (bij.args[1], bij.args[2], bij.args[0])
         } else {
             // Not an explicit bijection: try analytic synthesis (§06 case 1). Also
             // thread `M`'s refined SUPPORT (`valueset_of`, e.g. `posreals` for
@@ -2643,7 +2679,7 @@ fn lower_pushfwd(
                 .cloned()
                 .unwrap_or(flatppl_core::ValueSet::Unknown);
             match crate::invert::derive_bijection(m, bij_node, &domain, &support)? {
-                Some(bij) => (bij.f_inv, bij.logvol),
+                Some(bij) => (bij.f_inv, bij.logvol, bij_node),
                 None => {
                     return Err(refuse(
                         bij_resolved,
@@ -2660,17 +2696,21 @@ fn lower_pushfwd(
     let inner_density = lower_measure_density_at(m, m_inner, preimage, origin)?;
     // Decided AFTER the base has lowered, so a base that refuses for its own
     // reason reports that reason rather than this one.
-    match reference_measure(&domain).ok_or_else(|| refuse_unproven_reference(node, m))? {
-        // Counting reference: no volume element (§06 "Density convention"). The
-        // pushforward density IS the base's pmf at the preimage.
-        Reference::Counting => Ok(inner_density),
-        // logvol_val = logvol(preimage)
-        Reference::Lebesgue => {
-            let logvol_val =
-                apply_change_of_variables(m, bij_resolved, logvol_node, preimage, "logvol")?;
-            Ok(build_call(m, "sub", &[inner_density, logvol_val]))
-        }
-    }
+    let density =
+        match reference_measure(&domain).ok_or_else(|| refuse_unproven_reference(node, m))? {
+            // Counting reference: no volume element (§06 "Density convention"). The
+            // pushforward density IS the base's pmf at the preimage.
+            Reference::Counting => inner_density,
+            // logvol_val = logvol(preimage)
+            Reference::Lebesgue => {
+                let logvol_val =
+                    apply_change_of_variables(m, bij_resolved, logvol_node, preimage, "logvol")?;
+                build_call(m, "sub", &[inner_density, logvol_val])
+            }
+        };
+    // The whole change of variables is gated, not just the base term: outside the
+    // image there is no mass to weigh.
+    Ok(gate_to_image(m, forward, &domain, v, density))
 }
 
 /// The reference measure a base measure's density is taken with respect to, which

@@ -17,10 +17,13 @@
 //! is the single table of §06's named unary bijections, and it is reached through
 //! ONE lookup ([`unary_entry`]) from both entry points: [`bare_bijection`] for a
 //! bare builtin value, [`classify`] for an op inside a lambda body. Each entry
-//! carries its inverse, its FORWARD log-volume `log|g'|` and its §06 domain
-//! restriction, with the two emissions kept as BUILDERS parameterised by the
-//! point the derivative is taken at — which is what lets one table serve both: a
-//! chain needs `log|g'|` at a node it already holds, not a callable to apply.
+//! carries its inverse, its FORWARD log-volume `log|g'|`, its §06 domain
+//! restriction and its IMAGE, with the two emissions kept as BUILDERS parameterised
+//! by the point the derivative is taken at — which is what lets one table serve
+//! both: a chain needs `log|g'|` at a node it already holds, not a callable to
+//! apply. The image is read by [`forward_image`] for the density path's −∞ gate on
+//! the query point, from the same table and off the forward map alone, so no
+//! spelling of `pushfwd` gates differently from another.
 //!
 //! ## Scalar-chain inversion
 //!
@@ -244,6 +247,103 @@ pub(crate) fn derive_bijection(
     }
 }
 
+/// The IMAGE of a `pushfwd`'s forward map `f`, as a §03 set node for an `in(y, S)`
+/// gate — or `None` where this pass cannot determine one (no gate then).
+///
+/// Read from `f` ALONE, and from the same [`REGISTRY`] entry the change of
+/// variables comes from, so the explicit `bijection(f, f_inv, logvol)` spelling
+/// gates identically to the synthesised one: the annotation records an inverse and
+/// a log-volume but never an image, while §06 makes its result "a function that is
+/// semantically `f`".
+///
+/// For a COMPOSITION the gate is the OUTERMOST op's image, which is a SUPERSET of
+/// the composition's own (`image(gₙ∘…∘g₁) ⊆ image(gₙ)`) — exact when the inner ops
+/// are affine, hence onto, and never a false −∞ otherwise. Tightening it
+/// (`x -> exp(x) + 1` has image (1, ∞) and gates here on (0, ∞)) needs the forward
+/// interval propagation the chain domain guard is also waiting on.
+pub(crate) fn forward_image(m: &mut Module, f: NodeId, domain: &Type) -> Option<NodeId> {
+    let (f_resolved, _) = resolve_ref_one(m, f);
+    if domain_is_vector(domain) {
+        // An elementwise map applies one scalar `g` per cell, so its image is `g`'s
+        // in every cell — `cartpow(image(g), n)` (§03). A dynamic length has no
+        // static `n` to build that power with, and a matrix-affine map is onto.
+        let g = elementwise_operator(m, f_resolved)?;
+        let elem = forward_image(m, g, &vector_elem_domain(domain))?;
+        let n = static_vector_len(domain)?;
+        let n_node = m.alloc(Node::Lit(Scalar::Int(n)));
+        return Some(build_call(m, "cartpow", &[elem, n_node]));
+    }
+    let image = scalar_image(m, f_resolved)?;
+    Some(image.set_node(m))
+}
+
+/// A SCALAR forward map's image: the [`REGISTRY`] entry's own for a bare builtin
+/// (`pushfwd(exp, M)`) or a one-op lambda, `pow`'s per-exponent range for
+/// `pow(_, k)`, and the outermost op's for a longer chain (see
+/// [`forward_image`]).
+fn scalar_image(m: &Module, f: NodeId) -> Option<Image> {
+    match recognise(m, f) {
+        Recognized::BareConst(name) => unary_entry(&name)?.1.image,
+        Recognized::Lambda { body, ph, .. } => {
+            if let Some(k_node) = single_pow(m, body, ph) {
+                return pow_image(m, k_node);
+            }
+            let ops = flatten_chain(m, body, ph).ok().flatten()?;
+            match ops.first()? {
+                ChainOp::Registry { entry, .. } => entry.image,
+                _ => None,
+            }
+        }
+        Recognized::Unrecognized => None,
+    }
+}
+
+/// `pow(_, k)`'s image: `xᵏ` carries `[0, ∞)` onto `[0, ∞)` for `k > 0` and
+/// `(0, ∞)` onto `(0, ∞)` for `k < 0` — the same split as its domain
+/// ([`derive_pow`], which refuses `k = 0`).
+fn pow_image(m: &Module, k_node: NodeId) -> Option<Image> {
+    let k = literal_real(m, k_node)?;
+    if k == 0.0 {
+        return None;
+    }
+    Some(Image::Set(if k < 0.0 {
+        Domain::PosReals
+    } else {
+        Domain::NonNegReals
+    }))
+}
+
+/// The scalar per-cell operator of an elementwise forward map over a vector
+/// variate: the map ITSELF for the bare spelling (`pushfwd(exp, MvNormal)`), or
+/// `broadcast`'s operator for the lambda spelling (`x -> broadcast(exp, x)`).
+/// `None` for any other vector body — a matrix-affine map, or a coupled broadcast
+/// (both refused or onto, neither gated).
+fn elementwise_operator(m: &Module, f: NodeId) -> Option<NodeId> {
+    match recognise(m, f) {
+        Recognized::BareConst(_) => Some(f),
+        Recognized::Lambda { body, ph, .. } => {
+            let c = expect_builtin_call(m, body, "broadcast")?;
+            if !c.named.is_empty() || c.args.len() != 2 {
+                return None;
+            }
+            let (g, data) = (c.args[0], c.args[1]);
+            is_placeholder_ref(m, data, ph).then_some(g)
+        }
+        Recognized::Unrecognized => None,
+    }
+}
+
+/// The STATIC length of a vector `domain`, or `None` for a dynamic one.
+fn static_vector_len(domain: &Type) -> Option<i64> {
+    match domain {
+        Type::Array { shape, .. } if shape.len() == 1 => match shape[0] {
+            Dim::Static(n) => Some(i64::from(n)),
+            Dim::Dynamic => None,
+        },
+        _ => None,
+    }
+}
+
 /// One entry of the §06 case-1 known-bijection registry for a unary builtin
 /// forward op `g`, expressed as BUILDERS parameterised by the point `g`'s
 /// derivative is taken at. Both `pushfwd` spellings consume the same entry:
@@ -265,6 +365,10 @@ struct UnaryEntry {
     logvol: LogVol,
     /// The §06 case-1 domain restriction on `g`'s input, if any.
     domain: Option<Domain>,
+    /// `g`'s IMAGE, where it is a proper subset of the reals — the set the density
+    /// path gates the query point against ([`Image`]). `None` for an onto map
+    /// (`log`, `neg`, `sinh`), which needs no gate.
+    image: Option<Image>,
 }
 
 /// The inverse column of a [`UnaryEntry`], carried so that BOTH spellings a
@@ -415,6 +519,62 @@ impl Domain {
             Domain::Unit => "(0, 1) (a continuous base may touch 0 or 1)",
         }
     }
+
+    /// This set as a §03 set-valued node, for an `in(y, S)` membership gate.
+    fn set_node(self, m: &mut Module) -> NodeId {
+        match self {
+            Domain::PosReals => bare_const(m, "posreals"),
+            Domain::NonNegReals => bare_const(m, "nonnegreals"),
+            Domain::AboveMinusOne => {
+                let lo = m.alloc(Node::Lit(Scalar::Real(-1.0)));
+                let hi = bare_const(m, "inf");
+                build_call(m, "interval", &[lo, hi])
+            }
+            // §03's `unitinterval` is [0, 1] — the closed form of §06's `interval(0, 1)`.
+            Domain::Unit => bare_const(m, "unitinterval"),
+        }
+    }
+}
+
+/// The IMAGE of a recognised forward map `g`: the set outside which the
+/// pushforward has no mass. §06 `(f_*M)(Y) = M(f⁻¹(Y))` — at a `y` outside the
+/// image the preimage is EMPTY, so the measure is 0 and the log-density −∞. That
+/// is a computable value, not an intractable one, so the density path gates on
+/// this set instead of refusing.
+///
+/// A CLOSED superset of an open image is fine (`invlogit` gates on `unitinterval`
+/// ⊋ (0, 1), `tanh` on [−1, 1] ⊋ (−1, 1)): the inverse sends the endpoint to ±inf,
+/// where the base density is already −∞, so the two agree there.
+#[derive(Clone, Copy)]
+enum Image {
+    /// The §03 set a [`Domain`] variant already names. For an inverse PAIR the
+    /// image IS the partner's domain (`exp`'s image is `log`'s domain, `posreals`),
+    /// so both columns read one vocabulary.
+    Set(Domain),
+    /// A range no [`Domain`] variant names, built directly.
+    Build(fn(&mut Module) -> NodeId),
+}
+
+impl Image {
+    fn set_node(&self, m: &mut Module) -> NodeId {
+        match self {
+            Image::Set(d) => d.set_node(m),
+            Image::Build(build) => build(m),
+        }
+    }
+}
+
+/// A bare builtin constant node (`posreals`, `unitinterval`, `inf`, `pi`).
+fn bare_const(m: &mut Module, name: &str) -> NodeId {
+    let sym = m.intern(name);
+    m.alloc(Node::Const(sym))
+}
+
+/// `interval(lo, hi)` with literal endpoints.
+fn literal_interval(m: &mut Module, lo: f64, hi: f64) -> NodeId {
+    let lo = m.alloc(Node::Lit(Scalar::Real(lo)));
+    let hi = m.alloc(Node::Lit(Scalar::Real(hi)));
+    build_call(m, "interval", &[lo, hi])
 }
 
 /// The §06 case-1 known-bijection registry: the built-in unary forwards every
@@ -440,6 +600,7 @@ static REGISTRY: &[(&str, UnaryEntry)] = &[
             inverse: Inverse::Builtin("log"),
             logvol: LogVol::At(|_m, x| x),
             domain: None,
+            image: Some(Image::Set(Domain::PosReals)),
         },
     ),
     // d/dx ln x = 1/x ⇒ log|f'| = −ln x. Domain posreals: over a base whose
@@ -455,6 +616,7 @@ static REGISTRY: &[(&str, UnaryEntry)] = &[
                 build_call(m, "neg", &[logx])
             }),
             domain: Some(Domain::PosReals),
+            image: None,
         },
     ),
     // f'(x) = −1 ⇒ log|f'| = 0.
@@ -464,6 +626,7 @@ static REGISTRY: &[(&str, UnaryEntry)] = &[
             inverse: Inverse::Builtin("neg"),
             logvol: LogVol::Zero,
             domain: None,
+            image: None,
         },
     ),
     // sqrt(x) = pow(x, 0.5) — §06's literal-exponent `pow` case, so the inverse
@@ -479,6 +642,7 @@ static REGISTRY: &[(&str, UnaryEntry)] = &[
                 pow_logvol(m, k_node, SQRT_EXPONENT, x)
             }),
             domain: Some(Domain::NonNegReals),
+            image: Some(Image::Set(Domain::NonNegReals)),
         },
     ),
     // log10(x) = ln x / ln 10 ⇒ log|f'| = −ln x − ln(ln 10); inverse
@@ -499,6 +663,7 @@ static REGISTRY: &[(&str, UnaryEntry)] = &[
                 build_call(m, "neg", &[s])
             }),
             domain: Some(Domain::PosReals),
+            image: None,
         },
     ),
     // log1p(x) = ln(1 + x) ⇒ log|f'| = −ln(1 + x) = −log1p(x); inverse expm1.
@@ -511,6 +676,7 @@ static REGISTRY: &[(&str, UnaryEntry)] = &[
                 build_call(m, "neg", &[l])
             }),
             domain: Some(Domain::AboveMinusOne),
+            image: None,
         },
     ),
     // expm1(x) = eˣ − 1 ⇒ log|f'| = x (identity); inverse log1p. Domain ℝ.
@@ -520,6 +686,7 @@ static REGISTRY: &[(&str, UnaryEntry)] = &[
             inverse: Inverse::Builtin("log1p"),
             logvol: LogVol::At(|_m, x| x),
             domain: None,
+            image: Some(Image::Set(Domain::AboveMinusOne)),
         },
     ),
     // logit(p) = ln(p / (1 − p)) ⇒ log|f'| = −ln p − ln(1 − p); inverse invlogit.
@@ -536,6 +703,7 @@ static REGISTRY: &[(&str, UnaryEntry)] = &[
                 build_call(m, "neg", &[s])
             }),
             domain: Some(Domain::Unit),
+            image: None,
         },
     ),
     // invlogit(x) = 1 / (1 + e⁻ˣ) ⇒ log|f'| = ln σ(x) + ln(1 − σ(x)); inverse
@@ -553,6 +721,7 @@ static REGISTRY: &[(&str, UnaryEntry)] = &[
                 build_call(m, "add", &[log_s, log_oms])
             }),
             domain: None,
+            image: Some(Image::Set(Domain::Unit)),
         },
     ),
     // probit(p) = Φ⁻¹(p) ⇒ log|f'| = ½ln(2π) + ½·probit(p)²; inverse invprobit (Φ).
@@ -570,6 +739,7 @@ static REGISTRY: &[(&str, UnaryEntry)] = &[
                 build_call(m, "add", &[half_ln2pi, half_sq])
             }),
             domain: Some(Domain::Unit),
+            image: None,
         },
     ),
     // invprobit(x) = Φ(x) ⇒ log|f'| = ln φ(x) = −½ln(2π) − ½x²; inverse probit.
@@ -588,6 +758,7 @@ static REGISTRY: &[(&str, UnaryEntry)] = &[
                 build_call(m, "neg", &[s])
             }),
             domain: None,
+            image: Some(Image::Set(Domain::Unit)),
         },
     ),
     // atan(x) ⇒ log|f'| = −ln(1 + x²); inverse tan (valid on atan's range
@@ -605,6 +776,16 @@ static REGISTRY: &[(&str, UnaryEntry)] = &[
                 build_call(m, "neg", &[l])
             }),
             domain: None,
+            // `tan` is the single-valued inverse only on (−π/2, π/2) — outside it
+            // `tan(y)` is still finite, so an ungated query would read a preimage
+            // that is not one.
+            image: Some(Image::Build(|m| {
+                let pi = bare_const(m, "pi");
+                let two = m.alloc(Node::Lit(Scalar::Real(2.0)));
+                let half_pi = build_call(m, "divide", &[pi, two]);
+                let neg_half_pi = build_call(m, "neg", &[half_pi]);
+                build_call(m, "interval", &[neg_half_pi, half_pi])
+            })),
         },
     ),
     // sinh(x) ⇒ log|f'| = ln cosh(x); inverse asinh. Domain ℝ.
@@ -617,6 +798,7 @@ static REGISTRY: &[(&str, UnaryEntry)] = &[
                 build_call(m, "log", &[ch])
             }),
             domain: None,
+            image: None,
         },
     ),
     // asinh(x) ⇒ log|f'| = −½ln(1 + x²); inverse sinh. Domain ℝ.
@@ -634,6 +816,7 @@ static REGISTRY: &[(&str, UnaryEntry)] = &[
                 build_call(m, "mul", &[mhalf, l])
             }),
             domain: None,
+            image: None,
         },
     ),
     // tanh(x) ⇒ log|f'| = ln(1 − tanh(x)²); inverse atanh. Domain ℝ.
@@ -650,6 +833,7 @@ static REGISTRY: &[(&str, UnaryEntry)] = &[
                 build_call(m, "log", &[omsq])
             }),
             domain: None,
+            image: Some(Image::Build(|m| literal_interval(m, -1.0, 1.0))),
         },
     ),
 ];
