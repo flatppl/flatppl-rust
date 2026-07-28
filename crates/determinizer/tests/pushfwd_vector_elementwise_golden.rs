@@ -105,7 +105,7 @@ fn scalar_base_still_takes_the_scalar_derivation() {
         "a scalar base keeps the plain scalar change of variables:\n{out}"
     );
     assert_eq!(
-        out.matches("(log 0.5)").count(),
+        out.matches("(log ").count(),
         2,
         "preimage AND volume term, `logdensityof(M, log y) − log y`:\n{out}"
     );

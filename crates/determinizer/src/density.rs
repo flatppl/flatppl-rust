@@ -66,7 +66,8 @@
 //!   A base whose variate proves neither reference measure is **refused**
 //!   ([`reference_measure`]). Where `f`'s IMAGE is known, the whole change of
 //!   variables is wrapped in the same `ifelse` gate `truncate` emits — outside the
-//!   image the preimage is empty and the density −∞ ([`gate_to_image`]).
+//!   image the preimage is empty and the density −∞ ([`gate_density`]) — and reads a
+//!   point sanitised against that gate ([`gate_point`]).
 //! - `iid(M, N)` → `Σ_{i<N} density(M, get0(v, i))` — **`N` is the static
 //!   1-D repeat count read from the iid node's own const-evaluated domain
 //!   shape** (`iid_static_size`), so a shape-dependent size (`iid(M,
@@ -2657,7 +2658,8 @@ fn build_touniform(m: &mut Module, kernel: NodeId, input: NodeId, x: NodeId) -> 
     }))
 }
 
-/// `logdensityof(truncate(M, S), v)` = `ifelse(in(v, S), logdensityof(M, v), neg(inf))`.
+/// `logdensityof(truncate(M, S), v)` = `ifelse(in(v, S), logdensityof(M, v'),
+/// neg(inf))`, where `v'` is `v` sanitised against the gate ([`gate_point`]).
 ///
 /// The gate is the `_ in R` membership builtin (FlatPIR head `in`), which infers
 /// to a boolean — the spec's membership idiom (§06, `fn(_ in R)`). `elementof`
@@ -2679,42 +2681,83 @@ fn lower_truncate(
         (c.args[0], c.args[1])
     };
 
+    let cond = build_call(m, "in", &[v, s_node]);
+    // Lowered at the RAW point, so a §13 pin records the query point itself: `truncate`
+    // does not move the variate, so outside `S` a draw the point determines still takes
+    // that value — the gate is about the measure's density, not about the draw. The
+    // sanitised point goes into the emitted ARM only.
     let inner_density = lower_measure_density_at(m, m_inner, v, origin)?;
-    Ok(gate_outside_set(m, v, s_node, inner_density))
+    // The dangerous op in a truncation's gated arm is the base density itself, so the
+    // witness is a point in the BASE's support. It need not be in `S` — it is never the
+    // gate's value, only the point the excluded arm is differentiated at.
+    let witness = support_witness_point(m, m_inner, v);
+    let point = gate_point(m, cond, v, witness);
+    let arm = crate::driver::substitute_in_tree(m, inner_density, v, point);
+    Ok(gate_density(m, cond, arm))
 }
 
-/// `ifelse(in(v, S), density, neg(inf))` — `density` where `v` lies in the set `S`,
-/// −∞ outside it. The emitted shape of [`lower_truncate`], shared with
-/// [`lower_pushfwd`]'s image gate so the two cannot drift (see [`gate_to_image`]).
-fn gate_outside_set(m: &mut Module, v: NodeId, set: NodeId, density: NodeId) -> NodeId {
-    let gate = build_call(m, "in", &[v, set]);
+/// The point a −∞ gate's TAKEN arm must be built over: the query point where `cond`
+/// holds, and `witness` — a point the arm is safe at — where it does not.
+///
+/// §07: "`ifelse` and `land`/`lor` do not guarantee short-circuit evaluation". The
+/// StableHLO lowering is `stablehlo.select`, which evaluates both operands. For the
+/// VALUE that is harmless — select RETURNS one arm, it does not blend them, so the
+/// excluded point's density never reaches the result. For the GRADIENT it is not:
+/// reverse mode sends a ZERO cotangent to the untaken arm, and `0 · ±inf` and
+/// `0 · NaN` are both NaN, which then propagates into every parameter that arm
+/// reaches. Measured with jax 0.4.36: `where(y >= 0, sqrt(y), -inf)` at `y = -0.5` has
+/// value −inf and gradient **NaN**; with the input sanitised, gradient 0. The emitted
+/// FlatPDL is differentiated (Enzyme-JAX over the StableHLO lowering), so this is not
+/// hypothetical.
+///
+/// Hence the arm is built over a point INSIDE the gate and no dangerous op ever sees
+/// the excluded value. Do NOT instead reason operator by operator about which
+/// derivative happens to stay finite: `log` survives only because `1/y` is finite for
+/// negative `y`, and even that breaks at `y = 0`, where `0 · inf` is NaN. This is the
+/// discipline `crates/stablehlo/src/registry.rs` states for `log_bessel_i0` — prove
+/// the dangerous op never sees a bad input.
+///
+/// `witness = None` (no point is derivable) leaves the arm over the raw query point.
+fn gate_point(m: &mut Module, cond: NodeId, v: NodeId, witness: Option<NodeId>) -> NodeId {
+    match witness {
+        Some(w) => build_call(m, "ifelse", &[cond, v, w]),
+        None => v,
+    }
+}
+
+/// `ifelse(cond, density, neg(inf))` — `density` where the gate holds, −∞ outside it.
+/// The other half of [`gate_point`], and the emitted shape of BOTH gates
+/// ([`lower_truncate`]'s set membership and [`lower_pushfwd`]'s image), so the two
+/// cannot drift. `density` must be built over [`gate_point`]'s result, never over the
+/// raw query point.
+fn gate_density(m: &mut Module, cond: NodeId, density: NodeId) -> NodeId {
     let inf_sym = m.intern("inf");
     let inf_node = m.alloc(Node::Const(inf_sym));
     let neg_inf = build_call(m, "neg", &[inf_node]);
-    build_call(m, "ifelse", &[gate, density, neg_inf])
+    build_call(m, "ifelse", &[cond, density, neg_inf])
 }
 
-/// Gate a pushforward density on the query point lying inside the forward map's
-/// IMAGE. §06 `(f_*M)(Y) = M(f⁻¹(Y))`: outside the image the preimage is empty, so
-/// the measure is 0 and the log-density −∞ — a computable value, not an
-/// intractable one, hence a gate and not a refusal. Ungated, `f⁻¹` is read at a
-/// point that has no preimage and the query returns a finite number
-/// (`pushfwd(exp, Normal)` at `y ≤ 0` scores the base at `log y`).
+/// A point inside measure `measure`'s SUPPORT, shaped like its variate — a gate
+/// witness for a base density ([`gate_point`]). A vector variate takes the element
+/// point in every cell, sized off the query point `v` so a dynamic length is covered
+/// too.
 ///
-/// `None` from [`crate::invert::forward_image`] leaves `density` unwrapped — the
-/// image is not determinable for every forward map (an explicit `bijection` over an
-/// unrecognised `f`, a dynamic-length elementwise map), and the gate is an addition
-/// to the change of variables, not a precondition for it.
-fn gate_to_image(
-    m: &mut Module,
-    forward: NodeId,
-    domain: &Type,
-    v: NodeId,
-    density: NodeId,
-) -> NodeId {
-    match crate::invert::forward_image(m, forward, domain) {
-        Some(set) => gate_outside_set(m, v, set, density),
-        None => density,
+/// `None` where the support or the variate names no such point (a record or table
+/// variate, an unproven support): no sanitisation then.
+fn support_witness_point(m: &mut Module, measure: NodeId, v: NodeId) -> Option<NodeId> {
+    let support = m.valueset_of(measure).cloned()?;
+    let w = crate::invert::support_witness(&support)?;
+    let scalar = m.alloc(Node::Lit(Scalar::Real(w)));
+    match m.type_of(measure) {
+        Some(Type::Measure { domain, .. }) => match &**domain {
+            Type::Scalar(_) => Some(scalar),
+            Type::Array { shape, .. } if shape.len() == 1 => {
+                let n = build_call(m, "lengthof", &[v]);
+                Some(build_call(m, "fill", &[scalar, n]))
+            }
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -2767,9 +2810,21 @@ fn lower_pushfwd(
         _ => Type::Any,
     };
 
+    // `M`'s refined SUPPORT (`valueset_of`, e.g. `posreals` for `Gamma`,
+    // `nonnegreals` for `Exponential`): the coarse variate type is `scalar real`
+    // (natural extent `reals`), which would refuse every positive-support base for
+    // `log`/`pow`. `None`/`%unknown` falls back to `Unknown` — conservatively refused
+    // by the domain guard (refuse-don't-mislower), NOT defaulted to positive. Read
+    // for BOTH spellings: the image gate's witness comes off it too, so it cannot
+    // depend on which spelling supplied the inverse.
+    let support = m
+        .valueset_of(m_inner)
+        .cloned()
+        .unwrap_or(flatppl_core::ValueSet::Unknown);
+
     // `forward` is the map itself, kept beside the change of variables for the image
-    // gate ([`gate_to_image`]) — arg 0 of an explicit `bijection`, else the whole
-    // forward argument.
+    // gate ([`crate::invert::forward_image`]) — arg 0 of an explicit `bijection`, else
+    // the whole forward argument.
     let (f_inv_node, logvol_node, forward) =
         if let Some(bij) = expect_builtin_call(m, bij_resolved, "bijection") {
             if bij.args.len() != 3 {
@@ -2782,17 +2837,7 @@ fn lower_pushfwd(
             (bij.args[1], bij.args[2], bij.args[0])
         } else {
             refuse_variate_kind_mismatch(m, &domain, v)?;
-            // Not an explicit bijection: try analytic synthesis (§06 case 1). Also
-            // thread `M`'s refined SUPPORT (`valueset_of`, e.g. `posreals` for
-            // `Gamma`, `nonnegreals` for `Exponential`): the coarse variate type is
-            // `scalar real` (natural extent `reals`), which would refuse every
-            // positive-support base for `log`/`pow`. `None`/`%unknown` support falls
-            // back to `Unknown` — conservatively refused by the domain guard
-            // (refuse-don't-mislower), NOT defaulted to positive.
-            let support = m
-                .valueset_of(m_inner)
-                .cloned()
-                .unwrap_or(flatppl_core::ValueSet::Unknown);
+            // Not an explicit bijection: try analytic synthesis (§06 case 1).
             match crate::invert::derive_bijection(m, bij_node, &domain, &support)? {
                 Some(bij) => (bij.f_inv, bij.logvol, bij_node),
                 None => {
@@ -2823,9 +2868,29 @@ fn lower_pushfwd(
                 build_call(m, "sub", &[inner_density, logvol_val])
             }
         };
-    // The whole change of variables is gated, not just the base term: outside the
-    // image there is no mass to weigh.
-    Ok(gate_to_image(m, forward, &domain, v, density))
+    // The image gate. §06 `(f_*M)(Y) = M(f⁻¹(Y))`: outside the image the preimage is
+    // empty, so the measure is 0 and the log-density −∞ — a computable value, not an
+    // intractable one, hence a gate and not a refusal. Ungated, `f⁻¹` is read at a
+    // point that has no preimage and the query returns a finite number
+    // (`pushfwd(exp, Normal)` at `y ≤ 0` scores the base at `log y`).
+    //
+    // `None` leaves the density unwrapped — the image is not determinable for every
+    // forward map (an explicit `bijection` over an unrecognised `f`, a dynamic-length
+    // elementwise map), and the gate is an addition to the change of variables, not a
+    // precondition for it.
+    //
+    // The whole change of variables is gated, not just the base term: outside the image
+    // there is no mass to weigh. The sanitised point is substituted into the emitted arm
+    // rather than fed to the change of variables, so a §13 pin still records the raw
+    // preimage (`crate::driver::substitute_in_tree`, as in [`lower_truncate`]).
+    match crate::invert::forward_image(m, forward, &domain, v, &support) {
+        Some(g) => {
+            let point = gate_point(m, g.cond, v, g.witness);
+            let arm = crate::driver::substitute_in_tree(m, density, v, point);
+            Ok(gate_density(m, g.cond, arm))
+        }
+        None => Ok(density),
+    }
 }
 
 /// Refuse a query point whose structural KIND differs from the base measure's

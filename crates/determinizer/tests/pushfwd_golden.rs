@@ -70,14 +70,13 @@ fn pushfwd_composition_exp_affine_lowers() {
         p.contains("builtin_logdensityof") && p.contains("log"),
         "got:\n{p}"
     );
-    // Composed inverse log(y)/2, applied at the literal query point y = 0.5,
-    // is beta-reduced (Buffy #263 Pass 2) to divide(log(0.5), 2.0) — `log` is
-    // excluded from const-fold (see `canon/fold.rs`), so the `log(0.5)` leaf
-    // stays unevaluated and the `divide` around it does too (const-fold
-    // requires BOTH operands literal):
+    // Composed inverse log(y)/2, applied at the query point y = 0.5, is
+    // beta-reduced (Buffy #263 Pass 2) to divide(log(y'), 2.0) — where `y'` is the
+    // image gate's sanitised point, so the leaf under `log` is the sanitising
+    // `ifelse` rather than the bare literal:
     assert!(
-        p.contains("(divide") && p.contains("(log 0.5)"),
-        "inverse log(0.5)/2 present:\n{p}"
+        p.contains("(divide") && p.contains("(log ") && p.contains("(ifelse"),
+        "inverse log(y)/2 present:\n{p}"
     );
     // Chain-rule logvol: the exp term contributes the partial-forward 2x,
     // evaluated at x = f_inv(0.5) = log(0.5)/2 (the SAME inlined inverse

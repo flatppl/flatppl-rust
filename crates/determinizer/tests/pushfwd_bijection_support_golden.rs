@@ -160,11 +160,12 @@ fn pushfwd_sqrt_over_discrete_nonnegative_support_lowers() {
     // with "requires M's support to lie within the positive reals" — an
     // over-refusal, `sqrt`'s domain having been modelled as `log`'s.
     //
-    // The inverse is `pow(y, 1/k)` at k = ½, i.e. `y²`, const-folded at the query
-    // point 0.5 to 0.25; no volume element over a counting reference.
+    // The inverse is `pow(y, 1/k)` at k = ½, i.e. `y²`, read at the image gate's
+    // sanitised point (so it does not const-fold to 0.25); no volume element over a
+    // counting reference.
     let p = pir("d = pushfwd(sqrt, Poisson(rate = 3.0))\nlp = logdensityof(d, 0.5)");
     assert!(
-        p.contains("builtin_logdensityof Poisson") && p.contains(" 0.25)"),
+        p.contains("builtin_logdensityof Poisson") && p.contains("(pow ") && p.contains(" 2.0)"),
         "the base pmf is scored at the preimage y²:\n{p}"
     );
     assert!(!p.contains("(sub "), "no volume element over an atom:\n{p}");
@@ -177,7 +178,7 @@ fn pushfwd_pow_over_discrete_nonnegative_support_lowers() {
     // which `sqrt` = `pow(_, 1/2)` is a case)"), so both spellings are pinned.
     let p = pir("d = pushfwd(fn(pow(_, 2.0)), Poisson(rate = 3.0))\nlp = logdensityof(d, 0.5)");
     assert!(
-        p.contains("builtin_logdensityof Poisson") && p.contains("(pow 0.5 0.5)"),
+        p.contains("builtin_logdensityof Poisson") && p.contains("(pow ") && p.contains(" 0.5)"),
         "the base pmf is scored at the preimage y^(1/2):\n{p}"
     );
     assert!(!p.contains("(sub "), "no volume element over an atom:\n{p}");

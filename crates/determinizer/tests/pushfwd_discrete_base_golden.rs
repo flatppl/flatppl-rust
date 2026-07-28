@@ -53,9 +53,9 @@ fn pushfwd_exp_over_discrete_base_emits_no_volume_term() {
         "no change-of-variables subtraction over a counting reference:\n{discrete}"
     );
     assert_eq!(
-        discrete.matches("(log 0.5)").count(),
+        discrete.matches("(log ").count(),
         1,
-        "exactly one `log(0.5)` — the preimage; the volume term would add a second:\n{discrete}"
+        "exactly one `log` — the preimage; the volume term would add a second:\n{discrete}"
     );
 
     // Same map over a CONTINUOUS base (the canonical LogNormal): the volume term
@@ -67,7 +67,7 @@ fn pushfwd_exp_over_discrete_base_emits_no_volume_term() {
         "a Lebesgue reference still subtracts the volume term:\n{continuous}"
     );
     assert_eq!(
-        continuous.matches("(log 0.5)").count(),
+        continuous.matches("(log ").count(),
         2,
         "preimage AND volume term, `logdensityof(M, log y) − log y`:\n{continuous}"
     );
