@@ -1792,12 +1792,14 @@ lp = logdensityof(lawof(x), 0.5)";
     );
 }
 
-// §06 "Transformation and projection" prints the stochastic-node form with `~`
-// and a NAMED `lawof` binding, not with `draw(...)` inline and `lawof` inside the
-// query — so pin the spec's own program text verbatim. The `~`/named-binding
-// route resolves through different code (a binding hop on both the measure side
-// and `measure_of_arg`), so a regression in it would not be caught by the
-// inline spelling above.
+// §06 "Transformation and projection" prints the stochastic-node form with `~` and
+// a NAMED `lawof` binding, not with `draw(...)` inline and `lawof` inside the
+// query — so pin the spec's own program text as written. This is not extra
+// code coverage: `~` is parser sugar for `draw(…)` and lowers to identical IR, and
+// the `nu = lawof(…)` hop is covered elsewhere. What it holds is that the program
+// a reader copies out of §06 lowers to the same `lp` as the `pushfwd` spelling
+// printed beside it, and that the `nu` scaffold binding is swept rather than
+// surviving as a measure-layer node.
 #[test]
 fn spec_literal_stochastic_node_form_lowers() {
     let spec_text = "\
@@ -1837,12 +1839,15 @@ lp = logdensityof(lawof(d), 0.25)";
     let mut m = flatppl_syntax::parse(src).unwrap();
     let _ = flatppl_infer::infer(&mut m);
     let err = determinize(&m).expect_err("a value reaching two draws must refuse, not mislower");
-    assert!(
-        err.reason
-            .contains("primitive measure must be a built-in constructor call"),
-        "must be the primitive-measure refusal — a CHANGED reason here means the \
-         single-draw shape test was widened, so check what now lowers: {}",
-        err.reason
+    // Asserted on the refused CONSTRUCT, not the message: this refusal's wording is
+    // itself slated to be rewritten (it names a "primitive measure", which tells
+    // the author of `x1 - x2` nothing), and that rewrite must not have to touch
+    // this test. The construct is the two-draw expression itself.
+    assert_eq!(
+        err.construct, "sub",
+        "the refusal must land on the two-draw expression — anywhere else means the \
+         single-draw shape test was widened and something new now lowers: {} / {}",
+        err.construct, err.reason
     );
 }
 
@@ -1887,15 +1892,16 @@ lp = logdensityof(lawof(record(z = z, y = y)), record(z = 0.1, y = 0.2))";
 // why this must refuse until `crate::marginal` covers it. A FIXED parameter is not
 // a stochastic ancestor and must still lower: that half is the control.
 //
-// The guard reads the residual draw, so it holds for a module whose latent is
-// still latent when this query is lowered. It does NOT see a latent that an
-// EARLIER query in the same module already pinned to a literal — at that point
-// nothing distinguishes the pinned `mu = 0.1` from a genuinely fixed one, and
-// telling them apart needs the pre-pinning phase, which only the driver has. That
-// multi-query hazard is a property of sequential pinning and is not specific to
-// this path (the record spelling `lawof(record(y = y))` has it too, and had it
-// before this path existed); it is tracked separately, so do not read this test as
-// covering it.
+// This case, with the latent still latent, already refused before the guard — via
+// the driver's residual-`draw` scan — so what the guard adds HERE is only a reason
+// that names the cause. The ordering it actually rescues is the sibling test
+// `bare_lawof_scored_before_a_later_query_pins_the_latent_refuses`. And it does NOT
+// see a latent an EARLIER query already pinned to a literal: nothing then
+// distinguishes the pinned `mu = 0.1` from a genuinely fixed one, which needs the
+// pre-pinning phase that only the driver has. That multi-query hazard belongs to
+// sequential pinning and is not specific to this path (the record spelling
+// `lawof(record(y = y))` has it too, and had it before this path existed); it is
+// tracked separately, so do not read this test as covering it.
 #[test]
 fn bare_lawof_of_a_draw_with_a_latent_parameter_refuses() {
     let latent = "\
@@ -1923,5 +1929,167 @@ lp = logdensityof(lawof(y), 0.3)";
         pir.matches("builtin_logdensityof").count(),
         1,
         "a fixed parameter is no stochastic ancestor — must still lower:\n{pir}"
+    );
+}
+
+// The ordering that JUSTIFIES the marginalization guard, as opposed to merely
+// improving a message. Score `lawof(y)` FIRST, then let a second query pin `z`:
+// nothing downstream refuses, because by the time the residual-`draw` scan runs `z`
+// is a literal — so before the guard this emitted the conditional density
+// `p(y | z = 0.1)` as a finished, conformance-passing number, where §04 asks for
+// y's marginal. This is the shape the guard exists for.
+#[test]
+fn bare_lawof_scored_before_a_later_query_pins_the_latent_refuses() {
+    let src = "\
+z = draw(Normal(mu = 0.0, sigma = 1.0))
+y = draw(Normal(mu = z, sigma = 1.0))
+lp_y = logdensityof(lawof(y), 0.3)
+lp_z = logdensityof(lawof(z), 0.1)";
+    let mut m = flatppl_syntax::parse(src).unwrap();
+    let _ = flatppl_infer::infer(&mut m);
+    let err = determinize(&m).expect_err(
+        "the conditional density must not escape as a number just because the latent \
+         is pinned by a LATER query",
+    );
+    assert!(
+        err.reason
+            .contains("marginalizes over a stochastic ancestor"),
+        "must refuse as a marginal: {}",
+        err.reason
+    );
+}
+
+// A measure built from ANOTHER value's law is not parameterized by that value.
+// §04 "Reification to measures", *Phase of the reified law*: "the resulting measure
+// is itself deterministic (of parameterized or fixed phase): `lawof` absorbs
+// stochasticity into the reified law rather than propagating it outward." So in
+// `y = draw(pushfwd(exp, lawof(z)))` the base consumes `z`'s LAW, not its value:
+// `z` is no ancestor of `y`, and `lawof(y)` is an honest LogNormal. The
+// marginalization guard must therefore stop at a `lawof` argument — walking into it
+// would refuse a model that is fine, and would re-split the two §06 spellings this
+// path exists to unify, since the record spelling of the same model lowers.
+//
+// Verified numerically: every spelling below scores its LogNormal / affine /
+// truncated / weighted value against Distributions.jl exactly (e.g.
+// `logpdf(LogNormal(0,1), exp(0.5)) = -1.5439385332046727`).
+#[test]
+fn a_measure_over_another_values_law_is_not_a_stochastic_ancestor() {
+    let inline = "\
+z = draw(Normal(mu = 0.0, sigma = 1.0))
+y = draw(pushfwd(exp, lawof(z)))
+lp = logdensityof(lawof(y), 1.6487212707001282)";
+    let named = "\
+z = draw(Normal(mu = 0.0, sigma = 1.0))
+zl = lawof(z)
+y = draw(pushfwd(exp, zl))
+lp = logdensityof(lawof(y), 1.6487212707001282)";
+    let direct = "\
+lp = logdensityof(pushfwd(exp, Normal(mu = 0.0, sigma = 1.0)), 1.6487212707001282)";
+    let lp_direct = pir_binding(&flatppl_flatpir::write(&determinize_src(direct)), "lp");
+    for src in [inline, named] {
+        let pir = flatppl_flatpir::write(&determinize_src(src));
+        assert_eq!(
+            pir_binding(&pir, "lp"),
+            lp_direct,
+            "a law-of-a-law base must score as the plain pushforward:\n{pir}"
+        );
+    }
+
+    // The other combinators over `lawof(z)`, all of which the guard also refused.
+    // Each marker is the computation that combinator alone contributes, so none of
+    // these passes just because SOMETHING lowered: the support gate for `truncate`,
+    // the affine preimage `(0.3 - 1) / 2` for `locscale`, the weight for `weighted`.
+    for (src, marker) in [
+        (
+            "\
+z = draw(Normal(mu = 0.0, sigma = 1.0))
+y = draw(truncate(lawof(z), interval(0.0, inf)))
+lp = logdensityof(lawof(y), 0.3)",
+            "(in 0.3",
+        ),
+        (
+            "\
+z = draw(Normal(mu = 0.0, sigma = 1.0))
+y = draw(locscale(lawof(z), 1.0, 2.0))
+lp = logdensityof(lawof(y), 0.3)",
+            "-0.35",
+        ),
+        (
+            "\
+z = draw(Normal(mu = 0.0, sigma = 1.0))
+y = draw(weighted(0.5, lawof(z)))
+lp = logdensityof(lawof(y), 0.3)",
+            "(log 0.5)",
+        ),
+    ] {
+        let pir = flatppl_flatpir::write(&determinize_src(src));
+        assert!(
+            pir.contains(marker),
+            "combinator over lawof(z) must lower, keeping its own `{marker}` term:\n{pir}"
+        );
+        assert!(!pir.contains("lawof"), "measure layer gone:\n{pir}");
+    }
+
+    // But a genuinely RANDOM operand outside the `lawof` argument is a stochastic
+    // ancestor and must still refuse — the walk skips only what `lawof` encloses.
+    for src in [
+        "\
+q = draw(Uniform(a = 0.0, b = 1.0))
+z = draw(Normal(mu = 0.0, sigma = 1.0))
+y = draw(weighted(q, lawof(z)))
+lp = logdensityof(lawof(y), 0.3)",
+        "\
+q = draw(Normal(mu = 0.0, sigma = 1.0))
+z = draw(Normal(mu = 0.0, sigma = 1.0))
+y = draw(pushfwd(x -> x + q, lawof(z)))
+lp = logdensityof(lawof(y), 0.3)",
+    ] {
+        let mut m = flatppl_syntax::parse(src).unwrap();
+        let _ = flatppl_infer::infer(&mut m);
+        let err = determinize(&m)
+            .expect_err("a random weight / random forward map randomizes the law — refuse");
+        assert!(
+            err.reason
+                .contains("marginalizes over a stochastic ancestor"),
+            "must refuse as a marginal: {}",
+            err.reason
+        );
+    }
+}
+
+// A value law reached as a NESTED measure must not pin its binding: the variate it
+// is scored at belongs to the ENCLOSING value, a different draw. Here `lawof(z)` is
+// the base of `y`'s truncation, so it is scored at `y`'s variate 0.3 — pinning `z`
+// to that asserted a value for a draw the query never mentioned, and `w = z + 1.0`
+// came out as the number 1.3 in conformance-passing output. `lp` itself was right,
+// which is what made it silent. With the pin confined to the query's own measure,
+// `z = draw(...)` stays referenced by `w` and the driver refuses the program.
+#[test]
+fn a_nested_value_law_does_not_pin_the_enclosing_variate() {
+    let src = "\
+z = draw(Normal(mu = 0.0, sigma = 1.0))
+y = draw(truncate(lawof(z), interval(0.0, inf)))
+w = z + 1.0
+lp = logdensityof(lawof(record(y = y)), record(y = 0.3))";
+    let mut m = flatppl_syntax::parse(src).unwrap();
+    let _ = flatppl_infer::infer(&mut m);
+    let err = determinize(&m)
+        .expect_err("a live consumer of the scaffold draw must refuse, not receive a value");
+    assert_eq!(
+        err.construct, "draw",
+        "the surviving draw is what refuses: {} / {}",
+        err.construct, err.reason
+    );
+
+    // Without the live consumer, the same law scores fine and the scaffold draw is
+    // swept — so the refusal above is about `w`, not about nesting a `lawof`.
+    let no_consumer = "\
+z = draw(Normal(mu = 0.0, sigma = 1.0))
+y = draw(truncate(lawof(z), interval(0.0, inf)))
+lp = logdensityof(lawof(record(y = y)), record(y = 0.3))";
+    let pir = flatppl_flatpir::write(&determinize_src(no_consumer));
+    assert!(
+        pir.contains("(ifelse") && !pir.contains("lawof"),
+        "the truncated law still lowers:\n{pir}"
     );
 }

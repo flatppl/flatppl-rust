@@ -238,8 +238,11 @@ fn lower_density_core(
     }
     // Measure query: arg2 is the variate. Strip a `lawof` wrapper on the
     // (possibly grafted) measure node and hand it to the recursive dispatcher.
+    // This is the one call in the crate at `MeasurePosition::Query` — arg2 is the
+    // queried value's OWN variate here, which is what licenses `lower_value_law`
+    // to pin it back onto the binding.
     let measure_expr = measure_of_arg(m, arg1)?;
-    lower_measure_density(m, measure_expr, arg2)
+    lower_measure_density_at_query(m, measure_expr, arg2)
 }
 
 /// True iff `id` infers to a `Likelihood` type.
@@ -955,21 +958,64 @@ fn subtree_has_theta_capturing_input(m: &Module, root: NodeId, map: &[(Symbol, N
 // Core recursive dispatcher
 // ---------------------------------------------------------------------------
 
+/// Where in a query a measure sits: is it the thing the query names, or a
+/// sub-measure some combinator holds?
+///
+/// Only [`lower_value_law`] reads this, and only to decide whether pinning the
+/// scored value back onto its binding is sound. `v` is the variate of THIS
+/// measure, but a nested measure's variate is not the value whose law reached it:
+/// for `y = draw(truncate(lawof(z), S))` the `lawof(z)` sub-measure is scored at
+/// `y`'s variate, so pinning `z` to it would assert a value for a draw the query
+/// never mentioned. At the query's own measure the two coincide, and the pin is
+/// what lets the driver sweep the now-unreferenced `draw`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MeasurePosition {
+    /// The measure the query itself names — `v` is this value's own variate.
+    Query,
+    /// A sub-measure reached through a combinator, a record field, a `bayesupdate`
+    /// prior, a reified body … — `v` belongs to the enclosing measure.
+    Nested,
+}
+
 /// Compute the log-density of `measure_expr` at `v`, returning a deterministic node.
 /// `measure_expr` may be a record-of-draws, a combinator, a `(%ref self x)` pointing
 /// to one of those, or a bare primitive constructor.
+///
+/// Entry point for a measure in NESTED position. The measure a query itself names
+/// goes through [`lower_measure_density_at_query`] instead; see
+/// [`MeasurePosition`] for what turns on the difference.
 pub(crate) fn lower_measure_density(
     m: &mut Module,
     measure_expr: NodeId,
     v: NodeId,
+) -> Result<NodeId, RefuseError> {
+    lower_measure_density_at(m, measure_expr, v, MeasurePosition::Nested)
+}
+
+/// [`lower_measure_density`] for the measure a `logdensityof` / `densityof` query
+/// names directly — the one position where `v` is the scored value's own variate.
+pub(crate) fn lower_measure_density_at_query(
+    m: &mut Module,
+    measure_expr: NodeId,
+    v: NodeId,
+) -> Result<NodeId, RefuseError> {
+    lower_measure_density_at(m, measure_expr, v, MeasurePosition::Query)
+}
+
+fn lower_measure_density_at(
+    m: &mut Module,
+    measure_expr: NodeId,
+    v: NodeId,
+    position: MeasurePosition,
 ) -> Result<NodeId, RefuseError> {
     // Resolve a single level of `(%ref self x)` indirection on the measure side.
     let (measure_node, _binding_opt) = resolve_ref_one(m, measure_expr);
 
     // A reified-kernel *application* `k(input)` (a `%call(User(k), [input])`)
     // is not a builtin-named op; β-reduce it to its measure body and recurse.
+    // β-reduction does not move the measure, so the position carries over.
     if let Some(reduced) = crate::kernel::reduce_kernel_application(m, measure_node) {
-        return lower_measure_density(m, reduced, v);
+        return lower_measure_density_at(m, reduced, v, position);
     }
 
     // Dispatch on the measure op.
@@ -1041,12 +1087,12 @@ pub(crate) fn lower_measure_density(
         //
         // What a reversed order costs is COVERAGE, not a wrong number: the map
         // the value law would synthesize is `x -> Normal(mu = x, sigma = 1.0)`,
-        // and a constructor head is capitalized, so it matches nothing in
-        // `crate::invert`'s grammar and refuses there ("no analytic inverse").
-        // Every dependent product would stop lowering — loudly. The precision
-        // matters because it is the whole reason for the ordering, and
-        // `dependent_constructor_is_read_as_a_product_not_a_map` is the test that
-        // holds it.
+        // whose head `Normal` appears in neither `crate::invert`'s unary-bijection
+        // registry nor its affine grammar (`invert.rs:794-877`), so it refuses
+        // there ("no analytic inverse"). Every dependent product would stop
+        // lowering — loudly. The precision matters because it is the whole reason
+        // for the ordering, and `dependent_constructor_is_read_as_a_product_not_a_map`
+        // is the test that holds it.
         //
         // Reusing `build_density_term`'s own refusal as the gate keeps the two
         // paths' precedence exact without a second copy of
@@ -1056,7 +1102,7 @@ pub(crate) fn lower_measure_density(
             Ok(term) => Ok(term),
             // `measure_expr`, NOT the ref-resolved `measure_node`: the value law
             // pins the binding its value came from, which the resolution discards.
-            Err(not_a_constructor) => match lower_value_law(m, measure_expr, v) {
+            Err(not_a_constructor) => match lower_value_law(m, measure_expr, v, position) {
                 Some(scored) => scored,
                 None => Err(not_a_constructor),
             },
@@ -1518,13 +1564,6 @@ fn abstract_over_draw(
 /// FIELDS, and a bare scalar law has one field by construction, so the comparison
 /// is vacuous here.
 ///
-/// Pinning the binding `x` came from is what keeps the residual `x = draw(M)`
-/// from surviving into the conformance check: the driver sweeps a draw binding
-/// once nothing references it, and for `y = g(x)` only pinning `y` to the scored
-/// value drops the last reference to `x`. This mirrors `lower_record_of_draws`,
-/// including its ordering — pin only AFTER the density is built, since
-/// [`build_forward_map`] recovers `g` by inlining through that very binding.
-///
 /// **`M`'s own parameters must reach no draw.** §04 "Reification to measures"
 /// defines `lawof(x)` as the **TOTAL** law of `x`, and spells the consequence out
 /// on its worked `prior_predictive = lawof(record(obs = obs))`: a stochastic
@@ -1532,20 +1571,38 @@ fn abstract_over_draw(
 /// nodes in the traced sub-DAG, not boundary inputs, so `lawof` integrates them
 /// out", the measure-algebra equivalent being `kchain(prior, forward_kernel)`. So
 /// for `y ~ Normal(mu = z, sigma = 1)` with `z` latent, `lawof(y)` is the MARGINAL
-/// of `y`, not `Normal(mu = z, …)`: scoring the latter would emit the conditional
-/// density at whatever value some other query happened to pin `z` to — a wrong
-/// number, not a refusal. Marginalizing is `crate::marginal`'s job and it is
-/// closed-form only for a discrete-finite latent, so refuse here. A merely FIXED
+/// of `y`, not `Normal(mu = z, …)`. Marginalizing is `crate::marginal`'s job and it
+/// is closed-form only for a discrete-finite latent, so refuse here. A merely FIXED
 /// or parametric parameter (`mu = elementof(reals)`) is not a stochastic ancestor
-/// and lowers unaffected — the guard tests for a reachable `draw`, not for a
-/// non-literal parameter.
+/// and lowers unaffected — [`measure_reaches_draw`] tests for a reachable `draw`,
+/// not for a non-literal parameter.
+///
+/// **What that guard is worth, precisely.** With the latent still latent, the
+/// query already refused without it, via the driver's residual-`draw` scan — so
+/// there the guard only improves the diagnosis. With the latent pinned by an
+/// EARLIER query it cannot fire at all (nothing then distinguishes `mu = 0.1` from
+/// a genuinely fixed parameter; that limitation is tracked separately). Its real
+/// justification is the LATER-query ordering — score `lawof(y)` first, then a
+/// second query that pins `z` — where nothing downstream refuses and the
+/// conditional density escaped as a finished number.
+/// `bare_lawof_scored_before_a_later_query_pins_the_latent_refuses` names it.
+///
+/// Pinning the binding `x` came from is what keeps the residual `x = draw(M)`
+/// from surviving into the conformance check: the driver sweeps a draw binding
+/// once nothing references it, and for `y = g(x)` only pinning `y` to the scored
+/// value drops the last reference to `x`. This mirrors `lower_record_of_draws`,
+/// including its ordering — pin only AFTER the density is built, since
+/// [`build_forward_map`] recovers `g` by inlining through that very binding — and
+/// happens only at [`MeasurePosition::Query`], since a nested measure's `v` is the
+/// enclosing value's variate, not this value's.
 fn lower_value_law(
     m: &mut Module,
     value: NodeId,
     v: NodeId,
+    position: MeasurePosition,
 ) -> Option<Result<NodeId, RefuseError>> {
     let (measure, binding, transform, draw_site) = resolve_component_draw(m, value)?;
-    if !field_draw_sites(m, measure).is_empty() {
+    if measure_reaches_draw(m, measure) {
         return Some(Err(refuse(
             measure,
             m,
@@ -1562,12 +1619,67 @@ fn lower_value_law(
         }
     };
     let scored = lower_measure_density(m, law, v);
-    if scored.is_ok() {
+    if scored.is_ok() && position == MeasurePosition::Query {
         if let Some(bid) = binding {
             m.set_binding_rhs(bid, v);
         }
     }
     Some(scored)
+}
+
+/// Does the measure expression at `node` reach a `draw` — i.e. is its law
+/// parameterized by a value that is itself random, so that [`lower_value_law`]
+/// would have to marginalize?
+///
+/// Deliberately NOT [`field_draw_sites`], which the shape test uses and must keep
+/// its own semantics: this walk stops at a `lawof(…)` ARGUMENT, because `lawof`
+/// crosses from values into measures. §04 "Reification to measures", *Phase of the
+/// reified law*: "the resulting measure is itself deterministic (of parameterized
+/// or fixed phase): `lawof` absorbs stochasticity into the reified law rather than
+/// propagating it outward." So in `y = draw(pushfwd(exp, lawof(z)))` the base
+/// consumes `z`'s LAW, not `z`'s value — `z` is no ancestor of `y`, `lawof(y)` is
+/// an honest LogNormal, and walking into `lawof(z)` would refuse it. `lawof`'s own
+/// argument still gets checked when the recursion reaches it as a measure in its
+/// own right (the dispatcher's `"lawof"` arm), so nothing is skipped, only
+/// attributed to the right place.
+///
+/// Only the `lawof` argument is skipped. Everything else is walked, including a
+/// combinator's non-measure operands (`w` in `weighted(w, lawof(z))`) and a
+/// pushforward's forward map (`pushfwd(functionof(u -> u + z), M)`), where a
+/// reachable draw genuinely does randomize the resulting law.
+fn measure_reaches_draw(m: &Module, node: NodeId) -> bool {
+    fn walk(m: &Module, node: NodeId, path: &mut Vec<BindingId>) -> bool {
+        match m.node(node) {
+            Node::Ref(Ref {
+                ns: RefNs::SelfMod,
+                name,
+            }) => {
+                let Some(bid) = m.binding_by_name(*name) else {
+                    return false;
+                };
+                if path.contains(&bid) {
+                    return false; // cyclic definition — stop rather than recurse forever
+                }
+                path.push(bid);
+                let found = walk(m, m.binding(bid).rhs, path);
+                path.pop();
+                found
+            }
+            Node::Call(c) => {
+                // A `draw` IS the stochastic ancestor; no need to look inside it.
+                if draw_argument(m, node).is_some() {
+                    return true;
+                }
+                if matches!(builtin_name(m, node), Some("lawof")) {
+                    return false;
+                }
+                c.args.iter().any(|&arg| walk(m, arg, path))
+                    || c.named.iter().any(|n| walk(m, n.value, path))
+            }
+            _ => false,
+        }
+    }
+    walk(m, node, &mut Vec::new())
 }
 
 // ---------------------------------------------------------------------------
