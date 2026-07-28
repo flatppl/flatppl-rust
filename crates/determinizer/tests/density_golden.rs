@@ -2256,22 +2256,64 @@ lp = logdensityof(pushfwd(exp, lawof(y)), 1.6487212707001282)",
     );
 }
 
-// An op with no type rule is not a value map, and must not be reported as one. The
-// value-law path used to hand `mixture(record(w = 0.5, m = lawof(z)))` — an
-// unimplemented MEASURE combinator left `%deferred` — to `crate::invert`, which
-// answered "no analytic inverse": true of the inverse, wrong about the problem.
+// An unimplemented MEASURE combinator reached as a pseudo-transform must REFUSE, not
+// mislower. The assertion is deliberately on the outcome and not on the wording: the
+// reason `crate::invert` gives ("no analytic inverse") is imprecise, since the real
+// problem is that `mixture` has no type rule so nothing knows it is a map at all.
+// Gating the value-law path on the transform's inferred type to say that instead was
+// tried and reverted — `%deferred` propagates outward from any operand, so the gate
+// also refused `A * x + b`, whose `add` is ordinary and which `crate::invert` inverts
+// correctly (see `bare_matrix_affine_value_law_lowers_like_the_record_spelling`).
+// Losing a correct lowering to improve a message on an unimplemented op is the wrong
+// trade; if the message is worth fixing, discriminate on the head op, not the result
+// type.
 #[test]
-fn a_deferred_transform_refuses_as_untyped_not_as_non_invertible() {
+fn an_unimplemented_measure_combinator_as_a_transform_refuses() {
     let src = "\
 z = draw(Normal(mu = 0.0, sigma = 1.0))
 y = draw(mixture(record(w = 0.5, m = lawof(z))))
 lp = logdensityof(lawof(y), 0.3)";
     let mut m = flatppl_syntax::parse(src).unwrap();
     let _ = flatppl_infer::infer(&mut m);
-    let err = determinize(&m).expect_err("an op with no type rule must refuse");
+    let err = determinize(&m).expect_err("an unimplemented measure combinator must refuse");
     assert!(
-        err.reason.contains("no type rule"),
-        "the diagnosis must be the missing type rule, not a missing inverse: {}",
+        !err.reason.is_empty(),
+        "refusal carries a reason: {}",
         err.reason
+    );
+}
+
+// The bare and record spellings of one matrix-affine value law must lower to the same
+// density. `A * x + b` types as `%deferred` at the `add`, because `mul(matrix, vector)`
+// has no type rule and deferredness propagates outward — but the map is an ordinary
+// affine one and `crate::invert`'s matrix-affine grammar handles it, emitting
+// `linsolve`/`logabsdet`. A guard that read that deferred RESULT type as "unreadable
+// map" refused this while the record spelling (which reaches the measure through
+// `lower_record_of_draws`) kept lowering, splitting the two spellings of one measure.
+// This pins them together, the same bar `bare_lawof_of_derived_scalar_lowers_like_pushfwd`
+// holds for the scalar case.
+#[test]
+fn bare_matrix_affine_value_law_lowers_like_the_record_spelling() {
+    let prelude = "\
+A = [[2.0, 0.0], [0.0, 3.0]]
+b = [1.0, 1.0]
+x = draw(MvNormal(mu = [0.0, 0.0], sigma = [[1.0, 0.0], [0.0, 1.0]]))
+y = A * x + b
+";
+    let bare = flatppl_flatpir::write(&determinize_src(&format!(
+        "{prelude}lp = logdensityof(lawof(y), [1.0, 1.0])"
+    )));
+    let record = flatppl_flatpir::write(&determinize_src(&format!(
+        "{prelude}lp = logdensityof(lawof(record(y = y)), record(y = [1.0, 1.0]))"
+    )));
+    let lp = pir_binding(&bare, "lp");
+    assert!(
+        lp.contains("linsolve") && lp.contains("logabsdet"),
+        "the matrix-affine inverse and its log-volume are emitted:\n{lp}"
+    );
+    assert_eq!(
+        lp,
+        pir_binding(&record, "lp"),
+        "bare and record spellings of one measure must lower identically:\n{bare}\n---\n{record}"
     );
 }

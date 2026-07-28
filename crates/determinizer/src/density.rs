@@ -1667,22 +1667,21 @@ fn lower_value_law(
     let law = match transform {
         None => measure,
         Some(call) => {
-            // A transform whose own type inference did not resolve is not a value
-            // map this path can read — `mixture(record(w = …, m = lawof(z)))` is an
-            // unimplemented MEASURE op left `%deferred`, and synthesizing a forward
-            // map for it sends it to `crate::invert`, which then reports "no
-            // analytic inverse". True of the inverse, but the wrong diagnosis: the
-            // op has no type rule, so nothing here knows it is a map at all. Say
-            // that instead. (`Failed` is inference's own error; leave it to speak.)
-            if matches!(m.type_of(call), Some(Type::Deferred) | None) {
-                return Some(Err(refuse(
-                    call,
-                    m,
-                    "this value's law is a transform whose op has no type rule yet, so it \
-                     cannot be read as either a map of the draw or a measure over it — \
-                     refuse rather than mislower",
-                )));
-            }
+            // Deliberately NOT gated on the transform's inferred type. A `%deferred`
+            // result type does not mean the op is unreadable as a map: `%deferred`
+            // propagates OUTWARD from any operand, so `A * x + b` types as deferred
+            // at the `add` — because `mul(matrix, vector)` has no type rule — while
+            // `add` itself is perfectly ordinary and `crate::invert`'s affine grammar
+            // inverts the whole thing correctly. Refusing on the result type cost
+            // that lowering and split this spelling from the record one, which
+            // reaches the same measure through `lower_record_of_draws`.
+            //
+            // An op that genuinely has no type rule (an unimplemented MEASURE op such
+            // as `mixture`, reached here as a pseudo-transform) instead falls through
+            // to `crate::invert` and is refused there as having no analytic inverse.
+            // That diagnosis is imprecise — the real reason is that nothing knows it
+            // is a map at all — but a merely imprecise message on an unimplemented op
+            // is a far better trade than losing a correct lowering.
             let fwd = build_forward_map(m, call, draw_site);
             build_call(m, "pushfwd", &[fwd, measure])
         }
