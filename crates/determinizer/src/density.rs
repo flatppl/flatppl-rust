@@ -2767,35 +2767,6 @@ fn lower_pushfwd(
         _ => Type::Any,
     };
 
-    // The query point's structural KIND against the base's variate kind, on the
-    // ORIGINAL `v` — before the preimage is synthesised. Every forward map that
-    // reaches the change of variables below is kind-PRESERVING (a scalar chain, a
-    // matrix-affine or an elementwise map over a vector; §06 case 2's projection,
-    // the one kind-changing form, returned above), so a scalar law scored at a
-    // record/vector is ill-formed and there is no correct value to emit.
-    //
-    // [`build_density_term`]'s downstream guard cannot see this: by the time the
-    // base is scored, the point is `f_inv(v)` — a node inference never typed — so
-    // `variate_kind` is `None` there and its conservative unknown-passes branch
-    // no-ops. Hence the check here, on the typed original.
-    //
-    // An explicit `bijection` between kinds (a scalar and a one-field record) is
-    // over-refused: nothing in the annotation lets this pass verify such a map, and
-    // an unchecked mismatch emits `op(record(…))` that no gate rejects.
-    if let (Some(dk), Some(vk)) = (variate_kind(&domain), m.type_of(v).and_then(variate_kind)) {
-        if dk != vk {
-            return Err(refuse(
-                v,
-                m,
-                "the query point's type does not match the kind of the pushforward base \
-                 measure's variate, and every recognised forward map here preserves that kind \
-                 — a scalar-domain law scored at a record or vector has no change of variables \
-                 (§06 \"Engine contract for pushfwd density evaluation\"): refuse rather than \
-                 emit an ill-typed application of the inverse",
-            ));
-        }
-    }
-
     // `forward` is the map itself, kept beside the change of variables for the image
     // gate ([`gate_to_image`]) — arg 0 of an explicit `bijection`, else the whole
     // forward argument.
@@ -2810,6 +2781,7 @@ fn lower_pushfwd(
             }
             (bij.args[1], bij.args[2], bij.args[0])
         } else {
+            refuse_variate_kind_mismatch(m, &domain, v)?;
             // Not an explicit bijection: try analytic synthesis (§06 case 1). Also
             // thread `M`'s refined SUPPORT (`valueset_of`, e.g. `posreals` for
             // `Gamma`, `nonnegreals` for `Exponential`): the coarse variate type is
@@ -2854,6 +2826,46 @@ fn lower_pushfwd(
     // The whole change of variables is gated, not just the base term: outside the
     // image there is no mass to weigh.
     Ok(gate_to_image(m, forward, &domain, v, density))
+}
+
+/// Refuse a query point whose structural KIND differs from the base measure's
+/// variate kind, checked on the ORIGINAL typed `v` — before the preimage is
+/// synthesised.
+///
+/// Only for a SYNTHESISED forward (§06 case 1), which is where the soundness
+/// argument holds: every map [`crate::invert`] recognises is kind-PRESERVING (a
+/// scalar chain, a matrix-affine or an elementwise map over a vector; §06 case 2's
+/// projection, the one kind-changing form, is dispatched before this), so a
+/// scalar-domain law scored at a record or vector has no change of variables and
+/// there is no correct value to emit.
+///
+/// An explicit `bijection` is NOT checked here. §06 sanctions a kind-changing
+/// annotation outright — `logvolume` "generalizes the log-absolute-determinant of
+/// the Jacobian to mappings between spaces of different dimension", and "the user
+/// asserts that `f_inv` is the inverse of `f` … FlatPPL implementations are not
+/// required to verify this". A `functionof`/lambda `f_inv` that cannot bind the
+/// point's fields refuses in [`crate::kernel::reduce_kernel_application`], and the
+/// one unverifiable spelling — a BARE operator applied at a record — refuses in
+/// [`apply_change_of_variables`].
+///
+/// [`build_density_term`]'s downstream guard cannot see this: by the time the base
+/// is scored, the point is `f_inv(v)` — a node inference never typed — so
+/// `variate_kind` is `None` there and its conservative unknown-passes branch no-ops.
+fn refuse_variate_kind_mismatch(m: &Module, domain: &Type, v: NodeId) -> Result<(), RefuseError> {
+    if let (Some(dk), Some(vk)) = (variate_kind(domain), m.type_of(v).and_then(variate_kind)) {
+        if dk != vk {
+            return Err(refuse(
+                v,
+                m,
+                "the query point's type does not match the kind of the pushforward base \
+                 measure's variate, and every forward map synthesised here preserves that kind \
+                 — a scalar-domain law scored at a record or vector has no change of variables \
+                 (§06 \"Engine contract for pushfwd density evaluation\"): refuse rather than \
+                 emit an ill-typed application of the inverse",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The reference measure a base measure's density is taken with respect to, which

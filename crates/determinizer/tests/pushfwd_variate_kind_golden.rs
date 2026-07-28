@@ -103,6 +103,27 @@ fn matching_variate_kinds_still_lower() {
 }
 
 #[test]
+fn an_explicit_bijection_between_kinds_still_lowers() {
+    // The kind check is confined to a SYNTHESISED forward. §06 sanctions a
+    // kind-changing annotation: `logvolume` "generalizes the log-absolute-determinant
+    // of the Jacobian to mappings between spaces of different dimension", and the user
+    // asserts `f_inv` — "FlatPPL implementations are not required to verify this". Here
+    // `f_inv` is a `functionof` that DOES bind the record's field, so the reducer
+    // accepts it and the change of variables is the correct one.
+    let src = "finv = functionof(_a_, a = _a_)\n\
+               b = pushfwd(bijection(fn(record(a = _)), finv, fn(0.0 * _)), \
+                 Normal(mu = 0.0, sigma = 1.0))\n\
+               lp = logdensityof(b, record(a = 1.0))";
+    let out = lp(src);
+    assert!(
+        out.contains("(sub ")
+            && out.contains("builtin_logdensityof Normal")
+            && out.contains(" 1.0)"),
+        "expected the change of variables at the bound field:\n{out}"
+    );
+}
+
+#[test]
 fn bare_operator_at_a_record_refuses_when_the_kind_check_cannot_fire() {
     // `pushfwd`'s own result type is its forward map's CODOMAIN, which this pass does
     // not track, so a pushforward OF a pushforward has an unproven variate: the kind
