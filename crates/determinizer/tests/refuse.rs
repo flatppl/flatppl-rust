@@ -1026,17 +1026,38 @@ lp = logdensityof(lawof(record(a = s, b = y1)), record(a = 0.5, b = 0.25))";
 // into the per-field fold, or this would silently sample a variate the model
 // never declared — fabricating a draw. `lower_measure_sample` keeps refusing;
 // only the measure-position entry point gained the leaf case.
+//
+// The record MUST also contain a real draw. Without one it is not
+// Stochastic-phase, so `lower_closed_measure_sample`'s `lawof` arm refuses on the
+// phase check BEFORE the per-field fold runs at all — which would make this
+// guardrail vacuous, staying green even if the constructor leaf were moved into
+// `lower_measure_sample` (the exact regression it exists to catch). Hence the `y`
+// field, and hence the assertion on `construct`/`reason` rather than on the
+// refusal merely being non-empty.
 #[test]
 fn undrawn_measure_in_a_record_field_still_refuses() {
     let src = "\
 s = rnginit([42, 0, 0, 0])
-draws = rand(s, lawof(record(a = Normal(mu = 0.0, sigma = 1.0))))";
+y = draw(Normal(mu = 0.0, sigma = 1.0))
+draws = rand(s, lawof(record(y = y, a = Normal(mu = 0.0, sigma = 1.0))))";
     let m = parse_infer(src);
     let err = determinize(&m)
         .expect_err("an un-drawn measure in a record field is not a variate — must refuse");
     assert!(
-        !err.reason.is_empty(),
-        "refusal names the unsupported field:\n{err:?}"
+        err.construct.contains("Normal"),
+        "refusal names the un-drawn constructor sitting in the field, not the record \
+         or the lawof: {err:?}"
+    );
+    assert!(
+        err.reason.contains("unsupported measure construct"),
+        "the refusal comes from the per-field dispatcher, not the lawof phase check — \
+         a 'not stochastic-phase' reason here would mean the fold was never reached and \
+         this guardrail is vacuous: {err:?}"
+    );
+    assert!(
+        !err.reason.contains("stochastic-phase"),
+        "the record IS stochastic-phase (field y is a draw), so the phase check must \
+         not be what refuses: {err:?}"
     );
 }
 
@@ -1083,12 +1104,14 @@ draws = rand(s, pushfwd(r -> get(r, \"y1\") - get(r, \"y2\"), lawof(record(y1 = 
     let err = determinize(&m)
         .expect_err("a map whose parameters do not match the record variate's fields must refuse");
     assert!(
-        err.reason.contains("does not apply to the record variate"),
+        err.reason.contains("do not correspond"),
         "refusal rests on the §04 field/parameter correspondence: {err:?}"
     );
+    // Both sides are named, so the message reads as a correspondence failure rather
+    // than blaming a field the map may legitimately be selecting.
     assert!(
-        err.reason.contains("`y1`") || err.reason.contains("`r`"),
-        "refusal names the offending field or parameter: {err:?}"
+        err.reason.contains("map parameters `r`") && err.reason.contains("variate fields `y1`"),
+        "refusal names the map's parameters AND the variate's fields: {err:?}"
     );
     assert!(
         err.construct.contains("pushfwd"),
@@ -1111,8 +1134,7 @@ draws = rand(s, pushfwd(f, lawof(record(y1 = y1, y2 = y2))))";
     let err = determinize(&m)
         .expect_err("a map covering only some of the record's fields must refuse, not project");
     assert!(
-        err.reason
-            .contains("variate field `y2` binds no map parameter"),
+        err.reason.contains("field `y2` binds no parameter"),
         "refusal names the field that would have been silently dropped: {err:?}"
     );
 }

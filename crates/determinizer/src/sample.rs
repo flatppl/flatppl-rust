@@ -294,19 +294,37 @@ fn lower_pushfwd_sample(
     let (value, rng_out) = lower_closed_measure_sample(m, base, rng)?;
     // A bare builtin map needs no reduction — the head rewrite handles it — EXCEPT
     // over a record variate, where the application is §04 auto-splatting against
-    // that operator's own parameter names. This vertical does not resolve those, and
-    // nothing downstream would catch the mismatch: `infer` reports no diagnostic for
+    // that operator's own argument names. Deciding whether those names MATCH the
+    // record's fields needs the operator's argument names, and they are not
+    // available here: `flatppl_infer` exposes ordered parameter names only for
+    // measure constructors (`distribution_param_names` /
+    // `fundamental_measure_param_names` / `constructor_param_names`), while a
+    // deterministic builtin's catalogue row is `Sig::Function { params:
+    // Vec<ParamSig> }` — declared parameter TYPES, documented as "never read",
+    // carrying no names. §07's function table has them (`exp(x)`,
+    // `pow(base, exponent)`) but the determiniser cannot see it.
+    //
+    // So this refuses the whole record-valued case, which over-refuses a
+    // name-matching map like `pushfwd(exp, lawof(record(x = y1)))`. Refusing is
+    // still the right side to err on, because nothing downstream would catch a
+    // MISmatch: `infer` reports no diagnostic for
     // `pushfwd(exp, lawof(record(y = …)))` and `is_flatpdl` is structural, so
-    // `exp(record(y = …))` would pass every gate and fail only in the engine.
+    // `exp(record(y = …))` would pass every gate and fail only in the engine. The
+    // message says the names are unavailable rather than implying the model is
+    // ill-formed.
     if matches!(m.node(map), Node::Const(_)) {
         if expect_builtin_call(m, value, "record").is_some() {
             return Err(refuse(
                 pushfwd_node,
                 m,
                 "pushfwd's map is a bare built-in operator and its base measure's variate is a \
-                 record: applying it is §04 auto-splatting against the operator's own parameter \
-                 names, which this vertical does not resolve — write the map as a functionof \
-                 whose parameter names are the record's field names",
+                 record, so applying it is §04 auto-splatting against that operator's argument \
+                 names — and those names are not available to the determiniser (only measure \
+                 constructors carry ordered parameter names in the catalogue; a builtin \
+                 function's row carries argument TYPES only). This may well be a well-formed \
+                 call, but it cannot be checked here, and an unchecked mismatch would emit \
+                 `op(record(…))` that no gate rejects — write the map as a functionof or lambda \
+                 whose parameter names are the record's field names, which IS checkable",
             ));
         }
         return Ok((build_user_call(m, map, value), rng_out));
@@ -320,11 +338,14 @@ fn lower_pushfwd_sample(
                 pushfwd_node,
                 m,
                 &format!(
-                    "pushfwd's map does not apply to the record variate of its base measure: \
-                     {why}. §04 \"Calling conventions\" makes a record argument whose field \
-                     names do not match the callable's argument names a static error, and \
+                    "pushfwd's map and the record variate of its base measure do not correspond \
+                     ({why}). §04 \"Calling conventions\" applies the map by auto-splatting the \
+                     record — parameters bind to like-named fields — and makes a record whose \
+                     field names do not match the callable's argument names a static error; \
                      binding only the parameters that DO match would silently project the \
-                     variate onto those coordinates — refuse rather than drop the rest"
+                     variate onto those coordinates. A map that deliberately projects (a \
+                     whole-record or hole map, §06 \"pushfwd\") is not expressible this way and \
+                     is not built here — refuse rather than drop coordinates"
                 ),
             ));
         }
@@ -365,15 +386,30 @@ fn record_splat_mismatch(m: &Module, value: NodeId, inputs: &[(Symbol, Ref)]) ->
         c.named.iter().map(|n| n.name).collect()
     };
     let params: Vec<Symbol> = inputs.iter().map(|&(n, _)| n).collect();
+    // Name BOTH sides in the message. Blaming the odd name alone reads absurdly for
+    // a map whose whole purpose is selecting that coordinate ("variate field `y1`
+    // binds no map parameter", for a map that projects onto `y1`); showing the two
+    // lists makes it a correspondence failure, which is what it is.
+    let listing = |syms: &[Symbol]| {
+        syms.iter()
+            .map(|&s| format!("`{}`", m.resolve(s)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let sides = format!(
+        "map parameters {} vs variate fields {}",
+        listing(&params),
+        listing(&fields)
+    );
     if let Some(f) = fields.iter().find(|f| !params.contains(f)) {
         return Some(format!(
-            "variate field `{}` binds no map parameter",
+            "{sides} — field `{}` binds no parameter",
             m.resolve(*f)
         ));
     }
     if let Some(p) = params.iter().find(|p| !fields.contains(p)) {
         return Some(format!(
-            "map parameter `{}` names no variate field",
+            "{sides} — parameter `{}` names no field",
             m.resolve(*p)
         ));
     }

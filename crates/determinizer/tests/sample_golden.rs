@@ -725,3 +725,111 @@ fn first_sample_term(pir: &str) -> String {
     }
     panic!("unbalanced builtin_sample term in:\n{pir}");
 }
+
+// The capability this whole vertical exists for, in the shape the guards around it
+// are scoped against: `pushfwd` over a RECORD law, with a map whose parameter names
+// are the record's fields (§04 auto-splatting). The scalar-base golden above does
+// not cover it, and three `refuse.rs` tests fence this neighbourhood — so without
+// this golden a future tightening of `record_splat_mismatch` could make the correct
+// spelling refuse with every other test still green, silently removing the feature.
+//
+// Two INDEPENDENT draws in the base: 2 logical samples, 3 syntactic occurrences.
+// The first sample's node is shared — its value is `sub`'s left operand and its
+// advanced rng seeds the second sample — and the FlatPIR writer has no
+// common-subexpression sharing, so it re-expands at both sites. Exactly the
+// 3-for-2 artifact `two_independent_draws_thread_the_rng` documents.
+#[test]
+fn pushfwd_over_independent_record_law_applies_map_to_both_draws() {
+    let src = "\
+s = rnginit([42, 0, 0, 0])
+y1 = draw(Normal(mu = 0.0, sigma = 1.0))
+y2 = draw(Normal(mu = 0.0, sigma = 1.0))
+f = functionof(_a_ - _b_, y1 = _a_, y2 = _b_)
+draws = rand(s, pushfwd(f, lawof(record(y1 = y1, y2 = y2))))";
+    let m = parse_infer(src);
+    let out = determinize(&m).expect("pushfwd over a record law with a field-named map must lower");
+    let pir = flatppl_flatpir::write(&out);
+    assert_eq!(
+        pir.matches("builtin_sample").count(),
+        3,
+        "2 logical samples; the first's shared (value, rng) node re-expands where its \
+         rng seeds the second (no CSE in the writer):\n{pir}"
+    );
+    assert!(
+        pir.contains("(sub "),
+        "the map is applied FORWARD to the sampled record:\n{pir}"
+    );
+    // The threading is what distinguishes 2 logical samples from 2 independent
+    // reads of `s`. Same idiom as `two_independent_draws_thread_the_rng`: the
+    // first sample reads the raw `s` and its text appears at both its reference
+    // sites; the second takes a COMPOSITE (`%meta`-wrapped) rng argument, which is
+    // the `get0(sample_1, 1)` advanced slot.
+    assert_eq!(
+        pir.matches("(builtin_sample (%ref self s) Normal").count(),
+        2,
+        "the first sample seeds from the raw rng `s`, at both its reference sites:\n{pir}"
+    );
+    assert_eq!(
+        pir.matches("(builtin_sample (%meta").count(),
+        1,
+        "the second sample takes a threaded (composite) rng argument, not a bare ref:\n{pir}"
+    );
+    assert!(
+        pir.contains("(builtin_sample (%meta (%rngstate %fixed rngstates) (get0"),
+        "and that argument is the get0(...) advanced-rng projection:\n{pir}"
+    );
+    assert!(
+        !pir.contains("(pushfwd ") && !pir.contains("(lawof ") && !pir.contains("(draw "),
+        "measure layer gone:\n{pir}"
+    );
+    assert!(flatppl_determinizer::is_flatpdl(&out).is_ok());
+}
+
+// Same map, but the base record law has a SHARED latent (`mu` feeding both `y1`
+// and `y2`). This is where a re-inlined latent would hide, and where the earlier
+// version of these goldens had no `builtin_sample` count assertion at all.
+//
+// 3 latents, 3 samples, and here the count is EXACT rather than inflated: the
+// shared-latent path binds each sample to its own synthetic name, so each appears
+// once and consumers read it by name. `mu` re-drawn per consumer would show up as
+// a fourth occurrence.
+#[test]
+fn pushfwd_over_shared_latent_record_law_samples_each_latent_once() {
+    let src = "\
+s = rnginit([42, 0, 0, 0])
+mu = draw(Normal(mu = 0.0, sigma = 10.0))
+y1 = draw(Normal(mu = mu, sigma = 1.0))
+y2 = draw(Normal(mu = mu, sigma = 1.0))
+f = functionof(_a_ - _b_, y1 = _a_, y2 = _b_)
+draws = rand(s, pushfwd(f, lawof(record(y1 = y1, y2 = y2))))";
+    let m = parse_infer(src);
+    let out =
+        determinize(&m).expect("pushfwd over a shared-latent record law must lower, sampling once");
+    let pir = flatppl_flatpir::write(&out);
+    assert_eq!(
+        pir.matches("builtin_sample").count(),
+        3,
+        "mu, y1, y2 — one sample each, mu NOT re-drawn per consumer:\n{pir}"
+    );
+    // The shared latent is bound to one synthetic name and read by name; two
+    // `builtin_sample` bindings for `mu` would mean shared-ancestor identity broke.
+    assert_eq!(
+        pir.matches("%bind __sample_mu ").count(),
+        1,
+        "mu's sample is a single named binding:\n{pir}"
+    );
+    assert_eq!(
+        pir.matches("(builtin_sample (%ref self s)").count(),
+        1,
+        "only the root latent reads the source rng; the rest are threaded:\n{pir}"
+    );
+    assert!(
+        pir.contains("(sub "),
+        "the map is applied FORWARD over the shared-latent draws:\n{pir}"
+    );
+    assert!(
+        !pir.contains("(pushfwd ") && !pir.contains("(lawof ") && !pir.contains("(draw "),
+        "measure layer gone:\n{pir}"
+    );
+    assert!(flatppl_determinizer::is_flatpdl(&out).is_ok());
+}
