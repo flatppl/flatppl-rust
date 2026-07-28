@@ -1598,12 +1598,68 @@ lp = logdensityof(lawof(record(y = y)), record(y = 2.0))";
         1,
         "one density term:\n{pir}"
     );
+    // The change-of-variables Jacobian, pinned BY VALUE. Do not weaken this to
+    // `contains("log")`: the string `builtin_logdensityof` itself contains `log`,
+    // so such an assertion is satisfied by the very term it is meant to be
+    // distinguished from, and a regression dropping the Jacobian would still leave
+    // one `builtin_logdensityof`, no `lawof`, and valid FlatPDL. `(abs 2.0)` is
+    // reachable only from the log-volume of the scale 2.0 (`logvol = log|c|`).
+    let lp = pir_binding(&pir, "lp");
     assert!(
-        pir.contains("log"),
-        "change-of-variables log-volume term present:\n{pir}"
+        lp.contains("(sub ") && lp.contains("(log ") && lp.contains("(abs 2.0)"),
+        "density minus the log-volume log|2| — the §06 change of variables:\n{lp}"
+    );
+    // The point the inner Normal is scored at: f_inv(2.0) = (2.0 − 1.0)/2 = 0.5,
+    // const-folded. Together with log|2| this is exactly the expression the
+    // independent Julia oracle validated at -1.737085713764618.
+    assert!(
+        lp.contains(" 0.5)"),
+        "inner density evaluated at the preimage 0.5:\n{lp}"
     );
     assert!(!pir.contains("lawof"), "measure layer gone:\n{pir}");
     assert!(flatppl_determinizer::is_flatpdl(&out).is_ok());
+
+    // §06 declares this the same measure as the explicit spelling, so the two must
+    // emit the identical scored expression.
+    let pushfwd_spelling = "\
+b = pushfwd(x -> 2.0 * x + 1.0, Normal(mu = 0.0, sigma = 1.0))
+lp = logdensityof(b, 2.0)";
+    let pir_pf = {
+        let mut m = flatppl_syntax::parse(pushfwd_spelling).unwrap();
+        let _ = flatppl_infer::infer(&mut m);
+        let out = determinize(&m).expect("explicit pushfwd spelling must lower");
+        flatppl_flatpir::write(&out)
+    };
+    assert_eq!(
+        lp,
+        pir_binding(&pir_pf, "lp"),
+        "the two §06-equivalent spellings must emit the same scored expression"
+    );
+}
+
+/// The `(%bind <name> …)` form for `name` in FlatPIR text, delimited by its OWN
+/// matching parenthesis. Scoped to the binding rather than taken as the rest of
+/// the file, so anything emitted after it cannot make two of these differ for an
+/// unrelated reason.
+fn pir_binding(pir: &str, name: &str) -> String {
+    let open = format!("(%bind {name} ");
+    let start = pir
+        .find(&open)
+        .unwrap_or_else(|| panic!("no `{name}` binding in:\n{pir}"));
+    let mut depth = 0usize;
+    for (i, ch) in pir[start..].char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return pir[start..start + i + 1].to_string();
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("unterminated `{name}` binding in:\n{pir}")
 }
 
 // The §06 case-1 registry entry the record-field guard's unary-only shape test
@@ -1648,15 +1704,9 @@ lp = logdensityof(d, [1.5, 2.5])";
         let out = determinize(&m).expect("explicit pushfwd spelling must lower");
         flatppl_flatpir::write(&out)
     };
-    let lp_of = |s: &str| {
-        s.lines()
-            .position(|l| l.contains("(%bind lp"))
-            .map(|i| s.lines().skip(i).collect::<Vec<_>>().join("\n"))
-            .expect("lp binding present")
-    };
     assert_eq!(
-        lp_of(&pir),
-        lp_of(&pir_pf),
+        pir_binding(&pir, "lp"),
+        pir_binding(&pir_pf, "lp"),
         "the two §06-equivalent spellings must emit the same scored expression"
     );
 }
