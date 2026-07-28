@@ -1371,43 +1371,22 @@ fn collect_draw_sites(
 }
 
 /// Build the forward map `g` for `pushfwd(g, Mᵢ)` from a transformed field's
-/// `call` over its single `draw_site`, in the spelling a user would write —
-/// exactly the two surface forms [`lower_pushfwd`] already consumes, so the
+/// `call` over its single `draw_site`, as the lambda `x -> <call with the draw
+/// replaced by x>` — the surface form [`lower_pushfwd`] consumes, so the
 /// `lawof(record(…))` and explicit-`pushfwd` spellings §06 declares equivalent
-/// reach `crate::invert` identically:
+/// reach `crate::invert` identically.
 ///
-/// * a bare builtin value (`pushfwd(sqrt, Mᵢ)`) when the call is a lone unary
-///   application to the draw — `crate::invert`'s bare-builtin registry covers
-///   the whole §07 monotone-elementary set (`sqrt`, `logit`, `log1p`, …), which
-///   is WIDER than the lambda path's scalar-chain grammar, so this form must be
-///   kept for the shape that already used it;
-/// * otherwise the lambda `x -> <call with the draw replaced by x>`
-///   (`pushfwd(x -> 2.0 * x + 1.0, Mᵢ)`), which is what carries a composed
-///   multi-operand map.
+/// One form suffices for every shape, from a lone unary (`sqrt(sigma2)`) to a
+/// composed multi-operand map (`2.0 * sigma2 + 1.0`): `crate::invert` reads the
+/// §06 case-1 registry through a single lookup that does not distinguish a bare
+/// builtin from a lambda body, so `x -> sqrt(x)` and the bare `sqrt` synthesize
+/// the same change of variables.
 fn build_forward_map(m: &mut Module, call: NodeId, draw_site: NodeId) -> NodeId {
-    if let Node::Call(c) = m.node(call) {
-        if let CallHead::Builtin(g) = c.head {
-            // A lone unary application whose operand IS the draw (directly or
-            // through one ref hop): the bare-builtin form names it exactly. A
-            // unary call over a NESTED expression (`log1p(2.0 * x)`) must not take
-            // this path — `pushfwd(log1p, Mᵢ)` would silently drop the inner map.
-            if c.args.len() == 1 && c.named.is_empty() && resolves_to(m, c.args[0], draw_site) {
-                return m.alloc(Node::Const(g));
-            }
-        }
-    }
     let x = m.intern("x");
     let ph = m.intern("_x_");
     let mut path = Vec::new();
     let body = abstract_over_draw(m, call, draw_site, ph, &mut path);
     crate::invert::wrap_functionof(m, x, ph, body)
-}
-
-/// Does `node` denote `draw_site` — either being it, or a `(%ref self x)` whose
-/// binding RHS is it?
-fn resolves_to(m: &Module, node: NodeId, draw_site: NodeId) -> bool {
-    let (effective, _) = resolve_ref_one(m, node);
-    effective == draw_site
 }
 
 /// Rebuild `node` as an expression in the lambda placeholder `ph`, replacing
