@@ -238,7 +238,7 @@ fn lower_density_core(
     }
     // Measure query: arg2 is the variate. Strip a `lawof` wrapper on the
     // (possibly grafted) measure node and hand it to the recursive dispatcher.
-    // This is the one call in the crate at `MeasurePosition::Query` — arg2 is the
+    // This is the one call in the crate at [`VariateOrigin::Point`] — arg2 is the
     // queried value's OWN variate here, which is what licenses `lower_value_law`
     // to pin it back onto the binding.
     let measure_expr = measure_of_arg(m, arg1)?;
@@ -1646,8 +1646,8 @@ fn abstract_over_draw(
 /// value drops the last reference to `x`. This mirrors `lower_record_of_draws`,
 /// including its ordering — pin only AFTER the density is built, since
 /// [`build_forward_map`] recovers `g` by inlining through that very binding — and
-/// happens only at [`MeasurePosition::Query`], since a nested measure's `v` is the
-/// enclosing value's variate, not this value's.
+/// happens only at [`VariateOrigin::Point`], since a variate that did not come from
+/// the query point belongs to the enclosing value, not to this one.
 fn lower_value_law(
     m: &mut Module,
     value: NodeId,
@@ -1706,10 +1706,20 @@ fn lower_value_law(
 /// or fixed phase): `lawof` absorbs stochasticity into the reified law rather than
 /// propagating it outward." So in `y = draw(pushfwd(exp, lawof(z)))` the base
 /// consumes `z`'s LAW, not `z`'s value — `z` is no ancestor of `y`, `lawof(y)` is
-/// an honest LogNormal, and walking into `lawof(z)` would refuse it. `lawof`'s own
-/// argument still gets checked when the recursion reaches it as a measure in its
-/// own right (the dispatcher's `"lawof"` arm), so nothing is skipped, only
-/// attributed to the right place.
+/// an honest LogNormal, and walking into `lawof(z)` would refuse it.
+///
+/// **The skip is not self-sufficient — [`refuse_stochastic_measure_law`] is what
+/// makes it safe, and only partly.** An earlier revision justified the skip by
+/// claiming `lawof`'s argument "still gets checked when the recursion reaches it as
+/// a measure in its own right". That is true only when the argument is a *value*.
+/// When it is a measure EXPRESSION, `lower_lawof` unwraps it, `build_density_term`
+/// succeeds, and this function is never entered — which silently emitted the
+/// conditional density for `lawof(Normal(mu = a, …))` at a later-pinned latent `a`.
+/// [`refuse_stochastic_measure_law`] now catches that at the `lawof` strip sites.
+/// It tests `Type::Measure`, so a `Kernel`-typed argument — `lawof(functionof(…))`,
+/// `lawof(kernelof(…))` — is still unguarded and still emits the conditional; that
+/// gap predates this path and is tracked. Do not restore the "nothing is skipped"
+/// wording: it is how this conclusion gets re-derived wrongly.
 ///
 /// Only the `lawof` argument is skipped. Everything else is walked, including a
 /// combinator's non-measure operands (`w` in `weighted(w, lawof(z))`) and a

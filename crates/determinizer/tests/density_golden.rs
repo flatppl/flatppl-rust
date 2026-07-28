@@ -2206,6 +2206,17 @@ w = y + 1.0
 lp = logdensityof(truncate(lawof(y), interval(0.0, inf)), 0.3)",
             "(%bind w 1.3)",
         ),
+        // `locscale`'s preimage is invertible, so the point determines the draw:
+        // `y = (0.3 - 1.0) / 2.0 = -0.35`, hence `w = 0.65`. This threading was the
+        // one position no test covered — mutating it to `Other` left the whole file
+        // green — and it is behaviour-visible: without it this program refuses.
+        (
+            "\
+y = draw(Normal(mu = 0.0, sigma = 1.0))
+w = y + 1.0
+lp = logdensityof(locscale(lawof(y), 1.0, 2.0), 0.3)",
+            "(%bind w 0.65)",
+        ),
         // `lawof(lawof(y))` — the unwrap must carry the point through.
         (
             "\
