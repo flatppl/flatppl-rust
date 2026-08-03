@@ -1202,6 +1202,20 @@ fn lower_lawof(
 /// recognised conjugate pair — without synthesizing the `kchain`, since the table needs
 /// only the prior, the likelihood, and the symbol linking them. No row applying is what
 /// keeps the refusal.
+/// Score a conjugate row's closed form at the variate `v`. A [`MarginalForm::Measure`] goes
+/// through the ordinary density path; a [`MarginalForm::LogDensity`] IS the scored term
+/// already — the row emitted the log-density because §08 names no constructor for it.
+fn score_marginal_form(
+    m: &mut Module,
+    form: &crate::marginal::MarginalForm,
+    v: NodeId,
+) -> Result<NodeId, RefuseError> {
+    match form {
+        crate::marginal::MarginalForm::Measure(measure) => lower_measure_density(m, *measure, v),
+        crate::marginal::MarginalForm::LogDensity(ld) => Ok(ld.at(m, v)),
+    }
+}
+
 fn marginalize_or_refuse_stochastic_law(
     m: &mut Module,
     arg: NodeId,
@@ -1220,7 +1234,7 @@ fn marginalize_or_refuse_stochastic_law(
     if is_measure_expr && measure_reaches_draw(m, resolved, &[]) {
         // One variate, so no product to get wrong: the marginal's own latent is not needed.
         if let Some(marginal) = crate::marginal::conjugate_marginal_measure(m, resolved, &[]) {
-            return lower_measure_density(m, marginal?.measure, v).map(Some);
+            return score_marginal_form(m, &marginal?.form, v).map(Some);
         }
         return Err(refuse(
             resolved,
@@ -1306,7 +1320,7 @@ fn marginalize_or_refuse_record_law(
         }
     }
     let siblings: Vec<NodeId> = fields.iter().map(|&(_, _, _, site)| site).collect();
-    let mut marginals: Vec<(Symbol, NodeId)> = Vec::new();
+    let mut marginals: Vec<(Symbol, crate::marginal::MarginalForm)> = Vec::new();
     let mut integrated: Vec<Symbol> = Vec::new();
     for &(name, measure, transform, _) in &fields {
         // The transform is walked as well as the measure: for `b = y + z` the outside
@@ -1334,7 +1348,7 @@ fn marginalize_or_refuse_record_law(
                     ));
                 }
                 integrated.push(built.latent);
-                marginals.push((name, built.measure));
+                marginals.push((name, built.form));
             }
             None => {
                 return Err(refuse(
@@ -1417,8 +1431,7 @@ fn lower_record_of_draws(
 }
 
 /// [`lower_record_of_draws`] where the caller has already marginalized some fields:
-/// `marginals` replaces the named field's own measure with the closed-form marginal
-/// measure supplied for it.
+/// `marginals` replaces the named field's own factor with the closed form supplied for it.
 ///
 /// Only [`marginalize_or_refuse_record_law`] passes a non-empty list, and only for a
 /// field whose measure is parameterized by a draw the record does not carry (§04 makes
@@ -1431,20 +1444,9 @@ fn lower_record_of_draws_with(
     m: &mut Module,
     record_node: NodeId,
     v: NodeId,
-    marginals: &[(Symbol, NodeId)],
+    marginals: &[(Symbol, crate::marginal::MarginalForm)],
 ) -> Result<NodeId, RefuseError> {
-    let mut components = match_independent_record(m, record_node, v)?;
-    for comp in components.iter_mut() {
-        if let Some(&(_, marginal)) = marginals.iter().find(|(name, _)| *name == comp.name) {
-            // A marginalized field carries no transform: its law is the marginal
-            // itself, and a pushforward of it is refused upstream.
-            debug_assert!(
-                comp.transform.is_none(),
-                "marginalized field has a transform"
-            );
-            comp.measure = marginal;
-        }
-    }
+    let components = match_independent_record(m, record_node, v)?;
 
     // Empty record (degenerate joint): a sum over no components. The independent-
     // product density is Σᵢ logdensityof(Mᵢ, xᵢ) (§06 "Density of composed measures"),
@@ -1453,13 +1455,25 @@ fn lower_record_of_draws_with(
         return Ok(m.alloc(Node::Lit(Scalar::Real(0.0))));
     }
 
-    // Build density terms per component. A transformed field
+    // Build density terms per component. A marginalized field is scored from its
+    // closed form, which may be a log-density EXPRESSION rather than a measure — so the
+    // substitution happens here, at the term, not on `comp.measure`. A transformed field
     // (`transform = Some(call)`) is scored as the pushforward `pushfwd(g, Mᵢ)` of
     // the inner draw's law under `g` — `lower_pushfwd` applies the §06
     // change-of-variables (`logdensityof(Mᵢ, g⁻¹(y)) − logvol(g⁻¹(y))`),
     // reusing the recorded/derived inverse; a non-invertible `g` refuses there.
     let mut terms: Vec<NodeId> = Vec::with_capacity(components.len());
     for comp in &components {
+        if let Some((_, form)) = marginals.iter().find(|(name, _)| *name == comp.name) {
+            // A marginalized field carries no transform: its law is the marginal
+            // itself, and a pushforward of it is refused upstream.
+            debug_assert!(
+                comp.transform.is_none(),
+                "marginalized field has a transform"
+            );
+            terms.push(score_marginal_form(m, form, comp.pinned)?);
+            continue;
+        }
         let measure = match comp.transform {
             None => comp.measure,
             Some(call) => {
@@ -1904,7 +1918,7 @@ fn lower_value_law(
             // One variate, so no product to get wrong: the marginal's own latent is not
             // needed. A caller that SUMS several marginals does need it — see
             // [`marginalize_or_refuse_record_law`]'s shared-latent refusal.
-            let scored = built.and_then(|mg| lower_measure_density(m, mg.measure, v));
+            let scored = built.and_then(|mg| score_marginal_form(m, &mg.form, v));
             // Pin as the ancestor-free path does: the marginal consumed this value's
             // `draw`, so the binding must not survive into the conformance check.
             if scored.is_ok() && origin == VariateOrigin::Point {

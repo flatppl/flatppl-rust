@@ -259,6 +259,111 @@ lp = logdensityof(pp, record(y = 0.5))";
     );
 }
 
+// The explicit `kchain` spelling of the three rows whose closed form is not a §08
+// constructor or needs the `sqrt` path. This spelling has its own variate descent: a
+// log-density row has no measure to wrap in the kernel's `record(y = …)`, so the record
+// wrapper is applied to the VALUE instead and the row's expression consumes `v.y`. The
+// maths, the test points and the wrong answers are in `src/marginal.md`.
+#[test]
+fn kchain_conjugate_marginals_for_the_expression_and_sqrt_rows() {
+    // Row 3 (Beta–Binomial): an expression, not a constructor — §08 names no
+    // `BetaBinomial`. The `record(k = …)` kernel body means `variate_like_kernel` must
+    // hand the row the scalar `7`, not the record.
+    let out = determinize_src(
+        "\
+p = draw(Beta(alpha = 2.0, beta = 3.0))
+kk = kernelof(record(k = draw(Binomial(n = 10, p = p))), p = p)
+pp = kchain(lawof(record(p = p)), kk)
+lp = logdensityof(pp, record(k = 7))",
+    );
+    let pir = flatppl_flatpir::write(&out);
+    assert!(
+        !pir.contains("builtin_logdensityof"),
+        "the beta-binomial marginal is an expression:\n{pir}"
+    );
+    // Scored at the SCALAR 7: `loggamma(k+1)` folded to `loggamma(8.0)` and
+    // `loggamma(k+α)` to `loggamma(9.0)` only because the row got `7`, not the record.
+    assert!(
+        pir.contains("(loggamma 8.0)") && pir.contains("(loggamma 9.0)"),
+        "the row consumed the record's scalar `k` = 7:\n{pir}"
+    );
+    assert!(
+        !pir.contains("(%field k") && !pir.contains("(get "),
+        "the record variate is consumed by the descent, not left as a `get`:\n{pir}"
+    );
+    assert!(
+        !pir.contains("kchain") && !pir.contains("kernelof") && !pir.contains("(draw "),
+        "measure layer gone:\n{pir}"
+    );
+    assert!(
+        flatppl_determinizer::is_flatpdl(&out).is_ok(),
+        "is_flatpdl failed:\n{pir}"
+    );
+
+    // Row 4 (Exponential prior on the VARIANCE): the latent reaches `sigma` through a
+    // `sqrt`, and the answer IS a §08 constructor — `Laplace(0, 1/sqrt(2λ))`.
+    let out = determinize_src(
+        "\
+v = draw(Exponential(rate = 0.5))
+kk = kernelof(record(y = draw(Normal(mu = 0.0, sigma = sqrt(v)))), v = v)
+pp = kchain(lawof(record(v = v)), kk)
+lp = logdensityof(pp, record(y = 4.0))",
+    );
+    let pir = flatppl_flatpir::write(&out);
+    assert!(
+        pir.contains("(builtin_logdensityof Laplace ")
+            && pir.contains("(%field location 0.0)")
+            && pir.contains("(%field scale 1.0)"),
+        "the Exponential-variance marginal is Laplace(0, 1/sqrt(2λ)) = Laplace(0, 1):\n{pir}"
+    );
+    assert!(
+        flatppl_determinizer::is_flatpdl(&out).is_ok(),
+        "is_flatpdl failed:\n{pir}"
+    );
+
+    // Row 5 (InverseGamma prior on the VARIANCE): the `sqrt` path AND an expression.
+    let out = determinize_src(
+        "\
+v = draw(InverseGamma(shape = 2.5, scale = 3.0))
+kk = kernelof(record(y = draw(Normal(mu = 0.0, sigma = sqrt(v)))), v = v)
+pp = kchain(lawof(record(v = v)), kk)
+lp = logdensityof(pp, record(y = 5.0))",
+    );
+    let pir = flatppl_flatpir::write(&out);
+    assert!(
+        !pir.contains("builtin_logdensityof"),
+        "the scaled Student t marginal is an expression:\n{pir}"
+    );
+    assert!(
+        pir.contains("(log 1.0954451150103321)") && pir.contains("(log1p 4.166666666666666)"),
+        "scale sqrt(β/α) and the tail at the scalar variate 5.0:\n{pir}"
+    );
+    assert!(
+        flatppl_determinizer::is_flatpdl(&out).is_ok(),
+        "is_flatpdl failed:\n{pir}"
+    );
+}
+
+// Refuse-don't-mislower for the `sqrt` path in the EXPLICIT spelling: the same
+// Exponential prior feeding `sigma` as a bare ref is a prior on the standard deviation,
+// not on the variance, so Row 4's `LatentPath::Sqrt` must reject it.
+#[test]
+fn kchain_conjugate_marginal_refuses_a_bare_ref_where_a_row_wants_sqrt() {
+    let m = parse_infer(
+        "\
+v = draw(Exponential(rate = 0.5))
+kk = kernelof(record(y = draw(Normal(mu = 0.0, sigma = v))), v = v)
+pp = kchain(lawof(record(v = v)), kk)
+lp = logdensityof(pp, record(y = 4.0))",
+    );
+    let err = determinize(&m)
+        .expect_err("a prior on the standard deviation is not the variance-mixture row — refuse");
+    assert!(
+        err.reason.contains("non-enumerable"),
+        "refusal explains the non-enumerable marginal: {err:?}"
+    );
+}
+
 // `normalize(logweighted(x -> logdensityof(g2, x), g1))` with `g1`, `g2` both
 // Normal is a POINTWISE PRODUCT OF TWO GAUSSIANS, which normalizes IN CLOSED
 // FORM (no quadrature): the overlap integral is itself a Gaussian

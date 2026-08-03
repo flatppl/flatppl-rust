@@ -16,10 +16,42 @@ A table row IS the "in closed form" branch, for one recognised prior/likelihood 
 
 $$\int p_K(x \mid a)\, p_M(a)\, \mathrm{d}a = p_{M'}(x)$$
 
-for a single §08 distribution $M'$. The row supplies $M'$'s parameters as functions of
-$M$'s and $K$'s. It is not general integration: a row matches only when the two
-constructors line up exactly, the latent feeds exactly the conjugating parameter, and
-every other likelihood parameter is latent-independent.
+The row supplies $p_{M'}$. It is not general integration: a row matches only when the two
+constructors line up exactly, the latent reaches exactly the conjugating parameter along
+the path the row expects, and every other likelihood parameter is latent-independent.
+
+## A row need not name a §08 distribution
+
+Determinised output is a deterministic expression, so a row may return its answer in
+either of two forms (`MarginalForm`):
+
+- **`Measure`** — a §08 distribution-constructor node, scored by the ordinary density path
+  into one `builtin_logdensityof`. Rows 1, 2 and 4.
+- **`LogDensity`** — the closed-form log-density itself, built from §07 builtins at the
+  variate. Rows 3 and 5, because §08 names no `BetaBinomial` and its `StudentT(nu)` is the
+  standard form only (its location-scale form is a `pushfwd`, not a bare constructor).
+
+Both rows' expressions use `loggamma`, a §07 builtin ("Elementary functions", domain
+`posreals`) — **not** a §09 standard-module member, so no `load_module` is involved. That
+distinction is what separates them from the deferred row at the end of this file.
+
+Nothing about a row being closed-form requires a constructor to exist. Rows 3 and 5 were
+once recorded as blocked on a §08 addition on that false premise; do not reintroduce it.
+
+## The latent's path to the conjugating parameter
+
+§08 parameterizes each distribution by the quantity it names, and that is not always the
+quantity a conjugacy is stated in. `Normal` takes `sigma`, so a prior on the **variance**
+reaches the conjugating parameter through a `sqrt`: `Normal(mu = 0, sigma = sqrt(v))`. Each
+row therefore records a `LatentPath` — `Direct` (the parameter's value IS the latent's ref)
+or `Sqrt` — and a row matches only along its own path.
+
+**Why the row must record it.** A location mixture and a scale mixture over the same base
+agree closely. For Row 4's own prior, the location mixture `y = m + ε` with
+`m ~ Exponential(rate = 1)`, `ε ~ Normal(0, 1)` has log-density `-1.1759117615936188` at
+`y = 0.5`, while Row 4's scale mixture `Laplace(0, 1)` gives `-1.1931471805599454` — a gap
+of **0.017 nats**. A row that accepted a bare ref where it wanted `sqrt` would score one as
+the other, and no plausible test point near the origin would notice.
 
 ## Two spellings, one table
 
@@ -153,6 +185,226 @@ and two steps inside the lower crossing.
 Structurally, the emitted constructor NAME already separates the two answers
 (`NegativeBinomial` vs `Poisson`), and the identity map means the emission must carry no
 arithmetic at all.
+
+## Row 3 — Beta prior on a Binomial `p`
+
+| | |
+|---|---|
+| model | `p ~ Beta(alpha = α, beta = β)`; `k ~ Binomial(n = n, p = p)` |
+| latent | `p`, feeding the likelihood's `p`, `LatentPath::Direct` |
+| §08 answer | none — §08 names no `BetaBinomial`; the row emits the log-pmf |
+| builder | `build_beta_binomial_marginal` / `build_beta_binomial_logpmf` |
+
+The integral, with §08's `Binomial(n, p)` pmf $\binom{n}{k}p^k(1-p)^{n-k}$ and `Beta(alpha,
+beta)` density $\frac{p^{\alpha-1}(1-p)^{\beta-1}}{B(\alpha,\beta)}$:
+
+$$\int_0^1 \binom{n}{k} p^k (1-p)^{n-k}
+\frac{p^{\alpha-1}(1-p)^{\beta-1}}{B(\alpha,\beta)}\, \mathrm{d}p
+= \binom{n}{k} \frac{1}{B(\alpha,\beta)} \int_0^1 p^{k+\alpha-1}(1-p)^{n-k+\beta-1}\,
+\mathrm{d}p
+= \binom{n}{k}\frac{B(k+\alpha,\, n-k+\beta)}{B(\alpha,\beta)}$$
+
+— the beta-binomial pmf, the integral being the definition of the beta function. In log
+space, with `loggamma` the §07 builtin and $\log B(x,y) = \log\Gamma(x) + \log\Gamma(y) -
+\log\Gamma(x+y)$:
+
+```text
+log C(n, k) = loggamma(n+1) − loggamma(k+1) − loggamma(n−k+1)
+logpmf      = log C(n, k) + log B(k+α, n−k+β) − log B(α, β)
+```
+
+**Parameter map, re-derived against §08's own parameterisation.** §08's `Beta` takes two
+SHAPES `alpha`/`beta` (not a mean and a concentration), and §08's `Binomial` takes `n` and a
+`p` that is a **probability** (not a rate or a logit). So α, β come from the prior verbatim
+and `n` from the likelihood verbatim — no reparameterisation. `n` is read from the
+likelihood because the trial count is the likelihood's, and check (c) has already proven it
+latent-independent.
+
+### Test point
+
+| | |
+|---|---|
+| model | `p ~ Beta(2, 3)`; `k ~ Binomial(n = 10, p = p)` |
+| point | `k = 7` |
+| marginal | `BetaBinomial(10, 2, 3)` |
+| truth | `-2.526728144641337` |
+| wrong answer | `-3.1590202516350088` |
+| gap | `0.632` nats |
+
+The wrong answer is the plug-in `Binomial(10, 0.4)` at `k = 7` — the conditional at the
+prior MEAN $\alpha/(\alpha+\beta) = 0.4$. The two share a mean, so only the dispersion tells
+them apart, exactly as in Row 2.
+
+**What the point discriminates against.** The gap crosses zero twice over `k`, between
+`k = 2` and `k = 3` and between `k = 6` and `k = 7`: the beta-binomial is overdispersed, so
+it loses mass in the centre and gains it in both tails. `k = 7` is the first integer above
+the upper crossing, where the gap is already `0.632`; the mirror point is the lower
+extremum `k = 4` (gap `-0.584`). A test at `k = 6` (gap `-0.061`) would be nearly blind.
+
+Structurally the emitted expression pins the map by itself: every `loggamma` argument
+const-folds, so the row shows as `loggamma` at `11.0, 8.0, 4.0` (the coefficient) and
+`9.0, 6.0, 15.0` against `2.0, 3.0, 5.0` (the posterior-over-prior beta ratio). A plug-in
+would name `Binomial` and carry a `0.4`, and neither survives.
+
+## Rows 4 and 5 — a prior on the VARIANCE, reached through `sqrt`
+
+Both are Gaussian **scale** mixtures: `y | v ~ Normal(mu = μ, sigma = sqrt(v))` with a prior
+on `v`. Both therefore use `LatentPath::Sqrt`, and the 0.017-nat location/scale
+near-agreement above is why that path is recorded rather than assumed.
+
+Both rows pass the likelihood's `mu` through as the marginal's location. `y = μ + s·ε` for a
+symmetric mixture `ε`, so the marginal is the same law shifted by `μ` — an elementary
+location shift, and check (c) has already proven `mu` latent-independent. The test points
+below all sit at `μ = 0`, so the **numeric** verification covers `μ = 0` only; the shift
+itself is the derivation just given, not a checked number.
+
+### Row 4 — Exponential prior on the variance → Laplace
+
+| | |
+|---|---|
+| model | `v ~ Exponential(rate = λ)`; `y ~ Normal(mu = μ, sigma = sqrt(v))` |
+| latent | `v`, feeding the likelihood's `sigma` under a `sqrt` |
+| §08 answer | `Laplace(location = μ, scale = 1/sqrt(2λ))` |
+| builder | `build_exponential_variance_marginal` |
+
+With §08's `Exponential(rate)` density $\lambda e^{-\lambda v}$, `Normal(mu, sigma)` density
+$\frac{1}{\sigma\sqrt{2\pi}}e^{-(x-\mu)^2/2\sigma^2}$ and `Laplace(location, scale)` density
+$\frac{1}{2b}e^{-|x-\mu|/b}$, at $\mu = 0$:
+
+$$\int_0^\infty \frac{1}{\sqrt{2\pi v}}e^{-y^2/2v}\, \lambda e^{-\lambda v}\, \mathrm{d}v
+= \frac{\lambda}{\sqrt{2\pi}} \int_0^\infty v^{-1/2}
+e^{-\left(\frac{y^2}{2v} + \lambda v\right)}\, \mathrm{d}v
+= \sqrt{\frac{\lambda}{2}}\; e^{-\sqrt{2\lambda}\,|y|}$$
+
+(the inner integral is the standard $\int_0^\infty v^{-1/2}e^{-a/v - cv}\mathrm{d}v =
+\sqrt{\pi/c}\,e^{-2\sqrt{ac}}$ with $a = y^2/2$, $c = \lambda$). That is
+$\frac{1}{2b}e^{-|y|/b}$ with $b = 1/\sqrt{2\lambda}$ — `Laplace(0, b)` exactly.
+
+**Parameter map, re-derived against §08's own parameterisation.** §08 parameterizes
+`Exponential` by **rate** $\lambda$ (`rate = elementof(posreals)`: "the decay rate"), not by
+mean or scale; and `Laplace` by **scale** $b$, not by rate. So the map is
+$b = 1/\sqrt{2\lambda}$, emitted `divide(1.0, sqrt(mul(2.0, λ)))`. Stated the other way, a
+prior of MEAN $2b^2$ is `rate = 1/(2b^2)`, and the map inverts that. A row that passed
+$\lambda$ through, or read it as a scale, would give a different constant.
+
+| | |
+|---|---|
+| model | `v ~ Exponential(rate = 0.5)` (mean 2, so `b = 1`); `y ~ Normal(0, sqrt(v))` |
+| point | `y = 4.0` |
+| marginal | `Laplace(0, 1)`, emitted `scale` folds to `1.0` |
+| truth | `-4.693147180559945` |
+| wrong answer | `-5.265512123484645` |
+| gap | `0.572` nats |
+
+The wrong answer is the plug-in `Normal(0, sqrt 2)` — the likelihood at the prior MEAN
+variance $1/\lambda = 2$.
+
+**Do not move this test point without re-scanning the gap.** The gap is only `0.135` at
+`y = 0.5`, and it changes sign twice over `y ∈ [0.5, 4.0]` (`-0.178`, `-0.428`, `-0.178` at
+`y` = 1, 2, 3), so it crosses zero near `y ≈ 1` and `y ≈ 3` and a test there is blind by
+construction. Worse, at `y = 0.5` the wrong answer is `-1.3280121234846454`, numerically
+identical to **Row 1's truth** — so a row mix-up at that point would look correct.
+
+Structurally `scale = 1.0` alone cannot tell $1/\sqrt{2\lambda}$ from a $\lambda$ passed
+through, since both are 1 at $\lambda = 0.5$. A second shape with `rate = 0.125` → `scale
+2.0` pins the arithmetic; it asserts structure only and claims no density number.
+
+### Row 5 — InverseGamma prior on the variance → scaled Student t
+
+| | |
+|---|---|
+| model | `v ~ InverseGamma(shape = α, scale = β)`; `y ~ Normal(mu = μ, sigma = sqrt(v))` |
+| latent | `v`, feeding the likelihood's `sigma` under a `sqrt` |
+| §08 answer | none as a constructor — the location-scale t is a `pushfwd`; the row emits the log-density |
+| builder | `build_inverse_gamma_variance_marginal` / `build_scaled_t_logpdf` |
+
+With §08's `InverseGamma(shape, scale)` density
+$\frac{\beta^\alpha}{\Gamma(\alpha)}v^{-\alpha-1}e^{-\beta/v}$, at $\mu = 0$:
+
+$$\int_0^\infty \frac{1}{\sqrt{2\pi v}}e^{-y^2/2v}\,
+\frac{\beta^\alpha}{\Gamma(\alpha)} v^{-\alpha-1} e^{-\beta/v}\, \mathrm{d}v
+= \frac{\beta^\alpha}{\Gamma(\alpha)\sqrt{2\pi}} \int_0^\infty
+v^{-\alpha-\frac{3}{2}} e^{-\left(\beta + \frac{y^2}{2}\right)/v}\, \mathrm{d}v
+= \frac{\Gamma\!\left(\alpha+\frac12\right)\beta^\alpha}
+{\Gamma(\alpha)\sqrt{2\pi}\left(\beta + \frac{y^2}{2}\right)^{\alpha + 1/2}}$$
+
+which regroups to the Student t with $\nu = 2\alpha$ scaled by $s = \sqrt{\beta/\alpha}$:
+substituting $\beta = \alpha s^2$ and $\nu = 2\alpha$ gives
+$\frac{\Gamma\left(\frac{\nu+1}{2}\right)}{\Gamma\left(\frac{\nu}{2}\right)
+\sqrt{\nu\pi}\, s}\left(1 + \frac{(y/s)^2}{\nu}\right)^{-(\nu+1)/2}$, i.e. §08's
+`StudentT(nu)` density in $y/s$ divided by $s$ — the density of
+`pushfwd(fn(mu + s * _), StudentT(nu))`.
+
+The emitted form writes the normalizer with a log-beta rather than the gamma ratio and
+$\log(\nu\pi)/2$, because $B(\nu/2, 1/2) = \Gamma(\nu/2)\Gamma(1/2)/\Gamma((\nu+1)/2)$
+absorbs the $\Gamma(1/2) = \sqrt{\pi}$ — so no `pi` constant is needed and
+`build_logbeta` is reused:
+
+```text
+z    = (y − μ)/s,   s = sqrt(β/α),   ν = 2α
+logZ = log(s) + log(sqrt(ν)) + log B(ν/2, 1/2)
+out  = −[ logZ + ((ν+1)/2) · log1p(z²/ν) ]
+```
+
+**Parameter map, re-derived against §08's own parameterisation.** §08 calls
+`InverseGamma`'s second parameter `scale`, but it is **not** a multiplicative scale: §08
+states "The `scale` parameter of `InverseGamma` plays the same numerical role as the `rate`
+parameter of `Gamma`", and the density has it as the $\beta$ in $e^{-\beta/v}$. So the map
+reads `scale` as that $\beta$, giving $s = \sqrt{\beta/\alpha}$ and $\nu = 2\alpha$. Reading
+it as a multiplicative scale would put $\beta$ in the wrong place and fold to a different
+constant.
+
+| | |
+|---|---|
+| model | `v ~ InverseGamma(shape = 2.5, scale = 3.0)`; `y ~ Normal(0, sqrt(v))` |
+| point | `y = 5.0` |
+| marginal | location 0, `s = sqrt(3/2.5) = 1.0954451150103321`, `ν = 5` |
+| truth | `-5.986463573222975` |
+| wrong answer | `-7.515512123484645` |
+| gap | `1.529` nats |
+
+The wrong answer is the plug-in `Normal(0, sqrt(β/(α−1)))` — the likelihood at the prior
+MEAN variance $\beta/(\alpha-1) = 2$.
+
+**What the point discriminates against.** The t is heavier-tailed than the Gaussian with the
+same central scale, so the gap is positive near the origin (`0.146` at `y = 0.5`), negative
+through the shoulder (`-0.007`, `-0.152`, `-0.327`, `-0.293` at `y` = 1, 1.4, 2, 3) and
+strongly positive in the tail. It therefore crosses zero just above `y = 1` and again
+between `y = 3` and `y = 5`. The point was moved from `y = 1.4`, where the gap is only
+`0.152`, out to `y = 5.0` where it is `1.529`.
+
+Structurally the folded literals pin the map: `log 1.0954451150103321` is $\log s$ with $s$
+read as $\sqrt{\beta/\alpha}$, `log 2.23606797749979` is $\log\sqrt{\nu}$ at $\nu = 2\alpha
+= 5$, `loggamma` at `2.5`/`0.5`/`3.0` is $\log B(\nu/2, 1/2)$, and `mul 3.0` with
+`log1p 4.166666666666666` is $((\nu+1)/2)\log(1 + z^2/\nu)$.
+
+## Deferred by decision — Exponential prior on the MEAN
+
+`v ~ Exponential(rate = λ)`; `y ~ Normal(mu = v, sigma = σ)` is a **location** mixture, whose
+marginal is the exponentially modified Gaussian — verified `-1.1759117615936188` at
+`y = 0.5` with `λ = 1`, `σ = 1`, against quadrature of its own integral. It is not in the
+table, and it must not be added.
+
+Its density needs `erfc`, which is a **§09 standard-module member**
+(`09-standard-modules.md`, `special-functions`), not a §07 builtin. The determiniser emits
+no §09 module call anywhere, and such a call would have to carry a `load_module` whose name
+**and version** match the catalogue in *both* engines. **Module loading in determinised
+output is deferred pending consortium discussion** — a settled decision, not an open
+question.
+
+§13 gives nothing to appeal to: it describes the target only as "a deterministic DAG", never
+uses the name "FlatPDL", and states that determinization "is preliminary and subject to
+change. It is not part of FlatPPL semantic versioning yet." So the admissible vocabulary of
+determinised output is defined solely by `is_flatpdl`, and widening it would set profile
+policy by accident.
+
+Do not reimplement `erfc` from §07 builtins to route around this. If any other row you
+consider needs a §09 member, stop and report it rather than reaching for the same
+workaround. This row is recorded here so a later reader does not rediscover it and assume
+nobody had checked.
+
+The refusal test for it is `a_latent_with_no_conjugate_row_still_refuses`'s
+"exponential prior on a location" case, which is also Row 4's nearest neighbour.
 
 ## Refusal is the fallback, and stays load-bearing
 
