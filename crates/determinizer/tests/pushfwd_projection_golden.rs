@@ -325,10 +325,15 @@ fn positional_joint_index_projection_keeps_the_selected_component() {
         1,
         "only the selected component is scored:\n{lp}"
     );
+    // Match the KEPT component's whole parameter record: a bare `"1.0"` would also
+    // match the dropped component's `mu = 1.0`, so it discriminates nothing.
     assert!(
-        lp.contains("1.0") && !lp.contains("2.0"),
-        "the KEPT component is Normal(mu = 0.0, sigma = 1.0), not Normal(mu = 1.0, sigma = 2.0) \
-         — a sigma of 2.0 would be the wrong component:\n{lp}"
+        lp.contains("(%field mu 0.0) (%field sigma 1.0)"),
+        "the kept component is Normal(mu = 0.0, sigma = 1.0):\n{lp}"
+    );
+    assert!(
+        !lp.contains("(%field mu 1.0) (%field sigma 2.0)"),
+        "the dropped component Normal(mu = 1.0, sigma = 2.0) is marginalized out:\n{lp}"
     );
 }
 
@@ -630,4 +635,118 @@ fn single_element_selector_refuses_naming_the_subset_form() {
         msg.contains("SUBSET"),
         "message must point at the subset form: {msg}"
     );
+}
+
+#[test]
+fn scalar_cat_jointchain_permuted_prefix_keep_refuses() {
+    // The kept SET is the leading prefix {1, 2} but the ORDER is permuted. The
+    // sub-chain is scored positionally — slot j of the point feeds component j — so
+    // honouring the written order is not expressible here, and §07's subset
+    // selection never states whether the result follows selector order or container
+    // order. Measured before this refusal existed: `get(_, [2, 1])` at [0.5, 0.3]
+    // emitted logpdf(N(0,1), 0.5) + logpdf(Exp(rate 0.5), 0.3) =
+    // -1.887085713764618, where the ascending spelling at [0.3, 0.5] gives
+    // -2.317911337530609. Two different numbers from the same selection — refuse.
+    let e = determinize(&parse_infer(
+        "a = draw(Normal(mu = 0.0, sigma = 1.0))\n\
+         b = draw(Exponential(rate = a))\n\
+         kb = kernelof(b, a = a)\n\
+         kc = kernelof(draw(Gamma(shape = 2.0, rate = b)), b = b)\n\
+         jc = jointchain(lawof(a), kb, kc)\n\
+         lp = logdensityof(pushfwd(fn(get(_, [2, 1])), jc), [0.5, 0.3])",
+    ))
+    .expect_err("a permuted prefix keep has no settled marginal and must refuse");
+    let msg = format!("{e:?}");
+    assert!(msg.contains("refuse"), "must be a refusal: {msg}");
+    assert!(
+        msg.contains("PERMUTED"),
+        "message must name the permuted order, not a non-prefix set: {msg}"
+    );
+}
+
+#[test]
+fn index_projection_at_a_scalar_point_refuses() {
+    // The brief's own headline model with a SCALAR point. Every slot the index arm
+    // emits is a `get0(v, j)`, so a scalar point would emit `get0(0.5, 0)` — and
+    // inference raises nothing on the projected law, making the determiniser the
+    // last gate. Refuse rather than emit ill-typed FlatPDL.
+    let e = determinize(&parse_infer(
+        "m = iid(Normal(mu = 0.0, sigma = 1.0), 3)\n\
+         p = pushfwd(fn(get(_, [1])), m)\n\
+         lp = logdensityof(p, 0.5)",
+    ))
+    .expect_err("a scalar point off a vector-variate projection must refuse");
+    let msg = format!("{e:?}");
+    assert!(msg.contains("refuse"), "must be a refusal: {msg}");
+    assert!(
+        !msg.contains("get0"),
+        "must refuse, not report an emitted get0: {msg}"
+    );
+}
+
+#[test]
+fn index_projection_at_an_overlong_point_refuses() {
+    // Selecting one component and scoring at a 2-vector: the second entry has no
+    // slot in the sub-product, so lowering it would drop `0.7` with no diagnostic.
+    let e = determinize(&parse_infer(
+        "m = iid(Normal(mu = 0.0, sigma = 1.0), 3)\n\
+         p = pushfwd(fn(get(_, [1])), m)\n\
+         lp = logdensityof(p, [0.5, 0.7])",
+    ))
+    .expect_err("a point longer than the selection must refuse");
+    let msg = format!("{e:?}");
+    assert!(msg.contains("refuse"), "must be a refusal: {msg}");
+    assert!(
+        msg.contains("selects 1 component(s) but the query point has 2"),
+        "message must name both lengths: {msg}"
+    );
+}
+
+#[test]
+fn unsupported_selector_forms_refuse_as_projections_not_as_unrecognised_maps() {
+    // A pure `get` on the lambda's placeholder is ALWAYS a projection, never a
+    // bijection, so a selector form this arm does not lower must still refuse AS a
+    // projection. Reporting it as an unrecognised forward map would send a reader
+    // after a `bijection` annotation, which no projection can carry.
+    //
+    // §07's multi-axis subset `get(A, [1, 3, 4], 2)`, the `all` / `only` axis
+    // keywords, and a vector mixing integers with field names each reach here.
+    let cases = [
+        (
+            "m = iid(Normal(mu = 0.0, sigma = 1.0), 3)\n\
+             p = pushfwd(fn(get(_, [1], 2)), m)\n\
+             lp = logdensityof(p, [0.5])",
+            "multi-axis",
+        ),
+        (
+            "m = iid(Normal(mu = 0.0, sigma = 1.0), 3)\n\
+             p = pushfwd(fn(get(_, all)), m)\n\
+             lp = logdensityof(p, [0.5, 0.7, 0.9])",
+            "`all` axis keyword",
+        ),
+        (
+            "m = iid(Normal(mu = 0.0, sigma = 1.0), 3)\n\
+             p = pushfwd(fn(get(_, [1, \"a\"])), m)\n\
+             lp = logdensityof(p, [0.5, 0.7])",
+            "not all field names or all integer indices",
+        ),
+    ];
+    for (src, expected) in cases {
+        let e = format!(
+            "{:?}",
+            determinize(&parse_infer(src)).expect_err("an unsupported selector form must refuse")
+        );
+        assert!(
+            e.contains("structural projection"),
+            "must refuse AS a projection ({expected}): {e}"
+        );
+        assert!(
+            e.contains(expected),
+            "message must name the unsupported selector form: {e}"
+        );
+        assert!(
+            !e.contains("matrix-affine") && !e.contains("bijection"),
+            "must NOT be reported as an unrecognised forward map ({expected}): {e}"
+        );
+    }
 }

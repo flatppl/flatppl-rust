@@ -3233,6 +3233,11 @@ enum Selector {
     /// (`get` is 1-based, `get0` 0-based, §07 `get0`), so the lowering can refuse
     /// an out-of-range index by the user's own convention instead of wrapping it.
     Indices { raw: Vec<i64>, one_based: bool },
+    /// A selector form this arm does not lower, carrying the name of the form for
+    /// the refusal. Classified rather than left unrecognised so a projection is
+    /// never reported as an unrecognised forward map — a reader would go looking
+    /// for a `bijection` annotation, which no projection can have.
+    Unsupported(&'static str),
 }
 
 /// A recognised **pure structural projection** forward function (§06 case 2).
@@ -3248,14 +3253,17 @@ struct GetProjection {
 
 /// Recognise a pure structural-projection forward function `fn(get(_, sel))` — a
 /// one-input `functionof` lambda whose body is exactly `get(<the input
-/// placeholder>, sel)` or `get0(<placeholder>, sel)` (§06 case 2). `sel` is a
-/// `vector` literal of field names or of integer indices (the subset selector), or
-/// a single such literal (element access).
+/// placeholder>, sel)` or `get0(<placeholder>, sel)` (§06 case 2).
 ///
 /// The projection must be PURE: the `get`'s first argument is the bare input
-/// placeholder (no wrapping transform) and its selector is a literal. A `get` that
-/// also transforms, or selects via a computed key, is NOT this pattern (`None`) —
-/// the caller then treats the forward as a bijection candidate / refuses.
+/// placeholder (no wrapping transform). A `get` that also transforms is NOT this
+/// pattern (`None`) — the caller then treats the forward as a bijection candidate.
+///
+/// A pure `get` on the placeholder is ALWAYS a projection, never a bijection, so
+/// every selector form is recognised: one it cannot classify comes back as
+/// [`Selector::Unsupported`] for the lowering to refuse BY NAME, rather than as
+/// `None`, which would reach the bijection-synthesis diagnostic and send a reader
+/// after an annotation a projection can never carry.
 ///
 /// Field names are returned as owned strings (not interned `Symbol`s) so this
 /// stays an immutable read; the caller matches them against the product's
@@ -3279,17 +3287,33 @@ fn recognize_get_projection(m: &Module, f: NodeId) -> Option<GetProjection> {
     }
     let ph = entries[0].1.name;
 
-    // body = get(<ph>, sel) / get0(<ph>, sel) — a pure selection.
+    // body = get(<ph>, sel…) / get0(<ph>, sel…) — a pure selection.
     let (get, one_based) = match expect_builtin_call(m, c.args[0], "get") {
         Some(g) => (g, true),
         None => (expect_builtin_call(m, c.args[0], "get0")?, false),
     };
-    if get.args.len() != 2 || !get.named.is_empty() {
+    if get.args.is_empty() {
         return None;
     }
     // First arg is EXACTLY the input placeholder (no transform).
     if !matches!(m.node(get.args[0]), Node::Ref(Ref { ns: RefNs::Local, name }) if *name == ph) {
         return None;
+    }
+    // A pure `get` on the placeholder: from here every exit is a projection.
+    let unsupported = |what: &'static str| {
+        Some(GetProjection {
+            sel: Selector::Unsupported(what),
+            subset: true,
+        })
+    };
+    if !get.named.is_empty() {
+        return unsupported("a keyword selector argument");
+    }
+    if get.args.len() != 2 {
+        // §07 spells a multi-axis subset `get(A, [1, 3, 4], 2)`. A product measure's
+        // components live on ONE axis, so a second selector axis has no component
+        // meaning here.
+        return unsupported("a multi-axis selector (more than one selector argument)");
     }
     let sel = get.args[1];
     // Subset selector: a non-empty `vector` of string literals (fields) or of
@@ -3319,7 +3343,18 @@ fn recognize_get_projection(m: &Module, f: NodeId) -> Option<GetProjection> {
             },
             subset: false,
         }),
-        _ => None,
+        // The `all` / `only` axis keywords (§07 `get`) parse to a `%const`.
+        Node::Const(s) => match m.resolve(*s) {
+            "all" => unsupported("the `all` axis keyword"),
+            "only" => unsupported("the `only` axis keyword"),
+            _ => unsupported("a non-literal selector"),
+        },
+        // A `vector(...)` that is neither all-strings nor all-integers (mixed
+        // int/string entries, or a computed entry).
+        _ if expect_builtin_call(m, sel, "vector").is_some() => {
+            unsupported("a selector vector that is not all field names or all integer indices")
+        }
+        _ => unsupported("a non-literal selector"),
     }
 }
 
@@ -3419,6 +3454,19 @@ fn lower_projection_pushfwd(
         Selector::Names(fields) => lower_named_projection(m, m_inner_expr, fields, v),
         Selector::Indices { raw, one_based } => {
             lower_index_projection(m, m_inner_expr, raw, *one_based, v)
+        }
+        Selector::Unsupported(what) => {
+            let (m_inner, _) = resolve_ref_one(m, m_inner_expr);
+            Err(refuse(
+                m_inner,
+                m,
+                &format!(
+                    "structural projection (§06 case 2) is recognised but uses {what}, which this \
+                     arm does not lower to a closed-form marginal; the supported selectors are a \
+                     vector of field names `get(_, [\"a\", …])` and a vector of component indices \
+                     `get(_, [1, …])` — refuse rather than mislower"
+                ),
+            ))
         }
     }
 }
@@ -3616,6 +3664,11 @@ fn lower_named_projection(
 /// A `jointchain` is a DEPENDENT product: only a leading PREFIX keep is closed-form
 /// (the dropped trailing kernels are normalized Markov kernels that integrate to
 /// 1); any other keep is the `kchain` integral and refuses.
+///
+/// **The query point is checked before any slot is built.** Every slot here is a
+/// `get0(v, j)`, which is only meaningful for a point of the base's own variate
+/// KIND and of the SELECTED length — a scalar point would emit `get0(0.5, 0)` and an
+/// over-long point would drop its tail, both silently.
 fn lower_index_projection(
     m: &mut Module,
     m_inner_expr: NodeId,
@@ -3624,6 +3677,9 @@ fn lower_index_projection(
     v: NodeId,
 ) -> Result<NodeId, RefuseError> {
     let (m_inner, _) = resolve_ref_one(m, m_inner_expr);
+    // The point checks run INSIDE each supported arm, not here: dispatching on the
+    // base shape first lets a field-keyed base report the by-name spelling rather
+    // than a variate-kind mismatch its point would also trip.
     match builtin_name(m, m_inner) {
         // `iid(M, n)`: every slot is the SAME `M`, so the marginal over any k slots
         // is `M^⊗k` — the k-fold sum of `M`'s density at the projected point's
@@ -3631,6 +3687,7 @@ fn lower_index_projection(
         // repeat axis, so `get0(v, j)` recovers a whole `M`-variate row (the
         // asymmetry [`lower_iid`]'s unroll documents).
         Some("iid") => {
+            refuse_bad_index_point(m, m_inner, v, raw.len())?;
             let n = iid_static_size(m, m_inner).ok_or_else(|| {
                 refuse(
                     m_inner,
@@ -3674,6 +3731,7 @@ fn lower_index_projection(
             let comps = {
                 let c = expect_builtin_call(m, m_inner, "joint")
                     .ok_or_else(|| refuse(m_inner, m, "expected joint"))?;
+                // The keyword form is field-keyed; report that before the point.
                 if !c.named.is_empty() {
                     return Err(refuse(
                         m_inner,
@@ -3688,6 +3746,7 @@ fn lower_index_projection(
                 }
                 c.args.to_vec()
             };
+            refuse_bad_index_point(m, m_inner, v, raw.len())?;
             for &comp in &comps {
                 let (resolved, _) = resolve_ref_one(m, comp);
                 let kind = match m.type_of(resolved) {
@@ -3760,6 +3819,15 @@ fn lower_index_projection(
 ///
 /// A record-family chain refuses here: its variate is a record, addressed by field
 /// name, not by slot.
+///
+/// **The keep must be ASCENDING as written, not merely a prefix set.** The sub-chain
+/// is rebuilt from `args[..k]` and scored positionally by
+/// [`crate::jointchain::lower_jointchain`] — slot `j` of the point feeds component
+/// `j` — so a permuted selection such as `get(_, [2, 1])` would score the components
+/// against the wrong slots and return a different number with no diagnostic. §07's
+/// subset selection does not state whether the result follows selector order or
+/// container order, so a permutation has no settled meaning to lower; refuse it. (The
+/// by-name arm has no such hazard: its point is a record read by field name.)
 fn lower_scalar_chain_index_projection(
     m: &mut Module,
     node: NodeId,
@@ -3784,14 +3852,28 @@ fn lower_scalar_chain_index_projection(
         }
         c.args.to_vec()
     };
+    refuse_bad_index_point(m, node, v, raw.len())?;
     let kept = normalize_selected_indices(m, node, raw, one_based, args.len())?;
     let k = kept.len();
-    // Dependency-respecting PREFIX keep ⇔ the kept slots are exactly the leading
-    // {0, …, k-1}; any other keep drops a slot a kept or later kernel reads, which
-    // is the intractable `kchain` integral.
-    let mut sorted = kept;
-    sorted.sort_unstable();
-    if !sorted.iter().copied().eq(0..k) {
+    // Dependency-respecting PREFIX keep ⇔ the kept slots are the leading
+    // {0, …, k-1} AS WRITTEN. A different SET drops a slot a kept or later kernel
+    // reads — the intractable `kchain` integral. The same set in a different ORDER
+    // is a permutation the positional sub-chain cannot express (see the doc
+    // comment); both refuse, distinguished so the message is actionable.
+    if !kept.iter().copied().eq(0..k) {
+        let mut sorted = kept.clone();
+        sorted.sort_unstable();
+        if sorted.iter().copied().eq(0..k) {
+            return Err(refuse(
+                node,
+                m,
+                "structural projection over a `jointchain` keeps the leading prefix in a PERMUTED \
+                 order: the sub-chain is scored positionally (slot j of the point feeds component \
+                 j), and §07 does not state whether subset selection follows selector order or \
+                 container order, so a permuted keep has no settled marginal — write the selection \
+                 in ascending order — refuse rather than mislower",
+            ));
+        }
         return Err(refuse_jointchain_nonprefix(m, node));
     }
     // Each dropped trailing kernel must be a confirmed normalized Markov kernel to
@@ -3824,6 +3906,53 @@ fn lower_scalar_chain_index_projection(
         }));
         crate::jointchain::lower_jointchain(m, sub, v)
     }
+}
+
+/// Refuse a query point the index arm cannot slice: one of the wrong variate KIND,
+/// or of the wrong LENGTH for the `k` selected components.
+///
+/// Every slot the index arm emits is a `get0(v, j)` for `j` in `0..k`. A scalar point
+/// would emit `get0(0.5, 0)` — ill-typed FlatPDL, which inference does not reject on
+/// the projected law — and a longer point would have its tail silently dropped. The
+/// `lower_pushfwd` entry runs the kind check only on the bijection path, which the
+/// projection early return precedes, so the index arms run it themselves.
+fn refuse_bad_index_point(
+    m: &Module,
+    m_inner: NodeId,
+    v: NodeId,
+    k: usize,
+) -> Result<(), RefuseError> {
+    // A projection preserves the base's variate kind (an index-keyed product's array
+    // / `cat` vector stays one), so the base domain's kind is the point's.
+    if let Some(Type::Measure { domain, .. }) = m.type_of(m_inner) {
+        let domain = (**domain).clone();
+        refuse_variate_kind_mismatch(m, &domain, v)?;
+    }
+    refuse_point_length_mismatch(m, v, k)
+}
+
+/// Refuse a query point whose leading axis length disagrees with the `k` selected
+/// components. Only a statically-resolved leading `Dim` can be checked; a dynamic or
+/// unresolved length passes, matching how the other lowerings read a point.
+fn refuse_point_length_mismatch(m: &Module, v: NodeId, k: usize) -> Result<(), RefuseError> {
+    let Some(Type::Array { shape, .. }) = m.type_of(v) else {
+        return Ok(());
+    };
+    let Some(Dim::Static(n)) = shape.first().copied() else {
+        return Ok(());
+    };
+    if n as usize != k {
+        return Err(refuse(
+            v,
+            m,
+            &format!(
+                "structural projection selects {k} component(s) but the query point has {n} — the \
+                 projected variate is the sub-product over the selected components, so a longer \
+                 point would have its tail silently dropped — refuse rather than mislower"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Normalize a projection's written indices to 0-based component positions over an
