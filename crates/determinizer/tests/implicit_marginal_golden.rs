@@ -2,12 +2,11 @@
 //! not a refusal.
 //!
 //! §04 *Reification to measures* makes `lawof(x)` the total law of `x`, and §04 *Kernels
-//! and `kernelof`* says which ancestors go: a `prior_predictive = lawof(record(obs =
-//! obs))` is "obtained by marginalizing over `theta1` and `theta2` — they are internal
-//! stochastic nodes in the traced sub-DAG, not boundary inputs, so `lawof` integrates them
-//! out. `prior_predictive` is equivalent to `kchain(prior, forward_kernel)`." The guard
-//! that stopped the CONDITIONAL density escaping refused this whole shape, including the
-//! pairs `CONJUGATE_TABLE` already answers in closed form. It now tries the table first.
+//! and `kernelof`* says which ancestors go: internal stochastic nodes of the traced
+//! sub-DAG "are not boundary inputs, so `lawof` integrates them out", equivalently
+//! `kchain(prior, forward_kernel)`. The guard against the CONDITIONAL escaping refused
+//! this whole shape, including pairs `CONJUGATE_TABLE` answers in closed form; it now
+//! tries the table first.
 //!
 //! The maths of each row, its test point, and the wrong answer that point discriminates
 //! against are in `src/marginal.md`. The numbers quoted below are verified there against
@@ -438,18 +437,14 @@ lp = logdensityof(lawof(record(y1 = y1, y2 = y2)), record(y1 = 0.5, y2 = 0.7))")
 // worst failure class the determiniser has. §04 "Kernels and `kernelof`" works this exact
 // shape and makes the joint `kchain(prior, forward_kernel)`, never a product.
 //
-// This is the one shape where every PER-FIELD answer is right and the assembled product is
-// still wrong, which is why the check cannot live in the conjugate row: the row is asked for
-// y1's law and returns it correctly. `conjugate_marginal_measure` reports the latent it
-// integrated so the record path can see the collision.
+// Every PER-FIELD answer is right and the assembled product still wrong, so the check
+// cannot live in the conjugate row: the row is asked for y1's law and returns it
+// correctly. `conjugate_marginal_measure` reports the latent it integrated so the record
+// path sees the collision — which is why every row inherits the refusal, including the
+// two whose closed form is a log-density EXPRESSION.
 //
-// Both field orders, and with the latent still latent as well as pinned by a sibling query —
-// the refusal must not depend on which field the walk reaches first, nor on the provenance
-// path the marginal was built through.
-//
-// EVERY row inherits the refusal, including the two whose closed form is a log-density
-// EXPRESSION: the check reads the latent the row reports, not the shape of its answer, so a
-// shared VARIANCE is refused exactly as a shared mean is.
+// Covers both field orders and both provenance paths (latent still latent, and pinned by
+// a sibling query).
 #[test]
 fn two_fields_sharing_one_latent_refuse_rather_than_emit_the_product() {
     for (model, queries) in [
@@ -645,7 +640,7 @@ lp_y = logdensityof(lawof(y), 0.5)",
     ] {
         let reason = refusal(src);
         assert!(
-            reason.contains("no conjugate closed-form applies"),
+            reason.contains("no conjugate row"),
             "{label} must refuse as an unanswerable marginal: {reason}"
         );
     }

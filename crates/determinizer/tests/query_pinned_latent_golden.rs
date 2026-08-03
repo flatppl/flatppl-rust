@@ -9,18 +9,16 @@
 //! to measures" makes `lawof(y)` y's TOTAL law, the marginal `Normal(0, √2)`. Both
 //! spellings had it (`lawof(y)` and `lawof(record(y = y))`), in both statement orders.
 //!
-//! The fix records the pin (`Module::pin_binding_to_query_point`), so the provenance
-//! outlives the rewrite the way the draw does not. What must NOT be caught: a
-//! genuinely fixed parameter, an independent latent another query pinned, and a
-//! SIBLING field of the same record product — that dependence is the chain rule, and
-//! §04's own exception ("not boundary inputs") keeps a `kernelof` body conditional.
+//! `Module::pin_binding_to_query_point` records the pin, so the provenance outlives the
+//! rewrite. What must NOT be caught: a genuinely fixed parameter, an independent latent
+//! another query pinned, and a SIBLING field of the same record product — that dependence
+//! is the chain rule, and §04's "not boundary inputs" exception keeps a `kernelof` body
+//! conditional.
 //!
-//! The provenance first bought a REFUSAL. It now buys the marginal itself: the pin also
-//! records the `draw(prior)` it replaced (`Module::query_pinned_rhs`), which is what
-//! `crate::marginal`'s conjugate table needs to answer the integral in the pinned
-//! ordering. So the assertions here are that the two orderings reach the SAME marginal —
-//! what this file guards is the provenance, not the row (that is
-//! `implicit_marginal_golden.rs`, and the maths is `src/marginal.md`).
+//! The pin also records the `draw(prior)` it replaced (`Module::query_pinned_rhs`), which
+//! is what `crate::marginal`'s conjugate table needs in the pinned ordering. So the
+//! assertions are that both orderings reach the SAME marginal. This file guards the
+//! provenance, not the row (`implicit_marginal_golden.rs`; maths in `src/marginal.md`).
 //!
 //! Structural only (flatppl-rust is not a density engine): every lowering is asserted
 //! on its emitted FlatPDL and passed through `is_flatpdl`.
@@ -143,7 +141,7 @@ lp_z = logdensityof(lawof(z), 0.3)
 lp_b = logdensityof(lawof(record(b = b)), record(b = 0.5))";
     let reason = refusal(src);
     assert!(
-        reason.contains("a draw the record does not carry"),
+        reason.contains("uncarried draw"),
         "must refuse as a marginal: {reason}"
     );
 }

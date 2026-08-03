@@ -70,10 +70,9 @@ fn pushfwd_composition_exp_affine_lowers() {
         p.contains("builtin_logdensityof") && p.contains("log"),
         "got:\n{p}"
     );
-    // Composed inverse log(y)/2, applied at the query point y = 0.5, is
-    // beta-reduced (Buffy #263 Pass 2) to divide(log(y'), 2.0) — where `y'` is the
-    // image gate's sanitised point, so the leaf under `log` is the sanitising
-    // `ifelse` rather than the bare literal:
+    // Composed inverse log(y)/2 at the query point y = 0.5 beta-reduces to
+    // divide(log(y'), 2.0), where `y'` is the image gate's sanitised point — so the
+    // leaf under `log` is the sanitising `ifelse`, not the bare literal.
     assert!(
         p.contains("(divide") && p.contains("(log ") && p.contains("(ifelse"),
         "inverse log(y)/2 present:\n{p}"
@@ -135,7 +134,7 @@ fn pushfwd_log_over_unrestricted_domain_refuses() {
         "d = pushfwd(log, Normal(mu = 0.0, sigma = 1.0))\nlp = logdensityof(d, 0.5)",
     ))
     .expect_err("pushfwd(log, Normal) over a non-positive-support base must refuse");
-    assert!(format!("{e:?}").contains("refuse"), "got: {e:?}");
+    assert!(e.reason.contains("log's domain"), "got: {e:?}");
 }
 
 #[test]
@@ -152,7 +151,6 @@ fn pushfwd_log_chain_over_unrestricted_domain_refuses() {
     ))
     .expect_err("a chain containing log over a non-positive-support base must refuse");
     let msg = format!("{e:?}");
-    assert!(msg.contains("refuse"), "got: {e:?}");
     assert!(
         msg.contains("support"),
         "expected the base-support branch, not the composition branch: {e:?}"
@@ -284,7 +282,7 @@ fn pushfwd_scalar_scale_over_vector_refuses() {
          lp = logdensityof(d, [0.1, 0.2, 0.3])",
     ))
     .expect_err("scalar affine over a vector variate must refuse, not scalar-chain-lower");
-    assert!(format!("{e:?}").contains("refuse"), "got: {e:?}");
+    assert!(e.reason.contains("vector variate"), "got: {e:?}");
 }
 
 #[test]
@@ -515,7 +513,7 @@ fn projection_over_nonproduct_refuses() {
          lp = logdensityof(pr, record(a = 0.5))",
     ))
     .expect_err("projection over a non-product measure must refuse");
-    assert!(format!("{e:?}").contains("refuse"), "got: {e:?}");
+    assert!(e.reason.contains("field-keyed product"), "got: {e:?}");
 }
 
 #[test]
@@ -529,7 +527,7 @@ fn projection_over_iid_refuses() {
          lp = logdensityof(pr, record(a = 0.5))",
     ))
     .expect_err("projection over iid must refuse (scoped to field-keyed products)");
-    assert!(format!("{e:?}").contains("refuse"), "got: {e:?}");
+    assert!(e.reason.contains("field-keyed product"), "got: {e:?}");
 }
 
 #[test]
@@ -720,7 +718,6 @@ fn domain_restricted_registry_op_inside_a_composition_refuses() {
     ))
     .expect_err("a domain-restricted op inside a composition must refuse");
     let msg = format!("{e:?}");
-    assert!(msg.contains("refuse"), "got: {e:?}");
     assert!(
         msg.contains("inside a composition"),
         "expected the composition branch, not the support branch: {e:?}"

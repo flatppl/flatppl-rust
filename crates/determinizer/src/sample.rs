@@ -164,16 +164,12 @@ fn strip_lawof(m: &Module, node: NodeId) -> Option<NodeId> {
 /// are "measures involving non-constant weighting … or multivariate truncation",
 /// both still refused via [`classify_intractable_or_deferred`].
 ///
-/// **Why this is a separate entry point from [`lower_measure_sample`].** That
-/// function doubles as the per-FIELD dispatcher for a record law (both record
-/// folds call it for every field, whatever the field's head), and the two
-/// positions admit different sets — §04's distinction between a variate and a
-/// measure. A record field is a declared variate or a deterministic expression;
-/// `rand`'s argument is a closed measure. Putting the primitive-constructor leaf
-/// case in the shared dispatcher would make `lawof(record(a = Normal(…)))`
-/// silently *sample* a field the model never declared as a variate — fabricating
-/// a draw (`tests/refuse.rs::undrawn_measure_in_a_record_field_still_refuses`
-/// pins that it keeps refusing).
+/// Separate from [`lower_measure_sample`], which doubles as the per-FIELD dispatcher
+/// for a record law, because the two positions admit different sets (§04's variate /
+/// measure distinction). Putting the primitive-constructor leaf in the shared
+/// dispatcher would make `lawof(record(a = Normal(…)))` sample a field the model never
+/// declared as a variate
+/// (`tests/refuse.rs::undrawn_measure_in_a_record_field_still_refuses`).
 fn lower_closed_measure_sample(
     m: &mut Module,
     measure: NodeId,
@@ -184,27 +180,20 @@ fn lower_closed_measure_sample(
         Some("lawof") => {
             let inner = strip_lawof(m, resolved)
                 .ok_or_else(|| refuse(resolved, m, "lawof expects 1 arg"))?;
-            // `lawof(?x)` itself infers to a DETERMINISTIC phase (spec §04 "Phase
-            // of the reified law": lawof absorbs its argument's stochasticity
-            // rather than propagating it — `crates/infer/src/ops.rs`'s `"lawof"`
-            // phase arm traces `law_phase(?x)`, never `Phase::Stochastic`). So the
-            // phase that matters here is `?x`'s own, not `lawof(?x)`'s: a `?x`
-            // that is not Stochastic-phase (e.g. `lawof(3.0)`, or
-            // `lawof(record(a = a))` where `a` is a plain constant, not a draw)
-            // has no generative `draw` subgraph for `rand` to re-run — refuse
-            // rather than silently echo the constant back out as a "sample".
+            // Test `?x`'s phase, not `lawof(?x)`'s: §04 "Phase of the reified law"
+            // makes `lawof` absorb its argument's stochasticity, so `lawof(?x)` is
+            // always deterministic-phase. A non-Stochastic `?x` (`lawof(3.0)`) has no
+            // generative `draw` subgraph for `rand` to re-run.
             //
-            // This check belongs to the `lawof` ARM, not to `rand` as a whole: a
-            // bare `Normal(…)` or `pushfwd(f, Normal(…))` in measure position is
-            // a measure, so its own phase is deterministic too, and a
-            // rand-level phase check would refuse every composed measure.
+            // Belongs to the `lawof` ARM, not to `rand` as a whole: a bare `Normal(…)`
+            // in measure position is deterministic-phase too, so a rand-level phase
+            // check would refuse every composed measure.
             if !matches!(m.phase_of(inner), Some(Phase::Stochastic)) {
                 return Err(refuse(
                     inner,
                     m,
-                    "lawof's argument is not stochastic-phase (a Dirac/deterministic point) — \
-                     rand samples the law of a STOCHASTIC subgraph, so lawof(<non-stochastic>) \
-                     has no generative draw to sample; refuse rather than mislower",
+                    "lawof's argument is not stochastic-phase (a Dirac/deterministic point), so it \
+                     has no generative draw for `rand` to sample",
                 ));
             }
             lower_closed_measure_sample(m, inner, rng)
@@ -248,31 +237,23 @@ fn lower_closed_measure_sample(
 /// `pushfwd(f, M)` in measure position → sample `M`, then apply `f` FORWARD to the
 /// sampled value; the rng is the one `M`'s sample advanced.
 ///
-/// This is the textbook easy direction: $X \sim M \Rightarrow f(X) \sim f_* M$ by
-/// the definition of the pushforward (§06 `pushfwd`: $(f_* M)(Y) = M(f^{-1}(Y))$),
-/// so sampling needs **no inverse and no Jacobian** — this path must never touch
-/// `crate::invert` or the bijection registry the density side uses. `f` need not
-/// even be injective. Nested `pushfwd`s work by the same recursion, and the base
-/// case that terminates it is [`lower_closed_measure_sample`]'s
-/// primitive-constructor leaf.
+/// $X \sim M \Rightarrow f(X) \sim f_* M$ by the definition of the pushforward (§06
+/// `pushfwd`: $(f_* M)(Y) = M(f^{-1}(Y))$), so sampling needs **no inverse and no
+/// Jacobian** — this path must never touch `crate::invert` or the bijection registry
+/// the density side uses, and `f` need not be injective. Nested `pushfwd`s recurse to
+/// [`lower_closed_measure_sample`]'s primitive-constructor leaf.
 ///
-/// The forward application is emitted as `(%call f <sampled value>)`, which must
-/// then actually resolve to FlatPDL — a surviving `%call` is neither a
-/// deterministic op nor a `builtin_*` primitive. Two forms resolve, and this
-/// function admits exactly those two:
+/// The forward application is `(%call f <sampled value>)`, and only two forms resolve
+/// to FlatPDL:
 ///
-/// * a **bare builtin** callee (`pushfwd(exp, …)`, where the map is a
-///   [`Node::Const`]) — `canon::inline`'s `builtin_callee_head` rewrites the head
-///   to a direct builtin call;
-/// * a **reified** `functionof`/lambda map that beta-reduces under
-///   [`crate::kernel::reduce_kernel_application`] — applied here rather than left
-///   to the driver's fixpoint, so that a map which does NOT reduce refuses HERE,
-///   naming the map.
+/// * a **bare builtin** callee (`pushfwd(exp, …)`) — `canon::inline`'s
+///   `builtin_callee_head` rewrites the head to a direct builtin call;
+/// * a **reified** `functionof`/lambda that beta-reduces under
+///   [`crate::kernel::reduce_kernel_application`], applied here rather than left to the
+///   driver's fixpoint so a map that does NOT reduce refuses HERE, naming the map.
 ///
-/// `is_flatpdl` rejects a surviving `CallHead::User` at exit
-/// (`NonConformKind::ResidualUserCall`), so an unreduced application refuses either
-/// way. This check earns its place by giving the specific reason rather than the
-/// gate's generic one.
+/// A surviving `CallHead::User` refuses at exit anyway
+/// (`NonConformKind::ResidualUserCall`); refusing here gives the specific reason.
 fn lower_pushfwd_sample(
     m: &mut Module,
     pushfwd_node: NodeId,
@@ -293,39 +274,23 @@ fn lower_pushfwd_sample(
         (c.args[0], c.args[1])
     };
     let (value, rng_out) = lower_closed_measure_sample(m, base, rng)?;
-    // A bare builtin map needs no reduction — the head rewrite handles it — EXCEPT
-    // over a record variate, where the application is §04 auto-splatting against
-    // that operator's own argument names. Deciding whether those names MATCH the
-    // record's fields needs the operator's argument names, and they are not
-    // available here: `flatppl_infer` exposes ordered parameter names only for
-    // measure constructors (`distribution_param_names` /
-    // `fundamental_measure_param_names` / `constructor_param_names`), while a
-    // deterministic builtin's catalogue row is `Sig::Function { params:
-    // Vec<ParamSig> }` — declared parameter TYPES, documented as "never read",
-    // carrying no names. §07's function table has them (`exp(x)`,
-    // `pow(base, exponent)`) but the determiniser cannot see it.
+    // A bare builtin map needs no reduction — the head rewrite handles it — EXCEPT over
+    // a record variate, where the application is §04 auto-splatting against that
+    // operator's own argument names. `flatppl_infer` exposes ordered parameter names
+    // only for measure constructors; a deterministic builtin's catalogue row is
+    // `Sig::Function { params: Vec<ParamSig> }` — argument TYPES, no names.
     //
-    // So this refuses the whole record-valued case, which over-refuses a
-    // name-matching map like `pushfwd(exp, lawof(record(x = y1)))`. Refusing is
-    // still the right side to err on, because nothing downstream would catch a
-    // MISmatch: `infer` reports no diagnostic for
-    // `pushfwd(exp, lawof(record(y = …)))` and `is_flatpdl` is structural, so
-    // `exp(record(y = …))` would pass every gate and fail only in the engine. The
-    // message says the names are unavailable rather than implying the model is
-    // ill-formed.
+    // So the whole record-valued case refuses, over-refusing a name-matching map like
+    // `pushfwd(exp, lawof(record(x = y1)))`. Nothing downstream would catch a MISmatch:
+    // `infer` reports no diagnostic and `is_flatpdl` is structural, so
+    // `exp(record(y = …))` passes every gate and fails only in the engine.
     if matches!(m.node(map), Node::Const(_)) {
         if expect_builtin_call(m, value, "record").is_some() {
             return Err(refuse(
                 pushfwd_node,
                 m,
-                "pushfwd's map is a bare built-in operator and its base measure's variate is a \
-                 record, so applying it is §04 auto-splatting against that operator's argument \
-                 names — and those names are not available to the determiniser (only measure \
-                 constructors carry ordered parameter names in the catalogue; a builtin \
-                 function's row carries argument TYPES only). This may well be a well-formed \
-                 call, but it cannot be checked here, and an unchecked mismatch would emit \
-                 `op(record(…))` that no gate rejects — write the map as a functionof or lambda \
-                 whose parameter names are the record's field names, which IS checkable",
+                "pushfwd's map is a bare built-in over a record variate: §04 auto-splatting needs \
+                 argument names the catalogue lacks — use a functionof or lambda over the fields",
             ));
         }
         return Ok((build_user_call(m, map, value), rng_out));
@@ -339,14 +304,9 @@ fn lower_pushfwd_sample(
                 pushfwd_node,
                 m,
                 &format!(
-                    "pushfwd's map and the record variate of its base measure do not correspond \
-                     ({why}). §04 \"Calling conventions\" applies the map by auto-splatting the \
-                     record — parameters bind to like-named fields — and makes a record whose \
-                     field names do not match the callable's argument names a static error; \
-                     binding only the parameters that DO match would silently project the \
-                     variate onto those coordinates. A map that deliberately projects (a \
-                     whole-record or hole map, §06 \"pushfwd\") is not expressible this way and \
-                     is not built here — refuse rather than drop coordinates"
+                    "pushfwd's map does not correspond to its base measure's record variate \
+                     ({why}); §04 \"Calling conventions\" makes a field/argument-name mismatch a \
+                     static error"
                 ),
             ));
         }
@@ -356,11 +316,8 @@ fn lower_pushfwd_sample(
         refuse(
             pushfwd_node,
             m,
-            "pushfwd's map does not reduce when applied to the sampled variate: its parameter \
-             list does not bind against the base measure's domain (for a record-valued base, \
-             application binds the map's parameters by field name). The forward application \
-             would survive as an unreduced call, which is not FlatPDL — refuse rather than \
-             emit it",
+            "pushfwd's map does not reduce at the sampled variate: its parameters do not bind the \
+             base domain (§04 binds a record's fields by name), leaving a residual call",
         )
     })?;
     Ok((reduced, rng_out))
@@ -371,16 +328,11 @@ fn lower_pushfwd_sample(
 /// record literal (there is nothing to splat); otherwise the offending name, for
 /// the refusal message.
 ///
-/// §04 "Calling conventions" (auto-splatting): "`f(record(a = x, b = y, ...))` …
-/// [is] equivalent to `f(a = x, b = y, ...)`" and "A call with field or column
-/// names that do not match the callable's argument names is a static error". The
-/// forward application of a `pushfwd` map to a record variate is exactly such a
-/// call. [`crate::kernel::reduce_kernel_application`]'s record branch binds each of
-/// the callable's inputs from a like-named field and stops there — it never checks
-/// that every FIELD was consumed — so a map declaring a strict SUBSET of the
-/// record's fields reduces to a projection of the variate, silently dropping the
-/// other coordinates. Since a marginalizing projection and a full transform are
-/// different measures, that difference is a wrong sample, not a cosmetic one.
+/// §04 "Calling conventions": "A call with field or column names that do not match the
+/// callable's argument names is a static error". [`crate::kernel::reduce_kernel_application`]'s
+/// record branch binds each input from a like-named field and never checks that every
+/// FIELD was consumed, so a map declaring a strict SUBSET reduces to a projection of
+/// the variate — a different measure, hence a wrong sample.
 fn record_splat_mismatch(m: &Module, value: NodeId, inputs: &[(Symbol, Ref)]) -> Option<String> {
     let fields: Vec<Symbol> = {
         let c = expect_builtin_call(m, value, "record")?;
@@ -522,24 +474,18 @@ fn classify_drawn_measure(m: &Module, resolved: NodeId) -> Option<RefuseError> {
 /// [`lower_pushfwd_sample`]).
 ///
 /// Per §04 a `draw` introduces a **fresh** stochastic node, so
-/// `d = draw(pushfwd(f, lawof(record(y1 = y1, y2 = y2))))` is a NEW draw,
-/// independent of the existing `y1`/`y2`, not a spelling of `d = f(record(y1 =
-/// y1, y2 = y2))`. Lowering it by reusing those samples would emit a joint that
-/// is silently wrong in the opposite direction — perfectly dependent where the
-/// model asked for independence. Drawing it correctly means sampling the base law
-/// a SECOND time, independently of the surrounding model's copies of the same
-/// latents, which this vertical does not build. The message points at the
-/// deterministic spelling for the (common) case where that is what was meant.
+/// `d = draw(pushfwd(f, lawof(record(y1 = y1, y2 = y2))))` is independent of the
+/// existing `y1`/`y2`, not a spelling of `d = f(record(y1 = y1, y2 = y2))`. Reusing
+/// those samples would emit a perfectly dependent joint where the model asked for
+/// independence. Drawing it needs the base law sampled a SECOND time, independently of
+/// the surrounding model's copies of the same latents, which this vertical does not
+/// build.
 fn refuse_draw_of_pushfwd(m: &Module, id: NodeId) -> RefuseError {
     refuse(
         id,
         m,
-        "draw(pushfwd(f, M)) denotes a fresh, independent draw from the pushforward law, not a \
-         deterministic function of the draws inside M — reusing those draws would emit a wrong \
-         (perfectly dependent) joint, and drawing M a second time independently of the \
-         surrounding model's own copies of its latents is not built in this vertical; if you \
-         meant a deterministic function of the existing draws, write the field as that \
-         expression instead",
+        "draw(pushfwd(f, M)) is a fresh, independent draw from the pushforward law, not a function \
+         of the draws inside M; resampling M independently is not implemented",
     )
 }
 
@@ -549,10 +495,8 @@ fn refuse_weighted_family(m: &Module, id: NodeId) -> RefuseError {
     refuse(
         id,
         m,
-        "sampling a weighted/logweighted/bayesupdate measure is intractable (§07 \"rand\": \
-         non-constant weighting is named as an intractable-to-sample case; §13 \"Refused \
-         constructs\" names it explicitly — no direct sampling recipe for an arbitrary \
-         reweighted measure) — refuse rather than mislower",
+        "sampling a weighted/logweighted/bayesupdate measure is intractable (§07 \"rand\" names \
+         non-constant weighting; §13 \"Refused constructs\" names it explicitly)",
     )
 }
 
@@ -564,10 +508,8 @@ fn refuse_truncate(m: &Module, id: NodeId) -> RefuseError {
         refuse(
             id,
             m,
-            "sampling a multivariate truncated measure is intractable (§07 \"rand\": \
-             multivariate truncation is named as an intractable-to-sample case; §13 \"Refused \
-             constructs\" names it explicitly — no general sampling recipe for an arbitrary \
-             multivariate truncation) — refuse rather than mislower",
+            "sampling a multivariate truncated measure is intractable (§07 \"rand\" names \
+             multivariate truncation; §13 \"Refused constructs\" names it explicitly)",
         )
     } else {
         refuse_deferred_combinator(m, id)
@@ -684,9 +626,8 @@ fn lower_iid_sample(
         refuse(
             kernel,
             m,
-            "iid sample: inner kernel must be a built-in constructor (a broadcast/\
-             array-of-kernels measure has differing per-element params — not a \
-             fixed-kernel fan-out; refuse rather than mislower)",
+            "iid sample: inner kernel must be a built-in constructor; a broadcast/array-of-kernels \
+             form is not lowered here",
         )
     })?;
     Ok(build_iid_sample_term(m, ctor, kernel_input, n, rng))

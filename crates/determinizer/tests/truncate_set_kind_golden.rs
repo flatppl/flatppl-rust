@@ -45,7 +45,7 @@ fn record_variate_truncated_by_a_scalar_set_refuses() {
              lp = logdensityof(m, record(x = 0.5))"
         ));
         assert!(
-            reason.contains("truncation set's space")
+            reason.contains("truncate's set")
                 && reason.contains("set of scalars")
                 && reason.contains("a record"),
             "`{set}` must refuse naming both spaces, got: {reason}"

@@ -1081,11 +1081,9 @@ impl<'m> Emitter<'m> {
         };
         assert!(
             a.elem == ElemKind::Real || combine_op == "stablehlo.add",
-            "reduce_axis: a non-Real reduction identity is only implemented for the \
-             additive (stablehlo.add) combine — the dtype-exact ±inf identities of \
-             reduce_max/reduce_min have no integer or boolean form, and their callers \
-             (logsumexp's term vector; ops::lower_extremum, which refuses a non-Real \
-             operand) only ever pass a Real operand"
+            "reduce_axis: a non-Real reduction identity exists only for the additive \
+             (stablehlo.add) combine; reduce_max/reduce_min have no integer or boolean ±inf \
+             identity"
         );
 
         let init_ssa = self.fresh();

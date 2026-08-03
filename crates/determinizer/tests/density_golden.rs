@@ -346,7 +346,8 @@ fn logit_prior_over_real_support_base_refuses() {
         m
     };
     let e = determinize(&m).expect_err("logit over a real-support base must refuse");
-    assert!(format!("{e:?}").contains("refuse"), "got: {e:?}");
+    assert_eq!(e.construct, "logit", "got: {e:?}");
+    assert!(e.reason.contains("(0, 1)"), "got: {e:?}");
 }
 
 // weighted(w, M): logdensityof → log(w) + logdensityof(M, v)
@@ -1829,16 +1830,11 @@ lp = logdensityof(lawof(d), 0.25)";
     );
 }
 
-// The dispatcher's constructor fallthrough reads a constructor BEFORE offering
-// the node to the value law, and this is the test that holds that order. A
-// dependent prior's `Normal(mu = z, sigma = 1.0)` is a product the chain rule
-// scores with `z` pinned, but it also satisfies the value law's shape test (it
-// reaches exactly one draw, `z`'s), so a reversed order would hand it to
-// `pushfwd` as the map `x -> Normal(mu = x, sigma = 1.0)` — which refuses in
-// `crate::invert`, since `Normal` appears in neither its unary-bijection registry
-// nor its affine grammar (capitalization is correlated convention, not the reason).
-// The cost of losing the order is therefore that every dependent product stops
-// lowering; this asserts it still does, with `z` pinned into the second term.
+// Holds the dispatcher's order: a constructor is read BEFORE the node is offered to
+// the value law. A dependent prior's `Normal(mu = z, sigma = 1.0)` is a product the
+// chain rule scores with `z` pinned, yet it also passes the value law's shape test (it
+// reaches exactly one draw), so a reversed order would hand it to `pushfwd` as the map
+// `x -> Normal(mu = x, sigma = 1.0)` and every dependent product would stop lowering.
 #[test]
 fn dependent_constructor_is_read_as_a_product_not_a_map() {
     let src = "\
@@ -1861,20 +1857,16 @@ lp = logdensityof(lawof(record(z = z, y = y)), record(z = 0.1, y = 0.2))";
     );
 }
 
-// §04 "Reification to measures": `lawof(x)` is the **TOTAL** law of `x`, and §04's
-// worked `prior_predictive = lawof(record(obs = obs))` states the consequence —
-// stochastic ancestors "are internal stochastic nodes in the traced sub-DAG, not
-// boundary inputs, so `lawof` integrates them out", equivalently
-// `kchain(prior, forward_kernel)`. So for `y ~ Normal(mu = z, sigma = 1)` with `z`
-// latent, `lawof(y)` is y's MARGINAL, and scoring `Normal(mu = z, …)` instead emits the
-// conditional density — a wrong number rather than a refusal. A FIXED parameter is not
-// a stochastic ancestor and must still lower to its own conditional: that half is the
-// control, and it is what stops the marginalization from becoming a blanket rule.
+// §04 "Reification to measures": `lawof(x)` is the **TOTAL** law of `x`, and stochastic
+// ancestors "are internal stochastic nodes in the traced sub-DAG, not boundary inputs,
+// so `lawof` integrates them out". So for `y ~ Normal(mu = z, sigma = 1)` with `z`
+// latent, `lawof(y)` is y's MARGINAL; scoring `Normal(mu = z, …)` emits the conditional,
+// a wrong number rather than a refusal. The FIXED-parameter half is the control that
+// stops the marginalization becoming a blanket rule.
 //
-// The Normal-prior-on-a-Normal-mean pair here is a `CONJUGATE_TABLE` row, so this
-// lowers to the marginal `Normal(0, √2)` rather than refusing. The pair that has NO row
-// is what still refuses (`implicit_marginal_golden.rs`), and the row's own maths and test
-// point are in `src/marginal.md`.
+// This pair is a `CONJUGATE_TABLE` row, so it lowers to `Normal(0, √2)`. The pair with
+// NO row still refuses (`implicit_marginal_golden.rs`); the row's maths is in
+// `src/marginal.md`.
 #[test]
 fn bare_lawof_of_a_draw_with_a_latent_parameter_marginalizes() {
     let latent = "\
@@ -1914,13 +1906,11 @@ lp = logdensityof(lawof(y), 0.3)";
     );
 }
 
-// The ordering that JUSTIFIES the marginalization guard, as opposed to merely
-// improving a message. Score `lawof(y)` FIRST, then let a second query pin `z`:
-// nothing downstream refuses, because by the time the residual-`draw` scan runs `z`
-// is a literal — so before the guard this emitted the conditional density
-// `p(y | z = 0.1)` as a finished, conformance-passing number, where §04 asks for
-// y's marginal. This is the shape the guard exists for; the marginal is now what it
-// emits, so the assertion is that the conditional's `mu = 0.1` is nowhere in it.
+// The ordering that JUSTIFIES the marginalization guard: score `lawof(y)` FIRST, then
+// let a second query pin `z`. Nothing downstream refuses — by the time the
+// residual-`draw` scan runs, `z` is a literal — so this emitted the conditional
+// `p(y | z = 0.1)` as a finished, conformance-passing number where §04 asks for y's
+// marginal.
 #[test]
 fn bare_lawof_scored_before_a_later_query_pins_the_latent_marginalizes() {
     let src = "\
@@ -1946,8 +1936,8 @@ lp_z = logdensityof(lawof(z), 0.1)";
 // `y = draw(pushfwd(exp, lawof(z)))` the base consumes `z`'s LAW, not its value:
 // `z` is no ancestor of `y`, and `lawof(y)` is an honest LogNormal. The
 // marginalization guard must therefore stop at a `lawof` argument — walking into it
-// would refuse a model that is fine, and would re-split the two §06 spellings this
-// path exists to unify, since the record spelling of the same model lowers.
+// would refuse a model that is fine, and re-split the two §06 spellings this path
+// unifies.
 //
 // Verified numerically: every spelling below scores its LogNormal / affine /
 // truncated / weighted value against Distributions.jl exactly (e.g.
@@ -2074,28 +2064,21 @@ lp = logdensityof(lawof(record(y = y)), record(y = 0.3))";
     );
 }
 
-// C1: the marginalization guard has a measure-expression half, and it is NOT
-// reachable from `lower_value_law`. When `lawof`'s argument is a MEASURE rather
-// than a value, the `lawof` is simply stripped and `build_density_term` scores the
-// constructor — so `lawof(Normal(mu = a, sigma = 1))` with `a` latent emitted the
-// conditional `N(a, 1)` at whatever value a later query pinned `a` to, where §04's
-// total law is the marginal `N(0, √2)`. Verified against Distributions.jl: the
-// emitted number was -1.4989385332046727 (`logpdf(Normal(0.1, 1), exp(0.5))`) and
-// the marginal is -1.8280121234846454 (`logpdf(Normal(0, √2), exp(0.5))`) — wrong
-// by 0.329 nats, conformance-passing, and precisely the later-query ordering the
-// value-side guard exists to stop.
+// C1: the marginalization guard's measure-expression half is NOT reachable from
+// `lower_value_law`. When `lawof`'s argument is a MEASURE the `lawof` is stripped and
+// `build_density_term` scores the constructor, so `lawof(Normal(mu = a, sigma = 1))`
+// with `a` latent emitted the conditional at whatever value a later query pinned `a`
+// to. Against Distributions.jl: the emitted -1.4989385332046727
+// (`logpdf(Normal(0.1, 1), exp(0.5))`) vs the marginal -1.8280121234846454
+// (`logpdf(Normal(0, √2), exp(0.5))`) — wrong by 0.329 nats, conformance-passing.
 //
-// Both places a `lawof` is stripped must apply the total-law reading: the dispatcher's
-// arm, and `measure_of_arg` at the query entry (which is why the direct query below is
-// included — it bypasses the dispatcher entirely and was wrong before the value-side
-// guard existed too).
+// Both strip points must apply the total-law reading: the dispatcher's arm and
+// `measure_of_arg` at the query entry (hence the direct query below, which bypasses the
+// dispatcher entirely).
 //
 // The Normal-prior-on-a-Normal-mean pair IS a `CONJUGATE_TABLE` row, so the direct query
-// now lowers to `Normal(0, √2)` instead of refusing. The nested cases still refuse, but
-// no longer HERE: the base's marginal lowers and the residual blocker is the §06
-// reference-measure gate on a `pushfwd`/`draw` over a `lawof` base, which is a different
-// guard with its own tests. They are kept as refuse-don't-mislower, without pinning the
-// reason, so neither guard is credited with the other's coverage.
+// lowers to `Normal(0, √2)`. The nested cases still refuse, on the §06 reference-measure
+// gate over a `lawof` base — a different guard, so their reason is not pinned here.
 #[test]
 fn lawof_of_a_draw_parameterized_measure_marginalizes() {
     // Direct query on the stochastic law — strips at `measure_of_arg`, never reaching the
@@ -2168,21 +2151,14 @@ lp = logdensityof(lawof(truncate(lawof(z), interval(0.0, inf))), 0.3)",
 
 // The measure-expression guard tested `Type::Measure`, and a REIFICATION types as
 // `Kernel` — so `F = functionof(Normal(mu = a, sigma = 1.0))` with `a` latent slipped
-// past it and `logdensityof(lawof(F), 0.5)` emitted `builtin_logdensityof(Normal,
-// record(mu = 0.1, sigma = 1.0), 0.5)`, the conditional at whatever value a later
-// query pinned `a` to. §04 "Reification to measures" makes `lawof(x)` the TOTAL law
-// and states the consequence on its worked `prior_predictive = lawof(record(obs =
-// obs))`: a stochastic ancestor is "obtained by marginalizing over" — "they are
-// internal stochastic nodes in the traced sub-DAG, not boundary inputs, so `lawof`
-// integrates them out", equivalently `kchain(prior, forward_kernel)`. Here that
-// marginal is `Normal(0, √2)`; the emitted conditional was `Normal(0.1, 1)`, a
-// finished conformance-passing number wrong by 0.329 nats.
+// past it and `logdensityof(lawof(F), 0.5)` emitted the conditional `Normal(0.1, 1)`
+// where §04 "Reification to measures" asks for the TOTAL law, the marginal
+// `Normal(0, √2)` — a conformance-passing number wrong by 0.329 nats.
 //
-// Still refuses, but the reason recorded here originally ("the `kchain` is closed-form
-// only for a discrete-finite latent") was wrong: `CONJUGATE_TABLE` answers this very pair
-// in closed form, and the UNWRAPPED `lawof(Normal(mu = a, sigma = 1))` now lowers to the
-// marginal. What refuses is the WRAPPER: a row needs a bare distribution constructor, and
-// a reification is not one. A coverage gap, not a correctness one.
+// Still refuses, but on the WRAPPER: a `CONJUGATE_TABLE` row needs a bare distribution
+// constructor and a reification is not one, while the UNWRAPPED
+// `lawof(Normal(mu = a, sigma = 1))` now lowers to the marginal. A coverage gap, not a
+// correctness one.
 #[test]
 fn lawof_of_a_draw_parameterized_reification_refuses() {
     for src in [
@@ -2277,16 +2253,13 @@ lp = logdensityof(lawof(F), 0.5)",
 // §13 "Determinization": "`draw` nodes take their values from the explicit `point`,
 // unless marginalized out." So wherever the point determines a draw's value —
 // directly, or through an invertible transform — the draw must be PINNED, and a
-// downstream consumer evaluates at the query point. Confining the pin to the
-// query's own measure was too narrow: every position below preserves the variate,
-// so the point reaches the draw, yet each refused with the uninformative
-// `refuse draw … no determinization rule` once a live consumer kept the draw alive.
+// downstream consumer evaluates at the query point. Every position below preserves the
+// variate, so the point reaches the draw.
 //
-// The boundary is recorded in BOTH directions on purpose. The next contributor who
-// sees `joint(a = lawof(y))` refusing must not widen the pin to record fields as
-// well — `a_nested_value_law_does_not_pin_the_enclosing_variate` is the other side,
-// and a record field's measure describes the FIELD's draw, so a `lawof` inside it
-// names a third value the point says nothing about.
+// The boundary is pinned in BOTH directions: the pin must NOT widen to record fields
+// (`a_nested_value_law_does_not_pin_the_enclosing_variate`), since a record field's
+// measure describes the FIELD's draw, so a `lawof` inside it names a third value the
+// point says nothing about.
 #[test]
 fn variate_preserving_positions_pin_the_draw_from_the_point() {
     for (src, expect) in [
@@ -2307,9 +2280,8 @@ lp = logdensityof(truncate(lawof(y), interval(0.0, inf)), 0.3)",
             "(%bind w 1.3)",
         ),
         // `locscale`'s preimage is invertible, so the point determines the draw:
-        // `y = (0.3 - 1.0) / 2.0 = -0.35`, hence `w = 0.65`. This threading was the
-        // one position no test covered — mutating it to `Other` left the whole file
-        // green — and it is behaviour-visible: without it this program refuses.
+        // `y = (0.3 - 1.0) / 2.0 = -0.35`, hence `w = 0.65`. Behaviour-visible: without
+        // this threading the program refuses.
         (
             "\
 y = draw(Normal(mu = 0.0, sigma = 1.0))
@@ -2367,17 +2339,13 @@ lp = logdensityof(pushfwd(exp, lawof(y)), 1.6487212707001282)",
     );
 }
 
-// An unimplemented MEASURE combinator reached as a pseudo-transform must REFUSE, not
-// mislower. The assertion is deliberately on the outcome and not on the wording: the
-// reason `crate::invert` gives ("no analytic inverse") is imprecise, since the real
-// problem is that `mixture` has no type rule so nothing knows it is a map at all.
-// Gating the value-law path on the transform's inferred type to say that instead was
-// tried and reverted — `%deferred` propagates outward from any operand, so the gate
-// also refused `A * x + b`, whose `add` is ordinary and which `crate::invert` inverts
-// correctly (see `bare_matrix_affine_value_law_lowers_like_the_record_spelling`).
-// Losing a correct lowering to improve a message on an unimplemented op is the wrong
-// trade; if the message is worth fixing, discriminate on the head op, not the result
-// type.
+// An unimplemented MEASURE combinator reached as a pseudo-transform must REFUSE. The
+// assertion is on the outcome, not the wording: `crate::invert` says "no analytic
+// inverse", which is imprecise — `mixture` has no type rule, so nothing knows it is a
+// map at all. Gating on the transform's inferred type instead ALSO refused `A * x + b`,
+// which inverts correctly (`bare_matrix_affine_value_law_lowers_like_the_record_spelling`),
+// because `%deferred` propagates outward from any operand. Discriminate on the head op,
+// not the result type.
 #[test]
 fn an_unimplemented_measure_combinator_as_a_transform_refuses() {
     let src = "\
@@ -2394,15 +2362,12 @@ lp = logdensityof(lawof(y), 0.3)";
     );
 }
 
-// The bare and record spellings of one matrix-affine value law must lower to the same
-// density. `A * x + b` types as `%deferred` at the `add`, because `mul(matrix, vector)`
-// has no type rule and deferredness propagates outward — but the map is an ordinary
-// affine one and `crate::invert`'s matrix-affine grammar handles it, emitting
-// `linsolve`/`logabsdet`. A guard that read that deferred RESULT type as "unreadable
-// map" refused this while the record spelling (which reaches the measure through
-// `lower_record_of_draws`) kept lowering, splitting the two spellings of one measure.
-// This pins them together, the same bar `bare_lawof_of_derived_scalar_lowers_like_pushfwd`
-// holds for the scalar case.
+// The bare and record spellings of one matrix-affine value law must lower identically.
+// `A * x + b` types as `%deferred` at the `add` (`mul(matrix, vector)` has no type rule
+// and deferredness propagates outward), yet `crate::invert`'s matrix-affine grammar
+// handles it and emits `linsolve`/`logabsdet`. A guard reading that deferred RESULT type
+// as "unreadable map" refused the bare spelling while the record one kept lowering. Same
+// bar `bare_lawof_of_derived_scalar_lowers_like_pushfwd` holds for the scalar case.
 #[test]
 fn bare_matrix_affine_value_law_lowers_like_the_record_spelling() {
     let prelude = "\
@@ -2429,12 +2394,10 @@ y = A * x + b
     );
 }
 
-// `lower_value_law` sits on the measure dispatcher's FALLTHROUGH, so a bare
-// stochastic value serves in ANY measure position, not only as a query's own target.
-// The two tests below pin that composition for `weighted` and `superpose`: neither
-// arm was taught about value laws, both compose with them, and nothing else in the
-// suite would notice if a refactor took the composition away — the combinator tests
-// above all use a primitive constructor as the inner measure.
+// `lower_value_law` sits on the measure dispatcher's FALLTHROUGH, so a bare stochastic
+// value serves in ANY measure position. The two tests below pin that composition for
+// `weighted` and `superpose`; the combinator tests above all use a primitive constructor
+// as the inner measure, so nothing else would notice if the composition went away.
 //
 // `weighted(w, lawof(y))`: §06 `weighted` gives `log(w) + logdensityof(lawof(y), v)`,
 // where the inner term is `y`'s own draw scored at the query's variate.

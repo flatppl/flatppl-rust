@@ -230,14 +230,11 @@ fn lower_iszero(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, E
 
 // ---- real / extrema / fill -----------------------------------------------------
 
-/// §07 `real` — "returns `x` for real `x`". Value identity: NO rounding,
-/// clamping or truncation. The one thing it may emit is the §03
-/// `booleans ⊂ integers ⊂ reals` embedding when the operand really is
-/// integer-typed, which is exact; [`Emitter::convert`] emits nothing at all
-/// for an already-real operand. The decision is made on the operand's own
-/// lowered kind, not on the node's name — the determiniser wraps `round` in
-/// `real` precisely to stop `exp(round(x))` from typing as `integers` and
-/// being evaluated in integer arithmetic.
+/// §07 `real` — "returns `x` for real `x`". Value identity: NO rounding, clamping or
+/// truncation. It may emit the exact §03 `booleans ⊂ integers ⊂ reals` embedding for an
+/// integer-typed operand, and nothing for an already-real one. Decided on the operand's
+/// own lowered kind, not the node's name — the determiniser wraps `round` in `real` to
+/// stop `exp(round(x))` typing as `integers` and evaluating in integer arithmetic.
 ///
 /// A `Complex` operand (where §07 gives $\mathrm{Re}(x)$) has no tensor form
 /// at all and is refused upstream in `crate::types`.
@@ -301,13 +298,10 @@ fn lower_extremum(
 /// dynamic (`?`) axis is refused — `broadcast_in_dim`'s result shape must be
 /// static text.
 ///
-/// A fill value whose kind OUTRANKS the array's element kind is refused too.
-/// [`Emitter::convert`] is documented as numerically exact for every embedding
-/// this emitter performs, which holds only going UP §03's
-/// `booleans ⊂ integers ⊂ reals` chain; a real value into an integer array
-/// would truncate toward zero. Inference should reject that mismatch upstream,
-/// so this is the same narrow-and-refuse guard the other ops here use, not a
-/// reachable case.
+/// A fill value whose kind OUTRANKS the array's element kind is refused too:
+/// [`Emitter::convert`] is exact only going UP §03's `booleans ⊂ integers ⊂ reals`
+/// chain, and a real value into an integer array would truncate toward zero.
+/// Inference should reject that upstream, so this is a narrow-and-refuse guard.
 fn lower_fill(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
     let [x_id, _size] = args_exact(id, args)?;
     let (ty, kind) = e.node_ty(id)?;

@@ -16,10 +16,8 @@
 //! `get(_, ["a", "c"])` addresses a field-keyed product (keyword `joint`,
 //! record-of-draws, record-family `jointchain`) or an index-keyed product named by
 //! `relabel`. An INDEX selector `get(_, [1, 3])` — `get` is 1-BASED, `get0` 0-based
-//! (§07 `get0`) — addresses an index-keyed product's slots directly: a bare `iid`,
-//! a positional `joint`, or a scalar-cat `jointchain`. Each spelling refuses over
-//! the other's keying, because an integer slot does not address a record variate
-//! and a field name does not address a `cat` slot.
+//! (§07 `get0`) — addresses an index-keyed product's slots: a bare `iid`, a positional
+//! `joint`, or a scalar-cat `jointchain`. Each spelling refuses over the other's keying.
 mod common;
 use common::pir_binding;
 use flatppl_determinizer::determinize;
@@ -468,7 +466,6 @@ fn scalar_cat_jointchain_index_prefix_keep_improper_trailing_kernel_refuses() {
     ))
     .expect_err("dropping a trailing kernel with an improper body must refuse");
     let msg = format!("{e:?}");
-    assert!(msg.contains("refuse"), "must be a refusal: {msg}");
     assert!(
         msg.contains("normalized"),
         "names the un-normalized dropped body: {msg}"
@@ -495,7 +492,6 @@ fn index_projection_over_a_nonproduct_measure_names_the_missing_product_structur
     ))
     .expect_err("a projection off a measure with no product structure must refuse");
     let msg = format!("{e:?}");
-    assert!(msg.contains("refuse"), "must be a refusal: {msg}");
     assert!(
         msg.contains("product"),
         "message must name the missing product structure: {msg}"
@@ -518,7 +514,6 @@ fn get_index_zero_refuses_as_out_of_range() {
     ))
     .expect_err("a 0 index under the 1-based `get` must refuse");
     let msg = format!("{e:?}");
-    assert!(msg.contains("refuse"), "must be a refusal: {msg}");
     assert!(
         msg.contains("1-based"),
         "message must name the 1-based convention: {msg}"
@@ -536,7 +531,6 @@ fn duplicate_index_selection_refuses() {
     ))
     .expect_err("a duplicate selected index must refuse");
     let msg = format!("{e:?}");
-    assert!(msg.contains("refuse"), "must be a refusal: {msg}");
     assert!(msg.contains("twice"), "names the double count: {msg}");
 }
 
@@ -552,7 +546,6 @@ fn index_projection_dropping_an_unnormalized_component_refuses() {
     ))
     .expect_err("dropping a non-normalized component must refuse");
     let msg = format!("{e:?}");
-    assert!(msg.contains("refuse"), "must be a refusal: {msg}");
     assert!(
         msg.contains("non-normalized"),
         "names the un-normalized dropped component: {msg}"
@@ -570,7 +563,6 @@ fn index_projection_over_a_keyword_joint_points_at_the_field_spelling() {
     ))
     .expect_err("an index selector over a field-keyed product must refuse");
     let msg = format!("{e:?}");
-    assert!(msg.contains("refuse"), "must be a refusal: {msg}");
     assert!(
         msg.contains("record") && msg.contains("name"),
         "names the record variate and the by-name spelling: {msg}"
@@ -588,7 +580,6 @@ fn index_projection_over_a_relabeled_product_points_at_the_label_spelling() {
     ))
     .expect_err("an index selector over a relabeled product must refuse");
     let msg = format!("{e:?}");
-    assert!(msg.contains("refuse"), "must be a refusal: {msg}");
     assert!(
         msg.contains("record") && msg.contains("name"),
         "names the record variate and the by-name spelling: {msg}"
@@ -609,7 +600,6 @@ fn index_projection_over_a_nonscalar_joint_component_refuses() {
     ))
     .expect_err("an index selector over a non-scalar-component joint must refuse");
     let msg = format!("{e:?}");
-    assert!(msg.contains("refuse"), "must be a refusal: {msg}");
     assert!(
         msg.contains("scalar"),
         "names the scalar requirement: {msg}"
@@ -630,7 +620,6 @@ fn single_element_selector_refuses_naming_the_subset_form() {
     ))
     .expect_err("single-element access is not the case-2 subset pattern");
     let msg = format!("{e:?}");
-    assert!(msg.contains("refuse"), "must be a refusal: {msg}");
     assert!(
         msg.contains("SUBSET"),
         "message must point at the subset form: {msg}"
@@ -657,7 +646,6 @@ fn scalar_cat_jointchain_permuted_prefix_keep_refuses() {
     ))
     .expect_err("a permuted prefix keep has no settled marginal and must refuse");
     let msg = format!("{e:?}");
-    assert!(msg.contains("refuse"), "must be a refusal: {msg}");
     assert!(
         msg.contains("PERMUTED"),
         "message must name the permuted order, not a non-prefix set: {msg}"
@@ -677,7 +665,6 @@ fn index_projection_at_a_scalar_point_refuses() {
     ))
     .expect_err("a scalar point off a vector-variate projection must refuse");
     let msg = format!("{e:?}");
-    assert!(msg.contains("refuse"), "must be a refusal: {msg}");
     assert!(
         !msg.contains("get0"),
         "must refuse, not report an emitted get0: {msg}"
@@ -695,7 +682,6 @@ fn index_projection_at_an_overlong_point_refuses() {
     ))
     .expect_err("a point longer than the selection must refuse");
     let msg = format!("{e:?}");
-    assert!(msg.contains("refuse"), "must be a refusal: {msg}");
     assert!(
         msg.contains("selects 1 component(s) but the query point has 2"),
         "message must name both lengths: {msg}"

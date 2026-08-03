@@ -628,11 +628,10 @@ draws = rand(s, lawof(record(mu = mu, y1 = y1, y2 = y2, d = d)))";
 //   random_data, rstate2 = rand(rstate, iid(Normal(0, 1), 10))
 //   more_random_data, rstate3 = rand(rstate2, iid(Exponential(1), 5))
 //
-// A fixed-kernel `iid(K, n)` is itself a nullary kernel, hence a closed measure —
-// the same §07 clause that admits a bare constructor. It must lower, and it must
-// lower to the SAME batched term as the `xs ~ iid(...); rand(s, lawof(xs))`
-// spelling: ONE `builtin_sample` carrying the size dim, with a SINGLE advanced
-// rngstate (§07 measure-eval-prims), never one sample per element.
+// A fixed-kernel `iid(K, n)` is itself a nullary kernel, hence a closed measure. It must
+// lower to the SAME batched term as the `xs ~ iid(...); rand(s, lawof(xs))` spelling: ONE
+// `builtin_sample` carrying the size dim, with a SINGLE advanced rngstate (§07
+// measure-eval-prims), never one sample per element.
 #[test]
 fn rand_of_bare_iid_matches_the_draw_spelling() {
     let measure_position = "\
@@ -726,12 +725,10 @@ fn first_sample_term(pir: &str) -> String {
     panic!("unbalanced builtin_sample term in:\n{pir}");
 }
 
-// The capability this whole vertical exists for, in the shape the guards around it
-// are scoped against: `pushfwd` over a RECORD law, with a map whose parameter names
-// are the record's fields (§04 auto-splatting). The scalar-base golden above does
-// not cover it, and three `refuse.rs` tests fence this neighbourhood — so without
-// this golden a future tightening of `record_splat_mismatch` could make the correct
-// spelling refuse with every other test still green, silently removing the feature.
+// `pushfwd` over a RECORD law with a map whose parameter names are the record's fields
+// (§04 auto-splatting) — the capability the `refuse.rs` guards around it are scoped
+// against. Without this golden a tightening of `record_splat_mismatch` could make the
+// correct spelling refuse with every other test still green.
 //
 // Two INDEPENDENT draws in the base: 2 logical samples, 3 syntactic occurrences.
 // The first sample's node is shared — its value is `sub`'s left operand and its

@@ -651,14 +651,12 @@ pub(crate) struct ImplicitMarginal {
 /// of whose parameters is a latent of the model — as a distribution-constructor node plus
 /// the latent it integrated out.
 ///
-/// This is the implicit spelling of the same integral [`lower_kchain_marginal`] does for
-/// an explicit `kchain`. §04 "Reification to measures" makes `lawof(y)` y's TOTAL law:
-/// "they are internal stochastic nodes in the traced sub-DAG, not boundary inputs, so
-/// `lawof` integrates them out", the measure-algebra equivalent being
-/// `kchain(prior, forward_kernel)`. `y ~ Normal(mu = z, sigma = 1)` over a latent `z`
-/// therefore asks for exactly the Normal–Normal row, without the user writing the
-/// `kchain`. The caller's marginalization refusal stays the fallback: `None` here means
-/// no row applies, never that the conditional may be scored instead.
+/// The implicit spelling of the integral [`lower_kchain_marginal`] does for an explicit
+/// `kchain`. §04 "Reification to measures" makes `lawof(y)` y's TOTAL law — internal
+/// stochastic nodes are "not boundary inputs, so `lawof` integrates them out" — so
+/// `y ~ Normal(mu = z, sigma = 1)` over a latent `z` asks for the Normal–Normal row
+/// without the user writing the `kchain`. `None` means no row applies, never that the
+/// conditional may be scored instead.
 ///
 /// `exempt` passes the caller's own accounted-for draw sites through to
 /// [`measure_stochastic_ancestors`] — the sibling fields of a record product, whose
