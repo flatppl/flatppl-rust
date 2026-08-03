@@ -2161,6 +2161,12 @@ fn lower_logit_emits_log_of_the_odds_ratio() {
 /// through the exact identity $\Phi^{-1}(p) = \sqrt{2}\,\mathrm{erf}^{-1}(2p-1)$.
 /// √2 is written at full `f64` precision so an f64 module is not silently held
 /// to f32 accuracy.
+///
+/// **This path is VALUE-only under Enzyme.** `chlo.erf_inv` has no adjoint
+/// ("could not compute the adjoint for this operation"), so a density reaching
+/// `probit` — every `pushfwd(invprobit, M)` — executes but cannot be
+/// differentiated. The op is exact and the values are verified; the gap is the
+/// executor's. Do not read a passing test here as a working gradient.
 #[test]
 fn lower_probit_emits_erf_inv_of_the_rescaled_argument() {
     let out = lower_unary_head("probit");
@@ -2306,8 +2312,11 @@ fn lower_asinh_emits_chlo_asinh() {
         out.contains("%0 = chlo.asinh %arg0 : tensor<f32> -> tensor<f32>"),
         "asinh:\n{out}"
     );
+    // Trailing space: a bare `"stablehlo.log"` is also a prefix of
+    // `log_plus_one` and `logistic`, so it would reject a valid future spelling
+    // for the wrong reason.
     assert!(
-        !out.contains("stablehlo.sqrt") && !out.contains("stablehlo.log"),
+        !out.contains("stablehlo.sqrt") && !out.contains("stablehlo.log "),
         "asinh:\n{out}"
     );
     assert!(is_delimiter_balanced(&out));
@@ -9917,14 +9926,26 @@ fn emit_logdensity_asinh_pushfwd_matches_frozen_golden() {
     );
 }
 
+/// Does some `stablehlo.log` consume a `stablehlo.divide`'s result? That is the
+/// shape of `logit(p) = log(p / (1 - p))`, and it is what makes the `invlogit`
+/// roster row below discriminating: a bare `stablehlo.log` would pass on the
+/// Normal logpdf's own `-log(sigma)` no matter how `logit` were lowered.
+/// Matched by SSA name rather than position, so renumbering does not break it.
+fn emits_log_of_a_divide(out: &str) -> bool {
+    out.lines()
+        .filter_map(|l| l.split_once(" = stablehlo.divide "))
+        .any(|(ssa, _)| out.contains(&format!("stablehlo.log {} :", ssa.trim())))
+}
+
 /// Every one of §06's seven open-image forward maps now EMITS, and each spells
 /// its own inverse head. The pin against a partial fix: adding only the
 /// inverses would still refuse on `cosh`/`tanh` (log-volume heads) and on
 /// `invprobit`/`atan`/`expm1` (safe-point witnesses).
 #[test]
 fn emit_logdensity_every_recognised_open_image_pushfwd_emits() {
+    // `invlogit`'s inverse is a three-op ratio with no single distinctive op, so
+    // it is checked structurally by `emits_log_of_a_divide` instead.
     for (forward, inverse_op) in [
-        ("invlogit", "stablehlo.log"),
         ("invprobit", "chlo.erf_inv"),
         ("atan", "stablehlo.sine"),
         ("expm1", "stablehlo.log_plus_one"),
@@ -9945,4 +9966,11 @@ fn emit_logdensity_every_recognised_open_image_pushfwd_emits() {
         );
         assert!(is_delimiter_balanced(&out), "pushfwd({forward}):\n{out}");
     }
+
+    let out = emit_logdensity(&determinize_src(PUSHFWD_INVLOGIT_SRC));
+    assert!(
+        emits_log_of_a_divide(&out),
+        "pushfwd(invlogit) must lower `logit` as log of a ratio:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out), "pushfwd(invlogit):\n{out}");
 }
