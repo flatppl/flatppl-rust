@@ -293,3 +293,45 @@ fn determinize_refuses_with_exit_3() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// `--emit flatpir` renders FlatPIR (§11) instead of surface syntax, and surface
+/// syntax stays the default. The distinction matters to an external gate: the
+/// surface printer spells a builtin call and a user call the same way — `f(x)`
+/// either way — so only FlatPIR shows which one a determinised module carries.
+#[test]
+fn determinize_emit_flatpir_renders_flatpir() {
+    let dir = std::env::temp_dir().join(format!("flatppl-det-cli-emit-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let input = dir.join("e.flatppl");
+    std::fs::write(
+        &input,
+        "a = draw(Normal(mu = 0.0, sigma = 1.0))\nlp = logdensityof(lawof(record(a = a)), record(a = 0.5))\n",
+    )
+    .unwrap();
+
+    let pir = flatppl()
+        .arg("determinize")
+        .arg(&input)
+        .arg("--emit")
+        .arg("flatpir")
+        .output()
+        .unwrap();
+    assert!(
+        pir.status.success(),
+        "exit 0; stderr: {}",
+        String::from_utf8_lossy(&pir.stderr)
+    );
+    let pir_out = String::from_utf8_lossy(&pir.stdout);
+    assert!(
+        pir_out.contains("(%module") && pir_out.contains("(%bind lp"),
+        "--emit flatpir must render FlatPIR S-expressions:\n{pir_out}"
+    );
+
+    let default = flatppl().arg("determinize").arg(&input).output().unwrap();
+    assert!(default.status.success());
+    let default_out = String::from_utf8_lossy(&default.stdout);
+    assert!(
+        !default_out.contains("(%module"),
+        "surface syntax must stay the default:\n{default_out}"
+    );
+}
