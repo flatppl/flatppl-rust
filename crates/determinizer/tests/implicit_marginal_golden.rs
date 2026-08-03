@@ -163,6 +163,230 @@ k = draw(Poisson(rate = rate))
     }
 }
 
+// Row 3 (Beta prior on a Binomial `p`), both spellings. §08 names no `BetaBinomial`
+// constructor, so the row emits the log-pmf from §07 builtins — `loggamma` is a §07
+// "Elementary functions" entry. A row does not have to name a distribution: determinised
+// output is a deterministic expression.
+//
+// Prior `Beta(alpha = 2, beta = 3)`, likelihood `Binomial(n = 10, p = p)`, marginal
+// `BetaBinomial(10, 2, 3)`. logdensity at k = 7 is -2.526728144641337. The wrong answer this
+// pins out is the plug-in `Binomial(10, 0.4)` at k = 7 = -3.1590202516350088 — the
+// conditional at the prior MEAN `α/(α+β) = 0.4` (0.632 nats).
+#[test]
+fn beta_prior_on_a_binomial_p_marginalizes_in_both_spellings() {
+    let model = "\
+p = draw(Beta(alpha = 2.0, beta = 3.0))
+k = draw(Binomial(n = 10, p = p))
+";
+    for query in [
+        "lp_k = logdensityof(lawof(k), 7)",
+        "lp_k = logdensityof(lawof(record(k = k)), record(k = 7))",
+    ] {
+        let lp_k = pir_binding(&pir(&format!("{model}{query}")), "lp_k");
+        // No constructor to score: the row's answer IS the expression.
+        assert!(
+            !lp_k.contains("builtin_logdensityof"),
+            "the beta-binomial marginal is an expression, not a scored constructor:\n{lp_k}"
+        );
+        // log C(10, 7) = loggamma(11) − loggamma(8) − loggamma(4). Every argument
+        // const-folds, so the three literals pin the coefficient by themselves.
+        assert!(
+            lp_k.contains("(loggamma 11.0)")
+                && lp_k.contains("(loggamma 8.0)")
+                && lp_k.contains("(loggamma 4.0)"),
+            "log C(n, k) is loggamma(n+1) − loggamma(k+1) − loggamma(n−k+1):\n{lp_k}"
+        );
+        // log B(k+α, n−k+β) = log B(9, 6) and log B(α, β) = log B(2, 3). The POSTERIOR
+        // shapes are what a plug-in has no analogue of, so 9.0/6.0/15.0 are the row.
+        assert!(
+            lp_k.contains("(loggamma 9.0)")
+                && lp_k.contains("(loggamma 6.0)")
+                && lp_k.contains("(loggamma 15.0)")
+                && lp_k.contains("(loggamma 5.0)"),
+            "log B(k+α, n−k+β) − log B(α, β) at α = 2, β = 3, n = 10, k = 7:\n{lp_k}"
+        );
+        // The plug-in wrong answer would score the LIKELIHOOD family at the prior mean.
+        assert!(
+            !lp_k.contains("Binomial") && !lp_k.contains("0.4"),
+            "not the plug-in Binomial(10, 0.4) at the prior mean p:\n{lp_k}"
+        );
+    }
+}
+
+// Row 4 (Exponential prior on the VARIANCE → Laplace). The latent reaches the conjugating
+// parameter through a `sqrt`, because §08's `Normal` takes `sigma` and the prior is on the
+// variance. §08 parameterizes `Exponential` by RATE, so a prior of mean 2b² is
+// `rate = 1/(2b²)` and the map inverts that: `scale = 1/sqrt(2λ)`.
+//
+// Prior `Exponential(rate = 0.5)` (mean 2, so b = 1) → marginal `Laplace(0, 1)`. logdensity
+// at y = 4.0 is -4.693147180559945. The wrong answer this pins out is the plug-in
+// `Normal(0, sqrt 2)` at the prior mean variance = -5.265512123484645 (0.572 nats).
+#[test]
+fn exponential_prior_on_a_variance_marginalizes_to_a_laplace() {
+    let model = "\
+v = draw(Exponential(rate = 0.5))
+y = draw(Normal(mu = 0.0, sigma = sqrt(v)))
+";
+    for query in [
+        "lp_y = logdensityof(lawof(y), 4.0)",
+        "lp_y = logdensityof(lawof(record(y = y)), record(y = 4.0))",
+    ] {
+        let lp_y = pir_binding(&pir(&format!("{model}{query}")), "lp_y");
+        assert!(
+            lp_y.contains("(builtin_logdensityof Laplace "),
+            "the Exponential-variance marginal is a Laplace:\n{lp_y}"
+        );
+        assert!(
+            lp_y.contains("(%field location 0.0)") && lp_y.contains("(%field scale 1.0)"),
+            "location is the likelihood's mu, scale is 1/sqrt(2λ) = 1:\n{lp_y}"
+        );
+        // The plug-in wrong answer would keep the likelihood's family.
+        assert!(
+            !lp_y.contains("Normal"),
+            "not the plug-in Normal at the prior mean variance:\n{lp_y}"
+        );
+    }
+
+    // `scale = 1` cannot tell `1/sqrt(2λ)` from a `λ` passed through, so a second shape
+    // with a DISTINCT answer pins the arithmetic. `rate = 0.125` is mean 8 = 2b² with
+    // b = 2, and 1/sqrt(2 · 0.125) = 2. Structural only — no density number is claimed.
+    let lp_y = pir_binding(
+        &pir("\
+v = draw(Exponential(rate = 0.125))
+y = draw(Normal(mu = 0.0, sigma = sqrt(v)))
+lp_y = logdensityof(lawof(y), 4.0)"),
+        "lp_y",
+    );
+    assert!(
+        lp_y.contains("(%field scale 2.0)"),
+        "scale is 1/sqrt(2λ) = 2 at λ = 0.125, not λ itself:\n{lp_y}"
+    );
+
+    // The likelihood's `mu` becomes the marginal's LOCATION: `y = μ + s·ε` for a symmetric
+    // mixture, so the marginal is the same law shifted. At `mu = 1.5`, `rate = 0.5`,
+    // logdensity at y = 4.0 is -3.1931471805599454 (`src/marginal.md`).
+    let lp_y = pir_binding(
+        &pir("\
+v = draw(Exponential(rate = 0.5))
+y = draw(Normal(mu = 1.5, sigma = sqrt(v)))
+lp_y = logdensityof(lawof(y), 4.0)"),
+        "lp_y",
+    );
+    assert!(
+        lp_y.contains("(%field location 1.5)") && lp_y.contains("(%field scale 1.0)"),
+        "the likelihood's mu is the marginal's location, the scale unchanged by it:\n{lp_y}"
+    );
+}
+
+// Row 5 (InverseGamma prior on the VARIANCE → scaled Student t), both spellings. §08's
+// `StudentT(nu)` is the standard form only — "The location-scale form is obtained via
+// `pushfwd(fn(mu + sigma * _), StudentT(nu))`" — and a `pushfwd` is not a bare constructor,
+// so this row emits the log-density.
+//
+// Prior `InverseGamma(shape = 2.5, scale = 3.0)` → location 0, scale sqrt(β/α) =
+// 1.0954451150103321, ν = 2α = 5. logdensity at y = 5.0 is -5.986463573222975. The wrong
+// answer this pins out is the plug-in `Normal(0, sqrt(β/(α−1)))` at the prior mean variance
+// = -7.515512123484645 (1.529 nats).
+#[test]
+fn inverse_gamma_prior_on_a_variance_marginalizes_to_a_scaled_student_t() {
+    let model = "\
+v = draw(InverseGamma(shape = 2.5, scale = 3.0))
+y = draw(Normal(mu = 0.0, sigma = sqrt(v)))
+";
+    for query in [
+        "lp_y = logdensityof(lawof(y), 5.0)",
+        "lp_y = logdensityof(lawof(record(y = y)), record(y = 5.0))",
+    ] {
+        let lp_y = pir_binding(&pir(&format!("{model}{query}")), "lp_y");
+        assert!(
+            !lp_y.contains("builtin_logdensityof"),
+            "the scaled Student t marginal is an expression, not a scored constructor:\n{lp_y}"
+        );
+        // scale = sqrt(β/α) = sqrt(1.2), const-folded. Reading β as a MULTIPLICATIVE scale
+        // rather than as Gamma's rate would fold to a different constant.
+        assert!(
+            lp_y.contains("(log 1.0954451150103321)"),
+            "the log-normalizer carries log(scale) with scale = sqrt(β/α) = sqrt(1.2):\n{lp_y}"
+        );
+        // log sqrt(ν) with ν = 2α = 5: sqrt folds to 2.23606797749979.
+        assert!(
+            lp_y.contains("(log 2.23606797749979)"),
+            "the log-normalizer carries log(sqrt ν) with ν = 2α = 5:\n{lp_y}"
+        );
+        // log B(ν/2, 1/2) = loggamma(2.5) + loggamma(0.5) − loggamma(3.0), which absorbs
+        // the Γ(1/2) = sqrt(π) so no `pi` constant appears.
+        assert!(
+            lp_y.contains("(loggamma 2.5)")
+                && lp_y.contains("(loggamma 0.5)")
+                && lp_y.contains("(loggamma 3.0)"),
+            "the log-normalizer carries log B(ν/2, 1/2):\n{lp_y}"
+        );
+        // ((ν+1)/2) · log1p(z²/ν) with z = 5/sqrt(1.2): both factors const-fold.
+        assert!(
+            lp_y.contains("(mul 3.0 ") && lp_y.contains("(log1p 4.166666666666666)"),
+            "the tail is ((ν+1)/2) · log1p(z²/ν) = 3 · log1p(25/1.2/5):\n{lp_y}"
+        );
+        // The plug-in wrong answer would keep the likelihood's family.
+        assert!(
+            !lp_y.contains("Normal"),
+            "not the plug-in Normal at the prior mean variance:\n{lp_y}"
+        );
+    }
+
+    // `mu` enters through `z = (y − μ)/s`, so a nonzero one changes the TAIL, not the
+    // normalizer. At `mu = 1.5` the tail argument becomes (5 − 1.5)²/1.2/5 =
+    // 2.041666666666667 and logdensity at y = 5.0 is -4.396997199853038
+    // (`src/marginal.md`). A row that dropped `mu` would keep 4.166666666666666.
+    let lp_y = pir_binding(
+        &pir("\
+v = draw(InverseGamma(shape = 2.5, scale = 3.0))
+y = draw(Normal(mu = 1.5, sigma = sqrt(v)))
+lp_y = logdensityof(lawof(y), 5.0)"),
+        "lp_y",
+    );
+    assert!(
+        lp_y.contains("(log1p 2.041666666666667)") && !lp_y.contains("(log1p 4.166666666666666)"),
+        "mu enters through z = (y − μ)/s, so the tail argument shifts with it:\n{lp_y}"
+    );
+    // The normalizer is independent of `mu`: same scale, same ν, same log-beta.
+    assert!(
+        lp_y.contains("(log 1.0954451150103321)")
+            && lp_y.contains("(log 2.23606797749979)")
+            && lp_y.contains("(loggamma 2.5)"),
+        "the log-normalizer does not depend on mu:\n{lp_y}"
+    );
+}
+
+// The `Sqrt` path's ref resolution is unreachable, and this pins WHY — so a later reader
+// does not hunt for the coverage, and a change that makes the shape lower is forced to
+// re-examine the row. A named intermediate (`s = sqrt(v)`; `sigma = s`) refuses EARLIER
+// than the table: `s` keeps referencing `v`, so the driver never sweeps `v = draw(…)` and
+// the residual `draw` reaches exit. The refusal is the driver's, not the row's — the
+// construct is `draw`, not `kchain`.
+#[test]
+fn a_named_sqrt_intermediate_refuses_upstream_not_in_the_row() {
+    for src in [
+        "\
+v = draw(Exponential(rate = 0.5))
+s = sqrt(v)
+y = draw(Normal(mu = 0.0, sigma = s))
+lp = logdensityof(lawof(y), 4.0)",
+        "\
+v = draw(Exponential(rate = 0.5))
+s = sqrt(v)
+kk = kernelof(record(y = draw(Normal(mu = 0.0, sigma = s))), v = v)
+pp = kchain(lawof(record(v = v)), kk)
+lp = logdensityof(pp, record(y = 4.0))",
+    ] {
+        let err = determinize(&parse_infer(src))
+            .expect_err("a named sqrt intermediate leaves the latent's draw live — refuse");
+        assert_eq!(
+            err.construct, "draw",
+            "the refusal is the driver's residual-draw scan, not the conjugate row's: {err:?}"
+        );
+    }
+}
+
 // One field marginalizes, an independent sibling does not. The routing hands the whole
 // record back to the product lowering with just that field's measure replaced, so the
 // sibling keeps its own factor and its own pin — a marginal must not cost the product.
@@ -222,24 +446,53 @@ lp = logdensityof(lawof(record(y1 = y1, y2 = y2)), record(y1 = 0.5, y2 = 0.7))")
 // Both field orders, and with the latent still latent as well as pinned by a sibling query —
 // the refusal must not depend on which field the walk reaches first, nor on the provenance
 // path the marginal was built through.
+//
+// EVERY row inherits the refusal, including the two whose closed form is a log-density
+// EXPRESSION: the check reads the latent the row reports, not the shape of its answer, so a
+// shared VARIANCE is refused exactly as a shared mean is.
 #[test]
 fn two_fields_sharing_one_latent_refuse_rather_than_emit_the_product() {
-    let model = "\
+    for (model, queries) in [
+        (
+            "\
 z = draw(Normal(mu = 0.0, sigma = 1.0))
 y1 = draw(Normal(mu = z, sigma = 1.0))
 y2 = draw(Normal(mu = z, sigma = 1.0))
-";
-    for query in [
-        "lp = logdensityof(lawof(record(y1 = y1, y2 = y2)), record(y1 = 0.5, y2 = 0.7))",
-        "lp = logdensityof(lawof(record(y2 = y2, y1 = y1)), record(y2 = 0.7, y1 = 0.5))",
-        "lp_z = logdensityof(lawof(z), 0.3)\n\
-         lp = logdensityof(lawof(record(y1 = y1, y2 = y2)), record(y1 = 0.5, y2 = 0.7))",
+",
+            &[
+                "lp = logdensityof(lawof(record(y1 = y1, y2 = y2)), record(y1 = 0.5, y2 = 0.7))",
+                "lp = logdensityof(lawof(record(y2 = y2, y1 = y1)), record(y2 = 0.7, y1 = 0.5))",
+                "lp_z = logdensityof(lawof(z), 0.3)\n\
+                 lp = logdensityof(lawof(record(y1 = y1, y2 = y2)), record(y1 = 0.5, y2 = 0.7))",
+            ][..],
+        ),
+        // Row 4: a shared VARIANCE. Each field's marginal is `Laplace(0, 1)` and each is
+        // right, but the shared `v` is the dependence — the joint is not the product.
+        (
+            "\
+v = draw(Exponential(rate = 0.5))
+y1 = draw(Normal(mu = 0.0, sigma = sqrt(v)))
+y2 = draw(Normal(mu = 0.0, sigma = sqrt(v)))
+",
+            &["lp = logdensityof(lawof(record(y1 = y1, y2 = y2)), record(y1 = 0.5, y2 = 4.0))"][..],
+        ),
+        // Row 5: same, with a log-density-expression row.
+        (
+            "\
+v = draw(InverseGamma(shape = 2.5, scale = 3.0))
+y1 = draw(Normal(mu = 0.0, sigma = sqrt(v)))
+y2 = draw(Normal(mu = 0.0, sigma = sqrt(v)))
+",
+            &["lp = logdensityof(lawof(record(y1 = y1, y2 = y2)), record(y1 = 0.5, y2 = 5.0))"][..],
+        ),
     ] {
-        let reason = refusal(&format!("{model}{query}"));
-        assert!(
-            reason.contains("marginalize over the SAME latent"),
-            "a correlated joint must refuse, not emit the product of marginals: {reason}"
-        );
+        for query in queries {
+            let reason = refusal(&format!("{model}{query}"));
+            assert!(
+                reason.contains("marginalize over the SAME latent"),
+                "a correlated joint must refuse, not emit the product of marginals: {reason}"
+            );
+        }
     }
 }
 
@@ -343,6 +596,51 @@ z = draw(Normal(mu = 0.0, sigma = 1.0))
 y = draw(Normal(mu = z, sigma = 1.0))
 b = exp(y)
 lp_b = logdensityof(lawof(record(b = b)), record(b = 1.6487212707001282))",
+        ),
+        // Rows 4 and 5 are on the VARIANCE, and this is the neighbour that matters for
+        // them: the same prior feeding the MEAN is a LOCATION mixture, whose marginal is
+        // the exponentially modified Gaussian — and at y = 0.5 that differs from Row 4's
+        // Laplace by only 0.017 nats, so a row matching a bare ref where it wants `sqrt`
+        // would look almost right. Its density needs `erfc`, a §09 standard-module member
+        // the determiniser emits no call to (`src/marginal.md`), so it must refuse.
+        (
+            "exponential prior on a location",
+            "\
+v = draw(Exponential(rate = 0.5))
+y = draw(Normal(mu = v, sigma = 1.0))
+lp_y = logdensityof(lawof(y), 0.5)",
+        ),
+        (
+            "inverse gamma prior on a location",
+            "\
+v = draw(InverseGamma(shape = 2.5, scale = 3.0))
+y = draw(Normal(mu = v, sigma = 1.0))
+lp_y = logdensityof(lawof(y), 0.5)",
+        ),
+        // A prior on the STANDARD DEVIATION, not the variance: the latent reaches `sigma`
+        // as a bare ref, so the `sqrt` path must reject it. Rows 4 and 5 hold only for a
+        // variance mixture; reusing them here would score the wrong mixture entirely.
+        (
+            "exponential prior on a standard deviation",
+            "\
+v = draw(Exponential(rate = 0.5))
+y = draw(Normal(mu = 0.0, sigma = v))
+lp_y = logdensityof(lawof(y), 4.0)",
+        ),
+        (
+            "inverse gamma prior on a standard deviation",
+            "\
+v = draw(InverseGamma(shape = 2.5, scale = 3.0))
+y = draw(Normal(mu = 0.0, sigma = v))
+lp_y = logdensityof(lawof(y), 5.0)",
+        ),
+        // Row 3's families do not pair with a Normal likelihood.
+        (
+            "beta prior on a normal mean",
+            "\
+p = draw(Beta(alpha = 2.0, beta = 3.0))
+y = draw(Normal(mu = p, sigma = 1.0))
+lp_y = logdensityof(lawof(y), 0.5)",
         ),
     ] {
         let reason = refusal(src);

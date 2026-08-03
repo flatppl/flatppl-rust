@@ -2,10 +2,11 @@
 //! closed-form conjugate table (spec §06, "Density of composed measures", the `kchain`
 //! row).
 //!
-//! **The maths of every conjugate row — the integral, its closed form, the §08 name, the
-//! test point and the wrong answer that point discriminates against — is in
-//! `marginal.md`, beside this file.** Check a row there rather than reverse-engineering
-//! its `build_*_marginal`.
+//! **The maths of every conjugate row — the integral, its closed form, the §08 name or the
+//! emitted expression, the test point and the wrong answer that point discriminates
+//! against — is in `marginal.md`, beside this file.** Check a row there rather than
+//! reverse-engineering its `build_*_marginal`. Not every row has a §08 name: two answer
+//! with a log-density expression, because §08 names no constructor for them.
 //!
 //! `kchain(M, K)` is Kleisli bind: it marginalizes the intermediate latent `a`,
 //! keeping the kernel `K`'s variate. Its density at `x` is the marginal integral
@@ -360,10 +361,55 @@ fn static_int(m: &Module, id: NodeId) -> Option<i64> {
 // latent-independent. Anything else keeps the non-enumerable refuse
 // (refuse-don't-mislower).
 
+/// The closed form a conjugate row returns.
+///
+/// A row does **not** have to name a §08 distribution. Determinised output is a
+/// deterministic expression, so a row whose answer §08 has no constructor for emits the
+/// closed-form log-density instead: the beta-binomial pmf (Row 3) and the scaled Student t
+/// (Row 5) are both that case, and both are built from §07 builtins only.
+pub(crate) enum MarginalForm {
+    /// A §08 distribution-constructor node, scored by the ordinary density path.
+    Measure(NodeId),
+    /// A closed-form log-density, applied to the variate by [`LogDensity::at`].
+    LogDensity(LogDensity),
+}
+
+/// A row's closed-form log-density, resolved down to its parameter nodes and waiting for
+/// the variate.
+///
+/// Not a boxed closure: the parameters travel as a `Vec` in the order the row's `build`
+/// reads them, so the builder stays a plain `fn` pointer like [`MarginalBuilder`].
+pub(crate) struct LogDensity {
+    build: fn(&mut Module, &[NodeId], NodeId) -> NodeId,
+    params: Vec<NodeId>,
+}
+
+impl LogDensity {
+    /// The log-density expression at `variate`.
+    pub(crate) fn at(&self, m: &mut Module, variate: NodeId) -> NodeId {
+        (self.build)(m, &self.params, variate)
+    }
+}
+
+/// How the latent reaches the conjugating parameter.
+///
+/// The row records this because §08 parameterizes by the quantity it names, not by
+/// whatever a conjugacy is stated in: `Normal` takes `sigma`, so a prior on the VARIANCE
+/// reaches it through a `sqrt`. A row that accepted a bare ref where it wanted `sqrt`
+/// would score a LOCATION mixture as a scale mixture, and those two agree to 0.017 nats
+/// at `y = 0.5` (`marginal.md`, Rows 4 and 5).
+enum LatentPath {
+    /// The parameter's value IS the latent's ref.
+    Direct,
+    /// The parameter's value is `sqrt(<the latent's ref>)`.
+    Sqrt,
+}
+
 /// A conjugate-marginal builder: from the prior's and likelihood's keyword
-/// arguments (`(param, value)` pairs), build the closed-form marginal
-/// distribution-constructor node, or `None` if a required parameter is absent.
-type MarginalBuilder = fn(&mut Module, &[(Symbol, NodeId)], &[(Symbol, NodeId)]) -> Option<NodeId>;
+/// arguments (`(param, value)` pairs), build the closed form, or `None` if a required
+/// parameter is absent.
+type MarginalBuilder =
+    fn(&mut Module, &[(Symbol, NodeId)], &[(Symbol, NodeId)]) -> Option<MarginalForm>;
 
 /// One conjugate prior/likelihood pair whose `kchain` marginal is closed-form.
 struct ConjugateRow {
@@ -372,11 +418,13 @@ struct ConjugateRow {
     /// Likelihood distribution-constructor name (the kernel body), e.g. `"Normal"`.
     likelihood: &'static str,
     /// The likelihood parameter the latent feeds (the "conjugating" parameter),
-    /// e.g. `"mu"`. Its value must be exactly the kernel's boundary-input ref.
+    /// e.g. `"mu"`.
     conjugating_param: &'static str,
-    /// Build the closed-form marginal distribution-constructor node from the
-    /// prior's keyword arguments and the likelihood's keyword arguments. Returns
-    /// `None` if a required parameter is absent (a matched-but-malformed pair).
+    /// The transformation the latent passes through on its way to that parameter.
+    latent_path: LatentPath,
+    /// Build the closed form from the prior's keyword arguments and the likelihood's
+    /// keyword arguments. Returns `None` if a required parameter is absent (a
+    /// matched-but-malformed pair).
     build_marginal: MarginalBuilder,
 }
 
@@ -387,13 +435,36 @@ const CONJUGATE_TABLE: &[ConjugateRow] = &[
         prior: "Normal",
         likelihood: "Normal",
         conjugating_param: "mu",
+        latent_path: LatentPath::Direct,
         build_marginal: build_normal_normal_marginal,
     },
     ConjugateRow {
         prior: "Gamma",
         likelihood: "Poisson",
         conjugating_param: "rate",
+        latent_path: LatentPath::Direct,
         build_marginal: build_gamma_poisson_marginal,
+    },
+    ConjugateRow {
+        prior: "Beta",
+        likelihood: "Binomial",
+        conjugating_param: "p",
+        latent_path: LatentPath::Direct,
+        build_marginal: build_beta_binomial_marginal,
+    },
+    ConjugateRow {
+        prior: "Exponential",
+        likelihood: "Normal",
+        conjugating_param: "sigma",
+        latent_path: LatentPath::Sqrt,
+        build_marginal: build_exponential_variance_marginal,
+    },
+    ConjugateRow {
+        prior: "InverseGamma",
+        likelihood: "Normal",
+        conjugating_param: "sigma",
+        latent_path: LatentPath::Sqrt,
+        build_marginal: build_inverse_gamma_variance_marginal,
     },
 ];
 
@@ -427,16 +498,49 @@ fn try_conjugate_marginal(
     let kernel_input_sym = kernel.inputs[0].1.name;
 
     let marginal = match build_conjugate_marginal(m, latent_dist, lik.dist, kernel_input_sym)? {
-        Ok(node) => node,
+        Ok(form) => form,
         Err(e) => return Some(Err(e)),
     };
 
-    // Score the marginal at `v` through the kernel's variate wrapper: for a
-    // record-shaped kernel body this descends `record{field}` → scalar and scores
-    // the marginal at `v.field`; for a bare scalar body it scores directly. Both
-    // reach `build_density_term`, emitting one `builtin_logdensityof(marginal, …)`.
-    let marginal_measure = wrap_like_kernel(m, marginal, lik.record_field);
-    Some(lower_measure_density(m, marginal_measure, v))
+    match marginal {
+        // Score the marginal at `v` through the kernel's variate wrapper: for a
+        // record-shaped kernel body this descends `record{field}` → scalar and scores
+        // the marginal at `v.field`; for a bare scalar body it scores directly. Both
+        // reach `build_density_term`, emitting one `builtin_logdensityof(marginal, …)`.
+        MarginalForm::Measure(marginal) => {
+            let marginal_measure = wrap_like_kernel(m, marginal, lik.record_field);
+            Some(lower_measure_density(m, marginal_measure, v))
+        }
+        // A log-density form has no measure to wrap, so the kernel's variate wrapper is
+        // applied to the VALUE instead: the row's expression consumes the same scalar the
+        // measure path would have descended to.
+        MarginalForm::LogDensity(ld) => match variate_like_kernel(m, v, lik.record_field) {
+            Some(scalar) => Some(Ok(ld.at(m, scalar))),
+            None => Some(Err(refuse_kchain(
+                v,
+                "closed-form log-density marginal over a record-shaped kernel needs the \
+                 variate's field, and this variate is not a record literal carrying it",
+            ))),
+        },
+    }
+}
+
+/// The scalar the kernel's variate wrapper descends `v` to: `v` itself for a bare scalar
+/// kernel body, or `v`'s matching field for a `record(field = …)` one.
+///
+/// The field is read from a record LITERAL rather than emitted as a `get`, mirroring what
+/// [`lower_measure_density`]'s record descent does on the measure path — so the two forms
+/// score at the same node and neither leaves a `get` over a literal behind.
+fn variate_like_kernel(m: &Module, v: NodeId, record_field: Option<Symbol>) -> Option<NodeId> {
+    let Some(field) = record_field else {
+        return Some(v);
+    };
+    let (resolved, _) = resolve_ref_one(m, v);
+    let rec = expect_builtin_call(m, resolved, "record")?;
+    rec.named
+        .iter()
+        .find(|na| na.name == field)
+        .map(|na| na.value)
 }
 
 /// The conjugate table's detection + build, shared by the explicit `kchain` spelling
@@ -453,7 +557,7 @@ fn build_conjugate_marginal(
     latent_dist: NodeId,
     lik_dist: NodeId,
     latent_sym: Symbol,
-) -> Option<Result<NodeId, RefuseError>> {
+) -> Option<Result<MarginalForm, RefuseError>> {
     // (a) The prior must be a bare distribution constructor (positional or
     // keyword arguments).
     let (prior_sym, prior_kwargs) = split_kernel_constructor(m, latent_dist)?;
@@ -465,55 +569,81 @@ fn build_conjugate_marginal(
     let prior_name = m.resolve(prior_sym).to_string();
     let lik_name = m.resolve(lik_sym).to_string();
 
-    // Find the row whose prior + likelihood families both match.
-    let row = CONJUGATE_TABLE
+    // EVERY row whose prior + likelihood families match is tried, not just the first: two
+    // rows may share a family pair and differ only in which parameter the latent feeds, or
+    // along which path it gets there (`Normal`–`Normal` on `mu` vs. on `sqrt`-of-variance).
+    for row in CONJUGATE_TABLE
         .iter()
-        .find(|r| r.prior == prior_name.as_str() && r.likelihood == lik_name.as_str())?;
-
-    // (b) The conjugating parameter's value must be EXACTLY the latent's ref
-    // `(%ref self|%local latent_sym)` — the latent feeding that parameter,
-    // unresolved. Anything else (a constant, a derived expression) is not this
-    // conjugate shape.
-    let conj_val = find_kwarg(m, &lik_kwargs, row.conjugating_param)?;
-    if !is_input_ref(m, conj_val, latent_sym) {
-        return None;
-    }
-
-    // (c) Every OTHER likelihood parameter must be latent-independent. A second
-    // parameter that also references the latent (e.g. both `mu` and `sigma`
-    // depending on the latent) is not a Normal–Normal (mean-only) conjugacy.
-    for (psym, pval) in &lik_kwargs {
-        if m.resolve(*psym) == row.conjugating_param {
+        .filter(|r| r.prior == prior_name.as_str() && r.likelihood == lik_name.as_str())
+    {
+        // (b) The conjugating parameter's value must carry the latent's ref
+        // `(%ref self|%local latent_sym)` along the row's own path — bare for `Direct`,
+        // under a `sqrt` for `Sqrt`. Anything else (a constant, some other derived
+        // expression) is not this conjugate shape.
+        let Some(conj_val) = find_kwarg(m, &lik_kwargs, row.conjugating_param) else {
+            continue;
+        };
+        if !matches_latent_path(m, conj_val, &row.latent_path, latent_sym) {
             continue;
         }
-        if references_input(m, *pval, latent_sym) {
-            return None;
+
+        // (c) Every OTHER likelihood parameter must be latent-independent. A second
+        // parameter that also references the latent (e.g. both `mu` and `sigma`
+        // depending on the latent) is not a Normal–Normal (mean-only) conjugacy.
+        if lik_kwargs.iter().any(|(psym, pval)| {
+            m.resolve(*psym) != row.conjugating_param && references_input(m, *pval, latent_sym)
+        }) {
+            continue;
+        }
+
+        return Some(
+            (row.build_marginal)(m, &prior_kwargs, &lik_kwargs).ok_or_else(|| {
+                refuse_kchain(
+                    latent_dist,
+                    "conjugate pair matched but a required distribution parameter is missing",
+                )
+            }),
+        );
+    }
+    None
+}
+
+/// Does the conjugating parameter's value `value` carry the latent along `path`?
+fn matches_latent_path(m: &Module, value: NodeId, path: &LatentPath, latent: Symbol) -> bool {
+    match path {
+        LatentPath::Direct => is_input_ref(m, value, latent),
+        // The ref resolution is DEFENSIVE, and currently unreachable: it would admit a named
+        // intermediate (`s = sqrt(v)`; `sigma = s`), but that whole shape refuses earlier, at
+        // the driver's residual-`draw` scan — `s` keeps referencing `v`, so `v = draw(…)` is
+        // never swept and survives to exit. Kept rather than dropped so the arm still matches
+        // if that upstream refusal is ever lifted; pinned as a refusal by
+        // `a_named_sqrt_intermediate_refuses_upstream_not_in_the_row`, which records that the
+        // refusal is not this row's.
+        LatentPath::Sqrt => {
+            let (resolved, _) = resolve_ref_one(m, value);
+            match expect_builtin_call(m, resolved, "sqrt") {
+                Some(c) if c.args.len() == 1 && c.named.is_empty() => {
+                    is_input_ref(m, c.args[0], latent)
+                }
+                _ => false,
+            }
         }
     }
-
-    Some(
-        (row.build_marginal)(m, &prior_kwargs, &lik_kwargs).ok_or_else(|| {
-            refuse_kchain(
-                latent_dist,
-                "conjugate pair matched but a required distribution parameter is missing",
-            )
-        }),
-    )
 }
 
 // ---------------------------------------------------------------------------
 // The implicit `lawof` spelling
 // ---------------------------------------------------------------------------
 
-/// A marginal this module built for the implicit spelling: the closed-form marginal
-/// distribution-constructor node, and the latent it integrated out.
+/// A marginal this module built for the implicit spelling: the closed form, and the latent
+/// it integrated out.
 ///
 /// The `latent` is not diagnostics. A caller building a PRODUCT of several marginals must
 /// know which latent each one integrated: two marginals over the SAME latent are not
 /// independent, and adding their log-densities is a wrong number
 /// ([`crate::density::marginalize_or_refuse_record_law`]).
 pub(crate) struct ImplicitMarginal {
-    pub measure: NodeId,
+    pub form: MarginalForm,
     pub latent: Symbol,
 }
 
@@ -554,7 +684,7 @@ pub(crate) fn conjugate_marginal_measure(
     }
     Some(
         build_conjugate_marginal(m, prior, likelihood, latent)?
-            .map(|measure| ImplicitMarginal { measure, latent }),
+            .map(|form| ImplicitMarginal { form, latent }),
     )
 }
 
@@ -692,6 +822,22 @@ fn build_constructor(m: &mut Module, ctor: &str, params: &[(&str, NodeId)]) -> N
     }))
 }
 
+/// A real literal node.
+fn real(m: &mut Module, v: f64) -> NodeId {
+    m.alloc(Node::Lit(Scalar::Real(v)))
+}
+
+/// `log B(x, y) = loggamma(x) + loggamma(y) − loggamma(x + y)`. `loggamma` is a §07
+/// builtin ("Elementary functions", domain `posreals`); §07 names no log-beta.
+fn build_logbeta(m: &mut Module, x: NodeId, y: NodeId) -> NodeId {
+    let lx = build_call(m, "loggamma", &[x]);
+    let ly = build_call(m, "loggamma", &[y]);
+    let sum = build_call(m, "add", &[x, y]);
+    let lxy = build_call(m, "loggamma", &[sum]);
+    let num = build_call(m, "add", &[lx, ly]);
+    build_call(m, "sub", &[num, lxy])
+}
+
 /// Normal–Normal (conjugate mean) marginal builder:
 /// `Normal(mu = μ0, sigma = sqrt(add(pow(σ0, 2), pow(σ, 2))))` where `μ0`, `σ0`
 /// are the prior's `mu`/`sigma` and `σ` is the likelihood's `sigma`.
@@ -699,7 +845,7 @@ fn build_normal_normal_marginal(
     m: &mut Module,
     prior_kwargs: &[(Symbol, NodeId)],
     lik_kwargs: &[(Symbol, NodeId)],
-) -> Option<NodeId> {
+) -> Option<MarginalForm> {
     let mu0 = find_kwarg(m, prior_kwargs, "mu")?;
     let sigma0 = find_kwarg(m, prior_kwargs, "sigma")?;
     let sigma = find_kwarg(m, lik_kwargs, "sigma")?;
@@ -713,11 +859,11 @@ fn build_normal_normal_marginal(
     let var_sum = build_call(m, "add", &[var0, var]);
     let sigma_marginal = build_call(m, "sqrt", &[var_sum]);
 
-    Some(build_constructor(
+    Some(MarginalForm::Measure(build_constructor(
         m,
         "Normal",
         &[("mu", mu0), ("sigma", sigma_marginal)],
-    ))
+    )))
 }
 
 /// Gamma–Poisson (conjugate rate) marginal builder:
@@ -729,15 +875,154 @@ fn build_gamma_poisson_marginal(
     m: &mut Module,
     prior_kwargs: &[(Symbol, NodeId)],
     _lik_kwargs: &[(Symbol, NodeId)],
-) -> Option<NodeId> {
+) -> Option<MarginalForm> {
     let alpha = find_kwarg(m, prior_kwargs, "shape")?;
     let beta = find_kwarg(m, prior_kwargs, "rate")?;
 
-    Some(build_constructor(
+    Some(MarginalForm::Measure(build_constructor(
         m,
         "NegativeBinomial",
         &[("alpha", alpha), ("beta", beta)],
-    ))
+    )))
+}
+
+/// Beta–Binomial (conjugate success probability) marginal builder. §08 names no
+/// `BetaBinomial` constructor, so the row returns the log-pmf
+/// ([`build_beta_binomial_logpmf`]) rather than a measure.
+fn build_beta_binomial_marginal(
+    m: &mut Module,
+    prior_kwargs: &[(Symbol, NodeId)],
+    lik_kwargs: &[(Symbol, NodeId)],
+) -> Option<MarginalForm> {
+    let alpha = find_kwarg(m, prior_kwargs, "alpha")?;
+    let beta = find_kwarg(m, prior_kwargs, "beta")?;
+    let n = find_kwarg(m, lik_kwargs, "n")?;
+
+    Some(MarginalForm::LogDensity(LogDensity {
+        build: build_beta_binomial_logpmf,
+        params: vec![alpha, beta, n],
+    }))
+}
+
+/// The beta-binomial log-pmf at `k`, from `params = [α, β, n]`:
+///
+/// ```text
+/// log C(n, k) + log B(k + α, n − k + β) − log B(α, β)
+/// log C(n, k) = loggamma(n+1) − loggamma(k+1) − loggamma(n−k+1)
+/// ```
+fn build_beta_binomial_logpmf(m: &mut Module, params: &[NodeId], k: NodeId) -> NodeId {
+    let [alpha, beta, n] = [params[0], params[1], params[2]];
+
+    let one = real(m, 1.0);
+    let n1 = build_call(m, "add", &[n, one]);
+    let k1 = build_call(m, "add", &[k, one]);
+    // `n − k` serves both the binomial coefficient and the posterior beta's second shape.
+    let nk = build_call(m, "sub", &[n, k]);
+    let nk1 = build_call(m, "add", &[nk, one]);
+    let lg_n1 = build_call(m, "loggamma", &[n1]);
+    let lg_k1 = build_call(m, "loggamma", &[k1]);
+    let lg_nk1 = build_call(m, "loggamma", &[nk1]);
+    let coeff = build_call(m, "sub", &[lg_n1, lg_k1]);
+    let coeff = build_call(m, "sub", &[coeff, lg_nk1]);
+
+    let post_a = build_call(m, "add", &[k, alpha]);
+    let post_b = build_call(m, "add", &[nk, beta]);
+    let post = build_logbeta(m, post_a, post_b);
+    let prior = build_logbeta(m, alpha, beta);
+    let ratio = build_call(m, "sub", &[post, prior]);
+
+    build_call(m, "add", &[coeff, ratio])
+}
+
+/// Exponential-prior-on-the-VARIANCE marginal builder:
+/// `Laplace(location = μ, scale = 1/sqrt(2λ))` where `λ` is the prior's `rate` and `μ` the
+/// likelihood's `mu`. §08 parameterizes `Exponential` by **rate**, so a prior of mean
+/// `2b²` is `rate = 1/(2b²)` and the map inverts that to `b`.
+fn build_exponential_variance_marginal(
+    m: &mut Module,
+    prior_kwargs: &[(Symbol, NodeId)],
+    lik_kwargs: &[(Symbol, NodeId)],
+) -> Option<MarginalForm> {
+    let rate = find_kwarg(m, prior_kwargs, "rate")?;
+    let mu = find_kwarg(m, lik_kwargs, "mu")?;
+
+    let two = real(m, 2.0);
+    let two_rate = build_call(m, "mul", &[two, rate]);
+    let root = build_call(m, "sqrt", &[two_rate]);
+    let one = real(m, 1.0);
+    let scale = build_call(m, "divide", &[one, root]);
+
+    Some(MarginalForm::Measure(build_constructor(
+        m,
+        "Laplace",
+        &[("location", mu), ("scale", scale)],
+    )))
+}
+
+/// InverseGamma-prior-on-the-VARIANCE marginal builder. The answer is the scaled Student t
+/// with location `μ`, scale `sqrt(β/α)` and `ν = 2α`; §08's `StudentT(nu)` is the standard
+/// form only ("The location-scale form is obtained via `pushfwd(fn(mu + sigma * _),
+/// StudentT(nu))`"), and a `pushfwd` is not a bare constructor, so the row returns the
+/// log-density ([`build_scaled_t_logpdf`]).
+///
+/// §08 parameterizes `InverseGamma` by `shape`/`scale`, and its `scale` "plays the same
+/// numerical role as the `rate` parameter of `Gamma`" — the `β` in `e^{-β/x}`. So the map
+/// reads the prior's `scale` as β, NOT as a multiplicative scale.
+fn build_inverse_gamma_variance_marginal(
+    m: &mut Module,
+    prior_kwargs: &[(Symbol, NodeId)],
+    lik_kwargs: &[(Symbol, NodeId)],
+) -> Option<MarginalForm> {
+    let shape = find_kwarg(m, prior_kwargs, "shape")?;
+    let scale = find_kwarg(m, prior_kwargs, "scale")?;
+    let mu = find_kwarg(m, lik_kwargs, "mu")?;
+
+    Some(MarginalForm::LogDensity(LogDensity {
+        build: build_scaled_t_logpdf,
+        params: vec![shape, scale, mu],
+    }))
+}
+
+/// The scaled Student t log-density at `y`, from `params = [α, β, μ]` — location `μ`,
+/// scale `s = sqrt(β/α)`, `ν = 2α`:
+///
+/// ```text
+/// −[ log s + log sqrt(ν) + log B(ν/2, 1/2) + ((ν+1)/2)·log1p(z²/ν) ],   z = (y − μ)/s
+/// ```
+///
+/// The normalizer is written with `log B(ν/2, 1/2)` rather than the gamma ratio and
+/// `log(νπ)/2` because `B(ν/2, 1/2) = Γ(ν/2)Γ(1/2)/Γ((ν+1)/2)` absorbs the `Γ(1/2) = √π`,
+/// so no `pi` constant is needed and [`build_logbeta`] is reused.
+fn build_scaled_t_logpdf(m: &mut Module, params: &[NodeId], y: NodeId) -> NodeId {
+    let [shape, beta, mu] = [params[0], params[1], params[2]];
+
+    let two = real(m, 2.0);
+    let nu = build_call(m, "mul", &[two, shape]);
+    let ratio = build_call(m, "divide", &[beta, shape]);
+    let s = build_call(m, "sqrt", &[ratio]);
+
+    let one = real(m, 1.0);
+    let nu1 = build_call(m, "add", &[nu, one]);
+    let half_nu1 = build_call(m, "divide", &[nu1, two]);
+    let half_nu = build_call(m, "divide", &[nu, two]);
+    let half = real(m, 0.5);
+
+    let log_s = build_call(m, "log", &[s]);
+    let root_nu = build_call(m, "sqrt", &[nu]);
+    let log_root_nu = build_call(m, "log", &[root_nu]);
+    let logb = build_logbeta(m, half_nu, half);
+    let norm = build_call(m, "add", &[log_s, log_root_nu]);
+    let norm = build_call(m, "add", &[norm, logb]);
+
+    let dev = build_call(m, "sub", &[y, mu]);
+    let z = build_call(m, "divide", &[dev, s]);
+    let z2 = build_call(m, "pow", &[z, two]);
+    let z2_nu = build_call(m, "divide", &[z2, nu]);
+    let shaped = build_call(m, "log1p", &[z2_nu]);
+    let tail = build_call(m, "mul", &[half_nu1, shaped]);
+
+    let total = build_call(m, "add", &[norm, tail]);
+    build_call(m, "neg", &[total])
 }
 
 // ---------------------------------------------------------------------------
