@@ -15,6 +15,13 @@
 //! SIBLING field of the same record product — that dependence is the chain rule, and
 //! §04's own exception ("not boundary inputs") keeps a `kernelof` body conditional.
 //!
+//! The provenance first bought a REFUSAL. It now buys the marginal itself: the pin also
+//! records the `draw(prior)` it replaced (`Module::query_pinned_rhs`), which is what
+//! `crate::marginal`'s conjugate table needs to answer the integral in the pinned
+//! ordering. So the assertions here are that the two orderings reach the SAME marginal —
+//! what this file guards is the provenance, not the row (that is
+//! `implicit_marginal_golden.rs`, and the maths is `src/marginal.md`).
+//!
 //! Structural only (flatppl-rust is not a density engine): every lowering is asserted
 //! on its emitted FlatPDL and passed through `is_flatpdl`.
 use flatppl_determinizer::{determinize, is_flatpdl};
@@ -46,13 +53,18 @@ fn refusal(src: &str) -> String {
         .reason
 }
 
-// The bare spelling, in both statement orders. `lp_z` first is the order that needed
-// the pin provenance: by the time `lp_y` lowers, `z` is the literal `0.3` and the
-// residual-`draw` scan has nothing left to catch. `lp_y` first refuses through the
-// still-present `draw`, and is asserted so a future change cannot fix one order by
-// breaking the other.
+// The bare spelling, in both statement orders. `lp_z` first is the order that needs
+// the pin provenance: by the time `lp_y` lowers, `z` is the literal `0.3`, so neither the
+// residual-`draw` scan nor `z`'s own binding has anything left to say — the provenance is
+// the only thing that still knows `z` was a latent AND what its prior was. `lp_y` first
+// reaches the same marginal through the still-present `draw`, and both are asserted so a
+// future change cannot fix one order by breaking the other.
+//
+// `Normal(0, √2)` (sigma folds to 1.4142135623730951) is the marginal; the conditional
+// `Normal(0.3, 1)` at the pinned latent is what must NOT appear.
 #[test]
 fn a_pinned_latent_is_not_a_fixed_parameter_bare_spelling() {
+    let mut emitted = Vec::new();
     for src in [
         "\
 z = draw(Normal(mu = 0.0, sigma = 1.0))
@@ -65,12 +77,21 @@ y = draw(Normal(mu = z, sigma = 1.0))
 lp_y = logdensityof(lawof(y), 0.5)
 lp_z = logdensityof(lawof(z), 0.3)",
     ] {
-        let reason = refusal(src);
+        let lp_y = pir_binding(&pir(src), "lp_y");
         assert!(
-            reason.contains("marginalizes over a stochastic ancestor"),
-            "must refuse as a marginal: {reason}"
+            lp_y.contains("(%field sigma 1.4142135623730951)"),
+            "the latent is marginalized out, not read as a fixed parameter:\n{lp_y}"
         );
+        assert!(
+            !lp_y.contains("(%field mu 0.3)"),
+            "not the conditional at the pinned latent:\n{lp_y}"
+        );
+        emitted.push(lp_y);
     }
+    assert_eq!(
+        emitted[0], emitted[1],
+        "both statement orders must reach the same marginal"
+    );
 }
 
 // The record spelling — the more common way to write the query, and wrong in BOTH
@@ -79,6 +100,7 @@ lp_z = logdensityof(lawof(z), 0.3)",
 // emitted term silently became the conditional.
 #[test]
 fn a_pinned_latent_is_not_a_fixed_parameter_record_spelling() {
+    let mut emitted = Vec::new();
     for src in [
         "\
 z = draw(Normal(mu = 0.0, sigma = 1.0))
@@ -91,12 +113,21 @@ y = draw(Normal(mu = z, sigma = 1.0))
 lp_y = logdensityof(lawof(record(y = y)), record(y = 0.5))
 lp_z = logdensityof(lawof(record(z = z)), record(z = 0.3))",
     ] {
-        let reason = refusal(src);
+        let lp_y = pir_binding(&pir(src), "lp_y");
         assert!(
-            reason.contains("a draw the record does not carry"),
-            "must refuse as a marginal over an ancestor outside the product: {reason}"
+            lp_y.contains("(%field sigma 1.4142135623730951)"),
+            "the ancestor outside the product is marginalized out:\n{lp_y}"
         );
+        assert!(
+            !lp_y.contains("(%field mu 0.3)"),
+            "not the conditional at the latent another query pinned:\n{lp_y}"
+        );
+        emitted.push(lp_y);
     }
+    assert_eq!(
+        emitted[0], emitted[1],
+        "both statement orders must reach the same marginal"
+    );
 }
 
 // A field's MAP, not only its measure, can carry the outside ancestor: `b = y + z` is
@@ -118,7 +149,9 @@ lp_b = logdensityof(lawof(record(b = b)), record(b = 0.5))";
 }
 
 // `rand` rewrites a latent's binding the same way a density query does, and the
-// realization it writes is even further from a model constant than a query point is.
+// realization it writes is even further from a model constant than a query point is —
+// scoring `y` against it would condition on one draw of `z`, where §04 asks for y's law
+// over all of them.
 #[test]
 fn a_sampled_latent_is_not_a_fixed_parameter() {
     let src = "\
@@ -127,10 +160,14 @@ z = draw(Normal(mu = 0.0, sigma = 1.0))
 y = draw(Normal(mu = z, sigma = 1.0))
 zs, s2 = rand(s, lawof(record(z = z)))
 lp_y = logdensityof(lawof(y), 0.5)";
-    let reason = refusal(src);
+    let lp_y = pir_binding(&pir(src), "lp_y");
     assert!(
-        reason.contains("marginalizes over a stochastic ancestor"),
-        "must refuse as a marginal: {reason}"
+        lp_y.contains("(%field sigma 1.4142135623730951)"),
+        "the sampled latent is marginalized out:\n{lp_y}"
+    );
+    assert!(
+        !lp_y.contains("builtin_sample"),
+        "the marginal does not condition on the drawn realization:\n{lp_y}"
     );
 }
 

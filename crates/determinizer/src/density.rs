@@ -249,7 +249,12 @@ fn lower_density_core(
     // This is the one call in the crate at [`VariateOrigin::Point`] — arg2 is the
     // queried value's OWN variate here, which is what licenses `lower_value_law`
     // to pin it back onto the binding.
-    let measure_expr = measure_of_arg(m, arg1)?;
+    let (measure_expr, stripped_lawof) = measure_of_arg(m, arg1)?;
+    if stripped_lawof {
+        if let Some(marginal) = marginalize_or_refuse_stochastic_law(m, measure_expr, arg2)? {
+            return Ok(marginal);
+        }
+    }
     lower_measure_density_at_point(m, measure_expr, arg2)
 }
 
@@ -1150,21 +1155,27 @@ fn lower_lawof(
         }
         c.args[0]
     };
-    refuse_stochastic_measure_law(m, arg)?;
+    if let Some(marginal) = marginalize_or_refuse_stochastic_law(m, arg, v)? {
+        return Ok(marginal);
+    }
     lower_measure_density_at(m, arg, v, origin)
 }
 
-/// Refuse `lawof(<measure expression>)` whose measure is parameterized by a draw —
-/// `lawof(Normal(mu = a, sigma = 1))` with `a` latent, whose total law is the
-/// marginal `N(0, √2)`, not `N(a, 1)` at whatever value `a` later takes.
+/// Marginalize — or refuse — `lawof(<measure expression>)` whose measure is
+/// parameterized by a draw: `lawof(Normal(mu = a, sigma = 1))` with `a` latent, whose
+/// total law is the marginal `N(0, √2)`, not `N(a, 1)` at whatever value `a` later takes.
+///
+/// `Ok(None)` means no marginalization is called for and the caller lowers as usual;
+/// `Ok(Some(node))` is the emitted closed-form marginal density at `v`; `Err` is the
+/// refusal.
 ///
 /// This is the measure-expression half of the marginalization guard;
 /// [`lower_value_law`] covers the half where `lawof`'s argument is a VALUE. Both
 /// are needed, and neither subsumes the other: a measure argument is unwrapped and
 /// scored by `build_density_term`, which succeeds, so `lower_value_law` is never
 /// entered and its guard never runs. Called from both places a `lawof` is stripped —
-/// here, and [`measure_of_arg`] at the query entry, which strips the top-level one
-/// before the dispatcher ever sees it.
+/// [`lower_lawof`], and [`lower_density_core`] at the query entry, which strips the
+/// top-level one via [`measure_of_arg`] before the dispatcher ever sees it.
 ///
 /// **The discriminator is value-versus-measure-expression, and it has to be.**
 /// Running [`measure_reaches_draw`] on a VALUE argument would report every
@@ -1186,14 +1197,20 @@ fn lower_lawof(
 /// both readings. What keeps this from over-refusing is [`measure_reaches_draw`] —
 /// `lawof(functionof(Normal(mu = elementof(reals), …)))` reaches no draw and lowers.
 ///
-/// Refusing rather than marginalizing is deliberate: the marginal is
-/// `kchain(lawof(a), a -> Normal(mu = a, …))`, closed-form only for a discrete-finite
-/// latent ([`crate::marginal`]'s scope), and synthesizing that `kchain` from the
-/// reification — rewriting the captured self-ref into a kernel boundary — is
-/// machinery this guard does not have.
-fn refuse_stochastic_measure_law(m: &Module, arg: NodeId) -> Result<(), RefuseError> {
+/// The marginal is `kchain(lawof(a), a -> Normal(mu = a, …))`, which
+/// [`crate::marginal::conjugate_marginal_measure`] answers in closed form for a
+/// recognised conjugate pair — without synthesizing the `kchain`, since the table needs
+/// only the prior, the likelihood, and the symbol linking them. No row applying is what
+/// keeps the refusal.
+fn marginalize_or_refuse_stochastic_law(
+    m: &mut Module,
+    arg: NodeId,
+    v: NodeId,
+) -> Result<Option<NodeId>, RefuseError> {
     let (resolved, _) = resolve_ref_one(m, arg);
-    refuse_stochastic_record_law(m, resolved)?;
+    if let Some(product) = marginalize_or_refuse_record_law(m, resolved, v)? {
+        return Ok(Some(product));
+    }
     let is_measure_expr = is_measure_expr_type(m, arg)
         || is_measure_expr_type(m, resolved)
         || matches!(
@@ -1201,20 +1218,23 @@ fn refuse_stochastic_measure_law(m: &Module, arg: NodeId) -> Result<(), RefuseEr
             Some("functionof") | Some("kernelof")
         );
     if is_measure_expr && measure_reaches_draw(m, resolved, &[]) {
+        if let Some(marginal) = crate::marginal::conjugate_marginal_measure(m, resolved, &[]) {
+            return lower_measure_density(m, marginal?, v).map(Some);
+        }
         return Err(refuse(
             resolved,
             m,
             "lawof of a measure parameterized by a draw is that value's MARGINAL law \
-             (§04: lawof reifies the TOTAL law), which is a kchain marginal — refuse rather \
-             than score the conditional at a pinned latent",
+             (§04: lawof reifies the TOTAL law), which is a kchain marginal and no conjugate \
+             closed-form applies — refuse rather than score the conditional at a pinned latent",
         ));
     }
-    Ok(())
+    Ok(None)
 }
 
-/// Refuse `lawof(record(…))` one of whose fields' laws is parameterized by a draw the
-/// record does not carry — `lawof(record(y = y))` with `y ~ Normal(mu = z, sigma = 1)`
-/// and `z` a latent of the model but no field here.
+/// Marginalize — or refuse — `lawof(record(…))` one of whose fields' laws is parameterized
+/// by a draw the record does not carry: `lawof(record(y = y))` with
+/// `y ~ Normal(mu = z, sigma = 1)` and `z` a latent of the model but no field here.
 ///
 /// §04 "Reification to measures" makes `lawof(x)` the TOTAL law and, on its worked
 /// `prior_predictive = lawof(record(obs = obs))`, says which ancestors get integrated
@@ -1241,36 +1261,66 @@ fn refuse_stochastic_measure_law(m: &Module, arg: NodeId) -> Result<(), RefuseEr
 /// makes the sibling set incomplete, so the check stands down entirely rather than
 /// mistake a sibling for an outsider — that refusal is the caller's, with its own
 /// reason.
-fn refuse_stochastic_record_law(m: &Module, record_node: NodeId) -> Result<(), RefuseError> {
+///
+/// **Marginalizing does not re-implement the product.** A field whose outside ancestor a
+/// conjugate row can integrate out gets its own closed-form marginal MEASURE, and the
+/// whole record is then handed to [`lower_record_of_draws_with`] — so the remaining
+/// fields, the chain-rule sibling pinning, and the latent pins all stay that function's,
+/// and several fields may marginalize at once. `Ok(None)` means no field needed it.
+///
+/// A field that is a TRANSFORM of its draw (`b = y + z`) is refused rather than
+/// marginalized: its law is the pushforward of the marginal under that map, which is not
+/// what the table's row returns.
+fn marginalize_or_refuse_record_law(
+    m: &mut Module,
+    record_node: NodeId,
+    v: NodeId,
+) -> Result<Option<NodeId>, RefuseError> {
     let Some(rec) = expect_builtin_call(m, record_node, "record") else {
-        return Ok(());
+        return Ok(None);
     };
     let mut fields = Vec::with_capacity(rec.named.len());
     for field in rec.named.iter() {
         match resolve_component_draw(m, field.value) {
             Some((measure, _, transform, draw_site)) => {
-                fields.push((measure, transform, draw_site))
+                fields.push((field.name, measure, transform, draw_site))
             }
-            None => return Ok(()),
+            None => return Ok(None),
         }
     }
-    let siblings: Vec<NodeId> = fields.iter().map(|&(_, _, site)| site).collect();
-    for &(measure, transform, _) in &fields {
+    let siblings: Vec<NodeId> = fields.iter().map(|&(_, _, _, site)| site).collect();
+    let mut marginals: Vec<(Symbol, NodeId)> = Vec::new();
+    for &(name, measure, transform, _) in &fields {
         // The transform is walked as well as the measure: for `b = y + z` the outside
         // ancestor is in the MAP, which `build_forward_map` would read as a constant.
         let reaches = |node| measure_reaches_draw(m, node, &siblings);
-        if reaches(measure) || transform.is_some_and(reaches) {
-            return Err(refuse(
-                measure,
-                m,
-                "lawof of a record whose field law is parameterized by a draw the record does \
-                 not carry is that field's MARGINAL law (§04: lawof reifies the TOTAL law), \
-                 which is a kchain marginal — refuse rather than score the conditional at a \
-                 latent pinned by another query",
-            ));
+        if !(reaches(measure) || transform.is_some_and(reaches)) {
+            continue;
+        }
+        let marginal = if transform.is_some() {
+            None
+        } else {
+            crate::marginal::conjugate_marginal_measure(m, measure, &siblings)
+        };
+        match marginal {
+            Some(built) => marginals.push((name, built?)),
+            None => {
+                return Err(refuse(
+                    measure,
+                    m,
+                    "lawof of a record whose field law is parameterized by a draw the record \
+                     does not carry is that field's MARGINAL law (§04: lawof reifies the TOTAL \
+                     law), which is a kchain marginal and no conjugate closed-form applies — \
+                     refuse rather than score the conditional at a latent pinned by another \
+                     query",
+                ));
+            }
         }
     }
-    Ok(())
+    if marginals.is_empty() {
+        return Ok(None);
+    }
+    lower_record_of_draws_with(m, record_node, v, &marginals).map(Some)
 }
 
 /// Is `node`'s inferred type a measure EXPRESSION's — a measure, or a reification
@@ -1294,6 +1344,10 @@ fn is_measure_expr_type(m: &Module, node: NodeId) -> bool {
 /// value node from `v`, and — when the component reached us through a binding
 /// reference — that binding, so the driver can pin it to the scored value.
 struct Component {
+    /// The record field this component is, so a caller that pre-computed a
+    /// closed-form marginal for it can say WHICH field
+    /// ([`lower_record_of_draws_with`]).
+    name: Symbol,
     /// The distribution-constructor (or combinator) node `mᵢ`. For a
     /// transformed field (`transform = Some(call)`), this is the INNER draw's
     /// measure `Mᵢ`; the driver wraps it as `pushfwd(g, Mᵢ)` before scoring.
@@ -1327,7 +1381,38 @@ fn lower_record_of_draws(
     record_node: NodeId,
     v: NodeId,
 ) -> Result<NodeId, RefuseError> {
-    let components = match_independent_record(m, record_node, v)?;
+    lower_record_of_draws_with(m, record_node, v, &[])
+}
+
+/// [`lower_record_of_draws`] where the caller has already marginalized some fields:
+/// `marginals` replaces the named field's own measure with the closed-form marginal
+/// measure supplied for it.
+///
+/// Only [`marginalize_or_refuse_record_law`] passes a non-empty list, and only for a
+/// field whose measure is parameterized by a draw the record does not carry (§04 makes
+/// that field's law its marginal). The substitution is by field NAME rather than by
+/// rewriting the model, because the field's `y = draw(Normal(mu = z, …))` binding is
+/// shared: a `kernelof` body elsewhere CONDITIONS on `z` as a boundary input (§04's own
+/// exception), so rewriting the binding's measure to the marginal would silently drop
+/// that dependence.
+fn lower_record_of_draws_with(
+    m: &mut Module,
+    record_node: NodeId,
+    v: NodeId,
+    marginals: &[(Symbol, NodeId)],
+) -> Result<NodeId, RefuseError> {
+    let mut components = match_independent_record(m, record_node, v)?;
+    for comp in components.iter_mut() {
+        if let Some(&(_, marginal)) = marginals.iter().find(|(name, _)| *name == comp.name) {
+            // A marginalized field carries no transform: its law is the marginal
+            // itself, and a pushforward of it is refused upstream.
+            debug_assert!(
+                comp.transform.is_none(),
+                "marginalized field has a transform"
+            );
+            comp.measure = marginal;
+        }
+    }
 
     // Empty record (degenerate joint): a sum over no components. The independent-
     // product density is Σᵢ logdensityof(Mᵢ, xᵢ) (§06 "Density of composed measures"),
@@ -1439,6 +1524,7 @@ fn match_independent_record(
                 }
             };
         components.push(Component {
+            name: field.name,
             measure,
             pinned,
             draw_binding,
@@ -1739,21 +1825,23 @@ fn abstract_over_draw(
 /// nodes in the traced sub-DAG, not boundary inputs, so `lawof` integrates them
 /// out", the measure-algebra equivalent being `kchain(prior, forward_kernel)`. So
 /// for `y ~ Normal(mu = z, sigma = 1)` with `z` latent, `lawof(y)` is the MARGINAL
-/// of `y`, not `Normal(mu = z, …)`. Marginalizing is `crate::marginal`'s job and it
-/// is closed-form only for a discrete-finite latent, so refuse here. A merely FIXED
+/// of `y`, not `Normal(mu = z, …)`. Marginalizing is `crate::marginal`'s job:
+/// [`crate::marginal::conjugate_marginal_measure`] answers it in closed form for a
+/// recognised conjugate pair, and only a pair with no row refuses here. A merely FIXED
 /// or parametric parameter (`mu = elementof(reals)`) is not a stochastic ancestor
 /// and lowers unaffected — [`measure_reaches_draw`] tests for a reachable `draw`,
 /// not for a non-literal parameter.
 ///
-/// **What that guard is worth, precisely.** With the latent still latent, the
-/// query already refused without it, via the driver's residual-`draw` scan — so
-/// there the guard only improves the diagnosis. Its own justification is the
-/// LATER-query ordering — score `lawof(y)` first, then a second query that pins `z` —
-/// where nothing downstream refuses and the conditional density escaped as a finished
-/// number (`bare_lawof_scored_before_a_later_query_pins_the_latent_refuses`). The
+/// **What the guard is worth, precisely.** With the latent still latent, a pair with no
+/// row already refused without it, via the driver's residual-`draw` scan — so there the
+/// guard only improves the diagnosis. Its own justification is the LATER-query ordering —
+/// score `lawof(y)` first, then a second query that pins `z` — where nothing downstream
+/// refuses and the conditional density escaped as a finished number
+/// (`bare_lawof_scored_before_a_later_query_pins_the_latent_marginalizes`). The
 /// EARLIER-query ordering it reaches only through the pin provenance
 /// [`measure_reaches_draw`] reads: once `z = 0.3` nothing in the binding is left to
-/// test, so the pin itself has to record that it was a latent
+/// test, so the pin itself has to record that it was a latent, AND what its prior was
+/// ([`Module::query_pinned_rhs`], which is what lets the marginal be built at all)
 /// (`a_pinned_latent_is_not_a_fixed_parameter_bare_spelling`).
 ///
 /// Pinning the binding `x` came from is what keeps the residual `x = draw(M)`
@@ -1772,12 +1860,32 @@ fn lower_value_law(
 ) -> Option<Result<NodeId, RefuseError>> {
     let (measure, binding, transform, draw_site) = resolve_component_draw(m, value)?;
     if measure_reaches_draw(m, measure, &[]) {
+        // A TRANSFORMED value's law is the pushforward of the marginal under that map,
+        // which the table's row does not return — refuse rather than score the marginal
+        // at the transformed variate.
+        let marginal = if transform.is_some() {
+            None
+        } else {
+            crate::marginal::conjugate_marginal_measure(m, measure, &[])
+        };
+        if let Some(built) = marginal {
+            let scored = built.and_then(|marginal| lower_measure_density(m, marginal, v));
+            // Pin as the ancestor-free path does: the marginal consumed this value's
+            // `draw`, so the binding must not survive into the conformance check.
+            if scored.is_ok() && origin == VariateOrigin::Point {
+                if let Some(bid) = binding {
+                    m.pin_binding_to_query_point(bid, v);
+                }
+            }
+            return Some(scored);
+        }
         return Some(Err(refuse(
             measure,
             m,
             "the law of this value marginalizes over a stochastic ancestor of its own measure \
-             (§04: lawof reifies the TOTAL law), which is a kchain marginal — refuse rather than \
-             emit the conditional density at a pinned latent",
+             (§04: lawof reifies the TOTAL law), which is a kchain marginal and no conjugate \
+             closed-form applies — refuse rather than emit the conditional density at a pinned \
+             latent",
         )));
     }
     let law = match transform {
@@ -1856,41 +1964,101 @@ fn lower_value_law(
 /// pushforward's forward map (`pushfwd(functionof(u -> u + z), M)`), where a
 /// reachable draw genuinely does randomize the resulting law.
 fn measure_reaches_draw(m: &Module, node: NodeId, exempt: &[NodeId]) -> bool {
-    fn walk(m: &Module, node: NodeId, exempt: &[NodeId], path: &mut Vec<BindingId>) -> bool {
+    !measure_stochastic_ancestors(m, node, exempt).is_empty()
+}
+
+/// One stochastic ancestor of a measure expression, as reported by
+/// [`measure_stochastic_ancestors`].
+pub(crate) enum Ancestor {
+    /// A latent reached through a `(%ref self name)`: the binding symbol the measure
+    /// references it by, and its PRIOR measure (the `draw`'s argument).
+    Named { name: Symbol, prior: NodeId },
+    /// An ancestor with no `(name, prior)` pair to marginalize over — an inline
+    /// `draw(…)`, or a binding whose (pre-pin) right-hand side is not a bare `draw`.
+    Opaque,
+}
+
+/// Every stochastic ancestor [`measure_reaches_draw`] finds, described well enough to
+/// marginalize over: `crate::marginal` needs the latent's own symbol (to prove the
+/// likelihood feeds it to exactly the conjugating parameter) and its prior measure.
+///
+/// One walk serves both consumers so the guard and the marginal router cannot drift on
+/// what counts as an ancestor. See [`measure_reaches_draw`] for the walk's rules — the
+/// `lawof` stop, the pinned-binding provenance, and `exempt`.
+///
+/// A latent an earlier query pinned reports the prior the pin replaced
+/// ([`Module::query_pinned_rhs`]): the pin overwrote the binding with a literal, so the
+/// `draw(prior)` is reachable only through that provenance.
+pub(crate) fn measure_stochastic_ancestors(
+    m: &Module,
+    node: NodeId,
+    exempt: &[NodeId],
+) -> Vec<Ancestor> {
+    fn describe(via: Option<Symbol>, prior: Option<NodeId>) -> Ancestor {
+        match (via, prior) {
+            (Some(name), Some(prior)) => Ancestor::Named { name, prior },
+            _ => Ancestor::Opaque,
+        }
+    }
+    // `via` is the binding symbol of the ref hop taken IMMEDIATELY above `node`, and
+    // only that one: a draw reached through an intervening call (`mu = 2 * z`) is
+    // attributed to its own ref hop, never to the outer binding.
+    fn walk(
+        m: &Module,
+        node: NodeId,
+        via: Option<Symbol>,
+        exempt: &[NodeId],
+        path: &mut Vec<BindingId>,
+        out: &mut Vec<Ancestor>,
+    ) {
         match m.node(node) {
             Node::Ref(Ref {
                 ns: RefNs::SelfMod,
                 name,
             }) => {
                 let Some(bid) = m.binding_by_name(*name) else {
-                    return false;
+                    return;
                 };
                 if m.is_query_pinned(bid) {
-                    return true; // a latent an earlier query replaced with its point
+                    // A latent an earlier query replaced with its point. Its own prior
+                    // is only in the pin's provenance now.
+                    let prior = m
+                        .query_pinned_rhs(bid)
+                        .and_then(|rhs| draw_argument(m, rhs));
+                    out.push(describe(Some(*name), prior));
+                    return;
                 }
                 if path.contains(&bid) {
-                    return false; // cyclic definition — stop rather than recurse forever
+                    return; // cyclic definition — stop rather than recurse forever
                 }
                 path.push(bid);
-                let found = walk(m, m.binding(bid).rhs, exempt, path);
+                walk(m, m.binding(bid).rhs, Some(*name), exempt, path, out);
                 path.pop();
-                found
             }
             Node::Call(c) => {
                 // A `draw` IS the stochastic ancestor; no need to look inside it.
-                if draw_argument(m, node).is_some() {
-                    return !exempt.contains(&node);
+                if let Some(prior) = draw_argument(m, node) {
+                    if !exempt.contains(&node) {
+                        out.push(describe(via, Some(prior)));
+                    }
+                    return;
                 }
                 if matches!(builtin_name(m, node), Some("lawof")) {
-                    return false;
+                    return;
                 }
-                c.args.iter().any(|&arg| walk(m, arg, exempt, path))
-                    || c.named.iter().any(|n| walk(m, n.value, exempt, path))
+                for &arg in c.args.iter() {
+                    walk(m, arg, None, exempt, path, out);
+                }
+                for n in c.named.iter() {
+                    walk(m, n.value, None, exempt, path, out);
+                }
             }
-            _ => false,
+            _ => {}
         }
     }
-    walk(m, node, exempt, &mut Vec::new())
+    let mut out = Vec::new();
+    walk(m, node, None, exempt, &mut Vec::new(), &mut out);
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -5363,23 +5531,24 @@ pub(crate) fn build_density_term(
 /// otherwise we hand the (original, unresolved) measure node straight to the
 /// dispatcher, which itself resolves one ref level and dispatches by op.
 ///
+/// The `bool` reports whether a `lawof` was stripped. The strip bypasses the
+/// dispatcher's `"lawof"` arm entirely, so §04's total-law reading — and hence the
+/// caller's [`marginalize_or_refuse_stochastic_law`] — has to be applied here too:
+/// `logdensityof(lawof(Normal(mu = a, …)), 0.5)` with `a` latent reaches
+/// `build_density_term` directly and would otherwise score the conditional.
+///
 /// Takes the measure argument node directly (not the enclosing `logdensityof`
 /// query), so it works on a grafted node the caller substituted for the original
 /// cross-module ref.
-fn measure_of_arg(m: &Module, measure_arg: NodeId) -> Result<NodeId, RefuseError> {
+fn measure_of_arg(m: &Module, measure_arg: NodeId) -> Result<(NodeId, bool), RefuseError> {
     let (resolved, _) = resolve_ref_one(m, measure_arg);
     if let Some(law) = expect_builtin_call(m, resolved, "lawof") {
         if law.args.len() != 1 {
             return Err(refuse(resolved, m, "lawof expects 1 arg"));
         }
-        // This strip bypasses the dispatcher's `"lawof"` arm entirely, so the
-        // marginalization guard has to run here too — `logdensityof(lawof(Normal(mu
-        // = a, …)), 0.5)` with `a` latent reaches `build_density_term` directly and
-        // would otherwise score the conditional.
-        refuse_stochastic_measure_law(m, law.args[0])?;
-        return Ok(law.args[0]);
+        return Ok((law.args[0], true));
     }
-    Ok(measure_arg)
+    Ok((measure_arg, false))
 }
 
 // ---------------------------------------------------------------------------
