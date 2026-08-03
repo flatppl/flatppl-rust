@@ -133,6 +133,32 @@ fn is_flatpdl_accepts_builtin_sample_with_and_without_a_shape() {
     );
 }
 
+/// The arity count is positional PLUS named, so a keyword spelling is counted the
+/// same as the positional one and is not falsely flagged at three arguments. No
+/// determiniser emission site produces a named argument on a `builtin_*` primitive,
+/// so this is the only cover the named half of the count has.
+#[test]
+fn builtin_primitive_arity_counts_named_arguments() {
+    let ok = infer_module("y = builtin_logdensityof(kernel = 1.0, kernel_input = 2.0, x = 3.0)\n");
+    assert!(
+        !is_flatpdl(&ok).err().is_some_and(|v| v
+            .iter()
+            .any(|n| matches!(n.kind, NonConformKind::BuiltinArity))),
+        "three named arguments must not be arity-flagged; got: {:?}",
+        is_flatpdl(&ok)
+    );
+
+    let bad = infer_module(
+        "y = builtin_logdensityof(kernel = 1.0, kernel_input = 2.0, x = 3.0, extra = 4.0)\n",
+    );
+    let v = is_flatpdl(&bad).expect_err("a fourth named argument is non-conformant");
+    assert!(
+        v.iter()
+            .any(|n| matches!(n.kind, NonConformKind::BuiltinArity) && n.reason.contains("got 4")),
+        "expected a BuiltinArity violation reporting four arguments; got: {v:?}"
+    );
+}
+
 /// The surface printer spells a builtin call and a user call the same way —
 /// `f(x)` either way — so surface syntax cannot show an external gate whether a
 /// determinised module carries a residual user call. FlatPIR (§11) keeps the head

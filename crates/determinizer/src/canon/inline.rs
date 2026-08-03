@@ -1,17 +1,18 @@
 //! Pass 2: inline residual user-defined function/kernel calls so no
 //! `(%call User ...)` reaches consumers (Buffy #263; unblocks #261).
 //!
-//! `is_flatpdl` (`conformance.rs`) never flagged a residual `CallHead::User`
-//! call — it only rejects Measure/Likelihood-typed nodes, stray Kernel types,
-//! and `Stochastic` phase — so a determinized module could carry a live
-//! `(%call (%ref self scale) 1.5)` and still report FlatPDL-conformant. That
-//! residual is exactly what flatppl-js cannot evaluate on the score path
+//! A live `(%call (%ref self scale) 1.5)` is exactly what flatppl-js cannot
+//! evaluate on the score path
 //! (Buffy #261): FlatPDL is defined as deterministic ops + the six
 //! `builtin_*` primitives, and a call to a user function is neither. This
-//! pass beta-reduces every such call away rather than widening
-//! `is_flatpdl`'s reject list, because a residual call CAN always be
-//! inlined here (unlike a genuinely un-lowerable measure op) — eliminating
-//! it is strictly more useful than merely detecting it.
+//! pass beta-reduces every such call away, because eliminating one is strictly
+//! more useful than merely detecting it.
+//!
+//! `is_flatpdl` (`conformance.rs`) also rejects a residual `CallHead::User`
+//! (`NonConformKind::ResidualUserCall`), so a call this pass CANNOT reduce
+//! refuses at the driver's exit gate instead of reporting FlatPDL-conformant.
+//! Two shapes reach it: an unresolved callee, and an arity mismatch at the call
+//! site.
 
 use flatppl_core::{CallHead, Module, Node, NodeId};
 
@@ -21,10 +22,10 @@ use crate::kernel::reduce_kernel_application;
 /// Replace each `(%call User(callee) args)` with its beta-reduced body. Reuses
 /// `reduce_kernel_application` (which resolves the reified callee, binds inputs
 /// by position/keyword/record-splat, and substitutes via `substitute_ref`). A
-/// call it cannot reduce (unresolved callee, arity mismatch) is left in place
-/// — refuse-free; `is_flatpdl` never flagged this shape either way, so leaving
-/// one in place changes nothing about conformance, only about whether a
-/// consuming engine can evaluate it.
+/// call it cannot reduce (unresolved callee, arity mismatch) is left in place —
+/// this pass itself stays refuse-free — and `is_flatpdl` then rejects it at the
+/// driver's exit gate, so the module refuses rather than reaching a consuming
+/// engine that cannot evaluate it.
 pub(crate) fn inline_user_calls(m: &mut Module) -> bool {
     let mut changed = false;
     let pairs: Vec<(flatppl_core::BindingId, NodeId)> =
