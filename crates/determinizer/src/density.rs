@@ -2955,9 +2955,13 @@ fn refuse_truncation_set_kind_mismatch(
 }
 
 /// The element kind of a truncation set argument, in [`VariateKind`] — the same
-/// vocabulary the variate is read into, so the two compare directly — with the
-/// set's own surface spelling, for the refusal message. `None` where the argument
-/// proves no kind.
+/// vocabulary the variate is read into, so the two compare directly — with a
+/// rendering of the set to name it in the refusal. `None` where the argument proves
+/// no kind.
+///
+/// The rendering is the §03 name for a predefined set, and otherwise the CANONICAL
+/// value-set rendering, which need not be what the user typed:
+/// `cartprod(a = interval(0, inf))` renders `record(a: interval(0, inf))`.
 ///
 /// One level of ref indirection is resolved, so a preset set binding
 /// (`S = interval(0, 1)` … `truncate(M, S)`) is covered too.
@@ -2965,11 +2969,8 @@ fn truncation_set_kind(m: &Module, s_node: NodeId) -> Option<(VariateKind, Strin
     let (s, _) = resolve_ref_one(m, s_node);
     // A named set first: a bare `Node::Const`'s own value-set annotation is
     // `anything`, which would both prove nothing and misname the set.
-    if let Some(kind) = predefined_set_kind(m, s) {
-        let Node::Const(sym) = m.node(s) else {
-            unreachable!("predefined_set_kind matches only a Const")
-        };
-        return Some((kind, m.resolve(*sym).to_string()));
+    if let Some(named) = predefined_set_kind(m, s) {
+        return Some(named);
     }
     let set = m.valueset_of(s)?;
     Some((set_element_kind(set)?, m.display_valueset(set)))
@@ -3000,16 +3001,19 @@ fn set_element_kind(set: &ValueSet) -> Option<VariateKind> {
     }
 }
 
-/// The element kind of a §03 predefined set named by a bare `Node::Const`, which
-/// carries no value-set annotation of its own. Every predefined set is a set of
+/// The element kind and name of a §03 predefined set named by a bare `Node::Const`,
+/// which carries no value-set annotation of its own. Every predefined set is a set of
 /// scalars except `anything` and `rngstates`, which prove no kind.
-fn predefined_set_kind(m: &Module, s: NodeId) -> Option<VariateKind> {
+fn predefined_set_kind(m: &Module, s: NodeId) -> Option<(VariateKind, String)> {
     let Node::Const(sym) = m.node(s) else {
         return None;
     };
-    match m.resolve(*sym) {
+    let name = m.resolve(*sym);
+    match name {
         "reals" | "posreals" | "nonnegreals" | "unitinterval" | "integers" | "posintegers"
-        | "nonnegintegers" | "booleans" | "complexes" => Some(VariateKind::Scalar),
+        | "nonnegintegers" | "booleans" | "complexes" => {
+            Some((VariateKind::Scalar, name.to_string()))
+        }
         _ => None,
     }
 }

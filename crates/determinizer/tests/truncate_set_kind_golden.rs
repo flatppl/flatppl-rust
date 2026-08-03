@@ -54,6 +54,23 @@ fn record_variate_truncated_by_a_scalar_set_refuses() {
 }
 
 #[test]
+fn a_preset_set_binding_refuses_through_the_ref() {
+    // The one level of ref indirection `truncation_set_kind` resolves: the set argument
+    // is a `%ref` to a preset binding, not the constructor call.
+    let reason = refusal(
+        "S = interval(0.0, inf)\n\
+         mb = Normal(mu = 0.0, sigma = 1.0)\n\
+         x = draw(mb)\n\
+         m = truncate(lawof(record(x = x)), S)\n\
+         lp = logdensityof(m, record(x = 0.5))",
+    );
+    assert!(
+        reason.contains("set of scalars") && reason.contains("a record"),
+        "a preset set binding must refuse through the ref, got: {reason}"
+    );
+}
+
+#[test]
 fn scalar_variate_truncated_by_a_vector_set_refuses() {
     // The mismatch in the other direction, and the other kind.
     let reason = refusal(
@@ -106,20 +123,40 @@ fn matching_spaces_still_lower() {
 
 #[test]
 fn an_unprovable_set_kind_still_lowers() {
-    // Refuse on proof, not on absence of evidence. `interval(lo, hi)` over non-literal
-    // bounds reads as no value-set at all, and `anything` "signals that no specific
-    // type constraint is imposed" (§03) — neither proves a mismatch, so both lower.
-    for set in ["interval(lo, inf)", "anything"] {
-        let out = lp(&format!(
+    // Refuse on proof, not on absence of evidence. Each set below fails to prove a
+    // kind, so none of them refuses — against variates a PROVEN kind would refuse.
+    let record_variate = |set: &str| {
+        format!(
             "lo = 0.0\n\
              mb = Normal(mu = 0.0, sigma = 1.0)\n\
              x = draw(mb)\n\
              m = truncate(lawof(record(x = x)), {set})\n\
              lp = logdensityof(m, record(x = 0.5))"
-        ));
+        )
+    };
+    for (label, src) in [
+        // Non-literal bounds: inference reads no value-set off the `interval` at all.
+        ("non-literal interval", record_variate("interval(lo, inf)")),
+        // §03: `anything` "signals that no specific type constraint is imposed".
+        ("anything", record_variate("anything")),
+        // §03: `rngstates` members are "algorithm-dependent opaque values".
+        ("rngstates", record_variate("rngstates")),
+        (
+            // §03 makes a power over a record set the set of tables, but
+            // `ValueSet::natural_of` gives an array-OF-records type the identical
+            // value-set — so it proves neither Table nor Vector, and a scalar variate
+            // (which both would refuse) must still lower.
+            "cartpow over a record set",
+            "m = truncate(Normal(mu = 0.0, sigma = 1.0), \
+               cartpow(cartprod(a = reals, b = posreals), 2))\n\
+             lp = logdensityof(m, 0.5)"
+                .to_string(),
+        ),
+    ] {
+        let out = lp(&src);
         assert!(
             out.contains("builtin_logdensityof"),
-            "`{set}` proves no mismatch and must lower:\n{out}"
+            "{label} proves no mismatch and must lower:\n{out}"
         );
     }
 }
