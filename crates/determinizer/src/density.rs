@@ -2792,13 +2792,16 @@ fn lower_pushfwd(
 
     // Extract f_inv and logvol: from an explicit bijection node if present,
     // otherwise synthesise them for a known invertible forward builtin.
-    // Structural projection (§06 case 2): `pushfwd(fn(get(_, [fields])), M)` is a
+    // Structural projection (§06 case 2): `pushfwd(fn(get(_, [sel])), M)` is a
     // MARGINALIZATION, not a bijection — `get` has no inverse, so it never reaches
     // the change-of-variables path. Recognise it up front and lower the closed-form
     // marginal over the SELECTED components (the unselected components integrate to
-    // 1 and drop). Only over an explicit field-keyed product; otherwise refuse.
-    if let Some(fields) = recognize_get_projection(m, bij_resolved) {
-        return lower_projection_pushfwd(m, m_inner, &fields, v);
+    // 1 and drop). Only over an explicit product; otherwise refuse — and refuse
+    // NAMING the missing product structure, which is why recognition happens here
+    // rather than leaving a projection to be misreported as an unrecognised
+    // forward map by the bijection synthesis below.
+    if let Some(proj) = recognize_get_projection(m, bij_resolved) {
+        return lower_projection_pushfwd(m, m_inner, &proj, v);
     }
 
     // `M`'s variate domain: what the analytic synthesis dispatches its
@@ -3221,21 +3224,43 @@ fn lower_locscale(
     }
 }
 
-/// Recognise a **pure structural-projection** forward function
-/// `fn(get(_, ["a", "c", …]))` — a one-input `functionof` lambda whose body is
-/// exactly `get(<the input placeholder>, vector("a", "c", …))` (§06 case 2). On
-/// a match, return the selected field-name strings, in selection order.
+/// Which components a §06 case-2 projection selects.
+enum Selector {
+    /// Field names, in selection order — a FIELD-KEYED product's components.
+    Names(Vec<Box<str>>),
+    /// Component positions, in selection order, as WRITTEN — an INDEX-KEYED
+    /// product's slots. `one_based` records which `get` spelling supplied them
+    /// (`get` is 1-based, `get0` 0-based, §07 `get0`), so the lowering can refuse
+    /// an out-of-range index by the user's own convention instead of wrapping it.
+    Indices { raw: Vec<i64>, one_based: bool },
+}
+
+/// A recognised **pure structural projection** forward function (§06 case 2).
+struct GetProjection {
+    sel: Selector,
+    /// `true` for a SUBSET selector `get(_, [a, b])` — §06 case 2's pattern; the
+    /// projected variate keeps the product's shape over the selected components.
+    /// `false` for single-element access `get(_, a)`, whose projected variate is
+    /// the component's own — recognised only so the lowering can refuse it by
+    /// name rather than let it fall through to the bijection diagnostic.
+    subset: bool,
+}
+
+/// Recognise a pure structural-projection forward function `fn(get(_, sel))` — a
+/// one-input `functionof` lambda whose body is exactly `get(<the input
+/// placeholder>, sel)` or `get0(<placeholder>, sel)` (§06 case 2). `sel` is a
+/// `vector` literal of field names or of integer indices (the subset selector), or
+/// a single such literal (element access).
 ///
 /// The projection must be PURE: the `get`'s first argument is the bare input
-/// placeholder (no wrapping transform) and its second argument is a `vector`
-/// literal of field-name strings. A `get` that also transforms, indexes by
-/// position, or selects via a computed key is NOT this pattern (`None`) — the
-/// caller then treats the forward as a bijection candidate / refuses.
+/// placeholder (no wrapping transform) and its selector is a literal. A `get` that
+/// also transforms, or selects via a computed key, is NOT this pattern (`None`) —
+/// the caller then treats the forward as a bijection candidate / refuses.
 ///
 /// Field names are returned as owned strings (not interned `Symbol`s) so this
 /// stays an immutable read; the caller matches them against the product's
 /// component names by resolving each component symbol to its string.
-fn recognize_get_projection(m: &Module, f: NodeId) -> Option<Vec<Box<str>>> {
+fn recognize_get_projection(m: &Module, f: NodeId) -> Option<GetProjection> {
     // f = functionof with exactly one %local placeholder input.
     let Node::Call(c) = m.node(f) else {
         return None;
@@ -3254,8 +3279,11 @@ fn recognize_get_projection(m: &Module, f: NodeId) -> Option<Vec<Box<str>>> {
     }
     let ph = entries[0].1.name;
 
-    // body = get(<ph>, vector("a", …)) — a pure field selection.
-    let get = expect_builtin_call(m, c.args[0], "get")?;
+    // body = get(<ph>, sel) / get0(<ph>, sel) — a pure selection.
+    let (get, one_based) = match expect_builtin_call(m, c.args[0], "get") {
+        Some(g) => (g, true),
+        None => (expect_builtin_call(m, c.args[0], "get0")?, false),
+    };
     if get.args.len() != 2 || !get.named.is_empty() {
         return None;
     }
@@ -3263,8 +3291,54 @@ fn recognize_get_projection(m: &Module, f: NodeId) -> Option<Vec<Box<str>>> {
     if !matches!(m.node(get.args[0]), Node::Ref(Ref { ns: RefNs::Local, name }) if *name == ph) {
         return None;
     }
-    // Second arg is a non-empty `vector` of string literals (the selected fields).
-    string_literal_vector(m, get.args[1])
+    let sel = get.args[1];
+    // Subset selector: a non-empty `vector` of string literals (fields) or of
+    // integer literals (component slots).
+    if let Some(names) = string_literal_vector(m, sel) {
+        return Some(GetProjection {
+            sel: Selector::Names(names),
+            subset: true,
+        });
+    }
+    if let Some(raw) = int_literal_vector(m, sel) {
+        return Some(GetProjection {
+            sel: Selector::Indices { raw, one_based },
+            subset: true,
+        });
+    }
+    // Single-element access: a bare string or integer literal.
+    match m.node(sel) {
+        Node::Lit(Scalar::Str(s)) => Some(GetProjection {
+            sel: Selector::Names(vec![s.clone()]),
+            subset: false,
+        }),
+        Node::Lit(Scalar::Int(i)) => Some(GetProjection {
+            sel: Selector::Indices {
+                raw: vec![*i],
+                one_based,
+            },
+            subset: false,
+        }),
+        _ => None,
+    }
+}
+
+/// Read a `vector(1, 3, …)` node as owned INTEGER literals, in order, or `None` if
+/// it is not a non-empty positional vector of integer literals. The index-keyed
+/// counterpart of [`string_literal_vector`].
+fn int_literal_vector(m: &Module, node: NodeId) -> Option<Vec<i64>> {
+    let vec = expect_builtin_call(m, node, "vector")?;
+    if !vec.named.is_empty() || vec.args.is_empty() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(vec.args.len());
+    for &a in vec.args.iter() {
+        let Node::Lit(Scalar::Int(i)) = m.node(a) else {
+            return None; // a non-integer entry is not an index list
+        };
+        out.push(*i);
+    }
+    Some(out)
 }
 
 /// Read a `vector("a", "b", …)` node as owned STRING-literal strings, in order,
@@ -3320,6 +3394,37 @@ fn string_literal_vector(m: &Module, node: NodeId) -> Option<Vec<Box<str>>> {
 /// marginal here and refuses (§06 case 2 permits "compute numerically or report a
 /// static error").
 fn lower_projection_pushfwd(
+    m: &mut Module,
+    m_inner_expr: NodeId,
+    proj: &GetProjection,
+    v: NodeId,
+) -> Result<NodeId, RefuseError> {
+    // §06 case 2's pattern is the SUBSET selector `get(_, [...])`. Single-element
+    // access `get(_, k)` projects onto ONE component and changes the variate KIND
+    // (the point is the component's own variate, not a sub-product's), so it needs
+    // its own point mapping and is not covered by the sub-product marginal below.
+    // Refuse by name — the diagnostic is the whole value of recognising it here.
+    if !proj.subset {
+        let (m_inner, _) = resolve_ref_one(m, m_inner_expr);
+        return Err(refuse(
+            m_inner,
+            m,
+            "structural projection (§06 case 2) is recognised for the SUBSET selector \
+             `pushfwd(fn(get(_, [k, …])), M)`; single-element access `get(_, k)` projects onto \
+             one component and changes the variate kind — write the subset form and score at a \
+             one-component point — refuse rather than mislower",
+        ));
+    }
+    match &proj.sel {
+        Selector::Names(fields) => lower_named_projection(m, m_inner_expr, fields, v),
+        Selector::Indices { raw, one_based } => {
+            lower_index_projection(m, m_inner_expr, raw, *one_based, v)
+        }
+    }
+}
+
+/// The FIELD-NAME arm of [`lower_projection_pushfwd`].
+fn lower_named_projection(
     m: &mut Module,
     m_inner_expr: NodeId,
     fields: &[Box<str>],
@@ -3435,7 +3540,7 @@ fn lower_projection_pushfwd(
                 if !identity {
                     return Err(refuse_jointchain_relabel_rename(m, inner_resolved));
                 }
-                return lower_projection_pushfwd(m, inner, fields, v);
+                return lower_named_projection(m, inner, fields, v);
             }
             let components = independent_product_components(m, inner)?;
             if labels.len() != components.len() {
@@ -3466,7 +3571,7 @@ fn lower_projection_pushfwd(
                 named: named.into(),
                 inputs: None,
             }));
-            lower_projection_pushfwd(m, materialized, fields, v)
+            lower_named_projection(m, materialized, fields, v)
         }
         // `jointchain` is a DEPENDENT product: a component's kernel reads earlier
         // variates. A projection keeping a dependency-respecting LEADING PREFIX of
@@ -3481,15 +3586,327 @@ fn lower_projection_pushfwd(
             m_inner,
             m,
             &format!(
-                "structural projection (§06 case 2) is closed-form only over an explicit \
-                 FIELD-KEYED product (keyword `joint` / record-of-draws) or an index-keyed \
-                 product named by `relabel` (iid / positional joint); got `{}` — a bare \
-                 index-keyed product projected by field name, or a non-product measure, has \
-                 no closed-form field-keyed marginal here — refuse rather than mislower",
+                "structural projection (§06 case 2) by FIELD NAME is closed-form only over an \
+                 explicit field-keyed product (keyword `joint` / record-of-draws / `jointchain`) \
+                 or an index-keyed product named by `relabel` (iid / positional joint); got `{}`, \
+                 which has no explicit product structure to select a field of — §06 case 2 \
+                 permits refusing a projection off a non-product measure — refuse rather than \
+                 mislower",
                 other.unwrap_or("<non-builtin>")
             ),
         )),
     }
+}
+
+/// The INDEX arm of [`lower_projection_pushfwd`]: `pushfwd(fn(get(_, [i, …])), M)`
+/// over an INDEX-KEYED product — an `iid`, a positional `joint`, or a scalar-cat
+/// `jointchain` — whose variate is an array / `cat` vector addressed by position.
+///
+/// The marginal is the sub-product over the selected slots, scored at the projected
+/// point's own slots `0 … k-1`: for an independent product the unselected
+/// components integrate to 1 and drop (§06 "joint and iid (independent
+/// products)"), so the marginal is the sum of the kept components' densities. This
+/// emits that sum directly against `get0(v, j)` — the same per-slot unroll
+/// [`lower_iid`] and [`lower_joint`] use — because a synthesised sub-`iid` node
+/// would carry no inferred domain for [`iid_static_size`] to read.
+///
+/// **Scope (refuse-don't-mislower).** A FIELD-keyed product (keyword `joint`,
+/// record-of-draws, `relabel`, a record-family `jointchain`) has a record variate
+/// that an integer slot does not address — refuse and name the by-field spelling.
+/// A `jointchain` is a DEPENDENT product: only a leading PREFIX keep is closed-form
+/// (the dropped trailing kernels are normalized Markov kernels that integrate to
+/// 1); any other keep is the `kchain` integral and refuses.
+fn lower_index_projection(
+    m: &mut Module,
+    m_inner_expr: NodeId,
+    raw: &[i64],
+    one_based: bool,
+    v: NodeId,
+) -> Result<NodeId, RefuseError> {
+    let (m_inner, _) = resolve_ref_one(m, m_inner_expr);
+    match builtin_name(m, m_inner) {
+        // `iid(M, n)`: every slot is the SAME `M`, so the marginal over any k slots
+        // is `M^⊗k` — the k-fold sum of `M`'s density at the projected point's
+        // slots. Correct for a non-scalar `M` too: `iid`'s variate has a leading
+        // repeat axis, so `get0(v, j)` recovers a whole `M`-variate row (the
+        // asymmetry [`lower_iid`]'s unroll documents).
+        Some("iid") => {
+            let n = iid_static_size(m, m_inner).ok_or_else(|| {
+                refuse(
+                    m_inner,
+                    m,
+                    "structural projection over an iid whose size is not a statically-resolved \
+                     1-D count (dynamic / multi-axis / unresolved) — its slots cannot be \
+                     selected by position — refuse rather than mislower",
+                )
+            })?;
+            let inner = {
+                let c = expect_builtin_call(m, m_inner, "iid")
+                    .ok_or_else(|| refuse(m_inner, m, "expected iid"))?;
+                if c.args.len() != 2 {
+                    return Err(refuse(m_inner, m, "iid expects 2 args (measure, size)"));
+                }
+                c.args[0]
+            };
+            let kept = normalize_selected_indices(m, m_inner, raw, one_based, n)?;
+            // Every dropped slot is a copy of this one `M`, so one mass read covers
+            // them all.
+            if kept.len() < n {
+                refuse_unnormalized_dropped_component(m, m_inner, inner, "iid component")?;
+            }
+            let terms = kept
+                .iter()
+                .enumerate()
+                .map(|(j, _)| {
+                    let idx = m.alloc(Node::Lit(Scalar::Int(j as i64)));
+                    let elem = build_call(m, "get0", &[v, idx]);
+                    lower_measure_density(m, inner, elem)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(fold_add(m, &terms))
+        }
+        // Positional `joint(M₁, …, Mₖ)`: the variate is the flat `cat` of the
+        // components' variates, so a slot index addresses a component only when
+        // EVERY component is scalar — the same guard [`lower_joint`] applies before
+        // its own `get0` slicing, and required of dropped components too, since a
+        // non-scalar one would shift every later slot.
+        Some("joint") => {
+            let comps = {
+                let c = expect_builtin_call(m, m_inner, "joint")
+                    .ok_or_else(|| refuse(m_inner, m, "expected joint"))?;
+                if !c.named.is_empty() {
+                    return Err(refuse(
+                        m_inner,
+                        m,
+                        "structural projection by INDEX over a KEYWORD joint: its variate is a \
+                         record keyed by field name, which an integer slot does not address — \
+                         project it by name (`get(_, [\"a\", …])`) — refuse rather than mislower",
+                    ));
+                }
+                if c.args.len() < 2 {
+                    return Err(refuse(m_inner, m, "joint needs at least 2 components"));
+                }
+                c.args.to_vec()
+            };
+            for &comp in &comps {
+                let (resolved, _) = resolve_ref_one(m, comp);
+                let kind = match m.type_of(resolved) {
+                    Some(Type::Measure { domain, .. }) => variate_kind(domain),
+                    _ => None,
+                };
+                if kind != Some(VariateKind::Scalar) {
+                    return Err(refuse(
+                        comp,
+                        m,
+                        "structural projection by index over a positional joint needs every \
+                         component's variate CONFIRMED scalar (a non-scalar or unresolved \
+                         component occupies several `cat` slots, so an index no longer names a \
+                         component) — refuse rather than mislower",
+                    ));
+                }
+            }
+            let kept = normalize_selected_indices(m, m_inner, raw, one_based, comps.len())?;
+            for (i, &comp) in comps.iter().enumerate() {
+                if !kept.contains(&i) {
+                    refuse_unnormalized_dropped_component(
+                        m,
+                        m_inner,
+                        comp,
+                        &format!("joint component {}", i + 1),
+                    )?;
+                }
+            }
+            let terms = kept
+                .iter()
+                .enumerate()
+                .map(|(j, &i)| {
+                    let idx = m.alloc(Node::Lit(Scalar::Int(j as i64)));
+                    let elem = build_call(m, "get0", &[v, idx]);
+                    lower_measure_density(m, comps[i], elem)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(fold_add(m, &terms))
+        }
+        Some("jointchain") => lower_scalar_chain_index_projection(m, m_inner, raw, one_based, v),
+        // A `relabel` names an index-keyed product's slots, giving it a RECORD
+        // variate (§06); a record-of-draws is field-keyed from the start. Neither is
+        // addressed by an integer slot.
+        Some("relabel") | Some("record") => Err(refuse(
+            m_inner,
+            m,
+            "structural projection by INDEX over a field-keyed measure (`relabel(...)` names its \
+             component slots, a record-of-draws is keyed by field): its variate is a record, \
+             which an integer slot does not address — project it by name — refuse rather than \
+             mislower",
+        )),
+        other => Err(refuse(
+            m_inner,
+            m,
+            &format!(
+                "structural projection (§06 case 2) by INDEX is closed-form only over an \
+                 index-keyed product (`iid`, positional `joint`, scalar-cat `jointchain`); got \
+                 `{}`, which has no explicit product structure to select a slot of — §06 case 2 \
+                 permits refusing a projection off a non-product measure — refuse rather than \
+                 mislower",
+                other.unwrap_or("<non-builtin>")
+            ),
+        )),
+    }
+}
+
+/// Lower an INDEX projection over a SCALAR-CAT `jointchain` (variate = the `cat`
+/// of the components' scalar draws) that keeps a **dependency-respecting leading
+/// prefix**, the index-keyed twin of [`lower_jointchain_projection`].
+///
+/// A record-family chain refuses here: its variate is a record, addressed by field
+/// name, not by slot.
+fn lower_scalar_chain_index_projection(
+    m: &mut Module,
+    node: NodeId,
+    raw: &[i64],
+    one_based: bool,
+    v: NodeId,
+) -> Result<NodeId, RefuseError> {
+    if crate::jointchain::record_variate_fields(m, node).is_some() {
+        return Err(refuse(
+            node,
+            m,
+            "structural projection by INDEX over a RECORD-family `jointchain`: its variate is a \
+             record keyed by the components' field names, which an integer slot does not address \
+             — project it by name — refuse rather than mislower",
+        ));
+    }
+    let args: Vec<NodeId> = {
+        let c = expect_builtin_call(m, node, "jointchain")
+            .ok_or_else(|| refuse_jointchain_projection(m, node))?;
+        if !c.named.is_empty() || c.args.len() < 2 {
+            return Err(refuse_jointchain_projection(m, node));
+        }
+        c.args.to_vec()
+    };
+    let kept = normalize_selected_indices(m, node, raw, one_based, args.len())?;
+    let k = kept.len();
+    // Dependency-respecting PREFIX keep ⇔ the kept slots are exactly the leading
+    // {0, …, k-1}; any other keep drops a slot a kept or later kernel reads, which
+    // is the intractable `kchain` integral.
+    let mut sorted = kept;
+    sorted.sort_unstable();
+    if !sorted.iter().copied().eq(0..k) {
+        return Err(refuse_jointchain_nonprefix(m, node));
+    }
+    // Each dropped trailing kernel must be a confirmed normalized Markov kernel to
+    // integrate to 1 and drop — read from the kernel BODY, never the kernel-type
+    // mass (see [`lower_jointchain_projection`]).
+    for &dropped in &args[k..] {
+        if !crate::jointchain::kernel_body_is_normalized(m, dropped) {
+            return Err(refuse(
+                node,
+                m,
+                "structural projection over a `jointchain` drops a trailing kernel whose body is \
+                 not a confirmed normalized probability measure, so dropping it would silently \
+                 omit mass from the marginal — refuse rather than mislower",
+            ));
+        }
+    }
+    if k == 1 {
+        // Keep the base slot alone: the marginal is the base measure's density at
+        // the projected point's slot 0.
+        let idx = m.alloc(Node::Lit(Scalar::Int(0)));
+        let elem = build_call(m, "get0", &[v, idx]);
+        lower_measure_density(m, args[0], elem)
+    } else {
+        let jointchain_sym = m.intern("jointchain");
+        let sub = m.alloc(Node::Call(Call {
+            head: CallHead::Builtin(jointchain_sym),
+            args: args[..k].to_vec().into(),
+            named: Vec::<NamedArg>::new().into(),
+            inputs: None,
+        }));
+        crate::jointchain::lower_jointchain(m, sub, v)
+    }
+}
+
+/// Normalize a projection's written indices to 0-based component positions over an
+/// `n`-slot product, in selection order.
+///
+/// Refuses an out-of-range index (reported in the user's own convention — `get` is
+/// 1-based, `get0` 0-based, §07 `get0`) and a DUPLICATE selection, which would
+/// score one component twice and double-count its density term.
+fn normalize_selected_indices(
+    m: &Module,
+    node: NodeId,
+    raw: &[i64],
+    one_based: bool,
+    n: usize,
+) -> Result<Vec<usize>, RefuseError> {
+    let (lo, hi) = if one_based {
+        (1, n as i64)
+    } else {
+        (0, n as i64 - 1)
+    };
+    let mut out = Vec::with_capacity(raw.len());
+    for &i in raw {
+        if i < lo || i > hi {
+            return Err(refuse(
+                node,
+                m,
+                &format!(
+                    "structural projection selects index {i}, outside {lo}..={hi} for this \
+                     {n}-component product ({} indexing, §07 `get0`) — refuse rather than \
+                     mislower",
+                    if one_based {
+                        "`get` is 1-based"
+                    } else {
+                        "`get0` is 0-based"
+                    }
+                ),
+            ));
+        }
+        let idx = (i - lo) as usize;
+        if out.contains(&idx) {
+            return Err(refuse(
+                node,
+                m,
+                &format!(
+                    "structural projection selects index {i} twice — the sub-product would score \
+                     that component twice, double-counting its density term — refuse rather than \
+                     mislower"
+                ),
+            ));
+        }
+        out.push(idx);
+    }
+    Ok(out)
+}
+
+/// Refuse if a DROPPED component of an index-keyed product is not a CONFIRMED
+/// `Mass::Normalized` probability measure — the index-keyed counterpart of
+/// [`refuse_unnormalized_dropped_fields`], and the same identity: `∫ M_dropped = 1`
+/// holds only at total mass exactly 1, so dropping an unnormalized component would
+/// silently omit its mass from the marginal.
+fn refuse_unnormalized_dropped_component(
+    m: &Module,
+    node: NodeId,
+    component: NodeId,
+    what: &str,
+) -> Result<(), RefuseError> {
+    let (resolved, _) = resolve_ref_one(m, component);
+    let mass = match m.type_of(resolved) {
+        Some(Type::Measure { mass, .. }) => Some(*mass),
+        _ => None,
+    };
+    if mass != Some(Mass::Normalized) {
+        return Err(refuse(
+            node,
+            m,
+            &format!(
+                "projection drops a non-normalized component ({what}); the marginal is not \
+                 closed-form here (§06 case 2 requires each dropped component to be a normalized \
+                 probability measure) — refuse rather than mislower"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// The refusal for a structural projection over a `jointchain` whose shape is not
