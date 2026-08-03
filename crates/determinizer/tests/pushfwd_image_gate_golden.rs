@@ -87,9 +87,12 @@ fn image_gate_is_byte_identical_across_the_two_spellings() {
 
 #[test]
 fn onto_forward_maps_emit_no_gate() {
-    // A map whose image is all of ℝ has nothing to gate: every `y` has a preimage.
-    // Without this the gate could be emitted unconditionally and the tests above
-    // would still pass, while every affine pushforward carried a vacuous `ifelse`.
+    // A map that carries its base's support ONTO ℝ has nothing to gate: every `y` has
+    // a preimage. Without this the gate could be emitted unconditionally and the tests
+    // above would still pass, while every affine pushforward carried a vacuous
+    // `ifelse`. `log` is onto from `Gamma`'s `[0, ∞)` because `log 0 = −∞`; `neg` is
+    // onto only because the base is `reals` — over a positive base it is NOT, and
+    // gates (see `a_reflection_over_a_bounded_support_gains_a_gate`).
     for (map, base) in [
         ("neg", "Normal(mu = 0.0, sigma = 1.0)"),
         ("log", "Gamma(shape = 2.0, rate = 1.0)"),
@@ -100,57 +103,80 @@ fn onto_forward_maps_emit_no_gate() {
             "d = pushfwd({map}, {base})\nlp = logdensityof(d, 0.5)"
         ));
         assert!(
-            !out.contains("(in ") && !out.contains("(neg inf)"),
+            !out.contains("(neg inf)"),
             "`{map}` is onto — no image gate:\n{out}"
         );
+        for gate in ["(in ", "(gt ", "(ge ", "(lt ", "(le "] {
+            assert!(
+                !out.contains(gate),
+                "`{map}` is onto — no `{gate}` condition:\n{out}"
+            );
+        }
     }
 }
 
 #[test]
+fn a_reflection_over_a_bounded_support_gains_a_gate() {
+    // `neg` carries `Gamma`'s `[0, ∞)` (§08 `nonnegreals`) to `(−∞, 0]`, so it is onto
+    // only over an unbounded base. Ungated, `pushfwd(neg, Gamma)` at `y = 0.5` read
+    // the base density at `−0.5` and returned a finite number where §06 gives −∞. The
+    // endpoint stays CLOSED: 0 is in the support, so `−0` is in the image.
+    let out = lp("d = pushfwd(neg, Gamma(shape = 2.0, rate = 1.0))\nlp = logdensityof(d, 0.5)");
+    assert!(
+        out.contains("(le 0.5 0.0)") && out.contains("(neg inf)"),
+        "a reflected positive support gates at 0:\n{out}"
+    );
+}
+
+#[test]
 fn each_registry_image_gates_on_its_own_set() {
-    // The image column is per-entry, so pin the set each one gates on rather than
-    // only that SOME gate appears: an image copied from the wrong entry would
-    // otherwise pass. `exp`'s image is §03's `posreals` = (0, +∞] and `sqrt`'s and
-    // `pow`'s is `nonnegreals` = [0, +∞], both EXACT as §03 sets. The rest have an
-    // OPEN endpoint that no §03 set spells (`interval(lo, hi)` "denotes the closed
-    // interval"; `unitinterval` is [0, 1]), so they gate by comparison: `invlogit`'s
-    // and `invprobit`'s (0, 1), `expm1`'s (−1, ∞), `tanh`'s (−1, 1), `atan`'s
-    // (−π/2, π/2).
+    // The endpoint map is per-entry, so pin the set each one gates on rather than
+    // only that SOME gate appears: a map copied from the wrong entry would otherwise
+    // pass. Over a base whose support is the whole of the map's domain the image is
+    // the map's RANGE, which is what the deleted static image column held: `exp`'s
+    // is §03's `posreals` = (0, +∞] and `sqrt`'s over a `nonnegreals` base is
+    // `nonnegreals` = [0, +∞], both EXACT as §03 sets. The rest have an OPEN endpoint
+    // that no §03 set spells (`interval(lo, hi)` "denotes the closed interval";
+    // `unitinterval` is [0, 1]), so they gate by comparison: `invlogit`'s and
+    // `invprobit`'s (0, 1), `expm1`'s (−1, ∞), `tanh`'s (−1, 1), `atan`'s (−π/2, π/2).
+    // Pinned as the whole CONDITION where its shape is flat: `posreals` and
+    // `nonnegreals` also appear in the arm's own type annotations, so a bare
+    // set-name substring proves nothing about the gate.
     for (map, base, expected) in [
         (
             "exp",
             "Normal(mu = 0.0, sigma = 1.0)",
-            vec!["(in ", "posreals"],
+            vec!["(in 0.5 posreals)"],
         ),
         (
             "sqrt",
             "Gamma(shape = 2.0, rate = 1.0)",
-            vec!["(in ", "nonnegreals"],
+            vec!["(in 0.5 nonnegreals)"],
         ),
         (
             "x -> pow(x, 3.0)",
             "Gamma(shape = 2.0, rate = 1.0)",
-            vec!["(in ", "nonnegreals"],
+            vec!["(in 0.5 nonnegreals)"],
         ),
         (
             "invlogit",
             "Normal(mu = 0.0, sigma = 1.0)",
-            vec!["(land ", "0.0)", "1.0)"],
+            vec!["(land ", "(gt 0.5 0.0)", "(lt 0.5 1.0)"],
         ),
         (
             "invprobit",
             "Normal(mu = 0.0, sigma = 1.0)",
-            vec!["(land ", "0.0)", "1.0)"],
+            vec!["(land ", "(gt 0.5 0.0)", "(lt 0.5 1.0)"],
         ),
         (
             "expm1",
             "Normal(mu = 0.0, sigma = 1.0)",
-            vec!["(gt ", "-1.0)"],
+            vec!["(gt 0.5 -1.0)"],
         ),
         (
             "tanh",
             "Normal(mu = 0.0, sigma = 1.0)",
-            vec!["(land ", "-1.0)", "1.0)"],
+            vec!["(land ", "(gt 0.5 -1.0)", "(lt 0.5 1.0)"],
         ),
         (
             "atan",
@@ -183,17 +209,17 @@ fn each_registry_image_gates_on_its_own_set() {
 }
 
 #[test]
-fn composition_gates_on_the_outermost_ops_image() {
-    // The gate for `gₙ∘…∘g₁` is `image(gₙ)`, a SUPERSET of the composition's own
-    // image — exact when the inner ops are affine (onto), and never a false −∞
-    // otherwise. `x -> exp(2·x)` has image (0, ∞) exactly; the affine-outermost
-    // `x -> 2·exp(x) + 1` has image (1, ∞) and is not gated at all, pending the
-    // forward interval propagation the chain domain guard also waits on.
+fn composition_gates_on_the_propagated_image() {
+    // The support is propagated through the chain INNERMOST-first, so the gate is the
+    // composition's OWN image, not the outermost op's superset. `x -> exp(2·x)` over a
+    // real base has image (0, ∞) — `2·x` is onto ℝ, so `exp`'s range. The
+    // affine-OUTERMOST `x -> 2·exp(x) + 1` has image (1, ∞) and is now gated on it;
+    // reading the outermost op alone reported no image at all here.
     let inner_affine = lp(
         "d = pushfwd(x -> exp(2.0 * x), Normal(mu = 0.0, sigma = 1.0))\nlp = logdensityof(d, 0.5)",
     );
     assert!(
-        inner_affine.contains("posreals") && inner_affine.contains("(neg inf)"),
+        inner_affine.contains("(in 0.5 posreals)") && inner_affine.contains("(neg inf)"),
         "an affine op INSIDE `exp` keeps `exp`'s image:\n{inner_affine}"
     );
     let outer_affine = lp(
@@ -201,8 +227,19 @@ fn composition_gates_on_the_outermost_ops_image() {
          lp = logdensityof(d, 0.5)",
     );
     assert!(
-        !outer_affine.contains("(in "),
-        "an affine OUTERMOST op reports no image here:\n{outer_affine}"
+        outer_affine.contains("(gt 0.5 1.0)") && outer_affine.contains("(neg inf)"),
+        "an affine OUTERMOST op gates on the propagated (1, ∞):\n{outer_affine}"
+    );
+    // An affine SHIFT under `exp` moves the endpoint off `exp`'s own range: `exp(x−5)`
+    // over `[0, ∞)` has image `[e⁻⁵, ∞)`, closed because 0 is IN `Gamma`'s support
+    // (§08 `nonnegreals`). Reading `exp`'s range instead would gate on (0, ∞).
+    let shifted = lp(
+        "d = pushfwd(x -> exp(x - 5.0), Gamma(shape = 2.0, rate = 1.0))\n\
+         lp = logdensityof(d, 0.5)",
+    );
+    assert!(
+        shifted.contains("(ge 0.5 0.006737946999085467)"),
+        "the shift moves the image endpoint to e⁻⁵:\n{shifted}"
     );
 }
 
@@ -239,12 +276,15 @@ fn matrix_affine_emits_no_gate() {
 
 #[test]
 fn discrete_base_is_gated_too() {
-    // The image is a property of the forward map, not of the reference measure: a
-    // counting-reference pushforward carries no volume element (§06 "Density
-    // convention") but still has no mass outside the image.
+    // A counting-reference pushforward carries no volume element (§06 "Density
+    // convention") but still has no mass outside the image. The support is
+    // `nonnegintegers`, whose convex HULL is `[0, ∞)`, so `exp`'s image of it is
+    // `[1, ∞)` — the hull's image is a superset of the atoms' image, and the lattice
+    // round trip is what cuts it back to `{eᵏ}`. Asserted as the CONDITION, not as a
+    // substring: `posreals` also appears in the witness's own type annotation.
     let out = lp("d = pushfwd(exp, Poisson(rate = 3.0))\nlp = logdensityof(d, 0.5)");
     assert!(
-        out.contains("posreals") && out.contains("(neg inf)"),
+        out.contains("(ge 0.5 1.0)") && out.contains("(neg inf)"),
         "a discrete base is gated on the image as well:\n{out}"
     );
     assert_eq!(
@@ -328,5 +368,88 @@ fn an_unproven_support_leaves_the_gate_unsanitised() {
     assert!(
         out.contains("nonnegreals") && out.contains("(neg inf)"),
         "the gate is still emitted:\n{out}"
+    );
+}
+
+#[test]
+fn the_image_endpoint_follows_the_bases_support() {
+    // The defect this replaced: `sqrt`'s image was the static closed `nonnegreals`
+    // whatever the base was. §06 `(f_*M)(Y) = M(f⁻¹(Y))` makes the image `f`'s image
+    // of the SUPPORT, so the endpoint's openness is the support's. §08 supports:
+    // `InverseGamma` `posreals` (0 excluded), `Gamma` `nonnegreals` (0 included),
+    // `Beta` `unitinterval`. A closed superset is not harmless at an excluded
+    // endpoint: `y = 0` took the gate and the change of variables differentiated to
+    // +inf there (measured, Enzyme-JAX).
+    for (base, expected) in [
+        (
+            "InverseGamma(shape = 5.0, scale = 5.0)",
+            "(in 0.5 posreals)",
+        ),
+        ("Gamma(shape = 2.0, rate = 1.0)", "(in 0.5 nonnegreals)"),
+        ("Beta(alpha = 2.0, beta = 2.0)", "(in 0.5 (%meta"),
+    ] {
+        let out = lp(&format!(
+            "d = pushfwd(sqrt, {base})\nlp = logdensityof(d, 0.5)"
+        ));
+        assert!(
+            out.contains(expected) && out.contains("(neg inf)"),
+            "`{base}`: expected `{expected}`:\n{out}"
+        );
+    }
+    // `Beta`'s `[0, 1]` maps to `[0, 1]` — bounded and closed at both ends, which §03
+    // spells `interval(lo, hi)` ("denotes the closed interval"). Not `unitinterval`,
+    // the same set: the StableHLO `in` lowering does not take that name.
+    let beta = lp("d = pushfwd(sqrt, Beta(alpha = 2.0, beta = 2.0))\nlp = logdensityof(d, 0.5)");
+    assert!(
+        beta.contains("(interval 0.0 1.0)") && !beta.contains("unitinterval"),
+        "a bounded closed image is an `interval`:\n{beta}"
+    );
+    // Both spellings §06 declares equivalent read the same support.
+    let bare = lp(
+        "d = pushfwd(sqrt, InverseGamma(shape = 5.0, scale = 5.0))\n\
+         lp = logdensityof(d, 0.5)",
+    );
+    let lambda = lp(
+        "d = pushfwd(x -> sqrt(x), InverseGamma(shape = 5.0, scale = 5.0))\n\
+         lp = logdensityof(d, 0.5)",
+    );
+    assert_eq!(bare, lambda, "bare vs lambda spelling over an open support");
+}
+
+#[test]
+fn a_truncated_base_maps_both_endpoints() {
+    // `truncate(M, S)`'s support lies inside `S` (§06 "Support restriction"), so both
+    // endpoints are finite and `exp` carries `[0, 5]` to `[e⁰, e⁵]`. The static image
+    // gated this on (0, ∞), which admits every point below 1.
+    let out = lp(
+        "d = pushfwd(exp, truncate(Normal(mu = 0.0, sigma = 1.0), interval(0.0, 5.0)))\n\
+         lp = logdensityof(d, 0.5)",
+    );
+    assert!(
+        out.contains("(interval 1.0 148.4131591025766)"),
+        "the image is the mapped truncation interval:\n{out}"
+    );
+}
+
+#[test]
+fn an_unproven_support_gates_on_the_maps_range() {
+    // The fallback, and the no-regression half: a base whose support the pass cannot
+    // read — `Uniform`'s support is its set ARGUMENT, unproven when the bounds are
+    // model inputs — gates on the forward's own RANGE, which is exactly the static
+    // image this walk replaced (`exp` → §03 `posreals`). A domain-RESTRICTED forward
+    // never reaches here: §06 case 1 refuses it on an unproven support first.
+    let unproven = lp("a = elementof(reals)\nb = elementof(reals)\n\
+         d = pushfwd(exp, Uniform(interval(a, b)))\nlp = logdensityof(d, 0.5)\n\
+         inputs = (a, b)\noutputs = (lp)");
+    assert!(
+        unproven.contains("(in 0.5 posreals)") && unproven.contains("(neg inf)"),
+        "an unproven support gates on `exp`'s range:\n{unproven}"
+    );
+    // And a PROVEN structural support is read: the same constructor over `nonnegreals`
+    // gates on the mapped endpoint instead.
+    let proven = lp("d = pushfwd(exp, Uniform(nonnegreals))\nlp = logdensityof(d, 0.5)");
+    assert!(
+        proven.contains("(ge 0.5 1.0)"),
+        "a structural support still maps:\n{proven}"
     );
 }
