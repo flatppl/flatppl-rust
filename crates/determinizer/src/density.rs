@@ -145,7 +145,7 @@
 use crate::refuse::RefuseError;
 use flatppl_core::{
     BindingId, Call, CallHead, Dim, Inputs, Mass, Module, NamedArg, NamedKind, Node, NodeId, Ref,
-    RefNs, Scalar, ScalarType, Symbol, Type,
+    RefNs, Scalar, ScalarType, Symbol, Type, ValueSet,
 };
 use flatppl_infer::ModuleBundle;
 
@@ -2869,6 +2869,9 @@ fn build_touniform(m: &mut Module, kernel: NodeId, input: NodeId, x: NodeId) -> 
 /// is a *set-valued parameter declaration* (`elementof(R)`), not a 2-arg
 /// membership predicate, so it must not be used here (a 2-arg `elementof` infers
 /// to `%deferred`, an ill-typed `ifelse` condition).
+///
+/// A set whose space is provably not the variate's refuses first
+/// ([`refuse_truncation_set_kind_mismatch`]).
 fn lower_truncate(
     m: &mut Module,
     node: NodeId,
@@ -2884,6 +2887,8 @@ fn lower_truncate(
         (c.args[0], c.args[1])
     };
 
+    refuse_truncation_set_kind_mismatch(m, node, m_inner, s_node)?;
+
     let cond = build_call(m, "in", &[v, s_node]);
     // Lowered at the RAW point, so a §13 pin records the query point itself: `truncate`
     // does not move the variate, so outside `S` a draw the point determines still takes
@@ -2897,6 +2902,116 @@ fn lower_truncate(
     let point = gate_point(m, cond, v, witness);
     let arm = crate::driver::substitute_in_tree(m, inner_density, v, point);
     Ok(gate_density(m, cond, arm))
+}
+
+/// Refuse `truncate(M, S)` when `S`'s elements are PROVABLY not of `M`'s variate
+/// kind — a record-variate law truncated by a scalar `interval`, say.
+///
+/// §06 "Support restriction" gives `truncate(M, S)` as ν(A) = M(A ∩ S). A set from
+/// another space makes A ∩ S empty, ν the zero measure, and −∞ its density
+/// everywhere — the emitted number is CORRECT. What is wrong is that a modelling
+/// error reads as a computation: the gate `record(x = …) in interval(lo, hi)` is
+/// false at every query point, with no diagnostic.
+///
+/// There is no repair to make instead. §03 "Sets" spells no record-valued
+/// `interval`, and §04 "Calling conventions"' auto-splat does not reach a record
+/// "given alongside other arguments" — `truncate(M, S)` has two — so nothing
+/// licenses projecting the record's field onto the scalar set. Name both spaces
+/// and refuse.
+///
+/// Refuse on PROOF, not on absence of evidence: an unprovable variate kind or set
+/// kind keeps lowering, so a working model does not start refusing.
+fn refuse_truncation_set_kind_mismatch(
+    m: &Module,
+    node: NodeId,
+    m_inner: NodeId,
+    s_node: NodeId,
+) -> Result<(), RefuseError> {
+    let Some(Type::Measure { domain, .. }) = m.type_of(m_inner) else {
+        return Ok(());
+    };
+    let (Some(vk), Some((sk, set_label))) = (variate_kind(domain), truncation_set_kind(m, s_node))
+    else {
+        return Ok(());
+    };
+    if vk == sk {
+        return Ok(());
+    }
+    Err(refuse(
+        node,
+        m,
+        &format!(
+            "the truncation set's space does not match the measure's variate: the set is a set of \
+             {} ({set_label}) but the variate is {} ({}) — §06 \"Support restriction\" is \
+             ν(A) = M(A ∩ S), so the restriction is the zero measure and its density is −∞ at \
+             every point. No §03 rule reads a set of one space as a set of another, and §04's \
+             auto-splat does not apply to `truncate`'s two arguments: give a truncation set over \
+             the variate's own space",
+            sk.plural(),
+            vk.article_noun(),
+            m.display_type(domain),
+        ),
+    ))
+}
+
+/// The element kind of a truncation set argument, in [`VariateKind`] — the same
+/// vocabulary the variate is read into, so the two compare directly — with the
+/// set's own surface spelling, for the refusal message. `None` where the argument
+/// proves no kind.
+///
+/// One level of ref indirection is resolved, so a preset set binding
+/// (`S = interval(0, 1)` … `truncate(M, S)`) is covered too.
+fn truncation_set_kind(m: &Module, s_node: NodeId) -> Option<(VariateKind, String)> {
+    let (s, _) = resolve_ref_one(m, s_node);
+    // A named set first: a bare `Node::Const`'s own value-set annotation is
+    // `anything`, which would both prove nothing and misname the set.
+    if let Some(kind) = predefined_set_kind(m, s) {
+        let Node::Const(sym) = m.node(s) else {
+            unreachable!("predefined_set_kind matches only a Const")
+        };
+        return Some((kind, m.resolve(*sym).to_string()));
+    }
+    let set = m.valueset_of(s)?;
+    Some((set_element_kind(set)?, m.display_valueset(set)))
+}
+
+/// The element kind of an inferred value-set (§03 "Sets").
+fn set_element_kind(set: &ValueSet) -> Option<VariateKind> {
+    use ValueSet::*;
+    match set {
+        Reals | PosReals | NonNegReals | UnitInterval | Integers | PosIntegers | NonNegIntegers
+        | Booleans | Complexes | Interval(..) => Some(VariateKind::Scalar),
+        // §03: a positional `cartprod`'s members are `cat`s of one element per
+        // component — "a set of arrays, not a set of tuples"; `stdsimplex(n)` is a
+        // set of n-vectors.
+        CartProd(_) | StdSimplex(_) => Some(VariateKind::Vector),
+        // §03 keyword form: "produces a set of records".
+        RecordSet(_) => Some(VariateKind::Record),
+        // §03: "When `S` is a record set, the power is the set of tables" — but
+        // `ValueSet::natural_of` maps an array-OF-records TYPE to this same
+        // value-set, so a power over a record set proves neither Table nor Vector.
+        CartPow(elem, _) => match &**elem {
+            RecordSet(_) | Deferred | Unknown => None,
+            _ => Some(VariateKind::Vector),
+        },
+        // `anything` "signals that no specific type constraint is imposed" (§03);
+        // `rngstates` members are "opaque values" with no variate kind.
+        Anything | RngStates | Deferred | Unknown => None,
+    }
+}
+
+/// The element kind of a §03 predefined set named by a bare `Node::Const`, which
+/// carries no value-set annotation of its own. Every predefined set is a set of
+/// scalars except `anything` and `rngstates`, which prove no kind.
+fn predefined_set_kind(m: &Module, s: NodeId) -> Option<VariateKind> {
+    let Node::Const(sym) = m.node(s) else {
+        return None;
+    };
+    match m.resolve(*sym) {
+        "reals" | "posreals" | "nonnegreals" | "unitinterval" | "integers" | "posintegers"
+        | "nonnegintegers" | "booleans" | "complexes" => Some(VariateKind::Scalar),
+        _ => None,
+    }
 }
 
 /// The point a −∞ gate's TAKEN arm must be built over: the query point where `cond`
@@ -5334,6 +5449,30 @@ enum VariateKind {
     Record,
     Tuple,
     Table,
+}
+
+impl VariateKind {
+    /// Plural noun, for naming what a SET's members are.
+    fn plural(self) -> &'static str {
+        match self {
+            VariateKind::Scalar => "scalars",
+            VariateKind::Vector => "vectors",
+            VariateKind::Record => "records",
+            VariateKind::Tuple => "tuples",
+            VariateKind::Table => "tables",
+        }
+    }
+
+    /// Singular with its article, for naming what a VARIATE is.
+    fn article_noun(self) -> &'static str {
+        match self {
+            VariateKind::Scalar => "a scalar",
+            VariateKind::Vector => "a vector",
+            VariateKind::Record => "a record",
+            VariateKind::Tuple => "a tuple",
+            VariateKind::Table => "a table",
+        }
+    }
 }
 
 fn variate_kind(t: &Type) -> Option<VariateKind> {
