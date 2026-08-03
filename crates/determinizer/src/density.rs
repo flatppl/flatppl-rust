@@ -1106,16 +1106,8 @@ fn lower_measure_density_at(
         // (`Normal(mu = z, sigma = 1.0)`) is a dependent product the chain rule
         // scores with `z` pinned, yet it also passes the value-law shape test
         // (one distinct draw reached), so offering it to the value law first
-        // would read the whole dependent product as a map of `z`.
-        //
-        // What a reversed order costs is COVERAGE, not a wrong number: the map
-        // the value law would synthesize is `x -> Normal(mu = x, sigma = 1.0)`,
-        // whose head `Normal` appears in neither `crate::invert`'s unary-bijection
-        // registry nor its affine grammar (`invert.rs:794-877`), so it refuses
-        // there ("no analytic inverse"). Every dependent product would stop
-        // lowering — loudly. The precision matters because it is the whole reason
-        // for the ordering, and `dependent_constructor_is_read_as_a_product_not_a_map`
-        // is the test that holds it.
+        // would read the whole dependent product as a map of `z`
+        // (`dependent_constructor_is_read_as_a_product_not_a_map`).
         //
         // Reusing `build_density_term`'s own refusal as the gate keeps the two
         // paths' precedence exact without a second copy of
@@ -1170,38 +1162,28 @@ fn lower_lawof(
 /// refusal.
 ///
 /// This is the measure-expression half of the marginalization guard;
-/// [`lower_value_law`] covers the half where `lawof`'s argument is a VALUE. Both
-/// are needed, and neither subsumes the other: a measure argument is unwrapped and
-/// scored by `build_density_term`, which succeeds, so `lower_value_law` is never
-/// entered and its guard never runs. Called from both places a `lawof` is stripped —
-/// [`lower_lawof`], and [`lower_density_core`] at the query entry, which strips the
-/// top-level one via [`measure_of_arg`] before the dispatcher ever sees it.
+/// [`lower_value_law`] covers the half where `lawof`'s argument is a VALUE. Neither
+/// subsumes the other: a measure argument is scored by `build_density_term`, which
+/// succeeds, so `lower_value_law` never runs. Called from both places a `lawof` is
+/// stripped — [`lower_lawof`], and [`lower_density_core`] at the query entry.
 ///
-/// **The discriminator is value-versus-measure-expression, and it has to be.**
-/// Running [`measure_reaches_draw`] on a VALUE argument would report every
-/// `lawof(z)` over a `~`-bound draw as stochastic and refuse the §06 stochastic-node
-/// form outright. Only a MEASURE-EXPRESSION argument is checked. An argument whose
-/// type inference did not resolve is left alone rather than refused on a guess (the
-/// driver re-infers each iteration, so a real measure expression carries its type by
-/// the time this runs). A RECORD argument gets its own check
-/// ([`refuse_stochastic_record_law`]), which is not this one: a dependent component
-/// `Normal(mu = z, …)` is the chain-rule product `lower_record_of_draws` scores when
-/// `z` is a sibling FIELD, and only a marginal when it is not.
+/// Only a MEASURE-EXPRESSION argument is checked. Running [`measure_reaches_draw`]
+/// on a VALUE argument would refuse every §06 stochastic-node `lawof(z)`. An
+/// argument whose type did not resolve is left alone rather than refused on a guess.
+/// A RECORD argument gets [`marginalize_or_refuse_record_law`] instead: a dependent
+/// component `Normal(mu = z, …)` is the chain-rule product `lower_record_of_draws`
+/// scores when `z` is a sibling FIELD, and only a marginal when it is not.
 ///
-/// **A reification counts as a measure expression.** `F = functionof(Normal(mu = a,
-/// sigma = 1.0))` types as `Kernel`, not `Measure`, so a `Type::Measure`-only test
-/// let `lawof(F)` through and emitted the conditional at a later-pinned `a`. The
-/// reification is admitted by its head as well as its type, since a `functionof`
-/// over a deterministic body types as `Function`: `lawof` of a reified FUNCTION is
-/// ill-formed and `lawof` of a reified MEASURE is the marginal, so refusing serves
-/// both readings. What keeps this from over-refusing is [`measure_reaches_draw`] —
+/// A reification counts as a measure expression, admitted by head as well as type:
+/// `F = functionof(Normal(mu = a, sigma = 1.0))` types as `Kernel`, so a
+/// `Type::Measure`-only test let `lawof(F)` through and emitted the conditional at a
+/// later-pinned `a`. [`measure_reaches_draw`] keeps this from over-refusing —
 /// `lawof(functionof(Normal(mu = elementof(reals), …)))` reaches no draw and lowers.
 ///
 /// The marginal is `kchain(lawof(a), a -> Normal(mu = a, …))`, which
 /// [`crate::marginal::conjugate_marginal_measure`] answers in closed form for a
-/// recognised conjugate pair — without synthesizing the `kchain`, since the table needs
-/// only the prior, the likelihood, and the symbol linking them. No row applying is what
-/// keeps the refusal.
+/// recognised pair, from the prior, the likelihood, and the symbol linking them. No
+/// row applying is what keeps the refusal.
 fn marginalize_or_refuse_stochastic_law(
     m: &mut Module,
     arg: NodeId,
@@ -1225,9 +1207,8 @@ fn marginalize_or_refuse_stochastic_law(
         return Err(refuse(
             resolved,
             m,
-            "lawof of a measure parameterized by a draw is that value's MARGINAL law \
-             (§04: lawof reifies the TOTAL law), which is a kchain marginal and no conjugate \
-             closed-form applies — refuse rather than score the conditional at a pinned latent",
+            "lawof of a draw-parameterized measure is the MARGINAL law (§04: lawof reifies the \
+             TOTAL law), and no conjugate closed form covers this kchain marginal",
         ));
     }
     Ok(None)
@@ -1253,57 +1234,46 @@ fn score_marginal_form(
 /// by a draw the record does not carry: `lawof(record(y = y))` with
 /// `y ~ Normal(mu = z, sigma = 1)` and `z` a latent of the model but no field here.
 ///
-/// §04 "Reification to measures" makes `lawof(x)` the TOTAL law and, on its worked
-/// `prior_predictive = lawof(record(obs = obs))`, says which ancestors get integrated
-/// out: "they are internal stochastic nodes in the traced sub-DAG, **not boundary
-/// inputs**, so `lawof` integrates them out". A SIBLING field's draw is neither — it
-/// is scored by the same product, and `lower_record_of_draws` pins it to its own field
-/// of the query point, so `lawof(record(z = z, y = y))` is the chain-rule joint and
-/// must keep lowering. Only an ancestor the record does not carry needs the `kchain`
-/// integral, and scoring it emits the conditional at whatever value that latent
-/// takes: `lawof(record(y = y))` emitted `p(y | z)` at a `z` a sibling query pinned,
-/// in EITHER statement order.
+/// §04 "Reification to measures" makes `lawof(x)` the TOTAL law and names which
+/// ancestors get integrated out: "they are internal stochastic nodes in the traced
+/// sub-DAG, **not boundary inputs**, so `lawof` integrates them out". A SIBLING
+/// field's draw is neither — `lower_record_of_draws` pins it to its own field of the
+/// query point, so `lawof(record(z = z, y = y))` is the chain-rule joint and must
+/// keep lowering. Only an ancestor the record does not carry needs the `kchain`
+/// integral; scoring it instead emits `p(y | z)` at whatever value `z` takes, in
+/// EITHER statement order.
 ///
-/// **This belongs to `lawof`, not to the record lowering.** `lower_record_of_draws`
-/// also scores the body of a `kernelof` / `functionof`, and a reification does not
-/// integrate its free stochastic params out — it CONDITIONS on them as boundary
-/// inputs, which is exactly §04's exception. `forward_kernel =
-/// kernelof(record(obs = obs), theta1 = theta1, theta2 = theta2)` with
-/// `obs ~ iid(Normal(mu = a, sigma = b), 10)` over derived `a`, `b` is that shape, and
-/// a guard placed in the record lowering refused it
-/// (`fixtures/flatppl/queries/bayesian_inference_2_posterior.flatppl`). Sited at the
-/// `lawof` strip points, it fires only where §04 asks for the total law.
+/// Sited at the `lawof` strip points, NOT in the record lowering:
+/// `lower_record_of_draws` also scores a `kernelof` / `functionof` body, and a
+/// reification CONDITIONS on its free stochastic params as boundary inputs — §04's
+/// exception. A guard in the record lowering refused
+/// `fixtures/flatppl/queries/bayesian_inference_2_posterior.flatppl`.
 ///
 /// A field the record lowering will refuse anyway (not a draw, or reaching two draws)
 /// makes the sibling set incomplete, so the check stands down entirely rather than
-/// mistake a sibling for an outsider — that refusal is the caller's, with its own
-/// reason.
+/// mistake a sibling for an outsider — that refusal is the caller's.
 ///
-/// **Marginalizing does not re-implement the product.** A field whose outside ancestor a
-/// conjugate row can integrate out gets its own closed-form marginal MEASURE, and the
-/// whole record is then handed to [`lower_record_of_draws_with`] — so the remaining
-/// fields, the chain-rule sibling pinning, and the latent pins all stay that function's,
-/// and several fields may marginalize at once. `Ok(None)` means no field needed it.
+/// A field whose outside ancestor a conjugate row integrates out gets its own
+/// closed-form marginal MEASURE, and the whole record then goes to
+/// [`lower_record_of_draws_with`], which keeps the remaining fields, the sibling
+/// pinning, and the latent pins. Several fields may marginalize at once. `Ok(None)`
+/// means no field needed it.
 ///
-/// **Only if the marginalized fields integrate DIFFERENT latents.** Marginalizing per
-/// field and summing the results is the density of the PRODUCT of the marginals, and that
-/// is the joint only when the fields are independent. Two fields over the same latent are
-/// not: for `y1, y2 ~ Normal(mu = z, sigma = 1)` over `z ~ Normal(0, 1)` the marginals are
-/// each `Normal(0, √2)` but `Cov(y1, y2) = Var(z) = 1`, so the joint is a correlated
-/// `MvNormal`, which §04's `kchain(prior, forward_kernel)` gives and no product of
-/// marginals does. Refuse. This is the one shape where every per-field answer is right and
-/// the assembled product is still wrong, so the check has to be here rather than in the
-/// row.
+/// Only if the marginalized fields integrate DIFFERENT latents. Summing per-field
+/// marginals is the density of the PRODUCT of the marginals, which is the joint only
+/// under independence: for `y1, y2 ~ Normal(mu = z, sigma = 1)` over `z ~ Normal(0,
+/// 1)` each marginal is `Normal(0, √2)` but `Cov(y1, y2) = Var(z) = 1`, so the joint
+/// is a correlated `MvNormal`. Refuse. Every per-field answer is right and the
+/// assembled product still wrong, so the check cannot live in the row.
 ///
-/// The `iid`/`joint` combinators over the same shape are NOT this case and correctly emit
-/// the product: §06 defines `joint(M1, M2, …)` as the "independent product measure"
-/// `(M1 ⊗ M2)(A × B) = M1(A) · M2(B)`, so `joint(a = lawof(y1), b = lawof(y2))` asks for
-/// the product of the two marginals. `lawof(record(y1 = y1, y2 = y2))` asks for the law of
-/// the traced sub-DAG, which is the correlated one.
+/// The `iid`/`joint` combinators over the same shape correctly emit the product: §06
+/// defines `joint(M1, M2, …)` as the "independent product measure", so
+/// `joint(a = lawof(y1), b = lawof(y2))` asks for the product of the two marginals,
+/// while `lawof(record(y1 = y1, y2 = y2))` asks for the correlated sub-DAG law.
 ///
 /// A field that is a TRANSFORM of its draw (`b = y + z`) is refused rather than
-/// marginalized: its law is the pushforward of the marginal under that map, which is not
-/// what the table's row returns.
+/// marginalized: its law is the pushforward of the marginal under that map, which the
+/// row does not return.
 fn marginalize_or_refuse_record_law(
     m: &mut Module,
     record_node: NodeId,
@@ -1343,10 +1313,9 @@ fn marginalize_or_refuse_record_law(
                     return Err(refuse(
                         measure,
                         m,
-                        "lawof of a record two of whose fields marginalize over the SAME latent \
-                         is a CORRELATED joint — the shared ancestor is the covariance, and \
-                         §04's kchain(prior, forward_kernel) is not a product of the fields' \
-                         marginals — refuse rather than emit the independent product",
+                        "lawof of a record whose fields marginalize over the SAME latent is a \
+                         CORRELATED joint (§04 kchain(prior, forward_kernel)), not a product of \
+                         their marginals",
                     ));
                 }
                 integrated.push(built.latent);
@@ -1356,11 +1325,9 @@ fn marginalize_or_refuse_record_law(
                 return Err(refuse(
                     measure,
                     m,
-                    "lawof of a record whose field law is parameterized by a draw the record \
-                     does not carry is that field's MARGINAL law (§04: lawof reifies the TOTAL \
-                     law), which is a kchain marginal and no conjugate closed-form applies — \
-                     refuse rather than score the conditional at a latent pinned by another \
-                     query",
+                    "lawof of a record field parameterized by an uncarried draw is that field's \
+                     MARGINAL law (§04: lawof reifies the TOTAL law), and no conjugate row covers \
+                     it",
                 ));
             }
         }
@@ -1557,10 +1524,9 @@ fn match_independent_record(
                     return Err(refuse(
                         field.value,
                         m,
-                        "record field reaches more than one draw; the guard counts distinct \
-                     draws, which equals the rank of the joint map only when each field \
-                     is a map of a single draw — admitting this needs a real rank test \
-                     on the joint map, so refuse rather than mislower",
+                        "record field reaches more than one draw: the distinct-draw count equals \
+                         the joint map's rank only when each field maps one draw, and there is no \
+                         rank test here",
                     ));
                 }
                 None => {
@@ -1679,25 +1645,18 @@ fn resolve_component_draw(
 /// first-reached order.
 ///
 /// Walks call operands (positional AND named, under either head kind) and hops
-/// through `(%ref self x)` bindings, stopping at each `draw(…)`: a draw's own
-/// measure ARGUMENT is deliberately not entered, because a draw whose parameters
-/// reference a sibling draw (`y = draw(Normal(mu = z, …))`) is a dependent
-/// product the caller scores by the chain rule with `z` pinned, not a map of `z`.
+/// through `(%ref self x)` bindings, stopping at each `draw(…)`. A draw's own measure
+/// ARGUMENT is not entered: `y = draw(Normal(mu = z, …))` is a dependent product the
+/// caller scores by the chain rule with `z` pinned, not a map of `z`.
 ///
-/// Missing a draw is unsound, not merely imprecise: one the walk failed to see
-/// would be treated as a fixed operand, which is how a coupled joint could get
-/// scored as if one of its draws were a constant — `derive_matrix_affine` accepts
-/// `mu + L * x` whenever `mu` does not mention the map's input, so a random `mu`
-/// must be caught HERE.
+/// Missing a draw is unsound, not merely imprecise — it would pass as a fixed operand:
+/// `derive_matrix_affine` accepts `mu + L * x` whenever `mu` does not mention the map's
+/// input, so a random `mu` must be caught HERE.
 ///
-/// Exhaustive over the positions it can be reached with, but NOT over every child
-/// of a call node: it descends `args` and `named` under either head kind, and does
-/// NOT descend the CALLEE expression of a `CallHead::User` head. What makes that
-/// omission safe lives in the caller, not here — [`resolve_component_draw`] admits
-/// a transformed field only when its head is `CallHead::Builtin`, so a User-headed
-/// field never reaches this walk as an admitted map; it refuses instead. Widening
-/// that head-kind gate therefore requires teaching this walk to enter callees
-/// first, or the draws inside a callee would go unseen.
+/// Does NOT descend the CALLEE expression of a `CallHead::User` head. That is safe
+/// only because [`resolve_component_draw`] admits a transformed field only under a
+/// `CallHead::Builtin` head. Widening that gate requires teaching this walk to enter
+/// callees first.
 ///
 /// The `path` guard makes a cyclic binding graph terminate (it then reports the
 /// draws found before the cycle, and the leftover self-ref refuses downstream).
@@ -1837,69 +1796,41 @@ fn abstract_over_draw(
 }
 
 /// Score the law of a single stochastic VALUE — the bare, non-record `lawof(x)`
-/// spelling — at `v`. `None` means the shape did not match (`x` is not the law of
-/// exactly one draw), leaving the caller's own refusal in force.
+/// spelling — at `v`. `None` means `x` is not the law of exactly one draw, leaving
+/// the caller's own refusal in force.
 ///
-/// `logdensityof(lawof(x), v)` strips its `lawof` at the query entry
-/// ([`measure_of_arg`]), so what reaches the measure dispatcher is `x` itself: a
-/// value expression, not a measure. A record-valued `x` lands on the `"record"`
-/// arm and is scored as a product of fields; a SCALAR `x` names no measure op at
-/// all and reaches the dispatcher's constructor fallthrough, which is where this
-/// is called from.
+/// The query entry strips the `lawof` ([`measure_of_arg`]), so a scalar `x` reaches
+/// the measure dispatcher's constructor fallthrough, which is where this is called
+/// from.
 ///
-/// The two spellings §06 "Transformation and projection" declares equivalent then
-/// share one lowering:
+/// §06 "Transformation and projection" declares two spellings equivalent, so both
+/// lower here:
 ///
 /// * `x = draw(M)` — §04 "Reification to measures", *Identity law*:
-///   "`lawof(draw(m))` is equivalent to `m`". Score `M` at `v` unchanged; no
-///   volume element enters.
-/// * `y = g(x)` over a single draw — §06's stochastic-node form of a
-///   pushforward, printed under "The equivalent in stochastic-node form is:".
-///   Score `pushfwd(g, M)`, so [`lower_pushfwd`] applies the change of variables
-///   and `crate::invert` supplies the inverse from the §06 case-1 registry. A map
-///   outside that registry refuses there rather than being mislowered.
+///   "`lawof(draw(m))` is equivalent to `m`". Score `M` at `v`; no volume element
+///   enters.
+/// * `y = g(x)` over one draw — §06's stochastic-node pushforward. Score
+///   `pushfwd(g, M)`; a map outside the §06 case-1 registry refuses in
+///   `crate::invert`.
 ///
-/// The shape test is [`resolve_component_draw`]'s, unmodified: a value reaching
-/// two or more distinct draws (`x1 - x2`) returns `None`, so no coupled joint can
-/// be read as a map of one draw. The record path's rank check is deliberately NOT
-/// reused — it compares the number of distinct draws against the number of
-/// FIELDS, and a bare scalar law has one field by construction, so the comparison
-/// is vacuous here.
+/// The shape test is [`resolve_component_draw`]'s: a value reaching two or more
+/// distinct draws (`x1 - x2`) returns `None`, so no coupled joint reads as a map of
+/// one draw.
 ///
-/// **`M`'s own parameters must reach no draw.** §04 "Reification to measures"
-/// defines `lawof(x)` as the **TOTAL** law of `x`, and spells the consequence out
-/// on its worked `prior_predictive = lawof(record(obs = obs))`: a stochastic
-/// ancestor is "obtained by marginalizing over" — "they are internal stochastic
-/// nodes in the traced sub-DAG, not boundary inputs, so `lawof` integrates them
-/// out", the measure-algebra equivalent being `kchain(prior, forward_kernel)`. So
-/// for `y ~ Normal(mu = z, sigma = 1)` with `z` latent, `lawof(y)` is the MARGINAL
-/// of `y`, not `Normal(mu = z, …)`. Marginalizing is `crate::marginal`'s job:
-/// [`crate::marginal::conjugate_marginal_measure`] answers it in closed form for a
-/// recognised conjugate pair, and only a pair with no row refuses here. A merely FIXED
-/// or parametric parameter (`mu = elementof(reals)`) is not a stochastic ancestor
-/// and lowers unaffected — [`measure_reaches_draw`] tests for a reachable `draw`,
-/// not for a non-literal parameter.
+/// `M`'s own parameters must reach no draw. §04 defines `lawof(x)` as the TOTAL law
+/// of `x`, so for `y ~ Normal(mu = z, sigma = 1)` with `z` latent, `lawof(y)` is the
+/// MARGINAL; [`crate::marginal::conjugate_marginal_measure`] supplies it in closed
+/// form and a pair with no row refuses. A fixed or parametric `mu` is not a
+/// stochastic ancestor — [`measure_reaches_draw`] tests for a reachable `draw`, not
+/// for a non-literal parameter, and reads the pin provenance
+/// [`Module::query_pinned_rhs`] records so a pinned latent still counts
+/// (`a_pinned_latent_is_not_a_fixed_parameter_bare_spelling`,
+/// `bare_lawof_scored_before_a_later_query_pins_the_latent_marginalizes`).
 ///
-/// **What the guard is worth, precisely.** With the latent still latent, a pair with no
-/// row already refused without it, via the driver's residual-`draw` scan — so there the
-/// guard only improves the diagnosis. Its own justification is the LATER-query ordering —
-/// score `lawof(y)` first, then a second query that pins `z` — where nothing downstream
-/// refuses and the conditional density escaped as a finished number
-/// (`bare_lawof_scored_before_a_later_query_pins_the_latent_marginalizes`). The
-/// EARLIER-query ordering it reaches only through the pin provenance
-/// [`measure_reaches_draw`] reads: once `z = 0.3` nothing in the binding is left to
-/// test, so the pin itself has to record that it was a latent, AND what its prior was
-/// ([`Module::query_pinned_rhs`], which is what lets the marginal be built at all)
-/// (`a_pinned_latent_is_not_a_fixed_parameter_bare_spelling`).
-///
-/// Pinning the binding `x` came from is what keeps the residual `x = draw(M)`
-/// from surviving into the conformance check: the driver sweeps a draw binding
-/// once nothing references it, and for `y = g(x)` only pinning `y` to the scored
-/// value drops the last reference to `x`. This mirrors `lower_record_of_draws`,
-/// including its ordering — pin only AFTER the density is built, since
-/// [`build_forward_map`] recovers `g` by inlining through that very binding — and
-/// happens only at [`VariateOrigin::Point`], since a variate that did not come from
-/// the query point belongs to the enclosing value, not to this one.
+/// Pin the binding `x` came from AFTER the density is built — [`build_forward_map`]
+/// recovers `g` by inlining through that very binding — and only at
+/// [`VariateOrigin::Point`]. Without the pin the residual `x = draw(M)` survives
+/// into the conformance check.
 fn lower_value_law(
     m: &mut Module,
     value: NodeId,
@@ -1933,10 +1864,8 @@ fn lower_value_law(
         return Some(Err(refuse(
             measure,
             m,
-            "the law of this value marginalizes over a stochastic ancestor of its own measure \
-             (§04: lawof reifies the TOTAL law), which is a kchain marginal and no conjugate \
-             closed-form applies — refuse rather than emit the conditional density at a pinned \
-             latent",
+            "this value's law marginalizes over a stochastic ancestor of its own measure (§04: \
+             lawof reifies the TOTAL law), and no conjugate row covers this kchain marginal",
         )));
     }
     let law = match transform {
@@ -1974,41 +1903,29 @@ fn lower_value_law(
 /// parameterized by a value that is itself random, so that [`lower_value_law`]
 /// would have to marginalize?
 ///
-/// **A binding an earlier query pinned counts as a draw**
-/// ([`Module::is_query_pinned`]). Pinning rewrites `z = draw(Normal(0, 1))` to
-/// `z = 0.3`, after which nothing in the binding tells it from a genuinely fixed
-/// `mu = elementof(reals)` — so `y ~ Normal(mu = z, sigma = 1)` scored by a LATER
-/// query emitted the conditional `p(y | z = 0.3)` where §04 asks for y's marginal.
-/// The provenance is what makes that decidable; without it there is nothing left to
-/// test, which is why no local shape check can close this.
+/// A binding an earlier query pinned counts as a draw ([`Module::is_query_pinned`]).
+/// Pinning rewrites `z = draw(Normal(0, 1))` to `z = 0.3`, after which nothing in the
+/// binding tells it from a fixed `mu = elementof(reals)` — so `y ~ Normal(mu = z,
+/// sigma = 1)` scored by a LATER query emitted `p(y | z = 0.3)` where §04 asks for
+/// y's marginal. Only the provenance makes that decidable; no local shape check can.
 ///
-/// `exempt` lists draw sites the CALLER accounts for itself — the sibling fields of
-/// a record product, whose dependence is the chain rule
-/// [`lower_record_of_draws`] already scores with the sibling pinned. Every other
-/// caller passes `&[]`. An exempt draw is not descended into, for
-/// [`field_draw_sites`]'s reason: its own parameters are checked when that component
-/// is walked in its turn.
+/// `exempt` lists draw sites the CALLER accounts for itself — the sibling fields of a
+/// record product, whose dependence [`lower_record_of_draws`] already scores by the
+/// chain rule with the sibling pinned. Every other caller passes `&[]`. An exempt
+/// draw is not descended into, for [`field_draw_sites`]'s reason: its own parameters
+/// are checked when that component is walked in its turn.
 ///
-/// Deliberately NOT [`field_draw_sites`], which the shape test uses and must keep
-/// its own semantics: this walk stops at a `lawof(…)` ARGUMENT, because `lawof`
-/// crosses from values into measures. §04 "Reification to measures", *Phase of the
-/// reified law*: "the resulting measure is itself deterministic (of parameterized
-/// or fixed phase): `lawof` absorbs stochasticity into the reified law rather than
-/// propagating it outward." So in `y = draw(pushfwd(exp, lawof(z)))` the base
-/// consumes `z`'s LAW, not `z`'s value — `z` is no ancestor of `y`, `lawof(y)` is
-/// an honest LogNormal, and walking into `lawof(z)` would refuse it.
+/// Deliberately NOT [`field_draw_sites`]: this walk stops at a `lawof(…)` ARGUMENT.
+/// §04 "Reification to measures", *Phase of the reified law*: "`lawof` absorbs
+/// stochasticity into the reified law rather than propagating it outward." So in
+/// `y = draw(pushfwd(exp, lawof(z)))` the base consumes `z`'s LAW, `z` is no ancestor
+/// of `y`, and walking into `lawof(z)` would refuse an honest LogNormal.
 ///
-/// **The skip is not self-sufficient — [`refuse_stochastic_measure_law`] is what
-/// makes it safe, and only partly.** An earlier revision justified the skip by
-/// claiming `lawof`'s argument "still gets checked when the recursion reaches it as
-/// a measure in its own right". That is true only when the argument is a *value*.
-/// When it is a measure EXPRESSION, `lower_lawof` unwraps it, `build_density_term`
+/// The skip is safe only because [`marginalize_or_refuse_stochastic_law`] guards the
+/// `lawof` strip sites. `lawof`'s argument reaches this walk again only when it is a
+/// VALUE; for a measure EXPRESSION `lower_lawof` unwraps it, `build_density_term`
 /// succeeds, and this function is never entered — which silently emitted the
-/// conditional density for `lawof(Normal(mu = a, …))` at a later-pinned latent `a`.
-/// [`refuse_stochastic_measure_law`] now catches that at the `lawof` strip sites,
-/// for a `Kernel`-typed reification argument (`lawof(functionof(…))`) as well as a
-/// `Measure`-typed one. Do not restore the "nothing is skipped" wording: it is how
-/// this conclusion gets re-derived wrongly.
+/// conditional for `lawof(Normal(mu = a, …))` at a later-pinned latent `a`.
 ///
 /// Only the `lawof` argument is skipped. Everything else is walked, including a
 /// combinator's non-measure operands (`w` in `weighted(w, lawof(z))`) and a
@@ -2925,15 +2842,12 @@ fn lower_truncate(
 ///
 /// §06 "Support restriction" gives `truncate(M, S)` as ν(A) = M(A ∩ S). A set from
 /// another space makes A ∩ S empty, ν the zero measure, and −∞ its density
-/// everywhere — the emitted number is CORRECT. What is wrong is that a modelling
-/// error reads as a computation: the gate `record(x = …) in interval(lo, hi)` is
-/// false at every query point, with no diagnostic.
+/// everywhere — the emitted number is CORRECT, but a modelling error then reads as a
+/// computation, with no diagnostic.
 ///
-/// There is no repair to make instead. §03 "Sets" spells no record-valued
-/// `interval`, and §04 "Calling conventions"' auto-splat does not reach a record
-/// "given alongside other arguments" — `truncate(M, S)` has two — so nothing
-/// licenses projecting the record's field onto the scalar set. Name both spaces
-/// and refuse.
+/// No repair is licensed instead: §03 "Sets" spells no record-valued `interval`, and
+/// §04 "Calling conventions"' auto-splat does not reach a record "given alongside
+/// other arguments" — `truncate(M, S)` has two.
 ///
 /// Refuse on PROOF, not on absence of evidence: an unprovable variate kind or set
 /// kind keeps lowering, so a working model does not start refusing.
@@ -2957,12 +2871,8 @@ fn refuse_truncation_set_kind_mismatch(
         node,
         m,
         &format!(
-            "the truncation set's space does not match the measure's variate: the set is a set of \
-             {} ({set_label}) but the variate is {} ({}) — §06 \"Support restriction\" is \
-             ν(A) = M(A ∩ S), so the restriction is the zero measure and its density is −∞ at \
-             every point. No §03 rule reads a set of one space as a set of another, and §04's \
-             auto-splat does not apply to `truncate`'s two arguments: give a truncation set over \
-             the variate's own space",
+            "truncate's set is a set of {} ({set_label}) but the variate is {} ({}): §06 \
+             \"Support restriction\" ν(A) = M(A ∩ S) is then the zero measure, −∞ everywhere",
             sk.plural(),
             vk.article_noun(),
             m.display_type(domain),
@@ -3038,22 +2948,19 @@ fn predefined_set_kind(m: &Module, s: NodeId) -> Option<(VariateKind, String)> {
 /// holds, and `witness` — a point the arm is safe at — where it does not.
 ///
 /// §07: "`ifelse` and `land`/`lor` do not guarantee short-circuit evaluation". The
-/// StableHLO lowering is `stablehlo.select`, which evaluates both operands. For the
-/// VALUE that is harmless — select RETURNS one arm, it does not blend them, so the
-/// excluded point's density never reaches the result. For the GRADIENT it is not:
-/// reverse mode sends a ZERO cotangent to the untaken arm, and `0 · ±inf` and
-/// `0 · NaN` are both NaN, which then propagates into every parameter that arm
-/// reaches. Measured with jax 0.4.36: `where(y >= 0, sqrt(y), -inf)` at `y = -0.5` has
-/// value −inf and gradient **NaN**; with the input sanitised, gradient 0. The emitted
-/// FlatPDL is differentiated (Enzyme-JAX over the StableHLO lowering), so this is not
-/// hypothetical.
+/// StableHLO lowering is `stablehlo.select`, which evaluates both operands. The VALUE
+/// is fine — select returns one arm. The GRADIENT is not: reverse mode sends a ZERO
+/// cotangent to the untaken arm, and `0 · ±inf` and `0 · NaN` are both NaN, which
+/// propagates into every parameter that arm reaches. Measured with jax 0.4.36:
+/// `where(y >= 0, sqrt(y), -inf)` at `y = -0.5` has value −inf and gradient **NaN**;
+/// with the input sanitised, gradient 0. The emitted FlatPDL IS differentiated
+/// (Enzyme-JAX over the StableHLO lowering).
 ///
-/// Hence the arm is built over a point INSIDE the gate and no dangerous op ever sees
-/// the excluded value. Do NOT instead reason operator by operator about which
-/// derivative happens to stay finite: `log` survives only because `1/y` is finite for
-/// negative `y`, and even that breaks at `y = 0`, where `0 · inf` is NaN. This is the
-/// discipline `crates/stablehlo/src/registry.rs` states for `log_bessel_i0` — prove
-/// the dangerous op never sees a bad input.
+/// So the arm is built over a point INSIDE the gate and no dangerous op sees the
+/// excluded value. Do NOT instead argue operator by operator about which derivative
+/// stays finite: `log` survives only because `1/y` is finite for negative `y`, and even
+/// that breaks at `y = 0`. Same discipline as `log_bessel_i0` in
+/// `crates/stablehlo/src/registry.rs` — prove the dangerous op never sees a bad input.
 ///
 /// `witness = None` (no point is derivable) leaves the arm over the raw query point.
 fn gate_point(m: &mut Module, cond: NodeId, v: NodeId, witness: Option<NodeId>) -> NodeId {
@@ -3217,24 +3124,21 @@ fn lower_pushfwd(
         }
     };
     // The image gate. §06 `(f_*M)(Y) = M(f⁻¹(Y))`: outside the image the preimage is
-    // empty, so the measure is 0 and the log-density −∞ — a computable value, not an
-    // intractable one, hence a gate and not a refusal. Ungated, `f⁻¹` is read at a
-    // point that has no preimage and the query returns a finite number
-    // (`pushfwd(exp, Normal)` at `y ≤ 0` scores the base at `log y`).
+    // empty, the measure 0 and the log-density −∞ — computable, hence a gate and not a
+    // refusal. Ungated, `pushfwd(exp, Normal)` at `y ≤ 0` scores the base at `log y`
+    // and returns a finite number.
     //
-    // `None` leaves the density unwrapped — the image is not determinable for every
+    // `None` leaves the density unwrapped: the image is not determinable for every
     // forward map (an explicit `bijection` over an unrecognised `f`, a dynamic-length
-    // elementwise map), and the gate is an addition to the change of variables, not a
-    // precondition for it.
+    // elementwise map), and the gate is an addition to the change of variables.
     //
-    // The whole change of variables is gated, not just the base term: outside the image
-    // there is no mass to weigh. The sanitised point is substituted into the emitted arm
-    // rather than fed to the change of variables, so a §13 pin still records the raw
-    // preimage (`crate::driver::substitute_in_tree`, as in [`lower_truncate`]).
+    // The WHOLE change of variables is gated, not just the base term — outside the
+    // image there is no mass to weigh. The sanitised point is substituted into the
+    // emitted arm rather than fed to the change of variables, so a §13 pin still
+    // records the raw preimage (as in [`lower_truncate`]).
     //
-    // The image and lattice conditions are ONE gate: they exclude the same kind of
-    // point (one with no preimage, one whose preimage is no atom), so they take one
-    // sanitisation and one selection rather than a nested pair.
+    // Image and lattice are ONE gate: they exclude the same kind of point, so they take
+    // one sanitisation and one selection rather than a nested pair.
     let image = crate::invert::forward_image(m, forward, &domain, v, &support);
     let cond = match (image.as_ref().map(|g| g.cond), lattice) {
         (Some(a), Some(b)) => Some(build_call(m, "land", &[a, b])),
@@ -3327,36 +3231,29 @@ fn variate_is_vector(domain: &Type) -> bool {
 /// variate kind, checked on the ORIGINAL typed `v` — before the preimage is
 /// synthesised.
 ///
-/// Only for a SYNTHESISED forward (§06 case 1), which is where the soundness
-/// argument holds: every map [`crate::invert`] recognises is kind-PRESERVING (a
-/// scalar chain, a matrix-affine or an elementwise map over a vector; §06 case 2's
-/// projection, the one kind-changing form, is dispatched before this), so a
-/// scalar-domain law scored at a record or vector has no change of variables and
-/// there is no correct value to emit.
+/// Only for a SYNTHESISED forward (§06 case 1): every map [`crate::invert`] recognises
+/// is kind-PRESERVING (§06 case 2's projection, the one kind-changing form, is
+/// dispatched before this), so a scalar-domain law scored at a record or vector has no
+/// change of variables and no correct value to emit.
 ///
-/// An explicit `bijection` is NOT checked here. §06 sanctions a kind-changing
-/// annotation outright — `logvolume` "generalizes the log-absolute-determinant of
-/// the Jacobian to mappings between spaces of different dimension", and "the user
-/// asserts that `f_inv` is the inverse of `f` … FlatPPL implementations are not
-/// required to verify this". A `functionof`/lambda `f_inv` that cannot bind the
-/// point's fields refuses in [`crate::kernel::reduce_kernel_application`], and the
-/// one unverifiable spelling — a BARE operator applied at a record — refuses in
-/// [`apply_change_of_variables`].
+/// An explicit `bijection` is NOT checked here — §06 sanctions a kind-changing
+/// annotation, since `logvolume` "generalizes the log-absolute-determinant of the
+/// Jacobian to mappings between spaces of different dimension" and implementations "are
+/// not required to verify" the asserted inverse. A `functionof`/lambda `f_inv` that
+/// cannot bind the point's fields refuses in
+/// [`crate::kernel::reduce_kernel_application`]; a BARE operator applied at a record
+/// refuses in [`apply_change_of_variables`].
 ///
-/// [`build_density_term`]'s downstream guard cannot see this: by the time the base
-/// is scored, the point is `f_inv(v)` — a node inference never typed — so
-/// `variate_kind` is `None` there and its conservative unknown-passes branch no-ops.
+/// [`build_density_term`]'s downstream guard cannot see this: by then the point is
+/// `f_inv(v)`, a node inference never typed, so `variate_kind` is `None` there.
 fn refuse_variate_kind_mismatch(m: &Module, domain: &Type, v: NodeId) -> Result<(), RefuseError> {
     if let (Some(dk), Some(vk)) = (variate_kind(domain), m.type_of(v).and_then(variate_kind)) {
         if dk != vk {
             return Err(refuse(
                 v,
                 m,
-                "the query point's type does not match the kind of the pushforward base \
-                 measure's variate, and every forward map synthesised here preserves that kind \
-                 — a scalar-domain law scored at a record or vector has no change of variables \
-                 (§06 \"Engine contract for pushfwd density evaluation\"): refuse rather than \
-                 emit an ill-typed application of the inverse",
+                "the query point's kind does not match the pushforward base variate, and every \
+                 synthesised forward map preserves kind (§06 \"Engine contract for pushfwd\")",
             ));
         }
     }
@@ -3411,10 +3308,8 @@ fn refuse_unproven_reference(node: NodeId, m: &Module) -> RefuseError {
     refuse(
         node,
         m,
-        "the base measure's variate does not prove its reference measure (§06 \"Density \
-         convention\": Lebesgue for a continuous variate, counting for a discrete one), so \
-         whether the change of variables carries a volume element is undecided — refuse rather \
-         than guess continuous and rescale a discrete measure's atoms",
+        "the variate does not prove a reference measure (§06 \"Density convention\": Lebesgue for \
+         continuous, counting for discrete), so the volume element is undecided",
     )
 }
 
@@ -3423,30 +3318,19 @@ fn refuse_unproven_reference(node: NodeId, m: &Module) -> RefuseError {
 /// the check [`crate::sample::lower_pushfwd_sample`] performs on its FORWARD
 /// application, and it exists for the same reason.
 ///
-/// [`build_user_call`] emits `(%call callee point)`, and a `CallHead::User` that
-/// survives to exit is neither a deterministic op nor a `builtin_*` primitive, so it
-/// is not FlatPDL. `is_flatpdl` rejects the shape at exit
-/// (`NonConformKind::ResidualUserCall`), so the residual refuses either way; this
-/// check earns its place by naming WHICH map failed to bind against WHICH point,
-/// where the gate reports a generic residual. Two forms resolve, and this admits
-/// exactly those two:
+/// A residual `CallHead::User` refuses at exit anyway
+/// (`NonConformKind::ResidualUserCall`); reducing HERE names WHICH map failed to bind
+/// against WHICH point. Two forms resolve, and only these two are admitted:
 ///
-/// * a **bare builtin** callee — directly a [`Node::Const`], or a `(%ref self f)`
-///   whose binding is one (`f = log`), which `canon::fold`'s alias resolution
-///   inlines before `canon::inline`'s `builtin_callee_head` rewrites the head to a
-///   direct builtin call. There is nothing to beta-reduce, so the application is
-///   emitted as written and those two passes finish it — EXCEPT at a record point,
-///   which refuses for the reason [`crate::sample::lower_pushfwd_sample`]'s bare
-///   arm gives;
+/// * a **bare builtin** callee — a [`Node::Const`], or a `(%ref self f)` whose binding
+///   is one (`f = log`), which `canon::fold` inlines before `canon::inline`'s
+///   `builtin_callee_head` rewrites the head. Nothing to beta-reduce, so it is emitted
+///   as written — EXCEPT at a record point, which refuses;
 /// * a **reified** `functionof`/lambda that beta-reduces under
 ///   [`crate::kernel::reduce_kernel_application`].
 ///
-/// Anything else refuses. Reducing HERE rather than leaving it to
-/// `canon::inline`'s later sweep is what keeps the refusal SPECIFIC: that pass
-/// leaves a call it cannot reduce in place by design, and the exit gate then
-/// refuses it generically. The shape this actually catches is a map applied to a variate it
-/// cannot bind against — a record-valued variate scored against a scalar-domain law,
-/// where the splat has no field to match the map's parameter.
+/// The shape this catches is a map applied to a variate it cannot bind against — a
+/// record-valued variate scored against a scalar-domain law.
 fn apply_change_of_variables(
     m: &mut Module,
     node: NodeId,
@@ -3460,23 +3344,18 @@ fn apply_change_of_variables(
     // call, so admit it unreduced exactly as the sample side does.
     if matches!(m.node(resolve_ref_one(m, callee).0), Node::Const(_)) {
         // At a RECORD point the application is §04 auto-splatting against that
-        // operator's own argument names, and those names are not available here (a
-        // deterministic builtin's catalogue row carries argument TYPES only), so the
-        // correspondence cannot be checked — the same wall `lower_pushfwd_sample`'s
-        // bare arm hits on the forward application. Unchecked it emits
-        // `op(record(…))`, which no gate rejects.
+        // operator's own argument names, which a deterministic builtin's catalogue row
+        // does not carry (argument TYPES only) — the same wall
+        // `lower_pushfwd_sample`'s bare arm hits. Unchecked it emits `op(record(…))`,
+        // which no gate rejects.
         if expect_builtin_call(m, point, "record").is_some() {
             return Err(refuse(
                 node,
                 m,
                 &format!(
-                    "the change of variables' `{role}` is a bare built-in operator applied to a \
-                     record, which is §04 auto-splatting against that operator's argument names \
-                     — and those names are not available to the determiniser (only measure \
-                     constructors carry ordered parameter names in the catalogue). This may be a \
-                     well-formed call, but an unchecked mismatch would emit `op(record(…))` that \
-                     no gate rejects — write the map as a functionof or lambda whose parameter \
-                     names are the record's field names, which IS checkable"
+                    "`{role}` is a bare built-in applied to a record: §04 auto-splatting needs \
+                     argument names the catalogue lacks — use a functionof or lambda over the \
+                     fields"
                 ),
             ));
         }
@@ -3487,12 +3366,8 @@ fn apply_change_of_variables(
             node,
             m,
             &format!(
-                "the change of variables' `{role}` does not reduce when applied to the variate: \
-                 its parameter list does not bind against the value being scored (for a \
-                 record-valued variate, application binds the map's parameters by field name, so \
-                 a scalar-domain law scored at a record has nothing to bind). The application \
-                 would survive as an unreduced `%call`, which is not FlatPDL — refuse rather than \
-                 emit it"
+                "`{role}` does not reduce at the variate: its parameters do not bind the scored \
+                 value (§04 binds a record's fields by name), leaving an unreduced `%call`"
             ),
         )
     })
@@ -3785,10 +3660,8 @@ fn lower_projection_pushfwd(
         return Err(refuse(
             m_inner,
             m,
-            "structural projection (§06 case 2) is recognised for the SUBSET selector \
-             `pushfwd(fn(get(_, [k, …])), M)`; single-element access `get(_, k)` projects onto \
-             one component and changes the variate kind — write the subset form and score at a \
-             one-component point — refuse rather than mislower",
+            "§06 case 2 projection needs the SUBSET selector `pushfwd(fn(get(_, [k, …])), M)`; \
+             `get(_, k)` projects onto one component, changing the variate kind",
         ));
     }
     match &proj.sel {
@@ -3802,10 +3675,9 @@ fn lower_projection_pushfwd(
                 m_inner,
                 m,
                 &format!(
-                    "structural projection (§06 case 2) is recognised but uses {what}, which this \
-                     arm does not lower to a closed-form marginal; the supported selectors are a \
-                     vector of field names `get(_, [\"a\", …])` and a vector of component indices \
-                     `get(_, [1, …])` — refuse rather than mislower"
+                    "structural projection (§06 case 2) uses {what}; the supported selectors are a \
+                     vector of field names `get(_, [\"a\", …])` or of component indices `get(_, \
+                     [1, …])`"
                 ),
             ))
         }
@@ -3975,12 +3847,8 @@ fn lower_named_projection(
             m_inner,
             m,
             &format!(
-                "structural projection (§06 case 2) by FIELD NAME is closed-form only over an \
-                 explicit field-keyed product (keyword `joint` / record-of-draws / `jointchain`) \
-                 or an index-keyed product named by `relabel` (iid / positional joint); got `{}`, \
-                 which has no explicit product structure to select a field of — §06 case 2 \
-                 permits refusing a projection off a non-product measure — refuse rather than \
-                 mislower",
+                "structural projection (§06 case 2) by FIELD NAME needs a field-keyed product \
+                 (keyword `joint` / record-of-draws / `jointchain`) or a `relabel`; got `{}`",
                 other.unwrap_or("<non-builtin>")
             ),
         )),
@@ -3992,24 +3860,20 @@ fn lower_named_projection(
 /// `jointchain` — whose variate is an array / `cat` vector addressed by position.
 ///
 /// The marginal is the sub-product over the selected slots, scored at the projected
-/// point's own slots `0 … k-1`: for an independent product the unselected
-/// components integrate to 1 and drop (§06 "joint and iid (independent
-/// products)"), so the marginal is the sum of the kept components' densities. This
-/// emits that sum directly against `get0(v, j)` — the same per-slot unroll
-/// [`lower_iid`] and [`lower_joint`] use — because a synthesised sub-`iid` node
-/// would carry no inferred domain for [`iid_static_size`] to read.
+/// point's own slots `0 … k-1`: for an independent product the unselected components
+/// integrate to 1 and drop (§06 "joint and iid (independent products)"). The sum is
+/// emitted directly against `get0(v, j)` — the per-slot unroll [`lower_iid`] and
+/// [`lower_joint`] use — because a synthesised sub-`iid` node would carry no inferred
+/// domain for [`iid_static_size`] to read.
 ///
-/// **Scope (refuse-don't-mislower).** A FIELD-keyed product (keyword `joint`,
-/// record-of-draws, `relabel`, a record-family `jointchain`) has a record variate
-/// that an integer slot does not address — refuse and name the by-field spelling.
-/// A `jointchain` is a DEPENDENT product: only a leading PREFIX keep is closed-form
-/// (the dropped trailing kernels are normalized Markov kernels that integrate to
-/// 1); any other keep is the `kchain` integral and refuses.
+/// A FIELD-keyed product has a record variate that an integer slot does not address —
+/// refuse and name the by-field spelling. A `jointchain` is DEPENDENT: only a leading
+/// PREFIX keep is closed-form (the dropped trailing kernels are normalized Markov
+/// kernels that integrate to 1); any other keep is the `kchain` integral and refuses.
 ///
-/// **The query point is checked before any slot is built.** Every slot here is a
-/// `get0(v, j)`, which is only meaningful for a point of the base's own variate
-/// KIND and of the SELECTED length — a scalar point would emit `get0(0.5, 0)` and an
-/// over-long point would drop its tail, both silently.
+/// The query point is checked before any slot is built: `get0(v, j)` is meaningful only
+/// for a point of the base's variate KIND and of the SELECTED length — a scalar point
+/// would emit `get0(0.5, 0)` and an over-long point would drop its tail, both silently.
 fn lower_index_projection(
     m: &mut Module,
     m_inner_expr: NodeId,
@@ -4033,9 +3897,9 @@ fn lower_index_projection(
                 refuse(
                     m_inner,
                     m,
-                    "structural projection over an iid whose size is not a statically-resolved \
-                     1-D count (dynamic / multi-axis / unresolved) — its slots cannot be \
-                     selected by position — refuse rather than mislower",
+                    "structural projection over an iid whose size is not a statically-resolved 1-D \
+                     count (dynamic / multi-axis / unresolved): its slots have no positions to \
+                     select",
                 )
             })?;
             let inner = {
@@ -4078,8 +3942,7 @@ fn lower_index_projection(
                         m_inner,
                         m,
                         "structural projection by INDEX over a KEYWORD joint: its variate is a \
-                         record keyed by field name, which an integer slot does not address — \
-                         project it by name (`get(_, [\"a\", …])`) — refuse rather than mislower",
+                         record keyed by field name — project it by name, `get(_, [\"a\", …])`",
                     ));
                 }
                 if c.args.len() < 2 {
@@ -4099,9 +3962,8 @@ fn lower_index_projection(
                         comp,
                         m,
                         "structural projection by index over a positional joint needs every \
-                         component's variate CONFIRMED scalar (a non-scalar or unresolved \
-                         component occupies several `cat` slots, so an index no longer names a \
-                         component) — refuse rather than mislower",
+                         component's variate CONFIRMED scalar; a non-scalar one occupies several \
+                         `cat` slots",
                     ));
                 }
             }
@@ -4134,20 +3996,15 @@ fn lower_index_projection(
         Some("relabel") | Some("record") => Err(refuse(
             m_inner,
             m,
-            "structural projection by INDEX over a field-keyed measure (`relabel(...)` names its \
-             component slots, a record-of-draws is keyed by field): its variate is a record, \
-             which an integer slot does not address — project it by name — refuse rather than \
-             mislower",
+            "structural projection by INDEX over a field-keyed measure (`relabel`, \
+             record-of-draws): its variate is a record, not integer slots — project it by name",
         )),
         other => Err(refuse(
             m_inner,
             m,
             &format!(
-                "structural projection (§06 case 2) by INDEX is closed-form only over an \
-                 index-keyed product (`iid`, positional `joint`, scalar-cat `jointchain`); got \
-                 `{}`, which has no explicit product structure to select a slot of — §06 case 2 \
-                 permits refusing a projection off a non-product measure — refuse rather than \
-                 mislower",
+                "structural projection (§06 case 2) by INDEX needs an index-keyed product (`iid`, \
+                 positional `joint`, scalar-cat `jointchain`); got `{}`",
                 other.unwrap_or("<non-builtin>")
             ),
         )),
@@ -4181,8 +4038,7 @@ fn lower_scalar_chain_index_projection(
             node,
             m,
             "structural projection by INDEX over a RECORD-family `jointchain`: its variate is a \
-             record keyed by the components' field names, which an integer slot does not address \
-             — project it by name — refuse rather than mislower",
+             record keyed by the components' field names — project it by name",
         ));
     }
     let args: Vec<NodeId> = {
@@ -4208,11 +4064,8 @@ fn lower_scalar_chain_index_projection(
             return Err(refuse(
                 node,
                 m,
-                "structural projection over a `jointchain` keeps the leading prefix in a PERMUTED \
-                 order: the sub-chain is scored positionally (slot j of the point feeds component \
-                 j), and §07 does not state whether subset selection follows selector order or \
-                 container order, so a permuted keep has no settled marginal — write the selection \
-                 in ascending order — refuse rather than mislower",
+                "projection over a `jointchain` keeps a PERMUTED prefix: the sub-chain scores \
+                 positionally and §07 leaves subset order unspecified — write it ascending",
             ));
         }
         return Err(refuse_jointchain_nonprefix(m, node));
@@ -4226,8 +4079,7 @@ fn lower_scalar_chain_index_projection(
                 node,
                 m,
                 "structural projection over a `jointchain` drops a trailing kernel whose body is \
-                 not a confirmed normalized probability measure, so dropping it would silently \
-                 omit mass from the marginal — refuse rather than mislower",
+                 not a confirmed normalized probability measure, so mass would go missing",
             ));
         }
     }
@@ -4287,9 +4139,8 @@ fn refuse_point_length_mismatch(m: &Module, v: NodeId, k: usize) -> Result<(), R
             v,
             m,
             &format!(
-                "structural projection selects {k} component(s) but the query point has {n} — the \
-                 projected variate is the sub-product over the selected components, so a longer \
-                 point would have its tail silently dropped — refuse rather than mislower"
+                "structural projection selects {k} component(s) but the query point has {n}; the \
+                 projected variate is the sub-product, so the point's tail would be dropped"
             ),
         ));
     }
@@ -4322,8 +4173,7 @@ fn normalize_selected_indices(
                 m,
                 &format!(
                     "structural projection selects index {i}, outside {lo}..={hi} for this \
-                     {n}-component product ({} indexing, §07 `get0`) — refuse rather than \
-                     mislower",
+                     {n}-component product ({} indexing, §07 `get0`)",
                     if one_based {
                         "`get` is 1-based"
                     } else {
@@ -4339,8 +4189,7 @@ fn normalize_selected_indices(
                 m,
                 &format!(
                     "structural projection selects index {i} twice — the sub-product would score \
-                     that component twice, double-counting its density term — refuse rather than \
-                     mislower"
+                     that component twice, double-counting its density term"
                 ),
             ));
         }
@@ -4370,9 +4219,8 @@ fn refuse_unnormalized_dropped_component(
             node,
             m,
             &format!(
-                "projection drops a non-normalized component ({what}); the marginal is not \
-                 closed-form here (§06 case 2 requires each dropped component to be a normalized \
-                 probability measure) — refuse rather than mislower"
+                "projection drops a non-normalized component ({what}); §06 case 2 requires each \
+                 dropped component to be a normalized probability measure"
             ),
         ));
     }

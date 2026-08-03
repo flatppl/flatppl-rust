@@ -4,18 +4,16 @@
 //! read where it has no preimage and the query returns a FINITE number —
 //! `pushfwd(exp, Normal(0,1))` at `y = -0.5` scored the base at `log(-0.5)`.
 //!
-//! The emitted form is `truncate`'s (one pair of builders, `density::gate_point` and
-//! `density::gate_density`): the change of variables reads `ifelse(cond, y, witness)`
-//! and the result is `ifelse(cond, <change of variables>, neg(inf))`. It is a gate
-//! rather than a refusal because §06 fixes the value there — refusing would deny a
-//! query whose answer the spec gives. The sanitised input is not cosmetic: `ifelse`
-//! lowers to `stablehlo.select`, which evaluates both operands, and the untaken arm's
-//! zero cotangent times a NaN or infinite derivative is NaN.
+//! The emitted form is `truncate`'s (`density::gate_point` and `density::gate_density`):
+//! the change of variables reads `ifelse(cond, y, witness)` and the result is
+//! `ifelse(cond, <change of variables>, neg(inf))`. A gate rather than a refusal because
+//! §06 fixes the value there. The sanitised input is not cosmetic: `ifelse` lowers to
+//! `stablehlo.select`, which evaluates both operands, and the untaken arm's zero cotangent
+//! times a NaN or infinite derivative is NaN.
 //!
-//! Structural only (flatppl-rust is not a density engine): assert the emitted
-//! FlatPDL. Each gate is asserted alongside the change of variables it wraps, and
-//! an ONTO map is asserted to carry no gate — so neither a gate that swallowed the
-//! density nor one emitted unconditionally passes here.
+//! Structural only (flatppl-rust is not a density engine). Each gate is asserted alongside
+//! the change of variables it wraps, and an ONTO map is asserted to carry NO gate — so
+//! neither a gate that swallowed the density nor one emitted unconditionally passes.
 use flatppl_determinizer::{determinize, is_flatpdl};
 
 mod common;

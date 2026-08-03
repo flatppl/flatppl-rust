@@ -81,20 +81,17 @@ fn inline_walk(m: &mut Module, id: NodeId) -> NodeId {
     id
 }
 
-/// If `id` is `(%call <bare builtin> args…)`, the `Builtin` head that same
-/// application spells directly. A [`Node::Const`] is "a bare built-in symbol in
-/// value position … only for base built-ins" (user bindings are `Ref`), so
-/// applying one IS a builtin call — `(%call log 0.5)` and `(log 0.5)` denote the
-/// same thing, but only the latter is FlatPDL (deterministic ops + the six
-/// `builtin_*` primitives; a `%call` is neither) and only the latter carries a
-/// resolved type, since `reduce_kernel_application` can beta-reduce a reified
-/// `functionof` callee but has nothing to reduce for a bare operator.
+/// If `id` is `(%call <bare builtin> args…)`, the `Builtin` head that same application
+/// spells directly. A [`Node::Const`] is a bare built-in symbol (user bindings are `Ref`),
+/// so applying one IS a builtin call: `(%call log 0.5)` and `(log 0.5)` denote the same
+/// thing, but only the latter is FlatPDL and only the latter carries a resolved type —
+/// `reduce_kernel_application` beta-reduces a reified `functionof` callee and has nothing
+/// to reduce for a bare operator.
 ///
-/// This is what makes §06's two `pushfwd` spellings agree: a synthesized
-/// `f_inv` that is one builtin is emitted as the bare operator (the form
-/// `broadcast` needs, and the form a user writes in `bijection(exp, log, …)`),
-/// while a composed one is a lambda that beta-reduces — both then land on the
-/// same direct builtin call.
+/// This is what makes §06's two `pushfwd` spellings agree: a synthesized one-builtin
+/// `f_inv` is emitted as the bare operator (what `broadcast` needs, and what a user writes
+/// in `bijection(exp, log, …)`) while a composed one is a lambda that beta-reduces — both
+/// land on the same direct builtin call.
 fn builtin_callee_head(m: &Module, id: NodeId) -> Option<CallHead> {
     let Node::Call(c) = m.node(id) else {
         return None;

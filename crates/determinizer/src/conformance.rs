@@ -104,14 +104,12 @@ fn visit(m: &Module, id: NodeId, parent_builtin: Option<&str>, bad: &mut Vec<Non
         }
     }
     if let Node::Call(c) = m.node(id) {
-        // A residual `CallHead::User` application. `canon::inline` beta-reduces
-        // every user call it CAN reduce and leaves the rest in place refuse-free,
-        // so an unresolved callee or an arity mismatch reaches exit as a live
-        // `(%call (%ref self f) …)`. FlatPDL admits deterministic ops and the six
-        // `builtin_*` primitives (§07 "Measure kernel evaluation primitives");
-        // an application of a user-defined callable is neither, and the surface
-        // printer spells it `f(x)` exactly like a builtin call, so nothing
-        // downstream can tell the two apart.
+        // A residual `CallHead::User` application. `canon::inline` leaves a call it
+        // cannot reduce in place refuse-free, so an unresolved callee or an arity mismatch
+        // reaches exit as a live `(%call (%ref self f) …)`. FlatPDL admits deterministic
+        // ops and the six `builtin_*` primitives (§07 "Measure kernel evaluation
+        // primitives"), and the surface printer spells a user call `f(x)` exactly like a
+        // builtin one, so nothing downstream can tell them apart.
         if matches!(c.head, CallHead::User(_)) {
             bad.push(NonConformance {
                 node: id,

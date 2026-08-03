@@ -1682,13 +1682,11 @@ fn lower_gt_and_lt_emit_matching_compare_directions() {
     }
 }
 
-/// §03 `pi` — the scalar constant, in the EXACT shape the open-image gate
-/// builds it: `lt(y, divide(pi, 2.0))`, `atan`'s upper endpoint
-/// (`determinizer::invert::half_pi`, a `Node::Const` under §07 `divide`). The
-/// literal is `f64`'s shortest round-trip text, which the MLIR parser rounds to
-/// the nearest f32 in an f32 module — the same treatment every other real
-/// literal gets (`dense<3.141592653589793>` already appears in a frozen f32
-/// golden).
+/// §03 `pi` — the scalar constant in the EXACT shape the open-image gate builds it:
+/// `lt(y, divide(pi, 2.0))`, `atan`'s upper endpoint (`determinizer::invert::half_pi`, a
+/// `Node::Const` under §07 `divide`). The literal is `f64`'s shortest round-trip text,
+/// which the MLIR parser rounds to the nearest f32 in an f32 module, as every other real
+/// literal is.
 #[test]
 fn lower_pi_emits_the_constant_the_open_image_endpoint_needs() {
     let mut m = Module::new();

@@ -1002,16 +1002,14 @@ lp = logdensityof(lawof(record(a = y1, b = y2, d = d)), record(a = 0.5, b = 0.25
     determinize(&m).expect_err("k=3 > n=2 has no density — must refuse");
 }
 
-// A field reaching TWO draws breaks the diagonality that makes the distinct-draw
-// check equivalent to a rank check, so it must refuse until the guard computes a
-// real rank. Both spellings below are k = n = 2 with rank J_Φ < 2 over
-// `s = y1 + y2`, so no density exists in either:
+// A field reaching TWO draws breaks the diagonality that makes the distinct-draw check
+// equivalent to a rank check, so it refuses until the guard computes a real rank. Both
+// spellings below are k = n = 2 with rank J_Φ < 2 over `s = y1 + y2`, so neither has a
+// density:
 //
-// * `record(a = s, b = y1)` — `a` is a map of BOTH draws while `b` is a map of
-//   `y1` alone, so a naive per-field reading that resolved `a` to a single site
-//   would see two DISTINCT sites and admit a singular joint;
-// * `record(a = s, b = s)` — the rank-1 case: both fields are the same map of both
-//   draws, so J_Φ has rank 1 against n = 2.
+// * `record(a = s, b = y1)` — a per-field reading that resolved `a` to one site would see
+//   two DISTINCT sites and admit a singular joint;
+// * `record(a = s, b = s)` — rank 1 against n = 2.
 #[test]
 fn field_over_two_draws_refuses() {
     for query in [
@@ -1040,20 +1038,16 @@ s = y1 + y2
 // Sample path: what admitting a composed measure must NOT admit
 // ---------------------------------------------------------------------------
 
-// The field-position counterpart, and the guardrail for admitting a bare closed
-// measure in MEASURE position: a record FIELD holding an un-drawn measure must
-// still refuse. Admitting a bare constructor in measure position must not leak
-// into the per-field fold, or this would silently sample a variate the model
-// never declared — fabricating a draw. `lower_measure_sample` keeps refusing;
-// only the measure-position entry point gained the leaf case.
+// The guardrail for admitting a bare closed measure in MEASURE position: a record FIELD
+// holding an un-drawn measure must still refuse, or this would sample a variate the model
+// never declared. `lower_measure_sample` keeps refusing; only the measure-position entry
+// point gained the leaf case.
 //
-// The record MUST also contain a real draw. Without one it is not
-// Stochastic-phase, so `lower_closed_measure_sample`'s `lawof` arm refuses on the
-// phase check BEFORE the per-field fold runs at all — which would make this
-// guardrail vacuous, staying green even if the constructor leaf were moved into
-// `lower_measure_sample` (the exact regression it exists to catch). Hence the `y`
-// field, and hence the assertion on `construct`/`reason` rather than on the
-// refusal merely being non-empty.
+// The record MUST also contain a real draw (`y`). Without one it is not
+// Stochastic-phase, so the `lawof` arm's phase check refuses BEFORE the per-field fold
+// runs and the guardrail goes vacuous — green even if the constructor leaf moved into
+// `lower_measure_sample`. Hence also the assertion on `construct`/`reason` rather than on
+// a non-empty refusal.
 #[test]
 fn undrawn_measure_in_a_record_field_still_refuses() {
     let src = "\
@@ -1104,15 +1098,13 @@ draws = rand(s, lawof(record(y1 = y1, y2 = y2, d = d)))";
 }
 
 // Applying a `pushfwd` map to a RECORD variate is an auto-splatting call, and §04
-// "Calling conventions" makes it a static error when the record's field names do
-// not match the callable's argument names. A one-parameter lambda over a two-field
-// record law is exactly that: `r` names no field of `record(y1 = …, y2 = …)`.
+// "Calling conventions" makes a field/argument-name mismatch a static error: `r` names no
+// field of `record(y1 = …, y2 = …)`.
 //
-// Worth pinning in both directions, because the reducer's record branch binds each
-// of the callable's inputs from a like-named field and never checks that every
-// FIELD was consumed — so a map naming a strict SUBSET of the fields would reduce
-// to a silent projection of the variate. A marginalizing projection is a different
-// measure from a full transform, so that would be a wrong sample.
+// Pinned in both directions because the reducer's record branch binds each input from a
+// like-named field and never checks that every FIELD was consumed, so a map naming a
+// strict SUBSET would reduce to a silent projection — a different measure, hence a wrong
+// sample.
 #[test]
 fn rand_of_pushfwd_with_mismatched_record_map_refuses() {
     let src = "\
@@ -1124,7 +1116,7 @@ draws = rand(s, pushfwd(r -> get(r, \"y1\") - get(r, \"y2\"), lawof(record(y1 = 
     let err = determinize(&m)
         .expect_err("a map whose parameters do not match the record variate's fields must refuse");
     assert!(
-        err.reason.contains("do not correspond"),
+        err.reason.contains("does not correspond"),
         "refusal rests on the §04 field/parameter correspondence: {err:?}"
     );
     // Both sides are named, so the message reads as a correspondence failure rather
@@ -1159,14 +1151,10 @@ draws = rand(s, pushfwd(f, lawof(record(y1 = y1, y2 = y2))))";
     );
 }
 
-// The residual net behind the §04 correspondence check: a map that is neither a
-// bare builtin callee nor beta-reducible would leave a surviving `%call`, which is
-// not FlatPDL (deterministic ops + the six `builtin_*` primitives) and which
-// `is_flatpdl` does not flag — it checks phase and type, never a surviving
-// `CallHead::User`. So the sample path reduces the application itself and refuses
-// when it cannot, rather than exiting 0 with a non-conformant module. Here the map
-// takes two inputs and the variate is a scalar, so there is no record to splat and
-// the arity cannot bind.
+// The residual net behind the §04 correspondence check: a map that is neither a bare
+// builtin callee nor beta-reducible leaves a surviving `%call`, which is not FlatPDL. So
+// the sample path reduces the application itself and refuses when it cannot. Here the map
+// takes two inputs and the variate is a scalar, so there is no record to splat.
 #[test]
 fn rand_of_pushfwd_with_unreducible_map_refuses() {
     let src = "\
@@ -1197,7 +1185,7 @@ draws = rand(s, pushfwd(exp, lawof(record(y = y1))))";
     let err = determinize(&m)
         .expect_err("a bare builtin map over a record variate must refuse, not emit exp(record)");
     assert!(
-        err.reason.contains("bare built-in operator"),
+        err.reason.contains("bare built-in"),
         "refusal names the unresolved auto-splat against the operator's parameters: {err:?}"
     );
 }

@@ -11,19 +11,15 @@
 //!
 //! ## One registry, two spellings
 //!
-//! §06 case 1 nowhere distinguishes `pushfwd(g, M)` from `pushfwd(x -> g(x), M)`
-//! — `bijection`'s own entry describes its annotated result as "a function that is
-//! semantically `f`" — so the spelling must not change the outcome. [`REGISTRY`]
-//! is the single table of §06's named unary bijections, and it is reached through
-//! ONE lookup ([`unary_entry`]) from both entry points: [`bare_bijection`] for a
-//! bare builtin value, [`classify`] for an op inside a lambda body. Each entry
-//! carries its inverse, its FORWARD log-volume `log|g'|`, its §06 domain
-//! restriction and its IMAGE, with the two emissions kept as BUILDERS parameterised
-//! by the point the derivative is taken at — which is what lets one table serve
-//! both: a chain needs `log|g'|` at a node it already holds, not a callable to
-//! apply. The image is read by [`forward_image`] for the density path's −∞ gate on
-//! the query point, from the same table and off the forward map alone, so no
-//! spelling of `pushfwd` gates differently from another.
+//! §06 case 1 nowhere distinguishes `pushfwd(g, M)` from `pushfwd(x -> g(x), M)`, so
+//! the spelling must not change the outcome. [`REGISTRY`] is the single table of §06's
+//! named unary bijections, reached through ONE lookup ([`unary_entry`]) from both
+//! [`bare_bijection`] (a bare builtin value) and [`classify`] (an op inside a lambda
+//! body). Each entry carries its inverse, its FORWARD log-volume `log|g'|`, its §06
+//! domain restriction and its IMAGE. The two emissions are BUILDERS parameterised by
+//! the point the derivative is taken at, because a chain needs `log|g'|` at a node it
+//! already holds, not a callable to apply. [`forward_image`] reads the image from the
+//! same table, so no spelling of `pushfwd` gates differently from another.
 //!
 //! ## Scalar-chain inversion
 //!
@@ -61,13 +57,9 @@
 //! 2x + log 2` (the `2x` is `exp`'s partial-forward point).
 //!
 //! A domain-restricted registry op (`log`, `log10`, `log1p`, `logit`, `probit`,
-//! `sqrt`) is admitted in a chain ONLY where its input IS the base variate —
-//! innermost — and there the base measure's support decides (§06 case 1). An
-//! interior one refuses: the support bounds only the innermost input, and proving
-//! `2·x > 0` from `x > 0`, let alone `log x > 0`, needs interval propagation
-//! through the chain. This over-refuses maps that are in fact well-defined
-//! (`x -> log(2·x)` over a positive base), which is the direction §06 sanctions —
-//! "refused rather than yielding a silently sub-probability measure".
+//! `sqrt`) is admitted in a chain ONLY as the innermost op, where the base measure's
+//! support decides (§06 case 1). An interior one refuses, over-refusing well-defined
+//! maps like `x -> log(2·x)` — see the chain domain check for what would recover them.
 //!
 //! ## Matrix-affine (vector variate) — the MvNormal construction
 //!
@@ -203,10 +195,8 @@ pub(crate) fn derive_bijection(
         return Err(refuse(
             f,
             m,
-            "the pushforward base measure's variate is a matrix, and no recognised forward map \
-             applies to one (§06 case 1 gives scalar, elementwise-over-a-vector and \
-             matrix-vector affine maps): the scalar derivation would emit a single scalar \
-             log-volume where the log-det sums over every cell — refuse rather than mislower",
+            "the pushforward base variate is a matrix and §06 case 1 recognises no matrix forward \
+             map (scalar, elementwise-over-a-vector, matrix-vector affine only)",
         ));
     }
     // The VECTOR variate dispatch comes BEFORE the bare/lambda split, because the
@@ -282,9 +272,8 @@ fn derive_vector_bijection(
             Err(refuse(
                 f,
                 m,
-                "forward map over a vector variate is not a recognised matrix-affine \
-                 (mu + L * x) or elementwise (broadcast(g, x)) map — refuse rather \
-                 than mislower",
+                "forward map over a vector variate is not a recognised matrix-affine (mu + L * x) \
+                 or elementwise (broadcast(g, x)) map",
             ))
         }
         Recognized::Unrecognized => Ok(None),
@@ -1155,8 +1144,7 @@ fn bare_bijection(
                 f,
                 m,
                 &format!(
-                    "pushfwd({op}, M) requires M's support to lie within {op}'s domain, {}; \
-                     refuse rather than mislower a sub-probability measure",
+                    "pushfwd({op}, M) requires M's support to lie within {op}'s domain, {}",
                     domain.describe()
                 ),
             ));
@@ -1192,28 +1180,20 @@ fn derive_chain(
         return Ok(None);
     };
 
-    // §06 case 1's domain restriction, applied to the chain. A domain-restricted
-    // op (`log`, `log10`, `log1p`, `logit`, `probit`, `sqrt`) is undefined outside
-    // its domain, and lowering it there yields a silently SUB-probability measure.
-    // The base measure's support bounds only the INNERMOST op's input; an interior
-    // op receives an intermediate value this pass does not bound. So a
-    // domain-restricted op is admitted ONLY where its input IS the base variate —
-    // innermost, the last element of the outermost-first chain — and there the base
-    // `support` decides. Anywhere else it refuses, which is the direction §06
-    // sanctions: "refused rather than yielding a silently sub-probability measure".
+    // §06 case 1's domain restriction, applied to the chain. A domain-restricted op
+    // (`log`, `log10`, `log1p`, `logit`, `probit`, `sqrt`) lowered outside its domain
+    // yields a silently SUB-probability measure. The base `support` bounds only the
+    // INNERMOST op's input, so a domain-restricted op is admitted ONLY as the last
+    // element of the outermost-first chain; anywhere else it refuses, per §06:
+    // "refused rather than yielding a silently sub-probability measure".
     //
-    // DELIBERATELY CONSERVATIVE, PENDING INTERVAL PROPAGATION THROUGH THE CHAIN.
-    // This rule refuses maps that are in fact perfectly well-defined, whenever the
-    // base support already lies inside the op's domain and the intervening ops
-    // preserve that: `x -> log(2.0 * x)`, `x -> log(x / 2.0)`, `x -> log(x + 1.0)`,
-    // `x -> log(exp(x))`, `x -> sqrt(2.0 * x)` over a positive base are all sound
-    // and all refused here. Recovering them needs the propagated input interval at
-    // each op (every registry forward is monotone on its own domain, so this is
-    // endpoint mapping with orientation tracking, not general interval arithmetic)
-    // checked for CONTAINMENT in that op's domain. That containment check is also
-    // what keeps `x -> log(neg(x))` refusing once propagation exists — its
-    // propagated input lands in the negatives. Until then, read a refusal from this
-    // branch as "not proven", NOT as "unsound".
+    // CONSERVATIVE, pending interval propagation through the chain. Sound maps refuse
+    // here too — `x -> log(2.0 * x)`, `x -> log(x + 1.0)`, `x -> sqrt(2.0 * x)` over a
+    // positive base. Recovering them needs each op's propagated input interval checked
+    // for CONTAINMENT in its domain (every registry forward is monotone on its own
+    // domain, so endpoint mapping with orientation tracking suffices); the same check
+    // keeps `x -> log(neg(x))` refusing. Read a refusal here as "not proven", NOT as
+    // "unsound".
     for (i, op) in ops.iter().enumerate() {
         let ChainOp::Registry {
             op: name, entry, ..
@@ -1227,9 +1207,8 @@ fn derive_chain(
                 body,
                 m,
                 &format!(
-                    "{name} is restricted to {} and sits inside a composition, where its input \
-                     is an intermediate value this pass cannot bound — refuse rather than \
-                     mislower a sub-probability measure",
+                    "{name} is restricted to {} and sits inside a composition, where its input is \
+                     an intermediate value this pass cannot bound",
                     domain.set()
                 ),
             ));
@@ -1240,8 +1219,7 @@ fn derive_chain(
                 m,
                 &format!(
                     "a forward map through {name} requires the base measure's support to lie \
-                     within {name}'s domain, {}; refuse rather than mislower a sub-probability \
-                     measure",
+                     within {name}'s domain, {}",
                     domain.describe()
                 ),
             ));
@@ -1487,8 +1465,7 @@ fn derive_pow(
             f,
             m,
             &format!(
-                "pow(_, {k}) requires M's support to lie within its domain, {}; refuse rather \
-                 than mislower a sub-probability measure",
+                "pow(_, {k}) requires M's support to lie within its domain, {}",
                 domain.describe()
             ),
         ));

@@ -1,12 +1,9 @@
 //! Threading the base measure's refined SUPPORT (a `ValueSet`) into the pushfwd
-//! change-of-variables domain guard (§06 case 1). A domain-restricted forward is
-//! admitted only where the base's support provably lies inside its domain. The
-//! guard used to read the COARSE structural type of the base variate (`scalar
-//! real` → natural extent `reals`), so it conservatively REFUSED every
-//! scalar-real base — even a genuinely positive-support one (`Gamma`,
-//! `Exponential`, a positive `interval`). It now reads the base's inferred
-//! support, so an in-domain base lowers while an out-of-domain one (a
-//! real-support base under `log`, an atom where the forward is ±inf) and an
+//! change-of-variables domain guard (§06 case 1). A domain-restricted forward is admitted
+//! only where the base's support provably lies inside its domain. Reading the COARSE
+//! structural type instead (`scalar real` → `reals`) refused every scalar-real base,
+//! including positive-support ones (`Gamma`, `Exponential`, a positive `interval`). An
+//! out-of-domain base (real support under `log`, an atom where the forward is ±inf) and an
 //! unconstrained one still refuse.
 //!
 //! Structural only (flatppl-rust is not a density engine): assert the emitted
@@ -90,7 +87,8 @@ fn pushfwd_log_over_real_support_still_refuses() {
         "d = pushfwd(fn(log(_)), Normal(mu = 0.0, sigma = 1.0))\nlp = logdensityof(d, 0.5)",
     ))
     .expect_err("pushfwd(log, Normal) over a real-support base must refuse");
-    assert!(format!("{e:?}").contains("refuse"), "got: {e:?}");
+    assert_eq!(e.construct, "log", "got: {e:?}");
+    assert!(e.reason.contains("positive reals"), "got: {e:?}");
 }
 
 #[test]
@@ -120,7 +118,8 @@ fn pushfwd_log_over_discrete_atom_at_zero_refuses() {
         "d = pushfwd(fn(log(_)), Poisson(rate = 1.0))\nlp = logdensityof(d, 0.5)",
     ))
     .expect_err("a discrete base with a positive-mass atom at 0 must refuse");
-    assert!(format!("{e:?}").contains("refuse"), "got: {e:?}");
+    assert_eq!(e.construct, "log", "got: {e:?}");
+    assert!(e.reason.contains("positive reals"), "got: {e:?}");
 }
 
 #[test]
@@ -130,13 +129,11 @@ fn pushfwd_log_over_discrete_positive_integer_support_lowers_without_a_jacobian(
     // pushforward is well-defined and §06 case 1 requires the density: `pmf(k)` at
     // the atom `y = log k`, i.e. the base scored at `exp(y)`.
     //
-    // Regression guard, in the form the maths actually supports: the guard's accept
-    // arm once listed `PosIntegers` alongside the continuous sets while the volume
-    // element was applied unconditionally, so the emitted density at atom
-    // `y = log k` picked up a bogus `+log k` (right only at k = 1). The volume
-    // element is now dropped over a counting reference (§06 "Density convention"),
-    // which is what makes lowering correct here — so this asserts the density is
-    // emitted AND that no change-of-variables term rides along.
+    // Regression guard: the accept arm once listed `PosIntegers` alongside the continuous
+    // sets while the volume element was applied unconditionally, so the density at atom
+    // `y = log k` picked up a bogus `+log k` (right only at k = 1). The volume element is
+    // dropped over a counting reference (§06 "Density convention"), so this asserts the
+    // density is emitted AND that no change-of-variables term rides along.
     let p =
         pir("d = pushfwd(fn(log(_)), Categorical(p = [0.2, 0.3, 0.5]))\nlp = logdensityof(d, 0.5)");
     assert!(
@@ -160,7 +157,8 @@ fn pushfwd_log_over_unconstrained_support_refuses() {
         "d = pushfwd(fn(log(_)), Uniform(anything))\nlp = logdensityof(d, 3.0)",
     ))
     .expect_err("an unconstrained (not-provably-positive) support must refuse");
-    assert!(format!("{e:?}").contains("refuse"), "got: {e:?}");
+    assert_eq!(e.construct, "log", "got: {e:?}");
+    assert!(e.reason.contains("positive reals"), "got: {e:?}");
 }
 
 #[test]
