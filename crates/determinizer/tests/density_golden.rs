@@ -1866,37 +1866,38 @@ lp = logdensityof(lawof(record(z = z, y = y)), record(z = 0.1, y = 0.2))";
 // stochastic ancestors "are internal stochastic nodes in the traced sub-DAG, not
 // boundary inputs, so `lawof` integrates them out", equivalently
 // `kchain(prior, forward_kernel)`. So for `y ~ Normal(mu = z, sigma = 1)` with `z`
-// latent, `lawof(y)` is y's MARGINAL, and scoring `Normal(mu = z, …)` instead
-// emits the conditional density — a wrong number rather than a refusal, which is
-// why this must refuse until `crate::marginal` covers it. A FIXED parameter is not
-// a stochastic ancestor and must still lower: that half is the control.
+// latent, `lawof(y)` is y's MARGINAL, and scoring `Normal(mu = z, …)` instead emits the
+// conditional density — a wrong number rather than a refusal. A FIXED parameter is not
+// a stochastic ancestor and must still lower to its own conditional: that half is the
+// control, and it is what stops the marginalization from becoming a blanket rule.
 //
-// This case, with the latent still latent, already refused before the guard — via
-// the driver's residual-`draw` scan — so what the guard adds HERE is only a reason
-// that names the cause. The ordering it actually rescues is the sibling test
-// `bare_lawof_scored_before_a_later_query_pins_the_latent_refuses`. A latent an
-// EARLIER query already pinned to a literal is a third thing again: nothing in the
-// binding then distinguishes `mu = 0.1` from a genuinely fixed one, so that ordering
-// is caught by the pin's own provenance, in
-// `query_pinned_latent_golden.rs`. Do not read this test as covering either.
+// The Normal-prior-on-a-Normal-mean pair here is a `CONJUGATE_TABLE` row, so this
+// lowers to the marginal `Normal(0, √2)` rather than refusing. The pair that has NO row
+// is what still refuses (`implicit_marginal_golden.rs`), and the row's own maths and test
+// point are in `src/marginal.md`.
 #[test]
-fn bare_lawof_of_a_draw_with_a_latent_parameter_refuses() {
+fn bare_lawof_of_a_draw_with_a_latent_parameter_marginalizes() {
     let latent = "\
 z = draw(Normal(mu = 0.0, sigma = 1.0))
 y = draw(Normal(mu = z, sigma = 1.0))
 lp_y = logdensityof(lawof(y), 0.3)";
-    let mut m = flatppl_syntax::parse(latent).unwrap();
-    let _ = flatppl_infer::infer(&mut m);
-    let err = determinize(&m)
-        .expect_err("a law requiring marginalization must refuse, not score the conditional");
+    let lp_y = pir_binding(&flatppl_flatpir::write(&determinize_src(latent)), "lp_y");
+    assert_eq!(
+        lp_y.matches("builtin_logdensityof").count(),
+        1,
+        "the marginal is one density term, not a product over the ancestor:\n{lp_y}"
+    );
     assert!(
-        err.reason
-            .contains("marginalizes over a stochastic ancestor"),
-        "must refuse as a marginal, not for an incidental reason: {}",
-        err.reason
+        lp_y.contains("(%field mu 0.0)") && lp_y.contains("(%field sigma 1.4142135623730951)"),
+        "the ancestor is integrated out — sqrt(σ0² + σ²) = sqrt(2):\n{lp_y}"
+    );
+    assert!(
+        !lp_y.contains("(%field sigma 1.0)") && !lp_y.contains("(%ref self z)"),
+        "not the CONDITIONAL: neither the likelihood's own sigma nor a residual ref to z:\n{lp_y}"
     );
 
-    // Control: a fixed/parametric parameter needs no marginalization.
+    // Control: a fixed/parametric parameter needs no marginalization, and keeps its own
+    // sigma rather than the marginal's.
     let fixed = "\
 zz = elementof(reals)
 y = draw(Normal(mu = zz, sigma = 1.0))
@@ -1907,6 +1908,10 @@ lp = logdensityof(lawof(y), 0.3)";
         1,
         "a fixed parameter is no stochastic ancestor — must still lower:\n{pir}"
     );
+    assert!(
+        pir_binding(&pir, "lp").contains("(%field sigma 1.0)"),
+        "a fixed parameter's law is not widened by a marginal that is not there:\n{pir}"
+    );
 }
 
 // The ordering that JUSTIFIES the marginalization guard, as opposed to merely
@@ -1914,25 +1919,23 @@ lp = logdensityof(lawof(y), 0.3)";
 // nothing downstream refuses, because by the time the residual-`draw` scan runs `z`
 // is a literal — so before the guard this emitted the conditional density
 // `p(y | z = 0.1)` as a finished, conformance-passing number, where §04 asks for
-// y's marginal. This is the shape the guard exists for.
+// y's marginal. This is the shape the guard exists for; the marginal is now what it
+// emits, so the assertion is that the conditional's `mu = 0.1` is nowhere in it.
 #[test]
-fn bare_lawof_scored_before_a_later_query_pins_the_latent_refuses() {
+fn bare_lawof_scored_before_a_later_query_pins_the_latent_marginalizes() {
     let src = "\
 z = draw(Normal(mu = 0.0, sigma = 1.0))
 y = draw(Normal(mu = z, sigma = 1.0))
 lp_y = logdensityof(lawof(y), 0.3)
 lp_z = logdensityof(lawof(z), 0.1)";
-    let mut m = flatppl_syntax::parse(src).unwrap();
-    let _ = flatppl_infer::infer(&mut m);
-    let err = determinize(&m).expect_err(
-        "the conditional density must not escape as a number just because the latent \
-         is pinned by a LATER query",
+    let lp_y = pir_binding(&flatppl_flatpir::write(&determinize_src(src)), "lp_y");
+    assert!(
+        lp_y.contains("(%field mu 0.0)") && lp_y.contains("(%field sigma 1.4142135623730951)"),
+        "y's marginal, not the conditional at the later-pinned latent:\n{lp_y}"
     );
     assert!(
-        err.reason
-            .contains("marginalizes over a stochastic ancestor"),
-        "must refuse as a marginal: {}",
-        err.reason
+        !lp_y.contains("(%field mu 0.1)"),
+        "the later query's point must not reach y's law:\n{lp_y}"
     );
 }
 
@@ -2082,12 +2085,36 @@ lp = logdensityof(lawof(record(y = y)), record(y = 0.3))";
 // by 0.329 nats, conformance-passing, and precisely the later-query ordering the
 // value-side guard exists to stop.
 //
-// Both places a `lawof` is stripped must check: the dispatcher's arm, and
-// `measure_of_arg` at the query entry (which is why the third case here, a DIRECT
-// query on such a law, is included — it bypasses the dispatcher entirely and was
-// wrong before the value-side guard existed too).
+// Both places a `lawof` is stripped must apply the total-law reading: the dispatcher's
+// arm, and `measure_of_arg` at the query entry (which is why the direct query below is
+// included — it bypasses the dispatcher entirely and was wrong before the value-side
+// guard existed too).
+//
+// The Normal-prior-on-a-Normal-mean pair IS a `CONJUGATE_TABLE` row, so the direct query
+// now lowers to `Normal(0, √2)` instead of refusing. The nested cases still refuse, but
+// no longer HERE: the base's marginal lowers and the residual blocker is the §06
+// reference-measure gate on a `pushfwd`/`draw` over a `lawof` base, which is a different
+// guard with its own tests. They are kept as refuse-don't-mislower, without pinning the
+// reason, so neither guard is credited with the other's coverage.
 #[test]
-fn lawof_of_a_draw_parameterized_measure_refuses() {
+fn lawof_of_a_draw_parameterized_measure_marginalizes() {
+    // Direct query on the stochastic law — strips at `measure_of_arg`, never reaching the
+    // dispatcher's `lawof` arm. The conditional `Normal(0.1, 1)` that used to escape here
+    // carried the later query's point; the marginal carries the prior's, widened.
+    let src = "\
+a = draw(Normal(mu = 0.0, sigma = 1.0))
+lp_m = logdensityof(lawof(Normal(mu = a, sigma = 1.0)), 0.5)
+lp_a = logdensityof(lawof(a), 0.1)";
+    let lp_m = pir_binding(&flatppl_flatpir::write(&determinize_src(src)), "lp_m");
+    assert!(
+        lp_m.contains("(%field mu 0.0)") && lp_m.contains("(%field sigma 1.4142135623730951)"),
+        "the measure expression's total law is the marginal Normal(0, sqrt 2):\n{lp_m}"
+    );
+    assert!(
+        !lp_m.contains("(%field mu 0.1)"),
+        "not the conditional at the later-pinned latent:\n{lp_m}"
+    );
+
     for src in [
         // Through the dispatcher: a pushforward whose base is the stochastic law.
         "\
@@ -2108,23 +2135,12 @@ ml = lawof(Normal(mu = a, sigma = 1.0))
 y = draw(pushfwd(exp, ml))
 lp_y = logdensityof(lawof(y), 1.6487212707001282)
 lp_a = logdensityof(lawof(a), 0.1)",
-        // Direct query on the stochastic law — strips at `measure_of_arg`, never
-        // reaching the dispatcher's `lawof` arm.
-        "\
-a = draw(Normal(mu = 0.0, sigma = 1.0))
-lp_m = logdensityof(lawof(Normal(mu = a, sigma = 1.0)), 0.5)
-lp_a = logdensityof(lawof(a), 0.1)",
     ] {
         let mut m = flatppl_syntax::parse(src).unwrap();
         let _ = flatppl_infer::infer(&mut m);
-        let err = determinize(&m).expect_err(
-            "the law of a draw-parameterized measure is a marginal — refuse, do not \
-             score the conditional",
-        );
-        assert!(
-            err.reason.contains("MARGINAL law"),
-            "must refuse as a marginal: {}",
-            err.reason
+        determinize(&m).expect_err(
+            "a draw OF a draw-parameterized law must not score the conditional; nothing \
+             clears every gate on this shape yet",
         );
     }
 
@@ -2162,9 +2178,11 @@ lp = logdensityof(lawof(truncate(lawof(z), interval(0.0, inf))), 0.3)",
 // marginal is `Normal(0, √2)`; the emitted conditional was `Normal(0.1, 1)`, a
 // finished conformance-passing number wrong by 0.329 nats.
 //
-// Refusing rather than marginalizing is the call: the `kchain` is closed-form only
-// for a discrete-finite latent (`crate::marginal`'s scope), and synthesizing it from
-// the reification is machinery the guard does not have.
+// Still refuses, but the reason recorded here originally ("the `kchain` is closed-form
+// only for a discrete-finite latent") was wrong: `CONJUGATE_TABLE` answers this very pair
+// in closed form, and the UNWRAPPED `lawof(Normal(mu = a, sigma = 1))` now lowers to the
+// marginal. What refuses is the WRAPPER: a row needs a bare distribution constructor, and
+// a reification is not one. A coverage gap, not a correctness one.
 #[test]
 fn lawof_of_a_draw_parameterized_reification_refuses() {
     for src in [

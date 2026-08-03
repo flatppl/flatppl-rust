@@ -53,11 +53,14 @@ pub struct Module {
     /// the `%autoinputs` slot on FlatPIR write, dropped on FlatPPL write.
     auto_inputs: SecondaryMap<NodeId, Box<[(Symbol, Ref)]>>,
     /// Bindings a determinization query replaced with the point it was scored at
-    /// (`flatppl-determinizer`). The RHS is then a literal indistinguishable from a
-    /// model constant, and a later query reading it as fixed would emit a
-    /// CONDITIONAL density where §04 asks for the total law — so the pin records
-    /// that it was a latent. Not projected into any output format.
-    query_pinned: std::collections::HashSet<BindingId>,
+    /// (`flatppl-determinizer`), each mapped to the RHS the pin replaced. The RHS is
+    /// then a literal indistinguishable from a model constant, and a later query
+    /// reading it as fixed would emit a CONDITIONAL density where §04 asks for the
+    /// total law — so the pin records that it was a latent. The replaced RHS is kept
+    /// because refusing is not the only answer: a later query that marginalizes this
+    /// latent out needs its `draw(prior)`, which the pin overwrote. Not projected
+    /// into any output format.
+    query_pinned: HashMap<BindingId, NodeId>,
 }
 
 /// A top-level binding `name = rhs`.
@@ -132,8 +135,11 @@ impl Module {
     /// binding distinguishes the literal from a model constant, and that is exactly
     /// what a later query must not read as fixed.
     pub fn pin_binding_to_query_point(&mut self, id: BindingId, point: NodeId) {
+        let replaced = self.binding(id).rhs;
         self.set_binding_rhs(id, point);
-        self.query_pinned.insert(id);
+        // First pin wins: a second query over the same latent would otherwise record
+        // the first query's point as the replaced RHS, losing the `draw(prior)`.
+        self.query_pinned.entry(id).or_insert(replaced);
     }
 
     /// Did a determinization query pin this binding
@@ -141,7 +147,15 @@ impl Module {
     /// from a query point is still a stochastic node of the model; a measure
     /// parameterized by it has that node as an ancestor to marginalize over.
     pub fn is_query_pinned(&self, id: BindingId) -> bool {
-        self.query_pinned.contains(&id)
+        self.query_pinned.contains_key(&id)
+    }
+
+    /// The right-hand side the query pin replaced — the latent's own `draw(prior)`,
+    /// for a binding [`Module::pin_binding_to_query_point`] pinned. `None` for an
+    /// unpinned binding. A query that marginalizes this latent out needs the prior,
+    /// which is unreachable from the binding once the pin overwrote it.
+    pub fn query_pinned_rhs(&self, id: BindingId) -> Option<NodeId> {
+        self.query_pinned.get(&id).copied()
     }
 
     /// Keep only the bindings in `keep`, in their existing source order; drop the

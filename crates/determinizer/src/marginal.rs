@@ -1,5 +1,11 @@
-//! The `kchain` marginal-density rule and its discrete/continuous classifier
-//! (spec §06, "Density of composed measures", the `kchain` row).
+//! The `kchain` marginal-density rule, its discrete/continuous classifier, and the
+//! closed-form conjugate table (spec §06, "Density of composed measures", the `kchain`
+//! row).
+//!
+//! **The maths of every conjugate row — the integral, its closed form, the §08 name, the
+//! test point and the wrong answer that point discriminates against — is in
+//! `marginal.md`, beside this file.** Check a row there rather than reverse-engineering
+//! its `build_*_marginal`.
 //!
 //! `kchain(M, K)` is Kleisli bind: it marginalizes the intermediate latent `a`,
 //! keeping the kernel `K`'s variate. Its density at `x` is the marginal integral
@@ -10,8 +16,8 @@
 //!
 //! which is **generally intractable**. The spec says an engine evaluates it "in
 //! closed form, or by enumeration of a discrete latent, and otherwise reports a
-//! static error." This module implements the **discrete-enumeration** branch and
-//! refuses everything else:
+//! static error." This module implements two of the three branches and refuses the
+//! rest:
 //!
 //! - **Discrete-finite latent** (a statically-known, small atom set `{a₀, …, a_{N-1}}`):
 //!   the integral becomes a finite **mass-weighted** sum, in log space the
@@ -24,9 +30,17 @@
 //!   — NOT `logsumexp − logN`, which is only correct for a uniform latent (the
 //!   biased Monte-Carlo form the design explicitly rejects).
 //!
-//! - **Continuous, infinite-discrete, or otherwise non-enumerable latent**
-//!   (`Normal`, `Poisson`, an unbounded integer range, …): **refused**. The
-//!   conjugate / quadrature closed-form table is a deliberate follow-on.
+//! - **A recognised conjugate prior/likelihood pair** (`CONJUGATE_TABLE`), whose
+//!   integral collapses to one closed-form distribution. Continuity is no obstacle
+//!   here: the Normal–Normal row integrates a `Normal` latent exactly.
+//!
+//! - **Any other continuous or infinite-discrete latent** (`Normal` on a scale
+//!   parameter, `Poisson` with no matching row, …): **refused**.
+//!
+//! Both spellings of the integral reach the table. `kchain(prior, kernelof(…))` is the
+//! explicit one; `lawof(y)` over a `y ~ Dist(param = z, …)` with `z` latent is the
+//! implicit one §04 "Reification to measures" defines as the same marginal, routed here
+//! from `density.rs`'s marginalization guard by [`conjugate_marginal_measure`].
 //!
 //! ## What is enumerable
 //!
@@ -48,8 +62,9 @@
 //! continuous distribution are **not** enumerable → refused.
 
 use crate::density::{
-    build_call, build_density_term, build_record, draw_argument, expect_builtin_call,
-    lower_measure_density, refuse, resolve_ref_one, split_kernel_constructor,
+    Ancestor, build_call, build_density_term, build_record, draw_argument, expect_builtin_call,
+    lower_measure_density, measure_stochastic_ancestors, refuse, resolve_ref_one,
+    split_kernel_constructor,
 };
 use crate::kernel::{Kernel, resolve_kernel, substitute_ref};
 use crate::refuse::RefuseError;
@@ -403,15 +418,46 @@ fn try_conjugate_marginal(
     kernel: &Kernel,
     v: NodeId,
 ) -> Option<Result<NodeId, RefuseError>> {
-    // (a) The prior must be a bare distribution constructor (positional or
-    // keyword arguments).
-    let (prior_sym, prior_kwargs) = split_kernel_constructor(m, latent_dist)?;
-
     // Resolve the likelihood constructor from the kernel body, remembering any
     // single-field record wrapper so the marginal is scored at the SAME variate
     // shape as the kernel (a record `{y}` vs. a bare scalar).
     let lik = resolve_likelihood(m, kernel.body)?;
-    let (lik_sym, lik_kwargs) = split_kernel_constructor(m, lik.dist)?;
+    // `try_conjugate_marginal` is only reached after the caller's single-input
+    // length check, so the single kernel input here is guaranteed.
+    let kernel_input_sym = kernel.inputs[0].1.name;
+
+    let marginal = match build_conjugate_marginal(m, latent_dist, lik.dist, kernel_input_sym)? {
+        Ok(node) => node,
+        Err(e) => return Some(Err(e)),
+    };
+
+    // Score the marginal at `v` through the kernel's variate wrapper: for a
+    // record-shaped kernel body this descends `record{field}` → scalar and scores
+    // the marginal at `v.field`; for a bare scalar body it scores directly. Both
+    // reach `build_density_term`, emitting one `builtin_logdensityof(marginal, …)`.
+    let marginal_measure = wrap_like_kernel(m, marginal, lik.record_field);
+    Some(lower_measure_density(m, marginal_measure, v))
+}
+
+/// The conjugate table's detection + build, shared by the explicit `kchain` spelling
+/// ([`try_conjugate_marginal`]) and the implicit `lawof` one
+/// ([`conjugate_marginal_measure`]). `latent_sym` is the symbol the likelihood
+/// references the latent by — a `kernelof` boundary input for the explicit spelling,
+/// the latent's own binding name for the implicit one.
+///
+/// * `None` — no row matches (the caller keeps its own refusal).
+/// * `Some(Err(..))` — a row matched but a required distribution parameter is missing.
+/// * `Some(Ok(node))` — the closed-form marginal distribution-constructor node.
+fn build_conjugate_marginal(
+    m: &mut Module,
+    latent_dist: NodeId,
+    lik_dist: NodeId,
+    latent_sym: Symbol,
+) -> Option<Result<NodeId, RefuseError>> {
+    // (a) The prior must be a bare distribution constructor (positional or
+    // keyword arguments).
+    let (prior_sym, prior_kwargs) = split_kernel_constructor(m, latent_dist)?;
+    let (lik_sym, lik_kwargs) = split_kernel_constructor(m, lik_dist)?;
 
     // Resolve the constructor names to owned strings (the `split_*` calls above
     // borrow `m` mutably to intern positional-arg names, so we cannot hold a
@@ -424,15 +470,12 @@ fn try_conjugate_marginal(
         .iter()
         .find(|r| r.prior == prior_name.as_str() && r.likelihood == lik_name.as_str())?;
 
-    // (b) The conjugating parameter's value must be EXACTLY the boundary-input
-    // ref `(%ref self|%local kernel.inputs[0].1.name)` — the latent feeding that
-    // parameter, unresolved. Anything else (a constant, a derived expression) is
-    // not this conjugate shape. `try_conjugate_marginal` is only reached after
-    // the caller's single-input length check, so the single kernel input here is
-    // guaranteed.
-    let kernel_input_sym = kernel.inputs[0].1.name;
+    // (b) The conjugating parameter's value must be EXACTLY the latent's ref
+    // `(%ref self|%local latent_sym)` — the latent feeding that parameter,
+    // unresolved. Anything else (a constant, a derived expression) is not this
+    // conjugate shape.
     let conj_val = find_kwarg(m, &lik_kwargs, row.conjugating_param)?;
-    if !is_input_ref(m, conj_val, kernel_input_sym) {
+    if !is_input_ref(m, conj_val, latent_sym) {
         return None;
     }
 
@@ -443,28 +486,101 @@ fn try_conjugate_marginal(
         if m.resolve(*psym) == row.conjugating_param {
             continue;
         }
-        if references_input(m, *pval, kernel_input_sym) {
+        if references_input(m, *pval, latent_sym) {
             return None;
         }
     }
 
-    // Build the closed-form marginal distribution constructor.
-    let marginal = match (row.build_marginal)(m, &prior_kwargs, &lik_kwargs) {
-        Some(node) => node,
-        None => {
-            return Some(Err(refuse_kchain(
+    Some(
+        (row.build_marginal)(m, &prior_kwargs, &lik_kwargs).ok_or_else(|| {
+            refuse_kchain(
                 latent_dist,
                 "conjugate pair matched but a required distribution parameter is missing",
-            )));
-        }
-    };
+            )
+        }),
+    )
+}
 
-    // Score the marginal at `v` through the kernel's variate wrapper: for a
-    // record-shaped kernel body this descends `record{field}` → scalar and scores
-    // the marginal at `v.field`; for a bare scalar body it scores directly. Both
-    // reach `build_density_term`, emitting one `builtin_logdensityof(marginal, …)`.
-    let marginal_measure = wrap_like_kernel(m, marginal, lik.record_field);
-    Some(lower_measure_density(m, marginal_measure, v))
+// ---------------------------------------------------------------------------
+// The implicit `lawof` spelling
+// ---------------------------------------------------------------------------
+
+/// A marginal this module built for the implicit spelling: the closed-form marginal
+/// distribution-constructor node, and the latent it integrated out.
+///
+/// The `latent` is not diagnostics. A caller building a PRODUCT of several marginals must
+/// know which latent each one integrated: two marginals over the SAME latent are not
+/// independent, and adding their log-densities is a wrong number
+/// ([`crate::density::marginalize_or_refuse_record_law`]).
+pub(crate) struct ImplicitMarginal {
+    pub measure: NodeId,
+    pub latent: Symbol,
+}
+
+/// The closed-form conjugate marginal of `likelihood` — a distribution constructor one
+/// of whose parameters is a latent of the model — as a distribution-constructor node plus
+/// the latent it integrated out.
+///
+/// This is the implicit spelling of the same integral [`lower_kchain_marginal`] does for
+/// an explicit `kchain`. §04 "Reification to measures" makes `lawof(y)` y's TOTAL law:
+/// "they are internal stochastic nodes in the traced sub-DAG, not boundary inputs, so
+/// `lawof` integrates them out", the measure-algebra equivalent being
+/// `kchain(prior, forward_kernel)`. `y ~ Normal(mu = z, sigma = 1)` over a latent `z`
+/// therefore asks for exactly the Normal–Normal row, without the user writing the
+/// `kchain`. The caller's marginalization refusal stays the fallback: `None` here means
+/// no row applies, never that the conditional may be scored instead.
+///
+/// `exempt` passes the caller's own accounted-for draw sites through to
+/// [`measure_stochastic_ancestors`] — the sibling fields of a record product, whose
+/// dependence is the chain rule, not a marginal.
+///
+/// **One latent, whose prior is itself ancestor-free.** Two latents feeding two
+/// parameters is not a single conjugate integral, and neither is a two-level hierarchy
+/// (`z ~ Normal(mu = w, …)` with `w` latent) — the row's closed form integrates ONE
+/// prior. Both return `None` rather than a marginal that silently conditions on the
+/// ancestor it did not integrate.
+///
+/// **A marginal is correct only for the ONE variate it is the law of.** This returns a
+/// marginal, never a licence to multiply marginals together: the returned [`ImplicitMarginal`]
+/// carries the latent so a caller assembling a product can refuse when two of them share it.
+pub(crate) fn conjugate_marginal_measure(
+    m: &mut Module,
+    likelihood: NodeId,
+    exempt: &[NodeId],
+) -> Option<Result<ImplicitMarginal, RefuseError>> {
+    let (latent, prior) = sole_named_ancestor(m, likelihood, exempt)?;
+    if !measure_stochastic_ancestors(m, prior, &[]).is_empty() {
+        return None;
+    }
+    Some(
+        build_conjugate_marginal(m, prior, likelihood, latent)?
+            .map(|measure| ImplicitMarginal { measure, latent }),
+    )
+}
+
+/// The single named stochastic ancestor of `likelihood`, as `(symbol, prior)`. `None`
+/// when there is none, when two DISTINCT latents are reached, or when any ancestor has
+/// no recoverable `(name, prior)` pair ([`Ancestor::Opaque`]) — each of which is outside
+/// the table's one-prior integral.
+fn sole_named_ancestor(
+    m: &Module,
+    likelihood: NodeId,
+    exempt: &[NodeId],
+) -> Option<(Symbol, NodeId)> {
+    let mut found: Option<(Symbol, NodeId)> = None;
+    for ancestor in measure_stochastic_ancestors(m, likelihood, exempt) {
+        let Ancestor::Named { name, prior } = ancestor else {
+            return None;
+        };
+        match found {
+            None => found = Some((name, prior)),
+            // The same latent feeding two parameters is still one ancestor; check (c)
+            // in `build_conjugate_marginal` is what rejects that shape.
+            Some((seen, _)) if seen == name => {}
+            Some(_) => return None,
+        }
+    }
+    found
 }
 
 /// The likelihood constructor resolved out of a kernel body, plus any
