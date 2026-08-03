@@ -1,5 +1,8 @@
 use flatppl_determinizer::determinize;
 
+mod common;
+use common::pir_binding;
+
 // A two-independent-Gaussian product scored at data: logdensityof(lawof(record(...)), v)
 // must lower to a SUM of two builtin_logdensityof terms, no `lawof`/`draw`/`joint` left.
 #[test]
@@ -1545,5 +1548,948 @@ lp = logdensityof(post, record(a = 0.3, b = 1.0))";
     assert!(
         pir.matches("builtin_logdensityof").count() >= 3,
         "loglik + 2 prior fields, got:\n{pir}"
+    );
+}
+
+// The control for `refuse.rs::duplicate_draw_across_fields_refuses`: two
+// INDEPENDENT draws are k = n = 2 with a full-rank (identity) Jacobian, so the
+// density exists and is the product of marginals. This must keep lowering — the
+// distinctness guard has to distinguish this from the duplicate case, which before
+// the fix produced byte-identical FlatPDL.
+#[test]
+fn distinct_draws_still_lower_to_sum() {
+    let src = "\
+y1 = draw(Normal(mu = 0.0, sigma = 1.0))
+y2 = draw(Normal(mu = 0.0, sigma = 1.0))
+lp = logdensityof(lawof(record(a = y1, b = y2)), record(a = 0.5, b = 0.25))";
+    let m = {
+        let mut m = flatppl_syntax::parse(src).unwrap();
+        let _ = flatppl_infer::infer(&mut m);
+        m
+    };
+    let out = determinize(&m).expect("distinct draws must lower");
+    let pir = flatppl_flatpir::write(&out);
+    assert_eq!(
+        pir.matches("builtin_logdensityof").count(),
+        2,
+        "two independent density terms:\n{pir}"
+    );
+    assert!(flatppl_determinizer::is_flatpdl(&out).is_ok());
+}
+
+// §06 "Engine contract for pushfwd density evaluation" case 1 mandates a registry
+// including "affine maps composed from add/sub/neg/mul/divide (with positive
+// scaling)". `invert.rs::derive_chain` already implements it, but the record-field
+// guard's unary-only shape test could never route a BINARY call to it, so this
+// spelling refused while the explicit `pushfwd(x -> 2.0*x + 1.0, Normal(0,1))`
+// spelling lowered correctly — two spellings §06 calls equivalent.
+#[test]
+fn affine_transformed_field_lowers() {
+    let src = "\
+x = draw(Normal(mu = 0.0, sigma = 1.0))
+y = 2.0 * x + 1.0
+lp = logdensityof(lawof(record(y = y)), record(y = 2.0))";
+    let m = {
+        let mut m = flatppl_syntax::parse(src).unwrap();
+        let _ = flatppl_infer::infer(&mut m);
+        m
+    };
+    let out = determinize(&m).expect("registry-mandated affine map must lower");
+    let pir = flatppl_flatpir::write(&out);
+    assert_eq!(
+        pir.matches("builtin_logdensityof").count(),
+        1,
+        "one density term:\n{pir}"
+    );
+    // The change-of-variables Jacobian, pinned BY VALUE. Do not weaken this to
+    // `contains("log")`: the string `builtin_logdensityof` itself contains `log`,
+    // so such an assertion is satisfied by the very term it is meant to be
+    // distinguished from, and a regression dropping the Jacobian would still leave
+    // one `builtin_logdensityof`, no `lawof`, and valid FlatPDL. `(abs 2.0)` is
+    // reachable only from the log-volume of the scale 2.0 (`logvol = log|c|`).
+    let lp = pir_binding(&pir, "lp");
+    assert!(
+        lp.contains("(sub ") && lp.contains("(log ") && lp.contains("(abs 2.0)"),
+        "density minus the log-volume log|2| — the §06 change of variables:\n{lp}"
+    );
+    // The point the inner Normal is scored at: f_inv(2.0) = (2.0 − 1.0)/2 = 0.5,
+    // const-folded. Together with log|2| this is exactly the expression the
+    // independent Julia oracle validated at -1.737085713764618.
+    assert!(
+        lp.contains(" 0.5)"),
+        "inner density evaluated at the preimage 0.5:\n{lp}"
+    );
+    assert!(!pir.contains("lawof"), "measure layer gone:\n{pir}");
+    assert!(flatppl_determinizer::is_flatpdl(&out).is_ok());
+
+    // §06 declares this the same measure as the explicit spelling, so the two must
+    // emit the identical scored expression.
+    let pushfwd_spelling = "\
+b = pushfwd(x -> 2.0 * x + 1.0, Normal(mu = 0.0, sigma = 1.0))
+lp = logdensityof(b, 2.0)";
+    let pir_pf = {
+        let mut m = flatppl_syntax::parse(pushfwd_spelling).unwrap();
+        let _ = flatppl_infer::infer(&mut m);
+        let out = determinize(&m).expect("explicit pushfwd spelling must lower");
+        flatppl_flatpir::write(&out)
+    };
+    assert_eq!(
+        lp,
+        pir_binding(&pir_pf, "lp"),
+        "the two §06-equivalent spellings must emit the same scored expression"
+    );
+}
+
+// The §06 case-1 registry entry the record-field guard's unary-only shape test
+// most conspicuously could not reach: the matrix-vector affine map
+// `mu + lower_cholesky(cov) * _` (the MvNormal construction, §08). `add`/`mul`
+// over a VECTOR draw is a binary call, so this spelling refused; now it routes to
+// `invert::derive_matrix_affine` and lowers to the matrix change of variables
+// `logdensityof(M, linsolve(L, y - mu)) - logabsdet(L)`. Verified numerically
+// against `logpdf(MvNormal(mu, L Lᵀ), y)` (Distributions.jl): both this spelling
+// and the explicit `pushfwd(x -> L * x + mu, M)` score -2.9244728372492634.
+#[test]
+fn matrix_affine_transformed_field_lowers() {
+    let record_spelling = "\
+cov = rowstack([[4.0, 2.0], [2.0, 3.0]])
+L = lower_cholesky(cov)
+z = draw(MvNormal(mu = [0.0, 0.0], cov = eye(2)))
+y = L * z + [1.0, 2.0]
+lp = logdensityof(lawof(record(y = y)), record(y = [1.5, 2.5]))";
+    let pushfwd_spelling = "\
+cov = rowstack([[4.0, 2.0], [2.0, 3.0]])
+L = lower_cholesky(cov)
+d = pushfwd(x -> L * x + [1.0, 2.0], MvNormal(mu = [0.0, 0.0], cov = eye(2)))
+lp = logdensityof(d, [1.5, 2.5])";
+    let pir = {
+        let mut m = flatppl_syntax::parse(record_spelling).unwrap();
+        let _ = flatppl_infer::infer(&mut m);
+        let out = determinize(&m).expect("registry-mandated matrix-affine map must lower");
+        assert!(flatppl_determinizer::is_flatpdl(&out).is_ok());
+        flatppl_flatpir::write(&out)
+    };
+    assert!(
+        pir.contains("(linsolve") && pir.contains("(logabsdet"),
+        "matrix change of variables f_inv = linsolve(L, y - mu), logvol = logabsdet(L):\n{pir}"
+    );
+    assert!(!pir.contains("lawof"), "measure layer gone:\n{pir}");
+
+    // §06 declares the two spellings the same measure, so the scored binding must
+    // be the identical expression, not merely a numerically equal one.
+    let pir_pf = {
+        let mut m = flatppl_syntax::parse(pushfwd_spelling).unwrap();
+        let _ = flatppl_infer::infer(&mut m);
+        let out = determinize(&m).expect("explicit pushfwd spelling must lower");
+        flatppl_flatpir::write(&out)
+    };
+    assert_eq!(
+        pir_binding(&pir, "lp"),
+        pir_binding(&pir_pf, "lp"),
+        "the two §06-equivalent spellings must emit the same scored expression"
+    );
+}
+
+// §06 "Transformation and projection" prints these two programs adjacently and
+// calls them the same measure, the second under "The equivalent in stochastic-node
+// form is:":
+//     mu = Normal(mu = 0, sigma = 1); nu = pushfwd(exp, mu)
+//     mu = Normal(mu = 0, sigma = 1); x ~ mu; y = exp(x); nu = lawof(y)
+// The first lowered; the second refused at the primitive-measure path, because a
+// bare scalar `lawof(<derived>)` never reaches the record-field guard. Both must
+// now lower, and to the SAME density.
+#[test]
+fn bare_lawof_of_derived_scalar_lowers_like_pushfwd() {
+    let node_form = "\
+mu = Normal(mu = 0.0, sigma = 1.0)
+x = draw(mu)
+y = exp(x)
+lp = logdensityof(lawof(y), 1.6487212707001282)";
+    let pushfwd_form = "\
+mu = Normal(mu = 0.0, sigma = 1.0)
+nu = pushfwd(exp, mu)
+lp = logdensityof(nu, 1.6487212707001282)";
+    let lower = |src: &str| {
+        let mut m = flatppl_syntax::parse(src).unwrap();
+        let _ = flatppl_infer::infer(&mut m);
+        let out = determinize(&m).expect("both §06 spellings must lower");
+        assert!(flatppl_determinizer::is_flatpdl(&out).is_ok());
+        flatppl_flatpir::write(&out)
+    };
+    let a = lower(node_form);
+    let b = lower(pushfwd_form);
+    assert_eq!(
+        a.matches("builtin_logdensityof").count(),
+        1,
+        "stochastic-node form has one density term:\n{a}"
+    );
+    assert!(!a.contains("lawof"), "measure layer gone:\n{a}");
+    assert_eq!(
+        a.matches("builtin_logdensityof").count(),
+        b.matches("builtin_logdensityof").count(),
+        "both §06 spellings lower to the same shape:\n{a}\n---\n{b}"
+    );
+    // §06 declares the two spellings the same measure, so the scored binding must
+    // be the identical expression, not merely a numerically equal one — the same
+    // bar `matrix_affine_transformed_field_lowers` holds the record spelling to.
+    assert_eq!(
+        pir_binding(&a, "lp"),
+        pir_binding(&b, "lp"),
+        "the two §06-equivalent spellings must emit the same scored expression"
+    );
+}
+
+// §04 "Reification to measures", **Identity law**: "`lawof(draw(m))` is
+// equivalent to `m`." The UNtransformed sibling of the case above — a bare
+// scalar `lawof(x)` over a `~`-bound draw — reached the same primitive-measure
+// refusal, because the law of a scalar draw is not itself a constructor call.
+// It must score as `m` directly, with no change-of-variables term.
+#[test]
+fn bare_lawof_of_draw_scores_the_drawn_measure() {
+    let src = "\
+mu = Normal(mu = 0.0, sigma = 1.0)
+x = draw(mu)
+lp = logdensityof(lawof(x), 0.5)";
+    let mut m = flatppl_syntax::parse(src).unwrap();
+    let _ = flatppl_infer::infer(&mut m);
+    let out = determinize(&m).expect("§04 identity law: lawof(draw(m)) is m");
+    assert!(flatppl_determinizer::is_flatpdl(&out).is_ok());
+    let pir = flatppl_flatpir::write(&out);
+    assert_eq!(
+        pir.matches("builtin_logdensityof").count(),
+        1,
+        "one density term, the drawn measure's own:\n{pir}"
+    );
+    assert!(
+        !pir.contains("lawof") && !pir.contains("(draw "),
+        "measure layer gone:\n{pir}"
+    );
+    // The identity law adds no volume element: `m` is scored at the variate as-is.
+    assert!(
+        !pir.contains("(sub ") && !pir.contains("(log "),
+        "no change of variables for an untransformed draw:\n{pir}"
+    );
+}
+
+// §06 "Transformation and projection" prints the stochastic-node form with `~` and
+// a NAMED `lawof` binding, not with `draw(...)` inline and `lawof` inside the
+// query — so pin the spec's own program text as written. This is not extra
+// code coverage: `~` is parser sugar for `draw(…)` and lowers to identical IR, and
+// the `nu = lawof(…)` hop is covered elsewhere. What it holds is that the program
+// a reader copies out of §06 lowers to the same `lp` as the `pushfwd` spelling
+// printed beside it, and that the `nu` scaffold binding is swept rather than
+// surviving as a measure-layer node.
+#[test]
+fn spec_literal_stochastic_node_form_lowers() {
+    let spec_text = "\
+mu = Normal(mu = 0.0, sigma = 1.0)
+x ~ mu
+y = exp(x)
+nu = lawof(y)
+lp = logdensityof(nu, 1.6487212707001282)";
+    let pushfwd_form = "\
+mu = Normal(mu = 0.0, sigma = 1.0)
+nu = pushfwd(exp, mu)
+lp = logdensityof(nu, 1.6487212707001282)";
+    let pir = flatppl_flatpir::write(&determinize_src(spec_text));
+    let pir_pf = flatppl_flatpir::write(&determinize_src(pushfwd_form));
+    assert_eq!(
+        pir_binding(&pir, "lp"),
+        pir_binding(&pir_pf, "lp"),
+        "§06's two spellings, as the spec writes them, must emit one expression"
+    );
+    assert!(!pir.contains("lawof"), "measure layer gone:\n{pir}");
+}
+
+// A value reaching TWO distinct draws is refused, and that refusal is what makes
+// the single-draw shape test safe: `resolve_component_draw` admits a transformed
+// value only when it is a function of exactly one draw, so a coupled joint can
+// never be read as a map of one of its draws. `x1 - x2` is §06 case 3 (a
+// dimension-reducing map that is not a coordinate projection), where a static
+// error is the default and symbolic/numeric fallbacks are explicitly optional —
+// so refusing is conformant, not a gap.
+#[test]
+fn bare_lawof_of_a_two_draw_value_refuses() {
+    let src = "\
+x1 = draw(Normal(mu = 0.0, sigma = 1.0))
+x2 = draw(Normal(mu = 0.0, sigma = 1.0))
+d = x1 - x2
+lp = logdensityof(lawof(d), 0.25)";
+    let mut m = flatppl_syntax::parse(src).unwrap();
+    let _ = flatppl_infer::infer(&mut m);
+    let err = determinize(&m).expect_err("a value reaching two draws must refuse, not mislower");
+    // Asserted on the refused CONSTRUCT, not the message: this refusal's wording is
+    // itself slated to be rewritten (it names a "primitive measure", which tells
+    // the author of `x1 - x2` nothing), and that rewrite must not have to touch
+    // this test. The construct is the two-draw expression itself.
+    assert_eq!(
+        err.construct, "sub",
+        "the refusal must land on the two-draw expression — anywhere else means the \
+         single-draw shape test was widened and something new now lowers: {} / {}",
+        err.construct, err.reason
+    );
+}
+
+// The dispatcher's constructor fallthrough reads a constructor BEFORE offering
+// the node to the value law, and this is the test that holds that order. A
+// dependent prior's `Normal(mu = z, sigma = 1.0)` is a product the chain rule
+// scores with `z` pinned, but it also satisfies the value law's shape test (it
+// reaches exactly one draw, `z`'s), so a reversed order would hand it to
+// `pushfwd` as the map `x -> Normal(mu = x, sigma = 1.0)` — which refuses in
+// `crate::invert`, since `Normal` appears in neither its unary-bijection registry
+// nor its affine grammar (capitalization is correlated convention, not the reason).
+// The cost of losing the order is therefore that every dependent product stops
+// lowering; this asserts it still does, with `z` pinned into the second term.
+#[test]
+fn dependent_constructor_is_read_as_a_product_not_a_map() {
+    let src = "\
+z = draw(Normal(mu = 0.0, sigma = 1.0))
+y = draw(Normal(mu = z, sigma = 1.0))
+lp = logdensityof(lawof(record(z = z, y = y)), record(z = 0.1, y = 0.2))";
+    let pir = flatppl_flatpir::write(&determinize_src(src));
+    assert_eq!(
+        pir.matches("builtin_logdensityof").count(),
+        2,
+        "chain rule: p(z) * p(y | z), two terms:\n{pir}"
+    );
+    assert!(
+        pir.contains("(%field mu 0.1)"),
+        "y's measure keeps its dependent mu, pinned to z's scored value:\n{pir}"
+    );
+    assert!(
+        !pir.contains("(pushfwd") && !pir.contains("(sub "),
+        "a dependent product carries no change of variables:\n{pir}"
+    );
+}
+
+// §04 "Reification to measures": `lawof(x)` is the **TOTAL** law of `x`, and §04's
+// worked `prior_predictive = lawof(record(obs = obs))` states the consequence —
+// stochastic ancestors "are internal stochastic nodes in the traced sub-DAG, not
+// boundary inputs, so `lawof` integrates them out", equivalently
+// `kchain(prior, forward_kernel)`. So for `y ~ Normal(mu = z, sigma = 1)` with `z`
+// latent, `lawof(y)` is y's MARGINAL, and scoring `Normal(mu = z, …)` instead
+// emits the conditional density — a wrong number rather than a refusal, which is
+// why this must refuse until `crate::marginal` covers it. A FIXED parameter is not
+// a stochastic ancestor and must still lower: that half is the control.
+//
+// This case, with the latent still latent, already refused before the guard — via
+// the driver's residual-`draw` scan — so what the guard adds HERE is only a reason
+// that names the cause. The ordering it actually rescues is the sibling test
+// `bare_lawof_scored_before_a_later_query_pins_the_latent_refuses`. A latent an
+// EARLIER query already pinned to a literal is a third thing again: nothing in the
+// binding then distinguishes `mu = 0.1` from a genuinely fixed one, so that ordering
+// is caught by the pin's own provenance, in
+// `query_pinned_latent_golden.rs`. Do not read this test as covering either.
+#[test]
+fn bare_lawof_of_a_draw_with_a_latent_parameter_refuses() {
+    let latent = "\
+z = draw(Normal(mu = 0.0, sigma = 1.0))
+y = draw(Normal(mu = z, sigma = 1.0))
+lp_y = logdensityof(lawof(y), 0.3)";
+    let mut m = flatppl_syntax::parse(latent).unwrap();
+    let _ = flatppl_infer::infer(&mut m);
+    let err = determinize(&m)
+        .expect_err("a law requiring marginalization must refuse, not score the conditional");
+    assert!(
+        err.reason
+            .contains("marginalizes over a stochastic ancestor"),
+        "must refuse as a marginal, not for an incidental reason: {}",
+        err.reason
+    );
+
+    // Control: a fixed/parametric parameter needs no marginalization.
+    let fixed = "\
+zz = elementof(reals)
+y = draw(Normal(mu = zz, sigma = 1.0))
+lp = logdensityof(lawof(y), 0.3)";
+    let pir = flatppl_flatpir::write(&determinize_src(fixed));
+    assert_eq!(
+        pir.matches("builtin_logdensityof").count(),
+        1,
+        "a fixed parameter is no stochastic ancestor — must still lower:\n{pir}"
+    );
+}
+
+// The ordering that JUSTIFIES the marginalization guard, as opposed to merely
+// improving a message. Score `lawof(y)` FIRST, then let a second query pin `z`:
+// nothing downstream refuses, because by the time the residual-`draw` scan runs `z`
+// is a literal — so before the guard this emitted the conditional density
+// `p(y | z = 0.1)` as a finished, conformance-passing number, where §04 asks for
+// y's marginal. This is the shape the guard exists for.
+#[test]
+fn bare_lawof_scored_before_a_later_query_pins_the_latent_refuses() {
+    let src = "\
+z = draw(Normal(mu = 0.0, sigma = 1.0))
+y = draw(Normal(mu = z, sigma = 1.0))
+lp_y = logdensityof(lawof(y), 0.3)
+lp_z = logdensityof(lawof(z), 0.1)";
+    let mut m = flatppl_syntax::parse(src).unwrap();
+    let _ = flatppl_infer::infer(&mut m);
+    let err = determinize(&m).expect_err(
+        "the conditional density must not escape as a number just because the latent \
+         is pinned by a LATER query",
+    );
+    assert!(
+        err.reason
+            .contains("marginalizes over a stochastic ancestor"),
+        "must refuse as a marginal: {}",
+        err.reason
+    );
+}
+
+// A measure built from ANOTHER value's law is not parameterized by that value.
+// §04 "Reification to measures", *Phase of the reified law*: "the resulting measure
+// is itself deterministic (of parameterized or fixed phase): `lawof` absorbs
+// stochasticity into the reified law rather than propagating it outward." So in
+// `y = draw(pushfwd(exp, lawof(z)))` the base consumes `z`'s LAW, not its value:
+// `z` is no ancestor of `y`, and `lawof(y)` is an honest LogNormal. The
+// marginalization guard must therefore stop at a `lawof` argument — walking into it
+// would refuse a model that is fine, and would re-split the two §06 spellings this
+// path exists to unify, since the record spelling of the same model lowers.
+//
+// Verified numerically: every spelling below scores its LogNormal / affine /
+// truncated / weighted value against Distributions.jl exactly (e.g.
+// `logpdf(LogNormal(0,1), exp(0.5)) = -1.5439385332046727`).
+#[test]
+fn a_measure_over_another_values_law_is_not_a_stochastic_ancestor() {
+    let inline = "\
+z = draw(Normal(mu = 0.0, sigma = 1.0))
+y = draw(pushfwd(exp, lawof(z)))
+lp = logdensityof(lawof(y), 1.6487212707001282)";
+    let named = "\
+z = draw(Normal(mu = 0.0, sigma = 1.0))
+zl = lawof(z)
+y = draw(pushfwd(exp, zl))
+lp = logdensityof(lawof(y), 1.6487212707001282)";
+    let direct = "\
+lp = logdensityof(pushfwd(exp, Normal(mu = 0.0, sigma = 1.0)), 1.6487212707001282)";
+    let lp_direct = pir_binding(&flatppl_flatpir::write(&determinize_src(direct)), "lp");
+    for src in [inline, named] {
+        let pir = flatppl_flatpir::write(&determinize_src(src));
+        assert_eq!(
+            pir_binding(&pir, "lp"),
+            lp_direct,
+            "a law-of-a-law base must score as the plain pushforward:\n{pir}"
+        );
+    }
+
+    // The other combinators over `lawof(z)`, all of which the guard also refused.
+    // Each marker is the computation that combinator alone contributes, so none of
+    // these passes just because SOMETHING lowered: the support gate for `truncate`,
+    // the affine preimage `(0.3 - 1) / 2` for `locscale`, the weight for `weighted`.
+    for (src, marker) in [
+        (
+            "\
+z = draw(Normal(mu = 0.0, sigma = 1.0))
+y = draw(truncate(lawof(z), interval(0.0, inf)))
+lp = logdensityof(lawof(y), 0.3)",
+            "(in 0.3",
+        ),
+        (
+            "\
+z = draw(Normal(mu = 0.0, sigma = 1.0))
+y = draw(locscale(lawof(z), 1.0, 2.0))
+lp = logdensityof(lawof(y), 0.3)",
+            "-0.35",
+        ),
+        (
+            "\
+z = draw(Normal(mu = 0.0, sigma = 1.0))
+y = draw(weighted(0.5, lawof(z)))
+lp = logdensityof(lawof(y), 0.3)",
+            "(log 0.5)",
+        ),
+    ] {
+        let pir = flatppl_flatpir::write(&determinize_src(src));
+        assert!(
+            pir.contains(marker),
+            "combinator over lawof(z) must lower, keeping its own `{marker}` term:\n{pir}"
+        );
+        assert!(!pir.contains("lawof"), "measure layer gone:\n{pir}");
+    }
+
+    // But a genuinely RANDOM operand outside the `lawof` argument is a stochastic
+    // ancestor and must still refuse — the walk skips only what `lawof` encloses.
+    for src in [
+        "\
+q = draw(Uniform(a = 0.0, b = 1.0))
+z = draw(Normal(mu = 0.0, sigma = 1.0))
+y = draw(weighted(q, lawof(z)))
+lp = logdensityof(lawof(y), 0.3)",
+        "\
+q = draw(Normal(mu = 0.0, sigma = 1.0))
+z = draw(Normal(mu = 0.0, sigma = 1.0))
+y = draw(pushfwd(x -> x + q, lawof(z)))
+lp = logdensityof(lawof(y), 0.3)",
+    ] {
+        let mut m = flatppl_syntax::parse(src).unwrap();
+        let _ = flatppl_infer::infer(&mut m);
+        let err = determinize(&m)
+            .expect_err("a random weight / random forward map randomizes the law — refuse");
+        assert!(
+            err.reason
+                .contains("marginalizes over a stochastic ancestor"),
+            "must refuse as a marginal: {}",
+            err.reason
+        );
+    }
+}
+
+// A value law reached as a NESTED measure must not pin its binding: the variate it
+// is scored at belongs to the ENCLOSING value, a different draw. Here `lawof(z)` is
+// the base of `y`'s truncation, so it is scored at `y`'s variate 0.3 — pinning `z`
+// to that asserted a value for a draw the query never mentioned, and `w = z + 1.0`
+// came out as the number 1.3 in conformance-passing output. `lp` itself was right,
+// which is what made it silent. With the pin confined to the query's own measure,
+// `z = draw(...)` stays referenced by `w` and the driver refuses the program.
+#[test]
+fn a_nested_value_law_does_not_pin_the_enclosing_variate() {
+    let src = "\
+z = draw(Normal(mu = 0.0, sigma = 1.0))
+y = draw(truncate(lawof(z), interval(0.0, inf)))
+w = z + 1.0
+lp = logdensityof(lawof(record(y = y)), record(y = 0.3))";
+    let mut m = flatppl_syntax::parse(src).unwrap();
+    let _ = flatppl_infer::infer(&mut m);
+    let err = determinize(&m)
+        .expect_err("a live consumer of the scaffold draw must refuse, not receive a value");
+    assert_eq!(
+        err.construct, "draw",
+        "the surviving draw is what refuses: {} / {}",
+        err.construct, err.reason
+    );
+
+    // Without the live consumer, the same law scores fine and the scaffold draw is
+    // swept — so the refusal above is about `w`, not about nesting a `lawof`.
+    let no_consumer = "\
+z = draw(Normal(mu = 0.0, sigma = 1.0))
+y = draw(truncate(lawof(z), interval(0.0, inf)))
+lp = logdensityof(lawof(record(y = y)), record(y = 0.3))";
+    let pir = flatppl_flatpir::write(&determinize_src(no_consumer));
+    assert!(
+        pir.contains("(ifelse") && !pir.contains("lawof"),
+        "the truncated law still lowers:\n{pir}"
+    );
+}
+
+// C1: the marginalization guard has a measure-expression half, and it is NOT
+// reachable from `lower_value_law`. When `lawof`'s argument is a MEASURE rather
+// than a value, the `lawof` is simply stripped and `build_density_term` scores the
+// constructor — so `lawof(Normal(mu = a, sigma = 1))` with `a` latent emitted the
+// conditional `N(a, 1)` at whatever value a later query pinned `a` to, where §04's
+// total law is the marginal `N(0, √2)`. Verified against Distributions.jl: the
+// emitted number was -1.4989385332046727 (`logpdf(Normal(0.1, 1), exp(0.5))`) and
+// the marginal is -1.8280121234846454 (`logpdf(Normal(0, √2), exp(0.5))`) — wrong
+// by 0.329 nats, conformance-passing, and precisely the later-query ordering the
+// value-side guard exists to stop.
+//
+// Both places a `lawof` is stripped must check: the dispatcher's arm, and
+// `measure_of_arg` at the query entry (which is why the third case here, a DIRECT
+// query on such a law, is included — it bypasses the dispatcher entirely and was
+// wrong before the value-side guard existed too).
+#[test]
+fn lawof_of_a_draw_parameterized_measure_refuses() {
+    for src in [
+        // Through the dispatcher: a pushforward whose base is the stochastic law.
+        "\
+a = draw(Normal(mu = 0.0, sigma = 1.0))
+y = draw(pushfwd(exp, lawof(Normal(mu = a, sigma = 1.0))))
+lp_y = logdensityof(lawof(y), 1.6487212707001282)
+lp_a = logdensityof(lawof(a), 0.1)",
+        // Same, through `truncate`.
+        "\
+a = draw(Normal(mu = 0.0, sigma = 1.0))
+y = draw(truncate(lawof(Normal(mu = a, sigma = 1.0)), interval(0.0, inf)))
+lp_y = logdensityof(lawof(y), 0.3)
+lp_a = logdensityof(lawof(a), 0.1)",
+        // Named, so the check cannot depend on the argument being inline.
+        "\
+a = draw(Normal(mu = 0.0, sigma = 1.0))
+ml = lawof(Normal(mu = a, sigma = 1.0))
+y = draw(pushfwd(exp, ml))
+lp_y = logdensityof(lawof(y), 1.6487212707001282)
+lp_a = logdensityof(lawof(a), 0.1)",
+        // Direct query on the stochastic law — strips at `measure_of_arg`, never
+        // reaching the dispatcher's `lawof` arm.
+        "\
+a = draw(Normal(mu = 0.0, sigma = 1.0))
+lp_m = logdensityof(lawof(Normal(mu = a, sigma = 1.0)), 0.5)
+lp_a = logdensityof(lawof(a), 0.1)",
+    ] {
+        let mut m = flatppl_syntax::parse(src).unwrap();
+        let _ = flatppl_infer::infer(&mut m);
+        let err = determinize(&m).expect_err(
+            "the law of a draw-parameterized measure is a marginal — refuse, do not \
+             score the conditional",
+        );
+        assert!(
+            err.reason.contains("MARGINAL law"),
+            "must refuse as a marginal: {}",
+            err.reason
+        );
+    }
+
+    // Control: a measure argument whose parameters are FIXED is not stochastic, and
+    // `lawof(lawof(z))` / `lawof(truncate(lawof(z), …))` are deterministic measures
+    // built from another law — none of these may be caught.
+    for src in [
+        "\
+p = elementof(reals)
+lp = logdensityof(lawof(Normal(mu = p, sigma = 1.0)), 0.5)",
+        "\
+z = draw(Normal(mu = 0.0, sigma = 1.0))
+lp = logdensityof(lawof(lawof(z)), 0.3)",
+        "\
+z = draw(Normal(mu = 0.0, sigma = 1.0))
+lp = logdensityof(lawof(truncate(lawof(z), interval(0.0, inf))), 0.3)",
+    ] {
+        let pir = flatppl_flatpir::write(&determinize_src(src));
+        assert!(
+            pir.contains("builtin_logdensityof"),
+            "a deterministic measure's law must still lower:\n{pir}"
+        );
+    }
+}
+
+// The measure-expression guard tested `Type::Measure`, and a REIFICATION types as
+// `Kernel` — so `F = functionof(Normal(mu = a, sigma = 1.0))` with `a` latent slipped
+// past it and `logdensityof(lawof(F), 0.5)` emitted `builtin_logdensityof(Normal,
+// record(mu = 0.1, sigma = 1.0), 0.5)`, the conditional at whatever value a later
+// query pinned `a` to. §04 "Reification to measures" makes `lawof(x)` the TOTAL law
+// and states the consequence on its worked `prior_predictive = lawof(record(obs =
+// obs))`: a stochastic ancestor is "obtained by marginalizing over" — "they are
+// internal stochastic nodes in the traced sub-DAG, not boundary inputs, so `lawof`
+// integrates them out", equivalently `kchain(prior, forward_kernel)`. Here that
+// marginal is `Normal(0, √2)`; the emitted conditional was `Normal(0.1, 1)`, a
+// finished conformance-passing number wrong by 0.329 nats.
+//
+// Refusing rather than marginalizing is the call: the `kchain` is closed-form only
+// for a discrete-finite latent (`crate::marginal`'s scope), and synthesizing it from
+// the reification is machinery the guard does not have.
+#[test]
+fn lawof_of_a_draw_parameterized_reification_refuses() {
+    for src in [
+        // Direct query on the reification's law — the shape that emitted the number.
+        "\
+a = draw(Normal(mu = 0.0, sigma = 1.0))
+F = functionof(Normal(mu = a, sigma = 1.0))
+lp = logdensityof(lawof(F), 0.5)
+lp_a = logdensityof(lawof(record(a = a)), record(a = 0.1))",
+        // Inline, so the check cannot depend on the reification being named.
+        "\
+a = draw(Normal(mu = 0.0, sigma = 1.0))
+lp = logdensityof(lawof(functionof(Normal(mu = a, sigma = 1.0))), 0.5)
+lp_a = logdensityof(lawof(record(a = a)), record(a = 0.1))",
+        // `kernelof` reifies the same way and must be caught the same way.
+        "\
+a = draw(Normal(mu = 0.0, sigma = 1.0))
+K = kernelof(Normal(mu = a, sigma = 1.0))
+lp = logdensityof(lawof(K), 0.5)
+lp_a = logdensityof(lawof(record(a = a)), record(a = 0.1))",
+    ] {
+        let mut m = flatppl_syntax::parse(src).unwrap();
+        let _ = flatppl_infer::infer(&mut m);
+        let err = determinize(&m).expect_err(
+            "the law of a draw-parameterized reification is a marginal — refuse, do not \
+             score the conditional",
+        );
+        assert!(
+            err.reason.contains("MARGINAL law"),
+            "must refuse as a marginal: {}",
+            err.reason
+        );
+    }
+
+    // A `draw` OF the reification reaches the same conclusion by the value-side half
+    // of the guard, whose reason names the ancestor rather than the law. Asserted
+    // separately so neither half is credited with the other's coverage.
+    for src in [
+        "\
+a = draw(Normal(mu = 0.0, sigma = 1.0))
+F = functionof(Normal(mu = a, sigma = 1.0))
+w = draw(F)
+lp = logdensityof(lawof(w), 0.5)
+lp_a = logdensityof(lawof(record(a = a)), record(a = 0.1))",
+        "\
+a = draw(Normal(mu = 0.0, sigma = 1.0))
+F = functionof(Normal(mu = a, sigma = 1.0))
+y = draw(pushfwd(exp, F))
+lp = logdensityof(lawof(y), 1.6487212707001282)
+lp_a = logdensityof(lawof(record(a = a)), record(a = 0.1))",
+    ] {
+        let mut m = flatppl_syntax::parse(src).unwrap();
+        let _ = flatppl_infer::infer(&mut m);
+        let err = determinize(&m)
+            .expect_err("a draw of a draw-parameterized reification must refuse too");
+        assert!(
+            err.reason
+                .contains("marginalizes over a stochastic ancestor"),
+            "must refuse as a marginal: {}",
+            err.reason
+        );
+    }
+
+    // Control: what makes this a guard and not a ban on `lawof(<reification>)`. A
+    // reification over FIXED or literal parameters has no stochastic ancestor to
+    // integrate out and must still lower to its one density term.
+    for src in [
+        "\
+p = elementof(reals)
+F = functionof(Normal(mu = p, sigma = 1.0))
+lp = logdensityof(lawof(F), 0.5)",
+        "\
+F = functionof(Normal(mu = 0.0, sigma = 1.0))
+lp = logdensityof(lawof(F), 0.5)",
+    ] {
+        let out = determinize_src(src);
+        let pir = flatppl_flatpir::write(&out);
+        assert_eq!(
+            pir_binding(&pir, "lp")
+                .matches("builtin_logdensityof")
+                .count(),
+            1,
+            "a reification over fixed parameters must still lower:\n{pir}"
+        );
+        assert!(
+            flatppl_determinizer::is_flatpdl(&out).is_ok(),
+            "is_flatpdl failed:\n{pir}"
+        );
+    }
+}
+
+// §13 "Determinization": "`draw` nodes take their values from the explicit `point`,
+// unless marginalized out." So wherever the point determines a draw's value —
+// directly, or through an invertible transform — the draw must be PINNED, and a
+// downstream consumer evaluates at the query point. Confining the pin to the
+// query's own measure was too narrow: every position below preserves the variate,
+// so the point reaches the draw, yet each refused with the uninformative
+// `refuse draw … no determinization rule` once a live consumer kept the draw alive.
+//
+// The boundary is recorded in BOTH directions on purpose. The next contributor who
+// sees `joint(a = lawof(y))` refusing must not widen the pin to record fields as
+// well — `a_nested_value_law_does_not_pin_the_enclosing_variate` is the other side,
+// and a record field's measure describes the FIELD's draw, so a `lawof` inside it
+// names a third value the point says nothing about.
+#[test]
+fn variate_preserving_positions_pin_the_draw_from_the_point() {
+    for (src, expect) in [
+        // `joint` field: `v.a` is the field measure's own variate.
+        (
+            "\
+y = draw(Normal(mu = 0.0, sigma = 1.0))
+w = y + 1.0
+lp = logdensityof(joint(a = lawof(y)), record(a = 0.3))",
+            "(%bind w 1.3)",
+        ),
+        // `truncate`'s base is scored at the same point.
+        (
+            "\
+y = draw(Normal(mu = 0.0, sigma = 1.0))
+w = y + 1.0
+lp = logdensityof(truncate(lawof(y), interval(0.0, inf)), 0.3)",
+            "(%bind w 1.3)",
+        ),
+        // `locscale`'s preimage is invertible, so the point determines the draw:
+        // `y = (0.3 - 1.0) / 2.0 = -0.35`, hence `w = 0.65`. This threading was the
+        // one position no test covered — mutating it to `Other` left the whole file
+        // green — and it is behaviour-visible: without it this program refuses.
+        (
+            "\
+y = draw(Normal(mu = 0.0, sigma = 1.0))
+w = y + 1.0
+lp = logdensityof(locscale(lawof(y), 1.0, 2.0), 0.3)",
+            "(%bind w 0.65)",
+        ),
+        // `lawof(lawof(y))` — the unwrap must carry the point through.
+        (
+            "\
+y = draw(Normal(mu = 0.0, sigma = 1.0))
+w = y + 1.0
+lp = logdensityof(lawof(lawof(y)), 0.3)",
+            "(%bind w 1.3)",
+        ),
+        // A reified body.
+        (
+            "\
+y = draw(Normal(mu = 0.0, sigma = 1.0))
+w = y + 1.0
+lp = logdensityof(functionof(lawof(y)), 0.3)",
+            "(%bind w 1.3)",
+        ),
+        // A `likelihoodof` kernel, scored at the baked observation.
+        (
+            "\
+mu = elementof(reals)
+y = draw(Normal(mu = 0.0, sigma = 1.0))
+w = y + 1.0
+L = likelihoodof(lawof(y), 0.3)
+lp = logdensityof(L, record(mu = 2.0))",
+            "(%bind w 1.3)",
+        ),
+    ] {
+        let pir = flatppl_flatpir::write(&determinize_src(src));
+        assert!(
+            pir.contains(expect),
+            "§13: the point determines this draw, so `w` evaluates at it — expected \
+             `{expect}`:\n{pir}"
+        );
+        assert!(!pir.contains("(draw "), "no draw survives:\n{pir}");
+    }
+
+    // A pushforward's preimage is "through an invertible transform", so the draw is
+    // determined too — here `y = log(exp(0.5)) = 0.5`, not swept to a placeholder.
+    let pir = flatppl_flatpir::write(&determinize_src(
+        "\
+y = draw(Normal(mu = 0.0, sigma = 1.0))
+w = y + 1.0
+lp = logdensityof(pushfwd(exp, lawof(y)), 1.6487212707001282)",
+    ));
+    assert!(
+        pir.contains("(%bind y (%meta") && pir.contains("(log 1.6487212707001282)"),
+        "y takes the invertible preimage of the point:\n{pir}"
+    );
+}
+
+// An unimplemented MEASURE combinator reached as a pseudo-transform must REFUSE, not
+// mislower. The assertion is deliberately on the outcome and not on the wording: the
+// reason `crate::invert` gives ("no analytic inverse") is imprecise, since the real
+// problem is that `mixture` has no type rule so nothing knows it is a map at all.
+// Gating the value-law path on the transform's inferred type to say that instead was
+// tried and reverted — `%deferred` propagates outward from any operand, so the gate
+// also refused `A * x + b`, whose `add` is ordinary and which `crate::invert` inverts
+// correctly (see `bare_matrix_affine_value_law_lowers_like_the_record_spelling`).
+// Losing a correct lowering to improve a message on an unimplemented op is the wrong
+// trade; if the message is worth fixing, discriminate on the head op, not the result
+// type.
+#[test]
+fn an_unimplemented_measure_combinator_as_a_transform_refuses() {
+    let src = "\
+z = draw(Normal(mu = 0.0, sigma = 1.0))
+y = draw(mixture(record(w = 0.5, m = lawof(z))))
+lp = logdensityof(lawof(y), 0.3)";
+    let mut m = flatppl_syntax::parse(src).unwrap();
+    let _ = flatppl_infer::infer(&mut m);
+    let err = determinize(&m).expect_err("an unimplemented measure combinator must refuse");
+    assert!(
+        !err.reason.is_empty(),
+        "refusal carries a reason: {}",
+        err.reason
+    );
+}
+
+// The bare and record spellings of one matrix-affine value law must lower to the same
+// density. `A * x + b` types as `%deferred` at the `add`, because `mul(matrix, vector)`
+// has no type rule and deferredness propagates outward — but the map is an ordinary
+// affine one and `crate::invert`'s matrix-affine grammar handles it, emitting
+// `linsolve`/`logabsdet`. A guard that read that deferred RESULT type as "unreadable
+// map" refused this while the record spelling (which reaches the measure through
+// `lower_record_of_draws`) kept lowering, splitting the two spellings of one measure.
+// This pins them together, the same bar `bare_lawof_of_derived_scalar_lowers_like_pushfwd`
+// holds for the scalar case.
+#[test]
+fn bare_matrix_affine_value_law_lowers_like_the_record_spelling() {
+    let prelude = "\
+A = [[2.0, 0.0], [0.0, 3.0]]
+b = [1.0, 1.0]
+x = draw(MvNormal(mu = [0.0, 0.0], sigma = [[1.0, 0.0], [0.0, 1.0]]))
+y = A * x + b
+";
+    let bare = flatppl_flatpir::write(&determinize_src(&format!(
+        "{prelude}lp = logdensityof(lawof(y), [1.0, 1.0])"
+    )));
+    let record = flatppl_flatpir::write(&determinize_src(&format!(
+        "{prelude}lp = logdensityof(lawof(record(y = y)), record(y = [1.0, 1.0]))"
+    )));
+    let lp = pir_binding(&bare, "lp");
+    assert!(
+        lp.contains("linsolve") && lp.contains("logabsdet"),
+        "the matrix-affine inverse and its log-volume are emitted:\n{lp}"
+    );
+    assert_eq!(
+        lp,
+        pir_binding(&record, "lp"),
+        "bare and record spellings of one measure must lower identically:\n{bare}\n---\n{record}"
+    );
+}
+
+// `lower_value_law` sits on the measure dispatcher's FALLTHROUGH, so a bare
+// stochastic value serves in ANY measure position, not only as a query's own target.
+// The two tests below pin that composition for `weighted` and `superpose`: neither
+// arm was taught about value laws, both compose with them, and nothing else in the
+// suite would notice if a refactor took the composition away — the combinator tests
+// above all use a primitive constructor as the inner measure.
+//
+// `weighted(w, lawof(y))`: §06 `weighted` gives `log(w) + logdensityof(lawof(y), v)`,
+// where the inner term is `y`'s own draw scored at the query's variate.
+#[test]
+fn weighted_over_a_value_law_lowers_to_log_w_plus_the_value_density() {
+    let src = "\
+y = draw(Normal(mu = 0.0, sigma = 1.0))
+lp = logdensityof(weighted(0.5, lawof(y)), 0.3)";
+    let out = determinize_src(src);
+    let pir = flatppl_flatpir::write(&out);
+    let lp = pir_binding(&pir, "lp");
+    // `(log 0.5)` as a call head, not a bare "log" substring, which
+    // `builtin_logdensityof` would satisfy tautologically.
+    assert!(
+        lp.contains("(add ") && lp.contains("(log 0.5)"),
+        "log(w) added to the inner density:\n{lp}"
+    );
+    assert_eq!(
+        lp.matches("builtin_logdensityof").count(),
+        1,
+        "exactly one inner density — the value law's own draw:\n{lp}"
+    );
+    // The inner density is scored at the QUERY's variate. A value law that pinned its
+    // draw and then scored somewhere else is the failure this rules out.
+    assert!(
+        lp.contains(" 0.3)"),
+        "the inner density is scored at the query's variate:\n{lp}"
+    );
+    assert!(
+        !pir.contains("weighted") && !pir.contains("lawof") && !pir.contains("(draw "),
+        "measure layer gone:\n{pir}"
+    );
+    assert!(
+        flatppl_determinizer::is_flatpdl(&out).is_ok(),
+        "is_flatpdl failed:\n{pir}"
+    );
+}
+
+// `superpose(lawof(y), Normal(...))`: a value law and an ordinary primitive measure
+// mixed in one §06 measure sum. Both mixands are scored at the query's variate and
+// combined with `logsumexp` over a vector, the same shape
+// `superpose_lowers_to_logsumexp_of_densities` requires of two constructors.
+#[test]
+fn superpose_of_a_value_law_and_a_constructor_lowers_to_logsumexp() {
+    let src = "\
+y = draw(Normal(mu = 0.0, sigma = 1.0))
+lp = logdensityof(superpose(lawof(y), Normal(mu = 1.0, sigma = 1.0)), 0.3)";
+    let out = determinize_src(src);
+    let pir = flatppl_flatpir::write(&out);
+    let lp = pir_binding(&pir, "lp");
+    assert!(
+        lp.contains("(logsumexp (%meta ((%array"),
+        "logsumexp must take a single vector (array-typed) argument, not variadic \
+         scalars (§07):\n{lp}"
+    );
+    assert_eq!(
+        lp.matches("builtin_logdensityof").count(),
+        2,
+        "one density per mixand — the value law and the constructor:\n{lp}"
+    );
+    // The mixands keep their OWN parameters. Collapsing both onto one kernel input
+    // would still emit two density terms and still pass `is_flatpdl`, so assert the
+    // two `mu`s separately rather than trusting the term count.
+    assert!(
+        lp.contains("(%field mu 0.0)") && lp.contains("(%field mu 1.0)"),
+        "each mixand keeps its own parameters:\n{lp}"
+    );
+    assert!(
+        !pir.contains("superpose") && !pir.contains("lawof") && !pir.contains("(draw "),
+        "measure layer gone:\n{pir}"
+    );
+    assert!(
+        flatppl_determinizer::is_flatpdl(&out).is_ok(),
+        "is_flatpdl failed:\n{pir}"
     );
 }

@@ -59,7 +59,15 @@
 //! - `truncate(M, S)` → `ifelse(in(v, S), density(M, v), neg(inf))` (the `_ in R`
 //!   membership builtin, which infers to a boolean — `elementof` is a set-valued
 //!   parameter declaration, not a membership predicate).
-//! - `pushfwd(bijection(f, f_inv, logvol), M)` → `sub(density(M, f_inv(v)), logvol(f_inv(v)))`
+//! - `pushfwd(bijection(f, f_inv, logvol), M)` → `sub(density(M, f_inv(v)),
+//!   logvol(f_inv(v)))` over a CONTINUOUS base; over a discrete one the volume
+//!   term is dropped (`density(M, f_inv(v))` alone) — a counting-measure density
+//!   has no volume element, §06 "Density convention". Same split for `locscale`.
+//!   A base whose variate proves neither reference measure is **refused**
+//!   ([`reference_measure`]). Where `f`'s IMAGE is known, the whole change of
+//!   variables is wrapped in the same `ifelse` gate `truncate` emits — outside the
+//!   image the preimage is empty and the density −∞ ([`gate_density`]) — and reads a
+//!   point sanitised against that gate ([`gate_point`]).
 //! - `iid(M, N)` → `Σ_{i<N} density(M, get0(v, i))` — **`N` is the static
 //!   1-D repeat count read from the iid node's own const-evaluated domain
 //!   shape** (`iid_static_size`), so a shape-dependent size (`iid(M,
@@ -238,8 +246,11 @@ fn lower_density_core(
     }
     // Measure query: arg2 is the variate. Strip a `lawof` wrapper on the
     // (possibly grafted) measure node and hand it to the recursive dispatcher.
+    // This is the one call in the crate at [`VariateOrigin::Point`] — arg2 is the
+    // queried value's OWN variate here, which is what licenses `lower_value_law`
+    // to pin it back onto the binding.
     let measure_expr = measure_of_arg(m, arg1)?;
-    lower_measure_density(m, measure_expr, arg2)
+    lower_measure_density_at_point(m, measure_expr, arg2)
 }
 
 /// True iff `id` infers to a `Likelihood` type.
@@ -679,7 +690,7 @@ fn lower_likelihood_query(
     // the θ field names. A same-module `k` is returned unchanged.
     let k = resolve_cross_module_kernel(m, bundle, k)?;
     let theta_map = theta_field_map(m, theta)?;
-    let density = lower_measure_density(m, k, obs)?;
+    let density = lower_measure_density_at_point(m, k, obs)?;
     // Refuse-don't-mislower: a θ param captured as a `functionof` / `kernelof`
     // reification *input* (a `(name, %ref self <name>)` boundary entry) cannot be
     // reached by the `substitute_refs_by_name` inliner below — `map_tree` walks
@@ -955,21 +966,74 @@ fn subtree_has_theta_capturing_input(m: &Module, root: NodeId, map: &[(Symbol, N
 // Core recursive dispatcher
 // ---------------------------------------------------------------------------
 
+/// Does the query's explicit point determine the variate `v` of the measure being
+/// lowered?
+///
+/// §13 "Determinization" fixes the convention this encodes: "`draw` nodes take
+/// their values from the explicit `point`, unless marginalized out." So when the
+/// point determines a draw's value — directly, or through an invertible transform —
+/// pinning that draw is spec-mandated, and a downstream `w = y + 1.0` correctly
+/// evaluates at the query point. When it does not, pinning fabricates a value for a
+/// draw the query never mentioned: for `y = draw(truncate(lawof(z), S))` the
+/// `lawof(z)` sub-measure is scored at `y`'s point, but `z` is an INDEPENDENT draw
+/// and that number was never `z`'s value.
+///
+/// Only [`lower_value_law`] reads this, and only to decide whether to pin.
+/// Variate-preserving positions propagate it (a `lawof` unwrap, `truncate`'s base,
+/// a `joint` field, a `likelihoodof` kernel, a reified body, a pushforward's
+/// invertible preimage); a record field resets it, since a record field's measure
+/// describes the FIELD's draw and any `lawof` inside it names some third value.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VariateOrigin {
+    /// `v` is this measure's own variate, supplied by the query point.
+    Point,
+    /// `v` belongs to some other value; this measure's draw is independent of it.
+    Other,
+}
+
 /// Compute the log-density of `measure_expr` at `v`, returning a deterministic node.
 /// `measure_expr` may be a record-of-draws, a combinator, a `(%ref self x)` pointing
 /// to one of those, or a bare primitive constructor.
+///
+/// Entry point for a measure whose variate the query point does NOT determine.
+/// A measure the point does determine goes through
+/// [`lower_measure_density_at_point`]; see [`VariateOrigin`].
 pub(crate) fn lower_measure_density(
     m: &mut Module,
     measure_expr: NodeId,
     v: NodeId,
+) -> Result<NodeId, RefuseError> {
+    lower_measure_density_at(m, measure_expr, v, VariateOrigin::Other)
+}
+
+/// [`lower_measure_density`] for a measure whose variate IS the query point —
+/// the query's own measure, and every variate-preserving position under it.
+pub(crate) fn lower_measure_density_at_point(
+    m: &mut Module,
+    measure_expr: NodeId,
+    v: NodeId,
+) -> Result<NodeId, RefuseError> {
+    lower_measure_density_at(m, measure_expr, v, VariateOrigin::Point)
+}
+
+/// The dispatcher proper. A variate-PRESERVING position calls this directly,
+/// passing its own caller's `origin` through unchanged, so the point's reach is
+/// neither lost nor invented; every other position goes through
+/// [`lower_measure_density`].
+fn lower_measure_density_at(
+    m: &mut Module,
+    measure_expr: NodeId,
+    v: NodeId,
+    origin: VariateOrigin,
 ) -> Result<NodeId, RefuseError> {
     // Resolve a single level of `(%ref self x)` indirection on the measure side.
     let (measure_node, _binding_opt) = resolve_ref_one(m, measure_expr);
 
     // A reified-kernel *application* `k(input)` (a `%call(User(k), [input])`)
     // is not a builtin-named op; β-reduce it to its measure body and recurse.
+    // β-reduction does not move the measure, so the position carries over.
     if let Some(reduced) = crate::kernel::reduce_kernel_application(m, measure_node) {
-        return lower_measure_density(m, reduced, v);
+        return lower_measure_density_at(m, reduced, v, origin);
     }
 
     // Dispatch on the measure op.
@@ -985,26 +1049,26 @@ pub(crate) fn lower_measure_density(
         // already-stripped `lawof` never re-enters this arm, since the entry
         // point's strip means `measure_node` is `M` itself by the time it's
         // dispatched, so there's no double count.
-        Some("lawof") => lower_lawof(m, measure_node, v),
+        Some("lawof") => lower_lawof(m, measure_node, v, origin),
         Some("weighted") => lower_weighted(m, measure_node, v),
         Some("logweighted") => lower_logweighted(m, measure_node, v),
         Some("superpose") => lower_superpose(m, measure_node, v),
         Some("normalize") => lower_normalize(m, measure_node, v),
-        Some("truncate") => lower_truncate(m, measure_node, v),
-        Some("pushfwd") => lower_pushfwd(m, measure_node, v),
+        Some("truncate") => lower_truncate(m, measure_node, v, origin),
+        Some("pushfwd") => lower_pushfwd(m, measure_node, v, origin),
         // kchain marginal: discrete-finite latent → mass-weighted logsumexp;
         // continuous / infinite-discrete / non-enumerable → refuse (Task 5).
         Some("kchain") => crate::marginal::lower_kchain_marginal(m, measure_node, v),
         Some("jointchain") => crate::jointchain::lower_jointchain(m, measure_node, v),
         Some("iid") => lower_iid(m, measure_node, v),
         Some("broadcast") => lower_broadcast_kernel(m, measure_node, v),
-        Some("joint") => lower_joint(m, measure_node, v),
+        Some("joint") => lower_joint(m, measure_node, v, origin),
         // A reified measure (`functionof` / `kernelof`) used AS a measure — its
         // body is the measure expression it reifies. Unwrap to the body and recurse
         // so a `broadcast(K, params)` body reaches the broadcast-kernel arm and a
         // bare constructor body reaches `build_density_term` (histfactory's
         // `functionof(Poisson.(expected))` scored via `likelihoodof`).
-        Some("functionof") | Some("kernelof") => lower_reified_measure(m, measure_node, v),
+        Some("functionof") | Some("kernelof") => lower_reified_measure(m, measure_node, v, origin),
         // Refused combinators — refused here rather than mis-lowered.
         // `likelihoodof` / `joint_likelihood` / `bayesupdate` are normally
         // intercepted at the `logdensityof` entry (where the `bundle` needed to
@@ -1020,7 +1084,7 @@ pub(crate) fn lower_measure_density(
         // `locscale(m, shift, scale)` = `pushfwd(x -> scale * x + shift, m)`
         // (§06 line 369/402): the affine change-of-variables, reusing the same
         // scalar / matrix-affine synthesis as `pushfwd` (Task 5).
-        Some("locscale") => lower_locscale(m, measure_node, v),
+        Some("locscale") => lower_locscale(m, measure_node, v, origin),
         Some("markovchain")
         | Some("kscan")
         | Some("bayesupdate")
@@ -1028,8 +1092,39 @@ pub(crate) fn lower_measure_density(
         | Some("restrict")
         | Some("likelihoodof")
         | Some("joint_likelihood") => Err(refuse_op(measure_node, m)),
-        // Fallthrough: treat as a primitive distribution constructor.
-        _ => build_density_term(m, measure_node, v),
+        // Fallthrough: treat as a primitive distribution constructor — and, only
+        // if that refuses, as a stochastic VALUE whose law a bare `lawof(x)`
+        // reified ([`lower_value_law`]).
+        //
+        // The constructor read goes FIRST, and that order is load-bearing: a
+        // constructor whose parameters reference a draw
+        // (`Normal(mu = z, sigma = 1.0)`) is a dependent product the chain rule
+        // scores with `z` pinned, yet it also passes the value-law shape test
+        // (one distinct draw reached), so offering it to the value law first
+        // would read the whole dependent product as a map of `z`.
+        //
+        // What a reversed order costs is COVERAGE, not a wrong number: the map
+        // the value law would synthesize is `x -> Normal(mu = x, sigma = 1.0)`,
+        // whose head `Normal` appears in neither `crate::invert`'s unary-bijection
+        // registry nor its affine grammar (`invert.rs:794-877`), so it refuses
+        // there ("no analytic inverse"). Every dependent product would stop
+        // lowering — loudly. The precision matters because it is the whole reason
+        // for the ordering, and `dependent_constructor_is_read_as_a_product_not_a_map`
+        // is the test that holds it.
+        //
+        // Reusing `build_density_term`'s own refusal as the gate keeps the two
+        // paths' precedence exact without a second copy of
+        // [`split_kernel_constructor`]'s notion of a well-formed constructor
+        // call. When neither matches, the primitive refusal is the one reported.
+        _ => match build_density_term(m, measure_node, v) {
+            Ok(term) => Ok(term),
+            // `measure_expr`, NOT the ref-resolved `measure_node`: the value law
+            // pins the binding its value came from, which the resolution discards.
+            Err(not_a_constructor) => match lower_value_law(m, measure_expr, v, origin) {
+                Some(scored) => scored,
+                None => Err(not_a_constructor),
+            },
+        },
     }
 }
 
@@ -1041,7 +1136,12 @@ pub(crate) fn lower_measure_density(
 /// exactly the shape that arm already scores).
 ///
 /// A `lawof` with anything but exactly one argument refuses (refuse-don't-mislower).
-fn lower_lawof(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseError> {
+fn lower_lawof(
+    m: &mut Module,
+    node: NodeId,
+    v: NodeId,
+    origin: VariateOrigin,
+) -> Result<NodeId, RefuseError> {
     let arg = {
         let c = expect_builtin_call(m, node, "lawof")
             .ok_or_else(|| refuse(node, m, "expected lawof"))?;
@@ -1050,7 +1150,139 @@ fn lower_lawof(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Refuse
         }
         c.args[0]
     };
-    lower_measure_density(m, arg, v)
+    refuse_stochastic_measure_law(m, arg)?;
+    lower_measure_density_at(m, arg, v, origin)
+}
+
+/// Refuse `lawof(<measure expression>)` whose measure is parameterized by a draw —
+/// `lawof(Normal(mu = a, sigma = 1))` with `a` latent, whose total law is the
+/// marginal `N(0, √2)`, not `N(a, 1)` at whatever value `a` later takes.
+///
+/// This is the measure-expression half of the marginalization guard;
+/// [`lower_value_law`] covers the half where `lawof`'s argument is a VALUE. Both
+/// are needed, and neither subsumes the other: a measure argument is unwrapped and
+/// scored by `build_density_term`, which succeeds, so `lower_value_law` is never
+/// entered and its guard never runs. Called from both places a `lawof` is stripped —
+/// here, and [`measure_of_arg`] at the query entry, which strips the top-level one
+/// before the dispatcher ever sees it.
+///
+/// **The discriminator is value-versus-measure-expression, and it has to be.**
+/// Running [`measure_reaches_draw`] on a VALUE argument would report every
+/// `lawof(z)` over a `~`-bound draw as stochastic and refuse the §06 stochastic-node
+/// form outright. Only a MEASURE-EXPRESSION argument is checked. An argument whose
+/// type inference did not resolve is left alone rather than refused on a guess (the
+/// driver re-infers each iteration, so a real measure expression carries its type by
+/// the time this runs). A RECORD argument gets its own check
+/// ([`refuse_stochastic_record_law`]), which is not this one: a dependent component
+/// `Normal(mu = z, …)` is the chain-rule product `lower_record_of_draws` scores when
+/// `z` is a sibling FIELD, and only a marginal when it is not.
+///
+/// **A reification counts as a measure expression.** `F = functionof(Normal(mu = a,
+/// sigma = 1.0))` types as `Kernel`, not `Measure`, so a `Type::Measure`-only test
+/// let `lawof(F)` through and emitted the conditional at a later-pinned `a`. The
+/// reification is admitted by its head as well as its type, since a `functionof`
+/// over a deterministic body types as `Function`: `lawof` of a reified FUNCTION is
+/// ill-formed and `lawof` of a reified MEASURE is the marginal, so refusing serves
+/// both readings. What keeps this from over-refusing is [`measure_reaches_draw`] —
+/// `lawof(functionof(Normal(mu = elementof(reals), …)))` reaches no draw and lowers.
+///
+/// Refusing rather than marginalizing is deliberate: the marginal is
+/// `kchain(lawof(a), a -> Normal(mu = a, …))`, closed-form only for a discrete-finite
+/// latent ([`crate::marginal`]'s scope), and synthesizing that `kchain` from the
+/// reification — rewriting the captured self-ref into a kernel boundary — is
+/// machinery this guard does not have.
+fn refuse_stochastic_measure_law(m: &Module, arg: NodeId) -> Result<(), RefuseError> {
+    let (resolved, _) = resolve_ref_one(m, arg);
+    refuse_stochastic_record_law(m, resolved)?;
+    let is_measure_expr = is_measure_expr_type(m, arg)
+        || is_measure_expr_type(m, resolved)
+        || matches!(
+            builtin_name(m, resolved),
+            Some("functionof") | Some("kernelof")
+        );
+    if is_measure_expr && measure_reaches_draw(m, resolved, &[]) {
+        return Err(refuse(
+            resolved,
+            m,
+            "lawof of a measure parameterized by a draw is that value's MARGINAL law \
+             (§04: lawof reifies the TOTAL law), which is a kchain marginal — refuse rather \
+             than score the conditional at a pinned latent",
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse `lawof(record(…))` one of whose fields' laws is parameterized by a draw the
+/// record does not carry — `lawof(record(y = y))` with `y ~ Normal(mu = z, sigma = 1)`
+/// and `z` a latent of the model but no field here.
+///
+/// §04 "Reification to measures" makes `lawof(x)` the TOTAL law and, on its worked
+/// `prior_predictive = lawof(record(obs = obs))`, says which ancestors get integrated
+/// out: "they are internal stochastic nodes in the traced sub-DAG, **not boundary
+/// inputs**, so `lawof` integrates them out". A SIBLING field's draw is neither — it
+/// is scored by the same product, and `lower_record_of_draws` pins it to its own field
+/// of the query point, so `lawof(record(z = z, y = y))` is the chain-rule joint and
+/// must keep lowering. Only an ancestor the record does not carry needs the `kchain`
+/// integral, and scoring it emits the conditional at whatever value that latent
+/// takes: `lawof(record(y = y))` emitted `p(y | z)` at a `z` a sibling query pinned,
+/// in EITHER statement order.
+///
+/// **This belongs to `lawof`, not to the record lowering.** `lower_record_of_draws`
+/// also scores the body of a `kernelof` / `functionof`, and a reification does not
+/// integrate its free stochastic params out — it CONDITIONS on them as boundary
+/// inputs, which is exactly §04's exception. `forward_kernel =
+/// kernelof(record(obs = obs), theta1 = theta1, theta2 = theta2)` with
+/// `obs ~ iid(Normal(mu = a, sigma = b), 10)` over derived `a`, `b` is that shape, and
+/// a guard placed in the record lowering refused it
+/// (`fixtures/flatppl/queries/bayesian_inference_2_posterior.flatppl`). Sited at the
+/// `lawof` strip points, it fires only where §04 asks for the total law.
+///
+/// A field the record lowering will refuse anyway (not a draw, or reaching two draws)
+/// makes the sibling set incomplete, so the check stands down entirely rather than
+/// mistake a sibling for an outsider — that refusal is the caller's, with its own
+/// reason.
+fn refuse_stochastic_record_law(m: &Module, record_node: NodeId) -> Result<(), RefuseError> {
+    let Some(rec) = expect_builtin_call(m, record_node, "record") else {
+        return Ok(());
+    };
+    let mut fields = Vec::with_capacity(rec.named.len());
+    for field in rec.named.iter() {
+        match resolve_component_draw(m, field.value) {
+            Some((measure, _, transform, draw_site)) => {
+                fields.push((measure, transform, draw_site))
+            }
+            None => return Ok(()),
+        }
+    }
+    let siblings: Vec<NodeId> = fields.iter().map(|&(_, _, site)| site).collect();
+    for &(measure, transform, _) in &fields {
+        // The transform is walked as well as the measure: for `b = y + z` the outside
+        // ancestor is in the MAP, which `build_forward_map` would read as a constant.
+        let reaches = |node| measure_reaches_draw(m, node, &siblings);
+        if reaches(measure) || transform.is_some_and(reaches) {
+            return Err(refuse(
+                measure,
+                m,
+                "lawof of a record whose field law is parameterized by a draw the record does \
+                 not carry is that field's MARGINAL law (§04: lawof reifies the TOTAL law), \
+                 which is a kchain marginal — refuse rather than score the conditional at a \
+                 latent pinned by another query",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Is `node`'s inferred type a measure EXPRESSION's — a measure, or a reification
+/// standing for one? A reified measure is `Kernel`-typed (`driver::is_measure_typed_rhs`
+/// relies on the same fact to sweep a dead `functionof` measure binding), never a
+/// value type, so admitting `Kernel` here cannot capture the VALUE argument the
+/// value-versus-measure discriminator depends on excluding.
+fn is_measure_expr_type(m: &Module, node: NodeId) -> bool {
+    matches!(
+        m.type_of(node),
+        Some(Type::Measure { .. }) | Some(Type::Kernel { .. })
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1063,9 +1295,8 @@ fn lower_lawof(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Refuse
 /// reference — that binding, so the driver can pin it to the scored value.
 struct Component {
     /// The distribution-constructor (or combinator) node `mᵢ`. For a
-    /// bijection-transformed field (`transform = Some(g)`), this is the INNER
-    /// draw's measure `Mᵢ`; the driver wraps it as `pushfwd(g, Mᵢ)` before
-    /// scoring.
+    /// transformed field (`transform = Some(call)`), this is the INNER draw's
+    /// measure `Mᵢ`; the driver wraps it as `pushfwd(g, Mᵢ)` before scoring.
     measure: NodeId,
     /// The matching part of `v` to score `mᵢ` at.
     pinned: NodeId,
@@ -1075,10 +1306,19 @@ struct Component {
     /// sqrt(sigma2)`) — pinning it to the scored value feeds sibling measures
     /// and the likelihood that reference `sigma`.
     draw_binding: Option<BindingId>,
-    /// `Some(g)` when the field is a unary bijection `g(draw)` (spec §06
-    /// pushfwd) rather than a bare `draw`: the field's law is the pushforward
-    /// of the inner draw's law under the built-in `g` (e.g. `sqrt`).
-    transform: Option<Symbol>,
+    /// `Some(call)` when the field is a built-in call over its draw (spec §06
+    /// pushfwd) rather than a bare `draw`: the field's law is the pushforward of
+    /// the inner draw's law under that call read as a function of the draw. The
+    /// WHOLE call node is carried, not just its head symbol, because a composed
+    /// map (`2.0 * x + 1.0`) is not named by any single builtin;
+    /// [`build_forward_map`] turns it into the forward map `pushfwd` consumes.
+    transform: Option<NodeId>,
+    /// The `draw(Mᵢ)` node this field's law comes from — the identity of the
+    /// UNDERLYING draw, which `draw_binding` is not: for a transformed field
+    /// `b = exp(y)` the binding is `b` while the draw site is `y`'s. Used to
+    /// detect two fields resolving to the same draw, which makes the record law
+    /// rank-deficient and hence density-free.
+    draw_site: NodeId,
 }
 
 /// Lower `record(a = draw(Mₐ), ...)` at `record_node` with value `v`.
@@ -1096,8 +1336,8 @@ fn lower_record_of_draws(
         return Ok(m.alloc(Node::Lit(Scalar::Real(0.0))));
     }
 
-    // Build density terms per component. A bijection-transformed field
-    // (`transform = Some(g)`) is scored as the pushforward `pushfwd(g, Mᵢ)` of
+    // Build density terms per component. A transformed field
+    // (`transform = Some(call)`) is scored as the pushforward `pushfwd(g, Mᵢ)` of
     // the inner draw's law under `g` — `lower_pushfwd` applies the §06
     // change-of-variables (`logdensityof(Mᵢ, g⁻¹(y)) − logvol(g⁻¹(y))`),
     // reusing the recorded/derived inverse; a non-invertible `g` refuses there.
@@ -1105,18 +1345,20 @@ fn lower_record_of_draws(
     for comp in &components {
         let measure = match comp.transform {
             None => comp.measure,
-            Some(g) => {
-                let fwd = m.alloc(Node::Const(g));
+            Some(call) => {
+                let fwd = build_forward_map(m, call, comp.draw_site);
                 build_call(m, "pushfwd", &[fwd, comp.measure])
             }
         };
         terms.push(lower_measure_density(m, measure, comp.pinned)?);
     }
 
-    // Pin each referenced draw binding to its scored value.
+    // Pin each referenced draw binding to its scored value, recording that a QUERY
+    // put the literal there — a later query must not read it as a model constant
+    // (see [`measure_reaches_draw`]).
     for comp in &components {
         if let Some(bid) = comp.draw_binding {
-            m.set_binding_rhs(bid, comp.pinned);
+            m.pin_binding_to_query_point(bid, comp.pinned);
         }
     }
 
@@ -1165,44 +1407,103 @@ fn match_independent_record(
         let pinned = lookup_field(m, &vrec.named, field.name)
             .ok_or_else(|| refuse(v, m, "missing field in value record"))?;
 
-        let (measure, draw_binding, transform) = resolve_component_draw(m, field.value)
-            .ok_or_else(|| {
-                refuse(
-                    field.value,
-                    m,
-                    "field is not a draw, a reference to a draw, or a bijection of a draw",
-                )
-            })?;
+        let (measure, draw_binding, transform, draw_site) =
+            match resolve_component_draw(m, field.value) {
+                Some(resolved) => resolved,
+                // A field whose expression reaches TWO OR MORE draws is refused with
+                // its own reason: the rank check below counts DISTINCT draws, which
+                // equals rank J_Φ only while every field is a map of a single draw
+                // (Φ block-diagonal). A multi-draw field breaks that — `a = y1 + y2`
+                // and `b = y1 + y2` reach two distinct draws each, pass any pairwise
+                // distinctness test, and still have rank 1 — so admitting one would
+                // need a real rank computation on J_Φ, not a draw count. Nothing here
+                // says the map is non-invertible: §06 case 2 requires density support
+                // for the non-injective structural projections, so invertibility is
+                // not the criterion.
+                None if field_draw_sites(m, field.value).len() > 1 => {
+                    return Err(refuse(
+                        field.value,
+                        m,
+                        "record field reaches more than one draw; the guard counts distinct \
+                     draws, which equals the rank of the joint map only when each field \
+                     is a map of a single draw — admitting this needs a real rank test \
+                     on the joint map, so refuse rather than mislower",
+                    ));
+                }
+                None => {
+                    return Err(refuse(
+                        field.value,
+                        m,
+                        "field is not a draw, a reference to a draw, or a bijection of a draw",
+                    ));
+                }
+            };
         components.push(Component {
             measure,
             pinned,
             draw_binding,
             transform,
+            draw_site,
         });
+    }
+
+    // Rank check. Within the shapes this guard admits, each field is a map of
+    // exactly ONE draw, so Φ (draws → fields) is diagonal and
+    // rank J_Φ = the number of DISTINCT draws reached. A density w.r.t. the
+    // product base measure exists iff rank J_Φ = k (Φ an a.e. submersion), so
+    // fewer distinct draws than fields means the law is carried by a
+    // lower-dimensional set and has no density at all — refuse rather than emit
+    // a product of marginals, which is the density of a DIFFERENT (mutually
+    // singular) measure. Holds because FlatPPL field expressions are smooth; for
+    // a merely Borel map the dimension argument would not apply.
+    for (i, c) in components.iter().enumerate() {
+        if components[i + 1..]
+            .iter()
+            .any(|o| o.draw_site == c.draw_site)
+        {
+            return Err(refuse(
+                record_node,
+                m,
+                "record law has fewer distinct draws than fields, so its joint is \
+                 carried by a lower-dimensional set and has no density (two fields \
+                 resolve to the same draw)",
+            ));
+        }
     }
 
     Ok(components)
 }
 
 /// Resolve a record-field value to the measure to score it at. Returns
-/// `(measure_node, outer_binding, transform)`:
+/// `(measure_node, outer_binding, transform, draw_site)`:
 /// * `measure_node` — the inner draw's measure argument `Mᵢ` (the
 ///   distribution-constructor node);
 /// * `outer_binding` — `Some(bid)` when the field reached us through a
 ///   `(%ref self x)` binding, so the driver can pin `x` to the scored value;
-/// * `transform` — `Some(g)` when the field is a unary bijection `g(draw)`
-///   (§06 pushfwd) rather than a bare draw; the driver wraps `Mᵢ` as
-///   `pushfwd(g, Mᵢ)` before scoring.
+/// * `transform` — `Some(call)` when the field is a built-in call over its draw
+///   (§06 pushfwd) rather than a bare draw; the driver turns that call into a
+///   forward map and wraps `Mᵢ` as `pushfwd(g, Mᵢ)` before scoring.
+/// * `draw_site` — the `draw(Mᵢ)` node itself, i.e. the underlying draw's
+///   identity (NOT `outer_binding`: for `b = exp(y)`, `outer_binding` is `b`'s
+///   binding while `draw_site` is `y`'s `draw(...)` node). Used by the caller
+///   to detect two fields resolving to the same draw.
 ///
 /// Cases: **A** `(%ref self x)` whose binding RHS is `draw(Mᵢ)`; **B** inline
-/// `draw(Mᵢ)`; **C** a unary builtin call `g(inner)` (either inline or the RHS
-/// of a `(%ref self x)` binding) where `inner` resolves — one further ref hop —
-/// to a `draw(Mᵢ)`. `sigma = sqrt(sigma2)` is Case C: `outer_binding` is
-/// `sigma`'s binding and `transform = sqrt`.
+/// `draw(Mᵢ)`; **C** a builtin call (either inline or the RHS of a
+/// `(%ref self x)` binding) whose operands reach EXACTLY ONE distinct draw.
+/// `sigma = sqrt(sigma2)` and `y = 2.0 * x + 1.0` are both Case C.
+///
+/// Case C tests the SHAPE only — how many draws the field's expression is a
+/// function of — never which maps are invertible. §06 case 1's known-bijection
+/// registry is implemented once, in [`crate::invert`], and reached through the
+/// `pushfwd(g, Mᵢ)` the driver builds; mirroring it here would duplicate the
+/// table and drift from it. A map outside the registry refuses there (as `abs`
+/// does today), so widening the shape test cannot mislower, and every future
+/// registry entry is admitted here for free.
 fn resolve_component_draw(
     m: &Module,
     value: NodeId,
-) -> Option<(NodeId, Option<BindingId>, Option<Symbol>)> {
+) -> Option<(NodeId, Option<BindingId>, Option<NodeId>, NodeId)> {
     // One `(%ref self x)` hop: the field either IS a self-ref to a binding
     // (Cases A / ref-C) or is spelled inline (Cases B / inline-C).
     let (effective, outer_binding) = match m.node(value) {
@@ -1216,41 +1517,380 @@ fn resolve_component_draw(
         _ => (value, None),
     };
 
-    // Cases A / B: the effective RHS is a bare `draw(Mᵢ)`.
+    // Cases A / B: the effective RHS is a bare `draw(Mᵢ)` — `effective` IS the
+    // draw site.
     if let Some(measure) = draw_argument(m, effective) {
-        return Some((measure, outer_binding, None));
+        return Some((measure, outer_binding, None, effective));
     }
 
-    // Case C: the effective RHS is a unary built-in call `g(inner)` where
-    // `inner` resolves (one more ref hop) to a `draw(Mᵢ)`. The field's law is
-    // the pushforward of the inner draw's law under `g`. `g` need not be a
-    // recognised bijection here — the driver's `pushfwd(g, Mᵢ)` lowering
-    // refuses a non-invertible `g` (refuse-don't-mislower).
+    // Case C: the effective RHS is a built-in call whose operands reach EXACTLY
+    // ONE distinct draw `draw(Mᵢ)` (literal / draw-free operands alongside are
+    // fine). The field's law is the pushforward of that draw's law under the call
+    // read as a function of the draw. The call need not be a recognised bijection
+    // here — the driver's `pushfwd(g, Mᵢ)` lowering refuses a non-invertible `g`
+    // (refuse-don't-mislower).
     if let Node::Call(c) = m.node(effective) {
-        if let CallHead::Builtin(g) = c.head {
-            if c.args.len() == 1 && c.named.is_empty() {
-                if let Some(inner_measure) = resolve_inner_draw_measure(m, c.args[0]) {
-                    return Some((inner_measure, outer_binding, Some(g)));
-                }
+        if matches!(c.head, CallHead::Builtin(_)) {
+            let sites = field_draw_sites(m, effective);
+            if let [site] = sites[..] {
+                let measure = draw_argument(m, site)?;
+                return Some((measure, outer_binding, Some(effective), site));
             }
         }
     }
     None
 }
 
-/// The inner half of Case C: resolve `node` — one `(%ref self x)` hop or inline
-/// — to the measure argument of a `draw(Mᵢ)`. Returns just the measure; the
-/// inner draw's binding is NOT pinned (in the transformed-field models it is
-/// referenced only to define the outer binding, which the driver pins instead).
-fn resolve_inner_draw_measure(m: &Module, node: NodeId) -> Option<NodeId> {
-    let effective = match m.node(node) {
+/// Every DISTINCT `draw(…)` node the expression at `node` is a function of, in
+/// first-reached order.
+///
+/// Walks call operands (positional AND named, under either head kind) and hops
+/// through `(%ref self x)` bindings, stopping at each `draw(…)`: a draw's own
+/// measure ARGUMENT is deliberately not entered, because a draw whose parameters
+/// reference a sibling draw (`y = draw(Normal(mu = z, …))`) is a dependent
+/// product the caller scores by the chain rule with `z` pinned, not a map of `z`.
+///
+/// Missing a draw is unsound, not merely imprecise: one the walk failed to see
+/// would be treated as a fixed operand, which is how a coupled joint could get
+/// scored as if one of its draws were a constant — `derive_matrix_affine` accepts
+/// `mu + L * x` whenever `mu` does not mention the map's input, so a random `mu`
+/// must be caught HERE.
+///
+/// Exhaustive over the positions it can be reached with, but NOT over every child
+/// of a call node: it descends `args` and `named` under either head kind, and does
+/// NOT descend the CALLEE expression of a `CallHead::User` head. What makes that
+/// omission safe lives in the caller, not here — [`resolve_component_draw`] admits
+/// a transformed field only when its head is `CallHead::Builtin`, so a User-headed
+/// field never reaches this walk as an admitted map; it refuses instead. Widening
+/// that head-kind gate therefore requires teaching this walk to enter callees
+/// first, or the draws inside a callee would go unseen.
+///
+/// The `path` guard makes a cyclic binding graph terminate (it then reports the
+/// draws found before the cycle, and the leftover self-ref refuses downstream).
+fn field_draw_sites(m: &Module, node: NodeId) -> Vec<NodeId> {
+    let mut sites = Vec::new();
+    let mut path = Vec::new();
+    collect_draw_sites(m, node, &mut path, &mut sites);
+    sites
+}
+
+/// [`field_draw_sites`]'s recursor. `path` is the chain of bindings currently
+/// being expanded (the cycle guard); `sites` accumulates the distinct draws.
+fn collect_draw_sites(
+    m: &Module,
+    node: NodeId,
+    path: &mut Vec<BindingId>,
+    sites: &mut Vec<NodeId>,
+) {
+    match m.node(node) {
         Node::Ref(Ref {
             ns: RefNs::SelfMod,
             name,
-        }) => m.binding(m.binding_by_name(*name)?).rhs,
+        }) => {
+            let Some(bid) = m.binding_by_name(*name) else {
+                return;
+            };
+            if path.contains(&bid) {
+                return; // cyclic definition — stop rather than recurse forever
+            }
+            path.push(bid);
+            collect_draw_sites(m, m.binding(bid).rhs, path, sites);
+            path.pop();
+        }
+        Node::Call(c) => {
+            if draw_argument(m, node).is_some() {
+                if !sites.contains(&node) {
+                    sites.push(node);
+                }
+                return;
+            }
+            for &arg in c.args.iter() {
+                collect_draw_sites(m, arg, path, sites);
+            }
+            for named in c.named.iter() {
+                collect_draw_sites(m, named.value, path, sites);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Build the forward map `g` for `pushfwd(g, Mᵢ)` from a transformed field's
+/// `call` over its single `draw_site`, as the lambda `x -> <call with the draw
+/// replaced by x>` — the surface form [`lower_pushfwd`] consumes, so the
+/// `lawof(record(…))` and explicit-`pushfwd` spellings §06 declares equivalent
+/// reach `crate::invert` identically.
+///
+/// One form suffices for every shape, from a lone unary (`sqrt(sigma2)`) to a
+/// composed multi-operand map (`2.0 * sigma2 + 1.0`): `crate::invert` reads the
+/// §06 case-1 registry through a single lookup that does not distinguish a bare
+/// builtin from a lambda body, so `x -> sqrt(x)` and the bare `sqrt` synthesize
+/// the same change of variables.
+fn build_forward_map(m: &mut Module, call: NodeId, draw_site: NodeId) -> NodeId {
+    let x = m.intern("x");
+    let ph = m.intern("_x_");
+    let mut path = Vec::new();
+    let body = abstract_over_draw(m, call, draw_site, ph, &mut path);
+    crate::invert::wrap_functionof(m, x, ph, body)
+}
+
+/// Rebuild `node` as an expression in the lambda placeholder `ph`, replacing
+/// `draw_site` with `(%ref %local ph)`. Subtrees that do not reach the draw are
+/// returned unchanged (shared, not copied); a `(%ref self x)` whose binding does
+/// reach the draw is INLINED, since a lambda body may not reach its input through
+/// a module-level binding. Mirrors [`collect_draw_sites`]'s walk, including its
+/// `path` guard: an unrelated self-ref is left in place and refused downstream by
+/// `crate::invert` (it is neither the placeholder nor a literal).
+fn abstract_over_draw(
+    m: &mut Module,
+    node: NodeId,
+    draw_site: NodeId,
+    ph: Symbol,
+    path: &mut Vec<BindingId>,
+) -> NodeId {
+    if node == draw_site {
+        return m.alloc(Node::Ref(Ref {
+            ns: RefNs::Local,
+            name: ph,
+        }));
+    }
+    match m.node(node).clone() {
+        Node::Ref(Ref {
+            ns: RefNs::SelfMod,
+            name,
+        }) => {
+            let Some(bid) = m.binding_by_name(name) else {
+                return node;
+            };
+            if path.contains(&bid) {
+                return node;
+            }
+            path.push(bid);
+            let rhs = m.binding(bid).rhs;
+            let rebuilt = abstract_over_draw(m, rhs, draw_site, ph, path);
+            path.pop();
+            if rebuilt == rhs { node } else { rebuilt }
+        }
+        Node::Call(c) => {
+            let mut changed = false;
+            let mut args: Vec<NodeId> = Vec::with_capacity(c.args.len());
+            for &arg in c.args.iter() {
+                let rebuilt = abstract_over_draw(m, arg, draw_site, ph, path);
+                changed |= rebuilt != arg;
+                args.push(rebuilt);
+            }
+            let mut named: Vec<NamedArg> = Vec::with_capacity(c.named.len());
+            for entry in c.named.iter() {
+                let rebuilt = abstract_over_draw(m, entry.value, draw_site, ph, path);
+                changed |= rebuilt != entry.value;
+                named.push(NamedArg {
+                    value: rebuilt,
+                    ..*entry
+                });
+            }
+            if !changed {
+                return node;
+            }
+            m.alloc(Node::Call(Call {
+                head: c.head,
+                args: args.into(),
+                named: named.into(),
+                inputs: c.inputs,
+            }))
+        }
         _ => node,
+    }
+}
+
+/// Score the law of a single stochastic VALUE — the bare, non-record `lawof(x)`
+/// spelling — at `v`. `None` means the shape did not match (`x` is not the law of
+/// exactly one draw), leaving the caller's own refusal in force.
+///
+/// `logdensityof(lawof(x), v)` strips its `lawof` at the query entry
+/// ([`measure_of_arg`]), so what reaches the measure dispatcher is `x` itself: a
+/// value expression, not a measure. A record-valued `x` lands on the `"record"`
+/// arm and is scored as a product of fields; a SCALAR `x` names no measure op at
+/// all and reaches the dispatcher's constructor fallthrough, which is where this
+/// is called from.
+///
+/// The two spellings §06 "Transformation and projection" declares equivalent then
+/// share one lowering:
+///
+/// * `x = draw(M)` — §04 "Reification to measures", *Identity law*:
+///   "`lawof(draw(m))` is equivalent to `m`". Score `M` at `v` unchanged; no
+///   volume element enters.
+/// * `y = g(x)` over a single draw — §06's stochastic-node form of a
+///   pushforward, printed under "The equivalent in stochastic-node form is:".
+///   Score `pushfwd(g, M)`, so [`lower_pushfwd`] applies the change of variables
+///   and `crate::invert` supplies the inverse from the §06 case-1 registry. A map
+///   outside that registry refuses there rather than being mislowered.
+///
+/// The shape test is [`resolve_component_draw`]'s, unmodified: a value reaching
+/// two or more distinct draws (`x1 - x2`) returns `None`, so no coupled joint can
+/// be read as a map of one draw. The record path's rank check is deliberately NOT
+/// reused — it compares the number of distinct draws against the number of
+/// FIELDS, and a bare scalar law has one field by construction, so the comparison
+/// is vacuous here.
+///
+/// **`M`'s own parameters must reach no draw.** §04 "Reification to measures"
+/// defines `lawof(x)` as the **TOTAL** law of `x`, and spells the consequence out
+/// on its worked `prior_predictive = lawof(record(obs = obs))`: a stochastic
+/// ancestor is "obtained by marginalizing over" — "they are internal stochastic
+/// nodes in the traced sub-DAG, not boundary inputs, so `lawof` integrates them
+/// out", the measure-algebra equivalent being `kchain(prior, forward_kernel)`. So
+/// for `y ~ Normal(mu = z, sigma = 1)` with `z` latent, `lawof(y)` is the MARGINAL
+/// of `y`, not `Normal(mu = z, …)`. Marginalizing is `crate::marginal`'s job and it
+/// is closed-form only for a discrete-finite latent, so refuse here. A merely FIXED
+/// or parametric parameter (`mu = elementof(reals)`) is not a stochastic ancestor
+/// and lowers unaffected — [`measure_reaches_draw`] tests for a reachable `draw`,
+/// not for a non-literal parameter.
+///
+/// **What that guard is worth, precisely.** With the latent still latent, the
+/// query already refused without it, via the driver's residual-`draw` scan — so
+/// there the guard only improves the diagnosis. Its own justification is the
+/// LATER-query ordering — score `lawof(y)` first, then a second query that pins `z` —
+/// where nothing downstream refuses and the conditional density escaped as a finished
+/// number (`bare_lawof_scored_before_a_later_query_pins_the_latent_refuses`). The
+/// EARLIER-query ordering it reaches only through the pin provenance
+/// [`measure_reaches_draw`] reads: once `z = 0.3` nothing in the binding is left to
+/// test, so the pin itself has to record that it was a latent
+/// (`a_pinned_latent_is_not_a_fixed_parameter_bare_spelling`).
+///
+/// Pinning the binding `x` came from is what keeps the residual `x = draw(M)`
+/// from surviving into the conformance check: the driver sweeps a draw binding
+/// once nothing references it, and for `y = g(x)` only pinning `y` to the scored
+/// value drops the last reference to `x`. This mirrors `lower_record_of_draws`,
+/// including its ordering — pin only AFTER the density is built, since
+/// [`build_forward_map`] recovers `g` by inlining through that very binding — and
+/// happens only at [`VariateOrigin::Point`], since a variate that did not come from
+/// the query point belongs to the enclosing value, not to this one.
+fn lower_value_law(
+    m: &mut Module,
+    value: NodeId,
+    v: NodeId,
+    origin: VariateOrigin,
+) -> Option<Result<NodeId, RefuseError>> {
+    let (measure, binding, transform, draw_site) = resolve_component_draw(m, value)?;
+    if measure_reaches_draw(m, measure, &[]) {
+        return Some(Err(refuse(
+            measure,
+            m,
+            "the law of this value marginalizes over a stochastic ancestor of its own measure \
+             (§04: lawof reifies the TOTAL law), which is a kchain marginal — refuse rather than \
+             emit the conditional density at a pinned latent",
+        )));
+    }
+    let law = match transform {
+        None => measure,
+        Some(call) => {
+            // Deliberately NOT gated on the transform's inferred type. A `%deferred`
+            // result type does not mean the op is unreadable as a map: `%deferred`
+            // propagates OUTWARD from any operand, so `A * x + b` types as deferred
+            // at the `add` — because `mul(matrix, vector)` has no type rule — while
+            // `add` itself is perfectly ordinary and `crate::invert`'s affine grammar
+            // inverts the whole thing correctly. Refusing on the result type cost
+            // that lowering and split this spelling from the record one, which
+            // reaches the same measure through `lower_record_of_draws`.
+            //
+            // An op that genuinely has no type rule (an unimplemented MEASURE op such
+            // as `mixture`, reached here as a pseudo-transform) instead falls through
+            // to `crate::invert` and is refused there as having no analytic inverse.
+            // That diagnosis is imprecise — the real reason is that nothing knows it
+            // is a map at all — but a merely imprecise message on an unimplemented op
+            // is a far better trade than losing a correct lowering.
+            let fwd = build_forward_map(m, call, draw_site);
+            build_call(m, "pushfwd", &[fwd, measure])
+        }
     };
-    draw_argument(m, effective)
+    let scored = lower_measure_density(m, law, v);
+    if scored.is_ok() && origin == VariateOrigin::Point {
+        if let Some(bid) = binding {
+            m.pin_binding_to_query_point(bid, v);
+        }
+    }
+    Some(scored)
+}
+
+/// Does the measure expression at `node` reach a `draw` — i.e. is its law
+/// parameterized by a value that is itself random, so that [`lower_value_law`]
+/// would have to marginalize?
+///
+/// **A binding an earlier query pinned counts as a draw**
+/// ([`Module::is_query_pinned`]). Pinning rewrites `z = draw(Normal(0, 1))` to
+/// `z = 0.3`, after which nothing in the binding tells it from a genuinely fixed
+/// `mu = elementof(reals)` — so `y ~ Normal(mu = z, sigma = 1)` scored by a LATER
+/// query emitted the conditional `p(y | z = 0.3)` where §04 asks for y's marginal.
+/// The provenance is what makes that decidable; without it there is nothing left to
+/// test, which is why no local shape check can close this.
+///
+/// `exempt` lists draw sites the CALLER accounts for itself — the sibling fields of
+/// a record product, whose dependence is the chain rule
+/// [`lower_record_of_draws`] already scores with the sibling pinned. Every other
+/// caller passes `&[]`. An exempt draw is not descended into, for
+/// [`field_draw_sites`]'s reason: its own parameters are checked when that component
+/// is walked in its turn.
+///
+/// Deliberately NOT [`field_draw_sites`], which the shape test uses and must keep
+/// its own semantics: this walk stops at a `lawof(…)` ARGUMENT, because `lawof`
+/// crosses from values into measures. §04 "Reification to measures", *Phase of the
+/// reified law*: "the resulting measure is itself deterministic (of parameterized
+/// or fixed phase): `lawof` absorbs stochasticity into the reified law rather than
+/// propagating it outward." So in `y = draw(pushfwd(exp, lawof(z)))` the base
+/// consumes `z`'s LAW, not `z`'s value — `z` is no ancestor of `y`, `lawof(y)` is
+/// an honest LogNormal, and walking into `lawof(z)` would refuse it.
+///
+/// **The skip is not self-sufficient — [`refuse_stochastic_measure_law`] is what
+/// makes it safe, and only partly.** An earlier revision justified the skip by
+/// claiming `lawof`'s argument "still gets checked when the recursion reaches it as
+/// a measure in its own right". That is true only when the argument is a *value*.
+/// When it is a measure EXPRESSION, `lower_lawof` unwraps it, `build_density_term`
+/// succeeds, and this function is never entered — which silently emitted the
+/// conditional density for `lawof(Normal(mu = a, …))` at a later-pinned latent `a`.
+/// [`refuse_stochastic_measure_law`] now catches that at the `lawof` strip sites,
+/// for a `Kernel`-typed reification argument (`lawof(functionof(…))`) as well as a
+/// `Measure`-typed one. Do not restore the "nothing is skipped" wording: it is how
+/// this conclusion gets re-derived wrongly.
+///
+/// Only the `lawof` argument is skipped. Everything else is walked, including a
+/// combinator's non-measure operands (`w` in `weighted(w, lawof(z))`) and a
+/// pushforward's forward map (`pushfwd(functionof(u -> u + z), M)`), where a
+/// reachable draw genuinely does randomize the resulting law.
+fn measure_reaches_draw(m: &Module, node: NodeId, exempt: &[NodeId]) -> bool {
+    fn walk(m: &Module, node: NodeId, exempt: &[NodeId], path: &mut Vec<BindingId>) -> bool {
+        match m.node(node) {
+            Node::Ref(Ref {
+                ns: RefNs::SelfMod,
+                name,
+            }) => {
+                let Some(bid) = m.binding_by_name(*name) else {
+                    return false;
+                };
+                if m.is_query_pinned(bid) {
+                    return true; // a latent an earlier query replaced with its point
+                }
+                if path.contains(&bid) {
+                    return false; // cyclic definition — stop rather than recurse forever
+                }
+                path.push(bid);
+                let found = walk(m, m.binding(bid).rhs, exempt, path);
+                path.pop();
+                found
+            }
+            Node::Call(c) => {
+                // A `draw` IS the stochastic ancestor; no need to look inside it.
+                if draw_argument(m, node).is_some() {
+                    return !exempt.contains(&node);
+                }
+                if matches!(builtin_name(m, node), Some("lawof")) {
+                    return false;
+                }
+                c.args.iter().any(|&arg| walk(m, arg, exempt, path))
+                    || c.named.iter().any(|n| walk(m, n.value, exempt, path))
+            }
+            _ => false,
+        }
+    }
+    walk(m, node, exempt, &mut Vec::new())
 }
 
 // ---------------------------------------------------------------------------
@@ -2018,14 +2658,20 @@ fn build_touniform(m: &mut Module, kernel: NodeId, input: NodeId, x: NodeId) -> 
     }))
 }
 
-/// `logdensityof(truncate(M, S), v)` = `ifelse(in(v, S), logdensityof(M, v), neg(inf))`.
+/// `logdensityof(truncate(M, S), v)` = `ifelse(in(v, S), logdensityof(M, v'),
+/// neg(inf))`, where `v'` is `v` sanitised against the gate ([`gate_point`]).
 ///
 /// The gate is the `_ in R` membership builtin (FlatPIR head `in`), which infers
 /// to a boolean — the spec's membership idiom (§06, `fn(_ in R)`). `elementof`
 /// is a *set-valued parameter declaration* (`elementof(R)`), not a 2-arg
 /// membership predicate, so it must not be used here (a 2-arg `elementof` infers
 /// to `%deferred`, an ill-typed `ifelse` condition).
-fn lower_truncate(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseError> {
+fn lower_truncate(
+    m: &mut Module,
+    node: NodeId,
+    v: NodeId,
+    origin: VariateOrigin,
+) -> Result<NodeId, RefuseError> {
     let (m_inner, s_node) = {
         let c = expect_builtin_call(m, node, "truncate")
             .ok_or_else(|| refuse(node, m, "expected truncate"))?;
@@ -2035,23 +2681,103 @@ fn lower_truncate(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Ref
         (c.args[0], c.args[1])
     };
 
-    let inner_density = lower_measure_density(m, m_inner, v)?;
-    let gate = build_call(m, "in", &[v, s_node]);
+    let cond = build_call(m, "in", &[v, s_node]);
+    // Lowered at the RAW point, so a §13 pin records the query point itself: `truncate`
+    // does not move the variate, so outside `S` a draw the point determines still takes
+    // that value — the gate is about the measure's density, not about the draw. The
+    // sanitised point goes into the emitted ARM only.
+    let inner_density = lower_measure_density_at(m, m_inner, v, origin)?;
+    // The dangerous op in a truncation's gated arm is the base density itself, so the
+    // witness is a point in the BASE's support. It need not be in `S` — it is never the
+    // gate's value, only the point the excluded arm is differentiated at.
+    let witness = support_witness_point(m, m_inner, v);
+    let point = gate_point(m, cond, v, witness);
+    let arm = crate::driver::substitute_in_tree(m, inner_density, v, point);
+    Ok(gate_density(m, cond, arm))
+}
+
+/// The point a −∞ gate's TAKEN arm must be built over: the query point where `cond`
+/// holds, and `witness` — a point the arm is safe at — where it does not.
+///
+/// §07: "`ifelse` and `land`/`lor` do not guarantee short-circuit evaluation". The
+/// StableHLO lowering is `stablehlo.select`, which evaluates both operands. For the
+/// VALUE that is harmless — select RETURNS one arm, it does not blend them, so the
+/// excluded point's density never reaches the result. For the GRADIENT it is not:
+/// reverse mode sends a ZERO cotangent to the untaken arm, and `0 · ±inf` and
+/// `0 · NaN` are both NaN, which then propagates into every parameter that arm
+/// reaches. Measured with jax 0.4.36: `where(y >= 0, sqrt(y), -inf)` at `y = -0.5` has
+/// value −inf and gradient **NaN**; with the input sanitised, gradient 0. The emitted
+/// FlatPDL is differentiated (Enzyme-JAX over the StableHLO lowering), so this is not
+/// hypothetical.
+///
+/// Hence the arm is built over a point INSIDE the gate and no dangerous op ever sees
+/// the excluded value. Do NOT instead reason operator by operator about which
+/// derivative happens to stay finite: `log` survives only because `1/y` is finite for
+/// negative `y`, and even that breaks at `y = 0`, where `0 · inf` is NaN. This is the
+/// discipline `crates/stablehlo/src/registry.rs` states for `log_bessel_i0` — prove
+/// the dangerous op never sees a bad input.
+///
+/// `witness = None` (no point is derivable) leaves the arm over the raw query point.
+fn gate_point(m: &mut Module, cond: NodeId, v: NodeId, witness: Option<NodeId>) -> NodeId {
+    match witness {
+        Some(w) => build_call(m, "ifelse", &[cond, v, w]),
+        None => v,
+    }
+}
+
+/// `ifelse(cond, density, neg(inf))` — `density` where the gate holds, −∞ outside it.
+/// The other half of [`gate_point`], and the emitted shape of BOTH gates
+/// ([`lower_truncate`]'s set membership and [`lower_pushfwd`]'s image), so the two
+/// cannot drift. `density` must be built over [`gate_point`]'s result, never over the
+/// raw query point.
+fn gate_density(m: &mut Module, cond: NodeId, density: NodeId) -> NodeId {
     let inf_sym = m.intern("inf");
     let inf_node = m.alloc(Node::Const(inf_sym));
     let neg_inf = build_call(m, "neg", &[inf_node]);
-    Ok(build_call(m, "ifelse", &[gate, inner_density, neg_inf]))
+    build_call(m, "ifelse", &[cond, density, neg_inf])
+}
+
+/// A point inside measure `measure`'s SUPPORT, shaped like its variate — a gate
+/// witness for a base density ([`gate_point`]). A vector variate takes the element
+/// point in every cell, sized off the query point `v` so a dynamic length is covered
+/// too.
+///
+/// `None` where the support or the variate names no such point (a record or table
+/// variate, an unproven support): no sanitisation then.
+fn support_witness_point(m: &mut Module, measure: NodeId, v: NodeId) -> Option<NodeId> {
+    let support = m.valueset_of(measure).cloned()?;
+    let w = crate::invert::support_witness(&support)?;
+    let scalar = m.alloc(Node::Lit(Scalar::Real(w)));
+    match m.type_of(measure) {
+        Some(Type::Measure { domain, .. }) => match &**domain {
+            Type::Scalar(_) => Some(scalar),
+            Type::Array { shape, .. } if shape.len() == 1 => {
+                let n = build_call(m, "lengthof", &[v]);
+                Some(build_call(m, "fill", &[scalar, n]))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// `logdensityof(pushfwd(bij, M), v)` = `logdensityof(M, f_inv(v)) - logvol(f_inv(v))`
-/// where `bij = bijection(f, f_inv, logvol)`.
+/// where `bij = bijection(f, f_inv, logvol)`, over a base with a LEBESGUE
+/// reference. Over a discrete (counting-reference) base the volume term is
+/// dropped — see [`reference_measure`], which also refuses a base whose variate
+/// proves neither reference.
 ///
 /// The forward map may be given explicitly as a `bijection(f, f_inv, logvol)`
 /// node (directly or via one level of ref), OR — per §06 case 1 — as a known
 /// invertible builtin (`pushfwd(exp, M)`, `pushfwd(x -> exp(x), M)`), for which
 /// `(f_inv, logvol)` is synthesised analytically by [`crate::invert`]. Anything
 /// else refuses.
-fn lower_pushfwd(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseError> {
+fn lower_pushfwd(
+    m: &mut Module,
+    node: NodeId,
+    v: NodeId,
+    origin: VariateOrigin,
+) -> Result<NodeId, RefuseError> {
     let (bij_node, m_inner) = {
         let c = expect_builtin_call(m, node, "pushfwd")
             .ok_or_else(|| refuse(node, m, "expected pushfwd"))?;
@@ -2075,7 +2801,31 @@ fn lower_pushfwd(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Refu
         return lower_projection_pushfwd(m, m_inner, &fields, v);
     }
 
-    let (f_inv_node, logvol_node) =
+    // `M`'s variate domain: what the analytic synthesis dispatches its
+    // scalar/vector forms on, and what §06's density convention reads to decide
+    // whether a volume element applies at all ([`reference_measure`]). An unknown
+    // domain defaults to `%any` — refused by both.
+    let domain = match m.type_of(m_inner) {
+        Some(Type::Measure { domain, .. }) => (**domain).clone(),
+        _ => Type::Any,
+    };
+
+    // `M`'s refined SUPPORT (`valueset_of`, e.g. `posreals` for `Gamma`,
+    // `nonnegreals` for `Exponential`): the coarse variate type is `scalar real`
+    // (natural extent `reals`), which would refuse every positive-support base for
+    // `log`/`pow`. `None`/`%unknown` falls back to `Unknown` — conservatively refused
+    // by the domain guard (refuse-don't-mislower), NOT defaulted to positive. Read
+    // for BOTH spellings: the image gate's witness comes off it too, so it cannot
+    // depend on which spelling supplied the inverse.
+    let support = m
+        .valueset_of(m_inner)
+        .cloned()
+        .unwrap_or(flatppl_core::ValueSet::Unknown);
+
+    // `forward` is the map itself, kept beside the change of variables for the image
+    // gate ([`crate::invert::forward_image`]) — arg 0 of an explicit `bijection`, else
+    // the whole forward argument.
+    let (f_inv_node, logvol_node, forward) =
         if let Some(bij) = expect_builtin_call(m, bij_resolved, "bijection") {
             if bij.args.len() != 3 {
                 return Err(refuse(
@@ -2084,27 +2834,12 @@ fn lower_pushfwd(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Refu
                     "bijection expects 3 args (f, f_inv, logvol)",
                 ));
             }
-            (bij.args[1], bij.args[2])
+            (bij.args[1], bij.args[2], bij.args[0])
         } else {
-            // Not an explicit bijection: try analytic synthesis (§06 case 1). Pass
-            // `M`'s variate domain (needed for domain-restricted maps like `pow`);
-            // an unknown domain defaults to `%any`, which those maps refuse.
-            let domain = match m.type_of(m_inner) {
-                Some(Type::Measure { domain, .. }) => (**domain).clone(),
-                _ => Type::Any,
-            };
-            // Also thread `M`'s refined SUPPORT (`valueset_of`, e.g. `posreals`
-            // for `Gamma`, `nonnegreals` for `Exponential`): the coarse variate
-            // type is `scalar real` (natural extent `reals`), which would refuse
-            // every positive-support base for `log`/`pow`. `None`/`%unknown`
-            // support falls back to `Unknown` — conservatively refused by the
-            // positivity guard (refuse-don't-mislower), NOT defaulted to positive.
-            let support = m
-                .valueset_of(m_inner)
-                .cloned()
-                .unwrap_or(flatppl_core::ValueSet::Unknown);
+            refuse_variate_kind_mismatch(m, &domain, v)?;
+            // Not an explicit bijection: try analytic synthesis (§06 case 1).
             match crate::invert::derive_bijection(m, bij_node, &domain, &support)? {
-                Some(bij) => (bij.f_inv, bij.logvol),
+                Some(bij) => (bij.f_inv, bij.logvol, bij_node),
                 None => {
                     return Err(refuse(
                         bij_resolved,
@@ -2116,12 +2851,308 @@ fn lower_pushfwd(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Refu
         };
 
     // preimage = f_inv(v)
-    let preimage = build_user_call(m, f_inv_node, v);
+    let preimage = apply_change_of_variables(m, bij_resolved, f_inv_node, v, "f_inv")?;
     // inner_density = logdensityof(M, preimage)
-    let inner_density = lower_measure_density(m, m_inner, preimage)?;
-    // logvol_val = logvol(preimage)
-    let logvol_val = build_user_call(m, logvol_node, preimage);
-    Ok(build_call(m, "sub", &[inner_density, logvol_val]))
+    let inner_density = lower_measure_density_at(m, m_inner, preimage, origin)?;
+    // Decided AFTER the base has lowered, so a base that refuses for its own
+    // reason reports that reason rather than this one.
+    let (density, lattice) = match reference_measure(&domain)
+        .ok_or_else(|| refuse_unproven_reference(node, m))?
+    {
+        // Counting reference: no volume element (§06 "Density convention"). The
+        // pushforward density IS the base's pmf at the preimage — SNAPPED to the
+        // lattice, and gated on the snap being faithful.
+        Reference::Counting => {
+            let snapped = snap_to_lattice(m, preimage, &domain);
+            let lattice = on_lattice(m, bij_resolved, forward, v, snapped, &domain)?;
+            let at_atom = crate::driver::substitute_in_tree(m, inner_density, preimage, snapped);
+            (at_atom, Some(lattice))
+        }
+        // logvol_val = logvol(preimage)
+        Reference::Lebesgue => {
+            let logvol_val =
+                apply_change_of_variables(m, bij_resolved, logvol_node, preimage, "logvol")?;
+            (build_call(m, "sub", &[inner_density, logvol_val]), None)
+        }
+    };
+    // The image gate. §06 `(f_*M)(Y) = M(f⁻¹(Y))`: outside the image the preimage is
+    // empty, so the measure is 0 and the log-density −∞ — a computable value, not an
+    // intractable one, hence a gate and not a refusal. Ungated, `f⁻¹` is read at a
+    // point that has no preimage and the query returns a finite number
+    // (`pushfwd(exp, Normal)` at `y ≤ 0` scores the base at `log y`).
+    //
+    // `None` leaves the density unwrapped — the image is not determinable for every
+    // forward map (an explicit `bijection` over an unrecognised `f`, a dynamic-length
+    // elementwise map), and the gate is an addition to the change of variables, not a
+    // precondition for it.
+    //
+    // The whole change of variables is gated, not just the base term: outside the image
+    // there is no mass to weigh. The sanitised point is substituted into the emitted arm
+    // rather than fed to the change of variables, so a §13 pin still records the raw
+    // preimage (`crate::driver::substitute_in_tree`, as in [`lower_truncate`]).
+    //
+    // The image and lattice conditions are ONE gate: they exclude the same kind of
+    // point (one with no preimage, one whose preimage is no atom), so they take one
+    // sanitisation and one selection rather than a nested pair.
+    let image = crate::invert::forward_image(m, forward, &domain, v, &support);
+    let cond = match (image.as_ref().map(|g| g.cond), lattice) {
+        (Some(a), Some(b)) => Some(build_call(m, "land", &[a, b])),
+        (Some(c), None) | (None, Some(c)) => Some(c),
+        (None, None) => None,
+    };
+    match cond {
+        Some(cond) => {
+            let point = gate_point(m, cond, v, image.and_then(|g| g.witness));
+            let arm = crate::driver::substitute_in_tree(m, density, v, point);
+            Ok(gate_density(m, cond, arm))
+        }
+        None => Ok(density),
+    }
+}
+
+/// The preimage SNAPPED to the integer lattice — `round(x)`, cell-wise over a vector
+/// variate (§07 `round`: "nearest integer, half to even").
+///
+/// A discrete base's pmf is nonzero only at integers, and the preimage of an ATOM of
+/// the pushforward need not be exactly one in floating point: `pushfwd(sqrt,
+/// Poisson(3))` at the atom `√2` has preimage `2.0000000000000004`, where the pmf is 0
+/// and the density read as −∞ instead of `logpmf(2, 3)`. The `exp` spelling agreed with
+/// the truth only by float luck (`log(e²)` is exactly `2.0`), so this is not
+/// `sqrt`-specific and must not be fixed per operator. Snapping restores the atom;
+/// [`on_lattice`] is what keeps a genuinely off-lattice query at −∞.
+///
+/// Wrapped in §07 `real` ("returns `x` for real `x`") because `round` types as
+/// `integers`, and an integer-typed operand under the forward would let a backend
+/// materialise `exp(round(x))` in integer arithmetic — truncating the atom's image and
+/// failing [`on_lattice`] for a point that IS an atom. The wrapper is value-identity.
+fn snap_to_lattice(m: &mut Module, x: NodeId, domain: &Type) -> NodeId {
+    let snapped = if variate_is_vector(domain) {
+        let round = m.intern("round");
+        let round = m.alloc(Node::Const(round));
+        build_call(m, "broadcast", &[round, x])
+    } else {
+        build_call(m, "round", &[x])
+    };
+    build_call(m, "real", &[snapped])
+}
+
+/// The lattice test: is the query point EXACTLY the forward image of the snapped
+/// preimage? The pushforward of a counting measure through an injective `f` has atoms
+/// only at `{f(k)}`, so this is the membership test on that set, and it is the test
+/// [`snap_to_lattice`] must be paired with — snapping alone would score the nearest
+/// atom at an off-lattice point, where the truth is −∞.
+///
+/// Round-TRIP through the forward rather than a tolerance on `|x − round(x)|`: an atom
+/// of the pushforward is produced by evaluating `f` at an integer, so `f(round(f⁻¹(y)))`
+/// reproduces it bit for bit, while the inverse leg alone need not land on the integer
+/// (the `√2` case above). §07's `iszero` is the exact-zero test that admits reals
+/// ("`iszero(x)`, unlike `x == 0`, allows non-discrete inputs"; `equal` is restricted to
+/// discrete domains). Over a vector variate the per-cell differences are reduced first —
+/// `sum(abs(·))` is zero exactly when every cell is.
+fn on_lattice(
+    m: &mut Module,
+    node: NodeId,
+    forward: NodeId,
+    v: NodeId,
+    snapped: NodeId,
+    domain: &Type,
+) -> Result<NodeId, RefuseError> {
+    let back = apply_change_of_variables(m, node, forward, snapped, "f")?;
+    Ok(lattice_test(m, v, back, domain))
+}
+
+/// [`on_lattice`]'s comparison, over a `back` the caller built — shared with
+/// [`lower_locscale`], whose forward is §06's `scale * x + shift` rather than a
+/// callable.
+fn lattice_test(m: &mut Module, v: NodeId, back: NodeId, domain: &Type) -> NodeId {
+    let diff = build_call(m, "sub", &[v, back]);
+    let scalar = if variate_is_vector(domain) {
+        let mag = build_call(m, "abs", &[diff]);
+        build_call(m, "sum", &[mag])
+    } else {
+        diff
+    };
+    build_call(m, "iszero", &[scalar])
+}
+
+/// Is the base measure's variate a VECTOR — a 1-D array? The elementwise spellings of
+/// the discrete lattice gate key on this (`crate::invert::domain_is_vector`'s
+/// counterpart on the density side; a matrix variate is refused there).
+fn variate_is_vector(domain: &Type) -> bool {
+    matches!(domain, Type::Array { shape, .. } if shape.len() == 1)
+}
+
+/// Refuse a query point whose structural KIND differs from the base measure's
+/// variate kind, checked on the ORIGINAL typed `v` — before the preimage is
+/// synthesised.
+///
+/// Only for a SYNTHESISED forward (§06 case 1), which is where the soundness
+/// argument holds: every map [`crate::invert`] recognises is kind-PRESERVING (a
+/// scalar chain, a matrix-affine or an elementwise map over a vector; §06 case 2's
+/// projection, the one kind-changing form, is dispatched before this), so a
+/// scalar-domain law scored at a record or vector has no change of variables and
+/// there is no correct value to emit.
+///
+/// An explicit `bijection` is NOT checked here. §06 sanctions a kind-changing
+/// annotation outright — `logvolume` "generalizes the log-absolute-determinant of
+/// the Jacobian to mappings between spaces of different dimension", and "the user
+/// asserts that `f_inv` is the inverse of `f` … FlatPPL implementations are not
+/// required to verify this". A `functionof`/lambda `f_inv` that cannot bind the
+/// point's fields refuses in [`crate::kernel::reduce_kernel_application`], and the
+/// one unverifiable spelling — a BARE operator applied at a record — refuses in
+/// [`apply_change_of_variables`].
+///
+/// [`build_density_term`]'s downstream guard cannot see this: by the time the base
+/// is scored, the point is `f_inv(v)` — a node inference never typed — so
+/// `variate_kind` is `None` there and its conservative unknown-passes branch no-ops.
+fn refuse_variate_kind_mismatch(m: &Module, domain: &Type, v: NodeId) -> Result<(), RefuseError> {
+    if let (Some(dk), Some(vk)) = (variate_kind(domain), m.type_of(v).and_then(variate_kind)) {
+        if dk != vk {
+            return Err(refuse(
+                v,
+                m,
+                "the query point's type does not match the kind of the pushforward base \
+                 measure's variate, and every forward map synthesised here preserves that kind \
+                 — a scalar-domain law scored at a record or vector has no change of variables \
+                 (§06 \"Engine contract for pushfwd density evaluation\"): refuse rather than \
+                 emit an ill-typed application of the inverse",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The reference measure a base measure's density is taken with respect to, which
+/// decides whether a pushforward carries a volume element at all. §06 "Density
+/// convention": "All density formulas in this section are with respect to a
+/// reference measure implied by the constituent distribution types: Lebesgue for
+/// continuous variates, counting measure for discrete variates."
+enum Reference {
+    /// Continuous variate — Lebesgue reference; the §06 change of variables
+    /// subtracts `logvol(f_inv(v))`.
+    Lebesgue,
+    /// Discrete variate — counting reference. A counting-measure density has NO
+    /// volume element, so an injective `f` gives `(f_*M)({y}) = M({f⁻¹(y)})` —
+    /// §06's `(f_*M)(Y) = M(f⁻¹(Y))` at a singleton — i.e. the base's pmf at the
+    /// preimage, unscaled. Subtracting a `logvol` there rescales every atom and
+    /// the result is not a probability measure: `pushfwd(exp, Poisson(3))` would
+    /// total `exp(−3 + 3/e) ≈ 0.150`, `locscale(Poisson(3), 1, 2)` exactly ½.
+    Counting,
+}
+
+/// §06's reference measure for a base measure whose VARIATE type is `variate` —
+/// the slot §06's density convention keys on, declared per distribution in the
+/// infer catalogue (`Poisson`: `domain: Scalar(Integer)`, `Normal`:
+/// `Scalar(Real)`).
+///
+/// `None` where the variate does not prove one reference or the other, and the
+/// caller then refuses: `%any`/`%deferred` (an inference gap — e.g. a base that
+/// is itself a `pushfwd`, whose codomain this pass does not track), and a
+/// record/tuple variate, whose components may mix the two references (§06
+/// "Reference measure for product measures" gives such a joint the product
+/// reference `Lebesgue ⊗ Counting`, over which a single volume element is not the
+/// change of variables).
+fn reference_measure(variate: &Type) -> Option<Reference> {
+    match variate {
+        Type::Scalar(ScalarType::Real | ScalarType::Complex) => Some(Reference::Lebesgue),
+        Type::Scalar(ScalarType::Integer | ScalarType::Boolean) => Some(Reference::Counting),
+        // A homogeneous product shares its cells' reference measure.
+        Type::Array { elem, .. } => reference_measure(elem),
+        Type::TVector { elem, .. } => reference_measure(elem),
+        _ => None,
+    }
+}
+
+/// The refusal for a base measure whose reference measure is not proven — shared
+/// by the `pushfwd` and `locscale` change-of-variables tails, which must not
+/// guess it. See [`reference_measure`].
+fn refuse_unproven_reference(node: NodeId, m: &Module) -> RefuseError {
+    refuse(
+        node,
+        m,
+        "the base measure's variate does not prove its reference measure (§06 \"Density \
+         convention\": Lebesgue for a continuous variate, counting for a discrete one), so \
+         whether the change of variables carries a volume element is undecided — refuse rather \
+         than guess continuous and rescale a discrete measure's atoms",
+    )
+}
+
+/// Apply a change-of-variables callable (`f_inv` or `logvol`) at `point`, requiring
+/// the application to actually resolve to FlatPDL. The density-side counterpart of
+/// the check [`crate::sample::lower_pushfwd_sample`] performs on its FORWARD
+/// application, and it exists for the same reason.
+///
+/// [`build_user_call`] emits `(%call callee point)`, and a `CallHead::User` that
+/// survives to exit is neither a deterministic op nor a `builtin_*` primitive, so it
+/// is not FlatPDL — while `is_flatpdl` is phase/type-based and does not flag the
+/// shape (`canon::inline`'s module header records exactly this blind spot). Two
+/// forms resolve, and this admits exactly those two:
+///
+/// * a **bare builtin** callee — directly a [`Node::Const`], or a `(%ref self f)`
+///   whose binding is one (`f = log`), which `canon::fold`'s alias resolution
+///   inlines before `canon::inline`'s `builtin_callee_head` rewrites the head to a
+///   direct builtin call. There is nothing to beta-reduce, so the application is
+///   emitted as written and those two passes finish it — EXCEPT at a record point,
+///   which refuses for the reason [`crate::sample::lower_pushfwd_sample`]'s bare
+///   arm gives;
+/// * a **reified** `functionof`/lambda that beta-reduces under
+///   [`crate::kernel::reduce_kernel_application`].
+///
+/// Anything else refuses. Reducing HERE rather than leaving it to
+/// `canon::inline`'s later sweep is what makes a refusal possible at all: that pass
+/// leaves a call it cannot reduce in place by design, so the residual would reach
+/// exit 0 silently. The shape this actually catches is a map applied to a variate it
+/// cannot bind against — a record-valued variate scored against a scalar-domain law,
+/// where the splat has no field to match the map's parameter.
+fn apply_change_of_variables(
+    m: &mut Module,
+    node: NodeId,
+    callee: NodeId,
+    point: NodeId,
+    role: &str,
+) -> Result<NodeId, RefuseError> {
+    let applied = build_user_call(m, callee, point);
+    // A bare operator (possibly reached through one alias hop) has no body to
+    // substitute into; `canon`'s head rewrite is what lands it on a direct builtin
+    // call, so admit it unreduced exactly as the sample side does.
+    if matches!(m.node(resolve_ref_one(m, callee).0), Node::Const(_)) {
+        // At a RECORD point the application is §04 auto-splatting against that
+        // operator's own argument names, and those names are not available here (a
+        // deterministic builtin's catalogue row carries argument TYPES only), so the
+        // correspondence cannot be checked — the same wall `lower_pushfwd_sample`'s
+        // bare arm hits on the forward application. Unchecked it emits
+        // `op(record(…))`, which no gate rejects.
+        if expect_builtin_call(m, point, "record").is_some() {
+            return Err(refuse(
+                node,
+                m,
+                &format!(
+                    "the change of variables' `{role}` is a bare built-in operator applied to a \
+                     record, which is §04 auto-splatting against that operator's argument names \
+                     — and those names are not available to the determiniser (only measure \
+                     constructors carry ordered parameter names in the catalogue). This may be a \
+                     well-formed call, but an unchecked mismatch would emit `op(record(…))` that \
+                     no gate rejects — write the map as a functionof or lambda whose parameter \
+                     names are the record's field names, which IS checkable"
+                ),
+            ));
+        }
+        return Ok(applied);
+    }
+    crate::kernel::reduce_kernel_application(m, applied).ok_or_else(|| {
+        refuse(
+            node,
+            m,
+            &format!(
+                "the change of variables' `{role}` does not reduce when applied to the variate: \
+                 its parameter list does not bind against the value being scored (for a \
+                 record-valued variate, application binds the map's parameters by field name, so \
+                 a scalar-domain law scored at a record has nothing to bind). The application \
+                 would survive as an unreduced `%call`, which is not FlatPDL — refuse rather than \
+                 emit it"
+            ),
+        )
+    })
 }
 
 /// `logdensityof(locscale(m, shift, scale), v)` — the affine (location-scale)
@@ -2130,8 +3161,14 @@ fn lower_pushfwd(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Refu
 /// ([`crate::invert::derive_locscale`], which reuses the same scalar / matrix-
 /// affine emission as [`lower_pushfwd`]'s synthesis path) and apply the §06
 /// change-of-variables formula `logdensityof(m, f_inv(v)) − logvol(f_inv(v))` —
-/// structurally identical to [`lower_pushfwd`]'s tail.
-fn lower_locscale(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseError> {
+/// structurally identical to [`lower_pushfwd`]'s tail, including its
+/// [`reference_measure`] split (no volume term over a discrete base).
+fn lower_locscale(
+    m: &mut Module,
+    node: NodeId,
+    v: NodeId,
+    origin: VariateOrigin,
+) -> Result<NodeId, RefuseError> {
     let (m_inner, shift, scale) = {
         let c = expect_builtin_call(m, node, "locscale")
             .ok_or_else(|| refuse(node, m, "expected locscale"))?;
@@ -2152,11 +3189,34 @@ fn lower_locscale(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Ref
         _ => Type::Any,
     };
     let bij = crate::invert::derive_locscale(m, shift, scale, &domain)?;
-    // §06 change-of-variables: logdensityof(m, f_inv(v)) − logvol(f_inv(v)).
-    let preimage = build_user_call(m, bij.f_inv, v);
-    let inner_density = lower_measure_density(m, m_inner, preimage)?;
-    let logvol_val = build_user_call(m, bij.logvol, preimage);
-    Ok(build_call(m, "sub", &[inner_density, logvol_val]))
+    // §06 change-of-variables: logdensityof(m, f_inv(v)) − logvol(f_inv(v)). Both
+    // applications go through the same reduce-or-refuse check as [`lower_pushfwd`]'s
+    // tail — this shares that tail's shape, so it shares its residual-`%call` risk.
+    let preimage = apply_change_of_variables(m, node, bij.f_inv, v, "f_inv")?;
+    let inner_density = lower_measure_density_at(m, m_inner, preimage, origin)?;
+    match reference_measure(&domain).ok_or_else(|| refuse_unproven_reference(node, m))? {
+        // Counting reference: no volume element (§06 "Density convention"). An
+        // affine map over a discrete base relabels its atoms and preserves their
+        // mass; `log|scale|` would rescale it. See [`reference_measure`].
+        //
+        // The relabelled atoms still need the lattice treatment [`lower_pushfwd`]
+        // gives them — `(y − shift)/scale` need not land exactly on an integer — so
+        // the preimage is snapped and gated on the round trip through §06's
+        // `scale * x + shift`, built here from `shift`/`scale` directly.
+        Reference::Counting => {
+            let snapped = snap_to_lattice(m, preimage, &domain);
+            let scaled = build_call(m, "mul", &[scale, snapped]);
+            let back = build_call(m, "add", &[scaled, shift]);
+            let cond = lattice_test(m, v, back, &domain);
+            let at_atom = crate::driver::substitute_in_tree(m, inner_density, preimage, snapped);
+            // No image gate to share a witness with: `scale * x + shift` is onto.
+            Ok(gate_density(m, cond, at_atom))
+        }
+        Reference::Lebesgue => {
+            let logvol_val = apply_change_of_variables(m, node, bij.logvol, preimage, "logvol")?;
+            Ok(build_call(m, "sub", &[inner_density, logvol_val]))
+        }
+    }
 }
 
 /// Recognise a **pure structural-projection** forward function
@@ -2313,7 +3373,7 @@ fn lower_projection_pushfwd(
             // A record field's value is `draw(Mₐ)` (or a ref to one) — unwrap to
             // the underlying measure argument before reading its mass.
             refuse_unnormalized_dropped_fields(m, m_inner, &named, fields, |m, value| {
-                resolve_component_draw(m, value).map(|(measure, _, _)| measure)
+                resolve_component_draw(m, value).map(|(measure, _, _, _)| measure)
             })?;
             let selected = select_projection_fields(m, m_inner, &named, fields)?;
             let record_sym = m.intern("record");
@@ -3295,7 +4355,12 @@ fn emit_kernel_broadcast_density(
 /// [`lower_keyword_joint`] for the record form. A call with BOTH populated
 /// (mixing positional and keyword components) is neither form — refused,
 /// rather than guessing which one was meant.
-fn lower_joint(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseError> {
+fn lower_joint(
+    m: &mut Module,
+    node: NodeId,
+    v: NodeId,
+    origin: VariateOrigin,
+) -> Result<NodeId, RefuseError> {
     let (positional, named): (Vec<NodeId>, Vec<NamedArg>) = {
         let c = expect_builtin_call(m, node, "joint")
             .ok_or_else(|| refuse(node, m, "expected joint"))?;
@@ -3312,7 +4377,7 @@ fn lower_joint(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Refuse
     }
 
     if !named.is_empty() {
-        return lower_keyword_joint(m, node, &named, v);
+        return lower_keyword_joint(m, node, &named, v, origin);
     }
 
     let inner = positional;
@@ -3395,6 +4460,7 @@ fn lower_keyword_joint(
     node: NodeId,
     named: &[NamedArg],
     v: NodeId,
+    origin: VariateOrigin,
 ) -> Result<NodeId, RefuseError> {
     for n in named {
         if n.kind != NamedKind::Field {
@@ -3433,7 +4499,7 @@ fn lower_keyword_joint(
                 ),
             )
         })?;
-        terms.push(lower_measure_density(m, field.value, pinned)?);
+        terms.push(lower_measure_density_at(m, field.value, pinned, origin)?);
     }
     Ok(fold_add(m, &terms))
 }
@@ -3460,7 +4526,12 @@ fn lower_keyword_joint(
 /// once the wrapper is unwrapped the [`subtree_has_theta_capturing_input`] guard
 /// (which scans for a SURVIVING reification's inputs) no longer sees the boundary.
 /// Rather than emit a density with a dangling placeholder, we REFUSE.
-fn lower_reified_measure(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseError> {
+fn lower_reified_measure(
+    m: &mut Module,
+    node: NodeId,
+    v: NodeId,
+    origin: VariateOrigin,
+) -> Result<NodeId, RefuseError> {
     let body = {
         let Node::Call(c) = m.node(node) else {
             return Err(refuse(node, m, "expected functionof/kernelof"));
@@ -3489,7 +4560,7 @@ fn lower_reified_measure(m: &mut Module, node: NodeId, v: NodeId) -> Result<Node
         }
         c.args[0]
     };
-    lower_measure_density(m, body, v)
+    lower_measure_density_at(m, body, v, origin)
 }
 
 // ---------------------------------------------------------------------------
@@ -3750,6 +4821,11 @@ fn measure_of_arg(m: &Module, measure_arg: NodeId) -> Result<NodeId, RefuseError
         if law.args.len() != 1 {
             return Err(refuse(resolved, m, "lawof expects 1 arg"));
         }
+        // This strip bypasses the dispatcher's `"lawof"` arm entirely, so the
+        // marginalization guard has to run here too — `logdensityof(lawof(Normal(mu
+        // = a, …)), 0.5)` with `a` latent reaches `build_density_term` directly and
+        // would otherwise score the conditional.
+        refuse_stochastic_measure_law(m, law.args[0])?;
         return Ok(law.args[0]);
     }
     Ok(measure_arg)
@@ -3771,7 +4847,7 @@ pub(crate) fn build_call(m: &mut Module, head: &str, args: &[NodeId]) -> NodeId 
 }
 
 /// Allocate a user-function call `(%call callee arg)`.
-fn build_user_call(m: &mut Module, callee: NodeId, arg: NodeId) -> NodeId {
+pub(crate) fn build_user_call(m: &mut Module, callee: NodeId, arg: NodeId) -> NodeId {
     m.alloc(Node::Call(Call {
         head: CallHead::User(callee),
         args: vec![arg].into(),

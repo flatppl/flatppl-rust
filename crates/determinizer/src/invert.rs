@@ -9,11 +9,27 @@
 //! forward input `x` — matching the explicit-bijection convention consumed by
 //! `lower_pushfwd` (`logdensityof(M, f_inv(v)) - logvol(f_inv(v))`, §06 line 457).
 //!
+//! ## One registry, two spellings
+//!
+//! §06 case 1 nowhere distinguishes `pushfwd(g, M)` from `pushfwd(x -> g(x), M)`
+//! — `bijection`'s own entry describes its annotated result as "a function that is
+//! semantically `f`" — so the spelling must not change the outcome. [`REGISTRY`]
+//! is the single table of §06's named unary bijections, and it is reached through
+//! ONE lookup ([`unary_entry`]) from both entry points: [`bare_bijection`] for a
+//! bare builtin value, [`classify`] for an op inside a lambda body. Each entry
+//! carries its inverse, its FORWARD log-volume `log|g'|`, its §06 domain
+//! restriction and its IMAGE, with the two emissions kept as BUILDERS parameterised
+//! by the point the derivative is taken at — which is what lets one table serve
+//! both: a chain needs `log|g'|` at a node it already holds, not a callable to
+//! apply. The image is read by [`forward_image`] for the density path's −∞ gate on
+//! the query point, from the same table and off the forward map alone, so no
+//! spelling of `pushfwd` gates differently from another.
+//!
 //! ## Scalar-chain inversion
 //!
 //! The forward body is a linear chain of ops `f = gₙ∘…∘g₁` terminating at the
-//! single input placeholder — each op either a registry unary (`exp`/`log`/`neg`)
-//! or an AFFINE node with ONE literal operand `c` and ONE sub-expression `u`
+//! single input placeholder — each op either a [`REGISTRY`] unary or an AFFINE
+//! node with ONE literal operand `c` and ONE sub-expression `u`
 //! (`mul`/`divide`/`add`/`sub`). We invert it by:
 //!
 //! * **`f_inv(y) = g₁_inv(…(gₙ_inv(y))…)`** — apply the per-op inverses
@@ -23,18 +39,17 @@
 //!   evaluated at its PARTIAL-FORWARD input `gᵢ₋₁∘…∘g₁(x)`. That partial-forward
 //!   point is exactly `gᵢ`'s own sub-expression node in the forward body (already
 //!   an expression in the input placeholder), so we reuse it directly rather than
-//!   re-deriving the composition — only the non-constant local logvols reference
-//!   it (`exp`: `z`; `log`: `−log z`); the affine ops contribute a constant
-//!   (`mul`: `log|c|`; `divide`: `−log|c|`) or zero (`add`/`sub`, `neg`), so
+//!   re-deriving the composition. A registry op's term is its entry's log-volume
+//!   built at that node (`exp`: `z`; `log`: `−log z`; `tanh`: `log(1 − tanh(z)²)`);
+//!   the affine ops contribute a constant (`mul`: `log|c|`; `divide`: `−log|c|`)
+//!   or zero (`add`/`sub`, and a volume-preserving registry op such as `neg`), so
 //!   zero terms are dropped and an all-zero sum collapses to the literal `0`.
 //!
-//! Per-op table (`acc` = the accumulating inverse argument, `z` = the op's
-//! partial-forward input; local logvol = FORWARD `log|gᵢ'|` at `z`):
+//! Affine per-op table (`acc` = the accumulating inverse argument, `z` = the op's
+//! partial-forward input; local logvol = FORWARD `log|gᵢ'|` at `z`; the unary ops
+//! are [`REGISTRY`]'s two columns):
 //! | op            | inverse of `acc`   | local logvol        |
 //! |---------------|--------------------|---------------------|
-//! | `exp`         | `log(acc)`         | `z`                 |
-//! | `log`         | `exp(acc)`         | `neg(log(z))`       |
-//! | `neg`         | `neg(acc)`         | `0`                 |
 //! | `mul(c, u)`   | `divide(acc, c)`   | `log(abs(c))`       |
 //! | `divide(u, c)`| `mul(acc, c)`      | `neg(log(abs(c)))`  |
 //! | `add(c, u)`   | `sub(acc, c)`      | `0`                 |
@@ -44,6 +59,15 @@
 //! Closed-form checks: `x -> 2·x + 1` ⇒ `f_inv = (y−1)/2`, `f'(x) = 2`, `logvol =
 //! log 2`. `x -> exp(2·x)` ⇒ `f_inv = log(y)/2`, `f'(x) = 2·e^{2x}`, `logvol =
 //! 2x + log 2` (the `2x` is `exp`'s partial-forward point).
+//!
+//! A domain-restricted registry op (`log`, `log10`, `log1p`, `logit`, `probit`,
+//! `sqrt`) is admitted in a chain ONLY where its input IS the base variate —
+//! innermost — and there the base measure's support decides (§06 case 1). An
+//! interior one refuses: the support bounds only the innermost input, and proving
+//! `2·x > 0` from `x > 0`, let alone `log x > 0`, needs interval propagation
+//! through the chain. This over-refuses maps that are in fact well-defined
+//! (`x -> log(2·x)` over a positive base), which is the direction §06 sanctions —
+//! "refused rather than yielding a silently sub-probability measure".
 //!
 //! ## Matrix-affine (vector variate) — the MvNormal construction
 //!
@@ -92,10 +116,13 @@
 //! input domain is not verifiable here), or any other recognised builtin op.
 //! A wrong `(f_inv, logvol)` is never synthesised.
 //!
-//! Single-op `pow(_, k)` (`x -> pow(x, k)`) keeps its Task-1 domain-restricted
-//! derivation ([`derive_pow`]); a bare builtin value (`pushfwd(exp, M)`) keeps
-//! its Task-1 single-op form ([`bare_bijection`], byte-equality-pinned against the
-//! explicit `bijection(exp, log, x -> x)`).
+//! Single-op `pow(_, k)` (`x -> pow(x, k)`) takes its own domain-restricted
+//! derivation ([`derive_pow`]) since the exponent comes from the call rather than
+//! the op name; a `pow` reached inside a composition is refused. `sqrt` is the same
+//! derivation at a fixed `k = 1/2` ([`pow_inverse`]/[`pow_logvol`]), reached
+//! through the registry like any other named op. A bare builtin value
+//! (`pushfwd(exp, M)`) is byte-equality-pinned against the explicit
+//! `bijection(exp, log, x -> x)`.
 
 use crate::density::{build_call, expect_builtin_call, fold_add, refuse, resolve_ref_one};
 use crate::refuse::RefuseError;
@@ -113,15 +140,17 @@ pub(crate) struct Bijection {
 }
 
 /// One op `gᵢ` in a scalar chain, carrying what its inverse and local logvol
-/// need: for the two non-constant-logvol unary ops (`exp`/`log`) the PARTIAL-
-/// FORWARD sub-expression node (`z`), for the affine ops the literal operand `c`.
+/// need: for a [`REGISTRY`] unary the PARTIAL-FORWARD sub-expression node (`z`),
+/// for the affine ops the literal operand `c`.
 enum ChainOp {
-    /// `exp(z)`: inverse `log(acc)`; local logvol `z` (the partial-forward node).
-    Exp(NodeId),
-    /// `log(z)`: inverse `exp(acc)`; local logvol `neg(log(z))`.
-    Log(NodeId),
-    /// `neg(z)`: inverse `neg(acc)`; local logvol `0`.
-    Neg,
+    /// A registry unary `g(z)`: inverse and local forward log-volume both come
+    /// from the shared [`REGISTRY`] entry, built at `z` — the op's PARTIAL-FORWARD
+    /// input, already an expression in the chain's input placeholder.
+    Registry {
+        op: &'static str,
+        entry: &'static UnaryEntry,
+        z: NodeId,
+    },
     /// `c·z`: inverse `divide(acc, c)`; local logvol `log(abs(c))`.
     MulByLit(NodeId),
     /// `z/c`: inverse `mul(acc, c)`; local logvol `neg(log(abs(c)))`.
@@ -155,7 +184,8 @@ enum Recognized {
 ///   single-op `pow`, or a scalar chain of unary/affine ops); the derived
 ///   change-of-variables is returned.
 /// * `Ok(None)` — `f` is not a recognised forward function (the caller refuses).
-/// * `Err(_)` — `f` is recognised but not invertible here (refuse).
+/// * `Err(_)` — `f` is recognised but not invertible here, or `domain` is a rank the
+///   §06 case-1 forms do not cover (a matrix) — refuse.
 pub(crate) fn derive_bijection(
     m: &mut Module,
     f: NodeId,
@@ -164,6 +194,31 @@ pub(crate) fn derive_bijection(
 ) -> Result<Option<Bijection>, RefuseError> {
     // Resolve one level of self-ref (`pushfwd(g, M)` where `g = exp`).
     let (f_resolved, _) = resolve_ref_one(m, f);
+    // A MATRIX variate has no recognised forward map here: §06 case 1's set is
+    // scalar, elementwise-over-a-vector, and matrix-VECTOR affine (`mu + L * x`).
+    // Unrefused it took the scalar derivation, which emits one scalar log-volume
+    // against the whole matrix — the rank-2 analogue of the vector defect the
+    // dispatch below closes, where the log-det is the SUM over all r·c cells.
+    if domain_is_matrix(domain) {
+        return Err(refuse(
+            f,
+            m,
+            "the pushforward base measure's variate is a matrix, and no recognised forward map \
+             applies to one (§06 case 1 gives scalar, elementwise-over-a-vector and \
+             matrix-vector affine maps): the scalar derivation would emit a single scalar \
+             log-volume where the log-det sums over every cell — refuse rather than mislower",
+        ));
+    }
+    // The VECTOR variate dispatch comes BEFORE the bare/lambda split, because the
+    // bare spelling of an elementwise map is still an elementwise map (§06 nowhere
+    // distinguishes `pushfwd(g, M)` from `pushfwd(x -> broadcast(g, x), M)` over a
+    // vector base) and its Jacobian is DIAGONAL. Reached after the split, a bare
+    // operator took the SCALAR derivation and emitted that op's scalar log-volume
+    // against an n-vector — `sub(<scalar>, log(y))` with a vector `log(y)` — where
+    // the log-det is `Σᵢ log|g'(yᵢ)|`.
+    if domain_is_vector(domain) {
+        return derive_vector_bijection(m, f, f_resolved, domain, support);
+    }
     match recognise(m, f_resolved) {
         // Bare builtin value: Task-1 single-op form (byte-equality-pinned).
         Recognized::BareConst(name) => bare_bijection(m, &name, f, support),
@@ -172,40 +227,6 @@ pub(crate) fn derive_bijection(
             input_name,
             ph,
         } => {
-            // Matrix-vector affine map `mu + L * x` over a VECTOR variate (§06
-            // case 1: the engine MUST recognise maps such as
-            // `mu + lower_cholesky(cov) * _`). Keyed on the base measure's variate
-            // domain being a vector (1-D array) — this is the MvNormal construction
-            // (§08 MvNormal), distinct from the scalar chain below.
-            if domain_is_vector(domain) {
-                // Matrix-vector affine map `mu + L * x` (the MvNormal construction).
-                if let Some(bij) = derive_matrix_affine(m, body, ph)? {
-                    return Ok(Some(bij));
-                }
-                // Multivariate ELEMENTWISE unary map `broadcast(g, x)` with `g`
-                // scalar-invertible: a DIAGONAL Jacobian, so `logvol` is the SUM of
-                // the per-cell scalar forward log-derivatives. `g` is derived by
-                // recursing over the vector's ELEMENT domain (scalar path), then
-                // wrapped in `broadcast` + `sum` (§06 case 1 elementwise extension;
-                // see [`derive_elementwise`]).
-                let elem_domain = vector_elem_domain(domain);
-                let elem_sup = elem_support(support);
-                if let Some(bij) = derive_elementwise(m, body, ph, &elem_domain, &elem_sup)? {
-                    return Ok(Some(bij));
-                }
-                // A vector-variate forward body that is neither a recognised
-                // matrix-affine nor elementwise map: refuse rather than fall through
-                // to the scalar chain, whose per-op log-volume is not summed over the
-                // vector's axes and would silently mislower (a scalar-scale `k·x` over
-                // a vector has log-volume `n·log|k|`, not `log|k|`).
-                return Err(refuse(
-                    f,
-                    m,
-                    "forward map over a vector variate is not a recognised matrix-affine \
-                     (mu + L * x) or elementwise (broadcast(g, x)) map — refuse rather \
-                     than mislower",
-                ));
-            }
             // Single-op `pow(x, k)` keeps its Task-1 domain-restricted derivation;
             // a `pow` anywhere else in a chain is refused by the chain walk (its
             // input domain is not verifiable here).
@@ -218,268 +239,935 @@ pub(crate) fn derive_bijection(
     }
 }
 
-/// The Task-1 single-builtin bijections for a bare builtin value
-/// (`pushfwd(exp, M)`): the `f_inv`/`logvol` forms whose byte-equality against
-/// `bijection(exp, log, x -> x)` pins the forward-log-volume convention. Any
-/// other bare builtin (including bare `pow`, which needs an exponent) is not a
+/// Derive `(f_inv, logvol)` for a forward map over a VECTOR variate — the two
+/// vector forms §06 case 1 mandates, and nothing else:
+///
+/// * a matrix-vector affine map `mu + L * x` ([`derive_matrix_affine`], the
+///   MvNormal construction, §08 `MvNormal`);
+/// * an ELEMENTWISE unary map, whose diagonal Jacobian makes `logvol` the SUM of
+///   the per-cell scalar forward log-derivatives. Both its spellings land here: the
+///   bare operator (`pushfwd(exp, MvNormal)`) derives the per-cell map over the
+///   vector's ELEMENT domain and support, and `broadcast(g, x)` recurses on `g` the
+///   same way ([`derive_elementwise`]); both then go through [`wrap_elementwise`],
+///   so the two emit the identical term.
+///
+/// Anything else refuses rather than falling through to the scalar chain, whose
+/// per-op log-volume is not summed over the vector's axes and would silently
+/// mislower (a scalar scale `k·x` over an n-vector has log-volume `n·log|k|`, not
+/// `log|k|`).
+fn derive_vector_bijection(
+    m: &mut Module,
+    f: NodeId,
+    f_resolved: NodeId,
+    domain: &Type,
+    support: &ValueSet,
+) -> Result<Option<Bijection>, RefuseError> {
+    let elem_domain = vector_elem_domain(domain);
+    let elem_sup = elem_support(support);
+    match recognise(m, f_resolved) {
+        // The bare operator IS the per-cell map, so the §06 domain restriction is
+        // checked against the ELEMENT support — the same support the `broadcast`
+        // spelling's recursion reads.
+        Recognized::BareConst(name) => match bare_bijection(m, &name, f, &elem_sup)? {
+            Some(per_cell) => Ok(Some(wrap_elementwise(m, &per_cell))),
+            None => Ok(None),
+        },
+        Recognized::Lambda { body, ph, .. } => {
+            if let Some(bij) = derive_matrix_affine(m, body, ph)? {
+                return Ok(Some(bij));
+            }
+            if let Some(bij) = derive_elementwise(m, body, ph, &elem_domain, &elem_sup)? {
+                return Ok(Some(bij));
+            }
+            Err(refuse(
+                f,
+                m,
+                "forward map over a vector variate is not a recognised matrix-affine \
+                 (mu + L * x) or elementwise (broadcast(g, x)) map — refuse rather \
+                 than mislower",
+            ))
+        }
+        Recognized::Unrecognized => Ok(None),
+    }
+}
+
+/// Lift a PER-CELL scalar change of variables to a vector variate whose forward
+/// Jacobian is diagonal:
+///
+/// * **`f_inv(y) = broadcast(g_inv, y)`** — the scalar inverse applied cell-wise;
+/// * **`logvol(x) = sum(broadcast(g_logvol, x))`** — `log|det J_f| = Σᵢ log|g'(xᵢ)|`
+///   (§07 `sum` reduces a real vector to a scalar).
+///
+/// The single emission site for both spellings of the elementwise map, so neither
+/// can drift from the other. A logvol that failed to `sum` would be a vector where
+/// a scalar log-det belongs.
+fn wrap_elementwise(m: &mut Module, per_cell: &Bijection) -> Bijection {
+    let (g_inv, g_logvol) = (per_cell.f_inv, per_cell.logvol);
+    let f_inv = lambda(m, |m, y| build_call(m, "broadcast", &[g_inv, y]));
+    let logvol = lambda(m, |m, x| {
+        let per_cell = build_call(m, "broadcast", &[g_logvol, x]);
+        build_call(m, "sum", &[per_cell])
+    });
+    Bijection { f_inv, logvol }
+}
+
+/// The −∞ image gate for a `pushfwd`'s forward map `f`: the membership CONDITION on
+/// the query point `y`, plus a WITNESS the gated arm is safe to be built over. `None`
+/// where this pass cannot determine an image (no gate then).
+pub(crate) struct ImageGate {
+    /// The boolean condition "`y` is in `f`'s image".
+    pub(crate) cond: NodeId,
+    /// A point strictly INSIDE the image — the value the gate substitutes for an
+    /// excluded `y` (`crate::density::gate_point`), so no dangerous op in the gated
+    /// arm ever sees one. `None` where no point is derivable: the base's support names
+    /// none, or it lies outside the forward's own §06 domain.
+    pub(crate) witness: Option<NodeId>,
+}
+
+/// Read from `f` ALONE, and from the same [`REGISTRY`] entry the change of
+/// variables comes from, so the explicit `bijection(f, f_inv, logvol)` spelling
+/// gates identically to the synthesised one: the annotation records an inverse and
+/// a log-volume but never an image, while §06 makes its result "a function that is
+/// semantically `f`".
+///
+/// For a COMPOSITION the gate is the OUTERMOST op's image, which is a SUPERSET of
+/// the composition's own (`image(gₙ∘…∘g₁) ⊆ image(gₙ)`) — exact when the inner ops
+/// are affine, hence onto, and never a false −∞ otherwise. Tightening it
+/// (`x -> exp(x) + 1` has image (1, ∞) and gates here on (0, ∞)) needs the forward
+/// interval propagation the chain domain guard is also waiting on.
+pub(crate) fn forward_image(
+    m: &mut Module,
+    f: NodeId,
+    domain: &Type,
+    y: NodeId,
+    support: &ValueSet,
+) -> Option<ImageGate> {
+    let (f_resolved, _) = resolve_ref_one(m, f);
+    // A matrix variate reaches here only through an explicit `bijection` (the
+    // synthesis refuses it), and the scalar image would gate a matrix against a
+    // scalar set — §07 `in` requires "The type of `x` must match the element type
+    // of set `S`". No gate rather than an ill-typed one.
+    if domain_is_matrix(domain) {
+        return None;
+    }
+    if domain_is_vector(domain) {
+        // An elementwise map applies one scalar `g` per cell, so its image is `g`'s in
+        // every cell. A dynamic length has no static `n` for the `cartpow` spelling,
+        // and a matrix-affine map is onto.
+        let g = elementwise_operator(m, f_resolved)?;
+        let elem_sup = elem_support(support);
+        let (image, per_cell) = scalar_image(m, g, &elem_sup)?;
+        let n = static_vector_len(domain)?;
+        let cond = image.vector_condition(m, y, n)?;
+        // Every cell of the witness is the per-cell one: the image of a vector
+        // elementwise map is the per-cell image in every cell.
+        let witness = per_cell.map(|w| {
+            let n_node = m.alloc(Node::Lit(Scalar::Int(n)));
+            build_call(m, "fill", &[w, n_node])
+        });
+        return Some(ImageGate { cond, witness });
+    }
+    let (image, witness) = scalar_image(m, f_resolved, support)?;
+    let cond = image.condition(m, y)?;
+    Some(ImageGate { cond, witness })
+}
+
+/// A SCALAR forward map's image and its witness: the [`REGISTRY`] entry's own for a
+/// bare builtin (`pushfwd(exp, M)`) or a one-op lambda, `pow`'s per-exponent range
+/// for `pow(_, k)`, and the outermost op's for a longer chain (see
+/// [`forward_image`]).
+fn scalar_image(m: &mut Module, f: NodeId, support: &ValueSet) -> Option<(Image, Option<NodeId>)> {
+    match recognise(m, f) {
+        Recognized::BareConst(name) => {
+            let (op, entry) = unary_entry(&name)?;
+            Some((entry.image?, image_witness(m, op, entry.domain, support)))
+        }
+        Recognized::Lambda { body, ph, .. } => {
+            if let Some(k_node) = single_pow(m, body, ph) {
+                return pow_image(m, k_node, support);
+            }
+            let ops = flatten_chain(m, body, ph).ok().flatten()?;
+            match ops.first()? {
+                ChainOp::Registry { op, entry, .. } => {
+                    Some((entry.image?, image_witness(m, op, entry.domain, support)))
+                }
+                _ => None,
+            }
+        }
+        Recognized::Unrecognized => None,
+    }
+}
+
+/// A point strictly inside the image of the unary forward `op`: `op` APPLIED at a
+/// point in the base measure's `support`. Inside because every registry forward is a
+/// monotone injection on its own domain, so it carries an interior point of the domain
+/// to an interior point of the image — hence the check that `support`'s witness lies
+/// in `op`'s §06 domain, which the annotated `bijection` spelling reaches without any
+/// domain check having run.
+///
+/// For the single-op spellings the preimage of this witness is the support point
+/// itself, so the gated arm's base density and volume term are read at a point the
+/// base admits. For a CHAIN it is the inner ops' inverses of that point — finite and
+/// inside the chain's domain, the same superset looseness the image itself carries.
+fn image_witness(
+    m: &mut Module,
+    op: &str,
+    domain: Option<Domain>,
+    support: &ValueSet,
+) -> Option<NodeId> {
+    let w = witness_in(support, domain)?;
+    let w_node = m.alloc(Node::Lit(Scalar::Real(w)));
+    Some(build_call(m, op, &[w_node]))
+}
+
+/// [`support_witness`], required to lie inside `domain` where the forward has one.
+fn witness_in(support: &ValueSet, domain: Option<Domain>) -> Option<f64> {
+    let w = support_witness(support)?;
+    match domain {
+        Some(d) if !d.contains(w) => None,
+        _ => Some(w),
+    }
+}
+
+/// A point strictly inside `support` — what a −∞ gate substitutes for an excluded
+/// query point so the gated arm is never differentiated at one
+/// (`crate::density::gate_point`). `1` for every support that contains it, which is
+/// also the point every gated [`REGISTRY`] entry's domain admits; `0.5` inside the
+/// unit interval; the interior of a literal `interval`.
+///
+/// `None` where the support names no point — `%unknown`/`%deferred`/`anything`, and a
+/// simplex or product support whose interior is not a repeated scalar. The gate then
+/// goes unsanitised, exactly as it did before.
+pub(crate) fn support_witness(support: &ValueSet) -> Option<f64> {
+    use ValueSet::*;
+    match support {
+        Reals | PosReals | NonNegReals | Integers | PosIntegers | NonNegIntegers | Booleans => {
+            Some(1.0)
+        }
+        UnitInterval => Some(0.5),
+        Interval(lo, hi) => interval_witness(*lo, *hi),
+        // A homogeneous power's cells each take the element support's point.
+        CartPow(inner, _) => support_witness(inner),
+        _ => None,
+    }
+}
+
+/// A point strictly inside the OPEN interval `(lo, hi)` — `1` where that lies inside,
+/// else the midpoint of a bounded interval or one step in from a half-bounded one.
+/// `None` for an empty or degenerate interval, and for one with no finite endpoint at
+/// all (`reals` is spelled by its own [`ValueSet`] variant).
+fn interval_witness(lo: f64, hi: f64) -> Option<f64> {
+    // `partial_cmp` rather than `<`, so a NaN endpoint reports no witness.
+    if lo.partial_cmp(&hi) != Some(std::cmp::Ordering::Less) {
+        return None;
+    }
+    if lo < 1.0 && 1.0 < hi {
+        return Some(1.0);
+    }
+    match (lo.is_finite(), hi.is_finite()) {
+        (true, true) => Some(0.5 * (lo + hi)),
+        (true, false) => Some(lo + 1.0),
+        (false, true) => Some(hi - 1.0),
+        (false, false) => None,
+    }
+}
+
+/// `pow(_, k)`'s image: `xᵏ` carries `[0, ∞)` onto `[0, ∞)` for `k > 0` and
+/// `(0, ∞)` onto `(0, ∞)` for `k < 0` — the same split as its domain
+/// ([`derive_pow`], which refuses `k = 0`). Its witness is `pow(w, k)` at a support
+/// point `w`, on the same argument as [`image_witness`].
+fn pow_image(
+    m: &mut Module,
+    k_node: NodeId,
+    support: &ValueSet,
+) -> Option<(Image, Option<NodeId>)> {
+    let k = literal_real(m, k_node)?;
+    if k == 0.0 {
+        return None;
+    }
+    let domain = if k < 0.0 {
+        Domain::PosReals
+    } else {
+        Domain::NonNegReals
+    };
+    let witness = witness_in(support, Some(domain)).map(|w| {
+        let w_node = m.alloc(Node::Lit(Scalar::Real(w)));
+        build_call(m, "pow", &[w_node, k_node])
+    });
+    Some((Image::Set(domain), witness))
+}
+
+/// The scalar per-cell operator of an elementwise forward map over a vector
+/// variate: the map ITSELF for the bare spelling (`pushfwd(exp, MvNormal)`), or
+/// `broadcast`'s operator for the lambda spelling (`x -> broadcast(exp, x)`).
+/// `None` for any other vector body — a matrix-affine map, or a coupled broadcast
+/// (both refused or onto, neither gated).
+fn elementwise_operator(m: &Module, f: NodeId) -> Option<NodeId> {
+    match recognise(m, f) {
+        Recognized::BareConst(_) => Some(f),
+        Recognized::Lambda { body, ph, .. } => {
+            let c = expect_builtin_call(m, body, "broadcast")?;
+            if !c.named.is_empty() || c.args.len() != 2 {
+                return None;
+            }
+            let (g, data) = (c.args[0], c.args[1]);
+            is_placeholder_ref(m, data, ph).then_some(g)
+        }
+        Recognized::Unrecognized => None,
+    }
+}
+
+/// The STATIC length of a vector `domain`, or `None` for a dynamic one.
+fn static_vector_len(domain: &Type) -> Option<i64> {
+    match domain {
+        Type::Array { shape, .. } if shape.len() == 1 => match shape[0] {
+            Dim::Static(n) => Some(i64::from(n)),
+            Dim::Dynamic => None,
+        },
+        _ => None,
+    }
+}
+
+/// One entry of the §06 case-1 known-bijection registry for a unary builtin
+/// forward op `g`, expressed as BUILDERS parameterised by the point `g`'s
+/// derivative is taken at. Both `pushfwd` spellings consume the same entry:
+///
+/// * the BARE spelling (`pushfwd(g, M)`, [`bare_bijection`]) builds at a fresh
+///   lambda placeholder, yielding the single-input callables `lower_pushfwd`
+///   applies;
+/// * the LAMBDA spelling (`pushfwd(x -> g(x), M)` and any deeper composition,
+///   [`derive_chain`]) builds at `g`'s own PARTIAL-FORWARD sub-expression — the
+///   point the chain rule evaluates `log|gᵢ'|` at.
+///
+/// Keeping the two columns as builders rather than as finished callables is what
+/// lets one table serve both: a chain needs `log|g'|` AT a node it already holds,
+/// not a function it must apply.
+struct UnaryEntry {
+    /// `g⁻¹` — the inverse leg of the change of variables.
+    inverse: Inverse,
+    /// The FORWARD log-volume `log|g'|` at `point`.
+    logvol: LogVol,
+    /// The §06 case-1 domain restriction on `g`'s input, if any.
+    domain: Option<Domain>,
+    /// `g`'s IMAGE, where it is a proper subset of the reals — what the density path
+    /// gates the query point against, EXACTLY at an open endpoint ([`Image`]). `None`
+    /// for an onto map (`log`, `neg`, `sinh`), which needs no gate.
+    image: Option<Image>,
+}
+
+/// The inverse column of a [`UnaryEntry`], carried so that BOTH spellings a
+/// consumer can need are derived from one fact.
+enum Inverse {
+    /// The inverse is exactly one builtin: `g⁻¹(y) = <name>(y)`. Kept as the NAME
+    /// rather than only as a builder because a consumer may need it as an OPERATOR
+    /// VALUE — [`derive_elementwise`] passes the per-cell inverse to `broadcast`,
+    /// where the bare operator (`broadcast(log, y)`) is the canonical spelling and
+    /// a lambda would nest a second `_x_` placeholder inside the outer one.
+    Builtin(&'static str),
+    /// The inverse needs a compound expression (`log10⁻¹(y) = pow(10, y)`).
+    Build(fn(&mut Module, NodeId) -> NodeId),
+}
+
+impl Inverse {
+    /// The inverse APPLIED at `point` — what a chain accumulates.
+    fn at(&self, m: &mut Module, point: NodeId) -> NodeId {
+        match self {
+            Inverse::Builtin(name) => build_call(m, name, &[point]),
+            Inverse::Build(build) => build(m, point),
+        }
+    }
+
+    /// The inverse as a single-input CALLABLE value — what `lower_pushfwd` applies
+    /// and what `broadcast` takes as its operator: the bare builtin where there is
+    /// one, else a lambda around the builder.
+    fn callable(&self, m: &mut Module) -> NodeId {
+        match self {
+            Inverse::Builtin(name) => {
+                let sym = m.intern(name);
+                m.alloc(Node::Const(sym))
+            }
+            Inverse::Build(build) => lambda(m, *build),
+        }
+    }
+}
+
+/// The forward log-volume column of a [`UnaryEntry`].
+enum LogVol {
+    /// Identically zero (`|g'| = 1`, so `g` is volume-preserving): the bare
+    /// spelling emits the constant-`0` lambda, and a chain DROPS the term from its
+    /// sum (an all-zero sum collapses to the literal `0`).
+    Zero,
+    /// `log|g'|` built at the point.
+    At(fn(&mut Module, NodeId) -> NodeId),
+}
+
+/// A §06 case-1 domain restriction: "A domain-restricted forward — `log`/`log10`
+/// on `posreals`, `sqrt` (and `pow`) on `nonnegreals`, `log1p` on
+/// `interval(-1, inf)`, `logit`/`probit` on `interval(0, 1)` — additionally
+/// requires the base measure's support to lie within that domain; where it does
+/// not, density evaluation is refused rather than yielding a silently
+/// sub-probability measure."
+///
+/// One variant per §06 set, so an entry carries the domain §06 gives it and no
+/// other. Containment is decided against the base's refined SUPPORT, and an
+/// endpoint the forward sends to ±inf reads differently by measure class: it is a
+/// measure-zero boundary under a CONTINUOUS base (full mass survives) but a
+/// positive-mass ATOM under a discrete one (that mass is lost), so a discrete
+/// support must exclude it outright. Discrete supports are otherwise admitted —
+/// `nonnegintegers ⊆ nonnegreals`, and since the pushforward of a discrete base
+/// carries no volume element (`crate::density::reference_measure`) there is no
+/// Jacobian over it to be wrong.
+#[derive(Clone, Copy)]
+enum Domain {
+    /// `posreals` — `log`, `log10`, and `pow` with a NEGATIVE exponent (`x^k` is
+    /// undefined at 0 there). 0 is outside the domain.
+    PosReals,
+    /// `nonnegreals` — `sqrt`, and `pow` with a positive exponent. 0 is INSIDE
+    /// the domain, so a discrete atom at 0 is admitted (`sqrt(0) = 0`).
+    NonNegReals,
+    /// `interval(-1, inf)` — `log1p`.
+    AboveMinusOne,
+    /// `interval(0, 1)` — `logit`, `probit`.
+    Unit,
+}
+
+impl Domain {
+    /// Is a base measure whose refined support is `support` PROVABLY inside this
+    /// domain? Conservative: every support that does not prove containment
+    /// refuses, including `%unknown`/`anything`/`%deferred` and the caller's
+    /// `None → Unknown` fallback (refuse-don't-mislower). This reads the inferred
+    /// support (`Module::valueset_of`), NOT the coarse structural type of the
+    /// variate — a `scalar real` variate has natural extent `reals`, which would
+    /// refuse every scalar base, so the caller threads the refined support here.
+    fn admits(self, support: &ValueSet) -> bool {
+        use ValueSet::*;
+        match self {
+            // `log 0 = −inf`: a continuous base may touch 0 (measure-zero
+            // boundary), a discrete one may not, so only the strictly-positive
+            // integers qualify among the discrete supports.
+            Domain::PosReals => match support {
+                PosReals | NonNegReals | UnitInterval => true,
+                Interval(lo, _) => *lo >= 0.0,
+                PosIntegers => true,
+                _ => false,
+            },
+            // 0 is in the domain, so `nonnegintegers` (`Poisson`, `Binomial`,
+            // `Geometric`) and `booleans` (`Bernoulli`) are admitted alongside the
+            // continuous non-negative sets.
+            Domain::NonNegReals => match support {
+                PosReals | NonNegReals | UnitInterval => true,
+                Interval(lo, _) => *lo >= 0.0,
+                PosIntegers | NonNegIntegers | Booleans => true,
+                _ => false,
+            },
+            // `log1p(−1) = −inf`; no integer support has −1 as its least element
+            // (`integers` is unbounded below and refuses anyway), so the discrete
+            // sets need no endpoint carve-out here.
+            Domain::AboveMinusOne => match support {
+                PosReals | NonNegReals | UnitInterval => true,
+                Interval(lo, _) => *lo >= -1.0,
+                PosIntegers | NonNegIntegers | Booleans => true,
+                _ => false,
+            },
+            // `logit`/`probit` are ±inf at BOTH endpoints. A continuous base may
+            // touch them; `booleans` is exactly {0, 1} — both atoms — so no
+            // discrete support lies inside this domain.
+            Domain::Unit => match support {
+                UnitInterval => true,
+                Interval(lo, hi) => *lo >= 0.0 && *hi <= 1.0,
+                _ => false,
+            },
+        }
+    }
+
+    /// Does this domain contain the POINT `x`? Used on a gate's witness, which must
+    /// lie inside the forward's domain for the forward to carry it into the image
+    /// ([`image_witness`]) — the annotated `bijection` spelling reaches that with no
+    /// [`admits`](Self::admits) check having run.
+    fn contains(self, x: f64) -> bool {
+        match self {
+            Domain::PosReals => x > 0.0,
+            Domain::NonNegReals => x >= 0.0,
+            Domain::AboveMinusOne => x > -1.0,
+            Domain::Unit => x > 0.0 && x < 1.0,
+        }
+    }
+
+    /// The §06 set, for a message that only names the domain.
+    fn set(self) -> &'static str {
+        match self {
+            Domain::PosReals => "the positive reals",
+            Domain::NonNegReals => "the non-negative reals",
+            Domain::AboveMinusOne => "(−1, ∞)",
+            Domain::Unit => "(0, 1)",
+        }
+    }
+
+    /// The §06 set PLUS what [`admits`](Self::admits) actually allows at an
+    /// endpoint the forward sends to ±inf — for a message reporting a failed
+    /// containment check, where the endpoint rule is usually why it failed.
+    fn describe(self) -> &'static str {
+        match self {
+            Domain::PosReals => {
+                "the positive reals (a continuous base may touch 0, a discrete one may not)"
+            }
+            Domain::NonNegReals => "the non-negative reals",
+            Domain::AboveMinusOne => "(−1, ∞) (a continuous base may touch −1)",
+            Domain::Unit => "(0, 1) (a continuous base may touch 0 or 1)",
+        }
+    }
+
+    /// This set as a §03 set-valued node, for an `in(y, S)` membership gate.
+    fn set_node(self, m: &mut Module) -> NodeId {
+        match self {
+            Domain::PosReals => bare_const(m, "posreals"),
+            Domain::NonNegReals => bare_const(m, "nonnegreals"),
+            Domain::AboveMinusOne => {
+                let lo = m.alloc(Node::Lit(Scalar::Real(-1.0)));
+                let hi = bare_const(m, "inf");
+                build_call(m, "interval", &[lo, hi])
+            }
+            // §03's `unitinterval` is [0, 1] — the closed form of §06's `interval(0, 1)`.
+            Domain::Unit => bare_const(m, "unitinterval"),
+        }
+    }
+}
+
+/// The IMAGE of a recognised forward map `g`: the set outside which the
+/// pushforward has no mass. §06 `(f_*M)(Y) = M(f⁻¹(Y))` — at a `y` outside the
+/// image the preimage is EMPTY, so the measure is 0 and the log-density −∞. That
+/// is a computable value, not an intractable one, so the density path gates on
+/// this set instead of refusing.
+///
+/// The gate must be EXACT at an open endpoint; a closed superset is not harmless
+/// there. At the endpoint the inverse is ±inf, so the base density is −∞ AND the
+/// volume term diverges, and the emission is a SUBTRACTION: `sub(−∞, −∞)` is NaN
+/// where §06 gives −∞. `pushfwd(invlogit, Normal(0,1))` at `y = 1` is the case —
+/// `logit(1) = +∞`, `logvol = log σ(∞) + log(1 − σ(∞)) = −∞`. §03 spells no open
+/// interval (`interval(lo, hi)` "denotes the closed interval", `unitinterval` is
+/// [0, 1]), so an open image is gated by comparison instead of by `in`.
+#[derive(Clone, Copy)]
+enum Image {
+    /// The §03 set a [`Domain`] variant already names, which is EXACTLY the image:
+    /// `posreals` is (0, +∞] and `nonnegreals` [0, +∞] (§03), `exp`'s and `sqrt`'s
+    /// images. For an inverse PAIR the image IS the partner's domain (`exp`'s image
+    /// is `log`'s domain, `posreals`), so both columns read one vocabulary.
+    Set(Domain),
+    /// An image with an OPEN finite endpoint, which no §03 set spells. `None` on a
+    /// side is unbounded there.
+    Open {
+        lo: Option<fn(&mut Module) -> NodeId>,
+        hi: Option<fn(&mut Module) -> NodeId>,
+    },
+}
+
+impl Image {
+    /// The membership condition on a SCALAR query point.
+    fn condition(&self, m: &mut Module, y: NodeId) -> Option<NodeId> {
+        match self {
+            Image::Set(d) => {
+                let set = d.set_node(m);
+                Some(build_call(m, "in", &[y, set]))
+            }
+            Image::Open { lo, hi } => open_condition(m, *lo, *hi, y, y),
+        }
+    }
+
+    /// The membership condition on an `n`-cell VECTOR query point, whose image is
+    /// this one in EVERY cell: `cartpow(S, n)` (§03) for a set image, and for an open
+    /// one the same bounds against the point's extremes — every cell exceeds `lo`
+    /// exactly when the minimum does.
+    fn vector_condition(&self, m: &mut Module, y: NodeId, n: i64) -> Option<NodeId> {
+        match self {
+            Image::Set(d) => {
+                let elem = d.set_node(m);
+                let n_node = m.alloc(Node::Lit(Scalar::Int(n)));
+                let set = build_call(m, "cartpow", &[elem, n_node]);
+                Some(build_call(m, "in", &[y, set]))
+            }
+            Image::Open { lo, hi } => {
+                let min = build_call(m, "minimum", &[y]);
+                let max = build_call(m, "maximum", &[y]);
+                open_condition(m, *lo, *hi, min, max)
+            }
+        }
+    }
+}
+
+/// `lo < lo_point` and `hi_point < hi`, conjoined, with an unbounded side dropped.
+/// `None` when neither side is bounded — an onto map, which carries no image at all.
+fn open_condition(
+    m: &mut Module,
+    lo: Option<fn(&mut Module) -> NodeId>,
+    hi: Option<fn(&mut Module) -> NodeId>,
+    lo_point: NodeId,
+    hi_point: NodeId,
+) -> Option<NodeId> {
+    let above = lo.map(|build| {
+        let bound = build(m);
+        build_call(m, "gt", &[lo_point, bound])
+    });
+    let below = hi.map(|build| {
+        let bound = build(m);
+        build_call(m, "lt", &[hi_point, bound])
+    });
+    match (above, below) {
+        (Some(a), Some(b)) => Some(build_call(m, "land", &[a, b])),
+        (Some(c), None) | (None, Some(c)) => Some(c),
+        (None, None) => None,
+    }
+}
+
+/// A bare builtin constant node (`posreals`, `unitinterval`, `inf`, `pi`).
+fn bare_const(m: &mut Module, name: &str) -> NodeId {
+    let sym = m.intern(name);
+    m.alloc(Node::Const(sym))
+}
+
+/// A real literal node — an [`Image::Open`] endpoint.
+fn real_lit(m: &mut Module, x: f64) -> NodeId {
+    m.alloc(Node::Lit(Scalar::Real(x)))
+}
+
+/// `pi / 2` — `atan`'s image endpoint.
+fn half_pi(m: &mut Module) -> NodeId {
+    let pi = bare_const(m, "pi");
+    let two = real_lit(m, 2.0);
+    build_call(m, "divide", &[pi, two])
+}
+
+/// The §06 case-1 known-bijection registry: the built-in unary forwards every
+/// conforming engine must recognise by name, each with its inverse, its forward
+/// log-volume `log|g'|`, and its domain restriction. This is the SINGLE table
+/// both `pushfwd` entry points read (see [`unary_entry`]) — §06 nowhere
+/// distinguishes `pushfwd(g, M)` from `pushfwd(x -> g(x), M)`, and `bijection`'s
+/// own entry describes its annotated result as "a function that is semantically
+/// `f`", so the spelling must not change the outcome.
+///
+/// `exp`/`log`, `log10`, `log1p`/`expm1`, `logit`/`invlogit`,
+/// `probit`/`invprobit`, `atan`, `sinh`/`asinh` and `tanh` are §06's named
+/// members; `neg` is the volume-preserving reflection of §06's affine set; `sqrt`
+/// is §06's "`pow` with literal exponent (of which `sqrt` = `pow(_, 1/2)` is a
+/// case)" and so reuses [`pow_inverse`]/[`pow_logvol`] verbatim rather than
+/// carrying a parallel derivation. Each log-volume was cross-checked against
+/// numerical differentiation; §06's `cis` (complex) is out of scope here.
+static REGISTRY: &[(&str, UnaryEntry)] = &[
+    // d/dx eˣ = eˣ ⇒ log|f'| = x (identity).
+    (
+        "exp",
+        UnaryEntry {
+            inverse: Inverse::Builtin("log"),
+            logvol: LogVol::At(|_m, x| x),
+            domain: None,
+            image: Some(Image::Set(Domain::PosReals)),
+        },
+    ),
+    // d/dx ln x = 1/x ⇒ log|f'| = −ln x. Domain posreals: over a base whose
+    // support is not PROVABLY positive, `f_inv = exp` / `logvol = neg(log(x))`
+    // would still typecheck and "lower", but the density is valid only on the
+    // positive part of the support — a silently SUB-probability measure.
+    (
+        "log",
+        UnaryEntry {
+            inverse: Inverse::Builtin("exp"),
+            logvol: LogVol::At(|m, x| {
+                let logx = build_call(m, "log", &[x]);
+                build_call(m, "neg", &[logx])
+            }),
+            domain: Some(Domain::PosReals),
+            image: None,
+        },
+    ),
+    // f'(x) = −1 ⇒ log|f'| = 0.
+    (
+        "neg",
+        UnaryEntry {
+            inverse: Inverse::Builtin("neg"),
+            logvol: LogVol::Zero,
+            domain: None,
+            image: None,
+        },
+    ),
+    // sqrt(x) = pow(x, 0.5) — §06's literal-exponent `pow` case, so the inverse
+    // `pow(y, 1/k)` and log-volume `log|k| + (k−1)·log x` come from the shared
+    // `pow` builders at k = 0.5. Domain nonnegreals, §06's own set for `sqrt`
+    // (`pow` at a positive exponent takes the same one, see `derive_pow`).
+    (
+        "sqrt",
+        UnaryEntry {
+            inverse: Inverse::Build(|m, y| pow_inverse(m, SQRT_EXPONENT, y)),
+            logvol: LogVol::At(|m, x| {
+                let k_node = m.alloc(Node::Lit(Scalar::Real(SQRT_EXPONENT)));
+                pow_logvol(m, k_node, SQRT_EXPONENT, x)
+            }),
+            domain: Some(Domain::NonNegReals),
+            image: Some(Image::Set(Domain::NonNegReals)),
+        },
+    ),
+    // log10(x) = ln x / ln 10 ⇒ log|f'| = −ln x − ln(ln 10); inverse
+    // 10ˣ = pow(10, x). Domain posreals (same guard as `log`).
+    (
+        "log10",
+        UnaryEntry {
+            inverse: Inverse::Build(|m, y| {
+                let ten = m.alloc(Node::Lit(Scalar::Real(10.0)));
+                build_call(m, "pow", &[ten, y])
+            }),
+            logvol: LogVol::At(|m, x| {
+                let logx = build_call(m, "log", &[x]);
+                let ten = m.alloc(Node::Lit(Scalar::Real(10.0)));
+                let ln10 = build_call(m, "log", &[ten]);
+                let ln_ln10 = build_call(m, "log", &[ln10]);
+                let s = build_call(m, "add", &[logx, ln_ln10]);
+                build_call(m, "neg", &[s])
+            }),
+            domain: Some(Domain::PosReals),
+            image: None,
+        },
+    ),
+    // log1p(x) = ln(1 + x) ⇒ log|f'| = −ln(1 + x) = −log1p(x); inverse expm1.
+    (
+        "log1p",
+        UnaryEntry {
+            inverse: Inverse::Builtin("expm1"),
+            logvol: LogVol::At(|m, x| {
+                let l = build_call(m, "log1p", &[x]);
+                build_call(m, "neg", &[l])
+            }),
+            domain: Some(Domain::AboveMinusOne),
+            image: None,
+        },
+    ),
+    // expm1(x) = eˣ − 1 ⇒ log|f'| = x (identity); inverse log1p. Domain ℝ.
+    (
+        "expm1",
+        UnaryEntry {
+            inverse: Inverse::Builtin("log1p"),
+            logvol: LogVol::At(|_m, x| x),
+            domain: None,
+            // (−1, ∞), open at −1: `log1p(−1) = −∞` and the volume term diverges
+            // there too.
+            image: Some(Image::Open {
+                lo: Some(|m| real_lit(m, -1.0)),
+                hi: None,
+            }),
+        },
+    ),
+    // logit(p) = ln(p / (1 − p)) ⇒ log|f'| = −ln p − ln(1 − p); inverse invlogit.
+    (
+        "logit",
+        UnaryEntry {
+            inverse: Inverse::Builtin("invlogit"),
+            logvol: LogVol::At(|m, x| {
+                let logp = build_call(m, "log", &[x]);
+                let one = m.alloc(Node::Lit(Scalar::Real(1.0)));
+                let omp = build_call(m, "sub", &[one, x]);
+                let log_omp = build_call(m, "log", &[omp]);
+                let s = build_call(m, "add", &[logp, log_omp]);
+                build_call(m, "neg", &[s])
+            }),
+            domain: Some(Domain::Unit),
+            image: None,
+        },
+    ),
+    // invlogit(x) = 1 / (1 + e⁻ˣ) ⇒ log|f'| = ln σ(x) + ln(1 − σ(x)); inverse
+    // logit. Domain ℝ.
+    (
+        "invlogit",
+        UnaryEntry {
+            inverse: Inverse::Builtin("logit"),
+            logvol: LogVol::At(|m, x| {
+                let s = build_call(m, "invlogit", &[x]);
+                let log_s = build_call(m, "log", &[s]);
+                let one = m.alloc(Node::Lit(Scalar::Real(1.0)));
+                let oms = build_call(m, "sub", &[one, s]);
+                let log_oms = build_call(m, "log", &[oms]);
+                build_call(m, "add", &[log_s, log_oms])
+            }),
+            domain: None,
+            // (0, 1), open at BOTH endpoints: the inverse is ±∞ there and the
+            // volume term diverges with it. §03's `unitinterval` is the closed
+            // [0, 1], so it cannot spell this.
+            image: Some(Image::Open {
+                lo: Some(|m| real_lit(m, 0.0)),
+                hi: Some(|m| real_lit(m, 1.0)),
+            }),
+        },
+    ),
+    // probit(p) = Φ⁻¹(p) ⇒ log|f'| = ½ln(2π) + ½·probit(p)²; inverse invprobit (Φ).
+    (
+        "probit",
+        UnaryEntry {
+            inverse: Inverse::Builtin("invprobit"),
+            logvol: LogVol::At(|m, x| {
+                let half_ln2pi = half_ln_two_pi(m);
+                let pr = build_call(m, "probit", &[x]);
+                let two = m.alloc(Node::Lit(Scalar::Real(2.0)));
+                let sq = build_call(m, "pow", &[pr, two]);
+                let half = m.alloc(Node::Lit(Scalar::Real(0.5)));
+                let half_sq = build_call(m, "mul", &[half, sq]);
+                build_call(m, "add", &[half_ln2pi, half_sq])
+            }),
+            domain: Some(Domain::Unit),
+            image: None,
+        },
+    ),
+    // invprobit(x) = Φ(x) ⇒ log|f'| = ln φ(x) = −½ln(2π) − ½x²; inverse probit.
+    // Domain ℝ.
+    (
+        "invprobit",
+        UnaryEntry {
+            inverse: Inverse::Builtin("probit"),
+            logvol: LogVol::At(|m, x| {
+                let half_ln2pi = half_ln_two_pi(m);
+                let two = m.alloc(Node::Lit(Scalar::Real(2.0)));
+                let sq = build_call(m, "pow", &[x, two]);
+                let half = m.alloc(Node::Lit(Scalar::Real(0.5)));
+                let half_sq = build_call(m, "mul", &[half, sq]);
+                let s = build_call(m, "add", &[half_ln2pi, half_sq]);
+                build_call(m, "neg", &[s])
+            }),
+            domain: None,
+            // (0, 1), open at BOTH endpoints: the inverse is ±∞ there and the
+            // volume term diverges with it. §03's `unitinterval` is the closed
+            // [0, 1], so it cannot spell this.
+            image: Some(Image::Open {
+                lo: Some(|m| real_lit(m, 0.0)),
+                hi: Some(|m| real_lit(m, 1.0)),
+            }),
+        },
+    ),
+    // atan(x) ⇒ log|f'| = −ln(1 + x²); inverse tan (valid on atan's range
+    // (−π/2, π/2), where tan is the single-valued inverse). Domain ℝ.
+    (
+        "atan",
+        UnaryEntry {
+            inverse: Inverse::Builtin("tan"),
+            logvol: LogVol::At(|m, x| {
+                let two = m.alloc(Node::Lit(Scalar::Real(2.0)));
+                let sq = build_call(m, "pow", &[x, two]);
+                let one = m.alloc(Node::Lit(Scalar::Real(1.0)));
+                let onepx2 = build_call(m, "add", &[one, sq]);
+                let l = build_call(m, "log", &[onepx2]);
+                build_call(m, "neg", &[l])
+            }),
+            domain: None,
+            // `tan` is the single-valued inverse only on (−π/2, π/2) — outside it
+            // `tan(y)` is still finite, so an ungated query would read a preimage
+            // that is not one. Open: `tan(±π/2) = ±∞`.
+            image: Some(Image::Open {
+                lo: Some(|m| {
+                    let h = half_pi(m);
+                    build_call(m, "neg", &[h])
+                }),
+                hi: Some(half_pi),
+            }),
+        },
+    ),
+    // sinh(x) ⇒ log|f'| = ln cosh(x); inverse asinh. Domain ℝ.
+    (
+        "sinh",
+        UnaryEntry {
+            inverse: Inverse::Builtin("asinh"),
+            logvol: LogVol::At(|m, x| {
+                let ch = build_call(m, "cosh", &[x]);
+                build_call(m, "log", &[ch])
+            }),
+            domain: None,
+            image: None,
+        },
+    ),
+    // asinh(x) ⇒ log|f'| = −½ln(1 + x²); inverse sinh. Domain ℝ.
+    (
+        "asinh",
+        UnaryEntry {
+            inverse: Inverse::Builtin("sinh"),
+            logvol: LogVol::At(|m, x| {
+                let two = m.alloc(Node::Lit(Scalar::Real(2.0)));
+                let sq = build_call(m, "pow", &[x, two]);
+                let one = m.alloc(Node::Lit(Scalar::Real(1.0)));
+                let onepx2 = build_call(m, "add", &[one, sq]);
+                let l = build_call(m, "log", &[onepx2]);
+                let mhalf = m.alloc(Node::Lit(Scalar::Real(-0.5)));
+                build_call(m, "mul", &[mhalf, l])
+            }),
+            domain: None,
+            image: None,
+        },
+    ),
+    // tanh(x) ⇒ log|f'| = ln(1 − tanh(x)²); inverse atanh. Domain ℝ.
+    (
+        "tanh",
+        UnaryEntry {
+            inverse: Inverse::Builtin("atanh"),
+            logvol: LogVol::At(|m, x| {
+                let th = build_call(m, "tanh", &[x]);
+                let two = m.alloc(Node::Lit(Scalar::Real(2.0)));
+                let sq = build_call(m, "pow", &[th, two]);
+                let one = m.alloc(Node::Lit(Scalar::Real(1.0)));
+                let omsq = build_call(m, "sub", &[one, sq]);
+                build_call(m, "log", &[omsq])
+            }),
+            domain: None,
+            // (−1, 1), open: `atanh(±1) = ±∞` and `log(1 − tanh²)` diverges there.
+            image: Some(Image::Open {
+                lo: Some(|m| real_lit(m, -1.0)),
+                hi: Some(|m| real_lit(m, 1.0)),
+            }),
+        },
+    ),
+];
+
+/// `sqrt` as §06's literal-exponent `pow`: `sqrt(x) = pow(x, 1/2)`.
+const SQRT_EXPONENT: f64 = 0.5;
+
+/// Look `name` up in the shared [`REGISTRY`]. The ONE lookup both `pushfwd`
+/// entry points use — [`bare_bijection`] for the bare-builtin spelling and
+/// [`classify`] for the lambda/chain spelling — so their coverage cannot drift.
+fn unary_entry(name: &str) -> Option<(&'static str, &'static UnaryEntry)> {
+    REGISTRY
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(n, e)| (*n, e))
+}
+
+/// The single-builtin bijection for a bare builtin value (`pushfwd(exp, M)`):
+/// the shared [`REGISTRY`] entry's two builders, each wrapped in a fresh lambda
+/// to give the single-input callables `lower_pushfwd` applies. Any builtin
+/// outside the registry (including bare `pow`, which needs an exponent) is not a
 /// recognised bare bijection → `Ok(None)`.
 ///
-/// `exp`/`neg` are defined and injective over the whole real line, so they take
-/// no domain guard. `log` is undefined for `x ≤ 0` (spec §06 log defined on
-/// positive reals): over a base measure `M` whose support is not PROVABLY
-/// positive, `f_inv = exp` / `logvol = neg(log(x))` would still typecheck and
-/// "lower", but the resulting density is valid only on the positive half of
-/// `M`'s support — a silently SUB-probability measure (integrates to less than
-/// 1). Refuse rather than mislower (mirrors [`derive_pow`]'s
-/// `is_positive_domain` guard).
+/// A registry entry carrying a [`Domain`] refuses here unless the base measure's
+/// support provably lies within it (§06 case 1) — refuse rather than mislower a
+/// silently sub-probability measure.
 fn bare_bijection(
     m: &mut Module,
     name: &str,
     f: NodeId,
     support: &ValueSet,
 ) -> Result<Option<Bijection>, RefuseError> {
-    match name {
-        // d/dx eˣ = eˣ ⇒ log|f'| = x (identity).
-        "exp" => Ok(Some(Bijection {
-            f_inv: bare_builtin(m, "log"),
-            logvol: identity_lambda(m),
-        })),
-        // d/dx ln x = 1/x ⇒ log|f'| = −ln x.
-        "log" => {
-            if !is_positive_domain(support) {
-                return Err(refuse(
-                    f,
-                    m,
-                    "pushfwd(log, M) requires M to have positive support; refuse rather than \
-                     mislower a sub-probability measure",
-                ));
-            }
-            let logvol = lambda(m, |m, ph| {
-                let logx = build_call(m, "log", &[ph]);
-                build_call(m, "neg", &[logx])
-            });
-            Ok(Some(Bijection {
-                f_inv: bare_builtin(m, "exp"),
-                logvol,
-            }))
+    let Some((op, entry)) = unary_entry(name) else {
+        return Ok(None);
+    };
+    if let Some(domain) = entry.domain {
+        if !domain.admits(support) {
+            return Err(refuse(
+                f,
+                m,
+                &format!(
+                    "pushfwd({op}, M) requires M's support to lie within {op}'s domain, {}; \
+                     refuse rather than mislower a sub-probability measure",
+                    domain.describe()
+                ),
+            ));
         }
-        // f'(x) = −1 ⇒ log|f'| = 0.
-        "neg" => {
-            let logvol = lambda(m, |m, _ph| m.alloc(Node::Lit(Scalar::Real(0.0))));
-            Ok(Some(Bijection {
-                f_inv: bare_builtin(m, "neg"),
-                logvol,
-            }))
-        }
-        // `sqrt(x) = pow(x, 0.5)` — spec §06 "Known-bijection registry" lists
-        // `pow` with a literal exponent among the mandated built-in bijections,
-        // and `sqrt` is exactly that with `k = 0.5`. Delegate to `derive_pow`
-        // (which carries the oracle-verified inverse `pow(x, 1/k)`, log-volume,
-        // and the strictly-positive-domain guard) rather than hand-deriving a
-        // parallel change-of-variables that could diverge from `pow`'s.
-        "sqrt" => {
-            let half = m.alloc(Node::Lit(Scalar::Real(0.5)));
-            derive_pow(m, f, half, support)
-        }
-        // The remaining arms extend the §06 known-bijection registry to the
-        // monotone §07 elementary functions whose inverse is itself a built-in
-        // and whose forward log-volume `log|f'|` is analytic. Each `logvol`
-        // below was cross-checked against numerical differentiation. Grouped by
-        // whether the forward's domain (spec §07 "Domains") constrains the base
-        // measure's support (guarded) or is all of ℝ (unguarded).
-
-        // log10(x) = ln x / ln 10 ⇒ log|f'| = −ln x − ln(ln 10); inverse
-        // 10ˣ = pow(10, x). Domain posreals (same guard as `log`).
-        "log10" => {
-            if !is_positive_domain(support) {
-                return Err(refuse(
-                    f,
-                    m,
-                    "pushfwd(log10, M) requires M to have positive support; refuse rather than \
-                     mislower a sub-probability measure",
-                ));
-            }
-            let f_inv = lambda(m, |m, ph| {
-                let ten = m.alloc(Node::Lit(Scalar::Real(10.0)));
-                build_call(m, "pow", &[ten, ph])
-            });
-            let logvol = lambda(m, |m, ph| {
-                let logx = build_call(m, "log", &[ph]);
-                let ten = m.alloc(Node::Lit(Scalar::Real(10.0)));
-                let ln10 = build_call(m, "log", &[ten]);
-                let ln_ln10 = build_call(m, "log", &[ln10]);
-                let s = build_call(m, "add", &[logx, ln_ln10]);
-                build_call(m, "neg", &[s])
-            });
-            Ok(Some(Bijection { f_inv, logvol }))
-        }
-        // log1p(x) = ln(1 + x) ⇒ log|f'| = −ln(1 + x) = −log1p(x); inverse
-        // expm1. Domain (−1, ∞).
-        "log1p" => {
-            if !is_gt_neg_one_domain(support) {
-                return Err(refuse(
-                    f,
-                    m,
-                    "pushfwd(log1p, M) requires M support within (−1, ∞); refuse rather than \
-                     mislower a sub-probability measure",
-                ));
-            }
-            let logvol = lambda(m, |m, ph| {
-                let l = build_call(m, "log1p", &[ph]);
-                build_call(m, "neg", &[l])
-            });
-            Ok(Some(Bijection {
-                f_inv: bare_builtin(m, "expm1"),
-                logvol,
-            }))
-        }
-        // expm1(x) = eˣ − 1 ⇒ log|f'| = x (identity); inverse log1p. Domain ℝ.
-        "expm1" => Ok(Some(Bijection {
-            f_inv: bare_builtin(m, "log1p"),
-            logvol: identity_lambda(m),
-        })),
-        // logit(p) = ln(p / (1 − p)) ⇒ log|f'| = −ln p − ln(1 − p); inverse
-        // invlogit. Domain (0, 1).
-        "logit" => {
-            if !is_unit_domain(support) {
-                return Err(refuse(
-                    f,
-                    m,
-                    "pushfwd(logit, M) requires M support within (0, 1); refuse rather than \
-                     mislower a sub-probability measure",
-                ));
-            }
-            let logvol = lambda(m, |m, ph| {
-                let logp = build_call(m, "log", &[ph]);
-                let one = m.alloc(Node::Lit(Scalar::Real(1.0)));
-                let omp = build_call(m, "sub", &[one, ph]);
-                let log_omp = build_call(m, "log", &[omp]);
-                let s = build_call(m, "add", &[logp, log_omp]);
-                build_call(m, "neg", &[s])
-            });
-            Ok(Some(Bijection {
-                f_inv: bare_builtin(m, "invlogit"),
-                logvol,
-            }))
-        }
-        // invlogit(x) = 1 / (1 + e⁻ˣ) ⇒ log|f'| = ln σ(x) + ln(1 − σ(x));
-        // inverse logit. Domain ℝ.
-        "invlogit" => {
-            let logvol = lambda(m, |m, ph| {
-                let s = build_call(m, "invlogit", &[ph]);
-                let log_s = build_call(m, "log", &[s]);
-                let one = m.alloc(Node::Lit(Scalar::Real(1.0)));
-                let oms = build_call(m, "sub", &[one, s]);
-                let log_oms = build_call(m, "log", &[oms]);
-                build_call(m, "add", &[log_s, log_oms])
-            });
-            Ok(Some(Bijection {
-                f_inv: bare_builtin(m, "logit"),
-                logvol,
-            }))
-        }
-        // probit(p) = Φ⁻¹(p) ⇒ log|f'| = ½ln(2π) + ½·probit(p)²; inverse
-        // invprobit (Φ). Domain (0, 1).
-        "probit" => {
-            if !is_unit_domain(support) {
-                return Err(refuse(
-                    f,
-                    m,
-                    "pushfwd(probit, M) requires M support within (0, 1); refuse rather than \
-                     mislower a sub-probability measure",
-                ));
-            }
-            let logvol = lambda(m, |m, ph| {
-                let half_ln2pi = half_ln_two_pi(m);
-                let pr = build_call(m, "probit", &[ph]);
-                let two = m.alloc(Node::Lit(Scalar::Real(2.0)));
-                let sq = build_call(m, "pow", &[pr, two]);
-                let half = m.alloc(Node::Lit(Scalar::Real(0.5)));
-                let half_sq = build_call(m, "mul", &[half, sq]);
-                build_call(m, "add", &[half_ln2pi, half_sq])
-            });
-            Ok(Some(Bijection {
-                f_inv: bare_builtin(m, "invprobit"),
-                logvol,
-            }))
-        }
-        // invprobit(x) = Φ(x) ⇒ log|f'| = ln φ(x) = −½ln(2π) − ½x²; inverse
-        // probit. Domain ℝ.
-        "invprobit" => {
-            let logvol = lambda(m, |m, ph| {
-                let half_ln2pi = half_ln_two_pi(m);
-                let two = m.alloc(Node::Lit(Scalar::Real(2.0)));
-                let sq = build_call(m, "pow", &[ph, two]);
-                let half = m.alloc(Node::Lit(Scalar::Real(0.5)));
-                let half_sq = build_call(m, "mul", &[half, sq]);
-                let s = build_call(m, "add", &[half_ln2pi, half_sq]);
-                build_call(m, "neg", &[s])
-            });
-            Ok(Some(Bijection {
-                f_inv: bare_builtin(m, "probit"),
-                logvol,
-            }))
-        }
-        // atan(x) ⇒ log|f'| = −ln(1 + x²); inverse tan (valid on atan's range
-        // (−π/2, π/2), where tan is the single-valued inverse). Domain ℝ.
-        "atan" => {
-            let logvol = lambda(m, |m, ph| {
-                let two = m.alloc(Node::Lit(Scalar::Real(2.0)));
-                let sq = build_call(m, "pow", &[ph, two]);
-                let one = m.alloc(Node::Lit(Scalar::Real(1.0)));
-                let onepx2 = build_call(m, "add", &[one, sq]);
-                let l = build_call(m, "log", &[onepx2]);
-                build_call(m, "neg", &[l])
-            });
-            Ok(Some(Bijection {
-                f_inv: bare_builtin(m, "tan"),
-                logvol,
-            }))
-        }
-        // sinh(x) ⇒ log|f'| = ln cosh(x); inverse asinh. Domain ℝ.
-        "sinh" => {
-            let logvol = lambda(m, |m, ph| {
-                let ch = build_call(m, "cosh", &[ph]);
-                build_call(m, "log", &[ch])
-            });
-            Ok(Some(Bijection {
-                f_inv: bare_builtin(m, "asinh"),
-                logvol,
-            }))
-        }
-        // asinh(x) ⇒ log|f'| = −½ln(1 + x²); inverse sinh. Domain ℝ.
-        "asinh" => {
-            let logvol = lambda(m, |m, ph| {
-                let two = m.alloc(Node::Lit(Scalar::Real(2.0)));
-                let sq = build_call(m, "pow", &[ph, two]);
-                let one = m.alloc(Node::Lit(Scalar::Real(1.0)));
-                let onepx2 = build_call(m, "add", &[one, sq]);
-                let l = build_call(m, "log", &[onepx2]);
-                let mhalf = m.alloc(Node::Lit(Scalar::Real(-0.5)));
-                build_call(m, "mul", &[mhalf, l])
-            });
-            Ok(Some(Bijection {
-                f_inv: bare_builtin(m, "sinh"),
-                logvol,
-            }))
-        }
-        // tanh(x) ⇒ log|f'| = ln(1 − tanh(x)²); inverse atanh. Domain ℝ.
-        "tanh" => {
-            let logvol = lambda(m, |m, ph| {
-                let th = build_call(m, "tanh", &[ph]);
-                let two = m.alloc(Node::Lit(Scalar::Real(2.0)));
-                let sq = build_call(m, "pow", &[th, two]);
-                let one = m.alloc(Node::Lit(Scalar::Real(1.0)));
-                let omsq = build_call(m, "sub", &[one, sq]);
-                build_call(m, "log", &[omsq])
-            });
-            Ok(Some(Bijection {
-                f_inv: bare_builtin(m, "atanh"),
-                logvol,
-            }))
-        }
-        _ => Ok(None),
     }
+    let f_inv = entry.inverse.callable(m);
+    let logvol = match &entry.logvol {
+        LogVol::Zero => lambda(m, |m, _ph| m.alloc(Node::Lit(Scalar::Real(0.0)))),
+        LogVol::At(build) => lambda(m, *build),
+    };
+    Ok(Some(Bijection { f_inv, logvol }))
 }
 
 /// Derive the change-of-variables for a scalar-chain forward body `f = gₙ∘…∘g₁`
@@ -504,23 +1192,60 @@ fn derive_chain(
         return Ok(None);
     };
 
-    // A `log` ANYWHERE in the chain is undefined unless its own input is
-    // positive (spec §06 log defined on positive reals) — the same silent
-    // sub-probability danger [`bare_bijection`]'s `log` case guards against.
-    // Proving positivity of an INTERIOR op's input (rather than the chain's
-    // overall base support) is out of scope here, so this guard is
-    // CONSERVATIVE: it refuses the whole chain unless the base `support` is
-    // provably positive, even though a `log` deep in a chain might in fact
-    // always receive a positive intermediate value from a wider base. Refuse
-    // rather than mislower (mirrors [`derive_pow`]'s `is_positive_domain`
-    // guard).
-    if ops.iter().any(|op| matches!(op, ChainOp::Log(_))) && !is_positive_domain(support) {
-        return Err(refuse(
-            body,
-            m,
-            "a chain containing log requires the base measure to have positive support; \
-             refuse rather than mislower a sub-probability measure",
-        ));
+    // §06 case 1's domain restriction, applied to the chain. A domain-restricted
+    // op (`log`, `log10`, `log1p`, `logit`, `probit`, `sqrt`) is undefined outside
+    // its domain, and lowering it there yields a silently SUB-probability measure.
+    // The base measure's support bounds only the INNERMOST op's input; an interior
+    // op receives an intermediate value this pass does not bound. So a
+    // domain-restricted op is admitted ONLY where its input IS the base variate —
+    // innermost, the last element of the outermost-first chain — and there the base
+    // `support` decides. Anywhere else it refuses, which is the direction §06
+    // sanctions: "refused rather than yielding a silently sub-probability measure".
+    //
+    // DELIBERATELY CONSERVATIVE, PENDING INTERVAL PROPAGATION THROUGH THE CHAIN.
+    // This rule refuses maps that are in fact perfectly well-defined, whenever the
+    // base support already lies inside the op's domain and the intervening ops
+    // preserve that: `x -> log(2.0 * x)`, `x -> log(x / 2.0)`, `x -> log(x + 1.0)`,
+    // `x -> log(exp(x))`, `x -> sqrt(2.0 * x)` over a positive base are all sound
+    // and all refused here. Recovering them needs the propagated input interval at
+    // each op (every registry forward is monotone on its own domain, so this is
+    // endpoint mapping with orientation tracking, not general interval arithmetic)
+    // checked for CONTAINMENT in that op's domain. That containment check is also
+    // what keeps `x -> log(neg(x))` refusing once propagation exists — its
+    // propagated input lands in the negatives. Until then, read a refusal from this
+    // branch as "not proven", NOT as "unsound".
+    for (i, op) in ops.iter().enumerate() {
+        let ChainOp::Registry {
+            op: name, entry, ..
+        } = op
+        else {
+            continue;
+        };
+        let Some(domain) = entry.domain else { continue };
+        if i + 1 != ops.len() {
+            return Err(refuse(
+                body,
+                m,
+                &format!(
+                    "{name} is restricted to {} and sits inside a composition, where its input \
+                     is an intermediate value this pass cannot bound — refuse rather than \
+                     mislower a sub-probability measure",
+                    domain.set()
+                ),
+            ));
+        }
+        if !domain.admits(support) {
+            return Err(refuse(
+                body,
+                m,
+                &format!(
+                    "a forward map through {name} requires the base measure's support to lie \
+                     within {name}'s domain, {}; refuse rather than mislower a sub-probability \
+                     measure",
+                    domain.describe()
+                ),
+            ));
+        }
     }
 
     // f_inv(y) = g₁_inv(…(gₙ_inv(y))…): thread the per-op inverses through a fresh
@@ -598,10 +1323,23 @@ fn classify(m: &Module, cur: NodeId) -> Result<Option<(ChainOp, NodeId)>, Refuse
         // terminate at the input, so this is not a recognised forward function.
         _ => return Ok(None),
     };
+    // A unary op in the shared §06 registry — the SAME lookup the bare spelling
+    // does, so the two cannot cover different sets of ops. Its inverse and local
+    // forward log-volume are built later at `args[0]`, this op's partial-forward
+    // input.
+    if args.len() == 1 {
+        if let Some((op, entry)) = unary_entry(&name) {
+            return Ok(Some((
+                ChainOp::Registry {
+                    op,
+                    entry,
+                    z: args[0],
+                },
+                args[0],
+            )));
+        }
+    }
     match name.as_str() {
-        "exp" if args.len() == 1 => Ok(Some((ChainOp::Exp(args[0]), args[0]))),
-        "log" if args.len() == 1 => Ok(Some((ChainOp::Log(args[0]), args[0]))),
-        "neg" if args.len() == 1 => Ok(Some((ChainOp::Neg, args[0]))),
         // Affine multiply: exactly one literal operand (the scale `c`), and that
         // literal must be nonzero — `0.0 * u` collapses the forward map to the
         // constant 0, which is not injective (refuse rather than synthesize a
@@ -676,9 +1414,7 @@ fn classify(m: &Module, cur: NodeId) -> Result<Option<(ChainOp, NodeId)>, Refuse
 /// per-op table).
 fn apply_inverse(m: &mut Module, op: &ChainOp, acc: NodeId) -> NodeId {
     match op {
-        ChainOp::Exp(_) => build_call(m, "log", &[acc]),
-        ChainOp::Log(_) => build_call(m, "exp", &[acc]),
-        ChainOp::Neg => build_call(m, "neg", &[acc]),
+        ChainOp::Registry { entry, .. } => entry.inverse.at(m, acc),
         ChainOp::MulByLit(c) => build_call(m, "divide", &[acc, *c]),
         ChainOp::DivByLit(c) => build_call(m, "mul", &[acc, *c]),
         ChainOp::AddLit(c) => build_call(m, "sub", &[acc, *c]),
@@ -688,19 +1424,17 @@ fn apply_inverse(m: &mut Module, op: &ChainOp, acc: NodeId) -> NodeId {
 }
 
 /// `op`'s LOCAL forward log-derivative at its partial-forward input, or `None`
-/// when it is identically zero (`neg` / affine shift). The non-constant terms
-/// (`exp`/`log`) reuse the partial-forward sub-expression node directly — it is
-/// already the forward composition of the inner ops, expressed in the input
-/// placeholder, which is exactly the point `gᵢ`'s derivative is evaluated at.
+/// when it is identically zero (a volume-preserving registry op such as `neg`, or
+/// an affine shift). A registry op's term is built by its [`UnaryEntry`] AT the
+/// partial-forward sub-expression node — that node is already the forward
+/// composition of the inner ops, expressed in the input placeholder, which is
+/// exactly the point `gᵢ`'s derivative is evaluated at.
 fn local_logvol(m: &mut Module, op: &ChainOp) -> Option<NodeId> {
     match op {
-        // log|d/dz eᶻ| = z, evaluated at the partial-forward point (= the node).
-        ChainOp::Exp(z) => Some(*z),
-        // log|d/dz ln z| = −log z.
-        ChainOp::Log(z) => {
-            let logz = build_call(m, "log", &[*z]);
-            Some(build_call(m, "neg", &[logz]))
-        }
+        ChainOp::Registry { entry, z, .. } => match &entry.logvol {
+            LogVol::Zero => None,
+            LogVol::At(build) => Some(build(m, *z)),
+        },
         // log|d/dz (c·z)| = log|c|.
         ChainOp::MulByLit(c) => {
             let absc = build_call(m, "abs", &[*c]);
@@ -713,15 +1447,23 @@ fn local_logvol(m: &mut Module, op: &ChainOp) -> Option<NodeId> {
             Some(build_call(m, "neg", &[logabs]))
         }
         // Derivative ±1 ⇒ log|g'| = 0: contributes nothing to the sum.
-        ChainOp::Neg | ChainOp::AddLit(_) | ChainOp::SubLit(_) | ChainOp::RSubLit(_) => None,
+        ChainOp::AddLit(_) | ChainOp::SubLit(_) | ChainOp::RSubLit(_) => None,
     }
 }
 
 /// `pow(_, k)`: f_inv `x -> pow(x, 1/k)`; logvol `x -> add(log(abs(k)), mul(k-1, log(x)))`.
-/// Requires a nonzero literal exponent and a base whose `support` is a.e.
-/// positive ([`is_positive_domain`]) — the inverse `x^{1/k}` and the
-/// log-volume's `log x` are defined only there
-/// (d/dx xᵏ = k·xᵏ⁻¹ ⇒ log|f'| = log|k| + (k−1)·log x).
+/// Requires a nonzero literal exponent and a base whose `support` lies inside
+/// `pow`'s §06 domain — the inverse `x^{1/k}` and the log-volume's `log x` are
+/// defined only there (d/dx xᵏ = k·xᵏ⁻¹ ⇒ log|f'| = log|k| + (k−1)·log x).
+///
+/// §06 gives that domain as `nonnegreals`. A NEGATIVE exponent needs the stricter
+/// `posreals`: `x^k` is undefined at 0, so an atom there is not mapped anywhere
+/// and its mass is lost (under a continuous base 0 is a measure-zero boundary and
+/// either domain admits it, so the split only bites on a discrete base). No
+/// spelling currently reaches it — `pow(_, -1.0)` parses as `pow(_, neg(1.0))`,
+/// which [`literal_real`] rejects, so the exponent is not a literal and this
+/// returns `Ok(None)` first; the split is what keeps `nonnegreals` from becoming
+/// wrong if that folds.
 fn derive_pow(
     m: &mut Module,
     f: NodeId,
@@ -735,28 +1477,45 @@ fn derive_pow(
     if k == 0.0 {
         return Err(refuse(f, m, "pow with exponent 0 is not invertible"));
     }
-    if !is_positive_domain(support) {
+    let domain = if k < 0.0 {
+        Domain::PosReals
+    } else {
+        Domain::NonNegReals
+    };
+    if !domain.admits(support) {
         return Err(refuse(
             f,
             m,
-            "pow forward is invertible (with this log-volume) only on a strictly-positive domain",
+            &format!(
+                "pow(_, {k}) requires M's support to lie within its domain, {}; refuse rather \
+                 than mislower a sub-probability measure",
+                domain.describe()
+            ),
         ));
     }
-    // f_inv: x -> pow(x, 1/k)
-    let f_inv = lambda(m, |m, ph| {
-        let inv_exp = m.alloc(Node::Lit(Scalar::Real(1.0 / k)));
-        build_call(m, "pow", &[ph, inv_exp])
-    });
-    // logvol: x -> add(log(abs(k)), mul(k-1, log(x)))
-    let logvol = lambda(m, |m, ph| {
-        let abs_k = build_call(m, "abs", &[k_node]);
-        let log_abs_k = build_call(m, "log", &[abs_k]);
-        let km1 = m.alloc(Node::Lit(Scalar::Real(k - 1.0)));
-        let logx = build_call(m, "log", &[ph]);
-        let term = build_call(m, "mul", &[km1, logx]);
-        build_call(m, "add", &[log_abs_k, term])
-    });
+    let f_inv = lambda(m, |m, ph| pow_inverse(m, k, ph));
+    let logvol = lambda(m, |m, ph| pow_logvol(m, k_node, k, ph));
     Ok(Some(Bijection { f_inv, logvol }))
+}
+
+/// `pow(_, k)`'s inverse at `point`: `point^{1/k}`. Shared by [`derive_pow`] (the
+/// single-op `pow(x, k)` form) and the registry's `sqrt` entry (`k = 1/2`), so
+/// §06's "`sqrt` = `pow(_, 1/2)`" is one derivation, not two.
+fn pow_inverse(m: &mut Module, k: f64, point: NodeId) -> NodeId {
+    let inv_exp = m.alloc(Node::Lit(Scalar::Real(1.0 / k)));
+    build_call(m, "pow", &[point, inv_exp])
+}
+
+/// `pow(_, k)`'s FORWARD log-volume at `point`: `log|k| + (k−1)·log point`
+/// (d/dx xᵏ = k·xᵏ⁻¹). `k_node` is the exponent node reused inside `abs`, `k` its
+/// value. Shared by [`derive_pow`] and the registry's `sqrt` entry.
+fn pow_logvol(m: &mut Module, k_node: NodeId, k: f64, point: NodeId) -> NodeId {
+    let abs_k = build_call(m, "abs", &[k_node]);
+    let log_abs_k = build_call(m, "log", &[abs_k]);
+    let km1 = m.alloc(Node::Lit(Scalar::Real(k - 1.0)));
+    let logx = build_call(m, "log", &[point]);
+    let term = build_call(m, "mul", &[km1, logx]);
+    build_call(m, "add", &[log_abs_k, term])
 }
 
 /// Derive `(f_inv, logvol)` for a matrix-vector affine forward body
@@ -1039,22 +1798,13 @@ fn derive_elementwise(
         return Ok(None);
     }
     // Recurse on the scalar operator `g` over the vector's element domain +
-    // element support (the per-cell scalar support the positivity guard reads for
-    // a `log`/`pow` cell op). `None` → arm does not apply; `Err` → propagate (a
+    // element support (the per-cell scalar support the domain guard reads for a
+    // `log`/`pow` cell op). `None` → arm does not apply; `Err` → propagate (a
     // recognised-but-non-invertible `g`).
     let Some(g_bij) = derive_bijection(m, g, elem_domain, elem_support)? else {
         return Ok(None);
     };
-    let (g_inv, g_logvol) = (g_bij.f_inv, g_bij.logvol);
-    // f_inv(y) = broadcast(g_inv, y): apply the scalar inverse cell-wise.
-    let f_inv = lambda(m, |m, y| build_call(m, "broadcast", &[g_inv, y]));
-    // logvol(x) = sum(broadcast(g_logvol, x)): the diagonal Jacobian's log-det —
-    // Σᵢ log|g'(xᵢ)|.
-    let logvol = lambda(m, |m, x| {
-        let per_cell = build_call(m, "broadcast", &[g_logvol, x]);
-        build_call(m, "sum", &[per_cell])
-    });
-    Ok(Some(Bijection { f_inv, logvol }))
+    Ok(Some(wrap_elementwise(m, &g_bij)))
 }
 
 /// The element type of a vector (1-D array) `domain` — the SCALAR domain a
@@ -1070,7 +1820,7 @@ fn vector_elem_domain(domain: &Type) -> Type {
 
 /// The per-cell SUPPORT of a vector value-set — the scalar support the
 /// elementwise operator `g` acts on (`cartpow(elem, n)` → `elem`), threaded into
-/// the scalar recursion's positivity guard. Conservative `Unknown` for any
+/// the scalar recursion's [`Domain`] guard. Conservative `Unknown` for any
 /// non-power support (so a `log`/`pow` cell op over an unrefined vector base
 /// refuses rather than mislowers).
 fn elem_support(support: &ValueSet) -> ValueSet {
@@ -1182,6 +1932,22 @@ fn domain_is_vector(domain: &Type) -> bool {
     matches!(domain, Type::Array { shape, .. } if shape.len() == 1)
 }
 
+/// Is the base measure's variate domain a MATRIX — rank 2 or higher? Recognises
+/// the same two representations as [`type_is_matrix`]: a flat rank-2+ array
+/// (`Wishart`, `LKJ`: `Array{shape:[dyn, dyn]}`) and a nested array of arrays.
+/// An UNRESOLVED domain is conservatively not a matrix, so the callers' existing
+/// unknown-domain paths (refused later by `density::reference_measure`) are
+/// unchanged.
+fn domain_is_matrix(domain: &Type) -> bool {
+    match domain {
+        Type::Array { shape, .. } if shape.len() >= 2 => true,
+        Type::Array { shape, elem } if shape.len() == 1 => {
+            matches!(elem.as_ref(), Type::Array { .. })
+        }
+        _ => false,
+    }
+}
+
 /// Recognise the surface shape of a `pushfwd`'s (ref-resolved) forward argument:
 /// a bare builtin value (`Const`), or a one-input `functionof` lambda `x -> body`
 /// whose boundary is exactly one `%local` placeholder.
@@ -1246,15 +2012,18 @@ fn is_nonzero_lit(m: &Module, id: NodeId) -> bool {
     literal_real(m, id).is_some_and(|c| c != 0.0)
 }
 
-/// A bare builtin symbol node (`exp` / `log` / `neg`) usable directly as `f_inv`.
-fn bare_builtin(m: &mut Module, name: &str) -> NodeId {
-    let sym = m.intern(name);
-    m.alloc(Node::Const(sym))
-}
-
 /// Build a `functionof` lambda `<input_name> -> <body>` with the given boundary
-/// (input name + `%local` placeholder symbol).
-fn wrap_functionof(m: &mut Module, input_name: Symbol, ph: Symbol, body: NodeId) -> NodeId {
+/// (input name + `%local` placeholder symbol). This is the exact shape
+/// [`recognise`] admits as `Recognized::Lambda`, and the shape the parser emits
+/// for surface `x -> …`; the density path's record-field pushforward wrapper
+/// builds its composed forward maps with it so the two `pushfwd` spellings §06
+/// declares equivalent are byte-identical here.
+pub(crate) fn wrap_functionof(
+    m: &mut Module,
+    input_name: Symbol,
+    ph: Symbol,
+    body: NodeId,
+) -> NodeId {
     let functionof = m.intern("functionof");
     m.alloc(Node::Call(Call {
         head: CallHead::Builtin(functionof),
@@ -1287,79 +2056,12 @@ fn lambda(m: &mut Module, body: impl FnOnce(&mut Module, NodeId) -> NodeId) -> N
     wrap_functionof(m, x, ph, body_node)
 }
 
-/// The identity lambda `x -> x` (body IS the placeholder) — the forward
-/// log-volume of `exp`, spelled as the parser emits `x -> x`.
-fn identity_lambda(m: &mut Module) -> NodeId {
-    lambda(m, |_m, ph| ph)
-}
-
 /// The real value of a numeric literal node (`Int` widens to `Real`), or `None`.
 fn literal_real(m: &Module, id: NodeId) -> Option<f64> {
     match m.node(id) {
         Node::Lit(Scalar::Real(r)) => Some(*r),
         Node::Lit(Scalar::Int(i)) => Some(*i as f64),
         _ => None,
-    }
-}
-
-/// Is `log x` / `x^{1/k}` defined a.e. with full mass over a base whose refined
-/// SUPPORT is `support`? This reads the base measure's inferred support
-/// (`Module::valueset_of`), NOT the coarse structural type of its variate — a
-/// `scalar real` variate has natural extent `reals`, which would refuse EVERY
-/// scalar base, so the caller threads the refined support here instead.
-///
-/// True when the support is CONTINUOUS, excludes negatives, AND any boundary at
-/// 0 carries no probability mass:
-///   - strictly-positive continuous sets (`posreals`, `interval(lo>0, _)`) — 0
-///     is excluded outright;
-///   - continuous non-negative sets (`nonnegreals`, `unitinterval`,
-///     `interval(0, _)`) — 0 is a measure-zero boundary of a continuous base (no
-///     probability atom there), so `exp` maps −∞ ↦ 0 and the pushforward keeps
-///     full mass. (`Exponential`'s spec §08 support is `nonnegreals`, `Gamma`'s
-///     is `posreals`; both are continuous a.e.-positive bases, so the guard
-///     accepts either and they lower alike.)
-///
-/// Conservative everywhere else — refuse-don't-mislower: sets containing
-/// negatives (`reals`, `integers`), and EVERY discrete support regardless of
-/// whether it excludes 0 — `posintegers` (`Categorical`), `nonnegintegers`
-/// (`Poisson`), `booleans` — because a discrete measure has no Jacobian: a
-/// `log`/`pow` change-of-variables over it would silently synthesize a spurious
-/// density term. Every unproven support (`%unknown`, `anything`, `%deferred`,
-/// and the caller's `None → Unknown` fallback) also refuses.
-fn is_positive_domain(support: &ValueSet) -> bool {
-    use ValueSet::*;
-    match support {
-        // NOTE: CONTINUOUS supports only — a discrete support (e.g. `posintegers`,
-        // `Categorical`'s support) has no Jacobian, so `log`/`pow` pushforward of a
-        // discrete measure must refuse, not silently add a change-of-variables term.
-        PosReals | NonNegReals | UnitInterval => true,
-        Interval(lo, _) => *lo >= 0.0,
-        _ => false,
-    }
-}
-
-/// `support ⊆ (−1, ∞)` — the domain of `log1p` (spec §07: `interval(-1, inf)`).
-/// Continuous supports only, mirroring [`is_positive_domain`]'s discrete
-/// exclusion. The `lo == −1` boundary is a measure-zero point (`log1p(−1) =
-/// −inf`), admitted for the same reason `is_positive_domain` admits `lo == 0`.
-fn is_gt_neg_one_domain(support: &ValueSet) -> bool {
-    use ValueSet::*;
-    match support {
-        PosReals | NonNegReals | UnitInterval => true,
-        Interval(lo, _) => *lo >= -1.0,
-        _ => false,
-    }
-}
-
-/// `support ⊆ (0, 1)` — the domain of `logit` / `probit` (spec §07:
-/// `interval(0, 1)`). Continuous supports only; the `0`/`1` boundaries are the
-/// measure-zero points where `logit`/`probit` are `±inf`.
-fn is_unit_domain(support: &ValueSet) -> bool {
-    use ValueSet::*;
-    match support {
-        UnitInterval => true,
-        Interval(lo, hi) => *lo >= 0.0 && *hi <= 1.0,
-        _ => false,
     }
 }
 

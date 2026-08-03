@@ -483,11 +483,11 @@ fn apply_rule(
 
     // --- No rule matched: refuse with the op name ---
     let construct = op_name(m, target_node);
+    let reason = format!("no determinization rule for the `{construct}` measure-layer construct");
     Err(RefuseError {
         node: target_node,
         construct,
-        reason: "no determinization rule for this measure-layer construct (Task 3+ needed)"
-            .to_string(),
+        reason,
     })
 }
 
@@ -528,7 +528,12 @@ fn try_beta_law(m: &Module, node_id: NodeId) -> Option<NodeId> {
 
 /// Replace all occurrences of `old` with `new_id` in the subtree rooted at
 /// `root`. Returns the (possibly new) NodeId for the root after substitution.
-fn substitute_in_tree(m: &mut Module, root: NodeId, old: NodeId, new_id: NodeId) -> NodeId {
+pub(crate) fn substitute_in_tree(
+    m: &mut Module,
+    root: NodeId,
+    old: NodeId,
+    new_id: NodeId,
+) -> NodeId {
     map_tree(m, root, &mut |_m, id| (id == old).then_some(new_id))
 }
 

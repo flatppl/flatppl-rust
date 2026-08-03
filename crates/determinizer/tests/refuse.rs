@@ -553,14 +553,19 @@ lp = logdensityof(L, record(mu = 0.0))";
 }
 
 // ---------------------------------------------------------------------------
-// Sample path: the intractable / deferred set (spec §07 `rand` tractable set)
+// Sample path: the intractable / deferred split (§07 "rand"'s exclusion clause)
 // ---------------------------------------------------------------------------
 //
 // `sample.rs`'s `lower_measure_sample` dispatcher used to fall through every
 // unhandled measure-algebra op to one generic "unsupported measure construct"
 // message. These tests pin EXPLICIT, distinct refusals instead, so a refusal
-// tells the author WHY (outside rand's tractable set vs. simply not built
-// yet), not just THAT.
+// tells the author WHY (spec-excluded as intractable vs. simply not built
+// yet), not just THAT. §07 "rand" states a CRITERION, not a whitelist — it
+// "does not support measures for which [efficient IID generation] is an
+// intractable problem, especially measures involving non-constant weighting
+// … or multivariate truncation" — and §13 "Refused constructs" names those
+// same two shapes explicitly. Everything else this file pins as refused is
+// deferred: not spec-excluded, simply unbuilt in this vertical.
 //
 // `weighted`/`logweighted`/`bayesupdate`, `truncate`, and the deferred
 // combinators (`jointchain`/`kchain`/`superpose`/`pushfwd`) all reach their
@@ -588,7 +593,7 @@ draws = rand(s, lawof(record(d = d)))";
     let err = determinize(&m).expect_err("sampling a weighted measure is intractable — refuse");
     assert!(
         err.reason.contains("weighted") || err.reason.contains("intractable"),
-        "refusal explains weighted is outside rand's tractable set: {err:?}"
+        "refusal explains weighted's non-constant weighting is intractable to sample: {err:?}"
     );
 }
 
@@ -630,7 +635,7 @@ draws = rand(s, lawof(record(d = d)))";
         .expect_err("sampling a multivariate truncated measure is intractable — refuse");
     assert!(
         err.reason.contains("multivariate") && err.reason.contains("intractable"),
-        "refusal explains the multivariate truncation is outside rand's tractable set: {err:?}"
+        "refusal explains the multivariate truncation is intractable to sample: {err:?}"
     );
 }
 
@@ -661,8 +666,12 @@ draws = rand(s, lawof(record(d = d)))";
 // `d = draw(superpose(Normal(...), Normal(...)))`: `superpose` (measure
 // addition) is not conceptually intractable — a later vertical could thread
 // the rng through it — it is simply not built in this one (direct draws +
-// record-of-draws + shared ancestors). `jointchain`/`kchain`/`pushfwd` share
-// the identical match arm and message (not separately tested).
+// record-of-draws + shared ancestors). `jointchain`/`kchain` share the
+// identical match arm and message (not separately tested). `pushfwd` no longer
+// shares that arm — a pushforward IS sampled in measure position (sample the
+// base, apply the map: `sample_golden.rs::
+// rand_of_pushfwd_samples_base_then_applies_map`), and `draw(pushfwd(...))` has
+// its own fresh-draw refusal (`draw_of_pushfwd_over_existing_draws_refuses`).
 #[test]
 fn sample_deferred_combinator_refuses() {
     let src = "\
@@ -700,20 +709,14 @@ draws = rand(s)";
     );
 }
 
-// `rand(rng, M)` where `M` is not `lawof(...)` at all — `rand` samples the LAW
-// of a stochastic subgraph, so its second argument must be a `lawof(...)`.
-#[test]
-fn sample_rand_measure_not_lawof_refuses() {
-    let src = "\
-s = rnginit(0)
-draws = rand(s, Normal(mu = 0.0, sigma = 1.0))";
-    let m = parse_infer(src);
-    let err = determinize(&m).expect_err("rand's measure must be lawof(...) — refuse");
-    assert!(
-        err.reason.contains("lawof"),
-        "refusal names the lawof requirement: {err:?}"
-    );
-}
+// A `rand` whose measure is a bare closed measure (`rand(s, Normal(...))`) is
+// NOT refused — §07 types the second argument as "a closed measure `m`" and §06
+// makes a primitive constructor call a nullary kernel, i.e. closed. That golden
+// lives in `sample_golden.rs::rand_of_a_bare_closed_measure_samples`; the
+// refusal that used to sit here pinned the missing-`lawof` gate as a
+// requirement, which §07 contradicts. What DOES still refuse in that vicinity
+// is an un-drawn measure in a record FIELD — see
+// `undrawn_measure_in_a_record_field_still_refuses` below.
 
 // `draw` takes exactly 1 arg (the measure); a 2-arg call is malformed.
 #[test]
@@ -855,9 +858,10 @@ v, s2 = rand(s, lawof(record(x = x)))";
 
 // The realistic "thread the rng across two draws" shape the spec's own §07
 // example uses: `s2` (the first `rand`'s advanced rngstate) is destructured
-// out and threaded into a second `rand`. Both draws are individually within
-// `rand`'s tractable set (single-draw records), and now the destructuring of
-// the first `rand`'s result lowers too, so the whole chain lowers.
+// out and threaded into a second `rand`. Neither draw trips §07 "rand"'s
+// exclusion clause, and both are shapes this vertical builds (single-draw
+// records); now the destructuring of the first `rand`'s result lowers too, so
+// the whole chain lowers.
 #[test]
 fn destructured_rand_rng_threaded_into_second_rand_lowers() {
     let src = "\
@@ -939,5 +943,261 @@ out = draws.mu";
     assert!(
         flatppl_determinizer::is_flatpdl(&out).is_ok(),
         "must be FlatPDL:\n{pir}"
+    );
+}
+
+// A record law whose fields are functions of FEWER distinct draws than there are
+// fields has NO density, and the determiniser must say so rather than invent a
+// number. `record(a = y, b = y)` is the pushforward of a 1-D absolutely continuous
+// measure under t -> (t, t): its law is carried by the diagonal of R^2, a
+// lambda_2-null set, so it is not absolutely continuous w.r.t. lambda_2 and by
+// Radon-Nikodym no density exists. Before this guard the determiniser emitted
+// `add(builtin_logdensityof(...), builtin_logdensityof(...))` and exited 0 —
+// byte-identical to the output for two INDEPENDENT draws (see
+// `density_golden.rs::distinct_draws_still_lower_to_sum`).
+#[test]
+fn duplicate_draw_across_fields_refuses() {
+    let src = "\
+y = draw(Normal(mu = 0.0, sigma = 1.0))
+lp = logdensityof(lawof(record(a = y, b = y)), record(a = 0.5, b = 0.5))";
+    let m = parse_infer(src);
+    let err = determinize(&m).expect_err("k > n record law has no density — must refuse");
+    assert!(
+        err.reason.contains("distinct draw"),
+        "refusal explains fewer distinct draws than fields: {err:?}"
+    );
+}
+
+// Same defect reached through a transformed field: `record(a = y, b = exp(y))` is
+// carried by the curve {(t, e^t)} in R^2, also lambda_2-null. The transform makes
+// no difference — what matters is that both fields resolve to the SAME draw.
+#[test]
+fn duplicate_draw_via_transformed_field_refuses() {
+    let src = "\
+y = draw(Normal(mu = 0.0, sigma = 1.0))
+s = exp(y)
+lp = logdensityof(lawof(record(a = y, b = s)), record(a = 0.5, b = 1.6487212707001282))";
+    let m = parse_infer(src);
+    let err = determinize(&m).expect_err("transformed duplicate is still k > n — must refuse");
+    assert!(
+        err.reason.contains("distinct draw"),
+        "refusal explains fewer distinct draws than fields: {err:?}"
+    );
+}
+
+// GUARDRAIL, must stay green for the life of this branch. A derived field over two
+// draws is k=3 > n=2, rank-deficient, and §06 "Engine contract for pushfwd density
+// evaluation" case 3 independently mandates a static error for a map that is
+// neither in the known-bijection registry nor a structural projection. Task 3
+// widens the field-shape test; this test is what proves the widening did not
+// legitimise a singular joint.
+#[test]
+fn derived_field_over_two_draws_still_refuses() {
+    let src = "\
+y1 = draw(Normal(mu = 0.0, sigma = 1.0))
+y2 = draw(Normal(mu = 0.0, sigma = 1.0))
+d = y1 - y2
+lp = logdensityof(lawof(record(a = y1, b = y2, d = d)), record(a = 0.5, b = 0.25, d = 0.25))";
+    let m = parse_infer(src);
+    determinize(&m).expect_err("k=3 > n=2 has no density — must refuse");
+}
+
+// A field reaching TWO draws breaks the diagonality that makes the distinct-draw
+// check equivalent to a rank check, so it must refuse until the guard computes a
+// real rank. Both spellings below are k = n = 2 with rank J_Φ < 2 over
+// `s = y1 + y2`, so no density exists in either:
+//
+// * `record(a = s, b = y1)` — `a` is a map of BOTH draws while `b` is a map of
+//   `y1` alone, so a naive per-field reading that resolved `a` to a single site
+//   would see two DISTINCT sites and admit a singular joint;
+// * `record(a = s, b = s)` — the rank-1 case: both fields are the same map of both
+//   draws, so J_Φ has rank 1 against n = 2.
+#[test]
+fn field_over_two_draws_refuses() {
+    for query in [
+        "lp = logdensityof(lawof(record(a = s, b = y1)), record(a = 0.5, b = 0.25))",
+        "lp = logdensityof(lawof(record(a = s, b = s)), record(a = 0.5, b = 0.25))",
+    ] {
+        let src = format!(
+            "\
+y1 = draw(Normal(mu = 0.0, sigma = 1.0))
+y2 = draw(Normal(mu = 0.0, sigma = 1.0))
+s = y1 + y2
+{query}"
+        );
+        let m = parse_infer(&src);
+        let err = determinize(&m).expect_err(&format!(
+            "a field over two draws needs a rank test — must refuse: {query}"
+        ));
+        assert!(
+            err.reason.contains("rank") || err.reason.contains("more than one draw"),
+            "refusal explains the multi-draw field, not invertibility ({query}): {err:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sample path: what admitting a composed measure must NOT admit
+// ---------------------------------------------------------------------------
+
+// The field-position counterpart, and the guardrail for admitting a bare closed
+// measure in MEASURE position: a record FIELD holding an un-drawn measure must
+// still refuse. Admitting a bare constructor in measure position must not leak
+// into the per-field fold, or this would silently sample a variate the model
+// never declared — fabricating a draw. `lower_measure_sample` keeps refusing;
+// only the measure-position entry point gained the leaf case.
+//
+// The record MUST also contain a real draw. Without one it is not
+// Stochastic-phase, so `lower_closed_measure_sample`'s `lawof` arm refuses on the
+// phase check BEFORE the per-field fold runs at all — which would make this
+// guardrail vacuous, staying green even if the constructor leaf were moved into
+// `lower_measure_sample` (the exact regression it exists to catch). Hence the `y`
+// field, and hence the assertion on `construct`/`reason` rather than on the
+// refusal merely being non-empty.
+#[test]
+fn undrawn_measure_in_a_record_field_still_refuses() {
+    let src = "\
+s = rnginit([42, 0, 0, 0])
+y = draw(Normal(mu = 0.0, sigma = 1.0))
+draws = rand(s, lawof(record(y = y, a = Normal(mu = 0.0, sigma = 1.0))))";
+    let m = parse_infer(src);
+    let err = determinize(&m)
+        .expect_err("an un-drawn measure in a record field is not a variate — must refuse");
+    assert!(
+        err.construct.contains("Normal"),
+        "refusal names the un-drawn constructor sitting in the field, not the record \
+         or the lawof: {err:?}"
+    );
+    assert!(
+        err.reason.contains("unsupported measure construct"),
+        "the refusal comes from the per-field dispatcher, not the lawof phase check — \
+         a 'not stochastic-phase' reason here would mean the fold was never reached and \
+         this guardrail is vacuous: {err:?}"
+    );
+    assert!(
+        !err.reason.contains("stochastic-phase"),
+        "the record IS stochastic-phase (field y is a draw), so the phase check must \
+         not be what refuses: {err:?}"
+    );
+}
+
+// `draw(pushfwd(...))` is NOT a spelling of "a deterministic function of the
+// existing draws": per §04 `draw` introduces a FRESH stochastic node, so `d` here
+// would be independent of y1/y2, not equal to their difference. Lowering it by
+// reusing the existing samples would emit a silently wrong joint, so it stays
+// refused — and the message must explain the fresh-draw semantics rather than
+// implying the construct is unsupported.
+#[test]
+fn draw_of_pushfwd_over_existing_draws_refuses() {
+    let src = "\
+s = rnginit([42, 0, 0, 0])
+y1 = draw(Normal(mu = 0.0, sigma = 1.0))
+y2 = draw(Normal(mu = 0.0, sigma = 1.0))
+d = draw(pushfwd(r -> get(r, \"y1\") - get(r, \"y2\"), lawof(record(y1 = y1, y2 = y2))))
+draws = rand(s, lawof(record(y1 = y1, y2 = y2, d = d)))";
+    let m = parse_infer(src);
+    let err = determinize(&m).expect_err("draw of a pushfwd is a FRESH draw — must refuse");
+    assert!(
+        err.reason.contains("fresh"),
+        "refusal explains the fresh-draw semantics: {err:?}"
+    );
+}
+
+// Applying a `pushfwd` map to a RECORD variate is an auto-splatting call, and §04
+// "Calling conventions" makes it a static error when the record's field names do
+// not match the callable's argument names. A one-parameter lambda over a two-field
+// record law is exactly that: `r` names no field of `record(y1 = …, y2 = …)`.
+//
+// Worth pinning in both directions, because the reducer's record branch binds each
+// of the callable's inputs from a like-named field and never checks that every
+// FIELD was consumed — so a map naming a strict SUBSET of the fields would reduce
+// to a silent projection of the variate. A marginalizing projection is a different
+// measure from a full transform, so that would be a wrong sample.
+#[test]
+fn rand_of_pushfwd_with_mismatched_record_map_refuses() {
+    let src = "\
+s = rnginit([42, 0, 0, 0])
+y1 = draw(Normal(mu = 0.0, sigma = 1.0))
+y2 = draw(Normal(mu = 0.0, sigma = 1.0))
+draws = rand(s, pushfwd(r -> get(r, \"y1\") - get(r, \"y2\"), lawof(record(y1 = y1, y2 = y2))))";
+    let m = parse_infer(src);
+    let err = determinize(&m)
+        .expect_err("a map whose parameters do not match the record variate's fields must refuse");
+    assert!(
+        err.reason.contains("do not correspond"),
+        "refusal rests on the §04 field/parameter correspondence: {err:?}"
+    );
+    // Both sides are named, so the message reads as a correspondence failure rather
+    // than blaming a field the map may legitimately be selecting.
+    assert!(
+        err.reason.contains("map parameters `r`") && err.reason.contains("variate fields `y1`"),
+        "refusal names the map's parameters AND the variate's fields: {err:?}"
+    );
+    assert!(
+        err.construct.contains("pushfwd"),
+        "refusal names the pushfwd: {err:?}"
+    );
+}
+
+// The subset direction of the same rule: the map declares only `y1`, so the
+// reducer would bind `y1` and silently DROP `y2`, emitting a projection of the
+// variate where the model wrote a transform of the whole record.
+#[test]
+fn rand_of_pushfwd_with_partial_record_map_refuses() {
+    let src = "\
+s = rnginit([42, 0, 0, 0])
+y1 = draw(Normal(mu = 0.0, sigma = 1.0))
+y2 = draw(Normal(mu = 0.0, sigma = 1.0))
+f = functionof(mul(2.0, _a_), y1 = _a_)
+draws = rand(s, pushfwd(f, lawof(record(y1 = y1, y2 = y2))))";
+    let m = parse_infer(src);
+    let err = determinize(&m)
+        .expect_err("a map covering only some of the record's fields must refuse, not project");
+    assert!(
+        err.reason.contains("field `y2` binds no parameter"),
+        "refusal names the field that would have been silently dropped: {err:?}"
+    );
+}
+
+// The residual net behind the §04 correspondence check: a map that is neither a
+// bare builtin callee nor beta-reducible would leave a surviving `%call`, which is
+// not FlatPDL (deterministic ops + the six `builtin_*` primitives) and which
+// `is_flatpdl` does not flag — it checks phase and type, never a surviving
+// `CallHead::User`. So the sample path reduces the application itself and refuses
+// when it cannot, rather than exiting 0 with a non-conformant module. Here the map
+// takes two inputs and the variate is a scalar, so there is no record to splat and
+// the arity cannot bind.
+#[test]
+fn rand_of_pushfwd_with_unreducible_map_refuses() {
+    let src = "\
+s = rnginit([42, 0, 0, 0])
+f = functionof(_a_ + _b_, x = _a_, y = _b_)
+draws = rand(s, pushfwd(f, Normal(mu = 0.0, sigma = 1.0)))";
+    let m = parse_infer(src);
+    let err = determinize(&m)
+        .expect_err("a pushfwd map that does not reduce must refuse, not emit an unreduced call");
+    assert!(
+        err.reason.contains("does not reduce"),
+        "refusal explains the map does not apply to the sampled variate: {err:?}"
+    );
+}
+
+// A BARE built-in operator as the `pushfwd` map, over a record-valued base: the
+// forward application is §04 auto-splatting against that operator's own parameter
+// names, and nothing downstream catches the mismatch — `infer` reports no
+// diagnostic for this model and `is_flatpdl` is structural, so `exp(record(y = …))`
+// would be emitted as a conformant module at exit 0 and fail only in the engine.
+#[test]
+fn rand_of_pushfwd_bare_builtin_map_over_record_refuses() {
+    let src = "\
+s = rnginit([42, 0, 0, 0])
+y1 = draw(Normal(mu = 0.0, sigma = 1.0))
+draws = rand(s, pushfwd(exp, lawof(record(y = y1))))";
+    let m = parse_infer(src);
+    let err = determinize(&m)
+        .expect_err("a bare builtin map over a record variate must refuse, not emit exp(record)");
+    assert!(
+        err.reason.contains("bare built-in operator"),
+        "refusal names the unresolved auto-splat against the operator's parameters: {err:?}"
     );
 }

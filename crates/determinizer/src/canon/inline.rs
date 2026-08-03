@@ -67,6 +67,9 @@ fn inline_walk(m: &mut Module, id: NodeId) -> NodeId {
     // Then reduce this node if it is a user call.
     if let Node::Call(c) = m.node(id) {
         if matches!(c.head, CallHead::User(_)) {
+            if let Some(head) = builtin_callee_head(m, id) {
+                return rebuild_with_head(m, id, head);
+            }
             if let Some(reduced) = reduce_kernel_application(m, id) {
                 // The reduced body may itself contain further user calls
                 // (e.g. a function whose body calls another function).
@@ -75,4 +78,46 @@ fn inline_walk(m: &mut Module, id: NodeId) -> NodeId {
         }
     }
     id
+}
+
+/// If `id` is `(%call <bare builtin> args…)`, the `Builtin` head that same
+/// application spells directly. A [`Node::Const`] is "a bare built-in symbol in
+/// value position … only for base built-ins" (user bindings are `Ref`), so
+/// applying one IS a builtin call — `(%call log 0.5)` and `(log 0.5)` denote the
+/// same thing, but only the latter is FlatPDL (deterministic ops + the six
+/// `builtin_*` primitives; a `%call` is neither) and only the latter carries a
+/// resolved type, since `reduce_kernel_application` can beta-reduce a reified
+/// `functionof` callee but has nothing to reduce for a bare operator.
+///
+/// This is what makes §06's two `pushfwd` spellings agree: a synthesized
+/// `f_inv` that is one builtin is emitted as the bare operator (the form
+/// `broadcast` needs, and the form a user writes in `bijection(exp, log, …)`),
+/// while a composed one is a lambda that beta-reduces — both then land on the
+/// same direct builtin call.
+fn builtin_callee_head(m: &Module, id: NodeId) -> Option<CallHead> {
+    let Node::Call(c) = m.node(id) else {
+        return None;
+    };
+    let CallHead::User(callee) = c.head else {
+        return None;
+    };
+    match m.node(callee) {
+        Node::Const(sym) => Some(CallHead::Builtin(*sym)),
+        _ => None,
+    }
+}
+
+/// Re-allocate `id`'s call with `head`, keeping its positional/named arguments
+/// (the callee child is dropped — it has become the head).
+fn rebuild_with_head(m: &mut Module, id: NodeId, head: CallHead) -> NodeId {
+    let Node::Call(c) = m.node(id) else {
+        return id;
+    };
+    let call = flatppl_core::Call {
+        head,
+        args: c.args.clone(),
+        named: c.named.clone(),
+        inputs: c.inputs.clone(),
+    };
+    m.alloc(Node::Call(call))
 }

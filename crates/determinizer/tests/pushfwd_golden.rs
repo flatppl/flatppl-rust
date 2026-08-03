@@ -70,14 +70,13 @@ fn pushfwd_composition_exp_affine_lowers() {
         p.contains("builtin_logdensityof") && p.contains("log"),
         "got:\n{p}"
     );
-    // Composed inverse log(y)/2, applied at the literal query point y = 0.5,
-    // is beta-reduced (Buffy #263 Pass 2) to divide(log(0.5), 2.0) — `log` is
-    // excluded from const-fold (see `canon/fold.rs`), so the `log(0.5)` leaf
-    // stays unevaluated and the `divide` around it does too (const-fold
-    // requires BOTH operands literal):
+    // Composed inverse log(y)/2, applied at the query point y = 0.5, is
+    // beta-reduced (Buffy #263 Pass 2) to divide(log(y'), 2.0) — where `y'` is the
+    // image gate's sanitised point, so the leaf under `log` is the sanitising
+    // `ifelse` rather than the bare literal:
     assert!(
-        p.contains("(divide") && p.contains("(log 0.5)"),
-        "inverse log(0.5)/2 present:\n{p}"
+        p.contains("(divide") && p.contains("(log ") && p.contains("(ifelse"),
+        "inverse log(y)/2 present:\n{p}"
     );
     // Chain-rule logvol: the exp term contributes the partial-forward 2x,
     // evaluated at x = f_inv(0.5) = log(0.5)/2 (the SAME inlined inverse
@@ -130,8 +129,8 @@ fn pushfwd_log_over_unrestricted_domain_refuses() {
     // well-formed-looking `(f_inv=exp, logvol=neg(log(x)))` change-of-variables
     // that is only valid on the positive half of the base support — silently a
     // SUB-probability measure (integrates to ~0.5, not 1). Refuse rather than
-    // mislower (mirrors derive_pow's is_positive_domain guard; §06 log defined
-    // on positive reals).
+    // mislower (the registry entry's `Domain::PosReals` guard; §06 puts `log` on
+    // `posreals`).
     let e = determinize(&parse_infer(
         "d = pushfwd(log, Normal(mu = 0.0, sigma = 1.0))\nlp = logdensityof(d, 0.5)",
     ))
@@ -142,15 +141,22 @@ fn pushfwd_log_over_unrestricted_domain_refuses() {
 #[test]
 fn pushfwd_log_chain_over_unrestricted_domain_refuses() {
     // Same silent-sub-probability danger as the bare-log case, but with `log`
-    // appearing inside a scalar-chain forward body (`2.0*log(x)`) rather than
-    // as the bare builtin. The chain-walk guard is conservative: it refuses
-    // ANY chain containing `log` unless the base domain is provably positive,
-    // regardless of where in the chain `log` sits.
+    // appearing inside a scalar-chain forward body (`2.0*log(x)`) rather than as
+    // the bare builtin. Here `log` is INNERMOST — its input is the base variate
+    // itself — so the base support decides, exactly as for the bare spelling, and
+    // a `Normal` base fails it. (A domain-restricted op that is NOT innermost
+    // refuses for a different reason; see
+    // domain_restricted_registry_op_inside_a_composition_refuses.)
     let e = determinize(&parse_infer(
         "d = pushfwd(x -> 2.0 * log(x), Normal(mu = 0.0, sigma = 1.0))\nlp = logdensityof(d, 0.5)",
     ))
     .expect_err("a chain containing log over a non-positive-support base must refuse");
-    assert!(format!("{e:?}").contains("refuse"), "got: {e:?}");
+    let msg = format!("{e:?}");
+    assert!(msg.contains("refuse"), "got: {e:?}");
+    assert!(
+        msg.contains("support"),
+        "expected the base-support branch, not the composition branch: {e:?}"
+    );
 }
 
 #[test]
@@ -561,4 +567,162 @@ fn projection_duplicate_field_refuses() {
     ))
     .expect_err("duplicate selected field must refuse, not double-count");
     assert!(format!("{e:?}").contains("refuse"), "got: {e:?}");
+}
+
+// §06 case 1's registry is a property of the FUNCTION, not of how it is spelled:
+// `bijection`'s entry describes the annotated result as "a function that is
+// semantically `f`". But a lambda body routes through `derive_chain`, whose per-op
+// table carried only exp/log/neg/mul/divide/add/sub, so `x -> sqrt(x)` refused
+// while the bare `sqrt` lowered — the same map, opposite outcomes. Note §06 calls
+// sqrt a case of "`pow` with literal exponent", and `x -> pow(x, 0.5)` already
+// lowered, which makes the asymmetry indefensible on the spec's own terms.
+//
+// Covers EVERY entry of the shared registry, not only the twelve that used to
+// refuse: `exp`/`log`/`neg` were already in both paths, and pinning them here
+// means a future entry reachable from only one path fails this test.
+#[test]
+fn lambda_and_bare_spellings_agree_across_the_registry() {
+    // (forward, base whose support lies in the forward's §06 domain, query point).
+    let cases = [
+        ("exp", "Normal(mu = 0.0, sigma = 1.0)", "0.5"),
+        ("log", "Gamma(shape = 2.0, rate = 1.0)", "0.5"),
+        ("neg", "Normal(mu = 0.0, sigma = 1.0)", "0.5"),
+        ("sqrt", "Gamma(shape = 2.0, rate = 1.0)", "1.5"),
+        ("tanh", "Normal(mu = 0.0, sigma = 1.0)", "0.5"),
+        ("atan", "Normal(mu = 0.0, sigma = 1.0)", "0.5"),
+        ("sinh", "Normal(mu = 0.0, sigma = 1.0)", "0.5"),
+        ("asinh", "Normal(mu = 0.0, sigma = 1.0)", "0.5"),
+        ("expm1", "Normal(mu = 0.0, sigma = 1.0)", "0.5"),
+        ("invlogit", "Normal(mu = 0.0, sigma = 1.0)", "0.5"),
+        ("invprobit", "Normal(mu = 0.0, sigma = 1.0)", "0.5"),
+        ("log10", "Gamma(shape = 2.0, rate = 1.0)", "0.2"),
+        ("log1p", "Gamma(shape = 2.0, rate = 1.0)", "0.5"),
+        ("logit", "Beta(alpha = 2.0, beta = 2.0)", "0.3"),
+        ("probit", "Beta(alpha = 2.0, beta = 2.0)", "0.3"),
+    ];
+    let lower = |src: &str| determinize(&parse_infer(src)).map(|out| flatppl_flatpir::write(&out));
+    for (op, base, point) in cases {
+        let bare = lower(&format!(
+            "b = pushfwd({op}, {base})\nlp = logdensityof(b, {point})"
+        ));
+        let lambda = lower(&format!(
+            "b = pushfwd(x -> {op}(x), {base})\nlp = logdensityof(b, {point})"
+        ));
+        let bare = bare.unwrap_or_else(|e| panic!("bare `{op}` must lower: {e:?}"));
+        let lambda = lambda.unwrap_or_else(|e| panic!("lambda `{op}` must lower: {e:?}"));
+        assert_eq!(
+            bare, lambda,
+            "`{op}`: the two spellings are the same map per §06 and must lower identically\n\
+             bare:\n{bare}\nlambda:\n{lambda}"
+        );
+    }
+}
+
+// GUARDRAIL: §06 case 1's domain restriction must survive the widening. A
+// domain-restricted forward "additionally requires the base measure's support to
+// lie within that domain; where it does not, density evaluation is refused rather
+// than yielding a silently sub-probability measure." `log10` over a Normal base
+// (support R, not posreals) must therefore refuse in BOTH spellings.
+#[test]
+fn domain_restricted_forward_over_wrong_support_still_refuses_both_spellings() {
+    for form in ["log10", "x -> log10(x)"] {
+        let src = format!(
+            "b = pushfwd({form}, Normal(mu = 0.0, sigma = 1.0))\nlp = logdensityof(b, 0.2)"
+        );
+        determinize(&parse_infer(&src)).expect_err(&format!(
+            "`{form}` over a Normal base violates §06's domain restriction — must refuse"
+        ));
+    }
+}
+
+#[test]
+fn registry_op_inside_a_composition_lowers_with_the_chain_rule() {
+    // The registry share must hold at CHAIN DEPTH, not just for the one-op
+    // spelling: `derive_chain` sums each op's LOCAL forward log-derivative at its
+    // own PARTIAL-FORWARD point, so for `f = tanh ∘ (2·)` the `tanh` term is
+    // `log(1 − tanh(2x)²)` — evaluated at `2x`, NOT at `x` — plus the affine
+    // `log|2|`. Byte-equal against the explicit `bijection(f, f_inv, logvol)`
+    // form, which pins the whole change of variables (a term evaluated at the
+    // wrong point, or a dropped term, fails here; a substring probe would not):
+    //   f_inv(y)  = atanh(y) / 2
+    //   logvol(x) = log(1 − tanh(2x)²) + log|2|
+    let synth = pir(
+        "d = pushfwd(x -> tanh(2.0 * x), Normal(mu = 0.0, sigma = 1.0))\n\
+         lp = logdensityof(d, 0.5)",
+    );
+    let explicit = pir(
+        "d = pushfwd(bijection(x -> tanh(2.0 * x), x -> atanh(x) / 2.0, \
+         x -> log(1.0 - pow(tanh(2.0 * x), 2.0)) + log(abs(2.0))), \
+         Normal(mu = 0.0, sigma = 1.0))\n\
+         lp = logdensityof(d, 0.5)",
+    );
+    assert!(synth.contains("builtin_logdensityof"), "got:\n{synth}");
+    assert_eq!(
+        synth, explicit,
+        "tanh∘(2·) must synthesize f_inv = atanh(y)/2 and logvol = log(1 − tanh(2x)²) + log|2|"
+    );
+}
+
+// REGRESSION for a silent wrong density that lowered on main at 9ac4ae7. §06 case
+// 1's domain restriction is about the forward's INPUT, but the guard used to test
+// only the BASE support — so a composition whose base support satisfied `log`'s
+// domain while the intervening op pushed the input OUT of it lowered, emitting a
+// density for a map that is undefined there. Each case below scored a value
+// through flatppl-js on main: `log(x - 5.0)` gave a clean finite -4.254296724642763
+// with no error, when the pushforward of the full Gamma under a map undefined on
+// x <= 5 carries total mass 0.0404 — a sub-probability measure whose properly
+// normalised density is -1.046, so main was wrong by 3.21 nats. `log(log(x))` gave
+// -1.402883223389705 the same way; the other two gave -Infinity.
+//
+// These four must refuse over a base whose support DOES satisfy the op's domain,
+// and refuse for a reason naming that op and its domain — a bare "refuses" would
+// also pass on an unrelated refusal (an unrecognised head, say), which would hide
+// the defect coming back. The op-and-domain core is asserted rather than the exact
+// branch wording because these same four must still refuse once interval
+// propagation lands (the propagated input fails containment in `log`'s domain), and
+// the wording will improve then.
+#[test]
+fn domain_restricted_forward_undefined_on_the_base_support_refuses() {
+    for body in [
+        "log(neg(x))",  // negates a positive base: log undefined on all of it
+        "log(x - 5.0)", // undefined on x <= 5, ~96% of the Gamma(2,1) mass
+        "log(log(x))",  // inner log is negative for x < 1
+        "log(0.0 - x)", // reflected-sub spelling of the first case
+    ] {
+        let src = format!(
+            "d = pushfwd(x -> {body}, Gamma(shape = 2.0, rate = 1.0))\n\
+             lp = logdensityof(d, 0.5)"
+        );
+        let e = determinize(&parse_infer(&src)).expect_err(&format!(
+            "`x -> {body}` over a positive base must refuse, not emit a density"
+        ));
+        let msg = format!("{e:?}");
+        assert!(
+            msg.contains("log") && msg.contains("the positive reals"),
+            "`x -> {body}` must refuse for `log`'s domain, not some unrelated cause: {e:?}"
+        );
+    }
+}
+
+#[test]
+fn domain_restricted_registry_op_inside_a_composition_refuses() {
+    // §06 case 1's domain restriction is about the forward's INPUT. The base
+    // measure's support bounds only the innermost op's input; an interior
+    // domain-restricted op receives an intermediate value this pass does not
+    // bound. `x -> log(neg(x))` over a POSITIVE base is the sharp case: the base
+    // support satisfies `log`'s domain, yet `neg(x)` is negative on all of it, so
+    // `log` is undefined everywhere and the emitted density would be pure
+    // fiction. Refuse — with the composition (not the support) named as the
+    // reason, so the two failure modes stay distinguishable.
+    let e = determinize(&parse_infer(
+        "d = pushfwd(x -> log(neg(x)), Gamma(shape = 2.0, rate = 1.0))\n\
+         lp = logdensityof(d, 0.5)",
+    ))
+    .expect_err("a domain-restricted op inside a composition must refuse");
+    let msg = format!("{e:?}");
+    assert!(msg.contains("refuse"), "got: {e:?}");
+    assert!(
+        msg.contains("inside a composition"),
+        "expected the composition branch, not the support branch: {e:?}"
+    );
 }
