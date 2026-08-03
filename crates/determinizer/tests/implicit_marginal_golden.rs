@@ -187,6 +187,93 @@ lp = logdensityof(lawof(record(y = y, q = q)), record(y = 0.5, q = 0.7))");
         lp.contains("(%field mu 4.0)") && lp.contains("(%field sigma 3.0)"),
         "q's factor is q's own law, unchanged:\n{lp}"
     );
+
+    // Two fields over DIFFERENT latents is a genuine product and must keep lowering, so the
+    // shared-latent refusal below cannot be a blanket ban on marginalizing two fields.
+    let two = pir_binding(
+        &pir("\
+z1 = draw(Normal(mu = 0.0, sigma = 1.0))
+z2 = draw(Normal(mu = 0.0, sigma = 3.0))
+y1 = draw(Normal(mu = z1, sigma = 1.0))
+y2 = draw(Normal(mu = z2, sigma = 1.0))
+lp = logdensityof(lawof(record(y1 = y1, y2 = y2)), record(y1 = 0.5, y2 = 0.7))"),
+        "lp",
+    );
+    assert!(
+        two.contains("(%field sigma 1.4142135623730951)")
+            && two.contains("(%field sigma 3.1622776601683795)"),
+        "each field marginalizes its own latent: sqrt(1+1) and sqrt(9+1):\n{two}"
+    );
+}
+
+// **Two fields sharing ONE latent are CORRELATED, so their joint is not the product of
+// their marginals.** For `y1, y2 ~ Normal(mu = z, sigma = 1)` over `z ~ Normal(0, 1)` each
+// marginal is `Normal(0, √2)`, but `Cov(y1, y2) = Var(z) = 1`, so the joint at
+// `(0.5, 0.7)` is `MvNormal([0, 0], [2 1; 1 2])` = -2.5171832107434002 while the product of
+// the marginals is -2.716024246969291 — off by 0.199 nats, conformance-passing, and the
+// worst failure class the determiniser has. §04 "Kernels and `kernelof`" works this exact
+// shape and makes the joint `kchain(prior, forward_kernel)`, never a product.
+//
+// This is the one shape where every PER-FIELD answer is right and the assembled product is
+// still wrong, which is why the check cannot live in the conjugate row: the row is asked for
+// y1's law and returns it correctly. `conjugate_marginal_measure` reports the latent it
+// integrated so the record path can see the collision.
+//
+// Both field orders, and with the latent still latent as well as pinned by a sibling query —
+// the refusal must not depend on which field the walk reaches first, nor on the provenance
+// path the marginal was built through.
+#[test]
+fn two_fields_sharing_one_latent_refuse_rather_than_emit_the_product() {
+    let model = "\
+z = draw(Normal(mu = 0.0, sigma = 1.0))
+y1 = draw(Normal(mu = z, sigma = 1.0))
+y2 = draw(Normal(mu = z, sigma = 1.0))
+";
+    for query in [
+        "lp = logdensityof(lawof(record(y1 = y1, y2 = y2)), record(y1 = 0.5, y2 = 0.7))",
+        "lp = logdensityof(lawof(record(y2 = y2, y1 = y1)), record(y2 = 0.7, y1 = 0.5))",
+        "lp_z = logdensityof(lawof(z), 0.3)\n\
+         lp = logdensityof(lawof(record(y1 = y1, y2 = y2)), record(y1 = 0.5, y2 = 0.7))",
+    ] {
+        let reason = refusal(&format!("{model}{query}"));
+        assert!(
+            reason.contains("marginalize over the SAME latent"),
+            "a correlated joint must refuse, not emit the product of marginals: {reason}"
+        );
+    }
+}
+
+// The `iid`/`joint` combinators over the SAME correlated shape correctly emit the product,
+// and must keep doing so: §06 defines `joint(M1, M2, …)` as the "independent product
+// measure" `(M1 ⊗ M2)(A × B) = M1(A) · M2(B)`, so `joint(a = lawof(y1), b = lawof(y2))` asks
+// for the product of the two marginals — a DIFFERENT measure from
+// `lawof(record(y1 = y1, y2 = y2))`, which is the law of the traced sub-DAG. The
+// shared-latent refusal above must therefore be sited in the record path, not in the row.
+#[test]
+fn joint_and_iid_over_a_shared_latent_are_products_by_definition() {
+    for src in [
+        "\
+z = draw(Normal(mu = 0.0, sigma = 1.0))
+y1 = draw(Normal(mu = z, sigma = 1.0))
+y2 = draw(Normal(mu = z, sigma = 1.0))
+lp = logdensityof(joint(a = lawof(y1), b = lawof(y2)), record(a = 0.5, b = 0.7))",
+        "\
+z = draw(Normal(mu = 0.0, sigma = 1.0))
+y1 = draw(Normal(mu = z, sigma = 1.0))
+lp = logdensityof(iid(lawof(y1), 2), [0.5, 0.7])",
+    ] {
+        let lp = pir_binding(&pir(src), "lp");
+        assert_eq!(
+            lp.matches("builtin_logdensityof").count(),
+            2,
+            "the independent product is two factors:\n{lp}"
+        );
+        assert_eq!(
+            lp.matches("(%field sigma 1.4142135623730951)").count(),
+            2,
+            "each factor is the marginal Normal(0, sqrt 2):\n{lp}"
+        );
+    }
 }
 
 // Refusal is the fallback, and each row's nearest non-conjugate neighbour must keep hitting

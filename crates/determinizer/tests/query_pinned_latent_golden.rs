@@ -160,14 +160,31 @@ z = draw(Normal(mu = 0.0, sigma = 1.0))
 y = draw(Normal(mu = z, sigma = 1.0))
 zs, s2 = rand(s, lawof(record(z = z)))
 lp_y = logdensityof(lawof(y), 0.5)";
-    let lp_y = pir_binding(&pir(src), "lp_y");
-    assert!(
-        lp_y.contains("(%field sigma 1.4142135623730951)"),
-        "the sampled latent is marginalized out:\n{lp_y}"
+    let text = pir(src);
+    let lp_y = pir_binding(&text, "lp_y");
+    assert_eq!(
+        lp_y.matches("builtin_logdensityof").count(),
+        1,
+        "the marginal is one density term:\n{lp_y}"
     );
     assert!(
-        !lp_y.contains("builtin_sample"),
-        "the marginal does not condition on the drawn realization:\n{lp_y}"
+        lp_y.contains("(%field mu 0.0)") && lp_y.contains("(%field sigma 1.4142135623730951)"),
+        "the sampled latent is marginalized out — prior mu, sqrt(2) sigma:\n{lp_y}"
+    );
+    // The discriminating half: y's law must carry NEITHER the realization (which the
+    // conditional would have as its `mu`) nor the likelihood's own sigma. `builtin_sample`
+    // alone is weak — the sample is bound elsewhere and could be reached by a ref.
+    assert!(
+        !lp_y.contains("(%field sigma 1.0)")
+            && !lp_y.contains("builtin_sample")
+            && !lp_y.contains("(%ref self "),
+        "the marginal does not condition on the drawn realization, by value or by ref:\n{lp_y}"
+    );
+    // The realization is still drawn for the `rand` query itself, so the assertion above is
+    // about y's law specifically, not about the module having no sample in it.
+    assert!(
+        text.contains("builtin_sample"),
+        "the rand query still samples z:\n{text}"
     );
 }
 

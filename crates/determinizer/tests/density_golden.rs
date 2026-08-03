@@ -1882,9 +1882,18 @@ z = draw(Normal(mu = 0.0, sigma = 1.0))
 y = draw(Normal(mu = z, sigma = 1.0))
 lp_y = logdensityof(lawof(y), 0.3)";
     let lp_y = pir_binding(&flatppl_flatpir::write(&determinize_src(latent)), "lp_y");
+    assert_eq!(
+        lp_y.matches("builtin_logdensityof").count(),
+        1,
+        "the marginal is one density term, not a product over the ancestor:\n{lp_y}"
+    );
     assert!(
-        lp_y.contains("(%field sigma 1.4142135623730951)"),
+        lp_y.contains("(%field mu 0.0)") && lp_y.contains("(%field sigma 1.4142135623730951)"),
         "the ancestor is integrated out — sqrt(σ0² + σ²) = sqrt(2):\n{lp_y}"
+    );
+    assert!(
+        !lp_y.contains("(%field sigma 1.0)") && !lp_y.contains("(%ref self z)"),
+        "not the CONDITIONAL: neither the likelihood's own sigma nor a residual ref to z:\n{lp_y}"
     );
 
     // Control: a fixed/parametric parameter needs no marginalization, and keeps its own

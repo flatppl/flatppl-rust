@@ -505,8 +505,21 @@ fn build_conjugate_marginal(
 // The implicit `lawof` spelling
 // ---------------------------------------------------------------------------
 
+/// A marginal this module built for the implicit spelling: the closed-form marginal
+/// distribution-constructor node, and the latent it integrated out.
+///
+/// The `latent` is not diagnostics. A caller building a PRODUCT of several marginals must
+/// know which latent each one integrated: two marginals over the SAME latent are not
+/// independent, and adding their log-densities is a wrong number
+/// ([`crate::density::marginalize_or_refuse_record_law`]).
+pub(crate) struct ImplicitMarginal {
+    pub measure: NodeId,
+    pub latent: Symbol,
+}
+
 /// The closed-form conjugate marginal of `likelihood` — a distribution constructor one
-/// of whose parameters is a latent of the model — as a distribution-constructor node.
+/// of whose parameters is a latent of the model — as a distribution-constructor node plus
+/// the latent it integrated out.
 ///
 /// This is the implicit spelling of the same integral [`lower_kchain_marginal`] does for
 /// an explicit `kchain`. §04 "Reification to measures" makes `lawof(y)` y's TOTAL law:
@@ -526,16 +539,23 @@ fn build_conjugate_marginal(
 /// (`z ~ Normal(mu = w, …)` with `w` latent) — the row's closed form integrates ONE
 /// prior. Both return `None` rather than a marginal that silently conditions on the
 /// ancestor it did not integrate.
+///
+/// **A marginal is correct only for the ONE variate it is the law of.** This returns a
+/// marginal, never a licence to multiply marginals together: the returned [`ImplicitMarginal`]
+/// carries the latent so a caller assembling a product can refuse when two of them share it.
 pub(crate) fn conjugate_marginal_measure(
     m: &mut Module,
     likelihood: NodeId,
     exempt: &[NodeId],
-) -> Option<Result<NodeId, RefuseError>> {
-    let (latent_sym, prior) = sole_named_ancestor(m, likelihood, exempt)?;
+) -> Option<Result<ImplicitMarginal, RefuseError>> {
+    let (latent, prior) = sole_named_ancestor(m, likelihood, exempt)?;
     if !measure_stochastic_ancestors(m, prior, &[]).is_empty() {
         return None;
     }
-    build_conjugate_marginal(m, prior, likelihood, latent_sym)
+    Some(
+        build_conjugate_marginal(m, prior, likelihood, latent)?
+            .map(|measure| ImplicitMarginal { measure, latent }),
+    )
 }
 
 /// The single named stochastic ancestor of `likelihood`, as `(symbol, prior)`. `None`

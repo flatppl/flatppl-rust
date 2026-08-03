@@ -1218,8 +1218,9 @@ fn marginalize_or_refuse_stochastic_law(
             Some("functionof") | Some("kernelof")
         );
     if is_measure_expr && measure_reaches_draw(m, resolved, &[]) {
+        // One variate, so no product to get wrong: the marginal's own latent is not needed.
         if let Some(marginal) = crate::marginal::conjugate_marginal_measure(m, resolved, &[]) {
-            return lower_measure_density(m, marginal?, v).map(Some);
+            return lower_measure_density(m, marginal?.measure, v).map(Some);
         }
         return Err(refuse(
             resolved,
@@ -1268,6 +1269,22 @@ fn marginalize_or_refuse_stochastic_law(
 /// fields, the chain-rule sibling pinning, and the latent pins all stay that function's,
 /// and several fields may marginalize at once. `Ok(None)` means no field needed it.
 ///
+/// **Only if the marginalized fields integrate DIFFERENT latents.** Marginalizing per
+/// field and summing the results is the density of the PRODUCT of the marginals, and that
+/// is the joint only when the fields are independent. Two fields over the same latent are
+/// not: for `y1, y2 ~ Normal(mu = z, sigma = 1)` over `z ~ Normal(0, 1)` the marginals are
+/// each `Normal(0, √2)` but `Cov(y1, y2) = Var(z) = 1`, so the joint is a correlated
+/// `MvNormal`, which §04's `kchain(prior, forward_kernel)` gives and no product of
+/// marginals does. Refuse. This is the one shape where every per-field answer is right and
+/// the assembled product is still wrong, so the check has to be here rather than in the
+/// row.
+///
+/// The `iid`/`joint` combinators over the same shape are NOT this case and correctly emit
+/// the product: §06 defines `joint(M1, M2, …)` as the "independent product measure"
+/// `(M1 ⊗ M2)(A × B) = M1(A) · M2(B)`, so `joint(a = lawof(y1), b = lawof(y2))` asks for
+/// the product of the two marginals. `lawof(record(y1 = y1, y2 = y2))` asks for the law of
+/// the traced sub-DAG, which is the correlated one.
+///
 /// A field that is a TRANSFORM of its draw (`b = y + z`) is refused rather than
 /// marginalized: its law is the pushforward of the marginal under that map, which is not
 /// what the table's row returns.
@@ -1290,6 +1307,7 @@ fn marginalize_or_refuse_record_law(
     }
     let siblings: Vec<NodeId> = fields.iter().map(|&(_, _, _, site)| site).collect();
     let mut marginals: Vec<(Symbol, NodeId)> = Vec::new();
+    let mut integrated: Vec<Symbol> = Vec::new();
     for &(name, measure, transform, _) in &fields {
         // The transform is walked as well as the measure: for `b = y + z` the outside
         // ancestor is in the MAP, which `build_forward_map` would read as a constant.
@@ -1303,7 +1321,21 @@ fn marginalize_or_refuse_record_law(
             crate::marginal::conjugate_marginal_measure(m, measure, &siblings)
         };
         match marginal {
-            Some(built) => marginals.push((name, built?)),
+            Some(built) => {
+                let built = built?;
+                if integrated.contains(&built.latent) {
+                    return Err(refuse(
+                        measure,
+                        m,
+                        "lawof of a record two of whose fields marginalize over the SAME latent \
+                         is a CORRELATED joint — the shared ancestor is the covariance, and \
+                         §04's kchain(prior, forward_kernel) is not a product of the fields' \
+                         marginals — refuse rather than emit the independent product",
+                    ));
+                }
+                integrated.push(built.latent);
+                marginals.push((name, built.measure));
+            }
             None => {
                 return Err(refuse(
                     measure,
@@ -1869,7 +1901,10 @@ fn lower_value_law(
             crate::marginal::conjugate_marginal_measure(m, measure, &[])
         };
         if let Some(built) = marginal {
-            let scored = built.and_then(|marginal| lower_measure_density(m, marginal, v));
+            // One variate, so no product to get wrong: the marginal's own latent is not
+            // needed. A caller that SUMS several marginals does need it — see
+            // [`marginalize_or_refuse_record_law`]'s shared-latent refusal.
+            let scored = built.and_then(|mg| lower_measure_density(m, mg.measure, v));
             // Pin as the ancestor-free path does: the marginal consumed this value's
             // `draw`, so the binding must not survive into the conformance check.
             if scored.is_ok() && origin == VariateOrigin::Point {

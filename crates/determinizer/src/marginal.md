@@ -159,6 +159,32 @@ arithmetic at all.
 No row applying is a refusal, never a licence to score the conditional. The refusals worth
 naming, each with a test:
 
+- **Two record fields marginalizing the SAME latent.** This one is different in kind from
+  the rest, and it is the only place where every per-row answer is right and the assembled
+  result is still wrong — so the row cannot catch it. For
+  `y1, y2 ~ Normal(mu = z, sigma = 1)` over `z ~ Normal(0, 1)`, each marginal is
+  `Normal(0, √2)` and each is correct, but the fields are **correlated** through the shared
+  ancestor: `Cov(y1, y2) = Var(z) = 1`. So
+
+  | | |
+  |---|---|
+  | truth at `(0.5, 0.7)` | `MvNormal([0,0], [2 1; 1 2])` = `-2.5171832107434002` |
+  | product of the marginals | `-2.716024246969291` |
+  | gap | `0.199` nats |
+
+  §04 *Kernels and `kernelof`* works this exact shape and makes the joint
+  `kchain(prior, forward_kernel)`, which is not a product of the fields' marginals for any
+  prior. `conjugate_marginal_measure` therefore returns the latent it integrated
+  (`ImplicitMarginal::latent`), and the record path refuses when two marginalized fields
+  report the same one. Two fields over DIFFERENT latents is a genuine product and lowers.
+
+  **`iid` and `joint` over the same model are NOT this case and correctly emit the
+  product.** §06 defines `joint(M1, M2, …)` as the "independent product measure"
+  `(M1 ⊗ M2)(A × B) = M1(A) · M2(B)`, so `joint(a = lawof(y1), b = lawof(y2))` asks for the
+  product of the two marginals — a different measure from `lawof(record(y1 = y1, y2 = y2))`,
+  which is the law of the traced sub-DAG. This is why the check is sited in the record path
+  rather than in the row or the combinator.
+
 - **The latent feeds a scale, not the mean.** `z ~ Normal(0, 2)`; `y ~ Normal(mu = 1, sigma = z)`
   is a Normal prior on a standard deviation. That is not the Normal–Normal (mean)
   conjugacy — no closed form here — and emitting Row 1's marginal for it would be the most
@@ -192,3 +218,7 @@ naming, each with a test:
    engines' gate.
 4. Add the refusal test for the nearest non-conjugate neighbour, so the row cannot widen
    silently.
+5. **Check what happens when two variates share the row's latent.** A correct marginal is
+   correct for ONE variate; summing two of them asserts independence the shared ancestor
+   denies. The record path already refuses on a repeated `ImplicitMarginal::latent`, so a new
+   row inherits that — but a new *caller* that assembles a product does not.
