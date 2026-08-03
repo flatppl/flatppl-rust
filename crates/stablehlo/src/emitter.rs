@@ -62,8 +62,9 @@ fn pos_inf_literal(dtype: Dtype) -> &'static str {
 /// on whichever of its two operands' kinds has the HIGHER rank (e.g. a
 /// `bool`-vs-`int` mismatch widens to `int`, an `int`-vs-`real` mismatch to
 /// `real`), never the other way — the embedding only ever goes "up" the
-/// inclusion chain.
-fn elem_rank(k: ElemKind) -> u8 {
+/// inclusion chain. `crate::ops` reads it too, to REFUSE a narrowing convert
+/// rather than emit one ([`ops::lower_fill`](crate::ops::lower_fill)).
+pub(crate) fn elem_rank(k: ElemKind) -> u8 {
     match k {
         ElemKind::Bool => 0,
         ElemKind::Int => 1,
@@ -475,6 +476,17 @@ impl<'m> Emitter<'m> {
     /// same discipline as [`Emitter::sin`].
     pub fn floor(&mut self, a: &Value) -> Value {
         self.unary_real("stablehlo.floor", a)
+    }
+    /// `stablehlo.round_nearest_even` — spec §07 `round`, "nearest integer,
+    /// half to even (IEEE 754 default)". StableHLO's other rounding op
+    /// (`round_nearest_afz`) breaks ties away from zero, so it is the wrong
+    /// one. The result stays in the FLOAT dtype (an f32/f64 holding an
+    /// integral value), never converted to an integer tensor: the
+    /// determiniser's discrete-pushforward gate wraps this in §07 `real`
+    /// precisely so the forward map is not re-evaluated in integer
+    /// arithmetic.
+    pub fn round_nearest_even(&mut self, a: &Value) -> Value {
+        self.unary_real("stablehlo.round_nearest_even", a)
     }
 
     /// `%N = stablehlo.compare {dir}, %a, %b : (lhs, rhs) -> i1-shape`.
@@ -959,6 +971,16 @@ impl<'m> Emitter<'m> {
         self.reduce_full("stablehlo.maximum", identity, a)
     }
 
+    /// Full reduction (all axes) to a scalar via repeated `stablehlo.minimum`
+    /// — spec §07 `minimum(xs)`, $\min_i x_i$. Mirror of
+    /// [`Emitter::reduce_max`]; its identity is `+inf`
+    /// ([`pos_inf_literal`], the sign-flipped counterpart of
+    /// [`reduce_max_identity`]).
+    pub fn reduce_min(&mut self, a: &Value) -> Value {
+        let identity = pos_inf_literal(self.dtype);
+        self.reduce_full("stablehlo.minimum", identity, a)
+    }
+
     /// Reduce ONLY the innermost (last) axis via `stablehlo.add`, leaving every
     /// outer axis intact: `[m, n] → [m]`, `[m, n, d] → [m, n]`, `[n] → Scalar`.
     /// Unlike [`Emitter::reduce_sum`] (which collapses EVERY axis to a scalar
@@ -1060,9 +1082,10 @@ impl<'m> Emitter<'m> {
         assert!(
             a.elem == ElemKind::Real || combine_op == "stablehlo.add",
             "reduce_axis: a non-Real reduction identity is only implemented for the \
-             additive (stablehlo.add) combine — reduce_max's dtype-exact -inf bit \
-             pattern is only ever reached via logsumexp, whose vector argument is \
-             always Real by construction"
+             additive (stablehlo.add) combine — the dtype-exact ±inf identities of \
+             reduce_max/reduce_min have no integer or boolean form, and their callers \
+             (logsumexp's term vector; ops::lower_extremum, which refuses a non-Real \
+             operand) only ever pass a Real operand"
         );
 
         let init_ssa = self.fresh();
@@ -2182,6 +2205,15 @@ impl<'m> Emitter<'m> {
         crate::types::mlir_type_of(self.m, id, self.dtype)
             .map(|(_, k)| k)
             .unwrap_or(ElemKind::Real)
+    }
+
+    /// The full [`crate::types::mlir_type_of`] result for `id`, propagating the
+    /// refusal rather than falling back like [`Emitter::node_kind`] — for a
+    /// caller that needs the node's inferred SHAPE and has no operand to read
+    /// it off instead (`ops::lower_fill`, whose `size` argument is the
+    /// determiniser's `lengthof(v)` rather than a literal).
+    pub(crate) fn node_ty(&self, id: NodeId) -> Result<(MlirTy, ElemKind), EmitError> {
+        crate::types::mlir_type_of(self.m, id, self.dtype)
     }
 
     /// Lower one FlatPDL node to a [`Value`], memoizing the result so a

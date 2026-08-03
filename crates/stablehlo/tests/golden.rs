@@ -1476,6 +1476,636 @@ fn lower_in_refuses_non_interval_set() {
     );
 }
 
+// ---- the determiniser's image/lattice gate vocabulary -------------------------
+//
+// `lower_pushfwd` gates a change of variables on the query point lying in the
+// forward map's image, and (over a discrete base) on its preimage snapping back
+// to the same atom. Both conditions are built from ops this map refused, so an
+// `in(y, posreals)` image — every `pushfwd(exp, M)` — refused at emission. The
+// tests below pin each newly-lowered op, and pin that the map stayed narrow.
+
+/// Bind `name` as a `func.func` argument of shape `ty` — the shape the mode
+/// builder gives a free query parameter, for a hand-built gate fragment.
+fn bind_arg(e: &mut Emitter, id: NodeId, ssa: &str, ty: MlirTy) {
+    e.bind(
+        id,
+        Value {
+            ssa: ssa.to_string(),
+            ty,
+            elem: ElemKind::Real,
+        },
+    );
+}
+
+/// §03 `posreals` is "$(0, +\infty]$, the positive reals including
+/// $+\infty$" — OPEN at zero, so membership is a STRICT `compare GT` against
+/// zero. One comparison, no interval product (there are no bounds to
+/// subtract).
+#[test]
+fn lower_in_posreals_compares_strictly_above_zero() {
+    let mut m = Module::new();
+    let v = local_ref(&mut m, "v");
+    let set = const_node(&mut m, "posreals");
+    let node = call(&mut m, "in", &[v, set]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    bind_arg(&mut e, v, "%arg0", MlirTy::Scalar);
+    let result = e.lower_node(node).unwrap();
+    let out = e.finish(
+        "f",
+        &[("%arg0".to_string(), MlirTy::Scalar, ElemKind::Real)],
+        &[&result],
+    );
+
+    assert!(out.contains("stablehlo.compare GT"), "in:\n{out}");
+    assert_eq!(out.matches("stablehlo.compare").count(), 1, "in:\n{out}");
+    assert!(!out.contains("stablehlo.subtract"), "in:\n{out}");
+    assert!(!out.contains("stablehlo.multiply"), "in:\n{out}");
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// §03 `nonnegreals` is "$[0, +\infty]$, the non-negative reals including
+/// $+\infty$" — CLOSED at zero, so membership is `compare GE`. The direction
+/// is NOT interchangeable with `posreals`': a `sqrt` image admits `0`, an
+/// `exp` image does not.
+#[test]
+fn lower_in_nonnegreals_compares_at_or_above_zero() {
+    let mut m = Module::new();
+    let v = local_ref(&mut m, "v");
+    let set = const_node(&mut m, "nonnegreals");
+    let node = call(&mut m, "in", &[v, set]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    bind_arg(&mut e, v, "%arg0", MlirTy::Scalar);
+    let result = e.lower_node(node).unwrap();
+    let out = e.finish(
+        "f",
+        &[("%arg0".to_string(), MlirTy::Scalar, ElemKind::Real)],
+        &[&result],
+    );
+
+    assert!(out.contains("stablehlo.compare GE"), "in:\n{out}");
+    assert!(!out.contains("stablehlo.compare GT"), "in:\n{out}");
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// §03 `cartpow(S, size)` is "the Cartesian power of `S` with shape `size`",
+/// so membership of a vector point holds when EVERY cell is in `S`: the
+/// per-cell `tensor<3xi1>` comparison is all-reduced (`stablehlo.and` combine,
+/// `true` identity) to the scalar `i1` the enclosing `ifelse`'s `select`
+/// needs.
+#[test]
+fn lower_in_cartpow_all_reduces_per_cell_membership() {
+    let mut m = Module::new();
+    let v = local_ref(&mut m, "v");
+    let elem = const_node(&mut m, "posreals");
+    let n = int(&mut m, 3);
+    let set = call(&mut m, "cartpow", &[elem, n]);
+    let node = call(&mut m, "in", &[v, set]);
+
+    let ty = MlirTy::Ranked(vec![Some(3)]);
+    let mut e = Emitter::new(&m, Dtype::F32);
+    bind_arg(&mut e, v, "%arg0", ty.clone());
+    let result = e.lower_node(node).unwrap();
+    assert_eq!(result.ty, MlirTy::Scalar, "the gate predicate is scalar");
+    let out = e.finish(
+        "f",
+        &[("%arg0".to_string(), ty, ElemKind::Real)],
+        &[&result],
+    );
+
+    assert!(
+        out.contains("-> tensor<3xi1>"),
+        "per-cell membership stays rank-1:\n{out}"
+    );
+    let reduce_line = out
+        .lines()
+        .find(|l| l.contains("stablehlo.reduce("))
+        .expect("missing all-reduce");
+    assert!(
+        reduce_line.contains("applies stablehlo.and")
+            && reduce_line.contains("(tensor<3xi1>, tensor<i1>) -> tensor<i1>"),
+        "cartpow membership all-reduces over i1:\n{reduce_line}"
+    );
+    assert!(out.contains("dense<true>"), "and-identity:\n{out}");
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// A literal `cartpow` power that disagrees with the point's own static length
+/// is a type error upstream — refused, rather than lowered against whichever
+/// of the two lengths happened to be read.
+#[test]
+fn lower_in_cartpow_refuses_length_mismatch() {
+    let mut m = Module::new();
+    let v = local_ref(&mut m, "v");
+    let elem = const_node(&mut m, "posreals");
+    let n = int(&mut m, 4);
+    let set = call(&mut m, "cartpow", &[elem, n]);
+    let node = call(&mut m, "in", &[v, set]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    bind_arg(&mut e, v, "%arg0", MlirTy::Ranked(vec![Some(3)]));
+    let err = e.lower_node(node).unwrap_err();
+    assert!(
+        err.msg.contains("cartpow(4)") && err.msg.contains("length 3"),
+        "unexpected message: {}",
+        err.msg
+    );
+}
+
+/// A `cartpow` membership needs a rank-1 point to reduce over — a scalar point
+/// refuses rather than reaching `reduce_all`'s rank assertion.
+#[test]
+fn lower_in_cartpow_refuses_scalar_point() {
+    let mut m = Module::new();
+    let v = local_ref(&mut m, "v");
+    let elem = const_node(&mut m, "nonnegreals");
+    let n = int(&mut m, 3);
+    let set = call(&mut m, "cartpow", &[elem, n]);
+    let node = call(&mut m, "in", &[v, set]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    bind_arg(&mut e, v, "%arg0", MlirTy::Scalar);
+    let err = e.lower_node(node).unwrap_err();
+    assert!(
+        err.msg.contains("cartpow") && err.msg.contains("rank-1"),
+        "unexpected message: {}",
+        err.msg
+    );
+}
+
+/// The gate emits no `unitinterval` membership, so `in` still refuses it —
+/// this stays the gate's vocabulary, not a general-purpose §03 set-membership
+/// lowering.
+#[test]
+fn lower_in_still_refuses_unitinterval() {
+    let mut m = Module::new();
+    let v = local_ref(&mut m, "v");
+    let set = const_node(&mut m, "unitinterval");
+    let node = call(&mut m, "in", &[v, set]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    bind_arg(&mut e, v, "%arg0", MlirTy::Scalar);
+    let err = e.lower_node(node).unwrap_err();
+    assert!(
+        err.msg.contains("posreals") && err.msg.contains("nonnegreals"),
+        "unexpected message: {}",
+        err.msg
+    );
+}
+
+/// §07 `gt`/`lt` ($a > b$ / $a < b$) — one `stablehlo.compare` each, in the
+/// matching direction. The open-image gate conjoins them
+/// (`lo < y && y < hi`), so a swapped direction would silently invert the
+/// gate.
+#[test]
+fn lower_gt_and_lt_emit_matching_compare_directions() {
+    for (head, dir) in [("gt", "GT"), ("lt", "LT")] {
+        let mut m = Module::new();
+        let a = local_ref(&mut m, "a");
+        let b = real(&mut m, 1.0);
+        let node = call(&mut m, head, &[a, b]);
+
+        let mut e = Emitter::new(&m, Dtype::F32);
+        bind_arg(&mut e, a, "%arg0", MlirTy::Scalar);
+        let result = e.lower_node(node).unwrap();
+        let out = e.finish(
+            "f",
+            &[("%arg0".to_string(), MlirTy::Scalar, ElemKind::Real)],
+            &[&result],
+        );
+        assert!(
+            out.contains(&format!("stablehlo.compare {dir}")),
+            "{head} must compare {dir}, in:\n{out}"
+        );
+        assert!(is_delimiter_balanced(&out));
+    }
+}
+
+/// §03 `pi` — the scalar constant, in the EXACT shape the open-image gate
+/// builds it: `lt(y, divide(pi, 2.0))`, `atan`'s upper endpoint
+/// (`determinizer::invert::half_pi`, a `Node::Const` under §07 `divide`). The
+/// literal is `f64`'s shortest round-trip text, which the MLIR parser rounds to
+/// the nearest f32 in an f32 module — the same treatment every other real
+/// literal gets (`dense<3.141592653589793>` already appears in a frozen f32
+/// golden).
+#[test]
+fn lower_pi_emits_the_constant_the_open_image_endpoint_needs() {
+    let mut m = Module::new();
+    let y = local_ref(&mut m, "y");
+    let pi = const_node(&mut m, "pi");
+    let two = real(&mut m, 2.0);
+    let half_pi = call(&mut m, "divide", &[pi, two]);
+    let node = call(&mut m, "lt", &[y, half_pi]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    bind_arg(&mut e, y, "%arg0", MlirTy::Scalar);
+    let result = e.lower_node(node).unwrap();
+    let out = e.finish(
+        "f",
+        &[("%arg0".to_string(), MlirTy::Scalar, ElemKind::Real)],
+        &[&result],
+    );
+
+    assert!(
+        out.contains("stablehlo.constant dense<3.141592653589793> : tensor<f32>"),
+        "in:\n{out}"
+    );
+    assert!(out.contains("stablehlo.divide"), "in:\n{out}");
+    assert!(out.contains("stablehlo.compare LT"), "in:\n{out}");
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// `pi` also lowers as a bare 0-arity CALL, not just as a `Node::Const` leaf —
+/// `lower_builtin` is the single source of truth for both spellings (as it
+/// already is for `inf`), so neither can drift.
+#[test]
+fn lower_pi_lowers_the_same_as_a_zero_arity_call() {
+    let mut m = Module::new();
+    let node = call(&mut m, "pi", &[]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    let result = e.lower_node(node).unwrap();
+    assert_eq!(result.ty, MlirTy::Scalar);
+    assert_eq!(result.elem, ElemKind::Real);
+    let out = e.finish("f", &[], &[&result]);
+    assert!(out.contains("dense<3.141592653589793>"), "in:\n{out}");
+}
+
+/// §07 `land` (`a && b`) — one `stablehlo.and` over two `i1` predicates. This
+/// is the op that joins the image and lattice conditions into ONE gate.
+#[test]
+fn lower_land_ands_two_predicates() {
+    let mut m = Module::new();
+    let v = local_ref(&mut m, "v");
+    let set = const_node(&mut m, "nonnegreals");
+    let image = call(&mut m, "in", &[v, set]);
+    let zero = real(&mut m, 0.0);
+    let lattice = call(&mut m, "gt", &[v, zero]);
+    let node = call(&mut m, "land", &[image, lattice]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    bind_arg(&mut e, v, "%arg0", MlirTy::Scalar);
+    let result = e.lower_node(node).unwrap();
+    let out = e.finish(
+        "f",
+        &[("%arg0".to_string(), MlirTy::Scalar, ElemKind::Real)],
+        &[&result],
+    );
+
+    assert_eq!(out.matches("stablehlo.compare").count(), 2, "in:\n{out}");
+    assert!(out.contains("stablehlo.and %"), "in:\n{out}");
+    assert!(
+        out.lines()
+            .any(|l| l.contains("stablehlo.and") && l.contains(": tensor<i1>")),
+        "the conjunction is over i1, not the float dtype:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// A `land` operand that is not a predicate-producing head refuses: a bare
+/// `Lit(Bool)` lowers as a float `constant`, which would make
+/// `stablehlo.and`'s declared `i1` type disagree with its operand.
+#[test]
+fn lower_land_refuses_a_non_predicate_operand() {
+    let mut m = Module::new();
+    let v = local_ref(&mut m, "v");
+    let set = const_node(&mut m, "posreals");
+    let image = call(&mut m, "in", &[v, set]);
+    let lit = m.alloc(Node::Lit(Scalar::Bool(true)));
+    let node = call(&mut m, "land", &[image, lit]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    bind_arg(&mut e, v, "%arg0", MlirTy::Scalar);
+    let err = e.lower_node(node).unwrap_err();
+    assert!(
+        err.msg.contains("land operand") && err.msg.contains("boolean predicate"),
+        "unexpected message: {}",
+        err.msg
+    );
+    assert_eq!(err.node, Some(lit));
+}
+
+/// `land` operands must share a shape — `Emitter::and` renders ONE type for
+/// both operands and the result, so a scalar/rank-1 pair would emit ill-typed
+/// text rather than broadcasting.
+#[test]
+fn lower_land_refuses_shape_mismatched_operands() {
+    let mut m = Module::new();
+    let s = local_ref(&mut m, "s");
+    let vec = local_ref(&mut m, "vec");
+    let pos = const_node(&mut m, "posreals");
+    let nonneg = const_node(&mut m, "nonnegreals");
+    let a = call(&mut m, "in", &[s, pos]);
+    let b = call(&mut m, "in", &[vec, nonneg]);
+    let node = call(&mut m, "land", &[a, b]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    bind_arg(&mut e, s, "%arg0", MlirTy::Scalar);
+    bind_arg(&mut e, vec, "%arg1", MlirTy::Ranked(vec![Some(3)]));
+    let err = e.lower_node(node).unwrap_err();
+    assert!(
+        err.msg.contains("land: operands must have the same shape"),
+        "unexpected message: {}",
+        err.msg
+    );
+}
+
+/// §07 `iszero` — `stablehlo.compare EQ` against zero. §07: "`iszero` checks
+/// that its argument is exactly zero, with no tolerance for numerical
+/// precision", and the lattice test relies on that exactness (an atom's image
+/// reproduces bit for bit), so NO epsilon constant may appear.
+#[test]
+fn lower_iszero_compares_eq_zero_with_no_epsilon() {
+    let mut m = Module::new();
+    let v = local_ref(&mut m, "v");
+    let back = real(&mut m, 2.0);
+    let diff = call(&mut m, "sub", &[v, back]);
+    let node = call(&mut m, "iszero", &[diff]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    bind_arg(&mut e, v, "%arg0", MlirTy::Scalar);
+    let result = e.lower_node(node).unwrap();
+    let out = e.finish(
+        "f",
+        &[("%arg0".to_string(), MlirTy::Scalar, ElemKind::Real)],
+        &[&result],
+    );
+
+    assert!(out.contains("stablehlo.compare EQ"), "in:\n{out}");
+    assert!(
+        !out.contains("stablehlo.abs"),
+        "an exact test needs no |·| tolerance form:\n{out}"
+    );
+    let constants: Vec<&str> = out
+        .lines()
+        .filter(|l| l.contains("stablehlo.constant"))
+        .collect();
+    assert!(
+        constants
+            .iter()
+            .all(|l| l.contains("dense<2.0>") || l.contains("dense<0.0>")),
+        "only the compared value and an exact zero may be materialised: {constants:?}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// §07 `round` is "nearest integer, half to even (IEEE 754 default)" — so
+/// `stablehlo.round_nearest_even`, never `round_nearest_afz` (ties away from
+/// zero) and never `floor`. The result stays in the float dtype: the
+/// determiniser wraps it in `real` precisely so the forward is not re-evaluated
+/// in integer arithmetic.
+#[test]
+fn lower_round_emits_round_nearest_even_in_the_float_dtype() {
+    let mut m = Module::new();
+    let v = local_ref(&mut m, "v");
+    let node = call(&mut m, "round", &[v]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    bind_arg(&mut e, v, "%arg0", MlirTy::Scalar);
+    let result = e.lower_node(node).unwrap();
+    assert_eq!(result.elem, ElemKind::Real);
+    let out = e.finish(
+        "f",
+        &[("%arg0".to_string(), MlirTy::Scalar, ElemKind::Real)],
+        &[&result],
+    );
+
+    assert!(
+        out.contains("stablehlo.round_nearest_even %arg0 : tensor<f32>"),
+        "in:\n{out}"
+    );
+    assert!(!out.contains("round_nearest_afz"), "in:\n{out}");
+    assert!(!out.contains("stablehlo.floor"), "in:\n{out}");
+    assert!(!out.contains("tensor<i32>"), "no integer form:\n{out}");
+}
+
+/// §07 `real` "returns `x` for real `x`" — value identity. Over an
+/// already-real operand it emits NOTHING at all: no rounding, no clamping, no
+/// convert.
+#[test]
+fn lower_real_is_value_identity_on_a_real_operand() {
+    let mut m = Module::new();
+    let v = local_ref(&mut m, "v");
+    let round = call(&mut m, "round", &[v]);
+    let node = call(&mut m, "real", &[round]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    bind_arg(&mut e, v, "%arg0", MlirTy::Scalar);
+    let result = e.lower_node(node).unwrap();
+    let out = e.finish(
+        "f",
+        &[("%arg0".to_string(), MlirTy::Scalar, ElemKind::Real)],
+        &[&result],
+    );
+
+    assert_eq!(
+        out.matches("stablehlo.round_nearest_even").count(),
+        1,
+        "in:\n{out}"
+    );
+    assert!(
+        !out.contains("stablehlo.convert"),
+        "real over a real operand emits nothing:\n{out}"
+    );
+}
+
+/// The one thing §07 `real` may emit is the §03 `integers ⊂ reals` embedding,
+/// when its operand really is integer-typed — exact, and decided from the
+/// operand's own lowered kind rather than from the op's name.
+#[test]
+fn lower_real_converts_an_integer_operand() {
+    let mut m = Module::new();
+    let k = int(&mut m, 3);
+    let node = call(&mut m, "real", &[k]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    let result = e.lower_node(node).unwrap();
+    assert_eq!(result.elem, ElemKind::Real);
+    let out = e.finish("f", &[], &[&result]);
+    assert!(
+        out.contains("stablehlo.convert") && out.contains("(tensor<i32>) -> tensor<f32>"),
+        "in:\n{out}"
+    );
+}
+
+/// §07 `maximum(xs)` / `minimum(xs)` — full reductions over a real array
+/// ($\max_i x_i$ / $\min_i x_i$), the vector open-image gate's extremes. Each
+/// reduces with its own combine and its own ∓inf identity.
+#[test]
+fn lower_maximum_and_minimum_reduce_with_dtype_exact_identities() {
+    for (head, combine, identity) in [
+        ("maximum", "stablehlo.maximum", "0xFF800000"),
+        ("minimum", "stablehlo.minimum", "0x7F800000"),
+    ] {
+        let mut m = Module::new();
+        let xs = local_ref(&mut m, "xs");
+        let node = call(&mut m, head, &[xs]);
+
+        let ty = MlirTy::Ranked(vec![Some(3)]);
+        let mut e = Emitter::new(&m, Dtype::F32);
+        bind_arg(&mut e, xs, "%arg0", ty.clone());
+        let result = e.lower_node(node).unwrap();
+        assert_eq!(result.ty, MlirTy::Scalar, "{head} reduces to a scalar");
+        let out = e.finish(
+            "f",
+            &[("%arg0".to_string(), ty, ElemKind::Real)],
+            &[&result],
+        );
+
+        assert!(
+            out.contains(&format!("applies {combine} across dimensions = [0]")),
+            "{head} in:\n{out}"
+        );
+        assert!(
+            out.contains(&format!("dense<{identity}>")),
+            "{head} needs the dtype-exact identity, in:\n{out}"
+        );
+        assert!(is_delimiter_balanced(&out));
+    }
+}
+
+/// §07 lists `maximum`/`minimum` under reductions over "real arrays"; §07's
+/// binary `max`/`min` are separate functions this map does not lower. A scalar
+/// operand refuses rather than silently reading as either.
+#[test]
+fn lower_maximum_refuses_a_scalar_operand() {
+    let mut m = Module::new();
+    let x = local_ref(&mut m, "x");
+    let node = call(&mut m, "maximum", &[x]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    bind_arg(&mut e, x, "%arg0", MlirTy::Scalar);
+    let err = e.lower_node(node).unwrap_err();
+    assert!(
+        err.msg.contains("must be an array"),
+        "unexpected message: {}",
+        err.msg
+    );
+}
+
+/// §07 `fill(x, size)` "creates an array of shape `size` filled with value
+/// `x`" — one `stablehlo.broadcast_in_dim` of the scalar. The shape comes from
+/// the node's own inferred type, since the determiniser spells `size` as
+/// `lengthof(v)`, which has no tensor form.
+#[test]
+fn lower_fill_broadcasts_the_scalar_to_the_inferred_shape() {
+    let mut m = Module::new();
+    let w = real(&mut m, 1.0);
+    let v = local_ref(&mut m, "v");
+    let size = call(&mut m, "lengthof", &[v]);
+    let node = call(&mut m, "fill", &[w, size]);
+    m.set_type(
+        node,
+        Type::Array {
+            shape: Box::new([Dim::Static(3)]),
+            elem: Box::new(Type::Scalar(ScalarType::Real)),
+        },
+    );
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    bind_arg(&mut e, v, "%arg0", MlirTy::Ranked(vec![Some(3)]));
+    let result = e.lower_node(node).unwrap();
+    assert_eq!(result.ty, MlirTy::Ranked(vec![Some(3)]));
+    let out = e.finish("f", &[], &[&result]);
+
+    assert!(
+        out.contains("stablehlo.broadcast_in_dim")
+            && out.contains("dims = [] : (tensor<f32>) -> tensor<3xf32>"),
+        "in:\n{out}"
+    );
+    // `lengthof` has no tensor form; `fill` reads its shape from the node's own
+    // inferred type instead, so the size argument is never lowered.
+    assert_eq!(
+        out.matches("stablehlo.").count(),
+        2,
+        "only the fill value's constant and one broadcast_in_dim:\n{out}"
+    );
+}
+
+/// A `fill` value whose kind outranks the array's element kind refuses rather
+/// than emitting a truncating `stablehlo.convert` — `Emitter::convert` is exact
+/// only going UP §03's `booleans ⊂ integers ⊂ reals` chain.
+#[test]
+fn lower_fill_refuses_a_narrowing_fill_value() {
+    let mut m = Module::new();
+    let w = real(&mut m, 1.5);
+    let n = int(&mut m, 3);
+    let node = call(&mut m, "fill", &[w, n]);
+    m.set_type(
+        node,
+        Type::Array {
+            shape: Box::new([Dim::Static(3)]),
+            elem: Box::new(Type::Scalar(ScalarType::Integer)),
+        },
+    );
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    let err = e.lower_node(node).unwrap_err();
+    assert!(
+        err.msg
+            .contains("narrowing it would not be value-preserving"),
+        "unexpected message: {}",
+        err.msg
+    );
+}
+
+/// A dynamically-shaped `fill` result refuses: `broadcast_in_dim`'s result
+/// shape is static text.
+#[test]
+fn lower_fill_refuses_a_dynamic_result_shape() {
+    let mut m = Module::new();
+    let w = real(&mut m, 1.0);
+    let n = int(&mut m, 3);
+    let node = call(&mut m, "fill", &[w, n]);
+    m.set_type(
+        node,
+        Type::Array {
+            shape: Box::new([Dim::Dynamic]),
+            elem: Box::new(Type::Scalar(ScalarType::Real)),
+        },
+    );
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    let err = e.lower_node(node).unwrap_err();
+    assert!(
+        err.msg.contains("statically-shaped"),
+        "unexpected message: {}",
+        err.msg
+    );
+}
+
+/// This wave widened the op map to the gate's vocabulary, not to §07 at large.
+/// Every op the gate does NOT emit still refuses through the catch-all — the
+/// pin that keeps `lower_builtin` narrow.
+#[test]
+fn lower_builtin_still_refuses_ops_the_gate_does_not_emit() {
+    // Adjacent to something newly lowered in each case: the other comparison
+    // directions and logical connectives, the binary extrema (vs the new
+    // reductions), the other roundings, the exact-equality pair, and the
+    // change-of-variables inverses an open-image `pushfwd` still needs.
+    for head in [
+        "le", "ge", "lor", "lnot", "lxor", "min", "max", "ceil", "isnan", "isfinite", "equal",
+        "unequal", "logit", "tan", "log1p", "atanh", "zeros", "ones",
+    ] {
+        let mut m = Module::new();
+        let a = real(&mut m, 1.0);
+        let b = real(&mut m, 2.0);
+        let node = call(&mut m, head, &[a, b]);
+
+        let mut e = Emitter::new(&m, Dtype::F32);
+        let err = match e.lower_node(node) {
+            Err(err) => err,
+            Ok(_) => panic!("'{head}' must still refuse"),
+        };
+        assert!(
+            err.msg.contains("unsupported builtin head"),
+            "'{head}' refused for the wrong reason: {}",
+            err.msg
+        );
+    }
+}
+
 /// `get0(v, 2)` on a length-5 rank-1 `v` slices out element 2 then reshapes
 /// the length-1 result down to a `Scalar`.
 #[test]
@@ -8762,4 +9392,101 @@ lp = logdensityof(lawof(record(a = a)), record(a = 0.5))\n";
             err.msg
         );
     }
+}
+
+// ---- the gate end to end ------------------------------------------------------
+//
+// Each `pushfwd` below refused at emission before this wave. They are the whole
+// justification for the gate: §06 `(f_*M)(Y) = M(f⁻¹(Y))` gives −∞ outside the
+// image, and ungated `f⁻¹` returns a finite number there instead.
+
+/// A DERIVED record field through a continuous base — `sigma = sqrt(sigma2)`,
+/// the shape every hierarchical model with a scale prior takes. The image gate
+/// is `sigma_v in nonnegreals` (§03 `[0, +inf]`, `sqrt`'s image), and the gated
+/// arm is built over the sanitised point.
+#[test]
+fn emit_logdensity_sqrt_derived_field_gates_on_nonnegreals() {
+    let src = "\
+sigma2 = draw(InverseGamma(shape = 5.0, scale = 5.0))
+sigma = sqrt(sigma2)
+sigma_v = elementof(posreals)
+lp = logdensityof(lawof(record(sigma = sigma)), record(sigma = sigma_v))
+inputs = (sigma_v)
+outputs = (lp)
+";
+    let d = determinize_src(src);
+    let out = emit_logdensity(&d);
+    assert!(is_delimiter_balanced(&out));
+    // `[0, +inf]` is CLOSED at zero, so `GE`.
+    assert!(out.contains("stablehlo.compare GE"), "in:\n{out}");
+    // The gate selects the sanitised point, and again the −∞ floor.
+    assert!(out.matches("stablehlo.select").count() >= 2, "in:\n{out}");
+    assert!(
+        out.contains("dense<0xFF800000>") || out.contains("stablehlo.negate"),
+        "the outside-image arm is −inf:\n{out}"
+    );
+}
+
+/// `pushfwd(exp, iid(Normal, 3))` over a VECTOR variate: the image is
+/// `cartpow(posreals, 3)`, which needs the per-cell comparison all-reduced, and
+/// the sanitisation witness is a `fill`. The brief's named never-emittable
+/// case ("`in(y, posreals)` already refused, so `pushfwd(exp, M)` was never
+/// emittable").
+#[test]
+fn emit_logdensity_vector_exp_pushfwd_gates_on_cartpow_posreals() {
+    let src = "\
+x = draw(iid(Normal(mu = 0.0, sigma = 1.0), 3))
+y = exp.(x)
+yv = elementof(cartpow(posreals, 3))
+lp = logdensityof(lawof(record(y = y)), record(y = yv))
+inputs = (yv)
+outputs = (lp)
+";
+    let d = determinize_src(src);
+    let out = emit_logdensity(&d);
+    assert!(is_delimiter_balanced(&out));
+    // `(0, +inf]` is OPEN at zero, so `GT`, per cell.
+    assert!(
+        out.contains("stablehlo.compare GT, %arg0")
+            && out.contains("(tensor<3xf32>, tensor<3xf32>) -> tensor<3xi1>"),
+        "in:\n{out}"
+    );
+    assert!(
+        out.contains("applies stablehlo.and across dimensions = [0]"),
+        "every cell must be in the image:\n{out}"
+    );
+    assert!(
+        out.contains("dims = [] : (tensor<f32>) -> tensor<3xf32>"),
+        "the `fill` witness broadcasts to the variate shape:\n{out}"
+    );
+}
+
+/// A DISCRETE base — `pushfwd(sqrt, Poisson)`. Both halves of the gate appear:
+/// the image membership AND the lattice round trip (§07 `round` under §07
+/// `real`, tested with §07 `iszero`), conjoined by §07 `land` into one
+/// `stablehlo.and`.
+#[test]
+fn emit_logdensity_discrete_pushfwd_gates_on_image_and_lattice() {
+    let src = "\
+k = draw(Poisson(rate = 3.0))
+r = sqrt(k)
+rv = elementof(nonnegreals)
+lp = logdensityof(lawof(record(r = r)), record(r = rv))
+inputs = (rv)
+outputs = (lp)
+";
+    let d = determinize_src(src);
+    let out = emit_logdensity(&d);
+    assert!(is_delimiter_balanced(&out));
+    assert!(out.contains("stablehlo.compare GE"), "image gate:\n{out}");
+    assert!(out.contains("stablehlo.compare EQ"), "lattice test:\n{out}");
+    assert!(
+        out.contains("stablehlo.round_nearest_even"),
+        "lattice snap:\n{out}"
+    );
+    let and_line = out
+        .lines()
+        .find(|l| l.contains("stablehlo.and"))
+        .expect("the two conditions must be ONE gate");
+    assert!(and_line.contains(": tensor<i1>"), "in:\n{and_line}");
 }

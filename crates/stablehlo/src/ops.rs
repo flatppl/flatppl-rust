@@ -10,6 +10,12 @@
 //! text itself, so every emitted op inherits that layer's assembly
 //! correctness.
 //!
+//! The map is deliberately narrow: it covers what the determiniser emits, and
+//! refuses anything else rather than guessing a lowering. `broadcast(f, …)`
+//! itself is handled one level up in [`Emitter::lower_broadcast`], which strips
+//! the wrapper and re-enters here with `f`'s own head — every op below that is
+//! elementwise therefore batches for free.
+//!
 //! A `builtin_*` primitive (`builtin_logdensityof`, `builtin_sample`,
 //! `builtin_touniform`, `builtin_fromuniform`, `builtin_tonormal`,
 //! `builtin_fromnormal`) or a bare distribution constructor name (`Normal`,
@@ -23,7 +29,7 @@
 
 use flatppl_core::{CallHead, Node, NodeId, Scalar};
 
-use crate::emitter::Emitter;
+use crate::emitter::{Emitter, elem_rank};
 use crate::mlir::{ElemKind, MlirTy, Value};
 use crate::refuse::EmitError;
 
@@ -61,14 +67,31 @@ pub(crate) fn lower_builtin(
         "abs" => unary(e, id, args, Emitter::abs),
         "cos" => unary(e, id, args, Emitter::cos),
         "invlogit" => unary(e, id, args, Emitter::invlogit),
+        // §07 `round` ("nearest integer, half to even") and §07 `real`
+        // ("returns `x` for real `x`") — the pair the determiniser's
+        // discrete-pushforward lattice snap emits, `real(round(x))`.
+        "round" => unary(e, id, args, Emitter::round_nearest_even),
+        "real" => lower_real(e, id, args),
         "ifelse" => lower_ifelse(e, id, args),
         "inf" => lower_inf(e, id, args),
+        "pi" => lower_pi(e, id, args),
         "logsumexp" => lower_logsumexp(e, id, args),
         "vector" => lower_vector(e, id, args),
         "sum" => unary(e, id, args, Emitter::reduce_sum),
+        // §07 reductions `maximum`/`minimum` ($\max_i x_i$ / $\min_i x_i$ over
+        // a real array) — NOT §07's binary `max`/`min`, which this map does not
+        // lower.
+        "maximum" => lower_extremum(e, id, args, Extremum::Max),
+        "minimum" => lower_extremum(e, id, args, Extremum::Min),
+        "fill" => lower_fill(e, id, args),
         "get0" => lower_get(e, id, args, 0),
         "get" => lower_get(e, id, args, 1),
         "in" => lower_in(e, id, args),
+        // §07 comparison functions `lt`/`gt` ($a < b$ / $a > b$ over `reals`).
+        "lt" => lower_compare(e, id, args, "LT"),
+        "gt" => lower_compare(e, id, args, "GT"),
+        "land" => lower_land(e, id, args),
+        "iszero" => lower_iszero(e, id, args),
         // `record(...)` is not a tensor — handled structurally by the mode
         // builder (a record-typed model input's fields become separate
         // tensor args), never reached here in a well-formed lowering.
@@ -115,28 +138,31 @@ fn binary<'m>(
 
 fn lower_ifelse(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
     let [c, a, b] = args_exact(id, args)?;
-    require_predicate_head(e, c)?;
+    require_predicate_head(e, c, "ifelse condition")?;
     let c = e.lower_node(c)?;
     let a = e.lower_node(a)?;
     let b = e.lower_node(b)?;
     Ok(e.select(&c, &a, &b))
 }
 
-/// `ifelse`'s condition must be a predicate-producing builtin call (`in`, or
-/// a future `compare`) — [`Emitter::select`] unconditionally renders its
-/// predicate operand as `i1`, so handing it any other node (e.g. a bare
+/// The predicate-producing builtin heads this map lowers to an `i1` value.
+/// [`Emitter::select`] and [`Emitter::and`] unconditionally render their
+/// predicate operands as `i1`, so handing either any other node (e.g. a bare
 /// `Lit(Bool)`, which lowers as a plain `tensor<f32>` `dense<1.0>` via
-/// `constant`) would make `select`'s declared `i1` operand disagree with
-/// `c`'s actual emitted type, producing ill-typed StableHLO. Same
-/// narrow-and-refuse discipline as `get`/`get0`'s literal-selector check:
-/// checked structurally against the *unlowered* condition node, before
-/// `lower_node` ever runs on it.
-fn require_predicate_head(e: &Emitter, cond: NodeId) -> Result<(), EmitError> {
+/// `constant`) would make the declared `i1` operand disagree with the actual
+/// emitted type, producing ill-typed StableHLO.
+const PREDICATE_HEADS: &[&str] = &["in", "compare", "lt", "gt", "land", "iszero"];
+
+/// An `ifelse` condition / `land` operand must be one of
+/// [`PREDICATE_HEADS`]. Same narrow-and-refuse discipline as `get`/`get0`'s
+/// literal-selector check: checked structurally against the *unlowered* node,
+/// before `lower_node` ever runs on it.
+fn require_predicate_head(e: &Emitter, cond: NodeId, what: &str) -> Result<(), EmitError> {
     let is_predicate = matches!(
         e.node(cond),
         Node::Call(c) if matches!(
             c.head,
-            CallHead::Builtin(sym) if matches!(e.resolve(sym), "in" | "compare")
+            CallHead::Builtin(sym) if PREDICATE_HEADS.contains(&e.resolve(sym))
         )
     );
     if is_predicate {
@@ -144,14 +170,190 @@ fn require_predicate_head(e: &Emitter, cond: NodeId) -> Result<(), EmitError> {
     } else {
         Err(EmitError::at(
             cond,
-            "ifelse condition must be a boolean predicate (in/compare)",
+            format!(
+                "{what} must be a boolean predicate ({})",
+                PREDICATE_HEADS.join("/")
+            ),
         ))
     }
+}
+
+// ---- comparisons and logic ----------------------------------------------------
+
+/// §07 `lt`/`gt` — one `stablehlo.compare` in direction `dir`. Operand shape
+/// and elem-kind reconciliation is [`Emitter::compare`]'s.
+fn lower_compare(
+    e: &mut Emitter,
+    id: NodeId,
+    args: &[NodeId],
+    dir: &str,
+) -> Result<Value, EmitError> {
+    let [a, b] = args_exact(id, args)?;
+    let a = e.lower_node(a)?;
+    let b = e.lower_node(b)?;
+    Ok(e.compare(dir, &a, &b))
+}
+
+/// §07 `land` (`a && b`, over `booleans`) — `stablehlo.and` over two `i1`
+/// predicates. Both operands must be [`PREDICATE_HEADS`] calls, and must share
+/// a shape: [`Emitter::and`] renders ONE type for both operands and the result,
+/// so a mismatched pair would emit ill-typed text.
+fn lower_land(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
+    let [a_id, b_id] = args_exact(id, args)?;
+    require_predicate_head(e, a_id, "land operand")?;
+    require_predicate_head(e, b_id, "land operand")?;
+    let a = e.lower_node(a_id)?;
+    let b = e.lower_node(b_id)?;
+    if a.ty != b.ty {
+        return Err(EmitError::at(
+            id,
+            format!(
+                "land: operands must have the same shape, got {:?} and {:?}",
+                a.ty, b.ty
+            ),
+        ));
+    }
+    Ok(e.and(&a, &b))
+}
+
+/// §07 `iszero` — `stablehlo.compare EQ` against zero. §07: "`iszero` checks
+/// that its argument is exactly zero, with no tolerance for numerical
+/// precision", so NO epsilon is introduced. An `Int` operand is widened to the
+/// float dtype by [`Emitter::compare`]'s own kind reconciliation, which is
+/// exact (§03 `integers ⊂ reals`) and so preserves exactness.
+fn lower_iszero(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
+    let [a] = args_exact(id, args)?;
+    let a = e.lower_node(a)?;
+    let zero = e.constant(0.0, a.ty.clone());
+    Ok(e.compare("EQ", &a, &zero))
+}
+
+// ---- real / extrema / fill -----------------------------------------------------
+
+/// §07 `real` — "returns `x` for real `x`". Value identity: NO rounding,
+/// clamping or truncation. The one thing it may emit is the §03
+/// `booleans ⊂ integers ⊂ reals` embedding when the operand really is
+/// integer-typed, which is exact; [`Emitter::convert`] emits nothing at all
+/// for an already-real operand. The decision is made on the operand's own
+/// lowered kind, not on the node's name — the determiniser wraps `round` in
+/// `real` precisely to stop `exp(round(x))` from typing as `integers` and
+/// being evaluated in integer arithmetic.
+///
+/// A `Complex` operand (where §07 gives $\mathrm{Re}(x)$) has no tensor form
+/// at all and is refused upstream in `crate::types`.
+fn lower_real(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
+    let [a] = args_exact(id, args)?;
+    let a = e.lower_node(a)?;
+    Ok(e.convert(&a, ElemKind::Real))
+}
+
+#[derive(Clone, Copy)]
+enum Extremum {
+    Max,
+    Min,
+}
+
+/// §07 `maximum(xs)` / `minimum(xs)` — a full reduction over a real ARRAY
+/// ($\max_i x_i$ / $\min_i x_i$). A scalar operand is refused rather than
+/// silently returned: §07 lists these under reductions with domain "real
+/// arrays", and the binary §07 `max`/`min` are different functions this map
+/// does not lower. A non-`Real` operand is refused too — the ±inf reduction
+/// identity has no integer or boolean form (see [`Emitter::reduce_min`]).
+fn lower_extremum(
+    e: &mut Emitter,
+    id: NodeId,
+    args: &[NodeId],
+    which: Extremum,
+) -> Result<Value, EmitError> {
+    let [xs] = args_exact(id, args)?;
+    let xs = e.lower_node(xs)?;
+    if !matches!(xs.ty, MlirTy::Ranked(_)) {
+        return Err(EmitError::at(
+            id,
+            format!(
+                "maximum/minimum: operand must be an array, got {:?} (the binary \
+                 max/min are separate functions with no lowering here)",
+                xs.ty
+            ),
+        ));
+    }
+    if xs.elem != ElemKind::Real {
+        return Err(EmitError::at(
+            id,
+            format!(
+                "maximum/minimum: only a real array is supported, got {:?}",
+                xs.elem
+            ),
+        ));
+    }
+    Ok(match which {
+        Extremum::Max => e.reduce_max(&xs),
+        Extremum::Min => e.reduce_min(&xs),
+    })
+}
+
+/// §07 `fill(x, size)` — "creates an array of shape `size` filled with value
+/// `x`", one `stablehlo.broadcast_in_dim` of the scalar `x`.
+///
+/// The result shape is read off `id`'s OWN inferred type, not by lowering
+/// `size`: the determiniser spells the size as `lengthof(v)`, which has no
+/// tensor form, while inference has already resolved the result shape. A
+/// dynamic (`?`) axis is refused — `broadcast_in_dim`'s result shape must be
+/// static text.
+///
+/// A fill value whose kind OUTRANKS the array's element kind is refused too.
+/// [`Emitter::convert`] is documented as numerically exact for every embedding
+/// this emitter performs, which holds only going UP §03's
+/// `booleans ⊂ integers ⊂ reals` chain; a real value into an integer array
+/// would truncate toward zero. Inference should reject that mismatch upstream,
+/// so this is the same narrow-and-refuse guard the other ops here use, not a
+/// reachable case.
+fn lower_fill(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
+    let [x_id, _size] = args_exact(id, args)?;
+    let (ty, kind) = e.node_ty(id)?;
+    match &ty {
+        MlirTy::Ranked(dims) if dims.iter().all(Option::is_some) => {}
+        other => {
+            return Err(EmitError::at(
+                id,
+                format!("fill: result must be a statically-shaped array, got {other:?}"),
+            ));
+        }
+    }
+    let x = e.lower_node(x_id)?;
+    if x.ty != MlirTy::Scalar {
+        return Err(EmitError::at(
+            id,
+            format!("fill: fill value must be a scalar, got {:?}", x.ty),
+        ));
+    }
+    if elem_rank(x.elem) > elem_rank(kind) {
+        return Err(EmitError::at(
+            id,
+            format!(
+                "fill: fill value is {:?} but the array element type is {kind:?}; \
+                 narrowing it would not be value-preserving",
+                x.elem
+            ),
+        ));
+    }
+    let x = e.convert(&x, kind);
+    Ok(e.broadcast_in_dim(&x, &[], ty))
 }
 
 fn lower_inf(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
     args_exact::<0>(id, args)?;
     Ok(e.inf(MlirTy::Scalar))
+}
+
+/// §03 `pi` — "the mathematical constant $\pi$". Gate vocabulary: `atan`'s
+/// image endpoint is `pi / 2` (`crate`-external, `determinizer::invert`).
+/// `f64`'s `Display` is shortest-round-trip, so the emitted decimal literal
+/// recovers the `f64` value exactly and the nearest `f32` to it at `Dtype::F32`
+/// — the same rounding every other real literal in an f32 module takes.
+fn lower_pi(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
+    args_exact::<0>(id, args)?;
+    Ok(e.scalar(std::f64::consts::PI))
 }
 
 // ---- logsumexp ---------------------------------------------------------------
@@ -368,43 +570,139 @@ fn literal_index(e: &Emitter, id: NodeId, index: NodeId) -> Result<i64, EmitErro
 
 // ---- in (interval membership) ------------------------------------------------
 
-/// `in(v, S)` (spec §06 membership predicate `_ in R`): only `S =
-/// interval(lo, hi)` is supported — refuses any other set expression (e.g.
-/// the bare constants `reals`/`posreals`, or a `cartprod`). Lowers to a
-/// single `compare`, not an explicit AND of two bound checks: `MlirTy` has
-/// no boolean variant to combine (see `emitter.rs`'s module doc comment), so
-/// ANDing two comparisons would need a boolean-AND op this emitter doesn't
-/// have. Instead uses the closed-interval algebraic identity `v ∈ [lo, hi]
-/// ⟺ (v - lo) · (hi - v) ≥ 0` (zero, i.e. included, exactly at either
-/// boundary; negative outside it, for `lo ≤ hi`) to reduce membership to one
-/// comparison.
-fn lower_in(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
-    let [v_id, set_id] = args_exact(id, args)?;
-    let (lo_id, hi_id) = interval_bounds(e, id, set_id)?;
-
-    let v = e.lower_node(v_id)?;
-    let lo = e.lower_node(lo_id)?;
-    let hi = e.lower_node(hi_id)?;
-    let lo = broadcast_to(e, id, &lo, &v.ty)?;
-    let hi = broadcast_to(e, id, &hi, &v.ty)?;
-
-    let below = e.sub(&v, &lo);
-    let above = e.sub(&hi, &v);
-    let product = e.mul(&below, &above);
-    let zero = e.constant(0.0, v.ty.clone());
-    Ok(e.compare("GE", &product, &zero))
+/// The §03 element sets `in(v, S)` lowers a membership test for. Every other
+/// set expression refuses.
+#[derive(Clone, Copy)]
+enum ElemSet {
+    /// §03 `interval(lo, hi)` — "denotes the closed interval $[lo, hi]$".
+    Interval(NodeId, NodeId),
+    /// §03 `posreals` — "$(0, +\infty]$, the positive reals including
+    /// $+\infty$". OPEN at zero.
+    PosReals,
+    /// §03 `nonnegreals` — "$[0, +\infty]$, the non-negative reals including
+    /// $+\infty$". CLOSED at zero.
+    NonNegReals,
 }
 
-/// Destructure `S = interval(lo, hi)`, refusing any other set expression.
-fn interval_bounds(e: &Emitter, id: NodeId, set_id: NodeId) -> Result<(NodeId, NodeId), EmitError> {
-    let refuse = || EmitError::at(id, "'in': only an interval(lo, hi) set is supported");
+/// `in(v, S)` (spec §06 membership predicate `_ in R`) over a §03 element set,
+/// or over `cartpow(S, n)` of one for a vector variate.
+///
+/// A supported `S` is [`ElemSet`]: `interval(lo, hi)`, `posreals`,
+/// `nonnegreals`. Every other set expression (`reals`, `unitinterval`,
+/// `integers`, a `cartprod`, a `stdsimplex`) refuses rather than lowering an
+/// approximation — the determiniser's image gates emit only these.
+fn lower_in(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
+    let [v_id, set_id] = args_exact(id, args)?;
+    let v = e.lower_node(v_id)?;
+
+    // §03 `cartpow(S, size)`: "the Cartesian power of `S` with shape `size`" —
+    // membership holds when EVERY cell is in `S`, so the per-cell predicate is
+    // all-reduced to the scalar `i1` the enclosing `ifelse` needs.
+    if let Some((elem_id, n_id)) = cartpow_parts(e, set_id) {
+        let dims = match &v.ty {
+            MlirTy::Ranked(dims) if dims.len() == 1 => dims.clone(),
+            other => {
+                return Err(EmitError::at(
+                    id,
+                    format!(
+                        "'in' over cartpow: only a rank-1 (vector) point is supported, got {other:?}"
+                    ),
+                ));
+            }
+        };
+        // A literal power that disagrees with the point's own static length is a
+        // type error upstream, not something to lower against one of the two.
+        if let (Node::Lit(Scalar::Int(n)), Some(len)) = (e.node(n_id), dims[0]) {
+            if *n < 0 || (*n as u64) != len {
+                return Err(EmitError::at(
+                    id,
+                    format!("'in' over cartpow({n}): point has length {len}"),
+                ));
+            }
+        }
+        let set = classify_elem_set(e, id, elem_id)?;
+        let per_cell = elem_membership(e, id, &v, set)?;
+        return Ok(e.reduce_all(&per_cell));
+    }
+
+    let set = classify_elem_set(e, id, set_id)?;
+    elem_membership(e, id, &v, set)
+}
+
+/// The membership predicate for one [`ElemSet`], elementwise at `v`'s shape.
+///
+/// `interval(lo, hi)` lowers to a SINGLE `compare` via the closed-interval
+/// algebraic identity `v ∈ [lo, hi] ⟺ (v - lo) · (hi - v) ≥ 0` (zero, i.e.
+/// included, exactly at either boundary; negative outside it, for `lo ≤ hi`).
+///
+/// `posreals`/`nonnegreals` lower to one comparison against zero, and the
+/// DIRECTION is not interchangeable: §03 makes `posreals` $(0, +\infty]$ (open
+/// at zero, so `GT`) and `nonnegreals` $[0, +\infty]$ (closed, so `GE`). Both
+/// admit `+inf` (§03 "Note on infinities"), which both directions already
+/// accept; `NaN` compares false in either, i.e. is outside the set.
+fn elem_membership(
+    e: &mut Emitter,
+    id: NodeId,
+    v: &Value,
+    set: ElemSet,
+) -> Result<Value, EmitError> {
+    match set {
+        ElemSet::PosReals => {
+            let zero = e.constant(0.0, v.ty.clone());
+            Ok(e.compare("GT", v, &zero))
+        }
+        ElemSet::NonNegReals => {
+            let zero = e.constant(0.0, v.ty.clone());
+            Ok(e.compare("GE", v, &zero))
+        }
+        ElemSet::Interval(lo_id, hi_id) => {
+            let lo = e.lower_node(lo_id)?;
+            let hi = e.lower_node(hi_id)?;
+            let lo = broadcast_to(e, id, &lo, &v.ty)?;
+            let hi = broadcast_to(e, id, &hi, &v.ty)?;
+            let below = e.sub(v, &lo);
+            let above = e.sub(&hi, v);
+            let product = e.mul(&below, &above);
+            let zero = e.constant(0.0, v.ty.clone());
+            Ok(e.compare("GE", &product, &zero))
+        }
+    }
+}
+
+/// Classify `S` as an [`ElemSet`], refusing any other set expression.
+fn classify_elem_set(e: &Emitter, id: NodeId, set_id: NodeId) -> Result<ElemSet, EmitError> {
+    let refuse = || {
+        EmitError::at(
+            id,
+            "'in': only an interval(lo, hi), posreals or nonnegreals set is supported \
+             (optionally under one cartpow)",
+        )
+    };
     match e.node(set_id) {
+        Node::Const(sym) => match e.resolve(*sym) {
+            "posreals" => Ok(ElemSet::PosReals),
+            "nonnegreals" => Ok(ElemSet::NonNegReals),
+            _ => Err(refuse()),
+        },
         Node::Call(c) => match c.head {
             CallHead::Builtin(sym) if e.resolve(sym) == "interval" => args_exact::<2>(id, &c.args)
-                .map(|[lo, hi]| (lo, hi))
+                .map(|[lo, hi]| ElemSet::Interval(lo, hi))
                 .map_err(|_| refuse()),
             _ => Err(refuse()),
         },
         _ => Err(refuse()),
+    }
+}
+
+/// Destructure `cartpow(S, n)` into `(S, n)`; `None` for anything else.
+fn cartpow_parts(e: &Emitter, set_id: NodeId) -> Option<(NodeId, NodeId)> {
+    match e.node(set_id) {
+        Node::Call(c) => match c.head {
+            CallHead::Builtin(sym) if e.resolve(sym) == "cartpow" && c.args.len() == 2 => {
+                Some((c.args[0], c.args[1]))
+            }
+            _ => None,
+        },
+        _ => None,
     }
 }
