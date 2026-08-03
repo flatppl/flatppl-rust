@@ -3084,9 +3084,11 @@ fn refuse_unproven_reference(node: NodeId, m: &Module) -> RefuseError {
 ///
 /// [`build_user_call`] emits `(%call callee point)`, and a `CallHead::User` that
 /// survives to exit is neither a deterministic op nor a `builtin_*` primitive, so it
-/// is not FlatPDL — while `is_flatpdl` is phase/type-based and does not flag the
-/// shape (`canon::inline`'s module header records exactly this blind spot). Two
-/// forms resolve, and this admits exactly those two:
+/// is not FlatPDL. `is_flatpdl` rejects the shape at exit
+/// (`NonConformKind::ResidualUserCall`), so the residual refuses either way; this
+/// check earns its place by naming WHICH map failed to bind against WHICH point,
+/// where the gate reports a generic residual. Two forms resolve, and this admits
+/// exactly those two:
 ///
 /// * a **bare builtin** callee — directly a [`Node::Const`], or a `(%ref self f)`
 ///   whose binding is one (`f = log`), which `canon::fold`'s alias resolution
@@ -3099,9 +3101,9 @@ fn refuse_unproven_reference(node: NodeId, m: &Module) -> RefuseError {
 ///   [`crate::kernel::reduce_kernel_application`].
 ///
 /// Anything else refuses. Reducing HERE rather than leaving it to
-/// `canon::inline`'s later sweep is what makes a refusal possible at all: that pass
-/// leaves a call it cannot reduce in place by design, so the residual would reach
-/// exit 0 silently. The shape this actually catches is a map applied to a variate it
+/// `canon::inline`'s later sweep is what keeps the refusal SPECIFIC: that pass
+/// leaves a call it cannot reduce in place by design, and the exit gate then
+/// refuses it generically. The shape this actually catches is a map applied to a variate it
 /// cannot bind against — a record-valued variate scored against a scalar-domain law,
 /// where the splat has no field to match the map's parameter.
 fn apply_change_of_variables(

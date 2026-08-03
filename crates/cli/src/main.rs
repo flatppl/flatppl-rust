@@ -158,7 +158,8 @@ enum Command {
     Determinize {
         /// Input FlatPPL file.
         input: PathBuf,
-        /// Output file (`.flatppl`); stdout if omitted.
+        /// Output file (`.flatppl`, or `.flatpir` with `--emit flatpir`);
+        /// stdout if omitted.
         #[arg(short, long)]
         output: Option<PathBuf>,
         /// Requested-output binding name to keep (repeatable). Bindings not
@@ -166,6 +167,10 @@ enum Command {
         /// bindings are kept (backward-compatible).
         #[arg(long = "keep")]
         keep: Vec<String>,
+        /// Output form: canonical FlatPPL surface syntax, or FlatPIR
+        /// S-expressions.
+        #[arg(long, value_enum, default_value_t = EmitForm::Flatppl)]
+        emit: EmitForm,
     },
     /// Emit textual StableHLO for a FlatPPL model.
     ///
@@ -229,6 +234,21 @@ impl From<InferLevel> for flatppl_infer::Level {
     }
 }
 
+/// Output form selector for `determinize --emit`.
+///
+/// The surface printer spells a builtin call and a user call the same way —
+/// `f(x)` either way — so surface syntax alone cannot show an external gate
+/// whether a determinised module carries a residual user call. FlatPIR (§11)
+/// keeps the head distinction (`(%call …)` for a user application), so it can.
+#[cfg(feature = "determinize")]
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum EmitForm {
+    /// Canonical FlatPPL surface syntax (the default).
+    Flatppl,
+    /// FlatPIR S-expressions.
+    Flatpir,
+}
+
 /// Input format selector for `--from`.
 #[cfg(feature = "convert")]
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -288,7 +308,8 @@ fn main() -> ExitCode {
             input,
             output,
             keep,
-        } => determinize_cmd(&input, output.as_deref(), &keep),
+            emit,
+        } => determinize_cmd(&input, output.as_deref(), &keep, emit),
         #[cfg(feature = "stablehlo")]
         Command::Stablehlo {
             input,
@@ -562,15 +583,21 @@ fn load_and_infer(
     Ok((module, bundle))
 }
 
-/// `flatppl determinize <in.flatppl> [-o out] [--keep name]…` — legalize a
-/// FlatPPL model to the deterministic FlatPDL profile (eliminate the measure
-/// layer), printing canonical FlatPPL syntax to `output`/stdout. With one or
+/// `flatppl determinize <in.flatppl> [-o out] [--keep name]… [--emit form]` —
+/// legalize a FlatPPL model to the deterministic FlatPDL profile (eliminate the
+/// measure layer), printing to `output`/stdout in `emit`'s form (canonical
+/// FlatPPL syntax by default, FlatPIR with `--emit flatpir`). With one or
 /// more `--keep <name>`, only bindings reachable from those requested-output
 /// roots survive (root-based DCE, Buffy #263 Pass 4-A); with none, every
 /// binding is kept (unchanged behavior). Refuses (exit 3, via
 /// `Failure::Refuse`) any construct the determiniser cannot legalize.
 #[cfg(feature = "determinize")]
-fn determinize_cmd(input: &Path, output: Option<&Path>, keep: &[String]) -> Result<(), Failure> {
+fn determinize_cmd(
+    input: &Path,
+    output: Option<&Path>,
+    keep: &[String],
+    emit: EmitForm,
+) -> Result<(), Failure> {
     let (mut module, bundle) = load_and_infer(input)?;
     let syms: Vec<flatppl_core::Symbol> = keep.iter().map(|name| module.intern(name)).collect();
     let roots = if syms.is_empty() {
@@ -585,7 +612,10 @@ fn determinize_cmd(input: &Path, output: Option<&Path>, keep: &[String]) -> Resu
                 e.construct, e.node, e.reason
             ))
         })?;
-    let rendered = flatppl_syntax::print(&lowered);
+    let rendered = match emit {
+        EmitForm::Flatppl => flatppl_syntax::print(&lowered),
+        EmitForm::Flatpir => flatppl_flatpir::write(&lowered),
+    };
     match output {
         Some(path) => fs::write(path, rendered)
             .map_err(|e| Failure::Plain(format!("writing `{}`: {e}", path.display())))?,

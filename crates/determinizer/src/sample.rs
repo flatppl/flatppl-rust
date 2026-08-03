@@ -266,12 +266,13 @@ fn lower_closed_measure_sample(
 ///   to a direct builtin call;
 /// * a **reified** `functionof`/lambda map that beta-reduces under
 ///   [`crate::kernel::reduce_kernel_application`] — applied here rather than left
-///   to the driver's fixpoint, so that a map which does NOT reduce is a refusal
-///   instead of an unreduced `%call` emitted at exit 0.
+///   to the driver's fixpoint, so that a map which does NOT reduce refuses HERE,
+///   naming the map.
 ///
-/// The check matters because `is_flatpdl` is phase/type-based and does not flag a
-/// surviving `CallHead::User`, so an unreduced application would leave the module
-/// silently non-conformant.
+/// `is_flatpdl` rejects a surviving `CallHead::User` at exit
+/// (`NonConformKind::ResidualUserCall`), so an unreduced application refuses either
+/// way. This check earns its place by giving the specific reason rather than the
+/// gate's generic one.
 fn lower_pushfwd_sample(
     m: &mut Module,
     pushfwd_node: NodeId,
