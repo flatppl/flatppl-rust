@@ -2,10 +2,11 @@
 //! closed-form conjugate table (spec §06, "Density of composed measures", the `kchain`
 //! row).
 //!
-//! **The maths of every conjugate row — the integral, its closed form, the §08 name, the
-//! test point and the wrong answer that point discriminates against — is in
-//! `marginal.md`, beside this file.** Check a row there rather than reverse-engineering
-//! its `build_*_marginal`.
+//! **The maths of every conjugate row — the integral, its closed form, the §08 name or the
+//! emitted expression, the test point and the wrong answer that point discriminates
+//! against — is in `marginal.md`, beside this file.** Check a row there rather than
+//! reverse-engineering its `build_*_marginal`. Not every row has a §08 name: two answer
+//! with a log-density expression, because §08 names no constructor for them.
 //!
 //! `kchain(M, K)` is Kleisli bind: it marginalizes the intermediate latent `a`,
 //! keeping the kernel `K`'s variate. Its density at `x` is the marginal integral
@@ -611,8 +612,13 @@ fn build_conjugate_marginal(
 fn matches_latent_path(m: &Module, value: NodeId, path: &LatentPath, latent: Symbol) -> bool {
     match path {
         LatentPath::Direct => is_input_ref(m, value, latent),
-        // One ref level is resolved first so a named intermediate (`s = sqrt(v)`;
-        // `sigma = s`) reads the same as the inline `sigma = sqrt(v)`.
+        // The ref resolution is DEFENSIVE, and currently unreachable: it would admit a named
+        // intermediate (`s = sqrt(v)`; `sigma = s`), but that whole shape refuses earlier, at
+        // the driver's residual-`draw` scan — `s` keeps referencing `v`, so `v = draw(…)` is
+        // never swept and survives to exit. Kept rather than dropped so the arm still matches
+        // if that upstream refusal is ever lifted; pinned as a refusal by
+        // `a_named_sqrt_intermediate_refuses_upstream_not_in_the_row`, which records that the
+        // refusal is not this row's.
         LatentPath::Sqrt => {
             let (resolved, _) = resolve_ref_one(m, value);
             match expect_builtin_call(m, resolved, "sqrt") {

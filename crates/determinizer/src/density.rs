@@ -1202,20 +1202,6 @@ fn lower_lawof(
 /// recognised conjugate pair — without synthesizing the `kchain`, since the table needs
 /// only the prior, the likelihood, and the symbol linking them. No row applying is what
 /// keeps the refusal.
-/// Score a conjugate row's closed form at the variate `v`. A [`MarginalForm::Measure`] goes
-/// through the ordinary density path; a [`MarginalForm::LogDensity`] IS the scored term
-/// already — the row emitted the log-density because §08 names no constructor for it.
-fn score_marginal_form(
-    m: &mut Module,
-    form: &crate::marginal::MarginalForm,
-    v: NodeId,
-) -> Result<NodeId, RefuseError> {
-    match form {
-        crate::marginal::MarginalForm::Measure(measure) => lower_measure_density(m, *measure, v),
-        crate::marginal::MarginalForm::LogDensity(ld) => Ok(ld.at(m, v)),
-    }
-}
-
 fn marginalize_or_refuse_stochastic_law(
     m: &mut Module,
     arg: NodeId,
@@ -1245,6 +1231,22 @@ fn marginalize_or_refuse_stochastic_law(
         ));
     }
     Ok(None)
+}
+
+/// Score a conjugate row's closed form at the variate `v`. A [`MarginalForm::Measure`] goes
+/// through the ordinary density path; a [`MarginalForm::LogDensity`] IS the scored term
+/// already — the row emitted the log-density because §08 names no constructor for it
+/// (§13 *Signature: `inputs` and `outputs`* admits "any other **deterministic expression**
+/// over the inputs").
+fn score_marginal_form(
+    m: &mut Module,
+    form: &crate::marginal::MarginalForm,
+    v: NodeId,
+) -> Result<NodeId, RefuseError> {
+    match form {
+        crate::marginal::MarginalForm::Measure(measure) => lower_measure_density(m, *measure, v),
+        crate::marginal::MarginalForm::LogDensity(ld) => Ok(ld.at(m, v)),
+    }
 }
 
 /// Marginalize — or refuse — `lawof(record(…))` one of whose fields' laws is parameterized

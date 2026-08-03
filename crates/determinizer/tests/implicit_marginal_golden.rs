@@ -261,6 +261,21 @@ lp_y = logdensityof(lawof(y), 4.0)"),
         lp_y.contains("(%field scale 2.0)"),
         "scale is 1/sqrt(2λ) = 2 at λ = 0.125, not λ itself:\n{lp_y}"
     );
+
+    // The likelihood's `mu` becomes the marginal's LOCATION: `y = μ + s·ε` for a symmetric
+    // mixture, so the marginal is the same law shifted. At `mu = 1.5`, `rate = 0.5`,
+    // logdensity at y = 4.0 is -3.1931471805599454 (`src/marginal.md`).
+    let lp_y = pir_binding(
+        &pir("\
+v = draw(Exponential(rate = 0.5))
+y = draw(Normal(mu = 1.5, sigma = sqrt(v)))
+lp_y = logdensityof(lawof(y), 4.0)"),
+        "lp_y",
+    );
+    assert!(
+        lp_y.contains("(%field location 1.5)") && lp_y.contains("(%field scale 1.0)"),
+        "the likelihood's mu is the marginal's location, the scale unchanged by it:\n{lp_y}"
+    );
 }
 
 // Row 5 (InverseGamma prior on the VARIANCE → scaled Student t), both spellings. §08's
@@ -315,6 +330,59 @@ y = draw(Normal(mu = 0.0, sigma = sqrt(v)))
         assert!(
             !lp_y.contains("Normal"),
             "not the plug-in Normal at the prior mean variance:\n{lp_y}"
+        );
+    }
+
+    // `mu` enters through `z = (y − μ)/s`, so a nonzero one changes the TAIL, not the
+    // normalizer. At `mu = 1.5` the tail argument becomes (5 − 1.5)²/1.2/5 =
+    // 2.041666666666667 and logdensity at y = 5.0 is -4.396997199853038
+    // (`src/marginal.md`). A row that dropped `mu` would keep 4.166666666666666.
+    let lp_y = pir_binding(
+        &pir("\
+v = draw(InverseGamma(shape = 2.5, scale = 3.0))
+y = draw(Normal(mu = 1.5, sigma = sqrt(v)))
+lp_y = logdensityof(lawof(y), 5.0)"),
+        "lp_y",
+    );
+    assert!(
+        lp_y.contains("(log1p 2.041666666666667)") && !lp_y.contains("(log1p 4.166666666666666)"),
+        "mu enters through z = (y − μ)/s, so the tail argument shifts with it:\n{lp_y}"
+    );
+    // The normalizer is independent of `mu`: same scale, same ν, same log-beta.
+    assert!(
+        lp_y.contains("(log 1.0954451150103321)")
+            && lp_y.contains("(log 2.23606797749979)")
+            && lp_y.contains("(loggamma 2.5)"),
+        "the log-normalizer does not depend on mu:\n{lp_y}"
+    );
+}
+
+// The `Sqrt` path's ref resolution is unreachable, and this pins WHY — so a later reader
+// does not hunt for the coverage, and a change that makes the shape lower is forced to
+// re-examine the row. A named intermediate (`s = sqrt(v)`; `sigma = s`) refuses EARLIER
+// than the table: `s` keeps referencing `v`, so the driver never sweeps `v = draw(…)` and
+// the residual `draw` reaches exit. The refusal is the driver's, not the row's — the
+// construct is `draw`, not `kchain`.
+#[test]
+fn a_named_sqrt_intermediate_refuses_upstream_not_in_the_row() {
+    for src in [
+        "\
+v = draw(Exponential(rate = 0.5))
+s = sqrt(v)
+y = draw(Normal(mu = 0.0, sigma = s))
+lp = logdensityof(lawof(y), 4.0)",
+        "\
+v = draw(Exponential(rate = 0.5))
+s = sqrt(v)
+kk = kernelof(record(y = draw(Normal(mu = 0.0, sigma = s))), v = v)
+pp = kchain(lawof(record(v = v)), kk)
+lp = logdensityof(pp, record(y = 4.0))",
+    ] {
+        let err = determinize(&parse_infer(src))
+            .expect_err("a named sqrt intermediate leaves the latent's draw live — refuse");
+        assert_eq!(
+            err.construct, "draw",
+            "the refusal is the driver's residual-draw scan, not the conjugate row's: {err:?}"
         );
     }
 }

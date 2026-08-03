@@ -22,8 +22,10 @@ the path the row expects, and every other likelihood parameter is latent-indepen
 
 ## A row need not name a §08 distribution
 
-Determinised output is a deterministic expression, so a row may return its answer in
-either of two forms (`MarginalForm`):
+This is a spec fact, not an implementer's convenience. §13 *Signature: `inputs` and
+`outputs`* lists what an output may be — a density, a sampled value, and "any other
+**deterministic expression** over the inputs". So a row may return its answer in either of
+two forms (`MarginalForm`):
 
 - **`Measure`** — a §08 distribution-constructor node, scored by the ordinary density path
   into one `builtin_logdensityof`. Rows 1, 2 and 4.
@@ -253,10 +255,10 @@ on `v`. Both therefore use `LatentPath::Sqrt`, and the 0.017-nat location/scale
 near-agreement above is why that path is recorded rather than assumed.
 
 Both rows pass the likelihood's `mu` through as the marginal's location. `y = μ + s·ε` for a
-symmetric mixture `ε`, so the marginal is the same law shifted by `μ` — an elementary
-location shift, and check (c) has already proven `mu` latent-independent. The test points
-below all sit at `μ = 0`, so the **numeric** verification covers `μ = 0` only; the shift
-itself is the derivation just given, not a checked number.
+symmetric mixture `ε`, so the marginal is the same law shifted by `μ`, and check (c) has
+already proven `mu` latent-independent. **Verified at nonzero `μ` as well as at `μ = 0`** —
+each row carries a second point below, its truth derived by quadrature of the row's own
+mixture integral at `μ = 1.5`.
 
 ### Row 4 — Exponential prior on the variance → Laplace
 
@@ -308,6 +310,18 @@ identical to **Row 1's truth** — so a row mix-up at that point would look corr
 Structurally `scale = 1.0` alone cannot tell $1/\sqrt{2\lambda}$ from a $\lambda$ passed
 through, since both are 1 at $\lambda = 0.5$. A second shape with `rate = 0.125` → `scale
 2.0` pins the arithmetic; it asserts structure only and claims no density number.
+
+**Nonzero location.** Same prior, `mu = 1.5`:
+
+| | |
+|---|---|
+| model | `v ~ Exponential(rate = 0.5)`; `y ~ Normal(mu = 1.5, sigma = sqrt(v))` |
+| point | `y = 4.0` |
+| marginal | `Laplace(1.5, 1)` |
+| truth | `-3.1931471805599454` |
+
+$-\log 2 - |4 - 1.5| = -\log 2 - 2.5$ exactly, and quadrature of the mixture integral at
+`μ = 1.5` agrees. The location travels; the scale does not depend on it.
 
 ### Row 5 — InverseGamma prior on the variance → scaled Student t
 
@@ -377,6 +391,20 @@ Structurally the folded literals pin the map: `log 1.0954451150103321` is $\log 
 read as $\sqrt{\beta/\alpha}$, `log 2.23606797749979` is $\log\sqrt{\nu}$ at $\nu = 2\alpha
 = 5$, `loggamma` at `2.5`/`0.5`/`3.0` is $\log B(\nu/2, 1/2)$, and `mul 3.0` with
 `log1p 4.166666666666666` is $((\nu+1)/2)\log(1 + z^2/\nu)$.
+
+**Nonzero location.** Same prior, `mu = 1.5`:
+
+| | |
+|---|---|
+| model | `v ~ InverseGamma(shape = 2.5, scale = 3.0)`; `y ~ Normal(mu = 1.5, sigma = sqrt(v))` |
+| point | `y = 5.0` |
+| truth | `-4.396997199853038` |
+
+`mu` enters only through $z = (y - \mu)/s$, so the **tail** argument moves and the
+normalizer does not: the emitted `log1p` argument goes from `4.166666666666666` to
+`2.041666666666667` = $(5 - 1.5)^2/1.2/5$, while `log 1.0954451150103321`,
+`log 2.23606797749979` and the log-beta are unchanged. A row that dropped `mu` would keep
+`4.166666666666666`, which is what the golden asserts against.
 
 ## Deferred by decision — Exponential prior on the MEAN
 
