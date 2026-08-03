@@ -62,8 +62,9 @@ fn pos_inf_literal(dtype: Dtype) -> &'static str {
 /// on whichever of its two operands' kinds has the HIGHER rank (e.g. a
 /// `bool`-vs-`int` mismatch widens to `int`, an `int`-vs-`real` mismatch to
 /// `real`), never the other way — the embedding only ever goes "up" the
-/// inclusion chain.
-fn elem_rank(k: ElemKind) -> u8 {
+/// inclusion chain. `crate::ops` reads it too, to REFUSE a narrowing convert
+/// rather than emit one ([`ops::lower_fill`](crate::ops::lower_fill)).
+pub(crate) fn elem_rank(k: ElemKind) -> u8 {
     match k {
         ElemKind::Bool => 0,
         ElemKind::Int => 1,

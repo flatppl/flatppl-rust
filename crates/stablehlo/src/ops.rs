@@ -29,7 +29,7 @@
 
 use flatppl_core::{CallHead, Node, NodeId, Scalar};
 
-use crate::emitter::Emitter;
+use crate::emitter::{Emitter, elem_rank};
 use crate::mlir::{ElemKind, MlirTy, Value};
 use crate::refuse::EmitError;
 
@@ -300,6 +300,14 @@ fn lower_extremum(
 /// tensor form, while inference has already resolved the result shape. A
 /// dynamic (`?`) axis is refused — `broadcast_in_dim`'s result shape must be
 /// static text.
+///
+/// A fill value whose kind OUTRANKS the array's element kind is refused too.
+/// [`Emitter::convert`] is documented as numerically exact for every embedding
+/// this emitter performs, which holds only going UP §03's
+/// `booleans ⊂ integers ⊂ reals` chain; a real value into an integer array
+/// would truncate toward zero. Inference should reject that mismatch upstream,
+/// so this is the same narrow-and-refuse guard the other ops here use, not a
+/// reachable case.
 fn lower_fill(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
     let [x_id, _size] = args_exact(id, args)?;
     let (ty, kind) = e.node_ty(id)?;
@@ -319,6 +327,16 @@ fn lower_fill(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, Emi
             format!("fill: fill value must be a scalar, got {:?}", x.ty),
         ));
     }
+    if elem_rank(x.elem) > elem_rank(kind) {
+        return Err(EmitError::at(
+            id,
+            format!(
+                "fill: fill value is {:?} but the array element type is {kind:?}; \
+                 narrowing it would not be value-preserving",
+                x.elem
+            ),
+        ));
+    }
     let x = e.convert(&x, kind);
     Ok(e.broadcast_in_dim(&x, &[], ty))
 }
@@ -330,8 +348,9 @@ fn lower_inf(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, Emit
 
 /// §03 `pi` — "the mathematical constant $\pi$". Gate vocabulary: `atan`'s
 /// image endpoint is `pi / 2` (`crate`-external, `determinizer::invert`).
-/// `f64`'s `Display` is shortest-round-trip, so the emitted decimal literal is
-/// exact at both dtypes.
+/// `f64`'s `Display` is shortest-round-trip, so the emitted decimal literal
+/// recovers the `f64` value exactly and the nearest `f32` to it at `Dtype::F32`
+/// — the same rounding every other real literal in an f32 module takes.
 fn lower_pi(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
     args_exact::<0>(id, args)?;
     Ok(e.scalar(std::f64::consts::PI))

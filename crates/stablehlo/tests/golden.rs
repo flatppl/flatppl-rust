@@ -1682,6 +1682,56 @@ fn lower_gt_and_lt_emit_matching_compare_directions() {
     }
 }
 
+/// §03 `pi` — the scalar constant, in the EXACT shape the open-image gate
+/// builds it: `lt(y, divide(pi, 2.0))`, `atan`'s upper endpoint
+/// (`determinizer::invert::half_pi`, a `Node::Const` under §07 `divide`). The
+/// literal is `f64`'s shortest round-trip text, which the MLIR parser rounds to
+/// the nearest f32 in an f32 module — the same treatment every other real
+/// literal gets (`dense<3.141592653589793>` already appears in a frozen f32
+/// golden).
+#[test]
+fn lower_pi_emits_the_constant_the_open_image_endpoint_needs() {
+    let mut m = Module::new();
+    let y = local_ref(&mut m, "y");
+    let pi = const_node(&mut m, "pi");
+    let two = real(&mut m, 2.0);
+    let half_pi = call(&mut m, "divide", &[pi, two]);
+    let node = call(&mut m, "lt", &[y, half_pi]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    bind_arg(&mut e, y, "%arg0", MlirTy::Scalar);
+    let result = e.lower_node(node).unwrap();
+    let out = e.finish(
+        "f",
+        &[("%arg0".to_string(), MlirTy::Scalar, ElemKind::Real)],
+        &[&result],
+    );
+
+    assert!(
+        out.contains("stablehlo.constant dense<3.141592653589793> : tensor<f32>"),
+        "in:\n{out}"
+    );
+    assert!(out.contains("stablehlo.divide"), "in:\n{out}");
+    assert!(out.contains("stablehlo.compare LT"), "in:\n{out}");
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// `pi` also lowers as a bare 0-arity CALL, not just as a `Node::Const` leaf —
+/// `lower_builtin` is the single source of truth for both spellings (as it
+/// already is for `inf`), so neither can drift.
+#[test]
+fn lower_pi_lowers_the_same_as_a_zero_arity_call() {
+    let mut m = Module::new();
+    let node = call(&mut m, "pi", &[]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    let result = e.lower_node(node).unwrap();
+    assert_eq!(result.ty, MlirTy::Scalar);
+    assert_eq!(result.elem, ElemKind::Real);
+    let out = e.finish("f", &[], &[&result]);
+    assert!(out.contains("dense<3.141592653589793>"), "in:\n{out}");
+}
+
 /// §07 `land` (`a && b`) — one `stablehlo.and` over two `i1` predicates. This
 /// is the op that joins the image and lattice conditions into ONE gate.
 #[test]
@@ -1970,6 +2020,33 @@ fn lower_fill_broadcasts_the_scalar_to_the_inferred_shape() {
         out.matches("stablehlo.").count(),
         2,
         "only the fill value's constant and one broadcast_in_dim:\n{out}"
+    );
+}
+
+/// A `fill` value whose kind outranks the array's element kind refuses rather
+/// than emitting a truncating `stablehlo.convert` — `Emitter::convert` is exact
+/// only going UP §03's `booleans ⊂ integers ⊂ reals` chain.
+#[test]
+fn lower_fill_refuses_a_narrowing_fill_value() {
+    let mut m = Module::new();
+    let w = real(&mut m, 1.5);
+    let n = int(&mut m, 3);
+    let node = call(&mut m, "fill", &[w, n]);
+    m.set_type(
+        node,
+        Type::Array {
+            shape: Box::new([Dim::Static(3)]),
+            elem: Box::new(Type::Scalar(ScalarType::Integer)),
+        },
+    );
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    let err = e.lower_node(node).unwrap_err();
+    assert!(
+        err.msg
+            .contains("narrowing it would not be value-preserving"),
+        "unexpected message: {}",
+        err.msg
     );
 }
 
