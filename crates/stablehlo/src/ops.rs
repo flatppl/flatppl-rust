@@ -67,6 +67,31 @@ pub(crate) fn lower_builtin(
         "abs" => unary(e, id, args, Emitter::abs),
         "cos" => unary(e, id, args, Emitter::cos),
         "invlogit" => unary(e, id, args, Emitter::invlogit),
+        // §06 change-of-variables heads. An open-image `pushfwd` spells THREE
+        // families of head, all of which must lower or the density refuses:
+        //
+        // - the INVERSE (`invlogit`→`logit`, `invprobit`→`probit`,
+        //   `atan`→`tan`, `expm1`→`log1p`, `sinh`→`asinh`, `asinh`→`sinh`,
+        //   `tanh`→`atanh`);
+        // - the head the forward's own LOG-VOLUME term spells — `cosh` for
+        //   `sinh` (`log(cosh(x))`), `tanh` for `tanh` (`log(1 − tanh(x)²)`);
+        // - the FORWARD itself, applied to the safe-point witness the
+        //   determiniser substitutes for an out-of-image query
+        //   (`probit(ifelse(gate, y, invprobit(1.0)))`) — so `invprobit`,
+        //   `atan` and `expm1` are needed too, even though nothing inverts to
+        //   them.
+        "logit" => unary(e, id, args, Emitter::logit),
+        "probit" => unary(e, id, args, Emitter::probit),
+        "invprobit" => unary(e, id, args, Emitter::invprobit),
+        "tan" => unary(e, id, args, Emitter::tan),
+        "atan" => unary(e, id, args, Emitter::atan),
+        "log1p" => unary(e, id, args, Emitter::log1p),
+        "expm1" => unary(e, id, args, Emitter::expm1),
+        "sinh" => unary(e, id, args, Emitter::sinh),
+        "cosh" => unary(e, id, args, Emitter::cosh),
+        "asinh" => unary(e, id, args, Emitter::asinh),
+        "atanh" => unary(e, id, args, Emitter::atanh),
+        "tanh" => unary(e, id, args, Emitter::tanh),
         // §07 `round` ("nearest integer, half to even") and §07 `real`
         // ("returns `x` for real `x`") — the pair the determiniser's
         // discrete-pushforward lattice snap emits, `real(round(x))`.

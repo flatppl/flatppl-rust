@@ -2080,11 +2080,13 @@ fn lower_fill_refuses_a_dynamic_result_shape() {
 fn lower_builtin_still_refuses_ops_the_gate_does_not_emit() {
     // Adjacent to something lowered in each case: the other logical connectives, the
     // binary extrema (vs the reductions), the other roundings, the exact-equality
-    // pair, and the change-of-variables inverses an open-image `pushfwd` still needs.
-    // `le`/`ge` are NOT here — a closed finite image endpoint emits them.
+    // pair, and — next to the change-of-variables heads — the §07 elementary
+    // functions no recognised §06 forward map spells (`acosh`/`asin`/`acos`/
+    // `log10`/`atan2`). `le`/`ge` are NOT here: a closed finite image endpoint
+    // emits them.
     for head in [
         "lor", "lnot", "lxor", "min", "max", "ceil", "isnan", "isfinite", "equal", "unequal",
-        "logit", "tan", "log1p", "atanh", "zeros", "ones",
+        "acosh", "asin", "acos", "log10", "atan2", "zeros", "ones",
     ] {
         let mut m = Module::new();
         let a = real(&mut m, 1.0);
@@ -2102,6 +2104,258 @@ fn lower_builtin_still_refuses_ops_the_gate_does_not_emit() {
             err.msg
         );
     }
+}
+
+// ---- §06 change-of-variables heads -------------------------------------------
+//
+// An open-image `pushfwd` density spells three families of head: the forward
+// map's INVERSE, the head the forward's own log-volume term uses, and the
+// FORWARD itself applied to the safe-point witness the determiniser
+// substitutes for an out-of-image query. All three must lower or the density
+// refuses. Every construct pinned below was checked against the real MLIR
+// parser AND Enzyme-JAX for both value and gradient.
+
+/// Lower `head(%arg0)` over one scalar real argument and return the whole
+/// `func.func` text — the shared shape for the per-head tests below.
+fn lower_unary_head(head: &str) -> String {
+    let mut m = Module::new();
+    let v = local_ref(&mut m, "v");
+    let node = call(&mut m, head, &[v]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    bind_arg(&mut e, v, "%arg0", MlirTy::Scalar);
+    let result = e
+        .lower_node(node)
+        .unwrap_or_else(|err| panic!("'{head}' must lower: {}", err.msg));
+    e.finish(
+        "f",
+        &[("%arg0".to_string(), MlirTy::Scalar, ElemKind::Real)],
+        &[&result],
+    )
+}
+
+/// §07 `logit(p)` is $\log(p/(1-p))$ — emitted as that formula verbatim over
+/// core StableHLO ops, no CHLO. §07 also fixes the endpoints: "`logit` and
+/// `probit` evaluate to `-inf` at $p = 0$ and `inf` at $p = 1$", which IEEE
+/// delivers unaided — `0/1 = 0` so `log 0 = −inf`, `1/0 = +inf` so
+/// `log(+inf) = +inf` — so nothing here clamps or gates.
+#[test]
+fn lower_logit_emits_log_of_the_odds_ratio() {
+    let out = lower_unary_head("logit");
+    assert!(
+        out.contains("%0 = stablehlo.constant dense<1.0> : tensor<f32>")
+            && out.contains("%1 = stablehlo.subtract %0, %arg0 : tensor<f32>")
+            && out.contains("%2 = stablehlo.divide %arg0, %1 : tensor<f32>")
+            && out.contains("%3 = stablehlo.log %2 : tensor<f32>"),
+        "logit:\n{out}"
+    );
+    assert_eq!(out.matches("stablehlo.divide").count(), 1, "logit:\n{out}");
+    assert_eq!(out.matches("stablehlo.log ").count(), 1, "logit:\n{out}");
+    assert!(!out.contains("chlo."), "logit needs no CHLO op:\n{out}");
+    // NOT the logistic sigmoid — that is `invlogit`, the other direction.
+    assert!(!out.contains("stablehlo.logistic"), "logit:\n{out}");
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// §07 `probit(p)` is "$\Phi^{-1}(p)$, standard-normal quantile", emitted
+/// through the exact identity $\Phi^{-1}(p) = \sqrt{2}\,\mathrm{erf}^{-1}(2p-1)$.
+/// √2 is written at full `f64` precision so an f64 module is not silently held
+/// to f32 accuracy.
+#[test]
+fn lower_probit_emits_erf_inv_of_the_rescaled_argument() {
+    let out = lower_unary_head("probit");
+    assert!(
+        out.contains("chlo.erf_inv %3 : tensor<f32> -> tensor<f32>"),
+        "probit:\n{out}"
+    );
+    assert!(
+        out.contains("stablehlo.constant dense<1.4142135623730951> : tensor<f32>"),
+        "√2 at full f64 precision:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.multiply").count(),
+        2,
+        "probit:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.subtract").count(),
+        1,
+        "probit:\n{out}"
+    );
+    // The CDF, not the quantile, is `invprobit` — `chlo.erf` must not appear.
+    assert_eq!(out.matches("chlo.erf ").count(), 0, "probit:\n{out}");
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// §07 `invprobit(x)` is "$\Phi(x)$, standard-normal CDF" —
+/// $\tfrac12(1 + \mathrm{erf}(x/\sqrt{2}))$, the same identity
+/// `registry::normal_cdf` uses. Reached only as the safe-point witness of an
+/// `invprobit` pushforward, never as an inverse.
+#[test]
+fn lower_invprobit_emits_the_erf_normal_cdf() {
+    let out = lower_unary_head("invprobit");
+    assert!(
+        out.contains("chlo.erf %1 : tensor<f32> -> tensor<f32>"),
+        "invprobit:\n{out}"
+    );
+    assert!(
+        out.contains("stablehlo.constant dense<1.4142135623730951> : tensor<f32>")
+            && out.contains("stablehlo.constant dense<0.5> : tensor<f32>"),
+        "invprobit:\n{out}"
+    );
+    assert_eq!(out.matches("stablehlo.add").count(), 1, "invprobit:\n{out}");
+    assert!(!out.contains("chlo.erf_inv"), "invprobit:\n{out}");
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// §07 `tan(x)` — composed as `sin(x) / cos(x)`, both core StableHLO ops, the
+/// choice `Emitter::sin`'s doc comment records for this crate and the one
+/// §08 Cauchy's `@sample` already shares.
+#[test]
+fn lower_tan_emits_sine_over_cosine() {
+    let out = lower_unary_head("tan");
+    assert!(
+        out.contains("%0 = stablehlo.sine %arg0 : tensor<f32>")
+            && out.contains("%1 = stablehlo.cosine %arg0 : tensor<f32>")
+            && out.contains("%2 = stablehlo.divide %0, %1 : tensor<f32>"),
+        "tan:\n{out}"
+    );
+    assert!(!out.contains("chlo.tan"), "tan:\n{out}");
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// §07 `atan(x)` — `stablehlo.atan2(x, 1)`, since `atan2(y, x)` is `atan(y/x)`
+/// in the correct quadrant. A core StableHLO op, unlike `chlo.atan`. Reached
+/// as the safe-point witness of an `atan` pushforward.
+#[test]
+fn lower_atan_emits_atan2_against_one() {
+    let out = lower_unary_head("atan");
+    assert!(
+        out.contains("%0 = stablehlo.constant dense<1.0> : tensor<f32>")
+            && out.contains("%1 = stablehlo.atan2 %arg0, %0 : tensor<f32>"),
+        "atan:\n{out}"
+    );
+    assert!(!out.contains("chlo.atan"), "atan:\n{out}");
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// §07 `log1p(x)` is $\ln(1 + x)$ — the core `stablehlo.log_plus_one`, one op.
+/// §07: "`log1p` evaluates to `-inf` at $x = -1$", which `log_plus_one`
+/// honours directly (measured), so no gate is added. NOT `log(1 + x)`, which
+/// loses precision for small `x`.
+#[test]
+fn lower_log1p_emits_log_plus_one() {
+    let out = lower_unary_head("log1p");
+    assert!(
+        out.contains("%0 = stablehlo.log_plus_one %arg0 : tensor<f32>"),
+        "log1p:\n{out}"
+    );
+    assert!(!out.contains("stablehlo.log %"), "log1p:\n{out}");
+    assert!(!out.contains("stablehlo.add"), "log1p:\n{out}");
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// §07 `expm1(x)` is $e^x - 1$ — the core `stablehlo.exponential_minus_one`,
+/// not `exp(x) - 1`. Reached as the safe-point witness of an `expm1`
+/// pushforward.
+#[test]
+fn lower_expm1_emits_exponential_minus_one() {
+    let out = lower_unary_head("expm1");
+    assert!(
+        out.contains("%0 = stablehlo.exponential_minus_one %arg0 : tensor<f32>"),
+        "expm1:\n{out}"
+    );
+    assert!(!out.contains("stablehlo.exponential %"), "expm1:\n{out}");
+    assert!(!out.contains("stablehlo.subtract"), "expm1:\n{out}");
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// §07 `sinh(x)` — the single `chlo.sinh`, in CHLO's function-type assembly
+/// form. NOT `(eˣ − e⁻ˣ)/2`, which overflows for large `|x|` where the single
+/// op does not.
+#[test]
+fn lower_sinh_emits_chlo_sinh() {
+    let out = lower_unary_head("sinh");
+    assert!(
+        out.contains("%0 = chlo.sinh %arg0 : tensor<f32> -> tensor<f32>"),
+        "sinh:\n{out}"
+    );
+    assert!(!out.contains("stablehlo.exponential"), "sinh:\n{out}");
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// §07 `cosh(x)` — the single `chlo.cosh`. Reached as the head of `sinh`'s own
+/// log-volume term, `log(cosh(x))`, not as any map's inverse.
+#[test]
+fn lower_cosh_emits_chlo_cosh() {
+    let out = lower_unary_head("cosh");
+    assert!(
+        out.contains("%0 = chlo.cosh %arg0 : tensor<f32> -> tensor<f32>"),
+        "cosh:\n{out}"
+    );
+    assert!(!out.contains("stablehlo.exponential"), "cosh:\n{out}");
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// §07 `asinh(x)` is $\operatorname{arsinh}(x)$ — the single `chlo.asinh`. NOT
+/// `log(x + √(x² + 1))`, whose `x²` overflows for large `|x|`.
+#[test]
+fn lower_asinh_emits_chlo_asinh() {
+    let out = lower_unary_head("asinh");
+    assert!(
+        out.contains("%0 = chlo.asinh %arg0 : tensor<f32> -> tensor<f32>"),
+        "asinh:\n{out}"
+    );
+    assert!(
+        !out.contains("stablehlo.sqrt") && !out.contains("stablehlo.log"),
+        "asinh:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// §07 `atanh(x)` is $\operatorname{artanh}(x)$, composed as
+/// `½·(log1p(x) − log1p(−x))`.
+///
+/// The negative assertion is the point of this test: `chlo.atanh` exists and
+/// its VALUE is right, but Enzyme differentiates it to the NEGATED derivative
+/// (measured `−1/(1 − x²)` at every probed point), which would silently invert
+/// the gradient of any density reaching it. The composed form is
+/// gradient-correct and keeps §07's `±inf` at `x = ±1`, since one
+/// `log_plus_one` is then `−inf`.
+#[test]
+fn lower_atanh_composes_log_plus_one_rather_than_chlo_atanh() {
+    let out = lower_unary_head("atanh");
+    assert!(!out.contains("chlo.atanh"), "atanh:\n{out}");
+    assert!(
+        out.contains("%0 = stablehlo.negate %arg0 : tensor<f32>")
+            && out.contains("%1 = stablehlo.log_plus_one %arg0 : tensor<f32>")
+            && out.contains("%2 = stablehlo.log_plus_one %0 : tensor<f32>")
+            && out.contains("%3 = stablehlo.subtract %1, %2 : tensor<f32>"),
+        "atanh:\n{out}"
+    );
+    assert!(
+        out.contains("stablehlo.constant dense<0.5> : tensor<f32>"),
+        "atanh:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.log_plus_one").count(),
+        2,
+        "atanh:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// §07 `tanh(x)` — the core `stablehlo.tanh`. Reached as the head of `tanh`'s
+/// own log-volume term, `log(1 − tanh(x)²)`, not as any map's inverse.
+#[test]
+fn lower_tanh_emits_stablehlo_tanh() {
+    let out = lower_unary_head("tanh");
+    assert!(
+        out.contains("%0 = stablehlo.tanh %arg0 : tensor<f32>"),
+        "tanh:\n{out}"
+    );
+    assert!(!out.contains("chlo."), "tanh needs no CHLO op:\n{out}");
+    assert!(is_delimiter_balanced(&out));
 }
 
 /// `get0(v, 2)` on a length-5 rank-1 `v` slices out element 2 then reshapes
@@ -9491,4 +9745,204 @@ outputs = (lp)
         .find(|l| l.contains("stablehlo.and"))
         .expect("the two conditions must be ONE gate");
     assert!(and_line.contains(": tensor<i1>"), "in:\n{and_line}");
+}
+
+// ---- open-image `pushfwd` densities, end to end -------------------------------
+//
+// One module per image FAMILY, each frozen as a golden file. Every one of these
+// refused at `unsupported builtin head '<inverse>'` before this wave, because an
+// open-image `pushfwd` spells the forward's inverse, its log-volume head, and
+// the forward itself at the safe-point witness. All three were verified against
+// an independent closed form through Enzyme-JAX — value AND gradient at
+// interior points, and value `-inf` with gradient exactly `0.0` outside the
+// image (the untaken `select` arm, never NaN).
+
+/// Bounded image: `pushfwd(invlogit, Normal(0, 1))` is the logit-normal on
+/// `(0, 1)`. Verified at `y = 0.7`: `0.28275240` against the closed form
+/// `logφ(logit y) − log y − log(1 − y) = 0.282752383`.
+const PUSHFWD_INVLOGIT_SRC: &str = "\
+yobs = elementof(reals)
+lp = logdensityof(pushfwd(invlogit, Normal(mu = 0.0, sigma = 1.0)), yobs)
+inputs = (yobs)
+outputs = (lp)
+";
+
+/// Half-line image: `pushfwd(expm1, Normal(0, 1))` lives on `(-1, inf)`,
+/// bounded below only. Verified at `y = 0.5`: `-1.40660465` against
+/// `logφ(log1p y) − log1p y = -1.40660462`.
+const PUSHFWD_EXPM1_SRC: &str = "\
+yobs = elementof(reals)
+lp = logdensityof(pushfwd(expm1, Normal(mu = 0.0, sigma = 1.0)), yobs)
+inputs = (yobs)
+outputs = (lp)
+";
+
+/// Whole-line image: `asinh` is ONTO, so §06 gives it no image at all and the
+/// density carries no gate. Verified at `y = 0.5`: `-0.934594154` against
+/// `logφ(sinh y) + log cosh y = -0.934594185`.
+const PUSHFWD_ASINH_SRC: &str = "\
+yobs = elementof(reals)
+lp = logdensityof(pushfwd(asinh, Normal(mu = 0.0, sigma = 1.0)), yobs)
+inputs = (yobs)
+outputs = (lp)
+";
+
+/// The bounded-image gate, both ends. §07 fixes the endpoint values that make
+/// the image `(0, 1)` OPEN — "`logit` and `probit` evaluate to `-inf` at
+/// $p = 0$ and `inf` at $p = 1$" — so the bounds are the pinned constants `0.0`
+/// and `1.0`, compared STRICTLY (`GT`/`LT`, never `GE`/`LE`) and conjoined into
+/// one `stablehlo.and`.
+#[test]
+fn emit_logdensity_invlogit_pushfwd_gates_strictly_on_zero_and_one() {
+    let out = emit_logdensity(&determinize_src(PUSHFWD_INVLOGIT_SRC));
+    assert!(is_delimiter_balanced(&out));
+    assert!(
+        out.contains("stablehlo.compare GT, %arg0, %0 : (tensor<f32>, tensor<f32>) -> tensor<i1>")
+            && out.contains(
+                "stablehlo.compare LT, %arg0, %2 : (tensor<f32>, tensor<f32>) -> tensor<i1>"
+            ),
+        "both ends compared strictly:\n{out}"
+    );
+    assert!(
+        out.contains("%0 = stablehlo.constant dense<0.0> : tensor<f32>")
+            && out.contains("%2 = stablehlo.constant dense<1.0> : tensor<f32>"),
+        "§07's endpoints are the gate bounds:\n{out}"
+    );
+    assert!(
+        !out.contains("compare GE") && !out.contains("compare LE"),
+        "a closed superset would make the endpoint sub(−inf, −inf) = NaN:\n{out}"
+    );
+    assert_eq!(out.matches("stablehlo.and").count(), 1, "one gate:\n{out}");
+    // `logit` is the inverse; `invlogit` (`stablehlo.logistic`) appears both in
+    // the log-volume term and at the safe-point witness.
+    assert!(out.contains("stablehlo.logistic"), "invlogit:\n{out}");
+    // Two selects: the witness substitution, then the −inf floor.
+    assert_eq!(
+        out.matches("stablehlo.select").count(),
+        2,
+        "witness + floor:\n{out}"
+    );
+    assert!(
+        out.contains("dense<0x7F800000>") && out.contains("stablehlo.negate"),
+        "the outside-image arm is −inf:\n{out}"
+    );
+}
+
+#[test]
+fn emit_logdensity_invlogit_pushfwd_matches_frozen_golden() {
+    let out = emit_logdensity(&determinize_src(PUSHFWD_INVLOGIT_SRC));
+    let golden = include_str!("goldens/pushfwd_invlogit_logdensity.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted @logdensity drifted from the frozen golden \
+         (tests/goldens/pushfwd_invlogit_logdensity.mlir)"
+    );
+}
+
+/// The half-line gate: ONE comparison, no conjunction. §07 fixes the bound —
+/// "`log1p` evaluates to `-inf` at $x = -1$" — so `expm1`'s image is open at
+/// `-1` and unbounded above, and the pinned constant is `-1.0`.
+#[test]
+fn emit_logdensity_expm1_pushfwd_gates_strictly_above_minus_one() {
+    let out = emit_logdensity(&determinize_src(PUSHFWD_EXPM1_SRC));
+    assert!(is_delimiter_balanced(&out));
+    assert!(
+        out.contains("%0 = stablehlo.constant dense<-1.0> : tensor<f32>")
+            && out.contains(
+                "stablehlo.compare GT, %arg0, %0 : (tensor<f32>, tensor<f32>) -> tensor<i1>"
+            ),
+        "§07's `log1p(-1) = -inf` is the gate bound:\n{out}"
+    );
+    // Unbounded above, so no upper comparison and nothing to conjoin.
+    assert!(!out.contains("compare LT"), "no upper bound:\n{out}");
+    assert!(!out.contains("stablehlo.and"), "nothing to conjoin:\n{out}");
+    assert_eq!(
+        out.matches("stablehlo.log_plus_one").count(),
+        2,
+        "`log1p` inverts `expm1`, and is its log-volume term:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.exponential_minus_one").count(),
+        1,
+        "`expm1` itself only at the safe-point witness:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+#[test]
+fn emit_logdensity_expm1_pushfwd_matches_frozen_golden() {
+    let out = emit_logdensity(&determinize_src(PUSHFWD_EXPM1_SRC));
+    let golden = include_str!("goldens/pushfwd_expm1_logdensity.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted @logdensity drifted from the frozen golden \
+         (tests/goldens/pushfwd_expm1_logdensity.mlir)"
+    );
+}
+
+/// The whole-line case carries NO gate: `asinh` is onto, so §06 gives it no
+/// image, and there is nothing to compare, conjoin, sanitise or floor. The
+/// negative assertions are the substance — a spurious gate here would clamp a
+/// density that is finite everywhere.
+#[test]
+fn emit_logdensity_asinh_pushfwd_carries_no_image_gate() {
+    let out = emit_logdensity(&determinize_src(PUSHFWD_ASINH_SRC));
+    assert!(is_delimiter_balanced(&out));
+    assert!(!out.contains("stablehlo.compare"), "onto map:\n{out}");
+    assert!(!out.contains("stablehlo.select"), "onto map:\n{out}");
+    assert!(!out.contains("dense<0x7F800000>"), "no −inf floor:\n{out}");
+    // `sinh` inverts `asinh`; both the base density and the log-volume term
+    // read the same inverse point.
+    assert_eq!(
+        out.matches("chlo.sinh %arg0 : tensor<f32> -> tensor<f32>")
+            .count(),
+        2,
+        "the inverse is `sinh`, at the query point directly:\n{out}"
+    );
+    assert!(
+        !out.contains("chlo.asinh"),
+        "`asinh` is the forward:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+#[test]
+fn emit_logdensity_asinh_pushfwd_matches_frozen_golden() {
+    let out = emit_logdensity(&determinize_src(PUSHFWD_ASINH_SRC));
+    let golden = include_str!("goldens/pushfwd_asinh_logdensity.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted @logdensity drifted from the frozen golden \
+         (tests/goldens/pushfwd_asinh_logdensity.mlir)"
+    );
+}
+
+/// Every one of §06's seven open-image forward maps now EMITS, and each spells
+/// its own inverse head. The pin against a partial fix: adding only the
+/// inverses would still refuse on `cosh`/`tanh` (log-volume heads) and on
+/// `invprobit`/`atan`/`expm1` (safe-point witnesses).
+#[test]
+fn emit_logdensity_every_recognised_open_image_pushfwd_emits() {
+    for (forward, inverse_op) in [
+        ("invlogit", "stablehlo.log"),
+        ("invprobit", "chlo.erf_inv"),
+        ("atan", "stablehlo.sine"),
+        ("expm1", "stablehlo.log_plus_one"),
+        ("sinh", "chlo.asinh"),
+        ("asinh", "chlo.sinh"),
+        ("tanh", "stablehlo.log_plus_one"),
+    ] {
+        let src = format!(
+            "yobs = elementof(reals)\n\
+             lp = logdensityof(pushfwd({forward}, Normal(mu = 0.0, sigma = 1.0)), yobs)\n\
+             inputs = (yobs)\n\
+             outputs = (lp)\n"
+        );
+        let out = emit_logdensity(&determinize_src(&src));
+        assert!(
+            out.contains(inverse_op),
+            "pushfwd({forward}) must lower its inverse via {inverse_op}:\n{out}"
+        );
+        assert!(is_delimiter_balanced(&out), "pushfwd({forward}):\n{out}");
+    }
 }

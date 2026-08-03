@@ -489,6 +489,127 @@ impl<'m> Emitter<'m> {
         self.unary_real("stablehlo.round_nearest_even", a)
     }
 
+    // ---- §06 change-of-variables inverse heads -----------------------------
+    //
+    // The inverses `crate::ops` needs for an open-image `pushfwd` density:
+    // each forward map's partner (`invlogit`→`logit`, `atan`→`tan`, …) plus
+    // the two heads a forward's own log-volume term spells (`cosh` for
+    // `sinh`, `tanh` for `tanh`). Every construct below was checked against
+    // the real MLIR parser AND Enzyme-JAX for value and gradient; where the
+    // obvious single op is differentiated WRONGLY, the composed form is used
+    // instead and the reason recorded on the helper.
+
+    /// `logit(p) = log(p / (1 − p))` — spec §07's formula verbatim, over core
+    /// StableHLO ops. §07: "`logit` and `probit` evaluate to `-inf` at
+    /// $p = 0$ and `inf` at $p = 1$", which IEEE division delivers with no
+    /// gate: at `p = 0` the ratio is `0/1 = 0` so `log 0 = −inf`, and at
+    /// `p = 1` it is `1/0 = +inf` so `log(+inf) = +inf`.
+    pub(crate) fn logit(&mut self, a: &Value) -> Value {
+        let one = self.constant(1.0, a.ty.clone());
+        let omp = self.sub(&one, a);
+        let ratio = self.div(a, &omp);
+        self.log(&ratio)
+    }
+
+    /// `probit(p) = Φ⁻¹(p) = √2 · erf_inv(2p − 1)` (spec §07's standard-normal
+    /// quantile). The identity is exact, and carries §07's endpoints through:
+    /// `erf_inv(∓1) = ∓inf` gives `-inf` at `p = 0` and `inf` at `p = 1`
+    /// (both confirmed by execution).
+    ///
+    /// √2 goes in at full `f64` precision, unlike [`Emitter::
+    /// uniform_to_normal`]'s pinned 8-digit sampling literal, so an f64
+    /// module is not silently held to f32 accuracy. See [`Emitter::erf_inv`]
+    /// for the gradient limitation this inherits.
+    pub(crate) fn probit(&mut self, a: &Value) -> Value {
+        let two = self.constant(2.0, a.ty.clone());
+        let one = self.constant(1.0, a.ty.clone());
+        let scaled = self.mul(a, &two);
+        let centred = self.sub(&scaled, &one);
+        let e = self.erf_inv(&centred);
+        let sqrt2 = self.constant(std::f64::consts::SQRT_2, a.ty.clone());
+        self.mul(&e, &sqrt2)
+    }
+
+    /// `invprobit(x) = Φ(x) = ½·(1 + erf(x / √2))` (spec §07's standard-normal
+    /// CDF). Same identity `crate::registry::normal_cdf` uses at
+    /// `mu = 0, sigma = 1`, spelled here for the op map because
+    /// `crate::ops` has no `Params` to read.
+    pub(crate) fn invprobit(&mut self, a: &Value) -> Value {
+        let sqrt2 = self.constant(std::f64::consts::SQRT_2, a.ty.clone());
+        let z = self.div(a, &sqrt2);
+        let erf_z = self.erf(&z);
+        let one = self.constant(1.0, a.ty.clone());
+        let one_plus = self.add(&one, &erf_z);
+        let half = self.constant(0.5, a.ty.clone());
+        self.mul(&half, &one_plus)
+    }
+
+    /// `expm1(x) = eˣ − 1` (spec §07) — core
+    /// `stablehlo.exponential_minus_one`.
+    pub(crate) fn expm1(&mut self, a: &Value) -> Value {
+        self.unary_real("stablehlo.exponential_minus_one", a)
+    }
+
+    /// `tan(x) = sin(x) / cos(x)` (spec §07) — the composition
+    /// [`Emitter::sin`]'s doc comment records as this crate's choice, both
+    /// factors core StableHLO ops. `atan`'s image gate keeps the argument
+    /// strictly inside `(−π/2, π/2)`, so the poles are never reached.
+    pub(crate) fn tan(&mut self, a: &Value) -> Value {
+        let s = self.sin(a);
+        let c = self.cos(a);
+        self.div(&s, &c)
+    }
+
+    /// `log1p(x) = ln(1 + x)` (spec §07) — core `stablehlo.log_plus_one`,
+    /// which honours §07's "`log1p` evaluates to `-inf` at $x = -1$"
+    /// directly.
+    pub(crate) fn log1p(&mut self, a: &Value) -> Value {
+        self.unary_real("stablehlo.log_plus_one", a)
+    }
+
+    /// `tanh(x)` (spec §07) — core `stablehlo.tanh`. Reached as the head of
+    /// `tanh`'s OWN log-volume term, `log(1 − tanh(x)²)`, not as an inverse.
+    pub(crate) fn tanh(&mut self, a: &Value) -> Value {
+        self.unary_real("stablehlo.tanh", a)
+    }
+
+    /// `sinh(x)` (spec §07) — `chlo.sinh`. Preferred over
+    /// `(eˣ − e⁻ˣ)/2`, which overflows for large `|x|` where the single op
+    /// does not.
+    pub(crate) fn sinh(&mut self, a: &Value) -> Value {
+        self.chlo_unary("chlo.sinh", a)
+    }
+
+    /// `cosh(x)` (spec §07) — `chlo.cosh`. Reached as the head of `sinh`'s
+    /// log-volume term, `log(cosh(x))`, not as an inverse.
+    pub(crate) fn cosh(&mut self, a: &Value) -> Value {
+        self.chlo_unary("chlo.cosh", a)
+    }
+
+    /// `asinh(x)` = $\operatorname{arsinh}(x)$ (spec §07) — `chlo.asinh`.
+    /// Preferred over `log(x + √(x² + 1))`, whose `x²` overflows for large
+    /// `|x|`.
+    pub(crate) fn asinh(&mut self, a: &Value) -> Value {
+        self.chlo_unary("chlo.asinh", a)
+    }
+
+    /// `atanh(x)` = $\operatorname{artanh}(x)$ (spec §07), composed as
+    /// `½·(log1p(x) − log1p(−x))`.
+    ///
+    /// NOT `chlo.atanh`: that op's value is right but Enzyme differentiates
+    /// it to the NEGATED derivative (measured `−1/(1 − x²)` at every probed
+    /// point), which would silently invert the gradient of any density that
+    /// reached it. The composed form is gradient-correct and keeps §07's
+    /// endpoints — at `x = ±1` one `log_plus_one` is `−inf`, giving `±inf`.
+    pub(crate) fn atanh(&mut self, a: &Value) -> Value {
+        let neg = self.neg(a);
+        let plus = self.log1p(a);
+        let minus = self.log1p(&neg);
+        let diff = self.sub(&plus, &minus);
+        let half = self.constant(0.5, a.ty.clone());
+        self.mul(&half, &diff)
+    }
+
     /// `%N = stablehlo.compare {dir}, %a, %b : (lhs, rhs) -> i1-shape`.
     /// `dir` is a StableHLO `comparison_direction` (`"LT"`, `"GE"`, `"EQ"`,
     /// ...). The result is logically an `i1` tensor of the operands' shape —
@@ -927,31 +1048,31 @@ impl<'m> Emitter<'m> {
 
     // ---- CHLO special functions ------------------------------------------
 
-    /// `%N = chlo.lgamma %a : in_ty -> out_ty` — the log-gamma function.
-    /// Unlike the `stablehlo.*` elementary unary ops, `chlo.lgamma` is a
-    /// function-type op (its operand and result types are separated by
-    /// `->`, both spelled out) rather than the single-`: ty` form `unary`
-    /// emits — elementwise here, so `in_ty == out_ty`, but both must still
-    /// be written for the op to parse. Real-only (like [`Emitter::log`]):
-    /// `a` is [`Emitter::convert`]ed to [`ElemKind::Real`] first — e.g. a
-    /// literal-parameter `Gamma(2, 1)`'s `shape` reaches
-    /// `crate::registry::gamma_logpdf`'s `lgamma(&shape)` as a bare `Int`
-    /// value constant, with no `NodeId` for the caller to coerce against an
-    /// inferred result kind (`crate::registry` calls this directly, never
-    /// through `crate::ops`'s dispatch table).
-    pub fn lgamma(&mut self, a: &Value) -> Value {
+    /// One elementwise CHLO unary op, `%N = {op} %a : ty -> ty`. CHLO spells
+    /// its operand and result types either side of a `->`, both written out,
+    /// rather than the single-`: ty` form [`Emitter::unary`] emits; the op
+    /// does not parse without both. Real-only, like [`Emitter::unary_real`]:
+    /// no CHLO op here has integer semantics.
+    fn chlo_unary(&mut self, op: &str, a: &Value) -> Value {
         let a = &self.convert(a, ElemKind::Real);
         let ssa = self.fresh();
         let ty_text = a.ty.render(self.dtype, a.elem);
-        self.push(&format!(
-            "{ssa} = chlo.lgamma {} : {ty_text} -> {ty_text}",
-            a.ssa
-        ));
+        self.push(&format!("{ssa} = {op} {} : {ty_text} -> {ty_text}", a.ssa));
         Value {
             ssa,
             ty: a.ty.clone(),
             elem: ElemKind::Real,
         }
+    }
+
+    /// `chlo.lgamma` — the log-gamma function. Real-only conversion matters
+    /// here: a literal-parameter `Gamma(2, 1)`'s `shape` reaches
+    /// `crate::registry::gamma_logpdf`'s `lgamma(&shape)` as a bare `Int`
+    /// value constant, with no `NodeId` for the caller to coerce against an
+    /// inferred result kind (`crate::registry` calls this directly, never
+    /// through `crate::ops`'s dispatch table).
+    pub fn lgamma(&mut self, a: &Value) -> Value {
+        self.chlo_unary("chlo.lgamma", a)
     }
 
     // VonMises log-I₀ (Task 10) must inline a polynomial approximation —
@@ -1449,17 +1570,7 @@ impl<'m> Emitter<'m> {
     /// The Normal CDF's core (spec §07 `builtin_touniform`, see
     /// [`crate::registry::normal_cdf`]).
     pub(crate) fn erf(&mut self, a: &Value) -> Value {
-        let ssa = self.fresh();
-        let ty_text = a.ty.render(self.dtype, a.elem);
-        self.push(&format!(
-            "{ssa} = chlo.erf {} : {ty_text} -> {ty_text}",
-            a.ssa
-        ));
-        Value {
-            ssa,
-            ty: a.ty.clone(),
-            elem: ElemKind::Real,
-        }
+        self.chlo_unary("chlo.erf", a)
     }
 
     /// `atan(a)` (the arctangent, `(-π/2, π/2)`), via the core StableHLO binary
@@ -1474,23 +1585,12 @@ impl<'m> Emitter<'m> {
         self.binary("stablehlo.atan2", a, &one)
     }
 
-    /// `%N = chlo.erf_inv %a : ty -> ty` — the inverse error function (the
-    /// probit's core), a CHLO function-type op like [`Emitter::lgamma`]. Pinned
-    /// in the plan's Task-1 spike (parses + Enzyme-executes; a golden using it
-    /// must therefore carry the `chlo` dialect). Private: only
-    /// [`Emitter::uniform_to_normal`] needs it.
+    /// `chlo.erf_inv` — the inverse error function, the probit's core. Parses
+    /// and Enzyme-EXECUTES, but Enzyme cannot DIFFERENTIATE it ("could not
+    /// compute the adjoint for this operation"), so any density path reaching
+    /// [`Emitter::probit`] yields values without gradients.
     fn erf_inv(&mut self, a: &Value) -> Value {
-        let ssa = self.fresh();
-        let ty_text = a.ty.render(self.dtype, a.elem);
-        self.push(&format!(
-            "{ssa} = chlo.erf_inv {} : {ty_text} -> {ty_text}",
-            a.ssa
-        ));
-        Value {
-            ssa,
-            ty: a.ty.clone(),
-            elem: ElemKind::Real,
-        }
+        self.chlo_unary("chlo.erf_inv", a)
     }
 
     /// Broadcast a `Scalar` operand `s` up to `out_ty` (a no-op clone when
