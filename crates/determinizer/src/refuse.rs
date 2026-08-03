@@ -33,4 +33,13 @@ pub enum NonConformKind {
     /// binding-removal pass (root-based DCE, Buffy #263 Pass 4-A, is the first
     /// one) dropping a binding something still points at.
     DanglingSelfRef,
+    /// A `CallHead::User` application survived into FlatPDL. FlatPDL is
+    /// deterministic ops plus the six `builtin_*` primitives (§07 "Measure
+    /// kernel evaluation primitives"); an application of a user-defined callable
+    /// is neither, and no consumer can evaluate one.
+    ResidualUserCall,
+    /// A call to one of the six `builtin_*` primitives carries the wrong number
+    /// of arguments for its §07 signature. `flatppl-infer` has no arity rule for
+    /// these, so a mis-arity primitive is typed, not `Type::Failed`.
+    BuiltinArity,
 }
