@@ -730,6 +730,14 @@ fn unsupported_selector_forms_refuse_as_projections_not_as_unrecognised_maps() {
              lp = logdensityof(p, [0.5, 0.7])",
             "not all field names or all integer indices",
         ),
+        (
+            // Zero selector args is the opposite of multi-axis; the message
+            // must not claim "more than one selector argument".
+            "m = iid(Normal(mu = 0.0, sigma = 1.0), 3)\n\
+             p = pushfwd(fn(get(_)), m)\n\
+             lp = logdensityof(p, [0.5, 0.7, 0.9])",
+            "no selector argument",
+        ),
     ];
     for (src, expected) in cases {
         let e = format!(

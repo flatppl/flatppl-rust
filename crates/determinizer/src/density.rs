@@ -3309,11 +3309,14 @@ fn recognize_get_projection(m: &Module, f: NodeId) -> Option<GetProjection> {
     if !get.named.is_empty() {
         return unsupported("a keyword selector argument");
     }
-    if get.args.len() != 2 {
+    if get.args.len() > 2 {
         // §07 spells a multi-axis subset `get(A, [1, 3, 4], 2)`. A product measure's
         // components live on ONE axis, so a second selector axis has no component
         // meaning here.
         return unsupported("a multi-axis selector (more than one selector argument)");
+    }
+    if get.args.len() < 2 {
+        return unsupported("no selector argument");
     }
     let sel = get.args[1];
     // Subset selector: a non-empty `vector` of string literals (fields) or of
