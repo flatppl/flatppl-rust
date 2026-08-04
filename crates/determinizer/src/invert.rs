@@ -307,10 +307,13 @@ fn wrap_elementwise(m: &mut Module, per_cell: &Bijection) -> Bijection {
 pub(crate) struct ImageGate {
     /// The boolean condition "`y` is in `f`'s image".
     pub(crate) cond: NodeId,
-    /// A point strictly INSIDE the image — the value the gate substitutes for an
-    /// excluded `y` (`crate::density::gate_point`), so no dangerous op in the gated
-    /// arm ever sees one. `None` where no point is derivable: the base's support names
-    /// none, or it lies outside the forward's own §06 domain.
+    /// A point IN the image — the value the gate substitutes for an excluded `y`
+    /// (`crate::density::gate_point`), so no dangerous op in the gated arm ever sees
+    /// one. Usually interior, but ON the boundary where a CLOSED endpoint comes from a
+    /// discrete support's hull (`booleans`' witness is 1, and `exp(1) = e` is the hull
+    /// image's own endpoint) — which is enough, since the arm only needs every op in it
+    /// to stay finite there. `None` where no point is derivable: the base's support
+    /// names none, or it lies outside the forward's own §06 domain.
     pub(crate) witness: Option<NodeId>,
 }
 
@@ -394,12 +397,13 @@ fn image_ops(m: &Module, f: NodeId) -> Option<Vec<ImageOp>> {
 }
 
 /// The image of a base whose support is `support` under `ops`: the support's extent
-/// pushed through them INNERMOST-first ([`push_extent`]). `None` only where the walk
-/// has no op to take a range from and the support proves no extent.
+/// pushed through them INNERMOST-first ([`push_extent`]). `None` where the walk has no
+/// op to take a range from and the support proves no extent, and where an op leaves
+/// nothing to map ([`Extent::nonempty`]).
 fn image_extent(ops: &[ImageOp], support: &ValueSet) -> Option<Extent> {
     let mut ext = Extent::of_support(support);
     for op in ops.iter().rev() {
-        ext = Some(push_extent(ext, op));
+        ext = Some(push_extent(ext, op)?);
     }
     ext
 }
@@ -409,13 +413,16 @@ fn image_extent(ops: &[ImageOp], support: &ValueSet) -> Option<Extent> {
 /// also what an unproven support falls back to (exactly the static per-op image this
 /// walk replaced) and what supplies a bound the map cannot evaluate
 /// ([`EndpointMap::at`]).
-fn push_extent(ext: Option<Extent>, op: &ImageOp) -> Extent {
+///
+/// Capping at the range is what makes the walk MONOTONE in the safe direction: every
+/// result is a subset of the op's own range, hence of the static image it replaced, so
+/// an image can only tighten and never widen.
+fn push_extent(ext: Option<Extent>, op: &ImageOp) -> Option<Extent> {
     let domain = op.domain.map_or(Extent::REALS, Domain::extent);
     let range = domain.map(op.map);
-    match ext {
-        Some(e) => range.intersect(e.intersect(domain).map(op.map)),
-        None => range,
-    }
+    let Some(e) = ext else { return Some(range) };
+    let inside = e.intersect(domain).nonempty()?;
+    range.intersect(inside.map(op.map)).nonempty()
 }
 
 /// A point in the base measure's `support` carried THROUGH the forward: in the image
@@ -565,6 +572,11 @@ enum EndpointMap {
     /// A [`REGISTRY`] unary's own numeric forward, INCREASING on its domain (`neg`,
     /// the one reflection in the table, is `Scale(-1)`).
     Unary(fn(f64) -> f64),
+    /// `atan`, kept its own variant rather than a [`Unary`](Self::Unary) so the
+    /// SPELLING of its range endpoints travels with the op ([`Spelling::HalfPi`]):
+    /// ±π/2 emit as §07 `pi / 2`, which a decimal literal would hide. No other op
+    /// can pick that spelling up.
+    Atan,
     /// `c·x` — `mul` by a literal, and `neg` at `c = −1`.
     Scale(f64),
     /// `x/c` — `divide` by a literal, kept a division so the endpoint is the value
@@ -586,6 +598,7 @@ impl EndpointMap {
     fn at(self, x: f64) -> f64 {
         match self {
             EndpointMap::Unary(f) => f(x),
+            EndpointMap::Atan => x.atan(),
             EndpointMap::Scale(c) => x * c,
             EndpointMap::Divide(c) => x / c,
             EndpointMap::Shift(c) => x + c,
@@ -597,12 +610,32 @@ impl EndpointMap {
     /// Does the op REVERSE the two endpoints?
     fn decreasing(self) -> bool {
         match self {
-            EndpointMap::Unary(_) | EndpointMap::Shift(_) => false,
+            EndpointMap::Unary(_) | EndpointMap::Atan | EndpointMap::Shift(_) => false,
             EndpointMap::Scale(c) | EndpointMap::Divide(c) => c < 0.0,
             EndpointMap::Reflect(_) => true,
             EndpointMap::Pow(k) => k < 0.0,
         }
     }
+
+    /// How the endpoints this op produces are SPELLED — a property of the op, so no
+    /// other op's endpoint can take a symbolic spelling by numeric coincidence.
+    fn spelling(self) -> Spelling {
+        match self {
+            EndpointMap::Atan => Spelling::HalfPi,
+            _ => Spelling::Literal,
+        }
+    }
+}
+
+/// How an [`Extent`]'s endpoints are SPELLED, decided by the op that produced them
+/// ([`EndpointMap::spelling`]).
+#[derive(Clone, Copy, PartialEq)]
+enum Spelling {
+    /// A decimal literal, which `f64`'s shortest-round-trip `Display` recovers
+    /// exactly.
+    Literal,
+    /// The op's range endpoints are ±π/2 and emit as §07 `pi / 2`.
+    HalfPi,
 }
 
 /// A point strictly inside `support` — what a −∞ gate substitutes for an excluded
@@ -882,7 +915,11 @@ impl Domain {
             Domain::AboveMinusOne => (Bound::Open(-1.0), Bound::Unbounded),
             Domain::Unit => (Bound::Open(0.0), Bound::Open(1.0)),
         };
-        Extent { lo, hi }
+        Extent {
+            lo,
+            hi,
+            spell: Spelling::Literal,
+        }
     }
 }
 
@@ -919,13 +956,14 @@ impl Bound {
         m: &mut Module,
         point: NodeId,
         [strict, inclusive]: [&str; 2],
+        spell: Spelling,
     ) -> Option<NodeId> {
         let (op, x) = match self {
             Bound::Unbounded => return None,
             Bound::Open(x) => (strict, x),
             Bound::Closed(x) => (inclusive, x),
         };
-        let bound = bound_node(m, x);
+        let bound = bound_node(m, x, spell);
         Some(build_call(m, op, &[point, bound]))
     }
 }
@@ -946,10 +984,16 @@ impl Bound {
 /// op: over `InverseGamma` (§08 support `posreals`) `sqrt`'s image is open at 0, and
 /// a closed `nonnegreals` admitted `y = 0`, where the gate was TAKEN and the change
 /// of variables differentiated to +inf.
+/// An extent is always NON-EMPTY: `lo` below `hi`, or one point both sides include.
+/// [`intersect`](Extent::intersect) is the only operation that can violate that, and
+/// [`nonempty`](Extent::nonempty) is where it is caught.
 #[derive(Clone, Copy)]
 struct Extent {
     lo: Bound,
     hi: Bound,
+    /// How both endpoints are SPELLED — set by the op that produced them, never read
+    /// off their values ([`EndpointMap::spelling`]).
+    spell: Spelling,
 }
 
 impl Extent {
@@ -957,6 +1001,7 @@ impl Extent {
     const REALS: Extent = Extent {
         lo: Bound::Unbounded,
         hi: Bound::Unbounded,
+        spell: Spelling::Literal,
     };
 
     /// The extent of a base measure's inferred support (§03's sets, read via
@@ -987,7 +1032,11 @@ impl Extent {
             }
             _ => return None,
         };
-        Some(Extent { lo, hi })
+        Some(Extent {
+            lo,
+            hi,
+            spell: Spelling::Literal,
+        })
     }
 
     /// This extent mapped through `map`, monotone on it: the two endpoint images,
@@ -998,19 +1047,47 @@ impl Extent {
     fn map(self, map: EndpointMap) -> Extent {
         let lo = map_bound(self.lo, f64::NEG_INFINITY, map);
         let hi = map_bound(self.hi, f64::INFINITY, map);
-        if map.decreasing() {
-            Extent { lo: hi, hi: lo }
-        } else {
-            Extent { lo, hi }
+        let (lo, hi) = if map.decreasing() { (hi, lo) } else { (lo, hi) };
+        Extent {
+            lo,
+            hi,
+            spell: map.spelling(),
         }
     }
 
-    /// The tighter of two extents on each side.
+    /// The tighter of two extents on each side. A symbolic spelling survives only
+    /// where both sides agree on it — the two partners in [`push_extent`] are one
+    /// op's range and its mapped support, so they always do.
     fn intersect(self, other: Extent) -> Extent {
         Extent {
             lo: tighter(self.lo, other.lo, f64::NEG_INFINITY, |a, b| a > b),
             hi: tighter(self.hi, other.hi, f64::INFINITY, |a, b| a < b),
+            spell: if self.spell == other.spell {
+                self.spell
+            } else {
+                Spelling::Literal
+            },
         }
+    }
+
+    /// `None` where this extent contains NO point: `lo` above `hi`, or one point that
+    /// either side excludes. Only [`intersect`](Self::intersect) can produce one, and
+    /// only where the base's support is disjoint from the op's §06 domain — reachable
+    /// through an explicit `bijection`, which skips the `Domain::admits` check
+    /// (`crate::density::lower_pushfwd`). Every such case collapses to `Unbounded`
+    /// today because the out-of-domain endpoint maps to NaN or ±inf, but an inverted
+    /// extent whose endpoints stayed finite would emit `interval(lo, hi)` backwards,
+    /// which the StableHLO `in` lowering reads as the COMPLEMENT of the intended set
+    /// (its closed-interval identity is `(v − lo)·(hi − v) >= 0`). No gate is the
+    /// honest answer: an always-false one would be a false −∞ wherever the map does
+    /// have mass.
+    fn nonempty(self) -> Option<Extent> {
+        let (lo, hi) = (
+            self.lo.value(f64::NEG_INFINITY),
+            self.hi.value(f64::INFINITY),
+        );
+        let holds = lo < hi || (lo == hi && self.lo.is_closed() && self.hi.is_closed());
+        holds.then_some(self)
     }
 
     /// The membership condition on a SCALAR query point. `None` for an unbounded
@@ -1051,8 +1128,8 @@ impl Extent {
             (Bound::Open(0.0), Bound::Unbounded) => Some(bare_const(m, "posreals")),
             (Bound::Closed(0.0), Bound::Unbounded) => Some(bare_const(m, "nonnegreals")),
             (Bound::Closed(lo), Bound::Closed(hi)) => {
-                let lo = bound_node(m, lo);
-                let hi = bound_node(m, hi);
+                let lo = bound_node(m, lo, self.spell);
+                let hi = bound_node(m, hi, self.spell);
                 Some(build_call(m, "interval", &[lo, hi]))
             }
             _ => None,
@@ -1063,8 +1140,8 @@ impl Extent {
     /// endpoint), conjoined, with an unbounded side dropped. `None` when neither side
     /// is bounded.
     fn comparisons(&self, m: &mut Module, lo_point: NodeId, hi_point: NodeId) -> Option<NodeId> {
-        let above = self.lo.compare(m, lo_point, ["gt", "ge"]);
-        let below = self.hi.compare(m, hi_point, ["lt", "le"]);
+        let above = self.lo.compare(m, lo_point, ["gt", "ge"], self.spell);
+        let below = self.hi.compare(m, hi_point, ["lt", "le"], self.spell);
         match (above, below) {
             (Some(a), Some(b)) => Some(build_call(m, "land", &[a, b])),
             (Some(c), None) | (None, Some(c)) => Some(c),
@@ -1110,16 +1187,22 @@ fn tighter(a: Bound, b: Bound, side: f64, cuts_more: impl Fn(f64, f64) -> bool) 
     }
 }
 
-/// An [`Extent`] endpoint as a node. `±pi/2` keeps the symbolic §07 `pi` spelling it
-/// is `atan`'s image endpoint by; every other endpoint is a literal, which
-/// `f64`'s shortest-round-trip `Display` recovers exactly.
-fn bound_node(m: &mut Module, x: f64) -> NodeId {
-    if x == std::f64::consts::FRAC_PI_2 {
-        return half_pi(m);
-    }
-    if x == -std::f64::consts::FRAC_PI_2 {
+/// An [`Extent`] endpoint as a node: a decimal literal, except where the OP that
+/// produced the endpoint declares a symbolic spelling for it ([`Spelling`]).
+///
+/// The magnitude check is not the key, it is the CONFIRMATION: `spell` says this op's
+/// range endpoints are ±π/2, and the check says this bound is one of them rather than
+/// an interior image point. `atan` over a BOUNDED support has finite interior
+/// endpoints (`atan([0, 1])` is `[0, 0.7853981633974483]`) and they are literals like
+/// any other.
+fn bound_node(m: &mut Module, x: f64, spell: Spelling) -> NodeId {
+    if spell == Spelling::HalfPi && x.abs() == std::f64::consts::FRAC_PI_2 {
         let h = half_pi(m);
-        return build_call(m, "neg", &[h]);
+        return if x < 0.0 {
+            build_call(m, "neg", &[h])
+        } else {
+            h
+        };
     }
     real_lit(m, x)
 }
@@ -1130,7 +1213,7 @@ fn bare_const(m: &mut Module, name: &str) -> NodeId {
     m.alloc(Node::Const(sym))
 }
 
-/// A real literal node — an [`Image::Open`] endpoint.
+/// A real literal node — an [`Extent`] endpoint.
 fn real_lit(m: &mut Module, x: f64) -> NodeId {
     m.alloc(Node::Lit(Scalar::Real(x)))
 }
@@ -1357,8 +1440,10 @@ static REGISTRY: &[(&str, UnaryEntry)] = &[
             domain: None,
             // `tan` is the single-valued inverse only on `atan`'s range (−π/2, π/2) —
             // outside it `tan(y)` is still finite, so an ungated query would read a
-            // preimage that is not one. Open at both: `tan(±π/2) = ±∞`.
-            map: EndpointMap::Unary(f64::atan),
+            // preimage that is not one. Open at both: `tan(±π/2) = ±∞`. Its own
+            // [`EndpointMap`] variant, which is what carries the symbolic `pi / 2`
+            // spelling of those two endpoints.
+            map: EndpointMap::Atan,
         },
     ),
     // sinh(x) ⇒ log|f'| = ln cosh(x); inverse asinh. Domain ℝ.

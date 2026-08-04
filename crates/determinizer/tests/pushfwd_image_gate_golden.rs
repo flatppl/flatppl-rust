@@ -396,6 +396,23 @@ fn the_image_endpoint_follows_the_bases_support() {
             "`{base}`: expected `{expected}`:\n{out}"
         );
     }
+    // The same contrast under ONE forward, so nothing but the support's openness can
+    // explain the difference: `exp` carries `LogNormal`'s `posreals` to the OPEN
+    // `(1, ∞)` and `Gamma`'s `nonnegreals` to the CLOSED `[1, ∞)`. Both endpoints are
+    // finite, which no §03 set spells, so both gate by comparison — `gt` against `ge`
+    // is the whole difference.
+    for (base, expected) in [
+        ("LogNormal(mu = 0.0, sigma = 1.0)", "(gt 0.5 1.0)"),
+        ("Gamma(shape = 2.0, rate = 1.0)", "(ge 0.5 1.0)"),
+    ] {
+        let out = lp(&format!(
+            "d = pushfwd(exp, {base})\nlp = logdensityof(d, 0.5)"
+        ));
+        assert!(
+            out.contains(expected) && out.contains("(neg inf)"),
+            "`exp` over `{base}`: expected `{expected}`:\n{out}"
+        );
+    }
     // `Beta`'s `[0, 1]` maps to `[0, 1]` — bounded and closed at both ends, which §03
     // spells `interval(lo, hi)` ("denotes the closed interval"). Not `unitinterval`,
     // the same set: the StableHLO `in` lowering does not take that name.
