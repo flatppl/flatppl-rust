@@ -1,0 +1,183 @@
+//! Call-arity rules: §07 argument counts for builtins whose parameter list the
+//! catalogue declares, and declared-parameter counts for user-defined callables.
+//!
+//! Before these rules a mis-arity call typed silently — every rule arm that
+//! indexes fixed argument positions ignored extras and defaulted a missing one,
+//! so `exp(1.0, 2.0)` was `real` and `log()` was `real`.
+
+use flatppl_infer::{Diagnostic, Severity, infer};
+
+fn ir(src: &str) -> String {
+    let mut m = flatppl_syntax::parse(src).unwrap();
+    let _ = infer(&mut m);
+    flatppl_flatpir::write(&m)
+}
+
+fn errors(src: &str) -> Vec<String> {
+    let mut m = flatppl_syntax::parse(src).unwrap();
+    infer(&mut m)
+        .into_iter()
+        .filter(|d: &Diagnostic| d.severity == Severity::Error)
+        .map(|d| d.message)
+        .collect()
+}
+
+/// The six leaks that motivated the rule. Each typed a concrete scalar (or
+/// `%deferred`) before; each is `%failed` now, with the callee and its declared
+/// count named.
+#[test]
+fn measured_leaks_are_now_static_errors() {
+    for (src, want) in [
+        ("x = add(1.0)", "`add` takes 2 arguments (spec §07), got 1"),
+        (
+            "x = add(1.0, 2.0, 3.0)",
+            "`add` takes 2 arguments (spec §07), got 3",
+        ),
+        (
+            "x = exp(1.0, 2.0)",
+            "`exp` takes 1 argument (spec §07), got 2",
+        ),
+        (
+            "x = sqrt(1.0, 2.0, 3.0)",
+            "`sqrt` takes 1 argument (spec §07), got 3",
+        ),
+        (
+            "x = lengthof([1.0], 2.0)",
+            "`lengthof` takes 1 argument (spec §07), got 2",
+        ),
+        ("x = log()", "`log` takes 1 argument (spec §07), got 0"),
+    ] {
+        assert_eq!(errors(src), vec![want.to_string()], "for {src}");
+        assert!(
+            ir(src).contains("(%failed"),
+            "{src} must type %failed:\n{}",
+            ir(src)
+        );
+    }
+}
+
+/// A well-formed call is untouched: no error, and the type the op's own rule
+/// produces.
+#[test]
+fn correct_arity_still_types() {
+    assert!(errors("x = exp(1.0)").is_empty());
+    assert!(errors("x = add(1.0, 2.0)").is_empty());
+    assert!(errors("x = ifelse(true, 1.0, 2.0)").is_empty());
+    assert!(errors("a = [1.0, 2.0]\nx = lengthof(a)").is_empty());
+}
+
+/// §07 "Linear algebra": "when called as `diag(A)`, `k` defaults to `0`" — both
+/// spellings pass, a third argument does not.
+#[test]
+fn optional_parameter_admits_both_spellings() {
+    let m = "M = rowstack([[1.0, 2.0], [3.0, 4.0]])\n";
+    assert!(errors(&format!("{m}x = diag(M)")).is_empty());
+    assert!(errors(&format!("{m}x = diag(M, 1)")).is_empty());
+    assert_eq!(
+        errors(&format!("{m}x = diag(M, 1, 2)")),
+        vec!["`diag` takes 1 or 2 arguments (spec §07), got 3".to_string()]
+    );
+}
+
+/// §07: `builtin_sample(rngstate, kernel, kernel_input, n, m, ...)` — "or a
+/// scalar `X` if no `n, m, ...` are given", so three is a minimum. `get`'s
+/// selector list is variadic the same way.
+#[test]
+fn variadic_parameter_has_a_minimum_but_no_maximum() {
+    let s = "state = rnginit(0)\nk = record(mu = 0.0, sigma = 1.0)\n";
+    assert!(errors(&format!("{s}xs, s2 = builtin_sample(state, Normal, k)")).is_empty());
+    assert!(
+        errors(&format!(
+            "{s}xs, s2 = builtin_sample(state, Normal, k, 4, 5)"
+        ))
+        .is_empty()
+    );
+    assert_eq!(
+        errors(&format!("{s}xs, s2 = builtin_sample(state, Normal)")),
+        vec!["`builtin_sample` takes at least 3 arguments (spec §07), got 2".to_string()]
+    );
+
+    let v = "v = [1.0, 2.0, 3.0]\n";
+    assert!(errors(&format!("{v}x = get(v, 1)")).is_empty());
+    assert_eq!(
+        errors(&format!("{v}x = get(v)")),
+        vec!["`get` takes at least 2 arguments (spec §07), got 1".to_string()]
+    );
+}
+
+/// Named arguments count toward the total, so the keyword spelling of a §07
+/// parameter is not a missing argument.
+#[test]
+fn named_arguments_count_toward_arity() {
+    assert!(errors("n = 3\nx = checked(n, condition = n > 0)").is_empty());
+    assert!(errors("n = 3\nx = checked(value = n, condition = n > 0)").is_empty());
+    assert_eq!(
+        errors("n = 3\nx = checked(n, condition = n > 0, extra = 1.0)"),
+        vec!["`checked` takes 2 arguments (spec §07), got 3".to_string()]
+    );
+}
+
+/// Applying a user-defined callable at the wrong arity is a static error naming
+/// the callee, instead of typing through `substituted_result`'s
+/// bind-what-you-can and reaching the determiniser as a `ResidualUserCall`.
+#[test]
+fn user_call_arity_is_checked_against_the_declared_parameters() {
+    let f = "scale(x) = mul(x, 2.0)\n";
+    assert!(errors(&format!("{f}s = scale(1.5)")).is_empty());
+    assert_eq!(
+        errors(&format!("{f}s = scale(1.5, 3.0)")),
+        vec!["`scale` declares 1 parameter, got 2 arguments".to_string()]
+    );
+    assert_eq!(
+        errors(&format!("{f}s = scale()")),
+        vec!["`scale` declares 1 parameter, got 0 arguments".to_string()]
+    );
+
+    let g = "lin(a, b, x) = add(a, mul(b, x))\n";
+    assert!(errors(&format!("{g}y = lin(1.0, 2.0, 3.0)")).is_empty());
+    assert!(
+        errors(&format!("{g}y = lin(a = 1.0, b = 2.0, x = 3.0)")).is_empty(),
+        "keyword application of every parameter must pass"
+    );
+    assert_eq!(
+        errors(&format!("{g}y = lin(1.0, 2.0)")),
+        vec!["`lin` declares 3 parameters, got 2 arguments".to_string()]
+    );
+}
+
+/// A §08 distribution constructor is NOT arity-checked: its catalogue `params`
+/// are §08 field names added for the determiniser, and several rows are
+/// knowingly degraded, so enforcing §08 constructor arity needs its own pass.
+#[test]
+fn distribution_constructors_are_not_arity_checked() {
+    assert!(errors("m = Normal(0.0, 1.0, 2.0)").is_empty());
+}
+
+/// §07's "Domains" column for the elementary functions lists `reals` and
+/// `complexes`, never `integers`: an integer argument is admitted only through
+/// §03's `integers ⊂ reals`, so the real-domain function applies and the result
+/// is real. `exp(2)` typed `integer` before this row fix, which is what forced
+/// the determiniser's value-identity `real()` wrap.
+#[test]
+fn elementary_functions_of_an_integer_are_real() {
+    for src in [
+        "x = exp(2)",
+        "x = log(2)",
+        "x = sqrt(4)",
+        "x = sin(1)",
+        "x = loggamma(3)",
+        "x = conj(2)",
+    ] {
+        let out = ir(src);
+        assert!(
+            out.contains("(%scalar real)") && !out.contains("(%scalar integer)"),
+            "{src} must be a real scalar; got:\n{out}"
+        );
+    }
+    // The complex path is unchanged.
+    let out = ir("x = exp(complex(1.0, 2.0))");
+    assert!(
+        out.contains("(%scalar complex)"),
+        "exp of a complex stays complex; got:\n{out}"
+    );
+}

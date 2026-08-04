@@ -57,6 +57,9 @@ pub(crate) fn call_rule(
     // User-defined callable application: the result looks through the callee
     // to the reified body (spec §11 reified callables).
     if let Some((callee_node, callee_ty)) = callee {
+        if let Some(ty) = user_arity_check(inf, id, callee_node, args, named) {
+            return (ty, joined);
+        }
         let ty = user_call_type(inf, callee_node, &callee_ty, args, named);
         return (ty, joined);
     }
@@ -70,6 +73,13 @@ pub(crate) fn call_rule(
     // + body, and always *fixed* (a reification closes over its ancestry).
     if call.inputs.is_some() {
         return (reification_type(inf, id, call, &name, args), Phase::Fixed);
+    }
+
+    // Call arity, where the catalogue declares a parameter list. Ahead of the
+    // per-op rules because most of them index fixed argument positions and so
+    // ignore extras and silently type an under-supplied call.
+    if let Some(ty) = arity_check(inf, id, &name, args.len() + named.len()) {
+        return (ty, joined);
     }
 
     let ty = match name.as_str() {
@@ -586,7 +596,7 @@ pub(crate) fn call_rule(
         "broadcast" => broadcast_type(inf, args, named),
 
         // ---- catalogue dispatch (spec §07 functions + spec §08 distributions) ----
-        // Per-name functions whose result is a pure scalar (constant, SameScalarKind,
+        // Per-name functions whose result is a pure scalar (constant, RealOrComplexOfArg,
         // or DomainMap) are declared in catalogue.ron and lowered here.
         // Distribution constructors (Sig::Distribution rows) are also dispatched here.
         // Structural ops above cannot be expressed in ResultSig and stay as code.
@@ -1906,6 +1916,50 @@ fn cat_or_diagnose(
     }
 }
 
+/// Reject an application of a user-defined callable whose argument count
+/// contradicts the callable's declared parameter list. Returns
+/// `Some(Type::Failed)` for a mismatch, `None` when the count matches or the
+/// callee is not a local reification (a cross-module or non-reified callee
+/// declares no parameter list here).
+///
+/// Without this the call still types — `substituted_result` binds parameters to
+/// arguments by keyword then position and ignores the rest — so a wrong-arity
+/// application reaches the determiniser as a `ResidualUserCall` refusal instead
+/// of a static error naming the callee.
+fn user_arity_check(
+    inf: &mut Inferencer<'_, '_>,
+    id: NodeId,
+    callee: NodeId,
+    args: &[ArgInfo],
+    named: &[NamedInfo],
+) -> Option<Type> {
+    // A §09 standard-module application is checked against its catalogue row,
+    // not against a local reification's inputs.
+    if inf.module_catalogue_ref(callee).is_some() {
+        return None;
+    }
+    let (reif_id, _) = local_reification(inf, callee)?;
+    let want = input_entries(inf, reif_id)?.len();
+    let got = args.len() + named.len();
+    if got == want {
+        return None;
+    }
+    let who = match inf.module.node(callee) {
+        Node::Ref(r) if r.ns == RefNs::SelfMod => {
+            format!("`{}`", inf.module.resolve(r.name))
+        }
+        _ => "callable".to_string(),
+    };
+    let noun = if want == 1 { "parameter" } else { "parameters" };
+    inf.diags.push(crate::Diagnostic::error_at(
+        id,
+        format!("{who} declares {want} {noun}, got {got} arguments"),
+    ));
+    Some(Type::Failed(
+        format!("user call declares {want} {noun}, got {got}").into(),
+    ))
+}
+
 /// Calling a user-defined callable: a function returns its body's type, a
 /// kernel returns the *measure* its body denotes (`kernelof` reifies the law
 /// of a value-typed body).
@@ -2392,7 +2446,7 @@ fn broadcast_type(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo], named: &[Named
     // argument types feed the lowering: an array input contributes its element
     // type, a scalar rides along unchanged (every current §09 sig has a fixed
     // cell type, but lowering against the cell args keeps a future
-    // `SameScalarKind` / `DomainMap` row correct).
+    // `RealOrComplexOfArg` / `DomainMap` row correct).
     if let Some(sig) = inf.module_catalogue_ref(head_node).map(|c| c.sig.clone()) {
         let cell_args: Vec<ArgInfo> = args[1..]
             .iter()
@@ -2496,12 +2550,33 @@ fn broadcast_distribution_no_shape(inf: &mut Inferencer<'_, '_>, head_node: Node
     }
 }
 
+/// Reject a call whose argument count contradicts the callee's declared §07
+/// parameter list. Returns `Some(Type::Failed)` for a mis-arity call and `None`
+/// when the call is admissible or the catalogue declares no arity for `name`.
+///
+/// `got` counts named arguments too: every §07 parameter is nameable, so
+/// `checked(value_expr, condition = …)` supplies two.
+fn arity_check(inf: &mut Inferencer<'_, '_>, id: NodeId, name: &str, got: usize) -> Option<Type> {
+    let arity = crate::catalogue::builtin().base_arity(name)?;
+    if arity.admits(got) {
+        return None;
+    }
+    let declared = arity.describe();
+    inf.diags.push(crate::Diagnostic::error_at(
+        id,
+        format!("`{name}` takes {declared} (spec §07), got {got}"),
+    ));
+    Some(Type::Failed(
+        format!("{name} takes {declared}, got {got}").into(),
+    ))
+}
+
 /// The result type of a per-name function declared in the catalogue as
 /// `Sig::Function`, or `None` if the name is not a known function (so the
 /// caller can fall through to distribution dispatch, then gap).
 ///
 /// `arg_scalar` is built from the inferred positional argument types so that
-/// `SameScalarKind` and `DomainMap` sigs can read the call-site scalar kind.
+/// `RealOrComplexOfArg` and `DomainMap` sigs can read the call-site scalar kind.
 fn function_result(
     module: &mut flatppl_core::Module,
     name: &str,

@@ -62,10 +62,9 @@ pub(crate) enum Sig {
         params: Vec<String>,
     },
     Function {
-        // Declared parameter types: parsed from RON for schema fidelity, but
-        // `lower` does not type-check function arguments (result inference is
-        // structural over the call), so the field is never read.
-        #[allow(dead_code)]
+        /// Declared parameter list. `lower` does not type-check arguments
+        /// (result inference is structural over the call), so only the list's
+        /// *shape* is read — by [`Arity::of`], for the call-arity rule.
         params: Vec<ParamSig>,
         result: ResultSig,
         /// The result's value-set, when tighter than the result type's natural
@@ -75,6 +74,64 @@ pub(crate) enum Sig {
         #[serde(default)]
         result_set: ResultSet,
     },
+    /// A builtin whose §07 parameter list is declared here but whose result type
+    /// is computed structurally in `ops.rs` (operand promotion, container shape
+    /// construction, measure-algebra threading). `ResultSig` cannot express
+    /// those, so the row carries the arity alone: `lower` never sees it and
+    /// `function_result` returns `None` for it, leaving the `ops.rs` arm
+    /// authoritative for the type.
+    Structural { params: Vec<ParamSig> },
+}
+
+/// The admissible positional-argument count of a catalogue row: `min` required
+/// parameters, and `max` = `None` for a trailing [`ParamSig::Variadic`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Arity {
+    pub min: usize,
+    pub max: Option<usize>,
+}
+
+impl Arity {
+    /// Derive the arity of a declared parameter list. Required parameters count
+    /// toward `min`; a trailing `Optional` raises `max` without raising `min`;
+    /// a trailing `Variadic` removes the upper bound.
+    fn of(params: &[ParamSig]) -> Arity {
+        let mut min = 0;
+        let mut max = Some(0);
+        for p in params {
+            match p {
+                ParamSig::Variadic(_) => max = None,
+                ParamSig::Optional(_) => max = max.map(|m| m + 1),
+                _ => {
+                    min += 1;
+                    max = max.map(|m| m + 1);
+                }
+            }
+        }
+        Arity { min, max }
+    }
+
+    /// True when `got` arguments satisfy this arity.
+    pub fn admits(&self, got: usize) -> bool {
+        got >= self.min && self.max.is_none_or(|m| got <= m)
+    }
+
+    /// The declared count as it reads in a diagnostic: `1 argument`,
+    /// `2 arguments`, `1 or 2 arguments`, `at least 3 arguments`.
+    pub fn describe(&self) -> String {
+        let count = match self.max {
+            Some(max) if max == self.min => format!("{max}"),
+            Some(max) if max == self.min + 1 => format!("{} or {max}", self.min),
+            Some(max) => format!("{} to {max}", self.min),
+            None => format!("at least {}", self.min),
+        };
+        let noun = if count == "1" {
+            "argument"
+        } else {
+            "arguments"
+        };
+        format!("{count} {noun}")
+    }
 }
 
 /// The value-set of a function result, tighter than its type's natural extent.
@@ -156,8 +213,10 @@ pub(crate) enum MassTag {
     Unknown,
 }
 
-// Parameter-type tags: parsed alongside `Sig::Function.params` for RON schema
-// fidelity, but `lower` does not consult them, so the payloads are never read.
+// Parameter-type tags. The *payloads* are documentation of the spec's declared
+// domains — `lower` does not consult them, so they are never read; the list's
+// shape is read by `Arity::of`. `Optional` and `Variadic` are trailing markers
+// (guarded by `trailing_markers_only`).
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
 pub(crate) enum ParamSig {
@@ -166,12 +225,22 @@ pub(crate) enum ParamSig {
     Matrix,
     Callable,
     Any,
+    /// May be omitted; the spec states the default (`diag(A)` → `k = 0`).
+    Optional(Box<ParamSig>),
+    /// Zero or more further arguments of this kind.
+    Variadic(Box<ParamSig>),
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) enum ResultSig {
     Scalar(ScalarTag),
-    SameScalarKind(usize),
+    /// Result is a real scalar for a real (or integer, or boolean) arg `i` and a
+    /// complex scalar for a complex one — the codomain of §07's elementary
+    /// functions, whose "Domains" column lists `reals`/`complexes` and never
+    /// `integers`. An integer argument is admitted only through §03's
+    /// `integers ⊂ reals`, so the real-domain function applies and the result is
+    /// real: `exp(2)` is `real`, not `integer`.
+    RealOrComplexOfArg(usize),
     DomainMap {
         arg: usize,
         map: Vec<(ScalarTag, ScalarTag)>,
@@ -291,6 +360,18 @@ impl Catalogue {
         self.base.iter().find(|b| b.name == name).map(|b| &b.sig)
     }
 
+    /// The declared call arity of base builtin `name`, or `None` when the
+    /// catalogue declares no parameter list for it. Distribution rows are
+    /// excluded: their `params` are §08 field *names* added for the
+    /// determiniser, and several rows are knowingly degraded, so enforcing
+    /// §08 constructor arity needs its own grounding pass.
+    pub fn base_arity(&self, name: &str) -> Option<Arity> {
+        match self.base(name)? {
+            Sig::Function { params, .. } | Sig::Structural { params } => Some(Arity::of(params)),
+            Sig::Distribution { .. } => None,
+        }
+    }
+
     /// True iff base builtin `name` exists and has a distribution signature.
     /// Used by the LSP to bias completion ordering after a `~` binding.
     pub fn base_is_distribution(&self, name: &str) -> bool {
@@ -346,7 +427,7 @@ impl Catalogue {
                 .find(|b| b.name == name)
                 .and_then(|b| match &b.sig {
                     Sig::Distribution { params, .. } => Some(params.clone()),
-                    Sig::Function { .. } => None,
+                    Sig::Function { .. } | Sig::Structural { .. } => None,
                 })
         })
     }
@@ -452,7 +533,7 @@ mod tests {
         let src = r#"Catalogue(
             base: [ Builtin(name: "Normal", sig: Distribution(domain: Scalar(Real), support: Reals, mass: Normalized)) ],
             modules: [ Module(name: "m", version: "0.1", bindings: [
-                Binding(name: "f", sig: Function(params: [Scalar(Real)], result: SameScalarKind(0))),
+                Binding(name: "f", sig: Function(params: [Scalar(Real)], result: RealOrComplexOfArg(0))),
             ]) ],
         )"#;
         let cat = parse_catalogue(src).expect("parses");
@@ -570,11 +651,11 @@ mod tests {
     ///
     /// Two argument-scalar scenarios are tested for each function:
     ///   - arg0 = `None` (no concrete type — default behaviour)
-    ///   - arg0 = `Some(Complex)` (complex-in path, relevant for SameScalarKind)
+    ///   - arg0 = `Some(Complex)` (complex-in path, relevant for RealOrComplexOfArg)
     #[test]
     fn catalogue_functions_faithful_to_legacy_ops() {
         // (name, arg0_scalar) pairs to exercise.
-        // For SameScalarKind fns the complex path matters; for fixed-output fns both
+        // For RealOrComplexOfArg fns the complex path matters; for fixed-output fns both
         // should return the same constant type.
         let cases: &[(&str, Option<ScalarType>)] = &[
             // scalar-integer output
@@ -613,7 +694,7 @@ mod tests {
             ("isinf", None),
             ("isnan", None),
             ("iszero", None),
-            // SameScalarKind(0): real→real
+            // RealOrComplexOfArg(0): real→real
             ("exp", None),
             ("exp", Some(ScalarType::Real)),
             ("log", None),
@@ -641,12 +722,22 @@ mod tests {
             ("invlogit", None),
             ("probit", None),
             ("invprobit", None),
-            // SameScalarKind(0): complex→complex
+            // RealOrComplexOfArg(0): complex→complex
             ("exp", Some(ScalarType::Complex)),
             ("log", Some(ScalarType::Complex)),
             ("sqrt", Some(ScalarType::Complex)),
             ("conj", None),
             ("conj", Some(ScalarType::Complex)),
+            // RealOrComplexOfArg(0): integer→REAL. §07's "Domains" column for the
+            // elementary functions never lists `integers`, so an integer argument
+            // is admitted only via §03's `integers ⊂ reals` and the result is real.
+            ("exp", Some(ScalarType::Integer)),
+            ("log", Some(ScalarType::Integer)),
+            ("sqrt", Some(ScalarType::Integer)),
+            ("sin", Some(ScalarType::Integer)),
+            ("loggamma", Some(ScalarType::Integer)),
+            ("conj", Some(ScalarType::Integer)),
+            ("invlogit", Some(ScalarType::Integer)),
             // abs / abs2: complex→real (DomainMap)
             ("abs", None),
             ("abs", Some(ScalarType::Real)),
@@ -911,6 +1002,139 @@ mod tests {
         assert!(
             !cat.base_is_distribution("NotARealBuiltin"),
             "unknown name must be false"
+        );
+    }
+
+    /// `Optional` and `Variadic` are trailing markers: a required parameter
+    /// after one of them would make `Arity::of`'s `min` wrong.
+    #[test]
+    fn arity_markers_are_trailing_only() {
+        fn check(what: &str, params: &[ParamSig]) {
+            let mut seen_marker = false;
+            for p in params {
+                match p {
+                    ParamSig::Optional(_) => seen_marker = true,
+                    ParamSig::Variadic(_) => seen_marker = true,
+                    _ => assert!(
+                        !seen_marker,
+                        "{what}: required parameter after an Optional/Variadic marker"
+                    ),
+                }
+            }
+            // A `Variadic` subsumes anything after it.
+            let variadic_at = params
+                .iter()
+                .position(|p| matches!(p, ParamSig::Variadic(_)));
+            if let Some(i) = variadic_at {
+                assert_eq!(
+                    i,
+                    params.len() - 1,
+                    "{what}: Variadic must be the last parameter"
+                );
+            }
+        }
+
+        let cat = builtin();
+        for b in &cat.base {
+            match &b.sig {
+                Sig::Function { params, .. } | Sig::Structural { params } => check(&b.name, params),
+                Sig::Distribution { .. } => {}
+            }
+        }
+        for m in &cat.modules {
+            for b in &m.bindings {
+                match &b.sig {
+                    Sig::Function { params, .. } | Sig::Structural { params } => {
+                        check(&format!("{}.{}", m.name, b.name), params)
+                    }
+                    Sig::Distribution { .. } => {}
+                }
+            }
+        }
+    }
+
+    /// The §07 argument counts the arity rule enforces, including the two shapes
+    /// a plain `params.len()` would get wrong: `diag`'s optional `k` and
+    /// `builtin_sample`'s variadic sample shape.
+    #[test]
+    fn base_arity_reads_the_declared_parameter_list() {
+        let cat = builtin();
+        let fixed = |min: usize| {
+            Some(Arity {
+                min,
+                max: Some(min),
+            })
+        };
+        assert_eq!(cat.base_arity("exp"), fixed(1));
+        assert_eq!(cat.base_arity("add"), fixed(2));
+        assert_eq!(cat.base_arity("ifelse"), fixed(3));
+        assert_eq!(cat.base_arity("bijection"), fixed(3));
+        // §07: "when called as `diag(A)`, `k` defaults to `0`".
+        assert_eq!(
+            cat.base_arity("diag"),
+            Some(Arity {
+                min: 1,
+                max: Some(2)
+            })
+        );
+        // §07: `builtin_sample | rngstate, kernel, kernel_input, n, m, ...`.
+        assert_eq!(
+            cat.base_arity("builtin_sample"),
+            Some(Arity { min: 3, max: None })
+        );
+        assert_eq!(
+            cat.base_arity("builtin_logdensityof"),
+            fixed(3),
+            "the five fixed-arity primitives take kernel, kernel_input, x"
+        );
+        // §07: `get | container, selectors...` — a container and at least one selector.
+        assert_eq!(cat.base_arity("get"), Some(Arity { min: 2, max: None }));
+        // Distribution rows declare §08 field names, not a checked §07 arity.
+        assert_eq!(cat.base_arity("Normal"), None);
+        assert_eq!(cat.base_arity("NotARealBuiltin"), None);
+    }
+
+    #[test]
+    fn arity_admits_and_describes() {
+        let one_or_two = Arity {
+            min: 1,
+            max: Some(2),
+        };
+        assert!(!one_or_two.admits(0));
+        assert!(one_or_two.admits(1));
+        assert!(one_or_two.admits(2));
+        assert!(!one_or_two.admits(3));
+        assert_eq!(one_or_two.describe(), "1 or 2 arguments");
+
+        let at_least_three = Arity { min: 3, max: None };
+        assert!(!at_least_three.admits(2));
+        assert!(at_least_three.admits(300));
+        assert_eq!(at_least_three.describe(), "at least 3 arguments");
+
+        assert_eq!(
+            Arity {
+                min: 2,
+                max: Some(2)
+            }
+            .describe(),
+            "2 arguments"
+        );
+        assert_eq!(
+            Arity {
+                min: 1,
+                max: Some(3)
+            }
+            .describe(),
+            "1 to 3 arguments"
+        );
+        // Only an exact count of one is singular.
+        assert_eq!(
+            Arity {
+                min: 1,
+                max: Some(1)
+            }
+            .describe(),
+            "1 argument"
         );
     }
 }

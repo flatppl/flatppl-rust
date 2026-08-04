@@ -215,6 +215,9 @@ pub(crate) fn lower(sig: &Sig, ctx: &LowerCtx) -> (Type, ValueSet) {
             let vset = function_set(*result_set, &ty);
             (ty, vset)
         }
+        // Arity-only rows carry no result sig; `function_result` filters them
+        // out before `lower` is reached.
+        Sig::Structural { .. } => (Type::Deferred, ValueSet::Unknown),
     }
 }
 
@@ -261,9 +264,10 @@ fn function_set(tag: crate::catalogue::ResultSet, ty: &Type) -> ValueSet {
 fn lower_result(result: &ResultSig, ctx: &LowerCtx) -> Type {
     match result {
         ResultSig::Scalar(s) => Type::Scalar(scalar(*s)),
-        ResultSig::SameScalarKind(i) => {
-            Type::Scalar((ctx.arg_scalar)(*i).unwrap_or(ScalarType::Real))
-        }
+        ResultSig::RealOrComplexOfArg(i) => Type::Scalar(match (ctx.arg_scalar)(*i) {
+            Some(ScalarType::Complex) => ScalarType::Complex,
+            _ => ScalarType::Real,
+        }),
         ResultSig::DomainMap { arg, map } => {
             let got = (ctx.arg_scalar)(*arg);
             let out = map
@@ -389,7 +393,7 @@ mod tests {
     fn same_scalar_kind_follows_arg() {
         let sig = Sig::Function {
             params: vec![],
-            result: ResultSig::SameScalarKind(0),
+            result: ResultSig::RealOrComplexOfArg(0),
             result_set: crate::catalogue::ResultSet::Natural,
         };
         let cx = LowerCtx {

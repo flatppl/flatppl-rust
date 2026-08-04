@@ -74,11 +74,97 @@ Catalogue(
 
         // ---- base per-name functions (spec §07) ----
         // Per-name signatures expressible via ResultSig: constant scalar output,
-        // SameScalarKind, DomainMap, Matrix, and the arg-threading forms
+        // RealOrComplexOfArg, DomainMap, Matrix, and the arg-threading forms
         // SameAsArg / RealOfArgShape / CommonOf / ElemScalarKind. Only ops whose
         // result genuinely cannot be expressed (e.g. operand-promoting elementwise
         // arith add/sub/mul/pow, container shape construction) stay in ops.rs
         // call_rule; prefer a catalogue row whenever ResultSig can carry the rule.
+
+        // -- arity-only rows (Sig::Structural): §07 parameter list declared here,
+        //    result type computed in ops.rs (operand promotion, container shape,
+        //    measure threading — none expressible as a ResultSig). --
+
+        // §07 "Operator-equivalent functions" / "Arithmetic functions":
+        // `add | a, b`, `sub | a, b`, `mul | a, b`, `divide | a, b`, `neg | x`,
+        // `pow | base, exponent`.
+        Builtin(name: "add",    sig: Structural(params: [Any, Any])),
+        Builtin(name: "sub",    sig: Structural(params: [Any, Any])),
+        Builtin(name: "mul",    sig: Structural(params: [Any, Any])),
+        Builtin(name: "divide", sig: Structural(params: [Any, Any])),
+        Builtin(name: "neg",    sig: Structural(params: [Any])),
+        Builtin(name: "pow",    sig: Structural(params: [Any, Any])),
+
+        // §07 "Elementary functions": `atan2 | y, x`, `min | a, b`, `max | a, b`.
+        Builtin(name: "atan2", sig: Structural(params: [Scalar(Real), Scalar(Real)])),
+        Builtin(name: "min",   sig: Structural(params: [Scalar(Real), Scalar(Real)])),
+        Builtin(name: "max",   sig: Structural(params: [Scalar(Real), Scalar(Real)])),
+
+        // §07 "Array and table generation": `vector | x1, x2, ...`,
+        // `array | data, size, dimorder`, `fill | x, size`, `zeros | size`,
+        // `ones | size`. §07 states no minimum element count for `vector`.
+        Builtin(name: "vector", sig: Structural(params: [Variadic(Any)])),
+        Builtin(name: "array",  sig: Structural(params: [Vector(Real), Vector(Integer), Vector(Integer)])),
+        Builtin(name: "fill",   sig: Structural(params: [Any, Any])),
+        Builtin(name: "zeros",  sig: Structural(params: [Any])),
+        Builtin(name: "ones",   sig: Structural(params: [Any])),
+
+        // §07 "Data loading": `load_data | source, valueset`.
+        Builtin(name: "load_data", sig: Structural(params: [Any, Any])),
+
+        // §07 "Field and element access": `get | container, selectors...` —
+        // a container plus at least one selector, then further selectors for
+        // multi-dimensional access (`get(v, 2, 3)`).
+        Builtin(name: "get",  sig: Structural(params: [Any, Any, Variadic(Any)])),
+        Builtin(name: "get0", sig: Structural(params: [Any, Any, Variadic(Any)])),
+
+        // §07 "Array and table operations": `cat | x, y, ...`, `rowstack | vs`,
+        // `tile | A, size`, `splitblocks | A, blocksize`, `partition | xs, spec`,
+        // `addaxes | A, n_leading, n_trailing`.
+        Builtin(name: "cat",         sig: Structural(params: [Any, Any, Variadic(Any)])),
+        Builtin(name: "rowstack",    sig: Structural(params: [Any])),
+        Builtin(name: "tile",        sig: Structural(params: [Any, Any])),
+        Builtin(name: "splitblocks", sig: Structural(params: [Any, Any])),
+        Builtin(name: "partition",   sig: Structural(params: [Vector(Real), Any])),
+        Builtin(name: "addaxes",     sig: Structural(params: [Any, Scalar(Integer), Scalar(Integer)])),
+
+        // §07 "Checked values": `checked | value, condition`.
+        Builtin(name: "checked", sig: Structural(params: [Any, Scalar(Boolean)])),
+
+        // §07 "Reductions": `sum | xs`, `prod | xs`, `mean | xs`,
+        // `indicesof | x`, `indicesof0 | x`.
+        Builtin(name: "sum",        sig: Structural(params: [Any])),
+        Builtin(name: "prod",       sig: Structural(params: [Any])),
+        Builtin(name: "mean",       sig: Structural(params: [Any])),
+        Builtin(name: "indicesof",  sig: Structural(params: [Any])),
+        Builtin(name: "indicesof0", sig: Structural(params: [Any])),
+
+        // §07 "Norms and normalization": `l1unit | v`, `l2unit | v`,
+        // `softmax | v`, `logsoftmax | v`.
+        Builtin(name: "l1unit",     sig: Structural(params: [Vector(Real)])),
+        Builtin(name: "l2unit",     sig: Structural(params: [Vector(Real)])),
+        Builtin(name: "softmax",    sig: Structural(params: [Vector(Real)])),
+        Builtin(name: "logsoftmax", sig: Structural(params: [Vector(Real)])),
+
+        // §07 "Membership, filtering, and bin selection": `filter | pred, data`,
+        // `selectbins | edges, region, counts`.
+        Builtin(name: "filter",     sig: Structural(params: [Callable, Any])),
+        Builtin(name: "selectbins", sig: Structural(params: [Vector(Real), Any, Vector(Real)])),
+
+        // §07 "Random value generation": `rnginit | rngseed`, `rand | rstate, m`.
+        Builtin(name: "rnginit", sig: Structural(params: [Vector(Integer)])),
+        Builtin(name: "rand",    sig: Structural(params: [Any, Any])),
+
+        // §07 "Measure kernel evaluation primitives": the five fixed-arity
+        // primitives take `kernel, kernel_input, x`; `builtin_sample` takes
+        // `rngstate, kernel, kernel_input, n, m, ...` — "or a scalar `X` if no
+        // `n, m, ...` are given", so its trailing shape is variadic. Mirrors
+        // `determinizer::conformance::builtin_primitive_arity`.
+        Builtin(name: "builtin_logdensityof", sig: Structural(params: [Callable, Any, Any])),
+        Builtin(name: "builtin_touniform",    sig: Structural(params: [Callable, Any, Any])),
+        Builtin(name: "builtin_fromuniform",  sig: Structural(params: [Callable, Any, Any])),
+        Builtin(name: "builtin_tonormal",     sig: Structural(params: [Callable, Any, Any])),
+        Builtin(name: "builtin_fromnormal",   sig: Structural(params: [Callable, Any, Any])),
+        Builtin(name: "builtin_sample",       sig: Structural(params: [Any, Callable, Any, Variadic(Scalar(Integer))])),
 
         // -- scalar-integer output --
         // spec §07 "Elementary functions": floor/ceil/round return integers.
@@ -161,7 +247,8 @@ Catalogue(
         // diagmat(x): vector → diagonal matrix, element kind from the vector.
         Builtin(name: "diagmat",        sig: Function(params: [Vector(Real)], result: MatrixElem(rows: Dyn, cols: Dyn, elem: OfArg(0)))),
         // diag(A, k=0): extract a diagonal as a vector, element kind from A.
-        Builtin(name: "diag",           sig: Function(params: [Matrix, Scalar(Integer)], result: Vector(len: Dyn, elem: OfArg(0)))),
+        // §07 "Linear algebra": "when called as `diag(A)`, `k` defaults to `0`".
+        Builtin(name: "diag",           sig: Function(params: [Matrix, Optional(Scalar(Integer))], result: Vector(len: Dyn, elem: OfArg(0)))),
         // cross(a, b): 3-vector cross product, element kind from a.
         Builtin(name: "cross",          sig: Function(params: [Vector(Real), Vector(Real)], result: Vector(len: Dyn, elem: OfArg(0)))),
         // linspace / extlinspace: real vector of grid points.
@@ -232,42 +319,42 @@ Catalogue(
         Builtin(name: "isnan",    sig: Function(params: [Any], result: Scalar(Boolean))),
         Builtin(name: "iszero",   sig: Function(params: [Any], result: Scalar(Boolean))),
 
-        // -- SameScalarKind(0): real→real, complex→complex --
+        // -- RealOrComplexOfArg(0): real→real, complex→complex --
         // (spec §07 "Elementary functions": all accept reals and complexes)
-        Builtin(name: "exp",       sig: Function(params: [Any], result: SameScalarKind(0), result_set: PosReals)),
-        Builtin(name: "log",       sig: Function(params: [Any], result: SameScalarKind(0))),
+        Builtin(name: "exp",       sig: Function(params: [Any], result: RealOrComplexOfArg(0), result_set: PosReals)),
+        Builtin(name: "log",       sig: Function(params: [Any], result: RealOrComplexOfArg(0))),
         // log2: in ops.rs but absent from spec §07. Kept for engine compatibility.
-        Builtin(name: "log2",      sig: Function(params: [Any], result: SameScalarKind(0)),
+        Builtin(name: "log2",      sig: Function(params: [Any], result: RealOrComplexOfArg(0)),
             degraded: Some("log2 is not listed in spec §07; kept for engine compatibility")),
-        Builtin(name: "log10",     sig: Function(params: [Any], result: SameScalarKind(0))),
-        Builtin(name: "sqrt",      sig: Function(params: [Any], result: SameScalarKind(0), result_set: NonNegReals)),
-        Builtin(name: "sin",       sig: Function(params: [Any], result: SameScalarKind(0), result_set: Interval(-1.0, 1.0))),
-        Builtin(name: "cos",       sig: Function(params: [Any], result: SameScalarKind(0), result_set: Interval(-1.0, 1.0))),
-        Builtin(name: "tan",       sig: Function(params: [Any], result: SameScalarKind(0))),
-        Builtin(name: "asin",      sig: Function(params: [Any], result: SameScalarKind(0))),
-        Builtin(name: "acos",      sig: Function(params: [Any], result: SameScalarKind(0))),
-        Builtin(name: "atan",      sig: Function(params: [Any], result: SameScalarKind(0))),
-        Builtin(name: "sinh",      sig: Function(params: [Any], result: SameScalarKind(0))),
-        Builtin(name: "cosh",      sig: Function(params: [Any], result: SameScalarKind(0), result_set: PosReals)),
-        Builtin(name: "tanh",      sig: Function(params: [Any], result: SameScalarKind(0), result_set: Interval(-1.0, 1.0))),
-        Builtin(name: "asinh",     sig: Function(params: [Any], result: SameScalarKind(0))),
-        Builtin(name: "acosh",     sig: Function(params: [Any], result: SameScalarKind(0))),
-        Builtin(name: "atanh",     sig: Function(params: [Any], result: SameScalarKind(0))),
-        Builtin(name: "log1p",     sig: Function(params: [Any], result: SameScalarKind(0))),
-        Builtin(name: "expm1",     sig: Function(params: [Any], result: SameScalarKind(0))),
-        Builtin(name: "gamma",     sig: Function(params: [Any], result: SameScalarKind(0))),
-        Builtin(name: "loggamma",  sig: Function(params: [Any], result: SameScalarKind(0))),
-        Builtin(name: "logit",     sig: Function(params: [Any], result: SameScalarKind(0))),
-        Builtin(name: "invlogit",  sig: Function(params: [Any], result: SameScalarKind(0), result_set: UnitInterval)),
-        Builtin(name: "probit",    sig: Function(params: [Any], result: SameScalarKind(0))),
-        Builtin(name: "invprobit", sig: Function(params: [Any], result: SameScalarKind(0), result_set: UnitInterval)),
+        Builtin(name: "log10",     sig: Function(params: [Any], result: RealOrComplexOfArg(0))),
+        Builtin(name: "sqrt",      sig: Function(params: [Any], result: RealOrComplexOfArg(0), result_set: NonNegReals)),
+        Builtin(name: "sin",       sig: Function(params: [Any], result: RealOrComplexOfArg(0), result_set: Interval(-1.0, 1.0))),
+        Builtin(name: "cos",       sig: Function(params: [Any], result: RealOrComplexOfArg(0), result_set: Interval(-1.0, 1.0))),
+        Builtin(name: "tan",       sig: Function(params: [Any], result: RealOrComplexOfArg(0))),
+        Builtin(name: "asin",      sig: Function(params: [Any], result: RealOrComplexOfArg(0))),
+        Builtin(name: "acos",      sig: Function(params: [Any], result: RealOrComplexOfArg(0))),
+        Builtin(name: "atan",      sig: Function(params: [Any], result: RealOrComplexOfArg(0))),
+        Builtin(name: "sinh",      sig: Function(params: [Any], result: RealOrComplexOfArg(0))),
+        Builtin(name: "cosh",      sig: Function(params: [Any], result: RealOrComplexOfArg(0), result_set: PosReals)),
+        Builtin(name: "tanh",      sig: Function(params: [Any], result: RealOrComplexOfArg(0), result_set: Interval(-1.0, 1.0))),
+        Builtin(name: "asinh",     sig: Function(params: [Any], result: RealOrComplexOfArg(0))),
+        Builtin(name: "acosh",     sig: Function(params: [Any], result: RealOrComplexOfArg(0))),
+        Builtin(name: "atanh",     sig: Function(params: [Any], result: RealOrComplexOfArg(0))),
+        Builtin(name: "log1p",     sig: Function(params: [Any], result: RealOrComplexOfArg(0))),
+        Builtin(name: "expm1",     sig: Function(params: [Any], result: RealOrComplexOfArg(0))),
+        Builtin(name: "gamma",     sig: Function(params: [Any], result: RealOrComplexOfArg(0))),
+        Builtin(name: "loggamma",  sig: Function(params: [Any], result: RealOrComplexOfArg(0))),
+        Builtin(name: "logit",     sig: Function(params: [Any], result: RealOrComplexOfArg(0))),
+        Builtin(name: "invlogit",  sig: Function(params: [Any], result: RealOrComplexOfArg(0), result_set: UnitInterval)),
+        Builtin(name: "probit",    sig: Function(params: [Any], result: RealOrComplexOfArg(0))),
+        Builtin(name: "invprobit", sig: Function(params: [Any], result: RealOrComplexOfArg(0), result_set: UnitInterval)),
         // abs / abs2: |x| and |x|² are real for both real and complex inputs
         // (real_or_complex(arg) in ops.rs: complex→real, not complex→complex).
         // DomainMap captures this: Complex maps to Real; anything else defaults Real.
         Builtin(name: "abs",  sig: Function(params: [Any], result: DomainMap(arg: 0, map: [(Complex, Real)]), result_set: NonNegReals)),
         Builtin(name: "abs2", sig: Function(params: [Any], result: DomainMap(arg: 0, map: [(Complex, Real)]), result_set: NonNegReals)),
         // conj: complex conjugate — real→real, complex→complex.
-        Builtin(name: "conj", sig: Function(params: [Any], result: SameScalarKind(0))),
+        Builtin(name: "conj", sig: Function(params: [Any], result: RealOrComplexOfArg(0))),
     ],
     // Standard modules (spec §09) live in their own RON files under
     // catalogues/ and are merged in by catalogue::builtin().

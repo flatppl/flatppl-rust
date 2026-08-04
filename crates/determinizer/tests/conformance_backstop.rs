@@ -50,12 +50,15 @@ fn is_flatpdl_accepts_valid_flatpdl() {
 }
 
 /// `canon::inline` beta-reduces every user call it CAN reduce and leaves the
-/// rest in place refuse-free, so an arity mismatch at the call site survived to
+/// rest in place refuse-free, so an arity mismatch at the call site survives to
 /// exit as a live `(%call (%ref self scale) 1.5 3.0)`. FlatPDL admits
 /// deterministic ops and the six `builtin_*` primitives (§07 "Measure kernel
 /// evaluation primitives"); an application of a user-defined callable is
-/// neither, so the gate must reject it — which turns the case from exit 0 with
-/// output no engine can evaluate into a refusal naming the construct.
+/// neither, so the gate reports it.
+///
+/// `flatppl-infer` now also marks the mis-arity application `Type::Failed`
+/// (`scale` declares one parameter), so `is_flatpdl` reports both violations and
+/// the refusal names the `Failed` node — inference reaches the defect first.
 #[test]
 fn residual_user_call_from_arity_mismatch_is_rejected_and_refused() {
     let m = infer_module("scale(x) = mul(x, 2.0)\ns = scale(1.5, 3.0)\n");
@@ -65,8 +68,13 @@ fn residual_user_call_from_arity_mismatch_is_rejected_and_refused() {
             .any(|n| matches!(n.kind, NonConformKind::ResidualUserCall)),
         "expected a ResidualUserCall violation; got: {v:?}"
     );
+    assert!(
+        v.iter().any(|n| matches!(n.kind, NonConformKind::Failed)
+            && n.reason.contains("declares 1 parameter, got 2")),
+        "inference must mark the mis-arity application Failed; got: {v:?}"
+    );
     let e = determinize(&m).expect_err("determinize must refuse rather than emit the residual");
-    assert_eq!(e.construct, "ResidualUserCall", "refusal: {e:?}");
+    assert_eq!(e.construct, "Failed", "refusal: {e:?}");
 }
 
 /// The other way `canon::inline` bails: the callee resolves to a non-callable
@@ -86,11 +94,14 @@ fn residual_user_call_from_unresolved_callee_is_rejected_and_refused() {
 }
 
 /// `builtin_logdensityof(kernel, kernel_input, x)` takes exactly three arguments
-/// (§07 "Measure kernel evaluation primitives"). `flatppl-infer` has no arity
-/// rule for the primitive — it types the two-argument call `Scalar(Real)`, not
-/// `Type::Failed` — so the generic `Failed` backstop never fires and the arity
-/// check is what must catch this. The second assertion pins that: a `Failed`
-/// violation here would mean the check is redundant with inference.
+/// (§07 "Measure kernel evaluation primitives"), and both nets now catch a
+/// two-argument call: `flatppl-infer`'s catalogue arity rule marks it
+/// `Type::Failed`, and this structural check reports `BuiltinArity`.
+///
+/// The structural check stays despite the overlap: `is_flatpdl` reads the
+/// inferred side-tables, so on a module whose annotations came from somewhere
+/// else — FlatPIR `%meta` read straight off disk, or an older inference run —
+/// the `Failed` net is not there and only the call shape shows the defect.
 #[test]
 fn is_flatpdl_rejects_wrong_arity_builtin_primitive() {
     let m = infer_module("y = builtin_logdensityof(1.0, 2.0)\n");
@@ -101,9 +112,8 @@ fn is_flatpdl_rejects_wrong_arity_builtin_primitive() {
         "expected a BuiltinArity violation; got: {v:?}"
     );
     assert!(
-        !v.iter().any(|n| matches!(n.kind, NonConformKind::Failed)),
-        "inference must NOT already mark a mis-arity primitive Failed, else this \
-         check duplicates it; got: {v:?}"
+        v.iter().any(|n| matches!(n.kind, NonConformKind::Failed)),
+        "inference's arity rule must also mark the primitive Failed; got: {v:?}"
     );
 }
 
