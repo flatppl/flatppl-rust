@@ -734,13 +734,15 @@ fn fill_and_array_element_kind_and_shape() {
         out.contains("(%array 1 (3) (%scalar integer))") && out.contains("(fill"),
         "fill(2, 3) should be a length-3 integer vector, got:\n{out}"
     );
+    // §07 declares `array | data, size, dimorder` with no default for
+    // `dimorder`, so all three are supplied.
     let out = ir_at(
-        "d = [1.0, 2.0, 3.0, 4.0]\nx = array(d, [2, 2])",
+        "d = [1.0, 2.0, 3.0, 4.0]\nx = array(d, [2, 2], [1, 2])",
         Level::Shape,
     );
     assert!(
         out.contains("(%array 2 (2 2) (%scalar real))") && out.contains("(array"),
-        "array(d, [2,2]) should be a 2x2 real matrix, got:\n{out}"
+        "array(d, [2,2], [1,2]) should be a 2x2 real matrix, got:\n{out}"
     );
 }
 
