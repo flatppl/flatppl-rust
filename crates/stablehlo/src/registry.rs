@@ -933,12 +933,10 @@ fn cauchy_cdf(e: &mut Emitter, p: &Params, x: &Value) -> Result<Value, EmitError
 }
 
 /// §08 Cauchy's sampling transform, verbatim: `x0 + gamma * tan(pi * (U -
-/// 1/2))`, `U ~ Uniform(0, 1)`. No native `tan` op exists in `stablehlo`/
-/// `chlo` (unlike `chlo.lgamma`, a real special-function op — see
-/// [`Emitter::sin`]'s doc comment), so `tan(t)` is composed as `sin(t) /
-/// cos(t)`, exactly the task brief's fallback. `U` is drawn at `location`'s
-/// own shape, mirroring [`normal_sample`]'s `&mu.ty` convention (the
-/// FIRST parameter [`cauchy_logpdf`] itself reads).
+/// 1/2))`, `U ~ Uniform(0, 1)`. [`Emitter::tan`] carries the `sin(t) / cos(t)`
+/// composition this shares with the density path's `tan` head. `U` is drawn at
+/// `location`'s own shape, mirroring [`normal_sample`]'s `&mu.ty` convention
+/// (the FIRST parameter [`cauchy_logpdf`] itself reads).
 fn cauchy_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
     let location = p.get(e, "location")?;
     let scale = p.get(e, "scale")?;
@@ -950,9 +948,7 @@ fn cauchy_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
     let pi = e.scalar(std::f64::consts::PI);
     let t = e.mul(&pi, &centered);
 
-    let sin_t = e.sin(&t);
-    let cos_t = e.cos(&t);
-    let tan_t = e.div(&sin_t, &cos_t);
+    let tan_t = e.tan(&t);
 
     let scale_tan = e.mul(&scale, &tan_t);
     Ok(e.add(&location, &scale_tan))
