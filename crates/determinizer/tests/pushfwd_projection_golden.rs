@@ -785,4 +785,40 @@ fn closed_reified_projection_lowers_identically_to_the_lambda_spelling() {
         p_reified, p_plain,
         "reified and lambda spellings lower to identical FlatPDL:\nreified:\n{p_reified}\nlambda:\n{p_plain}"
     );
+
+    // NESTED wrappers unwrap to a fixpoint. §04's rationale applies at every level, so
+    // stopping after one layer would leave the doubly-reified spelling refusing with the
+    // same map misdiagnosis one level up.
+    let nested = "m = joint(Normal(mu = 0.0, sigma = 1.0), Normal(mu = 1.0, sigma = 2.0))\n\
+                  p = pushfwd(functionof(functionof(v -> get(v, [1]))), m)\n\
+                  lp = logdensityof(p, [0.5])";
+    assert_eq!(
+        pir(nested),
+        p_plain,
+        "a doubly-reified projection lowers identically too"
+    );
+}
+
+// The unwrap is not projection-specific: it serves the BIJECTION path the same way. An
+// affine forward map is the shape that shows it, since it exercises the
+// change-of-variables lowering (the `- log(abs(2.0))` volume term) rather than the
+// marginal. Refused at `48899b0`, byte-identical to the plain lambda now.
+#[test]
+fn closed_reified_affine_forward_map_lowers_identically_to_the_lambda_spelling() {
+    let reified = "m = Normal(mu = 0.0, sigma = 1.0)\n\
+                   p = pushfwd(functionof(x -> 2.0 * x + 1.0), m)\n\
+                   lp = logdensityof(p, 0.5)";
+    let plain = "m = Normal(mu = 0.0, sigma = 1.0)\n\
+                 p = pushfwd(x -> 2.0 * x + 1.0, m)\n\
+                 lp = logdensityof(p, 0.5)";
+    let p_reified = pir(reified);
+    assert!(
+        pir_binding(&p_reified, "lp").contains("log"),
+        "the change-of-variables volume term must be present:\n{p_reified}"
+    );
+    assert_eq!(
+        p_reified,
+        pir(plain),
+        "reified and lambda affine spellings lower to identical FlatPDL:\n{p_reified}"
+    );
 }

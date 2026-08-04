@@ -2371,11 +2371,10 @@ fn domain_is_matrix(domain: &Type) -> bool {
 /// equivalent to known values", so the wrapper carries no meaning the shapes below
 /// need; without this the reified spelling misses the recogniser its plain spelling
 /// reaches, and refuses with a bijection-annotation misdiagnosis.
+/// [`crate::kernel::classify_reification`] unwraps nested wrappers to a fixpoint, so
+/// no recursion is needed here.
 fn recognise(m: &Module, f: NodeId) -> Recognized {
-    if let Some(body) = crate::kernel::resolve_closed_reification(m, f) {
-        let (inner, _) = crate::density::resolve_ref_one(m, body);
-        return recognise(m, inner);
-    }
+    let f = crate::kernel::resolve_closed_reification(m, f).unwrap_or(f);
     match m.node(f) {
         Node::Const(sym) => Recognized::BareConst(m.resolve(*sym).to_string()),
         Node::Call(c) => {

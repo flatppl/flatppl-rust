@@ -2188,9 +2188,29 @@ a = draw(Normal(mu = 0.0, sigma = 1.0))
 lp = logdensityof(lawof(Normal(mu = a, sigma = 1.0)), 0.5)
 lp_a = logdensityof(lawof(record(a = a)), record(a = 0.1))",
         ),
-        // `kernelof` reifies the same way and must be unwrapped the same way. §04 makes
-        // `kernelof(x)` equivalent to `functionof(lawof(x))`, and `lawof` of a measure
-        // is that measure, so the unwrapped body is the same `Normal(mu = a, …)`.
+        // NESTED wrappers unwrap to a fixpoint. §04's rationale clause applies at every
+        // level, so two closed layers mean the body just as one does, and the routing
+        // must not stop after the first. Before the fixpoint this refused.
+        (
+            "\
+a = draw(Normal(mu = 0.0, sigma = 1.0))
+F = functionof(functionof(Normal(mu = a, sigma = 1.0)))
+lp = logdensityof(lawof(F), 0.5)
+lp_a = logdensityof(lawof(record(a = a)), record(a = 0.1))",
+            "\
+a = draw(Normal(mu = 0.0, sigma = 1.0))
+F = Normal(mu = a, sigma = 1.0)
+lp = logdensityof(lawof(F), 0.5)
+lp_a = logdensityof(lawof(record(a = a)), record(a = 0.1))",
+        ),
+        // OUT-OF-SPEC, pinned defensively — NOT derived from §04. §04 "Kernels and
+        // `kernelof`" says "`x` must not be a measure", so `kernelof(Normal(…))` is
+        // ill-formed; nothing in the front end rejects it (it infers with no
+        // diagnostic). The unwrap treats `kernelof` like `functionof` because the
+        // pre-existing `kernel::resolve_reified` does, and this pins that the
+        // ill-formed spelling at least cannot diverge from the well-formed one it
+        // resembles. A spec-legal `kernelof` spelling is covered by
+        // `kernelof_of_a_value_lowers_identically_to_lawof_of_that_value`.
         (
             "\
 a = draw(Normal(mu = 0.0, sigma = 1.0))
@@ -2299,6 +2319,65 @@ lp = logdensityof(lawof(F), 0.5)",
             flatppl_determinizer::is_flatpdl(&out).is_ok(),
             "is_flatpdl failed:\n{pir}"
         );
+    }
+}
+
+// The spec-LEGAL `kernelof` spelling: §04 "Kernels and `kernelof`" reifies a VALUE
+// ("`x` must not be a measure") and makes `kernelof(x)` equivalent to
+// `functionof(lawof(x))`. So `kernelof(a)` scored as a measure must match `lawof(a)`,
+// which §04's identity law makes `a`'s own `Normal(0, 1)`.
+#[test]
+fn kernelof_of_a_value_lowers_identically_to_lawof_of_that_value() {
+    let reified = "\
+a = draw(Normal(mu = 0.0, sigma = 1.0))
+lp = logdensityof(kernelof(a), 0.5)";
+    let plain = "\
+a = draw(Normal(mu = 0.0, sigma = 1.0))
+lp = logdensityof(lawof(a), 0.5)";
+    let pir_reified = flatppl_flatpir::write(&determinize_src(reified));
+    let pir_plain = flatppl_flatpir::write(&determinize_src(plain));
+    assert!(
+        pir_reified.contains("builtin_logdensityof"),
+        "kernelof of a value must lower:\n{pir_reified}"
+    );
+    assert_eq!(
+        pir_reified, pir_plain,
+        "kernelof(a) and lawof(a) lower to identical FlatPDL:\nkernelof:\n{pir_reified}\nlawof:\n{pir_plain}"
+    );
+}
+
+// The unwrap is CLOSED-only, and "closed" is not the same as "boundary lists nothing".
+// A `%autoinputs` reification whose body holds a free `%local` placeholder auto-traces
+// to ZERO inputs — a `%local` is never an `elementof` leaf — yet the placeholder is
+// bound by nothing once the wrapper is gone. §04 "Placeholders and holes" forbids the
+// module ("All placeholders must appear both in the expression to be reified and the
+// boundary input keyword arguments") but no front-end diagnostic enforces it, so the
+// determiniser must refuse rather than score a dangling ref.
+//
+// The placeholder sits in SCALE position deliberately. In `mu` position the conjugate
+// row and the pre-existing reified-measure path emit the same dangling ref either way,
+// so the guard would not be observable; in `sigma` position the row fires on the
+// unwrapped body and would emit
+// `(%field sigma (sqrt (add 1.0 (pow (%ref %local _v_) 2.0))))` — which is what this
+// test catches. Verified discriminating by mutation, not assumed.
+#[test]
+fn a_closed_reification_whose_body_holds_a_free_placeholder_is_not_unwrapped() {
+    let pir = "(%module\n\
+      (%bind a (draw (Normal (%kwarg mu 0.0) (%kwarg sigma 1.0))))\n\
+      (%bind F (functionof (Normal (%kwarg mu (%ref self a)) (%kwarg sigma (%ref %local _v_))) %autoinputs %deferred))\n\
+      (%bind lp (logdensityof (lawof (%ref self F)) 0.5)))";
+    let mut m = flatppl_flatpir::read(pir).expect("probe FlatPIR must parse");
+    let _ = flatppl_infer::infer(&mut m);
+    match determinize(&m) {
+        Ok(out) => panic!(
+            "must refuse rather than emit a dangling placeholder:\n{}",
+            flatppl_flatpir::write(&out)
+        ),
+        Err(e) => assert!(
+            e.reason.contains("placeholder"),
+            "refusal must name the placeholder, not the boundary inputs it does not have: {}",
+            e.reason
+        ),
     }
 }
 
