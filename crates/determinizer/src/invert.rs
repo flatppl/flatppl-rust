@@ -1074,13 +1074,21 @@ impl Extent {
     /// either side excludes. Only [`intersect`](Self::intersect) can produce one, and
     /// only where the base's support is disjoint from the op's §06 domain — reachable
     /// through an explicit `bijection`, which skips the `Domain::admits` check
-    /// (`crate::density::lower_pushfwd`). Every such case collapses to `Unbounded`
-    /// today because the out-of-domain endpoint maps to NaN or ±inf, but an inverted
-    /// extent whose endpoints stayed finite would emit `interval(lo, hi)` backwards,
-    /// which the StableHLO `in` lowering reads as the COMPLEMENT of the intended set
-    /// (its closed-interval identity is `(v − lo)·(hi − v) >= 0`). No gate is the
-    /// honest answer: an always-false one would be a false −∞ wherever the map does
-    /// have mass.
+    /// (`crate::density::lower_pushfwd`).
+    ///
+    /// An inverted extent must not reach [`named_set`](Self::named_set), which would
+    /// spell it `interval(lo, hi)` backwards — and the StableHLO `in` lowering reads
+    /// that as the COMPLEMENT of the intended set, since its closed-interval identity
+    /// `(v − lo)·(hi − v) >= 0` holds BETWEEN an inverted pair. A map UNDEFINED outside
+    /// its domain cannot get there (the out-of-domain endpoint maps to NaN or ±inf and
+    /// collapses to `Unbounded`), but one merely RESTRICTED there can: `pow`'s domain is
+    /// `nonnegreals` while `x³` is finite on negatives.
+    ///
+    /// No gate is the honest answer, not an always-false one: an empty intersection
+    /// means this pass's domain reasoning does not describe the map the user ASSERTED,
+    /// on a model §06 case 1 would refuse outright. Emitting nothing falls back to the
+    /// ungated change of variables, which is what the same model got before the image
+    /// was computed from the support at all.
     fn nonempty(self) -> Option<Extent> {
         let (lo, hi) = (
             self.lo.value(f64::NEG_INFINITY),

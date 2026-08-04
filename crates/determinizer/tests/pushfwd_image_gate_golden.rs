@@ -449,6 +449,60 @@ fn a_truncated_base_maps_both_endpoints() {
 }
 
 #[test]
+fn a_support_disjoint_from_the_forwards_domain_emits_no_image_gate() {
+    // A support intersected with the forward's §06 domain can be EMPTY, and then there
+    // is no image to gate on (`Extent::nonempty`). Reachable only through the explicit
+    // `bijection` spelling, which skips the domain check a synthesised forward refuses
+    // on first.
+    //
+    // The LOAD-BEARING case is a map defined OUTSIDE its §06 domain. `pow`'s domain is
+    // `nonnegreals`, but `x³` is perfectly finite on negatives, so over
+    // `interval(-5, -1)` the empty intersection `(Open(0), Closed(-1))` maps to two
+    // FINITE endpoints and survives as an inverted extent. Ungarded it emits
+    // `0.5 in interval(0.0, -1.0)` — endpoints the wrong way round, which the StableHLO
+    // `in` lowering reads as the COMPLEMENT of the intended set (its closed-interval
+    // identity is `(v − lo)·(hi − v) >= 0`, non-negative BETWEEN an inverted pair).
+    let odd_pow = lp(
+        "d = pushfwd(bijection(x -> pow(x, 3.0), x -> pow(x, 0.3333333333333333), \
+         x -> add(log(3.0), mul(2.0, log(x)))), \
+         truncate(Normal(mu = 0.0, sigma = 1.0), interval(-5.0, -1.0)))\n\
+         lp = logdensityof(d, 0.5)",
+    );
+    assert!(
+        !odd_pow.contains("(interval 0.0 -1.0)"),
+        "an empty extent must not be spelled as a backwards interval:\n{odd_pow}"
+    );
+    // The change of variables is left UNGATED: the emission IS §06's subtraction,
+    // `logdensityof(M, f_inv(v)) - logvol(f_inv(v))`. Without this the assertion above
+    // would also pass on an emission that gated on some other wrong set.
+    assert_eq!(
+        pir_head(&call_arg(&odd_pow, "%bind", 1)),
+        "sub",
+        "an empty image must leave the change of variables ungated:\n{odd_pow}"
+    );
+    // A map that is UNDEFINED outside its domain reaches the same check but cannot show
+    // it: `log`'s out-of-domain endpoint maps to NaN and collapses to `Unbounded`, so
+    // this emitted no gate before the extent walk existed either. Kept because it is the
+    // shape the guard's doc names, and it must stay ungated.
+    let out_of_domain = lp("d = pushfwd(bijection(log, exp, x -> neg(log(x))), \
+         truncate(Normal(mu = 0.0, sigma = 1.0), interval(-3.0, -1.0)))\n\
+         lp = logdensityof(d, 0.5)");
+    assert_eq!(
+        pir_head(&call_arg(&out_of_domain, "%bind", 1)),
+        "sub",
+        "an out-of-domain support must leave the change of variables ungated:\n{out_of_domain}"
+    );
+    // Neither tests the QUERY point. The base truncation's own gate survives in both,
+    // and it reads the PREIMAGE (`exp(0.5)`, `0.5 ^ (1/3)`), never `0.5`.
+    for out in [&odd_pow, &out_of_domain] {
+        assert!(
+            !out.contains("(in 0.5 ") && !out.contains("(gt 0.5 ") && !out.contains("(ge 0.5 "),
+            "no image gate may test the query point:\n{out}"
+        );
+    }
+}
+
+#[test]
 fn an_unproven_support_gates_on_the_maps_range() {
     // The fallback, and the no-regression half: a base whose support the pass cannot
     // read — `Uniform`'s support is its set ARGUMENT, unproven when the bounds are
