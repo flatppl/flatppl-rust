@@ -5,6 +5,11 @@ the `kchain` marginal integral. This file states each integral, its closed form,
 constructor that names the answer, and the test point that pins it — so a reader can
 check the maths without reverse-engineering a `build_*_marginal`.
 
+**Two families live here.** `CONJUGATE_TABLE`'s rows each marginalize ONE variate's law.
+The **shared-latent record law** below is a second family, deliberately outside the table:
+it is the law of N variates jointly, so no per-variate row can express it, and no product
+of per-variate rows is equal to it.
+
 ## What the table solves
 
 §06 *Density of composed measures*: "`kchain` marginalizes the intermediate variate, so
@@ -406,6 +411,206 @@ normalizer does not: the emitted `log1p` argument goes from `4.166666666666666` 
 `log 2.23606797749979` and the log-beta are unchanged. A row that dropped `mu` would keep
 `4.166666666666666`, which is what the golden asserts against.
 
+## The shared-latent record law — one prior, N correlated fields
+
+| | |
+|---|---|
+| model | `z ~ Normal(mu = μ₀, sigma = s₀)`; `yᵢ ~ Normal(mu = z, sigma = σᵢ)` for `i = 1…N` |
+| query | `logdensityof(lawof(record(y₁ = y₁, …, y_N = y_N)), record(y₁ = x₁, …))` |
+| latent | `z`, feeding every field's `mu`, and carried by NO field of the record |
+| answer | `MvNormal(μ₀·1, Σ)` with `Σ = s₀²·J + diag(σ₁²…σ_N²)`, `J` all-ones |
+| builder | `build_shared_latent_normal_logpdf` |
+| recogniser | `shared_latent_record_law` |
+
+This is the shape the record path used to refuse. Every per-field marginal is right
+(`Normal(μ₀, sqrt(s₀² + σᵢ²))`, Row 1) and their product is still the wrong measure,
+because the fields are correlated through `z`. `N = 1` is not this family: it is Row 1,
+and it keeps lowering there.
+
+### The integral
+
+`z` is integrated out of the product of the conditionals (§04 *Reification to measures*
+makes `lawof(record(…))` the total law of the traced sub-DAG; §04 *Kernels and `kernelof`*
+identifies it with `kchain(prior, forward_kernel)`):
+
+$$p(x_1,\dots,x_N) = \int \mathcal{N}(z;\, \mu_0,\, s_0)
+\prod_{i=1}^{N} \mathcal{N}(x_i;\, z,\, \sigma_i)\; \mathrm{d}z$$
+
+Solve it structurally rather than by integrating. Write
+$y = \mu_0\mathbf{1} + s_0\xi\mathbf{1} + \varepsilon$ with $\xi \sim \mathcal{N}(0,1)$ and
+$\varepsilon \sim \mathcal{N}(0, D)$, $D = \mathrm{diag}(\sigma_1^2,\dots,\sigma_N^2)$,
+independent. An affine image of a Gaussian is Gaussian, so $y$ is Gaussian, and its first
+two moments are read off directly:
+
+$$\mathbb{E}[y] = \mu_0\mathbf{1}, \qquad
+\mathrm{Cov}(y) = s_0^2\,\mathbf{1}\mathbf{1}^{\mathsf{T}} + D \;=\; \Sigma$$
+
+so $\mathrm{Var}(y_i) = s_0^2 + \sigma_i^2$ — each **diagonal** entry is Row 1's marginal
+variance, which is why the per-field rows are individually correct — and
+$\mathrm{Cov}(y_i, y_j) = s_0^2 = \mathrm{Var}(z)$ for $i \neq j$, which is the part a
+product of those rows throws away.
+
+### Σ⁻¹ and log det Σ without matrix ops
+
+$\Sigma$ is diagonal plus rank one, so both pieces of the Gaussian log-density are scalar
+expressions. Write $d_i = 1/\sigma_i^2$, $r_i = x_i - \mu_0$, and
+
+$$S = \sum_i d_i = \mathbf{1}^{\mathsf{T}}D^{-1}\mathbf{1}, \qquad
+T = \sum_i d_i r_i = \mathbf{1}^{\mathsf{T}}D^{-1}r, \qquad
+k = s_0^2 S$$
+
+**Sherman–Morrison** on $\Sigma = D + s_0^2\,\mathbf{1}\mathbf{1}^{\mathsf{T}}$:
+
+$$\Sigma^{-1} = D^{-1} - \frac{s_0^2\,D^{-1}\mathbf{1}\mathbf{1}^{\mathsf{T}}D^{-1}}
+{1 + s_0^2\,\mathbf{1}^{\mathsf{T}}D^{-1}\mathbf{1}}
+\quad\Longrightarrow\quad
+r^{\mathsf{T}}\Sigma^{-1}r = \sum_i d_i r_i^2 \;-\; \frac{s_0^2\,T^2}{1 + k}$$
+
+**The matrix determinant lemma** on the same split:
+
+$$\det\Sigma = \det(D)\,\bigl(1 + s_0^2\,\mathbf{1}^{\mathsf{T}}D^{-1}\mathbf{1}\bigr)
+\quad\Longrightarrow\quad
+\log\det\Sigma = \sum_i \log \sigma_i^2 \;+\; \log(1 + k)$$
+
+Both corrections carry the SAME $1 + k$, and both vanish at $s_0 = 0$ — where the fields
+really are independent and the law collapses to the product of the conditionals.
+
+### The emitted expression
+
+$$\log p = -\tfrac{1}{2}\Bigl[\,N\log 2\pi \;+\; \sum_i \log \sigma_i^2
+\;+\; \log(1+k) \;+\; \sum_i d_i r_i^2 \;-\; \frac{s_0^2 T^2}{1+k}\,\Bigr]$$
+
+emitted as one flat §07 sum, in this order:
+
+```text
+vᵢ   = pow(σᵢ, 2.0)                      dᵢ = divide(1.0, vᵢ)      rᵢ = sub(xᵢ, μ₀)
+S    = add-fold over dᵢ                  k  = mul(pow(s₀, 2.0), S)
+T    = add-fold over mul(dᵢ, rᵢ)
+quad = sub(add-fold over mul(dᵢ, pow(rᵢ, 2.0)),
+           divide(mul(pow(s₀, 2.0), pow(T, 2.0)), add(1.0, k)))
+out  = mul(-0.5, add-fold [ mul(N, log2π) , log(v₁) … log(v_N) , log1p(k) , quad ])
+```
+
+`log2π` is the literal `1.8378770664093453`; `N` is the field count, so `mul(N, log2π)`
+const-folds and a wrong field count shows in the folded literal. Everything is §07
+("Elementary functions"): `add`, `sub`, `mul`, `divide`, `pow`, `log`, `log1p`. **No matrix
+op, and no §08 `MvNormal` constructor** — a constructor would force the record variate to
+be converted to a vector, which is the variate-kind seam, and `is_flatpdl` admits the
+expression as it stands.
+
+`log`/`log1p` are deliberately not const-folded (`canon::fold` excludes transcendentals to
+keep the det-js equivalence bit-identical), so the emitted sum keeps three legible parts
+even for an all-literal model: the folded `N log 2π`, the residual `log`/`log1p` terms, and
+`quad` as ONE folded literal. That literal is the Sherman–Morrison result, so it is the
+strongest thing a golden can assert.
+
+**Field order.** The row pairs `σᵢ` with `xᵢ` by field NAME — the variates come from
+`match_independent_record`, which looks each field up in the query record — and emits the
+sum in the record's WRITTEN order. So reordering the record's fields permutes the `log(vᵢ)`
+terms in the emitted sum: the output is not byte-identical, and only the pairing is
+invariant.
+
+What IS invariant is every folded literal: `N log 2π`, the `log1p` argument `k`, and `quad`.
+`quad` is where a mispairing would show, and loudly — pairing point C's σ with the wrong
+fields moves it from `5.851661943957181` to `4.2324472630774075`, and point B's from
+`0.747121951219512` to `2.042975609756093`. All three points below are additionally verified
+to evaluate bit-identically under reversal in the emitted summation order, though that is a
+property of these points, not a guarantee: a permuted floating-point sum need not be exact
+for `N ≥ 3`.
+
+### Test points
+
+All three truths agree to full double precision along THREE independent routes: this
+section's closed form, `MvNormal` in Distributions.jl, and Gauss–Kronrod quadrature
+(`QuadGK`, `rtol = 1e-13`) of the mixture integral above. The quadrature is the one that
+does not share this derivation's algebra.
+
+**Point A — the pinned two-field case.** `μ₀ = 0`, `s₀ = 1`, `σ = (1, 1)`, `x = (0.5, 0.7)`.
+
+| | |
+|---|---|
+| truth | `-2.5171832107434002` |
+| product of the marginals | `-2.716024246969291` |
+| gap | `0.199` nats |
+
+The wrong answer is the product of two correct `Normal(0, √2)` marginals — the number the
+determiniser emitted before the record path refused this shape. Folded literals:
+`mul(2, log2π)` → `3.6757541328186907`, `log1p` argument `2.0`, `quad` → `0.26`.
+
+**Point B — three fields, UNEQUAL σ.** `μ₀ = 0`, `s₀ = 1.5`, `σ = (0.5, 1, 2)`,
+`x = (0.9, 1.2, 2)`.
+
+| | |
+|---|---|
+| truth | `-4.405587203673088` |
+| product of the marginals | `-5.424117657134536` (gap `1.019`) |
+| conditional at `z = μ₀` | `-5.596815599614018` (gap `1.191`) |
+| σ in reversed order | `-5.053514032941378` (gap `0.648`) |
+| Sherman–Morrison term dropped | `-6.872026228063332` (gap `2.466`) |
+| the `log(1+k)` det term dropped | `-3.1303765752237744` (gap `−1.275`) |
+
+Unequal σ is what makes this point discriminate at all: with σ equal, the fields are
+exchangeable and a row that permuted them would pass. The last two rows are the two ways to
+half-apply the rank-one correction — apply it to the quadratic form only, or to the log-det
+only — and both are caught. Folded literals: `mul(3, log2π)` → `5.513631199228036`, `log`
+arguments `0.25`, `1.0`, `4.0`, `log1p` argument `11.8125`, `quad` → `0.747121951219512`.
+
+**Gap scan.** The gap against the product of the marginals does NOT change sign along the
+all-fields-together direction `x = t·(1,1,1)`: it is positive everywhere, with its minimum
+`0.689` at the origin, because moving the fields together is exactly the correlation the
+product misses. It DOES change sign along a spreading direction — along `t·(1,0,−1)` it
+crosses zero near `t ≈ ±1.05`, and along `t·(1,0,0)` near `t ≈ ±1.3` — so a point chosen on
+a spread axis can be blind. This point sits off those axes; shifting all three fields by
+`±0.4` moves the gap monotonically over `0.801 … 1.309`, with no crossing nearby.
+
+**Point C — nonzero μ₀.** `μ₀ = 1.5`, `s₀ = 0.8`, `σ = (0.7, 1.3)`, `x = (3.5, 0.5)`.
+
+| | |
+|---|---|
+| truth | `-5.163204327709579` |
+| μ₀ dropped (read as 0) | `-8.216098673951652` (gap `3.053`) |
+| conditional at `z = μ₀` | `-6.121057028165009` (gap `0.958`) |
+| product of the marginals | `-4.306423795663165` (gap `−0.857`) |
+| `s₀` and `σ₁` swapped | `-4.893335214229616` (gap `−0.270`) |
+
+Carried for the same reason Rows 4 and 5 carry a nonzero-location point: μ₀ enters only
+through `rᵢ = xᵢ − μ₀`, so a row that dropped it would keep every other literal and pass
+every `μ₀ = 0` point. The point is a SPREAD one (one field high, one low), which is why its
+gap against the product of the marginals is negative — that is the opposite sign from
+Point B's, so the two together pin the sign of the correlation term rather than just its
+magnitude. All four gaps exceed `0.27` nats; shifting both fields by `±0.4` leaves the
+product gap flat near `−0.85`, with no crossing. Folded literals: `log` arguments
+`0.48999999999999994` and `1.6900000000000002`, `log1p` argument `1.6848206738316633`,
+`quad` → `5.851661943957181`.
+
+### What keeps refusing
+
+The family is deliberately narrow: N fields, each a BARE `draw` of `Normal(mu = z, …)`
+directly referencing ONE shared latent whose own prior is `Normal` and ancestor-free. Each
+of these keeps the shared-latent refusal, and each is pinned by a test:
+
+- **A scale latent.** `yᵢ ~ Normal(mu = 1, sigma = z)`. Not a Gaussian marginal at all, so
+  no rank-one Σ exists.
+- **A non-Normal shared prior.** `z ~ Exponential(…)` feeding N Normal means. The mixture
+  is Gaussian only conditionally; the joint is not.
+- **A non-Normal field family.** `yᵢ ~ Poisson(rate = z)` — the fields are correlated, and
+  the joint is not in this closed form.
+- **Two shared latents.** `yᵢ ~ Normal(mu = add(z, w), …)`. Σ is then rank TWO plus
+  diagonal, and neither Sherman–Morrison as written nor the one-prior integral covers it.
+- **A DERIVED field mean.** `yᵢ ~ Normal(mu = mul(2.0, z), …)` has a closed-form joint that
+  is NOT this one (the loadings differ per field), so the exact-ref check refuses it, the
+  same way Row 1's does.
+- **A transformed field.** `b = exp(y1)` needs the pushforward of the JOINT, which this row
+  does not return.
+- **Mixed shared and unshared fields.** Every field must integrate the same latent. A
+  record where two fields share `z` and a third integrates `w` would need the product of
+  this row with `w`'s own — correct in principle, and outside the decided scope.
+
+`iid` and `joint` over the same model still emit the PRODUCT, and that is not a
+contradiction: §06 defines `joint(M1, M2, …)` as the "independent product measure", so
+`joint(a = lawof(y1), b = lawof(y2))` asks for a different measure than
+`lawof(record(y1 = y1, y2 = y2))` does. Only the record spelling gains the correlated form.
+
 ## Deferred by decision — Exponential prior on the MEAN
 
 `v ~ Exponential(rate = λ)`; `y ~ Normal(mu = v, sigma = σ)` is a **location** mixture, whose
@@ -440,30 +645,16 @@ No row applying is a refusal, never a licence to score the conditional. The refu
 naming, each with a test:
 
 - **Two record fields marginalizing the SAME latent.** This one is different in kind from
-  the rest, and it is the only place where every per-row answer is right and the assembled
-  result is still wrong — so the row cannot catch it. For
-  `y1, y2 ~ Normal(mu = z, sigma = 1)` over `z ~ Normal(0, 1)`, each marginal is
-  `Normal(0, √2)` and each is correct, but the fields are **correlated** through the shared
-  ancestor: `Cov(y1, y2) = Var(z) = 1`. So
+  the rest: it is the only place where every per-row answer is right and the assembled
+  result is still wrong, so the row cannot catch it. `conjugate_marginal_measure` therefore
+  returns the latent it integrated (`ImplicitMarginal::latent`), and the record path
+  compares them across fields. Two fields over DIFFERENT latents is a genuine product and
+  lowers.
 
-  | | |
-  |---|---|
-  | truth at `(0.5, 0.7)` | `MvNormal([0,0], [2 1; 1 2])` = `-2.5171832107434002` |
-  | product of the marginals | `-2.716024246969291` |
-  | gap | `0.199` nats |
-
-  §04 *Kernels and `kernelof`* works this exact shape and makes the joint
-  `kchain(prior, forward_kernel)`, which is not a product of the fields' marginals for any
-  prior. `conjugate_marginal_measure` therefore returns the latent it integrated
-  (`ImplicitMarginal::latent`), and the record path refuses when two marginalized fields
-  report the same one. Two fields over DIFFERENT latents is a genuine product and lowers.
-
-  **`iid` and `joint` over the same model are NOT this case and correctly emit the
-  product.** §06 defines `joint(M1, M2, …)` as the "independent product measure"
-  `(M1 ⊗ M2)(A × B) = M1(A) · M2(B)`, so `joint(a = lawof(y1), b = lawof(y2))` asks for the
-  product of the two marginals — a different measure from `lawof(record(y1 = y1, y2 = y2))`,
-  which is the law of the traced sub-DAG. This is why the check is sited in the record path
-  rather than in the row or the combinator.
+  Where the shape is the shared-latent record law above — every field a bare
+  `Normal(mu = z, …)` draw over one ancestor-free `Normal` prior — the record path now emits
+  that law's closed form instead of refusing. Any other shared-latent shape still refuses;
+  the list is in that section's *What keeps refusing*.
 
 - **The latent feeds a scale, not the mean.** `z ~ Normal(0, 2)`; `y ~ Normal(mu = 1, sigma = z)`
   is a Normal prior on a standard deviation. That is not the Normal–Normal (mean)
@@ -500,5 +691,8 @@ naming, each with a test:
    silently.
 5. **Check what happens when two variates share the row's latent.** A correct marginal is
    correct for ONE variate; summing two of them asserts independence the shared ancestor
-   denies. The record path already refuses on a repeated `ImplicitMarginal::latent`, so a new
-   row inherits that — but a new *caller* that assembles a product does not.
+   denies. The record path compares each field's `ImplicitMarginal::latent` and refuses on a
+   repeat, so a new row inherits that — but a new *caller* that assembles a product does
+   not. The one exception is the shared-latent record law, which answers the repeat with the
+   joint closed form; it recognises its own Normal-on-Normal-mean shape only, so a new row
+   inherits the refusal, never that law.
