@@ -87,9 +87,17 @@ pub(crate) fn lower_builtin(
         "get0" => lower_get(e, id, args, 0),
         "get" => lower_get(e, id, args, 1),
         "in" => lower_in(e, id, args),
-        // §07 comparison functions `lt`/`gt` ($a < b$ / $a > b$ over `reals`).
+        // §07 comparison functions `lt`/`gt`/`le`/`ge` ($a < b$, $a > b$, $a \le b$,
+        // $a \ge b$ over `reals`). The inclusive pair is the image gate's vocabulary
+        // for a CLOSED finite endpoint (`determinizer::invert`): `pushfwd(exp, Gamma)`
+        // has image [1, ∞), which no §03 set spells — `interval(1, inf)` would, but
+        // its lowering is the product `(v − lo)·(hi − v) ≥ 0`, and at `v = lo` with an
+        // infinite `hi` that is `0 · inf` = NaN, i.e. FALSE at the one endpoint the
+        // closed bound exists to admit.
         "lt" => lower_compare(e, id, args, "LT"),
         "gt" => lower_compare(e, id, args, "GT"),
+        "le" => lower_compare(e, id, args, "LE"),
+        "ge" => lower_compare(e, id, args, "GE"),
         "land" => lower_land(e, id, args),
         "iszero" => lower_iszero(e, id, args),
         // `record(...)` is not a tensor — handled structurally by the mode
@@ -151,7 +159,7 @@ fn lower_ifelse(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, E
 /// `Lit(Bool)`, which lowers as a plain `tensor<f32>` `dense<1.0>` via
 /// `constant`) would make the declared `i1` operand disagree with the actual
 /// emitted type, producing ill-typed StableHLO.
-const PREDICATE_HEADS: &[&str] = &["in", "compare", "lt", "gt", "land", "iszero"];
+const PREDICATE_HEADS: &[&str] = &["in", "compare", "lt", "gt", "le", "ge", "land", "iszero"];
 
 /// An `ifelse` condition / `land` operand must be one of
 /// [`PREDICATE_HEADS`]. Same narrow-and-refuse discipline as `get`/`get0`'s

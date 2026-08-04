@@ -2078,13 +2078,13 @@ fn lower_fill_refuses_a_dynamic_result_shape() {
 /// pin that keeps `lower_builtin` narrow.
 #[test]
 fn lower_builtin_still_refuses_ops_the_gate_does_not_emit() {
-    // Adjacent to something newly lowered in each case: the other comparison
-    // directions and logical connectives, the binary extrema (vs the new
-    // reductions), the other roundings, the exact-equality pair, and the
-    // change-of-variables inverses an open-image `pushfwd` still needs.
+    // Adjacent to something lowered in each case: the other logical connectives, the
+    // binary extrema (vs the reductions), the other roundings, the exact-equality
+    // pair, and the change-of-variables inverses an open-image `pushfwd` still needs.
+    // `le`/`ge` are NOT here — a closed finite image endpoint emits them.
     for head in [
-        "le", "ge", "lor", "lnot", "lxor", "min", "max", "ceil", "isnan", "isfinite", "equal",
-        "unequal", "logit", "tan", "log1p", "atanh", "zeros", "ones",
+        "lor", "lnot", "lxor", "min", "max", "ceil", "isnan", "isfinite", "equal", "unequal",
+        "logit", "tan", "log1p", "atanh", "zeros", "ones",
     ] {
         let mut m = Module::new();
         let a = real(&mut m, 1.0);
@@ -9399,11 +9399,14 @@ lp = logdensityof(lawof(record(a = a)), record(a = 0.5))\n";
 // image, and ungated `f⁻¹` returns a finite number there instead.
 
 /// A DERIVED record field through a continuous base — `sigma = sqrt(sigma2)`,
-/// the shape every hierarchical model with a scale prior takes. The image gate
-/// is `sigma_v in nonnegreals` (§03 `[0, +inf]`, `sqrt`'s image), and the gated
-/// arm is built over the sanitised point.
+/// the shape every hierarchical model with a scale prior takes. The image gate is
+/// `sigma_v in posreals`: `InverseGamma`'s §08 support is `posreals`, OPEN at 0, so
+/// `sqrt`'s image of it is open at 0 too and the comparison is `GT`. A closed
+/// `nonnegreals` (`GE`) admitted `sigma_v = 0`, where the gate was taken and the
+/// change of variables differentiated to +inf. The gated arm is built over the
+/// sanitised point.
 #[test]
-fn emit_logdensity_sqrt_derived_field_gates_on_nonnegreals() {
+fn emit_logdensity_sqrt_derived_field_gates_on_the_open_image() {
     let src = "\
 sigma2 = draw(InverseGamma(shape = 5.0, scale = 5.0))
 sigma = sqrt(sigma2)
@@ -9415,8 +9418,9 @@ outputs = (lp)
     let d = determinize_src(src);
     let out = emit_logdensity(&d);
     assert!(is_delimiter_balanced(&out));
-    // `[0, +inf]` is CLOSED at zero, so `GE`.
-    assert!(out.contains("stablehlo.compare GE"), "in:\n{out}");
+    // `(0, +inf]` is OPEN at zero, so `GT` — and NOT `GE`, which is the defect.
+    assert!(out.contains("stablehlo.compare GT"), "in:\n{out}");
+    assert!(!out.contains("stablehlo.compare GE"), "in:\n{out}");
     // The gate selects the sanitised point, and again the −∞ floor.
     assert!(out.matches("stablehlo.select").count() >= 2, "in:\n{out}");
     assert!(

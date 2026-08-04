@@ -16,10 +16,11 @@
 //! named unary bijections, reached through ONE lookup ([`unary_entry`]) from both
 //! [`bare_bijection`] (a bare builtin value) and [`classify`] (an op inside a lambda
 //! body). Each entry carries its inverse, its FORWARD log-volume `log|g'|`, its §06
-//! domain restriction and its IMAGE. The two emissions are BUILDERS parameterised by
-//! the point the derivative is taken at, because a chain needs `log|g'|` at a node it
-//! already holds, not a callable to apply. [`forward_image`] reads the image from the
-//! same table, so no spelling of `pushfwd` gates differently from another.
+//! domain restriction and its ENDPOINT MAP. The two emissions are BUILDERS
+//! parameterised by the point the derivative is taken at, because a chain needs
+//! `log|g'|` at a node it already holds, not a callable to apply. [`forward_image`]
+//! reads the endpoint map from the same table, so no spelling of `pushfwd` gates
+//! differently from another.
 //!
 //! ## Scalar-chain inversion
 //!
@@ -306,24 +307,28 @@ fn wrap_elementwise(m: &mut Module, per_cell: &Bijection) -> Bijection {
 pub(crate) struct ImageGate {
     /// The boolean condition "`y` is in `f`'s image".
     pub(crate) cond: NodeId,
-    /// A point strictly INSIDE the image — the value the gate substitutes for an
-    /// excluded `y` (`crate::density::gate_point`), so no dangerous op in the gated
-    /// arm ever sees one. `None` where no point is derivable: the base's support names
-    /// none, or it lies outside the forward's own §06 domain.
+    /// A point IN the image — the value the gate substitutes for an excluded `y`
+    /// (`crate::density::gate_point`), so no dangerous op in the gated arm ever sees
+    /// one. Usually interior, but ON the boundary where a CLOSED endpoint comes from a
+    /// discrete support's hull (`booleans`' witness is 1, and `exp(1) = e` is the hull
+    /// image's own endpoint) — which is enough, since the arm only needs every op in it
+    /// to stay finite there. `None` where no point is derivable: the base's support
+    /// names none, or it lies outside the forward's own §06 domain.
     pub(crate) witness: Option<NodeId>,
 }
 
-/// Read from `f` ALONE, and from the same [`REGISTRY`] entry the change of
-/// variables comes from, so the explicit `bijection(f, f_inv, logvol)` spelling
-/// gates identically to the synthesised one: the annotation records an inverse and
-/// a log-volume but never an image, while §06 makes its result "a function that is
-/// semantically `f`".
+/// Read from `f` and the BASE'S SUPPORT alone, through the same [`REGISTRY`] entry
+/// the change of variables comes from, so the explicit `bijection(f, f_inv, logvol)`
+/// spelling gates identically to the synthesised one: the annotation records an
+/// inverse and a log-volume but never an image, while §06 makes its result "a
+/// function that is semantically `f`".
 ///
-/// For a COMPOSITION the gate is the OUTERMOST op's image, which is a SUPERSET of
-/// the composition's own (`image(gₙ∘…∘g₁) ⊆ image(gₙ)`) — exact when the inner ops
-/// are affine, hence onto, and never a false −∞ otherwise. Tightening it
-/// (`x -> exp(x) + 1` has image (1, ∞) and gates here on (0, ∞)) needs the forward
-/// interval propagation the chain domain guard is also waiting on.
+/// The image is COMPUTED, never tabulated: §06 `(f_*M)(Y) = M(f⁻¹(Y))` makes it
+/// `f`'s image of the support, and every §06 case-1 forward is monotone on its
+/// domain, so mapping the support's two endpoints gives it ([`Extent`]). A
+/// COMPOSITION propagates the support innermost-first, one op at a time, so
+/// `x -> 2·exp(x) + 1` over a real base gates on its own (1, ∞) rather than on
+/// `exp`'s (0, ∞) or on nothing.
 pub(crate) fn forward_image(
     m: &mut Module,
     f: NodeId,
@@ -361,61 +366,276 @@ pub(crate) fn forward_image(
     Some(ImageGate { cond, witness })
 }
 
-/// A SCALAR forward map's image and its witness: the [`REGISTRY`] entry's own for a
-/// bare builtin (`pushfwd(exp, M)`) or a one-op lambda, `pow`'s per-exponent range
-/// for `pow(_, k)`, and the outermost op's for a longer chain (see
-/// [`forward_image`]).
-fn scalar_image(m: &mut Module, f: NodeId, support: &ValueSet) -> Option<(Image, Option<NodeId>)> {
+/// A SCALAR forward map's image and its witness, both walks reading ONE reading of
+/// the map's ops ([`image_ops`]) so a spelling cannot change either.
+fn scalar_image(m: &mut Module, f: NodeId, support: &ValueSet) -> Option<(Extent, Option<NodeId>)> {
+    let ops = image_ops(m, f)?;
+    let image = image_extent(&ops, support)?;
+    let witness = image_witness(m, &ops, support);
+    Some((image, witness))
+}
+
+/// The ops of a recognised scalar forward map, OUTERMOST-first: one for a bare
+/// builtin (`pushfwd(exp, M)`) or a one-op lambda, `pow`'s own for `pow(_, k)`, and
+/// the whole chain for a longer composition. `None` for a map this pass does not
+/// recognise (no gate then).
+fn image_ops(m: &Module, f: NodeId) -> Option<Vec<ImageOp>> {
     match recognise(m, f) {
         Recognized::BareConst(name) => {
             let (op, entry) = unary_entry(&name)?;
-            Some((entry.image?, image_witness(m, op, entry.domain, support)))
+            Some(vec![ImageOp::unary(op, entry)])
         }
         Recognized::Lambda { body, ph, .. } => {
             if let Some(k_node) = single_pow(m, body, ph) {
-                return pow_image(m, k_node, support);
+                return pow_op(m, k_node).map(|op| vec![op]);
             }
             let ops = flatten_chain(m, body, ph).ok().flatten()?;
-            match ops.first()? {
-                ChainOp::Registry { op, entry, .. } => {
-                    Some((entry.image?, image_witness(m, op, entry.domain, support)))
-                }
-                _ => None,
-            }
+            ops.iter().map(|op| ImageOp::of_chain_op(m, op)).collect()
         }
         Recognized::Unrecognized => None,
     }
 }
 
-/// A point strictly inside the image of the unary forward `op`: `op` APPLIED at a
-/// point in the base measure's `support`. Inside because every registry forward is a
-/// monotone injection on its own domain, so it carries an interior point of the domain
-/// to an interior point of the image — hence the check that `support`'s witness lies
-/// in `op`'s §06 domain, which the annotated `bijection` spelling reaches without any
-/// domain check having run.
-///
-/// For the single-op spellings the preimage of this witness is the support point
-/// itself, so the gated arm's base density and volume term are read at a point the
-/// base admits. For a CHAIN it is the inner ops' inverses of that point — finite and
-/// inside the chain's domain, the same superset looseness the image itself carries.
-fn image_witness(
-    m: &mut Module,
-    op: &str,
-    domain: Option<Domain>,
-    support: &ValueSet,
-) -> Option<NodeId> {
-    let w = witness_in(support, domain)?;
-    let w_node = m.alloc(Node::Lit(Scalar::Real(w)));
-    Some(build_call(m, op, &[w_node]))
+/// The image of a base whose support is `support` under `ops`: the support's extent
+/// pushed through them INNERMOST-first ([`push_extent`]). `None` where the walk has no
+/// op to take a range from and the support proves no extent, and where an op leaves
+/// nothing to map ([`Extent::nonempty`]).
+fn image_extent(ops: &[ImageOp], support: &ValueSet) -> Option<Extent> {
+    let mut ext = Extent::of_support(support);
+    for op in ops.iter().rev() {
+        ext = Some(push_extent(ext, op)?);
+    }
+    ext
 }
 
-/// [`support_witness`], required to lie inside `domain` where the forward has one.
-fn witness_in(support: &ValueSet, domain: Option<Domain>) -> Option<f64> {
-    let w = support_witness(support)?;
-    match domain {
-        Some(d) if !d.contains(w) => None,
-        _ => Some(w),
+/// Push `ext` through ONE op: intersect the op's §06 domain, map the endpoints, and
+/// cap the result at the op's own RANGE — the image over its whole domain, which is
+/// also what an unproven support falls back to (exactly the static per-op image this
+/// walk replaced) and what supplies a bound the map cannot evaluate
+/// ([`EndpointMap::at`]).
+///
+/// Capping at the range is what makes the walk MONOTONE in the safe direction: every
+/// result is a subset of the op's own range, hence of the static image it replaced, so
+/// an image can only tighten and never widen.
+fn push_extent(ext: Option<Extent>, op: &ImageOp) -> Option<Extent> {
+    let domain = op.domain.map_or(Extent::REALS, Domain::extent);
+    let range = domain.map(op.map);
+    let Some(e) = ext else { return Some(range) };
+    let inside = e.intersect(domain).nonempty()?;
+    range.intersect(inside.map(op.map)).nonempty()
+}
+
+/// A point in the base measure's `support` carried THROUGH the forward: in the image
+/// by construction, and with that support point as its preimage, so the gated arm
+/// reads the base density and the volume term where both are finite
+/// (`crate::density::gate_point`).
+///
+/// `None` where the support names no point ([`support_witness`]), where the point or
+/// an intermediate leaves an op's §06 domain — which the annotated `bijection`
+/// spelling reaches with no domain check having run — or where an op carries it to
+/// ±inf. The gate then goes unsanitised, exactly as it did before.
+fn image_witness(m: &mut Module, ops: &[ImageOp], support: &ValueSet) -> Option<NodeId> {
+    let mut x = support_witness(support)?;
+    let mut node = m.alloc(Node::Lit(Scalar::Real(x)));
+    for op in ops.iter().rev() {
+        if op.domain.is_some_and(|d| !d.contains(x)) {
+            return None;
+        }
+        x = op.map.at(x);
+        if !x.is_finite() {
+            return None;
+        }
+        node = op.build.at(m, node);
     }
+    Some(node)
+}
+
+/// One op of a forward map as the IMAGE walks read it. Built from a bare [`REGISTRY`]
+/// entry, from `pow`'s literal exponent and from a [`ChainOp`] alike, so the image
+/// and the witness are computed by one walk each over every spelling.
+struct ImageOp {
+    /// The op's §06 case-1 domain restriction, intersected in before it maps.
+    domain: Option<Domain>,
+    map: EndpointMap,
+    build: Build,
+}
+
+/// How the witness leg APPLIES an [`ImageOp`] to a node.
+enum Build {
+    /// `op(x)` — a [`REGISTRY`] unary.
+    Unary(&'static str),
+    /// `op(x, c)` with the literal operand `c` (`pow(x, k)`, `mul(x, c)`), or
+    /// `op(c, x)` where `literal_first` (`sub(c, x)`).
+    WithLit {
+        op: &'static str,
+        c: NodeId,
+        literal_first: bool,
+    },
+}
+
+impl Build {
+    fn at(&self, m: &mut Module, x: NodeId) -> NodeId {
+        match self {
+            Build::Unary(op) => build_call(m, op, &[x]),
+            Build::WithLit {
+                op,
+                c,
+                literal_first: false,
+            } => build_call(m, op, &[x, *c]),
+            Build::WithLit {
+                op,
+                c,
+                literal_first: true,
+            } => build_call(m, op, &[*c, x]),
+        }
+    }
+}
+
+impl ImageOp {
+    /// A [`REGISTRY`] unary, applied by name.
+    fn unary(op: &'static str, entry: &UnaryEntry) -> ImageOp {
+        ImageOp {
+            domain: entry.domain,
+            map: entry.map,
+            build: Build::Unary(op),
+        }
+    }
+
+    /// The image reading of one chain op. `None` where an affine op's coefficient is
+    /// not a numeric literal, which [`classify`] admits none of.
+    fn of_chain_op(m: &Module, op: &ChainOp) -> Option<ImageOp> {
+        let affine = |c: NodeId, map: EndpointMap, op: &'static str, literal_first: bool| {
+            Some(ImageOp {
+                domain: None,
+                map,
+                build: Build::WithLit {
+                    op,
+                    c,
+                    literal_first,
+                },
+            })
+        };
+        match op {
+            ChainOp::Registry { op, entry, .. } => Some(ImageOp::unary(op, entry)),
+            ChainOp::MulByLit(c) => {
+                affine(*c, EndpointMap::Scale(literal_real(m, *c)?), "mul", false)
+            }
+            ChainOp::DivByLit(c) => affine(
+                *c,
+                EndpointMap::Divide(literal_real(m, *c)?),
+                "divide",
+                false,
+            ),
+            ChainOp::AddLit(c) => {
+                affine(*c, EndpointMap::Shift(literal_real(m, *c)?), "add", false)
+            }
+            ChainOp::SubLit(c) => {
+                affine(*c, EndpointMap::Shift(-literal_real(m, *c)?), "sub", false)
+            }
+            ChainOp::RSubLit(c) => {
+                affine(*c, EndpointMap::Reflect(literal_real(m, *c)?), "sub", true)
+            }
+        }
+    }
+}
+
+/// `pow(_, k)` as one [`ImageOp`]: §06's literal-exponent case, whose domain splits
+/// on the sign of `k` — `xᵏ` is undefined at 0 for `k < 0` ([`derive_pow`], which
+/// refuses `k = 0`).
+fn pow_op(m: &Module, k_node: NodeId) -> Option<ImageOp> {
+    let k = literal_real(m, k_node)?;
+    if k == 0.0 {
+        return None;
+    }
+    let domain = if k < 0.0 {
+        Domain::PosReals
+    } else {
+        Domain::NonNegReals
+    };
+    Some(ImageOp {
+        domain: Some(domain),
+        map: EndpointMap::Pow(k),
+        build: Build::WithLit {
+            op: "pow",
+            c: k_node,
+            literal_first: false,
+        },
+    })
+}
+
+/// How a forward carries an ENDPOINT. Every §06 case-1 forward is monotone on its own
+/// domain, so an interval's image is its two endpoint images ([`Extent::map`]) — the
+/// whole mechanism the image comes from, in place of a per-op static image that could
+/// not see the base's support.
+#[derive(Clone, Copy)]
+enum EndpointMap {
+    /// A [`REGISTRY`] unary's own numeric forward, INCREASING on its domain (`neg`,
+    /// the one reflection in the table, is `Scale(-1)`).
+    Unary(fn(f64) -> f64),
+    /// `atan`, kept its own variant rather than a [`Unary`](Self::Unary) so the
+    /// SPELLING of its range endpoints travels with the op ([`Spelling::HalfPi`]):
+    /// ±π/2 emit as §07 `pi / 2`, which a decimal literal would hide. No other op
+    /// can pick that spelling up.
+    Atan,
+    /// `c·x` — `mul` by a literal, and `neg` at `c = −1`.
+    Scale(f64),
+    /// `x/c` — `divide` by a literal, kept a division so the endpoint is the value
+    /// the emitted map produces (`x·(1/c)` is not `x/c`).
+    Divide(f64),
+    /// `x + c` — `add` a literal, and `sub` one at `−c`.
+    Shift(f64),
+    /// `c − x` — `sub` FROM a literal.
+    Reflect(f64),
+    /// `xᵏ` — §06's literal-exponent `pow`, `k ≠ 0`.
+    Pow(f64),
+}
+
+impl EndpointMap {
+    /// The op at an extended-real endpoint. `f64::NAN` where this pass has no
+    /// implementation (`probit`/`invprobit` away from their limits, which need an
+    /// inverse error function), which drops that bound to the op's range rather than
+    /// guessing it.
+    fn at(self, x: f64) -> f64 {
+        match self {
+            EndpointMap::Unary(f) => f(x),
+            EndpointMap::Atan => x.atan(),
+            EndpointMap::Scale(c) => x * c,
+            EndpointMap::Divide(c) => x / c,
+            EndpointMap::Shift(c) => x + c,
+            EndpointMap::Reflect(c) => c - x,
+            EndpointMap::Pow(k) => x.powf(k),
+        }
+    }
+
+    /// Does the op REVERSE the two endpoints?
+    fn decreasing(self) -> bool {
+        match self {
+            EndpointMap::Unary(_) | EndpointMap::Atan | EndpointMap::Shift(_) => false,
+            EndpointMap::Scale(c) | EndpointMap::Divide(c) => c < 0.0,
+            EndpointMap::Reflect(_) => true,
+            EndpointMap::Pow(k) => k < 0.0,
+        }
+    }
+
+    /// How the endpoints this op produces are SPELLED — a property of the op, so no
+    /// other op's endpoint can take a symbolic spelling by numeric coincidence.
+    fn spelling(self) -> Spelling {
+        match self {
+            EndpointMap::Atan => Spelling::HalfPi,
+            _ => Spelling::Literal,
+        }
+    }
+}
+
+/// How an [`Extent`]'s endpoints are SPELLED, decided by the op that produced them
+/// ([`EndpointMap::spelling`]).
+#[derive(Clone, Copy, PartialEq)]
+enum Spelling {
+    /// A decimal literal, which `f64`'s shortest-round-trip `Display` recovers
+    /// exactly.
+    Literal,
+    /// The op's range endpoints are ±π/2 and emit as §07 `pi / 2`.
+    HalfPi,
 }
 
 /// A point strictly inside `support` — what a −∞ gate substitutes for an excluded
@@ -459,31 +679,6 @@ fn interval_witness(lo: f64, hi: f64) -> Option<f64> {
         (false, true) => Some(hi - 1.0),
         (false, false) => None,
     }
-}
-
-/// `pow(_, k)`'s image: `xᵏ` carries `[0, ∞)` onto `[0, ∞)` for `k > 0` and
-/// `(0, ∞)` onto `(0, ∞)` for `k < 0` — the same split as its domain
-/// ([`derive_pow`], which refuses `k = 0`). Its witness is `pow(w, k)` at a support
-/// point `w`, on the same argument as [`image_witness`].
-fn pow_image(
-    m: &mut Module,
-    k_node: NodeId,
-    support: &ValueSet,
-) -> Option<(Image, Option<NodeId>)> {
-    let k = literal_real(m, k_node)?;
-    if k == 0.0 {
-        return None;
-    }
-    let domain = if k < 0.0 {
-        Domain::PosReals
-    } else {
-        Domain::NonNegReals
-    };
-    let witness = witness_in(support, Some(domain)).map(|w| {
-        let w_node = m.alloc(Node::Lit(Scalar::Real(w)));
-        build_call(m, "pow", &[w_node, k_node])
-    });
-    Some((Image::Set(domain), witness))
 }
 
 /// The scalar per-cell operator of an elementwise forward map over a vector
@@ -538,10 +733,11 @@ struct UnaryEntry {
     logvol: LogVol,
     /// The §06 case-1 domain restriction on `g`'s input, if any.
     domain: Option<Domain>,
-    /// `g`'s IMAGE, where it is a proper subset of the reals — what the density path
-    /// gates the query point against, EXACTLY at an open endpoint ([`Image`]). `None`
-    /// for an onto map (`log`, `neg`, `sinh`), which needs no gate.
-    image: Option<Image>,
+    /// `g` at an ENDPOINT — the one fact the image gate is computed from. `g` is
+    /// monotone on `domain`, so the image of the base's support is its endpoints
+    /// mapped ([`Extent::map`]); the image over the whole `domain` is `g`'s range,
+    /// which is what a base with an unproven support gates on.
+    map: EndpointMap,
 }
 
 /// The inverse column of a [`UnaryEntry`], carried so that BOTH spellings a
@@ -706,105 +902,317 @@ impl Domain {
         }
     }
 
-    /// This set as a §03 set-valued node, for an `in(y, S)` membership gate.
-    fn set_node(self, m: &mut Module) -> NodeId {
-        match self {
-            Domain::PosReals => bare_const(m, "posreals"),
-            Domain::NonNegReals => bare_const(m, "nonnegreals"),
-            Domain::AboveMinusOne => {
-                let lo = m.alloc(Node::Lit(Scalar::Real(-1.0)));
-                let hi = bare_const(m, "inf");
-                build_call(m, "interval", &[lo, hi])
-            }
-            // §03's `unitinterval` is [0, 1] — the closed form of §06's `interval(0, 1)`.
-            Domain::Unit => bare_const(m, "unitinterval"),
+    /// This domain as an [`Extent`]: the set a base support is intersected with
+    /// before it maps, and the set the forward's own RANGE is the image of.
+    ///
+    /// `Unit` is OPEN at both ends, matching [`contains`](Self::contains) — §06 writes
+    /// the domain `interval(0, 1)` and §03's `interval` is closed, but `logit`/`probit`
+    /// are ±inf AT the endpoints, so the open reading is the one that maps.
+    fn extent(self) -> Extent {
+        let (lo, hi) = match self {
+            Domain::PosReals => (Bound::Open(0.0), Bound::Unbounded),
+            Domain::NonNegReals => (Bound::Closed(0.0), Bound::Unbounded),
+            Domain::AboveMinusOne => (Bound::Open(-1.0), Bound::Unbounded),
+            Domain::Unit => (Bound::Open(0.0), Bound::Open(1.0)),
+        };
+        Extent {
+            lo,
+            hi,
+            spell: Spelling::Literal,
         }
     }
 }
 
-/// The IMAGE of a recognised forward map `g`: the set outside which the
-/// pushforward has no mass. §06 `(f_*M)(Y) = M(f⁻¹(Y))` — at a `y` outside the
-/// image the preimage is EMPTY, so the measure is 0 and the log-density −∞. That
-/// is a computable value, not an intractable one, so the density path gates on
-/// this set instead of refusing.
+/// One endpoint of an [`Extent`].
+#[derive(Clone, Copy)]
+enum Bound {
+    /// No bound on this side.
+    Unbounded,
+    /// The endpoint is IN the set — `nonnegreals`' 0 (§03 `[0, +inf]`).
+    Closed(f64),
+    /// The endpoint is NOT in the set — `posreals`' 0 (§03 `(0, +inf]`), and every
+    /// endpoint a forward reaches only in a limit.
+    Open(f64),
+}
+
+impl Bound {
+    /// The endpoint as an extended real; `side` is the infinity an unbounded side
+    /// stands for.
+    fn value(self, side: f64) -> f64 {
+        match self {
+            Bound::Unbounded => side,
+            Bound::Closed(x) | Bound::Open(x) => x,
+        }
+    }
+
+    fn is_closed(self) -> bool {
+        matches!(self, Bound::Closed(_))
+    }
+
+    /// `point <op> endpoint` — the STRICT op where this bound excludes its endpoint,
+    /// the inclusive one where it does not. `None` for an unbounded side.
+    fn compare(
+        self,
+        m: &mut Module,
+        point: NodeId,
+        [strict, inclusive]: [&str; 2],
+        spell: Spelling,
+    ) -> Option<NodeId> {
+        let (op, x) = match self {
+            Bound::Unbounded => return None,
+            Bound::Open(x) => (strict, x),
+            Bound::Closed(x) => (inclusive, x),
+        };
+        let bound = bound_node(m, x, spell);
+        Some(build_call(m, op, &[point, bound]))
+    }
+}
+
+/// A connected extent of the reals with per-endpoint openness: a base measure's
+/// SUPPORT (for a discrete one, its convex hull) and, mapped through a monotone
+/// forward, the pushforward's IMAGE — the set outside which it has no mass. §06
+/// `(f_*M)(Y) = M(f⁻¹(Y))`: at a `y` outside the image the preimage is EMPTY, so the
+/// measure is 0 and the log-density −∞. That is a computable value, not an
+/// intractable one, so the density path gates on this extent instead of refusing.
 ///
 /// The gate must be EXACT at an open endpoint; a closed superset is not harmless
 /// there. At the endpoint the inverse is ±inf, so the base density is −∞ AND the
 /// volume term diverges, and the emission is a SUBTRACTION: `sub(−∞, −∞)` is NaN
-/// where §06 gives −∞. `pushfwd(invlogit, Normal(0,1))` at `y = 1` is the case —
-/// `logit(1) = +∞`, `logvol = log σ(∞) + log(1 − σ(∞)) = −∞`. §03 spells no open
-/// interval (`interval(lo, hi)` "denotes the closed interval", `unitinterval` is
-/// [0, 1]), so an open image is gated by comparison instead of by `in`.
+/// where §06 gives −∞ (`pushfwd(invlogit, Normal(0,1))` at `y = 1` — `logit(1) = +∞`,
+/// `logvol = log σ(∞) + log(1 − σ(∞)) = −∞`). It also breaks the GRADIENT, which is
+/// why the endpoints are computed from the base's support rather than tabulated per
+/// op: over `InverseGamma` (§08 support `posreals`) `sqrt`'s image is open at 0, and
+/// a closed `nonnegreals` admitted `y = 0`, where the gate was TAKEN and the change
+/// of variables differentiated to +inf.
+/// An extent is always NON-EMPTY: `lo` below `hi`, or one point both sides include.
+/// [`intersect`](Extent::intersect) is the only operation that can violate that, and
+/// [`nonempty`](Extent::nonempty) is where it is caught.
 #[derive(Clone, Copy)]
-enum Image {
-    /// The §03 set a [`Domain`] variant already names, which is EXACTLY the image:
-    /// `posreals` is (0, +∞] and `nonnegreals` [0, +∞] (§03), `exp`'s and `sqrt`'s
-    /// images. For an inverse PAIR the image IS the partner's domain (`exp`'s image
-    /// is `log`'s domain, `posreals`), so both columns read one vocabulary.
-    Set(Domain),
-    /// An image with an OPEN finite endpoint, which no §03 set spells. `None` on a
-    /// side is unbounded there.
-    Open {
-        lo: Option<fn(&mut Module) -> NodeId>,
-        hi: Option<fn(&mut Module) -> NodeId>,
-    },
+struct Extent {
+    lo: Bound,
+    hi: Bound,
+    /// How both endpoints are SPELLED — set by the op that produced them, never read
+    /// off their values ([`EndpointMap::spelling`]).
+    spell: Spelling,
 }
 
-impl Image {
-    /// The membership condition on a SCALAR query point.
+impl Extent {
+    /// ℝ — the extent of an unrestricted domain, and the identity of [`intersect`](Self::intersect).
+    const REALS: Extent = Extent {
+        lo: Bound::Unbounded,
+        hi: Bound::Unbounded,
+        spell: Spelling::Literal,
+    };
+
+    /// The extent of a base measure's inferred support (§03's sets, read via
+    /// `Module::valueset_of`). A DISCRETE support gives its convex HULL: the hull's
+    /// image is a superset of the atoms' image, and the lattice test
+    /// (`crate::density::on_lattice`) is what cuts it back to the atoms.
+    ///
+    /// `None` for a support that proves no extent — `%unknown`/`%deferred`/`anything`,
+    /// a product, a simplex, the complexes — where the image falls back to the
+    /// forward's own range ([`push_extent`]).
+    fn of_support(support: &ValueSet) -> Option<Extent> {
+        use ValueSet::*;
+        let (lo, hi) = match support {
+            Reals | Integers => (Bound::Unbounded, Bound::Unbounded),
+            PosReals => (Bound::Open(0.0), Bound::Unbounded),
+            NonNegReals | NonNegIntegers => (Bound::Closed(0.0), Bound::Unbounded),
+            PosIntegers => (Bound::Closed(1.0), Bound::Unbounded),
+            // §03: `booleans` is {false, true}, whose numeric hull is [0, 1].
+            UnitInterval | Booleans => (Bound::Closed(0.0), Bound::Closed(1.0)),
+            // §03: `interval(lo, hi)` "denotes the closed interval". An infinite
+            // endpoint is no bound; `partial_cmp` rather than `<` so a NaN endpoint
+            // proves no extent.
+            Interval(lo, hi) => {
+                if lo.partial_cmp(hi) != Some(std::cmp::Ordering::Less) {
+                    return None;
+                }
+                (finite_bound(*lo), finite_bound(*hi))
+            }
+            _ => return None,
+        };
+        Some(Extent {
+            lo,
+            hi,
+            spell: Spelling::Literal,
+        })
+    }
+
+    /// This extent mapped through `map`, monotone on it: the two endpoint images,
+    /// swapped where `map` decreases. An endpoint the map sends to ±inf (or cannot
+    /// evaluate) leaves that side unbounded, and a closed endpoint stays closed only
+    /// where its image is finite — the openness §06's image inherits from the
+    /// support's own and from the map's endpoint behaviour.
+    fn map(self, map: EndpointMap) -> Extent {
+        let lo = map_bound(self.lo, f64::NEG_INFINITY, map);
+        let hi = map_bound(self.hi, f64::INFINITY, map);
+        let (lo, hi) = if map.decreasing() { (hi, lo) } else { (lo, hi) };
+        Extent {
+            lo,
+            hi,
+            spell: map.spelling(),
+        }
+    }
+
+    /// The tighter of two extents on each side. A symbolic spelling survives only
+    /// where both sides agree on it — the two partners in [`push_extent`] are one
+    /// op's range and its mapped support, so they always do.
+    fn intersect(self, other: Extent) -> Extent {
+        Extent {
+            lo: tighter(self.lo, other.lo, f64::NEG_INFINITY, |a, b| a > b),
+            hi: tighter(self.hi, other.hi, f64::INFINITY, |a, b| a < b),
+            spell: if self.spell == other.spell {
+                self.spell
+            } else {
+                Spelling::Literal
+            },
+        }
+    }
+
+    /// `None` where this extent contains NO point: `lo` above `hi`, or one point that
+    /// either side excludes. Only [`intersect`](Self::intersect) can produce one, and
+    /// only where the base's support is disjoint from the op's §06 domain — reachable
+    /// through an explicit `bijection`, which skips the `Domain::admits` check
+    /// (`crate::density::lower_pushfwd`).
+    ///
+    /// An inverted extent must not reach [`named_set`](Self::named_set), which would
+    /// spell it `interval(lo, hi)` backwards — and the StableHLO `in` lowering reads
+    /// that as the COMPLEMENT of the intended set, since its closed-interval identity
+    /// `(v − lo)·(hi − v) >= 0` holds BETWEEN an inverted pair. A map UNDEFINED outside
+    /// its domain cannot get there (the out-of-domain endpoint maps to NaN or ±inf and
+    /// collapses to `Unbounded`), but one merely RESTRICTED there can: `pow`'s domain is
+    /// `nonnegreals` while `x³` is finite on negatives.
+    ///
+    /// No gate is the honest answer, not an always-false one: an empty intersection
+    /// means this pass's domain reasoning does not describe the map the user ASSERTED,
+    /// on a model §06 case 1 would refuse outright. Emitting nothing falls back to the
+    /// ungated change of variables, which is what the same model got before the image
+    /// was computed from the support at all.
+    fn nonempty(self) -> Option<Extent> {
+        let (lo, hi) = (
+            self.lo.value(f64::NEG_INFINITY),
+            self.hi.value(f64::INFINITY),
+        );
+        let holds = lo < hi || (lo == hi && self.lo.is_closed() && self.hi.is_closed());
+        holds.then_some(self)
+    }
+
+    /// The membership condition on a SCALAR query point. `None` for an unbounded
+    /// extent — an onto map, which needs no gate.
     fn condition(&self, m: &mut Module, y: NodeId) -> Option<NodeId> {
-        match self {
-            Image::Set(d) => {
-                let set = d.set_node(m);
-                Some(build_call(m, "in", &[y, set]))
+        if let Some(set) = self.named_set(m) {
+            return Some(build_call(m, "in", &[y, set]));
+        }
+        self.comparisons(m, y, y)
+    }
+
+    /// The membership condition on an `n`-cell VECTOR query point, whose image is this
+    /// one in EVERY cell: `cartpow(S, n)` (§03) where a set names it, else the same
+    /// bounds against the point's extremes — every cell exceeds `lo` exactly when the
+    /// minimum does.
+    fn vector_condition(&self, m: &mut Module, y: NodeId, n: i64) -> Option<NodeId> {
+        if let Some(elem) = self.named_set(m) {
+            let n_node = m.alloc(Node::Lit(Scalar::Int(n)));
+            let set = build_call(m, "cartpow", &[elem, n_node]);
+            return Some(build_call(m, "in", &[y, set]));
+        }
+        let min = build_call(m, "minimum", &[y]);
+        let max = build_call(m, "maximum", &[y]);
+        self.comparisons(m, min, max)
+    }
+
+    /// The §03 set this extent IS, where one spells it EXACTLY — `posreals` is
+    /// (0, +inf] and `nonnegreals` [0, +inf], and `interval(lo, hi)` "denotes the
+    /// closed interval". Preferred over comparisons because `in(y, S)` is what the
+    /// StableHLO lowering takes for those three sets. §03's `unitinterval` is the
+    /// same set as `interval(0, 1)` and is not spelled here: that lowering does not
+    /// recognise the name.
+    ///
+    /// `None` for an extent with a HALF-open or an open FINITE endpoint, which no §03
+    /// set spells, and for an unbounded one.
+    fn named_set(&self, m: &mut Module) -> Option<NodeId> {
+        match (self.lo, self.hi) {
+            (Bound::Open(0.0), Bound::Unbounded) => Some(bare_const(m, "posreals")),
+            (Bound::Closed(0.0), Bound::Unbounded) => Some(bare_const(m, "nonnegreals")),
+            (Bound::Closed(lo), Bound::Closed(hi)) => {
+                let lo = bound_node(m, lo, self.spell);
+                let hi = bound_node(m, hi, self.spell);
+                Some(build_call(m, "interval", &[lo, hi]))
             }
-            Image::Open { lo, hi } => open_condition(m, *lo, *hi, y, y),
+            _ => None,
         }
     }
 
-    /// The membership condition on an `n`-cell VECTOR query point, whose image is
-    /// this one in EVERY cell: `cartpow(S, n)` (§03) for a set image, and for an open
-    /// one the same bounds against the point's extremes — every cell exceeds `lo`
-    /// exactly when the minimum does.
-    fn vector_condition(&self, m: &mut Module, y: NodeId, n: i64) -> Option<NodeId> {
-        match self {
-            Image::Set(d) => {
-                let elem = d.set_node(m);
-                let n_node = m.alloc(Node::Lit(Scalar::Int(n)));
-                let set = build_call(m, "cartpow", &[elem, n_node]);
-                Some(build_call(m, "in", &[y, set]))
-            }
-            Image::Open { lo, hi } => {
-                let min = build_call(m, "minimum", &[y]);
-                let max = build_call(m, "maximum", &[y]);
-                open_condition(m, *lo, *hi, min, max)
-            }
+    /// `lo < lo_point` and `hi_point < hi` (`≤` where the bound includes its
+    /// endpoint), conjoined, with an unbounded side dropped. `None` when neither side
+    /// is bounded.
+    fn comparisons(&self, m: &mut Module, lo_point: NodeId, hi_point: NodeId) -> Option<NodeId> {
+        let above = self.lo.compare(m, lo_point, ["gt", "ge"], self.spell);
+        let below = self.hi.compare(m, hi_point, ["lt", "le"], self.spell);
+        match (above, below) {
+            (Some(a), Some(b)) => Some(build_call(m, "land", &[a, b])),
+            (Some(c), None) | (None, Some(c)) => Some(c),
+            (None, None) => None,
         }
     }
 }
 
-/// `lo < lo_point` and `hi_point < hi`, conjoined, with an unbounded side dropped.
-/// `None` when neither side is bounded — an onto map, which carries no image at all.
-fn open_condition(
-    m: &mut Module,
-    lo: Option<fn(&mut Module) -> NodeId>,
-    hi: Option<fn(&mut Module) -> NodeId>,
-    lo_point: NodeId,
-    hi_point: NodeId,
-) -> Option<NodeId> {
-    let above = lo.map(|build| {
-        let bound = build(m);
-        build_call(m, "gt", &[lo_point, bound])
-    });
-    let below = hi.map(|build| {
-        let bound = build(m);
-        build_call(m, "lt", &[hi_point, bound])
-    });
-    match (above, below) {
-        (Some(a), Some(b)) => Some(build_call(m, "land", &[a, b])),
-        (Some(c), None) | (None, Some(c)) => Some(c),
-        (None, None) => None,
+/// A §03 `interval` endpoint as a [`Bound`]: closed where finite, no bound where
+/// infinite.
+fn finite_bound(x: f64) -> Bound {
+    if x.is_finite() {
+        Bound::Closed(x)
+    } else {
+        Bound::Unbounded
     }
+}
+
+/// One endpoint through `map`; `side` is the infinity an unbounded endpoint stands
+/// for. A non-finite image is no bound at all.
+fn map_bound(b: Bound, side: f64, map: EndpointMap) -> Bound {
+    // `+ 0.0` normalises the `-0.0` a reflection produces at 0 (`neg`'s image of
+    // `[0, inf)` is `(-inf, -0.0]`): the two compare equal, so the sign only shows up
+    // in the emitted literal and in the `named_set` patterns.
+    let y = map.at(b.value(side)) + 0.0;
+    if !y.is_finite() {
+        Bound::Unbounded
+    } else if b.is_closed() {
+        Bound::Closed(y)
+    } else {
+        Bound::Open(y)
+    }
+}
+
+/// The tighter of two bounds on the same side: the one whose endpoint cuts more, and
+/// on an EQUAL endpoint the open one (which excludes it).
+fn tighter(a: Bound, b: Bound, side: f64, cuts_more: impl Fn(f64, f64) -> bool) -> Bound {
+    let (x, y) = (a.value(side), b.value(side));
+    if cuts_more(x, y) || (x == y && b.is_closed()) {
+        a
+    } else {
+        b
+    }
+}
+
+/// An [`Extent`] endpoint as a node: a decimal literal, except where the OP that
+/// produced the endpoint declares a symbolic spelling for it ([`Spelling`]).
+///
+/// The magnitude check is not the key, it is the CONFIRMATION: `spell` says this op's
+/// range endpoints are ±π/2, and the check says this bound is one of them rather than
+/// an interior image point. `atan` over a BOUNDED support has finite interior
+/// endpoints (`atan([0, 1])` is `[0, 0.7853981633974483]`) and they are literals like
+/// any other.
+fn bound_node(m: &mut Module, x: f64, spell: Spelling) -> NodeId {
+    if spell == Spelling::HalfPi && x.abs() == std::f64::consts::FRAC_PI_2 {
+        let h = half_pi(m);
+        return if x < 0.0 {
+            build_call(m, "neg", &[h])
+        } else {
+            h
+        };
+    }
+    real_lit(m, x)
 }
 
 /// A bare builtin constant node (`posreals`, `unitinterval`, `inf`, `pi`).
@@ -813,7 +1221,7 @@ fn bare_const(m: &mut Module, name: &str) -> NodeId {
     m.alloc(Node::Const(sym))
 }
 
-/// A real literal node — an [`Image::Open`] endpoint.
+/// A real literal node — an [`Extent`] endpoint.
 fn real_lit(m: &mut Module, x: f64) -> NodeId {
     m.alloc(Node::Lit(Scalar::Real(x)))
 }
@@ -840,6 +1248,13 @@ fn half_pi(m: &mut Module) -> NodeId {
 /// case)" and so reuses [`pow_inverse`]/[`pow_logvol`] verbatim rather than
 /// carrying a parallel derivation. Each log-volume was cross-checked against
 /// numerical differentiation; §06's `cis` (complex) is out of scope here.
+///
+/// Every entry's endpoint map is INCREASING on its domain except `neg`, the one
+/// reflection, so the image of a base support is its endpoints mapped in place
+/// ([`Extent::map`]) — see [`EndpointMap`], which replaced a static per-entry image
+/// that could not see the base's support. Mapping an entry's own DOMAIN through its
+/// map reproduces that static image exactly, which is what an unproven support still
+/// gates on.
 static REGISTRY: &[(&str, UnaryEntry)] = &[
     // d/dx eˣ = eˣ ⇒ log|f'| = x (identity).
     (
@@ -848,7 +1263,7 @@ static REGISTRY: &[(&str, UnaryEntry)] = &[
             inverse: Inverse::Builtin("log"),
             logvol: LogVol::At(|_m, x| x),
             domain: None,
-            image: Some(Image::Set(Domain::PosReals)),
+            map: EndpointMap::Unary(f64::exp),
         },
     ),
     // d/dx ln x = 1/x ⇒ log|f'| = −ln x. Domain posreals: over a base whose
@@ -864,17 +1279,18 @@ static REGISTRY: &[(&str, UnaryEntry)] = &[
                 build_call(m, "neg", &[logx])
             }),
             domain: Some(Domain::PosReals),
-            image: None,
+            map: EndpointMap::Unary(f64::ln),
         },
     ),
-    // f'(x) = −1 ⇒ log|f'| = 0.
+    // f'(x) = −1 ⇒ log|f'| = 0. The one DECREASING entry, spelled as its affine
+    // scale so the endpoint map needs no direction column.
     (
         "neg",
         UnaryEntry {
             inverse: Inverse::Builtin("neg"),
             logvol: LogVol::Zero,
             domain: None,
-            image: None,
+            map: EndpointMap::Scale(-1.0),
         },
     ),
     // sqrt(x) = pow(x, 0.5) — §06's literal-exponent `pow` case, so the inverse
@@ -890,7 +1306,7 @@ static REGISTRY: &[(&str, UnaryEntry)] = &[
                 pow_logvol(m, k_node, SQRT_EXPONENT, x)
             }),
             domain: Some(Domain::NonNegReals),
-            image: Some(Image::Set(Domain::NonNegReals)),
+            map: EndpointMap::Unary(f64::sqrt),
         },
     ),
     // log10(x) = ln x / ln 10 ⇒ log|f'| = −ln x − ln(ln 10); inverse
@@ -911,7 +1327,7 @@ static REGISTRY: &[(&str, UnaryEntry)] = &[
                 build_call(m, "neg", &[s])
             }),
             domain: Some(Domain::PosReals),
-            image: None,
+            map: EndpointMap::Unary(f64::log10),
         },
     ),
     // log1p(x) = ln(1 + x) ⇒ log|f'| = −ln(1 + x) = −log1p(x); inverse expm1.
@@ -924,22 +1340,19 @@ static REGISTRY: &[(&str, UnaryEntry)] = &[
                 build_call(m, "neg", &[l])
             }),
             domain: Some(Domain::AboveMinusOne),
-            image: None,
+            map: EndpointMap::Unary(f64::ln_1p),
         },
     ),
-    // expm1(x) = eˣ − 1 ⇒ log|f'| = x (identity); inverse log1p. Domain ℝ.
+    // expm1(x) = eˣ − 1 ⇒ log|f'| = x (identity); inverse log1p. Domain ℝ, range
+    // (−1, ∞) open at −1 — `exp_m1(−inf) = −1` is a limit, and `log1p(−1) = −∞`
+    // with the volume term diverging there too.
     (
         "expm1",
         UnaryEntry {
             inverse: Inverse::Builtin("log1p"),
             logvol: LogVol::At(|_m, x| x),
             domain: None,
-            // (−1, ∞), open at −1: `log1p(−1) = −∞` and the volume term diverges
-            // there too.
-            image: Some(Image::Open {
-                lo: Some(|m| real_lit(m, -1.0)),
-                hi: None,
-            }),
+            map: EndpointMap::Unary(f64::exp_m1),
         },
     ),
     // logit(p) = ln(p / (1 − p)) ⇒ log|f'| = −ln p − ln(1 − p); inverse invlogit.
@@ -956,7 +1369,7 @@ static REGISTRY: &[(&str, UnaryEntry)] = &[
                 build_call(m, "neg", &[s])
             }),
             domain: Some(Domain::Unit),
-            image: None,
+            map: EndpointMap::Unary(logit_at),
         },
     ),
     // invlogit(x) = 1 / (1 + e⁻ˣ) ⇒ log|f'| = ln σ(x) + ln(1 − σ(x)); inverse
@@ -974,13 +1387,9 @@ static REGISTRY: &[(&str, UnaryEntry)] = &[
                 build_call(m, "add", &[log_s, log_oms])
             }),
             domain: None,
-            // (0, 1), open at BOTH endpoints: the inverse is ±∞ there and the
-            // volume term diverges with it. §03's `unitinterval` is the closed
-            // [0, 1], so it cannot spell this.
-            image: Some(Image::Open {
-                lo: Some(|m| real_lit(m, 0.0)),
-                hi: Some(|m| real_lit(m, 1.0)),
-            }),
+            // Range (0, 1), open at BOTH endpoints (both are limits): the inverse is
+            // ±∞ there and the volume term diverges with it.
+            map: EndpointMap::Unary(invlogit_at),
         },
     ),
     // probit(p) = Φ⁻¹(p) ⇒ log|f'| = ½ln(2π) + ½·probit(p)²; inverse invprobit (Φ).
@@ -998,7 +1407,7 @@ static REGISTRY: &[(&str, UnaryEntry)] = &[
                 build_call(m, "add", &[half_ln2pi, half_sq])
             }),
             domain: Some(Domain::Unit),
-            image: None,
+            map: EndpointMap::Unary(probit_at),
         },
     ),
     // invprobit(x) = Φ(x) ⇒ log|f'| = ln φ(x) = −½ln(2π) − ½x²; inverse probit.
@@ -1017,13 +1426,9 @@ static REGISTRY: &[(&str, UnaryEntry)] = &[
                 build_call(m, "neg", &[s])
             }),
             domain: None,
-            // (0, 1), open at BOTH endpoints: the inverse is ±∞ there and the
-            // volume term diverges with it. §03's `unitinterval` is the closed
-            // [0, 1], so it cannot spell this.
-            image: Some(Image::Open {
-                lo: Some(|m| real_lit(m, 0.0)),
-                hi: Some(|m| real_lit(m, 1.0)),
-            }),
+            // Range (0, 1), open at BOTH endpoints (both are limits): the inverse is
+            // ±∞ there and the volume term diverges with it.
+            map: EndpointMap::Unary(invprobit_at),
         },
     ),
     // atan(x) ⇒ log|f'| = −ln(1 + x²); inverse tan (valid on atan's range
@@ -1041,16 +1446,12 @@ static REGISTRY: &[(&str, UnaryEntry)] = &[
                 build_call(m, "neg", &[l])
             }),
             domain: None,
-            // `tan` is the single-valued inverse only on (−π/2, π/2) — outside it
-            // `tan(y)` is still finite, so an ungated query would read a preimage
-            // that is not one. Open: `tan(±π/2) = ±∞`.
-            image: Some(Image::Open {
-                lo: Some(|m| {
-                    let h = half_pi(m);
-                    build_call(m, "neg", &[h])
-                }),
-                hi: Some(half_pi),
-            }),
+            // `tan` is the single-valued inverse only on `atan`'s range (−π/2, π/2) —
+            // outside it `tan(y)` is still finite, so an ungated query would read a
+            // preimage that is not one. Open at both: `tan(±π/2) = ±∞`. Its own
+            // [`EndpointMap`] variant, which is what carries the symbolic `pi / 2`
+            // spelling of those two endpoints.
+            map: EndpointMap::Atan,
         },
     ),
     // sinh(x) ⇒ log|f'| = ln cosh(x); inverse asinh. Domain ℝ.
@@ -1063,7 +1464,7 @@ static REGISTRY: &[(&str, UnaryEntry)] = &[
                 build_call(m, "log", &[ch])
             }),
             domain: None,
-            image: None,
+            map: EndpointMap::Unary(f64::sinh),
         },
     ),
     // asinh(x) ⇒ log|f'| = −½ln(1 + x²); inverse sinh. Domain ℝ.
@@ -1081,7 +1482,7 @@ static REGISTRY: &[(&str, UnaryEntry)] = &[
                 build_call(m, "mul", &[mhalf, l])
             }),
             domain: None,
-            image: None,
+            map: EndpointMap::Unary(f64::asinh),
         },
     ),
     // tanh(x) ⇒ log|f'| = ln(1 − tanh(x)²); inverse atanh. Domain ℝ.
@@ -1098,14 +1499,49 @@ static REGISTRY: &[(&str, UnaryEntry)] = &[
                 build_call(m, "log", &[omsq])
             }),
             domain: None,
-            // (−1, 1), open: `atanh(±1) = ±∞` and `log(1 − tanh²)` diverges there.
-            image: Some(Image::Open {
-                lo: Some(|m| real_lit(m, -1.0)),
-                hi: Some(|m| real_lit(m, 1.0)),
-            }),
+            // Range (−1, 1), open at both (limits): `atanh(±1) = ±∞` and
+            // `log(1 − tanh²)` diverges there.
+            map: EndpointMap::Unary(f64::tanh),
         },
     ),
 ];
+
+/// `logit(p) = ln(p / (1 − p))` at an endpoint: −inf at 0 and +inf at 1, so
+/// `logit`'s range over its (0, 1) domain is ℝ and it carries no gate.
+fn logit_at(p: f64) -> f64 {
+    (p / (1.0 - p)).ln()
+}
+
+/// `invlogit(x) = 1 / (1 + e⁻ˣ)` at an endpoint: 0 and 1 in the two limits.
+fn invlogit_at(x: f64) -> f64 {
+    1.0 / (1.0 + (-x).exp())
+}
+
+/// `probit(p) = Φ⁻¹(p)` at an endpoint. Only the two DOMAIN endpoints are reachable
+/// without an inverse error function, which this pass has no implementation of; a
+/// finite interior point reports NaN, which leaves the image bound at `probit`'s own
+/// range ([`push_extent`]) rather than guessing one.
+fn probit_at(p: f64) -> f64 {
+    if p <= 0.0 {
+        f64::NEG_INFINITY
+    } else if p >= 1.0 {
+        f64::INFINITY
+    } else {
+        f64::NAN
+    }
+}
+
+/// `invprobit(x) = Φ(x)` at an endpoint — 0 and 1 in the two limits, and NaN at a
+/// finite point, on the same argument as [`probit_at`].
+fn invprobit_at(x: f64) -> f64 {
+    if x == f64::NEG_INFINITY {
+        0.0
+    } else if x == f64::INFINITY {
+        1.0
+    } else {
+        f64::NAN
+    }
+}
 
 /// `sqrt` as §06's literal-exponent `pow`: `sqrt(x) = pow(x, 1/2)`.
 const SQRT_EXPONENT: f64 = 0.5;
