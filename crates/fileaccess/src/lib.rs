@@ -186,16 +186,43 @@ mod tests {
         }
     }
 
-    /// A unique temp cache root per test (no env, no network).
-    fn temp_root() -> PathBuf {
-        static N: AtomicU64 = AtomicU64::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "flatppl-fa-test-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    /// A private temp cache root per test (no env, no network), deleted when the
+    /// test ends.
+    ///
+    /// The directory is claimed with `create_dir`, which fails when the name is
+    /// already taken. The name embeds the pid, and the OS recycles pids, so
+    /// without that exclusive claim a run could inherit the populated cache a
+    /// previous run left at the same path — a hit where the test expects a miss.
+    /// The `Drop` removal keeps such leftovers from accumulating at all.
+    struct TempRoot(PathBuf);
+
+    impl TempRoot {
+        fn new() -> TempRoot {
+            static N: AtomicU64 = AtomicU64::new(0);
+            let base = std::env::temp_dir();
+            loop {
+                let dir = base.join(format!(
+                    "flatppl-fa-test-{}-{}",
+                    std::process::id(),
+                    N.fetch_add(1, Ordering::Relaxed)
+                ));
+                match std::fs::create_dir(&dir) {
+                    Ok(()) => return TempRoot(dir),
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(e) => panic!("temp cache root {}: {e}", dir.display()),
+                }
+            }
+        }
+
+        fn path(&self) -> PathBuf {
+            self.0.clone()
+        }
+    }
+
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 
     fn read(p: &Path) -> String {
@@ -206,14 +233,14 @@ mod tests {
 
     #[test]
     fn miss_fetches_stores_and_writes_metadata() {
-        let root = temp_root();
-        let cache = Cache::new(root.clone(), false, true); // trust_all
+        let root = TempRoot::new();
+        let cache = Cache::new(root.path(), false, true); // trust_all
         let fetcher = FakeFetcher::new("x = 1");
         let path = cache.get(URL, &fetcher, &DenyAll).expect("resolves");
 
         assert_eq!(read(&path), "x = 1");
         assert_eq!(fetcher.call_count(), 1, "first resolve fetches once");
-        assert!(path.starts_with(root.join("v1/objects")));
+        assert!(path.starts_with(root.path().join("v1/objects")));
 
         // Metadata sits beside the object and is valid JSON with the URL.
         let meta_path = path.with_file_name(format!(
@@ -232,8 +259,8 @@ mod tests {
 
     #[test]
     fn hit_does_not_refetch() {
-        let root = temp_root();
-        let cache = Cache::new(root, false, true);
+        let root = TempRoot::new();
+        let cache = Cache::new(root.path(), false, true);
         let fetcher = FakeFetcher::new("x = 1");
         let p1 = cache.get(URL, &fetcher, &DenyAll).unwrap();
         let p2 = cache.get(URL, &fetcher, &DenyAll).unwrap();
@@ -243,8 +270,8 @@ mod tests {
 
     #[test]
     fn offline_miss_is_an_error_and_does_not_fetch() {
-        let root = temp_root();
-        let cache = Cache::new(root, true, true); // offline
+        let root = TempRoot::new();
+        let cache = Cache::new(root.path(), true, true); // offline
         let fetcher = FakeFetcher::new("x = 1");
         let err = cache.get(URL, &fetcher, &DenyAll).unwrap_err();
         assert!(matches!(err, Error::Offline(_)), "got {err:?}");
@@ -253,8 +280,8 @@ mod tests {
 
     #[test]
     fn untrusted_is_refused_without_marker_and_does_not_fetch() {
-        let root = temp_root();
-        let cache = Cache::new(root, false, false); // not trust_all
+        let root = TempRoot::new();
+        let cache = Cache::new(root.path(), false, false); // not trust_all
         let fetcher = FakeFetcher::new("x = 1");
         let err = cache.get(URL, &fetcher, &DenyAll).unwrap_err();
         assert!(matches!(err, Error::Untrusted(_)), "got {err:?}");
@@ -263,8 +290,8 @@ mod tests {
 
     #[test]
     fn approval_writes_marker_so_next_run_is_trusted() {
-        let root = temp_root();
-        let cache = Cache::new(root, false, false);
+        let root = TempRoot::new();
+        let cache = Cache::new(root.path(), false, false);
         let fetcher = FakeFetcher::new("x = 1");
         // First: approve once → fetch + marker written.
         cache.get(URL, &fetcher, &ApproveAll).unwrap();
@@ -281,8 +308,8 @@ mod tests {
 
     #[test]
     fn failed_fetch_writes_nothing() {
-        let root = temp_root();
-        let cache = Cache::new(root, false, true);
+        let root = TempRoot::new();
+        let cache = Cache::new(root.path(), false, true);
         let err = cache.get(URL, &FailFetcher, &DenyAll).unwrap_err();
         assert!(matches!(err, Error::Fetch { .. }), "got {err:?}");
         let k = super::cache::cache_key(URL);
@@ -292,17 +319,17 @@ mod tests {
 
     #[test]
     fn resolver_local_passthrough_and_notfound() {
-        let root = temp_root();
-        let file = root.join("model.flatppl");
+        let root = TempRoot::new();
+        let file = root.path().join("model.flatppl");
         std::fs::write(&file, "y = 2").unwrap();
         let fetcher = FakeFetcher::new("");
-        let r = Resolver::new(Cache::new(root.clone(), false, true), &fetcher, &DenyAll);
+        let r = Resolver::new(Cache::new(root.path(), false, true), &fetcher, &DenyAll);
 
         let here = Location::Local(file.clone());
         assert_eq!(r.local_path(&here).unwrap(), file);
         assert_eq!(r.read(&here).unwrap(), b"y = 2");
 
-        let missing = Location::Local(root.join("nope.flatppl"));
+        let missing = Location::Local(root.path().join("nope.flatppl"));
         assert!(matches!(r.local_path(&missing), Err(Error::NotFound(_))));
         assert_eq!(fetcher.call_count(), 0, "local paths never fetch");
     }
