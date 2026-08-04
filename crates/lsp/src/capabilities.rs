@@ -11,12 +11,16 @@ use crate::queries::{
 };
 use flatppl_core::{BindingId, CallHead, Doc, Node, Ref, RefNs, Scalar};
 
-/// Test-only counter incremented each time the static completion set is built.
-/// Used by `static_completion_items_built_once` to prove the `OnceLock` cache is
-/// populated exactly once across calls.
 #[cfg(test)]
-static STATIC_COMPLETION_BUILDS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    /// Test-only counter incremented each time the static completion set is built.
+    /// Used by `static_completion_items_built_once` to prove the `OnceLock` cache
+    /// is populated exactly once across calls.
+    ///
+    /// Thread-local, not process-global: libtest runs each test on its own thread,
+    /// so a build a parallel test triggers counts against that test, never this one.
+    static STATIC_COMPLETION_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// An owned, salsa-friendly diagnostic: a byte range into the source, a severity,
 /// and a message. The LSP `Range` (UTF-16) is computed at emit time from these
@@ -660,7 +664,7 @@ pub(crate) fn completion(
 /// This never depends on any request input, so it is built once and reused.
 fn build_static_completion_items() -> Vec<lsp_types::CompletionItem> {
     #[cfg(test)]
-    STATIC_COMPLETION_BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    STATIC_COMPLETION_BUILDS.with(|n| n.set(n.get() + 1));
     use lsp_types::{CompletionItem, CompletionItemKind};
     let mut items: Vec<CompletionItem> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -689,9 +693,9 @@ fn build_static_completion_items() -> Vec<lsp_types::CompletionItem> {
 /// Return the cached static completion set, building it on first use.
 ///
 /// In production the cache is a process-global `OnceLock`: the set is built once
-/// for the life of the process. Under `cfg(test)` the cache is resettable (via
-/// [`reset_static_completion_items`]) so the build-once contract can be asserted
-/// deterministically regardless of which test populates the cache first.
+/// for the life of the process. Under `cfg(test)` it is per-thread and resettable
+/// (via [`reset_static_completion_items`]), which makes the build-once contract
+/// assertable from one test without a parallel test warming the cache first.
 #[cfg(not(test))]
 fn static_completion_items() -> Vec<lsp_types::CompletionItem> {
     use std::sync::OnceLock;
@@ -703,21 +707,24 @@ fn static_completion_items() -> Vec<lsp_types::CompletionItem> {
 
 #[cfg(test)]
 fn static_completion_items() -> Vec<lsp_types::CompletionItem> {
-    let mut guard = STATIC_ITEMS_TEST_CACHE.lock().unwrap();
-    if guard.is_none() {
-        *guard = Some(build_static_completion_items());
-    }
-    guard.as_ref().unwrap().clone()
+    STATIC_ITEMS_TEST_CACHE.with(|cache| {
+        cache
+            .borrow_mut()
+            .get_or_insert_with(build_static_completion_items)
+            .clone()
+    })
 }
 
 #[cfg(test)]
-static STATIC_ITEMS_TEST_CACHE: std::sync::Mutex<Option<Vec<lsp_types::CompletionItem>>> =
-    std::sync::Mutex::new(None);
+thread_local! {
+    static STATIC_ITEMS_TEST_CACHE: std::cell::RefCell<Option<Vec<lsp_types::CompletionItem>>> =
+        const { std::cell::RefCell::new(None) };
+}
 
-/// Drop the test-only static-completion cache so the next call rebuilds it.
+/// Drop this thread's test-only static-completion cache so the next call rebuilds it.
 #[cfg(test)]
 fn reset_static_completion_items() {
-    *STATIC_ITEMS_TEST_CACHE.lock().unwrap() = None;
+    STATIC_ITEMS_TEST_CACHE.with(|cache| *cache.borrow_mut() = None);
 }
 
 /// Attempt to resolve the `standard_module` module name for the binding named
@@ -798,13 +805,6 @@ fn strip_last_nonempty_line(text: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Serializes the general-completion tests, which share the resettable
-    /// static-items cache and its build counter. Without this guard they could
-    /// interleave (one test's `reset` racing another's `get_or_build`) and skew
-    /// the build count. The member-completion path does not touch the cache, so
-    /// it intentionally does not take this lock.
-    static COMPLETION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     // ── parse error tests ────────────────────────────────────────────────────
 
@@ -1475,9 +1475,6 @@ mod tests {
 
     #[test]
     fn completion_includes_keywords_builtins_and_scope() {
-        let _guard = COMPLETION_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let db = Database::default();
         let cats = Catalogues::new(&db, vec![]);
         let src = "alpha = 1\nbeta = 2";
@@ -1534,14 +1531,10 @@ mod tests {
 
     #[test]
     fn static_completion_items_built_once() {
-        use std::sync::atomic::Ordering::Relaxed;
-        let _guard = COMPLETION_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        // Drop any cache another test may have populated, then reset the counter,
-        // so the build-once contract is measured deterministically here.
+        // Both the cache and the counter are thread-local, so this clears only
+        // what an earlier test on this thread left behind.
         reset_static_completion_items();
-        STATIC_COMPLETION_BUILDS.store(0, Relaxed);
+        STATIC_COMPLETION_BUILDS.with(|n| n.set(0));
 
         let db1 = Database::default();
         let cats1 = Catalogues::new(&db1, vec![]);
@@ -1579,7 +1572,7 @@ mod tests {
         );
 
         // The static portion must have been built exactly once across all calls.
-        let builds = STATIC_COMPLETION_BUILDS.load(Relaxed);
+        let builds = STATIC_COMPLETION_BUILDS.with(|n| n.get());
         assert_eq!(
             builds, 1,
             "static completion items must be built once, not per call; got {builds} builds"
