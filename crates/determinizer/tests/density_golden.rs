@@ -2381,6 +2381,36 @@ fn a_closed_reification_whose_body_holds_a_free_placeholder_is_not_unwrapped() {
     }
 }
 
+// `lawof(kernelof(a))` reaches the same guard by a different route: the WRAPPER is
+// `Kernel`-typed, so the measure-expression test admits it, and the unwrap then exposes
+// `a`'s own `draw` — which is `Scalar(Real)`, NOT `Measure`. The refusal used to assert
+// "this draw node carries a MEASURE inferred type", false for this shape. Each route now
+// states only what is true of it.
+//
+// The refusal itself is a known spelling split left open on purpose:
+// `logdensityof(kernelof(a), 0.5)` lowers while this refuses, though §06 identifies a
+// closed kernel with the measure. Closing it needs the value-versus-measure discriminator.
+#[test]
+fn lawof_of_a_closed_reification_over_a_value_refuses_without_claiming_a_measure_type() {
+    let src = "\
+a = draw(Normal(mu = 0.0, sigma = 1.0))
+K = kernelof(a)
+lp = logdensityof(lawof(K), 0.5)";
+    let mut m = flatppl_syntax::parse(src).unwrap();
+    let _ = flatppl_infer::infer(&mut m);
+    let err = determinize(&m).expect_err("the value-versus-measure split still refuses");
+    assert!(
+        err.reason.contains("OVER A VALUE"),
+        "must name the value the reification wraps: {}",
+        err.reason
+    );
+    assert!(
+        !err.reason.contains("MEASURE inferred type"),
+        "must NOT claim a measure type this draw node does not have: {}",
+        err.reason
+    );
+}
+
 // A `draw` OF a measure expression (`draw(truncate(lawof(…), S))`) carries a MEASURE
 // inferred type, so the measure-expression guard admits `y`'s own draw node — a VALUE.
 // It then refused blaming the conjugate rows, which were never consulted for it. The

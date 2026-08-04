@@ -824,10 +824,8 @@ fn is_eliminable_measure_rhs(m: &Module, rhs: NodeId) -> bool {
 /// non-measure body is untouched: a `functionof` over a deterministic body is legal
 /// FlatPDL.
 fn is_nested_reified_measure_rhs(m: &Module, rhs: NodeId) -> bool {
-    crate::kernel::resolve_closed_reification(m, rhs).is_some_and(|body| {
-        let (body, _) = crate::density::resolve_ref_one(m, body);
-        is_measure_typed_rhs(m, body)
-    })
+    crate::kernel::resolve_closed_reification(m, rhs)
+        .is_some_and(|body| is_measure_typed_rhs(m, body))
 }
 
 /// True iff `rhs`'s inferred type is `Measure`, `Likelihood`, or `Kernel` — the

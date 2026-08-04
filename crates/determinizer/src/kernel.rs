@@ -126,8 +126,16 @@ pub(crate) enum Reification {
     /// it, so unwrapping here would emit a dangling `(%ref %local …)`.
     FreePlaceholder,
     /// An `%autoinputs` boundary whose side-table entry phase inference has not
-    /// filled ([`Module::auto_inputs_of`] `None`): UNKNOWN inputs, not zero. A
-    /// grafted cross-module kernel is this shape until the host re-infers.
+    /// filled ([`Module::auto_inputs_of`] `None`): UNKNOWN inputs, not zero.
+    ///
+    /// Not reachable through [`crate::determinize`] as things stand: the driver
+    /// re-runs inference at the top of every reduction pass, which fills the
+    /// side-table for every `%autoinputs` node — including one grafted in after the
+    /// host's own inference. Kept as the conservative default for any caller that
+    /// classifies before inference, since the alternative is to read an unfilled
+    /// table as "no inputs" and unwrap a parameterised reification. Pinned by
+    /// `classify_reification_reports_an_unfilled_boundary_rather_than_closed`, which
+    /// tests the classification directly for that reason.
     Unfilled,
     /// Not a one-argument `functionof` / `kernelof` at all.
     Plain,
@@ -500,4 +508,57 @@ fn record_field(m: &Module, rec: NodeId, name: Symbol) -> Option<NodeId> {
         return None;
     }
     c.named.iter().find(|na| na.name == name).map(|na| na.value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flatppl_core::Call;
+
+    /// An `%autoinputs` boundary whose side-table entry is absent means the inputs are
+    /// UNKNOWN, not none. Reading it as none would unwrap a reification that may well
+    /// have boundary inputs, dropping them silently. Tested at the classification level
+    /// because `determinize` re-infers before lowering, so no module reaches the
+    /// corresponding refusal — see [`Reification::Unfilled`].
+    #[test]
+    fn classify_reification_reports_an_unfilled_boundary_rather_than_closed() {
+        let src = "a = draw(Normal(mu = 0.0, sigma = 1.0))\n\
+                   F = functionof(Normal(mu = a, sigma = 1.0))\n\
+                   lp = logdensityof(lawof(F), 0.5)";
+        let mut m = flatppl_syntax::parse(src).unwrap();
+        let _ = flatppl_infer::infer(&mut m);
+
+        let f_sym = m.intern("F");
+        let f_bid = m.binding_by_name(f_sym).expect("F is bound");
+        let filled = m.binding(f_bid).rhs;
+        // Inference filled this one, and it is genuinely closed.
+        assert!(
+            matches!(classify_reification(&m, filled), Reification::Closed(_)),
+            "a traced boundary with no `elementof` leaves is closed"
+        );
+
+        // The same reification as a FRESH node: identical shape, no side-table entry.
+        let (head, args) = match m.node(filled) {
+            Node::Call(c) => (c.head, c.args.clone()),
+            _ => unreachable!("F's RHS is a call"),
+        };
+        let unfilled = m.alloc(Node::Call(Call {
+            head,
+            args,
+            named: Box::new([]),
+            inputs: Some(Inputs::Auto),
+        }));
+        assert!(
+            m.auto_inputs_of(unfilled).is_none(),
+            "a fresh node has no side-table entry"
+        );
+        assert!(
+            matches!(classify_reification(&m, unfilled), Reification::Unfilled),
+            "an unfilled boundary is UNKNOWN, never closed"
+        );
+        assert!(
+            resolve_closed_reification(&m, unfilled).is_none(),
+            "and it must not be unwrapped"
+        );
+    }
 }

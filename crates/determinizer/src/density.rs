@@ -1204,8 +1204,7 @@ fn marginalize_or_refuse_stochastic_law(
     // require exactly such a closed measure. So route the reified spelling exactly as
     // the plain one: the conjugate rows below read a bare constructor and the wrapper
     // is not one. A PARAMETERISED reification keeps its own arm.
-    let resolved = crate::kernel::resolve_closed_reification(m, referent)
-        .map_or(referent, |body| resolve_ref_one(m, body).0);
+    let resolved = crate::kernel::resolve_closed_reification(m, referent).unwrap_or(referent);
     if let Some(product) = marginalize_or_refuse_record_law(m, resolved, v)? {
         return Ok(Some(product));
     }
@@ -1256,18 +1255,34 @@ fn marginalize_or_refuse_stochastic_law(
             }
             crate::kernel::Reification::Closed(_) | crate::kernel::Reification::Plain => {}
         }
-        // A `draw` HEAD reached this measure-expression guard because its inferred
-        // type is `Measure` — a `draw` of a measure expression (`draw(truncate(lawof(…),
-        // S))`) types as one. The node is a VALUE, so no conjugate row was ever the
-        // blocker: it is that value-versus-measure discrimination. Attribute it there.
+        // A `draw` HEAD reached this measure-expression guard one of two ways, and only
+        // the first makes the type claim true. Asserting the wrong one is the
+        // misattribution class this work exists to remove, so split them.
         if draw_argument(m, resolved).is_some() {
+            // The draw node ITSELF types as `Measure` — a `draw` of a measure expression
+            // (`draw(truncate(lawof(…), S))`) does. It is still a VALUE, so no conjugate
+            // row was ever the blocker: it is that value-versus-measure discrimination.
+            if is_measure_expr_type(m, resolved) {
+                return Err(refuse(
+                    resolved,
+                    m,
+                    "lawof of a draw OF a measure expression is not yet lowerable: this draw \
+                     node carries a MEASURE inferred type, so the measure-expression guard \
+                     admitted a value. The blocker is that value-versus-measure \
+                     discrimination, not a missing conjugate row",
+                ));
+            }
+            // Otherwise the draw is an ordinary value (`Scalar(Real)`) and the guard was
+            // entered on the WRAPPER's `Kernel` type, the unwrap then exposing the draw:
+            // `lawof(kernelof(a))`. Say that instead of claiming a type the node lacks.
             return Err(refuse(
                 resolved,
                 m,
-                "lawof of a draw OF a measure expression is not yet lowerable: this draw node \
-                 carries a MEASURE inferred type, so the measure-expression guard admitted a \
-                 value. The blocker is that value-versus-measure discrimination, not a missing \
-                 conjugate row",
+                "lawof of a closed reification OVER A VALUE is not yet lowerable: the \
+                 reification types as a kernel, so the measure-expression guard admitted it, \
+                 but unwrapping reaches this value's own `draw`. §06 identifies a closed \
+                 kernel with a measure, so the spelling is legitimate; routing it needs the \
+                 value-versus-measure discriminator, not a conjugate row",
             ));
         }
         return Err(refuse(
@@ -3108,8 +3123,8 @@ fn lower_pushfwd(
     // `classify_reification`, which unwraps nested wrappers to a fixpoint, so the two
     // sites cannot disagree on depth.
     let (bij_resolved, _) = resolve_ref_one(m, bij_node);
-    let bij_resolved = crate::kernel::resolve_closed_reification(m, bij_resolved)
-        .map_or(bij_resolved, |body| resolve_ref_one(m, body).0);
+    let bij_resolved =
+        crate::kernel::resolve_closed_reification(m, bij_resolved).unwrap_or(bij_resolved);
 
     // Extract f_inv and logvol: from an explicit bijection node if present,
     // otherwise synthesise them for a known invertible forward builtin.
