@@ -2723,7 +2723,7 @@ impl<'m> Emitter<'m> {
     ///
     /// `rets` is a slice so this serves both the single-result `@logdensity`
     /// output and the multi-result `@sample` `(value, new_key)` ABI (and
-    /// buffy #107's record-output `@sample` later). A single-element slice
+    /// a record-output `@sample` later). A single-element slice
     /// renders `-> T` / `return %x : T` (no parenthesized tuple), byte-for-byte
     /// identical to the previous single-`ret` output; two-or-more render the
     /// parenthesized result-type list and comma-joined return.
