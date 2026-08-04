@@ -1174,10 +1174,19 @@ fn lower_lawof(
 /// component `Normal(mu = z, …)` is the chain-rule product `lower_record_of_draws`
 /// scores when `z` is a sibling FIELD, and only a marginal when it is not.
 ///
+/// A CLOSED reification is UNWRAPPED to its body first
+/// ([`crate::kernel::classify_reification`]), before the record path, the
+/// measure-expression disjunction and the conjugate dispatch below all run — so each
+/// of them sees `Normal(mu = a, …)` where the author wrote
+/// `functionof(Normal(mu = a, …))`, and the two spellings cannot drift apart. A
+/// reification that survives the unwrap keeps its own refusal arm, whose message
+/// names WHY it survived (boundary inputs, a free placeholder, an unfilled boundary).
+///
 /// A reification counts as a measure expression, admitted by head as well as type:
 /// `F = functionof(Normal(mu = a, sigma = 1.0))` types as `Kernel`, so a
 /// `Type::Measure`-only test let `lawof(F)` through and emitted the conditional at a
-/// later-pinned `a`. [`measure_reaches_draw`] keeps this from over-refusing —
+/// later-pinned `a`. That admission now applies to the unwrapped body as well.
+/// [`measure_reaches_draw`] keeps this from over-refusing —
 /// `lawof(functionof(Normal(mu = elementof(reals), …)))` reaches no draw and lowers.
 ///
 /// The marginal is `kchain(lawof(a), a -> Normal(mu = a, …))`, which
@@ -1189,11 +1198,18 @@ fn marginalize_or_refuse_stochastic_law(
     arg: NodeId,
     v: NodeId,
 ) -> Result<Option<NodeId>, RefuseError> {
-    let (resolved, _) = resolve_ref_one(m, arg);
+    let (referent, _) = resolve_ref_one(m, arg);
+    // A CLOSED reification of a measure IS that measure — §06 "Uniform kernel
+    // extension" identifies "measures with nullary kernels", and makes `logdensityof`
+    // require exactly such a closed measure. So route the reified spelling exactly as
+    // the plain one: the conjugate rows below read a bare constructor and the wrapper
+    // is not one. A PARAMETERISED reification keeps its own arm.
+    let resolved = crate::kernel::resolve_closed_reification(m, referent).unwrap_or(referent);
     if let Some(product) = marginalize_or_refuse_record_law(m, resolved, v)? {
         return Ok(Some(product));
     }
     let is_measure_expr = is_measure_expr_type(m, arg)
+        || is_measure_expr_type(m, referent)
         || is_measure_expr_type(m, resolved)
         || matches!(
             builtin_name(m, resolved),
@@ -1203,6 +1219,71 @@ fn marginalize_or_refuse_stochastic_law(
         // One variate, so no product to get wrong: the marginal's own latent is not needed.
         if let Some(marginal) = crate::marginal::conjugate_marginal_measure(m, resolved, &[]) {
             return score_marginal_form(m, &marginal?.form, v).map(Some);
+        }
+        // A reification still standing here was NOT unwrapped, and the reason decides
+        // the message. Reading it off `classify_reification` keeps the refusal from
+        // asserting boundary inputs that a shape with an EMPTY boundary does not have.
+        match crate::kernel::classify_reification(m, resolved) {
+            crate::kernel::Reification::Parameterised => {
+                return Err(refuse(
+                    resolved,
+                    m,
+                    "lawof of a PARAMETERISED reification (one with boundary inputs) is not yet \
+                     lowerable: reaching the reified body needs a value bound to each boundary \
+                     input, which is §04 kernel-boundary semantics, not an unwrapping. A CLOSED \
+                     reification (no boundary inputs) lowers as its body does",
+                ));
+            }
+            crate::kernel::Reification::FreePlaceholder => {
+                return Err(refuse(
+                    resolved,
+                    m,
+                    "this reification declares no boundary input, yet its body references a \
+                     `%local` placeholder — §04 \"Placeholders and holes\" requires every \
+                     placeholder to appear in the boundary keyword arguments too. Unwrapping it \
+                     would score a dangling placeholder, so refuse",
+                ));
+            }
+            crate::kernel::Reification::Unfilled => {
+                return Err(refuse(
+                    resolved,
+                    m,
+                    "this reification's auto-traced boundary is not filled in, so its inputs are \
+                     UNKNOWN rather than known to be none; re-run inference over the module \
+                     before scoring it",
+                ));
+            }
+            crate::kernel::Reification::Closed(_) | crate::kernel::Reification::Plain => {}
+        }
+        // A `draw` HEAD reached this measure-expression guard one of two ways, and only
+        // the first makes the type claim true. Asserting the wrong one is the
+        // misattribution class this work exists to remove, so split them.
+        if draw_argument(m, resolved).is_some() {
+            // The draw node ITSELF types as `Measure` — a `draw` of a measure expression
+            // (`draw(truncate(lawof(…), S))`) does. It is still a VALUE, so no conjugate
+            // row was ever the blocker: it is that value-versus-measure discrimination.
+            if is_measure_expr_type(m, resolved) {
+                return Err(refuse(
+                    resolved,
+                    m,
+                    "lawof of a draw OF a measure expression is not yet lowerable: this draw \
+                     node carries a MEASURE inferred type, so the measure-expression guard \
+                     admitted a value. The blocker is that value-versus-measure \
+                     discrimination, not a missing conjugate row",
+                ));
+            }
+            // Otherwise the draw is an ordinary value (`Scalar(Real)`) and the guard was
+            // entered on the WRAPPER's `Kernel` type, the unwrap then exposing the draw:
+            // `lawof(kernelof(a))`. Say that instead of claiming a type the node lacks.
+            return Err(refuse(
+                resolved,
+                m,
+                "lawof of a closed reification OVER A VALUE is not yet lowerable: the \
+                 reification types as a kernel, so the measure-expression guard admitted it, \
+                 but unwrapping reaches this value's own `draw`. §06 identifies a closed \
+                 kernel with a measure, so the spelling is legitimate; routing it needs the \
+                 value-versus-measure discriminator, not a conjugate row",
+            ));
         }
         return Err(refuse(
             resolved,
@@ -3032,8 +3113,18 @@ fn lower_pushfwd(
         (c.args[0], c.args[1])
     };
 
-    // Resolve `bij_node` through one level of ref indirection.
+    // Resolve `bij_node` through one level of ref indirection, then unwrap any CLOSED
+    // reification around the forward map: `functionof(v -> get(v, [1]))` has no
+    // boundary input of its own, and §04 forbids a nullary callable "as this would
+    // make them equivalent to known values", so it IS the lambda it wraps. Without
+    // this the reified spelling misses the projection recogniser below that its plain
+    // spelling reaches. `crate::invert::recognise` unwraps the same way, since
+    // `derive_bijection` resolves the forward argument itself; both go through
+    // `classify_reification`, which unwraps nested wrappers to a fixpoint, so the two
+    // sites cannot disagree on depth.
     let (bij_resolved, _) = resolve_ref_one(m, bij_node);
+    let bij_resolved =
+        crate::kernel::resolve_closed_reification(m, bij_resolved).unwrap_or(bij_resolved);
 
     // Extract f_inv and logvol: from an explicit bijection node if present,
     // otherwise synthesise them for a known invertible forward builtin.

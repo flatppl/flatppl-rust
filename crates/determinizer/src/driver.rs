@@ -809,7 +809,23 @@ fn sweep_dead_measure_bindings(m: &mut Module) {
 /// combinators before inference has classified them, and the type arm catches
 /// distribution constructors, which are not on the op-name list.
 fn is_eliminable_measure_rhs(m: &Module, rhs: NodeId) -> bool {
-    is_combinator_rhs(m, rhs) || is_measure_typed_rhs(m, rhs)
+    is_combinator_rhs(m, rhs)
+        || is_measure_typed_rhs(m, rhs)
+        || is_nested_reified_measure_rhs(m, rhs)
+}
+
+/// True iff `rhs` is a CLOSED reification that wraps — to a fixpoint — a
+/// measure-layer body. Inference types `functionof(functionof(Normal(…)))` as
+/// `Function`, because the `Kernel` rule fires only when the reified body is itself
+/// `Measure`-typed, so [`is_measure_typed_rhs`] misses the outer wrapper while
+/// `is_flatpdl` still rejects the residual `Kernel` inside it. A closed reification
+/// means its body ([`crate::kernel::classify_reification`]), so such a binding is as
+/// dead as the single-wrapper one the type arm already sweeps. A nest over a
+/// non-measure body is untouched: a `functionof` over a deterministic body is legal
+/// FlatPDL.
+fn is_nested_reified_measure_rhs(m: &Module, rhs: NodeId) -> bool {
+    crate::kernel::resolve_closed_reification(m, rhs)
+        .is_some_and(|body| is_measure_typed_rhs(m, body))
 }
 
 /// True iff `rhs`'s inferred type is `Measure`, `Likelihood`, or `Kernel` — the
