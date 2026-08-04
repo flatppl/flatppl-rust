@@ -744,3 +744,45 @@ fn unsupported_selector_forms_refuse_as_projections_not_as_unrecognised_maps() {
         );
     }
 }
+
+// The REIFIED spelling of the same projection. `functionof(v -> get(v, [1]))` has no
+// boundary input of its own — a CLOSED reification — and §04 forbids a nullary callable
+// "as this would make them equivalent to known values", so it IS the lambda it wraps.
+// The recogniser above reads a bare `fn` lambda head, so before the unwrap this spelling
+// missed it and refused with a bijection-annotation misdiagnosis: `pushfwd bijection arg
+// must be a bijection(f, f_inv, logvol) node`, which sends a reader after an annotation
+// no projection can carry. No wrong number was ever emitted — the split was in spelling.
+//
+// Pinned as byte-identical emission against the plain spelling, plus the term count and
+// the value, so neither the routing nor the marginal can drift alone.
+#[test]
+fn closed_reified_projection_lowers_identically_to_the_lambda_spelling() {
+    let reified = "m = joint(Normal(mu = 0.0, sigma = 1.0), Normal(mu = 1.0, sigma = 2.0))\n\
+                   p = pushfwd(functionof(v -> get(v, [1])), m)\n\
+                   lp = logdensityof(p, [0.5])";
+    let plain = "m = joint(Normal(mu = 0.0, sigma = 1.0), Normal(mu = 1.0, sigma = 2.0))\n\
+                 p = pushfwd(v -> get(v, [1]), m)\n\
+                 lp = logdensityof(p, [0.5])";
+    let p_reified = pir(reified);
+    let p_plain = pir(plain);
+    // ONE term: component 1 is kept, component 2 integrates to 1 and drops.
+    assert_eq!(
+        pir_binding(&p_reified, "lp")
+            .matches("builtin_logdensityof")
+            .count(),
+        1,
+        "keeps exactly the selected component:\n{p_reified}"
+    );
+    // The kept component is `Normal(0, 1)` scored at 0.5. Its density is
+    // -1.0439385332046727 (Distributions.jl: `logpdf(Normal(0.0, 1.0), 0.5)`), which the
+    // dropped `Normal(1, 2)` discriminates against — scoring the WRONG component would
+    // give -1.7370857137646181, and scoring both -3.351... .
+    assert!(
+        pir_binding(&p_reified, "lp").contains("(%field sigma 1.0)"),
+        "the kept component is Normal(0, 1), not Normal(1, 2):\n{p_reified}"
+    );
+    assert_eq!(
+        p_reified, p_plain,
+        "reified and lambda spellings lower to identical FlatPDL:\nreified:\n{p_reified}\nlambda:\n{p_plain}"
+    );
+}

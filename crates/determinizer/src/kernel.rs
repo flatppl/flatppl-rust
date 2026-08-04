@@ -108,6 +108,86 @@ pub(crate) fn resolve_reified(m: &Module, k_arg: NodeId) -> Option<Kernel> {
     Some(Kernel { body, inputs, auto })
 }
 
+/// Resolve `id` to the BODY of a CLOSED reification — a one-argument
+/// `functionof` / `kernelof` whose boundary is declared and EMPTY, so the
+/// callable takes no inputs and every ancestor is closed over (spec §04
+/// "Reification to functions and kernels": the traced `elementof` leaves
+/// "become the inputs of the reified callable", and there are none).
+///
+/// §04 forbids the result: "No callables may have nullary inputs, as this would
+/// make them equivalent to known values." So a closed reification IS its body as
+/// a value, and unwrapping it is a spelling change, not a semantic one. This is
+/// what lets a dispatch site that reads bare heads reach the reified spelling of
+/// a construct it already recognises unwrapped.
+///
+/// `None` for every other shape, including two that must NOT be unwrapped:
+/// - an `%autoinputs` boundary whose side-table entry phase inference has not
+///   filled ([`Module::auto_inputs_of`] `None`) — unknown inputs, not zero;
+/// - a body with a free `%local` placeholder ref, which unwrapping would leave
+///   dangling (see [`has_free_local`]).
+///
+/// The placeholder check keeps THIS unwrap from emitting a dangling
+/// `(%ref %local …)`. It does not close the same hole on the pre-existing
+/// `density::lower_reified_measure` path, which screens a `%specinputs` boundary
+/// for placeholder entries but not an `%autoinputs` one.
+pub(crate) fn resolve_closed_reification(m: &Module, id: NodeId) -> Option<NodeId> {
+    let Node::Call(c) = m.node(id) else {
+        return None;
+    };
+    let CallHead::Builtin(sym) = c.head else {
+        return None;
+    };
+    let head = m.resolve(sym);
+    if (head != "functionof" && head != "kernelof") || c.args.len() != 1 {
+        return None;
+    }
+    let closed = match c.inputs.as_ref()? {
+        Inputs::Spec(entries) => entries.is_empty(),
+        Inputs::Auto => m.auto_inputs_of(id)?.is_empty(),
+    };
+    let body = c.args[0];
+    (closed && !has_free_local(m, body)).then_some(body)
+}
+
+/// True iff the subtree at `root` refers to a `%local` placeholder that no
+/// reification boundary WITHIN the subtree declares. Such a ref is bound by an
+/// enclosing boundary, so unwrapping that boundary would leave it dangling.
+fn has_free_local(m: &Module, root: NodeId) -> bool {
+    fn walk(m: &Module, id: NodeId, bound: &mut Vec<Symbol>) -> bool {
+        if let Node::Ref(Ref {
+            ns: RefNs::Local,
+            name,
+        }) = m.node(id)
+        {
+            return !bound.contains(name);
+        }
+        let declared: Vec<Symbol> = match m.node(id) {
+            Node::Call(c) => match c.inputs.as_ref() {
+                Some(Inputs::Spec(entries)) => entries
+                    .iter()
+                    .filter(|(_, r)| r.ns == RefNs::Local)
+                    .map(|(_, r)| r.name)
+                    .collect(),
+                Some(Inputs::Auto) => m
+                    .auto_inputs_of(id)
+                    .unwrap_or_default()
+                    .iter()
+                    .filter(|(_, r)| r.ns == RefNs::Local)
+                    .map(|(_, r)| r.name)
+                    .collect(),
+                None => Vec::new(),
+            },
+            _ => Vec::new(),
+        };
+        let depth = bound.len();
+        bound.extend(declared);
+        let found = m.node(id).children().into_iter().any(|c| walk(m, c, bound));
+        bound.truncate(depth);
+        found
+    }
+    walk(m, root, &mut Vec::new())
+}
+
 /// Replace every `(%ref self name)` / `(%ref %local name)` in the subtree at
 /// `root` with `new_id`. Append-only. Shadow-aware over ONE hazard: a nested
 /// `functionof`/`kernelof` reification whose OWN boundary re-declares `name`

@@ -2364,7 +2364,18 @@ fn domain_is_matrix(domain: &Type) -> bool {
 /// Recognise the surface shape of a `pushfwd`'s (ref-resolved) forward argument:
 /// a bare builtin value (`Const`), or a one-input `functionof` lambda `x -> body`
 /// whose boundary is exactly one `%local` placeholder.
+///
+/// A CLOSED reification wrapping either of those — `functionof(v -> get(v, [1]))`,
+/// which has no boundary input of its own — is unwrapped first and recognised as
+/// what it wraps. §04 forbids a nullary callable "as this would make them
+/// equivalent to known values", so the wrapper carries no meaning the shapes below
+/// need; without this the reified spelling misses the recogniser its plain spelling
+/// reaches, and refuses with a bijection-annotation misdiagnosis.
 fn recognise(m: &Module, f: NodeId) -> Recognized {
+    if let Some(body) = crate::kernel::resolve_closed_reification(m, f) {
+        let (inner, _) = crate::density::resolve_ref_one(m, body);
+        return recognise(m, inner);
+    }
     match m.node(f) {
         Node::Const(sym) => Recognized::BareConst(m.resolve(*sym).to_string()),
         Node::Call(c) => {

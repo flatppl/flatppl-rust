@@ -2155,40 +2155,92 @@ lp = logdensityof(lawof(truncate(lawof(z), interval(0.0, inf))), 0.3)",
 // where §04 "Reification to measures" asks for the TOTAL law, the marginal
 // `Normal(0, √2)` — a conformance-passing number wrong by 0.329 nats.
 //
-// Still refuses, but on the WRAPPER: a `CONJUGATE_TABLE` row needs a bare distribution
-// constructor and a reification is not one, while the UNWRAPPED
-// `lawof(Normal(mu = a, sigma = 1))` now lowers to the marginal. A coverage gap, not a
-// correctness one.
+// The marginal now LOWERS in the reified spelling too. A `CONJUGATE_TABLE` row reads a
+// bare distribution constructor and the wrapper is not one, so the routing unwraps a
+// CLOSED reification (no boundary inputs) to its body first — §04 forbids a nullary
+// callable "as this would make them equivalent to known values", so the body IS the
+// reification's value. Pinned as BYTE-IDENTICAL emission against the plain spelling:
+// anything less would let the two spellings drift back apart.
 #[test]
-fn lawof_of_a_draw_parameterized_reification_refuses() {
-    for src in [
+fn lawof_of_a_closed_reification_lowers_identically_to_its_body() {
+    for (reified, plain) in [
         // Direct query on the reification's law — the shape that emitted the number.
-        "\
+        (
+            "\
 a = draw(Normal(mu = 0.0, sigma = 1.0))
 F = functionof(Normal(mu = a, sigma = 1.0))
 lp = logdensityof(lawof(F), 0.5)
 lp_a = logdensityof(lawof(record(a = a)), record(a = 0.1))",
-        // Inline, so the check cannot depend on the reification being named.
-        "\
+            "\
+a = draw(Normal(mu = 0.0, sigma = 1.0))
+F = Normal(mu = a, sigma = 1.0)
+lp = logdensityof(lawof(F), 0.5)
+lp_a = logdensityof(lawof(record(a = a)), record(a = 0.1))",
+        ),
+        // Inline, so the routing cannot depend on the reification being named.
+        (
+            "\
 a = draw(Normal(mu = 0.0, sigma = 1.0))
 lp = logdensityof(lawof(functionof(Normal(mu = a, sigma = 1.0))), 0.5)
 lp_a = logdensityof(lawof(record(a = a)), record(a = 0.1))",
-        // `kernelof` reifies the same way and must be caught the same way.
-        "\
+            "\
+a = draw(Normal(mu = 0.0, sigma = 1.0))
+lp = logdensityof(lawof(Normal(mu = a, sigma = 1.0)), 0.5)
+lp_a = logdensityof(lawof(record(a = a)), record(a = 0.1))",
+        ),
+        // `kernelof` reifies the same way and must be unwrapped the same way. §04 makes
+        // `kernelof(x)` equivalent to `functionof(lawof(x))`, and `lawof` of a measure
+        // is that measure, so the unwrapped body is the same `Normal(mu = a, …)`.
+        (
+            "\
 a = draw(Normal(mu = 0.0, sigma = 1.0))
 K = kernelof(Normal(mu = a, sigma = 1.0))
 lp = logdensityof(lawof(K), 0.5)
 lp_a = logdensityof(lawof(record(a = a)), record(a = 0.1))",
+            "\
+a = draw(Normal(mu = 0.0, sigma = 1.0))
+K = Normal(mu = a, sigma = 1.0)
+lp = logdensityof(lawof(K), 0.5)
+lp_a = logdensityof(lawof(record(a = a)), record(a = 0.1))",
+        ),
+    ] {
+        let pir_reified = flatppl_flatpir::write(&determinize_src(reified));
+        let pir_plain = flatppl_flatpir::write(&determinize_src(plain));
+        // The marginal is `Normal(0, √2)`, NOT the conditional `Normal(0.1, 1)` at the
+        // later-pinned `a` — the 0.329-nat error this shape once emitted.
+        assert!(
+            pir_reified.contains("1.4142135623730951"),
+            "must lower to the marginal Normal(0, √2):\n{pir_reified}"
+        );
+        assert_eq!(
+            pir_reified, pir_plain,
+            "reified and plain spellings lower to identical FlatPDL:\nreified:\n{pir_reified}\nplain:\n{pir_plain}"
+        );
+    }
+
+    // A PARAMETERISED reification (one WITH boundary inputs) keeps refusing: reaching
+    // its body needs a value bound to each input, which is §04 kernel-boundary
+    // semantics, not an unwrapping. The message must say so rather than blame the rows.
+    for src in [
+        "\
+a = draw(Normal(mu = 0.0, sigma = 1.0))
+s = elementof(posreals)
+F = functionof(Normal(mu = a, sigma = s))
+lp = logdensityof(lawof(F), 0.5)",
+        "\
+a = draw(Normal(mu = 0.0, sigma = 1.0))
+s = elementof(posreals)
+K = kernelof(Normal(mu = a, sigma = s))
+lp = logdensityof(lawof(K), 0.5)",
     ] {
         let mut m = flatppl_syntax::parse(src).unwrap();
         let _ = flatppl_infer::infer(&mut m);
-        let err = determinize(&m).expect_err(
-            "the law of a draw-parameterized reification is a marginal — refuse, do not \
-             score the conditional",
-        );
+        let err = determinize(&m)
+            .expect_err("a parameterised reification's law is not yet lowerable — refuse");
         assert!(
-            err.reason.contains("MARGINAL law"),
-            "must refuse as a marginal: {}",
+            err.reason.contains("PARAMETERISED reification")
+                && err.reason.contains("boundary input"),
+            "must refuse naming the boundary inputs, not the conjugate rows: {}",
             err.reason
         );
     }
@@ -2246,6 +2298,44 @@ lp = logdensityof(lawof(F), 0.5)",
         assert!(
             flatppl_determinizer::is_flatpdl(&out).is_ok(),
             "is_flatpdl failed:\n{pir}"
+        );
+    }
+}
+
+// A `draw` OF a measure expression (`draw(truncate(lawof(…), S))`) carries a MEASURE
+// inferred type, so the measure-expression guard admits `y`'s own draw node — a VALUE.
+// It then refused blaming the conjugate rows, which were never consulted for it. The
+// node refuses either way; only the ATTRIBUTION was wrong. The discriminator itself is
+// untouched, so this pins the message, not a lowering.
+//
+// The sibling `y = draw(pushfwd(exp, lawof(…)))` is NOT this shape: it refuses earlier,
+// at §06's reference-measure gate on the `pushfwd`, so it pins nothing about this guard.
+#[test]
+fn lawof_of_a_draw_of_a_measure_expression_refuses_naming_the_discriminator() {
+    for src in [
+        "\
+a = draw(Normal(mu = 0.0, sigma = 1.0))
+S = interval(0.0, 3.0)
+y = draw(truncate(lawof(Normal(mu = a, sigma = 1.0)), S))
+lp = logdensityof(lawof(y), 0.5)",
+        // Inline set, so the guard cannot depend on the truncation set being named.
+        "\
+a = draw(Normal(mu = 0.0, sigma = 1.0))
+y = draw(truncate(lawof(Normal(mu = a, sigma = 1.0)), interval(0.0, 3.0)))
+lp = logdensityof(lawof(y), 0.5)",
+    ] {
+        let mut m = flatppl_syntax::parse(src).unwrap();
+        let _ = flatppl_infer::infer(&mut m);
+        let err = determinize(&m).expect_err("a draw of a measure expression is not yet lowerable");
+        assert!(
+            err.reason.contains("value-versus-measure discrimination"),
+            "must attribute the refusal to the discriminator: {}",
+            err.reason
+        );
+        assert!(
+            !err.reason.contains("no conjugate"),
+            "must NOT blame a missing conjugate row, which was never the blocker: {}",
+            err.reason
         );
     }
 }

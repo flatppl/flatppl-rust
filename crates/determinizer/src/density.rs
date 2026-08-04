@@ -1189,11 +1189,19 @@ fn marginalize_or_refuse_stochastic_law(
     arg: NodeId,
     v: NodeId,
 ) -> Result<Option<NodeId>, RefuseError> {
-    let (resolved, _) = resolve_ref_one(m, arg);
+    let (referent, _) = resolve_ref_one(m, arg);
+    // A CLOSED reification is its body as a value (§04: nullary callables are
+    // forbidden precisely because they "would make them equivalent to known
+    // values"), so route the reified spelling exactly as the plain one — the
+    // conjugate rows below read a bare constructor and the wrapper is not one.
+    // A PARAMETERISED reification keeps its own arm.
+    let resolved = crate::kernel::resolve_closed_reification(m, referent)
+        .map_or(referent, |body| resolve_ref_one(m, body).0);
     if let Some(product) = marginalize_or_refuse_record_law(m, resolved, v)? {
         return Ok(Some(product));
     }
     let is_measure_expr = is_measure_expr_type(m, arg)
+        || is_measure_expr_type(m, referent)
         || is_measure_expr_type(m, resolved)
         || matches!(
             builtin_name(m, resolved),
@@ -1203,6 +1211,36 @@ fn marginalize_or_refuse_stochastic_law(
         // One variate, so no product to get wrong: the marginal's own latent is not needed.
         if let Some(marginal) = crate::marginal::conjugate_marginal_measure(m, resolved, &[]) {
             return score_marginal_form(m, &marginal?.form, v).map(Some);
+        }
+        // A reification still standing here has BOUNDARY INPUTS: reaching its body
+        // means substituting values for them, which is §04's kernel-boundary
+        // semantics, not a spelling change. Name that rather than blame the rows.
+        if matches!(
+            builtin_name(m, resolved),
+            Some("functionof") | Some("kernelof")
+        ) {
+            return Err(refuse(
+                resolved,
+                m,
+                "lawof of a PARAMETERISED reification (one with boundary inputs) is not yet \
+                 lowerable: reaching the reified body needs a value bound to each boundary \
+                 input, which is §04 kernel-boundary semantics, not an unwrapping. A CLOSED \
+                 reification (no boundary inputs) lowers as its body does",
+            ));
+        }
+        // A `draw` HEAD reached this measure-expression guard because its inferred
+        // type is `Measure` — a `draw` of a measure expression (`draw(truncate(lawof(…),
+        // S))`) types as one. The node is a VALUE, so no conjugate row was ever the
+        // blocker: it is that value-versus-measure discrimination. Attribute it there.
+        if draw_argument(m, resolved).is_some() {
+            return Err(refuse(
+                resolved,
+                m,
+                "lawof of a draw OF a measure expression is not yet lowerable: this draw node \
+                 carries a MEASURE inferred type, so the measure-expression guard admitted a \
+                 value. The blocker is that value-versus-measure discrimination, not a missing \
+                 conjugate row",
+            ));
         }
         return Err(refuse(
             resolved,
@@ -3032,8 +3070,16 @@ fn lower_pushfwd(
         (c.args[0], c.args[1])
     };
 
-    // Resolve `bij_node` through one level of ref indirection.
+    // Resolve `bij_node` through one level of ref indirection, then unwrap a CLOSED
+    // reification around the forward map: `functionof(v -> get(v, [1]))` has no
+    // boundary input of its own, and §04 forbids a nullary callable "as this would
+    // make them equivalent to known values", so it IS the lambda it wraps. Without
+    // this the reified spelling misses the projection recogniser below that its plain
+    // spelling reaches. `crate::invert::recognise` unwraps the same way, since
+    // `derive_bijection` resolves the forward argument itself.
     let (bij_resolved, _) = resolve_ref_one(m, bij_node);
+    let bij_resolved = crate::kernel::resolve_closed_reification(m, bij_resolved)
+        .map_or(bij_resolved, |body| resolve_ref_one(m, body).0);
 
     // Extract f_inv and logvol: from an explicit bijection node if present,
     // otherwise synthesise them for a known invertible forward builtin.
