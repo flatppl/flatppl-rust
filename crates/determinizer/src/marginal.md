@@ -427,6 +427,18 @@ This is the shape the record path used to refuse. Every per-field marginal is ri
 because the fields are correlated through `z`. `N = 1` is not this family: it is Row 1,
 and it keeps lowering there.
 
+**`σᵢ` must be latent-independent, which is not the same as constant.** A `σᵢ` that
+references a SIBLING field's draw is admitted, and is correct — see *A σ over a sibling
+field* below. What a `σᵢ` may not do is reference the shared latent, because then the
+integral is not this one.
+
+**Every field must be a BARE draw.** A transformed field (`b = exp(y3)`) is refused, and the
+refusal has to be tested over the WHOLE record rather than per field: the record path detects
+the repeated latent on the SECOND shared field, so a transform written after it is never
+screened by the per-field arm. Missing that gate scored the query's value of `b` as the
+untransformed draw — no inverse, no log-volume — and `exp(y3)` and `2.0·y3` emitted
+identically, which is the proof the map was ignored rather than mis-applied.
+
 ### The integral
 
 `z` is integrated out of the product of the conditionals (§04 *Reification to measures*
@@ -583,6 +595,36 @@ product gap flat near `−0.85`, with no crossing. Folded literals: `log` argume
 `0.48999999999999994` and `1.6900000000000002`, `log1p` argument `1.6848206738316633`,
 `quad` → `5.851661943957181`.
 
+### A σ over a sibling field — admitted, and why the Σ reading stops applying
+
+```flatppl
+z  = draw(Normal(mu = 0.0, sigma = 1.0))
+y1 = draw(Normal(mu = z, sigma = 1.0))
+y2 = draw(Normal(mu = z, sigma = y1))
+```
+
+`σ₂` is the sibling field `y1`, which is latent-independent, so the recogniser admits it and
+emits `σ₂² = 0.25` at the query point `(0.5, 0.7)` — the sibling's own query value, pinned by
+the chain rule the record path already applies to sibling draws (that is what `exempt` /
+`siblings` is for). Truth `-2.2381096204634274`, verified by quadrature of
+`∫ φ(z) N(0.5; z, 1) N(0.7; z, 0.5) dz`; emitted `log` arguments `1.0` and `0.25`, `log1p`
+argument `5.0`, `quad` `0.39500000000000024`.
+
+**The value is right and the Gaussian READING is not.** With `σ₂ = y1` the fields are not
+conditionally independent given `z`, so this model is not jointly Gaussian and `Σ` is not its
+covariance. What still holds is the only thing the emission needs: at a FIXED query point
+`σ₂` is the constant `x₁`, so
+
+$$\prod_i \mathcal{N}(x_i;\, z,\, \sigma_i)
+= p(x_1 \mid z)\; p(x_2 \mid z, y_1 = x_1)$$
+
+by the chain rule, and integrating that against the prior is the joint density at that point.
+So the expression evaluates correctly while the `MvNormal(μ₀·1, Σ)` sentence at the top of
+this section does not describe this model. Do not read Σ back out of it.
+
+Support is the query's problem, not the lowering's: a query putting `y1 ≤ 0` asks for a
+`Normal` with a non-positive scale, exactly as any model with a data-dependent `sigma` does.
+
 ### What keeps refusing
 
 The family is deliberately narrow: N fields, each a BARE `draw` of `Normal(mu = z, …)`
@@ -600,8 +642,9 @@ of these keeps the shared-latent refusal, and each is pinned by a test:
 - **A DERIVED field mean.** `yᵢ ~ Normal(mu = mul(2.0, z), …)` has a closed-form joint that
   is NOT this one (the loadings differ per field), so the exact-ref check refuses it, the
   same way Row 1's does.
-- **A transformed field.** `b = exp(y1)` needs the pushforward of the JOINT, which this row
-  does not return.
+- **A transformed field**, in ANY position. `b = exp(y1)` needs the pushforward of the JOINT,
+  which this row does not return. Gated over the whole record at the call site AND re-checked
+  in the emitter, because the per-field screen only sees fields reached before the repeat.
 - **Mixed shared and unshared fields.** Every field must integrate the same latent. A
   record where two fields share `z` and a third integrates `w` would need the product of
   this row with `w`'s own — correct in principle, and outside the decided scope.

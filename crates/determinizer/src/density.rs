@@ -1401,10 +1401,21 @@ fn marginalize_or_refuse_record_law(
                     // The fields are correlated through the shared ancestor, so no product of
                     // per-field marginals is the joint. One shape has a closed form for the
                     // joint itself; everything else refuses.
+                    //
+                    // EVERY field must be an untransformed draw, tested here over the whole
+                    // record rather than per field. The per-field `transform.is_some()` arm above
+                    // only screens fields reached BEFORE the repeat is detected — the repeat
+                    // lands on the second shared field, so a transformed field written after it
+                    // would never be screened, and the law would score the query's value of the
+                    // TRANSFORMED field as the untransformed draw: no inverse, no log-volume.
                     let field_measures: Vec<NodeId> =
                         fields.iter().map(|&(_, measure, _, _)| measure).collect();
-                    if let Some(law) =
-                        crate::marginal::shared_latent_record_law(m, &field_measures, &siblings)
+                    let all_bare = fields.iter().all(|(_, _, t, _)| t.is_none());
+                    if let Some(law) = all_bare
+                        .then(|| {
+                            crate::marginal::shared_latent_record_law(m, &field_measures, &siblings)
+                        })
+                        .flatten()
                     {
                         // The law requires every field to share ONE latent, so it must be the
                         // one the repeat was detected on. A mismatch would mean the two
@@ -1456,6 +1467,14 @@ fn marginalize_or_refuse_record_law(
 /// [`lower_record_of_draws_with`] does — that is what lets the driver sweep the now-dead
 /// `draw` bindings, the shared latent's included, and what records that a QUERY put the
 /// literal there.
+///
+/// Because it re-resolves the fields, it re-checks the two properties it needs rather than
+/// trusting the caller's screening of a DIFFERENT list: that no field is transformed, and
+/// that it has exactly one variate per sigma the law carries. Both are refusals, not
+/// asserts — a release build would otherwise score a transformed field as its untransformed
+/// draw, or `zip` a length mismatch down to the shorter list and emit the law of a subset.
+/// Neither is reachable while the caller screens first, so both carry their OWN reason: if
+/// one ever fires, the message says which invariant broke rather than blaming the shape.
 fn lower_shared_latent_record_law(
     m: &mut Module,
     record_node: NodeId,
@@ -1463,6 +1482,23 @@ fn lower_shared_latent_record_law(
     law: &crate::marginal::SharedLatentRecordLaw,
 ) -> Result<NodeId, RefuseError> {
     let components = match_independent_record(m, record_node, v)?;
+    if let Some(comp) = components.iter().find(|c| c.transform.is_some()) {
+        return Err(refuse(
+            comp.measure,
+            m,
+            "lawof of a record whose fields marginalize over the SAME latent has a closed-form \
+             joint only when every field is a BARE draw: a transformed field's law is the \
+             pushforward of that joint, which this law does not return",
+        ));
+    }
+    if components.len() != law.field_count {
+        return Err(refuse(
+            record_node,
+            m,
+            "the shared-latent record law needs exactly one variate per field it was built \
+             over, and the record destructured to a different count",
+        ));
+    }
     let variates: Vec<NodeId> = components.iter().map(|c| c.pinned).collect();
     let term = law.form.at(m, &variates);
     for comp in &components {

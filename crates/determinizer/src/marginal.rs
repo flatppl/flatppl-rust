@@ -1057,6 +1057,9 @@ const LOG_2PI: f64 = 1.8378770664093453;
 pub(crate) struct SharedLatentRecordLaw {
     /// The shared latent this law integrated out, so the caller can report it.
     pub latent: Symbol,
+    /// How many fields the law was built over, so the emitter can prove it has one variate
+    /// per sigma rather than `zip` a mismatch down to the shorter list.
+    pub field_count: usize,
     /// The joint log-density, awaiting one variate per field in the SAME order the field
     /// measures were supplied in. §08 names no constructor for it, and a §08 `MvNormal`
     /// would force the record variate into a vector, so the form is an expression (§13
@@ -1086,13 +1089,22 @@ pub(crate) struct SharedLatentRecordLaw {
 /// **The checks are deliberately over-determined, and most are not individually reachable
 /// today.** Only a shape whose every field ALREADY matched a `CONJUGATE_TABLE` row gets
 /// here — the caller detects the repeated latent from those rows — so the caller's upstream
-/// filtering happens to imply several of them. `CONJUGATE_TABLE` has exactly one
-/// Normal-mean row, so no shape can reach here with a non-`Normal` prior, a non-`Normal`
-/// field family, or a non-`Direct` mean unless that row is widened or another Normal-mean
-/// row is added. Verified by mutation: removing any ONE of the family, path and
-/// cross-field-agreement checks reddens nothing, and removing the mean-path and
-/// latent-agreement checks TOGETHER lets a partly-shared record mislower. They stay so this
-/// recogniser does not silently depend on the table's current shape.
+/// filtering happens to imply several of them. Verified by mutation: removing any ONE of the
+/// family, path and cross-field-agreement checks reddens nothing, and removing the mean-path
+/// and latent-agreement checks TOGETHER lets a partly-shared record mislower.
+///
+/// **The masking mechanism is `find_kwarg`, not the family check.** `CONJUGATE_TABLE` admits
+/// the priors `Normal`, `Gamma`, `Beta`, `Exponential` and `InverseGamma`, and of the
+/// non-`Normal` four NONE takes both `mu` and `sigma` — so `find_kwarg(prior_kwargs, "mu")?`
+/// turns them away before `prior_sym` is ever compared. The field-family check is masked the
+/// same way (`Poisson` takes `rate`, `Binomial` takes `n`/`p`). The one shape that does reach
+/// here with a non-`Normal` prior is Rows 4 and 5's shared VARIANCE, and it is turned away
+/// twice — by `find_kwarg("mu")` on the prior and, independently, by the `Direct` mean path.
+///
+/// That masking is an accident of the current table, not a guarantee, which is why the
+/// explicit checks stay. Two changes would make them live, and each needs a probe that
+/// isolates the guard it turns on: a §08 prior taking both `mu` and `sigma` (`LogNormal` is
+/// the candidate), or a second Normal-mean row.
 pub(crate) fn shared_latent_record_law(
     m: &mut Module,
     field_measures: &[NodeId],
@@ -1143,6 +1155,7 @@ pub(crate) fn shared_latent_record_law(
     params.extend(sigmas);
     Some(SharedLatentRecordLaw {
         latent,
+        field_count: field_measures.len(),
         form: LogDensity {
             build: build_shared_latent_normal_logpdf,
             params,
@@ -1174,11 +1187,17 @@ fn build_shared_latent_normal_logpdf(
 ) -> NodeId {
     let [mu0, s0] = [params[0], params[1]];
     let sigmas = &params[2..];
+    // The emitter refuses a count mismatch before reaching here
+    // ([`crate::density::lower_shared_latent_record_law`]), so the `zip`s below cannot
+    // truncate. Restated as an assert because this builder's own correctness needs it.
     debug_assert_eq!(
         sigmas.len(),
         variates.len(),
         "one sigma and one variate per record field"
     );
+
+    let two = real(m, 2.0);
+    let one = real(m, 1.0);
 
     // Per field: the variance vᵢ (shared between dᵢ and the log-det), the precision dᵢ,
     // and the deviation rᵢ.
@@ -1186,16 +1205,13 @@ fn build_shared_latent_normal_logpdf(
     let mut precisions = Vec::with_capacity(sigmas.len());
     let mut devs = Vec::with_capacity(sigmas.len());
     for (&sigma, &x) in sigmas.iter().zip(variates) {
-        let two = real(m, 2.0);
         let var = build_call(m, "pow", &[sigma, two]);
-        let one = real(m, 1.0);
         vars.push(var);
         precisions.push(build_call(m, "divide", &[one, var]));
         devs.push(build_call(m, "sub", &[x, mu0]));
     }
 
     // k = s₀²·Σdᵢ, the rank-one term both corrections divide by.
-    let two = real(m, 2.0);
     let prior_var = build_call(m, "pow", &[s0, two]);
     let precision_sum = crate::density::fold_add(m, &precisions);
     let k = build_call(m, "mul", &[prior_var, precision_sum]);
@@ -1211,16 +1227,13 @@ fn build_shared_latent_normal_logpdf(
         .iter()
         .zip(&devs)
         .map(|(&d, &r)| {
-            let two = real(m, 2.0);
             let r2 = build_call(m, "pow", &[r, two]);
             build_call(m, "mul", &[d, r2])
         })
         .collect();
     let diag_quad = crate::density::fold_add(m, &squared);
-    let two = real(m, 2.0);
     let t2 = build_call(m, "pow", &[t, two]);
     let correction_num = build_call(m, "mul", &[prior_var, t2]);
-    let one = real(m, 1.0);
     let denom = build_call(m, "add", &[one, k]);
     let correction = build_call(m, "divide", &[correction_num, denom]);
     let quad = build_call(m, "sub", &[diag_quad, correction]);

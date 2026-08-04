@@ -680,6 +680,36 @@ y3 = draw(Normal(mu = w, sigma = 1.0))
 lp = logdensityof(lawof(record(y1 = y1, y2 = y2, y3 = y3)), \
              record(y1 = 0.5, y2 = 0.7, y3 = 0.2))",
         ),
+        // A TRANSFORMED field, written AFTER the second shared field — the position the
+        // per-field screen never reaches, because the repeat is detected on the second shared
+        // field and the loop returns there. Without the whole-record gate this lowered and
+        // scored the query's value of `b` as the untransformed draw: emitted
+        // `-4.033712780173963` against the truth `-3.985439088559615` for `exp` (0.048 nats)
+        // and `-4.319047460733908` for the affine map (0.285 nats), both from quadrature of
+        // the mixture with the change of variables applied. The two maps emitted IDENTICALLY,
+        // which is what proves the map was ignored rather than mis-applied.
+        (
+            "a transformed field AFTER the second shared field, exp",
+            "\
+z = draw(Normal(mu = 0.0, sigma = 1.0))
+y1 = draw(Normal(mu = z, sigma = 1.0))
+y2 = draw(Normal(mu = z, sigma = 1.0))
+y3 = draw(Normal(mu = z, sigma = 1.0))
+b = exp(y3)
+lp = logdensityof(lawof(record(y1 = y1, y2 = y2, b = b)), \
+             record(y1 = 0.5, y2 = 0.7, b = 1.5))",
+        ),
+        (
+            "a transformed field AFTER the second shared field, affine",
+            "\
+z = draw(Normal(mu = 0.0, sigma = 1.0))
+y1 = draw(Normal(mu = z, sigma = 1.0))
+y2 = draw(Normal(mu = z, sigma = 1.0))
+y3 = draw(Normal(mu = z, sigma = 1.0))
+b = 2.0 * y3
+lp = logdensityof(lawof(record(y1 = y1, y2 = y2, b = b)), \
+             record(y1 = 0.5, y2 = 0.7, b = 1.5))",
+        ),
     ] {
         let reason = refusal(src);
         assert!(
@@ -758,6 +788,39 @@ lp = logdensityof(lawof(record(b = b, y2 = y2)), record(b = 1.5, y2 = 0.7))",
              {reason}"
         );
     }
+}
+
+// A `sigma` over a SIBLING field is admitted, because the law needs σᵢ latent-INDEPENDENT and
+// that is not the same as constant. `σ₂ = y1` emits the sibling's own query value, pinned by
+// the chain rule the record path already applies to sibling draws.
+//
+// Truth `-2.2381096204634274` — quadrature of `∫ φ(z) N(0.5; z, 1) N(0.7; z, 0.5) dz`.
+//
+// **The value is right and the Gaussian reading is not.** With `σ₂ = y1` the fields are not
+// conditionally independent given `z`, so this model is not jointly Gaussian and `Σ` is not
+// its covariance. What holds is what the emission needs: at a fixed query point `σ₂` is the
+// constant `x₁`, so `Πᵢ N(xᵢ; z, σᵢ) = p(x₁ | z)·p(x₂ | z, y1 = x₁)` by the chain rule, and
+// integrating that against the prior is the joint density there. `marginal.md`, *A σ over a
+// sibling field*, says the same and warns against reading Σ back out.
+#[test]
+fn a_sigma_over_a_sibling_field_is_admitted_at_the_pinned_sibling() {
+    let lp = pir_binding(
+        &pir("\
+z = draw(Normal(mu = 0.0, sigma = 1.0))
+y1 = draw(Normal(mu = z, sigma = 1.0))
+y2 = draw(Normal(mu = z, sigma = y1))
+lp = logdensityof(lawof(record(y1 = y1, y2 = y2)), record(y1 = 0.5, y2 = 0.7))"),
+        "lp",
+    );
+    assert!(
+        lp.contains("(log 1.0)") && lp.contains("(log 0.25)"),
+        "σ₂² is the PINNED sibling 0.5 squared, not a residual ref:\n{lp}"
+    );
+    assert!(lp.contains("(log1p 5.0)"), "k = 1²·(1 + 1/0.25) = 5:\n{lp}");
+    assert!(
+        lp.contains(" 0.39500000000000024)"),
+        "the quadratic form at the pinned sibling:\n{lp}"
+    );
 }
 
 // ONE field over a shared-latent-shaped model is Row 1, not the record law, and must keep
