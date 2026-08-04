@@ -117,19 +117,16 @@ impl Arity {
     }
 
     /// The declared count as it reads in a diagnostic: `1 argument`,
-    /// `2 arguments`, `1 or 2 arguments`, `at least 3 arguments`.
+    /// `2 arguments`, `1 or 2 arguments`, `at least 3 arguments`. The noun agrees
+    /// with the last number in the phrase, so `at least 1` is singular.
     pub fn describe(&self) -> String {
-        let count = match self.max {
-            Some(max) if max == self.min => format!("{max}"),
-            Some(max) if max == self.min + 1 => format!("{} or {max}", self.min),
-            Some(max) => format!("{} to {max}", self.min),
-            None => format!("at least {}", self.min),
+        let (count, last) = match self.max {
+            Some(max) if max == self.min => (format!("{max}"), max),
+            Some(max) if max == self.min + 1 => (format!("{} or {max}", self.min), max),
+            Some(max) => (format!("{} to {max}", self.min), max),
+            None => (format!("at least {}", self.min), self.min),
         };
-        let noun = if count == "1" {
-            "argument"
-        } else {
-            "arguments"
-        };
+        let noun = if last == 1 { "argument" } else { "arguments" };
         format!("{count} {noun}")
     }
 }
@@ -1127,7 +1124,8 @@ mod tests {
             .describe(),
             "1 to 3 arguments"
         );
-        // Only an exact count of one is singular.
+        // The noun agrees with the last number in the phrase, so both of these
+        // are singular.
         assert_eq!(
             Arity {
                 min: 1,
@@ -1135,6 +1133,10 @@ mod tests {
             }
             .describe(),
             "1 argument"
+        );
+        assert_eq!(
+            Arity { min: 1, max: None }.describe(),
+            "at least 1 argument"
         );
     }
 }

@@ -103,7 +103,10 @@ Catalogue(
         // `array | data, size, dimorder`, `fill | x, size`, `zeros | size`,
         // `ones | size`. §07 states no minimum element count for `vector`.
         Builtin(name: "vector", sig: Structural(params: [Variadic(Any)])),
-        Builtin(name: "array",  sig: Structural(params: [Vector(Real), Vector(Integer), Vector(Integer)])),
+        // `array`'s §07 Domains are "vector, integer vector, integer vector" —
+        // `data`'s element kind is unconstrained (§07's example passes
+        // `data = [1, 2, 3, 4, 5, 6]`), so it is `Any`, not a real vector.
+        Builtin(name: "array",  sig: Structural(params: [Any, Vector(Integer), Vector(Integer)])),
         Builtin(name: "fill",   sig: Structural(params: [Any, Any])),
         Builtin(name: "zeros",  sig: Structural(params: [Any])),
         Builtin(name: "ones",   sig: Structural(params: [Any])),
@@ -120,11 +123,19 @@ Catalogue(
         // §07 "Array and table operations": `cat | x, y, ...`, `rowstack | vs`,
         // `tile | A, size`, `splitblocks | A, blocksize`, `partition | xs, spec`,
         // `addaxes | A, n_leading, n_trailing`.
-        Builtin(name: "cat",         sig: Structural(params: [Any, Any, Variadic(Any)])),
+        // `cat`'s minimum is ONE, not two: §07 makes
+        // `cat(scalar1, scalar2, ...)` "Equivalent to `vector(scalar1, scalar2,
+        // ...)`", and that identical `x1, x2, ...` notation must admit one
+        // argument — `[1.0]` lowers to `(vector 1.0)` and `[]` to `(vector)`.
+        // So the notation does not mean "at least two" for either row.
+        Builtin(name: "cat",         sig: Structural(params: [Any, Variadic(Any)])),
         Builtin(name: "rowstack",    sig: Structural(params: [Any])),
         Builtin(name: "tile",        sig: Structural(params: [Any, Any])),
         Builtin(name: "splitblocks", sig: Structural(params: [Any, Any])),
-        Builtin(name: "partition",   sig: Structural(params: [Vector(Real), Any])),
+        // `partition`'s §07 Domains are "vector, positive integer or integer
+        // vector" — `xs`'s element kind is unconstrained (§07's example passes
+        // `partition([1, 2, 3, 4, 5, 6], 3)`).
+        Builtin(name: "partition",   sig: Structural(params: [Any, Any])),
         Builtin(name: "addaxes",     sig: Structural(params: [Any, Scalar(Integer), Scalar(Integer)])),
 
         // §07 "Checked values": `checked | value, condition`.
@@ -139,16 +150,20 @@ Catalogue(
         Builtin(name: "indicesof0", sig: Structural(params: [Any])),
 
         // §07 "Norms and normalization": `l1unit | v`, `l2unit | v`,
-        // `softmax | v`, `logsoftmax | v`.
-        Builtin(name: "l1unit",     sig: Structural(params: [Vector(Real)])),
-        Builtin(name: "l2unit",     sig: Structural(params: [Vector(Real)])),
+        // `softmax | v`, `logsoftmax | v`. §07 gives `l1unit`/`l2unit`
+        // "real/complex vectors" (hence `Any`, there being no real-or-complex
+        // vector tag) and `softmax`/`logsoftmax` "real vectors".
+        Builtin(name: "l1unit",     sig: Structural(params: [Any])),
+        Builtin(name: "l2unit",     sig: Structural(params: [Any])),
         Builtin(name: "softmax",    sig: Structural(params: [Vector(Real)])),
         Builtin(name: "logsoftmax", sig: Structural(params: [Vector(Real)])),
 
         // §07 "Membership, filtering, and bin selection": `filter | pred, data`,
         // `selectbins | edges, region, counts`.
         Builtin(name: "filter",     sig: Structural(params: [Callable, Any])),
-        Builtin(name: "selectbins", sig: Structural(params: [Vector(Real), Any, Vector(Real)])),
+        // `selectbins`'s §07 Domains are "vector, set, vector" — `counts` are bin
+        // counts, so its element kind is not real-only.
+        Builtin(name: "selectbins", sig: Structural(params: [Vector(Real), Any, Any])),
 
         // §07 "Random value generation": `rnginit | rngseed`, `rand | rstate, m`.
         Builtin(name: "rnginit", sig: Structural(params: [Vector(Integer)])),

@@ -84,7 +84,8 @@ fn optional_parameter_admits_both_spellings() {
 /// selector list is variadic the same way.
 #[test]
 fn variadic_parameter_has_a_minimum_but_no_maximum() {
-    let s = "state = rnginit(0)\nk = record(mu = 0.0, sigma = 1.0)\n";
+    // §07 "Random value generation": `rnginit`'s seed is a byte vector.
+    let s = "state = rnginit([1, 2, 3])\nk = record(mu = 0.0, sigma = 1.0)\n";
     assert!(errors(&format!("{s}xs, s2 = builtin_sample(state, Normal, k)")).is_empty());
     assert!(
         errors(&format!(
@@ -102,6 +103,28 @@ fn variadic_parameter_has_a_minimum_but_no_maximum() {
     assert_eq!(
         errors(&format!("{v}x = get(v)")),
         vec!["`get` takes at least 2 arguments (spec §07), got 1".to_string()]
+    );
+}
+
+/// §07 "Array and table operations" makes `cat(scalar1, scalar2, ...)`
+/// "Equivalent to `vector(scalar1, scalar2, ...)`", and array literals lower to
+/// real `vector` calls — `[1.0]` to `(vector 1.0)` and `[]` to `(vector)`. So the
+/// shared `x1, x2, ...` notation admits one argument, and reading it as "at least
+/// two" for `cat` would reject `cat(1.0)` while accepting the equivalent
+/// `vector(1.0)`.
+#[test]
+fn cat_and_vector_read_the_same_notation_the_same_way() {
+    assert!(errors("v = cat(1.0)").is_empty());
+    assert!(errors("v = cat(1.0, 2.0)").is_empty());
+    assert!(errors("v = vector(1.0)").is_empty());
+    assert!(errors("v = vector()").is_empty());
+    // The surface spellings that lower to those `vector` calls.
+    assert!(errors("v = [1.0]").is_empty());
+    assert!(errors("v = []").is_empty());
+    // `cat` still needs something to concatenate.
+    assert_eq!(
+        errors("v = cat()"),
+        vec!["`cat` takes at least 1 argument (spec §07), got 0".to_string()]
     );
 }
 
