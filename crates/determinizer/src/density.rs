@@ -1307,7 +1307,7 @@ fn score_marginal_form(
 ) -> Result<NodeId, RefuseError> {
     match form {
         crate::marginal::MarginalForm::Measure(measure) => lower_measure_density(m, *measure, v),
-        crate::marginal::MarginalForm::LogDensity(ld) => Ok(ld.at(m, v)),
+        crate::marginal::MarginalForm::LogDensity(ld) => Ok(ld.at(m, &[v])),
     }
 }
 
@@ -1340,12 +1340,19 @@ fn score_marginal_form(
 /// pinning, and the latent pins. Several fields may marginalize at once. `Ok(None)`
 /// means no field needed it.
 ///
-/// Only if the marginalized fields integrate DIFFERENT latents. Summing per-field
-/// marginals is the density of the PRODUCT of the marginals, which is the joint only
-/// under independence: for `y1, y2 ~ Normal(mu = z, sigma = 1)` over `z ~ Normal(0,
-/// 1)` each marginal is `Normal(0, √2)` but `Cov(y1, y2) = Var(z) = 1`, so the joint
-/// is a correlated `MvNormal`. Refuse. Every per-field answer is right and the
-/// assembled product still wrong, so the check cannot live in the row.
+/// A per-field product only if the marginalized fields integrate DIFFERENT latents.
+/// Summing per-field marginals is the density of the PRODUCT of the marginals, which is
+/// the joint only under independence: for `y1, y2 ~ Normal(mu = z, sigma = 1)` over
+/// `z ~ Normal(0, 1)` each marginal is `Normal(0, √2)` but `Cov(y1, y2) = Var(z) = 1`, so
+/// the joint is a correlated `MvNormal`. Every per-field answer is right and the assembled
+/// product still wrong, so the check cannot live in the row.
+///
+/// A repeated latent therefore leaves the product path entirely. Where the shape is the
+/// shared-latent record law — every field a bare `Normal(mu = z, …)` draw over one
+/// ancestor-free `Normal` prior — `crate::marginal::shared_latent_record_law` supplies the
+/// joint's closed form and [`lower_shared_latent_record_law`] emits it as a single term.
+/// Any other shared-latent shape refuses (a scale latent, another family, two shared
+/// latents, a derived mean, a transformed field, a partly-shared record).
 ///
 /// The `iid`/`joint` combinators over the same shape correctly emit the product: §06
 /// defines `joint(M1, M2, …)` as the "independent product measure", so
@@ -1391,12 +1398,40 @@ fn marginalize_or_refuse_record_law(
             Some(built) => {
                 let built = built?;
                 if integrated.contains(&built.latent) {
+                    // The fields are correlated through the shared ancestor, so no product of
+                    // per-field marginals is the joint. One shape has a closed form for the
+                    // joint itself; everything else refuses.
+                    //
+                    // EVERY field must be an untransformed draw, tested here over the whole
+                    // record rather than per field. The per-field `transform.is_some()` arm above
+                    // only screens fields reached BEFORE the repeat is detected — the repeat
+                    // lands on the second shared field, so a transformed field written after it
+                    // would never be screened, and the law would score the query's value of the
+                    // TRANSFORMED field as the untransformed draw: no inverse, no log-volume.
+                    let field_measures: Vec<NodeId> =
+                        fields.iter().map(|&(_, measure, _, _)| measure).collect();
+                    let all_bare = fields.iter().all(|(_, _, t, _)| t.is_none());
+                    if let Some(law) = all_bare
+                        .then(|| {
+                            crate::marginal::shared_latent_record_law(m, &field_measures, &siblings)
+                        })
+                        .flatten()
+                    {
+                        // The law requires every field to share ONE latent, so it must be the
+                        // one the repeat was detected on. A mismatch would mean the two
+                        // ancestry paths disagree.
+                        debug_assert_eq!(
+                            law.latent, built.latent,
+                            "the record law must integrate the repeated latent"
+                        );
+                        return lower_shared_latent_record_law(m, record_node, v, &law).map(Some);
+                    }
                     return Err(refuse(
                         measure,
                         m,
                         "lawof of a record whose fields marginalize over the SAME latent is a \
                          CORRELATED joint (§04 kchain(prior, forward_kernel)), not a product of \
-                         their marginals",
+                         their marginals, and no closed form covers this shape",
                     ));
                 }
                 integrated.push(built.latent);
@@ -1417,6 +1452,61 @@ fn marginalize_or_refuse_record_law(
         return Ok(None);
     }
     lower_record_of_draws_with(m, record_node, v, &marginals).map(Some)
+}
+
+/// Emit the shared-latent record law's joint log-density: ONE term over all the record's
+/// fields, not a per-field product.
+///
+/// The fields are re-resolved through [`match_independent_record`] rather than reusing the
+/// caller's list, because that is where the variate is destructured (a value that is a
+/// `(%ref self x)` to a record literal resolves the same as an inline one) and where the
+/// rank check lives. Its `Component` order is the record's field order, the same order the
+/// law's sigmas were collected in, so the variates pair with the sigmas by position.
+///
+/// Each field's draw binding is pinned to its scored value exactly as
+/// [`lower_record_of_draws_with`] does — that is what lets the driver sweep the now-dead
+/// `draw` bindings, the shared latent's included, and what records that a QUERY put the
+/// literal there.
+///
+/// Because it re-resolves the fields, it re-checks the two properties it needs rather than
+/// trusting the caller's screening of a DIFFERENT list: that no field is transformed, and
+/// that it has exactly one variate per sigma the law carries. Both are refusals, not
+/// asserts — a release build would otherwise score a transformed field as its untransformed
+/// draw, or `zip` a length mismatch down to the shorter list and emit the law of a subset.
+/// Neither is reachable while the caller screens first, so both carry their OWN reason: if
+/// one ever fires, the message says which invariant broke rather than blaming the shape.
+fn lower_shared_latent_record_law(
+    m: &mut Module,
+    record_node: NodeId,
+    v: NodeId,
+    law: &crate::marginal::SharedLatentRecordLaw,
+) -> Result<NodeId, RefuseError> {
+    let components = match_independent_record(m, record_node, v)?;
+    if let Some(comp) = components.iter().find(|c| c.transform.is_some()) {
+        return Err(refuse(
+            comp.measure,
+            m,
+            "lawof of a record whose fields marginalize over the SAME latent has a closed-form \
+             joint only when every field is a BARE draw: a transformed field's law is the \
+             pushforward of that joint, which this law does not return",
+        ));
+    }
+    if components.len() != law.field_count {
+        return Err(refuse(
+            record_node,
+            m,
+            "the shared-latent record law needs exactly one variate per field it was built \
+             over, and the record destructured to a different count",
+        ));
+    }
+    let variates: Vec<NodeId> = components.iter().map(|c| c.pinned).collect();
+    let term = law.form.at(m, &variates);
+    for comp in &components {
+        if let Some(bid) = comp.draw_binding {
+            m.pin_binding_to_query_point(bid, comp.pinned);
+        }
+    }
+    Ok(term)
 }
 
 /// Is `node`'s inferred type a measure EXPRESSION's — a measure, or a reification

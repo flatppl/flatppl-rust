@@ -380,14 +380,25 @@ pub(crate) enum MarginalForm {
 /// Not a boxed closure: the parameters travel as a `Vec` in the order the row's `build`
 /// reads them, so the builder stays a plain `fn` pointer like [`MarginalBuilder`].
 pub(crate) struct LogDensity {
-    build: fn(&mut Module, &[NodeId], NodeId) -> NodeId,
+    build: fn(&mut Module, &[NodeId], &[NodeId]) -> NodeId,
     params: Vec<NodeId>,
 }
 
 impl LogDensity {
-    /// The log-density expression at `variate`.
-    pub(crate) fn at(&self, m: &mut Module, variate: NodeId) -> NodeId {
-        (self.build)(m, &self.params, variate)
+    /// The log-density expression at `variates` — ONE variate for a `CONJUGATE_TABLE` row,
+    /// whose law is over a single variate, and one per record field for the shared-latent
+    /// record law ([`shared_latent_record_law`]), whose law is over all of them jointly.
+    pub(crate) fn at(&self, m: &mut Module, variates: &[NodeId]) -> NodeId {
+        (self.build)(m, &self.params, variates)
+    }
+}
+
+/// The sole variate of a scalar row's law. A row that reads its variate through this cannot
+/// silently score the wrong one if a caller ever hands it a record's whole field list.
+fn sole_variate(variates: &[NodeId]) -> NodeId {
+    match variates {
+        [v] => *v,
+        _ => unreachable!("a CONJUGATE_TABLE row's law is over exactly one variate"),
     }
 }
 
@@ -515,7 +526,7 @@ fn try_conjugate_marginal(
         // applied to the VALUE instead: the row's expression consumes the same scalar the
         // measure path would have descended to.
         MarginalForm::LogDensity(ld) => match variate_like_kernel(m, v, lik.record_field) {
-            Some(scalar) => Some(Ok(ld.at(m, scalar))),
+            Some(scalar) => Some(Ok(ld.at(m, &[scalar]))),
             None => Some(Err(refuse_kchain(
                 v,
                 "closed-form log-density marginal over a record-shaped kernel needs the \
@@ -908,7 +919,8 @@ fn build_beta_binomial_marginal(
 /// log C(n, k) + log B(k + α, n − k + β) − log B(α, β)
 /// log C(n, k) = loggamma(n+1) − loggamma(k+1) − loggamma(n−k+1)
 /// ```
-fn build_beta_binomial_logpmf(m: &mut Module, params: &[NodeId], k: NodeId) -> NodeId {
+fn build_beta_binomial_logpmf(m: &mut Module, params: &[NodeId], variates: &[NodeId]) -> NodeId {
+    let k = sole_variate(variates);
     let [alpha, beta, n] = [params[0], params[1], params[2]];
 
     let one = real(m, 1.0);
@@ -991,7 +1003,8 @@ fn build_inverse_gamma_variance_marginal(
 /// The normalizer is written with `log B(ν/2, 1/2)` rather than the gamma ratio and
 /// `log(νπ)/2` because `B(ν/2, 1/2) = Γ(ν/2)Γ(1/2)/Γ((ν+1)/2)` absorbs the `Γ(1/2) = √π`,
 /// so no `pi` constant is needed and [`build_logbeta`] is reused.
-fn build_scaled_t_logpdf(m: &mut Module, params: &[NodeId], y: NodeId) -> NodeId {
+fn build_scaled_t_logpdf(m: &mut Module, params: &[NodeId], variates: &[NodeId]) -> NodeId {
+    let y = sole_variate(variates);
     let [shape, beta, mu] = [params[0], params[1], params[2]];
 
     let two = real(m, 2.0);
@@ -1024,6 +1037,222 @@ fn build_scaled_t_logpdf(m: &mut Module, params: &[NodeId], y: NodeId) -> NodeId
 }
 
 // ---------------------------------------------------------------------------
+// The shared-latent record law
+// ---------------------------------------------------------------------------
+
+/// `log(2π)`, the Gaussian normalizer's constant. Hardcoded rather than computed from a
+/// `PI` const so the emitted literal is the same on every platform: `canon::fold` folds
+/// `mul(N, LOG_2PI)` into the output, and `f64::ln` is not rounding-mandated.
+/// `log_2pi_matches_the_computed_constant` pins it against `(2·π).ln()`.
+const LOG_2PI: f64 = 1.8378770664093453;
+
+/// The joint law of a record whose fields all draw `Normal(mu = z, sigma = σᵢ)` over ONE
+/// shared latent `z ~ Normal(μ₀, s₀)`.
+///
+/// Not a `CONJUGATE_TABLE` row: a row's closed form is the law of ONE variate, and this law
+/// is over all N of them jointly. That is the whole point — each field's own Row 1 marginal
+/// is correct, and their product is a different measure, because
+/// `Cov(yᵢ, yⱼ) = Var(z) = s₀²`. `marginal.md`'s *The shared-latent record law* has the
+/// derivation, the emitted expression and the pinned points.
+pub(crate) struct SharedLatentRecordLaw {
+    /// The shared latent this law integrated out, so the caller can report it.
+    pub latent: Symbol,
+    /// How many fields the law was built over, so the emitter can prove it has one variate
+    /// per sigma rather than `zip` a mismatch down to the shorter list.
+    pub field_count: usize,
+    /// The joint log-density, awaiting one variate per field in the SAME order the field
+    /// measures were supplied in. §08 names no constructor for it, and a §08 `MvNormal`
+    /// would force the record variate into a vector, so the form is an expression (§13
+    /// admits "any other **deterministic expression** over the inputs").
+    pub form: LogDensity,
+}
+
+/// Recognise the shared-latent record law over `field_measures` — the record's per-field
+/// distribution-constructor nodes, in field order — or `None`.
+///
+/// `exempt` is the caller's own accounted-for draw sites (the record's sibling fields),
+/// threaded to [`measure_stochastic_ancestors`] exactly as
+/// [`conjugate_marginal_measure`] threads it: a latent the record CARRIES is scored by the
+/// chain rule, not integrated, so only an uncarried ancestor reaches this law.
+///
+/// The shape is narrow on purpose, and every rejection here keeps the caller's
+/// shared-latent refusal (refuse-don't-mislower):
+///
+/// * at least TWO fields — one field is Row 1, which already lowers, and routing it here
+///   would change output for no gain;
+/// * every field's measure is `Normal`, its `mu` EXACTLY the shared latent's ref
+///   ([`LatentPath::Direct`] — a derived `mul(2, z)` mean has a different joint), and its
+///   `sigma` latent-independent;
+/// * ONE shared latent across all fields, whose prior is a `Normal` with both parameters
+///   and is itself ancestor-free (a two-level hierarchy is not this integral).
+///
+/// **The checks are deliberately over-determined, and most are not individually reachable
+/// today.** Only a shape whose every field ALREADY matched a `CONJUGATE_TABLE` row gets
+/// here — the caller detects the repeated latent from those rows — so the caller's upstream
+/// filtering happens to imply several of them. Verified by mutation: removing any ONE of the
+/// family, path and cross-field-agreement checks reddens nothing, and removing the mean-path
+/// and latent-agreement checks TOGETHER lets a partly-shared record mislower.
+///
+/// **The masking mechanism is `find_kwarg`, not the family check.** `CONJUGATE_TABLE` admits
+/// the priors `Normal`, `Gamma`, `Beta`, `Exponential` and `InverseGamma`, and of the
+/// non-`Normal` four NONE takes both `mu` and `sigma` — so `find_kwarg(prior_kwargs, "mu")?`
+/// turns them away before `prior_sym` is ever compared. The field-family check is masked the
+/// same way (`Poisson` takes `rate`, `Binomial` takes `n`/`p`). The one shape that does reach
+/// here with a non-`Normal` prior is Rows 4 and 5's shared VARIANCE, and it is turned away
+/// twice — by `find_kwarg("mu")` on the prior and, independently, by the `Direct` mean path.
+///
+/// That masking is an accident of the current table, not a guarantee, which is why the
+/// explicit checks stay. Two changes would make them live, and each needs a probe that
+/// isolates the guard it turns on: a §08 prior taking both `mu` and `sigma` (`LogNormal` is
+/// the candidate), or a second Normal-mean row.
+pub(crate) fn shared_latent_record_law(
+    m: &mut Module,
+    field_measures: &[NodeId],
+    exempt: &[NodeId],
+) -> Option<SharedLatentRecordLaw> {
+    if field_measures.len() < 2 {
+        return None;
+    }
+
+    // One shared latent across every field. `sole_named_ancestor` already rejects a field
+    // reaching two DISTINCT latents, so this only has to check the fields agree.
+    let (latent, prior) = sole_named_ancestor(m, field_measures[0], exempt)?;
+    for &measure in &field_measures[1..] {
+        let (other, other_prior) = sole_named_ancestor(m, measure, exempt)?;
+        if other != latent || other_prior != prior {
+            return None;
+        }
+    }
+    if !measure_stochastic_ancestors(m, prior, &[]).is_empty() {
+        return None;
+    }
+
+    let (prior_sym, prior_kwargs) = split_kernel_constructor(m, prior)?;
+    if m.resolve(prior_sym) != "Normal" {
+        return None;
+    }
+    let mu0 = find_kwarg(m, &prior_kwargs, "mu")?;
+    let s0 = find_kwarg(m, &prior_kwargs, "sigma")?;
+
+    let mut sigmas = Vec::with_capacity(field_measures.len());
+    for &measure in field_measures {
+        let (lik_sym, lik_kwargs) = split_kernel_constructor(m, measure)?;
+        if m.resolve(lik_sym) != "Normal" {
+            return None;
+        }
+        let mu = find_kwarg(m, &lik_kwargs, "mu")?;
+        if !matches_latent_path(m, mu, &LatentPath::Direct, latent) {
+            return None;
+        }
+        let sigma = find_kwarg(m, &lik_kwargs, "sigma")?;
+        if references_input(m, sigma, latent) {
+            return None;
+        }
+        sigmas.push(sigma);
+    }
+
+    let mut params = vec![mu0, s0];
+    params.extend(sigmas);
+    Some(SharedLatentRecordLaw {
+        latent,
+        field_count: field_measures.len(),
+        form: LogDensity {
+            build: build_shared_latent_normal_logpdf,
+            params,
+        },
+    })
+}
+
+/// The shared-latent record law's log-density at `variates`, from
+/// `params = [μ₀, s₀, σ₁, …, σ_N]`.
+///
+/// `Σ = s₀²·11ᵀ + diag(σᵢ²)` is diagonal plus rank one, so Sherman–Morrison gives the
+/// inverse's action and the matrix determinant lemma the log-det, and BOTH corrections
+/// carry the same `1 + k`:
+///
+/// ```text
+/// dᵢ = 1/σᵢ²   rᵢ = xᵢ − μ₀   S = Σ dᵢ   T = Σ dᵢrᵢ   k = s₀²S
+/// rᵀΣ⁻¹r  = Σ dᵢrᵢ² − s₀²T²/(1 + k)
+/// logdetΣ = Σ log σᵢ² + log(1 + k)
+/// out     = −½[ N·log2π + logdetΣ + rᵀΣ⁻¹r ]
+/// ```
+///
+/// Every op is §07 ("Elementary functions") — no matrix op and no `MvNormal` constructor.
+/// The sum is emitted flat, with `quad` last and on its own, so an all-literal model folds
+/// it to a single legible literal (`canon::fold` leaves `log`/`log1p` alone).
+fn build_shared_latent_normal_logpdf(
+    m: &mut Module,
+    params: &[NodeId],
+    variates: &[NodeId],
+) -> NodeId {
+    let [mu0, s0] = [params[0], params[1]];
+    let sigmas = &params[2..];
+    // The emitter refuses a count mismatch before reaching here
+    // ([`crate::density::lower_shared_latent_record_law`]), so the `zip`s below cannot
+    // truncate. Restated as an assert because this builder's own correctness needs it.
+    debug_assert_eq!(
+        sigmas.len(),
+        variates.len(),
+        "one sigma and one variate per record field"
+    );
+
+    let two = real(m, 2.0);
+    let one = real(m, 1.0);
+
+    // Per field: the variance vᵢ (shared between dᵢ and the log-det), the precision dᵢ,
+    // and the deviation rᵢ.
+    let mut vars = Vec::with_capacity(sigmas.len());
+    let mut precisions = Vec::with_capacity(sigmas.len());
+    let mut devs = Vec::with_capacity(sigmas.len());
+    for (&sigma, &x) in sigmas.iter().zip(variates) {
+        let var = build_call(m, "pow", &[sigma, two]);
+        vars.push(var);
+        precisions.push(build_call(m, "divide", &[one, var]));
+        devs.push(build_call(m, "sub", &[x, mu0]));
+    }
+
+    // k = s₀²·Σdᵢ, the rank-one term both corrections divide by.
+    let prior_var = build_call(m, "pow", &[s0, two]);
+    let precision_sum = crate::density::fold_add(m, &precisions);
+    let k = build_call(m, "mul", &[prior_var, precision_sum]);
+
+    // rᵀΣ⁻¹r = Σdᵢrᵢ² − s₀²T²/(1 + k).
+    let weighted: Vec<NodeId> = precisions
+        .iter()
+        .zip(&devs)
+        .map(|(&d, &r)| build_call(m, "mul", &[d, r]))
+        .collect();
+    let t = crate::density::fold_add(m, &weighted);
+    let squared: Vec<NodeId> = precisions
+        .iter()
+        .zip(&devs)
+        .map(|(&d, &r)| {
+            let r2 = build_call(m, "pow", &[r, two]);
+            build_call(m, "mul", &[d, r2])
+        })
+        .collect();
+    let diag_quad = crate::density::fold_add(m, &squared);
+    let t2 = build_call(m, "pow", &[t, two]);
+    let correction_num = build_call(m, "mul", &[prior_var, t2]);
+    let denom = build_call(m, "add", &[one, k]);
+    let correction = build_call(m, "divide", &[correction_num, denom]);
+    let quad = build_call(m, "sub", &[diag_quad, correction]);
+
+    // −½[ N·log2π + Σ log vᵢ + log1p(k) + quad ], flat so `quad` stays a lone literal.
+    let count = real(m, sigmas.len() as f64);
+    let log_2pi = real(m, LOG_2PI);
+    let mut terms = vec![build_call(m, "mul", &[count, log_2pi])];
+    for &var in &vars {
+        terms.push(build_call(m, "log", &[var]));
+    }
+    terms.push(build_call(m, "log1p", &[k]));
+    terms.push(quad);
+    let total = crate::density::fold_add(m, &terms);
+    let neg_half = real(m, -0.5);
+    build_call(m, "mul", &[neg_half, total])
+}
+
+// ---------------------------------------------------------------------------
 // Refusal
 // ---------------------------------------------------------------------------
 
@@ -1033,5 +1262,17 @@ fn refuse_kchain(node: NodeId, reason: &str) -> RefuseError {
         node,
         construct: "kchain".to_string(),
         reason: reason.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LOG_2PI;
+
+    // `LOG_2PI` is hardcoded so the emitted literal cannot vary with the platform's `ln`,
+    // and this is what keeps it honest: it must still BE log(2π).
+    #[test]
+    fn log_2pi_matches_the_computed_constant() {
+        assert_eq!(LOG_2PI, (2.0 * std::f64::consts::PI).ln());
     }
 }

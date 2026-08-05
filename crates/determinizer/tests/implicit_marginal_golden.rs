@@ -429,66 +429,416 @@ lp = logdensityof(lawof(record(y1 = y1, y2 = y2)), record(y1 = 0.5, y2 = 0.7))")
     );
 }
 
-// **Two fields sharing ONE latent are CORRELATED, so their joint is not the product of
-// their marginals.** For `y1, y2 ~ Normal(mu = z, sigma = 1)` over `z ~ Normal(0, 1)` each
-// marginal is `Normal(0, √2)`, but `Cov(y1, y2) = Var(z) = 1`, so the joint at
-// `(0.5, 0.7)` is `MvNormal([0, 0], [2 1; 1 2])` = -2.5171832107434002 while the product of
-// the marginals is -2.716024246969291 — off by 0.199 nats, conformance-passing, and the
-// worst failure class the determiniser has. §04 "Kernels and `kernelof`" works this exact
-// shape and makes the joint `kchain(prior, forward_kernel)`, never a product.
+// **Fields sharing ONE latent are CORRELATED, so their joint is not the product of their
+// marginals** — and for one shape the joint itself is closed-form. For
+// `yᵢ ~ Normal(mu = z, sigma = σᵢ)` over `z ~ Normal(μ₀, s₀)` each field's marginal is
+// `Normal(μ₀, sqrt(s₀² + σᵢ²))` and each is right, but `Cov(yᵢ, yⱼ) = Var(z) = s₀²`, so the
+// joint is `MvNormal(μ₀·1, s₀²·J + diag(σᵢ²))`. Σ is diagonal plus rank one, so
+// Sherman–Morrison and the matrix determinant lemma give the log-density as §07 builtins —
+// `src/marginal.md`, *The shared-latent record law*, has the derivation and every number.
 //
-// Every PER-FIELD answer is right and the assembled product still wrong, so the check
-// cannot live in the conjugate row: the row is asked for y1's law and returns it
-// correctly. `conjugate_marginal_measure` reports the latent it integrated so the record
-// path sees the collision — which is why every row inherits the refusal, including the
-// two whose closed form is a log-density EXPRESSION.
+// Every per-field answer being right is why this cannot live in a conjugate row: the row is
+// asked for y1's law and returns it correctly. `conjugate_marginal_measure` reports the
+// latent it integrated, the record path sees the collision, and only then is the joint law
+// tried.
 //
-// Covers both field orders and both provenance paths (latent still latent, and pinned by
-// a sibling query).
+// `log`/`log1p` are not const-folded (`canon::fold` excludes transcendentals), so for an
+// all-literal model the emission keeps three checkable parts: the folded `N·log 2π`, the
+// residual `log`/`log1p` terms, and the quadratic form as ONE folded literal. That last
+// literal is the Sherman–Morrison result and the strongest thing assertable here — pairing
+// point C's σ with the wrong fields moves it from 5.851661943957181 to 4.2324472630774075,
+// and point B's from 0.747121951219512 to 2.042975609756093.
+//
+// Every truth below is verified in `marginal.md` three ways — the closed form, `MvNormal` in
+// Distributions.jl, and quadrature of the mixture integral — and nothing here computes one.
 #[test]
-fn two_fields_sharing_one_latent_refuse_rather_than_emit_the_product() {
-    for (model, queries) in [
-        (
-            "\
+fn a_shared_latent_record_lowers_the_correlated_joint_not_the_product() {
+    // Point A. μ₀ = 0, s₀ = 1, σ = (1, 1) at (0.5, 0.7): truth -2.5171832107434002, against
+    // the product of the marginals -2.716024246969291, a 0.199-nat gap.
+    let model_a = "\
 z = draw(Normal(mu = 0.0, sigma = 1.0))
 y1 = draw(Normal(mu = z, sigma = 1.0))
 y2 = draw(Normal(mu = z, sigma = 1.0))
-",
-            &[
-                "lp = logdensityof(lawof(record(y1 = y1, y2 = y2)), record(y1 = 0.5, y2 = 0.7))",
-                "lp = logdensityof(lawof(record(y2 = y2, y1 = y1)), record(y2 = 0.7, y1 = 0.5))",
-                "lp_z = logdensityof(lawof(z), 0.3)\n\
-                 lp = logdensityof(lawof(record(y1 = y1, y2 = y2)), record(y1 = 0.5, y2 = 0.7))",
-            ][..],
-        ),
-        // Row 4: a shared VARIANCE. Each field's marginal is `Laplace(0, 1)` and each is
-        // right, but the shared `v` is the dependence — the joint is not the product.
+";
+    for query in [
+        "lp = logdensityof(lawof(record(y1 = y1, y2 = y2)), record(y1 = 0.5, y2 = 0.7))",
+        // Reversed field order. The `log(vᵢ)` terms permute with it, so the emission is not
+        // byte-identical; the folded literals are, and they are what carries the pairing.
+        "lp = logdensityof(lawof(record(y2 = y2, y1 = y1)), record(y2 = 0.7, y1 = 0.5))",
+        // The other provenance path: an earlier query PINNED `z`, so the record query finds
+        // a literal where the latent was. This is the shape whose conditional escaped before
+        // the pin's provenance was recorded, and it must still reach the joint.
+        "lp_z = logdensityof(lawof(z), 0.3)\n\
+         lp = logdensityof(lawof(record(y1 = y1, y2 = y2)), record(y1 = 0.5, y2 = 0.7))",
+    ] {
+        let lp = pir_binding(&pir(&format!("{model_a}{query}")), "lp");
+        assert!(
+            lp.contains("(mul -0.5 ") && lp.contains("3.6757541328186907"),
+            "−½ over the flat sum, opening with 2·log 2π:\n{lp}"
+        );
+        assert_eq!(
+            lp.matches("(log 1.0)").count(),
+            2,
+            "one log σᵢ² per field, both variances 1:\n{lp}"
+        );
+        assert!(
+            lp.contains("(log1p 2.0)"),
+            "the rank-one log-det term log(1 + s₀²Σdᵢ) at k = 2:\n{lp}"
+        );
+        assert!(
+            lp.contains(" 0.26)"),
+            "the Sherman–Morrison quadratic form 0.74 − 1.44/3 = 0.26:\n{lp}"
+        );
+        // The product of the marginals is what this replaces, so its signature must be gone.
+        assert!(
+            !lp.contains("builtin_logdensityof"),
+            "the joint is one expression, not a product of scored marginals:\n{lp}"
+        );
+        assert!(
+            !lp.contains("1.4142135623730951"),
+            "no per-field Normal(0, √2) marginal survives:\n{lp}"
+        );
+    }
+
+    // Point B. THREE fields with UNEQUAL σ = (0.5, 1, 2), s₀ = 1.5, at (0.9, 1.2, 2):
+    // truth -4.405587203673088. Unequal σ is what makes the point discriminate at all —
+    // with σ equal the fields are exchangeable and a row that permuted them would pass.
+    // Wrong answers: the product of the marginals -5.424117657134536, the conditional at
+    // z = μ₀ -5.596815599614018, σ reversed -5.053514032941378, and the two half-applied
+    // corrections -6.872026228063332 (no Sherman–Morrison) and -3.1303765752237744 (no
+    // log-det term).
+    let model_b = "\
+z = draw(Normal(mu = 0.0, sigma = 1.5))
+y1 = draw(Normal(mu = z, sigma = 0.5))
+y2 = draw(Normal(mu = z, sigma = 1.0))
+y3 = draw(Normal(mu = z, sigma = 2.0))
+";
+    for query in [
+        "lp = logdensityof(lawof(record(y1 = y1, y2 = y2, y3 = y3)), \
+         record(y1 = 0.9, y2 = 1.2, y3 = 2.0))",
+        "lp = logdensityof(lawof(record(y3 = y3, y2 = y2, y1 = y1)), \
+         record(y3 = 2.0, y2 = 1.2, y1 = 0.9))",
+    ] {
+        let lp = pir_binding(&pir(&format!("{model_b}{query}")), "lp");
+        assert!(
+            lp.contains("5.513631199228036"),
+            "3·log 2π — the field COUNT is folded in, so a miscount shows here:\n{lp}"
+        );
+        for arg in ["(log 0.25)", "(log 1.0)", "(log 4.0)"] {
+            assert!(
+                lp.contains(arg),
+                "log σᵢ² for each of 0.5, 1, 2 — {arg}:\n{lp}"
+            );
+        }
+        assert!(
+            lp.contains("(log1p 11.8125)"),
+            "k = 1.5²·(4 + 1 + 0.25) = 11.8125:\n{lp}"
+        );
+        assert!(
+            lp.contains(" 0.747121951219512)"),
+            "the quadratic form; a σ/field mispairing gives 2.042975609756093:\n{lp}"
+        );
+    }
+
+    // Point C. NONZERO μ₀ = 1.5, s₀ = 0.8, σ = (0.7, 1.3) at (3.5, 0.5): truth
+    // -5.163204327709579. Carried for the reason Rows 4 and 5 carry a nonzero-location
+    // point — μ₀ enters only through rᵢ = xᵢ − μ₀, so a row that dropped it keeps every
+    // other literal and passes every μ₀ = 0 point. Dropped, it gives -8.216098673951652,
+    // a 3.053-nat gap. This is also a SPREAD point (one field high, one low), so its gap
+    // against the product of the marginals is -0.857 — the opposite sign from point B's,
+    // which pins the sign of the correlation term and not just its magnitude.
+    let model_c = "\
+z = draw(Normal(mu = 1.5, sigma = 0.8))
+y1 = draw(Normal(mu = z, sigma = 0.7))
+y2 = draw(Normal(mu = z, sigma = 1.3))
+";
+    for query in [
+        "lp = logdensityof(lawof(record(y1 = y1, y2 = y2)), record(y1 = 3.5, y2 = 0.5))",
+        "lp = logdensityof(lawof(record(y2 = y2, y1 = y1)), record(y2 = 0.5, y1 = 3.5))",
+    ] {
+        let lp = pir_binding(&pir(&format!("{model_c}{query}")), "lp");
+        assert!(
+            lp.contains("(log 0.48999999999999994)") && lp.contains("(log 1.6900000000000002)"),
+            "log σᵢ² for 0.7 and 1.3:\n{lp}"
+        );
+        assert!(
+            lp.contains("(log1p 1.6848206738316633)"),
+            "k = 0.8²·(1/0.49 + 1/1.69):\n{lp}"
+        );
+        assert!(
+            lp.contains(" 5.851661943957181)"),
+            "the quadratic form, which is where μ₀ enters; mispaired σ gives \
+             4.2324472630774075:\n{lp}"
+        );
+    }
+}
+
+// The joint law must be reachable through a REIFIED spelling of the record too. §06's
+// *Uniform kernel extension* identifies a measure with a nullary kernel, so a CLOSED
+// `functionof` means its body, and the `lawof` routing unwraps it to a fixpoint. That unwrap
+// and this law are independent changes to the same dispatch area, so the composition is
+// pinned rather than assumed.
+//
+// The named spelling is compared on the `lp` binding, not the whole module: its
+// `M = functionof(record(…))` binding survives as a dead `Function`-typed one, which the
+// measure-binding sweep does not reach. That residual is byte-identical at `482d26f` with
+// this branch's changes stashed, so it is pre-existing and not this law's doing.
+#[test]
+fn a_reified_shared_latent_record_reaches_the_same_joint_law() {
+    let model = "\
+z = draw(Normal(mu = 0.0, sigma = 1.0))
+y1 = draw(Normal(mu = z, sigma = 1.0))
+y2 = draw(Normal(mu = z, sigma = 1.0))
+";
+    let plain = pir_binding(
+        &pir(&format!(
+            "{model}lp = logdensityof(lawof(record(y1 = y1, y2 = y2)), \
+             record(y1 = 0.5, y2 = 0.7))"
+        )),
+        "lp",
+    );
+    assert!(
+        plain.contains(" 0.26)"),
+        "the plain spelling must be the joint, or the parity below proves nothing:\n{plain}"
+    );
+    for query in [
+        // Named closed reification.
+        "M = functionof(record(y1 = y1, y2 = y2))\n\
+         lp = logdensityof(lawof(M), record(y1 = 0.5, y2 = 0.7))",
+        // Inline.
+        "lp = logdensityof(lawof(functionof(record(y1 = y1, y2 = y2))), \
+         record(y1 = 0.5, y2 = 0.7))",
+        // Nested — §04's rationale applies at every level, so the unwrap is a fixpoint.
+        "lp = logdensityof(lawof(functionof(functionof(record(y1 = y1, y2 = y2)))), \
+         record(y1 = 0.5, y2 = 0.7))",
+    ] {
+        let lp = pir_binding(&pir(&format!("{model}{query}")), "lp");
+        assert_eq!(
+            lp, plain,
+            "a reified record spelling must reach the joint law identically"
+        );
+    }
+}
+
+// Refusal stays the fallback for every shared-latent shape the law does not cover. The
+// blocks below are the ones that REACH the law's recogniser — each field's own conjugate row
+// matches, so the repeated latent is detected — and are turned away there. The rest of the
+// non-matching shapes (a scale latent under a Normal prior, a non-Normal prior, two shared
+// latents, a derived mean, a two-level hierarchy, a transformed field) never get that far:
+// no per-field row matches them, so they refuse upstream with the per-field reason, and
+// `a_shared_latent_shape_with_no_per_field_row_refuses_upstream` pins that instead.
+//
+// These probes do NOT isolate one recogniser check each. Verified by mutation: each is
+// caught by two or three of them at once, so removing any single check reddens nothing here
+// (`shared_latent_record_law` records which checks that leaves unreachable-as-sole-cause).
+// The partly-shared record below is the one with a demonstrated floor — removing BOTH the
+// mean-path and the latent-agreement check lets it mislower, which is what makes it a real
+// guard rather than a restatement of the caller's filtering.
+#[test]
+fn a_shared_latent_shape_outside_the_record_law_still_refuses() {
+    for (label, src) in [
+        // Rows 4 and 5: a shared VARIANCE. Each field's marginal is right (`Laplace(0, 1)`,
+        // and the scaled t) and the joint is a correlated SCALE mixture, not a Gaussian with
+        // a rank-one Σ — the law's Normal-prior and mean-position checks both refuse it.
         (
+            "shared variance, laplace row",
             "\
 v = draw(Exponential(rate = 0.5))
 y1 = draw(Normal(mu = 0.0, sigma = sqrt(v)))
 y2 = draw(Normal(mu = 0.0, sigma = sqrt(v)))
-",
-            &["lp = logdensityof(lawof(record(y1 = y1, y2 = y2)), record(y1 = 0.5, y2 = 4.0))"][..],
+lp = logdensityof(lawof(record(y1 = y1, y2 = y2)), record(y1 = 0.5, y2 = 4.0))",
         ),
-        // Row 5: same, with a log-density-expression row.
         (
+            "shared variance, scaled-t row",
             "\
 v = draw(InverseGamma(shape = 2.5, scale = 3.0))
 y1 = draw(Normal(mu = 0.0, sigma = sqrt(v)))
 y2 = draw(Normal(mu = 0.0, sigma = sqrt(v)))
-",
-            &["lp = logdensityof(lawof(record(y1 = y1, y2 = y2)), record(y1 = 0.5, y2 = 5.0))"][..],
+lp = logdensityof(lawof(record(y1 = y1, y2 = y2)), record(y1 = 0.5, y2 = 5.0))",
+        ),
+        // A shared latent under a different FAMILY. Row 2 answers each field, the fields are
+        // correlated, and the joint is no Gaussian at all.
+        (
+            "shared rate, gamma-poisson rows",
+            "\
+z = draw(Gamma(shape = 2.0, rate = 1.0))
+k1 = draw(Poisson(rate = z))
+k2 = draw(Poisson(rate = z))
+lp = logdensityof(lawof(record(k1 = k1, k2 = k2)), record(k1 = 3, k2 = 5))",
+        ),
+        // PARTLY shared: y1 and y2 share `z`, y3 integrates `w`. The joint is this law's
+        // form times `w`'s own marginal — correct in principle, outside the decided scope,
+        // and refused rather than approximated.
+        (
+            "two fields share a latent, a third does not",
+            "\
+z = draw(Normal(mu = 0.0, sigma = 1.0))
+w = draw(Normal(mu = 0.0, sigma = 1.0))
+y1 = draw(Normal(mu = z, sigma = 1.0))
+y2 = draw(Normal(mu = z, sigma = 1.0))
+y3 = draw(Normal(mu = w, sigma = 1.0))
+lp = logdensityof(lawof(record(y1 = y1, y2 = y2, y3 = y3)), \
+             record(y1 = 0.5, y2 = 0.7, y3 = 0.2))",
+        ),
+        // A TRANSFORMED field, written AFTER the second shared field — the position the
+        // per-field screen never reaches, because the repeat is detected on the second shared
+        // field and the loop returns there. Without the whole-record gate this lowered and
+        // scored the query's value of `b` as the untransformed draw: emitted
+        // `-4.033712780173963` against the truth `-3.985439088559615` for `exp` (0.048 nats)
+        // and `-4.319047460733908` for the affine map (0.285 nats), both from quadrature of
+        // the mixture with the change of variables applied. The two maps emitted IDENTICALLY,
+        // which is what proves the map was ignored rather than mis-applied.
+        (
+            "a transformed field AFTER the second shared field, exp",
+            "\
+z = draw(Normal(mu = 0.0, sigma = 1.0))
+y1 = draw(Normal(mu = z, sigma = 1.0))
+y2 = draw(Normal(mu = z, sigma = 1.0))
+y3 = draw(Normal(mu = z, sigma = 1.0))
+b = exp(y3)
+lp = logdensityof(lawof(record(y1 = y1, y2 = y2, b = b)), \
+             record(y1 = 0.5, y2 = 0.7, b = 1.5))",
+        ),
+        (
+            "a transformed field AFTER the second shared field, affine",
+            "\
+z = draw(Normal(mu = 0.0, sigma = 1.0))
+y1 = draw(Normal(mu = z, sigma = 1.0))
+y2 = draw(Normal(mu = z, sigma = 1.0))
+y3 = draw(Normal(mu = z, sigma = 1.0))
+b = 2.0 * y3
+lp = logdensityof(lawof(record(y1 = y1, y2 = y2, b = b)), \
+             record(y1 = 0.5, y2 = 0.7, b = 1.5))",
         ),
     ] {
-        for query in queries {
-            let reason = refusal(&format!("{model}{query}"));
-            assert!(
-                reason.contains("marginalize over the SAME latent"),
-                "a correlated joint must refuse, not emit the product of marginals: {reason}"
-            );
-        }
+        let reason = refusal(src);
+        assert!(
+            reason.contains("marginalize over the SAME latent")
+                && reason.contains("no closed form covers this shape"),
+            "{label}: a correlated joint outside the law must refuse, not emit a \
+             product of marginals: {reason}"
+        );
     }
+}
+
+// The shared-latent shapes the record law does not reach, because no per-field conjugate row
+// matches them either: they refuse at the per-field guard, one step earlier. Pinned so that
+// widening a conjugate row later cannot silently route one of them into the record law —
+// each would then hit the law's own checks, and this test would show the reason moved.
+#[test]
+fn a_shared_latent_shape_with_no_per_field_row_refuses_upstream() {
+    for (label, src) in [
+        (
+            "shared latent on a SCALE",
+            "\
+z = draw(Normal(mu = 0.0, sigma = 2.0))
+y1 = draw(Normal(mu = 1.0, sigma = z))
+y2 = draw(Normal(mu = 1.0, sigma = z))
+lp = logdensityof(lawof(record(y1 = y1, y2 = y2)), record(y1 = 0.5, y2 = 0.7))",
+        ),
+        (
+            "non-Normal shared prior on the mean",
+            "\
+z = draw(Exponential(rate = 1.0))
+y1 = draw(Normal(mu = z, sigma = 1.0))
+y2 = draw(Normal(mu = z, sigma = 1.0))
+lp = logdensityof(lawof(record(y1 = y1, y2 = y2)), record(y1 = 0.5, y2 = 0.7))",
+        ),
+        (
+            "two shared latents in the mean",
+            "\
+z = draw(Normal(mu = 0.0, sigma = 1.0))
+w = draw(Normal(mu = 0.0, sigma = 1.0))
+y1 = draw(Normal(mu = add(z, w), sigma = 1.0))
+y2 = draw(Normal(mu = add(z, w), sigma = 1.0))
+lp = logdensityof(lawof(record(y1 = y1, y2 = y2)), record(y1 = 0.5, y2 = 0.7))",
+        ),
+        (
+            "derived shared mean",
+            "\
+z = draw(Normal(mu = 0.0, sigma = 1.0))
+y1 = draw(Normal(mu = 2.0 * z, sigma = 1.0))
+y2 = draw(Normal(mu = 2.0 * z, sigma = 1.0))
+lp = logdensityof(lawof(record(y1 = y1, y2 = y2)), record(y1 = 0.5, y2 = 0.7))",
+        ),
+        (
+            "two-level hierarchy over the shared latent",
+            "\
+w = draw(Normal(mu = 0.0, sigma = 1.0))
+z = draw(Normal(mu = w, sigma = 1.0))
+y1 = draw(Normal(mu = z, sigma = 1.0))
+y2 = draw(Normal(mu = z, sigma = 1.0))
+lp = logdensityof(lawof(record(y1 = y1, y2 = y2)), record(y1 = 0.5, y2 = 0.7))",
+        ),
+        (
+            "a transformed field over the shared latent",
+            "\
+z = draw(Normal(mu = 0.0, sigma = 1.0))
+y1 = draw(Normal(mu = z, sigma = 1.0))
+y2 = draw(Normal(mu = z, sigma = 1.0))
+b = exp(y1)
+lp = logdensityof(lawof(record(b = b, y2 = y2)), record(b = 1.5, y2 = 0.7))",
+        ),
+    ] {
+        let reason = refusal(src);
+        assert!(
+            reason.contains("parameterized by an uncarried draw")
+                && reason.contains("no conjugate row covers it"),
+            "{label}: expected the per-field refusal, one step before the record law: \
+             {reason}"
+        );
+    }
+}
+
+// A `sigma` over a SIBLING field is admitted, because the law needs σᵢ latent-INDEPENDENT and
+// that is not the same as constant. `σ₂ = y1` emits the sibling's own query value, pinned by
+// the chain rule the record path already applies to sibling draws.
+//
+// Truth `-2.2381096204634274` — quadrature of `∫ φ(z) N(0.5; z, 1) N(0.7; z, 0.5) dz`.
+//
+// **The value is right and the Gaussian reading is not.** With `σ₂ = y1` the fields are not
+// conditionally independent given `z`, so this model is not jointly Gaussian and `Σ` is not
+// its covariance. What holds is what the emission needs: at a fixed query point `σ₂` is the
+// constant `x₁`, so `Πᵢ N(xᵢ; z, σᵢ) = p(x₁ | z)·p(x₂ | z, y1 = x₁)` by the chain rule, and
+// integrating that against the prior is the joint density there. `marginal.md`, *A σ over a
+// sibling field*, says the same and warns against reading Σ back out.
+#[test]
+fn a_sigma_over_a_sibling_field_is_admitted_at_the_pinned_sibling() {
+    let lp = pir_binding(
+        &pir("\
+z = draw(Normal(mu = 0.0, sigma = 1.0))
+y1 = draw(Normal(mu = z, sigma = 1.0))
+y2 = draw(Normal(mu = z, sigma = y1))
+lp = logdensityof(lawof(record(y1 = y1, y2 = y2)), record(y1 = 0.5, y2 = 0.7))"),
+        "lp",
+    );
+    assert!(
+        lp.contains("(log 1.0)") && lp.contains("(log 0.25)"),
+        "σ₂² is the PINNED sibling 0.5 squared, not a residual ref:\n{lp}"
+    );
+    assert!(lp.contains("(log1p 5.0)"), "k = 1²·(1 + 1/0.25) = 5:\n{lp}");
+    assert!(
+        lp.contains(" 0.39500000000000024)"),
+        "the quadratic form at the pinned sibling:\n{lp}"
+    );
+}
+
+// ONE field over a shared-latent-shaped model is Row 1, not the record law, and must keep
+// emitting Row 1's `Normal(μ₀, sqrt(s₀² + σ²))`. The law requires two fields precisely so
+// this output does not change.
+#[test]
+fn a_single_field_record_stays_on_the_per_field_row() {
+    let lp = pir_binding(
+        &pir("\
+z = draw(Normal(mu = 0.0, sigma = 1.0))
+y1 = draw(Normal(mu = z, sigma = 1.0))
+lp = logdensityof(lawof(record(y1 = y1)), record(y1 = 0.5))"),
+        "lp",
+    );
+    assert!(
+        lp.contains("builtin_logdensityof") && lp.contains("(%field sigma 1.4142135623730951)"),
+        "one field is Row 1's marginal Normal(0, √2), scored as a measure:\n{lp}"
+    );
 }
 
 // The `iid`/`joint` combinators over the SAME correlated shape correctly emit the product,
