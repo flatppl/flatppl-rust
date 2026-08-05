@@ -982,26 +982,27 @@ fn sum_over_int_array_reduces_with_int_init_and_result() {
     );
 }
 
-/// Fix-up regression (post-A2 review): an all-integer `in(k, interval(0,
-/// 10))` must still emit a well-typed `stablehlo.compare`. `ops::lower_in`'s
-/// `below`/`above`/`product` chain (`sub`/`mul`, kind-polymorphic) stays
-/// `Int` throughout since every operand here is a literal `Int`, but
-/// `lower_in`'s own `zero` constant is unconditionally `Real`
+/// Fix-up regression (post-A2 review): an all-integer `in(k, posreals)` must
+/// still emit a well-typed `stablehlo.compare`. `k` stays `Int` (a literal),
+/// but `elem_membership`'s own `zero` constant is unconditionally `Real`
 /// (`Emitter::constant(0.0, ...)`) — so `Emitter::compare` must reconcile the
-/// mismatched pair (widening the `Int` product up to `Real`, per
-/// `elem_rank`'s order) rather than emitting `stablehlo.compare` over a
-/// declared-mismatched `(tensor<i32>, tensor<f32>)` operand pair. Every
-/// operand is a plain `Lit(Int)` (not a free/bound arg), so this needs no
-/// determinizer pass and cannot be const-folded (this test calls
-/// `Emitter::lower_node` directly, never `flatppl_determinizer::determinize`).
+/// mismatched pair (widening `Int` up to `Real`, per `elem_rank`'s order)
+/// rather than emitting `stablehlo.compare` over a declared-mismatched
+/// `(tensor<i32>, tensor<f32>)` operand pair. Every operand is a plain
+/// `Lit(Int)` (not a free/bound arg), so this needs no determinizer pass and
+/// cannot be const-folded (this test calls `Emitter::lower_node` directly,
+/// never `flatppl_determinizer::determinize`).
+///
+/// Moved here from `interval(0, 10)` (`elem_membership`'s boundary-NaN fix):
+/// the split-compare interval lowering no longer builds a `zero` constant at
+/// all, so it no longer exercises this reconciliation; `posreals`/
+/// `nonnegreals` still do and are the same `in(...)` predicate family.
 #[test]
-fn all_integer_in_interval_reconciles_compare_operand_kinds() {
+fn all_integer_in_posreals_reconciles_compare_operand_kinds() {
     let mut m = Module::new();
     let k = int(&mut m, 5);
-    let lo = int(&mut m, 0);
-    let hi = int(&mut m, 10);
-    let interval = call(&mut m, "interval", &[lo, hi]);
-    let cond = call(&mut m, "in", &[k, interval]);
+    let set = const_node(&mut m, "posreals");
+    let cond = call(&mut m, "in", &[k, set]);
 
     let mut e = Emitter::new(&m, Dtype::F32);
     let result = e.lower_node(cond).unwrap();
@@ -1411,10 +1412,14 @@ fn lower_ifelse_refuses_non_predicate_condition() {
 }
 
 /// `in(v, interval(lo, hi))` with a scalar `v` (matching lo/hi's shape)
-/// reduces to a single `compare` — two `subtract`s and one `multiply`, no
-/// `broadcast_in_dim` (shapes already match).
+/// reduces to two separate comparisons ANDed together — `v ≥ lo` and
+/// `v ≤ hi` — no `subtract`/`multiply` and no `broadcast_in_dim` (shapes
+/// already match). NOT the algebraic product identity `(v−lo)·(hi−v) ≥ 0`:
+/// that is `0 · inf = NaN` at `v = lo` when `hi` is infinite, so it mis-lowers
+/// FALSE at the interval's own closed lower bound (`elem_membership`'s
+/// boundary-NaN fix).
 #[test]
-fn lower_in_interval_reduces_to_one_compare() {
+fn lower_in_interval_reduces_to_two_compares() {
     let mut m = Module::new();
     let v = local_ref(&mut m, "v");
     let lo = real(&mut m, 0.0);
@@ -1438,17 +1443,60 @@ fn lower_in_interval_reduces_to_one_compare() {
         &[&result],
     );
 
-    assert_eq!(
-        out.matches("stablehlo.subtract").count(),
-        2,
-        "expected v-lo and hi-v subtracts, in:\n{out}"
+    assert!(
+        !out.contains("stablehlo.subtract"),
+        "no product identity, no subtract, in:\n{out}"
     );
-    assert_eq!(out.matches("stablehlo.multiply").count(), 1);
-    assert!(out.contains("stablehlo.compare GE"));
+    assert!(
+        !out.contains("stablehlo.multiply"),
+        "no product identity, no multiply, in:\n{out}"
+    );
+    assert!(out.contains("stablehlo.compare GE"), "v >= lo, in:\n{out}");
+    assert!(out.contains("stablehlo.compare LE"), "v <= hi, in:\n{out}");
+    assert_eq!(out.matches("stablehlo.and").count(), 1, "in:\n{out}");
     assert!(
         !out.contains("broadcast_in_dim"),
         "scalar operands need no broadcast, in:\n{out}"
     );
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// `interval(0, inf)` — the shape the product identity got wrong at its own
+/// closed lower bound (`(v−lo)·(hi−v) ≥ 0` is `0 · inf = NaN` at `v = lo`) —
+/// must lower through the SAME two-compare-and-`and` path as a finite
+/// interval, not some other, still-multiplying, branch for an infinite `hi`.
+#[test]
+fn lower_in_interval_with_infinite_upper_still_splits_the_compares() {
+    let mut m = Module::new();
+    let v = local_ref(&mut m, "v");
+    let lo = real(&mut m, 0.0);
+    let hi = real(&mut m, f64::INFINITY);
+    let interval = call(&mut m, "interval", &[lo, hi]);
+    let node = call(&mut m, "in", &[v, interval]);
+
+    let mut e = Emitter::new(&m, Dtype::F32);
+    e.bind(
+        v,
+        Value {
+            ssa: "%arg0".to_string(),
+            ty: MlirTy::Scalar,
+            elem: ElemKind::Real,
+        },
+    );
+    let result = e.lower_node(node).unwrap();
+    let out = e.finish(
+        "f",
+        &[("%arg0".to_string(), MlirTy::Scalar, ElemKind::Real)],
+        &[&result],
+    );
+
+    assert!(
+        !out.contains("stablehlo.subtract") && !out.contains("stablehlo.multiply"),
+        "an infinite hi must not fall back to the NaN-producing product identity, in:\n{out}"
+    );
+    assert!(out.contains("stablehlo.compare GE"), "v >= lo, in:\n{out}");
+    assert!(out.contains("stablehlo.compare LE"), "v <= hi, in:\n{out}");
+    assert_eq!(out.matches("stablehlo.and").count(), 1, "in:\n{out}");
     assert!(is_delimiter_balanced(&out));
 }
 

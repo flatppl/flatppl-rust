@@ -658,9 +658,13 @@ fn lower_in(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitE
 
 /// The membership predicate for one [`ElemSet`], elementwise at `v`'s shape.
 ///
-/// `interval(lo, hi)` lowers to a SINGLE `compare` via the closed-interval
-/// algebraic identity `v ∈ [lo, hi] ⟺ (v - lo) · (hi - v) ≥ 0` (zero, i.e.
-/// included, exactly at either boundary; negative outside it, for `lo ≤ hi`).
+/// `interval(lo, hi)` lowers to two separate comparisons, `v ≥ lo` and
+/// `v ≤ hi`, ANDed together. NOT the algebraic identity `(v - lo) · (hi - v)
+/// ≥ 0`: that product is `0 · inf = NaN` at `v = lo` when `hi` is infinite,
+/// so `interval(lo, inf)` mis-lowered FALSE at its own closed lower bound —
+/// `truncate(Normal, interval(0, inf))` scored `-inf` at `y = 0` where the
+/// finite half-normal density is owed (measured, Enzyme-JAX f32; see
+/// `flatppl-dev/TODO-flatppl-rust.md`'s `ge`/`le` follow-up).
 ///
 /// `posreals`/`nonnegreals` lower to one comparison against zero, and the
 /// DIRECTION is not interchangeable: §03 makes `posreals` $(0, +\infty]$ (open
@@ -687,11 +691,9 @@ fn elem_membership(
             let hi = e.lower_node(hi_id)?;
             let lo = broadcast_to(e, id, &lo, &v.ty)?;
             let hi = broadcast_to(e, id, &hi, &v.ty)?;
-            let below = e.sub(v, &lo);
-            let above = e.sub(&hi, v);
-            let product = e.mul(&below, &above);
-            let zero = e.constant(0.0, v.ty.clone());
-            Ok(e.compare("GE", &product, &zero))
+            let above_lo = e.compare("GE", v, &lo);
+            let below_hi = e.compare("LE", v, &hi);
+            Ok(e.and(&above_lo, &below_hi))
         }
     }
 }
