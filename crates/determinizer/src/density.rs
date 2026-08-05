@@ -1356,10 +1356,12 @@ fn score_marginal_form(
 /// Any other shared-latent shape refuses (a scale latent, another family, two shared
 /// latents, a derived mean, a transformed field, a partly-shared record).
 ///
-/// The `iid`/`joint` combinators over the same shape correctly emit the product: §06
-/// defines `joint(M1, M2, …)` as the "independent product measure", so
-/// `joint(a = lawof(y1), b = lawof(y2))` asks for the product of the two marginals,
-/// while `lawof(record(y1 = y1, y2 = y2))` asks for the correlated sub-DAG law.
+/// `iid` over the same shape still emits the product — it redraws its reified sub-DAG
+/// afresh per copy, never sharing ancestors (§06 "iid" entry). `joint` over the SAME named
+/// reified components now reaches this same law too: `joint(a = lawof(y1), b = lawof(y2))`
+/// is `lawof(record(a = y1, b = y2))` (§06 "Reified components share their ancestry"), so
+/// [`lower_keyword_joint`] builds that record and dispatches here rather than assuming
+/// independence.
 ///
 /// A field that is a TRANSFORM of its draw (`b = y + z`) is refused rather than
 /// marginalized: its law is the pushforward of the marginal under that map, which the
@@ -5265,17 +5267,18 @@ fn emit_kernel_broadcast_density(
     build_call(m, "sum", &[per_cell])
 }
 
-/// `logdensityof(joint(M₁,…,Mₖ), v)` = `Σ logdensityof(Mᵢ, get0(v, i))`
-/// (§06 "Density of composed measures"). The variate is the positional `cat` of the
-/// component variates.
+/// `logdensityof(joint(M₁,…,Mₖ), v)` — the positional `cat` form of `joint`
+/// (§06 "Joint composition", §06 "Density of composed measures"). For components sharing
+/// no stochastic ancestor this is `Σ logdensityof(Mᵢ, get0(v, i))`; for two or more
+/// REIFIED components (bare `lawof(x)` calls) it is the cat-law counterpart of the
+/// keyword/record form — see the reified-group handling below and
+/// [`lower_keyword_joint`], which builds the same rewrite for the named spelling.
 ///
-/// **Scope:** positional `joint` only, scalar-variate components. `joint`'s
-/// variate is the positional `cat` of the component variates
-/// (§06 "Density of composed measures"); for
-/// scalar-variate components the destructuring is `get0(v, i)`, one slot per
-/// component. Component variates of higher rank need `cat`-slice routing, which
-/// this does not build — a component whose measure domain is non-scalar
-/// (e.g. `iid(Normal, 2)`, domain array[2]) is refused HERE, up front, by
+/// **Scope:** scalar-variate components only. `joint`'s variate is the positional `cat`
+/// of the component variates; for scalar-variate components the destructuring is
+/// `get0(v, i)`, one slot per component. Component variates of higher rank need
+/// `cat`-slice routing, which this does not build — a component whose measure domain is
+/// non-scalar (e.g. `iid(Normal, 2)`, domain array[2]) is refused HERE, up front, by
 /// inspecting each component's own measure domain kind. This is NOT left to the
 /// downstream recursive call: `build_density_term`'s domain check compares the
 /// measure domain against the value `get0(v, i)`, which infers to
@@ -5352,8 +5355,45 @@ fn lower_joint(
             ));
         }
     }
+    // §06 "Reified components share their ancestry": two or more components that are bare
+    // `lawof(x)` calls re-enter the record law that scores `lawof(record(...))` — build
+    // `record(_0 = x₀, …)` from the reified arguments, keyed to a matching value record
+    // sliced from `v` by `get0`, and dispatch through the SAME machinery
+    // [`lower_keyword_joint`] uses (the shared-latent record law, its singular-joint
+    // refusal, and its independent-fields fallback), rather than re-deriving
+    // ancestry-sharing here. A component that is not reified (a distribution constructor)
+    // is always a fresh draw — §06 "Joint composition": "Components that share no
+    // stochastic ancestor — distribution constructors always ... — are mutually
+    // independent" — and stays on the per-slot path below.
+    let reified: Vec<(usize, Symbol, NodeId)> = inner
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &mi)| {
+            reified_lawof_arg(m, mi).map(|x| (i, m.intern(&format!("_j{i}")), x))
+        })
+        .collect();
+
     let mut terms = Vec::with_capacity(inner.len());
+    if reified.len() >= 2 {
+        let record_fields: Vec<(Symbol, NodeId)> =
+            reified.iter().map(|&(_, name, x)| (name, x)).collect();
+        let mut pinned_fields = Vec::with_capacity(reified.len());
+        for &(i, name, _) in &reified {
+            let idx = m.alloc(Node::Lit(Scalar::Int(i as i64)));
+            let elem = build_call(m, "get0", &[v, idx]);
+            pinned_fields.push((name, elem));
+        }
+        terms.push(lower_reified_joint_group(
+            m,
+            &record_fields,
+            &pinned_fields,
+            VariateOrigin::Other,
+        )?);
+    }
     for (i, &mi) in inner.iter().enumerate() {
+        if reified.len() >= 2 && reified.iter().any(|&(ri, _, _)| ri == i) {
+            continue;
+        }
         let idx = m.alloc(Node::Lit(Scalar::Int(i as i64)));
         let elem = build_call(m, "get0", &[v, idx]);
         terms.push(lower_measure_density(m, mi, elem)?);
@@ -5361,20 +5401,61 @@ fn lower_joint(
     Ok(fold_add(m, &terms))
 }
 
-/// `logdensityof(joint(name₁ = M₁, …, nameₖ = Mₖ), v)` = `Σᵢ
-/// logdensityof(Mᵢ, v.nameᵢ)` — the keyword/record form of `joint` (§04
-/// example: `prior = joint(theta1 = Normal(...), theta2 = Exponential(...))`;
-/// §06 "joint and iid (independent products)"). The variate `v` is a RECORD
-/// keyed by the SAME field names as the joint's named components — unlike the
-/// positional form's flat `cat` vector, so there is no `get0`-slicing and
-/// (consequently) no scalar-component restriction: each component is matched
-/// to its OWN record field by name and scored there directly, whatever shape
-/// that field's value has. The downstream `lower_measure_density` /
-/// `build_density_term` recursion already domain-checks each component
-/// against its own pinned field value, which is exactly the guard a
-/// non-scalar component needs — no upfront kind inspection required (contrast
-/// [`lower_joint`]'s positional path, which DOES need one because `get0(v,
-/// i)`'s value infers to `%deferred` and so bypasses that same check).
+/// The shared tail of the reified-group rewrite both [`lower_joint`]'s positional path and
+/// [`lower_keyword_joint`] use (§06 "Reified components share their ancestry"): build
+/// `record(name₁ = x₁, …)` from the reified components' own values, wrap it in `lawof`, and
+/// score it at the matching value record `record(name₁ = pinned₁, …)` — through
+/// `lower_measure_density_at`, the same dispatcher entry a written `lawof(record(...))`
+/// reaches. The two callers differ only in how each name's reified value and pinned point
+/// are obtained (`get0(v, i)` slices for the positional `cat` form, record-field lookup for
+/// the keyword form), so only that gathering stays in each caller.
+fn lower_reified_joint_group(
+    m: &mut Module,
+    reified: &[(Symbol, NodeId)],
+    pinned: &[(Symbol, NodeId)],
+    origin: VariateOrigin,
+) -> Result<NodeId, RefuseError> {
+    let record_node = build_record(m, reified);
+    let lawof_node = build_call(m, "lawof", &[record_node]);
+    let value_record = build_record(m, pinned);
+    lower_measure_density_at(m, lawof_node, value_record, origin)
+}
+
+/// A joint component is REIFIED (§06 "Reified components share their ancestry") when it
+/// is a bare `lawof(x)` call, one ref hop resolved. Returns the reified value `x`. A
+/// distribution CONSTRUCTOR component (`Normal(...)`) never matches this, whatever its own
+/// parameters reference — it is always a fresh draw (§06 "Joint composition": "distribution
+/// constructors always" share no stochastic ancestor with any other component).
+fn reified_lawof_arg(m: &Module, measure: NodeId) -> Option<NodeId> {
+    let (resolved, _) = resolve_ref_one(m, measure);
+    let c = expect_builtin_call(m, resolved, "lawof")?;
+    (c.args.len() == 1).then_some(c.args[0])
+}
+
+/// `logdensityof(joint(name₁ = M₁, …, nameₖ = Mₖ), v)` — the keyword/record form of
+/// `joint` (§04 example: `prior = joint(theta1 = Normal(...), theta2 = Exponential(...))`;
+/// §06 "Joint composition"). The variate `v` is a RECORD keyed by the SAME field names as
+/// the joint's named components — unlike the positional form's flat `cat` vector, so there
+/// is no `get0`-slicing.
+///
+/// **Reified components share their ancestry** (§06 "Joint composition", the heading of
+/// that name): two or more NAMED components that are bare `lawof(x)` calls are scored as
+/// `lawof(record(name₁ = x₁, …))` — built here and dispatched through that spelling's OWN
+/// machinery, not re-derived. That one lowering already covers the shared-latent record
+/// law when the reified traces share a stochastic ancestor, the refusal for a singular
+/// joint (the same draw referenced twice, or a deterministic transform of another
+/// component's draw — §06 "Singular joints"), and the per-field fallback when the traces
+/// are disjoint. A distribution CONSTRUCTOR component (`Normal(...)`) is always a fresh
+/// draw — §06 "Joint composition": "distribution constructors always" share no stochastic
+/// ancestor with any other component — so it is excluded from the group and scored on its
+/// own, below, exactly as before this rewrite.
+///
+/// Each non-grouped component is matched to its OWN record field by name and scored there
+/// directly, whatever shape that field's value has — the downstream `lower_measure_density`
+/// / `build_density_term` recursion domain-checks it against its own pinned field value, so
+/// no upfront kind inspection is needed here (contrast [`lower_joint`]'s positional path,
+/// which DOES need one because `get0(v, i)`'s value infers to `%deferred` and so bypasses
+/// that same check).
 ///
 /// Called only from [`lower_joint`] once it has confirmed `named` is
 /// non-empty and `args` is empty, so `named` here is always non-empty.
@@ -5382,8 +5463,9 @@ fn lower_joint(
 /// **Refuses** (rather than mislowering) when: a named component is not a
 /// `%field` (a malformed named arg); the value `v` is not a `record(...)`
 /// node; `v`'s record carries a positional (non-named) element alongside its
-/// named fields; or `v`'s record is missing a field that one of the joint's
-/// named components expects.
+/// named fields; `v`'s record is missing a field that one of the joint's
+/// named components expects; or — via the record-law dispatch — the reified
+/// group turns out to be a singular joint.
 ///
 /// An extra value-record field NOT named by the joint (e.g. `record(x=.., y=..,
 /// z=..)` against `joint(x=.., y=..)`) is silently ignored — this matches the
@@ -5421,8 +5503,37 @@ fn lower_keyword_joint(
     }
     let vrec_named: Vec<NamedArg> = vrec.named.to_vec();
 
+    // §06 "Reified components share their ancestry": group the NAMED components that are
+    // bare `lawof(x)` calls and reroute them through `lawof(record(...))`'s own machinery.
+    let reified: Vec<(Symbol, NodeId)> = named
+        .iter()
+        .filter_map(|f| reified_lawof_arg(m, f.value).map(|x| (f.name, x)))
+        .collect();
+
     let mut terms = Vec::with_capacity(named.len());
+    if reified.len() >= 2 {
+        let mut pinned_fields = Vec::with_capacity(reified.len());
+        for &(name, _) in &reified {
+            let pinned = lookup_field(m, &vrec_named, name).ok_or_else(|| {
+                refuse(
+                    v,
+                    m,
+                    &format!("missing field {} in joint value record", m.resolve(name)),
+                )
+            })?;
+            pinned_fields.push((name, pinned));
+        }
+        terms.push(lower_reified_joint_group(
+            m,
+            &reified,
+            &pinned_fields,
+            origin,
+        )?);
+    }
     for field in named {
+        if reified.len() >= 2 && reified.iter().any(|&(name, _)| name == field.name) {
+            continue;
+        }
         let pinned = lookup_field(m, &vrec_named, field.name).ok_or_else(|| {
             refuse(
                 v,

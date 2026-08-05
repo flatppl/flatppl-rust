@@ -649,10 +649,12 @@ of these keeps the shared-latent refusal, and each is pinned by a test:
   record where two fields share `z` and a third integrates `w` would need the product of
   this row with `w`'s own — correct in principle, and outside the decided scope.
 
-`iid` and `joint` over the same model still emit the PRODUCT, and that is not a
-contradiction: §06 defines `joint(M1, M2, …)` as the "independent product measure", so
-`joint(a = lawof(y1), b = lawof(y2))` asks for a different measure than
-`lawof(record(y1 = y1, y2 = y2))` does. Only the record spelling gains the correlated form.
+`iid` over the same model still emits the PRODUCT: it redraws its reified sub-DAG afresh
+per copy and never shares ancestors (§06 "iid" entry). `joint` no longer does — §06 "Reified
+components share their ancestry" makes `joint(a = lawof(y1), b = lawof(y2))` equivalent to
+`lawof(record(a = y1, b = y2))`, so a keyword `joint` over two or more reified components
+now reaches this SAME law (`crates/determinizer/src/density.rs`, `lower_keyword_joint`'s
+record-law dispatch). The positional spelling reaches the cat-law counterpart the same way.
 
 ## Deferred by decision — Exponential prior on the MEAN
 
