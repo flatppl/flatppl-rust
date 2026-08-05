@@ -5478,6 +5478,25 @@ fn lower_reified_measure(
         }
         c.args[0]
     };
+    // The screen above reads boundary ENTRIES, so it misses an `%autoinputs`
+    // boundary: the auto-trace records `elementof` self-refs only, never a
+    // placeholder, so a placeholder in the body is declared NOWHERE. Scoring it
+    // would put a dangling `(%ref %local …)` in the density. §04 *Placeholders and
+    // holes*: "All placeholders must appear both in the expression to be reified
+    // and the boundary input keyword arguments." `infer`'s undeclared-placeholder
+    // error is the front door and stops any caller that acts on diagnostics; a
+    // caller that ignores them still reaches here, and this names the obstacle
+    // rather than leaving the refusal to the `%failed` type inference left behind.
+    if crate::kernel::has_free_local(m, body) {
+        return Err(refuse(
+            node,
+            m,
+            "functionof/kernelof used as a measure reaches a placeholder that no boundary input \
+             declares (spec §04: a placeholder must appear in the reified expression AND the \
+             boundary keyword arguments); scoring it would leave a dangling `%local` ref in the \
+             density — refuse rather than mislower",
+        ));
+    }
     lower_measure_density_at(m, body, v, origin)
 }
 
