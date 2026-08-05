@@ -78,7 +78,7 @@ pub(crate) fn call_rule(
     // Call arity, where the catalogue declares a parameter list. Ahead of the
     // per-op rules because most of them index fixed argument positions and so
     // ignore extras and silently type an under-supplied call.
-    if let Some(ty) = arity_check(inf, id, &name, args.len() + named.len()) {
+    if let Some(ty) = arity_check(inf, id, &name, args, named) {
         return (ty, joined);
     }
 
@@ -1536,9 +1536,10 @@ fn reification_type(
     args: &[ArgInfo],
 ) -> Type {
     // Boundary entries whose target ref is a `%local` placeholder — that entry
-    // IS the placeholder's declaration (spec §04). Filled per arm below; an
-    // `%autoinputs` boundary declares none (the auto-trace records `elementof`
-    // leaves, never a placeholder), so its list stays empty.
+    // IS the placeholder's declaration (spec §04), under either origin tag. The
+    // auto-trace itself only ever records `elementof` leaves, but FlatPIR may
+    // carry an explicit entry list under `%autoinputs`, and such an entry
+    // declares its placeholder exactly as a `%specinputs` entry does.
     let mut declared: Vec<Symbol> = Vec::new();
     let inputs: Box<[Symbol]> = match call.inputs.as_ref() {
         Some(Inputs::Spec(entries)) => {
@@ -1569,7 +1570,15 @@ fn reification_type(
             entries.iter().map(|(n, _)| *n).collect()
         }
         Some(Inputs::Auto) => match inf.module.auto_inputs_of(id) {
-            Some(entries) => entries.iter().map(|(n, _)| *n).collect(),
+            Some(entries) => {
+                declared.extend(
+                    entries
+                        .iter()
+                        .filter(|(_, r)| r.ns == RefNs::Local)
+                        .map(|(_, r)| r.name),
+                );
+                entries.iter().map(|(n, _)| *n).collect()
+            }
             None => {
                 // §04 auto-trace: discover the body's `elementof` parametric
                 // leaves (canonical-sorted by name) and fill the side-table, so
@@ -1645,6 +1654,8 @@ fn reification_type(
 /// `declared` does not list, as `(placeholder, first occurrence)` pairs in walk
 /// order. Spec §04 *Placeholders and holes*: "All placeholders must appear both
 /// in the expression to be reified and the boundary input keyword arguments."
+/// The operative rule: a boundary entry targeting the placeholder declares it,
+/// under either origin tag — a `%specinputs` entry or an `%autoinputs` entry.
 ///
 /// A nested `functionof`/`kernelof` is its OWN placeholder scope (§04: "The
 /// scope of a placeholder is the nearest enclosing `functionof` or `kernelof`"),
@@ -2648,25 +2659,62 @@ fn broadcast_distribution_no_shape(inf: &mut Inferencer<'_, '_>, head_node: Node
     }
 }
 
-/// Reject a call whose argument count contradicts the callee's declared §07
-/// parameter list. Returns `Some(Type::Failed)` for a mis-arity call and `None`
-/// when the call is admissible or the catalogue declares no arity for `name`.
-///
-/// `got` counts named arguments too: every §07 parameter is nameable, so
-/// `checked(value_expr, condition = …)` supplies two.
-fn arity_check(inf: &mut Inferencer<'_, '_>, id: NodeId, name: &str, got: usize) -> Option<Type> {
-    let arity = crate::catalogue::builtin().base_arity(name)?;
+/// Reject a call whose argument count contradicts the callee's declared
+/// parameter list — §07 for a function or arity-only row, §08 for a
+/// distribution constructor. Returns `Some(Type::Failed)` for a mis-arity call
+/// and `None` when the call is admissible, the count is not knowable
+/// (see [`supplied_arg_count`]), or the catalogue declares no arity for `name`.
+fn arity_check(
+    inf: &mut Inferencer<'_, '_>,
+    id: NodeId,
+    name: &str,
+    args: &[ArgInfo],
+    named: &[NamedInfo],
+) -> Option<Type> {
+    let cat = crate::catalogue::builtin();
+    let arity = cat.base_arity(name)?;
+    let got = supplied_arg_count(args, named)?;
     if arity.admits(got) {
         return None;
     }
+    let section = if cat.base_is_distribution(name) {
+        "§08"
+    } else {
+        "§07"
+    };
     let declared = arity.describe();
     inf.diags.push(crate::Diagnostic::error_at(
         id,
-        format!("`{name}` takes {declared} (spec §07), got {got}"),
+        format!("`{name}` takes {declared} (spec {section}), got {got}"),
     ));
     Some(Type::Failed(
         format!("{name} takes {declared}, got {got}").into(),
     ))
+}
+
+/// The number of arguments a call supplies to its callee's parameter list, or
+/// `None` when that number is not statically knowable.
+///
+/// Named arguments count: every §07 parameter and every §08 distribution
+/// parameter is nameable (§04 "Calling conventions": "All built-in ordinary
+/// callables have a defined input order and accept both positional and keyword
+/// arguments"), so `checked(value_expr, condition = …)` and `Normal(mu = m,
+/// sigma = s)` each supply two.
+///
+/// A record or table given as the call's SOLE argument auto-splats — §04:
+/// "`f(record(a = x, b = y, ...))` … are equivalent to `f(a = x, b = y, ...)`"
+/// — so it supplies one argument per field, not one. When such an argument's
+/// type is still open, a splat cannot be ruled out and no count is trustworthy.
+fn supplied_arg_count(args: &[ArgInfo], named: &[NamedInfo]) -> Option<usize> {
+    if !named.is_empty() || args.len() != 1 {
+        return Some(args.len() + named.len());
+    }
+    match &args[0].1 {
+        Type::Record(fields) => Some(fields.len()),
+        Type::Table { columns, .. } => Some(columns.len()),
+        Type::Deferred | Type::Var(_) | Type::Any | Type::Failed(_) => None,
+        _ => Some(1),
+    }
 }
 
 /// The result type of a per-name function declared in the catalogue as

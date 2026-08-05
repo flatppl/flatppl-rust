@@ -168,12 +168,83 @@ fn user_call_arity_is_checked_against_the_declared_parameters() {
     );
 }
 
-/// A §08 distribution constructor is NOT arity-checked: its catalogue `params`
-/// are §08 field names added for the determiniser, and several rows are
-/// knowingly degraded, so enforcing §08 constructor arity needs its own pass.
+/// §08 "Built-in distributions": "The names and order of the distribution
+/// parameters specified below define the names and positional order of the
+/// kernel arguments." No §08 entry gives a parameter a default, so a
+/// constructor's arity is exactly its declared count — over- and under-supply
+/// are both static errors naming the constructor and that count.
 #[test]
-fn distribution_constructors_are_not_arity_checked() {
-    assert!(errors("m = Normal(0.0, 1.0, 2.0)").is_empty());
+fn distribution_constructor_arity_is_the_declared_parameter_count() {
+    for (src, want) in [
+        (
+            "m = Normal(0.0, 1.0, 2.0)",
+            "`Normal` takes 2 arguments (spec §08), got 3",
+        ),
+        (
+            "m = Normal(0.0)",
+            "`Normal` takes 2 arguments (spec §08), got 1",
+        ),
+        (
+            "m = StudentT(3.0, 1.0)",
+            "`StudentT` takes 1 argument (spec §08), got 2",
+        ),
+        (
+            "m = GeneralizedNormal(0.0, 1.0)",
+            "`GeneralizedNormal` takes 3 arguments (spec §08), got 2",
+        ),
+        (
+            "m = Poisson()",
+            "`Poisson` takes 1 argument (spec §08), got 0",
+        ),
+    ] {
+        assert_eq!(errors(src), vec![want.to_string()], "for {src}");
+        assert!(
+            ir(src).contains("(%failed"),
+            "{src} must type %failed:\n{}",
+            ir(src)
+        );
+    }
+}
+
+/// Every spelling §04 admits for a built-in constructor passes: positional,
+/// keyword, and mixed. §04 "Calling conventions": "All built-in ordinary
+/// callables have a defined input order and accept both positional and keyword
+/// arguments."
+#[test]
+fn every_constructor_call_spelling_passes_at_the_declared_count() {
+    assert!(errors("m = Normal(0.0, 1.0)").is_empty());
+    assert!(errors("m = Normal(mu = 0.0, sigma = 1.0)").is_empty());
+    assert!(
+        errors("m = Normal(sigma = 1.0, mu = 0.0)").is_empty(),
+        "keyword order is not significant (spec §04)"
+    );
+    assert!(errors("m = Normal(0.0, sigma = 1.0)").is_empty());
+    assert!(errors("m = Multinomial(3, [0.2, 0.8])").is_empty());
+}
+
+/// §04 "Calling conventions": "`f(record(a = x, b = y, ...))` … are equivalent
+/// to `f(a = x, b = y, ...)`", so a sole record argument supplies one argument
+/// per field. Counting it as one would reject the splat spelling of every
+/// multi-parameter constructor.
+#[test]
+fn a_sole_record_argument_supplies_one_argument_per_field() {
+    assert!(errors("m = Normal(record(mu = 0.0, sigma = 1.0))").is_empty());
+    assert!(
+        errors("p = record(mu = 0.0, sigma = 1.0)\nm = Normal(p)").is_empty(),
+        "the splat is about the argument being a record, not about spelling `record(…)` inline"
+    );
+    // The field count is what is checked, so a wrong-width record still fails.
+    assert_eq!(
+        errors("m = Normal(record(mu = 0.0, sigma = 1.0, tau = 2.0))"),
+        vec!["`Normal` takes 2 arguments (spec §08), got 3".to_string()]
+    );
+    // §04: auto-splatting fires only for a SOLE argument, so a record alongside
+    // other arguments counts as the one ordinary value it is — three here, not
+    // four.
+    assert_eq!(
+        errors("m = Normal(record(mu = 0.0, sigma = 1.0), 1.0, 2.0)"),
+        vec!["`Normal` takes 2 arguments (spec §08), got 3".to_string()]
+    );
 }
 
 /// §07's "Domains" column for the elementary functions lists `reals` and

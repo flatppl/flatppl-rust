@@ -647,34 +647,37 @@ fn uniform_support_is_the_argument_set() {
 /// natural extent. Catches transcription slips in the table itself.
 #[test]
 fn distribution_catalogue_sweep() {
+    // Each row is called at its own §08 parameter count — the arity rule now
+    // enforces it, and a generic two-argument spelling is not a valid call of a
+    // one- or three-parameter constructor.
     let scalar_dists = [
-        "Uniform",
-        "Normal",
-        "GeneralizedNormal",
-        "Cauchy",
-        "StudentT",
-        "Logistic",
-        "LogNormal",
-        "Exponential",
-        "Gamma",
-        "Weibull",
-        "Pareto",
-        "InverseGamma",
-        "Beta",
-        "ChiSquared",
-        "VonMises",
-        "Laplace",
-        "Bernoulli",
-        "Categorical",
-        "Categorical0",
-        "Binomial",
-        "Geometric",
-        "NegativeBinomial",
-        "NegativeBinomial2",
-        "Poisson",
+        ("Uniform", "interval(0.0, 1.0)"),
+        ("Normal", "0.5, 0.5"),
+        ("GeneralizedNormal", "0.5, 0.5, 0.5"),
+        ("Cauchy", "0.5, 0.5"),
+        ("StudentT", "0.5"),
+        ("Logistic", "0.5, 0.5"),
+        ("LogNormal", "0.5, 0.5"),
+        ("Exponential", "0.5"),
+        ("Gamma", "0.5, 0.5"),
+        ("Weibull", "0.5, 0.5"),
+        ("Pareto", "0.5, 0.5"),
+        ("InverseGamma", "0.5, 0.5"),
+        ("Beta", "0.5, 0.5"),
+        ("ChiSquared", "0.5"),
+        ("VonMises", "0.5, 0.5"),
+        ("Laplace", "0.5, 0.5"),
+        ("Bernoulli", "0.5"),
+        ("Categorical", "[0.5, 0.5]"),
+        ("Categorical0", "[0.5, 0.5]"),
+        ("Binomial", "2, 0.5"),
+        ("Geometric", "0.5"),
+        ("NegativeBinomial", "0.5, 0.5"),
+        ("NegativeBinomial2", "0.5, 0.5"),
+        ("Poisson", "0.5"),
     ];
-    for name in scalar_dists {
-        let src = format!("m = {name}(0.5, 0.5)");
+    for (name, args) in scalar_dists {
+        let src = format!("m = {name}({args})");
         let (module, _) = infer_src(&src);
         let out = flatppl_flatpir::write(&module);
         assert!(
