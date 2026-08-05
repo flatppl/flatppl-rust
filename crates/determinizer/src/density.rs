@@ -1359,7 +1359,7 @@ fn score_marginal_form(
 /// `iid` over the same shape still emits the product — it redraws its reified sub-DAG
 /// afresh per copy, never sharing ancestors (§06 "iid" entry). `joint` over the SAME named
 /// reified components now reaches this same law too: `joint(a = lawof(y1), b = lawof(y2))`
-/// is `lawof(record(a = y1, b = y2))` (§04 "Reified components share their ancestry"), so
+/// is `lawof(record(a = y1, b = y2))` (§06 "Reified components share their ancestry"), so
 /// [`lower_keyword_joint`] builds that record and dispatches here rather than assuming
 /// independence.
 ///
@@ -5362,8 +5362,9 @@ fn lower_joint(
     // [`lower_keyword_joint`] uses (the shared-latent record law, its singular-joint
     // refusal, and its independent-fields fallback), rather than re-deriving
     // ancestry-sharing here. A component that is not reified (a distribution constructor)
-    // is always a fresh draw — §06 "Mixed components" — and stays on the per-slot path
-    // below.
+    // is always a fresh draw — §06 "Joint composition": "Components that share no
+    // stochastic ancestor — distribution constructors always ... — are mutually
+    // independent" — and stays on the per-slot path below.
     let reified: Vec<(usize, Symbol, NodeId)> = inner
         .iter()
         .enumerate()
@@ -5376,16 +5377,18 @@ fn lower_joint(
     if reified.len() >= 2 {
         let record_fields: Vec<(Symbol, NodeId)> =
             reified.iter().map(|&(_, name, x)| (name, x)).collect();
-        let record_node = build_record(m, &record_fields);
-        let lawof_node = build_call(m, "lawof", &[record_node]);
-        let mut value_fields = Vec::with_capacity(reified.len());
+        let mut pinned_fields = Vec::with_capacity(reified.len());
         for &(i, name, _) in &reified {
             let idx = m.alloc(Node::Lit(Scalar::Int(i as i64)));
             let elem = build_call(m, "get0", &[v, idx]);
-            value_fields.push((name, elem));
+            pinned_fields.push((name, elem));
         }
-        let value_record = build_record(m, &value_fields);
-        terms.push(lower_measure_density(m, lawof_node, value_record)?);
+        terms.push(lower_reified_joint_group(
+            m,
+            &record_fields,
+            &pinned_fields,
+            VariateOrigin::Other,
+        )?);
     }
     for (i, &mi) in inner.iter().enumerate() {
         if reified.len() >= 2 && reified.iter().any(|&(ri, _, _)| ri == i) {
@@ -5398,10 +5401,31 @@ fn lower_joint(
     Ok(fold_add(m, &terms))
 }
 
+/// The shared tail of the reified-group rewrite both [`lower_joint`]'s positional path and
+/// [`lower_keyword_joint`] use (§06 "Reified components share their ancestry"): build
+/// `record(name₁ = x₁, …)` from the reified components' own values, wrap it in `lawof`, and
+/// score it at the matching value record `record(name₁ = pinned₁, …)` — through
+/// `lower_measure_density_at`, the same dispatcher entry a written `lawof(record(...))`
+/// reaches. The two callers differ only in how each name's reified value and pinned point
+/// are obtained (`get0(v, i)` slices for the positional `cat` form, record-field lookup for
+/// the keyword form), so only that gathering stays in each caller.
+fn lower_reified_joint_group(
+    m: &mut Module,
+    reified: &[(Symbol, NodeId)],
+    pinned: &[(Symbol, NodeId)],
+    origin: VariateOrigin,
+) -> Result<NodeId, RefuseError> {
+    let record_node = build_record(m, reified);
+    let lawof_node = build_call(m, "lawof", &[record_node]);
+    let value_record = build_record(m, pinned);
+    lower_measure_density_at(m, lawof_node, value_record, origin)
+}
+
 /// A joint component is REIFIED (§06 "Reified components share their ancestry") when it
 /// is a bare `lawof(x)` call, one ref hop resolved. Returns the reified value `x`. A
 /// distribution CONSTRUCTOR component (`Normal(...)`) never matches this, whatever its own
-/// parameters reference — it is always a fresh draw (§06 "Mixed components").
+/// parameters reference — it is always a fresh draw (§06 "Joint composition": "distribution
+/// constructors always" share no stochastic ancestor with any other component).
 fn reified_lawof_arg(m: &Module, measure: NodeId) -> Option<NodeId> {
     let (resolved, _) = resolve_ref_one(m, measure);
     let c = expect_builtin_call(m, resolved, "lawof")?;
@@ -5414,16 +5438,17 @@ fn reified_lawof_arg(m: &Module, measure: NodeId) -> Option<NodeId> {
 /// the joint's named components — unlike the positional form's flat `cat` vector, so there
 /// is no `get0`-slicing.
 ///
-/// **Reified components share their ancestry** (§06 "Joint composition"; §04 "Reified
-/// components share their ancestry"): two or more NAMED components that are bare
-/// `lawof(x)` calls are scored as `lawof(record(name₁ = x₁, …))` — built here and
-/// dispatched through that spelling's OWN machinery, not re-derived. That one lowering
-/// already covers the shared-latent record law when the reified traces share a
-/// stochastic ancestor, the refusal for a singular joint (the same draw referenced twice,
-/// or a deterministic transform of another component's draw — §04 "Singular joints"), and
-/// the per-field fallback when the traces are disjoint. A distribution CONSTRUCTOR
-/// component (`Normal(...)`) is always a fresh draw — §06 "Mixed components" — so it is
-/// excluded from the group and scored on its own, below, exactly as before this rewrite.
+/// **Reified components share their ancestry** (§06 "Joint composition", the heading of
+/// that name): two or more NAMED components that are bare `lawof(x)` calls are scored as
+/// `lawof(record(name₁ = x₁, …))` — built here and dispatched through that spelling's OWN
+/// machinery, not re-derived. That one lowering already covers the shared-latent record
+/// law when the reified traces share a stochastic ancestor, the refusal for a singular
+/// joint (the same draw referenced twice, or a deterministic transform of another
+/// component's draw — §06 "Singular joints"), and the per-field fallback when the traces
+/// are disjoint. A distribution CONSTRUCTOR component (`Normal(...)`) is always a fresh
+/// draw — §06 "Joint composition": "distribution constructors always" share no stochastic
+/// ancestor with any other component — so it is excluded from the group and scored on its
+/// own, below, exactly as before this rewrite.
 ///
 /// Each non-grouped component is matched to its OWN record field by name and scored there
 /// directly, whatever shape that field's value has — the downstream `lower_measure_density`
@@ -5487,9 +5512,7 @@ fn lower_keyword_joint(
 
     let mut terms = Vec::with_capacity(named.len());
     if reified.len() >= 2 {
-        let record_node = build_record(m, &reified);
-        let lawof_node = build_call(m, "lawof", &[record_node]);
-        let mut value_fields = Vec::with_capacity(reified.len());
+        let mut pinned_fields = Vec::with_capacity(reified.len());
         for &(name, _) in &reified {
             let pinned = lookup_field(m, &vrec_named, name).ok_or_else(|| {
                 refuse(
@@ -5498,13 +5521,12 @@ fn lower_keyword_joint(
                     &format!("missing field {} in joint value record", m.resolve(name)),
                 )
             })?;
-            value_fields.push((name, pinned));
+            pinned_fields.push((name, pinned));
         }
-        let value_record = build_record(m, &value_fields);
-        terms.push(lower_measure_density_at(
+        terms.push(lower_reified_joint_group(
             m,
-            lawof_node,
-            value_record,
+            &reified,
+            &pinned_fields,
             origin,
         )?);
     }

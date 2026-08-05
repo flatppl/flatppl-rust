@@ -841,7 +841,7 @@ lp = logdensityof(lawof(record(y1 = y1)), record(y1 = 0.5))"),
     );
 }
 
-// §04 "Reified components share their ancestry" makes `joint(a = lawof(y1), b =
+// §06 "Reified components share their ancestry" makes `joint(a = lawof(y1), b =
 // lawof(y2))` equivalent to `lawof(record(a = y1, b = y2))`: the shared ancestor is traced
 // once and the dependence is retained, so a keyword `joint` over two reified components now
 // reaches the SAME shared-latent record law as the plain record spelling — the correlated
@@ -912,7 +912,49 @@ lp = logdensityof(iid(lawof(y1), 2), [0.5, 0.7])"),
     );
 }
 
-// §04 "Singular joints": the same draw referenced twice, or a component that is a
+// The POSITIONAL form of the same rewrite: §06 "Joint composition" says "the positional
+// form is the corresponding `cat` law", so `joint(lawof(y1), lawof(y2))` reaches the SAME
+// record-law machinery as the keyword spelling above, via synthetic field names and a
+// value record sliced from the flat `cat` variate with `get0`. UNEQUAL sigmas, not the
+// keyword test's equal pair: at (0.5, 0.7) equal sigmas make the quadratic form symmetric
+// in the two fields, so an equal-sigma point cannot catch a slot swap (pairing σ to the
+// wrong field). `σ = (1, 3)` does: `Σ = [[2,1],[1,10]]`, det 19, quad = 2.78/19 =
+// 0.1463157894736842, against 0.24736842105263157 if the sigmas were paired to the wrong
+// slots (`Σ = [[10,1],[1,2]]` at the same point).
+#[test]
+fn a_positional_joint_over_a_shared_latent_reaches_the_record_law() {
+    let lp = pir_binding(
+        &pir("\
+z = draw(Normal(mu = 0.0, sigma = 1.0))
+y1 = draw(Normal(mu = z, sigma = 1.0))
+y2 = draw(Normal(mu = z, sigma = 3.0))
+lp = logdensityof(joint(lawof(y1), lawof(y2)), [0.5, 0.7])"),
+        "lp",
+    );
+    assert!(
+        lp.contains("(mul -0.5 ") && lp.contains("3.6757541328186907"),
+        "−½ over the flat sum, opening with 2·log 2π:\n{lp}"
+    );
+    assert!(
+        lp.contains("(log 1.0)") && lp.contains("(log 9.0)"),
+        "log σᵢ² for σ = (1, 3):\n{lp}"
+    );
+    assert!(
+        lp.contains("(log1p 1.1111111111111112)"),
+        "k = 1²·(1/1 + 1/9):\n{lp}"
+    );
+    assert!(
+        lp.contains(" 0.1463157894736842)"),
+        "the Sherman–Morrison quadratic form; a σ/slot mispairing gives \
+         0.24736842105263157:\n{lp}"
+    );
+    assert!(
+        !lp.contains("builtin_logdensityof"),
+        "the joint is one expression, not a product of scored marginals:\n{lp}"
+    );
+}
+
+// §06 "Singular joints": the same draw referenced twice, or a component that is a
 // deterministic transform of another component's draw, has no density w.r.t. the product
 // reference measure — refused rather than mislowered to a product. Positional `joint`
 // reaches this via the SAME record-law rank check `match_independent_record` already runs
@@ -948,8 +990,10 @@ lp = logdensityof(joint(lawof(a), lawof(exp(a))), [0.5, 0.7])",
     }
 }
 
-// Mixed components (§06 "Mixed components"): a distribution CONSTRUCTOR component is
-// always a fresh draw, so dependence handling applies only among the REIFIED components.
+// Mixed components (§06 "Joint composition": "Components that share no stochastic
+// ancestor — distribution constructors always ... — are mutually independent"): a
+// distribution CONSTRUCTOR component is always a fresh draw, so dependence handling
+// applies only among the REIFIED components.
 // `x = lawof(a)` shares `a`'s ancestor `z`, but the sole OTHER component here is a bare
 // `Normal(0, 1)` constructor — nothing to correlate with — so `x` keeps its own marginal
 // and `y` scores as an ordinary independent factor.

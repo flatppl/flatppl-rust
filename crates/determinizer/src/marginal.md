@@ -650,7 +650,7 @@ of these keeps the shared-latent refusal, and each is pinned by a test:
   this row with `w`'s own — correct in principle, and outside the decided scope.
 
 `iid` over the same model still emits the PRODUCT: it redraws its reified sub-DAG afresh
-per copy and never shares ancestors (§06 "iid" entry). `joint` no longer does — §04 "Reified
+per copy and never shares ancestors (§06 "iid" entry). `joint` no longer does — §06 "Reified
 components share their ancestry" makes `joint(a = lawof(y1), b = lawof(y2))` equivalent to
 `lawof(record(a = y1, b = y2))`, so a keyword `joint` over two or more reified components
 now reaches this SAME law (`crates/determinizer/src/density.rs`, `lower_keyword_joint`'s
