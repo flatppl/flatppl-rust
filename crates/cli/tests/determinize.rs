@@ -210,10 +210,10 @@ fn fixture_query_corpus_lowers_or_documented_refuse() {
     }
 }
 
-/// Pass 4 Task A review Fix 2: `--keep <name>` (repeatable) runs root-based DCE
-/// (Buffy #263 Pass 4-A) through the real CLI binary. Without `--keep`, the
-/// unreachable `dead1 = 42.0` binding survives (zeroed-or-as-is, current
-/// keep-all behavior); with `--keep __score__`, only `__score__` (and its
+/// `--keep <name>` (repeatable) runs root-based DCE through the real CLI
+/// binary. Without `--keep`, the unreachable `dead1 = 42.0` binding survives
+/// (zeroed-or-as-is, current keep-all behavior); with `--keep __score__`, only
+/// `__score__` (and its
 /// transitive deps — here none, since it lowers to a self-contained
 /// `builtin_logdensityof` call) survives, and the unreachable `dead1` binding
 /// is dropped entirely from the emitted FlatPPL.

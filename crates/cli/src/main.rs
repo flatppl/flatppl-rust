@@ -588,9 +588,9 @@ fn load_and_infer(
 /// measure layer), printing to `output`/stdout in `emit`'s form (canonical
 /// FlatPPL syntax by default, FlatPIR with `--emit flatpir`). With one or
 /// more `--keep <name>`, only bindings reachable from those requested-output
-/// roots survive (root-based DCE, Buffy #263 Pass 4-A); with none, every
-/// binding is kept (unchanged behavior). Refuses (exit 3, via
-/// `Failure::Refuse`) any construct the determiniser cannot legalize.
+/// roots survive (root-based DCE); with none, every binding is kept (unchanged
+/// behavior). Refuses (exit 3, via `Failure::Refuse`) any construct the
+/// determiniser cannot legalize.
 #[cfg(feature = "determinize")]
 fn determinize_cmd(
     input: &Path,

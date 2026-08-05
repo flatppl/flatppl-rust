@@ -162,7 +162,8 @@ impl Module {
     /// rest from iteration (`order`) and name lookup (`by_name`). The dropped
     /// bindings' arena slots are not reclaimed (the arena has no removal), but they
     /// become unreachable: `bindings()`, the writer, and `binding_by_name` no
-    /// longer see them. Used by the determiniser's root-based DCE (Pass 4 / #263).
+    /// longer see them. Used by the determiniser's root-based dead-code
+    /// elimination, which keeps only the bindings a requested output reaches.
     pub fn retain_bindings(&mut self, keep: &std::collections::HashSet<BindingId>) {
         self.order.retain(|id| keep.contains(id));
         self.by_name.retain(|_name, id| keep.contains(id));

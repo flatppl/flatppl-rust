@@ -51,7 +51,7 @@ fn emit_stub_on_flatpdl_returns_module() {
 // emitter's `broadcast` lowering must run the rank-agnostic Normal logpdf over
 // the rank-1 (`3x`) batch, scalars auto-broadcasting, then reduce. Verified
 // out-of-tree to IREE-execute == scipy oracle (linear_regression/partial_pooling);
-// this golden pins the emit + the batched shape. Buffy #303 (broadcast gap).
+// this golden pins the emit + the batched shape.
 #[test]
 fn broadcast_iid_likelihood_lowers_to_batched_density() {
     let src = "flatppl_compat = \"0.1\"\n\
@@ -247,7 +247,7 @@ outputs = (q)
 // reified `functionof` elementwise: bind each input (by keyword name / position)
 // and lower the body, whose arithmetic auto-broadcasts scalar↔rank-1. This is
 // the ex_poisson_glm_link posterior; verified out-of-tree to Enzyme-execute ==
-// scipy oracle (Δ≈2.5e-6 f32) at the corpus theta points. Buffy #328.
+// scipy oracle (Δ≈2.5e-6 f32) at the corpus theta points.
 #[test]
 fn broadcast_of_user_function_monomorphises_elementwise() {
     let src = "flatppl_compat = \"0.1\"\n\
@@ -295,7 +295,7 @@ outputs = (score)\n";
 
 // `invlogit(x)` (§07 logistic sigmoid, e.g. a logit-link GLM's inverse link)
 // lowers to the native, numerically-stable `stablehlo.logistic` op. Verified
-// out-of-tree to IREE-execute == scipy `expit` oracle (Δ≈2e-8). Buffy #303.
+// out-of-tree to IREE-execute == scipy `expit` oracle (Δ≈2e-8).
 #[test]
 fn invlogit_lowers_to_stablehlo_logistic() {
     let src = "flatppl_compat = \"0.1\"\n\
@@ -8563,8 +8563,7 @@ fn emit_sample_dirichlet_iid_matches_frozen_golden() {
     );
 }
 
-// ---- fan-out for discrete inverse-CDF Poisson + NegativeBinomial (buffy #148,
-// #156b) ---------------------------------------------------------------------
+// ---- fan-out for discrete inverse-CDF Poisson + NegativeBinomial ------------
 //
 // Poisson's scalar draw is a bounded inverse-CDF `stablehlo.while` (walk the CDF
 // until `U <= F(k)`). The fanned draw batches that walk PER LANE via
@@ -8711,8 +8710,7 @@ fn emit_sample_negative_binomial2_iid_matches_frozen_golden() {
     );
 }
 
-// ---- fan-out for elementwise Laplace/Bernoulli/Geometric (buffy #148, #155,
-// #156a) --------------------------------------------------------------------
+// ---- fan-out for elementwise Laplace/Bernoulli/Geometric -------------------
 //
 // Bernoulli/Geometric were left off `FANOUT_SAFE` alongside the genuinely
 // `while`/unrolled discrete samplers, and Laplace was left off scoped to Task
@@ -8871,8 +8869,7 @@ fn emit_sample_geometric_iid_matches_frozen_golden() {
     );
 }
 
-// ---- fan-out for discrete non-elementwise Binomial + Categorical (buffy #148,
-// #156b) ---------------------------------------------------------------------
+// ---- fan-out for discrete non-elementwise Binomial + Categorical -----------
 //
 // Unlike the Tier-1 elementwise discrete samplers (Bernoulli/Geometric), these
 // two have a scalar draw that is NOT purely elementwise, yet each fans out
@@ -9389,7 +9386,7 @@ outputs = q1
     );
 }
 
-// ---- Buffy #327: `builtin_touniform` (univariate continuous CDF) ------------
+// ---- `builtin_touniform` (univariate continuous CDF) -----------------------
 //
 // Spec §07 "Measure kernel evaluation primitives": for kernels of univariate
 // continuous measures, `builtin_touniform(kernel, kernel_input, x)` is the
@@ -9556,7 +9553,7 @@ fn builtin_touniform_refuses_non_const_kernel() {
     assert_eq!(err.node, Some(kernel));
 }
 
-// Regression (Buffy #376): a `table(...)` / `record(...)` field access
+// Regression: a `table(...)` / `record(...)` field access
 // `t.field` lowers as `get(t, "field")` (a string selector). The emitter must
 // project the named COLUMN of the table/record literal — not try to lower the
 // aggregate as a tensor, which refuses `unsupported builtin head 'table'`
@@ -9588,7 +9585,7 @@ outputs = (lp)\n";
     );
 }
 
-// Regression (Buffy #377): a query whose EVERY density term is the axis-native
+// Regression: a query whose EVERY density term is the axis-native
 // broadcast form `sum(broadcast(builtin_logdensityof, ...))` (here two iid
 // priors + an iid Bernoulli likelihood, all dotted — the rasch-1pl shape) must
 // pass `emit_logdensity`'s query-output guard. The guard's
