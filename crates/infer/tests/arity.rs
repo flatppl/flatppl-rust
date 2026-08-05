@@ -143,13 +143,17 @@ fn named_arguments_count_toward_arity() {
 /// §04 scopes auto-splatting to "built-in or user defined value functions,
 /// constructors or transition kernels", and its `fchain` paragraph relies on it
 /// ("if `f1` returns a record and `f2` accepts keyword arguments matching the
-/// record fields, the two functions compose directly"), so a USER call counts a
-/// sole record argument by its fields too. Two corpus models are this shape —
-/// `simple-transport2.flatppl`'s `k_model(glob_pars)` and `feature-test1
-/// .flatppl`'s `forward_kernel(rand_pars)` — and both were falsely rejected
-/// while the user-call path counted a sole record as one argument.
+/// record fields, the two functions compose directly"), so a USER call must be
+/// able to count a sole record argument by its fields. Two corpus models are this
+/// shape — `simple-transport2.flatppl`'s `k_model(glob_pars)` and `feature-test1
+/// .flatppl`'s `forward_kernel(rand_pars)` — and both were falsely rejected while
+/// the user-call path counted a sole record as one argument.
+///
+/// That the splat reading must be AVAILABLE is settled; whether it is the only
+/// available one is the open §04 question pinned by
+/// `a_sole_record_is_accepted_as_one_argument_pending_the_open_sec04_question`.
 #[test]
-fn a_user_call_splats_a_sole_record_argument_too() {
+fn a_user_call_can_splat_a_sole_record_argument() {
     let f = "lin(a, b, mu) = add(a, add(b, mu))\n\
              pars = record(a = 1.0, b = 2.0, mu = 3.0)\n";
     assert!(
@@ -170,20 +174,27 @@ fn a_user_call_splats_a_sole_record_argument_too() {
     );
 }
 
-/// §04 gives a sole record argument two readings and does not disambiguate them
-/// for a positional call, so a callee EITHER reading satisfies is not a mis-arity
-/// call. Both readings are live in the corpus: `simple-transport1.flatppl`'s
-/// `generator = kernelof(x, pars = pars)` takes a record as its ONE `pars`
-/// parameter, while `k_model` splats one of the same shape into three. Preferring
-/// the splat unconditionally falsely rejects the former.
+/// INTERIM, pending an open §04 question — this pins today's permissive choice,
+/// not a settled rule. §04 enumerates exactly two non-splat cases ("a record given
+/// alongside other arguments, or bound to a parameter by keyword"), and a
+/// positional sole record is neither, so the most direct reading is that it ALWAYS
+/// splats — under which this very model is invalid. Two anchors lean toward a
+/// splat conditioned on the names corresponding: §04's `fchain` paragraph, and
+/// `determinizer::sample::record_splat_mismatch`. Until the question is settled,
+/// inference accepts a call that either reading satisfies, so it rejects no model
+/// under either resolution — and this shape, which the corpus uses
+/// (`simple-transport1.flatppl:20`'s `generator(pars)` against
+/// `generator = kernelof(x, pars = pars)`), keeps typing.
+///
+/// If §04 resolves to always-splat, this test should invert rather than be deleted.
 #[test]
-fn a_sole_record_may_also_be_the_one_ordinary_argument() {
+fn a_sole_record_is_accepted_as_one_argument_pending_the_open_sec04_question() {
     let src = "pars = record(a = 1.0, b = 2.0, mu = 3.0)\n\
                takes_a_record(p) = get(p, [\"a\"])\n\
                y = takes_a_record(pars)";
     assert!(
         errors(src).is_empty(),
-        "a 3-field record is also a valid single argument to a 1-parameter callable"
+        "a 3-field record is accepted as a single argument to a 1-parameter callable"
     );
 }
 

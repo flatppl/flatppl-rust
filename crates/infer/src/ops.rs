@@ -2688,7 +2688,8 @@ fn arity_check(
     let got = reading.count;
     if arity.admits(got) {
         // The count is right; the names still have to be the declared ones.
-        // Only distribution rows declare names (see `base_param_names`).
+        // Only distribution rows declare names, so `?` here means "this row
+        // declares none — accept the call", not a failure to propagate.
         let names = cat.base_param_names(name)?.to_vec();
         return arg_name_check(
             inf,
@@ -2715,7 +2716,7 @@ fn arity_check(
     ))
 }
 
-/// How §04 reads a call's arguments against a declared parameter count.
+/// How a call's arguments read against a declared parameter count.
 struct ArgReading {
     /// The argument count the admitting reading supplies.
     count: usize,
@@ -2724,8 +2725,7 @@ struct ArgReading {
     splatting: bool,
 }
 
-/// The §04 reading of a call's arguments, or `None` when no reading can be
-/// trusted.
+/// The reading of a call's arguments, or `None` when no reading can be trusted.
 ///
 /// The plain reading counts positional plus keyword arguments: every §07
 /// parameter and every §08 distribution parameter is nameable (§04 "Calling
@@ -2733,17 +2733,28 @@ struct ArgReading {
 /// accept both positional and keyword arguments"), so `checked(value_expr,
 /// condition = …)` and `Normal(mu = m, sigma = s)` each supply two.
 ///
-/// A record or table given as the call's SOLE argument admits a second reading —
-/// §04 auto-splatting, "`f(record(a = x, b = y, ...))` and `f(table(a = x, b = y,
-/// ...))` are equivalent to `f(a = x, b = y, ...)`" — supplying one argument per
-/// field. §04 does not disambiguate the two for a positional call, and both are
-/// live in the corpus: a 3-field record fills `k_model`'s three parameters by
-/// splatting, while `generator = kernelof(x, pars = pars)` takes the same kind of
-/// record as its ONE `pars` parameter. So a callee that either reading satisfies
-/// is not a mis-arity call, and picking one over the other would invent a rule
-/// the spec does not state. `splatting` is set only when the splat reading is the
-/// only fit, so an ambiguous call is never name-checked against fields that may
-/// not be binding.
+/// A record or table given as the call's SOLE argument may instead auto-splat —
+/// §04: "`f(record(a = x, b = y, ...))` and `f(table(a = x, b = y, ...))` are
+/// equivalent to `f(a = x, b = y, ...)`" — supplying one argument per field.
+///
+/// **This is an INTERIM resolution of an open §04 question, not settled spec.**
+/// §04 enumerates exactly two cases that do NOT splat — "a record given alongside
+/// other arguments, or bound to a parameter by keyword" — and a positional sole
+/// record is neither, so the most direct reading is that it ALWAYS splats. Under
+/// that reading `generator = kernelof(x, pars = pars)` called as `generator(pars)`
+/// (`simple-transport1.flatppl:20`, and `transport-model.flatppl`) is invalid.
+/// Two anchors lean the other way, toward a splat conditioned on the names
+/// corresponding: §04's `fchain` paragraph ("if `f1` returns a record and `f2`
+/// accepts keyword arguments matching the record fields, the two functions compose
+/// directly"), and `determinizer::sample::record_splat_mismatch`, which already
+/// resolves the same ambiguity by name correspondence.
+///
+/// Pending that question, this accepts a call that EITHER reading satisfies,
+/// which rejects no model under either resolution. The cost is that a callee the
+/// plain reading already satisfies is never name-checked — see the TODO entry for
+/// the ten single-parameter §08 rows this blinds. `splatting` is set only when the
+/// splat reading is the only fit, so an ambiguous call is never name-checked
+/// against fields that may not be binding.
 ///
 /// When such an argument's type is still open, neither reading is knowable.
 fn arg_reading(
@@ -2765,6 +2776,8 @@ fn arg_reading(
         Type::Deferred | Type::Var(_) | Type::Any | Type::Failed(_) => return None,
         _ => return plain_reading,
     };
+    // The plain reading wins ties only because it is the conservative half of the
+    // open question above, not because §04 prefers it.
     if admits(plain) {
         return plain_reading;
     }
