@@ -62,7 +62,9 @@ fn pushfwd_affine_lambda_lowers() {
 
 #[test]
 fn pushfwd_composition_exp_affine_lowers() {
-    // x -> exp(2*x) : chain. f_inv(y) = log(y)/2 ; logvol = log(2) + 2x  (chain rule).
+    // x -> exp(2*x) : chain. f_inv(y) = log(y)/2 ; logvol = log(y) + log(2).
+    // f'(x) = 2e^{2x}, and at x = f_inv(y) that is 2y, so log|f'| = log y + log 2 —
+    // the chain rule with each term taken at its own op's OUTPUT.
     let p = pir(
         "d = pushfwd(x -> exp(2.0 * x), Normal(mu = 0.0, sigma = 1.0))\nlp = logdensityof(d, 0.5)",
     );
@@ -77,14 +79,19 @@ fn pushfwd_composition_exp_affine_lowers() {
         p.contains("(divide") && p.contains("(log ") && p.contains("(ifelse"),
         "inverse log(y)/2 present:\n{p}"
     );
-    // Chain-rule logvol: the exp term contributes the partial-forward 2x,
-    // evaluated at x = f_inv(0.5) = log(0.5)/2 (the SAME inlined inverse
-    // expression, consistently substituted — `mul(2.0, divide(log(0.5), 2.0))`);
-    // the affine term contributes log|2| = log(abs(2)).
+    // Chain-rule logvol: `exp`'s term sits at `exp`'s own output, which IS the
+    // query point, so it is `log(y')` and not the partial-forward `2x` reached
+    // through `f_inv`; the affine term contributes log|2| = log(abs(2)).
     assert!(
-        p.contains("(mul 2.0 (%meta ((%scalar real) %fixed reals) (divide")
+        !p.contains("(mul 2.0 (%meta ((%scalar real) %fixed reals) (divide")
             && p.contains("(abs 2.0)"),
-        "chain-rule logvol (2*f_inv(0.5) + log 2) present:\n{p}"
+        "chain-rule logvol (log y + log 2) present, with no 2·f_inv(y) term:\n{p}"
+    );
+    // No round trip: `exp` is applied only to the literal inside the gate's witness
+    // (once per `ifelse`, since this emitter has no CSE), never to `f_inv(y)`.
+    assert!(
+        !p.contains("(exp (%meta"),
+        "the forward `exp` must not be re-applied to the inverse:\n{p}"
     );
 }
 
@@ -355,53 +362,61 @@ fn pushfwd_elementwise_exp_lowers() {
         p.contains("(broadcast log"),
         "f_inv = broadcast(log, y) present:\n{p}"
     );
-    // The per-cell logvol identity map `x -> x` is a NESTED reification
-    // (`functionof(_x_ -> _x_)`, boundary name `_x_`) sitting INSIDE the body
-    // of the OUTER logvol reification (also boundary name `_x_`, per the
-    // synthesizer's uniform placeholder naming — see `kernel::shadows_name`).
-    // Pass 2 must inline the outer call WITHOUT capturing the inner one's own
-    // `_x_`: the inner identity's body must survive as the bare placeholder
-    // ref, not get rewritten to the outer's substituted value.
+    // The per-cell logvol map `y -> log(y)` is a NESTED reification (boundary name
+    // `_x_`) sitting INSIDE the body of the OUTER logvol reification (also boundary
+    // name `_x_`, per the synthesizer's uniform placeholder naming — see
+    // `kernel::shadows_name`). Pass 2 must inline the outer call WITHOUT capturing
+    // the inner one's own `_x_`: the inner body must survive referencing the bare
+    // placeholder, not get rewritten to the outer's substituted value.
     assert!(
-        p.contains("(functionof (%ref %local _x_) %specinputs ((x (%ref %local _x_))))"),
-        "nested per-cell identity map must keep its OWN _x_ unsubstituted (no capture):\n{p}"
+        p.contains(
+            "(functionof (%meta ((%scalar real) %parameterized reals) (log (%ref %local _x_))) \
+             %specinputs ((x (%ref %local _x_))))"
+        ),
+        "nested per-cell map must keep its OWN _x_ unsubstituted (no capture):\n{p}"
+    );
+    // `exp`'s per-cell volume term is `log(yᵢ)` at the cell's own output, so the SUM
+    // reduces the query vector directly. Reached through the preimage it would read
+    // `broadcast(log, …)` twice — once for `f_inv`, once under `sum`.
+    assert_eq!(
+        p.matches("(broadcast log").count(),
+        1,
+        "the sole `broadcast log` is f_inv; the volume reads the query point:\n{p}"
     );
 }
 
 #[test]
-fn pushfwd_elementwise_byte_equals_explicit() {
+fn pushfwd_elementwise_both_spellings_byte_equal() {
     // pushfwd_elementwise_exp_lowers only substring-matches (`(sum ...`,
     // `(broadcast log`); the matrix arm added a non-degenerate byte-equal test
     // (pushfwd_matrix_affine_nonidentity_logdet) specifically because substring
-    // matches can miss a sign/shape bug that a full structural pin catches.
-    // Byte-equal the synthesized elementwise bijection against the explicit
-    // `bijection(f, f_inv, logvol)` form it should be identical to:
-    //   f_inv(y)   = broadcast(log, y)          (per-cell scalar inverse)
-    //   logvol(x)  = sum(broadcast(x -> x, x))  (diagonal log-det: g_logvol for
-    //                                             exp is the identity, per-cell,
-    //                                             summed)
-    // `f_inv`/`logvol` are spelled `x -> ...` (not `fn(_)`) because the
-    // synthesizer always names its emitted lambdas' boundary "x"/"_x_"
-    // ([`lambda`] in invert.rs) — spelling the explicit comparison form with
-    // `fn(_)` sugar (which names its placeholder differently) would break byte
-    // equality for a reason unrelated to the change-of-variables, exactly as
-    // pushfwd_bare_exp_lowers_like_explicit_bijection's doc comment notes for
-    // the dead-binding pitfall. The explicit bijection is inlined (not bound to
-    // a name) for the same reason.
-    let synth = pir(
+    // matches can miss a sign/shape bug that a full structural pin catches. The
+    // non-degenerate pin here is §06's OWN invariant — the two spellings of the
+    // same elementwise map must lower identically, since §06 nowhere distinguishes
+    // `pushfwd(g, M)` from `pushfwd(x -> broadcast(g, x), M)` and
+    // [`wrap_elementwise`] is their single emission site:
+    //   f_inv(y)  = broadcast(log, y)                 (per-cell scalar inverse)
+    //   logvol(y) = sum(broadcast(y -> log(y), y))    (diagonal log-det, per-cell
+    //                                                  `log|g'(g⁻¹(yᵢ))| = log yᵢ`,
+    //                                                  summed)
+    //
+    // This pin USED to be against an explicit `bijection(f, x -> broadcast(log,
+    // x), x -> sum(broadcast(x -> x, x)))`. No explicit annotation can match any
+    // more: the synthesised logvol is a function of the QUERY point while an
+    // annotation's is a function of the forward input applied at the preimage
+    // (§06 → "Engine contract for `pushfwd` density evaluation"), so reproducing
+    // `sum(broadcast(log, v))` from `broadcast(log, v)` would need the forward back —
+    // the round trip the query-point spelling exists to remove.
+    let bare = pir("d = pushfwd(exp, iid(Normal(mu = 0.0, sigma = 1.0), 3))\n\
+         lp = logdensityof(d, [0.5, 0.6, 0.7])");
+    let lambda = pir(
         "d = pushfwd(fn(broadcast(exp, _)), iid(Normal(mu = 0.0, sigma = 1.0), 3))\n\
          lp = logdensityof(d, [0.5, 0.6, 0.7])",
     );
-    let explicit = pir(
-        "d = pushfwd(bijection(fn(broadcast(exp, _)), x -> broadcast(log, x), \
-         x -> sum(broadcast(x -> x, x))), iid(Normal(mu = 0.0, sigma = 1.0), 3))\n\
-         lp = logdensityof(d, [0.5, 0.6, 0.7])",
-    );
-    assert!(synth.contains("builtin_logdensityof"), "got:\n{synth}");
+    assert!(bare.contains("builtin_logdensityof"), "got:\n{bare}");
     assert_eq!(
-        synth, explicit,
-        "synthesized elementwise bijection must match the explicit \
-         bijection(f, x -> broadcast(log, x), x -> sum(broadcast(x -> x, x))) form"
+        bare, lambda,
+        "the bare and broadcast spellings of the same elementwise map must lower identically"
     );
 }
 
@@ -636,28 +651,44 @@ fn domain_restricted_forward_over_wrong_support_still_refuses_both_spellings() {
 #[test]
 fn registry_op_inside_a_composition_lowers_with_the_chain_rule() {
     // The registry share must hold at CHAIN DEPTH, not just for the one-op
-    // spelling: `derive_chain` sums each op's LOCAL forward log-derivative at its
-    // own PARTIAL-FORWARD point, so for `f = tanh ∘ (2·)` the `tanh` term is
-    // `log(1 − tanh(2x)²)` — evaluated at `2x`, NOT at `x` — plus the affine
-    // `log|2|`. Byte-equal against the explicit `bijection(f, f_inv, logvol)`
-    // form, which pins the whole change of variables (a term evaluated at the
-    // wrong point, or a dropped term, fails here; a substring probe would not):
+    // spelling. `derive_chain` sums each op's LOCAL log-derivative at its OWN
+    // OUTPUT, so for `f = tanh ∘ (2·)`:
     //   f_inv(y)  = atanh(y) / 2
-    //   logvol(x) = log(1 − tanh(2x)²) + log|2|
-    let synth = pir(
+    //   logvol(y) = log1p(−y²) + log|2|
+    // which is the closed form: `f'(x) = 2·(1 − tanh²(2x))`, and at
+    // `x = atanh(y)/2` the inner `tanh(2x)` IS `y`, so `log|f'| = log(1 − y²) +
+    // log 2`. The `tanh` term therefore sits at the chain's OUTPUT (the query
+    // point), and the affine one contributes a constant.
+    //
+    // A byte-equal pin against an explicit `bijection(f, f_inv, logvol)` is no
+    // longer possible — an annotation's logvol is a function of the forward input,
+    // applied at the preimage (§06 → "Engine contract for `pushfwd` density
+    // evaluation"), so it could only reach `y` by re-applying `tanh`, the round trip
+    // this spelling removes. The three
+    // assertions below pin the same three things that pin caught: WHICH point each
+    // term is taken at, that neither term is dropped, and that no term round-trips.
+    let p = pir(
         "d = pushfwd(x -> tanh(2.0 * x), Normal(mu = 0.0, sigma = 1.0))\n\
          lp = logdensityof(d, 0.5)",
     );
-    let explicit = pir(
-        "d = pushfwd(bijection(x -> tanh(2.0 * x), x -> atanh(x) / 2.0, \
-         x -> log(1.0 - pow(tanh(2.0 * x), 2.0)) + log(abs(2.0))), \
-         Normal(mu = 0.0, sigma = 1.0))\n\
-         lp = logdensityof(d, 0.5)",
+    assert!(p.contains("builtin_logdensityof"), "got:\n{p}");
+    // The base is scored at the preimage `atanh(y')/2`, `y'` the sanitised point.
+    assert!(
+        p.contains("(divide (%meta ((%scalar real) %fixed reals) (atanh (%meta"),
+        "f_inv = atanh(y)/2 present:\n{p}"
     );
-    assert!(synth.contains("builtin_logdensityof"), "got:\n{synth}");
-    assert_eq!(
-        synth, explicit,
-        "tanh∘(2·) must synthesize f_inv = atanh(y)/2 and logvol = log(1 − tanh(2x)²) + log|2|"
+    // `tanh`'s term is `log1p(−y'²)` — the `pow` reads the gate's `ifelse` on the
+    // QUERY point directly, not the preimage — and the affine term is log|2|.
+    assert!(
+        p.contains("(log1p (%meta ((%scalar real) %fixed reals) (neg (%meta ((%scalar real) %fixed reals) (pow (%meta ((%scalar real) %fixed reals) (ifelse")
+            && p.contains("(log (%meta ((%scalar real) %fixed nonnegreals) (abs 2.0)))"),
+        "chain-rule logvol log1p(−y²) + log|2| present, both terms:\n{p}"
+    );
+    // No round trip: `tanh` is applied only to the literal `2.0` inside the gate's
+    // witness, never to a computed expression such as the preimage.
+    assert!(
+        !p.contains("(tanh (%meta"),
+        "the forward `tanh` must not be re-applied to the inverse:\n{p}"
     );
 }
 

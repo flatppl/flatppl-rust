@@ -205,16 +205,17 @@ fn pushfwd_pow_over_discrete_nonnegative_support_lowers() {
 fn pushfwd_sqrt_over_continuous_nonnegative_support_lowers_with_its_volume_term() {
     // A CONTINUOUS base on `nonnegreals` — `interval(0, 5)`, whose lower endpoint
     // is `sqrt`'s domain boundary. It lies inside `nonnegreals`, so it lowers, and
-    // being Lebesgue it keeps its volume term `log|k| + (k−1)·log x` at k = ½. The
-    // regression half of the domain widening: it must not stop applying.
+    // being Lebesgue it keeps its volume term `log|k| + ((k−1)/k)·log y` at k = ½,
+    // whose coefficient is −1. The regression half of the domain widening: it must
+    // not stop applying.
     let p = pir("d = pushfwd(sqrt, Uniform(interval(0.0, 5.0)))\nlp = logdensityof(d, 1.0)");
     assert!(
         p.contains("builtin_logdensityof Uniform") && p.contains("(sub "),
         "a continuous base keeps the change of variables:\n{p}"
     );
     assert!(
-        p.contains("(abs 0.5)") && p.contains("-0.5"),
-        "the `pow` log-volume log|½| + (½−1)·log x is emitted:\n{p}"
+        p.contains("(abs 0.5)") && p.contains("(mul -1.0"),
+        "the `pow` log-volume log|½| + ((½−1)/½)·log y is emitted:\n{p}"
     );
 }
 
