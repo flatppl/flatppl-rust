@@ -9897,13 +9897,21 @@ fn emit_logdensity_asinh_pushfwd_carries_no_image_gate() {
     assert!(!out.contains("stablehlo.compare"), "onto map:\n{out}");
     assert!(!out.contains("stablehlo.select"), "onto map:\n{out}");
     assert!(!out.contains("dense<0x7F800000>"), "no −inf floor:\n{out}");
-    // `sinh` inverts `asinh`; both the base density and the log-volume term
-    // read the same inverse point.
+    // `sinh` inverts `asinh`, and it is emitted ONCE — for the base density alone.
+    // The log-volume reads `%arg0` directly (`−ln cosh y`, spelled
+    // `−(|y| + log1p(exp(−2|y|)) − ln 2)`), where the forward-input spelling
+    // `−½·ln(1 + sinh(y)²)` had a second `sinh` whose square overflowed f32 at
+    // `|y| ≳ 45.5`.
     assert_eq!(
         out.matches("chlo.sinh %arg0 : tensor<f32> -> tensor<f32>")
             .count(),
+        1,
+        "the inverse is `sinh`, read only by the base density:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.abs %arg0").count(),
         2,
-        "the inverse is `sinh`, at the query point directly:\n{out}"
+        "the log-volume is `−ln cosh y`, in the query point:\n{out}"
     );
     assert!(
         !out.contains("chlo.asinh"),
