@@ -2351,8 +2351,10 @@ lp = logdensityof(lawof(a), 0.5)";
 // to ZERO inputs — a `%local` is never an `elementof` leaf — yet the placeholder is
 // bound by nothing once the wrapper is gone. §04 "Placeholders and holes" forbids the
 // module ("All placeholders must appear both in the expression to be reified and the
-// boundary input keyword arguments") but no front-end diagnostic enforces it, so the
-// determiniser must refuse rather than score a dangling ref.
+// boundary input keyword arguments"), and `infer` now rejects it at the front door
+// (`reification_type`'s undeclared-placeholder error). This guard stays the backstop for
+// a caller that reaches the determiniser without acting on inference's diagnostics, and
+// must refuse rather than score a dangling ref.
 //
 // The placeholder sits in SCALE position deliberately. In `mu` position the conjugate
 // row and the pre-existing reified-measure path emit the same dangling ref either way,
@@ -2672,4 +2674,50 @@ lp = logdensityof(superpose(lawof(y), Normal(mu = 1.0, sigma = 1.0)), 0.3)";
         flatppl_determinizer::is_flatpdl(&out).is_ok(),
         "is_flatpdl failed:\n{pir}"
     );
+}
+
+// The second net for the same §04 rule, at the pre-existing reified-measure path.
+// `density::lower_reified_measure` screened a `%specinputs` boundary for placeholder
+// ENTRIES, which cannot see this shape: an `%autoinputs` boundary lists `elementof`
+// leaves only, so a placeholder in the body is declared NOWHERE and the screen read the
+// entry list as clean. At `482d26f` this exact module inferred with zero diagnostics and
+// scored `builtin_logdensityof(Normal, record(mu = _v_, sigma = 1.0), 0.5)` — a dangling
+// `%local` ref in a density.
+//
+// `infer` is the front door now and rejects the module for any caller that acts on
+// diagnostics. This test is the caller that does not, so it still reaches the screen.
+// Verified discriminating by mutation, three ways: with the screen disabled the module
+// refuses anyway, but only on the `%failed` type inference leaves behind, with the bare
+// reason "undeclared placeholder" and no §04 citation; with the infer error disabled
+// instead, this screen alone produces the refusal below; with BOTH disabled the dangling
+// `(%ref %local _v_)` is scored again. The placeholder sits in `mu` position — where the
+// free-`%local` guard on the UNWRAP path is invisible, which is why that guard did not
+// already cover it.
+#[test]
+fn an_autoinputs_reification_reaching_an_undeclared_placeholder_refuses_to_score() {
+    let pir = "(%module\n\
+      (%bind F (functionof (Normal (%kwarg mu (%ref %local _v_)) (%kwarg sigma 1.0)) \
+      %autoinputs %deferred))\n\
+      (%bind lp (logdensityof (lawof (%ref self F)) 0.5)))";
+    let mut m = flatppl_flatpir::read(pir).expect("probe FlatPIR must parse");
+    let _ = flatppl_infer::infer(&mut m);
+    match determinize(&m) {
+        Ok(out) => panic!(
+            "must refuse rather than score a dangling placeholder:\n{}",
+            flatppl_flatpir::write(&out)
+        ),
+        Err(e) => {
+            assert!(
+                e.reason
+                    .contains("placeholder that no boundary input declares"),
+                "the refusal must name the undeclared placeholder as the obstacle: {}",
+                e.reason
+            );
+            assert!(
+                e.reason.contains("§04"),
+                "and cite the rule it enforces: {}",
+                e.reason
+            );
+        }
+    }
 }

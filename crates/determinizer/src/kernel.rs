@@ -122,8 +122,10 @@ pub(crate) enum Reification {
     /// An empty boundary, but the body holds a free `%local` placeholder that no
     /// boundary declares. §04 *Placeholders and holes* forbids the module — "All
     /// placeholders must appear both in the expression to be reified and the
-    /// boundary input keyword arguments" — and no front-end diagnostic enforces
-    /// it, so unwrapping here would emit a dangling `(%ref %local …)`.
+    /// boundary input keyword arguments" — so unwrapping here would emit a
+    /// dangling `(%ref %local …)`. The front door for the shape is `infer`'s
+    /// undeclared-placeholder error (`infer/src/ops.rs`, `reification_type`);
+    /// this stays the conservative default for a pre-inference caller.
     FreePlaceholder,
     /// An `%autoinputs` boundary whose side-table entry phase inference has not
     /// filled ([`Module::auto_inputs_of`] `None`): UNKNOWN inputs, not zero.
@@ -246,13 +248,14 @@ pub(crate) fn resolve_closed_reification(m: &Module, id: NodeId) -> Option<NodeI
 /// enclosing boundary, so unwrapping that boundary would leave it dangling.
 ///
 /// This keeps the unwrap in [`classify_reification`] from emitting a dangling
-/// `(%ref %local …)`. It does NOT close the same hole on the pre-existing
-/// `density::lower_reified_measure` path, which screens a `%specinputs` boundary for
-/// placeholder entries but not an `%autoinputs` one — so
-/// `functionof(Normal(mu = _v_, sigma = 1.0))` used as a measure still scores with
-/// the placeholder in it. That shape parses from surface syntax and infers without a
-/// diagnostic; closing it needs a front-end check, not this walk.
-fn has_free_local(m: &Module, root: NodeId) -> bool {
+/// `(%ref %local …)`, and `density::lower_reified_measure` screens its own
+/// `%autoinputs` boundary with it (that path's `%specinputs` screen covers only
+/// placeholder ENTRIES). The front door for the shape is now `infer`'s
+/// undeclared-placeholder error (`infer/src/ops.rs`, `reification_type`), which
+/// rejects `functionof(Normal(mu = _v_, sigma = 1.0))` before the determiniser
+/// runs; these two screens stay as the backstop for a caller that ignores
+/// inference's diagnostics.
+pub(crate) fn has_free_local(m: &Module, root: NodeId) -> bool {
     fn walk(m: &Module, id: NodeId, bound: &mut Vec<Symbol>) -> bool {
         if let Node::Ref(Ref {
             ns: RefNs::Local,

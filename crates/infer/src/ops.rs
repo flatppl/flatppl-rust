@@ -1535,6 +1535,11 @@ fn reification_type(
     name: &str,
     args: &[ArgInfo],
 ) -> Type {
+    // Boundary entries whose target ref is a `%local` placeholder — that entry
+    // IS the placeholder's declaration (spec §04). Filled per arm below; an
+    // `%autoinputs` boundary declares none (the auto-trace records `elementof`
+    // leaves, never a placeholder), so its list stays empty.
+    let mut declared: Vec<Symbol> = Vec::new();
     let inputs: Box<[Symbol]> = match call.inputs.as_ref() {
         Some(Inputs::Spec(entries)) => {
             // Reification is module-local (spec §04): a boundary may not designate
@@ -1555,6 +1560,12 @@ fn reification_type(
                 ));
                 return Type::Failed("cross-module reification boundary".into());
             }
+            declared.extend(
+                entries
+                    .iter()
+                    .filter(|(_, r)| r.ns == RefNs::Local)
+                    .map(|(_, r)| r.name),
+            );
             entries.iter().map(|(n, _)| *n).collect()
         }
         Some(Inputs::Auto) => match inf.module.auto_inputs_of(id) {
@@ -1589,6 +1600,30 @@ fn reification_type(
         },
         None => unreachable!("reification_type called only when inputs are present"),
     };
+    // §04 *Placeholders and holes*, the front door: a placeholder this
+    // reification's body reaches and its boundary does not declare is a static
+    // error. Unenforced it reaches the determiniser as a dangling `(%ref %local
+    // …)` inside a scored density (`density::lower_reified_measure` screens the
+    // same hole from behind).
+    if let Some((body, _, _)) = args.first() {
+        let undeclared = undeclared_placeholders(inf.module, *body, &declared);
+        if !undeclared.is_empty() {
+            for (ph, at) in undeclared {
+                let name = inf.module.resolve(ph).to_string();
+                let kw = name.trim_matches('_').to_string();
+                inf.diags.push(crate::Diagnostic::error_at(
+                    at,
+                    format!(
+                        "placeholder `{name}` appears in the reified expression but no boundary \
+                         input declares it (spec §04 Placeholders and holes: \"All placeholders \
+                         must appear both in the expression to be reified and the boundary input \
+                         keyword arguments\"); declare it as `{kw} = {name}`"
+                    ),
+                ));
+            }
+            return Type::Failed("undeclared placeholder".into());
+        }
+    }
     let body_ty = args.first().map(|(_, t, _)| t);
     match (name, body_ty) {
         // `kernelof` reifies the LAW of a value-typed body — a probability
@@ -1604,6 +1639,69 @@ fn reification_type(
         ("functionof", _) => Type::Function { inputs },
         _ => Type::Deferred,
     }
+}
+
+/// Every `%local` placeholder the reified expression at `body` reaches that
+/// `declared` does not list, as `(placeholder, first occurrence)` pairs in walk
+/// order. Spec §04 *Placeholders and holes*: "All placeholders must appear both
+/// in the expression to be reified and the boundary input keyword arguments."
+///
+/// A nested `functionof`/`kernelof` is its OWN placeholder scope (§04: "The
+/// scope of a placeholder is the nearest enclosing `functionof` or `kernelof`"),
+/// so the walk stops at one: a placeholder free there is that reification's
+/// error, reported when inference reaches it (children are traced first).
+/// Self-refs ARE followed, so a placeholder one binding away is still caught.
+fn undeclared_placeholders(
+    module: &flatppl_core::Module,
+    body: NodeId,
+    declared: &[Symbol],
+) -> Vec<(Symbol, NodeId)> {
+    fn walk(
+        module: &flatppl_core::Module,
+        id: NodeId,
+        declared: &[Symbol],
+        found: &mut Vec<(Symbol, NodeId)>,
+        visited: &mut std::collections::HashSet<NodeId>,
+    ) {
+        if !visited.insert(id) {
+            return;
+        }
+        match module.node(id) {
+            Node::Ref(r) if r.ns == RefNs::Local => {
+                if !declared.contains(&r.name) && !found.iter().any(|(p, _)| *p == r.name) {
+                    found.push((r.name, id));
+                }
+                return;
+            }
+            Node::Ref(r) if r.ns == RefNs::SelfMod => {
+                if let Some(b) = module.binding_by_name(r.name) {
+                    let rhs = module.binding(b).rhs;
+                    walk(module, rhs, declared, found, visited);
+                }
+                return;
+            }
+            Node::Call(c)
+                if c.inputs.is_some()
+                    && matches!(c.head, CallHead::Builtin(h)
+                        if matches!(module.resolve(h), "functionof" | "kernelof")) =>
+            {
+                return;
+            }
+            _ => {}
+        }
+        for child in module.node(id).children() {
+            walk(module, child, declared, found, visited);
+        }
+    }
+    let mut found = Vec::new();
+    walk(
+        module,
+        body,
+        declared,
+        &mut found,
+        &mut std::collections::HashSet::new(),
+    );
+    found
 }
 
 /// `likelihoodof(K, obs)` — inputs ride over from the kernel; the obstype is
