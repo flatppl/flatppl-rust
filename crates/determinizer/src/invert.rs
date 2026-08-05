@@ -5,9 +5,29 @@
 //! one-op lambda, or a chain/affine lambda rather than an explicit
 //! `bijection(f, f_inv, logvol)` node.
 //!
-//! `logvol` is the FORWARD log-volume element — `log|f'(x)|` as a function of the
-//! forward input `x` — matching the explicit-bijection convention consumed by
-//! `lower_pushfwd` (`logdensityof(M, f_inv(v)) - logvol(f_inv(v))`, §06 line 457).
+//! `logvol` is the FORWARD log-volume element, spelled in the QUERY POINT: the
+//! single-input callable `y -> log|f'(f_inv(y))|`, which `lower_pushfwd` applies at
+//! the query point itself (`logdensityof(M, f_inv(v)) - logvol(v)`) rather than at
+//! the preimage. An EXPLICIT `bijection(f, f_inv, logvol)` keeps the spec's own
+//! convention — a function of the forward input, applied at `f_inv(v)`: §06 →
+//! "Engine contract for `pushfwd` density evaluation" says "The forward log-volume
+//! is evaluated at the preimage f⁻¹(y) and **subtracted**", and §06 →
+//! "Transformation and projection"'s `bijection` entry that "The convention is that
+//! `logvolume` describes the forward map". So the two differ, and `lower_pushfwd`
+//! names which point each is applied at.
+//!
+//! ## Why the query point, and not the forward input
+//!
+//! `log|f'|` composed with `f_inv` is the same real number either way, but the
+//! ROUND TRIP through `f` at the inverse point is lossy in float where it
+//! saturates, and the emission is a SUBTRACTION: `sub(-inf, -inf)` is NaN and
+//! `sub(finite, -inf)` is `+inf` where §06 gives a value. Measured through
+//! Enzyme-JAX (f32): `pushfwd(asinh, N(0,1))` at `y = 50` had `1 + sinh(y)²`
+//! overflow to `+inf`; `pushfwd(tanh, N(0,1))` at `y = 1 − 1.2e-7` had
+//! `tanh(atanh(y))` return exactly `1.0`, so `log(1 − tanh²)` was `-inf`;
+//! `pushfwd(log, Gamma)` at `y = 100` had `log(exp(y))` overflow. Each entry's
+//! column is therefore the ALGEBRAICALLY IDENTICAL spelling in `y` — `-log(cosh y)`,
+//! `log1p(-y²)`, `-y` — which cannot saturate where the round trip did.
 //!
 //! ## One registry, two spellings
 //!
@@ -15,10 +35,10 @@
 //! the spelling must not change the outcome. [`REGISTRY`] is the single table of §06's
 //! named unary bijections, reached through ONE lookup ([`unary_entry`]) from both
 //! [`bare_bijection`] (a bare builtin value) and [`classify`] (an op inside a lambda
-//! body). Each entry carries its inverse, its FORWARD log-volume `log|g'|`, its §06
-//! domain restriction and its ENDPOINT MAP. The two emissions are BUILDERS
-//! parameterised by the point the derivative is taken at, because a chain needs
-//! `log|g'|` at a node it already holds, not a callable to apply. [`forward_image`]
+//! body). Each entry carries its inverse, its log-volume `log|g'∘g⁻¹|` in the op's
+//! OUTPUT point, its §06 domain restriction and its ENDPOINT MAP. The two emissions
+//! are BUILDERS parameterised by the point they are built at, because a chain needs
+//! the term at a node it already holds, not a callable to apply. [`forward_image`]
 //! reads the endpoint map from the same table, so no spelling of `pushfwd` gates
 //! differently from another.
 //!
@@ -31,20 +51,20 @@
 //!
 //! * **`f_inv(y) = g₁_inv(…(gₙ_inv(y))…)`** — apply the per-op inverses
 //!   outermost-first to a fresh placeholder (undo `gₙ` first, `g₁` last).
-//! * **`logvol(x) = Σᵢ logvolᵢ(gᵢ₋₁∘…∘g₁(x))`** — the chain rule
-//!   `log|f'| = Σᵢ log|gᵢ'|`, with each op's LOCAL forward log-derivative
-//!   evaluated at its PARTIAL-FORWARD input `gᵢ₋₁∘…∘g₁(x)`. That partial-forward
-//!   point is exactly `gᵢ`'s own sub-expression node in the forward body (already
-//!   an expression in the input placeholder), so we reuse it directly rather than
-//!   re-deriving the composition. A registry op's term is its entry's log-volume
-//!   built at that node (`exp`: `z`; `log`: `−log z`; `tanh`: `log(1 − tanh(z)²)`);
-//!   the affine ops contribute a constant (`mul`: `log|c|`; `divide`: `−log|c|`)
-//!   or zero (`add`/`sub`, and a volume-preserving registry op such as `neg`), so
-//!   zero terms are dropped and an all-zero sum collapses to the literal `0`.
+//! * **`logvol(y) = Σᵢ logvolᵢ(gₙ∘…∘gᵢ(f_inv(y)))`** — the chain rule
+//!   `log|f'| = Σᵢ log|gᵢ'|`, with each op's term taken at its OWN OUTPUT. Both
+//!   legs come out of ONE outermost-first walk: the accumulator holds `gᵢ`'s output
+//!   expressed in `y` at the moment `gᵢ⁻¹` is about to be applied to it, so the term
+//!   is the entry's column built at the accumulator (`exp`: `log acc`; `log`:
+//!   `−acc`; `tanh`: `log1p(−acc²)`), and the accumulator then becomes `gᵢ`'s input
+//!   for the next op. The affine ops contribute a constant (`mul`: `log|c|`;
+//!   `divide`: `−log|c|`) or zero (`add`/`sub`, and a volume-preserving registry op
+//!   such as `neg`), so zero terms are dropped and an all-zero sum collapses to the
+//!   literal `0`.
 //!
-//! Affine per-op table (`acc` = the accumulating inverse argument, `z` = the op's
-//! partial-forward input; local logvol = FORWARD `log|gᵢ'|` at `z`; the unary ops
-//! are [`REGISTRY`]'s two columns):
+//! Affine per-op table (`acc` = the accumulating inverse argument, which IS the op's
+//! output point; local logvol = `log|gᵢ'|` there; the unary ops are [`REGISTRY`]'s
+//! two columns):
 //! | op            | inverse of `acc`   | local logvol        |
 //! |---------------|--------------------|---------------------|
 //! | `mul(c, u)`   | `divide(acc, c)`   | `log(abs(c))`       |
@@ -55,7 +75,8 @@
 //!
 //! Closed-form checks: `x -> 2·x + 1` ⇒ `f_inv = (y−1)/2`, `f'(x) = 2`, `logvol =
 //! log 2`. `x -> exp(2·x)` ⇒ `f_inv = log(y)/2`, `f'(x) = 2·e^{2x}`, `logvol =
-//! 2x + log 2` (the `2x` is `exp`'s partial-forward point).
+//! log y + log 2` — `exp`'s term sits at `exp`'s own output, which is `y` itself,
+//! where the forward-input spelling had `2x` and needed the round trip to reach it.
 //!
 //! A domain-restricted registry op (`log`, `log10`, `log1p`, `logit`, `probit`,
 //! `sqrt`) is admitted in a chain ONLY as the innermost op, where the base measure's
@@ -71,7 +92,8 @@
 //! * **`f_inv(y) = linsolve(L, y − mu)`** — solve `L x = y − mu` for `x =
 //!   L⁻¹(y − mu)` (§07 `linsolve`), and
 //! * **`logvol = logabsdet(L)`** — the forward log-volume `log|det L|`, CONSTANT
-//!   in `x` (§07 `logabsdet`), emitted as an argument-ignoring lambda.
+//!   in the variate (§07 `logabsdet`), emitted as an argument-ignoring lambda, so
+//!   the query-point convention below costs it nothing.
 //!
 //! The map is refused (Err) when `mu` or `L` references the input (a
 //! coupled/nonlinear map — Jacobian ≠ constant `L`) or `L` is confirmed
@@ -91,8 +113,9 @@
 //! a scalar domain is not a vector, so the recursion never re-enters this arm) and
 //! wrap:
 //! * **`f_inv(y) = broadcast(g_inv, y)`** — apply the scalar inverse cell-wise;
-//! * **`logvol(x) = sum(broadcast(g_logvol, x))`** — `Σᵢ log|g'(xᵢ)|`, the diagonal
-//!   log-det (§07 `sum` reduces a real vector to a scalar).
+//! * **`logvol(y) = sum(broadcast(g_logvol, y))`** — `Σᵢ log|g'(g⁻¹(yᵢ))|`, the
+//!   diagonal log-det in the query point (§07 `sum` reduces a real vector to a
+//!   scalar).
 //!
 //! A COUPLED broadcast mixing two or more variate slots (`broadcast(add, x, x)`,
 //! `broadcast(mul, x, x)`) is refused (Err) — its Jacobian is not diagonal in the
@@ -127,22 +150,28 @@ use flatppl_core::{
 /// A synthesised change-of-variables: the inverse map `f_inv` and the FORWARD
 /// log-volume element `logvol`, each a single-input FlatPIR callable the caller
 /// applies via `build_user_call`.
+///
+/// `logvol` is a function of the QUERY POINT (`y -> log|f'(f_inv(y))|`), so the
+/// caller applies it at `v` and NOT at the preimage — see the module docs for why
+/// the round trip through `f` at the preimage is the defect this avoids. An
+/// explicit `bijection`'s third argument keeps the forward-input convention of §06
+/// → "Engine contract for `pushfwd` density evaluation" instead, so
+/// `crate::density::lower_pushfwd` applies the two at different points.
 pub(crate) struct Bijection {
     pub f_inv: NodeId,
     pub logvol: NodeId,
 }
 
 /// One op `gᵢ` in a scalar chain, carrying what its inverse and local logvol
-/// need: for a [`REGISTRY`] unary the PARTIAL-FORWARD sub-expression node (`z`),
-/// for the affine ops the literal operand `c`.
+/// need: for a [`REGISTRY`] unary the shared entry, for the affine ops the literal
+/// operand `c`. Neither leg needs a node off the FORWARD body — both are built at
+/// the op's output point, which [`derive_chain`]'s inverse walk already holds.
 enum ChainOp {
-    /// A registry unary `g(z)`: inverse and local forward log-volume both come
-    /// from the shared [`REGISTRY`] entry, built at `z` — the op's PARTIAL-FORWARD
-    /// input, already an expression in the chain's input placeholder.
+    /// A registry unary: inverse and local log-volume both come from the shared
+    /// [`REGISTRY`] entry.
     Registry {
         op: &'static str,
         entry: &'static UnaryEntry,
-        z: NodeId,
     },
     /// `c·z`: inverse `divide(acc, c)`; local logvol `log(abs(c))`.
     MulByLit(NodeId),
@@ -161,11 +190,7 @@ enum Recognized {
     /// A bare builtin value used as a function (`pushfwd(exp, M)`).
     BareConst(String),
     /// A one-input `functionof` lambda `x -> body` (chain / affine / single op).
-    Lambda {
-        body: NodeId,
-        input_name: Symbol,
-        ph: Symbol,
-    },
+    Lambda { body: NodeId, ph: Symbol },
     /// Anything else — not a recognised forward function.
     Unrecognized,
 }
@@ -213,18 +238,14 @@ pub(crate) fn derive_bijection(
     match recognise(m, f_resolved) {
         // Bare builtin value: Task-1 single-op form (byte-equality-pinned).
         Recognized::BareConst(name) => bare_bijection(m, &name, f, support),
-        Recognized::Lambda {
-            body,
-            input_name,
-            ph,
-        } => {
+        Recognized::Lambda { body, ph } => {
             // Single-op `pow(x, k)` keeps its Task-1 domain-restricted derivation;
             // a `pow` anywhere else in a chain is refused by the chain walk (its
             // input domain is not verifiable here).
             if let Some(k_node) = single_pow(m, body, ph) {
                 return derive_pow(m, f, k_node, support);
             }
-            derive_chain(m, body, input_name, ph, support)
+            derive_chain(m, body, ph, support)
         }
         Recognized::Unrecognized => Ok(None),
     }
@@ -285,8 +306,13 @@ fn derive_vector_bijection(
 /// Jacobian is diagonal:
 ///
 /// * **`f_inv(y) = broadcast(g_inv, y)`** — the scalar inverse applied cell-wise;
-/// * **`logvol(x) = sum(broadcast(g_logvol, x))`** — `log|det J_f| = Σᵢ log|g'(xᵢ)|`
-///   (§07 `sum` reduces a real vector to a scalar).
+/// * **`logvol(y) = sum(broadcast(g_logvol, y))`** — `log|det J_f| =
+///   Σᵢ log|g'(g⁻¹(yᵢ))|`, the diagonal log-det in the QUERY point (§07 `sum`
+///   reduces a real vector to a scalar). `g_logvol` is the per-cell column, already
+///   composed with `g⁻¹`, so the reduction reads the query vector directly rather
+///   than the preimage — for `g = exp` that is `sum(broadcast(y -> log y, y))`, and
+///   `broadcast(log, …)` appears once in the whole emission (as `f_inv`) instead of
+///   twice.
 ///
 /// The single emission site for both spellings of the elementwise map, so neither
 /// can drift from the other. A logvol that failed to `sum` would be a vector where
@@ -720,17 +746,18 @@ fn static_vector_len(domain: &Type) -> Option<i64> {
 ///   lambda placeholder, yielding the single-input callables `lower_pushfwd`
 ///   applies;
 /// * the LAMBDA spelling (`pushfwd(x -> g(x), M)` and any deeper composition,
-///   [`derive_chain`]) builds at `g`'s own PARTIAL-FORWARD sub-expression — the
-///   point the chain rule evaluates `log|gᵢ'|` at.
+///   [`derive_chain`]) builds at `g`'s own OUTPUT node in the inverse walk — the
+///   point the chain rule evaluates `log|gᵢ'∘gᵢ⁻¹|` at.
 ///
 /// Keeping the two columns as builders rather than as finished callables is what
-/// lets one table serve both: a chain needs `log|g'|` AT a node it already holds,
+/// lets one table serve both: a chain needs the term AT a node it already holds,
 /// not a function it must apply.
 struct UnaryEntry {
     /// `g⁻¹` — the inverse leg of the change of variables.
     inverse: Inverse,
-    /// The FORWARD log-volume `log|g'|` at `point`.
-    logvol: LogVol,
+    /// `log|g'(g⁻¹(u))|` at the op's OUTPUT point `u` — the log-volume already
+    /// composed with the inverse, so no consumer re-applies `g` to reach it.
+    logvol_out: LogVol,
     /// The §06 case-1 domain restriction on `g`'s input, if any.
     domain: Option<Domain>,
     /// `g` at an ENDPOINT — the one fact the image gate is computed from. `g` is
@@ -776,13 +803,13 @@ impl Inverse {
     }
 }
 
-/// The forward log-volume column of a [`UnaryEntry`].
+/// The log-volume column of a [`UnaryEntry`], in the op's OUTPUT point.
 enum LogVol {
     /// Identically zero (`|g'| = 1`, so `g` is volume-preserving): the bare
     /// spelling emits the constant-`0` lambda, and a chain DROPS the term from its
     /// sum (an all-zero sum collapses to the literal `0`).
     Zero,
-    /// `log|g'|` built at the point.
+    /// `log|g'(g⁻¹(u))|` built at the output point `u`.
     At(fn(&mut Module, NodeId) -> NodeId),
 }
 
@@ -1234,12 +1261,23 @@ fn half_pi(m: &mut Module) -> NodeId {
 }
 
 /// The §06 case-1 known-bijection registry: the built-in unary forwards every
-/// conforming engine must recognise by name, each with its inverse, its forward
-/// log-volume `log|g'|`, and its domain restriction. This is the SINGLE table
-/// both `pushfwd` entry points read (see [`unary_entry`]) — §06 nowhere
+/// conforming engine must recognise by name, each with its inverse, its log-volume
+/// `log|g'∘g⁻¹|` in the op's OUTPUT point, and its domain restriction. This is the
+/// SINGLE table both `pushfwd` entry points read (see [`unary_entry`]) — §06 nowhere
 /// distinguishes `pushfwd(g, M)` from `pushfwd(x -> g(x), M)`, and `bijection`'s
 /// own entry describes its annotated result as "a function that is semantically
 /// `f`", so the spelling must not change the outcome.
+///
+/// Every row's column is `log|g'(g⁻¹(u))|`, and each comment carries the algebra
+/// that puts it in `u`. Three rows reach `u` through their own inverse and stay that
+/// way DELIBERATELY, because the composition is the numerically stable one and the
+/// closed form in `u` is worse or absent: `sinh`'s `log(cosh(asinh u))` is
+/// `√(1+u²)` computed without ever forming `u²` (which overflows f32 at
+/// `u ≈ 1.8e19`, where `cosh∘asinh` survives to `≈ 8e37`); `atan`'s
+/// `−log(1 + tan(u)²)` cannot saturate, since `tan` is finite by `1.6e7` at the
+/// nearest f32 inside `±π/2`; and `invprobit`'s `log φ(probit u)` has no elementary
+/// form in `u` at all. In all three the inverse is the SAME expression the base
+/// density already reads, so it is not a round trip through the forward.
 ///
 /// `exp`/`log`, `log10`, `log1p`/`expm1`, `logit`/`invlogit`,
 /// `probit`/`invprobit`, `atan`, `sinh`/`asinh` and `tanh` are §06's named
@@ -1256,28 +1294,27 @@ fn half_pi(m: &mut Module) -> NodeId {
 /// map reproduces that static image exactly, which is what an unproven support still
 /// gates on.
 static REGISTRY: &[(&str, UnaryEntry)] = &[
-    // d/dx eˣ = eˣ ⇒ log|f'| = x (identity).
+    // d/dx eˣ = eˣ ⇒ log|g'(x)| = x; at x = ln u that is ln u.
     (
         "exp",
         UnaryEntry {
             inverse: Inverse::Builtin("log"),
-            logvol: LogVol::At(|_m, x| x),
+            logvol_out: LogVol::At(|m, u| build_call(m, "log", &[u])),
             domain: None,
             map: EndpointMap::Unary(f64::exp),
         },
     ),
-    // d/dx ln x = 1/x ⇒ log|f'| = −ln x. Domain posreals: over a base whose
-    // support is not PROVABLY positive, `f_inv = exp` / `logvol = neg(log(x))`
-    // would still typecheck and "lower", but the density is valid only on the
-    // positive part of the support — a silently SUB-probability measure.
+    // d/dx ln x = 1/x ⇒ log|g'(x)| = −ln x; at x = eᵘ that is −u, which is where
+    // the round-trip spelling `−log(exp(u))` overflowed (f32 `u ≳ 88.7`).
+    // Domain posreals: over a base whose support is not PROVABLY positive,
+    // `f_inv = exp` / `logvol = neg(u)` would still typecheck and "lower", but the
+    // density is valid only on the positive part of the support — a silently
+    // SUB-probability measure.
     (
         "log",
         UnaryEntry {
             inverse: Inverse::Builtin("exp"),
-            logvol: LogVol::At(|m, x| {
-                let logx = build_call(m, "log", &[x]);
-                build_call(m, "neg", &[logx])
-            }),
+            logvol_out: LogVol::At(|m, u| build_call(m, "neg", &[u])),
             domain: Some(Domain::PosReals),
             map: EndpointMap::Unary(f64::ln),
         },
@@ -1288,29 +1325,31 @@ static REGISTRY: &[(&str, UnaryEntry)] = &[
         "neg",
         UnaryEntry {
             inverse: Inverse::Builtin("neg"),
-            logvol: LogVol::Zero,
+            logvol_out: LogVol::Zero,
             domain: None,
             map: EndpointMap::Scale(-1.0),
         },
     ),
     // sqrt(x) = pow(x, 0.5) — §06's literal-exponent `pow` case, so the inverse
-    // `pow(y, 1/k)` and log-volume `log|k| + (k−1)·log x` come from the shared
+    // `pow(u, 1/k)` and log-volume `log|k| + ((k−1)/k)·log u` come from the shared
     // `pow` builders at k = 0.5. Domain nonnegreals, §06's own set for `sqrt`
     // (`pow` at a positive exponent takes the same one, see `derive_pow`).
     (
         "sqrt",
         UnaryEntry {
             inverse: Inverse::Build(|m, y| pow_inverse(m, SQRT_EXPONENT, y)),
-            logvol: LogVol::At(|m, x| {
+            logvol_out: LogVol::At(|m, u| {
                 let k_node = m.alloc(Node::Lit(Scalar::Real(SQRT_EXPONENT)));
-                pow_logvol(m, k_node, SQRT_EXPONENT, x)
+                pow_logvol_out(m, k_node, SQRT_EXPONENT, u)
             }),
             domain: Some(Domain::NonNegReals),
             map: EndpointMap::Unary(f64::sqrt),
         },
     ),
-    // log10(x) = ln x / ln 10 ⇒ log|f'| = −ln x − ln(ln 10); inverse
-    // 10ˣ = pow(10, x). Domain posreals (same guard as `log`).
+    // log10(x) = ln x / ln 10 ⇒ log|g'(x)| = −ln x − ln(ln 10); at x = 10ᵘ,
+    // ln x = u·ln 10, so the term is −(u·ln 10 + ln(ln 10)) and the `10ᵘ` the
+    // round trip formed (overflowing at f32 `u ≳ 38.5`) is gone. Domain posreals
+    // (same guard as `log`).
     (
         "log10",
         UnaryEntry {
@@ -1318,73 +1357,76 @@ static REGISTRY: &[(&str, UnaryEntry)] = &[
                 let ten = m.alloc(Node::Lit(Scalar::Real(10.0)));
                 build_call(m, "pow", &[ten, y])
             }),
-            logvol: LogVol::At(|m, x| {
-                let logx = build_call(m, "log", &[x]);
+            logvol_out: LogVol::At(|m, u| {
                 let ten = m.alloc(Node::Lit(Scalar::Real(10.0)));
                 let ln10 = build_call(m, "log", &[ten]);
+                let scaled = build_call(m, "mul", &[ln10, u]);
                 let ln_ln10 = build_call(m, "log", &[ln10]);
-                let s = build_call(m, "add", &[logx, ln_ln10]);
+                let s = build_call(m, "add", &[scaled, ln_ln10]);
                 build_call(m, "neg", &[s])
             }),
             domain: Some(Domain::PosReals),
             map: EndpointMap::Unary(f64::log10),
         },
     ),
-    // log1p(x) = ln(1 + x) ⇒ log|f'| = −ln(1 + x) = −log1p(x); inverse expm1.
+    // log1p(x) = ln(1 + x) ⇒ log|g'(x)| = −log1p(x); at x = expm1(u) that is −u,
+    // where the round trip `−log1p(expm1(u))` overflowed (f32 `u ≳ 88.7`).
     (
         "log1p",
         UnaryEntry {
             inverse: Inverse::Builtin("expm1"),
-            logvol: LogVol::At(|m, x| {
-                let l = build_call(m, "log1p", &[x]);
-                build_call(m, "neg", &[l])
-            }),
+            logvol_out: LogVol::At(|m, u| build_call(m, "neg", &[u])),
             domain: Some(Domain::AboveMinusOne),
             map: EndpointMap::Unary(f64::ln_1p),
         },
     ),
-    // expm1(x) = eˣ − 1 ⇒ log|f'| = x (identity); inverse log1p. Domain ℝ, range
-    // (−1, ∞) open at −1 — `exp_m1(−inf) = −1` is a limit, and `log1p(−1) = −∞`
-    // with the volume term diverging there too.
+    // expm1(x) = eˣ − 1 ⇒ log|g'(x)| = x; at x = log1p(u) that is log1p(u).
+    // Domain ℝ, range (−1, ∞) open at −1 — `exp_m1(−inf) = −1` is a limit, and
+    // `log1p(−1) = −∞` with the volume term diverging there too.
     (
         "expm1",
         UnaryEntry {
             inverse: Inverse::Builtin("log1p"),
-            logvol: LogVol::At(|_m, x| x),
+            logvol_out: LogVol::At(|m, u| build_call(m, "log1p", &[u])),
             domain: None,
             map: EndpointMap::Unary(f64::exp_m1),
         },
     ),
-    // logit(p) = ln(p / (1 − p)) ⇒ log|f'| = −ln p − ln(1 − p); inverse invlogit.
+    // logit(p) = ln(p / (1 − p)) ⇒ log|g'(p)| = −ln p − ln(1 − p); at p = σ(u) that
+    // is softplus(u) + softplus(−u) — `−ln σ(u) = softplus(−u)` and
+    // `−ln(1 − σ(u)) = −ln σ(−u) = softplus(u)` — which is even in `u` and equals
+    // `|u| + 2·log1p(exp(−|u|))`. The `σ(u)` spelling saturated to exactly 1.0 at
+    // f32 `u ≳ 16.6`, where `ln(1 − σ)` is `−inf`.
     (
         "logit",
         UnaryEntry {
             inverse: Inverse::Builtin("invlogit"),
-            logvol: LogVol::At(|m, x| {
-                let logp = build_call(m, "log", &[x]);
-                let one = m.alloc(Node::Lit(Scalar::Real(1.0)));
-                let omp = build_call(m, "sub", &[one, x]);
-                let log_omp = build_call(m, "log", &[omp]);
-                let s = build_call(m, "add", &[logp, log_omp]);
-                build_call(m, "neg", &[s])
+            logvol_out: LogVol::At(|m, u| {
+                let a = build_call(m, "abs", &[u]);
+                let neg_a = build_call(m, "neg", &[a]);
+                let e = build_call(m, "exp", &[neg_a]);
+                let l = build_call(m, "log1p", &[e]);
+                let two = m.alloc(Node::Lit(Scalar::Real(2.0)));
+                let doubled = build_call(m, "mul", &[two, l]);
+                build_call(m, "add", &[a, doubled])
             }),
             domain: Some(Domain::Unit),
             map: EndpointMap::Unary(logit_at),
         },
     ),
-    // invlogit(x) = 1 / (1 + e⁻ˣ) ⇒ log|f'| = ln σ(x) + ln(1 − σ(x)); inverse
-    // logit. Domain ℝ.
+    // invlogit(x) = 1 / (1 + e⁻ˣ) ⇒ log|g'(x)| = ln σ(x) + ln(1 − σ(x)); at
+    // x = logit(u), σ(x) IS u, so the term is `ln u + log1p(−u)`. The round trip
+    // returned exactly 1.0 from `σ(logit u)` at f32 `u = 1 − 6e-8`, making
+    // `ln(1 − σ)` `−inf` and the whole density `+inf`. Domain ℝ.
     (
         "invlogit",
         UnaryEntry {
             inverse: Inverse::Builtin("logit"),
-            logvol: LogVol::At(|m, x| {
-                let s = build_call(m, "invlogit", &[x]);
-                let log_s = build_call(m, "log", &[s]);
-                let one = m.alloc(Node::Lit(Scalar::Real(1.0)));
-                let oms = build_call(m, "sub", &[one, s]);
-                let log_oms = build_call(m, "log", &[oms]);
-                build_call(m, "add", &[log_s, log_oms])
+            logvol_out: LogVol::At(|m, u| {
+                let log_u = build_call(m, "log", &[u]);
+                let neg_u = build_call(m, "neg", &[u]);
+                let log1m = build_call(m, "log1p", &[neg_u]);
+                build_call(m, "add", &[log_u, log1m])
             }),
             domain: None,
             // Range (0, 1), open at BOTH endpoints (both are limits): the inverse is
@@ -1392,16 +1434,18 @@ static REGISTRY: &[(&str, UnaryEntry)] = &[
             map: EndpointMap::Unary(invlogit_at),
         },
     ),
-    // probit(p) = Φ⁻¹(p) ⇒ log|f'| = ½ln(2π) + ½·probit(p)²; inverse invprobit (Φ).
+    // probit(p) = Φ⁻¹(p) ⇒ log|g'(p)| = ½ln(2π) + ½·probit(p)²; at p = Φ(u),
+    // probit(p) IS u, so the term is `½ln(2π) + ½u²`. The round trip
+    // `probit(invprobit(u))` returned ±inf once `Φ(u)` saturated to 0 or 1
+    // (f32 `|u| ≳ 5.2`).
     (
         "probit",
         UnaryEntry {
             inverse: Inverse::Builtin("invprobit"),
-            logvol: LogVol::At(|m, x| {
+            logvol_out: LogVol::At(|m, u| {
                 let half_ln2pi = half_ln_two_pi(m);
-                let pr = build_call(m, "probit", &[x]);
                 let two = m.alloc(Node::Lit(Scalar::Real(2.0)));
-                let sq = build_call(m, "pow", &[pr, two]);
+                let sq = build_call(m, "pow", &[u, two]);
                 let half = m.alloc(Node::Lit(Scalar::Real(0.5)));
                 let half_sq = build_call(m, "mul", &[half, sq]);
                 build_call(m, "add", &[half_ln2pi, half_sq])
@@ -1410,16 +1454,23 @@ static REGISTRY: &[(&str, UnaryEntry)] = &[
             map: EndpointMap::Unary(probit_at),
         },
     ),
-    // invprobit(x) = Φ(x) ⇒ log|f'| = ln φ(x) = −½ln(2π) − ½x²; inverse probit.
-    // Domain ℝ.
+    // invprobit(x) = Φ(x) ⇒ log|g'(x)| = ln φ(x) = −½ln(2π) − ½x²; at x = probit(u)
+    // that is `ln φ(probit u)`, which has no elementary form in `u`. The `probit(u)`
+    // that stays is the INVERSE — the same expression the base density is scored at
+    // — not the forward, so this row is not a round trip. It is the one row where a
+    // saturating inverse still poisons both terms: §07 gives `probit` as `-inf` only
+    // "at p = 0", so a finite `u` reaching `-inf` is the emitter's
+    // `√2·erf_inv(2u − 1)` losing `u` entirely once `2u − 1` rounds to `−1`, which
+    // no spelling here can undo. Domain ℝ.
     (
         "invprobit",
         UnaryEntry {
             inverse: Inverse::Builtin("probit"),
-            logvol: LogVol::At(|m, x| {
+            logvol_out: LogVol::At(|m, u| {
                 let half_ln2pi = half_ln_two_pi(m);
+                let pr = build_call(m, "probit", &[u]);
                 let two = m.alloc(Node::Lit(Scalar::Real(2.0)));
-                let sq = build_call(m, "pow", &[x, two]);
+                let sq = build_call(m, "pow", &[pr, two]);
                 let half = m.alloc(Node::Lit(Scalar::Real(0.5)));
                 let half_sq = build_call(m, "mul", &[half, sq]);
                 let s = build_call(m, "add", &[half_ln2pi, half_sq]);
@@ -1431,15 +1482,20 @@ static REGISTRY: &[(&str, UnaryEntry)] = &[
             map: EndpointMap::Unary(invprobit_at),
         },
     ),
-    // atan(x) ⇒ log|f'| = −ln(1 + x²); inverse tan (valid on atan's range
-    // (−π/2, π/2), where tan is the single-valued inverse). Domain ℝ.
+    // atan(x) ⇒ log|g'(x)| = −ln(1 + x²); at x = tan(u) that is `−ln(1 + tan(u)²)`,
+    // kept over the equivalent `2·ln(cos u)` because it cannot saturate: `tan` at the
+    // nearest f32 inside `±π/2` is only `1.6e7`, so `tan(u)²` never overflows, and
+    // `tan(u)` is the inverse the base density is scored at anyway. Inverse `tan` is
+    // valid on atan's range (−π/2, π/2), where it is the single-valued inverse.
+    // Domain ℝ.
     (
         "atan",
         UnaryEntry {
             inverse: Inverse::Builtin("tan"),
-            logvol: LogVol::At(|m, x| {
+            logvol_out: LogVol::At(|m, u| {
+                let t = build_call(m, "tan", &[u]);
                 let two = m.alloc(Node::Lit(Scalar::Real(2.0)));
-                let sq = build_call(m, "pow", &[x, two]);
+                let sq = build_call(m, "pow", &[t, two]);
                 let one = m.alloc(Node::Lit(Scalar::Real(1.0)));
                 let onepx2 = build_call(m, "add", &[one, sq]);
                 let l = build_call(m, "log", &[onepx2]);
@@ -1454,49 +1510,61 @@ static REGISTRY: &[(&str, UnaryEntry)] = &[
             map: EndpointMap::Atan,
         },
     ),
-    // sinh(x) ⇒ log|f'| = ln cosh(x); inverse asinh. Domain ℝ.
+    // sinh(x) ⇒ log|g'(x)| = ln cosh(x); at x = asinh(u) that is `ln(cosh(asinh u))`,
+    // i.e. `½·log1p(u²)`. The composition is kept because it is the STABLER of the
+    // two: `cosh∘asinh` computes `√(1+u²)` without forming `u²`, so it survives to
+    // f32 `u ≈ 8e37` where `log1p(u²)` overflows at `1.8e19`. Domain ℝ.
     (
         "sinh",
         UnaryEntry {
             inverse: Inverse::Builtin("asinh"),
-            logvol: LogVol::At(|m, x| {
-                let ch = build_call(m, "cosh", &[x]);
+            logvol_out: LogVol::At(|m, u| {
+                let a = build_call(m, "asinh", &[u]);
+                let ch = build_call(m, "cosh", &[a]);
                 build_call(m, "log", &[ch])
             }),
             domain: None,
             map: EndpointMap::Unary(f64::sinh),
         },
     ),
-    // asinh(x) ⇒ log|f'| = −½ln(1 + x²); inverse sinh. Domain ℝ.
+    // asinh(x) ⇒ log|g'(x)| = −½ln(1 + x²); at x = sinh(u), `1 + sinh²u = cosh²u`, so
+    // the term is `−ln cosh u` = `−(|u| + log1p(exp(−2|u|)) − ln 2)` (from
+    // `cosh u = e^{|u|}(1 + e^{−2|u|})/2`). Overflow-free, where the round trip's
+    // `sinh(u)²` overflowed f32 at `|u| ≳ 45.5` and `−ln(cosh u)` alone would only
+    // move that to `≈ 88.7`.
     (
         "asinh",
         UnaryEntry {
             inverse: Inverse::Builtin("sinh"),
-            logvol: LogVol::At(|m, x| {
+            logvol_out: LogVol::At(|m, u| {
+                let a = build_call(m, "abs", &[u]);
+                let mtwo = m.alloc(Node::Lit(Scalar::Real(-2.0)));
+                let scaled = build_call(m, "mul", &[mtwo, a]);
+                let e = build_call(m, "exp", &[scaled]);
+                let l = build_call(m, "log1p", &[e]);
+                let s = build_call(m, "add", &[a, l]);
                 let two = m.alloc(Node::Lit(Scalar::Real(2.0)));
-                let sq = build_call(m, "pow", &[x, two]);
-                let one = m.alloc(Node::Lit(Scalar::Real(1.0)));
-                let onepx2 = build_call(m, "add", &[one, sq]);
-                let l = build_call(m, "log", &[onepx2]);
-                let mhalf = m.alloc(Node::Lit(Scalar::Real(-0.5)));
-                build_call(m, "mul", &[mhalf, l])
+                let ln2 = build_call(m, "log", &[two]);
+                let ln_cosh = build_call(m, "sub", &[s, ln2]);
+                build_call(m, "neg", &[ln_cosh])
             }),
             domain: None,
             map: EndpointMap::Unary(f64::asinh),
         },
     ),
-    // tanh(x) ⇒ log|f'| = ln(1 − tanh(x)²); inverse atanh. Domain ℝ.
+    // tanh(x) ⇒ log|g'(x)| = ln(1 − tanh(x)²); at x = atanh(u), tanh(x) IS u, so the
+    // term is `log1p(−u²)`. The round trip returned exactly 1.0 from
+    // `tanh(atanh u)` at f32 `u = 1 − 1.2e-7`, making the term `−inf` and the whole
+    // density `+inf`. Inverse atanh. Domain ℝ.
     (
         "tanh",
         UnaryEntry {
             inverse: Inverse::Builtin("atanh"),
-            logvol: LogVol::At(|m, x| {
-                let th = build_call(m, "tanh", &[x]);
+            logvol_out: LogVol::At(|m, u| {
                 let two = m.alloc(Node::Lit(Scalar::Real(2.0)));
-                let sq = build_call(m, "pow", &[th, two]);
-                let one = m.alloc(Node::Lit(Scalar::Real(1.0)));
-                let omsq = build_call(m, "sub", &[one, sq]);
-                build_call(m, "log", &[omsq])
+                let sq = build_call(m, "pow", &[u, two]);
+                let neg_sq = build_call(m, "neg", &[sq]);
+                build_call(m, "log1p", &[neg_sq])
             }),
             domain: None,
             // Range (−1, 1), open at both (limits): `atanh(±1) = ±∞` and
@@ -1587,7 +1655,7 @@ fn bare_bijection(
         }
     }
     let f_inv = entry.inverse.callable(m);
-    let logvol = match &entry.logvol {
+    let logvol = match &entry.logvol_out {
         LogVol::Zero => lambda(m, |m, _ph| m.alloc(Node::Lit(Scalar::Real(0.0)))),
         LogVol::At(build) => lambda(m, *build),
     };
@@ -1595,9 +1663,9 @@ fn bare_bijection(
 }
 
 /// Derive the change-of-variables for a scalar-chain forward body `f = gₙ∘…∘g₁`
-/// (`input_name`/`ph` are the forward lambda's boundary — reused verbatim on the
-/// `logvol` so the partial-forward sub-expressions, which reference `ph`, resolve
-/// inside it). See the module docs for the inverse / chain-rule construction.
+/// (`ph` is the forward lambda's placeholder, read only to flatten the chain — both
+/// emitted callables carry their own fresh one). See the module docs for the
+/// inverse / chain-rule construction.
 ///
 /// * `Ok(Some(_))` — every op in the chain is invertible.
 /// * `Ok(None)` — the chain hit an unrecognised shape (a non-builtin head, or a
@@ -1608,7 +1676,6 @@ fn bare_bijection(
 fn derive_chain(
     m: &mut Module,
     body: NodeId,
-    input_name: Symbol,
     ph: Symbol,
     support: &ValueSet,
 ) -> Result<Option<Bijection>, RefuseError> {
@@ -1631,10 +1698,7 @@ fn derive_chain(
     // keeps `x -> log(neg(x))` refusing. Read a refusal here as "not proven", NOT as
     // "unsound".
     for (i, op) in ops.iter().enumerate() {
-        let ChainOp::Registry {
-            op: name, entry, ..
-        } = op
-        else {
+        let ChainOp::Registry { op: name, entry } = op else {
             continue;
         };
         let Some(domain) = entry.domain else { continue };
@@ -1672,22 +1736,25 @@ fn derive_chain(
         acc
     });
 
-    // logvol(x) = Σᵢ logvolᵢ(partial-forward point). Drop the zero contributions
-    // (neg / add / sub); an all-zero sum is the constant 0.
-    let mut terms = Vec::new();
-    for op in &ops {
-        if let Some(term) = local_logvol(m, op) {
-            terms.push(term);
+    // logvol(y) = Σᵢ logvolᵢ(gᵢ's own output). The SAME outermost-first walk as
+    // `f_inv`: at each step the accumulator is the op's output expressed in `y`, so
+    // the term is built there BEFORE the inverse is applied. Drop the zero
+    // contributions (neg / add / sub); an all-zero sum is the constant 0.
+    let logvol = lambda(m, |m, y| {
+        let mut acc = y;
+        let mut terms = Vec::new();
+        for op in &ops {
+            if let Some(term) = local_logvol(m, op, acc) {
+                terms.push(term);
+            }
+            acc = apply_inverse(m, op, acc);
         }
-    }
-    let logvol_body = if terms.is_empty() {
-        m.alloc(Node::Lit(Scalar::Real(0.0)))
-    } else {
-        fold_add(m, &terms)
-    };
-    // Reuse the forward lambda's own input name + placeholder so the reused
-    // partial-forward sub-expressions (which reference `ph`) resolve here.
-    let logvol = wrap_functionof(m, input_name, ph, logvol_body);
+        if terms.is_empty() {
+            m.alloc(Node::Lit(Scalar::Real(0.0)))
+        } else {
+            fold_add(m, &terms)
+        }
+    });
 
     Ok(Some(Bijection { f_inv, logvol }))
 }
@@ -1739,18 +1806,11 @@ fn classify(m: &Module, cur: NodeId) -> Result<Option<(ChainOp, NodeId)>, Refuse
     };
     // A unary op in the shared §06 registry — the SAME lookup the bare spelling
     // does, so the two cannot cover different sets of ops. Its inverse and local
-    // forward log-volume are built later at `args[0]`, this op's partial-forward
-    // input.
+    // log-volume are built later, at the op's OUTPUT in the inverse walk; `args[0]`
+    // is returned only as the subterm to descend into.
     if args.len() == 1 {
         if let Some((op, entry)) = unary_entry(&name) {
-            return Ok(Some((
-                ChainOp::Registry {
-                    op,
-                    entry,
-                    z: args[0],
-                },
-                args[0],
-            )));
+            return Ok(Some((ChainOp::Registry { op, entry }, args[0])));
         }
     }
     match name.as_str() {
@@ -1837,17 +1897,16 @@ fn apply_inverse(m: &mut Module, op: &ChainOp, acc: NodeId) -> NodeId {
     }
 }
 
-/// `op`'s LOCAL forward log-derivative at its partial-forward input, or `None`
-/// when it is identically zero (a volume-preserving registry op such as `neg`, or
-/// an affine shift). A registry op's term is built by its [`UnaryEntry`] AT the
-/// partial-forward sub-expression node — that node is already the forward
-/// composition of the inner ops, expressed in the input placeholder, which is
-/// exactly the point `gᵢ`'s derivative is evaluated at.
-fn local_logvol(m: &mut Module, op: &ChainOp) -> Option<NodeId> {
+/// `op`'s LOCAL log-volume at `out`, its own output point, or `None` when the term
+/// is identically zero (a volume-preserving registry op such as `neg`, or an affine
+/// shift). A registry op's term is built by its [`UnaryEntry`]'s already-composed
+/// column, so `out` is the accumulating inverse argument and no forward
+/// sub-expression is read.
+fn local_logvol(m: &mut Module, op: &ChainOp, out: NodeId) -> Option<NodeId> {
     match op {
-        ChainOp::Registry { entry, z, .. } => match &entry.logvol {
+        ChainOp::Registry { entry, .. } => match &entry.logvol_out {
             LogVol::Zero => None,
-            LogVol::At(build) => Some(build(m, *z)),
+            LogVol::At(build) => Some(build(m, out)),
         },
         // log|d/dz (c·z)| = log|c|.
         ChainOp::MulByLit(c) => {
@@ -1865,7 +1924,7 @@ fn local_logvol(m: &mut Module, op: &ChainOp) -> Option<NodeId> {
     }
 }
 
-/// `pow(_, k)`: f_inv `x -> pow(x, 1/k)`; logvol `x -> add(log(abs(k)), mul(k-1, log(x)))`.
+/// `pow(_, k)`: f_inv `y -> pow(y, 1/k)`; logvol `y -> add(log(abs(k)), mul((k-1)/k, log(y)))`.
 /// Requires a nonzero literal exponent and a base whose `support` lies inside
 /// `pow`'s §06 domain — the inverse `x^{1/k}` and the log-volume's `log x` are
 /// defined only there (d/dx xᵏ = k·xᵏ⁻¹ ⇒ log|f'| = log|k| + (k−1)·log x).
@@ -1907,7 +1966,7 @@ fn derive_pow(
         ));
     }
     let f_inv = lambda(m, |m, ph| pow_inverse(m, k, ph));
-    let logvol = lambda(m, |m, ph| pow_logvol(m, k_node, k, ph));
+    let logvol = lambda(m, |m, ph| pow_logvol_out(m, k_node, k, ph));
     Ok(Some(Bijection { f_inv, logvol }))
 }
 
@@ -1919,15 +1978,19 @@ fn pow_inverse(m: &mut Module, k: f64, point: NodeId) -> NodeId {
     build_call(m, "pow", &[point, inv_exp])
 }
 
-/// `pow(_, k)`'s FORWARD log-volume at `point`: `log|k| + (k−1)·log point`
-/// (d/dx xᵏ = k·xᵏ⁻¹). `k_node` is the exponent node reused inside `abs`, `k` its
-/// value. Shared by [`derive_pow`] and the registry's `sqrt` entry.
-fn pow_logvol(m: &mut Module, k_node: NodeId, k: f64, point: NodeId) -> NodeId {
+/// `pow(_, k)`'s log-volume at its OUTPUT `point`: `log|k| + ((k−1)/k)·log point`.
+/// From `log|g'(x)| = log|k| + (k−1)·log x` (d/dx xᵏ = k·xᵏ⁻¹) at `x = point^{1/k}`,
+/// where `log x = (1/k)·log point`. That folds the inverse into the coefficient, so
+/// the `point^{1/k}` the forward-input spelling formed — overflowing f32 at
+/// `point ≳ 1.8e19` for `k = 1/2` — is gone. `k_node` is the exponent node reused
+/// inside `abs`, `k` its value. Shared by [`derive_pow`] and the registry's `sqrt`
+/// entry.
+fn pow_logvol_out(m: &mut Module, k_node: NodeId, k: f64, point: NodeId) -> NodeId {
     let abs_k = build_call(m, "abs", &[k_node]);
     let log_abs_k = build_call(m, "log", &[abs_k]);
-    let km1 = m.alloc(Node::Lit(Scalar::Real(k - 1.0)));
+    let coeff = m.alloc(Node::Lit(Scalar::Real((k - 1.0) / k)));
     let logx = build_call(m, "log", &[point]);
-    let term = build_call(m, "mul", &[km1, logx]);
+    let term = build_call(m, "mul", &[coeff, logx]);
     build_call(m, "add", &[log_abs_k, term])
 }
 
@@ -1940,14 +2003,18 @@ fn pow_logvol(m: &mut Module, k_node: NodeId, k: f64, point: NodeId) -> NodeId {
 ///   `x = L⁻¹(y − mu)` (spec §07 `linsolve`: square `A`, vector `b`; `inv(L)` is
 ///   avoided in favour of the direct solve).
 /// * **`logvol = logabsdet(L)`** — the FORWARD log-volume `log|det J_f| =
-///   log|det L|`, CONSTANT in `x` (a linear map has constant Jacobian `L`; spec
-///   §07 `logabsdet(A) = log|det A|`, square matrix → real scalar). Emitted as a
-///   lambda that IGNORES its argument, consistent with Tasks 1-2's logvol shape;
-///   the caller applies it at the preimage (`logvol(f_inv(v))`), which β-reduces
-///   to the constant.
+///   log|det L|`, CONSTANT in the variate (a linear map has constant Jacobian `L`;
+///   spec §07 `logabsdet(A) = log|det A|`, square matrix → real scalar). Emitted as
+///   a lambda that IGNORES its argument, so the point it is applied at cannot
+///   matter: the caller applies a synthesised logvol at the QUERY point
+///   ([`Bijection`]), and `logvol(v)` β-reduces to the same constant `logvol(f_inv(v))`
+///   would have.
 ///
 /// MvNormal cross-check (Σ = L Lᵀ): the caller emits `logdensityof(iid N(0,1),
-/// f_inv(v)) − logvol(f_inv(v))` (§06 line 457) =
+/// f_inv(v)) − logvol(v)` (§06 → "Engine contract for `pushfwd` density
+/// evaluation", whose change-of-variables formula subtracts the forward log-volume;
+/// its own spelling evaluates that at the preimage, which for a constant is the
+/// same number) =
 /// `−n/2·log 2π − ½‖L⁻¹(v−mu)‖² − log|det L|`. With `‖L⁻¹u‖² = uᵀ(LLᵀ)⁻¹u =
 /// uᵀΣ⁻¹u` and `log|det L| = ½·log|det Σ|`, this is exactly
 /// `log N(v; mu, Σ)` — the standard-normal inner density plus `−logabsdet(L)`
@@ -2139,24 +2206,26 @@ fn type_is_matrix(m: &Module, id: NodeId) -> bool {
 /// so its log-det is the SUM of the per-cell scalar forward log-derivatives:
 ///
 /// * **`f_inv(y) = broadcast(g_inv, y)`** — apply `g`'s scalar inverse cell-wise.
-/// * **`logvol(x) = sum(broadcast(g_logvol, x))`** — `log|det J_f| = Σᵢ log|g'(xᵢ)|`
-///   (§07 `sum` reduces a real vector to a scalar; `broadcast` lifts the scalar
-///   `g_logvol` over the cells).
+/// * **`logvol(y) = sum(broadcast(g_logvol, y))`** — `log|det J_f| =
+///   Σᵢ log|g'(g⁻¹(yᵢ))|` in the QUERY point (§07 `sum` reduces a real vector to a
+///   scalar; `broadcast` lifts the scalar `g_logvol` over the cells).
 ///
 /// `(g_inv, g_logvol)` are obtained by RECURSING [`derive_bijection`] on the
 /// scalar operator `g` over the vector's ELEMENT `domain` — `g` then takes the
 /// bare-builtin / scalar-chain path (a scalar domain is not a vector, so the
 /// recursion never re-enters this arm), reusing every scalar inversion verbatim.
+/// `g_logvol` therefore arrives already composed with `g⁻¹`.
 ///
 /// LogNormal-vector cross-check: for `g = exp` over an n-vector of iid `N(0,1)`,
-/// `g_inv = log`, `g_logvol = identity` (`log|d/dx eˣ| = x`). The caller emits
-/// `logdensityof(iid N(0,1), broadcast(log, v)) − sum(broadcast(id, broadcast(log,
-/// v)))` = `Σᵢ [logN(0,1)(log vᵢ) − log vᵢ]` — exactly n independent LogNormals
-/// (the standard-normal density at `log vᵢ` minus the per-cell `log vᵢ`
-/// change-of-variables term, summed by the diagonal log-det). A logvol that failed
-/// to `sum` (a vector, not the scalar log-det) or summed at the wrong point would
-/// be a silently wrong density; `sum(broadcast(g_logvol, x))` is the correct
-/// forward log-volume.
+/// `g_inv = log` and `g_logvol = y -> log y` (`log|d/dx eˣ| = x` at `x = log y`).
+/// The caller emits `logdensityof(iid N(0,1), broadcast(log, v)) −
+/// sum(broadcast(y -> log y, v))` = `Σᵢ [logN(0,1)(log vᵢ) − log vᵢ]` — exactly n
+/// independent LogNormals (the standard-normal density at `log vᵢ` minus the
+/// per-cell `log vᵢ` change-of-variables term, summed by the diagonal log-det).
+/// The volume reduction reads `v` itself, so `broadcast(log, …)` appears once in
+/// the emission rather than nested inside the sum as well. A logvol that failed to
+/// `sum` (a vector, not the scalar log-det) or read the wrong point would be a
+/// silently wrong density.
 ///
 /// * `Ok(Some(_))` — `body` is `broadcast(g, x)` with `x` the bare input
 ///   placeholder and `g` scalar-invertible.
@@ -2384,7 +2453,6 @@ fn recognise(m: &Module, f: NodeId) -> Recognized {
                         if entries.len() == 1 && entries[0].1.ns == RefNs::Local {
                             return Recognized::Lambda {
                                 body: c.args[0],
-                                input_name: entries[0].0,
                                 ph: entries[0].1.name,
                             };
                         }

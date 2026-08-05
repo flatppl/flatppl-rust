@@ -60,7 +60,9 @@
 //!   membership builtin, which infers to a boolean — `elementof` is a set-valued
 //!   parameter declaration, not a membership predicate).
 //! - `pushfwd(bijection(f, f_inv, logvol), M)` → `sub(density(M, f_inv(v)),
-//!   logvol(f_inv(v)))` over a CONTINUOUS base; over a discrete one the volume
+//!   logvol(f_inv(v)))` over a CONTINUOUS base — a SYNTHESISED change of variables
+//!   spells its volume in the query point instead, `logvol(v)`
+//!   ([`crate::invert::Bijection`]); over a discrete base the volume
 //!   term is dropped (`density(M, f_inv(v))` alone) — a counting-measure density
 //!   has no volume element, §06 "Density convention". Same split for `locscale`.
 //!   A base whose variate proves neither reference measure is **refused**
@@ -3254,7 +3256,16 @@ fn lower_pushfwd(
     // `forward` is the map itself, kept beside the change of variables for the image
     // gate ([`crate::invert::forward_image`]) — arg 0 of an explicit `bijection`, else
     // the whole forward argument.
-    let (f_inv_node, logvol_node, forward) =
+    //
+    // `logvol_in_query_point` records which POINT the volume term is a function of,
+    // because the two sources do not agree. An explicit `bijection`'s third argument
+    // is the spec's `logvol(f_inv(v))` (§06 → "Engine contract for `pushfwd` density
+    // evaluation": "The forward log-volume is evaluated at the preimage f⁻¹(y) and
+    // **subtracted**") — a function of the forward input, which
+    // the annotation's author wrote and this pass must not reinterpret. A SYNTHESISED
+    // one is a function of the query point (`crate::invert::Bijection`), because
+    // spelling it at the preimage round-trips through the forward and saturates.
+    let (f_inv_node, logvol_node, forward, logvol_in_query_point) =
         if let Some(bij) = expect_builtin_call(m, bij_resolved, "bijection") {
             if bij.args.len() != 3 {
                 return Err(refuse(
@@ -3263,12 +3274,12 @@ fn lower_pushfwd(
                     "bijection expects 3 args (f, f_inv, logvol)",
                 ));
             }
-            (bij.args[1], bij.args[2], bij.args[0])
+            (bij.args[1], bij.args[2], bij.args[0], false)
         } else {
             refuse_variate_kind_mismatch(m, &domain, v)?;
             // Not an explicit bijection: try analytic synthesis (§06 case 1).
             match crate::invert::derive_bijection(m, bij_node, &domain, &support)? {
-                Some(bij) => (bij.f_inv, bij.logvol, bij_node),
+                Some(bij) => (bij.f_inv, bij.logvol, bij_node, true),
                 None => {
                     return Err(refuse(
                         bij_resolved,
@@ -3297,10 +3308,11 @@ fn lower_pushfwd(
             let at_atom = crate::driver::substitute_in_tree(m, inner_density, preimage, snapped);
             (at_atom, Some(lattice))
         }
-        // logvol_val = logvol(preimage)
+        // logvol_val = logvol(v) for a synthesised change of variables, logvol(preimage)
+        // for an annotated one (see `logvol_in_query_point`).
         Reference::Lebesgue => {
-            let logvol_val =
-                apply_change_of_variables(m, bij_resolved, logvol_node, preimage, "logvol")?;
+            let at = if logvol_in_query_point { v } else { preimage };
+            let logvol_val = apply_change_of_variables(m, bij_resolved, logvol_node, at, "logvol")?;
             (build_call(m, "sub", &[inner_density, logvol_val]), None)
         }
     };
@@ -3612,7 +3624,11 @@ fn lower_locscale(
             Ok(gate_density(m, cond, at_atom))
         }
         Reference::Lebesgue => {
-            let logvol_val = apply_change_of_variables(m, node, bij.logvol, preimage, "logvol")?;
+            // Applied at `v`, the query point: `derive_locscale`'s logvol is the
+            // synthesis convention (`crate::invert::Bijection`). It is CONSTANT in the
+            // variate either way — `log|scale|` / `logabsdet(L)` ignore the argument —
+            // so the emission is unchanged by which point it reads.
+            let logvol_val = apply_change_of_variables(m, node, bij.logvol, v, "logvol")?;
             Ok(build_call(m, "sub", &[inner_density, logvol_val]))
         }
     }
