@@ -841,37 +841,137 @@ lp = logdensityof(lawof(record(y1 = y1)), record(y1 = 0.5))"),
     );
 }
 
-// The `iid`/`joint` combinators over the SAME correlated shape correctly emit the product,
-// and must keep doing so: §06 defines `joint(M1, M2, …)` as the "independent product
-// measure" `(M1 ⊗ M2)(A × B) = M1(A) · M2(B)`, so `joint(a = lawof(y1), b = lawof(y2))` asks
-// for the product of the two marginals — a DIFFERENT measure from
-// `lawof(record(y1 = y1, y2 = y2))`, which is the law of the traced sub-DAG. The
-// shared-latent refusal above must therefore be sited in the record path, not in the row.
+// §04 "Reified components share their ancestry" makes `joint(a = lawof(y1), b =
+// lawof(y2))` equivalent to `lawof(record(a = y1, b = y2))`: the shared ancestor is traced
+// once and the dependence is retained, so a keyword `joint` over two reified components now
+// reaches the SAME shared-latent record law as the plain record spelling — the correlated
+// joint, not the product of the two marginals. `iid` stays the product: §06 "iid" entry
+// makes it independent by construction, redrawing its reified sub-DAG afresh per copy and
+// never sharing ancestors with another copy. So the shared-latent refusal for a record
+// whose fields marginalize the SAME latent, pinned above, is reached from BOTH spellings —
+// the plain record and this `joint` rewrite of it — while `iid` never reaches it at all.
 #[test]
-fn joint_and_iid_over_a_shared_latent_are_products_by_definition() {
-    for src in [
-        "\
+fn joint_over_a_shared_latent_reaches_the_record_law_iid_stays_the_product() {
+    // `joint(a = lawof(y1), b = lawof(y2))` over the SAME shared-latent model as Point A
+    // above: truth -2.5171832107434002, against the product of the marginals
+    // -2.716024246969291. The emission must carry Point A's folded literals — same
+    // structure as `lawof(record(y1 = y1, y2 = y2))`, modulo the field names `a`/`b`.
+    let joint_lp = pir_binding(
+        &pir("\
 z = draw(Normal(mu = 0.0, sigma = 1.0))
 y1 = draw(Normal(mu = z, sigma = 1.0))
 y2 = draw(Normal(mu = z, sigma = 1.0))
-lp = logdensityof(joint(a = lawof(y1), b = lawof(y2)), record(a = 0.5, b = 0.7))",
-        "\
+lp = logdensityof(joint(a = lawof(y1), b = lawof(y2)), record(a = 0.5, b = 0.7))"),
+        "lp",
+    );
+    assert!(
+        joint_lp.contains("(mul -0.5 ") && joint_lp.contains("3.6757541328186907"),
+        "−½ over the flat sum, opening with 2·log 2π, the same as the plain record spelling:\n{joint_lp}"
+    );
+    assert_eq!(
+        joint_lp.matches("(log 1.0)").count(),
+        2,
+        "one log σᵢ² per field, both variances 1:\n{joint_lp}"
+    );
+    assert!(
+        joint_lp.contains("(log1p 2.0)"),
+        "the rank-one log-det term log(1 + s₀²Σdᵢ) at k = 2:\n{joint_lp}"
+    );
+    assert!(
+        joint_lp.contains(" 0.26)"),
+        "the Sherman–Morrison quadratic form 0.74 − 1.44/3 = 0.26:\n{joint_lp}"
+    );
+    assert!(
+        !joint_lp.contains("builtin_logdensityof"),
+        "the joint is one expression, not a product of scored marginals:\n{joint_lp}"
+    );
+    assert!(
+        !joint_lp.contains("1.4142135623730951"),
+        "no per-field Normal(0, √2) marginal survives:\n{joint_lp}"
+    );
+
+    // `iid(lawof(y1), 2)` over the SAME model still emits the product: two copies redraw
+    // `y1`'s reified sub-DAG (including `z`) afresh, so they never share the ancestor a
+    // `joint` of two DISTINCT reified draws now does.
+    let iid_lp = pir_binding(
+        &pir("\
 z = draw(Normal(mu = 0.0, sigma = 1.0))
 y1 = draw(Normal(mu = z, sigma = 1.0))
-lp = logdensityof(iid(lawof(y1), 2), [0.5, 0.7])",
+lp = logdensityof(iid(lawof(y1), 2), [0.5, 0.7])"),
+        "lp",
+    );
+    assert_eq!(
+        iid_lp.matches("builtin_logdensityof").count(),
+        2,
+        "iid's independent product is two factors:\n{iid_lp}"
+    );
+    assert_eq!(
+        iid_lp.matches("(%field sigma 1.4142135623730951)").count(),
+        2,
+        "each factor is the marginal Normal(0, sqrt 2):\n{iid_lp}"
+    );
+}
+
+// §04 "Singular joints": the same draw referenced twice, or a component that is a
+// deterministic transform of another component's draw, has no density w.r.t. the product
+// reference measure — refused rather than mislowered to a product. Positional `joint`
+// reaches this via the SAME record-law rank check `match_independent_record` already runs
+// for `lawof(record(...))` ("two fields resolve to the same draw"): `joint(lawof(a),
+// lawof(a))` rewrites to a two-field record both of whose fields are `a`'s own draw, and
+// `joint(lawof(a), lawof(exp(a)))` rewrites to a record whose second field is a transform
+// of the first field's draw — same draw site, so the same rank deficiency.
+#[test]
+fn a_singular_joint_refuses_rather_than_mislowers() {
+    for (label, src) in [
+        (
+            "the same draw referenced twice",
+            "\
+a = draw(Normal(mu = 0.0, sigma = 1.0))
+lp = logdensityof(joint(lawof(a), lawof(a)), [0.5, 0.7])",
+        ),
+        (
+            "a deterministic transform of another component's draw",
+            "\
+a = draw(Normal(mu = 0.0, sigma = 1.0))
+lp = logdensityof(joint(lawof(a), lawof(exp(a))), [0.5, 0.7])",
+        ),
     ] {
-        let lp = pir_binding(&pir(src), "lp");
-        assert_eq!(
-            lp.matches("builtin_logdensityof").count(),
-            2,
-            "the independent product is two factors:\n{lp}"
-        );
-        assert_eq!(
-            lp.matches("(%field sigma 1.4142135623730951)").count(),
-            2,
-            "each factor is the marginal Normal(0, sqrt 2):\n{lp}"
+        let m = parse_infer(src);
+        let err = determinize(&m).expect_err(&format!(
+            "{label} has no density w.r.t. the product reference measure, and must refuse"
+        ));
+        assert!(
+            err.reason.contains("same draw"),
+            "{label}: refusal should name the singularity:\n{}",
+            err.reason
         );
     }
+}
+
+// Mixed components (§06 "Mixed components"): a distribution CONSTRUCTOR component is
+// always a fresh draw, so dependence handling applies only among the REIFIED components.
+// `x = lawof(a)` shares `a`'s ancestor `z`, but the sole OTHER component here is a bare
+// `Normal(0, 1)` constructor — nothing to correlate with — so `x` keeps its own marginal
+// and `y` scores as an ordinary independent factor.
+#[test]
+fn a_constructor_component_is_a_fresh_draw_not_a_correlation_partner() {
+    let lp = pir_binding(
+        &pir("\
+z = draw(Normal(mu = 0.0, sigma = 1.0))
+a = draw(Normal(mu = z, sigma = 1.0))
+lp = logdensityof(joint(x = lawof(a), y = Normal(mu = 0.0, sigma = 1.0)), \
+         record(x = 0.5, y = 0.7))"),
+        "lp",
+    );
+    assert_eq!(
+        lp.matches("builtin_logdensityof").count(),
+        2,
+        "two independent factors, not a correlated joint:\n{lp}"
+    );
+    assert!(
+        lp.contains("(%field sigma 1.4142135623730951)"),
+        "x's marginal is Normal(0, √2), integrating z out:\n{lp}"
+    );
 }
 
 // Refusal is the fallback, and each row's nearest non-conjugate neighbour must keep hitting
