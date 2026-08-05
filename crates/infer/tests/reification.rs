@@ -177,11 +177,11 @@ fn infer_diags(src: &str) -> (flatppl_core::Module, Vec<flatppl_infer::Diagnosti
 }
 
 /// Spec §04 *Placeholders and holes*: "All placeholders must appear both in the
-/// expression to be reified and the boundary input keyword arguments." An
-/// `%autoinputs` boundary declares NO placeholder — the auto-trace records
-/// `elementof` leaves only — so this module violates the rule, and before this
-/// check it inferred with ZERO diagnostics and scored with a dangling
-/// `(%ref %local _v_)` inside `builtin_logdensityof`.
+/// expression to be reified and the boundary input keyword arguments." The
+/// auto-trace declares NO placeholder — it records `elementof` leaves only — so
+/// this module violates the rule, and before this check it inferred with ZERO
+/// diagnostics and scored with a dangling `(%ref %local _v_)` inside
+/// `builtin_logdensityof`.
 #[test]
 fn a_placeholder_no_boundary_declares_is_a_static_error() {
     let src = "F = functionof(Normal(mu = _v_, sigma = 1.0))\n\
@@ -284,5 +284,44 @@ fn a_placeholder_reached_through_a_self_ref_is_caught() {
             .iter()
             .any(|d| d.severity == Severity::Error && d.message.contains("placeholder `_v_`")),
         "the ref must be followed: {diags:?}"
+    );
+}
+
+/// FlatPIR may carry an explicit entry list under `%autoinputs` (the reader
+/// accepts one there), and an entry targeting a placeholder declares it exactly
+/// as a `%specinputs` entry does — §04 asks only that the placeholder "appear …
+/// in the boundary input keyword arguments", not which origin tag records them.
+/// No workspace producer emits this shape, hence the hand-written FlatPIR.
+#[test]
+fn an_autoinputs_entry_declares_its_placeholder() {
+    let pir = "(%module\n  \
+       (%public F)\n  \
+       (%bind F (functionof (Normal (%kwarg mu (%ref %local _v_)) (%kwarg sigma 1.0)) \
+       %autoinputs ((v (%ref %local _v_))))))";
+    let mut module = flatppl_flatpir::read(pir).expect("hand-written FlatPIR reads");
+    let diags = infer_module(&mut module, &ModuleBundle::new(), Level::Type);
+    assert!(
+        diags.iter().all(|d| d.severity != Severity::Error),
+        "the `%autoinputs` entry declares `_v_`: {diags:?}"
+    );
+}
+
+/// The control for the test above: an `%autoinputs` list that does NOT target
+/// the placeholder leaves it undeclared, so the §04 check still fires.
+#[test]
+fn an_autoinputs_list_that_misses_the_placeholder_still_errors() {
+    let pir = "(%module\n  \
+       (%public other)\n  \
+       (%public F)\n  \
+       (%bind other (elementof reals))\n  \
+       (%bind F (functionof (Normal (%kwarg mu (%ref %local _v_)) (%kwarg sigma 1.0)) \
+       %autoinputs ((w (%ref self other))))))";
+    let mut module = flatppl_flatpir::read(pir).expect("hand-written FlatPIR reads");
+    let diags = infer_module(&mut module, &ModuleBundle::new(), Level::Type);
+    assert!(
+        diags
+            .iter()
+            .any(|d| d.severity == Severity::Error && d.message.contains("placeholder `_v_`")),
+        "an entry for `other` declares no placeholder: {diags:?}"
     );
 }

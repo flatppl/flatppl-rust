@@ -56,7 +56,8 @@ pub(crate) enum Sig {
         /// Ordered constructor parameter names (spec §08/§09 "Parameters"
         /// column), e.g. `Normal` → `["mu", "sigma"]`. Consumed by the
         /// determiniser to build a density record's named fields from
-        /// positional call arguments. `#[serde(default)]` so parsing does not
+        /// positional call arguments, and by [`Catalogue::base_arity`] for the
+        /// call-arity rule. `#[serde(default)]` so parsing does not
         /// break mid-migration — every row is expected to fill it in.
         #[serde(default)]
         params: Vec<String>,
@@ -358,14 +359,33 @@ impl Catalogue {
     }
 
     /// The declared call arity of base builtin `name`, or `None` when the
-    /// catalogue declares no parameter list for it. Distribution rows are
-    /// excluded: their `params` are §08 field *names* added for the
-    /// determiniser, and several rows are knowingly degraded, so enforcing
-    /// §08 constructor arity needs its own grounding pass.
+    /// catalogue declares no parameter list for it.
+    ///
+    /// A distribution row's arity is exact: §08 "Built-in distributions" states
+    /// that "the names and order of the distribution parameters specified below
+    /// define the names and positional order of the kernel arguments", and no
+    /// §08 entry gives a parameter a default, so every one is required. An
+    /// unfilled `params` (the `#[serde(default)]` migration escape) yields
+    /// `None` rather than an invented arity of zero.
     pub fn base_arity(&self, name: &str) -> Option<Arity> {
         match self.base(name)? {
             Sig::Function { params, .. } | Sig::Structural { params } => Some(Arity::of(params)),
-            Sig::Distribution { .. } => None,
+            Sig::Distribution { params, .. } if params.is_empty() => None,
+            Sig::Distribution { params, .. } => Some(Arity {
+                min: params.len(),
+                max: Some(params.len()),
+            }),
+        }
+    }
+
+    /// The declared parameter NAMES of base builtin `name`, for the §04
+    /// name-binding rule. Only distribution rows have them: a `Sig::Function` /
+    /// `Sig::Structural` row declares `ParamSig` type tags, whose §07 names live
+    /// in the row's comment rather than in the data.
+    pub fn base_param_names(&self, name: &str) -> Option<&[String]> {
+        match self.base(name)? {
+            Sig::Distribution { params, .. } if !params.is_empty() => Some(params),
+            _ => None,
         }
     }
 
@@ -1050,8 +1070,8 @@ mod tests {
         }
     }
 
-    /// The §07 argument counts the arity rule enforces, including the two shapes
-    /// a plain `params.len()` would get wrong: `diag`'s optional `k` and
+    /// The §07/§08 argument counts the arity rule enforces, including the two
+    /// shapes a plain `params.len()` would get wrong: `diag`'s optional `k` and
     /// `builtin_sample`'s variadic sample shape.
     #[test]
     fn base_arity_reads_the_declared_parameter_list() {
@@ -1086,8 +1106,11 @@ mod tests {
         );
         // §07: `get | container, selectors...` — a container and at least one selector.
         assert_eq!(cat.base_arity("get"), Some(Arity { min: 2, max: None }));
-        // Distribution rows declare §08 field names, not a checked §07 arity.
-        assert_eq!(cat.base_arity("Normal"), None);
+        // §08 distribution rows: every parameter is required, so the arity is
+        // exactly the declared count.
+        assert_eq!(cat.base_arity("Normal"), fixed(2));
+        assert_eq!(cat.base_arity("StudentT"), fixed(1));
+        assert_eq!(cat.base_arity("GeneralizedNormal"), fixed(3));
         assert_eq!(cat.base_arity("NotARealBuiltin"), None);
     }
 

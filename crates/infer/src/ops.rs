@@ -78,7 +78,7 @@ pub(crate) fn call_rule(
     // Call arity, where the catalogue declares a parameter list. Ahead of the
     // per-op rules because most of them index fixed argument positions and so
     // ignore extras and silently type an under-supplied call.
-    if let Some(ty) = arity_check(inf, id, &name, args.len() + named.len()) {
+    if let Some(ty) = arity_check(inf, id, &name, args, named) {
         return (ty, joined);
     }
 
@@ -1536,9 +1536,10 @@ fn reification_type(
     args: &[ArgInfo],
 ) -> Type {
     // Boundary entries whose target ref is a `%local` placeholder — that entry
-    // IS the placeholder's declaration (spec §04). Filled per arm below; an
-    // `%autoinputs` boundary declares none (the auto-trace records `elementof`
-    // leaves, never a placeholder), so its list stays empty.
+    // IS the placeholder's declaration (spec §04), under either origin tag. The
+    // auto-trace itself only ever records `elementof` leaves, but FlatPIR may
+    // carry an explicit entry list under `%autoinputs`, and such an entry
+    // declares its placeholder exactly as a `%specinputs` entry does.
     let mut declared: Vec<Symbol> = Vec::new();
     let inputs: Box<[Symbol]> = match call.inputs.as_ref() {
         Some(Inputs::Spec(entries)) => {
@@ -1569,7 +1570,15 @@ fn reification_type(
             entries.iter().map(|(n, _)| *n).collect()
         }
         Some(Inputs::Auto) => match inf.module.auto_inputs_of(id) {
-            Some(entries) => entries.iter().map(|(n, _)| *n).collect(),
+            Some(entries) => {
+                declared.extend(
+                    entries
+                        .iter()
+                        .filter(|(_, r)| r.ns == RefNs::Local)
+                        .map(|(_, r)| r.name),
+                );
+                entries.iter().map(|(n, _)| *n).collect()
+            }
             None => {
                 // §04 auto-trace: discover the body's `elementof` parametric
                 // leaves (canonical-sorted by name) and fill the side-table, so
@@ -1645,6 +1654,8 @@ fn reification_type(
 /// `declared` does not list, as `(placeholder, first occurrence)` pairs in walk
 /// order. Spec §04 *Placeholders and holes*: "All placeholders must appear both
 /// in the expression to be reified and the boundary input keyword arguments."
+/// The operative rule: a boundary entry targeting the placeholder declares it,
+/// under either origin tag — a `%specinputs` entry or an `%autoinputs` entry.
 ///
 /// A nested `functionof`/`kernelof` is its OWN placeholder scope (§04: "The
 /// scope of a placeholder is the nearest enclosing `functionof` or `kernelof`"),
@@ -2016,9 +2027,10 @@ fn cat_or_diagnose(
 
 /// Reject an application of a user-defined callable whose argument count
 /// contradicts the callable's declared parameter list. Returns
-/// `Some(Type::Failed)` for a mismatch, `None` when the count matches or the
-/// callee is not a local reification (a cross-module or non-reified callee
-/// declares no parameter list here).
+/// `Some(Type::Failed)` for a mismatch, `None` when the count matches, the
+/// count is not knowable (see [`supplied_arg_count`]), or the callee is not a
+/// local reification (a cross-module or non-reified callee declares no
+/// parameter list here).
 ///
 /// Without this the call still types — `substituted_result` binds parameters to
 /// arguments by keyword then position and ignores the rest — so a wrong-arity
@@ -2037,17 +2049,27 @@ fn user_arity_check(
         return None;
     }
     let (reif_id, _) = local_reification(inf, callee)?;
-    let want = input_entries(inf, reif_id)?.len();
-    let got = args.len() + named.len();
-    if got == want {
-        return None;
-    }
+    let entries = input_entries(inf, reif_id)?;
+    let want = entries.len();
+    // §04 scopes auto-splatting to "built-in or user defined value functions,
+    // constructors or transition kernels", so a user call reads a sole record
+    // argument exactly as a builtin call does.
+    let reading = arg_reading(args, named, &|n| n == want)?;
+    let got = reading.count;
     let who = match inf.module.node(callee) {
         Node::Ref(r) if r.ns == RefNs::SelfMod => {
             format!("`{}`", inf.module.resolve(r.name))
         }
         _ => "callable".to_string(),
     };
+    if got == want {
+        // The count is right; the names still have to be the declared inputs.
+        let names: Vec<String> = entries
+            .iter()
+            .map(|(n, _)| inf.module.resolve(*n).to_string())
+            .collect();
+        return arg_name_check(inf, &names, &who, None, &reading, args, named);
+    }
     let noun = if want == 1 { "parameter" } else { "parameters" };
     inf.diags.push(crate::Diagnostic::error_at(
         id,
@@ -2648,24 +2670,203 @@ fn broadcast_distribution_no_shape(inf: &mut Inferencer<'_, '_>, head_node: Node
     }
 }
 
-/// Reject a call whose argument count contradicts the callee's declared §07
-/// parameter list. Returns `Some(Type::Failed)` for a mis-arity call and `None`
-/// when the call is admissible or the catalogue declares no arity for `name`.
-///
-/// `got` counts named arguments too: every §07 parameter is nameable, so
-/// `checked(value_expr, condition = …)` supplies two.
-fn arity_check(inf: &mut Inferencer<'_, '_>, id: NodeId, name: &str, got: usize) -> Option<Type> {
-    let arity = crate::catalogue::builtin().base_arity(name)?;
+/// Reject a call whose argument count contradicts the callee's declared
+/// parameter list — §07 for a function or arity-only row, §08 for a
+/// distribution constructor. Returns `Some(Type::Failed)` for a mis-arity call
+/// and `None` when the call is admissible, the count is not knowable
+/// (see [`supplied_arg_count`]), or the catalogue declares no arity for `name`.
+fn arity_check(
+    inf: &mut Inferencer<'_, '_>,
+    id: NodeId,
+    name: &str,
+    args: &[ArgInfo],
+    named: &[NamedInfo],
+) -> Option<Type> {
+    let cat = crate::catalogue::builtin();
+    let arity = cat.base_arity(name)?;
+    let reading = arg_reading(args, named, &|n| arity.admits(n))?;
+    let got = reading.count;
     if arity.admits(got) {
-        return None;
+        // The count is right; the names still have to be the declared ones.
+        // Only distribution rows declare names, so `?` here means "this row
+        // declares none — accept the call", not a failure to propagate.
+        let names = cat.base_param_names(name)?.to_vec();
+        return arg_name_check(
+            inf,
+            &names,
+            &format!("`{name}`"),
+            Some("§08"),
+            &reading,
+            args,
+            named,
+        );
     }
+    let section = if cat.base_is_distribution(name) {
+        "§08"
+    } else {
+        "§07"
+    };
     let declared = arity.describe();
     inf.diags.push(crate::Diagnostic::error_at(
         id,
-        format!("`{name}` takes {declared} (spec §07), got {got}"),
+        format!("`{name}` takes {declared} (spec {section}), got {got}"),
     ));
     Some(Type::Failed(
         format!("{name} takes {declared}, got {got}").into(),
+    ))
+}
+
+/// How a call's arguments read against a declared parameter count.
+struct ArgReading {
+    /// The argument count the admitting reading supplies.
+    count: usize,
+    /// True when §04 auto-splatting is the only reading that fits, so the sole
+    /// record's field names — not the keyword names — are what bind.
+    splatting: bool,
+}
+
+/// The reading of a call's arguments, or `None` when no reading can be trusted.
+///
+/// The plain reading counts positional plus keyword arguments: every §07
+/// parameter and every §08 distribution parameter is nameable (§04 "Calling
+/// conventions": "All built-in ordinary callables have a defined input order and
+/// accept both positional and keyword arguments"), so `checked(value_expr,
+/// condition = …)` and `Normal(mu = m, sigma = s)` each supply two.
+///
+/// A record or table given as the call's SOLE argument may instead auto-splat —
+/// §04: "`f(record(a = x, b = y, ...))` and `f(table(a = x, b = y, ...))` are
+/// equivalent to `f(a = x, b = y, ...)`" — supplying one argument per field.
+///
+/// **This is an INTERIM resolution of an open §04 question, not settled spec.**
+/// §04 enumerates exactly two cases that do NOT splat — "a record given alongside
+/// other arguments, or bound to a parameter by keyword" — and a positional sole
+/// record is neither, so the most direct reading is that it ALWAYS splats. Under
+/// that reading `generator = kernelof(x, pars = pars)` called as `generator(pars)`
+/// (`simple-transport1.flatppl:20`, and `transport-model.flatppl`) is invalid.
+/// Two anchors lean the other way, toward a splat conditioned on the names
+/// corresponding: §04's `fchain` paragraph ("if `f1` returns a record and `f2`
+/// accepts keyword arguments matching the record fields, the two functions compose
+/// directly"), and `determinizer::sample::record_splat_mismatch`, which already
+/// resolves the same ambiguity by name correspondence.
+///
+/// Pending that question, this accepts a call that EITHER reading satisfies,
+/// which rejects no model under either resolution. The cost is that a callee the
+/// plain reading already satisfies is never name-checked — see the TODO entry for
+/// the ten single-parameter §08 rows this blinds. `splatting` is set only when the
+/// splat reading is the only fit, so an ambiguous call is never name-checked
+/// against fields that may not be binding.
+///
+/// When such an argument's type is still open, neither reading is knowable.
+fn arg_reading(
+    args: &[ArgInfo],
+    named: &[NamedInfo],
+    admits: &dyn Fn(usize) -> bool,
+) -> Option<ArgReading> {
+    let plain = args.len() + named.len();
+    let plain_reading = Some(ArgReading {
+        count: plain,
+        splatting: false,
+    });
+    if !named.is_empty() || args.len() != 1 {
+        return plain_reading;
+    }
+    let fields = match &args[0].1 {
+        Type::Record(fields) => fields.len(),
+        Type::Table { columns, .. } => columns.len(),
+        Type::Deferred | Type::Var(_) | Type::Any | Type::Failed(_) => return None,
+        _ => return plain_reading,
+    };
+    // The plain reading wins ties only because it is the conservative half of the
+    // open question above, not because §04 prefers it.
+    if admits(plain) {
+        return plain_reading;
+    }
+    // Either the splat reading fits, or neither does — and when neither fits, the
+    // splat count is the one to report: a record handed to a callable it cannot
+    // fill is being splatted.
+    Some(ArgReading {
+        count: fields,
+        splatting: true,
+    })
+}
+
+/// The names a call binds its arguments to, each with the node to anchor a
+/// diagnostic at: the keyword arguments, or — when `reading` splats — the sole
+/// record or table argument's field names (anchored at that argument, the only
+/// node the type carries). Empty for a purely positional call, which binds by
+/// order and so has no names to check.
+fn supplied_arg_names(
+    inf: &Inferencer<'_, '_>,
+    reading: &ArgReading,
+    args: &[ArgInfo],
+    named: &[NamedInfo],
+) -> Vec<(String, NodeId)> {
+    if !reading.splatting {
+        return named
+            .iter()
+            .map(|(n, node, _, _)| (inf.module.resolve(*n).to_string(), *node))
+            .collect();
+    }
+    let (node, ty, _) = &args[0];
+    let fields = match ty {
+        Type::Record(fields) => fields,
+        Type::Table { columns, .. } => columns,
+        _ => return Vec::new(),
+    };
+    fields
+        .iter()
+        .map(|(n, _)| (inf.module.resolve(*n).to_string(), *node))
+        .collect()
+}
+
+/// Reject a call that binds an argument to a name the callee does not declare.
+///
+/// §04 "Calling conventions" makes keyword arguments bind by name — "Arguments
+/// are bound to inputs by name, the order of the arguments is not relevant" —
+/// and states the rule outright for the auto-splat form: "A call with field or
+/// column names that do not match the callable's argument names is a static
+/// error." Unenforced, `Normal(mu = 0.0, tau = 1.0)` passes on count alone and
+/// determinizes to `builtin_logdensityof(Normal, record(mu = 0.0, tau = 1.0), …)`
+/// — a nonexistent `tau` and a missing `sigma` handed to the engine.
+///
+/// Reports every unbindable name, and returns `Some(Type::Failed)` if there was
+/// one. `who` names the callee as it should read in the diagnostic; `section`
+/// attributes the parameter list ("spec §08" for a constructor row, `None` for a
+/// user callable, whose parameters are declared in the module itself).
+fn arg_name_check(
+    inf: &mut Inferencer<'_, '_>,
+    declared: &[String],
+    who: &str,
+    section: Option<&str>,
+    reading: &ArgReading,
+    args: &[ArgInfo],
+    named: &[NamedInfo],
+) -> Option<Type> {
+    let supplied = supplied_arg_names(inf, reading, args, named);
+    let unknown: Vec<(String, NodeId)> = supplied
+        .into_iter()
+        .filter(|(n, _)| !declared.iter().any(|d| d == n))
+        .collect();
+    if unknown.is_empty() {
+        return None;
+    }
+    let list = declared
+        .iter()
+        .map(|p| format!("`{p}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let source = match section {
+        Some(s) => format!("spec {s} parameters"),
+        None => "declares".to_string(),
+    };
+    for (name, at) in &unknown {
+        inf.diags.push(crate::Diagnostic::error_at(
+            *at,
+            format!("{who} has no parameter `{name}` ({source}: {list})"),
+        ));
+    }
+    Some(Type::Failed(
+        format!("{who} has no parameter `{}`", unknown[0].0).into(),
     ))
 }
 

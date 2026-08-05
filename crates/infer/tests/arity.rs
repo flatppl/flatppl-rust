@@ -140,6 +140,64 @@ fn named_arguments_count_toward_arity() {
     );
 }
 
+/// §04 scopes auto-splatting to "built-in or user defined value functions,
+/// constructors or transition kernels", and its `fchain` paragraph relies on it
+/// ("if `f1` returns a record and `f2` accepts keyword arguments matching the
+/// record fields, the two functions compose directly"), so a USER call must be
+/// able to count a sole record argument by its fields. Two corpus models are this
+/// shape — `simple-transport2.flatppl`'s `k_model(glob_pars)` and `feature-test1
+/// .flatppl`'s `forward_kernel(rand_pars)` — and both were falsely rejected while
+/// the user-call path counted a sole record as one argument.
+///
+/// That the splat reading must be AVAILABLE is settled; whether it is the only
+/// available one is the open §04 question pinned by
+/// `a_sole_record_is_accepted_as_one_argument_pending_the_open_sec04_question`.
+#[test]
+fn a_user_call_can_splat_a_sole_record_argument() {
+    let f = "lin(a, b, mu) = add(a, add(b, mu))\n\
+             pars = record(a = 1.0, b = 2.0, mu = 3.0)\n";
+    assert!(
+        errors(&format!("{f}y = lin(pars)")).is_empty(),
+        "a 3-field record fills three parameters by splatting"
+    );
+    // The lambda spelling `k_model` uses, whose boundary the sugar emits.
+    let g = "pars = record(a = 1.0, b = 2.0, mu = 3.0)\n\
+             k = (a, b, mu) -> add(a, add(b, mu))\n";
+    assert!(
+        errors(&format!("{g}y = k(pars)")).is_empty(),
+        "the lambda's `%specinputs` boundary is three parameters, and the record fills them"
+    );
+    // A record whose field count matches nothing still fails, at the splat count.
+    assert_eq!(
+        errors(&format!("{f}two = record(a = 1.0, b = 2.0)\ny = lin(two)")),
+        vec!["`lin` declares 3 parameters, got 2 arguments".to_string()]
+    );
+}
+
+/// INTERIM, pending an open §04 question — this pins today's permissive choice,
+/// not a settled rule. §04 enumerates exactly two non-splat cases ("a record given
+/// alongside other arguments, or bound to a parameter by keyword"), and a
+/// positional sole record is neither, so the most direct reading is that it ALWAYS
+/// splats — under which this very model is invalid. Two anchors lean toward a
+/// splat conditioned on the names corresponding: §04's `fchain` paragraph, and
+/// `determinizer::sample::record_splat_mismatch`. Until the question is settled,
+/// inference accepts a call that either reading satisfies, so it rejects no model
+/// under either resolution — and this shape, which the corpus uses
+/// (`simple-transport1.flatppl:20`'s `generator(pars)` against
+/// `generator = kernelof(x, pars = pars)`), keeps typing.
+///
+/// If §04 resolves to always-splat, this test should invert rather than be deleted.
+#[test]
+fn a_sole_record_is_accepted_as_one_argument_pending_the_open_sec04_question() {
+    let src = "pars = record(a = 1.0, b = 2.0, mu = 3.0)\n\
+               takes_a_record(p) = get(p, [\"a\"])\n\
+               y = takes_a_record(pars)";
+    assert!(
+        errors(src).is_empty(),
+        "a 3-field record is accepted as a single argument to a 1-parameter callable"
+    );
+}
+
 /// Applying a user-defined callable at the wrong arity is a static error naming
 /// the callee, instead of typing through `substituted_result`'s
 /// bind-what-you-can and reaching the determiniser as a `ResidualUserCall`.
@@ -168,12 +226,83 @@ fn user_call_arity_is_checked_against_the_declared_parameters() {
     );
 }
 
-/// A §08 distribution constructor is NOT arity-checked: its catalogue `params`
-/// are §08 field names added for the determiniser, and several rows are
-/// knowingly degraded, so enforcing §08 constructor arity needs its own pass.
+/// §08 "Built-in distributions": "The names and order of the distribution
+/// parameters specified below define the names and positional order of the
+/// kernel arguments." No §08 entry gives a parameter a default, so a
+/// constructor's arity is exactly its declared count — over- and under-supply
+/// are both static errors naming the constructor and that count.
 #[test]
-fn distribution_constructors_are_not_arity_checked() {
-    assert!(errors("m = Normal(0.0, 1.0, 2.0)").is_empty());
+fn distribution_constructor_arity_is_the_declared_parameter_count() {
+    for (src, want) in [
+        (
+            "m = Normal(0.0, 1.0, 2.0)",
+            "`Normal` takes 2 arguments (spec §08), got 3",
+        ),
+        (
+            "m = Normal(0.0)",
+            "`Normal` takes 2 arguments (spec §08), got 1",
+        ),
+        (
+            "m = StudentT(3.0, 1.0)",
+            "`StudentT` takes 1 argument (spec §08), got 2",
+        ),
+        (
+            "m = GeneralizedNormal(0.0, 1.0)",
+            "`GeneralizedNormal` takes 3 arguments (spec §08), got 2",
+        ),
+        (
+            "m = Poisson()",
+            "`Poisson` takes 1 argument (spec §08), got 0",
+        ),
+    ] {
+        assert_eq!(errors(src), vec![want.to_string()], "for {src}");
+        assert!(
+            ir(src).contains("(%failed"),
+            "{src} must type %failed:\n{}",
+            ir(src)
+        );
+    }
+}
+
+/// Every spelling §04 admits for a built-in constructor passes: positional,
+/// keyword, and mixed. §04 "Calling conventions": "All built-in ordinary
+/// callables have a defined input order and accept both positional and keyword
+/// arguments."
+#[test]
+fn every_constructor_call_spelling_passes_at_the_declared_count() {
+    assert!(errors("m = Normal(0.0, 1.0)").is_empty());
+    assert!(errors("m = Normal(mu = 0.0, sigma = 1.0)").is_empty());
+    assert!(
+        errors("m = Normal(sigma = 1.0, mu = 0.0)").is_empty(),
+        "keyword order is not significant (spec §04)"
+    );
+    assert!(errors("m = Normal(0.0, sigma = 1.0)").is_empty());
+    assert!(errors("m = Multinomial(3, [0.2, 0.8])").is_empty());
+}
+
+/// §04 "Calling conventions": "`f(record(a = x, b = y, ...))` … are equivalent
+/// to `f(a = x, b = y, ...)`", so a sole record argument supplies one argument
+/// per field. Counting it as one would reject the splat spelling of every
+/// multi-parameter constructor.
+#[test]
+fn a_sole_record_argument_supplies_one_argument_per_field() {
+    assert!(errors("m = Normal(record(mu = 0.0, sigma = 1.0))").is_empty());
+    assert!(
+        errors("p = record(mu = 0.0, sigma = 1.0)\nm = Normal(p)").is_empty(),
+        "the splat is about the argument being a record, not about spelling `record(…)` inline"
+    );
+    // The field count is what is checked, so a wrong-width record still fails.
+    assert_eq!(
+        errors("m = Normal(record(mu = 0.0, sigma = 1.0, tau = 2.0))"),
+        vec!["`Normal` takes 2 arguments (spec §08), got 3".to_string()]
+    );
+    // §04: auto-splatting fires only for a SOLE argument, so a record alongside
+    // other arguments counts as the one ordinary value it is — three here, not
+    // four.
+    assert_eq!(
+        errors("m = Normal(record(mu = 0.0, sigma = 1.0), 1.0, 2.0)"),
+        vec!["`Normal` takes 2 arguments (spec §08), got 3".to_string()]
+    );
 }
 
 /// §07's "Domains" column for the elementary functions lists `reals` and
@@ -202,5 +331,54 @@ fn elementary_functions_of_an_integer_are_real() {
     assert!(
         out.contains("(%scalar complex)"),
         "exp of a complex stays complex; got:\n{out}"
+    );
+}
+
+/// §04 "Calling conventions" binds keyword arguments by name — "Arguments are
+/// bound to inputs by name, the order of the arguments is not relevant" — and
+/// states the rule outright for the splat form: "A call with field or column
+/// names that do not match the callable's argument names is a static error."
+/// Checking the count alone let `Normal(mu = 0.0, tau = 1.0)` through and
+/// determinize to `builtin_logdensityof(Normal, record(mu = 0.0, tau = 1.0), …)`
+/// — a nonexistent `tau` and a missing `sigma` handed to the engine.
+#[test]
+fn a_named_argument_must_be_a_declared_parameter() {
+    assert_eq!(
+        errors("m = Normal(mu = 0.0, tau = 1.0)"),
+        vec!["`Normal` has no parameter `tau` (spec §08 parameters: `mu`, `sigma`)".to_string()]
+    );
+    // Every unbindable name is reported, not just the first.
+    assert_eq!(
+        errors("m = Normal(record(aaa = 0.0, bbb = 1.0))"),
+        vec![
+            "`Normal` has no parameter `aaa` (spec §08 parameters: `mu`, `sigma`)".to_string(),
+            "`Normal` has no parameter `bbb` (spec §08 parameters: `mu`, `sigma`)".to_string(),
+        ],
+        "a splatted record's field names are the names that bind"
+    );
+    // The §08 names themselves still pass, in any order, and positionally.
+    assert!(errors("m = Normal(mu = 0.0, sigma = 1.0)").is_empty());
+    assert!(errors("m = Normal(sigma = 1.0, mu = 0.0)").is_empty());
+    assert!(errors("m = Normal(0.0, sigma = 1.0)").is_empty());
+    assert!(errors("m = Normal(0.0, 1.0)").is_empty());
+    // A user callable's parameters are declared by its own boundary.
+    assert_eq!(
+        errors("f(x) = mul(x, 2.0)\ny = f(zzz = 1.5)"),
+        vec!["`f` has no parameter `zzz` (declares: `x`)".to_string()]
+    );
+    assert!(errors("f(x) = mul(x, 2.0)\ny = f(x = 1.5)").is_empty());
+}
+
+/// The name check must not fire on a call whose count is admissible under the
+/// ORDINARY reading of a sole record — there the record is one value and its
+/// fields are not binding names, so checking them would reject a legal call.
+#[test]
+fn an_ordinary_record_argument_is_not_name_checked() {
+    let src = "pars = record(zzz = 1.0, qqq = 2.0)\n\
+               takes_a_record(p) = get(p, [\"zzz\"])\n\
+               y = takes_a_record(pars)";
+    assert!(
+        errors(src).is_empty(),
+        "the record binds to `p`; `zzz`/`qqq` are its fields, not argument names"
     );
 }
