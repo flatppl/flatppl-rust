@@ -391,7 +391,7 @@ fn iid_index_projection_of_a_nonscalar_component_keeps_the_whole_row() {
     // that MvNormal itself, scored at the row [0.5, 0.5]. (A positional `joint`
     // has no such axis, which is why its own arm requires scalar components.)
     let p = pir(
-        "m = iid(MvNormal(mu = [0.0, 1.0], sigma = [[1.0, 0.0], [0.0, 1.0]]), 3)\n\
+        "m = iid(MvNormal(mu = [0.0, 1.0], cov = [[1.0, 0.0], [0.0, 1.0]]), 3)\n\
          p = pushfwd(fn(get(_, [1])), m)\n\
          lp = logdensityof(p, [[0.5, 0.5]])",
     );
@@ -486,7 +486,7 @@ fn index_projection_over_a_nonproduct_measure_names_the_missing_product_structur
     // was unrecognised, which would send a reader looking for a `bijection`
     // annotation (the wrong fix for a non-invertible projection).
     let e = determinize(&parse_infer(
-        "m = MvNormal(mu = [0.0, 1.0], sigma = [[1.0, 0.0], [0.0, 1.0]])\n\
+        "m = MvNormal(mu = [0.0, 1.0], cov = [[1.0, 0.0], [0.0, 1.0]])\n\
          p = pushfwd(fn(get(_, [1])), m)\n\
          lp = logdensityof(p, [0.5])",
     ))

@@ -2574,7 +2574,7 @@ fn bare_matrix_affine_value_law_lowers_like_the_record_spelling() {
     let prelude = "\
 A = [[2.0, 0.0], [0.0, 3.0]]
 b = [1.0, 1.0]
-x = draw(MvNormal(mu = [0.0, 0.0], sigma = [[1.0, 0.0], [0.0, 1.0]]))
+x = draw(MvNormal(mu = [0.0, 0.0], cov = [[1.0, 0.0], [0.0, 1.0]]))
 y = A * x + b
 ";
     let bare = flatppl_flatpir::write(&determinize_src(&format!(

@@ -378,6 +378,17 @@ impl Catalogue {
         }
     }
 
+    /// The declared parameter NAMES of base builtin `name`, for the §04
+    /// name-binding rule. Only distribution rows have them: a `Sig::Function` /
+    /// `Sig::Structural` row declares `ParamSig` type tags, whose §07 names live
+    /// in the row's comment rather than in the data.
+    pub fn base_param_names(&self, name: &str) -> Option<&[String]> {
+        match self.base(name)? {
+            Sig::Distribution { params, .. } if !params.is_empty() => Some(params),
+            _ => None,
+        }
+    }
+
     /// True iff base builtin `name` exists and has a distribution signature.
     /// Used by the LSP to bias completion ordering after a `~` binding.
     pub fn base_is_distribution(&self, name: &str) -> bool {
