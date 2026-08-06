@@ -2216,6 +2216,42 @@ impl<'m> Emitter<'m> {
         Some(elems[idx as usize])
     }
 
+    /// Record `value` as the `func.func` argument holding column/field `name` of
+    /// the aggregate ABI input `container` — the per-column destructuring
+    /// `crate::modes::bind_input` performs for a table/record `load_data` input.
+    /// The aggregate node itself is never bound in the memo (it has no monolithic
+    /// tensor form), so this side table is the ONLY way a column access can reach
+    /// its argument; [`Emitter::column_arg`] is the read side.
+    pub(crate) fn bind_column(&mut self, container: NodeId, name: String, value: Value) {
+        self.columns.insert((container, name), value);
+    }
+
+    /// If `args` is `get`/`get0`'s `[container, selector]` pair and `container`
+    /// resolves (one `(%ref self x)` hop) to an aggregate ABI input that
+    /// [`Emitter::bind_column`] destructured, return the [`Value`] of the column
+    /// the `selector` names — so `data.y` reads its own `%argN` rather than
+    /// trying to index a table that has no tensor form. `None` for every other
+    /// container/selector, including a column name the destructuring did not
+    /// produce (the caller then falls through to the ordinary `get` path, which
+    /// refuses).
+    ///
+    /// Disjoint from [`Emitter::named_field_projection`], which matches a
+    /// `table(...)`/`record(...)` LITERAL: a `load_data` container is neither, so
+    /// only one of the two can ever fire for a given node.
+    fn column_arg(&self, args: &[NodeId]) -> Option<Value> {
+        if self.columns.is_empty() {
+            return None;
+        }
+        let [container, selector] = <[NodeId; 2]>::try_from(args).ok()?;
+        let resolved = self.resolve_ref_one(container);
+        let field = match self.m.node(selector) {
+            Node::Lit(Scalar::Str(s)) => s.as_ref(),
+            Node::Const(sym) => self.m.resolve(*sym),
+            _ => return None,
+        };
+        self.columns.get(&(resolved, field.to_string())).cloned()
+    }
+
     /// If `args` is `get`/`get0`'s `[container, selector]` pair and
     /// `container` resolves (one `(%ref self x)` hop,
     /// [`Emitter::resolve_ref_one`]) to a `table(...)` or `record(...)`
@@ -2231,34 +2267,6 @@ impl<'m> Emitter<'m> {
     /// table/record literal, the selector is not a field name, or no field
     /// matches (the caller then tries [`Emitter::tuple_projection`], else the
     /// ordinary tensor `get`).
-    /// Record `value` as the `func.func` argument holding column/field `name`
-    /// of the aggregate ABI input `container` (`crate::modes`'s destructuring).
-    pub(crate) fn bind_column(&mut self, container: NodeId, name: String, value: Value) {
-        self.columns.insert((container, name), value);
-    }
-
-    /// If `args` is `get`/`get0`'s `[container, selector]` pair and `container`
-    /// resolves (one `(%ref self x)` hop) to an aggregate ABI input that was
-    /// destructured into per-column arguments, return the [`Value`] of the
-    /// column the `selector` names — so `data.y` reads its own `%argN` rather
-    /// than trying to index a table that has no tensor form. `None` for every
-    /// other container/selector, including a column name the destructuring did
-    /// not produce (the caller then falls through to the ordinary `get` path,
-    /// which refuses).
-    fn column_arg(&self, args: &[NodeId]) -> Option<Value> {
-        if self.columns.is_empty() {
-            return None;
-        }
-        let [container, selector] = <[NodeId; 2]>::try_from(args).ok()?;
-        let resolved = self.resolve_ref_one(container);
-        let field = match self.m.node(selector) {
-            Node::Lit(Scalar::Str(s)) => s.as_ref(),
-            Node::Const(sym) => self.m.resolve(*sym),
-            _ => return None,
-        };
-        self.columns.get(&(resolved, field.to_string())).cloned()
-    }
-
     fn named_field_projection(&self, args: &[NodeId]) -> Option<NodeId> {
         let [container, selector] = <[NodeId; 2]>::try_from(args).ok()?;
         let resolved = self.resolve_ref_one(container);
@@ -2716,17 +2724,20 @@ impl<'m> Emitter<'m> {
                         crate::registry::lower_touniform(self, id, &call.args)
                     } else if name == "broadcast" {
                         self.lower_broadcast(id, &call.args)
-                    } else if name == "mul" && crate::ops::is_matrix_product(self, &call.args) {
-                        // A BARE `mul` over a rank-2 lhs is the matrix product
-                        // (spec §07 "Linear algebra": "Matrix multiplication and
-                        // addition use the standard `*` and `+` operators"). The
-                        // elementwise `.*` spelling arrives as
-                        // `broadcast(mul, …)` and reaches `ops::lower_builtin`
-                        // through `lower_broadcast` instead, which never passes
-                        // through this dispatch — so the two spellings cannot be
+                    } else if name == "mul" {
+                        // A BARE `mul` is the surface `*`, which spec §07 "Linear
+                        // algebra" defines as the MATRIX product ("Matrix
+                        // multiplication and addition use the standard `*` and
+                        // `+` operators") — not as an elementwise op.
+                        // `ops::lower_bare_mul` routes by operand shape and
+                        // refuses a non-scalar pair §07 gives no meaning. The
+                        // elementwise `.*` spelling arrives as `broadcast(mul, …)`
+                        // and reaches `ops::lower_builtin` through
+                        // `lower_broadcast` instead, which never passes through
+                        // this dispatch — so the two spellings cannot be
                         // confused, and no state flag is needed to tell them
                         // apart.
-                        crate::ops::lower_matrix_product(self, id, &call.args)
+                        crate::ops::lower_bare_mul(self, id, &call.args)
                     } else if matches!(name.as_str(), "get0" | "get") {
                         // `get0(builtin_sample(...), k)` / `get((%ref self
                         // <shared-latent>), k)`: a projection of a sampled

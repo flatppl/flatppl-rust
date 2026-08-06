@@ -93,6 +93,19 @@
 //!   are both statically known and unequal — "matrix product inner dimensions
 //!   disagree: ...". A defensive second line: `infer`'s `mul_type` already
 //!   makes such a call `Type::Failed`, so the determiniser refuses it first.
+//! - a matrix product whose lowered operand RANKS disagree with the inferred
+//!   types the dispatch classified on — "matrix product operand ranks disagree
+//!   with their inferred types: ...". Unreachable unless the two layers drift;
+//!   it exists so `lower_matrix_product` cannot index past a short dim list.
+//! - a BARE `mul` (surface `*`) whose operands are both non-scalar but are not a
+//!   product §07 defines — two vectors, a rank-3 pair, a `TVector` product —
+//!   "`*` has no meaning for these operand shapes: ... Write `.*` for an
+//!   elementwise product, or `transpose(a) * b` for an inner product (which this
+//!   emitter does not yet lower)". §07 gives `*` on vectors a meaning only
+//!   through a transpose and none for rank 3, and `infer`'s `mul_type` returns
+//!   `Deferred` for both, so lowering them elementwise would silently answer a
+//!   different question. `ops::classify_bare_mul` decides; a scalar operand or an
+//!   absent type keeps the ordinary elementwise path.
 //! - an unknown builtin head — "unsupported builtin head '...'"
 //! - wrong arity for any arity-checked head (`args_exact`, shared by
 //!   `unary`/`binary`/`ifelse`/`get`/`get0`/`in`/`inf`) — "expected N

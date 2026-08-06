@@ -9620,6 +9620,130 @@ outputs = lp
     assert!(is_delimiter_balanced(&out));
 }
 
+/// `*` on two VECTORS refuses. §07 gives `*` a vector meaning only through a
+/// transpose ("the product of a transposed vector and a non-transposed vector is
+/// a scalar"), and `infer`'s `mul_type` returns `Deferred` for a rank-1 pair — so
+/// lowering it elementwise would answer a question the model did not ask (a user
+/// writing `v * w` for a dot product would silently get a vector of products).
+#[test]
+fn emit_logdensity_refuses_bare_mul_on_two_vectors() {
+    let src = "\
+v = elementof(cartpow(reals, 3))
+w = elementof(cartpow(reals, 3))
+z = v * w
+lp = logdensityof(lawof(record(y = draw(Normal(mu = sum(z), sigma = 1.0)))), record(y = 1.0))
+inputs = (v, w)
+outputs = lp
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let err = flatppl_stablehlo::emit(
+        &d,
+        flatppl_stablehlo::Mode::LogDensity,
+        &flatppl_stablehlo::EmitOptions::default(),
+    )
+    .unwrap_err();
+    assert!(
+        err.msg
+            .contains("`*` has no meaning for these operand shapes")
+            && err.msg.contains(".*"),
+        "expected a `*`-undefined refusal pointing at `.*`, got: {}",
+        err.msg
+    );
+}
+
+/// Same for a rank-3 pair, which §07 gives no product meaning at all.
+#[test]
+fn emit_logdensity_refuses_bare_mul_on_rank_three_operands() {
+    let src = "\
+a = elementof(cartpow(reals, [2, 3, 4]))
+b = elementof(cartpow(reals, [2, 3, 4]))
+z = a * b
+lp = logdensityof(lawof(record(y = draw(Normal(mu = sum(z), sigma = 1.0)))), record(y = 1.0))
+inputs = (a, b)
+outputs = lp
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let err = flatppl_stablehlo::emit(
+        &d,
+        flatppl_stablehlo::Mode::LogDensity,
+        &flatppl_stablehlo::EmitOptions::default(),
+    )
+    .unwrap_err();
+    assert!(
+        err.msg
+            .contains("`*` has no meaning for these operand shapes"),
+        "expected a `*`-undefined refusal for a rank-3 pair, got: {}",
+        err.msg
+    );
+}
+
+/// A bare `mul` with a SCALAR operand is untouched by the guard — it is the
+/// ordinary elementwise multiply, and it is the shape the determiniser's own
+/// synthesized `mul(literal, …)` sites build, so refusing it would break
+/// lowering well outside this wave.
+#[test]
+fn emit_logdensity_bare_mul_with_a_scalar_operand_stays_elementwise() {
+    let src = "\
+s = elementof(reals)
+w = elementof(cartpow(reals, 3))
+z = s * w
+lp = logdensityof(lawof(record(y = draw(Normal(mu = sum(z), sigma = 1.0)))), record(y = 1.0))
+inputs = (s, w)
+outputs = lp
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let out = emit_logdensity(&d);
+    assert!(
+        out.contains("stablehlo.multiply") && !out.contains("dot_general"),
+        "scalar * vector must stay an elementwise multiply, in:\n{out}"
+    );
+}
+
+/// Scalar `*` scalar likewise stays elementwise (the overwhelmingly common
+/// shape; the guard must not touch it).
+#[test]
+fn emit_logdensity_bare_mul_of_two_scalars_stays_elementwise() {
+    let src = "\
+s = elementof(reals)
+t = elementof(reals)
+z = s * t
+lp = logdensityof(lawof(record(y = draw(Normal(mu = z, sigma = 1.0)))), record(y = 1.0))
+inputs = (s, t)
+outputs = lp
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let out = emit_logdensity(&d);
+    assert!(
+        out.contains("stablehlo.multiply %arg0, %arg1 : tensor<f32>"),
+        "scalar * scalar must stay an elementwise multiply, in:\n{out}"
+    );
+}
+
+/// `.*` on two VECTORS stays elementwise — the guard keys on a BARE `mul`, and
+/// `.*` arrives as `broadcast(mul, …)` through a path that never reaches it. This
+/// is the pair the `*` refusal above points users toward, so it must work.
+#[test]
+fn emit_logdensity_elementwise_mul_over_vectors_stays_elementwise() {
+    let src = "\
+v = elementof(cartpow(reals, 3))
+w = elementof(cartpow(reals, 3))
+z = v .* w
+lp = logdensityof(lawof(record(y = draw(Normal(mu = sum(z), sigma = 1.0)))), record(y = 1.0))
+inputs = (v, w)
+outputs = lp
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let out = emit_logdensity(&d);
+    assert!(
+        out.contains("stablehlo.multiply %arg0, %arg1 : tensor<3xf32>"),
+        "`.*` over two vectors must stay an elementwise multiply, in:\n{out}"
+    );
+    assert!(
+        !out.contains("dot_general"),
+        "`.*` must not become a matrix product, in:\n{out}"
+    );
+}
+
 /// The elementwise `.*` spelling over two rank-2 operands stays elementwise —
 /// it must NOT be captured by the matrix-product dispatch (it arrives as
 /// `broadcast(mul, …)`, which never passes through that dispatch).

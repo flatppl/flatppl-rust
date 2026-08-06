@@ -222,37 +222,91 @@ fn require_broadcastable(id: NodeId, a: &Value, b: &Value) -> Result<(), EmitErr
     ))
 }
 
-/// Whether a bare `mul` node's operands are a MATRIX product rather than an
-/// elementwise one: a rank-2 left operand against a rank-2 (matrix·matrix) or
-/// rank-1 (matrix·vector) right one. Read off the operands' inferred FlatPDL
-/// types — the same discriminator `infer`'s `mul_type` uses — so no operand is
-/// lowered to answer the question. Spec §07 "Linear algebra": "Matrix
-/// multiplication and addition use the standard `*` and `+` operators."
-///
-/// TRAP FOR WHOEVER LOWERS `transpose`. §07 also makes "the product of a
-/// transposed vector and a non-transposed vector … a scalar", and `infer` types
-/// `transpose(a) * b` as exactly that. This predicate does NOT recognize it (the
-/// lhs is rank 1, not 2), so such a `mul` would fall to the elementwise path —
-/// where `require_broadcastable` sees two equal-rank, equal-length operands,
-/// passes, and emits an elementwise multiply instead of an inner product: a
-/// SILENT WRONG ANSWER, not a refusal. It is unreachable today only because
-/// `transpose` has no lowering in this map at all, so the `transpose` node
-/// refuses first. Adding a `transpose` lowering therefore REQUIRES adding the
-/// `TVector` cases here (and a `[n]x[n] -> scalar` contraction) in the same
-/// change.
-pub(crate) fn is_matrix_product(e: &Emitter, args: &[NodeId]) -> bool {
-    let [a, b] = match <[NodeId; 2]>::try_from(args) {
-        Ok(pair) => pair,
-        Err(_) => return false,
-    };
-    matches!(
-        (array_rank(e, a), array_rank(e, b)),
-        (Some(2), Some(2)) | (Some(2), Some(1))
-    )
+/// What a BARE `mul` (surface `*`, spec §07 "Linear algebra") means for the
+/// shapes of its operands.
+enum BareMul {
+    /// A rank-2 lhs against a rank-2 or rank-1 rhs: one `stablehlo.dot_general`.
+    MatrixProduct,
+    /// At least one operand is a scalar (or has no inferred type): the ordinary
+    /// elementwise multiply, which broadcasts the scalar side.
+    Elementwise,
+    /// Both operands are non-scalar but the pair is not a product this emitter
+    /// implements — and §07 gives `*` NO elementwise meaning, so lowering it
+    /// elementwise would answer a different question than the model asked.
+    Undefined,
 }
 
-/// The rank of `id`'s inferred `Array` type, flattening a nested element chain
-/// the way `crate::types::mlir_type_of` does — `None` for any other type.
+/// Classify a bare `mul`'s operands by their inferred FlatPDL types — the same
+/// information `infer`'s `mul_type` reads — so no operand is lowered to decide.
+///
+/// Only `Some(2)` on the LEFT makes a product, matching `mul_type`'s own
+/// matrix·matrix / matrix·vector arms. Every other non-scalar pair is
+/// [`BareMul::Undefined`]: §07 gives `*` on two vectors a meaning only WITH a
+/// transpose ("the product of a transposed vector and a non-transposed vector is
+/// a scalar") and none at all for rank-3 operands, and `mul_type` agrees by
+/// returning `Type::Deferred` for both. An operand whose type is absent
+/// (a freshly synthesized determiniser node before re-inference) or scalar
+/// classifies as [`BareMul::Elementwise`], which is what keeps the determiniser's
+/// own `mul(literal, vector)` idiom lowering.
+fn classify_bare_mul(e: &Emitter, args: &[NodeId]) -> BareMul {
+    let [a, b] = match <[NodeId; 2]>::try_from(args) {
+        Ok(pair) => pair,
+        // Wrong arity: let `binary`'s `args_exact` produce the arity message.
+        Err(_) => return BareMul::Elementwise,
+    };
+    match (array_rank(e, a), array_rank(e, b)) {
+        (Some(2), Some(2)) | (Some(2), Some(1)) => BareMul::MatrixProduct,
+        (Some(_), Some(_)) => BareMul::Undefined,
+        _ => BareMul::Elementwise,
+    }
+}
+
+/// Lower a bare `mul` — the surface `*`. Routes by [`classify_bare_mul`]:
+/// a matrix product to [`lower_matrix_product`], an undefined non-scalar pair to
+/// a refusal, and everything else to the elementwise `mul` in [`lower_builtin`].
+///
+/// Reached ONLY from `Emitter::lower_node`'s dispatch, never from
+/// `Emitter::lower_broadcast` — so the elementwise `.*` spelling
+/// (`broadcast(mul, …)`) is not classified here and keeps its own meaning.
+///
+/// The `Undefined` refusal also covers the `TVector` products §07 defines
+/// (`transpose(v) * w`): this emitter has no inner-product lowering, and
+/// refusing is right where silently emitting an elementwise multiply would be a
+/// wrong number. Whoever adds a `transpose` lowering must add the `TVector` arms
+/// to [`classify_bare_mul`] and a `[n]x[n] -> scalar` contraction with it; until
+/// then the shape refuses here rather than at `transpose`.
+pub(crate) fn lower_bare_mul(
+    e: &mut Emitter,
+    id: NodeId,
+    args: &[NodeId],
+) -> Result<Value, EmitError> {
+    match classify_bare_mul(e, args) {
+        BareMul::MatrixProduct => lower_matrix_product(e, id, args),
+        BareMul::Elementwise => binary(e, id, args, Emitter::mul),
+        BareMul::Undefined => {
+            let shape = |n: NodeId| match e.type_of(n) {
+                Some(t) => format!("{t:?}"),
+                None => "unknown".to_string(),
+            };
+            Err(EmitError::at(
+                id,
+                format!(
+                    "`*` has no meaning for these operand shapes: {} against {} — §07 \
+                     \"Linear algebra\" defines `*` as the matrix product (a matrix against a \
+                     matrix or a vector), and for vectors only through a transpose. Write `.*` \
+                     for an elementwise product, or `transpose(a) * b` for an inner product \
+                     (which this emitter does not yet lower)",
+                    shape(args[0]),
+                    shape(args[1])
+                ),
+            ))
+        }
+    }
+}
+
+/// The rank of `id`'s inferred `Array`/`TVector` type, flattening a nested
+/// element chain the way `crate::types::mlir_type_of` does — `None` for a scalar,
+/// an untyped node, or any other type.
 fn array_rank(e: &Emitter, id: NodeId) -> Option<usize> {
     fn rank(ty: &Type) -> Option<usize> {
         match ty {
@@ -264,16 +318,12 @@ fn array_rank(e: &Emitter, id: NodeId) -> Option<usize> {
     rank(e.type_of(id)?)
 }
 
-/// Lower a bare `mul` whose operands [`is_matrix_product`] identified: matrix·
+/// Lower a bare `mul` [`classify_bare_mul`] called a matrix product: matrix·
 /// vector via [`Emitter::matvec`], matrix·matrix via [`Emitter::matmat`], both
-/// one `stablehlo.dot_general`. The inner dimensions are checked HERE so a
-/// disagreement refuses; the emitter helpers panic on one, and this is the only
-/// caller that reaches them from surface `*`.
-pub(crate) fn lower_matrix_product(
-    e: &mut Emitter,
-    id: NodeId,
-    args: &[NodeId],
-) -> Result<Value, EmitError> {
+/// one `stablehlo.dot_general`. The operand RANKS and the inner dimensions are
+/// re-checked HERE so a disagreement refuses; the emitter helpers panic on one,
+/// and this is the only caller that reaches them from surface `*`.
+fn lower_matrix_product(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
     let [a, b] = args_exact(id, args)?;
     let a = e.lower_node(a)?;
     let b = e.lower_node(b)?;
@@ -283,6 +333,21 @@ pub(crate) fn lower_matrix_product(
             "matrix product needs ranked tensor operands",
         ));
     };
+    // The ranks come from the INFERRED types (`classify_bare_mul`) while the dims
+    // below come from the LOWERED values; if those two ever disagree, indexing
+    // `da[1]`/`db[0]` would panic in the one function whose job is to refuse
+    // before the emitter's own assertions are reached. Check rather than index
+    // blindly.
+    if da.len() != 2 || db.is_empty() || db.len() > 2 {
+        return Err(EmitError::at(
+            id,
+            format!(
+                "matrix product operand ranks disagree with their inferred types: \
+                 {:?} against {:?} — expected a rank-2 lhs and a rank-1 or rank-2 rhs",
+                a.ty, b.ty
+            ),
+        ));
+    }
     // A dynamic inner dim on either side is not a KNOWN disagreement, so it
     // passes: `dot_general` contracts it at run time.
     if matches!((da[1], db[0]), (Some(m), Some(n)) if m != n) {
