@@ -2384,8 +2384,10 @@ fn a_closed_reification_whose_body_holds_a_free_placeholder_is_not_unwrapped() {
 }
 
 // §04 "Kernels and `kernelof`": "`kernelof(x, kwargs...)` is equivalent to
-// `functionof(lawof(x), kwargs...)`". So `M = kernelof(a)` and `M = functionof(lawof(a))`
-// are one expression in two spellings, and `logdensityof(lawof(M), 0.5)` is one request
+// `functionof(lawof(x), kwargs...)` […]" — the elided tail scopes what the inner `lawof`
+// marginalizes over to the subgraph the `kwargs` delimit, which is vacuous for the
+// boundary-less spellings here. So `M = kernelof(a)` and `M = functionof(lawof(a))` are
+// one expression in two spellings, and `logdensityof(lawof(M), 0.5)` is one request
 // either way. The `functionof(lawof(a))` spelling lowered while `kernelof(a)` refused:
 // both wrappers are `Kernel`-typed, but only the `kernelof` one made the
 // measure-expression guard admit the WRAPPER and then run the draw walk on `a`'s own
@@ -2394,12 +2396,13 @@ fn a_closed_reification_whose_body_holds_a_free_placeholder_is_not_unwrapped() {
 // Pinned BYTE-IDENTICAL (same binding name in each) rather than merely both-lowering:
 // anything less lets the §04 equivalence drift apart again. The scored value is
 // `logpdf(Normal(0, 1), 0.5) = -1.0439385332046727` (Distributions.jl) — `a`'s own law,
-// since §04 "Phase of the reified law" has the reification absorb `a`'s stochasticity,
-// leaving nothing to marginalize.
+// since §04 "Phase of the reified law" has the reification absorb `a`'s stochasticity
+// ("`lawof` absorbs stochasticity into the reified law rather than propagating it
+// outward"), leaving nothing to marginalize.
 //
-// Whether `lawof` may take a MEASURE at all is a separate, open §04 question (`lawof`
-// "reifies a value node"): the outer `lawof` here is the same in both spellings, so any
-// ruling on it moves them together.
+// The outer `lawof` takes a MEASURE, which §04 states no rule for ("`lawof` reifies a
+// value node"). That admissibility question is settled separately, and either way it
+// applies to both spellings alike, so it cannot pull them apart.
 #[test]
 fn lawof_of_a_closed_kernelof_lowers_identically_to_its_section_04_equivalent() {
     let mut emitted: Vec<String> = Vec::new();
@@ -2446,6 +2449,94 @@ lp = logdensityof(M, 0.5)",
             && direct.contains("(%field sigma 1.0)"),
         "the scored term must be `a`'s own Normal(0, 1) density at 0.5 \
          (-1.0439385332046727, Distributions.jl):\n{direct}"
+    );
+}
+
+// §04's `kernelof` equivalence holds for ANY `x`, not just a bare `draw`, so the fix
+// generalizes past the roster pair above and these classes must be pinned too. Each row
+// is `lawof(kernelof(b))` against the plain `lawof(b)`, BYTE-IDENTICAL — the `kernelof` is
+// written inline so both modules carry the same bindings and the whole emission compares.
+//
+// All three refused at `b79517a`, the first two through the MARGINAL-law fall-through and
+// the third through the value-versus-measure arm. Each value is Distributions.jl:
+//
+// * `b = 2.0 * a`  — affine pushforward, `logpdf(Normal(0, 2), 0.5) = -1.643335713764618`,
+//   emitted as `logdensityof(Normal(0, 1), 0.25) - log(abs(2.0))`.
+// * `b = exp(a)`   — `logpdf(LogNormal(0, 1), 0.5) = -0.46601785960382813`, emitted with
+//   §06's support gate on `posreals`.
+// * `b = draw(Normal(mu = a, sigma = 1.0))` — a MARGINAL body, so `lawof` does integrate
+//   `a` out here: `logpdf(Normal(0, √2), 0.5) = -1.3280121234846454`.
+//
+// The third row is the one that shows the guard still marginalizes when the body calls for
+// it: reading the unwrapped body suppressed nothing, it only stopped the walk from
+// treating a VALUE body as a draw-parameterized measure.
+#[test]
+fn lawof_of_a_closed_kernelof_over_a_derived_value_matches_the_plain_spelling() {
+    for (body, expected) in [
+        ("2.0 * a", "(abs 2.0)"),
+        ("exp(a)", "posreals"),
+        (
+            "draw(Normal(mu = a, sigma = 1.0))",
+            "(%field sigma 1.4142135623730951)",
+        ),
+    ] {
+        let reified = flatppl_flatpir::write(&determinize_src(&format!(
+            "\
+a = draw(Normal(mu = 0.0, sigma = 1.0))
+b = {body}
+lp = logdensityof(lawof(kernelof(b)), 0.5)"
+        )));
+        let plain = flatppl_flatpir::write(&determinize_src(&format!(
+            "\
+a = draw(Normal(mu = 0.0, sigma = 1.0))
+b = {body}
+lp = logdensityof(lawof(b), 0.5)"
+        )));
+        assert_eq!(
+            reified, plain,
+            "`lawof(kernelof(b))` must lower as `lawof(b)` for b = {body}:\nreified:\n{reified}\nplain:\n{plain}"
+        );
+        assert!(
+            reified.contains(expected),
+            "b = {body} must keep its own lowering ({expected}):\n{reified}"
+        );
+    }
+}
+
+// OUT-OF-SPEC, pinned defensively — NOT derived from §04, and the sibling of the
+// `kernelof(Normal(…))` row in `lawof_of_a_closed_reification_lowers_identically_to_its_body`.
+// §04 "Kernels and `kernelof`" says "`x` must not be a measure", and a closed `kernelof(a)`
+// IS a measure by §06 "Uniform kernel extension" ("identify measures with nullary
+// kernels"), so the OUTER `kernelof` here is ill-formed. Nothing rejects it: it infers with
+// no diagnostic, and the unwrap runs to a fixpoint through both layers.
+//
+// It refused at `b79517a` only as a side effect of the wrapper-typed guard entry this wave
+// corrected — never for its §04 violation, and never with a message naming one. It now
+// lowers to the same term as the well-formed single-layer spelling, so the pin records a
+// defensible value for an ill-formed module rather than blessing the spelling.
+//
+// TODO: reject `kernelof(<measure>)` in `infer` (`crates/infer/src/ops.rs`), which covers
+// this row and the `kernelof(Normal(…))` one together — they are the same §04 clause. Left
+// out of this wave: it flips both pinned goldens to static errors, and `crates/infer` is
+// being changed on an unmerged branch.
+#[test]
+fn lawof_of_a_nested_kernelof_lowers_to_the_single_layer_term_though_out_of_spec() {
+    let nested = flatppl_flatpir::write(&determinize_src(
+        "\
+a = draw(Normal(mu = 0.0, sigma = 1.0))
+M = kernelof(kernelof(a))
+lp = logdensityof(lawof(M), 0.5)",
+    ));
+    let single = flatppl_flatpir::write(&determinize_src(
+        "\
+a = draw(Normal(mu = 0.0, sigma = 1.0))
+M = kernelof(a)
+lp = logdensityof(lawof(M), 0.5)",
+    ));
+    assert_eq!(
+        nested, single,
+        "an ill-formed extra `kernelof` layer must not change the value it lowers to:\n\
+         nested:\n{nested}\nsingle:\n{single}"
     );
 }
 
