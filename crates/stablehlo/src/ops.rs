@@ -186,40 +186,62 @@ fn binary<'m>(
     Ok(op(e, &a, &b))
 }
 
-/// Refuse an operand pair `Emitter::broadcast_pair` would panic on — different
-/// rank, or an axis pair that is neither equal nor size-1-vs-concrete (§04
-/// broadcasting). The elementwise `Emitter::binary`/`compare`/`select` helpers
-/// are infallible and have no `Result` to carry an [`EmitError`], so the check
-/// belongs here at the one call site that still has one. Without it a
-/// rank-mismatched elementwise op aborts the process instead of refusing.
+/// Refuse an operand pair `Emitter::broadcast_pair` would panic on. The
+/// elementwise `Emitter::binary`/`compare`/`select` helpers are infallible and
+/// have no `Result` to carry an [`EmitError`], so the check belongs here at the
+/// one call site that still has one. Without it a pair with no broadcast form
+/// aborts the process instead of refusing.
+///
+/// Enumerates the pairs `broadcast_pair` HANDLES and refuses everything else,
+/// rather than listing the pairs it panics on: `MlirTy` has four variants, so a
+/// `Key` or `Tuple` operand reaches its `(ta, tb) => panic!` arm exactly as a
+/// rank mismatch does. Matching positively also means a variant added later
+/// refuses by default instead of silently acquiring a panic path.
 fn require_broadcastable(id: NodeId, a: &Value, b: &Value) -> Result<(), EmitError> {
-    let (MlirTy::Ranked(da), MlirTy::Ranked(db)) = (&a.ty, &b.ty) else {
-        // A scalar operand broadcasts against any rank; a `Key` never reaches an
-        // arithmetic op.
-        return Ok(());
+    let refuse = |why: &str| {
+        Err(EmitError::at(
+            id,
+            format!(
+                "elementwise operands do not broadcast: {:?} against {:?} — {why}",
+                a.ty, b.ty
+            ),
+        ))
     };
-    let compatible = da.len() == db.len()
-        && da.iter().zip(db.iter()).all(|(&x, &y)| {
-            matches!(
-                (x, y),
-                (Some(m), Some(n)) if m == n)
-                || matches!(
-                    (x, y),
-                    (Some(1), Some(_)) | (Some(_), Some(1)) | (None, None)
-                )
-        });
-    if compatible {
-        return Ok(());
+    // An rng-state key and a tuple have no arithmetic form at all, equal types or
+    // not: `broadcast_pair`'s equal-type fast path would hand such a pair straight
+    // through to an arithmetic op that cannot mean anything on it.
+    let unarithmetic = |t: &MlirTy| matches!(t, MlirTy::Key | MlirTy::Tuple(_));
+    if unarithmetic(&a.ty) || unarithmetic(&b.ty) {
+        return refuse(
+            "an rng-state key and a tuple have no elementwise arithmetic form (spec §07's \
+             rng state is threaded, never computed on)",
+        );
     }
-    Err(EmitError::at(
-        id,
-        format!(
-            "elementwise operands do not broadcast: {:?} against {:?} — §04 broadcasting \
-             needs equal rank with each axis pair equal or size 1 (a matrix product is the \
-             non-elementwise `*`, not `.*`)",
-            a.ty, b.ty
-        ),
-    ))
+    match (&a.ty, &b.ty) {
+        // A scalar operand broadcasts against any rank.
+        (MlirTy::Scalar, _) | (_, MlirTy::Scalar) => Ok(()),
+        (MlirTy::Ranked(da), MlirTy::Ranked(db)) => {
+            let compatible = da.len() == db.len()
+                && da.iter().zip(db.iter()).all(|(&x, &y)| {
+                    matches!(
+                        (x, y),
+                        (Some(m), Some(n)) if m == n)
+                        || matches!(
+                            (x, y),
+                            (Some(1), Some(_)) | (Some(_), Some(1)) | (None, None)
+                        )
+                });
+            if compatible {
+                Ok(())
+            } else {
+                refuse(
+                    "§04 broadcasting needs equal rank with each axis pair equal or size 1 \
+                     (a matrix product is the non-elementwise `*`, not `.*`)",
+                )
+            }
+        }
+        _ => refuse("no broadcast form for this shape pair"),
+    }
 }
 
 /// What a BARE `mul` (surface `*`, spec §07 "Linear algebra") means for the

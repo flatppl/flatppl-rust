@@ -522,9 +522,9 @@ fn bind_input(
         return Err(EmitError::at(
             rhs,
             format!(
-                "`inputs` entry `{}` declares no shape (`anything`) and cannot be a \
-                 function argument; give it the value set it actually holds — an engine \
-                 must not infer the shape from the source",
+                "`inputs` entry `{}` declares no shape (`anything`) and cannot be promoted \
+                 to a function argument (spec §13 signature); give it the value set it \
+                 actually holds",
                 m.resolve(sym)
             ),
         ));
@@ -536,9 +536,10 @@ fn bind_input(
                 EmitError::at(
                     rhs,
                     format!(
-                        "`inputs` entry `{}` column `{name}` has no tensor form, so the \
-                         entry cannot be destructured into arguments; a column must be a \
-                         scalar or an array of scalars",
+                        "`inputs` entry `{}` column `{name}` has no tensor form, so this \
+                         emitter cannot destructure the entry into arguments; it handles a \
+                         scalar column and an array-valued one, but not a nested \
+                         table/record column (which §03 does permit)",
                         m.resolve(sym)
                     ),
                 )

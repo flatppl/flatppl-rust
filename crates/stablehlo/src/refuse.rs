@@ -54,16 +54,20 @@
 //!   input (`external`/`load_data`) — e.g. a literal or a derived/computed
 //!   binding — "`inputs` entry '...' is not an elementof parameter, external,
 //!   or load_data input — only these constructs can be ABI arguments"
-//! - an `inputs` entry that declares no shape (`load_data(source, anything)`)
-//!   — "`inputs` entry '...' declares no shape (`anything`) and cannot be a
-//!   function argument; ..." (spec §07: an engine must not infer the shape
-//!   from the source; §13 `sec:determinization-signature`: `anything`
-//!   "declares none and cannot be promoted")
+//! - an `inputs` entry that declares no shape — "`inputs` entry '...' declares
+//!   no shape (`anything`) and cannot be promoted to a function argument (spec
+//!   §13 signature); ..." (§13 `sec:determinization-signature`: `anything`
+//!   "declares none and cannot be promoted"). Fires for EVERY construct over
+//!   `anything`, not only `load_data`, so the message cites the signature rule
+//!   rather than §07's don't-read-the-source clause — `elementof(anything)`
+//!   has no source to read.
 //! - a destructured aggregate entry with a column that has no tensor form of
 //!   its own (a nested record/table column) — "`inputs` entry '...' column
-//!   '...' has no tensor form, so the entry cannot be destructured into
-//!   arguments; ..." (names the column, unlike `types.rs`'s generic aggregate
-//!   refusal)
+//!   '...' has no tensor form, so this emitter cannot destructure the entry
+//!   into arguments; ..." (names the column, unlike `types.rs`'s generic
+//!   aggregate refusal). Worded as an EMITTER limit, not a language rule: §03
+//!   Tables says "Each column is a vector or a table", so a nested table
+//!   column is legal FlatPPL that this backend declines to flatten.
 //! - (`emit_sample_abi`) `outputs` naming other than exactly one output —
 //!   "`outputs` for a sample query must name exactly one output (the sampled
 //!   value)" (`EmitError::whole`)

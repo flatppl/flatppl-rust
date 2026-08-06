@@ -67,6 +67,16 @@ numbering runs over the flattened list, so an entry after a destructured one
 shifts by the column count. A column that is itself an aggregate (a nested
 record) refuses, naming the column.
 
+**A dynamic row count emits `?` columns, and nothing checks them at run time.**
+A valueset whose power is non-literal — `cartpow(cartprod(x, y), n)` with
+`n = external(posintegers)` — has no statically known row count, so its column
+arguments type `tensor<?xf32>`. The `n` argument is emitted alongside them as an
+ordinary `tensor<i32>` input, but **nothing ties the runtime length of those
+columns to the value passed as `n`**: the host is responsible for supplying
+consistent shapes, and a mismatch is neither refused here nor detected by the
+emitted module. A model that needs the length pinned at compile time should
+declare a literal row count.
+
 `inputs` is **authoritative and exhaustive**: every `elementof` parameter in
 the module must appear in it, or emission refuses. A binding that is neither an
 `elementof` parameter nor a fixed `external`/`load_data` input (e.g. a literal

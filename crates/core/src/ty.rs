@@ -171,8 +171,10 @@ impl ValueSet {
             // row count (spec §03: `cartpow(recordset, n)` is "the set of n-row
             // tables"). The row record is `Record(columns)` — each column stores
             // its per-row element type (scalar, array, or — for a table-valued
-            // column — a record). This matches `load_data`'s table value-set
-            // (`cartpow(recordset, %dynamic)`), so both representations agree.
+            // column — a record). This matches the value-set a table SET
+            // expression carries (`cartpow(recordset, n)`, whatever construct
+            // declares it — `elementof`, `external`, `load_data`), so the two
+            // representations of one table agree.
             Type::Table { columns, nrows } => match record_natural(columns) {
                 ValueSet::Unknown => ValueSet::Unknown,
                 rec => ValueSet::CartPow(Box::new(rec), *nrows),

@@ -71,6 +71,16 @@ fn value_sets_are_refinements_of_natural_extent() {
         "tn = table(id = [1, 2], hits = table(x = [1.0, 2.0]))",
         "ld = load_data(source = \"d.csv\", valueset = cartprod(a = reals, b = posreals))",
         "lc = load_data(source = \"d.csv\", valueset = cartpow(posreals, 3))",
+        // The TABLE producer: a power of a record set now types as `Table`, so its
+        // value-set must still prove ⊆ natural_of(Table) = cartpow(record, nrows).
+        // This is the exact drift the guard exists to catch, on every construct
+        // that can declare the set.
+        "lt = load_data(source = \"d.csv\", valueset = cartpow(cartprod(a = reals, b = posreals), 4))",
+        "et = elementof(cartpow(cartprod(a = reals, b = posreals), 4))",
+        "xt = external(cartpow(cartprod(a = reals, b = posreals), 4))",
+        // An array-valued column under the row axis (§03: "a vector column's
+        // elements may themselves be arrays").
+        "lv = load_data(source = \"d.csv\", valueset = cartpow(cartprod(a = cartpow(reals, 3), b = reals), 4))",
         // measures: the support is a refinement of the domain extent
         "m = truncate(Normal(mu = 0.0, sigma = 1.0), interval(0.0, 1.0))",
         "obs = iid(Normal(mu = 0.0, sigma = 1.0), 5)",
