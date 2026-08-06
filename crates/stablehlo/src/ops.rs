@@ -25,6 +25,15 @@
 //! `Emitter::lower_node`, which [`Emitter::lower_broadcast`] bypasses, so a
 //! `.*`-derived `mul` can never reach it.
 //!
+//! **Nor is `+` `.+`.** The same split covers the other operators §07
+//! "Operator-equivalent functions" gives a narrower domain than elementwise:
+//! `add`/`sub` take "scalars or arrays of same shape (real or complex)",
+//! `divide`/`pow` "scalars (real or complex)". The entries below are the
+//! *elementwise* lowerings the dotted spellings need, so `Emitter::lower_node`
+//! routes the BARE heads through [`lower_bare_arith`] first, which refuses an
+//! out-of-domain operand pair rather than letting `Emitter::broadcast_pair`
+//! silently answer what `.+` asks.
+//!
 //! A `builtin_*` primitive (`builtin_logdensityof`, `builtin_sample`,
 //! `builtin_touniform`, `builtin_fromuniform`, `builtin_tonormal`,
 //! `builtin_fromnormal`) or a bare distribution constructor name (`Normal`,
@@ -332,6 +341,150 @@ pub(crate) fn lower_bare_mul(
                 ),
             ))
         }
+    }
+}
+
+/// What a bare `add`/`sub`/`divide`/`pow` operand's inferred type says about its
+/// §07 arithmetic shape. [`ArithShape::Unknown`] is the permissive class: it
+/// covers `%deferred`, `%any`, an absent type (a freshly synthesized determiniser
+/// node before re-inference) and every non-arithmetic type, so the guard below
+/// refuses only a shape pair it can PROVE is outside the domain.
+enum ArithShape {
+    Scalar,
+    /// A flat axis list, nested element chains flattened as
+    /// [`array_rank`]/`crate::types::mlir_type_of` flatten them. `None` is a
+    /// dynamic axis, which matches any extent.
+    Array(Vec<Option<u32>>),
+    /// A transposed (row) vector — §03 keeps it distinct from a rank-1 `Array`,
+    /// so the two are never "the same shape".
+    TVector(Vec<Option<u32>>),
+    Unknown,
+}
+
+impl ArithShape {
+    fn is_array(&self) -> bool {
+        matches!(self, ArithShape::Array(_) | ArithShape::TVector(_))
+    }
+
+    /// The pair is PROVABLY not the same shape. A dynamic axis against anything
+    /// is not a proof, so it passes; only a statically-unequal extent, a rank
+    /// difference, an array-against-scalar mix, or an `Array`/`TVector`
+    /// transposition mismatch counts.
+    fn differs_from(&self, other: &ArithShape) -> bool {
+        use ArithShape::*;
+        match (self, other) {
+            (Unknown, _) | (_, Unknown) => false,
+            (Scalar, Scalar) => false,
+            (Scalar, _) | (_, Scalar) => true,
+            // A column vector against a row vector.
+            (Array(_), TVector(_)) | (TVector(_), Array(_)) => true,
+            (Array(a), Array(b)) | (TVector(a), TVector(b)) => {
+                a.len() != b.len()
+                    || a.iter()
+                        .zip(b.iter())
+                        .any(|(x, y)| matches!((x, y), (Some(m), Some(n)) if m != n))
+            }
+        }
+    }
+}
+
+/// Classify `id`'s inferred type for the bare-arithmetic domain guard.
+fn arith_shape(e: &Emitter, id: NodeId) -> ArithShape {
+    /// The axes an `Array`/`TVector` element chain contributes, or `None` for a
+    /// scalar leaf.
+    fn axes(ty: &Type) -> Option<Vec<Option<u32>>> {
+        let dim = |d: &flatppl_core::Dim| match d {
+            flatppl_core::Dim::Static(n) => Some(*n),
+            flatppl_core::Dim::Dynamic => None,
+        };
+        match ty {
+            Type::Array { shape, elem } => {
+                let mut v: Vec<Option<u32>> = shape.iter().map(dim).collect();
+                v.extend(axes(elem).unwrap_or_default());
+                Some(v)
+            }
+            Type::TVector { len, elem } => {
+                let mut v = vec![dim(len)];
+                v.extend(axes(elem).unwrap_or_default());
+                Some(v)
+            }
+            _ => None,
+        }
+    }
+    match e.type_of(id) {
+        Some(Type::Scalar(_)) => ArithShape::Scalar,
+        Some(ty @ Type::Array { .. }) => ArithShape::Array(axes(ty).unwrap_or_default()),
+        Some(ty @ Type::TVector { .. }) => ArithShape::TVector(axes(ty).unwrap_or_default()),
+        _ => ArithShape::Unknown,
+    }
+}
+
+/// Lower a bare `add`/`sub`/`divide`/`pow` — the surface `+`, `-`, `/`, `^` —
+/// refusing an operand pair outside the §07 "Operator-equivalent functions"
+/// domain for that head:
+///
+/// - `add`/`sub`: "scalars or arrays of same shape (real or complex)". A scalar
+///   against an array is OUTSIDE it, so `scalar + vector` refuses; two arrays of
+///   the same shape are vector addition and stay legal.
+/// - `divide`/`pow`: "scalars (real or complex)". Any array operand refuses.
+///
+/// `neg` needs no guard: its domain is "scalars or arrays", so elementwise
+/// negation of an array is already sound.
+///
+/// Reached ONLY from `Emitter::lower_node`'s dispatch, never from
+/// `Emitter::lower_broadcast` — the dotted spellings (`.+`, `.-`, `./`, `.^`)
+/// arrive as `broadcast(add, …)` etc. and re-enter [`lower_builtin`] directly, so
+/// they keep broadcasting. Same discriminator as [`lower_bare_mul`]'s.
+///
+/// Classifying on the INFERRED types (not the lowered shapes) is what keeps the
+/// determiniser's synthesized arithmetic lowering: a node it built fresh has no
+/// type yet, and a `%local` inside a `functionof` monomorphised under `broadcast`
+/// is typed scalar even though its bound value is rank-1.
+pub(crate) fn lower_bare_arith<'m>(
+    e: &mut Emitter<'m>,
+    id: NodeId,
+    head: &str,
+    args: &[NodeId],
+) -> Result<Value, EmitError> {
+    type BinOp<'m> = fn(&mut Emitter<'m>, &Value, &Value) -> Value;
+    let (op, surface, dotted): (BinOp<'m>, &str, &str) = match head {
+        "add" => (Emitter::add, "+", ".+"),
+        "sub" => (Emitter::sub, "-", ".-"),
+        "divide" => (Emitter::div, "/", "./"),
+        "pow" => (Emitter::pow, "^", ".^"),
+        other => {
+            return Err(EmitError::at(
+                id,
+                format!("not a bare arithmetic head '{other}'"),
+            ));
+        }
+    };
+    // Wrong arity: let `binary`'s `args_exact` produce the arity message.
+    let Ok([a, b]) = <[NodeId; 2]>::try_from(args) else {
+        return binary(e, id, args, op);
+    };
+    let (sa, sb) = (arith_shape(e, a), arith_shape(e, b));
+    let shape = |n: NodeId| match e.type_of(n) {
+        Some(t) => format!("{t:?}"),
+        None => "unknown".to_string(),
+    };
+    let refuse = |domain: &str| {
+        Err(EmitError::at(
+            id,
+            format!(
+                "`{surface}` has no meaning for these operand shapes: {} against {} — §07 \
+                 \"Operator-equivalent functions\" gives `{head}` the domain {domain}. Write \
+                 `{dotted}` for the elementwise form (`broadcast({head}, …)`), which broadcasts \
+                 a scalar against an array",
+                shape(a),
+                shape(b)
+            ),
+        ))
+    };
+    match head {
+        "divide" | "pow" if sa.is_array() || sb.is_array() => refuse("\"scalars\""),
+        "add" | "sub" if sa.differs_from(&sb) => refuse("\"scalars or arrays of same shape\""),
+        _ => binary(e, id, args, op),
     }
 }
 

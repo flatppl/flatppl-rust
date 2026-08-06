@@ -10000,6 +10000,340 @@ outputs = lp
     );
 }
 
+// ---- the bare `+`/`-`/`/`/`^` domain guard ----------------------------------
+//
+// §07 "Operator-equivalent functions" gives each head a DOMAIN: `add`/`sub`
+// "scalars or arrays of same shape (real or complex)", `divide` and `pow`
+// "scalars (real or complex)". Outside it a bare operator has no mathematical
+// meaning, and the elementwise reading is spelled with the dotted form. All four
+// heads used to route straight to `Emitter::add`/`sub`/`div`/`pow`, whose
+// `broadcast_pair` reconciles a scalar against an array — so `scalar + vector`
+// silently emitted the number `.+` means. `ops::lower_bare_arith` refuses it.
+// The guard keys on the BARE head, exactly as the `*` guard above does, so the
+// dotted spellings and an explicit `broadcast(add, …)` keep broadcasting.
+
+/// `scalar + vector` is outside `add`'s domain and must refuse, naming `.+`.
+#[test]
+fn emit_logdensity_refuses_bare_add_of_scalar_and_vector() {
+    let src = "\
+s = elementof(reals)
+v = elementof(cartpow(reals, 3))
+z = s + v
+lp = logdensityof(lawof(record(y = draw(Normal(mu = sum(z), sigma = 1.0)))), record(y = 1.0))
+inputs = (s, v)
+outputs = lp
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let err = flatppl_stablehlo::emit(
+        &d,
+        flatppl_stablehlo::Mode::LogDensity,
+        &flatppl_stablehlo::EmitOptions::default(),
+    )
+    .unwrap_err();
+    assert!(
+        err.msg
+            .contains("`+` has no meaning for these operand shapes")
+            && err.msg.contains("arrays of same shape")
+            && err.msg.contains(".+"),
+        "expected an `add`-domain refusal pointing at `.+`, got: {}",
+        err.msg
+    );
+}
+
+/// `sub` carries the same domain, so `vector - scalar` refuses too — and in the
+/// other operand order, since the domain is symmetric.
+#[test]
+fn emit_logdensity_refuses_bare_sub_of_vector_and_scalar() {
+    let src = "\
+s = elementof(reals)
+v = elementof(cartpow(reals, 3))
+z = v - s
+lp = logdensityof(lawof(record(y = draw(Normal(mu = sum(z), sigma = 1.0)))), record(y = 1.0))
+inputs = (s, v)
+outputs = lp
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let err = flatppl_stablehlo::emit(
+        &d,
+        flatppl_stablehlo::Mode::LogDensity,
+        &flatppl_stablehlo::EmitOptions::default(),
+    )
+    .unwrap_err();
+    assert!(
+        err.msg
+            .contains("`-` has no meaning for these operand shapes")
+            && err.msg.contains(".-"),
+        "expected a `sub`-domain refusal pointing at `.-`, got: {}",
+        err.msg
+    );
+}
+
+/// Two arrays of DIFFERENT shape are also outside `add`'s domain — `broadcast_pair`
+/// would have reconciled a size-1 axis, which is `.+`'s meaning, not `+`'s.
+#[test]
+fn emit_logdensity_refuses_bare_add_of_mismatched_vectors() {
+    let src = "\
+v = elementof(cartpow(reals, 3))
+w = elementof(cartpow(reals, 1))
+z = v + w
+lp = logdensityof(lawof(record(y = draw(Normal(mu = sum(z), sigma = 1.0)))), record(y = 1.0))
+inputs = (v, w)
+outputs = lp
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let err = flatppl_stablehlo::emit(
+        &d,
+        flatppl_stablehlo::Mode::LogDensity,
+        &flatppl_stablehlo::EmitOptions::default(),
+    )
+    .unwrap_err();
+    assert!(
+        err.msg
+            .contains("`+` has no meaning for these operand shapes"),
+        "expected an `add`-domain refusal for mismatched shapes, got: {}",
+        err.msg
+    );
+}
+
+/// `divide`'s domain is "scalars", so ANY array operand refuses — including the
+/// scale-a-vector idiom `v / s`, whose elementwise reading is `./`.
+#[test]
+fn emit_logdensity_refuses_bare_divide_with_a_vector_operand() {
+    let src = "\
+s = elementof(reals)
+v = elementof(cartpow(reals, 3))
+z = v / s
+lp = logdensityof(lawof(record(y = draw(Normal(mu = sum(z), sigma = 1.0)))), record(y = 1.0))
+inputs = (s, v)
+outputs = lp
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let err = flatppl_stablehlo::emit(
+        &d,
+        flatppl_stablehlo::Mode::LogDensity,
+        &flatppl_stablehlo::EmitOptions::default(),
+    )
+    .unwrap_err();
+    assert!(
+        err.msg
+            .contains("`/` has no meaning for these operand shapes")
+            && err.msg.contains("\"scalars\"")
+            && err.msg.contains("./"),
+        "expected a `divide`-domain refusal pointing at `./`, got: {}",
+        err.msg
+    );
+}
+
+/// `pow`'s domain is "scalars" too: `v ^ 2.0` refuses and names `.^`.
+#[test]
+fn emit_logdensity_refuses_bare_pow_with_a_vector_base() {
+    let src = "\
+v = elementof(cartpow(reals, 3))
+z = v ^ 2.0
+lp = logdensityof(lawof(record(y = draw(Normal(mu = sum(z), sigma = 1.0)))), record(y = 1.0))
+inputs = (v)
+outputs = lp
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let err = flatppl_stablehlo::emit(
+        &d,
+        flatppl_stablehlo::Mode::LogDensity,
+        &flatppl_stablehlo::EmitOptions::default(),
+    )
+    .unwrap_err();
+    assert!(
+        err.msg
+            .contains("`^` has no meaning for these operand shapes")
+            && err.msg.contains(".^"),
+        "expected a `pow`-domain refusal pointing at `.^`, got: {}",
+        err.msg
+    );
+}
+
+/// Two arrays of the SAME shape are inside `add`'s domain — vector addition is
+/// sound maths and stays legal. This is the case the guard must not over-reach on.
+#[test]
+fn emit_logdensity_bare_add_of_same_shape_vectors_stays_legal() {
+    let src = "\
+v = elementof(cartpow(reals, 3))
+w = elementof(cartpow(reals, 3))
+z = v + w
+lp = logdensityof(lawof(record(y = draw(Normal(mu = sum(z), sigma = 1.0)))), record(y = 1.0))
+inputs = (v, w)
+outputs = lp
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let out = emit_logdensity(&d);
+    assert!(
+        out.contains("stablehlo.add %arg0, %arg1 : tensor<3xf32>"),
+        "same-shape vector addition must lower, in:\n{out}"
+    );
+}
+
+/// Scalar `+` scalar — the overwhelmingly common shape — is untouched.
+#[test]
+fn emit_logdensity_bare_add_of_two_scalars_stays_legal() {
+    let src = "\
+s = elementof(reals)
+t = elementof(reals)
+z = s + t
+lp = logdensityof(lawof(record(y = draw(Normal(mu = z, sigma = 1.0)))), record(y = 1.0))
+inputs = (s, t)
+outputs = lp
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let out = emit_logdensity(&d);
+    assert!(
+        out.contains("stablehlo.add %arg0, %arg1 : tensor<f32>"),
+        "scalar addition must lower, in:\n{out}"
+    );
+}
+
+/// `.+` on a scalar and a vector — the spelling the refusals point at — keeps
+/// broadcasting. It arrives as `broadcast(add, …)` and never reaches the guard.
+#[test]
+fn emit_logdensity_dotted_add_over_scalar_and_vector_stays_broadcast() {
+    let src = "\
+s = elementof(reals)
+v = elementof(cartpow(reals, 3))
+z = s .+ v
+lp = logdensityof(lawof(record(y = draw(Normal(mu = sum(z), sigma = 1.0)))), record(y = 1.0))
+inputs = (s, v)
+outputs = lp
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let out = emit_logdensity(&d);
+    assert!(
+        out.contains("stablehlo.add") && out.contains("tensor<3xf32>"),
+        "`.+` must broadcast the scalar against the vector, in:\n{out}"
+    );
+}
+
+/// The explicit `broadcast(add, s, v)` spelling — `add` in higher-order position,
+/// which §07 permits — lowers through the same `"add"` entry in
+/// `ops::lower_builtin` and must keep broadcasting.
+#[test]
+fn emit_logdensity_broadcast_headed_add_keeps_broadcasting() {
+    let src = "\
+s = elementof(reals)
+v = elementof(cartpow(reals, 3))
+z = broadcast(add, s, v)
+lp = logdensityof(lawof(record(y = draw(Normal(mu = sum(z), sigma = 1.0)))), record(y = 1.0))
+inputs = (s, v)
+outputs = lp
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let out = emit_logdensity(&d);
+    assert!(
+        out.contains("stablehlo.add") && out.contains("tensor<3xf32>"),
+        "`broadcast(add, …)` must broadcast the scalar against the vector, in:\n{out}"
+    );
+}
+
+/// `divide` and `pow` on two scalars are inside their domain and stay legal —
+/// the guard refuses on an ARRAY operand, not on the head.
+#[test]
+fn emit_logdensity_bare_divide_and_pow_of_scalars_stay_legal() {
+    let src = "\
+s = elementof(reals)
+t = elementof(posreals)
+z = s / t + t ^ 2.0
+lp = logdensityof(lawof(record(y = draw(Normal(mu = z, sigma = 1.0)))), record(y = 1.0))
+inputs = (s, t)
+outputs = lp
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let out = emit_logdensity(&d);
+    assert!(
+        out.contains("stablehlo.divide") && out.contains("stablehlo.power"),
+        "scalar `/` and `^` must lower, in:\n{out}"
+    );
+}
+
+// The two DETERMINISER-SYNTHESIZED sites the guard newly refuses. Both were
+// accepts-invalid before it: each emitted a `func.func @logdensity(...) ->
+// tensor<3xf32>` for a query scoring a SCALAR variate, and a log-density is a
+// scalar — the vector was `broadcast_pair` silently lifting an out-of-domain
+// operand pair. Neither model is well-formed, and `infer` reports no diagnostic
+// for either (see the `%deferred` note in the wave report), so the emitter is
+// currently the only gate. Pinned here so the refusals are deliberate; the
+// cleaner fix is for the determiniser row / `infer` to reject these earlier.
+
+/// The Normal–Normal conjugate marginal row (`determinizer::marginal`) fires on a
+/// prior whose `sigma` is a VECTOR and synthesizes `pow(sigma, 2)` on it —
+/// outside §07 `pow`'s "scalars" domain.
+#[test]
+fn emit_logdensity_refuses_synthesized_pow_over_a_vector_conjugate_sigma() {
+    let src = "\
+sv = elementof(cartpow(posreals, 3))
+a = draw(Normal(mu = 0.0, sigma = sv))
+y = draw(Normal(mu = a, sigma = 1.0))
+lp = logdensityof(lawof(record(y = y)), record(y = 1.0))
+inputs = (sv)
+outputs = lp
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let err = flatppl_stablehlo::emit(
+        &d,
+        flatppl_stablehlo::Mode::LogDensity,
+        &flatppl_stablehlo::EmitOptions::default(),
+    )
+    .unwrap_err();
+    assert!(
+        err.msg
+            .contains("`^` has no meaning for these operand shapes"),
+        "expected a `pow`-domain refusal for the vector conjugate sigma, got: {}",
+        err.msg
+    );
+}
+
+/// `locscale` over a SCALAR variate synthesizes `divide(y − shift, scale)`
+/// (`determinizer::invert::derive_locscale`). That branch refuses a MATRIX scale
+/// but not a VECTOR one, so a vector `scale` reaches the emitter and is outside
+/// §07 `divide`'s "scalars" domain.
+#[test]
+fn emit_logdensity_refuses_synthesized_divide_by_a_vector_locscale_scale() {
+    let src = "\
+sc = elementof(cartpow(posreals, 3))
+m0 = locscale(Normal(mu = 0.0, sigma = 1.0), 1.0, sc)
+lp = logdensityof(lawof(record(y = draw(m0))), record(y = 0.5))
+inputs = (sc)
+outputs = lp
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let err = flatppl_stablehlo::emit(
+        &d,
+        flatppl_stablehlo::Mode::LogDensity,
+        &flatppl_stablehlo::EmitOptions::default(),
+    )
+    .unwrap_err();
+    assert!(
+        err.msg
+            .contains("`/` has no meaning for these operand shapes"),
+        "expected a `divide`-domain refusal for the vector locscale scale, got: {}",
+        err.msg
+    );
+}
+
+/// `neg` keeps its array domain — §07 gives `neg` "scalars or arrays", so `-v`
+/// on a vector is elementwise negation and no guard applies.
+#[test]
+fn emit_logdensity_bare_neg_of_a_vector_stays_legal() {
+    let src = "\
+v = elementof(cartpow(reals, 3))
+z = -v
+lp = logdensityof(lawof(record(y = draw(Normal(mu = sum(z), sigma = 1.0)))), record(y = 1.0))
+inputs = (v)
+outputs = lp
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let out = emit_logdensity(&d);
+    assert!(
+        out.contains("stablehlo.negate %arg0 : tensor<3xf32>"),
+        "vector negation must lower elementwise, in:\n{out}"
+    );
+}
+
 /// An elementwise op whose operands do not broadcast REFUSES rather than
 /// aborting on `Emitter::broadcast_pair`'s rank assertion. `a .* b` with a
 /// rank-2 and a rank-1 operand is the case that used to panic, and the message

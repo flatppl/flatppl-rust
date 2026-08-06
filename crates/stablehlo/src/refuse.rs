@@ -110,6 +110,16 @@
 //!   `Deferred` for both, so lowering them elementwise would silently answer a
 //!   different question. `ops::classify_bare_mul` decides; a scalar operand or an
 //!   absent type keeps the ordinary elementwise path.
+//! - a BARE `add`/`sub`/`divide`/`pow` (surface `+`, `-`, `/`, `^`) whose operand
+//!   shapes are outside the §07 "Operator-equivalent functions" domain for that
+//!   head — `add`/`sub` take "scalars or arrays of same shape (real or complex)",
+//!   `divide`/`pow` "scalars (real or complex)" — "`+` has no meaning for these
+//!   operand shapes: ... Write `.+` for the elementwise form ...". Without it
+//!   `Emitter::broadcast_pair` reconciles the pair, so `scalar + vector` silently
+//!   emitted the number `.+` means (accepts-invalid). `ops::lower_bare_arith`
+//!   decides, on the same bare-vs-`broadcast`-headed discriminator as `mul`; an
+//!   `%any`/`%deferred`/absent operand type keeps the ordinary path, so the guard
+//!   refuses only a pair it can prove is out of domain.
 //! - an unknown builtin head — "unsupported builtin head '...'"
 //! - wrong arity for any arity-checked head (`args_exact`, shared by
 //!   `unary`/`binary`/`ifelse`/`get`/`get0`/`in`/`inf`) — "expected N
