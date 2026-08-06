@@ -113,7 +113,10 @@
 //! - a BARE `add`/`sub`/`divide`/`pow` (surface `+`, `-`, `/`, `^`) whose operand
 //!   shapes are outside the §07 "Operator-equivalent functions" domain for that
 //!   head — `add`/`sub` take "scalars or arrays of same shape (real or complex)",
-//!   `divide`/`pow` "scalars (real or complex)" — "`+` has no meaning for these
+//!   `pow` "scalars (real or complex)", `divide` "scalars, vector-scalar,
+//!   matrix-scalar (real or complex)" (flatppl-design#75; §05 "`/` requires a
+//!   scalar divisor", so `scalar / vector` refuses while `vector / scalar` lowers)
+//!   — "`+` has no meaning for these
 //!   operand shapes: ... Write `.+` for the elementwise form ...". Without it
 //!   `Emitter::broadcast_pair` reconciles the pair, so `scalar + vector` silently
 //!   emitted the number `.+` means (accepts-invalid). `ops::lower_bare_arith`

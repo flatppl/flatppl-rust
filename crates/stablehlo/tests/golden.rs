@@ -10003,9 +10003,11 @@ outputs = lp
 // ---- the bare `+`/`-`/`/`/`^` domain guard ----------------------------------
 //
 // §07 "Operator-equivalent functions" gives each head a DOMAIN: `add`/`sub`
-// "scalars or arrays of same shape (real or complex)", `divide` and `pow`
-// "scalars (real or complex)". Outside it a bare operator has no mathematical
-// meaning, and the elementwise reading is spelled with the dotted form. All four
+// "scalars or arrays of same shape (real or complex)", `pow` "scalars (real or
+// complex)", `divide` "scalars, vector-scalar, matrix-scalar (real or complex)"
+// (the amended row — see the `divide` block below). Outside it a bare operator has
+// no mathematical meaning, and the elementwise reading is spelled with the dotted
+// form. All four
 // heads used to route straight to `Emitter::add`/`sub`/`div`/`pow`, whose
 // `broadcast_pair` reconciles a scalar against an array — so `scalar + vector`
 // silently emitted the number `.+` means. `ops::lower_bare_arith` refuses it.
@@ -10095,14 +10097,61 @@ outputs = lp
     );
 }
 
-/// `divide`'s domain is "scalars", so ANY array operand refuses — including the
-/// scale-a-vector idiom `v / s`, whose elementwise reading is `./`.
+// `divide`'s domain is the §07 row widened by flatppl-design#75: "scalars,
+// vector-scalar, matrix-scalar (real or complex)". §05 "No implicit operator
+// broadcasting" says it directly too — "`/` requires a scalar divisor, and `^` is
+// scalar-only" — so the DIVISOR is the discriminator: a rank-1 or rank-2 dividend
+// over a scalar divisor is scalar multiplication by the reciprocal and lowers as
+// the ordinary scalar-broadcast divide. The owner ruled the earlier
+// `divide`/`mul` asymmetry unintended.
+
+/// `vector / scalar` is INSIDE the amended domain and emits the same elementwise
+/// divide `./` would.
 #[test]
-fn emit_logdensity_refuses_bare_divide_with_a_vector_operand() {
+fn emit_logdensity_bare_divide_of_vector_by_scalar_stays_legal() {
     let src = "\
 s = elementof(reals)
 v = elementof(cartpow(reals, 3))
 z = v / s
+lp = logdensityof(lawof(record(y = draw(Normal(mu = sum(z), sigma = 1.0)))), record(y = 1.0))
+inputs = (s, v)
+outputs = lp
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let out = emit_logdensity(&d);
+    assert!(
+        out.contains("stablehlo.divide") && out.contains("tensor<3xf32>"),
+        "vector / scalar must lower as a scalar-broadcast divide, in:\n{out}"
+    );
+}
+
+/// `matrix / scalar` — the amended row's second added form — likewise emits.
+#[test]
+fn emit_logdensity_bare_divide_of_matrix_by_scalar_stays_legal() {
+    let src = "\
+s = elementof(reals)
+a = elementof(cartpow(reals, [4, 3]))
+z = a / s
+lp = logdensityof(lawof(record(y = draw(Normal(mu = sum(z), sigma = 1.0)))), record(y = 1.0))
+inputs = (s, a)
+outputs = lp
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let out = emit_logdensity(&d);
+    assert!(
+        out.contains("stablehlo.divide") && out.contains("tensor<4x3xf32>"),
+        "matrix / scalar must lower as a scalar-broadcast divide, in:\n{out}"
+    );
+}
+
+/// `scalar / vector` stays OUTSIDE the domain: the amended row adds
+/// dividend-array forms only, and an elementwise reciprocal is `./`'s job.
+#[test]
+fn emit_logdensity_refuses_bare_divide_of_scalar_by_vector() {
+    let src = "\
+s = elementof(reals)
+v = elementof(cartpow(reals, 3))
+z = s / v
 lp = logdensityof(lawof(record(y = draw(Normal(mu = sum(z), sigma = 1.0)))), record(y = 1.0))
 inputs = (s, v)
 outputs = lp
@@ -10117,9 +10166,68 @@ outputs = lp
     assert!(
         err.msg
             .contains("`/` has no meaning for these operand shapes")
-            && err.msg.contains("\"scalars\"")
+            && err.msg.contains("vector-scalar")
             && err.msg.contains("./"),
         "expected a `divide`-domain refusal pointing at `./`, got: {}",
+        err.msg
+    );
+}
+
+/// Two vectors: the DIVISOR is an array, so it refuses whatever the dividend is.
+#[test]
+fn emit_logdensity_refuses_bare_divide_of_two_vectors() {
+    let src = "\
+v = elementof(cartpow(reals, 3))
+w = elementof(cartpow(reals, 3))
+z = v / w
+lp = logdensityof(lawof(record(y = draw(Normal(mu = sum(z), sigma = 1.0)))), record(y = 1.0))
+inputs = (v, w)
+outputs = lp
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let err = flatppl_stablehlo::emit(
+        &d,
+        flatppl_stablehlo::Mode::LogDensity,
+        &flatppl_stablehlo::EmitOptions::default(),
+    )
+    .unwrap_err();
+    assert!(
+        err.msg
+            .contains("`/` has no meaning for these operand shapes"),
+        "expected a `divide`-domain refusal for two vectors, got: {}",
+        err.msg
+    );
+}
+
+/// A RANK-3 dividend over a scalar divisor refuses — the one case where §05 and
+/// §07 can be read differently. §05 constrains only the divisor ("`/` requires a
+/// scalar divisor"), which a rank-3 dividend satisfies; §07's row enumerates
+/// `vector-scalar` and `matrix-scalar` and stops. §07's table is the precise
+/// statement (for `mul`, §05's prose is likewise less complete than §07's row,
+/// which `classify_bare_mul` follows strictly), so the guard follows §07.
+/// Dividing a rank-3 array by a scalar IS sound maths, so this pins a SPEC
+/// boundary, not a mathematical one — admitting it means amending the row.
+#[test]
+fn emit_logdensity_refuses_bare_divide_of_rank_three_by_scalar() {
+    let src = "\
+s = elementof(reals)
+a = elementof(cartpow(reals, [2, 3, 4]))
+z = a / s
+lp = logdensityof(lawof(record(y = draw(Normal(mu = sum(z), sigma = 1.0)))), record(y = 1.0))
+inputs = (s, a)
+outputs = lp
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let err = flatppl_stablehlo::emit(
+        &d,
+        flatppl_stablehlo::Mode::LogDensity,
+        &flatppl_stablehlo::EmitOptions::default(),
+    )
+    .unwrap_err();
+    assert!(
+        err.msg
+            .contains("`/` has no meaning for these operand shapes"),
+        "expected a `divide`-domain refusal for a rank-3 dividend, got: {}",
         err.msg
     );
 }
@@ -10289,8 +10397,9 @@ outputs = lp
 
 /// `locscale` over a SCALAR variate synthesizes `divide(y − shift, scale)`
 /// (`determinizer::invert::derive_locscale`). That branch refuses a MATRIX scale
-/// but not a VECTOR one, so a vector `scale` reaches the emitter and is outside
-/// §07 `divide`'s "scalars" domain.
+/// but not a VECTOR one, so a vector `scale` reaches the emitter as the DIVISOR —
+/// which the amended §07 row still requires to be scalar, so it refuses. The
+/// `divide` widening does not rescue this one.
 #[test]
 fn emit_logdensity_refuses_synthesized_divide_by_a_vector_locscale_scale() {
     let src = "\

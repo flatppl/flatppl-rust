@@ -426,7 +426,23 @@ fn arith_shape(e: &Emitter, id: NodeId) -> ArithShape {
 /// - `add`/`sub`: "scalars or arrays of same shape (real or complex)". A scalar
 ///   against an array is OUTSIDE it, so `scalar + vector` refuses; two arrays of
 ///   the same shape are vector addition and stay legal.
-/// - `divide`/`pow`: "scalars (real or complex)". Any array operand refuses.
+/// - `divide`: "scalars, vector-scalar, matrix-scalar (real or complex)"
+///   (flatppl-design#75). §05 "No implicit operator broadcasting" states the same
+///   constraint directly — "`/` requires a scalar divisor, and `^` is
+///   scalar-only" — so the DIVISOR is the discriminator here: a rank-1 or rank-2
+///   dividend over a scalar divisor is scalar multiplication by the reciprocal,
+///   sound, and lowers as the ordinary scalar-broadcast divide. `scalar / vector`
+///   is NOT in the domain; an elementwise reciprocal is `./`'s job.
+///
+///   A rank-3 dividend refuses, which is the one place the two clauses can be read
+///   differently: §05 constrains only the divisor (satisfied), while §07 enumerates
+///   `vector-scalar` and `matrix-scalar` and stops. §07's table is the precise
+///   statement and §05 the prose summary — for `mul`, §05's "supports matrix and
+///   matrix–vector multiplication" is likewise less complete than §07's row, which
+///   [`classify_bare_mul`] follows strictly. So this guard follows §07 and refuses
+///   rank 3. Dividing a rank-3 array by a scalar IS sound maths, so admitting it
+///   would be a spec-row change, not a guard relaxation.
+/// - `pow`: "scalars (real or complex)". Any array operand refuses.
 ///
 /// `neg` needs no guard: its domain is "scalars or arrays", so elementwise
 /// negation of an array is already sound.
@@ -481,8 +497,17 @@ pub(crate) fn lower_bare_arith<'m>(
             ),
         ))
     };
+    const DIVIDE_DOMAIN: &str = "\"scalars, vector-scalar, matrix-scalar\"";
     match head {
-        "divide" | "pow" if sa.is_array() || sb.is_array() => refuse("\"scalars\""),
+        "pow" if sa.is_array() || sb.is_array() => refuse("\"scalars\""),
+        // A known-array DIVISOR is proof enough on its own, whatever the dividend
+        // is: it rules out `scalar / vector` and `vector / vector` together.
+        "divide" if sb.is_array() => refuse(DIVIDE_DOMAIN),
+        // Dividend rank 1 or 2 over a scalar divisor is in the amended row; a
+        // higher-rank dividend is not enumerated, so it refuses.
+        "divide" if sa.is_array() && !matches!(&sa, ArithShape::Array(d) if d.len() <= 2) => {
+            refuse(DIVIDE_DOMAIN)
+        }
         "add" | "sub" if sa.differs_from(&sb) => refuse("\"scalars or arrays of same shape\""),
         _ => binary(e, id, args, op),
     }
