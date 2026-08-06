@@ -9560,6 +9560,168 @@ outputs = q1
     );
 }
 
+// ---- Matrix product: `*` is not `.*` (spec §07 "Linear algebra") ------------
+//
+// §07: "Matrix multiplication and addition use the standard `*` and `+`
+// operators." A BARE `mul` over a rank-2 lhs is that product and lowers to one
+// `stablehlo.dot_general`; the elementwise `.*` spelling reaches the op map as
+// `broadcast(mul, …)` and stays elementwise. Before this, every `mul` went
+// elementwise and a rank-2 × rank-1 pair ABORTED the process on
+// `Emitter::broadcast_pair`'s rank assertion.
+
+/// Matrix·vector `*` lowers to `dot_general` contracting the lhs's trailing axis
+/// against the vector, giving the lhs's leading axis — `[4, 3] * [3]` → `[4]`.
+#[test]
+fn emit_logdensity_matrix_times_vector_is_one_dot_general() {
+    let src = "\
+x = elementof(cartpow(reals, [4, 3]))
+b = elementof(cartpow(reals, 3))
+mv = x * b
+lp = logdensityof(lawof(record(y = draw(Normal(mu = sum(mv), sigma = 1.0)))), record(y = 1.0))
+inputs = (x, b)
+outputs = lp
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let out = emit_logdensity(&d);
+    assert!(
+        out.contains(
+            "stablehlo.dot_general %arg0, %arg1, contracting_dims = [1] x [0], \
+             precision = [DEFAULT, DEFAULT] : (tensor<4x3xf32>, tensor<3xf32>) -> tensor<4xf32>"
+        ),
+        "matrix·vector must be one dot_general giving tensor<4xf32>, in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// Matrix·matrix `*` falls out of the same contraction one rank higher —
+/// `[4, 3] * [3, 2]` → `[4, 2]` — and chains into a matrix·vector product.
+#[test]
+fn emit_logdensity_matrix_times_matrix_chains_into_matvec() {
+    let src = "\
+a = elementof(cartpow(reals, [4, 3]))
+b = elementof(cartpow(reals, [3, 2]))
+v = elementof(cartpow(reals, 2))
+mm = a * b
+r = mm * v
+lp = logdensityof(lawof(record(y = draw(Normal(mu = sum(r), sigma = 1.0)))), record(y = 1.0))
+inputs = (a, b, v)
+outputs = lp
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let out = emit_logdensity(&d);
+    assert!(
+        out.contains("(tensor<4x3xf32>, tensor<3x2xf32>) -> tensor<4x2xf32>"),
+        "matrix·matrix must give tensor<4x2xf32>, in:\n{out}"
+    );
+    assert!(
+        out.contains("(tensor<4x2xf32>, tensor<2xf32>) -> tensor<4xf32>"),
+        "the product must chain into a matrix·vector, in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// The elementwise `.*` spelling over two rank-2 operands stays elementwise —
+/// it must NOT be captured by the matrix-product dispatch (it arrives as
+/// `broadcast(mul, …)`, which never passes through that dispatch).
+#[test]
+fn emit_logdensity_elementwise_mul_over_matrices_stays_elementwise() {
+    let src = "\
+a = elementof(cartpow(reals, [4, 3]))
+c = elementof(cartpow(reals, [4, 3]))
+d = a .* c
+lp = logdensityof(lawof(record(y = draw(Normal(mu = sum(d), sigma = 1.0)))), record(y = 1.0))
+inputs = (a, c)
+outputs = lp
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let out = emit_logdensity(&d);
+    assert!(
+        out.contains("stablehlo.multiply %arg0, %arg1 : tensor<4x3xf32>"),
+        "`.*` over two matrices must stay an elementwise multiply, in:\n{out}"
+    );
+    assert!(
+        !out.contains("dot_general"),
+        "`.*` must not lower to a matrix product, in:\n{out}"
+    );
+}
+
+/// An elementwise op whose operands do not broadcast REFUSES rather than
+/// aborting on `Emitter::broadcast_pair`'s rank assertion. `a .* b` with a
+/// rank-2 and a rank-1 operand is the case that used to panic, and the message
+/// names the `*`-vs-`.*` distinction that fixes such a model.
+#[test]
+fn emit_logdensity_refuses_unbroadcastable_elementwise_operands() {
+    let src = "\
+a = elementof(cartpow(reals, [4, 3]))
+b = elementof(cartpow(reals, 3))
+d = a .* b
+lp = logdensityof(lawof(record(y = draw(Normal(mu = sum(d), sigma = 1.0)))), record(y = 1.0))
+inputs = (a, b)
+outputs = lp
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let err = flatppl_stablehlo::emit(
+        &d,
+        flatppl_stablehlo::Mode::LogDensity,
+        &flatppl_stablehlo::EmitOptions::default(),
+    )
+    .unwrap_err();
+    assert!(
+        err.msg.contains("do not broadcast") && err.msg.contains("matrix product"),
+        "expected a broadcast refusal naming the matrix-product alternative, got: {}",
+        err.msg
+    );
+}
+
+/// The wave's full worked probe: a table `load_data` whose `x` column is a
+/// 3-vector per row feeds a matrix·vector product against the `beta` parameter,
+/// and its `y` column is the likelihood variate. One `inputs` entry (`data`)
+/// contributes `%arg3` (`tensor<4x3xf32>`) and `%arg4` (`tensor<4xf32>`); the
+/// model's own `x_data` parameter is NOT an argument — the query point pins it
+/// to `data.x`, so it is substituted away and DCE drops it (§13: an `elementof`
+/// no output reaches "is eliminated like any other unreached binding"). The
+/// source `data.json` is never read.
+#[test]
+fn emit_logdensity_table_column_matvec_worked_probe() {
+    let src = "\
+alpha = elementof(reals)
+beta = elementof(cartpow(reals, 3))
+sigma = elementof(posreals)
+x_data = elementof(cartpow(reals, [4, 3]))
+means = alpha .+ x_data * beta
+y ~ Normal.(means, sigma)
+k = kernelof(record(y = y), alpha = alpha, beta = beta, sigma = sigma, x_data = x_data)
+data = load_data(\"data.json\", cartpow(cartprod(x = cartpow(reals, 3), y = reals), 4))
+L = likelihoodof(k, record(y = data.y))
+lp = logdensityof(L, record(alpha = alpha, beta = beta, sigma = sigma, x_data = data.x))
+inputs = (alpha, beta, sigma, data)
+outputs = (lp)
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let out = emit_logdensity(&d);
+    assert!(
+        out.contains(
+            "func.func @logdensity(%arg0: tensor<f32>, %arg1: tensor<3xf32>, \
+             %arg2: tensor<f32>, %arg3: tensor<4x3xf32>, %arg4: tensor<4xf32>) -> tensor<f32>"
+        ),
+        "expected the worked probe's signature (data.x → %arg3, data.y → %arg4), in:\n{out}"
+    );
+    // The x column enters through the matvec against beta ...
+    assert!(
+        out.contains(
+            "stablehlo.dot_general %arg3, %arg1, contracting_dims = [1] x [0], \
+             precision = [DEFAULT, DEFAULT] : (tensor<4x3xf32>, tensor<3xf32>) -> tensor<4xf32>"
+        ),
+        "the x column must reach beta through one dot_general, in:\n{out}"
+    );
+    // ... and the y column is the variate the residual subtracts from.
+    assert!(
+        out.contains("stablehlo.subtract %arg4, "),
+        "the y column must be the likelihood variate, in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
 /// A destructured table used as ONE value (here `sum(data)`) refuses: the
 /// per-column arguments supply no monolithic tensor, and the message says to
 /// read it column-wise instead of reporting an unsupported head.

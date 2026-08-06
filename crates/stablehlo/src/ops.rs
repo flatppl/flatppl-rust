@@ -16,6 +16,15 @@
 //! the wrapper and re-enters here with `f`'s own head — every op below that is
 //! elementwise therefore batches for free.
 //!
+//! **`*` is not `.*`.** Spec §07 "Linear algebra": "Matrix multiplication and
+//! addition use the standard `*` and `+` operators." The two spellings are
+//! already distinct in FlatPDL — `.*` is `broadcast(mul, …)`, plain `*` a bare
+//! `mul` — so [`is_matrix_product`]/[`lower_matrix_product`] handle a bare `mul`
+//! over a rank-2 left operand as one `stablehlo.dot_general`, and the `"mul"`
+//! entry in the map below stays purely elementwise. That dispatch lives in
+//! `Emitter::lower_node`, which [`Emitter::lower_broadcast`] bypasses, so a
+//! `.*`-derived `mul` can never reach it.
+//!
 //! A `builtin_*` primitive (`builtin_logdensityof`, `builtin_sample`,
 //! `builtin_touniform`, `builtin_fromuniform`, `builtin_tonormal`,
 //! `builtin_fromnormal`) or a bare distribution constructor name (`Normal`,
@@ -27,7 +36,7 @@
 //! primitives, still unimplemented until a later task adds a matching
 //! registry gate for it).
 
-use flatppl_core::{CallHead, Node, NodeId, Scalar};
+use flatppl_core::{CallHead, Node, NodeId, Scalar, Type};
 
 use crate::emitter::{Emitter, elem_rank};
 use crate::mlir::{ElemKind, MlirTy, Value};
@@ -173,7 +182,124 @@ fn binary<'m>(
     let [a, b] = args_exact(id, args)?;
     let a = e.lower_node(a)?;
     let b = e.lower_node(b)?;
+    require_broadcastable(id, &a, &b)?;
     Ok(op(e, &a, &b))
+}
+
+/// Refuse an operand pair `Emitter::broadcast_pair` would panic on — different
+/// rank, or an axis pair that is neither equal nor size-1-vs-concrete (§04
+/// broadcasting). The elementwise `Emitter::binary`/`compare`/`select` helpers
+/// are infallible and have no `Result` to carry an [`EmitError`], so the check
+/// belongs here at the one call site that still has one. Without it a
+/// rank-mismatched elementwise op aborts the process instead of refusing.
+fn require_broadcastable(id: NodeId, a: &Value, b: &Value) -> Result<(), EmitError> {
+    let (MlirTy::Ranked(da), MlirTy::Ranked(db)) = (&a.ty, &b.ty) else {
+        // A scalar operand broadcasts against any rank; a `Key` never reaches an
+        // arithmetic op.
+        return Ok(());
+    };
+    let compatible = da.len() == db.len()
+        && da.iter().zip(db.iter()).all(|(&x, &y)| {
+            matches!(
+                (x, y),
+                (Some(m), Some(n)) if m == n)
+                || matches!(
+                    (x, y),
+                    (Some(1), Some(_)) | (Some(_), Some(1)) | (None, None)
+                )
+        });
+    if compatible {
+        return Ok(());
+    }
+    Err(EmitError::at(
+        id,
+        format!(
+            "elementwise operands do not broadcast: {:?} against {:?} — §04 broadcasting \
+             needs equal rank with each axis pair equal or size 1 (a matrix product is the \
+             non-elementwise `*`, not `.*`)",
+            a.ty, b.ty
+        ),
+    ))
+}
+
+/// Whether a bare `mul` node's operands are a MATRIX product rather than an
+/// elementwise one: a rank-2 left operand against a rank-2 (matrix·matrix) or
+/// rank-1 (matrix·vector) right one. Read off the operands' inferred FlatPDL
+/// types — the same discriminator `infer`'s `mul_type` uses — so no operand is
+/// lowered to answer the question. Spec §07 "Linear algebra": "Matrix
+/// multiplication and addition use the standard `*` and `+` operators."
+///
+/// TRAP FOR WHOEVER LOWERS `transpose`. §07 also makes "the product of a
+/// transposed vector and a non-transposed vector … a scalar", and `infer` types
+/// `transpose(a) * b` as exactly that. This predicate does NOT recognize it (the
+/// lhs is rank 1, not 2), so such a `mul` would fall to the elementwise path —
+/// where `require_broadcastable` sees two equal-rank, equal-length operands,
+/// passes, and emits an elementwise multiply instead of an inner product: a
+/// SILENT WRONG ANSWER, not a refusal. It is unreachable today only because
+/// `transpose` has no lowering in this map at all, so the `transpose` node
+/// refuses first. Adding a `transpose` lowering therefore REQUIRES adding the
+/// `TVector` cases here (and a `[n]x[n] -> scalar` contraction) in the same
+/// change.
+pub(crate) fn is_matrix_product(e: &Emitter, args: &[NodeId]) -> bool {
+    let [a, b] = match <[NodeId; 2]>::try_from(args) {
+        Ok(pair) => pair,
+        Err(_) => return false,
+    };
+    matches!(
+        (array_rank(e, a), array_rank(e, b)),
+        (Some(2), Some(2)) | (Some(2), Some(1))
+    )
+}
+
+/// The rank of `id`'s inferred `Array` type, flattening a nested element chain
+/// the way `crate::types::mlir_type_of` does — `None` for any other type.
+fn array_rank(e: &Emitter, id: NodeId) -> Option<usize> {
+    fn rank(ty: &Type) -> Option<usize> {
+        match ty {
+            Type::Array { shape, elem } => Some(shape.len() + rank(elem).unwrap_or(0)),
+            Type::TVector { elem, .. } => Some(1 + rank(elem).unwrap_or(0)),
+            _ => None,
+        }
+    }
+    rank(e.type_of(id)?)
+}
+
+/// Lower a bare `mul` whose operands [`is_matrix_product`] identified: matrix·
+/// vector via [`Emitter::matvec`], matrix·matrix via [`Emitter::matmat`], both
+/// one `stablehlo.dot_general`. The inner dimensions are checked HERE so a
+/// disagreement refuses; the emitter helpers panic on one, and this is the only
+/// caller that reaches them from surface `*`.
+pub(crate) fn lower_matrix_product(
+    e: &mut Emitter,
+    id: NodeId,
+    args: &[NodeId],
+) -> Result<Value, EmitError> {
+    let [a, b] = args_exact(id, args)?;
+    let a = e.lower_node(a)?;
+    let b = e.lower_node(b)?;
+    let (MlirTy::Ranked(da), MlirTy::Ranked(db)) = (&a.ty, &b.ty) else {
+        return Err(EmitError::at(
+            id,
+            "matrix product needs ranked tensor operands",
+        ));
+    };
+    // A dynamic inner dim on either side is not a KNOWN disagreement, so it
+    // passes: `dot_general` contracts it at run time.
+    if matches!((da[1], db[0]), (Some(m), Some(n)) if m != n) {
+        return Err(EmitError::at(
+            id,
+            format!(
+                "matrix product inner dimensions disagree: {:?} against {:?} — the lhs's \
+                 trailing axis must match the rhs's leading axis",
+                a.ty, b.ty
+            ),
+        ));
+    }
+    if db.len() == 1 {
+        Ok(e.matvec(&a, &b))
+    } else {
+        Ok(e.matmat(&a, &b))
+    }
 }
 
 // ---- ifelse / inf -----------------------------------------------------------

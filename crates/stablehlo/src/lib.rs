@@ -133,6 +133,25 @@
 //! func.func @logdensity(%arg0: tensor<f32>, %arg1: tensor<3xf32>, %arg2: tensor<3xf32>) -> tensor<f32>
 //! ```
 //!
+//! A column of 3-vectors against a vector parameter — the `x` column is
+//! `tensor<4x3xf32>` and `x_data * beta` is a matrix product (spec §07 "Linear
+//! algebra"), one `stablehlo.dot_general`. `x_data` is not an argument: the
+//! query point pins it to `data.x`, so it is substituted away:
+//!
+//! ```text
+//! beta   = elementof(cartpow(reals, 3))
+//! x_data = elementof(cartpow(reals, [4, 3]))
+//! means  = alpha .+ x_data * beta
+//! data   = load_data("d.json", cartpow(cartprod(x = cartpow(reals, 3), y = reals), 4))
+//! inputs  = (alpha, beta, sigma, data)
+//! outputs = logdensityof(L, record(alpha = alpha, beta = beta, sigma = sigma, x_data = data.x))
+//! ```
+//! →
+//! ```mlir
+//! func.func @logdensity(%arg0: tensor<f32>, %arg1: tensor<3xf32>, %arg2: tensor<f32>,
+//!                       %arg3: tensor<4x3xf32>, %arg4: tensor<4xf32>) -> tensor<f32>
+//! ```
+//!
 //! Caveat for `load_module` query modules: an `inputs` parameter's *binding*
 //! name must not shadow a binding of the loaded model (a bare `alpha` scoring a
 //! model that itself binds `alpha` collides across the independent namespaces

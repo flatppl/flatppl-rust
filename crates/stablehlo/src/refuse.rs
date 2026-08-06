@@ -82,6 +82,17 @@
 //! - a destructured `load_data` input used as one monolithic value — "a
 //!   load_data input whose valueset is a table or record has no single tensor
 //!   form; read it column-wise (`data.y`) — one argument per column"
+//! - an elementwise binary op whose operands do not broadcast (different rank,
+//!   or an axis pair neither equal nor size-1) — "elementwise operands do not
+//!   broadcast: ... — §04 broadcasting needs equal rank ... (a matrix product
+//!   is the non-elementwise `*`, not `.*`)". This is `ops::require_broadcastable`
+//!   turning what was an `Emitter::broadcast_pair` PANIC into a refusal; the
+//!   infallible `binary`/`compare`/`select` helpers still assert, but no
+//!   arity-2 elementwise head can now reach that assertion.
+//! - a matrix product (`*`, spec §07 "Linear algebra") whose inner dimensions
+//!   are both statically known and unequal — "matrix product inner dimensions
+//!   disagree: ...". A defensive second line: `infer`'s `mul_type` already
+//!   makes such a call `Type::Failed`, so the determiniser refuses it first.
 //! - an unknown builtin head — "unsupported builtin head '...'"
 //! - wrong arity for any arity-checked head (`args_exact`, shared by
 //!   `unary`/`binary`/`ifelse`/`get`/`get0`/`in`/`inf`) — "expected N

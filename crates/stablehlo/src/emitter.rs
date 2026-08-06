@@ -27,7 +27,7 @@
 use std::collections::{HashMap, HashSet};
 
 use flatppl_core::{
-    CallHead, Inputs, Module, NamedKind, Node, NodeId, Ref, RefNs, Scalar, Symbol, ValueSet,
+    CallHead, Inputs, Module, NamedKind, Node, NodeId, Ref, RefNs, Scalar, Symbol, Type, ValueSet,
 };
 
 use crate::Dtype;
@@ -1316,13 +1316,53 @@ impl<'m> Emitter<'m> {
             );
         }
 
+        self.dot_contract(a, b, 1, 0, vec![a_dims[0]])
+    }
+
+    /// Matrix-matrix product `a @ b` (spec §07 "Linear algebra": "Matrix
+    /// multiplication and addition use the standard `*` and `+` operators"),
+    /// contracting `a`'s (`[m, k]`) trailing dimension against `b`'s (`[k, n]`)
+    /// leading one — the same `contracting_dims = [1] x [0]` as
+    /// [`Emitter::matvec`], with `b` one rank higher, so the result is
+    /// `[m, n]`. Panics on a non-rank-2 operand or a disagreeing inner
+    /// dimension, like [`Emitter::matvec`]: `crate::ops`'s `mul` dispatch
+    /// checks both before calling, so a caller-facing shape error refuses
+    /// there rather than reaching here.
+    pub fn matmat(&mut self, a: &Value, b: &Value) -> Value {
+        let dims = |v: &Value, side: &str| match &v.ty {
+            MlirTy::Ranked(d) if d.len() == 2 => d.clone(),
+            other => panic!("matmat expects a rank-2 (matrix) {side} operand, got {other:?}"),
+        };
+        let a_dims = dims(a, "lhs");
+        let b_dims = dims(b, "rhs");
+        if a_dims[1] != b_dims[0] {
+            panic!(
+                "matmat: lhs trailing dim {:?} does not match rhs leading dim {:?}",
+                a_dims[1], b_dims[0]
+            );
+        }
+        self.dot_contract(a, b, 1, 0, vec![a_dims[0], b_dims[1]])
+    }
+
+    /// Emit one `stablehlo.dot_general` in the pretty form, contracting `a`'s
+    /// dimension `la` against `b`'s `lb` and producing `result_dims`. Shared by
+    /// [`Emitter::matvec`] and [`Emitter::matmat`], which differ only in the
+    /// result shape; each validates its own operand ranks first.
+    fn dot_contract(
+        &mut self,
+        a: &Value,
+        b: &Value,
+        la: usize,
+        lb: usize,
+        result_dims: Vec<Option<u64>>,
+    ) -> Value {
         let ssa = self.fresh();
         let a_ty = a.ty.render(self.dtype, a.elem);
         let b_ty = b.ty.render(self.dtype, b.elem);
-        let result_ty = MlirTy::Ranked(vec![a_dims[0]]);
+        let result_ty = MlirTy::Ranked(result_dims);
         let result_ty_text = result_ty.render(self.dtype, ElemKind::Real);
         self.push(&format!(
-            "{ssa} = stablehlo.dot_general {}, {}, contracting_dims = [1] x [0], precision = [DEFAULT, DEFAULT] : ({a_ty}, {b_ty}) -> {result_ty_text}",
+            "{ssa} = stablehlo.dot_general {}, {}, contracting_dims = [{la}] x [{lb}], precision = [DEFAULT, DEFAULT] : ({a_ty}, {b_ty}) -> {result_ty_text}",
             a.ssa, b.ssa
         ));
         Value {
@@ -2310,6 +2350,14 @@ impl<'m> Emitter<'m> {
         self.m.resolve(sym)
     }
 
+    /// A node's inferred FlatPDL `Type`. A narrow accessor mirroring
+    /// [`Emitter::node`], for `crate::ops`'s `mul` dispatch, which reads the
+    /// operands' ranks to tell a matrix product from an elementwise one WITHOUT
+    /// lowering either operand first.
+    pub(crate) fn type_of(&self, id: NodeId) -> Option<&Type> {
+        self.m.type_of(id)
+    }
+
     /// Resolve a node's statically-known [`ValueSet`] (spec §03), read
     /// straight from the FlatPDL module's `Module::valueset_of` side table.
     /// A narrow accessor mirroring [`Emitter::node`]/[`Emitter::resolve`] —
@@ -2668,6 +2716,17 @@ impl<'m> Emitter<'m> {
                         crate::registry::lower_touniform(self, id, &call.args)
                     } else if name == "broadcast" {
                         self.lower_broadcast(id, &call.args)
+                    } else if name == "mul" && crate::ops::is_matrix_product(self, &call.args) {
+                        // A BARE `mul` over a rank-2 lhs is the matrix product
+                        // (spec §07 "Linear algebra": "Matrix multiplication and
+                        // addition use the standard `*` and `+` operators"). The
+                        // elementwise `.*` spelling arrives as
+                        // `broadcast(mul, …)` and reaches `ops::lower_builtin`
+                        // through `lower_broadcast` instead, which never passes
+                        // through this dispatch — so the two spellings cannot be
+                        // confused, and no state flag is needed to tell them
+                        // apart.
+                        crate::ops::lower_matrix_product(self, id, &call.args)
                     } else if matches!(name.as_str(), "get0" | "get") {
                         // `get0(builtin_sample(...), k)` / `get((%ref self
                         // <shared-latent>), k)`: a projection of a sampled
