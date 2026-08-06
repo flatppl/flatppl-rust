@@ -49,15 +49,40 @@ Each `inputs` entry becomes a `func.func` argument, typed by its FlatPPL phase:
 |---|---|
 | `elementof(S)` parameter | argument (inferred element kind: real / int / bool) |
 | `external(S)` input | argument typed from `S` |
-| `load_data(source, S)` input | `tensor<N×f32>`, `N` pinned from a compile-time read of the file's row count (`.csv` / `.wsv`) — **values are never baked**, they are the runtime argument |
+| `load_data(source, S)` input | argument(s) shaped from the declared valueset `S` — **`source` is never read**, and the values are never baked; they are the runtime argument |
+
+A `load_data` input's shape comes from its declared `valueset` and nothing else
+(spec §07 `load_data`: "`valueset` fully determines the result's shape"; §13
+`sec:determinization-signature`: "function argument (shape from its `valueset`,
+contents at runtime)"). The emitter never opens the file, so a model emits
+whether or not the source exists. `anything` declares no shape and refuses.
+
+An aggregate valueset — a table `cartpow(cartprod(a = S1, b = S2, …), N)` or a
+record `cartprod(a = S1, …)` — has no single tensor form, so **one `inputs` entry
+becomes one argument per column/field, in declared column order**: a scalar
+column of an `N`-row table is `tensor<N×f32>`, a `cartpow(reals, k)` column is
+`tensor<N×k×f32>`, a scalar field of a record is `tensor<f32>`. Column access on
+the loaded binding (`data.y`) resolves to that column's argument, and argument
+numbering runs over the flattened list, so an entry after a destructured one
+shifts by the column count. A column that is itself an aggregate (a nested
+record) refuses, naming the column.
+
+**A dynamic row count emits `?` columns, and nothing checks them at run time.**
+A valueset whose power is non-literal — `cartpow(cartprod(x, y), n)` with
+`n = external(posintegers)` — has no statically known row count, so its column
+arguments type `tensor<?xf32>`. The `n` argument is emitted alongside them as an
+ordinary `tensor<i32>` input, but **nothing ties the runtime length of those
+columns to the value passed as `n`**: the host is responsible for supplying
+consistent shapes, and a mismatch is neither refused here nor detected by the
+emitted module. A model that needs the length pinned at compile time should
+declare a literal row count.
 
 `inputs` is **authoritative and exhaustive**: every `elementof` parameter in
 the module must appear in it, or emission refuses. A binding that is neither an
 `elementof` parameter nor a fixed `external`/`load_data` input (e.g. a literal
-or a derived computation) cannot be an argument and refuses. A `load_data`
-whose file format is unsupported (`.json`, Arrow) refuses rather than
-mis-shaping the argument. A fixed-phase input the query reaches but that is not
-listed in `inputs` refuses, pointing at the ABI.
+or a derived computation) cannot be an argument and refuses. A fixed-phase input
+the query reaches but that is not listed in `inputs` refuses, pointing at the
+ABI.
 
 ### `outputs` — the results
 
@@ -98,19 +123,33 @@ outputs = (logdensityof(L, record(a = mu)), logdensityof(post, record(a = 0.5)))
 func.func @logdensity(%arg0: tensor<f32>) -> (tensor<f32>, tensor<f32>)
 ```
 
-Data as a runtime argument — a `load_data` input listed in `inputs` is a
-shape-pinned tensor (here `d.csv` has 3 data rows), so one compiled module
-scores any length-3 data vector without re-emitting; the data is not a constant:
+Data as a runtime argument — a `load_data` input listed in `inputs` is a tensor
+shaped from its valueset, so one compiled module scores any length-3 data vector
+without re-emitting; the data is not a constant:
 
 ```
 mu = elementof(reals)
-y  = load_data("d.csv", reals)
+y  = load_data("d.csv", cartpow(reals, 3))
 inputs  = (mu, y)
 outputs = logdensityof(post, record(a = mu))
 ```
 
 ```mlir
 func.func @logdensity(%arg0: tensor<f32>, %arg1: tensor<3xf32>) -> tensor<f32>
+```
+
+One CSV holding several columns — the single `data` entry destructures into its
+two columns in declared order, so `data.y` is `%arg2`:
+
+```
+mu   = elementof(reals)
+data = load_data("d.csv", cartpow(cartprod(x = reals, y = reals), 3))
+inputs  = (mu, data)
+outputs = logdensityof(L, record(a = mu))
+```
+
+```mlir
+func.func @logdensity(%arg0: tensor<f32>, %arg1: tensor<3xf32>, %arg2: tensor<3xf32>) -> tensor<f32>
 ```
 
 Fallback — a model with neither binding still emits, from the last-public-binding
@@ -153,10 +192,10 @@ binding across the independent module namespaces and refuse. The record
   (input binding symbols in order; output query nodes in order); `None` when
   neither binding is present (the fallback signal).
 - `modes::emit_logdensity_abi` — the ABI emission path: exhaustiveness check,
-  ordered arguments, shape-pinned `load_data`, ordered results.
-- `EmitOptions::input_shapes` — the compile-time `load_data` length map
-  (binding name → shape) the host supplies; the CLI reads each `load_data`
-  file's row count into it.
+  ordered arguments, ordered results.
+- `modes::bind_input` / `modes::aggregate_columns` — the argument(s) one
+  `inputs` entry contributes, including the per-column destructuring;
+  `Emitter::bind_column` / `Emitter::column_arg` route a column access to its
+  argument.
 - The CLI verb (`flatppl stablehlo`) recognizes `inputs`/`outputs` on the
-  surface model, roots determinization DCE on them, and populates
-  `input_shapes`.
+  surface model and roots determinization DCE on them. It reads no data file.

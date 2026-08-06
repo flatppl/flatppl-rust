@@ -9317,30 +9317,17 @@ fn inputs_outputs_bindings_parse_and_infer_without_error() {
     assert!(diags.is_empty(), "infer diagnostics: {diags:?}");
 }
 
-// ---- PR-2: fixed-phase inputs (`external`, `load_data`) as runtime args -----
+// ---- Fixed-phase inputs (`external`, `load_data`) as runtime args -----------
 //
 // A fixed-phase binding (`external(S)` / `load_data(...)`) listed in `inputs`
-// becomes a `func.func` argument instead of refusing (PR-1) — extending the
-// SAME ABI arg path PR-1 built for `elementof`. `external(S)` types from `S`
-// (scalar first); `load_data(...)` types `tensor<N×f32>` with `N` pinned from
-// the compile-time file read threaded via `EmitOptions::input_shapes` (design
-// doc "load_data — shape, not values": only the shape is pinned, the values are
-// the runtime argument, never baked). A fixed-phase binding NOT in `inputs`
-// still refuses, pointing at the ABI.
-
-/// Emit `@logdensity` with a compile-time shape-pin map (the CLI's
-/// [`EmitOptions::input_shapes`], populated from a `load_data` file read).
-fn emit_logdensity_with_shapes(m: &Module, shapes: &[(&str, Vec<u64>)]) -> String {
-    let opts = flatppl_stablehlo::EmitOptions {
-        input_shapes: shapes
-            .iter()
-            .map(|(name, dims)| (name.to_string(), dims.clone()))
-            .collect(),
-        ..Default::default()
-    };
-    flatppl_stablehlo::emit(m, flatppl_stablehlo::Mode::LogDensity, &opts)
-        .expect("must emit @logdensity")
-}
+// becomes a `func.func` argument instead of refusing — the SAME ABI arg path
+// `elementof` uses. `external(S)` types from `S` (scalar first);
+// `load_data(source, valueset)` types from its declared `valueset` and never
+// reads `source` (spec §07 `load_data`: "`valueset` fully determines the
+// result's shape"; §13 `sec:determinization-signature`: "function argument
+// (shape from its `valueset`, contents at runtime)"). An aggregate valueset
+// destructures into one argument per column. A fixed-phase binding NOT in
+// `inputs` still refuses, pointing at the ABI.
 
 /// Step 2 (external, scalar): a scalar `external(reals)` listed in `inputs`
 /// becomes a scalar `func.func` argument (`tensor<f32>`), NOT a PR-1 refusal.
@@ -9368,14 +9355,47 @@ outputs = q1
     assert!(is_delimiter_balanced(&out));
 }
 
-/// Step 3 (load_data): a `load_data(...)` binding listed in `inputs` emits a
-/// ranked-tensor argument whose length is the compile-time-pinned `N`
-/// (`tensor<3×f32>` here) — NOT a `tensor<?×f32>` (unusable downstream), NOT a
-/// refusal, and NOT a baked `stablehlo.constant` (its values are the runtime
-/// argument). `y` is a declared-but-unused input (a stable ABI arg is not
-/// DCE'd), isolating the shape-pin from any density-over-vector lowering.
+/// Step 3 (load_data): a `load_data(source, cartpow(reals, N))` binding listed
+/// in `inputs` emits `tensor<N×f32>` from its DECLARED valueset — NOT a
+/// `tensor<?×f32>`, NOT a refusal, and NOT a baked `stablehlo.constant` (its
+/// values are the runtime argument). `y` is a declared-but-unused input (a
+/// stable ABI arg is not DCE'd), isolating the argument's typing from any
+/// density-over-vector lowering.
 #[test]
-fn emit_logdensity_abi_load_data_pinned_tensor_arg() {
+fn emit_logdensity_abi_load_data_arg_shaped_from_valueset() {
+    let src = "\
+a = elementof(reals)
+y = load_data(\"data.csv\", cartpow(reals, 3))
+m = lawof(record(a = draw(Normal(mu = 0.0, sigma = 1.0))))
+q1 = logdensityof(m, record(a = a))
+inputs = (a, y)
+outputs = q1
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let out = emit_logdensity(&d);
+    assert!(
+        out.contains(
+            "func.func @logdensity(%arg0: tensor<f32>, %arg1: tensor<3xf32>) -> tensor<f32>"
+        ),
+        "load_data `y` must become `%arg1: tensor<3xf32>` from its valueset, in:\n{out}"
+    );
+    assert!(
+        !out.contains("tensor<?x"),
+        "a valueset-shaped load_data arg must not carry a dynamic `?` dim, in:\n{out}"
+    );
+    // Values are the runtime argument, never inlined: no data constant for `y`.
+    assert!(
+        !out.contains("dense<[") && !out.contains("data.csv"),
+        "load_data values must not be baked as a constant, in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// A SCALAR valueset yields a scalar argument (spec §07 `load_data`: "A scalar
+/// set yields a scalar") — the spelling that read the source's row count before
+/// this rule was corrected, so it locks the direction of the fix.
+#[test]
+fn emit_logdensity_abi_load_data_scalar_valueset_is_a_scalar_arg() {
     let src = "\
 a = elementof(reals)
 y = load_data(\"data.csv\", reals)
@@ -9385,23 +9405,756 @@ inputs = (a, y)
 outputs = q1
 ";
     let d = determinize_abi_roots(src, &["inputs", "outputs"]);
-    let out = emit_logdensity_with_shapes(&d, &[("y", vec![3])]);
+    let out = emit_logdensity(&d);
     assert!(
         out.contains(
-            "func.func @logdensity(%arg0: tensor<f32>, %arg1: tensor<3xf32>) -> tensor<f32>"
+            "func.func @logdensity(%arg0: tensor<f32>, %arg1: tensor<f32>) -> tensor<f32>"
         ),
-        "load_data `y` must become a shape-pinned `%arg1: tensor<3xf32>`, in:\n{out}"
+        "`load_data(_, reals)` must be a SCALAR arg, in:\n{out}"
     );
+}
+
+/// `load_data(source, anything)` cannot be promoted to an argument (§07: engines
+/// "should not do this as an automatic step" — infer the shape from the source;
+/// §13 `sec:determinization-signature`: "`anything` declares none and cannot be
+/// promoted"). Refuses naming the entry, rather than emitting an untyped arg.
+#[test]
+fn emit_logdensity_abi_refuses_load_data_over_anything() {
+    let src = "\
+a = elementof(reals)
+y = load_data(\"data.csv\", anything)
+m = lawof(record(a = draw(Normal(mu = 0.0, sigma = 1.0))))
+q1 = logdensityof(m, record(a = a))
+inputs = (a, y)
+outputs = q1
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let err = flatppl_stablehlo::emit(
+        &d,
+        flatppl_stablehlo::Mode::LogDensity,
+        &flatppl_stablehlo::EmitOptions::default(),
+    )
+    .unwrap_err();
     assert!(
-        !out.contains("tensor<?x"),
-        "the pinned load_data arg must not carry a dynamic `?` dim, in:\n{out}"
+        err.msg.contains("declares no shape") && err.msg.contains('y'),
+        "expected an `anything`-cannot-be-promoted refusal naming `y`, got: {}",
+        err.msg
     );
-    // Values are the runtime argument, never inlined: no data constant for `y`.
+}
+
+/// A TABLE valueset (`cartpow(cartprod(x = …, y = …), N)`) destructures into one
+/// argument per column, in declared column order, each `tensor<N×f32>` — one
+/// `inputs` entry, two arguments (the crate doc's flattening convention). The
+/// likelihood variate `data.y` reads the SECOND column's argument, so the
+/// emitted body is the two-separate-files emission with the arguments renamed:
+/// `%arg3` (x column) is unused here, `%arg4` (y column) enters the density.
+#[test]
+fn emit_logdensity_abi_load_data_table_destructures_into_column_args() {
+    let src = "\
+alpha = elementof(reals)
+beta = elementof(reals)
+sigma = elementof(posreals)
+data = load_data(\"data.csv\", cartpow(cartprod(x = reals, y = reals), 4))
+means = alpha .+ beta .* data.x
+y ~ Normal.(means, sigma)
+k = kernelof(record(y = y), alpha = alpha, beta = beta, sigma = sigma)
+L = likelihoodof(k, record(y = data.y))
+lp = logdensityof(L, record(alpha = alpha, beta = beta, sigma = sigma))
+inputs = (alpha, beta, sigma, data)
+outputs = (lp)
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let out = emit_logdensity(&d);
     assert!(
-        !out.contains("dense<[") && !out.contains("data.csv"),
-        "load_data values must not be baked as a constant, in:\n{out}"
+        out.contains(
+            "func.func @logdensity(%arg0: tensor<f32>, %arg1: tensor<f32>, \
+             %arg2: tensor<f32>, %arg3: tensor<4xf32>, %arg4: tensor<4xf32>) -> tensor<f32>"
+        ),
+        "the table entry `data` must destructure into `%arg3` (x) and `%arg4` (y), in:\n{out}"
+    );
+    // The x column feeds the mean and the y column the variate — each column
+    // argument reaches the op the model's column access named.
+    assert!(
+        out.contains("stablehlo.multiply %0, %arg3 : tensor<4xf32>")
+            && out.contains("stablehlo.subtract %arg4, "),
+        "x → the mean, y → the variate residual, in:\n{out}"
     );
     assert!(is_delimiter_balanced(&out));
+}
+
+/// A table column that is itself an array shapes as `tensor<N×k×f32>` — the row
+/// count is the leading axis and the column's own `cartpow(reals, k)` follows.
+#[test]
+fn emit_logdensity_abi_load_data_array_column_is_rank_two() {
+    let src = "\
+alpha = elementof(reals)
+sigma = elementof(posreals)
+data = load_data(\"data.csv\", cartpow(cartprod(x = cartpow(reals, 3), y = reals), 4))
+y ~ Normal.(alpha, sigma)
+k = kernelof(record(y = y), alpha = alpha, sigma = sigma)
+L = likelihoodof(k, record(y = data.y))
+lp = logdensityof(L, record(alpha = alpha, sigma = sigma))
+inputs = (alpha, sigma, data)
+outputs = (lp)
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let out = emit_logdensity(&d);
+    assert!(
+        out.contains(
+            "func.func @logdensity(%arg0: tensor<f32>, %arg1: tensor<f32>, \
+             %arg2: tensor<4x3xf32>, %arg3: tensor<4xf32>) -> tensor<f32>"
+        ),
+        "a `cartpow(reals, 3)` column of a 4-row table must be `tensor<4x3xf32>`, in:\n{out}"
+    );
+}
+
+/// A RECORD valueset (`cartprod(...)`, no power) destructures the same way, one
+/// argument per field (§07: "`cartprod` a record") — a record of scalars gives
+/// scalar arguments, not a row axis.
+#[test]
+fn emit_logdensity_abi_load_data_record_destructures_into_field_args() {
+    let src = "\
+a = elementof(reals)
+pars = load_data(\"p.csv\", cartprod(mu = reals, tau = posreals))
+m = lawof(record(a = draw(Normal(mu = pars.mu, sigma = pars.tau))))
+q1 = logdensityof(m, record(a = a))
+inputs = (a, pars)
+outputs = q1
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let out = emit_logdensity(&d);
+    assert!(
+        out.contains(
+            "func.func @logdensity(%arg0: tensor<f32>, %arg1: tensor<f32>, \
+             %arg2: tensor<f32>) -> tensor<f32>"
+        ),
+        "the record entry `pars` must destructure into `mu`/`tau` args, in:\n{out}"
+    );
+}
+
+/// A column with no tensor form of its own (a nested record column) refuses
+/// NAMING THE COLUMN rather than reporting the generic aggregate refusal for the
+/// whole entry — destructuring one level does not make a nested aggregate
+/// lowerable.
+#[test]
+fn emit_logdensity_abi_refuses_nested_aggregate_column() {
+    let src = "\
+a = elementof(reals)
+data = load_data(\"d.csv\", cartpow(cartprod(x = reals, inner = cartprod(p = reals, q = reals)), 4))
+m = lawof(record(a = draw(Normal(mu = 0.0, sigma = 1.0))))
+q1 = logdensityof(m, record(a = a))
+inputs = (a, data)
+outputs = q1
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let err = flatppl_stablehlo::emit(
+        &d,
+        flatppl_stablehlo::Mode::LogDensity,
+        &flatppl_stablehlo::EmitOptions::default(),
+    )
+    .unwrap_err();
+    assert!(
+        err.msg.contains("column `inner` has no tensor form"),
+        "expected a refusal naming the nested column `inner`, got: {}",
+        err.msg
+    );
+}
+
+// ---- Matrix product: `*` is not `.*` (spec §07 "Linear algebra") ------------
+//
+// §07: "Matrix multiplication and addition use the standard `*` and `+`
+// operators." A BARE `mul` over a rank-2 lhs is that product and lowers to one
+// `stablehlo.dot_general`; the elementwise `.*` spelling reaches the op map as
+// `broadcast(mul, …)` and stays elementwise. Before this, every `mul` went
+// elementwise and a rank-2 × rank-1 pair ABORTED the process on
+// `Emitter::broadcast_pair`'s rank assertion.
+
+/// Matrix·vector `*` lowers to `dot_general` contracting the lhs's trailing axis
+/// against the vector, giving the lhs's leading axis — `[4, 3] * [3]` → `[4]`.
+#[test]
+fn emit_logdensity_matrix_times_vector_is_one_dot_general() {
+    let src = "\
+x = elementof(cartpow(reals, [4, 3]))
+b = elementof(cartpow(reals, 3))
+mv = x * b
+lp = logdensityof(lawof(record(y = draw(Normal(mu = sum(mv), sigma = 1.0)))), record(y = 1.0))
+inputs = (x, b)
+outputs = lp
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let out = emit_logdensity(&d);
+    assert!(
+        out.contains(
+            "stablehlo.dot_general %arg0, %arg1, contracting_dims = [1] x [0], \
+             precision = [DEFAULT, DEFAULT] : (tensor<4x3xf32>, tensor<3xf32>) -> tensor<4xf32>"
+        ),
+        "matrix·vector must be one dot_general giving tensor<4xf32>, in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// Matrix·matrix `*` falls out of the same contraction one rank higher —
+/// `[4, 3] * [3, 2]` → `[4, 2]` — and chains into a matrix·vector product.
+#[test]
+fn emit_logdensity_matrix_times_matrix_chains_into_matvec() {
+    let src = "\
+a = elementof(cartpow(reals, [4, 3]))
+b = elementof(cartpow(reals, [3, 2]))
+v = elementof(cartpow(reals, 2))
+mm = a * b
+r = mm * v
+lp = logdensityof(lawof(record(y = draw(Normal(mu = sum(r), sigma = 1.0)))), record(y = 1.0))
+inputs = (a, b, v)
+outputs = lp
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let out = emit_logdensity(&d);
+    assert!(
+        out.contains("(tensor<4x3xf32>, tensor<3x2xf32>) -> tensor<4x2xf32>"),
+        "matrix·matrix must give tensor<4x2xf32>, in:\n{out}"
+    );
+    assert!(
+        out.contains("(tensor<4x2xf32>, tensor<2xf32>) -> tensor<4xf32>"),
+        "the product must chain into a matrix·vector, in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// `*` on two VECTORS refuses. §07 gives `*` a vector meaning only through a
+/// transpose ("the product of a transposed vector and a non-transposed vector is
+/// a scalar"), and `infer`'s `mul_type` returns `Deferred` for a rank-1 pair — so
+/// lowering it elementwise would answer a question the model did not ask (a user
+/// writing `v * w` for a dot product would silently get a vector of products).
+#[test]
+fn emit_logdensity_refuses_bare_mul_on_two_vectors() {
+    let src = "\
+v = elementof(cartpow(reals, 3))
+w = elementof(cartpow(reals, 3))
+z = v * w
+lp = logdensityof(lawof(record(y = draw(Normal(mu = sum(z), sigma = 1.0)))), record(y = 1.0))
+inputs = (v, w)
+outputs = lp
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let err = flatppl_stablehlo::emit(
+        &d,
+        flatppl_stablehlo::Mode::LogDensity,
+        &flatppl_stablehlo::EmitOptions::default(),
+    )
+    .unwrap_err();
+    assert!(
+        err.msg
+            .contains("`*` has no meaning for these operand shapes")
+            && err.msg.contains(".*"),
+        "expected a `*`-undefined refusal pointing at `.*`, got: {}",
+        err.msg
+    );
+}
+
+/// Same for a rank-3 pair, which §07 gives no product meaning at all.
+#[test]
+fn emit_logdensity_refuses_bare_mul_on_rank_three_operands() {
+    let src = "\
+a = elementof(cartpow(reals, [2, 3, 4]))
+b = elementof(cartpow(reals, [2, 3, 4]))
+z = a * b
+lp = logdensityof(lawof(record(y = draw(Normal(mu = sum(z), sigma = 1.0)))), record(y = 1.0))
+inputs = (a, b)
+outputs = lp
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let err = flatppl_stablehlo::emit(
+        &d,
+        flatppl_stablehlo::Mode::LogDensity,
+        &flatppl_stablehlo::EmitOptions::default(),
+    )
+    .unwrap_err();
+    assert!(
+        err.msg
+            .contains("`*` has no meaning for these operand shapes"),
+        "expected a `*`-undefined refusal for a rank-3 pair, got: {}",
+        err.msg
+    );
+}
+
+/// A bare `mul` with a SCALAR operand is untouched by the guard — it is the
+/// ordinary elementwise multiply, and it is the shape the determiniser's own
+/// synthesized `mul(literal, …)` sites build, so refusing it would break
+/// lowering well outside this wave.
+#[test]
+fn emit_logdensity_bare_mul_with_a_scalar_operand_stays_elementwise() {
+    let src = "\
+s = elementof(reals)
+w = elementof(cartpow(reals, 3))
+z = s * w
+lp = logdensityof(lawof(record(y = draw(Normal(mu = sum(z), sigma = 1.0)))), record(y = 1.0))
+inputs = (s, w)
+outputs = lp
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let out = emit_logdensity(&d);
+    assert!(
+        out.contains("stablehlo.multiply") && !out.contains("dot_general"),
+        "scalar * vector must stay an elementwise multiply, in:\n{out}"
+    );
+}
+
+/// Scalar `*` scalar likewise stays elementwise (the overwhelmingly common
+/// shape; the guard must not touch it).
+#[test]
+fn emit_logdensity_bare_mul_of_two_scalars_stays_elementwise() {
+    let src = "\
+s = elementof(reals)
+t = elementof(reals)
+z = s * t
+lp = logdensityof(lawof(record(y = draw(Normal(mu = z, sigma = 1.0)))), record(y = 1.0))
+inputs = (s, t)
+outputs = lp
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let out = emit_logdensity(&d);
+    assert!(
+        out.contains("stablehlo.multiply %arg0, %arg1 : tensor<f32>"),
+        "scalar * scalar must stay an elementwise multiply, in:\n{out}"
+    );
+}
+
+/// `.*` on two VECTORS stays elementwise — the guard keys on a BARE `mul`, and
+/// `.*` arrives as `broadcast(mul, …)` through a path that never reaches it. This
+/// is the pair the `*` refusal above points users toward, so it must work.
+#[test]
+fn emit_logdensity_elementwise_mul_over_vectors_stays_elementwise() {
+    let src = "\
+v = elementof(cartpow(reals, 3))
+w = elementof(cartpow(reals, 3))
+z = v .* w
+lp = logdensityof(lawof(record(y = draw(Normal(mu = sum(z), sigma = 1.0)))), record(y = 1.0))
+inputs = (v, w)
+outputs = lp
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let out = emit_logdensity(&d);
+    assert!(
+        out.contains("stablehlo.multiply %arg0, %arg1 : tensor<3xf32>"),
+        "`.*` over two vectors must stay an elementwise multiply, in:\n{out}"
+    );
+    assert!(
+        !out.contains("dot_general"),
+        "`.*` must not become a matrix product, in:\n{out}"
+    );
+}
+
+// ---- `require_broadcastable` covers all THREE of its call sites ------------
+//
+// `Emitter::binary`, `Emitter::compare` and `Emitter::select` each reconcile
+// operands through `broadcast_pair`, which panics on a pair with no broadcast
+// form. Guarding only `ops::binary` left `ifelse`/`compare` aborting the process
+// on ordinary surface FlatPPL. These three pin every pairing.
+
+/// `ifelse`'s two BRANCHES must broadcast against each other — a matrix branch
+/// and a vector branch used to abort in `Emitter::select`'s `broadcast_pair`.
+#[test]
+fn emit_logdensity_refuses_ifelse_with_unbroadcastable_branches() {
+    let src = "\
+m = elementof(cartpow(reals, [4, 3]))
+v = elementof(cartpow(reals, 3))
+p = elementof(reals)
+q = elementof(reals)
+z = ifelse(p < q, m, v)
+lp = logdensityof(lawof(record(y = draw(Normal(mu = sum(z), sigma = 1.0)))), record(y = 1.0))
+inputs = (m, v, p, q)
+outputs = lp
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let err = flatppl_stablehlo::emit(
+        &d,
+        flatppl_stablehlo::Mode::LogDensity,
+        &flatppl_stablehlo::EmitOptions::default(),
+    )
+    .unwrap_err();
+    assert!(
+        err.msg.contains("do not broadcast"),
+        "expected a broadcast refusal for the branch pair, got: {}",
+        err.msg
+    );
+}
+
+/// A COMPARE's operands must broadcast — `m < v` with a matrix and a vector used
+/// to abort in `Emitter::compare`'s `broadcast_pair`.
+#[test]
+fn emit_logdensity_refuses_compare_with_unbroadcastable_operands() {
+    let src = "\
+m = elementof(cartpow(reals, [4, 3]))
+v = elementof(cartpow(reals, 3))
+z = ifelse(m < v, 1.0, 2.0)
+lp = logdensityof(lawof(record(y = draw(Normal(mu = sum(z), sigma = 1.0)))), record(y = 1.0))
+inputs = (m, v)
+outputs = lp
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let err = flatppl_stablehlo::emit(
+        &d,
+        flatppl_stablehlo::Mode::LogDensity,
+        &flatppl_stablehlo::EmitOptions::default(),
+    )
+    .unwrap_err();
+    assert!(
+        err.msg.contains("do not broadcast"),
+        "expected a broadcast refusal for the compare operands, got: {}",
+        err.msg
+    );
+}
+
+/// `ifelse`'s PREDICATE must broadcast against its branches. This case never
+/// panicked — `Emitter::select`'s second pass uses `broadcast_scalar`, which
+/// emitted an INVALID `broadcast_in_dim` (a rank-2 operand to a rank-1 result
+/// under `dims = []`) and returned success. A mislowering is worse than the
+/// abort the sibling cases had, so it refuses too.
+#[test]
+fn emit_logdensity_refuses_ifelse_with_a_mismatched_predicate_shape() {
+    let src = "\
+m = elementof(cartpow(reals, [4, 3]))
+n = elementof(cartpow(reals, [4, 3]))
+v1 = elementof(cartpow(reals, 3))
+v2 = elementof(cartpow(reals, 3))
+z = ifelse(v1 < v2, m, n)
+lp = logdensityof(lawof(record(y = draw(Normal(mu = sum(z), sigma = 1.0)))), record(y = 1.0))
+inputs = (m, n, v1, v2)
+outputs = lp
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let err = flatppl_stablehlo::emit(
+        &d,
+        flatppl_stablehlo::Mode::LogDensity,
+        &flatppl_stablehlo::EmitOptions::default(),
+    )
+    .unwrap_err();
+    assert!(
+        err.msg.contains("does not match its branches' shape"),
+        "expected a predicate-shape refusal for the predicate/branch pair, got: {}",
+        err.msg
+    );
+}
+
+/// A SIZE-1 predicate against `[3]` branches. The size-1 rule
+/// `require_broadcastable` applies is right for elementwise arithmetic, where
+/// `broadcast_pair` supplies identity dims, but WRONG for the predicate pass —
+/// `Emitter::broadcast_scalar` emits an empty `dims` list, valid only for a
+/// rank-0 operand. This used to emit
+/// `broadcast_in_dim … dims = [] : (tensor<3xf32>) -> tensor<1xf32>` and exit 0:
+/// invalid StableHLO claiming to shrink 3 to 1.
+#[test]
+fn emit_logdensity_refuses_ifelse_with_a_size_one_predicate() {
+    let src = "\
+p1 = elementof(cartpow(reals, 1))
+p2 = elementof(cartpow(reals, 1))
+m = elementof(cartpow(reals, 3))
+n = elementof(cartpow(reals, 3))
+z = ifelse(p1 < p2, m, n)
+lp = logdensityof(lawof(record(y = draw(Normal(mu = sum(z), sigma = 1.0)))), record(y = 1.0))
+inputs = (p1, p2, m, n)
+outputs = lp
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let err = flatppl_stablehlo::emit(
+        &d,
+        flatppl_stablehlo::Mode::LogDensity,
+        &flatppl_stablehlo::EmitOptions::default(),
+    )
+    .unwrap_err();
+    assert!(
+        err.msg.contains("does not match its branches' shape"),
+        "expected a predicate-shape refusal for a size-1 predicate, got: {}",
+        err.msg
+    );
+}
+
+/// The mirror: a `[3]` predicate against SIZE-1 branches, which emitted the
+/// invalid expansion in the other direction.
+#[test]
+fn emit_logdensity_refuses_ifelse_with_size_one_branches_under_a_wider_predicate() {
+    let src = "\
+p1 = elementof(cartpow(reals, 3))
+p2 = elementof(cartpow(reals, 3))
+m = elementof(cartpow(reals, 1))
+n = elementof(cartpow(reals, 1))
+z = ifelse(p1 < p2, m, n)
+lp = logdensityof(lawof(record(y = draw(Normal(mu = sum(z), sigma = 1.0)))), record(y = 1.0))
+inputs = (p1, p2, m, n)
+outputs = lp
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let err = flatppl_stablehlo::emit(
+        &d,
+        flatppl_stablehlo::Mode::LogDensity,
+        &flatppl_stablehlo::EmitOptions::default(),
+    )
+    .unwrap_err();
+    assert!(
+        err.msg.contains("does not match its branches' shape"),
+        "expected a predicate-shape refusal for size-1 branches, got: {}",
+        err.msg
+    );
+}
+
+/// A size-1 BRANCH against a `[3]` branch under a `[3]` predicate must still
+/// LOWER, and this is why the predicate is compared against the branches'
+/// reconciled shape rather than against one branch: `broadcast_pair` expands the
+/// size-1 branch with proper identity dims first, so the predicate pass is a
+/// no-op and the emission is valid. Comparing the predicate to `a` alone would
+/// refuse a shape that works today.
+#[test]
+fn emit_logdensity_ifelse_size_one_branch_reconciles_before_the_predicate_check() {
+    let src = "\
+p1 = elementof(cartpow(reals, 3))
+p2 = elementof(cartpow(reals, 3))
+m = elementof(cartpow(reals, 1))
+n = elementof(cartpow(reals, 3))
+z = ifelse(p1 < p2, m, n)
+lp = logdensityof(lawof(record(y = draw(Normal(mu = sum(z), sigma = 1.0)))), record(y = 1.0))
+inputs = (p1, p2, m, n)
+outputs = lp
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let out = emit_logdensity(&d);
+    assert!(
+        out.contains(
+            "stablehlo.select %1, %2, %arg3 : (tensor<3xi1>, tensor<3xf32>, tensor<3xf32>) \
+             -> tensor<3xf32>"
+        ),
+        "a size-1 branch must reconcile to [3] and the select stay valid, in:\n{out}"
+    );
+    // The size-1 expansion must use proper identity dims, never an empty list.
+    assert!(
+        !out.contains("dims = [] : (tensor<1xf32>)")
+            && !out.contains("dims = [] : (tensor<3xf32>)"),
+        "a non-rank-0 operand must never broadcast under an empty dims list, in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// The shapes `ifelse` MUST still accept: a scalar predicate against ranked
+/// branches (StableHLO's select takes one), and a ranked predicate against
+/// scalar branches (they broadcast up). Guards against the three refusals above
+/// over-refusing the ordinary image-gate shapes the determiniser emits.
+#[test]
+fn emit_logdensity_ifelse_scalar_and_ranked_predicates_still_lower() {
+    for (label, src) in [
+        (
+            "scalar pred, ranked branches",
+            "\
+m = elementof(cartpow(reals, 3))
+n = elementof(cartpow(reals, 3))
+p = elementof(reals)
+q = elementof(reals)
+z = ifelse(p < q, m, n)
+lp = logdensityof(lawof(record(y = draw(Normal(mu = sum(z), sigma = 1.0)))), record(y = 1.0))
+inputs = (m, n, p, q)
+outputs = lp
+",
+        ),
+        (
+            "ranked pred, scalar branches",
+            "\
+v1 = elementof(cartpow(reals, 3))
+v2 = elementof(cartpow(reals, 3))
+z = ifelse(v1 < v2, 1.0, 2.0)
+lp = logdensityof(lawof(record(y = draw(Normal(mu = sum(z), sigma = 1.0)))), record(y = 1.0))
+inputs = (v1, v2)
+outputs = lp
+",
+        ),
+    ] {
+        let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+        let out = emit_logdensity(&d);
+        assert!(
+            out.contains("stablehlo.select"),
+            "{label} must still lower a select, in:\n{out}"
+        );
+        assert!(is_delimiter_balanced(&out));
+    }
+}
+
+/// The elementwise `.*` spelling over two rank-2 operands stays elementwise —
+/// it must NOT be captured by the matrix-product dispatch (it arrives as
+/// `broadcast(mul, …)`, which never passes through that dispatch).
+#[test]
+fn emit_logdensity_elementwise_mul_over_matrices_stays_elementwise() {
+    let src = "\
+a = elementof(cartpow(reals, [4, 3]))
+c = elementof(cartpow(reals, [4, 3]))
+d = a .* c
+lp = logdensityof(lawof(record(y = draw(Normal(mu = sum(d), sigma = 1.0)))), record(y = 1.0))
+inputs = (a, c)
+outputs = lp
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let out = emit_logdensity(&d);
+    assert!(
+        out.contains("stablehlo.multiply %arg0, %arg1 : tensor<4x3xf32>"),
+        "`.*` over two matrices must stay an elementwise multiply, in:\n{out}"
+    );
+    assert!(
+        !out.contains("dot_general"),
+        "`.*` must not lower to a matrix product, in:\n{out}"
+    );
+}
+
+/// An elementwise op whose operands do not broadcast REFUSES rather than
+/// aborting on `Emitter::broadcast_pair`'s rank assertion. `a .* b` with a
+/// rank-2 and a rank-1 operand is the case that used to panic, and the message
+/// names the `*`-vs-`.*` distinction that fixes such a model.
+#[test]
+fn emit_logdensity_refuses_unbroadcastable_elementwise_operands() {
+    let src = "\
+a = elementof(cartpow(reals, [4, 3]))
+b = elementof(cartpow(reals, 3))
+d = a .* b
+lp = logdensityof(lawof(record(y = draw(Normal(mu = sum(d), sigma = 1.0)))), record(y = 1.0))
+inputs = (a, b)
+outputs = lp
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let err = flatppl_stablehlo::emit(
+        &d,
+        flatppl_stablehlo::Mode::LogDensity,
+        &flatppl_stablehlo::EmitOptions::default(),
+    )
+    .unwrap_err();
+    assert!(
+        err.msg.contains("do not broadcast") && err.msg.contains("matrix product"),
+        "expected a broadcast refusal naming the matrix-product alternative, got: {}",
+        err.msg
+    );
+}
+
+/// The wave's full worked probe: a table `load_data` whose `x` column is a
+/// 3-vector per row feeds a matrix·vector product against the `beta` parameter,
+/// and its `y` column is the likelihood variate. One `inputs` entry (`data`)
+/// contributes `%arg3` (`tensor<4x3xf32>`) and `%arg4` (`tensor<4xf32>`); the
+/// model's own `x_data` parameter is NOT an argument — the query point pins it
+/// to `data.x`, so it is substituted away and DCE drops it (§13: an `elementof`
+/// no output reaches "is eliminated like any other unreached binding"). The
+/// source `data.json` is never read.
+#[test]
+fn emit_logdensity_table_column_matvec_worked_probe() {
+    let src = "\
+alpha = elementof(reals)
+beta = elementof(cartpow(reals, 3))
+sigma = elementof(posreals)
+x_data = elementof(cartpow(reals, [4, 3]))
+means = alpha .+ x_data * beta
+y ~ Normal.(means, sigma)
+k = kernelof(record(y = y), alpha = alpha, beta = beta, sigma = sigma, x_data = x_data)
+data = load_data(\"data.json\", cartpow(cartprod(x = cartpow(reals, 3), y = reals), 4))
+L = likelihoodof(k, record(y = data.y))
+lp = logdensityof(L, record(alpha = alpha, beta = beta, sigma = sigma, x_data = data.x))
+inputs = (alpha, beta, sigma, data)
+outputs = (lp)
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let out = emit_logdensity(&d);
+    assert!(
+        out.contains(
+            "func.func @logdensity(%arg0: tensor<f32>, %arg1: tensor<3xf32>, \
+             %arg2: tensor<f32>, %arg3: tensor<4x3xf32>, %arg4: tensor<4xf32>) -> tensor<f32>"
+        ),
+        "expected the worked probe's signature (data.x → %arg3, data.y → %arg4), in:\n{out}"
+    );
+    // The x column enters through the matvec against beta ...
+    assert!(
+        out.contains(
+            "stablehlo.dot_general %arg3, %arg1, contracting_dims = [1] x [0], \
+             precision = [DEFAULT, DEFAULT] : (tensor<4x3xf32>, tensor<3xf32>) -> tensor<4xf32>"
+        ),
+        "the x column must reach beta through one dot_general, in:\n{out}"
+    );
+    // ... and the y column is the variate the residual subtracts from.
+    assert!(
+        out.contains("stablehlo.subtract %arg4, "),
+        "the y column must be the likelihood variate, in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// The DOWNSTREAM FIXTURE's shape, at its real 20 rows: the same model as
+/// `emit_logdensity_table_column_matvec_worked_probe` with `N = 20` instead of
+/// `4`. Kept as its own golden rather than folded into that one because the row
+/// count is the number the deleted compile-time file read used to supply — a
+/// regression that re-derived `N` from anything but the `valueset` would have to
+/// produce 20 here and 4 there, so pinning both shapes catches a hardcoded or
+/// mis-plumbed dim that a single-`N` golden would miss.
+#[test]
+fn emit_logdensity_table_column_matvec_twenty_row_fixture_shape() {
+    let src = "\
+alpha = elementof(reals)
+beta = elementof(cartpow(reals, 3))
+sigma = elementof(posreals)
+x_data = elementof(cartpow(reals, [20, 3]))
+means = alpha .+ x_data * beta
+y ~ Normal.(means, sigma)
+k = kernelof(record(y = y), alpha = alpha, beta = beta, sigma = sigma, x_data = x_data)
+data = load_data(\"data.json\", cartpow(cartprod(x = cartpow(reals, 3), y = reals), 20))
+L = likelihoodof(k, record(y = data.y))
+lp = logdensityof(L, record(alpha = alpha, beta = beta, sigma = sigma, x_data = data.x))
+inputs = (alpha, beta, sigma, data)
+outputs = (lp)
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let out = emit_logdensity(&d);
+    assert!(
+        out.contains(
+            "func.func @logdensity(%arg0: tensor<f32>, %arg1: tensor<3xf32>, \
+             %arg2: tensor<f32>, %arg3: tensor<20x3xf32>, %arg4: tensor<20xf32>) -> tensor<f32>"
+        ),
+        "expected the 20-row fixture signature, in:\n{out}"
+    );
+    // The mean is reached through the matvec of the x column against beta ...
+    assert!(
+        out.contains(
+            "stablehlo.dot_general %arg3, %arg1, contracting_dims = [1] x [0], \
+             precision = [DEFAULT, DEFAULT] : (tensor<20x3xf32>, tensor<3xf32>) -> tensor<20xf32>"
+        ),
+        "the mean must come through dot_general(%arg3, %arg1), in:\n{out}"
+    );
+    // ... and the variate through the y column.
+    assert!(
+        out.contains("stablehlo.subtract %arg4, "),
+        "the variate must be %arg4 (the y column), in:\n{out}"
+    );
+    // The density reduces over the 20 rows, not some other length.
+    assert!(
+        out.contains("(tensor<20xf32>, tensor<f32>) -> tensor<f32>"),
+        "the log-density must reduce over 20 rows, in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// A destructured table used as ONE value (here `sum(data)`) refuses: the
+/// per-column arguments supply no monolithic tensor, and the message says to
+/// read it column-wise instead of reporting an unsupported head.
+#[test]
+fn emit_logdensity_abi_refuses_whole_table_in_tensor_position() {
+    let src = "\
+alpha = elementof(reals)
+data = load_data(\"d.csv\", cartpow(cartprod(x = reals, y = reals), 4))
+lp = logdensityof(lawof(record(y = draw(Normal(mu = alpha, sigma = 1.0)))), \
+record(y = sum(data)))
+inputs = (alpha, data)
+outputs = (lp)
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let err = flatppl_stablehlo::emit(
+        &d,
+        flatppl_stablehlo::Mode::LogDensity,
+        &flatppl_stablehlo::EmitOptions::default(),
+    )
+    .unwrap_err();
+    assert!(
+        err.msg.contains("read it column-wise"),
+        "expected a column-wise-access refusal, got: {}",
+        err.msg
+    );
 }
 
 /// Step 4 (refuse when not in `inputs`): a fixed-phase binding that an output

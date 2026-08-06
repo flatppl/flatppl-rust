@@ -44,11 +44,25 @@
 //!   integer-domain parameter such as `posintegers` arrives as a `tensor<i32>`
 //!   argument and is converted to float only where it enters real-valued math);
 //! - an `external(S)` input → an argument typed from `S`;
-//! - a `load_data(…)` input → a `tensor<N×f32>` argument whose length `N` is
-//!   pinned from a compile-time read of the file's row count (`.csv` / `.wsv`;
-//!   other formats refuse) — the **values are never baked**, they are the
-//!   runtime argument (the CLI supplies the lengths via
-//!   [`EmitOptions::input_shapes`]).
+//! - a `load_data(source, valueset)` input → argument(s) shaped from the
+//!   declared `valueset`, never from reading `source` (spec §07 `load_data`:
+//!   "`valueset` fully determines the result's shape"; §13
+//!   `sec:determinization-signature`: "function argument (shape from its
+//!   `valueset`, contents at runtime)"). The emitter never opens the file, so a
+//!   model emits whether or not the source exists. `anything` declares no shape
+//!   and refuses.
+//!
+//! ## Aggregate `load_data` inputs destructure into one argument per column
+//!
+//! A `load_data` input whose `valueset` is a table (`cartpow(cartprod(a = S1,
+//! b = S2, …), N)`) or a record (`cartprod(a = S1, …)`) has no single tensor
+//! form. **One `inputs` entry then becomes several `func.func` arguments, one
+//! per column/field, in DECLARED column order**, each shaped from its own
+//! column set — a scalar column of an `N`-row table is `tensor<N×f32>`, a
+//! `cartpow(reals, k)` column is `tensor<N×k×f32>`, a scalar field of a record
+//! is `tensor<f32>`. Column access on the loaded binding (`data.y`) resolves to
+//! that column's argument. Argument numbering is positional over the flattened
+//! list, so an entry after a destructured one shifts by the column count.
 //!
 //! `inputs` is authoritative and exhaustive: every `elementof` parameter in
 //! the module must be listed, or emission refuses. Each `outputs` entry is a
@@ -91,18 +105,51 @@
 //! ```
 //!
 //! Data as a runtime argument — a `load_data` input listed in `inputs` is a
-//! shape-pinned tensor (here `d.csv` has 3 data rows), so one compiled module
-//! scores any 3-vector without re-emitting; its values are not constants:
+//! tensor shaped from its `valueset`, so one compiled module scores any
+//! 3-vector without re-emitting; its values are not constants:
 //!
 //! ```text
 //! mu = elementof(reals)
-//! y  = load_data("d.csv", reals)
+//! y  = load_data("d.csv", cartpow(reals, 3))
 //! inputs  = (mu, y)
 //! outputs = logdensityof(post, record(a = mu))
 //! ```
 //! →
 //! ```mlir
 //! func.func @logdensity(%arg0: tensor<f32>, %arg1: tensor<3xf32>) -> tensor<f32>
+//! ```
+//!
+//! One CSV holding several columns — the single `data` entry destructures into
+//! its two columns in declared order, so `data.y` is `%arg2`:
+//!
+//! ```text
+//! mu   = elementof(reals)
+//! data = load_data("d.csv", cartpow(cartprod(x = reals, y = reals), 3))
+//! inputs  = (mu, data)
+//! outputs = logdensityof(L, record(a = mu))
+//! ```
+//! →
+//! ```mlir
+//! func.func @logdensity(%arg0: tensor<f32>, %arg1: tensor<3xf32>, %arg2: tensor<3xf32>) -> tensor<f32>
+//! ```
+//!
+//! A column of 3-vectors against a vector parameter — the `x` column is
+//! `tensor<4x3xf32>` and `x_data * beta` is a matrix product (spec §07 "Linear
+//! algebra"), one `stablehlo.dot_general`. `x_data` is not an argument: the
+//! query point pins it to `data.x`, so it is substituted away:
+//!
+//! ```text
+//! beta   = elementof(cartpow(reals, 3))
+//! x_data = elementof(cartpow(reals, [4, 3]))
+//! means  = alpha .+ x_data * beta
+//! data   = load_data("d.json", cartpow(cartprod(x = cartpow(reals, 3), y = reals), 4))
+//! inputs  = (alpha, beta, sigma, data)
+//! outputs = logdensityof(L, record(alpha = alpha, beta = beta, sigma = sigma, x_data = data.x))
+//! ```
+//! →
+//! ```mlir
+//! func.func @logdensity(%arg0: tensor<f32>, %arg1: tensor<3xf32>, %arg2: tensor<f32>,
+//!                       %arg3: tensor<4x3xf32>, %arg4: tensor<4xf32>) -> tensor<f32>
 //! ```
 //!
 //! Caveat for `load_module` query modules: an `inputs` parameter's *binding*
@@ -146,28 +193,11 @@ pub enum Dtype {
 /// never assumes/hardcodes 64-bit floats.
 pub struct EmitOptions {
     pub dtype: Dtype,
-    /// Compile-time shape pins for fixed-phase ABI inputs whose FlatPDL type
-    /// carries a dynamic dim — `load_data(...)` (typed `CartPow(set,
-    /// Dim::Dynamic)`, so `tensor<?×f32>`) and a shaped `external(...)` — keyed
-    /// by the input binding's name. The design doc (`docs/superpowers/specs/
-    /// 2026-07-17-inputs-outputs-abi-design.md`, "`load_data` — shape, not
-    /// values") pins the length from a compile-time read of the resolved file
-    /// *only* for its shape; the values remain the runtime argument (never
-    /// baked). The CLI (`stablehlo_cmd`) reads each `load_data` ABI-input file's
-    /// length and populates this map; [`modes::emit_logdensity_abi`] uses it to
-    /// override the dynamic dim so the argument types `tensor<N×f32>` — a `?`
-    /// dim would be unusable downstream (the executor requires a static shape
-    /// for the density's reduce/broadcast). Empty (the default) means no pin:
-    /// an input with a dynamic dim then types as-is (a `?` arg).
-    pub input_shapes: std::collections::HashMap<String, Vec<u64>>,
 }
 
 impl Default for EmitOptions {
     fn default() -> Self {
-        Self {
-            dtype: Dtype::F32,
-            input_shapes: std::collections::HashMap::new(),
-        }
+        Self { dtype: Dtype::F32 }
     }
 }
 

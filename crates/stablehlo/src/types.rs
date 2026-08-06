@@ -9,10 +9,12 @@
 //! nested `Array`/`TVector` element chain into ONE tensor shape.
 //!
 //! Types with no tensor form are refused, never mis-lowered: aggregates
-//! (`Record`/`Tuple`/`Table`) must be destructured by an earlier pass, and a
-//! residual measure-layer type (`Measure`/`Kernel`/`Likelihood`) reaching
-//! here is an invariant violation — `emit` only ever runs on already-
-//! determinized FlatPDL (`flatppl_determinizer::is_flatpdl`).
+//! (`Record`/`Tuple`/`Table`) must be destructured, and a residual
+//! measure-layer type (`Measure`/`Kernel`/`Likelihood`) reaching here is an
+//! invariant violation — `emit` only ever runs on already-determinized FlatPDL
+//! (`flatppl_determinizer::is_flatpdl`). An aggregate ABI *input* is
+//! destructured into one argument per column by `crate::modes`, which calls
+//! [`mlir_type_of_ty`] per column, so it never reaches the aggregate refusal.
 
 use flatppl_core::{Dim, Module, NodeId, ScalarType, Type};
 
@@ -30,14 +32,21 @@ use crate::refuse::EmitError;
 /// returned [`ElemKind`] reflects the node's actual inferred scalar kind
 /// (spec §03 boolean/integer/real) via [`scalar_kind`]; a `Complex` scalar
 /// has no tensor form and is refused rather than mis-lowered.
-pub fn mlir_type_of(
-    m: &Module,
-    id: NodeId,
-    _dtype: Dtype,
-) -> Result<(MlirTy, ElemKind), EmitError> {
+pub fn mlir_type_of(m: &Module, id: NodeId, dtype: Dtype) -> Result<(MlirTy, ElemKind), EmitError> {
     let ty = m
         .type_of(id)
         .ok_or_else(|| EmitError::at(id, "node has no inferred type"))?;
+    mlir_type_of_ty(id, ty, dtype)
+}
+
+/// [`mlir_type_of`] for a `Type` that is not (or not yet) any node's own
+/// inferred type — the column type an aggregate ABI input destructures into
+/// (`crate::modes`). `id` is the node the refusal is localized to.
+pub fn mlir_type_of_ty(
+    id: NodeId,
+    ty: &Type,
+    _dtype: Dtype,
+) -> Result<(MlirTy, ElemKind), EmitError> {
     match ty {
         Type::Scalar(st) => Ok((MlirTy::Scalar, scalar_kind(id, *st)?)),
         Type::Array { shape, elem } => {

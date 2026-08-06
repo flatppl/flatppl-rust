@@ -54,6 +54,20 @@
 //!   input (`external`/`load_data`) — e.g. a literal or a derived/computed
 //!   binding — "`inputs` entry '...' is not an elementof parameter, external,
 //!   or load_data input — only these constructs can be ABI arguments"
+//! - an `inputs` entry that declares no shape — "`inputs` entry '...' declares
+//!   no shape (`anything`) and cannot be promoted to a function argument (spec
+//!   §13 signature); ..." (§13 `sec:determinization-signature`: `anything`
+//!   "declares none and cannot be promoted"). Fires for EVERY construct over
+//!   `anything`, not only `load_data`, so the message cites the signature rule
+//!   rather than §07's don't-read-the-source clause — `elementof(anything)`
+//!   has no source to read.
+//! - a destructured aggregate entry with a column that has no tensor form of
+//!   its own (a nested record/table column) — "`inputs` entry '...' column
+//!   '...' has no tensor form, so this emitter cannot destructure the entry
+//!   into arguments; ..." (names the column, unlike `types.rs`'s generic
+//!   aggregate refusal). Worded as an EMITTER limit, not a language rule: §03
+//!   Tables says "Each column is a vector or a table", so a nested table
+//!   column is legal FlatPPL that this backend declines to flatten.
 //! - (`emit_sample_abi`) `outputs` naming other than exactly one output —
 //!   "`outputs` for a sample query must name exactly one output (the sampled
 //!   value)" (`EmitError::whole`)
@@ -62,13 +76,40 @@
 //!   rnginit/external(rngstates) source to thread from"
 //!
 //! (`external`/`load_data` inputs LISTED in `inputs` are supported — they
-//! become function arguments, `load_data` shape-pinned from
-//! [`crate::EmitOptions::input_shapes`], values never baked. The CLI-level
-//! refusal for an unsupported `load_data` file format is a `Failure::Refuse`
-//! in `crates/cli`, not an `EmitError`, so it is not cataloged here.)
+//! become function arguments, `load_data` shaped from its declared `valueset`,
+//! values never baked. An aggregate valueset destructures into one argument per
+//! column, so the `types.rs` aggregate refusal below is reached only by an
+//! aggregate in tensor position, not by a table ABI input.)
 //!
 //! **`ops.rs`** (the deterministic builtin-head map):
 //! - `record(...)` reached in tensor position — "record has no tensor form"
+//! - a destructured `load_data` input used as one monolithic value — "a
+//!   load_data input whose valueset is a table or record has no single tensor
+//!   form; read it column-wise (`data.y`) — one argument per column"
+//! - an elementwise binary op whose operands do not broadcast (different rank,
+//!   or an axis pair neither equal nor size-1) — "elementwise operands do not
+//!   broadcast: ... — §04 broadcasting needs equal rank ... (a matrix product
+//!   is the non-elementwise `*`, not `.*`)". This is `ops::require_broadcastable`
+//!   turning what was an `Emitter::broadcast_pair` PANIC into a refusal; the
+//!   infallible `binary`/`compare`/`select` helpers still assert, but no
+//!   arity-2 elementwise head can now reach that assertion.
+//! - a matrix product (`*`, spec §07 "Linear algebra") whose inner dimensions
+//!   are both statically known and unequal — "matrix product inner dimensions
+//!   disagree: ...". A defensive second line: `infer`'s `mul_type` already
+//!   makes such a call `Type::Failed`, so the determiniser refuses it first.
+//! - a matrix product whose lowered operand RANKS disagree with the inferred
+//!   types the dispatch classified on — "matrix product operand ranks disagree
+//!   with their inferred types: ...". Unreachable unless the two layers drift;
+//!   it exists so `lower_matrix_product` cannot index past a short dim list.
+//! - a BARE `mul` (surface `*`) whose operands are both non-scalar but are not a
+//!   product §07 defines — two vectors, a rank-3 pair, a `TVector` product —
+//!   "`*` has no meaning for these operand shapes: ... Write `.*` for an
+//!   elementwise product, or `transpose(a) * b` for an inner product (which this
+//!   emitter does not yet lower)". §07 gives `*` on vectors a meaning only
+//!   through a transpose and none for rank 3, and `infer`'s `mul_type` returns
+//!   `Deferred` for both, so lowering them elementwise would silently answer a
+//!   different question. `ops::classify_bare_mul` decides; a scalar operand or an
+//!   absent type keeps the ordinary elementwise path.
 //! - an unknown builtin head — "unsupported builtin head '...'"
 //! - wrong arity for any arity-checked head (`args_exact`, shared by
 //!   `unary`/`binary`/`ifelse`/`get`/`get0`/`in`/`inf`) — "expected N

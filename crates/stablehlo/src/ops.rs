@@ -16,6 +16,15 @@
 //! the wrapper and re-enters here with `f`'s own head — every op below that is
 //! elementwise therefore batches for free.
 //!
+//! **`*` is not `.*`.** Spec §07 "Linear algebra": "Matrix multiplication and
+//! addition use the standard `*` and `+` operators." The two spellings are
+//! already distinct in FlatPDL — `.*` is `broadcast(mul, …)`, plain `*` a bare
+//! `mul` — so [`classify_bare_mul`]/[`lower_bare_mul`] handle a bare `mul`
+//! over a rank-2 left operand as one `stablehlo.dot_general`, and the `"mul"`
+//! entry in the map below stays purely elementwise. That dispatch lives in
+//! `Emitter::lower_node`, which [`Emitter::lower_broadcast`] bypasses, so a
+//! `.*`-derived `mul` can never reach it.
+//!
 //! A `builtin_*` primitive (`builtin_logdensityof`, `builtin_sample`,
 //! `builtin_touniform`, `builtin_fromuniform`, `builtin_tonormal`,
 //! `builtin_fromnormal`) or a bare distribution constructor name (`Normal`,
@@ -27,7 +36,7 @@
 //! primitives, still unimplemented until a later task adds a matching
 //! registry gate for it).
 
-use flatppl_core::{CallHead, Node, NodeId, Scalar};
+use flatppl_core::{CallHead, Node, NodeId, Scalar, Type};
 
 use crate::emitter::{Emitter, elem_rank};
 use crate::mlir::{ElemKind, MlirTy, Value};
@@ -129,6 +138,15 @@ pub(crate) fn lower_builtin(
         // builder (a record-typed model input's fields become separate
         // tensor args), never reached here in a well-formed lowering.
         "record" => Err(EmitError::at(id, "record has no tensor form")),
+        // A `load_data` listed in `inputs` is pre-bound to its argument by the
+        // mode builder and never lowered. Reaching here means it is used as one
+        // monolithic value while its valueset is an aggregate, which the
+        // per-column destructuring cannot supply.
+        "load_data" => Err(EmitError::at(
+            id,
+            "a load_data input whose valueset is a table or record has no single \
+             tensor form; read it column-wise (`data.y`) — one argument per column",
+        )),
         other => Err(EmitError::at(
             id,
             format!("unsupported builtin head '{other}'"),
@@ -164,7 +182,220 @@ fn binary<'m>(
     let [a, b] = args_exact(id, args)?;
     let a = e.lower_node(a)?;
     let b = e.lower_node(b)?;
+    require_broadcastable(id, &a, &b)?;
     Ok(op(e, &a, &b))
+}
+
+/// Refuse an operand pair `Emitter::broadcast_pair` would panic on. The
+/// `Emitter::binary`/`compare`/`select` helpers are infallible and have no
+/// `Result` to carry an [`EmitError`], so the check belongs in their callers here
+/// — and there are THREE, every one of which must call it or a pair with no
+/// broadcast form aborts the process instead of refusing:
+///
+/// - [`binary`] (every arity-2 arithmetic head),
+/// - [`lower_compare`] (`Emitter::compare` reconciles its operands the same way),
+/// - [`lower_ifelse`] (`Emitter::select` broadcasts the branch pair, AND both
+///   branches against the predicate's shape — so it checks two pairings).
+///
+/// An earlier round guarded only [`binary`] while claiming the panic was closed;
+/// `compare` and `select` kept aborting on ordinary surface FlatPPL
+/// (`ifelse(p < q, m, v)` with a matrix and a vector branch).
+///
+/// Enumerates the pairs `broadcast_pair` HANDLES and refuses everything else,
+/// rather than listing the pairs it panics on: `MlirTy` has four variants, so a
+/// `Key` or `Tuple` operand reaches its `(ta, tb) => panic!` arm exactly as a
+/// rank mismatch does. Matching positively also means a variant added later
+/// refuses by default instead of silently acquiring a panic path.
+fn require_broadcastable(id: NodeId, a: &Value, b: &Value) -> Result<(), EmitError> {
+    let refuse = |why: &str| {
+        Err(EmitError::at(
+            id,
+            format!(
+                "elementwise operands do not broadcast: {:?} against {:?} — {why}",
+                a.ty, b.ty
+            ),
+        ))
+    };
+    // An rng-state key and a tuple have no arithmetic form at all, equal types or
+    // not: `broadcast_pair`'s equal-type fast path would hand such a pair straight
+    // through to an arithmetic op that cannot mean anything on it.
+    let unarithmetic = |t: &MlirTy| matches!(t, MlirTy::Key | MlirTy::Tuple(_));
+    if unarithmetic(&a.ty) || unarithmetic(&b.ty) {
+        return refuse(
+            "an rng-state key and a tuple have no elementwise arithmetic form (spec §07's \
+             rng state is threaded, never computed on)",
+        );
+    }
+    match (&a.ty, &b.ty) {
+        // A scalar operand broadcasts against any rank.
+        (MlirTy::Scalar, _) | (_, MlirTy::Scalar) => Ok(()),
+        (MlirTy::Ranked(da), MlirTy::Ranked(db)) => {
+            let compatible = da.len() == db.len()
+                && da.iter().zip(db.iter()).all(|(&x, &y)| {
+                    matches!(
+                        (x, y),
+                        (Some(m), Some(n)) if m == n)
+                        || matches!(
+                            (x, y),
+                            (Some(1), Some(_)) | (Some(_), Some(1)) | (None, None)
+                        )
+                });
+            if compatible {
+                Ok(())
+            } else {
+                refuse(
+                    "§04 broadcasting needs equal rank with each axis pair equal or size 1 \
+                     (a matrix product is the non-elementwise `*`, not `.*`)",
+                )
+            }
+        }
+        _ => refuse("no broadcast form for this shape pair"),
+    }
+}
+
+/// What a BARE `mul` (surface `*`, spec §07 "Linear algebra") means for the
+/// shapes of its operands.
+enum BareMul {
+    /// A rank-2 lhs against a rank-2 or rank-1 rhs: one `stablehlo.dot_general`.
+    MatrixProduct,
+    /// At least one operand is a scalar (or has no inferred type): the ordinary
+    /// elementwise multiply, which broadcasts the scalar side.
+    Elementwise,
+    /// Both operands are non-scalar but the pair is not a product this emitter
+    /// implements — and §07 gives `*` NO elementwise meaning, so lowering it
+    /// elementwise would answer a different question than the model asked.
+    Undefined,
+}
+
+/// Classify a bare `mul`'s operands by their inferred FlatPDL types — the same
+/// information `infer`'s `mul_type` reads — so no operand is lowered to decide.
+///
+/// Only `Some(2)` on the LEFT makes a product, matching `mul_type`'s own
+/// matrix·matrix / matrix·vector arms. Every other non-scalar pair is
+/// [`BareMul::Undefined`]: §07 gives `*` on two vectors a meaning only WITH a
+/// transpose ("the product of a transposed vector and a non-transposed vector is
+/// a scalar") and none at all for rank-3 operands, and `mul_type` agrees by
+/// returning `Type::Deferred` for both. An operand whose type is absent
+/// (a freshly synthesized determiniser node before re-inference) or scalar
+/// classifies as [`BareMul::Elementwise`], which is what keeps the determiniser's
+/// own `mul(literal, vector)` idiom lowering.
+fn classify_bare_mul(e: &Emitter, args: &[NodeId]) -> BareMul {
+    let [a, b] = match <[NodeId; 2]>::try_from(args) {
+        Ok(pair) => pair,
+        // Wrong arity: let `binary`'s `args_exact` produce the arity message.
+        Err(_) => return BareMul::Elementwise,
+    };
+    match (array_rank(e, a), array_rank(e, b)) {
+        (Some(2), Some(2)) | (Some(2), Some(1)) => BareMul::MatrixProduct,
+        (Some(_), Some(_)) => BareMul::Undefined,
+        _ => BareMul::Elementwise,
+    }
+}
+
+/// Lower a bare `mul` — the surface `*`. Routes by [`classify_bare_mul`]:
+/// a matrix product to [`lower_matrix_product`], an undefined non-scalar pair to
+/// a refusal, and everything else to the elementwise `mul` in [`lower_builtin`].
+///
+/// Reached ONLY from `Emitter::lower_node`'s dispatch, never from
+/// `Emitter::lower_broadcast` — so the elementwise `.*` spelling
+/// (`broadcast(mul, …)`) is not classified here and keeps its own meaning.
+///
+/// The `Undefined` refusal also covers the `TVector` products §07 defines
+/// (`transpose(v) * w`): this emitter has no inner-product lowering, and
+/// refusing is right where silently emitting an elementwise multiply would be a
+/// wrong number. Whoever adds a `transpose` lowering must add the `TVector` arms
+/// to [`classify_bare_mul`] and a `[n]x[n] -> scalar` contraction with it; until
+/// then the shape refuses here rather than at `transpose`.
+pub(crate) fn lower_bare_mul(
+    e: &mut Emitter,
+    id: NodeId,
+    args: &[NodeId],
+) -> Result<Value, EmitError> {
+    match classify_bare_mul(e, args) {
+        BareMul::MatrixProduct => lower_matrix_product(e, id, args),
+        BareMul::Elementwise => binary(e, id, args, Emitter::mul),
+        BareMul::Undefined => {
+            let shape = |n: NodeId| match e.type_of(n) {
+                Some(t) => format!("{t:?}"),
+                None => "unknown".to_string(),
+            };
+            Err(EmitError::at(
+                id,
+                format!(
+                    "`*` has no meaning for these operand shapes: {} against {} — §07 \
+                     \"Linear algebra\" defines `*` as the matrix product (a matrix against a \
+                     matrix or a vector), and for vectors only through a transpose. Write `.*` \
+                     for an elementwise product, or `transpose(a) * b` for an inner product \
+                     (which this emitter does not yet lower)",
+                    shape(args[0]),
+                    shape(args[1])
+                ),
+            ))
+        }
+    }
+}
+
+/// The rank of `id`'s inferred `Array`/`TVector` type, flattening a nested
+/// element chain the way `crate::types::mlir_type_of` does — `None` for a scalar,
+/// an untyped node, or any other type.
+fn array_rank(e: &Emitter, id: NodeId) -> Option<usize> {
+    fn rank(ty: &Type) -> Option<usize> {
+        match ty {
+            Type::Array { shape, elem } => Some(shape.len() + rank(elem).unwrap_or(0)),
+            Type::TVector { elem, .. } => Some(1 + rank(elem).unwrap_or(0)),
+            _ => None,
+        }
+    }
+    rank(e.type_of(id)?)
+}
+
+/// Lower a bare `mul` [`classify_bare_mul`] called a matrix product: matrix·
+/// vector via [`Emitter::matvec`], matrix·matrix via [`Emitter::matmat`], both
+/// one `stablehlo.dot_general`. The operand RANKS and the inner dimensions are
+/// re-checked HERE so a disagreement refuses; the emitter helpers panic on one,
+/// and this is the only caller that reaches them from surface `*`.
+fn lower_matrix_product(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
+    let [a, b] = args_exact(id, args)?;
+    let a = e.lower_node(a)?;
+    let b = e.lower_node(b)?;
+    let (MlirTy::Ranked(da), MlirTy::Ranked(db)) = (&a.ty, &b.ty) else {
+        return Err(EmitError::at(
+            id,
+            "matrix product needs ranked tensor operands",
+        ));
+    };
+    // The ranks come from the INFERRED types (`classify_bare_mul`) while the dims
+    // below come from the LOWERED values; if those two ever disagree, indexing
+    // `da[1]`/`db[0]` would panic in the one function whose job is to refuse
+    // before the emitter's own assertions are reached. Check rather than index
+    // blindly.
+    if da.len() != 2 || db.is_empty() || db.len() > 2 {
+        return Err(EmitError::at(
+            id,
+            format!(
+                "matrix product operand ranks disagree with their inferred types: \
+                 {:?} against {:?} — expected a rank-2 lhs and a rank-1 or rank-2 rhs",
+                a.ty, b.ty
+            ),
+        ));
+    }
+    // A dynamic inner dim on either side is not a KNOWN disagreement, so it
+    // passes: `dot_general` contracts it at run time.
+    if matches!((da[1], db[0]), (Some(m), Some(n)) if m != n) {
+        return Err(EmitError::at(
+            id,
+            format!(
+                "matrix product inner dimensions disagree: {:?} against {:?} — the lhs's \
+                 trailing axis must match the rhs's leading axis",
+                a.ty, b.ty
+            ),
+        ));
+    }
+    if db.len() == 1 {
+        Ok(e.matvec(&a, &b))
+    } else {
+        Ok(e.matmat(&a, &b))
+    }
 }
 
 // ---- ifelse / inf -----------------------------------------------------------
@@ -175,7 +406,88 @@ fn lower_ifelse(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, E
     let c = e.lower_node(c)?;
     let a = e.lower_node(a)?;
     let b = e.lower_node(b)?;
+    // `Emitter::select` broadcasts the two BRANCHES against each other through
+    // `broadcast_pair` (which panics on a pair with no broadcast form), and then
+    // broadcasts both against the first ranked shape among {pred, a, b}. So two
+    // pairings have to hold, and neither is checked by the infallible helper:
+    require_broadcastable(id, &a, &b)?;
+    require_select_predicate(id, &c, &a, &b)?;
     Ok(e.select(&c, &a, &b))
+}
+
+/// Refuse a `select` predicate whose shape `Emitter::select`'s second pass cannot
+/// legally broadcast the branches to.
+///
+/// That pass is NOT `broadcast_pair` — it is `Emitter::broadcast_scalar`, which
+/// emits `broadcast_in_dim(s, &[], out_ty)` whenever `s.ty != out_ty`, and an
+/// EMPTY `dims` list is valid only for a rank-0 operand. So the size-1 expansion
+/// [`require_broadcastable`] permits is wrong here: it is sound for elementwise
+/// arithmetic, where `broadcast_pair` supplies proper identity dims, but a size-1
+/// predicate against `[3]` branches (or the mirror) silently emitted
+/// `broadcast_in_dim … dims = [] : (tensor<3xf32>) -> tensor<1xf32>` — invalid
+/// StableHLO, exit 0.
+///
+/// The admissible cases, and nothing else:
+/// - a SCALAR predicate — StableHLO's `select` takes one against ranked operands,
+///   and the branches keep their own shape;
+/// - a ranked predicate with SCALAR branches — they broadcast up from rank 0, so
+///   the empty `dims` list is correct;
+/// - a ranked predicate whose shape EQUALS the shape the branches reconcile to,
+///   making the second pass a no-op.
+///
+/// The last case compares against the RECONCILED branch shape, not against `a`
+/// alone: `broadcast_pair` has already expanded a size-1 branch axis with proper
+/// dims by the time the predicate pass runs, so `(pred [3], a [1], b [3])` is
+/// legal and emits a valid `select` — checking `c == a` would refuse it.
+fn require_select_predicate(id: NodeId, c: &Value, a: &Value, b: &Value) -> Result<(), EmitError> {
+    if matches!(c.ty, MlirTy::Scalar) {
+        return Ok(());
+    }
+    let MlirTy::Ranked(dc) = &c.ty else {
+        return Err(EmitError::at(
+            id,
+            format!("ifelse predicate has no tensor form: {:?}", c.ty),
+        ));
+    };
+    // The shape the branches carry into the predicate pass. `require_broadcastable`
+    // has already run on the pair, so a mixed Ranked pair here is compatible.
+    let branch_shape = match (&a.ty, &b.ty) {
+        (MlirTy::Ranked(da), MlirTy::Ranked(db)) => Some(common_shape(da, db)),
+        (MlirTy::Ranked(d), _) | (_, MlirTy::Ranked(d)) => Some(d.clone()),
+        // Both scalar: they broadcast up from rank 0, which `dims = []` expresses
+        // correctly whatever the predicate's shape.
+        _ => None,
+    };
+    match branch_shape {
+        None => Ok(()),
+        Some(target) if *dc == target => Ok(()),
+        Some(target) => Err(EmitError::at(
+            id,
+            format!(
+                "ifelse predicate shape {:?} does not match its branches' shape {:?} — a \
+                 select predicate must be a scalar or exactly the branch shape (the branch \
+                 broadcast cannot expand a non-scalar predicate)",
+                MlirTy::Ranked(dc.clone()),
+                MlirTy::Ranked(target)
+            ),
+        )),
+    }
+}
+
+/// The per-axis shape `Emitter::broadcast_pair` reconciles a COMPATIBLE ranked
+/// pair to: an axis pair that is equal keeps its size, a size-1 axis takes the
+/// other side's, and a doubly dynamic axis stays dynamic. Only meaningful after
+/// [`require_broadcastable`] has accepted the pair.
+fn common_shape(da: &[Option<u64>], db: &[Option<u64>]) -> Vec<Option<u64>> {
+    da.iter()
+        .zip(db.iter())
+        .map(|(&x, &y)| match (x, y) {
+            (Some(1), other) => other,
+            (other, Some(1)) => other,
+            (Some(m), _) => Some(m),
+            (None, other) => other,
+        })
+        .collect()
 }
 
 /// The predicate-producing builtin heads this map lowers to an `i1` value.
@@ -224,6 +536,9 @@ fn lower_compare(
     let [a, b] = args_exact(id, args)?;
     let a = e.lower_node(a)?;
     let b = e.lower_node(b)?;
+    // `Emitter::compare` reconciles its operands through `broadcast_pair` exactly
+    // as `Emitter::binary` does, and is equally infallible.
+    require_broadcastable(id, &a, &b)?;
     Ok(e.compare(dir, &a, &b))
 }
 

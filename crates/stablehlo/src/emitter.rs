@@ -27,7 +27,7 @@
 use std::collections::{HashMap, HashSet};
 
 use flatppl_core::{
-    CallHead, Inputs, Module, NamedKind, Node, NodeId, Ref, RefNs, Scalar, Symbol, ValueSet,
+    CallHead, Inputs, Module, NamedKind, Node, NodeId, Ref, RefNs, Scalar, Symbol, Type, ValueSet,
 };
 
 use crate::Dtype;
@@ -110,6 +110,13 @@ pub struct Emitter<'m> {
     /// then broadcast over that batch via [`Emitter::binary`]'s auto-broadcast.
     /// `None` (the scalar case) leaves every draw sized exactly as before.
     batch_shape: Option<Vec<u64>>,
+    /// The per-column `func.func` arguments an aggregate ABI input was
+    /// destructured into, keyed by the aggregate's own [`NodeId`] and the
+    /// column/field name (see `crate::modes`'s destructuring and the crate doc).
+    /// A table/record has no monolithic tensor form, so the aggregate node is
+    /// never bound in `memo`; a column access reaching it resolves here instead
+    /// ([`Emitter::column_arg`]).
+    columns: HashMap<(NodeId, String), Value>,
 }
 
 impl<'m> Emitter<'m> {
@@ -123,6 +130,7 @@ impl<'m> Emitter<'m> {
             cur_key: None,
             sample_keys: HashMap::new(),
             batch_shape: None,
+            columns: HashMap::new(),
         }
     }
 
@@ -1308,13 +1316,53 @@ impl<'m> Emitter<'m> {
             );
         }
 
+        self.dot_contract(a, b, 1, 0, vec![a_dims[0]])
+    }
+
+    /// Matrix-matrix product `a @ b` (spec §07 "Linear algebra": "Matrix
+    /// multiplication and addition use the standard `*` and `+` operators"),
+    /// contracting `a`'s (`[m, k]`) trailing dimension against `b`'s (`[k, n]`)
+    /// leading one — the same `contracting_dims = [1] x [0]` as
+    /// [`Emitter::matvec`], with `b` one rank higher, so the result is
+    /// `[m, n]`. Panics on a non-rank-2 operand or a disagreeing inner
+    /// dimension, like [`Emitter::matvec`]: `crate::ops`'s `mul` dispatch
+    /// checks both before calling, so a caller-facing shape error refuses
+    /// there rather than reaching here.
+    pub fn matmat(&mut self, a: &Value, b: &Value) -> Value {
+        let dims = |v: &Value, side: &str| match &v.ty {
+            MlirTy::Ranked(d) if d.len() == 2 => d.clone(),
+            other => panic!("matmat expects a rank-2 (matrix) {side} operand, got {other:?}"),
+        };
+        let a_dims = dims(a, "lhs");
+        let b_dims = dims(b, "rhs");
+        if a_dims[1] != b_dims[0] {
+            panic!(
+                "matmat: lhs trailing dim {:?} does not match rhs leading dim {:?}",
+                a_dims[1], b_dims[0]
+            );
+        }
+        self.dot_contract(a, b, 1, 0, vec![a_dims[0], b_dims[1]])
+    }
+
+    /// Emit one `stablehlo.dot_general` in the pretty form, contracting `a`'s
+    /// dimension `la` against `b`'s `lb` and producing `result_dims`. Shared by
+    /// [`Emitter::matvec`] and [`Emitter::matmat`], which differ only in the
+    /// result shape; each validates its own operand ranks first.
+    fn dot_contract(
+        &mut self,
+        a: &Value,
+        b: &Value,
+        la: usize,
+        lb: usize,
+        result_dims: Vec<Option<u64>>,
+    ) -> Value {
         let ssa = self.fresh();
         let a_ty = a.ty.render(self.dtype, a.elem);
         let b_ty = b.ty.render(self.dtype, b.elem);
-        let result_ty = MlirTy::Ranked(vec![a_dims[0]]);
+        let result_ty = MlirTy::Ranked(result_dims);
         let result_ty_text = result_ty.render(self.dtype, ElemKind::Real);
         self.push(&format!(
-            "{ssa} = stablehlo.dot_general {}, {}, contracting_dims = [1] x [0], precision = [DEFAULT, DEFAULT] : ({a_ty}, {b_ty}) -> {result_ty_text}",
+            "{ssa} = stablehlo.dot_general {}, {}, contracting_dims = [{la}] x [{lb}], precision = [DEFAULT, DEFAULT] : ({a_ty}, {b_ty}) -> {result_ty_text}",
             a.ssa, b.ssa
         ));
         Value {
@@ -2168,6 +2216,42 @@ impl<'m> Emitter<'m> {
         Some(elems[idx as usize])
     }
 
+    /// Record `value` as the `func.func` argument holding column/field `name` of
+    /// the aggregate ABI input `container` — the per-column destructuring
+    /// `crate::modes::bind_input` performs for a table/record `load_data` input.
+    /// The aggregate node itself is never bound in the memo (it has no monolithic
+    /// tensor form), so this side table is the ONLY way a column access can reach
+    /// its argument; [`Emitter::column_arg`] is the read side.
+    pub(crate) fn bind_column(&mut self, container: NodeId, name: String, value: Value) {
+        self.columns.insert((container, name), value);
+    }
+
+    /// If `args` is `get`/`get0`'s `[container, selector]` pair and `container`
+    /// resolves (one `(%ref self x)` hop) to an aggregate ABI input that
+    /// [`Emitter::bind_column`] destructured, return the [`Value`] of the column
+    /// the `selector` names — so `data.y` reads its own `%argN` rather than
+    /// trying to index a table that has no tensor form. `None` for every other
+    /// container/selector, including a column name the destructuring did not
+    /// produce (the caller then falls through to the ordinary `get` path, which
+    /// refuses).
+    ///
+    /// Disjoint from [`Emitter::named_field_projection`], which matches a
+    /// `table(...)`/`record(...)` LITERAL: a `load_data` container is neither, so
+    /// only one of the two can ever fire for a given node.
+    fn column_arg(&self, args: &[NodeId]) -> Option<Value> {
+        if self.columns.is_empty() {
+            return None;
+        }
+        let [container, selector] = <[NodeId; 2]>::try_from(args).ok()?;
+        let resolved = self.resolve_ref_one(container);
+        let field = match self.m.node(selector) {
+            Node::Lit(Scalar::Str(s)) => s.as_ref(),
+            Node::Const(sym) => self.m.resolve(*sym),
+            _ => return None,
+        };
+        self.columns.get(&(resolved, field.to_string())).cloned()
+    }
+
     /// If `args` is `get`/`get0`'s `[container, selector]` pair and
     /// `container` resolves (one `(%ref self x)` hop,
     /// [`Emitter::resolve_ref_one`]) to a `table(...)` or `record(...)`
@@ -2272,6 +2356,14 @@ impl<'m> Emitter<'m> {
     /// Resolve an interned name. A narrow accessor mirroring [`Emitter::node`].
     pub(crate) fn resolve(&self, sym: Symbol) -> &str {
         self.m.resolve(sym)
+    }
+
+    /// A node's inferred FlatPDL `Type`. A narrow accessor mirroring
+    /// [`Emitter::node`], for `crate::ops`'s `mul` dispatch, which reads the
+    /// operands' ranks to tell a matrix product from an elementwise one WITHOUT
+    /// lowering either operand first.
+    pub(crate) fn type_of(&self, id: NodeId) -> Option<&Type> {
+        self.m.type_of(id)
     }
 
     /// Resolve a node's statically-known [`ValueSet`] (spec §03), read
@@ -2632,6 +2724,20 @@ impl<'m> Emitter<'m> {
                         crate::registry::lower_touniform(self, id, &call.args)
                     } else if name == "broadcast" {
                         self.lower_broadcast(id, &call.args)
+                    } else if name == "mul" {
+                        // A BARE `mul` is the surface `*`, which spec §07 "Linear
+                        // algebra" defines as the MATRIX product ("Matrix
+                        // multiplication and addition use the standard `*` and
+                        // `+` operators") — not as an elementwise op.
+                        // `ops::lower_bare_mul` routes by operand shape and
+                        // refuses a non-scalar pair §07 gives no meaning. The
+                        // elementwise `.*` spelling arrives as `broadcast(mul, …)`
+                        // and reaches `ops::lower_builtin` through
+                        // `lower_broadcast` instead, which never passes through
+                        // this dispatch — so the two spellings cannot be
+                        // confused, and no state flag is needed to tell them
+                        // apart.
+                        crate::ops::lower_bare_mul(self, id, &call.args)
                     } else if matches!(name.as_str(), "get0" | "get") {
                         // `get0(builtin_sample(...), k)` / `get((%ref self
                         // <shared-latent>), k)`: a projection of a sampled
@@ -2644,6 +2750,11 @@ impl<'m> Emitter<'m> {
                         // ordinary case) falls through to `ops::lower_builtin`'s
                         // generic rank-1-tensor `get`/`get0`.
                         let base = if name == "get0" { 0 } else { 1 };
+                        // A column of a destructured aggregate ABI input reads
+                        // that column's own argument (`Emitter::column_arg`).
+                        if let Some(column) = self.column_arg(&call.args) {
+                            return Ok(column);
+                        }
                         if let Some(field) = self.named_field_projection(&call.args) {
                             return self.lower_node(field);
                         }
