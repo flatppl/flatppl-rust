@@ -22,6 +22,14 @@ fn errors(src: &str) -> Vec<String> {
         .collect()
 }
 
+/// The tail `arg_name_check` appends when the unbindable names came from a
+/// SPLATTED record or table, pointing at the keyword spelling §04 names. Spelled
+/// once here so the assertions below stay readable and still match exactly.
+const SPLAT_HINT: &str = " — a sole positional record or table always splats \
+                           (spec §04), so its field names bind as arguments; to \
+                           pass it as one ordinary argument use the keyword \
+                           spelling, as in `f(pars = record(...))`";
+
 /// The six leaks that motivated the rule. Each typed a concrete scalar (or
 /// `%deferred`) before; each is `%failed` now, with the callee and its declared
 /// count named.
@@ -149,9 +157,9 @@ fn named_arguments_count_toward_arity() {
 /// .flatppl`'s `forward_kernel(rand_pars)` — and both were falsely rejected while
 /// the user-call path counted a sole record as one argument.
 ///
-/// That the splat reading must be AVAILABLE is settled; whether it is the only
-/// available one is the open §04 question pinned by
-/// `a_sole_record_is_accepted_as_one_argument_pending_the_open_sec04_question`.
+/// design#74 settled that the splat reading is not merely available but the ONLY
+/// one for a sole positional record — see
+/// `a_sole_positional_record_always_splats_and_is_not_one_argument`.
 #[test]
 fn a_user_call_can_splat_a_sole_record_argument() {
     let f = "lin(a, b, mu) = add(a, add(b, mu))\n\
@@ -174,27 +182,31 @@ fn a_user_call_can_splat_a_sole_record_argument() {
     );
 }
 
-/// INTERIM, pending an open §04 question — this pins today's permissive choice,
-/// not a settled rule. §04 enumerates exactly two non-splat cases ("a record given
-/// alongside other arguments, or bound to a parameter by keyword"), and a
-/// positional sole record is neither, so the most direct reading is that it ALWAYS
-/// splats — under which this very model is invalid. Two anchors lean toward a
-/// splat conditioned on the names corresponding: §04's `fchain` paragraph, and
-/// `determinizer::sample::record_splat_mismatch`. Until the question is settled,
-/// inference accepts a call that either reading satisfies, so it rejects no model
-/// under either resolution — and this shape, which the corpus uses
-/// (`simple-transport1.flatppl:20`'s `generator(pars)` against
-/// `generator = kernelof(x, pars = pars)`), keeps typing.
+/// The INVERSE of what this test asserted while §04 was ambiguous. design#74
+/// settled the question in favour of always-splat: "A sole positional record or
+/// table therefore always splats: whether its field or column names match the
+/// callable's argument names decides only whether the call is valid, never whether
+/// the splat occurs." So a 3-field record handed positionally to a 1-parameter
+/// callable is NOT one argument — it splats to three, and the arity check rejects
+/// it. Passing it as one value takes the keyword spelling (§04: "requires the
+/// keyword spelling, as in `f(pars = record(...))`"), asserted below.
 ///
-/// If §04 resolves to always-splat, this test should invert rather than be deleted.
+/// Kept rather than deleted, per the review that placed the interim version: the
+/// shape is exactly the one the permissive rule existed to admit, so it is the
+/// case a regression would resurrect.
 #[test]
-fn a_sole_record_is_accepted_as_one_argument_pending_the_open_sec04_question() {
-    let src = "pars = record(a = 1.0, b = 2.0, mu = 3.0)\n\
-               takes_a_record(p) = get(p, [\"a\"])\n\
-               y = takes_a_record(pars)";
+fn a_sole_positional_record_always_splats_and_is_not_one_argument() {
+    let f = "pars = record(a = 1.0, b = 2.0, mu = 3.0)\n\
+             takes_a_record(p) = get(p, [\"a\"])\n";
+    assert_eq!(
+        errors(&format!("{f}y = takes_a_record(pars)")),
+        vec!["`takes_a_record` declares 1 parameter, got 3 arguments".to_string()],
+        "the 3-field record splats to three arguments, so the 1-parameter callable is over-supplied"
+    );
+    // The keyword spelling §04 names is how the record passes as ONE value.
     assert!(
-        errors(src).is_empty(),
-        "a 3-field record is accepted as a single argument to a 1-parameter callable"
+        errors(&format!("{f}y = takes_a_record(p = pars)")).is_empty(),
+        "bound to a parameter by keyword, the record is an ordinary value and does not splat"
     );
 }
 
@@ -347,12 +359,18 @@ fn a_named_argument_must_be_a_declared_parameter() {
         errors("m = Normal(mu = 0.0, tau = 1.0)"),
         vec!["`Normal` has no parameter `tau` (spec §08 parameters: `mu`, `sigma`)".to_string()]
     );
-    // Every unbindable name is reported, not just the first.
+    // Every unbindable name is reported, not just the first. A SPLATTING call also
+    // names the keyword spelling, since the splat is what made these field names
+    // bind and the author may have meant to pass the record as one value.
     assert_eq!(
         errors("m = Normal(record(aaa = 0.0, bbb = 1.0))"),
         vec![
-            "`Normal` has no parameter `aaa` (spec §08 parameters: `mu`, `sigma`)".to_string(),
-            "`Normal` has no parameter `bbb` (spec §08 parameters: `mu`, `sigma`)".to_string(),
+            format!(
+                "`Normal` has no parameter `aaa` (spec §08 parameters: `mu`, `sigma`){SPLAT_HINT}"
+            ),
+            format!(
+                "`Normal` has no parameter `bbb` (spec §08 parameters: `mu`, `sigma`){SPLAT_HINT}"
+            ),
         ],
         "a splatted record's field names are the names that bind"
     );
@@ -369,16 +387,73 @@ fn a_named_argument_must_be_a_declared_parameter() {
     assert!(errors("f(x) = mul(x, 2.0)\ny = f(x = 1.5)").is_empty());
 }
 
-/// The name check must not fire on a call whose count is admissible under the
-/// ORDINARY reading of a sole record — there the record is one value and its
-/// fields are not binding names, so checking them would reject a legal call.
+/// The name check must not reach the fields of a record that is NOT splatted.
+/// design#74 removed the case this test was originally written around — a sole
+/// positional record read as one ordinary value — so it now pins the two
+/// non-splatting cases §04 still names: "a record given alongside other arguments,
+/// or bound to a parameter by keyword, is an ordinary value and is not splatted."
+/// In both, the record binds as a value and its field names are not argument names.
 #[test]
-fn an_ordinary_record_argument_is_not_name_checked() {
-    let src = "pars = record(zzz = 1.0, qqq = 2.0)\n\
-               takes_a_record(p) = get(p, [\"zzz\"])\n\
-               y = takes_a_record(pars)";
+fn a_record_that_does_not_splat_is_not_name_checked() {
+    let f = "pars = record(zzz = 1.0, qqq = 2.0)\n\
+             takes_a_record(p) = get(p, [\"zzz\"])\n";
+    // Bound to a parameter by keyword.
     assert!(
-        errors(src).is_empty(),
+        errors(&format!("{f}y = takes_a_record(p = pars)")).is_empty(),
         "the record binds to `p`; `zzz`/`qqq` are its fields, not argument names"
     );
+    // Alongside another argument.
+    let g = "pars = record(zzz = 1.0, qqq = 2.0)\n\
+             pick(p, k) = get(p, [k])\n";
+    assert!(
+        errors(&format!("{g}y = pick(pars, \"zzz\")")).is_empty(),
+        "a record given alongside another argument is an ordinary value"
+    );
+}
+
+/// The always-splat rule switches the §04 name check ON for SINGLE-parameter
+/// constructors, which the earlier either-reading rule left unchecked: a 1-field
+/// record satisfied the plain reading on count, so its field name never bound and
+/// never got compared. `Poisson(record(zzz = 0.5))` was silently accepted and
+/// determinized to a `Poisson` with no `rate`.
+///
+/// The flatppl-js twin of this case landed alongside (js#136), where the same
+/// spelling produced a silent NaN rather than a silent accept.
+#[test]
+fn a_single_parameter_constructor_name_checks_a_splatted_record() {
+    assert_eq!(
+        errors("m = Poisson(record(zzz = 0.5))"),
+        vec![format!(
+            "`Poisson` has no parameter `zzz` (spec §08 parameters: `rate`){SPLAT_HINT}"
+        )],
+        "the sole record splats, so `zzz` binds as an argument name and fails"
+    );
+    // The right field name splats cleanly, and the positional form is unaffected.
+    assert!(errors("m = Poisson(record(rate = 0.5))").is_empty());
+    assert!(errors("m = Poisson(0.5)").is_empty());
+    assert!(errors("m = Poisson(rate = 0.5)").is_empty());
+    // Not specific to `Poisson` — every single-parameter row is now covered.
+    assert_eq!(
+        errors("m = Geometric(record(zzz = 0.5))"),
+        vec![format!(
+            "`Geometric` has no parameter `zzz` (spec §08 parameters: `p`){SPLAT_HINT}"
+        )]
+    );
+}
+
+/// §04 names records AND tables in the same breath ("`f(record(a = x, ...))` and
+/// `f(table(a = x, ...))` are equivalent to `f(a = x, ...)`"), and the amendment
+/// says "a sole positional record or table". A table splats by COLUMN name, on the
+/// same unconditional terms.
+#[test]
+fn a_sole_positional_table_splats_by_column_name() {
+    assert_eq!(
+        errors("d = table(zzz = [1.0, 2.0])\nm = Poisson(d)"),
+        vec![format!(
+            "`Poisson` has no parameter `zzz` (spec §08 parameters: `rate`){SPLAT_HINT}"
+        )],
+        "the sole table splats, so its column name binds as an argument name"
+    );
+    // A column named for the parameter splats cleanly.
+    assert!(errors("d = table(rate = [1.0, 2.0])\nm = Poisson(d)").is_empty());
 }

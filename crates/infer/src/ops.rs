@@ -2104,7 +2104,7 @@ fn user_arity_check(
     // §04 scopes auto-splatting to "built-in or user defined value functions,
     // constructors or transition kernels", so a user call reads a sole record
     // argument exactly as a builtin call does.
-    let reading = arg_reading(args, named, &|n| n == want)?;
+    let reading = arg_reading(args, named)?;
     let got = reading.count;
     let who = match inf.module.node(callee) {
         Node::Ref(r) if r.ns == RefNs::SelfMod => {
@@ -2734,7 +2734,7 @@ fn arity_check(
 ) -> Option<Type> {
     let cat = crate::catalogue::builtin();
     let arity = cat.base_arity(name)?;
-    let reading = arg_reading(args, named, &|n| arity.admits(n))?;
+    let reading = arg_reading(args, named)?;
     let got = reading.count;
     if arity.admits(got) {
         // The count is right; the names still have to be the declared ones.
@@ -2768,10 +2768,10 @@ fn arity_check(
 
 /// How a call's arguments read against a declared parameter count.
 struct ArgReading {
-    /// The argument count the admitting reading supplies.
+    /// The argument count the reading supplies.
     count: usize,
-    /// True when §04 auto-splatting is the only reading that fits, so the sole
-    /// record's field names — not the keyword names — are what bind.
+    /// True when the call auto-splats a sole positional record or table, so that
+    /// argument's FIELD names — not the keyword names — are what bind.
     splatting: bool,
 }
 
@@ -2783,35 +2783,36 @@ struct ArgReading {
 /// accept both positional and keyword arguments"), so `checked(value_expr,
 /// condition = …)` and `Normal(mu = m, sigma = s)` each supply two.
 ///
-/// A record or table given as the call's SOLE argument may instead auto-splat —
-/// §04: "`f(record(a = x, b = y, ...))` and `f(table(a = x, b = y, ...))` are
-/// equivalent to `f(a = x, b = y, ...)`" — supplying one argument per field.
+/// A record or table given as the call's SOLE positional argument ALWAYS
+/// auto-splats, supplying one argument per field or column — §04 "Calling
+/// conventions": "`f(record(a = x, b = y, ...))` and `f(table(a = x, b = y, ...))`
+/// are equivalent to `f(a = x, b = y, ...)`", and, as amended by design#74, "A
+/// sole positional record or table therefore always splats: whether its field or
+/// column names match the callable's argument names decides only whether the call
+/// is valid, never whether the splat occurs."
 ///
-/// **This is an INTERIM resolution of an open §04 question, not settled spec.**
-/// §04 enumerates exactly two cases that do NOT splat — "a record given alongside
-/// other arguments, or bound to a parameter by keyword" — and a positional sole
-/// record is neither, so the most direct reading is that it ALWAYS splats. Under
-/// that reading `generator = kernelof(x, pars = pars)` called as `generator(pars)`
-/// (`simple-transport1.flatppl:20`, and `transport-model.flatppl`) is invalid.
-/// Two anchors lean the other way, toward a splat conditioned on the names
-/// corresponding: §04's `fchain` paragraph ("if `f1` returns a record and `f2`
-/// accepts keyword arguments matching the record fields, the two functions compose
-/// directly"), and `determinizer::sample::record_splat_mismatch`, which already
-/// resolves the same ambiguity by name correspondence.
+/// So the callee's parameter list does NOT influence the reading: it cannot make a
+/// sole positional record read as one ordinary value. Passing a record as one
+/// argument takes the keyword spelling instead — §04: "Passing a record or table as
+/// one ordinary argument requires the keyword spelling, as in
+/// `f(pars = record(...))`" — which lands in the `!named.is_empty()` arm below and
+/// does not splat, as do the other two non-splatting cases §04 names ("a record
+/// given alongside other arguments, or bound to a parameter by keyword").
 ///
-/// Pending that question, this accepts a call that EITHER reading satisfies,
-/// which rejects no model under either resolution. The cost is that a callee the
-/// plain reading already satisfies is never name-checked — see the TODO entry for
-/// the ten single-parameter §08 rows this blinds. `splatting` is set only when the
-/// splat reading is the only fit, so an ambiguous call is never name-checked
-/// against fields that may not be binding.
+/// Because the splat is unconditional, the field names are always the binding
+/// names, so `arg_name_check` now name-checks every sole-record call — including
+/// the single-parameter §08 constructors that the earlier either-reading rule left
+/// unchecked (`Poisson(record(zzz = 0.5))` was silently accepted).
 ///
-/// When such an argument's type is still open, neither reading is knowable.
-fn arg_reading(
-    args: &[ArgInfo],
-    named: &[NamedInfo],
-    admits: &dyn Fn(usize) -> bool,
-) -> Option<ArgReading> {
+/// §04 scopes all of this to ORDINARY callables ("built-in or user defined value
+/// functions, constructors or transition kernels"). Special operations have
+/// "distinguished, unnamed, ordered inputs" and never splat — they are excluded
+/// structurally rather than here, since [`arity_check`] returns at its
+/// `base_arity` lookup for a head the catalogue declares no parameter list for,
+/// which is every special operation.
+///
+/// When the sole argument's type is still open, the reading is not knowable.
+fn arg_reading(args: &[ArgInfo], named: &[NamedInfo]) -> Option<ArgReading> {
     let plain = args.len() + named.len();
     let plain_reading = Some(ArgReading {
         count: plain,
@@ -2824,16 +2825,9 @@ fn arg_reading(
         Type::Record(fields) => fields.len(),
         Type::Table { columns, .. } => columns.len(),
         Type::Deferred | Type::Var(_) | Type::Any | Type::Failed(_) => return None,
+        // Not a record or table: an ordinary sole positional argument.
         _ => return plain_reading,
     };
-    // The plain reading wins ties only because it is the conservative half of the
-    // open question above, not because §04 prefers it.
-    if admits(plain) {
-        return plain_reading;
-    }
-    // Either the splat reading fits, or neither does — and when neither fits, the
-    // splat count is the one to report: a record handed to a callable it cannot
-    // fill is being splatted.
     Some(ArgReading {
         count: fields,
         splatting: true,
@@ -2883,6 +2877,13 @@ fn supplied_arg_names(
 /// one. `who` names the callee as it should read in the diagnostic; `section`
 /// attributes the parameter list ("spec §08" for a constructor row, `None` for a
 /// user callable, whose parameters are declared in the module itself).
+///
+/// A SPLATTING call gets the keyword spelling named too. Its field names bind
+/// because §04 makes a sole positional record splat unconditionally, so the author
+/// who meant to pass the record as one value has an actionable fix rather than a
+/// bare "no parameter" — §04: "Passing a record or table as one ordinary argument
+/// requires the keyword spelling, as in `f(pars = record(...))`". The hint goes on
+/// every diagnostic, not once, because each is read on its own line in an editor.
 fn arg_name_check(
     inf: &mut Inferencer<'_, '_>,
     declared: &[String],
@@ -2909,10 +2910,19 @@ fn arg_name_check(
         Some(s) => format!("spec {s} parameters"),
         None => "declares".to_string(),
     };
+    // The splat is what made these field names binding, so say so and name the
+    // spelling that passes the record as one argument instead.
+    let hint = if reading.splatting {
+        " — a sole positional record or table always splats (spec §04), so its \
+         field names bind as arguments; to pass it as one ordinary argument use \
+         the keyword spelling, as in `f(pars = record(...))`"
+    } else {
+        ""
+    };
     for (name, at) in &unknown {
         inf.diags.push(crate::Diagnostic::error_at(
             *at,
-            format!("{who} has no parameter `{name}` ({source}: {list})"),
+            format!("{who} has no parameter `{name}` ({source}: {list}){hint}"),
         ));
     }
     Some(Type::Failed(
