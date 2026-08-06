@@ -9722,6 +9722,59 @@ outputs = (lp)
     assert!(is_delimiter_balanced(&out));
 }
 
+/// The DOWNSTREAM FIXTURE's shape, at its real 20 rows: the same model as
+/// `emit_logdensity_table_column_matvec_worked_probe` with `N = 20` instead of
+/// `4`. Kept as its own golden rather than folded into that one because the row
+/// count is the number the deleted compile-time file read used to supply — a
+/// regression that re-derived `N` from anything but the `valueset` would have to
+/// produce 20 here and 4 there, so pinning both shapes catches a hardcoded or
+/// mis-plumbed dim that a single-`N` golden would miss.
+#[test]
+fn emit_logdensity_table_column_matvec_twenty_row_fixture_shape() {
+    let src = "\
+alpha = elementof(reals)
+beta = elementof(cartpow(reals, 3))
+sigma = elementof(posreals)
+x_data = elementof(cartpow(reals, [20, 3]))
+means = alpha .+ x_data * beta
+y ~ Normal.(means, sigma)
+k = kernelof(record(y = y), alpha = alpha, beta = beta, sigma = sigma, x_data = x_data)
+data = load_data(\"data.json\", cartpow(cartprod(x = cartpow(reals, 3), y = reals), 20))
+L = likelihoodof(k, record(y = data.y))
+lp = logdensityof(L, record(alpha = alpha, beta = beta, sigma = sigma, x_data = data.x))
+inputs = (alpha, beta, sigma, data)
+outputs = (lp)
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let out = emit_logdensity(&d);
+    assert!(
+        out.contains(
+            "func.func @logdensity(%arg0: tensor<f32>, %arg1: tensor<3xf32>, \
+             %arg2: tensor<f32>, %arg3: tensor<20x3xf32>, %arg4: tensor<20xf32>) -> tensor<f32>"
+        ),
+        "expected the 20-row fixture signature, in:\n{out}"
+    );
+    // The mean is reached through the matvec of the x column against beta ...
+    assert!(
+        out.contains(
+            "stablehlo.dot_general %arg3, %arg1, contracting_dims = [1] x [0], \
+             precision = [DEFAULT, DEFAULT] : (tensor<20x3xf32>, tensor<3xf32>) -> tensor<20xf32>"
+        ),
+        "the mean must come through dot_general(%arg3, %arg1), in:\n{out}"
+    );
+    // ... and the variate through the y column.
+    assert!(
+        out.contains("stablehlo.subtract %arg4, "),
+        "the variate must be %arg4 (the y column), in:\n{out}"
+    );
+    // The density reduces over the 20 rows, not some other length.
+    assert!(
+        out.contains("(tensor<20xf32>, tensor<f32>) -> tensor<f32>"),
+        "the log-density must reduce over 20 rows, in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
 /// A destructured table used as ONE value (here `sum(data)`) refuses: the
 /// per-column arguments supply no monolithic tensor, and the message says to
 /// read it column-wise instead of reporting an unsupported head.
