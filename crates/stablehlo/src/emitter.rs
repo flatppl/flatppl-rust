@@ -2738,6 +2738,17 @@ impl<'m> Emitter<'m> {
                         // confused, and no state flag is needed to tell them
                         // apart.
                         crate::ops::lower_bare_mul(self, id, &call.args)
+                    } else if matches!(name.as_str(), "add" | "sub" | "divide" | "pow") {
+                        // The same bare-vs-dotted split as `mul` above, for the
+                        // other operators §07 "Operator-equivalent functions"
+                        // gives a narrower domain than elementwise: `add`/`sub`
+                        // take "scalars or arrays of same shape", `divide`/`pow`
+                        // "scalars". A bare `scalar + vector` is outside the
+                        // domain — `ops::lower_bare_arith` refuses it and names
+                        // `.+`. The dotted spellings arrive as
+                        // `broadcast(add, …)` through `lower_broadcast`, which
+                        // bypasses this dispatch, so they keep broadcasting.
+                        crate::ops::lower_bare_arith(self, id, &name, &call.args)
                     } else if matches!(name.as_str(), "get0" | "get") {
                         // `get0(builtin_sample(...), k)` / `get((%ref self
                         // <shared-latent>), k)`: a projection of a sampled
