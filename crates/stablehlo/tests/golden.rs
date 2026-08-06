@@ -9830,10 +9830,107 @@ outputs = lp
     )
     .unwrap_err();
     assert!(
-        err.msg.contains("do not broadcast"),
-        "expected a broadcast refusal for the predicate/branch pair, got: {}",
+        err.msg.contains("does not match its branches' shape"),
+        "expected a predicate-shape refusal for the predicate/branch pair, got: {}",
         err.msg
     );
+}
+
+/// A SIZE-1 predicate against `[3]` branches. The size-1 rule
+/// `require_broadcastable` applies is right for elementwise arithmetic, where
+/// `broadcast_pair` supplies identity dims, but WRONG for the predicate pass —
+/// `Emitter::broadcast_scalar` emits an empty `dims` list, valid only for a
+/// rank-0 operand. This used to emit
+/// `broadcast_in_dim … dims = [] : (tensor<3xf32>) -> tensor<1xf32>` and exit 0:
+/// invalid StableHLO claiming to shrink 3 to 1.
+#[test]
+fn emit_logdensity_refuses_ifelse_with_a_size_one_predicate() {
+    let src = "\
+p1 = elementof(cartpow(reals, 1))
+p2 = elementof(cartpow(reals, 1))
+m = elementof(cartpow(reals, 3))
+n = elementof(cartpow(reals, 3))
+z = ifelse(p1 < p2, m, n)
+lp = logdensityof(lawof(record(y = draw(Normal(mu = sum(z), sigma = 1.0)))), record(y = 1.0))
+inputs = (p1, p2, m, n)
+outputs = lp
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let err = flatppl_stablehlo::emit(
+        &d,
+        flatppl_stablehlo::Mode::LogDensity,
+        &flatppl_stablehlo::EmitOptions::default(),
+    )
+    .unwrap_err();
+    assert!(
+        err.msg.contains("does not match its branches' shape"),
+        "expected a predicate-shape refusal for a size-1 predicate, got: {}",
+        err.msg
+    );
+}
+
+/// The mirror: a `[3]` predicate against SIZE-1 branches, which emitted the
+/// invalid expansion in the other direction.
+#[test]
+fn emit_logdensity_refuses_ifelse_with_size_one_branches_under_a_wider_predicate() {
+    let src = "\
+p1 = elementof(cartpow(reals, 3))
+p2 = elementof(cartpow(reals, 3))
+m = elementof(cartpow(reals, 1))
+n = elementof(cartpow(reals, 1))
+z = ifelse(p1 < p2, m, n)
+lp = logdensityof(lawof(record(y = draw(Normal(mu = sum(z), sigma = 1.0)))), record(y = 1.0))
+inputs = (p1, p2, m, n)
+outputs = lp
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let err = flatppl_stablehlo::emit(
+        &d,
+        flatppl_stablehlo::Mode::LogDensity,
+        &flatppl_stablehlo::EmitOptions::default(),
+    )
+    .unwrap_err();
+    assert!(
+        err.msg.contains("does not match its branches' shape"),
+        "expected a predicate-shape refusal for size-1 branches, got: {}",
+        err.msg
+    );
+}
+
+/// A size-1 BRANCH against a `[3]` branch under a `[3]` predicate must still
+/// LOWER, and this is why the predicate is compared against the branches'
+/// reconciled shape rather than against one branch: `broadcast_pair` expands the
+/// size-1 branch with proper identity dims first, so the predicate pass is a
+/// no-op and the emission is valid. Comparing the predicate to `a` alone would
+/// refuse a shape that works today.
+#[test]
+fn emit_logdensity_ifelse_size_one_branch_reconciles_before_the_predicate_check() {
+    let src = "\
+p1 = elementof(cartpow(reals, 3))
+p2 = elementof(cartpow(reals, 3))
+m = elementof(cartpow(reals, 1))
+n = elementof(cartpow(reals, 3))
+z = ifelse(p1 < p2, m, n)
+lp = logdensityof(lawof(record(y = draw(Normal(mu = sum(z), sigma = 1.0)))), record(y = 1.0))
+inputs = (p1, p2, m, n)
+outputs = lp
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let out = emit_logdensity(&d);
+    assert!(
+        out.contains(
+            "stablehlo.select %1, %2, %arg3 : (tensor<3xi1>, tensor<3xf32>, tensor<3xf32>) \
+             -> tensor<3xf32>"
+        ),
+        "a size-1 branch must reconcile to [3] and the select stay valid, in:\n{out}"
+    );
+    // The size-1 expansion must use proper identity dims, never an empty list.
+    assert!(
+        !out.contains("dims = [] : (tensor<1xf32>)")
+            && !out.contains("dims = [] : (tensor<3xf32>)"),
+        "a non-rank-0 operand must never broadcast under an empty dims list, in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
 }
 
 /// The shapes `ifelse` MUST still accept: a scalar predicate against ranked

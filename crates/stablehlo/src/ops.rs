@@ -19,7 +19,7 @@
 //! **`*` is not `.*`.** Spec §07 "Linear algebra": "Matrix multiplication and
 //! addition use the standard `*` and `+` operators." The two spellings are
 //! already distinct in FlatPDL — `.*` is `broadcast(mul, …)`, plain `*` a bare
-//! `mul` — so [`is_matrix_product`]/[`lower_matrix_product`] handle a bare `mul`
+//! `mul` — so [`classify_bare_mul`]/[`lower_bare_mul`] handle a bare `mul`
 //! over a rank-2 left operand as one `stablehlo.dot_general`, and the `"mul"`
 //! entry in the map below stays purely elementwise. That dispatch lives in
 //! `Emitter::lower_node`, which [`Emitter::lower_broadcast`] bypasses, so a
@@ -411,13 +411,83 @@ fn lower_ifelse(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, E
     // broadcasts both against the first ranked shape among {pred, a, b}. So two
     // pairings have to hold, and neither is checked by the infallible helper:
     require_broadcastable(id, &a, &b)?;
-    // The predicate against a branch. A SCALAR pred passes (StableHLO's select
-    // accepts one against ranked operands) and an equal shape passes; a ranked
-    // pred of a different shape would otherwise reach `broadcast_scalar`, which
-    // does not panic but emits an invalid `broadcast_in_dim` (rank-2 operand to a
-    // rank-1 result under `dims = []`) — a mislowering, worse than the abort.
-    require_broadcastable(id, &c, &a)?;
+    require_select_predicate(id, &c, &a, &b)?;
     Ok(e.select(&c, &a, &b))
+}
+
+/// Refuse a `select` predicate whose shape `Emitter::select`'s second pass cannot
+/// legally broadcast the branches to.
+///
+/// That pass is NOT `broadcast_pair` — it is `Emitter::broadcast_scalar`, which
+/// emits `broadcast_in_dim(s, &[], out_ty)` whenever `s.ty != out_ty`, and an
+/// EMPTY `dims` list is valid only for a rank-0 operand. So the size-1 expansion
+/// [`require_broadcastable`] permits is wrong here: it is sound for elementwise
+/// arithmetic, where `broadcast_pair` supplies proper identity dims, but a size-1
+/// predicate against `[3]` branches (or the mirror) silently emitted
+/// `broadcast_in_dim … dims = [] : (tensor<3xf32>) -> tensor<1xf32>` — invalid
+/// StableHLO, exit 0.
+///
+/// The admissible cases, and nothing else:
+/// - a SCALAR predicate — StableHLO's `select` takes one against ranked operands,
+///   and the branches keep their own shape;
+/// - a ranked predicate with SCALAR branches — they broadcast up from rank 0, so
+///   the empty `dims` list is correct;
+/// - a ranked predicate whose shape EQUALS the shape the branches reconcile to,
+///   making the second pass a no-op.
+///
+/// The last case compares against the RECONCILED branch shape, not against `a`
+/// alone: `broadcast_pair` has already expanded a size-1 branch axis with proper
+/// dims by the time the predicate pass runs, so `(pred [3], a [1], b [3])` is
+/// legal and emits a valid `select` — checking `c == a` would refuse it.
+fn require_select_predicate(id: NodeId, c: &Value, a: &Value, b: &Value) -> Result<(), EmitError> {
+    if matches!(c.ty, MlirTy::Scalar) {
+        return Ok(());
+    }
+    let MlirTy::Ranked(dc) = &c.ty else {
+        return Err(EmitError::at(
+            id,
+            format!("ifelse predicate has no tensor form: {:?}", c.ty),
+        ));
+    };
+    // The shape the branches carry into the predicate pass. `require_broadcastable`
+    // has already run on the pair, so a mixed Ranked pair here is compatible.
+    let branch_shape = match (&a.ty, &b.ty) {
+        (MlirTy::Ranked(da), MlirTy::Ranked(db)) => Some(common_shape(da, db)),
+        (MlirTy::Ranked(d), _) | (_, MlirTy::Ranked(d)) => Some(d.clone()),
+        // Both scalar: they broadcast up from rank 0, which `dims = []` expresses
+        // correctly whatever the predicate's shape.
+        _ => None,
+    };
+    match branch_shape {
+        None => Ok(()),
+        Some(target) if *dc == target => Ok(()),
+        Some(target) => Err(EmitError::at(
+            id,
+            format!(
+                "ifelse predicate shape {:?} does not match its branches' shape {:?} — a \
+                 select predicate must be a scalar or exactly the branch shape (the branch \
+                 broadcast cannot expand a non-scalar predicate)",
+                MlirTy::Ranked(dc.clone()),
+                MlirTy::Ranked(target)
+            ),
+        )),
+    }
+}
+
+/// The per-axis shape `Emitter::broadcast_pair` reconciles a COMPATIBLE ranked
+/// pair to: an axis pair that is equal keeps its size, a size-1 axis takes the
+/// other side's, and a doubly dynamic axis stays dynamic. Only meaningful after
+/// [`require_broadcastable`] has accepted the pair.
+fn common_shape(da: &[Option<u64>], db: &[Option<u64>]) -> Vec<Option<u64>> {
+    da.iter()
+        .zip(db.iter())
+        .map(|(&x, &y)| match (x, y) {
+            (Some(1), other) => other,
+            (other, Some(1)) => other,
+            (Some(m), _) => Some(m),
+            (None, other) => other,
+        })
+        .collect()
 }
 
 /// The predicate-producing builtin heads this map lowers to an `i1` value.
