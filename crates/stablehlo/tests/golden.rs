@@ -9620,6 +9620,380 @@ outputs = lp
     assert!(is_delimiter_balanced(&out));
 }
 
+// ---- §07 transpose/adjoint and the transposed-vector products ---------------
+//
+// §07 "Linear algebra": "Matrix multiplication and addition use the standard `*`
+// and `+` operators. The product of a non-transposed vector and a transposed
+// vector is a matrix; the product of a transposed vector and a non-transposed
+// vector is a scalar." Its `mul` row admits exactly "scalars, matrix-matrix,
+// matrix-vector, scalar-matrix, scalar-vector, transposed-vector–vector,
+// vector–transposed-vector". Every shape below is NON-SQUARE wherever a shape can
+// be, so a transposed contraction cannot pass by coincidence.
+
+/// A MATRIX transpose swaps its axes: `[4,3] -> [3,4]`, non-square so the
+/// permutation is pinned rather than merely plausible.
+#[test]
+fn emit_logdensity_transpose_of_a_matrix_swaps_axes() {
+    let src = "\
+m = elementof(cartpow(reals, [4, 3]))
+z = sum(sum(transpose(m)))
+lp = logdensityof(lawof(record(y = draw(Normal(mu = z, sigma = 1.0)))), record(y = 1.0))
+inputs = m
+outputs = lp
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let out = emit_logdensity(&d);
+    assert!(
+        out.contains(
+            "stablehlo.transpose %arg0, dims = [1, 0] : (tensor<4x3xf32>) -> tensor<3x4xf32>"
+        ),
+        "a matrix transpose must permute [1, 0] to tensor<3x4xf32>, in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// `adjoint` emits the SAME op as `transpose`: this crate has no complex element
+/// type (`ElemKind` is Real/Int/Bool, and `mlir_type_of` refuses a `Complex`
+/// scalar), so the conjugation half of the conjugate transpose is the identity
+/// over every element type it can emit.
+#[test]
+fn emit_logdensity_adjoint_is_transpose_over_the_reals() {
+    let src = "\
+m = elementof(cartpow(reals, [4, 3]))
+z = sum(sum(adjoint(m)))
+lp = logdensityof(lawof(record(y = draw(Normal(mu = z, sigma = 1.0)))), record(y = 1.0))
+inputs = m
+outputs = lp
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let out = emit_logdensity(&d);
+    assert!(
+        out.contains(
+            "stablehlo.transpose %arg0, dims = [1, 0] : (tensor<4x3xf32>) -> tensor<3x4xf32>"
+        ),
+        "adjoint must emit the plain transpose over the reals, in:\n{out}"
+    );
+}
+
+/// A VECTOR transpose emits NOTHING. §07 makes the transpose of a vector "a
+/// transposed vector …, not a single-row matrix", and §03 makes that a distinct
+/// TYPE — but it has no distinct tensor form, since `mlir_type_of` maps a rank-1
+/// `Array` and a `TVector` both to `tensor<nxf32>`. The orientation is carried by
+/// the inferred type, which is where the `mul` dispatch reads it from.
+///
+/// This also pins §07's "`transpose` and `adjoint` are self-inverse" for vectors
+/// with no fold required: `transpose(transpose(v))` emits zero transposes, and the
+/// reduction consumes `%arg0` directly.
+#[test]
+fn emit_logdensity_vector_transpose_is_a_type_level_no_op() {
+    let src = "\
+v = elementof(cartpow(reals, 3))
+z = sum(transpose(transpose(v)))
+lp = logdensityof(lawof(record(y = draw(Normal(mu = z, sigma = 1.0)))), record(y = 1.0))
+inputs = v
+outputs = lp
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let out = emit_logdensity(&d);
+    assert!(
+        !out.contains("stablehlo.transpose"),
+        "a vector transpose has no tensor form to emit, in:\n{out}"
+    );
+    assert!(
+        out.contains("stablehlo.reduce(%arg0 init:"),
+        "the double transpose must reduce the argument directly, in:\n{out}"
+    );
+}
+
+/// The MATRIX half of §07's "`transpose` and `adjoint` are self-inverse": the
+/// involution is left to the consuming compiler, so BOTH transposes are emitted
+/// and the round trip returns to the original shape. Pinning the choice (rather
+/// than folding here) because a `transpose(transpose(x))` peephole would be this
+/// crate's first such rewrite and buys nothing XLA does not already do — if
+/// someone later adds the fold, this golden is what they must update
+/// deliberately.
+#[test]
+fn emit_logdensity_double_matrix_transpose_emits_both_and_round_trips() {
+    let src = "\
+m = elementof(cartpow(reals, [4, 3]))
+z = sum(sum(transpose(transpose(m))))
+lp = logdensityof(lawof(record(y = draw(Normal(mu = z, sigma = 1.0)))), record(y = 1.0))
+inputs = m
+outputs = lp
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let out = emit_logdensity(&d);
+    assert_eq!(
+        out.matches("stablehlo.transpose").count(),
+        2,
+        "both matrix transposes are emitted, unfolded, in:\n{out}"
+    );
+    assert!(
+        out.contains("(tensor<4x3xf32>) -> tensor<3x4xf32>")
+            && out.contains("(tensor<3x4xf32>) -> tensor<4x3xf32>"),
+        "the round trip must return to tensor<4x3xf32>, in:\n{out}"
+    );
+}
+
+/// `transpose(a) * b` is the INNER product — §07: "the product of a transposed
+/// vector and a non-transposed vector is a scalar". One `dot_general` contracting
+/// axis 0 against axis 0, with a rank-0 (`tensor<f32>`) result. This is the trap
+/// this wave exists to close: before the bare-`*` guard it went silently
+/// elementwise, giving a vector of products where the model asked for a scalar.
+#[test]
+fn emit_logdensity_transposed_vector_times_vector_is_an_inner_product() {
+    let src = "\
+v = elementof(cartpow(reals, 3))
+w = elementof(cartpow(reals, 3))
+z = transpose(v) * w
+lp = logdensityof(lawof(record(y = draw(Normal(mu = z, sigma = 1.0)))), record(y = 1.0))
+inputs = (v, w)
+outputs = lp
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let out = emit_logdensity(&d);
+    assert!(
+        out.contains(
+            "stablehlo.dot_general %arg0, %arg1, contracting_dims = [0] x [0], \
+             precision = [DEFAULT, DEFAULT] : (tensor<3xf32>, tensor<3xf32>) -> tensor<f32>"
+        ),
+        "the inner product must contract [0] x [0] to a scalar, in:\n{out}"
+    );
+    // A scalar result, so no reduction is needed to consume it.
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// `a * transpose(b)` is the OUTER product — §07: "The product of a
+/// non-transposed vector and a transposed vector is a matrix". NON-SQUARE
+/// (`[4] × [3] -> [4,3]`), which is what pins the orientation: the lhs spreads
+/// along axis 0 and the rhs along axis 1, so a swapped emission would give
+/// `tensor<3x4xf32>`.
+#[test]
+fn emit_logdensity_vector_times_transposed_vector_is_an_outer_product() {
+    let src = "\
+v = elementof(cartpow(reals, 4))
+w = elementof(cartpow(reals, 3))
+z = sum(sum(v * transpose(w)))
+lp = logdensityof(lawof(record(y = draw(Normal(mu = z, sigma = 1.0)))), record(y = 1.0))
+inputs = (v, w)
+outputs = lp
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let out = emit_logdensity(&d);
+    assert!(
+        out.contains(
+            "stablehlo.broadcast_in_dim %arg0, dims = [0] : (tensor<4xf32>) -> tensor<4x3xf32>"
+        ),
+        "the lhs must spread along axis 0, in:\n{out}"
+    );
+    assert!(
+        out.contains(
+            "stablehlo.broadcast_in_dim %arg1, dims = [1] : (tensor<3xf32>) -> tensor<4x3xf32>"
+        ),
+        "the rhs must spread along axis 1, in:\n{out}"
+    );
+    assert!(
+        out.contains("stablehlo.multiply %1, %2 : tensor<4x3xf32>"),
+        "the outer product is the broadcast pair multiplied, in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// `.*` on a TVECTOR pair stays elementwise — the control that shows the new
+/// product arms did not capture the dotted spelling, which arrives as
+/// `broadcast(mul, …)` through a path the `mul` dispatch never sees.
+#[test]
+fn emit_logdensity_elementwise_mul_over_transposed_vectors_stays_elementwise() {
+    let src = "\
+v = elementof(cartpow(reals, 3))
+w = elementof(cartpow(reals, 3))
+z = sum(transpose(v) .* transpose(w))
+lp = logdensityof(lawof(record(y = draw(Normal(mu = z, sigma = 1.0)))), record(y = 1.0))
+inputs = (v, w)
+outputs = lp
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let out = emit_logdensity(&d);
+    assert!(
+        out.contains("stablehlo.multiply %arg0, %arg1 : tensor<3xf32>"),
+        "`.*` over two transposed vectors must stay elementwise, in:\n{out}"
+    );
+    assert!(
+        !out.contains("dot_general"),
+        "`.*` must not become an inner product, in:\n{out}"
+    );
+}
+
+/// A TRANSPOSED-vector dividend over a scalar divisor lowers. §07's amended
+/// `divide` row (flatppl-design#75) is "scalars, vector-scalar, matrix-scalar",
+/// and §03 says "The term vector will represent both non-transposed vectors
+/// (one-dimensional arrays) and transposed vectors in the following, unless noted
+/// otherwise" — the divide row notes no such exception, unlike the `mul` row,
+/// which spells the orientations out precisely because they change the result.
+/// The guard's whitelist admitted only `Array`, one case stricter than the row.
+#[test]
+fn emit_logdensity_transposed_vector_over_scalar_divides() {
+    let src = "\
+v = elementof(cartpow(reals, 3))
+s = elementof(posreals)
+z = sum(transpose(v) / s)
+lp = logdensityof(lawof(record(y = draw(Normal(mu = z, sigma = 1.0)))), record(y = 1.0))
+inputs = (v, s)
+outputs = lp
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let out = emit_logdensity(&d);
+    assert!(
+        out.contains("stablehlo.divide"),
+        "a transposed-vector dividend over a scalar divisor must lower, in:\n{out}"
+    );
+}
+
+/// `ArithShape::differs_from`'s TVector arms, which no test reached before
+/// transposed vectors were constructible: two transposed vectors of the SAME
+/// length add (they are the same shape), differing lengths refuse, and a
+/// transposed vector against a plain one refuses on ORIENTATION alone even though
+/// both are `tensor<3xf32>` — §03 keeps them distinct types, and adding a row to a
+/// column is not vector addition.
+#[test]
+fn emit_logdensity_transposed_vector_addition_respects_orientation() {
+    let same = "\
+v = elementof(cartpow(reals, 3))
+w = elementof(cartpow(reals, 3))
+z = sum(transpose(v) + transpose(w))
+lp = logdensityof(lawof(record(y = draw(Normal(mu = z, sigma = 1.0)))), record(y = 1.0))
+inputs = (v, w)
+outputs = lp
+";
+    let d = determinize_abi_roots(same, &["inputs", "outputs"]);
+    let out = emit_logdensity(&d);
+    assert!(
+        out.contains("stablehlo.add %arg0, %arg1 : tensor<3xf32>"),
+        "two transposed vectors of the same length must add, in:\n{out}"
+    );
+
+    for (label, src) in [
+        (
+            "differing lengths",
+            "\
+v = elementof(cartpow(reals, 3))
+w = elementof(cartpow(reals, 4))
+z = sum(transpose(v) + transpose(w))
+lp = logdensityof(lawof(record(y = draw(Normal(mu = z, sigma = 1.0)))), record(y = 1.0))
+inputs = (v, w)
+outputs = lp
+",
+        ),
+        (
+            "row against column",
+            "\
+v = elementof(cartpow(reals, 3))
+w = elementof(cartpow(reals, 3))
+z = sum(transpose(v) + w)
+lp = logdensityof(lawof(record(y = draw(Normal(mu = z, sigma = 1.0)))), record(y = 1.0))
+inputs = (v, w)
+outputs = lp
+",
+        ),
+    ] {
+        let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+        let err = flatppl_stablehlo::emit(
+            &d,
+            flatppl_stablehlo::Mode::LogDensity,
+            &flatppl_stablehlo::EmitOptions::default(),
+        )
+        .unwrap_err();
+        assert!(
+            err.msg.contains("has no meaning for these operand shapes"),
+            "{label} must refuse, got: {}",
+            err.msg
+        );
+    }
+}
+
+/// The pairs §07's `mul` row does NOT admit, now that transposed vectors are
+/// constructible. `matrix-vector` is listed but `vector-matrix` is not, and the
+/// row distinguishes transposed from non-transposed exactly where orientation
+/// decides the result — so neither matrix/TVector mix is admitted. `infer` agrees
+/// independently: `mul_type` types both `%deferred` (measured).
+#[test]
+fn emit_logdensity_refuses_the_mul_pairs_section_07_omits() {
+    for (label, src) in [
+        (
+            "TVector * TVector",
+            "\
+v = elementof(cartpow(reals, 3))
+w = elementof(cartpow(reals, 3))
+z = sum(transpose(v) * transpose(w))
+lp = logdensityof(lawof(record(y = draw(Normal(mu = z, sigma = 1.0)))), record(y = 1.0))
+inputs = (v, w)
+outputs = lp
+",
+        ),
+        (
+            "matrix * TVector",
+            "\
+m = elementof(cartpow(reals, [4, 3]))
+w = elementof(cartpow(reals, 3))
+z = sum(sum(m * transpose(w)))
+lp = logdensityof(lawof(record(y = draw(Normal(mu = z, sigma = 1.0)))), record(y = 1.0))
+inputs = (m, w)
+outputs = lp
+",
+        ),
+        (
+            "TVector * matrix",
+            "\
+v = elementof(cartpow(reals, 3))
+m = elementof(cartpow(reals, [3, 4]))
+z = sum(transpose(v) * m)
+lp = logdensityof(lawof(record(y = draw(Normal(mu = z, sigma = 1.0)))), record(y = 1.0))
+inputs = (v, m)
+outputs = lp
+",
+        ),
+    ] {
+        let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+        let err = flatppl_stablehlo::emit(
+            &d,
+            flatppl_stablehlo::Mode::LogDensity,
+            &flatppl_stablehlo::EmitOptions::default(),
+        )
+        .unwrap_err();
+        assert!(
+            err.msg.contains("has no meaning for these operand shapes")
+                && err.msg.contains("transposed-vector–vector"),
+            "{label} must refuse citing §07's mul row, got: {}",
+            err.msg
+        );
+    }
+}
+
+/// `transpose`/`adjoint` refuse above rank 2 — §07's domain is "vectors,
+/// matrices", and a rank-3 array has no canonical permutation.
+#[test]
+fn emit_logdensity_refuses_transpose_above_rank_two() {
+    let src = "\
+a = elementof(cartpow(reals, [2, 3, 4]))
+z = sum(sum(sum(transpose(a))))
+lp = logdensityof(lawof(record(y = draw(Normal(mu = z, sigma = 1.0)))), record(y = 1.0))
+inputs = a
+outputs = lp
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let err = flatppl_stablehlo::emit(
+        &d,
+        flatppl_stablehlo::Mode::LogDensity,
+        &flatppl_stablehlo::EmitOptions::default(),
+    )
+    .unwrap_err();
+    assert!(
+        err.msg.contains("has no lowering for") && err.msg.contains("vectors, matrices"),
+        "expected a §07-domain refusal for a rank-3 transpose, got: {}",
+        err.msg
+    );
+}
+
 /// `*` on two VECTORS refuses. §07 gives `*` a vector meaning only through a
 /// transpose ("the product of a transposed vector and a non-transposed vector is
 /// a scalar"), and `infer`'s `mul_type` returns `Deferred` for a rank-1 pair — so

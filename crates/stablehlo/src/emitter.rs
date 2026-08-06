@@ -1316,7 +1316,7 @@ impl<'m> Emitter<'m> {
             );
         }
 
-        self.dot_contract(a, b, 1, 0, vec![a_dims[0]])
+        self.dot_contract(a, b, 1, 0, MlirTy::Ranked(vec![a_dims[0]]))
     }
 
     /// Matrix-matrix product `a @ b` (spec §07 "Linear algebra": "Matrix
@@ -1341,7 +1341,55 @@ impl<'m> Emitter<'m> {
                 a_dims[1], b_dims[0]
             );
         }
-        self.dot_contract(a, b, 1, 0, vec![a_dims[0], b_dims[1]])
+        self.dot_contract(a, b, 1, 0, MlirTy::Ranked(vec![a_dims[0], b_dims[1]]))
+    }
+
+    /// Inner (dot) product of a TRANSPOSED vector and a vector, spec §07 "Linear
+    /// algebra": "the product of a transposed vector and a non-transposed vector
+    /// is a scalar". Both operands are rank-1 tensors — §03 keeps the transposed
+    /// vector a distinct TYPE, but it has no distinct tensor form — so this
+    /// contracts axis 0 against axis 0 and yields a rank-0 result, typed
+    /// [`MlirTy::Scalar`] so downstream arithmetic treats it as the scalar it is.
+    /// Panics on a non-rank-1 operand or disagreeing lengths; `crate::ops`'s `mul`
+    /// dispatch checks both first.
+    pub fn inner_product(&mut self, a: &Value, b: &Value) -> Value {
+        let dims = |v: &Value, side: &str| match &v.ty {
+            MlirTy::Ranked(d) if d.len() == 1 => d.clone(),
+            other => panic!("inner_product expects a rank-1 {side} operand, got {other:?}"),
+        };
+        let a_dims = dims(a, "lhs");
+        let b_dims = dims(b, "rhs");
+        if matches!((a_dims[0], b_dims[0]), (Some(m), Some(n)) if m != n) {
+            panic!(
+                "inner_product: lengths disagree ({:?} vs {:?})",
+                a_dims[0], b_dims[0]
+            );
+        }
+        self.dot_contract(a, b, 0, 0, MlirTy::Scalar)
+    }
+
+    /// Outer product of a vector and a TRANSPOSED vector, spec §07 "Linear
+    /// algebra": "The product of a non-transposed vector and a transposed vector
+    /// is a matrix". `[n] × [m] → [n, m]` with `result[i, j] = a[i] · b[j]`.
+    ///
+    /// Built from two [`Emitter::broadcast_in_dim`]s and a multiply rather than a
+    /// `dot_general` with an EMPTY contracting-dims list: the empty pretty form
+    /// (`contracting_dims = [] x []`) is not one this crate has validated against
+    /// a real StableHLO parser, while a rank-1 `broadcast_in_dim` under a
+    /// single-axis `dims` list is the form already used throughout. `a` spreads
+    /// along axis 0 and `b` along axis 1, so the multiply is the outer product.
+    /// Panics on a non-rank-1 operand; `crate::ops`'s `mul` dispatch checks first.
+    pub fn outer_product(&mut self, a: &Value, b: &Value) -> Value {
+        let dims = |v: &Value, side: &str| match &v.ty {
+            MlirTy::Ranked(d) if d.len() == 1 => d.clone(),
+            other => panic!("outer_product expects a rank-1 {side} operand, got {other:?}"),
+        };
+        let n = dims(a, "lhs")[0];
+        let m = dims(b, "rhs")[0];
+        let out = MlirTy::Ranked(vec![n, m]);
+        let a_full = self.broadcast_in_dim(a, &[0], out.clone());
+        let b_full = self.broadcast_in_dim(b, &[1], out);
+        self.mul(&a_full, &b_full)
     }
 
     /// Emit one `stablehlo.dot_general` in the pretty form, contracting `a`'s
@@ -1354,12 +1402,11 @@ impl<'m> Emitter<'m> {
         b: &Value,
         la: usize,
         lb: usize,
-        result_dims: Vec<Option<u64>>,
+        result_ty: MlirTy,
     ) -> Value {
         let ssa = self.fresh();
         let a_ty = a.ty.render(self.dtype, a.elem);
         let b_ty = b.ty.render(self.dtype, b.elem);
-        let result_ty = MlirTy::Ranked(result_dims);
         let result_ty_text = result_ty.render(self.dtype, ElemKind::Real);
         self.push(&format!(
             "{ssa} = stablehlo.dot_general {}, {}, contracting_dims = [{la}] x [{lb}], precision = [DEFAULT, DEFAULT] : ({a_ty}, {b_ty}) -> {result_ty_text}",

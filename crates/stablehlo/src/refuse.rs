@@ -101,15 +101,25 @@
 //!   types the dispatch classified on — "matrix product operand ranks disagree
 //!   with their inferred types: ...". Unreachable unless the two layers drift;
 //!   it exists so `lower_matrix_product` cannot index past a short dim list.
-//! - a BARE `mul` (surface `*`) whose operands are both non-scalar but are not a
-//!   product §07 defines — two vectors, a rank-3 pair, a `TVector` product —
-//!   "`*` has no meaning for these operand shapes: ... Write `.*` for an
-//!   elementwise product, or `transpose(a) * b` for an inner product (which this
-//!   emitter does not yet lower)". §07 gives `*` on vectors a meaning only
-//!   through a transpose and none for rank 3, and `infer`'s `mul_type` returns
-//!   `Deferred` for both, so lowering them elementwise would silently answer a
-//!   different question. `ops::classify_bare_mul` decides; a scalar operand or an
-//!   absent type keeps the ordinary elementwise path.
+//! - a BARE `mul` (surface `*`) whose operands are both non-scalar but are not one
+//!   of the four products §07's `mul` row admits — two same-orientation vectors, a
+//!   matrix against a transposed vector (either order), a rank-3 pair — "`*` has
+//!   no meaning for these operand shapes: ... §07 \"Linear algebra\" gives `mul`
+//!   the domain \"scalars, matrix-matrix, matrix-vector, scalar-matrix,
+//!   scalar-vector, transposed-vector–vector, vector–transposed-vector\" ...".
+//!   `infer`'s `mul_type` types every one of them `%deferred`, so lowering them
+//!   elementwise would silently answer a different question.
+//!   `ops::classify_bare_mul` decides on orientation-aware shapes; a scalar
+//!   operand or an absent type keeps the ordinary elementwise path.
+//! - an INNER product (`transpose(a) * b`) whose operand lengths are statically
+//!   unequal — "inner product operand lengths disagree: ...". A defensive second
+//!   line: `infer`'s `mul_type` already makes such a call `Type::Failed` ("inner
+//!   product: vector lengths disagree (spec §07)"), so the determiniser refuses
+//!   first and this arm is reachable only from a direct `emit` call.
+//! - `transpose`/`adjoint` above rank 2 — "`transpose` has no lowering for ... §07
+//!   \"Linear algebra\" gives it the domain \"vectors, matrices\"". A rank-1
+//!   operand emits NOTHING (the transposition is type-level only) and a rank-2 one
+//!   emits `stablehlo.transpose … dims = [1, 0]`.
 //! - a BARE `add`/`sub`/`divide`/`pow` (surface `+`, `-`, `/`, `^`) whose operand
 //!   shapes are outside the §07 "Operator-equivalent functions" domain for that
 //!   head — `add`/`sub` take "scalars or arrays of same shape (real or complex)",

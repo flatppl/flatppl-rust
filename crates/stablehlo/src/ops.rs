@@ -19,11 +19,19 @@
 //! **`*` is not `.*`.** Spec §07 "Linear algebra": "Matrix multiplication and
 //! addition use the standard `*` and `+` operators." The two spellings are
 //! already distinct in FlatPDL — `.*` is `broadcast(mul, …)`, plain `*` a bare
-//! `mul` — so [`classify_bare_mul`]/[`lower_bare_mul`] handle a bare `mul`
-//! over a rank-2 left operand as one `stablehlo.dot_general`, and the `"mul"`
-//! entry in the map below stays purely elementwise. That dispatch lives in
-//! `Emitter::lower_node`, which [`Emitter::lower_broadcast`] bypasses, so a
-//! `.*`-derived `mul` can never reach it.
+//! `mul` — so [`classify_bare_mul`]/[`lower_bare_mul`] handle a bare `mul` as one
+//! of §07's four products, and the `"mul"` entry in the map below stays purely
+//! elementwise. That dispatch lives in `Emitter::lower_node`, which
+//! [`Emitter::lower_broadcast`] bypasses, so a `.*`-derived `mul` can never reach
+//! it.
+//!
+//! The four products are `matrix-matrix` and `matrix-vector` (one
+//! `stablehlo.dot_general`), plus the two transposed-vector orientations §07
+//! defines — `transpose(a) * b` contracting to a scalar and `a * transpose(b)`
+//! spreading to a matrix. Orientation is type-level only: §03 makes a transposed
+//! vector a distinct TYPE, but `crate::types::mlir_type_of` maps it and a rank-1
+//! array to the same `tensor<nxf32>`, so [`lower_transpose`] emits nothing for a
+//! vector and the dispatch reads the orientation off the inferred types.
 //!
 //! **Nor is `+` `.+`.** The same split covers the other operators §07
 //! "Operator-equivalent functions" gives a narrower domain than elementwise:
@@ -115,6 +123,8 @@ pub(crate) fn lower_builtin(
         // discrete-pushforward lattice snap emits, `real(round(x))`.
         "round" => unary(e, id, args, Emitter::round_nearest_even),
         "real" => lower_real(e, id, args),
+        // §07 "Linear algebra" `transpose`/`adjoint`, domain "vectors, matrices".
+        "transpose" | "adjoint" => lower_transpose(e, id, args, head),
         "ifelse" => lower_ifelse(e, id, args),
         "inf" => lower_inf(e, id, args),
         "pi" => lower_pi(e, id, args),
@@ -265,39 +275,66 @@ fn require_broadcastable(id: NodeId, a: &Value, b: &Value) -> Result<(), EmitErr
 /// What a BARE `mul` (surface `*`, spec §07 "Linear algebra") means for the
 /// shapes of its operands.
 enum BareMul {
-    /// A rank-2 lhs against a rank-2 or rank-1 rhs: one `stablehlo.dot_general`.
+    /// A rank-2 lhs against a rank-2 or rank-1 rhs: one `stablehlo.dot_general`
+    /// (`matrix-matrix` / `matrix-vector` in §07's `mul` row).
     MatrixProduct,
+    /// `transposed-vector–vector` — §07: "the product of a transposed vector and
+    /// a non-transposed vector is a scalar".
+    InnerProduct,
+    /// `vector–transposed-vector` — §07: "The product of a non-transposed vector
+    /// and a transposed vector is a matrix".
+    OuterProduct,
     /// At least one operand is a scalar (or has no inferred type): the ordinary
     /// elementwise multiply, which broadcasts the scalar side.
     Elementwise,
-    /// Both operands are non-scalar but the pair is not a product this emitter
-    /// implements — and §07 gives `*` NO elementwise meaning, so lowering it
-    /// elementwise would answer a different question than the model asked.
+    /// Both operands are non-scalar but the pair is not a product §07 admits — so
+    /// lowering it elementwise would answer a different question than the model
+    /// asked.
     Undefined,
 }
 
 /// Classify a bare `mul`'s operands by their inferred FlatPDL types — the same
 /// information `infer`'s `mul_type` reads — so no operand is lowered to decide.
 ///
-/// Only `Some(2)` on the LEFT makes a product, matching `mul_type`'s own
-/// matrix·matrix / matrix·vector arms. Every other non-scalar pair is
-/// [`BareMul::Undefined`]: §07 gives `*` on two vectors a meaning only WITH a
-/// transpose ("the product of a transposed vector and a non-transposed vector is
-/// a scalar") and none at all for rank-3 operands, and `mul_type` agrees by
-/// returning `Type::Deferred` for both. An operand whose type is absent
-/// (a freshly synthesized determiniser node before re-inference) or scalar
-/// classifies as [`BareMul::Elementwise`], which is what keeps the determiniser's
-/// own `mul(literal, vector)` idiom lowering.
+/// The admitted set is §07's `mul` row verbatim: "scalars, matrix-matrix,
+/// matrix-vector, scalar-matrix, scalar-vector, transposed-vector–vector,
+/// vector–transposed-vector". Orientation is load-bearing, so this reads
+/// [`arith_shape`] (which keeps `Array` and `TVector` distinct, per §03's "In
+/// addition, transposed vectors are a distinct type in FlatPPL") rather than a
+/// bare rank.
+///
+/// Everything else is [`BareMul::Undefined`], and `infer` independently agrees —
+/// `mul_type` returns `Type::Deferred` for each (measured):
+/// - vector·vector and TVector·TVector: §07 gives `*` a vector meaning ONLY
+///   through a transpose, and only in the two mixed orientations;
+/// - matrix·TVector and TVector·matrix: the row lists `matrix-vector` but no
+///   `vector-matrix`, and it distinguishes transposed from non-transposed exactly
+///   where orientation decides the result. §03's "the term vector will represent
+///   both … unless noted otherwise" could be read as widening `matrix-vector` to
+///   cover a transposed rhs, but `[m,k] · row[k]` does not conform dimensionally,
+///   so that reading contradicts the maths and is not taken. A row-vector–matrix
+///   product IS sound maths, and admitting it would be a spec-row change rather
+///   than a guard relaxation;
+/// - rank 3 and above: not enumerated at all.
+///
+/// An operand whose type is absent (a freshly synthesized determiniser node
+/// before re-inference) or scalar classifies as [`BareMul::Elementwise`], which
+/// is what keeps the determiniser's own `mul(literal, vector)` idiom lowering.
 fn classify_bare_mul(e: &Emitter, args: &[NodeId]) -> BareMul {
+    use ArithShape::*;
     let [a, b] = match <[NodeId; 2]>::try_from(args) {
         Ok(pair) => pair,
         // Wrong arity: let `binary`'s `args_exact` produce the arity message.
         Err(_) => return BareMul::Elementwise,
     };
-    match (array_rank(e, a), array_rank(e, b)) {
-        (Some(2), Some(2)) | (Some(2), Some(1)) => BareMul::MatrixProduct,
-        (Some(_), Some(_)) => BareMul::Undefined,
-        _ => BareMul::Elementwise,
+    match (arith_shape(e, a), arith_shape(e, b)) {
+        (Scalar, _) | (_, Scalar) | (Unknown, _) | (_, Unknown) => BareMul::Elementwise,
+        (Array(da), Array(db)) if da.len() == 2 && (db.len() == 2 || db.len() == 1) => {
+            BareMul::MatrixProduct
+        }
+        (TVector(da), Array(db)) if da.len() == 1 && db.len() == 1 => BareMul::InnerProduct,
+        (Array(da), TVector(db)) if da.len() == 1 && db.len() == 1 => BareMul::OuterProduct,
+        _ => BareMul::Undefined,
     }
 }
 
@@ -309,12 +346,9 @@ fn classify_bare_mul(e: &Emitter, args: &[NodeId]) -> BareMul {
 /// `Emitter::lower_broadcast` — so the elementwise `.*` spelling
 /// (`broadcast(mul, …)`) is not classified here and keeps its own meaning.
 ///
-/// The `Undefined` refusal also covers the `TVector` products §07 defines
-/// (`transpose(v) * w`): this emitter has no inner-product lowering, and
-/// refusing is right where silently emitting an elementwise multiply would be a
-/// wrong number. Whoever adds a `transpose` lowering must add the `TVector` arms
-/// to [`classify_bare_mul`] and a `[n]x[n] -> scalar` contraction with it; until
-/// then the shape refuses here rather than at `transpose`.
+/// All four §07 products lower here: `matrix-matrix` and `matrix-vector` through
+/// [`lower_matrix_product`], and the two transposed-vector orientations through
+/// [`Emitter::inner_product`] / [`Emitter::outer_product`].
 pub(crate) fn lower_bare_mul(
     e: &mut Emitter,
     id: NodeId,
@@ -322,6 +356,8 @@ pub(crate) fn lower_bare_mul(
 ) -> Result<Value, EmitError> {
     match classify_bare_mul(e, args) {
         BareMul::MatrixProduct => lower_matrix_product(e, id, args),
+        BareMul::InnerProduct => lower_vector_product(e, id, args, VectorProduct::Inner),
+        BareMul::OuterProduct => lower_vector_product(e, id, args, VectorProduct::Outer),
         BareMul::Elementwise => binary(e, id, args, Emitter::mul),
         BareMul::Undefined => {
             let shape = |n: NodeId| match e.type_of(n) {
@@ -332,15 +368,132 @@ pub(crate) fn lower_bare_mul(
                 id,
                 format!(
                     "`*` has no meaning for these operand shapes: {} against {} — §07 \
-                     \"Linear algebra\" defines `*` as the matrix product (a matrix against a \
-                     matrix or a vector), and for vectors only through a transpose. Write `.*` \
-                     for an elementwise product, or `transpose(a) * b` for an inner product \
-                     (which this emitter does not yet lower)",
+                     \"Linear algebra\" gives `mul` the domain \"scalars, matrix-matrix, \
+                     matrix-vector, scalar-matrix, scalar-vector, transposed-vector–vector, \
+                     vector–transposed-vector\", which admits a vector pair only in a mixed \
+                     transposed orientation and no rank-3 operand at all. Write `.*` for an \
+                     elementwise product, `transpose(a) * b` for an inner product, or \
+                     `a * transpose(b)` for an outer product",
                     shape(args[0]),
                     shape(args[1])
                 ),
             ))
         }
+    }
+}
+
+/// Lower §07 "Linear algebra"'s `transpose` / `adjoint`, whose domain is
+/// "vectors, matrices".
+///
+/// A MATRIX swaps its two axes: `stablehlo.transpose … dims = [1, 0]`.
+///
+/// A VECTOR is a no-op at the tensor level, and that is the substantive point.
+/// §07 says "The transpose of a vector is a transposed vector …, not a
+/// single-row matrix", and §03 makes that transposed vector a distinct TYPE — but
+/// it has no distinct tensor form, since `crate::types::mlir_type_of` maps both a
+/// rank-1 `Array` and a `TVector` to `tensor<nxf32>`. So the transposition is
+/// carried entirely by the inferred type, which is where `crate::ops`'s `mul`
+/// dispatch reads orientation from; emitting a `stablehlo.transpose … dims = [0]`
+/// would be a legal identity and pure noise. The operand's `Value` passes
+/// straight through.
+///
+/// This also settles §07's "`transpose` and `adjoint` are self-inverse" for
+/// vectors without a fold: `transpose(transpose(v))` emits nothing either time.
+/// For a matrix the two `stablehlo.transpose` ops ARE both emitted — an
+/// involution left to the consuming compiler to fold rather than pattern-matched
+/// here, since a peephole over `%N = transpose(transpose(x))` would be this
+/// crate's first such rewrite and buys nothing XLA does not already do.
+///
+/// `adjoint` is the CONJUGATE transpose, but this crate has no complex element
+/// type at all — [`crate::mlir::ElemKind`] is Real/Int/Bool only, and
+/// `mlir_type_of` refuses a `Complex` scalar outright — so over the elements this
+/// crate emits the conjugation is the identity, and `adjoint` is exactly
+/// `transpose`. A complex operand cannot reach here today; if a complex element
+/// type is ever added, this arm must grow a conjugation before the permutation.
+///
+/// Rank 3 and above refuses: §07's domain is vectors and matrices, and there is
+/// no canonical permutation for a higher-rank array.
+fn lower_transpose(
+    e: &mut Emitter,
+    id: NodeId,
+    args: &[NodeId],
+    head: &str,
+) -> Result<Value, EmitError> {
+    let [a] = args_exact(id, args)?;
+    let v = e.lower_node(a)?;
+    match &v.ty {
+        // A vector or a transposed vector: the distinction is type-level only.
+        MlirTy::Ranked(d) if d.len() == 1 => Ok(v),
+        MlirTy::Ranked(d) if d.len() == 2 => Ok(e.transpose(&v, &[1, 0])),
+        other => Err(EmitError::at(
+            id,
+            format!(
+                "`{head}` has no lowering for {other:?} — §07 \"Linear algebra\" gives it the \
+                 domain \"vectors, matrices\", so a rank-3 or higher operand has no transpose"
+            ),
+        )),
+    }
+}
+
+/// Which transposed-vector product [`lower_vector_product`] emits.
+#[derive(Clone, Copy)]
+enum VectorProduct {
+    /// `transpose(a) * b` → scalar.
+    Inner,
+    /// `a * transpose(b)` → matrix.
+    Outer,
+}
+
+/// Lower one of §07's two transposed-vector products. Both operands are rank-1
+/// tensors (§03 makes the transposed vector a distinct type, not a distinct
+/// tensor shape), so the ORIENTATION comes from the inferred types
+/// [`classify_bare_mul`] already read — never from the lowered values, which
+/// cannot tell a row from a column.
+///
+/// The inner product's lengths must agree; a mismatch refuses here rather than
+/// reaching [`Emitter::inner_product`]'s panic. `infer`'s `mul_type` already
+/// makes a statically-unequal pair `Type::Failed` ("inner product: vector lengths
+/// disagree"), so the determiniser refuses first — this is the defensive second
+/// line, matching [`lower_matrix_product`]'s own inner-dimension check. The outer
+/// product needs no length agreement at all: `[n] × [m] → [n, m]` for any n, m.
+fn lower_vector_product(
+    e: &mut Emitter,
+    id: NodeId,
+    args: &[NodeId],
+    kind: VectorProduct,
+) -> Result<Value, EmitError> {
+    let [a, b] = args_exact(id, args)?;
+    let a = e.lower_node(a)?;
+    let b = e.lower_node(b)?;
+    let rank1 = |v: &Value| matches!(&v.ty, MlirTy::Ranked(d) if d.len() == 1);
+    if !rank1(&a) || !rank1(&b) {
+        return Err(EmitError::at(
+            id,
+            format!(
+                "transposed-vector product needs two rank-1 operands, got {:?} against {:?}",
+                a.ty, b.ty
+            ),
+        ));
+    }
+    match kind {
+        VectorProduct::Inner => {
+            let (MlirTy::Ranked(da), MlirTy::Ranked(db)) = (&a.ty, &b.ty) else {
+                unreachable!("rank-1 checked above");
+            };
+            if matches!((da[0], db[0]), (Some(m), Some(n)) if m != n) {
+                return Err(EmitError::at(
+                    id,
+                    format!(
+                        "inner product operand lengths disagree: {:?} against {:?} — \
+                         `transpose(a) * b` contracts the two vectors, so they must be the \
+                         same length",
+                        a.ty, b.ty
+                    ),
+                ));
+            }
+            Ok(e.inner_product(&a, &b))
+        }
+        VectorProduct::Outer => Ok(e.outer_product(&a, &b)),
     }
 }
 
@@ -352,7 +505,7 @@ pub(crate) fn lower_bare_mul(
 enum ArithShape {
     Scalar,
     /// A flat axis list, nested element chains flattened as
-    /// [`array_rank`]/`crate::types::mlir_type_of` flatten them. `None` is a
+    /// `crate::types::mlir_type_of` flattens them. `None` is a
     /// dynamic axis, which matches any extent.
     Array(Vec<Option<u32>>),
     /// A transposed (row) vector — §03 keeps it distinct from a rank-1 `Array`,
@@ -504,27 +657,23 @@ pub(crate) fn lower_bare_arith<'m>(
         // is: it rules out `scalar / vector` and `vector / vector` together.
         "divide" if sb.is_array() => refuse(DIVIDE_DOMAIN),
         // Dividend rank 1 or 2 over a scalar divisor is in the amended row; a
-        // higher-rank dividend is not enumerated, so it refuses.
-        "divide" if sa.is_array() && !matches!(&sa, ArithShape::Array(d) if d.len() <= 2) => {
+        // higher-rank dividend is not enumerated, so it refuses. A TRANSPOSED
+        // vector dividend counts as `vector-scalar`: §03 says "The term vector
+        // will represent both non-transposed vectors (one-dimensional arrays) and
+        // transposed vectors in the following, unless noted otherwise", and the
+        // divide row notes no such exception (unlike the `mul` row, which spells
+        // the transposed orientations out precisely because they change the
+        // result). Whitelisting only `Array` here was one case stricter than the
+        // row.
+        "divide"
+            if sa.is_array()
+                && !matches!(&sa, ArithShape::Array(d) | ArithShape::TVector(d) if d.len() <= 2) =>
+        {
             refuse(DIVIDE_DOMAIN)
         }
         "add" | "sub" if sa.differs_from(&sb) => refuse("\"scalars or arrays of same shape\""),
         _ => binary(e, id, args, op),
     }
-}
-
-/// The rank of `id`'s inferred `Array`/`TVector` type, flattening a nested
-/// element chain the way `crate::types::mlir_type_of` does — `None` for a scalar,
-/// an untyped node, or any other type.
-fn array_rank(e: &Emitter, id: NodeId) -> Option<usize> {
-    fn rank(ty: &Type) -> Option<usize> {
-        match ty {
-            Type::Array { shape, elem } => Some(shape.len() + rank(elem).unwrap_or(0)),
-            Type::TVector { elem, .. } => Some(1 + rank(elem).unwrap_or(0)),
-            _ => None,
-        }
-    }
-    rank(e.type_of(id)?)
 }
 
 /// Lower a bare `mul` [`classify_bare_mul`] called a matrix product: matrix·
