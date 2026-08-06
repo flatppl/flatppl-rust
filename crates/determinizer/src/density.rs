@@ -1187,7 +1187,11 @@ fn lower_lawof(
 /// A reification counts as a measure expression, admitted by head as well as type:
 /// `F = functionof(Normal(mu = a, sigma = 1.0))` types as `Kernel`, so a
 /// `Type::Measure`-only test let `lawof(F)` through and emitted the conditional at a
-/// later-pinned `a`. That admission now applies to the unwrapped body as well.
+/// later-pinned `a`. Once a wrapper is unwrapped the admission is decided by the BODY
+/// alone, never by the wrapper's own type: a closed `kernelof(a)` over a VALUE also
+/// types as `Kernel`, and admitting it ran the draw walk on `a`'s own `draw` and
+/// refused. §04 *Kernels and `kernelof`* makes `kernelof(a)` "equivalent to
+/// `functionof(lawof(a))`", the spelling that already lowered, so the two must agree.
 /// [`measure_reaches_draw`] keeps this from over-refusing —
 /// `lawof(functionof(Normal(mu = elementof(reals), …)))` reaches no draw and lowers.
 ///
@@ -1206,13 +1210,21 @@ fn marginalize_or_refuse_stochastic_law(
     // require exactly such a closed measure. So route the reified spelling exactly as
     // the plain one: the conjugate rows below read a bare constructor and the wrapper
     // is not one. A PARAMETERISED reification keeps its own arm.
-    let resolved = crate::kernel::resolve_closed_reification(m, referent).unwrap_or(referent);
+    let (resolved, unwrapped) = match crate::kernel::resolve_closed_reification(m, referent) {
+        Some(body) => (body, true),
+        None => (referent, false),
+    };
     if let Some(product) = marginalize_or_refuse_record_law(m, resolved, v)? {
         return Ok(Some(product));
     }
-    let is_measure_expr = is_measure_expr_type(m, arg)
-        || is_measure_expr_type(m, referent)
-        || is_measure_expr_type(m, resolved)
+    // Once a wrapper is unwrapped its BODY is the construct's value, so the
+    // measure-expression test reads the body alone. Reading the wrapper's own type
+    // instead admitted a closed `kernelof(a)` over a VALUE — it types as `Kernel` —
+    // and then ran `measure_reaches_draw` on `a`'s own `draw`, the one thing this
+    // guard must not do. The head test stays unconditional: an unwrap can stop on a
+    // PARAMETERISED reification, which keeps its own arm below.
+    let is_measure_expr = is_measure_expr_type(m, resolved)
+        || (!unwrapped && is_measure_expr_type(m, arg))
         || matches!(
             builtin_name(m, resolved),
             Some("functionof") | Some("kernelof")
@@ -1257,34 +1269,20 @@ fn marginalize_or_refuse_stochastic_law(
             }
             crate::kernel::Reification::Closed(_) | crate::kernel::Reification::Plain => {}
         }
-        // A `draw` HEAD reached this measure-expression guard one of two ways, and only
-        // the first makes the type claim true. Asserting the wrong one is the
-        // misattribution class this work exists to remove, so split them.
-        if draw_argument(m, resolved).is_some() {
-            // The draw node ITSELF types as `Measure` — a `draw` of a measure expression
-            // (`draw(truncate(lawof(…), S))`) does. It is still a VALUE, so no conjugate
-            // row was ever the blocker: it is that value-versus-measure discrimination.
-            if is_measure_expr_type(m, resolved) {
-                return Err(refuse(
-                    resolved,
-                    m,
-                    "lawof of a draw OF a measure expression is not yet lowerable: this draw \
-                     node carries a MEASURE inferred type, so the measure-expression guard \
-                     admitted a value. The blocker is that value-versus-measure \
-                     discrimination, not a missing conjugate row",
-                ));
-            }
-            // Otherwise the draw is an ordinary value (`Scalar(Real)`) and the guard was
-            // entered on the WRAPPER's `Kernel` type, the unwrap then exposing the draw:
-            // `lawof(kernelof(a))`. Say that instead of claiming a type the node lacks.
+        // A `draw` HEAD that reaches this measure-expression guard carries a MEASURE
+        // inferred type itself — a `draw` of a measure expression
+        // (`draw(truncate(lawof(…), S))`) does. It is still a VALUE, so no conjugate row
+        // was ever the blocker: it is that value-versus-measure discrimination. A draw
+        // whose own type is an ordinary value no longer arrives here, since the
+        // measure-expression test above reads the unwrapped body rather than a wrapper.
+        if draw_argument(m, resolved).is_some() && is_measure_expr_type(m, resolved) {
             return Err(refuse(
                 resolved,
                 m,
-                "lawof of a closed reification OVER A VALUE is not yet lowerable: the \
-                 reification types as a kernel, so the measure-expression guard admitted it, \
-                 but unwrapping reaches this value's own `draw`. §06 identifies a closed \
-                 kernel with a measure, so the spelling is legitimate; routing it needs the \
-                 value-versus-measure discriminator, not a conjugate row",
+                "lawof of a draw OF a measure expression is not yet lowerable: this draw \
+                 node carries a MEASURE inferred type, so the measure-expression guard \
+                 admitted a value. The blocker is that value-versus-measure \
+                 discrimination, not a missing conjugate row",
             ));
         }
         return Err(refuse(
