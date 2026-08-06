@@ -9744,6 +9744,140 @@ outputs = lp
     );
 }
 
+// ---- `require_broadcastable` covers all THREE of its call sites ------------
+//
+// `Emitter::binary`, `Emitter::compare` and `Emitter::select` each reconcile
+// operands through `broadcast_pair`, which panics on a pair with no broadcast
+// form. Guarding only `ops::binary` left `ifelse`/`compare` aborting the process
+// on ordinary surface FlatPPL. These three pin every pairing.
+
+/// `ifelse`'s two BRANCHES must broadcast against each other — a matrix branch
+/// and a vector branch used to abort in `Emitter::select`'s `broadcast_pair`.
+#[test]
+fn emit_logdensity_refuses_ifelse_with_unbroadcastable_branches() {
+    let src = "\
+m = elementof(cartpow(reals, [4, 3]))
+v = elementof(cartpow(reals, 3))
+p = elementof(reals)
+q = elementof(reals)
+z = ifelse(p < q, m, v)
+lp = logdensityof(lawof(record(y = draw(Normal(mu = sum(z), sigma = 1.0)))), record(y = 1.0))
+inputs = (m, v, p, q)
+outputs = lp
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let err = flatppl_stablehlo::emit(
+        &d,
+        flatppl_stablehlo::Mode::LogDensity,
+        &flatppl_stablehlo::EmitOptions::default(),
+    )
+    .unwrap_err();
+    assert!(
+        err.msg.contains("do not broadcast"),
+        "expected a broadcast refusal for the branch pair, got: {}",
+        err.msg
+    );
+}
+
+/// A COMPARE's operands must broadcast — `m < v` with a matrix and a vector used
+/// to abort in `Emitter::compare`'s `broadcast_pair`.
+#[test]
+fn emit_logdensity_refuses_compare_with_unbroadcastable_operands() {
+    let src = "\
+m = elementof(cartpow(reals, [4, 3]))
+v = elementof(cartpow(reals, 3))
+z = ifelse(m < v, 1.0, 2.0)
+lp = logdensityof(lawof(record(y = draw(Normal(mu = sum(z), sigma = 1.0)))), record(y = 1.0))
+inputs = (m, v)
+outputs = lp
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let err = flatppl_stablehlo::emit(
+        &d,
+        flatppl_stablehlo::Mode::LogDensity,
+        &flatppl_stablehlo::EmitOptions::default(),
+    )
+    .unwrap_err();
+    assert!(
+        err.msg.contains("do not broadcast"),
+        "expected a broadcast refusal for the compare operands, got: {}",
+        err.msg
+    );
+}
+
+/// `ifelse`'s PREDICATE must broadcast against its branches. This case never
+/// panicked — `Emitter::select`'s second pass uses `broadcast_scalar`, which
+/// emitted an INVALID `broadcast_in_dim` (a rank-2 operand to a rank-1 result
+/// under `dims = []`) and returned success. A mislowering is worse than the
+/// abort the sibling cases had, so it refuses too.
+#[test]
+fn emit_logdensity_refuses_ifelse_with_a_mismatched_predicate_shape() {
+    let src = "\
+m = elementof(cartpow(reals, [4, 3]))
+n = elementof(cartpow(reals, [4, 3]))
+v1 = elementof(cartpow(reals, 3))
+v2 = elementof(cartpow(reals, 3))
+z = ifelse(v1 < v2, m, n)
+lp = logdensityof(lawof(record(y = draw(Normal(mu = sum(z), sigma = 1.0)))), record(y = 1.0))
+inputs = (m, n, v1, v2)
+outputs = lp
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let err = flatppl_stablehlo::emit(
+        &d,
+        flatppl_stablehlo::Mode::LogDensity,
+        &flatppl_stablehlo::EmitOptions::default(),
+    )
+    .unwrap_err();
+    assert!(
+        err.msg.contains("do not broadcast"),
+        "expected a broadcast refusal for the predicate/branch pair, got: {}",
+        err.msg
+    );
+}
+
+/// The shapes `ifelse` MUST still accept: a scalar predicate against ranked
+/// branches (StableHLO's select takes one), and a ranked predicate against
+/// scalar branches (they broadcast up). Guards against the three refusals above
+/// over-refusing the ordinary image-gate shapes the determiniser emits.
+#[test]
+fn emit_logdensity_ifelse_scalar_and_ranked_predicates_still_lower() {
+    for (label, src) in [
+        (
+            "scalar pred, ranked branches",
+            "\
+m = elementof(cartpow(reals, 3))
+n = elementof(cartpow(reals, 3))
+p = elementof(reals)
+q = elementof(reals)
+z = ifelse(p < q, m, n)
+lp = logdensityof(lawof(record(y = draw(Normal(mu = sum(z), sigma = 1.0)))), record(y = 1.0))
+inputs = (m, n, p, q)
+outputs = lp
+",
+        ),
+        (
+            "ranked pred, scalar branches",
+            "\
+v1 = elementof(cartpow(reals, 3))
+v2 = elementof(cartpow(reals, 3))
+z = ifelse(v1 < v2, 1.0, 2.0)
+lp = logdensityof(lawof(record(y = draw(Normal(mu = sum(z), sigma = 1.0)))), record(y = 1.0))
+inputs = (v1, v2)
+outputs = lp
+",
+        ),
+    ] {
+        let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+        let out = emit_logdensity(&d);
+        assert!(
+            out.contains("stablehlo.select"),
+            "{label} must still lower a select, in:\n{out}"
+        );
+        assert!(is_delimiter_balanced(&out));
+    }
+}
+
 /// The elementwise `.*` spelling over two rank-2 operands stays elementwise —
 /// it must NOT be captured by the matrix-product dispatch (it arrives as
 /// `broadcast(mul, …)`, which never passes through that dispatch).

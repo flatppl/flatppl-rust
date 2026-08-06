@@ -187,10 +187,19 @@ fn binary<'m>(
 }
 
 /// Refuse an operand pair `Emitter::broadcast_pair` would panic on. The
-/// elementwise `Emitter::binary`/`compare`/`select` helpers are infallible and
-/// have no `Result` to carry an [`EmitError`], so the check belongs here at the
-/// one call site that still has one. Without it a pair with no broadcast form
-/// aborts the process instead of refusing.
+/// `Emitter::binary`/`compare`/`select` helpers are infallible and have no
+/// `Result` to carry an [`EmitError`], so the check belongs in their callers here
+/// — and there are THREE, every one of which must call it or a pair with no
+/// broadcast form aborts the process instead of refusing:
+///
+/// - [`binary`] (every arity-2 arithmetic head),
+/// - [`lower_compare`] (`Emitter::compare` reconciles its operands the same way),
+/// - [`lower_ifelse`] (`Emitter::select` broadcasts the branch pair, AND both
+///   branches against the predicate's shape — so it checks two pairings).
+///
+/// An earlier round guarded only [`binary`] while claiming the panic was closed;
+/// `compare` and `select` kept aborting on ordinary surface FlatPPL
+/// (`ifelse(p < q, m, v)` with a matrix and a vector branch).
 ///
 /// Enumerates the pairs `broadcast_pair` HANDLES and refuses everything else,
 /// rather than listing the pairs it panics on: `MlirTy` has four variants, so a
@@ -397,6 +406,17 @@ fn lower_ifelse(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, E
     let c = e.lower_node(c)?;
     let a = e.lower_node(a)?;
     let b = e.lower_node(b)?;
+    // `Emitter::select` broadcasts the two BRANCHES against each other through
+    // `broadcast_pair` (which panics on a pair with no broadcast form), and then
+    // broadcasts both against the first ranked shape among {pred, a, b}. So two
+    // pairings have to hold, and neither is checked by the infallible helper:
+    require_broadcastable(id, &a, &b)?;
+    // The predicate against a branch. A SCALAR pred passes (StableHLO's select
+    // accepts one against ranked operands) and an equal shape passes; a ranked
+    // pred of a different shape would otherwise reach `broadcast_scalar`, which
+    // does not panic but emits an invalid `broadcast_in_dim` (rank-2 operand to a
+    // rank-1 result under `dims = []`) — a mislowering, worse than the abort.
+    require_broadcastable(id, &c, &a)?;
     Ok(e.select(&c, &a, &b))
 }
 
@@ -446,6 +466,9 @@ fn lower_compare(
     let [a, b] = args_exact(id, args)?;
     let a = e.lower_node(a)?;
     let b = e.lower_node(b)?;
+    // `Emitter::compare` reconciles its operands through `broadcast_pair` exactly
+    // as `Emitter::binary` does, and is equally infallible.
+    require_broadcastable(id, &a, &b)?;
     Ok(e.compare(dir, &a, &b))
 }
 
