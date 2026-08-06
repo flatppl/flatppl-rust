@@ -332,21 +332,16 @@ pub(crate) fn call_rule(
 
         // ---- parameters / inputs (spec §04) ----
         "elementof" | "external" => set_element_type(inf, args.first().map(|a| a.0)),
-        // `load_data(source, valueset)` (spec §07): a vector/table of the
-        // declared `valueset`'s element type. The row count is not statically
-        // known (spec §11 "a common source of dynamic row counts"), so the
-        // leading dim is `%dynamic`. `valueset` is the keyword or the second
-        // positional arg (after `source`). A scalar / cartpow / stdsimplex
-        // valueset gives a vector; a cartprod (table) valueset is left deferred.
+        // `load_data(source, valueset)` (spec §07 `load_data`): "`valueset`
+        // fully determines the result's shape" — "A scalar set yields a scalar,
+        // `cartpow` an array, `cartprod` a record, and a power of a record set a
+        // table". So the result is a MEMBER of the declared set, exactly as for
+        // `elementof`/`external`, with no extra row axis: nothing reads the
+        // source to discover a shape. `valueset` is the keyword or the second
+        // positional arg (after `source`).
         "load_data" => {
             let vs = named_or_positional_node(inf.module, named, args, "valueset", 1);
-            match set_element_type(inf, vs) {
-                Type::Deferred => Type::Deferred,
-                elem => Type::Array {
-                    shape: Box::new([Dim::Dynamic]),
-                    elem: Box::new(elem),
-                },
-            }
+            set_element_type(inf, vs)
         }
 
         // ---- measure algebra (spec §06) ----
@@ -1106,6 +1101,30 @@ fn get_type(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo], base: i64) -> Type {
     current
 }
 
+/// A single-axis power of a RECORD set is the set of tables, so its member is
+/// a `Table`, not an array-of-records: spec §07 `load_data` states it directly
+/// ("`cartprod` a record, and a power of a record set a table"), and
+/// `ValueSet::natural_of` already gives `Type::Table { columns, nrows }` and
+/// `cartpow(recordset, n)` the identical value-set. Applied inside
+/// [`set_element_type`]'s `cartpow` arm so every construct declaring the set
+/// (`elementof`, `external`, `load_data`) agrees on the member's type — and so
+/// column access (`data.y`) resolves, which it cannot through an array element.
+/// A multi-axis power of a record set (`cartpow(recordset, [2, 3])`) keeps its
+/// array form: §03 gives no table with two row axes, and folding one axis into
+/// `nrows` would drop the other.
+fn table_of_record_power(shape: Box<[Dim]>, elem: Type) -> Type {
+    match elem {
+        Type::Record(columns) if shape.len() == 1 => Type::Table {
+            columns,
+            nrows: shape[0],
+        },
+        elem => Type::Array {
+            shape,
+            elem: Box::new(elem),
+        },
+    }
+}
+
 /// The element type of a set expression (`elementof` / `external` argument),
 /// read structurally — sets are not first-class in the type grammar.
 fn set_element_type(inf: &mut Inferencer<'_, '_>, node: Option<NodeId>) -> Type {
@@ -1145,10 +1164,7 @@ fn set_element_type(inf: &mut Inferencer<'_, '_>, node: Option<NodeId>) -> Type 
                         Some(size_arg) => {
                             let elem = set_element_type(inf, set_arg);
                             let shape = count_dims(inf, size_arg);
-                            Type::Array {
-                                shape,
-                                elem: Box::new(elem),
-                            }
+                            table_of_record_power(shape, elem)
                         }
                     }
                 }
@@ -3271,14 +3287,11 @@ pub(crate) fn call_valueset(
                 _ => ValueSet::Unknown,
             }
         }
-        // `load_data` is a dynamic-length vector whose entries lie in the
-        // declared `valueset`: `CartPow(valueset, %dynamic)`.
+        // `load_data`'s value lies in the declared `valueset` itself (spec §07:
+        // "`valueset` fully determines the result's shape") — no extra row axis.
         "load_data" => {
             let vs = named_or_positional_node(inf.module, named, args, "valueset", 1);
-            match set_expr_valueset(inf, vs) {
-                ValueSet::Unknown => ValueSet::Unknown,
-                set => ValueSet::CartPow(Box::new(set), Dim::Dynamic),
-            }
+            set_expr_valueset(inf, vs)
         }
         // Measure supports (the measure node's value set IS its support).
         "Lebesgue" | "Counting" => set_expr_valueset(inf, args.first().map(|a| a.0)),

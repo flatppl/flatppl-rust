@@ -1055,35 +1055,71 @@ fn function_result_set_falls_back_for_complex() {
     );
 }
 
-// ---- load_data: dynamic-length vector of the declared valueset (§07) ----
+// ---- load_data: the declared valueset determines the shape (§07) ----
 
-/// `load_data(source, valueset)` is a vector of the declared `valueset`'s
-/// element type with a `%dynamic` length (the row count is not statically
-/// known). The value-set is `cartpow(valueset, %dynamic)`. Keyword and
-/// positional spellings agree; a `cartpow` valueset gives a vector-of-vectors.
+/// §07 `load_data`: "`valueset` fully determines the result's shape" — "A scalar
+/// set yields a scalar, `cartpow` an array, `cartprod` a record, and a power of
+/// a record set a table". So the result is a MEMBER of the declared set and NO
+/// row axis is added: nothing may read the source to discover a shape (§07 for
+/// `anything`: engines "should not do this as an automatic step"). Keyword and
+/// positional spellings agree.
 #[test]
-fn load_data_is_a_dynamic_vector_of_the_valueset() {
+fn load_data_shape_is_the_declared_valueset() {
     let out = ir("w = load_data(source = \"w.csv\", valueset = reals)");
     let w = out.lines().find(|l| l.contains("%bind w")).unwrap_or("");
     assert!(
-        w.contains("(%array 1 (%dynamic) (%scalar real))")
-            && w.contains("(cartpow reals %dynamic)"),
-        "load_data(valueset=reals) should be a dynamic real vector; got:\n{out}"
+        w.contains("(%scalar real)") && w.contains("%fixed reals"),
+        "load_data(valueset=reals) should be a SCALAR real; got:\n{out}"
     );
     // Positional form agrees.
     let out = ir("w = load_data(\"w.csv\", nonnegintegers)");
     let w = out.lines().find(|l| l.contains("%bind w")).unwrap_or("");
     assert!(
-        w.contains("(%array 1 (%dynamic) (%scalar integer))")
-            && w.contains("(cartpow nonnegintegers %dynamic)"),
-        "positional load_data(.., nonnegintegers) should be a dynamic integer vector; got:\n{out}"
+        w.contains("(%scalar integer)") && w.contains("%fixed nonnegintegers"),
+        "positional load_data(.., nonnegintegers) should be a scalar integer; got:\n{out}"
     );
-    // A cartpow valueset → a dynamic vector of fixed-width vectors.
+    // A cartpow valueset → an array of exactly that width.
     let out = ir("w = load_data(source = \"w.csv\", valueset = cartpow(reals, 3))");
     let w = out.lines().find(|l| l.contains("%bind w")).unwrap_or("");
     assert!(
-        w.contains("(%array 1 (%dynamic) (%array 1 (3) (%scalar real)))"),
-        "load_data(valueset=cartpow(reals,3)) should be a dynamic vector of 3-vectors; got:\n{out}"
+        w.contains("(%array 1 (3) (%scalar real))") && w.contains("(cartpow reals 3)"),
+        "load_data(valueset=cartpow(reals,3)) should be a 3-vector; got:\n{out}"
+    );
+    // A record cartprod → a record.
+    let out = ir("w = load_data(\"w.csv\", cartprod(a = reals, b = unitinterval))");
+    let w = out.lines().find(|l| l.contains("%bind w")).unwrap_or("");
+    assert!(
+        w.contains("(%record (a (%scalar real)) (b (%scalar real)))"),
+        "load_data(cartprod record) should be a record; got:\n{out}"
+    );
+}
+
+/// A power of a RECORD set is the set of tables (§07: "a power of a record set a
+/// table"), so its member is a `%table` with that row count — the shape a column
+/// access reads. This holds for every construct declaring the set, not just
+/// `load_data`: `ValueSet::natural_of` already gives a `Table` and
+/// `cartpow(recordset, n)` the identical value-set.
+#[test]
+fn a_power_of_a_record_set_is_a_table() {
+    for src in [
+        "w = load_data(\"w.csv\", cartpow(cartprod(x = reals, y = reals), 4))",
+        "w = elementof(cartpow(cartprod(x = reals, y = reals), 4))",
+        "w = external(cartpow(cartprod(x = reals, y = reals), 4))",
+    ] {
+        let out = ir(src);
+        let w = out.lines().find(|l| l.contains("%bind w")).unwrap_or("");
+        assert!(
+            w.contains("(%table (%columns (x (%scalar real)) (y (%scalar real))) (%nrows 4))")
+                && w.contains("(cartpow (record (x reals) (y reals)) 4)"),
+            "`{src}` should be a 4-row table; got:\n{out}"
+        );
+    }
+    // A column access resolves against the table's columns.
+    let out = ir("w = load_data(\"w.csv\", cartpow(cartprod(x = reals, y = reals), 4))\nc = w.y");
+    let c = out.lines().find(|l| l.contains("%bind c")).unwrap_or("");
+    assert!(
+        c.contains("(%array 1 (4) (%scalar real))") && c.contains("(cartpow reals 4)"),
+        "a scalar column of a 4-row table should read as a 4-vector; got:\n{out}"
     );
 }
 
@@ -1192,14 +1228,16 @@ fn cartprod_record_valueset() {
     );
 }
 
-/// `load_data` over a record cartprod is a dynamic-row table value-set.
+/// `load_data` over a power of a record set carries that table value-set — the
+/// declared set itself, with no extra row axis (§07: "`valueset` fully
+/// determines the result's shape").
 #[test]
 fn load_data_table_valueset() {
-    let out =
-        ir("t = load_data(source = \"d.csv\", valueset = cartprod(a = reals, b = unitinterval))");
+    let out = ir("t = load_data(source = \"d.csv\", \
+                  valueset = cartpow(cartprod(a = reals, b = unitinterval), 7))");
     assert!(
-        out.contains("(cartpow (record (a reals) (b unitinterval)) %dynamic)"),
-        "load_data(cartprod record) should be a dynamic vector of records; got:\n{out}"
+        out.contains("(cartpow (record (a reals) (b unitinterval)) 7)"),
+        "load_data over a 7-row table set should carry that set; got:\n{out}"
     );
 }
 
