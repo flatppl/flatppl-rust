@@ -54,6 +54,16 @@
 //!   input (`external`/`load_data`) — e.g. a literal or a derived/computed
 //!   binding — "`inputs` entry '...' is not an elementof parameter, external,
 //!   or load_data input — only these constructs can be ABI arguments"
+//! - an `inputs` entry that declares no shape (`load_data(source, anything)`)
+//!   — "`inputs` entry '...' declares no shape (`anything`) and cannot be a
+//!   function argument; ..." (spec §07: an engine must not infer the shape
+//!   from the source; §13 `sec:determinization-signature`: `anything`
+//!   "declares none and cannot be promoted")
+//! - a destructured aggregate entry with a column that has no tensor form of
+//!   its own (a nested record/table column) — "`inputs` entry '...' column
+//!   '...' has no tensor form, so the entry cannot be destructured into
+//!   arguments; ..." (names the column, unlike `types.rs`'s generic aggregate
+//!   refusal)
 //! - (`emit_sample_abi`) `outputs` naming other than exactly one output —
 //!   "`outputs` for a sample query must name exactly one output (the sampled
 //!   value)" (`EmitError::whole`)
@@ -62,13 +72,16 @@
 //!   rnginit/external(rngstates) source to thread from"
 //!
 //! (`external`/`load_data` inputs LISTED in `inputs` are supported — they
-//! become function arguments, `load_data` shape-pinned from
-//! [`crate::EmitOptions::input_shapes`], values never baked. The CLI-level
-//! refusal for an unsupported `load_data` file format is a `Failure::Refuse`
-//! in `crates/cli`, not an `EmitError`, so it is not cataloged here.)
+//! become function arguments, `load_data` shaped from its declared `valueset`,
+//! values never baked. An aggregate valueset destructures into one argument per
+//! column, so the `types.rs` aggregate refusal below is reached only by an
+//! aggregate in tensor position, not by a table ABI input.)
 //!
 //! **`ops.rs`** (the deterministic builtin-head map):
 //! - `record(...)` reached in tensor position — "record has no tensor form"
+//! - a destructured `load_data` input used as one monolithic value — "a
+//!   load_data input whose valueset is a table or record has no single tensor
+//!   form; read it column-wise (`data.y`) — one argument per column"
 //! - an unknown builtin head — "unsupported builtin head '...'"
 //! - wrong arity for any arity-checked head (`args_exact`, shared by
 //!   `unary`/`binary`/`ifelse`/`get`/`get0`/`in`/`inf`) — "expected N

@@ -25,6 +25,12 @@
 //! handling: `Emitter::lower_node`'s ordinary `Lit` dispatch turns a fixed
 //! scalar leaf into a `stablehlo.constant` when the query walk reaches it.
 //!
+//! An input with no single tensor form — a `load_data` over a table or record
+//! valueset — is instead destructured into ONE ARGUMENT PER COLUMN
+//! ([`bind_input`]/[`aggregate_columns`]), each pre-bound through
+//! [`Emitter::bind_column`] so a column access resolves to it. The aggregate
+//! node stays unbound, so using the whole table in tensor position refuses.
+//!
 //! **Designating the query.** Nothing in FlatPDL marks a binding as "the"
 //! output; the query is designated *explicitly* by the reserved
 //! `outputs = (…)` binding ([`read_abi`]). The last-public-binding heuristic
@@ -50,13 +56,13 @@
 
 use std::collections::HashSet;
 
-use flatppl_core::{CallHead, Module, Node, NodeId, Phase, Ref, RefNs, Scalar, Symbol};
+use flatppl_core::{CallHead, Module, Node, NodeId, Phase, Ref, RefNs, Scalar, Symbol, Type};
 
 use crate::EmitOptions;
 use crate::emitter::Emitter;
 use crate::mlir::{ElemKind, MlirTy, Value};
 use crate::refuse::EmitError;
-use crate::types::mlir_type_of;
+use crate::types::{mlir_type_of, mlir_type_of_ty};
 
 /// The compilation ABI declared by the reserved `inputs = …` / `outputs = …`
 /// top-level bindings (design doc
@@ -137,9 +143,9 @@ fn tuple_elems(m: &Module, rhs: NodeId) -> Vec<NodeId> {
 ///
 /// Scope: an ABI input is either an `elementof` parameter or a
 /// fixed-phase input construct — `external(S)` (a scalar/shaped runtime arg
-/// typed from `S`) or `load_data(...)` (a `tensor<N×f32>` whose length `N` is
-/// pinned from a compile-time file read, threaded via
-/// [`EmitOptions::input_shapes`]; values are never baked). Any other binding
+/// typed from `S`) or `load_data(source, valueset)` (shaped from `valueset`,
+/// never from reading `source`; values are never baked). [`bind_input`] builds
+/// each entry's argument(s). Any other binding
 /// named in `inputs` (a literal, a computed value) refuses. `inputs` is
 /// authoritative and exhaustive for `elementof`: every `elementof` binding in
 /// `m` must appear in `abi.inputs`, else this refuses naming the missing
@@ -174,8 +180,8 @@ pub(crate) fn emit_logdensity_abi(
     // A fixed-phase input construct (`external`/`load_data`) that survived
     // root-DCE (i.e. an output reaches it) but is NOT declared in `inputs`
     // refuses, pointing at the ABI: fixed data becomes a runtime argument only
-    // by being listed in `inputs`; its values are never baked (design doc
-    // phase→ABI table + "load_data — shape, not values"). A fixed binding no
+    // by being listed in `inputs`; its values are never baked (spec §13
+    // `sec:determinization-signature`'s phase table). A fixed binding no
     // output reaches was already pruned by DCE, so it never gets here — the
     // refusal fires exactly when the value would actually be needed.
     for (_, binding) in m.bindings() {
@@ -200,50 +206,7 @@ pub(crate) fn emit_logdensity_abi(
 
     let mut args: Vec<(String, MlirTy, ElemKind)> = Vec::with_capacity(abi.inputs.len());
     for &sym in &abi.inputs {
-        let bid = m.binding_by_name(sym).ok_or_else(|| {
-            EmitError::whole(format!(
-                "`inputs` names `{}`, which is not a binding of the determinized module",
-                m.resolve(sym)
-            ))
-        })?;
-        let binding = m.binding(bid);
-        // Accept `elementof` (parameterized) and the fixed-phase input
-        // constructs `external`/`load_data`; anything else (a literal, a
-        // computed value) cannot be an ABI argument and refuses. The message
-        // keeps "not an elementof parameter" for the literal/computed case.
-        if !is_free_param(m, binding.rhs) && !is_fixed_input(m, binding.rhs) {
-            return Err(EmitError::at(
-                binding.rhs,
-                format!(
-                    "`inputs` entry `{}` is not an elementof parameter, external, or \
-                     load_data input — only these constructs can be ABI arguments",
-                    m.resolve(sym)
-                ),
-            ));
-        }
-        let name = format!("%arg{}", args.len());
-        let (mut ty, elem) = mlir_type_of(m, binding.rhs, opts.dtype)?;
-        // Shape-pin a fixed-phase input whose FlatPDL type carries a dynamic
-        // dim (`load_data` → `tensor<?×f32>`) from the compile-time length map
-        // (design doc "load_data — shape, not values"): `tensor<N×f32>`. A `?`
-        // dim would be unusable downstream. `elementof`/statically-shaped
-        // inputs need no pin and keep their inferred type.
-        if let Some(shape) = opts.input_shapes.get(m.resolve(sym)) {
-            ty = MlirTy::Ranked(shape.iter().map(|&n| Some(n)).collect());
-        }
-        // Use the inferred element kind (not a hardcoded `Real`): an integer /
-        // boolean `elementof` (or int `load_data`) input must arrive as an
-        // int/bool tensor arg so the value-path widening reconciles correctly.
-        // For a real input this is `ElemKind::Real` — byte-identical to before.
-        e.bind(
-            binding.rhs,
-            Value {
-                ssa: name.clone(),
-                ty: ty.clone(),
-                elem,
-            },
-        );
-        args.push((name, ty, elem));
+        bind_input(m, &mut e, sym, opts, &mut args)?;
     }
 
     let mut rets_vals: Vec<Value> = Vec::with_capacity(abi.outputs.len());
@@ -349,40 +312,13 @@ pub(crate) fn emit_sample_abi(
     // INDEPENDENTLY of the leading `%key` — reproducing the pre-purge
     // `emit_sample` signature exactly (`%key`, `%arg0`, `%arg1`, …) so the
     // frozen sample goldens stay byte-identical: the purge removes the query
-    // heuristic, it does not renumber the emitted arguments.
-    for (nfree, &sym) in abi.inputs.iter().enumerate() {
-        let bid = m.binding_by_name(sym).ok_or_else(|| {
-            EmitError::whole(format!(
-                "`inputs` names `{}`, which is not a binding of the determinized module",
-                m.resolve(sym)
-            ))
-        })?;
-        let binding = m.binding(bid);
-        if !is_free_param(m, binding.rhs) && !is_fixed_input(m, binding.rhs) {
-            return Err(EmitError::at(
-                binding.rhs,
-                format!(
-                    "`inputs` entry `{}` is not an elementof parameter, external, or \
-                     load_data input",
-                    m.resolve(sym)
-                ),
-            ));
-        }
-        let name = format!("%arg{nfree}");
-        let (mut ty, elem) = mlir_type_of(m, binding.rhs, opts.dtype)?;
-        if let Some(shape) = opts.input_shapes.get(m.resolve(sym)) {
-            ty = MlirTy::Ranked(shape.iter().map(|&n| Some(n)).collect());
-        }
-        e.bind(
-            binding.rhs,
-            Value {
-                ssa: name.clone(),
-                ty: ty.clone(),
-                elem,
-            },
-        );
-        args.push((name, ty, elem));
+    // heuristic, it does not renumber the emitted arguments. Built in their own
+    // vector so `%key` does not enter the numbering.
+    let mut abi_args: Vec<(String, MlirTy, ElemKind)> = Vec::with_capacity(abi.inputs.len());
+    for &sym in &abi.inputs {
+        bind_input(m, &mut e, sym, opts, &mut abi_args)?;
     }
+    args.extend(abi_args);
 
     // The declared output is a `(%ref self draws)` node (ABI outputs are refs,
     // unlike the legacy path's binding RHS); resolve it to the underlying
@@ -536,6 +472,144 @@ fn resolve_self_ref(m: &Module, id: NodeId) -> NodeId {
     cur
 }
 
+/// Append the `func.func` argument(s) the `inputs` entry `sym` contributes, in
+/// declared order, and pre-bind each so the query walk resolves to it.
+///
+/// Usually one argument, typed by [`mlir_type_of`]. An entry whose type is an
+/// aggregate with columns — a table or a record, the shapes a
+/// `load_data(source, cartpow(cartprod(…), N))` / `cartprod(…)` valueset
+/// declares (spec §07 `load_data`) — has no monolithic tensor form and becomes
+/// ONE ARGUMENT PER COLUMN in declared column order (see the crate doc's
+/// flattening convention), each bound via [`Emitter::bind_column`] so a column
+/// access (`data.y`) reads its own argument. The aggregate node itself stays
+/// unbound: using the whole table in tensor position still refuses.
+///
+/// Refuses an entry that is neither an `elementof` parameter nor a fixed input
+/// (`external`/`load_data`), a `load_data` over `anything` (§07: engines must
+/// not infer the shape from the source, and §13's signature subsection says
+/// `anything` "declares none and cannot be promoted"), and a column whose own
+/// type has no tensor form (a nested table/record column), naming the column.
+fn bind_input(
+    m: &Module,
+    e: &mut Emitter,
+    sym: Symbol,
+    opts: &EmitOptions,
+    args: &mut Vec<(String, MlirTy, ElemKind)>,
+) -> Result<(), EmitError> {
+    let bid = m.binding_by_name(sym).ok_or_else(|| {
+        EmitError::whole(format!(
+            "`inputs` names `{}`, which is not a binding of the determinized module",
+            m.resolve(sym)
+        ))
+    })?;
+    let rhs = m.binding(bid).rhs;
+    // Accept `elementof` (parameterized) and the fixed-phase input constructs
+    // `external`/`load_data`; anything else (a literal, a computed value) cannot
+    // be an ABI argument and refuses. The message keeps "not an elementof
+    // parameter" for the literal/computed case.
+    if !is_free_param(m, rhs) && !is_fixed_input(m, rhs) {
+        return Err(EmitError::at(
+            rhs,
+            format!(
+                "`inputs` entry `{}` is not an elementof parameter, external, or \
+                 load_data input — only these constructs can be ABI arguments",
+                m.resolve(sym)
+            ),
+        ));
+    }
+
+    if matches!(m.type_of(rhs), Some(Type::Any)) {
+        return Err(EmitError::at(
+            rhs,
+            format!(
+                "`inputs` entry `{}` declares no shape (`anything`) and cannot be a \
+                 function argument; give it the value set it actually holds — an engine \
+                 must not infer the shape from the source",
+                m.resolve(sym)
+            ),
+        ));
+    }
+
+    if let Some(columns) = aggregate_columns(m, rhs) {
+        for (name, column_ty) in columns {
+            let (ty, elem) = mlir_type_of_ty(rhs, &column_ty, opts.dtype).map_err(|_| {
+                EmitError::at(
+                    rhs,
+                    format!(
+                        "`inputs` entry `{}` column `{name}` has no tensor form, so the \
+                         entry cannot be destructured into arguments; a column must be a \
+                         scalar or an array of scalars",
+                        m.resolve(sym)
+                    ),
+                )
+            })?;
+            let ssa = format!("%arg{}", args.len());
+            e.bind_column(
+                rhs,
+                name,
+                Value {
+                    ssa: ssa.clone(),
+                    ty: ty.clone(),
+                    elem,
+                },
+            );
+            args.push((ssa, ty, elem));
+        }
+        return Ok(());
+    }
+
+    let ssa = format!("%arg{}", args.len());
+    // Use the inferred element kind (not a hardcoded `Real`): an integer /
+    // boolean `elementof` (or int `load_data`) input must arrive as an int/bool
+    // tensor arg so the value-path widening reconciles correctly.
+    let (ty, elem) = mlir_type_of(m, rhs, opts.dtype)?;
+    e.bind(
+        rhs,
+        Value {
+            ssa: ssa.clone(),
+            ty: ty.clone(),
+            elem,
+        },
+    );
+    args.push((ssa, ty, elem));
+    Ok(())
+}
+
+/// The columns an aggregate ABI input destructures into, as
+/// `(name, per-argument type)` in declared column order — `None` for a type
+/// with a tensor form of its own (the ordinary one-argument case).
+///
+/// A `Table { columns, nrows }` column stores its PER-ROW element type, so the
+/// argument holding the whole column is that type under one leading `nrows`
+/// axis: a scalar column of a 4-row table is `tensor<4xf32>`, a
+/// `cartpow(reals, 3)` column `tensor<4x3xf32>`. A `Record`'s field is already
+/// the whole value, so it is taken as-is.
+fn aggregate_columns(m: &Module, rhs: NodeId) -> Option<Vec<(String, Type)>> {
+    match m.type_of(rhs)? {
+        Type::Table { columns, nrows } => Some(
+            columns
+                .iter()
+                .map(|(name, column)| {
+                    (
+                        m.resolve(*name).to_string(),
+                        Type::Array {
+                            shape: Box::new([*nrows]),
+                            elem: Box::new(column.clone()),
+                        },
+                    )
+                })
+                .collect(),
+        ),
+        Type::Record(fields) => Some(
+            fields
+                .iter()
+                .map(|(name, field)| (m.resolve(*name).to_string(), field.clone()))
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
 /// A free-parameter declaration: `Phase::Parameterized` (spec §04 "Phase of
 /// an expression") AND structurally a bare `elementof(...)` call. The phase
 /// check alone is not enough — see the module doc comment on why phase is a
@@ -547,9 +621,8 @@ fn is_free_param(m: &Module, rhs: NodeId) -> bool {
 /// A fixed-phase input construct: structurally a bare `external(...)` or
 /// `load_data(...)` call (spec §04 "fixed" phase — set at initialization,
 /// immutable after). Listed in `inputs`, such a binding becomes a runtime
-/// argument (the values are NOT baked; `load_data`'s shape is pinned from a
-/// compile-time file read — design doc "load_data — shape, not values"); NOT
-/// listed, [`emit_logdensity_abi`] refuses. A purely structural check (like
+/// argument (the values are NOT baked; `load_data`'s shape comes from its
+/// declared `valueset`); NOT listed, [`emit_logdensity_abi`] refuses. A purely structural check (like
 /// [`is_free_param`]'s `elementof` test) — the phase taint is not needed to
 /// distinguish these declarations.
 fn is_fixed_input(m: &Module, rhs: NodeId) -> bool {

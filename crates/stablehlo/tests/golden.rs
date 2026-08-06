@@ -9317,30 +9317,17 @@ fn inputs_outputs_bindings_parse_and_infer_without_error() {
     assert!(diags.is_empty(), "infer diagnostics: {diags:?}");
 }
 
-// ---- PR-2: fixed-phase inputs (`external`, `load_data`) as runtime args -----
+// ---- Fixed-phase inputs (`external`, `load_data`) as runtime args -----------
 //
 // A fixed-phase binding (`external(S)` / `load_data(...)`) listed in `inputs`
-// becomes a `func.func` argument instead of refusing (PR-1) — extending the
-// SAME ABI arg path PR-1 built for `elementof`. `external(S)` types from `S`
-// (scalar first); `load_data(...)` types `tensor<N×f32>` with `N` pinned from
-// the compile-time file read threaded via `EmitOptions::input_shapes` (design
-// doc "load_data — shape, not values": only the shape is pinned, the values are
-// the runtime argument, never baked). A fixed-phase binding NOT in `inputs`
-// still refuses, pointing at the ABI.
-
-/// Emit `@logdensity` with a compile-time shape-pin map (the CLI's
-/// [`EmitOptions::input_shapes`], populated from a `load_data` file read).
-fn emit_logdensity_with_shapes(m: &Module, shapes: &[(&str, Vec<u64>)]) -> String {
-    let opts = flatppl_stablehlo::EmitOptions {
-        input_shapes: shapes
-            .iter()
-            .map(|(name, dims)| (name.to_string(), dims.clone()))
-            .collect(),
-        ..Default::default()
-    };
-    flatppl_stablehlo::emit(m, flatppl_stablehlo::Mode::LogDensity, &opts)
-        .expect("must emit @logdensity")
-}
+// becomes a `func.func` argument instead of refusing — the SAME ABI arg path
+// `elementof` uses. `external(S)` types from `S` (scalar first);
+// `load_data(source, valueset)` types from its declared `valueset` and never
+// reads `source` (spec §07 `load_data`: "`valueset` fully determines the
+// result's shape"; §13 `sec:determinization-signature`: "function argument
+// (shape from its `valueset`, contents at runtime)"). An aggregate valueset
+// destructures into one argument per column. A fixed-phase binding NOT in
+// `inputs` still refuses, pointing at the ABI.
 
 /// Step 2 (external, scalar): a scalar `external(reals)` listed in `inputs`
 /// becomes a scalar `func.func` argument (`tensor<f32>`), NOT a PR-1 refusal.
@@ -9368,14 +9355,47 @@ outputs = q1
     assert!(is_delimiter_balanced(&out));
 }
 
-/// Step 3 (load_data): a `load_data(...)` binding listed in `inputs` emits a
-/// ranked-tensor argument whose length is the compile-time-pinned `N`
-/// (`tensor<3×f32>` here) — NOT a `tensor<?×f32>` (unusable downstream), NOT a
-/// refusal, and NOT a baked `stablehlo.constant` (its values are the runtime
-/// argument). `y` is a declared-but-unused input (a stable ABI arg is not
-/// DCE'd), isolating the shape-pin from any density-over-vector lowering.
+/// Step 3 (load_data): a `load_data(source, cartpow(reals, N))` binding listed
+/// in `inputs` emits `tensor<N×f32>` from its DECLARED valueset — NOT a
+/// `tensor<?×f32>`, NOT a refusal, and NOT a baked `stablehlo.constant` (its
+/// values are the runtime argument). `y` is a declared-but-unused input (a
+/// stable ABI arg is not DCE'd), isolating the argument's typing from any
+/// density-over-vector lowering.
 #[test]
-fn emit_logdensity_abi_load_data_pinned_tensor_arg() {
+fn emit_logdensity_abi_load_data_arg_shaped_from_valueset() {
+    let src = "\
+a = elementof(reals)
+y = load_data(\"data.csv\", cartpow(reals, 3))
+m = lawof(record(a = draw(Normal(mu = 0.0, sigma = 1.0))))
+q1 = logdensityof(m, record(a = a))
+inputs = (a, y)
+outputs = q1
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let out = emit_logdensity(&d);
+    assert!(
+        out.contains(
+            "func.func @logdensity(%arg0: tensor<f32>, %arg1: tensor<3xf32>) -> tensor<f32>"
+        ),
+        "load_data `y` must become `%arg1: tensor<3xf32>` from its valueset, in:\n{out}"
+    );
+    assert!(
+        !out.contains("tensor<?x"),
+        "a valueset-shaped load_data arg must not carry a dynamic `?` dim, in:\n{out}"
+    );
+    // Values are the runtime argument, never inlined: no data constant for `y`.
+    assert!(
+        !out.contains("dense<[") && !out.contains("data.csv"),
+        "load_data values must not be baked as a constant, in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// A SCALAR valueset yields a scalar argument (spec §07 `load_data`: "A scalar
+/// set yields a scalar") — the spelling that read the source's row count before
+/// this rule was corrected, so it locks the direction of the fix.
+#[test]
+fn emit_logdensity_abi_load_data_scalar_valueset_is_a_scalar_arg() {
     let src = "\
 a = elementof(reals)
 y = load_data(\"data.csv\", reals)
@@ -9385,23 +9405,186 @@ inputs = (a, y)
 outputs = q1
 ";
     let d = determinize_abi_roots(src, &["inputs", "outputs"]);
-    let out = emit_logdensity_with_shapes(&d, &[("y", vec![3])]);
+    let out = emit_logdensity(&d);
     assert!(
         out.contains(
-            "func.func @logdensity(%arg0: tensor<f32>, %arg1: tensor<3xf32>) -> tensor<f32>"
+            "func.func @logdensity(%arg0: tensor<f32>, %arg1: tensor<f32>) -> tensor<f32>"
         ),
-        "load_data `y` must become a shape-pinned `%arg1: tensor<3xf32>`, in:\n{out}"
+        "`load_data(_, reals)` must be a SCALAR arg, in:\n{out}"
     );
+}
+
+/// `load_data(source, anything)` cannot be promoted to an argument (§07: engines
+/// "should not do this as an automatic step" — infer the shape from the source;
+/// §13 `sec:determinization-signature`: "`anything` declares none and cannot be
+/// promoted"). Refuses naming the entry, rather than emitting an untyped arg.
+#[test]
+fn emit_logdensity_abi_refuses_load_data_over_anything() {
+    let src = "\
+a = elementof(reals)
+y = load_data(\"data.csv\", anything)
+m = lawof(record(a = draw(Normal(mu = 0.0, sigma = 1.0))))
+q1 = logdensityof(m, record(a = a))
+inputs = (a, y)
+outputs = q1
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let err = flatppl_stablehlo::emit(
+        &d,
+        flatppl_stablehlo::Mode::LogDensity,
+        &flatppl_stablehlo::EmitOptions::default(),
+    )
+    .unwrap_err();
     assert!(
-        !out.contains("tensor<?x"),
-        "the pinned load_data arg must not carry a dynamic `?` dim, in:\n{out}"
+        err.msg.contains("declares no shape") && err.msg.contains('y'),
+        "expected an `anything`-cannot-be-promoted refusal naming `y`, got: {}",
+        err.msg
     );
-    // Values are the runtime argument, never inlined: no data constant for `y`.
+}
+
+/// A TABLE valueset (`cartpow(cartprod(x = …, y = …), N)`) destructures into one
+/// argument per column, in declared column order, each `tensor<N×f32>` — one
+/// `inputs` entry, two arguments (the crate doc's flattening convention). The
+/// likelihood variate `data.y` reads the SECOND column's argument, so the
+/// emitted body is the two-separate-files emission with the arguments renamed:
+/// `%arg3` (x column) is unused here, `%arg4` (y column) enters the density.
+#[test]
+fn emit_logdensity_abi_load_data_table_destructures_into_column_args() {
+    let src = "\
+alpha = elementof(reals)
+beta = elementof(reals)
+sigma = elementof(posreals)
+data = load_data(\"data.csv\", cartpow(cartprod(x = reals, y = reals), 4))
+means = alpha .+ beta .* data.x
+y ~ Normal.(means, sigma)
+k = kernelof(record(y = y), alpha = alpha, beta = beta, sigma = sigma)
+L = likelihoodof(k, record(y = data.y))
+lp = logdensityof(L, record(alpha = alpha, beta = beta, sigma = sigma))
+inputs = (alpha, beta, sigma, data)
+outputs = (lp)
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let out = emit_logdensity(&d);
     assert!(
-        !out.contains("dense<[") && !out.contains("data.csv"),
-        "load_data values must not be baked as a constant, in:\n{out}"
+        out.contains(
+            "func.func @logdensity(%arg0: tensor<f32>, %arg1: tensor<f32>, \
+             %arg2: tensor<f32>, %arg3: tensor<4xf32>, %arg4: tensor<4xf32>) -> tensor<f32>"
+        ),
+        "the table entry `data` must destructure into `%arg3` (x) and `%arg4` (y), in:\n{out}"
+    );
+    // The x column feeds the mean and the y column the variate — each column
+    // argument reaches the op the model's column access named.
+    assert!(
+        out.contains("stablehlo.multiply %0, %arg3 : tensor<4xf32>")
+            && out.contains("stablehlo.subtract %arg4, "),
+        "x → the mean, y → the variate residual, in:\n{out}"
     );
     assert!(is_delimiter_balanced(&out));
+}
+
+/// A table column that is itself an array shapes as `tensor<N×k×f32>` — the row
+/// count is the leading axis and the column's own `cartpow(reals, k)` follows.
+#[test]
+fn emit_logdensity_abi_load_data_array_column_is_rank_two() {
+    let src = "\
+alpha = elementof(reals)
+sigma = elementof(posreals)
+data = load_data(\"data.csv\", cartpow(cartprod(x = cartpow(reals, 3), y = reals), 4))
+y ~ Normal.(alpha, sigma)
+k = kernelof(record(y = y), alpha = alpha, sigma = sigma)
+L = likelihoodof(k, record(y = data.y))
+lp = logdensityof(L, record(alpha = alpha, sigma = sigma))
+inputs = (alpha, sigma, data)
+outputs = (lp)
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let out = emit_logdensity(&d);
+    assert!(
+        out.contains(
+            "func.func @logdensity(%arg0: tensor<f32>, %arg1: tensor<f32>, \
+             %arg2: tensor<4x3xf32>, %arg3: tensor<4xf32>) -> tensor<f32>"
+        ),
+        "a `cartpow(reals, 3)` column of a 4-row table must be `tensor<4x3xf32>`, in:\n{out}"
+    );
+}
+
+/// A RECORD valueset (`cartprod(...)`, no power) destructures the same way, one
+/// argument per field (§07: "`cartprod` a record") — a record of scalars gives
+/// scalar arguments, not a row axis.
+#[test]
+fn emit_logdensity_abi_load_data_record_destructures_into_field_args() {
+    let src = "\
+a = elementof(reals)
+pars = load_data(\"p.csv\", cartprod(mu = reals, tau = posreals))
+m = lawof(record(a = draw(Normal(mu = pars.mu, sigma = pars.tau))))
+q1 = logdensityof(m, record(a = a))
+inputs = (a, pars)
+outputs = q1
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let out = emit_logdensity(&d);
+    assert!(
+        out.contains(
+            "func.func @logdensity(%arg0: tensor<f32>, %arg1: tensor<f32>, \
+             %arg2: tensor<f32>) -> tensor<f32>"
+        ),
+        "the record entry `pars` must destructure into `mu`/`tau` args, in:\n{out}"
+    );
+}
+
+/// A column with no tensor form of its own (a nested record column) refuses
+/// NAMING THE COLUMN rather than reporting the generic aggregate refusal for the
+/// whole entry — destructuring one level does not make a nested aggregate
+/// lowerable.
+#[test]
+fn emit_logdensity_abi_refuses_nested_aggregate_column() {
+    let src = "\
+a = elementof(reals)
+data = load_data(\"d.csv\", cartpow(cartprod(x = reals, inner = cartprod(p = reals, q = reals)), 4))
+m = lawof(record(a = draw(Normal(mu = 0.0, sigma = 1.0))))
+q1 = logdensityof(m, record(a = a))
+inputs = (a, data)
+outputs = q1
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let err = flatppl_stablehlo::emit(
+        &d,
+        flatppl_stablehlo::Mode::LogDensity,
+        &flatppl_stablehlo::EmitOptions::default(),
+    )
+    .unwrap_err();
+    assert!(
+        err.msg.contains("column `inner` has no tensor form"),
+        "expected a refusal naming the nested column `inner`, got: {}",
+        err.msg
+    );
+}
+
+/// A destructured table used as ONE value (here `sum(data)`) refuses: the
+/// per-column arguments supply no monolithic tensor, and the message says to
+/// read it column-wise instead of reporting an unsupported head.
+#[test]
+fn emit_logdensity_abi_refuses_whole_table_in_tensor_position() {
+    let src = "\
+alpha = elementof(reals)
+data = load_data(\"d.csv\", cartpow(cartprod(x = reals, y = reals), 4))
+lp = logdensityof(lawof(record(y = draw(Normal(mu = alpha, sigma = 1.0)))), \
+record(y = sum(data)))
+inputs = (alpha, data)
+outputs = (lp)
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let err = flatppl_stablehlo::emit(
+        &d,
+        flatppl_stablehlo::Mode::LogDensity,
+        &flatppl_stablehlo::EmitOptions::default(),
+    )
+    .unwrap_err();
+    assert!(
+        err.msg.contains("read it column-wise"),
+        "expected a column-wise-access refusal, got: {}",
+        err.msg
+    );
 }
 
 /// Step 4 (refuse when not in `inputs`): a fixed-phase binding that an output

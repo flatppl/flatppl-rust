@@ -83,33 +83,66 @@ fn stablehlo_abi_model_emits_ordered_signature_with_no_warning() {
     );
 }
 
-/// PR-2: a `load_data(...)` binding listed in `inputs` becomes a shape-pinned
-/// tensor argument end-to-end through the real CLI binary — `stablehlo_cmd`
-/// reads the resolved data file for its LENGTH only (here `data.csv` has 4 data
-/// rows) and types the argument `tensor<4xf32>`, NOT `tensor<?xf32>` and NOT a
-/// baked constant (design doc "load_data — shape, not values"). Both the model
-/// and its `data.csv` are written to the same dir so the relative source
-/// resolves.
+/// A `load_data` ABI input is shaped from its declared `valueset` end-to-end
+/// through the real CLI binary, and THE SOURCE FILE NEED NOT EXIST: nothing in
+/// the pipeline opens it (spec §07 `load_data`: "`valueset` fully determines the
+/// result's shape"; §13 `sec:determinization-signature`: "function argument
+/// (shape from its `valueset`, contents at runtime)"). `data.csv` is
+/// deliberately never written — the compile-time row-count read this replaces
+/// would have failed here.
 #[test]
-fn stablehlo_abi_load_data_pins_tensor_arg_from_file_length() {
-    let dir = std::env::temp_dir().join(format!(
-        "flatppl-stablehlo-cli-load-data-{}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    // Header row + 4 data rows → a length-4 vector.
-    std::fs::write(dir.join("data.csv"), "y\n1.0\n2.0\n3.0\n4.0\n").unwrap();
-    let input = dir.join("m.flatppl");
-    std::fs::write(
-        &input,
+fn stablehlo_abi_load_data_shape_comes_from_valueset_without_reading_the_source() {
+    let input = write_model(
+        "abi-load-data-valueset",
         "a = elementof(reals)\n\
-         y = load_data(\"data.csv\", reals)\n\
+         y = load_data(\"data.csv\", cartpow(reals, 4))\n\
          m = lawof(record(a = draw(Normal(mu = 0.0, sigma = 1.0))))\n\
          q1 = logdensityof(m, record(a = a))\n\
          inputs = (a, y)\n\
          outputs = q1\n",
-    )
-    .unwrap();
+    );
+    assert!(
+        !input.with_file_name("data.csv").exists(),
+        "the test's premise is that the source is absent"
+    );
+    let out = flatppl().arg("stablehlo").arg(&input).output().unwrap();
+    assert!(
+        out.status.success(),
+        "emission must not depend on the source file; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(
+            "func.func @logdensity(%arg0: tensor<f32>, %arg1: tensor<4xf32>) -> tensor<f32>"
+        ),
+        "expected `y` typed `tensor<4xf32>` from `cartpow(reals, 4)`:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("tensor<?x"),
+        "a valueset-shaped load_data arg must not carry a dynamic `?` dim:\n{stdout}"
+    );
+}
+
+/// One CSV holding several columns: a table-valueset `load_data` input becomes
+/// one argument per column in declared order, end-to-end through the CLI. `data`
+/// is a single `inputs` entry and contributes `%arg3` (x) and `%arg4` (y).
+#[test]
+fn stablehlo_abi_load_data_table_destructures_into_column_args() {
+    let input = write_model(
+        "abi-load-data-table",
+        "alpha = elementof(reals)\n\
+         beta = elementof(reals)\n\
+         sigma = elementof(posreals)\n\
+         data = load_data(\"data.csv\", cartpow(cartprod(x = reals, y = reals), 4))\n\
+         means = alpha .+ beta .* data.x\n\
+         y ~ Normal.(means, sigma)\n\
+         k = kernelof(record(y = y), alpha = alpha, beta = beta, sigma = sigma)\n\
+         L = likelihoodof(k, record(y = data.y))\n\
+         lp = logdensityof(L, record(alpha = alpha, beta = beta, sigma = sigma))\n\
+         inputs = (alpha, beta, sigma, data)\n\
+         outputs = (lp)\n",
+    );
     let out = flatppl().arg("stablehlo").arg(&input).output().unwrap();
     assert!(
         out.status.success(),
@@ -119,51 +152,10 @@ fn stablehlo_abi_load_data_pins_tensor_arg_from_file_length() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains(
-            "func.func @logdensity(%arg0: tensor<f32>, %arg1: tensor<4xf32>) -> tensor<f32>"
+            "func.func @logdensity(%arg0: tensor<f32>, %arg1: tensor<f32>, \
+             %arg2: tensor<f32>, %arg3: tensor<4xf32>, %arg4: tensor<4xf32>) -> tensor<f32>"
         ),
-        "expected `y` pinned to `%arg1: tensor<4xf32>` from the file length:\n{stdout}"
-    );
-    assert!(
-        !stdout.contains("tensor<?x"),
-        "the pinned load_data arg must not carry a dynamic `?` dim:\n{stdout}"
-    );
-}
-
-/// PR-2 review follow-up (refuse, don't mis-lower): the `load_data` shape pin
-/// dispatches by file format and REFUSES an unsupported one rather than blindly
-/// line-counting it (which would silently mis-shape the arg). A `.json`
-/// `load_data` ABI input therefore exits 3 with a format message, not a bogus
-/// `tensor<N×f32>`. (`.csv` / `.wsv` are the supported delimited-text formats.)
-#[test]
-fn stablehlo_abi_load_data_refuses_unsupported_format() {
-    let dir = std::env::temp_dir().join(format!(
-        "flatppl-stablehlo-cli-load-data-json-{}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("data.json"), "[1.0, 2.0, 3.0]\n").unwrap();
-    let input = dir.join("m.flatppl");
-    std::fs::write(
-        &input,
-        "a = elementof(reals)\n\
-         y = load_data(\"data.json\", reals)\n\
-         m = lawof(record(a = draw(Normal(mu = 0.0, sigma = 1.0))))\n\
-         q1 = logdensityof(m, record(a = a))\n\
-         inputs = (a, y)\n\
-         outputs = q1\n",
-    )
-    .unwrap();
-    let out = flatppl().arg("stablehlo").arg(&input).output().unwrap();
-    assert_eq!(
-        out.status.code(),
-        Some(3),
-        "a .json load_data shape pin must refuse (exit 3); stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("unsupported format") && stderr.contains(".json"),
-        "expected an unsupported-format refusal naming .json, got: {stderr}"
+        "expected `data` destructured into two column args:\n{stdout}"
     );
 }
 

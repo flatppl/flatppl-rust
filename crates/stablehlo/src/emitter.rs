@@ -110,6 +110,13 @@ pub struct Emitter<'m> {
     /// then broadcast over that batch via [`Emitter::binary`]'s auto-broadcast.
     /// `None` (the scalar case) leaves every draw sized exactly as before.
     batch_shape: Option<Vec<u64>>,
+    /// The per-column `func.func` arguments an aggregate ABI input was
+    /// destructured into, keyed by the aggregate's own [`NodeId`] and the
+    /// column/field name (see `crate::modes`'s destructuring and the crate doc).
+    /// A table/record has no monolithic tensor form, so the aggregate node is
+    /// never bound in `memo`; a column access reaching it resolves here instead
+    /// ([`Emitter::column_arg`]).
+    columns: HashMap<(NodeId, String), Value>,
 }
 
 impl<'m> Emitter<'m> {
@@ -123,6 +130,7 @@ impl<'m> Emitter<'m> {
             cur_key: None,
             sample_keys: HashMap::new(),
             batch_shape: None,
+            columns: HashMap::new(),
         }
     }
 
@@ -2183,6 +2191,34 @@ impl<'m> Emitter<'m> {
     /// table/record literal, the selector is not a field name, or no field
     /// matches (the caller then tries [`Emitter::tuple_projection`], else the
     /// ordinary tensor `get`).
+    /// Record `value` as the `func.func` argument holding column/field `name`
+    /// of the aggregate ABI input `container` (`crate::modes`'s destructuring).
+    pub(crate) fn bind_column(&mut self, container: NodeId, name: String, value: Value) {
+        self.columns.insert((container, name), value);
+    }
+
+    /// If `args` is `get`/`get0`'s `[container, selector]` pair and `container`
+    /// resolves (one `(%ref self x)` hop) to an aggregate ABI input that was
+    /// destructured into per-column arguments, return the [`Value`] of the
+    /// column the `selector` names — so `data.y` reads its own `%argN` rather
+    /// than trying to index a table that has no tensor form. `None` for every
+    /// other container/selector, including a column name the destructuring did
+    /// not produce (the caller then falls through to the ordinary `get` path,
+    /// which refuses).
+    fn column_arg(&self, args: &[NodeId]) -> Option<Value> {
+        if self.columns.is_empty() {
+            return None;
+        }
+        let [container, selector] = <[NodeId; 2]>::try_from(args).ok()?;
+        let resolved = self.resolve_ref_one(container);
+        let field = match self.m.node(selector) {
+            Node::Lit(Scalar::Str(s)) => s.as_ref(),
+            Node::Const(sym) => self.m.resolve(*sym),
+            _ => return None,
+        };
+        self.columns.get(&(resolved, field.to_string())).cloned()
+    }
+
     fn named_field_projection(&self, args: &[NodeId]) -> Option<NodeId> {
         let [container, selector] = <[NodeId; 2]>::try_from(args).ok()?;
         let resolved = self.resolve_ref_one(container);
@@ -2644,6 +2680,11 @@ impl<'m> Emitter<'m> {
                         // ordinary case) falls through to `ops::lower_builtin`'s
                         // generic rank-1-tensor `get`/`get0`.
                         let base = if name == "get0" { 0 } else { 1 };
+                        // A column of a destructured aggregate ABI input reads
+                        // that column's own argument (`Emitter::column_arg`).
+                        if let Some(column) = self.column_arg(&call.args) {
+                            return Ok(column);
+                        }
                         if let Some(field) = self.named_field_projection(&call.args) {
                             return self.lower_node(field);
                         }

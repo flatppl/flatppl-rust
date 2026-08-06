@@ -129,6 +129,15 @@ pub(crate) fn lower_builtin(
         // builder (a record-typed model input's fields become separate
         // tensor args), never reached here in a well-formed lowering.
         "record" => Err(EmitError::at(id, "record has no tensor form")),
+        // A `load_data` listed in `inputs` is pre-bound to its argument by the
+        // mode builder and never lowered. Reaching here means it is used as one
+        // monolithic value while its valueset is an aggregate, which the
+        // per-column destructuring cannot supply.
+        "load_data" => Err(EmitError::at(
+            id,
+            "a load_data input whose valueset is a table or record has no single \
+             tensor form; read it column-wise (`data.y`) — one argument per column",
+        )),
         other => Err(EmitError::at(
             id,
             format!("unsupported builtin head '{other}'"),
