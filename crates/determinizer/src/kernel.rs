@@ -155,7 +155,10 @@ pub(crate) enum Reification {
 ///   with an empty first argument. So in FlatPPL, we unify measures and kernels and
 ///   identify measures with nullary kernels." The same section blesses scoring it —
 ///   `logdensityof` and friends "require closed measures (i.e. nullary kernels) as
-///   inputs". That is an identity, so the `lawof` routing rests on it.
+///   inputs". That identity is what lets a caller route the wrapper as its body. It
+///   says nothing about `lawof`'s own argument class, which §04 states separately
+///   ("`lawof` reifies a value node"), so no caller may read it as licensing a
+///   `lawof` over a measure.
 /// - A closed reification of a FUNCTION has no such identity. There §04's
 ///   prohibition carries it, by its rationale clause: "No callables may have
 ///   nullary inputs, as this would make them equivalent to known values." Read

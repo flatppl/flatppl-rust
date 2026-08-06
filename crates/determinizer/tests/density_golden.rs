@@ -2383,33 +2383,69 @@ fn a_closed_reification_whose_body_holds_a_free_placeholder_is_not_unwrapped() {
     }
 }
 
-// `lawof(kernelof(a))` reaches the same guard by a different route: the WRAPPER is
-// `Kernel`-typed, so the measure-expression test admits it, and the unwrap then exposes
-// `a`'s own `draw` — which is `Scalar(Real)`, NOT `Measure`. The refusal used to assert
-// "this draw node carries a MEASURE inferred type", false for this shape. Each route now
-// states only what is true of it.
+// §04 "Kernels and `kernelof`": "`kernelof(x, kwargs...)` is equivalent to
+// `functionof(lawof(x), kwargs...)`". So `M = kernelof(a)` and `M = functionof(lawof(a))`
+// are one expression in two spellings, and `logdensityof(lawof(M), 0.5)` is one request
+// either way. The `functionof(lawof(a))` spelling lowered while `kernelof(a)` refused:
+// both wrappers are `Kernel`-typed, but only the `kernelof` one made the
+// measure-expression guard admit the WRAPPER and then run the draw walk on `a`'s own
+// `draw` — a VALUE. The guard now reads the unwrapped body, so the spellings agree.
 //
-// The refusal itself is a known spelling split left open on purpose:
-// `logdensityof(kernelof(a), 0.5)` lowers while this refuses, though §06 identifies a
-// closed kernel with the measure. Closing it needs the value-versus-measure discriminator.
+// Pinned BYTE-IDENTICAL (same binding name in each) rather than merely both-lowering:
+// anything less lets the §04 equivalence drift apart again. The scored value is
+// `logpdf(Normal(0, 1), 0.5) = -1.0439385332046727` (Distributions.jl) — `a`'s own law,
+// since §04 "Phase of the reified law" has the reification absorb `a`'s stochasticity,
+// leaving nothing to marginalize.
+//
+// Whether `lawof` may take a MEASURE at all is a separate, open §04 question (`lawof`
+// "reifies a value node"): the outer `lawof` here is the same in both spellings, so any
+// ruling on it moves them together.
 #[test]
-fn lawof_of_a_closed_reification_over_a_value_refuses_without_claiming_a_measure_type() {
-    let src = "\
+fn lawof_of_a_closed_kernelof_lowers_identically_to_its_section_04_equivalent() {
+    let mut emitted: Vec<String> = Vec::new();
+    for reifier in ["kernelof(a)", "functionof(lawof(a))"] {
+        let src = format!(
+            "\
 a = draw(Normal(mu = 0.0, sigma = 1.0))
-K = kernelof(a)
-lp = logdensityof(lawof(K), 0.5)";
-    let mut m = flatppl_syntax::parse(src).unwrap();
-    let _ = flatppl_infer::infer(&mut m);
-    let err = determinize(&m).expect_err("the value-versus-measure split still refuses");
-    assert!(
-        err.reason.contains("OVER A VALUE"),
-        "must name the value the reification wraps: {}",
-        err.reason
+M = {reifier}
+lp = logdensityof(lawof(M), 0.5)"
+        );
+        let pir = flatppl_flatpir::write(&determinize_src(&src));
+        assert!(
+            !pir.contains("1.4142135623730951"),
+            "nothing is marginalized here, so no widened sigma:\n{pir}"
+        );
+        emitted.push(pir);
+    }
+    assert_eq!(
+        emitted[0], emitted[1],
+        "§04 makes `kernelof(a)` and `functionof(lawof(a))` one expression; \
+         their laws must lower identically:\nkernelof:\n{}\nfunctionof(lawof):\n{}",
+        emitted[0], emitted[1]
+    );
+
+    // And scoring the closed kernel WITHOUT the outer `lawof` — legal on its own terms,
+    // since §06 "Uniform kernel extension" identifies a closed kernel with its measure
+    // and `logdensityof` "require[s] closed measures (i.e. nullary kernels) as inputs" —
+    // reaches the same term. This is the pair the split was measured on.
+    let direct = flatppl_flatpir::write(&determinize_src(
+        "\
+a = draw(Normal(mu = 0.0, sigma = 1.0))
+M = kernelof(a)
+lp = logdensityof(M, 0.5)",
+    ));
+    assert_eq!(
+        direct, emitted[0],
+        "`logdensityof(kernelof(a), v)` and `logdensityof(lawof(kernelof(a)), v)` are one \
+         request:\ndirect:\n{direct}\nvia lawof:\n{}",
+        emitted[0]
     );
     assert!(
-        !err.reason.contains("MEASURE inferred type"),
-        "must NOT claim a measure type this draw node does not have: {}",
-        err.reason
+        direct.contains("builtin_logdensityof Normal")
+            && direct.contains("(%field mu 0.0)")
+            && direct.contains("(%field sigma 1.0)"),
+        "the scored term must be `a`'s own Normal(0, 1) density at 0.5 \
+         (-1.0439385332046727, Distributions.jl):\n{direct}"
     );
 }
 
