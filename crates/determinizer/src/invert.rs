@@ -2149,8 +2149,11 @@ pub(crate) fn derive_locscale(
         // with the variate of `m`", so any CONFIRMED non-scalar `shift` or `scale` is
         // variate-incompatible here — refuse. `type_is_matrix` alone let a VECTOR through,
         // and the emitted `divide(y − shift, scale)` then had a vector DIVISOR, outside
-        // §07 `divide`'s "scalars, vector-scalar, matrix-scalar" domain, with a vector
-        // `log|scale|` for a log-volume that has to be a scalar.
+        // §07 `divide`'s "scalars, array-scalar, transposed-vector–scalar (real or complex)"
+        // domain (flatppl-design#77, pending owner review), with a vector `log|scale|` for a
+        // log-volume that has to be a scalar. #77 widens the DIVIDEND to any rank and leaves
+        // the divisor scalar in every form, so it does not rescue this site — the narrower
+        // #75 row it supersedes refused it for the same reason.
         for (name, arg) in [("shift", shift), ("scale", scale)] {
             if let Some(kind) = crate::density::confirmed_non_scalar(m, arg) {
                 return Err(refuse(

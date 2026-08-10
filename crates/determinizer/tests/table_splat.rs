@@ -20,15 +20,20 @@
 //! callee here is always a user `functionof`/`kernelof` reification, which has no documented
 //! domain — §07's "Domains" column covers built-ins. The exemption is decided by the
 //! callee's arity AND declared domain, so a single-input USER reification stays splatting.
+//! `crates/infer` reached the same conclusion independently in #144
+//! (`a_user_callable_is_never_exempt_from_the_splat`).
+//!
+//! **Division of labour with #144.** Inference now rejects a MISMATCHED splat, so the
+//! determiniser is no longer the gate for that direction and this file does not re-assert the
+//! diagnostic — `crates/infer/tests/arity.rs` owns it. What remains uniquely the
+//! determiniser's, and what these tests are for, is the MATCHING direction: performing the
+//! splat so the body actually reduces. Verified still load-bearing on this base by reverting
+//! `kernel.rs` to d6dfe31, which reddens every matching test below.
 use flatppl_determinizer::determinize;
 
-/// Does NOT assert `infer` is clean. The subject here is the DETERMINISER's binding
-/// decision, and `infer`'s verdict on a name mismatch is actively changing: the
-/// `infer-always-splat` branch (`TODO-flatppl-rust.md`, "RESOLVED and ENFORCED
-/// (flatppl-design#74 …)") makes a mismatched splat a static error in inference, tables
-/// included. These tests must keep passing across that landing, so the silence is pinned
-/// once, deliberately, in [`infer_is_currently_silent_on_a_mismatched_splat`] instead of
-/// being an incidental precondition of every case.
+/// Does NOT assert `infer` is clean, deliberately: `refusal` below expects a module inference
+/// has already flagged (#144 marks a mismatched splat `Type::Failed`), so asserting clean
+/// diagnostics would contradict the very cases this file covers.
 fn parse_infer(src: &str) -> flatppl_core::Module {
     let mut m = flatppl_syntax::parse(src).unwrap();
     let _ = flatppl_infer::infer(&mut m);
@@ -81,11 +86,23 @@ z = g(table(a = xs))");
     );
 }
 
-/// The direction that was accepts-invalid: column `a` against an input named `zz`. §04 makes
-/// this a static error, and the whole-table bind previously produced a plausible number for
-/// it. `infer` reports nothing, so the determiniser is the gate.
+/// The direction that was accepts-invalid — column `a` against an input named `zz`, which
+/// used to bind the whole table and produce a plausible number. It now refuses, but the
+/// refusal has MOVED LAYER: #144 marks the call `Type::Failed` in inference, and the
+/// determiniser refuses on the residual failed node rather than through `record_field`'s
+/// `None`. So this asserts the end-to-end verdict and names the layer, which is the part no
+/// single-crate test covers.
+///
+/// The infer-side goldens own the diagnostic itself — `arity.rs`'s
+/// `a_sole_positional_table_splats_by_column_name` pins this exact message and its matching
+/// counterpart, and `a_user_callable_is_never_exempt_from_the_splat` pins the reasoning
+/// `is_splattable` relies on. Nothing here re-asserts either.
+///
+/// The determiniser's own mismatch arm is consequently a BACKSTOP, not the gate: it is
+/// unreachable through surface syntax while inference flags the call first. It still matters
+/// for a hand-built or FlatPIR-loaded module that carries no such diagnostic.
 #[test]
-fn a_mismatched_table_column_refuses_instead_of_binding_the_table_whole() {
+fn a_mismatched_splat_refuses_though_inference_now_catches_it_first() {
     let reason = refusal(
         "\
 xs = elementof(cartpow(reals, 4))
@@ -93,8 +110,8 @@ g = functionof(sum(_p_), zz = _p_)
 z = g(table(a = xs))",
     );
     assert!(
-        reason.contains("residual user call"),
-        "the unreduced application refuses at the FlatPDL exit check: {reason}"
+        reason.contains("has no parameter `a`"),
+        "the refusal is inference's §04 name check, surfaced through the failed node: {reason}"
     );
 }
 
@@ -136,41 +153,20 @@ lp = logdensityof(lawof(record(y = draw(mk(record(mu = 1.5))))), record(y = 0.5)
     );
 }
 
-/// Why the determiniser is the gate today: `infer` reports NOTHING for a mismatched splat,
-/// even though §04 makes it a static error.
-///
-/// **Invert or delete this test when `infer-always-splat` lands** — that branch makes the
-/// mismatch a static error in inference, at which point this assertion is the one that
-/// should fail, pointing a reader at the TODO entry rather than at a mystery.
-#[test]
-fn infer_is_currently_silent_on_a_mismatched_splat() {
-    let mut m = flatppl_syntax::parse(
-        "\
-xs = elementof(cartpow(reals, 4))
-g = functionof(sum(_p_), zz = _p_)
-z = g(table(a = xs))",
-    )
-    .unwrap();
-    let diags = flatppl_infer::infer(&mut m);
-    assert!(
-        diags.is_empty(),
-        "if inference now diagnoses this, the determiniser is no longer the only gate — \
-         update this test and the TODO entry: {diags:?}"
-    );
-}
-
-/// A mismatched RECORD field still refuses, as it did before — the guard was already correct
-/// for records and must stay so.
-#[test]
-fn a_mismatched_record_field_still_refuses() {
-    let reason = refusal(
-        "\
-r0 = record(aa = 1.5)
-g = functionof(_p_ + 1.0, zz = _p_)
-z = g(r0)",
-    );
-    assert!(
-        reason.contains("residual user call"),
-        "the unreduced application refuses: {reason}"
-    );
-}
+// Two tests stood here and are DELETED rather than adapted, because #144 moved what they
+// asserted into inference and `crates/infer/tests/arity.rs` already owns it:
+//
+// - `infer_is_currently_silent_on_a_mismatched_splat` was written to fail by design once the
+//   splat landed. It has done its job: inference now reports "`g` has no parameter `a`" with
+//   the splat hint. Re-asserting that here would duplicate
+//   `a_sole_positional_table_splats_by_column_name`.
+// - `a_mismatched_record_field_still_refuses` asserted the RECORD mismatch refuses through the
+//   FlatPDL exit check. Same story — inference flags it first now, and
+//   `a_single_parameter_constructor_name_checks_a_splatted_record` plus
+//   `a_record_that_does_not_splat_is_not_name_checked` cover the record side.
+//
+// The end-to-end verdict and the layer handoff survive in
+// `a_mismatched_splat_refuses_though_inference_now_catches_it_first` above. What this file
+// still uniquely covers is the MATCHING direction — the capability only the determiniser can
+// provide, verified still load-bearing on this base by reverting `kernel.rs` to d6dfe31 and
+// watching all three matching tests redden.

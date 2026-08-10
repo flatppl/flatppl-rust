@@ -5684,9 +5684,12 @@ fn variate_kind(t: &Type) -> Option<VariateKind> {
 /// [`variate_kind`] answers `None` for).
 ///
 /// For a guard over a synthesized SCALAR expression. §07 "Operator-equivalent functions"
-/// gives `pow` the domain "scalars" and `divide` "scalars, vector-scalar, matrix-scalar",
-/// so a determiniser row that builds `pow(p, 2)` or `divide(d, p)` on a parameter `p`
-/// needs `p` scalar; the elementwise forms are `broadcast(pow, …)` / `.^` (§04
+/// gives `pow` the domain "scalars", and `divide` "scalars, array-scalar,
+/// transposed-vector–scalar (real or complex)" (flatppl-design#77, pending owner review;
+/// it supersedes #75's narrower "scalars, vector-scalar, matrix-scalar"). Every form #77
+/// admits still has a SCALAR divisor — it widens the DIVIDEND to any rank, not the divisor —
+/// so a determiniser row that builds `pow(p, 2)` or `divide(d, p)` on a parameter `p` needs
+/// `p` scalar either way; the elementwise forms are `broadcast(pow, …)` / `.^` (§04
 /// "Broadcasting"), a different node no row builds.
 ///
 /// **Prove-it-is-wrong, not fail-closed.** A literal parameter node carries no inferred

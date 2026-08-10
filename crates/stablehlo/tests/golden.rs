@@ -11025,8 +11025,10 @@ outputs = lp
 /// `locscale` over a SCALAR variate synthesizes `divide(y − shift, scale)`
 /// (`determinizer::invert::derive_locscale`). That branch refused a MATRIX scale
 /// but not a VECTOR one, so a vector `scale` became the DIVISOR — outside §07
-/// `divide`'s "scalars, vector-scalar, matrix-scalar" domain, and §06 requires
-/// `scale` to be value-compatible with the variate of `m`. The branch now refuses.
+/// `divide`'s "scalars, array-scalar, transposed-vector–scalar (real or complex)"
+/// domain (flatppl-design#77, pending owner review), whose every form has a scalar
+/// divisor, and §06 requires `scale` to be value-compatible with the variate of `m`.
+/// The branch now refuses, so this model no longer reaches the emitter at all.
 #[test]
 fn determinize_refuses_a_scalar_variate_locscale_with_a_vector_scale() {
     let src = "\

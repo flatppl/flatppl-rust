@@ -117,8 +117,10 @@ lp = logdensityof(lawof(record(y = y)), record(y = 1.0))",
 /// Row 5 (InverseGamma prior on the variance → scaled Student t) is the third synthesized
 /// site the 2026-08-06 bare-op sweep found: `build_scaled_t_logpdf` builds
 /// `divide(beta, shape)` from the prior's own parameters, which with VECTOR parameters is an
-/// array-over-array `divide` — outside §07's "scalars, vector-scalar, matrix-scalar" domain
-/// on BOTH operands.
+/// array-over-array `divide` — outside §07's "scalars, array-scalar,
+/// transposed-vector–scalar (real or complex)" domain (flatppl-design#77, pending owner
+/// review) because the DIVISOR is an array. #77 widened the dividend to any rank, so this is
+/// the one of the three sites where only the divisor half still refuses.
 ///
 /// That site was benign only because `crates/stablehlo` cannot lower `loggamma`, so the whole
 /// family refused before reaching it — a trap primed to become a live emitter refusal the
@@ -220,9 +222,11 @@ lp = logdensityof(lawof(record(y = y)), record(y = 1.0))");
 
 /// The scalar branch emits `f_inv(y) = divide(y − shift, scale)` and
 /// `logvol = log(abs(scale))`. A vector `scale` makes the DIVISOR an array — outside §07
-/// `divide`'s "scalars, vector-scalar, matrix-scalar" domain — and makes the log-volume a
-/// vector where a log-density term must be a scalar. §06 forbids the shape outright:
-/// `shift` and `scale` must be value-compatible with the variate of `m`, which is `reals`.
+/// `divide`'s "scalars, array-scalar, transposed-vector–scalar (real or complex)" domain
+/// (flatppl-design#77, pending owner review), every form of which has a scalar divisor — and
+/// makes the log-volume a vector where a log-density term must be a scalar. §06 forbids the
+/// shape outright: `shift` and `scale` must be value-compatible with the variate of `m`,
+/// which is `reals`.
 #[test]
 fn a_vector_scale_refuses_in_the_locscale_scalar_branch() {
     let err = refusal(
