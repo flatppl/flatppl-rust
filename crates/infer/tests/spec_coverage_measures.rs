@@ -469,8 +469,25 @@ fn both_gates_survive_alias_hops() {
         "n = Normal(mu = 0.0, sigma = 1.0)\nt = truncate(n, interval(0.0, 1.0))\nt2 = t\nt3 = t2\nz = lawof(t3)",
         "requires a `%normalized` measure"
     ));
+    // Three hops on the kernelof side too — the same depth the lawof case pins, so
+    // neither gate is left resting on a single-hop claim.
     assert!(rejects(
         "mu = elementof(reals)\nn = Normal(mu = mu, sigma = 1.0)\nn2 = n\nz = kernelof(n2, mu = mu)",
         "this argument is a measure"
+    ));
+    assert!(rejects(
+        "mu = elementof(reals)\nn = Normal(mu = mu, sigma = 1.0)\nn2 = n\nn3 = n2\nz = kernelof(n3, mu = mu)",
+        "this argument is a measure"
+    ));
+    // And for the KERNEL body, which reaches the gate by a different arm.
+    assert!(rejects(
+        "\
+mu = elementof(reals)
+y ~ Normal(mu = mu, sigma = 1.0)
+k = kernelof(record(y = y), mu = mu)
+k2 = k
+k3 = k2
+z = kernelof(k3, mu = mu)",
+        "this argument is a kernel"
     ));
 }

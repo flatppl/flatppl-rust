@@ -1183,8 +1183,12 @@ fn table_of_record_power(shape: Box<[Dim]>, elem: Type) -> Type {
 /// - `%deferred` PASSES. §04's "anything else" reads literally as including it,
 ///   but `%deferred` means "not yet inferred" rather than "not normalized" (§11),
 ///   so rejecting it would convert every gap in mass inference into a user-facing
-///   error on a model that may be perfectly well-formed. Failing open here keeps
-///   the gate a statement about proven-unnormalized measures.
+///   error on a model that may be perfectly well-formed. So the rule this
+///   implements is **reject unless proven `%normalized`, or not yet inferred** —
+///   NOT "reject what is proven unnormalized". The difference is `%unknown`, which
+///   §11 defines as "unknown total mass": it is rejected without anything having
+///   been proven about it, because the gate's question is whether normalization was
+///   established, not whether non-normalization was.
 /// - Only a `Type::Measure` argument is gated. §04 also says "On a non-nullary
 ///   kernel, `lawof` lifts pointwise", so a `Type::Kernel` argument is legitimate;
 ///   whether a non-Markov kernel should be gated by its own `%mass` is the same
