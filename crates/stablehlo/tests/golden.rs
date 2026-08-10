@@ -11178,7 +11178,7 @@ outputs = (lp)
     assert!(is_delimiter_balanced(&out));
 }
 
-/// A destructured table used as ONE value (here `sum(xs = data)`) refuses: the
+/// A destructured table used as ONE value (here `sum(data)`) refuses: the
 /// per-column arguments supply no monolithic tensor, and the message says to
 /// read it column-wise instead of reporting an unsupported head.
 ///

@@ -178,7 +178,9 @@ fn a_user_call_can_splat_a_sole_record_argument() {
     // A record whose field count matches nothing still fails, at the splat count.
     assert_eq!(
         errors(&format!("{f}two = record(a = 1.0, b = 2.0)\ny = lin(two)")),
-        vec!["`lin` declares 3 parameters, got 2 arguments".to_string()]
+        vec![format!(
+            "`lin` declares 3 parameters, got 2 arguments{SPLAT_HINT}"
+        )]
     );
 }
 
@@ -200,7 +202,9 @@ fn a_sole_positional_record_always_splats_and_is_not_one_argument() {
              takes_a_record(p) = get(p, [\"a\"])\n";
     assert_eq!(
         errors(&format!("{f}y = takes_a_record(pars)")),
-        vec!["`takes_a_record` declares 1 parameter, got 3 arguments".to_string()],
+        vec![format!(
+            "`takes_a_record` declares 1 parameter, got 3 arguments{SPLAT_HINT}"
+        )],
         "the 3-field record splats to three arguments, so the 1-parameter callable is over-supplied"
     );
     // The keyword spelling §04 names is how the record passes as ONE value.
@@ -306,7 +310,9 @@ fn a_sole_record_argument_supplies_one_argument_per_field() {
     // The field count is what is checked, so a wrong-width record still fails.
     assert_eq!(
         errors("m = Normal(record(mu = 0.0, sigma = 1.0, tau = 2.0))"),
-        vec!["`Normal` takes 2 arguments (spec §08), got 3".to_string()]
+        vec![format!(
+            "`Normal` takes 2 arguments (spec §08), got 3{SPLAT_HINT}"
+        )]
     );
     // §04: auto-splatting fires only for a SOLE argument, so a record alongside
     // other arguments counts as the one ordinary value it is — three here, not
@@ -456,4 +462,45 @@ fn a_sole_positional_table_splats_by_column_name() {
     );
     // A column named for the parameter splats cleanly.
     assert!(errors("d = table(rate = [1.0, 2.0])\nm = Poisson(d)").is_empty());
+}
+
+/// The splat hint must reach the ARITY diagnostics, not only the name check. The
+/// arity branch is where §04's always-splat rule is most confusing: the author
+/// wrote one argument and the error reports several, none of which they typed. All
+/// three reporting paths carry it — the two arity mismatches and the name check.
+///
+/// A call that does NOT splat gets no hint: an ordinary over-arity call has
+/// nothing to explain, and the hint would be noise on the common case.
+#[test]
+fn the_splat_hint_reaches_every_diagnostic_a_splatting_call_can_produce() {
+    // §08 constructor, arity path: 2 fields against 1 parameter.
+    assert_eq!(
+        errors("m = Poisson(record(zzz = 0.5, qqq = 1.0))"),
+        vec![format!(
+            "`Poisson` takes 1 argument (spec §08), got 2{SPLAT_HINT}"
+        )]
+    );
+    // §07 value function, arity path — the reach onto §07 the amendment created.
+    assert_eq!(
+        errors("d = load_data(\"d.csv\", cartpow(cartprod(x = reals, y = reals), 4))\ns = sum(d)"),
+        vec![format!(
+            "`sum` takes 1 argument (spec §07), got 2{SPLAT_HINT}"
+        )]
+    );
+    // USER call, arity path — the shape the transport models used.
+    assert_eq!(
+        errors("pars = record(a = 1.0, b = 2.0, mu = 3.0)\nf(p) = get(p, [\"a\"])\ny = f(pars)"),
+        vec![format!(
+            "`f` declares 1 parameter, got 3 arguments{SPLAT_HINT}"
+        )]
+    );
+    // Not a splat: no hint on either arity path.
+    assert_eq!(
+        errors("f(x) = mul(x, 2.0)\ny = f(1.0, 2.0)"),
+        vec!["`f` declares 1 parameter, got 2 arguments".to_string()]
+    );
+    assert_eq!(
+        errors("x = exp(1.0, 2.0)"),
+        vec!["`exp` takes 1 argument (spec §07), got 2".to_string()]
+    );
 }

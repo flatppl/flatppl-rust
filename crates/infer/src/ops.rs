@@ -2121,9 +2121,12 @@ fn user_arity_check(
         return arg_name_check(inf, &names, &who, None, &reading, args, named);
     }
     let noun = if want == 1 { "parameter" } else { "parameters" };
+    // Same reason as `arity_check`'s: a splatting call reports the field count, not
+    // the one argument written. This is the path the transport-model spelling hits.
+    let hint = if reading.splatting { SPLAT_HINT } else { "" };
     inf.diags.push(crate::Diagnostic::error_at(
         id,
-        format!("{who} declares {want} {noun}, got {got} arguments"),
+        format!("{who} declares {want} {noun}, got {got} arguments{hint}"),
     ));
     Some(Type::Failed(
         format!("user call declares {want} {noun}, got {got}").into(),
@@ -2757,14 +2760,34 @@ fn arity_check(
         "§07"
     };
     let declared = arity.describe();
+    // `got` is the SPLAT count on a splatting call, so the author sees a number
+    // larger than the arguments they wrote — say where it came from.
+    let hint = if reading.splatting { SPLAT_HINT } else { "" };
     inf.diags.push(crate::Diagnostic::error_at(
         id,
-        format!("`{name}` takes {declared} (spec {section}), got {got}"),
+        format!("`{name}` takes {declared} (spec {section}), got {got}{hint}"),
     ));
     Some(Type::Failed(
         format!("{name} takes {declared}, got {got}").into(),
     ))
 }
+
+/// The explanation appended to any diagnostic whose argument count or names came
+/// from an auto-splat. §04's always-splat rule is the surprising step — the author
+/// wrote one argument and the error talks about several, or about names they never
+/// typed — so every diagnostic on a splatting call says the splat happened and
+/// names the spelling that passes the aggregate as one value (§04: "Passing a
+/// record or table as one ordinary argument requires the keyword spelling, as in
+/// `f(pars = record(...))`").
+///
+/// Shared by all three paths that can report on a splatting call: the two arity
+/// mismatches ([`arity_check`] for builtins, [`user_arity_check`] for user
+/// callables) and the name check ([`arg_name_check`]). A call that does not splat
+/// gets none of it — an ordinary over-arity call has nothing to explain.
+const SPLAT_HINT: &str = " — a sole positional record or table always splats \
+                          (spec §04), so its field names bind as arguments; to \
+                          pass it as one ordinary argument use the keyword \
+                          spelling, as in `f(pars = record(...))`";
 
 /// How a call's arguments read against a declared parameter count.
 struct ArgReading {
@@ -2910,15 +2933,8 @@ fn arg_name_check(
         Some(s) => format!("spec {s} parameters"),
         None => "declares".to_string(),
     };
-    // The splat is what made these field names binding, so say so and name the
-    // spelling that passes the record as one argument instead.
-    let hint = if reading.splatting {
-        " — a sole positional record or table always splats (spec §04), so its \
-         field names bind as arguments; to pass it as one ordinary argument use \
-         the keyword spelling, as in `f(pars = record(...))`"
-    } else {
-        ""
-    };
+    // The splat is what made these field names binding, so say so.
+    let hint = if reading.splatting { SPLAT_HINT } else { "" };
     for (name, at) in &unknown {
         inf.diags.push(crate::Diagnostic::error_at(
             *at,
