@@ -337,6 +337,10 @@ enum BareMul {
     /// `vector–transposed-vector` — §07: "The product of a non-transposed vector
     /// and a transposed vector is a matrix".
     OuterProduct,
+    /// A row vector against a matrix, `row[k] · [k, n] → row[n]`. Not in §07's
+    /// `mul` row as of design `9e35262`; flatppl-design#77 (pending owner review)
+    /// adds `transposed-vector–matrix` to it.
+    RowMatrixProduct,
     /// At least one operand is a scalar (or has no inferred type): the ordinary
     /// elementwise multiply, which broadcasts the scalar side.
     Elementwise,
@@ -387,6 +391,10 @@ fn classify_bare_mul(e: &Emitter, args: &[NodeId]) -> BareMul {
         }
         (TVector(da), Array(db)) if da.len() == 1 && db.len() == 1 => BareMul::InnerProduct,
         (Array(da), TVector(db)) if da.len() == 1 && db.len() == 1 => BareMul::OuterProduct,
+        // Row-vector against a matrix. AHEAD OF THE SPEC ROW: see
+        // [`lower_vector_product`]'s doc for why this is admitted while the
+        // mirrored `matrix * row` below stays refused.
+        (TVector(da), Array(db)) if da.len() == 1 && db.len() == 2 => BareMul::RowMatrixProduct,
         _ => BareMul::Undefined,
     }
 }
@@ -411,6 +419,7 @@ pub(crate) fn lower_bare_mul(
         BareMul::MatrixProduct => lower_matrix_product(e, id, args),
         BareMul::InnerProduct => lower_vector_product(e, id, args, VectorProduct::Inner),
         BareMul::OuterProduct => lower_vector_product(e, id, args, VectorProduct::Outer),
+        BareMul::RowMatrixProduct => lower_vector_product(e, id, args, VectorProduct::RowMatrix),
         BareMul::Elementwise => binary(e, id, args, Emitter::mul),
         BareMul::Undefined => {
             let shape = |n: NodeId| match e.type_of(n) {
@@ -495,6 +504,8 @@ enum VectorProduct {
     Inner,
     /// `a * transpose(b)` → matrix.
     Outer,
+    /// `transpose(a) * m` → row vector.
+    RowMatrix,
 }
 
 /// Lower one of §07's two transposed-vector products. Both operands are rank-1
@@ -509,6 +520,20 @@ enum VectorProduct {
 /// disagree"), so the determiniser refuses first — this is the defensive second
 /// line, matching [`lower_matrix_product`]'s own inner-dimension check. The outer
 /// product needs no length agreement at all: `[n] × [m] → [n, m]` for any n, m.
+///
+/// [`VectorProduct::RowMatrix`] (`row[k] · [k, n] → row[n]`) is the third
+/// orientation, and it runs ahead of the MERGED spec: §07's `mul` row lists
+/// `matrix-vector` and no `vector-matrix` as of design `9e35262`, which is why the
+/// preceding wave refused it. **flatppl-design#77 (pending owner review)** adds
+/// `transposed-vector–matrix` to the row and states the result directly: "the
+/// product of a transposed vector and a matrix is a transposed vector" — so a row,
+/// not a single-row matrix, which is why the result type is `TVector{n}` and not a
+/// `[1, n]` array. The maths agrees and would have forced it anyway:
+/// `(1×k)(k×n) = 1×n`.
+///
+/// The MIRROR case, `matrix * row`, stays refused and is NOT the same omission:
+/// `[m,k] · row[k]` does not conform for any `m, k` except the degenerate `k = 1`,
+/// so there is no product to admit, and #77 does not add one.
 fn lower_vector_product(
     e: &mut Emitter,
     id: NodeId,
@@ -519,12 +544,19 @@ fn lower_vector_product(
     let a = e.lower_node(a)?;
     let b = e.lower_node(b)?;
     let rank1 = |v: &Value| matches!(&v.ty, MlirTy::Ranked(d) if d.len() == 1);
-    if !rank1(&a) || !rank1(&b) {
+    // The row–matrix case takes a rank-2 rhs; the two vector products take rank 1
+    // on both sides.
+    let want_rank2_rhs = matches!(kind, VectorProduct::RowMatrix);
+    let rhs_ok = |v: &Value| matches!(&v.ty, MlirTy::Ranked(d) if d.len() == if want_rank2_rhs { 2 } else { 1 });
+    if !rank1(&a) || !rhs_ok(&b) {
         return Err(EmitError::at(
             id,
             format!(
-                "transposed-vector product needs two rank-1 operands, got {:?} against {:?}",
-                a.ty, b.ty
+                "transposed-vector product needs a rank-1 lhs and a rank-{} rhs, got {:?} \
+                 against {:?}",
+                if want_rank2_rhs { 2 } else { 1 },
+                a.ty,
+                b.ty
             ),
         ));
     }
@@ -547,6 +579,24 @@ fn lower_vector_product(
             Ok(e.inner_product(&a, &b))
         }
         VectorProduct::Outer => Ok(e.outer_product(&a, &b)),
+        VectorProduct::RowMatrix => {
+            let (MlirTy::Ranked(da), MlirTy::Ranked(db)) = (&a.ty, &b.ty) else {
+                unreachable!("ranks checked above");
+            };
+            // The row's length pairs with the matrix's LEADING axis.
+            if matches!((da[0], db[0]), (Some(k1), Some(k2)) if k1 != k2) {
+                return Err(EmitError::at(
+                    id,
+                    format!(
+                        "row-vector–matrix product inner dimensions disagree: {:?} against \
+                         {:?} — `transpose(a) * m` contracts the row against the matrix's \
+                         leading axis",
+                        a.ty, b.ty
+                    ),
+                ));
+            }
+            Ok(e.row_matrix_product(&a, &b))
+        }
     }
 }
 
@@ -632,22 +682,16 @@ fn arith_shape(e: &Emitter, id: NodeId) -> ArithShape {
 /// - `add`/`sub`: "scalars or arrays of same shape (real or complex)". A scalar
 ///   against an array is OUTSIDE it, so `scalar + vector` refuses; two arrays of
 ///   the same shape are vector addition and stay legal.
-/// - `divide`: "scalars, vector-scalar, matrix-scalar (real or complex)"
-///   (flatppl-design#75). §05 "No implicit operator broadcasting" states the same
+/// - `divide`: "scalars, array-scalar, transposed-vector–scalar (real or complex)"
+///   (flatppl-design#77, pending owner review; it supersedes the narrower row #75
+///   introduced). §05 "No implicit operator broadcasting" states the same
 ///   constraint directly — "`/` requires a scalar divisor, and `^` is
-///   scalar-only" — so the DIVISOR is the discriminator here: a rank-1 or rank-2
-///   dividend over a scalar divisor is scalar multiplication by the reciprocal,
-///   sound, and lowers as the ordinary scalar-broadcast divide. `scalar / vector`
-///   is NOT in the domain; an elementwise reciprocal is `./`'s job.
-///
-///   A rank-3 dividend refuses, which is the one place the two clauses can be read
-///   differently: §05 constrains only the divisor (satisfied), while §07 enumerates
-///   `vector-scalar` and `matrix-scalar` and stops. §07's table is the precise
-///   statement and §05 the prose summary — for `mul`, §05's "supports matrix and
-///   matrix–vector multiplication" is likewise less complete than §07's row, which
-///   [`classify_bare_mul`] follows strictly. So this guard follows §07 and refuses
-///   rank 3. Dividing a rank-3 array by a scalar IS sound maths, so admitting it
-///   would be a spec-row change, not a guard relaxation.
+///   scalar-only" — so the DIVISOR is the whole discriminator: a dividend of ANY
+///   rank over a scalar divisor is scalar multiplication by the reciprocal, sound,
+///   and lowers as the ordinary scalar-broadcast divide. `array` is §03's
+///   rank-agnostic n-dimensional term, and `transposed-vector–scalar` names the
+///   row-vector dividend outright. `scalar / vector` is NOT in the domain, and
+///   neither is `array / array`; an elementwise reciprocal is `./`'s job.
 /// - `pow`: "scalars (real or complex)". Any array operand refuses.
 ///
 /// `neg` needs no guard: its domain is "scalars or arrays", so elementwise
@@ -703,27 +747,30 @@ pub(crate) fn lower_bare_arith<'m>(
             ),
         ))
     };
-    const DIVIDE_DOMAIN: &str = "\"scalars, vector-scalar, matrix-scalar\"";
+    // The domain named in the refusal a USER sees. It must track the row the guard
+    // actually enforces: quoting the narrower pre-#77 row told anyone hitting the
+    // divisor refusal that a dividend shape the engine accepts was out of bounds.
+    const DIVIDE_DOMAIN: &str = "\"scalars, array-scalar, transposed-vector–scalar\"";
     match head {
         "pow" if sa.is_array() || sb.is_array() => refuse("\"scalars\""),
         // A known-array DIVISOR is proof enough on its own, whatever the dividend
         // is: it rules out `scalar / vector` and `vector / vector` together.
         "divide" if sb.is_array() => refuse(DIVIDE_DOMAIN),
-        // Dividend rank 1 or 2 over a scalar divisor is in the amended row; a
-        // higher-rank dividend is not enumerated, so it refuses. A TRANSPOSED
-        // vector dividend counts as `vector-scalar`: §03 says "The term vector
-        // will represent both non-transposed vectors (one-dimensional arrays) and
-        // transposed vectors in the following, unless noted otherwise", and the
-        // divide row notes no such exception (unlike the `mul` row, which spells
-        // the transposed orientations out precisely because they change the
-        // result). Whitelisting only `Array` here was one case stricter than the
-        // row.
-        "divide"
-            if sa.is_array()
-                && !matches!(&sa, ArithShape::Array(d) | ArithShape::TVector(d) if d.len() <= 2) =>
-        {
-            refuse(DIVIDE_DOMAIN)
-        }
+        // Any-rank dividend over a scalar divisor lowers. The DIVISOR is the whole
+        // discriminator: §05 "No implicit operator broadcasting" constrains only it
+        // ("`/` requires a scalar divisor", unchanged by #77), and `v / s` is scalar
+        // multiplication by the reciprocal, which is sound at every rank.
+        //
+        // Ahead of the MERGED spec row for rank 3 and above: §07's row enumerates
+        // `vector-scalar` and `matrix-scalar` and stops (design `9e35262`), which is
+        // why the preceding wave refused a rank-3 dividend. **flatppl-design#77
+        // (pending owner review)** rewrites the row as "scalars, array-scalar,
+        // transposed-vector–scalar", where `array` is §03's rank-agnostic
+        // n-dimensional term — so every rank is admitted, and the transposed-vector
+        // dividend is now named OUTRIGHT rather than resting on §03's "the term
+        // vector will represent both" blanket, which is what the F6 fix argued from.
+        // Nothing further is needed here: every dividend shape falls through, so the
+        // only `divide` refusal left is the array-divisor one above.
         "add" | "sub" if sa.differs_from(&sb) => refuse("\"scalars or arrays of same shape\""),
         _ => binary(e, id, args, op),
     }

@@ -828,6 +828,40 @@ fn mul_type(args: &[ArgInfo]) -> Type {
                 elem: Box::new(elem),
             },
         },
+        // Transposed-vector · matrix → transposed vector, `row[k] · [k, n] → row[n]`.
+        // flatppl-design#77 (pending owner review) adds `transposed-vector–matrix` to
+        // §07's `mul` row and states the result type in prose: "the product of a
+        // transposed vector and a matrix is a transposed vector". So the result is a
+        // ROW — `TVector`, not a `[1, n]` single-row matrix — which also keeps the
+        // orientation-preserving pattern the inner (→ scalar) and outer (→ matrix)
+        // products follow. The maths agrees: `(1×k)(k×n) = 1×n`.
+        //
+        // Ahead of the merged row: as of design `9e35262` §07 lists `matrix-vector`
+        // and no `vector-matrix`. The mirror (`matrix · row`) stays `Deferred` and
+        // #77 does not add it: `[m,k] · row[k]` does not conform for any `m, k` but
+        // the degenerate `k = 1`.
+        (
+            Type::TVector { len: la, elem: ea },
+            Type::Array {
+                shape: sb,
+                elem: eb,
+            },
+        ) if sb.len() == 2 => {
+            if matches!((*la, sb[0]), (Dim::Static(k1), Dim::Static(k2)) if k1 != k2) {
+                return Type::Failed(
+                    "row-vector–matrix product: the row's length must match the matrix's \
+                     leading dimension (spec §07)"
+                        .into(),
+                );
+            }
+            match promote2(Some(ea.as_ref()), Some(eb.as_ref())) {
+                Type::Deferred => Type::Deferred,
+                elem => Type::TVector {
+                    len: sb[1],
+                    elem: Box::new(elem),
+                },
+            }
+        }
         _ => Type::Deferred,
     }
 }
