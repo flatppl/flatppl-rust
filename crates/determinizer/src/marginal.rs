@@ -607,6 +607,15 @@ fn build_conjugate_marginal(
             continue;
         }
 
+        // (d) Every parameter of BOTH distributions must be scalar. Checked here, once,
+        // for every row rather than inside the five builders: the shared precondition is
+        // the row contract itself ([`sole_variate`] — a row's closed form is the law of
+        // ONE scalar variate), not any one builder's arithmetic.
+        if let Some(err) = non_scalar_parameter_refusal(m, latent_dist, &prior_kwargs, &lik_kwargs)
+        {
+            return Some(Err(err));
+        }
+
         return Some(
             (row.build_marginal)(m, &prior_kwargs, &lik_kwargs).ok_or_else(|| {
                 refuse_kchain(
@@ -617,6 +626,60 @@ fn build_conjugate_marginal(
         );
     }
     None
+}
+
+/// The refusal for a matched conjugate pair one of whose distribution parameters is a
+/// CONFIRMED non-scalar, or `None` when every parameter passes.
+///
+/// **Why every row needs this, not just the ones that do arithmetic.** Four of the five
+/// rows build a parameter map out of §07 "Operator-equivalent functions" and "Elementary
+/// functions" arithmetic — `pow`, `add`, `sqrt`, `divide`, `loggamma` — whose domains are
+/// scalars, so a vector parameter puts the synthesized expression outside them. Row 2
+/// (Gamma–Poisson) reuses its parameters unchanged and would survive that reading, yet a
+/// vector `alpha` would still emit a `NegativeBinomial` whose log-density at the row's
+/// SCALAR variate is not a scalar. The row contract is a scalar-variate law either way, so
+/// the check is on the contract.
+///
+/// **§08 makes this an ill-formed model, not a shape the row should generalize.** §08
+/// "Univariate continuous distributions" gives `Normal` the parameters `mu`, `sigma` with
+/// variate domain `reals`, and §04 "Broadcasting" gives the vector-parameter spelling as
+/// `broadcast(Normal, means, sigmas)` (`Normal.(means, sigmas)`), which "returns an
+/// **array-valued measure**" — a `broadcast` node, not the bare constructor
+/// [`split_kernel_constructor`] matched here. So a per-component conjugate marginal is a
+/// DIFFERENT lowering over a DIFFERENT variate: an n-vector one, whose parameter map needs
+/// the elementwise `broadcast(pow, σ₀, 2)` and whose answer is `broadcast(Normal, …)`. No
+/// row builds that, and building it here would score an n-vector law at the scalar variate
+/// the match required. Refuse; a broadcast conjugate row is a separate row (`marginal.md`,
+/// "Adding a row").
+///
+/// A future row over a distribution whose §08 parameters include a genuine vector
+/// (`Categorical`'s `p`, `MvNormal`'s `mu`) must move this check into the rows that need
+/// it — the current table's seven parameters are all scalar per §08.
+fn non_scalar_parameter_refusal(
+    m: &Module,
+    latent_dist: NodeId,
+    prior_kwargs: &[(Symbol, NodeId)],
+    lik_kwargs: &[(Symbol, NodeId)],
+) -> Option<RefuseError> {
+    let (which, psym, kind) = prior_kwargs
+        .iter()
+        .map(|kw| ("prior", kw))
+        .chain(lik_kwargs.iter().map(|kw| ("likelihood", kw)))
+        .find_map(|(which, (psym, pval))| {
+            crate::density::confirmed_non_scalar(m, *pval).map(|kind| (which, *psym, kind))
+        })?;
+    Some(refuse_kchain(
+        latent_dist,
+        &format!(
+            "conjugate pair matched but the {which}'s `{}` is {} — a row's closed form is the \
+             law of one SCALAR variate, and its parameter map is §07 scalar arithmetic \
+             (`pow`'s domain is \"scalars\"). The vector-parameter spelling is \
+             `broadcast(Dist, …)` (§04 \"Broadcasting\"), an array-valued measure no row \
+             covers — refuse rather than mislower",
+            m.resolve(psym),
+            kind.article_noun(),
+        ),
+    ))
 }
 
 /// Does the conjugating parameter's value `value` carry the latent along `path`?

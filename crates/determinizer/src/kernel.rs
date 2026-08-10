@@ -396,8 +396,9 @@ fn shadows_name(m: &Module, id: NodeId, name: Symbol) -> bool {
 ///   Binding is an exact bijection: every boundary input supplied once, and no
 ///   keyword without a matching boundary name — a missing or extra name refuses
 ///   (`None`), never leaving a boundary input free (a silent wrong density).
-/// - a single `record(...)` argument: each boundary input is bound BY FIELD
-///   NAME (the `k(record(mu = 1.5))` idiom — `record_field`).
+/// - a single `record(...)` or `table(...)` argument: each boundary input is bound BY
+///   FIELD/COLUMN NAME (the `k(record(mu = 1.5))` idiom — `is_splattable` /
+///   `record_field`).
 /// - one or more POSITIONAL arguments: bound BY POSITION, arg\[i\] → the
 ///   i-th boundary entry (the `mk(0.0)` idiom). Positional binding is
 ///   `%specinputs`-ONLY: an `%autoinputs` kernel is keyword-only (§04), so a
@@ -405,12 +406,16 @@ fn shadows_name(m: &Module, id: NodeId, name: Symbol) -> bool {
 ///   arbitrarily-ordered traced input. Arity must match the input count
 ///   exactly; a mismatch refuses (`None`) rather than guessing.
 ///
-/// Note the record form binds BY FIELD NAME even when the kernel has exactly
-/// one boundary input: `k(record(mu = 1.5))` looks up the input's own name as
-/// a field of the record — it never binds the record as a whole positionally
-/// to that single input. A field-name mismatch (the record lacks a field
-/// matching the input's name) cleanly refuses (`None`) via `record_field`'s
-/// `?`, rather than falling back to binding the whole record positionally.
+/// Note the auto-splatting form binds BY NAME even when the kernel has exactly one
+/// boundary input: `k(record(mu = 1.5))` looks up the input's own name as a field of
+/// the record — it never binds the record as a whole positionally to that single
+/// input. §04 "Calling conventions" is explicit that this is not a fallback: "A sole
+/// positional record or table therefore always splats: whether its field or column
+/// names match the callable's argument names decides only whether the call is valid,
+/// never whether the splat occurs" (flatppl-design#74). So a name mismatch cleanly
+/// refuses (`None`) via `record_field`'s `?`, rather than falling back to binding the
+/// whole value positionally. `is_splattable` covers `table` for the same reason — see
+/// its comment for why flatppl-design#78's single-input exemption cannot reach here.
 ///
 /// An `%autoinputs` (keyword-only, boundary-less) reification IS handled: its
 /// auto-traced boundary names + refs are read from the module's auto-inputs
@@ -466,7 +471,7 @@ pub(crate) fn reduce_kernel_application(m: &mut Module, node: NodeId) -> Option<
         return Some(body);
     }
 
-    if args.len() == 1 && is_record(m, args[0]) {
+    if args.len() == 1 && is_splattable(m, args[0]) {
         for (name, target) in kernel.inputs {
             let value = record_field(m, args[0], name)?;
             body = substitute_ref(m, body, target.name, value);
@@ -486,23 +491,31 @@ pub(crate) fn reduce_kernel_application(m: &mut Module, node: NodeId) -> Option<
     Some(body)
 }
 
-/// Does `rec` (after one level of ref-resolution) denote a `record(...)`
-/// call? Used to distinguish the by-field-name application form from the
-/// positional form in `reduce_kernel_application`.
-fn is_record(m: &Module, rec: NodeId) -> bool {
-    let (resolved, _) = resolve_ref_one(m, rec);
-    let Node::Call(c) = m.node(resolved) else {
-        return false;
-    };
-    let CallHead::Builtin(sym) = c.head else {
-        return false;
-    };
-    m.resolve(sym) == "record"
+/// Does `rec` (after one level of ref-resolution) denote a `record(...)` or `table(...)`
+/// call? Used to distinguish the by-name auto-splatting application form from the
+/// positional one in [`reduce_kernel_application`].
+///
+/// §04 "Calling conventions" names BOTH: "`f(record(a = x, b = y, ...))` and
+/// `f(table(a = x, b = y, ...))` are equivalent to `f(a = x, b = y, ...)`", and a sole
+/// positional one of either "therefore always splats". Recognising only `record` sent a
+/// sole positional TABLE down the positional arm, where a single-input reification bound
+/// the whole table to that input — the whole-value reading §04 now rules out.
+///
+/// **The §04 amendment under review does not exempt this site.** flatppl-design#78 (OPEN,
+/// owner-accepted, PENDING review) exempts "a callable with exactly one input whose
+/// documented domain admits records or tables", so that `sum(t)` and `lengthof(t)` reduce
+/// over the table. Its test is the CALLEE's arity and DOCUMENTED domain. Every callee
+/// reaching here is a user `functionof`/`kernelof` reification ([`resolve_reified`] off a
+/// `CallHead::User`), which has no documented domain at all — §07's "Domains" column
+/// covers built-ins — so the exemption cannot apply however many inputs it declares. A
+/// bare-builtin callee never reaches this function: `canon` rewrites it to a direct
+/// builtin call, and the two `pushfwd` sites screen it off beforehand.
+fn is_splattable(m: &Module, rec: NodeId) -> bool {
+    matches!(splat_head(m, rec), Some("record") | Some("table"))
 }
 
-/// Look up field `name` in a `record(%field … )` node; `None` if `rec` is not
-/// a record literal or lacks the field.
-fn record_field(m: &Module, rec: NodeId, name: Symbol) -> Option<NodeId> {
+/// The `record`/`table` head of `rec` after one level of ref-resolution, or `None`.
+fn splat_head(m: &Module, rec: NodeId) -> Option<&str> {
     let (resolved, _) = resolve_ref_one(m, rec);
     let Node::Call(c) = m.node(resolved) else {
         return None;
@@ -510,9 +523,24 @@ fn record_field(m: &Module, rec: NodeId, name: Symbol) -> Option<NodeId> {
     let CallHead::Builtin(sym) = c.head else {
         return None;
     };
-    if m.resolve(sym) != "record" {
+    Some(m.resolve(sym))
+}
+
+/// Look up field/column `name` in a `record(%field … )` or `table(%field … )` node; `None`
+/// if `rec` is not such a literal or lacks the name.
+///
+/// `None` is what makes a name mismatch REFUSE instead of falling back to whole-value
+/// binding, and it also covers an OPAQUE table — a `load_data` result has no syntactic
+/// columns to splat, so the §04 splat is not constructible here and the reduction refuses
+/// rather than bind the table whole.
+fn record_field(m: &Module, rec: NodeId, name: Symbol) -> Option<NodeId> {
+    if !is_splattable(m, rec) {
         return None;
     }
+    let (resolved, _) = resolve_ref_one(m, rec);
+    let Node::Call(c) = m.node(resolved) else {
+        return None;
+    };
     c.named.iter().find(|na| na.name == name).map(|na| na.value)
 }
 
