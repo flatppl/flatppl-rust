@@ -84,6 +84,68 @@ lp = logdensityof(lawof(record(y = y)), record(y = 1.0))",
     );
 }
 
+/// Row 5 (InverseGamma prior on the variance → scaled Student t) is the third synthesized
+/// site the 2026-08-06 bare-op sweep found: `build_scaled_t_logpdf` builds
+/// `divide(beta, shape)` from the prior's own parameters, which with VECTOR parameters is an
+/// array-over-array `divide` — outside §07's "scalars, vector-scalar, matrix-scalar" domain
+/// on BOTH operands.
+///
+/// That site was benign only because `crates/stablehlo` cannot lower `loggamma`, so the whole
+/// family refused before reaching it — a trap primed to become a live emitter refusal the
+/// moment `loggamma` lowers. Checking the parameters in `build_conjugate_marginal` rather
+/// than in each builder defuses it: the row refuses BEFORE `build_scaled_t_logpdf` runs, so
+/// adding `loggamma` no longer has to fix this row too.
+#[test]
+fn a_vector_prior_parameter_refuses_before_the_scaled_t_builder_runs() {
+    let err = refusal(
+        "\
+sh = elementof(cartpow(posreals, 3))
+sc = elementof(cartpow(posreals, 3))
+v = draw(InverseGamma(shape = sh, scale = sc))
+y = draw(Normal(mu = 0.0, sigma = sqrt(v)))
+lp = logdensityof(lawof(record(y = y)), record(y = 0.5))",
+    );
+    assert!(
+        err.reason
+            .contains("conjugate pair matched but the prior's `shape` is a vector"),
+        "Row 5 refuses in the shared parameter check, not in its log-density builder: {err:?}"
+    );
+}
+
+/// Row 2 (Gamma–Poisson) is the row that proves the check is on the row CONTRACT and not on
+/// any builder's arithmetic: its parameter map is the IDENTITY — `alpha`/`beta` are the
+/// prior's `shape`/`rate` reused unchanged, no arithmetic at all (`marginal.md`, Row 2). A
+/// purely arithmetic reading would leave it admitting a vector `shape` and emitting a
+/// `NegativeBinomial` whose log-density at the scalar variate is not a scalar.
+#[test]
+fn a_vector_prior_parameter_refuses_even_where_the_row_does_no_arithmetic() {
+    let err = refusal(
+        "\
+s = elementof(cartpow(posreals, 3))
+r = draw(Gamma(shape = s, rate = 2.0))
+k = draw(Poisson(rate = r))
+lp = logdensityof(lawof(record(k = k)), record(k = 3))",
+    );
+    assert!(
+        err.reason
+            .contains("conjugate pair matched but the prior's `shape` is a vector"),
+        "the identity-map row refuses too: {err:?}"
+    );
+}
+
+/// Row 5's SCALAR control still lowers, so the guard did not simply disable the row.
+#[test]
+fn row_five_still_lowers_with_scalar_parameters() {
+    let text = pir("\
+v = draw(InverseGamma(shape = 3.0, scale = 2.0))
+y = draw(Normal(mu = 0.0, sigma = sqrt(v)))
+lp = logdensityof(lawof(record(y = y)), record(y = 0.5))");
+    assert!(
+        text.contains("loggamma"),
+        "the scaled-t log-density form still lowers:\n{text}"
+    );
+}
+
 /// The guard must not over-reach on the row it exists to protect. Row 1's own shape with
 /// SCALAR sigmas still lowers to the closed-form marginal, and `sqrt(2² + 1²) = sqrt(5)`
 /// const-folds — the literal that pins the variance sum (`marginal.md`, Row 1: a variance
