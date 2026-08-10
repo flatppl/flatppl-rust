@@ -22,10 +22,16 @@
 //! callee's arity AND declared domain, so a single-input USER reification stays splatting.
 use flatppl_determinizer::determinize;
 
+/// Does NOT assert `infer` is clean. The subject here is the DETERMINISER's binding
+/// decision, and `infer`'s verdict on a name mismatch is actively changing: the
+/// `infer-always-splat` branch (`TODO-flatppl-rust.md`, "RESOLVED and ENFORCED
+/// (flatppl-design#74 …)") makes a mismatched splat a static error in inference, tables
+/// included. These tests must keep passing across that landing, so the silence is pinned
+/// once, deliberately, in [`infer_is_currently_silent_on_a_mismatched_splat`] instead of
+/// being an incidental precondition of every case.
 fn parse_infer(src: &str) -> flatppl_core::Module {
     let mut m = flatppl_syntax::parse(src).unwrap();
-    let diags = flatppl_infer::infer(&mut m);
-    assert!(diags.is_empty(), "infer must be clean: {diags:?}");
+    let _ = flatppl_infer::infer(&mut m);
     m
 }
 
@@ -127,6 +133,29 @@ lp = logdensityof(lawof(record(y = draw(mk(record(mu = 1.5))))), record(y = 0.5)
     assert!(
         text.contains("(%field mu 1.5)"),
         "the record's `mu` field binds the kernel's `mu` input:\n{text}"
+    );
+}
+
+/// Why the determiniser is the gate today: `infer` reports NOTHING for a mismatched splat,
+/// even though §04 makes it a static error.
+///
+/// **Invert or delete this test when `infer-always-splat` lands** — that branch makes the
+/// mismatch a static error in inference, at which point this assertion is the one that
+/// should fail, pointing a reader at the TODO entry rather than at a mystery.
+#[test]
+fn infer_is_currently_silent_on_a_mismatched_splat() {
+    let mut m = flatppl_syntax::parse(
+        "\
+xs = elementof(cartpow(reals, 4))
+g = functionof(sum(_p_), zz = _p_)
+z = g(table(a = xs))",
+    )
+    .unwrap();
+    let diags = flatppl_infer::infer(&mut m);
+    assert!(
+        diags.is_empty(),
+        "if inference now diagnoses this, the determiniser is no longer the only gate — \
+         update this test and the TODO entry: {diags:?}"
     );
 }
 

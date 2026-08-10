@@ -16,10 +16,14 @@
 //! backstop for the unproven cases (a `%deferred` parameter type still reaches it).
 use flatppl_determinizer::determinize;
 
+/// Does NOT assert `infer` is clean. The subject is the ROW's guard, and this wave's own
+/// follow-up asks inference to start rejecting a non-scalar distribution parameter — so
+/// asserting silence in every case would make the whole file fail on an improvement it
+/// recommends. The silence is pinned once, deliberately, in
+/// [`infer_is_currently_silent_on_a_vector_distribution_parameter`].
 fn parse_infer(src: &str) -> flatppl_core::Module {
     let mut m = flatppl_syntax::parse(src).unwrap();
-    let diags = flatppl_infer::infer(&mut m);
-    assert!(diags.is_empty(), "infer must be clean: {diags:?}");
+    let _ = flatppl_infer::infer(&mut m);
     m
 }
 
@@ -30,6 +34,32 @@ fn refusal(src: &str) -> flatppl_determinizer::RefuseError {
 fn pir(src: &str) -> String {
     let out = determinize(&parse_infer(src)).expect("must lower, not refuse");
     flatppl_flatpir::write(&out)
+}
+
+/// Why these rows have to be the gate: `infer` reports NOTHING for a bare `Normal` whose
+/// `sigma` is a vector, and it even types the synthesized `sqrt(add(pow(sv, 2.0), 1.0))` as a
+/// scalar despite the `%deferred` `pow` under it — so the emitted marginal claims a scalar
+/// `sigma` and no structural gate disagrees.
+///
+/// **Invert or delete this test when inference learns to reject a non-scalar distribution
+/// parameter** (this wave's follow-up). Failing here should point at that work, not look
+/// like an unrelated break.
+#[test]
+fn infer_is_currently_silent_on_a_vector_distribution_parameter() {
+    let mut m = flatppl_syntax::parse(
+        "\
+sv = elementof(cartpow(posreals, 3))
+a = draw(Normal(mu = 0.0, sigma = sv))
+y = draw(Normal(mu = a, sigma = 1.0))
+lp = logdensityof(lawof(record(y = y)), record(y = 1.0))",
+    )
+    .unwrap();
+    let diags = flatppl_infer::infer(&mut m);
+    assert!(
+        diags.is_empty(),
+        "if inference now rejects a vector distribution parameter, the row guard is no longer \
+         the only gate — update this test and the TODO entry: {diags:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
