@@ -133,9 +133,12 @@
 //! - a BARE `add`/`sub`/`divide`/`pow` (surface `+`, `-`, `/`, `^`) whose operand
 //!   shapes are outside the §07 "Operator-equivalent functions" domain for that
 //!   head — `add`/`sub` take "scalars or arrays of same shape (real or complex)",
-//!   `pow` "scalars (real or complex)", `divide` "scalars, vector-scalar,
-//!   matrix-scalar (real or complex)" (flatppl-design#75; §05 "`/` requires a
-//!   scalar divisor", so `scalar / vector` refuses while `vector / scalar` lowers)
+//!   `pow` "scalars (real or complex)", `divide` "scalars, array-scalar,
+//!   transposed-vector–scalar (real or complex)" (flatppl-design#77, pending owner
+//!   review, superseding the narrower row #75 introduced; §05 "`/` requires a
+//!   scalar divisor" is unchanged, so the DIVISOR is the whole discriminator —
+//!   `scalar / vector` and `array / array` refuse while an any-rank dividend over a
+//!   scalar divisor lowers)
 //!   — "`+` has no meaning for these
 //!   operand shapes: ... Write `.+` for the elementwise form ...". Without it
 //!   `Emitter::broadcast_pair` reconciles the pair, so `scalar + vector` silently

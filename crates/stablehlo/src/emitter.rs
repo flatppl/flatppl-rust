@@ -1368,6 +1368,36 @@ impl<'m> Emitter<'m> {
         self.dot_contract(a, b, 0, 0, MlirTy::Scalar)
     }
 
+    /// Row-vector–matrix product: a TRANSPOSED vector against a matrix,
+    /// `row[k] · [k, n] → row[n]`, contracting the lhs's only axis against the
+    /// matrix's LEADING one. `result[j] = Σ_k a[k] · b[k, j]`.
+    ///
+    /// Contrast [`Emitter::matvec`], which contracts the matrix's TRAILING axis
+    /// (`[m, k] · [k] → [m]`): here the matrix is on the right, so it is dim 0 that
+    /// pairs with the row. The result is a row vector — one rank-1 tensor, with the
+    /// orientation carried by the inferred type, since MLIR has no row/column
+    /// distinction (see `crate::ops::lower_transpose`).
+    ///
+    /// Panics on a non-rank-1 lhs, a non-rank-2 rhs, or a disagreeing inner
+    /// dimension; `crate::ops`'s `mul` dispatch checks all three first.
+    pub fn row_matrix_product(&mut self, a: &Value, b: &Value) -> Value {
+        let a_dims = match &a.ty {
+            MlirTy::Ranked(d) if d.len() == 1 => d.clone(),
+            other => panic!("row_matrix_product expects a rank-1 lhs, got {other:?}"),
+        };
+        let b_dims = match &b.ty {
+            MlirTy::Ranked(d) if d.len() == 2 => d.clone(),
+            other => panic!("row_matrix_product expects a rank-2 rhs, got {other:?}"),
+        };
+        if matches!((a_dims[0], b_dims[0]), (Some(k1), Some(k2)) if k1 != k2) {
+            panic!(
+                "row_matrix_product: lhs length {:?} does not match rhs leading dim {:?}",
+                a_dims[0], b_dims[0]
+            );
+        }
+        self.dot_contract(a, b, 0, 0, MlirTy::Ranked(vec![b_dims[1]]))
+    }
+
     /// Outer product of a vector and a TRANSPOSED vector, spec §07 "Linear
     /// algebra": "The product of a non-transposed vector and a transposed vector
     /// is a matrix". `[n] × [m] → [n, m]` with `result[i, j] = a[i] · b[j]`.

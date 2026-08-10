@@ -9935,13 +9935,14 @@ outputs = lp
     );
 }
 
-/// A TRANSPOSED-vector dividend over a scalar divisor lowers. §07's amended
-/// `divide` row (flatppl-design#75) is "scalars, vector-scalar, matrix-scalar",
-/// and §03 says "The term vector will represent both non-transposed vectors
-/// (one-dimensional arrays) and transposed vectors in the following, unless noted
-/// otherwise" — the divide row notes no such exception, unlike the `mul` row,
-/// which spells the orientations out precisely because they change the result.
-/// The guard's whitelist admitted only `Array`, one case stricter than the row.
+/// A TRANSPOSED-vector dividend over a scalar divisor lowers. §07's `divide` row
+/// under flatppl-design#77 (pending owner review) is "scalars, array-scalar,
+/// transposed-vector–scalar", which names this case OUTRIGHT. When this golden was
+/// written the row was #75's narrower "scalars, vector-scalar, matrix-scalar" and
+/// admitting a row-vector dividend rested on §03's "The term vector will represent
+/// both non-transposed vectors … and transposed vectors …, unless noted otherwise"
+/// blanket; #77 removes the need for that inference. Either way the guard's
+/// whitelist had admitted only `Array`, one case stricter than the row.
 #[test]
 fn emit_logdensity_transposed_vector_over_scalar_divides() {
     let src = "\
@@ -10022,13 +10023,79 @@ outputs = lp
     }
 }
 
-/// The pairs §07's `mul` row does NOT admit, now that transposed vectors are
-/// constructible. `matrix-vector` is listed but `vector-matrix` is not, and the
-/// row distinguishes transposed from non-transposed exactly where orientation
-/// decides the result — so neither matrix/TVector mix is admitted. `infer` agrees
-/// independently: `mul_type` types both `%deferred` (measured).
+/// `transpose(v) * m` is the ROW-VECTOR–MATRIX product: `row[k] · [k, n] → row[n]`,
+/// contracting the row against the matrix's LEADING axis (`[0] x [0]`) — the mirror
+/// of `matvec`, which contracts the matrix's trailing axis.
+///
+/// NON-SQUARE (`[3] × [3,4] -> [4]`) so no other contraction pairing can pass:
+/// `[0] x [1]` would pair 3 against 4, and `[1] x [0]` is not available on a rank-1
+/// lhs. The result type is `tensor<4xf32>` — the matrix's TRAILING dim, not the
+/// row's length, which a swapped contraction would have produced.
+///
+/// This runs AHEAD OF §07's `mul` row, which lists `matrix-vector` and no
+/// `vector-matrix` (design `9e35262`); admitted on the owner's ruling that the
+/// omission is an oversight, with a spec PR widening the row in flight. The maths
+/// forces it: `(1×k)(k×n) = 1×n`.
 #[test]
-fn emit_logdensity_refuses_the_mul_pairs_section_07_omits() {
+fn emit_logdensity_row_vector_times_matrix_contracts_the_leading_axis() {
+    let src = "\
+v = elementof(cartpow(reals, 3))
+m = elementof(cartpow(reals, [3, 4]))
+z = sum(transpose(v) * m)
+lp = logdensityof(lawof(record(y = draw(Normal(mu = z, sigma = 1.0)))), record(y = 1.0))
+inputs = (v, m)
+outputs = lp
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let out = emit_logdensity(&d);
+    assert!(
+        out.contains(
+            "stablehlo.dot_general %arg0, %arg1, contracting_dims = [0] x [0], \
+             precision = [DEFAULT, DEFAULT] : (tensor<3xf32>, tensor<3x4xf32>) -> tensor<4xf32>"
+        ),
+        "row·matrix must contract [0] x [0] to tensor<4xf32>, in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// The row–matrix product's inner dimensions must agree: the row's length against
+/// the matrix's LEADING dim. Measured mechanism — `infer`'s `mul_type` makes a
+/// static mismatch a `Type::Failed`, which the DETERMINISER then refuses on
+/// (`determinize: refuse Failed … row-vector–matrix product: the row's length must
+/// match the matrix's leading dimension`), so the emitter never sees it. The
+/// emitter carries its own check as a defensive second line, reachable only from a
+/// direct `emit` call — exactly the arrangement the inner product has.
+#[test]
+fn row_matrix_with_disagreeing_inner_dimensions_fails_inference() {
+    let src = "\
+v = elementof(cartpow(reals, 3))
+m = elementof(cartpow(reals, [5, 4]))
+z = transpose(v) * m
+";
+    let mut module = flatppl_syntax::parse(src).expect("parse");
+    let _ = flatppl_infer::infer(&mut module);
+    let z = module
+        .bindings()
+        .find(|(_, b)| module.resolve(b.name) == "z")
+        .map(|(_, b)| b.rhs)
+        .expect("binding z");
+    let ty = module.type_of(z).expect("z has a type");
+    assert!(
+        matches!(ty, flatppl_core::Type::Failed(msg) if msg.contains("row-vector–matrix product")),
+        "a mismatched row·matrix must be Type::Failed, got: {ty:?}"
+    );
+}
+
+/// The operand pairs that have no product at all. Two same-orientation vectors
+/// (§07 gives `*` a vector meaning only in a mixed transposed orientation), and
+/// `matrix * row` — which is NOT a spec oversight like `row * matrix` was:
+/// `[m,k] · row[k]` does not conform for any `m, k` but the degenerate `k = 1`, so
+/// there is no product to admit. `infer` agrees, typing both `%deferred`.
+///
+/// `TVector * matrix` was in this list until the row-vector–matrix product landed;
+/// it now has its own lowering golden below.
+#[test]
+fn emit_logdensity_refuses_the_mul_pairs_with_no_product() {
     for (label, src) in [
         (
             "TVector * TVector",
@@ -10049,17 +10116,6 @@ w = elementof(cartpow(reals, 3))
 z = sum(sum(m * transpose(w)))
 lp = logdensityof(lawof(record(y = draw(Normal(mu = z, sigma = 1.0)))), record(y = 1.0))
 inputs = (m, w)
-outputs = lp
-",
-        ),
-        (
-            "TVector * matrix",
-            "\
-v = elementof(cartpow(reals, 3))
-m = elementof(cartpow(reals, [3, 4]))
-z = sum(transpose(v) * m)
-lp = logdensityof(lawof(record(y = draw(Normal(mu = z, sigma = 1.0)))), record(y = 1.0))
-inputs = (v, m)
 outputs = lp
 ",
         ),
@@ -10489,8 +10545,8 @@ outputs = lp
 //
 // §07 "Operator-equivalent functions" gives each head a DOMAIN: `add`/`sub`
 // "scalars or arrays of same shape (real or complex)", `pow` "scalars (real or
-// complex)", `divide` "scalars, vector-scalar, matrix-scalar (real or complex)"
-// (the amended row — see the `divide` block below). Outside it a bare operator has
+// complex)", `divide` "scalars, array-scalar, transposed-vector–scalar (real or
+// complex)" (flatppl-design#77 — see the `divide` block below). Outside it a bare operator has
 // no mathematical meaning, and the elementwise reading is spelled with the dotted
 // form. All four
 // heads used to route straight to `Emitter::add`/`sub`/`div`/`pow`, whose
@@ -10582,13 +10638,14 @@ outputs = lp
     );
 }
 
-// `divide`'s domain is the §07 row widened by flatppl-design#75: "scalars,
-// vector-scalar, matrix-scalar (real or complex)". §05 "No implicit operator
-// broadcasting" says it directly too — "`/` requires a scalar divisor, and `^` is
-// scalar-only" — so the DIVISOR is the discriminator: a rank-1 or rank-2 dividend
-// over a scalar divisor is scalar multiplication by the reciprocal and lowers as
-// the ordinary scalar-broadcast divide. The owner ruled the earlier
-// `divide`/`mul` asymmetry unintended.
+// `divide`'s domain is the §07 row as widened by flatppl-design#77 (pending owner
+// review): "scalars, array-scalar, transposed-vector–scalar (real or complex)",
+// where `array` is §03's rank-agnostic n-dimensional term. §05 "No implicit
+// operator broadcasting" says it directly too — "`/` requires a scalar divisor,
+// and `^` is scalar-only" — so the DIVISOR is the whole discriminator: a dividend
+// of ANY rank over a scalar divisor is scalar multiplication by the reciprocal and
+// lowers as the ordinary scalar-broadcast divide. The owner ruled both the earlier
+// `divide`/`mul` asymmetry (#75) and the surviving rank ceiling (#77) unintended.
 
 /// `vector / scalar` is INSIDE the amended domain and emits the same elementwise
 /// divide `./` would.
@@ -10651,7 +10708,9 @@ outputs = lp
     assert!(
         err.msg
             .contains("`/` has no meaning for these operand shapes")
-            && err.msg.contains("vector-scalar")
+            // The domain the message quotes must be the row the guard enforces —
+            // #77's, not #75's narrower one (which said `vector-scalar`).
+            && err.msg.contains("array-scalar")
             && err.msg.contains("./"),
         "expected a `divide`-domain refusal pointing at `./`, got: {}",
         err.msg
@@ -10684,37 +10743,98 @@ outputs = lp
     );
 }
 
-/// A RANK-3 dividend over a scalar divisor refuses — the one case where §05 and
-/// §07 can be read differently. §05 constrains only the divisor ("`/` requires a
-/// scalar divisor"), which a rank-3 dividend satisfies; §07's row enumerates
-/// `vector-scalar` and `matrix-scalar` and stops. §07's table is the precise
-/// statement (for `mul`, §05's prose is likewise less complete than §07's row,
-/// which `classify_bare_mul` follows strictly), so the guard follows §07.
-/// Dividing a rank-3 array by a scalar IS sound maths, so this pins a SPEC
-/// boundary, not a mathematical one — admitting it means amending the row.
+/// A dividend of ANY rank over a scalar divisor lowers. This golden previously
+/// pinned the opposite for rank 3, which was the one case where §05 and §07 read
+/// differently: §05 constrains only the divisor ("`/` requires a scalar divisor"),
+/// which a rank-3 dividend satisfies, while §07's row enumerated `vector-scalar`
+/// and `matrix-scalar` and stopped. The refusal therefore pinned a SPEC boundary
+/// rather than a mathematical one — `v / s` is scalar multiplication by the
+/// reciprocal, sound at every rank — and it has been ruled an oversight, with a
+/// spec PR widening the row. Flipped deliberately: the divisor stays the whole
+/// discriminator, so `scalar / array` and `array / array` still refuse.
 #[test]
-fn emit_logdensity_refuses_bare_divide_of_rank_three_by_scalar() {
-    let src = "\
+fn emit_logdensity_bare_divide_of_any_rank_by_a_scalar_lowers() {
+    for (label, decl, expr) in [
+        ("rank 1", "a = elementof(cartpow(reals, 3))", "sum(a / s)"),
+        (
+            "rank 2",
+            "a = elementof(cartpow(reals, [3, 4]))",
+            "sum(sum(a / s))",
+        ),
+        (
+            "rank 3",
+            "a = elementof(cartpow(reals, [2, 3, 4]))",
+            "sum(sum(sum(a / s)))",
+        ),
+    ] {
+        let src = format!(
+            "\
 s = elementof(reals)
-a = elementof(cartpow(reals, [2, 3, 4]))
-z = a / s
-lp = logdensityof(lawof(record(y = draw(Normal(mu = sum(z), sigma = 1.0)))), record(y = 1.0))
+{decl}
+z = {expr}
+lp = logdensityof(lawof(record(y = draw(Normal(mu = z, sigma = 1.0)))), record(y = 1.0))
 inputs = (s, a)
 outputs = lp
-";
-    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
-    let err = flatppl_stablehlo::emit(
-        &d,
-        flatppl_stablehlo::Mode::LogDensity,
-        &flatppl_stablehlo::EmitOptions::default(),
-    )
-    .unwrap_err();
-    assert!(
-        err.msg
-            .contains("`/` has no meaning for these operand shapes"),
-        "expected a `divide`-domain refusal for a rank-3 dividend, got: {}",
-        err.msg
-    );
+"
+        );
+        let d = determinize_abi_roots(&src, &["inputs", "outputs"]);
+        let out = emit_logdensity(&d);
+        assert!(
+            out.contains("stablehlo.divide"),
+            "{label} dividend over a scalar divisor must lower, in:\n{out}"
+        );
+    }
+}
+
+/// The divisor remains the whole discriminator, at every rank: an ARRAY divisor
+/// still refuses, which is what keeps `scalar / vector` and `vector / vector` out
+/// (§05: "`/` requires a scalar divisor"). Widening the dividend must not have
+/// widened this.
+#[test]
+fn emit_logdensity_still_refuses_bare_divide_by_an_array() {
+    for (label, decls, expr, inputs) in [
+        (
+            "scalar / vector",
+            "s = elementof(reals)\nv = elementof(cartpow(reals, 3))",
+            "sum(s / v)",
+            "(s, v)",
+        ),
+        (
+            "vector / vector",
+            "v = elementof(cartpow(reals, 3))\nw = elementof(cartpow(reals, 3))",
+            "sum(v / w)",
+            "(v, w)",
+        ),
+        (
+            "rank-3 / vector",
+            "a = elementof(cartpow(reals, [2, 3, 4]))\nv = elementof(cartpow(reals, 4))",
+            "sum(sum(sum(a / v)))",
+            "(a, v)",
+        ),
+    ] {
+        let src = format!(
+            "\
+{decls}
+z = {expr}
+lp = logdensityof(lawof(record(y = draw(Normal(mu = z, sigma = 1.0)))), record(y = 1.0))
+inputs = {inputs}
+outputs = lp
+"
+        );
+        let d = determinize_abi_roots(&src, &["inputs", "outputs"]);
+        let err = flatppl_stablehlo::emit(
+            &d,
+            flatppl_stablehlo::Mode::LogDensity,
+            &flatppl_stablehlo::EmitOptions::default(),
+        )
+        .unwrap_err();
+        assert!(
+            err.msg
+                .contains("`/` has no meaning for these operand shapes"),
+            "{label} must still refuse, got: {}",
+            err.msg
+        );
+    }
 }
 
 /// `pow`'s domain is "scalars" too: `v ^ 2.0` refuses and names `.^`.
