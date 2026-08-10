@@ -5636,7 +5636,7 @@ fn lower_reified_measure(
 /// type-var) or non-variate types — those never refuse. `Array` and `TVector`
 /// share a kind, so a column-vs-row-vector annotation difference is not flagged.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum VariateKind {
+pub(crate) enum VariateKind {
     Scalar,
     Vector,
     Record,
@@ -5657,7 +5657,7 @@ impl VariateKind {
     }
 
     /// Singular with its article, for naming what a VARIATE is.
-    fn article_noun(self) -> &'static str {
+    pub(crate) fn article_noun(self) -> &'static str {
         match self {
             VariateKind::Scalar => "a scalar",
             VariateKind::Vector => "a vector",
@@ -5676,6 +5676,30 @@ fn variate_kind(t: &Type) -> Option<VariateKind> {
         Type::Tuple(_) => Some(VariateKind::Tuple),
         Type::Table { .. } => Some(VariateKind::Table),
         _ => None,
+    }
+}
+
+/// `value`'s CONFIRMED non-scalar [`VariateKind`], or `None` when its inferred type is a
+/// scalar OR is not known at all (`%deferred`, `%any`, a type-var, or absent — the cases
+/// [`variate_kind`] answers `None` for).
+///
+/// For a guard over a synthesized SCALAR expression. §07 "Operator-equivalent functions"
+/// gives `pow` the domain "scalars" and `divide` "scalars, vector-scalar, matrix-scalar",
+/// so a determiniser row that builds `pow(p, 2)` or `divide(d, p)` on a parameter `p`
+/// needs `p` scalar; the elementwise forms are `broadcast(pow, …)` / `.^` (§04
+/// "Broadcasting"), a different node no row builds.
+///
+/// **Prove-it-is-wrong, not fail-closed.** A literal parameter node carries no inferred
+/// type at all (`Normal(mu = 0.0, sigma = 1.0)` — the literals are untyped), so requiring
+/// a CONFIRMED scalar would reject the very rows this guards. Answering `None` on an
+/// unknown type keeps every such shape on the path it has today and refuses only what the
+/// inferred type proves is out of domain — the same discipline as the StableHLO emitter's
+/// bare-op domain guard, which stays the backstop for the unproven cases.
+pub(crate) fn confirmed_non_scalar(m: &Module, value: NodeId) -> Option<VariateKind> {
+    let (resolved, _) = resolve_ref_one(m, value);
+    match variate_kind(m.type_of(resolved)?)? {
+        VariateKind::Scalar => None,
+        kind => Some(kind),
     }
 }
 

@@ -2105,8 +2105,9 @@ fn derive_matrix_affine(
 /// (a scalar scale over an n-vector has forward log-volume `n·log|scale|`, not
 /// `log|scale|` — the same danger [`derive_bijection`]'s vector guard closes);
 /// the matrix `scale` is a CONFIRMED non-square matrix; or a scalar variate is
-/// paired with a matrix `scale`. A literal-zero scalar `scale` (a non-injective
-/// collapse) also refuses, matching [`classify`]'s affine-`mul` guard.
+/// paired with a CONFIRMED non-scalar `shift` or `scale` (§06 requires both to be
+/// "value-compatible with the variate of `m`"). A literal-zero scalar `scale` (a
+/// non-injective collapse) also refuses, matching [`classify`]'s affine-`mul` guard.
 ///
 /// `shift` and `scale` are the raw `locscale` argument nodes; they are shared
 /// (not cloned) into the emitted callables, exactly as [`derive_matrix_affine`]
@@ -2144,14 +2145,28 @@ pub(crate) fn derive_locscale(
         return Ok(Bijection { f_inv, logvol });
     }
     if matches!(domain, Type::Scalar(_)) {
-        // Scalar affine. A matrix scale is variate-incompatible here — refuse.
-        if type_is_matrix(m, scale) {
-            return Err(refuse(
-                scale,
-                m,
-                "locscale over a scalar variate requires a scalar scale, not a matrix — \
-                 refuse rather than mislower",
-            ));
+        // Scalar affine. §06 `locscale`: "`shift` and `scale` must be value-compatible
+        // with the variate of `m`", so any CONFIRMED non-scalar `shift` or `scale` is
+        // variate-incompatible here — refuse. `type_is_matrix` alone let a VECTOR through,
+        // and the emitted `divide(y − shift, scale)` then had a vector DIVISOR, outside
+        // §07 `divide`'s "scalars, vector-scalar, matrix-scalar" domain, with a vector
+        // `log|scale|` for a log-volume that has to be a scalar.
+        for (name, arg) in [("shift", shift), ("scale", scale)] {
+            if let Some(kind) = crate::density::confirmed_non_scalar(m, arg) {
+                return Err(refuse(
+                    arg,
+                    m,
+                    &format!(
+                        "locscale over a scalar variate requires a scalar {name}, and this one is \
+                         {} — §06 requires `shift` and `scale` to be value-compatible with the \
+                         variate of `m`, and the affine map onto a higher-dimensional variate has \
+                         no density w.r.t. that variate's reference measure. For a general \
+                         matrix-vector affine map use `pushfwd` directly (§06) — refuse rather \
+                         than mislower",
+                        kind.article_noun(),
+                    ),
+                ));
+            }
         }
         // A literal-zero scale collapses the forward map to the constant `shift`
         // (not injective) and makes `log|scale| = −∞`; refuse (mirrors the

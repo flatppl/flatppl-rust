@@ -9181,6 +9181,24 @@ fn determinize_abi_roots(src: &str, roots: &[&str]) -> Module {
     .expect("must determinize, not refuse")
 }
 
+/// The determiniser's refusal reason for a model this emitter's guards used to be the only
+/// gate for. `infer` must still be clean — a refusal that inference had already reported
+/// would not be the determiniser's.
+fn determinize_err(src: &str) -> String {
+    let mut m = flatppl_syntax::parse(src).expect("parse");
+    let diags = flatppl_infer::infer(&mut m);
+    assert!(diags.is_empty(), "infer diagnostics: {diags:?}");
+    let syms: Vec<flatppl_core::Symbol> =
+        ["inputs", "outputs"].iter().map(|r| m.intern(r)).collect();
+    flatppl_determinizer::determinize_with_roots(
+        &m,
+        &flatppl_infer::ModuleBundle::new(),
+        Some(&syms),
+    )
+    .expect_err("must refuse in the determiniser, not reach the emitter")
+    .reason
+}
+
 const ABI_TWO_OUTPUT_SRC: &str = "\
 a = elementof(reals)
 b = elementof(reals)
@@ -10963,20 +10981,31 @@ outputs = lp
     );
 }
 
-// The two DETERMINISER-SYNTHESIZED sites the guard newly refuses. Both were
-// accepts-invalid before it: each emitted a `func.func @logdensity(...) ->
-// tensor<3xf32>` for a query scoring a SCALAR variate, and a log-density is a
-// scalar — the vector was `broadcast_pair` silently lifting an out-of-domain
-// operand pair. Neither model is well-formed, and `infer` reports no diagnostic
-// for either (see the `%deferred` note in the wave report), so the emitter is
-// currently the only gate. Pinned here so the refusals are deliberate; the
-// cleaner fix is for the determiniser row / `infer` to reject these earlier.
+// The two DETERMINISER-SYNTHESIZED sites, now refused by the ROWS THEMSELVES.
+// Both were accepts-invalid before this guard: each emitted a `func.func
+// @logdensity(...) -> tensor<3xf32>` for a query scoring a SCALAR variate, and a
+// log-density is a scalar — the vector was `broadcast_pair` silently lifting an
+// out-of-domain operand pair. The emitter guard caught them next, and the rows
+// now refuse first, which is where the two wave reports said the fix belonged: a
+// row that cannot express the shape should not match it.
+//
+// These two therefore no longer reach the emitter, and they assert the
+// DETERMINISER refusal — kept here, at the site that found them, so removing
+// either row guard reddens a test rather than silently restoring the
+// accepts-invalid lowering. The EMITTER half of both op/shape pairs stays
+// covered by the user-written models above, which the determiniser lowers
+// unchanged: `emit_logdensity_refuses_bare_pow_with_a_vector_base` (`v ^ 2.0`)
+// and `emit_logdensity_refuses_bare_divide_of_scalar_by_vector` (`s / v`).
+//
+// `infer` still reports NO diagnostic for either model, and types the
+// synthesized `sqrt(add(pow(sv, 2.0), 1.0))` as `(%scalar real)` despite the
+// `%deferred` `pow` under it — so neither refusal comes from inference.
 
-/// The Normal–Normal conjugate marginal row (`determinizer::marginal`) fires on a
-/// prior whose `sigma` is a VECTOR and synthesizes `pow(sigma, 2)` on it —
-/// outside §07 `pow`'s "scalars" domain.
+/// The Normal–Normal conjugate marginal row (`determinizer::marginal`) matched a
+/// prior whose `sigma` is a VECTOR and synthesized `pow(sigma, 2)` on it — outside
+/// §07 `pow`'s "scalars" domain. The row's parameter-scalarity guard now refuses.
 #[test]
-fn emit_logdensity_refuses_synthesized_pow_over_a_vector_conjugate_sigma() {
+fn determinize_refuses_a_conjugate_row_over_a_vector_prior_sigma() {
     let src = "\
 sv = elementof(cartpow(posreals, 3))
 a = draw(Normal(mu = 0.0, sigma = sv))
@@ -10985,28 +11014,21 @@ lp = logdensityof(lawof(record(y = y)), record(y = 1.0))
 inputs = (sv)
 outputs = lp
 ";
-    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
-    let err = flatppl_stablehlo::emit(
-        &d,
-        flatppl_stablehlo::Mode::LogDensity,
-        &flatppl_stablehlo::EmitOptions::default(),
-    )
-    .unwrap_err();
+    let err = determinize_err(src);
     assert!(
-        err.msg
-            .contains("`^` has no meaning for these operand shapes"),
-        "expected a `pow`-domain refusal for the vector conjugate sigma, got: {}",
-        err.msg
+        err.contains("conjugate pair matched but the prior's `sigma` is a vector")
+            && err.contains("broadcast"),
+        "expected the conjugate row's non-scalar-parameter refusal, got: {err}"
     );
 }
 
 /// `locscale` over a SCALAR variate synthesizes `divide(y − shift, scale)`
-/// (`determinizer::invert::derive_locscale`). That branch refuses a MATRIX scale
-/// but not a VECTOR one, so a vector `scale` reaches the emitter as the DIVISOR —
-/// which the amended §07 row still requires to be scalar, so it refuses. The
-/// `divide` widening does not rescue this one.
+/// (`determinizer::invert::derive_locscale`). That branch refused a MATRIX scale
+/// but not a VECTOR one, so a vector `scale` became the DIVISOR — outside §07
+/// `divide`'s "scalars, vector-scalar, matrix-scalar" domain, and §06 requires
+/// `scale` to be value-compatible with the variate of `m`. The branch now refuses.
 #[test]
-fn emit_logdensity_refuses_synthesized_divide_by_a_vector_locscale_scale() {
+fn determinize_refuses_a_scalar_variate_locscale_with_a_vector_scale() {
     let src = "\
 sc = elementof(cartpow(posreals, 3))
 m0 = locscale(Normal(mu = 0.0, sigma = 1.0), 1.0, sc)
@@ -11014,18 +11036,11 @@ lp = logdensityof(lawof(record(y = draw(m0))), record(y = 0.5))
 inputs = (sc)
 outputs = lp
 ";
-    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
-    let err = flatppl_stablehlo::emit(
-        &d,
-        flatppl_stablehlo::Mode::LogDensity,
-        &flatppl_stablehlo::EmitOptions::default(),
-    )
-    .unwrap_err();
+    let err = determinize_err(src);
     assert!(
-        err.msg
-            .contains("`/` has no meaning for these operand shapes"),
-        "expected a `divide`-domain refusal for the vector locscale scale, got: {}",
-        err.msg
+        err.contains("locscale over a scalar variate requires a scalar scale")
+            && err.contains("a vector"),
+        "expected the locscale scalar-branch refusal, got: {err}"
     );
 }
 
