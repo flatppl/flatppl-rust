@@ -120,6 +120,16 @@
 //!   \"Linear algebra\" gives it the domain \"vectors, matrices\"". A rank-1
 //!   operand emits NOTHING (the transposition is type-level only) and a rank-2 one
 //!   emits `stablehlo.transpose … dims = [1, 0]`.
+//! - an operand pair of different ORIENTATION — a rank-1 `Array` (column) against
+//!   a `TVector` (row) — "operands have different orientation: ... §03 makes a
+//!   transposed vector a distinct type from a one-dimensional array ...".
+//!   `ops::require_same_orientation`, called from `binary`, `lower_compare` and
+//!   `lower_ifelse` (the branch pair). It CANNOT live in `require_broadcastable`:
+//!   that sees only `MlirTy`, where both are `tensor<nxf32>`. Deliberately
+//!   orientation-only, not the whole of `ArithShape::differs_from` — that also
+//!   reports a scalar against an array, which is exactly what the dotted
+//!   spellings broadcast and what the determiniser's synthesized
+//!   `mul(literal, vector)` relies on.
 //! - a BARE `add`/`sub`/`divide`/`pow` (surface `+`, `-`, `/`, `^`) whose operand
 //!   shapes are outside the §07 "Operator-equivalent functions" domain for that
 //!   head — `add`/`sub` take "scalars or arrays of same shape (real or complex)",

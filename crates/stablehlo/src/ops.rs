@@ -192,6 +192,55 @@ fn unary<'m>(
     Ok(op(e, &a))
 }
 
+/// Refuse an operand pair whose ORIENTATION differs — a column (a rank-1
+/// `Array`) against a row (a `TVector`).
+///
+/// The elementwise, compare and select paths all reconcile through `MlirTy`,
+/// where a `TVector{n}` and a rank-1 `Array[n]` are the same `tensor<nxf32>` — so
+/// §03's distinction ("In addition, transposed vectors are a distinct type in
+/// FlatPPL") is invisible to `require_broadcastable` / `Emitter::compare` /
+/// `Emitter::select`, and a row/column mix lowered silently. This reads the
+/// INFERRED types instead, the way [`classify_bare_mul`] does, and it is why the
+/// check lives in the `crate::ops` callers rather than in
+/// [`require_broadcastable`], which only ever sees `MlirTy`.
+///
+/// Deliberately NOT the whole of [`ArithShape::differs_from`], which also reports
+/// a scalar against an array: the dotted spellings exist to broadcast exactly
+/// that (`s .+ v`), and the determiniser's synthesized `mul(literal, vector)`
+/// idiom reaches [`binary`] too, so refusing that pair would break far more than
+/// it fixes. Extent mismatches within one orientation stay
+/// [`require_broadcastable`]'s job.
+fn require_same_orientation(
+    e: &Emitter,
+    id: NodeId,
+    a: NodeId,
+    b: NodeId,
+) -> Result<(), EmitError> {
+    let (sa, sb) = (arith_shape(e, a), arith_shape(e, b));
+    if matches!(
+        (&sa, &sb),
+        (ArithShape::Array(_), ArithShape::TVector(_))
+            | (ArithShape::TVector(_), ArithShape::Array(_))
+    ) {
+        let shape = |n: NodeId| match e.type_of(n) {
+            Some(t) => format!("{t:?}"),
+            None => "unknown".to_string(),
+        };
+        return Err(EmitError::at(
+            id,
+            format!(
+                "operands have different orientation: {} against {} — §03 makes a transposed \
+                 vector a distinct type from a one-dimensional array, so combining a row with \
+                 a column elementwise is not defined even though both are `tensor<nxf32>`. \
+                 Transpose one of them to match",
+                shape(a),
+                shape(b)
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn binary<'m>(
     e: &mut Emitter<'m>,
     id: NodeId,
@@ -199,6 +248,10 @@ fn binary<'m>(
     op: fn(&mut Emitter<'m>, &Value, &Value) -> Value,
 ) -> Result<Value, EmitError> {
     let [a, b] = args_exact(id, args)?;
+    // Orientation first, from the inferred types, while the node ids are still in
+    // hand — `require_broadcastable` below sees only `MlirTy`, which cannot tell a
+    // row from a column.
+    require_same_orientation(e, id, a, b)?;
     let a = e.lower_node(a)?;
     let b = e.lower_node(b)?;
     require_broadcastable(id, &a, &b)?;
@@ -730,6 +783,10 @@ fn lower_matrix_product(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<
 fn lower_ifelse(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
     let [c, a, b] = args_exact(id, args)?;
     require_predicate_head(e, c, "ifelse condition")?;
+    // The two BRANCHES must share an orientation: selecting between a row and a
+    // column is not defined, and neither the `broadcast_pair` below nor
+    // `Emitter::select` can see the difference (both are `tensor<nxf32>`).
+    require_same_orientation(e, id, a, b)?;
     let c = e.lower_node(c)?;
     let a = e.lower_node(a)?;
     let b = e.lower_node(b)?;
@@ -861,6 +918,9 @@ fn lower_compare(
     dir: &str,
 ) -> Result<Value, EmitError> {
     let [a, b] = args_exact(id, args)?;
+    // Comparing a row against a column is not defined either, and `MlirTy` cannot
+    // tell them apart — same reasoning as [`binary`]'s.
+    require_same_orientation(e, id, a, b)?;
     let a = e.lower_node(a)?;
     let b = e.lower_node(b)?;
     // `Emitter::compare` reconciles its operands through `broadcast_pair` exactly

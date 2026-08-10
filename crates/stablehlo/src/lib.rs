@@ -52,6 +52,18 @@
 //!   model emits whether or not the source exists. `anything` declares no shape
 //!   and refuses.
 //!
+//! **Orientation is absent from the emitted signature, deliberately.** §03 makes
+//! a transposed vector a distinct type from a one-dimensional array, but MLIR has
+//! no such distinction: a `TVector{N}` argument or result renders
+//! `tensor<Nxf32>`, indistinguishable from a column of the same length. So a
+//! caller cannot tell from the signature whether an argument is a row or a
+//! column, and a `@logdensity` whose output is a transposed vector looks exactly
+//! like one returning a column. This is not a wrong number — the orientation is
+//! enforced inside the emitter, where `crate::ops` reads the INFERRED types (a
+//! row/column mix refuses, whether spelled `*`, `.+`, a comparison or an `ifelse`
+//! branch pair) — it is a limit of what the boundary can express. A host that
+//! needs the distinction must carry it out of band.
+//!
 //! ## Aggregate `load_data` inputs destructure into one argument per column
 //!
 //! A `load_data` input whose `valueset` is a table (`cartpow(cartprod(a = S1,

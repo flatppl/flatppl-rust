@@ -9735,6 +9735,117 @@ outputs = lp
     );
 }
 
+/// Orientation is enforced on the DOTTED and predicate paths too, not just the
+/// bare ones. `require_broadcastable`, `Emitter::compare` and `Emitter::select`
+/// all reconcile through `MlirTy`, where a `TVector{3}` and an `Array[3]` are the
+/// same `tensor<3xf32>` — so §03's distinction was invisible to them and each of
+/// these four mixed a row with a column at exit 0 before this check.
+#[test]
+fn emit_logdensity_refuses_mixed_orientation_on_the_dotted_and_predicate_paths() {
+    for (label, expr, inputs) in [
+        ("`.+`", "sum(transpose(v) .+ w)", "(v, w)"),
+        ("`.*`", "sum(transpose(v) .* w)", "(v, w)"),
+        (
+            "compare inside ifelse",
+            "sum(ifelse(transpose(v) < w, v, w))",
+            "(v, w)",
+        ),
+        (
+            "ifelse branches",
+            "sum(ifelse(p < q, transpose(v), w))",
+            "(v, w, p, q)",
+        ),
+    ] {
+        let src = format!(
+            "\
+v = elementof(cartpow(reals, 3))
+w = elementof(cartpow(reals, 3))
+p = elementof(reals)
+q = elementof(reals)
+z = {expr}
+lp = logdensityof(lawof(record(y = draw(Normal(mu = z, sigma = 1.0)))), record(y = 1.0))
+inputs = {inputs}
+outputs = lp
+"
+        );
+        let d = determinize_abi_roots(&src, &["inputs", "outputs"]);
+        let err = flatppl_stablehlo::emit(
+            &d,
+            flatppl_stablehlo::Mode::LogDensity,
+            &flatppl_stablehlo::EmitOptions::default(),
+        )
+        .unwrap_err();
+        assert!(
+            err.msg.contains("different orientation"),
+            "{label} must refuse a row/column mix, got: {}",
+            err.msg
+        );
+    }
+}
+
+/// The controls the orientation check must NOT catch. A SCALAR against an array is
+/// exactly what the dotted spellings broadcast, and it is also the determiniser's
+/// synthesized `mul(literal, vector)` idiom — which is why the check is
+/// orientation-only rather than the whole of `ArithShape::differs_from` (that
+/// reports a scalar/array pair as differing too). Two operands of the SAME
+/// orientation stay legal whatever the orientation is.
+#[test]
+fn emit_logdensity_orientation_check_leaves_broadcast_and_same_orientation_alone() {
+    for (label, decls, expr, inputs, want) in [
+        (
+            "scalar .+ vector",
+            "s = elementof(reals)\nv = elementof(cartpow(reals, 3))",
+            "sum(s .+ v)",
+            "(s, v)",
+            "stablehlo.add",
+        ),
+        (
+            "scalar .* vector",
+            "s = elementof(reals)\nv = elementof(cartpow(reals, 3))",
+            "sum(s .* v)",
+            "(s, v)",
+            "stablehlo.multiply",
+        ),
+        (
+            "TVector .+ TVector",
+            "v = elementof(cartpow(reals, 3))\nw = elementof(cartpow(reals, 3))",
+            "sum(transpose(v) .+ transpose(w))",
+            "(v, w)",
+            "stablehlo.add",
+        ),
+        (
+            "TVector .* TVector",
+            "v = elementof(cartpow(reals, 3))\nw = elementof(cartpow(reals, 3))",
+            "sum(transpose(v) .* transpose(w))",
+            "(v, w)",
+            "stablehlo.multiply",
+        ),
+        (
+            "all-TVector ifelse",
+            "v = elementof(cartpow(reals, 3))\nw = elementof(cartpow(reals, 3))",
+            "sum(ifelse(transpose(v) < transpose(w), transpose(v), transpose(w)))",
+            "(v, w)",
+            "stablehlo.select",
+        ),
+    ] {
+        let src = format!(
+            "\
+{decls}
+z = {expr}
+lp = logdensityof(lawof(record(y = draw(Normal(mu = z, sigma = 1.0)))), record(y = 1.0))
+inputs = {inputs}
+outputs = lp
+"
+        );
+        let d = determinize_abi_roots(&src, &["inputs", "outputs"]);
+        let out = emit_logdensity(&d);
+        assert!(
+            out.contains(want),
+            "{label} must still lower a {want}, in:\n{out}"
+        );
+    }
+}
+
 /// `transpose(a) * b` is the INNER product — §07: "the product of a transposed
 /// vector and a non-transposed vector is a scalar". One `dot_general` contracting
 /// axis 0 against axis 0, with a rank-0 (`tensor<f32>`) result. This is the trap
