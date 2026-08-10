@@ -22,13 +22,15 @@ fn errors(src: &str) -> Vec<String> {
         .collect()
 }
 
-/// The tail `arg_name_check` appends when the unbindable names came from a
-/// SPLATTED record or table, pointing at the keyword spelling §04 names. Spelled
-/// once here so the assertions below stay readable and still match exactly.
-const SPLAT_HINT: &str = " — a sole positional record or table always splats \
-                           (spec §04), so its field names bind as arguments; to \
-                           pass it as one ordinary argument use the keyword \
-                           spelling, as in `f(pars = record(...))`";
+/// The tail every diagnostic gets when its count or names came from a SPLATTED
+/// record or table, pointing at the keyword spelling §04 names. Spelled out here
+/// rather than imported from the crate: importing would make the assertions
+/// tautological (the message equalling itself), whereas this copy pins the rendered
+/// text and fails loudly if it drifts.
+const SPLAT_HINT: &str = " — this sole positional record or table splatted into one \
+                           argument per field (spec §04), so its field names bind as \
+                           argument names; to pass it as one ordinary argument use \
+                           the keyword spelling, as in `f(pars = record(...))`";
 
 /// The six leaks that motivated the rule. Each typed a concrete scalar (or
 /// `%deferred`) before; each is `%failed` now, with the callee and its declared
@@ -481,10 +483,13 @@ fn the_splat_hint_reaches_every_diagnostic_a_splatting_call_can_produce() {
         )]
     );
     // §07 value function, arity path — the reach onto §07 the amendment created.
+    // `prod` and not `sum`: `sum` is exempt under #78's carve-out (see
+    // `a_single_input_callable_whose_domain_admits_tables_is_exempt`), while `prod` is
+    // an arrays-only row and still splats.
     assert_eq!(
-        errors("d = load_data(\"d.csv\", cartpow(cartprod(x = reals, y = reals), 4))\ns = sum(d)"),
+        errors("d = load_data(\"d.csv\", cartpow(cartprod(x = reals, y = reals), 4))\ns = prod(d)"),
         vec![format!(
-            "`sum` takes 1 argument (spec §07), got 2{SPLAT_HINT}"
+            "`prod` takes 1 argument (spec §07), got 2{SPLAT_HINT}"
         )]
     );
     // USER call, arity path — the shape the transport models used.
@@ -503,4 +508,89 @@ fn the_splat_hint_reaches_every_diagnostic_a_splatting_call_can_produce() {
         errors("x = exp(1.0, 2.0)"),
         vec!["`exp` takes 1 argument (spec §07), got 2".to_string()]
     );
+}
+
+/// §04's single-input carve-out (flatppl-design#78, pending owner review): "A
+/// callable with exactly one input whose documented domain admits records or tables
+/// is exempt and receives a sole positional record or table whole, so that `sum(t)`
+/// and `lengthof(t)` reduce over the table rather than splatting."
+///
+/// Without it the unconditional splat binds by NAME, so `sum(t)` was valid for no
+/// table at any column count — which made §07's **Table reductions** paragraph dead
+/// prose and contradicted §03 "Tables": "`lengthof(t)` returns the number of table
+/// rows."
+///
+/// The exempt set was derived by reading every §07 domain, not from #78's two
+/// examples: `lengthof` is the only row whose *Domains* cell names tables
+/// ("vectors, tables"), and `sum`/`mean`/`var` get theirs from the Table reductions
+/// paragraph. Both halves of the condition come from the CALLEE's signature.
+#[test]
+fn a_single_input_callable_whose_domain_admits_tables_is_exempt() {
+    let t = "d = load_data(\"d.csv\", cartpow(cartprod(x = reals, y = reals), 4))\n";
+    // The four exempt rows take the two-column table whole.
+    for f in ["sum", "mean", "var", "lengthof"] {
+        assert!(
+            errors(&format!("{t}s = {f}(d)")).is_empty(),
+            "`{f}` is exempt and must take the table whole"
+        );
+        // Same for a record, which §04 names alongside tables.
+        assert!(
+            errors(&format!("r = record(a = 1.0, b = 2.0)\ns = {f}(r)")).is_empty(),
+            "`{f}` is exempt for a record too"
+        );
+    }
+    // `std` is the near miss and is NOT exempt: it is sqrt(var) over "real arrays",
+    // but the Table reductions paragraph names three functions and `std` is not one,
+    // so no documented domain admits a table. Following the spec as written.
+    assert_eq!(
+        errors(&format!("{t}s = std(d)")),
+        vec![format!(
+            "`std` takes 1 argument (spec §07), got 2{SPLAT_HINT}"
+        )],
+        "`std` has no documented table domain, so it still splats"
+    );
+    // Arrays-only rows keep splatting.
+    for f in ["prod", "sizeof"] {
+        assert_eq!(
+            errors(&format!("{t}s = {f}(d)")),
+            vec![format!(
+                "`{f}` takes 1 argument (spec §07), got 2{SPLAT_HINT}"
+            )],
+            "`{f}` is arrays-only and must still splat"
+        );
+    }
+    // The ARITY half matters independently of the domain half: `Exponential` has one
+    // input, but its domain is `reals`, so it splats — and here the field name
+    // happens to match, which is what makes the call valid rather than the exemption.
+    assert!(errors("m = Exponential(record(rate = 1.0))").is_empty());
+    assert_eq!(
+        errors("m = Exponential(record(zzz = 1.0))"),
+        vec![format!(
+            "`Exponential` has no parameter `zzz` (spec §08 parameters: `rate`){SPLAT_HINT}"
+        )],
+        "one input is not enough to exempt: the domain must admit aggregates"
+    );
+    // Multi-input splats are untouched, and so are the vector domains of the exempt
+    // rows themselves.
+    assert!(errors("m = Normal(record(mu = 0.0, sigma = 1.0))").is_empty());
+    assert!(errors("v = [1.0, 2.0]\ns = sum(v)").is_empty());
+    assert!(errors("v = [1.0, 2.0]\ns = lengthof(v)").is_empty());
+}
+
+/// A user callable is never exempt: #78 keys the carve-out on a *documented domain*,
+/// and a user boundary declares parameters, not domains. So a sole positional record
+/// still splats into a user call — which is what `a_user_call_can_splat_a_sole_record
+/// _argument` relies on.
+#[test]
+fn a_user_callable_is_never_exempt_from_the_splat() {
+    let f = "pars = record(a = 1.0, b = 2.0)\n";
+    assert_eq!(
+        errors(&format!("{f}one(p) = get(p, [\"a\"])\ny = one(pars)")),
+        vec![format!(
+            "`one` declares 1 parameter, got 2 arguments{SPLAT_HINT}"
+        )],
+        "a one-parameter user callable has no documented domain, so no exemption"
+    );
+    // And the keyword spelling is still the way to pass the record whole.
+    assert!(errors(&format!("{f}one(p) = get(p, [\"a\"])\ny = one(p = pars)")).is_empty());
 }

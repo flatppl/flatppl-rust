@@ -2103,8 +2103,10 @@ fn user_arity_check(
     let want = entries.len();
     // §04 scopes auto-splatting to "built-in or user defined value functions,
     // constructors or transition kernels", so a user call reads a sole record
-    // argument exactly as a builtin call does.
-    let reading = arg_reading(args, named)?;
+    // argument exactly as a builtin call does. #78's single-input carve-out turns
+    // on a DOCUMENTED DOMAIN, which a user callable does not have — its boundary
+    // declares parameters, not domains — so a user call is never exempt.
+    let reading = arg_reading(args, named, false)?;
     let got = reading.count;
     let who = match inf.module.node(callee) {
         Node::Ref(r) if r.ns == RefNs::SelfMod => {
@@ -2737,7 +2739,7 @@ fn arity_check(
 ) -> Option<Type> {
     let cat = crate::catalogue::builtin();
     let arity = cat.base_arity(name)?;
-    let reading = arg_reading(args, named)?;
+    let reading = arg_reading(args, named, cat.base_takes_aggregate_whole(name))?;
     let got = reading.count;
     if arity.admits(got) {
         // The count is right; the names still have to be the declared ones.
@@ -2773,21 +2775,28 @@ fn arity_check(
 }
 
 /// The explanation appended to any diagnostic whose argument count or names came
-/// from an auto-splat. §04's always-splat rule is the surprising step — the author
-/// wrote one argument and the error talks about several, or about names they never
-/// typed — so every diagnostic on a splatting call says the splat happened and
-/// names the spelling that passes the aggregate as one value (§04: "Passing a
-/// record or table as one ordinary argument requires the keyword spelling, as in
+/// from an auto-splat. The splat is the surprising step — the author wrote one
+/// argument and the error talks about several, or about names they never typed — so
+/// every diagnostic on a splatting call says the splat happened and names the
+/// spelling that passes the aggregate as one value (§04: "Passing a record or table
+/// as one ordinary argument requires the keyword spelling, as in
 /// `f(pars = record(...))`").
+///
+/// Deliberately does NOT say "always splats". #78's single-input carve-out made
+/// that false: `sum(t)` and `lengthof(t)` do not splat. The wording states what
+/// happened to THIS call instead of asserting a universal rule, which is both true
+/// and the more useful thing to read. It also stays quiet about the carve-out —
+/// naming it would be noise on `Poisson(record(zzz = 0.5))`, where no exemption
+/// could apply.
 ///
 /// Shared by all three paths that can report on a splatting call: the two arity
 /// mismatches ([`arity_check`] for builtins, [`user_arity_check`] for user
 /// callables) and the name check ([`arg_name_check`]). A call that does not splat
 /// gets none of it — an ordinary over-arity call has nothing to explain.
-const SPLAT_HINT: &str = " — a sole positional record or table always splats \
-                          (spec §04), so its field names bind as arguments; to \
-                          pass it as one ordinary argument use the keyword \
-                          spelling, as in `f(pars = record(...))`";
+const SPLAT_HINT: &str = " — this sole positional record or table splatted into one \
+                          argument per field (spec §04), so its field names bind as \
+                          argument names; to pass it as one ordinary argument use \
+                          the keyword spelling, as in `f(pars = record(...))`";
 
 /// How a call's arguments read against a declared parameter count.
 struct ArgReading {
@@ -2814,13 +2823,24 @@ struct ArgReading {
 /// column names match the callable's argument names decides only whether the call
 /// is valid, never whether the splat occurs."
 ///
-/// So the callee's parameter list does NOT influence the reading: it cannot make a
+/// So the callee's parameter NAMES do not influence the reading: they cannot make a
 /// sole positional record read as one ordinary value. Passing a record as one
 /// argument takes the keyword spelling instead — §04: "Passing a record or table as
 /// one ordinary argument requires the keyword spelling, as in
 /// `f(pars = record(...))`" — which lands in the `!named.is_empty()` arm below and
 /// does not splat, as do the other two non-splatting cases §04 names ("a record
 /// given alongside other arguments, or bound to a parameter by keyword").
+///
+/// `takes_aggregate_whole` is §04's SINGLE-INPUT CARVE-OUT (flatppl-design#78,
+/// pending owner review): "A callable with exactly one input whose documented
+/// domain admits records or tables is exempt and receives a sole positional record
+/// or table whole, so that `sum(t)` and `lengthof(t)` reduce over the table rather
+/// than splatting." Without it the splat binds by name, so `sum(t)` and
+/// `lengthof(t)` were valid for no table at any column count — which made §07's
+/// **Table reductions** paragraph dead prose. The exempt set is
+/// `Catalogue::base_takes_aggregate_whole`, keyed on the callee's own arity and
+/// documented domain; a USER callable is never exempt, having no documented domain
+/// to read.
 ///
 /// Because the splat is unconditional, the field names are always the binding
 /// names, so `arg_name_check` now name-checks every sole-record call — including
@@ -2835,13 +2855,17 @@ struct ArgReading {
 /// which is every special operation.
 ///
 /// When the sole argument's type is still open, the reading is not knowable.
-fn arg_reading(args: &[ArgInfo], named: &[NamedInfo]) -> Option<ArgReading> {
+fn arg_reading(
+    args: &[ArgInfo],
+    named: &[NamedInfo],
+    takes_aggregate_whole: bool,
+) -> Option<ArgReading> {
     let plain = args.len() + named.len();
     let plain_reading = Some(ArgReading {
         count: plain,
         splatting: false,
     });
-    if !named.is_empty() || args.len() != 1 {
+    if !named.is_empty() || args.len() != 1 || takes_aggregate_whole {
         return plain_reading;
     }
     let fields = match &args[0].1 {
