@@ -378,6 +378,90 @@ impl Catalogue {
         }
     }
 
+    /// Base builtins whose documented domain admits a record or a TABLE, and so
+    /// take a sole positional aggregate whole instead of auto-splatting it —
+    /// §04's single-input carve-out (flatppl-design#78, pending owner review):
+    /// "A callable with exactly one input whose documented domain admits records
+    /// or tables is exempt and receives a sole positional record or table whole,
+    /// so that `sum(t)` and `lengthof(t)` reduce over the table rather than
+    /// splatting."
+    ///
+    /// Derived by classifying all 96 single-input base builtins against §07's
+    /// Domains column and prose, not by taking #78's two examples as the list. Each
+    /// member, with where its aggregate domain is documented:
+    ///
+    /// - `lengthof` ("vectors, tables"), `reverse` ("vectors, tables"), `indicesof`
+    ///   and `indicesof0` ("vectors, arrays, tables") — the Domains cell names
+    ///   tables outright. §03 "Tables" backs `lengthof`: "`lengthof(t)` returns the
+    ///   number of table rows."
+    /// - `identity` ("any") — an unrestricted domain admits records and tables, and
+    ///   a function returning its argument unchanged must not restructure it.
+    /// - `sum`, `mean`, `var`, `std` — their Domains cells say only "real/complex
+    ///   arrays" / "real arrays"; the table domain lives in §07's **Table
+    ///   reductions** paragraph ("When `sum`, `mean`, `var`, or `std` is applied to a
+    ///   table, the reduction operates column-wise and returns a record whose fields
+    ///   are the column names"). #78 names `sum(t)` normatively for exactly this
+    ///   reason. `std` was added to that paragraph by an owner ruling on 2026-08-10
+    ///   (flatppl-design `4c93237`, onto #77) after this guard first shipped without
+    ///   it — it is $\sqrt{\mathrm{var}}$, so a column-wise `var` implies a
+    ///   column-wise `std`.
+    ///
+    /// Deliberately ABSENT, each checked against its own row rather than assumed:
+    ///
+    /// - `boolean`, `integer`, `real` — "any **scalar** numeric". The word "any" is
+    ///   qualified, so these do not admit aggregates.
+    /// - `sizeof` ("vectors, arrays"), `prod` ("real/complex arrays"), and every
+    ///   other reduction/norm/stack row — arrays only.
+    /// - `qr` — RETURNS `record(Q, R)`, but its domain is "$m \times n$ matrices".
+    ///   The carve-out is about the domain, not the result.
+    /// - `totalmass` — §06, and its input is a measure, not an aggregate.
+    /// - `length` and `log2` — catalogue rows with no §07 entry at all, so no
+    ///   documented domain to admit anything.
+    /// - Every single-input §08 constructor (`Poisson`, `Dirichlet`, `Categorical`,
+    ///   `Exponential`, …) — scalar or vector domains, never aggregates. This is
+    ///   what keeps `Poisson(record(zzz = 0.5))` a static error.
+    /// - `get`, `get0` ("records, arrays, tables, tuples") and `filter` ("function,
+    ///   array or table") DO admit aggregates in their cells, but they are
+    ///   MULTI-input, so #78's "exactly one input" half excludes them and they never
+    ///   reach this list. They are also absent from the single-input arity set, so
+    ///   the exclusion holds twice over.
+    ///
+    /// The caller pairs this with the arity half of #78's condition, so a row that
+    /// later gains a second parameter stops being exempt without this list changing
+    /// — see [`Catalogue::base_takes_aggregate_whole`].
+    const AGGREGATE_DOMAIN_BUILTINS: &[&str] = &[
+        "identity",
+        "indicesof",
+        "indicesof0",
+        "lengthof",
+        "mean",
+        "reverse",
+        "std",
+        "sum",
+        "var",
+    ];
+
+    /// True iff base builtin `name` satisfies BOTH halves of §04's single-input
+    /// carve-out: exactly one declared input, and a documented domain admitting
+    /// records or tables ([`Self::AGGREGATE_DOMAIN_BUILTINS`]).
+    ///
+    /// Both halves are read off the CALLEE's signature, never the caller's field
+    /// names, which is what keeps the rule decidable at the call site and leaves
+    /// every multi-input splat alone. Arity is checked here rather than trusted of
+    /// the list: `Exponential(record(rate = 1.0))` is one input but a `reals`
+    /// domain, and a hypothetical two-input `sum` would stop being exempt on its
+    /// own.
+    pub(crate) fn base_takes_aggregate_whole(&self, name: &str) -> bool {
+        let single_input = matches!(
+            self.base_arity(name),
+            Some(Arity {
+                min: 1,
+                max: Some(1)
+            })
+        );
+        single_input && Self::AGGREGATE_DOMAIN_BUILTINS.contains(&name)
+    }
+
     /// The declared parameter NAMES of base builtin `name`, for the §04
     /// name-binding rule. Only distribution rows have them: a `Sig::Function` /
     /// `Sig::Structural` row declares `ParamSig` type tags, whose §07 names live

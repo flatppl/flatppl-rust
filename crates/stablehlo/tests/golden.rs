@@ -11181,11 +11181,19 @@ outputs = (lp)
 /// A destructured table used as ONE value (here `sum(data)`) refuses: the
 /// per-column arguments supply no monolithic tensor, and the message says to
 /// read it column-wise instead of reporting an unsupported head.
+///
+/// The table has ONE column because §04, as amended by design#74, makes a sole
+/// positional record or table splat unconditionally: a two-column `sum(data)` now
+/// reads as two arguments and fails inference on arity before reaching the emitter.
+/// One column splats to one argument, which `sum`'s arity admits, so the call still
+/// reaches the emitter with the whole table in tensor position — which is what this
+/// test is about. (The keyword spelling `sum(xs = data)` does not work here for an
+/// unrelated reason: `ops::lower_builtin` reads only positional arguments.)
 #[test]
 fn emit_logdensity_abi_refuses_whole_table_in_tensor_position() {
     let src = "\
 alpha = elementof(reals)
-data = load_data(\"d.csv\", cartpow(cartprod(x = reals, y = reals), 4))
+data = load_data(\"d.csv\", cartpow(cartprod(x = reals), 4))
 lp = logdensityof(lawof(record(y = draw(Normal(mu = alpha, sigma = 1.0)))), \
 record(y = sum(data)))
 inputs = (alpha, data)
