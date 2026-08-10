@@ -386,36 +386,54 @@ impl Catalogue {
     /// so that `sum(t)` and `lengthof(t)` reduce over the table rather than
     /// splatting."
     ///
-    /// Derived by reading every §07 domain, not by taking the sentence's two
-    /// examples as the list. The whole set, with where the domain is documented:
+    /// Derived by classifying all 96 single-input base builtins against §07's
+    /// Domains column and prose, not by taking #78's two examples as the list. Each
+    /// member, with where its aggregate domain is documented:
     ///
-    /// - `lengthof` — the only §07 row whose *Domains* cell names tables outright
-    ///   ("vectors, tables"), and §03 "Tables": "`lengthof(t)` returns the number
-    ///   of table rows."
+    /// - `lengthof` ("vectors, tables"), `reverse` ("vectors, tables"), `indicesof`
+    ///   and `indicesof0` ("vectors, arrays, tables") — the Domains cell names
+    ///   tables outright. §03 "Tables" backs `lengthof`: "`lengthof(t)` returns the
+    ///   number of table rows."
+    /// - `identity` ("any") — an unrestricted domain admits records and tables, and
+    ///   a function returning its argument unchanged must not restructure it.
     /// - `sum`, `mean`, `var` — their Domains cells say only "real/complex arrays";
     ///   the table domain lives in §07's **Table reductions** paragraph ("When
     ///   `sum`, `mean`, or `var` is applied to a table, the reduction operates
     ///   column-wise and returns a record whose fields are the column names"). #78
     ///   names `sum(t)` normatively for exactly this reason.
     ///
-    /// Deliberately ABSENT, each checked against its own row:
+    /// Deliberately ABSENT, each checked against its own row rather than assumed:
     ///
     /// - `std` — the near miss. It is $\sqrt{\mathrm{var}}$ over "real arrays", but
     ///   the Table reductions paragraph names three functions and `std` is not one
     ///   of them, so no documented domain admits a table. Following the spec as
     ///   written; flagged as a spec question rather than papered over here.
+    /// - `boolean`, `integer`, `real` — "any **scalar** numeric". The word "any" is
+    ///   qualified, so these do not admit aggregates.
     /// - `sizeof` ("vectors, arrays"), `prod` ("real/complex arrays"), and every
     ///   other reduction/norm/stack row — arrays only.
     /// - `qr` — RETURNS `record(Q, R)`, but its domain is "$m \times n$ matrices".
     ///   The carve-out is about the domain, not the result.
+    /// - `totalmass` — §06, and its input is a measure, not an aggregate.
+    /// - `length` and `log2` — catalogue rows with no §07 entry at all, so no
+    ///   documented domain to admit anything.
     /// - Every single-input §08 constructor (`Poisson`, `Dirichlet`, `Categorical`,
-    ///   …) — scalar or vector domains, never aggregates. This is what keeps
-    ///   `Poisson(record(zzz = 0.5))` a static error.
+    ///   `Exponential`, …) — scalar or vector domains, never aggregates. This is
+    ///   what keeps `Poisson(record(zzz = 0.5))` a static error.
     ///
     /// The caller pairs this with the arity half of #78's condition, so a row that
     /// later gains a second parameter stops being exempt without this list changing
     /// — see [`Catalogue::base_takes_aggregate_whole`].
-    const AGGREGATE_DOMAIN_BUILTINS: &[&str] = &["lengthof", "mean", "sum", "var"];
+    const AGGREGATE_DOMAIN_BUILTINS: &[&str] = &[
+        "identity",
+        "indicesof",
+        "indicesof0",
+        "lengthof",
+        "mean",
+        "reverse",
+        "sum",
+        "var",
+    ];
 
     /// True iff base builtin `name` satisfies BOTH halves of §04's single-input
     /// carve-out: exactly one declared input, and a documented domain admitting

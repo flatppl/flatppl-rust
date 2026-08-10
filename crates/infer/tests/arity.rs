@@ -520,15 +520,32 @@ fn the_splat_hint_reaches_every_diagnostic_a_splatting_call_can_produce() {
 /// prose and contradicted §03 "Tables": "`lengthof(t)` returns the number of table
 /// rows."
 ///
-/// The exempt set was derived by reading every §07 domain, not from #78's two
-/// examples: `lengthof` is the only row whose *Domains* cell names tables
-/// ("vectors, tables"), and `sum`/`mean`/`var` get theirs from the Table reductions
-/// paragraph. Both halves of the condition come from the CALLEE's signature.
+/// The exempt set was derived by classifying all 96 single-input base builtins
+/// against §07's Domains column and prose, not from #78's two examples.
+/// `lengthof`/`reverse` ("vectors, tables"), `indicesof`/`indicesof0` ("vectors,
+/// arrays, tables") and `identity` ("any") have it in the cell; `sum`/`mean`/`var`
+/// get theirs from the Table reductions paragraph. Both halves of the condition
+/// come from the CALLEE's signature.
+///
+/// An earlier revision of this test listed only four, because the extraction regex
+/// matched a bare `` |`name`| `` row and silently dropped every row whose name is a
+/// LINK (`| [`reverse`](#reverse) |`) — which is most of them. The four missed rows
+/// are named individually below so a repeat of that mistake fails here.
 #[test]
 fn a_single_input_callable_whose_domain_admits_tables_is_exempt() {
     let t = "d = load_data(\"d.csv\", cartpow(cartprod(x = reals, y = reals), 4))\n";
-    // The four exempt rows take the two-column table whole.
-    for f in ["sum", "mean", "var", "lengthof"] {
+    // All EIGHT exempt rows take the two-column table whole. `reverse`,
+    // `indicesof`, `indicesof0` and `identity` are the ones the first pass missed.
+    for f in [
+        "sum",
+        "mean",
+        "var",
+        "lengthof",
+        "reverse",
+        "indicesof",
+        "indicesof0",
+        "identity",
+    ] {
         assert!(
             errors(&format!("{t}s = {f}(d)")).is_empty(),
             "`{f}` is exempt and must take the table whole"
@@ -537,6 +554,15 @@ fn a_single_input_callable_whose_domain_admits_tables_is_exempt() {
         assert!(
             errors(&format!("r = record(a = 1.0, b = 2.0)\ns = {f}(r)")).is_empty(),
             "`{f}` is exempt for a record too"
+        );
+    }
+    // `boolean`/`integer`/`real` read "any SCALAR numeric" — the qualifier means they
+    // do NOT admit aggregates, so they still splat. This is the trap in reading the
+    // Domains column for the word "any".
+    for f in ["boolean", "integer", "real"] {
+        assert!(
+            !errors(&format!("{t}s = {f}(d)")).is_empty(),
+            "`{f}` is \"any scalar numeric\", not \"any\", so it must still splat"
         );
     }
     // `std` is the near miss and is NOT exempt: it is sqrt(var) over "real arrays",
@@ -593,4 +619,70 @@ fn a_user_callable_is_never_exempt_from_the_splat() {
     );
     // And the keyword spelling is still the way to pass the record whole.
     assert!(errors(&format!("{f}one(p) = get(p, [\"a\"])\ny = one(p = pars)")).is_empty());
+}
+
+/// What the newly-exempt rows TYPE to over a table, which is the half the carve-out
+/// makes reachable for the first time. Pinned because "the call is accepted" and
+/// "the call is typed correctly" are different claims, and only the second is worth
+/// having.
+///
+/// `reverse` and `identity` return the table unchanged (§07: "reverse element/row
+/// order" over "vectors, tables"; "returns `x` unchanged" over "any"), `indicesof`
+/// returns axis indices, and `lengthof` the row count (§03: "`lengthof(t)` returns
+/// the number of table rows"). All four are correct.
+///
+/// The three reductions are NOT, and they fail in two different ways. §07's Table
+/// reductions paragraph defines the result as "a record whose fields are the column
+/// names and values are the per-column reductions", but `sum` and `mean` produce
+/// `%deferred` (an honest no-rule-yet) while **`var` produces `(%scalar real)` —
+/// a WRONG type, not a missing one**. Both predate this branch: `origin/main`
+/// accepted these calls and typed them identically. Pinned as measured, so closing
+/// either gap shows up here as a deliberate change rather than a surprise.
+///
+/// Cross-engine note: flatppl-js REJECTS `reverse(t)` despite the same Domains cell.
+/// Rust accepting it is the conformant behaviour, so that is a js-side gap, not a
+/// disagreement to resolve here.
+#[test]
+fn the_exempt_rows_type_their_table_argument() {
+    let t = "d = load_data(\"d.csv\", cartpow(cartprod(x = reals, y = reals), 4))\n";
+    let pir = |f: &str| ir(&format!("{t}s = {f}(d)"));
+    // Table in, same table out.
+    for f in ["reverse", "identity"] {
+        let out = pir(f);
+        assert!(
+            out.contains("(%bind s (%meta ((%table (%columns (x (%scalar real)) (y (%scalar real))) (%nrows 4))"),
+            "`{f}` over a table must type as that same table, in:\n{out}"
+        );
+    }
+    // Axis indices: a rank-1 integer array.
+    for f in ["indicesof", "indicesof0"] {
+        let out = pir(f);
+        assert!(
+            out.contains("(%bind s (%meta ((%array 1 (%dynamic) (%scalar integer))"),
+            "`{f}` over a table must type as an integer index array, in:\n{out}"
+        );
+    }
+    // Row count.
+    let out = pir("lengthof");
+    assert!(
+        out.contains("(%bind s (%meta ((%scalar integer) %fixed nonnegintegers)"),
+        "`lengthof` over a table must type as a nonneg integer, in:\n{out}"
+    );
+    // Gap 1 — honest: no rule yet.
+    for f in ["sum", "mean"] {
+        let out = pir(f);
+        assert!(
+            out.contains(&format!("(%bind s (%meta (%deferred %fixed %unknown) ({f}")),
+            "`{f}` over a table is still %deferred (§07 defines a record result), in:\n{out}"
+        );
+    }
+    // Gap 2 — worse: `var` claims a SCALAR where §07 defines a record of per-column
+    // variances. Pinned as the wrong type it currently produces, not as the right
+    // one, so the pin cannot be mistaken for a conformance claim.
+    let out = pir("var");
+    assert!(
+        out.contains("(%bind s (%meta ((%scalar real) %fixed nonnegreals) (var"),
+        "`var` over a table currently MISTYPES as a scalar real (§07 defines a \
+         per-column record) — pinned as-is; fixing it is its own change, in:\n{out}"
+    );
 }
