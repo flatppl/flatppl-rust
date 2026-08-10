@@ -345,9 +345,12 @@ pub(crate) fn call_rule(
         }
 
         // ---- measure algebra (spec §06) ----
-        "lawof" => Type::Measure {
-            domain: Box::new(args.first().map_or(Type::Any, |(_, t, _)| t.clone())),
-            mass: Mass::Deferred,
+        "lawof" => match lawof_mass_gate(inf, args) {
+            Some(failed) => failed,
+            None => Type::Measure {
+                domain: Box::new(args.first().map_or(Type::Any, |(_, t, _)| t.clone())),
+                mass: Mass::Deferred,
+            },
         },
         "draw" => measure_domain(arg_ty(args, 0)),
         "iid" => iid_type(inf, args),
@@ -1159,6 +1162,58 @@ fn table_of_record_power(shape: Box<[Dim]>, elem: Type) -> Type {
     }
 }
 
+/// `lawof(m)`'s total-mass gate: a MEASURE argument must be `%normalized`.
+///
+/// Spec §04 as amended by flatppl-design#73 (@ `9d9a91c`, pending owner review):
+/// "`lawof(m)` requires `m`'s `%mass` to be `%normalized` (see total-mass
+/// classes); anything else is a static error, since an unnormalized measure is
+/// not its own law and admits no such mixture. `lawof` never normalizes its
+/// argument; `normalize(m)` states that intent." So the diagnostic names
+/// `normalize` as the escape.
+///
+/// Returns `Some(Type::Failed(_))` when it rejects, `None` to let the ordinary
+/// rule run. Deliberately conservative, and deliberately narrow in three ways:
+///
+/// - It rejects on the mass class the checker can PROVE is not `%normalized`,
+///   which includes `%finite`. A `%finite` `superpose` whose weights happen to sum
+///   to one is rejected: the class is what the rule quantifies over, not the
+///   arithmetic, and a checker that tried to discharge the arithmetic would accept
+///   some models and reject equivalent ones depending on how much constant folding
+///   had run.
+/// - `%deferred` PASSES. §04's "anything else" reads literally as including it,
+///   but `%deferred` means "not yet inferred" rather than "not normalized" (§11),
+///   so rejecting it would convert every gap in mass inference into a user-facing
+///   error on a model that may be perfectly well-formed. Failing open here keeps
+///   the gate a statement about proven-unnormalized measures.
+/// - Only a `Type::Measure` argument is gated. §04 also says "On a non-nullary
+///   kernel, `lawof` lifts pointwise", so a `Type::Kernel` argument is legitimate;
+///   whether a non-Markov kernel should be gated by its own `%mass` is the same
+///   question one level up and is NOT decided here.
+fn lawof_mass_gate(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> Option<Type> {
+    let (arg_node, arg_ty, _) = args.first()?;
+    let Type::Measure { mass, .. } = arg_ty else {
+        return None;
+    };
+    let offending = match mass {
+        // Proven normalized, or not yet inferred — let it through.
+        Mass::Normalized | Mass::Deferred => return None,
+        Mass::Null => "%null",
+        Mass::Finite => "%finite",
+        Mass::LocallyFinite => "%locallyfinite",
+        Mass::Unknown => "%unknown",
+    };
+    inf.diags.push(crate::Diagnostic::error_at(
+        *arg_node,
+        format!(
+            "`lawof` requires a `%normalized` measure (spec §04), but this argument's \
+             total mass is `{offending}`: an unnormalized measure is not its own law. \
+             Wrap it in `normalize(...)` to state that intent — `lawof` never \
+             normalizes its argument"
+        ),
+    ));
+    Some(Type::Failed("lawof of an unnormalized measure".into()))
+}
+
 /// The element type of a set expression (`elementof` / `external` argument),
 /// read structurally — sets are not first-class in the type grammar.
 fn set_element_type(inf: &mut Inferencer<'_, '_>, node: Option<NodeId>) -> Type {
@@ -1686,7 +1741,39 @@ fn reification_type(
     let body_ty = args.first().map(|(_, t, _)| t);
     match (name, body_ty) {
         // `kernelof` reifies the LAW of a value-typed body — a probability
-        // measure per input, i.e. a Markov kernel.
+        // measure per input, i.e. a Markov kernel. Its body must BE a value:
+        // §04 "Kernels and `kernelof`" says it "reifies (typically stochastic)
+        // value nodes to Markov kernels. `x` must not be a measure", and
+        // flatppl-design#73 adds the reason — "since `functionof` already reifies
+        // a measure node to a kernel directly". A measure-layer body is therefore
+        // a static error, not something to wrap.
+        ("kernelof", Some(body @ (Type::Measure { .. } | Type::Kernel { .. }))) => {
+            let anchor = args.first().map_or(id, |(n, _, _)| *n);
+            // §04's sentence names the measure case; a KERNEL body fails the same
+            // clause one step earlier (it is not a value node either) and #73's
+            // `functionof` reason covers it identically. Named separately so the
+            // diagnostic does not tell a user their kernel is a measure.
+            let (what, fix) = match body {
+                Type::Measure { .. } => (
+                    "a measure",
+                    "use `functionof` to reify a measure node to a kernel directly, \
+                     or pass the value you meant to take the law of",
+                ),
+                _ => (
+                    "a kernel",
+                    "a kernel is already a reified law — pass the value node you meant \
+                     to reify, or drop the outer `kernelof`",
+                ),
+            };
+            inf.diags.push(crate::Diagnostic::error_at(
+                anchor,
+                format!(
+                    "`kernelof` reifies value nodes, but this argument is {what} \
+                     (spec §04: `x` must not be a measure); {fix}"
+                ),
+            ));
+            Type::Failed("kernelof of a measure-layer argument".into())
+        }
         ("kernelof", _) => Type::Kernel {
             inputs,
             mass: Mass::Normalized,

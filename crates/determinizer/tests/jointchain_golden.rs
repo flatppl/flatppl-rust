@@ -168,7 +168,7 @@ lp = logdensityof(j, record(a = 0.3, b = 0.7))";
 fn jointchain_scalar_single_step() {
     let src = "\
 a = draw(Normal(mu = 0.0, sigma = 1.0))
-k = kernelof(Normal(mu = a, sigma = 0.5), a = a)
+k = kernelof(draw(Normal(mu = a, sigma = 0.5)), a = a)
 j = jointchain(lawof(a), k)
 lp = logdensityof(j, [0.3, 0.7])";
     let out = determinize_src(src);
@@ -214,8 +214,8 @@ lp = logdensityof(j, [0.3, 0.7])";
 fn jointchain_scalar_multi_step() {
     let src = "\
 a = draw(Normal(mu = 0.0, sigma = 1.0))
-k1 = kernelof(Normal(mu = a, sigma = 0.5), a = a)
-k2 = kernelof(Normal(mu = add(get0(_ab_, 0), get0(_ab_, 1)), sigma = 0.25), ab = _ab_)
+k1 = kernelof(draw(Normal(mu = a, sigma = 0.5)), a = a)
+k2 = kernelof(draw(Normal(mu = add(get0(_ab_, 0), get0(_ab_, 1)), sigma = 0.25)), ab = _ab_)
 j = jointchain(lawof(a), k1, k2)
 lp = logdensityof(j, [0.3, 0.7, 1.1])";
     let out = determinize_src(src);
