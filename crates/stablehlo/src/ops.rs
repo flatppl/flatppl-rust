@@ -823,6 +823,13 @@ fn lower_ifelse(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, E
 /// alone: `broadcast_pair` has already expanded a size-1 branch axis with proper
 /// dims by the time the predicate pass runs, so `(pred [3], a [1], b [3])` is
 /// legal and emits a valid `select` — checking `c == a` would refuse it.
+///
+/// This checks SHAPE only, never orientation: a predicate derived from transposed
+/// vectors selecting between plain ones is deliberately admitted. `select` is
+/// per-element and the result takes the BRANCHES' orientation (which
+/// [`require_same_orientation`] does check), so the mask's orientation has no
+/// channel through which to change a selected value or the result type — unlike
+/// an elementwise `add` or a `compare`, where both operands feed the result.
 fn require_select_predicate(id: NodeId, c: &Value, a: &Value, b: &Value) -> Result<(), EmitError> {
     if matches!(c.ty, MlirTy::Scalar) {
         return Ok(());
