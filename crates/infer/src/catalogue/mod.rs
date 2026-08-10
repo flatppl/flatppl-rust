@@ -396,18 +396,18 @@ impl Catalogue {
     ///   number of table rows."
     /// - `identity` ("any") — an unrestricted domain admits records and tables, and
     ///   a function returning its argument unchanged must not restructure it.
-    /// - `sum`, `mean`, `var` — their Domains cells say only "real/complex arrays";
-    ///   the table domain lives in §07's **Table reductions** paragraph ("When
-    ///   `sum`, `mean`, or `var` is applied to a table, the reduction operates
-    ///   column-wise and returns a record whose fields are the column names"). #78
-    ///   names `sum(t)` normatively for exactly this reason.
+    /// - `sum`, `mean`, `var`, `std` — their Domains cells say only "real/complex
+    ///   arrays" / "real arrays"; the table domain lives in §07's **Table
+    ///   reductions** paragraph ("When `sum`, `mean`, `var`, or `std` is applied to a
+    ///   table, the reduction operates column-wise and returns a record whose fields
+    ///   are the column names"). #78 names `sum(t)` normatively for exactly this
+    ///   reason. `std` was added to that paragraph by an owner ruling on 2026-08-10
+    ///   (flatppl-design `4c93237`, onto #77) after this guard first shipped without
+    ///   it — it is $\sqrt{\mathrm{var}}$, so a column-wise `var` implies a
+    ///   column-wise `std`.
     ///
     /// Deliberately ABSENT, each checked against its own row rather than assumed:
     ///
-    /// - `std` — the near miss. It is $\sqrt{\mathrm{var}}$ over "real arrays", but
-    ///   the Table reductions paragraph names three functions and `std` is not one
-    ///   of them, so no documented domain admits a table. Following the spec as
-    ///   written; flagged as a spec question rather than papered over here.
     /// - `boolean`, `integer`, `real` — "any **scalar** numeric". The word "any" is
     ///   qualified, so these do not admit aggregates.
     /// - `sizeof` ("vectors, arrays"), `prod` ("real/complex arrays"), and every
@@ -420,6 +420,11 @@ impl Catalogue {
     /// - Every single-input §08 constructor (`Poisson`, `Dirichlet`, `Categorical`,
     ///   `Exponential`, …) — scalar or vector domains, never aggregates. This is
     ///   what keeps `Poisson(record(zzz = 0.5))` a static error.
+    /// - `get`, `get0` ("records, arrays, tables, tuples") and `filter` ("function,
+    ///   array or table") DO admit aggregates in their cells, but they are
+    ///   MULTI-input, so #78's "exactly one input" half excludes them and they never
+    ///   reach this list. They are also absent from the single-input arity set, so
+    ///   the exclusion holds twice over.
     ///
     /// The caller pairs this with the arity half of #78's condition, so a row that
     /// later gains a second parameter stops being exempt without this list changing
@@ -431,6 +436,7 @@ impl Catalogue {
         "lengthof",
         "mean",
         "reverse",
+        "std",
         "sum",
         "var",
     ];

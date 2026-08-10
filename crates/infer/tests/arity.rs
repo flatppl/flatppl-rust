@@ -520,12 +520,14 @@ fn the_splat_hint_reaches_every_diagnostic_a_splatting_call_can_produce() {
 /// prose and contradicted §03 "Tables": "`lengthof(t)` returns the number of table
 /// rows."
 ///
-/// The exempt set was derived by classifying all 96 single-input base builtins
-/// against §07's Domains column and prose, not from #78's two examples.
+/// NINE members, derived by classifying all 96 single-input base builtins against
+/// §07's Domains column and prose, not from #78's two examples.
 /// `lengthof`/`reverse` ("vectors, tables"), `indicesof`/`indicesof0` ("vectors,
-/// arrays, tables") and `identity` ("any") have it in the cell; `sum`/`mean`/`var`
-/// get theirs from the Table reductions paragraph. Both halves of the condition
-/// come from the CALLEE's signature.
+/// arrays, tables") and `identity` ("any") have it in the cell;
+/// `sum`/`mean`/`var`/`std` get theirs from the Table reductions paragraph — `std` by
+/// an owner ruling on 2026-08-10 (design `4c93237`) which added it to that paragraph,
+/// since it is sqrt(var) and a column-wise `var` implies a column-wise `std`. Both
+/// halves of the condition come from the CALLEE's signature.
 ///
 /// An earlier revision of this test listed only four, because the extraction regex
 /// matched a bare `` |`name`| `` row and silently dropped every row whose name is a
@@ -540,6 +542,7 @@ fn a_single_input_callable_whose_domain_admits_tables_is_exempt() {
         "sum",
         "mean",
         "var",
+        "std",
         "lengthof",
         "reverse",
         "indicesof",
@@ -565,15 +568,13 @@ fn a_single_input_callable_whose_domain_admits_tables_is_exempt() {
             "`{f}` is \"any scalar numeric\", not \"any\", so it must still splat"
         );
     }
-    // `std` is the near miss and is NOT exempt: it is sqrt(var) over "real arrays",
-    // but the Table reductions paragraph names three functions and `std` is not one,
-    // so no documented domain admits a table. Following the spec as written.
-    assert_eq!(
-        errors(&format!("{t}s = std(d)")),
-        vec![format!(
-            "`std` takes 1 argument (spec §07), got 2{SPLAT_HINT}"
-        )],
-        "`std` has no documented table domain, so it still splats"
+    // `get`/`get0` ("records, arrays, tables, tuples") and `filter` ("function, array
+    // or table") admit aggregates in their CELLS but are MULTI-input, so #78's
+    // "exactly one input" half excludes them. The arity half carries real weight here,
+    // not only for `Exponential` below.
+    assert!(
+        errors("r = record(a = 1.0, b = 2.0)\nx = get(r, [\"a\"])").is_empty(),
+        "`get` is multi-input, so its record argument is ordinary, not splatted"
     );
     // Arrays-only rows keep splatting.
     for f in ["prod", "sizeof"] {
