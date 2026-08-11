@@ -439,6 +439,46 @@ screened by the per-field arm. Missing that gate scored the query's value of `b`
 untransformed draw — no inverse, no log-volume — and `exp(y3)` and `2.0·y3` emitted
 identically, which is the proof the map was ignored rather than mis-applied.
 
+**Three spellings reach this one law.** §06 *Joint composition* has a `joint` retain a
+stochastic node shared between its component traces, so `joint` rewrites to the record above
+rather than carrying its own closed form. `density::joint_component_coordinate` decides which
+components join the rewrite and what each contributes as its coordinate:
+
+| spelling | each component's coordinate |
+|---|---|
+| `lawof(record(y₁ = y₁, …))` | the field value as written |
+| `joint(a = lawof(y₁), b = lawof(y₂))` | the reified value `yᵢ` |
+| `joint(a = Normal(mu = z, sigma = σₐ), b = Normal(mu = z, sigma = σᵦ))` | a FRESH `draw` of the constructor |
+
+The third is the constructor-parameter route, and the fresh draw is the whole point: §06 has
+each component contribute "a fresh coordinate" while the shared node enters the composed
+trace once, so `joint(m, m)` over one stochastic `m` is TWO conditionally independent draws
+over ONE `z` — the correlated law, not the singular diagonal joint that two reified laws of
+one draw give. A component reaching no stochastic node joins nothing and stays an independent
+factor. The positional forms are the same rewrite over `cat`-sliced values.
+
+**The rewrite triggers per COMPONENT, not on a count of them.** Two or more contributors always
+wrap into the record above. A SOLE contributor wraps only when its coordinate is a synthesized
+draw — that is the case the record path exists for, since the per-component path would score the
+constructor's conditional and leave the latent's own `draw` unconsumed. A sole REIFIED
+contributor keeps its direct per-component path at every variate shape, and is never made a
+one-field record: wrapping it would add a nesting level that breaks a record-valued component
+(`lawof(record(_j0 = record(u = u, w = w)))` has one field reaching two draws, which the
+one-draw-per-field rule refuses), and it has no need of the wrapper anyway.
+`a_sole_reified_component_keeps_its_direct_path_at_every_variate_shape` pins that.
+
+The gate is `needs_record_wrapper`, and it is deliberately not a count: a component's law is the
+TOTAL law of its own trace (§04 *Reification to measures*) and cannot depend on what its siblings
+do. Gating on two contributors instead made
+`joint(a = Normal(mu = z1, …), b = Normal(mu = z2, …))` lower while
+`joint(a = Normal(mu = z1, …), b = Exponential(…))` refused — the same component `a`, two
+different answers, decided by its sibling.
+
+One spelling still refuses: a BARE `logdensityof(Normal(mu = z, …), x)`, outside any
+`joint`/`lawof`, does not reach the marginalization guard at all (it is sited at the `lawof`
+strip points). Pinned as a known gap by
+`a_bare_stochastic_parameter_measure_still_refuses_known_gap`.
+
 ### The integral
 
 `z` is integrated out of the product of the conditionals (§04 *Reification to measures*
@@ -532,7 +572,7 @@ for `N ≥ 3`.
 
 ### Test points
 
-All three truths agree to full double precision along THREE independent routes: this
+All four truths agree to full double precision along THREE independent routes: this
 section's closed form, `MvNormal` in Distributions.jl, and Gauss–Kronrod quadrature
 (`QuadGK`, `rtol = 1e-13`) of the mixture integral above. The quadrature is the one that
 does not share this derivation's algebra.
@@ -595,6 +635,28 @@ product gap flat near `−0.85`, with no crossing. Folded literals: `log` argume
 `0.48999999999999994` and `1.6900000000000002`, `log1p` argument `1.6848206738316633`,
 `quad` → `5.851661943957181`.
 
+**Point D — the constructor-joint spelling.** `μ₀ = 0.5`, `s₀ = 2`, `σ = (0.6, 0.8)`,
+`x = (2.5, −1.0)`, so `Σ = [[4.36, 4], [4, 4.64]]`.
+
+| | |
+|---|---|
+| truth | `-8.748747354129808` |
+| product of the marginals | `-4.0426427710908985` (gap `−4.706`) |
+| conditional at `z = μ₀` | `-8.417275946884702` (gap `−0.331`) |
+| σ paired to the wrong fields | `-8.690833208895306` (gap `−0.058`) |
+| μ₀ dropped (read as 0) | `-8.86575756593011` (gap `0.117`) |
+| Sherman–Morrison term dropped | `-9.872393397582488` (gap `1.124`) |
+| the `log(1+k)` det term dropped | `-7.293629903432019` (gap `−1.455`) |
+
+Carried for the constructor-parameter spelling, where the coordinates are fresh draws the
+model never named — so it is the point that proves the rewrite integrates `z` ONCE over two
+coordinates rather than reusing one. A SPREAD point (one field well above μ₀, one below)
+under strong correlation (`s₀` over three times either `σᵢ`), which is what makes the product
+gap `4.7` nats rather than Point A's `0.2`. `s₀ ≫ σᵢ` is also the regime where the two
+half-applied corrections separate most, and both are caught above. Folded literals:
+`mul(2, log2π)` → `3.6757541328186907`, `log` arguments `0.36` and `0.6400000000000001`,
+`log1p` argument `17.36111111111111`, `quad` → `12.379444024205748`.
+
 ### A σ over a sibling field — admitted, and why the Σ reading stops applying
 
 ```flatppl
@@ -629,7 +691,10 @@ Support is the query's problem, not the lowering's: a query putting `y1 ≤ 0` a
 
 The family is deliberately narrow: N fields, each a BARE `draw` of `Normal(mu = z, …)`
 directly referencing ONE shared latent whose own prior is `Normal` and ancestor-free. Each
-of these keeps the shared-latent refusal, and each is pinned by a test:
+of these keeps the shared-latent refusal, and each is pinned by a test. All three spellings
+inherit the same list — widening which spellings REACH the law never widens what it answers,
+and `a_constructor_joint_outside_the_record_law_refuses` pins the constructor route's rows
+against the `lawof` route's:
 
 - **A scale latent.** `yᵢ ~ Normal(mu = 1, sigma = z)`. Not a Gaussian marginal at all, so
   no rank-one Σ exists.
@@ -647,11 +712,16 @@ of these keeps the shared-latent refusal, and each is pinned by a test:
   in the emitter, because the per-field screen only sees fields reached before the repeat.
 - **Mixed shared and unshared fields.** Every field must integrate the same latent. A
   record where two fields share `z` and a third integrates `w` would need the product of
-  this row with `w`'s own — correct in principle, and outside the decided scope.
+  this row with `w`'s own — correct in principle, and outside the decided scope. Newly
+  reachable through the constructor route as a PARTLY-shared joint
+  (`joint(a = Normal(mu = z1, …), b = Normal(mu = z1, …), c = Normal(mu = z2, …))`), so it is
+  pinned by `a_partly_shared_constructor_joint_refuses`. The closed form that would answer it
+  is `compound(a, b) · marginal(c)`; building it means letting the recogniser partition the
+  fields by latent instead of demanding one, which is a widening, not a bug fix.
 
 `iid` over the same model still emits the PRODUCT: it redraws its reified sub-DAG afresh
-per copy and never shares ancestors (§06 "iid" entry). `joint` no longer does — §06 "Reified
-components share their ancestry" makes `joint(a = lawof(y1), b = lawof(y2))` equivalent to
+per copy and never shares ancestors (§06 "iid" entry). `joint` no longer does — §06
+"Equivalent record law" makes `joint(a = lawof(y1), b = lawof(y2))` equivalent to
 `lawof(record(a = y1, b = y2))`, so a keyword `joint` over two or more reified components
 now reaches this SAME law (`crates/determinizer/src/density.rs`, `lower_keyword_joint`'s
 record-law dispatch). The positional spelling reaches the cat-law counterpart the same way.
