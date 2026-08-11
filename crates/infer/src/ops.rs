@@ -3093,23 +3093,39 @@ fn broadcast_distribution_no_shape(inf: &mut Inferencer<'_, '_>, head_node: Node
 /// distribution constructor. Returns `Some(Type::Failed)` for a mis-arity call
 /// and `None` when the call is admissible, the count is not knowable
 /// (see [`supplied_arg_count`]), or the catalogue declares no arity for `name`.
-/// The §04 refusal for a sole positional record or table splatted onto a row whose variadic
-/// inputs are UNNAMED.
+/// The refusal for a sole positional record or table splatted onto a row that declares no names
+/// for its inputs — `cat`, `get`, `get0` today.
 ///
-/// §04 "Calling conventions" states that "Special operations have zero to three
-/// distinguished, **unnamed**, ordered inputs of fixed arity" and lists these rows by name —
-/// "`cat`, `fchain`, `kchain`: Variadic unnamed inputs with significant order", "`get`: One
-/// distinguished input plus variadic unnamed input with significant order", "`vector`: Unnamed
-/// variadic inputs with significant order". An unnamed input offers no name for a splatted
-/// field to bind to, so NO field name can ever match and §04's "A call with field or column
-/// names that do not match the callable's argument names is a static error" applies to every
-/// such call. (§04 lists `cat` and `get`; `get0` inherits via §07's "zero-based variant of
-/// `get`".)
+/// **Grounded PER ROW, not on §04's always-splat rule.** `wave-CATADJ-report.md` §1 adjudicates
+/// the auto-splat bullet's scope over special operations as **UNDERDETERMINED**: §04 never states
+/// the exclusion, §03 "Tables" applies splatting to `table(r)`/`record(t)` — both on §04's
+/// special-operations list — and §05 publishes a shorter roster omitting these rows. So the
+/// justification below stands on §07, which holds under either reading:
+///
+/// - **`cat` — §07 defines no one-argument form.** Its three bullets
+///   (`cat(scalar1, scalar2, ...)`, `cat(vector1, vector2, ...)`, `cat(record1, record2, ...)`)
+///   are all written with two-or-more operands, and no sentence assigns a value to `cat(r)`.
+///   "Arity 1..∞" is this crate's catalogue row, not spec text: "arity" occurs once in the whole
+///   spec and never with a number for `cat`. Refusing contradicts no sentence.
+/// - **`get`/`get0` — §07 requires a selector.** "`get(container, selectors...)` — unified element
+///   access and subset selection", with every documented form supplying one and no zero-selector
+///   form defined. `get0` is the "zero-based variant of `get`" and inherits the requirement.
+/// - **A table** additionally falls outside each row's §07 Domains cell (`cat`'s reads "scalars,
+///   vectors, or records").
+///
+/// §04's mismatch clause ("A call with field or column names that do not match the callable's
+/// argument names is a static error") is still what the message cites for the *rule*, because on
+/// a row with no declared names nothing can match — that part is not in dispute. What the
+/// adjudication removed is the claim that §04's list settles which rows are in scope.
 ///
 /// **Deliberately does NOT append [`SPLAT_HINT`].** That tail advises the keyword spelling
-/// (`f(pars = record(...))`), which is unusable here: an unnamed input has no keyword to
-/// address it by, so pointing at one would send the author down a path that cannot work. The
-/// honest fix is to pass the elements explicitly, which is what this message says instead.
+/// (`f(pars = record(...))`), which is unusable here: a row declaring no input names has no
+/// keyword to address them by, so pointing at one would send the author down a path that cannot
+/// work. The honest fix is to pass the arguments explicitly, which is what this message says.
+///
+/// A row that DOES declare names never reaches here — see
+/// [`crate::catalogue::Catalogue::base_has_unnamed_variadic`], which steps aside for it so the
+/// ordinary name check decides. That is what makes `builtin_sample`'s matching splat valid.
 fn refuse_splat_onto_unnamed_variadic(
     inf: &mut Inferencer<'_, '_>,
     id: NodeId,

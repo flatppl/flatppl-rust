@@ -179,7 +179,12 @@ Catalogue(
         Builtin(name: "builtin_fromuniform",  sig: Structural(params: [Callable, Any, Any], names: ["kernel", "kernel_input", "u"])),
         Builtin(name: "builtin_tonormal",     sig: Structural(params: [Callable, Any, Any], names: ["kernel", "kernel_input", "x"])),
         Builtin(name: "builtin_fromnormal",   sig: Structural(params: [Callable, Any, Any], names: ["kernel", "kernel_input", "z"])),
-        Builtin(name: "builtin_sample",       sig: Structural(params: [Any, Callable, Any, Variadic(Scalar(Integer))])),
+        // §07 "Measure kernel evaluation primitives" spells the signature
+        // `builtin_sample(rngstate, kernel, kernel_input, n, m, ...)`, so the three
+        // distinguished inputs are documented BY NAME like every sibling primitive's. Only the
+        // trailing sample-shape ints (`n, m, ...`) stay nameless: they are variadic, and naming
+        // a prefix of an unbounded tail would refuse a legitimate further shape argument.
+        Builtin(name: "builtin_sample",       sig: Structural(params: [Any, Callable, Any, Variadic(Scalar(Integer))], names: ["rngstate", "kernel", "kernel_input"])),
 
         // -- scalar-integer output --
         // spec §07 "Elementary functions": floor/ceil/round return integers.
