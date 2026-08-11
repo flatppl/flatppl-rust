@@ -5365,27 +5365,32 @@ fn lower_joint(
     // ancestry-sharing here. A component reaching no draw shares no node with any sibling
     // and stays on the per-slot path below.
     //
-    // **The gate is "reaches a draw", NOT "two or more of them do."** A component's own law
-    // is the TOTAL law of its coordinate (§04 "Reification to measures"), which does not
-    // depend on how many SIBLINGS happen to reach a draw. Gating the rewrite on a count of
-    // two made `joint(a = Normal(mu = z1, …), b = Normal(mu = z2, …))` lower to the product
-    // of both marginals while the strictly easier `joint(a = Normal(mu = z1, …),
-    // b = Exponential(…))` refused — the same first component, two different answers,
-    // decided by its sibling. One contributor is a one-field record, which the record path
-    // already answers with that field's conjugate marginal (there is no repeated latent, so
-    // the shared-latent law is not reached and `N = 1` stays on its per-field row).
-    let mut shared: Vec<(usize, Symbol, NodeId)> = Vec::new();
+    // **A component's own law does not depend on its siblings.** It is the TOTAL law of its
+    // coordinate (§04 "Reification to measures"), so a lone constructor-with-a-latent
+    // marginalizes exactly as it does beside a second one. Gating the rewrite on a count of
+    // two contributors made `joint(a = Normal(mu = z1, …), b = Normal(mu = z2, …))` lower to
+    // the product of both marginals while the strictly easier `joint(a = Normal(mu = z1, …),
+    // b = Exponential(…))` refused. But the wrapper is not free for a SOLE reified
+    // contributor — it adds a nesting level that breaks the record-valued case — so
+    // [`needs_record_wrapper`], not the count and not "reaches a draw", decides.
+    let mut shared: Vec<(usize, Symbol, Coordinate)> = Vec::new();
     for (i, &mi) in inner.iter().enumerate() {
         if let Some(coord) = joint_component_coordinate(m, mi) {
             let name = m.intern(&format!("_j{i}"));
             shared.push((i, name, coord));
         }
     }
+    let coordinates: Vec<Coordinate> = shared.iter().map(|&(_, _, c)| c).collect();
+    if !needs_record_wrapper(&coordinates) {
+        shared.clear();
+    }
 
     let mut terms = Vec::with_capacity(inner.len());
     if !shared.is_empty() {
-        let record_fields: Vec<(Symbol, NodeId)> =
-            shared.iter().map(|&(_, name, x)| (name, x)).collect();
+        let record_fields: Vec<(Symbol, NodeId)> = shared
+            .iter()
+            .map(|&(_, name, c)| (name, c.value()))
+            .collect();
         let mut pinned_fields = Vec::with_capacity(shared.len());
         for &(i, name, _) in &shared {
             let idx = m.alloc(Node::Lit(Scalar::Int(i as i64)));
@@ -5430,6 +5435,32 @@ fn lower_shared_trace_joint_group(
     lower_measure_density_at(m, lawof_node, value_record, origin)
 }
 
+/// Which of §06's two shared-node routes produced a component's coordinate. The value is the
+/// coordinate either way; the distinction decides whether a SOLE contributor needs the
+/// record wrapper at all (see [`lower_joint`]'s gate).
+#[derive(Clone, Copy)]
+enum Coordinate {
+    /// A reified `lawof(x)` component: the coordinate IS the reified value `x`, which the
+    /// per-component path can already score directly at any variate shape.
+    Reified(NodeId),
+    /// A constructor carrying a stochastic parameter: the coordinate is a draw synthesized
+    /// here, and only the record path consumes it — the per-component path would score the
+    /// conditional and leave the latent's own `draw` unconsumed.
+    FreshDraw(NodeId),
+}
+
+impl Coordinate {
+    fn value(self) -> NodeId {
+        match self {
+            Coordinate::Reified(x) | Coordinate::FreshDraw(x) => x,
+        }
+    }
+
+    fn is_fresh_draw(self) -> bool {
+        matches!(self, Coordinate::FreshDraw(_))
+    }
+}
+
 /// The value node a `joint` component contributes to the COMPOSED TRACE, or `None` when
 /// the component reaches no stochastic node and so shares nothing with any sibling.
 ///
@@ -5453,12 +5484,35 @@ fn lower_shared_trace_joint_group(
 ///
 /// The fresh draw is built over the RESOLVED constructor rather than the component as
 /// written, so the record law downstream reads the constructor directly instead of a ref hop.
-fn joint_component_coordinate(m: &mut Module, measure: NodeId) -> Option<NodeId> {
+fn joint_component_coordinate(m: &mut Module, measure: NodeId) -> Option<Coordinate> {
     let (resolved, _) = resolve_ref_one(m, measure);
     if let Some(c) = expect_builtin_call(m, resolved, "lawof") {
-        return (c.args.len() == 1).then_some(c.args[0]);
+        return (c.args.len() == 1).then_some(Coordinate::Reified(c.args[0]));
     }
-    measure_reaches_draw(m, resolved, &[]).then(|| build_call(m, "draw", &[resolved]))
+    measure_reaches_draw(m, resolved, &[])
+        .then(|| Coordinate::FreshDraw(build_call(m, "draw", &[resolved])))
+}
+
+/// Does this contributor set need the `lawof(record(...))` wrapper?
+///
+/// TWO OR MORE contributors always do — that is the whole point, since only the record law
+/// sees the shared node. A SOLE contributor needs it only when its coordinate is a
+/// synthesized draw: the per-component path would score that constructor's CONDITIONAL and
+/// leave the latent's `draw` unconsumed (the refusal wave F3 exists to remove).
+///
+/// A sole REIFIED contributor must NOT be wrapped. It already has a working direct path for
+/// every variate shape, and wrapping adds a nesting level that breaks the record-valued case:
+/// `joint(a = lawof(record(u = u, w = w)), b = Exponential(…))` becomes
+/// `lawof(record(_j0 = record(u = u, w = w)))`, whose single field reaches TWO draws, so
+/// `match_independent_record`'s one-draw-per-field rule refuses a shape §06 *Keyword form*
+/// blesses ("a record-valued component becomes a nested record under its name"). Gating the
+/// wrapper on a bare contributor COUNT regressed exactly that.
+fn needs_record_wrapper(coordinates: &[Coordinate]) -> bool {
+    match coordinates {
+        [] => false,
+        [sole] => sole.is_fresh_draw(),
+        _ => true,
+    }
 }
 
 /// `logdensityof(joint(name₁ = M₁, …, nameₖ = Mₖ), v)` — the keyword/record form of
@@ -5533,15 +5587,19 @@ fn lower_keyword_joint(
     }
     let vrec_named: Vec<NamedArg> = vrec.named.to_vec();
 
-    // §06 "Joint composition": group EVERY named component whose trace reaches a stochastic
+    // §06 "Joint composition": group the named components whose traces reach a stochastic
     // node ([`joint_component_coordinate`]) and reroute them through `lawof(record(...))`'s
-    // own machinery. The gate is "reaches a draw", not a count of two — see
-    // [`lower_joint`]'s note on why a count made one component's law depend on its siblings.
-    let mut shared: Vec<(Symbol, NodeId)> = Vec::new();
+    // own machinery, when [`needs_record_wrapper`] says the group needs it — see
+    // [`lower_joint`]'s note on why neither a bare count nor "reaches a draw" is the gate.
+    let mut shared: Vec<(Symbol, Coordinate)> = Vec::new();
     for f in named {
         if let Some(coord) = joint_component_coordinate(m, f.value) {
             shared.push((f.name, coord));
         }
+    }
+    let coordinates: Vec<Coordinate> = shared.iter().map(|&(_, c)| c).collect();
+    if !needs_record_wrapper(&coordinates) {
+        shared.clear();
     }
 
     let mut terms = Vec::with_capacity(named.len());
@@ -5557,9 +5615,11 @@ fn lower_keyword_joint(
             })?;
             pinned_fields.push((name, pinned));
         }
+        let record_fields: Vec<(Symbol, NodeId)> =
+            shared.iter().map(|&(name, c)| (name, c.value())).collect();
         terms.push(lower_shared_trace_joint_group(
             m,
-            &shared,
+            &record_fields,
             &pinned_fields,
             origin,
         )?);

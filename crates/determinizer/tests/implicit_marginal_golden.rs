@@ -1130,6 +1130,57 @@ fn one_constructor_with_a_latent_marginalizes_beside_an_ancestor_free_sibling() 
     }
 }
 
+// **A SOLE reified component must NOT be wrapped in the record scaffold.** §06 *Keyword form*
+// blesses a record-valued component — "a record-valued component becomes a nested record under
+// its name — the name adds a level, it does not merge the inner fields" — and such a component
+// already has a working direct path at every variate shape. Wrapping it anyway adds a SECOND
+// nesting level: `joint(a = lawof(record(u = u, w = w)), b = Exponential(…))` would become
+// `lawof(record(_j0 = record(u = u, w = w)))`, whose single field reaches TWO draws, so
+// `match_independent_record`'s one-draw-per-field rule refuses it. Gating the wrapper on a
+// contributor COUNT did exactly that and regressed these shapes from lowering to refusing
+// against `origin/main`; `needs_record_wrapper` now wraps a sole contributor only when its
+// coordinate is a SYNTHESIZED draw, which is the case that genuinely needs the record path.
+//
+// Every row below LOWERS at `origin/main` (e3d303e) and must keep lowering. Nothing here
+// asserts the shared-latent law — these are ancestry-disjoint products; the point is purely
+// that the rewrite does not intercept them.
+#[test]
+fn a_sole_reified_component_keeps_its_direct_path_at_every_variate_shape() {
+    for (label, model, query) in [
+        (
+            "record-valued reified component beside an Exponential",
+            "u = draw(Normal(mu = 0.0, sigma = 1.0))\nw = draw(Normal(mu = 0.0, sigma = 2.0))\n",
+            "lp = logdensityof(joint(a = lawof(record(u = u, w = w)), b = Exponential(rate = 1.0)), \
+             record(a = record(u = 0.5, w = 0.7), b = 0.3))",
+        ),
+        (
+            "record-valued reified component beside a Normal",
+            "u = draw(Normal(mu = 0.0, sigma = 1.0))\nw = draw(Normal(mu = 0.0, sigma = 2.0))\n",
+            "lp = logdensityof(joint(a = lawof(record(u = u, w = w)), \
+             b = Normal(mu = 0.0, sigma = 1.0)), record(a = record(u = 0.5, w = 0.7), b = 0.3))",
+        ),
+        (
+            // A non-scalar NON-record variate too, so the pin is about added nesting in
+            // general rather than about records specifically.
+            "iid-valued reified component beside an Exponential",
+            "u = draw(iid(Normal(mu = 0.0, sigma = 1.0), 2))\n",
+            "lp = logdensityof(joint(a = lawof(u), b = Exponential(rate = 1.0)), \
+             record(a = [0.5, 0.7], b = 0.3))",
+        ),
+    ] {
+        let lp = pir_binding(&pir(&format!("{model}{query}")), "lp");
+        assert!(
+            lp.contains("builtin_logdensityof"),
+            "{label}: must lower to scored factors, not refuse:\n{lp}"
+        );
+        assert!(
+            !lp.contains("log1p"),
+            "{label}: no shared-latent rank-one correction belongs here — these components \
+             share no node:\n{lp}"
+        );
+    }
+}
+
 // Constructor components reaching DIFFERENT latents share no node, so §06's product rule
 // stands and each component contributes its own marginal (§04: `lawof` reifies the TOTAL
 // law). This also refused before — nothing consumed either draw.

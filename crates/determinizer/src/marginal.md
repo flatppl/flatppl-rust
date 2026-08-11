@@ -712,8 +712,8 @@ against the `lawof` route's:
   fields by latent instead of demanding one, which is a widening, not a bug fix.
 
 `iid` over the same model still emits the PRODUCT: it redraws its reified sub-DAG afresh
-per copy and never shares ancestors (§06 "iid" entry). `joint` no longer does — §06 "Reified
-components share their ancestry" makes `joint(a = lawof(y1), b = lawof(y2))` equivalent to
+per copy and never shares ancestors (§06 "iid" entry). `joint` no longer does — §06
+"Equivalent record law" makes `joint(a = lawof(y1), b = lawof(y2))` equivalent to
 `lawof(record(a = y1, b = y2))`, so a keyword `joint` over two or more reified components
 now reaches this SAME law (`crates/determinizer/src/density.rs`, `lower_keyword_joint`'s
 record-law dispatch). The positional spelling reaches the cat-law counterpart the same way.
