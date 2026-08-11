@@ -457,14 +457,22 @@ over ONE `z` — the correlated law, not the singular diagonal joint that two re
 one draw give. A component reaching no stochastic node joins nothing and stays an independent
 factor. The positional forms are the same rewrite over `cat`-sliced values.
 
-**The rewrite triggers per COMPONENT, not on a count of them.** Any component reaching a draw
-goes through the record path, even when it is the only one — its law is the TOTAL law of its
-own trace (§04 *Reification to measures*) and cannot depend on what its siblings do. A single
-contributor is a one-field record, which lands on that field's per-field conjugate row (no
-repeated latent, so this section's law is not reached); two or more sharing a latent land here.
-Gating on two contributors instead made `joint(a = Normal(mu = z1, …), b = Normal(mu = z2, …))`
-lower while `joint(a = Normal(mu = z1, …), b = Exponential(…))` refused — the same component
-`a`, two different answers, decided by its sibling.
+**The rewrite triggers per COMPONENT, not on a count of them.** Two or more contributors always
+wrap into the record above. A SOLE contributor wraps only when its coordinate is a synthesized
+draw — that is the case the record path exists for, since the per-component path would score the
+constructor's conditional and leave the latent's own `draw` unconsumed. A sole REIFIED
+contributor keeps its direct per-component path at every variate shape, and is never made a
+one-field record: wrapping it would add a nesting level that breaks a record-valued component
+(`lawof(record(_j0 = record(u = u, w = w)))` has one field reaching two draws, which the
+one-draw-per-field rule refuses), and it has no need of the wrapper anyway.
+`a_sole_reified_component_keeps_its_direct_path_at_every_variate_shape` pins that.
+
+The gate is `needs_record_wrapper`, and it is deliberately not a count: a component's law is the
+TOTAL law of its own trace (§04 *Reification to measures*) and cannot depend on what its siblings
+do. Gating on two contributors instead made
+`joint(a = Normal(mu = z1, …), b = Normal(mu = z2, …))` lower while
+`joint(a = Normal(mu = z1, …), b = Exponential(…))` refused — the same component `a`, two
+different answers, decided by its sibling.
 
 One spelling still refuses: a BARE `logdensityof(Normal(mu = z, …), x)`, outside any
 `joint`/`lawof`, does not reach the marginalization guard at all (it is sited at the `lawof`
