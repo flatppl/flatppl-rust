@@ -491,3 +491,119 @@ z = kernelof(k3, mu = mu)",
         "this argument is a kernel"
     ));
 }
+
+// ============================================================
+// `lawof` of a measure is the IDENTITY (#73's definition half)
+// ============================================================
+
+/// §04 as amended by flatppl-design#73 (@ `9d9a91c`, pending owner review):
+/// "`lawof(m)` is `lawof(draw(m))`, the law of a draw from `m`" and "A probability
+/// measure of fixed or parameterized phase is its own law, so `lawof(m)` is
+/// equivalent to `m` and `lawof` is idempotent."
+///
+/// So the result type is the ARGUMENT's type, not a measure wrapping it. Before
+/// this, `lawof(Normal(…))` typed as a measure whose DOMAIN was a measure.
+#[test]
+fn lawof_of_a_normalized_measure_is_the_identity() {
+    let out = ir("n = Normal(mu = 0.0, sigma = 1.0)\nz = lawof(n)");
+    let n = out.lines().find(|l| l.contains("%bind n")).unwrap_or("");
+    let z = out.lines().find(|l| l.contains("%bind z")).unwrap_or("");
+    let ty = "((%measure (%domain (%scalar real)) (%mass %normalized))";
+    assert!(n.contains(ty), "the measure itself:\n{out}");
+    assert!(z.contains(ty), "lawof of it must type identically:\n{out}");
+    // No measure-over-measure anywhere.
+    assert!(
+        !z.contains("(%domain (%measure"),
+        "must not wrap the argument as the domain:\n{out}"
+    );
+}
+
+/// §04's idempotence, which falls out of the identity: `lawof(lawof(m))` types as
+/// `m`. Worth its own pin — it is the property that would break first if the arm
+/// ever went back to wrapping.
+#[test]
+fn lawof_is_idempotent_on_a_measure() {
+    let out = ir("n = Normal(mu = 0.0, sigma = 1.0)\nz = lawof(lawof(lawof(n)))");
+    assert!(
+        out.lines()
+            .find(|l| l.contains("%bind z"))
+            .unwrap_or("")
+            .contains("((%measure (%domain (%scalar real)) (%mass %normalized))"),
+        "three lawof layers type as one:\n{out}"
+    );
+}
+
+/// The identity holds for a measure the GATE admits by the `%deferred` route as
+/// well, so gate and typing stay consistent: everything admitted is typed as a law.
+/// A `normalize(...)`d restriction is the spelling §04 names as the escape.
+#[test]
+fn lawof_of_a_normalized_restriction_types_over_the_element_domain() {
+    let out = ir("n = Normal(mu = 0.0, sigma = 1.0)\n\
+         z = lawof(normalize(truncate(n, interval(0.0, 1.0))))");
+    assert!(
+        out.lines()
+            .find(|l| l.contains("%bind z"))
+            .unwrap_or("")
+            .contains("((%measure (%domain (%scalar real)) (%mass %normalized))"),
+        "a measure over the ELEMENT domain, not over the measure:\n{out}"
+    );
+}
+
+/// §04: "On a non-nullary kernel, `lawof` lifts pointwise, as the uniform kernel
+/// extension does for measure-algebra operations." So the result is a KERNEL over
+/// the same inputs, not a measure whose domain is a kernel.
+#[test]
+fn lawof_of_a_kernel_lifts_pointwise() {
+    let out = ir("mu = elementof(reals)\n\
+         y ~ Normal(mu = mu, sigma = 1.0)\n\
+         k = kernelof(record(y = y), mu = mu)\n\
+         z = lawof(k)");
+    let z = out.lines().find(|l| l.contains("%bind z")).unwrap_or("");
+    assert!(
+        z.contains("((%kernel (%inputs mu) (%mass %normalized))"),
+        "a kernel over the same inputs:\n{out}"
+    );
+    assert!(
+        !z.contains("(%domain (%kernel"),
+        "must not wrap the kernel as a domain:\n{out}"
+    );
+}
+
+/// The VALUE spelling — the only one the corpus uses — is unchanged: the law of a
+/// value is a measure over that value's type.
+#[test]
+fn lawof_of_a_value_still_types_over_the_value() {
+    for (src, want) in [
+        (
+            "y ~ Normal(mu = 0.0, sigma = 1.0)\nz = lawof(y)",
+            "((%measure (%domain (%scalar real)) (%mass %normalized))",
+        ),
+        (
+            "y ~ Normal(mu = 0.0, sigma = 1.0)\nz = lawof(record(y = y))",
+            "((%measure (%domain (%record (y (%scalar real)))) (%mass %normalized))",
+        ),
+    ] {
+        let out = ir(src);
+        assert!(
+            out.lines()
+                .find(|l| l.contains("%bind z"))
+                .unwrap_or("")
+                .contains(want),
+            "{src}\nwant {want}\n{out}"
+        );
+    }
+}
+
+/// Alias-transparent, like the gate: the identity is read off the inferred type, so
+/// hops cannot change it.
+#[test]
+fn the_lawof_identity_survives_alias_hops() {
+    let out = ir("n = Normal(mu = 0.0, sigma = 1.0)\nn2 = n\nn3 = n2\nz = lawof(n3)");
+    assert!(
+        out.lines()
+            .find(|l| l.contains("%bind z"))
+            .unwrap_or("")
+            .contains("((%measure (%domain (%scalar real)) (%mass %normalized))"),
+        "three alias hops must not change the identity typing:\n{out}"
+    );
+}

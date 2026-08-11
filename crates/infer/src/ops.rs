@@ -354,10 +354,7 @@ pub(crate) fn call_rule(
         // ---- measure algebra (spec §06) ----
         "lawof" => match lawof_mass_gate(inf, args) {
             Some(failed) => failed,
-            None => Type::Measure {
-                domain: Box::new(args.first().map_or(Type::Any, |(_, t, _)| t.clone())),
-                mass: Mass::Deferred,
-            },
+            None => lawof_type(args.first().map(|(_, t, _)| t)),
         },
         "draw" => measure_domain(arg_ty(args, 0)),
         "iid" => iid_type(inf, args),
@@ -1264,6 +1261,72 @@ fn table_of_record_power(shape: Box<[Dim]>, elem: Type) -> Type {
         elem => Type::Array {
             shape,
             elem: Box::new(elem),
+        },
+    }
+}
+
+/// `lawof(x)`'s result type, for each of the three argument shapes §04 admits.
+///
+/// The measure case is DERIVED, not asserted. §04 as amended by flatppl-design#73
+/// (@ `9d9a91c`, pending owner review) gives one equation — "`lawof(m)` is
+/// `lawof(draw(m))`, the law of a draw from `m`" — and composing the two rules
+/// this module already has for its halves types it mechanically:
+///
+/// - `draw(m)` is m's DOMAIN (`measure_domain`, the `"draw"` arm), and
+/// - `lawof(<value : T>)` is a measure over `T`,
+///
+/// so `lawof(m)` is a measure over m's domain — which, for the `%normalized`
+/// measure the gate admits, IS m's own type. §04 states that consequence
+/// separately ("A probability measure of fixed or parameterized phase is its own
+/// law, so `lawof(m)` is equivalent to `m` and `lawof` is idempotent"), so the
+/// derivation and the prose agree.
+///
+/// **Both phases give the same TYPE, which is why no phase split appears here.**
+/// §04 distinguishes them semantically — a fixed/parameterized measure is its own
+/// law, while a stochastic one yields "the marginal law of a draw from it: the
+/// mixture ν(B) = ∫ κ(z, B) dP(z)". A mixture of measures over `D` is still a
+/// measure over `D`, and still a probability measure, so the two cases differ in
+/// what the determiniser must BUILD, not in what infer records.
+///
+/// The result's `%mass` is `%normalized` unconditionally: a law is a probability
+/// measure by definition. That also settles the `%deferred`-argument case the gate
+/// deliberately admits (see [`lawof_mass_gate`]) — an argument whose mass is not
+/// yet inferred still has a law if it has one at all, and if it turns out
+/// unnormalized the gate rejects it once inference completes. The gate and this
+/// typing therefore stay consistent: everything the gate admits is typed as a law.
+/// (`Mass::Normalized` also matches the separate mass-level `"lawof"` rule, which
+/// has said `Normalized` all along.)
+///
+/// A KERNEL argument lifts pointwise — §04: "On a non-nullary kernel, `lawof`
+/// lifts pointwise, as the uniform kernel extension does for measure-algebra
+/// operations" — so the result is a kernel over the same inputs whose output
+/// measure is a law, hence `%normalized`. Before this it wrapped, producing a
+/// measure whose DOMAIN was a kernel.
+///
+/// Every other argument is a VALUE, and keeps the original behaviour: a measure
+/// over that value's type. That is the overwhelmingly common spelling
+/// (`lawof(y)`, `lawof(record(y = y))`) and the corpus's only one.
+///
+/// A `Likelihood` argument falls in that last bucket and so still types as a
+/// measure OVER a likelihood. #73 is silent on likelihoods — it defines `lawof`
+/// for a measure and for a kernel — so nothing here invents semantics for it; the
+/// open question is recorded in the wave report rather than guessed at.
+fn lawof_type(arg: Option<&Type>) -> Type {
+    match arg {
+        // `lawof(m)` = `lawof(draw(m))`: a measure over m's domain.
+        Some(Type::Measure { domain, .. }) => Type::Measure {
+            domain: domain.clone(),
+            mass: Mass::Normalized,
+        },
+        // Pointwise lift over a kernel's output measure.
+        Some(Type::Kernel { inputs, .. }) => Type::Kernel {
+            inputs: inputs.clone(),
+            mass: Mass::Normalized,
+        },
+        // A value: the law of that value.
+        other => Type::Measure {
+            domain: Box::new(other.cloned().unwrap_or(Type::Any)),
+            mass: Mass::Normalized,
         },
     }
 }
