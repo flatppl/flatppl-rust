@@ -526,32 +526,53 @@ impl Catalogue {
         }
     }
 
-    /// Does `name` declare a VARIADIC tail whose inputs §04 leaves unnamed? Such a row can
+    /// Does `name` declare a VARIADIC parameter whose inputs §04 leaves unnamed? Such a row can
     /// never accept a splatted aggregate — there is no name for a field to bind to.
     ///
-    /// Read structurally off the declared parameter list (a trailing
-    /// [`ParamSig::Variadic`]) rather than from a name list, so a variadic row added later is
-    /// covered on arrival instead of needing to be remembered here. §04 "Calling conventions"
-    /// is what makes the structure sufficient: every variadic special operation it enumerates
-    /// has *unnamed* variadic inputs — "`cat`, `fchain`, `kchain`: Variadic unnamed inputs
-    /// with significant order", "`get`: One distinguished input plus variadic unnamed input",
-    /// "`vector`: Unnamed variadic inputs with significant order", "`tuple`: Unnamed variadic
-    /// inputs with significant order", "`superpose`: Variadic unnamed inputs with no
-    /// significant order".
+    /// Read structurally off the declared parameter list (`params.iter().any(Variadic)`) rather
+    /// than from a name list, so a variadic row added later is covered on arrival instead of
+    /// needing to be remembered here. §04 "Calling conventions" is what makes the structure
+    /// sufficient: every variadic special operation it enumerates has *unnamed* variadic inputs
+    /// — "`cat`, `fchain`, `kchain`: Variadic unnamed inputs with significant order", "`get`:
+    /// One distinguished input plus variadic unnamed input", "`vector`: Unnamed variadic inputs
+    /// with significant order", "`tuple`: Unnamed variadic inputs with significant order",
+    /// "`superpose`: Variadic unnamed inputs with no significant order".
     ///
-    /// **The exclusion list is the one §04 category that differs**: `cartprod`, `joint` and
-    /// `jointchain` take "Variadic unnamed **or named** inputs", and `record`/`table`,
-    /// `functionof`/`kernelof`, `broadcast` and `load_module` take named ones — for those a
-    /// field name CAN bind, so a splat is not automatically wrong. None of them is a base
-    /// catalogue row today (`ops.rs` types them structurally, so this method never sees them),
-    /// which makes the list pure future-proofing: it keeps the structural rule honest if any
-    /// of them ever gains a row.
+    /// **`any`, not `last`, deliberately.** All five live rows put the variadic parameter last,
+    /// so the two agree today — but [`Arity::of`] is itself position-agnostic (any `Variadic`
+    /// removes the upper bound), so matching it keeps this guard covering exactly the set of
+    /// rows the arity rule treats as unbounded. Checking `last` would leave a hypothetical
+    /// mid-list variadic unbounded on arity yet unguarded here, which is the fail-open
+    /// direction.
+    ///
+    /// ## The exclusions
+    ///
+    /// **Rows whose variadic inputs §04 documents as NAMED** — `record`/`table`,
+    /// `functionof`/`kernelof`, `broadcast`, `load_module`. A field name CAN bind on these, so a
+    /// splat is not automatically wrong. None is a base catalogue row today (`ops.rs` types them
+    /// structurally, so this method never sees them); the list is future-proofing.
+    ///
+    /// `cartprod`, `joint` and `jointchain` are deliberately **NOT** excluded even though §04
+    /// gives them "Variadic unnamed **or named** inputs": the ambiguity cuts the other way. If
+    /// one of them ever gains a row with unnamed variadic inputs, an exclusion would silently
+    /// accept the very splat this guard closes, so the structural read decides for them.
+    ///
+    /// **`vector` is excluded on §07 grounds, and it is the one row where a sole aggregate has a
+    /// plausible NON-splat reading.** §07 gives `vector` the arguments `x1, x2, ...` over the
+    /// domain "**scalars**" — its arguments *are* the elements of the result. So `vector(pars)`
+    /// reads naturally as "a one-element array holding `pars`", which is what
+    /// `ys ~ transport.(xs, [pars])` means in
+    /// `flatppl-js/packages/engine/test/fixtures/simple-transport1.flatppl` and
+    /// `packages/web/demo/transport-model.flatppl`. §03's element rule already reports that
+    /// accurately ("array elements must be scalars, strings, or arrays … got a record"), and
+    /// it diagnoses the shape the author actually asked for; the splat message would instead
+    /// advise `vector(t.a, t.b, t.mu)`, a THREE-element array of reals, which is a different
+    /// value. Every other variadic row takes arguments of heterogeneous ROLES, where no
+    /// one-argument reading exists. Pinned by
+    /// `variadic_splat.rs::vector_keeps_the_sec03_element_diagnosis`.
     pub(crate) fn base_has_unnamed_variadic(&self, name: &str) -> bool {
         /// §04 rows whose variadic inputs may be NAMED — a splat can bind on these.
         const NAMED_VARIADIC: &[&str] = &[
-            "cartprod",
-            "joint",
-            "jointchain",
             "record",
             "table",
             "functionof",
@@ -559,7 +580,9 @@ impl Catalogue {
             "broadcast",
             "load_module",
         ];
-        if NAMED_VARIADIC.contains(&name) {
+        // §07's `vector` takes its ELEMENTS as arguments, so a sole aggregate is an element
+        // question for §03, not a binding question for §04. See the doc comment.
+        if name == "vector" || NAMED_VARIADIC.contains(&name) {
             return false;
         }
         let params = match self.base(name) {

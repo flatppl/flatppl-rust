@@ -3053,7 +3053,8 @@ fn refuse_splat_onto_unnamed_variadic(
             let first = fields.first().map(String::as_str).unwrap_or("a");
             format!(
                 "pass the container and each selector explicitly, as in `{name}(t, \"{first}\")` \
-                 — the aggregate is this row's `container` argument, not a list of arguments"
+                 for an aggregate `t` — the aggregate is this row's `container` argument, not a \
+                 list of arguments"
             )
         }
         _ => format!(

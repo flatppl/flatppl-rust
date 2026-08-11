@@ -59,12 +59,14 @@ fn every_unnamed_variadic_row_refuses_a_splatted_aggregate() {
         .base_names()
         .filter(|n| {
             // Same structural property the implementation reads, re-derived here from the
-            // public API so the test is not just the implementation restated.
-            cat.base_arity(n).is_some_and(|a| a.max.is_none())
+            // public API so the test is not just the implementation restated. `vector` is
+            // excluded: §07 makes its arguments the ELEMENTS of the result, so a sole aggregate
+            // is a §03 element question — see `vector_keeps_the_sec03_element_diagnosis`.
+            *n != "vector" && cat.base_arity(n).is_some_and(|a| a.max.is_none())
         })
         .collect();
     assert!(
-        variadic.len() >= 5,
+        variadic.len() >= 4,
         "expected the known variadic rows, found {variadic:?}"
     );
     for n in &variadic {
@@ -155,7 +157,7 @@ fn the_get_diagnostic_points_at_the_container_and_selectors() {
 /// advice cannot work on these rows and would send the author down a dead end.
 #[test]
 fn the_refusal_does_not_advise_the_unusable_keyword_spelling() {
-    for n in ["cat", "get", "get0", "vector", "builtin_sample"] {
+    for n in ["cat", "get", "get0", "builtin_sample"] {
         for errs in [table_splat(n), record_splat(n)] {
             for e in errs.iter().filter(|e| e.contains("UNNAMED")) {
                 assert!(
@@ -235,5 +237,41 @@ fn a_named_row_keeps_its_name_checked_splat() {
             .iter()
             .any(|e| e.contains("has no parameter `zzq`")),
         "and a mismatch still reports the NAME check, not the variadic one: {mismatch:?}"
+    );
+}
+
+/// **`vector` keeps §03's element diagnosis** — the one variadic row where a sole aggregate has
+/// a plausible NON-splat reading, and the one place the §04 message would be a net loss.
+///
+/// §07 gives `vector` the arguments `x1, x2, ...` over the domain "scalars": its arguments ARE
+/// the elements of the result. So `vector(pars)` reads naturally as "a one-element array holding
+/// `pars`" — which is exactly what `[pars]` means in the two corpus models below — and §03's
+/// element rule reports that accurately. The §04 splat message would instead advise
+/// `vector(t.a, t.b, t.mu)`: a THREE-element array of reals, a different value from the
+/// one-element array the author asked for.
+///
+/// This pins the corpus shape directly: an array literal holding a record, as written in
+/// `flatppl-js/packages/engine/test/fixtures/simple-transport1.flatppl:21` and
+/// `packages/web/demo/transport-model.flatppl:21` (`ys ~ transport.(xs, [pars])`).
+#[test]
+fn vector_keeps_the_sec03_element_diagnosis() {
+    // The transport shape: a record, then an array literal holding it.
+    let errs = errors(
+        "a = elementof(reals)\n\
+         b = elementof(reals)\n\
+         mu = elementof(reals)\n\
+         pars = record(a = a, b = b, mu = mu)\n\
+         z = [pars]\n",
+    );
+    assert!(
+        errs.iter().any(
+            |e| e.contains("array elements must be scalars, strings, or arrays")
+                && e.contains("got a record")
+        ),
+        "§03's element rule is the accurate diagnosis for a one-element array: {errs:?}"
+    );
+    assert!(
+        !errs.iter().any(|e| e.contains("UNNAMED")),
+        "the §04 splat message must NOT fire — it would advise a different array shape: {errs:?}"
     );
 }
