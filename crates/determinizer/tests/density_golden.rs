@@ -550,10 +550,15 @@ lp = logdensityof(lawof(record(a = a)), record(a = 0.5))";
 
 // The spec's canonical mixture idiom (§06 "Additive superposition"):
 // `normalize(superpose(weighted(p, M1), weighted(1 - p, M2)))` with weights p and
-// `1 - p`. It lowers via the SAME convex-superposition rule — the weights-sum-to-
-// one case is Z = add(p, sub(1, p)) with no symbolic sum-to-one proof (the
-// backend evaluates log Z → log 1 = 0). Proves the dissimilar-mixture shape
-// unblocks. Regression for buffy #262.
+// `1 - p`. It lowers via the SAME convex-superposition rule, and now WITHOUT any
+// normalizer term: inference proves the `superpose` `%normalized` from the
+// complement weights, so `normalize` takes its identity path ("If `M` is already
+// a probability measure … `Z = 1`, `logZ = 0`" — `lower_normalize_density`).
+//
+// This pin previously asserted a `(log 1.0)` term, which const-folding produced
+// from `Z = add(p, sub(1, p))`. Same density either way (log 1 = 0); the proof
+// removes the subtraction rather than folding it, so the assertion moved from
+// "the normalizer folds to log 1.0" to "there is no normalizer to fold".
 #[test]
 fn normalize_superpose_one_minus_p_mixture_idiom_lowers() {
     let src = "\
@@ -574,15 +579,16 @@ lp = logdensityof(lawof(record(a = a)), record(a = 0.5))";
         2,
         "one density term per mixand:\n{pir}"
     );
-    // Z = add(p, 1 - p) with p = 0.4 a literal: canon Pass 1's
-    // `resolve_alias_refs` inlines the trivial alias `(%ref self p)` to `0.4`,
-    // then const-fold reduces `add(0.4, sub(1.0, 0.4))` to the literal `1.0`
-    // (the basic arithmetic ops are IEEE-754-exact, so this is bit-identical
-    // to evaluating it at run time) — the normalizer surfaces as a bare
-    // `(log 1.0)`, distinct from the per-mixand `(add (log 0.4) …)` terms.
+    // No normalizer at all: the mixture is `%normalized` before `normalize` is
+    // lowered, so nothing is subtracted. The per-mixand `(add (log 0.4) …)` terms
+    // stay, which is why this asserts on the SUBTRACTION and not on `log`.
     assert!(
-        pir.contains("(log 1.0)"),
-        "log(p + (1 - p)) additive-mass normalizer folds the weights to 1.0:\n{pir}"
+        !pir.contains("(log 1.0)"),
+        "a proven-normalized mixture needs no log(1.0) normalizer:\n{pir}"
+    );
+    assert!(
+        !pir.contains("(sub (logsumexp"),
+        "nothing is subtracted from the mixture density:\n{pir}"
     );
     assert!(
         !pir.contains("normalize") && !pir.contains("superpose") && !pir.contains("weighted"),

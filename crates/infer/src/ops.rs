@@ -1355,10 +1355,14 @@ fn lawof_type(arg: Option<&Type>) -> Type {
 /// both implement "reject unless proven `%normalized`, or not yet inferred", and
 /// the three narrowings that phrase encodes are argued once here.
 ///
-/// - `%finite` IS rejected, including a `superpose` whose weights visibly sum to
-///   one. The rule quantifies over the mass CLASS, not the arithmetic; a checker
-///   that discharged `0.5 + 0.5 = 1` would accept one model and reject an
-///   equivalent one depending on how much constant folding had run.
+/// - `%finite` IS rejected. The rule quantifies over the mass CLASS: this reads
+///   the class the mass rules produced and does no arithmetic of its own, so a
+///   `%finite` measure is refused however normalized it looks here. Proving
+///   normalization is the MASS RULE's job, and where a proof exists the class it
+///   yields is `%normalized` before this is ever consulted — see
+///   [`superpose_is_provably_normalized`], which is why a mixture with
+///   sum-to-one weights reaches this function as `%normalized` rather than
+///   arguing its way past a `%finite` verdict.
 /// - `%deferred` PASSES. §11 defines it as "not yet inferred" rather than a mass
 ///   verdict, so rejecting it would turn every gap in mass inference into a
 ///   user-facing error on a possibly well-formed model. Note what this makes the
@@ -1399,10 +1403,12 @@ fn unprovable_normalization(args: &[ArgInfo]) -> Option<&'static str> {
 /// `%normalized`, so a draw from an unnormalized measure has no law.
 ///
 /// What §04 does NOT settle is how much proving a checker attempts. It says
-/// "normalized measure", not whether `%finite` weights that visibly sum to one
-/// count as normalized. That class-quantified narrowing lives in
-/// [`unprovable_normalization`] and is the only part of this gate that may still
-/// owe spec text.
+/// "normalized measure", not how hard to work at showing a measure is one. That
+/// question is answered in two places, and the split matters: the MASS RULES
+/// prove what they can (see [`superpose_is_provably_normalized`] for the
+/// sum-to-one mixture) and this gate then quantifies over the resulting class
+/// (see [`unprovable_normalization`]). The classification a checker is expected
+/// to reach is the part that may still owe spec text.
 ///
 /// The gap this closes was surfaced measurably: `draw(truncate(lawof(…), S))` used
 /// to lower to the marginal density gated on `S` with **no normalizer** — the
@@ -4118,6 +4124,204 @@ fn distribution_support(
 // Total-mass classes (Level::Normalization) — spec §11
 // =====================================================================
 
+/// Does this `superpose(...)` PROVE a total mass of exactly one, so §11's
+/// `%normalized` ("total mass of one") applies rather than merely `%finite`?
+///
+/// The maths is forced: `superpose` is measure addition (§06 `superpose`,
+/// $\nu(A) = M_1(A) + M_2(A) + \ldots$) and `weighted(w, M)` scales by `w`
+/// (§06 `weighted`, $\mathrm{d}\nu = w \cdot \mathrm{d}M$), so a superposition
+/// of `weighted(w_i, m_i)` with every `m_i` normalized has total mass `Σ w_i`.
+/// Prove `Σ w_i = 1` and the sum is a probability measure. §06 words `superpose`
+/// as "generally not normalized" and recommends
+/// `normalize(superpose(weighted(w1, M1), weighted(w2, M2)))` for a mixture —
+/// "generally" is what this reads: the normalize spelling stays correct and
+/// stays necessary for everything not proven here.
+///
+/// This reads the argument SYNTAX of the call, not the argument masses, and it
+/// has to: the mass lattice has no "scaled by an unproven factor" element, so
+/// `weighted(psi, m)` with a stochastic `psi` folds to `%unknown` and the
+/// weights are unrecoverable from the folded class.
+///
+/// Requires ALL of:
+///
+/// 1. Every argument is `weighted(w_i, m_i)` (positional spelling) with `m_i`
+///    proven `%normalized`.
+/// 2. The weights provably sum to one, by exactly two decidable readings —
+///    [`literal_weights_sum_to_one`] and [`complement_pair`]. No arithmetic
+///    prover, so `superpose(weighted(w, m), weighted(1 - w, m2))` written with
+///    two separately-bound halves of one sum is NOT proven.
+/// 3. Every weight is provably in [0, 1], so each component is a measure and
+///    the sum is a mixture rather than a signed combination.
+fn superpose_is_provably_normalized(inf: &Inferencer<'_, '_>, args: &[ArgInfo]) -> bool {
+    if args.len() < 2 {
+        return false;
+    }
+    let mut weights = Vec::with_capacity(args.len());
+    for (node, _, _) in args {
+        let Some((weight, base)) = weighted_parts(inf, *node) else {
+            return false;
+        };
+        if !matches!(
+            inf.lookup_type(base),
+            Some(Type::Measure {
+                mass: Mass::Normalized,
+                ..
+            })
+        ) {
+            return false;
+        }
+        weights.push(weight);
+    }
+    literal_weights_sum_to_one(inf, &weights) || complement_pair(inf, &weights)
+}
+
+/// `(weight, base)` of a `weighted(w, M)` call, looking through binding
+/// references so a named component (`signal = weighted(w, m)`) reads the same as
+/// an inline one.
+///
+/// Positional two-argument spelling only. §04 lets a built-in take its arguments
+/// by keyword too, so `weighted(weight = w, base = m)` is valid FlatPPL that this
+/// declines to prove — conservative, and the exit condition is adding the keyword
+/// spelling here, not relaxing anything else.
+fn weighted_parts(inf: &Inferencer<'_, '_>, node: NodeId) -> Option<(NodeId, NodeId)> {
+    let Node::Call(c) = inf.module.node(resolve_binding_refs(inf, node)) else {
+        return None;
+    };
+    let CallHead::Builtin(op) = c.head else {
+        return None;
+    };
+    // `logweighted` is deliberately absent: its weight is exp(logweight), so
+    // proving a sum of one is a different (and non-linear) question.
+    if inf.module.resolve(op) != "weighted" || c.args.len() != 2 || !c.named.is_empty() {
+        return None;
+    }
+    Some((c.args[0], c.args[1]))
+}
+
+/// Follow `(%ref self x)` hops to the bound right-hand side. Bounded, so a
+/// reference cycle (which inference reports separately) cannot spin here.
+fn resolve_binding_refs(inf: &Inferencer<'_, '_>, node: NodeId) -> NodeId {
+    let mut node = node;
+    for _ in 0..16 {
+        let Node::Ref(r) = inf.module.node(node) else {
+            break;
+        };
+        if r.ns != RefNs::SelfMod {
+            break;
+        }
+        let Some(binding) = inf.module.binding_by_name(r.name) else {
+            break;
+        };
+        node = inf.module.binding(binding).rhs;
+    }
+    node
+}
+
+/// All weights are non-negative literals whose DECLARED decimal values sum to
+/// exactly one.
+///
+/// "Declared decimal" is the load-bearing choice, and it is neither f64 addition
+/// nor the exact value of the stored doubles. Measured, on the three readings of
+/// the same weights:
+///
+/// - `[0.3, 0.7]` — f64 addition gives exactly 1.0, the stored doubles sum to
+///   0.99999999999999994…, the declared decimals sum to 1. Accepted here.
+/// - `[0.3333333333333333; 3]` — f64 addition gives exactly 1.0 (two roundings
+///   land on it), the declared decimals sum to 0.9999999999999999. REJECTED
+///   here; an f64 fold would have accepted a mixture whose weights, as written,
+///   do not sum to one.
+/// - `[0.1; 10]` — the declared decimals sum to 1, so accepted, and this must
+///   not depend on f64 addition happening to agree.
+///
+/// So the proof is exact rational arithmetic over what the model says, never
+/// over what a particular float width does with it — FlatPPL mandates no
+/// precision, and this verdict must not move with the engine's.
+fn literal_weights_sum_to_one(inf: &Inferencer<'_, '_>, weights: &[NodeId]) -> bool {
+    fn exact_sum_is_one(inf: &Inferencer<'_, '_>, weights: &[NodeId]) -> Option<bool> {
+        let parsed: Option<Vec<(i128, u32)>> = weights
+            .iter()
+            .map(|&w| decimal_literal(inf.module.node(w)))
+            .collect();
+        let parsed = parsed?;
+        // A negative weight makes the component a signed measure, not a measure.
+        if parsed.iter().any(|&(mantissa, _)| mantissa < 0) {
+            return Some(false);
+        }
+        let scale = parsed.iter().map(|&(_, s)| s).max().unwrap_or(0);
+        let unit = 10i128.checked_pow(scale)?;
+        let mut total: i128 = 0;
+        for (mantissa, s) in parsed {
+            let lift = 10i128.checked_pow(scale - s)?;
+            total = total.checked_add(mantissa.checked_mul(lift)?)?;
+        }
+        Some(total == unit)
+    }
+    exact_sum_is_one(inf, weights).unwrap_or(false)
+}
+
+/// A numeric literal as its declared decimal value: `(mantissa, scale)` denotes
+/// `mantissa / 10^scale`. `None` for a non-literal, and for a magnitude whose
+/// digits would overflow the exact sum.
+fn decimal_literal(node: &Node) -> Option<(i128, u32)> {
+    match node {
+        Node::Lit(Scalar::Int(n)) => Some((*n as i128, 0)),
+        Node::Lit(Scalar::Real(r)) if r.is_finite() => {
+            // `{}` on an f64 is the shortest decimal that round-trips, i.e. what
+            // the model wrote, and never exponent notation.
+            let text = format!("{r}");
+            let (int_digits, frac_digits) = text.split_once('.').unwrap_or((text.as_str(), ""));
+            if int_digits.len() + frac_digits.len() > 18 {
+                return None;
+            }
+            let mantissa: i128 = format!("{int_digits}{frac_digits}").parse().ok()?;
+            Some((mantissa, frac_digits.len() as u32))
+        }
+        _ => None,
+    }
+}
+
+/// The complement pattern: exactly two weights, `e` and `1 - e` with the same
+/// `e`, where `e` is provably in [0, 1]. Then the weights sum to one whatever
+/// `e` turns out to be — the one sum-to-one proof that survives a stochastic or
+/// parameterized weight.
+fn complement_pair(inf: &Inferencer<'_, '_>, weights: &[NodeId]) -> bool {
+    let [a, b] = weights else {
+        return false;
+    };
+    is_complement_of(inf, *a, *b) || is_complement_of(inf, *b, *a)
+}
+
+/// Is `whole_minus` the expression `1 - part`, with `part` proven to lie in
+/// [0, 1]?
+///
+/// Structural equality of the two `part` subtrees is the whole test — no
+/// value-level reasoning. Two DIFFERENT expressions that happen to be equal
+/// (`psi` and a second binding holding the same draw) are correctly not proven:
+/// they are different random variables.
+fn is_complement_of(inf: &Inferencer<'_, '_>, part: NodeId, whole_minus: NodeId) -> bool {
+    let Node::Call(c) = inf.module.node(resolve_binding_refs(inf, whole_minus)) else {
+        return false;
+    };
+    let CallHead::Builtin(op) = c.head else {
+        return false;
+    };
+    if inf.module.resolve(op) != "sub" || c.args.len() != 2 || !c.named.is_empty() {
+        return false;
+    }
+    let subtrahend_is_one = match inf.module.node(c.args[0]) {
+        Node::Lit(Scalar::Int(n)) => *n == 1,
+        Node::Lit(Scalar::Real(r)) => *r == 1.0,
+        _ => false,
+    };
+    subtrahend_is_one
+        && inf.module.structural_eq(part, c.args[1])
+        // [0, 1] is exactly `unitinterval` (§11 value sets); `subset_of` proves
+        // containment or answers false, so an unconstrained weight is unproven.
+        && inf
+            .lookup_valueset(part)
+            .subset_of(&ValueSet::UnitInterval)
+}
+
 /// Fill the `%mass` slot of a measure/kernel-typed call result, per the §06
 /// composition rules. `normalize` on a measure with statically known zero or
 /// infinite mass is a static error (spec: the result is undefined).
@@ -4239,6 +4443,12 @@ pub(crate) fn fill_mass(
         // `superpose(M1, M2, …)` is measure addition Z = Σ Zi (spec §06): the
         // sum of finite masses is finite but generally not normalized; any
         // infinite component makes the sum infinite; an Unknown taints the sum.
+        //
+        // "Generally" has one decidable exception, checked first because it
+        // recovers a class the folded masses have already lost: a mixture whose
+        // component weights PROVABLY sum to one is normalized, even when each
+        // `weighted` component folded to `%unknown`.
+        "superpose" if superpose_is_provably_normalized(inf, args) => Mass::Normalized,
         "superpose" => {
             let masses: Vec<Mass> = (0..args.len()).map(arg_mass).collect();
             if masses.iter().any(|m| matches!(m, Mass::Unknown)) {

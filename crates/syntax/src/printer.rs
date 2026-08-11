@@ -621,37 +621,9 @@ impl<'m> Printer<'m> {
 
     /// Structural equality of two expression trees (chain middles are shared
     /// node ids straight from the parser, but FlatPIR round-trips duplicate
-    /// them).
+    /// them). Lives on [`Module`] so inference's own structural readers share it.
     fn structural_eq(&self, a: NodeId, b: NodeId) -> bool {
-        if a == b {
-            return true;
-        }
-        match (self.module.node(a), self.module.node(b)) {
-            (Node::Lit(x), Node::Lit(y)) => x == y,
-            (Node::Const(x), Node::Const(y)) => x == y,
-            (Node::Hole, Node::Hole) => true,
-            (Node::Ref(x), Node::Ref(y)) => x == y,
-            (Node::Axis(x), Node::Axis(y)) => x == y,
-            (Node::Call(x), Node::Call(y)) => {
-                let heads = match (x.head, y.head) {
-                    (CallHead::Builtin(p), CallHead::Builtin(q)) => p == q,
-                    (CallHead::User(p), CallHead::User(q)) => self.structural_eq(p, q),
-                    _ => false,
-                };
-                heads
-                    && x.inputs == y.inputs
-                    && x.args.len() == y.args.len()
-                    && x.args
-                        .iter()
-                        .zip(y.args.iter())
-                        .all(|(&p, &q)| self.structural_eq(p, q))
-                    && x.named.len() == y.named.len()
-                    && x.named.iter().zip(y.named.iter()).all(|(p, q)| {
-                        p.kind == q.kind && p.name == q.name && self.structural_eq(p.value, q.value)
-                    })
-            }
-            _ => false,
-        }
+        self.module.structural_eq(a, b)
     }
 
     fn expr_list(&self, ids: &[NodeId], lambda: &[Symbol]) -> String {
