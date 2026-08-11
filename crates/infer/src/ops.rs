@@ -356,7 +356,10 @@ pub(crate) fn call_rule(
             Some(failed) => failed,
             None => lawof_type(args.first().map(|(_, t, _)| t)),
         },
-        "draw" => measure_domain(arg_ty(args, 0)),
+        "draw" => match draw_mass_gate(inf, args) {
+            Some(failed) => failed,
+            None => measure_domain(arg_ty(args, 0)),
+        },
         "iid" => iid_type(inf, args),
         // Measure-transforming ops keep the domain but get a FRESH mass slot
         // — their total mass differs from the base's and is computed by the
@@ -1344,6 +1347,88 @@ fn lawof_type(arg: Option<&Type>) -> Type {
     }
 }
 
+/// The mass class of a first argument that is a MEASURE whose normalization cannot
+/// be established, as the `%name` to quote in a diagnostic — `None` when the
+/// argument is not a measure, or is one whose mass the caller must accept.
+///
+/// Shared by [`lawof_mass_gate`] and [`draw_mass_gate`] so the two cannot drift:
+/// both implement "reject unless proven `%normalized`, or not yet inferred", and
+/// the three narrowings that phrase encodes are argued once here.
+///
+/// - `%finite` IS rejected, including a `superpose` whose weights visibly sum to
+///   one. The rule quantifies over the mass CLASS, not the arithmetic; a checker
+///   that discharged `0.5 + 0.5 = 1` would accept one model and reject an
+///   equivalent one depending on how much constant folding had run.
+/// - `%deferred` PASSES. §11 defines it as "not yet inferred" rather than a mass
+///   verdict, so rejecting it would turn every gap in mass inference into a
+///   user-facing error on a possibly well-formed model. Note what this makes the
+///   rule: **reject unless proven `%normalized`, or not yet inferred** — NOT
+///   "reject what is proven unnormalized". The difference is `%unknown`, which §11
+///   defines as "unknown total mass" and which IS rejected, without anything having
+///   been proven about it, because the question is whether normalization was
+///   established, not whether non-normalization was.
+/// - Only `Type::Measure` is inspected. A `Type::Kernel` argument is each caller's
+///   own question; see [`draw_mass_gate`] for why `draw` does not extend to one.
+fn unprovable_normalization(args: &[ArgInfo]) -> Option<&'static str> {
+    let (_, arg_ty, _) = args.first()?;
+    let Type::Measure { mass, .. } = arg_ty else {
+        return None;
+    };
+    match mass {
+        // Proven normalized, or not yet inferred — let it through.
+        Mass::Normalized | Mass::Deferred => None,
+        Mass::Null => Some("%null"),
+        Mass::Finite => Some("%finite"),
+        Mass::LocallyFinite => Some("%locallyfinite"),
+        Mass::Unknown => Some("%unknown"),
+    }
+}
+
+/// `draw(m)`'s total-mass gate: you cannot draw from a measure that is not a
+/// probability measure, and this engine will not quietly normalize one for you.
+///
+/// **Owner ruling, implementation before spec.** No §04/§06 sentence states this
+/// yet; a design PR follows this change. The derivation is #73's equation read
+/// right-to-left: #73 gives `lawof(m)` = `lawof(draw(m))` and requires `lawof`'s
+/// argument to be `%normalized`, so `lawof(draw(m))` needs `m` normalized too —
+/// a draw from an unnormalized measure has no law. §04 independently says
+/// `lawof(x)` "reifies the ancestor subgraph of `x` as a probability measure",
+/// which a draw from a `%finite` restriction cannot satisfy. The alternative to
+/// refusing is normalizing implicitly, which would make a model's meaning depend
+/// on a step the user never wrote.
+///
+/// The gap this closes was surfaced measurably: `draw(truncate(lawof(…), S))` used
+/// to lower to the marginal density gated on `S` with **no normalizer** — the
+/// correct density of an unnormalized restriction, silently presented as a law.
+/// `normalize(...)` is the escape, and the diagnostic says so.
+///
+/// **A KERNEL argument is deliberately NOT gated, and not because it is safe.**
+/// §06's "Uniform kernel extension" is what would license reading `draw(K)`
+/// pointwise — "On a kernel, the operation applies to the output measure at each
+/// input point" — but that paragraph scopes itself to measure-algebra operations
+/// and closes with "This applies to all measure-to-measure operations except
+/// `jointchain` and `kchain`". `draw` is measure-to-VALUE, so the sentence does not
+/// reach it, and nothing else licenses drawing from a non-nullary kernel without an
+/// input point. A NULLARY kernel is a measure by that same paragraph's identity
+/// ("identify measures with nullary kernels") and so is covered by the measure arm.
+/// Whether `draw(<non-nullary kernel>)` should be its own static error is a separate
+/// rule about shapes rather than about mass; today it types `%deferred` via
+/// `measure_domain` and is left alone.
+fn draw_mass_gate(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> Option<Type> {
+    let offending = unprovable_normalization(args)?;
+    let (arg_node, _, _) = args.first()?;
+    inf.diags.push(crate::Diagnostic::error_at(
+        *arg_node,
+        format!(
+            "`draw` requires a probability measure, but this argument's total mass is \
+             `{offending}`: there is no draw from an unnormalized measure. Wrap it in \
+             `normalize(...)` to state that intent — `draw` never normalizes its \
+             argument"
+        ),
+    ));
+    Some(Type::Failed("draw from an unnormalized measure".into()))
+}
+
 /// `lawof(m)`'s total-mass gate: a MEASURE argument must be `%normalized`.
 ///
 /// Spec §04 as amended by flatppl-design#73 (@ `9d9a91c`, pending owner review):
@@ -1376,18 +1461,8 @@ fn lawof_type(arg: Option<&Type>) -> Type {
 ///   whether a non-Markov kernel should be gated by its own `%mass` is the same
 ///   question one level up and is NOT decided here.
 fn lawof_mass_gate(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> Option<Type> {
-    let (arg_node, arg_ty, _) = args.first()?;
-    let Type::Measure { mass, .. } = arg_ty else {
-        return None;
-    };
-    let offending = match mass {
-        // Proven normalized, or not yet inferred — let it through.
-        Mass::Normalized | Mass::Deferred => return None,
-        Mass::Null => "%null",
-        Mass::Finite => "%finite",
-        Mass::LocallyFinite => "%locallyfinite",
-        Mass::Unknown => "%unknown",
-    };
+    let offending = unprovable_normalization(args)?;
+    let (arg_node, _, _) = args.first()?;
     inf.diags.push(crate::Diagnostic::error_at(
         *arg_node,
         format!(

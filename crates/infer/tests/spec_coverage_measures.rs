@@ -607,3 +607,116 @@ fn the_lawof_identity_survives_alias_hops() {
         "three alias hops must not change the identity typing:\n{out}"
     );
 }
+
+// ============================================================
+// `draw` requires a probability measure (owner ruling; spec PR to follow)
+// ============================================================
+//
+// No implicit normalization: drawing from a measure whose mass is not a
+// probability is a static error, and `normalize(m)` is the escape. Derived from
+// #73's equation read right-to-left — `lawof(m)` = `lawof(draw(m))` and `lawof`
+// requires `%normalized`, so a draw from an unnormalized measure has no law.
+// Mirrors `lawof`'s gate exactly; both route through `unprovable_normalization`.
+
+/// Every mass class the checker can prove is not a probability is rejected, and the
+/// message names `normalize(...)`.
+#[test]
+fn draw_rejects_a_measure_that_is_not_a_probability() {
+    let n = "n = Normal(mu = 0.0, sigma = 1.0)\n";
+    // %finite by restriction.
+    assert!(rejects(
+        &format!("{n}y = draw(truncate(n, interval(0.0, 1.0)))"),
+        "`draw` requires a probability measure"
+    ));
+    // %finite by reweighting.
+    assert!(rejects(
+        &format!("{n}y = draw(weighted(2.0, n))"),
+        "total mass is `%finite`"
+    ));
+    // %locallyfinite — a reference measure.
+    assert!(rejects(
+        "y = draw(Lebesgue(reals))",
+        "total mass is `%locallyfinite`"
+    ));
+    // The escape is named.
+    assert!(rejects(
+        &format!("{n}y = draw(truncate(n, interval(0.0, 1.0)))"),
+        "normalize(...)"
+    ));
+}
+
+/// The same class-quantified conservatism as `lawof`'s gate: a `%finite`
+/// `superpose` whose weights visibly sum to one is REJECTED, because the rule is
+/// about the mass class and not about whether the arithmetic happens to fold.
+#[test]
+fn draw_rejects_a_finite_superpose_even_when_the_weights_sum_to_one() {
+    let src = "\
+n = Normal(mu = 0.0, sigma = 1.0)
+sp = superpose(weighted(0.5, n), weighted(0.5, n))
+y = draw(sp)";
+    assert!(rejects(src, "total mass is `%finite`"));
+    let fixed = "\
+n = Normal(mu = 0.0, sigma = 1.0)
+sp = superpose(weighted(0.5, n), weighted(0.5, n))
+y = draw(normalize(sp))";
+    assert!(diags_of(fixed).is_empty(), "{:?}", diags_of(fixed));
+}
+
+/// What the gate must NOT touch: the ordinary spellings every model uses, and the
+/// explicit `normalize` escape. `draw` of a KERNEL is also left alone — §06's
+/// uniform kernel extension scopes itself to "measure-to-measure operations", and
+/// `draw` is measure-to-value, so nothing licenses a pointwise reading to gate.
+#[test]
+fn draw_accepts_probabilities_the_escape_and_a_kernel() {
+    for src in [
+        "y = draw(Normal(mu = 0.0, sigma = 1.0))",
+        "y ~ Normal(mu = 0.0, sigma = 1.0)",
+        "y = draw(iid(Normal(mu = 0.0, sigma = 1.0), 3))",
+        "n = Normal(mu = 0.0, sigma = 1.0)\ny = draw(normalize(truncate(n, interval(0.0, 1.0))))",
+        "n = Normal(mu = 0.0, sigma = 1.0)\ny = draw(normalize(weighted(2.0, n)))",
+        "mu = elementof(reals)\ny ~ Normal(mu = mu, sigma = 1.0)\n\
+         k = kernelof(record(y = y), mu = mu)\nz = draw(k)",
+    ] {
+        assert!(
+            diags_of(src).is_empty(),
+            "{src} must infer clean: {:?}",
+            diags_of(src)
+        );
+    }
+}
+
+/// Alias-transparent at three hops on BOTH arms, like the `lawof`/`kernelof` gates:
+/// the rule reads the inferred type, and a ref's type is its target's.
+#[test]
+fn the_draw_gate_survives_alias_hops() {
+    assert!(rejects(
+        "n = Normal(mu = 0.0, sigma = 1.0)\nt = truncate(n, interval(0.0, 1.0))\n\
+         t2 = t\nt3 = t2\ny = draw(t3)",
+        "`draw` requires a probability measure"
+    ));
+    // The accepting side must be alias-transparent too, or the gate could be
+    // defeated into REFUSING a legitimate model by an alias hop.
+    let ok = "n = Normal(mu = 0.0, sigma = 1.0)\nm = normalize(truncate(n, interval(0.0, 1.0)))\n\
+              m2 = m\nm3 = m2\ny = draw(m3)";
+    assert!(diags_of(ok).is_empty(), "{:?}", diags_of(ok));
+}
+
+/// The shape that motivated the ruling: `draw(truncate(lawof(…), S))` used to lower
+/// to the marginal density gated on `S` with no normalizer — an unnormalized
+/// measure silently presented as a law. Both gates now speak, and `lawof`'s fires
+/// on the inner argument only when it is itself unnormalized, so this reports the
+/// `draw`.
+#[test]
+fn the_ldid_unnormalized_shape_is_now_rejected() {
+    let src = "\
+a = draw(Normal(mu = 0.0, sigma = 1.0))
+y = draw(truncate(lawof(Normal(mu = a, sigma = 1.0)), interval(0.0, 3.0)))
+lp = logdensityof(lawof(y), 0.5)";
+    assert!(rejects(src, "`draw` requires a probability measure"));
+    // And the explicit escape clears it.
+    let fixed = "\
+a = draw(Normal(mu = 0.0, sigma = 1.0))
+y = draw(normalize(truncate(lawof(Normal(mu = a, sigma = 1.0)), interval(0.0, 3.0))))
+lp = logdensityof(lawof(y), 0.5)";
+    assert!(diags_of(fixed).is_empty(), "{:?}", diags_of(fixed));
+}
