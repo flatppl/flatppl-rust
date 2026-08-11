@@ -578,6 +578,12 @@ fn record_field(m: &mut Module, rec: NodeId, name: Symbol) -> Option<NodeId> {
         return c.named.iter().find(|na| na.name == name).map(|na| na.value);
     }
     // Opaque table: bind the column access §03 defines, if the type declares that column.
+    //
+    // A multi-column splat that refuses on a LATER column leaves the `get` nodes already
+    // allocated for the earlier ones unreferenced. Benign: the arena is append-only and never
+    // freed per node (`crates/core/src/id.rs`), nothing reaches them, and inference rejects a
+    // name mismatch before the determiniser runs anyway — so the partial case is only reachable
+    // when some other layer has already failed.
     if !table_columns(m, rec)?.contains(&name) {
         return None;
     }

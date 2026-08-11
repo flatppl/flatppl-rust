@@ -224,22 +224,25 @@ z = g(t)";
 /// identically — the same property the literal case pins, now for the type-derived columns.
 #[test]
 fn an_opaque_table_splats_by_name_not_by_column_order() {
+    // The body is NON-COMMUTATIVE (`-`, not `+`) and the second module declares its columns
+    // in the REVERSED order. A commutative body would pass either way round, so it could not
+    // tell name binding from declaration order; subtraction can.
     let forward = printed(
         "\
 t = load_data(\"x.csv\", cartpow(cartprod(a = reals, b = reals), 4))
-g = functionof(sum(_p_) + sum(_r_), a = _p_, b = _r_)
+g = functionof(sum(_p_) - sum(_r_), a = _p_, b = _r_)
 z = g(t)",
     );
     let reversed = printed(
         "\
 t = load_data(\"x.csv\", cartpow(cartprod(b = reals, a = reals), 4))
-g = functionof(sum(_p_) + sum(_r_), a = _p_, b = _r_)
+g = functionof(sum(_p_) - sum(_r_), a = _p_, b = _r_)
 z = g(t)",
     );
     for text in [&forward, &reversed] {
         assert!(
-            text.contains("z = sum(t.a) + sum(t.b)"),
-            "column order must not change which input a column binds:\n{text}"
+            text.contains("z = sum(t.a) - sum(t.b)"),
+            "column `a` must bind input `a` whatever order the columns are declared in:\n{text}"
         );
     }
 }
@@ -291,5 +294,68 @@ z = g(v)");
     assert!(
         text.contains("(sum (%ref self v))"),
         "a vector argument binds positionally, unsplatted:\n{text}"
+    );
+}
+
+/// The ONE-COLUMN opaque table, which this wave changed SILENTLY and did not disclose until
+/// review caught it. §04 splats "whatever its field count, a single field included", so a
+/// one-column table against a one-input callable whose parameter IS that column's name splats
+/// to the column — it does not bind the table whole.
+///
+/// The change is lower → lower-DIFFERENTLY, a worse class than the refuse → lower this wave
+/// set out to make, because nothing fails to announce it:
+///
+/// | | base `0094dcc` | head |
+/// |---|---|---|
+/// | `g = functionof(sum(_p_), a = _p_)`, `g(t)` | `z = sum(t)` | `z = sum(t.a)` |
+/// | `g = functionof(lengthof(_p_), a = _p_)`, `g(t)` | `z = lengthof(t)` | `z = lengthof(t.a)` |
+///
+/// The head values are the correct ones — they are what the `table(...)` literal twin has
+/// always given — and the base ones were the whole-value bind §04 rules out. The semantics
+/// differ, not just the spelling: `sum(t)` is a §07 TABLE reduction (a record of per-column
+/// sums) while `sum(t.a)` is a scalar sum over one column. Pinned for both heads so the change
+/// cannot silently revert or drift again.
+///
+/// A KNOWN, PRE-EXISTING disagreement rides along here and is deliberately not asserted as
+/// correct: `infer` types this `z` as `(%record (a (%scalar real)))` — it binds the whole table
+/// to the body's placeholder and then applies the table-reduction rule — while the determiniser
+/// lowers the scalar `sum(t.a)`. Identical on base, and on the literal path too, so it is not
+/// this wave's doing. Recorded in `TODO-flatppl-rust.md`.
+#[test]
+fn a_one_column_opaque_table_splats_to_its_column_not_to_the_whole_table() {
+    for (body, want) in [
+        ("sum(_p_)", "z = sum(t.a)"),
+        ("lengthof(_p_)", "z = lengthof(t.a)"),
+    ] {
+        let text = printed(&format!(
+            "t = load_data(\"x.csv\", cartpow(cartprod(a = reals), 4))\n\
+             g = functionof({body}, a = _p_)\n\
+             z = g(t)"
+        ));
+        assert!(
+            text.contains(want),
+            "a one-column table must splat to `{want}`, not bind the table whole:\n{text}"
+        );
+        assert!(
+            !text.contains("z = sum(t)") && !text.contains("z = lengthof(t)"),
+            "the whole-table bind §04 rules out must not survive:\n{text}"
+        );
+    }
+    // A one-column table whose column name does NOT match still refuses, so the one-column
+    // case is not a blanket "bind the only column" shortcut — it binds BY NAME like any other.
+    let mut m = flatppl_syntax::parse(
+        "t = load_data(\"x.csv\", cartpow(cartprod(zzz = reals), 4))\n\
+         g = functionof(sum(_p_), a = _p_)\n\
+         z = g(t)",
+    )
+    .unwrap();
+    let errors: Vec<String> = flatppl_infer::infer(&mut m)
+        .into_iter()
+        .filter(|d| d.severity == flatppl_infer::Severity::Error)
+        .map(|d| d.message)
+        .collect();
+    assert!(
+        errors.iter().any(|e| e.contains("has no parameter `zzz`")),
+        "a one-column table with a non-matching column name is a §04 static error, got: {errors:?}"
     );
 }
