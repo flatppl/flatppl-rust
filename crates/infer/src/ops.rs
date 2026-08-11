@@ -1387,15 +1387,22 @@ fn unprovable_normalization(args: &[ArgInfo]) -> Option<&'static str> {
 /// `draw(m)`'s total-mass gate: you cannot draw from a measure that is not a
 /// probability measure, and this engine will not quietly normalize one for you.
 ///
-/// **Owner ruling, implementation before spec.** No §04/§06 sentence states this
-/// yet; a design PR follows this change. The derivation is #73's equation read
-/// right-to-left: #73 gives `lawof(m)` = `lawof(draw(m))` and requires `lawof`'s
-/// argument to be `%normalized`, so `lawof(draw(m))` needs `m` normalized too —
-/// a draw from an unnormalized measure has no law. §04 independently says
-/// `lawof(x)` "reifies the ancestor subgraph of `x` as a probability measure",
-/// which a draw from a `%finite` restriction cannot satisfy. The alternative to
-/// refusing is normalizing implicitly, which would make a model's meaning depend
-/// on a step the user never wrote.
+/// **§04 states the rule normatively** (`docs/04-design.md`, reification): "`x ~ m`
+/// (equivalent to `x = draw(m)`) introduces a stochastic node `x` by drawing a
+/// variate from a normalized measure (i.e. a probability measure) `m`." A `draw`
+/// from anything else is therefore already ill-formed; the owner ruling is only
+/// that the engine says so instead of normalizing quietly, because implicit
+/// normalization makes a model's meaning depend on a step the user never wrote.
+///
+/// flatppl-design#73 corroborates §04 when its equation is read right-to-left:
+/// #73 gives `lawof(m)` = `lawof(draw(m))` and requires `lawof`'s argument to be
+/// `%normalized`, so a draw from an unnormalized measure has no law.
+///
+/// What §04 does NOT settle is how much proving a checker attempts. It says
+/// "normalized measure", not whether `%finite` weights that visibly sum to one
+/// count as normalized. That class-quantified narrowing lives in
+/// [`unprovable_normalization`] and is the only part of this gate that may still
+/// owe spec text.
 ///
 /// The gap this closes was surfaced measurably: `draw(truncate(lawof(…), S))` used
 /// to lower to the marginal density gated on `S` with **no normalizer** — the
@@ -1408,12 +1415,14 @@ fn unprovable_normalization(args: &[ArgInfo]) -> Option<&'static str> {
 /// input point" — but that paragraph scopes itself to measure-algebra operations
 /// and closes with "This applies to all measure-to-measure operations except
 /// `jointchain` and `kchain`". `draw` is measure-to-VALUE, so the sentence does not
-/// reach it, and nothing else licenses drawing from a non-nullary kernel without an
-/// input point. A NULLARY kernel is a measure by that same paragraph's identity
-/// ("identify measures with nullary kernels") and so is covered by the measure arm.
-/// Whether `draw(<non-nullary kernel>)` should be its own static error is a separate
-/// rule about shapes rather than about mass; today it types `%deferred` via
-/// `measure_domain` and is left alone.
+/// reach it. §06 arguably FORBIDS the case outright: "Operations that map measures
+/// to values, like `totalmass`, `densityof`, and `logdensityof`, require closed
+/// measures (i.e. nullary kernels) as inputs" — an exemplary list, and `draw` maps
+/// a measure to a value. A NULLARY kernel is a measure by that same paragraph's
+/// identity ("identify measures with nullary kernels") and so is covered by the
+/// measure arm. So the open question is whether `draw(<non-nullary kernel>)`
+/// deserves a static error of its own, which is a rule about shapes rather than
+/// about mass; today it types `%deferred` via `measure_domain` and is left alone.
 fn draw_mass_gate(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> Option<Type> {
     let offending = unprovable_normalization(args)?;
     let (arg_node, _, _) = args.first()?;

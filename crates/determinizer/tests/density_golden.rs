@@ -2602,10 +2602,11 @@ lp = logdensityof(lawof(M), 0.5)",
 // so `draw` of a measure whose mass is not a probability is a STATIC ERROR and the escape is the
 // user writing `normalize(...)`.
 //
-// The rule is #73's equation read right-to-left: #73 gives `lawof(m)` = `lawof(draw(m))` and
+// The rule is normative §04 already: "`x ~ m` (equivalent to `x = draw(m)`) introduces a stochastic
+// node `x` by drawing a variate from a normalized measure (i.e. a probability measure) `m`."
+// flatppl-design#73 corroborates it right-to-left — #73 gives `lawof(m)` = `lawof(draw(m))` and
 // requires `lawof`'s argument to be `%normalized`, so a draw from an unnormalized measure has no
-// law. A §04/§06 sentence follows as a design PR; the gate lives in `infer`
-// (`ops::draw_mass_gate`).
+// law. The gate lives in `infer` (`ops::draw_mass_gate`).
 //
 // NOTE why this asserts the DIAGNOSTIC and not a determiniser refusal: `determinize_src` calls
 // `infer` and discards its diagnostics, so the determiniser still walks an ill-formed module and
@@ -2648,10 +2649,15 @@ lp = logdensityof(lawof(y), 0.3)",
         );
     }
 
-    // POSITIVE CONTROL: writing the normalization explicitly is the escape, and it must still
-    // reach the CDF transport path — the same `builtin_touniform` route
-    // `normalize(truncate(Ctor, S))` takes elsewhere in this file. Without this, the refusals
-    // above would be satisfied by a gate that rejected the whole family.
+    // POSITIVE CONTROL: writing the normalization explicitly is the escape, so this must INFER
+    // CLEAN. Without it, the refusals above would be satisfied by a gate that rejected the whole
+    // family.
+    //
+    // It does not lower, and that is disclosed rather than asserted: for this shape the base is a
+    // `lawof` marginal, and determinization then refuses one layer down with "normalize(truncate):
+    // closed-form Z needs a leaf built-in distribution base; a composed/pushfwd base has no
+    // defined touniform transport". That limit is pre-existing and unrelated to this gate — a LEAF
+    // base does reach `builtin_touniform`. Both layers refuse, so nothing unsafe lowers.
     let src = "\
 a = draw(Normal(mu = 0.0, sigma = 1.0))
 y = draw(normalize(truncate(lawof(Normal(mu = a, sigma = 1.0)), interval(0.0, 3.0))))
