@@ -1289,13 +1289,26 @@ fn table_of_record_power(shape: Box<[Dim]>, elem: Type) -> Type {
 /// what the determiniser must BUILD, not in what infer records.
 ///
 /// The result's `%mass` is `%normalized` unconditionally: a law is a probability
-/// measure by definition. That also settles the `%deferred`-argument case the gate
-/// deliberately admits (see [`lawof_mass_gate`]) — an argument whose mass is not
-/// yet inferred still has a law if it has one at all, and if it turns out
-/// unnormalized the gate rejects it once inference completes. The gate and this
-/// typing therefore stay consistent: everything the gate admits is typed as a law.
-/// (`Mass::Normalized` also matches the separate mass-level `"lawof"` rule, which
-/// has said `Normalized` all along.)
+/// measure by definition. This is the ONLY place that mass is decided — the
+/// mass-level rule table has no `"lawof"` arm, deliberately (see the pointer there).
+///
+/// On the `%deferred`-argument path the gate deliberately admits (see
+/// [`lawof_mass_gate`]), that `%normalized` is an unproven ASSUMPTION, and
+/// permanently so. There is no later pass to revisit it: `trace::Inferencer::run`
+/// walks each binding once, memoized, and flushes into the module's side tables, so
+/// an argument's `%mass` is final at the moment the gate reads it. So the honest
+/// statement of what this pair does is: **normalization is a theorem where the gate
+/// proves it, and an assumption on the `%deferred` path.** The two stay consistent
+/// in the sense that everything admitted is typed as a law — not in the sense that
+/// everything typed as a law was checked.
+///
+/// The assumption is narrow in practice and resisted attempts to break it: no model
+/// in either corpus (51 across `flatppl-examples` and the in-repo fixtures) emits a
+/// measure with `%mass %deferred` at all, and mass crosses module boundaries
+/// intact. It is recorded rather than closed because closing it means either
+/// rejecting `%deferred` (which turns every mass-inference gap into a user-facing
+/// error, the thing [`lawof_mass_gate`] exists to avoid) or propagating `%deferred`
+/// into the result (which would claim `lawof` might not produce a law).
 ///
 /// A KERNEL argument lifts pointwise — §04: "On a non-nullary kernel, `lawof`
 /// lifts pointwise, as the uniform kernel extension does for measure-algebra
@@ -3957,8 +3970,14 @@ pub(crate) fn fill_mass(
     };
 
     let mass = match name.as_str() {
+        // NO `"lawof"` arm, on purpose: `lawof_type` sets the result mass itself
+        // (`Mass::Normalized`), so an arm here would be dead. It WAS dead and
+        // agreeing, which is worse than absent — a later change to `lawof_type`'s
+        // mass would leave this reading as though it still governed. Mutation-proven
+        // dead before removal: flipping it to `Mass::Null` broke zero tests, while
+        // the same flip on the `Dirac` arm below broke one, so the harness was
+        // sensitive and the silence meant unreachable.
         // Every §08 distribution is a probability measure.
-        "lawof" => Mass::Normalized,
         // `Dirac(value)` is a point-mass probability measure (total mass 1).
         "Dirac" => Mass::Normalized,
         // Reference measures: finite on a bounded support, infinite (but

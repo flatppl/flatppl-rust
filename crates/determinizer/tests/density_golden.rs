@@ -2098,12 +2098,22 @@ lp_a = logdensityof(lawof(a), 0.1)";
         "not the conditional at the later-pinned latent:\n{lp_m}"
     );
 
-    // These three USED to refuse. The refusal was an artifact of the pre-identity typing:
-    // `lawof(<measure>)` wrapped its argument, so `truncate`/`pushfwd` of it kept a MEASURE
-    // domain and the `draw` node itself typed as a measure, tripping a value-versus-measure
-    // guard. With `lawof` typed as the identity (#73), `y` types as the real it is and the
-    // shapes reach the marginal machinery — which produces the SAME `Normal(0, √2)` this
-    // test's first half pins. The property the test is named for is what is asserted:
+    // Both rows below USED to refuse, and — measured against base 01c4e48 — for DIFFERENT
+    // reasons, neither of which was a rule about this shape:
+    //
+    //   `draw(pushfwd(exp, lawof(…)))`  refused at §06's REFERENCE-MEASURE gate on the
+    //                                   `pushfwd`: "the variate does not prove a reference
+    //                                   measure … so the volume element is undecided".
+    //   `draw(truncate(lawof(…), S))`   refused at the VALUE-VERSUS-MEASURE discriminator
+    //                                   (that row now lives in its own characterization test).
+    //
+    // Both traced to the pre-identity typing: `lawof(<measure>)` wrapped its argument, so
+    // `pushfwd`/`truncate` of it kept a MEASURE domain and the `draw` node typed as a measure —
+    // which denied the pushfwd a reference measure it could name, and tripped the discriminator
+    // on the truncate. With `lawof` typed as the identity (#73), `y` types as the real it is,
+    // both blockers dissolve, and the shapes reach the marginal machinery — producing the SAME
+    // `Normal(0, √2)` this test's first half pins. The property the test is named for is what is
+    // asserted:
     // the MARGINAL is used, never the conditional at the later-pinned latent.
     for (label, src) in [
         (
@@ -2618,6 +2628,14 @@ lp = logdensityof(lawof(y), 0.5)",
 a = draw(Normal(mu = 0.0, sigma = 1.0))
 y = draw(truncate(lawof(Normal(mu = a, sigma = 1.0)), interval(0.0, 3.0)))
 lp = logdensityof(lawof(y), 0.5)",
+        // The HALF-LINE variant, which the base file covered in the row this wave moved out
+        // of `lawof_of_a_draw_parameterized_measure_marginalizes` and would otherwise have
+        // left unpinned. An unbounded truncation set behaves the same way: same marginal,
+        // still no normalizer.
+        "\
+a = draw(Normal(mu = 0.0, sigma = 1.0))
+y = draw(truncate(lawof(Normal(mu = a, sigma = 1.0)), interval(0.0, inf)))
+lp = logdensityof(lawof(y), 0.3)",
     ] {
         let lp = pir_binding(&flatppl_flatpir::write(&determinize_src(src)), "lp");
         // The marginal, not the conditional — the one thing here that IS established.
