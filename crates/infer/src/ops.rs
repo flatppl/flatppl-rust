@@ -4259,6 +4259,51 @@ fn literal_weights_sum_to_one(inf: &Inferencer<'_, '_>, weights: &[NodeId]) -> b
     exact_sum_is_one(inf, weights).unwrap_or(false)
 }
 
+/// A built-in whose value is a property of the NODE rather than of the expression:
+/// reading the spelling tells you nothing about which value you get, so two
+/// occurrences of one spelling may denote two different values.
+///
+/// §04 is explicit for the parameterized case — `functionof` "traces the ancestor
+/// subgraph of its argument back to all leaves of parametric phase — that is, all
+/// `elementof` leaves. These **leaf nodes** become the inputs of the reified
+/// callable" — so each `elementof` occurrence is its own parameter, exactly as each
+/// `draw` is its own stochastic coordinate ("each draw from `m` is a fresh
+/// coordinate"). `rand`, `rnginit` and `rngstate` thread explicit randomness, and
+/// `external` / `load_data` are compile-time-unknown.
+///
+/// The set is deliberately wider than freshness alone: two `load_data` calls on the
+/// same path do agree, but this predicate exists so a caller can decline to reason
+/// about the value at all, and a caller that needs the distinction should not be
+/// tempted to shorten the list. Consulted by [`crate::consteval`] (these are
+/// `%dynamic`, never a const-eval gap) and by [`is_complement_of`] (structural
+/// equality is not value identity across one of these).
+pub(crate) fn is_opaque_value_source(name: &str) -> bool {
+    matches!(
+        name,
+        "draw" | "rand" | "elementof" | "external" | "load_data" | "rnginit" | "rngstate"
+    )
+}
+
+/// Does this expression subtree contain an [`is_opaque_value_source`] call?
+///
+/// Does NOT follow binding references, and that is the point: one binding is one
+/// coordinate, so two `(%ref self psi)` nodes denote the same value however `psi`
+/// was produced. Only sources written INSIDE the compared subtree defeat identity.
+fn contains_opaque_value_source(inf: &Inferencer<'_, '_>, node: NodeId) -> bool {
+    if let Node::Call(c) = inf.module.node(node) {
+        if let CallHead::Builtin(op) = c.head {
+            if is_opaque_value_source(inf.module.resolve(op)) {
+                return true;
+            }
+        }
+    }
+    let mut found = false;
+    inf.module.for_each_child(node, |child| {
+        found = found || contains_opaque_value_source(inf, child);
+    });
+    found
+}
+
 /// A numeric literal as its declared decimal value: `(mantissa, scale)` denotes
 /// `mantissa / 10^scale`. `None` for a non-literal, and for a magnitude whose
 /// digits would overflow the exact sum.
@@ -4291,13 +4336,29 @@ fn complement_pair(inf: &Inferencer<'_, '_>, weights: &[NodeId]) -> bool {
     is_complement_of(inf, *a, *b) || is_complement_of(inf, *b, *a)
 }
 
-/// Is `whole_minus` the expression `1 - part`, with `part` proven to lie in
-/// [0, 1]?
+/// Is `whole_minus` the expression `1 - part`, for the SAME `part`, with `part`
+/// proven to lie in [0, 1]?
 ///
-/// Structural equality of the two `part` subtrees is the whole test — no
-/// value-level reasoning. Two DIFFERENT expressions that happen to be equal
-/// (`psi` and a second binding holding the same draw) are correctly not proven:
-/// they are different random variables.
+/// **Structural equality is not value identity, and treating it as such was
+/// unsound.** Two inline `draw(Uniform(interval(0.0, 1.0)))` subtrees are
+/// syntactically identical and are two independent coordinates (#73: "each draw
+/// from `m` is a fresh coordinate"), so `w1 + (1 - w2) = 1` holds only on a
+/// probability-zero event — yet the pair typed `%normalized` and lowered as a law
+/// with no normalizer. A silently wrong number, and worse than refusing.
+///
+/// So identity needs one of two things, and structural equality alone is neither:
+///
+/// - the SAME node, which is identity by construction; or
+/// - a subtree with no [`is_opaque_value_source`] inside it, where the spelling
+///   does determine the value.
+///
+/// The legitimate spelling survives because a binding is one coordinate: in
+/// `psi ~ Beta(…)` with weights `psi` and `1 - psi`, both compared subtrees are
+/// `(%ref self psi)` — no source is written inside either, and the `draw` sits in
+/// `psi`'s own binding, which this deliberately does not enter. Two DIFFERENT
+/// bindings holding equal draws (`psi` and `phi`) were already unproven, by
+/// `Ref` symbol inequality; the inline duplicate was the gap between that control
+/// and this test.
 fn is_complement_of(inf: &Inferencer<'_, '_>, part: NodeId, whole_minus: NodeId) -> bool {
     let Node::Call(c) = inf.module.node(resolve_binding_refs(inf, whole_minus)) else {
         return false;
@@ -4313,8 +4374,12 @@ fn is_complement_of(inf: &Inferencer<'_, '_>, part: NodeId, whole_minus: NodeId)
         Node::Lit(Scalar::Real(r)) => *r == 1.0,
         _ => false,
     };
+    let other = c.args[1];
+    let same_value = part == other
+        || (!contains_opaque_value_source(inf, part) && !contains_opaque_value_source(inf, other));
     subtrahend_is_one
-        && inf.module.structural_eq(part, c.args[1])
+        && inf.module.structural_eq(part, other)
+        && same_value
         // [0, 1] is exactly `unitinterval` (§11 value sets); `subset_of` proves
         // containment or answers false, so an unconstrained weight is unproven.
         && inf

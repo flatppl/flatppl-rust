@@ -792,6 +792,36 @@ n = Normal(mu = 0.0, sigma = 1.0)
 sp = superpose(n, weighted(0.5, n))
 y = draw(sp)",
         ),
+        (
+            // THE soundness control. These two weight subtrees are syntactically
+            // identical and are two INDEPENDENT coordinates (#73: "each draw from
+            // `m` is a fresh coordinate"), so the masses sum to one only on a
+            // probability-zero event. Structural equality alone accepted this and
+            // typed it `%normalized` — an almost-surely-non-probability lowered as
+            // a law with no normalizer, i.e. a silently wrong number.
+            "two INLINE draws that are structurally identical but independent",
+            "\
+n1 = Normal(mu = 0.0, sigma = 1.0)
+n2 = Normal(mu = 5.0, sigma = 1.0)
+mix = superpose(
+    weighted(draw(Uniform(interval(0.0, 1.0))), n1),
+    weighted(1 - draw(Uniform(interval(0.0, 1.0))), n2))
+y = draw(mix)",
+        ),
+        (
+            // The same hole one phase over: §04 says each `elementof` LEAF becomes
+            // an input of the reified callable, so two occurrences are two
+            // parameters. Pinned to prove the exclusion set is a property and not
+            // the single name `draw`.
+            "two INLINE elementof parameters, structurally identical but distinct",
+            "\
+n1 = Normal(mu = 0.0, sigma = 1.0)
+n2 = Normal(mu = 5.0, sigma = 1.0)
+mix = superpose(
+    weighted(elementof(unitinterval), n1),
+    weighted(1 - elementof(unitinterval), n2))
+y = draw(mix)",
+        ),
     ] {
         assert!(
             !diags_of(src).is_empty(),
