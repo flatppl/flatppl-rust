@@ -75,12 +75,38 @@ pub(crate) fn call_rule(
         return (reification_type(inf, id, call, &name, args), Phase::Fixed);
     }
 
+    // Keyword arguments moved into their DECLARED POSITIONS, once, before any rule reads
+    // them — §04 "Calling conventions" makes the two spellings the same call:
+    //
+    //   "All built-in ordinary callables have a defined input order and accept both
+    //    positional and keyword arguments."
+    //
+    // The per-op rules below index fixed positions (`args.get(1)`, `args.first()`), so
+    // without this a keyword call reached them with an EMPTY `args` and every
+    // position-indexed check silently deferred. `named` is deliberately left intact: the
+    // handful of rules that read it resolve a parameter by name and pick one value, so
+    // seeing it in both places changes nothing, and the rules whose variadic inputs are
+    // genuinely named (`record`, `table`, `joint`, `jointchain`, `broadcast`) declare no
+    // parameter names at all and so are never normalized.
     // Call arity, where the catalogue declares a parameter list. Ahead of the
     // per-op rules because most of them index fixed argument positions and so
     // ignore extras and silently type an under-supplied call.
     if let Some(ty) = arity_check(inf, id, &name, args, named) {
         return (ty, joined);
     }
+
+    // AFTER `arity_check`, which must see the call as WRITTEN: it counts
+    // `args.len() + named.len()` and resolves the splat, so handing it a vector holding the
+    // keywords as well as `named` would double every keyword. Normalization is for POSITIONS
+    // only; counts and names are settled above.
+    let normalized;
+    let args = match normalize_keyword_args(inf.module, &name, args, named) {
+        Some(v) => {
+            normalized = v;
+            normalized.as_slice()
+        }
+        None => args,
+    };
 
     let ty = match name.as_str() {
         // ---- arithmetic (spec §07) — structural: result depends on arg shapes/types ----
@@ -639,6 +665,96 @@ pub(crate) fn call_rule(
 
 fn arg_ty(args: &[ArgInfo], i: usize) -> Option<&Type> {
     args.get(i).map(|(_, t, _)| t)
+}
+
+/// A positional argument vector with each keyword argument moved to its DECLARED position,
+/// or `None` when the call needs no normalizing or cannot be normalized unambiguously.
+///
+/// §04 "Calling conventions": "All built-in ordinary callables have a defined input order and
+/// accept both positional and keyword arguments." So `f(a = x, b = y)`, `f(x, y)` and the mixed
+/// `f(x, b = y)` are the same call, and every rule that reads argument POSITIONS should see the
+/// same vector for all three. §04 also fixes the mixed form's order — positional arguments bind
+/// "in order", keyword arguments "by name" — so a positional prefix occupies `0..args.len()` and
+/// each keyword lands at its own declared index.
+///
+/// **This is the one place the two spellings are reconciled.** The alternative — teaching each
+/// per-op rule to look in both `args` and `named` — is two sites deriving one rule, which is how
+/// the asymmetry it fixes arose in the first place: `arg_ty` reads only positions, so the
+/// kernel-type check on the five `builtin_*` transports and the integer-domain check on
+/// `div`/`mod` fired on `f(1.0, …)` and stayed silent on `f(rngstate = 1.0, …)`.
+///
+/// **Normalizes only an UNAMBIGUOUS mapping** — `None` for anything else, leaving the call
+/// exactly as it arrived so the existing arity and name checks report it:
+///
+/// * no keyword arguments, or the row declares no parameter names (nothing to map by);
+/// * a keyword whose name the row does not declare (the name check's business);
+/// * a keyword targeting a position a positional argument already fills (a double-bound
+///   parameter, which no rule should have to guess about);
+/// * a GAP — a position neither spelling supplies — since a vector cannot carry a hole and
+///   fabricating one would hide the under-supplied call the arity check exists to catch.
+fn normalize_keyword_args(
+    module: &flatppl_core::Module,
+    name: &str,
+    args: &[ArgInfo],
+    named: &[NamedInfo],
+) -> Option<Vec<ArgInfo>> {
+    let cat = crate::catalogue::builtin();
+    let declared = cat.base_param_names(name)?;
+    if named.is_empty() {
+        // The SPLAT spelling. §04 makes `f(record(a = x, b = y))` "equivalent to
+        // `f(a = x, b = y, ...)`", so it must reach the same per-op rules as the keyword form
+        // it is defined as — which is the whole reason a splat inherited the keyword hole.
+        // `arg_reading` splats for COUNTING and NAMING only; nothing rewrote `args`, so the
+        // rules still saw one aggregate argument.
+        //
+        // The synthesized entries carry the AGGREGATE's node, not a per-field one: a
+        // type-level splat has no per-field node (an opaque table has no field expressions),
+        // and `supplied_arg_names` already anchors splat diagnostics at the aggregate for the
+        // same reason. Types and positions are what the rules read.
+        if cat.base_takes_aggregate_whole(name) {
+            return None; // §04's single-input carve-out — no splat happens at all
+        }
+        let [(node, ty, phase)] = args else {
+            return None;
+        };
+        let fields: &[(Symbol, Type)] = match ty {
+            Type::Record(f) => f,
+            Type::Table { columns, .. } => columns,
+            _ => return None,
+        };
+        let mut slots: Vec<Option<ArgInfo>> = Vec::new();
+        for (sym, fty) in fields {
+            let supplied = module.resolve(*sym);
+            let pos = declared.iter().position(|d| d.as_str() == supplied)?;
+            if pos < slots.len() && slots[pos].is_some() {
+                return None;
+            }
+            while slots.len() <= pos {
+                slots.push(None);
+            }
+            slots[pos] = Some((*node, fty.clone(), *phase));
+        }
+        return slots.into_iter().collect();
+    }
+    let mut slots: Vec<Option<ArgInfo>> = Vec::new();
+    // The positional prefix keeps its order (§04: "bound to the inputs in order").
+    for a in args {
+        slots.push(Some(a.clone()));
+    }
+    for (sym, node, ty, phase) in named {
+        // `named` carries interned symbols; compare against the declared spelling.
+        let supplied = module.resolve(*sym);
+        let pos = declared.iter().position(|d| d.as_str() == supplied)?;
+        if pos < slots.len() && slots[pos].is_some() {
+            return None; // double-bound parameter
+        }
+        while slots.len() <= pos {
+            slots.push(None);
+        }
+        slots[pos] = Some((*node, ty.clone(), *phase));
+    }
+    // A hole means the call is under-supplied; hand it back unchanged for the arity check.
+    slots.into_iter().collect()
 }
 
 /// The node supplied for a parameter that may be passed by keyword (`key = …`)
