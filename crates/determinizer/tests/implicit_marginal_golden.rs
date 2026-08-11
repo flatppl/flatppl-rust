@@ -1043,13 +1043,27 @@ fn a_constructor_joint_sharing_a_latent_lowers_the_compound_law() {
     }
 }
 
-// §04 *Identity law* on the `joint(m, m)` case: "`joint(m, m)` contributes a fresh
-// coordinate per occurrence, so the two draws are independent given `m`'s stochastic
-// ancestors — which remain shared". Writing the SAME stochastic measure binding twice is
-// therefore the correlated law of two conditionally independent draws, NOT the singular
-// diagonal joint that two reified laws of ONE draw give (`a_singular_joint_refuses`). The
-// distinction is the whole content of §04's "Equal laws do not make values interchangeable
-// as `joint` components": one shared MEASURE is two coordinates, one shared DRAW is one.
+// Writing the SAME stochastic measure binding twice is the correlated law of two
+// conditionally independent draws, NOT the singular diagonal joint that two reified laws of
+// ONE draw give (`a_singular_joint_refuses_rather_than_mislowers`). One shared MEASURE is two
+// coordinates; one shared DRAW is one.
+//
+// **Grounded on §06 *Joint composition*, not on §04's Identity-law clause, and the two are in
+// tension.** §06 governs the composed trace and gives this shape directly:
+//
+// > A component contributes a fresh coordinate; a stochastic node shared between component
+// > traces (through a reified component — `lawof`, `kernelof` — or a stochastic constructor
+// > parameter) remains a single node of the composed trace.
+//
+// Two coordinates, one `z`, hence `Cov = Var(z) ≠ 0`. Merged §04 *Identity law* ends "a
+// `joint` of two reified laws of the same draw is the singular diagonal joint, while
+// `joint(m, m)` is the product of two independent draws" — and read literally that last
+// clause contradicts what this test pins. §04's sentence is drawing the singular-versus-two-
+// draws contrast and does not qualify "independent" by `m`'s own ancestors, which is exactly
+// the imprecision the unmerged `joint-mm-shared-ancestors` branch is written to fix. Until
+// that lands, §06's rule plus the maths (`Cov(a, b) = Var(z)` for two draws whose mean is the
+// shared `z`) is the authority here — maths > spec > code — and the tension is worth a spec
+// PR rather than a code change.
 #[test]
 fn joint_of_the_same_stochastic_measure_twice_is_two_fresh_coordinates() {
     // Point A's model and point, reached by writing `mm` twice: truth -2.5171832107434002.
@@ -1069,6 +1083,51 @@ lp = logdensityof(joint(a = mm, b = mm), record(a = 0.5, b = 0.7))"),
         2,
         "two fields, so two log σᵢ² terms — one occurrence is not one coordinate:\n{lp}"
     );
+}
+
+// **A component's law does not depend on how many SIBLINGS reach a draw.** §04 *Reification
+// to measures* makes a coordinate's law the TOTAL law of its trace, so ONE
+// constructor-with-a-latent beside an ancestor-free sibling must get the same marginal it gets
+// beside a second latent-carrying sibling. Gating the rewrite on "two or more contributors"
+// broke exactly that: `joint(a = Normal(mu = z1, …), b = Normal(mu = z2, …))` lowered while the
+// strictly easier `joint(a = Normal(mu = z1, …), b = Exponential(…))` — same first component,
+// plus an ancestor-free second one — refused with the raw leftover-`draw` message. Both now
+// give `a` its marginal `Normal(0, √2)` and score `b` independently.
+#[test]
+fn one_constructor_with_a_latent_marginalizes_beside_an_ancestor_free_sibling() {
+    for (label, query) in [
+        (
+            "keyword",
+            "lp = logdensityof(joint(a = Normal(mu = z1, sigma = 1.0), \
+             b = Exponential(rate = 1.0)), record(a = 0.5, b = 0.7))",
+        ),
+        (
+            "positional",
+            "lp = logdensityof(joint(Normal(mu = z1, sigma = 1.0), \
+             Exponential(rate = 1.0)), [0.5, 0.7])",
+        ),
+    ] {
+        let lp = pir_binding(
+            &pir(&format!(
+                "z1 = draw(Normal(mu = 0.0, sigma = 1.0))\n{query}"
+            )),
+            "lp",
+        );
+        assert_eq!(
+            lp.matches("builtin_logdensityof").count(),
+            2,
+            "{label}: the marginalized component plus its independent sibling:\n{lp}"
+        );
+        assert!(
+            lp.contains("(%field sigma 1.4142135623730951)"),
+            "{label}: a's TOTAL law is the marginal Normal(0, √2), integrating z1 out — not \
+             the conditional at z1, and not a refusal:\n{lp}"
+        );
+        assert!(
+            lp.contains("Exponential"),
+            "{label}: the ancestor-free sibling is still its own factor:\n{lp}"
+        );
+    }
 }
 
 // Constructor components reaching DIFFERENT latents share no node, so §06's product rule
@@ -1187,6 +1246,51 @@ lp = logdensityof(joint(a = lawof(z), b = Normal(mu = z, sigma = 1.0)), record(a
     assert!(
         !lp.contains("log1p"),
         "nothing was integrated out, so there is no rank-one correction:\n{lp}"
+    );
+}
+
+// A PARTLY-shared joint refuses: two components share `z1` and a third integrates `z2`, so
+// no single latent covers every field. `shared_latent_record_law` requires all fields to agree
+// on one latent, and the closed form that WOULD answer this — `compound(a, b) · marginal(c)`,
+// a product of the two-field law with `c`'s own marginal — is not built. Correct as
+// refuse-don't-mislower, and newly reachable through the constructor route, so it is pinned
+// rather than left to chance. `marginal.md`'s *What keeps refusing* carries the row.
+#[test]
+fn a_partly_shared_constructor_joint_refuses() {
+    let src = "\
+z1 = draw(Normal(mu = 0.0, sigma = 1.0))
+z2 = draw(Normal(mu = 0.0, sigma = 1.0))
+lp = logdensityof(joint(a = Normal(mu = z1, sigma = 1.0), b = Normal(mu = z1, sigma = 1.0), \
+     c = Normal(mu = z2, sigma = 1.0)), record(a = 0.5, b = 0.7, c = 0.9))";
+    let err = determinize(&parse_infer(src))
+        .expect_err("no single latent covers every field — refuse, do not mislower");
+    assert!(
+        err.reason.contains("SAME latent") && err.reason.contains("no closed form"),
+        "the refusal names the shared latent and the missing closed form:\n{}",
+        err.reason
+    );
+}
+
+// **Known gap, pinned so it cannot change silently.** A BARE stochastic-parameter measure
+// scored outside any `joint`/`lawof` still refuses with the raw leftover-`draw` message,
+// even though §04 makes its law the marginal and this wave emits exactly that marginal for
+// the same constructor INSIDE a joint. The marginalization guard is sited at the `lawof`
+// strip points (`marginalize_or_refuse_stochastic_law`), and a bare `logdensityof(Normal(mu =
+// z, …), x)` passes none of them. Widening it is the general implicit-marginal path — every
+// density query on a stochastic-parameter measure — not this wave's `joint` rewrite, so it is
+// recorded in TODO-flatppl-rust.md beside the `iid` gap instead of fixed here. Delete this
+// test when that lands.
+#[test]
+fn a_bare_stochastic_parameter_measure_still_refuses_known_gap() {
+    let src = "\
+z = draw(Normal(mu = 0.0, sigma = 1.0))
+lp = logdensityof(Normal(mu = z, sigma = 1.0), 0.5)";
+    let err = determinize(&parse_infer(src)).expect_err("the bare spelling is the known gap");
+    assert!(
+        err.reason
+            .contains("no determinization rule for the `draw`"),
+        "pinned as the leftover-draw refusal; if this message changed, the gap moved:\n{}",
+        err.reason
     );
 }
 

@@ -5356,14 +5356,24 @@ fn lower_joint(
             ));
         }
     }
-    // §06 "Joint composition": two or more components whose traces can reach a shared
-    // stochastic node re-enter the record law that scores `lawof(record(...))` — build
-    // `record(_0 = x₀, …)` from their coordinates ([`joint_component_coordinate`]), keyed
-    // to a matching value record sliced from `v` by `get0`, and dispatch through the SAME
-    // machinery [`lower_keyword_joint`] uses (the shared-latent record law, its
-    // singular-joint refusal, and its independent-fields fallback), rather than
-    // re-deriving ancestry-sharing here. A component reaching no draw shares no node with
-    // any sibling and stays on the per-slot path below.
+    // §06 "Joint composition": EVERY component whose trace reaches a stochastic node goes
+    // through the record law that scores `lawof(record(...))` — build `record(_0 = x₀, …)`
+    // from their coordinates ([`joint_component_coordinate`]), keyed to a matching value
+    // record sliced from `v` by `get0`, and dispatch through the SAME machinery
+    // [`lower_keyword_joint`] uses (the shared-latent record law, its singular-joint
+    // refusal, and its independent-fields fallback), rather than re-deriving
+    // ancestry-sharing here. A component reaching no draw shares no node with any sibling
+    // and stays on the per-slot path below.
+    //
+    // **The gate is "reaches a draw", NOT "two or more of them do."** A component's own law
+    // is the TOTAL law of its coordinate (§04 "Reification to measures"), which does not
+    // depend on how many SIBLINGS happen to reach a draw. Gating the rewrite on a count of
+    // two made `joint(a = Normal(mu = z1, …), b = Normal(mu = z2, …))` lower to the product
+    // of both marginals while the strictly easier `joint(a = Normal(mu = z1, …),
+    // b = Exponential(…))` refused — the same first component, two different answers,
+    // decided by its sibling. One contributor is a one-field record, which the record path
+    // already answers with that field's conjugate marginal (there is no repeated latent, so
+    // the shared-latent law is not reached and `N = 1` stays on its per-field row).
     let mut shared: Vec<(usize, Symbol, NodeId)> = Vec::new();
     for (i, &mi) in inner.iter().enumerate() {
         if let Some(coord) = joint_component_coordinate(m, mi) {
@@ -5373,7 +5383,7 @@ fn lower_joint(
     }
 
     let mut terms = Vec::with_capacity(inner.len());
-    if shared.len() >= 2 {
+    if !shared.is_empty() {
         let record_fields: Vec<(Symbol, NodeId)> =
             shared.iter().map(|&(_, name, x)| (name, x)).collect();
         let mut pinned_fields = Vec::with_capacity(shared.len());
@@ -5390,7 +5400,7 @@ fn lower_joint(
         )?);
     }
     for (i, &mi) in inner.iter().enumerate() {
-        if shared.len() >= 2 && shared.iter().any(|&(ri, _, _)| ri == i) {
+        if shared.iter().any(|&(ri, _, _)| ri == i) {
             continue;
         }
         let idx = m.alloc(Node::Lit(Scalar::Int(i as i64)));
@@ -5523,9 +5533,10 @@ fn lower_keyword_joint(
     }
     let vrec_named: Vec<NamedArg> = vrec.named.to_vec();
 
-    // §06 "Joint composition": group the NAMED components whose traces can reach a shared
-    // stochastic node ([`joint_component_coordinate`]) and reroute them through
-    // `lawof(record(...))`'s own machinery.
+    // §06 "Joint composition": group EVERY named component whose trace reaches a stochastic
+    // node ([`joint_component_coordinate`]) and reroute them through `lawof(record(...))`'s
+    // own machinery. The gate is "reaches a draw", not a count of two — see
+    // [`lower_joint`]'s note on why a count made one component's law depend on its siblings.
     let mut shared: Vec<(Symbol, NodeId)> = Vec::new();
     for f in named {
         if let Some(coord) = joint_component_coordinate(m, f.value) {
@@ -5534,7 +5545,7 @@ fn lower_keyword_joint(
     }
 
     let mut terms = Vec::with_capacity(named.len());
-    if shared.len() >= 2 {
+    if !shared.is_empty() {
         let mut pinned_fields = Vec::with_capacity(shared.len());
         for &(name, _) in &shared {
             let pinned = lookup_field(m, &vrec_named, name).ok_or_else(|| {
@@ -5554,7 +5565,7 @@ fn lower_keyword_joint(
         )?);
     }
     for field in named {
-        if shared.len() >= 2 && shared.iter().any(|&(name, _)| name == field.name) {
+        if shared.iter().any(|&(name, _)| name == field.name) {
             continue;
         }
         let pinned = lookup_field(m, &vrec_named, field.name).ok_or_else(|| {

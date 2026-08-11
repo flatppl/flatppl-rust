@@ -457,6 +457,20 @@ over ONE `z` — the correlated law, not the singular diagonal joint that two re
 one draw give. A component reaching no stochastic node joins nothing and stays an independent
 factor. The positional forms are the same rewrite over `cat`-sliced values.
 
+**The rewrite triggers per COMPONENT, not on a count of them.** Any component reaching a draw
+goes through the record path, even when it is the only one — its law is the TOTAL law of its
+own trace (§04 *Reification to measures*) and cannot depend on what its siblings do. A single
+contributor is a one-field record, which lands on that field's per-field conjugate row (no
+repeated latent, so this section's law is not reached); two or more sharing a latent land here.
+Gating on two contributors instead made `joint(a = Normal(mu = z1, …), b = Normal(mu = z2, …))`
+lower while `joint(a = Normal(mu = z1, …), b = Exponential(…))` refused — the same component
+`a`, two different answers, decided by its sibling.
+
+One spelling still refuses: a BARE `logdensityof(Normal(mu = z, …), x)`, outside any
+`joint`/`lawof`, does not reach the marginalization guard at all (it is sited at the `lawof`
+strip points). Pinned as a known gap by
+`a_bare_stochastic_parameter_measure_still_refuses_known_gap`.
+
 ### The integral
 
 `z` is integrated out of the product of the conditionals (§04 *Reification to measures*
@@ -690,7 +704,12 @@ against the `lawof` route's:
   in the emitter, because the per-field screen only sees fields reached before the repeat.
 - **Mixed shared and unshared fields.** Every field must integrate the same latent. A
   record where two fields share `z` and a third integrates `w` would need the product of
-  this row with `w`'s own — correct in principle, and outside the decided scope.
+  this row with `w`'s own — correct in principle, and outside the decided scope. Newly
+  reachable through the constructor route as a PARTLY-shared joint
+  (`joint(a = Normal(mu = z1, …), b = Normal(mu = z1, …), c = Normal(mu = z2, …))`), so it is
+  pinned by `a_partly_shared_constructor_joint_refuses`. The closed form that would answer it
+  is `compound(a, b) · marginal(c)`; building it means letting the recogniser partition the
+  fields by latent instead of demanding one, which is a widening, not a bug fix.
 
 `iid` over the same model still emits the PRODUCT: it redraws its reified sub-DAG afresh
 per copy and never shares ancestors (§06 "iid" entry). `joint` no longer does — §06 "Reified
