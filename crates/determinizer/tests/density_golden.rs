@@ -2098,32 +2098,50 @@ lp_a = logdensityof(lawof(a), 0.1)";
         "not the conditional at the later-pinned latent:\n{lp_m}"
     );
 
-    for src in [
-        // Through the dispatcher: a pushforward whose base is the stochastic law.
-        "\
+    // Both rows below USED to refuse, and — measured against base 01c4e48 — for DIFFERENT
+    // reasons, neither of which was a rule about this shape:
+    //
+    //   `draw(pushfwd(exp, lawof(…)))`  refused at §06's REFERENCE-MEASURE gate on the
+    //                                   `pushfwd`: "the variate does not prove a reference
+    //                                   measure … so the volume element is undecided".
+    //   `draw(truncate(lawof(…), S))`   refused at the VALUE-VERSUS-MEASURE discriminator
+    //                                   (that row now lives in its own characterization test).
+    //
+    // Both traced to the pre-identity typing: `lawof(<measure>)` wrapped its argument, so
+    // `pushfwd`/`truncate` of it kept a MEASURE domain and the `draw` node typed as a measure —
+    // which denied the pushfwd a reference measure it could name, and tripped the discriminator
+    // on the truncate. With `lawof` typed as the identity (#73), `y` types as the real it is,
+    // both blockers dissolve, and the shapes reach the marginal machinery — producing the SAME
+    // `Normal(0, √2)` this test's first half pins. The property the test is named for is what is
+    // asserted:
+    // the MARGINAL is used, never the conditional at the later-pinned latent.
+    for (label, src) in [
+        (
+            "pushforward of the stochastic law",
+            "\
 a = draw(Normal(mu = 0.0, sigma = 1.0))
 y = draw(pushfwd(exp, lawof(Normal(mu = a, sigma = 1.0))))
 lp_y = logdensityof(lawof(y), 1.6487212707001282)
 lp_a = logdensityof(lawof(a), 0.1)",
-        // Same, through `truncate`.
-        "\
-a = draw(Normal(mu = 0.0, sigma = 1.0))
-y = draw(truncate(lawof(Normal(mu = a, sigma = 1.0)), interval(0.0, inf)))
-lp_y = logdensityof(lawof(y), 0.3)
-lp_a = logdensityof(lawof(a), 0.1)",
-        // Named, so the check cannot depend on the argument being inline.
-        "\
+        ),
+        (
+            "named, so it cannot depend on the argument being inline",
+            "\
 a = draw(Normal(mu = 0.0, sigma = 1.0))
 ml = lawof(Normal(mu = a, sigma = 1.0))
 y = draw(pushfwd(exp, ml))
 lp_y = logdensityof(lawof(y), 1.6487212707001282)
 lp_a = logdensityof(lawof(a), 0.1)",
+        ),
     ] {
-        let mut m = flatppl_syntax::parse(src).unwrap();
-        let _ = flatppl_infer::infer(&mut m);
-        determinize(&m).expect_err(
-            "a draw OF a draw-parameterized law must not score the conditional; nothing \
-             clears every gate on this shape yet",
+        let lp_y = pir_binding(&flatppl_flatpir::write(&determinize_src(src)), "lp_y");
+        assert!(
+            lp_y.contains("(%field sigma 1.4142135623730951)"),
+            "{label}: must use the marginal Normal(0, √2):\n{lp_y}"
+        );
+        assert!(
+            !lp_y.contains("(%field mu 0.1)"),
+            "{label}: not the conditional at the later-pinned latent:\n{lp_y}"
         );
     }
 
@@ -2578,40 +2596,58 @@ lp = logdensityof(lawof(M), 0.5)",
     );
 }
 
-// A `draw` OF a measure expression (`draw(truncate(lawof(…), S))`) carries a MEASURE
-// inferred type, so the measure-expression guard admits `y`'s own draw node — a VALUE.
-// It then refused blaming the conjugate rows, which were never consulted for it. The
-// node refuses either way; only the ATTRIBUTION was wrong. The discriminator itself is
-// untouched, so this pins the message, not a lowering.
+// CHARACTERIZATION, not an endorsement — the pattern this file already uses for a value it
+// records without blessing (cf. the pre-gate `kernelof` rows). This shape USED to refuse, and
+// the refusal was an artifact of the pre-identity `lawof` typing: `lawof(<measure>)` wrapped
+// its argument, so `truncate` of it kept a MEASURE domain, the `draw` node typed as a measure,
+// and a value-versus-measure guard fired. With `lawof` typed as the identity (#73) the guard
+// correctly no longer fires, and the shape lowers.
 //
-// The sibling `y = draw(pushfwd(exp, lawof(…)))` is NOT this shape: it refuses earlier,
-// at §06's reference-measure gate on the `pushfwd`, so it pins nothing about this guard.
+// It lowers to the MARGINAL `Normal(0, √2)` gated on the truncation set — which is the correct
+// density of `truncate(M, S)`, an unnormalized (`%finite`) restriction, and is therefore NOT a
+// probability density: there is no `1 / (F(hi) − F(lo))` normalizer.
+//
+// OPEN QUESTION, deliberately not decided here. §04 says `lawof(x)` "reifies the ancestor
+// subgraph of `x` as a probability measure", and #73 requires `lawof(m)`'s argument to be
+// `%normalized` — but here the unnormalized measure sits under a `draw`, where neither
+// sentence reaches it. Reading #73's equation `lawof(m) := lawof(draw(m))` right-to-left would
+// extend the mass requirement through the `draw` and restore a refusal, now as a proper §04
+// static error; that is a derivation, not spec text, so it is recorded for a spec author rather
+// than implemented. Until it is settled this test pins WHAT is emitted, so a future change to
+// this shape is noticed, while asserting nothing about whether the value is right.
 #[test]
-fn lawof_of_a_draw_of_a_measure_expression_refuses_naming_the_discriminator() {
+fn draw_of_a_truncated_stochastic_law_lowers_to_the_unnormalized_marginal() {
     for src in [
         "\
 a = draw(Normal(mu = 0.0, sigma = 1.0))
 S = interval(0.0, 3.0)
 y = draw(truncate(lawof(Normal(mu = a, sigma = 1.0)), S))
 lp = logdensityof(lawof(y), 0.5)",
-        // Inline set, so the guard cannot depend on the truncation set being named.
+        // Inline set, so the behaviour cannot depend on the truncation set being named.
         "\
 a = draw(Normal(mu = 0.0, sigma = 1.0))
 y = draw(truncate(lawof(Normal(mu = a, sigma = 1.0)), interval(0.0, 3.0)))
 lp = logdensityof(lawof(y), 0.5)",
+        // The HALF-LINE variant, which the base file covered in the row this wave moved out
+        // of `lawof_of_a_draw_parameterized_measure_marginalizes` and would otherwise have
+        // left unpinned. An unbounded truncation set behaves the same way: same marginal,
+        // still no normalizer.
+        "\
+a = draw(Normal(mu = 0.0, sigma = 1.0))
+y = draw(truncate(lawof(Normal(mu = a, sigma = 1.0)), interval(0.0, inf)))
+lp = logdensityof(lawof(y), 0.3)",
     ] {
-        let mut m = flatppl_syntax::parse(src).unwrap();
-        let _ = flatppl_infer::infer(&mut m);
-        let err = determinize(&m).expect_err("a draw of a measure expression is not yet lowerable");
+        let lp = pir_binding(&flatppl_flatpir::write(&determinize_src(src)), "lp");
+        // The marginal, not the conditional — the one thing here that IS established.
         assert!(
-            err.reason.contains("value-versus-measure discrimination"),
-            "must attribute the refusal to the discriminator: {}",
-            err.reason
+            lp.contains("(%field sigma 1.4142135623730951)"),
+            "the base is the marginal Normal(0, √2):\n{lp}"
         );
+        // And the restriction is unnormalized: no CDF normalizer is emitted. Pinned so that
+        // adding one (or restoring a refusal) is a deliberate, visible change.
         assert!(
-            !err.reason.contains("no conjugate"),
-            "must NOT blame a missing conjugate row, which was never the blocker: {}",
-            err.reason
+            !lp.contains("builtin_touniform"),
+            "no normalizer today — see the OPEN QUESTION above:\n{lp}"
         );
     }
 }
