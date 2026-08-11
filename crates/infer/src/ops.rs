@@ -167,7 +167,7 @@ pub(crate) fn call_rule(
         // `sum` / `prod` / `mean` reduce a real/complex array to its element
         // type (spec §07 Reductions): mean of a complex array is complex.
         // (NOT a constant Scalar(Real); legacy ops.rs returned Real always.)
-        "sum" | "prod" | "mean" => reduce_type(arg_ty(args, 0)),
+        "sum" | "prod" | "mean" => reduce_type(&name, arg_ty(args, 0)),
         // Vector normalizations: same-shape real vector — shape must thread through.
         "softmax" | "logsoftmax" | "l1unit" | "l2unit" => match arg_ty(args, 0) {
             Some(Type::Array { shape, .. }) if shape.len() == 1 => Type::Array {
@@ -1043,9 +1043,35 @@ fn rowstack_type(a: Option<&Type>) -> Type {
 }
 
 /// `sum`/`prod` over an array reduce to the element type.
-fn reduce_type(a: Option<&Type>) -> Type {
+/// The scalar a §07 reduction produces over elements of scalar type `elem`. The one
+/// place that answer is written down, so the array form ([`reduce_type`]) and the
+/// table form ([`table_reduction_type`]) cannot drift — and, more to the point,
+/// cannot "agree" by sharing a mistake.
+///
+/// - `sum`/`prod` — the element type. A sum of integers is an integer.
+/// - `mean` — §07 defines it as $\bar{x} = \frac{1}{n}\sum_i x_i$, and the mean of
+///   `[1, 2]` is `1.5`, so an INTEGER input gives a REAL. Complex stays complex
+///   (§07's domain for `mean` is "real/complex arrays"). This is arithmetic, so it
+///   outranks both the previous code and any convenience of keeping the element type.
+/// - `var`/`std` — real, matching their catalogue rows and their "real arrays" domain.
+fn reduced_scalar(head: &str, elem: ScalarType) -> ScalarType {
+    match (head, elem) {
+        ("sum" | "prod", e) => e,
+        ("mean", ScalarType::Complex) => ScalarType::Complex,
+        _ => ScalarType::Real,
+    }
+}
+
+/// `sum`/`prod`/`mean` over an ARRAY (spec §07 Reductions). A scalar element type is
+/// mapped by [`reduced_scalar`]; a non-scalar element (an array-of-arrays) keeps the
+/// element type as before, since §07 does not pin down what reducing along one axis
+/// of a nested array yields and this is not the place to guess.
+fn reduce_type(head: &str, a: Option<&Type>) -> Type {
     match a {
-        Some(Type::Array { elem, .. }) => elem.as_ref().clone(),
+        Some(Type::Array { elem, .. }) => match elem.as_ref() {
+            Type::Scalar(s) => Type::Scalar(reduced_scalar(head, *s)),
+            other => other.clone(),
+        },
         Some(Type::Any) => Type::Any,
         _ => Type::Deferred,
     }
@@ -1110,9 +1136,11 @@ fn table_reduction_type(head: &str, a: Option<&Type>) -> Type {
     if !columns.iter().all(|(_, t)| matches!(t, Type::Scalar(_))) {
         return Type::Deferred;
     }
-    let per_column = |col: &Type| match head {
-        "var" | "std" => Type::Scalar(ScalarType::Real),
-        _ => col.clone(),
+    // Shares `reduced_scalar` with the array form, so the two agree on a rule that
+    // was checked against §07's formulas rather than on whatever each happened to do.
+    let per_column = |col: &Type| match col {
+        Type::Scalar(s) => Type::Scalar(reduced_scalar(head, *s)),
+        other => other.clone(),
     };
     Type::Record(
         columns

@@ -721,16 +721,25 @@ fn a_table_reduction_gives_a_record_of_per_column_reductions() {
             "`{f}` must give a record keyed by the column names, in:\n{out}"
         );
     }
-    // `sum`/`mean` keep the column's own element type — an INTEGER column sums to an
+    // `sum` keeps the column's own element type — an INTEGER column sums to an
     // integer, exactly as `sum` of an integer array does.
     let mixed = "d = load_data(\"d.csv\", cartpow(cartprod(k = integers, y = reals), 4))\n";
-    for f in ["sum", "mean"] {
-        let out = ir(&format!("{mixed}s = {f}(d)"));
-        assert!(
-            out.contains("(%record (k (%scalar integer)) (y (%scalar real)))"),
-            "`{f}` must keep each column's element type, in:\n{out}"
-        );
-    }
+    let out = ir(&format!("{mixed}s = sum(d)"));
+    assert!(
+        out.contains("(%record (k (%scalar integer)) (y (%scalar real)))"),
+        "`sum` must keep each column's element type, in:\n{out}"
+    );
+    // `mean` does NOT: §07 defines it as (1/n)Σxᵢ, and the mean of `[1, 2]` is `1.5`,
+    // so an integer column means to a REAL. An earlier revision of this test asserted
+    // the opposite, having derived `mean` from `sum` instead of from §07's formula —
+    // which reproduced a pre-existing bug in the ARRAY path (`mean([1, 2, 3])` also
+    // typed integer) and dressed the agreement up as a correctness argument. Both
+    // paths now share `reduced_scalar`, checked against the formula.
+    let out = ir(&format!("{mixed}s = mean(d)"));
+    assert!(
+        out.contains("(%record (k (%scalar real)) (y (%scalar real)))"),
+        "`mean` of an integer column must be real, in:\n{out}"
+    );
     // `var`/`std` give a real per column whatever the column's type, mirroring their
     // catalogue row's `result: Scalar(Real)` on the array form.
     for f in ["var", "std"] {
@@ -818,8 +827,35 @@ fn table_reductions_do_not_extend_to_prod_or_to_non_scalar_columns() {
     }
 }
 
-/// The ARRAY forms are untouched — the new rule is guarded on the argument being a
-/// table, so every non-table call keeps the arm it had.
+/// §07's `mean` is $\bar{x} = \frac{1}{n}\sum_i x_i$, so the mean of an INTEGER array
+/// is a REAL — the mean of `[1, 2]` is `1.5`. `reduce_type` returned the element type
+/// for all of `sum`/`prod`/`mean`, so `mean([1, 2, 3])` typed integer. That is
+/// arithmetic, so it outranks the previous code.
+///
+/// This was pre-existing on `main`, not introduced here; it surfaced because the
+/// table rule was derived from it and inherited it. `sum` and `prod` of integers
+/// stay integers, which is correct, and complex stays complex for all three.
+#[test]
+fn mean_of_an_integer_array_is_real() {
+    let out = ir("v = [1, 2, 3]\ns = mean(v)");
+    assert!(
+        out.contains("(%bind s (%meta ((%scalar real) %fixed reals) (mean"),
+        "`mean` of an integer array must be real, in:\n{out}"
+    );
+    // The reductions whose element type IS the answer keep it.
+    for f in ["sum", "prod"] {
+        let out = ir(&format!("v = [1, 2, 3]\ns = {f}(v)"));
+        assert!(
+            out.contains(&format!(
+                "(%bind s (%meta ((%scalar integer) %fixed integers) ({f}"
+            )),
+            "`{f}` of an integer array stays an integer, in:\n{out}"
+        );
+    }
+}
+
+/// The ARRAY forms are otherwise untouched — the table rule is guarded on the
+/// argument being a table, so every non-table call keeps the arm it had.
 #[test]
 fn array_reductions_are_unchanged_by_the_table_rule() {
     let v = "v = [1.0, 2.0, 3.0]\n";
