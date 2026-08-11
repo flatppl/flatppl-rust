@@ -58,16 +58,23 @@ fn every_unnamed_variadic_row_refuses_a_splatted_aggregate() {
     let variadic: Vec<&str> = cat
         .base_names()
         .filter(|n| {
-            // Same structural property the implementation reads, re-derived here from the
-            // public API so the test is not just the implementation restated. `vector` is
-            // excluded: §07 makes its arguments the ELEMENTS of the result, so a sole aggregate
-            // is a §03 element question — see `vector_keeps_the_sec03_element_diagnosis`.
-            *n != "vector" && cat.base_arity(n).is_some_and(|a| a.max.is_none())
+            // The implementation's real predicate, re-derived here from the public API so the
+            // test is not just the implementation restated: variadic AND declaring no names.
+            // `vector` is excluded on §07/§03 grounds (see
+            // `vector_keeps_the_sec03_element_diagnosis`), and a row that DECLARES names — like
+            // `builtin_sample` — is not an "unnamed" row at all, so the ordinary name check
+            // decides it (see `the_guard_keys_on_declared_names_not_on_a_hardcoded_list`).
+            *n != "vector"
+                && cat.base_param_names(n).is_none()
+                && cat.base_arity(n).is_some_and(|a| a.max.is_none())
         })
         .collect();
-    assert!(
-        variadic.len() >= 4,
-        "expected the known variadic rows, found {variadic:?}"
+    let mut variadic = variadic;
+    variadic.sort_unstable();
+    assert_eq!(
+        variadic,
+        ["cat", "get", "get0"],
+        "exactly the nameless variadic rows"
     );
     for n in &variadic {
         for (spelling, errs) in [("table", table_splat(n)), ("record", record_splat(n))] {
@@ -91,25 +98,27 @@ fn the_three_names_b76_left_open_are_closed() {
     }
 }
 
-/// `builtin_sample` was masked: a 2-column table failed its ARITY (at least 3 arguments), so
-/// the splat looked handled. With four columns the arity fits and it used to be accepted —
-/// which is why the refusal precedes the arity comparison rather than following it.
+/// The refusal precedes the ARITY comparison, so the §04 reason is reported even where the count
+/// would also be wrong. `get` takes at least 2 arguments, so a ONE-column table fails arity too —
+/// and must still report the binding problem, which is the actionable one.
+///
+/// This property was found through `builtin_sample`, whose 2-column probe failed its "at least 3
+/// arguments" check and so looked handled in both the B76 audit and the NAMES sweep; four columns
+/// fit and it was accepted outright. `builtin_sample` no longer belongs to this guard at all (it
+/// declares §07 names — `wave-CATADJ-report.md` §6), so the property is pinned here on a row that
+/// does. The lesson that produced it stands: probe with more columns than any row's arity.
 #[test]
-fn builtin_sample_is_not_saved_by_its_arity() {
-    let two_col = errors(
+fn the_refusal_precedes_the_arity_check() {
+    let one_col = errors(
         "xs = elementof(cartpow(reals, 4))\n\
-         t = table(zzq = xs, zzr = xs)\n\
-         z = builtin_sample(t)\n",
+         t = table(zzq = xs)\n\
+         z = get(t)\n",
     );
     assert!(
-        two_col
+        one_col
             .iter()
             .any(|e| e.contains("variadic inputs are UNNAMED")),
-        "even where arity would also complain, the §04 reason is the one reported: {two_col:?}"
-    );
-    assert!(
-        !table_splat("builtin_sample").is_empty(),
-        "and a fitting column count must not slip through"
+        "the §04 reason is reported, not a bare count complaint: {one_col:?}"
     );
 }
 
@@ -274,4 +283,156 @@ fn vector_keeps_the_sec03_element_diagnosis() {
         !errs.iter().any(|e| e.contains("UNNAMED")),
         "the §04 splat message must NOT fire — it would advise a different array shape: {errs:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// `builtin_sample` — an ORDINARY callable, so a name-matched splat must bind
+// ---------------------------------------------------------------------------
+
+/// A model prefix supplying a real rngstate, kernel and kernel input, so the only thing under
+/// test is how the arguments are SPELLED.
+const PRIMS: &str = "s = rnginit([42, 0, 0, 0])\n\
+                     k = kernelof(draw(Normal(mu = _m_, sigma = 1.0)), mu = _m_)\n\
+                     x = record(mu = 0.5)\n";
+
+/// The adjudicated non-conformance (`wave-CATADJ-report.md` §6), now fixed.
+///
+/// §04's special-operations list omits `builtin_sample` entirely, so it is an ORDINARY callable:
+/// "All built-in ordinary callables have a defined input order and accept both positional and
+/// keyword arguments." §07 "Measure kernel evaluation primitives" documents its three
+/// distinguished inputs by name — "`builtin_sample(rngstate, kernel, kernel_input, n, m, ...)`"
+/// — so a record carrying exactly those splats to a valid three-argument call and §04's
+/// auto-splat bullet applies with no scoping dispute.
+///
+/// Before the fix its row alone among the six primitives carried no `names`, so the structural
+/// guard caught its trailing `Variadic(Scalar(Integer))` (the optional sample shape) and refused.
+#[test]
+fn a_name_matched_record_splats_onto_builtin_sample() {
+    assert!(
+        errors(&format!(
+            "{PRIMS}r = record(rngstate = s, kernel = k, kernel_input = x)\n\
+             z = builtin_sample(r)\n"
+        ))
+        .is_empty(),
+        "§07 names these three inputs, so the splat binds"
+    );
+    // The two spellings §04 grants an ordinary callable, as controls.
+    for spelling in [
+        "z = builtin_sample(s, k, x)\n",
+        "z = builtin_sample(rngstate = s, kernel = k, kernel_input = x)\n",
+    ] {
+        assert!(
+            errors(&format!("{PRIMS}{spelling}")).is_empty(),
+            "positional and keyword must both keep working: {spelling}"
+        );
+    }
+}
+
+/// A MISMATCHED record errors through the ordinary NAME check, citing §07's parameter list —
+/// **not** the variadic-splat message. The row is no longer in that guard at all.
+#[test]
+fn a_mismatched_record_on_builtin_sample_errors_via_the_name_check() {
+    let errs = errors(&format!(
+        "{PRIMS}r = record(zzq = s, zzr = k, zzs = x)\nz = builtin_sample(r)\n"
+    ));
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("`builtin_sample` has no parameter `zzq`")
+                && e.contains("spec §07 parameters: `rngstate`, `kernel`, `kernel_input`")),
+        "the NAME check decides: {errs:?}"
+    );
+    assert!(
+        !errs
+            .iter()
+            .any(|e| e.contains("variadic inputs are UNNAMED")),
+        "the variadic guard must not fire on a row that declares names: {errs:?}"
+    );
+}
+
+/// An EXTRA field errors, and the reason is worth recording because §07's Arguments cell does
+/// mention `n`.
+///
+/// Only the three DISTINGUISHED inputs are declared; the sample-shape tail (`n, m, ...`) stays
+/// variadic and nameless, because naming a prefix of an unbounded tail would refuse a legitimate
+/// further shape argument. So a record carrying `n` fails §04's mismatch clause: "A call with
+/// field or column names that do not match the callable's argument names is a static error".
+///
+/// **Residual ambiguity, flagged not resolved:** §07 spells the signature `builtin_sample(rngstate,
+/// kernel, kernel_input, n, m, ...)`, so `n` IS a name the spec writes down — yet the `...`
+/// leaves the tail unbounded and unnamed beyond `m`, and §04 gives no rule for binding a splatted
+/// field to a variadic slot. Refusing is the conservative side: it rejects a spelling the spec
+/// arguably permits rather than accepting one it may not, and the keyword form
+/// `builtin_sample(rngstate = …, kernel = …, kernel_input = …, 4)` remains available.
+#[test]
+fn an_extra_shape_field_errors_because_only_the_distinguished_inputs_are_named() {
+    let errs = errors(&format!(
+        "{PRIMS}r = record(rngstate = s, kernel = k, kernel_input = x, n = 4)\n\
+         z = builtin_sample(r)\n"
+    ));
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("`builtin_sample` has no parameter `n`")),
+        "the shape tail is nameless, so `n` binds nothing: {errs:?}"
+    );
+}
+
+/// A TABLE whose columns match the three names is **accepted**, and that is the right outcome for
+/// the rule under test: §04 draws no distinction between a record and a table splat, and the names
+/// match, so the binding is valid.
+///
+/// What is wrong with such a call is the argument TYPES — a table's columns are equal-length
+/// vectors, so `rngstate` receives a vector of reals where §07's Domains cell wants `rngstates`,
+/// and `kernel` a vector where it wants a kernel. That is **not** this guard's business and not
+/// this wave's regression: the kernel-type check fires only on the POSITIONAL path, so
+/// `builtin_sample(rngstate = 1.0, kernel = 2.0, kernel_input = 3.0)` is accepted at base
+/// `af1d92d` too — verified by running these probes against it. The splat lowers to the keyword
+/// form and inherits that pre-existing hole rather than opening one.
+///
+/// Pinned as measured, so closing the keyword-path type gap shows up here as a deliberate change.
+#[test]
+fn a_name_matched_table_splats_and_the_type_gap_is_pre_existing() {
+    assert!(
+        errors(
+            "xs = elementof(cartpow(reals, 4))\n\
+             t = table(rngstate = xs, kernel = xs, kernel_input = xs)\n\
+             z = builtin_sample(t)\n"
+        )
+        .is_empty(),
+        "the names match, so §04's binding rule is satisfied"
+    );
+    // The same type hole through the keyword spelling, which predates this wave.
+    assert!(
+        errors("z = builtin_sample(rngstate = 1.0, kernel = 2.0, kernel_input = 3.0)\n").is_empty(),
+        "keyword-path argument types are unchecked (pre-existing, af1d92d)"
+    );
+    // And the POSITIONAL path does check, which is what makes the gap a path asymmetry.
+    assert!(
+        errors("z = builtin_sample(1.0, 2.0, 3.0)\n")
+            .iter()
+            .any(|e| e.contains("must be a distribution kernel")),
+        "positional argument types ARE checked"
+    );
+}
+
+/// The guard steps aside for `builtin_sample` because it DECLARES names, not because it is listed
+/// somewhere — so the mechanism is self-maintaining, and `cat`/`get`/`get0` are unaffected.
+#[test]
+fn the_guard_keys_on_declared_names_not_on_a_hardcoded_list() {
+    let cat = builtin_catalogue();
+    assert_eq!(
+        cat.base_param_names("builtin_sample")
+            .expect("builtin_sample declares its §07 names"),
+        ["rngstate", "kernel", "kernel_input"],
+        "exactly §07's three distinguished inputs"
+    );
+    for n in ["cat", "get", "get0"] {
+        assert!(
+            cat.base_param_names(n).is_none(),
+            "`{n}` still declares no names, so it stays in the guard"
+        );
+        assert!(
+            !table_splat(n).is_empty(),
+            "`{n}` must still refuse a splatted aggregate"
+        );
+    }
 }
