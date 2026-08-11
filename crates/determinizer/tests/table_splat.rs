@@ -45,6 +45,15 @@ fn pir(src: &str) -> String {
     flatppl_flatpir::write(&out)
 }
 
+/// The determinised module printed as SURFACE syntax. Used where the assertion is about a
+/// synthesized column access, which reads as `t.a` here but as
+/// `(get (%ref self t) "a")` wrapped in `%meta` in FlatPIR — the surface form states the
+/// intent without the assertion having to tolerate meta nesting.
+fn printed(src: &str) -> String {
+    let out = determinize(&parse_infer(src)).expect("must lower, not refuse");
+    flatppl_syntax::print(&out)
+}
+
 fn refusal(src: &str) -> String {
     determinize(&parse_infer(src))
         .expect_err("a name mismatch is a §04 static error — refuse, never bind the whole value")
@@ -170,3 +179,183 @@ lp = logdensityof(lawof(record(y = draw(mk(record(mu = 1.5))))), record(y = 0.5)
 // still uniquely covers is the MATCHING direction — the capability only the determiniser can
 // provide, verified still load-bearing on this base by reverting `kernel.rs` to d6dfe31 and
 // watching all three matching tests redden.
+
+// ---- opaque tables ---------------------------------------------------------------
+//
+// D6 left this open and said so: "An OPAQUE table — a `load_data` result rather than a
+// `table(...)` literal — is still bound whole", because `splat_head` needs a syntactic
+// `table(...)` node to destructure and a `load_data` result has none. §04 draws no such
+// distinction, and §13 `sec:determinization-signature` makes a `load_data`'s shape come from
+// its declared `valueset`, so its columns are as statically known as a literal's — they are in
+// the inferred type, `(%table (%columns (a …) (b …)) (%nrows 4))`.
+//
+// Two things changed since D6, in different layers. #144 made inference reject the MISMATCH
+// direction from the type, which closed D6's headline symptom (the call no longer lowers with
+// the table bound whole). But that left the MATCHING direction — a §04-legal call — passing
+// inference and then refusing here with the generic "residual user call", while its literal
+// twin lowered. These tests cover the matching direction, which is the half that is uniquely
+// the determiniser's: `record_field` now synthesizes the column access §03 defines
+// (`t.a` → `get(t, "a")`) so the splat is constructible from an opaque value.
+
+/// The opaque twin of `a_matching_table_literal_splats_its_columns`, asserted to reduce to the
+/// same shape: each column binds its like-named input and no residual call survives. The
+/// column values arrive as `get`, not as the literal's inline nodes, which is the only
+/// difference §03's column access permits.
+#[test]
+fn a_matching_opaque_table_splats_its_columns() {
+    let src = "\
+t = load_data(\"x.csv\", cartpow(cartprod(a = reals, b = reals), 4))
+g = functionof(sum(_p_) + sum(_r_), a = _p_, b = _r_)
+z = g(t)";
+    let text = printed(src);
+    assert!(
+        text.contains("z = sum(t.a) + sum(t.b)"),
+        "each column binds its like-named input as a column access:\n{text}"
+    );
+    assert!(
+        !pir(src).contains("%call"),
+        "no residual user call may survive the splat:\n{}",
+        pir(src)
+    );
+}
+
+/// §04: "The order of fields or columns is not relevant." An opaque table whose columns are
+/// declared in the opposite order to the callee's inputs binds by NAME and reduces
+/// identically — the same property the literal case pins, now for the type-derived columns.
+#[test]
+fn an_opaque_table_splats_by_name_not_by_column_order() {
+    // The body is NON-COMMUTATIVE (`-`, not `+`) and the second module declares its columns
+    // in the REVERSED order. A commutative body would pass either way round, so it could not
+    // tell name binding from declaration order; subtraction can.
+    let forward = printed(
+        "\
+t = load_data(\"x.csv\", cartpow(cartprod(a = reals, b = reals), 4))
+g = functionof(sum(_p_) - sum(_r_), a = _p_, b = _r_)
+z = g(t)",
+    );
+    let reversed = printed(
+        "\
+t = load_data(\"x.csv\", cartpow(cartprod(b = reals, a = reals), 4))
+g = functionof(sum(_p_) - sum(_r_), a = _p_, b = _r_)
+z = g(t)",
+    );
+    for text in [&forward, &reversed] {
+        assert!(
+            text.contains("z = sum(t.a) - sum(t.b)"),
+            "column `a` must bind input `a` whatever order the columns are declared in:\n{text}"
+        );
+    }
+}
+
+/// The D6 repro itself: a two-column opaque table against a ONE-input reification. D6
+/// measured this as lowering with the table bound whole (`(lengthof (%ref self t))`). It is
+/// now a static error, caught by inference from the type — so the determiniser never sees a
+/// well-formed module and this asserts the diagnostic rather than a refusal reason.
+///
+/// Kept here rather than only in `crates/infer/tests/arity.rs` because the *opaque* table is
+/// what D6 flagged, and this is the case that would silently regress if `table_columns` ever
+/// stopped reading the type.
+#[test]
+fn the_d6_opaque_table_repro_is_a_static_error_not_a_whole_value_bind() {
+    let mut m = flatppl_syntax::parse(
+        "t = load_data(\"x.csv\", cartpow(cartprod(a = reals, b = reals), 4))\n\
+         g = functionof(lengthof(_q_), tt = _q_)\n\
+         z = g(t)",
+    )
+    .unwrap();
+    let errors: Vec<String> = flatppl_infer::infer(&mut m)
+        .into_iter()
+        .filter(|d| d.severity == flatppl_infer::Severity::Error)
+        .map(|d| d.message)
+        .collect();
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("`g` declares 1 parameter, got 2 arguments")),
+        "the two columns splat onto one input, which is a §04 static error, got: {errors:?}"
+    );
+    // And the old symptom is gone: nothing binds the table whole.
+    assert!(
+        !flatppl_flatpir::write(&m).contains("(lengthof (%ref self t))"),
+        "the table must not be bound whole to the single input"
+    );
+}
+
+/// PERMISSIVE where the type does not say: a sole positional argument that is NOT a table
+/// keeps the positional binding it had, so nothing is refused or splatted on a guess.
+/// `table_columns` keys on `Type::Table`, so a vector — or any value whose type is deferred —
+/// simply is not splattable.
+#[test]
+fn a_non_table_sole_argument_still_binds_positionally() {
+    let text = pir("\
+v = elementof(cartpow(reals, 4))
+g = functionof(sum(_q_), q = _q_)
+z = g(v)");
+    assert!(
+        text.contains("(sum (%ref self v))"),
+        "a vector argument binds positionally, unsplatted:\n{text}"
+    );
+}
+
+/// The ONE-COLUMN opaque table, which this wave changed SILENTLY and did not disclose until
+/// review caught it. §04 splats "whatever its field count, a single field included", so a
+/// one-column table against a one-input callable whose parameter IS that column's name splats
+/// to the column — it does not bind the table whole.
+///
+/// The change is lower → lower-DIFFERENTLY, a worse class than the refuse → lower this wave
+/// set out to make, because nothing fails to announce it:
+///
+/// | | base `0094dcc` | head |
+/// |---|---|---|
+/// | `g = functionof(sum(_p_), a = _p_)`, `g(t)` | `z = sum(t)` | `z = sum(t.a)` |
+/// | `g = functionof(lengthof(_p_), a = _p_)`, `g(t)` | `z = lengthof(t)` | `z = lengthof(t.a)` |
+///
+/// The head values are the correct ones — they are what the `table(...)` literal twin has
+/// always given — and the base ones were the whole-value bind §04 rules out. The semantics
+/// differ, not just the spelling: `sum(t)` is a §07 TABLE reduction (a record of per-column
+/// sums) while `sum(t.a)` is a scalar sum over one column. Pinned for both heads so the change
+/// cannot silently revert or drift again.
+///
+/// A KNOWN, PRE-EXISTING disagreement rides along here and is deliberately not asserted as
+/// correct: `infer` types this `z` as `(%record (a (%scalar real)))` — it binds the whole table
+/// to the body's placeholder and then applies the table-reduction rule — while the determiniser
+/// lowers the scalar `sum(t.a)`. Identical on base, and on the literal path too, so it is not
+/// this wave's doing. Recorded in `TODO-flatppl-rust.md`.
+#[test]
+fn a_one_column_opaque_table_splats_to_its_column_not_to_the_whole_table() {
+    for (body, want) in [
+        ("sum(_p_)", "z = sum(t.a)"),
+        ("lengthof(_p_)", "z = lengthof(t.a)"),
+    ] {
+        let text = printed(&format!(
+            "t = load_data(\"x.csv\", cartpow(cartprod(a = reals), 4))\n\
+             g = functionof({body}, a = _p_)\n\
+             z = g(t)"
+        ));
+        assert!(
+            text.contains(want),
+            "a one-column table must splat to `{want}`, not bind the table whole:\n{text}"
+        );
+        assert!(
+            !text.contains("z = sum(t)") && !text.contains("z = lengthof(t)"),
+            "the whole-table bind §04 rules out must not survive:\n{text}"
+        );
+    }
+    // A one-column table whose column name does NOT match still refuses, so the one-column
+    // case is not a blanket "bind the only column" shortcut — it binds BY NAME like any other.
+    let mut m = flatppl_syntax::parse(
+        "t = load_data(\"x.csv\", cartpow(cartprod(zzz = reals), 4))\n\
+         g = functionof(sum(_p_), a = _p_)\n\
+         z = g(t)",
+    )
+    .unwrap();
+    let errors: Vec<String> = flatppl_infer::infer(&mut m)
+        .into_iter()
+        .filter(|d| d.severity == flatppl_infer::Severity::Error)
+        .map(|d| d.message)
+        .collect();
+    assert!(
+        errors.iter().any(|e| e.contains("has no parameter `zzz`")),
+        "a one-column table with a non-matching column name is a §04 static error, got: {errors:?}"
+    );
+}

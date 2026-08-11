@@ -17,7 +17,8 @@
 
 use crate::density::{draw_argument, resolve_ref_one};
 use flatppl_core::{
-    Call, CallHead, Inputs, Module, NamedArg, NamedKind, Node, NodeId, Ref, RefNs, Symbol,
+    Call, CallHead, Inputs, Module, NamedArg, NamedKind, Node, NodeId, Ref, RefNs, Scalar, Symbol,
+    Type,
 };
 
 /// A resolved kernel: its reified body and its boundary inputs as
@@ -511,7 +512,31 @@ pub(crate) fn reduce_kernel_application(m: &mut Module, node: NodeId) -> Option<
 /// bare-builtin callee never reaches this function: `canon` rewrites it to a direct
 /// builtin call, and the two `pushfwd` sites screen it off beforehand.
 fn is_splattable(m: &Module, rec: NodeId) -> bool {
-    matches!(splat_head(m, rec), Some("record") | Some("table"))
+    matches!(splat_head(m, rec), Some("record") | Some("table")) || table_columns(m, rec).is_some()
+}
+
+/// The column names of an OPAQUE table — one with no syntactic `table(...)` head, such as a
+/// `load_data` result — read from its INFERRED TYPE. `None` for anything that is not a
+/// table, including a table whose type has not been inferred.
+///
+/// §13 `sec:determinization-signature` makes a `load_data`'s shape come from its declared
+/// `valueset`, so the columns of `load_data("x.csv", cartpow(cartprod(a = reals, b = reals),
+/// 4))` are statically known — they are right there in
+/// `(%table (%columns (a …) (b …)) (%nrows 4))`. That is what lets §04's splat apply to an
+/// opaque table exactly as to a literal one: the names the splat binds by do not depend on
+/// the file's contents. `determinize` re-infers before lowering, so the type is populated by
+/// the time this runs.
+///
+/// Type-based rather than syntax-based, so it stays permissive where the type is not known:
+/// a `%deferred` or absent type gives `None`, the value is not treated as splattable, and
+/// nothing is refused on a guess.
+fn table_columns(m: &Module, rec: NodeId) -> Option<Vec<Symbol>> {
+    let (resolved, _) = resolve_ref_one(m, rec);
+    let ty = m.type_of(rec).or_else(|| m.type_of(resolved))?;
+    match ty {
+        Type::Table { columns, .. } => Some(columns.iter().map(|(n, _)| *n).collect()),
+        _ => None,
+    }
 }
 
 /// The `record`/`table` head of `rec` after one level of ref-resolution, or `None`.
@@ -526,22 +551,50 @@ fn splat_head(m: &Module, rec: NodeId) -> Option<&str> {
     Some(m.resolve(sym))
 }
 
-/// Look up field/column `name` in a `record(%field … )` or `table(%field … )` node; `None`
-/// if `rec` is not such a literal or lacks the name.
+/// The value §04's splat binds to `name`: field/column `name` of a `record(%field … )` or
+/// `table(%field … )` literal, or — for an OPAQUE table — a synthesized column access.
+/// `None` if `rec` is neither, or lacks the name.
 ///
-/// `None` is what makes a name mismatch REFUSE instead of falling back to whole-value
-/// binding, and it also covers an OPAQUE table — a `load_data` result has no syntactic
-/// columns to splat, so the §04 splat is not constructible here and the reduction refuses
-/// rather than bind the table whole.
-fn record_field(m: &Module, rec: NodeId, name: Symbol) -> Option<NodeId> {
-    if !is_splattable(m, rec) {
+/// `None` on a missing name is what makes a mismatch REFUSE rather than fall back to
+/// whole-value binding.
+///
+/// **The opaque case.** A `load_data` result has no syntactic columns, so D6 could not
+/// destructure it and the reduction refused — which left a §04-legal model
+/// (`g(t)` against a `g` whose parameters are `t`'s column names) refusing with the generic
+/// "residual user call", while its `table(...)` literal twin lowered. The columns are
+/// statically known from the type ([`table_columns`]), and §03 "Tables" already spells the
+/// per-column value: "Column access by name: `t.a` … returns the column with that name as a
+/// vector", which the parser lowers to `get(t, "a")`. So the splat IS constructible — it is
+/// the same set of column values the literal case binds, reached through `get` instead of
+/// through the literal's `%field` list. Synthesizing it makes the two forms agree, which is
+/// what §04 requires: "whether its field or column names match the callable's argument names
+/// decides only whether the call is valid, never whether the splat occurs."
+fn record_field(m: &mut Module, rec: NodeId, name: Symbol) -> Option<NodeId> {
+    if matches!(splat_head(m, rec), Some("record") | Some("table")) {
+        let (resolved, _) = resolve_ref_one(m, rec);
+        let Node::Call(c) = m.node(resolved) else {
+            return None;
+        };
+        return c.named.iter().find(|na| na.name == name).map(|na| na.value);
+    }
+    // Opaque table: bind the column access §03 defines, if the type declares that column.
+    //
+    // A multi-column splat that refuses on a LATER column leaves the `get` nodes already
+    // allocated for the earlier ones unreferenced. Benign: the arena is append-only and never
+    // freed per node (`crates/core/src/id.rs`), nothing reaches them, and inference rejects a
+    // name mismatch before the determiniser runs anyway — so the partial case is only reachable
+    // when some other layer has already failed.
+    if !table_columns(m, rec)?.contains(&name) {
         return None;
     }
-    let (resolved, _) = resolve_ref_one(m, rec);
-    let Node::Call(c) = m.node(resolved) else {
-        return None;
-    };
-    c.named.iter().find(|na| na.name == name).map(|na| na.value)
+    let key = m.alloc(Node::Lit(Scalar::Str(m.resolve(name).into())));
+    let get = m.intern("get");
+    Some(m.alloc(Node::Call(Call {
+        head: CallHead::Builtin(get),
+        args: vec![rec, key].into(),
+        named: Vec::<NamedArg>::new().into(),
+        inputs: None,
+    })))
 }
 
 #[cfg(test)]
