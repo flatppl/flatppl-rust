@@ -2,7 +2,7 @@
 //! (optional) annotation side-tables; exposes the read / build / annotate API.
 
 use crate::id::{Arena, BindingId, Idx, Interner, NodeId, SecondaryMap, Symbol};
-use crate::node::{Node, Ref};
+use crate::node::{CallHead, Node, Ref};
 use crate::ty::{Mass, Phase, Type, ValueSet};
 use std::collections::HashMap;
 
@@ -384,6 +384,46 @@ impl Module {
     /// Visit the child sub-nodes of a node (delegates to [`Node::for_each_child`]).
     pub fn for_each_child(&self, id: NodeId, f: impl FnMut(NodeId)) {
         self.node(id).for_each_child(f);
+    }
+
+    /// Structural equality of two expression trees: same shape, same literals,
+    /// same references, same call heads. Node ids are NOT canonical — the parser
+    /// shares a chain middle while a FlatPIR round-trip duplicates it — so any
+    /// analysis that asks "is this the same expression twice" needs this rather
+    /// than `a == b`.
+    ///
+    /// Equal REFERENCES, not equal values: `(%ref self psi)` twice is the same
+    /// expression, but two distinct bindings with equal right-hand sides are not.
+    pub fn structural_eq(&self, a: NodeId, b: NodeId) -> bool {
+        if a == b {
+            return true;
+        }
+        match (self.node(a), self.node(b)) {
+            (Node::Lit(x), Node::Lit(y)) => x == y,
+            (Node::Const(x), Node::Const(y)) => x == y,
+            (Node::Hole, Node::Hole) => true,
+            (Node::Ref(x), Node::Ref(y)) => x == y,
+            (Node::Axis(x), Node::Axis(y)) => x == y,
+            (Node::Call(x), Node::Call(y)) => {
+                let heads = match (x.head, y.head) {
+                    (CallHead::Builtin(p), CallHead::Builtin(q)) => p == q,
+                    (CallHead::User(p), CallHead::User(q)) => self.structural_eq(p, q),
+                    _ => false,
+                };
+                heads
+                    && x.inputs == y.inputs
+                    && x.args.len() == y.args.len()
+                    && x.args
+                        .iter()
+                        .zip(y.args.iter())
+                        .all(|(&p, &q)| self.structural_eq(p, q))
+                    && x.named.len() == y.named.len()
+                    && x.named.iter().zip(y.named.iter()).all(|(p, q)| {
+                        p.kind == q.kind && p.name == q.name && self.structural_eq(p.value, q.value)
+                    })
+            }
+            _ => false,
+        }
     }
 
     // ---- annotate (side-tables) ----

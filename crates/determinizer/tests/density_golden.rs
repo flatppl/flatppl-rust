@@ -550,10 +550,15 @@ lp = logdensityof(lawof(record(a = a)), record(a = 0.5))";
 
 // The spec's canonical mixture idiom (§06 "Additive superposition"):
 // `normalize(superpose(weighted(p, M1), weighted(1 - p, M2)))` with weights p and
-// `1 - p`. It lowers via the SAME convex-superposition rule — the weights-sum-to-
-// one case is Z = add(p, sub(1, p)) with no symbolic sum-to-one proof (the
-// backend evaluates log Z → log 1 = 0). Proves the dissimilar-mixture shape
-// unblocks. Regression for buffy #262.
+// `1 - p`. It lowers via the SAME convex-superposition rule, and now WITHOUT any
+// normalizer term: inference proves the `superpose` `%normalized` from the
+// complement weights, so `normalize` takes its identity path ("If `M` is already
+// a probability measure … `Z = 1`, `logZ = 0`" — `lower_normalize_density`).
+//
+// This pin previously asserted a `(log 1.0)` term, which const-folding produced
+// from `Z = add(p, sub(1, p))`. Same density either way (log 1 = 0); the proof
+// removes the subtraction rather than folding it, so the assertion moved from
+// "the normalizer folds to log 1.0" to "there is no normalizer to fold".
 #[test]
 fn normalize_superpose_one_minus_p_mixture_idiom_lowers() {
     let src = "\
@@ -574,15 +579,16 @@ lp = logdensityof(lawof(record(a = a)), record(a = 0.5))";
         2,
         "one density term per mixand:\n{pir}"
     );
-    // Z = add(p, 1 - p) with p = 0.4 a literal: canon Pass 1's
-    // `resolve_alias_refs` inlines the trivial alias `(%ref self p)` to `0.4`,
-    // then const-fold reduces `add(0.4, sub(1.0, 0.4))` to the literal `1.0`
-    // (the basic arithmetic ops are IEEE-754-exact, so this is bit-identical
-    // to evaluating it at run time) — the normalizer surfaces as a bare
-    // `(log 1.0)`, distinct from the per-mixand `(add (log 0.4) …)` terms.
+    // No normalizer at all: the mixture is `%normalized` before `normalize` is
+    // lowered, so nothing is subtracted. The per-mixand `(add (log 0.4) …)` terms
+    // stay, which is why this asserts on the SUBTRACTION and not on `log`.
     assert!(
-        pir.contains("(log 1.0)"),
-        "log(p + (1 - p)) additive-mass normalizer folds the weights to 1.0:\n{pir}"
+        !pir.contains("(log 1.0)"),
+        "a proven-normalized mixture needs no log(1.0) normalizer:\n{pir}"
+    );
+    assert!(
+        !pir.contains("(sub (logsumexp"),
+        "nothing is subtracted from the mixture density:\n{pir}"
     );
     assert!(
         !pir.contains("normalize") && !pir.contains("superpose") && !pir.contains("weighted"),
@@ -2596,60 +2602,78 @@ lp = logdensityof(lawof(M), 0.5)",
     );
 }
 
-// CHARACTERIZATION, not an endorsement — the pattern this file already uses for a value it
-// records without blessing (cf. the pre-gate `kernelof` rows). This shape USED to refuse, and
-// the refusal was an artifact of the pre-identity `lawof` typing: `lawof(<measure>)` wrapped
-// its argument, so `truncate` of it kept a MEASURE domain, the `draw` node typed as a measure,
-// and a value-versus-measure guard fired. With `lawof` typed as the identity (#73) the guard
-// correctly no longer fires, and the shape lowers.
+// RESOLVED. This was a characterization pin recording an unnormalized density that `lawof`
+// presented as a law, written explicitly to flip visibly once the gap was ruled on. The owner
+// ruled: no implicit normalization — "we want to be honest here, we do not want hidden magic" —
+// so `draw` of a measure whose mass is not a probability is a STATIC ERROR and the escape is the
+// user writing `normalize(...)`.
 //
-// It lowers to the MARGINAL `Normal(0, √2)` gated on the truncation set — which is the correct
-// density of `truncate(M, S)`, an unnormalized (`%finite`) restriction, and is therefore NOT a
-// probability density: there is no `1 / (F(hi) − F(lo))` normalizer.
+// The rule is normative §04 already: "`x ~ m` (equivalent to `x = draw(m)`) introduces a stochastic
+// node `x` by drawing a variate from a normalized measure (i.e. a probability measure) `m`."
+// flatppl-design#73 corroborates it right-to-left — #73 gives `lawof(m)` = `lawof(draw(m))` and
+// requires `lawof`'s argument to be `%normalized`, so a draw from an unnormalized measure has no
+// law. The gate lives in `infer` (`ops::draw_mass_gate`).
 //
-// OPEN QUESTION, deliberately not decided here. §04 says `lawof(x)` "reifies the ancestor
-// subgraph of `x` as a probability measure", and #73 requires `lawof(m)`'s argument to be
-// `%normalized` — but here the unnormalized measure sits under a `draw`, where neither
-// sentence reaches it. Reading #73's equation `lawof(m) := lawof(draw(m))` right-to-left would
-// extend the mass requirement through the `draw` and restore a refusal, now as a proper §04
-// static error; that is a derivation, not spec text, so it is recorded for a spec author rather
-// than implemented. Until it is settled this test pins WHAT is emitted, so a future change to
-// this shape is noticed, while asserting nothing about whether the value is right.
+// NOTE why this asserts the DIAGNOSTIC and not a determiniser refusal: `determinize_src` calls
+// `infer` and discards its diagnostics, so the determiniser still walks an ill-formed module and
+// would still emit the old density here. Through the CLI the gate stops the pipeline (exit 3).
+// The gate is an infer-level static error, so `infer` is where it is pinned.
 #[test]
-fn draw_of_a_truncated_stochastic_law_lowers_to_the_unnormalized_marginal() {
-    for src in [
-        "\
+fn draw_of_an_unnormalized_measure_is_a_static_error() {
+    for (label, src) in [
+        (
+            "bounded truncation of a stochastic law",
+            "\
 a = draw(Normal(mu = 0.0, sigma = 1.0))
 S = interval(0.0, 3.0)
 y = draw(truncate(lawof(Normal(mu = a, sigma = 1.0)), S))
 lp = logdensityof(lawof(y), 0.5)",
-        // Inline set, so the behaviour cannot depend on the truncation set being named.
-        "\
+        ),
+        (
+            "inline set, so it cannot depend on the set being named",
+            "\
 a = draw(Normal(mu = 0.0, sigma = 1.0))
 y = draw(truncate(lawof(Normal(mu = a, sigma = 1.0)), interval(0.0, 3.0)))
 lp = logdensityof(lawof(y), 0.5)",
-        // The HALF-LINE variant, which the base file covered in the row this wave moved out
-        // of `lawof_of_a_draw_parameterized_measure_marginalizes` and would otherwise have
-        // left unpinned. An unbounded truncation set behaves the same way: same marginal,
-        // still no normalizer.
-        "\
+        ),
+        (
+            "half-line, an unbounded truncation set",
+            "\
 a = draw(Normal(mu = 0.0, sigma = 1.0))
 y = draw(truncate(lawof(Normal(mu = a, sigma = 1.0)), interval(0.0, inf)))
 lp = logdensityof(lawof(y), 0.3)",
+        ),
     ] {
-        let lp = pir_binding(&flatppl_flatpir::write(&determinize_src(src)), "lp");
-        // The marginal, not the conditional — the one thing here that IS established.
+        let mut m = flatppl_syntax::parse(src).unwrap();
+        let diags = flatppl_infer::infer(&mut m);
         assert!(
-            lp.contains("(%field sigma 1.4142135623730951)"),
-            "the base is the marginal Normal(0, √2):\n{lp}"
-        );
-        // And the restriction is unnormalized: no CDF normalizer is emitted. Pinned so that
-        // adding one (or restoring a refusal) is a deliberate, visible change.
-        assert!(
-            !lp.contains("builtin_touniform"),
-            "no normalizer today — see the OPEN QUESTION above:\n{lp}"
+            diags.iter().any(|d| {
+                let t = format!("{d:?}");
+                t.contains("`draw` requires a probability measure") && t.contains("normalize(...)")
+            }),
+            "{label}: must be a static error naming the escape: {diags:?}"
         );
     }
+
+    // POSITIVE CONTROL: writing the normalization explicitly is the escape, so this must INFER
+    // CLEAN. Without it, the refusals above would be satisfied by a gate that rejected the whole
+    // family.
+    //
+    // It does not lower, and that is disclosed rather than asserted: for this shape the base is a
+    // `lawof` marginal, and determinization then refuses one layer down with "normalize(truncate):
+    // closed-form Z needs a leaf built-in distribution base; a composed/pushfwd base has no
+    // defined touniform transport". That limit is pre-existing and unrelated to this gate — a LEAF
+    // base does reach `builtin_touniform`. Both layers refuse, so nothing unsafe lowers.
+    let src = "\
+a = draw(Normal(mu = 0.0, sigma = 1.0))
+y = draw(normalize(truncate(lawof(Normal(mu = a, sigma = 1.0)), interval(0.0, 3.0))))
+lp = logdensityof(lawof(y), 0.5)";
+    let mut m = flatppl_syntax::parse(src).unwrap();
+    let diags = flatppl_infer::infer(&mut m);
+    assert!(
+        diags.is_empty(),
+        "the explicit `normalize` escape must infer clean: {diags:?}"
+    );
 }
 
 // §13 "Determinization": "`draw` nodes take their values from the explicit `point`,

@@ -384,23 +384,26 @@ fn lawof_rejects_a_measure_that_is_not_normalized() {
     ));
 }
 
-/// THE conservative case, adversarially endorsed: a `%finite` `superpose` whose
-/// weights happen to sum to one is REJECTED. The rule quantifies over the mass
-/// CLASS, not over the arithmetic — a checker that discharged `0.5 + 0.5 = 1`
-/// would accept this and reject an equivalent model whose weights were less
-/// foldable, which is worse than rejecting both.
+/// The gate still quantifies over the mass CLASS — a measure it holds as
+/// `%finite` is rejected however normalized it looks — but a `superpose` whose
+/// weights provably sum to one is no longer `%finite` at all, so `lawof` of it is
+/// legal. Both halves are pinned here because the distinction is the whole design:
+/// the PROOF moved into the mass rule, the gate did not soften.
 #[test]
-fn lawof_rejects_a_finite_superpose_even_when_the_weights_sum_to_one() {
-    let src = "\
+fn lawof_takes_a_proven_mixture_and_still_refuses_a_finite_measure() {
+    let proven = "\
 n = Normal(mu = 0.0, sigma = 1.0)
 sp = superpose(weighted(0.5, n), weighted(0.5, n))
 z = lawof(sp)";
-    assert!(rejects(src, "total mass is `%finite`"));
+    assert!(diags_of(proven).is_empty(), "{:?}", diags_of(proven));
+    let finite = "\
+n = Normal(mu = 0.0, sigma = 1.0)
+z = lawof(weighted(0.5, n))";
+    assert!(rejects(finite, "total mass is `%finite`"));
     // `normalize` is the stated escape and must clear it.
     let fixed = "\
 n = Normal(mu = 0.0, sigma = 1.0)
-sp = superpose(weighted(0.5, n), weighted(0.5, n))
-z = lawof(normalize(sp))";
+z = lawof(normalize(weighted(0.5, n)))";
     assert!(diags_of(fixed).is_empty(), "{:?}", diags_of(fixed));
 }
 
@@ -606,4 +609,320 @@ fn the_lawof_identity_survives_alias_hops() {
             .contains("((%measure (%domain (%scalar real)) (%mass %normalized))"),
         "three alias hops must not change the identity typing:\n{out}"
     );
+}
+
+// ============================================================
+// `draw` requires a probability measure (owner ruling; spec PR to follow)
+// ============================================================
+//
+// No implicit normalization: drawing from a measure whose mass is not a
+// probability is a static error, and `normalize(m)` is the escape. Derived from
+// #73's equation read right-to-left — `lawof(m)` = `lawof(draw(m))` and `lawof`
+// requires `%normalized`, so a draw from an unnormalized measure has no law.
+// Mirrors `lawof`'s gate exactly; both route through `unprovable_normalization`.
+
+/// Every mass class the checker can prove is not a probability is rejected, and the
+/// message names `normalize(...)`.
+#[test]
+fn draw_rejects_a_measure_that_is_not_a_probability() {
+    let n = "n = Normal(mu = 0.0, sigma = 1.0)\n";
+    // %finite by restriction.
+    assert!(rejects(
+        &format!("{n}y = draw(truncate(n, interval(0.0, 1.0)))"),
+        "`draw` requires a probability measure"
+    ));
+    // %finite by reweighting.
+    assert!(rejects(
+        &format!("{n}y = draw(weighted(2.0, n))"),
+        "total mass is `%finite`"
+    ));
+    // %locallyfinite — a reference measure.
+    assert!(rejects(
+        "y = draw(Lebesgue(reals))",
+        "total mass is `%locallyfinite`"
+    ));
+    // The escape is named.
+    assert!(rejects(
+        &format!("{n}y = draw(truncate(n, interval(0.0, 1.0)))"),
+        "normalize(...)"
+    ));
+}
+
+/// A mixture whose weights PROVABLY sum to one is `%normalized`, so the gate lets
+/// it through — the mass rule proves the normalization upstream rather than the
+/// gate relaxing. Both readings, and the `normalize` spelling §06 recommends stays
+/// valid (it is then a no-op on an already-normalized measure).
+///
+/// This reverses an earlier decision: the same `superpose(weighted(0.5, n),
+/// weighted(0.5, n))` was pinned as REJECTED when the only rule was
+/// class-quantified. What changed is not the gate but how much the mass rule
+/// proves; the gate still rejects every measure it is handed as `%finite`, which
+/// [`draw_still_rejects_a_finite_measure`] pins.
+#[test]
+fn draw_accepts_a_mixture_whose_weights_provably_sum_to_one() {
+    for (label, src) in [
+        (
+            "literal halves",
+            "\
+n = Normal(mu = 0.0, sigma = 1.0)
+sp = superpose(weighted(0.5, n), weighted(0.5, n))
+y = draw(sp)",
+        ),
+        (
+            "literal decimals that no float width adds to one",
+            "\
+n = Normal(mu = 0.0, sigma = 1.0)
+sp = superpose(weighted(0.1, n), weighted(0.2, n), weighted(0.7, n))
+y = draw(sp)",
+        ),
+        (
+            "the complement pattern with a stochastic weight — the zero-inflated shape",
+            "\
+psi ~ Beta(1.5, 1.5)
+sp = superpose(weighted(psi, Binomial(20, 0.4)), weighted(1 - psi, Dirac(0)))
+y = draw(sp)",
+        ),
+        (
+            "the complement pattern with a parameterized weight",
+            "\
+w = elementof(unitinterval)
+n = Normal(mu = 0.0, sigma = 1.0)
+sp = superpose(weighted(w, n), weighted(1 - w, Dirac(0.0)))
+y = draw(sp)",
+        ),
+        (
+            "components bound separately, so the proof looks through references",
+            "\
+psi ~ Beta(1.5, 1.5)
+hit = weighted(psi, Binomial(20, 0.4))
+miss = weighted(1 - psi, Dirac(0))
+y = draw(superpose(hit, miss))",
+        ),
+        (
+            "the explicit normalize spelling stays valid on top of the proof",
+            "\
+psi ~ Beta(1.5, 1.5)
+sp = superpose(weighted(psi, Binomial(20, 0.4)), weighted(1 - psi, Dirac(0)))
+y = draw(normalize(sp))",
+        ),
+        (
+            "iid of the mixture, which is how a model actually draws it",
+            "\
+psi ~ Beta(1.5, 1.5)
+sp = superpose(weighted(psi, Binomial(20, 0.4)), weighted(1 - psi, Dirac(0)))
+y = draw(iid(sp, 10))",
+        ),
+    ] {
+        assert!(
+            diags_of(src).is_empty(),
+            "{label} must infer clean: {:?}",
+            diags_of(src)
+        );
+    }
+}
+
+/// The sum-to-one proof is exactly as wide as its two readings. Each of these is
+/// a mixture a human would call normalized, and none of them is PROVEN so, which
+/// is the point: no arithmetic prover, no value-level reasoning about weights.
+#[test]
+fn the_sum_to_one_proof_rejects_everything_it_cannot_decide() {
+    for (label, src) in [
+        (
+            "not a complement: 1 - 2e",
+            "\
+psi ~ Beta(1.5, 1.5)
+sp = superpose(weighted(psi, Binomial(20, 0.4)), weighted(1 - 2 * psi, Dirac(0)))
+y = draw(sp)",
+        ),
+        (
+            "two DIFFERENT subtrees, e1 and 1 - e2, even with identical laws",
+            "\
+psi ~ Beta(1.5, 1.5)
+phi ~ Beta(1.5, 1.5)
+sp = superpose(weighted(psi, Binomial(20, 0.4)), weighted(1 - phi, Dirac(0)))
+y = draw(sp)",
+        ),
+        (
+            "a complement whose part is not proven to lie in [0, 1]",
+            "\
+w = elementof(reals)
+n = Normal(mu = 0.0, sigma = 1.0)
+sp = superpose(weighted(w, n), weighted(1 - w, Dirac(0.0)))
+y = draw(sp)",
+        ),
+        (
+            "literals summing to 0.999",
+            "\
+n = Normal(mu = 0.0, sigma = 1.0)
+sp = superpose(weighted(0.5, n), weighted(0.499, n))
+y = draw(sp)",
+        ),
+        (
+            // f64 addition of these three IS exactly 1.0 — two roundings land on
+            // it — so an engine that folded the weights in f64 would wrongly
+            // prove this. The declared decimals sum to 0.9999999999999999.
+            "literals that only f64 addition would call one",
+            "\
+n = Normal(mu = 0.0, sigma = 1.0)
+sp = superpose(
+    weighted(0.3333333333333333, n),
+    weighted(0.3333333333333333, n),
+    weighted(0.3333333333333333, n))
+y = draw(sp)",
+        ),
+        (
+            "a negative weight, so the components are not both measures",
+            "\
+n = Normal(mu = 0.0, sigma = 1.0)
+sp = superpose(weighted(-0.5, n), weighted(1.5, n))
+y = draw(sp)",
+        ),
+        (
+            "weights that sum to one over an UNNORMALIZED component",
+            "\
+n = Normal(mu = 0.0, sigma = 1.0)
+u = weighted(3.0, n)
+sp = superpose(weighted(0.5, u), weighted(0.5, n))
+y = draw(sp)",
+        ),
+        (
+            "a bare component that is not `weighted` at all",
+            "\
+n = Normal(mu = 0.0, sigma = 1.0)
+sp = superpose(n, weighted(0.5, n))
+y = draw(sp)",
+        ),
+        (
+            // THE soundness control. These two weight subtrees are syntactically
+            // identical and are two INDEPENDENT coordinates (#73: "each draw from
+            // `m` is a fresh coordinate"), so the masses sum to one only on a
+            // probability-zero event. Structural equality alone accepted this and
+            // typed it `%normalized` — an almost-surely-non-probability lowered as
+            // a law with no normalizer, i.e. a silently wrong number.
+            "two INLINE draws that are structurally identical but independent",
+            "\
+n1 = Normal(mu = 0.0, sigma = 1.0)
+n2 = Normal(mu = 5.0, sigma = 1.0)
+mix = superpose(
+    weighted(draw(Uniform(interval(0.0, 1.0))), n1),
+    weighted(1 - draw(Uniform(interval(0.0, 1.0))), n2))
+y = draw(mix)",
+        ),
+        (
+            // The same hole one phase over: §04 says each `elementof` LEAF becomes
+            // an input of the reified callable, so two occurrences are two
+            // parameters. Pinned to prove the exclusion set is a property and not
+            // the single name `draw`.
+            "two INLINE elementof parameters, structurally identical but distinct",
+            "\
+n1 = Normal(mu = 0.0, sigma = 1.0)
+n2 = Normal(mu = 5.0, sigma = 1.0)
+mix = superpose(
+    weighted(elementof(unitinterval), n1),
+    weighted(1 - elementof(unitinterval), n2))
+y = draw(mix)",
+        ),
+    ] {
+        assert!(
+            !diags_of(src).is_empty(),
+            "{label} must NOT be proven normalized, but inferred clean"
+        );
+        assert!(
+            rejects(src, "`draw` requires a probability measure"),
+            "{label} must be rejected by the draw gate: {:?}",
+            diags_of(src)
+        );
+    }
+}
+
+/// The gate's class-quantified rejection, unchanged by the sum-to-one proof: a
+/// measure the checker holds as `%finite` is refused whatever produced it.
+#[test]
+fn draw_still_rejects_a_finite_measure() {
+    let src = "\
+n = Normal(mu = 0.0, sigma = 1.0)
+y = draw(weighted(0.5, n))";
+    assert!(rejects(src, "total mass is `%finite`"));
+    let fixed = "\
+n = Normal(mu = 0.0, sigma = 1.0)
+y = draw(normalize(weighted(0.5, n)))";
+    assert!(diags_of(fixed).is_empty(), "{:?}", diags_of(fixed));
+}
+
+/// `lawof` shares the improvement, because the proof lives in the `superpose`
+/// MASS rule and not in either gate: the mixture is `%normalized`, so it is its
+/// own law.
+#[test]
+fn lawof_accepts_a_mixture_whose_weights_provably_sum_to_one() {
+    let src = "\
+psi ~ Beta(1.5, 1.5)
+sp = superpose(weighted(psi, Binomial(20, 0.4)), weighted(1 - psi, Dirac(0)))
+m = lawof(sp)";
+    assert!(diags_of(src).is_empty(), "{:?}", diags_of(src));
+    // Unproven weights still fail `lawof`'s gate, with its own message.
+    let unproven = "\
+psi ~ Beta(1.5, 1.5)
+phi ~ Beta(1.5, 1.5)
+sp = superpose(weighted(psi, Binomial(20, 0.4)), weighted(1 - phi, Dirac(0)))
+m = lawof(sp)";
+    assert!(rejects(unproven, "`%unknown`"));
+}
+
+/// What the gate must NOT touch: the ordinary spellings every model uses, and the
+/// explicit `normalize` escape. `draw` of a KERNEL is also left alone — §06's
+/// uniform kernel extension scopes itself to "measure-to-measure operations", and
+/// `draw` is measure-to-value, so nothing licenses a pointwise reading to gate.
+#[test]
+fn draw_accepts_probabilities_the_escape_and_a_kernel() {
+    for src in [
+        "y = draw(Normal(mu = 0.0, sigma = 1.0))",
+        "y ~ Normal(mu = 0.0, sigma = 1.0)",
+        "y = draw(iid(Normal(mu = 0.0, sigma = 1.0), 3))",
+        "n = Normal(mu = 0.0, sigma = 1.0)\ny = draw(normalize(truncate(n, interval(0.0, 1.0))))",
+        "n = Normal(mu = 0.0, sigma = 1.0)\ny = draw(normalize(weighted(2.0, n)))",
+        "mu = elementof(reals)\ny ~ Normal(mu = mu, sigma = 1.0)\n\
+         k = kernelof(record(y = y), mu = mu)\nz = draw(k)",
+    ] {
+        assert!(
+            diags_of(src).is_empty(),
+            "{src} must infer clean: {:?}",
+            diags_of(src)
+        );
+    }
+}
+
+/// Alias-transparent at three hops on BOTH arms, like the `lawof`/`kernelof` gates:
+/// the rule reads the inferred type, and a ref's type is its target's.
+#[test]
+fn the_draw_gate_survives_alias_hops() {
+    assert!(rejects(
+        "n = Normal(mu = 0.0, sigma = 1.0)\nt = truncate(n, interval(0.0, 1.0))\n\
+         t2 = t\nt3 = t2\ny = draw(t3)",
+        "`draw` requires a probability measure"
+    ));
+    // The accepting side must be alias-transparent too, or the gate could be
+    // defeated into REFUSING a legitimate model by an alias hop.
+    let ok = "n = Normal(mu = 0.0, sigma = 1.0)\nm = normalize(truncate(n, interval(0.0, 1.0)))\n\
+              m2 = m\nm3 = m2\ny = draw(m3)";
+    assert!(diags_of(ok).is_empty(), "{:?}", diags_of(ok));
+}
+
+/// The shape that motivated the ruling: `draw(truncate(lawof(…), S))` used to lower
+/// to the marginal density gated on `S` with no normalizer — an unnormalized
+/// measure silently presented as a law. Both gates now speak, and `lawof`'s fires
+/// on the inner argument only when it is itself unnormalized, so this reports the
+/// `draw`.
+#[test]
+fn the_ldid_unnormalized_shape_is_now_rejected() {
+    let src = "\
+a = draw(Normal(mu = 0.0, sigma = 1.0))
+y = draw(truncate(lawof(Normal(mu = a, sigma = 1.0)), interval(0.0, 3.0)))
+lp = logdensityof(lawof(y), 0.5)";
+    assert!(rejects(src, "`draw` requires a probability measure"));
+    // And the explicit escape clears it.
+    let fixed = "\
+a = draw(Normal(mu = 0.0, sigma = 1.0))
+y = draw(normalize(truncate(lawof(Normal(mu = a, sigma = 1.0)), interval(0.0, 3.0))))
+lp = logdensityof(lawof(y), 0.5)";
+    assert!(diags_of(fixed).is_empty(), "{:?}", diags_of(fixed));
 }
