@@ -669,21 +669,207 @@ fn the_exempt_rows_type_their_table_argument() {
         out.contains("(%bind s (%meta ((%scalar integer) %fixed nonnegintegers)"),
         "`lengthof` over a table must type as a nonneg integer, in:\n{out}"
     );
-    // Gap 1 — honest: no rule yet.
+    // The four §07 table reductions now give the record the paragraph defines:
+    // "returns a record whose fields are the column names and values are the
+    // per-column reductions". Previously `sum`/`mean` were `%deferred` and `var`
+    // MISTYPED as `(%scalar real)`; both were pinned as-measured here, and this
+    // assertion replacing those pins is the deliberate change they existed to force.
     for f in ["sum", "mean"] {
         let out = pir(f);
         assert!(
-            out.contains(&format!("(%bind s (%meta (%deferred %fixed %unknown) ({f}")),
-            "`{f}` over a table is still %deferred (§07 defines a record result), in:\n{out}"
+            out.contains(&format!(
+                "(%bind s (%meta ((%record (x (%scalar real)) (y (%scalar real))) \
+                 %fixed (record (x reals) (y reals))) ({f}"
+            )),
+            "`{f}` over a table must give a record of per-column sums, in:\n{out}"
         );
     }
-    // Gap 2 — worse: `var` claims a SCALAR where §07 defines a record of per-column
-    // variances. Pinned as the wrong type it currently produces, not as the right
-    // one, so the pin cannot be mistaken for a conformance claim.
-    let out = pir("var");
+    // `var`/`std` reduce each column to a NON-NEGATIVE real, so the per-field set is
+    // `nonnegreals` — their catalogue row's `result_set`, applied per column instead
+    // of to the whole result.
+    for f in ["var", "std"] {
+        let out = pir(f);
+        assert!(
+            out.contains(&format!(
+                "(%bind s (%meta ((%record (x (%scalar real)) (y (%scalar real))) \
+                 %fixed (record (x nonnegreals) (y nonnegreals))) ({f}"
+            )),
+            "`{f}` over a table must give a record of per-column variances, in:\n{out}"
+        );
+    }
+}
+
+/// §07 **Table reductions**: "When `sum`, `mean`, or `var` is applied to a table,
+/// the reduction operates column-wise and returns a record whose fields are the
+/// column names and values are the per-column reductions. Every column must support
+/// the reduction operation." `std` joins that list by the owner ruling of 2026-08-10
+/// (flatppl-design `4c93237`) — a commit which is NOT on design `main`, so `std`'s
+/// membership here rests on unmerged spec, exactly as its splat exemption does.
+///
+/// The per-column value is whatever the reduction gives for an ARRAY of that
+/// column's element type, so the table and array forms agree by construction:
+/// `sum`/`mean` keep the column's element type, `var`/`std` give a real. That is
+/// derived from the existing array rules rather than being a second set of rules.
+#[test]
+fn a_table_reduction_gives_a_record_of_per_column_reductions() {
+    let two = "d = load_data(\"d.csv\", cartpow(cartprod(x = reals, y = reals), 4))\n";
+    // Field NAMES come from the columns, in column order.
+    for f in ["sum", "mean", "var", "std"] {
+        let out = ir(&format!("{two}s = {f}(d)"));
+        assert!(
+            out.contains("(%record (x (%scalar real)) (y (%scalar real)))"),
+            "`{f}` must give a record keyed by the column names, in:\n{out}"
+        );
+    }
+    // `sum` keeps the column's own element type — an INTEGER column sums to an
+    // integer, exactly as `sum` of an integer array does.
+    let mixed = "d = load_data(\"d.csv\", cartpow(cartprod(k = integers, y = reals), 4))\n";
+    let out = ir(&format!("{mixed}s = sum(d)"));
     assert!(
-        out.contains("(%bind s (%meta ((%scalar real) %fixed nonnegreals) (var"),
-        "`var` over a table currently MISTYPES as a scalar real (§07 defines a \
-         per-column record) — pinned as-is; fixing it is its own change, in:\n{out}"
+        out.contains("(%record (k (%scalar integer)) (y (%scalar real)))"),
+        "`sum` must keep each column's element type, in:\n{out}"
     );
+    // `mean` does NOT: §07 defines it as (1/n)Σxᵢ, and the mean of `[1, 2]` is `1.5`,
+    // so an integer column means to a REAL. An earlier revision of this test asserted
+    // the opposite, having derived `mean` from `sum` instead of from §07's formula —
+    // which reproduced a pre-existing bug in the ARRAY path (`mean([1, 2, 3])` also
+    // typed integer) and dressed the agreement up as a correctness argument. Both
+    // paths now share `reduced_scalar`, checked against the formula.
+    let out = ir(&format!("{mixed}s = mean(d)"));
+    assert!(
+        out.contains("(%record (k (%scalar real)) (y (%scalar real)))"),
+        "`mean` of an integer column must be real, in:\n{out}"
+    );
+    // `var`/`std` give a real per column whatever the column's type, mirroring their
+    // catalogue row's `result: Scalar(Real)` on the array form.
+    for f in ["var", "std"] {
+        let out = ir(&format!("{mixed}s = {f}(d)"));
+        assert!(
+            out.contains("(%record (k (%scalar real)) (y (%scalar real)))"),
+            "`{f}` must give a real per column, in:\n{out}"
+        );
+    }
+}
+
+/// A ONE-column table gives a ONE-field record — the reduction does not collapse to
+/// a scalar just because there is a single column. This is the case that has to stay
+/// consistent with the splat rule pinned in `a_single_input_callable_whose_domain_
+/// admits_tables_is_exempt`: a one-column table is where a NON-exempt callable's
+/// splat happens to match on count, so the two rules meet here and must not disagree
+/// about what a one-column table is.
+#[test]
+fn a_one_column_table_reduces_to_a_one_field_record() {
+    let one = "d = load_data(\"d.csv\", cartpow(cartprod(x = reals), 4))\n";
+    for f in ["sum", "mean"] {
+        let out = ir(&format!("{one}s = {f}(d)"));
+        assert!(
+            out.contains("(%record (x (%scalar real)))")
+                && !out.contains("%bind s (%meta ((%scalar"),
+            "`{f}` over a one-column table is a one-field record, not a scalar, in:\n{out}"
+        );
+    }
+    for f in ["var", "std"] {
+        let out = ir(&format!("{one}s = {f}(d)"));
+        assert!(
+            out.contains("(%record (x (%scalar real)))"),
+            "`{f}` over a one-column table is a one-field record, in:\n{out}"
+        );
+    }
+}
+
+/// The value-set must describe the same value the TYPE does. Before this rule
+/// `var(<table>)` carried `nonnegreals` — a scalar set on what is now a record — and
+/// nothing reading the set rather than the type could tell.
+#[test]
+fn a_table_reduction_carries_a_matching_record_value_set() {
+    let two = "d = load_data(\"d.csv\", cartpow(cartprod(x = reals, y = reals), 4))\n";
+    for (f, want) in [
+        ("sum", "(record (x reals) (y reals))"),
+        ("mean", "(record (x reals) (y reals))"),
+        ("var", "(record (x nonnegreals) (y nonnegreals))"),
+        ("std", "(record (x nonnegreals) (y nonnegreals))"),
+    ] {
+        let out = ir(&format!("{two}s = {f}(d)"));
+        assert!(
+            out.contains(want),
+            "`{f}` must carry the value-set {want}, in:\n{out}"
+        );
+    }
+}
+
+/// Two deliberate NON-extensions, both spec-grounded.
+///
+/// `prod` is not a table reduction: §07's paragraph names `sum`, `mean`, `var` (and
+/// `std` by ruling) and stops, so `prod` over a table keeps whatever it did. It is
+/// also not splat-exempt, so a multi-column table never reaches its type rule at all.
+///
+/// A column whose per-row type is NOT a scalar leaves the whole call `%deferred`:
+/// §07 says only "Every column must support the reduction operation" and does not say
+/// what reducing a column of vectors yields, so inventing one would be guessing.
+#[test]
+fn table_reductions_do_not_extend_to_prod_or_to_non_scalar_columns() {
+    let two = "d = load_data(\"d.csv\", cartpow(cartprod(x = reals, y = reals), 4))\n";
+    // `prod` is not exempt, so the two-column table splats and fails on arity.
+    assert!(
+        errors(&format!("{two}s = prod(d)"))
+            .iter()
+            .any(|e| e.contains("`prod` takes 1 argument")),
+        "`prod` is not a table reduction and not splat-exempt"
+    );
+    // A vector-valued column: no rule, and `%deferred` rather than a guess.
+    let vec_col = "d = load_data(\"d.csv\", cartpow(cartprod(v = cartpow(reals, 3)), 4))\n";
+    for f in ["sum", "mean", "var", "std"] {
+        let out = ir(&format!("{vec_col}s = {f}(d)"));
+        assert!(
+            out.contains(&format!("(%bind s (%meta (%deferred %fixed %unknown) ({f}")),
+            "`{f}` over a vector-column table must stay %deferred, in:\n{out}"
+        );
+    }
+}
+
+/// §07's `mean` is $\bar{x} = \frac{1}{n}\sum_i x_i$, so the mean of an INTEGER array
+/// is a REAL — the mean of `[1, 2]` is `1.5`. `reduce_type` returned the element type
+/// for all of `sum`/`prod`/`mean`, so `mean([1, 2, 3])` typed integer. That is
+/// arithmetic, so it outranks the previous code.
+///
+/// This was pre-existing on `main`, not introduced here; it surfaced because the
+/// table rule was derived from it and inherited it. `sum` and `prod` of integers
+/// stay integers, which is correct, and complex stays complex for all three.
+#[test]
+fn mean_of_an_integer_array_is_real() {
+    let out = ir("v = [1, 2, 3]\ns = mean(v)");
+    assert!(
+        out.contains("(%bind s (%meta ((%scalar real) %fixed reals) (mean"),
+        "`mean` of an integer array must be real, in:\n{out}"
+    );
+    // The reductions whose element type IS the answer keep it.
+    for f in ["sum", "prod"] {
+        let out = ir(&format!("v = [1, 2, 3]\ns = {f}(v)"));
+        assert!(
+            out.contains(&format!(
+                "(%bind s (%meta ((%scalar integer) %fixed integers) ({f}"
+            )),
+            "`{f}` of an integer array stays an integer, in:\n{out}"
+        );
+    }
+}
+
+/// The ARRAY forms are otherwise untouched — the table rule is guarded on the
+/// argument being a table, so every non-table call keeps the arm it had.
+#[test]
+fn array_reductions_are_unchanged_by_the_table_rule() {
+    let v = "v = [1.0, 2.0, 3.0]\n";
+    for (f, want) in [
+        ("sum", "((%scalar real) %fixed reals)"),
+        ("mean", "((%scalar real) %fixed reals)"),
+        ("prod", "((%scalar real) %fixed reals)"),
+        ("var", "((%scalar real) %fixed nonnegreals)"),
+        ("std", "((%scalar real) %fixed nonnegreals)"),
+    ] {
+        let out = ir(&format!("{v}s = {f}(v)"));
+        assert!(
+            out.contains(want),
+            "`{f}` over an array must still be {want}, in:\n{out}"
+        );
+    }
 }

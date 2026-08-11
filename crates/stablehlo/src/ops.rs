@@ -130,7 +130,7 @@ pub(crate) fn lower_builtin(
         "pi" => lower_pi(e, id, args),
         "logsumexp" => lower_logsumexp(e, id, args),
         "vector" => lower_vector(e, id, args),
-        "sum" => unary(e, id, args, Emitter::reduce_sum),
+        "sum" => lower_sum(e, id, args),
         // §07 reductions `maximum`/`minimum` ($\max_i x_i$ / $\min_i x_i$ over
         // a real array) — NOT §07's binary `max`/`min`, which this map does not
         // lower.
@@ -823,6 +823,42 @@ fn lower_matrix_product(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<
     } else {
         Ok(e.matmat(&a, &b))
     }
+}
+
+// ---- reductions --------------------------------------------------------------
+
+/// Lower `sum`. Over an array this is the ordinary reduction; over a TABLE it
+/// refuses, and refuses SPECIFICALLY rather than incidentally.
+///
+/// §07 "Table reductions" makes `sum(t)` return "a record whose fields are the
+/// column names and values are the per-column reductions" — and this emitter has no
+/// record value at all: every [`Value`] is a tensor, and [`lower_builtin`]'s
+/// `"record"` arm refuses with "record has no tensor form". So the result is not
+/// expressible here, and refusing is the honest outcome rather than lowering one
+/// column and calling it the answer.
+///
+/// Checked BEFORE the argument is lowered, because otherwise the argument's own
+/// refusal fires first and blames the wrong thing: a table from `load_data` gave the
+/// column-wise-destructuring message (accurate, but about `load_data` rather than
+/// about the reduction), and a table from `elementof` gave "unsupported builtin head
+/// 'elementof'", which says nothing about tables at all. Both are this message now,
+/// whatever the table's provenance.
+///
+/// `mean`/`var`/`std` need no equivalent: this map lowers them for NO argument type,
+/// so "unsupported builtin head" is already accurate for them.
+fn lower_sum(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
+    if let [arg] = args {
+        if matches!(e.type_of(*arg), Some(Type::Table { .. })) {
+            return Err(EmitError::at(
+                id,
+                "a table reduction has no tensor form: §07 \"Table reductions\" makes `sum` over \
+                 a table a RECORD of per-column sums, and this emitter represents every value as \
+                 a tensor. Reduce one column at a time instead — `sum(data.x)` lowers, and a \
+                 table input is already one argument per column",
+            ));
+        }
+    }
+    unary(e, id, args, Emitter::reduce_sum)
 }
 
 // ---- ifelse / inf -----------------------------------------------------------
