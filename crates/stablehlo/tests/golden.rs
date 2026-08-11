@@ -11195,24 +11195,24 @@ outputs = (lp)
     assert!(is_delimiter_balanced(&out));
 }
 
-/// A destructured table used as ONE value (here `sum(data)`) refuses: the
-/// per-column arguments supply no monolithic tensor, and the message says to
-/// read it column-wise instead of reporting an unsupported head.
+/// A destructured table used as ONE value refuses: the per-column arguments supply
+/// no monolithic tensor, and the message says to read it column-wise instead of
+/// reporting an unsupported head.
 ///
-/// The table has ONE column because §04, as amended by design#74, makes a sole
-/// positional record or table splat unconditionally: a two-column `sum(data)` now
-/// reads as two arguments and fails inference on arity before reaching the emitter.
-/// One column splats to one argument, which `sum`'s arity admits, so the call still
-/// reaches the emitter with the whole table in tensor position — which is what this
-/// test is about. (The keyword spelling `sum(xs = data)` does not work here for an
-/// unrelated reason: `ops::lower_builtin` reads only positional arguments.)
+/// The whole-table use is ROW ACCESS (`get(data, 1)`, §03 "Row access by integer
+/// index"). It was `sum(data)` until table reductions gained a type, at which point
+/// `sum` over a table grew its own, more specific refusal — see
+/// `emit_logdensity_refuses_a_table_reduction_with_its_own_message`. Row access still
+/// reaches this one, so the `load_data` destructuring refusal keeps its coverage
+/// rather than being silently orphaned by that change.
 #[test]
 fn emit_logdensity_abi_refuses_whole_table_in_tensor_position() {
     let src = "\
 alpha = elementof(reals)
 data = load_data(\"d.csv\", cartpow(cartprod(x = reals), 4))
+row = get(data, 1)
 lp = logdensityof(lawof(record(y = draw(Normal(mu = alpha, sigma = 1.0)))), \
-record(y = sum(data)))
+record(y = get(row, [\"x\"])))
 inputs = (alpha, data)
 outputs = (lp)
 ";
@@ -11852,4 +11852,79 @@ fn emit_logdensity_every_recognised_open_image_pushfwd_emits() {
         "pushfwd(invlogit) must lower `logit` as log of a ratio:\n{out}"
     );
     assert!(is_delimiter_balanced(&out), "pushfwd(invlogit):\n{out}");
+}
+
+/// A §07 table reduction refuses with its OWN message, naming the reason and the
+/// spelling that works, whatever the table's provenance.
+///
+/// The reduction's result type is a record ("a record whose fields are the column
+/// names and values are the per-column reductions"), and this emitter has no record
+/// value — every `Value` is a tensor, and the `record` head itself refuses with
+/// "record has no tensor form". So the lowering is not expressible and a refusal is
+/// the honest outcome; a wrong number would not be.
+///
+/// Before this, the reason came out wrong depending on where the table came from: a
+/// `load_data` table blamed the column-wise destructuring (accurate but about
+/// `load_data`, not about the reduction) and an `elementof` table reported
+/// "unsupported builtin head 'elementof'", which mentions neither tables nor
+/// reductions. Both spellings are asserted here so that stays fixed.
+#[test]
+fn emit_logdensity_refuses_a_table_reduction_with_its_own_message() {
+    let want = "a table reduction has no tensor form";
+    for (label, decl) in [
+        (
+            "load_data",
+            "data = load_data(\"d.csv\", cartpow(cartprod(x = reals), 4))",
+        ),
+        (
+            "elementof",
+            "data = elementof(cartpow(cartprod(x = reals), 4))",
+        ),
+    ] {
+        let src = format!(
+            "alpha = elementof(reals)\n{decl}\n\
+             lp = logdensityof(lawof(record(y = draw(Normal(mu = alpha, sigma = 1.0)))), \
+             record(y = get(sum(data), [\"x\"])))\n\
+             inputs = (alpha, data)\noutputs = (lp)\n"
+        );
+        let d = determinize_abi_roots(&src, &["inputs", "outputs"]);
+        let err = flatppl_stablehlo::emit(
+            &d,
+            flatppl_stablehlo::Mode::LogDensity,
+            &flatppl_stablehlo::EmitOptions::default(),
+        )
+        .unwrap_err();
+        assert!(
+            err.msg.contains(want) && err.msg.contains("sum(data.x)"),
+            "the {label} table must give the reduction refusal naming the column spelling, \
+             got: {}",
+            err.msg
+        );
+    }
+}
+
+/// The spelling the refusal recommends actually lowers: reducing ONE COLUMN of a
+/// destructured table emits, because a table input is already one tensor argument
+/// per column. Asserted alongside the refusal so the advice cannot rot into
+/// pointing at something that does not work.
+///
+/// The table is 4 rows of one column, so the reduce is over a uniquely determined
+/// axis — there is no second axis the sum could have been taken along.
+#[test]
+fn emit_logdensity_lowers_a_reduction_over_one_table_column() {
+    let src = "\
+alpha = elementof(reals)
+data = load_data(\"d.csv\", cartpow(cartprod(x = reals), 4))
+lp = logdensityof(lawof(record(y = draw(Normal(mu = alpha, sigma = 1.0)))), \
+record(y = sum(data.x)))
+inputs = (alpha, data)
+outputs = (lp)
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let out = emit_logdensity(&d);
+    assert!(
+        out.contains("stablehlo.reduce") && out.contains("tensor<4xf32>"),
+        "the column reduction must emit a reduce over the 4 rows, in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
 }
