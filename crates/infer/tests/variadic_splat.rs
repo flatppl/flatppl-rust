@@ -376,42 +376,46 @@ fn an_extra_shape_field_errors_because_only_the_distinguished_inputs_are_named()
     );
 }
 
-/// A TABLE whose columns match the three names is **accepted**, and that is the right outcome for
-/// the rule under test: §04 draws no distinction between a record and a table splat, and the names
-/// match, so the binding is valid.
+/// A TABLE whose columns match the three names **splats correctly and then fails on argument
+/// TYPES** — and both halves of that are the point.
 ///
-/// What is wrong with such a call is the argument TYPES — a table's columns are equal-length
-/// vectors, so `rngstate` receives a vector of reals where §07's Domains cell wants `rngstates`,
-/// and `kernel` a vector where it wants a kernel. That is **not** this guard's business and not
-/// this wave's regression: the kernel-type check fires only on the POSITIONAL path, so
-/// `builtin_sample(rngstate = 1.0, kernel = 2.0, kernel_input = 3.0)` is accepted at base
-/// `af1d92d` too — verified by running these probes against it. The splat lowers to the keyword
-/// form and inherits that pre-existing hole rather than opening one.
+/// The BINDING is valid: §04 draws no distinction between a record and a table splat, and the
+/// names match. What is wrong is the types — a table's columns are equal-length vectors, so
+/// `rngstate` receives a vector of reals where §07's Domains cell wants `rngstates`, and `kernel`
+/// a vector where it wants a kernel.
 ///
-/// Pinned as measured, so closing the keyword-path type gap shows up here as a deliberate change.
+/// **FLIPPED by wave KWTYPE.** BSFIX pinned this as ACCEPTED and recorded why: the kernel-type
+/// check read `args` positionally, so it fired on `builtin_sample(1.0, 2.0, 3.0)` and stayed
+/// silent on the keyword form — and a splat lowers to the keyword form, so it inherited that hole.
+/// Verified pre-existing at `af1d92d` at the time. KWTYPE normalizes keyword arguments into their
+/// declared positions before the per-op rules run, so all three spellings — positional, keyword,
+/// and splatted — now reach the same check. The assertions below are the inverse of BSFIX's.
 #[test]
-fn a_name_matched_table_splats_and_the_type_gap_is_pre_existing() {
-    assert!(
-        errors(
-            "xs = elementof(cartpow(reals, 4))\n\
-             t = table(rngstate = xs, kernel = xs, kernel_input = xs)\n\
-             z = builtin_sample(t)\n"
-        )
-        .is_empty(),
-        "the names match, so §04's binding rule is satisfied"
+fn a_name_matched_table_splat_now_reaches_the_argument_type_check() {
+    let table = errors(
+        "xs = elementof(cartpow(reals, 4))\n\
+         t = table(rngstate = xs, kernel = xs, kernel_input = xs)\n\
+         z = builtin_sample(t)\n",
     );
-    // The same type hole through the keyword spelling, which predates this wave.
     assert!(
-        errors("z = builtin_sample(rngstate = 1.0, kernel = 2.0, kernel_input = 3.0)\n").is_empty(),
-        "keyword-path argument types are unchecked (pre-existing, af1d92d)"
-    );
-    // And the POSITIONAL path does check, which is what makes the gap a path asymmetry.
-    assert!(
-        errors("z = builtin_sample(1.0, 2.0, 3.0)\n")
+        table
             .iter()
             .any(|e| e.contains("must be a distribution kernel")),
-        "positional argument types ARE checked"
+        "the splat binds by name and then the type check fires: {table:?}"
     );
+    // All three spellings of the same call now agree — this is the asymmetry KWTYPE closed.
+    for spelling in [
+        "z = builtin_sample(1.0, 2.0, 3.0)\n",
+        "z = builtin_sample(rngstate = 1.0, kernel = 2.0, kernel_input = 3.0)\n",
+        "z = builtin_sample(1.0, kernel = 2.0, kernel_input = 3.0)\n",
+    ] {
+        assert!(
+            errors(spelling)
+                .iter()
+                .any(|e| e.contains("must be a distribution kernel")),
+            "every §04-equivalent spelling must reach the check: {spelling}"
+        );
+    }
 }
 
 /// The guard steps aside for `builtin_sample` because it DECLARES names, not because it is listed
