@@ -114,20 +114,18 @@ fn column_order_is_irrelevant_once_binding_is_by_name() {
 }
 
 /// The whole audit surface, swept: every base name against a name-mismatched sole positional
-/// 2-column table. Only the nine exempt names and the deliberately-nameless VARIADIC rows may
-/// still accept it.
+/// 2-column table. **Only the nine `#78`-exempt names may still accept it** — the variadic
+/// carve-out that used to appear here is closed (`variadic_splat.rs`), so this sweep is now
+/// exhaustive over the B76 finding set with no exceptions beyond the carve-out.
 #[test]
-fn no_builtin_accepts_a_name_mismatched_splat_except_the_documented_exclusions() {
+fn no_builtin_accepts_a_name_mismatched_splat_except_the_exempt_nine() {
     let cat = builtin_catalogue();
     let mut accepted: Vec<&str> = cat
         .base_names()
         .filter(|n| mismatched(n).is_empty())
         .collect();
     accepted.sort_unstable();
-    let unexpected: Vec<&&str> = accepted
-        .iter()
-        .filter(|n| !EXEMPT.contains(n) && !["cat", "get", "get0"].contains(n))
-        .collect();
+    let unexpected: Vec<&&str> = accepted.iter().filter(|n| !EXEMPT.contains(n)).collect();
     assert!(
         unexpected.is_empty(),
         "these accept a name-mismatched splat and should not: {unexpected:?}"
@@ -245,26 +243,22 @@ fn bijection_cites_sec06_in_both_its_diagnostics() {
     }
 }
 
-/// The variadic rows are deliberately nameless, and this pins the boundary rather than hiding
-/// it. **The reason is blast radius, not spec silence** — §04 is explicit that these inputs
-/// are UNNAMED: "Special operations have zero to three distinguished, unnamed, ordered inputs
-/// of fixed arity", then "`cat`, `fchain`, `kchain`: Variadic unnamed inputs with significant
-/// order" and "`get`: One distinguished input plus variadic unnamed input". An unnamed input
-/// cannot be addressed by a field name, so no column name can ever match one and §04's
-/// static-error clause arguably already settles it. Naming them would extend the
-/// accept→error flip to every such call at once, which is why it is deferred as scope.
-/// (§04 lists `cat` and `get`; `get0` inherits via §07 "zero-based variant of `get`".)
+/// The variadic rows stay nameless — there is no name list to give them — but the splat onto
+/// them is now a §04 STATIC ERROR rather than a silent positional bind. The deferral this test
+/// used to record is CLOSED (owner ruling: "we do not want hidden magic"); the refusal itself
+/// lives in `variadic_splat.rs`, and what this pins is the half that belongs to naming: these
+/// rows declare no names, and that no longer implies acceptance.
 #[test]
-fn variadic_rows_are_deliberately_nameless_on_blast_radius_grounds() {
+fn variadic_rows_stay_nameless_but_no_longer_accept_a_splat() {
     let cat = builtin_catalogue();
     for n in ["cat", "get", "get0"] {
         assert!(
             cat.base_param_names(n).is_none(),
-            "`{n}` is variadic and stays nameless as deferred scope — see this test's comment"
+            "`{n}`'s variadic inputs are unnamed (§04), so there is no name list to declare"
         );
         assert!(
-            mismatched(n).is_empty(),
-            "`{n}` therefore still accepts a name-mismatched splat — the deferred gap"
+            !mismatched(n).is_empty(),
+            "`{n}` must now REFUSE a splatted aggregate — the deferral is closed"
         );
     }
 }

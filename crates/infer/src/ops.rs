@@ -3003,6 +3003,106 @@ fn broadcast_distribution_no_shape(inf: &mut Inferencer<'_, '_>, head_node: Node
 /// distribution constructor. Returns `Some(Type::Failed)` for a mis-arity call
 /// and `None` when the call is admissible, the count is not knowable
 /// (see [`supplied_arg_count`]), or the catalogue declares no arity for `name`.
+/// The §04 refusal for a sole positional record or table splatted onto a row whose variadic
+/// inputs are UNNAMED.
+///
+/// §04 "Calling conventions" states that "Special operations have zero to three
+/// distinguished, **unnamed**, ordered inputs of fixed arity" and lists these rows by name —
+/// "`cat`, `fchain`, `kchain`: Variadic unnamed inputs with significant order", "`get`: One
+/// distinguished input plus variadic unnamed input with significant order", "`vector`: Unnamed
+/// variadic inputs with significant order". An unnamed input offers no name for a splatted
+/// field to bind to, so NO field name can ever match and §04's "A call with field or column
+/// names that do not match the callable's argument names is a static error" applies to every
+/// such call. (§04 lists `cat` and `get`; `get0` inherits via §07's "zero-based variant of
+/// `get`".)
+///
+/// **Deliberately does NOT append [`SPLAT_HINT`].** That tail advises the keyword spelling
+/// (`f(pars = record(...))`), which is unusable here: an unnamed input has no keyword to
+/// address it by, so pointing at one would send the author down a path that cannot work. The
+/// honest fix is to pass the elements explicitly, which is what this message says instead.
+fn refuse_splat_onto_unnamed_variadic(
+    inf: &mut Inferencer<'_, '_>,
+    id: NodeId,
+    name: &str,
+    cat: &crate::catalogue::Catalogue,
+    args: &[ArgInfo],
+) -> Type {
+    let section = cat.base_param_section(name);
+    let fields = splatted_field_names(inf, &args[0].1);
+    // §07 "Field and element access": "`r.a` ≡ `get(r, "a")`", so dot access is the concise
+    // spelling for pulling one field out.
+    let how = match name {
+        // The whole argument list is the variadic tail: every field becomes its own argument.
+        "cat" | "vector" => {
+            let listed = fields
+                .iter()
+                .map(|f| format!("t.{f}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            if listed.is_empty() {
+                format!("pass each element as its own argument, as in `{name}(t.a, t.b)`")
+            } else {
+                format!(
+                    "pass each one as its own argument, as in `{name}({listed})` for an aggregate `t`"
+                )
+            }
+        }
+        // A distinguished prefix plus a variadic tail: the aggregate is very likely the
+        // CONTAINER, and what is missing is the selector.
+        "get" | "get0" => {
+            let first = fields.first().map(String::as_str).unwrap_or("a");
+            format!(
+                "pass the container and each selector explicitly, as in `{name}(t, \"{first}\")` \
+                 — the aggregate is this row's `container` argument, not a list of arguments"
+            )
+        }
+        _ => format!(
+            "pass each argument explicitly; `{name}`'s variadic inputs are positional, so they \
+             cannot be supplied as an aggregate"
+        ),
+    };
+    let listed = if fields.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " (its {} {})",
+            if fields.len() == 1 {
+                "name is"
+            } else {
+                "names are"
+            },
+            fields
+                .iter()
+                .map(|f| format!("`{f}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    inf.diags.push(crate::Diagnostic::error_at(
+        id,
+        format!(
+            "`{name}`'s variadic inputs are UNNAMED (spec {section}), so a sole positional \
+             record or table{listed} has no name to bind to — spec §04 makes a call whose \
+             field or column names do not match the callable's argument names a static error. \
+             To fix it, {how}"
+        ),
+    ));
+    Type::Failed(format!("{name} cannot splat an aggregate onto unnamed variadic inputs").into())
+}
+
+/// The field or column names of a CONFIRMED record/table type, in declaration order; empty
+/// for anything else.
+fn splatted_field_names(inf: &Inferencer<'_, '_>, ty: &Type) -> Vec<String> {
+    let syms: &[(flatppl_core::Symbol, Type)] = match ty {
+        Type::Record(fields) => fields,
+        Type::Table { columns, .. } => columns,
+        _ => return Vec::new(),
+    };
+    syms.iter()
+        .map(|(n, _)| inf.module.resolve(*n).to_string())
+        .collect()
+}
+
 fn arity_check(
     inf: &mut Inferencer<'_, '_>,
     id: NodeId,
@@ -3014,6 +3114,13 @@ fn arity_check(
     let arity = cat.base_arity(name)?;
     let reading = arg_reading(args, named, cat.base_takes_aggregate_whole(name))?;
     let got = reading.count;
+    // A splat onto a row whose variadic inputs are UNNAMED can never bind, whatever the
+    // count, so this precedes the arity comparison: with a fitting column count the arity
+    // would pass and the nameless row would then ACCEPT, and with a non-fitting one the
+    // arity message would describe a count problem instead of the real one.
+    if reading.splatting && cat.base_has_unnamed_variadic(name) {
+        return Some(refuse_splat_onto_unnamed_variadic(inf, id, name, cat, args));
+    }
     if arity.admits(got) {
         // The count is right; the names still have to be the declared ones. `?`
         // here means "this row declares none — accept the call", not a failure to

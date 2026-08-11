@@ -496,20 +496,24 @@ impl Catalogue {
     ///
     /// - **`length` and `log2`** — catalogue rows with no §07 entry at all, so
     ///   there is no documented name to enforce.
-    /// - **Every VARIADIC row** (`cat`, `get`, `get0`, `vector`, …). Left nameless
-    ///   on BLAST-RADIUS grounds, not because the spec is silent — it is not. §04
-    ///   "Calling conventions" states that "Special operations have zero to three
-    ///   distinguished, **unnamed**, ordered inputs of fixed arity" and lists these
-    ///   rows explicitly: "`cat`, `fchain`, `kchain`: Variadic unnamed inputs with
-    ///   significant order", "`get`: One distinguished input plus variadic unnamed
-    ///   input", "`vector`: Unnamed variadic inputs with significant order". An
-    ///   UNNAMED input cannot be addressed by a field name, so no column name can
-    ///   ever match one, and §04's "does not match … is a static error" arguably
-    ///   settles the case already. Naming them would therefore extend the
-    ///   accept→error flip to every such call at once, which is a bigger behaviour
-    ///   change than this row-naming wave took on; it is deferred as scope, and the
-    ///   permissive direction is the safe side to defer on. (§04 lists `cat` and
-    ///   `get`; `get0` inherits via §07 "zero-based variant of `get`".)
+    /// - **Every VARIADIC row** (`cat`, `get`, `get0`, `vector`, `builtin_sample`).
+    ///   These have no name list to declare, because §04 makes their variadic inputs
+    ///   UNNAMED: "Special operations have zero to three distinguished, **unnamed**,
+    ///   ordered inputs of fixed arity", then "`cat`, `fchain`, `kchain`: Variadic
+    ///   unnamed inputs with significant order", "`get`: One distinguished input plus
+    ///   variadic unnamed input", "`vector`: Unnamed variadic inputs with significant
+    ///   order". (§04 lists `cat` and `get`; `get0` inherits via §07's "zero-based
+    ///   variant of `get`".)
+    ///
+    ///   **Nameless here no longer means the splat is accepted.** An earlier revision
+    ///   deferred that on blast-radius grounds; the owner has since ruled ("we do not
+    ///   want hidden magic") and the positional column bind is closed —
+    ///   [`Self::base_has_unnamed_variadic`] makes a splatted aggregate onto one of
+    ///   these rows a §04 static error, reported by
+    ///   `ops::refuse_splat_onto_unnamed_variadic` and pinned by
+    ///   `crates/infer/tests/variadic_splat.rs`. So the permissive default below
+    ///   covers only the two undocumented rows above; every nameless VARIADIC row is
+    ///   refused before the name check is reached.
     /// - **Rows whose §07 "Arguments" cell is not a name list** (a formula or a
     ///   dash), where there is nothing to read.
     pub fn base_param_names(&self, name: &str) -> Option<&[String]> {
@@ -520,6 +524,49 @@ impl Catalogue {
             }
             _ => None,
         }
+    }
+
+    /// Does `name` declare a VARIADIC tail whose inputs §04 leaves unnamed? Such a row can
+    /// never accept a splatted aggregate — there is no name for a field to bind to.
+    ///
+    /// Read structurally off the declared parameter list (a trailing
+    /// [`ParamSig::Variadic`]) rather than from a name list, so a variadic row added later is
+    /// covered on arrival instead of needing to be remembered here. §04 "Calling conventions"
+    /// is what makes the structure sufficient: every variadic special operation it enumerates
+    /// has *unnamed* variadic inputs — "`cat`, `fchain`, `kchain`: Variadic unnamed inputs
+    /// with significant order", "`get`: One distinguished input plus variadic unnamed input",
+    /// "`vector`: Unnamed variadic inputs with significant order", "`tuple`: Unnamed variadic
+    /// inputs with significant order", "`superpose`: Variadic unnamed inputs with no
+    /// significant order".
+    ///
+    /// **The exclusion list is the one §04 category that differs**: `cartprod`, `joint` and
+    /// `jointchain` take "Variadic unnamed **or named** inputs", and `record`/`table`,
+    /// `functionof`/`kernelof`, `broadcast` and `load_module` take named ones — for those a
+    /// field name CAN bind, so a splat is not automatically wrong. None of them is a base
+    /// catalogue row today (`ops.rs` types them structurally, so this method never sees them),
+    /// which makes the list pure future-proofing: it keeps the structural rule honest if any
+    /// of them ever gains a row.
+    pub(crate) fn base_has_unnamed_variadic(&self, name: &str) -> bool {
+        /// §04 rows whose variadic inputs may be NAMED — a splat can bind on these.
+        const NAMED_VARIADIC: &[&str] = &[
+            "cartprod",
+            "joint",
+            "jointchain",
+            "record",
+            "table",
+            "functionof",
+            "kernelof",
+            "broadcast",
+            "load_module",
+        ];
+        if NAMED_VARIADIC.contains(&name) {
+            return false;
+        }
+        let params = match self.base(name) {
+            Some(Sig::Function { params, .. }) | Some(Sig::Structural { params, .. }) => params,
+            _ => return false,
+        };
+        params.iter().any(|p| matches!(p, ParamSig::Variadic(_)))
     }
 
     /// The spec section that documents `name`'s parameter names, for a diagnostic
