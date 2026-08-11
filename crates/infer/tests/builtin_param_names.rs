@@ -209,22 +209,62 @@ fn an_undocumented_row_stays_permissive_on_names_and_relies_on_arity() {
     );
 }
 
-/// The variadic rows are deliberately nameless, and this pins the boundary rather than
-/// hiding it. §07 spells their tails `x, y, ...` / `container, selectors...`, naming a prefix
-/// but giving the repeated arguments no individual names, and §04 states no rule for binding
-/// a splatted field to a variadic slot. Enforcing the prefix alone would reject a column
-/// legitimately destined for an unnamed tail argument, so this waits on a spec answer.
+/// `bijection` is a §06 row, not a §07 one — it occurs zero times in §07, and §06 gives it
+/// both a table row and a prose entry with arguments `f`, `f_inv`, `logvolume`. It is a
+/// `Sig::Function` row like any §07 builtin, so the section must be mapped explicitly or the
+/// diagnostic sends a reader to a table `bijection` does not appear in.
+///
+/// It takes THREE arguments, so this needs a 3-column table to reach the name check — and
+/// that is what surfaced the second half: the ARITY branch had its own hardcoded §07/§08
+/// choice, so a 2-column table cited §07 even after the name check was fixed. Both branches
+/// now share `base_param_section`, and both are asserted here.
 #[test]
-fn variadic_rows_are_deliberately_nameless_pending_a_spec_rule() {
+fn bijection_cites_sec06_in_both_its_diagnostics() {
+    // Name check: 3 columns, so the arity is right and only the names are wrong.
+    let names = errors(
+        "xs = elementof(cartpow(reals, 4))\n\
+         t = table(zzq = xs, zzr = xs, zzs = xs)\n\
+         z = bijection(t)\n",
+    );
+    assert!(
+        names
+            .iter()
+            .any(|e| e.contains("spec §06 parameters: `f`, `f_inv`, `logvolume`")),
+        "the name check cites §06: {names:?}"
+    );
+    // Arity check: 2 columns against a 3-parameter row.
+    let arity = mismatched("bijection");
+    assert!(
+        arity
+            .iter()
+            .any(|e| e.contains("`bijection` takes 3 arguments (spec §06)")),
+        "the arity check cites §06 too: {arity:?}"
+    );
+    for e in names.iter().chain(&arity) {
+        assert!(!e.contains("spec §07"), "must never cite §07: {e}");
+    }
+}
+
+/// The variadic rows are deliberately nameless, and this pins the boundary rather than hiding
+/// it. **The reason is blast radius, not spec silence** — §04 is explicit that these inputs
+/// are UNNAMED: "Special operations have zero to three distinguished, unnamed, ordered inputs
+/// of fixed arity", then "`cat`, `fchain`, `kchain`: Variadic unnamed inputs with significant
+/// order" and "`get`: One distinguished input plus variadic unnamed input". An unnamed input
+/// cannot be addressed by a field name, so no column name can ever match one and §04's
+/// static-error clause arguably already settles it. Naming them would extend the
+/// accept→error flip to every such call at once, which is why it is deferred as scope.
+/// (§04 lists `cat` and `get`; `get0` inherits via §07 "zero-based variant of `get`".)
+#[test]
+fn variadic_rows_are_deliberately_nameless_on_blast_radius_grounds() {
     let cat = builtin_catalogue();
     for n in ["cat", "get", "get0"] {
         assert!(
             cat.base_param_names(n).is_none(),
-            "`{n}` is variadic and must stay nameless until §04 rules on variadic splat"
+            "`{n}` is variadic and stays nameless as deferred scope — see this test's comment"
         );
         assert!(
             mismatched(n).is_empty(),
-            "`{n}` therefore still accepts a name-mismatched splat — the known gap"
+            "`{n}` therefore still accepts a name-mismatched splat — the deferred gap"
         );
     }
 }

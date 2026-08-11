@@ -3030,11 +3030,9 @@ fn arity_check(
             named,
         );
     }
-    let section = if cat.base_is_distribution(name) {
-        "§08"
-    } else {
-        "§07"
-    };
+    // Same section mapping as the name check below, so a row documented outside §07 —
+    // `bijection`, `logdensityof` — cites §06 in BOTH its diagnostics rather than only one.
+    let section = cat.base_param_section(name);
     let declared = arity.describe();
     // `got` is the SPLAT count on a splatting call, so the author sees a number
     // larger than the arguments they wrote — say where it came from.
