@@ -208,6 +208,7 @@ pub(crate) fn lower(sig: &Sig, ctx: &LowerCtx) -> (Type, ValueSet) {
         }
         Sig::Function {
             params: _,
+            names: _,
             result,
             result_set,
         } => {
@@ -393,6 +394,7 @@ mod tests {
     fn same_scalar_kind_follows_arg() {
         let sig = Sig::Function {
             params: vec![],
+            names: vec![],
             result: ResultSig::RealOrComplexOfArg(0),
             result_set: crate::catalogue::ResultSet::Natural,
         };

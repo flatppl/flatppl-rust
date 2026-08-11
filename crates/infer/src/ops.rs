@@ -3015,25 +3015,24 @@ fn arity_check(
     let reading = arg_reading(args, named, cat.base_takes_aggregate_whole(name))?;
     let got = reading.count;
     if arity.admits(got) {
-        // The count is right; the names still have to be the declared ones.
-        // Only distribution rows declare names, so `?` here means "this row
-        // declares none — accept the call", not a failure to propagate.
+        // The count is right; the names still have to be the declared ones. `?`
+        // here means "this row declares none — accept the call", not a failure to
+        // propagate; see `base_param_names` for which rows are nameless and why.
         let names = cat.base_param_names(name)?.to_vec();
+        let section = cat.base_param_section(name);
         return arg_name_check(
             inf,
             &names,
             &format!("`{name}`"),
-            Some("§08"),
+            Some(section),
             &reading,
             args,
             named,
         );
     }
-    let section = if cat.base_is_distribution(name) {
-        "§08"
-    } else {
-        "§07"
-    };
+    // Same section mapping as the name check below, so a row documented outside §07 —
+    // `bijection`, `logdensityof` — cites §06 in BOTH its diagnostics rather than only one.
+    let section = cat.base_param_section(name);
     let declared = arity.describe();
     // `got` is the SPLAT count on a splatting call, so the author sees a number
     // larger than the arguments they wrote — say where it came from.

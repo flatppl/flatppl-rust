@@ -67,6 +67,20 @@ pub(crate) enum Sig {
         /// (result inference is structural over the call), so only the list's
         /// *shape* is read — by [`Arity::of`], for the call-arity rule.
         params: Vec<ParamSig>,
+        /// Ordered parameter NAMES, from §07's "Arguments" column (or §06's prose
+        /// for a measure operation), e.g. `atan2` → `["y", "x"]`. Parallel to
+        /// `params`, which carries only type tags.
+        ///
+        /// Read by [`Catalogue::base_param_names`] so §04's name-binding rule
+        /// applies to a splatted call on this row, exactly as it already does for
+        /// a `Distribution`. **`#[serde(default)]` is load-bearing, not just a
+        /// migration escape:** an empty list means "this row documents no names",
+        /// and `base_param_names` then answers `None`, which the arity check reads
+        /// as "accept" — so an undocumented row stays permissive instead of
+        /// refusing every splat. See that method for which rows are deliberately
+        /// left empty.
+        #[serde(default)]
+        names: Vec<String>,
         result: ResultSig,
         /// The result's value-set, when tighter than the result type's natural
         /// extent (e.g. `sqrt → nonnegreals`, `invlogit → unitinterval`).
@@ -81,7 +95,13 @@ pub(crate) enum Sig {
     /// those, so the row carries the arity alone: `lower` never sees it and
     /// `function_result` returns `None` for it, leaving the `ops.rs` arm
     /// authoritative for the type.
-    Structural { params: Vec<ParamSig> },
+    Structural {
+        params: Vec<ParamSig>,
+        /// Ordered parameter NAMES — see [`Sig::Function::names`]; identical
+        /// contract, including the permissive-when-empty default.
+        #[serde(default)]
+        names: Vec<String>,
+    },
 }
 
 /// The admissible positional-argument count of a catalogue row: `min` required
@@ -369,7 +389,9 @@ impl Catalogue {
     /// `None` rather than an invented arity of zero.
     pub fn base_arity(&self, name: &str) -> Option<Arity> {
         match self.base(name)? {
-            Sig::Function { params, .. } | Sig::Structural { params } => Some(Arity::of(params)),
+            Sig::Function { params, .. } | Sig::Structural { params, .. } => {
+                Some(Arity::of(params))
+            }
             Sig::Distribution { params, .. } if params.is_empty() => None,
             Sig::Distribution { params, .. } => Some(Arity {
                 min: params.len(),
@@ -463,13 +485,95 @@ impl Catalogue {
     }
 
     /// The declared parameter NAMES of base builtin `name`, for the §04
-    /// name-binding rule. Only distribution rows have them: a `Sig::Function` /
-    /// `Sig::Structural` row declares `ParamSig` type tags, whose §07 names live
-    /// in the row's comment rather than in the data.
+    /// name-binding rule. A `Distribution` row carries them as its `params`; a
+    /// `Function` / `Structural` row carries them in `names`, alongside the
+    /// `ParamSig` type tags in `params`.
+    ///
+    /// **An empty list answers `None`, which the caller reads as "accept".** So a
+    /// row documenting no names stays permissive rather than refusing every
+    /// splatted call — prove-it-is-wrong, the same discipline the determiniser's
+    /// shape guards use. Three groups are deliberately nameless:
+    ///
+    /// - **`length` and `log2`** — catalogue rows with no §07 entry at all, so
+    ///   there is no documented name to enforce.
+    /// - **Every VARIADIC row** (`cat`, `get`, `get0`, `vector`, …). Left nameless
+    ///   on BLAST-RADIUS grounds, not because the spec is silent — it is not. §04
+    ///   "Calling conventions" states that "Special operations have zero to three
+    ///   distinguished, **unnamed**, ordered inputs of fixed arity" and lists these
+    ///   rows explicitly: "`cat`, `fchain`, `kchain`: Variadic unnamed inputs with
+    ///   significant order", "`get`: One distinguished input plus variadic unnamed
+    ///   input", "`vector`: Unnamed variadic inputs with significant order". An
+    ///   UNNAMED input cannot be addressed by a field name, so no column name can
+    ///   ever match one, and §04's "does not match … is a static error" arguably
+    ///   settles the case already. Naming them would therefore extend the
+    ///   accept→error flip to every such call at once, which is a bigger behaviour
+    ///   change than this row-naming wave took on; it is deferred as scope, and the
+    ///   permissive direction is the safe side to defer on. (§04 lists `cat` and
+    ///   `get`; `get0` inherits via §07 "zero-based variant of `get`".)
+    /// - **Rows whose §07 "Arguments" cell is not a name list** (a formula or a
+    ///   dash), where there is nothing to read.
     pub fn base_param_names(&self, name: &str) -> Option<&[String]> {
         match self.base(name)? {
             Sig::Distribution { params, .. } if !params.is_empty() => Some(params),
+            Sig::Function { names, .. } | Sig::Structural { names, .. } if !names.is_empty() => {
+                Some(names)
+            }
             _ => None,
+        }
+    }
+
+    /// The spec section that documents `name`'s parameter names, for a diagnostic
+    /// that cites where the reader should check. §08 for a distribution
+    /// constructor, §06 for a measure operation, §07 for everything else.
+    ///
+    /// The measure-operation set is listed rather than inferred: `densityof`,
+    /// `logdensityof` and `bijection` are `Sig::Function` rows like any §07 builtin,
+    /// so nothing in the signature distinguishes them, and citing §07 for them would
+    /// send a reader to a table they do not appear in — `bijection` occurs zero times
+    /// in §07 and has its row and prose entry in §06 ("annotate `f` with inverse and
+    /// log-volume for density evaluation", arguments `f`, `f_inv`, `logvolume`).
+    ///
+    /// **Only four entries below are live.** The other 20 are not base catalogue rows
+    /// at all — `ops.rs` types them structurally, so `base_param_names` never reaches
+    /// them and their §06 citation cannot fire. They are listed anyway so that a
+    /// future catalogue row for any of them is sectioned correctly on arrival rather
+    /// than silently citing §07. The live four are `densityof`, `logdensityof`,
+    /// `totalmass` and `bijection`.
+    pub fn base_param_section(&self, name: &str) -> &'static str {
+        const MEASURE_OPS: &[&str] = &[
+            // Live — these four are catalogue rows today.
+            "densityof",
+            "logdensityof",
+            "totalmass",
+            "bijection",
+            // Not catalogue rows (typed in `ops.rs`); listed for future arrivals.
+            "kchain",
+            "jointchain",
+            "locscale",
+            "pushfwd",
+            "restrict",
+            "truncate",
+            "weighted",
+            "logweighted",
+            "normalize",
+            "superpose",
+            "mixture",
+            "iid",
+            "bayesupdate",
+            "likelihoodof",
+            "disintegrate",
+            "kernelof",
+            "functionof",
+            "lawof",
+            "joint",
+            "relabel",
+        ];
+        if self.base_is_distribution(name) {
+            "§08"
+        } else if MEASURE_OPS.contains(&name) {
+            "§06"
+        } else {
+            "§07"
         }
     }
 
@@ -1138,14 +1242,16 @@ mod tests {
         let cat = builtin();
         for b in &cat.base {
             match &b.sig {
-                Sig::Function { params, .. } | Sig::Structural { params } => check(&b.name, params),
+                Sig::Function { params, .. } | Sig::Structural { params, .. } => {
+                    check(&b.name, params)
+                }
                 Sig::Distribution { .. } => {}
             }
         }
         for m in &cat.modules {
             for b in &m.bindings {
                 match &b.sig {
-                    Sig::Function { params, .. } | Sig::Structural { params } => {
+                    Sig::Function { params, .. } | Sig::Structural { params, .. } => {
                         check(&format!("{}.{}", m.name, b.name), params)
                     }
                     Sig::Distribution { .. } => {}
