@@ -841,7 +841,7 @@ lp = logdensityof(lawof(record(y1 = y1)), record(y1 = 0.5))"),
     );
 }
 
-// §06 "Reified components share their ancestry" makes `joint(a = lawof(y1), b =
+// §06 "Equivalent record law" makes `joint(a = lawof(y1), b =
 // lawof(y2))` equivalent to `lawof(record(a = y1, b = y2))`: the shared ancestor is traced
 // once and the dependence is retained, so a keyword `joint` over two reified components now
 // reaches the SAME shared-latent record law as the plain record spelling — the correlated
@@ -954,6 +954,298 @@ lp = logdensityof(joint(lawof(y1), lawof(y2)), [0.5, 0.7])"),
     );
 }
 
+// **A CONSTRUCTOR component carrying a stochastic parameter is a correlation partner too.**
+// §06 *Joint composition* names both routes to a shared node in one sentence: "a stochastic
+// node shared between component traces (through a reified component — `lawof`, `kernelof` —
+// or a stochastic constructor parameter) remains a single node of the composed trace". So
+// `joint(a = Normal(mu = z, sigma = σₐ), b = Normal(mu = z, sigma = σᵦ))` over a latent `z`
+// draws `z` ONCE and each component contributes "a fresh coordinate" off it — the compound
+// law, equal to the record law of two fresh draws, not the product of two marginals. This
+// shape refused before ("no determinization rule for the `draw` measure-layer construct":
+// nothing consumed `z`).
+//
+// Closed form. With `z ~ N(μ₀, s₀²)` and `a, b | z` independent `N(z, σₐ²)`, `N(z, σᵦ²)`,
+// integrating `z` out gives `MvNormal((μ₀, μ₀), Σ)` with `Σ = s₀²·11ᵀ + diag(σₐ², σᵦ²)` —
+// §06's "cross-covariance Var(z) = s²" — which is the SAME Σ the shared-latent record law
+// already emits, hence the reuse rather than a second closed form.
+//
+// Point: μ₀ = 0.5, s₀ = 2, σ = (0.6, 0.8) at (2.5, −1.0), so `Σ = [[4.36, 4], [4, 4.64]]`.
+// Truth **−8.748747354129808**, verified twice independently of this repo: Distributions.jl
+// `logpdf(MvNormal([0.5,0.5], Σ), [2.5,-1.0])` = −8.7487473541298, and QuadGK over the
+// compound integral `∫ N(a;z,σₐ)N(b;z,σᵦ)N(z;μ₀,s₀) dz` = −8.748747354129808. The point is
+// a SPREAD one (one field far above the mean, one below) under strong correlation, which is
+// what makes it discriminate: the product of the marginals gives −4.0426427710908985, a
+// 4.71-nat gap. Other wrong answers it separates — the conditional at `z = μ₀`
+// −8.417275946884702, σ paired to the wrong fields −8.690833208895306, μ₀ dropped
+// −8.86575756593011, no Sherman–Morrison correction −9.872393397582488, no log-det term
+// −7.293629903432019.
+#[test]
+fn a_constructor_joint_sharing_a_latent_lowers_the_compound_law() {
+    let model = "z = draw(Normal(mu = 0.5, sigma = 2.0))\n";
+    for (label, query) in [
+        (
+            "keyword form",
+            "lp = logdensityof(joint(a = Normal(mu = z, sigma = 0.6), \
+             b = Normal(mu = z, sigma = 0.8)), record(a = 2.5, b = -1.0))",
+        ),
+        (
+            // §06: "the positional form is the corresponding `cat` law".
+            "positional form",
+            "lp = logdensityof(joint(Normal(mu = z, sigma = 0.6), \
+             Normal(mu = z, sigma = 0.8)), [2.5, -1.0])",
+        ),
+        (
+            // The components bound by name rather than written inline — one ref hop.
+            "components bound by name",
+            "ma = Normal(mu = z, sigma = 0.6)\n\
+             mb = Normal(mu = z, sigma = 0.8)\n\
+             lp = logdensityof(joint(a = ma, b = mb), record(a = 2.5, b = -1.0))",
+        ),
+        (
+            // The other provenance path: an earlier query PINNED `z`, so the joint finds a
+            // literal where the latent was and must still reach the compound law.
+            "an earlier query pinned the latent",
+            "lp_z = logdensityof(lawof(z), 0.3)\n\
+             lp = logdensityof(joint(a = Normal(mu = z, sigma = 0.6), \
+             b = Normal(mu = z, sigma = 0.8)), record(a = 2.5, b = -1.0))",
+        ),
+    ] {
+        let lp = pir_binding(&pir(&format!("{model}{query}")), "lp");
+        assert!(
+            lp.contains("(mul -0.5 ") && lp.contains("3.6757541328186907"),
+            "{label}: −½ over the flat sum, opening with 2·log 2π:\n{lp}"
+        );
+        assert!(
+            lp.contains("(log 0.36)") && lp.contains("(log 0.6400000000000001)"),
+            "{label}: log σᵢ² for σ = (0.6, 0.8):\n{lp}"
+        );
+        assert!(
+            lp.contains("(log1p 17.36111111111111)"),
+            "{label}: k = s₀²Σdᵢ = 4·(1/0.36 + 1/0.64):\n{lp}"
+        );
+        assert!(
+            lp.contains(" 12.379444024205748)"),
+            "{label}: the Sherman–Morrison quadratic form; σ paired to the wrong fields \
+             moves the total to -8.690833208895306:\n{lp}"
+        );
+        assert!(
+            !lp.contains("builtin_logdensityof"),
+            "{label}: the compound law is one expression, not a product of scored \
+             marginals:\n{lp}"
+        );
+        for marginal_sigma in ["2.08806130178211", "2.15406592285380"] {
+            assert!(
+                !lp.contains(marginal_sigma),
+                "{label}: no per-field marginal Normal(μ₀, sqrt(s₀² + σᵢ²)) survives — their \
+                 product is -4.0426427710908985, 4.71 nats off:\n{lp}"
+            );
+        }
+    }
+}
+
+// §04 *Identity law* on the `joint(m, m)` case: "`joint(m, m)` contributes a fresh
+// coordinate per occurrence, so the two draws are independent given `m`'s stochastic
+// ancestors — which remain shared". Writing the SAME stochastic measure binding twice is
+// therefore the correlated law of two conditionally independent draws, NOT the singular
+// diagonal joint that two reified laws of ONE draw give (`a_singular_joint_refuses`). The
+// distinction is the whole content of §04's "Equal laws do not make values interchangeable
+// as `joint` components": one shared MEASURE is two coordinates, one shared DRAW is one.
+#[test]
+fn joint_of_the_same_stochastic_measure_twice_is_two_fresh_coordinates() {
+    // Point A's model and point, reached by writing `mm` twice: truth -2.5171832107434002.
+    let lp = pir_binding(
+        &pir("\
+z = draw(Normal(mu = 0.0, sigma = 1.0))
+mm = Normal(mu = z, sigma = 1.0)
+lp = logdensityof(joint(a = mm, b = mm), record(a = 0.5, b = 0.7))"),
+        "lp",
+    );
+    assert!(
+        lp.contains("(log1p 2.0)") && lp.contains(" 0.26)"),
+        "two coordinates over one shared z — Point A's k = 2 and quadratic form 0.26:\n{lp}"
+    );
+    assert_eq!(
+        lp.matches("(log 1.0)").count(),
+        2,
+        "two fields, so two log σᵢ² terms — one occurrence is not one coordinate:\n{lp}"
+    );
+}
+
+// Constructor components reaching DIFFERENT latents share no node, so §06's product rule
+// stands and each component contributes its own marginal (§04: `lawof` reifies the TOTAL
+// law). This also refused before — nothing consumed either draw.
+#[test]
+fn a_constructor_joint_over_disjoint_latents_is_the_product_of_the_marginals() {
+    let lp = pir_binding(
+        &pir("\
+z1 = draw(Normal(mu = 0.0, sigma = 1.0))
+z2 = draw(Normal(mu = 0.0, sigma = 1.0))
+lp = logdensityof(joint(a = Normal(mu = z1, sigma = 1.0), b = Normal(mu = z2, sigma = 1.0)), \
+     record(a = 0.5, b = 0.7))"),
+        "lp",
+    );
+    assert_eq!(
+        lp.matches("builtin_logdensityof").count(),
+        2,
+        "disjoint ancestry is the product of two factors, not one compound law:\n{lp}"
+    );
+    assert_eq!(
+        lp.matches("(%field sigma 1.4142135623730951)").count(),
+        2,
+        "each factor is its own marginal Normal(0, √2):\n{lp}"
+    );
+    assert!(
+        !lp.contains("log1p"),
+        "no rank-one correction: there is no shared latent to correct for:\n{lp}"
+    );
+}
+
+// A joint of plain constructors — no stochastic parameter anywhere — must keep emitting the
+// plain product. This is the output the rewrite must NOT reach for, and the widest shape in
+// the corpus: §12's `product_dist` (`RooProdPdf`) lowers to exactly this.
+#[test]
+fn a_joint_of_ancestor_free_constructors_stays_the_plain_product() {
+    for (label, query) in [
+        (
+            "keyword",
+            "lp = logdensityof(joint(a = Normal(mu = 0.0, sigma = 1.0), \
+             b = Exponential(rate = 1.0)), record(a = 0.5, b = 0.7))",
+        ),
+        (
+            "positional",
+            "lp = logdensityof(joint(Normal(mu = 0.0, sigma = 1.0), \
+             Exponential(rate = 1.0)), [0.5, 0.7])",
+        ),
+    ] {
+        let lp = pir_binding(&pir(query), "lp");
+        assert_eq!(
+            lp.matches("builtin_logdensityof").count(),
+            2,
+            "{label}: the independent product is two scored factors:\n{lp}"
+        );
+        assert!(
+            lp.contains("Normal") && lp.contains("Exponential"),
+            "{label}: each component scored at its own constructor:\n{lp}"
+        );
+    }
+}
+
+// A constructor component and a REIFIED one sharing the same latent reach the compound law
+// together — the two routes §06 names in one sentence, mixed in one `joint`.
+//
+// σ = (1, 3) over `z ~ N(0, 1)` at (0.5, 0.7), the positional J1 test's point: Σ =
+// [[2,1],[1,10]], det 19, quadratic form 2.78/19 = 0.1463157894736842. A σ/field mispairing
+// (Σ = [[10,1],[1,2]]) gives 0.24736842105263157, so the point catches a swap.
+#[test]
+fn a_reified_and_a_constructor_component_share_the_same_latent() {
+    let lp = pir_binding(
+        &pir(
+            "\
+z = draw(Normal(mu = 0.0, sigma = 1.0))
+y1 = draw(Normal(mu = z, sigma = 1.0))
+lp = logdensityof(joint(a = lawof(y1), b = Normal(mu = z, sigma = 3.0)), record(a = 0.5, b = 0.7))",
+        ),
+        "lp",
+    );
+    assert!(
+        lp.contains("(log 1.0)") && lp.contains("(log 9.0)"),
+        "log σᵢ² for σ = (1, 3):\n{lp}"
+    );
+    assert!(
+        lp.contains("(log1p 1.1111111111111112)") && lp.contains(" 0.1463157894736842)"),
+        "k = 1·(1/1 + 1/9) and the quadratic form; a mispairing gives \
+         0.24736842105263157:\n{lp}"
+    );
+    assert!(
+        !lp.contains("builtin_logdensityof"),
+        "one compound law over both components:\n{lp}"
+    );
+}
+
+// A constructor component whose law is the reified law of the shared node ITSELF is the
+// chain rule, not an integral: `joint(a = lawof(z), b = Normal(mu = z, sigma = 1))` carries
+// `z` as its own coordinate, so `z` is scored at the query point and `b` conditionally on
+// it — §04 "Reification to measures" integrates out only ancestors the record does not
+// carry. The compound law must NOT fire here.
+#[test]
+fn a_joint_carrying_its_own_latent_is_the_chain_rule() {
+    let lp = pir_binding(
+        &pir("\
+z = draw(Normal(mu = 0.0, sigma = 1.0))
+lp = logdensityof(joint(a = lawof(z), b = Normal(mu = z, sigma = 1.0)), record(a = 0.3, b = 0.7))"),
+        "lp",
+    );
+    assert_eq!(
+        lp.matches("builtin_logdensityof").count(),
+        2,
+        "p(z)·p(b | z) is two factors:\n{lp}"
+    );
+    assert!(
+        lp.contains("(%field mu 0.3)"),
+        "b is scored conditionally at the carried z = 0.3, not marginally:\n{lp}"
+    );
+    assert!(
+        !lp.contains("log1p"),
+        "nothing was integrated out, so there is no rank-one correction:\n{lp}"
+    );
+}
+
+// Every shared-latent shape the record law does not cover keeps REFUSING through the
+// constructor spelling too — the rewrite widens which shapes reach the law, never what the
+// law claims to answer. Each row is the constructor-component counterpart of a row
+// `a_shared_latent_shape_with_no_per_field_row_refuses_upstream` pins for `lawof`.
+#[test]
+fn a_constructor_joint_outside_the_record_law_refuses() {
+    for (label, src) in [
+        (
+            "shared latent on a SCALE",
+            "\
+s = draw(Exponential(rate = 1.0))
+lp = logdensityof(joint(a = Normal(mu = 0.0, sigma = s), b = Normal(mu = 0.0, sigma = s)), \
+     record(a = 0.5, b = 0.7))",
+        ),
+        (
+            "two-level hierarchy over the shared latent",
+            "\
+w = draw(Normal(mu = 0.0, sigma = 1.0))
+z = draw(Normal(mu = w, sigma = 1.0))
+lp = logdensityof(joint(a = Normal(mu = z, sigma = 1.0), b = Normal(mu = z, sigma = 1.0)), \
+     record(a = 0.5, b = 0.7))",
+        ),
+        (
+            "a derived mean, not the latent itself",
+            "\
+z = draw(Normal(mu = 0.0, sigma = 1.0))
+lp = logdensityof(joint(a = Normal(mu = 2.0 * z, sigma = 1.0), b = Normal(mu = z, sigma = 1.0)), \
+     record(a = 0.5, b = 0.7))",
+        ),
+        (
+            "a non-Normal family over the shared latent",
+            "\
+z = draw(Normal(mu = 0.0, sigma = 1.0))
+lp = logdensityof(joint(a = Poisson(rate = z), b = Poisson(rate = z)), record(a = 1.0, b = 2.0))",
+        ),
+        (
+            // A combinator over the shared constructor, not a bare constructor: the
+            // truncated component's compound law is not this integral.
+            "a truncated component over the shared latent",
+            "\
+z = draw(Normal(mu = 0.0, sigma = 1.0))
+lp = logdensityof(joint(a = truncate(Normal(mu = z, sigma = 1.0), interval(0.0, 2.0)), \
+     b = Normal(mu = z, sigma = 1.0)), record(a = 0.5, b = 0.7))",
+        ),
+    ] {
+        let err = determinize(&parse_infer(src))
+            .expect_err(&format!("{label}: no closed form covers it — refuse"));
+        assert!(
+            err.reason.contains("MARGINAL law") || err.reason.contains("no closed form"),
+            "{label}: refusal must name the missing marginal/closed form rather than the \
+             leftover draw:\n{}",
+            err.reason
+        );
+    }
+}
+
 // §06 "Singular joints": the same draw referenced twice, or a component that is a
 // deterministic transform of another component's draw, has no density w.r.t. the product
 // reference measure — refused rather than mislowered to a product. Positional `joint`
@@ -990,15 +1282,16 @@ lp = logdensityof(joint(lawof(a), lawof(exp(a))), [0.5, 0.7])",
     }
 }
 
-// Mixed components (§06 "Joint composition": "Components that share no stochastic
-// ancestor — distribution constructors always ... — are mutually independent"): a
-// distribution CONSTRUCTOR component is always a fresh draw, so dependence handling
-// applies only among the REIFIED components.
-// `x = lawof(a)` shares `a`'s ancestor `z`, but the sole OTHER component here is a bare
-// `Normal(0, 1)` constructor — nothing to correlate with — so `x` keeps its own marginal
-// and `y` scores as an ordinary independent factor.
+// Mixed components (§06 "Joint composition": "Components that share no stochastic node are
+// independent, and their `joint` is the product measure"). What decides independence is
+// whether a component's trace REACHES a stochastic node, not whether it is spelled as a
+// constructor: `x = lawof(a)` reaches `a`'s ancestor `z`, but the sole OTHER component here
+// is a bare `Normal(0, 1)` reaching nothing, so there is no shared node and nothing to
+// correlate — `x` keeps its own marginal and `y` scores as an ordinary independent factor.
+// A constructor that DOES carry a stochastic parameter is a correlation partner, which
+// `a_constructor_joint_sharing_a_latent_lowers_the_compound_law` pins.
 #[test]
-fn a_constructor_component_is_a_fresh_draw_not_a_correlation_partner() {
+fn a_constructor_component_with_no_latent_is_not_a_correlation_partner() {
     let lp = pir_binding(
         &pir("\
 z = draw(Normal(mu = 0.0, sigma = 1.0))
