@@ -2104,10 +2104,15 @@ fn derive_matrix_affine(
 /// scalar nor a vector; a vector variate is paired with a non-matrix `scale`
 /// (a scalar scale over an n-vector has forward log-volume `n·log|scale|`, not
 /// `log|scale|` — the same danger [`derive_bijection`]'s vector guard closes);
-/// the matrix `scale` is a CONFIRMED non-square matrix; or a scalar variate is
-/// paired with a CONFIRMED non-scalar `shift` or `scale` (§06 requires both to be
-/// "value-compatible with the variate of `m`"). A literal-zero scalar `scale` (a
-/// non-injective collapse) also refuses, matching [`classify`]'s affine-`mul` guard.
+/// the matrix `scale` is a CONFIRMED non-square matrix; a vector variate is paired
+/// with a `shift` of CONFIRMED disagreeing shape ([`shift_confirmed_shape_mismatch`]);
+/// or a scalar variate is paired with a CONFIRMED non-scalar `shift` or `scale`. The
+/// last two are the two halves of §06's requirement that `shift` and `scale` be
+/// "value-compatible with the variate of `m`", and they are different tests: over a
+/// SCALAR variate anything non-scalar is wrong, while over a VECTOR variate a vector
+/// `shift` is what is right and only a differing shape is wrong. A literal-zero scalar
+/// `scale` (a non-injective collapse) also refuses, matching [`classify`]'s
+/// affine-`mul` guard.
 ///
 /// `shift` and `scale` are the raw `locscale` argument nodes; they are shared
 /// (not cloned) into the emitted callables, exactly as [`derive_matrix_affine`]
@@ -2134,6 +2139,26 @@ pub(crate) fn derive_locscale(
                 m,
                 "locscale matrix scale is not square (linsolve/logabsdet need a square matrix) — \
                  refuse rather than mislower",
+            ));
+        }
+        // The `shift` half of §06's value-compatibility requirement, mirroring the scalar
+        // branch below. `sub(y, shift)` puts `shift` against the VECTOR variate, and §07
+        // "Operator-equivalent functions" gives `sub` the domain "scalars or arrays of same
+        // shape (real or complex)" — so a scalar `shift`, or a vector of a different length,
+        // is outside it. Unlike the scalar branch this cannot be a non-scalar test: a vector
+        // shift of the WRONG LENGTH is equally invalid, so the check is shape AGREEMENT
+        // against the variate domain.
+        if let Some(what) = shift_confirmed_shape_mismatch(m, shift, domain) {
+            return Err(refuse(
+                shift,
+                m,
+                &format!(
+                    "locscale over a vector variate requires a `shift` of the SAME shape as the \
+                     variate, and this one is {what} — §06 requires `shift` and `scale` to be \
+                     value-compatible with the variate of `m`, and §07 gives `sub` the domain \
+                     \"scalars or arrays of same shape\", so `y − shift` has no meaning here. \
+                     Refuse rather than mislower"
+                ),
             ));
         }
         // f_inv(y) = linsolve(scale, y − shift); logvol(_) = logabsdet(scale).
@@ -2421,6 +2446,55 @@ fn matrix_confirmed_non_square(m: &Module, l: NodeId) -> bool {
             matches!(inner[0], Dim::Static(cols) if rows != cols)
         }
         _ => false,
+    }
+}
+
+/// How `shift`'s inferred type CONFIRMEDLY disagrees with a vector `domain`, as a noun
+/// phrase for the refusal, or `None` when the two agree or the disagreement cannot be
+/// proven.
+///
+/// The vector-branch counterpart of the scalar branch's `confirmed_non_scalar` check, and
+/// deliberately a different test: there, anything non-scalar is wrong; here, a vector shift
+/// is exactly what is RIGHT, and only a different shape is wrong. `sub(y, shift)` needs
+/// §07's "arrays of same shape".
+///
+/// **Prove-it-is-wrong, not fail-closed** — the same discipline as
+/// [`matrix_confirmed_non_square`] beside it. A `Dim::Dynamic` on either side, an
+/// unresolved/`%deferred`/`%any` type, or an element-type this cannot compare all answer
+/// `None`, so a shape that merely cannot be checked keeps the path it has today and the
+/// StableHLO bare-op domain guard stays its backstop. Only a statically-decidable
+/// disagreement refuses.
+fn shift_confirmed_shape_mismatch(m: &Module, shift: NodeId, domain: &Type) -> Option<String> {
+    let Type::Array {
+        shape: dom_shape, ..
+    } = domain
+    else {
+        return None;
+    };
+    let [dom_len] = dom_shape.as_ref() else {
+        return None;
+    };
+    match m.type_of(shift)? {
+        // A scalar against a vector variate: `sub(vector, scalar)` is outside §07's row
+        // whatever the length, so this needs no static dimension to be decidable. It is the
+        // case the branch was missing entirely.
+        Type::Scalar(_) => Some("a scalar".to_string()),
+        // §03 makes a transposed (row) vector a distinct type from a 1-D array, so an
+        // orientation difference is a shape difference even at equal length.
+        Type::TVector { .. } => Some("a transposed (row) vector, not a column vector".to_string()),
+        Type::Array { shape, .. } if shape.len() != 1 => {
+            Some(format!("an array of rank {}, not a vector", shape.len()))
+        }
+        Type::Array { shape, .. } => match (shape[0], *dom_len) {
+            (Dim::Static(got), Dim::Static(want)) if got != want => {
+                Some(format!("a vector of length {got}, not {want}"))
+            }
+            // Either side dynamic — not statically decidable, so not confirmed.
+            _ => None,
+        },
+        // Records, tuples, tables, measures, unresolved types: a `shift` of one of these is
+        // ill-formed for a different reason, and this guard is not the place to rule on it.
+        _ => None,
     }
 }
 
