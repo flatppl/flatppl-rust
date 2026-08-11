@@ -342,3 +342,152 @@ fn positional_joint_domain_is_cat_array() {
         "keyword joint → record domain; got:\n{outr}"
     );
 }
+
+// ============================================================
+// Measure-argument gates on `lawof` and `kernelof`
+// ============================================================
+//
+// Two §04 rules that nothing enforced before. `lawof(m)` requires `m`'s `%mass`
+// to be `%normalized` (flatppl-design#73 @ 9d9a91c, pending owner review);
+// `kernelof(x)` requires `x` to be a value node — "`x` must not be a measure",
+// already normative in §04.
+
+/// Diagnostics from a full infer pass, as `Debug` strings.
+fn diags_of(src: &str) -> Vec<String> {
+    let mut m = flatppl_syntax::parse(src).unwrap();
+    infer(&mut m).iter().map(|d| format!("{d:?}")).collect()
+}
+
+fn rejects(src: &str, needle: &str) -> bool {
+    diags_of(src).iter().any(|d| d.contains(needle))
+}
+
+/// §04 (#73): "`lawof(m)` requires `m`'s `%mass` to be `%normalized` …; anything
+/// else is a static error, since an unnormalized measure is not its own law".
+/// One case per rejected mass class the checker can produce.
+#[test]
+fn lawof_rejects_a_measure_that_is_not_normalized() {
+    // %finite — a truncation is a restriction, mass ≤ 1 and not provably 1.
+    assert!(rejects(
+        "n = Normal(mu = 0.0, sigma = 1.0)\nt = truncate(n, interval(0.0, 1.0))\nz = lawof(t)",
+        "requires a `%normalized` measure"
+    ));
+    // %locallyfinite — infinite total mass.
+    assert!(rejects(
+        "z = lawof(Lebesgue(reals))",
+        "total mass is `%locallyfinite`"
+    ));
+    // The message names the escape hatch §04 names.
+    assert!(rejects(
+        "n = Normal(mu = 0.0, sigma = 1.0)\nt = truncate(n, interval(0.0, 1.0))\nz = lawof(t)",
+        "normalize(...)"
+    ));
+}
+
+/// THE conservative case, adversarially endorsed: a `%finite` `superpose` whose
+/// weights happen to sum to one is REJECTED. The rule quantifies over the mass
+/// CLASS, not over the arithmetic — a checker that discharged `0.5 + 0.5 = 1`
+/// would accept this and reject an equivalent model whose weights were less
+/// foldable, which is worse than rejecting both.
+#[test]
+fn lawof_rejects_a_finite_superpose_even_when_the_weights_sum_to_one() {
+    let src = "\
+n = Normal(mu = 0.0, sigma = 1.0)
+sp = superpose(weighted(0.5, n), weighted(0.5, n))
+z = lawof(sp)";
+    assert!(rejects(src, "total mass is `%finite`"));
+    // `normalize` is the stated escape and must clear it.
+    let fixed = "\
+n = Normal(mu = 0.0, sigma = 1.0)
+sp = superpose(weighted(0.5, n), weighted(0.5, n))
+z = lawof(normalize(sp))";
+    assert!(diags_of(fixed).is_empty(), "{:?}", diags_of(fixed));
+}
+
+/// The gate must not fire where §04 says `lawof` is fine: a `%normalized`
+/// measure, a VALUE (the overwhelmingly common spelling), and a record of values.
+#[test]
+fn lawof_accepts_normalized_measures_and_values() {
+    for src in [
+        "z = lawof(Normal(mu = 0.0, sigma = 1.0))",
+        "y ~ Normal(mu = 0.0, sigma = 1.0)\nz = lawof(y)",
+        "y ~ Normal(mu = 0.0, sigma = 1.0)\nz = lawof(record(y = y))",
+        "n = Normal(mu = 0.0, sigma = 1.0)\nz = lawof(normalize(truncate(n, interval(0.0, 1.0))))",
+    ] {
+        assert!(
+            diags_of(src).is_empty(),
+            "{src} must infer clean: {:?}",
+            diags_of(src)
+        );
+    }
+}
+
+/// §04: `kernelof` "reifies (typically stochastic) value nodes"; "`x` must not be
+/// a measure". Both measure-layer argument shapes are rejected, and the
+/// diagnostics differ so a user with a kernel is not told they have a measure.
+#[test]
+fn kernelof_rejects_a_measure_layer_argument() {
+    let measure = "mu = elementof(reals)\nz = kernelof(Normal(mu = mu, sigma = 1.0), mu = mu)";
+    assert!(rejects(measure, "this argument is a measure"));
+    assert!(
+        rejects(measure, "functionof"),
+        "point at the construct §04 names"
+    );
+
+    let kernel = "\
+mu = elementof(reals)
+y ~ Normal(mu = mu, sigma = 1.0)
+k = kernelof(record(y = y), mu = mu)
+z = kernelof(k, mu = mu)";
+    assert!(rejects(kernel, "this argument is a kernel"));
+}
+
+/// `kernelof` of a VALUE stays legal, and so does `functionof` of a measure —
+/// §04 (#73) makes `functionof` the construct that reifies a measure node to a
+/// kernel directly, which is what the rejection message points at.
+#[test]
+fn kernelof_of_a_value_and_functionof_of_a_measure_stay_legal() {
+    for src in [
+        "mu = elementof(reals)\ny ~ Normal(mu = mu, sigma = 1.0)\nz = kernelof(record(y = y), mu = mu)",
+        "a = draw(Normal(mu = 0.0, sigma = 1.0))\nz = kernelof(a)",
+        "mu = elementof(reals)\nz = functionof(Normal(mu = mu, sigma = 1.0), mu = mu)",
+    ] {
+        assert!(
+            diags_of(src).is_empty(),
+            "{src} must infer clean: {:?}",
+            diags_of(src)
+        );
+    }
+}
+
+/// Both gates read the inferred TYPE, so an alias hop cannot defeat them — unlike
+/// the determiniser's structural `resolve_ref_one` walks, whose one-hop defeat is
+/// a known adjacent defect. A ref's type IS its target's type, at any depth.
+#[test]
+fn both_gates_survive_alias_hops() {
+    assert!(rejects(
+        "n = Normal(mu = 0.0, sigma = 1.0)\nt = truncate(n, interval(0.0, 1.0))\nt2 = t\nt3 = t2\nz = lawof(t3)",
+        "requires a `%normalized` measure"
+    ));
+    // Three hops on the kernelof side too — the same depth the lawof case pins, so
+    // neither gate is left resting on a single-hop claim.
+    assert!(rejects(
+        "mu = elementof(reals)\nn = Normal(mu = mu, sigma = 1.0)\nn2 = n\nz = kernelof(n2, mu = mu)",
+        "this argument is a measure"
+    ));
+    assert!(rejects(
+        "mu = elementof(reals)\nn = Normal(mu = mu, sigma = 1.0)\nn2 = n\nn3 = n2\nz = kernelof(n3, mu = mu)",
+        "this argument is a measure"
+    ));
+    // And for the KERNEL body, which reaches the gate by a different arm.
+    assert!(rejects(
+        "\
+mu = elementof(reals)
+y ~ Normal(mu = mu, sigma = 1.0)
+k = kernelof(record(y = y), mu = mu)
+k2 = k
+k3 = k2
+z = kernelof(k3, mu = mu)",
+        "this argument is a kernel"
+    ));
+}

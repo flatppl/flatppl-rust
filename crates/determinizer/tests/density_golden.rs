@@ -2203,26 +2203,13 @@ F = Normal(mu = a, sigma = 1.0)
 lp = logdensityof(lawof(F), 0.5)
 lp_a = logdensityof(lawof(record(a = a)), record(a = 0.1))",
         ),
-        // OUT-OF-SPEC, pinned defensively — NOT derived from §04. §04 "Kernels and
-        // `kernelof`" says "`x` must not be a measure", so `kernelof(Normal(…))` is
-        // ill-formed; nothing in the front end rejects it (it infers with no
-        // diagnostic). The unwrap treats `kernelof` like `functionof` because the
-        // pre-existing `kernel::resolve_reified` does, and this pins that the
-        // ill-formed spelling at least cannot diverge from the well-formed one it
-        // resembles. A spec-legal `kernelof` spelling is covered by
+        // The `kernelof(Normal(…))` row that used to sit here is GONE: §04 says
+        // `kernelof`'s "`x` must not be a measure", and `infer` now rejects it, so the
+        // spelling can no longer reach the determiniser to be compared against
+        // anything. Its replacement is the rejection test
+        // `kernelof_of_a_measure_is_a_static_error` below. A spec-legal `kernelof`
+        // spelling stays covered by
         // `kernelof_of_a_value_lowers_identically_to_lawof_of_that_value`.
-        (
-            "\
-a = draw(Normal(mu = 0.0, sigma = 1.0))
-K = kernelof(Normal(mu = a, sigma = 1.0))
-lp = logdensityof(lawof(K), 0.5)
-lp_a = logdensityof(lawof(record(a = a)), record(a = 0.1))",
-            "\
-a = draw(Normal(mu = 0.0, sigma = 1.0))
-K = Normal(mu = a, sigma = 1.0)
-lp = logdensityof(lawof(K), 0.5)
-lp_a = logdensityof(lawof(record(a = a)), record(a = 0.1))",
-        ),
     ] {
         let pir_reified = flatppl_flatpir::write(&determinize_src(reified));
         let pir_plain = flatppl_flatpir::write(&determinize_src(plain));
@@ -2247,10 +2234,14 @@ a = draw(Normal(mu = 0.0, sigma = 1.0))
 s = elementof(posreals)
 F = functionof(Normal(mu = a, sigma = s))
 lp = logdensityof(lawof(F), 0.5)",
+        // `kernelof` takes a VALUE (§04), so the parameterised kernel spelling wraps the
+        // measure in a `draw` — §04's identity law makes that equivalent to the kernel.
+        // The pre-gate spelling `kernelof(Normal(…))` is now a static error and would
+        // make this a determiniser assertion about an ill-formed module.
         "\
 a = draw(Normal(mu = 0.0, sigma = 1.0))
 s = elementof(posreals)
-K = kernelof(Normal(mu = a, sigma = s))
+K = kernelof(draw(Normal(mu = a, sigma = s)))
 lp = logdensityof(lawof(K), 0.5)",
     ] {
         let mut m = flatppl_syntax::parse(src).unwrap();
@@ -2503,40 +2494,87 @@ lp = logdensityof(lawof(b), 0.5)"
     }
 }
 
-// OUT-OF-SPEC, pinned defensively — NOT derived from §04, and the sibling of the
-// `kernelof(Normal(…))` row in `lawof_of_a_closed_reification_lowers_identically_to_its_body`.
-// §04 "Kernels and `kernelof`" says "`x` must not be a measure", and a closed `kernelof(a)`
-// IS a measure by §06 "Uniform kernel extension" ("identify measures with nullary
-// kernels"), so the OUTER `kernelof` here is ill-formed. Nothing rejects it: it infers with
-// no diagnostic, and the unwrap runs to a fixpoint through both layers.
-//
-// It refused at `b79517a` only as a side effect of the wrapper-typed guard entry this wave
-// corrected — never for its §04 violation, and never with a message naming one. It now
-// lowers to the same term as the well-formed single-layer spelling, so the pin records a
-// defensible value for an ill-formed module rather than blessing the spelling.
-//
-// TODO: reject `kernelof(<measure>)` in `infer` (`crates/infer/src/ops.rs`), which covers
-// this row and the `kernelof(Normal(…))` one together — they are the same §04 clause. Left
-// out of this wave: it flips both pinned goldens to static errors, and `crates/infer` is
-// being changed on an unmerged branch.
+// §04's `kernelof` clause on a MEASURE argument — the sibling of
+// `nested_kernelof_is_a_static_error` and the same clause. This replaces the
+// `kernelof(Normal(…))` row removed from
+// `lawof_of_a_closed_reification_lowers_identically_to_its_body`, which used to pin that
+// the ill-formed spelling at least agreed with the well-formed one it resembles. The
+// diagnostic points at `functionof`, which §04 (per flatppl-design#73) names as the
+// construct that DOES reify a measure node to a kernel directly.
 #[test]
-fn lawof_of_a_nested_kernelof_lowers_to_the_single_layer_term_though_out_of_spec() {
-    let nested = flatppl_flatpir::write(&determinize_src(
+fn kernelof_of_a_measure_is_a_static_error() {
+    let mut m = flatppl_syntax::parse(
+        "\
+a = draw(Normal(mu = 0.0, sigma = 1.0))
+K = kernelof(Normal(mu = a, sigma = 1.0))
+lp = logdensityof(lawof(K), 0.5)",
+    )
+    .unwrap();
+    let diags = flatppl_infer::infer(&mut m);
+    assert!(
+        diags.iter().any(|d| {
+            let m = format!("{d:?}");
+            m.contains("kernelof` reifies value nodes")
+                && m.contains("is a measure")
+                && m.contains("functionof")
+        }),
+        "kernelof of a measure must be a static error naming §04 and functionof: {diags:?}"
+    );
+    // `functionof` of the same measure stays legal — it is the construct §04 points to.
+    let mut ok = flatppl_syntax::parse(
+        "\
+a = draw(Normal(mu = 0.0, sigma = 1.0))
+F = functionof(Normal(mu = a, sigma = 1.0))
+lp = logdensityof(lawof(F), 0.5)",
+    )
+    .unwrap();
+    let ok_diags = flatppl_infer::infer(&mut ok);
+    assert!(
+        ok_diags.is_empty(),
+        "functionof of a measure must stay legal: {ok_diags:?}"
+    );
+}
+
+// §04's `kernelof` clause, now ENFORCED in `infer` — this test was the placeholder for the
+// flip and its predecessor's TODO named exactly this change. §04 "Kernels and `kernelof`"
+// says `kernelof` "reifies (typically stochastic) value nodes" and "`x` must not be a
+// measure"; a closed `kernelof(a)` IS a measure by §06 "Uniform kernel extension"
+// ("identify measures with nullary kernels"), so the OUTER `kernelof` here is ill-formed.
+//
+// It used to infer with NO diagnostic and lower to the same term as the single-layer
+// spelling — the previous wave pinned that equality defensively, to record a defensible
+// value for an ill-formed module rather than to bless the spelling. `infer` now rejects it,
+// so the pin becomes a rejection test and the equality it asserted is moot.
+#[test]
+fn nested_kernelof_is_a_static_error() {
+    let mut m = flatppl_syntax::parse(
         "\
 a = draw(Normal(mu = 0.0, sigma = 1.0))
 M = kernelof(kernelof(a))
 lp = logdensityof(lawof(M), 0.5)",
-    ));
-    let single = flatppl_flatpir::write(&determinize_src(
+    )
+    .unwrap();
+    let diags = flatppl_infer::infer(&mut m);
+    assert!(
+        diags.iter().any(|d| {
+            let m = format!("{d:?}");
+            m.contains("kernelof` reifies value nodes") && m.contains("is a kernel")
+        }),
+        "the outer kernelof must be a static error naming §04: {diags:?}"
+    );
+    // The well-formed single-layer spelling stays clean — the gate rejects the extra
+    // layer, not `kernelof` of a value.
+    let mut ok = flatppl_syntax::parse(
         "\
 a = draw(Normal(mu = 0.0, sigma = 1.0))
 M = kernelof(a)
 lp = logdensityof(lawof(M), 0.5)",
-    ));
-    assert_eq!(
-        nested, single,
-        "an ill-formed extra `kernelof` layer must not change the value it lowers to:\n\
-         nested:\n{nested}\nsingle:\n{single}"
+    )
+    .unwrap();
+    let ok_diags = flatppl_infer::infer(&mut ok);
+    assert!(
+        ok_diags.is_empty(),
+        "kernelof of a value must stay legal: {ok_diags:?}"
     );
 }
 
