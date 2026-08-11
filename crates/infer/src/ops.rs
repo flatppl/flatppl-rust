@@ -157,6 +157,13 @@ pub(crate) fn call_rule(
             shape: Box::new([Dim::Dynamic]),
             elem: Box::new(Type::Scalar(ScalarType::Integer)),
         },
+        // §07 "Table reductions": applied to a TABLE these reduce column-wise to a
+        // record. Guarded so every non-table argument keeps the arm it had —
+        // `sum`/`mean` the array rule just below, `var`/`std` their catalogue row
+        // (`result: Scalar(Real)`) via the `_` arm. See [`table_reduction_type`].
+        "sum" | "mean" | "var" | "std" if matches!(arg_ty(args, 0), Some(Type::Table { .. })) => {
+            table_reduction_type(&name, arg_ty(args, 0))
+        }
         // `sum` / `prod` / `mean` reduce a real/complex array to its element
         // type (spec §07 Reductions): mean of a complex array is complex.
         // (NOT a constant Scalar(Real); legacy ops.rs returned Real always.)
@@ -1042,6 +1049,77 @@ fn reduce_type(a: Option<&Type>) -> Type {
         Some(Type::Any) => Type::Any,
         _ => Type::Deferred,
     }
+}
+
+/// The result of a §07 **Table reductions** call: "When `sum`, `mean`, or `var` is
+/// applied to a table, the reduction operates column-wise and returns a record
+/// whose fields are the column names and values are the per-column reductions."
+/// So the result is a `Record` with one field per column, named for the column.
+///
+/// `std` is in the set too, by the owner ruling of 2026-08-10 which adds it to that
+/// paragraph (flatppl-design `4c93237`). **That commit is NOT on design `main`** — it
+/// sits on the `mul-divide-rows` branch — so `std`'s membership rests on unmerged
+/// spec, exactly as its splat exemption does. `prod` is deliberately absent: the
+/// paragraph does not name it, so `prod` over a table stays `%deferred`.
+///
+/// The per-column value is whatever that reduction gives for an array of the
+/// column's element type, so the two forms agree by construction rather than by a
+/// second set of rules:
+///
+/// - `sum`/`mean` — the column's own element type, mirroring [`reduce_type`]'s array
+///   arm (so a complex column sums to complex).
+/// - `var`/`std` — `Scalar(Real)`, mirroring their catalogue row's declared
+///   `result: Scalar(Real)` / `result_set: NonNegReals`, which is what they give for
+///   an array of any element type.
+///
+/// A column whose per-row type is NOT a scalar (a vector-valued column) leaves the
+/// whole call `%deferred`. §07 says only "Every column must support the reduction
+/// operation" and does not say what reducing a column of vectors yields, so this
+/// declines to invent one — `%deferred` is the honest no-rule-yet answer, and it is
+/// what the call typed before this rule existed.
+/// The value-set companion of [`table_reduction_type`]: a `cartprod(col = …)` record
+/// set whose fields match the result record's, so the type and the set describe the
+/// same value. Per-field set is the natural extent of that field's type, except
+/// `var`/`std`, which keep the `nonnegreals` their catalogue row declares — a
+/// variance is non-negative per column exactly as it is for an array.
+///
+/// `Unknown` whenever [`table_reduction_type`] declines to produce a record, so the
+/// two never disagree about whether a record is being described.
+fn table_reduction_valueset(head: &str, a: Option<&Type>) -> ValueSet {
+    let Type::Record(fields) = table_reduction_type(head, a) else {
+        return ValueSet::Unknown;
+    };
+    ValueSet::RecordSet(
+        fields
+            .iter()
+            .map(|(name, ty)| {
+                let set = match head {
+                    "var" | "std" => ValueSet::NonNegReals,
+                    _ => ValueSet::natural_of(ty),
+                };
+                (*name, set)
+            })
+            .collect(),
+    )
+}
+
+fn table_reduction_type(head: &str, a: Option<&Type>) -> Type {
+    let Some(Type::Table { columns, .. }) = a else {
+        return Type::Deferred;
+    };
+    if !columns.iter().all(|(_, t)| matches!(t, Type::Scalar(_))) {
+        return Type::Deferred;
+    }
+    let per_column = |col: &Type| match head {
+        "var" | "std" => Type::Scalar(ScalarType::Real),
+        _ => col.clone(),
+    };
+    Type::Record(
+        columns
+            .iter()
+            .map(|(name, col)| (*name, per_column(col)))
+            .collect(),
+    )
 }
 
 /// `get` with static selectors: integer indices consume array axes / pick
@@ -3543,6 +3621,18 @@ pub(crate) fn call_valueset(
         "checked" | "fixed" => args
             .first()
             .map_or(ValueSet::Unknown, |(n, _, _)| inf.lookup_valueset(*n)),
+        // §07 "Table reductions" give a RECORD, so the value-set must be the
+        // matching `cartprod(col = …)` and not the scalar set the callee's
+        // catalogue row declares. Without this arm `var(<table>)` carries
+        // `nonnegreals` — a scalar set on a record-typed value, which is incoherent
+        // and would mislead anything reading the set rather than the type.
+        // `sum`/`mean` are `Structural` rows with no `result_set`, so they already
+        // fall through to the type's natural extent and land on a record set; this
+        // arm makes `var`/`std` agree instead of short-circuiting on their row.
+        // Mirrors [`table_reduction_type`] arm for arm.
+        "sum" | "mean" | "var" | "std" if matches!(arg_ty(args, 0), Some(Type::Table { .. })) => {
+            table_reduction_valueset(&name, arg_ty(args, 0))
+        }
         // Catalogue functions carry their result value-set (`result_set` tag);
         // distribution constructors carry the support column of spec §08. A
         // bare name is one or the other — try the function row first, then fall
