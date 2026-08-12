@@ -487,12 +487,7 @@ pub(crate) fn call_rule(
         // `support` set is given as the named kwarg, auto-splatted from a
         // positional `record(support = S)` (§04), or as the plain positional set.
         "Lebesgue" | "Counting" => {
-            let support_node = named
-                .iter()
-                .find(|(n, _, _, _)| inf.module.resolve(*n) == "support")
-                .map(|(_, node, _, _)| *node)
-                .or_else(|| splat_field(inf, args, named, "support"))
-                .or_else(|| args.first().map(|a| a.0));
+            let support_node = lebesgue_counting_support_node(inf, args, named);
             Type::Measure {
                 domain: Box::new(set_element_type(inf, support_node)),
                 mass: Mass::Deferred,
@@ -3938,6 +3933,25 @@ fn splat_field(
         .map(|na| na.value)
 }
 
+/// The `support` argument NODE of a `Lebesgue`/`Counting` call (spec §06
+/// "Fundamental measures" table: parameter name `support`, e.g. `Lebesgue(reals)`
+/// or `Counting(integers)` — §11 mass-class worked example). Resolves the named
+/// kwarg, an auto-splatted positional `record(support = S)` (§04), or the plain
+/// positional set, in that order — every caller of this rule (the type-domain
+/// arm and the `%mass` arm) must accept all three spellings alike.
+fn lebesgue_counting_support_node(
+    inf: &Inferencer<'_, '_>,
+    args: &[ArgInfo],
+    named: &[NamedInfo],
+) -> Option<NodeId> {
+    named
+        .iter()
+        .find(|(n, _, _, _)| inf.module.resolve(*n) == "support")
+        .map(|(_, node, _, _)| *node)
+        .or_else(|| splat_field(inf, args, named, "support"))
+        .or_else(|| args.first().map(|a| a.0))
+}
+
 /// A dummy `SupportTag::Structural` check helper so `distribution_support` can
 /// peek at the raw tag without re-looking up the catalogue entry.
 #[inline]
@@ -4675,7 +4689,8 @@ pub(crate) fn fill_mass(
         // Reference measures: finite on a bounded support, infinite (but
         // boundedly finite) on an unbounded one.
         "Lebesgue" | "Counting" => {
-            match set_expr_valueset(inf, args.first().map(|a| a.0)).is_bounded() {
+            let support_node = lebesgue_counting_support_node(inf, args, named);
+            match set_expr_valueset(inf, support_node).is_bounded() {
                 Some(true) => Mass::Finite,
                 Some(false) => Mass::LocallyFinite,
                 None => Mass::Unknown,
@@ -4689,13 +4704,18 @@ pub(crate) fn fill_mass(
             _ => Mass::Unknown,
         },
         "joint" => {
-            let masses: Vec<Mass> = named
-                .iter()
-                .map(|(_, _, t, _)| match t {
-                    Type::Measure { mass, .. } => *mass,
-                    _ => Mass::Unknown,
-                })
-                .collect();
+            // Keyword and positional `joint` are mutually exclusive forms
+            // (`joint_type` above): mirror that split so both spellings of
+            // the same joint fold their components' masses identically.
+            let component_mass = |t: &Type| match t {
+                Type::Measure { mass, .. } => *mass,
+                _ => Mass::Unknown,
+            };
+            let masses: Vec<Mass> = if !named.is_empty() {
+                named.iter().map(|(_, _, t, _)| component_mass(t)).collect()
+            } else {
+                args.iter().map(|(_, t, _)| component_mass(t)).collect()
+            };
             product_mass(&masses)
         }
         // `restrict` shares truncate's support-restriction mass behaviour: the

@@ -599,6 +599,117 @@ fn joint_mass_products() {
     );
 }
 
+/// The positional and keyword spellings of `joint` are the same construct
+/// (spec §06): they must fold their components' masses via the same product
+/// rule. Bug: the positional arm fed `product_mass` an empty mass list (it
+/// read `named` only), so `masses.iter().all(…)` was vacuously true and every
+/// positional joint came out `%normalized` regardless of its components.
+#[test]
+fn positional_joint_mass_matches_keyword_joint_mass() {
+    let src = "p_norm = joint(Lebesgue(reals), Lebesgue(reals))\n\
+               k_norm = joint(a = Lebesgue(reals), b = Lebesgue(reals))\n\
+               p_mixed = joint(Normal(0.0, 1.0), Lebesgue(reals))\n\
+               k_mixed = joint(a = Normal(0.0, 1.0), b = Lebesgue(reals))";
+    let (module, diags) = infer_src(src);
+    let errors: Vec<_> = diags
+        .iter()
+        .filter(|d| d.severity == Severity::Error)
+        .collect();
+    assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+    let out = flatppl_flatpir::write(&module);
+
+    let mass_of = |binding: &str| -> String {
+        let bind = out
+            .find(&format!("(%bind {binding} "))
+            .unwrap_or_else(|| panic!("binding {binding} not found in:\n{out}"));
+        out[bind..(bind + 200).min(out.len())].to_string()
+    };
+
+    // Two Lebesgue(reals) components: locally-finite, both spellings, NOT
+    // normalized (the vacuous-product bug's symptom).
+    assert!(
+        mass_of("p_norm").contains("%locallyfinite"),
+        "positional all-Lebesgue joint must be %locallyfinite, got:\n{out}"
+    );
+    assert!(
+        mass_of("k_norm").contains("%locallyfinite"),
+        "keyword all-Lebesgue joint must be %locallyfinite, got:\n{out}"
+    );
+
+    // Normal (normalized) x Lebesgue (locally-finite) component: locally
+    // finite either way, and both spellings must agree.
+    assert!(
+        mass_of("p_mixed").contains("%locallyfinite"),
+        "positional mixed joint must be %locallyfinite, got:\n{out}"
+    );
+    assert!(
+        mass_of("k_mixed").contains("%locallyfinite"),
+        "keyword mixed joint must be %locallyfinite, got:\n{out}"
+    );
+}
+
+/// `Lebesgue`/`Counting` accept their `support` set either positionally or by
+/// the documented `support =` keyword (spec §06 "Fundamental measures" table:
+/// parameter name `support`; §11's worked mass-class example uses the
+/// positional spelling `Lebesgue(reals)` / `Counting(integers)` for the same
+/// measures). Bug: the `%mass` rule read `args.first()` only, so the keyword
+/// spelling always degraded to `%unknown`.
+#[test]
+fn lebesgue_counting_keyword_support_mass_matches_positional() {
+    let src = "p_reals = Lebesgue(reals)\n\
+               k_reals = Lebesgue(support = reals)\n\
+               p_unit = Lebesgue(interval(0.0, 1.0))\n\
+               k_unit = Lebesgue(support = interval(0.0, 1.0))\n\
+               k_counting = Counting(support = integers)";
+    let (module, diags) = infer_src(src);
+    let errors: Vec<_> = diags
+        .iter()
+        .filter(|d| d.severity == Severity::Error)
+        .collect();
+    assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+    let out = flatppl_flatpir::write(&module);
+
+    let mass_of = |out: &str, binding: &str| -> String {
+        let bind = out
+            .find(&format!("(%bind {binding} "))
+            .unwrap_or_else(|| panic!("binding {binding} not found in:\n{out}"));
+        out[bind..(bind + 200).min(out.len())].to_string()
+    };
+
+    assert!(
+        mass_of(&out, "p_reals").contains("%locallyfinite"),
+        "Lebesgue(reals) must be %locallyfinite, got:\n{out}"
+    );
+    assert!(
+        mass_of(&out, "k_reals").contains("%locallyfinite"),
+        "Lebesgue(support = reals) must match the positional spelling (%locallyfinite), got:\n{out}"
+    );
+    assert!(
+        !mass_of(&out, "k_reals").contains("%unknown"),
+        "Lebesgue(support = reals) must not degrade to %unknown, got:\n{out}"
+    );
+
+    assert!(
+        mass_of(&out, "p_unit").contains("%finite")
+            && !mass_of(&out, "p_unit").contains("%locallyfinite"),
+        "Lebesgue(interval(0.0, 1.0)) must be %finite, got:\n{out}"
+    );
+    assert!(
+        mass_of(&out, "k_unit").contains("%finite")
+            && !mass_of(&out, "k_unit").contains("%locallyfinite"),
+        "Lebesgue(support = interval(0.0, 1.0)) must match the positional spelling (%finite), got:\n{out}"
+    );
+
+    assert!(
+        mass_of(&out, "k_counting").contains("%locallyfinite"),
+        "Counting(support = integers) must be %locallyfinite, got:\n{out}"
+    );
+    assert!(
+        !mass_of(&out, "k_counting").contains("%unknown"),
+        "Counting(support = integers) must not degrade to %unknown, got:\n{out}"
+    );
+}
+
 /// Uniform's support is the set expression passed as its argument (spec §08
 /// "Domain/Support: ambient value space of `support` / `support`").  It is
 /// structural — resolved by `distribution_support` at inference time via
