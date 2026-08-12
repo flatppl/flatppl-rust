@@ -284,6 +284,20 @@ fn spot_checked_names_match_the_spec_arguments_column() {
         ("diag", &["A", "k"][..]),
         ("onehot", &["i", "n"][..]),
         ("sum", &["xs"][..]),
+        // The six "Measure kernel evaluation primitives" (§07): fixed by PR #154 (rust#154);
+        // audited whole here and confirmed each already matches §07's Arguments column verbatim.
+        ("builtin_logdensityof", &["kernel", "kernel_input", "x"][..]),
+        ("builtin_touniform", &["kernel", "kernel_input", "x"][..]),
+        ("builtin_fromuniform", &["kernel", "kernel_input", "u"][..]),
+        ("builtin_tonormal", &["kernel", "kernel_input", "x"][..]),
+        ("builtin_fromnormal", &["kernel", "kernel_input", "z"][..]),
+        // `builtin_sample(rngstate, kernel, kernel_input, n, m, ...)` — only the three
+        // distinguished inputs are named; the trailing sample-shape ints are an unbounded
+        // variadic tail, so naming a prefix of it would refuse a legitimate further argument.
+        (
+            "builtin_sample",
+            &["rngstate", "kernel", "kernel_input"][..],
+        ),
     ] {
         let got = cat
             .base_param_names(n)
