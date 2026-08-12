@@ -127,3 +127,69 @@ fn cartpow_one_arg_fails_type_and_valueset_consistently() {
         ok.valueset_of(rhs_ok)
     );
 }
+
+/// `Lebesgue`/`Counting` accept their `support` set either positionally or by
+/// the documented `support =` keyword (spec §06 "Fundamental measures" table:
+/// parameter name `support`). Sibling of the `%mass` fix in PR #159 —
+/// `call_valueset`'s Lebesgue/Counting arm read `args.first()` only, so the
+/// keyword spelling's nested `.valueset()` query degraded to `%unknown` while
+/// the positional spelling resolved fine.
+#[test]
+fn lebesgue_counting_keyword_support_valueset_matches_positional() {
+    let src = "p_reals = Lebesgue(reals)\n\
+               k_reals = Lebesgue(support = reals)\n\
+               p_unit = Lebesgue(interval(0.0, 1.0))\n\
+               k_unit = Lebesgue(support = interval(0.0, 1.0))\n\
+               p_counting = Counting(integers)\n\
+               k_counting = Counting(support = integers)";
+    let mut m = flatppl_syntax::parse(src).unwrap();
+    let _ = infer(&mut m);
+
+    let vset = |m: &flatppl_core::Module, name: &str| -> ValueSet {
+        let rhs = m
+            .bindings()
+            .find(|(_, b)| m.resolve(b.name) == name)
+            .unwrap_or_else(|| panic!("binding {name} not found"))
+            .1
+            .rhs;
+        m.valueset_of(rhs)
+            .cloned()
+            .unwrap_or_else(|| panic!("binding {name} has no value-set"))
+    };
+
+    let p_reals = vset(&m, "p_reals");
+    let k_reals = vset(&m, "k_reals");
+    assert_ne!(
+        k_reals,
+        ValueSet::Unknown,
+        "Lebesgue(support = reals) must not degrade to %unknown"
+    );
+    assert_eq!(
+        k_reals, p_reals,
+        "Lebesgue(support = reals) must match the positional spelling's value-set"
+    );
+
+    let p_unit = vset(&m, "p_unit");
+    let k_unit = vset(&m, "k_unit");
+    assert_ne!(
+        k_unit,
+        ValueSet::Unknown,
+        "Lebesgue(support = interval(0.0, 1.0)) must not degrade to %unknown"
+    );
+    assert_eq!(
+        k_unit, p_unit,
+        "Lebesgue(support = interval(0.0, 1.0)) must match the positional spelling's value-set"
+    );
+
+    let p_counting = vset(&m, "p_counting");
+    let k_counting = vset(&m, "k_counting");
+    assert_ne!(
+        k_counting,
+        ValueSet::Unknown,
+        "Counting(support = integers) must not degrade to %unknown"
+    );
+    assert_eq!(
+        k_counting, p_counting,
+        "Counting(support = integers) must match the positional spelling's value-set"
+    );
+}

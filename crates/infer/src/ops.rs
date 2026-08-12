@@ -4094,7 +4094,11 @@ pub(crate) fn call_valueset(
             set_expr_valueset(inf, vs)
         }
         // Measure supports (the measure node's value set IS its support).
-        "Lebesgue" | "Counting" => set_expr_valueset(inf, args.first().map(|a| a.0)),
+        // `support` resolves positionally or by keyword, matching `fill_mass`'s
+        // Lebesgue/Counting arm — both read the same argument.
+        "Lebesgue" | "Counting" => {
+            set_expr_valueset(inf, lebesgue_counting_support_node(inf, args, named))
+        }
         "lawof" => args
             .first()
             .map_or(ValueSet::Unknown, |(n, _, _)| inf.lookup_valueset(*n)),
