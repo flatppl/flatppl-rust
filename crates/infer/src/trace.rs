@@ -50,10 +50,52 @@ pub(crate) struct Inferencer<'m, 's> {
     /// call args — the bare ref node itself types as `Type::Any` (matching a
     /// bare base name). Populated in the `RefNs::Module` arm.
     module_catalogue_refs: HashMap<NodeId, crate::modules::CatalogueRef>,
+    /// Argument positions of a `builtin_*` primitive or a `broadcast`, where a
+    /// bare distribution-constructor atom is a kernel TAG rather than a value
+    /// reference. See [`collect_kernel_tag_nodes`].
+    kernel_tag_nodes: HashSet<NodeId>,
+}
+
+/// The exact node ids sitting in a kernel-TAG SLOT, where a bare
+/// distribution-constructor atom is a tag rather than a variable reference.
+///
+/// One node per tag-bearing call, decided by
+/// [`crate::builtins::kernel_tag_node`] — the single table of which argument of
+/// which call is the tag, shared with the determiniser's conformance scan so the
+/// two cannot disagree.
+///
+/// This exists because inference runs over determiniser OUTPUT as well as user
+/// source: the determiniser resolves `broadcast(hepphys.ContinuedPoisson, rates)`
+/// to a BARE `Const(ContinuedPoisson)` tag — both engines key the registry bare —
+/// and the driver re-runs `infer` on its own output each iteration. Without the
+/// slot, the §04 bare-name gate could not tell that tag from a user writing
+/// `add(CrystalBall, 1.0)`, which must still be rejected because §09 gives a
+/// member no unqualified spelling.
+///
+/// The slot is exact, not per-call: an earlier cut exempted every argument of any
+/// `builtin_*` / `broadcast` call and narrowed only by name, which let a §09
+/// constructor pass in the observed-value, params and rngstate slots
+/// (`builtin_logdensityof(Normal, record(…), CrystalBall)` and friends lowered at
+/// exit 0). Only the tag slot is a tag.
+fn collect_kernel_tag_nodes(m: &Module) -> HashSet<NodeId> {
+    fn walk(m: &Module, id: NodeId, out: &mut HashSet<NodeId>) {
+        if let Node::Call(c) = m.node(id) {
+            out.extend(crate::builtins::kernel_tag_node(m, c));
+        }
+        for child in m.node(id).children() {
+            walk(m, child, out);
+        }
+    }
+    let mut out = HashSet::new();
+    for (_bid, b) in m.bindings() {
+        walk(m, b.rhs, &mut out);
+    }
+    out
 }
 
 impl<'m, 's> Inferencer<'m, 's> {
     pub(crate) fn new(module: &'m mut Module, level: Level, session: &'s InferSession<'s>) -> Self {
+        let kernel_tag_nodes = collect_kernel_tag_nodes(module);
         Inferencer {
             module,
             level,
@@ -67,6 +109,7 @@ impl<'m, 's> Inferencer<'m, 's> {
             noted_gaps: HashSet::new(),
             module_callable_results: HashMap::new(),
             module_catalogue_refs: HashMap::new(),
+            kernel_tag_nodes,
         }
     }
 
@@ -83,6 +126,7 @@ impl<'m, 's> Inferencer<'m, 's> {
             .iter()
             .map(|(id, r)| (*id, (r.ty.clone(), r.phase, r.vset.clone())))
             .collect();
+        let kernel_tag_nodes = collect_kernel_tag_nodes(module);
         Inferencer {
             module,
             level,
@@ -96,6 +140,7 @@ impl<'m, 's> Inferencer<'m, 's> {
             noted_gaps: HashSet::new(),
             module_callable_results: HashMap::new(),
             module_catalogue_refs: HashMap::new(),
+            kernel_tag_nodes,
         }
     }
 
@@ -323,8 +368,34 @@ impl<'m, 's> Inferencer<'m, 's> {
             }
             Node::Const(sym) => {
                 let name = self.module.resolve(*sym).to_string();
-                self.set_vset(id, ops::const_valueset(&name));
-                (ops::const_type(&name), Phase::Fixed)
+                // A bare atom is the `base` namespace: the parser emits one for
+                // every unqualified name it did not find among the module's
+                // bindings (`syntax::parser::resolve_bare_name`). If it is not a
+                // built-in either, the name resolves nowhere and §04 "Name
+                // resolution" makes that a static error — without this arm
+                // `const_type` hands the unknown name `Type::Any`, inference
+                // absorbs it as a `%fixed` scalar, and the determiniser lowers a
+                // FREE VARIABLE into FlatPDL. The `self.`-qualified spelling of
+                // the same mistake has always errored ("unresolved reference").
+                // One exemption: a distribution constructor in kernel-TAG
+                // position. §09 members are not in the `base` namespace, but the
+                // determiniser emits one BARE as a tag and re-runs inference over
+                // its own output — see `collect_kernel_tag_nodes`.
+                let is_tag = self.kernel_tag_nodes.contains(&id)
+                    && crate::builtins::is_kernel_tag_name(&name);
+                if !is_tag && !crate::builtins::is_base_name(&name) {
+                    self.diags.push(Diagnostic::error_at(
+                        id,
+                        format!(
+                            "unresolvable name `{name}`: not a binding in this module and not a \
+                             FlatPPL built-in (spec §04 \"Name resolution\")"
+                        ),
+                    ));
+                    (Type::Failed("unresolvable name".into()), Phase::Fixed)
+                } else {
+                    self.set_vset(id, ops::const_valueset(&name));
+                    (ops::const_type(&name), Phase::Fixed)
+                }
             }
             Node::Ref(r) => match r.ns {
                 RefNs::SelfMod => match self.module.binding_by_name(r.name) {

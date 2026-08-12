@@ -42,4 +42,13 @@ pub enum NonConformKind {
     /// of arguments for its §07 signature. `flatppl-infer` has no arity rule for
     /// these, so a mis-arity primitive is typed, not `Type::Failed`.
     BuiltinArity,
+    /// A bare atom (`Node::Const`) or a builtin call head
+    /// (`CallHead::Builtin`) names nothing in the `base` namespace: a FREE
+    /// VARIABLE, or a call to a function that does not exist, in the emitted
+    /// FlatPDL — neither of which any consumer can evaluate. `flatppl-infer`
+    /// rejects both at their source (spec §04 "Name resolution"), so this is the
+    /// structural backstop for any future path that synthesises or re-admits
+    /// one — it reads the name, not the type table, so it holds even when the
+    /// node is typed rather than `Type::Failed`.
+    FreeBareName,
 }

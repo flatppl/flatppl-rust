@@ -190,3 +190,230 @@ fn flatpir_rendering_of_flatpdl_round_trips() {
         "FlatPIR rendering of FlatPDL must round-trip through the reader"
     );
 }
+
+/// A FREE VARIABLE — a bare atom naming nothing in the `base` namespace and no
+/// binding — must never reach `Ok(())`. `flatppl-infer` now rejects one at its
+/// source (spec §04 "Name resolution"), so in practice the module below never
+/// gets built; this arm is the structural backstop for a future path that
+/// synthesises or re-admits one, which is why the module is assembled BY HAND
+/// and inference is never run. With no type table, the `Type::Failed` arm cannot
+/// fire, so `FreeBareName` is the only kind that can report it.
+#[test]
+fn is_flatpdl_rejects_a_free_bare_name_without_inference() {
+    use flatppl_core::{Binding, Module, Node};
+
+    let mut m = Module::new();
+    let f1 = m.intern("f1");
+    let free = m.alloc(Node::Const(f1));
+    let name = m.intern("q");
+    m.add_binding(Binding {
+        name,
+        rhs: free,
+        doc: None,
+        public: true,
+        synthetic: false,
+    });
+
+    let v = is_flatpdl(&m).expect_err("a free bare name is non-conformant");
+    assert!(
+        v.iter()
+            .any(|n| matches!(n.kind, NonConformKind::FreeBareName)
+                && n.reason.contains("free variable `f1`")),
+        "expected a FreeBareName violation naming `f1`; got: {v:?}"
+    );
+    assert!(
+        !v.iter().any(|n| matches!(n.kind, NonConformKind::Failed)),
+        "the check must not depend on the type table; got: {v:?}"
+    );
+}
+
+/// The companion direction: a bare atom that IS a built-in (`pi`, and `sum` used
+/// as a value) is conformant, so the gate does not reject ordinary FlatPDL.
+#[test]
+fn is_flatpdl_accepts_bare_builtin_atoms() {
+    let m = infer_module("v = [1.0, 2.0]\ny = mul(pi, reduce(sum, v))\n");
+    let out = determinize(&m).expect("a deterministic model must determinize");
+    assert!(
+        is_flatpdl(&out).is_ok(),
+        "bare built-in atoms must stay conformant; got: {:?}",
+        is_flatpdl(&out)
+    );
+}
+
+/// End-to-end: the determiniser's exit gate turns the violation into a refusal
+/// rather than emitting the free variable. This is the contract the reproducer
+/// broke — `determinize` exited 0 emitting `builtin_logdensityof(Normal,
+/// record(mu = f1, sigma = 1.5), 0.7)` with nothing binding `f1`.
+#[test]
+fn determinize_refuses_a_model_with_an_unbound_component_name() {
+    let m = infer_module(
+        "z = draw(Normal(mu = 0.4, sigma = 1.0))\n\
+         q = logdensityof(joint(f1 = Normal(mu = z, sigma = 0.5), \
+         f2 = Normal(mu = f1, sigma = 1.5)), record(f1 = 0.3, f2 = 0.7))\n",
+    );
+    // Both arms fire on the same node. `visit` reads the type table first, so
+    // the `Type::Failed` backstop is `violations[0]` and names the refusal; the
+    // CLI has already printed inference's own located diagnostic by then. The
+    // structural arm is asserted separately below so a future path that stops
+    // typing the node `Failed` still leaves the contract enforced.
+    let err = determinize(&m).expect_err("an unbound component name must refuse, not lower");
+    assert_eq!(err.construct, "Failed");
+    assert_eq!(err.reason, "unresolvable name");
+
+    let v = is_flatpdl(&m).expect_err("the inferred module is non-conformant");
+    assert!(
+        v.iter()
+            .any(|n| matches!(n.kind, NonConformKind::FreeBareName)
+                && n.reason.contains("free variable `f1`")),
+        "the structural arm must also report `f1`; got: {v:?}"
+    );
+}
+
+/// The call-head shape of the same defect. A bare `name(...)` call is
+/// `CallHead::Builtin(name)`, not a `Node::Const`, so the atom arm alone missed
+/// it: `y = nromal(1.0)` determinized to `y = nromal(1.0)` at exit 0, a call to a
+/// function that does not exist. Assembled BY HAND with no inference for the same
+/// reason as the bare-atom case — with no type table only `FreeBareName` can
+/// report it.
+#[test]
+fn is_flatpdl_rejects_a_free_call_head_without_inference() {
+    use flatppl_core::{Binding, Call, CallHead, Module, Node, Scalar};
+
+    let mut m = Module::new();
+    let arg = m.alloc(Node::Lit(Scalar::Real(1.0)));
+    let head = m.intern("nromal");
+    let call = m.alloc(Node::Call(Call {
+        head: CallHead::Builtin(head),
+        args: Box::new([arg]),
+        named: Box::new([]),
+        inputs: None,
+    }));
+    let name = m.intern("y");
+    m.add_binding(Binding {
+        name,
+        rhs: call,
+        doc: None,
+        public: true,
+        synthetic: false,
+    });
+
+    let v = is_flatpdl(&m).expect_err("a free call head is non-conformant");
+    assert!(
+        v.iter()
+            .any(|n| matches!(n.kind, NonConformKind::FreeBareName)
+                && n.reason.contains("free call head `nromal`")),
+        "expected a FreeBareName violation naming `nromal`; got: {v:?}"
+    );
+    assert!(
+        !v.iter().any(|n| matches!(n.kind, NonConformKind::Failed)),
+        "the check must not depend on the type table; got: {v:?}"
+    );
+}
+
+/// Ordinary builtin call heads, a reification head (`functionof`), and a §09
+/// member behind its alias must all stay conformant — the gate rejects unknown
+/// heads, not calls in general.
+#[test]
+fn is_flatpdl_accepts_real_call_heads() {
+    let m = infer_module("v = [1.0, 2.0]\ng = functionof(add(_x_, 1.0), x = _x_)\ny = g(sum(v))\n");
+    let out = determinize(&m).expect("a deterministic model must determinize");
+    assert!(
+        is_flatpdl(&out).is_ok(),
+        "real call heads must stay conformant; got: {:?}",
+        is_flatpdl(&out)
+    );
+}
+
+/// A bare §09 member is a free variable, so the determiniser must refuse rather
+/// than lower it. Before this, `y = add(kallen, 1.0)` determinized at exit 0 to
+/// `y = kallen + 1.0` with `kallen` unbound — a wrong lowering.
+#[test]
+fn determinize_refuses_a_bare_module_member() {
+    let m = infer_module("y = add(kallen, 1.0)\n");
+    let err = determinize(&m).expect_err("a bare §09 member must refuse, not lower");
+    assert_eq!(err.construct, "Failed");
+    assert_eq!(err.reason, "unresolvable name");
+}
+
+/// The conformance exemption is a SLOT, not a name: `conformance::visit` had no
+/// position gate at all, so any §09 constructor anywhere passed. Built BY HAND with
+/// no inference so only `FreeBareName` can report it — the point is that the scan
+/// itself discriminates, independently of whether the resolver already errored.
+#[test]
+fn is_flatpdl_rejects_a_constructor_outside_the_tag_slot() {
+    use flatppl_core::{Binding, Call, CallHead, Module, Node, Scalar};
+
+    // `builtin_logdensityof(Normal, record(), CrystalBall)` — the constructor is in
+    // the observed-value slot (§07: `kernel, kernel_input, x`), not the tag slot.
+    let mut m = Module::new();
+    let normal = m.intern("Normal");
+    let tag = m.alloc(Node::Const(normal));
+    let rec_sym = m.intern("record");
+    let params = m.alloc(Node::Call(Call {
+        head: CallHead::Builtin(rec_sym),
+        args: Box::new([]),
+        named: Box::new([]),
+        inputs: None,
+    }));
+    let cb = m.intern("CrystalBall");
+    let observed = m.alloc(Node::Const(cb));
+    let ld = m.intern("builtin_logdensityof");
+    let call = m.alloc(Node::Call(Call {
+        head: CallHead::Builtin(ld),
+        args: Box::new([tag, params, observed]),
+        named: Box::new([]),
+        inputs: None,
+    }));
+    let y = m.intern("y");
+    m.add_binding(Binding {
+        name: y,
+        rhs: call,
+        doc: None,
+        public: true,
+        synthetic: false,
+    });
+
+    let v = is_flatpdl(&m).expect_err("a constructor outside the tag slot is non-conformant");
+    assert!(
+        v.iter()
+            .any(|n| matches!(n.kind, NonConformKind::FreeBareName)
+                && n.reason.contains("`CrystalBall`")),
+        "expected a FreeBareName violation naming CrystalBall; got: {v:?}"
+    );
+
+    // The accept control, same builder: move the constructor INTO the tag slot and
+    // the scan passes. `Scalar` import is used by the observed value here.
+    let mut m2 = Module::new();
+    let cb2 = m2.intern("CrystalBall");
+    let tag2 = m2.alloc(Node::Const(cb2));
+    let rec2 = m2.intern("record");
+    let params2 = m2.alloc(Node::Call(Call {
+        head: CallHead::Builtin(rec2),
+        args: Box::new([]),
+        named: Box::new([]),
+        inputs: None,
+    }));
+    let obs2 = m2.alloc(Node::Lit(Scalar::Real(0.5)));
+    let ld2 = m2.intern("builtin_logdensityof");
+    let call2 = m2.alloc(Node::Call(Call {
+        head: CallHead::Builtin(ld2),
+        args: Box::new([tag2, params2, obs2]),
+        named: Box::new([]),
+        inputs: None,
+    }));
+    let y2 = m2.intern("y");
+    m2.add_binding(Binding {
+        name: y2,
+        rhs: call2,
+        doc: None,
+        public: true,
+        synthetic: false,
+    });
+    assert!(
+        !is_flatpdl(&m2).err().is_some_and(|v| v
+            .iter()
+            .any(|n| matches!(n.kind, NonConformKind::FreeBareName))),
+        "a constructor IN the tag slot must not be flagged; got: {:?}",
+        is_flatpdl(&m2)
+    );
+}

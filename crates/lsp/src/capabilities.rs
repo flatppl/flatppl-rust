@@ -875,13 +875,17 @@ mod tests {
 
     #[test]
     fn note_maps_to_hint() {
-        // An unrecognised op (`foo(1)`) produces a `Note` (honest %deferred gap).
-        let mut m = flatppl_syntax::parse("x = foo(1)").expect("parses");
+        // A built-in with no type rule yet produces a `Note` (honest %deferred
+        // gap). It must be a REAL built-in — `PoissonProcess` is a §08
+        // distribution with no `catalogue.ron` row. An invented name (this test
+        // used `foo`) is an unresolvable name under spec §04 "Name resolution"
+        // and yields an Error, not a Note.
+        let mut m = flatppl_syntax::parse("x = PoissonProcess(1)").expect("parses");
         let diags = flatppl_infer::infer_with(&mut m, flatppl_infer::Level::Type);
         let note_diag = diags
             .iter()
             .find(|d| d.severity == flatppl_infer::Severity::Note)
-            .expect("expected at least one Note diagnostic for unknown op foo");
+            .expect("expected a Note diagnostic for the rule-less builtin PoissonProcess");
 
         let lsp_diag = LspDiag::from_infer(note_diag, &m);
         assert_eq!(
