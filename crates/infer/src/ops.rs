@@ -530,9 +530,12 @@ pub(crate) fn call_rule(
 
         // ---- explicit RNG (spec §07) ----
         "rnginit" => Type::RngState,
-        "rand" => match measure_domain(arg_ty(args, 1)) {
-            Type::Deferred => Type::Deferred,
-            domain => Type::Tuple(Box::new([domain, Type::RngState])),
+        "rand" => match rand_mass_gate(inf, args) {
+            Some(failed) => failed,
+            None => match measure_domain(arg_ty(args, 1)) {
+                Type::Deferred => Type::Deferred,
+                domain => Type::Tuple(Box::new([domain, Type::RngState])),
+            },
         },
 
         // ---- measure-kernel evaluation primitives (spec §07 sec:measure-eval-prims) ----
@@ -1483,13 +1486,17 @@ fn lawof_type(arg: Option<&Type>) -> Type {
     }
 }
 
-/// The mass class of a first argument that is a MEASURE whose normalization cannot
-/// be established, as the `%name` to quote in a diagnostic — `None` when the
-/// argument is not a measure, or is one whose mass the caller must accept.
+/// The mass class of the slice's first argument, when that argument is a MEASURE
+/// whose normalization cannot be established, as the `%name` to quote in a
+/// diagnostic — `None` when the argument is not a measure, or is one whose mass
+/// the caller must accept. Callers whose measure argument sits at a fixed offset
+/// (`rand_mass_gate`, arg 1) pass the sub-slice starting there, so "first" means
+/// "first of what was handed in", not "first of the call's own arguments".
 ///
-/// Shared by [`lawof_mass_gate`] and [`draw_mass_gate`] so the two cannot drift:
-/// both implement "reject unless proven `%normalized`, or not yet inferred", and
-/// the three narrowings that phrase encodes are argued once here.
+/// Shared by [`lawof_mass_gate`], [`draw_mass_gate`], and [`rand_mass_gate`] so
+/// the three cannot drift: all three implement "reject unless proven
+/// `%normalized`, or not yet inferred", and the three narrowings that phrase
+/// encodes are argued once here.
 ///
 /// - `%finite` IS rejected. The rule quantifies over the mass CLASS: this reads
 ///   the class the mass rules produced and does no arithmetic of its own, so a
@@ -1578,6 +1585,27 @@ fn draw_mass_gate(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> Option<Type
         ),
     ));
     Some(Type::Failed("draw from an unnormalized measure".into()))
+}
+
+/// `rand(rstate, m)`'s total-mass gate: the same rule as [`draw_mass_gate`]
+/// (§07's `rand` draws from a normalized measure exactly as `draw` does — #73's
+/// equation is agnostic to which spelling produced the draw), reused via
+/// [`unprovable_normalization`] and adapted only for `rand`'s argument order:
+/// the measure is arg 1, not arg 0 (arg 0 is the rngstate).
+fn rand_mass_gate(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> Option<Type> {
+    let measure_arg = args.get(1..)?;
+    let offending = unprovable_normalization(measure_arg)?;
+    let (arg_node, _, _) = measure_arg.first()?;
+    inf.diags.push(crate::Diagnostic::error_at(
+        *arg_node,
+        format!(
+            "`rand` requires a probability measure, but this argument's total mass is \
+             `{offending}`: there is no draw from an unnormalized measure. Wrap it in \
+             `normalize(...)` to state that intent — `rand` never normalizes its \
+             argument"
+        ),
+    ));
+    Some(Type::Failed("rand from an unnormalized measure".into()))
 }
 
 /// `lawof(m)`'s total-mass gate: a MEASURE argument must be `%normalized`.
