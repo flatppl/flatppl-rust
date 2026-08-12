@@ -688,8 +688,11 @@ fn arg_ty(args: &[ArgInfo], i: usize) -> Option<&Type> {
 ///
 /// * no keyword arguments, or the row declares no parameter names (nothing to map by);
 /// * a keyword whose name the row does not declare (the name check's business);
-/// * a keyword targeting a position a positional argument already fills (a double-bound
-///   parameter, which no rule should have to guess about);
+/// * a keyword targeting a position a positional argument already fills — a double-bound
+///   parameter. `arity_check` now calls [`check_double_bound`] before this function ever runs,
+///   so on a row with declared names the call already failed and returned there; the guard
+///   below stays as the defensive backstop for a mapping this function builds itself (two
+///   splatted fields resolving to the same declared position);
 /// * a GAP — a position neither spelling supplies — since a vector cannot carry a hole and
 ///   fabricating one would hide the under-supplied call the arity check exists to catch.
 fn normalize_keyword_args(
@@ -3350,15 +3353,11 @@ fn arity_check(
         // propagate; see `base_param_names` for which rows are nameless and why.
         let names = cat.base_param_names(name)?.to_vec();
         let section = cat.base_param_section(name);
-        return arg_name_check(
-            inf,
-            &names,
-            &format!("`{name}`"),
-            Some(section),
-            &reading,
-            args,
-            named,
-        );
+        let who = format!("`{name}`");
+        if let Some(ty) = check_double_bound(inf, &names, &who, section, args, named) {
+            return Some(ty);
+        }
+        return arg_name_check(inf, &names, &who, Some(section), &reading, args, named);
     }
     // Same section mapping as the name check below, so a row documented outside §07 —
     // `bijection`, `logdensityof` — cites §06 in BOTH its diagnostics rather than only one.
@@ -3510,6 +3509,63 @@ fn supplied_arg_names(
         .iter()
         .map(|(n, _)| (inf.module.resolve(*n).to_string(), *node))
         .collect()
+}
+
+/// Reject a call that binds one parameter twice: once by position, once by keyword.
+///
+/// §04 "Calling conventions" gives positional and keyword arguments each their own
+/// binding rule — "Positional arguments are accepted only if the callable has ordered
+/// inputs, so that the arguments can be mapped to the inputs in order" and "Arguments
+/// are bound to inputs by name" — and only mixes the two forms through "All built-in
+/// ordinary callables have a defined input order and accept both positional and
+/// keyword arguments." A defined input order is a mapping from position to ONE input
+/// each; a keyword whose declared position a positional argument already fills has no
+/// input left to bind to, so the call supplies two values for one input and none for
+/// the input the keyword's position would otherwise vacate.
+///
+/// Unenforced, `atan2(1.0, y = 2.0)` passed silently: `arity_check` counts
+/// `args.len() + named.len()` and never notices the two entries name the same input,
+/// and the name check below only verifies that a supplied name IS declared, never
+/// that it is supplied once. `normalize_keyword_args` already detects the collision
+/// (`pos < slots.len() && slots[pos].is_some()`) but only to hand the call back
+/// unnormalized — silently, since normalization failure is not itself an error path.
+/// This makes the same collision a static error instead of a mapping the normalizer
+/// quietly declines.
+///
+/// Only reachable on the mixed spelling: a splat has no separate positional prefix to
+/// collide with (`arg_reading` only splats when `named` is empty), so `args` and
+/// `named` here are the ordinary positional prefix and keyword suffix of one call.
+fn check_double_bound(
+    inf: &mut Inferencer<'_, '_>,
+    declared: &[String],
+    who: &str,
+    section: &str,
+    args: &[ArgInfo],
+    named: &[NamedInfo],
+) -> Option<Type> {
+    let offenders: Vec<(String, NodeId)> = named
+        .iter()
+        .filter_map(|(sym, node, ..)| {
+            let supplied = inf.module.resolve(*sym).to_string();
+            let pos = declared.iter().position(|d| *d == supplied)?;
+            (pos < args.len()).then_some((supplied, *node))
+        })
+        .collect();
+    if offenders.is_empty() {
+        return None;
+    }
+    for (name, at) in &offenders {
+        inf.diags.push(crate::Diagnostic::error_at(
+            *at,
+            format!(
+                "{who} parameter `{name}` is bound both positionally and by keyword \
+                 (spec {section} parameters have a defined input order — each is bound once)"
+            ),
+        ));
+    }
+    Some(Type::Failed(
+        format!("{who} parameter `{}` is bound twice", offenders[0].0).into(),
+    ))
 }
 
 /// Reject a call that binds an argument to a name the callee does not declare.

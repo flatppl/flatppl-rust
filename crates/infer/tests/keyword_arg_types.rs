@@ -156,19 +156,21 @@ fn named_variadic_rows_are_untouched() {
 /// **Normalization refuses to guess.** An ambiguous or incomplete mapping is handed back
 /// unchanged so the existing checks report it — not silently patched into a positional vector.
 ///
-/// This also PINS A PRE-EXISTING GAP this wave measured but did not fix: a **double-bound**
-/// parameter goes unreported. `atan2(1.0, y = 2.0)` supplies `y` positionally *and* by keyword,
-/// and neither existing check sees it — `arity_check` counts `args.len() + named.len()` = 2, which
-/// matches `atan2`'s arity, and the name check only verifies that each supplied name IS declared,
-/// never that it is supplied once. Verified unchanged at base `52dde93` and at this head, so the
-/// normalizer's `None` is not what hides it. Pinned as measured, so closing it shows up here as a
-/// deliberate change.
+/// The double-bound case is no longer left to the normalizer's silence: `check_double_bound`
+/// runs inside `arity_check`, ahead of `normalize_keyword_args`, and reports it directly.
+/// `atan2(1.0, y = 2.0)` supplies `y` positionally *and* by keyword — `arity_check` used to count
+/// `args.len() + named.len()` = 2, which matches `atan2`'s arity, and the name check only
+/// verified that each supplied name IS declared, never that it is supplied once, so the call
+/// passed silently. §04 gives positional and keyword binding each their own rule and only
+/// reconciles them through "a defined input order", which maps one position to one input — a
+/// keyword whose position a positional argument already fills has no input left to bind to.
 #[test]
-fn an_ambiguous_mapping_is_left_to_the_existing_checks() {
-    // Double-bound: NOT reported today, by either check. Pre-existing.
+fn a_double_bound_parameter_is_a_static_error() {
+    let errs = errors("z = atan2(1.0, y = 2.0)\n");
     assert!(
-        errors("z = atan2(1.0, y = 2.0)\n").is_empty(),
-        "pre-existing gap: a double-bound parameter is not detected — see this test's comment"
+        errs.iter()
+            .any(|e| e.contains("`atan2` parameter `y` is bound both positionally and by keyword")),
+        "a double-bound parameter must be reported: {errs:?}"
     );
     // An undeclared keyword name IS reported, by the name check.
     let unknown = errors("z = atan2(y = 1.0, zzq = 2.0)\n");
