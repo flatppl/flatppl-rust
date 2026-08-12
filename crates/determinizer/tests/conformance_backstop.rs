@@ -334,3 +334,86 @@ fn determinize_refuses_a_bare_module_member() {
     assert_eq!(err.construct, "Failed");
     assert_eq!(err.reason, "unresolvable name");
 }
+
+/// The conformance exemption is a SLOT, not a name: `conformance::visit` had no
+/// position gate at all, so any §09 constructor anywhere passed. Built BY HAND with
+/// no inference so only `FreeBareName` can report it — the point is that the scan
+/// itself discriminates, independently of whether the resolver already errored.
+#[test]
+fn is_flatpdl_rejects_a_constructor_outside_the_tag_slot() {
+    use flatppl_core::{Binding, Call, CallHead, Module, Node, Scalar};
+
+    // `builtin_logdensityof(Normal, record(), CrystalBall)` — the constructor is in
+    // the observed-value slot (§07: `kernel, kernel_input, x`), not the tag slot.
+    let mut m = Module::new();
+    let normal = m.intern("Normal");
+    let tag = m.alloc(Node::Const(normal));
+    let rec_sym = m.intern("record");
+    let params = m.alloc(Node::Call(Call {
+        head: CallHead::Builtin(rec_sym),
+        args: Box::new([]),
+        named: Box::new([]),
+        inputs: None,
+    }));
+    let cb = m.intern("CrystalBall");
+    let observed = m.alloc(Node::Const(cb));
+    let ld = m.intern("builtin_logdensityof");
+    let call = m.alloc(Node::Call(Call {
+        head: CallHead::Builtin(ld),
+        args: Box::new([tag, params, observed]),
+        named: Box::new([]),
+        inputs: None,
+    }));
+    let y = m.intern("y");
+    m.add_binding(Binding {
+        name: y,
+        rhs: call,
+        doc: None,
+        public: true,
+        synthetic: false,
+    });
+
+    let v = is_flatpdl(&m).expect_err("a constructor outside the tag slot is non-conformant");
+    assert!(
+        v.iter()
+            .any(|n| matches!(n.kind, NonConformKind::FreeBareName)
+                && n.reason.contains("`CrystalBall`")),
+        "expected a FreeBareName violation naming CrystalBall; got: {v:?}"
+    );
+
+    // The accept control, same builder: move the constructor INTO the tag slot and
+    // the scan passes. `Scalar` import is used by the observed value here.
+    let mut m2 = Module::new();
+    let cb2 = m2.intern("CrystalBall");
+    let tag2 = m2.alloc(Node::Const(cb2));
+    let rec2 = m2.intern("record");
+    let params2 = m2.alloc(Node::Call(Call {
+        head: CallHead::Builtin(rec2),
+        args: Box::new([]),
+        named: Box::new([]),
+        inputs: None,
+    }));
+    let obs2 = m2.alloc(Node::Lit(Scalar::Real(0.5)));
+    let ld2 = m2.intern("builtin_logdensityof");
+    let call2 = m2.alloc(Node::Call(Call {
+        head: CallHead::Builtin(ld2),
+        args: Box::new([tag2, params2, obs2]),
+        named: Box::new([]),
+        inputs: None,
+    }));
+    let y2 = m2.intern("y");
+    m2.add_binding(Binding {
+        name: y2,
+        rhs: call2,
+        doc: None,
+        public: true,
+        synthetic: false,
+    });
+    assert!(
+        !is_flatpdl(&m2).err().is_some_and(|v| v
+            .iter()
+            .any(|n| matches!(n.kind, NonConformKind::FreeBareName))),
+        "a constructor IN the tag slot must not be flagged; got: {:?}",
+        is_flatpdl(&m2)
+    );
+}

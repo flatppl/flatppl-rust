@@ -24,6 +24,8 @@
 //! and the five §08 distributions with no catalogue row at all — `Dirac`,
 //! `Lebesgue`, `Counting`, `PoissonProcess`, `BinnedPoissonProcess`.
 
+use flatppl_core::{Call, CallHead, Module, Node, NodeId};
+
 /// Names FlatPPL treats as built-ins (functions, distributions, constants,
 /// sets). A user binding with one of these names shadows the built-in.
 ///
@@ -331,12 +333,77 @@ pub fn is_base_name(name: &str) -> bool {
 /// every evaluator resolves it — so it is not a free name.
 ///
 /// This is NOT a resolution rule: [`is_base_name`] still rejects a bare §09
-/// constructor in source, because §09 gives it no unqualified spelling. This
-/// predicate is only for judging already-lowered FlatPDL.
+/// constructor in source, because §09 gives it no unqualified spelling. Necessary
+/// but not sufficient — a caller must ALSO check that the node is in the tag SLOT
+/// ([`kernel_tag_node`]); the name alone would exempt a constructor sitting in the
+/// observed-value or rngstate argument.
 pub fn is_kernel_tag_name(name: &str) -> bool {
     crate::catalogue::builtin()
         .distribution_param_names(name)
         .is_some()
+}
+
+/// The argument INDEX carrying the kernel tag, for a call head that carries one.
+///
+/// Spec §07 "Measure kernel evaluation primitives" fixes each signature, and the
+/// index differs between them — which is exactly why this is data and not prose.
+/// `determinizer::conformance::builtin_primitive_arity` is its arity counterpart;
+/// both would sit together but for the crate direction (`flatppl-determinizer`
+/// depends on `flatppl-infer`, not the reverse, and name resolution needs this
+/// table), so the tag table lives here and the determiniser reads it.
+pub fn kernel_tag_index(name: &str) -> Option<usize> {
+    match name {
+        // `kernel, kernel_input, x` — §07 table rows.
+        "builtin_logdensityof"
+        | "builtin_touniform"
+        | "builtin_fromuniform"
+        | "builtin_tonormal"
+        | "builtin_fromnormal" => Some(0),
+        // `rngstate, kernel, kernel_input, n, m, …` — the tag is the SECOND argument.
+        "builtin_sample" => Some(1),
+        _ => None,
+    }
+}
+
+/// The single node in `call`'s arguments that carries the kernel tag, if any.
+///
+/// The one place the tag SLOT is decided, shared by spec-§04 name resolution
+/// (`trace::collect_kernel_tag_nodes`) and the determiniser's FlatPDL conformance
+/// scan, so the two cannot disagree. Three shapes:
+///
+/// - a `builtin_*` primitive: [`kernel_tag_index`] positionally;
+/// - the same primitive spelled with keyword arguments: the parameter is always
+///   named `kernel` (§07), and `arity_check` accepts that spelling;
+/// - `broadcast` / `broadcasted` over a primitive: `broadcast(P, a₀, a₁, …)` zips
+///   `P` over cells, so broadcast argument `i + 1` is `P`'s argument `i`, putting
+///   the tag at `1 + kernel_tag_index(P)`. This is the determiniser's emitted
+///   `broadcast(builtin_logdensityof, ContinuedPoisson, broadcast(record, …), obs)`.
+///
+/// A plain `broadcast(K, args…)` whose head is NOT a primitive has no tag slot:
+/// its head is an ordinary callable, and a bare §09 constructor there is
+/// unresolvable like anywhere else. `broadcast(Poisson, rates)` is unaffected
+/// because `Poisson` is a base name.
+pub fn kernel_tag_node(m: &Module, call: &Call) -> Option<NodeId> {
+    let CallHead::Builtin(op) = call.head else {
+        return None;
+    };
+    let name = m.resolve(op);
+    if let Some(i) = kernel_tag_index(name) {
+        return call
+            .named
+            .iter()
+            .find(|na| m.resolve(na.name) == "kernel")
+            .map(|na| na.value)
+            .or_else(|| call.args.get(i).copied());
+    }
+    if name == "broadcast" || name == "broadcasted" {
+        let head = *call.args.first()?;
+        if let Node::Const(p) = m.node(head) {
+            let i = kernel_tag_index(m.resolve(*p))?;
+            return call.args.get(i + 1).copied();
+        }
+    }
+    None
 }
 
 #[cfg(test)]

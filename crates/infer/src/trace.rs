@@ -56,47 +56,31 @@ pub(crate) struct Inferencer<'m, 's> {
     kernel_tag_nodes: HashSet<NodeId>,
 }
 
-/// Node ids sitting where a bare distribution-constructor atom is a kernel TAG,
-/// not a variable reference.
+/// The exact node ids sitting in a kernel-TAG SLOT, where a bare
+/// distribution-constructor atom is a tag rather than a variable reference.
 ///
-/// Two positions, both keyed by ENCLOSING CALL rather than by argument index —
-/// the tag index varies per primitive, the same reason
-/// `determinizer::conformance` checks `Kernel`-typed nodes by enclosing call:
-///
-/// - any argument of a `builtin_*` primitive (§07 "Measure kernel evaluation
-///   primitives"), whose tag is arg 0 for `builtin_logdensityof` and the
-///   transports, arg 1 for `builtin_sample`;
-/// - any argument of `broadcast` / `broadcasted`, covering BOTH the user-level
-///   `broadcast(Poisson, rates)` head and the determiniser's emitted
-///   `broadcast(builtin_logdensityof, ContinuedPoisson, …)`.
+/// One node per tag-bearing call, decided by
+/// [`crate::builtins::kernel_tag_node`] — the single table of which argument of
+/// which call is the tag, shared with the determiniser's conformance scan so the
+/// two cannot disagree.
 ///
 /// This exists because inference runs over determiniser OUTPUT as well as user
 /// source: the determiniser resolves `broadcast(hepphys.ContinuedPoisson, rates)`
 /// to a BARE `Const(ContinuedPoisson)` tag — both engines key the registry bare —
 /// and the driver re-runs `infer` on its own output each iteration. Without the
-/// position, the §04 bare-name gate could not tell that tag from a user writing
+/// slot, the §04 bare-name gate could not tell that tag from a user writing
 /// `add(CrystalBall, 1.0)`, which must still be rejected because §09 gives a
 /// member no unqualified spelling.
 ///
-/// Breadth is harmless: the exemption fires only for a name that is already a
-/// catalogue distribution constructor, so widening the positions cannot admit an
-/// unknown name.
+/// The slot is exact, not per-call: an earlier cut exempted every argument of any
+/// `builtin_*` / `broadcast` call and narrowed only by name, which let a §09
+/// constructor pass in the observed-value, params and rngstate slots
+/// (`builtin_logdensityof(Normal, record(…), CrystalBall)` and friends lowered at
+/// exit 0). Only the tag slot is a tag.
 fn collect_kernel_tag_nodes(m: &Module) -> HashSet<NodeId> {
-    fn bears_a_tag(m: &Module, c: &flatppl_core::Call) -> bool {
-        match c.head {
-            CallHead::Builtin(op) => {
-                let name = m.resolve(op);
-                name.starts_with("builtin_") || name == "broadcast" || name == "broadcasted"
-            }
-            CallHead::User(_) => false,
-        }
-    }
     fn walk(m: &Module, id: NodeId, out: &mut HashSet<NodeId>) {
         if let Node::Call(c) = m.node(id) {
-            if bears_a_tag(m, c) {
-                out.extend(c.args.iter().copied());
-                out.extend(c.named.iter().map(|na| na.value));
-            }
+            out.extend(crate::builtins::kernel_tag_node(m, c));
         }
         for child in m.node(id).children() {
             walk(m, child, out);

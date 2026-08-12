@@ -262,3 +262,76 @@ fn an_alias_qualified_module_distribution_resolves() {
 fn rowless_base_distributions_resolve_bare() {
     assert_clean("m = Dirac(x = 1.0)\nlp = logdensityof(m, 1.0)\n");
 }
+
+// --- The kernel-tag exemption is a SLOT, not a name. -------------------------
+//
+// The determiniser emits a bare §09 constructor as a kernel tag
+// (`broadcast(builtin_logdensityof, ContinuedPoisson, …)`) and re-runs inference
+// over its own output, so a constructor in the TAG SLOT must resolve. An earlier
+// cut exempted every argument of any `builtin_*` / `broadcast` call and narrowed
+// only by name, which let a constructor pass in three slots that are not the tag.
+// `builtins::kernel_tag_node` now decides the slot from the §07 signatures.
+
+/// The observed-value argument of `builtin_logdensityof` (§07: `kernel,
+/// kernel_input, x`) is not the tag slot.
+#[test]
+fn a_constructor_in_the_observed_value_slot_is_unresolvable() {
+    assert_unresolvable(
+        "y = builtin_logdensityof(Normal, record(mu = 0.0, sigma = 1.0), CrystalBall)\n",
+        "CrystalBall",
+    );
+}
+
+/// Nor is the kernel-input (params) argument.
+#[test]
+fn a_constructor_in_the_params_slot_is_unresolvable() {
+    assert_unresolvable(
+        "y = builtin_logdensityof(Normal, CrystalBall, 0.5)\n",
+        "CrystalBall",
+    );
+}
+
+/// Nor the rngstate argument of `builtin_sample` (§07: `rngstate, kernel,
+/// kernel_input, n, m, …`), whose tag is the SECOND argument, not the first.
+#[test]
+fn a_constructor_in_the_rngstate_slot_is_unresolvable() {
+    assert_unresolvable(
+        "y = builtin_sample(CrystalBall, Normal, record(mu = 0.0, sigma = 1.0))\n",
+        "CrystalBall",
+    );
+}
+
+/// The accept control for the two positional tag slots — index 0 for
+/// `builtin_logdensityof`, index 1 for `builtin_sample`. These are the shapes the
+/// determiniser emits, so narrowing must not touch them.
+#[test]
+fn a_constructor_in_the_tag_slot_resolves() {
+    assert_clean(
+        "y = builtin_logdensityof(CrystalBall, \
+         record(m0 = 0.0, sigma = 1.0, alpha = 1.5, n = 2.0), 0.5)\n",
+    );
+    assert_clean(
+        "s = builtin_sample(rnginit(0), CrystalBall, \
+         record(m0 = 0.0, sigma = 1.0, alpha = 1.5, n = 2.0))\n",
+    );
+}
+
+/// The tag slot resolves through the keyword spelling too — §07 names the
+/// parameter `kernel`, and `arity_check` accepts keyword calls to the primitives.
+#[test]
+fn a_constructor_in_the_keyword_tag_slot_resolves() {
+    assert_clean(
+        "y = builtin_logdensityof(kernel = CrystalBall, \
+         kernel_input = record(m0 = 0.0, sigma = 1.0, alpha = 1.5, n = 2.0), x = 0.5)\n",
+    );
+}
+
+/// The exemption also requires the name to BE a constructor, so a §09 function is
+/// unresolvable even sitting in the tag slot.
+#[test]
+fn a_module_function_in_the_tag_slot_is_still_unresolvable() {
+    assert_unresolvable(
+        "y = builtin_logdensityof(kallen, record(a = 1.0), 0.5)\n",
+        "kallen",
+    );
+}

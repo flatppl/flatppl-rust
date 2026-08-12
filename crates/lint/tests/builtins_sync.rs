@@ -10,6 +10,14 @@
 //! segments — a fixed `../../../` resolves only in the primary checkout and
 //! missed the file (skipping the test) from a git worktree, whose crates sit two
 //! levels deeper.
+//!
+//! **This guard still does not run in CI, and the ancestor search does not change
+//! that.** CI checks out `flatppl-rust` (and `flatppl-js`) only, so no ancestor
+//! holds `flatppl-grammars` and the test returns early — and because it PASSES
+//! when it skips, the `eprintln` is captured and invisible. So drift between the
+//! roster and `keyword-lists.json` is caught only by a local run in a full
+//! workspace checkout. Closing that needs a cross-repo CI gate in
+//! `flatppl-grammars`; it is a follow-up there, not something this test can fix.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
