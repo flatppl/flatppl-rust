@@ -187,3 +187,56 @@ fn a_double_bound_parameter_is_a_static_error() {
         "an under-supplied call is reported on count: {gap:?}"
     );
 }
+
+/// **A parameter bound by keyword more than once, with no positional argument at all, is the
+/// same static error** — review-caught: `check_double_bound` originally only compared a
+/// keyword's position against the positional prefix's length, so `atan2(y = 1.0, y = 2.0)`
+/// (`y` supplied twice, both times by keyword) passed with no diagnostic and inferred
+/// `%deferred`. `arity_check` counted `args.len() + named.len()` = 2, matching `atan2`'s
+/// arity, and the name check only verified that `y` IS declared, never that it is supplied
+/// once — the same blind spot as the positional-vs-keyword case, just with both offending
+/// entries in `named` instead of one in each list.
+#[test]
+fn a_keyword_bound_parameter_is_a_static_error_even_with_no_positional_argument() {
+    let errs = errors("z = atan2(y = 1.0, y = 2.0)\n");
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("`atan2` parameter `y` is bound by keyword more than once")),
+        "a keyword-keyword double bind must be reported: {errs:?}"
+    );
+}
+
+/// **Triple binding.** A parameter supplied by keyword three times reports every binding past
+/// the first, not just the second — `bijection`'s three declared names (`f`, `f_inv`,
+/// `logvolume`) give an arity of exactly 3, so binding `f` three times and leaving the other
+/// two unbound still passes the arity count and reaches `check_double_bound`.
+#[test]
+fn a_triple_bound_parameter_reports_every_binding_past_the_first() {
+    let errs = errors("z = bijection(f = 1.0, f = 2.0, f = 3.0)\n");
+    let f_errs: Vec<&String> = errs
+        .iter()
+        .filter(|e| e.contains("`bijection` parameter `f` is bound by keyword more than once"))
+        .collect();
+    assert_eq!(
+        f_errs.len(),
+        2,
+        "the second AND third binding of `f` are each reported: {errs:?}"
+    );
+}
+
+/// **Clean-call control.** Every declared parameter supplied exactly once, all by keyword and
+/// in a scrambled order, must stay error-free — the double-bound checks must not fire on
+/// ordinary distinct bindings.
+#[test]
+fn distinct_keyword_bindings_raise_no_double_bound_error() {
+    for src in [
+        "z = atan2(y = 1.0, x = 2.0)\n",
+        "z = bijection(logvolume = 1.0, f = 2.0, f_inv = 3.0)\n",
+    ] {
+        let errs = errors(src);
+        assert!(
+            !errs.iter().any(|e| e.contains("is bound")),
+            "distinct bindings must raise no double-bound error: {src}\n{errs:?}"
+        );
+    }
+}
