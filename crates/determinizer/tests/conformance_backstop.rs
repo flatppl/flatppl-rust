@@ -190,3 +190,81 @@ fn flatpir_rendering_of_flatpdl_round_trips() {
         "FlatPIR rendering of FlatPDL must round-trip through the reader"
     );
 }
+
+/// A FREE VARIABLE — a bare atom naming nothing in the `base` namespace and no
+/// binding — must never reach `Ok(())`. `flatppl-infer` now rejects one at its
+/// source (spec §04 "Name resolution"), so in practice the module below never
+/// gets built; this arm is the structural backstop for a future path that
+/// synthesises or re-admits one, which is why the module is assembled BY HAND
+/// and inference is never run. With no type table, the `Type::Failed` arm cannot
+/// fire, so `FreeBareName` is the only kind that can report it.
+#[test]
+fn is_flatpdl_rejects_a_free_bare_name_without_inference() {
+    use flatppl_core::{Binding, Module, Node};
+
+    let mut m = Module::new();
+    let f1 = m.intern("f1");
+    let free = m.alloc(Node::Const(f1));
+    let name = m.intern("q");
+    m.add_binding(Binding {
+        name,
+        rhs: free,
+        doc: None,
+        public: true,
+        synthetic: false,
+    });
+
+    let v = is_flatpdl(&m).expect_err("a free bare name is non-conformant");
+    assert!(
+        v.iter()
+            .any(|n| matches!(n.kind, NonConformKind::FreeBareName)
+                && n.reason.contains("free variable `f1`")),
+        "expected a FreeBareName violation naming `f1`; got: {v:?}"
+    );
+    assert!(
+        !v.iter().any(|n| matches!(n.kind, NonConformKind::Failed)),
+        "the check must not depend on the type table; got: {v:?}"
+    );
+}
+
+/// The companion direction: a bare atom that IS a built-in (`pi`, and `sum` used
+/// as a value) is conformant, so the gate does not reject ordinary FlatPDL.
+#[test]
+fn is_flatpdl_accepts_bare_builtin_atoms() {
+    let m = infer_module("v = [1.0, 2.0]\ny = mul(pi, reduce(sum, v))\n");
+    let out = determinize(&m).expect("a deterministic model must determinize");
+    assert!(
+        is_flatpdl(&out).is_ok(),
+        "bare built-in atoms must stay conformant; got: {:?}",
+        is_flatpdl(&out)
+    );
+}
+
+/// End-to-end: the determiniser's exit gate turns the violation into a refusal
+/// rather than emitting the free variable. This is the contract the reproducer
+/// broke — `determinize` exited 0 emitting `builtin_logdensityof(Normal,
+/// record(mu = f1, sigma = 1.5), 0.7)` with nothing binding `f1`.
+#[test]
+fn determinize_refuses_a_model_with_an_unbound_component_name() {
+    let m = infer_module(
+        "z = draw(Normal(mu = 0.4, sigma = 1.0))\n\
+         q = logdensityof(joint(f1 = Normal(mu = z, sigma = 0.5), \
+         f2 = Normal(mu = f1, sigma = 1.5)), record(f1 = 0.3, f2 = 0.7))\n",
+    );
+    // Both arms fire on the same node. `visit` reads the type table first, so
+    // the `Type::Failed` backstop is `violations[0]` and names the refusal; the
+    // CLI has already printed inference's own located diagnostic by then. The
+    // structural arm is asserted separately below so a future path that stops
+    // typing the node `Failed` still leaves the contract enforced.
+    let err = determinize(&m).expect_err("an unbound component name must refuse, not lower");
+    assert_eq!(err.construct, "Failed");
+    assert_eq!(err.reason, "unresolvable name");
+
+    let v = is_flatpdl(&m).expect_err("the inferred module is non-conformant");
+    assert!(
+        v.iter()
+            .any(|n| matches!(n.kind, NonConformKind::FreeBareName)
+                && n.reason.contains("free variable `f1`")),
+        "the structural arm must also report `f1`; got: {v:?}"
+    );
+}

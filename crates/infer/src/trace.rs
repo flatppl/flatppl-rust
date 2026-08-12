@@ -323,8 +323,28 @@ impl<'m, 's> Inferencer<'m, 's> {
             }
             Node::Const(sym) => {
                 let name = self.module.resolve(*sym).to_string();
-                self.set_vset(id, ops::const_valueset(&name));
-                (ops::const_type(&name), Phase::Fixed)
+                // A bare atom is the `base` namespace: the parser emits one for
+                // every unqualified name it did not find among the module's
+                // bindings (`syntax::parser::resolve_bare_name`). If it is not a
+                // built-in either, the name resolves nowhere and §04 "Name
+                // resolution" makes that a static error — without this arm
+                // `const_type` hands the unknown name `Type::Any`, inference
+                // absorbs it as a `%fixed` scalar, and the determiniser lowers a
+                // FREE VARIABLE into FlatPDL. The `self.`-qualified spelling of
+                // the same mistake has always errored ("unresolved reference").
+                if !crate::builtins::is_base_name(&name) {
+                    self.diags.push(Diagnostic::error_at(
+                        id,
+                        format!(
+                            "unresolvable name `{name}`: not a binding in this module and not a \
+                             FlatPPL built-in (spec §04 \"Name resolution\")"
+                        ),
+                    ));
+                    (Type::Failed("unresolvable name".into()), Phase::Fixed)
+                } else {
+                    self.set_vset(id, ops::const_valueset(&name));
+                    (ops::const_type(&name), Phase::Fixed)
+                }
             }
             Node::Ref(r) => match r.ns {
                 RefNs::SelfMod => match self.module.binding_by_name(r.name) {

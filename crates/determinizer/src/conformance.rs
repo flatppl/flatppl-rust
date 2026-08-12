@@ -10,8 +10,11 @@ use flatppl_core::{CallHead, Inputs, Module, Node, NodeId, Phase, Ref, RefNs, Ty
 /// `functionof`/`kernelof` reification `Inputs` boundary entry naming a binding
 /// that is not present in the module (the self-check against any binding-removal
 /// pass, e.g. root-based DCE, Buffy #263 Pass 4-A, leaving a stranded pointer).
-/// Two further rejections: no residual `CallHead::User` application, and no
-/// wrong-arity call to one of the six `builtin_*` primitives (§07). Mostly a read
+/// Three further rejections: no residual `CallHead::User` application, no
+/// wrong-arity call to one of the six `builtin_*` primitives (§07), and no bare
+/// atom naming something outside the `base` namespace — a free variable, which
+/// `flatppl-infer` already refuses at source but which this scan re-checks
+/// structurally. Mostly a read
 /// of the inferred side-tables — run `infer` first — plus those two structural
 /// checks, which read the call shape because `flatppl-infer` types both shapes
 /// without complaint.
@@ -99,6 +102,23 @@ fn visit(m: &Module, id: NodeId, parent_builtin: Option<&str>, bad: &mut Vec<Non
                 reason: format!(
                     "dangling (%ref self {}) — no binding of that name in the module",
                     m.resolve(*name)
+                ),
+            });
+        }
+    }
+    // Free-bare-name check: a `Node::Const` is the `base` namespace, so an atom
+    // naming no built-in binds nowhere — a free variable in FlatPDL. Structural on
+    // purpose: `Failed` above catches the same node only while `flatppl-infer`
+    // types it that way, and the whole point of this arm is to hold if a future
+    // path types one as an ordinary value again.
+    if let Node::Const(sym) = m.node(id) {
+        let name = m.resolve(*sym);
+        if !flatppl_infer::builtins::is_base_name(name) {
+            bad.push(NonConformance {
+                node: id,
+                kind: NonConformKind::FreeBareName,
+                reason: format!(
+                    "free variable `{name}` — a bare atom naming no built-in and no binding"
                 ),
             });
         }
