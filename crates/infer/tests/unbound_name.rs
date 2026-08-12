@@ -34,6 +34,22 @@ fn assert_unresolvable(src: &str, name: &str) {
     );
 }
 
+fn assert_unresolvable_call(src: &str, name: &str) {
+    let errs = errors(src);
+    let hit = errs.iter().find(|d| {
+        d.message
+            .contains(&format!("unresolvable call to `{name}`"))
+    });
+    let Some(d) = hit else {
+        let msgs: Vec<_> = errs.iter().map(|d| &d.message).collect();
+        panic!("expected an unresolvable-call error for `{name}`; got: {msgs:?}");
+    };
+    assert!(
+        d.node.is_some(),
+        "the diagnostic must carry its node: {d:?}"
+    );
+}
+
 fn assert_clean(src: &str) {
     let msgs: Vec<String> = errors(src).into_iter().map(|d| d.message).collect();
     assert!(msgs.is_empty(), "expected no errors; got: {msgs:?}");
@@ -96,16 +112,6 @@ fn fn_holes_resolve() {
     assert_clean("f = fn(add(_, 1.0))\ny = f(2.0)\n");
 }
 
-/// A §09 standard-module member is a `RefNs::Module` ref resolved against the
-/// catalogue, never a bare atom.
-#[test]
-fn standard_module_members_resolve() {
-    assert_clean(
-        "pp = standard_module(\"particle-physics\", \"0.1\")\n\
-         y = pp.kallen(1.0, 2.0, 3.0)\n",
-    );
-}
-
 /// §03 set names and §07 constants are bare atoms with no `catalogue.ron` row.
 #[test]
 fn set_names_and_constants_resolve() {
@@ -165,4 +171,94 @@ fn metricsum_metric_is_reported_when_unbound() {
          g: C[.mu^, .nu_] := L1[.mu^, .beta_] * L2[.beta^, .nu_]\n",
         "g",
     );
+}
+
+// --- The CALL-HEAD half of the same §04 rule. -------------------------------
+//
+// A bare `name(...)` call parses to `CallHead::Builtin(name)`, not to a
+// `Node::Const`, so the bare-atom arm never sees it. `ops::call_rule`'s
+// catalogue-dispatch fallthrough used to answer every unrecognised head with a
+// `%deferred` note, which is honest for a builtin awaiting a type rule and wrong
+// for a head that names nothing: `y = nromal(1.0)` inferred with only a note and
+// the determiniser emitted the free call verbatim.
+
+/// A typo'd distribution name is a static error, not a `%deferred` note.
+#[test]
+fn unknown_call_head_is_an_error() {
+    assert_unresolvable_call("y = nromal(1.0)\n", "nromal");
+}
+
+/// The same for a head that looks like a function.
+#[test]
+fn unknown_function_call_head_is_an_error() {
+    assert_unresolvable_call("v = [1.0, 2.0]\ny = nosuchfn(v)\n", "nosuchfn");
+}
+
+/// A builtin that HAS no type rule keeps its `%deferred` note — the gate
+/// separates "no rule yet" from "no such name", and must not collapse the two.
+/// `Lebesgue` is a §08 distribution with no catalogue row of any kind.
+#[test]
+fn a_rowless_builtin_head_still_defers_rather_than_erroring() {
+    assert_clean("m = Lebesgue(dims = 1)\n");
+}
+
+/// A user-defined callable is `CallHead::User`, resolved through the callee, and
+/// never reaches the builtin-head arm.
+#[test]
+fn user_defined_call_heads_resolve() {
+    assert_clean("f(x) = add(x, 1.0)\ny = f(2.0)\n");
+}
+
+// --- §09 members: bare is unresolvable, alias-qualified is not. -------------
+//
+// A §09 standard-module member has a row in `catalogues/particle-physics.ron`
+// but lives in that MODULE's namespace, not in `base`. §09 gives no unqualified
+// spelling, so a bare occurrence is the unresolvable-name case. Before this,
+// `y = add(kallen, 1.0)` determinized to `y = kallen + 1.0` with `kallen`
+// unbound — a wrong lowering, not merely a missed error.
+
+#[test]
+fn a_bare_module_member_is_unresolvable() {
+    assert_unresolvable("y = add(kallen, 1.0)\n", "kallen");
+}
+
+#[test]
+fn a_bare_module_member_call_is_unresolvable() {
+    assert_unresolvable_call("y = kallen(1.0, 2.0, 3.0)\n", "kallen");
+}
+
+/// Including the eight §09 DISTRIBUTION constructors, which the keyword list
+/// listed alongside the base ones.
+#[test]
+fn a_bare_module_distribution_constructor_is_unresolvable() {
+    assert_unresolvable_call("y = CrystalBall(0.0, 1.0, 1.5, 2.0)\n", "CrystalBall");
+}
+
+/// The accept side: behind its alias the same member resolves, because that is a
+/// `RefNs::Module` ref checked against the module catalogue — a path that never
+/// consults `is_base_name`.
+#[test]
+fn an_alias_qualified_module_function_resolves() {
+    assert_clean(
+        "pp = standard_module(\"particle-physics\", \"0.1\")\n\
+         y = pp.kallen(1.0, 2.0, 3.0)\n",
+    );
+}
+
+#[test]
+fn an_alias_qualified_module_distribution_resolves() {
+    assert_clean(
+        "pp = standard_module(\"particle-physics\", \"0.1\")\n\
+         m = pp.CrystalBall(m0 = 0.0, sigma = 1.0, alpha = 1.5, n = 2.0)\n\
+         lp = logdensityof(m, 0.5)\n",
+    );
+}
+
+/// The five §08 distributions with no catalogue row still resolve bare. This is
+/// the pair to `a_bare_module_distribution_constructor_is_unresolvable`: both
+/// sets were called "§08 distributions with no row" before the review, and only
+/// these five actually are.
+#[test]
+fn rowless_base_distributions_resolve_bare() {
+    assert_clean("m = Dirac(x = 1.0)\nlp = logdensityof(m, 1.0)\n");
 }

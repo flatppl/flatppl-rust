@@ -219,19 +219,24 @@ fn reference_cycle_is_an_error() {
     assert!(out.contains("%failed"), "got:\n{out}");
 }
 
+/// An op with no type rule defers honestly rather than guessing.
+///
+/// The op must be a REAL built-in — `PoissonProcess` is a §08 distribution with no
+/// `catalogue.ron` row. An invented name (this test used `frobnicate`) is an
+/// unresolvable name under spec §04 "Name resolution" and errors instead of
+/// deferring, which would make this a test of the wrong thing. See
+/// `tests/unbound_name.rs` for the two behaviours side by side.
 #[test]
 fn unknown_op_is_an_honest_gap() {
-    let (module, diags) = infer_src("x = frobnicate(1, 2)");
+    let (module, diags) = infer_src("x = PoissonProcess(1, 2)");
     assert!(
-        diags
-            .iter()
-            .any(|d| d.severity == Severity::Note
-                && d.message.contains("no type rule for `frobnicate`")),
+        diags.iter().any(|d| d.severity == Severity::Note
+            && d.message.contains("no type rule for `PoissonProcess`")),
         "got: {diags:?}"
     );
     let out = flatppl_flatpir::write(&module);
     assert!(
-        out.contains("(%meta (%deferred %fixed %unknown) (frobnicate 1 2))"),
+        out.contains("(%meta (%deferred %fixed %unknown) (PoissonProcess 1 2))"),
         "got:\n{out}"
     );
 }

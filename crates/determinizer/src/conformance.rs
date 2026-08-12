@@ -106,20 +106,39 @@ fn visit(m: &Module, id: NodeId, parent_builtin: Option<&str>, bad: &mut Vec<Non
             });
         }
     }
-    // Free-bare-name check: a `Node::Const` is the `base` namespace, so an atom
-    // naming no built-in binds nowhere — a free variable in FlatPDL. Structural on
+    // Free-name check, over BOTH shapes the `base` namespace can be spelled in:
+    // a bare atom (`Node::Const`) and a builtin call head
+    // (`CallHead::Builtin`). Either one naming nothing in `base` binds nowhere —
+    // a free variable, or a call to a function that does not exist. Structural on
     // purpose: `Failed` above catches the same node only while `flatppl-infer`
     // types it that way, and the whole point of this arm is to hold if a future
     // path types one as an ordinary value again.
-    if let Node::Const(sym) = m.node(id) {
-        let name = m.resolve(*sym);
-        if !flatppl_infer::builtins::is_base_name(name) {
+    let free_name = match m.node(id) {
+        Node::Const(sym) => Some((*sym, "free variable")),
+        Node::Call(c) => match c.head {
+            // A reification's head is the construct itself (`functionof` /
+            // `kernelof`), always a real builtin, so no special case is needed.
+            CallHead::Builtin(op) => Some((op, "free call head")),
+            CallHead::User(_) => None,
+        },
+        _ => None,
+    };
+    if let Some((sym, what)) = free_name {
+        let name = m.resolve(sym);
+        // A distribution constructor is exempt: the determiniser deliberately
+        // emits a §09 constructor BARE as a kernel tag, dropping its module
+        // qualification because both engines key the registry bare
+        // (`is_kernel_tag_name`). A tag is not a variable reference. This softens
+        // the backstop for those constructor names only — `flatppl-infer` still
+        // rejects a bare one in SOURCE, so the user-visible rule is unchanged,
+        // and a §09 non-constructor (`kallen`) is still caught here.
+        if !flatppl_infer::builtins::is_base_name(name)
+            && !flatppl_infer::builtins::is_kernel_tag_name(name)
+        {
             bad.push(NonConformance {
                 node: id,
                 kind: NonConformKind::FreeBareName,
-                reason: format!(
-                    "free variable `{name}` — a bare atom naming no built-in and no binding"
-                ),
+                reason: format!("{what} `{name}` — names no built-in and no binding"),
             });
         }
     }

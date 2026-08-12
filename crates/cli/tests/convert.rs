@@ -208,6 +208,12 @@ fn renders_span_diagnostics() {
 
 /// `flatppl infer` annotates a module with `%meta` and reports honest gaps
 /// as notes on stderr.
+///
+/// The gap stand-in must be a REAL built-in with no type rule yet —
+/// `PoissonProcess` is a §08 distribution with no `catalogue.ron` row. An invented
+/// name (this test used `mystery`) is an unresolvable name under spec §04 "Name
+/// resolution" and now errors instead of deferring, which tests nothing about
+/// gap reporting.
 #[test]
 fn infer_emits_annotated_flatpir() {
     let dir = Scratch::new("infer");
@@ -215,7 +221,7 @@ fn infer_emits_annotated_flatpir() {
     let out_path = dir.path("m.flatpir");
     fs::write(
         &src,
-        "a = elementof(reals)\nb ~ Normal(a, 1.0)\nc = mystery(b)\n",
+        "a = elementof(reals)\nb ~ Normal(a, 1.0)\nc = PoissonProcess(b)\n",
     )
     .unwrap();
 
@@ -232,7 +238,7 @@ fn infer_emits_annotated_flatpir() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("note: no type rule for `mystery`"),
+        stderr.contains("note: no type rule for `PoissonProcess`"),
         "got:\n{stderr}"
     );
 
@@ -240,7 +246,7 @@ fn infer_emits_annotated_flatpir() {
     assert!(written.contains("(%meta ((%scalar real) %parameterized reals) (elementof reals))"));
     assert!(written.contains("(%meta ((%scalar real) %stochastic reals) (draw "));
     assert!(
-        written.contains("(%meta (%deferred %stochastic %unknown) (mystery "),
+        written.contains("(%meta (%deferred %stochastic %unknown) (PoissonProcess "),
         "got:\n{written}"
     );
 }

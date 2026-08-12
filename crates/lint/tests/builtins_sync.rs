@@ -1,19 +1,33 @@
-//! Guard `flatppl_lint::builtins::BUILTINS` against drift from the authoritative
+//! Guard the built-in roster (`flatppl_infer::builtins::BUILTINS`, re-exported
+//! by `flatppl_lint::builtins`) against drift from the authoritative
 //! `flatppl-grammars/keyword-lists.json`. Skipped (passes) when the sibling repo
 //! is not checked out, so CI without it still builds.
+//!
+//! The roster also feeds spec-§04 name resolution now
+//! (`flatppl_infer::builtins::is_base_name`), so a silent skip here is worse than
+//! it was: it would let the list drift under the resolver. Hence
+//! `keyword_lists_path` searches the ancestors instead of counting `..`
+//! segments — a fixed `../../../` resolves only in the primary checkout and
+//! missed the file (skipping the test) from a git worktree, whose crates sit two
+//! levels deeper.
 
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// The nearest ancestor of this crate holding `flatppl-grammars/keyword-lists.json`.
+fn keyword_lists_path() -> Option<PathBuf> {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .map(|d| d.join("flatppl-grammars/keyword-lists.json"))
+        .find(|p| p.exists())
+}
 
 #[test]
 fn builtins_match_keyword_lists() {
-    // Resolve relative to the crate manifest dir → workspace `../flatppl-grammars`.
-    let path =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../flatppl-grammars/keyword-lists.json");
-    if !path.exists() {
-        eprintln!("skipping: {} not present", path.display());
+    let Some(path) = keyword_lists_path() else {
+        eprintln!("skipping: no flatppl-grammars/keyword-lists.json in any ancestor");
         return;
-    }
+    };
     let json: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     let expected: BTreeSet<String> = json["categories"]

@@ -639,6 +639,27 @@ pub(crate) fn call_rule(
                     mass: Mass::Deferred,
                 },
                 None => {
+                    // `%deferred` means "no type rule YET" and is honest only
+                    // for a name that IS a built-in. A head naming nothing in
+                    // the `base` namespace resolves nowhere, and §04 "Name
+                    // resolution" makes that a static error — the call-head half
+                    // of the same rule the bare-atom arm enforces in `trace.rs`.
+                    // Without this, `y = nromal(1.0)` inferred with only a note
+                    // and the determiniser emitted the free call verbatim.
+                    //
+                    // User callables and §09 `alias.member` calls are
+                    // `CallHead::User` and returned far above, so they never
+                    // reach here.
+                    if !crate::builtins::is_base_name(&name) {
+                        inf.diags.push(crate::Diagnostic::error_at(
+                            id,
+                            format!(
+                                "unresolvable call to `{name}`: not a binding in this module and \
+                                 not a FlatPPL built-in (spec §04 \"Name resolution\")"
+                            ),
+                        ));
+                        return (Type::Failed("unresolvable name".into()), Phase::Fixed);
+                    }
                     inf.note_gap(op);
                     Type::Deferred
                 }

@@ -5,15 +5,30 @@
 //! and the lint `shadows-builtin` rule.
 //!
 //! [`BUILTINS`] is generated from `flatppl-grammars/keyword-lists.json`; kept in
-//! sync by `crates/lint/tests/builtins_sync.rs`. It is not the whole namespace on
-//! its own: `catalogue.ron` carries three rows the keyword list omits (`in`,
-//! `length`, `log2`), so [`is_base_name`] takes the union. Conversely the keyword
-//! list carries names no catalogue row covers — the measure ops and structural
-//! constructs `ops.rs` types by hand, the §08 distributions with no row
-//! (`CrystalBall`, `Dirac`, `Lebesgue`, …), the §03 set names, and the constants.
+//! sync by `crates/lint/tests/builtins_sync.rs`. It is the highlighter's word
+//! list, so it is neither a superset nor a subset of the `base` namespace, and
+//! [`is_base_name`] corrects it in both directions:
+//!
+//! - **Added.** `catalogue.ron` carries three rows the keyword list omits (`in`,
+//!   `length`, `log2`).
+//! - **Removed.** The keyword list carries the 21 §09 standard-module members of
+//!   `particle-physics` — 8 distribution constructors (`CrystalBall`, `Argus`,
+//!   `Voigtian`, `Landau`, `DoubleSidedCrystalBall`, `RelativisticBreitWigner`,
+//!   `BifurcatedNormal`, `ContinuedPoisson`) and 13 functions (`kallen`,
+//!   `wignerd`, `blatt_weisskopf`, the `interp_*` family, …). Each has a row in
+//!   `catalogues/particle-physics.ron` and is reachable ONLY behind its module
+//!   alias, so a bare occurrence is unresolvable.
+//!
+//! What the keyword list uniquely and correctly carries: the §03 set names, the
+//! constants, the measure ops and structural constructs `ops.rs` types by hand,
+//! and the five §08 distributions with no catalogue row at all — `Dirac`,
+//! `Lebesgue`, `Counting`, `PoissonProcess`, `BinnedPoissonProcess`.
 
 /// Names FlatPPL treats as built-ins (functions, distributions, constants,
 /// sets). A user binding with one of these names shadows the built-in.
+///
+/// The lint roster, synced to the grammars keyword list — **not** the `base`
+/// namespace. Use [`is_base_name`] for name resolution.
 pub const BUILTINS: &[&str] = &[
     "Argus",
     "Bernoulli",
@@ -288,7 +303,114 @@ pub const BUILTINS: &[&str] = &[
 /// step 2, "Otherwise, it resolves to the FlatPPL built-in of that name". A name
 /// that is neither a current-module binding nor a base built-in is unresolvable,
 /// and §04 makes that a static error.
+///
+/// Bare names only. A `§09` member behind its alias is a `RefNs::Module` ref
+/// resolved against the module catalogue and never reaches here.
 pub fn is_base_name(name: &str) -> bool {
-    // `BUILTINS` is strictly sorted (pinned by `builtins_sorted_and_unique`).
-    BUILTINS.binary_search(&name).is_ok() || crate::catalogue::builtin().base(name).is_some()
+    let cat = crate::catalogue::builtin();
+    // A base row wins outright, so a name that is somehow BOTH a base row and a
+    // §09 member keeps resolving. Nothing collides today
+    // (`no_base_row_is_also_a_module_member` pins that), but the order makes the
+    // §09 exclusion below unable to shadow a real builtin if one ever does.
+    if cat.base(name).is_some() {
+        return true;
+    }
+    // `BUILTINS` is strictly sorted (pinned by `builtins_are_sorted_and_unique`).
+    BUILTINS.binary_search(&name).is_ok() && !cat.is_module_member(name)
+}
+
+/// True iff `name` is a distribution constructor — base (§08) or standard-module
+/// (§09).
+///
+/// Such a name legitimately appears BARE in emitted FlatPDL as a kernel TAG: the
+/// determiniser resolves `broadcast(hepphys.ContinuedPoisson, rates)` to
+/// `broadcast(builtin_logdensityof, ContinuedPoisson, …)`, dropping the module
+/// qualification because both engines' registries key the constructor bare (see
+/// `determinizer/tests/broadcast_golden.rs`, the histfactory
+/// `hepphys.ContinuedPoisson.(…)` shape). A tag is not a variable reference —
+/// every evaluator resolves it — so it is not a free name.
+///
+/// This is NOT a resolution rule: [`is_base_name`] still rejects a bare §09
+/// constructor in source, because §09 gives it no unqualified spelling. This
+/// predicate is only for judging already-lowered FlatPDL.
+pub fn is_kernel_tag_name(name: &str) -> bool {
+    crate::catalogue::builtin()
+        .distribution_param_names(name)
+        .is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `is_base_name` reaches `BUILTINS` by `binary_search`. Pinned here rather
+    /// than only in `crates/lint/tests/builtins_sync.rs`, whose sibling-repo
+    /// guard is skipped in a git worktree (see that file).
+    #[test]
+    fn builtins_are_sorted_and_unique() {
+        assert!(
+            BUILTINS.windows(2).all(|w| w[0] < w[1]),
+            "BUILTINS must be strictly sorted for binary_search"
+        );
+    }
+
+    /// The §09 exclusion in `is_base_name` is subtractive, so it would silently
+    /// remove a real builtin if a base row and a module member ever shared a
+    /// name. They do not; the base-row-first order handles it if they ever do.
+    #[test]
+    fn no_base_row_is_also_a_module_member() {
+        let cat = crate::catalogue::builtin();
+        let both: Vec<&str> = cat
+            .base_names()
+            .filter(|n| cat.is_module_member(n))
+            .collect();
+        assert!(
+            both.is_empty(),
+            "a base row that is also a §09 member needs the ordering argument re-checked: {both:?}"
+        );
+    }
+
+    /// Spec §09: a standard-module member is reachable only behind its alias, so
+    /// a bare occurrence is not in the `base` namespace.
+    #[test]
+    fn bare_module_members_are_not_base_names() {
+        for name in [
+            "kallen",
+            "wignerd",
+            "blatt_weisskopf",
+            "interp_pwlin",
+            "CrystalBall",
+            "Argus",
+            "Voigtian",
+            "Landau",
+        ] {
+            assert!(
+                !is_base_name(name),
+                "`{name}` is a §09 member and must not resolve bare"
+            );
+        }
+    }
+
+    /// The five §08 distributions with no catalogue row of any kind still
+    /// resolve — they are base builtins the keyword list is the only record of.
+    #[test]
+    fn rowless_base_distributions_are_base_names() {
+        for name in [
+            "Dirac",
+            "Lebesgue",
+            "Counting",
+            "PoissonProcess",
+            "BinnedPoissonProcess",
+        ] {
+            assert!(is_base_name(name), "`{name}` is a §08 distribution");
+        }
+    }
+
+    /// The three `catalogue.ron` rows the keyword list omits.
+    #[test]
+    fn catalogue_only_rows_are_base_names() {
+        for name in ["in", "length", "log2"] {
+            assert!(is_base_name(name), "`{name}` has a catalogue.ron row");
+        }
+    }
 }

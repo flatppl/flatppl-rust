@@ -268,3 +268,69 @@ fn determinize_refuses_a_model_with_an_unbound_component_name() {
         "the structural arm must also report `f1`; got: {v:?}"
     );
 }
+
+/// The call-head shape of the same defect. A bare `name(...)` call is
+/// `CallHead::Builtin(name)`, not a `Node::Const`, so the atom arm alone missed
+/// it: `y = nromal(1.0)` determinized to `y = nromal(1.0)` at exit 0, a call to a
+/// function that does not exist. Assembled BY HAND with no inference for the same
+/// reason as the bare-atom case — with no type table only `FreeBareName` can
+/// report it.
+#[test]
+fn is_flatpdl_rejects_a_free_call_head_without_inference() {
+    use flatppl_core::{Binding, Call, CallHead, Module, Node, Scalar};
+
+    let mut m = Module::new();
+    let arg = m.alloc(Node::Lit(Scalar::Real(1.0)));
+    let head = m.intern("nromal");
+    let call = m.alloc(Node::Call(Call {
+        head: CallHead::Builtin(head),
+        args: Box::new([arg]),
+        named: Box::new([]),
+        inputs: None,
+    }));
+    let name = m.intern("y");
+    m.add_binding(Binding {
+        name,
+        rhs: call,
+        doc: None,
+        public: true,
+        synthetic: false,
+    });
+
+    let v = is_flatpdl(&m).expect_err("a free call head is non-conformant");
+    assert!(
+        v.iter()
+            .any(|n| matches!(n.kind, NonConformKind::FreeBareName)
+                && n.reason.contains("free call head `nromal`")),
+        "expected a FreeBareName violation naming `nromal`; got: {v:?}"
+    );
+    assert!(
+        !v.iter().any(|n| matches!(n.kind, NonConformKind::Failed)),
+        "the check must not depend on the type table; got: {v:?}"
+    );
+}
+
+/// Ordinary builtin call heads, a reification head (`functionof`), and a §09
+/// member behind its alias must all stay conformant — the gate rejects unknown
+/// heads, not calls in general.
+#[test]
+fn is_flatpdl_accepts_real_call_heads() {
+    let m = infer_module("v = [1.0, 2.0]\ng = functionof(add(_x_, 1.0), x = _x_)\ny = g(sum(v))\n");
+    let out = determinize(&m).expect("a deterministic model must determinize");
+    assert!(
+        is_flatpdl(&out).is_ok(),
+        "real call heads must stay conformant; got: {:?}",
+        is_flatpdl(&out)
+    );
+}
+
+/// A bare §09 member is a free variable, so the determiniser must refuse rather
+/// than lower it. Before this, `y = add(kallen, 1.0)` determinized at exit 0 to
+/// `y = kallen + 1.0` with `kallen` unbound — a wrong lowering.
+#[test]
+fn determinize_refuses_a_bare_module_member() {
+    let m = infer_module("y = add(kallen, 1.0)\n");
+    let err = determinize(&m).expect_err("a bare §09 member must refuse, not lower");
+    assert_eq!(err.construct, "Failed");
+    assert_eq!(err.reason, "unresolvable name");
+}

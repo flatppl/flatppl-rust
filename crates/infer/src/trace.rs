@@ -50,10 +50,68 @@ pub(crate) struct Inferencer<'m, 's> {
     /// call args — the bare ref node itself types as `Type::Any` (matching a
     /// bare base name). Populated in the `RefNs::Module` arm.
     module_catalogue_refs: HashMap<NodeId, crate::modules::CatalogueRef>,
+    /// Argument positions of a `builtin_*` primitive or a `broadcast`, where a
+    /// bare distribution-constructor atom is a kernel TAG rather than a value
+    /// reference. See [`collect_kernel_tag_nodes`].
+    kernel_tag_nodes: HashSet<NodeId>,
+}
+
+/// Node ids sitting where a bare distribution-constructor atom is a kernel TAG,
+/// not a variable reference.
+///
+/// Two positions, both keyed by ENCLOSING CALL rather than by argument index —
+/// the tag index varies per primitive, the same reason
+/// `determinizer::conformance` checks `Kernel`-typed nodes by enclosing call:
+///
+/// - any argument of a `builtin_*` primitive (§07 "Measure kernel evaluation
+///   primitives"), whose tag is arg 0 for `builtin_logdensityof` and the
+///   transports, arg 1 for `builtin_sample`;
+/// - any argument of `broadcast` / `broadcasted`, covering BOTH the user-level
+///   `broadcast(Poisson, rates)` head and the determiniser's emitted
+///   `broadcast(builtin_logdensityof, ContinuedPoisson, …)`.
+///
+/// This exists because inference runs over determiniser OUTPUT as well as user
+/// source: the determiniser resolves `broadcast(hepphys.ContinuedPoisson, rates)`
+/// to a BARE `Const(ContinuedPoisson)` tag — both engines key the registry bare —
+/// and the driver re-runs `infer` on its own output each iteration. Without the
+/// position, the §04 bare-name gate could not tell that tag from a user writing
+/// `add(CrystalBall, 1.0)`, which must still be rejected because §09 gives a
+/// member no unqualified spelling.
+///
+/// Breadth is harmless: the exemption fires only for a name that is already a
+/// catalogue distribution constructor, so widening the positions cannot admit an
+/// unknown name.
+fn collect_kernel_tag_nodes(m: &Module) -> HashSet<NodeId> {
+    fn bears_a_tag(m: &Module, c: &flatppl_core::Call) -> bool {
+        match c.head {
+            CallHead::Builtin(op) => {
+                let name = m.resolve(op);
+                name.starts_with("builtin_") || name == "broadcast" || name == "broadcasted"
+            }
+            CallHead::User(_) => false,
+        }
+    }
+    fn walk(m: &Module, id: NodeId, out: &mut HashSet<NodeId>) {
+        if let Node::Call(c) = m.node(id) {
+            if bears_a_tag(m, c) {
+                out.extend(c.args.iter().copied());
+                out.extend(c.named.iter().map(|na| na.value));
+            }
+        }
+        for child in m.node(id).children() {
+            walk(m, child, out);
+        }
+    }
+    let mut out = HashSet::new();
+    for (_bid, b) in m.bindings() {
+        walk(m, b.rhs, &mut out);
+    }
+    out
 }
 
 impl<'m, 's> Inferencer<'m, 's> {
     pub(crate) fn new(module: &'m mut Module, level: Level, session: &'s InferSession<'s>) -> Self {
+        let kernel_tag_nodes = collect_kernel_tag_nodes(module);
         Inferencer {
             module,
             level,
@@ -67,6 +125,7 @@ impl<'m, 's> Inferencer<'m, 's> {
             noted_gaps: HashSet::new(),
             module_callable_results: HashMap::new(),
             module_catalogue_refs: HashMap::new(),
+            kernel_tag_nodes,
         }
     }
 
@@ -83,6 +142,7 @@ impl<'m, 's> Inferencer<'m, 's> {
             .iter()
             .map(|(id, r)| (*id, (r.ty.clone(), r.phase, r.vset.clone())))
             .collect();
+        let kernel_tag_nodes = collect_kernel_tag_nodes(module);
         Inferencer {
             module,
             level,
@@ -96,6 +156,7 @@ impl<'m, 's> Inferencer<'m, 's> {
             noted_gaps: HashSet::new(),
             module_callable_results: HashMap::new(),
             module_catalogue_refs: HashMap::new(),
+            kernel_tag_nodes,
         }
     }
 
@@ -332,7 +393,13 @@ impl<'m, 's> Inferencer<'m, 's> {
                 // absorbs it as a `%fixed` scalar, and the determiniser lowers a
                 // FREE VARIABLE into FlatPDL. The `self.`-qualified spelling of
                 // the same mistake has always errored ("unresolved reference").
-                if !crate::builtins::is_base_name(&name) {
+                // One exemption: a distribution constructor in kernel-TAG
+                // position. §09 members are not in the `base` namespace, but the
+                // determiniser emits one BARE as a tag and re-runs inference over
+                // its own output — see `collect_kernel_tag_nodes`.
+                let is_tag = self.kernel_tag_nodes.contains(&id)
+                    && crate::builtins::is_kernel_tag_name(&name);
+                if !is_tag && !crate::builtins::is_base_name(&name) {
                     self.diags.push(Diagnostic::error_at(
                         id,
                         format!(

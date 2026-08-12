@@ -113,9 +113,13 @@ fn auto_inputs_boundary_ref_counts_as_use() {
     );
 }
 
+/// The gap op must be a REAL built-in with no type rule — `PoissonProcess` is a
+/// §08 distribution with no `catalogue.ron` row. An invented name (these two used
+/// `somethingweird`) is an unresolvable name under spec §04 "Name resolution" and
+/// errors instead of producing a gap.
 #[test]
 fn unknown_op_yields_inference_gap_note() {
-    let mut m = parse("y = somethingweird(1.0)\n");
+    let mut m = parse("y = PoissonProcess(1.0)\n");
     let ds = lint(&mut m, &Config::default());
     assert!(ds.iter().any(|d| d.rule == RuleId::InferenceGap));
 }
@@ -124,7 +128,7 @@ fn unknown_op_yields_inference_gap_note() {
 fn allowed_inference_gap_is_suppressed_while_infer_still_runs() {
     // inference-gap allowed, but unresolved/cycle stay active → the infer pass
     // still runs and the gap note is dropped by `push`.
-    let mut m = parse("y = somethingweird(1.0)\n");
+    let mut m = parse("y = PoissonProcess(1.0)\n");
     let mut cfg = Config::default();
     cfg.set(RuleId::InferenceGap, Severity::Allow);
     let ds = lint(&mut m, &cfg);

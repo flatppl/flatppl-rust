@@ -707,6 +707,20 @@ impl Catalogue {
         self.base.iter().map(|b| b.name.as_str())
     }
 
+    /// True iff `name` is a binding of ANY standard module (spec §09).
+    ///
+    /// A §09 member is reachable only through its module alias
+    /// (`pp.kallen(...)`) — §09 "Standard modules" gives no way to call one
+    /// unqualified, and the `base` namespace does not contain it. So this is a
+    /// name that must NOT resolve bare; see `crate::builtins::is_base_name`,
+    /// which consults a base row first so a name that is somehow both still
+    /// resolves.
+    pub fn is_module_member(&self, name: &str) -> bool {
+        self.modules
+            .iter()
+            .any(|m| m.bindings.iter().any(|b| b.name == name))
+    }
+
     /// The public binding names of a standard module, if present.
     pub fn module_binding_names(&self, module: &str) -> Option<impl Iterator<Item = &str>> {
         self.modules
