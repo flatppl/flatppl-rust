@@ -156,19 +156,21 @@ fn named_variadic_rows_are_untouched() {
 /// **Normalization refuses to guess.** An ambiguous or incomplete mapping is handed back
 /// unchanged so the existing checks report it — not silently patched into a positional vector.
 ///
-/// This also PINS A PRE-EXISTING GAP this wave measured but did not fix: a **double-bound**
-/// parameter goes unreported. `atan2(1.0, y = 2.0)` supplies `y` positionally *and* by keyword,
-/// and neither existing check sees it — `arity_check` counts `args.len() + named.len()` = 2, which
-/// matches `atan2`'s arity, and the name check only verifies that each supplied name IS declared,
-/// never that it is supplied once. Verified unchanged at base `52dde93` and at this head, so the
-/// normalizer's `None` is not what hides it. Pinned as measured, so closing it shows up here as a
-/// deliberate change.
+/// The double-bound case is no longer left to the normalizer's silence: `check_double_bound`
+/// runs inside `arity_check`, ahead of `normalize_keyword_args`, and reports it directly.
+/// `atan2(1.0, y = 2.0)` supplies `y` positionally *and* by keyword — `arity_check` used to count
+/// `args.len() + named.len()` = 2, which matches `atan2`'s arity, and the name check only
+/// verified that each supplied name IS declared, never that it is supplied once, so the call
+/// passed silently. §04 gives positional and keyword binding each their own rule and only
+/// reconciles them through "a defined input order", which maps one position to one input — a
+/// keyword whose position a positional argument already fills has no input left to bind to.
 #[test]
-fn an_ambiguous_mapping_is_left_to_the_existing_checks() {
-    // Double-bound: NOT reported today, by either check. Pre-existing.
+fn a_double_bound_parameter_is_a_static_error() {
+    let errs = errors("z = atan2(1.0, y = 2.0)\n");
     assert!(
-        errors("z = atan2(1.0, y = 2.0)\n").is_empty(),
-        "pre-existing gap: a double-bound parameter is not detected — see this test's comment"
+        errs.iter()
+            .any(|e| e.contains("`atan2` parameter `y` is bound both positionally and by keyword")),
+        "a double-bound parameter must be reported: {errs:?}"
     );
     // An undeclared keyword name IS reported, by the name check.
     let unknown = errors("z = atan2(y = 1.0, zzq = 2.0)\n");
@@ -184,4 +186,57 @@ fn an_ambiguous_mapping_is_left_to_the_existing_checks() {
             .any(|e| e.contains("`atan2` takes 2 arguments (spec §07), got 1")),
         "an under-supplied call is reported on count: {gap:?}"
     );
+}
+
+/// **A parameter bound by keyword more than once, with no positional argument at all, is the
+/// same static error** — review-caught: `check_double_bound` originally only compared a
+/// keyword's position against the positional prefix's length, so `atan2(y = 1.0, y = 2.0)`
+/// (`y` supplied twice, both times by keyword) passed with no diagnostic and inferred
+/// `%deferred`. `arity_check` counted `args.len() + named.len()` = 2, matching `atan2`'s
+/// arity, and the name check only verified that `y` IS declared, never that it is supplied
+/// once — the same blind spot as the positional-vs-keyword case, just with both offending
+/// entries in `named` instead of one in each list.
+#[test]
+fn a_keyword_bound_parameter_is_a_static_error_even_with_no_positional_argument() {
+    let errs = errors("z = atan2(y = 1.0, y = 2.0)\n");
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("`atan2` parameter `y` is bound by keyword more than once")),
+        "a keyword-keyword double bind must be reported: {errs:?}"
+    );
+}
+
+/// **Triple binding.** A parameter supplied by keyword three times reports every binding past
+/// the first, not just the second — `bijection`'s three declared names (`f`, `f_inv`,
+/// `logvolume`) give an arity of exactly 3, so binding `f` three times and leaving the other
+/// two unbound still passes the arity count and reaches `check_double_bound`.
+#[test]
+fn a_triple_bound_parameter_reports_every_binding_past_the_first() {
+    let errs = errors("z = bijection(f = 1.0, f = 2.0, f = 3.0)\n");
+    let f_errs: Vec<&String> = errs
+        .iter()
+        .filter(|e| e.contains("`bijection` parameter `f` is bound by keyword more than once"))
+        .collect();
+    assert_eq!(
+        f_errs.len(),
+        2,
+        "the second AND third binding of `f` are each reported: {errs:?}"
+    );
+}
+
+/// **Clean-call control.** Every declared parameter supplied exactly once, all by keyword and
+/// in a scrambled order, must stay error-free — the double-bound checks must not fire on
+/// ordinary distinct bindings.
+#[test]
+fn distinct_keyword_bindings_raise_no_double_bound_error() {
+    for src in [
+        "z = atan2(y = 1.0, x = 2.0)\n",
+        "z = bijection(logvolume = 1.0, f = 2.0, f_inv = 3.0)\n",
+    ] {
+        let errs = errors(src);
+        assert!(
+            !errs.iter().any(|e| e.contains("is bound")),
+            "distinct bindings must raise no double-bound error: {src}\n{errs:?}"
+        );
+    }
 }

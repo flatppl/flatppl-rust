@@ -688,8 +688,12 @@ fn arg_ty(args: &[ArgInfo], i: usize) -> Option<&Type> {
 ///
 /// * no keyword arguments, or the row declares no parameter names (nothing to map by);
 /// * a keyword whose name the row does not declare (the name check's business);
-/// * a keyword targeting a position a positional argument already fills (a double-bound
-///   parameter, which no rule should have to guess about);
+/// * a keyword targeting a position something else already fills — positionally, or by an
+///   earlier keyword — a double-bound parameter. `arity_check` now calls
+///   [`check_double_bound`] before this function ever runs and catches BOTH spellings of the
+///   collision, so on a row with declared names the call already failed and returned there;
+///   the two guards below (splat and mixed) are unreachable for such a row and stay only as
+///   a defensive backstop should a nameless-row caller ever reach this branch;
 /// * a GAP — a position neither spelling supplies — since a vector cannot carry a hole and
 ///   fabricating one would hide the under-supplied call the arity check exists to catch.
 fn normalize_keyword_args(
@@ -746,7 +750,7 @@ fn normalize_keyword_args(
         let supplied = module.resolve(*sym);
         let pos = declared.iter().position(|d| d.as_str() == supplied)?;
         if pos < slots.len() && slots[pos].is_some() {
-            return None; // double-bound parameter
+            return None; // double-bound parameter — `check_double_bound` already caught this
         }
         while slots.len() <= pos {
             slots.push(None);
@@ -3350,15 +3354,11 @@ fn arity_check(
         // propagate; see `base_param_names` for which rows are nameless and why.
         let names = cat.base_param_names(name)?.to_vec();
         let section = cat.base_param_section(name);
-        return arg_name_check(
-            inf,
-            &names,
-            &format!("`{name}`"),
-            Some(section),
-            &reading,
-            args,
-            named,
-        );
+        let who = format!("`{name}`");
+        if let Some(ty) = check_double_bound(inf, &names, &who, section, args, named) {
+            return Some(ty);
+        }
+        return arg_name_check(inf, &names, &who, Some(section), &reading, args, named);
     }
     // Same section mapping as the name check below, so a row documented outside §07 —
     // `bijection`, `logdensityof` — cites §06 in BOTH its diagnostics rather than only one.
@@ -3510,6 +3510,85 @@ fn supplied_arg_names(
         .iter()
         .map(|(n, _)| (inf.module.resolve(*n).to_string(), *node))
         .collect()
+}
+
+/// Reject a call that binds one parameter twice — positionally and by keyword, or by
+/// keyword more than once.
+///
+/// §04 "Calling conventions" gives positional and keyword arguments each their own
+/// binding rule — "Positional arguments are accepted only if the callable has ordered
+/// inputs, so that the arguments can be mapped to the inputs in order" and "Arguments
+/// are bound to inputs by name" — and only mixes the two forms through "All built-in
+/// ordinary callables have a defined input order and accept both positional and
+/// keyword arguments." A defined input order is a mapping from position to ONE input
+/// each; whatever supplies a second value to that input — a positional argument
+/// filling it and a keyword naming it too, or two keywords naming it — has no input
+/// left for the second value to bind to. (No sentence spells out "each input is bound
+/// once" directly; this is the reading the "defined input order" framing forces, not
+/// an explicit spec rule — worth tightening in a future §04 revision.)
+///
+/// Unenforced, `atan2(1.0, y = 2.0)` and `atan2(y = 1.0, y = 2.0)` both passed
+/// silently: `arity_check` counts `args.len() + named.len()` and never notices two
+/// entries naming the same input, and the name check below only verifies that a
+/// supplied name IS declared, never that it is supplied once. `normalize_keyword_args`
+/// already detects both collisions (the `pos < slots.len() && slots[pos].is_some()`
+/// guards, one per spelling) but only to hand the call back unnormalized — silently,
+/// since normalization failure is not itself an error path. This makes both collisions
+/// a static error instead of a mapping the normalizer quietly declines.
+///
+/// Only reachable on the mixed or all-keyword spelling: a splat has no separate
+/// keyword list to collide within (`arg_reading` only splats when `named` is empty,
+/// and a splatted aggregate's fields are unique by construction), so `args` and
+/// `named` here are the ordinary positional prefix and keyword suffix of one call.
+fn check_double_bound(
+    inf: &mut Inferencer<'_, '_>,
+    declared: &[String],
+    who: &str,
+    section: &str,
+    args: &[ArgInfo],
+    named: &[NamedInfo],
+) -> Option<Type> {
+    // `slots[pos]` is `true` once something has claimed that declared position — the
+    // positional prefix claims its slots up front, so a keyword landing on one of them
+    // is caught the same way a second keyword landing on an already-keyword-claimed one is.
+    let mut slots = vec![false; declared.len()];
+    for slot in slots.iter_mut().take(args.len()) {
+        *slot = true;
+    }
+    let mut offenders: Vec<(String, NodeId, bool)> = Vec::new();
+    for (sym, node, ..) in named {
+        let supplied = inf.module.resolve(*sym).to_string();
+        let Some(pos) = declared.iter().position(|d| *d == supplied) else {
+            continue; // undeclared name — `arg_name_check`'s business, not this check's
+        };
+        if slots[pos] {
+            // `pos < args.len()` distinguishes "a positional argument already claimed
+            // this slot" from "an earlier keyword already claimed it" for the message.
+            offenders.push((supplied, *node, pos < args.len()));
+        } else {
+            slots[pos] = true;
+        }
+    }
+    if offenders.is_empty() {
+        return None;
+    }
+    for (name, at, by_position) in &offenders {
+        let how = if *by_position {
+            "bound both positionally and by keyword"
+        } else {
+            "bound by keyword more than once"
+        };
+        inf.diags.push(crate::Diagnostic::error_at(
+            *at,
+            format!(
+                "{who} parameter `{name}` is {how} (spec {section} parameters have a \
+                 defined input order — each is bound once)"
+            ),
+        ));
+    }
+    Some(Type::Failed(
+        format!("{who} parameter `{}` is bound twice", offenders[0].0).into(),
+    ))
 }
 
 /// Reject a call that binds an argument to a name the callee does not declare.
