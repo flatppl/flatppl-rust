@@ -9,13 +9,13 @@ use flatppl_core::{CallHead, Inputs, Module, Node, NodeId, Phase, Ref, RefNs, Ty
 /// produced it); and no dangling `(%ref self <name>)` — a body reference or a
 /// `functionof`/`kernelof` reification `Inputs` boundary entry naming a binding
 /// that is not present in the module (the self-check against any binding-removal
-/// pass, e.g. root-based DCE, Buffy #263 Pass 4-A, leaving a stranded pointer).
+/// pass, e.g. root-based DCE, leaving a stranded pointer).
 /// Three further rejections: no residual `CallHead::User` application, no
 /// wrong-arity call to one of the six `builtin_*` primitives (§07), and no bare
-/// atom naming something outside the `base` namespace — a free variable, which
-/// `flatppl-infer` already refuses at source but which this scan re-checks
-/// structurally. Mostly a read
-/// of the inferred side-tables — run `infer` first — plus those two structural
+/// atom or unresolvable call head naming something outside the `base`
+/// namespace — a free variable, which `flatppl-infer` already refuses at source
+/// but which this scan re-checks structurally. Mostly a read
+/// of the inferred side-tables — run `infer` first — plus those structural
 /// checks, which read the call shape because `flatppl-infer` types both shapes
 /// without complaint.
 pub fn is_flatpdl(m: &Module) -> Result<(), Vec<NonConformance>> {
