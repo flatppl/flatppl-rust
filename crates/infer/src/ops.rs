@@ -4783,12 +4783,27 @@ pub(crate) fn fill_mass(
                 Type::Measure { mass, .. } => *mass,
                 _ => Mass::Unknown,
             };
-            let masses: Vec<Mass> = if !named.is_empty() {
-                named.iter().map(|(_, _, t, _)| component_mass(t)).collect()
+            let (masses, not_clean): (Vec<Mass>, Vec<bool>) = if !named.is_empty() {
+                named
+                    .iter()
+                    .map(|(_, node, t, _)| {
+                        (
+                            component_mass(t),
+                            !joint_component_is_trace_clean(inf, *node, 0),
+                        )
+                    })
+                    .unzip()
             } else {
-                args.iter().map(|(_, t, _)| component_mass(t)).collect()
+                args.iter()
+                    .map(|(node, t, _)| {
+                        (
+                            component_mass(t),
+                            !joint_component_is_trace_clean(inf, *node, 0),
+                        )
+                    })
+                    .unzip()
             };
-            product_mass(&masses)
+            product_mass(&masses, &not_clean)
         }
         // `restrict` shares truncate's support-restriction mass behaviour: the
         // result is a sub-measure, so a probability/finite measure becomes
@@ -4932,28 +4947,50 @@ pub(crate) fn fill_mass(
     Type::Measure { domain, mass }
 }
 
-/// The mass of a `joint`'s components (spec §06 "Reference measure for
-/// product measures": a shared-ancestor `joint` keeps the product reference
-/// measure but its density is the equivalent record law, not a plain
-/// product). For trace-disjoint components the product-of-classes rule below
-/// is exact. For components sharing a stochastic ancestor it is exact only up
-/// to one non-normalized member: `%finite`x`%finite` composed through a
-/// shared ancestor can be infinite (Student-t/`y^2` counterexample,
-/// kernel-joint-q4-maths.md §7), so once two or more components are
-/// non-normalized no class stronger than `%unknown` is statically justified.
-/// This crate carries no ancestry tracking to tell shared from disjoint
-/// apart, so the two-or-more case degrades unconditionally — sound but
-/// conservative for provably-disjoint components (e.g. two independent
-/// `Lebesgue(reals)`) that would otherwise fold to a precise class.
-fn product_mass(masses: &[Mass]) -> Mass {
+/// The mass of a `joint`'s components (spec §06 `joint` entry: "a stochastic
+/// node shared between component traces … remains a single node of the
+/// composed trace. Components that share no stochastic node are independent,
+/// and their `joint` is the product measure"). For trace-disjoint components
+/// the product-of-classes rule below is exact. For components sharing a
+/// stochastic ancestor it is exact only up to one non-normalized member:
+/// `%finite`x`%finite` composed through a shared ancestor can be infinite
+/// (Student-t/`y^2` counterexample, kernel-joint-q4-maths.md §7), so once two
+/// or more components that MAY share an ancestor are non-normalized, no class
+/// stronger than `%unknown` is statically justified.
+///
+/// `not_clean[i]` says component `i` is not PROVABLY free of any stochastic
+/// trace node (see [`joint_component_is_trace_clean`]) — i.e. it may
+/// participate in sharing. A component that IS provably clean cannot share
+/// with anything (spec §04 "Identity law": `joint(m, m)` over a bare
+/// constructor `m` is the product of two independent draws, never the
+/// diagonal) and so is exempt from the degrade below regardless of its own
+/// mass class — only the "may share" components are counted toward the
+/// two-or-more threshold.
+///
+/// An EMPTY component list (`joint()`) is `%deferred`, not `%normalized`:
+/// `joint_type`'s domain arm already leaves a zero-component `joint`'s domain
+/// `%deferred` (nothing resolves the variate shape), so the mass side
+/// matching that honestly, rather than vacuously satisfying `all()` and
+/// claiming a definite class the domain itself does not support, keeps the
+/// two slots consistent. `joint()`'s legality is a separate, unaddressed
+/// question (spec §06 spells the construct `joint(M1, M2, ...)`).
+fn product_mass(masses: &[Mass], not_clean: &[bool]) -> Mass {
     use Mass::*;
+    if masses.is_empty() {
+        return Deferred;
+    }
     if masses.contains(&Null) {
         return Null;
     }
     if masses.iter().all(|m| *m == Normalized) {
         return Normalized;
     }
-    if masses.iter().filter(|m| **m != Normalized).count() >= 2 {
+    let ambiguous_nonnormalized = masses
+        .iter()
+        .zip(not_clean)
+        .filter(|(m, dirty)| !matches!(m, Normalized | Deferred) && **dirty)
+        .count();
+    if ambiguous_nonnormalized >= 2 {
         return Unknown;
     }
     if masses.iter().all(|m| matches!(m, Normalized | Finite)) {
@@ -4966,6 +5003,60 @@ fn product_mass(masses: &[Mass]) -> Mass {
         return LocallyFinite;
     }
     Unknown
+}
+
+/// Whether a `joint` COMPONENT provably carries no stochastic trace node,
+/// following self-module refs the way [`law_phase`] does (bounded by the same
+/// `depth` cap). Spec §04 "Trace of the reified law": a stochastic node
+/// enters a `joint`'s composed trace only through a REIFIED component
+/// (`lawof`/`kernelof`) or, per §06's `joint` entry, "a stochastic
+/// constructor parameter". A subtree containing neither channel cannot carry
+/// or close over a stochastic node, so it cannot share one with any sibling
+/// component (§04 "Identity law": `joint(m, m)` over a bare constructor `m`
+/// is the product of two independent draws, never the diagonal).
+///
+/// Conservative: the catalogue is [`is_opaque_value_source`]'s
+/// (`draw`/`rand`/`elementof`/`external`/`load_data`/`rnginit`/`rngstate`),
+/// widened by the three ways a value can carry or close over a reified trace
+/// — `lawof`, `kernelof`, `functionof`. Any of these ANYWHERE in the subtree
+/// answers `false` ("not provably clean"), never "definitely shares" — this
+/// only ever RULES OUT sharing, never proves it, so it is not the ancestry
+/// oracle the wave brief forbids inventing: it never compares two components
+/// against each other, only asks a local question of one.
+fn joint_component_is_trace_clean(inf: &Inferencer<'_, '_>, node: NodeId, depth: u32) -> bool {
+    if depth > 64 {
+        return false; // safe: "not provably clean" on a cycle/depth cap
+    }
+    if let Node::Ref(r) = inf.module.node(node) {
+        if r.ns != flatppl_core::RefNs::SelfMod {
+            return false; // cross-module: conservatively not provably clean
+        }
+        return match inf.module.binding_by_name(r.name) {
+            Some(b) => {
+                let rhs = inf.module.binding(b).rhs;
+                joint_component_is_trace_clean(inf, rhs, depth + 1)
+            }
+            None => false,
+        };
+    }
+    if let Node::Call(c) = inf.module.node(node) {
+        match c.head {
+            CallHead::Builtin(op) => {
+                let name = inf.module.resolve(op);
+                if is_opaque_value_source(name)
+                    || matches!(name, "lawof" | "kernelof" | "functionof")
+                {
+                    return false;
+                }
+            }
+            CallHead::User(_) => return false, // user-callable application: conservative
+        }
+    }
+    let mut clean = true;
+    inf.module.for_each_child(node, |child| {
+        clean = clean && joint_component_is_trace_clean(inf, child, depth + 1);
+    });
+    clean
 }
 
 /// Broadcasting a kernel over data cells: an independent product per cell.

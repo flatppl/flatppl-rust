@@ -998,11 +998,11 @@ fn rand_accepts_a_deferred_mass_measure() {
 // ============================================================
 
 /// All-normalized components stay `%normalized` regardless of arity spelling
-/// (spec §06 "Reference measure for product measures": the record law of
-/// probability components has mass 1) — the positional control case.
+/// (kernel-joint-q4-maths.md §7: "the record law of probability components
+/// has mass 1") — the positional all-Normal control case.
 #[test]
 fn joint_mass_positional_all_normalized_stays_normalized() {
-    let src = "m = joint(Normal(0.0, 1.0), Beta(1.0, 1.0))";
+    let src = "m = joint(Normal(0.0, 1.0), Normal(1.0, 2.0))";
     let out = ir(src);
     assert!(
         out.contains("(%mass %normalized)"),
@@ -1013,8 +1013,19 @@ fn joint_mass_positional_all_normalized_stays_normalized() {
 /// Two components sharing a stochastic ancestor (`z1`, `z2` both trace back
 /// to `mu`) and both non-normalized after `truncate`: the product rule is
 /// unsound here in general (kernel-joint-q4-maths.md §7, Student-t/`y^2`
-/// counterexample), and this crate has no ancestor tracking to prove the
-/// sharing absent, so the composed class must degrade to `%unknown`.
+/// counterexample). Both components are `lawof`-reified, so neither is
+/// provably trace-clean (`joint_component_is_trace_clean` — reification is
+/// one of the two channels spec §06's `joint` entry names for sharing a
+/// stochastic node) and the composed class degrades to `%unknown`.
+///
+/// This does NOT prove the degrade fires because of the shared `mu` — a pair
+/// of `lawof`-reified components with no shared ancestor at all would hit the
+/// same branch and read the same `%unknown` (no ancestor-identity oracle
+/// exists to tell the two apart, by the wave brief's design). What the
+/// carve-out DOES discriminate is reified vs bare-constructor components: see
+/// `positional_joint_mass_matches_keyword_joint_mass` in `golden.rs`, whose
+/// two bare `Lebesgue(reals)` components are provably trace-clean and stay
+/// exact at `%locallyfinite` under the identical two-non-normalized shape.
 #[test]
 fn joint_mass_two_nonnormalized_components_degrade_to_unknown() {
     let src = "mu ~ Normal(0.0, 1.0)\n\
@@ -1059,10 +1070,78 @@ fn joint_mass_one_nonnormalized_component_stays_exact() {
 /// `draw`/`rand` gate integration: a positional `joint` of two non-normalized
 /// components must be refused, same as the keyword form always was — this is
 /// the draw/rand-gate consumer of the mass fix above, not a new gate rule.
+/// Refuses at `%locallyfinite` (the trace-clean carve-out keeps this shape
+/// exact; see `positional_joint_mass_matches_keyword_joint_mass`), same as it
+/// did once `#159` landed — the gate itself is untouched by this wave.
 #[test]
 fn draw_of_positional_joint_two_lebesgue_refuses() {
     assert!(rejects(
         "y = draw(joint(Lebesgue(reals), Lebesgue(reals)))",
         "requires a probability measure"
     ));
+}
+
+/// `rand` shares `draw`'s gate (`unprovable_normalization`) but a different
+/// argument offset (measure at index 1) — pin the pair so the two cannot
+/// drift.
+#[test]
+fn rand_of_positional_joint_two_lebesgue_refuses() {
+    assert!(rejects(
+        "s = rnginit(0)\ny = rand(s, joint(Lebesgue(reals), Lebesgue(reals)))",
+        "requires a probability measure"
+    ));
+}
+
+/// Regression (review Critical 1): `normalize` is the one consumer that
+/// distinguishes `%locallyfinite` from `%unknown` — a `%locallyfinite`
+/// argument is a static error (spec §06, undefined normalization), while
+/// `%unknown` silently passes through as `%normalized`. Before the trace-clean
+/// carve-out, this exact shape's class widened from `%locallyfinite` to
+/// `%unknown` and this error disappeared, reopening (via `normalize`) the
+/// hole the wave exists to close: `draw(normalize(joint(Lebesgue(reals),
+/// Lebesgue(reals))))` would type `%normalized` and pass the draw gate. Both
+/// components are provably trace-clean bare constructors, so this must stay
+/// a static error.
+#[test]
+fn normalize_of_two_lebesgue_joint_is_a_static_error() {
+    assert!(rejects(
+        "n = normalize(joint(Lebesgue(reals), Lebesgue(reals)))",
+        "infinite total mass is undefined"
+    ));
+    assert!(rejects(
+        "n = normalize(joint(a = Lebesgue(reals), b = Lebesgue(reals)))",
+        "infinite total mass is undefined"
+    ));
+}
+
+/// Same regression, milder instance: `truncate` of a `%locallyfinite` measure
+/// to a bounded set is `%finite` (`ops.rs` truncate/restrict arm); at
+/// `%unknown` it would fall through to `%unknown` instead, losing a provable
+/// class with no diagnostic to mark the loss.
+#[test]
+fn truncate_of_two_lebesgue_joint_is_finite() {
+    let src = "j = truncate(joint(Lebesgue(reals), Lebesgue(reals)), interval(0.0, 1.0))";
+    let out = ir(src);
+    assert!(
+        out.contains("(%mass %finite)"),
+        "truncated two-Lebesgue joint must be %finite; got:\n{out}"
+    );
+}
+
+/// `joint()` (arity zero): `product_mass(&[])`'s `all()` was vacuously
+/// `%normalized` regardless of arity — the same root cause the brief names
+/// for the positional bug, reachable through arity zero instead of the
+/// named/positional split. The domain arm already leaves a zero-component
+/// `joint`'s domain `%deferred` (nothing resolves the variate shape), so the
+/// mass side now matches that honestly instead of claiming a definite class
+/// the domain does not support. `joint()`'s legality is a separate,
+/// unaddressed question — not decided here.
+#[test]
+fn joint_of_no_components_is_deferred_not_normalized() {
+    let src = "e = joint()";
+    let out = ir(src);
+    assert!(
+        out.contains("(%mass %deferred)"),
+        "empty joint must be %deferred, not a definite class; got:\n{out}"
+    );
 }
