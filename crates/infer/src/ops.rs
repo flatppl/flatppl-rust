@@ -57,6 +57,31 @@ pub(crate) fn call_rule(
     // User-defined callable application: the result looks through the callee
     // to the reified body (spec §11 reified callables).
     if let Some((callee_node, callee_ty)) = callee {
+        // `true`/`false` are lexed unconditionally to a bool `Lit` (never a
+        // `Ref`), so `true(0.5)` is postfix APPLICATION on that literal (spec
+        // §11), reaching this `CallHead::User` path instead of the
+        // `CallHead::Builtin` fallback below that types every other
+        // predefined constant's application `Type::Failed`. Without this,
+        // `callee_ty` here is a bare `Scalar(Boolean)` — matching neither
+        // `Type::Function` nor `Type::Kernel` in `user_call_type` — so it fell
+        // through to that function's honest `Type::Deferred` default, silent
+        // and indistinguishable from "no rule yet".
+        if let Node::Lit(Scalar::Bool(b)) = inf.module.node(callee_node) {
+            let name = if *b { "true" } else { "false" };
+            inf.diags.push(crate::Diagnostic::error_at(
+                id,
+                format!(
+                    "`{name}` is a predefined constant (spec §03), not a callable, \
+                     so it cannot be applied to arguments (spec §04 \"Language \
+                     design\": no callable has nullary inputs, which is what a \
+                     known value like `{name}` would need to be one)"
+                ),
+            ));
+            return (
+                Type::Failed(format!("{name} is not callable").into()),
+                Phase::Fixed,
+            );
+        }
         if let Some(ty) = user_arity_check(inf, id, callee_node, &callee_ty, args, named) {
             return (ty, joined);
         }
