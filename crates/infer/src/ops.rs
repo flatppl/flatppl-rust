@@ -4932,7 +4932,19 @@ pub(crate) fn fill_mass(
     Type::Measure { domain, mass }
 }
 
-/// The mass of an independent product of components.
+/// The mass of a `joint`'s components (spec §06 "Reference measure for
+/// product measures": a shared-ancestor `joint` keeps the product reference
+/// measure but its density is the equivalent record law, not a plain
+/// product). For trace-disjoint components the product-of-classes rule below
+/// is exact. For components sharing a stochastic ancestor it is exact only up
+/// to one non-normalized member: `%finite`x`%finite` composed through a
+/// shared ancestor can be infinite (Student-t/`y^2` counterexample,
+/// kernel-joint-q4-maths.md §7), so once two or more components are
+/// non-normalized no class stronger than `%unknown` is statically justified.
+/// This crate carries no ancestry tracking to tell shared from disjoint
+/// apart, so the two-or-more case degrades unconditionally — sound but
+/// conservative for provably-disjoint components (e.g. two independent
+/// `Lebesgue(reals)`) that would otherwise fold to a precise class.
 fn product_mass(masses: &[Mass]) -> Mass {
     use Mass::*;
     if masses.contains(&Null) {
@@ -4940,6 +4952,9 @@ fn product_mass(masses: &[Mass]) -> Mass {
     }
     if masses.iter().all(|m| *m == Normalized) {
         return Normalized;
+    }
+    if masses.iter().filter(|m| **m != Normalized).count() >= 2 {
+        return Unknown;
     }
     if masses.iter().all(|m| matches!(m, Normalized | Finite)) {
         return Finite;

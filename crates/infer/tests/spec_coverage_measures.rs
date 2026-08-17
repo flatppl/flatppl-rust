@@ -992,3 +992,77 @@ fn rand_accepts_a_deferred_mass_measure() {
         "{diags:?}"
     );
 }
+
+// ============================================================
+// `joint` mass class (kernel-joint-q4-maths.md §7)
+// ============================================================
+
+/// All-normalized components stay `%normalized` regardless of arity spelling
+/// (spec §06 "Reference measure for product measures": the record law of
+/// probability components has mass 1) — the positional control case.
+#[test]
+fn joint_mass_positional_all_normalized_stays_normalized() {
+    let src = "m = joint(Normal(0.0, 1.0), Beta(1.0, 1.0))";
+    let out = ir(src);
+    assert!(
+        out.contains("(%mass %normalized)"),
+        "positional all-normalized joint must be %normalized; got:\n{out}"
+    );
+}
+
+/// Two components sharing a stochastic ancestor (`z1`, `z2` both trace back
+/// to `mu`) and both non-normalized after `truncate`: the product rule is
+/// unsound here in general (kernel-joint-q4-maths.md §7, Student-t/`y^2`
+/// counterexample), and this crate has no ancestor tracking to prove the
+/// sharing absent, so the composed class must degrade to `%unknown`.
+#[test]
+fn joint_mass_two_nonnormalized_components_degrade_to_unknown() {
+    let src = "mu ~ Normal(0.0, 1.0)\n\
+               z1 ~ Normal(mu, 1.0)\n\
+               z2 ~ Normal(mu, 1.0)\n\
+               lz1 = lawof(z1)\n\
+               lz2 = lawof(z2)\n\
+               j = joint(truncate(lz1, interval(0.0, 5.0)), truncate(lz2, interval(0.0, 5.0)))";
+    let out = ir(src);
+    let bind = out
+        .find("(%bind j ")
+        .unwrap_or_else(|| panic!("binding j not found in:\n{out}"));
+    assert!(
+        out[bind..(bind + 120).min(out.len())].contains("%unknown"),
+        "shared-ancestor joint of two non-normalized components must be \
+         %unknown; got:\n{out}"
+    );
+}
+
+/// A single non-normalized component sharing ancestry with normalized peers
+/// stays exact (kernel-joint-q4-maths.md §7: "exactly one non-normalized
+/// component… its class carries over. Sound.") — no degrade when only one
+/// member deviates from `%normalized`.
+#[test]
+fn joint_mass_one_nonnormalized_component_stays_exact() {
+    let src = "mu ~ Normal(0.0, 1.0)\n\
+               z1 ~ Normal(mu, 1.0)\n\
+               z2 ~ Normal(mu, 1.0)\n\
+               lz2 = lawof(z2)\n\
+               j = joint(truncate(lawof(z1), interval(0.0, 5.0)), lz2)";
+    let out = ir(src);
+    let bind = out
+        .find("(%bind j ")
+        .unwrap_or_else(|| panic!("binding j not found in:\n{out}"));
+    assert!(
+        out[bind..(bind + 120).min(out.len())].contains("%finite"),
+        "one non-normalized (truncated) + one normalized component must stay \
+         %finite; got:\n{out}"
+    );
+}
+
+/// `draw`/`rand` gate integration: a positional `joint` of two non-normalized
+/// components must be refused, same as the keyword form always was — this is
+/// the draw/rand-gate consumer of the mass fix above, not a new gate rule.
+#[test]
+fn draw_of_positional_joint_two_lebesgue_refuses() {
+    assert!(rejects(
+        "y = draw(joint(Lebesgue(reals), Lebesgue(reals)))",
+        "requires a probability measure"
+    ));
+}
