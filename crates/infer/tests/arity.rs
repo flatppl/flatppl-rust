@@ -527,13 +527,16 @@ fn the_splat_hint_reaches_every_diagnostic_a_splatting_call_can_produce() {
         )]
     );
     // §07 value function, arity path — the reach onto §07 the amendment created.
-    // `prod` and not `sum`: `sum` is exempt under #78's carve-out (see
-    // `a_single_input_callable_whose_domain_admits_tables_is_exempt`), while `prod` is
-    // an arrays-only row and still splats.
+    // `sizeof` and not `sum`: `sum` is exempt under #78's carve-out (see
+    // `a_single_input_callable_whose_domain_admits_tables_is_exempt`), while `sizeof`
+    // is an arrays-only row and still splats. `prod` moved off this list onto the
+    // exempt one when design PR #79 added it to the Table reductions paragraph.
     assert_eq!(
-        errors("d = load_data(\"d.csv\", cartpow(cartprod(x = reals, y = reals), 4))\ns = prod(d)"),
+        errors(
+            "d = load_data(\"d.csv\", cartpow(cartprod(x = reals, y = reals), 4))\ns = sizeof(d)"
+        ),
         vec![format!(
-            "`prod` takes 1 argument (spec §07), got 2{SPLAT_HINT}"
+            "`sizeof` takes 1 argument (spec §07), got 2{SPLAT_HINT}"
         )]
     );
     // USER call, arity path — the shape the transport models used.
@@ -573,6 +576,11 @@ fn the_splat_hint_reaches_every_diagnostic_a_splatting_call_can_produce() {
 /// since it is sqrt(var) and a column-wise `var` implies a column-wise `std`. Both
 /// halves of the condition come from the CALLEE's signature.
 ///
+/// `prod`/`maximum`/`minimum` join the same paragraph by design PR #79
+/// (owner-merge pending as of this test): the engine work lands ahead of the spec
+/// merge, per the owner's ruling, so the twelve members below are current even
+/// though #79 is not yet on `flatppl-design` `main`.
+///
 /// An earlier revision of this test listed only four, because the extraction regex
 /// matched a bare `` |`name`| `` row and silently dropped every row whose name is a
 /// LINK (`| [`reverse`](#reverse) |`) — which is most of them. The four missed rows
@@ -580,13 +588,17 @@ fn the_splat_hint_reaches_every_diagnostic_a_splatting_call_can_produce() {
 #[test]
 fn a_single_input_callable_whose_domain_admits_tables_is_exempt() {
     let t = "d = load_data(\"d.csv\", cartpow(cartprod(x = reals, y = reals), 4))\n";
-    // All EIGHT exempt rows take the two-column table whole. `reverse`,
-    // `indicesof`, `indicesof0` and `identity` are the ones the first pass missed.
+    // All exempt rows take the two-column table whole. `reverse`, `indicesof`,
+    // `indicesof0` and `identity` are the ones the first pass missed; `prod`,
+    // `maximum`, `minimum` are the three #79 adds.
     for f in [
         "sum",
         "mean",
         "var",
         "std",
+        "prod",
+        "maximum",
+        "minimum",
         "lengthof",
         "reverse",
         "indicesof",
@@ -620,16 +632,15 @@ fn a_single_input_callable_whose_domain_admits_tables_is_exempt() {
         errors("r = record(a = 1.0, b = 2.0)\nx = get(r, [\"a\"])").is_empty(),
         "`get` is multi-input, so its record argument is ordinary, not splatted"
     );
-    // Arrays-only rows keep splatting.
-    for f in ["prod", "sizeof"] {
-        assert_eq!(
-            errors(&format!("{t}s = {f}(d)")),
-            vec![format!(
-                "`{f}` takes 1 argument (spec §07), got 2{SPLAT_HINT}"
-            )],
-            "`{f}` is arrays-only and must still splat"
-        );
-    }
+    // Arrays-only row keeps splatting.
+    let f = "sizeof";
+    assert_eq!(
+        errors(&format!("{t}s = {f}(d)")),
+        vec![format!(
+            "`{f}` takes 1 argument (spec §07), got 2{SPLAT_HINT}"
+        )],
+        "`{f}` is arrays-only and must still splat"
+    );
     // The ARITY half matters independently of the domain half: `Exponential` has one
     // input, but its domain is `reals`, so it splats — and here the field name
     // happens to match, which is what makes the call valid rather than the exemption.
@@ -841,32 +852,83 @@ fn a_table_reduction_carries_a_matching_record_value_set() {
     }
 }
 
-/// Two deliberate NON-extensions, both spec-grounded.
-///
-/// `prod` is not a table reduction: §07's paragraph names `sum`, `mean`, `var` (and
-/// `std` by ruling) and stops, so `prod` over a table keeps whatever it did. It is
-/// also not splat-exempt, so a multi-column table never reaches its type rule at all.
-///
-/// A column whose per-row type is NOT a scalar leaves the whole call `%deferred`:
-/// §07 says only "Every column must support the reduction operation" and does not say
-/// what reducing a column of vectors yields, so inventing one would be guessing.
+/// A deliberate NON-extension, spec-grounded: a column whose per-row type is NOT a
+/// scalar leaves the whole call `%deferred`. §07 says only "Every column must
+/// support the reduction operation" and does not say what reducing a column of
+/// vectors yields, so inventing one would be guessing. Covers all seven table
+/// reductions, including the three design PR #79 adds.
 #[test]
-fn table_reductions_do_not_extend_to_prod_or_to_non_scalar_columns() {
-    let two = "d = load_data(\"d.csv\", cartpow(cartprod(x = reals, y = reals), 4))\n";
-    // `prod` is not exempt, so the two-column table splats and fails on arity.
-    assert!(
-        errors(&format!("{two}s = prod(d)"))
-            .iter()
-            .any(|e| e.contains("`prod` takes 1 argument")),
-        "`prod` is not a table reduction and not splat-exempt"
-    );
-    // A vector-valued column: no rule, and `%deferred` rather than a guess.
+fn table_reductions_leave_non_scalar_columns_deferred() {
     let vec_col = "d = load_data(\"d.csv\", cartpow(cartprod(v = cartpow(reals, 3)), 4))\n";
-    for f in ["sum", "mean", "var", "std"] {
+    for f in ["sum", "mean", "var", "std", "prod", "maximum", "minimum"] {
         let out = ir(&format!("{vec_col}s = {f}(d)"));
         assert!(
             out.contains(&format!("(%bind s (%meta (%deferred %fixed %unknown) ({f}")),
             "`{f}` over a vector-column table must stay %deferred, in:\n{out}"
+        );
+    }
+}
+
+/// `prod`, `maximum`, `minimum` join the §07 **Table reductions** paragraph by
+/// design PR #79 (owner-merge pending as of this test; the engine work lands ahead
+/// of the spec merge, per the owner's ruling, with the gap recorded in
+/// `flatppl-dev`). Before this change each of the three was arrays-only and not
+/// splat-exempt, so a multi-column table never reached a type rule for them at
+/// all — it failed on arity instead, exactly as `table_reductions_leave_non_
+/// scalar_columns_deferred`'s predecessor pinned for `prod`.
+///
+/// `prod` keeps the column's own element type (spec §07: a product of integers is
+/// an integer, same as `sum`). `maximum`/`minimum` also keep the element type —
+/// they return an ELEMENT of the column rather than a computed aggregate,
+/// matching their catalogue row's `ElemScalarKind` result on the array form.
+#[test]
+fn prod_maximum_minimum_reduce_a_table_column_wise() {
+    let two = "d = load_data(\"d.csv\", cartpow(cartprod(x = reals, y = reals), 4))\n";
+    for f in ["prod", "maximum", "minimum"] {
+        // No longer an arity error: the call is exempt and reaches the table rule.
+        assert!(
+            errors(&format!("{two}s = {f}(d)")).is_empty(),
+            "`{f}` must be splat-exempt over a table (design PR #79)"
+        );
+        let out = ir(&format!("{two}s = {f}(d)"));
+        assert!(
+            out.contains(&format!(
+                "(%bind s (%meta ((%record (x (%scalar real)) (y (%scalar real))) \
+                 %fixed (record (x reals) (y reals))) ({f}"
+            )),
+            "`{f}` over a table must give a record keyed by the column names, in:\n{out}"
+        );
+    }
+    // Element type is preserved per column, including for an INTEGER column —
+    // unlike `mean`/`var`/`std`, none of the three computes a new numeric kind.
+    let mixed = "d = load_data(\"d.csv\", cartpow(cartprod(k = integers, y = reals), 4))\n";
+    for f in ["prod", "maximum", "minimum"] {
+        let out = ir(&format!("{mixed}s = {f}(d)"));
+        assert!(
+            out.contains("(%record (k (%scalar integer)) (y (%scalar real)))"),
+            "`{f}` must keep each column's own element type, in:\n{out}"
+        );
+    }
+    // A ONE-column table still gives a ONE-field record, not a scalar — the same
+    // case `a_one_column_table_reduces_to_a_one_field_record` pins for sum/mean.
+    let one = "d = load_data(\"d.csv\", cartpow(cartprod(x = reals), 4))\n";
+    for f in ["prod", "maximum", "minimum"] {
+        let out = ir(&format!("{one}s = {f}(d)"));
+        assert!(
+            out.contains("(%record (x (%scalar real)))")
+                && !out.contains("%bind s (%meta ((%scalar"),
+            "`{f}` over a one-column table is a one-field record, not a scalar, in:\n{out}"
+        );
+    }
+    // The value-set must describe the record, not the scalar set `maximum`/
+    // `minimum`'s catalogue row would give for a bare array argument — the same
+    // drift `a_table_reduction_carries_a_matching_record_value_set` guards for
+    // `var`/`std`.
+    for f in ["prod", "maximum", "minimum"] {
+        let out = ir(&format!("{two}s = {f}(d)"));
+        assert!(
+            out.contains("(record (x reals) (y reals))"),
+            "`{f}` must carry the value-set (record (x reals) (y reals)), in:\n{out}"
         );
     }
 }

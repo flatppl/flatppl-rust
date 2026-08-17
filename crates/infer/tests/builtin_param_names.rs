@@ -39,14 +39,19 @@ fn mismatched(builtin: &str) -> Vec<String> {
     ))
 }
 
-/// The nine names §04's single-input carve-out exempts (flatppl-design#78) — they take the
-/// aggregate WHOLE, so no splat and no name check applies to them.
+/// The names §04's single-input carve-out exempts (flatppl-design#78) — they take the
+/// aggregate WHOLE, so no splat and no name check applies to them. `prod`, `maximum`,
+/// `minimum` join the original nine by design PR #79 (owner-merge pending as of this
+/// change), which extends §07's Table reductions paragraph to those three.
 const EXEMPT: &[&str] = &[
     "identity",
     "indicesof",
     "indicesof0",
     "lengthof",
+    "maximum",
     "mean",
+    "minimum",
+    "prod",
     "reverse",
     "std",
     "sum",
@@ -114,11 +119,12 @@ fn column_order_is_irrelevant_once_binding_is_by_name() {
 }
 
 /// The whole audit surface, swept: every base name against a name-mismatched sole positional
-/// 2-column table. **Only the nine `#78`-exempt names may still accept it** — the variadic
+/// 2-column table. **Only the `#78`-exempt names may still accept it** — the variadic
 /// carve-out that used to appear here is closed (`variadic_splat.rs`), so this sweep is now
-/// exhaustive over the B76 finding set with no exceptions beyond the carve-out.
+/// exhaustive over the B76 finding set with no exceptions beyond the carve-out. `EXEMPT` grew
+/// from nine to twelve when design PR #79 added `prod`/`maximum`/`minimum`.
 #[test]
-fn no_builtin_accepts_a_name_mismatched_splat_except_the_exempt_nine() {
+fn no_builtin_accepts_a_name_mismatched_splat_except_the_exempt_set() {
     let cat = builtin_catalogue();
     let mut accepted: Vec<&str> = cat
         .base_names()

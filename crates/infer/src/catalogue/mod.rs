@@ -418,22 +418,24 @@ impl Catalogue {
     ///   number of table rows."
     /// - `identity` ("any") — an unrestricted domain admits records and tables, and
     ///   a function returning its argument unchanged must not restructure it.
-    /// - `sum`, `mean`, `var`, `std` — their Domains cells say only "real/complex
-    ///   arrays" / "real arrays"; the table domain lives in §07's **Table
-    ///   reductions** paragraph ("When `sum`, `mean`, `var`, or `std` is applied to a
-    ///   table, the reduction operates column-wise and returns a record whose fields
-    ///   are the column names"). #78 names `sum(t)` normatively for exactly this
-    ///   reason. `std` was added to that paragraph by an owner ruling on 2026-08-10
-    ///   (flatppl-design `4c93237`, onto #77) after this guard first shipped without
-    ///   it — it is $\sqrt{\mathrm{var}}$, so a column-wise `var` implies a
-    ///   column-wise `std`.
+    /// - `sum`, `mean`, `var`, `std`, `prod`, `maximum`, `minimum` — their Domains
+    ///   cells say only "real/complex arrays" / "real arrays"; the table domain
+    ///   lives in §07's **Table reductions** paragraph ("When `sum`, `mean`, `var`,
+    ///   `std`, `prod`, `maximum`, or `minimum` is applied to a table, the reduction
+    ///   operates column-wise and returns a record whose fields are the column
+    ///   names"). #78 names `sum(t)` normatively for exactly this reason. `std` was
+    ///   added to that paragraph by an owner ruling on 2026-08-10 (flatppl-design
+    ///   `4c93237`, onto #77) — it is $\sqrt{\mathrm{var}}$, so a column-wise `var`
+    ///   implies a column-wise `std`. `prod`, `maximum`, `minimum` were added by
+    ///   design PR #79 (owner-merge pending as of this change; landed ahead of spec
+    ///   per the owner's ruling that the engine work need not wait).
     ///
     /// Deliberately ABSENT, each checked against its own row rather than assumed:
     ///
     /// - `boolean`, `integer`, `real` — "any **scalar** numeric". The word "any" is
     ///   qualified, so these do not admit aggregates.
-    /// - `sizeof` ("vectors, arrays"), `prod` ("real/complex arrays"), and every
-    ///   other reduction/norm/stack row — arrays only.
+    /// - `sizeof` ("vectors, arrays") and every other reduction/norm/stack row —
+    ///   arrays only.
     /// - `qr` — RETURNS `record(Q, R)`, but its domain is "$m \times n$ matrices".
     ///   The carve-out is about the domain, not the result.
     /// - `totalmass` — §06, and its input is a measure, not an aggregate.
@@ -456,7 +458,10 @@ impl Catalogue {
         "indicesof",
         "indicesof0",
         "lengthof",
+        "maximum",
         "mean",
+        "minimum",
+        "prod",
         "reverse",
         "std",
         "sum",
