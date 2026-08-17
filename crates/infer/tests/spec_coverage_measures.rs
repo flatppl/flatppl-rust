@@ -1573,3 +1573,89 @@ fn the_q1_error_reads_an_auto_inputs_boundary_too() {
         "two auto-traced boundaries agree by construction"
     );
 }
+
+/// `disintegrate_type` uses an EMPTY kernel-inputs list as its documented
+/// don't-know sentinel ("Falls back to empty kernel inputs … when the joint isn't
+/// a record measure or the selector isn't a static field-name set"). §04 forbids
+/// what a genuine empty list would mean — "No callables may have nullary inputs,
+/// as this would make them equivalent to known values" — so the arity check must
+/// read it as "unknown", not as `want = 0`. Reading it as a declaration blamed the
+/// call site for the arity of a kernel whose inputs the engine could not
+/// determine, on programs that previously inferred and deferred honestly.
+///
+/// The element reaches the check through a `get`, which IS a local builtin call
+/// with no boundary, so the fallback fires for it — the sentinel is what has to be
+/// declined, not the shape.
+#[test]
+fn an_unresolvable_disintegrate_element_can_still_be_applied() {
+    // The selector names a field the joint does not have.
+    let missing = "a ~ Normal(mu = 0.0, sigma = 1.0)\n\
+                   b ~ Normal(mu = a, sigma = 1.0)\n\
+                   J = lawof(record(a = a, b = b))\n\
+                   fk, prior = disintegrate([\"nosuchfield\"], J)\n\
+                   M = fk(a = 0.5)";
+    assert!(
+        !rejects(missing, "declares 0 parameters"),
+        "an unknown input list is not a zero-parameter declaration: {:?}",
+        diags_of(missing)
+    );
+    assert!(
+        bind_line(&ir(missing), "fk").contains("(%kernel (%inputs )"),
+        "premise: the sentinel really is the empty list"
+    );
+    // The joint is not a record measure at all.
+    let not_a_record = "a ~ Normal(mu = 0.0, sigma = 1.0)\n\
+                        Jsc = lawof(a)\n\
+                        fk, prior = disintegrate([\"a\"], Jsc)\n\
+                        M = fk(a = 0.5)";
+    assert!(
+        !rejects(not_a_record, "declares 0 parameters"),
+        "same sentinel through the non-record fallback: {:?}",
+        diags_of(not_a_record)
+    );
+    // And the fix is not a blanket opt-out: a RESOLVED element is still checked.
+    let resolved = "a ~ Normal(mu = 0.0, sigma = 1.0)\n\
+                    b ~ Normal(mu = a, sigma = 1.0)\n\
+                    J = lawof(record(a = a, b = b))\n\
+                    fk, prior = disintegrate([\"b\"], J)\n\
+                    M = fk(nope = 0.5)";
+    assert!(
+        rejects(resolved, "`fk` has no parameter `nope` (declares: `a`)"),
+        "a resolved input list is a real declaration and §04 still applies"
+    );
+}
+
+/// A `joint` mixing positional and keyword components is a static error. §06
+/// spells two forms and no third, and reading only `named` whenever it is
+/// non-empty silently DROPS every positional component — for a kernel that drops
+/// its inputs from the union, contradicting #85's "the union of the component
+/// kernels' inputs by name", which carries no qualification by spelling. Both
+/// routes to an answer agree: rewriting the call by §06's own relabel equivalence
+/// leaves a positional `joint` mixing a bare variate with a relabelled record,
+/// which "Mixing shape classes is a static error" rejects; and the determiniser's
+/// `lower_joint` already refuses the shape in the same words.
+///
+/// Before this, the drop was silent AND enforced: `KJ` typed `(%inputs w)` with
+/// `z` gone, and applying it with both real inputs failed the arity check against
+/// the truncated list.
+#[test]
+fn a_joint_mixing_positional_and_keyword_kernel_components_is_a_static_error() {
+    let src = "z  = elementof(reals)\n\
+               w  = elementof(reals)\n\
+               b1 ~ Normal(mu = z, sigma = 1.0)\n\
+               b2 ~ Normal(mu = w, sigma = 1.0)\n\
+               K1 = kernelof(b1, z = z)\n\
+               K2 = kernelof(b2, w = w)\n\
+               KJ = joint(K1, q = K2)\n\
+               M  = KJ(z = 0.0, w = 0.0)";
+    assert!(
+        rejects(src, "mixes positional and keyword components"),
+        "the mixed spelling is refused on its own terms: {:?}",
+        diags_of(src)
+    );
+    assert!(
+        !rejects(src, "declares 1 parameter, got 2 arguments"),
+        "and NOT reported as a call-site arity error against the dropped list: {:?}",
+        diags_of(src)
+    );
+}

@@ -2147,12 +2147,51 @@ fn joint_type(
 ///
 /// A component that is neither a measure nor a kernel leaves the whole `joint`
 /// `%deferred`, exactly as the measure arms do.
+///
+/// **A MIXED spelling — positional and keyword components in one call — is a
+/// static error here.** §06 spells two forms and no third: `joint(M1, M2, ...)`
+/// and `joint(name1 = M1, name2 = M2, ...)`. Reading only `named` whenever it is
+/// non-empty, which is what the measure arms do, silently DROPS every positional
+/// component, and for a kernel that means dropping its inputs from the union —
+/// contradicting #85's own sentence, which unions "the component kernels' inputs"
+/// with no qualification by spelling. Refusing is the reading that both routes to
+/// the answer support:
+///
+/// - §06 defines the keyword form BY the relabel equivalence
+///   (`joint(a = M1, b = M2)` "is equivalent to `joint(relabel(M1, ["a"]),
+///   relabel(M2, ["b"]))`"). Rewriting a mixed call by it yields a purely
+///   positional `joint(K1, relabel(K2, ["q"]))`, which the one shape-class rule
+///   then judges: "All components must have the same shape class … Mixing shape
+///   classes is a static error." A bare component's variate beside a relabelled
+///   one is scalar beside record, so every mixed spelling this arm can see is
+///   already a static error by that rule. (Deciding it per-component instead would
+///   need each kernel component's output variate, which `Type::Kernel` does not
+///   carry — Q2 — so this arm could not compute it if it wanted to.)
+/// - `determinizer`'s `lower_joint` already refuses the shape in the same words:
+///   "joint mixes positional and keyword components; a joint is either the
+///   positional cat-variate form or the keyword record-variate form, not both". So
+///   typing it was only ever a deferral of the same refusal to a later pass.
+///
+/// Scoped to the kernel arm deliberately. The MEASURE arms drop a positional
+/// component the same way (`joint(Normal(0.0, 1.0), b = Exponential(1.0))` types
+/// over `record{b}` alone), which is pre-existing and carded; the decision above
+/// applies to it unchanged, but making it there changes typing on a path this wave
+/// does not own.
 fn kernel_joint_type(
     inf: &mut Inferencer<'_, '_>,
     id: NodeId,
     args: &[ArgInfo],
     named: &[NamedInfo],
 ) -> Type {
+    if !args.is_empty() && !named.is_empty() {
+        inf.diags.push(crate::Diagnostic::error_at(
+            id,
+            "`joint` mixes positional and keyword components: a `joint` is either \
+             the positional cat-variate form or the keyword record-variate form, \
+             not both (spec §06)",
+        ));
+        return Type::Failed("joint mixes positional and keyword components".into());
+    }
     let components: Vec<(NodeId, &Type)> = if named.is_empty() {
         args.iter().map(|(n, t, _)| (*n, t)).collect()
     } else {
@@ -2410,6 +2449,12 @@ fn kernel_joint_result_type(inf: &mut Inferencer<'_, '_>, callee: NodeId) -> Opt
             _ => return None,
         }
     };
+    // A mixed spelling is a static error ([`kernel_joint_type`]), so it never
+    // reaches here with a `Type::Kernel` callee. Declined rather than read, so the
+    // component-dropping split exists in one place instead of two.
+    if !call.args.is_empty() && !call.named.is_empty() {
+        return None;
+    }
     let components: Vec<(Option<Symbol>, NodeId)> = if call.named.is_empty() {
         call.args.iter().map(|&a| (None, a)).collect()
     } else {
@@ -2989,6 +3034,26 @@ fn cat_or_diagnose(
 ///   case the doc comment's "declares no parameter list here" already excepted;
 /// - a reification, which [`user_arity_check`] reads from the boundary first and
 ///   never reaches this fallback for.
+///
+/// **An EMPTY list is a don't-know sentinel, never a declaration, and is
+/// declined.** §04 forbids the thing it would otherwise mean: "No callables may
+/// have nullary inputs, as this would make them equivalent to known values." So a
+/// kernel type carrying zero inputs cannot be a well-formed declaration, and at
+/// least one rule uses the empty list to say exactly that — `disintegrate_type`
+/// documents "Falls back to empty kernel inputs … when the joint isn't a record
+/// measure or the selector isn't a static field-name set", and the element reaches
+/// here through a `get`, which IS a local builtin call with no boundary. Reading
+/// that sentinel as `want = 0` blamed the call site for the arity of a kernel
+/// whose inputs the engine could not determine, turning a program that inferred
+/// and deferred honestly into a hard static error.
+///
+/// Declining the empty list is preferred over allowlisting heads the way
+/// [`kernel_mass_is_own_rules`] does, for two reasons. It rests on a spec sentence
+/// rather than on a list that has to be maintained, and it keeps the §04 check
+/// reachable for every op that lifts pointwise to a kernel — an allowlist would
+/// silently stop checking the next one added. It does not defend against a future
+/// rule inventing a DIFFERENT sentinel (a wrong non-empty list); nothing does that
+/// today.
 fn local_kernel_inputs(
     inf: &Inferencer<'_, '_>,
     callee: NodeId,
@@ -2997,6 +3062,9 @@ fn local_kernel_inputs(
     let Type::Kernel { inputs, .. } = callee_ty else {
         return None;
     };
+    if inputs.is_empty() {
+        return None;
+    }
     let mut node = callee;
     loop {
         match inf.module.node(node) {
