@@ -1433,3 +1433,143 @@ fn an_all_measure_joint_is_unchanged_by_the_kernel_arm() {
         "positional measure joint's exact fold unchanged; got:\n{pos}"
     );
 }
+
+/// §04 "Calling conventions": "A call with field or column names that do not
+/// match the callable's argument names is a static error." A fan-out kernel
+/// declares its inputs in its TYPE rather than on a boundary node, and the
+/// user-call arity/name check read only the boundary — so every ill-formed
+/// application of one typed as a closed `%measure` with the declared input never
+/// bound, and `draw(KJ())` as a concrete `%record`. Each spelling must now be
+/// refused exactly as the plain-`kernelof` control is.
+#[test]
+fn an_ill_formed_application_of_a_fan_out_kernel_is_a_static_error() {
+    let model = |app: &str| {
+        format!(
+            "{SHARED_LATENT_PROBE}\
+             K1 = kernelof(a1, z = z)\n\
+             K2 = kernelof(a2, z = z)\n\
+             KJ = joint(p = K1, q = K2)\n\
+             M  = {app}"
+        )
+    };
+    assert!(
+        rejects(&model("KJ()"), "`KJ` declares 1 parameter, got 0 arguments"),
+        "an unbound declared input is not a closed measure"
+    );
+    assert!(
+        rejects(
+            &model("KJ(nope = 0.0)"),
+            "`KJ` has no parameter `nope` (declares: `z`)"
+        ),
+        "an undeclared keyword is a static error"
+    );
+    assert!(
+        rejects(
+            &model("KJ(z = 0.0, extra = 1.0)"),
+            "`KJ` declares 1 parameter, got 2 arguments"
+        ),
+        "a surplus argument is a static error"
+    );
+    // The well-formed application still types, and still types as the record.
+    let ok = model("KJ(z = 0.0)");
+    assert!(
+        !rejects(&ok, "declares 1 parameter"),
+        "the well-formed application must not be caught by the arity check"
+    );
+    assert!(
+        bind_line(&ir(&ok), "M").contains("(%measure (%domain (%record"),
+        "and it is still a measure over the record variate"
+    );
+}
+
+/// The fold must not consume a component mass that its own type rule never set.
+/// `fill_mass` returns early unless the type is `Type::Measure`, so
+/// `truncate(kernelof(…), …)` keeps the base's `%normalized` where the measure
+/// version reads `%finite` (a separate, carded defect — asserted here as the
+/// premise, not as correct). Folding that unchanged published a wrong STRONGER
+/// class: the `joint` read `%normalized` instead of Q5's `%unknown`, and `kchain`
+/// carried it onto a MEASURE, past the gates an unnormalized measure must not
+/// pass.
+#[test]
+fn a_fan_out_does_not_inherit_an_unlifted_component_mass() {
+    let out = ir("z  = elementof(reals)\n\
+                  a1 ~ Normal(mu = z, sigma = 1.0)\n\
+                  a2 ~ Normal(mu = z, sigma = 1.0)\n\
+                  T1 = truncate(kernelof(a1, z = z), interval(0.0, 5.0))\n\
+                  T2 = truncate(kernelof(a2, z = z), interval(0.0, 5.0))\n\
+                  KJ = joint(p = T1, q = T2)\n\
+                  C  = kchain(Normal(mu = 0.0, sigma = 1.0), KJ)");
+    assert!(
+        bind_line(&out, "T1").contains("(%mass %normalized)"),
+        "premise: the component's mass is un-lifted and reads %normalized; if \
+         this line fails the `fill_mass` lift landed and this test should read \
+         the true class instead:\n{out}"
+    );
+    assert!(
+        bind_line(&out, "KJ").contains("(%mass %unknown)"),
+        "the fan-out must not fold an un-lifted component class; got:\n{out}"
+    );
+    assert!(
+        bind_line(&out, "C").contains("(%mass %unknown)"),
+        "and `kchain` must not carry a claimed %normalized onto a measure; \
+         got:\n{out}"
+    );
+}
+
+/// The Q1 narrowing's load-bearing half. `component_draw_nodes` walks straight
+/// past the reification boundary, so both components here report `w`'s draw and
+/// the intersection is non-empty — yet boundary substitution SEVERS `w` and the
+/// components are genuinely trace-disjoint. Only the ancestor test stops the
+/// false fire: `w`'s own subtree is `Normal(0.0, 1.0)` and never reaches
+/// `(%ref self z)`. Without it, a well-formed program would be rejected.
+#[test]
+fn a_shared_draw_upstream_of_the_boundary_does_not_fire_the_q1_error() {
+    let src = "w  ~ Normal(mu = 0.0, sigma = 1.0)\n\
+               z  = 2.0 * w\n\
+               a1 ~ Normal(mu = z, sigma = 1.0)\n\
+               a2 ~ Normal(mu = z, sigma = 1.0)\n\
+               K1 = kernelof(a1, s = z)\n\
+               K2 = kernelof(a2, t = z)\n\
+               KJ = joint(p = K1, q = K2)";
+    assert!(
+        !rejects(src, "bound under different input names"),
+        "a draw the boundary severs is not shared between the components"
+    );
+    assert!(
+        bind_line(&ir(src), "KJ").contains("(%kernel (%inputs s t)"),
+        "and both names are inputs of the fan-out"
+    );
+}
+
+/// The `%autoinputs` boundary spelling reaches the Q1 check too: a bare
+/// `kernelof(a2)` auto-traces `z` as its input name, so pairing it with an
+/// explicit `s = z` is the same disagreement, and two bare `kernelof`s agree by
+/// construction. Every other test here uses an explicit boundary, so this pins
+/// the side-table path `input_entries` reads for `Inputs::Auto`.
+#[test]
+fn the_q1_error_reads_an_auto_inputs_boundary_too() {
+    assert!(
+        rejects(
+            &format!(
+                "{SHARED_LATENT_PROBE}\
+                 K1 = kernelof(a1, s = z)\n\
+                 K2 = kernelof(a2)\n\
+                 KJ = joint(p = K1, q = K2)"
+            ),
+            "bound under different input names"
+        ),
+        "an auto-traced input name disagrees with an explicit one"
+    );
+    assert!(
+        !rejects(
+            &format!(
+                "{SHARED_LATENT_PROBE}\
+                 K1 = kernelof(a1)\n\
+                 K2 = kernelof(a2)\n\
+                 KJ = joint(p = K1, q = K2)"
+            ),
+            "bound under different input names"
+        ),
+        "two auto-traced boundaries agree by construction"
+    );
+}

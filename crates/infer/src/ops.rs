@@ -57,7 +57,7 @@ pub(crate) fn call_rule(
     // User-defined callable application: the result looks through the callee
     // to the reified body (spec §11 reified callables).
     if let Some((callee_node, callee_ty)) = callee {
-        if let Some(ty) = user_arity_check(inf, id, callee_node, args, named) {
+        if let Some(ty) = user_arity_check(inf, id, callee_node, &callee_ty, args, named) {
             return (ty, joined);
         }
         let ty = user_call_type(inf, callee_node, &callee_ty, args, named);
@@ -2974,21 +2974,75 @@ fn cat_or_diagnose(
     }
 }
 
+/// The input names of a callee that is a LOCAL measure-algebra expression typed
+/// as a kernel — a fan-out `joint(K1, K2, …)`, a nested one, `truncate(K)` — where
+/// the parameter list lives in the type because there is no boundary node to read.
+/// `None` for anything else, so [`user_arity_check`] stays silent rather than
+/// guessing.
+///
+/// Deliberately gated on the callee resolving, through self-module refs, to a
+/// LOCAL builtin call with no `inputs` boundary. That excludes the two sources
+/// whose declared list this function has no business policing:
+///
+/// - a cross-module `(%ref <alias> member)`, whose input list rode a side-table
+///   from the dependency's own inference rather than being declared here — the
+///   case the doc comment's "declares no parameter list here" already excepted;
+/// - a reification, which [`user_arity_check`] reads from the boundary first and
+///   never reaches this fallback for.
+fn local_kernel_inputs(
+    inf: &Inferencer<'_, '_>,
+    callee: NodeId,
+    callee_ty: &Type,
+) -> Option<Vec<Symbol>> {
+    let Type::Kernel { inputs, .. } = callee_ty else {
+        return None;
+    };
+    let mut node = callee;
+    loop {
+        match inf.module.node(node) {
+            Node::Ref(r) if r.ns == RefNs::SelfMod => {
+                let binding = inf.module.binding_by_name(r.name)?;
+                node = inf.module.binding(binding).rhs;
+            }
+            Node::Call(c) if c.inputs.is_none() => {
+                let CallHead::Builtin(_) = c.head else {
+                    return None;
+                };
+                return Some(inputs.to_vec());
+            }
+            _ => return None,
+        }
+    }
+}
+
 /// Reject an application of a user-defined callable whose argument count
 /// contradicts the callable's declared parameter list. Returns
 /// `Some(Type::Failed)` for a mismatch, `None` when the count matches, the
-/// count is not knowable (see [`supplied_arg_count`]), or the callee is not a
-/// local reification (a cross-module or non-reified callee declares no
-/// parameter list here).
+/// count is not knowable (see [`supplied_arg_count`]), or the callee declares no
+/// parameter list this function can read (a cross-module callee's list is
+/// carried in a side-table, not declared here).
 ///
 /// Without this the call still types — `substituted_result` binds parameters to
 /// arguments by keyword then position and ignores the rest — so a wrong-arity
 /// application reaches the determiniser as a `ResidualUserCall` refusal instead
 /// of a static error naming the callee.
+///
+/// **Two sources for the parameter list.** A reification declares its inputs on
+/// the node ([`local_reification`] + [`input_entries`]). A callable built by a
+/// measure-algebra op — a fan-out kernel `joint(K1, K2, …)`, and by the same
+/// token `truncate(K)` or a nested `joint` — declares them in its TYPE instead,
+/// because there is no boundary to read ([`local_kernel_inputs`]). §04 "Calling
+/// conventions" governs both ("A call with field or column names that do not
+/// match the callable's argument names is a static error"), so reading only the
+/// first source abandoned the whole check for the second: `KJ()`,
+/// `KJ(nope = 0.0)` and `KJ(z = 0.0, extra = 1.0)` all typed as a closed
+/// `%measure`, and `draw(KJ())` as a concrete `%record`, with the declared input
+/// never bound.
 fn user_arity_check(
     inf: &mut Inferencer<'_, '_>,
     id: NodeId,
     callee: NodeId,
+    callee_ty: &Type,
     args: &[ArgInfo],
     named: &[NamedInfo],
 ) -> Option<Type> {
@@ -2997,9 +3051,14 @@ fn user_arity_check(
     if inf.module_catalogue_ref(callee).is_some() {
         return None;
     }
-    let (reif_id, _) = local_reification(inf, callee)?;
-    let entries = input_entries(inf, reif_id)?;
-    let want = entries.len();
+    let declared: Vec<Symbol> = match local_reification(inf, callee) {
+        Some((reif_id, _)) => input_entries(inf, reif_id)?
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect(),
+        None => local_kernel_inputs(inf, callee, callee_ty)?,
+    };
+    let want = declared.len();
     // §04 scopes auto-splatting to "built-in or user defined value functions,
     // constructors or transition kernels", so a user call reads a sole record
     // argument exactly as a builtin call does. #78's single-input carve-out turns
@@ -3015,9 +3074,9 @@ fn user_arity_check(
     };
     if got == want {
         // The count is right; the names still have to be the declared inputs.
-        let names: Vec<String> = entries
+        let names: Vec<String> = declared
             .iter()
-            .map(|(n, _)| inf.module.resolve(*n).to_string())
+            .map(|n| inf.module.resolve(*n).to_string())
             .collect();
         return arg_name_check(inf, &names, &who, None, &reading, args, named);
     }
@@ -5278,16 +5337,12 @@ pub(crate) fn fill_mass(
 /// the split is mirrored here so both spellings of the same joint fold
 /// identically.
 fn joint_mass(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo], named: &[NamedInfo]) -> Mass {
-    let component_mass = |t: &Type| match t {
-        Type::Measure { mass, .. } | Type::Kernel { mass, .. } => *mass,
-        _ => Mass::Unknown,
-    };
     let (masses, not_clean): (Vec<Mass>, Vec<bool>) = if !named.is_empty() {
         named
             .iter()
             .map(|(_, node, t, _)| {
                 (
-                    component_mass(t),
+                    component_mass(inf, *node, t),
                     !joint_component_is_trace_clean(inf, *node, 0),
                 )
             })
@@ -5296,13 +5351,82 @@ fn joint_mass(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo], named: &[NamedInfo
         args.iter()
             .map(|(node, t, _)| {
                 (
-                    component_mass(t),
+                    component_mass(inf, *node, t),
                     !joint_component_is_trace_clean(inf, *node, 0),
                 )
             })
             .unzip()
     };
     product_mass(&masses, &not_clean)
+}
+
+/// The mass class [`joint_mass`] folds for one component.
+///
+/// A measure component is read straight off its type, as it always was. A KERNEL
+/// component is read only when its own type rule SET that mass; otherwise the
+/// fold refuses to trust it and contributes `%unknown`.
+///
+/// The distrust is not conservatism, it is a live defect on the other side.
+/// `fill_mass` returns early unless the type is `Type::Measure`, so an op whose
+/// type rule lifts pointwise to a kernel never reaches its own mass arm and keeps
+/// the BASE's class: `truncate(kernelof(a1, z = z), interval(0.0, 5.0))` reads
+/// `%normalized` where the measure version correctly reads `%finite`. Folding that
+/// unchanged published a wrong STRONGER class — a `joint` of two such components
+/// read `%normalized` instead of Q5's `%unknown`, and `kchain` carried the
+/// `%normalized` onto a MEASURE, past the `normalize`/`draw`/`rand` gates an
+/// unnormalized measure must not pass.
+///
+/// Fixing the lift itself (in `fill_mass`) is the better end state and is carded
+/// separately: it touches every measure-to-measure arm and flips kernel classes
+/// across the corpus, which carries its own repin risk. This read is chosen
+/// instead because it cannot move any class that exists today — a `Type::Kernel`
+/// component only reaches a `joint` through [`kernel_joint_type`], which is new,
+/// so measure-joint output is untouched — and it fails toward the weaker class.
+///
+/// The trusted heads are exactly the rules that write a kernel's mass themselves:
+/// `kernelof`/`functionof` (`reification_type`, from the body), `lawof`
+/// (`lawof_type`, `%normalized` by §04's identity law), and `joint` itself
+/// (`kernel_joint_type`, recursively through this same fold). Everything else —
+/// including a `disintegrate` tuple element and a cross-module kernel, whose
+/// masses ARE set correctly but not by a head this can see — reads `%unknown`.
+fn component_mass(inf: &Inferencer<'_, '_>, node: NodeId, t: &Type) -> Mass {
+    match t {
+        Type::Measure { mass, .. } => *mass,
+        Type::Kernel { mass, .. } if kernel_mass_is_own_rules(inf, node) => *mass,
+        _ => Mass::Unknown,
+    }
+}
+
+/// Whether a kernel-typed component's `%mass` was set by its own type rule, and
+/// so may be folded — see [`component_mass`] for why the question has to be asked
+/// at all. Follows self-module refs to the head that produced the value.
+fn kernel_mass_is_own_rules(inf: &Inferencer<'_, '_>, node: NodeId) -> bool {
+    let mut node = node;
+    let mut depth = 0u32;
+    loop {
+        if depth > 64 {
+            return false; // safe: "not provably its own rule's mass"
+        }
+        depth += 1;
+        match inf.module.node(node) {
+            Node::Ref(r) if r.ns == RefNs::SelfMod => {
+                let Some(binding) = inf.module.binding_by_name(r.name) else {
+                    return false;
+                };
+                node = inf.module.binding(binding).rhs;
+            }
+            Node::Call(c) => {
+                let CallHead::Builtin(op) = c.head else {
+                    return false;
+                };
+                return matches!(
+                    inf.module.resolve(op),
+                    "kernelof" | "functionof" | "lawof" | "joint"
+                );
+            }
+            _ => return false,
+        }
+    }
 }
 
 /// The mass of a `joint`'s components (spec §06 `joint` entry: "a stochastic
