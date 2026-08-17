@@ -2154,23 +2154,25 @@ fn joint_type(
 /// non-empty, which is what the measure arms do, silently DROPS every positional
 /// component, and for a kernel that means dropping its inputs from the union —
 /// contradicting #85's own sentence, which unions "the component kernels' inputs"
-/// with no qualification by spelling. Refusing is the reading that both routes to
-/// the answer support:
+/// with no qualification by spelling.
 ///
-/// - §06 defines the keyword form BY the relabel equivalence
-///   (`joint(a = M1, b = M2)` "is equivalent to `joint(relabel(M1, ["a"]),
-///   relabel(M2, ["b"]))`"). Rewriting a mixed call by it yields a purely
-///   positional `joint(K1, relabel(K2, ["q"]))`, which the one shape-class rule
-///   then judges: "All components must have the same shape class … Mixing shape
-///   classes is a static error." A bare component's variate beside a relabelled
-///   one is scalar beside record, so every mixed spelling this arm can see is
-///   already a static error by that rule. (Deciding it per-component instead would
-///   need each kernel component's output variate, which `Type::Kernel` does not
-///   carry — Q2 — so this arm could not compute it if it wanted to.)
-/// - `determinizer`'s `lower_joint` already refuses the shape in the same words:
-///   "joint mixes positional and keyword components; a joint is either the
-///   positional cat-variate form or the keyword record-variate form, not both". So
-///   typing it was only ever a deferral of the same refusal to a later pass.
+/// **The decision rests on §06 spelling two forms and no third**, which is the line
+/// `determinizer`'s `lower_joint` already takes in the same words: "joint mixes
+/// positional and keyword components; a joint is either the positional cat-variate
+/// form or the keyword record-variate form, not both". So typing the shape was only
+/// ever a deferral of that refusal to a later pass.
+///
+/// A second route — rewriting the call by §06's own relabel equivalence
+/// (`joint(a = M1, b = M2)` "is equivalent to `joint(relabel(M1, ["a"]),
+/// relabel(M2, ["b"]))`") and letting the shape-class rule judge the resulting
+/// positional call — agrees only for a SCALAR positional component, and does not
+/// generalise. The rule permits "all records with distinct field names", so a
+/// record-variate positional component survives the reduction: for
+/// `KR = kernelof(record(p = a1, q = a2), z = z)`, the rewrite
+/// `joint(KR, relabel(K2, ["r"]))` is a joint of two records and types, while the
+/// mixed `joint(KR, r = K2)` refuses here. Whatever §06 permits, this arm could not
+/// apply the shape-class rule anyway: it needs each component's output variate,
+/// which `Type::Kernel` does not carry (Q2).
 ///
 /// Scoped to the kernel arm deliberately. The MEASURE arms drop a positional
 /// component the same way (`joint(Normal(0.0, 1.0), b = Exponential(1.0))` types
