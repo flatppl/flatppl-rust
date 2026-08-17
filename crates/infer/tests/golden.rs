@@ -604,6 +604,17 @@ fn joint_mass_products() {
 /// rule. Bug: the positional arm fed `product_mass` an empty mass list (it
 /// read `named` only), so `masses.iter().all(…)` was vacuously true and every
 /// positional joint came out `%normalized` regardless of its components.
+///
+/// `p_norm`/`k_norm` (two `Lebesgue(reals)` components) stay exact at
+/// `%locallyfinite`: neither component is reified (`lawof`/`kernelof`) or
+/// built from a stochastic constructor parameter, so both are provably
+/// trace-clean (`joint_component_is_trace_clean`) and per spec §04 "Identity
+/// law" (`joint(m, m)` over a bare constructor `m` is the product of two
+/// independent draws) cannot share a stochastic ancestor with anything — the
+/// product rule is exact regardless of how many such components there are.
+/// Contrast `joint_mass_two_nonnormalized_components_degrade_to_unknown` in
+/// `spec_coverage_measures.rs`, where the non-normalized components ARE
+/// reified and the same rule conservatively degrades to `%unknown`.
 #[test]
 fn positional_joint_mass_matches_keyword_joint_mass() {
     let src = "p_norm = joint(Lebesgue(reals), Lebesgue(reals))\n\
@@ -626,7 +637,8 @@ fn positional_joint_mass_matches_keyword_joint_mass() {
     };
 
     // Two Lebesgue(reals) components: locally-finite, both spellings, NOT
-    // normalized (the vacuous-product bug's symptom).
+    // normalized (the vacuous-product bug's symptom) and NOT conservatively
+    // degraded (both are provably trace-clean bare constructors).
     assert!(
         mass_of("p_norm").contains("%locallyfinite"),
         "positional all-Lebesgue joint must be %locallyfinite, got:\n{out}"

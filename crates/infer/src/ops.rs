@@ -4783,12 +4783,27 @@ pub(crate) fn fill_mass(
                 Type::Measure { mass, .. } => *mass,
                 _ => Mass::Unknown,
             };
-            let masses: Vec<Mass> = if !named.is_empty() {
-                named.iter().map(|(_, _, t, _)| component_mass(t)).collect()
+            let (masses, not_clean): (Vec<Mass>, Vec<bool>) = if !named.is_empty() {
+                named
+                    .iter()
+                    .map(|(_, node, t, _)| {
+                        (
+                            component_mass(t),
+                            !joint_component_is_trace_clean(inf, *node, 0),
+                        )
+                    })
+                    .unzip()
             } else {
-                args.iter().map(|(_, t, _)| component_mass(t)).collect()
+                args.iter()
+                    .map(|(node, t, _)| {
+                        (
+                            component_mass(t),
+                            !joint_component_is_trace_clean(inf, *node, 0),
+                        )
+                    })
+                    .unzip()
             };
-            product_mass(&masses)
+            product_mass(&masses, &not_clean)
         }
         // `restrict` shares truncate's support-restriction mass behaviour: the
         // result is a sub-measure, so a probability/finite measure becomes
@@ -4932,14 +4947,56 @@ pub(crate) fn fill_mass(
     Type::Measure { domain, mass }
 }
 
-/// The mass of an independent product of components.
-fn product_mass(masses: &[Mass]) -> Mass {
+/// The mass of a `joint`'s components (spec §06 `joint` entry: "a stochastic
+/// node shared between component traces … remains a single node of the
+/// composed trace. Components that share no stochastic node are independent,
+/// and their `joint` is the product measure"). For trace-disjoint components
+/// the product-of-classes rule below is exact. For components sharing a
+/// stochastic ancestor it is exact only up to one non-normalized member:
+/// `%finite`x`%finite` composed through a shared ancestor can be infinite
+/// (Student-t/`y^2` counterexample, kernel-joint-q4-maths.md §7), so once two
+/// or more components that MAY share an ancestor are non-normalized, no class
+/// stronger than `%unknown` is statically justified.
+///
+/// `not_clean[i]` says component `i` is not PROVABLY free of any stochastic
+/// trace node (see [`joint_component_is_trace_clean`]) — i.e. it may
+/// participate in sharing. A component that IS provably clean cannot share
+/// with anything (spec §04 "Identity law": `joint(m, m)` over a bare
+/// constructor `m` is the product of two independent draws, never the
+/// diagonal) and so is exempt from the degrade below regardless of its own
+/// mass class — only the "may share" components are counted toward the
+/// two-or-more threshold.
+///
+/// An EMPTY component list (`joint()`) is `%deferred`, not `%normalized`:
+/// `joint_type`'s domain arm already leaves a zero-component `joint`'s domain
+/// `%deferred` (nothing resolves the variate shape), so the mass side
+/// matching that honestly, rather than vacuously satisfying `all()` and
+/// claiming a definite class the domain itself does not support, keeps the
+/// two slots consistent. `joint()`'s legality is a separate, unaddressed
+/// question (spec §06 spells the construct `joint(M1, M2, ...)`).
+fn product_mass(masses: &[Mass], not_clean: &[bool]) -> Mass {
     use Mass::*;
+    // `zip` below truncates silently on a length mismatch, which would
+    // under-count the degrade and hand back a class stronger than justified.
+    // The single call site builds both slices from one `unzip`, so they
+    // always agree; this documents the invariant for the next caller.
+    debug_assert_eq!(masses.len(), not_clean.len());
+    if masses.is_empty() {
+        return Deferred;
+    }
     if masses.contains(&Null) {
         return Null;
     }
     if masses.iter().all(|m| *m == Normalized) {
         return Normalized;
+    }
+    let ambiguous_nonnormalized = masses
+        .iter()
+        .zip(not_clean)
+        .filter(|(m, dirty)| !matches!(m, Normalized | Deferred) && **dirty)
+        .count();
+    if ambiguous_nonnormalized >= 2 {
+        return Unknown;
     }
     if masses.iter().all(|m| matches!(m, Normalized | Finite)) {
         return Finite;
@@ -4951,6 +5008,103 @@ fn product_mass(masses: &[Mass]) -> Mass {
         return LocallyFinite;
     }
     Unknown
+}
+
+/// Whether a `joint` COMPONENT provably carries no stochastic trace node,
+/// following self-module refs the way [`law_phase`] does (bounded by the same
+/// `depth` cap). Spec §04 "Trace of the reified law": a stochastic node
+/// enters a `joint`'s composed trace only through a REIFIED component
+/// (`lawof`/`kernelof`) or, per §06's `joint` entry, "a stochastic
+/// constructor parameter". A subtree containing neither channel cannot carry
+/// or close over a stochastic node, so it cannot share one with any sibling
+/// component (§04 "Identity law": `joint(m, m)` over a bare constructor `m`
+/// is the product of two independent draws, never the diagonal).
+///
+/// The disqualifier list is `draw`/`rand` (§04 "Phases": "`draw` nodes are
+/// stochastic" — the only source of a stochastic node at all) plus the three
+/// ways a value can carry or close over a REIFIED trace — `lawof`,
+/// `kernelof`, `functionof` — plus `rnginit`/`rngstate` (an RNG state is not
+/// itself a stochastic node, but `rand` consuming a shared state is close
+/// enough to correlation that refusing to call it clean costs nothing).
+/// Deliberately NOT [`is_opaque_value_source`]'s whole catalogue: that
+/// predicate answers a different question (value identity), and its
+/// `elementof`/`external`/`load_data` members are §04-classified
+/// *parameterized* or *fixed*, never stochastic — kernel-joint-q4-maths.md §8
+/// is explicit that "a shared input name is a shared value, not a shared
+/// stochastic node". Any of the disqualifiers ANYWHERE in the subtree answers
+/// `false` ("not provably clean"), never "definitely shares" — this only ever
+/// RULES OUT sharing, never proves it, so it is not the ancestry oracle the
+/// wave brief forbids inventing: it never compares two components against
+/// each other, only asks a local question of one.
+///
+/// Memoized (`memo`) because the walk follows refs through the binding DAG,
+/// which is a DAG and not a tree: an unmemoized walk revisits a
+/// diamond-shared binding once per PATH to it, which is exponential in depth
+/// on a chain of repeated sub-expressions. Caching each node's answer makes
+/// the walk linear in the number of distinct nodes visited. The `depth > 64`
+/// bailout is intentionally NOT cached — it is a conservative fallback for a
+/// pathologically deep single path, not that node's true answer, and caching
+/// it could make a later, shorter path to the same node see a stale `false`.
+fn joint_component_is_trace_clean(inf: &Inferencer<'_, '_>, node: NodeId, depth: u32) -> bool {
+    fn walk(
+        inf: &Inferencer<'_, '_>,
+        node: NodeId,
+        depth: u32,
+        memo: &mut std::collections::HashMap<NodeId, bool>,
+    ) -> bool {
+        if let Some(&clean) = memo.get(&node) {
+            return clean;
+        }
+        if depth > 64 {
+            return false; // safe: "not provably clean" on a cycle/depth cap
+        }
+        if let Node::Ref(r) = inf.module.node(node) {
+            let clean = if r.ns != flatppl_core::RefNs::SelfMod {
+                false // cross-module: conservatively not provably clean
+            } else {
+                match inf.module.binding_by_name(r.name) {
+                    Some(b) => {
+                        let rhs = inf.module.binding(b).rhs;
+                        walk(inf, rhs, depth + 1, memo)
+                    }
+                    None => false,
+                }
+            };
+            memo.insert(node, clean);
+            return clean;
+        }
+        if let Node::Call(c) = inf.module.node(node) {
+            match c.head {
+                CallHead::Builtin(op) => {
+                    let name = inf.module.resolve(op);
+                    if matches!(
+                        name,
+                        "draw"
+                            | "rand"
+                            | "rnginit"
+                            | "rngstate"
+                            | "lawof"
+                            | "kernelof"
+                            | "functionof"
+                    ) {
+                        memo.insert(node, false);
+                        return false;
+                    }
+                }
+                CallHead::User(_) => {
+                    memo.insert(node, false); // user-callable application: conservative
+                    return false;
+                }
+            }
+        }
+        let mut clean = true;
+        inf.module.for_each_child(node, |child| {
+            clean = clean && walk(inf, child, depth + 1, memo);
+        });
+        memo.insert(node, clean);
+        clean
+    }
+    walk(inf, node, depth, &mut std::collections::HashMap::new())
 }
 
 /// Broadcasting a kernel over data cells: an independent product per cell.

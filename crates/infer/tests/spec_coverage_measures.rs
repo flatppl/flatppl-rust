@@ -992,3 +992,178 @@ fn rand_accepts_a_deferred_mass_measure() {
         "{diags:?}"
     );
 }
+
+// ============================================================
+// `joint` mass class (kernel-joint-q4-maths.md §7)
+// ============================================================
+
+/// All-normalized components stay `%normalized` regardless of arity spelling
+/// (kernel-joint-q4-maths.md §7: "the record law of probability components
+/// has mass 1") — the positional all-Normal control case.
+#[test]
+fn joint_mass_positional_all_normalized_stays_normalized() {
+    let src = "m = joint(Normal(0.0, 1.0), Normal(1.0, 2.0))";
+    let out = ir(src);
+    assert!(
+        out.contains("(%mass %normalized)"),
+        "positional all-normalized joint must be %normalized; got:\n{out}"
+    );
+}
+
+/// Two components sharing a stochastic ancestor (`z1`, `z2` both trace back
+/// to `mu`) and both non-normalized after `truncate`: the product rule is
+/// unsound here in general (kernel-joint-q4-maths.md §7, Student-t/`y^2`
+/// counterexample). Both components are `lawof`-reified, so neither is
+/// provably trace-clean (`joint_component_is_trace_clean` — reification is
+/// one of the two channels spec §06's `joint` entry names for sharing a
+/// stochastic node) and the composed class degrades to `%unknown`.
+///
+/// This does NOT prove the degrade fires because of the shared `mu` — a pair
+/// of `lawof`-reified components with no shared ancestor at all would hit the
+/// same branch and read the same `%unknown` (no ancestor-identity oracle
+/// exists to tell the two apart, by the wave brief's design). What the
+/// carve-out DOES discriminate is reified vs bare-constructor components: see
+/// `positional_joint_mass_matches_keyword_joint_mass` in `golden.rs`, whose
+/// two bare `Lebesgue(reals)` components are provably trace-clean and stay
+/// exact at `%locallyfinite` under the identical two-non-normalized shape.
+#[test]
+fn joint_mass_two_nonnormalized_components_degrade_to_unknown() {
+    let src = "mu ~ Normal(0.0, 1.0)\n\
+               z1 ~ Normal(mu, 1.0)\n\
+               z2 ~ Normal(mu, 1.0)\n\
+               lz1 = lawof(z1)\n\
+               lz2 = lawof(z2)\n\
+               j = joint(truncate(lz1, interval(0.0, 5.0)), truncate(lz2, interval(0.0, 5.0)))";
+    let out = ir(src);
+    let bind = out
+        .find("(%bind j ")
+        .unwrap_or_else(|| panic!("binding j not found in:\n{out}"));
+    assert!(
+        out[bind..(bind + 120).min(out.len())].contains("%unknown"),
+        "shared-ancestor joint of two non-normalized components must be \
+         %unknown; got:\n{out}"
+    );
+}
+
+/// A single non-normalized component sharing ancestry with normalized peers
+/// stays exact (kernel-joint-q4-maths.md §7: "exactly one non-normalized
+/// component… its class carries over. Sound.") — no degrade when only one
+/// member deviates from `%normalized`.
+#[test]
+fn joint_mass_one_nonnormalized_component_stays_exact() {
+    let src = "mu ~ Normal(0.0, 1.0)\n\
+               z1 ~ Normal(mu, 1.0)\n\
+               z2 ~ Normal(mu, 1.0)\n\
+               lz2 = lawof(z2)\n\
+               j = joint(truncate(lawof(z1), interval(0.0, 5.0)), lz2)";
+    let out = ir(src);
+    let bind = out
+        .find("(%bind j ")
+        .unwrap_or_else(|| panic!("binding j not found in:\n{out}"));
+    assert!(
+        out[bind..(bind + 120).min(out.len())].contains("%finite"),
+        "one non-normalized (truncated) + one normalized component must stay \
+         %finite; got:\n{out}"
+    );
+}
+
+/// `draw`/`rand` gate integration: a positional `joint` of two non-normalized
+/// components must be refused, same as the keyword form always was — this is
+/// the draw/rand-gate consumer of the mass fix above, not a new gate rule.
+/// Refuses at `%locallyfinite` (the trace-clean carve-out keeps this shape
+/// exact; see `positional_joint_mass_matches_keyword_joint_mass`), same as it
+/// did once `#159` landed — the gate itself is untouched by this wave.
+#[test]
+fn draw_of_positional_joint_two_lebesgue_refuses() {
+    assert!(rejects(
+        "y = draw(joint(Lebesgue(reals), Lebesgue(reals)))",
+        "requires a probability measure"
+    ));
+}
+
+/// `rand` shares `draw`'s gate (`unprovable_normalization`) but a different
+/// argument offset (measure at index 1) — pin the pair so the two cannot
+/// drift.
+#[test]
+fn rand_of_positional_joint_two_lebesgue_refuses() {
+    assert!(rejects(
+        "s = rnginit(0)\ny = rand(s, joint(Lebesgue(reals), Lebesgue(reals)))",
+        "requires a probability measure"
+    ));
+}
+
+/// Regression (review Critical 1): `normalize` is the one consumer that
+/// distinguishes `%locallyfinite` from `%unknown` — a `%locallyfinite`
+/// argument is a static error (spec §06, undefined normalization), while
+/// `%unknown` silently passes through as `%normalized`. Before the trace-clean
+/// carve-out, this exact shape's class widened from `%locallyfinite` to
+/// `%unknown` and this error disappeared, reopening (via `normalize`) the
+/// hole the wave exists to close: `draw(normalize(joint(Lebesgue(reals),
+/// Lebesgue(reals))))` would type `%normalized` and pass the draw gate. Both
+/// components are provably trace-clean bare constructors, so this must stay
+/// a static error.
+#[test]
+fn normalize_of_two_lebesgue_joint_is_a_static_error() {
+    assert!(rejects(
+        "n = normalize(joint(Lebesgue(reals), Lebesgue(reals)))",
+        "infinite total mass is undefined"
+    ));
+    assert!(rejects(
+        "n = normalize(joint(a = Lebesgue(reals), b = Lebesgue(reals)))",
+        "infinite total mass is undefined"
+    ));
+}
+
+/// Regression (re-review Important 3): the disqualifier catalogue must not
+/// disqualify a component just because it depends on an `elementof`
+/// parameter — §04 "Phases" classifies `elementof` inputs as *parameterized*,
+/// not stochastic, and kernel-joint-q4-maths.md §8 is explicit that "a shared
+/// input name is a shared value, not a shared stochastic node". Neither
+/// component below has a `draw` anywhere, so there is no stochastic node for
+/// them to share, and the joint must stay exact and trigger the same static
+/// error as the all-literal version — every HS3-converted model
+/// parameterizes exactly this way (`rf304_uncorrprod/model.flatppl`:
+/// `mean1 = elementof(reals)`, …), so a wrong answer here would be silent on
+/// every converted fixture.
+#[test]
+fn normalize_of_elementof_parameterized_joint_is_a_static_error() {
+    assert!(rejects(
+        "a = elementof(reals)\n\
+         c1 = locscale(Lebesgue(reals), a, 2.0)\n\
+         c2 = locscale(Lebesgue(reals), a, 3.0)\n\
+         n = normalize(joint(c1, c2))",
+        "infinite total mass is undefined"
+    ));
+}
+
+/// Same regression, milder instance: `truncate` of a `%locallyfinite` measure
+/// to a bounded set is `%finite` (`ops.rs` truncate/restrict arm); at
+/// `%unknown` it would fall through to `%unknown` instead, losing a provable
+/// class with no diagnostic to mark the loss.
+#[test]
+fn truncate_of_two_lebesgue_joint_is_finite() {
+    let src = "j = truncate(joint(Lebesgue(reals), Lebesgue(reals)), interval(0.0, 1.0))";
+    let out = ir(src);
+    assert!(
+        out.contains("(%mass %finite)"),
+        "truncated two-Lebesgue joint must be %finite; got:\n{out}"
+    );
+}
+
+/// `joint()` (arity zero): `product_mass(&[])`'s `all()` was vacuously
+/// `%normalized` regardless of arity — the same root cause the brief names
+/// for the positional bug, reachable through arity zero instead of the
+/// named/positional split. The domain arm already leaves a zero-component
+/// `joint`'s domain `%deferred` (nothing resolves the variate shape), so the
+/// mass side now matches that honestly instead of claiming a definite class
+/// the domain does not support. `joint()`'s legality is a separate,
+/// unaddressed question — not decided here.
+#[test]
+fn joint_of_no_components_is_deferred_not_normalized() {
+    let src = "e = joint()";
+    let out = ir(src);
+    assert!(
+        out.contains("(%mass %deferred)"),
+        "empty joint must be %deferred, not a definite class; got:\n{out}"
+    );
+}
