@@ -1114,6 +1114,28 @@ fn normalize_of_two_lebesgue_joint_is_a_static_error() {
     ));
 }
 
+/// Regression (re-review Important 3): the disqualifier catalogue must not
+/// disqualify a component just because it depends on an `elementof`
+/// parameter — §04 "Phases" classifies `elementof` inputs as *parameterized*,
+/// not stochastic, and kernel-joint-q4-maths.md §8 is explicit that "a shared
+/// input name is a shared value, not a shared stochastic node". Neither
+/// component below has a `draw` anywhere, so there is no stochastic node for
+/// them to share, and the joint must stay exact and trigger the same static
+/// error as the all-literal version — every HS3-converted model
+/// parameterizes exactly this way (`rf304_uncorrprod/model.flatppl`:
+/// `mean1 = elementof(reals)`, …), so a wrong answer here would be silent on
+/// every converted fixture.
+#[test]
+fn normalize_of_elementof_parameterized_joint_is_a_static_error() {
+    assert!(rejects(
+        "a = elementof(reals)\n\
+         c1 = locscale(Lebesgue(reals), a, 2.0)\n\
+         c2 = locscale(Lebesgue(reals), a, 3.0)\n\
+         n = normalize(joint(c1, c2))",
+        "infinite total mass is undefined"
+    ));
+}
+
 /// Same regression, milder instance: `truncate` of a `%locallyfinite` measure
 /// to a bounded set is `%finite` (`ops.rs` truncate/restrict arm); at
 /// `%unknown` it would fall through to `%unknown` instead, losing a provable
