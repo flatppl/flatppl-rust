@@ -185,9 +185,12 @@ pub(crate) fn call_rule(
         },
         // §07 "Table reductions": applied to a TABLE these reduce column-wise to a
         // record. Guarded so every non-table argument keeps the arm it had —
-        // `sum`/`mean` the array rule just below, `var`/`std` their catalogue row
-        // (`result: Scalar(Real)`) via the `_` arm. See [`table_reduction_type`].
-        "sum" | "mean" | "var" | "std" if matches!(arg_ty(args, 0), Some(Type::Table { .. })) => {
+        // `sum`/`mean`/`prod` the array rule just below, `var`/`std` their catalogue
+        // row (`result: Scalar(Real)`), `maximum`/`minimum` their catalogue row
+        // (`ElemScalarKind`), each via the `_` arm. See [`table_reduction_type`].
+        "sum" | "mean" | "var" | "std" | "prod" | "maximum" | "minimum"
+            if matches!(arg_ty(args, 0), Some(Type::Table { .. })) =>
+        {
             table_reduction_type(&name, arg_ty(args, 0))
         }
         // `sum` / `prod` / `mean` reduce a real/complex array to its element
@@ -1211,6 +1214,9 @@ fn rowstack_type(a: Option<&Type>) -> Type {
 /// cannot "agree" by sharing a mistake.
 ///
 /// - `sum`/`prod` — the element type. A sum of integers is an integer.
+/// - `maximum`/`minimum` — the element type: they return an ELEMENT of the input
+///   rather than a computed aggregate, matching their catalogue row's
+///   `ElemScalarKind` result (an integer array's max is an integer).
 /// - `mean` — §07 defines it as $\bar{x} = \frac{1}{n}\sum_i x_i$, and the mean of
 ///   `[1, 2]` is `1.5`, so an INTEGER input gives a REAL. Complex stays complex
 ///   (§07's domain for `mean` is "real/complex arrays"). This is arithmetic, so it
@@ -1218,7 +1224,7 @@ fn rowstack_type(a: Option<&Type>) -> Type {
 /// - `var`/`std` — real, matching their catalogue rows and their "real arrays" domain.
 fn reduced_scalar(head: &str, elem: ScalarType) -> ScalarType {
     match (head, elem) {
-        ("sum" | "prod", e) => e,
+        ("sum" | "prod" | "maximum" | "minimum", e) => e,
         ("mean", ScalarType::Complex) => ScalarType::Complex,
         _ => ScalarType::Real,
     }
@@ -1239,23 +1245,27 @@ fn reduce_type(head: &str, a: Option<&Type>) -> Type {
     }
 }
 
-/// The result of a §07 **Table reductions** call: "When `sum`, `mean`, or `var` is
-/// applied to a table, the reduction operates column-wise and returns a record
-/// whose fields are the column names and values are the per-column reductions."
-/// So the result is a `Record` with one field per column, named for the column.
+/// The result of a §07 **Table reductions** call: "When `sum`, `mean`, `var`,
+/// `std`, `prod`, `maximum`, or `minimum` is applied to a table, the reduction
+/// operates column-wise and returns a record whose fields are the column names
+/// and values are the per-column reductions." So the result is a `Record` with
+/// one field per column, named for the column.
 ///
-/// `std` is in the set too, by the owner ruling of 2026-08-10 which adds it to that
+/// `std` is in the set by the owner ruling of 2026-08-10 which adds it to that
 /// paragraph (flatppl-design `4c93237`). **That commit is NOT on design `main`** — it
 /// sits on the `mul-divide-rows` branch — so `std`'s membership rests on unmerged
-/// spec, exactly as its splat exemption does. `prod` is deliberately absent: the
-/// paragraph does not name it, so `prod` over a table stays `%deferred`.
+/// spec, exactly as its splat exemption does. `prod`, `maximum`, `minimum` are in
+/// the set by design PR #79 (owner-merge pending as of this change), which extends
+/// the same paragraph to those three; the engine work lands ahead of the spec merge
+/// per the owner's ruling, with the spec gap recorded in `flatppl-dev`.
 ///
 /// The per-column value is whatever that reduction gives for an array of the
 /// column's element type, so the two forms agree by construction rather than by a
 /// second set of rules:
 ///
-/// - `sum`/`mean` — the column's own element type, mirroring [`reduce_type`]'s array
-///   arm (so a complex column sums to complex).
+/// - `sum`/`mean`/`prod`/`maximum`/`minimum` — the column's own element type,
+///   mirroring [`reduce_type`]'s array arm (so a complex column sums to complex)
+///   and, for `maximum`/`minimum`, the catalogue row's `ElemScalarKind` result.
 /// - `var`/`std` — `Scalar(Real)`, mirroring their catalogue row's declared
 ///   `result: Scalar(Real)` / `result_set: NonNegReals`, which is what they give for
 ///   an array of any element type.
@@ -4228,11 +4238,18 @@ pub(crate) fn call_valueset(
         // catalogue row declares. Without this arm `var(<table>)` carries
         // `nonnegreals` — a scalar set on a record-typed value, which is incoherent
         // and would mislead anything reading the set rather than the type.
-        // `sum`/`mean` are `Structural` rows with no `result_set`, so they already
-        // fall through to the type's natural extent and land on a record set; this
-        // arm makes `var`/`std` agree instead of short-circuiting on their row.
+        // `sum`/`mean`/`prod` are `Structural` rows with no `result_set`, so they
+        // already fall through to the type's natural extent and land on a record
+        // set; this arm makes `var`/`std` agree instead of short-circuiting on
+        // their row. `maximum`/`minimum` are `Function` rows (catalogue
+        // `ElemScalarKind`, no `result_set`) that WOULD short-circuit the same way
+        // `function_valueset` computes a scalar set from `ElemScalarKind` against
+        // the table argument directly, ignoring the record type — so they need the
+        // arm too, unlike the Structural trio.
         // Mirrors [`table_reduction_type`] arm for arm.
-        "sum" | "mean" | "var" | "std" if matches!(arg_ty(args, 0), Some(Type::Table { .. })) => {
+        "sum" | "mean" | "var" | "std" | "maximum" | "minimum"
+            if matches!(arg_ty(args, 0), Some(Type::Table { .. })) =>
+        {
             table_reduction_valueset(&name, arg_ty(args, 0))
         }
         // Catalogue functions carry their result value-set (`result_set` tag);
