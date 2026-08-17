@@ -1167,3 +1167,269 @@ fn joint_of_no_components_is_deferred_not_normalized() {
         "empty joint must be %deferred, not a definite class; got:\n{out}"
     );
 }
+
+// ============================================================
+// `joint` over KERNEL components — the fan-out kernel
+// (spec §06 `joint` entry per flatppl-design#85; Q1–Q5 derived in
+// flatppl-dev/kernel-joint-q4-maths.md)
+// ============================================================
+
+/// The probe of `kernel-joint-q4-maths.md` §2: `u` is an internal latent shared
+/// by both components' traces, `z` is the boundary both reify against.
+const SHARED_LATENT_PROBE: &str = "z  = elementof(reals)\n\
+     u  ~ Normal(mu = z, sigma = 1.0)\n\
+     a1 ~ Normal(mu = u, sigma = 1.0)\n\
+     a2 ~ Normal(mu = u, sigma = 1.0)\n";
+
+/// The `(%bind <name> …)` line of `src`'s FlatPIR.
+fn bind_line(out: &str, name: &str) -> String {
+    let needle = format!("(%bind {name} ");
+    let at = out
+        .find(&needle)
+        .unwrap_or_else(|| panic!("binding {name} not found in:\n{out}"));
+    out[at..]
+        .lines()
+        .next()
+        .unwrap_or_else(|| panic!("binding {name} has no line in:\n{out}"))
+        .to_string()
+}
+
+/// Q1: "The result's inputs are the union of the component kernels' inputs by
+/// name". Disjoint signatures coexist — this is grounding-report probe p4, which
+/// the union rule makes legal with inputs `{z, w}` rather than a signature
+/// mismatch.
+#[test]
+fn kernel_joint_inputs_are_the_union_of_the_component_inputs_by_name() {
+    let out = ir("z  = elementof(reals)\n\
+                  w  = elementof(reals)\n\
+                  b1 ~ Normal(mu = z, sigma = 1.0)\n\
+                  b2 ~ Normal(mu = w, sigma = 1.0)\n\
+                  K1 = kernelof(b1, z = z)\n\
+                  K2 = kernelof(b2, w = w)\n\
+                  KJ = joint(p = K1, q = K2)");
+    assert!(
+        bind_line(&out, "KJ").contains("(%kernel (%inputs z w)"),
+        "disjoint component inputs must union, not conflict; got:\n{out}"
+    );
+}
+
+/// Q1, the fan half of the same rule: "a name declared by several components
+/// binds once in the result and every declaring component receives that one
+/// value". Both spellings, so the keyword and positional arms cannot drift.
+#[test]
+fn kernel_joint_shared_input_name_binds_once_and_fans() {
+    for spelling in ["joint(p = K1, q = K2)", "joint(K1, K2)"] {
+        let out = ir(&format!(
+            "{SHARED_LATENT_PROBE}\
+             K1 = kernelof(a1, z = z)\n\
+             K2 = kernelof(a2, z = z)\n\
+             KJ = {spelling}"
+        ));
+        assert!(
+            bind_line(&out, "KJ").contains("(%kernel (%inputs z)"),
+            "a shared input name must bind once ({spelling}); got:\n{out}"
+        );
+    }
+}
+
+/// Q2: "The keyword form applies unchanged, producing a kernel whose output
+/// variate is a record." §11's `(%kernel (%inputs …) (%mass …))` has no slot for
+/// the variate, so the record surfaces on APPLICATION — the applied fan-out is a
+/// measure over `record{p, q}`.
+#[test]
+fn applied_keyword_kernel_joint_is_a_measure_over_a_record() {
+    let out = ir(&format!(
+        "{SHARED_LATENT_PROBE}\
+         K1 = kernelof(a1, z = z)\n\
+         K2 = kernelof(a2, z = z)\n\
+         KJ = joint(p = K1, q = K2)\n\
+         M  = KJ(z = 0.0)"
+    ));
+    assert!(
+        bind_line(&out, "M").contains(
+            "(%measure (%domain (%record (p (%scalar real)) (q (%scalar real)))) \
+             (%mass %normalized))"
+        ),
+        "the applied keyword fan-out is a record-variate measure; got:\n{out}"
+    );
+}
+
+/// The positional counterpart: §06 forms the output variate by `cat`, so two
+/// scalar components applied give a length-2 vector, not a record.
+#[test]
+fn applied_positional_kernel_joint_is_a_measure_over_the_cat_variate() {
+    let out = ir(&format!(
+        "{SHARED_LATENT_PROBE}\
+         K1 = kernelof(a1, z = z)\n\
+         K2 = kernelof(a2, z = z)\n\
+         KJ = joint(K1, K2)\n\
+         M  = KJ(z = 0.0)"
+    ));
+    assert!(
+        bind_line(&out, "M")
+            .contains("(%measure (%domain (%array 1 (2) (%scalar real))) (%mass %normalized))"),
+        "the applied positional fan-out cats its component variates; got:\n{out}"
+    );
+}
+
+/// Q3: "Measure components are permitted and are the nullary case: they ignore
+/// the input." So a mixed `joint` is legal and the measure contributes nothing to
+/// the input union — grounding-report probe p3.
+#[test]
+fn mixed_measure_and_kernel_joint_is_a_kernel_over_the_kernel_inputs_alone() {
+    let out = ir("z  = elementof(reals)\n\
+                  b1 ~ Normal(mu = z, sigma = 1.0)\n\
+                  K1 = kernelof(b1, z = z)\n\
+                  M2 = Normal(mu = 0.0, sigma = 2.0)\n\
+                  KJ = joint(p = K1, q = M2)");
+    assert!(
+        bind_line(&out, "KJ").contains("(%kernel (%inputs z) (%mass %normalized))"),
+        "a measure component is the nullary case, contributing no input; got:\n{out}"
+    );
+}
+
+/// Q5: the mass rule is the measure case applied pointwise, so a fan-out of
+/// Markov kernels is a Markov kernel (§06: "A fan-out of Markov kernels is a
+/// Markov kernel"). Covered by the tests above; pinned here against the mixed
+/// form too, where the fold has to read a measure and a kernel component with the
+/// same rule.
+#[test]
+fn kernel_joint_of_normalized_components_is_markov_in_every_spelling() {
+    for spelling in [
+        "joint(p = K1, q = K2)",
+        "joint(K1, K2)",
+        "joint(p = K1, q = Normal(0.0, 1.0))",
+        "joint(K1, Normal(0.0, 1.0))",
+    ] {
+        let out = ir(&format!(
+            "{SHARED_LATENT_PROBE}\
+             K1 = kernelof(a1, z = z)\n\
+             K2 = kernelof(a2, z = z)\n\
+             KJ = {spelling}"
+        ));
+        assert!(
+            bind_line(&out, "KJ").contains("(%mass %normalized)"),
+            "a fan-out of Markov kernels is Markov ({spelling}); got:\n{out}"
+        );
+    }
+}
+
+/// Q5's qualification reaches through kernels, because the fold is the SAME one
+/// the measure case uses ([`joint_mass`]): two non-normalized components that may
+/// share a stochastic node degrade to `%unknown` rather than folding
+/// `%locallyfinite`×`%locallyfinite` (`kernel-joint-q4-maths.md` §7, the
+/// Student-t/`y^2` counterexample). One non-normalized member still folds
+/// exactly, which is the second half here.
+///
+/// Every KERNEL component is a reification, and `functionof`/`kernelof` are
+/// disqualifiers of `joint_component_is_trace_clean`, so no kernel component is
+/// ever provably trace-clean and 2+ non-normalized kernel components always
+/// degrade. Sound, and the same disclosed conservatism the measure case carries
+/// for two `lawof` components.
+#[test]
+fn kernel_joint_mass_degrades_on_two_nonnormalized_components_and_not_on_one() {
+    let two = ir(&format!(
+        "{SHARED_LATENT_PROBE}\
+         L1 = functionof(Lebesgue(reals), z = z)\n\
+         L2 = functionof(Lebesgue(interval(0.0, 1.0)), z = z)\n\
+         KJ = joint(p = L1, q = L2)"
+    ));
+    assert!(
+        bind_line(&two, "KJ").contains("(%mass %unknown)"),
+        "two non-normalized components cannot fold to a definite class; got:\n{two}"
+    );
+    let one = ir(&format!(
+        "{SHARED_LATENT_PROBE}\
+         L1 = functionof(Lebesgue(reals), z = z)\n\
+         K2 = kernelof(a2, z = z)\n\
+         KJ = joint(p = L1, q = K2)"
+    ));
+    assert!(
+        bind_line(&one, "KJ").contains("(%mass %locallyfinite)"),
+        "one non-normalized member folds exactly; got:\n{one}"
+    );
+}
+
+/// The Q1 consistency clause: "Components that share a stochastic node must bind
+/// every boundary ancestor of that node under the same input name; a `joint`
+/// whose sharing components disagree on that name is a static error." `u` is
+/// shared and its boundary ancestor `z` is `s` in one component and `t` in the
+/// other, so `u`'s parent has no value where `s != t`.
+#[test]
+fn kernel_joint_sharing_components_must_agree_on_a_shared_nodes_input_name() {
+    assert!(rejects(
+        &format!(
+            "{SHARED_LATENT_PROBE}\
+             K1 = kernelof(a1, s = z)\n\
+             K2 = kernelof(a2, t = z)\n\
+             KJ = joint(p = K1, q = K2)"
+        ),
+        "bound under different input names"
+    ));
+}
+
+/// The clause is restricted to boundary ANCESTORS of the shared node, so a
+/// disagreement off that ancestry is legal — widening it to any commonly-bound
+/// target would reject this well-formed program. Here the shared `u` descends
+/// from `w`, which both components bind as `c`; `z` is bound under `s` and `t`
+/// but is not an ancestor of `u`, so the retained node's parent stays
+/// single-valued and the inputs union to `{s, c, t}`.
+#[test]
+fn kernel_joint_name_disagreement_off_the_shared_ancestry_is_legal() {
+    let src = "z  = elementof(reals)\n\
+               w  = elementof(reals)\n\
+               u  ~ Normal(mu = w, sigma = 1.0)\n\
+               a1 ~ Normal(mu = u, sigma = 1.0)\n\
+               a2 ~ Normal(mu = u, sigma = 1.0)\n\
+               K1 = kernelof(a1, s = z, c = w)\n\
+               K2 = kernelof(a2, t = z, c = w)\n\
+               KJ = joint(p = K1, q = K2)";
+    assert!(
+        !rejects(src, "bound under different input names"),
+        "a disagreement that is not a shared node's ancestor is legal"
+    );
+    assert!(
+        bind_line(&ir(src), "KJ").contains("(%kernel (%inputs s c t)"),
+        "and the inputs still union by name"
+    );
+}
+
+/// Trace-DISJOINT components need no clause at all (`kernel-joint-q4-maths.md`
+/// §4: "Trace-disjoint components need no clause"), so differing input names for
+/// the same boundary node are legal when nothing is shared.
+#[test]
+fn trace_disjoint_kernel_joint_may_disagree_on_an_input_name() {
+    let src = "z  = elementof(reals)\n\
+               b1 ~ Normal(mu = z, sigma = 1.0)\n\
+               b2 ~ Normal(mu = z, sigma = 1.0)\n\
+               K1 = kernelof(b1, s = z)\n\
+               K2 = kernelof(b2, t = z)\n\
+               KJ = joint(p = K1, q = K2)";
+    assert!(
+        !rejects(src, "bound under different input names"),
+        "disjoint traces share no node, so no name has to agree"
+    );
+    assert!(
+        bind_line(&ir(src), "KJ").contains("(%kernel (%inputs s t)"),
+        "and both names are inputs of the fan-out"
+    );
+}
+
+/// An all-measure `joint` must be untouched by the kernel arm: still a measure,
+/// still the record/`cat` domain, still the same mass fold.
+#[test]
+fn an_all_measure_joint_is_unchanged_by_the_kernel_arm() {
+    let kw = ir("j = joint(a = Normal(0.0, 1.0), b = Exponential(1.0))");
+    assert!(
+        bind_line(&kw, "j").contains(
+            "(%measure (%domain (%record (a (%scalar real)) (b (%scalar real)))) \
+             (%mass %normalized))"
+        ),
+        "keyword measure joint unchanged; got:\n{kw}"
+    );
+    let pos = ir("j = joint(Lebesgue(reals), Lebesgue(reals))");
+    assert!(
+        bind_line(&pos, "j").contains("(%mass %locallyfinite)"),
+        "positional measure joint's exact fold unchanged; got:\n{pos}"
+    );
+}

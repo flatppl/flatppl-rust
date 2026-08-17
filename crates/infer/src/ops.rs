@@ -2065,12 +2065,24 @@ fn law_phase(inf: &mut Inferencer<'_, '_>, node: NodeId, depth: u32) -> Phase {
 
 /// `joint(a = M1, b = M2, …)` — a measure over the record of the components'
 /// domains (the positional form is deferred with the shape work).
+///
+/// A KERNEL component makes the whole `joint` a kernel — see
+/// [`kernel_joint_type`].
 fn joint_type(
     inf: &mut Inferencer<'_, '_>,
     id: NodeId,
     args: &[ArgInfo],
     named: &[NamedInfo],
 ) -> Type {
+    if args
+        .iter()
+        .any(|(_, t, _)| matches!(t, Type::Kernel { .. }))
+        || named
+            .iter()
+            .any(|(_, _, t, _)| matches!(t, Type::Kernel { .. }))
+    {
+        return kernel_joint_type(inf, id, args, named);
+    }
     // Keyword form `joint(a = M1, b = M2, …)`: a measure over a RECORD, each
     // component variate under its name (a record-valued component nests under
     // the name, not merged — spec §06).
@@ -2102,6 +2114,333 @@ fn joint_type(
         domain: Box::new(cat_or_diagnose(inf, id, "joint", &domains)),
         mass: Mass::Deferred,
     }
+}
+
+/// `joint(K1, K2, …)` where at least one component is a KERNEL — the fan-out
+/// kernel of spec §06's `joint` entry ("a kernel that fans a single input out to
+/// all component kernels, so each of them receives the same input"). The five
+/// semantic questions the sentence leaves open are settled in
+/// `flatppl-dev/kernel-joint-q4-maths.md` and written into §06 by
+/// flatppl-design#85:
+///
+/// - **Inputs: the union by name** (Q1). "The result's inputs are the union of
+///   the component kernels' inputs by name; a component receives the inputs it
+///   declares and is unaffected by the others." A name declared by several
+///   components binds once and fans to each of them. First-occurrence order, so
+///   the signature reads in source order rather than by symbol id.
+/// - **Measure components are the nullary case** (Q3) — §06 "Uniform kernel
+///   extension": "we unify measures and kernels and identify measures with
+///   nullary kernels". They contribute nothing to the union, which is why an
+///   all-measure `joint` never reaches here and a mixed one is legal.
+/// - **The keyword form still names a record variate** (Q2), but §11's
+///   `(%kernel (%inputs …) (%mass …))` carries no output domain, so the variate
+///   has nowhere to land in `Type::Kernel`. It becomes visible on APPLICATION,
+///   where [`kernel_joint_result_type`] builds the record (keyword) or `cat`
+///   (positional).
+/// - **RETAIN is a trace fact, not a type fact** (Q4). Whether the output law is
+///   correlated or a product turns on node identity in the components' carried
+///   traces, which no type slot records; the determiniser reads the traces.
+/// - **Mass: the qualified product rule** (Q5), shared verbatim with the measure
+///   case through [`joint_mass`]. At each input the output IS a measure-`joint`,
+///   so the kernel case adds nothing of its own — §11: a kernel's `%mass` is
+///   "the total-mass class of the output measure, uniform over all inputs".
+///
+/// A component that is neither a measure nor a kernel leaves the whole `joint`
+/// `%deferred`, exactly as the measure arms do.
+fn kernel_joint_type(
+    inf: &mut Inferencer<'_, '_>,
+    id: NodeId,
+    args: &[ArgInfo],
+    named: &[NamedInfo],
+) -> Type {
+    let components: Vec<(NodeId, &Type)> = if named.is_empty() {
+        args.iter().map(|(n, t, _)| (*n, t)).collect()
+    } else {
+        named.iter().map(|(_, n, t, _)| (*n, t)).collect()
+    };
+    let mut inputs: Vec<Symbol> = Vec::new();
+    for (_, t) in &components {
+        match t {
+            Type::Kernel {
+                inputs: component, ..
+            } => {
+                for name in component.iter() {
+                    if !inputs.contains(name) {
+                        inputs.push(*name);
+                    }
+                }
+            }
+            // Nullary: contributes no input (Q3).
+            Type::Measure { .. } => {}
+            _ => return Type::Deferred,
+        }
+    }
+    if let Some(failed) = diagnose_shared_node_input_names(inf, id, &components) {
+        return failed;
+    }
+    Type::Kernel {
+        inputs: inputs.into(),
+        mass: joint_mass(inf, args, named),
+    }
+}
+
+/// The Q1 consistency clause (§06 `joint` entry, flatppl-design#85):
+/// "Components that share a stochastic node must bind every boundary ancestor of
+/// that node under the same input name; a `joint` whose sharing components
+/// disagree on that name is a static error."
+///
+/// Why it is an error rather than a convention: under union-by-name the retained
+/// node has one parent value, so two components substituting its boundary
+/// ancestor with DIFFERENT inputs leave that parent undefined at any application
+/// where the two inputs differ (`kernel-joint-q4-maths.md` §4). The all-or-none
+/// boundary rule (§04 "Specifying reification boundaries") already excludes the
+/// half-substituted and same-name-different-node variants, so this is the only
+/// conflict shape.
+///
+/// **Detection is SOUND, not complete**, and each narrowing costs only
+/// diagnostics, never a wrong type:
+///
+/// - Sharing is decided by NODE IDENTITY of `draw` nodes reached through the
+///   binding DAG ([`component_draw_nodes`]) — the intersection the maths doc §10
+///   prescribes. Two components reaching the same `draw` node genuinely share it;
+///   a component whose trace this walk cannot follow (a cross-module ref, a
+///   lambda kernel, a depth-capped path) contributes no draws and so triggers
+///   nothing.
+/// - Only a component that resolves to a LOCAL reification is checked, since the
+///   clause is about boundary input names and only a reification declares them
+///   ([`local_reification`] + [`input_entries`]).
+/// - The conflict is reported only for a boundary target the shared node's own
+///   subtree actually reaches ([`subtree_reaches_name`]) — "boundary ancestor of
+///   that node", not "any boundary the two components happen to share". A
+///   disagreeing boundary that is NOT an ancestor of the shared node is legal
+///   (the retained node's parent is still single-valued), so widening the test
+///   would reject a well-formed program.
+///
+/// This is not the cross-component ancestry oracle `product_mass` deliberately
+/// avoids: it only ever ADDS a diagnostic on a proven identity, and never
+/// strengthens a mass class or a type on an unproven one.
+fn diagnose_shared_node_input_names(
+    inf: &mut Inferencer<'_, '_>,
+    id: NodeId,
+    components: &[(NodeId, &Type)],
+) -> Option<Type> {
+    /// One inspectable kernel component: the `draw` nodes its trace reaches, and
+    /// its boundary as `(input name, target name)` pairs.
+    struct Traced {
+        draws: Vec<NodeId>,
+        boundary: Vec<(Symbol, Symbol)>,
+    }
+    let mut traced: Vec<Traced> = Vec::new();
+    for (node, t) in components {
+        if !matches!(t, Type::Kernel { .. }) {
+            continue;
+        }
+        let Some((reif, _)) = local_reification(inf, *node) else {
+            continue;
+        };
+        let Some(entries) = input_entries(inf, reif) else {
+            continue;
+        };
+        traced.push(Traced {
+            draws: component_draw_nodes(inf, *node),
+            boundary: entries.iter().map(|(name, r)| (*name, r.name)).collect(),
+        });
+    }
+    for i in 0..traced.len() {
+        for j in (i + 1)..traced.len() {
+            let (left, right) = (&traced[i], &traced[j]);
+            for shared in left.draws.iter().filter(|d| right.draws.contains(d)) {
+                for (left_input, target) in &left.boundary {
+                    let Some((right_input, _)) = right.boundary.iter().find(|(_, t)| t == target)
+                    else {
+                        continue;
+                    };
+                    if right_input == left_input {
+                        continue;
+                    }
+                    if !subtree_reaches_name(inf, *shared, *target) {
+                        continue;
+                    }
+                    let target = inf.module.resolve(*target).to_string();
+                    let left = inf.module.resolve(*left_input).to_string();
+                    let right = inf.module.resolve(*right_input).to_string();
+                    inf.diags.push(crate::Diagnostic::error_at(
+                        id,
+                        format!(
+                            "`joint` components share a stochastic node whose boundary \
+                             ancestor `{target}` is bound under different input names \
+                             (`{left}` and `{right}`): the shared node's parent has no \
+                             well-defined value where the two inputs differ, so every \
+                             sharing component must bind it under the same name (spec §06 \
+                             `joint`)"
+                        ),
+                    ));
+                    return Some(Type::Failed(
+                        "joint kernel components disagree on a shared node's input name".into(),
+                    ));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The `draw` nodes a `joint` component's subtree reaches, by NODE IDENTITY,
+/// following self-module refs the way [`joint_component_is_trace_clean`] does and
+/// under the same `depth` cap. A stochastic node enters a `joint`'s composed trace
+/// only through a reified component or a stochastic constructor parameter (§04
+/// "Trace of the reified law", §06 `joint` entry), and both channels are subtrees
+/// of the component, so both are covered by one walk.
+///
+/// Node identity is what makes the answer meaningful: `u ~ Normal(…)` has ONE
+/// `draw` node in the binding DAG, so two components that both reach it through
+/// `(%ref self u)` reach the same `NodeId`, while two independent draws never do.
+/// The result is deliberately a proof of sharing only — a path this walk cannot
+/// follow yields fewer draws, never a spurious one.
+fn component_draw_nodes(inf: &Inferencer<'_, '_>, node: NodeId) -> Vec<NodeId> {
+    fn walk(
+        inf: &Inferencer<'_, '_>,
+        node: NodeId,
+        depth: u32,
+        seen: &mut std::collections::HashSet<NodeId>,
+        out: &mut Vec<NodeId>,
+    ) {
+        if depth > 64 || !seen.insert(node) {
+            return;
+        }
+        if let Node::Ref(r) = inf.module.node(node) {
+            if r.ns == RefNs::SelfMod {
+                if let Some(b) = inf.module.binding_by_name(r.name) {
+                    let rhs = inf.module.binding(b).rhs;
+                    walk(inf, rhs, depth + 1, seen, out);
+                }
+            }
+            return;
+        }
+        if let Node::Call(c) = inf.module.node(node) {
+            if let CallHead::Builtin(op) = c.head {
+                if inf.module.resolve(op) == "draw" {
+                    out.push(node);
+                }
+            }
+        }
+        let mut children = Vec::new();
+        inf.module
+            .for_each_child(node, |child| children.push(child));
+        for child in children {
+            walk(inf, child, depth + 1, seen, out);
+        }
+    }
+    let mut out = Vec::new();
+    walk(
+        inf,
+        node,
+        0,
+        &mut std::collections::HashSet::new(),
+        &mut out,
+    );
+    out
+}
+
+/// Does the subtree at `root` reach `(%ref self name)`, following self-module refs
+/// under the same `depth` cap as [`component_draw_nodes`]? Used to restrict the Q1
+/// conflict to a boundary target that is genuinely an ANCESTOR of the shared node.
+fn subtree_reaches_name(inf: &Inferencer<'_, '_>, root: NodeId, name: Symbol) -> bool {
+    fn walk(
+        inf: &Inferencer<'_, '_>,
+        node: NodeId,
+        name: Symbol,
+        depth: u32,
+        seen: &mut std::collections::HashSet<NodeId>,
+    ) -> bool {
+        if depth > 64 || !seen.insert(node) {
+            return false;
+        }
+        if let Node::Ref(r) = inf.module.node(node) {
+            if r.ns != RefNs::SelfMod {
+                return false;
+            }
+            if r.name == name {
+                return true;
+            }
+            let Some(b) = inf.module.binding_by_name(r.name) else {
+                return false;
+            };
+            let rhs = inf.module.binding(b).rhs;
+            return walk(inf, rhs, name, depth + 1, seen);
+        }
+        let mut children = Vec::new();
+        inf.module
+            .for_each_child(node, |child| children.push(child));
+        children
+            .into_iter()
+            .any(|child| walk(inf, child, name, depth + 1, seen))
+    }
+    walk(inf, root, name, 0, &mut std::collections::HashSet::new())
+}
+
+/// The output measure of an APPLIED kernel `joint` — `joint(K1, K2, …)(a)`.
+/// Spec §06 makes this the `joint` of the component output measures at that input
+/// ("At each input point the result is the `joint` of the component output
+/// measures"), so the variate is the same record (keyword) or `cat` (positional)
+/// merge as the measure case, and this is where Q2's record variate becomes
+/// visible — `Type::Kernel` has no slot for it.
+///
+/// The mass is left `%deferred` for the caller to fill from the kernel's own
+/// class, which §11 defines as uniform over all inputs. `None` when `callee` is
+/// not a local `joint` call or a component's variate is not statically
+/// resolvable, so the application stays `%deferred` rather than guessing a shape.
+fn kernel_joint_result_type(inf: &mut Inferencer<'_, '_>, callee: NodeId) -> Option<Type> {
+    let mut node = callee;
+    let call = loop {
+        match inf.module.node(node) {
+            Node::Ref(r) if r.ns == RefNs::SelfMod => {
+                let binding = inf.module.binding_by_name(r.name)?;
+                node = inf.module.binding(binding).rhs;
+            }
+            Node::Call(c) => {
+                let CallHead::Builtin(op) = c.head else {
+                    return None;
+                };
+                if inf.module.resolve(op) != "joint" {
+                    return None;
+                }
+                break c.clone();
+            }
+            _ => return None,
+        }
+    };
+    let components: Vec<(Option<Symbol>, NodeId)> = if call.named.is_empty() {
+        call.args.iter().map(|&a| (None, a)).collect()
+    } else {
+        call.named
+            .iter()
+            .map(|na| (Some(na.name), na.value))
+            .collect()
+    };
+    if components.is_empty() {
+        return None;
+    }
+    let mut variates = Vec::with_capacity(components.len());
+    for (name, component) in components {
+        let ty = inf.lookup_type(component).cloned()?;
+        let variate = component_variate(inf, component, &ty)?;
+        variates.push((name, variate));
+    }
+    let domain = if variates.iter().all(|(name, _)| name.is_some()) {
+        Type::Record(
+            variates
+                .into_iter()
+                .map(|(name, v)| (name.expect("all named"), v))
+                .collect(),
+        )
+    } else {
+        cat_compose(&variates.into_iter().map(|(_, v)| v).collect::<Vec<_>>())
+    };
+    Some(Type::Measure {
+        domain: Box::new(domain),
+        mass: Mass::Deferred,
+    })
 }
 
 /// `functionof` / `kernelof` (spec §04 reification, §11 reified callables).
@@ -2731,9 +3070,15 @@ fn user_call_type(
             .map(|(ty, _)| ty)
             .or_else(|| reified_result_type(inf, callee))
             .unwrap_or(Type::Deferred),
+        // A fan-out kernel (`joint(K1, K2, …)`) is not a reification, so neither
+        // substitution nor a reified body reaches its output measure —
+        // `kernel_joint_result_type` builds it from the components (spec §06: "At
+        // each input point the result is the `joint` of the component output
+        // measures").
         Type::Kernel { mass, .. } => match substituted_result(inf, callee, args, named)
             .map(|(ty, _)| ty)
             .or_else(|| reified_result_type(inf, callee))
+            .or_else(|| kernel_joint_result_type(inf, callee))
         {
             Some(Type::Measure { domain, .. }) => Type::Measure {
                 domain,
@@ -4775,36 +5120,7 @@ pub(crate) fn fill_mass(
             Mass::LocallyFinite => Mass::LocallyFinite,
             _ => Mass::Unknown,
         },
-        "joint" => {
-            // Keyword and positional `joint` are mutually exclusive forms
-            // (`joint_type` above): mirror that split so both spellings of
-            // the same joint fold their components' masses identically.
-            let component_mass = |t: &Type| match t {
-                Type::Measure { mass, .. } => *mass,
-                _ => Mass::Unknown,
-            };
-            let (masses, not_clean): (Vec<Mass>, Vec<bool>) = if !named.is_empty() {
-                named
-                    .iter()
-                    .map(|(_, node, t, _)| {
-                        (
-                            component_mass(t),
-                            !joint_component_is_trace_clean(inf, *node, 0),
-                        )
-                    })
-                    .unzip()
-            } else {
-                args.iter()
-                    .map(|(node, t, _)| {
-                        (
-                            component_mass(t),
-                            !joint_component_is_trace_clean(inf, *node, 0),
-                        )
-                    })
-                    .unzip()
-            };
-            product_mass(&masses, &not_clean)
-        }
+        "joint" => joint_mass(inf, args, named),
         // `restrict` shares truncate's support-restriction mass behaviour: the
         // result is a sub-measure, so a probability/finite measure becomes
         // merely finite, and an infinite measure stays finite only on a bounded
@@ -4945,6 +5261,48 @@ pub(crate) fn fill_mass(
         _ => Mass::Normalized,
     };
     Type::Measure { domain, mass }
+}
+
+/// The total-mass class of a `joint`, measure or kernel: [`product_mass`] over
+/// the components, qualified by per-component trace cleanliness.
+///
+/// One fold for both, because §06 gives the kernel case no rule of its own — at
+/// each input the fan-out kernel's output IS a measure-`joint`, and §11 makes a
+/// kernel's `%mass` "the total-mass class of the output measure, uniform over all
+/// inputs" (`kernel-joint-q4-maths.md` §7, Q5). A kernel component is read for its
+/// own class the same way [`fill_mass`]'s `arg_mass` and `jointchain`'s arm read
+/// one: a `%normalized` kernel is a Markov kernel, so a fan-out of Markov kernels
+/// is a Markov kernel.
+///
+/// Keyword and positional `joint` are mutually exclusive forms ([`joint_type`]):
+/// the split is mirrored here so both spellings of the same joint fold
+/// identically.
+fn joint_mass(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo], named: &[NamedInfo]) -> Mass {
+    let component_mass = |t: &Type| match t {
+        Type::Measure { mass, .. } | Type::Kernel { mass, .. } => *mass,
+        _ => Mass::Unknown,
+    };
+    let (masses, not_clean): (Vec<Mass>, Vec<bool>) = if !named.is_empty() {
+        named
+            .iter()
+            .map(|(_, node, t, _)| {
+                (
+                    component_mass(t),
+                    !joint_component_is_trace_clean(inf, *node, 0),
+                )
+            })
+            .unzip()
+    } else {
+        args.iter()
+            .map(|(node, t, _)| {
+                (
+                    component_mass(t),
+                    !joint_component_is_trace_clean(inf, *node, 0),
+                )
+            })
+            .unzip()
+    };
+    product_mass(&masses, &not_clean)
 }
 
 /// The mass of a `joint`'s components (spec §06 `joint` entry: "a stochastic
