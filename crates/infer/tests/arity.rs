@@ -74,8 +74,9 @@ fn measured_leaks_are_now_static_errors() {
 /// diagnostic — indistinguishable from an honest "no rule yet" gap and
 /// invisible to the `is_flatpdl` `Type::Failed` backstop. `true`/`false` are
 /// NOT covered here: they parse as a `CallHead::User` callee application (a
-/// different code path — `user_call_type`), not `CallHead::Builtin`, so they
-/// are out of reach of this rule and remain `%deferred`.
+/// different code path — `call_rule`'s user-call arm, not `CallHead::Builtin`)
+/// — see `predefined_constant_true_false_applied_via_user_call_is_a_static_error`
+/// below for that route.
 #[test]
 fn predefined_constant_applied_to_arguments_is_now_a_static_error() {
     for (src, want) in [
@@ -108,6 +109,30 @@ fn predefined_constant_applied_to_arguments_is_now_a_static_error() {
     // A bare reference to the constant, or a well-formed expression using one,
     // is untouched — only its APPLICATION is malformed.
     assert!(errors("x = pi\ny = 3.0 * pi / 4.0").is_empty());
+}
+
+/// `true`/`false` are lexed unconditionally to a bool `Lit` (never a `Ref`),
+/// so `true(0.5)` is postfix APPLICATION on that literal (spec §11), reaching
+/// `CallHead::User` — `user_call_type` — rather than the `CallHead::Builtin`
+/// path the test above covers. Same spec §03/§04 violation, same outcome.
+#[test]
+fn predefined_constant_true_false_applied_via_user_call_is_a_static_error() {
+    for (src, name) in [("x = true(0.5)", "true"), ("x = false(0.5)", "false")] {
+        let want = format!(
+            "`{name}` is a predefined constant (spec §03), not a callable, so it cannot be \
+             applied to arguments (spec §04 \"Language design\": no callable has nullary \
+             inputs, which is what a known value like `{name}` would need to be one)"
+        );
+        assert_eq!(errors(src), vec![want], "for {src}");
+        assert!(
+            ir(src).contains("(%failed"),
+            "{src} must type %failed:\n{}",
+            ir(src)
+        );
+    }
+    // A bare `true`/`false`, or a genuine user callable, is untouched.
+    assert!(errors("x = true\ny = false").is_empty());
+    assert!(errors("f(a) = a + 1.0\nx = f(1.0)").is_empty());
 }
 
 /// A well-formed call is untouched: no error, and the type the op's own rule
