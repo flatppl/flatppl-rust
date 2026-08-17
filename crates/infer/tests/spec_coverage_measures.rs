@@ -926,3 +926,69 @@ y = draw(normalize(truncate(lawof(Normal(mu = a, sigma = 1.0)), interval(0.0, 3.
 lp = logdensityof(lawof(y), 0.5)";
     assert!(diags_of(fixed).is_empty(), "{:?}", diags_of(fixed));
 }
+
+// ============================================================
+// `rand` requires a probability measure (#425 class; mirrors the `draw` gate)
+// ============================================================
+//
+// §07: `rand(rstate, m)` draws a variate from a normalized measure `m`. Same
+// owner ruling as `draw`, same `unprovable_normalization` gate, adapted to
+// `rand`'s second argument (the first is the rngstate).
+
+/// The unprovable classes are rejected and the message names the mass class
+/// and the `normalize(...)` escape, exactly like the `draw` gate.
+#[test]
+fn rand_rejects_a_measure_that_is_not_a_probability() {
+    let src = "s = rnginit(0)\ny = rand(s, Lebesgue(support = reals))";
+    assert!(rejects(src, "`rand` requires a probability measure"));
+    assert!(rejects(src, "total mass is `%locallyfinite`"));
+    assert!(rejects(src, "normalize(...)"));
+}
+
+/// The ordinary spelling — `rand` of a plain probability distribution — still
+/// infers the `(domain, %rngstate)` tuple untouched by the gate.
+#[test]
+fn rand_still_accepts_a_probability_measure() {
+    let out = ir("s = rnginit(0)\ny = rand(s, Normal(0.0, 1.0))");
+    assert!(
+        out.lines()
+            .find(|l| l.contains("%bind y"))
+            .unwrap_or("")
+            .contains("(%tuple (%scalar real) %rngstate)"),
+        "{out}"
+    );
+}
+
+/// `normalize(M)` of a `%finite` M is provably `Mass::Normalized` and passes
+/// the gate for free, same as it does for `draw`.
+#[test]
+fn rand_accepts_normalize_of_a_finite_measure() {
+    let src = "s = rnginit(0)\n\
+               y = rand(s, normalize(truncate(Lebesgue(support = reals), interval(0.0, 1.0))))";
+    assert!(diags_of(src).is_empty(), "{:?}", diags_of(src));
+}
+
+/// `%deferred` mass is "not yet inferred", not a proven-unnormalized verdict,
+/// so the gate lets it through honestly rather than forcing a false refusal.
+/// Stopping inference at `Level::Valueset` (before the Normalization-level
+/// mass pass fills it in) is the one way to hand the gate a measure whose
+/// mass is genuinely still `%deferred`, per `level_valueset_vs_normalization`
+/// in `golden.rs`.
+#[test]
+fn rand_accepts_a_deferred_mass_measure() {
+    let src = "s = rnginit(0)\ny = rand(s, Normal(0.0, 1.0))";
+    let mut module = flatppl_syntax::parse(src).unwrap();
+    let diags = flatppl_infer::infer_with(&mut module, flatppl_infer::Level::Valueset);
+    let out = flatppl_flatpir::write(&module);
+    assert!(
+        out.contains("%mass %deferred"),
+        "the mass must genuinely still be deferred at this level:\n{out}"
+    );
+    let diags: Vec<String> = diags.iter().map(|d| format!("{d:?}")).collect();
+    assert!(
+        !diags
+            .iter()
+            .any(|d| d.contains("`rand` requires a probability measure")),
+        "{diags:?}"
+    );
+}
