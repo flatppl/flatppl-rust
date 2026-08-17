@@ -343,6 +343,38 @@ pub fn is_kernel_tag_name(name: &str) -> bool {
         .is_some()
 }
 
+/// True iff `name` is one of spec §03's sixteen "Predefined constants" —
+/// `true`, `false`, `inf`, `pi`, `im`, and the eleven named value-sets
+/// (`reals`, `posreals`, `nonnegreals`, `unitinterval`, `posintegers`,
+/// `nonnegintegers`, `integers`, `booleans`, `complexes`, `rngstates`,
+/// `anything`). Each is a KNOWN VALUE, never a callable: §04 "Language design"
+/// states "No callables may have nullary inputs, as this would make them
+/// equivalent to known values", so a predefined constant — which by
+/// definition takes no inputs — can never be one. `all` and `_` are excluded
+/// on purpose: §03's own note calls them "syntactic elements, not value
+/// constants".
+pub fn is_predefined_constant(name: &str) -> bool {
+    matches!(
+        name,
+        "true"
+            | "false"
+            | "inf"
+            | "pi"
+            | "im"
+            | "reals"
+            | "posreals"
+            | "nonnegreals"
+            | "unitinterval"
+            | "posintegers"
+            | "nonnegintegers"
+            | "integers"
+            | "booleans"
+            | "complexes"
+            | "rngstates"
+            | "anything"
+    )
+}
+
 /// The argument INDEX carrying the kernel tag, for a call head that carries one.
 ///
 /// Spec §07 "Measure kernel evaluation primitives" fixes each signature, and the

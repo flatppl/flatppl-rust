@@ -32,6 +32,26 @@ fn is_flatpdl_rejects_residual_type_failed() {
     );
 }
 
+/// `pi` is a spec-§03 predefined constant, never a callable (§04: "No
+/// callables may have nullary inputs, as this would make them equivalent to
+/// known values"). Before `flatppl-infer` grew a rule for it, `pi(0.5)` typed
+/// `%deferred` with no diagnostic — the malformed application reached no type
+/// rule, so it read as an honest "no rule yet" gap and was invisible to this
+/// very backstop. `flatppl-infer` now marks it `Type::Failed`, so the generic
+/// net here catches it like any other residual `Failed` node.
+#[test]
+fn is_flatpdl_rejects_a_predefined_constant_applied_to_arguments() {
+    let m = infer_module("x = pi(0.5)");
+    let v = is_flatpdl(&m).unwrap_err();
+    assert!(
+        v.iter()
+            .any(|n| matches!(n.kind, NonConformKind::Failed)
+                && n.reason.contains("pi is not callable")),
+        "a `pi(0.5)`-class malformed application must be reported as NonConformKind::Failed; \
+         got: {v:?}"
+    );
+}
+
 /// Regression guard for the tightening: a normal model, fully lowered by the
 /// determiniser (no residual measure/likelihood/kernel/stochastic/failed
 /// node), must still pass `is_flatpdl` after the backstop is added.

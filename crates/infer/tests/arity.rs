@@ -66,6 +66,50 @@ fn measured_leaks_are_now_static_errors() {
     }
 }
 
+/// A predefined constant (spec §03: `true`, `false`, `inf`, `pi`, `im`, and the
+/// eleven named value-sets) is a known value, never a callable — §04 "Language
+/// design": "No callables may have nullary inputs, as this would make them
+/// equivalent to known values." Applying one to arguments, the `(pi 0.5)`
+/// class, used to reach no type rule and fall through to `%deferred` with no
+/// diagnostic — indistinguishable from an honest "no rule yet" gap and
+/// invisible to the `is_flatpdl` `Type::Failed` backstop. `true`/`false` are
+/// NOT covered here: they parse as a `CallHead::User` callee application (a
+/// different code path — `user_call_type`), not `CallHead::Builtin`, so they
+/// are out of reach of this rule and remain `%deferred`.
+#[test]
+fn predefined_constant_applied_to_arguments_is_now_a_static_error() {
+    for (src, want) in [
+        (
+            "x = pi(0.5)",
+            "`pi` is a predefined constant (spec §03), not a callable, so it cannot be applied \
+             to arguments (spec §04 \"Language design\": no callable has nullary inputs, which \
+             is what a known value like `pi` would need to be one)",
+        ),
+        (
+            "x = inf(0.5)",
+            "`inf` is a predefined constant (spec §03), not a callable, so it cannot be applied \
+             to arguments (spec §04 \"Language design\": no callable has nullary inputs, which \
+             is what a known value like `inf` would need to be one)",
+        ),
+        (
+            "x = reals(0.5)",
+            "`reals` is a predefined constant (spec §03), not a callable, so it cannot be \
+             applied to arguments (spec §04 \"Language design\": no callable has nullary \
+             inputs, which is what a known value like `reals` would need to be one)",
+        ),
+    ] {
+        assert_eq!(errors(src), vec![want.to_string()], "for {src}");
+        assert!(
+            ir(src).contains("(%failed"),
+            "{src} must type %failed:\n{}",
+            ir(src)
+        );
+    }
+    // A bare reference to the constant, or a well-formed expression using one,
+    // is untouched — only its APPLICATION is malformed.
+    assert!(errors("x = pi\ny = 3.0 * pi / 4.0").is_empty());
+}
+
 /// A well-formed call is untouched: no error, and the type the op's own rule
 /// produces.
 #[test]
