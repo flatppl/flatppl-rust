@@ -658,6 +658,29 @@ pub(crate) fn call_rule(
                         ));
                         return (Type::Failed("unresolvable name".into()), Phase::Fixed);
                     }
+                    // A predefined constant (spec §03) is a KNOWN VALUE, never a
+                    // callable — §04 "no callables may have nullary inputs, as this
+                    // would make them equivalent to known values". Without this,
+                    // `pi(0.5)` (or `reals(0.5)`, `true(0.5)`, …) reached no rule
+                    // above and fell through to the honest-gap arm below, typing
+                    // `%deferred` with no diagnostic — indistinguishable from "no
+                    // rule yet" and invisible to the `is_flatpdl` `Type::Failed`
+                    // backstop.
+                    if crate::builtins::is_predefined_constant(&name) {
+                        inf.diags.push(crate::Diagnostic::error_at(
+                            id,
+                            format!(
+                                "`{name}` is a predefined constant (spec §03), not a callable, \
+                                 so it cannot be applied to arguments (spec §04 \"Language \
+                                 design\": no callable has nullary inputs, which is what a \
+                                 known value like `{name}` would need to be one)"
+                            ),
+                        ));
+                        return (
+                            Type::Failed(format!("{name} is not callable").into()),
+                            Phase::Fixed,
+                        );
+                    }
                     inf.note_gap(op);
                     Type::Deferred
                 }
