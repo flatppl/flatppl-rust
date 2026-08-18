@@ -226,6 +226,60 @@ fn an_unapplied_kernel_joint_density_query_stays_refused() {
     determinize(&parse_infer(&src)).expect_err("an unapplied fan-out is not a closed measure");
 }
 
+/// The fan-out path gets the query-point guard too.
+///
+/// The finish rewrites the whole emitted density, so a point written as the ambient `z`
+/// would be scored at the applied value. Without the guard on this path,
+/// `record(p = z, q = -1.0)` scored the `p` coordinate at `0.0` and exited 0 — a silent
+/// wrong number on a shape `a86437d` refused. The two applied paths must carry the same
+/// guard; only the reification one did.
+#[test]
+fn an_applied_fan_out_refuses_a_query_point_naming_the_boundary() {
+    let src = format!(
+        "{PROBE}\
+         KJ = joint(p = K1, q = K2)\n\
+         lp = logdensityof(KJ(z = 0.0), record(p = z, q = -1.0))"
+    );
+    let err = determinize(&parse_infer(&src)).expect_err("the point and the boundary collide");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("boundary input"),
+        "the refusal must name the boundary collision; got: {msg}"
+    );
+}
+
+/// §04's splat binds a sole positional `table(...)` by COLUMN name exactly as it binds a
+/// `record(...)` by field name: "`f(record(a = x, b = y, ...))` and `f(table(a = x, b = y,
+/// ...))` are equivalent to `f(a = x, b = y, ...)`".
+///
+/// Recognising only `record` here sent the table down the positional arm, which bound the
+/// whole `table(z = 0.0)` node to every input and emitted
+/// `record(mu = table(z = 0.0), sigma = 1.0)` at exit 0. The two components are
+/// independent given the pinned input, so the oracle at `(1,-1)` is
+/// `-log(2*pi) - 1 = -2.8378770664093453`.
+#[test]
+fn an_applied_fan_out_splats_a_sole_positional_table() {
+    let out = lower(
+        "\
+z  = elementof(reals)
+b1 ~ Normal(mu = z, sigma = 1.0)
+b2 ~ Normal(mu = z, sigma = 1.0)
+K1 = kernelof(b1, z = z)
+K2 = kernelof(b2, z = z)
+KJ = joint(p = K1, q = K2)
+lp = logdensityof(KJ(table(z = 0.0)), record(p = 1.0, q = -1.0))",
+    );
+    assert!(
+        !out.contains("table("),
+        "the table must be splatted by column name, not bound whole; got:\n{out}"
+    );
+    assert_eq!(
+        out.matches("record(mu = 0.0, sigma = 1.0)").count(),
+        2,
+        "both factors read the splatted column; got:\n{out}"
+    );
+}
+
 /// The W1 shape refuses in the DETERMINISER too, not only at the inference front door.
 ///
 /// `kernel-joint-w1-maths.md` §3: with `u` shared and its ancestor `z` bound by `K1`

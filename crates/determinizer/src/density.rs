@@ -1175,6 +1175,22 @@ fn lower_applied_kernel_joint_inner(
         resolved.push(k);
     }
     let supplied = bind_fan_out_inputs(m, node, &union, supplied_args, supplied_kwargs)?;
+    // The same guard the reification path gets, and for the same reason: the finish
+    // below rewrites the whole emitted density, and §04 scopes the substitution to the
+    // REIFIED graph, which the query point is not in. Without it a point written as the
+    // ambient `z` is scored at the applied value.
+    let bound_targets: Vec<(Ref, NodeId)> = supplied
+        .iter()
+        .flat_map(|(name, value)| {
+            resolved.iter().flatten().flat_map(move |k| {
+                k.inputs
+                    .iter()
+                    .filter(move |(n, _)| n == name)
+                    .map(move |(_, target)| (*target, *value))
+            })
+        })
+        .collect();
+    refuse_boundary_named_query_point(m, v, &bound_targets)?;
 
     let mut bound: Vec<(Ref, NodeId)> = Vec::new();
     let mut rewritten: Vec<NodeId> = Vec::with_capacity(components.len());
@@ -1198,7 +1214,15 @@ fn lower_applied_kernel_joint_inner(
                                 ),
                             )
                         })?;
-                    body = crate::kernel::substitute_ref(m, body, target.name, value);
+                    // `LocalOnly`, exactly as the reification path: a same-module
+                    // target is substituted ONCE, by the finish below.
+                    body = crate::kernel::substitute_admitted(
+                        m,
+                        body,
+                        *target,
+                        value,
+                        crate::kernel::Substitute::LocalOnly,
+                    );
                     bound.push((*target, value));
                 }
                 let coordinate = build_call(m, "lawof", &[body]);
@@ -1343,20 +1367,24 @@ fn bind_fan_out_inputs(
         }
         return Ok(out);
     }
-    if args.len() == 1 && expect_builtin_call(m, resolve_ref_one(m, args[0]).0, "record").is_some()
-    {
-        let fields: Vec<(Symbol, NodeId)> = {
-            let rec = expect_builtin_call(m, resolve_ref_one(m, args[0]).0, "record")
-                .ok_or_else(|| bad_arity(m))?;
-            rec.named.iter().map(|na| (na.name, na.value)).collect()
-        };
+    // §04's splat covers `record(...)` AND `table(...)` ("`f(record(a = x, b = y, ...))`
+    // and `f(table(a = x, b = y, ...))` are equivalent to `f(a = x, b = y, ...)`"), plus
+    // an OPAQUE table whose columns come from its type. Reuse `kernel`'s own two helpers
+    // rather than re-test for a `record` head, so this path cannot drift from the
+    // reification path: recognising only `record` sent a sole positional TABLE down the
+    // positional arm below, which bound the whole `table(...)` node to every input.
+    if args.len() == 1 && crate::kernel::is_splattable(m, args[0]) {
         let mut out = Vec::with_capacity(union.len());
         for name in union {
-            let value = fields
-                .iter()
-                .find(|(n, _)| n == name)
-                .map(|(_, value)| *value)
-                .ok_or_else(|| bad_arity(m))?;
+            let value = crate::kernel::record_field(m, args[0], *name).ok_or_else(|| {
+                refuse(
+                    node,
+                    m,
+                    "the applied fan-out kernel's sole positional record or table carries no \
+                     field or column for one of its inputs: §04 auto-splatting binds by name, \
+                     and a name mismatch is an error rather than a whole-value bind",
+                )
+            })?;
             out.push((*name, value));
         }
         return Ok(out);
@@ -1562,7 +1590,11 @@ fn lower_measure_density_at(
     // A reified-kernel *application* `k(input)` (a `%call(User(k), [input])`)
     // is not a builtin-named op; β-reduce it to its measure body and recurse.
     // β-reduction does not move the measure, so the position carries over.
-    if let Some(app) = crate::kernel::reduce_kernel_application_bound(m, measure_node) {
+    if let Some(app) = crate::kernel::reduce_kernel_application_bound(
+        m,
+        measure_node,
+        crate::kernel::Substitute::LocalOnly,
+    ) {
         refuse_boundary_named_query_point(m, v, &app.bound)?;
         // §04 *Kernels and `kernelof`* makes `kernelof(x, kwargs...)` equivalent to
         // `functionof(lawof(x), kwargs...)`, so the APPLIED body sits under a `lawof`

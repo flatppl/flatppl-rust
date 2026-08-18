@@ -2393,19 +2393,35 @@ fn diagnose_shared_node_input_names(
                                      name",
                                 )
                             }
-                            None => (
-                                format!(
-                                    "`joint` components share a stochastic node whose boundary \
-                                     ancestor `{target}` one component binds as `{mine}` while \
-                                     another binds it under no name (a measure component binds \
-                                     nothing): the shared node would carry the applied input's \
-                                     law and the ambient `{target}`'s law at once, so every \
-                                     sharing component must bind that ancestor under the same \
-                                     name (spec §06 `joint`)"
-                                ),
-                                "joint components disagree on a shared node's ancestry: one \
-                                 binds it under no name",
-                            ),
+                            // The non-binder's KIND is read off `other.binds`, not assumed:
+                            // a measure component binds nothing by being nullary, while a
+                            // kernel component that simply omits the ancestor from its own
+                            // boundary is the same clause and a different mistake. Naming
+                            // the wrong one sends the reader looking for a measure component
+                            // that is not there.
+                            None => {
+                                let culprit = match &other.binds {
+                                    Binds::Nothing => {
+                                        "a measure component, which is nullary and binds nothing"
+                                    }
+                                    Binds::Declared(_) => {
+                                        "another kernel component, whose own boundary omits it"
+                                    }
+                                };
+                                (
+                                    format!(
+                                        "`joint` components share a stochastic node whose \
+                                         boundary ancestor `{target}` one component binds as \
+                                         `{mine}` while {culprit} binds it under no name: the \
+                                         shared node would carry the applied input's law and \
+                                         the ambient `{target}`'s law at once, so every sharing \
+                                         component must bind that ancestor under the same name \
+                                         (spec §06 `joint`)"
+                                    ),
+                                    "joint components disagree on a shared node's ancestry: one \
+                                     binds it under no name",
+                                )
+                            }
                         };
                         inf.diags.push(crate::Diagnostic::error_at(id, message));
                         return Some(Type::Failed(summary.into()));

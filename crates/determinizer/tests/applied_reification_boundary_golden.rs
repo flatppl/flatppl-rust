@@ -194,6 +194,53 @@ lp = logdensityof(KR(z = 5.0), record(p = 1.0, q = -1.0))",
     );
 }
 
+/// An applied value that READS the boundary node is substituted exactly ONCE.
+///
+/// `K(z = z + 1.0)` applies `K` at the ambient `z` plus one, which is legal and which
+/// `a86437d` lowered correctly. Two substitution passes over the same entry is a wrong
+/// number rather than a no-op: the syntactic pass writes `z + 1.0` into the body, and a
+/// second pass cannot tell its own output from source, so it yields `z + 1.0 + 1.0` — at
+/// `z = 0` that scores `-1.4189385332046727` where the truth is `-0.9189385332046727`.
+///
+/// The fix is that a same-module boundary target is substituted by the FINISH alone
+/// (`kernel::Substitute::LocalOnly`), never by both. Dropping such an entry from the
+/// finish's map instead would restore the original boundary-drop bug for the
+/// derived-binding spelling, so the three shapes below are pinned together with the
+/// derived-binding test above rather than in place of it.
+#[test]
+fn a_self_referential_applied_value_is_substituted_exactly_once() {
+    for (applied, expected) in [
+        ("z + 1.0", "record(mu = z + 1.0, sigma = 1.0)"),
+        ("2.0 * z", "record(mu = 2.0 * z, sigma = 1.0)"),
+    ] {
+        let out = lower(&format!(
+            "\
+z  = elementof(reals)
+b1 ~ Normal(mu = z, sigma = 1.0)
+K  = kernelof(b1, z = z)
+lp = logdensityof(K(z = {applied}), 1.0)"
+        ));
+        assert!(
+            out.contains(expected),
+            "`K(z = {applied})` must substitute once, giving `{expected}`; got:\n{out}"
+        );
+    }
+    // The same hazard one indirection away: the applied value is a BINDING whose own
+    // RHS reads the boundary node.
+    let out = lower(
+        "\
+z  = elementof(reals)
+v  = z + 1.0
+b1 ~ Normal(mu = z, sigma = 1.0)
+K  = kernelof(b1, z = z)
+lp = logdensityof(K(z = v), 1.0)",
+    );
+    assert!(
+        out.contains("record(mu = v, sigma = 1.0)"),
+        "the applied binding must stand as written, not `v + 1.0`; got:\n{out}"
+    );
+}
+
 /// A query point that names the boundary node refuses.
 ///
 /// §04 scopes the substitution to the REIFIED graph, so a point written as the ambient

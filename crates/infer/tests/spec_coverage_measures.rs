@@ -1438,6 +1438,14 @@ fn a_measure_component_sharing_a_boundary_bound_ancestor_is_a_static_error() {
         rejects(&src, "binds it under no name"),
         "a measure component sharing a boundary-descended node is a static error"
     );
+    assert!(
+        rejects(
+            &src,
+            "a measure component, which is nullary and binds nothing"
+        ),
+        "and the diagnostic names the MEASURE component as the non-binder; got: {:?}",
+        diags_of(&src)
+    );
 }
 
 /// Reading E (`kernel-joint-w1-maths.md` §4): the same law is one explicit reification
@@ -1549,6 +1557,17 @@ fn a_kernel_component_binding_a_shared_ancestor_under_no_name_is_a_static_error(
     assert!(
         rejects(src, "binds it under no name"),
         "a sharing KERNEL that binds the ancestor under no name is the same error; got: {:?}",
+        diags_of(src)
+    );
+    assert!(
+        rejects(src, "another kernel component, whose own boundary omits it"),
+        "and the diagnostic must name a KERNEL non-binder, not a measure component that is \
+         not there; got: {:?}",
+        diags_of(src)
+    );
+    assert!(
+        !rejects(src, "a measure component"),
+        "there is no measure component in this program; got: {:?}",
         diags_of(src)
     );
 }
