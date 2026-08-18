@@ -15,7 +15,7 @@ use crate::distribution::{
 };
 use crate::error::{Error, Result};
 use crate::expr;
-use crate::model::{Distribution, Document, Function, HistFactory, Modifier};
+use crate::model::{Datum, Distribution, Document, Function, HistFactory, Modifier};
 use crate::presets::{emit_domain, emit_parameter_point};
 use flatppl_core::{Module, NodeId};
 use std::collections::{BTreeMap, BTreeSet};
@@ -557,20 +557,66 @@ fn emit_functions(m: &mut Module, doc: &Document) -> Result<()> {
 }
 
 /// The observable record a conditional distribution over `obs` is normalized
-/// against: every axis of the dataset that contains `obs`, paired with its
-/// `(lo, hi)` bounds from the document's `domains`, in dataset axis order. Axes
-/// without declared bounds are dropped (no finite interval to integrate over).
+/// against: every axis of the selected dataset, paired with its `(lo, hi)`
+/// bounds from the document's `domains`, in dataset axis order. Axes without
+/// declared bounds are dropped (no finite interval to integrate over).
+///
+/// A document may carry more than one dataset containing `obs` — e.g. a 2-D
+/// conditional model scored on its own dataset AND folded (via `product_dist`)
+/// into a wider dataset for a bigger joint model. Document order among such
+/// datasets is arbitrary, so the dataset is chosen, in priority order:
+///
+/// 1. The dataset an HS3 `likelihoods` entry pairs with `dist_name` — the
+///    document's own explicit pdf-to-data binding, when present.
+/// 2. Among datasets containing `obs`, the one whose axis set exactly equals
+///    `needed_axes` (`obs` plus every axis a conditioning parameter's function
+///    depends on) — the dataset actually shaped for this conditional density,
+///    not merely one that happens to include `obs` among extra axes meant for
+///    a different (wider) distribution. Ties (two candidate datasets with the
+///    same axis set) resolve to the first in document order via `.find` —
+///    silently, same as tier 3. `needed_axes` itself can under-count: the
+///    caller's `funcs_axis` records only the first observable identifier per
+///    conditioning function (see its doc comment), so a function depending on
+///    two distinct axes is seen as depending on one, and this tier can then
+///    match a same-size wrong dataset or miss the true match entirely.
+/// 3. The first dataset containing `obs`, in document order — the prior
+///    behavior, safe as a last resort because it is only reached when no
+///    dataset exactly matches, i.e. every fixture with a single dataset per
+///    distribution (the common case) is unaffected.
+///
 /// Returns an empty vec when no dataset carries `obs`.
 fn ordered_record_axes(
     doc: &Document,
+    dist_name: &str,
     obs: &str,
+    needed_axes: &BTreeSet<&str>,
     domains: &BTreeMap<&str, (f64, f64)>,
 ) -> Vec<(String, (f64, f64))> {
-    let Some(dataset) = doc
+    let candidates: Vec<&Datum> = doc
         .data
         .iter()
-        .find(|ds| ds.axes.iter().any(|a| a.name == obs))
-    else {
+        .filter(|ds| ds.axes.iter().any(|a| a.name == obs))
+        .collect();
+
+    let named = doc.likelihoods.iter().find_map(|lk| {
+        let idx = lk.distributions.iter().position(|d| d == dist_name)?;
+        let name = lk.data.get(idx)?.as_str()?;
+        candidates.iter().copied().find(|ds| ds.name == name)
+    });
+
+    let dataset = named
+        .or_else(|| {
+            candidates.iter().copied().find(|ds| {
+                ds.axes.len() == needed_axes.len()
+                    && ds
+                        .axes
+                        .iter()
+                        .all(|a| needed_axes.contains(a.name.as_str()))
+            })
+        })
+        .or_else(|| candidates.first().copied());
+
+    let Some(dataset) = dataset else {
         return Vec::new();
     };
     dataset
@@ -593,6 +639,10 @@ fn emit_distributions(m: &mut Module, doc: &Document) -> Result<()> {
     // `funcs_axis` maps each `generic_function` to the (first) observable axis its
     // expression depends on. A distribution whose parameter names such a function
     // of a DISTINCT (non-self) axis is conditional and lowers via emit_conditional.
+    // "(first)" is a real gap, not just a parenthetical: a conditioning function of
+    // TWO distinct axes is seen as depending on only one, so `ordered_record_axes`'s
+    // `needed_axes` (built from this map) under-counts and its exact-match tier can
+    // pick a same-size wrong dataset or miss the true match — see its doc comment.
     let axis_set: BTreeSet<&str> = observables.iter().map(String::as_str).collect();
     let funcs_axis: BTreeMap<&str, &str> = doc
         .functions
@@ -714,15 +764,18 @@ fn emit_distributions(m: &mut Module, doc: &Document) -> Result<()> {
                 Some(VariateName::Single(ref v)) => Some(v.clone()),
                 _ => None,
             };
-            let cond_axis = d
+            let cond_axes: BTreeSet<&str> = d
                 .extra
                 .values()
                 .filter_map(|v| v.as_str())
                 .filter_map(|s| funcs_axis.get(s).copied())
-                .find(|ax| Some(*ax) != own_obs.as_deref());
-            if let (Some(obs), Some(_)) = (own_obs.as_deref(), cond_axis) {
+                .filter(|ax| Some(*ax) != own_obs.as_deref())
+                .collect();
+            if let Some(obs) = own_obs.as_deref().filter(|_| !cond_axes.is_empty()) {
                 let ctx = crate::distribution::CondCtx { funcs: &funcs_axis };
-                let record = ordered_record_axes(doc, obs, &domains);
+                let mut needed_axes = cond_axes.clone();
+                needed_axes.insert(obs);
+                let record = ordered_record_axes(doc, &d.name, obs, &needed_axes, &domains);
                 // The joint normalization region needs the observable record with
                 // bounds. An empty record (no dataset provides `obs`, or no axis has a
                 // declared domain) would emit a degenerate `cartprod()` — fail loud

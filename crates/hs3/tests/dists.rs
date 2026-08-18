@@ -1126,6 +1126,55 @@ fn rf309_conditional_gaussian_lowers_to_joint_normalized_density() {
     flatppl_syntax::parse(&out).expect("re-parse");
 }
 
+// rf309's real fixture (rf309_ndimplot) bundles TWO datasets: `model3Data`
+// (axes z, y, x — for the 3-D product `model3 = model * gz`) and `modelData`
+// (axes y, x — for `model` scored alone). Both contain `x`, so a converter
+// that picks "the first dataset in `doc.data` containing `x`" (document
+// order) mis-selects `model3Data` and normalizes `model` over the wrong
+// 3-axis region. `model`'s own observable record needs exactly (its own
+// variate `x`, plus the axis its conditioning function `fy` depends on, `y`)
+// — which is precisely `modelData`'s axis set, not `model3Data`'s superset.
+#[test]
+fn rf309_dataset_selection_picks_the_matching_axis_set_not_document_order() {
+    let hs3 = r#"{
+      "distributions": [
+        {"name":"model3","type":"product_dist","factors":["model","gz"]},
+        {"name":"model","type":"gaussian_dist","x":"x","sigma":"sigma","mean":"fy"},
+        {"name":"gz","type":"gaussian_dist","x":"z","mean":0.0,"sigma":2.0}
+      ],
+      "functions": [{"name":"fy","type":"generic_function","expression":"a0-a1*sqrt(10*abs(y))"}],
+      "domains": [{"name":"default_domain","type":"product_domain","axes":[
+        {"name":"x","min":-5.0,"max":5.0},
+        {"name":"y","min":-5.0,"max":5.0},
+        {"name":"z","min":-5.0,"max":5.0},
+        {"name":"sigma","min":0.1,"max":5.0}]}],
+      "data": [
+        {"name":"model3Data","type":"unbinned","axes":[{"name":"z"},{"name":"y"},{"name":"x"}],"entries":[[0.0,0.0,0.0]]},
+        {"name":"modelData","type":"unbinned","axes":[{"name":"y"},{"name":"x"}],"entries":[[0.0,0.0]]}
+      ]
+    }"#;
+    let m = flatppl_hs3::read_hs3(hs3).expect("convert");
+    let out = flatppl_syntax::print_with(&m, flatppl_syntax::Syntax::Minimal);
+    eprintln!("=== rf309 dataset selection ===\n{out}\n=== end ===");
+    // The 2-axis region, in modelData's own (y, x) order — NOT model3Data's
+    // 3-axis (z, y, x) order, which document order alone would pick.
+    assert!(
+        out.contains(
+            "Lebesgue(support = cartprod(y = interval(-5.0, 5.0), x = interval(-5.0, 5.0)))"
+        ),
+        "expected the 2-axis (y, x) region from modelData, got:\n{out}"
+    );
+    let model_line = out
+        .lines()
+        .find(|l| l.starts_with("model = "))
+        .unwrap_or_else(|| panic!("no `model = ...` binding line, got:\n{out}"));
+    assert!(
+        !model_line.contains("z = interval") && !model_line.contains("_z_"),
+        "model's normalization region must not pick up model3Data's z axis:\n{model_line}"
+    );
+    flatppl_syntax::parse(&out).expect("re-parse");
+}
+
 // A conditional dist whose observable record has no declared bounds cannot be
 // joint-normalized; the converter must fail loud, not emit a degenerate
 // `cartprod()`. Here `y` is a co-observed data axis (so the conditional path
