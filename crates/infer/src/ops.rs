@@ -187,18 +187,28 @@ pub(crate) fn call_rule(
         "tuple" => Type::Tuple(args.iter().map(|(_, t, _)| t.clone()).collect()),
         // `record(t)` auto-splats a single table into a record of its column
         // vectors (spec §03); otherwise a record of its named fields.
+        // `record(r)` on an argument that is ALREADY a record is the
+        // same-kind shape §03/§04 auto-splatting never sanctions (that rule
+        // converts the OTHER aggregate kind, never a value into its own
+        // kind) — refused rather than silently returning an empty record
+        // (the old `_` arm's `named` was empty here, since the call is
+        // positional). See [`refuse_same_kind_constructor`].
         "record" => match (named.is_empty(), args) {
             (true, [(_, Type::Table { columns, nrows }, _)]) => record_from_table(columns, *nrows),
+            (true, [(_, Type::Record(_), _)]) => refuse_same_kind_constructor(inf, id, "record"),
             _ => Type::Record(named.iter().map(|(n, _, t, _)| (*n, t.clone())).collect()),
         },
         // `table(r)` auto-splats a single record-of-vectors into columns (spec
-        // §03); otherwise a table of its named columns.
+        // §03); otherwise a table of its named columns. `table(t)` on an
+        // argument already a table is the same same-kind shape as `record`
+        // above — refused rather than silently deferring.
         "table" => match (named.is_empty(), args) {
             (true, [(node, Type::Record(fields), _)]) => {
                 let cols: Vec<(Symbol, &Type, NodeId)> =
                     fields.iter().map(|(n, t)| (*n, t, *node)).collect();
                 build_table(inf, &cols)
             }
+            (true, [(_, Type::Table { .. }, _)]) => refuse_same_kind_constructor(inf, id, "table"),
             _ => table_type(inf, named),
         },
         "rowstack" => rowstack_type(arg_ty(args, 0)),
@@ -428,7 +438,30 @@ pub(crate) fn call_rule(
         //   `locscale(M, …)`   — affine pushforward x → scale·x + shift
         // These no longer defer: even before the engine evaluates their mass,
         // the value domain is known, so the type slot carries `(%measure …)`.
-        "restrict" | "superpose" | "locscale" => fresh_measure(arg_ty(args, 0)),
+        "restrict" | "locscale" => fresh_measure(arg_ty(args, 0)),
+        // `superpose`'s first argument must itself be a measure (spec §06: measure
+        // addition) — `fresh_measure` otherwise passes a non-measure argument
+        // straight through unchanged, so `superpose(record(m1 = n1, m2 = n2))`
+        // typed as a RECORD of measures, with no diagnostic (`fresh_measure`'s
+        // `Some(other) => other.clone()` arm). A measure position holding a
+        // record is unambiguous, unlike the open same-kind-constructor ruling
+        // above, so it is refused outright here rather than deferred to a card.
+        "superpose" => match arg_ty(args, 0) {
+            Some(t) => match non_measure_kind(t) {
+                Some(kind) => {
+                    inf.diags.push(crate::Diagnostic::error_at(
+                        id,
+                        format!(
+                            "`superpose`'s argument must be a measure (spec §06: \
+                             measure addition); got {kind} instead"
+                        ),
+                    ));
+                    Type::Failed("superpose argument is not a measure".into())
+                }
+                None => fresh_measure(Some(t)),
+            },
+            None => Type::Deferred,
+        },
         // `pushfwd(f, M)` (spec §06): a measure whose domain is the CODOMAIN of
         // `f`. `f` maps a value drawn from `M`, so binding its input to `M`'s
         // variate (domain + support value-set) and reading `f`'s body type gives
@@ -1085,6 +1118,25 @@ fn forbidden_array_element(t: &Type) -> Option<&'static str> {
     }
 }
 
+/// Name a CONCRETE non-measure type for the `superpose` argument-kind
+/// diagnostic. `Deferred`/`Any`/`Var`/`Failed` are not-yet-known, not
+/// known-wrong, so they pass (`None`) rather than being misreported.
+fn non_measure_kind(t: &Type) -> Option<&'static str> {
+    match t {
+        Type::Measure { .. } | Type::Deferred | Type::Any | Type::Var(_) | Type::Failed(_) => None,
+        Type::Scalar(_) => Some("a scalar"),
+        Type::Array { .. } | Type::TVector { .. } => Some("an array"),
+        Type::Record(_) => Some("a record"),
+        Type::Tuple(_) => Some("a tuple"),
+        Type::Table { .. } => Some("a table"),
+        Type::Kernel { .. } => Some("a kernel"),
+        Type::Function { .. } => Some("a function"),
+        Type::Likelihood { .. } => Some("a likelihood"),
+        Type::RngState => Some("an rng state"),
+        Type::Module => Some("a module"),
+    }
+}
+
 /// `vector(e1, …, en)` — a static-length array of the unified element type.
 fn vector_type(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> Type {
     // §03: array elements must be scalars, strings, or arrays — never records,
@@ -1188,6 +1240,34 @@ fn build_table(inf: &mut Inferencer<'_, '_>, cols: &[(Symbol, &Type, NodeId)]) -
         columns: columns.into(),
         nrows,
     }
+}
+
+/// `record(r)` on an argument already a record, or `table(t)` on an argument
+/// already a table: §03/§04 auto-splatting is defined for the OTHER aggregate
+/// kind (`record(t)` reads a table's columns, `table(r)` reads a record's
+/// fields) and no spec sentence gives a same-kind call any meaning.
+///
+/// Before this, `record(record(a = 1.0, b = 2.0))` silently returned an EMPTY
+/// `(%record )` (the constructor's `_` arm reads `named`, which is empty for a
+/// positional call) and `table(t)` on a table silently returned `%deferred`
+/// (`table_type` also reads `named`) — both a wrong type with no diagnostic.
+///
+/// flatppl-js treats this call as identity pass-through, an engine-leniency
+/// rider flagging that the spec ruling is open (`TODO-flatppl-js.md`); this
+/// does NOT invent that identity semantics, since the ruling could go either
+/// way. It refuses with a location diagnostic instead, pending the ruling
+/// (`TODO-flatppl-rust.md`).
+fn refuse_same_kind_constructor(inf: &mut Inferencer<'_, '_>, id: NodeId, name: &str) -> Type {
+    inf.diags.push(crate::Diagnostic::error_at(
+        id,
+        format!(
+            "`{name}`'s sole positional argument is already a {name}; spec §03/§04 \
+             auto-splatting converts the OTHER aggregate kind into a {name}, never a \
+             {name} into itself — this call has no defined meaning and is refused \
+             pending a spec ruling on same-kind construction"
+        ),
+    ));
+    Type::Failed(format!("`{name}` applied to an argument already of that kind").into())
 }
 
 /// `record(t)`: a table's columns as a record of column vectors (spec §03, the
@@ -2108,6 +2188,14 @@ fn joint_type(
     {
         return kernel_joint_type(inf, id, args, named);
     }
+    // A mixed spelling is a static error in the measure arms too — see
+    // [`refuse_mixed_joint_spelling`] and [`kernel_joint_type`]'s doc comment.
+    // Before this, reading only `named` whenever it was non-empty silently
+    // DROPPED every positional component: `joint(Normal(0.0, 1.0), b =
+    // Exponential(1.0))` typed over `record{b}` alone.
+    if !args.is_empty() && !named.is_empty() {
+        return refuse_mixed_joint_spelling(inf, id);
+    }
     // Keyword form `joint(a = M1, b = M2, …)`: a measure over a RECORD, each
     // component variate under its name (a record-valued component nests under
     // the name, not merged — spec §06).
@@ -2139,6 +2227,22 @@ fn joint_type(
         domain: Box::new(cat_or_diagnose(inf, id, "joint", &domains)),
         mass: Mass::Deferred,
     }
+}
+
+/// A `joint` mixing positional and keyword components is a static error in
+/// EVERY arm — measure, kernel, and (once inference reaches it) don't-know —
+/// per §06 spelling two forms and no third: `joint(M1, M2, ...)` and
+/// `joint(name1 = M1, name2 = M2, ...)`. `determinizer`'s `lower_joint`
+/// already refuses the shape in the same words, so typing it here was only
+/// ever a deferral of that refusal to a later pass.
+fn refuse_mixed_joint_spelling(inf: &mut Inferencer<'_, '_>, id: NodeId) -> Type {
+    inf.diags.push(crate::Diagnostic::error_at(
+        id,
+        "`joint` mixes positional and keyword components: a `joint` is either \
+         the positional cat-variate form or the keyword record-variate form, \
+         not both (spec §06)",
+    ));
+    Type::Failed("joint mixes positional and keyword components".into())
 }
 
 /// `joint(K1, K2, …)` where at least one component is a KERNEL — the fan-out
@@ -2199,11 +2303,11 @@ fn joint_type(
 /// apply the shape-class rule anyway: it needs each component's output variate,
 /// which `Type::Kernel` does not carry (Q2).
 ///
-/// Scoped to the kernel arm deliberately. The MEASURE arms drop a positional
-/// component the same way (`joint(Normal(0.0, 1.0), b = Exponential(1.0))` types
-/// over `record{b}` alone), which is pre-existing and carded; the decision above
-/// applies to it unchanged, but making it there changes typing on a path this wave
-/// does not own.
+/// The refusal itself lives in [`refuse_mixed_joint_spelling`], shared with
+/// `joint_type`'s measure arms — the MEASURE arms dropped a positional
+/// component the same way before that fix (`joint(Normal(0.0, 1.0), b =
+/// Exponential(1.0))` typed over `record{b}` alone); this decision applies to
+/// them unchanged, since nothing above turns on the component being a kernel.
 fn kernel_joint_type(
     inf: &mut Inferencer<'_, '_>,
     id: NodeId,
@@ -2211,13 +2315,7 @@ fn kernel_joint_type(
     named: &[NamedInfo],
 ) -> Type {
     if !args.is_empty() && !named.is_empty() {
-        inf.diags.push(crate::Diagnostic::error_at(
-            id,
-            "`joint` mixes positional and keyword components: a `joint` is either \
-             the positional cat-variate form or the keyword record-variate form, \
-             not both (spec §06)",
-        ));
-        return Type::Failed("joint mixes positional and keyword components".into());
+        return refuse_mixed_joint_spelling(inf, id);
     }
     let components: Vec<(NodeId, &Type)> = if named.is_empty() {
         args.iter().map(|(n, t, _)| (*n, t)).collect()

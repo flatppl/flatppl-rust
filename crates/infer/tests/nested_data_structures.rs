@@ -324,6 +324,43 @@ fn record_from_table_splats() {
     );
 }
 
+/// `record(r)` on an argument already a record has no meaning §03/§04
+/// auto-splatting sanctions — that rule converts a TABLE's columns into a
+/// record, never a record into itself. Before this it silently returned an
+/// EMPTY `(%record )` (the constructor's fallback arm reads `named`, which is
+/// empty for a positional call), with no diagnostic.
+#[test]
+fn record_of_record_is_rejected() {
+    let errs = errors("r = record(record(a = 1.0, b = 2.0))");
+    assert!(
+        errs.iter().any(|m| m.contains("already a record")),
+        "record(record(...)) must be a located static error, got: {errs:?}"
+    );
+    let out = ir("r = record(record(a = 1.0, b = 2.0))");
+    assert!(
+        !out.contains("(%record )"),
+        "must not silently type as an empty record; got:\n{out}"
+    );
+}
+
+/// `table(t)` on an argument already a table is the same same-kind shape as
+/// `record(record(...))` above. Before this it silently returned
+/// `%deferred` (`table_type` also reads `named`, empty for a positional
+/// call), with no diagnostic.
+#[test]
+fn table_of_table_is_rejected() {
+    let errs = errors("t0 = table(a = [1.0, 2.0], b = [3.0, 4.0])\nt1 = table(t0)");
+    assert!(
+        errs.iter().any(|m| m.contains("already a table")),
+        "table(table(...)) must be a located static error, got: {errs:?}"
+    );
+    let out = ir("t0 = table(a = [1.0, 2.0], b = [3.0, 4.0])\nt1 = table(t0)");
+    assert!(
+        !out.contains("(%bind t1 (%meta (%deferred"),
+        "must not silently type as %deferred; got:\n{out}"
+    );
+}
+
 // ── the single cat shape rule (cat / cartprod / joint share cat_shape) ───────
 
 /// The `cat` op routes through the shared `cat_shape` rule: records merge into
