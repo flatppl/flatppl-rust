@@ -624,6 +624,38 @@ impl Catalogue {
         params.iter().any(|p| matches!(p, ParamSig::Variadic(_)))
     }
 
+    /// Base builtins that never accept a sole positional record/table splat, even
+    /// when its field or column names match the declared parameter names —
+    /// owner ruling on design PR #78 (decisions-log 2026-08-18): "§07's keyword
+    /// form owns `checked`; no special operation splats a sole record/table
+    /// argument." §04 lists `checked` among the special operations ("Two
+    /// distinguished inputs"), and that listing wins the double-listing against
+    /// §07's own named-parameter row for it — the double-listing itself is
+    /// `wave-rustbatch` item 2's authority (`designpass2-report.md` PR 78).
+    ///
+    /// Unlike [`Self::base_has_unnamed_variadic`], `checked`'s row DOES declare
+    /// names (`value`, `condition`) — the general ordinary-callable splat would
+    /// otherwise bind `checked(record(value = 1.0, condition = true))` by name
+    /// and succeed, silently narrowing the result to the `value` field's type
+    /// where §07 says `checked` "returns it with identical type and phase" (the
+    /// whole record). So this is a distinct carve-out from the unnamed-variadic
+    /// one, keyed by name rather than structurally, because nothing about
+    /// `checked`'s signature distinguishes it from an ordinary two-input row
+    /// like `atan2` — the exemption is about which construct OWNS the splatted
+    /// spelling (§07's keyword form), not about what `checked`'s parameters look
+    /// like.
+    ///
+    /// `cat`, `get`, `get0` already refuse a sole-record splat too, but through
+    /// [`Self::base_has_unnamed_variadic`] — a different mechanism for a
+    /// different reason (their inputs are genuinely UNNAMED, so a splat has
+    /// nothing to bind to regardless of field names). That refusal's wording
+    /// ("has no name to bind to") stays accurate under this same ruling: it
+    /// never claimed a name match would help, so the now-universal
+    /// no-splat-onto-a-special-operation rule does not contradict it.
+    pub(crate) fn base_never_splats(&self, name: &str) -> bool {
+        name == "checked"
+    }
+
     /// The spec section that documents `name`'s parameter names, for a diagnostic
     /// that cites where the reader should check. §08 for a distribution
     /// constructor, §06 for a measure operation, §07 for everything else.

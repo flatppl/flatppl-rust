@@ -4101,6 +4101,58 @@ fn refuse_splat_onto_unnamed_variadic(
     Type::Failed(format!("{name} cannot splat an aggregate onto unnamed variadic inputs").into())
 }
 
+/// Reject a sole positional record/table splat onto a [`Catalogue::base_never_splats`]
+/// row — currently `checked` alone (design PR #78, owner ruling, decisions-log
+/// 2026-08-18). Unlike [`refuse_splat_onto_unnamed_variadic`], the row DOES declare
+/// parameter names, so the diagnostic cannot say "no name to bind to" (a name-matched
+/// splat, e.g. `checked(record(value = 1.0, condition = true))`, WOULD bind if let
+/// through) — the point instead is that §07's keyword spelling owns this construct.
+fn refuse_checked_splat(
+    inf: &mut Inferencer<'_, '_>,
+    id: NodeId,
+    name: &str,
+    cat: &crate::catalogue::Catalogue,
+    args: &[ArgInfo],
+) -> Type {
+    let section = cat.base_param_section(name);
+    let names = cat.base_param_names(name).unwrap_or(&[]);
+    let keyword_form = format!(
+        "{name}({})",
+        names
+            .iter()
+            .map(|n| format!("{n} = ..."))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let fields = splatted_field_names(inf, &args[0].1);
+    let listed = if fields.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " (its {} {})",
+            if fields.len() == 1 {
+                "name is"
+            } else {
+                "names are"
+            },
+            fields
+                .iter()
+                .map(|f| format!("`{f}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    inf.diags.push(crate::Diagnostic::error_at(
+        id,
+        format!(
+            "`{name}` has no special-operation splat (spec {section} owns the keyword form): \
+             a sole positional record or table{listed} does not bind, whether or not its \
+             names match. Use the keyword form instead, as in `{keyword_form}`"
+        ),
+    ));
+    Type::Failed(format!("{name} does not splat a sole record or table argument").into())
+}
+
 /// The field or column names of a CONFIRMED record/table type, in declaration order; empty
 /// for anything else.
 fn splatted_field_names(inf: &Inferencer<'_, '_>, ty: &Type) -> Vec<String> {
@@ -4131,6 +4183,15 @@ fn arity_check(
     // arity message would describe a count problem instead of the real one.
     if reading.splatting && cat.base_has_unnamed_variadic(name) {
         return Some(refuse_splat_onto_unnamed_variadic(inf, id, name, cat, args));
+    }
+    // `checked` (design PR #78, owner ruling, decisions-log 2026-08-18): §07's
+    // keyword form owns it, so a sole positional record/table never splats here
+    // even when its field names match `value`/`condition` — precedes the arity
+    // and name checks the same way the unnamed-variadic refusal above does, for
+    // the same reason: a fitting field count would otherwise let the splat
+    // through before this can object.
+    if reading.splatting && cat.base_never_splats(name) {
+        return Some(refuse_checked_splat(inf, id, name, cat, args));
     }
     if arity.admits(got) {
         // The count is right; the names still have to be the declared ones. `?`
