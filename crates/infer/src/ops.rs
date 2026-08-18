@@ -1576,36 +1576,35 @@ fn table_of_record_power(shape: Box<[Dim]>, elem: Type) -> Type {
 /// measure over `D`, and still a probability measure, so the two cases differ in
 /// what the determiniser must BUILD, not in what infer records.
 ///
-/// The result's `%mass` is `%normalized` unconditionally: a law is a probability
-/// measure by definition. This is the ONLY place that mass is decided — the
-/// mass-level rule table has no `"lawof"` arm, deliberately (see the pointer there).
+/// The result's `%mass` is the ARGUMENT's mass, not `%normalized`
+/// unconditionally: [`lawof_mass_gate`] only admits a measure whose mass is
+/// `%normalized` (a theorem) or `%deferred` (not yet inferred, §11) — never a
+/// settled non-normalized class. Propagating the admitted mass gives
+/// `%normalized` on the proven path and `%deferred` on the unproven one; this
+/// is the ONLY place that mass is decided — the mass-level rule table has no
+/// `"lawof"` arm, deliberately (see the pointer there).
 ///
-/// On the `%deferred`-argument path the gate deliberately admits (see
-/// [`lawof_mass_gate`]), that `%normalized` is an unproven ASSUMPTION, and
-/// permanently so. There is no later pass to revisit it: `trace::Inferencer::run`
-/// walks each binding once, memoized, and flushes into the module's side tables, so
-/// an argument's `%mass` is final at the moment the gate reads it. So the honest
-/// statement of what this pair does is: **normalization is a theorem where the gate
-/// proves it, and an assumption on the `%deferred` path.** The two stay consistent
-/// in the sense that everything admitted is typed as a law — not in the sense that
-/// everything typed as a law was checked.
-///
-/// The assumption is narrow in practice and resisted attempts to break it: no model
-/// in either corpus (51 across `flatppl-examples` and the in-repo fixtures) emits a
-/// measure with `%mass %deferred` at all, and mass crosses module boundaries
-/// intact. It is recorded rather than closed because closing it means either
-/// rejecting `%deferred` (which turns every mass-inference gap into a user-facing
-/// error, the thing [`lawof_mass_gate`] exists to avoid) or propagating `%deferred`
-/// into the result (which would claim `lawof` might not produce a law).
+/// Design-PR #73's option C (owner ruling, decisions-log 2026-08-18) is the
+/// no-laundering rider: an engine that admits a `%deferred`-mass argument is
+/// ASSUMING normalization, not proving it, and "must leave the result's `%mass`
+/// `%deferred` rather than record it as `%normalized`" — stamping `%normalized`
+/// here would record an assumption as knowledge, which §11's "strongest
+/// statically KNOWN class" slot definition forbids. Before this fix the result
+/// was always stamped `%normalized`, laundering the assumption; `lawof(joint())`
+/// (the zero-component `joint` — the one source of a genuinely `%deferred`-mass
+/// measure reachable from source, per `product_mass`'s empty-list arm) is the
+/// executed red case.
 ///
 /// A KERNEL argument lifts pointwise — §04: "On a non-nullary kernel, `lawof`
 /// lifts pointwise, as the uniform kernel extension does for measure-algebra
 /// operations" — so the result is a kernel over the same inputs whose output
-/// measure is a law, hence `%normalized`. Before this it wrapped, producing a
-/// measure whose DOMAIN was a kernel.
+/// measure is a law, carrying that output measure's mass onward the same way.
+/// Before this it wrapped, producing a measure whose DOMAIN was a kernel.
 ///
 /// Every other argument is a VALUE, and keeps the original behaviour: a measure
-/// over that value's type. That is the overwhelmingly common spelling
+/// over that value's type, `%normalized` unconditionally — there is no mass
+/// slot on a value to propagate, and the law of a value is a probability
+/// measure by definition. That is the overwhelmingly common spelling
 /// (`lawof(y)`, `lawof(record(y = y))`) and the corpus's only one.
 ///
 /// A `Likelihood` argument falls in that last bucket and so still types as a
@@ -1614,15 +1613,16 @@ fn table_of_record_power(shape: Box<[Dim]>, elem: Type) -> Type {
 /// open question is recorded in the wave report rather than guessed at.
 fn lawof_type(arg: Option<&Type>) -> Type {
     match arg {
-        // `lawof(m)` = `lawof(draw(m))`: a measure over m's domain.
-        Some(Type::Measure { domain, .. }) => Type::Measure {
+        // `lawof(m)` = `lawof(draw(m))`: a measure over m's domain, carrying
+        // m's own (gate-admitted) mass onward rather than reasserting it.
+        Some(Type::Measure { domain, mass }) => Type::Measure {
             domain: domain.clone(),
-            mass: Mass::Normalized,
+            mass: *mass,
         },
-        // Pointwise lift over a kernel's output measure.
-        Some(Type::Kernel { inputs, .. }) => Type::Kernel {
+        // Pointwise lift over a kernel's output measure — same propagation.
+        Some(Type::Kernel { inputs, mass }) => Type::Kernel {
             inputs: inputs.clone(),
-            mass: Mass::Normalized,
+            mass: *mass,
         },
         // A value: the law of that value.
         other => Type::Measure {
@@ -5455,13 +5455,17 @@ pub(crate) fn fill_mass(
     };
 
     let mass = match name.as_str() {
-        // NO `"lawof"` arm, on purpose: `lawof_type` sets the result mass itself
-        // (`Mass::Normalized`), so an arm here would be dead. It WAS dead and
-        // agreeing, which is worse than absent — a later change to `lawof_type`'s
-        // mass would leave this reading as though it still governed. Mutation-proven
-        // dead before removal: flipping it to `Mass::Null` broke zero tests, while
-        // the same flip on the `Dirac` arm below broke one, so the harness was
-        // sensitive and the silence meant unreachable.
+        // `"lawof"` passes `mass` through unchanged: `lawof_type` already set
+        // the result mass (the gate-admitted argument's own mass, per the
+        // no-laundering rider), so this must NOT fall to the `_` catchall
+        // below — that catchall assumes "every unlisted head is a §08
+        // distribution, hence `%normalized`", which was harmlessly true only
+        // while `lawof_type` always produced `%normalized` itself (the guard
+        // above short-circuits unless `ty`'s mass is `%deferred`). Now that
+        // `lawof_type` can legitimately produce `%deferred`, an absent arm
+        // would re-launder it to `%normalized` right where the no-laundering
+        // rider forbids it.
+        "lawof" => mass,
         // Every §08 distribution is a probability measure.
         // `Dirac(value)` is a point-mass probability measure (total mass 1).
         "Dirac" => Mass::Normalized,
@@ -5688,7 +5692,7 @@ fn joint_mass(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo], named: &[NamedInfo
 ///
 /// The trusted heads are exactly the rules that write a kernel's mass themselves:
 /// `kernelof`/`functionof` (`reification_type`, from the body), `lawof`
-/// (`lawof_type`, `%normalized` by §04's identity law), and `joint` itself
+/// (`lawof_type`, propagating the argument's own gate-admitted mass), and `joint` itself
 /// (`kernel_joint_type`, recursively through this same fold). Everything else —
 /// including a `disintegrate` tuple element and a cross-module kernel, whose
 /// masses ARE set correctly but not by a head this can see — reads `%unknown`.

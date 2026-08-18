@@ -536,9 +536,10 @@ fn lawof_is_idempotent_on_a_measure() {
     );
 }
 
-/// The identity holds for a measure the GATE admits by the `%deferred` route as
-/// well, so gate and typing stay consistent: everything admitted is typed as a law.
-/// A `normalize(...)`d restriction is the spelling §04 names as the escape.
+/// A `normalize(...)`d restriction is the spelling §04 names as the escape, and
+/// `normalize` always stamps `%normalized` (never `%deferred`), so this case
+/// stays a theorem, not the gate's `%deferred` admission route — see
+/// `lawof_of_a_deferred_mass_measure_stays_deferred` for that one.
 #[test]
 fn lawof_of_a_normalized_restriction_types_over_the_element_domain() {
     let out = ir("n = Normal(mu = 0.0, sigma = 1.0)\n\
@@ -569,6 +570,34 @@ fn lawof_of_a_kernel_lifts_pointwise() {
     assert!(
         !z.contains("(%domain (%kernel"),
         "must not wrap the kernel as a domain:\n{out}"
+    );
+}
+
+/// Design-PR #73 option C's no-laundering rider (owner ruling, decisions-log
+/// 2026-08-18): an engine admitting a `%deferred`-mass argument to `lawof` must
+/// leave the RESULT's mass `%deferred`, never stamp `%normalized` — stamping
+/// `%normalized` would record an unproven assumption as §11's "statically KNOWN"
+/// class. `joint()` (zero components) is the one measure reachable from source
+/// whose mass is genuinely `%deferred` (`product_mass`'s empty-list arm), so it
+/// is the red case: `lawof`'s gate admits it (deferred passes, per
+/// `unprovable_normalization`), and the result must carry `%deferred` onward.
+#[test]
+fn lawof_of_a_deferred_mass_measure_stays_deferred() {
+    let out = ir("e = joint()\nq = lawof(e)");
+    let e = out.lines().find(|l| l.contains("%bind e")).unwrap_or("");
+    let q = out.lines().find(|l| l.contains("%bind q")).unwrap_or("");
+    assert!(
+        e.contains("(%mass %deferred)"),
+        "joint() must itself be %deferred mass (the gate's admission case):\n{out}"
+    );
+    assert!(
+        q.contains("(%mass %deferred)"),
+        "lawof of a %deferred-mass measure must stay %deferred, not launder to \
+         %normalized:\n{out}"
+    );
+    assert!(
+        !q.contains("(%mass %normalized)"),
+        "must not stamp the unproven assumption as known:\n{out}"
     );
 }
 
