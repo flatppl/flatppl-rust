@@ -439,29 +439,37 @@ pub(crate) fn call_rule(
         // These no longer defer: even before the engine evaluates their mass,
         // the value domain is known, so the type slot carries `(%measure …)`.
         "restrict" | "locscale" => fresh_measure(arg_ty(args, 0)),
-        // `superpose`'s first argument must itself be a measure (spec §06: measure
+        // EVERY `superpose` argument must itself be a measure (spec §06: measure
         // addition) — `fresh_measure` otherwise passes a non-measure argument
         // straight through unchanged, so `superpose(record(m1 = n1, m2 = n2))`
         // typed as a RECORD of measures, with no diagnostic (`fresh_measure`'s
         // `Some(other) => other.clone()` arm). A measure position holding a
         // record is unambiguous, unlike the open same-kind-constructor ruling
         // above, so it is refused outright here rather than deferred to a card.
-        "superpose" => match arg_ty(args, 0) {
-            Some(t) => match non_measure_kind(t) {
-                Some(kind) => {
+        // Checks the WHOLE argument list, not just position 0: a bad argument
+        // anywhere else was silently DROPPED from the type entirely (worse than
+        // position 0's silent pass-through) — `superpose(n, record(…))` typed as
+        // `n`'s plain measure, `%unknown` mass, the record gone, no diagnostic.
+        "superpose" => {
+            let mut bad = false;
+            for (node, t, _) in args {
+                if let Some(kind) = non_measure_kind(t) {
                     inf.diags.push(crate::Diagnostic::error_at(
-                        id,
+                        *node,
                         format!(
                             "`superpose`'s argument must be a measure (spec §06: \
                              measure addition); got {kind} instead"
                         ),
                     ));
-                    Type::Failed("superpose argument is not a measure".into())
+                    bad = true;
                 }
-                None => fresh_measure(Some(t)),
-            },
-            None => Type::Deferred,
-        },
+            }
+            if bad {
+                Type::Failed("superpose argument is not a measure".into())
+            } else {
+                fresh_measure(arg_ty(args, 0))
+            }
+        }
         // `pushfwd(f, M)` (spec §06): a measure whose domain is the CODOMAIN of
         // `f`. `f` maps a value drawn from `M`, so binding its input to `M`'s
         // variate (domain + support value-set) and reading `f`'s body type gives

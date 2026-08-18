@@ -1863,3 +1863,25 @@ fn superpose_of_a_record_is_rejected() {
         "must not silently type `s` as a record; got:\n{out}"
     );
 }
+
+/// The same check applies to EVERY `superpose` argument, not just the first.
+/// Before this, a bad argument in a later position was silently DROPPED from
+/// the type entirely — worse than position 0's silent pass-through:
+/// `superpose(n, record(m1 = n1, m2 = n2))` typed as `n`'s own plain measure
+/// (`%unknown` mass), the record gone, with no diagnostic.
+#[test]
+fn superpose_of_a_measure_and_a_record_is_rejected() {
+    let src = "n1 = Normal(0.0, 1.0)\n\
+               n2 = Exponential(1.0)\n\
+               s = superpose(n1, record(m1 = n1, m2 = n2))";
+    assert!(
+        rejects(src, "must be a measure"),
+        "a bad argument in position 2 must be a located static error, got: {:?}",
+        diags_of(src)
+    );
+    let out = ir(src);
+    assert!(
+        !out.contains("(%bind s (%meta ((%measure (%domain (%scalar real)) (%mass %unknown))"),
+        "must not silently drop the bad argument and type `s` as n1's plain measure; got:\n{out}"
+    );
+}
