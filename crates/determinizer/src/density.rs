@@ -1050,6 +1050,361 @@ fn substitute_applied_boundary(
     Ok(out)
 }
 
+/// `joint(K1, K2, …)(a)` — the APPLIED fan-out kernel. `None` when `node` is not an
+/// application of a `joint`.
+///
+/// §06 *Uniform kernel extension* defines the construct pointwise ("On a kernel, the
+/// operation applies to the output measure at each input point"), and the `joint` entry
+/// fans the input out, so `joint(K1, K2)(a) = joint(K1(a), K2(a))`. That is exactly the
+/// rewrite performed here: each kernel component is replaced by the measure it denotes
+/// at the fed input, and the rewritten `joint` goes through [`lower_joint`] — the same
+/// machinery a written measure `joint` reaches. Nothing about ancestry, the record law,
+/// the singular refusal, or the trace-disjoint product is re-derived.
+///
+/// A kernel component becomes `lawof(<its reified body>)`, which is §04 *Kernels and
+/// `kernelof`* read literally: "`kernelof(x, kwargs...)` is equivalent to
+/// `functionof(lawof(x), kwargs...)`". Handing `lawof(x)` rather than `x`'s LAW is what
+/// keeps §06 RETAIN and the singular refusal both working, because
+/// [`joint_component_coordinate`] maps `lawof(x)` to the reified value `x` itself and
+/// node identity survives: two components off distinct draws over a shared latent give
+/// the correlated record law (`kernel-joint-q4-maths.md` §3.1's commuting identity),
+/// while `joint(K, K)` gives one draw referenced twice, which
+/// `match_independent_record`'s rank check refuses as §06's singular joint. Reducing to
+/// the law instead would synthesize a FRESH draw per component and score `joint(K, K)`
+/// as a product — a density for a shape §06 says has none.
+///
+/// **Only two component shapes are lowered**, and the restriction is the W1 clause's
+/// conservative side:
+///
+/// - a reification whose boundary this pass binds, and
+/// - a measure reaching no `draw` at all — Q3's nullary case ("Measure components are
+///   permitted and are the nullary case: they ignore the input").
+///
+/// Any other component refuses. The shape this protects against is
+/// `kernel-joint-w1-maths.md`'s: a measure component sharing a stochastic node whose
+/// ancestor a kernel component binds has NO law (§3 — the single shared node would carry
+/// two laws at once), yet the record path would happily score it as the chain-rule joint,
+/// which is reading A's number for a question the source text does not ask. Inference
+/// rejects that shape first, so this is the backstop for a caller that ignores
+/// diagnostics — and a backstop must not need the ancestry oracle to be safe. The cost is
+/// disclosed: the two LEGAL shapes with a draw-reaching measure component
+/// (`kernel-joint-w1-maths.md` §5's closed shared node and its no-shared-node case)
+/// refuse here rather than lower.
+fn lower_applied_kernel_joint(
+    m: &mut Module,
+    node: NodeId,
+    v: NodeId,
+    origin: VariateOrigin,
+) -> Option<Result<NodeId, RefuseError>> {
+    let Node::Call(c) = m.node(node) else {
+        return None;
+    };
+    let CallHead::User(callee) = c.head else {
+        return None;
+    };
+    let supplied_args: Vec<NodeId> = c.args.to_vec();
+    let supplied_kwargs: Vec<(Symbol, NodeId)> = c
+        .named
+        .iter()
+        .filter(|na| na.kind == NamedKind::Kwarg)
+        .map(|na| (na.name, na.value))
+        .collect();
+    let (joint_node, _) = resolve_ref_one(m, callee);
+    let joint = expect_builtin_call(m, joint_node, "joint")?;
+    let positional: Vec<NodeId> = joint.args.to_vec();
+    let named: Vec<NamedArg> = joint.named.to_vec();
+    Some(lower_applied_kernel_joint_inner(
+        m,
+        node,
+        joint_node,
+        &positional,
+        &named,
+        &supplied_args,
+        &supplied_kwargs,
+        v,
+        origin,
+    ))
+}
+
+/// The fallible body of [`lower_applied_kernel_joint`], split out so the caller's
+/// `Option` and this function's `Result` do not have to nest inside one expression.
+#[allow(clippy::too_many_arguments)]
+fn lower_applied_kernel_joint_inner(
+    m: &mut Module,
+    node: NodeId,
+    joint_node: NodeId,
+    positional: &[NodeId],
+    named: &[NamedArg],
+    supplied_args: &[NodeId],
+    supplied_kwargs: &[(Symbol, NodeId)],
+    v: NodeId,
+    origin: VariateOrigin,
+) -> Result<NodeId, RefuseError> {
+    if !positional.is_empty() && !named.is_empty() {
+        return Err(refuse(
+            joint_node,
+            m,
+            "joint mixes positional and keyword components; a joint is either the \
+             positional cat-variate form or the keyword record-variate form, not both",
+        ));
+    }
+    let components: Vec<NodeId> = if named.is_empty() {
+        positional.to_vec()
+    } else {
+        named.iter().map(|na| na.value).collect()
+    };
+    if components.is_empty() {
+        return Err(refuse(joint_node, m, "joint has no components"));
+    }
+
+    // The union signature, first-occurrence ordered over the components, matching
+    // `infer`'s `kernel_joint_type`. A positional application binds against this order;
+    // §06's own union-by-name sentence is what makes the order the components' rather
+    // than any one component's.
+    let mut union: Vec<Symbol> = Vec::new();
+    let mut resolved: Vec<Option<crate::kernel::Kernel>> = Vec::with_capacity(components.len());
+    for &component in &components {
+        let k = crate::kernel::resolve_reified(m, component);
+        if let Some(k) = &k {
+            for (name, _) in &k.inputs {
+                if !union.contains(name) {
+                    union.push(*name);
+                }
+            }
+        }
+        resolved.push(k);
+    }
+    let supplied = bind_fan_out_inputs(m, node, &union, supplied_args, supplied_kwargs)?;
+
+    let mut bound: Vec<(Ref, NodeId)> = Vec::new();
+    let mut rewritten: Vec<NodeId> = Vec::with_capacity(components.len());
+    for (&component, kernel) in components.iter().zip(resolved.iter()) {
+        match kernel {
+            Some(k) => {
+                let mut body = k.body;
+                for (name, target) in &k.inputs {
+                    let value = supplied
+                        .iter()
+                        .find(|(n, _)| n == name)
+                        .map(|(_, value)| *value)
+                        .ok_or_else(|| {
+                            let name = m.resolve(*name).to_string();
+                            refuse(
+                                node,
+                                m,
+                                &format!(
+                                    "the applied fan-out kernel binds no value to its input \
+                                     `{name}`"
+                                ),
+                            )
+                        })?;
+                    body = crate::kernel::substitute_ref(m, body, target.name, value);
+                    bound.push((*target, value));
+                }
+                let coordinate = build_call(m, "lawof", &[body]);
+                annotate_synthesized_lawof(m, coordinate, body);
+                rewritten.push(coordinate);
+            }
+            None => {
+                if component_reaches_draw(m, component) {
+                    return Err(refuse(
+                        component,
+                        m,
+                        "a `joint` component of an applied fan-out that is not a reification \
+                         and yet reaches a stochastic node is not lowerable: if it shares that \
+                         node with a kernel component whose boundary binds one of the node's \
+                         ancestors, the shape has no law at all (§06 `joint`: a sharing \
+                         component that binds such an ancestor \"under no name\" is a static \
+                         error), and this pass does not carry the ancestry oracle that would \
+                         tell the legal case apart — refuse rather than score a rewritten \
+                         question",
+                    ));
+                }
+                rewritten.push(component);
+            }
+        }
+    }
+
+    let rebuilt = rebuild_joint(m, joint_node, named, &rewritten);
+    let density = lower_measure_density_at(m, rebuilt, v, origin)?;
+    substitute_applied_boundary(m, node, density, &bound)
+}
+
+/// Does this `joint` component's subtree reach a `draw` node, following same-module
+/// binding refs?
+///
+/// Deliberately NOT [`measure_reaches_draw`]: that one answers "is this measure
+/// expression parameterized by a latent", and it excludes the draw a `lawof` REIFIES,
+/// since that draw is the measure's own variate rather than an ancestor. Here the question
+/// is whether the component carries a stochastic node into the composed trace at all —
+/// §06's ancestry rule reads "a stochastic node shared between component traces (through a
+/// reified component — `lawof`, `kernelof` — or a stochastic constructor parameter)", so
+/// the reified draw counts and `lawof(u)` must answer yes. Reading it the other way is what
+/// let the W1 shape through the backstop.
+///
+/// The walk mirrors `infer`'s `component_draw_nodes`, including its depth cap: an
+/// unfollowable path yields fewer draws, so the answer is a proof of REACHING only. That
+/// direction is the safe one here, since reaching is what refuses.
+fn component_reaches_draw(m: &Module, component: NodeId) -> bool {
+    fn walk(
+        m: &Module,
+        id: NodeId,
+        depth: u32,
+        seen: &mut std::collections::HashSet<NodeId>,
+    ) -> bool {
+        if depth > 64 || !seen.insert(id) {
+            return false;
+        }
+        if let Node::Ref(Ref {
+            ns: RefNs::SelfMod,
+            name,
+        }) = m.node(id)
+        {
+            return match m.binding_by_name(*name) {
+                Some(bid) => walk(m, m.binding(bid).rhs, depth + 1, seen),
+                None => false,
+            };
+        }
+        if builtin_name(m, id) == Some("draw") {
+            return true;
+        }
+        let mut children = Vec::new();
+        m.for_each_child(id, |c| children.push(c));
+        children.into_iter().any(|c| walk(m, c, depth + 1, seen))
+    }
+    walk(m, component, 0, &mut std::collections::HashSet::new())
+}
+
+/// Give a `lawof(x)` node synthesized mid-pass the type `infer` would give it, so the
+/// guards downstream can read it.
+///
+/// [`lower_joint`]'s positional path fails CLOSED on a component whose measure domain is
+/// not known — it must, since `get0(v, i)` assigns each component one scalar `cat` slot
+/// and an unknown arity could silently drop slots. A node this pass allocates has no
+/// inferred type until the driver's next loop iteration, which is after the lowering, so
+/// without this the positional fan-out refuses on its own synthesized node rather than on
+/// anything about the model.
+///
+/// The type is `infer`'s own rule for a VALUE argument, not a new one: `lawof_type`
+/// (`infer/src/ops.rs`) gives `Type::Measure { domain: <the value's type>, mass:
+/// Normalized }`, the `%normalized` coming from §04's `lawof` identity law. A body whose
+/// own type did not resolve is left unannotated, so the fail-closed guard still fires
+/// there instead of being handed a guess.
+fn annotate_synthesized_lawof(m: &mut Module, lawof_node: NodeId, body: NodeId) {
+    let (resolved, _) = resolve_ref_one(m, body);
+    let Some(domain) = m.type_of(body).or_else(|| m.type_of(resolved)).cloned() else {
+        return;
+    };
+    if matches!(domain, Type::Deferred | Type::Any) {
+        return;
+    }
+    m.set_type(
+        lawof_node,
+        Type::Measure {
+            domain: Box::new(domain),
+            mass: Mass::Normalized,
+        },
+    );
+}
+
+/// Bind an applied fan-out's argument list to the union signature, by keyword, by §04
+/// record/table splat, or by position. The three forms and their refusals mirror
+/// [`crate::kernel::reduce_kernel_application`]'s, because the calling convention is
+/// §04's and does not depend on whether the callee is a reification or a measure-algebra
+/// op that produced a kernel.
+fn bind_fan_out_inputs(
+    m: &mut Module,
+    node: NodeId,
+    union: &[Symbol],
+    args: &[NodeId],
+    kwargs: &[(Symbol, NodeId)],
+) -> Result<Vec<(Symbol, NodeId)>, RefuseError> {
+    let bad_arity = |m: &Module| {
+        refuse(
+            node,
+            m,
+            "the applied fan-out kernel's arguments do not bind its inputs exactly (§04 \
+             calling conventions): every input supplied once, and no argument without a \
+             matching input",
+        )
+    };
+    if !kwargs.is_empty() {
+        if !args.is_empty() || kwargs.len() != union.len() {
+            return Err(bad_arity(m));
+        }
+        let mut out = Vec::with_capacity(union.len());
+        for name in union {
+            let value = kwargs
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, value)| *value)
+                .ok_or_else(|| bad_arity(m))?;
+            out.push((*name, value));
+        }
+        return Ok(out);
+    }
+    if args.len() == 1 && expect_builtin_call(m, resolve_ref_one(m, args[0]).0, "record").is_some()
+    {
+        let fields: Vec<(Symbol, NodeId)> = {
+            let rec = expect_builtin_call(m, resolve_ref_one(m, args[0]).0, "record")
+                .ok_or_else(|| bad_arity(m))?;
+            rec.named.iter().map(|na| (na.name, na.value)).collect()
+        };
+        let mut out = Vec::with_capacity(union.len());
+        for name in union {
+            let value = fields
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, value)| *value)
+                .ok_or_else(|| bad_arity(m))?;
+            out.push((*name, value));
+        }
+        return Ok(out);
+    }
+    if args.len() != union.len() {
+        return Err(bad_arity(m));
+    }
+    Ok(union.iter().copied().zip(args.iter().copied()).collect())
+}
+
+/// Re-spell a `joint` with `replacements` in place of its components, keeping the
+/// original's form: keyword field names for the record-variate spelling, argument order
+/// for the positional `cat` one.
+fn rebuild_joint(
+    m: &mut Module,
+    joint_node: NodeId,
+    named: &[NamedArg],
+    replacements: &[NodeId],
+) -> NodeId {
+    let head = match m.node(joint_node) {
+        Node::Call(c) => c.head,
+        _ => CallHead::Builtin(m.intern("joint")),
+    };
+    if named.is_empty() {
+        return m.alloc(Node::Call(Call {
+            head,
+            args: replacements.to_vec().into(),
+            named: Vec::<NamedArg>::new().into(),
+            inputs: None,
+        }));
+    }
+    let new_named: Vec<NamedArg> = named
+        .iter()
+        .zip(replacements.iter())
+        .map(|(na, &value)| NamedArg {
+            kind: na.kind,
+            name: na.name,
+            value,
+        })
+        .collect();
+    m.alloc(Node::Call(Call {
+        head,
+        args: Vec::<NodeId>::new().into(),
+        named: new_named.into(),
+        inputs: None,
+    }))
+}
+
 /// Refuse a query point that names one of the reification's boundary nodes.
 ///
 /// [`substitute_applied_boundary`] rewrites the whole emitted density, and the query
@@ -1224,6 +1579,14 @@ fn lower_measure_density_at(
             None => lower_measure_density_at(m, app.body, v, origin)?,
         };
         return substitute_applied_boundary(m, measure_node, density, &app.bound);
+    }
+
+    // An applied fan-out kernel `joint(K1, K2, …)(a)` — not a reification, so the
+    // reduction above declines it. §06 defines it pointwise, which is the rewrite
+    // [`lower_applied_kernel_joint`] performs before handing the result to the measure
+    // `joint` path.
+    if let Some(lowered) = lower_applied_kernel_joint(m, measure_node, v, origin) {
+        return lowered;
     }
 
     // Dispatch on the measure op.
