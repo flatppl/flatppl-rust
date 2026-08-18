@@ -1415,6 +1415,168 @@ fn trace_disjoint_kernel_joint_may_disagree_on_an_input_name() {
     );
 }
 
+/// The W1 shape: a MEASURE component sharing a stochastic node whose ancestor the
+/// kernel component binds as a boundary input.
+///
+/// `kernel-joint-w1-maths.md` §3 shows the shape denotes nothing: inside `K1(a)` the
+/// shared `u` carries `Normal(a, 1)` while inside `M` it carries `Normal(v, 1)` for the
+/// ambient `v`, and one node cannot carry two laws. #85's clause covers it under "does
+/// not bind it at all — in particular a measure component, which binds nothing".
+///
+/// The number the shape used to score, −2.0878770664093453, is reading A's — a
+/// different question (the `joint` of `K1` and the KERNELIZATION of `M`), which the
+/// next test spells explicitly and legally.
+#[test]
+fn a_measure_component_sharing_a_boundary_bound_ancestor_is_a_static_error() {
+    let src = format!(
+        "{SHARED_LATENT_PROBE}\
+         K1 = kernelof(a1, z = z)\n\
+         M  = lawof(u)\n\
+         KJ = joint(p = K1, q = M)"
+    );
+    assert!(
+        rejects(&src, "binds it under no name"),
+        "a measure component sharing a boundary-descended node is a static error"
+    );
+    assert!(
+        rejects(
+            &src,
+            "a measure component binds it under no name (measure components are nullary"
+        ),
+        "and the diagnostic names the MEASURE component as the non-binder, with the reason \
+         AFTER the verb rather than interrupting it; got: {:?}",
+        diags_of(&src)
+    );
+}
+
+/// Reading E (`kernel-joint-w1-maths.md` §4): the same law is one explicit reification
+/// away, and THAT is legal — both components bind the shared node's ancestor `z` under
+/// the same input name.
+#[test]
+fn both_components_binding_the_shared_ancestor_is_legal() {
+    let src = format!(
+        "{SHARED_LATENT_PROBE}\
+         K1 = kernelof(a1, z = z)\n\
+         K2 = kernelof(u, z = z)\n\
+         KJ = joint(p = K1, q = K2)"
+    );
+    assert!(
+        !rejects(&src, "shared stochastic node"),
+        "both components bind the shared ancestor under one name; got: {:?}",
+        diags_of(&src)
+    );
+    assert!(
+        bind_line(&ir(&src), "KJ").contains("(%kernel (%inputs z)"),
+        "and the fan-out takes the one shared input"
+    );
+}
+
+/// `kernel-joint-w1-maths.md` §5, first bullet — the CLOSED shared node. No ancestor of
+/// the shared `u` is anyone's boundary, so `M` is a closed measure, Q3's "they ignore
+/// the input" holds verbatim, and the shape is legal.
+#[test]
+fn a_measure_component_sharing_a_closed_node_is_legal() {
+    let src = "z  = elementof(reals)\n\
+               u  ~ Normal(mu = 0.0, sigma = 1.0)\n\
+               a1 ~ Normal(mu = u + z, sigma = 1.0)\n\
+               K1 = kernelof(a1, z = z)\n\
+               M  = lawof(u)\n\
+               KJ = joint(p = K1, q = M)";
+    assert!(
+        !rejects(src, "shared stochastic node"),
+        "a closed shared node has no boundary-bound ancestor; got: {:?}",
+        diags_of(src)
+    );
+    assert!(
+        bind_line(&ir(src), "KJ").contains("(%kernel (%inputs z)"),
+        "and the measure component contributes no input (Q3)"
+    );
+}
+
+/// `kernel-joint-w1-maths.md` §5, third bullet — no shared stochastic node at all. `M`
+/// is parameterized by the ambient `z` and `K1`'s reified graph holds a decoupled input,
+/// so no retained node forces two views onto one parent slot.
+#[test]
+fn a_measure_component_sharing_no_stochastic_node_is_legal() {
+    let src = "z  = elementof(reals)\n\
+               u  ~ Normal(mu = z, sigma = 1.0)\n\
+               a1 ~ Normal(mu = u, sigma = 1.0)\n\
+               w  ~ Normal(mu = z, sigma = 2.0)\n\
+               K1 = kernelof(a1, z = z)\n\
+               M  = lawof(w)\n\
+               KJ = joint(p = K1, q = M)";
+    assert!(
+        !rejects(src, "shared stochastic node"),
+        "nothing is shared, so the clause does not apply; got: {:?}",
+        diags_of(src)
+    );
+}
+
+/// The component's OWN boundary severs its trace (§04: a boundary node "can be thought
+/// of as being substituted with a new node … in the reified graph"), so `K2`, which
+/// binds `u` itself, shares nothing with `K1` and must not be read as a non-binder of
+/// `u`'s ancestor `z`.
+///
+/// Without the cut in `component_draw_nodes` this well-formed program is rejected: the
+/// syntactic walk reaches `u`'s draw through `K2`'s body, `z` is an ancestor of it, and
+/// `K2` declares `u` but not `z`.
+#[test]
+fn a_component_binding_the_shared_node_itself_shares_nothing() {
+    let src = format!(
+        "{SHARED_LATENT_PROBE}\
+         K1 = kernelof(a1, z = z)\n\
+         K2 = kernelof(a2, u = u)\n\
+         KJ = joint(p = K1, q = K2)"
+    );
+    assert!(
+        !rejects(&src, "shared stochastic node"),
+        "a boundary-severed node is not shared; got: {:?}",
+        diags_of(&src)
+    );
+    assert!(
+        bind_line(&ir(&src), "KJ").contains("(%kernel (%inputs z u)"),
+        "and the inputs union by name"
+    );
+}
+
+/// The kernel-side analogue of W1 (`kernel-joint-w1-maths.md` §6, "sharing variant"):
+/// the non-binder is a KERNEL, not a measure. One clause covers both, so the error
+/// wording is the same "under no name" case.
+///
+/// `K2` reifies against `w`, which is not an ancestor of the shared `u`; `u`'s ancestor
+/// `z` is bound by `K1` alone.
+#[test]
+fn a_kernel_component_binding_a_shared_ancestor_under_no_name_is_a_static_error() {
+    let src = "z  = elementof(reals)\n\
+               w  = elementof(reals)\n\
+               u  ~ Normal(mu = z, sigma = 1.0)\n\
+               a1 ~ Normal(mu = u, sigma = 1.0)\n\
+               a2 ~ Normal(mu = u + w, sigma = 1.0)\n\
+               K1 = kernelof(a1, z = z)\n\
+               K2 = kernelof(a2, c = w)\n\
+               KJ = joint(p = K1, q = K2)";
+    assert!(
+        rejects(src, "binds it under no name"),
+        "a sharing KERNEL that binds the ancestor under no name is the same error; got: {:?}",
+        diags_of(src)
+    );
+    assert!(
+        rejects(
+            src,
+            "another kernel component binds it under no name (its own boundary omits that \
+             ancestor)"
+        ),
+        "and the diagnostic must name a KERNEL non-binder, not a measure component that is \
+         not there; got: {:?}",
+        diags_of(src)
+    );
+    assert!(
+        !rejects(src, "a measure component"),
+        "there is no measure component in this program; got: {:?}",
+        diags_of(src)
+    );
+}
+
 /// An all-measure `joint` must be untouched by the kernel arm: still a measure,
 /// still the record/`cat` domain, still the same mass fold.
 #[test]

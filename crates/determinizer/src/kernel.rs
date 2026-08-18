@@ -354,6 +354,26 @@ pub(crate) fn substitute_ref(m: &mut Module, root: NodeId, name: Symbol, new_id:
     }))
 }
 
+/// [`substitute_ref`] for one boundary entry, or a no-op when `mode` leaves that
+/// entry to the caller. See [`Substitute`].
+pub(crate) fn substitute_admitted(
+    m: &mut Module,
+    body: NodeId,
+    target: Ref,
+    value: NodeId,
+    mode: Substitute,
+) -> NodeId {
+    let admitted = match mode {
+        Substitute::All => true,
+        Substitute::LocalOnly => target.ns == RefNs::Local,
+    };
+    if admitted {
+        substitute_ref(m, body, target.name, value)
+    } else {
+        body
+    }
+}
+
 /// True iff `id` is a reification (`functionof`/`kernelof`) whose OWN
 /// boundary declares `name` as one of its inputs' body-target refs — i.e.
 /// `id`'s body re-binds `name` for itself. Checked via the node's `Inputs`:
@@ -431,6 +451,71 @@ fn shadows_name(m: &Module, id: NodeId, name: Symbol) -> bool {
 /// one level of ref indirection and, if present, one level of `draw(...)`
 /// unwrapping to reach the actual measure/law BEFORE substituting.
 pub(crate) fn reduce_kernel_application(m: &mut Module, node: NodeId) -> Option<NodeId> {
+    reduce_kernel_application_bound(m, node, Substitute::All).map(|app| app.body)
+}
+
+/// A β-reduced reified-callable application: the reduced body plus the boundary
+/// binding that produced it, as `(body-target-ref, applied value)` pairs in
+/// boundary order.
+///
+/// The pairs matter because [`substitute_ref`] is SYNTACTIC: it rewrites only
+/// literal descendants of `body`, so a boundary reference reached through a
+/// module binding (`mu2 = 2.0 * z` with `z` the boundary, or a `record` field
+/// that is a `(%ref self b1)`) survives the reduction. A caller that goes on to
+/// LOWER the reduced body must finish the substitution over what it emits —
+/// `density::substitute_applied_boundary` does — or it scores a function of the
+/// very parameter the application pinned.
+pub(crate) struct AppliedReification {
+    pub body: NodeId,
+    pub bound: Vec<(Ref, NodeId)>,
+}
+
+/// Which boundary entries [`reduce_kernel_application_bound`] substitutes into the
+/// body itself.
+///
+/// The distinction exists because substituting the SAME entry twice is a wrong
+/// number, not a no-op: for `K(z = z + 1.0)` the syntactic pass writes `z + 1.0`
+/// into the body, and a second pass over the result cannot tell its own output from
+/// source, so it produces `z + 1.0 + 1.0`. A caller that finishes the substitution
+/// over the emitted density must therefore NOT have it done here as well.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Substitute {
+    /// Every entry. For a caller that performs no further substitution of its own —
+    /// `canon::inline`, the sampler, and the change-of-variables sites, none of which
+    /// emit a density to finish over.
+    All,
+    /// `%local` placeholder targets ONLY, leaving every same-module target to the
+    /// caller's own finish.
+    ///
+    /// The split is exactly the split of what a later pass CAN reach. A same-module
+    /// target is a module binding, so `density::substitute_applied_boundary` reaches
+    /// every occurrence of it — the literal ones in the body included — and reaches
+    /// them through bindings the syntactic walk stops at. A `%local` placeholder has
+    /// no module binding to reach it through, and §04 *Placeholders and holes*
+    /// requires it to appear inside the reified expression, so it must be bound here
+    /// or not at all.
+    ///
+    /// The two sets are disjoint, so nothing is substituted twice. They also exhaust
+    /// what [`substitute_ref`] can rewrite — it matches `RefNs::SelfMod | RefNs::Local`
+    /// and nothing else — so nothing this mode declines is left unbound. That is a
+    /// statement about those two namespaces only: a `RefNs::Module(alias)` boundary
+    /// target would be substituted by NEITHER pass, and it is unreachable here for a
+    /// different reason, namely that [`resolve_reified`] admits only a local
+    /// `kernelof`/`functionof` node, whose boundary entries name nodes in its own
+    /// module. A future cross-module boundary would need its own handling, not this
+    /// split widened.
+    LocalOnly,
+}
+
+/// [`reduce_kernel_application`] keeping the boundary binding it applied, and
+/// substituting only what `mode` admits. See [`AppliedReification`] for why a
+/// lowering caller needs the binding, and [`Substitute`] for why it must not also
+/// have the substitution done here.
+pub(crate) fn reduce_kernel_application_bound(
+    m: &mut Module,
+    node: NodeId,
+    mode: Substitute,
+) -> Option<AppliedReification> {
     let Node::Call(c) = m.node(node) else {
         return None;
     };
@@ -461,35 +546,39 @@ pub(crate) fn reduce_kernel_application(m: &mut Module, node: NodeId) -> Option<
     // supports it too. Refuse a keyword/positional mix, or any bijection failure
     // (arity mismatch, or a boundary input with no matching keyword) rather than
     // leave a boundary input free — a silent wrong density.
+    let mut bound: Vec<(Ref, NodeId)> = Vec::with_capacity(kernel.inputs.len());
     if !kwargs.is_empty() {
         if !args.is_empty() || kwargs.len() != kernel.inputs.len() {
             return None;
         }
         for (name, target) in &kernel.inputs {
             let value = kwargs.iter().find(|(n, _)| n == name).map(|(_, v)| *v)?;
-            body = substitute_ref(m, body, target.name, value);
+            body = substitute_admitted(m, body, *target, value, mode);
+            bound.push((*target, value));
         }
-        return Some(body);
+        return Some(AppliedReification { body, bound });
     }
 
     if args.len() == 1 && is_splattable(m, args[0]) {
         for (name, target) in kernel.inputs {
             let value = record_field(m, args[0], name)?;
-            body = substitute_ref(m, body, target.name, value);
+            body = substitute_admitted(m, body, target, value, mode);
+            bound.push((target, value));
         }
     } else if !kernel.auto && args.len() == kernel.inputs.len() {
         // POSITIONAL binding — `%specinputs`-only. An `%autoinputs` kernel is
         // keyword-only (§04), so a positional application of one falls through to
         // the refuse below rather than binding by an uninferable position.
         for (arg, (_, target)) in args.iter().zip(kernel.inputs.iter()) {
-            body = substitute_ref(m, body, target.name, *arg);
+            body = substitute_admitted(m, body, *target, *arg, mode);
+            bound.push((*target, *arg));
         }
     } else {
         // Arity mismatch, or a positional application of a keyword-only
         // `%autoinputs` kernel — refuse rather than mis-lower.
         return None;
     }
-    Some(body)
+    Some(AppliedReification { body, bound })
 }
 
 /// Does `rec` (after one level of ref-resolution) denote a `record(...)` or `table(...)`
@@ -511,7 +600,7 @@ pub(crate) fn reduce_kernel_application(m: &mut Module, node: NodeId) -> Option<
 /// covers built-ins — so the exemption cannot apply however many inputs it declares. A
 /// bare-builtin callee never reaches this function: `canon` rewrites it to a direct
 /// builtin call, and the two `pushfwd` sites screen it off beforehand.
-fn is_splattable(m: &Module, rec: NodeId) -> bool {
+pub(crate) fn is_splattable(m: &Module, rec: NodeId) -> bool {
     matches!(splat_head(m, rec), Some("record") | Some("table")) || table_columns(m, rec).is_some()
 }
 
@@ -569,7 +658,7 @@ fn splat_head(m: &Module, rec: NodeId) -> Option<&str> {
 /// through the literal's `%field` list. Synthesizing it makes the two forms agree, which is
 /// what §04 requires: "whether its field or column names match the callable's argument names
 /// decides only whether the call is valid, never whether the splat occurs."
-fn record_field(m: &mut Module, rec: NodeId, name: Symbol) -> Option<NodeId> {
+pub(crate) fn record_field(m: &mut Module, rec: NodeId, name: Symbol) -> Option<NodeId> {
     if matches!(splat_head(m, rec), Some("record") | Some("table")) {
         let (resolved, _) = resolve_ref_one(m, rec);
         let Node::Call(c) = m.node(resolved) else {

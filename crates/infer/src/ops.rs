@@ -2250,18 +2250,39 @@ fn kernel_joint_type(
     }
 }
 
-/// The Q1 consistency clause (§06 `joint` entry, flatppl-design#85):
-/// "Components that share a stochastic node must bind every boundary ancestor of
-/// that node under the same input name; a `joint` whose sharing components
-/// disagree on that name is a static error."
+/// What a `joint` component binds as boundary inputs, for the ancestry clause.
+enum Binds {
+    /// A LOCAL reification whose boundary this pass read, as `(input name, target
+    /// name)` pairs.
+    Declared(Vec<(Symbol, Symbol)>),
+    /// Proven to bind nothing. §06 "Uniform kernel extension" identifies a measure
+    /// with a nullary kernel, so a `Type::Measure` component declares no boundary
+    /// input at all — the case `kernel-joint-w1-maths.md` calls out by name ("in
+    /// particular a measure component, which binds nothing").
+    ///
+    /// A `Type::Kernel` component whose boundary this pass cannot read is NOT this:
+    /// it is unknown, and it stays excluded from the check entirely.
+    Nothing,
+}
+
+/// The Q1/W1 ancestry clause (§06 `joint` entry, flatppl-design#85):
+/// "Components that share a stochastic node must agree on that node's ancestry:
+/// every ancestor of the shared node that any component binds as a boundary input
+/// must be bound by every sharing component, under the same input name. A `joint`
+/// in which a sharing component binds such an ancestor under a different name, or
+/// does not bind it at all — in particular a measure component, which binds
+/// nothing — is a static error."
 ///
 /// Why it is an error rather than a convention: under union-by-name the retained
-/// node has one parent value, so two components substituting its boundary
-/// ancestor with DIFFERENT inputs leave that parent undefined at any application
-/// where the two inputs differ (`kernel-joint-q4-maths.md` §4). The all-or-none
-/// boundary rule (§04 "Specifying reification boundaries") already excludes the
-/// half-substituted and same-name-different-node variants, so this is the only
-/// conflict shape.
+/// node has one parent value. Two components substituting its boundary ancestor
+/// with DIFFERENT inputs leave that parent undefined at any application where the
+/// two inputs differ (`kernel-joint-q4-maths.md` §4), and a component that binds
+/// the ancestor under NO name reads the ambient module parameter instead, so the
+/// same single node would need two laws at once (`kernel-joint-w1-maths.md` §3).
+/// Both halves are one incoherence in one proof shape, which is why they are one
+/// clause and not two rules. The all-or-none boundary rule (§04 "Specifying
+/// reification boundaries") already excludes the half-substituted and
+/// same-name-different-node variants, so these are the only conflict shapes.
 ///
 /// **Detection is SOUND, not complete**, and each narrowing costs only
 /// diagnostics, never a wrong type:
@@ -2272,15 +2293,25 @@ fn kernel_joint_type(
 ///   a component whose trace this walk cannot follow (a cross-module ref, a
 ///   lambda kernel, a depth-capped path) contributes no draws and so triggers
 ///   nothing.
-/// - Only a component that resolves to a LOCAL reification is checked, since the
-///   clause is about boundary input names and only a reification declares them
-///   ([`local_reification`] + [`input_entries`]).
+/// - A component's own boundary SEVERS the walk ([`component_draw_nodes`]'s
+///   `boundary` argument): §04 substitutes a boundary node with a fresh input in the
+///   reified graph, so a draw at or beyond the boundary is not in that component's
+///   trace and cannot be shared through it. Without the cut, `K2 = kernelof(a2, u =
+///   u)` would look like a sharing non-binder of `u`'s own ancestor and be rejected,
+///   though it shares nothing (`kernel-joint-w1-maths.md` §5, third bullet).
+/// - Only a `Type::Measure` component counts as a proven non-binder ([`Binds`]). A
+///   kernel component whose boundary this pass cannot read is unknown, not a
+///   non-binder, so it is skipped rather than rejected.
 /// - The conflict is reported only for a boundary target the shared node's own
-///   subtree actually reaches ([`subtree_reaches_name`]) — "boundary ancestor of
-///   that node", not "any boundary the two components happen to share". A
-///   disagreeing boundary that is NOT an ancestor of the shared node is legal
-///   (the retained node's parent is still single-valued), so widening the test
+///   subtree actually reaches ([`subtree_reaches_name`]) — "every ancestor of the
+///   shared node that any component binds", not "any boundary the two components
+///   happen to share". A boundary that is NOT an ancestor of the shared node is
+///   legal (the retained node's parent is still single-valued), so widening the test
 ///   would reject a well-formed program.
+///
+/// The two directions are checked symmetrically, because "any component binds" makes
+/// the obligation mutual: the binder may be either side, and only one of them
+/// declares the ancestor in the W1 shape.
 ///
 /// This is not the cross-component ancestry oracle `product_mass` deliberately
 /// avoids: it only ever ADDS a diagnostic on a proven identity, and never
@@ -2290,60 +2321,118 @@ fn diagnose_shared_node_input_names(
     id: NodeId,
     components: &[(NodeId, &Type)],
 ) -> Option<Type> {
-    /// One inspectable kernel component: the `draw` nodes its trace reaches, and
-    /// its boundary as `(input name, target name)` pairs.
+    /// One inspectable component: the `draw` nodes its trace reaches, and what it
+    /// binds as boundary inputs.
     struct Traced {
         draws: Vec<NodeId>,
-        boundary: Vec<(Symbol, Symbol)>,
+        binds: Binds,
     }
     let mut traced: Vec<Traced> = Vec::new();
     for (node, t) in components {
-        if !matches!(t, Type::Kernel { .. }) {
-            continue;
-        }
-        let Some((reif, _)) = local_reification(inf, *node) else {
-            continue;
+        let binds = match t {
+            Type::Measure { .. } => Binds::Nothing,
+            Type::Kernel { .. } => {
+                let Some((reif, _)) = local_reification(inf, *node) else {
+                    continue;
+                };
+                let Some(entries) = input_entries(inf, reif) else {
+                    continue;
+                };
+                Binds::Declared(entries.iter().map(|(name, r)| (*name, r.name)).collect())
+            }
+            _ => continue,
         };
-        let Some(entries) = input_entries(inf, reif) else {
-            continue;
+        let boundary: Vec<Symbol> = match &binds {
+            Binds::Declared(entries) => entries.iter().map(|(_, target)| *target).collect(),
+            Binds::Nothing => Vec::new(),
         };
         traced.push(Traced {
-            draws: component_draw_nodes(inf, *node),
-            boundary: entries.iter().map(|(name, r)| (*name, r.name)).collect(),
+            draws: component_draw_nodes(inf, *node, &boundary),
+            binds,
         });
     }
     for i in 0..traced.len() {
         for j in (i + 1)..traced.len() {
-            let (left, right) = (&traced[i], &traced[j]);
-            for shared in left.draws.iter().filter(|d| right.draws.contains(d)) {
-                for (left_input, target) in &left.boundary {
-                    let Some((right_input, _)) = right.boundary.iter().find(|(_, t)| t == target)
-                    else {
+            for shared in traced[i]
+                .draws
+                .iter()
+                .filter(|d| traced[j].draws.contains(d))
+            {
+                for (binder, other) in [(&traced[i], &traced[j]), (&traced[j], &traced[i])] {
+                    let Binds::Declared(entries) = &binder.binds else {
                         continue;
                     };
-                    if right_input == left_input {
-                        continue;
+                    for (input, target) in entries {
+                        if !subtree_reaches_name(inf, *shared, *target) {
+                            continue;
+                        }
+                        let counterpart = match &other.binds {
+                            Binds::Declared(theirs) => {
+                                theirs.iter().find(|(_, t)| t == target).map(|(n, _)| *n)
+                            }
+                            Binds::Nothing => None,
+                        };
+                        if counterpart == Some(*input) {
+                            continue;
+                        }
+                        let target = inf.module.resolve(*target).to_string();
+                        let mine = inf.module.resolve(*input).to_string();
+                        let (message, summary) = match counterpart {
+                            Some(theirs) => {
+                                let theirs = inf.module.resolve(theirs).to_string();
+                                (
+                                    format!(
+                                        "`joint` components share a stochastic node whose \
+                                         boundary ancestor `{target}` is bound under different \
+                                         input names (`{mine}` and `{theirs}`): the shared \
+                                         node's parent has no well-defined value where the two \
+                                         inputs differ, so every sharing component must bind it \
+                                         under the same name (spec §06 `joint`)"
+                                    ),
+                                    "joint kernel components disagree on a shared node's input \
+                                     name",
+                                )
+                            }
+                            // The non-binder's KIND is read off `other.binds`, not assumed:
+                            // a measure component binds nothing by being nullary, while a
+                            // kernel component that simply omits the ancestor from its own
+                            // boundary is the same clause and a different mistake. Naming
+                            // the wrong one sends the reader looking for a measure component
+                            // that is not there.
+                            None => {
+                                // The non-binder's KIND names the component, and the reason
+                                // follows the verb rather than interrupting it — reading
+                                // "while a measure component, which binds nothing, binds it
+                                // under no name" doubles the verb and reads as a typo.
+                                let (who, why) = match &other.binds {
+                                    Binds::Nothing => (
+                                        "a measure component",
+                                        "measure components are nullary and declare no boundary \
+                                         inputs",
+                                    ),
+                                    Binds::Declared(_) => (
+                                        "another kernel component",
+                                        "its own boundary omits that ancestor",
+                                    ),
+                                };
+                                (
+                                    format!(
+                                        "`joint` components share a stochastic node whose \
+                                         boundary ancestor `{target}` one component binds as \
+                                         `{mine}` while {who} binds it under no name ({why}): \
+                                         the shared node would carry the applied input's law \
+                                         and the ambient `{target}`'s law at once, so every \
+                                         sharing component must bind that ancestor under the \
+                                         same name (spec §06 `joint`)"
+                                    ),
+                                    "joint components disagree on a shared node's ancestry: one \
+                                     binds it under no name",
+                                )
+                            }
+                        };
+                        inf.diags.push(crate::Diagnostic::error_at(id, message));
+                        return Some(Type::Failed(summary.into()));
                     }
-                    if !subtree_reaches_name(inf, *shared, *target) {
-                        continue;
-                    }
-                    let target = inf.module.resolve(*target).to_string();
-                    let left = inf.module.resolve(*left_input).to_string();
-                    let right = inf.module.resolve(*right_input).to_string();
-                    inf.diags.push(crate::Diagnostic::error_at(
-                        id,
-                        format!(
-                            "`joint` components share a stochastic node whose boundary \
-                             ancestor `{target}` is bound under different input names \
-                             (`{left}` and `{right}`): the shared node's parent has no \
-                             well-defined value where the two inputs differ, so every \
-                             sharing component must bind it under the same name (spec §06 \
-                             `joint`)"
-                        ),
-                    ));
-                    return Some(Type::Failed(
-                        "joint kernel components disagree on a shared node's input name".into(),
-                    ));
                 }
             }
         }
@@ -2363,10 +2452,22 @@ fn diagnose_shared_node_input_names(
 /// `(%ref self u)` reach the same `NodeId`, while two independent draws never do.
 /// The result is deliberately a proof of sharing only — a path this walk cannot
 /// follow yields fewer draws, never a spurious one.
-fn component_draw_nodes(inf: &Inferencer<'_, '_>, node: NodeId) -> Vec<NodeId> {
+///
+/// `boundary` names the component's OWN boundary targets, and the walk stops at each
+/// of them without recording anything beyond. §04 "Specifying reification
+/// boundaries" is why: "A specified boundary node `a` can be thought of as being
+/// substituted with a new node, generated via `elementof(valueset(a))`, in the
+/// reified graph", so a draw at or past the boundary is not in this component's trace
+/// and cannot be shared through it.
+fn component_draw_nodes(
+    inf: &Inferencer<'_, '_>,
+    node: NodeId,
+    boundary: &[Symbol],
+) -> Vec<NodeId> {
     fn walk(
         inf: &Inferencer<'_, '_>,
         node: NodeId,
+        boundary: &[Symbol],
         depth: u32,
         seen: &mut std::collections::HashSet<NodeId>,
         out: &mut Vec<NodeId>,
@@ -2375,10 +2476,10 @@ fn component_draw_nodes(inf: &Inferencer<'_, '_>, node: NodeId) -> Vec<NodeId> {
             return;
         }
         if let Node::Ref(r) = inf.module.node(node) {
-            if r.ns == RefNs::SelfMod {
+            if r.ns == RefNs::SelfMod && !boundary.contains(&r.name) {
                 if let Some(b) = inf.module.binding_by_name(r.name) {
                     let rhs = inf.module.binding(b).rhs;
-                    walk(inf, rhs, depth + 1, seen, out);
+                    walk(inf, rhs, boundary, depth + 1, seen, out);
                 }
             }
             return;
@@ -2394,13 +2495,14 @@ fn component_draw_nodes(inf: &Inferencer<'_, '_>, node: NodeId) -> Vec<NodeId> {
         inf.module
             .for_each_child(node, |child| children.push(child));
         for child in children {
-            walk(inf, child, depth + 1, seen, out);
+            walk(inf, child, boundary, depth + 1, seen, out);
         }
     }
     let mut out = Vec::new();
     walk(
         inf,
         node,
+        boundary,
         0,
         &mut std::collections::HashSet::new(),
         &mut out,
