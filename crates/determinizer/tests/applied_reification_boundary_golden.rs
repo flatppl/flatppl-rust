@@ -241,6 +241,196 @@ lp = logdensityof(K(z = v), 1.0)",
     );
 }
 
+/// A CROSS-NAMED applied value lowers, keeping the ambient sibling.
+///
+/// `K(z = w, w = 0.5)` binds input `z` to the ambient `w` and input `w` to `0.5`, so over
+/// the body `mu = z + w` the reified graph reads `mu = w + 0.5` with the ambient `w`
+/// surviving as a determinized input. §04 is what makes that the answer rather than
+/// `0.5 + 0.5`: an applied value is evaluated in the AMBIENT scope and is not part of the
+/// reified graph, so the `w` input's pin does not reach the `w` that input `z`'s value
+/// names.
+///
+/// Oracle at ambient `w = 0`: `log N(1; 0.5, 1) = -1.0439385332046727`. Both substitution
+/// passes are simultaneous, so the density has always been right to emit; what changed is
+/// the residual guard, which flagged the legitimately-present `w` as a possibly-missed
+/// occurrence and refused. It now excludes any target that ANY applied value reads.
+#[test]
+fn a_cross_named_applied_value_keeps_the_ambient_sibling() {
+    let out = lower(
+        "\
+z  = elementof(reals)
+w  = elementof(reals)
+b1 ~ Normal(mu = z + w, sigma = 1.0)
+K  = kernelof(b1, z = z, w = w)
+lp = logdensityof(K(z = w, w = 0.5), 1.0)",
+    );
+    assert!(
+        out.contains("record(mu = w + 0.5, sigma = 1.0)"),
+        "input `z` binds the ambient `w` and input `w` binds 0.5; got:\n{out}"
+    );
+    assert!(
+        out.contains("w = elementof(reals)"),
+        "the ambient `w` must survive as a determinized input; got:\n{out}"
+    );
+}
+
+/// The cyclic swap, where no substitution ORDER is correct.
+///
+/// `K(z = w, w = z)` over `mu = 2.0 * z + w` is `mu = 2.0 * w + z`, so BOTH ambient
+/// parameters survive. Oracle at ambient `w = 1`, `z = 0.5`:
+/// `log N(1; 2.5, 1) = -2.0439385332046727`, against `log N(1; 1.5, 1) =
+/// -1.0439385332046727` for the sequential `2.0 * z + z`.
+#[test]
+fn a_cyclic_swap_of_applied_values_exchanges_both_exactly_once() {
+    let out = lower(
+        "\
+z  = elementof(reals)
+w  = elementof(reals)
+b1 ~ Normal(mu = 2.0 * z + w, sigma = 1.0)
+K  = kernelof(b1, z = z, w = w)
+lp = logdensityof(K(z = w, w = z), 1.0)",
+    );
+    assert!(
+        out.contains("record(mu = 2.0 * w + z, sigma = 1.0)"),
+        "a swap exchanges the two parameters exactly once; got:\n{out}"
+    );
+    assert!(
+        out.contains("z = elementof(reals)") && out.contains("w = elementof(reals)"),
+        "both ambient parameters survive a swap; got:\n{out}"
+    );
+}
+
+/// A nested reification that RE-DECLARES a pinned boundary name refuses, and refusing it
+/// is what keeps the cross-naming relaxation honest.
+///
+/// `substitute_refs_by_name` runs on `driver::map_tree`, which has no shadow guard, so it
+/// descends into `h` and overwrites `h`'s OWN input reference with the outer pin —
+/// `h(2.0)`'s argument is discarded and `h`'s body folds to a constant. §04 forbids that
+/// directly: "The resulting function `h` now has arguments named `a` and `d`, but these
+/// are local to the function and decoupled from the original nodes `a` and `d`."
+///
+/// The error is UNBOUNDED, and it is the cross-naming exclusion that exposed it: a
+/// cross-read target is excluded from the residual check by design, so the residual check
+/// can no longer be this hazard's backstop. `subtree_capturing_reification_input` refuses
+/// it first instead. See `a_nested_reification_redeclaring_a_pinned_name_refuses` for the
+/// wrong number this prevents, and the alpha-renamed and lambda controls that must lower.
+///
+/// The second shape pins the exclusion as per-TARGET rather than a blanket disarming: it
+/// holds a cross-named pair (`z = w`) AND a third input `v` whose name `h` re-declares.
+/// The refusal must still fire and must name `v`, not the legitimately-present `w`.
+#[test]
+fn a_nested_reification_declaring_a_pinned_boundary_name_refuses() {
+    let redeclared_only = "\
+z  = elementof(reals)
+h  = functionof(z + 1.0, z = z)
+b1 ~ Normal(mu = h(2.0), sigma = 1.0)
+K  = kernelof(b1, z = z)
+lp = logdensityof(K(z = 0.5), 1.0)";
+    let err =
+        determinize(&parse_infer(redeclared_only)).expect_err("`h` re-declares the pinned `z`");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("OWN boundary inputs") && msg.contains("`z`"),
+        "the refusal must name the nested re-declaration of `z`; got: {msg}"
+    );
+
+    let redeclared_beside_a_cross_name = "\
+z  = elementof(reals)
+w  = elementof(reals)
+v  = elementof(reals)
+h  = functionof(v + 1.0, v = v)
+b1 ~ Normal(mu = z + w + h(2.0), sigma = 1.0)
+K  = kernelof(b1, z = z, w = w, v = v)
+lp = logdensityof(K(z = w, w = 0.5, v = 3.0), 1.0)";
+    let err = determinize(&parse_infer(redeclared_beside_a_cross_name))
+        .expect_err("`v` is re-declared even though `w` is legitimately present");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("`v`") && !msg.contains("`w`"),
+        "a cross-named sibling must not excuse a re-declared name; got: {msg}"
+    );
+}
+
+/// The wrong number the nested-re-declaration refusal prevents, pinned from both sides:
+/// the hazardous spelling must refuse, and the two spellings that CANNOT capture must
+/// lower to the truth.
+///
+/// `h = functionof(w * 10.0, w = w)` inside the body of a `K(z = w, w = 0.5)` application
+/// scored `record(mu = w + 0.5 + 5.0, …)` — `h`'s own input overwritten with the outer pin
+/// `0.5`, its argument `2.0` thrown away. At ambient `w = 0`, `y = 1.0` that is
+/// `log N(1; 5.5, 1) = -11.043938533204672` where the truth is
+/// `log N(1; 20.5, 1) = -191.04393853320468`. The error is unbounded in `h`'s body, not a
+/// perturbation.
+///
+/// The two controls prove the defect was pure NAME capture rather than anything about the
+/// nesting, because head produces the truth for both:
+///
+/// - alpha-renaming the nested input (`functionof(t * 10.0, t = t)`) — §04 makes the two
+///   the same function, so the two models must lower identically;
+/// - the lambda spelling (`w -> w * 10.0`), where `lower_lambda` mints a `%local`
+///   placeholder that cannot collide with a same-module name.
+///
+/// The `%autoinputs` spelling is the fourth row. It keeps its boundary in the module's
+/// side-table rather than inline, so reading `Inputs::Spec` alone missed it: the finish
+/// clobbered the auto-input and the reduction then could not bind it, refusing at a later
+/// site with a false internal message ("user call declares 0 parameters, got 1" — `g`
+/// declares one parameter, `w`). It must reach the same honest refusal as the `%specinputs`
+/// spelling.
+#[test]
+fn a_nested_reification_redeclaring_a_pinned_name_refuses() {
+    let hazard = |nested: &str, applied: &str| {
+        format!(
+            "\
+z  = elementof(reals)
+w  = elementof(reals)
+t  = elementof(reals)
+{nested}
+b1 ~ Normal(mu = z + w + {applied}, sigma = 1.0)
+K  = kernelof(b1, z = z, w = w)
+lp = logdensityof(K(z = w, w = 0.5), 1.0)"
+        )
+    };
+
+    for (nested, applied, what) in [
+        ("h  = functionof(w * 10.0, w = w)", "h(2.0)", "%specinputs"),
+        ("g  = functionof(w * 10.0)", "g(w = 2.0)", "%autoinputs"),
+    ] {
+        let src = hazard(nested, applied);
+        let err = determinize(&parse_infer(&src)).err().unwrap_or_else(|| {
+            panic!("{what}: must refuse, not score at the clobbered `mu = w + 0.5 + 5.0`")
+        });
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("OWN boundary inputs") && msg.contains("`w`"),
+            "{what}: the refusal must name the nested re-declaration of `w`; got: {msg}"
+        );
+        assert!(
+            !msg.contains("declares 0 parameters"),
+            "{what}: the refusal must not be the downstream arity message; got: {msg}"
+        );
+    }
+
+    for (nested, applied, what) in [
+        (
+            "h  = functionof(t * 10.0, t = t)",
+            "h(2.0)",
+            "alpha-renamed",
+        ),
+        ("h  = w -> w * 10.0", "h(2.0)", "lambda"),
+    ] {
+        let mut m = parse_infer(&hazard(nested, applied));
+        let lp = m.intern("lp");
+        let out = determinize_with_roots(&m, &ModuleBundle::new(), Some(&[lp]))
+            .unwrap_or_else(|e| panic!("{what}: must lower; got {e:?}"));
+        let printed = flatppl_syntax::print(&out);
+        assert!(
+            printed.contains("record(mu = w + 0.5 + 20.0, sigma = 1.0)"),
+            "{what}: a nested input that cannot collide keeps its own argument, so `h(2.0)` \
+             is 20.0; got:\n{printed}"
+        );
+    }
+}
+
 /// A query point that names the boundary node refuses.
 ///
 /// §04 scopes the substitution to the REIFIED graph, so a point written as the ambient
@@ -259,5 +449,36 @@ lp = logdensityof(K(z = 0.5), z)";
     assert!(
         msg.contains("boundary input"),
         "the refusal must name the boundary collision; got: {msg}"
+    );
+}
+
+/// The same hazard through the PRE-EXISTING self-reference exclusion, which was a silent
+/// wrong number on `origin/main` independently of the cross-naming relaxation.
+///
+/// `K(z = z + 1.0)` is self-referential, so `z` was already excluded from the residual
+/// check before this wave — and `h = functionof(z * 10.0, z = z)` in the body was clobbered
+/// exactly the same way. At `9d6f526` this emitted `record(mu = z + 1.0 + 30.0, …)`, which
+/// is `h`'s body evaluated after the finish wrote `z + 1.0` into it and the inline then
+/// bound `z := 2.0`: `(2.0 + 1.0) * 10.0`. At ambient `z = 0`, `y = 1.0` that scores
+/// `log N(1; 31, 1) = -450.91893853320465` where the truth is
+/// `log N(1; 21, 1) = -200.91893853320468`.
+///
+/// The nested-re-declaration refusal keys on the SUBSTITUTION MAP rather than on which
+/// targets the residual check excluded, so it covers this route too and closes a
+/// pre-existing hole rather than only containing the new one.
+#[test]
+fn a_self_referential_application_with_a_redeclared_nested_name_refuses() {
+    let src = "\
+z  = elementof(reals)
+h  = functionof(z * 10.0, z = z)
+b1 ~ Normal(mu = z + h(2.0), sigma = 1.0)
+K  = kernelof(b1, z = z)
+lp = logdensityof(K(z = z + 1.0), 1.0)";
+    let err = determinize(&parse_infer(src))
+        .expect_err("must refuse, not score at the clobbered `mu = z + 1.0 + 30.0`");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("OWN boundary inputs") && msg.contains("`z`"),
+        "the refusal must name the nested re-declaration of `z`; got: {msg}"
     );
 }

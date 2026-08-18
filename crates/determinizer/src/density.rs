@@ -699,15 +699,17 @@ fn lower_likelihood_query(
     let theta_map = theta_field_map(m, theta)?;
     let density = lower_measure_density_at_point(m, k, obs)?;
     // Refuse-don't-mislower: a θ param captured as a `functionof` / `kernelof`
-    // reification *input* (a `(name, %ref self <name>)` boundary entry) cannot be
-    // reached by the `substitute_refs_by_name` inliner below — `map_tree` walks
-    // `children()`, which excludes a `Call`'s `Inputs` bucket (core `node.rs`,
-    // `for_each_child`). Left un-inlined, that θ param stays a dangling `(%ref self
-    // <name>)` inside the reification, so the density scores as a function of the
-    // FREE param instead of at θ — a silent mislowering that still passes
-    // `is_flatpdl`. This must hold in EVERY build profile (a `debug_assert` is
-    // stripped in release), so we HARD REFUSE here rather than assert.
-    if subtree_has_theta_capturing_input(m, density, &theta_map) {
+    // reification *input* (a `(name, %ref self <name>)` boundary entry) is a name that
+    // reification RE-DECLARES for itself, and `substitute_refs_by_name` below cannot see
+    // the boundary — `map_tree` walks `children()`, which excludes a `Call`'s `Inputs`
+    // bucket (core `node.rs`, `for_each_child`). Either way the emitted density is
+    // wrong: the θ param stays a dangling `(%ref self <name>)` inside the reification
+    // and the density scores at the FREE param, or the inliner reaches the nested
+    // body and overwrites the reification's own input. Both pass `is_flatpdl`. This must
+    // hold in EVERY build profile (a `debug_assert` is stripped in release), so we HARD
+    // REFUSE here rather than assert. See [`subtree_capturing_reification_input`].
+    let theta_names: Vec<Symbol> = theta_map.iter().map(|(n, _)| *n).collect();
+    if subtree_capturing_reification_input(m, density, &theta_names).is_some() {
         return Err(refuse(
             likelihoodof_node,
             m,
@@ -922,29 +924,61 @@ fn theta_inlined_binding(
     result
 }
 
-/// True iff some `functionof` / `kernelof` reification reachable from `root`
-/// carries a `Spec` [`flatppl_core::Inputs`] boundary entry whose `Ref` is a
-/// `Ref(SelfMod, name)` for a `name` in `map` — i.e. a θ param captured as a
-/// reification input that [`substitute_refs_by_name`]'s `children()`-only walk
-/// would not reach. Backs the hard refuse in [`lower_likelihood_query`].
+/// The first `names` entry that some `functionof` / `kernelof` reification reachable
+/// from `root` declares as one of its OWN boundary inputs' body-target refs — i.e. a
+/// name the reification RE-DECLARES for itself, so that [`substitute_refs_by_name`]
+/// must not write an outer value into it. `None` when there is no such name.
+///
+/// **This is a capture hazard, and the two callers both refuse on it rather than
+/// substitute.** [`substitute_refs_by_name`] runs on [`crate::driver::map_tree`], which
+/// has no shadow guard (unlike [`crate::kernel::substitute_refs`], whose per-name
+/// `shadows_name` filter stops at exactly this edge). So the finish descends into the
+/// nested reification and rewrites ITS input reference to the outer value, whereupon the
+/// nested body becomes a constant and its own applied argument is discarded. §04
+/// *Specifying reification boundaries* forbids that outright: "The resulting function
+/// `h` now has arguments named `a` and `d`, but these are local to the function and
+/// decoupled from the original nodes `a` and `d`." The error is unbounded and it passes
+/// `is_flatpdl`, so this must hold in EVERY build profile — a hard refuse, never a
+/// `debug_assert`.
+///
+/// **`Inputs::Auto` counts, not only `Inputs::Spec`.** An `%autoinputs` boundary keeps
+/// its entries in the module's side-table ([`Module::auto_inputs_of`]) rather than
+/// inline, and the clobbering is identical — reading `Spec` alone let
+/// `functionof(w * 10.0)` applied as `g(w = 2.0)` through, where the finish overwrote
+/// the auto-input and the reduction then failed to bind it, refusing at a later site
+/// with a false internal message ("user call declares 0 parameters, got 1").
 ///
 /// The scan is `%ref self`-aware: an emitted density subtree references its
 /// weight/kernel reification by NAME (`(%call (%ref self w) v)`), not inline, so
-/// the `functionof` carrying the θ-capturing input lives in `w`'s binding RHS,
+/// the `functionof` carrying the capturing input lives in `w`'s binding RHS,
 /// one indirection away. `children()` alone (which stops at the `(%ref self w)`
 /// leaf) would miss it, so whenever we meet a `Ref(SelfMod, name)` whose binding
 /// RHS we have not yet visited, we descend into that RHS too. `visited_bindings`
 /// bounds the walk against reference cycles.
-fn subtree_has_theta_capturing_input(m: &Module, root: NodeId, map: &[(Symbol, NodeId)]) -> bool {
+fn subtree_capturing_reification_input(
+    m: &Module,
+    root: NodeId,
+    names: &[Symbol],
+) -> Option<Symbol> {
     let mut stack = vec![root];
     let mut visited_bindings = std::collections::HashSet::new();
     while let Some(id) = stack.pop() {
         match m.node(id) {
             Node::Call(c) => {
-                if let Some(flatppl_core::Inputs::Spec(entries)) = &c.inputs {
-                    for (_, r) in entries.iter() {
-                        if r.ns == RefNs::SelfMod && map.iter().any(|(n, _)| *n == r.name) {
-                            return true;
+                let entries: Vec<Ref> = match c.inputs.as_ref() {
+                    Some(Inputs::Spec(es)) => es.iter().map(|(_, r)| *r).collect(),
+                    Some(Inputs::Auto) => m
+                        .auto_inputs_of(id)
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|(_, r)| *r)
+                        .collect(),
+                    None => Vec::new(),
+                };
+                for r in entries {
+                    if r.ns == RefNs::SelfMod {
+                        if let Some(hit) = names.iter().find(|n| **n == r.name) {
+                            return Some(*hit);
                         }
                     }
                 }
@@ -966,7 +1000,7 @@ fn subtree_has_theta_capturing_input(m: &Module, root: NodeId, map: &[(Symbol, N
             _ => {}
         }
     }
-    false
+    None
 }
 
 /// Finish an applied reification's boundary substitution over the density its body
@@ -1000,21 +1034,42 @@ fn subtree_has_theta_capturing_input(m: &Module, root: NodeId, map: &[(Symbol, N
 /// boundary entries, and it leaves a reference cycle's binding alone. Either way the
 /// emitted density would read the unpinned parameter, so refuse rather than emit it.
 ///
-/// A boundary whose own applied VALUE references the boundary node (`K(z = z + 1.0)`)
-/// is excluded from the residual check: the ambient `z` is then legitimately part of
-/// the emitted density, and a residual occurrence cannot be told from the substituted
-/// one.
+/// **A target that ANY applied value reads is excluded from the residual check**,
+/// because the ambient node is then legitimately part of the emitted density and a
+/// residual occurrence cannot be told from the substituted one. That covers two
+/// shapes, and reachability from any value rather than from the target's OWN value is
+/// what covers the second:
 ///
-/// **The exclusion is per-entry, and the CROSS-naming case therefore refuses even
-/// though the substitution handled it correctly.** For `K(z = w, w = 0.5)` the ambient
-/// `w` is legitimately in the output as input `z`'s value, but `w` is also a boundary
-/// target whose own value (`0.5`) does not read it, so the residual check flags it. The
-/// emitted density IS right — `substitute_refs_by_name` applies every map entry in one
-/// `map_tree` pass and never re-descends into a replacement, so there is no sequential
-/// capture — and the refusal is the guard being unable to tell a sibling's value from a
-/// missed occurrence. Widening the exclusion to any target reachable from ANY bound
-/// value lowers it correctly; that is a verdict change with its own repin, so it is
-/// carded rather than taken here.
+/// - self-reference, `K(z = z + 1.0)` — the ambient `z` is the applied value's own
+///   content;
+/// - CROSS-naming, `K(z = w, w = 0.5)` — the ambient `w` is in the output as input
+///   `z`'s value, while `w`'s own value (`0.5`) does not read it. The emitted density
+///   is `record(mu = w, …)` with the ambient `w` surviving as a determinized input,
+///   which §04 requires: an applied value is evaluated in the AMBIENT scope and is not
+///   part of the reified graph. Both substitution passes are simultaneous — one
+///   `map_tree` here, one [`crate::kernel::substitute_refs`] pass in the reduction —
+///   so no entry can capture a sibling's value and the density is right to emit.
+///
+/// The exclusion is per-TARGET, so it does not disarm the residual check: a target no
+/// applied value reads is still checked, and still refuses, even alongside a cross-named
+/// sibling.
+///
+/// **It does mean the residual check can no longer be the backstop for a nested
+/// reification that re-declares a pinned name**, since a cross-read target is excluded
+/// from it by design. That hazard is therefore caught FIRST and on its own terms, by
+/// [`subtree_capturing_reification_input`], which refuses before the finish runs. Order
+/// matters: excluding a cross-read target from the residual check while leaving the
+/// nested-boundary hazard to it turned a fail-closed refusal into a silent unbounded
+/// wrong number (`h = functionof(w * 10.0, w = w)` inside the body of a `K(z = w,
+/// w = 0.5)` application scored at `mu = w + 5.0` where the truth is `mu = w + 20.0`).
+///
+/// Refusing the hazard is CONTAINMENT, not the end state. Giving the finish the per-name
+/// shadow filter [`crate::kernel::substitute_refs`] already has would lower those shapes
+/// correctly instead — but it also makes every `Inputs`-route residual occurrence a
+/// legitimate non-target, since an `Inputs` entry naming a pinned node IS a
+/// re-declaration of it, so the residual check would lose its only reachable trigger and
+/// several further shapes would flip refuse → lower. That is a wave with its own oracles
+/// and its own repin, not a fix round.
 fn substitute_applied_boundary(
     m: &mut Module,
     node: NodeId,
@@ -1030,20 +1085,55 @@ fn substitute_applied_boundary(
         .filter(|(r, _)| r.ns == RefNs::SelfMod)
         .map(|(r, v)| (r.name, *v))
         .collect();
+    // Refuse-don't-mislower, BEFORE the finish runs: a nested reification inside the
+    // density that re-declares one of these names as its OWN boundary input would have
+    // that input overwritten with the outer value, because `substitute_refs_by_name`
+    // has no shadow guard. §04 makes such an input local to its reification and
+    // decoupled from the outer node, so the finish must not reach it — see
+    // [`subtree_capturing_reification_input`] for the mechanism and the unbounded error
+    // it produces. The residual check below cannot substitute for this: its whole job is
+    // to spot a target still READABLE in the output, and a cross-read target is excluded
+    // from it by design.
+    let names: Vec<Symbol> = map.iter().map(|(n, _)| *n).collect();
+    if let Some(shadowed) = subtree_capturing_reification_input(m, density, &names) {
+        let name = m.resolve(shadowed).to_string();
+        return Err(refuse(
+            node,
+            m,
+            &format!(
+                "applying this reification pins its boundary input `{name}`, and the scored \
+                 density contains a nested functionof/kernelof that declares `{name}` as one of \
+                 its OWN boundary inputs. §04 makes that input local to the nested reification \
+                 and decoupled from the outer node, but the substitution that finishes this \
+                 application cannot see a nested boundary, so it would overwrite the nested \
+                 input with `{name}`'s applied value and discard the nested application's own \
+                 argument. Rename the nested reification's input, or spell it as a lambda \
+                 (whose placeholder cannot collide)"
+            ),
+        ));
+    }
     let out = if map.is_empty() {
         density
     } else {
         substitute_refs_by_name(m, density, &map)
     };
-    let self_referential: Vec<Ref> = bound
+    // A target ANY applied value reads is legitimately in the output, so it is not
+    // evidence of a missed occurrence. Reachability from any value, not just from that
+    // target's own value: `k(z = w, w = 0.5)` puts the ambient `w` in the output as
+    // input `z`'s value, and `w`'s own value (`0.5`) does not read it.
+    let from_values: Vec<Ref> = bound
         .iter()
-        .filter(|(r, value)| subtree_reaches_boundary_ref(m, *value, &[*r]).is_some())
         .map(|(r, _)| *r)
+        .filter(|r| {
+            bound
+                .iter()
+                .any(|(_, value)| subtree_reaches_boundary_ref(m, *value, &[*r]).is_some())
+        })
         .collect();
     let checked: Vec<Ref> = bound
         .iter()
         .map(|(r, _)| *r)
-        .filter(|r| !self_referential.contains(r))
+        .filter(|r| !from_values.contains(r))
         .collect();
     if let Some(leaked) = subtree_reaches_boundary_ref(m, out, &checked) {
         let name = m.resolve(leaked.name).to_string();
@@ -1052,11 +1142,11 @@ fn substitute_applied_boundary(
             m,
             &format!(
                 "applying this reification pins its boundary input `{name}`, and the emitted \
-                 density still reads `{name}`. That is either an occurrence the substitution \
-                 could not reach — a reification's own boundary entry, or a binding reference \
-                 cycle — or a SIBLING input's applied value legitimately reading `{name}` \
-                 (`k(a = {name}, {name} = 0.5)`). This pass cannot tell the two apart, and the \
-                 first would score at the unpinned parameter, so refuse"
+                 density still reads `{name}` through an occurrence the substitution could not \
+                 reach — a reification's own boundary entry, or a binding reference cycle. No \
+                 applied value of this application reads `{name}`, so the occurrence is not the \
+                 ambient node legitimately standing in for a sibling input; it would score at \
+                 the unpinned parameter, so refuse"
             ),
         ));
     }
@@ -1210,7 +1300,7 @@ fn lower_applied_kernel_joint_inner(
     for (&component, kernel) in components.iter().zip(resolved.iter()) {
         match kernel {
             Some(k) => {
-                let mut body = k.body;
+                let mut component_bound: Vec<(Ref, NodeId)> = Vec::with_capacity(k.inputs.len());
                 for (name, target) in &k.inputs {
                     let value = supplied
                         .iter()
@@ -1227,17 +1317,19 @@ fn lower_applied_kernel_joint_inner(
                                 ),
                             )
                         })?;
-                    // `LocalOnly`, exactly as the reification path: a same-module
-                    // target is substituted ONCE, by the finish below.
-                    body = crate::kernel::substitute_admitted(
-                        m,
-                        body,
-                        *target,
-                        value,
-                        crate::kernel::Substitute::LocalOnly,
-                    );
-                    bound.push((*target, value));
+                    component_bound.push((*target, value));
                 }
+                // `LocalOnly`, exactly as the reification path: a same-module target is
+                // substituted ONCE, by the finish below. One SIMULTANEOUS pass over the
+                // component's whole binding, so a cross-named applied value is not
+                // captured by the sibling entry that named it.
+                let body = crate::kernel::substitute_admitted(
+                    m,
+                    k.body,
+                    &component_bound,
+                    crate::kernel::Substitute::LocalOnly,
+                );
+                bound.extend(component_bound);
                 let coordinate = build_call(m, "lawof", &[body]);
                 annotate_synthesized_lawof(m, coordinate, body);
                 rewritten.push(coordinate);
