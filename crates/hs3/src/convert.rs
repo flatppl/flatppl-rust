@@ -572,7 +572,13 @@ fn emit_functions(m: &mut Module, doc: &Document) -> Result<()> {
 ///    `needed_axes` (`obs` plus every axis a conditioning parameter's function
 ///    depends on) — the dataset actually shaped for this conditional density,
 ///    not merely one that happens to include `obs` among extra axes meant for
-///    a different (wider) distribution.
+///    a different (wider) distribution. Ties (two candidate datasets with the
+///    same axis set) resolve to the first in document order via `.find` —
+///    silently, same as tier 3. `needed_axes` itself can under-count: the
+///    caller's `funcs_axis` records only the first observable identifier per
+///    conditioning function (see its doc comment), so a function depending on
+///    two distinct axes is seen as depending on one, and this tier can then
+///    match a same-size wrong dataset or miss the true match entirely.
 /// 3. The first dataset containing `obs`, in document order — the prior
 ///    behavior, safe as a last resort because it is only reached when no
 ///    dataset exactly matches, i.e. every fixture with a single dataset per
@@ -633,6 +639,10 @@ fn emit_distributions(m: &mut Module, doc: &Document) -> Result<()> {
     // `funcs_axis` maps each `generic_function` to the (first) observable axis its
     // expression depends on. A distribution whose parameter names such a function
     // of a DISTINCT (non-self) axis is conditional and lowers via emit_conditional.
+    // "(first)" is a real gap, not just a parenthetical: a conditioning function of
+    // TWO distinct axes is seen as depending on only one, so `ordered_record_axes`'s
+    // `needed_axes` (built from this map) under-counts and its exact-match tier can
+    // pick a same-size wrong dataset or miss the true match — see its doc comment.
     let axis_set: BTreeSet<&str> = observables.iter().map(String::as_str).collect();
     let funcs_axis: BTreeMap<&str, &str> = doc
         .functions
