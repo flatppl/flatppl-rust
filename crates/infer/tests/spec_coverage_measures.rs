@@ -1914,3 +1914,86 @@ fn superpose_of_a_measure_and_a_record_is_rejected() {
         "must not silently drop the bad argument and type `s` as n1's plain measure; got:\n{out}"
     );
 }
+
+// ============================================================
+// `iid` over a record-valued measure has a `%table` variate (spec §11)
+// ============================================================
+
+/// A SCALAR-size `iid` over a record-valued measure types `(%table (%columns
+/// …) (%nrows N))`, not `(%array 1 (N) (%record …))` — design PR #83 (owner
+/// ruling, decisions-log 2026-08-18): "the text is correct (§11 gives `%table`
+/// its own form; js conforms); rust types `%array` instead." §11's `%table`
+/// form and §03's Cartesian power ("the power is the set of tables" for a
+/// record set) both back the reading; flatppl-js already conforms
+/// (`designpass2-report.md`, "PR 83"). The value-set slot already agreed
+/// (`cartpow (record …) 5`, an n-row table per §03) — only the TYPE slot was
+/// wrong, so this pins that the two slots now agree on the shape.
+#[test]
+fn scalar_iid_over_a_record_measure_types_a_table() {
+    let src = "M = joint(a = Normal(mu = 0.0, sigma = 1.0), b = Beta(alpha = 1.0, beta = 1.0))\n\
+               q = iid(M, 5)";
+    assert!(diags_of(src).is_empty(), "{:?}", diags_of(src));
+    let out = ir(src);
+    let q = out.lines().find(|l| l.contains("%bind q")).unwrap_or("");
+    assert!(
+        q.contains(
+            "(%measure (%domain (%table (%columns (a (%scalar real)) (b (%scalar real))) \
+             (%nrows 5)))"
+        ),
+        "scalar record-iid must type a %table, not an array of records:\n{out}"
+    );
+    assert!(
+        !q.contains("(%array"),
+        "must not also carry the old %array-of-records spelling:\n{out}"
+    );
+
+    // The annotated FlatPIR round-trips through a re-read (§11 form is legal to
+    // parse back, not just to print).
+    let reread = flatppl_flatpir::read(&out)
+        .unwrap_or_else(|e| panic!("annotated output unreadable: {e}\n{out}"));
+    assert_eq!(
+        flatppl_flatpir::write(&reread),
+        out,
+        "annotated FlatPIR is not a write fixpoint"
+    );
+}
+
+/// The MULTI-axis case (`iid(M, [2, 3])`) has no `%table` reading — a table
+/// has one row axis (§03: "a multi-axis power of a record set has no table
+/// reading at all") — and stays array-of-records, untouched by #83's fix.
+#[test]
+fn multi_axis_iid_over_a_record_measure_stays_array_of_records() {
+    let src = "M = joint(a = Normal(mu = 0.0, sigma = 1.0), b = Beta(alpha = 1.0, beta = 1.0))\n\
+               q = iid(M, [2, 3])";
+    assert!(diags_of(src).is_empty(), "{:?}", diags_of(src));
+    let out = ir(src);
+    let q = out.lines().find(|l| l.contains("%bind q")).unwrap_or("");
+    assert!(
+        q.contains(
+            "(%measure (%domain (%array 2 (2 3) (%record (a (%scalar real)) (b (%scalar real))))"
+        ),
+        "multi-axis record-iid must stay an array of records:\n{out}"
+    );
+    assert!(
+        !q.contains("%table"),
+        "must not gain a %table reading:\n{out}"
+    );
+}
+
+/// A record whose SCALAR count is not statically known still gets the
+/// `%table` shape (a `%dynamic` row count), not the array reading — the
+/// table/array choice is driven by the count's RANK, which is always 1 for a
+/// scalar count regardless of whether its value is fixed (see `count_dims`).
+#[test]
+fn scalar_iid_over_a_record_measure_with_a_dynamic_count_still_tables() {
+    let src = "n = elementof(posintegers)\n\
+               M = joint(a = Normal(mu = 0.0, sigma = 1.0), b = Beta(alpha = 1.0, beta = 1.0))\n\
+               q = iid(M, n)";
+    assert!(diags_of(src).is_empty(), "{:?}", diags_of(src));
+    let out = ir(src);
+    let q = out.lines().find(|l| l.contains("%bind q")).unwrap_or("");
+    assert!(
+        q.contains("(%table (%columns (a (%scalar real)) (b (%scalar real))) (%nrows %dynamic))"),
+        "a dynamic scalar count must still type a %table with a %dynamic row count:\n{out}"
+    );
+}

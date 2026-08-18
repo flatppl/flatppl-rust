@@ -1994,6 +1994,24 @@ fn disintegrate_type(inf: &mut Inferencer<'_, '_>, call: &Call, args: &[ArgInfo]
 /// `iid(M, n)`: n iid draws bundle into an array over M's domain. A literal
 /// count (or literal count vector) gives static dims; anything computed is
 /// dynamic until fixed-value const-eval lands (engine-concepts §17.1).
+///
+/// A SCALAR count over a RECORD-valued `M` is the one shape §11 gives its own
+/// form: `(%table (%columns …) (%nrows N))`, not an array of records — design
+/// PR #83 (owner ruling, decisions-log 2026-08-18): "the text is correct (§11
+/// gives `%table` its own form … ); rust types `%array` instead", now fixed.
+/// §03's Cartesian power backs the reading too: "When `S` is a record set, the
+/// power is the set of tables with those columns", with its own worked example
+/// scalar (`cartpow(cartprod(a = reals, b = posreals), n)` is "the set of
+/// `n`-row tables"). `count_dims` gives a scalar `n` exactly one dim
+/// (`Box::new([..])`, both the literal-int and the dynamic-fallback arms), so
+/// `shape.len() == 1` is precisely the scalar case — no multi-axis shape is
+/// ever length 1, since a `vector`/`Vec` count contributes one dim per element.
+///
+/// A MULTI-axis count (`shape.len() != 1`, e.g. `iid(M, [2, 3])`) has NO table
+/// reading — a table has one row axis — and stays array-of-records, untouched:
+/// #83's own §03 tension notes "a multi-axis power of a record set has no
+/// table reading at all". A non-record `M` is likewise untouched, falling to
+/// the same array arm it always used.
 fn iid_type(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> Type {
     let domain = match arg_ty(args, 0) {
         Some(Type::Measure { domain, .. }) => domain.as_ref().clone(),
@@ -2002,11 +2020,19 @@ fn iid_type(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> Type {
     let Some((count_node, _, _)) = args.get(1) else {
         return Type::Deferred;
     };
-    Type::Measure {
-        domain: Box::new(Type::Array {
-            shape: count_dims(inf, *count_node),
+    let shape = count_dims(inf, *count_node);
+    let result_domain = match (&domain, shape.as_ref()) {
+        (Type::Record(fields), [nrows]) => Type::Table {
+            columns: fields.clone(),
+            nrows: *nrows,
+        },
+        _ => Type::Array {
+            shape,
             elem: Box::new(domain),
-        }),
+        },
+    };
+    Type::Measure {
+        domain: Box::new(result_domain),
         mass: Mass::Deferred,
     }
 }
