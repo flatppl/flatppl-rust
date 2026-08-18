@@ -1821,3 +1821,67 @@ fn a_joint_mixing_positional_and_keyword_kernel_components_is_a_static_error() {
         diags_of(src)
     );
 }
+
+/// The MEASURE arms of `joint` drop a positional component the same way the
+/// kernel arm did before its fix: reading only `named` whenever it is
+/// non-empty silently drops every positional component. Before this,
+/// `joint(Normal(0.0, 1.0), b = Exponential(1.0))` typed over `record{b}`
+/// alone, with `Normal(0.0, 1.0)` gone and no diagnostic.
+#[test]
+fn a_joint_mixing_positional_and_keyword_measure_components_is_a_static_error() {
+    let src = "j = joint(Normal(0.0, 1.0), b = Exponential(1.0))";
+    assert!(
+        rejects(src, "mixes positional and keyword components"),
+        "the mixed spelling is refused on its own terms: {:?}",
+        diags_of(src)
+    );
+    let out = ir(src);
+    assert!(
+        !out.contains("(%record (b"),
+        "must not silently type over the record with the positional dropped; got:\n{out}"
+    );
+}
+
+/// `superpose`'s argument must be a measure (spec §06: measure addition).
+/// Before this, `fresh_measure`'s `Some(other) => other.clone()` arm passed a
+/// non-measure argument straight through unchanged: `superpose(record(m1 =
+/// n1, m2 = n2))` typed as `(%record (m1 (%measure …)) (m2 (%measure …)))` —
+/// a record where a measure belongs — with no diagnostic.
+#[test]
+fn superpose_of_a_record_is_rejected() {
+    let src = "n1 = Normal(0.0, 1.0)\n\
+               n2 = Exponential(1.0)\n\
+               s = superpose(record(m1 = n1, m2 = n2))";
+    assert!(
+        rejects(src, "must be a measure"),
+        "superpose(record(...)) must be a located static error, got: {:?}",
+        diags_of(src)
+    );
+    let out = ir(src);
+    assert!(
+        !out.contains("(%bind s (%meta ((%record"),
+        "must not silently type `s` as a record; got:\n{out}"
+    );
+}
+
+/// The same check applies to EVERY `superpose` argument, not just the first.
+/// Before this, a bad argument in a later position was silently DROPPED from
+/// the type entirely — worse than position 0's silent pass-through:
+/// `superpose(n, record(m1 = n1, m2 = n2))` typed as `n`'s own plain measure
+/// (`%unknown` mass), the record gone, with no diagnostic.
+#[test]
+fn superpose_of_a_measure_and_a_record_is_rejected() {
+    let src = "n1 = Normal(0.0, 1.0)\n\
+               n2 = Exponential(1.0)\n\
+               s = superpose(n1, record(m1 = n1, m2 = n2))";
+    assert!(
+        rejects(src, "must be a measure"),
+        "a bad argument in position 2 must be a located static error, got: {:?}",
+        diags_of(src)
+    );
+    let out = ir(src);
+    assert!(
+        !out.contains("(%bind s (%meta ((%measure (%domain (%scalar real)) (%mass %unknown))"),
+        "must not silently drop the bad argument and type `s` as n1's plain measure; got:\n{out}"
+    );
+}
