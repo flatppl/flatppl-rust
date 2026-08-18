@@ -2400,23 +2400,30 @@ fn diagnose_shared_node_input_names(
                             // the wrong one sends the reader looking for a measure component
                             // that is not there.
                             None => {
-                                let culprit = match &other.binds {
-                                    Binds::Nothing => {
-                                        "a measure component, which is nullary and binds nothing"
-                                    }
-                                    Binds::Declared(_) => {
-                                        "another kernel component, whose own boundary omits it"
-                                    }
+                                // The non-binder's KIND names the component, and the reason
+                                // follows the verb rather than interrupting it — reading
+                                // "while a measure component, which binds nothing, binds it
+                                // under no name" doubles the verb and reads as a typo.
+                                let (who, why) = match &other.binds {
+                                    Binds::Nothing => (
+                                        "a measure component",
+                                        "measure components are nullary and declare no boundary \
+                                         inputs",
+                                    ),
+                                    Binds::Declared(_) => (
+                                        "another kernel component",
+                                        "its own boundary omits that ancestor",
+                                    ),
                                 };
                                 (
                                     format!(
                                         "`joint` components share a stochastic node whose \
                                          boundary ancestor `{target}` one component binds as \
-                                         `{mine}` while {culprit} binds it under no name: the \
-                                         shared node would carry the applied input's law and \
-                                         the ambient `{target}`'s law at once, so every sharing \
-                                         component must bind that ancestor under the same name \
-                                         (spec §06 `joint`)"
+                                         `{mine}` while {who} binds it under no name ({why}): \
+                                         the shared node would carry the applied input's law \
+                                         and the ambient `{target}`'s law at once, so every \
+                                         sharing component must bind that ancestor under the \
+                                         same name (spec §06 `joint`)"
                                     ),
                                     "joint components disagree on a shared node's ancestry: one \
                                      binds it under no name",

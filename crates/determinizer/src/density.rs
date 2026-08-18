@@ -1004,6 +1004,17 @@ fn subtree_has_theta_capturing_input(m: &Module, root: NodeId, map: &[(Symbol, N
 /// is excluded from the residual check: the ambient `z` is then legitimately part of
 /// the emitted density, and a residual occurrence cannot be told from the substituted
 /// one.
+///
+/// **The exclusion is per-entry, and the CROSS-naming case therefore refuses even
+/// though the substitution handled it correctly.** For `K(z = w, w = 0.5)` the ambient
+/// `w` is legitimately in the output as input `z`'s value, but `w` is also a boundary
+/// target whose own value (`0.5`) does not read it, so the residual check flags it. The
+/// emitted density IS right — `substitute_refs_by_name` applies every map entry in one
+/// `map_tree` pass and never re-descends into a replacement, so there is no sequential
+/// capture — and the refusal is the guard being unable to tell a sibling's value from a
+/// missed occurrence. Widening the exclusion to any target reachable from ANY bound
+/// value lowers it correctly; that is a verdict change with its own repin, so it is
+/// carded rather than taken here.
 fn substitute_applied_boundary(
     m: &mut Module,
     node: NodeId,
@@ -1040,10 +1051,12 @@ fn substitute_applied_boundary(
             node,
             m,
             &format!(
-                "applying this reification pins its boundary input `{name}`, but the emitted \
-                 density still reads `{name}` — the substitution could not reach every \
-                 occurrence (a reification boundary entry, or a binding reference cycle). \
-                 Scoring it would evaluate at the unpinned parameter, so refuse"
+                "applying this reification pins its boundary input `{name}`, and the emitted \
+                 density still reads `{name}`. That is either an occurrence the substitution \
+                 could not reach — a reification's own boundary entry, or a binding reference \
+                 cycle — or a SIBLING input's applied value legitimately reading `{name}` \
+                 (`k(a = {name}, {name} = 0.5)`). This pass cannot tell the two apart, and the \
+                 first would score at the unpinned parameter, so refuse"
             ),
         ));
     }

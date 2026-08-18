@@ -493,8 +493,17 @@ pub(crate) enum Substitute {
     /// them through bindings the syntactic walk stops at. A `%local` placeholder has
     /// no module binding to reach it through, and §04 *Placeholders and holes*
     /// requires it to appear inside the reified expression, so it must be bound here
-    /// or not at all. The two sets are disjoint by namespace, so nothing is
-    /// substituted twice and nothing is left unbound.
+    /// or not at all.
+    ///
+    /// The two sets are disjoint, so nothing is substituted twice. They also exhaust
+    /// what [`substitute_ref`] can rewrite — it matches `RefNs::SelfMod | RefNs::Local`
+    /// and nothing else — so nothing this mode declines is left unbound. That is a
+    /// statement about those two namespaces only: a `RefNs::Module(alias)` boundary
+    /// target would be substituted by NEITHER pass, and it is unreachable here for a
+    /// different reason, namely that [`resolve_reified`] admits only a local
+    /// `kernelof`/`functionof` node, whose boundary entries name nodes in its own
+    /// module. A future cross-module boundary would need its own handling, not this
+    /// split widened.
     LocalOnly,
 }
 

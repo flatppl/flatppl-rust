@@ -1441,9 +1441,10 @@ fn a_measure_component_sharing_a_boundary_bound_ancestor_is_a_static_error() {
     assert!(
         rejects(
             &src,
-            "a measure component, which is nullary and binds nothing"
+            "a measure component binds it under no name (measure components are nullary"
         ),
-        "and the diagnostic names the MEASURE component as the non-binder; got: {:?}",
+        "and the diagnostic names the MEASURE component as the non-binder, with the reason \
+         AFTER the verb rather than interrupting it; got: {:?}",
         diags_of(&src)
     );
 }
@@ -1560,7 +1561,11 @@ fn a_kernel_component_binding_a_shared_ancestor_under_no_name_is_a_static_error(
         diags_of(src)
     );
     assert!(
-        rejects(src, "another kernel component, whose own boundary omits it"),
+        rejects(
+            src,
+            "another kernel component binds it under no name (its own boundary omits that \
+             ancestor)"
+        ),
         "and the diagnostic must name a KERNEL non-binder, not a measure component that is \
          not there; got: {:?}",
         diags_of(src)
