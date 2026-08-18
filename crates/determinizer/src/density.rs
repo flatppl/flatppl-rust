@@ -969,6 +969,174 @@ fn subtree_has_theta_capturing_input(m: &Module, root: NodeId, map: &[(Symbol, N
     false
 }
 
+/// Finish an applied reification's boundary substitution over the density its body
+/// lowered to, and refuse if any boundary reference survives.
+///
+/// §04 *Specifying reification boundaries* makes the applied value the ONLY content a
+/// boundary node has inside the reified graph: "A specified boundary node `a` can be
+/// thought of as being substituted with a new node, generated via
+/// `elementof(valueset(a))`, in the reified graph." [`crate::kernel::substitute_ref`]
+/// delivers that only where the reference is a literal descendant of the reified body.
+/// It is not, in two shapes that both LOWERED to a function of the pinned parameter
+/// rather than refusing:
+///
+/// - the boundary is reached through a derived binding (`mu2 = 2.0 * z` with
+///   `b1 ~ Normal(mu = mu2, …)`), which the syntactic walk stops at as `(%ref self mu2)`;
+/// - the body is a `record` whose fields are `(%ref self b1)` refs, so the walk never
+///   reaches the draws' own constructors.
+///
+/// Finishing AFTER the lowering rather than deepening the substitution before it is
+/// what keeps §06 RETAIN intact. A deep pre-substitution has to rewrite the `draw`
+/// bindings a shared latent is reached through, and rewriting them per reference clones
+/// the latent once per record field — silently turning the correlated record law into
+/// the `iid`-style product (`-3.0310242469693` where the joint is `-3.3871832107434`).
+/// The emitted density has no `draw` left to clone: the shared latent is already
+/// integrated out into one term, and only deterministic parameter positions remain. The
+/// through-binding inline is [`substitute_refs_by_name`]'s, which memoizes per binding
+/// NAME, so a binding several positions reach is inlined once.
+///
+/// The residual check is the fail-closed half, and it is not decoration: the inline
+/// walks `children()`, which excludes a reification's own [`flatppl_core::Inputs`]
+/// boundary entries, and it leaves a reference cycle's binding alone. Either way the
+/// emitted density would read the unpinned parameter, so refuse rather than emit it.
+///
+/// A boundary whose own applied VALUE references the boundary node (`K(z = z + 1.0)`)
+/// is excluded from the residual check: the ambient `z` is then legitimately part of
+/// the emitted density, and a residual occurrence cannot be told from the substituted
+/// one.
+fn substitute_applied_boundary(
+    m: &mut Module,
+    node: NodeId,
+    density: NodeId,
+    bound: &[(Ref, NodeId)],
+) -> Result<NodeId, RefuseError> {
+    // Only a SelfMod target can be reached through a module binding, so only those
+    // need the through-binding inline. A `%local` placeholder target lives inside the
+    // reified body alone (§04 *Placeholders and holes* requires it to appear there),
+    // which the syntactic pre-substitution already covers.
+    let map: Vec<(Symbol, NodeId)> = bound
+        .iter()
+        .filter(|(r, _)| r.ns == RefNs::SelfMod)
+        .map(|(r, v)| (r.name, *v))
+        .collect();
+    let out = if map.is_empty() {
+        density
+    } else {
+        substitute_refs_by_name(m, density, &map)
+    };
+    let self_referential: Vec<Ref> = bound
+        .iter()
+        .filter(|(r, value)| subtree_reaches_boundary_ref(m, *value, &[*r]).is_some())
+        .map(|(r, _)| *r)
+        .collect();
+    let checked: Vec<Ref> = bound
+        .iter()
+        .map(|(r, _)| *r)
+        .filter(|r| !self_referential.contains(r))
+        .collect();
+    if let Some(leaked) = subtree_reaches_boundary_ref(m, out, &checked) {
+        let name = m.resolve(leaked.name).to_string();
+        return Err(refuse(
+            node,
+            m,
+            &format!(
+                "applying this reification pins its boundary input `{name}`, but the emitted \
+                 density still reads `{name}` — the substitution could not reach every \
+                 occurrence (a reification boundary entry, or a binding reference cycle). \
+                 Scoring it would evaluate at the unpinned parameter, so refuse"
+            ),
+        ));
+    }
+    Ok(out)
+}
+
+/// Refuse a query point that names one of the reification's boundary nodes.
+///
+/// [`substitute_applied_boundary`] rewrites the whole emitted density, and the query
+/// point sits inside it. §04's substitution is scoped to the REIFIED graph, so a point
+/// written as the ambient `z` must keep reading the ambient `z` — substituting the
+/// applied value there scores at the wrong point. Refuse instead of scoping the rewrite
+/// per node: the shape is expressible and pathological, and no fixture holds one.
+fn refuse_boundary_named_query_point(
+    m: &Module,
+    v: NodeId,
+    bound: &[(Ref, NodeId)],
+) -> Result<(), RefuseError> {
+    let targets: Vec<Ref> = bound.iter().map(|(r, _)| *r).collect();
+    match subtree_reaches_boundary_ref(m, v, &targets) {
+        Some(hit) => {
+            let name = m.resolve(hit.name).to_string();
+            Err(refuse(
+                v,
+                m,
+                &format!(
+                    "the query point reads `{name}`, which is also a boundary input of the \
+                     reification being applied: §04 substitutes the applied value inside the \
+                     REIFIED graph only, so the point and the boundary cannot share a name here"
+                ),
+            ))
+        }
+        None => Ok(()),
+    }
+}
+
+/// The first `targets` entry the subtree at `root` still reaches, or `None`.
+///
+/// Reaches, not merely contains: a `(%ref self x)` is followed into binding `x`'s RHS,
+/// because an emitted density references its parameters by name rather than inline. A
+/// reification's [`flatppl_core::Inputs`] boundary entries are inspected too — they are
+/// not `children()`, which is exactly why [`substitute_refs_by_name`] cannot rewrite
+/// them and why this check must see them. `visited` bounds the walk over shared DAG
+/// nodes and against a malformed reference cycle.
+fn subtree_reaches_boundary_ref(m: &Module, root: NodeId, targets: &[Ref]) -> Option<Ref> {
+    if targets.is_empty() {
+        return None;
+    }
+    let mut stack = vec![root];
+    let mut visited: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
+    let mut visited_bindings: std::collections::HashSet<BindingId> =
+        std::collections::HashSet::new();
+    while let Some(id) = stack.pop() {
+        if !visited.insert(id) {
+            continue;
+        }
+        match m.node(id) {
+            Node::Ref(r) => {
+                if let Some(hit) = targets.iter().find(|t| t.ns == r.ns && t.name == r.name) {
+                    return Some(*hit);
+                }
+                if r.ns == RefNs::SelfMod {
+                    if let Some(bid) = m.binding_by_name(r.name) {
+                        if visited_bindings.insert(bid) {
+                            stack.push(m.binding(bid).rhs);
+                        }
+                    }
+                }
+            }
+            Node::Call(c) => {
+                let entries: Vec<Ref> = match c.inputs.as_ref() {
+                    Some(Inputs::Spec(es)) => es.iter().map(|(_, r)| *r).collect(),
+                    Some(Inputs::Auto) => m
+                        .auto_inputs_of(id)
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|(_, r)| *r)
+                        .collect(),
+                    None => Vec::new(),
+                };
+                for e in entries {
+                    if let Some(hit) = targets.iter().find(|t| t.ns == e.ns && t.name == e.name) {
+                        return Some(*hit);
+                    }
+                }
+                m.for_each_child(id, |c| stack.push(c));
+            }
+            _ => m.for_each_child(id, |c| stack.push(c)),
+        }
+    }
+    None
+}
+
 // ---------------------------------------------------------------------------
 // Core recursive dispatcher
 // ---------------------------------------------------------------------------
@@ -1039,8 +1207,23 @@ fn lower_measure_density_at(
     // A reified-kernel *application* `k(input)` (a `%call(User(k), [input])`)
     // is not a builtin-named op; β-reduce it to its measure body and recurse.
     // β-reduction does not move the measure, so the position carries over.
-    if let Some(reduced) = crate::kernel::reduce_kernel_application(m, measure_node) {
-        return lower_measure_density_at(m, reduced, v, origin);
+    if let Some(app) = crate::kernel::reduce_kernel_application_bound(m, measure_node) {
+        refuse_boundary_named_query_point(m, v, &app.bound)?;
+        // §04 *Kernels and `kernelof`* makes `kernelof(x, kwargs...)` equivalent to
+        // `functionof(lawof(x), kwargs...)`, so the APPLIED body sits under a `lawof`
+        // whose boundary is now bound. Every stochastic node still free in it is
+        // therefore an internal node of the traced sub-DAG and not a boundary input,
+        // which §04 *Reification to measures* integrates out: "they are internal
+        // stochastic nodes in the traced sub-DAG, **not boundary inputs**, so `lawof`
+        // integrates them out". Run the same marginalization guard the unapplied
+        // `lawof(record(…))` spelling gets, so the two agree instead of the applied one
+        // silently conditioning on the latent (or, for a record body, leaving its `draw`
+        // for the driver's generic refusal).
+        let density = match marginalize_or_refuse_stochastic_law(m, app.body, v)? {
+            Some(marginal) => marginal,
+            None => lower_measure_density_at(m, app.body, v, origin)?,
+        };
+        return substitute_applied_boundary(m, measure_node, density, &app.bound);
     }
 
     // Dispatch on the measure op.

@@ -431,6 +431,31 @@ fn shadows_name(m: &Module, id: NodeId, name: Symbol) -> bool {
 /// one level of ref indirection and, if present, one level of `draw(...)`
 /// unwrapping to reach the actual measure/law BEFORE substituting.
 pub(crate) fn reduce_kernel_application(m: &mut Module, node: NodeId) -> Option<NodeId> {
+    reduce_kernel_application_bound(m, node).map(|app| app.body)
+}
+
+/// A β-reduced reified-callable application: the reduced body plus the boundary
+/// binding that produced it, as `(body-target-ref, applied value)` pairs in
+/// boundary order.
+///
+/// The pairs matter because [`substitute_ref`] is SYNTACTIC: it rewrites only
+/// literal descendants of `body`, so a boundary reference reached through a
+/// module binding (`mu2 = 2.0 * z` with `z` the boundary, or a `record` field
+/// that is a `(%ref self b1)`) survives the reduction. A caller that goes on to
+/// LOWER the reduced body must finish the substitution over what it emits —
+/// `density::substitute_applied_boundary` does — or it scores a function of the
+/// very parameter the application pinned.
+pub(crate) struct AppliedReification {
+    pub body: NodeId,
+    pub bound: Vec<(Ref, NodeId)>,
+}
+
+/// [`reduce_kernel_application`] keeping the boundary binding it applied. See
+/// [`AppliedReification`] for why a lowering caller needs it.
+pub(crate) fn reduce_kernel_application_bound(
+    m: &mut Module,
+    node: NodeId,
+) -> Option<AppliedReification> {
     let Node::Call(c) = m.node(node) else {
         return None;
     };
@@ -461,6 +486,7 @@ pub(crate) fn reduce_kernel_application(m: &mut Module, node: NodeId) -> Option<
     // supports it too. Refuse a keyword/positional mix, or any bijection failure
     // (arity mismatch, or a boundary input with no matching keyword) rather than
     // leave a boundary input free — a silent wrong density.
+    let mut bound: Vec<(Ref, NodeId)> = Vec::with_capacity(kernel.inputs.len());
     if !kwargs.is_empty() {
         if !args.is_empty() || kwargs.len() != kernel.inputs.len() {
             return None;
@@ -468,14 +494,16 @@ pub(crate) fn reduce_kernel_application(m: &mut Module, node: NodeId) -> Option<
         for (name, target) in &kernel.inputs {
             let value = kwargs.iter().find(|(n, _)| n == name).map(|(_, v)| *v)?;
             body = substitute_ref(m, body, target.name, value);
+            bound.push((*target, value));
         }
-        return Some(body);
+        return Some(AppliedReification { body, bound });
     }
 
     if args.len() == 1 && is_splattable(m, args[0]) {
         for (name, target) in kernel.inputs {
             let value = record_field(m, args[0], name)?;
             body = substitute_ref(m, body, target.name, value);
+            bound.push((target, value));
         }
     } else if !kernel.auto && args.len() == kernel.inputs.len() {
         // POSITIONAL binding — `%specinputs`-only. An `%autoinputs` kernel is
@@ -483,13 +511,14 @@ pub(crate) fn reduce_kernel_application(m: &mut Module, node: NodeId) -> Option<
         // the refuse below rather than binding by an uninferable position.
         for (arg, (_, target)) in args.iter().zip(kernel.inputs.iter()) {
             body = substitute_ref(m, body, target.name, *arg);
+            bound.push((*target, *arg));
         }
     } else {
         // Arity mismatch, or a positional application of a keyword-only
         // `%autoinputs` kernel — refuse rather than mis-lower.
         return None;
     }
-    Some(body)
+    Some(AppliedReification { body, bound })
 }
 
 /// Does `rec` (after one level of ref-resolution) denote a `record(...)` or `table(...)`
