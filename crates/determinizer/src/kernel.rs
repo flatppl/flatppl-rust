@@ -296,21 +296,52 @@ pub(crate) fn has_free_local(m: &Module, root: NodeId) -> bool {
 }
 
 /// Replace every `(%ref self name)` / `(%ref %local name)` in the subtree at
-/// `root` with `new_id`. Append-only. Shadow-aware over ONE hazard: a nested
-/// `functionof`/`kernelof` reification whose OWN boundary re-declares `name`
-/// as one of its inputs (see [`shadows_name`]) is left untouched — descending
-/// into it would rewrite a reference that belongs to that reification's OWN
-/// scope, not the outer substitution (variable capture). Beyond that one
-/// hazard this is still scope-UNAWARE: sound under the workspace no-shadowing
-/// assumption for every other binding form (a substituted symbol is never
-/// rebound by anything besides a reification boundary inside the subtree).
+/// `root` with `new_id`. [`substitute_refs`] for a single name.
 pub(crate) fn substitute_ref(m: &mut Module, root: NodeId, name: Symbol, new_id: NodeId) -> NodeId {
-    if let Node::Ref(Ref { ns, name: rname }) = m.node(root) {
-        if matches!(ns, RefNs::SelfMod | RefNs::Local) && *rname == name {
-            return new_id;
-        }
+    substitute_refs(m, root, &[(name, new_id)])
+}
+
+/// Replace every `(%ref self n)` / `(%ref %local n)` in the subtree at `root` with
+/// `map`'s value for `n`, for every entry of `map` SIMULTANEOUSLY. Append-only.
+///
+/// **Simultaneous, not one name after another, and that is the whole point of taking
+/// a map.** Applying the entries in sequence captures a value the previous entry
+/// inserted: for `k(z = w, w = 0.5)` over a body reading both, `z := w` writes `w`
+/// into the body and the `w := 0.5` pass then rewrites the `w` it just inserted,
+/// yielding `0.5` where §04 *Specifying reification boundaries* gives the ambient
+/// `w` — the applied value is evaluated in the AMBIENT scope and is not itself part
+/// of the reified graph, so nothing in it is a substitution target. One pass over
+/// the ORIGINAL tree cannot capture, because a replaced node stands in wholesale and
+/// is never descended into (the same property [`crate::driver::map_tree`] relies on).
+///
+/// Shadow-aware over ONE hazard, PER NAME: a nested `functionof`/`kernelof`
+/// reification whose OWN boundary re-declares some of `map`'s names (see
+/// [`shadows_name`]) is descended into with exactly those names dropped —
+/// substituting them would rewrite references belonging to that reification's own
+/// scope (variable capture). Beyond that one hazard this is still scope-UNAWARE:
+/// sound under the workspace no-shadowing assumption for every other binding form (a
+/// substituted symbol is never rebound by anything besides a reification boundary
+/// inside the subtree).
+pub(crate) fn substitute_refs(m: &mut Module, root: NodeId, map: &[(Symbol, NodeId)]) -> NodeId {
+    if map.is_empty() {
+        return root;
     }
-    if shadows_name(m, root, name) {
+    if let Node::Ref(Ref { ns, name }) = m.node(root) {
+        if matches!(ns, RefNs::SelfMod | RefNs::Local) {
+            if let Some((_, new_id)) = map.iter().find(|(n, _)| n == name) {
+                return *new_id;
+            }
+        }
+        return root;
+    }
+    // Per-name shadowing: a nested reification re-declaring SOME of the names blocks
+    // those and no others.
+    let active: Vec<(Symbol, NodeId)> = map
+        .iter()
+        .copied()
+        .filter(|(name, _)| !shadows_name(m, root, *name))
+        .collect();
+    if active.is_empty() {
         return root;
     }
     let children: Vec<NodeId> = m.node(root).children();
@@ -319,59 +350,32 @@ pub(crate) fn substitute_ref(m: &mut Module, root: NodeId, name: Symbol, new_id:
     }
     let new_children: Vec<NodeId> = children
         .iter()
-        .map(|&c| substitute_ref(m, c, name, new_id))
+        .map(|&c| substitute_refs(m, c, &active))
         .collect();
     if new_children == children {
         return root;
     }
-    let Node::Call(orig) = m.node(root) else {
-        unreachable!("non-call node with children is impossible in this IR");
-    };
-    let head = orig.head;
-    let inputs = orig.inputs.clone();
-    let n_args = orig.args.len();
-    let (new_head, slice) = match head {
-        CallHead::User(_) => (CallHead::User(new_children[0]), &new_children[1..]),
-        CallHead::Builtin(s) => (CallHead::Builtin(s), &new_children[..]),
-    };
-    let new_args: Vec<NodeId> = slice[..n_args].to_vec();
-    let new_named_values = &slice[n_args..];
-    let new_named: Vec<NamedArg> = orig
-        .named
-        .iter()
-        .zip(new_named_values.iter())
-        .map(|(na, &val)| NamedArg {
-            kind: na.kind,
-            name: na.name,
-            value: val,
-        })
-        .collect();
-    m.alloc(Node::Call(Call {
-        head: new_head,
-        args: new_args.into(),
-        named: new_named.into(),
-        inputs,
-    }))
+    crate::driver::rebuild_with_children(m, root, &new_children)
 }
 
-/// [`substitute_ref`] for one boundary entry, or a no-op when `mode` leaves that
-/// entry to the caller. See [`Substitute`].
+/// [`substitute_refs`] over the boundary entries `mode` admits, in ONE pass. See
+/// [`Substitute`] for the mode split, and [`substitute_refs`] for why the pass must
+/// cover every admitted entry at once rather than one entry at a time.
 pub(crate) fn substitute_admitted(
     m: &mut Module,
     body: NodeId,
-    target: Ref,
-    value: NodeId,
+    bound: &[(Ref, NodeId)],
     mode: Substitute,
 ) -> NodeId {
-    let admitted = match mode {
-        Substitute::All => true,
-        Substitute::LocalOnly => target.ns == RefNs::Local,
-    };
-    if admitted {
-        substitute_ref(m, body, target.name, value)
-    } else {
-        body
-    }
+    let map: Vec<(Symbol, NodeId)> = bound
+        .iter()
+        .filter(|(target, _)| match mode {
+            Substitute::All => true,
+            Substitute::LocalOnly => target.ns == RefNs::Local,
+        })
+        .map(|(target, value)| (target.name, *value))
+        .collect();
+    substitute_refs(m, body, &map)
 }
 
 /// True iff `id` is a reification (`functionof`/`kernelof`) whose OWN
@@ -478,6 +482,10 @@ pub(crate) struct AppliedReification {
 /// into the body, and a second pass over the result cannot tell its own output from
 /// source, so it produces `z + 1.0 + 1.0`. A caller that finishes the substitution
 /// over the emitted density must therefore NOT have it done here as well.
+///
+/// Whichever entries a mode admits are substituted in ONE simultaneous pass
+/// ([`substitute_refs`]), so a cross-named applied value (`k(z = w, w = 0.5)`) is
+/// never captured by the sibling entry that named it.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Substitute {
     /// Every entry. For a caller that performs no further substitution of its own —
@@ -546,6 +554,9 @@ pub(crate) fn reduce_kernel_application_bound(
     // supports it too. Refuse a keyword/positional mix, or any bijection failure
     // (arity mismatch, or a boundary input with no matching keyword) rather than
     // leave a boundary input free — a silent wrong density.
+    // The whole binding is computed BEFORE anything is substituted, so the
+    // substitution can run as one simultaneous pass ([`substitute_refs`]) rather than
+    // one pass per entry — which captures a sibling's applied value.
     let mut bound: Vec<(Ref, NodeId)> = Vec::with_capacity(kernel.inputs.len());
     if !kwargs.is_empty() {
         if !args.is_empty() || kwargs.len() != kernel.inputs.len() {
@@ -553,24 +564,18 @@ pub(crate) fn reduce_kernel_application_bound(
         }
         for (name, target) in &kernel.inputs {
             let value = kwargs.iter().find(|(n, _)| n == name).map(|(_, v)| *v)?;
-            body = substitute_admitted(m, body, *target, value, mode);
             bound.push((*target, value));
         }
-        return Some(AppliedReification { body, bound });
-    }
-
-    if args.len() == 1 && is_splattable(m, args[0]) {
-        for (name, target) in kernel.inputs {
-            let value = record_field(m, args[0], name)?;
-            body = substitute_admitted(m, body, target, value, mode);
-            bound.push((target, value));
+    } else if args.len() == 1 && is_splattable(m, args[0]) {
+        for (name, target) in &kernel.inputs {
+            let value = record_field(m, args[0], *name)?;
+            bound.push((*target, value));
         }
     } else if !kernel.auto && args.len() == kernel.inputs.len() {
         // POSITIONAL binding — `%specinputs`-only. An `%autoinputs` kernel is
         // keyword-only (§04), so a positional application of one falls through to
         // the refuse below rather than binding by an uninferable position.
         for (arg, (_, target)) in args.iter().zip(kernel.inputs.iter()) {
-            body = substitute_admitted(m, body, *target, *arg, mode);
             bound.push((*target, *arg));
         }
     } else {
@@ -578,6 +583,7 @@ pub(crate) fn reduce_kernel_application_bound(
         // `%autoinputs` kernel — refuse rather than mis-lower.
         return None;
     }
+    body = substitute_admitted(m, body, &bound, mode);
     Some(AppliedReification { body, bound })
 }
 

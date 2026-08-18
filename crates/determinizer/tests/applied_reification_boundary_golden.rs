@@ -241,6 +241,110 @@ lp = logdensityof(K(z = v), 1.0)",
     );
 }
 
+/// A CROSS-NAMED applied value lowers, keeping the ambient sibling.
+///
+/// `K(z = w, w = 0.5)` binds input `z` to the ambient `w` and input `w` to `0.5`, so over
+/// the body `mu = z + w` the reified graph reads `mu = w + 0.5` with the ambient `w`
+/// surviving as a determinized input. §04 is what makes that the answer rather than
+/// `0.5 + 0.5`: an applied value is evaluated in the AMBIENT scope and is not part of the
+/// reified graph, so the `w` input's pin does not reach the `w` that input `z`'s value
+/// names.
+///
+/// Oracle at ambient `w = 0`: `log N(1; 0.5, 1) = -1.0439385332046727`. Both substitution
+/// passes are simultaneous, so the density has always been right to emit; what changed is
+/// the residual guard, which flagged the legitimately-present `w` as a possibly-missed
+/// occurrence and refused. It now excludes any target that ANY applied value reads.
+#[test]
+fn a_cross_named_applied_value_keeps_the_ambient_sibling() {
+    let out = lower(
+        "\
+z  = elementof(reals)
+w  = elementof(reals)
+b1 ~ Normal(mu = z + w, sigma = 1.0)
+K  = kernelof(b1, z = z, w = w)
+lp = logdensityof(K(z = w, w = 0.5), 1.0)",
+    );
+    assert!(
+        out.contains("record(mu = w + 0.5, sigma = 1.0)"),
+        "input `z` binds the ambient `w` and input `w` binds 0.5; got:\n{out}"
+    );
+    assert!(
+        out.contains("w = elementof(reals)"),
+        "the ambient `w` must survive as a determinized input; got:\n{out}"
+    );
+}
+
+/// The cyclic swap, where no substitution ORDER is correct.
+///
+/// `K(z = w, w = z)` over `mu = 2.0 * z + w` is `mu = 2.0 * w + z`, so BOTH ambient
+/// parameters survive. Oracle at ambient `w = 1`, `z = 0.5`:
+/// `log N(1; 2.5, 1) = -2.0439385332046727`, against `log N(1; 1.5, 1) =
+/// -1.0439385332046727` for the sequential `2.0 * z + z`.
+#[test]
+fn a_cyclic_swap_of_applied_values_exchanges_both_exactly_once() {
+    let out = lower(
+        "\
+z  = elementof(reals)
+w  = elementof(reals)
+b1 ~ Normal(mu = 2.0 * z + w, sigma = 1.0)
+K  = kernelof(b1, z = z, w = w)
+lp = logdensityof(K(z = w, w = z), 1.0)",
+    );
+    assert!(
+        out.contains("record(mu = 2.0 * w + z, sigma = 1.0)"),
+        "a swap exchanges the two parameters exactly once; got:\n{out}"
+    );
+    assert!(
+        out.contains("z = elementof(reals)") && out.contains("w = elementof(reals)"),
+        "both ambient parameters survive a swap; got:\n{out}"
+    );
+}
+
+/// The residual guard's REAL job, kept: a boundary occurrence no applied value explains
+/// still refuses.
+///
+/// `h = functionof(z + 1.0, z = z)` inside the scored body carries `z` in its own
+/// `%specinputs` boundary, which the finish's `children()` walk cannot reach and must not
+/// rewrite (it belongs to `h`'s scope). The application pins `z = 0.5`, no applied value
+/// reads `z`, so the surviving occurrence is a genuinely missed one and the density would
+/// score at the unpinned parameter.
+///
+/// The second shape is the one that pins the exclusion as per-TARGET rather than a
+/// blanket disarming: it holds a cross-named pair (`z = w`) AND a third input `v` that
+/// leaks the same way. `w` is excluded because input `z`'s value reads it; `v` is not,
+/// because nothing reads `v` — so the refusal must still fire, and must name `v`.
+#[test]
+fn a_boundary_occurrence_no_applied_value_reads_still_refuses() {
+    let leaked_only = "\
+z  = elementof(reals)
+h  = functionof(z + 1.0, z = z)
+b1 ~ Normal(mu = h(2.0), sigma = 1.0)
+K  = kernelof(b1, z = z)
+lp = logdensityof(K(z = 0.5), 1.0)";
+    let err = determinize(&parse_infer(leaked_only)).expect_err("the boundary leaks through `h`");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("could not reach") && msg.contains("`z`"),
+        "the refusal must name the unreachable occurrence of `z`; got: {msg}"
+    );
+
+    let leaked_beside_a_cross_name = "\
+z  = elementof(reals)
+w  = elementof(reals)
+v  = elementof(reals)
+h  = functionof(v + 1.0, v = v)
+b1 ~ Normal(mu = z + w + h(2.0), sigma = 1.0)
+K  = kernelof(b1, z = z, w = w, v = v)
+lp = logdensityof(K(z = w, w = 0.5, v = 3.0), 1.0)";
+    let err = determinize(&parse_infer(leaked_beside_a_cross_name))
+        .expect_err("`v` leaks even though `w` is legitimately present");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("`v`") && !msg.contains("`w`"),
+        "a cross-named sibling must not excuse a target nothing reads; got: {msg}"
+    );
+}
+
 /// A query point that names the boundary node refuses.
 ///
 /// §04 scopes the substitution to the REIFIED graph, so a point written as the ambient

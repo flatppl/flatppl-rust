@@ -1000,21 +1000,28 @@ fn subtree_has_theta_capturing_input(m: &Module, root: NodeId, map: &[(Symbol, N
 /// boundary entries, and it leaves a reference cycle's binding alone. Either way the
 /// emitted density would read the unpinned parameter, so refuse rather than emit it.
 ///
-/// A boundary whose own applied VALUE references the boundary node (`K(z = z + 1.0)`)
-/// is excluded from the residual check: the ambient `z` is then legitimately part of
-/// the emitted density, and a residual occurrence cannot be told from the substituted
-/// one.
+/// **A target that ANY applied value reads is excluded from the residual check**,
+/// because the ambient node is then legitimately part of the emitted density and a
+/// residual occurrence cannot be told from the substituted one. That covers two
+/// shapes, and reachability from any value rather than from the target's OWN value is
+/// what covers the second:
 ///
-/// **The exclusion is per-entry, and the CROSS-naming case therefore refuses even
-/// though the substitution handled it correctly.** For `K(z = w, w = 0.5)` the ambient
-/// `w` is legitimately in the output as input `z`'s value, but `w` is also a boundary
-/// target whose own value (`0.5`) does not read it, so the residual check flags it. The
-/// emitted density IS right — `substitute_refs_by_name` applies every map entry in one
-/// `map_tree` pass and never re-descends into a replacement, so there is no sequential
-/// capture — and the refusal is the guard being unable to tell a sibling's value from a
-/// missed occurrence. Widening the exclusion to any target reachable from ANY bound
-/// value lowers it correctly; that is a verdict change with its own repin, so it is
-/// carded rather than taken here.
+/// - self-reference, `K(z = z + 1.0)` — the ambient `z` is the applied value's own
+///   content;
+/// - CROSS-naming, `K(z = w, w = 0.5)` — the ambient `w` is in the output as input
+///   `z`'s value, while `w`'s own value (`0.5`) does not read it. The emitted density
+///   is `record(mu = w, …)` with the ambient `w` surviving as a determinized input,
+///   which §04 requires: an applied value is evaluated in the AMBIENT scope and is not
+///   part of the reified graph. Both substitution passes are simultaneous — one
+///   `map_tree` here, one [`crate::kernel::substitute_refs`] pass in the reduction —
+///   so no entry can capture a sibling's value and the density is right to emit.
+///
+/// The exclusion is per-TARGET, so it does not disarm the guard: a target no applied
+/// value reads is still checked, and still refuses, even alongside a cross-named
+/// sibling. What it cannot separate is a target that a sibling's value reads AND that
+/// also leaks through a route the finish could not reach; that shape lowers, reading
+/// the ambient node where the pin was meant to apply. It needs the occurrence-level
+/// bookkeeping the whole design avoids, and no fixture holds one.
 fn substitute_applied_boundary(
     m: &mut Module,
     node: NodeId,
@@ -1035,15 +1042,23 @@ fn substitute_applied_boundary(
     } else {
         substitute_refs_by_name(m, density, &map)
     };
-    let self_referential: Vec<Ref> = bound
+    // A target ANY applied value reads is legitimately in the output, so it is not
+    // evidence of a missed occurrence. Reachability from any value, not just from that
+    // target's own value: `k(z = w, w = 0.5)` puts the ambient `w` in the output as
+    // input `z`'s value, and `w`'s own value (`0.5`) does not read it.
+    let from_values: Vec<Ref> = bound
         .iter()
-        .filter(|(r, value)| subtree_reaches_boundary_ref(m, *value, &[*r]).is_some())
         .map(|(r, _)| *r)
+        .filter(|r| {
+            bound
+                .iter()
+                .any(|(_, value)| subtree_reaches_boundary_ref(m, *value, &[*r]).is_some())
+        })
         .collect();
     let checked: Vec<Ref> = bound
         .iter()
         .map(|(r, _)| *r)
-        .filter(|r| !self_referential.contains(r))
+        .filter(|r| !from_values.contains(r))
         .collect();
     if let Some(leaked) = subtree_reaches_boundary_ref(m, out, &checked) {
         let name = m.resolve(leaked.name).to_string();
@@ -1052,11 +1067,11 @@ fn substitute_applied_boundary(
             m,
             &format!(
                 "applying this reification pins its boundary input `{name}`, and the emitted \
-                 density still reads `{name}`. That is either an occurrence the substitution \
-                 could not reach — a reification's own boundary entry, or a binding reference \
-                 cycle — or a SIBLING input's applied value legitimately reading `{name}` \
-                 (`k(a = {name}, {name} = 0.5)`). This pass cannot tell the two apart, and the \
-                 first would score at the unpinned parameter, so refuse"
+                 density still reads `{name}` through an occurrence the substitution could not \
+                 reach — a reification's own boundary entry, or a binding reference cycle. No \
+                 applied value of this application reads `{name}`, so the occurrence is not the \
+                 ambient node legitimately standing in for a sibling input; it would score at \
+                 the unpinned parameter, so refuse"
             ),
         ));
     }
@@ -1210,7 +1225,7 @@ fn lower_applied_kernel_joint_inner(
     for (&component, kernel) in components.iter().zip(resolved.iter()) {
         match kernel {
             Some(k) => {
-                let mut body = k.body;
+                let mut component_bound: Vec<(Ref, NodeId)> = Vec::with_capacity(k.inputs.len());
                 for (name, target) in &k.inputs {
                     let value = supplied
                         .iter()
@@ -1227,17 +1242,19 @@ fn lower_applied_kernel_joint_inner(
                                 ),
                             )
                         })?;
-                    // `LocalOnly`, exactly as the reification path: a same-module
-                    // target is substituted ONCE, by the finish below.
-                    body = crate::kernel::substitute_admitted(
-                        m,
-                        body,
-                        *target,
-                        value,
-                        crate::kernel::Substitute::LocalOnly,
-                    );
-                    bound.push((*target, value));
+                    component_bound.push((*target, value));
                 }
+                // `LocalOnly`, exactly as the reification path: a same-module target is
+                // substituted ONCE, by the finish below. One SIMULTANEOUS pass over the
+                // component's whole binding, so a cross-named applied value is not
+                // captured by the sibling entry that named it.
+                let body = crate::kernel::substitute_admitted(
+                    m,
+                    k.body,
+                    &component_bound,
+                    crate::kernel::Substitute::LocalOnly,
+                );
+                bound.extend(component_bound);
                 let coordinate = build_call(m, "lawof", &[body]);
                 annotate_synthesized_lawof(m, coordinate, body);
                 rewritten.push(coordinate);

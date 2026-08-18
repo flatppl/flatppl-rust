@@ -306,3 +306,42 @@ lp = logdensityof(KJ(z = 0.0), record(p = 1.0, q = 0.5))";
         "the refusal must name the ancestry clause; got: {msg}"
     );
 }
+
+/// A CROSS-NAMED application of a fan-out lowers, keeping the ambient sibling — the
+/// fan-out spelling of the reification path's
+/// `a_cross_named_applied_value_keeps_the_ambient_sibling`.
+///
+/// `KJ(z = w, w = 0.5)` binds each component's `z` to the ambient `w` and its `w` to
+/// `0.5`, so both factors read `mu = w + 0.5` with `w` surviving as a determinized input.
+/// §04 puts the applied value in the AMBIENT scope, outside the reified graph, so the `w`
+/// input's pin does not reach the `w` that input `z`'s value names. The components are
+/// trace-disjoint, so §06 gives the product of marginals; at ambient `w = 0` the oracle is
+/// `log N(1; 0.5, 1) + log N(-1; 0.5, 1) = -1.0439385332046727 + -2.0439385332046727 =
+/// -3.0878770664093453`.
+///
+/// Both the fan-out's per-component substitution and the finish are simultaneous, so the
+/// pass covers the fan-out as well as the reification path — the two cannot drift into
+/// disagreeing on a cross-named application.
+#[test]
+fn an_applied_fan_out_keeps_the_ambient_cross_named_sibling() {
+    let out = lower(
+        "\
+z  = elementof(reals)
+w  = elementof(reals)
+b1 ~ Normal(mu = z + w, sigma = 1.0)
+b2 ~ Normal(mu = z + w, sigma = 1.0)
+K1 = kernelof(b1, z = z, w = w)
+K2 = kernelof(b2, z = z, w = w)
+KJ = joint(p = K1, q = K2)
+lp = logdensityof(KJ(z = w, w = 0.5), record(p = 1.0, q = -1.0))",
+    );
+    assert_eq!(
+        out.matches("record(mu = w + 0.5, sigma = 1.0)").count(),
+        2,
+        "both factors bind `z` to the ambient `w` and `w` to 0.5; got:\n{out}"
+    );
+    assert!(
+        out.contains("w = elementof(reals)"),
+        "the ambient `w` must survive as a determinized input; got:\n{out}"
+    );
+}
