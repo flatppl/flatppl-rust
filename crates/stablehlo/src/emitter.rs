@@ -1195,15 +1195,27 @@ impl<'m> Emitter<'m> {
     /// element types to all agree. `identity_lit` is used verbatim only for a
     /// `Real` operand (byte-identical to before this fix — every existing
     /// caller); a non-`Real` operand needs its OWN identity literal in that
-    /// kind's own syntax, not `identity_lit`'s float formatting (`"0"`/
-    /// `"false"`, never the float-only `"0.000000e+00"` or a dtype-exact
-    /// -inf bit pattern). Only the additive (`stablehlo.add`) identity has a
+    /// kind's own syntax, not `identity_lit`'s float formatting (`"0"`,
+    /// never the float-only `"0.000000e+00"` or a dtype-exact -inf bit
+    /// pattern). Only the additive (`stablehlo.add`) identity has a
     /// non-`Real` form implemented — `reduce_max` is only ever reached via
     /// `ops::lower_logsumexp`, whose vector argument is always `Real` by
     /// construction (see its own doc comment: every element is a
     /// `logdensityof` term), so a non-`Real` operand reaching the `maximum`
     /// combine is an internal invariant violation, not a case this emitter
     /// has a literal for.
+    ///
+    /// A `Bool` operand is PROMOTED to `Int` first (`stablehlo.convert`, the
+    /// canonical §03 `booleans` $\subset$ `integers` embedding), because no
+    /// `i1` combine computes a reduction: `stablehlo.add` on `i1` is a wrapping
+    /// 1-bit add — parity, not a count — and `stablehlo.multiply` a
+    /// conjunction. §03 "Bool" mandates the promotion: "In arithmetic contexts,
+    /// `false` is promoted to zero and `true` to one, permitting expressions
+    /// such as `true + true`, `3 * false`, and `sum(mask)` to count true
+    /// entries". The result then carries `Int`, agreeing with what
+    /// `infer::ops::reduced_scalar` types `sum(bool_array)` as — so the emitted
+    /// ABI return type and the inferred type stay the same type. Before this,
+    /// `sum([true, true, false])` IREE-executed to `false`.
     fn reduce_axis(
         &mut self,
         combine_op: &str,
@@ -1211,16 +1223,22 @@ impl<'m> Emitter<'m> {
         a: &Value,
         axis: usize,
     ) -> Value {
+        let promoted = if a.elem == ElemKind::Bool {
+            self.convert(a, ElemKind::Int)
+        } else {
+            a.clone()
+        };
+        let a = &promoted;
         let init_lit: &str = match a.elem {
             ElemKind::Real => identity_lit,
             ElemKind::Int => "0",
+            // Unreachable: `Bool` was promoted to `Int` above.
             ElemKind::Bool => "false",
         };
         assert!(
             a.elem == ElemKind::Real || combine_op == "stablehlo.add",
             "reduce_axis: a non-Real reduction identity exists only for the additive \
-             (stablehlo.add) combine; reduce_max/reduce_min have no integer or boolean ±inf \
-             identity"
+             (stablehlo.add) combine; reduce_max/reduce_min have no integer ±inf identity"
         );
         self.reduce_axis_lit(combine_op, init_lit, a, axis)
     }
@@ -1230,6 +1248,12 @@ impl<'m> Emitter<'m> {
     /// [`Emitter::reduce_trailing_axes`] can supply a per-kind identity its own
     /// combine needs (`stablehlo.multiply`'s one, which the additive-only
     /// selection above has no form for) without duplicating the op text.
+    ///
+    /// Takes its operand at the element kind it is to reduce in: `reduce_axis`
+    /// has already promoted a `Bool` operand to `Int`, and
+    /// [`Emitter::reduce_trailing_axes`]'s caller (`aggregate::reduce`) widens
+    /// the frame to the aggregate node's own inferred kind. So no `i1` combine
+    /// is ever emitted from here.
     fn reduce_axis_lit(
         &mut self,
         combine_op: &str,
@@ -1297,18 +1321,20 @@ impl<'m> Emitter<'m> {
     ///   i1 would answer parity and reducing in a wider kind would contradict the
     ///   declared result type.
     ///
-    /// NOTE: [`Emitter::reduce_axis`] still selects `"false"` for a `Bool`
-    /// additive reduce, and THAT path is live and WRONG — `ops::lower_sum` over a
-    /// boolean array emits the wrapping `i1` add (measured under IREE:
-    /// `sum([true, true, false])` executes to `false`, where §03's promotion owes
-    /// the count `2`). §03 settles the direction — `sum(mask)` counts, so the fix
-    /// is to widen, not to refuse — but not the layer: inference types that call
-    /// `booleans`, so the emitted `tensor<i1>` result type would have to change
-    /// with it, and `reduce_axis` is infallible under five `-> Value` entry
-    /// points ([`Emitter::reduce_sum`], [`Emitter::reduce_max`],
-    /// [`Emitter::reduce_min`], [`Emitter::reduce_sum_last_axis`],
-    /// [`Emitter::diag`]) over three call sites. Left for a follow-up that owns
-    /// both crates rather than half-fixed here.
+    /// NOTE: both routes to a §07 reduction now WIDEN a boolean operand, and
+    /// differ only in the kind they widen to. This one is reached from
+    /// `crate::aggregate::reduce`, which widens the frame to the AGGREGATE
+    /// node's inferred kind — `Real` whenever the body's own type is
+    /// `%deferred`, which an axis-indexed body always is — so the arms above
+    /// stay dead. [`Emitter::reduce_axis`] widens to `Int`, because
+    /// `infer::ops::reduced_scalar` types `sum(bool_array)` as `integers` per
+    /// §03's promotion. Both count correctly, so neither answers parity, but one
+    /// §07 reduction over one boolean array does have two result types depending
+    /// on the spelling: `sum(mask)` returns `tensor<i32>` and
+    /// `aggregate(sum, [], mask[.i])` returns `tensor<f32>`. §03's derivation
+    /// says `integers` is the answer, so the divergence is the aggregate rule's
+    /// `unwrap_or(Real)` fallback in `infer`, not this method — recorded in
+    /// `flatppl-dev/TODO-flatppl-rust.md` for the next aggregate wave.
     pub(crate) fn reduce_trailing_axes(
         &mut self,
         id: NodeId,
