@@ -14,7 +14,7 @@
 
 use std::collections::HashSet;
 
-use flatppl_core::{BindingId, Node, Ref, RefNs};
+use flatppl_core::{BindingId, CallHead, Inputs, Node, Ref, RefNs};
 
 use crate::capabilities::resolve_ref_def;
 use crate::db::{Catalogues, FileSet, SourceFile};
@@ -30,12 +30,38 @@ pub struct NameLoc {
     pub end: u32,
 }
 
-/// The binding a rename or a references request is about.
-struct Target {
+/// What a rename or a references request is about.
+enum Target {
+    /// A module binding, possibly defined in another file of the bundle.
+    Binding(BindingTarget),
+    /// A function/kernel argument name. §04 "Objects, expressions, names and
+    /// modules" keeps argument names out of the module namespace, and §04
+    /// "Placeholders and holes" scopes a placeholder to "the nearest enclosing
+    /// `functionof` or `kernelof`", so the rename is confined to one binding's
+    /// RHS in one file — never cross-file.
+    Argument(ArgumentTarget),
+}
+
+/// A module binding target.
+struct BindingTarget {
     /// The file that defines the binding — not necessarily the requesting file.
     file: SourceFile,
     bid: BindingId,
     name: String,
+}
+
+/// A callable-argument target, in the file the request came from.
+struct ArgumentTarget {
+    file: SourceFile,
+    /// The binding whose RHS reifies the callable that declares this argument.
+    bid: BindingId,
+    /// The surface argument name, e.g. `a`.
+    name: String,
+    /// The lowered placeholder the body references, e.g. `_a_`.
+    placeholder: String,
+    /// Every declared argument name of the same callable, for the
+    /// distinctness check.
+    siblings: Vec<String>,
 }
 
 /// Resolve what the cursor at `byte_offset` designates, or refuse with the
@@ -79,11 +105,16 @@ fn resolve_target(
             continue;
         };
         if start <= byte_offset && byte_offset < end {
-            return Ok(Target {
+            return Ok(Target::Binding(BindingTarget {
                 file,
                 bid,
                 name: name.to_string(),
-            });
+            }));
+        }
+        // An argument declaration site: the cursor is inside the callable's
+        // argument list, which carries no node of its own.
+        if let Some(t) = argument_target_at(module, text, file, bid, byte_offset, None) {
+            return Ok(t);
         }
     }
 
@@ -93,16 +124,40 @@ fn resolve_target(
     };
     let span = module.span_of(node_id).ok_or_else(unresolved)?;
     match r.ns {
-        // §04 "Objects, expressions, names and modules": the "argument names of
-        // functions and kernels" are not part of the module namespace. A `%local`
-        // placeholder is scoped to its reification, so renaming one is a
-        // different operation from renaming a binding; it is not supported.
-        RefNs::Local => Err(Refusal(
-            "`_`-scoped placeholders (function and kernel argument names) are local \
-             to their callable, not module bindings (spec §04 \"Objects, expressions, \
-             names and modules\"), and are not renameable"
-                .to_string(),
-        )),
+        // A function/kernel argument. §04 keeps argument names out of the module
+        // namespace, so this is not a binding rename — but nothing in the docs
+        // forbids renaming one, so it is supported as its own scoped operation.
+        RefNs::Local => {
+            let placeholder = module.resolve(r.name).to_string();
+            // Find the binding whose RHS reifies the callable declaring it.
+            let owner = module
+                .bindings()
+                .filter(|(_, b)| {
+                    module
+                        .span_of(b.rhs)
+                        .is_some_and(|s| s.start <= span.start && span.end <= s.end)
+                })
+                .min_by_key(|(_, b)| {
+                    let s = module.span_of(b.rhs).expect("filtered to spanned RHS");
+                    s.end - s.start
+                });
+            let (bid, _) = owner.ok_or_else(|| {
+                Refusal(format!(
+                    "could not find the callable that declares `{placeholder}`"
+                ))
+            })?;
+            argument_target_at(module, text, file, bid, byte_offset, Some(&placeholder)).ok_or_else(
+                || {
+                    Refusal(format!(
+                        "`{placeholder}` is a placeholder whose declaration site has no \
+                         recorded span: an explicit `functionof`/`kernelof` boundary \
+                         declares it as a keyword argument, which the IR stores without \
+                         a source span, so the rename cannot be applied safely. Renaming \
+                         the argument of a `f(a) = …` definition or a lambda is supported."
+                    ))
+                },
+            )
+        }
         RefNs::Module(alias) => {
             // The node spans `alias.member`. When the cursor is on the alias half
             // the target is the alias binding in this file; the member half
@@ -119,11 +174,11 @@ fn resolve_target(
                     .ok_or_else(unresolved)?;
                 let def_mod = parse(db, def_file).module(db).ok_or_else(unresolved)?;
                 let name = def_mod.resolve(def_mod.binding(bid).name).to_string();
-                return Ok(Target {
+                return Ok(Target::Binding(BindingTarget {
                     file: def_file,
                     bid,
                     name,
-                });
+                }));
             }
             // A `standard_module` member has no workspace file to edit, so
             // `resolve_ref_def` finds nothing and the rename refuses.
@@ -138,24 +193,95 @@ fn resolve_target(
                 })?;
             let def_mod = parse(db, def_file).module(db).ok_or_else(unresolved)?;
             let name = def_mod.resolve(def_mod.binding(bid).name).to_string();
-            Ok(Target {
+            Ok(Target::Binding(BindingTarget {
                 file: def_file,
                 bid,
                 name,
-            })
+            }))
         }
         RefNs::SelfMod => {
             let (def_file, bid) =
                 resolve_ref_def(db, file, fs, cats, module, r).ok_or_else(unresolved)?;
             let def_mod = parse(db, def_file).module(db).ok_or_else(unresolved)?;
             let name = def_mod.resolve(def_mod.binding(bid).name).to_string();
-            Ok(Target {
+            Ok(Target::Binding(BindingTarget {
                 file: def_file,
                 bid,
                 name,
-            })
+            }))
         }
     }
+}
+
+/// Build an [`ArgumentTarget`] for the callable reified by binding `bid`.
+///
+/// Selects the argument either by `placeholder` (when the cursor was on a body
+/// reference) or by the cursor falling inside a declared argument's range (when it
+/// was on the declaration list). Returns `None` when `bid`'s RHS is not a
+/// reification with an ordered boundary, when the declaration list cannot be
+/// located in the source, or when the requested argument is not among the
+/// declared ones — every one a reason to fail closed rather than edit.
+fn argument_target_at(
+    module: &flatppl_core::Module,
+    text: &str,
+    file: SourceFile,
+    bid: BindingId,
+    byte_offset: u32,
+    placeholder: Option<&str>,
+) -> Option<Target> {
+    let binding = module.binding(bid);
+    let Node::Call(call) = module.node(binding.rhs) else {
+        return None;
+    };
+    let CallHead::Builtin(head) = call.head else {
+        return None;
+    };
+    let head_name = module.resolve(head);
+    if head_name != "functionof" && head_name != "kernelof" {
+        return None;
+    }
+    // `%autoinputs` has no ordered surface argument list to rename.
+    let Inputs::Spec(entries) = call.inputs.as_ref()? else {
+        return None;
+    };
+    let reif_span = module.span_of(binding.rhs)?;
+    let def_name = names::def_name_range(text, reif_span.start, module.resolve(binding.name));
+    let declared = names::argument_decl_ranges(text, reif_span.start, def_name);
+    if declared.is_empty() {
+        return None;
+    }
+    let siblings: Vec<String> = declared.iter().map(|(n, _, _)| n.clone()).collect();
+
+    // The surface name we are after.
+    let name = match placeholder {
+        // A body reference: invert the parser's `_{name}_` lowering. The explicit
+        // boundary spelling (where the body writes `_mu_` itself) does not invert,
+        // and its declaration is an unspanned keyword argument, so it yields None.
+        Some(ph) => {
+            let surface = names::placeholder_surface_name(ph)?;
+            if !siblings.iter().any(|s| s == surface) {
+                return None;
+            }
+            surface.to_string()
+        }
+        // A declaration site: the argument whose range contains the cursor.
+        None => declared
+            .iter()
+            .find(|(_, s, e)| *s <= byte_offset && byte_offset < *e)
+            .map(|(n, _, _)| n.clone())?,
+    };
+    // The boundary must actually declare it, so a source list that disagrees with
+    // the IR (a shape this code does not model) fails closed.
+    let entry = entries
+        .iter()
+        .find(|(sym, _)| module.resolve(*sym) == name)?;
+    Some(Target::Argument(ArgumentTarget {
+        file,
+        bid,
+        placeholder: module.resolve(entry.1.name).to_string(),
+        name,
+        siblings,
+    }))
 }
 
 /// Every occurrence of the target binding's name across the bundle: each `Ref`
@@ -176,6 +302,91 @@ fn occurrences(
     fs: FileSet,
     cats: Catalogues,
     target: &Target,
+    include_declaration: bool,
+) -> Vec<NameLoc> {
+    match target {
+        Target::Binding(t) => binding_occurrences(db, fs, cats, t, include_declaration),
+        Target::Argument(t) => argument_occurrences(db, t, include_declaration),
+    }
+}
+
+/// Every occurrence of an argument name: each `%local` reference to its
+/// placeholder inside the owning binding's RHS, plus the declaration site in the
+/// argument list.
+///
+/// Confined to one binding in one file. §04 "Placeholders and holes" gives the
+/// scoping rule — "The scope of a placeholder is the nearest enclosing
+/// `functionof` or `kernelof`" — and adds that "The same placeholder name may
+/// appear in different scopes without conflict", so the containment test below is
+/// what keeps a same-named argument of a *different* callable out of the set.
+fn argument_occurrences(
+    db: &dyn salsa::Database,
+    target: &ArgumentTarget,
+    include_declaration: bool,
+) -> Vec<NameLoc> {
+    use flatppl_core::Idx;
+    let Some(module) = parse(db, target.file).module(db) else {
+        return Vec::new();
+    };
+    let text = target.file.text(db);
+    let path = target.file.path(db).clone();
+    let binding = module.binding(target.bid);
+    let Some(rhs_span) = module.span_of(binding.rhs) else {
+        return Vec::new();
+    };
+
+    let mut out: Vec<NameLoc> = Vec::new();
+    let mut seen: HashSet<NameLoc> = HashSet::new();
+    let mut push = |start: u32, end: u32| {
+        let loc = NameLoc {
+            path: path.clone(),
+            start,
+            end,
+        };
+        if seen.insert(loc.clone()) {
+            out.push(loc);
+        }
+    };
+
+    for i in 0..module.node_count() {
+        let id = flatppl_core::NodeId::from_usize(i);
+        let Node::Ref(r) = module.node(id) else {
+            continue;
+        };
+        if !matches!(r.ns, RefNs::Local) || module.resolve(r.name) != target.placeholder {
+            continue;
+        }
+        let Some(span) = module.span_of(id) else {
+            continue;
+        };
+        // Only references inside the owning reification's RHS.
+        if span.start < rhs_span.start || span.end > rhs_span.end {
+            continue;
+        }
+        // The body writes the SURFACE name for a sugar argument, so the range must
+        // match that, not the placeholder. A mismatch fails closed.
+        if let Some((s, e)) = names::ref_name_range(text, span.start, RefPart::Head, &target.name) {
+            push(s, e);
+        }
+    }
+
+    if include_declaration {
+        let def_name = names::def_name_range(text, rhs_span.start, module.resolve(binding.name));
+        for (n, s, e) in names::argument_decl_ranges(text, rhs_span.start, def_name) {
+            if n == target.name {
+                push(s, e);
+            }
+        }
+    }
+    out
+}
+
+/// Every occurrence of a module binding's name across the bundle.
+fn binding_occurrences(
+    db: &dyn salsa::Database,
+    fs: FileSet,
+    cats: Catalogues,
+    target: &BindingTarget,
     include_declaration: bool,
 ) -> Vec<NameLoc> {
     use flatppl_core::Idx;
@@ -263,8 +474,9 @@ pub fn references(
 /// `textDocument/prepareRename`, or the refusal to report.
 ///
 /// A `None`/error result tells the client the position cannot be renamed, which
-/// is how a built-in, a standard-module member, a record field and a `%local`
-/// placeholder are all declined before the user types a new name.
+/// is how a built-in, a standard-module member and a record field are declined
+/// before the user types a new name. A function/kernel argument IS renameable and
+/// returns its range here.
 pub fn prepare_rename(
     db: &dyn salsa::Database,
     file: SourceFile,
@@ -294,23 +506,37 @@ pub fn prepare_rename(
 ///   record fields likewise: §04 "Objects, expressions, names and modules" states
 ///   that "Record field names and table column names are local to their object
 ///   and not part of the global module namespace". Reported by [`resolve_target`].
-/// - **Illegal new name.** §04 "Binding names" and §05 "Note on reserved words",
-///   enforced by [`names::check_new_name`].
-/// - **Collision.** §04 "Objects, expressions, names and modules": "A FlatPPL
-///   **module** is an unordered set of bindings of names to expressions." A second
-///   binding of the same name in one module is not such a set, so a rename onto an
-///   existing name in the defining module refuses.
-/// - **Public → private with a cross-module reference.** §04 "Binding names":
-///   public names "form the interface of a FlatPPL module", while private ones
-///   "are not part of the module's public interface". §04 "Module composition"
-///   gives the loading module access to "names in the loaded module" — i.e. to
-///   that interface. Prefixing an underscore therefore removes a name another
-///   file still reaches through `alias.name`, so the rename refuses instead of
-///   writing a bundle that no longer resolves.
+/// - **Illegal new name.** For a module binding, §04 "Binding names" and §05
+///   "Note on reserved words" via [`names::check_new_name`]. For an argument, the
+///   looser §05 `Name` production via [`names::check_new_argument_name`] — §04's
+///   binding regexes do NOT govern argument names, so an argument may take a shape
+///   a binding may not.
+/// - **Collision with an existing binding.** §04 "Objects, expressions, names and
+///   modules": "A FlatPPL **module** is an unordered set of bindings of names to
+///   expressions." A second binding of the same name in one module is not such a
+///   set, so a rename onto an existing name in the defining module refuses.
+/// - **Duplicate argument name.** §04 "Reification to functions and kernels":
+///   "Boundary input names must be distinct — a repeated name is a static error,
+///   which likewise forbids a lambda or named function from repeating an argument
+///   name." Nothing else catches this: `infer` currently accepts `f(a, a) = …`
+///   without a diagnostic (measured), so allowing the rename would silently
+///   produce the static error the spec names.
 ///
-/// Shadowing a built-in is deliberately NOT refused: §04 "Name resolution" says
-/// "This makes built-in names shadowable: a module may bind any name except for
-/// `self` and `base`."
+/// Deliberately NOT refused, because no rule forbids them:
+///
+/// - **Shadowing a built-in with a binding.** §04 "Name resolution": "This makes
+///   built-in names shadowable: a module may bind any name except for `self` and
+///   `base`."
+/// - **An argument shadowing a module binding or built-in.** §05 "Lambda syntax":
+///   "the argument names refer to the lambda's inputs and shadow any module-level
+///   binding of the same name."
+/// - **Making a cross-module-referenced name private.** The spec is silent on the
+///   mechanism for `module._private` (§04 "Binding names" says only that private
+///   bindings "are not part of the module's public interface"), and `infer`
+///   already reports the consequence precisely — "`_s` is private to
+///   `d.flatppl`" — at the offending reference. So the rename is performed and the
+///   existing diagnostic flags the result, rather than the server blocking a
+///   legitimate "make this private, then fix the callers" edit.
 pub fn rename_edits(
     db: &dyn salsa::Database,
     file: SourceFile,
@@ -321,46 +547,53 @@ pub fn rename_edits(
     new_name: &str,
 ) -> Result<Vec<NameLoc>, Refusal> {
     let target = resolve_target(db, file, fs, cats, byte_offset, index)?;
-    names::check_new_name(new_name)?;
-    if new_name == target.name {
-        return Ok(Vec::new());
-    }
-
-    let def_mod = parse(db, target.file).module(db).ok_or_else(|| {
-        Refusal("the defining file does not parse, so it cannot be edited".to_string())
-    })?;
-    if def_mod
-        .bindings()
-        .any(|(bid, b)| bid != target.bid && def_mod.resolve(b.name) == new_name)
-    {
-        return Err(Refusal(format!(
-            "`{new_name}` is already bound in {}; a module is a set of bindings of \
-             names to expressions (spec §04), so the name cannot be bound twice",
-            target.file.path(db)
-        )));
+    match &target {
+        Target::Binding(t) => {
+            names::check_new_name(new_name)?;
+            if new_name == t.name {
+                return Ok(Vec::new());
+            }
+            let def_mod = parse(db, t.file).module(db).ok_or_else(|| {
+                Refusal("the defining file does not parse, so it cannot be edited".to_string())
+            })?;
+            if def_mod
+                .bindings()
+                .any(|(bid, b)| bid != t.bid && def_mod.resolve(b.name) == new_name)
+            {
+                return Err(Refusal(format!(
+                    "`{new_name}` is already bound in {}; a module is a set of bindings of \
+                     names to expressions (spec §04), so the name cannot be bound twice",
+                    t.file.path(db)
+                )));
+            }
+        }
+        Target::Argument(t) => {
+            names::check_new_argument_name(new_name)?;
+            if new_name == t.name {
+                return Ok(Vec::new());
+            }
+            if t.siblings.iter().any(|s| s == new_name) {
+                return Err(Refusal(format!(
+                    "`{new_name}` is already an argument of this callable; spec §04 \
+                     \"Reification to functions and kernels\" requires that \"Boundary \
+                     input names must be distinct — a repeated name is a static error\""
+                )));
+            }
+        }
     }
 
     let locs = occurrences(db, fs, cats, &target, true);
 
-    if names::is_private(new_name) && !names::is_private(&target.name) {
-        let def_path = target.file.path(db).clone();
-        if let Some(other) = locs.iter().find(|l| l.path != def_path) {
-            return Err(Refusal(format!(
-                "`{}` is referenced from {} across a module boundary; making it \
-                 private (spec §04 \"Binding names\") would drop it from this \
-                 module's public interface and leave that reference unresolvable",
-                target.name, other.path
-            )));
-        }
-    }
-
     // A definition site we could not locate textually means the rewrite would be
-    // partial. Refuse rather than emit a broken edit.
-    if !locs.iter().any(|l| l.path == *target.file.path(db)) {
+    // partial. This is a fail-closed implementation guard, not a doctrine refusal:
+    // no rule forbids the rename, we simply cannot compute a correct edit for it.
+    let (def_path, name) = match &target {
+        Target::Binding(t) => (t.file.path(db).clone(), &t.name),
+        Target::Argument(t) => (t.file.path(db).clone(), &t.name),
+    };
+    if !locs.iter().any(|l| l.path == def_path) {
         return Err(Refusal(format!(
-            "could not locate the definition of `{}` in {}",
-            target.name,
-            target.file.path(db)
+            "could not locate the declaration of `{name}` in {def_path}"
         )));
     }
 
@@ -612,19 +845,28 @@ mod tests {
         );
     }
 
+    /// A function argument IS renameable. Nothing in the docs forbids it — §04
+    /// only says argument names live outside the module namespace — so
+    /// prepareRename must return a range rather than declining the category.
     #[test]
-    fn prepare_rename_refuses_a_function_parameter() {
-        // §04: argument names of functions and kernels are local to the callable.
+    fn prepare_rename_allows_a_function_argument() {
         let src = "f(a) = add(a, 1)";
         let (db, f, fs, cats) = single_file(src);
         let index = node_span_index(&db, f, fs, cats);
         let off = nth_offset(src, "add(a", 0) + 4;
-        let err = prepare_rename(&db, f, fs, cats, off, &index).expect_err("parameter must refuse");
-        assert!(
-            err.0.contains("placeholder"),
-            "refusal must cite the placeholder rule; got {}",
-            err.0
-        );
+        let range = prepare_rename(&db, f, fs, cats, off, &index)
+            .expect("a function argument is renameable");
+        assert_eq!(&src[range.0 as usize..range.1 as usize], "a");
+    }
+
+    #[test]
+    fn prepare_rename_allows_an_argument_declaration_site() {
+        // Offset 2 is the `a` inside `f(a)`, which carries no node of its own.
+        let src = "f(a) = add(a, 1)";
+        let (db, f, fs, cats) = single_file(src);
+        let index = node_span_index(&db, f, fs, cats);
+        let range = prepare_rename(&db, f, fs, cats, 2, &index).expect("declaration renameable");
+        assert_eq!(range, (2, 3));
     }
 
     #[test]
@@ -756,21 +998,61 @@ mod tests {
         assert_eq!(apply(src, &locs, "sqrt"), "sqrt = 1\ny = add(sqrt, 2)");
     }
 
+    /// Making a cross-module-referenced name private is PERFORMED, not refused.
+    ///
+    /// The spec is silent on the mechanism for `module._private`, and `infer`
+    /// already reports the consequence precisely at the offending reference (see
+    /// `cross_module_private_access_is_already_diagnosed`), so blocking the edit
+    /// would only deny a legitimate "make this private, then fix the callers"
+    /// workflow. The rename also rewrites the cross-module reference, so the bundle
+    /// stays internally consistent and the diagnostic lands on the visibility, not
+    /// on a dangling name.
     #[test]
-    fn rename_public_to_private_refuses_when_referenced_across_a_module_boundary() {
+    fn rename_public_to_private_is_performed_not_refused() {
         let db = Database::default();
-        let helpers = SourceFile::new(&db, "helpers.flatppl".to_string(), "s = 1.0".to_string());
+        let helpers_src = "s = 1.0";
+        let helpers = SourceFile::new(&db, "helpers.flatppl".to_string(), helpers_src.to_string());
         let model_src = "h = load_module(\"helpers.flatppl\")\nv = h.s";
         let model = SourceFile::new(&db, "model.flatppl".to_string(), model_src.to_string());
         let fs = FileSet::new(&db, vec![helpers, model]);
         let cats = Catalogues::new(&db, vec![]);
         let index = node_span_index(&db, helpers, fs, cats);
-        let err = rename_edits(&db, helpers, fs, cats, 0, &index, "_s")
-            .expect_err("public → private with a cross-module reference must refuse");
+        let locs = rename_edits(&db, helpers, fs, cats, 0, &index, "_s")
+            .expect("no rule forbids making a binding private");
+        let pick =
+            |p: &str| -> Vec<NameLoc> { locs.iter().filter(|l| l.path == p).cloned().collect() };
+        assert_eq!(
+            apply(helpers_src, &pick("helpers.flatppl"), "_s"),
+            "_s = 1.0"
+        );
+        assert_eq!(
+            apply(model_src, &pick("model.flatppl"), "_s"),
+            "h = load_module(\"helpers.flatppl\")\nv = h._s",
+            "the cross-module reference is rewritten too"
+        );
+    }
+
+    /// The measured basis for the decision above: `infer` already flags
+    /// cross-module access to a private binding, so allowing that rename does not
+    /// hide an error. If this ever fails, the rename should refuse instead of
+    /// relying on the diagnostic.
+    #[test]
+    fn cross_module_private_access_is_already_diagnosed() {
+        let db = Database::default();
+        let helpers = SourceFile::new(&db, "helpers.flatppl".to_string(), "_s = 1.0".to_string());
+        let model = SourceFile::new(
+            &db,
+            "model.flatppl".to_string(),
+            "h = load_module(\"helpers.flatppl\")\nv = h._s".to_string(),
+        );
+        let fs = FileSet::new(&db, vec![helpers, model]);
+        let cats = Catalogues::new(&db, vec![]);
+        let diags = crate::capabilities::diagnostics(&db, model, fs, cats);
         assert!(
-            err.0.contains("private") && err.0.contains("model.flatppl"),
-            "refusal must name the rule and the referring file; got {}",
-            err.0
+            diags.iter().any(|d| d.message.contains("is private to")
+                && d.severity == Some(lsp_types::DiagnosticSeverity::ERROR)),
+            "infer must flag `h._s` as private; got {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
     }
 
@@ -792,6 +1074,150 @@ mod tests {
         let locs =
             rename_edits(&db, f, fs, cats, 0, &index, "s").expect("widening visibility is legal");
         assert_eq!(apply(src, &locs, "s"), "s = 1.0\nu = add(s, 1.0)");
+    }
+
+    // ── argument (%local) rename ──────────────────────────────────────────────
+
+    #[test]
+    fn references_on_an_argument_cover_the_declaration_and_body_uses() {
+        let src = "f(a, b) = add(mul(a, a), b)";
+        let (db, f, fs, cats) = single_file(src);
+        let index = node_span_index(&db, f, fs, cats);
+        let locs = references(&db, f, fs, cats, 2, &index, true);
+        assert_eq!(locs.len(), 3, "declaration + two body uses; got {locs:?}");
+        for l in &locs {
+            assert_eq!(&src[l.start as usize..l.end as usize], "a");
+        }
+    }
+
+    #[test]
+    fn rename_a_named_function_argument() {
+        let src = "f(a, b) = add(mul(a, a), b)";
+        let (db, f, fs, cats) = single_file(src);
+        let index = node_span_index(&db, f, fs, cats);
+        let locs = rename_edits(&db, f, fs, cats, 2, &index, "scale").expect("allowed");
+        assert_eq!(
+            apply(src, &locs, "scale"),
+            "f(scale, b) = add(mul(scale, scale), b)"
+        );
+    }
+
+    #[test]
+    fn rename_a_lambda_argument() {
+        // §05 "Lambda syntax": `(a, b) -> expr`. The reification span starts at the
+        // argument list rather than after a binding name.
+        let src = "g = (a, b) -> add(a, b)";
+        let (db, f, fs, cats) = single_file(src);
+        let index = node_span_index(&db, f, fs, cats);
+        let off = nth_offset(src, "(a, b)", 0) + 1;
+        let locs = rename_edits(&db, f, fs, cats, off, &index, "x").expect("allowed");
+        assert_eq!(apply(src, &locs, "x"), "g = (x, b) -> add(x, b)");
+    }
+
+    #[test]
+    fn rename_a_single_bare_lambda_argument() {
+        // §05: `arg -> expr` with no parentheses in the single-argument form.
+        let src = "s = a -> add(a, 1)";
+        let (db, f, fs, cats) = single_file(src);
+        let index = node_span_index(&db, f, fs, cats);
+        let locs = rename_edits(&db, f, fs, cats, 4, &index, "v").expect("allowed");
+        assert_eq!(apply(src, &locs, "v"), "s = v -> add(v, 1)");
+    }
+
+    /// §04 "Placeholders and holes": "The same placeholder name may appear in
+    /// different scopes without conflict." So renaming `a` in one callable must not
+    /// touch the `a` of another.
+    #[test]
+    fn rename_an_argument_leaves_a_same_named_argument_of_another_callable_alone() {
+        let src = "f(a) = add(a, 1)\ng(a) = mul(a, 2)";
+        let (db, f, fs, cats) = single_file(src);
+        let index = node_span_index(&db, f, fs, cats);
+        let locs = rename_edits(&db, f, fs, cats, 2, &index, "z").expect("allowed");
+        assert_eq!(apply(src, &locs, "z"), "f(z) = add(z, 1)\ng(a) = mul(a, 2)");
+    }
+
+    /// §04 "Reification to functions and kernels": "Boundary input names must be
+    /// distinct — a repeated name is a static error, which likewise forbids a
+    /// lambda or named function from repeating an argument name." Nothing else
+    /// catches it (see `duplicate_argument_name_is_not_diagnosed`), so the rename
+    /// must refuse.
+    #[test]
+    fn rename_an_argument_onto_a_sibling_refuses() {
+        let src = "f(a, b) = add(a, b)";
+        let (db, f, fs, cats) = single_file(src);
+        let index = node_span_index(&db, f, fs, cats);
+        let err = rename_edits(&db, f, fs, cats, 2, &index, "b")
+            .expect_err("a repeated argument name is a §04 static error");
+        assert!(
+            err.0.contains("must be distinct"),
+            "refusal must quote the distinctness rule; got {}",
+            err.0
+        );
+    }
+
+    /// The measured basis for the refusal above: `infer` does NOT flag a duplicate
+    /// argument name, so "allow it and let diagnostics catch it" is unavailable
+    /// here. If this starts failing, the engine gained the check and the refusal
+    /// could be reconsidered.
+    #[test]
+    fn duplicate_argument_name_is_not_diagnosed() {
+        let mut m = flatppl_syntax::parse("f(a, a) = add(a, a)").expect("parses today");
+        let diags = flatppl_infer::infer_with(&mut m, flatppl_infer::Level::Shape);
+        assert!(
+            diags.is_empty(),
+            "if the engine now flags `f(a, a)`, revisit the rename refusal; got {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// An argument is governed by §05's plain `Name`, not §04's binding regexes, so
+    /// a `__`-prefixed argument name — illegal for a module binding — is allowed
+    /// here, as is shadowing a built-in (§05 "Lambda syntax").
+    #[test]
+    fn rename_an_argument_allows_shapes_a_binding_may_not_take() {
+        let src = "f(a) = add(a, 1)";
+        for candidate in ["__gen", "sqrt", "_priv"] {
+            let (db, f, fs, cats) = single_file(src);
+            let index = node_span_index(&db, f, fs, cats);
+            let locs = rename_edits(&db, f, fs, cats, 2, &index, candidate)
+                .unwrap_or_else(|e| panic!("`{candidate}` must be a legal argument name: {}", e.0));
+            assert_eq!(
+                apply(src, &locs, candidate),
+                format!("f({candidate}) = add({candidate}, 1)")
+            );
+        }
+    }
+
+    /// The parser rejects the `_name_` placeholder form as an argument name, so
+    /// accepting it would produce a file that no longer parses.
+    #[test]
+    fn rename_an_argument_to_the_placeholder_form_refuses() {
+        let src = "f(a) = add(a, 1)";
+        let (db, f, fs, cats) = single_file(src);
+        let index = node_span_index(&db, f, fs, cats);
+        let err = rename_edits(&db, f, fs, cats, 2, &index, "_x_")
+            .expect_err("the placeholder form is not a legal argument name");
+        assert!(err.0.contains("placeholder"), "got {}", err.0);
+        // Confirm the premise: the parser really does reject it.
+        assert!(flatppl_syntax::parse("f(_x_) = add(_x_, 1)").is_err());
+    }
+
+    /// An explicit `functionof`/`kernelof` boundary declares its argument as a
+    /// keyword argument, which the IR stores without a span. That is an
+    /// implementation limit, not a doctrine refusal, and the message says so.
+    #[test]
+    fn rename_an_explicit_boundary_argument_fails_closed() {
+        let src = "k = kernelof(Normal(_mu_, 1.0), mu = _mu_)";
+        let (db, f, fs, cats) = single_file(src);
+        let index = node_span_index(&db, f, fs, cats);
+        let off = nth_offset(src, "_mu_", 0);
+        let err = rename_edits(&db, f, fs, cats, off, &index, "nu")
+            .expect_err("no recorded span for the boundary keyword");
+        assert!(
+            err.0.contains("recorded span"),
+            "the message must state the implementation limit; got {}",
+            err.0
+        );
     }
 
     #[test]

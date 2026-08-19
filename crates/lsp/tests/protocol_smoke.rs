@@ -1096,6 +1096,11 @@ const RN_MODEL_SRC: &str = "h = load_module(\"rn_helpers.flatppl\")\nv = h.shift
 /// A buffer left mid-call, as it is when signature help actually fires.
 const RN_SIG_SRC: &str = "mu = 0.0\nx = Normal(mu, ";
 
+const RN_ARG_URI: &str = "file:///tmp/rn_arg.flatppl";
+
+/// A named function, for renaming one of its arguments.
+const RN_ARG_SRC: &str = "scale(v, k) = mul(v, k)";
+
 /// Protocol-level smoke coverage for `textDocument/references`,
 /// `textDocument/prepareRename`, `textDocument/rename` and
 /// `textDocument/signatureHelp`, driven over the wire on a two-file bundle.
@@ -1117,6 +1122,7 @@ fn references_rename_signature_smoke() {
     do_open_and_drain_diags(&client_conn, RN_HELPERS_URI, RN_HELPERS_SRC);
     do_open_and_drain_diags(&client_conn, RN_MODEL_URI, RN_MODEL_SRC);
     do_open_and_drain_diags(&client_conn, RN_SIG_URI, RN_SIG_SRC);
+    do_open_and_drain_diags(&client_conn, RN_ARG_URI, RN_ARG_SRC);
 
     /// The position of the `shifted` declaration in the helpers document.
     fn shifted_decl() -> lsp_types::TextDocumentPositionParams {
@@ -1219,15 +1225,16 @@ fn references_rename_signature_smoke() {
         );
     }
 
-    // ── textDocument/rename: a refusal reaches the client as an error ────────
+    // ── textDocument/rename: a CITED refusal reaches the client as an error ──
     //
-    // `_shifted` is private (spec §04 "Binding names"), and the model reaches
-    // `shifted` across the module boundary, so the rename must refuse rather
-    // than write a bundle that no longer resolves.
+    // `local` is already bound in the helpers document, and §04 "Objects,
+    // expressions, names and modules" makes a module "an unordered set of bindings
+    // of names to expressions", so binding one name twice refuses. This is the
+    // refusal shape a client must be able to surface.
     {
         let params = lsp_types::RenameParams {
             text_document_position: shifted_decl(),
-            new_name: "_shifted".to_string(),
+            new_name: "local".to_string(),
             work_done_progress_params: Default::default(),
         };
         let resp = round_trip(
@@ -1240,11 +1247,36 @@ fn references_rename_signature_smoke() {
         );
         let err = resp
             .error
-            .expect("public → private with a cross-module reference must refuse");
+            .expect("a collision with an existing binding must refuse");
         assert!(
-            err.message.contains("private"),
+            err.message.contains("already bound"),
             "the refusal must carry the reason; got {}",
             err.message
+        );
+    }
+
+    // Making the name private is NOT refused. The spec is silent on the mechanism
+    // for `module._private`, and `infer` already flags the consequence at the
+    // reference, so the server performs the edit rather than blocking a legitimate
+    // "make this private, then fix the callers" change.
+    {
+        let params = lsp_types::RenameParams {
+            text_document_position: shifted_decl(),
+            new_name: "_shifted".to_string(),
+            work_done_progress_params: Default::default(),
+        };
+        let resp = round_trip(
+            &client_conn,
+            Request {
+                id: RequestId::from(26i32),
+                method: Rename::METHOD.to_owned(),
+                params: serde_json::to_value(params).unwrap(),
+            },
+        );
+        assert!(
+            resp.error.is_none(),
+            "public → private must be performed, not refused; got {:?}",
+            resp.error
         );
     }
 
@@ -1342,6 +1374,77 @@ fn references_rename_signature_smoke() {
             Some(1),
             "the cursor is on the second argument"
         );
+    }
+
+    // ── textDocument/rename over a function ARGUMENT ─────────────────────────
+    //
+    // An argument name is renameable: §04 only places argument names outside the
+    // module namespace, and nothing in the docs forbids renaming one. The edit is
+    // confined to the one document that declares the callable.
+    {
+        // `scale(v, k) = mul(v, k)` — char 6 is the `v` in the argument list.
+        let pos = lsp_types::TextDocumentPositionParams {
+            text_document: lsp_types::TextDocumentIdentifier {
+                uri: Uri::from_str(RN_ARG_URI).unwrap(),
+            },
+            position: lsp_types::Position {
+                line: 0,
+                character: 6,
+            },
+        };
+        let prep = round_trip(
+            &client_conn,
+            Request {
+                id: RequestId::from(27i32),
+                method: PrepareRenameRequest::METHOD.to_owned(),
+                params: serde_json::to_value(pos.clone()).unwrap(),
+            },
+        );
+        let range: lsp_types::Range =
+            serde_json::from_value(prep.result.expect("prepareRename result"))
+                .expect("an argument must be renameable, not declined");
+        assert_eq!((range.start.character, range.end.character), (6, 7));
+
+        let params = lsp_types::RenameParams {
+            text_document_position: pos,
+            new_name: "value".to_string(),
+            work_done_progress_params: Default::default(),
+        };
+        let resp = round_trip(
+            &client_conn,
+            Request {
+                id: RequestId::from(28i32),
+                method: Rename::METHOD.to_owned(),
+                params: serde_json::to_value(params).unwrap(),
+            },
+        );
+        assert!(
+            resp.error.is_none(),
+            "renaming an argument must not error; got {:?}",
+            resp.error
+        );
+        let edit: lsp_types::WorkspaceEdit =
+            serde_json::from_value(resp.result.expect("rename result")).expect("WorkspaceEdit");
+        #[allow(clippy::mutable_key_type)] // lsp-types keys WorkspaceEdit by `Uri`
+        let changes = edit.changes.expect("changes keyed by document URI");
+        assert_eq!(
+            changes.len(),
+            1,
+            "an argument is scoped to its own callable, so only one document changes"
+        );
+        let edits = changes
+            .iter()
+            .find(|(u, _)| u.as_str() == RN_ARG_URI)
+            .map(|(_, e)| e.clone())
+            .expect("the declaring document is edited");
+        assert_eq!(
+            edits.len(),
+            2,
+            "the declaration in `scale(v, k)` and the body use in `mul(v, k)`"
+        );
+        for e in &edits {
+            assert_eq!(e.new_text, "value");
+        }
     }
 
     do_shutdown(&client_conn, 99);
