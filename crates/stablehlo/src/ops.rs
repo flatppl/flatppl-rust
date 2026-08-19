@@ -125,6 +125,14 @@ pub(crate) fn lower_builtin(
         "real" => lower_real(e, id, args),
         // §07 "Linear algebra" `transpose`/`adjoint`, domain "vectors, matrices".
         "transpose" | "adjoint" => lower_transpose(e, id, args, head),
+        // §07 "Array and table operations" `rowstack`/`colstack` (domain
+        // "vector of equal-length vectors") and `addaxes` (domain "array,
+        // non-negative integer, non-negative integer") — the shape
+        // constructors §03 "Arrays" names as the only way to turn a
+        // vector-of-vectors into a matrix.
+        "rowstack" => lower_stack(e, id, args, Stack::Rows),
+        "colstack" => lower_stack(e, id, args, Stack::Cols),
+        "addaxes" => lower_addaxes(e, id, args),
         "ifelse" => lower_ifelse(e, id, args),
         "inf" => lower_inf(e, id, args),
         "pi" => lower_pi(e, id, args),
@@ -501,6 +509,294 @@ fn lower_transpose(
             format!(
                 "`{head}` has no lowering for {other:?} — §07 \"Linear algebra\" gives it the \
                  domain \"vectors, matrices\", so a rank-3 or higher operand has no transpose"
+            ),
+        )),
+    }
+}
+
+/// Which matrix a §07 stack constructor builds out of its argument's vectors.
+#[derive(Clone, Copy)]
+enum Stack {
+    /// `rowstack(vs)` — "a matrix whose rows are the vectors in `vs`".
+    Rows,
+    /// `colstack(vs)` — "a matrix whose columns are the vectors in `vs`".
+    Cols,
+}
+
+/// Lower §07 "Array and table operations"'s `rowstack(vs)` / `colstack(vs)`,
+/// whose argument is "a vector of vectors, all of the same length".
+///
+/// **`rowstack` emits nothing**, and that is the substantive point. §03
+/// "Arrays" keeps a vector-of-vectors distinct from a matrix — "Vectors of
+/// vectors are not interpreted as matrices implicitly, but can be turned into
+/// matrices explicitly using `rowstack` or `colstack`" — but the distinction is
+/// type-level only here, exactly as a transposed vector's is in
+/// [`lower_transpose`]: `crate::types::mlir_type_of` FLATTENS a nested `Array`
+/// element chain into one tensor shape, so `vs` has already lowered to the
+/// `[n, m]` tensor whose row `i` is `vs[i]`. The outer axis leads in both
+/// producers — `Emitter::vector` concatenates along dim 0, and
+/// `types::flatten_elem` appends the inner dims after the outer for an ABI
+/// input — so §07's row order is already the one emitted and the operand's
+/// `Value` passes straight through. Emitting a rank-2 identity
+/// `stablehlo.transpose … dims = [0, 1]` would be pure noise.
+///
+/// **`colstack` is that matrix transposed**, one `stablehlo.transpose … dims =
+/// [1, 0]`. §07's own worked example is the check: `colstack([[1, 2, 3], [4, 5,
+/// 6]])` is the 3x2 matrix `[[1, 4], [2, 5], [3, 6]]`, which is `rowstack`'s
+/// 2x3 `[[1, 2, 3], [4, 5, 6]]` with its axes swapped.
+///
+/// A non-rank-2 operand refuses: rank 1 is a vector of SCALARS and rank 3 a
+/// vector of matrices, neither of which is §07's "vector of vectors". A RAGGED
+/// container refuses one level down, in [`lower_vector`] — inference types
+/// `[[1.0, 2.0], [3.0]]` as an array of `%any` rather than reporting it, so the
+/// emitter is the first layer to see it, and `lower_vector`'s
+/// identical-`MlirTy` check is where it is caught.
+///
+/// A MATRIX argument refuses too, and that check cannot be the one above: §03's
+/// "Vectors of vectors are not interpreted as matrices implicitly" has a converse
+/// — a matrix standing in for a vector of vectors is equally unsanctioned — but
+/// the two have the SAME lowered tensor, so only the inferred type can tell them
+/// apart ([`require_vector_container`]).
+///
+/// ORIENTATION: a container whose elements are uniformly TRANSPOSED vectors is
+/// accepted. This is a CHOICE, not a settled reading. §03 "Arrays" states the
+/// blanket it rests on — "The term vector will represent both non-transposed
+/// vectors (one-dimensional arrays) and transposed vectors in the following,
+/// unless noted otherwise" — and §07's entry names where the argument's vectors
+/// go (rows / columns), which fixes the result whatever their own orientation, so
+/// no number depends on the choice. But §03's array definition ("collections of
+/// scalar values (real, integer, boolean and complex values) or arrays") does not
+/// list transposed vectors, so an array OF transposed vectors is a value type the
+/// spec leaves unspecified rather than grants; `infer` types the enclosing
+/// `rowstack` `%deferred` rather than accepting it. Refusing, as `addaxes` does,
+/// would have been equally defensible; accepting keeps the blanket's plain
+/// reading, and `rowstack([transpose(v1), transpose(v2)])` emits the
+/// byte-identical module to the plain spelling. A container that MIXES the two
+/// refuses ([`require_uniform_orientation`]).
+fn lower_stack(
+    e: &mut Emitter,
+    id: NodeId,
+    args: &[NodeId],
+    kind: Stack,
+) -> Result<Value, EmitError> {
+    let head = match kind {
+        Stack::Rows => "rowstack",
+        Stack::Cols => "colstack",
+    };
+    let [vs_id] = args_exact(id, args)?;
+    require_vector_container(e, id, vs_id, head)?;
+    require_uniform_orientation(e, id, vs_id, head)?;
+    let vs = e.lower_node(vs_id)?;
+    if !matches!(&vs.ty, MlirTy::Ranked(dims) if dims.len() == 2) {
+        return Err(EmitError::at(
+            id,
+            format!(
+                "`{head}` has no lowering for {:?} — §07 \"Array and table operations\" gives it \
+                 the domain \"vector of equal-length vectors\", so the argument must lower to a \
+                 rank-2 tensor (a rank-1 operand is a vector of scalars, a rank-3 one a vector \
+                 of matrices)",
+                vs.ty
+            ),
+        ));
+    }
+    Ok(match kind {
+        Stack::Rows => vs,
+        Stack::Cols => e.transpose(&vs, &[1, 0]),
+    })
+}
+
+/// Refuse a `rowstack`/`colstack` argument that is a MATRIX (or any rank-2+
+/// array) rather than §07's "vector of equal-length vectors".
+///
+/// The rank-2 check in [`lower_stack`] is on the LOWERED tensor, which cannot see
+/// the difference: `types::mlir_type_of` flattens a nested element chain, so a
+/// `[2]`-of-`[2]` container and a `[2, 2]` matrix are both `tensor<2x2xf32>`. That
+/// is exactly what makes `rowstack` a no-op for a real container — and exactly
+/// what would make `rowstack(matrix)` a silent identity and `colstack(matrix)` a
+/// silent transpose of an operand §07 gives the constructor no meaning for. §03
+/// "Arrays" states the direction the spec does not sanction — "Vectors of vectors
+/// are not interpreted as matrices implicitly, but can be turned into matrices
+/// explicitly using `rowstack` or `colstack`" — and the converse is no more
+/// granted than the stated one.
+///
+/// Decided on the INFERRED type, the only layer that still distinguishes them,
+/// and `infer` independently agrees: `rowstack_type` (`crates/infer/src/ops.rs`)
+/// matches only a rank-1 array whose element is itself an array, so `rowstack(A)`
+/// on a matrix `A` is already `%deferred`.
+///
+/// Refuses ONLY a provably rank-2-or-higher `Array`. Everything else falls
+/// through to the checks that own it:
+/// - an outer `TVector` — a transposed container, rank-1, accepted (see
+///   [`lower_stack`]'s orientation note);
+/// - a rank-1 `Array` of scalars — [`lower_stack`]'s lowered-rank refusal;
+/// - a rank-1 `Array` of `%any` (what inference gives a RAGGED or
+///   MIXED-orientation container) — [`lower_vector`]'s ragged refusal or
+///   [`require_uniform_orientation`];
+/// - no inferred type, `%deferred`, `%any` (a freshly synthesized determiniser
+///   node) — the lowered-rank check, as before.
+fn require_vector_container(
+    e: &Emitter,
+    id: NodeId,
+    vs_id: NodeId,
+    head: &str,
+) -> Result<(), EmitError> {
+    // A use site reaches its binding through one `(%ref self x)` hop, and only
+    // the binding's rhs carries the inferred type in that case.
+    let ty = e
+        .type_of(vs_id)
+        .or_else(|| e.type_of(e.resolve_ref_one(vs_id)));
+    let Some(Type::Array { shape, .. }) = ty else {
+        return Ok(());
+    };
+    if shape.len() < 2 {
+        return Ok(());
+    }
+    Err(EmitError::at(
+        id,
+        format!(
+            "`{head}`'s argument is a rank-{} array, not a vector of vectors — §07 \"Array and \
+             table operations\" gives `{head}` the domain \"vector of equal-length vectors\", and \
+             §03 \"Arrays\" says vectors of vectors \"are not interpreted as matrices implicitly, \
+             but can be turned into matrices explicitly using `rowstack` or `colstack`\", so a \
+             matrix standing in for the container is not sanctioned either. The two have the same \
+             tensor form, so this would otherwise lower silently — an identity for `rowstack`, a \
+             transpose for `colstack`. A matrix is already stacked; pass the vectors themselves",
+            shape.len()
+        ),
+    ))
+}
+
+/// Refuse a `rowstack`/`colstack` container that MIXES orientations — one
+/// element a rank-1 `Array` (a column), another a `TVector` (a row).
+///
+/// §03 "Arrays" makes an array's elements one type ("fixed-size, ordered,
+/// n-dimensional collections of scalar values … or arrays"), and a transposed
+/// vector is a distinct type from a one-dimensional array, so a mixed container
+/// is not a well-typed FlatPPL array at all. Inference agrees without saying so:
+/// it types `[v1, transpose(v2)]` as an array of `%any` and the enclosing
+/// `rowstack` `%deferred`, so nothing upstream reports it — and both elements
+/// lower to the same `tensor<nxf32>`, so [`lower_vector`]'s identical-`MlirTy`
+/// check accepts the pair and the stack would lower silently. Same
+/// accepts-invalid trap as [`require_same_orientation`]'s, and closed the same
+/// way: on the INFERRED types, which is the only layer that can still tell a row
+/// from a column.
+///
+/// Only a literal `vector(...)` container is inspected — that is the one shape
+/// whose per-element types are visible here. A container reached any other way
+/// (an ABI input, a `partition` result) has a single element type by
+/// construction and cannot mix.
+fn require_uniform_orientation(
+    e: &Emitter,
+    id: NodeId,
+    vs_id: NodeId,
+    head: &str,
+) -> Result<(), EmitError> {
+    let vs_id = e.resolve_ref_one(vs_id);
+    let Node::Call(c) = e.node(vs_id) else {
+        return Ok(());
+    };
+    if !matches!(c.head, CallHead::Builtin(sym) if e.resolve(sym) == "vector") {
+        return Ok(());
+    }
+    let (mut saw_column, mut saw_row) = (false, false);
+    for &el in c.args.iter() {
+        match arith_shape(e, el) {
+            ArithShape::Array(_) => saw_column = true,
+            ArithShape::TVector(_) => saw_row = true,
+            _ => {}
+        }
+    }
+    if saw_column && saw_row {
+        return Err(EmitError::at(
+            id,
+            format!(
+                "`{head}`'s argument mixes vector orientations — a one-dimensional array \
+                 (column) and a transposed vector (row) in one container. §03 \"Arrays\" gives \
+                 an array a single element type and makes a transposed vector a distinct type \
+                 from a one-dimensional array, so this is not a well-typed vector of vectors \
+                 even though both lower to the same `tensor<nxf32>`. Transpose the odd element \
+                 to match"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Lower §07 "Array and table operations"'s `addaxes(A, n_leading,
+/// n_trailing)`, which "reshapes array `A` by adding `n_leading` singular
+/// (size-one) axes before the axes of `A` and `n_trailing` singular axes after
+/// them" — one `stablehlo.reshape`, since the element count is unchanged. §07's
+/// own worked case is the check: `A` of size `(3, 4, 5)` with `addaxes(A, 2, 3)`
+/// gives `(1, 1, 3, 4, 5, 1, 1, 1)`.
+///
+/// `addaxes(A, 0, 0)` emits nothing — the identity reshape would be noise.
+///
+/// The counts are read as LITERALS, not off the node's own inferred shape: §07
+/// requires them to be "non-negative fixed integers", and a fixed expression is
+/// already folded by the time the emitter runs (`addaxes(v, 1 + 1, 0)`
+/// determinizes to `addaxes(v, 2, 0)`), so the literal path is both the exact
+/// spec rule and self-contained — it does not depend on inference having
+/// resolved the result shape, and it cannot silently disagree with it.
+///
+/// Refuses a TRANSPOSED-vector `A`: §07's domain column for this entry is
+/// "array", not "vector", so §03's "the term vector will represent both …"
+/// blanket does not widen it — and here the widening would change the answer
+/// rather than merely permit a spelling. A row's tensor form is `[n]`, not
+/// `[1, n]` (`crate::types::mlir_type_of` maps a `TVector{n}` and a rank-1
+/// `Array[n]` to the same `tensor<nxf32>`), so `addaxes(transpose(v), 0, 1)`
+/// would emit `[n, 1]` — a COLUMN — while the operand already reads as a row.
+///
+/// Refuses a dynamically-shaped or non-ranked `A` too, as [`lower_fill`] does
+/// and for the same reason: `stablehlo.reshape`'s result shape is static text.
+fn lower_addaxes(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
+    let [a_id, nl_id, nt_id] = args_exact(id, args)?;
+    let n_leading = axis_count(e, id, nl_id, "n_leading")?;
+    let n_trailing = axis_count(e, id, nt_id, "n_trailing")?;
+    if matches!(e.type_of(a_id), Some(Type::TVector { .. })) {
+        return Err(EmitError::at(
+            id,
+            "addaxes: `A` is a transposed vector — §07 \"Array and table operations\" gives \
+             `addaxes` the domain \"array, non-negative integer, non-negative integer\", and a \
+             row's tensor form is `[n]`, so adding a trailing axis would produce a column \
+             `[n, 1]` rather than the row the operand already reads as. Transpose it first",
+        ));
+    }
+    let a = e.lower_node(a_id)?;
+    let dims = match &a.ty {
+        MlirTy::Ranked(dims) if dims.iter().all(Option::is_some) => dims.clone(),
+        other => {
+            return Err(EmitError::at(
+                id,
+                format!("addaxes: `A` must be a statically-shaped array, got {other:?}"),
+            ));
+        }
+    };
+    if n_leading == 0 && n_trailing == 0 {
+        return Ok(a);
+    }
+    let mut out = vec![Some(1); n_leading];
+    out.extend(dims);
+    out.resize(out.len() + n_trailing, Some(1));
+    Ok(e.reshape(&a, MlirTy::Ranked(out)))
+}
+
+/// One of `addaxes`' two axis counts, which §07 requires to be a "non-negative
+/// fixed integer". Anything else refuses rather than being guessed — see
+/// [`lower_addaxes`] for why the literal is the right source.
+///
+/// ONE message for both defects, because surface FlatPPL spells a negative count
+/// as `neg(1)` rather than a negative literal: `addaxes(v, -1, 0)` reaches here
+/// as a call, not a `Lit`, so a separate negative-literal arm would be a wording
+/// no input can produce.
+fn axis_count(e: &Emitter, id: NodeId, n_id: NodeId, which: &str) -> Result<usize, EmitError> {
+    match e.node(e.resolve_ref_one(n_id)) {
+        Node::Lit(Scalar::Int(n)) if *n >= 0 => Ok(*n as usize),
+        _ => Err(EmitError::at(
+            id,
+            format!(
+                "addaxes: `{which}` must be a non-negative fixed integer literal (§07 \"Array and \
+                 table operations\"); a fixed arithmetic expression is folded before the emitter \
+                 runs, so anything left here has no compile-time axis count"
             ),
         )),
     }

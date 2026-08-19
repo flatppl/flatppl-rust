@@ -1557,6 +1557,30 @@ impl<'m> Emitter<'m> {
     /// dimension `la` against `b`'s `lb` and producing `result_dims`. Shared by
     /// [`Emitter::matvec`] and [`Emitter::matmat`], which differ only in the
     /// result shape; each validates its own operand ranks first.
+    ///
+    /// StableHLO's `isPromotableElementType` (openxla/stablehlo
+    /// `TypeInference.cpp`) requires a `dot_general`'s lhs, rhs and result to
+    /// share ONE base type category — `IntegerType`, `FloatType`, `ComplexType`
+    /// or quantized — and permits only a bit-width widening within it. So the
+    /// operands are widened to their common kind first (up §03's
+    /// `booleans ⊂ integers ⊂ reals` chain, which [`Emitter::convert`] embeds
+    /// exactly) and the result carries that kind. An all-integer matrix product
+    /// therefore stays `Int`, matching both the maths and `infer`'s own
+    /// `mul_type`, which types it `integers`.
+    ///
+    /// Hardcoding a `Real` result emitted `(tensor<2x3xi32>, tensor<3x2xi32>) ->
+    /// tensor<2x2xf32>`, which crosses categories and is out of spec. Note that
+    /// it was not caught by execution: `iree-base-compiler` parses that module,
+    /// verifies it, compiles it and runs it, silently returning `f32` where
+    /// `infer` says integer — IREE does not enforce the constraint, which is
+    /// exactly why the spec rule rather than a compiler error is the ground here.
+    ///
+    /// PRE-EXISTING and pre-existing-REACHABLE, not a defect introduced with the
+    /// §07 stack constructors: `fill(1, [2, 3]) * fill(1, [3, 2])` and an integer
+    /// matrix ABI input both reach it without them. `rowstack` of integer literals
+    /// — §04's own aggregate example prelude — is one more door to it, and the one
+    /// that surfaced it. A `Real` operand pair (every other caller) converts
+    /// nothing and emits byte-identical text.
     fn dot_contract(
         &mut self,
         a: &Value,
@@ -1565,10 +1589,17 @@ impl<'m> Emitter<'m> {
         lb: usize,
         result_ty: MlirTy,
     ) -> Value {
+        let kind = if elem_rank(a.elem) >= elem_rank(b.elem) {
+            a.elem
+        } else {
+            b.elem
+        };
+        let a = self.convert(a, kind);
+        let b = self.convert(b, kind);
         let ssa = self.fresh();
-        let a_ty = a.ty.render(self.dtype, a.elem);
-        let b_ty = b.ty.render(self.dtype, b.elem);
-        let result_ty_text = result_ty.render(self.dtype, ElemKind::Real);
+        let a_ty = a.ty.render(self.dtype, kind);
+        let b_ty = b.ty.render(self.dtype, kind);
+        let result_ty_text = result_ty.render(self.dtype, kind);
         self.push(&format!(
             "{ssa} = stablehlo.dot_general {}, {}, contracting_dims = [{la}] x [{lb}], precision = [DEFAULT, DEFAULT] : ({a_ty}, {b_ty}) -> {result_ty_text}",
             a.ssa, b.ssa
@@ -1576,7 +1607,7 @@ impl<'m> Emitter<'m> {
         Value {
             ssa,
             ty: result_ty,
-            elem: ElemKind::Real,
+            elem: kind,
         }
     }
 

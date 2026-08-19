@@ -120,6 +120,51 @@
 //!   \"Linear algebra\" gives it the domain \"vectors, matrices\"". A rank-1
 //!   operand emits NOTHING (the transposition is type-level only) and a rank-2 one
 //!   emits `stablehlo.transpose … dims = [1, 0]`.
+//! - `rowstack`/`colstack` (§07 "Array and table operations") whose argument does
+//!   not lower to a rank-2 tensor — "`rowstack` has no lowering for ... §07 ...
+//!   gives it the domain \"vector of equal-length vectors\" ...". Rank 1 is a
+//!   vector of scalars, rank 3 a vector of matrices. Both are test-locked
+//!   (`tests/golden_stack.rs`), as is `colstack`'s own wording.
+//! - `rowstack`/`colstack` whose argument is a MATRIX (any rank-2-or-higher
+//!   `Array`) rather than a vector of vectors — "`rowstack`'s argument is a
+//!   rank-2 array, not a vector of vectors ... §03 \"Arrays\" says vectors of
+//!   vectors \"are not interpreted as matrices implicitly ...\"".
+//!   `ops::require_vector_container`, on the INFERRED type: the two have the same
+//!   lowered tensor (`mlir_type_of` flattens the element chain), so the rank-2
+//!   check on the `MlirTy` cannot tell them apart and this would lower silently —
+//!   an identity for `rowstack`, a transpose for `colstack`. `infer` agrees
+//!   independently: `rowstack_type` matches only a rank-1 array of arrays, so
+//!   `rowstack(matrix)` is already `%deferred`. Discriminates a nested
+//!   `cartpow(cartpow(reals, 3), 2)` ABI input (rank-1 container, ACCEPTED) from
+//!   `cartpow(reals, [2, 3])` (rank-2, refused) — same tensor, opposite verdicts.
+//! - `rowstack`/`colstack` whose argument MIXES orientations — one element a
+//!   rank-1 `Array` (column), another a `TVector` (row) — "`rowstack`'s argument
+//!   mixes vector orientations ... §03 \"Arrays\" gives an array a single element
+//!   type ...". `ops::require_uniform_orientation`, on the same
+//!   inferred-types-only channel as `require_same_orientation`: both elements
+//!   lower to the same `tensor<nxf32>`, so `lower_vector`'s identical-`MlirTy`
+//!   check accepts the pair. A UNIFORMLY transposed container is accepted (§03's
+//!   "the term vector will represent both …" blanket).
+//! - a RAGGED `rowstack`/`colstack` argument — refused one level down by
+//!   `vector()`'s identical-`MlirTy` check (below), since inference types
+//!   `[[1.0, 2.0], [3.0]]` as an array of `%any` rather than reporting it.
+//!   Test-locked from `rowstack` in `tests/golden_stack.rs`.
+//! - `addaxes` (§07) whose `A` is a TRANSPOSED vector — "addaxes: `A` is a
+//!   transposed vector ...". §07's domain column for this entry is "array", not
+//!   "vector", so §03's blanket does not widen it, and the widening would change
+//!   the answer: a row's tensor form is `[n]`, so a trailing axis would emit the
+//!   column `[n, 1]`.
+//! - `addaxes` whose `A` is not a statically-shaped array — "addaxes: `A` must be
+//!   a statically-shaped array, got ...". Same static-result-shape reason as
+//!   `lower_fill`'s; the test-locked case is a scalar `A`, the dynamic-extent case
+//!   is defensive.
+//! - `addaxes` whose `n_leading`/`n_trailing` is not a non-negative integer
+//!   literal — "addaxes: `n_leading` must be a non-negative fixed integer literal
+//!   (§07 ...)". ONE wording for both defects: surface `-1` arrives as `neg(1)`, a
+//!   call rather than a negative `Lit`, so a separate negative-literal arm would
+//!   be unreachable. `addaxes`' ARITY never reaches `args_exact` at all —
+//!   inference reports it ("`addaxes` takes 3 arguments (spec §07)"), pinned in
+//!   `tests/golden_stack.rs`.
 //! - an operand pair of different ORIENTATION — a rank-1 `Array` (column) against
 //!   a `TVector` (row) — "operands have different orientation: ... §03 makes a
 //!   transposed vector a distinct type from a one-dimensional array ...".
