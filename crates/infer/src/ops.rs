@@ -232,6 +232,14 @@ pub(crate) fn call_rule(
         // type (spec §07 Reductions): mean of a complex array is complex.
         // (NOT a constant Scalar(Real); legacy ops.rs returned Real always.)
         "sum" | "prod" | "mean" => reduce_type(&name, arg_ty(args, 0)),
+        // §03's boolean promotion reaches the CUMULATIVE pair for the same reason it
+        // reaches `sum`: `cumsum([true, true, false])` is `[1, 2, 2]`, and `2` is not a
+        // boolean, so the catalogue's `SameAsArg(0)` row typed the result
+        // `cartpow(booleans, 3)` — a set that does not contain the value. Guarded, so
+        // every non-boolean element keeps that row via the catalogue arm below.
+        "cumsum" | "cumprod" if bool_elem_array(arg_ty(args, 0)) => {
+            cumulative_bool_type(arg_ty(args, 0))
+        }
         // Vector normalizations: same-shape real vector — shape must thread through.
         "softmax" | "logsoftmax" | "l1unit" | "l2unit" => match arg_ty(args, 0) {
             Some(Type::Array { shape, .. }) if shape.len() == 1 => Type::Array {
@@ -1326,10 +1334,21 @@ fn rowstack_type(a: Option<&Type>) -> Type {
 /// table form ([`table_reduction_type`]) cannot drift — and, more to the point,
 /// cannot "agree" by sharing a mistake.
 ///
-/// - `sum`/`prod` — the element type. A sum of integers is an integer.
+/// - `sum`/`prod` over BOOLEANS — `Integer`, by §03 "Bool": "In arithmetic contexts,
+///   `false` is promoted to zero and `true` to one, permitting expressions such as
+///   `true + true`, `3 * false`, and `sum(mask)` to count true entries". Zero and one
+///   are §03 "Scalar types" `Integer`s, and §03 "Scalar value categories and sets"
+///   fixes `booleans` $\subset$ `integers` $\subset$ `reals`, so `integers` is the
+///   narrowest set the promotion lands in — a count, not a boolean. Keeping the
+///   element type here made `sum([true, true, false])` a boolean, which the
+///   StableHLO emitter honoured with a 1-bit `stablehlo.add`: parity, not a count.
+/// - `sum`/`prod` otherwise — the element type. A sum of integers is an integer.
 /// - `maximum`/`minimum` — the element type: they return an ELEMENT of the input
 ///   rather than a computed aggregate, matching their catalogue row's
-///   `ElemScalarKind` result (an integer array's max is an integer).
+///   `ElemScalarKind` result (an integer array's max is an integer). Booleans are
+///   NOT promoted: $\max_i x_i$ selects an element and performs no arithmetic, so
+///   §03's promotion sentence does not reach it, and a boolean array's max is a
+///   boolean.
 /// - `mean` — §07 defines it as $\bar{x} = \frac{1}{n}\sum_i x_i$, and the mean of
 ///   `[1, 2]` is `1.5`, so an INTEGER input gives a REAL. Complex stays complex
 ///   (§07's domain for `mean` is "real/complex arrays"). This is arithmetic, so it
@@ -1337,6 +1356,7 @@ fn rowstack_type(a: Option<&Type>) -> Type {
 /// - `var`/`std` — real, matching their catalogue rows and their "real arrays" domain.
 fn reduced_scalar(head: &str, elem: ScalarType) -> ScalarType {
     match (head, elem) {
+        ("sum" | "prod", ScalarType::Boolean) => ScalarType::Integer,
         ("sum" | "prod" | "maximum" | "minimum", e) => e,
         ("mean", ScalarType::Complex) => ScalarType::Complex,
         _ => ScalarType::Real,
@@ -1347,6 +1367,36 @@ fn reduced_scalar(head: &str, elem: ScalarType) -> ScalarType {
 /// mapped by [`reduced_scalar`]; a non-scalar element (an array-of-arrays) keeps the
 /// element type as before, since §07 does not pin down what reducing along one axis
 /// of a nested array yields and this is not the place to guess.
+/// True iff `a` is a rank-1-or-higher array (or `TVector`) whose scalar element kind is
+/// `Boolean` — the guard on the `cumsum`/`cumprod` promotion arm. Nested elements are
+/// not drilled: §07 gives the cumulative pair the domain "vectors", so a nested element
+/// is out of domain and keeps the catalogue row rather than being promoted here.
+fn bool_elem_array(a: Option<&Type>) -> bool {
+    matches!(
+        a,
+        Some(Type::Array { elem, .. } | Type::TVector { elem, .. })
+            if matches!(elem.as_ref(), Type::Scalar(ScalarType::Boolean))
+    )
+}
+
+/// The §03-promoted result type of `cumsum`/`cumprod` over the boolean array `a`:
+/// the argument's own shape (§07 makes the cumulative pair shape-preserving) with
+/// `Integer` elements. The one place that answer is written down, so the type arm and
+/// the value-set arm in [`call_valueset`] cannot drift — the value-set is
+/// `ValueSet::natural_of` of exactly this type. Only ever called behind
+/// [`bool_elem_array`], so the shapeless fallback is unreachable.
+fn cumulative_bool_type(a: Option<&Type>) -> Type {
+    let shape: Box<[Dim]> = match a {
+        Some(Type::Array { shape, .. }) => shape.clone(),
+        Some(Type::TVector { len, .. }) => Box::new([*len]),
+        _ => Box::new([Dim::Dynamic]),
+    };
+    Type::Array {
+        shape,
+        elem: Box::new(Type::Scalar(ScalarType::Integer)),
+    }
+}
+
 fn reduce_type(head: &str, a: Option<&Type>) -> Type {
     match a {
         Some(Type::Array { elem, .. }) => match elem.as_ref() {
@@ -5088,6 +5138,15 @@ pub(crate) fn call_valueset(
             if matches!(arg_ty(args, 0), Some(Type::Table { .. })) =>
         {
             table_reduction_valueset(&name, arg_ty(args, 0))
+        }
+        // Mirrors the `cumsum`/`cumprod` §03-promotion type arm. The catalogue's
+        // `SameAsArg(0)` row would hand back the ARGUMENT's set, `cartpow(booleans,
+        // n)`, against an integer-element type — a set that excludes the value
+        // (`cumsum([true, true, false])` is `[1, 2, 2]`). `sum`/`prod` need no arm:
+        // they are `Structural` rows with no `result_set`, so their set already
+        // follows the type.
+        "cumsum" | "cumprod" if bool_elem_array(arg_ty(args, 0)) => {
+            ValueSet::natural_of(&cumulative_bool_type(arg_ty(args, 0)))
         }
         // Catalogue functions carry their result value-set (`result_set` tag);
         // distribution constructors carry the support column of spec §08. A
