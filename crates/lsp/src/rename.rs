@@ -59,9 +59,6 @@ struct ArgumentTarget {
     name: String,
     /// The lowered placeholder the body references, e.g. `_a_`.
     placeholder: String,
-    /// Every declared argument name of the same callable, for the
-    /// distinctness check.
-    siblings: Vec<String>,
 }
 
 /// Resolve what the cursor at `byte_offset` designates, or refuse with the
@@ -280,7 +277,6 @@ fn argument_target_at(
         bid,
         placeholder: module.resolve(entry.1.name).to_string(),
         name,
-        siblings,
     }))
 }
 
@@ -515,15 +511,16 @@ pub fn prepare_rename(
 ///   modules": "A FlatPPL **module** is an unordered set of bindings of names to
 ///   expressions." A second binding of the same name in one module is not such a
 ///   set, so a rename onto an existing name in the defining module refuses.
-/// - **Duplicate argument name.** §04 "Reification to functions and kernels":
-///   "Boundary input names must be distinct — a repeated name is a static error,
-///   which likewise forbids a lambda or named function from repeating an argument
-///   name." Nothing else catches this: `infer` currently accepts `f(a, a) = …`
-///   without a diagnostic (measured), so allowing the rename would silently
-///   produce the static error the spec names.
 ///
-/// Deliberately NOT refused, because no rule forbids them:
+/// Deliberately NOT refused, because no rule forbids them, or because `infer`
+/// reports the consequence precisely:
 ///
+/// - **Renaming an argument onto a sibling.** §04 "Reification to functions and
+///   kernels" makes a repeated boundary input name a static error, and `infer` now
+///   reports it at the reification — "boundary input `b` is declared more than
+///   once" (measured by `duplicate_argument_name_is_diagnosed`). So the rename is
+///   performed and the diagnostic flags the result, rather than the server blocking
+///   a legitimate "rename this, then fix the other argument" edit.
 /// - **Shadowing a built-in with a binding.** §04 "Name resolution": "This makes
 ///   built-in names shadowable: a module may bind any name except for `self` and
 ///   `base`."
@@ -571,13 +568,6 @@ pub fn rename_edits(
             names::check_new_argument_name(new_name)?;
             if new_name == t.name {
                 return Ok(Vec::new());
-            }
-            if t.siblings.iter().any(|s| s == new_name) {
-                return Err(Refusal(format!(
-                    "`{new_name}` is already an argument of this callable; spec §04 \
-                     \"Reification to functions and kernels\" requires that \"Boundary \
-                     input names must be distinct — a repeated name is a static error\""
-                )));
             }
         }
     }
@@ -1136,36 +1126,40 @@ mod tests {
         assert_eq!(apply(src, &locs, "z"), "f(z) = add(z, 1)\ng(a) = mul(a, 2)");
     }
 
-    /// §04 "Reification to functions and kernels": "Boundary input names must be
-    /// distinct — a repeated name is a static error, which likewise forbids a
-    /// lambda or named function from repeating an argument name." Nothing else
-    /// catches it (see `duplicate_argument_name_is_not_diagnosed`), so the rename
-    /// must refuse.
+    /// §04 "Reification to functions and kernels" makes a repeated argument name a
+    /// static error, and `infer` reports it (see
+    /// `duplicate_argument_name_is_diagnosed`), so the server performs the edit and
+    /// lets the diagnostic flag the result instead of refusing.
     #[test]
-    fn rename_an_argument_onto_a_sibling_refuses() {
+    fn rename_an_argument_onto_a_sibling_is_allowed_and_diagnosed() {
         let src = "f(a, b) = add(a, b)";
         let (db, f, fs, cats) = single_file(src);
         let index = node_span_index(&db, f, fs, cats);
-        let err = rename_edits(&db, f, fs, cats, 2, &index, "b")
-            .expect_err("a repeated argument name is a §04 static error");
+        let locs = rename_edits(&db, f, fs, cats, 2, &index, "b").expect("allowed");
+        let renamed = apply(src, &locs, "b");
+        assert_eq!(renamed, "f(b, b) = add(b, b)");
+        let mut m = flatppl_syntax::parse(&renamed).expect("still parses");
+        let diags = flatppl_infer::infer_with(&mut m, flatppl_infer::Level::Shape);
         assert!(
-            err.0.contains("must be distinct"),
-            "refusal must quote the distinctness rule; got {}",
-            err.0
+            diags
+                .iter()
+                .any(|d| d.message.contains("declared more than once")),
+            "the result must be diagnosed; got {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
     }
 
-    /// The measured basis for the refusal above: `infer` does NOT flag a duplicate
-    /// argument name, so "allow it and let diagnostics catch it" is unavailable
-    /// here. If this starts failing, the engine gained the check and the refusal
-    /// could be reconsidered.
+    /// The measured basis for allowing the rename above: `infer` flags a repeated
+    /// argument name, so the LSP need not refuse to keep the file legal.
     #[test]
-    fn duplicate_argument_name_is_not_diagnosed() {
-        let mut m = flatppl_syntax::parse("f(a, a) = add(a, a)").expect("parses today");
+    fn duplicate_argument_name_is_diagnosed() {
+        let mut m = flatppl_syntax::parse("f(a, a) = add(a, a)").expect("parses");
         let diags = flatppl_infer::infer_with(&mut m, flatppl_infer::Level::Shape);
         assert!(
-            diags.is_empty(),
-            "if the engine now flags `f(a, a)`, revisit the rename refusal; got {:?}",
+            diags.iter().any(|d| d
+                .message
+                .contains("boundary input `a` is declared more than once")),
+            "got {:?}",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
     }
