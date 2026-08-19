@@ -1284,8 +1284,31 @@ impl<'m> Emitter<'m> {
     /// - `maximum`/`minimum` over a non-`Real` operand — the ±inf identity has
     ///   no integer or boolean form. §07 gives both the domain "real arrays",
     ///   and `ops::lower_extremum` reports the same limit for `maximum(xs)`.
-    /// - `prod` over a `Bool` operand — `stablehlo.multiply` on `i1` is a
-    ///   conjunction, not §07's $\prod_i x_i$.
+    /// - `prod` or `sum` over a `Bool` operand — on `i1`,
+    ///   `stablehlo.multiply` is a conjunction and `stablehlo.add` is a WRAPPING
+    ///   1-bit add (`true + true == false`, i.e. parity), so neither computes
+    ///   what §07 defines. A boolean array reaches a §07 reduction only through
+    ///   the promotion §03 "Bool" states — "`false` is promoted to zero and
+    ///   `true` to one, permitting expressions such as `true + true`, `3 *
+    ///   false`, and `sum(mask)` to count true entries" — i.e. WIDENED first,
+    ///   which is what `crate::aggregate::reduce` does before calling here. So a
+    ///   `Bool` operand arriving at this method means the node's inferred kind
+    ///   disagrees with its own caller; refusing surfaces that, where reducing in
+    ///   i1 would answer parity and reducing in a wider kind would contradict the
+    ///   declared result type.
+    ///
+    /// NOTE: [`Emitter::reduce_axis`] still selects `"false"` for a `Bool`
+    /// additive reduce, and THAT path is live and WRONG — `ops::lower_sum` over a
+    /// boolean array emits the wrapping `i1` add (measured under IREE:
+    /// `sum([true, true, false])` executes to `false`, where §03's promotion owes
+    /// the count `2`). §03 settles the direction — `sum(mask)` counts, so the fix
+    /// is to widen, not to refuse — but not the layer: inference types that call
+    /// `booleans`, so the emitted `tensor<i1>` result type would have to change
+    /// with it, and `reduce_axis` is infallible under five `-> Value` entry
+    /// points ([`Emitter::reduce_sum`], [`Emitter::reduce_max`],
+    /// [`Emitter::reduce_min`], [`Emitter::reduce_sum_last_axis`],
+    /// [`Emitter::diag`]) over three call sites. Left for a follow-up that owns
+    /// both crates rather than half-fixed here.
     pub(crate) fn reduce_trailing_axes(
         &mut self,
         id: NodeId,
@@ -1312,7 +1335,6 @@ impl<'m> Emitter<'m> {
         let (combine_op, identity) = match (kind, a.elem) {
             (AxisReduce::Sum, ElemKind::Real) => ("stablehlo.add", "0.000000e+00"),
             (AxisReduce::Sum, ElemKind::Int) => ("stablehlo.add", "0"),
-            (AxisReduce::Sum, ElemKind::Bool) => ("stablehlo.add", "false"),
             (AxisReduce::Prod, ElemKind::Real) => ("stablehlo.multiply", "1.000000e+00"),
             (AxisReduce::Prod, ElemKind::Int) => ("stablehlo.multiply", "1"),
             (AxisReduce::Max, ElemKind::Real) => {
@@ -1323,10 +1345,12 @@ impl<'m> Emitter<'m> {
                 return Err(EmitError::at(
                     id,
                     format!(
-                        "aggregate: the {} reduction has no {elem:?} identity — §07 gives \
-                         `maximum`/`minimum` the domain \"real arrays\" (the ±inf identity has no \
-                         integer or boolean form) and `stablehlo.multiply` over booleans is a \
-                         conjunction, not a product. Convert the body to reals first",
+                        "aggregate: the {} reduction has no {elem:?} identity that means what §07 \
+                         defines — §07 gives `maximum`/`minimum` the domain \"real arrays\" and the \
+                         ±inf identity has no integer or boolean form, while over booleans \
+                         `stablehlo.multiply` is a conjunction and `stablehlo.add` a wrapping \
+                         1-bit add (parity), neither of which is §07's product or sum. Convert the \
+                         body to reals first",
                         kind.spec_name()
                     ),
                 ));

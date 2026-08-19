@@ -12502,3 +12502,30 @@ fn aggregate_lowers_a_nested_aggregation_in_its_own_axis_scope() {
         "the outer result keeps `.i`, in:\n{out}"
     );
 }
+
+/// §04: "`aggregate` composes cleanly with `functionof` as the namespace of axis
+/// names is local to the enclosing `aggregate` and the namespace of placeholders
+/// is local to the enclosing `functionof`." §04's own `mymatmul` example, called
+/// on the same operands, emits the matmul golden BYTE-FOR-BYTE — the two
+/// namespaces do not interact, and the determiniser's inlining leaves the frame
+/// model nothing new to do.
+///
+/// Numerics: identical module, so identical to the `[[6, 8], [10, 6]]` execution
+/// pinned on `aggregate_matmul.mlir`.
+#[test]
+fn aggregate_composes_with_functionof_placeholders() {
+    let src = format!(
+        "flatppl_compat = \"0.1\"\n{AGG_A}{AGG_B}\
+         mymatmul = functionof(\n\
+         \x20   aggregate(sum, [.i, .k], _A_[.i, .j] * _B_[.j, .k]),\n\
+         \x20   A = _A_, B = _B_\n\
+         )\n\
+         C = mymatmul(A, B)\n\
+         inputs = (A, B)\noutputs = (C)\n"
+    );
+    assert_eq!(
+        emit_agg(&src),
+        include_str!("goldens/aggregate_matmul.mlir"),
+        "§04's functionof composition must emit the same module as the direct aggregate"
+    );
+}

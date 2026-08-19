@@ -237,21 +237,31 @@
 //!   (not test-locked: a zero-length `cartpow` axis)
 //! - `var`/`std` over a single element — "aggregate: '...' over 1 element(s) is
 //!   undefined — §07 defines it with the $n-1$ denominator"
-//! - `metricsum` — "metricsum has no lowering in this backend: ... it needs a
-//!   general indefinite matrix inverse, which StableHLO has no op for". §04's
-//!   own lowering makes every lower-variance axis an `inv(metric)` contraction,
-//!   and §04 requires the metric only to be "square, symmetric, and invertible";
-//!   `stablehlo.cholesky` needs positive-definiteness, so the missing piece is
-//!   different machinery from the frame model, not a missing arm of it
+//! - `metricsum` — "metricsum has no lowering in this backend: in general ... it
+//!   needs a general indefinite matrix inverse, which StableHLO has no op for".
+//!   §04's own lowering makes each lower-variance axis an `inv(metric)`
+//!   contraction, and §04 requires the metric only to be "square, symmetric, and
+//!   invertible"; `stablehlo.cholesky` needs positive-definiteness, so the
+//!   missing piece is different machinery from the frame model, not a missing arm
+//!   of it. UNCONDITIONAL by design — it declines the construct, not one variance
+//!   pattern, so the message says so rather than implying every call needs an
+//!   inverse (the all-upper degenerate case does not)
 //!
 //! **`emitter.rs`** (`Emitter::reduce_trailing_axes`, the aggregate
 //! contraction):
-//! - a `maximum`/`minimum` over a non-`Real` operand, or a `prod` over a `Bool`
-//!   one — "aggregate: the ... reduction has no ... identity — §07 gives
-//!   `maximum`/`minimum` the domain \"real arrays\" ...". Defensive: `infer`
-//!   types an axis-indexed body `%deferred`, so `aggregate`'s own inferred
-//!   element kind is `Real` and the frame is widened to it before the
-//!   contraction — no surface model reaches this arm today.
+//! - a `maximum`/`minimum` over a non-`Real` operand, or a `sum`/`prod` over a
+//!   `Bool` one — "aggregate: the ... reduction has no ... identity that means
+//!   what §07 defines ...". On `i1`, `stablehlo.multiply` is a conjunction and
+//!   `stablehlo.add` a WRAPPING 1-bit add (parity), so neither computes what §07
+//!   defines — §03 "Bool" reaches a reduction by PROMOTION ("`sum(mask)` to count
+//!   true entries"), i.e. widened first. Defensive: `infer` types an axis-indexed
+//!   body `%deferred`, so `aggregate`'s own inferred element kind is `Real` and
+//!   `aggregate::reduce` widens the frame to it before contracting — no surface
+//!   model reaches this arm today. `Emitter::reduce_axis`'s own
+//!   `ElemKind::Bool => "false"` additive arm is NOT guarded and IS live and
+//!   wrong (`ops::lower_sum` over a boolean array emits the wrapping add); see
+//!   that method's note — §03 settles the direction (widen), inference's
+//!   `booleans` typing of the call is the blocker.
 //!
 //! **`registry.rs`** (the distribution dispatch table):
 //! - a kernel-input record missing a parameter a builder needs —

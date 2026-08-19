@@ -178,6 +178,14 @@ pub(crate) fn lower_aggregate(
 
     let frame = build_frame(e, id, &output_axes, &sites)?;
 
+    // Bound WITHOUT snapshotting the body subtree's memo, unlike the crate's
+    // other `bind`-seeding site (`Emitter::lower_broadcast_userfn`, which restores
+    // it so one `functionof` re-lowers freshly under different arguments): a
+    // frame-shaped value here can never be read under a different frame, because
+    // `flatppl-core` interns NAMES only and hash-conses no nodes, so two
+    // aggregates over identical body text still hold distinct `NodeId`s — and an
+    // axis index cannot occur in a top-level binding, so no `Ref` can share one
+    // across aggregates either.
     for site in &sites {
         let v = frame_operand(e, site, &frame)?;
         e.bind(site.get_id, v);
@@ -189,26 +197,39 @@ pub(crate) fn lower_aggregate(
 }
 
 /// The refusal for `metricsum(metric, output_axes, expr)` (spec §04
-/// "Metric-aware Einstein summation"), which this backend does NOT lower.
+/// "Metric-aware Einstein summation"), which this backend does NOT lower — as a
+/// CONSTRUCT, whatever variances one particular call happens to use.
 ///
-/// Its §04 "Lowering to `aggregate`" turns every lower-variance axis into an
-/// `inv(metric)` contraction, so a metricsum needs the INVERSE of an arbitrary
-/// square symmetric invertible matrix — §04 requires only that the metric be
-/// "square, symmetric, and invertible", not positive-definite, and the section's
-/// own worked example is a Lorentz metric, which is indefinite. StableHLO has no
-/// matrix-inverse or LU op, and `stablehlo.cholesky` (this crate's only
-/// factorization) needs positive-definiteness, so the missing piece is a general
-/// indefinite inverse — different machinery from the frame model above, not a
-/// missing arm of it. Refused here with the reason rather than left to
-/// `ops::lower_builtin`'s generic "unsupported builtin head".
+/// The blocker is the general case. §04 "Lowering to `aggregate`" turns each
+/// lower-variance axis into an `inv(metric)` contraction, so a metricsum needs
+/// the INVERSE of an arbitrary square symmetric invertible matrix — §04 requires
+/// only that the metric be "square, symmetric, and invertible", not
+/// positive-definite, and the section's own worked example is a Lorentz metric,
+/// which is indefinite. StableHLO has no matrix-inverse or LU op, and
+/// `stablehlo.cholesky` (this crate's only factorization) needs
+/// positive-definiteness, so the missing piece is a general indefinite inverse —
+/// different machinery from the frame model above, not a missing arm of it.
+///
+/// The all-upper degenerate case (`g: r[.mu^] := v[.mu^]`) needs no inverse and
+/// would reduce to a plain `aggregate(sum, …)`, but it is refused with everything
+/// else rather than carved out: supporting it would still need §04's
+/// metricsum-only static checks (every repeated non-output index exactly twice,
+/// once upper and once lower; no bare neutral axes), and a backend that accepted
+/// some variance patterns and refused others would be a worse contract than one
+/// that declines the construct. The message therefore states what a metricsum
+/// needs IN GENERAL, and names the rewrite that works for every case including
+/// the degenerate one. Refused here rather than left to `ops::lower_builtin`'s
+/// generic "unsupported builtin head".
 pub(crate) fn metricsum_refusal(id: NodeId) -> EmitError {
     EmitError::at(
         id,
-        "metricsum has no lowering in this backend: §04 \"Lowering to `aggregate`\" makes every \
-         lower-variance axis an `inv(metric)` contraction, and §04 requires the metric only to be \
-         \"square, symmetric, and invertible\" — not positive-definite — so it needs a general \
-         indefinite matrix inverse, which StableHLO has no op for (`stablehlo.cholesky` requires \
-         positive-definiteness). Contract the metric factors explicitly and write the result as \
+        "metricsum has no lowering in this backend: in general §04 \"Lowering to `aggregate`\" \
+         makes each lower-variance axis an `inv(metric)` contraction, and §04 requires the metric \
+         only to be \"square, symmetric, and invertible\" — not positive-definite — so it needs a \
+         general indefinite matrix inverse, which StableHLO has no op for (`stablehlo.cholesky` \
+         requires positive-definiteness). The construct is declined as a whole rather than for \
+         some variance patterns only, so this call is refused even if its own indices need no \
+         inverse. Contract any metric factors explicitly and write the result as \
          `aggregate(sum, …)`, which does lower",
     )
 }
