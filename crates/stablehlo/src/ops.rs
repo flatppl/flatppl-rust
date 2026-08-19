@@ -93,6 +93,36 @@ pub(crate) fn lower_builtin(
         "abs" => unary(e, id, args, Emitter::abs),
         "cos" => unary(e, id, args, Emitter::cos),
         "invlogit" => unary(e, id, args, Emitter::invlogit),
+        // §07 "Elementary functions", the entries whose op or `Emitter` helper
+        // already existed and only lacked a head here. Domains from §07's own
+        // table; each is elementwise and shape-preserving, so it batches under
+        // `broadcast` for free like every other entry in this block.
+        //
+        // §07 gives most of these a `complexes` domain as well, which
+        // `crate::types` refuses (no complex element type) — booked once as the
+        // §03 Complex row, not repeated per head.
+        "sin" => unary(e, id, args, Emitter::sin),
+        "floor" => unary(e, id, args, Emitter::floor),
+        "ceil" => unary(e, id, args, Emitter::ceil),
+        "log10" => unary(e, id, args, Emitter::log10),
+        "abs2" => unary(e, id, args, Emitter::abs2),
+        "asin" => unary(e, id, args, Emitter::asin),
+        "acos" => unary(e, id, args, Emitter::acos),
+        "acosh" => unary(e, id, args, Emitter::acosh),
+        "loggamma" => unary(e, id, args, Emitter::lgamma),
+        "gamma" => unary(e, id, args, Emitter::gamma),
+        "atan2" => binary(e, id, args, Emitter::atan2),
+        // §07's BINARY `min`/`max` ($\min(a, b)$ / $\max(a, b)$, domain
+        // `reals`) — distinct from the `maximum`/`minimum` REDUCTIONS below.
+        "min" => lower_binary_extremum(e, id, args, Extremum::Min),
+        "max" => lower_binary_extremum(e, id, args, Extremum::Max),
+        // §07 "Identities": `identity(x)` "returns `x` unchanged". Domain
+        // "any", so no operand check beyond the one `lower_node` already makes
+        // — a value with no tensor form refuses there, not here.
+        "identity" => {
+            let [a] = args_exact(id, args)?;
+            e.lower_node(a)
+        }
         // §06 change-of-variables heads. An open-image `pushfwd` spells THREE
         // families of head, all of which must lower or the density refuses:
         //
@@ -125,6 +155,19 @@ pub(crate) fn lower_builtin(
         "real" => lower_real(e, id, args),
         // §07 "Linear algebra" `transpose`/`adjoint`, domain "vectors, matrices".
         "transpose" | "adjoint" => lower_transpose(e, id, args, head),
+        // §07 "Linear algebra", the entries that reduce to an `Emitter` matrix
+        // helper already in the crate. Every one of the daggers §07 writes
+        // ($\mathbf{A}\mathbf{A}^\dagger$, $\mathbf{x}\mathbf{x}^\dagger$,
+        // $\mathbf{x}^\dagger\mathbf{A}\mathbf{x}$) is a plain transpose here,
+        // for `lower_transpose`'s reason: this crate has no complex element type,
+        // so over the elements it emits conjugation is the identity.
+        "lower_cholesky" => lower_cholesky_head(e, id, args),
+        "diag" => lower_diag(e, id, args),
+        "trace" => lower_trace(e, id, args),
+        "self_outer" => lower_self_outer(e, id, args),
+        "row_gram" => lower_gram(e, id, args, Gram::Row),
+        "col_gram" => lower_gram(e, id, args, Gram::Col),
+        "quadform" => lower_quadform(e, id, args),
         // §07 "Array and table operations" `rowstack`/`colstack` (domain
         // "vector of equal-length vectors") and `addaxes` (domain "array,
         // non-negative integer, non-negative integer") — the shape
@@ -168,8 +211,22 @@ pub(crate) fn lower_builtin(
         "gt" => lower_compare(e, id, args, "GT"),
         "le" => lower_compare(e, id, args, "LE"),
         "ge" => lower_compare(e, id, args, "GE"),
-        "land" => lower_land(e, id, args),
+        // §07 "Comparison functions" `equal`/`unequal` ($a = b$, $a \neq b$).
+        // Their domain is DISCRETE ONLY — see [`lower_exact_compare`].
+        "equal" => lower_exact_compare(e, id, args, "EQ"),
+        "unequal" => lower_exact_compare(e, id, args, "NE"),
+        "land" => lower_land(e, id, args, Connective::And),
+        // §07 "Logical operators" `lor`/`lxor`/`lnot` (`a || b`, exclusive or,
+        // `!a`, all over `booleans`) — `stablehlo.or`/`xor`/`not` over the same
+        // `i1` predicates `land` takes, with the same operand rule.
+        "lor" => lower_land(e, id, args, Connective::Or),
+        "lxor" => lower_land(e, id, args, Connective::Xor),
+        "lnot" => lower_lnot(e, id, args),
         "iszero" => lower_iszero(e, id, args),
+        // §07 "Scalar predicates" `isfinite`/`isinf`/`isnan`.
+        "isfinite" => lower_finiteness(e, id, args, Finiteness::Finite),
+        "isinf" => lower_finiteness(e, id, args, Finiteness::Inf),
+        "isnan" => lower_finiteness(e, id, args, Finiteness::Nan),
         // `record(...)` is not a tensor — handled structurally by the mode
         // builder (a record-typed model input's fields become separate
         // tensor args), never reached here in a well-formed lowering.
@@ -512,6 +569,239 @@ fn lower_transpose(
             ),
         )),
     }
+}
+
+// ---- §07 linear algebra --------------------------------------------------------
+
+/// A statically-shaped rank-2 operand's dimensions, or a refusal. Every §07
+/// linear-algebra lowering below needs the two extents as NUMBERS — to check
+/// squareness, to size a result, or to reject a rank the helper would panic on
+/// — so a dynamic (`?`) axis refuses here rather than emitting a module whose
+/// shape contract cannot be checked.
+fn matrix_dims(id: NodeId, v: &Value, head: &str) -> Result<(u64, u64), EmitError> {
+    match &v.ty {
+        MlirTy::Ranked(d) if d.len() == 2 => match (d[0], d[1]) {
+            (Some(m), Some(n)) => Ok((m, n)),
+            _ => Err(EmitError::at(
+                id,
+                format!(
+                    "`{head}`: a dynamic matrix axis has no lowering, got {:?}",
+                    v.ty
+                ),
+            )),
+        },
+        other => Err(EmitError::at(
+            id,
+            format!(
+                "`{head}`: §07 \"Linear algebra\" gives this a matrix domain, so a rank-2 \
+                 operand is required, got {other:?}"
+            ),
+        )),
+    }
+}
+
+/// [`matrix_dims`] plus §07's SQUARE requirement, returning the single extent.
+fn square_dim(id: NodeId, v: &Value, head: &str) -> Result<u64, EmitError> {
+    let (m, n) = matrix_dims(id, v, head)?;
+    if m != n {
+        return Err(EmitError::at(
+            id,
+            format!(
+                "`{head}`: §07 \"Linear algebra\" gives this the domain \"square matrices\", \
+                 got {m}x{n}"
+            ),
+        ));
+    }
+    Ok(m)
+}
+
+/// Refuse a non-`Real` operand for the two helpers that hardcode a real element
+/// type. [`Emitter::cholesky`] renders `stablehlo.cholesky` at the operand's own
+/// kind (an integer operand emits an op IREE rejects) and [`Emitter::diag`]
+/// renders its iota/mask matrices and its reduction identity as floats
+/// unconditionally — so an `Int` or `Bool` operand would mis-emit rather than
+/// lower. §07's domains here (positive definite / matrices used through a
+/// Cholesky or a diagonal) are real anyway; §03's `booleans ⊂ integers ⊂ reals`
+/// means the caller can convert first.
+fn require_real_matrix(id: NodeId, v: &Value, head: &str) -> Result<(), EmitError> {
+    if v.elem == ElemKind::Real {
+        return Ok(());
+    }
+    Err(EmitError::at(
+        id,
+        format!(
+            "`{head}`: only a real matrix is supported, got {:?} — the underlying lowering \
+             emits float-typed index and identity constants. Convert to reals first",
+            v.elem
+        ),
+    ))
+}
+
+/// §07 `lower_cholesky(A)` — "lower-triangular $\mathbf{L}$ with
+/// $\mathbf{A} = \mathbf{L}\mathbf{L}^\dagger$ and positive diagonal entries",
+/// domain "positive definite `A`". One `stablehlo.cholesky` with `lower = true`.
+///
+/// Positive-definiteness is §07's precondition on the CALLER, not something a
+/// static emitter can check: `stablehlo.cholesky` is documented to produce
+/// implementation-defined values for a non-positive-definite operand, exactly as
+/// §07 leaves it a domain condition.
+fn lower_cholesky_head(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
+    let [a_id] = args_exact(id, args)?;
+    let a = e.lower_node(a_id)?;
+    square_dim(id, &a, "lower_cholesky")?;
+    require_real_matrix(id, &a, "lower_cholesky")?;
+    Ok(e.cholesky(&a))
+}
+
+/// §07 `diag(A, k)` — "extracts the $k$th diagonal of $\mathbf{A}$ as a vector
+/// … when called as `diag(A)`, `k` defaults to `0`".
+///
+/// PARTIAL against that entry, in two ways, each refused rather than
+/// approximated:
+///
+/// - **`k` must be the literal `0`.** [`Emitter::diag`] masks with
+///   `row == col`; a super- or sub-diagonal needs a shifted mask and a shorter
+///   result, which is a different lowering rather than a parameter of this one.
+/// - **`A` must be SQUARE**, though §07's domain is "matrices". `Emitter::diag`
+///   row-sums an `n`-column mask, so on an `m`x`n` operand with `m > n` it
+///   returns `m` entries — zeros for the rows the diagonal never reaches —
+///   instead of the `min(m, n)` §07 defines. Refusing keeps that from being
+///   silently answered.
+fn lower_diag(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
+    let (a_id, k_id) = match args {
+        [a] => (*a, None),
+        [a, k] => (*a, Some(*k)),
+        _ => {
+            return Err(EmitError::at(
+                id,
+                format!("`diag`: expected 1 or 2 argument(s), got {}", args.len()),
+            ));
+        }
+    };
+    if let Some(k) = k_id {
+        let k_val = literal_index(e, id, k).map_err(|_| {
+            EmitError::at(
+                id,
+                "`diag`: the diagonal offset `k` must be an integer literal",
+            )
+        })?;
+        if k_val != 0 {
+            return Err(EmitError::at(
+                id,
+                format!(
+                    "`diag`: only the MAIN diagonal (`k = 0`, §07's default) lowers, got k = \
+                     {k_val} — a §07 super- or sub-diagonal needs a shifted mask and a shorter \
+                     result than this lowering produces"
+                ),
+            ));
+        }
+    }
+    let a = e.lower_node(a_id)?;
+    square_dim(id, &a, "diag")?;
+    require_real_matrix(id, &a, "diag")?;
+    Ok(e.diag(&a))
+}
+
+/// §07 `trace(A)` — $\mathrm{tr}(\mathbf{A})$ over "square matrices", the sum
+/// of [`Emitter::diag`]'s extraction. Same square/real limits as
+/// [`lower_diag`], and for the same reasons.
+fn lower_trace(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
+    let [a_id] = args_exact(id, args)?;
+    let a = e.lower_node(a_id)?;
+    square_dim(id, &a, "trace")?;
+    require_real_matrix(id, &a, "trace")?;
+    let d = e.diag(&a);
+    Ok(e.reduce_sum(&d))
+}
+
+/// §07 `self_outer(x)` — "$\mathbf{x} \cdot \mathbf{x}^\dagger$ (outer
+/// product)", domain "vectors". One [`Emitter::outer_product`] of the operand
+/// against itself, giving `[n, n]`.
+///
+/// Orientation is not read: §07 gives the entry ONE domain ("vectors") and one
+/// result, and §03 makes a transposed vector the same tensor, so both spellings
+/// lower to the same square matrix.
+fn lower_self_outer(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
+    let [x_id] = args_exact(id, args)?;
+    let x = e.lower_node(x_id)?;
+    match &x.ty {
+        MlirTy::Ranked(d) if d.len() == 1 => {}
+        other => {
+            return Err(EmitError::at(
+                id,
+                format!(
+                    "`self_outer`: §07 \"Linear algebra\" gives it the domain \"vectors\", so a \
+                     rank-1 operand is required, got {other:?}"
+                ),
+            ));
+        }
+    }
+    Ok(e.outer_product(&x, &x))
+}
+
+/// Which §07 Gram matrix a head builds.
+#[derive(Clone, Copy)]
+enum Gram {
+    /// `row_gram(A)` — $\mathbf{A} \mathbf{A}^\dagger$, `[m, n] -> [m, m]`.
+    Row,
+    /// `col_gram(A)` — $\mathbf{A}^\dagger \mathbf{A}$, `[m, n] -> [n, n]`.
+    Col,
+}
+
+/// §07 `row_gram(A)` / `col_gram(A)`, domain "matrices" — one
+/// [`Emitter::transpose`] and one [`Emitter::matmat`]. Kind-polymorphic: the
+/// product runs through `Emitter::dot_contract`, which widens to the operands'
+/// common kind, so an integer matrix keeps an integer Gram.
+fn lower_gram(
+    e: &mut Emitter,
+    id: NodeId,
+    args: &[NodeId],
+    which: Gram,
+) -> Result<Value, EmitError> {
+    let head = match which {
+        Gram::Row => "row_gram",
+        Gram::Col => "col_gram",
+    };
+    let [a_id] = args_exact(id, args)?;
+    let a = e.lower_node(a_id)?;
+    matrix_dims(id, &a, head)?;
+    let at = e.transpose(&a, &[1, 0]);
+    Ok(match which {
+        Gram::Row => e.matmat(&a, &at),
+        Gram::Col => e.matmat(&at, &a),
+    })
+}
+
+/// §07 `quadform(A, x)` — "$\mathbf{x}^\dagger \mathbf{A} \mathbf{x}$", domain
+/// "square `A`, vector `x`". Associated as $\mathbf{x}^\dagger(\mathbf{A}
+/// \mathbf{x})$: one [`Emitter::matvec`] then one [`Emitter::inner_product`],
+/// which is two `dot_general`s rather than the three a left-to-right
+/// association would need, and gives §07's scalar result.
+fn lower_quadform(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
+    let [a_id, x_id] = args_exact(id, args)?;
+    let a = e.lower_node(a_id)?;
+    let x = e.lower_node(x_id)?;
+    let n = square_dim(id, &a, "quadform")?;
+    let len = match &x.ty {
+        MlirTy::Ranked(d) if d.len() == 1 => d[0],
+        other => {
+            return Err(EmitError::at(
+                id,
+                format!(
+                    "`quadform`: §07 gives `x` the domain \"vector\", so a rank-1 operand is \
+                     required, got {other:?}"
+                ),
+            ));
+        }
+    };
+    if len != Some(n) {
+        return Err(EmitError::at(
+            id,
+            format!("`quadform`: `x` must have length {n} to match the {n}x{n} `A`, got {len:?}"),
+        ));
+    }
+    let ax = e.matvec(&a, &x);
+    Ok(e.inner_product(&x, &ax))
 }
 
 /// Which matrix a §07 stack constructor builds out of its argument's vectors.
@@ -1275,7 +1565,17 @@ fn common_shape(da: &[Option<u64>], db: &[Option<u64>]) -> Vec<Option<u64>> {
 /// `Lit(Bool)`, which lowers as a plain `tensor<f32>` `dense<1.0>` via
 /// `constant`) would make the declared `i1` operand disagree with the actual
 /// emitted type, producing ill-typed StableHLO.
-const PREDICATE_HEADS: &[&str] = &["in", "compare", "lt", "gt", "le", "ge", "land", "iszero"];
+/// The heads whose CALL NODE this map recognizes as a boolean predicate — the
+/// operand vocabulary of `ifelse`'s condition and of §07's logical connectives.
+///
+/// Every entry lowers to an `i1`-typed [`Value`], so the list is exactly "the
+/// boolean-producing heads this map lowers". It does NOT admit a `Bool`-typed
+/// VALUE (a bound boolean, a boolean ABI input), which stays refused as a
+/// separate gap (`flatppl-dev/stablehlo-feature-matrix.md`, prioritized gap 6).
+const PREDICATE_HEADS: &[&str] = &[
+    "in", "compare", "lt", "gt", "le", "ge", "land", "lor", "lxor", "lnot", "iszero", "equal",
+    "unequal", "isfinite", "isinf", "isnan",
+];
 
 /// An `ifelse` condition / `land` operand must be one of
 /// [`PREDICATE_HEADS`]. Same narrow-and-refuse discipline as `get`/`get0`'s
@@ -1324,26 +1624,158 @@ fn lower_compare(
     Ok(e.compare(dir, &a, &b))
 }
 
-/// §07 `land` (`a && b`, over `booleans`) — `stablehlo.and` over two `i1`
-/// predicates. Both operands must be [`PREDICATE_HEADS`] calls, and must share
-/// a shape: [`Emitter::and`] renders ONE type for both operands and the result,
-/// so a mismatched pair would emit ill-typed text.
-fn lower_land(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
+/// §07 "Comparison functions" `equal`/`unequal` — one `stablehlo.compare`
+/// `EQ`/`NE`.
+///
+/// The operand domain is §07's verbatim: "`integers`, `booleans`, strings", and
+/// §07 states why — "Exact equality (`equal` / `==` and `unequal` / `!=`) is
+/// restricted to discrete domains to avoid dependence on numerical precision.
+/// To compare real-valued quantities for exact equality, use a function that
+/// guarantees a discrete result like `integer(x)`, `floor(x)`, `ceil(x)`, or
+/// `round(x)`." So a `Real` operand is REFUSED rather than compared: emitting
+/// a float `compare EQ` would answer a question §07 declines to define, and
+/// §07 already names `iszero` as the one exact test that does admit a
+/// non-discrete input. A string operand has no tensor form and refuses in
+/// `crate::types` before reaching here.
+///
+/// The refusal reads the LOWERED operand kinds, not the inferred types: a
+/// determiniser-synthesized node may carry no type, and it is the emitted
+/// element type that decides whether the comparison is float or integer.
+fn lower_exact_compare(
+    e: &mut Emitter,
+    id: NodeId,
+    args: &[NodeId],
+    dir: &str,
+) -> Result<Value, EmitError> {
     let [a_id, b_id] = args_exact(id, args)?;
-    require_predicate_head(e, a_id, "land operand")?;
-    require_predicate_head(e, b_id, "land operand")?;
+    require_same_orientation(e, id, a_id, b_id)?;
+    let a = e.lower_node(a_id)?;
+    let b = e.lower_node(b_id)?;
+    require_broadcastable(id, &a, &b)?;
+    for v in [&a, &b] {
+        if v.elem == ElemKind::Real {
+            return Err(EmitError::at(
+                id,
+                "equal/unequal: §07 \"Comparison functions\" gives these the domain \
+                 \"`integers`, `booleans`, strings\" and states that exact equality \"is \
+                 restricted to discrete domains to avoid dependence on numerical precision\". \
+                 A real operand has no `==` lowering — wrap it in a function that guarantees \
+                 a discrete result (`integer`, `floor`, `ceil`, `round`), or use `iszero`, \
+                 which §07 defines for a non-discrete input",
+            ));
+        }
+    }
+    Ok(e.compare(dir, &a, &b))
+}
+
+/// Which §07 "Logical operators" connective a two-operand logic head is.
+#[derive(Clone, Copy)]
+enum Connective {
+    /// `land` — `a && b`.
+    And,
+    /// `lor` — `a || b`.
+    Or,
+    /// `lxor` — §07's exclusive disjunction ("no infix operator").
+    Xor,
+}
+
+/// §07 `land`/`lor`/`lxor` (`a && b`, `a || b`, exclusive or, all over
+/// `booleans`) — one `stablehlo.and`/`or`/`xor` over two `i1` predicates.
+///
+/// Both operands must be [`PREDICATE_HEADS`] calls, and must share a shape:
+/// [`Emitter::and`] and its siblings render ONE type for both operands and the
+/// result, so a mismatched pair would emit ill-typed text.
+///
+/// The [`PREDICATE_HEADS`] requirement is NOT "must be boolean" — a `Bool`-typed
+/// bound value or ABI input renders `i1` too and would emit fine. It is the
+/// deliberately narrow same-shape gate `ifelse` uses, kept identical here so the
+/// boolean-VALUE gap is one documented refusal rather than half-closed in two
+/// inconsistent places (`flatppl-dev/stablehlo-feature-matrix.md`, prioritized
+/// gap 6).
+fn lower_land(
+    e: &mut Emitter,
+    id: NodeId,
+    args: &[NodeId],
+    which: Connective,
+) -> Result<Value, EmitError> {
+    let name = match which {
+        Connective::And => "land",
+        Connective::Or => "lor",
+        Connective::Xor => "lxor",
+    };
+    let [a_id, b_id] = args_exact(id, args)?;
+    require_predicate_head(e, a_id, &format!("{name} operand"))?;
+    require_predicate_head(e, b_id, &format!("{name} operand"))?;
     let a = e.lower_node(a_id)?;
     let b = e.lower_node(b_id)?;
     if a.ty != b.ty {
         return Err(EmitError::at(
             id,
             format!(
-                "land: operands must have the same shape, got {:?} and {:?}",
+                "{name}: operands must have the same shape, got {:?} and {:?}",
                 a.ty, b.ty
             ),
         ));
     }
-    Ok(e.and(&a, &b))
+    Ok(match which {
+        Connective::And => e.and(&a, &b),
+        Connective::Or => e.or(&a, &b),
+        Connective::Xor => e.xor(&a, &b),
+    })
+}
+
+/// §07 `lnot` (`!a`, over `booleans`) — one `stablehlo.not`. Same
+/// [`PREDICATE_HEADS`] operand rule as [`lower_land`], for the same reason.
+fn lower_lnot(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
+    let [a_id] = args_exact(id, args)?;
+    require_predicate_head(e, a_id, "lnot operand")?;
+    let a = e.lower_node(a_id)?;
+    Ok(e.not(&a))
+}
+
+/// Which §07 "Scalar predicates" finiteness test a head is.
+#[derive(Clone, Copy)]
+enum Finiteness {
+    /// `isfinite` — "`x` is a finite number (not ±∞, not NaN)".
+    Finite,
+    /// `isinf` — "`x` is $+\infty$ or $-\infty$".
+    Inf,
+    /// `isnan` — "`x` is NaN".
+    Nan,
+}
+
+/// §07 `isfinite`/`isinf`/`isnan`, composed out of ops this crate has already
+/// validated rather than the `chlo.is_inf` family:
+///
+/// - `isnan(x)` is `x != x`, the IEEE-754 definition (NaN is the one value not
+///   equal to itself);
+/// - `isinf(x)` is `abs(x) == inf`, true for both signs and false for NaN
+///   (`NaN == inf` is false);
+/// - `isfinite(x)` is `abs(x) < inf`, false for ±∞ AND false for NaN (an
+///   unordered comparison is false), which is exactly §07's "not ±∞, not NaN".
+///
+/// An `Int` or `Bool` operand takes the same path: [`Emitter::compare`] widens
+/// it to the float dtype exactly (§03 `booleans ⊂ integers ⊂ reals`), where
+/// `isfinite` is `true` and the other two `false` — the right answers for a
+/// value family with no infinities.
+fn lower_finiteness(
+    e: &mut Emitter,
+    id: NodeId,
+    args: &[NodeId],
+    which: Finiteness,
+) -> Result<Value, EmitError> {
+    let [a_id] = args_exact(id, args)?;
+    let a = e.lower_node(a_id)?;
+    if matches!(which, Finiteness::Nan) {
+        return Ok(e.compare("NE", &a, &a));
+    }
+    let mag = e.abs(&a);
+    let inf = e.inf(mag.ty.clone());
+    Ok(match which {
+        Finiteness::Finite => e.compare("LT", &mag, &inf),
+        Finiteness::Inf => e.compare("EQ", &mag, &inf),
+        Finiteness::Nan => unreachable!("handled above"),
+    })
 }
 
 /// §07 `iszero` — `stablehlo.compare EQ` against zero. §07: "`iszero` checks
@@ -1416,6 +1848,42 @@ fn lower_extremum(
     Ok(match which {
         Extremum::Max => e.reduce_max(&xs),
         Extremum::Min => e.reduce_min(&xs),
+    })
+}
+
+/// §07 "Elementary functions" `min(a, b)` / `max(a, b)` — the BINARY pair,
+/// one `stablehlo.minimum`/`maximum`. Distinct from [`lower_extremum`]'s
+/// same-family `minimum`/`maximum` reductions, which take one array.
+///
+/// A `Bool` operand refuses: §07's domain here is `reals`, and while §03 nests
+/// `booleans ⊂ integers ⊂ reals` so an INTEGER operand is in domain (and keeps
+/// an integer result through [`Emitter::min`]'s kind-polymorphic
+/// [`Emitter::binary`]), `stablehlo.minimum` over `i1` is a conjunction, which
+/// is §07's `land` rather than its `min`.
+fn lower_binary_extremum(
+    e: &mut Emitter,
+    id: NodeId,
+    args: &[NodeId],
+    which: Extremum,
+) -> Result<Value, EmitError> {
+    let [a_id, b_id] = args_exact(id, args)?;
+    require_same_orientation(e, id, a_id, b_id)?;
+    let a = e.lower_node(a_id)?;
+    let b = e.lower_node(b_id)?;
+    require_broadcastable(id, &a, &b)?;
+    for v in [&a, &b] {
+        if v.elem == ElemKind::Bool {
+            return Err(EmitError::at(
+                id,
+                "min/max: §07 \"Elementary functions\" gives the binary `min`/`max` the domain \
+                 `reals`, and over booleans `stablehlo.minimum`/`maximum` is a conjunction / \
+                 disjunction — §07's `land`/`lor`, not its `min`/`max`. Convert to reals first",
+            ));
+        }
+    }
+    Ok(match which {
+        Extremum::Max => e.max(&a, &b),
+        Extremum::Min => e.min(&a, &b),
     })
 }
 

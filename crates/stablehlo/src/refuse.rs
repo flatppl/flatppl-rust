@@ -202,12 +202,84 @@
 //!   decides, on the same bare-vs-`broadcast`-headed discriminator as `mul`; an
 //!   `%any`/`%deferred`/absent operand type keeps the ordinary path, so the guard
 //!   refuses only a pair it can prove is out of domain.
+//! - the BINARY `min`/`max` (§07 "Elementary functions") over a `Bool` operand
+//!   — "min/max: §07 ... gives the binary `min`/`max` the domain `reals`, and
+//!   over booleans `stablehlo.minimum`/`maximum` is a conjunction / disjunction
+//!   — §07's `land`/`lor`, not its `min`/`max` ...". An `Int` operand is NOT
+//!   refused: §03 nests `booleans ⊂ integers ⊂ reals`, and an integer
+//!   `stablehlo.minimum` is both legal and what §07's formula means.
+//! - `equal`/`unequal` over a `Real` operand — "equal/unequal: §07 \"Comparison
+//!   functions\" gives these the domain \"`integers`, `booleans`, strings\" and
+//!   states that exact equality \"is restricted to discrete domains to avoid
+//!   dependence on numerical precision\" ...". The refusal IS the lowering:
+//!   emitting a float `compare EQ` would answer a question §07 declines to
+//!   define, so the message names the four discretizing functions §07 offers
+//!   (`integer`/`floor`/`ceil`/`round`) plus `iszero`, which §07 defines for a
+//!   non-discrete input and which this map still lowers over the same operand.
+//!   A STRING operand never reaches here — `types.rs` refuses it first.
+//! - `land`/`lor`/`lxor`/`lnot` whose operand is not a boolean-producing call —
+//!   "<head> operand must be a boolean predicate (in/compare/lt/gt/le/ge/land/
+//!   lor/lxor/lnot/iszero/equal/unequal/isfinite/isinf/isnan)". Shared with
+//!   `ifelse`'s condition check (`ops::require_predicate_head` over
+//!   `ops::PREDICATE_HEADS`). Deliberately NOT widened to any `Bool`-typed
+//!   VALUE, though one renders `i1` and would emit: the boolean-value gap is
+//!   left as ONE documented refusal
+//!   (`flatppl-dev/stablehlo-feature-matrix.md`, prioritized gap 6) rather than
+//!   half-closed inconsistently across `ifelse` and the connectives.
+//! - `land`/`lor`/`lxor` whose operands have different shapes — "<head>:
+//!   operands must have the same shape, got ... and ...". `Emitter::and`/`or`/
+//!   `xor` render ONE type for both operands and the result.
+//! - `diag` with a non-zero offset `k` — "`diag`: only the MAIN diagonal (`k =
+//!   0`, §07's default) lowers, got k = N — a §07 super- or sub-diagonal needs a
+//!   shifted mask and a shorter result than this lowering produces". PARTIAL
+//!   against §07's entry, which defines every `k`; `Emitter::diag` masks on
+//!   `row == col`. A non-literal `k` gets its own wording ("the diagonal offset
+//!   `k` must be an integer literal").
+//! - `diag`/`trace`/`lower_cholesky`/`row_gram`/`col_gram`/`quadform` on a
+//!   non-rank-2 operand — "`<head>`: §07 \"Linear algebra\" gives this a matrix
+//!   domain, so a rank-2 operand is required, got ..."; and `self_outer` on a
+//!   non-rank-1 one — "`self_outer`: §07 ... gives it the domain \"vectors\"
+//!   ...". Every one of these `Emitter` matrix helpers PANICS on a bad rank
+//!   (`ops::matrix_dims` is what keeps them unreachable).
+//! - `diag`/`trace`/`quadform`/`lower_cholesky` on a non-SQUARE matrix —
+//!   "`<head>`: §07 \"Linear algebra\" gives this the domain \"square
+//!   matrices\", got MxN" (`ops::square_dim`). §07's `diag` domain is the wider
+//!   "matrices", but `Emitter::diag` row-sums an `n`-column mask, so on an `m`x`n`
+//!   operand with `m > n` it returns `m` entries — zeros for the rows the
+//!   diagonal never reaches — instead of §07's `min(m, n)`.
+//! - a dynamic (`?`) axis on any of the above — "`<head>`: a dynamic matrix axis
+//!   has no lowering, got ...". Not test-locked: `cartpow` over a fixed size
+//!   always resolves statically.
+//! - `diag`/`trace`/`lower_cholesky` on a non-`Real` matrix — "`<head>`: only a
+//!   real matrix is supported, got ... — the underlying lowering emits
+//!   float-typed index and identity constants ...". This is the Real-hardcode
+//!   family (`ops::require_real_matrix`): `Emitter::diag` renders its
+//!   iota/mask matrices and its reduction identity as floats unconditionally,
+//!   and `Emitter::cholesky` renders `stablehlo.cholesky` at the operand's own
+//!   kind while tagging the result `Real`, so an integer operand emits a
+//!   self-contradictory module IREE rejects outright. The head refuses rather
+//!   than reaching the helper. `row_gram`/`col_gram`/`quadform`/`self_outer` are
+//!   NOT in this family — they run through `Emitter::dot_contract`, which widens
+//!   to the operands' common §03 kind, so an integer Gram stays integer.
+//!   (The same hardcode is still reachable through `registry.rs`'s
+//!   `MvNormal`/`Wishart`/`LKJ` builders, which call `Emitter::cholesky`
+//!   directly — carded separately, not closed here.)
+//! - `quadform` whose vector length disagrees with `A`'s order — "`quadform`:
+//!   `x` must have length N to match the NxN `A`, got ...".
+//!   `Emitter::matvec` panics on a contracting-dim mismatch.
 //! - an unknown builtin head — "unsupported builtin head '...'"
 //! - wrong arity for any arity-checked head (`args_exact`, shared by
 //!   `unary`/`binary`/`ifelse`/`get`/`get0`/`in`/`inf`) — "expected N
-//!   argument(s), got M"
-//! - `ifelse`'s condition is not an `in`/`compare` predicate call — "ifelse
-//!   condition must be a boolean predicate (in/compare)"
+//!   argument(s), got M". `diag` is the one head with its OWN arity message
+//!   ("`diag`: expected 1 or 2 argument(s), got N"), because §07 gives it an
+//!   optional second argument that `args_exact`'s fixed `N` cannot express.
+//! - `ifelse`'s condition is not a boolean-producing predicate call — "ifelse
+//!   condition must be a boolean predicate (in/compare/lt/gt/le/ge/land/lor/
+//!   lxor/lnot/iszero/equal/unequal/isfinite/isinf/isnan)". The list is
+//!   `ops::PREDICATE_HEADS` verbatim — every head in this map that lowers to an
+//!   `i1` — so it grows whenever a boolean head is wired. The doc here said
+//!   "(in/compare)" through several waves in which the actual message had
+//!   already grown; it is generated from the constant, so quote the constant.
 //! - `broadcast_to` asked to broadcast a non-scalar, differently-shaped
 //!   operand (e.g. `in`'s bounds against its variate) — "shape mismatch:
 //!   cannot broadcast ... to ..."
