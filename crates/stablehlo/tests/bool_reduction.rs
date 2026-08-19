@@ -17,9 +17,11 @@
 //! | `sum(x .> 0.0)`, `x = [-1, -2, -3, -4]` | 0 | 0 |
 //! | `sum(x .> 0.0)`, `x = [0, 0, 1, 2]` | 2 | 2 |
 //! | `sum(x .> 0.0)`, `x = [5, 5, 5, 5]` | 4 | 4 |
+//! | `sum(rowstack([[T,F,T],[T,T,F]]))` | 4 | 4 |
+//! | `sum(x .> 0.0)`, `x` a `[2, 3]` argument | 4 / 0 / 6 / 1 | same |
 //!
-//! Before the fix the same masks executed to `false` / `true` / `true` / `false` — the
-//! parity of the count.
+//! Before the fix the same rank-1 masks executed to `false` / `true` / `true` / `false` —
+//! the parity of the count.
 //!
 //! New tests live here rather than in `golden.rs` because two sibling branches are
 //! landing changes in that file.
@@ -151,6 +153,49 @@ fn real_and_integer_sums_emit_no_conversion() {
     assert!(
         int.contains("(tensor<3xi32>, tensor<i32>) -> tensor<i32>"),
         "and reduces at i32:\n{int}"
+    );
+}
+
+/// A RANK-2 boolean `sum` converts ONCE and then reduces axis by axis.
+/// `Emitter::reduce_full` calls `reduce_axis` once per rank, and `reduce_axis` promotes at
+/// its top — so a naive reading would expect one `stablehlo.convert` per axis. There is
+/// exactly one: the first pass converts `i1` → `i32`, and every later pass sees an `i32`
+/// operand, for which `Emitter::convert` is a no-op that emits no line.
+///
+/// This case became emittable only when `rowstack` gained a lowering (#177); before that
+/// the rank-2 boolean reduce could not be executed at all. Executed under IREE against
+/// numpy: `sum(rowstack([[true, false, true], [true, true, false]]))` = 4 = `np.sum`, and
+/// the runtime-mask form `sum(x .> 0.0)` over a `[2, 3]` argument = 4 / 0 / 6 / 1 for
+/// `[[1,-2,3],[4,-5,6]]` / all-negative / all-ones / `[[0,0,0],[0,0,7]]`, each matching.
+#[test]
+fn a_rank_two_boolean_sum_converts_once_then_reduces_each_axis() {
+    let src = "m = rowstack([[true, false, true], [true, true, false]])\n\
+               c = sum(m)\n\
+               outputs = (c)\n";
+    let mlir = emit(src, &["outputs"]);
+    assert_eq!(
+        mlir.matches("stablehlo.convert").count(),
+        1,
+        "exactly one convert, not one per axis:\n{mlir}"
+    );
+    assert!(
+        mlir.contains("stablehlo.convert %16 : (tensor<2x3xi1>) -> tensor<2x3xi32>"),
+        "the whole rank-2 batch is promoted up front:\n{mlir}"
+    );
+    // Two reduces, each at i32: [2, 3] -> [3] -> scalar.
+    assert_eq!(
+        mlir.matches("stablehlo.reduce").count(),
+        2,
+        "one reduce per axis:\n{mlir}"
+    );
+    assert!(
+        mlir.contains("(tensor<2x3xi32>, tensor<i32>) -> tensor<3xi32>")
+            && mlir.contains("(tensor<3xi32>, tensor<i32>) -> tensor<i32>"),
+        "both passes run at i32:\n{mlir}"
+    );
+    assert!(
+        mlir.contains("func.func @logdensity() -> tensor<i32>"),
+        "and the ABI returns a count:\n{mlir}"
     );
 }
 
