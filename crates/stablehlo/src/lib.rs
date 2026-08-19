@@ -173,6 +173,7 @@
 //! See `crates/stablehlo/docs/inputs-outputs-abi.md` for the full reference —
 //! every refusal rule and query-module usage.
 
+mod aggregate;
 mod emitter;
 mod mlir;
 mod modes;

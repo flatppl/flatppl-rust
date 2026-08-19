@@ -11928,3 +11928,577 @@ outputs = (lp)
     );
     assert!(is_delimiter_balanced(&out));
 }
+
+// ---------------------------------------------------------------------------
+// §04 "Multi-axis aggregation" — `aggregate` (and its `:=` sugar)
+// ---------------------------------------------------------------------------
+
+/// `emit_logdensity`'s refusing counterpart, for the aggregate guard tests.
+fn emit_logdensity_err(m: &Module) -> flatppl_stablehlo::EmitError {
+    flatppl_stablehlo::emit(
+        m,
+        flatppl_stablehlo::Mode::LogDensity,
+        &flatppl_stablehlo::EmitOptions::default(),
+    )
+    .expect_err("must refuse, not emit")
+}
+
+/// Emit `src`'s `@logdensity` through the `inputs`/`outputs` ABI — the shared
+/// front end for every aggregate test below.
+fn emit_agg(src: &str) -> String {
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let out = emit_logdensity(&d);
+    assert!(
+        out.contains("module {") && is_delimiter_balanced(&out),
+        "well-formed module:\n{out}"
+    );
+    out
+}
+
+/// The refusal for `src`, from the emitter (inference and determinization must
+/// both stay clean — an aggregate shape error this backend cannot lower is not
+/// necessarily a language error).
+fn refuse_agg(src: &str) -> String {
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    emit_logdensity_err(&d).msg
+}
+
+/// §04's operands `A` (2x3) and `B` (3x2), as ABI inputs rather than
+/// `rowstack` literals: `rowstack` has no lowering in this crate, and passing
+/// the matrices as function arguments is also what lets the numeric gate feed
+/// §04's own values in and compare the executed result against its printed one.
+const AGG_A: &str = "A = elementof(cartpow(reals, [2, 3]))\n";
+const AGG_B: &str = "B = elementof(cartpow(reals, [3, 2]))\n";
+
+/// §04 example 1, matrix multiplication:
+/// `C = aggregate(sum, [.i, .k], A[.i, .j] * B[.j, .k])` → `[[6, 8], [10, 6]]`.
+///
+/// The frozen golden pins the whole frame model in one place: `.i`/`.k` (the
+/// output axes) lead the frame and `.j` (reduced) trails it, `A` enters under a
+/// monotone `dims = [0, 2]`, `B` needs a `stablehlo.transpose` first because its
+/// axes appear in descending frame order, and the single `stablehlo.reduce` is
+/// over the TRAILING dimension only.
+///
+/// Numerics verified by execution, not by reading: compiled with
+/// `iree-compiler` (llvm-cpu) and run on §04's own `A`/`B`, this returns
+/// `[[6, 8], [10, 6]]` — the value §04 prints.
+#[test]
+fn aggregate_matmul_matches_frozen_golden() {
+    let src = format!(
+        "flatppl_compat = \"0.1\"\n{AGG_A}{AGG_B}\
+         C = aggregate(sum, [.i, .k], A[.i, .j] * B[.j, .k])\n\
+         inputs = (A, B)\noutputs = (C)\n"
+    );
+    let out = emit_agg(&src);
+    assert_eq!(
+        out,
+        include_str!("goldens/aggregate_matmul.mlir"),
+        "emitted @logdensity drifted from tests/goldens/aggregate_matmul.mlir"
+    );
+}
+
+/// §04 example 2, the weighted sum of squared differences reducing over `.j`:
+/// `D = aggregate(sum, [.i, .k], (A[.i, .j] - B[.j, .k])^2 * w[.j])` →
+/// `[[34, 25], [114, 113]]`.
+///
+/// The point beyond example 1: three operands of three different ranks share
+/// one frame (`w` is rank-1 and enters under `dims = [2]`), and the body's
+/// arithmetic — `sub`, `pow`, `mul` — is the ORDINARY `crate::ops` lowering,
+/// with no aggregate-aware variant, because each `get` node is pre-bound to its
+/// frame-shaped value before the body is walked.
+///
+/// Numerics verified by execution (IREE llvm-cpu, §04's own `A`/`B`/`w`):
+/// `[[34, 25], [114, 113]]`.
+#[test]
+fn aggregate_weighted_squared_difference_matches_frozen_golden() {
+    let src = format!(
+        "flatppl_compat = \"0.1\"\n{AGG_A}{AGG_B}\
+         w = elementof(cartpow(reals, 3))\n\
+         D = aggregate(sum, [.i, .k], (A[.i, .j] - B[.j, .k])^2 * w[.j])\n\
+         inputs = (A, B, w)\noutputs = (D)\n"
+    );
+    let out = emit_agg(&src);
+    assert_eq!(
+        out,
+        include_str!("goldens/aggregate_weighted_sqdiff.mlir"),
+        "emitted @logdensity drifted from tests/goldens/aggregate_weighted_sqdiff.mlir"
+    );
+}
+
+/// §04 example 3, the column-wise variance `V = aggregate(var, [.j], A[.i, .j])`
+/// → `[32, 2, 8]`.
+///
+/// `var` is DERIVED, and this golden is where the derivation is pinned: the
+/// frame is `[.j, .i]` (the output axis leads, so `A` transposes into it), the
+/// column sum divides by `n = 2` for the mean, the mean broadcasts back over the
+/// reduced axis, and the centred sum of squares divides by `n - 1 = 1`. §07's
+/// row gives $\frac{1}{n-1}\sum_i (x_i - \bar x)^2$, and §04's printed
+/// `[32, 2, 8]` is that Bessel-corrected value — the population variance would
+/// print `[16, 1, 4]`.
+///
+/// Numerics verified by execution (IREE llvm-cpu, §04's own `A`): `[32, 2, 8]`,
+/// and `std` over the same input matches `numpy`'s `ddof=1` standard deviation
+/// to f32.
+#[test]
+fn aggregate_column_variance_matches_frozen_golden() {
+    let src = format!(
+        "flatppl_compat = \"0.1\"\n{AGG_A}\
+         V = aggregate(var, [.j], A[.i, .j])\n\
+         inputs = (A)\noutputs = (V)\n"
+    );
+    let out = emit_agg(&src);
+    assert_eq!(
+        out,
+        include_str!("goldens/aggregate_column_var.mlir"),
+        "emitted @logdensity drifted from tests/goldens/aggregate_column_var.mlir"
+    );
+}
+
+/// §04 example 4, the row-wise sum with one fixed column:
+/// `S = aggregate(sum, [.i], A[.i, 1])` → `[1, 9]`.
+///
+/// Two things are pinned. The MIXED index list (an axis name beside a literal
+/// index) lowers to `slice` + `reshape`, dropping the literal position before the
+/// operand enters the frame. And nothing is reduced: `.i` is the only axis and it
+/// is an output axis, so no `stablehlo.reduce` is emitted at all — §04's
+/// reduction is over "the axes that do not appear in `output_axes`", and here
+/// there are none.
+///
+/// Numerics verified by execution (IREE llvm-cpu, §04's own `A`): `[1, 9]` —
+/// which also confirms the 1-based indexing §07 gives `get` ("element access or
+/// subset selection (1-based indices)"); 0-based would print `[3, 5]`.
+#[test]
+fn aggregate_fixed_column_sum_matches_frozen_golden() {
+    let src = format!(
+        "flatppl_compat = \"0.1\"\n{AGG_A}\
+         S = aggregate(sum, [.i], A[.i, 1])\n\
+         inputs = (A)\noutputs = (S)\n"
+    );
+    let out = emit_agg(&src);
+    assert_eq!(
+        out,
+        include_str!("goldens/aggregate_fixed_column_sum.mlir"),
+        "emitted @logdensity drifted from tests/goldens/aggregate_fixed_column_sum.mlir"
+    );
+}
+
+/// §04 example 5, the product over `.j` of `(A + B)` entries:
+/// `P = aggregate(prod, [.i, .k], A[.i, .j] + B[.j, .k])` →
+/// `[[36, 24], [100, 108]]`.
+///
+/// Pins the `prod` contraction: `stablehlo.multiply` across the trailing
+/// dimension with the MULTIPLICATIVE identity `1.000000e+00` — the identity
+/// selection `Emitter::reduce_axis` has no form for, which is why
+/// `Emitter::reduce_trailing_axes` supplies its own per-combine one.
+///
+/// Numerics verified by execution (IREE llvm-cpu, §04's own `A`/`B`):
+/// `[[36, 24], [100, 108]]`. An additive identity here would print
+/// `[[11, 11], [16, 16]]`.
+#[test]
+fn aggregate_prod_over_sum_matches_frozen_golden() {
+    let src = format!(
+        "flatppl_compat = \"0.1\"\n{AGG_A}{AGG_B}\
+         P = aggregate(prod, [.i, .k], A[.i, .j] + B[.j, .k])\n\
+         inputs = (A, B)\noutputs = (P)\n"
+    );
+    let out = emit_agg(&src);
+    assert_eq!(
+        out,
+        include_str!("goldens/aggregate_prod_over_sum.mlir"),
+        "emitted @logdensity drifted from tests/goldens/aggregate_prod_over_sum.mlir"
+    );
+}
+
+/// The surface `:=` sugar (§04 "`:=` notation") emits the IDENTICAL module to
+/// the explicit `aggregate(sum, …)` call — it is a parser rewrite, so this is
+/// the property the emitter must not break, not a second lowering to maintain.
+#[test]
+fn aggregate_walrus_sugar_emits_the_same_module_as_the_call_form() {
+    let sugar = format!(
+        "flatppl_compat = \"0.1\"\n{AGG_A}{AGG_B}\
+         C[.i, .k] := A[.i, .j] * B[.j, .k]\n\
+         inputs = (A, B)\noutputs = (C)\n"
+    );
+    assert_eq!(
+        emit_agg(&sugar),
+        include_str!("goldens/aggregate_matmul.mlir"),
+        "`:=` is a parser rewrite of sum-aggregate, so it must emit the same module"
+    );
+}
+
+/// §04: "The empty axis list `[]` is legal and denotes full reduction to a
+/// scalar." Both frame axes are reduced, so the result is `tensor<f32>`.
+///
+/// Numerics verified by execution (IREE llvm-cpu): `[1, 2, 3] · [4, 5, 6]` = 32.
+#[test]
+fn aggregate_empty_axis_list_reduces_to_a_scalar() {
+    let src = "flatppl_compat = \"0.1\"\n\
+u = elementof(cartpow(reals, 3))\n\
+v = elementof(cartpow(reals, 3))\n\
+s[] := u[.i] * v[.i]\n\
+inputs = (u, v)\noutputs = (s)\n";
+    let out = emit_agg(src);
+    assert!(
+        out.contains("-> tensor<f32>") && out.contains("return %"),
+        "full reduction must return a rank-0 tensor, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.reduce").count(),
+        1,
+        "one axis, one reduce, in:\n{out}"
+    );
+}
+
+/// `mean` divides the sum by the statically known reduced-element count (§07:
+/// $\bar x = \frac{1}{n}\sum_i x_i$), which for a 2-row column-wise mean is 2.
+///
+/// Numerics verified by execution (IREE llvm-cpu) against `numpy`'s
+/// `A.mean(axis=0)`.
+#[test]
+fn aggregate_mean_divides_the_sum_by_the_reduced_count() {
+    let src = format!(
+        "flatppl_compat = \"0.1\"\n{AGG_A}\
+         m = aggregate(mean, [.j], A[.i, .j])\n\
+         inputs = (A)\noutputs = (m)\n"
+    );
+    let out = emit_agg(&src);
+    assert!(
+        out.contains("stablehlo.constant dense<2.0> : tensor<f32>")
+            && out.contains("stablehlo.divide"),
+        "mean must divide by the reduced count 2, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.reduce").count(),
+        1,
+        "mean is one sum plus a divide, in:\n{out}"
+    );
+}
+
+/// `std` is $\sqrt{\mathrm{var}}$ (§07's row), so it emits `var`'s two
+/// reductions and one `stablehlo.sqrt` on top.
+///
+/// Numerics verified by execution (IREE llvm-cpu) against `numpy`'s
+/// `A.std(axis=0, ddof=1)`.
+#[test]
+fn aggregate_std_is_the_square_root_of_the_variance() {
+    let src = format!(
+        "flatppl_compat = \"0.1\"\n{AGG_A}\
+         sd = aggregate(std, [.j], A[.i, .j])\n\
+         inputs = (A)\noutputs = (sd)\n"
+    );
+    let out = emit_agg(&src);
+    assert!(
+        out.contains("stablehlo.sqrt"),
+        "std must take a root:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.reduce").count(),
+        2,
+        "var's sum and centred sum of squares, in:\n{out}"
+    );
+}
+
+/// `maximum`/`minimum` contract with the dtype-exact ∓inf identities — a finite
+/// stand-in would be silently wrong for an input past it (`Emitter::reduce_max`'s
+/// own reasoning), so the bit patterns are asserted, not just the combine.
+///
+/// Numerics verified by execution (IREE llvm-cpu) against `numpy`'s
+/// `A.max(axis=1)` / `A.min()`.
+#[test]
+fn aggregate_extrema_use_the_dtype_exact_infinite_identities() {
+    let mx = format!(
+        "flatppl_compat = \"0.1\"\n{AGG_A}\
+         mx = aggregate(maximum, [.i], A[.i, .j])\n\
+         inputs = (A)\noutputs = (mx)\n"
+    );
+    let out = emit_agg(&mx);
+    assert!(
+        out.contains("dense<0xFF800000>") && out.contains("applies stablehlo.maximum"),
+        "maximum reduces from -inf, in:\n{out}"
+    );
+    let mn = format!(
+        "flatppl_compat = \"0.1\"\n{AGG_A}\
+         mn = aggregate(minimum, [], A[.i, .j])\n\
+         inputs = (A)\noutputs = (mn)\n"
+    );
+    let out = emit_agg(&mn);
+    assert!(
+        out.contains("dense<0x7F800000>") && out.contains("applies stablehlo.minimum"),
+        "minimum reduces from +inf, in:\n{out}"
+    );
+}
+
+/// A literal index between two axis names on a rank-3 operand (§04: "mixed
+/// indexing like `A[.i, 1, .j]` … is legal, as is `get(A, .i, 1, .j)`"): the
+/// middle position is sliced away, the two named axes survive.
+///
+/// Numerics verified by execution (IREE llvm-cpu) on `arange(24).reshape(2,3,4)`:
+/// rows `T[0, 1, :]` and `T[1, 1, :]`, i.e. `[[4, 5, 6, 7], [16, 17, 18, 19]]`.
+#[test]
+fn aggregate_lowers_a_literal_index_between_two_axis_names() {
+    let src = "flatppl_compat = \"0.1\"\n\
+T = elementof(cartpow(reals, [2, 3, 4]))\n\
+R = aggregate(sum, [.i, .k], get(T, .i, 2, .k))\n\
+inputs = (T)\noutputs = (R)\n";
+    let out = emit_agg(src);
+    assert!(
+        out.contains("stablehlo.slice %arg0 [0:2, 1:2, 0:4]") && out.contains("stablehlo.reshape"),
+        "the literal position must be sliced away, in:\n{out}"
+    );
+    assert!(
+        !out.contains("stablehlo.reduce"),
+        "both remaining axes are output axes — nothing to reduce, in:\n{out}"
+    );
+}
+
+/// §07's `only` selector (surface `B[.i, !]`) inside an aggregation body — the
+/// vocabulary §04's "Relationship to broadcasting" uses. The size-1 axis is
+/// dropped, and with both remaining axes retained the aggregation IS the
+/// elementwise product §04 says it equals.
+///
+/// Numerics verified by execution (IREE llvm-cpu): equal to `A * B` under
+/// `numpy` broadcasting, cell for cell.
+#[test]
+fn aggregate_lowers_the_only_selector_on_a_singleton_axis() {
+    let src = "flatppl_compat = \"0.1\"\n\
+A = elementof(cartpow(reals, [3, 4]))\n\
+B = elementof(cartpow(reals, [3, 1]))\n\
+R = aggregate(sum, [.i, .j], A[.i, .j] * B[.i, !])\n\
+inputs = (A, B)\noutputs = (R)\n";
+    let out = emit_agg(src);
+    assert!(
+        out.contains("stablehlo.reshape") && out.contains("stablehlo.multiply"),
+        "the singleton axis must be reshaped away, in:\n{out}"
+    );
+    assert!(
+        !out.contains("stablehlo.reduce"),
+        "no axis is reduced here, in:\n{out}"
+    );
+}
+
+/// §04: `output_axes` is a list of "distinct axis names … Repeated names are a
+/// static error."
+#[test]
+fn aggregate_refuses_a_repeated_output_axis() {
+    let src = format!(
+        "flatppl_compat = \"0.1\"\n{AGG_A}\
+         C = aggregate(sum, [.i, .i], A[.i, .j])\n\
+         inputs = (A)\noutputs = (C)\n"
+    );
+    let msg = refuse_agg(&src);
+    assert!(
+        msg.contains("output axis `.i` is repeated") && msg.contains("distinct"),
+        "got: {msg}"
+    );
+}
+
+/// §04: "All array dimensions indexed with the same axis name must have the same
+/// length." Naming both lengths is what makes the refusal actionable.
+#[test]
+fn aggregate_refuses_axis_dimensions_of_different_lengths() {
+    let src = "flatppl_compat = \"0.1\"\n\
+A = elementof(cartpow(reals, [2, 3]))\n\
+B = elementof(cartpow(reals, [4, 5]))\n\
+C = aggregate(sum, [.i], A[.i, .j] * B[.i, .j])\n\
+inputs = (A, B)\noutputs = (C)\n";
+    let msg = refuse_agg(src);
+    assert!(
+        msg.contains("axis `.i` indexes dimensions of different lengths, 2 and 4")
+            && msg.contains("same length"),
+        "got: {msg}"
+    );
+}
+
+/// §04: "Every axis name in `output_axes` must occur at least once in `expr`" —
+/// otherwise the result axis has no length to take.
+#[test]
+fn aggregate_refuses_an_output_axis_absent_from_the_body() {
+    let src = format!(
+        "flatppl_compat = \"0.1\"\n{AGG_A}\
+         C = aggregate(sum, [.i, .q], A[.i, .j])\n\
+         inputs = (A)\noutputs = (C)\n"
+    );
+    let msg = refuse_agg(&src);
+    assert!(
+        msg.contains("output axis `.q` does not index anything in the body"),
+        "got: {msg}"
+    );
+}
+
+/// One axis name indexing TWO dimensions of the same operand is a diagonal
+/// extraction. The frame gives each axis name exactly one dimension, and
+/// `stablehlo.broadcast_in_dim`'s dimension map must be unique, so there is no
+/// frame form — refused rather than mis-lowered to the full outer product.
+#[test]
+fn aggregate_refuses_a_diagonal_index() {
+    let src = "flatppl_compat = \"0.1\"\n\
+A = elementof(cartpow(reals, [3, 3]))\n\
+t = aggregate(sum, [], A[.i, .i])\n\
+inputs = (A)\noutputs = (t)\n";
+    let msg = refuse_agg(src);
+    assert!(
+        msg.contains("denotes a diagonal") && msg.contains("one dimension"),
+        "got: {msg}"
+    );
+}
+
+/// §04 admits exactly seven `f_reduction`s ("order-invariant vector-to-scalar").
+/// `cumsum` is a §07 reduction but NOT order-invariant, so it is refused with
+/// the eligible list named rather than reduced with something else.
+#[test]
+fn aggregate_refuses_an_ineligible_reduction() {
+    let src = format!(
+        "flatppl_compat = \"0.1\"\n{AGG_A}\
+         C = aggregate(cumsum, [.j], A[.i, .j])\n\
+         inputs = (A)\noutputs = (C)\n"
+    );
+    let msg = refuse_agg(&src);
+    assert!(
+        msg.contains("`cumsum` is not an eligible reduction")
+            && msg.contains("order-invariant vector-to-scalar reduction"),
+        "got: {msg}"
+    );
+}
+
+/// A body that does not select every dimension of an indexed operand — a
+/// partial index, or §07's whole-axis `all` — yields an ARRAY per axis
+/// combination, while §04 reduces "the resulting scalars".
+#[test]
+fn aggregate_refuses_a_body_that_is_not_scalar_per_axis_combination() {
+    let partial = format!(
+        "flatppl_compat = \"0.1\"\n{AGG_A}\
+         C = aggregate(sum, [.i], A[.i])\n\
+         inputs = (A)\noutputs = (C)\n"
+    );
+    let msg = refuse_agg(&partial);
+    assert!(
+        msg.contains("1 index selector(s) for a rank-2 operand")
+            && msg.contains("the resulting scalars"),
+        "got: {msg}"
+    );
+    let all = format!(
+        "flatppl_compat = \"0.1\"\n{AGG_A}\
+         C = aggregate(sum, [.i], A[.i, :])\n\
+         inputs = (A)\noutputs = (C)\n"
+    );
+    let msg = refuse_agg(&all);
+    assert!(
+        msg.contains("`all` selector") && msg.contains("the resulting scalars"),
+        "got: {msg}"
+    );
+}
+
+/// §07's `only`: "The indexed axis must be of length one."
+#[test]
+fn aggregate_refuses_the_only_selector_on_a_non_singleton_axis() {
+    let src = format!(
+        "flatppl_compat = \"0.1\"\n{AGG_A}\
+         C = aggregate(sum, [.i], A[.i, !])\n\
+         inputs = (A)\noutputs = (C)\n"
+    );
+    let msg = refuse_agg(&src);
+    assert!(
+        msg.contains("`!` indexes a dimension of length 3") && msg.contains("length one"),
+        "got: {msg}"
+    );
+}
+
+/// §07's `var` divides by $n - 1$, so a single element per output cell has no
+/// value — refused rather than emitting a division by zero.
+#[test]
+fn aggregate_refuses_var_over_a_single_element() {
+    let src = "flatppl_compat = \"0.1\"\n\
+A = elementof(cartpow(reals, [1, 3]))\n\
+V = aggregate(var, [.j], A[.i, .j])\n\
+inputs = (A)\noutputs = (V)\n";
+    let msg = refuse_agg(src);
+    assert!(
+        msg.contains("`var` over 1 element(s) is undefined") && msg.contains("$n-1$"),
+        "got: {msg}"
+    );
+}
+
+/// `metricsum` (§04 "Metric-aware Einstein summation") refuses with ITS OWN
+/// reason — the general indefinite matrix inverse its §04 lowering needs, which
+/// StableHLO has no op for — not with the generic unknown-head message. Reached
+/// through the `metric: name[…] := …` statement sugar, so the sugar cannot
+/// silently take a different path.
+#[test]
+fn aggregate_metricsum_refuses_naming_the_missing_matrix_inverse() {
+    let src = "flatppl_compat = \"0.1\"\n\
+g = elementof(cartpow(reals, [2, 2]))\n\
+L1 = elementof(cartpow(reals, [2, 2]))\n\
+L2 = elementof(cartpow(reals, [2, 2]))\n\
+g: L[.mu^, .rho_] := L1[.mu^, .nu_] * L2[.nu^, .rho_]\n\
+inputs = (g, L1, L2)\noutputs = (L)\n";
+    let msg = refuse_agg(src);
+    assert!(
+        msg.contains("metricsum has no lowering in this backend")
+            && msg.contains("indefinite matrix inverse"),
+        "got: {msg}"
+    );
+    assert!(
+        !msg.contains("unsupported builtin head"),
+        "must not fall through to the generic head refusal: {msg}"
+    );
+}
+
+/// A variance-marked axis OUTSIDE `metricsum` — §05 "Axis names and
+/// aggregation" ties the markers to `metricsum`, so a marked axis in a plain
+/// `aggregate` is refused rather than treated as its unmarked namesake.
+#[test]
+fn aggregate_refuses_a_variance_marked_axis() {
+    let src = format!(
+        "flatppl_compat = \"0.1\"\n{AGG_A}\
+         C = aggregate(sum, [.i], A[.i, .j^])\n\
+         inputs = (A)\noutputs = (C)\n"
+    );
+    let msg = refuse_agg(&src);
+    assert!(
+        msg.contains("carries a variance marker") && msg.contains("metricsum"),
+        "got: {msg}"
+    );
+}
+
+/// Chained axis indexing (`A[.i][.j]`) would need the inner operand's own frame
+/// value before the frame exists — refused, with the one-index-list spelling
+/// named.
+#[test]
+fn aggregate_refuses_chained_axis_indexing() {
+    let src = "flatppl_compat = \"0.1\"\n\
+A = elementof(cartpow(cartpow(reals, 3), 2))\n\
+t = aggregate(sum, [], A[.i][.j])\n\
+inputs = (A)\noutputs = (t)\n";
+    let msg = refuse_agg(src);
+    assert!(
+        msg.contains("chained axis indexing") && msg.contains("one index list"),
+        "got: {msg}"
+    );
+}
+
+/// §04: axis names are "lexically scoped to the enclosing `aggregate(...)`", so a
+/// NESTED aggregation owns its own axes and lowers through the ordinary
+/// `lower_node` dispatch — the outer frame's site collection must not descend into
+/// it (or `.j` would join the outer frame and be reduced twice).
+///
+/// Numerics verified by execution (IREE llvm-cpu): with §04's `A` and
+/// `v = [1, 2, 3]`, `A[.i, 1] * sum(v)` is `[6, 54]`.
+#[test]
+fn aggregate_lowers_a_nested_aggregation_in_its_own_axis_scope() {
+    let src = format!(
+        "flatppl_compat = \"0.1\"\n{AGG_A}\
+         v = elementof(cartpow(reals, 3))\n\
+         C = aggregate(sum, [.i], A[.i, 1] * aggregate(sum, [], v[.j]))\n\
+         inputs = (A, v)\noutputs = (C)\n"
+    );
+    let out = emit_agg(&src);
+    assert_eq!(
+        out.matches("stablehlo.reduce").count(),
+        1,
+        "only the inner aggregation reduces — the outer keeps its one output axis, in:\n{out}"
+    );
+    assert!(
+        out.contains("-> tensor<2xf32>"),
+        "the outer result keeps `.i`, in:\n{out}"
+    );
+}

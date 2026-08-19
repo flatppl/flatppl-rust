@@ -72,6 +72,30 @@ pub(crate) fn elem_rank(k: ElemKind) -> u8 {
     }
 }
 
+/// One order-invariant per-axis reduction [`Emitter::reduce_trailing_axes`]
+/// contracts an aggregation frame with. §04's other three eligible reductions
+/// (`mean`, `var`, `std`) are compositions over [`AxisReduce::Sum`] and are
+/// derived in `crate::aggregate`, not spelled as combines here.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum AxisReduce {
+    Sum,
+    Prod,
+    Max,
+    Min,
+}
+
+impl AxisReduce {
+    /// The §04 spelling, for a refusal message.
+    fn spec_name(self) -> &'static str {
+        match self {
+            AxisReduce::Sum => "sum",
+            AxisReduce::Prod => "prod",
+            AxisReduce::Max => "maximum",
+            AxisReduce::Min => "minimum",
+        }
+    }
+}
+
 /// Emits textual StableHLO into an internal buffer while assigning fresh SSA
 /// names and tracking which FlatPDL [`NodeId`]s have already been lowered.
 pub struct Emitter<'m> {
@@ -1187,6 +1211,32 @@ impl<'m> Emitter<'m> {
         a: &Value,
         axis: usize,
     ) -> Value {
+        let init_lit: &str = match a.elem {
+            ElemKind::Real => identity_lit,
+            ElemKind::Int => "0",
+            ElemKind::Bool => "false",
+        };
+        assert!(
+            a.elem == ElemKind::Real || combine_op == "stablehlo.add",
+            "reduce_axis: a non-Real reduction identity exists only for the additive \
+             (stablehlo.add) combine; reduce_max/reduce_min have no integer or boolean ±inf \
+             identity"
+        );
+        self.reduce_axis_lit(combine_op, init_lit, a, axis)
+    }
+
+    /// [`Emitter::reduce_axis`]'s emission half, with the init constant's
+    /// literal already resolved for `a`'s element kind. Split out so
+    /// [`Emitter::reduce_trailing_axes`] can supply a per-kind identity its own
+    /// combine needs (`stablehlo.multiply`'s one, which the additive-only
+    /// selection above has no form for) without duplicating the op text.
+    fn reduce_axis_lit(
+        &mut self,
+        combine_op: &str,
+        init_lit: &str,
+        a: &Value,
+        axis: usize,
+    ) -> Value {
         let dims = match &a.ty {
             MlirTy::Ranked(dims) => dims.clone(),
             other => panic!("reduce_axis expects a ranked operand, got {other:?}"),
@@ -1203,18 +1253,6 @@ impl<'m> Emitter<'m> {
         let operand_ty = a.ty.render(self.dtype, a.elem);
         let result_ty_text = result_ty.render(self.dtype, a.elem);
 
-        let init_lit: &str = match a.elem {
-            ElemKind::Real => identity_lit,
-            ElemKind::Int => "0",
-            ElemKind::Bool => "false",
-        };
-        assert!(
-            a.elem == ElemKind::Real || combine_op == "stablehlo.add",
-            "reduce_axis: a non-Real reduction identity exists only for the additive \
-             (stablehlo.add) combine; reduce_max/reduce_min have no integer or boolean ±inf \
-             identity"
-        );
-
         let init_ssa = self.fresh();
         self.push(&format!(
             "{init_ssa} = stablehlo.constant dense<{init_lit}> : {elem_ty}"
@@ -1230,6 +1268,75 @@ impl<'m> Emitter<'m> {
             ty: result_ty,
             elem: a.elem,
         }
+    }
+
+    /// Reduce `a`'s `n` TRAILING axes with `kind`, leaving the leading axes in
+    /// place and in their existing order — the contraction step of §04
+    /// "Multi-axis aggregation" (`crate::aggregate` orders its frame with the
+    /// `output_axes` leading, so the result needs no permutation afterwards).
+    /// `n == 0` returns `a` unchanged, emitting nothing: reducing over no axis
+    /// leaves a one-element multiset, which every [`AxisReduce`] maps to that
+    /// element.
+    ///
+    /// Refuses rather than emitting an identity constant that does not mean the
+    /// reduction it is spelled for:
+    ///
+    /// - `maximum`/`minimum` over a non-`Real` operand — the ±inf identity has
+    ///   no integer or boolean form. §07 gives both the domain "real arrays",
+    ///   and `ops::lower_extremum` reports the same limit for `maximum(xs)`.
+    /// - `prod` over a `Bool` operand — `stablehlo.multiply` on `i1` is a
+    ///   conjunction, not §07's $\prod_i x_i$.
+    pub(crate) fn reduce_trailing_axes(
+        &mut self,
+        id: NodeId,
+        kind: AxisReduce,
+        a: &Value,
+        n: usize,
+    ) -> Result<Value, EmitError> {
+        if n == 0 {
+            return Ok(a.clone());
+        }
+        let rank = match &a.ty {
+            MlirTy::Ranked(dims) => dims.len(),
+            other => {
+                return Err(EmitError::at(
+                    id,
+                    format!("aggregate: {other:?} has no axis to reduce"),
+                ));
+            }
+        };
+        assert!(
+            n <= rank,
+            "reduce_trailing_axes: {n} trailing axes asked of a rank-{rank} operand"
+        );
+        let (combine_op, identity) = match (kind, a.elem) {
+            (AxisReduce::Sum, ElemKind::Real) => ("stablehlo.add", "0.000000e+00"),
+            (AxisReduce::Sum, ElemKind::Int) => ("stablehlo.add", "0"),
+            (AxisReduce::Sum, ElemKind::Bool) => ("stablehlo.add", "false"),
+            (AxisReduce::Prod, ElemKind::Real) => ("stablehlo.multiply", "1.000000e+00"),
+            (AxisReduce::Prod, ElemKind::Int) => ("stablehlo.multiply", "1"),
+            (AxisReduce::Max, ElemKind::Real) => {
+                ("stablehlo.maximum", reduce_max_identity(self.dtype))
+            }
+            (AxisReduce::Min, ElemKind::Real) => ("stablehlo.minimum", pos_inf_literal(self.dtype)),
+            (kind, elem) => {
+                return Err(EmitError::at(
+                    id,
+                    format!(
+                        "aggregate: the {} reduction has no {elem:?} identity — §07 gives \
+                         `maximum`/`minimum` the domain \"real arrays\" (the ±inf identity has no \
+                         integer or boolean form) and `stablehlo.multiply` over booleans is a \
+                         conjunction, not a product. Convert the body to reals first",
+                        kind.spec_name()
+                    ),
+                ));
+            }
+        };
+        let mut cur = a.clone();
+        for i in 0..n {
+            cur = self.reduce_axis_lit(combine_op, identity, &cur, rank - 1 - i);
+        }
+        Ok(cur)
     }
 
     // ---- matrix helpers -----------------------------------------------------

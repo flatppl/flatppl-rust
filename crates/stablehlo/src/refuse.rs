@@ -177,6 +177,82 @@
 //!   test exercises the non-`Call` branch, the closure itself is the one
 //!   construction site)
 //!
+//! **`aggregate.rs`** (§04 "Multi-axis aggregation", reached through
+//! `ops::lower_builtin`'s `"aggregate"`/`"metricsum"` arms). Every site below is
+//! locked by a test in `tests/golden.rs` unless noted:
+//! - `f_reduction` is not one of §04's seven order-invariant built-ins —
+//!   "aggregate: '...' is not an eligible reduction — §04 ... lists the eligible
+//!   built-ins as `sum`, `prod`, `mean`, `var`, `std`, `maximum` and `minimum`"
+//!   (and, for a non-`Const` reduction node, "aggregate: f_reduction must be one
+//!   of the built-in reductions named bare" — that branch is NOT test-locked;
+//!   `infer` types such a call `%deferred` rather than rejecting it)
+//! - `output_axes` is not a literal axis list — "aggregate: output_axes must be
+//!   a literal axis list `[.i, .k]` (possibly empty)" (not test-locked: the
+//!   parser only ever builds the `vector`-of-`%axis` form)
+//! - a repeated `output_axes` name — "aggregate: output axis '.i' is repeated —
+//!   §04 requires output_axes to be distinct axis names"
+//! - an `output_axes` name that indexes nothing in the body — "aggregate: output
+//!   axis '.q' does not index anything in the body — §04 requires that 'every
+//!   axis name in `output_axes` must occur at least once in `expr`'"
+//! - a variance-marked axis (`.mu^` / `.mu_`) in a plain `aggregate` — "...
+//!   carries a variance marker, which §05 ... admits only inside `metricsum`"
+//!   (two sites, one for the axis list and one for a body index; the body one is
+//!   test-locked)
+//! - one axis name indexing TWO dimensions of the same operand (a diagonal) —
+//!   "aggregate: axis '.i' indexes two dimensions of one operand, which denotes
+//!   a diagonal — the aggregation frame gives each axis name one dimension".
+//!   `stablehlo.broadcast_in_dim`'s dimension map must be unique, so the frame
+//!   model has no form for it
+//! - chained axis indexing (`A[.i][.j]`) — "aggregate: chained axis indexing
+//!   ... has no frame form — write the axes in one index list"
+//! - a body index that is neither an axis name, an integer literal nor `!` —
+//!   "aggregate: an index in an aggregation body must be an axis name, an
+//!   integer literal, or `!`" (not test-locked)
+//! - §07's whole-axis `all` selector in a body — "aggregate: the `all` selector
+//!   selects a whole axis ... §04 reduces 'the resulting scalars'"
+//! - a partial index list (fewer selectors than the operand's rank) — "aggregate:
+//!   N index selector(s) for a rank-M operand — a partial index yields an array
+//!   per axis combination, and §04 reduces 'the resulting scalars'"
+//! - an axis-indexed operand with no tensor form — "aggregate: an axis-indexed
+//!   operand must be an array, got ..." (not test-locked)
+//! - a dynamic (`?`) dimension — "aggregate: a dynamic (`?`) dimension has no
+//!   aggregation frame — the frame's shape is static text ..." (not test-locked:
+//!   `cartpow` over a fixed size always resolves statically at `Level::Shape`)
+//! - a literal index out of range — "aggregate: 0-based index N is out of range
+//!   for a dimension of length M" (two sites: a below-floor selector before the
+//!   operand is lowered, and an over-length one after; neither is test-locked —
+//!   `infer` reports the out-of-range index first)
+//! - `!` on an axis longer than 1 — "aggregate: `!` indexes a dimension of
+//!   length N — §07 ... requires that 'the indexed axis must be of length one'"
+//! - axis dimensions of disagreeing length — "aggregate: axis '.i' indexes
+//!   dimensions of different lengths, N and M — §04 requires that 'all array
+//!   dimensions indexed with the same axis name must have the same length'"
+//! - a body whose value is not the frame's shape — "aggregate: the body
+//!   evaluates to ..., not to the aggregation frame's ..." (not test-locked: with
+//!   every indexed operand broadcast to the FULL frame, an elementwise body is
+//!   frame-shaped by construction, so this is the defensive line against a body
+//!   op that reshapes)
+//! - `mean`/`var`/`std` over an empty axis — "aggregate: '...' over an empty
+//!   axis is undefined — §07 divides by the element count, which is zero here"
+//!   (not test-locked: a zero-length `cartpow` axis)
+//! - `var`/`std` over a single element — "aggregate: '...' over 1 element(s) is
+//!   undefined — §07 defines it with the $n-1$ denominator"
+//! - `metricsum` — "metricsum has no lowering in this backend: ... it needs a
+//!   general indefinite matrix inverse, which StableHLO has no op for". §04's
+//!   own lowering makes every lower-variance axis an `inv(metric)` contraction,
+//!   and §04 requires the metric only to be "square, symmetric, and invertible";
+//!   `stablehlo.cholesky` needs positive-definiteness, so the missing piece is
+//!   different machinery from the frame model, not a missing arm of it
+//!
+//! **`emitter.rs`** (`Emitter::reduce_trailing_axes`, the aggregate
+//! contraction):
+//! - a `maximum`/`minimum` over a non-`Real` operand, or a `prod` over a `Bool`
+//!   one — "aggregate: the ... reduction has no ... identity — §07 gives
+//!   `maximum`/`minimum` the domain \"real arrays\" ...". Defensive: `infer`
+//!   types an axis-indexed body `%deferred`, so `aggregate`'s own inferred
+//!   element kind is `Real` and the frame is widened to it before the
+//!   contraction — no surface model reaches this arm today.
+//!
 //! **`registry.rs`** (the distribution dispatch table):
 //! - a kernel-input record missing a parameter a builder needs —
 //!   "distribution parameter '...' missing from kernel input"
