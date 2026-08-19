@@ -223,6 +223,169 @@ pub fn check_new_name(new_name: &str) -> Result<(), Refusal> {
     )))
 }
 
+/// Does `name` match §05's `Name` production?
+///
+/// §05 "Formal grammar": `Name ::= (Letter | Digit | "_")*` — precisely
+/// `Name ::= (Letter | "_") (Letter | Digit | "_")*`.
+fn is_name_production(name: &str) -> bool {
+    let mut bs = name.bytes();
+    bs.next()
+        .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+        && bs.all(is_ident_byte)
+}
+
+/// Is `name` the §04 placeholder form `_name_`?
+///
+/// §04 "Binding names" gives `^_[A-Za-z]([A-Za-z0-9_]*[A-Za-z0-9])?_$` and
+/// reserves it "for placeholder variables inside `functionof` and `kernelof`".
+fn is_placeholder_form(name: &str) -> bool {
+    name.len() >= 3
+        && name.starts_with('_')
+        && name.ends_with('_')
+        && is_name_production(name)
+        && name[1..name.len() - 1]
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_alphabetic())
+}
+
+/// Check `new_name` as a replacement function/kernel **argument** name.
+///
+/// This is deliberately NOT [`check_new_name`]: §04's public/private binding
+/// regexes govern module-level bindings only. §04 "Objects, expressions, names
+/// and modules" puts argument names outside that namespace — "Record field names
+/// and table column names are local to their object and not part of the global
+/// module namespace, nor are the argument names of functions and kernels" — and
+/// §05's `FunctionDefinition ::= Name "(" Name ("," Name)* ")" "=" Expression`
+/// admits the plain `Name` production for each argument. So an argument may take
+/// a shape a module binding may not, notably a `__`-prefixed name, and this must
+/// not refuse one.
+///
+/// Two constraints do apply:
+///
+/// - §05 "Note on reserved words" and §04 "Name resolution" keep the reserved
+///   words out of any `Name` position.
+/// - The `_name_` placeholder form is what the surface argument *lowers to*
+///   (surface `a` becomes placeholder `_a_`), so an argument spelled `_x_` would
+///   lower to `__x__`. The parser refuses it outright — "`_x_` cannot be a lambda
+///   argument name" — so accepting it here would only produce a file that no
+///   longer parses.
+///
+/// Shadowing is NOT refused: §05 "Lambda syntax" states that "the argument names
+/// refer to the lambda's inputs and shadow any module-level binding of the same
+/// name", so an argument may legally take the name of a module binding or a
+/// built-in.
+pub fn check_new_argument_name(new_name: &str) -> Result<(), Refusal> {
+    if new_name.is_empty() {
+        return Err(Refusal("an argument name cannot be empty".to_string()));
+    }
+    if RESERVED.contains(&new_name) {
+        return Err(Refusal(format!(
+            "`{new_name}` is a reserved name and cannot be used as an argument name \
+             (spec §05 \"Note on reserved words\")"
+        )));
+    }
+    if is_placeholder_form(new_name) {
+        return Err(Refusal(format!(
+            "`{new_name}` is the spec §04 placeholder form `_name_`, which is what a \
+             surface argument lowers to; the parser rejects it as an argument name"
+        )));
+    }
+    if is_name_production(new_name) {
+        return Ok(());
+    }
+    Err(Refusal(format!(
+        "`{new_name}` is not a legal name: spec §05 requires \
+         `Name ::= (Letter | \"_\") (Letter | Digit | \"_\")*`"
+    )))
+}
+
+/// The surface spelling of the placeholder `placeholder`, i.e. `_a_` → `a`.
+///
+/// The parser builds a sugar argument's placeholder as `format!("_{name}_")`
+/// (`flatppl_syntax`'s lambda and `FunctionDefinition` lowering), so stripping one
+/// underscore from each end inverts it. Returns `None` when `placeholder` is not
+/// of that shape.
+pub fn placeholder_surface_name(placeholder: &str) -> Option<&str> {
+    let inner = placeholder
+        .strip_prefix('_')
+        .and_then(|s| s.strip_suffix('_'))?;
+    (!inner.is_empty()).then_some(inner)
+}
+
+/// The byte ranges of the argument names declared by a callable, given the span
+/// of its reification node and the range of the enclosing binding's own name.
+///
+/// Handles the two sugar spellings §05 desugars to `functionof`, which are the
+/// two whose body references carry the *surface* argument name:
+///
+/// - **Named function** (`f(a, b) = add(a, b)`): the reification node's span is
+///   the BODY (`add(a, b)`), and the argument list sits between the binding
+///   name's `(` and its `)`.
+/// - **Lambda** (`g = (a, b) -> …`, `s = a -> …`): the reification node's span
+///   STARTS at the argument list, either parenthesized or a single bare name
+///   (§05 "Lambda syntax": "`(arg) -> expr` is not legal syntax").
+///
+/// Returns the declared names in order with their ranges. An explicit
+/// `functionof(…, mu = _mu_)` boundary is NOT handled here: its argument name is
+/// a keyword argument the IR records as a `NamedArg` with no span, so there is
+/// nothing to locate. The caller must fail closed on it.
+pub fn argument_decl_ranges(
+    text: &str,
+    reif_start: u32,
+    def_name: Option<(u32, u32)>,
+) -> Vec<(String, u32, u32)> {
+    // Lambda: the argument list is at the start of the reification's own span.
+    if let Some(list) = ident_list_at(text, reif_start) {
+        return list;
+    }
+    // Named function: the list follows the binding name.
+    match def_name {
+        Some((_, name_end)) => ident_list_at(text, name_end).unwrap_or_default(),
+        None => Vec::new(),
+    }
+}
+
+/// Read a §05 lambda/`FunctionDefinition` argument list starting at `at`:
+/// either `(` name (`,` name)* `)`, or a single bare name followed by `->`.
+///
+/// Returns `None` when `at` is on neither shape, so the caller can try the other
+/// anchor. Leading whitespace is skipped.
+fn ident_list_at(text: &str, at: u32) -> Option<Vec<(String, u32, u32)>> {
+    let bytes = text.as_bytes();
+    let (mut i, first) = next_significant(text, at)?;
+    if first != b'(' {
+        // A single bare name is a lambda argument only when `->` follows it.
+        let (start, end) = ident_at(text, i)?;
+        let (arrow, b) = next_significant(text, end)?;
+        if b != b'-' || bytes.get(arrow as usize + 1) != Some(&b'>') {
+            return None;
+        }
+        return Some(vec![(
+            text[start as usize..end as usize].to_string(),
+            start,
+            end,
+        )]);
+    }
+    i += 1; // past `(`
+    let mut out = Vec::new();
+    loop {
+        let (pos, b) = next_significant(text, i)?;
+        if b == b')' {
+            return Some(out);
+        }
+        let (start, end) = ident_at(text, pos)?;
+        out.push((text[start as usize..end as usize].to_string(), start, end));
+        let (sep_pos, sep) = next_significant(text, end)?;
+        match sep {
+            b',' => i = sep_pos + 1,
+            b')' => return Some(out),
+            // Anything else means this was not an argument list (e.g. a call).
+            _ => return None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -390,6 +553,107 @@ mod tests {
         for bad in ["", "1x", "x-y", "x y", "x.y", "é"] {
             assert!(check_new_name(bad).is_err(), "`{bad}` must refuse");
         }
+    }
+
+    // ── argument names (§05 `Name`, NOT §04 "Binding names") ─────────────────
+
+    /// An argument name is governed by §05's plain `Name`, so shapes §04 reserves
+    /// for module-level bindings are legal here. Refusing these would be
+    /// over-refusal: §04 scopes those reservations to bindings.
+    #[test]
+    fn argument_names_admit_shapes_a_binding_may_not_take() {
+        for ok in ["a", "mu", "_priv", "__gen", "__1", "sqrt", "Normal", "_x"] {
+            assert!(
+                check_new_argument_name(ok).is_ok(),
+                "`{ok}` must be a legal argument name: §05 `Name` admits it and §04's \
+                 binding regexes do not govern argument names"
+            );
+        }
+    }
+
+    #[test]
+    fn argument_names_refuse_reserved_words() {
+        for bad in ["in", "true", "false", "all", "only", "self", "base"] {
+            assert!(
+                check_new_argument_name(bad).is_err(),
+                "`{bad}` is reserved in any Name position"
+            );
+        }
+    }
+
+    /// The `_name_` placeholder form is what a surface argument lowers to, and the
+    /// parser rejects it outright as an argument name.
+    #[test]
+    fn argument_names_refuse_the_placeholder_form() {
+        for bad in ["_x_", "_mu_", "_a_b_"] {
+            let err = check_new_argument_name(bad).expect_err("placeholder form must refuse");
+            assert!(err.0.contains("placeholder"), "got {}", err.0);
+        }
+        // `__x__` is not the single-underscore placeholder form, so it is allowed.
+        assert!(check_new_argument_name("__x__").is_ok());
+    }
+
+    #[test]
+    fn argument_names_refuse_non_name_shapes() {
+        for bad in ["", "1a", "a-b", "a b", "a.b"] {
+            assert!(check_new_argument_name(bad).is_err(), "`{bad}` must refuse");
+        }
+    }
+
+    #[test]
+    fn placeholder_surface_name_inverts_the_parser_lowering() {
+        assert_eq!(placeholder_surface_name("_a_"), Some("a"));
+        assert_eq!(placeholder_surface_name("_mu_"), Some("mu"));
+        assert_eq!(placeholder_surface_name("_arg1_"), Some("arg1"));
+        // Not the sugar shape: no surface name to recover.
+        assert_eq!(placeholder_surface_name("a"), None);
+        assert_eq!(placeholder_surface_name("_a"), None);
+        assert_eq!(placeholder_surface_name("__"), None);
+    }
+
+    // ── argument declaration lists ───────────────────────────────────────────
+
+    /// A named function: the list follows the binding name, and the reification
+    /// node's span is the body.
+    #[test]
+    fn argument_decl_ranges_reads_a_named_function_list() {
+        let text = "f(a, b) = add(a, b)";
+        let got = argument_decl_ranges(text, 10, Some((0, 1)));
+        assert_eq!(
+            got,
+            vec![("a".to_string(), 2, 3), ("b".to_string(), 5, 6)],
+            "the declaration list is `f(a, b)`, not the body"
+        );
+    }
+
+    /// A lambda: the reification node's span STARTS at the argument list.
+    #[test]
+    fn argument_decl_ranges_reads_a_parenthesized_lambda_list() {
+        let text = "g = (a, b) -> add(a, b)";
+        let got = argument_decl_ranges(text, 4, Some((0, 1)));
+        assert_eq!(got, vec![("a".to_string(), 5, 6), ("b".to_string(), 8, 9)]);
+    }
+
+    /// §05 "Lambda syntax": the single-argument form takes no parentheses.
+    #[test]
+    fn argument_decl_ranges_reads_a_bare_single_lambda_argument() {
+        let text = "s = a -> add(a, 1)";
+        let got = argument_decl_ranges(text, 4, Some((0, 1)));
+        assert_eq!(got, vec![("a".to_string(), 4, 5)]);
+    }
+
+    /// A plain binding declares no arguments, and a call is not a declaration list.
+    #[test]
+    fn argument_decl_ranges_empty_for_a_plain_binding_or_a_call() {
+        assert!(argument_decl_ranges("x = 1", 4, Some((0, 1))).is_empty());
+        assert!(argument_decl_ranges("z = f(3)", 4, Some((0, 1))).is_empty());
+    }
+
+    #[test]
+    fn argument_decl_ranges_tolerates_whitespace_in_the_list() {
+        let text = "f( a ,  b ) = add(a, b)";
+        let got = argument_decl_ranges(text, 14, Some((0, 1)));
+        assert_eq!(got, vec![("a".to_string(), 3, 4), ("b".to_string(), 8, 9)]);
     }
 
     #[test]
