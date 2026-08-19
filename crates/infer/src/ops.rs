@@ -1576,36 +1576,41 @@ fn table_of_record_power(shape: Box<[Dim]>, elem: Type) -> Type {
 /// measure over `D`, and still a probability measure, so the two cases differ in
 /// what the determiniser must BUILD, not in what infer records.
 ///
-/// The result's `%mass` is `%normalized` unconditionally: a law is a probability
-/// measure by definition. This is the ONLY place that mass is decided — the
-/// mass-level rule table has no `"lawof"` arm, deliberately (see the pointer there).
+/// The result's `%mass` is the ARGUMENT's mass, not `%normalized`
+/// unconditionally: [`lawof_mass_gate`] only admits a measure whose mass is
+/// `%normalized` (a theorem) or `%deferred` (not yet inferred, §11) — never a
+/// settled non-normalized class. Propagating the admitted mass gives
+/// `%normalized` on the proven path and `%deferred` on the unproven one; this
+/// is the ONLY place that mass is decided — the mass-level rule table has no
+/// `"lawof"` arm, deliberately (see the pointer there).
 ///
-/// On the `%deferred`-argument path the gate deliberately admits (see
-/// [`lawof_mass_gate`]), that `%normalized` is an unproven ASSUMPTION, and
-/// permanently so. There is no later pass to revisit it: `trace::Inferencer::run`
-/// walks each binding once, memoized, and flushes into the module's side tables, so
-/// an argument's `%mass` is final at the moment the gate reads it. So the honest
-/// statement of what this pair does is: **normalization is a theorem where the gate
-/// proves it, and an assumption on the `%deferred` path.** The two stay consistent
-/// in the sense that everything admitted is typed as a law — not in the sense that
-/// everything typed as a law was checked.
-///
-/// The assumption is narrow in practice and resisted attempts to break it: no model
-/// in either corpus (51 across `flatppl-examples` and the in-repo fixtures) emits a
-/// measure with `%mass %deferred` at all, and mass crosses module boundaries
-/// intact. It is recorded rather than closed because closing it means either
-/// rejecting `%deferred` (which turns every mass-inference gap into a user-facing
-/// error, the thing [`lawof_mass_gate`] exists to avoid) or propagating `%deferred`
-/// into the result (which would claim `lawof` might not produce a law).
+/// Design-PR #73's option C (owner ruling, decisions-log 2026-08-18) is the
+/// no-laundering rider: an engine that admits a `%deferred`-mass argument is
+/// ASSUMING normalization, not proving it, and "must leave the result's `%mass`
+/// `%deferred` rather than record it as `%normalized`" — stamping `%normalized`
+/// here would record an assumption as knowledge, which §11's "strongest
+/// statically KNOWN class" slot definition forbids. Before this fix the result
+/// was always stamped `%normalized`, laundering the assumption; `lawof(joint())`
+/// (the zero-component `joint` — the one source of a genuinely `%deferred`-mass
+/// measure reachable from source, per `product_mass`'s empty-list arm) is the
+/// executed red case.
 ///
 /// A KERNEL argument lifts pointwise — §04: "On a non-nullary kernel, `lawof`
 /// lifts pointwise, as the uniform kernel extension does for measure-algebra
 /// operations" — so the result is a kernel over the same inputs whose output
-/// measure is a law, hence `%normalized`. Before this it wrapped, producing a
-/// measure whose DOMAIN was a kernel.
+/// measure is a law, carrying that output measure's mass onward the same way.
+/// Before this it wrapped, producing a measure whose DOMAIN was a kernel.
+/// [`lawof_mass_gate`] gates the kernel case by the identical three rules
+/// (2026-08-19, `lawof-kernel-mass-maths.md`: the pointwise lift composes the
+/// whole measure clause, settled-class error included, onto each output
+/// measure the kernel generates), so this branch only ever sees a kernel whose
+/// mass is `%normalized` or `%deferred` — the same two values the measure
+/// branch above sees.
 ///
 /// Every other argument is a VALUE, and keeps the original behaviour: a measure
-/// over that value's type. That is the overwhelmingly common spelling
+/// over that value's type, `%normalized` unconditionally — there is no mass
+/// slot on a value to propagate, and the law of a value is a probability
+/// measure by definition. That is the overwhelmingly common spelling
 /// (`lawof(y)`, `lawof(record(y = y))`) and the corpus's only one.
 ///
 /// A `Likelihood` argument falls in that last bucket and so still types as a
@@ -1614,15 +1619,16 @@ fn table_of_record_power(shape: Box<[Dim]>, elem: Type) -> Type {
 /// open question is recorded in the wave report rather than guessed at.
 fn lawof_type(arg: Option<&Type>) -> Type {
     match arg {
-        // `lawof(m)` = `lawof(draw(m))`: a measure over m's domain.
-        Some(Type::Measure { domain, .. }) => Type::Measure {
+        // `lawof(m)` = `lawof(draw(m))`: a measure over m's domain, carrying
+        // m's own (gate-admitted) mass onward rather than reasserting it.
+        Some(Type::Measure { domain, mass }) => Type::Measure {
             domain: domain.clone(),
-            mass: Mass::Normalized,
+            mass: *mass,
         },
-        // Pointwise lift over a kernel's output measure.
-        Some(Type::Kernel { inputs, .. }) => Type::Kernel {
+        // Pointwise lift over a kernel's output measure — same propagation.
+        Some(Type::Kernel { inputs, mass }) => Type::Kernel {
             inputs: inputs.clone(),
-            mass: Mass::Normalized,
+            mass: *mass,
         },
         // A value: the law of that value.
         other => Type::Measure {
@@ -1660,8 +1666,13 @@ fn lawof_type(arg: Option<&Type>) -> Type {
 ///   defines as "unknown total mass" and which IS rejected, without anything having
 ///   been proven about it, because the question is whether normalization was
 ///   established, not whether non-normalization was.
-/// - Only `Type::Measure` is inspected. A `Type::Kernel` argument is each caller's
-///   own question; see [`draw_mass_gate`] for why `draw` does not extend to one.
+/// - Only `Type::Measure` is inspected here. A `Type::Kernel` argument is each
+///   caller's own question, deliberately NOT folded into this shared function:
+///   [`lawof_mass_gate`] decides it (2026-08-19, `lawof-kernel-mass-maths.md`)
+///   with its own kernel arm, by the identical three rules — but `draw`/`rand`
+///   over a kernel remain a separate, undecided question; see
+///   [`draw_mass_gate`] for why `draw` does not extend to one. Folding the
+///   kernel case in here would silently extend it to `draw`/`rand` too.
 fn unprovable_normalization(args: &[ArgInfo]) -> Option<&'static str> {
     let (_, arg_ty, _) = args.first()?;
     let Type::Measure { mass, .. } = arg_ty else {
@@ -1781,23 +1792,55 @@ fn rand_mass_gate(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> Option<Type
 ///   §11 defines as "unknown total mass": it is rejected without anything having
 ///   been proven about it, because the gate's question is whether normalization was
 ///   established, not whether non-normalization was.
-/// - Only a `Type::Measure` argument is gated. §04 also says "On a non-nullary
-///   kernel, `lawof` lifts pointwise", so a `Type::Kernel` argument is legitimate;
-///   whether a non-Markov kernel should be gated by its own `%mass` is the same
-///   question one level up and is NOT decided here.
+/// - A `Type::Kernel` argument is gated too, by the SAME three rules, pointwise
+///   (`lawof-kernel-mass-maths.md`, ruled 2026-08-19): §04's "On a non-nullary
+///   kernel, `lawof` lifts pointwise" composes the whole measure clause above —
+///   requirement, settled-class error, and no-laundering rider alike — onto each
+///   output measure the kernel generates, and §11 puts the kernel `%mass` slot
+///   under the same "statically known" definition ("respectively all measures
+///   generated by the kernel"). The maths is exhaustive: wherever `lawof(K)` is
+///   defined at all, every output measure has mass 1 (the identity law at a
+///   fixed/parameterized point, the marginal-mixture integral at a stochastic
+///   one), so a settled non-`%normalized` kernel result never describes a value
+///   — it types an expression that has none, the same defect the measure arm
+///   exists to catch.
 fn lawof_mass_gate(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> Option<Type> {
-    let offending = unprovable_normalization(args)?;
-    let (arg_node, _, _) = args.first()?;
+    if let Some(offending) = unprovable_normalization(args) {
+        let (arg_node, _, _) = args.first()?;
+        inf.diags.push(crate::Diagnostic::error_at(
+            *arg_node,
+            format!(
+                "`lawof` requires a `%normalized` measure (spec §04), but this argument's \
+                 total mass is `{offending}`: an unnormalized measure is not its own law. \
+                 Wrap it in `normalize(...)` to state that intent — `lawof` never \
+                 normalizes its argument"
+            ),
+        ));
+        return Some(Type::Failed("lawof of an unnormalized measure".into()));
+    }
+    let (arg_node, arg_ty, _) = args.first()?;
+    let Type::Kernel { mass, .. } = arg_ty else {
+        return None;
+    };
+    let offending = match mass {
+        // Proven normalized at every input, or not yet inferred — let it
+        // through, exactly as the measure arm does.
+        Mass::Normalized | Mass::Deferred => return None,
+        Mass::Null => "%null",
+        Mass::Finite => "%finite",
+        Mass::LocallyFinite => "%locallyfinite",
+        Mass::Unknown => "%unknown",
+    };
     inf.diags.push(crate::Diagnostic::error_at(
         *arg_node,
         format!(
-            "`lawof` requires a `%normalized` measure (spec §04), but this argument's \
-             total mass is `{offending}`: an unnormalized measure is not its own law. \
-             Wrap it in `normalize(...)` to state that intent — `lawof` never \
+            "`lawof` lifts pointwise over a kernel (spec §04), but this kernel's output \
+             measures' total mass is `{offending}`: an unnormalized measure is not its \
+             own law. Wrap it in `normalize(...)` to state that intent — `lawof` never \
              normalizes its argument"
         ),
     ));
-    Some(Type::Failed("lawof of an unnormalized measure".into()))
+    Some(Type::Failed("lawof of an unnormalized kernel".into()))
 }
 
 /// The element type of a set expression (`elementof` / `external` argument),
@@ -1994,6 +2037,24 @@ fn disintegrate_type(inf: &mut Inferencer<'_, '_>, call: &Call, args: &[ArgInfo]
 /// `iid(M, n)`: n iid draws bundle into an array over M's domain. A literal
 /// count (or literal count vector) gives static dims; anything computed is
 /// dynamic until fixed-value const-eval lands (engine-concepts §17.1).
+///
+/// A SCALAR count over a RECORD-valued `M` is the one shape §11 gives its own
+/// form: `(%table (%columns …) (%nrows N))`, not an array of records — design
+/// PR #83 (owner ruling, decisions-log 2026-08-18): "the text is correct (§11
+/// gives `%table` its own form … ); rust types `%array` instead", now fixed.
+/// §03's Cartesian power backs the reading too: "When `S` is a record set, the
+/// power is the set of tables with those columns", with its own worked example
+/// scalar (`cartpow(cartprod(a = reals, b = posreals), n)` is "the set of
+/// `n`-row tables"). `count_dims` gives a scalar `n` exactly one dim
+/// (`Box::new([..])`, both the literal-int and the dynamic-fallback arms), so
+/// `shape.len() == 1` is precisely the scalar case — no multi-axis shape is
+/// ever length 1, since a `vector`/`Vec` count contributes one dim per element.
+///
+/// A MULTI-axis count (`shape.len() != 1`, e.g. `iid(M, [2, 3])`) has NO table
+/// reading — a table has one row axis — and stays array-of-records, untouched:
+/// #83's own §03 tension notes "a multi-axis power of a record set has no
+/// table reading at all". A non-record `M` is likewise untouched, falling to
+/// the same array arm it always used.
 fn iid_type(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> Type {
     let domain = match arg_ty(args, 0) {
         Some(Type::Measure { domain, .. }) => domain.as_ref().clone(),
@@ -2002,11 +2063,19 @@ fn iid_type(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> Type {
     let Some((count_node, _, _)) = args.get(1) else {
         return Type::Deferred;
     };
-    Type::Measure {
-        domain: Box::new(Type::Array {
-            shape: count_dims(inf, *count_node),
+    let shape = count_dims(inf, *count_node);
+    let result_domain = match (&domain, shape.as_ref()) {
+        (Type::Record(fields), [nrows]) => Type::Table {
+            columns: fields.clone(),
+            nrows: *nrows,
+        },
+        _ => Type::Array {
+            shape,
             elem: Box::new(domain),
-        }),
+        },
+    };
+    Type::Measure {
+        domain: Box::new(result_domain),
         mass: Mass::Deferred,
     }
 }
@@ -4101,6 +4170,58 @@ fn refuse_splat_onto_unnamed_variadic(
     Type::Failed(format!("{name} cannot splat an aggregate onto unnamed variadic inputs").into())
 }
 
+/// Reject a sole positional record/table splat onto a [`Catalogue::base_never_splats`]
+/// row — currently `checked` alone (design PR #78, owner ruling, decisions-log
+/// 2026-08-18). Unlike [`refuse_splat_onto_unnamed_variadic`], the row DOES declare
+/// parameter names, so the diagnostic cannot say "no name to bind to" (a name-matched
+/// splat, e.g. `checked(record(value = 1.0, condition = true))`, WOULD bind if let
+/// through) — the point instead is that §07's keyword spelling owns this construct.
+fn refuse_checked_splat(
+    inf: &mut Inferencer<'_, '_>,
+    id: NodeId,
+    name: &str,
+    cat: &crate::catalogue::Catalogue,
+    args: &[ArgInfo],
+) -> Type {
+    let section = cat.base_param_section(name);
+    let names = cat.base_param_names(name).unwrap_or(&[]);
+    let keyword_form = format!(
+        "{name}({})",
+        names
+            .iter()
+            .map(|n| format!("{n} = ..."))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let fields = splatted_field_names(inf, &args[0].1);
+    let listed = if fields.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " (its {} {})",
+            if fields.len() == 1 {
+                "name is"
+            } else {
+                "names are"
+            },
+            fields
+                .iter()
+                .map(|f| format!("`{f}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    inf.diags.push(crate::Diagnostic::error_at(
+        id,
+        format!(
+            "`{name}` has no special-operation splat (spec {section} owns the keyword form): \
+             a sole positional record or table{listed} does not bind, whether or not its \
+             names match. Use the keyword form instead, as in `{keyword_form}`"
+        ),
+    ));
+    Type::Failed(format!("{name} does not splat a sole record or table argument").into())
+}
+
 /// The field or column names of a CONFIRMED record/table type, in declaration order; empty
 /// for anything else.
 fn splatted_field_names(inf: &Inferencer<'_, '_>, ty: &Type) -> Vec<String> {
@@ -4131,6 +4252,15 @@ fn arity_check(
     // arity message would describe a count problem instead of the real one.
     if reading.splatting && cat.base_has_unnamed_variadic(name) {
         return Some(refuse_splat_onto_unnamed_variadic(inf, id, name, cat, args));
+    }
+    // `checked` (design PR #78, owner ruling, decisions-log 2026-08-18): §07's
+    // keyword form owns it, so a sole positional record/table never splats here
+    // even when its field names match `value`/`condition` — precedes the arity
+    // and name checks the same way the unnamed-variadic refusal above does, for
+    // the same reason: a fitting field count would otherwise let the splat
+    // through before this can object.
+    if reading.splatting && cat.base_never_splats(name) {
+        return Some(refuse_checked_splat(inf, id, name, cat, args));
     }
     if arity.admits(got) {
         // The count is right; the names still have to be the declared ones. `?`
@@ -5455,13 +5585,17 @@ pub(crate) fn fill_mass(
     };
 
     let mass = match name.as_str() {
-        // NO `"lawof"` arm, on purpose: `lawof_type` sets the result mass itself
-        // (`Mass::Normalized`), so an arm here would be dead. It WAS dead and
-        // agreeing, which is worse than absent — a later change to `lawof_type`'s
-        // mass would leave this reading as though it still governed. Mutation-proven
-        // dead before removal: flipping it to `Mass::Null` broke zero tests, while
-        // the same flip on the `Dirac` arm below broke one, so the harness was
-        // sensitive and the silence meant unreachable.
+        // `"lawof"` passes `mass` through unchanged: `lawof_type` already set
+        // the result mass (the gate-admitted argument's own mass, per the
+        // no-laundering rider), so this must NOT fall to the `_` catchall
+        // below — that catchall assumes "every unlisted head is a §08
+        // distribution, hence `%normalized`", which was harmlessly true only
+        // while `lawof_type` always produced `%normalized` itself (the guard
+        // above short-circuits unless `ty`'s mass is `%deferred`). Now that
+        // `lawof_type` can legitimately produce `%deferred`, an absent arm
+        // would re-launder it to `%normalized` right where the no-laundering
+        // rider forbids it.
+        "lawof" => mass,
         // Every §08 distribution is a probability measure.
         // `Dirac(value)` is a point-mass probability measure (total mass 1).
         "Dirac" => Mass::Normalized,
@@ -5688,7 +5822,7 @@ fn joint_mass(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo], named: &[NamedInfo
 ///
 /// The trusted heads are exactly the rules that write a kernel's mass themselves:
 /// `kernelof`/`functionof` (`reification_type`, from the body), `lawof`
-/// (`lawof_type`, `%normalized` by §04's identity law), and `joint` itself
+/// (`lawof_type`, propagating the argument's own gate-admitted mass), and `joint` itself
 /// (`kernel_joint_type`, recursively through this same fold). Everything else —
 /// including a `disintegrate` tuple element and a cross-module kernel, whose
 /// masses ARE set correctly but not by a head this can see — reads `%unknown`.

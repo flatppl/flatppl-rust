@@ -249,6 +249,38 @@ fn a_named_row_keeps_its_name_checked_splat() {
     );
 }
 
+/// **`checked` is the one NAMED row that does NOT keep the name-checked splat** — owner ruling
+/// on design PR #78 (decisions-log 2026-08-18): "§07's keyword form owns `checked`; no special
+/// operation splats a sole record/table argument." Before this ruling landed,
+/// `checked(record(value = 1.0, condition = true))` splatted and SUCCEEDED, silently narrowing
+/// the result to the `value` field's type — the red case `designpass2-report.md`'s "PR 78"
+/// section calls out by name. `cat`/`get`/`get0` already refused (via the unnamed-variadic
+/// guard above); `checked` needed its own carve-out because its row DOES declare names.
+#[test]
+fn checked_never_splats_a_sole_record_even_on_a_name_match() {
+    let matched = errors("z = checked(record(value = 1.0, condition = true))\n");
+    assert!(
+        matched
+            .iter()
+            .any(|e| e.contains("has no special-operation splat")),
+        "a name-MATCHED splat must still refuse: {matched:?}"
+    );
+    assert!(
+        matched.iter().any(|e| e.contains("checked(value = ...")),
+        "the refusal must point at the keyword form: {matched:?}"
+    );
+    // The two spellings §07 actually grants stay legal.
+    for spelling in [
+        "z = checked(1.0, true)\n",
+        "z = checked(value = 1.0, condition = true)\n",
+    ] {
+        assert!(
+            errors(spelling).is_empty(),
+            "positional and keyword must both keep working: {spelling}"
+        );
+    }
+}
+
 /// **`vector` keeps §03's element diagnosis** — the one variadic row where a sole aggregate has
 /// a plausible NON-splat reading, and the one place the §04 message would be a net loss.
 ///

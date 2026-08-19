@@ -536,9 +536,10 @@ fn lawof_is_idempotent_on_a_measure() {
     );
 }
 
-/// The identity holds for a measure the GATE admits by the `%deferred` route as
-/// well, so gate and typing stay consistent: everything admitted is typed as a law.
-/// A `normalize(...)`d restriction is the spelling §04 names as the escape.
+/// A `normalize(...)`d restriction is the spelling §04 names as the escape, and
+/// `normalize` always stamps `%normalized` (never `%deferred`), so this case
+/// stays a theorem, not the gate's `%deferred` admission route — see
+/// `lawof_of_a_deferred_mass_measure_stays_deferred` for that one.
 #[test]
 fn lawof_of_a_normalized_restriction_types_over_the_element_domain() {
     let out = ir("n = Normal(mu = 0.0, sigma = 1.0)\n\
@@ -569,6 +570,86 @@ fn lawof_of_a_kernel_lifts_pointwise() {
     assert!(
         !z.contains("(%domain (%kernel"),
         "must not wrap the kernel as a domain:\n{out}"
+    );
+}
+
+/// `lawof`'s gate extends to a KERNEL argument by the same three rules as the
+/// measure case, pointwise (owner ruling, `lawof-kernel-mass-maths.md`,
+/// 2026-08-19): §04's "On a non-nullary kernel, `lawof` lifts pointwise"
+/// composes the whole measure-argument mass clause — requirement, settled-class
+/// error, and no-laundering rider alike — onto each output measure the kernel
+/// generates. Wherever `lawof(K)` is defined at all, every output measure has
+/// mass 1, so a kernel with a SETTLED non-`%normalized` mass (here `%finite`,
+/// from `functionof` over a `weighted(...)` body) types an expression that has
+/// no value and must be a static error, exactly like `lawof` of a `%finite`
+/// measure. Before this fix the kernel branch was ungated and stamped the
+/// result `%normalized` regardless.
+#[test]
+fn lawof_rejects_a_kernel_that_is_not_normalized() {
+    assert!(rejects(
+        "k = functionof(weighted(0.5, Normal(mu = 0.0, sigma = 1.0)))\nq = lawof(k)",
+        "total mass is `%finite`"
+    ));
+    // The parameterized-input shape from the maths doc's probe 2, so a
+    // regression cannot narrow the fix to the nullary case alone.
+    assert!(rejects(
+        "z = elementof(reals)\n\
+         k = functionof(weighted(0.5, Normal(mu = z, sigma = 1.0)), z = z)\n\
+         q = lawof(k)",
+        "total mass is `%finite`"
+    ));
+}
+
+/// The kernel gate's `%deferred` arm mirrors the measure arm's no-laundering
+/// rider exactly: an admitted `%deferred`-mass kernel must come out `%deferred`,
+/// never `%normalized`. `functionof(joint())` is the executed producer (a
+/// zero-component `joint` body, the one source of a genuinely `%deferred`-mass
+/// measure reachable from source).
+#[test]
+fn lawof_of_a_deferred_mass_kernel_stays_deferred() {
+    let out = ir("k = functionof(joint())\nq = lawof(k)");
+    let k = out.lines().find(|l| l.contains("%bind k")).unwrap_or("");
+    let q = out.lines().find(|l| l.contains("%bind q")).unwrap_or("");
+    assert!(
+        k.contains("(%kernel (%inputs ) (%mass %deferred))"),
+        "functionof(joint()) must itself be a %deferred-mass kernel:\n{out}"
+    );
+    assert!(
+        q.contains("(%kernel (%inputs ) (%mass %deferred))"),
+        "lawof of a %deferred-mass kernel must stay %deferred, not launder to \
+         %normalized:\n{out}"
+    );
+    assert!(
+        !q.contains("%normalized"),
+        "must not stamp the unproven assumption as known:\n{out}"
+    );
+}
+
+/// Design-PR #73 option C's no-laundering rider (owner ruling, decisions-log
+/// 2026-08-18): an engine admitting a `%deferred`-mass argument to `lawof` must
+/// leave the RESULT's mass `%deferred`, never stamp `%normalized` — stamping
+/// `%normalized` would record an unproven assumption as §11's "statically KNOWN"
+/// class. `joint()` (zero components) is the one measure reachable from source
+/// whose mass is genuinely `%deferred` (`product_mass`'s empty-list arm), so it
+/// is the red case: `lawof`'s gate admits it (deferred passes, per
+/// `unprovable_normalization`), and the result must carry `%deferred` onward.
+#[test]
+fn lawof_of_a_deferred_mass_measure_stays_deferred() {
+    let out = ir("e = joint()\nq = lawof(e)");
+    let e = out.lines().find(|l| l.contains("%bind e")).unwrap_or("");
+    let q = out.lines().find(|l| l.contains("%bind q")).unwrap_or("");
+    assert!(
+        e.contains("(%mass %deferred)"),
+        "joint() must itself be %deferred mass (the gate's admission case):\n{out}"
+    );
+    assert!(
+        q.contains("(%mass %deferred)"),
+        "lawof of a %deferred-mass measure must stay %deferred, not launder to \
+         %normalized:\n{out}"
+    );
+    assert!(
+        !q.contains("(%mass %normalized)"),
+        "must not stamp the unproven assumption as known:\n{out}"
     );
 }
 
@@ -1883,5 +1964,88 @@ fn superpose_of_a_measure_and_a_record_is_rejected() {
     assert!(
         !out.contains("(%bind s (%meta ((%measure (%domain (%scalar real)) (%mass %unknown))"),
         "must not silently drop the bad argument and type `s` as n1's plain measure; got:\n{out}"
+    );
+}
+
+// ============================================================
+// `iid` over a record-valued measure has a `%table` variate (spec §11)
+// ============================================================
+
+/// A SCALAR-size `iid` over a record-valued measure types `(%table (%columns
+/// …) (%nrows N))`, not `(%array 1 (N) (%record …))` — design PR #83 (owner
+/// ruling, decisions-log 2026-08-18): "the text is correct (§11 gives `%table`
+/// its own form; js conforms); rust types `%array` instead." §11's `%table`
+/// form and §03's Cartesian power ("the power is the set of tables" for a
+/// record set) both back the reading; flatppl-js already conforms
+/// (`designpass2-report.md`, "PR 83"). The value-set slot already agreed
+/// (`cartpow (record …) 5`, an n-row table per §03) — only the TYPE slot was
+/// wrong, so this pins that the two slots now agree on the shape.
+#[test]
+fn scalar_iid_over_a_record_measure_types_a_table() {
+    let src = "M = joint(a = Normal(mu = 0.0, sigma = 1.0), b = Beta(alpha = 1.0, beta = 1.0))\n\
+               q = iid(M, 5)";
+    assert!(diags_of(src).is_empty(), "{:?}", diags_of(src));
+    let out = ir(src);
+    let q = out.lines().find(|l| l.contains("%bind q")).unwrap_or("");
+    assert!(
+        q.contains(
+            "(%measure (%domain (%table (%columns (a (%scalar real)) (b (%scalar real))) \
+             (%nrows 5)))"
+        ),
+        "scalar record-iid must type a %table, not an array of records:\n{out}"
+    );
+    assert!(
+        !q.contains("(%array"),
+        "must not also carry the old %array-of-records spelling:\n{out}"
+    );
+
+    // The annotated FlatPIR round-trips through a re-read (§11 form is legal to
+    // parse back, not just to print).
+    let reread = flatppl_flatpir::read(&out)
+        .unwrap_or_else(|e| panic!("annotated output unreadable: {e}\n{out}"));
+    assert_eq!(
+        flatppl_flatpir::write(&reread),
+        out,
+        "annotated FlatPIR is not a write fixpoint"
+    );
+}
+
+/// The MULTI-axis case (`iid(M, [2, 3])`) has no `%table` reading — a table
+/// has one row axis (§03: "a multi-axis power of a record set has no table
+/// reading at all") — and stays array-of-records, untouched by #83's fix.
+#[test]
+fn multi_axis_iid_over_a_record_measure_stays_array_of_records() {
+    let src = "M = joint(a = Normal(mu = 0.0, sigma = 1.0), b = Beta(alpha = 1.0, beta = 1.0))\n\
+               q = iid(M, [2, 3])";
+    assert!(diags_of(src).is_empty(), "{:?}", diags_of(src));
+    let out = ir(src);
+    let q = out.lines().find(|l| l.contains("%bind q")).unwrap_or("");
+    assert!(
+        q.contains(
+            "(%measure (%domain (%array 2 (2 3) (%record (a (%scalar real)) (b (%scalar real))))"
+        ),
+        "multi-axis record-iid must stay an array of records:\n{out}"
+    );
+    assert!(
+        !q.contains("%table"),
+        "must not gain a %table reading:\n{out}"
+    );
+}
+
+/// A record whose SCALAR count is not statically known still gets the
+/// `%table` shape (a `%dynamic` row count), not the array reading — the
+/// table/array choice is driven by the count's RANK, which is always 1 for a
+/// scalar count regardless of whether its value is fixed (see `count_dims`).
+#[test]
+fn scalar_iid_over_a_record_measure_with_a_dynamic_count_still_tables() {
+    let src = "n = elementof(posintegers)\n\
+               M = joint(a = Normal(mu = 0.0, sigma = 1.0), b = Beta(alpha = 1.0, beta = 1.0))\n\
+               q = iid(M, n)";
+    assert!(diags_of(src).is_empty(), "{:?}", diags_of(src));
+    let out = ir(src);
+    let q = out.lines().find(|l| l.contains("%bind q")).unwrap_or("");
+    assert!(
+        q.contains("(%table (%columns (a (%scalar real)) (b (%scalar real))) (%nrows %dynamic))"),
+        "a dynamic scalar count must still type a %table with a %dynamic row count:\n{out}"
     );
 }
