@@ -72,6 +72,30 @@ pub(crate) fn elem_rank(k: ElemKind) -> u8 {
     }
 }
 
+/// One order-invariant per-axis reduction [`Emitter::reduce_trailing_axes`]
+/// contracts an aggregation frame with. §04's other three eligible reductions
+/// (`mean`, `var`, `std`) are compositions over [`AxisReduce::Sum`] and are
+/// derived in `crate::aggregate`, not spelled as combines here.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum AxisReduce {
+    Sum,
+    Prod,
+    Max,
+    Min,
+}
+
+impl AxisReduce {
+    /// The §04 spelling, for a refusal message.
+    fn spec_name(self) -> &'static str {
+        match self {
+            AxisReduce::Sum => "sum",
+            AxisReduce::Prod => "prod",
+            AxisReduce::Max => "maximum",
+            AxisReduce::Min => "minimum",
+        }
+    }
+}
+
 /// Emits textual StableHLO into an internal buffer while assigning fresh SSA
 /// names and tracking which FlatPDL [`NodeId`]s have already been lowered.
 pub struct Emitter<'m> {
@@ -1187,6 +1211,32 @@ impl<'m> Emitter<'m> {
         a: &Value,
         axis: usize,
     ) -> Value {
+        let init_lit: &str = match a.elem {
+            ElemKind::Real => identity_lit,
+            ElemKind::Int => "0",
+            ElemKind::Bool => "false",
+        };
+        assert!(
+            a.elem == ElemKind::Real || combine_op == "stablehlo.add",
+            "reduce_axis: a non-Real reduction identity exists only for the additive \
+             (stablehlo.add) combine; reduce_max/reduce_min have no integer or boolean ±inf \
+             identity"
+        );
+        self.reduce_axis_lit(combine_op, init_lit, a, axis)
+    }
+
+    /// [`Emitter::reduce_axis`]'s emission half, with the init constant's
+    /// literal already resolved for `a`'s element kind. Split out so
+    /// [`Emitter::reduce_trailing_axes`] can supply a per-kind identity its own
+    /// combine needs (`stablehlo.multiply`'s one, which the additive-only
+    /// selection above has no form for) without duplicating the op text.
+    fn reduce_axis_lit(
+        &mut self,
+        combine_op: &str,
+        init_lit: &str,
+        a: &Value,
+        axis: usize,
+    ) -> Value {
         let dims = match &a.ty {
             MlirTy::Ranked(dims) => dims.clone(),
             other => panic!("reduce_axis expects a ranked operand, got {other:?}"),
@@ -1203,18 +1253,6 @@ impl<'m> Emitter<'m> {
         let operand_ty = a.ty.render(self.dtype, a.elem);
         let result_ty_text = result_ty.render(self.dtype, a.elem);
 
-        let init_lit: &str = match a.elem {
-            ElemKind::Real => identity_lit,
-            ElemKind::Int => "0",
-            ElemKind::Bool => "false",
-        };
-        assert!(
-            a.elem == ElemKind::Real || combine_op == "stablehlo.add",
-            "reduce_axis: a non-Real reduction identity exists only for the additive \
-             (stablehlo.add) combine; reduce_max/reduce_min have no integer or boolean ±inf \
-             identity"
-        );
-
         let init_ssa = self.fresh();
         self.push(&format!(
             "{init_ssa} = stablehlo.constant dense<{init_lit}> : {elem_ty}"
@@ -1230,6 +1268,99 @@ impl<'m> Emitter<'m> {
             ty: result_ty,
             elem: a.elem,
         }
+    }
+
+    /// Reduce `a`'s `n` TRAILING axes with `kind`, leaving the leading axes in
+    /// place and in their existing order — the contraction step of §04
+    /// "Multi-axis aggregation" (`crate::aggregate` orders its frame with the
+    /// `output_axes` leading, so the result needs no permutation afterwards).
+    /// `n == 0` returns `a` unchanged, emitting nothing: reducing over no axis
+    /// leaves a one-element multiset, which every [`AxisReduce`] maps to that
+    /// element.
+    ///
+    /// Refuses rather than emitting an identity constant that does not mean the
+    /// reduction it is spelled for:
+    ///
+    /// - `maximum`/`minimum` over a non-`Real` operand — the ±inf identity has
+    ///   no integer or boolean form. §07 gives both the domain "real arrays",
+    ///   and `ops::lower_extremum` reports the same limit for `maximum(xs)`.
+    /// - `prod` or `sum` over a `Bool` operand — on `i1`,
+    ///   `stablehlo.multiply` is a conjunction and `stablehlo.add` is a WRAPPING
+    ///   1-bit add (`true + true == false`, i.e. parity), so neither computes
+    ///   what §07 defines. A boolean array reaches a §07 reduction only through
+    ///   the promotion §03 "Bool" states — "`false` is promoted to zero and
+    ///   `true` to one, permitting expressions such as `true + true`, `3 *
+    ///   false`, and `sum(mask)` to count true entries" — i.e. WIDENED first,
+    ///   which is what `crate::aggregate::reduce` does before calling here. So a
+    ///   `Bool` operand arriving at this method means the node's inferred kind
+    ///   disagrees with its own caller; refusing surfaces that, where reducing in
+    ///   i1 would answer parity and reducing in a wider kind would contradict the
+    ///   declared result type.
+    ///
+    /// NOTE: [`Emitter::reduce_axis`] still selects `"false"` for a `Bool`
+    /// additive reduce, and THAT path is live and WRONG — `ops::lower_sum` over a
+    /// boolean array emits the wrapping `i1` add (measured under IREE:
+    /// `sum([true, true, false])` executes to `false`, where §03's promotion owes
+    /// the count `2`). §03 settles the direction — `sum(mask)` counts, so the fix
+    /// is to widen, not to refuse — but not the layer: inference types that call
+    /// `booleans`, so the emitted `tensor<i1>` result type would have to change
+    /// with it, and `reduce_axis` is infallible under five `-> Value` entry
+    /// points ([`Emitter::reduce_sum`], [`Emitter::reduce_max`],
+    /// [`Emitter::reduce_min`], [`Emitter::reduce_sum_last_axis`],
+    /// [`Emitter::diag`]) over three call sites. Left for a follow-up that owns
+    /// both crates rather than half-fixed here.
+    pub(crate) fn reduce_trailing_axes(
+        &mut self,
+        id: NodeId,
+        kind: AxisReduce,
+        a: &Value,
+        n: usize,
+    ) -> Result<Value, EmitError> {
+        if n == 0 {
+            return Ok(a.clone());
+        }
+        let rank = match &a.ty {
+            MlirTy::Ranked(dims) => dims.len(),
+            other => {
+                return Err(EmitError::at(
+                    id,
+                    format!("aggregate: {other:?} has no axis to reduce"),
+                ));
+            }
+        };
+        assert!(
+            n <= rank,
+            "reduce_trailing_axes: {n} trailing axes asked of a rank-{rank} operand"
+        );
+        let (combine_op, identity) = match (kind, a.elem) {
+            (AxisReduce::Sum, ElemKind::Real) => ("stablehlo.add", "0.000000e+00"),
+            (AxisReduce::Sum, ElemKind::Int) => ("stablehlo.add", "0"),
+            (AxisReduce::Prod, ElemKind::Real) => ("stablehlo.multiply", "1.000000e+00"),
+            (AxisReduce::Prod, ElemKind::Int) => ("stablehlo.multiply", "1"),
+            (AxisReduce::Max, ElemKind::Real) => {
+                ("stablehlo.maximum", reduce_max_identity(self.dtype))
+            }
+            (AxisReduce::Min, ElemKind::Real) => ("stablehlo.minimum", pos_inf_literal(self.dtype)),
+            (kind, elem) => {
+                return Err(EmitError::at(
+                    id,
+                    format!(
+                        "aggregate: the {} reduction has no {elem:?} identity that means what §07 \
+                         defines — §07 gives `maximum`/`minimum` the domain \"real arrays\" and the \
+                         ±inf identity has no integer or boolean form, while over booleans \
+                         `stablehlo.multiply` is a conjunction and `stablehlo.add` a wrapping \
+                         1-bit add (parity), neither of which is §07's product or sum. Convert the \
+                         body to reals first",
+                        kind.spec_name()
+                    ),
+                ));
+            }
+        };
+        let mut cur = a.clone();
+        for i in 0..n {
+            cur = self.reduce_axis_lit(combine_op, identity, &cur, rank - 1 - i);
+        }
+        Ok(cur)
     }
 
     // ---- matrix helpers -----------------------------------------------------

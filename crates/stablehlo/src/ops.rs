@@ -139,6 +139,15 @@ pub(crate) fn lower_builtin(
         "fill" => lower_fill(e, id, args),
         "get0" => lower_get(e, id, args, 0),
         "get" => lower_get(e, id, args, 1),
+        // §04 "Multi-axis aggregation" — the einsum-style contraction, and what
+        // the surface `:=` sugar desugars to. `crate::aggregate` owns the whole
+        // lowering (it binds the body's axis-indexed operands before walking the
+        // body, so it cannot be composed out of the elementwise entries above).
+        "aggregate" => crate::aggregate::lower_aggregate(e, id, args),
+        // §04 "Metric-aware Einstein summation" — refused with its own reason
+        // rather than falling through to the generic unknown-head message; see
+        // `aggregate::metricsum_refusal`.
+        "metricsum" => Err(crate::aggregate::metricsum_refusal(id)),
         "in" => lower_in(e, id, args),
         // §07 comparison functions `lt`/`gt`/`le`/`ge` ($a < b$, $a > b$, $a \le b$,
         // $a \ge b$ over `reals`). The inclusive pair is the image gate's vocabulary
