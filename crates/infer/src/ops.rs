@@ -2939,6 +2939,38 @@ fn reification_type(
         },
         None => unreachable!("reification_type called only when inputs are present"),
     };
+    // §04 *Specifying reification boundaries*: "Boundary input names must be
+    // distinct — a repeated name is a static error, which likewise forbids a
+    // lambda or named function from repeating an argument name." The §05 sugars
+    // (`f(a, a) = …`, `(a, a) -> …`) lower to this same boundary list, so one
+    // check here covers every reified form.
+    let mut seen: Vec<Symbol> = Vec::with_capacity(inputs.len());
+    let mut repeated: Vec<Symbol> = Vec::new();
+    for n in inputs.iter() {
+        if seen.contains(n) {
+            if !repeated.contains(n) {
+                repeated.push(*n);
+            }
+        } else {
+            seen.push(*n);
+        }
+    }
+    if !repeated.is_empty() {
+        for n in &repeated {
+            inf.diags.push(crate::Diagnostic::error_at(
+                id,
+                format!(
+                    "boundary input `{}` is declared more than once (spec §04 Specifying \
+                     reification boundaries: \"Boundary input names must be distinct — a \
+                     repeated name is a static error, which likewise forbids a lambda or \
+                     named function from repeating an argument name\"); give each input a \
+                     distinct name",
+                    inf.module.resolve(*n)
+                ),
+            ));
+        }
+        return Type::Failed("repeated boundary input name".into());
+    }
     // §04 *Placeholders and holes*, the front door: a placeholder this
     // reification's body reaches and its boundary does not declare is a static
     // error. Unenforced it reaches the determiniser as a dangling `(%ref %local

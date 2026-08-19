@@ -306,6 +306,103 @@ fn an_autoinputs_entry_declares_its_placeholder() {
     );
 }
 
+/// Spec §04 *Specifying reification boundaries*: "Boundary input names must be
+/// distinct — a repeated name is a static error, which likewise forbids a lambda
+/// or named function from repeating an argument name." Every §05 sugar lowers to
+/// the same `%specinputs` boundary, so all three spellings must error. Before
+/// this check each inferred with ZERO diagnostics as a function over `(a, a)`.
+#[test]
+fn a_repeated_boundary_input_name_is_a_static_error() {
+    for src in [
+        "f(a, a) = add(a, a)",
+        "g = (a, a) -> add(a, a)",
+        "c = 1.0\nh = functionof(add(c, c), a = c, a = c)",
+        "m = elementof(reals)\nx ~ Normal(mu = m, sigma = 1.0)\nk = kernelof(x, a = m, a = m)",
+    ] {
+        let (_, diags) = infer_diags(src);
+        let errors: Vec<_> = diags
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .collect();
+        assert_eq!(errors.len(), 1, "exactly one error for `{src}`: {diags:?}");
+        assert!(
+            errors[0]
+                .message
+                .contains("boundary input `a` is declared more than once")
+                && errors[0].message.contains(
+                    "Boundary input names must be distinct — a repeated name is a static error"
+                ),
+            "the message names the input and quotes §04: {}",
+            errors[0].message
+        );
+    }
+}
+
+/// The diagnostic is anchored at the reification node. Boundary entries are plain
+/// `(Symbol, Ref)` data with no node of their own, so the repeated name has no
+/// span of its own to carry; for the `f(a, a) = …` sugar the reification's span is
+/// the body, since the surface argument list sits at the binding name and is
+/// recoverable from the source text only (`crates/lsp/src/names.rs`).
+#[test]
+fn a_repeated_boundary_input_is_anchored_at_the_reification() {
+    let src = "f(a, a) = add(a, a)";
+    let (module, diags) = infer_diags(src);
+    let d = diags
+        .iter()
+        .find(|d| d.severity == Severity::Error)
+        .expect("one error");
+    let span = module
+        .span_of(d.node.expect("anchored"))
+        .expect("the reification carries a span");
+    assert_eq!(&src[span.start as usize..span.end as usize], "add(a, a)");
+}
+
+/// The control: distinct names are silent, and one repeated name is reported
+/// once however many times it repeats.
+#[test]
+fn distinct_boundary_input_names_are_silent() {
+    let src = "c = 1.0\nd = 2.0\nh = functionof(add(c, d), p = c, q = d)";
+    let (_, diags) = infer_diags(src);
+    assert!(
+        diags.iter().all(|d| d.severity != Severity::Error),
+        "distinct names are legal: {diags:?}"
+    );
+}
+
+#[test]
+fn a_thrice_repeated_boundary_input_reports_once() {
+    let src = "c = 1.0\nh = functionof(add(c, c), a = c, a = c, a = c)";
+    let (_, diags) = infer_diags(src);
+    assert_eq!(
+        diags
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .count(),
+        1,
+        "one error per repeated name: {diags:?}"
+    );
+}
+
+/// An explicit `%autoinputs` entry list can repeat a name too, and §04's rule is
+/// about the boundary, not about which origin tag records it.
+#[test]
+fn a_repeated_autoinputs_name_is_a_static_error() {
+    let pir = "(%module\n  \
+       (%public other)\n  \
+       (%public F)\n  \
+       (%bind other (elementof reals))\n  \
+       (%bind F (functionof (add (%ref self other) (%ref self other)) \
+       %autoinputs ((a (%ref self other)) (a (%ref self other))))))";
+    let mut module = flatppl_flatpir::read(pir).expect("hand-written FlatPIR reads");
+    let diags = infer_module(&mut module, &ModuleBundle::new(), Level::Type);
+    assert!(
+        diags.iter().any(|d| d.severity == Severity::Error
+            && d.message
+                .contains("boundary input `a` is declared more than once")),
+        "the `%autoinputs` boundary repeats `a`: {diags:?}"
+    );
+}
+
 /// The control for the test above: an `%autoinputs` list that does NOT target
 /// the placeholder leaves it undeclared, so the §04 check still fires.
 #[test]
