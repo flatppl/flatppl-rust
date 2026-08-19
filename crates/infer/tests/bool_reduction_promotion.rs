@@ -84,6 +84,78 @@ fn cumulative_over_booleans_types_as_integer_array() {
     }
 }
 
+/// The promotion must not flatten a TRANSPOSED boolean vector into a rank-1 array. §03
+/// "Arrays" keeps a transposed vector a distinct type, and §07 "Linear algebra" makes
+/// "the product of a transposed vector and a matrix … a transposed vector" — so losing
+/// the orientation costs a type the spec pins, downstream: `mul_type` has no rule for a
+/// bare array against a matrix, and the product went `%deferred`. Only the element kind
+/// is promoted.
+#[test]
+fn cumulative_over_a_transposed_boolean_vector_stays_transposed() {
+    for head in ["cumsum", "cumprod"] {
+        let src = format!("b = [true, true, false]\ntb = transpose(b)\nr = {head}(tb)\n");
+        let line = call_line(&src, head);
+        assert!(
+            line.contains("(%tvector 3 (%scalar integer))"),
+            "{head} over a transposed boolean vector must stay a tvector; got: {line}"
+        );
+        assert!(
+            line.contains("(cartpow integers 3)"),
+            "{head}'s value-set must still be cartpow integers 3; got: {line}"
+        );
+    }
+}
+
+/// The downstream consequence of the orientation, pinned on the §07 rule itself rather
+/// than on the intermediate type: `cumsum(transpose(b)) * M` is a transposed vector, not
+/// `%deferred`.
+#[test]
+fn a_transposed_cumulative_still_multiplies_with_a_matrix() {
+    let src = "b = [true, true, false]\n\
+               M = rowstack([[1, 2, 3], [4, 5, 6], [7, 8, 9]])\n\
+               y = cumsum(transpose(b)) * M\n";
+    let line = call_line(src, "mul");
+    assert!(
+        line.contains("(%tvector 3 (%scalar integer))"),
+        "§07: a transposed vector times a matrix is a transposed vector; got: {line}"
+    );
+}
+
+/// §07 "Table reductions": "the reduction operates column-wise and returns a record
+/// whose fields are the column names". `reduced_scalar` is shared with
+/// [`table_reduction_type`], so a BOOLEAN column's `sum` promotes to `integer` there
+/// too — the same §03 sentence applied per column. A real column is untouched alongside
+/// it, which is what makes this a column-wise rule rather than a whole-table one.
+#[test]
+fn a_boolean_table_column_sums_as_integer() {
+    let src = "t = table(flag = [true, false, true], v = [1.0, 2.0, 3.0])\nr = sum(t)\n";
+    let line = call_line(src, "sum");
+    assert!(
+        line.contains("(flag (%scalar integer))"),
+        "a boolean column's sum must be integer; got: {line}"
+    );
+    assert!(
+        line.contains("(flag integers)"),
+        "and its value-set must be integers; got: {line}"
+    );
+    assert!(
+        line.contains("(v (%scalar real))"),
+        "the real column must be untouched; got: {line}"
+    );
+}
+
+/// The promotion is on the element kind, so it does not care how many axes the boolean
+/// array has: a rank-2 boolean array's `sum` is one integer, not one boolean.
+#[test]
+fn a_multi_axis_boolean_array_sums_as_integer() {
+    let src = "m = rowstack([[true, false, true], [true, true, false]])\nr = sum(m)\n";
+    let line = call_line(src, "sum");
+    assert!(
+        line.contains("(%scalar integer)") && line.contains("%fixed integers"),
+        "a rank-2 boolean array's sum must be integer/integers; got: {line}"
+    );
+}
+
 // ---- the siblings, each settled from the same sentence ----
 
 /// §07 "Reductions" defines `mean` as $\bar{x} = \frac{1}{n}\sum_i x_i$. The promoted

@@ -1380,15 +1380,29 @@ fn bool_elem_array(a: Option<&Type>) -> bool {
 }
 
 /// The §03-promoted result type of `cumsum`/`cumprod` over the boolean array `a`:
-/// the argument's own shape (§07 makes the cumulative pair shape-preserving) with
-/// `Integer` elements. The one place that answer is written down, so the type arm and
-/// the value-set arm in [`call_valueset`] cannot drift — the value-set is
-/// `ValueSet::natural_of` of exactly this type. Only ever called behind
-/// [`bool_elem_array`], so the shapeless fallback is unreachable.
+/// the argument's own shape AND orientation (§07 makes the cumulative pair
+/// shape-preserving) with `Integer` elements. Only the element kind is promoted.
+///
+/// A `TVector` stays a `TVector`. §03 "Arrays" keeps a transposed vector a distinct
+/// type, and §07 "Linear algebra" makes "the product of a transposed vector and a
+/// matrix … a transposed vector" — so collapsing the orientation to a rank-1 `Array`
+/// loses a type the spec pins: `cumsum(transpose(b)) * M` typed `%deferred` instead of
+/// `%tvector`, since `mul_type` has no rule for a bare array against a matrix.
+///
+/// The one place this answer is written down, so the type arm and the value-set arm in
+/// [`call_valueset`] cannot drift — the value-set is `ValueSet::natural_of` of exactly
+/// this type, and it handles `TVector` too (`CartPow(elem, len)`, the same set an
+/// `Array` of that length gives). Only ever called behind [`bool_elem_array`], so the
+/// shapeless fallback is unreachable.
 fn cumulative_bool_type(a: Option<&Type>) -> Type {
+    if let Some(Type::TVector { len, .. }) = a {
+        return Type::TVector {
+            len: *len,
+            elem: Box::new(Type::Scalar(ScalarType::Integer)),
+        };
+    }
     let shape: Box<[Dim]> = match a {
         Some(Type::Array { shape, .. }) => shape.clone(),
-        Some(Type::TVector { len, .. }) => Box::new([*len]),
         _ => Box::new([Dim::Dynamic]),
     };
     Type::Array {
