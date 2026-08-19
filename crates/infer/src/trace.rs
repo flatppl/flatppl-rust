@@ -425,7 +425,7 @@ impl<'m, 's> Inferencer<'m, 's> {
                     let binding_name = self.module.resolve(r.name).to_string();
                     let subst_annos = self.subst_annos_for(alias);
                     match self.session.resolve(
-                        &*self.module,
+                        &mut *self.module,
                         alias,
                         &binding_name,
                         &subst_annos,
