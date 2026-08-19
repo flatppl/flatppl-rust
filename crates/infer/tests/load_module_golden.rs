@@ -65,6 +65,21 @@ fn spec_example_infers_cross_module() {
         "L should be Likelihood over (%scalar real); got {ty:?}; diags: {diags:?}"
     );
 
+    // §11 → "Annotated FlatPIR" prints this very model's `L` as
+    // `(%likelihood (%inputs center spread x) (%obstype (%scalar real)))`, and
+    // §11 → "Callable types" is normative: "The `%inputs` names are the
+    // callable's input names". The names come from the DEPENDENCY's interner, so
+    // asserting them is what pins the boundary re-intern.
+    let Some(flatppl_core::Type::Likelihood { inputs, .. }) = ty else {
+        unreachable!("asserted above");
+    };
+    let names: Vec<&str> = inputs.iter().map(|&s| model.resolve(s)).collect();
+    assert_eq!(
+        names,
+        ["center", "spread", "x"],
+        "L must inherit obs_kernel's input names as `helpers.flatppl` spells them"
+    );
+
     // Also assert the types of helpers' own bindings as standalone inference.
     // Run helpers standalone at Level::Shape so obs_kernel and shifted_value
     // are fully annotated.

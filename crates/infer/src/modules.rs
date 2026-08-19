@@ -60,6 +60,151 @@ impl ModuleBundle {
     }
 }
 
+// ── Cross-interner symbol translation ────────────────────────────────────────
+//
+// A `Symbol` is an index into ONE module's interner (`core::id`), and the
+// importer and each dependency intern independently. Several `Type` and
+// `ValueSet` variants carry `Symbol`s as *names*: `Kernel`/`Function`/
+// `Likelihood` inputs, `Record` fields, `Table` columns, `ValueSet::RecordSet`
+// fields. Handing such a value across the load boundary unchanged re-reads every
+// name as whatever the receiving interner holds at that index, which violates
+// §11's "The `%inputs` names are the callable's input names" and silently
+// rewrites a record domain. The determiniser's graft already re-interns
+// (`determinizer::crossmodule`); these walkers give inference the same
+// discipline.
+
+/// `ty` with every interned name replaced by `f(name)`.
+fn map_type_symbols(ty: &Type, f: &mut dyn FnMut(Symbol) -> Symbol) -> Type {
+    fn map_fields(
+        fields: &[(Symbol, Type)],
+        f: &mut dyn FnMut(Symbol) -> Symbol,
+    ) -> Box<[(Symbol, Type)]> {
+        fields
+            .iter()
+            .map(|(n, t)| (f(*n), map_type_symbols(t, f)))
+            .collect()
+    }
+    fn map_inputs(inputs: &[Symbol], f: &mut dyn FnMut(Symbol) -> Symbol) -> Box<[Symbol]> {
+        inputs.iter().map(|s| f(*s)).collect()
+    }
+    match ty {
+        Type::Array { shape, elem } => Type::Array {
+            shape: shape.clone(),
+            elem: Box::new(map_type_symbols(elem, f)),
+        },
+        Type::TVector { len, elem } => Type::TVector {
+            len: *len,
+            elem: Box::new(map_type_symbols(elem, f)),
+        },
+        Type::Record(fields) => Type::Record(map_fields(fields, f)),
+        Type::Tuple(parts) => Type::Tuple(parts.iter().map(|t| map_type_symbols(t, f)).collect()),
+        Type::Table { columns, nrows } => Type::Table {
+            columns: map_fields(columns, f),
+            nrows: *nrows,
+        },
+        Type::Measure { domain, mass } => Type::Measure {
+            domain: Box::new(map_type_symbols(domain, f)),
+            mass: *mass,
+        },
+        Type::Kernel { inputs, mass } => Type::Kernel {
+            inputs: map_inputs(inputs, f),
+            mass: *mass,
+        },
+        Type::Function { inputs } => Type::Function {
+            inputs: map_inputs(inputs, f),
+        },
+        Type::Likelihood { inputs, obstype } => Type::Likelihood {
+            inputs: map_inputs(inputs, f),
+            obstype: Box::new(map_type_symbols(obstype, f)),
+        },
+        // Symbol-free leaves.
+        Type::Deferred
+        | Type::Failed(_)
+        | Type::Any
+        | Type::Scalar(_)
+        | Type::RngState
+        | Type::Module
+        | Type::Var(_) => ty.clone(),
+    }
+}
+
+/// `vs` with every interned `RecordSet` field name replaced by `f(name)`.
+fn map_valueset_symbols(vs: &ValueSet, f: &mut dyn FnMut(Symbol) -> Symbol) -> ValueSet {
+    match vs {
+        ValueSet::CartPow(elem, d) => {
+            ValueSet::CartPow(Box::new(map_valueset_symbols(elem, f)), *d)
+        }
+        ValueSet::CartProd(parts) => {
+            ValueSet::CartProd(parts.iter().map(|s| map_valueset_symbols(s, f)).collect())
+        }
+        ValueSet::RecordSet(fields) => ValueSet::RecordSet(
+            fields
+                .iter()
+                .map(|(n, s)| (f(*n), map_valueset_symbols(s, f)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// Re-intern every name in `ty` from `from`'s interner into `into`'s.
+fn reintern_type(into: &mut Module, from: &Module, ty: &Type) -> Type {
+    map_type_symbols(ty, &mut |s| {
+        let name = from.resolve(s).to_string();
+        into.intern(&name)
+    })
+}
+
+/// Re-intern every name in `vs` from `from`'s interner into `into`'s.
+fn reintern_valueset(into: &mut Module, from: &Module, vs: &ValueSet) -> ValueSet {
+    map_valueset_symbols(vs, &mut |s| {
+        let name = from.resolve(s).to_string();
+        into.intern(&name)
+    })
+}
+
+/// The substitution half of the per-import-site memo key.
+///
+/// `Debug` pins the structure but renders a name as its bare `Symbol` index,
+/// which two modules assign independently — so two import sites in DIFFERENT
+/// modules can substitute records with different field names and produce the
+/// same string, and the second site would read the first site's names out of the
+/// memo. The interned names are therefore spelled out alongside the structure.
+/// (`ValueSet` is not `Hash`/`Eq`, which is why the key is a string at all.)
+fn subst_signature(importer: &Module, annos: &[(String, Resolved)]) -> String {
+    annos
+        .iter()
+        .map(|(name, r)| {
+            let mut names: Vec<String> = Vec::new();
+            let mut record = |s: Symbol| {
+                names.push(importer.resolve(s).to_string());
+                s
+            };
+            map_type_symbols(&r.ty, &mut record);
+            map_valueset_symbols(&r.vset, &mut record);
+            format!(
+                "{name}={:?}/{:?}/{:?}[{}]",
+                r.ty,
+                r.phase,
+                r.vset,
+                names.join("+")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// `res` with `ty`, `vset` and `result` re-interned from `from` into `into`.
+fn reintern_resolved(into: &mut Module, from: &Module, res: Resolved) -> Resolved {
+    Resolved {
+        ty: reintern_type(into, from, &res.ty),
+        vset: reintern_valueset(into, from, &res.vset),
+        result: res.result.map(|t| reintern_type(into, from, &t)),
+        phase: res.phase,
+        catalogue: res.catalogue,
+    }
+}
+
 /// The outcome of resolving `(%ref alias X)` across module boundaries.
 #[derive(Debug, Clone)]
 pub(crate) struct Resolved {
@@ -216,9 +361,16 @@ impl<'b> InferSession<'b> {
     /// The caller (`resolve`) is responsible for the cycle check before calling.
     /// Diagnostics from the child run are accumulated in `self.dep_diags` so
     /// that cycle errors and other dep-level errors reach the root caller.
+    ///
+    /// The seeds carry `importer`-context types, so their names are re-interned
+    /// into the dependency clone before the walk — the mirror of the outbound
+    /// translation in `resolve`. Without it the dependency's annotation table
+    /// holds foreign `Symbol` indices, which the outbound translation then reads
+    /// against the wrong interner.
     fn infer_dep(
         &self,
         dep: &Module,
+        importer: &Module,
         path: &str,
         key: &(String, String),
         seeds: &[(NodeId, Resolved)],
@@ -226,8 +378,12 @@ impl<'b> InferSession<'b> {
     ) {
         self.stack.borrow_mut().push(path.to_string());
         let mut dep_clone = dep.clone();
+        let seeds: Vec<(NodeId, Resolved)> = seeds
+            .iter()
+            .map(|(n, r)| (*n, reintern_resolved(&mut dep_clone, importer, r.clone())))
+            .collect();
         let child_diags =
-            crate::trace::Inferencer::new_seeded(&mut dep_clone, level, self, seeds).run();
+            crate::trace::Inferencer::new_seeded(&mut dep_clone, level, self, &seeds).run();
         self.stack.borrow_mut().pop();
         self.push_dep_diags(child_diags);
         // Two-phase memo access: `contains_key` above released the `Ref` so we
@@ -254,9 +410,13 @@ impl<'b> InferSession<'b> {
     /// importer-context inferred annotations for substitution inputs. On
     /// failure returns `Err(message)`; the caller emits an anchored error +
     /// `Type::Failed`.
+    ///
+    /// `importer` is `&mut` because the returned `Resolved` is re-interned into
+    /// the importer's interner before it leaves the boundary
+    /// (`reintern_resolved`) — a dependency `Symbol` is meaningless here.
     pub(crate) fn resolve(
         &self,
-        importer: &Module,
+        importer: &mut Module,
         alias: Symbol,
         binding_name: &str,
         subst_annos: &[(String, Resolved)],
@@ -290,14 +450,10 @@ impl<'b> InferSession<'b> {
             }
         })?;
 
-        // Memo key: path + Debug signature of substitution annotations
-        // (ValueSet is not Hash/Eq, so we use Debug strings).
-        let sig = subst_annos
-            .iter()
-            .map(|(name, r)| format!("{name}={:?}/{:?}/{:?}", r.ty, r.phase, r.vset))
-            .collect::<Vec<_>>()
-            .join(",");
-        let key = (directive.path.clone(), sig);
+        let key = (
+            directive.path.clone(),
+            subst_signature(importer, subst_annos),
+        );
 
         // Two-phase memo access: check first without holding a `Ref`, then
         // infer+insert (which needs `borrow_mut`), then re-borrow to read.
@@ -309,7 +465,7 @@ impl<'b> InferSession<'b> {
                 return Err(format!("module cycle: {}", chain.join(" → ")));
             }
             let seeds = seed_plan(dep, subst_annos);
-            self.infer_dep(dep, &directive.path, &key, &seeds, level);
+            self.infer_dep(dep, importer, &directive.path, &key, &seeds, level);
         }
 
         let memo = self.memo.borrow();
@@ -338,7 +494,7 @@ impl<'b> InferSession<'b> {
                  reify it with `lawof`/`kernelof` to export it)"
             ));
         }
-        Ok(Resolved {
+        let raw = Resolved {
             ty: dep_annotated
                 .type_of(rhs)
                 .cloned()
@@ -350,7 +506,8 @@ impl<'b> InferSession<'b> {
                 .unwrap_or(ValueSet::Unknown),
             result: callable_body_result(dep_annotated, rhs),
             catalogue: None,
-        })
+        };
+        Ok(reintern_resolved(importer, dep_annotated, raw))
     }
 }
 

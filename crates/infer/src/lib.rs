@@ -713,6 +713,11 @@ mod cross_module_callable_tests {
     /// body-result type over `Resolved` — never diverges from the single-module
     /// `reified_result_type` path. (Substituting `center = a` cross-module
     /// changes the value's *location*, not its TYPE, so the types must match.)
+    ///
+    /// Parity is asserted on the RENDERED types, not on the `Type` values: an
+    /// input name is a `Symbol`, and the two modules intern independently, so
+    /// equal `Symbol` indices across them would be a coincidence rather than
+    /// agreement (`display_type` resolves the names).
     #[test]
     fn cross_module_callable_matches_local_application() {
         // Local: the kernel and its likelihood inlined in one module.
@@ -753,10 +758,11 @@ mod cross_module_callable_tests {
             .rhs;
         let cross_ty = model.type_of(l_cross).cloned();
 
-        assert!(local_ty.is_some(), "local infer failed");
-        assert!(cross_ty.is_some(), "cross infer failed");
+        let local_ty = local_ty.expect("local infer failed");
+        let cross_ty = cross_ty.expect("cross infer failed");
         assert_eq!(
-            local_ty, cross_ty,
+            local.display_type(&local_ty),
+            model.display_type(&cross_ty),
             "cross-module callable application must match local application"
         );
     }
