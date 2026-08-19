@@ -86,6 +86,17 @@
 //! - a destructured `load_data` input used as one monolithic value — "a
 //!   load_data input whose valueset is a table or record has no single tensor
 //!   form; read it column-wise (`data.y`) — one argument per column"
+//! - `sum` over a TABLE — "a table reduction has no tensor form: §07 \"Table
+//!   reductions\" makes `sum` over a table a RECORD of per-column sums, ...".
+//!   A boolean ARRAY is not refused: §03 "Bool" promotes it ("`sum(mask)` to
+//!   count true entries"), `infer` types the result `integers`, and
+//!   `Emitter::reduce_axis` emits the matching `stablehlo.convert` to `i32`.
+//! - `maximum`/`minimum` over a non-real array — "maximum/minimum: only a real
+//!   array is supported, got ...". Booleans are refused here even though `sum`
+//!   accepts them, and deliberately: §03's promotion covers arithmetic
+//!   contexts, while $\max_i x_i$ selects an element, so `infer` keeps
+//!   `maximum(bool_array)` at `booleans` and there is no `i1` `stablehlo.reduce`
+//!   identity in this emitter to lower it with.
 //! - an elementwise binary op whose operands do not broadcast (different rank,
 //!   or an axis pair neither equal nor size-1) — "elementwise operands do not
 //!   broadcast: ... — §04 broadcasting needs equal rank ... (a matrix product
@@ -302,11 +313,12 @@
 //!   true entries"), i.e. widened first. Defensive: `infer` types an axis-indexed
 //!   body `%deferred`, so `aggregate`'s own inferred element kind is `Real` and
 //!   `aggregate::reduce` widens the frame to it before contracting — no surface
-//!   model reaches this arm today. `Emitter::reduce_axis`'s own
-//!   `ElemKind::Bool => "false"` additive arm is NOT guarded and IS live and
-//!   wrong (`ops::lower_sum` over a boolean array emits the wrapping add); see
-//!   that method's note — §03 settles the direction (widen), inference's
-//!   `booleans` typing of the call is the blocker.
+//!   model reaches this arm today. `Emitter::reduce_axis` also widens rather
+//!   than refusing — it converts a `Bool` operand to `Int`, per §03's promotion
+//!   and the `integers` type `infer` now gives `sum(bool_array)` — so its own
+//!   `ElemKind::Bool => "false"` additive arm is unreachable. The two routes
+//!   differ only in the kind they widen to (`Int` here, `Real` on the aggregate
+//!   path, whose body types `%deferred`); see `reduce_trailing_axes`'s note.
 //!
 //! **`registry.rs`** (the distribution dispatch table):
 //! - a kernel-input record missing a parameter a builder needs —
