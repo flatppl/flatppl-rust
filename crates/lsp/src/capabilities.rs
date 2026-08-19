@@ -405,7 +405,7 @@ pub fn goto_definition(
 ///   [`SourceFile`], and match the member name there. A `standard_module` alias
 ///   has no workspace file (`resolve_path` finds nothing) → `None`.
 /// - [`RefNs::Local`]: a placeholder input, not navigable → `None`.
-fn resolve_ref_def(
+pub(crate) fn resolve_ref_def(
     db: &dyn salsa::Database,
     file: SourceFile,
     fs: FileSet,
@@ -734,7 +734,7 @@ fn reset_static_completion_items() {
 /// When the file fails to parse (e.g. because the cursor is mid-expression on
 /// the last line), this function retries with the last newline-delimited line
 /// stripped, allowing completion to work even while the user is still typing.
-fn find_standard_module_name(
+pub(crate) fn find_standard_module_name(
     db: &dyn salsa::Database,
     file: SourceFile,
     fs: FileSet,
@@ -785,7 +785,7 @@ fn extract_standard_module_name(module: &flatppl_core::Module, alias: &str) -> O
 /// Strip the last non-empty line from `text` (newline-separated), returning
 /// the remainder. If `text` has no newline or is entirely blank, returns an
 /// empty string.
-fn strip_last_nonempty_line(text: &str) -> &str {
+pub(crate) fn strip_last_nonempty_line(text: &str) -> &str {
     // Walk backwards, skipping trailing whitespace / empty lines, then find the
     // newline that ends the preceding line.
     let bytes = text.as_bytes();

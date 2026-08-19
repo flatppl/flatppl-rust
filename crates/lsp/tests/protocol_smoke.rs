@@ -18,7 +18,8 @@ use lsp_types::{
     },
     request::{
         Completion, DocumentSymbolRequest, GotoDefinition, HoverRequest, Initialize,
-        InlayHintRequest, Request as _, WorkspaceSymbolRequest,
+        InlayHintRequest, PrepareRenameRequest, References, Rename, Request as _,
+        SignatureHelpRequest, WorkspaceSymbolRequest,
     },
 };
 
@@ -1075,6 +1076,348 @@ fn published_diagnostics_carry_version() {
         params.version
     );
 
+    do_shutdown(&client_conn, 99);
+    server_thread.join().expect("server thread must not panic");
+}
+
+// ── references / rename / signatureHelp protocol smoke ───────────────────────
+
+const RN_HELPERS_URI: &str = "file:///tmp/rn_helpers.flatppl";
+const RN_MODEL_URI: &str = "file:///tmp/rn_model.flatppl";
+const RN_SIG_URI: &str = "file:///tmp/rn_sig.flatppl";
+
+/// `shifted` is defined here, used locally, and re-exported through the member
+/// access in the model below.
+const RN_HELPERS_SRC: &str = "shifted = 1.0\nlocal = add(shifted, 1.0)";
+
+/// Loads the helpers module and reaches `shifted` across the module boundary.
+const RN_MODEL_SRC: &str = "h = load_module(\"rn_helpers.flatppl\")\nv = h.shifted";
+
+/// A buffer left mid-call, as it is when signature help actually fires.
+const RN_SIG_SRC: &str = "mu = 0.0\nx = Normal(mu, ";
+
+/// Protocol-level smoke coverage for `textDocument/references`,
+/// `textDocument/prepareRename`, `textDocument/rename` and
+/// `textDocument/signatureHelp`, driven over the wire on a two-file bundle.
+///
+/// The bundle matters: a rename of a name reached through `load_module` must come
+/// back as a `WorkspaceEdit` touching BOTH documents, which a single-file fixture
+/// could not show.
+#[test]
+fn references_rename_signature_smoke() {
+    let (server_conn, client_conn) = Connection::memory();
+    let server_thread = std::thread::spawn(move || {
+        let server_caps =
+            serde_json::to_value(flatppl_lsp::server::server_capabilities()).expect("caps");
+        let init_params = server_conn.initialize(server_caps).expect("handshake");
+        flatppl_lsp::server::run(server_conn, init_params).expect("server loop");
+    });
+
+    do_handshake(&client_conn, 1);
+    do_open_and_drain_diags(&client_conn, RN_HELPERS_URI, RN_HELPERS_SRC);
+    do_open_and_drain_diags(&client_conn, RN_MODEL_URI, RN_MODEL_SRC);
+    do_open_and_drain_diags(&client_conn, RN_SIG_URI, RN_SIG_SRC);
+
+    /// The position of the `shifted` declaration in the helpers document.
+    fn shifted_decl() -> lsp_types::TextDocumentPositionParams {
+        lsp_types::TextDocumentPositionParams {
+            text_document: lsp_types::TextDocumentIdentifier {
+                uri: Uri::from_str(RN_HELPERS_URI).unwrap(),
+            },
+            position: lsp_types::Position {
+                line: 0,
+                character: 0,
+            },
+        }
+    }
+
+    // ── textDocument/references ──────────────────────────────────────────────
+    {
+        let params = lsp_types::ReferenceParams {
+            text_document_position: shifted_decl(),
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: lsp_types::ReferenceContext {
+                include_declaration: true,
+            },
+        };
+        let resp = round_trip(
+            &client_conn,
+            Request {
+                id: RequestId::from(20i32),
+                method: References::METHOD.to_owned(),
+                params: serde_json::to_value(params).unwrap(),
+            },
+        );
+        assert!(
+            resp.error.is_none(),
+            "references must not error; got {:?}",
+            resp.error
+        );
+        let locs: Vec<lsp_types::Location> =
+            serde_json::from_value(resp.result.expect("references result"))
+                .expect("references result must deserialize to Location[]");
+        let uris: Vec<&str> = locs.iter().map(|l| l.uri.as_str()).collect();
+        assert_eq!(
+            locs.len(),
+            3,
+            "declaration + local use + the cross-module member ref; got {locs:?}"
+        );
+        assert!(
+            uris.contains(&RN_HELPERS_URI) && uris.contains(&RN_MODEL_URI),
+            "references must span the bundle, not just the open document; got {uris:?}"
+        );
+    }
+
+    // ── textDocument/prepareRename ───────────────────────────────────────────
+    {
+        let resp = round_trip(
+            &client_conn,
+            Request {
+                id: RequestId::from(21i32),
+                method: PrepareRenameRequest::METHOD.to_owned(),
+                params: serde_json::to_value(shifted_decl()).unwrap(),
+            },
+        );
+        assert!(resp.error.is_none(), "prepareRename must not error");
+        let range: lsp_types::Range =
+            serde_json::from_value(resp.result.expect("prepareRename result"))
+                .expect("prepareRename must return a Range");
+        assert_eq!(range.start.character, 0);
+        assert_eq!(
+            range.end.character, 7,
+            "the editable range covers `shifted`; got {range:?}"
+        );
+    }
+
+    // A built-in has no definition site to rewrite, so prepareRename declines it
+    // with a null result and the client never prompts for a name.
+    {
+        let params = lsp_types::TextDocumentPositionParams {
+            text_document: lsp_types::TextDocumentIdentifier {
+                uri: Uri::from_str(RN_HELPERS_URI).unwrap(),
+            },
+            // Line 1, char 8: the `add` of `local = add(shifted, 1.0)`.
+            position: lsp_types::Position {
+                line: 1,
+                character: 8,
+            },
+        };
+        let resp = round_trip(
+            &client_conn,
+            Request {
+                id: RequestId::from(22i32),
+                method: PrepareRenameRequest::METHOD.to_owned(),
+                params: serde_json::to_value(params).unwrap(),
+            },
+        );
+        assert_eq!(
+            resp.result,
+            Some(serde_json::Value::Null),
+            "prepareRename over a built-in must be null; got {:?}",
+            resp.result
+        );
+    }
+
+    // ── textDocument/rename: a refusal reaches the client as an error ────────
+    //
+    // `_shifted` is private (spec §04 "Binding names"), and the model reaches
+    // `shifted` across the module boundary, so the rename must refuse rather
+    // than write a bundle that no longer resolves.
+    {
+        let params = lsp_types::RenameParams {
+            text_document_position: shifted_decl(),
+            new_name: "_shifted".to_string(),
+            work_done_progress_params: Default::default(),
+        };
+        let resp = round_trip(
+            &client_conn,
+            Request {
+                id: RequestId::from(23i32),
+                method: Rename::METHOD.to_owned(),
+                params: serde_json::to_value(params).unwrap(),
+            },
+        );
+        let err = resp
+            .error
+            .expect("public → private with a cross-module reference must refuse");
+        assert!(
+            err.message.contains("private"),
+            "the refusal must carry the reason; got {}",
+            err.message
+        );
+    }
+
+    // ── textDocument/rename: the accepted edit spans both documents ──────────
+    {
+        let params = lsp_types::RenameParams {
+            text_document_position: shifted_decl(),
+            new_name: "offset".to_string(),
+            work_done_progress_params: Default::default(),
+        };
+        let resp = round_trip(
+            &client_conn,
+            Request {
+                id: RequestId::from(24i32),
+                method: Rename::METHOD.to_owned(),
+                params: serde_json::to_value(params).unwrap(),
+            },
+        );
+        assert!(
+            resp.error.is_none(),
+            "rename must not error; got {:?}",
+            resp.error
+        );
+        let edit: lsp_types::WorkspaceEdit =
+            serde_json::from_value(resp.result.expect("rename result"))
+                .expect("rename must return a WorkspaceEdit");
+        #[allow(clippy::mutable_key_type)] // lsp-types keys WorkspaceEdit by `Uri`
+        let changes = edit.changes.expect("changes keyed by document URI");
+        let helpers_edits = changes
+            .iter()
+            .find(|(u, _)| u.as_str() == RN_HELPERS_URI)
+            .map(|(_, e)| e.len())
+            .unwrap_or(0);
+        let model_edits = changes
+            .iter()
+            .find(|(u, _)| u.as_str() == RN_MODEL_URI)
+            .map(|(_, e)| e.len())
+            .unwrap_or(0);
+        assert_eq!(
+            helpers_edits, 2,
+            "the declaration and the local use in the defining document"
+        );
+        assert_eq!(
+            model_edits, 1,
+            "the member half of `h.shifted` in the importer"
+        );
+        for edits in changes.values() {
+            for e in edits {
+                assert_eq!(e.new_text, "offset");
+            }
+        }
+    }
+
+    // ── textDocument/signatureHelp ───────────────────────────────────────────
+    //
+    // `RN_SIG_SRC` does not parse (the call is still open), which is the state
+    // the request actually arrives in.
+    {
+        let params = lsp_types::SignatureHelpParams {
+            text_document_position_params: lsp_types::TextDocumentPositionParams {
+                text_document: lsp_types::TextDocumentIdentifier {
+                    uri: Uri::from_str(RN_SIG_URI).unwrap(),
+                },
+                // End of `x = Normal(mu, ` — the second argument.
+                position: lsp_types::Position {
+                    line: 1,
+                    character: 15,
+                },
+            },
+            work_done_progress_params: Default::default(),
+            context: None,
+        };
+        let resp = round_trip(
+            &client_conn,
+            Request {
+                id: RequestId::from(25i32),
+                method: SignatureHelpRequest::METHOD.to_owned(),
+                params: serde_json::to_value(params).unwrap(),
+            },
+        );
+        assert!(
+            resp.error.is_none(),
+            "signatureHelp must not error; got {:?}",
+            resp.error
+        );
+        let help: lsp_types::SignatureHelp =
+            serde_json::from_value(resp.result.expect("signatureHelp result"))
+                .expect("signatureHelp must return a SignatureHelp");
+        assert_eq!(
+            help.signatures[0].label, "Normal(mu, sigma)",
+            "the label must carry the catalogue's §08 parameter names"
+        );
+        assert_eq!(
+            help.active_parameter,
+            Some(1),
+            "the cursor is on the second argument"
+        );
+    }
+
+    do_shutdown(&client_conn, 99);
+    server_thread.join().expect("server thread must not panic");
+}
+
+// ── capability advertisement over the wire ───────────────────────────────────
+
+/// The `initialize` result must advertise references, rename (with
+/// `prepareProvider`) and signature help, or a client never sends those
+/// requests however well the handlers work.
+#[test]
+fn initialize_advertises_the_new_capabilities() {
+    let (server_conn, client_conn) = Connection::memory();
+    let server_thread = std::thread::spawn(move || {
+        let server_caps =
+            serde_json::to_value(flatppl_lsp::server::server_capabilities()).expect("caps");
+        let init_params = server_conn.initialize(server_caps).expect("handshake");
+        flatppl_lsp::server::run(server_conn, init_params).expect("server loop");
+    });
+
+    #[allow(deprecated)]
+    let init_params_value = serde_json::to_value(InitializeParams {
+        capabilities: ClientCapabilities::default(),
+        ..Default::default()
+    })
+    .expect("serialize InitializeParams");
+    client_conn
+        .sender
+        .send(Message::Request(Request {
+            id: RequestId::from(1i32),
+            method: Initialize::METHOD.to_owned(),
+            params: init_params_value,
+        }))
+        .unwrap();
+    let msg = client_conn
+        .receiver
+        .recv_timeout(Duration::from_secs(5))
+        .expect("InitializeResult");
+    let Message::Response(resp) = msg else {
+        panic!("expected the InitializeResult response; got {msg:?}");
+    };
+    let result: lsp_types::InitializeResult =
+        serde_json::from_value(resp.result.expect("initialize result"))
+            .expect("InitializeResult must deserialize");
+    let caps = result.capabilities;
+
+    assert_eq!(
+        caps.references_provider,
+        Some(lsp_types::OneOf::Left(true)),
+        "the server must advertise references"
+    );
+    match caps.rename_provider {
+        Some(lsp_types::OneOf::Right(opts)) => assert_eq!(
+            opts.prepare_provider,
+            Some(true),
+            "rename must advertise prepareProvider so a position can be declined"
+        ),
+        other => panic!("expected RenameOptions with prepareProvider; got {other:?}"),
+    }
+    let sig = caps
+        .signature_help_provider
+        .expect("the server must advertise signature help");
+    assert_eq!(
+        sig.trigger_characters.as_deref(),
+        Some(["(".to_string(), ",".to_string()].as_slice()),
+        "signature help must trigger on `(` and `,`"
+    );
+
+    client_conn
+        .sender
+        .send(Message::Notification(lsp_server::Notification::new(
+            Initialized::METHOD.to_owned(),
+            InitializedParams {},
+        )))
+        .unwrap();
     do_shutdown(&client_conn, 99);
     server_thread.join().expect("server thread must not panic");
 }

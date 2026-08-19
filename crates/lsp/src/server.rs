@@ -22,7 +22,8 @@ use lsp_types::{
     },
     request::{
         Completion, DocumentSymbolRequest, GotoDefinition, HoverRequest, InlayHintRequest,
-        Request as _, WorkspaceSymbolRequest,
+        PrepareRenameRequest, References, Rename, Request as _, SignatureHelpRequest,
+        WorkspaceSymbolRequest,
     },
 };
 
@@ -453,6 +454,10 @@ fn handle_request_on_worker(
         InlayHintRequest::METHOD => handle_inlay_hints(db, uri_to_file, fs, cats, req),
         GotoDefinition::METHOD => handle_goto_definition(db, uri_to_file, fs, cats, req),
         Completion::METHOD => handle_completion(db, uri_to_file, fs, cats, req),
+        References::METHOD => handle_references(db, uri_to_file, fs, cats, req),
+        PrepareRenameRequest::METHOD => handle_prepare_rename(db, uri_to_file, fs, cats, req),
+        Rename::METHOD => handle_rename(db, uri_to_file, fs, cats, req),
+        SignatureHelpRequest::METHOD => handle_signature_help(db, uri_to_file, fs, cats, req),
         _ => Response::new_err(
             req.id.clone(),
             lsp_server::ErrorCode::MethodNotFound as i32,
@@ -507,6 +512,22 @@ pub fn server_capabilities() -> ServerCapabilities {
         workspace_symbol_provider: Some(OneOf::Left(true)),
         inlay_hint_provider: Some(OneOf::Left(true)),
         definition_provider: Some(OneOf::Left(true)),
+        references_provider: Some(OneOf::Left(true)),
+        // `prepare_provider` so the client asks whether a position is renameable
+        // before prompting for a new name: built-ins, standard-module members,
+        // record fields and `%local` placeholders are declined up front.
+        rename_provider: Some(OneOf::Right(lsp_types::RenameOptions {
+            prepare_provider: Some(true),
+            work_done_progress_options: Default::default(),
+        })),
+        // `(` opens a signature, `,` advances the active parameter, and `=`
+        // retriggers because it turns the current argument into a §05 keyword
+        // argument, which moves the highlight to that name's declared slot.
+        signature_help_provider: Some(lsp_types::SignatureHelpOptions {
+            trigger_characters: Some(vec!["(".to_string(), ",".to_string()]),
+            retrigger_characters: Some(vec![",".to_string(), "=".to_string()]),
+            work_done_progress_options: Default::default(),
+        }),
         completion_provider: Some(CompletionOptions {
             trigger_characters: Some(vec![
                 ".".to_string(),
@@ -970,6 +991,216 @@ fn handle_completion(
 
     match result {
         Some(resp) => Response::new_ok(req.id.clone(), resp),
+        None => Response::new_ok(req.id.clone(), serde_json::Value::Null),
+    }
+}
+
+/// Turn a `SourceFile`'s stored path into the URI to report it under.
+///
+/// A stored path that is already a URI (a client-fed URL source, or a `file://`
+/// path) is used as-is; a bare filesystem path is percent-encoded.
+fn file_uri_for(path: &str) -> Option<Uri> {
+    let s = if path.contains("://") {
+        path.to_string()
+    } else {
+        path_to_file_uri(path)
+    };
+    Uri::from_str(&s).ok()
+}
+
+/// The `SourceFile` in `fs` whose stored path is `path`, for reusing its cached
+/// line index when converting a byte range in another file.
+fn file_by_path(db: &Database, fs: FileSet, path: &str) -> Option<SourceFile> {
+    fs.files(db).iter().copied().find(|f| f.path(db) == path)
+}
+
+/// Convert a byte range in the file stored at `path` to an LSP `Range`.
+fn range_in(db: &Database, fs: FileSet, path: &str, start: u32, end: u32) -> lsp_types::Range {
+    let li = file_by_path(db, fs, path)
+        .map(|f| line_index(db, f))
+        .unwrap_or_else(|| crate::line_index::LineIndex::new(""));
+    let s = li.position(start);
+    let e = li.position(end);
+    lsp_types::Range::new(
+        lsp_types::Position::new(s.line, s.character),
+        lsp_types::Position::new(e.line, e.character),
+    )
+}
+
+/// Resolve a request's text-document-position params to `(file, byte_offset)`.
+fn position_target(
+    db: &Database,
+    uri_to_file: &HashMap<String, SourceFile>,
+    tdp: &lsp_types::TextDocumentPositionParams,
+) -> Option<(SourceFile, u32)> {
+    let file = *uri_to_file.get(tdp.text_document.uri.as_str())?;
+    let li = line_index(db, file);
+    let byte = li.offset(Pos {
+        line: tdp.position.line,
+        character: tdp.position.character,
+    });
+    Some((file, byte))
+}
+
+/// Handle a `textDocument/references` request.
+///
+/// Returns the locations of every reference to the binding under the cursor
+/// across the whole file set. A position that is not on a binding yields an
+/// empty array, which is the protocol's "nothing to report".
+fn handle_references(
+    db: &Database,
+    uri_to_file: &HashMap<String, SourceFile>,
+    fs: FileSet,
+    cats: Catalogues,
+    req: &lsp_server::Request,
+) -> Response {
+    let locations: Vec<lsp_types::Location> = (|| {
+        let params: lsp_types::ReferenceParams = serde_json::from_value(req.params.clone()).ok()?;
+        let (file, byte) = position_target(db, uri_to_file, &params.text_document_position)?;
+        let index = node_span_index(db, file, fs, cats);
+        let locs = crate::rename::references(
+            db,
+            file,
+            fs,
+            cats,
+            byte,
+            &index,
+            params.context.include_declaration,
+        );
+        Some(
+            locs.into_iter()
+                .filter_map(|l| {
+                    Some(lsp_types::Location {
+                        uri: file_uri_for(&l.path)?,
+                        range: range_in(db, fs, &l.path, l.start, l.end),
+                    })
+                })
+                .collect(),
+        )
+    })()
+    .unwrap_or_default();
+
+    Response::new_ok(req.id.clone(), locations)
+}
+
+/// Handle a `textDocument/prepareRename` request.
+///
+/// A `null` result tells the client the position cannot be renamed, so it never
+/// prompts for a new name over a built-in, a standard-module member, a record
+/// field or a `%local` placeholder.
+fn handle_prepare_rename(
+    db: &Database,
+    uri_to_file: &HashMap<String, SourceFile>,
+    fs: FileSet,
+    cats: Catalogues,
+    req: &lsp_server::Request,
+) -> Response {
+    let result = (|| -> Option<lsp_types::Range> {
+        let params: lsp_types::TextDocumentPositionParams =
+            serde_json::from_value(req.params.clone()).ok()?;
+        let (file, byte) = position_target(db, uri_to_file, &params)?;
+        let index = node_span_index(db, file, fs, cats);
+        let (start, end) = crate::rename::prepare_rename(db, file, fs, cats, byte, &index).ok()?;
+        Some(range_in(db, fs, &file.path(db).clone(), start, end))
+    })();
+
+    match result {
+        Some(range) => Response::new_ok(req.id.clone(), range),
+        None => Response::new_ok(req.id.clone(), serde_json::Value::Null),
+    }
+}
+
+/// Handle a `textDocument/rename` request.
+///
+/// A refusal comes back as a `RequestFailed` error carrying the normative reason
+/// (see `crate::rename::rename_edits`), so the editor shows why the rename did
+/// not happen instead of silently doing nothing.
+fn handle_rename(
+    db: &Database,
+    uri_to_file: &HashMap<String, SourceFile>,
+    fs: FileSet,
+    cats: Catalogues,
+    req: &lsp_server::Request,
+) -> Response {
+    let params: lsp_types::RenameParams = match serde_json::from_value(req.params.clone()) {
+        Ok(p) => p,
+        Err(e) => {
+            return Response::new_err(
+                req.id.clone(),
+                lsp_server::ErrorCode::InvalidParams as i32,
+                format!("malformed rename params: {e}"),
+            );
+        }
+    };
+    let Some((file, byte)) = position_target(db, uri_to_file, &params.text_document_position)
+    else {
+        return Response::new_err(
+            req.id.clone(),
+            lsp_server::ErrorCode::InvalidParams as i32,
+            "rename position is not in a tracked document".to_string(),
+        );
+    };
+    let index = node_span_index(db, file, fs, cats);
+    let locs = match crate::rename::rename_edits(db, file, fs, cats, byte, &index, &params.new_name)
+    {
+        Ok(locs) => locs,
+        Err(refusal) => {
+            return Response::new_err(
+                req.id.clone(),
+                lsp_server::ErrorCode::RequestFailed as i32,
+                refusal.0,
+            );
+        }
+    };
+
+    // Group the edits per file: a WorkspaceEdit is keyed by document URI, and a
+    // rename through a `load_module` boundary touches at least two files.
+    //
+    // Grouping happens on the stored path, not on `Uri`: `WorkspaceEdit::changes`
+    // is a `HashMap<Uri, _>` imposed by lsp-types, and `Uri` carries a lazily
+    // filled cache, so it trips `clippy::mutable_key_type`. Keying on the path
+    // and converting once at the end keeps the interior-mutable type out of every
+    // hash lookup; the allow covers only the unavoidable final map.
+    let mut by_path: HashMap<String, Vec<lsp_types::TextEdit>> = HashMap::new();
+    for l in locs {
+        by_path
+            .entry(l.path.clone())
+            .or_default()
+            .push(lsp_types::TextEdit {
+                range: range_in(db, fs, &l.path, l.start, l.end),
+                new_text: params.new_name.clone(),
+            });
+    }
+    #[allow(clippy::mutable_key_type)] // lsp-types keys WorkspaceEdit by `Uri`
+    let changes = by_path
+        .into_iter()
+        .filter_map(|(path, edits)| Some((file_uri_for(&path)?, edits)))
+        .collect();
+    let edit = lsp_types::WorkspaceEdit {
+        changes: Some(changes),
+        ..Default::default()
+    };
+    Response::new_ok(req.id.clone(), edit)
+}
+
+/// Handle a `textDocument/signatureHelp` request.  Returns a `Response`
+/// (a `SignatureHelp` or null) without sending it — the caller dispatches.
+fn handle_signature_help(
+    db: &Database,
+    uri_to_file: &HashMap<String, SourceFile>,
+    fs: FileSet,
+    cats: Catalogues,
+    req: &lsp_server::Request,
+) -> Response {
+    let result = (|| -> Option<lsp_types::SignatureHelp> {
+        let params: lsp_types::SignatureHelpParams =
+            serde_json::from_value(req.params.clone()).ok()?;
+        let (file, byte) = position_target(db, uri_to_file, &params.text_document_position_params)?;
+        crate::signature::signature_help(db, file, fs, cats, byte)
+    })();
+
+    match result {
+        Some(help) => Response::new_ok(req.id.clone(), help),
         None => Response::new_ok(req.id.clone(), serde_json::Value::Null),
     }
 }
