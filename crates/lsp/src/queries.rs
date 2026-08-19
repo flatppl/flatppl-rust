@@ -409,7 +409,7 @@ pub(crate) fn load_module_paths(module: &Module) -> Vec<String> {
 /// comparison is symmetric. Returns `None` when nothing matches: the common case
 /// for `standard_module` names, and for an as-yet-unfed URL dep — a soft "source
 /// not available", like a missing local dep.
-pub(crate) fn resolve_path(
+pub fn resolve_path(
     db: &dyn salsa::Database,
     importer: SourceFile,
     directive_path: &str,

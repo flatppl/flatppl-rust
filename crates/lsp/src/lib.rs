@@ -12,6 +12,9 @@
 pub mod capabilities;
 pub mod db;
 pub mod line_index;
+pub mod names;
 pub mod pool;
 pub mod queries;
+pub mod rename;
 pub mod server;
+pub mod signature;

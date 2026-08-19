@@ -766,6 +766,40 @@ impl Catalogue {
             .map(|m| m.bindings.iter().map(|b| b.name.as_str()))
     }
 
+    /// Ordered parameter names of a standard-module member (spec §09), e.g.
+    /// module `pp` member `kallen`. `None` when the module or the member is
+    /// absent, or when the row documents no names — the same
+    /// "empty list means undocumented" contract as [`Self::base_param_names`].
+    ///
+    /// The module counterpart of `base_param_names`, so a caller that needs the
+    /// roster for `alias.member(…)` reads it from the catalogue instead of
+    /// carrying its own copy.
+    pub fn module_param_names(&self, module: &str, binding: &str) -> Option<&[String]> {
+        match self.module(module, binding)?.0 {
+            Sig::Distribution { params, .. } if !params.is_empty() => Some(params),
+            Sig::Function { names, .. } | Sig::Structural { names, .. } if !names.is_empty() => {
+                Some(names)
+            }
+            _ => None,
+        }
+    }
+
+    /// The declared call arity of a standard-module member (spec §09), or `None`
+    /// when the row declares no parameter list. The module counterpart of
+    /// [`Self::base_arity`], with the same distribution-is-exact rule.
+    pub fn module_arity(&self, module: &str, binding: &str) -> Option<Arity> {
+        match self.module(module, binding)?.0 {
+            Sig::Function { params, .. } | Sig::Structural { params, .. } => {
+                Some(Arity::of(params))
+            }
+            Sig::Distribution { params, .. } if params.is_empty() => None,
+            Sig::Distribution { params, .. } => Some(Arity {
+                min: params.len(),
+                max: Some(params.len()),
+            }),
+        }
+    }
+
     /// Ordered constructor parameter names for a built-in distribution (spec
     /// §08/§09 "Parameters" column), e.g. `Normal` → `["mu", "sigma"]`.
     /// Checks base builtins first, then every standard module's bindings.
@@ -1450,6 +1484,47 @@ mod tests {
         assert_eq!(cat.base_arity("StudentT"), fixed(1));
         assert_eq!(cat.base_arity("GeneralizedNormal"), fixed(3));
         assert_eq!(cat.base_arity("NotARealBuiltin"), None);
+    }
+
+    /// The §09 module counterparts of `base_param_names` / `base_arity`, which
+    /// the LSP's signature help reads so the argument roster lives in one place.
+    ///
+    /// A distribution row carries its §09 "Parameters" names and an exact arity.
+    /// A `Function` row that declares no `names` answers `None` for the roster
+    /// while still answering its arity — the same "empty list means undocumented"
+    /// contract `base_param_names` states.
+    #[test]
+    fn module_param_names_and_arity_read_the_declared_row() {
+        let cat = builtin();
+        assert_eq!(
+            cat.module_param_names("particle-physics", "RelativisticBreitWigner"),
+            Some(["mean".to_string(), "width".to_string()].as_slice())
+        );
+        assert_eq!(
+            cat.module_arity("particle-physics", "RelativisticBreitWigner"),
+            Some(Arity {
+                min: 2,
+                max: Some(2)
+            })
+        );
+        assert_eq!(
+            cat.module_param_names("special-functions", "bessel_j"),
+            None,
+            "the row declares no names, so the roster is undocumented"
+        );
+        assert_eq!(
+            cat.module_arity("special-functions", "bessel_j"),
+            Some(Arity {
+                min: 2,
+                max: Some(2)
+            }),
+            "the arity is still declared by the parameter-type list"
+        );
+        assert_eq!(
+            cat.module_param_names("particle-physics", "NotAMember"),
+            None
+        );
+        assert_eq!(cat.module_arity("no-such-module", "whatever"), None);
     }
 
     #[test]
