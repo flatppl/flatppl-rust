@@ -177,6 +177,7 @@ mod aggregate;
 mod emitter;
 mod mlir;
 mod modes;
+mod norms;
 mod ops;
 mod refuse;
 mod registry;

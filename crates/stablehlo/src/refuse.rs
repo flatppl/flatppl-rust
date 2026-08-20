@@ -86,11 +86,20 @@
 //! - a destructured `load_data` input used as one monolithic value — "a
 //!   load_data input whose valueset is a table or record has no single tensor
 //!   form; read it column-wise (`data.y`) — one argument per column"
-//! - `sum` over a TABLE — "a table reduction has no tensor form: §07 \"Table
-//!   reductions\" makes `sum` over a table a RECORD of per-column sums, ...".
-//!   A boolean ARRAY is not refused: §03 "Bool" promotes it ("`sum(mask)` to
-//!   count true entries"), `infer` types the result `integers`, and
-//!   `Emitter::reduce_axis` emits the matching `stablehlo.convert` to `i32`.
+//! - `sum` over a TABLE — the shared `norms::table_reduction_refusal`, "a table
+//!   reduction has no tensor form: §07 \"Table reductions\" makes `sum` over a
+//!   table a RECORD of per-column reductions, ...". `prod`/`mean`/`var`/`std`
+//!   raise the identical refusal from `norms.rs` (below); the message is one
+//!   function so those five cannot drift apart. **That is five of §07's SEVEN
+//!   table reductions.** §07 names "`sum`, `mean`, `var`, `std`, `prod`,
+//!   `maximum`, or `minimum`"; `maximum`/`minimum` over a table still report
+//!   "unsupported builtin head 'elementof'" — the blame-the-wrong-construct
+//!   failure this shared helper exists to prevent. Pre-existing (both were wired
+//!   before the shared helper) and a known gap, not a regression: closing it is
+//!   two more call sites. A boolean ARRAY is not refused:
+//!   §03 "Bool" promotes it ("`sum(mask)` to count true entries"), `infer` types
+//!   the result `integers`, and `Emitter::reduce_axis` emits the matching
+//!   `stablehlo.convert` to `i32`.
 //! - `maximum`/`minimum` over a non-real array — "maximum/minimum: only a real
 //!   array is supported, got ...". Booleans are refused here even though `sum`
 //!   accepts them, and deliberately: §03's promotion covers arithmetic
@@ -426,6 +435,68 @@
 //!   `functionof` — "broadcast: callable must be a bare builtin name or a
 //!   reified function"
 //! - `broadcast` with no callable at all — "broadcast: missing callable"
+//!
+//! **`norms.rs`** (§07 "Reductions" and "Norms and normalization", reached
+//! through `ops::lower_builtin`'s twelve bare-head arms). Every site below is
+//! locked by a test in `tests/golden_norms.rs` unless noted otherwise:
+//! - `prod`/`mean`/`var`/`std` over a TABLE — the shared
+//!   `table_reduction_refusal`, also raised for `sum` from `ops.rs`. §07 "Table
+//!   reductions" makes each a RECORD of per-column reductions, and this emitter
+//!   has no record value. Checked BEFORE the argument is lowered, so the
+//!   argument's own refusal cannot blame the wrong construct.
+//! - `prod`/`mean`/`var`/`std` over a SCALAR or a dynamically-shaped operand —
+//!   "...: §07 reduces an ARRAY, so the operand must be a statically-shaped
+//!   array, got ...". Matches `ops::lower_extremum`'s guard on
+//!   `maximum`/`minimum`; `ops::lower_sum` is the odd one out (it returns a
+//!   scalar operand unchanged through `Emitter::reduce_full`'s zero-iteration
+//!   path), which is pre-existing and untouched.
+//! - `mean`/`var`/`std` over an EMPTY array — "...: over an empty array this is
+//!   undefined — §07 divides by the element count, which is zero here".
+//!   Reachable from surface source: `elementof(cartpow(reals, [0]))` parses,
+//!   infers and determinizes cleanly. `prod` is NOT refused there — the empty
+//!   product is the multiplicative identity, which the reduce already emits
+//!   (executed: `1.0`).
+//! - `var`/`std` over a SINGLE element — "...: over 1 element(s) this is
+//!   undefined — §07 defines it with the $n-1$ denominator, and §04
+//!   \"Relationship to broadcasting\" states that `var` and `std` are undefined
+//!   over a single element". `aggregate::reduce` refuses the identical case; the
+//!   determiniser passes a length-1 `var(v)` straight through, so the refusal
+//!   has to land here. `mean` is NOT refused — it is the identity on a
+//!   one-element input, which is exactly the criterion §04 states.
+//! - the cumulative pair and every norm over anything but a statically-sized
+//!   RANK-1 operand — "...: §07 gives this head the domain \"vectors\", so its
+//!   operand must be a statically-sized rank-1 array, got ...". §07 gives
+//!   `cumsum`/`cumprod` and all six norm-family heads the domain "vectors"
+//!   specifically, unlike the reductions' "arrays", so a matrix has no §07
+//!   meaning to lower rather than a meaning this backend declines.
+//! - a `Bool` operand reaching the scan's combine table — "...: a boolean
+//!   operand must be promoted before the scan". Unreachable: `lower_cumulative`
+//!   converts a `Bool` operand to `Int` immediately above, per §03 "Bool"'s
+//!   promotion. Kept as a refusal rather than an `unreachable!()` so a future
+//!   reordering surfaces instead of panicking.
+//!
+//! **NOT refused: a length-0 vector, for any of the eight vector heads.** §07
+//! is SILENT on the empty case — a tracked spec gap, not a license
+//! (`flatppl-dev/TODO-flatppl-js.md:1562` records the same gap for the other
+//! engine), and §11 does not even admit a zero dimension in a well-formed
+//! shape. Pending a §07 ruling, the emitter answers with the mathematically
+//! standard identity value, matching numpy and the js engine's recorded
+//! position: the scans and `l1unit`/`l2unit`/`softmax`/`logsoftmax` return
+//! the empty vector, `l1norm`/`l2norm` the empty sum `0.0`. Only `mean`/`var`/
+//! `std` refuse over an empty array, and only because they divide by the element
+//! count. The scans answer it in `lower_cumulative` rather than reaching
+//! `Emitter::prefix_scan`, because `stablehlo.reduce_window` has no length-0 form
+//! (`window_dimensions = 0` is rejected). Before that guard existed the scans
+//! MISLOWERED this class — debug panicked on the `n - 1` underflow, release
+//! emitted `padding = 2^64 - 1` and exited 0 — so it is test-locked in both
+//! directions.
+//!
+//! No head in `norms.rs` refuses a non-`Real` operand. §03's
+//! `booleans ⊂ integers ⊂ reals` puts an integer or boolean operand inside
+//! every §07 domain here, and each head WIDENS to the kind `infer` types the
+//! call as (`prod` keeps the element kind, `Int` for a boolean array; every
+//! moment and every norm is `Real`) — so none reaches a helper that hardcodes
+//! `Real` over an operand it cannot represent, and none reduces in `i1`.
 //!
 //! **`registry.rs`** (the distribution dispatch table):
 //! - a kernel-input record missing a parameter a builder needs —
