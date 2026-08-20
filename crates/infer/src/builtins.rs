@@ -189,6 +189,7 @@ pub const BUILTINS: &[&str] = &[
     "kchain",
     "kernelof",
     "kscan",
+    "ksuperpose",
     "l1norm",
     "l1unit",
     "l2norm",

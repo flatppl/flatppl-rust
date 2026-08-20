@@ -478,6 +478,7 @@ pub(crate) fn call_rule(
                 fresh_measure(arg_ty(args, 0))
             }
         }
+        "ksuperpose" => ksuperpose_type(inf, id, args, named),
         // `pushfwd(f, M)` (spec §06): a measure whose domain is the CODOMAIN of
         // `f`. `f` maps a value drawn from `M`, so binding its input to `M`'s
         // variate (domain + support value-set) and reading `f`'s body type gives
@@ -2856,6 +2857,390 @@ fn kernel_joint_result_type(inf: &mut Inferencer<'_, '_>, callee: NodeId) -> Opt
     })
 }
 
+/// `ksuperpose(kernel, weights)` (spec §06 "Additive superposition") — the
+/// weighted-superposition LIFT. The call itself is a kernel, so this rule types
+/// the CURRIED form; the applied form is [`ksuperpose_result_type`].
+///
+/// §06: "`ksuperpose(kernel, weights)` is itself a kernel; applied to a
+/// parameter family it yields the mixture $\nu = \sum_i w_i\,\kappa(\theta_i)$".
+///
+/// **Inputs.** §04's arity row gives `ksuperpose` "Two distinguished inputs (the
+/// kernel and the weight vector); the resulting kernel is applied separately to
+/// the parameter family". The family is passed "as to `broadcast`", so the
+/// lifted kernel's parameter NAMES are the component kernel's own — a reified
+/// component declares them in its type, a bare constructor in §08's parameter
+/// column ([`ksuperpose_component_inputs`]). An unreadable component leaves the
+/// list empty, which makes `local_kernel_inputs` decline and skips
+/// [`user_arity_check`] rather than inventing an arity of zero.
+///
+/// **Mass** is `weighted`'s rule over a vector of weights, not `superpose`'s
+/// over a component list: §06 puts the total mass at
+/// $\sum_i w_i\,\mathrm{totalmass}(\kappa(\theta_i))$, "which is $\sum_i w_i$
+/// for a Markov `kernel`", and "need not be normalized, so the result is
+/// generally unnormalized". So a Markov component demotes to `%finite`, exactly
+/// as `weighted(w, M)` demotes a normalized base under a fixed scalar weight.
+/// Weights this pass cannot read as a fixed collection give `%unknown`, the same
+/// distrust `weighted` applies to a non-fixed weight — an unread weight could be
+/// infinite, and §06's all-zero case makes it the zero measure, which is not
+/// `%finite`'s guarantee either.
+fn ksuperpose_type(
+    inf: &mut Inferencer<'_, '_>,
+    id: NodeId,
+    args: &[ArgInfo],
+    named: &[NamedInfo],
+) -> Type {
+    // Two DISTINGUISHED inputs (§04), so neither is a keyword-spelled parameter
+    // and neither is variadic — unlike `superpose`, whose components are.
+    if !named.is_empty() || args.len() != 2 {
+        let got = args.len() + named.len();
+        inf.diags.push(crate::Diagnostic::error_at(
+            id,
+            format!(
+                "`ksuperpose` takes 2 positional arguments — the kernel and the \
+                 weight vector (spec §04 \"Calling conventions\": two distinguished \
+                 inputs) — got {got}"
+            ),
+        ));
+        return Type::Failed("ksuperpose takes 2 positional arguments".into());
+    }
+    let (weights_node, weights_ty, weights_phase) = args[1].clone();
+    if let Some(failed) = ksuperpose_weights_check(inf, weights_node, &weights_ty) {
+        return failed;
+    }
+    let (component_node, component_ty, _) = args[0].clone();
+    let inputs = ksuperpose_component_inputs(inf, component_node, &component_ty);
+    let mass = ksuperpose_mass(
+        ksuperpose_component_mass(inf, component_node, &component_ty),
+        &weights_ty,
+        weights_phase,
+    );
+    Type::Kernel { inputs, mass }
+}
+
+/// Reject a `ksuperpose` weight argument that cannot be a weight vector.
+/// §06 fixes `N` as "the length of `weights`", and the family rule measures every
+/// collection argument against that one axis, so a scalar or a multi-axis weight
+/// argument leaves `N` undefined rather than merely unknown. A `%deferred` or
+/// `%any` weight type is admitted: §06 says `N` "need not be statically known",
+/// and non-negativity is a runtime domain condition no type slot records.
+fn ksuperpose_weights_check(inf: &mut Inferencer<'_, '_>, node: NodeId, ty: &Type) -> Option<Type> {
+    let complaint = match ty {
+        // `flatten_dims` counts a nested array's axes as well as a multi-dim
+        // `shape`, so `[[…], […]]` is rejected as readily as a matrix.
+        Type::Array { .. } => match axis_count(ty) {
+            1 => return None,
+            axes => format!("an array with {axes} axes"),
+        },
+        Type::TVector { .. } | Type::Deferred | Type::Any | Type::Var(_) | Type::Failed(_) => {
+            return None;
+        }
+        Type::Table { .. } => "a table".to_string(),
+        other => match non_measure_kind(other) {
+            Some(kind) => kind.to_string(),
+            None => "a measure".to_string(),
+        },
+    };
+    inf.diags.push(crate::Diagnostic::error_at(
+        node,
+        format!(
+            "`ksuperpose`'s weights must be a vector (spec §06: \"The number of \
+             components $N$ is the length of `weights`\"); got {complaint} instead"
+        ),
+    ));
+    Some(Type::Failed("ksuperpose weights are not a vector".into()))
+}
+
+/// The parameter names the lifted kernel declares — the COMPONENT kernel's own,
+/// since §06 passes the family "as to `broadcast`" and `broadcast` binds a
+/// positional data-arg to the head's ordered parameter name. Empty when this pass
+/// cannot read them, which [`local_kernel_inputs`] treats as "no declared list"
+/// rather than as a nullary callable.
+fn ksuperpose_component_inputs(
+    inf: &mut Inferencer<'_, '_>,
+    node: NodeId,
+    ty: &Type,
+) -> Box<[Symbol]> {
+    if let Type::Kernel { inputs, .. } = ty {
+        return inputs.clone();
+    }
+    let Some(name) = ksuperpose_constructor_name(inf, node) else {
+        return Box::new([]);
+    };
+    let Some(params) = crate::constructor_param_names(&name) else {
+        return Box::new([]);
+    };
+    params.iter().map(|p| inf.module.intern(p)).collect()
+}
+
+/// The component's own measure-constructor name, following `%ref self` hops to a
+/// bare `Const` head. `ksuperpose(Normal, w)` and `K = Normal` /
+/// `ksuperpose(K, w)` both reach `"Normal"`; a §09 member ref
+/// (`hepphys.ContinuedPoisson`) reaches its member name, which
+/// `constructor_param_names` also resolves.
+fn ksuperpose_constructor_name(inf: &Inferencer<'_, '_>, node: NodeId) -> Option<String> {
+    let mut node = node;
+    for _ in 0..64 {
+        match inf.module.node(node) {
+            Node::Const(sym) => return Some(inf.module.resolve(*sym).to_string()),
+            Node::Ref(Ref {
+                ns: RefNs::Module(_),
+                name,
+            }) => return Some(inf.module.resolve(*name).to_string()),
+            Node::Ref(r) if r.ns == RefNs::SelfMod => {
+                let binding = inf.module.binding_by_name(r.name)?;
+                node = inf.module.binding(binding).rhs;
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// The component's total-mass class. [`component_mass`] covers a measure or a
+/// trusted-head kernel; a BARE constructor (`ksuperpose(Normal, w)`) is neither,
+/// and reading it `%unknown` would lose the one class §06's mass sentence names
+/// explicitly ("$\sum_i w_i$ for a Markov `kernel`"). A recognized §08/§09
+/// distribution is a probability measure, which is `fill_mass`'s own catchall
+/// reading of a constructor head; `Dirac` is a point mass, also normalized.
+fn ksuperpose_component_mass(inf: &Inferencer<'_, '_>, node: NodeId, ty: &Type) -> Mass {
+    match component_mass(inf, node, ty) {
+        Mass::Unknown => match ksuperpose_constructor_name(inf, node) {
+            Some(name) if crate::distribution_param_names(&name).is_some() => Mass::Normalized,
+            Some(name) if name == "Dirac" => Mass::Normalized,
+            _ => Mass::Unknown,
+        },
+        known => known,
+    }
+}
+
+/// §06's mass rule for the lift, shaped after `fill_mass`'s `weighted` arm.
+fn ksuperpose_mass(component: Mass, weights_ty: &Type, weights_phase: Phase) -> Mass {
+    if component == Mass::Null {
+        // Every component is the zero measure, so every weighted term is too.
+        return Mass::Null;
+    }
+    let weights_readable = matches!(
+        (weights_ty, weights_phase),
+        (Type::Array { .. } | Type::TVector { .. }, Phase::Fixed)
+    );
+    if !weights_readable {
+        return Mass::Unknown;
+    }
+    match component {
+        // Generally unnormalized: the weights need not sum to one.
+        Mass::Normalized | Mass::Finite => Mass::Finite,
+        Mass::LocallyFinite => Mass::LocallyFinite,
+        _ => Mass::Unknown,
+    }
+}
+
+/// The output measure of an APPLIED `ksuperpose` — `ksuperpose(K, w)(θ)`.
+///
+/// §06 makes it the mixture $\sum_i w_i\,\kappa(\theta_i)$ over the components'
+/// SHARED variate, so — unlike `broadcast`, whose applied form is the independent
+/// product over the family and whose domain therefore gains an axis — the family
+/// axis is CONTRACTED here and the domain is the component's per-cell variate.
+///
+/// This is also where §06's one-axis family rule is enforced, because the family
+/// arguments are the arguments of the APPLICATION, not of the lift: "the family
+/// has a single axis: along it every collection argument must have size $N$ or be
+/// singular (size one) … A table counts as having one axis, its rows; a
+/// collection argument with more than one axis is a static error."
+///
+/// `None` (→ the caller leaves the application `%deferred`) when the component's
+/// per-cell variate is not statically resolvable, never a guessed shape.
+fn ksuperpose_result_type(
+    inf: &mut Inferencer<'_, '_>,
+    callee: NodeId,
+    args: &[ArgInfo],
+    named: &[NamedInfo],
+) -> Option<Type> {
+    let call = ksuperpose_callee(inf, callee)?;
+    let weights = *call.args.get(1)?;
+    if let Some(failed) = ksuperpose_family_check(inf, callee, weights, args, named) {
+        return Some(failed);
+    }
+    let component = *call.args.first()?;
+    let cell = ksuperpose_cell_variate(inf, component, args, named)?;
+    Some(Type::Measure {
+        domain: Box::new(cell),
+        // `user_call_type` fills this from the lifted kernel's own class, which
+        // §11 defines as "uniform over all inputs".
+        mass: Mass::Deferred,
+    })
+}
+
+/// The `ksuperpose` call a callee resolves to, following `%ref self` hops.
+/// `None` for any other callee, so the applied-kernel chain in
+/// [`user_call_type`] falls through unchanged.
+fn ksuperpose_callee(inf: &Inferencer<'_, '_>, callee: NodeId) -> Option<Call> {
+    let mut node = callee;
+    for _ in 0..64 {
+        match inf.module.node(node) {
+            Node::Ref(r) if r.ns == RefNs::SelfMod => {
+                let binding = inf.module.binding_by_name(r.name)?;
+                node = inf.module.binding(binding).rhs;
+            }
+            Node::Call(c) => {
+                let CallHead::Builtin(op) = c.head else {
+                    return None;
+                };
+                if inf.module.resolve(op) != "ksuperpose" {
+                    return None;
+                }
+                if c.args.len() != 2 {
+                    return None;
+                }
+                return Some(c.clone());
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// §06's one-axis family rule. Each family argument is measured against `N`, the
+/// weights' own length: a collection must be one-axis and size `N` or singular,
+/// a non-collection is held constant. A `Dim::Dynamic` extent on either side is
+/// admitted — §06 says `N` "need not be statically known", so a dynamic length
+/// is a runtime check, not a static error.
+fn ksuperpose_family_check(
+    inf: &mut Inferencer<'_, '_>,
+    id: NodeId,
+    weights: NodeId,
+    args: &[ArgInfo],
+    named: &[NamedInfo],
+) -> Option<Type> {
+    let n = match inf.lookup_type(weights) {
+        Some(t @ Type::Array { .. }) if axis_count(t) == 1 => flatten_dims(t)[0],
+        Some(Type::TVector { len, .. }) => *len,
+        _ => Dim::Dynamic,
+    };
+    let family: Vec<(NodeId, Type)> = args
+        .iter()
+        .map(|(node, t, _)| (*node, t.clone()))
+        .chain(named.iter().map(|(_, node, t, _)| (*node, t.clone())))
+        .collect();
+    let mut failed = None;
+    for (node, ty) in family {
+        // A table's rows ARE the one axis (§06), so its `nrows` is the extent
+        // and it can never be the multi-axis error.
+        let extent = match &ty {
+            Type::Array { .. } => match axis_count(&ty) {
+                1 => flatten_dims(&ty)[0],
+                axes => {
+                    inf.diags.push(crate::Diagnostic::error_at(
+                        node,
+                        format!(
+                            "a `ksuperpose` family argument with more than one axis is a \
+                             static error (spec §06: \"a collection argument with more \
+                             than one axis is a static error\"); got an array with \
+                             {axes} axes"
+                        ),
+                    ));
+                    failed = Some(Type::Failed(
+                        "ksuperpose family argument is multi-axis".into(),
+                    ));
+                    continue;
+                }
+            },
+            Type::TVector { len, .. } => *len,
+            Type::Table { nrows, .. } => *nrows,
+            // Held constant across the components (§06).
+            _ => continue,
+        };
+        let (Dim::Static(got), Dim::Static(want)) = (extent, n) else {
+            continue;
+        };
+        if got != want && got != 1 {
+            inf.diags.push(crate::Diagnostic::error_at(
+                node,
+                format!(
+                    "a `ksuperpose` family argument must have size {want} — the length \
+                     of `weights` — or be singular (spec §06); got size {got}"
+                ),
+            ));
+            failed = Some(Type::Failed(
+                "ksuperpose family argument size does not match the weights".into(),
+            ));
+        }
+    }
+    let _ = id;
+    failed
+}
+
+/// How many axes a collection type has, counting a nested array's axes as well
+/// as a multi-dimensional `shape` — §04 Broadcasting's "number of axes", which
+/// [`flatten_dims`] already computes for `aggregate`.
+fn axis_count(t: &Type) -> usize {
+    flatten_dims(t).len()
+}
+
+/// The component kernel's PER-CELL variate: the mixture's own domain, since the
+/// components share one variate. Each family argument contributes its element
+/// type, exactly as `broadcast_type`'s `cell_arg` does; a non-collection rides
+/// along whole.
+fn ksuperpose_cell_variate(
+    inf: &mut Inferencer<'_, '_>,
+    component: NodeId,
+    args: &[ArgInfo],
+    named: &[NamedInfo],
+) -> Option<Type> {
+    // One axis stripped per family argument, as `broadcast_type`'s `cell_arg`
+    // does. A table's row IS its cell (§06: "A table counts as having one axis,
+    // its rows"), so it strips to the record of its columns.
+    let cell_arg = |t: &Type| match t {
+        Type::Array { elem, .. } => elem.as_ref().clone(),
+        Type::TVector { elem, .. } => elem.as_ref().clone(),
+        Type::Table { columns, .. } => Type::Record(columns.clone()),
+        other => other.clone(),
+    };
+    let cell_args: Vec<ArgInfo> = args.iter().map(|(n, t, p)| (*n, cell_arg(t), *p)).collect();
+    let cell_named: Vec<NamedInfo> = named
+        .iter()
+        .map(|(s, n, t, p)| (*s, *n, cell_arg(t), *p))
+        .collect();
+    // A reified component reaches its variate by substitution, exactly as
+    // `broadcast_type`'s `Type::Kernel` head does.
+    if let Some(ty) = substituted_result(inf, component, &cell_args, &cell_named)
+        .map(|(ty, _)| ty)
+        .or_else(|| reified_result_type(inf, component))
+    {
+        return match ty {
+            Type::Measure { domain, .. } if !matches!(*domain, Type::Deferred) => Some(*domain),
+            Type::Measure { .. } | Type::Deferred => None,
+            value_ty => Some(value_ty),
+        };
+    }
+    // A §09 member reference carries its catalogue sig; a bare builtin
+    // constructor reaches its domain by name. Both mirror `broadcast_type`.
+    if let Some(sig) = inf.module_catalogue_ref(component).map(|c| c.sig.clone()) {
+        return match catalogue_lower(&mut *inf.module, &sig, &cell_args).0 {
+            Type::Measure { domain, .. } => Some(*domain),
+            _ => None,
+        };
+    }
+    let name = ksuperpose_constructor_name(inf, component)?;
+    if let Some(domain) = distribution_domain(inf, &name, &cell_args, &cell_named) {
+        return Some(domain);
+    }
+    // `Dirac` is a §06 FUNDAMENTAL measure, deliberately outside the §08
+    // distribution catalogue, so `distribution_domain` declines it. Its variate
+    // is its `value` argument — here the per-cell element of the family's
+    // `value` column, which is what makes §08's
+    // `normalize(ksuperpose(Dirac, p)(value = labels))` a measure over the
+    // labels' own type. `Lebesgue`/`Counting` take a support SET rather than a
+    // point, and no family reading of that is settled, so they stay `%deferred`.
+    if name == "Dirac" {
+        return cell_named
+            .iter()
+            .find(|(n, _, _, _)| inf.module.resolve(*n) == "value")
+            .map(|(_, _, t, _)| t.clone())
+            .or_else(|| cell_args.first().map(|(_, t, _)| t.clone()));
+    }
+    None
+}
+
 /// `functionof` / `kernelof` (spec §04 reification, §11 reified callables).
 /// A `functionof` whose body is a measure *is* a kernel.
 fn reification_type(
@@ -3602,8 +3987,12 @@ fn user_call_type(
         // `kernel_joint_result_type` builds it from the components (spec §06: "At
         // each input point the result is the `joint` of the component output
         // measures").
-        Type::Kernel { mass, .. } => match substituted_result(inf, callee, args, named)
-            .map(|(ty, _)| ty)
+        // A LIFT kernel (`ksuperpose(K, w)`) is not a reification either, and it
+        // is tried FIRST: the family-axis rule it enforces
+        // ([`ksuperpose_family_check`]) must run even when the component happens
+        // to be a reification that `substituted_result` could type on its own.
+        Type::Kernel { mass, .. } => match ksuperpose_result_type(inf, callee, args, named)
+            .or_else(|| substituted_result(inf, callee, args, named).map(|(ty, _)| ty))
             .or_else(|| reified_result_type(inf, callee))
             .or_else(|| kernel_joint_result_type(inf, callee))
         {
@@ -3611,6 +4000,9 @@ fn user_call_type(
                 domain,
                 mass: *mass,
             },
+            // A rejected application (the `ksuperpose` family-axis rule) stays
+            // failed; wrapping it would publish a measure over `(%failed …)`.
+            Some(failed @ Type::Failed(_)) => failed,
             Some(value_ty) => Type::Measure {
                 domain: Box::new(value_ty),
                 mass: *mass,
@@ -5927,8 +6319,9 @@ fn joint_mass(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo], named: &[NamedInfo
 ///
 /// The trusted heads are exactly the rules that write a kernel's mass themselves:
 /// `kernelof`/`functionof` (`reification_type`, from the body), `lawof`
-/// (`lawof_type`, propagating the argument's own gate-admitted mass), and `joint` itself
-/// (`kernel_joint_type`, recursively through this same fold). Everything else —
+/// (`lawof_type`, propagating the argument's own gate-admitted mass), `joint` itself
+/// (`kernel_joint_type`, recursively through this same fold), and `ksuperpose`
+/// ([`ksuperpose_type`], from §06's $\sum_i w_i$ mass sentence). Everything else —
 /// including a `disintegrate` tuple element and a cross-module kernel, whose
 /// masses ARE set correctly but not by a head this can see — reads `%unknown`.
 fn component_mass(inf: &Inferencer<'_, '_>, node: NodeId, t: &Type) -> Mass {
@@ -5963,7 +6356,7 @@ fn kernel_mass_is_own_rules(inf: &Inferencer<'_, '_>, node: NodeId) -> bool {
                 };
                 return matches!(
                     inf.module.resolve(op),
-                    "kernelof" | "functionof" | "lawof" | "joint"
+                    "kernelof" | "functionof" | "lawof" | "joint" | "ksuperpose"
                 );
             }
             _ => return false,
