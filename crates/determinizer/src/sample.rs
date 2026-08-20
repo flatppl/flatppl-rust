@@ -33,7 +33,8 @@ use crate::density::{
 };
 use crate::refuse::RefuseError;
 use flatppl_core::{
-    Binding, BindingId, Module, NamedKind, Node, NodeId, Phase, Ref, RefNs, Scalar, Symbol, Type,
+    Binding, BindingId, CallHead, Module, NamedKind, Node, NodeId, Phase, Ref, RefNs, Scalar,
+    Symbol, Type,
 };
 
 /// `rand(rng, m)` → a deterministic sample of the closed measure `m`.
@@ -445,6 +446,9 @@ fn lower_measure_sample(
 /// [`lower_closed_measure_sample`]'s fallback, and (via
 /// [`classify_drawn_measure`]) the two places a `draw`'s inner measure is read.
 fn classify_intractable_or_deferred(m: &Module, resolved: NodeId) -> Option<RefuseError> {
+    if let Some(lift) = applied_ksuperpose_under_normalize(m, resolved) {
+        return Some(refuse_ksuperpose_sample(m, lift));
+    }
     match builtin_name(m, resolved) {
         Some("weighted") | Some("logweighted") | Some("bayesupdate") => {
             Some(refuse_weighted_family(m, resolved))
@@ -486,6 +490,49 @@ fn refuse_draw_of_pushfwd(m: &Module, id: NodeId) -> RefuseError {
         m,
         "draw(pushfwd(f, M)) is a fresh, independent draw from the pushforward law, not a function \
          of the draws inside M; resampling M independently is not implemented",
+    )
+}
+
+/// The applied `ksuperpose(K, w)(θ)` node inside `resolved`, looking through one
+/// `normalize` wrapper — `normalize(ksuperpose(…)(…))` is §06's own spelling of
+/// a mixture, so it is the shape a sample query actually carries. Returns the
+/// LIFT node, so the refusal points at the construct that is not sampled rather
+/// than at the enclosing `normalize`.
+fn applied_ksuperpose_under_normalize(m: &Module, resolved: NodeId) -> Option<NodeId> {
+    let mut node = resolved;
+    if let Some(c) = expect_builtin_call(m, node, "normalize") {
+        if c.args.len() != 1 {
+            return None;
+        }
+        node = resolve_ref_one(m, c.args[0]).0;
+    }
+    let Node::Call(c) = m.node(node) else {
+        return None;
+    };
+    let CallHead::User(callee) = c.head else {
+        return None;
+    };
+    let (lift_node, _) = resolve_ref_one(m, callee);
+    expect_builtin_call(m, lift_node, "ksuperpose").map(|_| lift_node)
+}
+
+/// `ksuperpose`: refused in SAMPLE mode, and not because it is intractable.
+///
+/// §06 is explicit the other way: "Because the weights do not depend on the
+/// variate, the mixture is sampleable whenever `kernel` is." Drawing it is the
+/// two-stage ancestral sample — pick a component index with probability
+/// proportional to `w`, then sample that component — which needs a discrete
+/// index sampler threaded through the family axis, and that is not built. So this
+/// refuses as UNIMPLEMENTED, deliberately worded apart from
+/// [`refuse_weighted_family`]'s intractability: a reader must not conclude the
+/// mixture cannot be sampled in principle.
+fn refuse_ksuperpose_sample(m: &Module, id: NodeId) -> RefuseError {
+    refuse(
+        id,
+        m,
+        "sampling a ksuperpose mixture is not implemented (§06 makes it sampleable \
+         whenever the component kernel is, via a component-index draw, but the \
+         two-stage sampler over the family axis is not built)",
     )
 }
 

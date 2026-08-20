@@ -406,6 +406,27 @@
 //!   differ only in the kind they widen to (`Int` here, `Real` on the aggregate
 //!   path, whose body types `%deferred`); see `reduce_trailing_axes`'s note.
 //!
+//! **`emitter.rs`** (`Emitter::lower_broadcast`, the batched-density head):
+//! - `broadcast(builtin_logdensityof, K, …)` whose `K` is not
+//!   [`crate::registry::is_batch_safe`] — "broadcast over builtin_logdensityof
+//!   of '...' is unsupported: its density builder is not rank-agnostic (batched
+//!   density is sound only for univariate pure-arithmetic distributions)". A
+//!   structural builder (matrix / gather / `support`) driven by batched inputs
+//!   would emit shape-inconsistent StableHLO, so the allow-list is default-deny.
+//!   This one gate covers every construct that reaches the batched-density path:
+//!   an `iid` fan-out, a value `broadcast`, and §06's `ksuperpose` mixture, all
+//!   of which the determiniser lowers through the same
+//!   `broadcast(builtin_logdensityof, …)` shape. Locked by
+//!   `tests/golden_ksuperpose.rs`'s
+//!   `a_non_batch_safe_component_refuses_at_the_existing_gate`.
+//! - `broadcast(builtin_logdensityof, …)` whose distribution argument is not a
+//!   bare `Const` constructor — "broadcast(builtin_logdensityof, …):
+//!   distribution must be a bare constructor"
+//! - a `broadcast` callable that is neither a bare builtin name nor a reified
+//!   `functionof` — "broadcast: callable must be a bare builtin name or a
+//!   reified function"
+//! - `broadcast` with no callable at all — "broadcast: missing callable"
+//!
 //! **`registry.rs`** (the distribution dispatch table):
 //! - a kernel-input record missing a parameter a builder needs —
 //!   "distribution parameter '...' missing from kernel input"
