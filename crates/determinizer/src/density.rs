@@ -1229,6 +1229,199 @@ fn lower_applied_kernel_joint(
     ))
 }
 
+/// `logdensityof(ksuperpose(K, w)(θ), x)` — the §06 mixture density.
+///
+/// > `ksuperpose` (weighted measure addition over the parameter family):
+/// > $\log\mathrm{densityof}(\mathrm{ksuperpose}(\kappa, w)(\theta), x) =
+/// > \mathrm{logsumexp}_i\left(\log w_i +
+/// > \log\mathrm{densityof}(\kappa(\theta_i), x)\right)$, so a zero weight
+/// > contributes $-\infty$ and drops out. The components come from one kernel and
+/// > so share one reference measure, which is the reference measure of the
+/// > mixture.
+///
+/// Emitted AXIS-NATIVE, never unrolled, because §06 makes $N$ "the length of
+/// `weights`, which need not be statically known":
+/// ```text
+/// kernel_inputs = broadcast(record, p0 = arg0, p1 = arg1, …)   # per-component θᵢ
+/// terms         = broadcast(add, broadcast(log, w),
+///                           broadcast(builtin_logdensityof, K, kernel_inputs, x))
+/// lp            = logsumexp(terms)
+/// ```
+/// The family axis is CONTRACTED by `logsumexp`, where an independent product
+/// (`iid`, value-`broadcast`) contracts it with `sum` — the one structural
+/// difference between the mixture and the product, and the reason both share
+/// [`emit_kernel_broadcast_per_cell`] but not its reduction. `x` rides the
+/// broadcast scalar against the per-component axis, which is the mirror image of
+/// `iid`'s singleton kernel input against a per-observation axis: there one
+/// kernel scores many points, here many kernels score one point.
+///
+/// `log` and `add` are wrapped in `broadcast` rather than applied bare because
+/// their catalogue rows are SCALAR (`log`'s result is `RealOrComplexOfArg`, a
+/// scalar for any argument), so `log(w)` over a vector would carry a scalar type
+/// annotation onto an array value. `broadcast_type`'s elementwise arm types both
+/// over the array (§04 "Broadcasting").
+///
+/// **Refuse-don't-mislower.** The component must be a bare measure constructor:
+/// a REIFIED component (`ksuperpose(kernelof(…), w)`) needs a per-component body
+/// evaluation that `Emitter::lower_broadcast_userfn` cannot express — the same
+/// architectural gap [`lower_iid`] documents at length for its own
+/// `functionof`-broadcast candidate — so it refuses rather than emit a form the
+/// backend mislowers. A table family argument refuses for the same reason
+/// [`lower_broadcast_kernel`] takes only positional and keyword data-args: the
+/// per-column extraction is not built.
+fn lower_applied_ksuperpose(
+    m: &mut Module,
+    node: NodeId,
+    v: NodeId,
+) -> Option<Result<NodeId, RefuseError>> {
+    let Node::Call(c) = m.node(node) else {
+        return None;
+    };
+    let CallHead::User(callee) = c.head else {
+        return None;
+    };
+    let pos_args: Vec<NodeId> = c.args.to_vec();
+    let kw_args: Vec<(Symbol, NodeId)> = c
+        .named
+        .iter()
+        .filter(|na| na.kind == NamedKind::Kwarg)
+        .map(|na| (na.name, na.value))
+        .collect();
+    let (lift_node, _) = resolve_ref_one(m, callee);
+    let lift = expect_builtin_call(m, lift_node, "ksuperpose")?;
+    if lift.args.len() != 2 {
+        return Some(Err(refuse(
+            lift_node,
+            m,
+            "ksuperpose expects 2 args (kernel, weights)",
+        )));
+    }
+    let component = lift.args[0];
+    let weights = lift.args[1];
+    Some(lower_applied_ksuperpose_inner(
+        m, lift_node, component, weights, &pos_args, &kw_args, v,
+    ))
+}
+
+/// The fallible body of [`lower_applied_ksuperpose`], split out so the caller's
+/// `Option` and this function's `Result` do not nest inside one expression.
+fn lower_applied_ksuperpose_inner(
+    m: &mut Module,
+    lift_node: NodeId,
+    component: NodeId,
+    weights: NodeId,
+    pos_args: &[NodeId],
+    kw_args: &[(Symbol, NodeId)],
+    v: NodeId,
+) -> Result<NodeId, RefuseError> {
+    // The component must resolve to a measure-CONSTRUCTOR name, the same two
+    // shapes `lower_broadcast_kernel` accepts: a bare built-in `Const`, or a §09
+    // member ref. A reification, a value-broadcast head, or a `%local` is not
+    // one — refuse.
+    let (ctor_node, _) = resolve_ref_one(m, component);
+    let ctor_sym = match *m.node(ctor_node) {
+        Node::Const(sym) => sym,
+        Node::Ref(Ref {
+            ns: RefNs::Module(_),
+            name,
+        }) => name,
+        _ => {
+            return Err(refuse(
+                lift_node,
+                m,
+                "ksuperpose component is not a bare measure constructor (a reified \
+                 kernel component is not lowered: the per-component body evaluation \
+                 has no backend form)",
+            ));
+        }
+    };
+    let param_names =
+        flatppl_infer::constructor_param_names(m.resolve(ctor_sym)).ok_or_else(|| {
+            refuse(
+                lift_node,
+                m,
+                "ksuperpose component is not a known measure constructor",
+            )
+        })?;
+    if pos_args.len() > param_names.len() {
+        return Err(refuse(
+            lift_node,
+            m,
+            "ksuperpose is applied to more positional family arguments than the \
+             component constructor has parameters",
+        ));
+    }
+    // A sole positional TABLE family argument reads as a splat, not as the
+    // constructor's first parameter — refuse rather than bind a whole table to
+    // one parameter name.
+    if let Some(&sole) = pos_args.first() {
+        if pos_args.len() == 1
+            && kw_args.is_empty()
+            && matches!(m.type_of(sole), Some(Type::Table { .. }))
+        {
+            return Err(refuse(
+                lift_node,
+                m,
+                "ksuperpose over a TABLE parameter family is not lowered (the \
+                 per-column family extraction is not built); pass the columns as \
+                 keyword vectors instead",
+            ));
+        }
+    }
+
+    // Per-component θᵢ: positional family args bind to the constructor's
+    // parameter names in order, a keyword family arg keeps its given name.
+    let mut fields: Vec<(Symbol, NodeId)> = Vec::with_capacity(pos_args.len() + kw_args.len());
+    for (i, &arg) in pos_args.iter().enumerate() {
+        let name = m.intern(&param_names[i]);
+        fields.push((name, arg));
+    }
+    fields.extend(kw_args.iter().copied());
+
+    let broadcast_sym = m.intern("broadcast");
+    let record_head = {
+        let record_sym = m.intern("record");
+        m.alloc(Node::Const(record_sym))
+    };
+    let record_kwargs: Vec<NamedArg> = fields
+        .iter()
+        .map(|&(name, value)| NamedArg {
+            kind: NamedKind::Kwarg,
+            name,
+            value,
+        })
+        .collect();
+    let kernel_inputs = m.alloc(Node::Call(Call {
+        head: CallHead::Builtin(broadcast_sym),
+        args: vec![record_head].into(),
+        named: record_kwargs.into(),
+        inputs: None,
+    }));
+
+    let per_cell = emit_kernel_broadcast_per_cell(m, ctor_sym, kernel_inputs, v);
+    let log_head = {
+        let log_sym = m.intern("log");
+        m.alloc(Node::Const(log_sym))
+    };
+    let log_w = m.alloc(Node::Call(Call {
+        head: CallHead::Builtin(broadcast_sym),
+        args: vec![log_head, weights].into(),
+        named: Vec::<NamedArg>::new().into(),
+        inputs: None,
+    }));
+    let add_head = {
+        let add_sym = m.intern("add");
+        m.alloc(Node::Const(add_sym))
+    };
+    let terms = m.alloc(Node::Call(Call {
+        head: CallHead::Builtin(broadcast_sym),
+        args: vec![add_head, log_w, per_cell].into(),
+        named: Vec::<NamedArg>::new().into(),
+        inputs: None,
+    }));
+    Ok(build_call(m, "logsumexp", &[terms]))
+}
+
 /// The fallible body of [`lower_applied_kernel_joint`], split out so the caller's
 /// `Option` and this function's `Result` do not have to nest inside one expression.
 #[allow(clippy::too_many_arguments)]
@@ -1726,6 +1919,13 @@ fn lower_measure_density_at(
         return lowered;
     }
 
+    // An applied weighted-superposition lift `ksuperpose(K, w)(θ)` — also not a
+    // reification, so the β-reduction above declines it too. §06 defines its
+    // density directly over the family axis ([`lower_applied_ksuperpose`]).
+    if let Some(lowered) = lower_applied_ksuperpose(m, measure_node, v) {
+        return lowered;
+    }
+
     // Dispatch on the measure op.
     let op = builtin_name(m, measure_node);
 
@@ -1775,6 +1975,17 @@ fn lower_measure_density_at(
         // (§06 line 369/402): the affine change-of-variables, reusing the same
         // scalar / matrix-affine synthesis as `pushfwd` (Task 5).
         Some("locscale") => lower_locscale(m, measure_node, v, origin),
+        // A CURRIED `ksuperpose(K, w)` reaching the measure dispatcher was never
+        // applied to a parameter family, so it is a kernel and has no variate to
+        // score — §06 gives it a density only "applied to a parameter family".
+        // The applied form is intercepted above; reaching here means the query
+        // asks for the density of the lift itself.
+        Some("ksuperpose") => Err(refuse(
+            measure_node,
+            m,
+            "ksuperpose is a kernel until it is applied to a parameter family \
+             (spec §06): an unapplied `ksuperpose(K, w)` has no density",
+        )),
         Some("markovchain")
         | Some("kscan")
         | Some("bayesupdate")
@@ -3302,6 +3513,30 @@ fn lower_normalize(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Re
         return Ok(build_call(m, "sub", &[sup_density, log_z]));
     }
 
+    // Closed-form Z for an APPLIED `ksuperpose` OVER A MARKOV COMPONENT:
+    // `normalize(ksuperpose(K, w)(θ))`. §06 puts the lift's total mass at
+    // "$\sum_i w_i\,\mathrm{totalmass}(\kappa(\theta_i))$, which is
+    // $\sum_i w_i$ for a Markov `kernel`" — so a probability-measure component
+    // makes Z the deterministic scalar `sum(w)`, no `totalmass` needed, and
+    //   logdensityof(normalize(mix), v) = logdensityof(mix, v) − log(sum(w)).
+    // This is the SAME identity the convex-superposition arm above applies to the
+    // variadic spelling, with `sum(w)` over the weight VECTOR in place of a fold
+    // over k literal weights — which is what lets the lift keep §06's "$N$ …
+    // need not be statically known".
+    //
+    // The component must be a probability measure. `Lebesgue`/`Counting` are not,
+    // and their `Σ wᵢ·totalmass` is not a closed-form scalar, so they fall
+    // through to the refuse below rather than being normalized by a mass they do
+    // not have. §06's own all-zero-weights case (Z = 0) and an infinite weight
+    // both violate its "Z finite and nonzero" precondition and stay the backend's
+    // runtime concern, exactly as the three arms above leave them.
+    if let Some(weights) = recognize_markov_ksuperpose(m, m_inner_resolved) {
+        let mix_density = lower_measure_density(m, m_inner, v)?;
+        let z = build_call(m, "sum", &[weights]);
+        let log_z = build_call(m, "log", &[z]);
+        return Ok(build_call(m, "sub", &[mix_density, log_z]));
+    }
+
     // No closed-form mass rule for an unnormalized measure in this MVP.
     Err(RefuseError {
         node,
@@ -3310,6 +3545,45 @@ fn lower_normalize(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Re
                  `totalmass` is not FlatPDL"
             .to_string(),
     })
+}
+
+/// Recognize an APPLIED `ksuperpose(K, w)(θ)` whose component `K` is a
+/// probability measure, returning the WEIGHT VECTOR node. Its `sum` is then the
+/// closed-form normalizer Z = Σᵢ wᵢ (see [`lower_normalize`]); `None` keeps
+/// `normalize`'s refuse.
+///
+/// `K`'s unit mass is read from its CONSTRUCTOR NAME rather than from an inferred
+/// `Mass::Normalized`, because a bare constructor in the component slot
+/// (`ksuperpose(Normal, w)`) is a `Node::Const` and carries no measure type at
+/// all — the mass only appears once the constructor is CALLED. Every §08/§09
+/// distribution is a probability measure and `Dirac` is a point mass, which is
+/// `fill_mass`'s own reading of a constructor head; a reference measure
+/// (`Lebesgue`/`Counting`) is neither and yields `None`. Structural, immutable
+/// read of `m`.
+fn recognize_markov_ksuperpose(m: &Module, node: NodeId) -> Option<NodeId> {
+    let Node::Call(c) = m.node(node) else {
+        return None;
+    };
+    let CallHead::User(callee) = c.head else {
+        return None;
+    };
+    let (lift_node, _) = resolve_ref_one(m, callee);
+    let lift = expect_builtin_call(m, lift_node, "ksuperpose")?;
+    if lift.args.len() != 2 {
+        return None;
+    }
+    let (ctor_node, _) = resolve_ref_one(m, lift.args[0]);
+    let ctor_sym = match *m.node(ctor_node) {
+        Node::Const(sym) => sym,
+        Node::Ref(Ref {
+            ns: RefNs::Module(_),
+            name,
+        }) => name,
+        _ => return None,
+    };
+    let name = m.resolve(ctor_sym);
+    let is_probability = flatppl_infer::distribution_param_names(name).is_some() || name == "Dirac";
+    is_probability.then_some(lift.args[1])
 }
 
 /// Recognize `superpose(weighted(w₁, A₁), …, weighted(wₖ, Aₖ))` (k ≥ 2) as a
@@ -5935,19 +6209,34 @@ fn emit_kernel_broadcast_density(
     kernel_input: NodeId,
     obs: NodeId,
 ) -> NodeId {
+    let per_cell = emit_kernel_broadcast_per_cell(m, ctor_sym, kernel_input, obs);
+    build_call(m, "sum", &[per_cell])
+}
+
+/// The per-cell half of [`emit_kernel_broadcast_density`]:
+/// `broadcast(builtin_logdensityof, K, kernel_input, obs)`, the ARRAY of
+/// per-cell log-densities before any reduction. Split out because the two
+/// reductions differ by construct — an independent product reduces it with
+/// `sum` (`iid`, value-`broadcast`), a mixture with `logsumexp` after adding
+/// the log-weights ([`lower_applied_ksuperpose`]).
+fn emit_kernel_broadcast_per_cell(
+    m: &mut Module,
+    ctor_sym: Symbol,
+    kernel_input: NodeId,
+    obs: NodeId,
+) -> NodeId {
     let broadcast_sym = m.intern("broadcast");
     let kernel = m.alloc(Node::Const(ctor_sym));
     let ldo_head = {
         let ldo_sym = m.intern("builtin_logdensityof");
         m.alloc(Node::Const(ldo_sym))
     };
-    let per_cell = m.alloc(Node::Call(Call {
+    m.alloc(Node::Call(Call {
         head: CallHead::Builtin(broadcast_sym),
         args: vec![ldo_head, kernel, kernel_input, obs].into(),
         named: Vec::<NamedArg>::new().into(),
         inputs: None,
-    }));
-    build_call(m, "sum", &[per_cell])
+    }))
 }
 
 /// `logdensityof(joint(M₁,…,Mₖ), v)` — the positional `cat` form of `joint`
