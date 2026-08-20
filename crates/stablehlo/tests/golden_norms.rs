@@ -551,10 +551,12 @@ fn no_multi_axis_scan_spelling_is_answered_since_section_07_pins_no_axis() {
 }
 
 /// **The complete length-0 behavior of all eight vector heads**, in one place, so
-/// none can regress independently. §07 gives each of them a "vectors" domain and
-/// a length-0 array IS a vector, so every one of these owes a defined value
-/// rather than a refusal — and each of the eight has one, verified by EXECUTION
-/// on a `tensor<0x…>` runtime argument:
+/// none can regress independently. §07 is silent on the empty case — a tracked
+/// spec gap (`flatppl-dev/TODO-flatppl-js.md:1562`), not a license — and §11
+/// excludes a zero dimension from a well-formed shape outright. Pending a
+/// ruling, each of the eight answers with the mathematically standard identity
+/// value, matching numpy and the js engine's recorded position, verified by
+/// EXECUTION on a `tensor<0x…>` runtime argument:
 ///
 /// | head | empty result | why |
 /// |---|---|---|

@@ -476,8 +476,12 @@
 //!   reordering surfaces instead of panicking.
 //!
 //! **NOT refused: a length-0 vector, for any of the eight vector heads.** §07
-//! gives them the domain "vectors" and a length-0 array is one, so each owes a
-//! defined value: the scans and `l1unit`/`l2unit`/`softmax`/`logsoftmax` return
+//! is SILENT on the empty case — a tracked spec gap, not a license
+//! (`flatppl-dev/TODO-flatppl-js.md:1562` records the same gap for the other
+//! engine), and §11 does not even admit a zero dimension in a well-formed
+//! shape. Pending a §07 ruling, the emitter answers with the mathematically
+//! standard identity value, matching numpy and the js engine's recorded
+//! position: the scans and `l1unit`/`l2unit`/`softmax`/`logsoftmax` return
 //! the empty vector, `l1norm`/`l2norm` the empty sum `0.0`. Only `mean`/`var`/
 //! `std` refuse over an empty array, and only because they divide by the element
 //! count. The scans answer it in `lower_cumulative` rather than reaching

@@ -334,12 +334,13 @@ pub(crate) fn lower_cumulative(
     };
 
     // An EMPTY vector scans to the empty vector — the operand itself, no op
-    // emitted. §07 gives the pair the domain "vectors" and a length-0 array is
-    // one, so the result is owed rather than refusable, and it is well defined:
-    // the prefix sequence of an empty sequence is empty (`np.cumsum([])` is
-    // `[]`). Unlike `mean`/`var`/`std`, which this module DOES refuse over an
-    // empty array, no division by the element count is involved, so there is no
-    // $0/0$ to decline.
+    // emitted. §07 is silent on the empty case (a tracked spec gap, not a
+    // license: flatppl-dev/TODO-flatppl-js.md:1562), and §11 excludes a zero
+    // dimension from a well-formed shape outright. Pending a ruling, this
+    // returns the mathematically standard identity: the prefix sequence of an
+    // empty sequence is empty (`np.cumsum([])` is `[]`). Unlike `mean`/`var`/
+    // `std`, which this module DOES refuse over an empty array, no division by
+    // the element count is involved, so there is no $0/0$ to decline.
     //
     // Handled here rather than in `Emitter::prefix_scan` because
     // `stablehlo.reduce_window` cannot express it at all: the window would have
