@@ -2121,20 +2121,59 @@ fn lower_fill_refuses_a_dynamic_result_shape() {
     );
 }
 
-/// This wave widened the op map to the gate's vocabulary, not to §07 at large.
-/// Every op the gate does NOT emit still refuses through the catch-all — the
-/// pin that keeps `lower_builtin` narrow.
+/// The op map is widened deliberately, never to §07 at large. Every head still
+/// absent from it refuses through the catch-all — the pin that keeps
+/// `lower_builtin` narrow.
 #[test]
 fn lower_builtin_still_refuses_ops_the_gate_does_not_emit() {
-    // Adjacent to something lowered in each case: the other logical connectives, the
-    // binary extrema (vs the reductions), the other roundings, the exact-equality
-    // pair, and — next to the change-of-variables heads — the §07 elementary
-    // functions no recognised §06 forward map spells (`acosh`/`asin`/`acos`/
-    // `log10`/`atan2`). `le`/`ge` are NOT here: a closed finite image endpoint
-    // emits them.
+    // Adjacent to something lowered in each case: the array generators next to
+    // `fill`, the remaining reductions next to `sum`/`maximum`/`minimum`, the
+    // norms next to `logsumexp`, the cumulative pair next to their plain
+    // reductions, the complex-valued elementary functions next to their real
+    // siblings, and the general-matrix decompositions next to `lower_cholesky`.
+    //
+    // Trimmed when `wave-hlowire` wired the existing-helper batch: `lor`,
+    // `lnot`, `lxor`, `min`, `max`, `ceil`, `isnan`, `isfinite`, `equal`,
+    // `unequal`, `acosh`, `asin`, `acos`, `log10` and `atan2` were all on this
+    // list and all now lower, so listing them here would assert the opposite of
+    // what the map does. `le`/`ge` are still not here, for the original reason:
+    // a closed finite image endpoint emits them.
     for head in [
-        "lor", "lnot", "lxor", "min", "max", "ceil", "isnan", "isfinite", "equal", "unequal",
-        "acosh", "asin", "acos", "log10", "atan2", "zeros", "ones",
+        "zeros",
+        "ones",
+        "eye",
+        "onehot",
+        "linspace",
+        "array",
+        "prod",
+        "mean",
+        "var",
+        "std",
+        "cumsum",
+        "cumprod",
+        "lengthof",
+        "sizeof",
+        "l1norm",
+        "l2norm",
+        "l1unit",
+        "l2unit",
+        "softmax",
+        "logsoftmax",
+        "conj",
+        "cis",
+        "imag",
+        "det",
+        "inv",
+        "logabsdet",
+        "linsolve",
+        "qr",
+        "diagmat",
+        "cross",
+        "reverse",
+        "checked",
+        "boolean",
+        "integer",
+        "filter",
     ] {
         let mut m = Module::new();
         let a = real(&mut m, 1.0);

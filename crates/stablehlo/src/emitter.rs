@@ -520,6 +520,67 @@ impl<'m> Emitter<'m> {
     pub fn round_nearest_even(&mut self, a: &Value) -> Value {
         self.unary_real("stablehlo.round_nearest_even", a)
     }
+    /// `stablehlo.ceil` — spec §07 `ceil`, $\lceil x \rceil$. The mirror of
+    /// [`Emitter::floor`], same plain `: ty` unary form; parser-validated
+    /// against `iree-base-compiler` 3.11's StableHLO parser.
+    pub fn ceil(&mut self, a: &Value) -> Value {
+        self.unary_real("stablehlo.ceil", a)
+    }
+    /// Spec §07 `log10`, $\log_{10}(x)$ — `log(x) / ln(10)`, with `ln(10)` a
+    /// literal constant rather than a runtime `log(10)`. StableHLO has no
+    /// base-10 log op.
+    ///
+    /// Written as a DIVISION by `ln(10)`, not a multiply by its reciprocal:
+    /// `1/ln(10)` is not exactly representable, so the multiply would add a
+    /// second rounding on top of the division's one.
+    pub fn log10(&mut self, a: &Value) -> Value {
+        let lx = self.log(a);
+        let ln10 = self.constant(std::f64::consts::LN_10, lx.ty.clone());
+        self.div(&lx, &ln10)
+    }
+    /// Spec §07 `abs2`, $\vert x\vert^2$ — `x * x` over the reals this crate
+    /// emits (no complex element type, so $\vert x\vert^2 = x^2$). Kind-
+    /// polymorphic through [`Emitter::mul`], so an integer operand keeps an
+    /// integer square.
+    pub fn abs2(&mut self, a: &Value) -> Value {
+        self.mul(a, a)
+    }
+    /// Spec §07 `atan2(y, x)`, in the correct quadrant — the core
+    /// `stablehlo.atan2` op [`Emitter::atan`] already partially applies, plus
+    /// an origin gate.
+    ///
+    /// The gate is normative, not defensive. §07: "`atan2(0, 0)` returns `0`",
+    /// and the bare op does NOT deliver it: compiled through
+    /// `iree-base-compiler` 3.11 (llvm-cpu) `stablehlo.atan2 0, 0` returns
+    /// **NaN**, because the pipeline lowers it as an `atan(y/x)` with a
+    /// quadrant fixup and `0/0` is NaN before the fixup runs. Every other
+    /// quadrant and both axes match `np.arctan2` to f32, measured — so only
+    /// the one point §07 pins needs selecting over.
+    ///
+    /// [`Emitter::atan`] deliberately does NOT route through here: its `x` is
+    /// the constant `1`, so the origin is unreachable and the gate would be
+    /// three dead ops in every `atan` a `pushfwd` emits.
+    pub fn atan2(&mut self, y: &Value, x: &Value) -> Value {
+        let raw = self.binary_real("stablehlo.atan2", y, x);
+        let zero = self.constant(0.0, raw.ty.clone());
+        let y_zero = self.compare("EQ", y, &zero);
+        let x_zero = self.compare("EQ", x, &zero);
+        let origin = self.and(&y_zero, &x_zero);
+        self.select(&origin, &zero, &raw)
+    }
+    /// Spec §07 binary `min(a, b)` / `max(a, b)`, $\min(a, b)$ / $\max(a, b)$
+    /// — NOT the same-named-family reductions `minimum`/`maximum`, which
+    /// [`crate::ops::lower_extremum`] lowers over an array. Kind-polymorphic
+    /// through [`Emitter::binary`], so an all-integer pair stays integer;
+    /// `crate::ops` refuses a `Bool` operand, which §07's `reals` domain does
+    /// not admit.
+    pub fn min(&mut self, a: &Value, b: &Value) -> Value {
+        self.binary("stablehlo.minimum", a, b)
+    }
+    /// See [`Emitter::min`].
+    pub fn max(&mut self, a: &Value, b: &Value) -> Value {
+        self.binary("stablehlo.maximum", a, b)
+    }
 
     // ---- §06 change-of-variables inverse heads -----------------------------
     //
@@ -1105,6 +1166,34 @@ impl<'m> Emitter<'m> {
     /// through `crate::ops`'s dispatch table).
     pub fn lgamma(&mut self, a: &Value) -> Value {
         self.chlo_unary("chlo.lgamma", a)
+    }
+
+    /// Spec §07 `gamma`, $\Gamma(x)$ over `posreals` — `exp(lgamma(x))`.
+    ///
+    /// `chlo.lgamma` is $\log\vert\Gamma\vert$, so `exp` of it recovers
+    /// $\vert\Gamma\vert$, not $\Gamma$. That is exactly $\Gamma$ on §07's
+    /// stated domain (`posreals`), where $\Gamma > 0$; no sign correction is
+    /// therefore in the lowering, and a non-positive argument is out of domain
+    /// rather than wrong.
+    pub fn gamma(&mut self, a: &Value) -> Value {
+        let lg = self.lgamma(a);
+        self.exp(&lg)
+    }
+
+    /// Spec §07 `asin`/`acos`/`acosh` — `chlo.asin`/`acos`/`acosh`, the CHLO
+    /// ops for the three inverse trig/hyperbolic functions with no core
+    /// StableHLO op. Same `: ty -> ty` form as [`Emitter::lgamma`]; each
+    /// parser-validated (and compiled) against `iree-base-compiler` 3.11.
+    pub fn asin(&mut self, a: &Value) -> Value {
+        self.chlo_unary("chlo.asin", a)
+    }
+    /// See [`Emitter::asin`].
+    pub fn acos(&mut self, a: &Value) -> Value {
+        self.chlo_unary("chlo.acos", a)
+    }
+    /// See [`Emitter::asin`].
+    pub fn acosh(&mut self, a: &Value) -> Value {
+        self.chlo_unary("chlo.acosh", a)
     }
 
     // VonMises log-I₀ (Task 10) must inline a polynomial approximation —
@@ -2150,7 +2239,7 @@ impl<'m> Emitter<'m> {
         Value {
             ssa,
             ty: a.ty.clone(),
-            elem: ElemKind::Real,
+            elem: ElemKind::Bool,
         }
     }
 
@@ -2167,7 +2256,25 @@ impl<'m> Emitter<'m> {
         Value {
             ssa,
             ty: a.ty.clone(),
-            elem: ElemKind::Real,
+            elem: ElemKind::Bool,
+        }
+    }
+
+    /// `%N = stablehlo.xor %a, %b : tensor<i1>` — spec §07 `lxor`, exclusive
+    /// disjunction of two `i1` predicates. Same [`render_i1`] shape-rendering
+    /// as [`Emitter::and`]/[`Emitter::or`]; parser-validated (and compiled)
+    /// against `iree-base-compiler` 3.11.
+    pub fn xor(&mut self, a: &Value, b: &Value) -> Value {
+        let ssa = self.fresh();
+        let ty = render_i1(&a.ty);
+        self.push(&format!(
+            "{ssa} = stablehlo.xor {}, {} : {ty}",
+            a.ssa, b.ssa
+        ));
+        Value {
+            ssa,
+            ty: a.ty.clone(),
+            elem: ElemKind::Bool,
         }
     }
 
@@ -2181,7 +2288,7 @@ impl<'m> Emitter<'m> {
         Value {
             ssa,
             ty: a.ty.clone(),
-            elem: ElemKind::Real,
+            elem: ElemKind::Bool,
         }
     }
 
