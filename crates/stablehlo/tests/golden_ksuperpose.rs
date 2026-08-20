@@ -14,26 +14,40 @@
 //! `compile_str(src, target_backends=["llvm-cpu"], input_type="stablehlo")` run
 //! under `local-task` in a python-mcp scratch env — the route
 //! `.superpowers/sdd/2026-08-05-joint-constructs-the-joint/wave-hloagg-report.md`
-//! documents. The executed artifacts were the frozen golden files in
-//! `tests/goldens/` read off disk, so the pinned text and the verified numbers
-//! cannot diverge. Oracle:
-//! `logsumexp(log(w) + norm.logpdf(x, mu, sigma)) − log(w.sum())`.
+//! documents. Oracle:
+//! `logsumexp(log(w) + norm.logpdf(x, mu, sigma)) − log(w.sum())`, computed
+//! before any engine output was read.
 //!
-//! | case | x | IREE f32 | scipy oracle | abs diff |
-//! |---|---|---|---|---|
-//! | normal mixture, normalized | 0.5 | −3.005950212 | −3.005949999 | 2.1e−07 |
-//! | normal mixture, normalized | −1.0 | −2.528376579 | −2.528376324 | 2.6e−07 |
-//! | normal mixture, normalized | 2.0 | −0.447547168 | −0.447547243 | 7.5e−08 |
-//! | normal mixture, normalized | 5.0 | −18.331153870 | −18.331151868 | 2.0e−06 |
-//! | normal mixture, UNnormalized | 0.5 | −3.005950212 | −3.005949999 | 2.1e−07 |
-//! | shared scalar sigma | 0.5 | −2.043938637 | −2.043938533 | 1.0e−07 |
-//! | singular (size-one) mu | 0.5 | −1.380489111 | −1.380489098 | 1.3e−08 |
-//! | Dirac superposition | 1.5 | −0.223143533 | −0.223143551 | 1.8e−08 |
-//! | Dirac superposition | 0.0 | −1.609437943 | −1.609437912 | 3.0e−08 |
-//! | one zero weight (drops out) | 0.5 | −4.543469906 | −4.543469796 | 1.1e−07 |
+//! The `gold` column says where the executed module came from. `Y` means the
+//! frozen file in `tests/goldens/` was read off disk and compiled, so for those
+//! three rows the pinned text and the verified number cannot diverge. The other
+//! seven were emitted from the source shown below into a scratch directory and
+//! compiled from there — they exercise the same lowering but pin no file, so a
+//! future emitter change could move them without reddening a golden.
+//!
+//! `w = [0.3, 1.2]` (unnormalized, so `Z = 1.5` and `log Z = 0.405465108`),
+//! `mus = [-1.0, 2.0]`, `sigmas = [1.0, 0.5]`.
+//!
+//! | case | x | gold | IREE f32 | scipy oracle | abs diff |
+//! |---|---|---|---|---|---|
+//! | normal mixture, normalized | 0.5 | Y | −3.411415339 | −3.411415108 | 2.3e−07 |
+//! | normal mixture, normalized | −1.0 | — | −2.528376579 | −2.528376324 | 2.6e−07 |
+//! | normal mixture, normalized | 2.0 | — | −0.447547168 | −0.447547243 | 7.5e−08 |
+//! | normal mixture, normalized | 5.0 | — | −18.331153870 | −18.331151868 | 2.0e−06 |
+//! | normal mixture, UNnormalized | 0.5 | — | −3.005950212 | −3.005949999 | 2.1e−07 |
+//! | shared scalar sigma | 0.5 | Y | −2.043938637 | −2.043938533 | 1.0e−07 |
+//! | singular (size-one) mu | 0.5 | — | −1.380489111 | −1.380489098 | 1.3e−08 |
+//! | Dirac superposition | 1.5 | Y | −0.223143533 | −0.223143551 | 1.8e−08 |
+//! | Dirac superposition | 0.0 | — | −1.609437943 | −1.609437912 | 3.0e−08 |
+//! | one zero weight (drops out) | 0.5 | — | −4.543469906 | −4.543469796 | 1.1e−07 |
 //!
 //! Every difference is f32 roundoff (relative error ≤ 1.1e−07; the 2.0e−06 entry
 //! is on a value of magnitude 18).
+//!
+//! The normalized and UNnormalized rows at x = 0.5 differ by exactly
+//! `log Z = log 1.5 = 0.405465108`, which is the arithmetic check that catches a
+//! transcribed pair swapped between them — an earlier revision of this table
+//! carried the unnormalized numbers on both rows.
 //!
 //! # Known deviation from §06: ALL-zero weights give NaN, not −∞
 //!
