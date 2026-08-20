@@ -187,6 +187,22 @@ pub(crate) fn lower_builtin(
         // lower.
         "maximum" => lower_extremum(e, id, args, Extremum::Max),
         "minimum" => lower_extremum(e, id, args, Extremum::Min),
+        // §07 "Reductions" and "Norms and normalization" — the remaining bare
+        // heads. `crate::norms` owns every body; each contracts through
+        // `Emitter::reduce_trailing_axes`, the helper `crate::aggregate` already
+        // uses for §04's `f_reduction`s.
+        "prod" => crate::norms::lower_reduction(e, id, args, crate::norms::BareReduction::Prod),
+        "mean" => crate::norms::lower_reduction(e, id, args, crate::norms::BareReduction::Mean),
+        "var" => crate::norms::lower_reduction(e, id, args, crate::norms::BareReduction::Var),
+        "std" => crate::norms::lower_reduction(e, id, args, crate::norms::BareReduction::Std),
+        "cumsum" => crate::norms::lower_cumulative(e, id, args, crate::norms::Cumulative::Sum),
+        "cumprod" => crate::norms::lower_cumulative(e, id, args, crate::norms::Cumulative::Prod),
+        "l1norm" => crate::norms::lower_norm(e, id, args, crate::norms::Norm::L1),
+        "l2norm" => crate::norms::lower_norm(e, id, args, crate::norms::Norm::L2),
+        "l1unit" => crate::norms::lower_norm(e, id, args, crate::norms::Norm::L1Unit),
+        "l2unit" => crate::norms::lower_norm(e, id, args, crate::norms::Norm::L2Unit),
+        "softmax" => crate::norms::lower_softmax(e, id, args, crate::norms::Softmax::Plain),
+        "logsoftmax" => crate::norms::lower_softmax(e, id, args, crate::norms::Softmax::Log),
         "fill" => lower_fill(e, id, args),
         "get0" => lower_get(e, id, args, 0),
         "get" => lower_get(e, id, args, 1),
@@ -250,7 +266,10 @@ pub(crate) fn lower_builtin(
 // ---- arity-checked leaf combinators ----------------------------------------
 
 /// Destructure `args` into exactly `N` positional arguments, or refuse.
-fn args_exact<const N: usize>(id: NodeId, args: &[NodeId]) -> Result<[NodeId; N], EmitError> {
+pub(crate) fn args_exact<const N: usize>(
+    id: NodeId,
+    args: &[NodeId],
+) -> Result<[NodeId; N], EmitError> {
     <[NodeId; N]>::try_from(args)
         .map_err(|_| EmitError::at(id, format!("expected {N} argument(s), got {}", args.len())))
 }
@@ -1439,18 +1458,14 @@ fn lower_matrix_product(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<
 /// 'elementof'", which says nothing about tables at all. Both are this message now,
 /// whatever the table's provenance.
 ///
-/// `mean`/`var`/`std` need no equivalent: this map lowers them for NO argument type,
-/// so "unsupported builtin head" is already accurate for them.
+/// The refusal itself now lives in [`crate::norms::table_reduction_refusal`],
+/// shared with `prod`/`mean`/`var`/`std` — those four used to reach
+/// "unsupported builtin head" for EVERY argument type, which made this guard
+/// `sum`-only; `crate::norms` wires them, so each needs the same table check.
 fn lower_sum(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
     if let [arg] = args {
         if matches!(e.type_of(*arg), Some(Type::Table { .. })) {
-            return Err(EmitError::at(
-                id,
-                "a table reduction has no tensor form: §07 \"Table reductions\" makes `sum` over \
-                 a table a RECORD of per-column sums, and this emitter represents every value as \
-                 a tensor. Reduce one column at a time instead — `sum(data.x)` lowers, and a \
-                 table input is already one argument per column",
-            ));
+            return Err(crate::norms::table_reduction_refusal(id, "sum"));
         }
     }
     unary(e, id, args, Emitter::reduce_sum)

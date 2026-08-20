@@ -1478,6 +1478,79 @@ impl<'m> Emitter<'m> {
         Ok(cur)
     }
 
+    /// A PREFIX SCAN over a rank-1 operand: `result[i]` is `combine_op` over
+    /// `a[0..=i]`, the shape §07 "Reductions" gives `cumsum`
+    /// ($(x_1, x_1+x_2, \dots)$) and `cumprod`.
+    ///
+    /// StableHLO has no cumulative op, but it does have `stablehlo.reduce_window`,
+    /// and a scan is one window pass: `window_dimensions = [n]` with the window
+    /// left-padded by `n - 1` puts `a[0..=i]` plus `n - 1 - i` padding elements in
+    /// window `i`, and the padded positions take the reduce's `init_values` — so
+    /// with `identity_lit` as the init, window `i` combines exactly the prefix.
+    /// This is the lowering XLA itself uses for a cumulative reduction, so it
+    /// needs neither a `stablehlo.while` nor an iota-masked matmul.
+    ///
+    /// The result is EXACT for both combines: the padding contributes only the
+    /// identity (`+0` / `*1`), both of which are exact in floating point. The
+    /// window is reduced as a tree rather than left-to-right, so a prefix's
+    /// rounding can differ from a sequential accumulation's — §07 defines the
+    /// mathematical prefix, not an association order.
+    ///
+    /// Cost is `O(n^2)` scalar combines for a length-`n` vector. That is the
+    /// same asymptotic cost as the masked-matmul alternative but with no
+    /// materialized `n`x`n` intermediate, and a log-depth associative scan would
+    /// need `stablehlo.while`.
+    ///
+    /// Emitted in the GENERIC (quoted) form with an explicit region: unlike
+    /// `stablehlo.reduce`, `reduce_window` has no `applies` pretty form. Panics
+    /// on an operand that is not a statically-shaped rank-1 tensor — the caller
+    /// (`crate::norms`) refuses those, mirroring this module's
+    /// panic-on-bad-shape discipline for an internal invariant.
+    pub(crate) fn prefix_scan(&mut self, combine_op: &str, identity_lit: &str, a: &Value) -> Value {
+        let n = match &a.ty {
+            MlirTy::Ranked(dims) if dims.len() == 1 => {
+                dims[0].expect("prefix_scan: operand axis must be statically sized")
+            }
+            other => {
+                panic!("prefix_scan expects a statically-shaped rank-1 operand, got {other:?}")
+            }
+        };
+        let elem_ty = MlirTy::Scalar.render(self.dtype, a.elem);
+        let operand_ty = a.ty.render(self.dtype, a.elem);
+
+        let init_ssa = self.fresh();
+        self.push(&format!(
+            "{init_ssa} = stablehlo.constant dense<{identity_lit}> : {elem_ty}"
+        ));
+
+        let (lhs, rhs, acc) = (self.fresh(), self.fresh(), self.fresh());
+        let ssa = self.fresh();
+        let mut text = String::new();
+        text.push_str(&format!(
+            "{ssa} = \"stablehlo.reduce_window\"({}, {init_ssa}) ({{\n",
+            a.ssa
+        ));
+        text.push_str(&format!("^bb0({lhs}: {elem_ty}, {rhs}: {elem_ty}):\n"));
+        text.push_str(&format!(
+            "  {acc} = {combine_op} {lhs}, {rhs} : {elem_ty}\n"
+        ));
+        text.push_str(&format!("  stablehlo.return {acc} : {elem_ty}\n"));
+        text.push_str("}) {\n");
+        text.push_str(&format!("  window_dimensions = array<i64: {n}>,\n"));
+        text.push_str("  window_strides = array<i64: 1>,\n");
+        text.push_str(&format!(
+            "  padding = dense<[[{}, 0]]> : tensor<1x2xi64>\n",
+            n - 1
+        ));
+        text.push_str(&format!("}} : ({operand_ty}, {elem_ty}) -> {operand_ty}"));
+        self.push(&text);
+        Value {
+            ssa,
+            ty: a.ty.clone(),
+            elem: a.elem,
+        }
+    }
+
     // ---- matrix helpers -----------------------------------------------------
 
     /// `%N = stablehlo.cholesky %a, lower = true : ty` — the lower-triangular

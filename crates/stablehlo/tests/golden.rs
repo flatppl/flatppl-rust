@@ -2127,10 +2127,9 @@ fn lower_fill_refuses_a_dynamic_result_shape() {
 #[test]
 fn lower_builtin_still_refuses_ops_the_gate_does_not_emit() {
     // Adjacent to something lowered in each case: the array generators next to
-    // `fill`, the remaining reductions next to `sum`/`maximum`/`minimum`, the
-    // norms next to `logsumexp`, the cumulative pair next to their plain
-    // reductions, the complex-valued elementary functions next to their real
-    // siblings, and the general-matrix decompositions next to `lower_cholesky`.
+    // `fill`, the size queries next to the reductions, the complex-valued
+    // elementary functions next to their real siblings, and the general-matrix
+    // decompositions next to `lower_cholesky`.
     //
     // Trimmed when `wave-hlowire` wired the existing-helper batch: `lor`,
     // `lnot`, `lxor`, `min`, `max`, `ceil`, `isnan`, `isfinite`, `equal`,
@@ -2138,6 +2137,13 @@ fn lower_builtin_still_refuses_ops_the_gate_does_not_emit() {
     // list and all now lower, so listing them here would assert the opposite of
     // what the map does. `le`/`ge` are still not here, for the original reason:
     // a closed finite image endpoint emits them.
+    //
+    // Trimmed again when `wave-hlonorm` wired §07's remaining reductions and its
+    // norms: `prod`, `mean`, `var`, `std`, `cumsum`, `cumprod`, `l1norm`,
+    // `l2norm`, `l1unit`, `l2unit`, `softmax` and `logsoftmax` all lower now, so
+    // they too would assert the opposite of what the map does. Each has its own
+    // refusal coverage in `tests/golden_norms.rs` — over the operands §07 puts
+    // out of domain, which is a different assertion from "the head is unknown".
     for head in [
         "zeros",
         "ones",
@@ -2145,20 +2151,8 @@ fn lower_builtin_still_refuses_ops_the_gate_does_not_emit() {
         "onehot",
         "linspace",
         "array",
-        "prod",
-        "mean",
-        "var",
-        "std",
-        "cumsum",
-        "cumprod",
         "lengthof",
         "sizeof",
-        "l1norm",
-        "l2norm",
-        "l1unit",
-        "l2unit",
-        "softmax",
-        "logsoftmax",
         "conj",
         "cis",
         "imag",
