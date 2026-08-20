@@ -90,7 +90,13 @@
 //!   reduction has no tensor form: §07 \"Table reductions\" makes `sum` over a
 //!   table a RECORD of per-column reductions, ...". `prod`/`mean`/`var`/`std`
 //!   raise the identical refusal from `norms.rs` (below); the message is one
-//!   function so the five cannot drift apart. A boolean ARRAY is not refused:
+//!   function so those five cannot drift apart. **That is five of §07's SEVEN
+//!   table reductions.** §07 names "`sum`, `mean`, `var`, `std`, `prod`,
+//!   `maximum`, or `minimum`"; `maximum`/`minimum` over a table still report
+//!   "unsupported builtin head 'elementof'" — the blame-the-wrong-construct
+//!   failure this shared helper exists to prevent. Pre-existing (both were wired
+//!   before the shared helper) and a known gap, not a regression: closing it is
+//!   two more call sites. A boolean ARRAY is not refused:
 //!   §03 "Bool" promotes it ("`sum(mask)` to count true entries"), `infer` types
 //!   the result `integers`, and `Emitter::reduce_axis` emits the matching
 //!   `stablehlo.convert` to `i32`.
@@ -468,6 +474,18 @@
 //!   converts a `Bool` operand to `Int` immediately above, per §03 "Bool"'s
 //!   promotion. Kept as a refusal rather than an `unreachable!()` so a future
 //!   reordering surfaces instead of panicking.
+//!
+//! **NOT refused: a length-0 vector, for any of the eight vector heads.** §07
+//! gives them the domain "vectors" and a length-0 array is one, so each owes a
+//! defined value: the scans and `l1unit`/`l2unit`/`softmax`/`logsoftmax` return
+//! the empty vector, `l1norm`/`l2norm` the empty sum `0.0`. Only `mean`/`var`/
+//! `std` refuse over an empty array, and only because they divide by the element
+//! count. The scans answer it in `lower_cumulative` rather than reaching
+//! `Emitter::prefix_scan`, because `stablehlo.reduce_window` has no length-0 form
+//! (`window_dimensions = 0` is rejected). Before that guard existed the scans
+//! MISLOWERED this class — debug panicked on the `n - 1` underflow, release
+//! emitted `padding = 2^64 - 1` and exited 0 — so it is test-locked in both
+//! directions.
 //!
 //! No head in `norms.rs` refuses a non-`Real` operand. §03's
 //! `booleans ⊂ integers ⊂ reals` puts an integer or boolean operand inside

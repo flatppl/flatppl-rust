@@ -323,7 +323,7 @@ pub(crate) fn lower_cumulative(
     let [xs_id] = args_exact(id, args)?;
     require_not_table(e, id, head, xs_id)?;
     let xs = e.lower_node(xs_id)?;
-    require_static_vector(id, head, &xs)?;
+    let n = require_static_vector(id, head, &xs)?;
 
     // §03's promotion, for [`lower_reduction`]'s reason: no `i1` combine
     // computes a cumulative sum or product.
@@ -332,6 +332,23 @@ pub(crate) fn lower_cumulative(
     } else {
         xs
     };
+
+    // An EMPTY vector scans to the empty vector — the operand itself, no op
+    // emitted. §07 gives the pair the domain "vectors" and a length-0 array is
+    // one, so the result is owed rather than refusable, and it is well defined:
+    // the prefix sequence of an empty sequence is empty (`np.cumsum([])` is
+    // `[]`). Unlike `mean`/`var`/`std`, which this module DOES refuse over an
+    // empty array, no division by the element count is involved, so there is no
+    // $0/0$ to decline.
+    //
+    // Handled here rather than in `Emitter::prefix_scan` because
+    // `stablehlo.reduce_window` cannot express it at all: the window would have
+    // to be `window_dimensions = 0`, which IREE rejects outright ("expects
+    // window to have positive value for 0-th window dimension"). Returning the
+    // operand sidesteps the op instead of emitting one that cannot verify.
+    if n == 0 {
+        return Ok(xs);
+    }
     let (op, identity) = match (which, xs.elem) {
         (Cumulative::Sum, ElemKind::Real) => ("stablehlo.add", "0.000000e+00"),
         (Cumulative::Sum, ElemKind::Int) => ("stablehlo.add", "0"),

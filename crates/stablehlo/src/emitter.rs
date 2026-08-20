@@ -1502,10 +1502,18 @@ impl<'m> Emitter<'m> {
     /// need `stablehlo.while`.
     ///
     /// Emitted in the GENERIC (quoted) form with an explicit region: unlike
-    /// `stablehlo.reduce`, `reduce_window` has no `applies` pretty form. Panics
-    /// on an operand that is not a statically-shaped rank-1 tensor — the caller
-    /// (`crate::norms`) refuses those, mirroring this module's
-    /// panic-on-bad-shape discipline for an internal invariant.
+    /// `stablehlo.reduce`, `reduce_window` has no `applies` pretty form.
+    ///
+    /// The operand must be a statically-shaped rank-1 tensor of length **>= 1**,
+    /// which `crate::norms::lower_cumulative` guarantees: it refuses a non-vector
+    /// and handles a length-0 vector itself (the empty scan is the empty vector,
+    /// emitted as the operand with no op). The length precondition is asserted
+    /// EXPLICITLY rather than left to `n - 1`: a length-0 operand used to
+    /// underflow that subtraction, which panicked in debug and in release emitted
+    /// `window_dimensions = 0` with `padding = 2^64 - 1` — text IREE rejects
+    /// ("expects window to have positive value for 0-th window dimension"), from
+    /// a CLI that exited 0. An arithmetic underflow is not a precondition check,
+    /// so this one is written down.
     pub(crate) fn prefix_scan(&mut self, combine_op: &str, identity_lit: &str, a: &Value) -> Value {
         let n = match &a.ty {
             MlirTy::Ranked(dims) if dims.len() == 1 => {
@@ -1515,6 +1523,11 @@ impl<'m> Emitter<'m> {
                 panic!("prefix_scan expects a statically-shaped rank-1 operand, got {other:?}")
             }
         };
+        assert!(
+            n >= 1,
+            "prefix_scan: a window needs at least one element; a length-0 scan has \
+             no reduce_window form and is the caller's to answer"
+        );
         let elem_ty = MlirTy::Scalar.render(self.dtype, a.elem);
         let operand_ty = a.ty.render(self.dtype, a.elem);
 

@@ -420,7 +420,9 @@ fn a_norm_widens_an_integer_vector_to_reals() {
 /// `exp`, so every exponent is $\le 0$ and nothing overflows. A naive
 /// $e^{v_i}/\sum_j e^{v_j}$ is `NaN` at `v = [1000, 1001, 999, 1000.5]` even in
 /// f64; the emitted form returns the correct distribution there (measured under
-/// IREE) and sums to exactly `1.0`.
+/// IREE) and sums to one at f32. ("At f32" is the honest qualifier: the four
+/// components accumulate to `1.0` in f32 but to `0.9999999702` in f64, and to
+/// `1.0000000522` at the mirrored all-negative probe.)
 #[test]
 fn softmax_and_logsoftmax_shift_by_the_max_before_exponentiating() {
     for head in ["softmax", "logsoftmax"] {
@@ -544,6 +546,81 @@ fn no_multi_axis_scan_spelling_is_answered_since_section_07_pins_no_axis() {
         assert!(
             err.contains(head) && err.contains("the domain \"vectors\""),
             "`y[.i] := {head}(…)` must refuse on §07's vectors domain, got: {err}"
+        );
+    }
+}
+
+/// **The complete length-0 behavior of all eight vector heads**, in one place, so
+/// none can regress independently. §07 gives each of them a "vectors" domain and
+/// a length-0 array IS a vector, so every one of these owes a defined value
+/// rather than a refusal — and each of the eight has one, verified by EXECUTION
+/// on a `tensor<0x…>` runtime argument:
+///
+/// | head | empty result | why |
+/// |---|---|---|
+/// | `cumsum`/`cumprod` | the empty vector | the prefix sequence of an empty sequence is empty (`np.cumsum([])` is `[]`) |
+/// | `l1norm`/`l2norm` | `0.0` | the empty sum, and `sqrt(0) == 0` |
+/// | `l1unit`/`l2unit` | the empty vector | no element to divide, so the division is vacuous |
+/// | `softmax`/`logsoftmax` | the empty vector | likewise — and no `NaN`, since there is no element to produce one |
+///
+/// Only `mean`/`var`/`std` refuse over an empty array, and only because they
+/// divide by the element count ($0/0$); nothing here does.
+///
+/// **The scans are a REGRESSION TEST.** They used to reach
+/// `Emitter::prefix_scan`, whose `n - 1` padding term underflowed: debug panicked
+/// with "attempt to subtract with overflow", and release emitted
+/// `window_dimensions = 0` with `padding = 2^64 - 1` from a CLI that exited 0 —
+/// text IREE rejects ("expects window to have positive value for 0-th window
+/// dimension"). `stablehlo.reduce_window` cannot express a length-0 scan at all,
+/// so `lower_cumulative` answers it directly by returning the operand.
+#[test]
+fn every_vector_head_has_a_defined_length_zero_result() {
+    // The scans and the three vector-valued norm families return a length-0
+    // vector; nothing is emitted for the scans, so the module is a bare return.
+    for head in ["cumsum", "cumprod"] {
+        let out = emit(&vec_src(head, "reals", 0));
+        assert!(
+            out.contains("-> tensor<0xf32>"),
+            "`{head}` over an empty vector must return an empty vector:\n{out}"
+        );
+        assert!(
+            !out.contains("reduce_window"),
+            "a length-0 scan has no reduce_window form, so none may be emitted:\n{out}"
+        );
+        assert!(
+            !out.contains("18446744073709551615"),
+            "`{head}` must not emit an underflowed padding term:\n{out}"
+        );
+    }
+    for head in ["l1unit", "l2unit", "softmax", "logsoftmax"] {
+        let out = emit(&vec_src(head, "reals", 0));
+        assert!(
+            out.contains("-> tensor<0xf32>"),
+            "`{head}` over an empty vector must return an empty vector:\n{out}"
+        );
+    }
+    // The two scalar-valued norms reduce to a scalar, not to an empty vector.
+    for head in ["l1norm", "l2norm"] {
+        let out = emit(&vec_src(head, "reals", 0));
+        assert!(
+            out.contains("-> tensor<f32>"),
+            "`{head}` over an empty vector must return the empty sum, a scalar:\n{out}"
+        );
+    }
+}
+
+/// §03's promotion is applied BEFORE the empty-scan shortcut, so an empty
+/// BOOLEAN scan still returns the integer element type `infer` gives it
+/// (`tensor<0xi32>`, not `tensor<0xi1>`). Ordering-sensitive: returning the
+/// operand before converting would have disagreed with the inferred type.
+#[test]
+fn an_empty_boolean_scan_keeps_the_promoted_integer_type() {
+    for head in ["cumsum", "cumprod"] {
+        let out = emit(&vec_src(head, "booleans", 0));
+        assert!(
+            out.contains("stablehlo.convert %arg0 : (tensor<0xi1>) -> tensor<0xi32>")
+                && out.contains("-> tensor<0xi32>"),
+            "`{head}` over an empty boolean vector must still promote to i32:\n{out}"
         );
     }
 }
