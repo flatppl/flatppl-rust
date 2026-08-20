@@ -429,8 +429,18 @@ impl Catalogue {
     ///   implies a column-wise `std`. `prod`, `maximum`, `minimum` were added by
     ///   design PR #79 (owner-merge pending as of this change; landed ahead of spec
     ///   per the owner's ruling that the engine work need not wait).
+    /// - `median`, `lany`, `lall` — added to the same **Table reductions** paragraph
+    ///   by the `missing-reductions` spec draft (flatppl-design `ee4c6fb`), which
+    ///   also states under §07 "Boolean reductions" that `lany` and `lall` "reduce a
+    ///   table column-wise". Unmerged, landed ahead of spec under the same ruling.
     ///
     /// Deliberately ABSENT, each checked against its own row rather than assumed:
+    ///
+    /// - `quantile` — two inputs, so the arity half of #78's condition excludes it
+    ///   whatever its domain. It is also absent from §07's Table reductions
+    ///   paragraph.
+    /// - `linfnorm`, `cummax`, `cummin` — "real/complex vectors" / "real vectors",
+    ///   arrays only, exactly like `l1norm`/`l2norm` and `cumsum`/`cumprod`.
     ///
     /// - `boolean`, `integer`, `real` — "any **scalar** numeric". The word "any" is
     ///   qualified, so these do not admit aggregates.
@@ -457,9 +467,12 @@ impl Catalogue {
         "identity",
         "indicesof",
         "indicesof0",
+        "lall",
+        "lany",
         "lengthof",
         "maximum",
         "mean",
+        "median",
         "minimum",
         "prod",
         "reverse",

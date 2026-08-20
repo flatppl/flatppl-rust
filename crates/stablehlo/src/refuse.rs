@@ -242,13 +242,19 @@
 //!   close both corners and retire this guard.
 //! - `land`/`lor`/`lxor`/`lnot` whose operand is not a boolean-producing call —
 //!   "<head> operand must be a boolean predicate (in/compare/lt/gt/le/ge/land/
-//!   lor/lxor/lnot/iszero/equal/unequal/isfinite/isinf/isnan)". Shared with
-//!   `ifelse`'s condition check (`ops::require_predicate_head` over
-//!   `ops::PREDICATE_HEADS`). Deliberately NOT widened to any `Bool`-typed
-//!   VALUE, though one renders `i1` and would emit: the boolean-value gap is
-//!   left as ONE documented refusal
+//!   lor/lxor/lnot/iszero/equal/unequal/isfinite/isinf/isnan), bare or under a
+//!   broadcast". Shared with `ifelse`'s condition check
+//!   (`ops::require_predicate_head` over `ops::PREDICATE_HEADS`). Deliberately NOT
+//!   widened to any `Bool`-typed VALUE, though one renders `i1` and would emit: the
+//!   boolean-value gap is left as ONE documented refusal
 //!   (`flatppl-dev/stablehlo-feature-matrix.md`, prioritized gap 6) rather than
 //!   half-closed inconsistently across `ifelse` and the connectives.
+//!
+//!   A `broadcast(P, …)` / dotted spelling whose head `P` is itself in the list
+//!   PASSES the gate, and must: `infer` now refuses a bare comparison over an array
+//!   (§07 gives the comparisons a scalar domain), so an ARRAY-shaped predicate can
+//!   only arrive dotted, and it lowers to an `i1` tensor of the operand's shape —
+//!   the property the gate selects for.
 //! - `land`/`lor`/`lxor` whose operands have different shapes — "<head>:
 //!   operands must have the same shape, got ... and ...". `Emitter::and`/`or`/
 //!   `xor` render ONE type for both operands and the result.
@@ -300,7 +306,8 @@
 //!   condition must be a boolean predicate (in/compare/lt/gt/le/ge/land/lor/
 //!   lxor/lnot/iszero/equal/unequal/isfinite/isinf/isnan)". The list is
 //!   `ops::PREDICATE_HEADS` verbatim — every head in this map that lowers to an
-//!   `i1` — so it grows whenever a boolean head is wired. The doc here said
+//!   `i1` — so it grows whenever a boolean head is wired, and the message now ends
+//!   "bare or under a broadcast" (see the connectives above). The doc here said
 //!   "(in/compare)" through several waves in which the actual message had
 //!   already grown; it is generated from the constant, so quote the constant.
 //! - `broadcast_to` asked to broadcast a non-scalar, differently-shaped
@@ -497,6 +504,79 @@
 //! call as (`prod` keeps the element kind, `Int` for a boolean array; every
 //! moment and every norm is `Real`) — so none reaches a helper that hardcodes
 //! `Real` over an operand it cannot represent, and none reduces in `i1`.
+//!
+//! **`order.rs`** (§07 "Boolean reductions", "Cumulative operations", the
+//! infinity norm and the two order statistics — the `missing-reductions` spec
+//! draft's seven heads, reached through `ops::lower_builtin`. Every site is locked
+//! by a test in `tests/golden_order.rs`):
+//! - `lany`/`lall`/`cummax`/`cummin` over a TABLE — the shared
+//!   `norms::table_reduction_refusal`, for the reason it records. The draft adds
+//!   `median`, `lany` and `lall` to §07's Table reductions paragraph, so all three
+//!   are column-wise heads with no record value to build here.
+//! - `lany`/`lall` over a SCALAR or a dynamically-shaped operand — "...: §07
+//!   reduces an ARRAY, so the operand must be a statically-shaped array, got ...",
+//!   matching `norms::lower_reduction`'s guard.
+//! - `lany`/`lall` over a non-BOOLEAN array — "...: §07 \"Boolean reductions\"
+//!   gives this head the domain \"boolean arrays\", and got an array of ...". This
+//!   is the one place a non-`Real` operand is refused on DOMAIN grounds rather
+//!   than widened, and the direction is why: §03's `booleans ⊂ integers ⊂ reals`
+//!   puts a boolean inside a real domain, never a real inside a boolean one, so
+//!   there is no widening to make. Reading truthiness off a real array would be a
+//!   convention §07 never states (the js engine does read it there, and its own
+//!   review records that as a gap; the two engines answer to the spec, not to each
+//!   other).
+//! - `cummax`/`cummin` over anything but a statically-sized RANK-1 operand —
+//!   the same "vectors" message the cumulative pair gives, on the same §07 Domains
+//!   authority.
+//! - `cummax`/`cummin` over a BOOLEAN vector — "the maximum/minimum scan has no
+//!   Bool form here: IREE 3.11 cannot compile an `i1` `stablehlo.reduce_window`
+//!   region at all ...". Raised from `Emitter::prefix_scan_extremum`. Reachable
+//!   from surface source, and NOT a §03 domain question: §03 does put a boolean
+//!   vector in §07's "real vectors", and `max`/`min` over booleans are exactly
+//!   `lor`/`land`. The limit is the target's — probed at `stablehlo.or`,
+//!   `stablehlo.and` and `stablehlo.maximum` alike, each failing to legalize with
+//!   "'arith.ori' op requires the same type for all operands and results". The
+//!   alternative, promoting to `Int` the way `norms::lower_cumulative` does for
+//!   `cumsum`, is unavailable for a DIFFERENT reason: `infer` types `cummax` of a
+//!   boolean vector a BOOLEAN vector (a running maximum selects an element and
+//!   performs no arithmetic, so §03 "Bool"'s promotion sentence does not reach
+//!   it), so a promoted lowering would return a type the module does not declare.
+//! - `median`/`quantile`, always — "... has no lowering here: §07 defines it as
+//!   ..., which needs the operand RANKED, and this emitter has no sort ...". Not a
+//!   domain refusal and not a spec gap: the heads are fully specified, and this
+//!   backend lacks the primitive. `stablehlo.sort` appears nowhere in the crate and
+//!   neither does a top-k; the sort-free rank-select alternative fabricates an
+//!   element whenever the input contains NaN (every comparison against NaN is
+//!   false, so two elements collide at one rank), and a wrong number with no
+//!   diagnostic is worse than refusing. The js engine implements both.
+//!   `order::refuse_order_statistic` carries the full argument.
+//! - `aggregate(median | lany | lall, …)` — "...: `X` IS an eligible reduction
+//!   under §04 \"Multi-axis aggregation\", but has no lowering in this emitter".
+//!   A DISTINCT message from `aggregate.rs`'s ineligibility refusal, because the
+//!   draft makes all three eligible and telling the caller otherwise would
+//!   contradict §04. The BARE `lany`/`lall` do lower; only the aggregate spelling
+//!   is missing, and `aggregate::ELIGIBLE_BUT_UNLOWERED` records what it needs.
+//!
+//! **NOT refused: a length-0 operand, for any of the five heads that lower.** Unlike
+//! the `norms.rs` family above, these are no longer answered pending a ruling — the
+//! owner's zero-size-arrays ruling of 2026-08-20
+//! (`flatppl-dev/empty-arrays-ruling.md`, sub-ruling 2) fixes every one of them:
+//! "`lany([])` = `false`, `lall([])` = `true`, `l1norm`/`l2norm`/`linfnorm` = `0`
+//! stand (forced identities)", and the vector-valued heads "all map empty to empty".
+//! Each was also oracle-matched. `linfnorm([])` is the only special case in the code
+//! (the reduce's own answer over a zero-length axis is its `-inf` identity, NEGATIVE
+//! for a quantity §07 declares a norm); `cummax([])`/`cummin([])` return the operand
+//! with no op emitted (`reduce_window` has no length-0 form); `lany([])`/`lall([])`
+//! need no case at all, since `stablehlo.reduce` over a zero-length axis returns its
+//! init.
+//!
+//! The same ruling also assigns this crate two follow-ups, NOT done here: update the
+//! `norms.rs` family's "pending a §07 ruling" wording above (now spec-backed), and add
+//! `maximum`/`minimum` over empty as $\mp\infty$. And it makes the SOURCE form these
+//! length-0 tests use illegal — `infer` is to refuse a written literal size of 0 — so
+//! every length-0 answer here becomes unreachable from legal source once that lands,
+//! because a derived 0 arrives as a `%dynamic` extent and every guard here refuses one.
+//! Recorded in `flatppl-dev/TODO-flatppl-rust.md`.
 //!
 //! **`registry.rs`** (the distribution dispatch table):
 //! - a kernel-input record missing a parameter a builder needs —

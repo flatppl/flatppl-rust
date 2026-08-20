@@ -9798,7 +9798,7 @@ fn emit_logdensity_refuses_mixed_orientation_on_the_dotted_and_predicate_paths()
         ("`.*`", "sum(transpose(v) .* w)", "(v, w)"),
         (
             "compare inside ifelse",
-            "sum(ifelse(transpose(v) < w, v, w))",
+            "sum(ifelse(transpose(v) .< w, v, w))",
             "(v, w)",
         ),
         (
@@ -9874,7 +9874,7 @@ fn emit_logdensity_orientation_check_leaves_broadcast_and_same_orientation_alone
         (
             "all-TVector ifelse",
             "v = elementof(cartpow(reals, 3))\nw = elementof(cartpow(reals, 3))",
-            "sum(ifelse(transpose(v) < transpose(w), transpose(v), transpose(w)))",
+            "sum(ifelse(transpose(v) .< transpose(w), transpose(v), transpose(w)))",
             "(v, w)",
             "stablehlo.select",
         ),
@@ -10378,7 +10378,7 @@ fn emit_logdensity_refuses_compare_with_unbroadcastable_operands() {
     let src = "\
 m = elementof(cartpow(reals, [4, 3]))
 v = elementof(cartpow(reals, 3))
-z = ifelse(m < v, 1.0, 2.0)
+z = ifelse(m .< v, 1.0, 2.0)
 lp = logdensityof(lawof(record(y = draw(Normal(mu = sum(z), sigma = 1.0)))), record(y = 1.0))
 inputs = (m, v)
 outputs = lp
@@ -10409,7 +10409,7 @@ m = elementof(cartpow(reals, [4, 3]))
 n = elementof(cartpow(reals, [4, 3]))
 v1 = elementof(cartpow(reals, 3))
 v2 = elementof(cartpow(reals, 3))
-z = ifelse(v1 < v2, m, n)
+z = ifelse(v1 .< v2, m, n)
 lp = logdensityof(lawof(record(y = draw(Normal(mu = sum(z), sigma = 1.0)))), record(y = 1.0))
 inputs = (m, n, v1, v2)
 outputs = lp
@@ -10442,7 +10442,7 @@ p1 = elementof(cartpow(reals, 1))
 p2 = elementof(cartpow(reals, 1))
 m = elementof(cartpow(reals, 3))
 n = elementof(cartpow(reals, 3))
-z = ifelse(p1 < p2, m, n)
+z = ifelse(p1 .< p2, m, n)
 lp = logdensityof(lawof(record(y = draw(Normal(mu = sum(z), sigma = 1.0)))), record(y = 1.0))
 inputs = (p1, p2, m, n)
 outputs = lp
@@ -10470,7 +10470,7 @@ p1 = elementof(cartpow(reals, 3))
 p2 = elementof(cartpow(reals, 3))
 m = elementof(cartpow(reals, 1))
 n = elementof(cartpow(reals, 1))
-z = ifelse(p1 < p2, m, n)
+z = ifelse(p1 .< p2, m, n)
 lp = logdensityof(lawof(record(y = draw(Normal(mu = sum(z), sigma = 1.0)))), record(y = 1.0))
 inputs = (p1, p2, m, n)
 outputs = lp
@@ -10502,7 +10502,7 @@ p1 = elementof(cartpow(reals, 3))
 p2 = elementof(cartpow(reals, 3))
 m = elementof(cartpow(reals, 1))
 n = elementof(cartpow(reals, 3))
-z = ifelse(p1 < p2, m, n)
+z = ifelse(p1 .< p2, m, n)
 lp = logdensityof(lawof(record(y = draw(Normal(mu = sum(z), sigma = 1.0)))), record(y = 1.0))
 inputs = (p1, p2, m, n)
 outputs = lp
@@ -10550,7 +10550,7 @@ outputs = lp
             "\
 v1 = elementof(cartpow(reals, 3))
 v2 = elementof(cartpow(reals, 3))
-z = ifelse(v1 < v2, 1.0, 2.0)
+z = ifelse(v1 .< v2, 1.0, 2.0)
 lp = logdensityof(lawof(record(y = draw(Normal(mu = sum(z), sigma = 1.0)))), record(y = 1.0))
 inputs = (v1, v2)
 outputs = lp

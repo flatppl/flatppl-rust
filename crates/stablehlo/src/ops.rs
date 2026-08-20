@@ -203,6 +203,25 @@ pub(crate) fn lower_builtin(
         "l2unit" => crate::norms::lower_norm(e, id, args, crate::norms::Norm::L2Unit),
         "softmax" => crate::norms::lower_softmax(e, id, args, crate::norms::Softmax::Plain),
         "logsoftmax" => crate::norms::lower_softmax(e, id, args, crate::norms::Softmax::Log),
+        // §07's boolean reductions, cumulative extrema, infinity norm and order
+        // statistics — `crate::order`, which see for why two of the six refuse.
+        "lany" => crate::order::lower_boolean_reduction(e, id, args, crate::order::BoolReduce::Any),
+        "lall" => crate::order::lower_boolean_reduction(e, id, args, crate::order::BoolReduce::All),
+        "cummax" => {
+            crate::order::lower_cumulative_extremum(e, id, args, crate::emitter::AxisReduce::Max)
+        }
+        "cummin" => {
+            crate::order::lower_cumulative_extremum(e, id, args, crate::emitter::AxisReduce::Min)
+        }
+        "linfnorm" => crate::order::lower_linf_norm(e, id, args),
+        "median" => Err(crate::order::refuse_order_statistic(
+            id,
+            crate::order::OrderStatistic::Median,
+        )),
+        "quantile" => Err(crate::order::refuse_order_statistic(
+            id,
+            crate::order::OrderStatistic::Quantile,
+        )),
         "fill" => lower_fill(e, id, args),
         "get0" => lower_get(e, id, args, 0),
         "get" => lower_get(e, id, args, 1),
@@ -1593,24 +1612,42 @@ const PREDICATE_HEADS: &[&str] = &[
 ];
 
 /// An `ifelse` condition / `land` operand must be one of
-/// [`PREDICATE_HEADS`]. Same narrow-and-refuse discipline as `get`/`get0`'s
-/// literal-selector check: checked structurally against the *unlowered* node,
-/// before `lower_node` ever runs on it.
+/// [`PREDICATE_HEADS`], bare or under a `broadcast`. Same narrow-and-refuse
+/// discipline as `get`/`get0`'s literal-selector check: checked structurally
+/// against the *unlowered* node, before `lower_node` ever runs on it.
+///
+/// `broadcast(P, …)` / the dotted spelling counts whenever `P` is itself in the
+/// list, because that is the ONLY route §07 gives an elementwise comparison:
+/// `infer` refuses a bare `lt(v, w)` over arrays (`ops::refuse_array_comparison`),
+/// so an ARRAY-shaped predicate can now only arrive dotted. It lowers to an `i1`
+/// tensor of the operand's shape — `v1 .< v2` over two `[3]` operands emits
+/// `stablehlo.compare LT … -> tensor<3xi1>` — which is exactly the property this
+/// gate selects for.
 fn require_predicate_head(e: &Emitter, cond: NodeId, what: &str) -> Result<(), EmitError> {
-    let is_predicate = matches!(
-        e.node(cond),
-        Node::Call(c) if matches!(
-            c.head,
-            CallHead::Builtin(sym) if PREDICATE_HEADS.contains(&e.resolve(sym))
-        )
-    );
+    let head_name = |id: NodeId| match e.node(id) {
+        Node::Call(c) => match c.head {
+            CallHead::Builtin(sym) => Some((e.resolve(sym).to_string(), c.args.to_vec())),
+            _ => None,
+        },
+        _ => None,
+    };
+    let is_predicate = match head_name(cond) {
+        Some((name, args)) if name == "broadcast" || name == "broadcasted" => {
+            args.first().is_some_and(|h| match e.node(*h) {
+                Node::Const(sym) => PREDICATE_HEADS.contains(&e.resolve(*sym)),
+                _ => false,
+            })
+        }
+        Some((name, _)) => PREDICATE_HEADS.contains(&name.as_str()),
+        None => false,
+    };
     if is_predicate {
         Ok(())
     } else {
         Err(EmitError::at(
             cond,
             format!(
-                "{what} must be a boolean predicate ({})",
+                "{what} must be a boolean predicate ({}), bare or under a broadcast",
                 PREDICATE_HEADS.join("/")
             ),
         ))

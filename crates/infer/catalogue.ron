@@ -215,11 +215,28 @@ Catalogue(
         // Norms (spec §07 "Norms and normalization"): l1/l2 norm → real scalar.
         Builtin(name: "l1norm",       sig: Function(params: [Any], names: ["v"],      result: Scalar(Real), result_set: NonNegReals)),
         Builtin(name: "l2norm",       sig: Function(params: [Any], names: ["v"],      result: Scalar(Real), result_set: NonNegReals)),
+        // linfnorm(v) = max_i |v_i| (spec §07 "Norms and normalization"), the
+        // same "real/complex vectors" domain and non-negative real result as its
+        // two siblings.
+        Builtin(name: "linfnorm",     sig: Function(params: [Any], names: ["v"],      result: Scalar(Real), result_set: NonNegReals)),
         // logsumexp (spec §07): log Σ exp(v_i) → real.
         Builtin(name: "logsumexp",    sig: Function(params: [Any], names: ["v"],      result: Scalar(Real))),
         // var/std (spec §07 "Reductions") involve a division/sqrt → always real.
         Builtin(name: "var",          sig: Function(params: [Any], names: ["xs"],      result: Scalar(Real), result_set: NonNegReals)),
         Builtin(name: "std",          sig: Function(params: [Any], names: ["xs"],      result: Scalar(Real), result_set: NonNegReals)),
+        // median/quantile (spec §07 "Reductions") are REAL over an integer array
+        // too, and for the same reason `mean` is: §07 defines `median` as
+        // "$\tfrac{1}{2}(x_{(n/2)} + x_{(n/2+1)})$ for even $n$" and `quantile`
+        // as an interpolation "$x_{(k)} + (h - k)(x_{(k+1)} - x_{(k)})$" — both
+        // arithmetic between two order statistics, so `median([1, 2])` is `1.5`.
+        // The odd-$n$ / integral-$h$ cases DO return an element, but $n$'s parity
+        // is not always static, so `Real` is the type that covers the row (§03's
+        // `integers ⊂ reals` makes it sound where the element is returned).
+        Builtin(name: "median",       sig: Function(params: [Any], names: ["xs"],      result: Scalar(Real))),
+        // `p`'s tag documents §07's `interval(0, 1)` column; the tags are not
+        // domain-checked (see `ParamSig`), and no engine can enforce that domain
+        // statically for a computed `p` anyway.
+        Builtin(name: "quantile",     sig: Function(params: [Any, Scalar(Real)], names: ["xs", "p"], result: Scalar(Real))),
         // maximum/minimum return an ELEMENT of the array, so the result kind
         // follows the element kind (an integer array yields an integer).
         Builtin(name: "maximum",      sig: Function(params: [Any], names: ["xs"],      result: ElemScalarKind(0))),
@@ -244,6 +261,15 @@ Catalogue(
         Builtin(name: "reverse",      sig: Function(params: [Any], names: ["xs"],      result: SameAsArg(0))),
         Builtin(name: "cumsum",       sig: Function(params: [Any], names: ["xs"],      result: SameAsArg(0))),
         Builtin(name: "cumprod",      sig: Function(params: [Any], names: ["xs"],      result: SameAsArg(0))),
+        // cummax/cummin (spec §07 "Cumulative operations") are shape-preserving
+        // like the pair above, but they take NO §03 boolean promotion: a running
+        // maximum SELECTS an element and performs no arithmetic, so §03 "Bool"'s
+        // promotion sentence does not reach it and a boolean vector's running max
+        // is a boolean vector. `SameAsArg(0)` is therefore exact on every element
+        // kind, and `cumsum`/`cumprod`'s carve-out in `ops::call_rule` has no
+        // counterpart here (`crates/infer/tests/order_statistics.rs` pins it).
+        Builtin(name: "cummax",       sig: Function(params: [Any], names: ["xs"],      result: SameAsArg(0))),
+        Builtin(name: "cummin",       sig: Function(params: [Any], names: ["xs"],      result: SameAsArg(0))),
         // real(x) = Re(x), imag(x) = Im(x): real-valued, shape-preserving (spec §07).
         Builtin(name: "real",         sig: Function(params: [Any], names: ["x"],      result: RealOfArgShape(0))),
         Builtin(name: "imag",         sig: Function(params: [Any], names: ["x"],      result: RealOfArgShape(0))),
@@ -333,6 +359,12 @@ Catalogue(
         Builtin(name: "lor",      sig: Function(params: [Scalar(Boolean), Scalar(Boolean)], names: ["a", "b"], result: Scalar(Boolean))),
         Builtin(name: "lnot",     sig: Function(params: [Scalar(Boolean)], names: ["a"],                  result: Scalar(Boolean))),
         Builtin(name: "lxor",     sig: Function(params: [Scalar(Boolean), Scalar(Boolean)], names: ["a", "b"], result: Scalar(Boolean))),
+        // §07 "Boolean reductions": `lany | xs`, `lall | xs` over "boolean
+        // arrays" — the `lor`- and `land`-reduction of the input. The result is
+        // boolean whatever the operand's shape, so no structural rule is needed
+        // for the ARRAY form; the TABLE form is `ops::table_reduction_type`'s.
+        Builtin(name: "lany",     sig: Function(params: [Any], names: ["xs"], result: Scalar(Boolean))),
+        Builtin(name: "lall",     sig: Function(params: [Any], names: ["xs"], result: Scalar(Boolean))),
         // Scalar predicates (spec §07).
         Builtin(name: "isfinite", sig: Function(params: [Any], names: ["x"], result: Scalar(Boolean))),
         Builtin(name: "isinf",    sig: Function(params: [Any], names: ["x"], result: Scalar(Boolean))),
