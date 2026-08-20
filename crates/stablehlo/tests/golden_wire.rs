@@ -495,6 +495,72 @@ outputs = (y)
     );
 }
 
+/// `isfinite`/`isinf` REFUSE a boolean operand, and `isnan` does not.
+///
+/// `stablehlo.abs` is defined over signed integer, float and complex operands,
+/// never over `pred`, so `Emitter::abs` (kind-polymorphic, so it renders the
+/// operand's own kind) would emit `stablehlo.abs %n : tensor<i1>` — a module
+/// IREE rejects outright ("operand #0 must be ranked tensor of … signless
+/// integer or … float or complex …, but got 'tensor<i1>'", measured). §03's
+/// `booleans ⊂ integers ⊂ reals` puts a boolean inside §07's `reals` domain, so
+/// this is a helper that does not cover its head's whole domain, and the head
+/// refuses the uncovered corner rather than emitting text that cannot compile.
+///
+/// `isnan` keeps lowering: it returns before the `abs`, and `compare NE` over
+/// `tensor<i1>` is legal and answers `false` — a boolean is never NaN. One test
+/// covers both halves so the asymmetry stays deliberate and cannot be
+/// "tidied up" in either direction.
+///
+/// An `Int` operand is NOT refused either — `stablehlo.abs` is defined over
+/// signed integers, verified by execution.
+#[test]
+fn isfinite_and_isinf_refuse_a_boolean_operand_but_isnan_does_not() {
+    for head in ["isfinite", "isinf"] {
+        let src =
+            format!("x = elementof(reals)\ny = {head}(lt(x, 1.0))\ninputs = (x)\noutputs = (y)\n");
+        let msg = emit_err(&src);
+        assert!(
+            msg.contains("isfinite/isinf") && msg.contains("stablehlo.abs"),
+            "`{head}` over a boolean: unexpected message: {msg}"
+        );
+    }
+
+    let out = emit("x = elementof(reals)\ny = isnan(lt(x, 1.0))\ninputs = (x)\noutputs = (y)\n");
+    assert!(
+        out.contains("stablehlo.compare NE, %1, %1 : (tensor<i1>, tensor<i1>) -> tensor<i1>"),
+        "isnan over a boolean stays legal — no abs, and an i1 self-inequality parses:\n{out}"
+    );
+    assert!(
+        !out.contains("stablehlo.abs"),
+        "isnan must not reach the abs:\n{out}"
+    );
+
+    // The same boolean operand still reaches `isfinite` through a conversion the
+    // model writes itself, which is what the refusal directs the user to.
+    let via_real = emit(
+        "x = elementof(reals)\ny = isfinite(ifelse(lt(x, 1.0), 1.0, 0.0))\ninputs = (x)\noutputs = (y)\n",
+    );
+    assert!(
+        via_real.contains("stablehlo.abs %4 : tensor<f32>"),
+        "a real-valued operand takes the ordinary path:\n{via_real}"
+    );
+}
+
+/// An INTEGER operand keeps lowering for all three predicates: `stablehlo.abs`
+/// is defined over signed integers, so the `Bool` guard above must not have been
+/// written as a blanket non-`Real` check.
+#[test]
+fn the_finiteness_predicates_still_accept_an_integer_operand() {
+    for head in ["isfinite", "isinf", "isnan"] {
+        let src = format!("n = elementof(integers)\ny = {head}(n)\ninputs = (n)\noutputs = (y)\n");
+        let out = emit(&src);
+        assert!(
+            out.contains("func.func @logdensity(%arg0: tensor<i32>) -> tensor<i1>"),
+            "`{head}` must lower over an integer operand:\n{out}"
+        );
+    }
+}
+
 // ---- §07 linear algebra -------------------------------------------------------
 
 /// A square real matrix and a matching vector as ABI arguments — the operand

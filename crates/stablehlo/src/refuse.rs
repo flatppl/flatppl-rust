@@ -217,6 +217,20 @@
 //!   (`integer`/`floor`/`ceil`/`round`) plus `iszero`, which §07 defines for a
 //!   non-discrete input and which this map still lowers over the same operand.
 //!   A STRING operand never reaches here — `types.rs` refuses it first.
+//! - `isfinite`/`isinf` over a `Bool` operand — "isfinite/isinf: a boolean
+//!   operand has no lowering here — these compose from `stablehlo.abs`, which is
+//!   defined over signed integer, float and complex operands but not over
+//!   `pred` ...". A helper that does not cover its head's whole §07 domain: §03's
+//!   `booleans ⊂ integers ⊂ reals` puts a boolean inside §07's `reals`, but
+//!   `Emitter::abs` is kind-polymorphic and would render
+//!   `stablehlo.abs %n : tensor<i1>`, which IREE rejects outright. An `Int`
+//!   operand is NOT refused — `stablehlo.abs` is defined over signed integers
+//!   (executed). `isnan` is NOT refused either, and the asymmetry is deliberate:
+//!   it returns before the `abs`, and `compare NE` over `tensor<i1>` is legal and
+//!   answers `false`, which is right. The `abs` HEAD has the same hole
+//!   (`abs(lt(x, 1.0))` fails identically at base) — pre-existing, carded
+//!   separately; widening `Emitter::abs` to convert a `Bool` operand up would
+//!   close both corners and retire this guard.
 //! - `land`/`lor`/`lxor`/`lnot` whose operand is not a boolean-producing call —
 //!   "<head> operand must be a boolean predicate (in/compare/lt/gt/le/ge/land/
 //!   lor/lxor/lnot/iszero/equal/unequal/isfinite/isinf/isnan)". Shared with

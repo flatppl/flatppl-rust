@@ -1754,10 +1754,30 @@ enum Finiteness {
 /// - `isfinite(x)` is `abs(x) < inf`, false for ±∞ AND false for NaN (an
 ///   unordered comparison is false), which is exactly §07's "not ±∞, not NaN".
 ///
-/// An `Int` or `Bool` operand takes the same path: [`Emitter::compare`] widens
-/// it to the float dtype exactly (§03 `booleans ⊂ integers ⊂ reals`), where
-/// `isfinite` is `true` and the other two `false` — the right answers for a
-/// value family with no infinities.
+/// An `Int` operand takes the same path: `stablehlo.abs` is defined over signed
+/// integers, and [`Emitter::compare`] then widens the result to the float dtype
+/// exactly (§03 `booleans ⊂ integers ⊂ reals`), so `isfinite` is `true` and the
+/// other two `false` — the right answers for a value family with no infinities.
+/// Verified by execution at `{0, 5, -7, i32::MAX}`.
+///
+/// A `Bool` operand is REFUSED for `isfinite`/`isinf`, and the asymmetry with
+/// `isnan` is real rather than an oversight. `stablehlo.abs` is defined over
+/// signed integer, float and complex operands, never over `pred`, so
+/// [`Emitter::abs`] — kind-polymorphic, so it renders the operand's own kind —
+/// emits `stablehlo.abs %n : tensor<i1>`, which IREE rejects outright
+/// ("operand #0 must be ranked tensor of … signless integer or … float or
+/// complex …, but got 'tensor<i1>'"). §03's `booleans ⊂ integers ⊂ reals` does
+/// put a boolean inside §07's `reals` domain, so this is a helper that does not
+/// cover its head's whole domain, and the head refuses the uncovered corner
+/// rather than emitting a module that cannot compile. `isnan` is unaffected: it
+/// returns before the `abs`, and `stablehlo.compare NE` over `tensor<i1>` is
+/// legal (compiles, and answers `false` — a boolean is never NaN, which is
+/// right).
+///
+/// The `abs` head itself has the same hole (`abs(lt(x, 1.0))` fails identically
+/// at base), which is PRE-EXISTING and carded separately; widening
+/// [`Emitter::abs`] to convert a `Bool` operand up would close this corner and
+/// that one together, and is the better long-term fix than this guard.
 fn lower_finiteness(
     e: &mut Emitter,
     id: NodeId,
@@ -1768,6 +1788,17 @@ fn lower_finiteness(
     let a = e.lower_node(a_id)?;
     if matches!(which, Finiteness::Nan) {
         return Ok(e.compare("NE", &a, &a));
+    }
+    if a.elem == ElemKind::Bool {
+        return Err(EmitError::at(
+            id,
+            "isfinite/isinf: a boolean operand has no lowering here — these compose from \
+             `stablehlo.abs`, which is defined over signed integer, float and complex operands \
+             but not over `pred`, so an `i1` operand would emit a module the target rejects. \
+             §03's `booleans ⊂ integers ⊂ reals` does put a boolean in §07's domain, so convert \
+             to reals first; `isnan` needs no conversion (it has no `abs`) and answers `false`, \
+             since a boolean is never NaN",
+        ));
     }
     let mag = e.abs(&a);
     let inf = e.inf(mag.ty.clone());
