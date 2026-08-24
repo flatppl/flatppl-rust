@@ -258,3 +258,63 @@ fn hs3_convert_emits_banner_and_compat() {
         "flatppl_compat must persist and lead under --no-header, got:\n{text}"
     );
 }
+
+/// An HS3 `generic_function` comparing an UNBINNED DATASET against a scalar.
+///
+/// The converter's own sweep once concluded that "nothing in the repo emits a bare
+/// comparison whose operand could be an array", on the premise that a
+/// `generic_function`'s free identifiers are all scalar observables or parameters.
+/// The premise is false: `data.rs` binds each unbinned dataset as `table(<col> =
+/// [...])`, and `expr.rs`'s identifier arm resolves any other name to an
+/// unconstrained self-reference, so this document converts CLEAN and its
+/// `cmpf = unb > 1.0` compares a 3-row table against a scalar.
+///
+/// `infer` used to type that `(%scalar boolean)` in silence. It must refuse. The
+/// conversion itself is deliberately still expected to SUCCEED — the converter
+/// transcribes the source document, and the scalar-domain rule is `infer`'s to
+/// enforce.
+#[cfg(feature = "infer")]
+#[test]
+fn a_generic_function_comparing_an_unbinned_dataset_is_refused_by_infer() {
+    let dir = std::env::temp_dir();
+    let inp = dir.join("hs3_table_cmp.json");
+    let flat = dir.join("hs3_table_cmp.flatppl");
+    let pir = dir.join("hs3_table_cmp.flatpir");
+    std::fs::write(
+        &inp,
+        r#"{"data":[{"axes":[{"name":"x","value":1.27}],
+                    "entries":[[1.27],[2.5],[3.5]],"name":"unb","type":"unbinned"}],
+            "functions":[{"name":"cmpf","type":"generic_function","expression":"unb > 1.0"}]}"#,
+    )
+    .unwrap();
+    let status = Command::new(env!("CARGO_BIN_EXE_flatppl"))
+        .args([
+            "convert",
+            "--from",
+            "hs3",
+            inp.to_str().unwrap(),
+            flat.to_str().unwrap(),
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success(), "the document must still convert");
+    let text = std::fs::read_to_string(&flat).unwrap();
+    assert!(
+        text.contains("cmpf = unb > 1.0") && text.contains("unb = table(x = [1.27, 2.5, 3.5])"),
+        "the table-versus-scalar comparison must be what is emitted, got:\n{text}"
+    );
+
+    let out = Command::new(env!("CARGO_BIN_EXE_flatppl"))
+        .args(["infer", flat.to_str().unwrap(), pir.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "infer must refuse the emitted module"
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("`gt` expects scalar operands") && err.contains("1-column table"),
+        "infer must name the table operand, got:\n{err}"
+    );
+}

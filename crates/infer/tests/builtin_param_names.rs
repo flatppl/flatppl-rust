@@ -42,14 +42,19 @@ fn mismatched(builtin: &str) -> Vec<String> {
 /// The names §04's single-input carve-out exempts (flatppl-design#78) — they take the
 /// aggregate WHOLE, so no splat and no name check applies to them. `prod`, `maximum`,
 /// `minimum` join the original nine by design PR #79 (owner-merge pending as of this
-/// change), which extends §07's Table reductions paragraph to those three.
+/// change), which extends §07's Table reductions paragraph to those three; `lany`, `lall`
+/// and `median` join by the `missing-reductions` spec draft (flatppl-design `ee4c6fb`),
+/// which extends the same paragraph again.
 const EXEMPT: &[&str] = &[
     "identity",
     "indicesof",
     "indicesof0",
+    "lall",
+    "lany",
     "lengthof",
     "maximum",
     "mean",
+    "median",
     "minimum",
     "prod",
     "reverse",
@@ -122,7 +127,10 @@ fn column_order_is_irrelevant_once_binding_is_by_name() {
 /// 2-column table. **Only the `#78`-exempt names may still accept it** — the variadic
 /// carve-out that used to appear here is closed (`variadic_splat.rs`), so this sweep is now
 /// exhaustive over the B76 finding set with no exceptions beyond the carve-out. `EXEMPT` grew
-/// from nine to twelve when design PR #79 added `prod`/`maximum`/`minimum`.
+/// from nine to twelve when design PR #79 added `prod`/`maximum`/`minimum`, and to fifteen
+/// when the `missing-reductions` draft added `median`/`lany`/`lall` — the same fifteen the js
+/// engine's `SPLAT_EXEMPT_BUILTINS` now carries. `quantile` is NOT here: it takes two inputs,
+/// so §04's arity half excludes it whatever its domain.
 #[test]
 fn no_builtin_accepts_a_name_mismatched_splat_except_the_exempt_set() {
     let cat = builtin_catalogue();

@@ -214,6 +214,15 @@ pub(crate) fn call_rule(
         "rowstack" => rowstack_type(arg_ty(args, 0)),
         "get" => get_type(inf, args, /*base=*/ 1),
         "get0" => get_type(inf, args, /*base=*/ 0),
+        // §07 gives every comparison ("Operator-equivalent functions") and every
+        // logical connective ("Logic and conditionals") a SCALAR domain, so a
+        // non-scalar operand has no §07 meaning — see [`refuse_nonscalar_operand`],
+        // which is where the citations live.
+        "equal" | "unequal" | "lt" | "le" | "gt" | "ge" | "land" | "lor" | "lxor" | "lnot"
+            if nonscalar_operand(args, named).is_some() =>
+        {
+            refuse_nonscalar_operand(inf, id, &name, args, named)
+        }
         "indicesof" | "indicesof0" => Type::Array {
             shape: Box::new([Dim::Dynamic]),
             elem: Box::new(Type::Scalar(ScalarType::Integer)),
@@ -221,9 +230,10 @@ pub(crate) fn call_rule(
         // §07 "Table reductions": applied to a TABLE these reduce column-wise to a
         // record. Guarded so every non-table argument keeps the arm it had —
         // `sum`/`mean`/`prod` the array rule just below, `var`/`std` their catalogue
-        // row (`result: Scalar(Real)`), `maximum`/`minimum` their catalogue row
-        // (`ElemScalarKind`), each via the `_` arm. See [`table_reduction_type`].
-        "sum" | "mean" | "var" | "std" | "prod" | "maximum" | "minimum"
+        // row (`result: Scalar(Real)`), `maximum`/`minimum`/`median`/`lany`/`lall`
+        // their catalogue row, each via the `_` arm. See [`table_reduction_type`].
+        "sum" | "mean" | "var" | "std" | "prod" | "maximum" | "minimum" | "median" | "lany"
+        | "lall"
             if matches!(arg_ty(args, 0), Some(Type::Table { .. })) =>
         {
             table_reduction_type(&name, arg_ty(args, 0))
@@ -305,11 +315,11 @@ pub(crate) fn call_rule(
         // scalar (e.g. `aggregate(sum, [], A[.i]*B[.i])`). A non-literal axis
         // list leaves the rank unknown → defer.
         "aggregate" | "metricsum" => {
-            let elem = Type::Scalar(
+            let elem = Type::Scalar(aggregate_result_kind(inf, args).unwrap_or_else(|| {
                 arg_ty(args, 2)
                     .and_then(elem_scalar_kind_of)
-                    .unwrap_or(ScalarType::Real),
-            );
+                    .unwrap_or(ScalarType::Real)
+            }));
             match args.get(1).and_then(|a| output_axis_names(inf, a.0)) {
                 // No output axes → full contraction → scalar.
                 Some(axes) if axes.is_empty() => elem,
@@ -1274,6 +1284,126 @@ fn build_table(inf: &mut Inferencer<'_, '_>, cols: &[(Symbol, &Type, NodeId)]) -
 /// does NOT invent that identity semantics, since the ruling could go either
 /// way. It refuses with a location diagnostic instead, pending the ruling
 /// (`TODO-flatppl-rust.md`).
+/// True iff `t` is an array or a transposed vector — the shapes §07's comparison
+/// rows do not admit under any calling convention.
+fn is_array_like(t: &Type) -> bool {
+    matches!(t, Type::Array { .. } | Type::TVector { .. })
+}
+
+/// The first operand of a comparison or a logical connective whose shape §07's
+/// scalar domains do not admit, if any.
+///
+/// An array or a transposed vector never has a scalar reading. A `Table` counts only
+/// when the call supplies more than the one positional argument §04 "Calling
+/// conventions" splats — "Auto-splatting is shallow and occurs only when a record or
+/// table is the call's sole argument" — so `gt(t, 1.0)` compares the table itself and
+/// is refused, while `gt(table(a = x, b = y))` splats to `gt(a = x, b = y)` and its
+/// operands are the columns, not the table.
+///
+/// A `Record` operand is still accepted, and the splat that carries ARRAY columns
+/// into a scalar row (`gt(table(a = v1, b = v2))`) is still silent. Both are the same
+/// class as this refusal and neither is fixed here — recorded in
+/// `flatppl-dev/TODO-flatppl-rust.md` rather than argued away.
+fn nonscalar_operand(args: &[ArgInfo], named: &[NamedInfo]) -> Option<Type> {
+    let splatting = named.is_empty() && args.len() == 1;
+    args.iter()
+        .map(|(_, t, _)| t)
+        .chain(named.iter().map(|(_, _, t, _)| t))
+        .find(|t| is_array_like(t) || (!splatting && matches!(t, Type::Table { .. })))
+        .cloned()
+}
+
+/// A short phrase naming a [`nonscalar_operand`] shape, for
+/// [`refuse_nonscalar_operand`]'s message. `Type` has no `Display`, and the rank is
+/// the part of the shape that makes the refusal legible.
+fn nonscalar_shape_phrase(t: &Type) -> String {
+    match t {
+        Type::Array { shape, .. } => format!("a rank-{} array", shape.len()),
+        Type::TVector { .. } => "a transposed vector".to_string(),
+        Type::Table { columns, .. } => format!("a {}-column table", columns.len()),
+        _ => "a non-scalar".to_string(),
+    }
+}
+
+/// A non-scalar operand to `equal`/`unequal`/`lt`/`le`/`gt`/`ge` or to
+/// `land`/`lor`/`lxor`/`lnot`.
+///
+/// §07 "Operator-equivalent functions" gives the comparison rows the domains
+/// `reals` (`lt`, `le`, `gt`, `ge`) and "`integers`, `booleans`, strings"
+/// (`equal`, `unequal`) — all SCALAR value-sets, where the `add`/`sub` rows in the
+/// SAME table read "scalars or arrays of same shape". The contrast is deliberate and
+/// visible side by side, so a comparison has no array domain to lower. §05 "Excluded
+/// constructs" states the general rule from the other direction — "**No implicit
+/// operator broadcasting.**" — and names `broadcast` and the dotted operators as the
+/// elementwise route. (§05's bullet enumerates only the arithmetic operators, so §07's
+/// Domains column is the load-bearing citation here, not that bullet's examples.)
+///
+/// §07 "Logic and conditionals" gives `land`, `lor`, `lxor` and `lnot` the domain
+/// `booleans` — the same kind of scalar value-set, in a table whose only other row
+/// (`ifelse`) spells its `anything` domain out. §05's broadcasting bullet does not
+/// enumerate them, so the Domains column carries this refusal on its own.
+///
+/// This was accepted before, and the leniency was not harmless: `infer` typed
+/// `gt(v, 3.0)` over a length-3 `v` as `Scalar(Boolean)` — a scalar — while the
+/// StableHLO emitter broadcast the same node and emitted
+/// `func.func @logdensity(%arg0: tensor<3xf32>) -> tensor<3xi1>`. The declared type
+/// and the emitted ABI disagreed on the result's SHAPE, with no diagnostic on either
+/// side. The connectives reached the same disagreement one step later:
+/// `ifelse(lnot(gt.(v, 3.0)), 1.0, 2.0)` typed `Scalar(Real)` over an operand typed a
+/// `[3]` boolean array, and the whole log-density compiled rank-lifted to
+/// `tensor<3xf32>`, exit 0. The emitter's predicate gate cannot catch that — the four
+/// connectives are `PREDICATE_HEADS` entries by design. Refusing statically closes
+/// every half at once.
+///
+/// The diagnostic names the dotted form, which is the working route: `gt.(v, 3.0)`,
+/// `v .> 3.0` and `broadcast(gt, v, 3.0)` all reach [`broadcast_type`]'s elementwise
+/// arm and type a boolean array of `v`'s shape. A TABLE operand has no dotted route,
+/// so its message names §03's column access instead.
+fn refuse_nonscalar_operand(
+    inf: &mut Inferencer<'_, '_>,
+    id: NodeId,
+    name: &str,
+    args: &[ArgInfo],
+    named: &[NamedInfo],
+) -> Type {
+    let offender = nonscalar_operand(args, named).unwrap_or(Type::Deferred);
+    let citation = if matches!(name, "land" | "lor" | "lxor" | "lnot") {
+        "spec §07 \"Logic and conditionals\" gives the logical operators the scalar \
+         domain `booleans`"
+            .to_string()
+    } else {
+        "spec §07 \"Operator-equivalent functions\" gives the comparisons the scalar \
+         domains `reals` and `integers`/`booleans`/strings, where `add`/`sub` in the \
+         same table read \"scalars or arrays of same shape\", and §05 \"Excluded \
+         constructs\" states \"No implicit operator broadcasting\""
+            .to_string()
+    };
+    let remedy = if matches!(offender, Type::Table { .. }) {
+        "Select a column and compare it elementwise instead — §03 \"Indexing\" gives \
+         column access as `t.colname` — which gives a boolean array of the column's \
+         length"
+            .to_string()
+    } else {
+        let dotted = if name == "lnot" {
+            format!("`{name}.(a)`")
+        } else {
+            format!("`{name}.(a, b)`")
+        };
+        format!(
+            "Apply it elementwise instead — {dotted}, or the dotted operator — which \
+             gives a boolean array of the operand's shape"
+        )
+    };
+    inf.diags.push(crate::Diagnostic::error_at(
+        id,
+        format!(
+            "`{name}` expects scalar operands, got {}: {citation}. {remedy}",
+            nonscalar_shape_phrase(&offender)
+        ),
+    ));
+    Type::Failed(format!("`{name}` applied to a non-scalar operand").into())
+}
+
 fn refuse_same_kind_constructor(inf: &mut Inferencer<'_, '_>, id: NodeId, name: &str) -> Type {
     inf.diags.push(crate::Diagnostic::error_at(
         id,
@@ -1355,12 +1485,54 @@ fn rowstack_type(a: Option<&Type>) -> Type {
 ///   (§07's domain for `mean` is "real/complex arrays"). This is arithmetic, so it
 ///   outranks both the previous code and any convenience of keeping the element type.
 /// - `var`/`std` — real, matching their catalogue rows and their "real arrays" domain.
+/// - `lany`/`lall` — `Boolean`, whatever the column's element kind. §07 "Boolean
+///   reductions" gives both the domain "boolean arrays" and describes each as a
+///   truth value ("`true` if at least one element of `xs` is `true`"), and
+///   `lor`/`land` are closed on `booleans`. Nothing is promoted: unlike `sum`, a
+///   disjunction is not arithmetic, so §03 "Bool"'s promotion sentence does not
+///   reach it.
+/// - `median` — `Real`, matching its catalogue row and for the reason recorded
+///   there: §07 averages two order statistics at even $n$, so `median([1, 2])` is
+///   `1.5`.
 fn reduced_scalar(head: &str, elem: ScalarType) -> ScalarType {
     match (head, elem) {
         ("sum" | "prod", ScalarType::Boolean) => ScalarType::Integer,
         ("sum" | "prod" | "maximum" | "minimum", e) => e,
+        ("lany" | "lall", _) => ScalarType::Boolean,
         ("mean", ScalarType::Complex) => ScalarType::Complex,
         _ => ScalarType::Real,
+    }
+}
+
+/// The element kind of an `aggregate(f_reduction, output_axes, body)` result when
+/// `f_reduction` fixes it REGARDLESS of the body's element kind — `None` when the
+/// body's kind is the answer.
+///
+/// §04 "Multi-axis aggregation" makes the result "an array of the shape declared by
+/// `output_axes`" whose entries are `f_reduction` applied to the contracted slice.
+/// So the entry type is whatever that reduction gives, which for three of §04's ten
+/// eligible built-ins is not the body's own kind:
+///
+/// - `median` — real even over an integer body, for [`reduced_scalar`]'s reason.
+/// - `lany`/`lall` — boolean whatever the body was; §07 "Boolean reductions" gives
+///   both a truth value.
+///
+/// `mean`, `var` and `std` have the SAME mismatch (all three are real-valued over an
+/// integer body) and are deliberately not listed: fixing them changes an
+/// already-shipped type on a construct outside this batch. Recorded in
+/// `flatppl-dev/TODO-flatppl-rust.md`, alongside the `sum` divergence
+/// `stablehlo::Emitter::reduce_trailing_axes` documents from the other side. Every
+/// axis-indexed body types `%deferred`, so the fallback lands on `Real` and the
+/// three are right on the common case; only a genuinely integer-typed body
+/// (`indicesof(...)`) surfaces it.
+fn aggregate_result_kind(inf: &Inferencer<'_, '_>, args: &[ArgInfo]) -> Option<ScalarType> {
+    let Node::Const(op) = inf.module.node(args.first()?.0) else {
+        return None;
+    };
+    match inf.module.resolve(*op) {
+        "median" => Some(ScalarType::Real),
+        "lany" | "lall" => Some(ScalarType::Boolean),
+        _ => None,
     }
 }
 
@@ -1424,10 +1596,10 @@ fn reduce_type(head: &str, a: Option<&Type>) -> Type {
 }
 
 /// The result of a §07 **Table reductions** call: "When `sum`, `mean`, `var`,
-/// `std`, `prod`, `maximum`, or `minimum` is applied to a table, the reduction
-/// operates column-wise and returns a record whose fields are the column names
-/// and values are the per-column reductions." So the result is a `Record` with
-/// one field per column, named for the column.
+/// `std`, `prod`, `maximum`, `minimum`, `median`, `lany`, or `lall` is applied to a
+/// table, the reduction operates column-wise and returns a record whose fields are
+/// the column names and values are the per-column reductions." So the result is a
+/// `Record` with one field per column, named for the column.
 ///
 /// `std` is in the set by the owner ruling of 2026-08-10 which adds it to that
 /// paragraph (flatppl-design `4c93237`). **That commit is NOT on design `main`** — it
@@ -1436,6 +1608,9 @@ fn reduce_type(head: &str, a: Option<&Type>) -> Type {
 /// the set by design PR #79 (owner-merge pending as of this change), which extends
 /// the same paragraph to those three; the engine work lands ahead of the spec merge
 /// per the owner's ruling, with the spec gap recorded in `flatppl-dev`.
+/// `median`, `lany` and `lall` are in the set by the `missing-reductions` spec draft
+/// (flatppl-design `ee4c6fb`), quoted above; that branch is likewise unmerged, and
+/// this engine work lands ahead of it under the same ruling.
 ///
 /// The per-column value is whatever that reduction gives for an array of the
 /// column's element type, so the two forms agree by construction rather than by a
@@ -1444,9 +1619,16 @@ fn reduce_type(head: &str, a: Option<&Type>) -> Type {
 /// - `sum`/`mean`/`prod`/`maximum`/`minimum` — the column's own element type,
 ///   mirroring [`reduce_type`]'s array arm (so a complex column sums to complex)
 ///   and, for `maximum`/`minimum`, the catalogue row's `ElemScalarKind` result.
-/// - `var`/`std` — `Scalar(Real)`, mirroring their catalogue row's declared
-///   `result: Scalar(Real)` / `result_set: NonNegReals`, which is what they give for
-///   an array of any element type.
+/// - `var`/`std`/`median` — `Scalar(Real)`, mirroring their catalogue row's declared
+///   `result: Scalar(Real)`, which is what they give for an array of any element
+///   type.
+/// - `lany`/`lall` — `Scalar(Boolean)`, likewise from their catalogue row.
+///
+/// §07 also states "Every column must support the reduction operation", which this
+/// does NOT check: `median` over a boolean column and `lany` over a real column both
+/// type without complaint. The gap is pre-existing for `maximum`/`minimum` over a
+/// boolean column, the three new heads inherit it, and closing it needs a per-head
+/// domain table §07 does not spell out — recorded in `flatppl-dev/TODO-flatppl-rust.md`.
 ///
 /// A column whose per-row type is NOT a scalar (a vector-valued column) leaves the
 /// whole call `%deferred`. §07 says only "Every column must support the reduction
@@ -4506,6 +4688,20 @@ fn broadcast_type(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo], named: &[Named
             | "cos" | "tan" | "tanh",
             [a],
         ) => real_or_complex(Some(a)),
+        // The comparisons and the logical connectives, whose per-cell result is a
+        // boolean whatever the cell kinds were (their catalogue rows all declare
+        // `result: Scalar(Boolean)`). This is the ONLY route §07 gives an
+        // elementwise comparison — its own Domains column is scalar-only, which
+        // `refuse_nonscalar_operand` now enforces — so `v .> 3.0`, `gt.(v, w)` and
+        // `broadcast(gt, v, 3.0)` are how a mask is built, and the mask is what
+        // §07 "Boolean reductions" hands `lany`/`lall`. Before this the whole
+        // dotted family typed `%deferred`, which left that refusal naming a route
+        // with no type.
+        (
+            "equal" | "unequal" | "lt" | "le" | "gt" | "ge" | "land" | "lor" | "lxor" | "lnot"
+            | "in" | "isfinite" | "isinf" | "isnan" | "iszero",
+            [_] | [_, _],
+        ) => Type::Scalar(ScalarType::Boolean),
         _ => return Type::Deferred,
     };
     Type::Array {
@@ -5571,8 +5767,10 @@ pub(crate) fn call_valueset(
         // `function_valueset` computes a scalar set from `ElemScalarKind` against
         // the table argument directly, ignoring the record type — so they need the
         // arm too, unlike the Structural trio.
+        // `median`/`lany`/`lall` are `Function` rows too, so they need the arm for
+        // the `maximum`/`minimum` reason.
         // Mirrors [`table_reduction_type`] arm for arm.
-        "sum" | "mean" | "var" | "std" | "maximum" | "minimum"
+        "sum" | "mean" | "var" | "std" | "maximum" | "minimum" | "median" | "lany" | "lall"
             if matches!(arg_ty(args, 0), Some(Type::Table { .. })) =>
         {
             table_reduction_valueset(&name, arg_ty(args, 0))

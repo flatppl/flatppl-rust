@@ -2411,26 +2411,151 @@ impl<'m> Emitter<'m> {
     /// [`Emitter::bool_const`]); panics on a non-rank-1 operand (an internal
     /// invariant violation, mirroring the other shape-typed helpers).
     pub fn reduce_all(&mut self, a: &Value) -> Value {
-        match &a.ty {
-            MlirTy::Ranked(dims) if dims.len() == 1 => {}
-            other => panic!("reduce_all expects a rank-1 (boolean vector) operand, got {other:?}"),
-        }
-        let operand_ty = render_i1(&a.ty);
-        let scalar_i1 = render_i1(&MlirTy::Scalar);
-        let init_ssa = self.fresh();
-        self.push(&format!(
-            "{init_ssa} = stablehlo.constant dense<true> : {scalar_i1}"
-        ));
-        let ssa = self.fresh();
-        self.push(&format!(
-            "{ssa} = stablehlo.reduce({} init: {init_ssa}) applies stablehlo.and across dimensions = [0] : ({operand_ty}, {scalar_i1}) -> {scalar_i1}",
-            a.ssa
-        ));
+        let all = self.reduce_boolean("stablehlo.and", "true", a);
+        // The rejection loop's condition consumes this through
+        // [`Emitter::not`]/[`Emitter::and`], which render `i1` from the SHAPE and
+        // ignore `elem`. Its callers were written against the `Real` placeholder
+        // every other internal predicate carries ([`Emitter::bool_const`]), so the
+        // kind is restored rather than propagated — a §07 `lall` needs `Bool`
+        // (its return type is the module's), an internal flag does not.
         Value {
-            ssa,
-            ty: MlirTy::Scalar,
             elem: ElemKind::Real,
+            ..all
         }
+    }
+
+    /// Reduce EVERY axis of a boolean (`i1`) tensor to a scalar `i1` with
+    /// `combine_op` and `identity_lit` — spec §07 "Boolean reductions" `lany`
+    /// (`stablehlo.or` / `false`) and `lall` (`stablehlo.and` / `true`).
+    ///
+    /// A GENUINE boolean reduction, and the reason it does not route through
+    /// [`Emitter::reduce_axis`]: that method PROMOTES an `i1` operand to `Int`
+    /// first, because on `i1` `stablehlo.add` is a wrapping 1-bit add (parity) and
+    /// `stablehlo.multiply` a conjunction, so §07's `sum` and `prod` cannot be
+    /// computed there. `lany`/`lall` are the opposite case — §07 defines them AS
+    /// the disjunction and the conjunction, `booleans` is closed under both, and
+    /// §03 "Bool"'s promotion sentence covers "arithmetic contexts", which a truth
+    /// value is not. So `i1` is the correct width and promoting would be the bug.
+    ///
+    /// The result carries [`ElemKind::Bool`], so [`Emitter::finish`] renders the
+    /// module's return type `tensor<i1>` — agreeing with the `Scalar(Boolean)`
+    /// `infer` types the call. Rank-agnostic: §07's domain is "boolean arrays", and
+    /// each axis is reduced in turn like [`Emitter::reduce_full`].
+    pub(crate) fn reduce_boolean(
+        &mut self,
+        combine_op: &str,
+        identity_lit: &str,
+        a: &Value,
+    ) -> Value {
+        let rank = match &a.ty {
+            MlirTy::Ranked(dims) => dims.len(),
+            other => panic!("reduce_boolean expects a ranked operand, got {other:?}"),
+        };
+        let scalar_i1 = render_i1(&MlirTy::Scalar);
+        let mut cur = Value {
+            ssa: a.ssa.clone(),
+            ty: a.ty.clone(),
+            elem: ElemKind::Bool,
+        };
+        for _ in 0..rank {
+            let init_ssa = self.fresh();
+            self.push(&format!(
+                "{init_ssa} = stablehlo.constant dense<{identity_lit}> : {scalar_i1}"
+            ));
+            let operand_ty = render_i1(&cur.ty);
+            let mut dims = match &cur.ty {
+                MlirTy::Ranked(dims) => dims.clone(),
+                other => panic!("reduce_boolean lost its shape: {other:?}"),
+            };
+            dims.remove(0);
+            let result_ty = if dims.is_empty() {
+                MlirTy::Scalar
+            } else {
+                MlirTy::Ranked(dims)
+            };
+            let result_ty_text = render_i1(&result_ty);
+            let ssa = self.fresh();
+            self.push(&format!(
+                "{ssa} = stablehlo.reduce({} init: {init_ssa}) applies {combine_op} across dimensions = [0] : ({operand_ty}, {scalar_i1}) -> {result_ty_text}",
+                cur.ssa
+            ));
+            cur = Value {
+                ssa,
+                ty: result_ty,
+                elem: ElemKind::Bool,
+            };
+        }
+        cur
+    }
+
+    /// A prefix scan whose combine is `maximum` or `minimum` — spec §07
+    /// "Cumulative operations" `cummax`/`cummin`, one
+    /// [`Emitter::prefix_scan`] over the window this method seeds.
+    ///
+    /// The seed is the combine's IDENTITY, so the `n - 1` padded positions in
+    /// window `i` contribute nothing and `result[i]` is the extremum of
+    /// `a[0..=i]` alone — the first element falls out of the window shape, with no
+    /// first-element special case. Verified by execution rather than argued:
+    /// `cummax([3, 1, 7, 5])` is `[3, 3, 7, 7]` and `cummax([-3, -7, -1, -5])` is
+    /// `[-3, -3, -1, -1]`, so the `-inf` pad never surfaces, and
+    /// `cummax([NaN, 1, 2, 3])` is `[NaN, NaN, NaN, NaN]` — `stablehlo.maximum`
+    /// PROPAGATES NaN, which `maximum(-inf, NaN)` returning NaN is what makes the
+    /// pad invisible there too. (`accumulate(max, ·)` in Julia agrees on all
+    /// three, including mid-input NaN: `cummax([1, NaN, 2])` is `[1, NaN, NaN]`.)
+    ///
+    /// The `Real` identities are the very literals
+    /// [`Emitter::reduce_trailing_axes`]'s `Max`/`Min` arms use, so the reduce and
+    /// the scan cannot disagree about what `-inf` is spelled as. `Int` gets the
+    /// type's extreme value instead: over the integers `maximum` has no ±inf, and
+    /// `infer`'s `SameAsArg(0)` row types `cummax` of an integer vector an INTEGER
+    /// vector, so widening to reals would make the emitted return type disagree
+    /// with the inferred one.
+    ///
+    /// A `Bool` operand REFUSES. §03's `booleans ⊂ integers ⊂ reals` puts it in
+    /// §07's "real vectors", and `max`/`min` over booleans are exactly `lor`/`land`
+    /// — but IREE 3.11 cannot compile ANY `i1` `reduce_window` region: the combine
+    /// fails to legalize with "'arith.ori' op requires the same type for all
+    /// operands and results" (probed at `stablehlo.or`, `stablehlo.and` and
+    /// `stablehlo.maximum` alike). Promoting to `Int` instead would contradict the
+    /// inferred boolean result type, which is the disagreement
+    /// `infer::ops::refuse_nonscalar_operand` exists to prevent, so this refuses
+    /// and says why.
+    pub(crate) fn prefix_scan_extremum(
+        &mut self,
+        id: NodeId,
+        kind: AxisReduce,
+        a: &Value,
+    ) -> Result<Value, EmitError> {
+        let (op, identity) = match (kind, a.elem, self.dtype) {
+            (AxisReduce::Max, ElemKind::Real, _) => {
+                ("stablehlo.maximum", reduce_max_identity(self.dtype))
+            }
+            (AxisReduce::Min, ElemKind::Real, _) => {
+                ("stablehlo.minimum", pos_inf_literal(self.dtype))
+            }
+            (AxisReduce::Max, ElemKind::Int, Dtype::F32) => ("stablehlo.maximum", "-2147483648"),
+            (AxisReduce::Max, ElemKind::Int, Dtype::F64) => {
+                ("stablehlo.maximum", "-9223372036854775808")
+            }
+            (AxisReduce::Min, ElemKind::Int, Dtype::F32) => ("stablehlo.minimum", "2147483647"),
+            (AxisReduce::Min, ElemKind::Int, Dtype::F64) => {
+                ("stablehlo.minimum", "9223372036854775807")
+            }
+            (kind, elem, _) => {
+                return Err(EmitError::at(
+                    id,
+                    format!(
+                        "the {} scan has no {elem:?} form here: IREE 3.11 cannot compile an `i1` \
+                         `stablehlo.reduce_window` region at all (the combine fails to legalize, \
+                         \"'arith.ori' op requires the same type for all operands and results\"), \
+                         and promoting a boolean operand would contradict the boolean result type \
+                         `infer` gives the call. Convert to integers or reals first",
+                        kind.spec_name()
+                    ),
+                ));
+            }
+        };
+        Ok(self.prefix_scan(op, identity, a))
     }
 
     /// Extract element `index` (a runtime `i32` scalar — see

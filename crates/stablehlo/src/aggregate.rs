@@ -59,9 +59,14 @@ use crate::emitter::{AxisReduce, Emitter, elem_rank};
 use crate::mlir::{ElemKind, MlirTy, Value};
 use crate::refuse::EmitError;
 
-/// §04's eligible `f_reduction`s: "an order-invariant vector-to-scalar
-/// reduction … The eligible built-ins are `sum`, `prod`, `mean`, `var`, `std`,
-/// `maximum` and `minimum`."
+/// The eligible `f_reduction`s this module LOWERS.
+///
+/// §04 "Multi-axis aggregation" requires "an order-invariant vector-to-scalar
+/// reduction" and, as of the `missing-reductions` spec draft (flatppl-design
+/// `ee4c6fb`), lists TEN eligible built-ins: "`sum`, `prod`, `mean`, `var`, `std`,
+/// `maximum`, `minimum`, `median`, `lany` and `lall`". The last three are eligible
+/// and have no lowering here — see [`ELIGIBLE_BUT_UNLOWERED`], which keeps the
+/// refusal from telling the caller they are ineligible when §04 says otherwise.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Reduction {
     Sum,
@@ -234,7 +239,24 @@ pub(crate) fn metricsum_refusal(id: NodeId) -> EmitError {
     )
 }
 
-/// Read the `f_reduction` argument. §04 admits only the seven built-in
+/// §04's eligible `f_reduction`s that this module does NOT lower — a DIFFERENT
+/// refusal from an ineligible name, because telling the caller that `median` "is
+/// not an eligible reduction" would contradict §04.
+///
+/// - `median` — an order statistic, and this crate has no sort. The bare head
+///   refuses for the same reason ([`crate::order::refuse_order_statistic`], which
+///   carries the full argument).
+/// - `lany`/`lall` — a genuine `i1` reduction, and [`Emitter::reduce_trailing_axes`]
+///   has no `and`/`or` combine. Adding one means an `AxisReduce` variant plus a
+///   frame that is NOT widened to the aggregate node's kind, which is the one thing
+///   `crate::aggregate::reduce` does to every frame today. The BARE `lany`/`lall`
+///   lower ([`crate::order::lower_boolean_reduction`]), so only the aggregate
+///   spelling is missing.
+///
+/// Recorded in `flatppl-dev/stablehlo-feature-matrix.md`.
+const ELIGIBLE_BUT_UNLOWERED: &[&str] = &["median", "lany", "lall"];
+
+/// Read the `f_reduction` argument. §04 admits only the ten built-in
 /// order-invariant reductions, named bare — a user function or a reference to a
 /// binding refuses rather than being called elementwise.
 fn read_reduction(e: &Emitter, f_id: NodeId) -> Result<Reduction, EmitError> {
@@ -247,17 +269,29 @@ fn read_reduction(e: &Emitter, f_id: NodeId) -> Result<Reduction, EmitError> {
             ));
         }
     };
-    Reduction::parse(name).ok_or_else(|| {
-        EmitError::at(
+    if let Some(r) = Reduction::parse(name) {
+        return Ok(r);
+    }
+    if ELIGIBLE_BUT_UNLOWERED.contains(&name) {
+        return Err(EmitError::at(
             f_id,
             format!(
-                "aggregate: `{name}` is not an eligible reduction — §04 \"Multi-axis \
-                 aggregation\" requires \"an order-invariant vector-to-scalar reduction\" and \
-                 lists the eligible built-ins as `sum`, `prod`, `mean`, `var`, `std`, `maximum` \
-                 and `minimum`"
+                "aggregate: `{name}` IS an eligible reduction under §04 \"Multi-axis \
+                 aggregation\", but has no lowering in this emitter. The bare `{name}(xs)` \
+                 spelling is the one to check: it lowers for `lany`/`lall` and refuses for \
+                 `median`, and its message says why"
             ),
-        )
-    })
+        ));
+    }
+    Err(EmitError::at(
+        f_id,
+        format!(
+            "aggregate: `{name}` is not an eligible reduction — §04 \"Multi-axis \
+             aggregation\" requires \"an order-invariant vector-to-scalar reduction\" and \
+             lists the eligible built-ins as `sum`, `prod`, `mean`, `var`, `std`, `maximum`, \
+             `minimum`, `median`, `lany` and `lall`"
+        ),
+    ))
 }
 
 /// Read `output_axes` — §04's "axis list of distinct axis names `[.name1,

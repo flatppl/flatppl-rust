@@ -179,6 +179,7 @@ mod mlir;
 mod modes;
 mod norms;
 mod ops;
+mod order;
 mod refuse;
 mod registry;
 mod types;

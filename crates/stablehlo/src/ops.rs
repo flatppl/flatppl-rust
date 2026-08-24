@@ -203,6 +203,25 @@ pub(crate) fn lower_builtin(
         "l2unit" => crate::norms::lower_norm(e, id, args, crate::norms::Norm::L2Unit),
         "softmax" => crate::norms::lower_softmax(e, id, args, crate::norms::Softmax::Plain),
         "logsoftmax" => crate::norms::lower_softmax(e, id, args, crate::norms::Softmax::Log),
+        // §07's boolean reductions, cumulative extrema, infinity norm and order
+        // statistics — `crate::order`, which see for why two of the six refuse.
+        "lany" => crate::order::lower_boolean_reduction(e, id, args, crate::order::BoolReduce::Any),
+        "lall" => crate::order::lower_boolean_reduction(e, id, args, crate::order::BoolReduce::All),
+        "cummax" => {
+            crate::order::lower_cumulative_extremum(e, id, args, crate::emitter::AxisReduce::Max)
+        }
+        "cummin" => {
+            crate::order::lower_cumulative_extremum(e, id, args, crate::emitter::AxisReduce::Min)
+        }
+        "linfnorm" => crate::order::lower_linf_norm(e, id, args),
+        "median" => Err(crate::order::refuse_order_statistic(
+            id,
+            crate::order::OrderStatistic::Median,
+        )),
+        "quantile" => Err(crate::order::refuse_order_statistic(
+            id,
+            crate::order::OrderStatistic::Quantile,
+        )),
         "fill" => lower_fill(e, id, args),
         "get0" => lower_get(e, id, args, 0),
         "get" => lower_get(e, id, args, 1),
@@ -1584,34 +1603,82 @@ fn common_shape(da: &[Option<u64>], db: &[Option<u64>]) -> Vec<Option<u64>> {
 /// operand vocabulary of `ifelse`'s condition and of §07's logical connectives.
 ///
 /// Every entry lowers to an `i1`-typed [`Value`], so the list is exactly "the
-/// boolean-producing heads this map lowers". It does NOT admit a `Bool`-typed
-/// VALUE (a bound boolean, a boolean ABI input), which stays refused as a
-/// separate gap (`flatppl-dev/stablehlo-feature-matrix.md`, prioritized gap 6).
+/// boolean-producing heads this map lowers" — §07's boolean reductions `lany`/`lall`
+/// included, since each lowers to a scalar `tensor<i1>` and is the most natural thing
+/// to condition an `ifelse` on. It does NOT admit a `Bool`-typed VALUE (a bound
+/// boolean, a boolean ABI input), which stays refused as a separate gap
+/// (`flatppl-dev/stablehlo-feature-matrix.md`, prioritized gap 6).
 const PREDICATE_HEADS: &[&str] = &[
     "in", "compare", "lt", "gt", "le", "ge", "land", "lor", "lxor", "lnot", "iszero", "equal",
-    "unequal", "isfinite", "isinf", "isnan",
+    "unequal", "isfinite", "isinf", "isnan", "lany", "lall",
 ];
 
+/// The [`PREDICATE_HEADS`] entries that do NOT lower elementwise, so `broadcast(P, …)`
+/// over them is not a predicate. §07's boolean reductions consume an array and produce
+/// ONE scalar `i1`, so a broadcast of one is not an elementwise lift of anything.
+///
+/// **The reason to refuse is NOT that the map cannot lower it — the map lowers it, and
+/// that is the problem.** `lower_builtin` DISCARDS the `broadcast` wrapper, so
+/// `lany.(b)` emits exactly the bare `lany(b)` reduce while `infer` types it
+/// `%deferred` with no diagnostic. Admitting it here would let an `ifelse` consume a
+/// condition whose broadcast was silently thrown away. This is one instance of a
+/// pre-existing family — `sum.(v)`, `mean.(v)` and `maximum.(v)` all type `%deferred`
+/// and all answer with the undotted reduction's NUMBER, exit 0 — carded separately
+/// (`flatppl-dev/TODO-flatppl-rust.md`). Excluding two heads from one gate does not
+/// close it, and is not meant to.
+const NON_ELEMENTWISE_PREDICATE_HEADS: &[&str] = &["lany", "lall"];
+
 /// An `ifelse` condition / `land` operand must be one of
-/// [`PREDICATE_HEADS`]. Same narrow-and-refuse discipline as `get`/`get0`'s
-/// literal-selector check: checked structurally against the *unlowered* node,
-/// before `lower_node` ever runs on it.
+/// [`PREDICATE_HEADS`], bare or under a `broadcast`. Same narrow-and-refuse
+/// discipline as `get`/`get0`'s literal-selector check: checked structurally
+/// against the *unlowered* node, before `lower_node` ever runs on it.
+///
+/// `broadcast(P, …)` / the dotted spelling counts whenever `P` is an ELEMENTWISE
+/// entry, because that is the ONLY route §07 gives an elementwise comparison:
+/// `infer` refuses a bare `lt(v, w)` over arrays (`ops::refuse_nonscalar_operand`),
+/// so an ARRAY-shaped predicate can now only arrive dotted. It lowers to an `i1`
+/// tensor of the operand's shape — `v1 .< v2` over two `[3]` operands emits
+/// `stablehlo.compare LT … -> tensor<3xi1>` — which is exactly the property this
+/// gate selects for. [`NON_ELEMENTWISE_PREDICATE_HEADS`] is excluded from that arm.
 fn require_predicate_head(e: &Emitter, cond: NodeId, what: &str) -> Result<(), EmitError> {
-    let is_predicate = matches!(
-        e.node(cond),
-        Node::Call(c) if matches!(
-            c.head,
-            CallHead::Builtin(sym) if PREDICATE_HEADS.contains(&e.resolve(sym))
-        )
-    );
+    let head_name = |id: NodeId| match e.node(id) {
+        Node::Call(c) => match c.head {
+            CallHead::Builtin(sym) => Some((e.resolve(sym).to_string(), c.args.to_vec())),
+            _ => None,
+        },
+        _ => None,
+    };
+    let is_predicate = match head_name(cond) {
+        Some((name, args)) if name == "broadcast" || name == "broadcasted" => {
+            args.first().is_some_and(|h| match e.node(*h) {
+                Node::Const(sym) => {
+                    let h = e.resolve(*sym);
+                    PREDICATE_HEADS.contains(&h) && !NON_ELEMENTWISE_PREDICATE_HEADS.contains(&h)
+                }
+                _ => false,
+            })
+        }
+        Some((name, _)) => PREDICATE_HEADS.contains(&name.as_str()),
+        None => false,
+    };
     if is_predicate {
         Ok(())
     } else {
+        // The two clauses must stay separate: naming a boolean reduction as
+        // admissible "under a broadcast" would send the reader back into this
+        // very refusal, since the broadcast spelling is what it rejects.
+        let elementwise: Vec<&str> = PREDICATE_HEADS
+            .iter()
+            .copied()
+            .filter(|h| !NON_ELEMENTWISE_PREDICATE_HEADS.contains(h))
+            .collect();
         Err(EmitError::at(
             cond,
             format!(
-                "{what} must be a boolean predicate ({})",
-                PREDICATE_HEADS.join("/")
+                "{what} must be a boolean predicate ({}), bare or under a broadcast, or \
+                 ({}) bare only",
+                elementwise.join("/"),
+                NON_ELEMENTWISE_PREDICATE_HEADS.join("/")
             ),
         ))
     }
