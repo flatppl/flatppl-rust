@@ -411,9 +411,17 @@ outputs = (o1, o2, o3)
 
 /// The carve-out that keeps the gate honest: a broadcast of a boolean reduction is
 /// NOT a predicate. `broadcast(P, …)` counts only for the ELEMENTWISE heads, because
-/// that arm exists to admit a dotted comparison; `lany` consumes an array and yields
-/// one scalar, so a broadcast of it lifts nothing and the map has no lowering for it
-/// (`infer`'s broadcast cell table leaves it `%deferred`, no diagnostic).
+/// that arm exists to admit a dotted comparison.
+///
+/// The reason is NOT that the map cannot lower `lany.(b)` — it lowers it, DISCARDING
+/// the `broadcast` wrapper, so the dotted spelling silently emits the undotted
+/// reduction while `infer` types it `%deferred` with no diagnostic. Admitting it would
+/// let an `ifelse` consume a condition whose broadcast was thrown away. The wider
+/// family (`sum.(v)`, `mean.(v)`, `maximum.(v)`, which answer with a NUMBER) is carded
+/// in `flatppl-dev/TODO-flatppl-rust.md`, not fixed here.
+///
+/// The message must not name the reduction heads as admissible under a broadcast, or
+/// it sends the reader back into this refusal.
 #[test]
 fn a_broadcast_boolean_reduction_is_not_a_predicate() {
     let err = emit_err(
@@ -427,6 +435,12 @@ outputs = (y)
     assert!(
         err.contains("must be a boolean predicate"),
         "a broadcast `lany` must still refuse: {err}"
+    );
+    // The message must not offer back the spelling it just rejected.
+    assert!(
+        err.contains("(lany/lall) bare only")
+            && !err.contains("lany/lall), bare or under a broadcast"),
+        "the message must say the reduction heads are bare-only: {err}"
     );
 }
 

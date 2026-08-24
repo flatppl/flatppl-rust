@@ -1615,9 +1615,17 @@ const PREDICATE_HEADS: &[&str] = &[
 
 /// The [`PREDICATE_HEADS`] entries that do NOT lower elementwise, so `broadcast(P, …)`
 /// over them is not a predicate. §07's boolean reductions consume an array and produce
-/// ONE scalar `i1`, so a bare call is a predicate while a broadcast of one is not an
-/// elementwise lift of anything — `infer`'s broadcast cell table leaves it
-/// `%deferred`, and this keeps the gate from admitting a shape the map cannot lower.
+/// ONE scalar `i1`, so a broadcast of one is not an elementwise lift of anything.
+///
+/// **The reason to refuse is NOT that the map cannot lower it — the map lowers it, and
+/// that is the problem.** `lower_builtin` DISCARDS the `broadcast` wrapper, so
+/// `lany.(b)` emits exactly the bare `lany(b)` reduce while `infer` types it
+/// `%deferred` with no diagnostic. Admitting it here would let an `ifelse` consume a
+/// condition whose broadcast was silently thrown away. This is one instance of a
+/// pre-existing family — `sum.(v)`, `mean.(v)` and `maximum.(v)` all type `%deferred`
+/// and all answer with the undotted reduction's NUMBER, exit 0 — carded separately
+/// (`flatppl-dev/TODO-flatppl-rust.md`). Excluding two heads from one gate does not
+/// close it, and is not meant to.
 const NON_ELEMENTWISE_PREDICATE_HEADS: &[&str] = &["lany", "lall"];
 
 /// An `ifelse` condition / `land` operand must be one of
@@ -1656,11 +1664,21 @@ fn require_predicate_head(e: &Emitter, cond: NodeId, what: &str) -> Result<(), E
     if is_predicate {
         Ok(())
     } else {
+        // The two clauses must stay separate: naming a boolean reduction as
+        // admissible "under a broadcast" would send the reader back into this
+        // very refusal, since the broadcast spelling is what it rejects.
+        let elementwise: Vec<&str> = PREDICATE_HEADS
+            .iter()
+            .copied()
+            .filter(|h| !NON_ELEMENTWISE_PREDICATE_HEADS.contains(h))
+            .collect();
         Err(EmitError::at(
             cond,
             format!(
-                "{what} must be a boolean predicate ({}), bare or under a broadcast",
-                PREDICATE_HEADS.join("/")
+                "{what} must be a boolean predicate ({}), bare or under a broadcast, or \
+                 ({}) bare only",
+                elementwise.join("/"),
+                NON_ELEMENTWISE_PREDICATE_HEADS.join("/")
             ),
         ))
     }

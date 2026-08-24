@@ -243,7 +243,7 @@
 //! - `land`/`lor`/`lxor`/`lnot` whose operand is not a boolean-producing call —
 //!   "<head> operand must be a boolean predicate (in/compare/lt/gt/le/ge/land/
 //!   lor/lxor/lnot/iszero/equal/unequal/isfinite/isinf/isnan), bare or under a
-//!   broadcast". Shared with `ifelse`'s condition check
+//!   broadcast, or (lany/lall) bare only". Shared with `ifelse`'s condition check
 //!   (`ops::require_predicate_head` over `ops::PREDICATE_HEADS`). Deliberately NOT
 //!   widened to any `Bool`-typed VALUE, though one renders `i1` and would emit: the
 //!   boolean-value gap is left as ONE documented refusal
@@ -305,9 +305,12 @@
 //! - `ifelse`'s condition is not a boolean-producing predicate call — "ifelse
 //!   condition must be a boolean predicate (in/compare/lt/gt/le/ge/land/lor/
 //!   lxor/lnot/iszero/equal/unequal/isfinite/isinf/isnan)". The list is
-//!   `ops::PREDICATE_HEADS` verbatim — every head in this map that lowers to an
-//!   `i1` — so it grows whenever a boolean head is wired, and the message now ends
-//!   "bare or under a broadcast" (see the connectives above). The doc here said
+//!   `ops::PREDICATE_HEADS` — every head in this map that lowers to an `i1` — so it
+//!   grows whenever a boolean head is wired, and the message ends "bare or under a
+//!   broadcast" (see the connectives above). §07's boolean reductions `lany`/`lall`
+//!   are in the list but appear in a SECOND clause, "or (lany/lall) bare only":
+//!   `broadcast(lany, …)` is refused, because `lower_builtin` discards the broadcast
+//!   wrapper and would emit the undotted reduction. The doc here said
 //!   "(in/compare)" through several waves in which the actual message had
 //!   already grown; it is generated from the constant, so quote the constant.
 //! - `broadcast_to` asked to broadcast a non-scalar, differently-shaped

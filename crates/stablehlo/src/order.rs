@@ -17,7 +17,7 @@
 //! what §07 says, and widening would be the mistake.
 //!
 //! **`median`/`quantile` refuse.** Both are order statistics, and this crate has no
-//! sort: `stablehlo.sort` appears nowhere in it, and neither does a top-k. See
+//! sort: it emits no `stablehlo.sort` anywhere, and no top-k. See
 //! [`refuse_order_statistic`] for what a lowering would cost and why answering
 //! without one would be worse than refusing.
 
