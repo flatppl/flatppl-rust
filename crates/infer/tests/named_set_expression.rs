@@ -208,3 +208,55 @@ fn cartpow_over_an_unreadable_set_defers_whole() {
         "no half-resolved shape may survive: {line}"
     );
 }
+
+/// A self-referential binding must still produce the CYCLE DIAGNOSTIC, not die.
+///
+/// The work budget bounds work, not stack: one chain spends a single budget unit per hop
+/// but a stack frame per hop too, so with the budget as the only guard the reader
+/// recursed until the stack died and the process aborted (SIGABRT, exit 134) before the
+/// cycle detector could speak. A depth bound alongside the budget is what keeps this
+/// reachable. Note an abort cannot be caught here — a regression takes the whole test
+/// binary down, which is a loud enough failure.
+#[test]
+fn a_self_referential_set_binding_reports_a_cycle_not_a_crash() {
+    let mut m = flatppl_syntax::parse("s = s\nx = elementof(s)\n").unwrap();
+    let errors: Vec<String> = infer(&mut m)
+        .into_iter()
+        .filter(|d| d.severity == flatppl_infer::Severity::Error)
+        .map(|d| d.message)
+        .collect();
+    assert!(
+        errors.iter().any(|e| e.contains("reference cycle")),
+        "a self-reference must report a cycle: {errors:?}"
+    );
+}
+
+/// A long but perfectly legal alias chain must defer, never abort. Measured with the
+/// budget as the only guard: such a chain died at N≈8000 on the main stack, and between
+/// N=1500 (survived) and N=2000 (aborted) on a **2MB thread stack** — the size
+/// `crates/lsp`, `crates/wasm-api` and libtest threads run on, which is why this test
+/// living in libtest is the right place to catch a regression.
+///
+/// Both sides of the bound are pinned: a chain shorter than `SET_EXPR_MAX_DEPTH`
+/// resolves, and a far longer one defers honestly in both slots.
+#[test]
+fn a_long_alias_chain_defers_instead_of_overflowing_the_stack() {
+    let chain = |n: usize| {
+        let mut src = String::from("a0 = cartpow(reals, 4)\n");
+        for i in 1..=n {
+            src.push_str(&format!("a{i} = a{}\n", i - 1));
+        }
+        src.push_str(&format!("x = elementof(a{n})\n"));
+        src
+    };
+    let short = bind_line(&chain(200), "x");
+    assert!(
+        short.contains("(%array 1 (4) (%scalar real)) %parameterized (cartpow reals 4)"),
+        "a 200-hop chain is within the depth bound and must resolve: {short}"
+    );
+    let long = bind_line(&chain(2000), "x");
+    assert!(
+        long.contains("(%deferred %parameterized %unknown)"),
+        "a 2000-hop chain must defer in both slots, not abort: {long}"
+    );
+}
