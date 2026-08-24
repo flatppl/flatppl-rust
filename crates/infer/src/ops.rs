@@ -2363,12 +2363,23 @@ fn lawof_mass_gate(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> Option<Typ
     Some(Type::Failed("lawof of an unnormalized kernel".into()))
 }
 
+/// Depth bound for following `%ref` chains through a set expression. A module is
+/// a DAG (§04), so a chain terminates; the bound only guards a malformed graph.
+const SET_REF_DEPTH: u32 = 64;
+
 /// The element type of a set expression (`elementof` / `external` argument),
 /// read structurally — sets are not first-class in the type grammar.
 fn set_element_type(inf: &mut Inferencer<'_, '_>, node: Option<NodeId>) -> Type {
+    set_element_type_at(inf, node, 0)
+}
+
+fn set_element_type_at(inf: &mut Inferencer<'_, '_>, node: Option<NodeId>, depth: u32) -> Type {
     let Some(node) = node else {
         return Type::Deferred;
     };
+    if depth > SET_REF_DEPTH {
+        return Type::Deferred;
+    }
     let module = &*inf.module;
     match module.node(node) {
         Node::Const(sym) => match module.resolve(*sym) {
@@ -2400,7 +2411,7 @@ fn set_element_type(inf: &mut Inferencer<'_, '_>, node: Option<NodeId>) -> Type 
                     match size_arg {
                         None => Type::Failed("cartpow expects (set, size)".into()),
                         Some(size_arg) => {
-                            let elem = set_element_type(inf, set_arg);
+                            let elem = set_element_type_at(inf, set_arg, depth + 1);
                             let shape = count_dims(inf, size_arg);
                             table_of_record_power(shape, elem)
                         }
@@ -2428,7 +2439,9 @@ fn set_element_type(inf: &mut Inferencer<'_, '_>, node: Option<NodeId>) -> Type 
                         let fields: Vec<(Symbol, Type)> = c
                             .named
                             .iter()
-                            .map(|na| (na.name, set_element_type(inf, Some(na.value))))
+                            .map(|na| {
+                                (na.name, set_element_type_at(inf, Some(na.value), depth + 1))
+                            })
                             .collect();
                         if fields.iter().any(|(_, t)| matches!(t, Type::Deferred)) {
                             Type::Deferred
@@ -2448,7 +2461,7 @@ fn set_element_type(inf: &mut Inferencer<'_, '_>, node: Option<NodeId>) -> Type 
                         let parts: Vec<Type> = c
                             .args
                             .iter()
-                            .map(|&a| set_element_type(inf, Some(a)))
+                            .map(|&a| set_element_type_at(inf, Some(a), depth + 1))
                             .collect();
                         // A member is the `cat` of one element per component
                         // (the same shape rule as `joint` variates); mixing
@@ -2461,6 +2474,20 @@ fn set_element_type(inf: &mut Inferencer<'_, '_>, node: Option<NodeId>) -> Type 
             },
             _ => Type::Deferred,
         },
+        // A set bound to a name — §03 "Preset domains" binds a set expression to
+        // a global name, and §04 admits a name reference wherever the expression
+        // itself is admitted, so `elementof(S_name)` must type as
+        // `elementof(<S_name's rhs>)`.
+        Node::Ref(r) if r.ns == RefNs::SelfMod => {
+            let name = r.name;
+            match module.binding_by_name(name) {
+                Some(b) => {
+                    let rhs = inf.module.binding(b).rhs;
+                    set_element_type_at(inf, Some(rhs), depth + 1)
+                }
+                None => Type::Deferred,
+            }
+        }
         _ => Type::Deferred,
     }
 }
@@ -6123,6 +6150,10 @@ fn vector_dim(ty: Option<&Type>) -> Dim {
 /// (a set-constructor used directly as a preset binding, spec §03). `Unknown`
 /// for any non-set-constructor head or unresolvable component.
 fn set_call_valueset(inf: &mut Inferencer<'_, '_>, c: &Call) -> ValueSet {
+    set_call_valueset_at(inf, c, 0)
+}
+
+fn set_call_valueset_at(inf: &mut Inferencer<'_, '_>, c: &Call, depth: u32) -> ValueSet {
     let CallHead::Builtin(op) = c.head else {
         return ValueSet::Unknown;
     };
@@ -6159,7 +6190,7 @@ fn set_call_valueset(inf: &mut Inferencer<'_, '_>, c: &Call) -> ValueSet {
             let Some(&size_arg) = c.args.get(1) else {
                 return ValueSet::Unknown;
             };
-            let elem = set_expr_valueset(inf, c.args.first().copied());
+            let elem = set_expr_valueset_at(inf, c.args.first().copied(), depth + 1);
             if elem == ValueSet::Unknown {
                 return ValueSet::Unknown;
             }
@@ -6175,7 +6206,7 @@ fn set_call_valueset(inf: &mut Inferencer<'_, '_>, c: &Call) -> ValueSet {
             if !c.named.is_empty() {
                 let mut fields = Vec::with_capacity(c.named.len());
                 for na in c.named.iter() {
-                    let set = set_expr_valueset(inf, Some(na.value));
+                    let set = set_expr_valueset_at(inf, Some(na.value), depth + 1);
                     if set == ValueSet::Unknown {
                         return ValueSet::Unknown;
                     }
@@ -6185,7 +6216,7 @@ fn set_call_valueset(inf: &mut Inferencer<'_, '_>, c: &Call) -> ValueSet {
             } else {
                 let mut parts = Vec::with_capacity(c.args.len());
                 for &arg in c.args.iter() {
-                    let set = set_expr_valueset(inf, Some(arg));
+                    let set = set_expr_valueset_at(inf, Some(arg), depth + 1);
                     if set == ValueSet::Unknown {
                         return ValueSet::Unknown;
                     }
@@ -6201,9 +6232,20 @@ fn set_call_valueset(inf: &mut Inferencer<'_, '_>, c: &Call) -> ValueSet {
 /// A set *expression* (an `elementof` / `truncate` / reference-measure
 /// argument) read structurally into a [`ValueSet`].
 fn set_expr_valueset(inf: &mut Inferencer<'_, '_>, node: Option<NodeId>) -> ValueSet {
+    set_expr_valueset_at(inf, node, 0)
+}
+
+fn set_expr_valueset_at(
+    inf: &mut Inferencer<'_, '_>,
+    node: Option<NodeId>,
+    depth: u32,
+) -> ValueSet {
     let Some(node) = node else {
         return ValueSet::Unknown;
     };
+    if depth > SET_REF_DEPTH {
+        return ValueSet::Unknown;
+    }
     match inf.module.node(node).clone() {
         Node::Const(sym) => match inf.module.resolve(sym) {
             "reals" => ValueSet::Reals,
@@ -6219,7 +6261,16 @@ fn set_expr_valueset(inf: &mut Inferencer<'_, '_>, node: Option<NodeId>) -> Valu
             "anything" => ValueSet::Anything,
             _ => ValueSet::Unknown,
         },
-        Node::Call(c) => set_call_valueset(inf, &c),
+        Node::Call(c) => set_call_valueset_at(inf, &c, depth),
+        // A set bound to a name (§03 "Preset domains", §04 name reference) — the
+        // reference denotes the same set as the binding's rhs.
+        Node::Ref(r) if r.ns == RefNs::SelfMod => match inf.module.binding_by_name(r.name) {
+            Some(b) => {
+                let rhs = inf.module.binding(b).rhs;
+                set_expr_valueset_at(inf, Some(rhs), depth + 1)
+            }
+            None => ValueSet::Unknown,
+        },
         _ => ValueSet::Unknown,
     }
 }
