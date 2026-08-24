@@ -2363,12 +2363,58 @@ fn lawof_mass_gate(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> Option<Typ
     Some(Type::Failed("lawof of an unnormalized kernel".into()))
 }
 
+/// Nodes one read of a set expression may resolve. A **work** budget, not a depth
+/// bound: following a `%ref` lets a module share a subexpression, so `s_k =
+/// cartprod(s_{k-1}, s_{k-1})` traverses $2^k$ nodes along paths only $k$ deep, and no
+/// depth limit sees it coming (measured: 501 bytes at k=20 cost 5.0s and 847MB). The
+/// budget is what the exponent runs out of. Memoizing the traversal would not be
+/// enough on its own — the resulting `Type`/`ValueSet` is itself exponentially large,
+/// so the size of the answer has to be bounded too, and every construction step here
+/// spends budget.
+///
+/// Each entry point starts a fresh budget, so a given node reads the same way however
+/// much work its siblings did. Exhaustion reads out as `%deferred`/`%unknown` — the
+/// same honest "no answer" a set this reader cannot follow already gets.
+///
+/// This bounds WORK, which is not the same as bounding STACK — see
+/// [`SET_EXPR_MAX_DEPTH`]. Both guards are needed.
+const SET_EXPR_NODE_BUDGET: u32 = 10_000;
+
+/// Reader frames one read of a set expression may nest. This bounds STACK, which the
+/// work budget does not: a single chain spends one budget unit per hop but one stack
+/// frame per hop too, so a budget alone lets `s = s` — or a long alias chain — recurse
+/// until the stack dies, aborting the process (SIGABRT) before the cycle detector can
+/// report `binding `s` is part of a reference cycle`. Measured with the budget as the
+/// only guard: `s = s` aborted with exit 134, and a legal alias chain died at N≈8000 on
+/// the main stack and between N=1500 (survived) and N=2000 (aborted) on a **2MB thread
+/// stack** — the size `crates/lsp`, `crates/wasm-api` and libtest threads run on.
+///
+/// 256 leaves roughly a 6x margin under that 2MB limit while being 4x more nesting than
+/// the deepest plausible set expression. Charged on every recursive step, so the
+/// constant means exactly what it says: at most this many nested reader frames.
+const SET_EXPR_MAX_DEPTH: u32 = 256;
+
 /// The element type of a set expression (`elementof` / `external` argument),
 /// read structurally — sets are not first-class in the type grammar.
 fn set_element_type(inf: &mut Inferencer<'_, '_>, node: Option<NodeId>) -> Type {
+    let mut budget = SET_EXPR_NODE_BUDGET;
+    set_element_type_at(inf, node, &mut budget, 0)
+}
+
+fn set_element_type_at(
+    inf: &mut Inferencer<'_, '_>,
+    node: Option<NodeId>,
+    budget: &mut u32,
+    depth: u32,
+) -> Type {
     let Some(node) = node else {
         return Type::Deferred;
     };
+    // Work and stack are bounded separately; whichever runs out first defers.
+    if *budget == 0 || depth > SET_EXPR_MAX_DEPTH {
+        return Type::Deferred;
+    }
+    *budget -= 1;
     let module = &*inf.module;
     match module.node(node) {
         Node::Const(sym) => match module.resolve(*sym) {
@@ -2400,9 +2446,19 @@ fn set_element_type(inf: &mut Inferencer<'_, '_>, node: Option<NodeId>) -> Type 
                     match size_arg {
                         None => Type::Failed("cartpow expects (set, size)".into()),
                         Some(size_arg) => {
-                            let elem = set_element_type(inf, set_arg);
-                            let shape = count_dims(inf, size_arg);
-                            table_of_record_power(shape, elem)
+                            let elem = set_element_type_at(inf, set_arg, budget, depth + 1);
+                            // An unreadable element set makes the POWER unreadable, so
+                            // defer whole rather than wrapping `%deferred` in a shape.
+                            // `set_call_valueset`'s `cartpow` arm already bails this way
+                            // on an `Unknown` element, and the two slots have to agree:
+                            // a half-resolved `(%array 1 (4) %deferred)` beside a
+                            // `%unknown` value set describes no set at all.
+                            if matches!(elem, Type::Deferred) {
+                                Type::Deferred
+                            } else {
+                                let shape = count_dims(inf, size_arg);
+                                table_of_record_power(shape, elem)
+                            }
                         }
                     }
                 }
@@ -2428,7 +2484,12 @@ fn set_element_type(inf: &mut Inferencer<'_, '_>, node: Option<NodeId>) -> Type 
                         let fields: Vec<(Symbol, Type)> = c
                             .named
                             .iter()
-                            .map(|na| (na.name, set_element_type(inf, Some(na.value))))
+                            .map(|na| {
+                                (
+                                    na.name,
+                                    set_element_type_at(inf, Some(na.value), budget, depth + 1),
+                                )
+                            })
                             .collect();
                         if fields.iter().any(|(_, t)| matches!(t, Type::Deferred)) {
                             Type::Deferred
@@ -2448,7 +2509,7 @@ fn set_element_type(inf: &mut Inferencer<'_, '_>, node: Option<NodeId>) -> Type 
                         let parts: Vec<Type> = c
                             .args
                             .iter()
-                            .map(|&a| set_element_type(inf, Some(a)))
+                            .map(|&a| set_element_type_at(inf, Some(a), budget, depth + 1))
                             .collect();
                         // A member is the `cat` of one element per component
                         // (the same shape rule as `joint` variates); mixing
@@ -2461,6 +2522,20 @@ fn set_element_type(inf: &mut Inferencer<'_, '_>, node: Option<NodeId>) -> Type 
             },
             _ => Type::Deferred,
         },
+        // A set bound to a name — §03 "Preset domains" binds a set expression to
+        // a global name, and §04 admits a name reference wherever the expression
+        // itself is admitted, so `elementof(S_name)` must type as
+        // `elementof(<S_name's rhs>)`.
+        Node::Ref(r) if r.ns == RefNs::SelfMod => {
+            let name = r.name;
+            match module.binding_by_name(name) {
+                Some(b) => {
+                    let rhs = inf.module.binding(b).rhs;
+                    set_element_type_at(inf, Some(rhs), budget, depth + 1)
+                }
+                None => Type::Deferred,
+            }
+        }
         _ => Type::Deferred,
     }
 }
@@ -6123,6 +6198,16 @@ fn vector_dim(ty: Option<&Type>) -> Dim {
 /// (a set-constructor used directly as a preset binding, spec §03). `Unknown`
 /// for any non-set-constructor head or unresolvable component.
 fn set_call_valueset(inf: &mut Inferencer<'_, '_>, c: &Call) -> ValueSet {
+    let mut budget = SET_EXPR_NODE_BUDGET;
+    set_call_valueset_at(inf, c, &mut budget, 0)
+}
+
+fn set_call_valueset_at(
+    inf: &mut Inferencer<'_, '_>,
+    c: &Call,
+    budget: &mut u32,
+    depth: u32,
+) -> ValueSet {
     let CallHead::Builtin(op) = c.head else {
         return ValueSet::Unknown;
     };
@@ -6159,7 +6244,7 @@ fn set_call_valueset(inf: &mut Inferencer<'_, '_>, c: &Call) -> ValueSet {
             let Some(&size_arg) = c.args.get(1) else {
                 return ValueSet::Unknown;
             };
-            let elem = set_expr_valueset(inf, c.args.first().copied());
+            let elem = set_expr_valueset_at(inf, c.args.first().copied(), budget, depth + 1);
             if elem == ValueSet::Unknown {
                 return ValueSet::Unknown;
             }
@@ -6175,7 +6260,7 @@ fn set_call_valueset(inf: &mut Inferencer<'_, '_>, c: &Call) -> ValueSet {
             if !c.named.is_empty() {
                 let mut fields = Vec::with_capacity(c.named.len());
                 for na in c.named.iter() {
-                    let set = set_expr_valueset(inf, Some(na.value));
+                    let set = set_expr_valueset_at(inf, Some(na.value), budget, depth + 1);
                     if set == ValueSet::Unknown {
                         return ValueSet::Unknown;
                     }
@@ -6185,7 +6270,7 @@ fn set_call_valueset(inf: &mut Inferencer<'_, '_>, c: &Call) -> ValueSet {
             } else {
                 let mut parts = Vec::with_capacity(c.args.len());
                 for &arg in c.args.iter() {
-                    let set = set_expr_valueset(inf, Some(arg));
+                    let set = set_expr_valueset_at(inf, Some(arg), budget, depth + 1);
                     if set == ValueSet::Unknown {
                         return ValueSet::Unknown;
                     }
@@ -6201,9 +6286,24 @@ fn set_call_valueset(inf: &mut Inferencer<'_, '_>, c: &Call) -> ValueSet {
 /// A set *expression* (an `elementof` / `truncate` / reference-measure
 /// argument) read structurally into a [`ValueSet`].
 fn set_expr_valueset(inf: &mut Inferencer<'_, '_>, node: Option<NodeId>) -> ValueSet {
+    let mut budget = SET_EXPR_NODE_BUDGET;
+    set_expr_valueset_at(inf, node, &mut budget, 0)
+}
+
+fn set_expr_valueset_at(
+    inf: &mut Inferencer<'_, '_>,
+    node: Option<NodeId>,
+    budget: &mut u32,
+    depth: u32,
+) -> ValueSet {
     let Some(node) = node else {
         return ValueSet::Unknown;
     };
+    // Work and stack are bounded separately; whichever runs out first defers.
+    if *budget == 0 || depth > SET_EXPR_MAX_DEPTH {
+        return ValueSet::Unknown;
+    }
+    *budget -= 1;
     match inf.module.node(node).clone() {
         Node::Const(sym) => match inf.module.resolve(sym) {
             "reals" => ValueSet::Reals,
@@ -6219,7 +6319,16 @@ fn set_expr_valueset(inf: &mut Inferencer<'_, '_>, node: Option<NodeId>) -> Valu
             "anything" => ValueSet::Anything,
             _ => ValueSet::Unknown,
         },
-        Node::Call(c) => set_call_valueset(inf, &c),
+        Node::Call(c) => set_call_valueset_at(inf, &c, budget, depth),
+        // A set bound to a name (§03 "Preset domains", §04 name reference) — the
+        // reference denotes the same set as the binding's rhs.
+        Node::Ref(r) if r.ns == RefNs::SelfMod => match inf.module.binding_by_name(r.name) {
+            Some(b) => {
+                let rhs = inf.module.binding(b).rhs;
+                set_expr_valueset_at(inf, Some(rhs), budget, depth + 1)
+            }
+            None => ValueSet::Unknown,
+        },
         _ => ValueSet::Unknown,
     }
 }
