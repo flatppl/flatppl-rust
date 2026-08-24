@@ -1617,16 +1617,104 @@ const PREDICATE_HEADS: &[&str] = &[
 /// over them is not a predicate. §07's boolean reductions consume an array and produce
 /// ONE scalar `i1`, so a broadcast of one is not an elementwise lift of anything.
 ///
-/// **The reason to refuse is NOT that the map cannot lower it — the map lowers it, and
-/// that is the problem.** `lower_builtin` DISCARDS the `broadcast` wrapper, so
-/// `lany.(b)` emits exactly the bare `lany(b)` reduce while `infer` types it
-/// `%deferred` with no diagnostic. Admitting it here would let an `ifelse` consume a
-/// condition whose broadcast was silently thrown away. This is one instance of a
-/// pre-existing family — `sum.(v)`, `mean.(v)` and `maximum.(v)` all type `%deferred`
-/// and all answer with the undotted reduction's NUMBER, exit 0 — carded separately
-/// (`flatppl-dev/TODO-flatppl-rust.md`). Excluding two heads from one gate does not
-/// close it, and is not meant to.
+/// This gate now runs AHEAD of a second one that refuses the same two heads outright:
+/// `lany`/`lall` are [`flatppl_infer::collection_domain_head`] entries, so
+/// [`Emitter::lower_broadcast`] refuses them under a broadcast along with the rest of
+/// the §07 collection-domain family. Keeping the carve-out here is not redundant — it
+/// refuses STRUCTURALLY, before `lower_node` runs on the condition, and it is what makes
+/// the `ifelse` message name the bare spelling that works. Without it the exclusion
+/// would have to be re-derived from the lowering error.
+///
+/// The two gates were written in the opposite order. This one landed first, when
+/// `lower_builtin` still DISCARDED the `broadcast` wrapper — `lany.(b)` emitted exactly
+/// the bare `lany(b)` reduce while `infer` typed it `%deferred` with no diagnostic, and
+/// the wider family (`sum.(v)`, `mean.(v)`, `maximum.(v)`) answered with the undotted
+/// reduction's NUMBER at exit 0. Excluding two heads from one gate did not close that,
+/// and was not meant to; `lower_broadcast` and `infer`'s domain refusal close it.
 const NON_ELEMENTWISE_PREDICATE_HEADS: &[&str] = &["lany", "lall"];
+
+/// Every §07 head whose Domains cell is a COLLECTION — arrays, vectors or tables, never
+/// a scalar — with the §07 table it lives in and that cell quoted. §04 applies a
+/// broadcast head to each ELEMENT, so none of these has a tensor form under a
+/// `broadcast`: [`Emitter::lower_broadcast`] refuses them rather than lowering the
+/// head's whole-array form and discarding the wrapper, which is what `sum.(v)` did.
+///
+/// A LOCAL copy of `flatppl_infer`'s table of the same name. This crate takes
+/// `flatppl-infer` as a dev-dependency only — the emitter reads determinized FlatPIR and
+/// does not otherwise depend on inference — so the two lists are kept honest by
+/// [`collection_domain_sync_tests::the_head_table_matches_infers`] at the foot of this
+/// file, which fails on any head, section or domain cell that drifts. Duplicating the
+/// list beats making the emitter depend on inference in order to refuse.
+pub(crate) const COLLECTION_DOMAIN_HEADS: &[(&str, &str, &str)] = &[
+    ("sum", "Reductions", "real/complex arrays"),
+    ("mean", "Reductions", "real/complex arrays"),
+    ("var", "Reductions", "real arrays"),
+    ("std", "Reductions", "real arrays"),
+    ("prod", "Reductions", "real/complex arrays"),
+    ("maximum", "Reductions", "real arrays"),
+    ("minimum", "Reductions", "real arrays"),
+    ("median", "Reductions", "real arrays"),
+    ("quantile", "Reductions", "real arrays"),
+    ("lengthof", "Reductions", "vectors, tables"),
+    ("sizeof", "Reductions", "vectors, arrays"),
+    ("indicesof", "Reductions", "vectors, arrays, tables"),
+    ("indicesof0", "Reductions", "vectors, arrays, tables"),
+    ("lany", "Boolean reductions", "boolean arrays"),
+    ("lall", "Boolean reductions", "boolean arrays"),
+    ("cumsum", "Cumulative operations", "vectors"),
+    ("cumprod", "Cumulative operations", "vectors"),
+    ("cummax", "Cumulative operations", "real vectors"),
+    ("cummin", "Cumulative operations", "real vectors"),
+    ("l1norm", "Norms and normalization", "real/complex vectors"),
+    ("l2norm", "Norms and normalization", "real/complex vectors"),
+    (
+        "linfnorm",
+        "Norms and normalization",
+        "real/complex vectors",
+    ),
+    ("l1unit", "Norms and normalization", "real/complex vectors"),
+    ("l2unit", "Norms and normalization", "real/complex vectors"),
+    ("logsumexp", "Norms and normalization", "real vectors"),
+    ("softmax", "Norms and normalization", "real vectors"),
+    ("logsoftmax", "Norms and normalization", "real vectors"),
+];
+
+pub(crate) fn collection_domain_head(name: &str) -> Option<(&'static str, &'static str)> {
+    COLLECTION_DOMAIN_HEADS
+        .iter()
+        .find(|(h, _, _)| *h == name)
+        .map(|(_, section, domain)| (*section, *domain))
+}
+
+/// The ten built-ins §04 "Multi-axis aggregation" admits as an `aggregate` reduction:
+/// "The eligible built-ins are `sum`, `prod`, `mean`, `var`, `std`, `maximum`,
+/// `minimum`, `median`, `lany` and `lall`." Mirrors `flatppl_infer`'s list of the same
+/// name, and is checked with the head table by
+/// [`collection_domain_sync_tests::the_aggregate_eligible_list_matches_04`].
+const AGGREGATE_ELIGIBLE_REDUCTIONS: &[&str] = &[
+    "sum", "prod", "mean", "var", "std", "maximum", "minimum", "median", "lany", "lall",
+];
+
+/// The remedy sentence of a collection-domain refusal: the bare call to write instead,
+/// with the head's §07 argument list, plus the per-axis `aggregate` form for the ten
+/// heads §04 actually admits. Naming `aggregate(l2norm, …)` would send the reader
+/// straight into `norms`'s eligibility refusal, and `quantile(v)` would be an arity
+/// error — `quantile` is §07's one two-argument row here.
+pub(crate) fn collection_domain_remedy(name: &str) -> String {
+    let bare = if name == "quantile" {
+        "quantile(v, p)".to_string()
+    } else {
+        format!("{name}(v)")
+    };
+    if AGGREGATE_ELIGIBLE_REDUCTIONS.contains(&name) {
+        format!(
+            "Use the bare `{bare}`, or `aggregate({name}, [.i], M[.i, .j])` \
+             (§04 \"Multi-axis aggregation\") to reduce along one axis of a multi-axis array."
+        )
+    } else {
+        format!("Use the bare `{bare}`.")
+    }
+}
 
 /// An `ifelse` condition / `land` operand must be one of
 /// [`PREDICATE_HEADS`], bare or under a `broadcast`. Same narrow-and-refuse
@@ -2411,5 +2499,65 @@ fn cartpow_parts(e: &Emitter, set_id: NodeId) -> Option<(NodeId, NodeId)> {
             _ => None,
         },
         _ => None,
+    }
+}
+
+/// The one place the emitter's copy of the §07 collection-domain table is checked
+/// against inference's. A unit test rather than an integration one, because
+/// [`COLLECTION_DOMAIN_HEADS`] is `pub(crate)` and `flatppl-infer` is a dev-dependency:
+/// both are in scope here and neither is in scope from `tests/`.
+#[cfg(test)]
+mod collection_domain_sync_tests {
+    /// Head for head, section for section, domain cell for domain cell. A head added to
+    /// one side only is how the mislowering this table closes survived in the first
+    /// place: the emitter lowered a family inference never typed.
+    #[test]
+    fn the_head_table_matches_infers() {
+        assert_eq!(
+            super::COLLECTION_DOMAIN_HEADS,
+            flatppl_infer::collection_domain_heads(),
+            "crates/stablehlo/src/ops.rs's COLLECTION_DOMAIN_HEADS has drifted from \
+             crates/infer/src/ops.rs's — a head, section or domain cell differs"
+        );
+    }
+
+    /// §04 names exactly ten eligible built-ins, and the remedy sentence offers
+    /// `aggregate` only for those. A head added here that §04 does not admit turns the
+    /// remedy into a pointer at a second refusal.
+    #[test]
+    fn the_aggregate_eligible_list_matches_04() {
+        assert_eq!(
+            super::AGGREGATE_ELIGIBLE_REDUCTIONS,
+            flatppl_infer::aggregate_eligible_reductions(),
+            "the two AGGREGATE_ELIGIBLE_REDUCTIONS lists have drifted"
+        );
+        for head in super::AGGREGATE_ELIGIBLE_REDUCTIONS {
+            assert!(
+                super::collection_domain_head(head).is_some(),
+                "`{head}` is §04-eligible but missing from COLLECTION_DOMAIN_HEADS"
+            );
+        }
+        // §07 "Cumulative operations" states the four scans "are not eligible
+        // reductions for multi-axis aggregation", so none may leak into the list.
+        for head in [
+            "cumsum", "cumprod", "cummax", "cummin", "l2norm", "softmax", "quantile",
+        ] {
+            assert!(
+                !super::AGGREGATE_ELIGIBLE_REDUCTIONS.contains(&head),
+                "`{head}` is not one of §04's ten eligible built-ins"
+            );
+        }
+    }
+
+    /// The remedy must never name a spelling that is itself an error. `quantile` is
+    /// §07's one two-argument row in the table, so `quantile(v)` would be an arity error.
+    #[test]
+    fn the_remedy_names_a_callable_spelling() {
+        assert!(super::collection_domain_remedy("quantile").contains("`quantile(v, p)`"));
+        assert!(!super::collection_domain_remedy("quantile").contains("aggregate"));
+        let sum = super::collection_domain_remedy("sum");
+        assert!(sum.contains("`sum(v)`") && sum.contains("aggregate(sum, [.i]"));
+        let norm = super::collection_domain_remedy("l2norm");
+        assert!(norm.contains("`l2norm(v)`") && !norm.contains("aggregate"));
     }
 }

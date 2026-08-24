@@ -413,12 +413,18 @@ outputs = (o1, o2, o3)
 /// NOT a predicate. `broadcast(P, …)` counts only for the ELEMENTWISE heads, because
 /// that arm exists to admit a dotted comparison.
 ///
-/// The reason is NOT that the map cannot lower `lany.(b)` — it lowers it, DISCARDING
-/// the `broadcast` wrapper, so the dotted spelling silently emits the undotted
-/// reduction while `infer` types it `%deferred` with no diagnostic. Admitting it would
-/// let an `ifelse` consume a condition whose broadcast was thrown away. The wider
-/// family (`sum.(v)`, `mean.(v)`, `maximum.(v)`, which answer with a NUMBER) is carded
-/// in `flatppl-dev/TODO-flatppl-rust.md`, not fixed here.
+/// When this landed, the reason was NOT that the map could not lower `lany.(b)` — it
+/// lowered it, DISCARDING the `broadcast` wrapper, so the dotted spelling silently
+/// emitted the undotted reduction while `infer` typed it `%deferred` with no
+/// diagnostic. That whole family (`sum.(v)`, `mean.(v)`, `maximum.(v)`, which answered
+/// with a NUMBER) is closed since: `flatppl_infer` refuses a collection-domain head
+/// broadcast over SCALAR elements, and `Emitter::lower_broadcast` refuses the head
+/// under a broadcast outright — see `tests/broadcast_collection_domain.rs`.
+///
+/// So the operand here is §03's vector of vectors, the one shape that still types
+/// clean: `lany.(bb)` is a `[2]` boolean array, and an array is not a scalar `i1`
+/// condition. That keeps this gate's own property under test — a broadcast of a
+/// boolean reduction is not a predicate — rather than re-testing the newer refusal.
 ///
 /// The message must not name the reduction heads as admissible under a broadcast, or
 /// it sends the reader back into this refusal.
@@ -426,9 +432,11 @@ outputs = (o1, o2, o3)
 fn a_broadcast_boolean_reduction_is_not_a_predicate() {
     let err = emit_err(
         "\
-b = elementof(cartpow(booleans, [4]))
-y = ifelse(lany.(b), 1.0, 2.0)
-inputs = (b)
+b1 = elementof(cartpow(booleans, [4]))
+b2 = elementof(cartpow(booleans, [4]))
+bb = [b1, b2]
+y = ifelse(lany.(bb), 1.0, 2.0)
+inputs = (b1, b2)
 outputs = (y)
 ",
     );

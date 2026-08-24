@@ -710,7 +710,7 @@ pub(crate) fn call_rule(
         }
 
         // ---- broadcasting (spec §04) ----
-        "broadcast" => broadcast_type(inf, args, named),
+        "broadcast" => broadcast_type(inf, id, args, named),
 
         // ---- catalogue dispatch (spec §07 functions + spec §08 distributions) ----
         // Per-name functions whose result is a pure scalar (constant, RealOrComplexOfArg,
@@ -1402,6 +1402,188 @@ fn refuse_nonscalar_operand(
         ),
     ));
     Type::Failed(format!("`{name}` applied to a non-scalar operand").into())
+}
+
+/// Every built-in head whose §07 Domains cell is a COLLECTION — arrays, vectors or
+/// tables — and never a scalar, paired with the §07 table it lives in and that cell
+/// quoted verbatim. The table drives both halves of the broadcast rule in
+/// [`broadcast_type`]: a scalar cell is refused against the quoted domain, and an
+/// array cell gets the per-cell answer from [`broadcast_collection_cell`].
+///
+/// A head is here because §07 denies it a scalar, not because it reduces. §07
+/// "Cumulative operations" calls its four a scan that "preserve[s] the shape of their
+/// input rather than reducing it", and the normalizations in §07 "Norms and
+/// normalization" likewise return a vector — but all of them are spelled over a
+/// vector, so a scalar cell misses their domain exactly as it misses `sum`'s.
+///
+/// `min`/`max` are deliberately ABSENT: §07 "Operator-equivalent functions" gives that
+/// pair two scalar arguments, so `max.(v, 0.0)` is a genuine elementwise broadcast and
+/// belongs to the cell table below, not here. The reductions are `maximum`/`minimum`.
+pub(crate) const COLLECTION_DOMAIN_HEADS: &[(&str, &str, &str)] = &[
+    ("sum", "Reductions", "real/complex arrays"),
+    ("mean", "Reductions", "real/complex arrays"),
+    ("var", "Reductions", "real arrays"),
+    ("std", "Reductions", "real arrays"),
+    ("prod", "Reductions", "real/complex arrays"),
+    ("maximum", "Reductions", "real arrays"),
+    ("minimum", "Reductions", "real arrays"),
+    ("median", "Reductions", "real arrays"),
+    ("quantile", "Reductions", "real arrays"),
+    ("lengthof", "Reductions", "vectors, tables"),
+    ("sizeof", "Reductions", "vectors, arrays"),
+    ("indicesof", "Reductions", "vectors, arrays, tables"),
+    ("indicesof0", "Reductions", "vectors, arrays, tables"),
+    ("lany", "Boolean reductions", "boolean arrays"),
+    ("lall", "Boolean reductions", "boolean arrays"),
+    ("cumsum", "Cumulative operations", "vectors"),
+    ("cumprod", "Cumulative operations", "vectors"),
+    ("cummax", "Cumulative operations", "real vectors"),
+    ("cummin", "Cumulative operations", "real vectors"),
+    ("l1norm", "Norms and normalization", "real/complex vectors"),
+    ("l2norm", "Norms and normalization", "real/complex vectors"),
+    (
+        "linfnorm",
+        "Norms and normalization",
+        "real/complex vectors",
+    ),
+    ("l1unit", "Norms and normalization", "real/complex vectors"),
+    ("l2unit", "Norms and normalization", "real/complex vectors"),
+    ("logsumexp", "Norms and normalization", "real vectors"),
+    ("softmax", "Norms and normalization", "real vectors"),
+    ("logsoftmax", "Norms and normalization", "real vectors"),
+];
+
+pub(crate) fn collection_domain_head(name: &str) -> Option<(&'static str, &'static str)> {
+    COLLECTION_DOMAIN_HEADS
+        .iter()
+        .find(|(h, _, _)| *h == name)
+        .map(|(_, section, domain)| (*section, *domain))
+}
+
+/// `broadcast(<collection-domain head>, …)` whose cells are SCALARS — the whole
+/// dotted-reduction family, refused against the §07 domain the cell misses.
+///
+/// §04 "Broadcasting" maps the head "elementwise over arrays", and its "Collection
+/// arguments" paragraph iterates every array argument along every axis; only the
+/// "Non-collection inputs" — scalars, functions, kernels, measures — are "held
+/// constant". So the head sees an ELEMENT, and the elements of a real array are
+/// scalars, which no row of [`COLLECTION_DOMAIN_HEADS`] admits.
+///
+/// This closes a silent mislowering, not a cosmetic gap. Every head in the table typed
+/// `%deferred` with no diagnostic while `stablehlo::Emitter::lower_broadcast` handed
+/// the head straight to `lower_builtin` — discarding the `broadcast` wrapper — so
+/// `sum.(v)` compiled to the undotted `sum(v)`'s reduce and answered with a NUMBER at
+/// exit 0, and `sum.(M)` contracted a matrix all the way to a scalar. The spellings the
+/// message offers are what the writer could have meant, and §03's nested array is the
+/// last of them: that one is LEGAL and typed by [`broadcast_collection_cell`].
+fn refuse_broadcast_collection_cell(
+    inf: &mut Inferencer<'_, '_>,
+    id: NodeId,
+    name: &str,
+    section: &str,
+    domain: &str,
+    cell: &Type,
+) -> Type {
+    inf.diags.push(crate::Diagnostic::error_at(
+        id,
+        format!(
+            "`{name}` under a broadcast is applied to each ELEMENT, and the elements here \
+             are {}: spec §07 \"{section}\" gives `{name}` the domain \"{domain}\", and spec \
+             §04 \"Broadcasting\" maps the head \"elementwise over arrays\". {} The dotted \
+             spelling means something only over a NESTED array (§03 \"Arrays\"), whose \
+             elements are themselves arrays.",
+            scalar_cell_phrase(cell),
+            collection_domain_remedy(name)
+        ),
+    ));
+    Type::Failed(format!("`{name}` broadcast over scalar elements").into())
+}
+
+/// The ten built-ins §04 "Multi-axis aggregation" admits as an `aggregate` reduction:
+/// "The eligible built-ins are `sum`, `prod`, `mean`, `var`, `std`, `maximum`,
+/// `minimum`, `median`, `lany` and `lall`." Every other [`COLLECTION_DOMAIN_HEADS`]
+/// entry is INELIGIBLE — §07 says as much for the cumulative four ("they are not
+/// eligible reductions for multi-axis aggregation") — so the refusal above must not
+/// offer them that remedy.
+pub(crate) const AGGREGATE_ELIGIBLE_REDUCTIONS: &[&str] = &[
+    "sum", "prod", "mean", "var", "std", "maximum", "minimum", "median", "lany", "lall",
+];
+
+/// The remedy sentence of a collection-domain refusal: the bare call to write instead,
+/// with the head's §07 argument list, plus the per-axis `aggregate` form for the ten
+/// heads §04 admits. `quantile` is §07's one two-argument row here, so `quantile(v)`
+/// would be an arity error; and offering `aggregate(l2norm, …)` would send the reader
+/// into §04's eligibility refusal instead of onto a working spelling.
+///
+/// The StableHLO emitter's `ops::collection_domain_remedy` is the same sentence for the
+/// same reason, so the two refusals name the same remedies.
+fn collection_domain_remedy(name: &str) -> String {
+    let bare = if name == "quantile" {
+        "quantile(v, p)".to_string()
+    } else {
+        format!("{name}(v)")
+    };
+    if AGGREGATE_ELIGIBLE_REDUCTIONS.contains(&name) {
+        format!(
+            "Use the bare `{bare}`, or `aggregate({name}, [.i], M[.i, .j])` \
+             (§04 \"Multi-axis aggregation\") to reduce along one axis of a multi-axis array."
+        )
+    } else {
+        format!("Use the bare `{bare}`.")
+    }
+}
+
+fn scalar_cell_phrase(cell: &Type) -> String {
+    match cell {
+        Type::Scalar(s) => format!("{} scalars", scalar_word(*s)),
+        _ => "scalars".to_string(),
+    }
+}
+
+fn scalar_word(s: ScalarType) -> &'static str {
+    match s {
+        ScalarType::Real => "real",
+        ScalarType::Integer => "integer",
+        ScalarType::Boolean => "boolean",
+        ScalarType::Complex => "complex",
+    }
+}
+
+/// The per-cell result of a [`COLLECTION_DOMAIN_HEADS`] head over a cell that IS a
+/// collection — the legal `sum.(vv)` over §03's vector of vectors, which reduces each
+/// inner vector. `None` leaves the broadcast `%deferred`.
+///
+/// Only the heads §07 gives a SCALAR result are answered here. `sum`/`prod`/`mean`/
+/// `maximum`/`minimum` route through [`reduce_type`], so the dotted form and the bare
+/// form cannot drift on §03's promotions — `sum` over boolean cells is `Integer` on
+/// both. The rest read their §07 row directly: `var`/`std`/`median`/`quantile` and the
+/// three norms are real-valued, `lany`/`lall` are truth values per §07 "Boolean
+/// reductions", `lengthof` counts.
+///
+/// The SHAPE-PRESERVING heads (the four cumulative ops, the four normalizations) and
+/// the shape-reporting ones (`sizeof`, `indicesof`, `indicesof0`) return `None` and
+/// stay `%deferred`. §07 does pin their results, but there is no tensor form for a
+/// nested array to lower into — `stablehlo` refuses the whole nested family — so
+/// pinning the type would buy a number nothing can produce. Recorded in
+/// `flatppl-dev/TODO-flatppl-rust.md`; the scalar-cell refusal above covers them today,
+/// which is the half that was emitting wrong numbers.
+fn broadcast_collection_cell(name: &str, cell: &Type) -> Option<Type> {
+    let elem = match cell {
+        Type::Array { elem, .. } | Type::TVector { elem, .. } => elem.as_ref(),
+        _ => return None,
+    };
+    match name {
+        "sum" | "prod" | "mean" | "maximum" | "minimum" => match reduce_type(name, Some(cell)) {
+            Type::Deferred => None,
+            t => Some(t),
+        },
+        "var" | "std" | "median" | "quantile" | "l1norm" | "l2norm" | "linfnorm" | "logsumexp" => {
+            matches!(elem, Type::Scalar(_)).then_some(Type::Scalar(ScalarType::Real))
+        }
+        "lany" | "lall" => Some(Type::Scalar(ScalarType::Boolean)),
+        "lengthof" => Some(Type::Scalar(ScalarType::Integer)),
+        _ => None,
+    }
 }
 
 fn refuse_same_kind_constructor(inf: &mut Inferencer<'_, '_>, id: NodeId, name: &str) -> Type {
@@ -4524,7 +4706,12 @@ fn collect_local_ref_seeds(
 /// array; a kernel / distribution-constructor head yields a **measure over
 /// the array** of per-cell variates — that is why `draw` of a broadcast
 /// distribution produces the observation array.
-fn broadcast_type(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo], named: &[NamedInfo]) -> Type {
+fn broadcast_type(
+    inf: &mut Inferencer<'_, '_>,
+    id: NodeId,
+    args: &[ArgInfo],
+    named: &[NamedInfo],
+) -> Type {
     let Some((head_node, head_ty, _)) = args.first() else {
         return Type::Deferred;
     };
@@ -4675,6 +4862,28 @@ fn broadcast_type(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo], named: &[Named
             }),
             // Independent product of per-cell distributions.
             mass: Mass::Normalized,
+        };
+    }
+
+    // A §07 collection-domain head (`sum`, `lany`, `l2norm`, `cumsum`, …). §04 applies
+    // it to each ELEMENT, so the cell decides: a scalar element misses the head's
+    // domain and is refused, an array element is the legal nested case. Placed ahead of
+    // the elementwise cell table because both answers are domain rulings, and because
+    // the table's `_` arm is what used to swallow this whole family into `%deferred`.
+    if let Some((section, domain)) = collection_domain_head(&op_name) {
+        let cell = elems.first().cloned().unwrap_or(Type::Deferred);
+        if matches!(cell, Type::Scalar(_)) {
+            return refuse_broadcast_collection_cell(inf, id, &op_name, section, domain, &cell);
+        }
+        return match broadcast_collection_cell(&op_name, &cell) {
+            Some(inner) => Type::Array {
+                shape,
+                elem: Box::new(inner),
+            },
+            // An unresolved cell, or a head whose nested answer is deliberately not
+            // pinned — never an accusation, since the refusal keys on a cell that IS a
+            // scalar rather than on the absence of an answer.
+            None => Type::Deferred,
         };
     }
 

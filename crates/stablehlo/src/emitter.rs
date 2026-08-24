@@ -3079,6 +3079,28 @@ impl<'m> Emitter<'m> {
                     "broadcast(builtin_logdensityof, …): distribution must be a bare constructor",
                 )),
             }
+        } else if let Some((section, domain)) = crate::ops::collection_domain_head(&fname) {
+            // A §07 collection-domain head under a broadcast. `lower_builtin` would
+            // lower it as the head's WHOLE-ARRAY form, silently discarding the
+            // `broadcast` wrapper — `sum.(v)` emitted the undotted `sum(v)`'s reduce
+            // and answered with a number at exit 0. Refuse instead.
+            //
+            // Both legal readings are out of reach here, so this is a refusal and not a
+            // gap to be filled later: over scalar elements the call is ill-typed (§07
+            // denies the head a scalar, and `flatppl_infer` now refuses it statically),
+            // and over §03's nested array the operand is a vector of vectors, which has
+            // no tensor form in this emitter at all.
+            Err(EmitError::at(
+                id,
+                format!(
+                    "`{fname}` under a broadcast has no tensor form: §04 \"Broadcasting\" \
+                     applies it to each ELEMENT, while §07 \"{section}\" gives `{fname}` the \
+                     domain \"{domain}\" — so the elements must themselves be arrays, and a \
+                     nested array is not a tensor. Emitting it as the whole-array \
+                     `{fname}` would answer a different question. {}",
+                    crate::ops::collection_domain_remedy(&fname)
+                ),
+            ))
         } else {
             // Elementwise arithmetic/unary (`add`/`mul`/… from `.+`/`.*`): the
             // op's `Emitter::binary`/`unary` auto-broadcasts scalar↔rank-1. An op
