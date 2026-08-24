@@ -1404,21 +1404,36 @@ fn refuse_nonscalar_operand(
     Type::Failed(format!("`{name}` applied to a non-scalar operand").into())
 }
 
-/// Every built-in head whose §07 Domains cell is a COLLECTION — arrays, vectors or
-/// tables — and never a scalar, paired with the §07 table it lives in and that cell
-/// quoted verbatim. The table drives both halves of the broadcast rule in
-/// [`broadcast_type`]: a scalar cell is refused against the quoted domain, and an
-/// array cell gets the per-cell answer from [`broadcast_collection_cell`].
+/// Every built-in head whose §07 Domains cell is a COLLECTION — arrays, vectors, matrices
+/// or tables — and never a scalar, paired with the §07 table it lives in and that cell as
+/// §07 writes it (maths rendered as text; a multi-argument row carries the whole cell even
+/// though only the FIRST argument's domain drives the refusal). The table drives both
+/// halves of the broadcast rule in [`broadcast_type`]: a scalar cell is refused against
+/// the quoted domain, and an array cell gets the per-cell answer from
+/// [`broadcast_collection_cell`].
 ///
 /// A head is here because §07 denies it a scalar, not because it reduces. §07
 /// "Cumulative operations" calls its four a scan that "preserve[s] the shape of their
 /// input rather than reducing it", and the normalizations in §07 "Norms and
 /// normalization" likewise return a vector — but all of them are spelled over a
-/// vector, so a scalar cell misses their domain exactly as it misses `sum`'s.
+/// vector, so a scalar cell misses their domain exactly as it misses `sum`'s. §07 "Linear
+/// algebra" and §07 "Array and table operations" are here for the same reason and were
+/// added a round later: `transpose.(v)`, `adjoint.(v)` and `self_outer.(v)` were MEASURED
+/// discarding the wrapper and emitting the undotted head's answer at exit 0, the last of
+/// them a `tensor<4x4xf32>` outer product.
 ///
-/// `min`/`max` are deliberately ABSENT: §07 "Operator-equivalent functions" gives that
-/// pair two scalar arguments, so `max.(v, 0.0)` is a genuine elementwise broadcast and
-/// belongs to the cell table below, not here. The reductions are `maximum`/`minimum`.
+/// Two absences are deliberate, both because the row admits a scalar:
+///
+/// - `min`/`max` — §07 "Operator-equivalent functions" gives that pair two scalar
+///   arguments, so `max.(v, 0.0)` is a genuine elementwise broadcast and belongs to the
+///   cell table below. The reductions are `maximum`/`minimum`.
+/// - `cat` — §07 "Array and table operations" gives it "scalars, vectors, or records",
+///   and "`cat(scalar1, scalar2, ...)` … produces a vector of those scalars". So
+///   `cat.(v, w)` is a well-formed per-element `cat` of two scalars, not a domain error.
+///
+/// The four tables swept are Reductions (with Boolean reductions, Cumulative operations
+/// and Norms and normalization), Linear algebra, and Array and table operations. §07's
+/// other tables are scalar-domain and out of scope for this rule.
 pub(crate) const COLLECTION_DOMAIN_HEADS: &[(&str, &str, &str)] = &[
     ("sum", "Reductions", "real/complex arrays"),
     ("mean", "Reductions", "real/complex arrays"),
@@ -1428,7 +1443,7 @@ pub(crate) const COLLECTION_DOMAIN_HEADS: &[(&str, &str, &str)] = &[
     ("maximum", "Reductions", "real arrays"),
     ("minimum", "Reductions", "real arrays"),
     ("median", "Reductions", "real arrays"),
-    ("quantile", "Reductions", "real arrays"),
+    ("quantile", "Reductions", "real arrays, `interval(0, 1)`"),
     ("lengthof", "Reductions", "vectors, tables"),
     ("sizeof", "Reductions", "vectors, arrays"),
     ("indicesof", "Reductions", "vectors, arrays, tables"),
@@ -1451,6 +1466,72 @@ pub(crate) const COLLECTION_DOMAIN_HEADS: &[(&str, &str, &str)] = &[
     ("logsumexp", "Norms and normalization", "real vectors"),
     ("softmax", "Norms and normalization", "real vectors"),
     ("logsoftmax", "Norms and normalization", "real vectors"),
+    ("transpose", "Linear algebra", "vectors, matrices"),
+    ("adjoint", "Linear algebra", "vectors, matrices"),
+    ("det", "Linear algebra", "square matrices"),
+    ("logabsdet", "Linear algebra", "square matrices"),
+    ("inv", "Linear algebra", "square matrices"),
+    ("trace", "Linear algebra", "square matrices"),
+    ("linsolve", "Linear algebra", "square `A`, vector `b`"),
+    ("qr", "Linear algebra", "m x n matrices with m >= n"),
+    ("lower_cholesky", "Linear algebra", "positive definite `A`"),
+    ("row_gram", "Linear algebra", "matrices"),
+    ("col_gram", "Linear algebra", "matrices"),
+    ("self_outer", "Linear algebra", "vectors"),
+    (
+        "cross",
+        "Linear algebra",
+        "real or complex vectors with `lengthof(a) == lengthof(b) == 3`",
+    ),
+    ("diagmat", "Linear algebra", "vectors"),
+    ("diag", "Linear algebra", "matrices, integer"),
+    ("quadform", "Linear algebra", "square `A`, vector `x`"),
+    (
+        "rowstack",
+        "Array and table operations",
+        "vector of equal-length vectors",
+    ),
+    (
+        "colstack",
+        "Array and table operations",
+        "vector of equal-length vectors",
+    ),
+    (
+        "tile",
+        "Array and table operations",
+        "array, integer or integer vector",
+    ),
+    (
+        "splitblocks",
+        "Array and table operations",
+        "array, integer or integer vector",
+    ),
+    (
+        "joinblocks",
+        "Array and table operations",
+        "array of equal-shaped arrays",
+    ),
+    (
+        "partition",
+        "Array and table operations",
+        "vector, positive integer or integer vector",
+    ),
+    ("reverse", "Array and table operations", "vectors, tables"),
+    (
+        "addaxes",
+        "Array and table operations",
+        "array, non-negative integer, non-negative integer",
+    ),
+    (
+        "blockdiagmat",
+        "Array and table operations",
+        "vector of matrices",
+    ),
+    (
+        "bandedmat",
+        "Array and table operations",
+        "vector, positive integer",
+    ),
 ];
 
 pub(crate) fn collection_domain_head(name: &str) -> Option<(&'static str, &'static str)> {

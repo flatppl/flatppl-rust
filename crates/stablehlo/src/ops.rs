@@ -1633,11 +1633,17 @@ const PREDICATE_HEADS: &[&str] = &[
 /// and was not meant to; `lower_broadcast` and `infer`'s domain refusal close it.
 const NON_ELEMENTWISE_PREDICATE_HEADS: &[&str] = &["lany", "lall"];
 
-/// Every §07 head whose Domains cell is a COLLECTION — arrays, vectors or tables, never
-/// a scalar — with the §07 table it lives in and that cell quoted. §04 applies a
-/// broadcast head to each ELEMENT, so none of these has a tensor form under a
-/// `broadcast`: [`Emitter::lower_broadcast`] refuses them rather than lowering the
+/// Every §07 head whose Domains cell is a COLLECTION — arrays, vectors, matrices or
+/// tables, never a scalar — with the §07 table it lives in and that cell as §07 writes
+/// it. §04 applies a broadcast head to each ELEMENT, so none of these has a tensor form
+/// under a `broadcast`: [`Emitter::lower_broadcast`] refuses them rather than lowering the
 /// head's whole-array form and discarding the wrapper, which is what `sum.(v)` did.
+///
+/// SCOPE: the six §07 tables swept are Reductions, Boolean reductions, Cumulative
+/// operations, Norms and normalization, Linear algebra, and Array and table operations.
+/// §07's remaining tables are scalar-domain. A head outside all six still falls through
+/// to [`lower_builtin`], so "no wrapper is discarded" is a claim about these tables, not
+/// about every conceivable head.
 ///
 /// A LOCAL copy of `flatppl_infer`'s table of the same name. This crate takes
 /// `flatppl-infer` as a dev-dependency only — the emitter reads determinized FlatPIR and
@@ -1654,7 +1660,7 @@ pub(crate) const COLLECTION_DOMAIN_HEADS: &[(&str, &str, &str)] = &[
     ("maximum", "Reductions", "real arrays"),
     ("minimum", "Reductions", "real arrays"),
     ("median", "Reductions", "real arrays"),
-    ("quantile", "Reductions", "real arrays"),
+    ("quantile", "Reductions", "real arrays, `interval(0, 1)`"),
     ("lengthof", "Reductions", "vectors, tables"),
     ("sizeof", "Reductions", "vectors, arrays"),
     ("indicesof", "Reductions", "vectors, arrays, tables"),
@@ -1677,6 +1683,72 @@ pub(crate) const COLLECTION_DOMAIN_HEADS: &[(&str, &str, &str)] = &[
     ("logsumexp", "Norms and normalization", "real vectors"),
     ("softmax", "Norms and normalization", "real vectors"),
     ("logsoftmax", "Norms and normalization", "real vectors"),
+    ("transpose", "Linear algebra", "vectors, matrices"),
+    ("adjoint", "Linear algebra", "vectors, matrices"),
+    ("det", "Linear algebra", "square matrices"),
+    ("logabsdet", "Linear algebra", "square matrices"),
+    ("inv", "Linear algebra", "square matrices"),
+    ("trace", "Linear algebra", "square matrices"),
+    ("linsolve", "Linear algebra", "square `A`, vector `b`"),
+    ("qr", "Linear algebra", "m x n matrices with m >= n"),
+    ("lower_cholesky", "Linear algebra", "positive definite `A`"),
+    ("row_gram", "Linear algebra", "matrices"),
+    ("col_gram", "Linear algebra", "matrices"),
+    ("self_outer", "Linear algebra", "vectors"),
+    (
+        "cross",
+        "Linear algebra",
+        "real or complex vectors with `lengthof(a) == lengthof(b) == 3`",
+    ),
+    ("diagmat", "Linear algebra", "vectors"),
+    ("diag", "Linear algebra", "matrices, integer"),
+    ("quadform", "Linear algebra", "square `A`, vector `x`"),
+    (
+        "rowstack",
+        "Array and table operations",
+        "vector of equal-length vectors",
+    ),
+    (
+        "colstack",
+        "Array and table operations",
+        "vector of equal-length vectors",
+    ),
+    (
+        "tile",
+        "Array and table operations",
+        "array, integer or integer vector",
+    ),
+    (
+        "splitblocks",
+        "Array and table operations",
+        "array, integer or integer vector",
+    ),
+    (
+        "joinblocks",
+        "Array and table operations",
+        "array of equal-shaped arrays",
+    ),
+    (
+        "partition",
+        "Array and table operations",
+        "vector, positive integer or integer vector",
+    ),
+    ("reverse", "Array and table operations", "vectors, tables"),
+    (
+        "addaxes",
+        "Array and table operations",
+        "array, non-negative integer, non-negative integer",
+    ),
+    (
+        "blockdiagmat",
+        "Array and table operations",
+        "vector of matrices",
+    ),
+    (
+        "bandedmat",
+        "Array and table operations",
+        "vector, positive integer",
+    ),
 ];
 
 pub(crate) fn collection_domain_head(name: &str) -> Option<(&'static str, &'static str)> {

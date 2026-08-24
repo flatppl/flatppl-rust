@@ -23,6 +23,14 @@
 //! vectors, whose cells really are arrays. At `9701877` that answered with a single
 //! scalar too, when the correct answer is the vector of per-inner-vector sums.
 //!
+//! The rule reaches six §07 tables, not just the reduction family: Reductions, Boolean
+//! reductions, Cumulative operations, Norms and normalization, Linear algebra, and Array
+//! and table operations. The last two were added a round later, after `transpose.(v)` and
+//! `adjoint.(v)` were measured returning `%arg0` unchanged and `self_outer.(v)` a
+//! `tensor<4x4xf32>` outer product, all at exit 0 — the same bug one table over. A head
+//! outside those six still falls through to `lower_builtin`, so the "no wrapper is
+//! discarded" claim is scoped to them.
+//!
 //! No golden is added. Every test here asserts a REFUSAL, so there is no `.mlir` to
 //! execute and no number to oracle.
 
@@ -120,6 +128,61 @@ fn every_collection_domain_head_refuses_under_a_broadcast() {
         assert!(
             err.contains(&format!("`{head}` under a broadcast has no tensor form")),
             "`{head}.(bb)` must refuse: {err}"
+        );
+    }
+}
+
+/// The three §07 "Linear algebra" heads that were MEASURED emitting at exit 0 with the
+/// wrapper discarded — the same bug one table over from the reduction family. At
+/// `f95b007` (and identically at `9701877`) over `v = elementof(cartpow(reals, [4]))`:
+/// `transpose.(v)` and `adjoint.(v)` returned `%arg0 : tensor<4xf32>` unchanged, and
+/// `self_outer.(v)` returned `tensor<4x4xf32>` — the undotted outer product.
+#[test]
+fn the_measured_linear_algebra_mislowerers_refuse() {
+    for head in ["transpose", "adjoint", "self_outer"] {
+        let err = emit_err(&nested_src(head, "reals"));
+        assert!(
+            err.contains(&format!("`{head}` under a broadcast has no tensor form"))
+                && err.contains("§07 \"Linear algebra\""),
+            "`{head}.(vv)` must refuse and cite its table: {err}"
+        );
+    }
+}
+
+/// The rest of both newly swept tables. Several already refused at exit 3 for their own
+/// reasons; pinning them here keeps the refusal on the DOMAIN rule rather than on
+/// whichever unrelated gate happened to catch them.
+#[test]
+fn the_rest_of_the_two_new_tables_refuse_under_a_broadcast() {
+    for head in [
+        "det",
+        "logabsdet",
+        "inv",
+        "trace",
+        "linsolve",
+        "qr",
+        "lower_cholesky",
+        "row_gram",
+        "col_gram",
+        "cross",
+        "diagmat",
+        "diag",
+        "quadform",
+        "rowstack",
+        "colstack",
+        "tile",
+        "splitblocks",
+        "joinblocks",
+        "partition",
+        "reverse",
+        "addaxes",
+        "blockdiagmat",
+        "bandedmat",
+    ] {
+        let err = emit_err(&nested_src(head, "reals"));
+        assert!(
+            err.contains(&format!("`{head}` under a broadcast has no tensor form")),
+            "`{head}.(vv)` must refuse on the domain rule: {err}"
         );
     }
 }

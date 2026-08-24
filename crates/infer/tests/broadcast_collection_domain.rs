@@ -11,8 +11,14 @@
 //! §07 "Reductions" gives `sum` the Domains cell "real/complex arrays", `median` "real
 //! arrays", `lengthof` "vectors, tables"; §07 "Boolean reductions" gives `lany`/`lall`
 //! "boolean arrays"; §07 "Norms and normalization" gives `l2norm` "real/complex
-//! vectors". None of them admits a scalar. So `sum.(v)` over a vector of scalars asks
-//! for the sum of a scalar and is ill-typed.
+//! vectors"; §07 "Linear algebra" gives `transpose` "vectors, matrices" and `self_outer`
+//! "vectors"; §07 "Array and table operations" gives `reverse` "vectors, tables". None of
+//! them admits a scalar. So `sum.(v)` over a vector of scalars asks for the sum of a
+//! scalar and is ill-typed, and the same argument reaches every head in those six tables.
+//!
+//! `cat` is the one row swept and REJECTED: §07 gives it "scalars, vectors, or records",
+//! so a per-element `cat` of two scalars is well formed. `min`/`max` are scalar-domain
+//! for the same reason and stay in the elementwise cell table.
 //!
 //! §03 "Arrays" makes the legal case reachable: arrays are "collections of scalar
 //! values ... or arrays", and "Vectors of vectors are not interpreted as matrices
@@ -107,6 +113,79 @@ fn a_dotted_reduction_over_scalar_cells_is_refused() {
     }
 }
 
+/// §07 "Linear algebra" and §07 "Array and table operations" are the same rule one table
+/// over, and three of them were MEASURED mislowering at exit 0 with the wrapper
+/// discarded: `transpose.(v)` and `adjoint.(v)` returned `%arg0` unchanged, and
+/// `self_outer.(v)` emitted a `tensor<4x4xf32>` outer product.
+#[test]
+fn the_linear_algebra_and_array_op_heads_are_refused_too() {
+    for head in [
+        // The three measured mislowerers first.
+        "transpose",
+        "adjoint",
+        "self_outer",
+        // The rest of §07 "Linear algebra".
+        "det",
+        "logabsdet",
+        "inv",
+        "trace",
+        "linsolve",
+        "qr",
+        "lower_cholesky",
+        "row_gram",
+        "col_gram",
+        "cross",
+        "diagmat",
+        "diag",
+        "quadform",
+        // §07 "Array and table operations", less `cat`.
+        "rowstack",
+        "colstack",
+        "tile",
+        "splitblocks",
+        "joinblocks",
+        "partition",
+        "reverse",
+        "addaxes",
+        "blockdiagmat",
+        "bandedmat",
+    ] {
+        let errs = errors(&scalar_cells(head, "reals"));
+        assert_eq!(
+            errs.len(),
+            1,
+            "`{head}.(v)` must refuse exactly once: {errs:?}"
+        );
+        assert!(
+            errs[0].contains(&format!("`{head}` under a broadcast")),
+            "`{head}`'s refusal must name the head: {}",
+            errs[0]
+        );
+    }
+    assert!(
+        errors(&scalar_cells("transpose", "reals"))[0].contains("§07 \"Linear algebra\""),
+        "`transpose` belongs to §07's linear-algebra table"
+    );
+    assert!(
+        errors(&scalar_cells("reverse", "reals"))[0].contains("§07 \"Array and table operations\""),
+        "`reverse` belongs to §07's array-ops table"
+    );
+}
+
+/// `cat` is the one row of §07 "Array and table operations" that ADMITS a scalar —
+/// "`cat(scalar1, scalar2, ...)` … produces a vector of those scalars" — so a per-element
+/// `cat` is well formed and must not be swept up with its table-mates.
+#[test]
+fn cat_admits_a_scalar_cell_and_is_not_refused() {
+    let errs = errors(
+        "v = elementof(cartpow(reals, [4]))\nw = elementof(cartpow(reals, [4]))\ny = cat.(v, w)\n",
+    );
+    assert!(
+        errs.is_empty(),
+        "`cat` takes scalars per §07, so the dotted form is legal: {errs:?}"
+    );
+}
+
 /// The message has to carry the two things a reader needs: WHY it is refused (the
 /// §07 domain the cell misses, and §04's per-element rule) and WHAT to write instead.
 #[test]
@@ -152,6 +231,14 @@ fn the_refusal_cites_the_domain_and_names_both_remedies() {
     assert!(
         errors(&scalar_cells("cumsum", "reals"))[0].contains("§07 \"Cumulative operations\""),
         "`cumsum` belongs to §07's cumulative table"
+    );
+    // §07 "Reductions" gives `quantile` the cell "real arrays, `interval(0, 1)`", and the
+    // table claims to carry the cell as §07 writes it — so the whole cell, not just the
+    // operand's half.
+    assert!(
+        errors("v = elementof(cartpow(reals, [4]))\ny = quantile.(v, 0.5)\n")[0]
+            .contains("real arrays, `interval(0, 1)`"),
+        "`quantile`'s Domains cell must be carried whole"
     );
 }
 

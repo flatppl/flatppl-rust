@@ -452,20 +452,26 @@
 //!   \"Reductions\" gives `sum` the domain \"real/complex arrays\" — so the elements
 //!   must themselves be arrays, and a nested array is not a tensor. …Use the bare
 //!   `sum(v)`, or `aggregate(sum, …)`". The head list and its §07 citations are
-//!   [`flatppl_infer::collection_domain_head`] — the reductions, the boolean
-//!   reductions, the cumulative scans and the norms/normalizations, 27 heads whose
-//!   Domains cell is arrays/vectors/tables and never a scalar.
+//!   `ops::COLLECTION_DOMAIN_HEADS` (pinned to `flatppl_infer`'s copy by a sync test) —
+//!   every head whose Domains cell is a collection and never a scalar across SIX §07
+//!   tables: Reductions, Boolean reductions, Cumulative operations, Norms and
+//!   normalization, Linear algebra, and Array and table operations.
 //!
 //!   This closed a MISLOWERING, not a gap. Every one of those heads fell through to
 //!   `ops::lower_builtin`, which lowered the head's WHOLE-ARRAY form and discarded the
 //!   `broadcast` wrapper: `sum.(v)` emitted the undotted `sum(v)`'s reduce and returned
 //!   a number at exit 0, `sum.(M)` contracted a `[2, 3]` matrix to a scalar, and the
 //!   one LEGAL spelling — `sum.(vv)` over §03's vector of vectors, whose answer is the
-//!   vector of per-inner-vector sums — also returned a single scalar. `flatppl-infer`
-//!   now refuses the scalar-element spellings statically and types the nested one; this
-//!   gate is the emitter's own half, so no wrapper is discarded even if inference is
-//!   bypassed. The nested case stays refused here because a vector of vectors has no
-//!   tensor form in this emitter.
+//!   vector of per-inner-vector sums — also returned a single scalar. `transpose.(v)`
+//!   and `adjoint.(v)` returned `%arg0` unchanged and `self_outer.(v)` emitted a
+//!   `tensor<4x4xf32>` outer product, all at exit 0 — the same bug one §07 table over,
+//!   which is why the sweep covers six tables rather than the reduction family alone.
+//!   `flatppl-infer` now refuses the scalar-element spellings statically and types the
+//!   nested one where §07 pins it; this gate is the emitter's own half, so no wrapper is
+//!   discarded **for a head in those six tables** even if inference is bypassed. A head
+//!   outside them still falls through to `lower_builtin`, so this is a scoped claim, not
+//!   a general one. The nested case stays refused here because a vector of vectors has
+//!   no tensor form in this emitter.
 //!
 //!   `ops::NON_ELEMENTWISE_PREDICATE_HEADS` overlaps deliberately: `lany`/`lall` hit
 //!   `require_predicate_head`'s structural check first, before `lower_node` runs on an
