@@ -79,6 +79,30 @@ pub fn constructor_param_names(name: &str) -> Option<Vec<String>> {
     distribution_param_names(name).or_else(|| fundamental_measure_param_names(name))
 }
 
+/// Every built-in head whose §07 Domains cell is a COLLECTION — arrays, vectors or
+/// tables, never a scalar — as `(head, §07 table, Domains cell)`, e.g.
+/// `("sum", "Reductions", "real/complex arrays")`.
+///
+/// Exposed so the two halves of the §04 broadcast rule cannot drift apart. Inference
+/// refuses `sum.(v)` over scalar elements against this domain; the StableHLO emitter
+/// refuses the same head under a `broadcast` rather than discarding the wrapper and
+/// emitting the whole-array reduction. That emitter takes this crate as a
+/// dev-dependency only, so it keeps its own copy and asserts equality against this one.
+/// A head in one list and not the other is exactly how the mislowering survived: the
+/// emitter lowered a family inference never typed.
+pub fn collection_domain_heads() -> &'static [(&'static str, &'static str, &'static str)] {
+    ops::COLLECTION_DOMAIN_HEADS
+}
+
+/// The built-ins §04 "Multi-axis aggregation" admits as an `aggregate` reduction: "The
+/// eligible built-ins are `sum`, `prod`, `mean`, `var`, `std`, `maximum`, `minimum`,
+/// `median`, `lany` and `lall`." Exposed beside [`collection_domain_heads`] so the
+/// StableHLO emitter's copy can be checked against it — a refusal that offers
+/// `aggregate` for an ineligible head sends the reader into a second refusal.
+pub fn aggregate_eligible_reductions() -> &'static [&'static str] {
+    ops::AGGREGATE_ELIGIBLE_REDUCTIONS
+}
+
 /// A message produced during inference. `Error` marks an ill-formed module
 /// (the offending nodes carry `(%failed …)` types); `Note` records an
 /// honest gap (op not yet in the catalogue, deferred feature).
