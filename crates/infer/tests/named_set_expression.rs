@@ -146,3 +146,65 @@ fn a_name_that_is_not_a_set_stays_deferred() {
         "`elementof` of a non-set name must stay deferred: {line}"
     );
 }
+
+/// `s_k = cartprod(s_{k-1}, s_{k-1})` shares one subexpression through a name, so the
+/// traversal is $2^k$ over paths only $k$ deep — the blowup a depth bound cannot see.
+/// Following refs made it reachable from a tiny file: measured on the un-budgeted fix,
+/// k=20 in a 501-byte source cost 5.0s and 847MB, quadrupling per level. The node
+/// budget is what the exponent runs out of.
+///
+/// Terminating quickly is the property under test, so the assertion is on the ANSWER
+/// (both slots deferred, no half-resolved shape) rather than a wall-clock threshold: a
+/// timing assert would be flaky on a loaded machine, while an exponential regression
+/// cannot produce this answer at all.
+#[test]
+fn a_shared_subexpression_cannot_blow_up_the_traversal() {
+    let mut src = String::from("s0 = reals\n");
+    for k in 1..=20 {
+        src.push_str(&format!("s{k} = cartprod(s{}, s{})\n", k - 1, k - 1));
+    }
+    src.push_str("x = elementof(s20)\n");
+    let line = bind_line(&src, "x");
+    assert!(
+        line.contains("(%deferred %parameterized %unknown)"),
+        "an over-budget set expression must read out deferred in BOTH slots: {line}"
+    );
+}
+
+/// The budget is a work bound, not a stinginess bound: an 11-level shared product is a
+/// 2048-component set and still resolves, which is far past anything a real model
+/// writes. This pins the headroom, so a later tightening of the budget cannot quietly
+/// start refusing ordinary sets.
+#[test]
+fn a_deeply_shared_but_affordable_set_still_resolves() {
+    let mut src = String::from("s0 = reals\n");
+    for k in 1..=11 {
+        src.push_str(&format!("s{k} = cartprod(s{}, s{})\n", k - 1, k - 1));
+    }
+    src.push_str("x = elementof(s11)\n");
+    let line = bind_line(&src, "x");
+    assert!(
+        !line.contains("%deferred") && !line.contains("%unknown"),
+        "an 11-level shared product is well within budget and must resolve: {line}"
+    );
+}
+
+/// The two slots must agree. When the element set is unreadable, the POWER is
+/// unreadable: `cartpow` must defer whole rather than wrap `%deferred` in a shape,
+/// because a `(%array 1 (4) %deferred)` type beside a `%unknown` value set describes no
+/// set at all. `nrm` is a measure, so it gives `cartpow` an unreadable element.
+#[test]
+fn cartpow_over_an_unreadable_set_defers_whole() {
+    let line = bind_line(
+        "nrm = Normal(mu = 0.0, sigma = 1.0)\nbad = cartpow(nrm, 4)\nx = elementof(bad)\n",
+        "x",
+    );
+    assert!(
+        line.contains("(%deferred %parameterized %unknown)"),
+        "cartpow over an unreadable element must defer whole, not wrap it: {line}"
+    );
+    assert!(
+        !line.contains("%array"),
+        "no half-resolved shape may survive: {line}"
+    );
+}
