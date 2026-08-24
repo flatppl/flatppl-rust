@@ -214,8 +214,9 @@ pub(crate) fn lower_linf_norm(
 /// Both are ORDER statistics: §07 defines `median` on "the order statistics
 /// $x_{(1)} \le \dots \le x_{(n)}$" and `quantile` as "linear interpolation between
 /// the order statistics of `xs`". Every route to an order statistic needs the input
-/// ranked, and this crate has no ranking primitive — `stablehlo.sort` appears
-/// nowhere in it, and neither does a top-k.
+/// ranked, and this crate has no ranking primitive — it emits no `stablehlo.sort`
+/// anywhere, and no top-k. (The name occurs only in prose like this and inside the
+/// refusal message below; no builder produces the op.)
 ///
 /// The two ways to add one, and why neither is taken here rather than deliberately:
 ///
@@ -227,10 +228,15 @@ pub(crate) fn lower_linf_norm(
 /// - **Rank-select without a sort**: $\mathrm{rank}(i) = \#\{j : x_j < x_i\} +
 ///   \#\{j < i : x_j = x_i\}$ over an $n \times n$ comparison matrix, then select
 ///   the wanted rank. Exact over the reals, and O(n²) in emitted tensor ops rather
-///   than in unrolled scalars. But it is silently WRONG in the presence of NaN:
+///   than in unrolled scalars. Unguarded it is silently WRONG in the presence of NaN:
 ///   every comparison against NaN is false, so two or more elements collide at the
 ///   same rank and the "sorted" vector then contains a fabricated element. A wrong
-///   number with no diagnostic is the one outcome worse than refusing.
+///   number with no diagnostic is the one outcome worse than refusing. That guard is
+///   UNBUILT and out of scope here, NOT unbuildable: `lany(isnan.(x))` selecting
+///   between the rank-select result and NaN is a handful of ops on top of the O(n²)
+///   emit, and both halves already lower (`isnan` is an elementwise cell, `lany`
+///   reduces to a scalar `i1`). NaN-propagation is also what `np.median` does. So
+///   this route stays open for a future wave.
 ///
 /// So this refuses, localized to the call, and names the head. The js engine
 /// implements both (its `_sortedCopy` sorts a host array), so the language has them
@@ -252,8 +258,8 @@ pub(crate) fn refuse_order_statistic(id: NodeId, which: OrderStatistic) -> EmitE
              RANKED, and this emitter has no sort — `stablehlo.sort` is not in its vocabulary and \
              neither is a top-k. Adding one is a feature (a region-carrying op, a NaN ordering \
              rule, and a runtime index for `p`), and the sort-free rank-select alternative \
-             fabricates an element whenever the input contains NaN, so this refuses rather than \
-             answering. The js engine implements both heads"
+             fabricates an element on a NaN input unless it is guarded, which it is not here, so \
+             this refuses rather than answering. The js engine implements both heads"
         ),
     )
 }

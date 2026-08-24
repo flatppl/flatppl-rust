@@ -1603,26 +1603,35 @@ fn common_shape(da: &[Option<u64>], db: &[Option<u64>]) -> Vec<Option<u64>> {
 /// operand vocabulary of `ifelse`'s condition and of §07's logical connectives.
 ///
 /// Every entry lowers to an `i1`-typed [`Value`], so the list is exactly "the
-/// boolean-producing heads this map lowers". It does NOT admit a `Bool`-typed
-/// VALUE (a bound boolean, a boolean ABI input), which stays refused as a
-/// separate gap (`flatppl-dev/stablehlo-feature-matrix.md`, prioritized gap 6).
+/// boolean-producing heads this map lowers" — §07's boolean reductions `lany`/`lall`
+/// included, since each lowers to a scalar `tensor<i1>` and is the most natural thing
+/// to condition an `ifelse` on. It does NOT admit a `Bool`-typed VALUE (a bound
+/// boolean, a boolean ABI input), which stays refused as a separate gap
+/// (`flatppl-dev/stablehlo-feature-matrix.md`, prioritized gap 6).
 const PREDICATE_HEADS: &[&str] = &[
     "in", "compare", "lt", "gt", "le", "ge", "land", "lor", "lxor", "lnot", "iszero", "equal",
-    "unequal", "isfinite", "isinf", "isnan",
+    "unequal", "isfinite", "isinf", "isnan", "lany", "lall",
 ];
+
+/// The [`PREDICATE_HEADS`] entries that do NOT lower elementwise, so `broadcast(P, …)`
+/// over them is not a predicate. §07's boolean reductions consume an array and produce
+/// ONE scalar `i1`, so a bare call is a predicate while a broadcast of one is not an
+/// elementwise lift of anything — `infer`'s broadcast cell table leaves it
+/// `%deferred`, and this keeps the gate from admitting a shape the map cannot lower.
+const NON_ELEMENTWISE_PREDICATE_HEADS: &[&str] = &["lany", "lall"];
 
 /// An `ifelse` condition / `land` operand must be one of
 /// [`PREDICATE_HEADS`], bare or under a `broadcast`. Same narrow-and-refuse
 /// discipline as `get`/`get0`'s literal-selector check: checked structurally
 /// against the *unlowered* node, before `lower_node` ever runs on it.
 ///
-/// `broadcast(P, …)` / the dotted spelling counts whenever `P` is itself in the
-/// list, because that is the ONLY route §07 gives an elementwise comparison:
-/// `infer` refuses a bare `lt(v, w)` over arrays (`ops::refuse_array_comparison`),
+/// `broadcast(P, …)` / the dotted spelling counts whenever `P` is an ELEMENTWISE
+/// entry, because that is the ONLY route §07 gives an elementwise comparison:
+/// `infer` refuses a bare `lt(v, w)` over arrays (`ops::refuse_nonscalar_operand`),
 /// so an ARRAY-shaped predicate can now only arrive dotted. It lowers to an `i1`
 /// tensor of the operand's shape — `v1 .< v2` over two `[3]` operands emits
 /// `stablehlo.compare LT … -> tensor<3xi1>` — which is exactly the property this
-/// gate selects for.
+/// gate selects for. [`NON_ELEMENTWISE_PREDICATE_HEADS`] is excluded from that arm.
 fn require_predicate_head(e: &Emitter, cond: NodeId, what: &str) -> Result<(), EmitError> {
     let head_name = |id: NodeId| match e.node(id) {
         Node::Call(c) => match c.head {
@@ -1634,7 +1643,10 @@ fn require_predicate_head(e: &Emitter, cond: NodeId, what: &str) -> Result<(), E
     let is_predicate = match head_name(cond) {
         Some((name, args)) if name == "broadcast" || name == "broadcasted" => {
             args.first().is_some_and(|h| match e.node(*h) {
-                Node::Const(sym) => PREDICATE_HEADS.contains(&e.resolve(*sym)),
+                Node::Const(sym) => {
+                    let h = e.resolve(*sym);
+                    PREDICATE_HEADS.contains(&h) && !NON_ELEMENTWISE_PREDICATE_HEADS.contains(&h)
+                }
                 _ => false,
             })
         }

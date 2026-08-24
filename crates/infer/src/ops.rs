@@ -214,14 +214,14 @@ pub(crate) fn call_rule(
         "rowstack" => rowstack_type(arg_ty(args, 0)),
         "get" => get_type(inf, args, /*base=*/ 1),
         "get0" => get_type(inf, args, /*base=*/ 0),
-        // §07 "Operator-equivalent functions" gives every comparison a SCALAR
-        // domain, so an array operand has no §07 meaning — see
-        // [`refuse_array_comparison`], which is where the citation lives.
-        "equal" | "unequal" | "lt" | "le" | "gt" | "ge"
-            if args.iter().any(|(_, t, _)| is_array_like(t))
-                || named.iter().any(|(_, _, t, _)| is_array_like(t)) =>
+        // §07 gives every comparison ("Operator-equivalent functions") and every
+        // logical connective ("Logic and conditionals") a SCALAR domain, so a
+        // non-scalar operand has no §07 meaning — see [`refuse_nonscalar_operand`],
+        // which is where the citations live.
+        "equal" | "unequal" | "lt" | "le" | "gt" | "ge" | "land" | "lor" | "lxor" | "lnot"
+            if nonscalar_operand(args, named).is_some() =>
         {
-            refuse_array_comparison(inf, id, &name, args, named)
+            refuse_nonscalar_operand(inf, id, &name, args, named)
         }
         "indicesof" | "indicesof0" => Type::Array {
             shape: Box::new([Dim::Dynamic]),
@@ -1285,24 +1285,48 @@ fn build_table(inf: &mut Inferencer<'_, '_>, cols: &[(Symbol, &Type, NodeId)]) -
 /// way. It refuses with a location diagnostic instead, pending the ruling
 /// (`TODO-flatppl-rust.md`).
 /// True iff `t` is an array or a transposed vector — the shapes §07's comparison
-/// rows do not admit. A `Table`/`Record` operand is NOT included: it takes the §04
-/// auto-splat path, which is a separate rule and a separate diagnostic.
+/// rows do not admit under any calling convention.
 fn is_array_like(t: &Type) -> bool {
     matches!(t, Type::Array { .. } | Type::TVector { .. })
 }
 
-/// A short phrase naming an [`is_array_like`] shape, for
-/// [`refuse_array_comparison`]'s message. `Type` has no `Display`, and the rank is
+/// The first operand of a comparison or a logical connective whose shape §07's
+/// scalar domains do not admit, if any.
+///
+/// An array or a transposed vector never has a scalar reading. A `Table` counts only
+/// when the call supplies more than the one positional argument §04 "Calling
+/// conventions" splats — "Auto-splatting is shallow and occurs only when a record or
+/// table is the call's sole argument" — so `gt(t, 1.0)` compares the table itself and
+/// is refused, while `gt(table(a = x, b = y))` splats to `gt(a = x, b = y)` and its
+/// operands are the columns, not the table.
+///
+/// A `Record` operand is still accepted, and the splat that carries ARRAY columns
+/// into a scalar row (`gt(table(a = v1, b = v2))`) is still silent. Both are the same
+/// class as this refusal and neither is fixed here — recorded in
+/// `flatppl-dev/TODO-flatppl-rust.md` rather than argued away.
+fn nonscalar_operand(args: &[ArgInfo], named: &[NamedInfo]) -> Option<Type> {
+    let splatting = named.is_empty() && args.len() == 1;
+    args.iter()
+        .map(|(_, t, _)| t)
+        .chain(named.iter().map(|(_, _, t, _)| t))
+        .find(|t| is_array_like(t) || (!splatting && matches!(t, Type::Table { .. })))
+        .cloned()
+}
+
+/// A short phrase naming a [`nonscalar_operand`] shape, for
+/// [`refuse_nonscalar_operand`]'s message. `Type` has no `Display`, and the rank is
 /// the part of the shape that makes the refusal legible.
-fn array_shape_phrase(t: &Type) -> String {
+fn nonscalar_shape_phrase(t: &Type) -> String {
     match t {
         Type::Array { shape, .. } => format!("a rank-{} array", shape.len()),
         Type::TVector { .. } => "a transposed vector".to_string(),
+        Type::Table { columns, .. } => format!("a {}-column table", columns.len()),
         _ => "a non-scalar".to_string(),
     }
 }
 
-/// An array operand to `equal`/`unequal`/`lt`/`le`/`gt`/`ge`.
+/// A non-scalar operand to `equal`/`unequal`/`lt`/`le`/`gt`/`ge` or to
+/// `land`/`lor`/`lxor`/`lnot`.
 ///
 /// §07 "Operator-equivalent functions" gives the comparison rows the domains
 /// `reals` (`lt`, `le`, `gt`, `ge`) and "`integers`, `booleans`, strings"
@@ -1314,44 +1338,70 @@ fn array_shape_phrase(t: &Type) -> String {
 /// elementwise route. (§05's bullet enumerates only the arithmetic operators, so §07's
 /// Domains column is the load-bearing citation here, not that bullet's examples.)
 ///
+/// §07 "Logic and conditionals" gives `land`, `lor`, `lxor` and `lnot` the domain
+/// `booleans` — the same kind of scalar value-set, in a table whose only other row
+/// (`ifelse`) spells its `anything` domain out. §05's broadcasting bullet does not
+/// enumerate them, so the Domains column carries this refusal on its own.
+///
 /// This was accepted before, and the leniency was not harmless: `infer` typed
 /// `gt(v, 3.0)` over a length-3 `v` as `Scalar(Boolean)` — a scalar — while the
 /// StableHLO emitter broadcast the same node and emitted
 /// `func.func @logdensity(%arg0: tensor<3xf32>) -> tensor<3xi1>`. The declared type
 /// and the emitted ABI disagreed on the result's SHAPE, with no diagnostic on either
-/// side. Refusing statically closes both halves at once.
+/// side. The connectives reached the same disagreement one step later:
+/// `ifelse(lnot(gt.(v, 3.0)), 1.0, 2.0)` typed `Scalar(Real)` over an operand typed a
+/// `[3]` boolean array, and the whole log-density compiled rank-lifted to
+/// `tensor<3xf32>`, exit 0. The emitter's predicate gate cannot catch that — the four
+/// connectives are `PREDICATE_HEADS` entries by design. Refusing statically closes
+/// every half at once.
 ///
 /// The diagnostic names the dotted form, which is the working route: `gt.(v, 3.0)`,
 /// `v .> 3.0` and `broadcast(gt, v, 3.0)` all reach [`broadcast_type`]'s elementwise
-/// arm and type a boolean array of `v`'s shape.
-fn refuse_array_comparison(
+/// arm and type a boolean array of `v`'s shape. A TABLE operand has no dotted route,
+/// so its message names §03's column access instead.
+fn refuse_nonscalar_operand(
     inf: &mut Inferencer<'_, '_>,
     id: NodeId,
     name: &str,
     args: &[ArgInfo],
     named: &[NamedInfo],
 ) -> Type {
-    let offender = args
-        .iter()
-        .map(|(_, t, _)| t)
-        .chain(named.iter().map(|(_, _, t, _)| t))
-        .find(|t| is_array_like(t))
-        .cloned()
-        .unwrap_or(Type::Deferred);
+    let offender = nonscalar_operand(args, named).unwrap_or(Type::Deferred);
+    let citation = if matches!(name, "land" | "lor" | "lxor" | "lnot") {
+        "spec §07 \"Logic and conditionals\" gives the logical operators the scalar \
+         domain `booleans`"
+            .to_string()
+    } else {
+        "spec §07 \"Operator-equivalent functions\" gives the comparisons the scalar \
+         domains `reals` and `integers`/`booleans`/strings, where `add`/`sub` in the \
+         same table read \"scalars or arrays of same shape\", and §05 \"Excluded \
+         constructs\" states \"No implicit operator broadcasting\""
+            .to_string()
+    };
+    let remedy = if matches!(offender, Type::Table { .. }) {
+        "Select a column and compare it elementwise instead — §03 \"Indexing\" gives \
+         column access as `t.colname` — which gives a boolean array of the column's \
+         length"
+            .to_string()
+    } else {
+        let dotted = if name == "lnot" {
+            format!("`{name}.(a)`")
+        } else {
+            format!("`{name}.(a, b)`")
+        };
+        format!(
+            "Apply it elementwise instead — {dotted}, or the dotted operator — which \
+             gives a boolean array of the operand's shape"
+        )
+    };
     inf.diags.push(crate::Diagnostic::error_at(
         id,
         format!(
-            "`{name}` expects scalar operands, got {}: spec §07 \"Operator-equivalent \
-             functions\" gives the comparisons the scalar domains `reals` and \
-             `integers`/`booleans`/strings, where `add`/`sub` in the same table read \
-             \"scalars or arrays of same shape\", and §05 \"Excluded constructs\" states \
-             \"No implicit operator broadcasting\". Apply it elementwise instead — \
-             `{name}.(a, b)`, or the dotted operator — which gives a boolean array of the \
-             operand's shape",
-            array_shape_phrase(&offender)
+            "`{name}` expects scalar operands, got {}: {citation}. {remedy}",
+            nonscalar_shape_phrase(&offender)
         ),
     ));
-    Type::Failed(format!("`{name}` applied to an array operand").into())
+    Type::Failed(format!("`{name}` applied to a non-scalar operand").into())
 }
 
 fn refuse_same_kind_constructor(inf: &mut Inferencer<'_, '_>, id: NodeId, name: &str) -> Type {
@@ -4642,7 +4692,7 @@ fn broadcast_type(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo], named: &[Named
         // boolean whatever the cell kinds were (their catalogue rows all declare
         // `result: Scalar(Boolean)`). This is the ONLY route §07 gives an
         // elementwise comparison — its own Domains column is scalar-only, which
-        // `refuse_array_comparison` now enforces — so `v .> 3.0`, `gt.(v, w)` and
+        // `refuse_nonscalar_operand` now enforces — so `v .> 3.0`, `gt.(v, w)` and
         // `broadcast(gt, v, 3.0)` are how a mask is built, and the mask is what
         // §07 "Boolean reductions" hands `lany`/`lall`. Before this the whole
         // dotted family typed `%deferred`, which left that refusal naming a route

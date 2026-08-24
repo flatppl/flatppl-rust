@@ -79,7 +79,7 @@ lp = logdensityof(lawof(record(y = draw(Normal(mu = z, sigma = 1.0)))), record(y
 
 /// The type must survive too, not just the name. A head that reached FlatPDL with
 /// its `%meta` slot dropped would emit against the wrong ABI type — which is
-/// exactly the disagreement `infer::ops::refuse_array_comparison` was added to
+/// exactly the disagreement `infer::ops::refuse_nonscalar_operand` was added to
 /// prevent on the comparison side.
 #[test]
 fn the_new_heads_carry_their_inferred_type_into_flatpdl() {

@@ -544,11 +544,12 @@
 //! - `median`/`quantile`, always — "... has no lowering here: §07 defines it as
 //!   ..., which needs the operand RANKED, and this emitter has no sort ...". Not a
 //!   domain refusal and not a spec gap: the heads are fully specified, and this
-//!   backend lacks the primitive. `stablehlo.sort` appears nowhere in the crate and
-//!   neither does a top-k; the sort-free rank-select alternative fabricates an
-//!   element whenever the input contains NaN (every comparison against NaN is
-//!   false, so two elements collide at one rank), and a wrong number with no
-//!   diagnostic is worse than refusing. The js engine implements both.
+//!   backend lacks the primitive. The crate emits no `stablehlo.sort` and no top-k;
+//!   the sort-free rank-select alternative fabricates an element whenever the input
+//!   contains NaN (every comparison against NaN is false, so two elements collide
+//!   at one rank), and a wrong number with no diagnostic is worse than refusing.
+//!   That NaN guard is unbuilt and out of scope, not unbuildable — see
+//!   `order::refuse_order_statistic`. The js engine implements both.
 //!   `order::refuse_order_statistic` carries the full argument.
 //! - `aggregate(median | lany | lall, …)` — "...: `X` IS an eligible reduction
 //!   under §04 \"Multi-axis aggregation\", but has no lowering in this emitter".

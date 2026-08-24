@@ -2518,7 +2518,7 @@ impl<'m> Emitter<'m> {
     /// operands and results" (probed at `stablehlo.or`, `stablehlo.and` and
     /// `stablehlo.maximum` alike). Promoting to `Int` instead would contradict the
     /// inferred boolean result type, which is the disagreement
-    /// `infer::ops::refuse_array_comparison` exists to prevent, so this refuses
+    /// `infer::ops::refuse_nonscalar_operand` exists to prevent, so this refuses
     /// and says why.
     pub(crate) fn prefix_scan_extremum(
         &mut self,

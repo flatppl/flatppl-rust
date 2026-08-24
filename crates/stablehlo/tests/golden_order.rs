@@ -36,8 +36,17 @@
 //! | `cummax([1, NaN, 2, 3])` | `[1, NaN, NaN, NaN]` | `np.maximum.accumulate` |
 //! | `linfnorm([NaN, 1, 2, 3])` | `NaN` | `np.linalg.norm` |
 //! | `linfnorm([])` | `0.0` | `np.linalg.norm([], inf)` |
-//! | `cummax([])` | `[]` | the empty prefix sequence |
+//! | `cummax([])` / `cummin([])` | `[]` / `[]`, shape `(0,)` | the empty prefix sequence |
 //! | `lany([])` / `lall([])` | `false` / `true` | `np.any([])` / `np.all([])` |
+//! | `ifelse(lany(v .> 3.0), 1, 2)` | `1.0` | `np.any(v > 3.0)` is `True` |
+//! | `ifelse(lall(v .> 0.0), 1, 2)` | `2.0` | `np.all(v > 0.0)` is `False` |
+//! | `ifelse(land(lany(v .> 3.0), lall(v .> 0.0)), 1, 2)` | `2.0` | `True and False` |
+//!
+//! The predicate module was executed over four operands, not one:
+//! `[0.5, 1, 2, 3]` → `2.0`/`1.0`/`2.0`, `[4, 5, 6, 7]` → `1.0`/`1.0`/`1.0`, and
+//! `[-1, -2, -3, -4]` → `2.0`/`2.0`/`2.0`, each matching numpy. All four sign
+//! combinations of the two conditions are covered, so a swapped `select` operand
+//! order or a flipped reduce identity cannot pass.
 //!
 //! Two of those rows are worth naming. `cummax([-3, -7, -1, -5])` is
 //! `[-3, -3, -1, -1]` and `cummax([-1e30, …])` is `[-1e30, …]`, so the `-inf`
@@ -216,7 +225,7 @@ outputs = (o1, o2)
 /// `stablehlo.or`, `stablehlo.and` and `stablehlo.maximum` alike, each failing with
 /// "'arith.ori' op requires the same type for all operands and results". Promoting
 /// instead would contradict the boolean result type `infer` gives the call, which is
-/// the type/ABI disagreement `infer::ops::refuse_array_comparison` exists to
+/// the type/ABI disagreement `infer::ops::refuse_nonscalar_operand` exists to
 /// prevent.
 #[test]
 fn a_boolean_cumulative_extremum_refuses_rather_than_promoting() {
@@ -359,6 +368,68 @@ fn the_boolean_reductions_reduce_in_i1_with_no_promotion() {
     }
 }
 
+/// A boolean reduction is a legal `ifelse` CONDITION — the EXECUTED artifact.
+///
+/// `lany`/`lall` lower to a scalar `tensor<i1>`, which is exactly what
+/// `PREDICATE_HEADS` admits ("Every entry lowers to an `i1`-typed `Value`"), and
+/// conditioning on one is the most natural consumer a §07 boolean reduction has. Both
+/// were missing from that list, so a bare `lany(v .> 3.0)` lowered as a module OUTPUT
+/// while `ifelse(lany(v .> 3.0), 1.0, 2.0)` refused. This is not the `Bool`-typed
+/// VALUE the list deliberately excludes (gap 6): it is a call node the map already
+/// lowers.
+///
+/// At `v = [1.5, -2.0, 3.25, 0.5]`: `np.any(v > 3.0)` is `True` → `1.0`,
+/// `np.all(v > 0.0)` is `False` → `2.0`, and their `land` is `False` → `2.0`.
+#[test]
+fn a_boolean_reduction_conditions_an_ifelse() {
+    let out = emit(
+        "\
+v = elementof(cartpow(reals, [4]))
+o1 = ifelse(lany(v .> 3.0), 1.0, 2.0)
+o2 = ifelse(lall(v .> 0.0), 1.0, 2.0)
+o3 = ifelse(land(lany(v .> 3.0), lall(v .> 0.0)), 1.0, 2.0)
+inputs = (v)
+outputs = (o1, o2, o3)
+",
+    );
+    assert_eq!(
+        out,
+        include_str!("goldens/order_boolean_predicate.mlir"),
+        "emitted predicate module drifted from tests/goldens/order_boolean_predicate.mlir"
+    );
+    // Each `select` takes a SCALAR `i1` — the reduce's result, not a rank-lifted mask.
+    assert_eq!(
+        out.matches("stablehlo.select %").count(),
+        3,
+        "three `ifelse`es, three selects:\n{out}"
+    );
+    assert!(
+        out.contains("(tensor<i1>, tensor<f32>, tensor<f32>) -> tensor<f32>"),
+        "the condition must arrive as a scalar i1:\n{out}"
+    );
+}
+
+/// The carve-out that keeps the gate honest: a broadcast of a boolean reduction is
+/// NOT a predicate. `broadcast(P, …)` counts only for the ELEMENTWISE heads, because
+/// that arm exists to admit a dotted comparison; `lany` consumes an array and yields
+/// one scalar, so a broadcast of it lifts nothing and the map has no lowering for it
+/// (`infer`'s broadcast cell table leaves it `%deferred`, no diagnostic).
+#[test]
+fn a_broadcast_boolean_reduction_is_not_a_predicate() {
+    let err = emit_err(
+        "\
+b = elementof(cartpow(booleans, [4]))
+y = ifelse(lany.(b), 1.0, 2.0)
+inputs = (b)
+outputs = (y)
+",
+    );
+    assert!(
+        err.contains("must be a boolean predicate"),
+        "a broadcast `lany` must still refuse: {err}"
+    );
+}
+
 /// The contrast held side by side, so neither head can drift onto the other's rule.
 #[test]
 fn sum_promotes_where_the_boolean_reductions_do_not() {
@@ -464,10 +535,12 @@ outputs = (y)
 // ---- §07 the order statistics: refused ----------------------------------------
 
 /// `median`/`quantile` refuse, localized to the call. Both are ORDER statistics and
-/// this crate has no sort — `stablehlo.sort` is not in its vocabulary and neither is
-/// a top-k. The refusal says so and names the reason a sort-free rank-select is not
-/// substituted: it fabricates an element whenever the input contains NaN, and a
-/// wrong number with no diagnostic is worse than refusing.
+/// this crate has no sort — it emits no `stablehlo.sort` and no top-k. The refusal
+/// says so and names the reason a sort-free rank-select is not substituted here: it
+/// fabricates an element whenever the input contains NaN, and a wrong number with no
+/// diagnostic is worse than refusing. The NaN guard that would make it safe is
+/// unbuilt and out of this wave's scope, not unbuildable — `order.rs` says which ops
+/// it would take, so a future wave does not read the route as closed.
 #[test]
 fn the_order_statistics_refuse_with_a_located_message() {
     for (head, src) in [
@@ -528,7 +601,7 @@ fn an_ineligible_reduction_still_gets_the_eligibility_message() {
 
 // ---- empty inputs -------------------------------------------------------------
 
-/// The frozen EMPTY module — the EXECUTED artifact, all four heads at length 0.
+/// The frozen EMPTY module — the EXECUTED artifact, all five heads at length 0.
 ///
 /// Every answer here is FIXED by the owner's zero-size-arrays ruling of 2026-08-20
 /// (`flatppl-dev/empty-arrays-ruling.md`, sub-ruling 2), not chosen by this wave:
@@ -565,8 +638,9 @@ o1 = linfnorm(v)
 o2 = cummax(v)
 o3 = lany(b)
 o4 = lall(b)
+o5 = cummin(v)
 inputs = (v, b)
-outputs = (o1, o2, o3, o4)
+outputs = (o1, o2, o3, o4, o5)
 ",
     );
     assert_eq!(
@@ -579,10 +653,20 @@ outputs = (o1, o2, o3, o4)
         out.contains("dense<0.0> : tensor<f32>") && !out.contains("applies stablehlo.maximum"),
         "linfnorm over an empty vector must be 0.0, not the reduce's -inf identity:\n{out}"
     );
-    // `cummax([])` is the operand itself, no `reduce_window` emitted at all.
+    // Both scans are the operand itself, no `reduce_window` emitted at all — the
+    // sibling head shares the special case, so it is executed at length 0 too.
     assert!(
         !out.contains("stablehlo.reduce_window"),
         "an empty scan emits no window op:\n{out}"
+    );
+    let ret = out
+        .lines()
+        .find(|l| l.trim_start().starts_with("return "))
+        .expect("a return line");
+    assert_eq!(
+        ret.matches("%arg0").count(),
+        2,
+        "`cummax([])` and `cummin([])` both return the operand unchanged: {ret}"
     );
     // The boolean pair DO reduce; the zero-length axis returns the init.
     assert_eq!(
