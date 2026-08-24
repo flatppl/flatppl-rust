@@ -473,6 +473,14 @@
 //!   a general one. The nested case stays refused here because a vector of vectors has
 //!   no tensor form in this emitter.
 //!
+//!   **Forward hazard for whoever wires the next collection head.** §07's remaining
+//!   tables are UNLOWERED, not scalar-domain: Convolution (`conv`, `crosscorr`), Binning
+//!   (`bincounts`), Approximation functions (`polynomial`, `bernstein`, `stepwise`) and
+//!   Array and table generation (`array`) all take a collection first argument, and each
+//!   is safe today only because `lower_builtin` answers "unsupported builtin head". Add
+//!   the head to `ops::COLLECTION_DOMAIN_HEADS` in the SAME change that wires it, or the
+//!   dotted spelling silently emits the undotted head's answer again.
+//!
 //!   `ops::NON_ELEMENTWISE_PREDICATE_HEADS` overlaps deliberately: `lany`/`lall` hit
 //!   `require_predicate_head`'s structural check first, before `lower_node` runs on an
 //!   `ifelse` condition, and that message names the bare spelling.

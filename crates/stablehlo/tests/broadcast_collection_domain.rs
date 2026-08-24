@@ -187,6 +187,36 @@ fn the_rest_of_the_two_new_tables_refuse_under_a_broadcast() {
     }
 }
 
+/// The forward hazard, pinned. §07's four remaining collection-domain tables — Convolution,
+/// Binning, Approximation functions, Array and table generation — are safe only because
+/// their heads are UNLOWERED, not because of the domain rule. This test states that
+/// out loud: each still refuses, but with "unsupported builtin head", NOT the domain
+/// message. Whoever wires one of these into `lower_builtin` will see this test flip to the
+/// domain message (good — the head joined the table) or to a PASS at exit 0 (bad — the
+/// wrapper is being discarded again, add the head to `COLLECTION_DOMAIN_HEADS`).
+#[test]
+fn the_unlowered_collection_heads_refuse_as_unsupported_not_on_the_domain_rule() {
+    for head in [
+        "conv",
+        "crosscorr",
+        "bincounts",
+        "polynomial",
+        "bernstein",
+        "stepwise",
+        "array",
+    ] {
+        let err = emit_err(&nested_src(head, "reals"));
+        assert!(
+            err.contains(&format!("unsupported builtin head '{head}'")),
+            "`{head}` is unlowered today, so the refusal comes from `lower_builtin`: {err}"
+        );
+        assert!(
+            !err.contains("under a broadcast has no tensor form"),
+            "`{head}` is deliberately NOT in COLLECTION_DOMAIN_HEADS yet: {err}"
+        );
+    }
+}
+
 /// The §07 citation follows the head into the message, so a reader is sent to the table
 /// that actually governs it.
 #[test]

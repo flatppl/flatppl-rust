@@ -1640,10 +1640,17 @@ const NON_ELEMENTWISE_PREDICATE_HEADS: &[&str] = &["lany", "lall"];
 /// head's whole-array form and discarding the wrapper, which is what `sum.(v)` did.
 ///
 /// SCOPE: the six §07 tables swept are Reductions, Boolean reductions, Cumulative
-/// operations, Norms and normalization, Linear algebra, and Array and table operations.
-/// §07's remaining tables are scalar-domain. A head outside all six still falls through
-/// to [`lower_builtin`], so "no wrapper is discarded" is a claim about these tables, not
-/// about every conceivable head.
+/// operations, Norms and normalization, Linear algebra, and Array and table operations. A
+/// head outside all six still falls through to [`lower_builtin`], so "no wrapper is
+/// discarded" is a claim about these tables, not about every conceivable head.
+///
+/// §07's remaining tables are UNLOWERED here, which is NOT the same as scalar-domain.
+/// Convolution (`conv`, `crosscorr`), Binning (`bincounts`), Approximation functions
+/// (`polynomial`, `bernstein`, `stepwise`) and Array and table generation (`array`) all
+/// take a collection first argument, and each is safe today only because
+/// [`lower_builtin`] answers "unsupported builtin head". **Wiring any of them here MUST
+/// add the head to this table in the same change**, or the dotted spelling starts
+/// discarding the wrapper again.
 ///
 /// A LOCAL copy of `flatppl_infer`'s table of the same name. This crate takes
 /// `flatppl-infer` as a dev-dependency only — the emitter reads determinized FlatPIR and
@@ -1690,7 +1697,7 @@ pub(crate) const COLLECTION_DOMAIN_HEADS: &[(&str, &str, &str)] = &[
     ("inv", "Linear algebra", "square matrices"),
     ("trace", "Linear algebra", "square matrices"),
     ("linsolve", "Linear algebra", "square `A`, vector `b`"),
-    ("qr", "Linear algebra", "m x n matrices with m >= n"),
+    ("qr", "Linear algebra", "m x n, m >= n matrices"),
     ("lower_cholesky", "Linear algebra", "positive definite `A`"),
     ("row_gram", "Linear algebra", "matrices"),
     ("col_gram", "Linear algebra", "matrices"),

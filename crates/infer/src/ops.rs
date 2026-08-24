@@ -1431,9 +1431,19 @@ fn refuse_nonscalar_operand(
 ///   and "`cat(scalar1, scalar2, ...)` … produces a vector of those scalars". So
 ///   `cat.(v, w)` is a well-formed per-element `cat` of two scalars, not a domain error.
 ///
-/// The four tables swept are Reductions (with Boolean reductions, Cumulative operations
-/// and Norms and normalization), Linear algebra, and Array and table operations. §07's
-/// other tables are scalar-domain and out of scope for this rule.
+/// The six tables swept are Reductions, Boolean reductions, Cumulative operations, Norms
+/// and normalization, Linear algebra, and Array and table operations.
+///
+/// **§07's remaining tables are UNLOWERED, not scalar-domain — a forward hazard, not a
+/// closed case.** Four of them carry a collection-domain first argument: Convolution
+/// (`conv`, `crosscorr` — "vector, vector"), Binning (`bincounts` — "vector or record of
+/// edge vectors, array or record"), Approximation functions (`polynomial`, `bernstein`,
+/// `stepwise`) and Array and table generation (`array` — "vector, integer vector, integer
+/// vector"). Dotted over scalar cells each types `%deferred` here and refuses in the
+/// emitter with "unsupported builtin head", so there is no live mislowering — but the
+/// safety comes from `lower_builtin` not lowering them AT ALL, not from this rule. Wiring
+/// any of them into `lower_builtin` MUST add the head to this table in the same change,
+/// or the dotted mislowering re-opens.
 pub(crate) const COLLECTION_DOMAIN_HEADS: &[(&str, &str, &str)] = &[
     ("sum", "Reductions", "real/complex arrays"),
     ("mean", "Reductions", "real/complex arrays"),
@@ -1473,7 +1483,7 @@ pub(crate) const COLLECTION_DOMAIN_HEADS: &[(&str, &str, &str)] = &[
     ("inv", "Linear algebra", "square matrices"),
     ("trace", "Linear algebra", "square matrices"),
     ("linsolve", "Linear algebra", "square `A`, vector `b`"),
-    ("qr", "Linear algebra", "m x n matrices with m >= n"),
+    ("qr", "Linear algebra", "m x n, m >= n matrices"),
     ("lower_cholesky", "Linear algebra", "positive definite `A`"),
     ("row_gram", "Linear algebra", "matrices"),
     ("col_gram", "Linear algebra", "matrices"),
