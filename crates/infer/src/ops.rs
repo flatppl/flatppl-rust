@@ -315,6 +315,11 @@ pub(crate) fn call_rule(
         // scalar (e.g. `aggregate(sum, [], A[.i]*B[.i])`). A non-literal axis
         // list leaves the rank unknown → defer.
         "aggregate" | "metricsum" => {
+            if name == "metricsum" {
+                if let Some(failed) = metricsum_metric_check(inf, args) {
+                    return (failed, joined);
+                }
+            }
             let elem = Type::Scalar(aggregate_result_kind(inf, args).unwrap_or_else(|| {
                 arg_ty(args, 2)
                     .and_then(elem_scalar_kind_of)
@@ -1798,6 +1803,76 @@ fn reduced_scalar(head: &str, elem: ScalarType) -> ScalarType {
 /// axis-indexed body types `%deferred`, so the fallback lands on `Real` and the
 /// three are right on the common case; only a genuinely integer-typed body
 /// (`indicesof(...)`) surfaces it.
+/// `metricsum`'s metric must be a rank-2 array of scalars — spec §04
+/// "Metric-aware Einstein summation": "It must be a square, symmetric, and
+/// invertible rank-2 array", and, under "Expression restrictions", "`metric`
+/// itself and all arrays indexed with co-/contravariant axis names in `expr`
+/// must be arrays of scalars."
+///
+/// The nested-literal case is the one worth its own message. §03 "Arrays":
+/// "Vectors of vectors are not interpreted as matrices implicitly, but can be
+/// turned into matrices explicitly using `rowstack` or `colstack`." So
+/// `[[1.0, 0.0], [0.0, -1.0]]` is a vector of two vectors, and the two lifts
+/// disagree on which axis the inner vectors become — the user has to pick, so
+/// this pass cannot pick for them.
+///
+/// `axis_count` is deliberately NOT used here: it flattens a nested array's
+/// axes into the count, so it reads a vector of vectors as rank 2 and would
+/// wave through exactly the type this check exists to reject.
+///
+/// `Some` carries the `Failed` type for the call; `None` means the metric is
+/// either well-typed or not yet known.
+fn metricsum_metric_check(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> Option<Type> {
+    let (node, ty, _) = args.first()?;
+    let (complaint, reason) = match ty {
+        Type::Deferred | Type::Any | Type::Var(_) | Type::Failed(_) => return None,
+        Type::Array { shape, elem } if shape.len() == 2 => match elem.as_ref() {
+            Type::Scalar(_) | Type::Deferred | Type::Any | Type::Var(_) => return None,
+            _ => (
+                metric_rank_complaint(ty),
+                "metricsum metric is not a rank-2 array of scalars",
+            ),
+        },
+        Type::Array { shape, elem } if shape.len() == 1 && matches!(**elem, Type::Array { .. }) => {
+            (
+                "`metricsum`'s metric is a vector of vectors, which spec §03 \"Arrays\" \
+             does not read as a matrix: \"Vectors of vectors are not interpreted as \
+             matrices implicitly, but can be turned into matrices explicitly using \
+             `rowstack` or `colstack`\". Wrap it — `rowstack(...)` makes the inner \
+             vectors the ROWS, `colstack(...)` the COLUMNS — since the two disagree \
+             and only you know which storage order you meant"
+                    .to_string(),
+                "metricsum metric is a vector of vectors",
+            )
+        }
+        other => (
+            metric_rank_complaint(other),
+            "metricsum metric is not a rank-2 array of scalars",
+        ),
+    };
+    inf.diags
+        .push(crate::Diagnostic::error_at(*node, complaint));
+    Some(Type::Failed(reason.into()))
+}
+
+/// The generic half of [`metricsum_metric_check`]'s refusal, for every metric
+/// that is not a vector of vectors — that case gets its own message.
+fn metric_rank_complaint(ty: &Type) -> String {
+    let got = match ty {
+        Type::Scalar(s) => format!("a {} scalar", scalar_word(*s)),
+        Type::Array { shape, elem } if matches!(**elem, Type::Array { .. }) => {
+            format!("a rank-{} array of arrays", shape.len())
+        }
+        Type::Array { shape, .. } => format!("a rank-{} array", shape.len()),
+        other => nonscalar_shape_phrase(other),
+    };
+    format!(
+        "`metricsum`'s metric must be a rank-2 array of scalars (spec §04 \
+         \"Metric-aware Einstein summation\": \"It must be a square, symmetric, and \
+         invertible rank-2 array\"); got {got}"
+    )
+}
+
 fn aggregate_result_kind(inf: &Inferencer<'_, '_>, args: &[ArgInfo]) -> Option<ScalarType> {
     let Node::Const(op) = inf.module.node(args.first()?.0) else {
         return None;
