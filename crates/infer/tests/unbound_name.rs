@@ -152,13 +152,15 @@ fn a_binding_shadowing_a_builtin_resolves() {
 
 /// The metric of a `metricsum` binding (§05: "The marker form `metric: C[...] :=
 /// expr`") is an ordinary reference — resolvable when bound, and reported when
-/// not.
+/// not. The `rowstack` lifts are load-bearing: §04 requires a rank-2 array of
+/// scalars, and a bare nested literal is a vector of vectors (§03), which
+/// `metricsum_metric_type.rs` pins as its own refusal.
 #[test]
 fn metricsum_metric_resolves_when_bound() {
     assert_clean(
-        "g = [[1.0, 0.0], [0.0, -1.0]]\n\
-         L1 = [[1.0, 2.0], [3.0, 4.0]]\n\
-         L2 = [[1.0, 0.0], [0.0, 1.0]]\n\
+        "g = rowstack([[1.0, 0.0], [0.0, -1.0]])\n\
+         L1 = rowstack([[1.0, 2.0], [3.0, 4.0]])\n\
+         L2 = rowstack([[1.0, 0.0], [0.0, 1.0]])\n\
          g: C[.mu^, .nu_] := L1[.mu^, .beta_] * L2[.beta^, .nu_]\n",
     );
 }
