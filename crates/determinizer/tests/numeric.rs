@@ -585,6 +585,56 @@ lp = logdensityof(d, 0.5)";
 }
 
 #[test]
+fn weighted_k_parameter_weight_splits_variate_components() {
+    // §06 "Weight arity": the variate is a 2-element array, and the weight
+    // declares exactly 2 scalar parameters, so each parameter receives one
+    // component in order — `w(v[1], v[2])`, not `w(v)`.
+    let src = "\
+g = Lebesgue(support = cartprod(interval(0.0, 1.0), interval(0.0, 1.0)))
+d = weighted((a, b) -> a * b, g)
+lp = logdensityof(d, [0.3, 0.4])";
+    let m = parse_infer(src);
+    let out = determinize(&m).expect("k-parameter weight over a matching k-array must lower");
+    assert!(
+        flatppl_determinizer::is_flatpdl(&out).is_ok(),
+        "must be FlatPDL"
+    );
+    let pir = flatppl_flatpir::write(&out);
+    assert!(
+        !pir.contains("(weighted ") && !pir.contains("(%call"),
+        "measure layer gone and no residual user-call:\n{pir}"
+    );
+    // The weight is inlined to `mul(get(v, 1), get(v, 2))`, one `get` per
+    // parameter, in order — not applied to the whole array as a single argument.
+    assert_eq!(
+        pir.matches("(get ").count(),
+        2,
+        "one `get` projection per weight parameter:\n{pir}"
+    );
+    assert!(
+        pir.contains(" 1)") && pir.contains(" 2)"),
+        "components projected at 1 and 2 (spec's 1-based indexing):\n{pir}"
+    );
+}
+
+#[test]
+fn weighted_wrong_arity_weight_refuses() {
+    // §06 "Weight arity": over a 2-element array variate, only arity 1 (whole
+    // variate) or arity 2 (one component per parameter) are allowed — arity 3
+    // is a spec error, not a silently accepted mis-binding.
+    let src = "\
+g = Lebesgue(support = cartprod(interval(0.0, 1.0), interval(0.0, 1.0)))
+d = weighted((a, b, c) -> a * b * c, g)
+lp = logdensityof(d, [0.3, 0.4])";
+    let m = parse_infer(src);
+    let e = determinize(&m).expect_err("a weight of the wrong arity must refuse, not mis-bind");
+    assert!(
+        e.reason.contains("Weight arity") || e.reason.contains("weight arity"),
+        "refusal should cite §06 Weight arity, got: {e:?}"
+    );
+}
+
+#[test]
 fn normalize_truncated_normal_structure() {
     // normalize(truncate(Normal(0,1), interval(-1,1))) scored at 0.5 →
     //   sub(density_with_gate, log(sub(touniform(base, hi), touniform(base, lo))))
