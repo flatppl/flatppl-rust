@@ -64,6 +64,15 @@ pub fn run(
     // find every `*.flatppl` file, read it, and build the initial SourceFile
     // map and FileSet.
 
+    // Directory names pruned from the workspace scan and from disk-created
+    // files (`didChangeWatchedFiles`). `node_modules` is always excluded
+    // regardless of client config — a dependency's test fixtures are never
+    // diagnostics material. The client may add more via
+    // `initializationOptions.diagnosticsExclude` (e.g. `"fixtures"` — many
+    // fixture corpora are deliberately invalid models, not user errors).
+    let mut excluded_dir_names = excluded_dir_names_from_params(&params);
+    excluded_dir_names.insert("node_modules".to_owned());
+
     let mut uri_to_file: HashMap<String, SourceFile> = HashMap::new();
 
     // Remote `load_module` / `load_data` URL sources, fed by the editor client
@@ -91,7 +100,12 @@ pub fn run(
 
     for root_uri_str in &roots {
         if let Some(path) = file_uri_to_path(root_uri_str) {
-            scan_dir(Path::new(&path), &mut db, &mut uri_to_file);
+            scan_dir(
+                Path::new(&path),
+                &mut db,
+                &mut uri_to_file,
+                &excluded_dir_names,
+            );
         }
     }
 
@@ -303,7 +317,15 @@ pub fn run(
                                 lsp_types::FileChangeType::CREATED
                                 | lsp_types::FileChangeType::CHANGED => {
                                     if let Some(path) = file_uri_to_path(&uri_str) {
-                                        if let Ok(text) = std::fs::read_to_string(&path) {
+                                        let path = Path::new(&path);
+                                        let under_excluded_dir = path
+                                            .ancestors()
+                                            .skip(1)
+                                            .any(|anc| is_excluded_dir(anc, &excluded_dir_names));
+                                        if under_excluded_dir {
+                                            continue;
+                                        }
+                                        if let Ok(text) = std::fs::read_to_string(path) {
                                             upsert_file(&mut db, &mut uri_to_file, uri_str, text);
                                         }
                                     }
@@ -554,6 +576,30 @@ fn catalogue_sources_from_params(params: &lsp_types::InitializeParams) -> Vec<St
         .unwrap_or_default()
 }
 
+/// Extract directory names to prune from the workspace scan, from
+/// `initializationOptions.diagnosticsExclude`. Defaults to `{"fixtures"}`
+/// when the client sends nothing — `node_modules` is added unconditionally
+/// by the caller, not here, since it must never be overridable.
+fn excluded_dir_names_from_params(params: &lsp_types::InitializeParams) -> HashSet<String> {
+    let configured: Option<Vec<String>> = params
+        .initialization_options
+        .as_ref()
+        .and_then(|v| v.get("diagnosticsExclude"))
+        .and_then(|v| serde_json::from_value(v.clone()).ok());
+    match configured {
+        Some(names) => names.into_iter().collect(),
+        None => HashSet::from(["fixtures".to_owned()]),
+    }
+}
+
+/// Whether `path` (a directory) should be pruned from the scan: its own
+/// final component name matches one of `excluded_dir_names` exactly.
+fn is_excluded_dir(path: &Path, excluded_dir_names: &HashSet<String>) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|name| excluded_dir_names.contains(name))
+}
+
 /// Convert a `file://` URI string to a filesystem path string, or `None` for
 /// non-`file:` schemes.
 ///
@@ -611,14 +657,24 @@ fn percent_decode(s: &str) -> String {
 
 /// Recursively walk `dir`, read every `*.flatppl` file found, and insert it
 /// into `uri_to_file`.  Unreadable files and non-UTF-8 content are skipped.
-fn scan_dir(dir: &Path, db: &mut Database, uri_to_file: &mut HashMap<String, SourceFile>) {
+/// A directory whose name is in `excluded_dir_names` is pruned entirely —
+/// none of its descendants are visited.
+fn scan_dir(
+    dir: &Path,
+    db: &mut Database,
+    uri_to_file: &mut HashMap<String, SourceFile>,
+    excluded_dir_names: &HashSet<String>,
+) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            scan_dir(&path, db, uri_to_file);
+            if is_excluded_dir(&path, excluded_dir_names) {
+                continue;
+            }
+            scan_dir(&path, db, uri_to_file, excluded_dir_names);
         } else if path.extension().and_then(|e| e.to_str()) == Some("flatppl") {
             let Ok(text) = std::fs::read_to_string(&path) else {
                 continue;
@@ -1444,6 +1500,88 @@ mod tests {
         // Nothing before the cursor: the `i > 0` guard must short-circuit, no panic.
         assert!(!tight_after_operator("", 0));
         assert!(!tight_after_operator("x", 0));
+    }
+
+    // ── excluded_dir_names_from_params / scan_dir pruning ────────────────────
+
+    #[test]
+    fn excluded_dir_names_defaults_to_fixtures() {
+        let params: lsp_types::InitializeParams =
+            serde_json::from_value(serde_json::json!({ "capabilities": {} })).unwrap();
+        let names = excluded_dir_names_from_params(&params);
+        assert_eq!(names, HashSet::from(["fixtures".to_owned()]));
+    }
+
+    #[test]
+    fn excluded_dir_names_read_from_init_options() {
+        let raw = serde_json::json!({
+            "capabilities": {},
+            "initializationOptions": { "diagnosticsExclude": ["fixtures", "demo"] }
+        });
+        let params: lsp_types::InitializeParams = serde_json::from_value(raw).unwrap();
+        let names = excluded_dir_names_from_params(&params);
+        assert_eq!(
+            names,
+            HashSet::from(["fixtures".to_owned(), "demo".to_owned()])
+        );
+    }
+
+    #[test]
+    fn excluded_dir_names_override_replaces_the_default() {
+        // A client-supplied list that omits "fixtures" drops it entirely —
+        // the default is a fallback for an ABSENT key, not a floor unioned
+        // into whatever the client sends.
+        let raw = serde_json::json!({
+            "capabilities": {},
+            "initializationOptions": { "diagnosticsExclude": ["demo"] }
+        });
+        let params: lsp_types::InitializeParams = serde_json::from_value(raw).unwrap();
+        let names = excluded_dir_names_from_params(&params);
+        assert_eq!(names, HashSet::from(["demo".to_owned()]));
+    }
+
+    #[test]
+    fn is_excluded_dir_matches_final_component_only() {
+        let excluded = HashSet::from(["fixtures".to_owned()]);
+        assert!(is_excluded_dir(Path::new("/a/b/fixtures"), &excluded));
+        // "fixtures" appears as an ancestor, but the dir itself is "b" — no match.
+        assert!(!is_excluded_dir(Path::new("/a/fixtures/b"), &excluded));
+        assert!(!is_excluded_dir(Path::new("/a/b/other"), &excluded));
+    }
+
+    #[test]
+    fn scan_dir_prunes_excluded_subtrees() {
+        // <tmp>/{good.flatppl, node_modules/leaked.flatppl, test/fixtures/bad.flatppl}
+        let root = std::env::temp_dir().join(format!(
+            "flatppl_lsp_scan_dir_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let node_modules = root.join("node_modules");
+        let fixtures = root.join("test").join("fixtures");
+        std::fs::create_dir_all(&node_modules).unwrap();
+        std::fs::create_dir_all(&fixtures).unwrap();
+        std::fs::write(root.join("good.flatppl"), "x ~ Normal(0, 1);").unwrap();
+        std::fs::write(node_modules.join("leaked.flatppl"), "bad syntax !!!").unwrap();
+        std::fs::write(fixtures.join("bad.flatppl"), "bad syntax !!!").unwrap();
+
+        let mut db = Database::default();
+        let mut uri_to_file: HashMap<String, SourceFile> = HashMap::new();
+        let excluded_dir_names = HashSet::from(["node_modules".to_owned(), "fixtures".to_owned()]);
+        scan_dir(&root, &mut db, &mut uri_to_file, &excluded_dir_names);
+
+        let scanned: Vec<String> = uri_to_file.keys().cloned().collect();
+        assert_eq!(
+            scanned.len(),
+            1,
+            "expected only good.flatppl; got: {scanned:?}"
+        );
+        assert!(scanned[0].ends_with("good.flatppl"), "got: {scanned:?}");
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     // ── position_to_byte ──────────────────────────────────────────────────────
