@@ -152,8 +152,10 @@ cat = normalize(ksuperpose(Dirac, w)(value = labels))";
 /// Over-wide Full-syntax statements break at their composition boundaries
 /// (call argument lists, dotted-broadcast operator spines, named arguments),
 /// while staying semantics-preserving and idempotent. A bare top-level
-/// operator chain cannot break (a depth-0 newline ends the statement) and is
-/// left flat. Source is inlined rather than added to `fixtures/flatppl/` so it
+/// operator chain cannot break (the printer wraps under a LEADING operator,
+/// which does not continue a depth-0 line) and is left flat. See
+/// `printer_emits_no_trailing_operator_wrap`.
+/// Source is inlined rather than added to `fixtures/flatppl/` so it
 /// stays out of the cross-engine corpus (these dotted-op forms hit a filed
 /// JS eta-expansion divergence orthogonal to printing).
 #[test]
@@ -204,6 +206,56 @@ dom = cartprod(a = interval(0.0, 10.0), b = interval(-5.0, 5.0), c0 = interval(0
         print_with(&m2, Syntax::Full),
         "wrapping is not idempotent"
     );
+}
+
+/// Trailing-operator line continuation (§05 "Statement separation") is a source
+/// form only: the printer never emits it, so a wrapped line always starts with
+/// its operator. Source that uses the continuation prints to the flat canonical
+/// form and re-parses to the same module.
+#[test]
+fn printer_emits_no_trailing_operator_wrap() {
+    let src = "\
+m = standard_module(\"particle-physics\", \"0.1\")
+a = elementof(reals)
+b = elementof(reals)
+c = elementof(cartpow(posreals, 2))
+expected = [20.0, 10.0] .*
+  m.interp_poly6_exp(0.95, 1.0, 1.05, a) .* b .+
+  [100.0, 0.0] .* c
+obs = Poisson.([20.0, 10.0] .*
+  m.interp_poly6_exp(0.95, 1.0, 1.05, a) .* b .+
+  [100.0, 0.0] .* m.interp_poly6_exp(0.95, 1.0, 1.05, a) .* c .+
+  [0.0, 100.0] .* m.interp_poly6_exp(0.95, 1.0, 1.05, b) .* c)";
+
+    const CONTINUATION_OPS: &[&str] = &[
+        "+", "-", "*", "/", "^", ".+", ".-", ".*", "./", ".^", "<", ">", "==", "!=", "<=", ">=",
+        ".<", ".>", ".==", ".!=", ".<=", ".>=", "&&", "||", ".&&", ".||", "in", "->", "=", "~",
+        ":=", ":",
+    ];
+
+    let m1 = parse(src).expect("parse trailing-operator continuations");
+    for syntax in [Syntax::Full, Syntax::Minimal] {
+        let printed = print_with(&m1, syntax);
+        for line in printed.lines() {
+            let last = line.split_whitespace().last().unwrap_or("");
+            assert!(
+                !CONTINUATION_OPS.contains(&last),
+                "printed line ends on a continuation operator: {line}"
+            );
+        }
+        let m2 = parse(&printed)
+            .unwrap_or_else(|e| panic!("re-parse of printed form failed: {e}\n{printed}"));
+        assert_eq!(
+            flatppl_flatpir::write(&m1),
+            flatppl_flatpir::write(&m2),
+            "printing changed the continued module\n--- printed ---\n{printed}"
+        );
+        assert_eq!(
+            printed,
+            print_with(&m2, syntax),
+            "printer is not idempotent"
+        );
+    }
 }
 
 /// Pins both printer levels so accidental drift is caught.

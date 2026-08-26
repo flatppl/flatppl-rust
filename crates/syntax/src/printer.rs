@@ -655,10 +655,11 @@ impl<'m> Printer<'m> {
     // A node prints flat when it fits within `WIDTH` at its starting column;
     // otherwise it breaks at its outermost composition boundary. Breaking is
     // only ever introduced INSIDE a bracket pair (call `()`, dot-call `.(`,
-    // literal `[ ]`), because the lexer treats a newline as whitespace only at
-    // nonzero bracket depth — at depth 0 it is a statement separator (§05). So
-    // a bare top-level operator chain (no enclosing bracket) is left flat; the
-    // `bracketed` flag tracks whether breaking is admissible here. The flat
+    // literal `[ ]`): a broken operator chain puts the operator at the START of
+    // the continuation line, and only a TRAILING operator continues a statement
+    // at depth 0 (§05). So a bare top-level operator chain (no enclosing
+    // bracket) is left flat; the `bracketed` flag tracks whether breaking is
+    // admissible here. The flat
     // form drives every fit/measure decision, so re-parsing and re-printing a
     // wrapped module reproduces it exactly (idempotent, semantics-preserving).
 
@@ -705,7 +706,7 @@ impl<'m> Printer<'m> {
     /// case [`full_w`](Self::full_w) keeps the measured flat text instead.
     fn break_node(&self, id: NodeId, lambda: &[Symbol], indent: usize, bracketed: bool) -> String {
         // An operator chain breaks one operand per line — but only inside a
-        // bracket, since the continuation newlines must not end the statement.
+        // bracket, since a leading operator does not continue a depth-0 line.
         if bracketed {
             if let Some(inf) = self.as_infix(id) {
                 return self.break_op(id, &inf.op, inf.lmin, inf.rmin, lambda, indent);

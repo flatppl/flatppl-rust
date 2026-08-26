@@ -5,7 +5,8 @@
 //!
 //! - **Newlines as separators only at depth 0.** Inside an unclosed `(`/`[`,
 //!   a newline is whitespace (implicit line continuation, §05); at bracket
-//!   depth 0 it becomes a [`TokenKind::Newline`] statement separator.
+//!   depth 0 it becomes a [`TokenKind::Newline`] statement separator, unless the
+//!   line ends on a `ContinuationOp` (see [`is_continuation_op`]).
 //! - **Maximal munch** for dotted operators (`.+`, `.==`, …) vs the field/axis
 //!   dot, and for the trailing-dot real literal (`1.` is `1.0`).
 //! - **Comments** (`#`, `###`) are discarded; **doc-comments** (`%`, `%%%`)
@@ -302,10 +303,38 @@ impl Lexer {
             self.bump();
         }
         // Inside brackets, newlines are whitespace (implicit continuation).
-        if self.bracket_depth == 0 {
+        if self.bracket_depth == 0 && !self.after_continuation_op() {
             self.push(TokenKind::Newline, start, line);
             self.after_value = false;
         }
+    }
+
+    /// Does the stream end with a trailing `ContinuationOp`, so this newline is
+    /// whitespace instead of a separator (§05 "Statement separation")? Blank and
+    /// comment-only lines carry the state over, because neither emits a token.
+    fn after_continuation_op(&self) -> bool {
+        let Some(last) = self.tokens.last() else {
+            return false;
+        };
+        if last.kind == TokenKind::Caret && self.caret_is_variance_marker() {
+            return false;
+        }
+        is_continuation_op(&last.kind)
+    }
+
+    /// Is the trailing `^` the upper-variance marker of an axis name (`.mu^`)
+    /// rather than the power operator (§05 axis names)? The marker must follow
+    /// the name immediately, so adjacent `Dot Name ^` spans decide it. The lower
+    /// marker needs no check: a trailing `_` lexes as part of the name.
+    fn caret_is_variance_marker(&self) -> bool {
+        let [dot, name, caret] = match self.tokens.as_slice() {
+            [.., a, b, c] => [a, b, c],
+            _ => return false,
+        };
+        dot.kind == TokenKind::Dot
+            && matches!(name.kind, TokenKind::Name(_))
+            && name.start == dot.end
+            && caret.start == name.end
     }
 
     fn push(&mut self, kind: TokenKind, start: u32, line: u32) {
@@ -765,6 +794,48 @@ impl Lexer {
     }
 }
 
+/// The `ContinuationOp` set of spec §05: every infix binary operator, the
+/// lambda arrow, and the binding operators. The unary-only `!` / `.!` and the
+/// field/axis `.` are excluded.
+fn is_continuation_op(kind: &TokenKind) -> bool {
+    match kind {
+        TokenKind::Plus
+        | TokenKind::Minus
+        | TokenKind::Star
+        | TokenKind::Slash
+        | TokenKind::Caret
+        | TokenKind::Lt
+        | TokenKind::Gt
+        | TokenKind::EqEq
+        | TokenKind::BangEq
+        | TokenKind::Le
+        | TokenKind::Ge
+        | TokenKind::AmpAmp
+        | TokenKind::PipePipe
+        | TokenKind::DotPlus
+        | TokenKind::DotMinus
+        | TokenKind::DotStar
+        | TokenKind::DotSlash
+        | TokenKind::DotCaret
+        | TokenKind::DotLt
+        | TokenKind::DotGt
+        | TokenKind::DotEqEq
+        | TokenKind::DotBangEq
+        | TokenKind::DotLe
+        | TokenKind::DotGe
+        | TokenKind::DotAmpAmp
+        | TokenKind::DotPipePipe
+        | TokenKind::Arrow
+        | TokenKind::Assign
+        | TokenKind::Tilde
+        | TokenKind::Walrus
+        | TokenKind::Colon => true,
+        // `in` is a CompOp the lexer sees as a plain name (§05 reserved words).
+        TokenKind::Name(n) => n == "in",
+        _ => false,
+    }
+}
+
 fn is_op_start(c: char) -> bool {
     matches!(
         c,
@@ -837,6 +908,64 @@ mod tests {
                 TokenKind::Name("x".into()),
             ]
         );
+    }
+
+    #[test]
+    fn trailing_operator_joins_the_next_line() {
+        // §05 "Statement separation": at depth 0 a newline after a
+        // `ContinuationOp` is whitespace.
+        for op in [
+            "+", "-", "*", "/", "^", "<", ">=", "==", "!=", ".+", ".*", ".==", "&&", "||", ".&&",
+            "in", "->", "=", "~", ":=", ":",
+        ] {
+            let src = format!("x {op}\ny");
+            assert!(
+                !kinds(&src).contains(&TokenKind::Newline),
+                "trailing `{op}` should continue the line"
+            );
+        }
+    }
+
+    #[test]
+    fn blank_and_comment_lines_do_not_end_a_join() {
+        assert_eq!(
+            kinds("x = a +\n\n # only a comment\n\nb"),
+            vec![
+                TokenKind::Name("x".into()),
+                TokenKind::Assign,
+                TokenKind::Name("a".into()),
+                TokenKind::Plus,
+                TokenKind::Name("b".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn trailing_comment_does_not_end_a_join() {
+        assert_eq!(
+            kinds("x = a + # why\nb"),
+            vec![
+                TokenKind::Name("x".into()),
+                TokenKind::Assign,
+                TokenKind::Name("a".into()),
+                TokenKind::Plus,
+                TokenKind::Name("b".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn axis_variance_caret_is_not_a_continuation_op() {
+        // `.mu^` is the upper-variance marker, so the newline still separates.
+        assert!(kinds("x = .mu^\ny = 1").contains(&TokenKind::Newline));
+        // A `^` not immediately after an axis name is the power operator.
+        assert!(!kinds("x = a^\nb").contains(&TokenKind::Newline));
+        assert!(!kinds("x = .mu ^\nb").contains(&TokenKind::Newline));
+    }
+
+    #[test]
+    fn leading_operator_does_not_join() {
+        assert!(kinds("x = a\n* b").contains(&TokenKind::Newline));
     }
 
     #[test]
