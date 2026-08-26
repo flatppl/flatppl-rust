@@ -319,6 +319,9 @@ pub(crate) fn call_rule(
                 if let Some(failed) = metricsum_metric_check(inf, args) {
                     return (failed, joined);
                 }
+                if let Some(failed) = metricsum_expr_check(inf, args) {
+                    return (failed, joined);
+                }
             }
             let elem = Type::Scalar(aggregate_result_kind(inf, args).unwrap_or_else(|| {
                 arg_ty(args, 2)
@@ -1871,6 +1874,109 @@ fn metric_rank_complaint(ty: &Type) -> String {
          \"Metric-aware Einstein summation\": \"It must be a square, symmetric, and \
          invertible rank-2 array\"); got {got}"
     )
+}
+
+/// The `expr` half of the same sentence [`metricsum_metric_check`] enforces —
+/// spec §04 "Metric-aware Einstein summation", "Expression restrictions":
+/// "`metric` itself and all arrays indexed with co-/contravariant axis names in
+/// `expr` must be arrays of scalars."
+///
+/// The sentence names co-/contravariant axis names, so a container reached only
+/// through neutral `aggregate` axes is outside it. Variance-marked axis names
+/// are "lexically scoped to the enclosing `metricsum`", so the walk stops at a
+/// nested `aggregate` / `metricsum` — that call gets its own visit here.
+///
+/// `axis_count` and `flatten_dims` are deliberately NOT used: both flatten a
+/// nested array's axes into the count, so they read a vector of vectors as
+/// rank 2 and would wave through exactly the type this check exists to reject.
+///
+/// `Some` carries the `Failed` type for the call; `None` means every
+/// variance-indexed container is either well-typed or not yet known.
+fn metricsum_expr_check(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> Option<Type> {
+    let mut bad = None;
+    variance_container_scan(inf, args.get(2)?.0, &mut bad);
+    let (node, complaint, reason) = bad?;
+    inf.diags.push(crate::Diagnostic::error_at(node, complaint));
+    Some(Type::Failed(reason.into()))
+}
+
+/// Walk a `metricsum` body for the first container indexed by a variance-marked
+/// axis that is not an array of scalars. First offender wins — the rest of the
+/// body would cascade off the same nesting mistake.
+fn variance_container_scan(
+    inf: &mut Inferencer<'_, '_>,
+    node: NodeId,
+    bad: &mut Option<(NodeId, String, &'static str)>,
+) {
+    if bad.is_some() {
+        return;
+    }
+    let Node::Call(c) = inf.module.node(node).clone() else {
+        return;
+    };
+    if let flatppl_core::CallHead::Builtin(op) = c.head {
+        let name = inf.module.resolve(op).to_string();
+        if name == "aggregate" || name == "metricsum" {
+            return;
+        }
+        if (name == "get" || name == "get0") && c.args.len() >= 2 {
+            let variance_marked = c.args[1..]
+                .iter()
+                .any(|&i| matches!(inf.module.node(i), Node::Axis(ax) if ax.variance.is_some()));
+            if variance_marked {
+                *bad = variance_container_complaint(inf, c.args[0]);
+                if bad.is_some() {
+                    return;
+                }
+            }
+        }
+    }
+    for &a in c.args.iter() {
+        variance_container_scan(inf, a, bad);
+    }
+    for n in c.named.iter() {
+        variance_container_scan(inf, n.value, bad);
+    }
+}
+
+/// The refusal for one variance-indexed container, or `None` when it is an array
+/// of scalars or its type is not yet known. A container that is not an array at
+/// all is a different error, left to `get`'s own rule.
+fn variance_container_complaint(
+    inf: &mut Inferencer<'_, '_>,
+    container: NodeId,
+) -> Option<(NodeId, String, &'static str)> {
+    let ty = inf.infer_node(container).0;
+    let Type::Array { elem, .. } = &ty else {
+        return None;
+    };
+    match elem.as_ref() {
+        Type::Scalar(_) | Type::Deferred | Type::Any | Type::Var(_) | Type::Failed(_) => None,
+        Type::Array { .. } => Some((
+            container,
+            "this `metricsum` tensor is a vector of vectors, which spec §03 \"Arrays\" \
+             does not read as a matrix: \"Vectors of vectors are not interpreted as \
+             matrices implicitly, but can be turned into matrices explicitly using \
+             `rowstack` or `colstack`\". Spec §04 \"Expression restrictions\" requires \
+             every array indexed with co-/contravariant axis names to be an array of \
+             scalars, so wrap it — `rowstack(...)` makes the inner vectors the ROWS, \
+             `colstack(...)` the COLUMNS — since the two disagree and only you know \
+             which storage order you meant"
+                .to_string(),
+            "metricsum tensor is a vector of vectors",
+        )),
+        other => Some((
+            container,
+            format!(
+                "an array indexed with co-/contravariant axis names must be an array of \
+                 scalars (spec §04 \"Expression restrictions\": \"`metric` itself and all \
+                 arrays indexed with co-/contravariant axis names in `expr` must be arrays \
+                 of scalars\"); got an array whose element is {}",
+                nonscalar_shape_phrase(other)
+            ),
+            "metricsum tensor is not an array of scalars",
+        )),
+    }
 }
 
 fn aggregate_result_kind(inf: &Inferencer<'_, '_>, args: &[ArgInfo]) -> Option<ScalarType> {
