@@ -323,18 +323,38 @@ impl Lexer {
     }
 
     /// Is the trailing `^` the upper-variance marker of an axis name (`.mu^`)
-    /// rather than the power operator (§05 axis names)? The marker must follow
-    /// the name immediately, so adjacent `Dot Name ^` spans decide it. The lower
-    /// marker needs no check: a trailing `_` lexes as part of the name.
+    /// rather than the power operator (§05 axis names)? Three conditions, all
+    /// needed: adjacent `Dot Name ^` spans, because the marker must follow the
+    /// name immediately; and a `.` that opens an axis label rather than a field
+    /// access, which the parser reads off the same position (a leading `.name`
+    /// is an axis, a `.name` after a value is postfix field access). So `a.b^`
+    /// ends on the power operator and continues the line. The lower marker needs
+    /// no check: a trailing `_` lexes as part of the name.
     fn caret_is_variance_marker(&self) -> bool {
         let [dot, name, caret] = match self.tokens.as_slice() {
             [.., a, b, c] => [a, b, c],
             _ => return false,
         };
-        dot.kind == TokenKind::Dot
-            && matches!(name.kind, TokenKind::Name(_))
-            && name.start == dot.end
-            && caret.start == name.end
+        let adjacent =
+            dot.kind == TokenKind::Dot && name.start == dot.end && caret.start == name.end;
+        adjacent && matches!(name.kind, TokenKind::Name(_)) && !self.dot_follows_a_value()
+    }
+
+    /// Could the token before the trailing `Dot Name ^` end an expression? Then
+    /// the `.` is field access, not an axis label.
+    fn dot_follows_a_value(&self) -> bool {
+        let Some(before) = self.tokens.len().checked_sub(4).map(|i| &self.tokens[i]) else {
+            return false;
+        };
+        matches!(
+            before.kind,
+            TokenKind::Int(_)
+                | TokenKind::Real(_)
+                | TokenKind::Str(_)
+                | TokenKind::Name(_)
+                | TokenKind::RParen
+                | TokenKind::RBracket
+        )
     }
 
     fn push(&mut self, kind: TokenKind, start: u32, line: u32) {
@@ -927,6 +947,23 @@ mod tests {
     }
 
     #[test]
+    fn semicolon_still_separates_after_a_trailing_operator() {
+        // §05 names only newlines in the continuation rule; `;` stays a hard
+        // statement separator even directly after a `ContinuationOp`.
+        assert_eq!(
+            kinds("x = 1 +;y"),
+            vec![
+                TokenKind::Name("x".into()),
+                TokenKind::Assign,
+                TokenKind::Int(1),
+                TokenKind::Plus,
+                TokenKind::Semi,
+                TokenKind::Name("y".into()),
+            ]
+        );
+    }
+
+    #[test]
     fn blank_and_comment_lines_do_not_end_a_join() {
         assert_eq!(
             kinds("x = a +\n\n # only a comment\n\nb"),
@@ -961,6 +998,28 @@ mod tests {
         // A `^` not immediately after an axis name is the power operator.
         assert!(!kinds("x = a^\nb").contains(&TokenKind::Newline));
         assert!(!kinds("x = .mu ^\nb").contains(&TokenKind::Newline));
+        // A `.name` after a value is field access, so its `^` is the operator.
+        assert!(!kinds("x = a.b^\nc").contains(&TokenKind::Newline));
+    }
+
+    #[test]
+    fn a_semicolon_stays_a_hard_separator() {
+        // §05 makes `;` and a newline equivalent separators, but only a NEWLINE
+        // after a `ContinuationOp` is whitespace. A depth-0 `;` still separates,
+        // so `x = 1 +; y = 2` is a parse error rather than a continuation.
+        assert_eq!(
+            kinds("x = 1 +; y = 2"),
+            vec![
+                TokenKind::Name("x".into()),
+                TokenKind::Assign,
+                TokenKind::Int(1),
+                TokenKind::Plus,
+                TokenKind::Semi,
+                TokenKind::Name("y".into()),
+                TokenKind::Assign,
+                TokenKind::Int(2),
+            ]
+        );
     }
 
     #[test]

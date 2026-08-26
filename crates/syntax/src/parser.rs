@@ -1639,6 +1639,12 @@ mod tests {
     }
 
     #[test]
+    fn a_trailing_operator_does_not_continue_across_a_semicolon() {
+        assert!(parse("x = 1 +; 2").is_err());
+        assert!(parse("x = 1 +\n2").is_ok());
+    }
+
+    #[test]
     fn node_at_offset_finds_the_inner_literal() {
         let src = "z = add(1, 2)";
         let m = parse(src).expect("parses");
