@@ -154,6 +154,34 @@ fn fmt_invalid_syntax_reports_diagnostic() {
 }
 
 #[test]
+fn fmt_check_invalid_syntax_file_errors_and_leaves_file_untouched() {
+    let dir = Scratch::new("checkbadsyntax");
+    let f = dir.path("m.flatppl");
+    let bad = "mu = 1.0 +\n";
+    fs::write(&f, bad).unwrap();
+
+    let out = bin().arg("fmt").arg("--check").arg(&f).output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(!out.stderr.is_empty());
+    // A parse failure is a hard error, not "dirty" — it must not be reported
+    // as the generic "not canonically formatted" outcome.
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("not canonically formatted"));
+    assert_eq!(fs::read_to_string(&f).unwrap(), bad);
+}
+
+#[test]
+fn fmt_inplace_invalid_syntax_does_not_write_file() {
+    let dir = Scratch::new("inplacebadsyntax");
+    let f = dir.path("m.flatppl");
+    let bad = "mu = 1.0 +\n";
+    fs::write(&f, bad).unwrap();
+
+    let out = bin().arg("fmt").arg(&f).output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(fs::read_to_string(&f).unwrap(), bad);
+}
+
+#[test]
 fn fmt_stdin_invalid_syntax_errors() {
     use std::io::Write;
     let mut child = bin()
