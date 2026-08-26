@@ -1609,6 +1609,42 @@ mod tests {
     }
 
     #[test]
+    fn trailing_operator_continuation_parses_to_one_statement() {
+        let joined = parse("rate = mu_sig * yield_sig +\n  mu_bkg * yield_bkg").expect("parses");
+        let flat = parse("rate = mu_sig * yield_sig + mu_bkg * yield_bkg").expect("parses");
+        assert_eq!(crate::print(&joined), crate::print(&flat));
+        assert_eq!(joined.bindings().count(), 1);
+    }
+
+    #[test]
+    fn trailing_binder_continuation_parses_to_one_statement() {
+        for src in [
+            "x ~\n  Normal(0, 1)",
+            "x =\n  1",
+            "g = eye(2)\nL = eye(2)\ng:\n  M[.mu^, .rho_] := L[.mu^, .rho_]",
+        ] {
+            parse(src).unwrap_or_else(|e| panic!("{src:?}: {e}"));
+        }
+    }
+
+    #[test]
+    fn axis_variance_marker_ends_the_statement() {
+        let m = parse("g = eye(2)\nL = eye(2)\ng: M[.mu^] := L[.mu^]\ny = 2").expect("parses");
+        assert_eq!(m.bindings().count(), 4);
+    }
+
+    #[test]
+    fn leading_operator_is_still_a_parse_error() {
+        assert!(parse("x = a\n* b").is_err());
+    }
+
+    #[test]
+    fn a_trailing_operator_does_not_continue_across_a_semicolon() {
+        assert!(parse("x = 1 +; 2").is_err());
+        assert!(parse("x = 1 +\n2").is_ok());
+    }
+
+    #[test]
     fn node_at_offset_finds_the_inner_literal() {
         let src = "z = add(1, 2)";
         let m = parse(src).expect("parses");
