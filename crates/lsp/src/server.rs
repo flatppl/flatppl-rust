@@ -1527,6 +1527,29 @@ mod tests {
     }
 
     #[test]
+    fn excluded_dir_names_override_replaces_the_default() {
+        // A client-supplied list that omits "fixtures" drops it entirely —
+        // the default is a fallback for an ABSENT key, not a floor unioned
+        // into whatever the client sends.
+        let raw = serde_json::json!({
+            "capabilities": {},
+            "initializationOptions": { "diagnosticsExclude": ["demo"] }
+        });
+        let params: lsp_types::InitializeParams = serde_json::from_value(raw).unwrap();
+        let names = excluded_dir_names_from_params(&params);
+        assert_eq!(names, HashSet::from(["demo".to_owned()]));
+    }
+
+    #[test]
+    fn is_excluded_dir_matches_final_component_only() {
+        let excluded = HashSet::from(["fixtures".to_owned()]);
+        assert!(is_excluded_dir(Path::new("/a/b/fixtures"), &excluded));
+        // "fixtures" appears as an ancestor, but the dir itself is "b" — no match.
+        assert!(!is_excluded_dir(Path::new("/a/fixtures/b"), &excluded));
+        assert!(!is_excluded_dir(Path::new("/a/b/other"), &excluded));
+    }
+
+    #[test]
     fn scan_dir_prunes_excluded_subtrees() {
         // <tmp>/{good.flatppl, node_modules/leaked.flatppl, test/fixtures/bad.flatppl}
         let root = std::env::temp_dir().join(format!(
