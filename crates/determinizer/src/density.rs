@@ -3157,8 +3157,8 @@ fn weight_is_variate_dependent(m: &Module, w_node: NodeId) -> bool {
 /// is a constant/scalar OR a function of the variate (§06 "Density of composed measures").
 /// A constant/scalar
 /// weight is used as-is (`log(w) + density`); a variate-dependent (function)
-/// weight is **applied at the variate** (`log w(v) + density`), with `w(v)` =
-/// `build_user_call(m, w_node, v)` — see [`weight_is_variate_dependent`].
+/// weight is **applied at the variate** per §06 "Weight arity" — see
+/// [`build_weight_call`].
 fn lower_weighted(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseError> {
     let (w_node, m_inner) = {
         let c = expect_builtin_call(m, node, "weighted")
@@ -3171,7 +3171,7 @@ fn lower_weighted(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Ref
     let inner_density = lower_measure_density(m, m_inner, v)?;
     // log w + density; a variate-dependent (function) weight is applied at v: log w(v).
     let w_scored = if weight_is_variate_dependent(m, w_node) {
-        build_user_call(m, w_node, v)
+        build_weight_call(m, w_node, v)?
     } else {
         w_node
     };
@@ -3184,7 +3184,7 @@ fn lower_weighted(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Ref
 /// The log-weight is
 /// already in log space, so there is no outer `log`: a constant/scalar `ℓ` is used
 /// as-is, and a variate-dependent (function) log-weight is **applied at the
-/// variate** (`ℓ(v) + density`), with `ℓ(v)` = `build_user_call(m, lw_node, v)`.
+/// variate** per §06 "Weight arity" — see [`build_weight_call`].
 fn lower_logweighted(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseError> {
     let (lw_node, m_inner) = {
         let c = expect_builtin_call(m, node, "logweighted")
@@ -3196,11 +3196,99 @@ fn lower_logweighted(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, 
     };
     let inner_density = lower_measure_density(m, m_inner, v)?;
     let lw_scored = if weight_is_variate_dependent(m, lw_node) {
-        build_user_call(m, lw_node, v)
+        build_weight_call(m, lw_node, v)?
     } else {
         lw_node
     };
     Ok(build_call(m, "add", &[lw_scored, inner_density]))
+}
+
+/// The declared parameter count of a variate-dependent `weighted`/`logweighted`
+/// weight, for the §06 "Weight arity" check in [`build_weight_call`]. Mirrors
+/// [`weight_is_variate_dependent`]'s two detection paths (a reified callable's
+/// inferred `Type::Function`/`Type::Kernel`, or an inline `functionof`/`kernelof`
+/// reification whose type inference left `%deferred`), reading the boundary's
+/// `%specinputs` list directly in the second case since the type carries no count.
+fn weight_declared_arity(m: &Module, w_node: NodeId) -> Option<usize> {
+    if let Some(Type::Function { inputs }) | Some(Type::Kernel { inputs, .. }) = m.type_of(w_node) {
+        return Some(inputs.len());
+    }
+    let (resolved, _) = resolve_ref_one(m, w_node);
+    if let Some(Type::Function { inputs }) | Some(Type::Kernel { inputs, .. }) = m.type_of(resolved)
+    {
+        return Some(inputs.len());
+    }
+    if let Node::Call(c) = m.node(resolved) {
+        if let Some(Inputs::Spec(entries)) = &c.inputs {
+            return Some(entries.len());
+        }
+    }
+    None
+}
+
+/// The static length of a 1-D array type, or `None` for a non-array or a
+/// dynamically-sized array — the latter can never satisfy the k-parameter form,
+/// since §06 "Weight arity" requires a FIXED k-element variate.
+fn array_len(m: &Module, node: NodeId) -> Option<usize> {
+    match m.type_of(node) {
+        Some(Type::Array { shape, .. }) if shape.len() == 1 => match shape[0] {
+            Dim::Static(n) => Some(n as usize),
+            Dim::Dynamic => None,
+        },
+        _ => None,
+    }
+}
+
+/// Apply a variate-dependent `weighted`/`logweighted` weight at the variate `v`,
+/// per §06 "Weight arity": a one-parameter weight receives the variate whole
+/// (`w(v)`); when `v` is a k-element array (k ≥ 2), a weight of exactly k scalar
+/// parameters instead receives one component per parameter, in order
+/// (`w(v[1], …, v[k])`); any other arity over a k-array is a spec error, refused
+/// here rather than left for [`crate::canon::inline::inline_user_calls`] to
+/// reject with a generic (and, for this construct, misleading — it always
+/// tried one argument) arity-mismatch message.
+///
+/// **Scope limit.** The array-length check only fires when `v` itself is a
+/// fixed-length array — a non-array variate falls back to the historical
+/// single-argument call unconditionally, even when the weight declares more
+/// than one input. That input list is not always a plain positional parameter
+/// roster: a `functionof`/`kernelof` reification's boundary can name a
+/// CAPTURED value alongside the variate parameter (e.g. `functionof(mul(coeff,
+/// _x_), x = _x_, coeff = coeff)`, closing over an outer θ), which is a
+/// different, already-guarded failure mode (θ captured inside a reification
+/// input — see `lower_likelihoodof_at_point`'s `subtree_capturing_reification_input`
+/// check) than the plain k-parameter split this function performs. Refusing
+/// here on arity alone would preempt that more specific diagnostic with a
+/// misleading "not a fixed-length array" message, for a case §06 "Weight arity"
+/// was never written to describe.
+fn build_weight_call(m: &mut Module, w_node: NodeId, v: NodeId) -> Result<NodeId, RefuseError> {
+    let Some(k) = weight_declared_arity(m, w_node) else {
+        return Ok(build_user_call(m, w_node, v));
+    };
+    if k <= 1 {
+        return Ok(build_user_call(m, w_node, v));
+    }
+    let Some(v_len) = array_len(m, v) else {
+        return Ok(build_user_call(m, w_node, v));
+    };
+    if v_len != k {
+        return Err(refuse(
+            w_node,
+            m,
+            &format!(
+                "weight declares {k} parameters, but the variate is a {v_len}-element array \
+                 (spec §06 \"Weight arity\": only 1 parameter (the whole variate) or exactly \
+                 {v_len} parameters (one component each) are allowed)"
+            ),
+        ));
+    }
+    let components: Vec<NodeId> = (1..=k as i64)
+        .map(|i| {
+            let idx = m.alloc(Node::Lit(Scalar::Int(i)));
+            build_call(m, "get", &[v, idx])
+        })
+        .collect();
+    Ok(build_user_call_n(m, w_node, components))
 }
 
 /// `logdensityof(superpose(M₁, …, Mₖ), v)` = `logsumexp([density(M₁,v), …, density(Mₖ,v)])`
@@ -7030,9 +7118,16 @@ pub(crate) fn build_call(m: &mut Module, head: &str, args: &[NodeId]) -> NodeId 
 
 /// Allocate a user-function call `(%call callee arg)`.
 pub(crate) fn build_user_call(m: &mut Module, callee: NodeId, arg: NodeId) -> NodeId {
+    build_user_call_n(m, callee, vec![arg])
+}
+
+/// Allocate a user-function call `(%call callee arg1 arg2 …)` — the
+/// multi-argument form [`build_weight_call`] needs for the §06 "Weight arity"
+/// k-parameter split, where [`build_user_call`]'s single argument does not fit.
+pub(crate) fn build_user_call_n(m: &mut Module, callee: NodeId, args: Vec<NodeId>) -> NodeId {
     m.alloc(Node::Call(Call {
         head: CallHead::User(callee),
-        args: vec![arg].into(),
+        args: args.into(),
         named: Vec::<NamedArg>::new().into(),
         inputs: None,
     }))
