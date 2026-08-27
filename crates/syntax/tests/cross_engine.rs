@@ -135,6 +135,10 @@ const KNOWN_DIVERGENCES: &[(&str, &str)] = &[
         "JS folds `neg` of a literal into a negative literal",
     ),
     (
+        "js:nested-broadcast-mvnormal-inner",
+        "JS folds `neg` of a literal into a negative literal",
+    ),
+    (
         "js:normal-mixture",
         "JS folds `neg` of a literal into a negative literal",
     ),
@@ -149,6 +153,10 @@ const KNOWN_DIVERGENCES: &[(&str, &str)] = &[
     (
         "js:polyeval-iid-broadcast-chain",
         "JS eta-expands dotted-op `broadcast(mul, …)` heads",
+    ),
+    (
+        "js:random-intercepts",
+        "JS eta-expands dotted-op `broadcast(add, …)` heads",
     ),
     (
         "js:rasch-two-parameter",
