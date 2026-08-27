@@ -123,24 +123,12 @@ const KNOWN_DIVERGENCES: &[(&str, &str)] = &[
         "JS resolves a user alias binding to its target at call sites",
     ),
     (
-        "js:hierarchical-repeated-measures",
-        "fixture uses off-spec bare-name `kernelof` boundary inputs (spec \
-         §11 admits only an ancestor-subgraph node or a placeholder)",
-    ),
-    (
         "js:horseshoe",
         "JS folds `neg` of a literal into a negative literal",
     ),
     (
         "js:joint-mvnormal-component",
-        "fixture uses off-spec bare-name `kernelof` boundary inputs (spec \
-         §11 admits only an ancestor-subgraph node or a placeholder)",
-    ),
-    (
-        "js:jointchain-cat-chain",
-        "fixture uses off-spec bare-name `kernelof` boundary inputs (spec \
-         §11 admits only an ancestor-subgraph node or a placeholder); the \
-         spec spelling needs the jointchain step-0 recogniser widened first",
+        "JS folds `neg` of a literal into a negative literal",
     ),
     (
         "js:metricsum-tensor",
