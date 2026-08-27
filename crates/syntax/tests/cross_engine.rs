@@ -51,24 +51,16 @@ const KNOWN_DIVERGENCES: &[(&str, &str)] = &[
         "JS emits `get_field` for field access (spec: `get`)",
     ),
     (
-        "rust:minimal",
-        "JS eagerly lowers `kernelof` to `functionof(lawof(…))`",
-    ),
-    (
         "rust:modules",
         "JS `toSexpr` crashes on `load_module` %assign substitutions",
     ),
     (
-        "js:ar1-noise-estimation",
-        "JS eagerly lowers `kernelof` to `functionof(lawof(…))`",
-    ),
-    (
         "js:bayesian_inference_1",
-        "JS eagerly lowers `kernelof` to `functionof(lawof(…))`",
+        "JS folds `neg` of a literal into a negative literal",
     ),
     (
         "js:bayesian_inference_2",
-        "JS eagerly lowers `kernelof` to `functionof(lawof(…))`",
+        "JS folds `neg` of a literal into a negative literal",
     ),
     (
         "js:bayesian_inference_3",
@@ -132,11 +124,8 @@ const KNOWN_DIVERGENCES: &[(&str, &str)] = &[
     ),
     (
         "js:hierarchical-repeated-measures",
-        "fixture uses off-spec bare-name `kernelof` boundary inputs",
-    ),
-    (
-        "js:hierarchical-state-space",
-        "fixture uses off-spec bare-name `kernelof` boundary inputs",
+        "fixture uses off-spec bare-name `kernelof` boundary inputs (spec \
+         §11 admits only an ancestor-subgraph node or a placeholder)",
     ),
     (
         "js:horseshoe",
@@ -144,19 +133,18 @@ const KNOWN_DIVERGENCES: &[(&str, &str)] = &[
     ),
     (
         "js:joint-mvnormal-component",
-        "fixture uses off-spec bare-name `kernelof` boundary inputs",
+        "fixture uses off-spec bare-name `kernelof` boundary inputs (spec \
+         §11 admits only an ancestor-subgraph node or a placeholder)",
     ),
     (
         "js:jointchain-cat-chain",
-        "fixture uses off-spec bare-name `kernelof` boundary inputs",
+        "fixture uses off-spec bare-name `kernelof` boundary inputs (spec \
+         §11 admits only an ancestor-subgraph node or a placeholder); the \
+         spec spelling needs the jointchain step-0 recogniser widened first",
     ),
     (
         "js:metricsum-tensor",
         "JS folds `neg` of a literal into a negative literal",
-    ),
-    (
-        "js:minimal",
-        "JS eagerly lowers `kernelof` to `functionof(lawof(…))`",
     ),
     (
         "js:normal-mixture",
@@ -184,15 +172,11 @@ const KNOWN_DIVERGENCES: &[(&str, &str)] = &[
     ),
     (
         "js:simple-transport2",
-        "JS eagerly lowers `kernelof` to `functionof(lawof(…))`",
+        "JS decomposition export: `%mlhs:` temps + 0-based `tuple_get`",
     ),
     (
         "js:vector-obs-mvnormal",
         "JS folds `neg` of a literal into a negative literal",
-    ),
-    (
-        "js:zero-inflated-binomial",
-        "JS eagerly lowers `kernelof` to `functionof(lawof(…))`",
     ),
 ];
 
