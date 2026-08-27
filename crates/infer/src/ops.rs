@@ -316,6 +316,9 @@ pub(crate) fn call_rule(
         // list leaves the rank unknown → defer.
         "aggregate" | "metricsum" => {
             if name == "metricsum" {
+                if let Some(failed) = metricsum_neutral_axis_check(inf, args) {
+                    return (failed, joined);
+                }
                 if let Some(failed) = metricsum_metric_check(inf, args) {
                     return (failed, joined);
                 }
@@ -1806,6 +1809,80 @@ fn reduced_scalar(head: &str, elem: ScalarType) -> ScalarType {
 /// axis-indexed body types `%deferred`, so the fallback lands on `Real` and the
 /// three are right on the common case; only a genuinely integer-typed body
 /// (`indicesof(...)`) surfaces it.
+/// Spec §04 "Metric-aware Einstein summation" / "Static checks": "bare neutral
+/// aggregate axes (`.i` without a variance marker) are not allowed inside
+/// `metricsum`." The same section states variance-marked axis names are
+/// "required inside `metricsum`".
+///
+/// A neutral axis has no lowering here: "each `_` (lower-variance) axis name in
+/// `expr` becomes an `inv(metric)` contraction" and an `^` axis reads
+/// all-contravariant storage directly, so a bare `.i` names neither and the
+/// contraction-pairing rule above it cannot be applied to it either. Absorbed
+/// silently, it reached the determiniser as a plain `aggregate` axis, dropping
+/// the metric factor the author's index placement asked for.
+///
+/// Both the `output_axes` list and the body are checked. The body walk stops at
+/// a nested `aggregate` / `metricsum`, since the section scopes variance-marked
+/// axis names "lexically ... to the enclosing `metricsum`" — a nested
+/// `aggregate` keeps its own neutral axes, and a nested `metricsum` gets its own
+/// visit here.
+///
+/// `Some` carries the `Failed` type for the call; `None` means every axis in
+/// scope carries a marker.
+fn metricsum_neutral_axis_check(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> Option<Type> {
+    let mut bare = None;
+    if let Some((axes, _, _)) = args.get(1) {
+        neutral_axis_scan(inf, *axes, &mut bare);
+    }
+    if bare.is_none() {
+        if let Some((body, _, _)) = args.get(2) {
+            neutral_axis_scan(inf, *body, &mut bare);
+        }
+    }
+    let (node, name) = bare?;
+    inf.diags.push(crate::Diagnostic::error_at(
+        node,
+        format!(
+            "bare neutral axis `.{name}` is not allowed inside `metricsum` (spec §04 \
+             \"Metric-aware Einstein summation\", \"Static checks\": \"bare neutral \
+             aggregate axes (`.i` without a variance marker) are not allowed inside \
+             `metricsum`\"); mark it `.{name}^` for an upper (contravariant) index or \
+             `.{name}_` for a lower (covariant) one"
+        ),
+    ));
+    Some(Type::Failed("neutral axis inside metricsum".into()))
+}
+
+/// Walk for the first unmarked axis name in a `metricsum`'s own scope. First
+/// offender wins: a whole body of neutral axes is one mistake, and naming them
+/// all would bury the fix.
+fn neutral_axis_scan(inf: &Inferencer<'_, '_>, node: NodeId, bare: &mut Option<(NodeId, String)>) {
+    if bare.is_some() {
+        return;
+    }
+    if let Node::Axis(ax) = inf.module.node(node) {
+        if ax.variance.is_none() {
+            *bare = Some((node, inf.module.resolve(ax.name).to_string()));
+        }
+        return;
+    }
+    let Node::Call(c) = inf.module.node(node).clone() else {
+        return;
+    };
+    if let flatppl_core::CallHead::Builtin(op) = c.head {
+        let name = inf.module.resolve(op);
+        if name == "aggregate" || name == "metricsum" {
+            return;
+        }
+    }
+    for &a in c.args.iter() {
+        neutral_axis_scan(inf, a, bare);
+    }
+    for n in c.named.iter() {
+        neutral_axis_scan(inf, n.value, bare);
+    }
+}
+
 /// `metricsum`'s metric must be a rank-2 array of scalars — spec §04
 /// "Metric-aware Einstein summation": "It must be a square, symmetric, and
 /// invertible rank-2 array", and, under "Expression restrictions", "`metric`
