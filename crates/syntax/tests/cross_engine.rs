@@ -59,6 +59,10 @@ const KNOWN_DIVERGENCES: &[(&str, &str)] = &[
         "JS `toSexpr` crashes on `load_module` %assign substitutions",
     ),
     (
+        "js:ar1-noise-estimation",
+        "JS eagerly lowers `kernelof` to `functionof(lawof(…))`",
+    ),
+    (
         "js:bayesian_inference_1",
         "JS eagerly lowers `kernelof` to `functionof(lawof(…))`",
     ),
@@ -131,11 +135,19 @@ const KNOWN_DIVERGENCES: &[(&str, &str)] = &[
         "fixture uses off-spec bare-name `kernelof` boundary inputs",
     ),
     (
+        "js:hierarchical-state-space",
+        "fixture uses off-spec bare-name `kernelof` boundary inputs",
+    ),
+    (
         "js:horseshoe",
         "JS folds `neg` of a literal into a negative literal",
     ),
     (
         "js:joint-mvnormal-component",
+        "fixture uses off-spec bare-name `kernelof` boundary inputs",
+    ),
+    (
+        "js:jointchain-cat-chain",
         "fixture uses off-spec bare-name `kernelof` boundary inputs",
     ),
     (
