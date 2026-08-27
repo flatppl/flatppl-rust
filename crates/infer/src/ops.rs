@@ -8,7 +8,7 @@
 
 use flatppl_core::{
     Call, CallHead, Dim, Inputs, Mass, Node, NodeId, Phase, Ref, RefNs, Scalar, ScalarType, Symbol,
-    Type, ValueSet,
+    Type, ValueSet, Variance,
 };
 
 use crate::Level;
@@ -323,6 +323,12 @@ pub(crate) fn call_rule(
                     return (failed, joined);
                 }
                 if let Some(failed) = metricsum_expr_check(inf, args) {
+                    return (failed, joined);
+                }
+                if let Some(failed) = metricsum_output_index_check(inf, args) {
+                    return (failed, joined);
+                }
+                if let Some(failed) = metricsum_contraction_check(inf, args) {
                     return (failed, joined);
                 }
             }
@@ -2053,6 +2059,209 @@ fn variance_container_complaint(
             ),
             "metricsum tensor is not an array of scalars",
         )),
+    }
+}
+
+/// Spec §04 "Metric-aware Einstein summation" / "Static checks": "every output
+/// index must occur in `expr` with the same variance and may not also be
+/// contracted".
+///
+/// The two halves fail differently, so they get separate messages. An output
+/// index absent from `expr` names a component the body never computes. An
+/// output index that also occurs with the opposite marker asks for a
+/// contraction over an index the result still carries — under "Lowering to
+/// `aggregate`" a lower output axis becomes a `metric` contraction *after* the
+/// sum, so the same name cannot be both summed away and raised.
+///
+/// `Some` carries the `Failed` type for the call; `None` means every output
+/// index occurs as declared, or `output_axes` is not a literal list.
+fn metricsum_output_index_check(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> Option<Type> {
+    let declared = metricsum_output_axes(inf, args.get(1)?.0)?;
+    let mut occurrences = Vec::new();
+    variance_axis_occurrences(inf, args.get(2)?.0, &mut occurrences);
+    for &(decl_node, name, variance) in declared.iter() {
+        let mut matched = false;
+        let mut opposite = None;
+        for &(node, occ_name, occ_variance) in occurrences.iter() {
+            if occ_name != name {
+                continue;
+            }
+            if occ_variance == variance {
+                matched = true;
+            } else if opposite.is_none() {
+                opposite = Some(node);
+            }
+        }
+        let spelling = axis_spelling(inf, name, variance);
+        let (node, complaint, reason) = if let Some(node) = opposite {
+            (
+                node,
+                format!(
+                    "output axis `{spelling}` also occurs in `expr` as \
+                     `{}`, which contracts an index the result still carries \
+                     (spec §04 \"Metric-aware Einstein summation\", \"Static checks\": \
+                     \"every output index must occur in `expr` with the same variance and \
+                     may not also be contracted\"); either match the output variance here \
+                     or rename this occurrence to a contracted index",
+                    axis_spelling(inf, name, flip_variance(variance))
+                ),
+                "metricsum output index is also contracted",
+            )
+        } else if matched {
+            continue;
+        } else {
+            (
+                decl_node,
+                format!(
+                    "output axis `{spelling}` does not occur in `expr` (spec §04 \
+                     \"Metric-aware Einstein summation\", \"Static checks\": \"every output \
+                     index must occur in `expr` with the same variance\"); `expr` has to \
+                     compute the components the output axes name"
+                ),
+                "metricsum output index is absent from expr",
+            )
+        };
+        inf.diags.push(crate::Diagnostic::error_at(node, complaint));
+        return Some(Type::Failed(reason.into()));
+    }
+    None
+}
+
+/// Spec §04 "Metric-aware Einstein summation" / "Static checks": "Every
+/// repeated non-output index in `expr` must occur exactly twice — once upper
+/// and once lower".
+///
+/// The clause governs *repeated* indices only, so a non-output index occurring
+/// ONCE is left alone: "Equivalence to `aggregate` under identity metric" makes
+/// `metricsum(eye(n), ...)` an `aggregate(sum, ...)`, and a plain row sum
+/// (`aggregate(sum, [.mu], A[.mu, .nu])`) spells exactly that — one unpaired
+/// non-output index. Refusing it would refuse a construct the equivalence
+/// clause requires. `flatppl-js` `analyzer.ts` static check #3 does refuse it;
+/// that divergence is recorded in `flatppl-dev/TODO-flatppl-rust.md`.
+///
+/// A repeated index with no metric factor between its two ends is the real
+/// error: under "Lowering to `aggregate`" only a `_` axis inserts
+/// `inv(metric)`, so two uppers or two lowers sum stored components with no
+/// metric at all, and a third occurrence leaves the pairing ambiguous.
+///
+/// `Some` carries the `Failed` type for the call; `None` means every repeated
+/// non-output index is one upper and one lower, or `output_axes` is not a
+/// literal list.
+fn metricsum_contraction_check(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> Option<Type> {
+    let declared = metricsum_output_axes(inf, args.get(1)?.0)?;
+    let mut occurrences = Vec::new();
+    variance_axis_occurrences(inf, args.get(2)?.0, &mut occurrences);
+    // First offender in source order: the rest of the body usually repeats the
+    // same index mistake, and naming them all would bury the fix.
+    for &(node, name, _) in occurrences.iter() {
+        if declared.iter().any(|&(_, out_name, _)| out_name == name) {
+            continue;
+        }
+        let uppers = occurrences
+            .iter()
+            .filter(|&&(_, n, v)| n == name && v == Variance::Upper)
+            .count();
+        let lowers = occurrences
+            .iter()
+            .filter(|&&(_, n, v)| n == name && v == Variance::Lower)
+            .count();
+        if uppers + lowers < 2 || (uppers == 1 && lowers == 1) {
+            continue;
+        }
+        let bare = inf.module.resolve(name).to_string();
+        inf.diags.push(crate::Diagnostic::error_at(
+            node,
+            format!(
+                "contracted axis `.{bare}` must occur exactly twice in `expr` — once upper \
+                 (`.{bare}^`) and once lower (`.{bare}_`) — but occurs {uppers} upper and \
+                 {lowers} lower (spec §04 \"Metric-aware Einstein summation\", \"Static \
+                 checks\": \"Every repeated non-output index in `expr` must occur exactly \
+                 twice — once upper and once lower\"); only a `_` axis inserts the \
+                 `inv(metric)` factor a contraction needs"
+            ),
+        ));
+        return Some(Type::Failed("metricsum index is not paired".into()));
+    }
+    None
+}
+
+/// `output_axes` as `(node, name, variance)` for every variance-marked entry,
+/// or `None` when arg 1 is not an axis-list literal.
+///
+/// Without the literal list there is no way to tell an output index from a
+/// contracted one, and mistaking one for the other would refuse valid code, so
+/// both index checks stand down on the same input the rank rule defers on.
+/// Unmarked entries are dropped: `metricsum_neutral_axis_check` already refused
+/// the call, so this is only reached with markers everywhere.
+fn metricsum_output_axes(
+    inf: &Inferencer<'_, '_>,
+    node: NodeId,
+) -> Option<Vec<(NodeId, Symbol, Variance)>> {
+    let Node::Call(c) = inf.module.node(node) else {
+        return None;
+    };
+    if !matches!(c.head, flatppl_core::CallHead::Builtin(op)
+        if inf.module.resolve(op) == "vector")
+    {
+        return None;
+    }
+    let mut out = Vec::new();
+    for &a in c.args.iter() {
+        if let Node::Axis(ax) = inf.module.node(a) {
+            if let Some(v) = ax.variance {
+                out.push((a, ax.name, v));
+            }
+        }
+    }
+    Some(out)
+}
+
+/// Every variance-marked axis occurrence in a `metricsum` body, in source
+/// order. Same scope boundary as [`neutral_axis_scan`]: §04 scopes
+/// variance-marked axis names "lexically ... to the enclosing `metricsum`", so
+/// the walk stops at a nested `aggregate` / `metricsum` and that call gets its
+/// own visit.
+fn variance_axis_occurrences(
+    inf: &Inferencer<'_, '_>,
+    node: NodeId,
+    out: &mut Vec<(NodeId, Symbol, Variance)>,
+) {
+    if let Node::Axis(ax) = inf.module.node(node) {
+        if let Some(v) = ax.variance {
+            out.push((node, ax.name, v));
+        }
+        return;
+    }
+    let Node::Call(c) = inf.module.node(node) else {
+        return;
+    };
+    if let flatppl_core::CallHead::Builtin(op) = c.head {
+        let name = inf.module.resolve(op);
+        if name == "aggregate" || name == "metricsum" {
+            return;
+        }
+    }
+    for &a in c.args.iter() {
+        variance_axis_occurrences(inf, a, out);
+    }
+    for n in c.named.iter() {
+        variance_axis_occurrences(inf, n.value, out);
+    }
+}
+
+/// An axis as the source spells it — `.mu^` upper, `.mu_` lower.
+fn axis_spelling(inf: &Inferencer<'_, '_>, name: Symbol, variance: Variance) -> String {
+    let marker = match variance {
+        Variance::Upper => '^',
+        Variance::Lower => '_',
+    };
+    format!(".{}{marker}", inf.module.resolve(name))
+}
+
+fn flip_variance(v: Variance) -> Variance {
+    match v {
+        Variance::Upper => Variance::Lower,
+        Variance::Lower => Variance::Upper,
     }
 }
 
