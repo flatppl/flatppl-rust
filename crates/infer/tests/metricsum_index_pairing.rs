@@ -182,13 +182,34 @@ fn a_plain_aggregate_is_untouched() {
     accepts(&format!("{SETUP}s = aggregate(sum, [], v[.i] * v[.i])\n"));
 }
 
-/// Without a literal axis list an output index cannot be told from a contracted
-/// one, so both checks stand down rather than refuse valid code.
+/// Spec §05 "Note on axis names" makes an `AxisList` outside an
+/// `aggregate`/`metricsum` `output_axes` position a static error, so `axes =
+/// [.mu^]` is already illegal and there is no valid code in this shape.
 #[test]
-fn a_non_literal_axis_list_defers() {
-    accepts(&format!(
-        "{SETUP}axes = [.mu^]\nT = metricsum(g, axes, A[.mu^, .nu^])\n"
-    ));
+fn a_non_literal_axis_list_is_refused() {
+    rejects(
+        &format!("{SETUP}axes = [.mu^]\nT = metricsum(g, axes, A[.mu^, .nu^])\n"),
+        "`output_axes` must be a literal axis list",
+    );
+}
+
+/// The stand-down used to hide the pairing violation behind the non-literal
+/// list as well.
+#[test]
+fn a_non_literal_axis_list_does_not_hide_a_pairing_violation() {
+    rejects(
+        &format!("{SETUP}axes = [.mu^]\nT = metricsum(g, axes, A[.mu^, .nu^] * v[.nu^])\n"),
+        "`output_axes` must be a literal axis list",
+    );
+}
+
+/// An `ArrayLiteral` in `output_axes` is not an `AxisList` either.
+#[test]
+fn a_non_axis_entry_is_refused() {
+    rejects(
+        &format!("{SETUP}T = metricsum(g, [1.0], A[.mu^, .nu_])\n"),
+        "`output_axes` must be a literal axis list",
+    );
 }
 
 /// The `:=` shorthand lowers to `metricsum`, so it is gated the same way.

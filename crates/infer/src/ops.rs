@@ -316,6 +316,10 @@ pub(crate) fn call_rule(
         // list leaves the rank unknown → defer.
         "aggregate" | "metricsum" => {
             if name == "metricsum" {
+                // First: every check below reads `output_axes` as a literal list.
+                if let Some(failed) = metricsum_output_axes_check(inf, args) {
+                    return (failed, joined);
+                }
                 if let Some(failed) = metricsum_neutral_axis_check(inf, args) {
                     return (failed, joined);
                 }
@@ -2074,7 +2078,7 @@ fn variance_container_complaint(
 /// sum, so the same name cannot be both summed away and raised.
 ///
 /// `Some` carries the `Failed` type for the call; `None` means every output
-/// index occurs as declared, or `output_axes` is not a literal list.
+/// index occurs as declared.
 fn metricsum_output_index_check(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> Option<Type> {
     let declared = metricsum_output_axes(inf, args.get(1)?.0)?;
     let mut occurrences = Vec::new();
@@ -2136,8 +2140,8 @@ fn metricsum_output_index_check(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) 
 /// `metricsum(eye(n), ...)` an `aggregate(sum, ...)`, and a plain row sum
 /// (`aggregate(sum, [.mu], A[.mu, .nu])`) spells exactly that — one unpaired
 /// non-output index. Refusing it would refuse a construct the equivalence
-/// clause requires. `flatppl-js` `analyzer.ts` static check #3 does refuse it;
-/// that divergence is recorded in `flatppl-dev/TODO-flatppl-rust.md`.
+/// clause requires. `flatppl-js` `analyzer.ts` accepts it too, since #219
+/// relaxed its static check #3.
 ///
 /// A repeated index with no metric factor between its two ends is the real
 /// error: under "Lowering to `aggregate`" only a `_` axis inserts
@@ -2145,8 +2149,7 @@ fn metricsum_output_index_check(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) 
 /// metric at all, and a third occurrence leaves the pairing ambiguous.
 ///
 /// `Some` carries the `Failed` type for the call; `None` means every repeated
-/// non-output index is one upper and one lower, or `output_axes` is not a
-/// literal list.
+/// non-output index is one upper and one lower.
 fn metricsum_contraction_check(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> Option<Type> {
     let declared = metricsum_output_axes(inf, args.get(1)?.0)?;
     let mut occurrences = Vec::new();
@@ -2185,12 +2188,43 @@ fn metricsum_contraction_check(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -
     None
 }
 
-/// `output_axes` as `(node, name, variance)` for every variance-marked entry,
-/// or `None` when arg 1 is not an axis-list literal.
+/// Spec §05 "Note on axis names": "The grammar likewise admits `AxisList` as a
+/// `Primary`, but it is legal only as the `output_axes` argument of an
+/// `aggregate` or `metricsum` call and as the axis-list binder of an
+/// `AggregateBinding` or `MetricsumBinding`; anywhere else it is a static
+/// error."
 ///
-/// Without the literal list there is no way to tell an output index from a
-/// contracted one, and mistaking one for the other would refuse valid code, so
-/// both index checks stand down on the same input the rank rule defers on.
+/// So `output_axes` has to be a literal axis list. Axis names are not values —
+/// §05 "Axis names and aggregation": "an axis name is legal only as an entry in
+/// `aggregate`'s `output_axes` axis list, as an index inside `[...]` within the
+/// body, or as a binder on the left-hand side of `:=`" — so nothing else can
+/// ever produce one, and `metricsum(g, axes, ...)` is a static error whatever
+/// `axes` is bound to.
+fn metricsum_output_axes_check(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> Option<Type> {
+    let node = args.get(1)?.0;
+    if metricsum_output_axes(inf, node).is_some() {
+        return None;
+    }
+    inf.diags.push(crate::Diagnostic::error_at(
+        node,
+        "`metricsum`'s `output_axes` must be a literal axis list (spec §05 \"Note on axis \
+         names\": \"The grammar likewise admits `AxisList` as a `Primary`, but it is legal \
+         only as the `output_axes` argument of an `aggregate` or `metricsum` call and as the \
+         axis-list binder of an `AggregateBinding` or `MetricsumBinding`; anywhere else it is \
+         a static error\"); axis names are not values, so no binding or call can produce this \
+         list — spell the axes here, `metricsum(metric, [.mu^, .nu_], expr)`"
+            .to_string(),
+    ));
+    Some(Type::Failed(
+        "metricsum output_axes is not a literal axis list".into(),
+    ))
+}
+
+/// `output_axes` as `(node, name, variance)` for every variance-marked entry,
+/// or `None` when arg 1 is not an axis-list literal — which
+/// [`metricsum_output_axes_check`] has already refused, so the two index checks
+/// below never run on one.
+///
 /// Unmarked entries are dropped: `metricsum_neutral_axis_check` already refused
 /// the call, so this is only reached with markers everywhere.
 fn metricsum_output_axes(
@@ -2207,10 +2241,13 @@ fn metricsum_output_axes(
     }
     let mut out = Vec::new();
     for &a in c.args.iter() {
-        if let Node::Axis(ax) = inf.module.node(a) {
-            if let Some(v) = ax.variance {
-                out.push((a, ax.name, v));
-            }
+        // An `ArrayLiteral` prints as the same `vector` call, so a non-`Axis`
+        // entry means this is not an `AxisList` at all.
+        let Node::Axis(ax) = inf.module.node(a) else {
+            return None;
+        };
+        if let Some(v) = ax.variance {
+            out.push((a, ax.name, v));
         }
     }
     Some(out)
