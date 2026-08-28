@@ -6,18 +6,20 @@
 //!
 //! [`BUILTINS`] is generated from `flatppl-grammars/keyword-lists.json`; kept in
 //! sync by `crates/lint/tests/builtins_sync.rs`. It is the highlighter's word
-//! list, so it is neither a superset nor a subset of the `base` namespace, and
-//! [`is_base_name`] corrects it in both directions:
+//! list, so it is still not a superset of the `base` namespace, and
+//! [`is_base_name`] adds what it omits: `catalogue.ron` carries three rows the
+//! keyword list does not (`in`, `length`, `log2`).
 //!
-//! - **Added.** `catalogue.ron` carries three rows the keyword list omits (`in`,
-//!   `length`, `log2`).
-//! - **Removed.** The keyword list carries the 21 §09 standard-module members of
-//!   `particle-physics` — 8 distribution constructors (`CrystalBall`, `Argus`,
-//!   `Voigtian`, `Landau`, `DoubleSidedCrystalBall`, `RelativisticBreitWigner`,
-//!   `BifurcatedNormal`, `ContinuedPoisson`) and 13 functions (`kallen`,
-//!   `wignerd`, `blatt_weisskopf`, the `interp_*` family, …). Each has a row in
-//!   `catalogues/particle-physics.ron` and is reachable ONLY behind its module
-//!   alias, so a bare occurrence is unresolvable.
+//! It is no longer a SUPERSET either. It used to carry the 21 §09
+//! `particle-physics` members — 8 distribution constructors (`CrystalBall`,
+//! `Argus`, `Voigtian`, `Landau`, `DoubleSidedCrystalBall`,
+//! `RelativisticBreitWigner`, `BifurcatedNormal`, `ContinuedPoisson`) and 13
+//! functions (`kallen`, `wignerd`, `blatt_weisskopf`, the `interp_*` family, …),
+//! and [`is_base_name`] subtracted them again. flatppl-grammars #37 (`9e66b2f`)
+//! dropped them from the keyword list, since each is reachable ONLY behind its
+//! module alias and a bare occurrence is unresolvable, so they are gone from
+//! here too. [`is_base_name`]'s `is_module_member` exclusion is kept as a
+//! standing invariant, not because any member is in the list today.
 //!
 //! What the keyword list uniquely and correctly carries: the §03 set names, the
 //! constants, the measure ops and structural constructs `ops.rs` types by hand,
@@ -32,22 +34,17 @@ use flatppl_core::{Call, CallHead, Module, Node, NodeId};
 /// The lint roster, synced to the grammars keyword list — **not** the `base`
 /// namespace. Use [`is_base_name`] for name resolution.
 pub const BUILTINS: &[&str] = &[
-    "Argus",
     "Bernoulli",
     "Beta",
-    "BifurcatedNormal",
     "BinnedPoissonProcess",
     "Binomial",
     "Categorical",
     "Categorical0",
     "Cauchy",
     "ChiSquared",
-    "ContinuedPoisson",
     "Counting",
-    "CrystalBall",
     "Dirac",
     "Dirichlet",
-    "DoubleSidedCrystalBall",
     "Exponential",
     "Gamma",
     "GeneralizedNormal",
@@ -56,7 +53,6 @@ pub const BUILTINS: &[&str] = &[
     "InverseWishart",
     "LKJ",
     "LKJCholesky",
-    "Landau",
     "Laplace",
     "Lebesgue",
     "LogNormal",
@@ -69,10 +65,8 @@ pub const BUILTINS: &[&str] = &[
     "Pareto",
     "Poisson",
     "PoissonProcess",
-    "RelativisticBreitWigner",
     "StudentT",
     "Uniform",
-    "Voigtian",
     "VonMises",
     "Weibull",
     "Wishart",
@@ -98,11 +92,9 @@ pub const BUILTINS: &[&str] = &[
     "bernstein",
     "bijection",
     "bincounts",
-    "blatt_weisskopf",
     "blockdiagmat",
     "boolean",
     "booleans",
-    "breakup_momentum",
     "broadcast",
     "broadcasted",
     "builtin_fromnormal",
@@ -170,11 +162,6 @@ pub const BUILTINS: &[&str] = &[
     "inf",
     "integer",
     "integers",
-    "interp_poly2_lin",
-    "interp_poly6_exp",
-    "interp_poly6_lin",
-    "interp_pwexp",
-    "interp_pwlin",
     "interval",
     "inv",
     "invlogit",
@@ -187,7 +174,6 @@ pub const BUILTINS: &[&str] = &[
     "joint",
     "joint_likelihood",
     "jointchain",
-    "kallen",
     "kchain",
     "kernelof",
     "kscan",
@@ -259,7 +245,6 @@ pub const BUILTINS: &[&str] = &[
     "record",
     "reduce",
     "relabel",
-    "resonance_breitwigner",
     "restrict",
     "reverse",
     "rnginit",
@@ -302,10 +287,6 @@ pub const BUILTINS: &[&str] = &[
     "var",
     "vector",
     "weighted",
-    "wignerD",
-    "wignerD_doublearg",
-    "wignerd",
-    "wignerd_doublearg",
     "zeros",
 ];
 
@@ -326,6 +307,10 @@ pub fn is_base_name(name: &str) -> bool {
         return true;
     }
     // `BUILTINS` is strictly sorted (pinned by `builtins_are_sorted_and_unique`).
+    // The `is_module_member` exclusion no longer subtracts anything — grammars
+    // #37 dropped the 21 §09 members from the keyword list — but it is what
+    // makes a bare §09 member unresolvable independently of which side of the
+    // sync is stale, so it stays.
     BUILTINS.binary_search(&name).is_ok() && !cat.is_module_member(name)
 }
 
