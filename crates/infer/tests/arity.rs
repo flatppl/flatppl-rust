@@ -185,21 +185,60 @@ fn variadic_parameter_has_a_minimum_but_no_maximum() {
     );
 }
 
+/// §07 "Linear algebra" gives `rowstack(vs)` and `colstack(vs)` ONE parameter —
+/// "a vector of equal-length vectors" — so neither stacks a vararg list of
+/// vectors. `rowstack(a, b)` is the natural mistake (NumPy's `row_stack` and
+/// Julia's `vcat` both take varargs) and a 2026-07-22 build accepted it; nothing
+/// pinned the refusal afterwards.
+#[test]
+fn rowstack_and_colstack_take_one_vector_of_vectors() {
+    let v = "a = [1.0, 2.0]\nb = [3.0, 4.0]\n";
+    for head in ["rowstack", "colstack"] {
+        // The one declared spelling, positional and keyword.
+        assert!(errors(&format!("{v}M = {head}([a, b])")).is_empty());
+        assert!(errors(&format!("{v}M = {head}(vs = [a, b])")).is_empty());
+        // A vararg list of vectors is not a second spelling.
+        assert_eq!(
+            errors(&format!("{v}M = {head}(a, b)")),
+            vec![format!("`{head}` takes 1 argument (spec §07), got 2")]
+        );
+        assert_eq!(
+            errors(&format!("{v}M = {head}(a, b, a)")),
+            vec![format!("`{head}` takes 1 argument (spec §07), got 3")]
+        );
+        assert_eq!(
+            errors(&format!("{v}M = {head}()")),
+            vec![format!("`{head}` takes 1 argument (spec §07), got 0")]
+        );
+    }
+}
+
 /// §07 "Array and table operations" makes `cat(scalar1, scalar2, ...)`
 /// "Equivalent to `vector(scalar1, scalar2, ...)`", and array literals lower to
-/// real `vector` calls — `[1.0]` to `(vector 1.0)` and `[]` to `(vector)`. So the
-/// shared `x1, x2, ...` notation admits one argument, and reading it as "at least
+/// real `vector` calls — `[1.0]` to `(vector 1.0)`. So the shared
+/// `x1, x2, ...` notation admits one argument, and reading it as "at least
 /// two" for `cat` would reject `cat(1.0)` while accepting the equivalent
 /// `vector(1.0)`.
+///
+/// The nullary spellings are an arity ACCEPT and a §05 position refusal: the
+/// `vector` row's minimum stays 0, and the empty `(vector)` node those two
+/// spellings share is an empty axis list out of position (see
+/// `axis_position.rs`), so no count message is what comes back.
 #[test]
 fn cat_and_vector_read_the_same_notation_the_same_way() {
     assert!(errors("v = cat(1.0)").is_empty());
     assert!(errors("v = cat(1.0, 2.0)").is_empty());
     assert!(errors("v = vector(1.0)").is_empty());
-    assert!(errors("v = vector()").is_empty());
-    // The surface spellings that lower to those `vector` calls.
     assert!(errors("v = [1.0]").is_empty());
-    assert!(errors("v = []").is_empty());
+    for src in ["v = vector()", "v = []"] {
+        let msgs = errors(src);
+        assert_eq!(msgs.len(), 1, "one error for `{src}`; got {msgs:?}");
+        assert!(
+            msgs[0].contains("an axis list is legal only as `output_axes`"),
+            "`{src}` must fail on position, not on count; got {}",
+            msgs[0]
+        );
+    }
     // `cat` still needs something to concatenate.
     assert_eq!(
         errors("v = cat()"),

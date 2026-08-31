@@ -962,11 +962,20 @@ fn empty_record_is_zero() {
 // same as the empty measure `record()` (the iid Σ rule, §06 "Density of composed measures",
 // with an empty index set). It lowers to the log-density literal 0 with NO
 // density term — it is NOT refused (both empty products must agree).
+//
+// The observation is a DERIVED empty vector (`flatppl-dev/empty-arrays-ruling.md`,
+// 2026-08-20: "an author may not write a degenerate shape, data may turn out
+// empty"). The literal `[]` this fixture used to score against is now a §05
+// axis-position error — see `empty_vector_literal_observation_is_refused`.
+// The written literal `0` size stays: the ruling's positivity rule for written
+// sizes is a separate, unlanded infer change (TODO-flatppl-rust.md).
 #[test]
 fn iid_zero_size_is_zero() {
     let src = "\
+xs = [1.0, 2.0, 3.0]
+keep = filter(x -> x < 0.0, xs)
 d = iid(Normal(mu = 0.0, sigma = 1.0), 0)
-lp = logdensityof(d, [])";
+lp = logdensityof(d, keep)";
     let m = parse_infer(src);
     let out = determinize(&m).expect("iid with zero size must lower to 0, not refuse");
     assert!(flatppl_determinizer::is_flatpdl(&out).is_ok());
@@ -983,5 +992,26 @@ lp = logdensityof(d, [])";
     assert!(
         pir.contains("(%bind lp 0.0)"),
         "empty iid product lowers to log-density 0:\n{pir}"
+    );
+}
+
+/// The spelling the fixture above used to carry. §05 "Note on axis names" makes
+/// `[]` an axis list, legal only as `output_axes`, and `ArrayLiteral` has no
+/// empty form — so a written `[]` observation never reaches the determiniser.
+#[test]
+fn empty_vector_literal_observation_is_refused() {
+    let src = "\
+d = iid(Normal(mu = 0.0, sigma = 1.0), 0)
+lp = logdensityof(d, [])";
+    let mut m = flatppl_syntax::parse(src).expect("fixture must parse");
+    let msgs: Vec<String> = flatppl_infer::infer(&mut m)
+        .into_iter()
+        .filter(|d| d.severity == flatppl_infer::Severity::Error)
+        .map(|d| d.message)
+        .collect();
+    assert!(
+        msgs.iter()
+            .any(|m| m.contains("an axis list is legal only as `output_axes`")),
+        "a written `[]` observation must be a static error; got {msgs:?}"
     );
 }

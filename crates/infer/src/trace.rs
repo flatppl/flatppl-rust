@@ -145,6 +145,15 @@ impl<'m, 's> Inferencer<'m, 's> {
     }
 
     pub(crate) fn run(mut self) -> Vec<Diagnostic> {
+        // Spec §05 axis positions, before the trace: the rules are positional,
+        // and seeding the offending node `Failed` keeps a refused bracket to one
+        // error instead of a cascade of type complaints about it.
+        for (node, diag) in crate::axes::position_errors(self.module) {
+            self.tys
+                .insert(node, Type::Failed("axis out of position".into()));
+            self.phases.insert(node, Phase::Fixed);
+            self.diags.push(diag);
+        }
         let ids: Vec<BindingId> = self.module.bindings().map(|(id, _)| id).collect();
         for id in ids {
             self.infer_binding(id);

@@ -20,6 +20,7 @@
 //! fixed`, with `elementof` introducing *parameterized*, `draw` *stochastic*,
 //! and `external` / loaded data / reifications *fixed*.
 
+mod axes;
 pub mod builtins;
 mod catalogue;
 mod consteval;
