@@ -330,3 +330,28 @@ fn empty_public_interface_is_faithful() {
     );
     assert_eq!(write(&m), write(&m2), "canonical fixpoint");
 }
+
+/// Spec §11 "Literal values": "A scalar literal carries no leading sign: a
+/// negated numeric literal is the call `(neg 1.0)`." That is the form
+/// flatppl-js emits too, so this text is the js side of the cross-engine
+/// round trip: rust must read it and write it back unchanged.
+#[test]
+fn negated_literal_is_a_neg_call() {
+    let src = "(%module (%public i r z v w)\
+        (%bind i (neg 3))\
+        (%bind r (neg 1.5))\
+        (%bind z (neg 2.0))\
+        (%bind v (vector 1 (neg 3) 5))\
+        (%bind w (record (%field a (neg 0.5)))))";
+    let text = write(&read(src).unwrap());
+    for form in [
+        "(%bind i (neg 3))",
+        "(%bind r (neg 1.5))",
+        "(%bind z (neg 2.0))",
+        "(%bind v (vector 1 (neg 3) 5))",
+        "(%bind w (record (%field a (neg 0.5))))",
+    ] {
+        assert!(text.contains(form), "missing {form}:\n{text}");
+    }
+    assert_eq!(write(&read(&text).unwrap()), text, "canonical fixpoint");
+}

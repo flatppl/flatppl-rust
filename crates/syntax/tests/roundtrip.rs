@@ -754,3 +754,26 @@ fn dotcall_head_parenthesized() {
         "mapped = ((a, b) -> a * b).([1.0, 2.0], [3.0, 4.0])"
     );
 }
+
+/// Spec §11 "Literal values": "A scalar literal carries no leading sign: a
+/// negated numeric literal is the call `(neg 1.0)`." Surface `-3` lowers to
+/// `neg` (§07) and §11 lowers operators to calls, so nothing folds the sign
+/// back into the atom — this is the rust side of the cross-engine round trip.
+#[test]
+fn negated_literal_emits_a_neg_call() {
+    let src = "i = -3\nr = -1.5\nz = -2.0\nv = [1, -3, 5]\nw = record(a = -0.5)";
+    let pir = flatppl_flatpir::write(&parse(src).unwrap());
+    for form in [
+        "(%bind i (neg 3))",
+        "(%bind r (neg 1.5))",
+        "(%bind z (neg 2.0))",
+        "(%bind v (vector 1 (neg 3) 5))",
+        "(%bind w (record (%field a (neg 0.5))))",
+    ] {
+        assert!(pir.contains(form), "missing {form}:\n{pir}");
+    }
+    assert!(
+        !pir.lines().any(|l| l.contains(" -")),
+        "no emitted literal carries a leading sign:\n{pir}"
+    );
+}

@@ -29,7 +29,9 @@ const END: &str = "<<<FLATPPL-PARITY:END";
 /// reason)`. A listed fixture that STOPS diverging fails the test as stale,
 /// so this list can only shrink truthfully.
 ///
-/// Every entry below was adjudicated against the spec (2026-06-11) and falls
+/// Every entry below was adjudicated against the spec (2026-06-11; the
+/// negated-literal class was closed and its survivors re-adjudicated
+/// 2026-09-01) and falls
 /// on the JS side — its `toSexpr` export reflects post-analysis engine
 /// internals rather than the §04 lowering projection. Filed as
 /// "Spec-faithful FlatPIR export" (+ two fixture items) in
@@ -40,7 +42,7 @@ const END: &str = "<<<FLATPPL-PARITY:END";
 const KNOWN_DIVERGENCES: &[(&str, &str)] = &[
     (
         "rust:eight-schools",
-        "JS folds `neg` of a literal into a negative literal",
+        "JS prints built-in values as `(%ref self Normal)` (spec: bare symbol)",
     ),
     (
         "rust:einsum-matmul",
@@ -53,14 +55,6 @@ const KNOWN_DIVERGENCES: &[(&str, &str)] = &[
     (
         "rust:modules",
         "JS `toSexpr` crashes on `load_module` %assign substitutions",
-    ),
-    (
-        "js:bayesian_inference_1",
-        "JS folds `neg` of a literal into a negative literal",
-    ),
-    (
-        "js:bayesian_inference_2",
-        "JS folds `neg` of a literal into a negative literal",
     ),
     (
         "js:bayesian_inference_3",
@@ -92,7 +86,7 @@ const KNOWN_DIVERGENCES: &[(&str, &str)] = &[
     ),
     (
         "js:eight-schools",
-        "JS folds `neg` of a literal into a negative literal",
+        "JS prints built-in values as `(%ref self Normal)` (spec: bare symbol)",
     ),
     (
         "js:einsum-matmul",
@@ -124,23 +118,11 @@ const KNOWN_DIVERGENCES: &[(&str, &str)] = &[
     ),
     (
         "js:horseshoe",
-        "JS folds `neg` of a literal into a negative literal",
-    ),
-    (
-        "js:joint-mvnormal-component",
-        "JS folds `neg` of a literal into a negative literal",
-    ),
-    (
-        "js:metricsum-tensor",
-        "JS folds `neg` of a literal into a negative literal",
+        "JS eta-expands dotted-op `broadcast(mul, …)` heads",
     ),
     (
         "js:nested-broadcast-mvnormal-inner",
-        "JS folds `neg` of a literal into a negative literal",
-    ),
-    (
-        "js:normal-mixture",
-        "JS folds `neg` of a literal into a negative literal",
+        "JS prints built-in values as `(%ref self MvNormal)` (spec: bare symbol)",
     ),
     (
         "js:bat-signal-background",
@@ -172,7 +154,7 @@ const KNOWN_DIVERGENCES: &[(&str, &str)] = &[
     ),
     (
         "js:vector-obs-mvnormal",
-        "JS folds `neg` of a literal into a negative literal",
+        "JS prints built-in values as `(%ref self MvNormal)` (spec: bare symbol)",
     ),
 ];
 
