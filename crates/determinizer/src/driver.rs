@@ -96,6 +96,16 @@ pub fn determinize_with_roots(
     // bindings, so this is a no-op there.
     crate::crossmodule::resolve_crossmodule_aliases(&mut work, bundle)?;
 
+    // §09 standard-module FUNCTION member lowering: rewrite `hep.interp_pwlin(…)`
+    // and its siblings into base ops (`crate::stdfn`). A function member is a
+    // catalogue entry with a closed form in §09, not a measure, so it cannot reach
+    // the constructor-tag path a §09 DISTRIBUTION member takes; without this it
+    // survives as a `CallHead::User` application and the conformance gate refuses
+    // it. Runs here so the measure-reduction loop and the density lowering see
+    // base ops only. A member with no base-op form is left in place for the
+    // conformance gate to name (root-based DCE must still be able to drop one).
+    crate::stdfn::lower_std_module_functions(&mut work)?;
+
     // Cross-module FUNCTION/kernel APPLICATION callees in regular bindings
     // (`a = m.f(theta)`): graft the cross-module callee to a local node so the
     // now-local application β-reduces normally in the loop below. This reuses the

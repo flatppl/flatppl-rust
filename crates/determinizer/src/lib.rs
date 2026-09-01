@@ -14,6 +14,7 @@ mod kernel;
 mod marginal;
 mod refuse;
 mod sample;
+mod stdfn;
 pub use conformance::is_flatpdl;
 pub use driver::{determinize, determinize_with, determinize_with_roots};
 pub use refuse::{NonConformKind, NonConformance, RefuseError};

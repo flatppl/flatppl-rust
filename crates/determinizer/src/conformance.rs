@@ -180,12 +180,25 @@ fn visit(
         // primitives"), and the surface printer spells a user call `f(x)` exactly like a
         // builtin one, so nothing downstream can tell them apart.
         if matches!(c.head, CallHead::User(_)) {
+            // A §09 standard-module FUNCTION member with no base-op form
+            // (`special-functions`, `ext-linear-algebra`, the Wigner functions, the
+            // higher-order `distances` members) reaches here as an ordinary
+            // residual user call. Name it: the generic reason gives no clue which
+            // member needs an engine primitive. `crate::stdfn` rewrites the
+            // members that do have one before the loop.
+            let reason = match crate::stdfn::residual_std_member(m, id) {
+                Some(name) => format!(
+                    "§09 standard-module function `{name}` has no lowering to FlatPDL base \
+                     operations — it needs an engine primitive"
+                ),
+                None => "residual user call — FlatPDL admits deterministic ops and the six \
+                         builtin_* primitives only"
+                    .to_string(),
+            };
             bad.push(NonConformance {
                 node: id,
                 kind: NonConformKind::ResidualUserCall,
-                reason: "residual user call — FlatPDL admits deterministic ops and the six \
-                         builtin_* primitives only"
-                    .into(),
+                reason,
             });
         }
         // Arity of the six `builtin_*` primitives. `flatppl-infer` has no arity
