@@ -464,6 +464,7 @@ pub(crate) fn call_rule(
             None => measure_domain(arg_ty(args, 0)),
         },
         "iid" => iid_type(inf, args),
+        "PoissonProcess" => poisson_process_type(inf, args, named),
         // Measure-transforming ops keep the domain but get a FRESH mass slot
         // — their total mass differs from the base's and is computed by the
         // normalization-level rules (inheriting it via the type clone would
@@ -3191,6 +3192,54 @@ fn iid_type(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> Type {
     };
     Type::Measure {
         domain: Box::new(result_domain),
+        mass: Mass::Deferred,
+    }
+}
+
+/// `PoissonProcess(intensity = M)` (spec §08): a measure over point
+/// CONFIGURATIONS drawn from the intensity's own point space. §08 gives the
+/// variate as "arrays (scalar points) or tables (record-valued points)", so the
+/// domain is [`iid_type`]'s array-or-table rule applied to `M`'s domain — a
+/// record point space gives a table (§03's Cartesian power over a record set
+/// "is the set of tables with those columns"), anything else an array.
+///
+/// The length is `Dim::Dynamic`, and that is not a degrade: the event count is
+/// itself random, so `PoissonProcess` carries no count argument for a static
+/// shape to come from. §08 also makes the order carry no meaning
+/// (permutation-invariant), which no `Type` variant expresses.
+///
+/// Mass is left `Deferred` for `fill_mass`'s §08 catch-all to make
+/// `%normalized`, which is right: the mass over all configurations is
+/// $\sum_k e^{-\Lambda} \Lambda^k / k! = 1$. A KERNEL intensity (§08 admits
+/// one) carries no domain in `Type::Kernel`, so it stays `%deferred`.
+fn poisson_process_type(
+    inf: &mut Inferencer<'_, '_>,
+    args: &[ArgInfo],
+    named: &[NamedInfo],
+) -> Type {
+    let intensity = named
+        .iter()
+        .find(|(n, _, _, _)| inf.module.resolve(*n) == "intensity")
+        .map(|(_, _, t, _)| t.clone())
+        .or_else(|| {
+            splat_field(inf, args, named, "intensity").and_then(|n| inf.lookup_type(n).cloned())
+        })
+        .or_else(|| arg_ty(args, 0).cloned());
+    let Some(Type::Measure { domain, .. }) = intensity else {
+        return Type::Deferred;
+    };
+    let config = match *domain {
+        Type::Record(fields) => Type::Table {
+            columns: fields,
+            nrows: Dim::Dynamic,
+        },
+        point => Type::Array {
+            shape: Box::new([Dim::Dynamic]),
+            elem: Box::new(point),
+        },
+    };
+    Type::Measure {
+        domain: Box::new(config),
         mass: Mass::Deferred,
     }
 }

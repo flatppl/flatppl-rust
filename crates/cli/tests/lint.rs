@@ -182,14 +182,14 @@ fn lint_allow_not_canonical_suppresses_it() {
 }
 
 /// The gap must be spelled with a REAL built-in that has no type rule yet —
-/// `PoissonProcess` is a §08 distribution with no `catalogue.ron` row. An
+/// `BinnedPoissonProcess` is a §08 distribution with no `catalogue.ron` row. An
 /// invented name (this test used `somethingweird`) is an unresolvable name under
 /// spec §04 "Name resolution" and errors instead of producing a gap warning.
 #[test]
 fn lint_reports_inference_gap() {
     let dir = Scratch::new("gap");
     let f = dir.path("m.flatppl");
-    fs::write(&f, "y = PoissonProcess(1.0)\n").unwrap();
+    fs::write(&f, "y = BinnedPoissonProcess(1.0)\n").unwrap();
     let out = bin().arg("lint").arg(&f).output().unwrap();
     assert!(String::from_utf8_lossy(&out.stderr).contains("inference-gap"));
 }

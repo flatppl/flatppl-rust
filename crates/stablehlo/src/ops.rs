@@ -2544,7 +2544,12 @@ fn elem_membership(
 }
 
 /// Classify `S` as an [`ElemSet`], refusing any other set expression.
+///
+/// One `(%ref self x)` level is resolved first: a support set is usually a named
+/// binding (`window = interval(0.0, 10.0)`), and the determiniser's `in(v, S)`
+/// gates carry that ref rather than the interval it names.
 fn classify_elem_set(e: &Emitter, id: NodeId, set_id: NodeId) -> Result<ElemSet, EmitError> {
+    let set_id = e.resolve_ref_one(set_id);
     let refuse = || {
         EmitError::at(
             id,

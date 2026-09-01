@@ -221,22 +221,23 @@ fn reference_cycle_is_an_error() {
 
 /// An op with no type rule defers honestly rather than guessing.
 ///
-/// The op must be a REAL built-in — `PoissonProcess` is a §08 distribution with no
+/// The op must be a REAL built-in — `BinnedPoissonProcess` is a §08 distribution with no
 /// `catalogue.ron` row. An invented name (this test used `frobnicate`) is an
 /// unresolvable name under spec §04 "Name resolution" and errors instead of
 /// deferring, which would make this a test of the wrong thing. See
 /// `tests/unbound_name.rs` for the two behaviours side by side.
 #[test]
 fn unknown_op_is_an_honest_gap() {
-    let (module, diags) = infer_src("x = PoissonProcess(1, 2)");
+    let (module, diags) = infer_src("x = BinnedPoissonProcess(1, 2)");
     assert!(
         diags.iter().any(|d| d.severity == Severity::Note
-            && d.message.contains("no type rule for `PoissonProcess`")),
+            && d.message
+                .contains("no type rule for `BinnedPoissonProcess`")),
         "got: {diags:?}"
     );
     let out = flatppl_flatpir::write(&module);
     assert!(
-        out.contains("(%meta (%deferred %fixed %unknown) (PoissonProcess 1 2))"),
+        out.contains("(%meta (%deferred %fixed %unknown) (BinnedPoissonProcess 1 2))"),
         "got:\n{out}"
     );
 }
@@ -420,6 +421,42 @@ fn mass_classes_compose() {
     );
     assert!(
         out.contains("(%bind post (%meta ((%measure (%domain (%scalar real)) (%mass %unknown))"),
+        "got:\n{out}"
+    );
+}
+
+/// `PoissonProcess(intensity)` (spec §08) is a measure over point
+/// CONFIGURATIONS: an array of the intensity's own point type, of
+/// dynamic length (the event count is itself random), and `%normalized`
+/// (the mass over all configurations is 1).
+#[test]
+fn poisson_process_is_a_measure_over_configurations() {
+    let src = "s = elementof(posreals)\n\
+               scalar_proc = PoissonProcess(intensity = weighted(s, Normal(0.0, 1.0)))\n\
+               table_proc = PoissonProcess(weighted(s, joint(x = Normal(0.0, 1.0), y = Normal(0.0, 1.0))))";
+    let (module, diags) = infer_src(src);
+    // A typed head takes no gap note.
+    assert!(
+        !diags
+            .iter()
+            .any(|d| d.message.contains("no type rule for `PoissonProcess`")),
+        "got: {diags:?}"
+    );
+    let out = flatppl_flatpir::write(&module);
+    // A scalar point space gives an array variate of dynamic length.
+    assert!(
+        out.contains(
+            "(%bind scalar_proc (%meta ((%measure (%domain (%array 1 (%dynamic) \
+             (%scalar real))) (%mass %normalized))"
+        ),
+        "got:\n{out}"
+    );
+    // A record point space gives a TABLE variate instead (§08 "record-valued points").
+    assert!(
+        out.contains(
+            "(%bind table_proc (%meta ((%measure (%domain (%table (%columns \
+             (x (%scalar real)) (y (%scalar real))) (%nrows %dynamic))) (%mass %normalized))"
+        ),
         "got:\n{out}"
     );
 }

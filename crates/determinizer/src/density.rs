@@ -1972,6 +1972,11 @@ fn lower_measure_density_at(
         Some("kchain") => crate::marginal::lower_kchain_marginal(m, measure_node, v),
         Some("jointchain") => crate::jointchain::lower_jointchain(m, measure_node, v),
         Some("iid") => lower_iid(m, measure_node, v),
+        Some("PoissonProcess") => lower_poisson_process(m, measure_node, v),
+        // `Lebesgue` is a reference measure, not a distribution constructor: its
+        // density is the support gate, not a backend density builder. Lowering
+        // it here keeps it out of FlatPDL ([`lower_lebesgue`]).
+        Some("Lebesgue") => lower_lebesgue(m, measure_node, v),
         Some("broadcast") => lower_broadcast_kernel(m, measure_node, v),
         Some("joint") => lower_joint(m, measure_node, v, origin),
         // A reified measure (`functionof` / `kernelof`) used AS a measure — its
@@ -3447,6 +3452,10 @@ fn lower_normalize(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Re
         if let Some(tc) = expect_builtin_call(m, m_inner_resolved, "truncate") {
             if tc.args.len() == 2 {
                 let (base, set) = (tc.args[0], tc.args[1]);
+                // Resolve one ref level: a truncation set is usually a named
+                // binding (`window = interval(0.0, 10.0)`), and the interval is
+                // then its RHS rather than the argument node itself.
+                let (set, _) = resolve_ref_one(m, set);
                 if let Some(ic) = expect_builtin_call(m, set, "interval") {
                     if ic.args.len() == 2 {
                         Some((base, ic.args[0], ic.args[1]))
@@ -6268,6 +6277,234 @@ fn lower_iid(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseEr
         terms.push(lower_measure_density(m, m_inner, elem)?);
     }
     Ok(fold_add(m, &terms))
+}
+
+/// `logdensityof(PoissonProcess(intensity = M), v)` — the extended unbinned
+/// log-likelihood
+/// ```text
+/// Σ_j logdensityof(M, v[j]) − totalmass(M)
+/// ```
+/// which is §08 `PoissonProcess`'s density w.r.t. `iid(Lebesgue, k)`,
+/// $\left(\prod_i \lambda(t_i)\right)\exp\left(-\int\lambda\right)$, in log
+/// space, with $\lambda$ the intensity's own density. §08's note names it: "In
+/// particle physics, a likelihood based on a Poisson process is often called an
+/// extended likelihood."
+///
+/// Two limits, each refused rather than mis-lowered:
+///
+/// * **The event count is random**, so `PoissonProcess` carries no count
+///   argument for [`lower_iid`]'s `iid_static_size` to read. The per-event sum is
+///   unrolled over the VARIATE's own statically-known length instead
+///   ([`static_array_variate_len`]). A dynamic-length variate is refused; so is a
+///   TABLE variate (§08's record-valued points), whose per-row access is not
+///   `get0`.
+/// * **`Λ = totalmass(M)` must be closed form**, since `totalmass` is a
+///   measure-layer query and not FlatPDL ([`closed_form_totalmass`]).
+///
+/// The per-event term goes back through [`lower_measure_density`], so a composed
+/// intensity — §06's own `superpose(weighted(s, sig), weighted(b, bkg))` idiom —
+/// scores through the existing `superpose`/`weighted` rules with no new arm.
+fn lower_poisson_process(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseError> {
+    let intensity = {
+        let c = expect_builtin_call(m, node, "PoissonProcess")
+            .ok_or_else(|| refuse(node, m, "expected PoissonProcess"))?;
+        named_or_positional(m, c, "intensity").ok_or_else(|| {
+            refuse(
+                node,
+                m,
+                "PoissonProcess expects one `intensity` measure (spec §08)",
+            )
+        })?
+    };
+
+    let n = static_array_variate_len(m, v).ok_or_else(|| {
+        refuse(
+            node,
+            m,
+            "PoissonProcess is scored by unrolling over the variate's events, so \
+             the variate must be an array of a statically-known length; a \
+             dynamic-length array or a record-valued (table) variate is not yet \
+             supported",
+        )
+    })?;
+
+    let total_mass = closed_form_totalmass(m, intensity).ok_or_else(|| {
+        refuse(
+            node,
+            m,
+            "PoissonProcess needs a closed-form total mass for its intensity \
+             (`totalmass` is not FlatPDL); only a `%normalized` measure, a \
+             `superpose` of such, a `weighted` by a variate-independent scalar, \
+             and a `Lebesgue` over a bounded `interval(lo, hi)` are derived",
+        )
+    })?;
+
+    let mut terms: Vec<NodeId> = Vec::with_capacity(n as usize + 1);
+    for j in 0..n {
+        let idx = m.alloc(Node::Lit(Scalar::Int(j as i64)));
+        let event = build_call(m, "get0", &[v, idx]);
+        terms.push(lower_measure_density(m, intensity, event)?);
+    }
+    // k = 0 leaves the intensity term empty; the density is then exp(−Λ).
+    let events_term = if terms.is_empty() {
+        m.alloc(Node::Lit(Scalar::Real(0.0)))
+    } else {
+        fold_add(m, &terms)
+    };
+    Ok(build_call(m, "sub", &[events_term, total_mass]))
+}
+
+/// `logdensityof(Lebesgue(support = S), v)` = `0` on `S`, `−inf` outside.
+///
+/// §06 *Fundamental measures* makes `Lebesgue(support = S)` "the canonical
+/// continuous reference measure on the support set `S`, restricted to `S`" and
+/// says "the `support` parameter specifies where the measure is nonzero; density
+/// is zero outside". A measure's density with respect to itself is 1, so the
+/// log-density is 0 inside `S` — the same `in(v, S)` gate [`lower_truncate`]
+/// builds, over a constant arm.
+///
+/// Lowering it here rather than leaving a residual
+/// `builtin_logdensityof(Lebesgue, …)` leaf keeps the reference measure out of
+/// FlatPDL, so no backend needs a `Lebesgue` density builder. `Counting` has the
+/// same rule over the integers and is deliberately NOT added in this change.
+fn lower_lebesgue(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseError> {
+    let support = {
+        let c = expect_builtin_call(m, node, "Lebesgue")
+            .ok_or_else(|| refuse(node, m, "expected Lebesgue"))?;
+        named_or_positional(m, c, "support").ok_or_else(|| {
+            refuse(
+                node,
+                m,
+                "Lebesgue expects a `support` set (spec §06 `Lebesgue`)",
+            )
+        })?
+    };
+    let cond = build_call(m, "in", &[v, support]);
+    let zero = m.alloc(Node::Lit(Scalar::Real(0.0)));
+    Ok(gate_density(m, cond, zero))
+}
+
+/// The argument named `name` of `c`: the keyword/field entry, the same name
+/// inside a positional `record(name = …)` splat (§04), or the plain first
+/// positional argument. Immutable read, so it compares resolved strings rather
+/// than interning `name`.
+fn named_or_positional(m: &Module, c: &Call, name: &str) -> Option<NodeId> {
+    let field = |named: &[NamedArg]| -> Option<NodeId> {
+        named
+            .iter()
+            .find(|n| n.kind != NamedKind::Assign && m.resolve(n.name) == name)
+            .map(|n| n.value)
+    };
+    if let Some(v) = field(&c.named) {
+        return Some(v);
+    }
+    let arg = *c.args.first()?;
+    if let Some(rec) = expect_builtin_call(m, arg, "record") {
+        if let Some(v) = field(&rec.named) {
+            return Some(v);
+        }
+    }
+    Some(arg)
+}
+
+/// The statically-known length of an ARRAY variate, following one `(%ref self x)`
+/// level (an observed array is usually a named binding). `None` for a dynamic
+/// length, a multi-axis shape, or any non-array variate — including a `%table`,
+/// whose rows `get0` does not index.
+fn static_array_variate_len(m: &Module, v: NodeId) -> Option<u32> {
+    let ty = match m.type_of(v) {
+        Some(t) => t,
+        None => {
+            let (resolved, _) = resolve_ref_one(m, v);
+            m.type_of(resolved)?
+        }
+    };
+    match ty {
+        Type::Array { shape, .. } if shape.len() == 1 => match shape[0] {
+            Dim::Static(n) => Some(n),
+            Dim::Dynamic => None,
+        },
+        _ => None,
+    }
+}
+
+/// The total mass `Λ = totalmass(M)` of `measure` as a closed-form deterministic
+/// scalar node, or `None` when no rule applies.
+///
+/// `totalmass` is a measure-layer query and is not FlatPDL, so a rule needing
+/// `Λ` must synthesize it from the measure's structure. Each rule is a §06
+/// identity:
+///
+/// * a statically `%normalized` measure — `Λ = 1`, since §06 `normalize` defines
+///   `Z = totalmass(M)` and returns `M / Z`;
+/// * `superpose(M₁, …, Mₖ)` — `Λ = Σ Λᵢ` (§06 "measure addition");
+/// * `weighted(w, M)` with a variate-INDEPENDENT `w` — `Λ = w · totalmass(M)`,
+///   from §06 `weighted`'s $\mathrm{d}\nu = \text{weight}\cdot\mathrm{d}M$. A
+///   variate-dependent weight makes `Λ = ∫ w(x)\,\mathrm{d}M(x)` an integral with
+///   no closed form, the same guard [`recognize_convex_superposition`] applies;
+/// * `Lebesgue(support = interval(lo, hi))` with a mass inference proved FINITE —
+///   `Λ = hi − lo`, the support's length. The `Mass::Finite` check is what rules
+///   out an unbounded interval, whose mass is infinite.
+///
+/// Anything else yields `None` and the caller refuses. [`lower_normalize`]
+/// recognizes an overlapping but different set of `Z` shapes inline; merging the
+/// two is left out of this change.
+fn closed_form_totalmass(m: &mut Module, measure: NodeId) -> Option<NodeId> {
+    let (node, _) = resolve_ref_one(m, measure);
+
+    if matches!(
+        m.type_of(node),
+        Some(Type::Measure {
+            mass: Mass::Normalized,
+            ..
+        })
+    ) {
+        return Some(m.alloc(Node::Lit(Scalar::Real(1.0))));
+    }
+
+    if let Some(parts) = expect_builtin_call(m, node, "superpose")
+        .filter(|c| !c.args.is_empty())
+        .map(|c| c.args.to_vec())
+    {
+        let mut masses = Vec::with_capacity(parts.len());
+        for part in parts {
+            masses.push(closed_form_totalmass(m, part)?);
+        }
+        return Some(fold_add(m, &masses));
+    }
+
+    if let Some((w, base)) = expect_builtin_call(m, node, "weighted")
+        .filter(|c| c.args.len() == 2)
+        .map(|c| (c.args[0], c.args[1]))
+    {
+        if weight_is_variate_dependent(m, w) {
+            return None;
+        }
+        let inner = closed_form_totalmass(m, base)?;
+        return Some(build_call(m, "mul", &[w, inner]));
+    }
+
+    let bounded_lebesgue = matches!(
+        m.type_of(node),
+        Some(Type::Measure {
+            mass: Mass::Finite,
+            ..
+        })
+    );
+    if bounded_lebesgue {
+        let bounds = {
+            let c = expect_builtin_call(m, node, "Lebesgue")?;
+            let support = named_or_positional(m, c, "support")?;
+            let (set, _) = resolve_ref_one(m, support);
+            let ic = expect_builtin_call(m, set, "interval")?;
+            if ic.args.len() != 2 {
+                return None;
+            }
+            (ic.args[0], ic.args[1])
+        };
+        return Some(build_call(m, "sub", &[bounds.1, bounds.0]));
+    }
+    None
 }
 
 /// `logdensityof(broadcast(K, arg0, arg1, …), obs)` where `K` is a distribution

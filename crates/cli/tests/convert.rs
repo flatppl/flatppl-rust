@@ -210,7 +210,7 @@ fn renders_span_diagnostics() {
 /// as notes on stderr.
 ///
 /// The gap stand-in must be a REAL built-in with no type rule yet —
-/// `PoissonProcess` is a §08 distribution with no `catalogue.ron` row. An invented
+/// `BinnedPoissonProcess` is a §08 distribution with no `catalogue.ron` row. An invented
 /// name (this test used `mystery`) is an unresolvable name under spec §04 "Name
 /// resolution" and now errors instead of deferring, which tests nothing about
 /// gap reporting.
@@ -221,7 +221,7 @@ fn infer_emits_annotated_flatpir() {
     let out_path = dir.path("m.flatpir");
     fs::write(
         &src,
-        "a = elementof(reals)\nb ~ Normal(a, 1.0)\nc = PoissonProcess(b)\n",
+        "a = elementof(reals)\nb ~ Normal(a, 1.0)\nc = BinnedPoissonProcess(b)\n",
     )
     .unwrap();
 
@@ -238,7 +238,7 @@ fn infer_emits_annotated_flatpir() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("note: no type rule for `PoissonProcess`"),
+        stderr.contains("note: no type rule for `BinnedPoissonProcess`"),
         "got:\n{stderr}"
     );
 
@@ -246,7 +246,7 @@ fn infer_emits_annotated_flatpir() {
     assert!(written.contains("(%meta ((%scalar real) %parameterized reals) (elementof reals))"));
     assert!(written.contains("(%meta ((%scalar real) %stochastic reals) (draw "));
     assert!(
-        written.contains("(%meta (%deferred %stochastic %unknown) (PoissonProcess "),
+        written.contains("(%meta (%deferred %stochastic %unknown) (BinnedPoissonProcess "),
         "got:\n{written}"
     );
 }
