@@ -241,6 +241,31 @@ fn a_table_family_refuses_and_names_the_working_spelling() {
     );
 }
 
+/// A MULTIVARIATE family types (§06's family rule reads a family argument's axes
+/// against the rank of the parameter it feeds) but has no `broadcast(record, …)`
+/// form, so the lowering refuses. The message must name the implementation limit,
+/// not the spec — the model is legal FlatPPL.
+#[test]
+fn a_multivariate_family_refuses_and_names_the_implementation_limit() {
+    let msg = refusal(
+        "w = [0.2, 0.8]\n\
+         mus = rowstack([[0.0, 0.0], [3.0, 3.0]])\n\
+         c1 = rowstack([[1.0, 0.2], [0.2, 1.0]])\n\
+         covs = [c1, c1]\n\
+         mix = ksuperpose(MvNormal, w)(mu = mus, cov = covs)\n\
+         y = elementof(cartpow(reals, 2))\n\
+         lp = logdensityof(mix, y)\n",
+    );
+    assert!(
+        msg.contains("MULTIVARIATE parameter family") && msg.contains("is not lowered"),
+        "got: {msg}"
+    );
+    assert!(
+        !msg.contains("static error"),
+        "the model is legal FlatPPL; the refusal is an implementation limit: {msg}"
+    );
+}
+
 /// §06 says the mixture "is sampleable whenever `kernel` is", so the refusal must
 /// read as UNIMPLEMENTED — a component-index draw that is not built — and must not
 /// be confused with `weighted`'s genuine intractability.

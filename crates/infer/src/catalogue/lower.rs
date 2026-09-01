@@ -371,6 +371,7 @@ mod tests {
             support: SupportTag::Reals,
             mass: MassTag::Normalized,
             params: vec!["mu".to_string(), "sigma".to_string()],
+            param_ranks: vec![],
         };
         let cx = LowerCtx {
             arg_scalar: &|_| Some(ScalarType::Real),

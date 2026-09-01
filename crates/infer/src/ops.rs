@@ -4091,11 +4091,11 @@ fn ksuperpose_mass(component: Mass, weights_ty: &Type, weights_phase: Phase) -> 
 /// product over the family and whose domain therefore gains an axis — the family
 /// axis is CONTRACTED here and the domain is the component's per-cell variate.
 ///
-/// This is also where §06's one-axis family rule is enforced, because the family
-/// arguments are the arguments of the APPLICATION, not of the lift: "the family
-/// has a single axis: along it every collection argument must have size $N$ or be
-/// singular (size one) … A table counts as having one axis, its rows; a
-/// collection argument with more than one axis is a static error."
+/// This is also where §06's family-axis rule is enforced, because the family
+/// arguments are the arguments of the APPLICATION, not of the lift: "with one
+/// family axis per collection argument: an argument's family axes are its leading
+/// axes in excess of the rank (number of axes) of the parameter it feeds, and any
+/// count other than one is a static error."
 ///
 /// `None` (→ the caller leaves the application `%deferred`) when the component's
 /// per-cell variate is not statically resolvable, never a guessed shape.
@@ -4107,10 +4107,10 @@ fn ksuperpose_result_type(
 ) -> Option<Type> {
     let call = ksuperpose_callee(inf, callee)?;
     let weights = *call.args.get(1)?;
-    if let Some(failed) = ksuperpose_family_check(inf, callee, weights, args, named) {
+    let component = *call.args.first()?;
+    if let Some(failed) = ksuperpose_family_check(inf, component, weights, args, named) {
         return Some(failed);
     }
-    let component = *call.args.first()?;
     let cell = ksuperpose_cell_variate(inf, component, args, named)?;
     Some(Type::Measure {
         domain: Box::new(cell),
@@ -4149,14 +4149,28 @@ fn ksuperpose_callee(inf: &Inferencer<'_, '_>, callee: NodeId) -> Option<Call> {
     None
 }
 
-/// §06's one-axis family rule. Each family argument is measured against `N`, the
-/// weights' own length: a collection must be one-axis and size `N` or singular,
-/// a non-collection is held constant. A `Dim::Dynamic` extent on either side is
-/// admitted — §06 says `N` "need not be statically known", so a dynamic length
-/// is a runtime check, not a static error.
+/// §06's family-axis rule. Each collection argument must carry EXACTLY ONE
+/// family axis — "its leading axes in excess of the rank (number of axes) of the
+/// parameter it feeds, and any count other than one is a static error" — and
+/// along that axis it must have size `N`, the weights' own length, or be singular.
+/// A non-collection argument is held constant across the components.
+///
+/// Within the family, §04 *Collection arguments*' same-number-of-axes
+/// requirement is suspended, so ranks may differ between arguments: `MvNormal`
+/// takes an $N \times d$ `mu` beside an $N \times d \times d$ `cov`.
+///
+/// A `Dim::Dynamic` extent on either side is admitted — §06 says `N` "need not be
+/// statically known", so a dynamic length is a runtime check, not a static error.
+///
+/// A parameter whose rank this pass cannot read ([`ksuperpose_param_rank`]) is
+/// measured as rank-polymorphic: the rank that leaves exactly one family axis, so
+/// the argument passes and one axis is stripped for the cell. That is the only
+/// honest reading — without a declared rank there is no count to compare — and it
+/// is what §08's `normalize(ksuperpose(Dirac, p)(value = labels))` needs, `Dirac`
+/// taking a value of any rank.
 fn ksuperpose_family_check(
     inf: &mut Inferencer<'_, '_>,
-    id: NodeId,
+    component: NodeId,
     weights: NodeId,
     args: &[ArgInfo],
     named: &[NamedInfo],
@@ -4166,36 +4180,88 @@ fn ksuperpose_family_check(
         Some(Type::TVector { len, .. }) => *len,
         _ => Dim::Dynamic,
     };
-    let family: Vec<(NodeId, Type)> = args
+    let component_ty = inf
+        .lookup_type(component)
+        .cloned()
+        .unwrap_or(Type::Deferred);
+    let param_names = ksuperpose_component_inputs(inf, component, &component_ty);
+    let param_of_position = |i: usize| param_names.get(i).copied();
+    let family: Vec<(NodeId, Option<Symbol>, Type)> = args
         .iter()
-        .map(|(node, t, _)| (*node, t.clone()))
-        .chain(named.iter().map(|(_, node, t, _)| (*node, t.clone())))
+        .enumerate()
+        .map(|(i, (node, t, _))| (*node, param_of_position(i), t.clone()))
+        .chain(
+            named
+                .iter()
+                .map(|(name, node, t, _)| (*node, Some(*name), t.clone())),
+        )
         .collect();
     let mut failed = None;
-    for (node, ty) in family {
-        // A table's rows ARE the one axis (§06), so its `nrows` is the extent
-        // and it can never be the multi-axis error.
+    for (node, param, ty) in family {
+        let rank = param.and_then(|p| ksuperpose_param_rank(inf, component, p));
+        let param_label = |inf: &Inferencer<'_, '_>| match param {
+            Some(p) => format!("`{}`", inf.module.resolve(p)),
+            None => "the parameter it feeds".to_string(),
+        };
+        // A table's rows ARE its family axis (§06 passes a table's columns as the
+        // collection arguments), so the rank comparison is against the COLUMN
+        // element's own rank, and the extent is `nrows`.
         let extent = match &ty {
-            Type::Array { .. } => match axis_count(&ty) {
-                1 => flatten_dims(&ty)[0],
-                axes => {
+            Type::Table { columns, nrows } => {
+                for (col, col_elem) in columns.iter() {
+                    let Some(rank) = ksuperpose_param_rank(inf, component, *col) else {
+                        continue;
+                    };
+                    let axes = collection_axis_count(col_elem);
+                    if axes != rank {
+                        let name = inf.module.resolve(*col).to_string();
+                        inf.diags.push(crate::Diagnostic::error_at(
+                            node,
+                            format!(
+                                "a `ksuperpose` family argument must have exactly one family \
+                                 axis (spec §06: \"an argument's family axes are its leading \
+                                 axes in excess of the rank (number of axes) of the parameter \
+                                 it feeds, and any count other than one is a static error\"); \
+                                 the table's rows are one axis and `{name}` has rank {rank}, \
+                                 so a column of rank-{axes} elements does not leave exactly \
+                                 one"
+                            ),
+                        ));
+                        failed = Some(Type::Failed(
+                            "ksuperpose family argument has the wrong number of family axes".into(),
+                        ));
+                    }
+                }
+                *nrows
+            }
+            Type::Array { .. } | Type::TVector { .. } => {
+                let axes = collection_axis_count(&ty);
+                if let Some(rank) = rank
+                    && axes != rank + 1
+                {
+                    let label = param_label(inf);
                     inf.diags.push(crate::Diagnostic::error_at(
                         node,
                         format!(
-                            "a `ksuperpose` family argument with more than one axis is a \
-                             static error (spec §06: \"a collection argument with more \
-                             than one axis is a static error\"); got an array with \
-                             {axes} axes"
+                            "a `ksuperpose` family argument must have exactly one family axis \
+                             (spec §06: \"an argument's family axes are its leading axes in \
+                             excess of the rank (number of axes) of the parameter it feeds, \
+                             and any count other than one is a static error\"); {label} has \
+                             rank {rank}, so a collection with {axes} axes gives {} family \
+                             axes",
+                            axes.saturating_sub(rank)
                         ),
                     ));
                     failed = Some(Type::Failed(
-                        "ksuperpose family argument is multi-axis".into(),
+                        "ksuperpose family argument has the wrong number of family axes".into(),
                     ));
                     continue;
                 }
-            },
-            Type::TVector { len, .. } => *len,
-            Type::Table { nrows, .. } => *nrows,
+                match &ty {
+                    Type::TVector { len, .. } => *len,
+                    _ => flatten_dims(&ty)[0],
+                }
+            }
             // Held constant across the components (§06).
             _ => continue,
         };
@@ -4206,8 +4272,8 @@ fn ksuperpose_family_check(
             inf.diags.push(crate::Diagnostic::error_at(
                 node,
                 format!(
-                    "a `ksuperpose` family argument must have size {want} — the length \
-                     of `weights` — or be singular (spec §06); got size {got}"
+                    "a `ksuperpose` family argument must have size {want} along the family \
+                     axis — the length of `weights` — or be singular (spec §06); got size {got}"
                 ),
             ));
             failed = Some(Type::Failed(
@@ -4215,8 +4281,27 @@ fn ksuperpose_family_check(
             ));
         }
     }
-    let _ = id;
     failed
+}
+
+/// The declared RANK of the component kernel's parameter `param` — §08's
+/// "Parameters" shapes, carried by the catalogue row
+/// (`Catalogue::distribution_param_ranks`). `None` when this pass cannot read
+/// it: a reified component (a `%kernel` type records input NAMES only), a
+/// fundamental measure whose parameter is rank-polymorphic (`Dirac`'s `value`),
+/// or an unreadable component. [`ksuperpose_family_check`] treats `None` as
+/// rank-polymorphic rather than guessing rank 0.
+fn ksuperpose_param_rank(
+    inf: &Inferencer<'_, '_>,
+    component: NodeId,
+    param: Symbol,
+) -> Option<usize> {
+    let name = ksuperpose_constructor_name(inf, component)?;
+    let params = crate::distribution_param_names(&name)?;
+    let ranks = crate::distribution_param_ranks(&name)?;
+    let wanted = inf.module.resolve(param);
+    let i = params.iter().position(|p| p == wanted)?;
+    ranks.get(i).copied()
 }
 
 /// How many axes a collection type has, counting a nested array's axes as well
@@ -4224,6 +4309,17 @@ fn ksuperpose_family_check(
 /// [`flatten_dims`] already computes for `aggregate`.
 fn axis_count(t: &Type) -> usize {
     flatten_dims(t).len()
+}
+
+/// [`axis_count`], but a row vector's `len` counts as an axis — `flatten_dims`
+/// reads `%array` shapes only, and §06's family rule measures the axes of any
+/// collection argument.
+fn collection_axis_count(t: &Type) -> usize {
+    match t {
+        Type::Array { shape, elem } => shape.len() + collection_axis_count(elem),
+        Type::TVector { elem, .. } => 1 + collection_axis_count(elem),
+        _ => 0,
+    }
 }
 
 /// The component kernel's PER-CELL variate: the mixture's own domain, since the
@@ -4236,11 +4332,19 @@ fn ksuperpose_cell_variate(
     args: &[ArgInfo],
     named: &[NamedInfo],
 ) -> Option<Type> {
-    // One axis stripped per family argument, as `broadcast_type`'s `cell_arg`
-    // does. A table's row IS its cell (§06: "A table counts as having one axis,
-    // its rows"), so it strips to the record of its columns.
+    // Exactly ONE axis stripped per family argument — the family axis §06 gives
+    // each collection argument — leaving the parameter's own rank behind. A
+    // multi-dimensional `shape` keeps its trailing axes: an $N \times d \times d$
+    // `cov` strips to a $d \times d$ matrix, not to its scalar element. A table's
+    // row is its cell, so it strips to the record of its columns.
     let cell_arg = |t: &Type| match t {
-        Type::Array { elem, .. } => elem.as_ref().clone(),
+        Type::Array { shape, elem } => match shape.split_first() {
+            Some((_, rest)) if !rest.is_empty() => Type::Array {
+                shape: rest.into(),
+                elem: elem.clone(),
+            },
+            _ => elem.as_ref().clone(),
+        },
         Type::TVector { elem, .. } => elem.as_ref().clone(),
         Type::Table { columns, .. } => Type::Record(columns.clone()),
         other => other.clone(),

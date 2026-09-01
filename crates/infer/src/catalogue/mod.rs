@@ -61,6 +61,19 @@ pub(crate) enum Sig {
         /// break mid-migration — every row is expected to fill it in.
         #[serde(default)]
         params: Vec<String>,
+        /// Declared RANK (number of axes) of each parameter, parallel to
+        /// `params` — `MvNormal` → `[1, 2]`, since §08 gives `mu` as a "mean
+        /// vector" and `cov` as an "$n \times n$" matrix. Read by
+        /// [`Self::distribution_param_ranks`] for §06's `ksuperpose` family-axis
+        /// rule, which measures a family argument's axes against the rank of the
+        /// parameter it feeds.
+        ///
+        /// **An empty list means every parameter is a scalar (rank 0).** That is
+        /// the shape of all but the seven shaped rows below, and of every §09
+        /// module row, so the default states the common case instead of leaving
+        /// it unread. `param_ranks_are_parallel_to_params` pins the length.
+        #[serde(default)]
+        param_ranks: Vec<usize>,
     },
     Function {
         /// Declared parameter list. `lower` does not type-check arguments
@@ -831,6 +844,42 @@ impl Catalogue {
                 })
         })
     }
+
+    /// Declared parameter RANKS for a built-in distribution, parallel to
+    /// [`Self::distribution_param_names`] — `MvNormal` → `[1, 2]`. A row that
+    /// declares no ranks reports every parameter as rank 0 (see
+    /// [`Sig::Distribution::param_ranks`]). `None` under the same conditions as
+    /// `distribution_param_names`.
+    pub fn distribution_param_ranks(&self, name: &str) -> Option<Vec<usize>> {
+        let ranks = |params: &Vec<String>, param_ranks: &Vec<usize>| {
+            if param_ranks.is_empty() {
+                vec![0; params.len()]
+            } else {
+                param_ranks.clone()
+            }
+        };
+        if let Some(Sig::Distribution {
+            params,
+            param_ranks,
+            ..
+        }) = self.base(name)
+        {
+            return Some(ranks(params, param_ranks));
+        }
+        self.modules.iter().find_map(|m| {
+            m.bindings
+                .iter()
+                .find(|b| b.name == name)
+                .and_then(|b| match &b.sig {
+                    Sig::Distribution {
+                        params,
+                        param_ranks,
+                        ..
+                    } => Some(ranks(params, param_ranks)),
+                    Sig::Function { .. } | Sig::Structural { .. } => None,
+                })
+        })
+    }
 }
 
 /// A merged view of the built-in catalogue plus zero or more host-supplied
@@ -1383,6 +1432,66 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A declared `param_ranks` list must cover every parameter, so the
+    /// family-axis rule never reads a rank off the wrong parameter. An empty
+    /// list is the all-scalar default and is admitted.
+    #[test]
+    fn param_ranks_are_parallel_to_params() {
+        let cat = builtin();
+        let check = |what: &str, params: &Vec<String>, param_ranks: &Vec<usize>| {
+            assert!(
+                param_ranks.is_empty() || param_ranks.len() == params.len(),
+                "{what}: {} param_ranks for {} params",
+                param_ranks.len(),
+                params.len()
+            );
+        };
+        for b in &cat.base {
+            if let Sig::Distribution {
+                params,
+                param_ranks,
+                ..
+            } = &b.sig
+            {
+                check(&b.name, params, param_ranks);
+            }
+        }
+        for m in &cat.modules {
+            for binding in &m.bindings {
+                if let Sig::Distribution {
+                    params,
+                    param_ranks,
+                    ..
+                } = &binding.sig
+                {
+                    check(&format!("{}.{}", m.name, binding.name), params, param_ranks);
+                }
+            }
+        }
+    }
+
+    /// The shaped §08 rows: `MvNormal` `mu` is a vector and `cov` a matrix,
+    /// `Multinomial` `n` a scalar and `p` a vector. An unshaped row reports
+    /// rank 0 for every parameter.
+    #[test]
+    fn distribution_param_ranks_read_the_declared_shapes() {
+        let cat = builtin();
+        assert_eq!(cat.distribution_param_ranks("MvNormal"), Some(vec![1, 2]));
+        assert_eq!(
+            cat.distribution_param_ranks("Multinomial"),
+            Some(vec![0, 1])
+        );
+        assert_eq!(cat.distribution_param_ranks("Dirichlet"), Some(vec![1]));
+        assert_eq!(cat.distribution_param_ranks("Wishart"), Some(vec![0, 2]));
+        assert_eq!(cat.distribution_param_ranks("Normal"), Some(vec![0, 0]));
+        // A §09 module distribution: every parameter is a scalar.
+        assert_eq!(
+            cat.distribution_param_ranks("CrystalBall"),
+            Some(vec![0, 0, 0, 0])
+        );
+        assert_eq!(cat.distribution_param_ranks("sqrt"), None);
     }
 
     #[test]

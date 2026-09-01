@@ -3,8 +3,8 @@
 //!
 //! The lift is a KERNEL; applying it to a parameter family contracts the family
 //! axis into a mixture over the components' shared variate. Both halves are
-//! pinned here, plus the two static errors §06 names (a multi-axis family
-//! argument, and one whose size is neither $N$ nor one).
+//! pinned here, plus the two static errors §06 names (a family argument whose
+//! family-axis count is not one, and one whose size is neither $N$ nor one).
 
 use flatppl_infer::{Severity, infer};
 
@@ -143,20 +143,96 @@ fn a_family_argument_of_the_wrong_size_is_a_static_error() {
         "w = [0.3, 1.2]\n\
          mus = [-1.0, 2.0, 3.0]\n\
          mix = ksuperpose(Normal, w)(mu = mus, sigma = 1.0)\n",
-        "must have size 2 — the length of `weights` — or be singular",
+        "must have size 2 along the family axis — the length of `weights` — or be singular",
     );
 }
 
-/// §06: "a collection argument with more than one axis is a static error". A
-/// nested array counts its axes, so `[[…], […]]` is caught as readily as a
-/// declared matrix.
+/// §06: "an argument's family axes are its leading axes in excess of the rank
+/// (number of axes) of the parameter it feeds, and any count other than one is a
+/// static error". `Normal`'s `mu` has rank 0, so a two-axis argument carries two
+/// family axes. A nested array counts its axes, so `[[…], […]]` is caught as
+/// readily as a declared matrix.
 #[test]
-fn a_multi_axis_family_argument_is_a_static_error() {
+fn two_family_axes_over_a_scalar_parameter_is_a_static_error() {
     rejects(
         "w = [0.3, 1.2]\n\
          mus = [[0.0, 1.0], [2.0, 3.0]]\n\
          mix = ksuperpose(Normal, w)(mu = mus, sigma = 1.0)\n",
-        "with more than one axis is a static error",
+        "`mu` has rank 0, so a collection with 2 axes gives 2 family axes",
+    );
+}
+
+/// The same sentence in the other direction: a family argument at the
+/// parameter's own rank carries ZERO family axes, which "any count other than
+/// one" also refuses. A shared covariance must be spelled with a singular family
+/// axis; only a NON-collection is held constant.
+#[test]
+fn zero_family_axes_over_a_matrix_parameter_is_a_static_error() {
+    rejects(
+        "w = [0.2, 0.8]\n\
+         mus = rowstack([[0.0, 0.0], [3.0, 3.0]])\n\
+         cov = rowstack([[1.0, 0.2], [0.2, 1.0]])\n\
+         mix = ksuperpose(MvNormal, w)(mu = mus, cov = cov)\n",
+        "`cov` has rank 2, so a collection with 2 axes gives 0 family axes",
+    );
+}
+
+/// §06: "Within the family the same-number-of-axes requirement of *Collection
+/// arguments* does not apply, so the components may be multivariate — a vector
+/// parameter takes an $N \times d$ matrix while a matrix parameter takes an
+/// $N \times d \times d$ array." The mixture's variate is the COMPONENT
+/// variate: a vector of $d$, not an array over the family.
+#[test]
+fn a_multivariate_family_mixes_over_the_component_variate() {
+    let out = pir("w = [0.2, 0.5, 0.3]\n\
+         mus = rowstack([[0.0, 0.0], [3.0, 3.0], [-2.0, 1.0]])\n\
+         c1 = rowstack([[1.0, 0.2], [0.2, 1.0]])\n\
+         c2 = rowstack([[2.0, 0.0], [0.0, 0.5]])\n\
+         c3 = rowstack([[1.5, -0.3], [-0.3, 1.5]])\n\
+         covs = [c1, c2, c3]\n\
+         mix = normalize(ksuperpose(MvNormal, w)(mu = mus, cov = covs))\n\
+         y ~ mix\n");
+    assert!(
+        out.contains("(%measure (%domain (%array 1 (2) (%scalar real))) (%mass %normalized))"),
+        "the mixture is a measure over MvNormal's own vector variate:\n{out}"
+    );
+}
+
+/// A singular family axis expands by repetition at any rank: one $d \times d$
+/// covariance serves all $N$ components when it is spelled $1 \times d \times d$.
+#[test]
+fn a_singular_family_axis_expands_at_matrix_rank() {
+    let out = pir("w = [0.2, 0.5, 0.3]\n\
+         mus = rowstack([[0.0, 0.0], [3.0, 3.0], [-2.0, 1.0]])\n\
+         c1 = rowstack([[1.0, 0.2], [0.2, 1.0]])\n\
+         covs = [c1]\n\
+         mix = normalize(ksuperpose(MvNormal, w)(mu = mus, cov = covs))\n\
+         y ~ mix\n");
+    assert!(
+        out.contains("(%measure (%domain (%array 1 (2) (%scalar real))) (%mass %normalized))"),
+        "a size-one cov axis expands over the three components:\n{out}"
+    );
+}
+
+/// A table family works by ROW axis with per-column element rank: `MvNormal`'s
+/// `mu` column holds vectors and its `cov` column holds matrices.
+#[test]
+fn a_table_family_takes_its_column_element_ranks() {
+    let out = pir("w = [0.2, 0.8]\n\
+         c1 = rowstack([[1.0, 0.2], [0.2, 1.0]])\n\
+         pars = table(mu = [[0.0, 0.0], [3.0, 3.0]], cov = [c1, c1])\n\
+         mix = normalize(ksuperpose(MvNormal, w)(pars))\n\
+         y ~ mix\n");
+    assert!(
+        out.contains("(%domain (%array 1 "),
+        "the mixture is a measure over a vector variate:\n{out}"
+    );
+    // A vector-element column over a SCALAR parameter is the two-family-axes error.
+    rejects(
+        "w = [0.2, 0.8]\n\
+         pars = table(mu = [[0.0, 0.0], [3.0, 3.0]], sigma = [1.0, 0.5])\n\
+         mix = ksuperpose(Normal, w)(pars)\n",
+        "the table's rows are one axis and `mu` has rank 0",
     );
 }
 
@@ -198,7 +274,7 @@ fn a_table_family_argument_counts_its_rows_as_the_one_axis() {
         "w = [0.3, 1.2]\n\
          params = table(mu = [-1.0, 2.0, 3.0], sigma = [1.0, 0.5, 0.25])\n\
          mix = ksuperpose(Normal, w)(params)\n",
-        "must have size 2 — the length of `weights` — or be singular",
+        "must have size 2 along the family axis — the length of `weights` — or be singular",
     );
 }
 

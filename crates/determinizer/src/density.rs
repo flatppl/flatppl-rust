@@ -1369,6 +1369,27 @@ fn lower_applied_ksuperpose_inner(
         }
     }
 
+    // A MULTIVARIATE family — §06's "a vector parameter takes an $N \times d$
+    // matrix while a matrix parameter takes an $N \times d \times d$ array" — has
+    // no form in the `broadcast(record, …)` family below: §04 *Collection
+    // arguments* makes a plain broadcast require the same number of axes from
+    // every collection argument and strips EVERY axis to reach its cell, so an
+    // $N \times d$ `mu` beside an $N \times d \times d$ `cov` cannot be spelled
+    // that way. Refuse rather than emit a form the backend mislowers; the
+    // per-component slice extraction this needs is not built.
+    for &arg in pos_args.iter().chain(kw_args.iter().map(|(_, v)| v)) {
+        let axes = m.type_of(arg).map(array_axes).unwrap_or(0);
+        if axes > 1 {
+            return Err(refuse(
+                lift_node,
+                m,
+                "ksuperpose over a MULTIVARIATE parameter family is not lowered (the \
+                 per-component slice extraction is not built): a family argument with \
+                 an axis beyond the family axis has no `broadcast(record, …)` form",
+            ));
+        }
+    }
+
     // Per-component θᵢ: positional family args bind to the constructor's
     // parameter names in order, a keyword family arg keeps its given name.
     let mut fields: Vec<(Symbol, NodeId)> = Vec::with_capacity(pos_args.len() + kw_args.len());
@@ -7252,6 +7273,16 @@ pub(crate) fn resolve_ref_one(m: &Module, id: NodeId) -> (NodeId, Option<Binding
 }
 
 /// A refusal naming the construct at `id`.
+/// Axes of a value type, counting a nested array's own axes — the §04
+/// "number of axes" a broadcast cell strips.
+fn array_axes(t: &Type) -> usize {
+    match t {
+        Type::Array { shape, elem } => shape.len() + array_axes(elem),
+        Type::TVector { elem, .. } => 1 + array_axes(elem),
+        _ => 0,
+    }
+}
+
 pub(crate) fn refuse(id: NodeId, m: &Module, reason: &str) -> RefuseError {
     let construct = match m.node(id) {
         Node::Call(c) => match c.head {
