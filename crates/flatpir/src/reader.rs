@@ -183,7 +183,16 @@ fn read_atom_expr(module: &mut Module, s: &str, span: Span) -> Result<NodeId> {
         "false" => Node::Lit(Scalar::Bool(false)),
         "_" => Node::Hole,
         _ => {
-            if let Some(num) = classify_number(s) {
+            if let Some(magnitude) = signed_numeric_magnitude(s) {
+                return Err(err_at(
+                    span,
+                    format!(
+                        "signed numeric atom `{s}`: §11 \"Literal values\" says a scalar \
+                         literal carries no leading sign; a negated literal is the call \
+                         `(neg {magnitude})`"
+                    ),
+                ));
+            } else if let Some(num) = classify_number(s) {
                 Node::Lit(num)
             } else if s.starts_with('%') {
                 return Err(err_at(
@@ -878,29 +887,31 @@ fn read_doc(form: &Sexpr) -> Result<Doc> {
 /// Classify a bare atom as an integer or real *by lexical form* (spec §11), or
 /// `None` if it is not numeric (and so a symbol / constant). Crucially, this
 /// never treats `inf` / `nan` / `pi` as numbers — those are bare constants.
+/// A leading `-`/`+` is never a literal here (§11 "Literal values": a scalar
+/// literal carries no leading sign) — see [`signed_numeric_magnitude`].
 pub(crate) fn classify_number(s: &str) -> Option<Scalar> {
     let bytes = s.as_bytes();
     let first = *bytes.first()?;
-    let numeric_start =
-        first.is_ascii_digit() || (matches!(first, b'-' | b'+' | b'.') && bytes.len() > 1);
+    if matches!(first, b'-' | b'+') {
+        return None;
+    }
+    let numeric_start = first.is_ascii_digit() || (first == b'.' && bytes.len() > 1);
     if !numeric_start || !s.bytes().any(|b| b.is_ascii_digit()) {
         return None;
     }
+    parse_number_magnitude(s)
+}
 
-    let (negative, rest) = match first {
-        b'-' => (true, &s[1..]),
-        b'+' => (false, &s[1..]),
-        _ => (false, s),
-    };
-
+/// Parse an unsigned numeric atom's magnitude (hex integer, integer, or real).
+fn parse_number_magnitude(s: &str) -> Option<Scalar> {
     // Hex integer (`0xF7`).
-    if let Some(hex) = rest.strip_prefix("0x").or_else(|| rest.strip_prefix("0X")) {
+    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
         let digits: String = hex.chars().filter(|&c| c != '_').collect();
         if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_hexdigit()) {
             return None;
         }
         let v = i64::from_str_radix(&digits, 16).ok()?;
-        return Some(Scalar::Int(if negative { -v } else { v }));
+        return Some(Scalar::Int(v));
     }
 
     let cleaned: String = s.chars().filter(|&c| c != '_').collect();
@@ -910,6 +921,28 @@ pub(crate) fn classify_number(s: &str) -> Option<Scalar> {
     } else {
         cleaned.parse::<i64>().ok().map(Scalar::Int)
     }
+}
+
+/// Detect an atom that lexically is a signed numeric literal (`-1.0`, `+5`,
+/// `-0xFF`) — the exact shape §11 "Literal values" forbids: "A scalar literal
+/// carries no leading sign: a negated numeric literal is the call `(neg
+/// 1.0)`." Returns the unsigned magnitude text for the error message, or
+/// `None` when the atom is not a signed number (e.g. the bare constant
+/// `-inf`, which has no digit).
+fn signed_numeric_magnitude(s: &str) -> Option<&str> {
+    let bytes = s.as_bytes();
+    let first = *bytes.first()?;
+    if !matches!(first, b'-' | b'+') || bytes.len() <= 1 {
+        return None;
+    }
+    let rest = &s[1..];
+    let rest_first = rest.as_bytes()[0];
+    let numeric_start = rest_first.is_ascii_digit() || rest_first == b'.';
+    if !numeric_start || !rest.bytes().any(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    parse_number_magnitude(rest)?;
+    Some(rest)
 }
 
 // ---- small Sexpr accessors with descriptive, positioned errors ----

@@ -579,12 +579,14 @@ fn string_escapes_roundtrip() {
 }
 
 #[test]
-fn negative_and_big_numbers() {
-    let j = rt("(%module (%public n m) (%bind n -42) (%bind m -3.5))");
+fn negated_numbers_via_neg_call() {
+    // §11 "Literal values": a scalar literal carries no leading sign; a
+    // negated literal is the call `(neg <lit>)`, not a signed atom.
+    let j = rt("(%module (%public n m) (%bind n (neg 42)) (%bind m (neg 3.5)))");
     let binds = j["%module"]["binds"].as_array().unwrap();
     let expr = |name: &str| binds.iter().find(|b| b["name"] == name).unwrap()["expr"].clone();
-    assert_eq!(expr("n"), json!({ "int": -42 }));
-    assert_eq!(expr("m"), json!({ "real": -3.5 }));
+    assert_eq!(expr("n"), json!(["neg", { "int": 42 }]));
+    assert_eq!(expr("m"), json!(["neg", { "real": 3.5 }]));
 }
 
 #[test]

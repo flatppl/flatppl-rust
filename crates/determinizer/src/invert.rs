@@ -1538,7 +1538,10 @@ static REGISTRY: &[(&str, UnaryEntry)] = &[
             inverse: Inverse::Builtin("sinh"),
             logvol_out: LogVol::At(|m, u| {
                 let a = build_call(m, "abs", &[u]);
-                let mtwo = m.alloc(Node::Lit(Scalar::Real(-2.0)));
+                // §11 "Literal values": a scalar literal carries no leading sign, so
+                // -2.0 is built as `neg(2.0)`, not a negative `Lit` atom.
+                let two_pos = m.alloc(Node::Lit(Scalar::Real(2.0)));
+                let mtwo = build_call(m, "neg", &[two_pos]);
                 let scaled = build_call(m, "mul", &[mtwo, a]);
                 let e = build_call(m, "exp", &[scaled]);
                 let l = build_call(m, "log1p", &[e]);
