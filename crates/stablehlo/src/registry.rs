@@ -308,6 +308,25 @@ static REGISTRY: &[(&str, DistLowering)] = &[
             touniform: None,
         },
     ),
+    // §09 particle-physics standard-module densities. Reached exactly like a §08
+    // base constructor: the determiniser emits the BARE member name as the kernel
+    // tag, so the module qualification is gone by the time `lookup` runs.
+    (
+        "CrystalBall",
+        DistLowering {
+            logpdf: crystal_ball_logpdf,
+            sample: None,
+            touniform: None,
+        },
+    ),
+    (
+        "Argus",
+        DistLowering {
+            logpdf: argus_logpdf,
+            sample: None,
+            touniform: None,
+        },
+    ),
 ];
 
 /// Look up a distribution's lowering by its constructor name (`"Normal"`,
@@ -1924,6 +1943,181 @@ fn binomial_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, Emit
 /// weighted(1-w, Dirac(0))), n)`'s batched mixture density (the zero-inflated
 /// binomial idiom). Its `@sample` builder is [`dirac_sample`] — the identity
 /// `value`.
+/// §09 `CrystalBall(m0, sigma, alpha, n)` — a Gaussian core with a power-law
+/// tail below `-alpha` standard deviations, normalized.
+///
+/// With `t = (x − m₀)/σ` and `a = |α|`, §09's density is
+/// `(1/M)·A·(B − t)^(−n)` for `t < −a` and `(1/M)·exp(−t²/2)` otherwise, where
+/// `A = (n/a)^n·exp(−a²/2)` and `B = n/a − a`. So
+///
+/// ```text
+/// log f = select(t < −a,  log A − n·log(B − t),  −t²/2)  −  log M
+/// ```
+///
+/// §09 leaves `M` as "a normalizing constant"; its closed form follows from the
+/// two pieces. The tail integrates to `A·(n/a)^(1−n)/(n−1) = (n/a)·exp(−a²/2)/(n−1)`
+/// (substituting `u = B − t`, whose lower limit at `t = −a` is `B + a = n/a`),
+/// and the core to `√(π/2)·(1 + erf(a/√2))`, both scaled by `σ` for the `t → x`
+/// change of variables:
+///
+/// ```text
+/// M = σ·( (n/a)·exp(−a²/2)/(n−1) + √(π/2)·(1 + erf(a/√2)) )
+/// ```
+///
+/// Verified against `scipy.stats.crystalball(beta = alpha, m = n, loc = m0,
+/// scale = sigma).logpdf` at four masses of the b_mass_peak corpus model,
+/// agreeing to 0–9e-16 absolute.
+///
+/// `n ≤ 1` makes the tail integral divergent, so §09's `M` does not exist; the
+/// emitted `n − 1` then drives `log M` to `NaN` rather than a wrong finite
+/// number. Both `select` branches are computed, so the discarded
+/// `log(B − t)` of a non-positive argument on the core side is a per-element
+/// `NaN` that `select` drops — the same discipline [`Emitter::atan2`] uses.
+fn crystal_ball_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
+    let m0 = p.get(e, "m0")?;
+    let sigma = p.get(e, "sigma")?;
+    let alpha = p.get(e, "alpha")?;
+    let n = p.get(e, "n")?;
+
+    let diff = e.sub(v, &m0);
+    let t = e.div(&diff, &sigma);
+    let a = e.abs(&alpha);
+
+    let n_over_a = e.div(&n, &a);
+    let a_sq = e.mul(&a, &a);
+    let half = e.scalar(0.5);
+    let half_a_sq = e.mul(&half, &a_sq);
+    let log_n_over_a = e.log(&n_over_a);
+    let n_log_n_over_a = e.mul(&n, &log_n_over_a);
+    let log_a_coef = e.sub(&n_log_n_over_a, &half_a_sq);
+    let b = e.sub(&n_over_a, &a);
+
+    let b_minus_t = e.sub(&b, &t);
+    let log_b_minus_t = e.log(&b_minus_t);
+    let n_log_b_minus_t = e.mul(&n, &log_b_minus_t);
+    let tail_branch = e.sub(&log_a_coef, &n_log_b_minus_t);
+
+    let t_sq = e.mul(&t, &t);
+    let neg_half = e.scalar(-0.5);
+    let core_branch = e.mul(&neg_half, &t_sq);
+
+    let neg_a = e.neg(&a);
+    let in_tail = e.compare("LT", &t, &neg_a);
+    let log_unnorm = e.select(&in_tail, &tail_branch, &core_branch);
+
+    // M's tail piece: (n/a)·exp(−a²/2)/(n − 1).
+    let neg_half_a_sq = e.neg(&half_a_sq);
+    let exp_term = e.exp(&neg_half_a_sq);
+    let tail_num = e.mul(&n_over_a, &exp_term);
+    let one = e.scalar(1.0);
+    let n_minus_one = e.sub(&n, &one);
+    let tail_int = e.div(&tail_num, &n_minus_one);
+
+    // M's core piece: √(π/2)·(1 + erf(a/√2)).
+    let sqrt2 = e.scalar(std::f64::consts::SQRT_2);
+    let a_over_sqrt2 = e.div(&a, &sqrt2);
+    let erf_a = e.erf(&a_over_sqrt2);
+    let one_plus_erf = e.add(&one, &erf_a);
+    let sqrt_half_pi = e.scalar((std::f64::consts::PI / 2.0).sqrt());
+    let core_int = e.mul(&sqrt_half_pi, &one_plus_erf);
+
+    let total_int = e.add(&tail_int, &core_int);
+    let mass = e.mul(&sigma, &total_int);
+    let log_mass = e.log(&mass);
+    Ok(e.sub(&log_unnorm, &log_mass))
+}
+
+/// §09 `Argus(resonance, slope, power)`, normalized.
+///
+/// With `m₀ = resonance`, `c = slope`, `p = power` and `u = 1 − (x/m₀)²`,
+/// §09's density is `(1/M)·x·u^p·exp(c·u)` on `0 < x < m₀`, so
+///
+/// ```text
+/// log f = log x + p·log u + c·u − log M
+/// ```
+///
+/// The support is NOT re-checked here: every builder in this module scores its
+/// per-observation formula and leaves `S`-membership to the measure layer's
+/// `restrict`/`truncate` (see this module's header note on `uniform_logpdf`).
+///
+/// `M = (m₀²/2)·∫₀¹ u^p·e^(cu) du`. For `c < 0` that integral is
+/// `s^(−(p+1))·γ(p+1, s)` with `s = −c`, a LOWER INCOMPLETE GAMMA, for which
+/// StableHLO/CHLO gives no op this emitter carries. At §09's stated typical
+/// `power = 0.5` it collapses to `erf`, via `γ(3/2, s) = (√π/2)·erf(√s) − √s·e^(−s)`:
+///
+/// ```text
+/// M = (m₀²/2)·s^(−3/2)·( (√π/2)·erf(√s) − √s·e^(−s) ),   s = −slope
+/// ```
+///
+/// so this builder REFUSES any other `power`, naming the missing function,
+/// rather than mislower. `power` must be a literal for that check, which the
+/// `record` the determiniser emits preserves.
+///
+/// Verified against `scipy.stats.argus(chi = √(−2·slope), scale = resonance)`
+/// (equivalently a direct quadrature of §09's own formula) at four slopes,
+/// agreeing to 9e-10 relative or better — the residual is the quadrature's, not
+/// the closed form's.
+///
+/// `slope ≥ 0` is admitted by §09's `reals` domain but leaves `√s` imaginary
+/// (`slope > 0`) or `M`'s expression a removable `0/0` (`slope = 0`); both emit
+/// `NaN` rather than a wrong finite number.
+fn argus_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
+    let power_id = p.field_id(e, "power")?;
+    let power = match e.node(power_id) {
+        Node::Lit(Scalar::Real(x)) if *x == 0.5 => 0.5,
+        Node::Lit(Scalar::Int(_)) | Node::Lit(Scalar::Real(_)) => {
+            return Err(EmitError::at(
+                power_id,
+                "Argus normalizer for power != 0.5 needs the lower incomplete gamma \
+                 function, which has no StableHLO/CHLO lowering here",
+            ));
+        }
+        _ => {
+            return Err(EmitError::at(
+                power_id,
+                "Argus power must be a literal: the normalizer has a closed form only \
+                 at power = 0.5 (spec §09's typical value)",
+            ));
+        }
+    };
+
+    let resonance = p.get(e, "resonance")?;
+    let slope = p.get(e, "slope")?;
+
+    let r = e.div(v, &resonance);
+    let r_sq = e.mul(&r, &r);
+    let one = e.scalar(1.0);
+    let u = e.sub(&one, &r_sq);
+
+    let log_v = e.log(v);
+    let log_u = e.log(&u);
+    let p_lit = e.scalar(power);
+    let p_log_u = e.mul(&p_lit, &log_u);
+    let c_u = e.mul(&slope, &u);
+    let sum = e.add(&log_v, &p_log_u);
+    let log_unnorm = e.add(&sum, &c_u);
+
+    let s = e.neg(&slope);
+    let sqrt_s = e.sqrt(&s);
+    let erf_sqrt_s = e.erf(&sqrt_s);
+    let half_sqrt_pi = e.scalar(std::f64::consts::PI.sqrt() / 2.0);
+    let erf_term = e.mul(&half_sqrt_pi, &erf_sqrt_s);
+    let neg_s = e.neg(&s);
+    let exp_neg_s = e.exp(&neg_s);
+    let exp_term = e.mul(&sqrt_s, &exp_neg_s);
+    let bracket = e.sub(&erf_term, &exp_term);
+
+    let neg_three_halves = e.scalar(-1.5);
+    let s_pow = e.pow(&s, &neg_three_halves);
+    let res_sq = e.mul(&resonance, &resonance);
+    let half = e.scalar(0.5);
+    let half_res_sq = e.mul(&half, &res_sq);
+    let scaled = e.mul(&half_res_sq, &s_pow);
+    let mass = e.mul(&scaled, &bracket);
+    let log_mass = e.log(&mass);
+    Ok(e.sub(&log_unnorm, &log_mass))
+}
+
 fn dirac_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
     let value = p.get(e, "value")?;
     let eq = e.compare("EQ", v, &value);
