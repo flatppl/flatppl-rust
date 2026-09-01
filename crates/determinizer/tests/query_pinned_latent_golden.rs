@@ -131,18 +131,29 @@ lp_z = logdensityof(lawof(record(z = z)), record(z = 0.3))",
 // A field's MAP, not only its measure, can carry the outside ancestor: `b = y + z` is
 // read as a pushforward of y's law, and `build_forward_map` would take the pinned `z`
 // for a constant of the map.
+//
+// The two spellings must refuse for the SAME reason. §13 "Output reduction" reduces per
+// output, so the earlier `lp_z` query cannot change how `lp_b` classifies `b` — and
+// `b` reaches two draws either way, which is the honest refusal.
 #[test]
 fn a_transformed_field_is_checked_through_its_map() {
-    let src = "\
+    let model = "\
 z = draw(Normal(mu = 0.0, sigma = 1.0))
 y = draw(Normal(mu = 0.0, sigma = 1.0))
 b = y + z
-lp_z = logdensityof(lawof(z), 0.3)
-lp_b = logdensityof(lawof(record(b = b)), record(b = 0.5))";
-    let reason = refusal(src);
+";
+    let lp_b = "lp_b = logdensityof(lawof(record(b = b)), record(b = 0.5))";
+    let unpinned = refusal(&format!("{model}{lp_b}"));
+    let pinned = refusal(&format!(
+        "{model}lp_z = logdensityof(lawof(z), 0.3)\n{lp_b}"
+    ));
     assert!(
-        reason.contains("uncarried draw"),
-        "must refuse as a marginal: {reason}"
+        unpinned.contains("reaches more than one draw"),
+        "must refuse as a marginal: {unpinned}"
+    );
+    assert_eq!(
+        unpinned, pinned,
+        "the earlier query's pin must not change the refusal"
     );
 }
 
@@ -374,5 +385,82 @@ fn a_bare_value_law_still_serves_in_every_measure_position() {
     ] {
         let lp = pir_binding(&pir(&src), "lp");
         assert!(lp.contains(marker), "expected `{marker}` in:\n{lp}");
+    }
+}
+
+// ONE measure scored TWICE — once at literal fields, once at the ABI-symbolic fields of
+// an `inputs`/`outputs` query. §13 "Output reduction" reduces PER OUTPUT ("a `draw`
+// reached by both kinds of output is resolved through `rand` in the sampled output's
+// slice and read from `point` in the density output's"), so the literal query's own
+// point must not decide whether the symbolic one legalizes. It did: the first query's
+// pin left the model looking pinless-and-drawless to the second, which refused with
+// "field is not a draw, a reference to a draw, or a bijection of a draw".
+//
+// Three shapes, each a different pin-blind read: the record law's own draw
+// classification, the dead-measure sweep (which saw an ALIASED prior as orphaned once
+// the pin removed the last live reference to it), and the sibling-field exemption
+// (which the pinned arm of the ancestor walk skipped, so a carried sibling counted as
+// an outside ancestor and the record law refused).
+#[test]
+fn a_measure_scored_at_literals_still_lowers_at_abi_inputs() {
+    let symbolic = "\
+t1 = elementof(reals)
+t2 = elementof(posreals)
+inputs = (t1, t2)
+outputs = logdensityof(prior, record(a = t1, b = t2))
+";
+    for (name, model) in [
+        // A shared latent correlates the two fields, so the law is the joint, not a
+        // product of marginals.
+        (
+            "shared latent",
+            "\
+z = draw(Normal(mu = 0.0, sigma = 1.0))
+a = draw(Normal(mu = z, sigma = 1.0))
+b = draw(Normal(mu = z, sigma = 1.0))
+prior = lawof(record(a = a, b = b))
+lp = logdensityof(prior, record(a = 0.5, b = 0.7))
+",
+        ),
+        // The priors are ALIASED bindings, so the pin removes the last reference to
+        // them and the dead-measure sweep would zero them out from under the second
+        // query.
+        (
+            "aliased priors",
+            "\
+a_dist = Normal(0, 1)
+b_dist = Exponential(1)
+a ~ a_dist
+b ~ b_dist
+prior = lawof(record(a = a, b = b))
+lp = logdensityof(prior, record(a = 0.5, b = 1.0))
+",
+        ),
+        // `b`'s measure is parameterized by its SIBLING field `a`, which the record law
+        // scores by the chain rule rather than marginalizing over.
+        (
+            "sibling parameter",
+            "\
+a = draw(Normal(mu = 0.0, sigma = 1.0))
+b = draw(Exponential(rate = exp(a)))
+prior = lawof(record(a = a, b = b))
+lp = logdensityof(prior, record(a = 0.5, b = 1.0))
+",
+        ),
+    ] {
+        let text = pir(&format!("{model}{symbolic}"));
+        let outputs = pir_binding(&text, "outputs");
+        assert!(
+            outputs.contains("(%ref self t1)") && outputs.contains("(%ref self t2)"),
+            "{name}: the symbolic query scores at its OWN inputs:\n{outputs}"
+        );
+        // The literal query still lowers to its own number, unchanged by the presence
+        // of the second query.
+        let alone = pir_binding(&pir(model), "lp");
+        assert_eq!(
+            alone,
+            pir_binding(&text, "lp"),
+            "{name}: the literal query is unaffected by the second query"
+        );
     }
 }

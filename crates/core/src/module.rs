@@ -150,20 +150,26 @@ impl Module {
         self.query_pinned.entry(id).or_insert(replaced);
     }
 
-    /// Did a determinization query pin this binding
-    /// ([`Module::pin_binding_to_query_point`])? A binding whose literal RHS came
-    /// from a query point is still a stochastic node of the model; a measure
-    /// parameterized by it has that node as an ancestor to marginalize over.
-    pub fn is_query_pinned(&self, id: BindingId) -> bool {
-        self.query_pinned.contains_key(&id)
-    }
-
     /// The right-hand side the query pin replaced — the latent's own `draw(prior)`,
     /// for a binding [`Module::pin_binding_to_query_point`] pinned. `None` for an
     /// unpinned binding. A query that marginalizes this latent out needs the prior,
     /// which is unreachable from the binding once the pin overwrote it.
     pub fn query_pinned_rhs(&self, id: BindingId) -> Option<NodeId> {
         self.query_pinned.get(&id).copied()
+    }
+
+    /// The right-hand side the MODEL declared for `id` — the pre-pin `draw(prior)` for
+    /// a binding an earlier query pinned, else the current right-hand side.
+    ///
+    /// §13 "Output reduction" reduces PER OUTPUT: "a `draw` reached by both kinds of
+    /// output is resolved through `rand` in the sampled output's slice and read from
+    /// `point` in the density output's." So a draw one query already scored must still
+    /// read as a draw for the next query, at that query's own point. Any pass that
+    /// classifies a binding as a draw must read through this, not `binding(id).rhs`,
+    /// which the pin overwrote with the first query's literal.
+    pub fn declared_binding_rhs(&self, id: BindingId) -> NodeId {
+        self.query_pinned_rhs(id)
+            .unwrap_or_else(|| self.binding(id).rhs)
     }
 
     /// Declare `names` as the inputs of the reification whose body is about to be

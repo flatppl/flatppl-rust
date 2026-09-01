@@ -2550,11 +2550,36 @@ fn lower_record_of_draws_with(
             terms.push(score_marginal_form(m, form, comp.pinned)?);
             continue;
         }
+        // A sibling's value is substituted INTO this component's measure, not left as a
+        // `(%ref self sibling)` for the binding pin below to supply. §13 "Output
+        // reduction" reduces PER OUTPUT, and a SECOND query over the same record re-pins
+        // those bindings — an emitted term still holding the ref would then read the
+        // other query's point, which is a wrong number rather than a refusal. Same
+        // leak-free discipline [`substitute_refs_by_name`] already applies on the
+        // likelihood path, for the same reason.
+        //
+        // Keyed on the BINDING name, which a measure references it by, not the field
+        // name: `record(a = y1, …)` scores `y1`'s measure. The component's own binding is
+        // excluded, and its `draw_site` never sits inside what is substituted — the
+        // measure is the draw's ARGUMENT, and the forward map has already replaced the
+        // draw with its placeholder — so the substitution cannot rebuild the draw node
+        // the pushforward is taken over.
+        let subs: Vec<(Symbol, NodeId)> = components
+            .iter()
+            .filter(|other| other.name != comp.name)
+            .filter_map(|other| {
+                other
+                    .draw_binding
+                    .map(|bid| (m.binding(bid).name, other.pinned))
+            })
+            .collect();
         let measure = match comp.transform {
-            None => comp.measure,
+            None => substitute_siblings(m, comp.measure, &subs),
             Some(call) => {
                 let fwd = build_forward_map(m, call, comp.draw_site);
-                build_call(m, "pushfwd", &[fwd, comp.measure])
+                let fwd = substitute_siblings(m, fwd, &subs);
+                let inner = substitute_siblings(m, comp.measure, &subs);
+                build_call(m, "pushfwd", &[fwd, inner])
             }
         };
         terms.push(lower_measure_density(m, measure, comp.pinned)?);
@@ -2570,6 +2595,38 @@ fn lower_record_of_draws_with(
     }
 
     Ok(fold_add(m, &terms))
+}
+
+/// [`crate::kernel::substitute_refs`], carrying the original nodes' inferred types onto
+/// the copy the substitution rebuilt.
+///
+/// Substituting a sibling's value for a `(%ref self sibling)` changes no shape, so the
+/// original type still describes the copy — and lowerings READ that type: `lower_iid`
+/// takes its repeat count from the `iid` node's own const-evaluated domain shape, so an
+/// untyped copy of `iid(Normal(mu, tau), J)` refuses as a dynamic size. Inference does not
+/// re-run until the driver's next iteration, which is after this rule finishes.
+fn substitute_siblings(m: &mut Module, root: NodeId, subs: &[(Symbol, NodeId)]) -> NodeId {
+    let rebuilt = crate::kernel::substitute_refs(m, root, subs);
+    carry_types(m, root, rebuilt, subs);
+    rebuilt
+}
+
+/// [`substitute_siblings`]'s type copier: walk the original and the rebuilt tree in step
+/// and give each rebuilt node its original's type. A shared subtree (same id) is already
+/// typed; a SUBSTITUTED node keeps the replacement value's own type, not the reference's.
+fn carry_types(m: &mut Module, old: NodeId, new: NodeId, subs: &[(Symbol, NodeId)]) {
+    if old == new || subs.iter().any(|(_, value)| *value == new) {
+        return;
+    }
+    if let Some(ty) = m.type_of(old).cloned() {
+        m.set_type(new, ty);
+    }
+    let (olds, news) = (m.node(old).children(), m.node(new).children());
+    if olds.len() == news.len() {
+        for (o, n) in olds.into_iter().zip(news) {
+            carry_types(m, o, n, subs);
+        }
+    }
 }
 
 /// Match `record(%field nameᵢ valueᵢ ...)` and pair each component with the
@@ -2713,13 +2770,17 @@ fn resolve_component_draw(
 ) -> Option<(NodeId, Option<BindingId>, Option<NodeId>, NodeId)> {
     // One `(%ref self x)` hop: the field either IS a self-ref to a binding
     // (Cases A / ref-C) or is spelled inline (Cases B / inline-C).
+    //
+    // `declared_binding_rhs`, not `binding(bid).rhs`: an EARLIER query over the same
+    // measure pinned this latent to its own point, overwriting the `draw` with a
+    // literal. §13 reduces per output, so this query must still see the draw.
     let (effective, outer_binding) = match m.node(value) {
         Node::Ref(Ref {
             ns: RefNs::SelfMod,
             name,
         }) => {
             let bid = m.binding_by_name(*name)?;
-            (m.binding(bid).rhs, Some(bid))
+            (m.declared_binding_rhs(bid), Some(bid))
         }
         _ => (value, None),
     };
@@ -2794,7 +2855,7 @@ fn collect_draw_sites(
                 return; // cyclic definition — stop rather than recurse forever
             }
             path.push(bid);
-            collect_draw_sites(m, m.binding(bid).rhs, path, sites);
+            collect_draw_sites(m, m.declared_binding_rhs(bid), path, sites);
             path.pop();
         }
         Node::Call(c) => {
@@ -2866,7 +2927,7 @@ fn abstract_over_draw(
                 return node;
             }
             path.push(bid);
-            let rhs = m.binding(bid).rhs;
+            let rhs = m.declared_binding_rhs(bid);
             let rebuilt = abstract_over_draw(m, rhs, draw_site, ph, path);
             path.pop();
             if rebuilt == rhs { node } else { rebuilt }
@@ -3010,7 +3071,8 @@ fn lower_value_law(
 /// parameterized by a value that is itself random, so that [`lower_value_law`]
 /// would have to marginalize?
 ///
-/// A binding an earlier query pinned counts as a draw ([`Module::is_query_pinned`]).
+/// A binding an earlier query pinned counts as a draw
+/// ([`Module::declared_binding_rhs`]).
 /// Pinning rewrites `z = draw(Normal(0, 1))` to `z = 0.3`, after which nothing in the
 /// binding tells it from a fixed `mu = elementof(reals)` — so `y ~ Normal(mu = z,
 /// sigma = 1)` scored by a LATER query emitted `p(y | z = 0.3)` where §04 asks for
@@ -3103,20 +3165,23 @@ pub(crate) fn measure_stochastic_ancestors(
                 let Some(bid) = m.binding_by_name(*name) else {
                     return;
                 };
-                if m.is_query_pinned(bid) {
-                    // A latent an earlier query replaced with its point. Its own prior
-                    // is only in the pin's provenance now.
-                    let prior = m
-                        .query_pinned_rhs(bid)
-                        .and_then(|rhs| draw_argument(m, rhs));
-                    out.push(describe(Some(*name), prior));
-                    return;
-                }
                 if path.contains(&bid) {
                     return; // cyclic definition — stop rather than recurse forever
                 }
                 path.push(bid);
-                walk(m, m.binding(bid).rhs, Some(*name), exempt, path, out);
+                // `declared_binding_rhs`, so a latent an earlier query pinned walks as
+                // the `draw(prior)` the pin overwrote. One arm for both, rather than a
+                // pinned special case: the special case pushed its ancestor without
+                // consulting `exempt`, so a SIBLING field's latent counted as an
+                // outside ancestor once pinned, and the record law refused.
+                walk(
+                    m,
+                    m.declared_binding_rhs(bid),
+                    Some(*name),
+                    exempt,
+                    path,
+                    out,
+                );
                 path.pop();
             }
             Node::Call(c) => {
@@ -7713,17 +7778,38 @@ fn array_axes(t: &Type) -> usize {
 }
 
 pub(crate) fn refuse(id: NodeId, m: &Module, reason: &str) -> RefuseError {
-    let construct = match m.node(id) {
+    RefuseError {
+        node: id,
+        construct: name_construct(m, id),
+        reason: reason.to_string(),
+    }
+}
+
+/// Name the construct at `id` the way the SOURCE spells it — the reader has to find
+/// this node in their own model, and `Ref(Ref { ns: SelfMod, name: Symbol(5) })` names
+/// nothing they wrote. A call reports its op, a reference the binding it names, a
+/// literal its value.
+pub(crate) fn name_construct(m: &Module, id: NodeId) -> String {
+    match m.node(id) {
         Node::Call(c) => match c.head {
             CallHead::Builtin(sym) => m.resolve(sym).to_string(),
             CallHead::User(_) => "user-call".to_string(),
         },
-        other => format!("{other:?}"),
-    };
-    RefuseError {
-        node: id,
-        construct,
-        reason: reason.to_string(),
+        Node::Ref(Ref { ns, name }) => match ns {
+            RefNs::SelfMod | RefNs::Local => format!("`{}`", m.resolve(*name)),
+            RefNs::Module(alias) => {
+                format!("`{}.{}`", m.resolve(*alias), m.resolve(*name))
+            }
+        },
+        Node::Const(sym) => format!("`{}`", m.resolve(*sym)),
+        Node::Lit(s) => match s {
+            Scalar::Int(v) => format!("`{v}`"),
+            Scalar::Real(v) => format!("`{v}`"),
+            Scalar::Bool(v) => format!("`{v}`"),
+            Scalar::Str(v) => format!("`{v:?}`"),
+        },
+        Node::Hole => "`_`".to_string(),
+        Node::Axis(_) => "axis label".to_string(),
     }
 }
 

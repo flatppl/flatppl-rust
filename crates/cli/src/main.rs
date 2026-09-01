@@ -540,7 +540,7 @@ fn prepare_cmd(files: &[PathBuf], update: bool) -> Result<(), Failure> {
 #[cfg(any(feature = "determinize", feature = "stablehlo"))]
 fn load_and_infer(
     input: &Path,
-) -> Result<(flatppl_core::Module, flatppl_infer::ModuleBundle), Failure> {
+) -> Result<(flatppl_core::Module, flatppl_infer::ModuleBundle, String), Failure> {
     let source =
         fs::read_to_string(input).map_err(|e| format!("reading `{}`: {e}", input.display()))?;
     let mut module = match flatppl_cli::read_module(Format::FlatPpl, &source) {
@@ -580,7 +580,62 @@ fn load_and_infer(
         )));
     }
 
-    Ok((module, bundle))
+    Ok((module, bundle, source))
+}
+
+/// Render a determiniser refusal so the reader can find it in their own model: the
+/// construct as the source spells it, the binding it sits in, and a `file:line:col`.
+///
+/// Not the `NodeId`: that is an arena index into a module the reader never sees, and it
+/// shifts whenever anything upstream allocates one more node. A node the determiniser
+/// SYNTHESIZED carries no span and sits in no source binding, so both parts are
+/// optional and the message degrades to construct plus reason.
+#[cfg(any(feature = "determinize", feature = "stablehlo"))]
+fn refuse_message(
+    input: &Path,
+    source: &str,
+    module: &flatppl_core::Module,
+    e: &flatppl_determinizer::RefuseError,
+) -> String {
+    let mut site = String::new();
+    if let Some(name) = enclosing_binding(module, e.node) {
+        site.push_str(&format!(" in `{name}`"));
+    }
+    if let Some(span) = module.span_of(e.node) {
+        let (line, col) = line_col(source, span.start as usize);
+        site.push_str(&format!(" ({}:{line}:{col})", input.display()));
+    }
+    format!("determinize: refuse {}{site}: {}", e.construct, e.reason)
+}
+
+/// The name of the binding whose right-hand side subtree contains `node`, or `None` for
+/// a node the determiniser synthesized (in no source binding).
+#[cfg(any(feature = "determinize", feature = "stablehlo"))]
+fn enclosing_binding(module: &flatppl_core::Module, node: flatppl_core::NodeId) -> Option<String> {
+    for (_, binding) in module.bindings() {
+        let mut queue = vec![binding.rhs];
+        let mut qi = 0;
+        while qi < queue.len() {
+            let id = queue[qi];
+            qi += 1;
+            if id == node {
+                return Some(module.resolve(binding.name).to_string());
+            }
+            module.for_each_child(id, |child| queue.push(child));
+        }
+    }
+    None
+}
+
+/// 1-based line and column of byte `offset` in `source`, counting a column in
+/// characters so a non-ASCII line still points at the right glyph.
+#[cfg(any(feature = "determinize", feature = "stablehlo"))]
+fn line_col(source: &str, offset: usize) -> (usize, usize) {
+    let offset = offset.min(source.len());
+    let before = &source[..offset];
+    let line = before.matches('\n').count() + 1;
+    let col = before.rsplit('\n').next().unwrap_or("").chars().count() + 1;
+    (line, col)
 }
 
 /// `flatppl determinize <in.flatppl> [-o out] [--keep name]… [--emit form]` —
@@ -598,20 +653,15 @@ fn determinize_cmd(
     keep: &[String],
     emit: EmitForm,
 ) -> Result<(), Failure> {
-    let (mut module, bundle) = load_and_infer(input)?;
+    let (mut module, bundle, source) = load_and_infer(input)?;
     let syms: Vec<flatppl_core::Symbol> = keep.iter().map(|name| module.intern(name)).collect();
     let roots = if syms.is_empty() {
         None
     } else {
         Some(syms.as_slice())
     };
-    let lowered =
-        flatppl_determinizer::determinize_with_roots(&module, &bundle, roots).map_err(|e| {
-            Failure::Refuse(format!(
-                "determinize: refuse {} (node {:?}): {}",
-                e.construct, e.node, e.reason
-            ))
-        })?;
+    let lowered = flatppl_determinizer::determinize_with_roots(&module, &bundle, roots)
+        .map_err(|e| Failure::Refuse(refuse_message(input, &source, &module, &e)))?;
     let rendered = match emit {
         EmitForm::Flatppl => flatppl_syntax::print(&lowered),
         EmitForm::Flatpir => flatppl_flatpir::write(&lowered),
@@ -632,7 +682,7 @@ fn determinize_cmd(
 /// convention as `determinize`.
 #[cfg(feature = "stablehlo")]
 fn stablehlo_cmd(input: &Path, mode: &str, output: Option<&Path>) -> Result<(), Failure> {
-    let (module, bundle) = load_and_infer(input)?;
+    let (module, bundle, source) = load_and_infer(input)?;
 
     let mode = match mode {
         "logdensity" => flatppl_stablehlo::Mode::LogDensity,
@@ -675,12 +725,7 @@ fn stablehlo_cmd(input: &Path, mode: &str, output: Option<&Path>) -> Result<(), 
     let roots = Some(abi_syms);
 
     let lowered = flatppl_determinizer::determinize_with_roots(&module, &bundle, roots.as_deref())
-        .map_err(|e| {
-            Failure::Refuse(format!(
-                "determinize: refuse {} (node {:?}): {}",
-                e.construct, e.node, e.reason
-            ))
-        })?;
+        .map_err(|e| Failure::Refuse(refuse_message(input, &source, &module, &e)))?;
     let opts = flatppl_stablehlo::EmitOptions::default();
     let rendered = flatppl_stablehlo::emit(&lowered, mode, &opts)
         .map_err(|e| Failure::Refuse(e.to_string()))?;

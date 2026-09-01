@@ -758,7 +758,16 @@ const COMBINATOR_OPS: &[&str] = &[
 /// on the *inferred type* — which `is_flatpdl` itself uses to reject residual
 /// measure-layer values — sweeps exactly the bindings that would otherwise trip
 /// the conformance gate, and no others (a value-typed binding never matches).
+/// A query-pinned latent's PRIOR is exempt while another query is still unreduced —
+/// see [`referenced_via_pinned_prior`].
 fn sweep_dead_measure_bindings(m: &mut Module) {
+    // §13 "Output reduction" reduces PER OUTPUT, so a second query over the same
+    // measure re-reads the `draw(prior)` an earlier query's pin overwrote
+    // (`Module::declared_binding_rhs`). Until the last query is lowered, that prior
+    // is live even though no CURRENT right-hand side mentions it. Once the measure
+    // layer is gone the exemption lifts and `canon` sweeps the prior for real.
+    let queries_pending = find_op_node(m, &["logdensityof", "densityof", "rand"]).is_some();
+
     // Iterate to a fixpoint so dead-binding *cascades* are fully eliminated.
     // A `kchain` marginal leaves a chain `pp = kchain(M, k)` → `k = kernelof(…)`
     // → `z = draw(…)`: only `pp` is unreferenced at first (the still-present-but-
@@ -777,7 +786,9 @@ fn sweep_dead_measure_bindings(m: &mut Module) {
         let dead: Vec<BindingId> = m
             .bindings()
             .filter(|(bid, b)| {
-                is_eliminable_measure_rhs(m, b.rhs) && !binding_is_referenced(m, *bid, b.name)
+                is_eliminable_measure_rhs(m, b.rhs)
+                    && !binding_is_referenced(m, *bid, b.name)
+                    && !(queries_pending && referenced_via_pinned_prior(m, *bid, b.name))
             })
             .map(|(bid, _)| bid)
             .collect();
@@ -794,7 +805,8 @@ fn sweep_dead_measure_bindings(m: &mut Module) {
             let binding = m.binding(bid);
             debug_assert!(
                 is_eliminable_measure_rhs(m, binding.rhs)
-                    && !binding_is_referenced(m, bid, binding.name),
+                    && !binding_is_referenced(m, bid, binding.name)
+                    && !(queries_pending && referenced_via_pinned_prior(m, bid, binding.name)),
                 "sweep must only zero a dead measure binding"
             );
             let zero = m.alloc(Node::Lit(Scalar::Real(0.0)));
@@ -876,6 +888,26 @@ pub(crate) fn binding_is_referenced(m: &Module, bid: BindingId, name_sym: Symbol
         }
     }
     false
+}
+
+/// True iff some other QUERY-PINNED binding's DECLARED right-hand side — the
+/// `draw(prior)` the pin overwrote ([`flatppl_core::Module::query_pinned_rhs`]) —
+/// refers to `name_sym`.
+///
+/// [`binding_is_referenced`] cannot see this: it reads the post-pin literal, in which
+/// the reference is gone. The measure it names is still live for a LATER query, which
+/// re-reads the declared right-hand side (§13 "Output reduction" reduces per output).
+/// The shape is `p = Normal(0, 1)` / `theta ~ p`: pinning `theta` to the first query's
+/// point leaves `p` looking orphaned while a second query still needs it.
+///
+/// Reads the pin provenance ONLY, so it adds no reference a live binding tree does not
+/// already have, and shares [`subtree_contains_ref`] with the body walk.
+fn referenced_via_pinned_prior(m: &Module, bid: BindingId, name_sym: Symbol) -> bool {
+    m.bindings().any(|(other_bid, _)| {
+        other_bid != bid
+            && m.query_pinned_rhs(other_bid)
+                .is_some_and(|rhs| subtree_contains_ref(m, rhs, name_sym))
+    })
 }
 
 /// Collect every `%ref self <name>` reachable in `root`'s subtree — as a body
