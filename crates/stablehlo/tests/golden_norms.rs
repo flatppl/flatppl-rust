@@ -20,7 +20,7 @@
 //! operand would have walked into. See
 //! `.superpowers/sdd/2026-08-05-joint-constructs-the-joint/wave-hlonorm-report.md`.
 
-use flatppl_core::Module;
+use flatppl_core::{Dim, Module, Type, ValueSet};
 
 fn parse_infer(src: &str) -> Module {
     let mut m = flatppl_syntax::parse(src).expect("parse");
@@ -66,6 +66,105 @@ fn emit_err(src: &str) -> String {
 /// One `head(v)` over a runtime vector of `len` elements drawn from `set`.
 fn vec_src(head: &str, set: &str, len: usize) -> String {
     format!("v = elementof(cartpow({set}, [{len}]))\ny = {head}(v)\ninputs = (v)\noutputs = (y)\n")
+}
+
+/// The sentinel length [`zero_the_extents`] rewrites away. Distinctive on
+/// purpose: a `1` would collide with an incidental unit extent and silently
+/// rewrite it.
+const LEN0_SENTINEL: u32 = 7;
+
+/// Rewrite every [`LEN0_SENTINEL`] extent in a module's inferred types and value
+/// sets to 0, in place.
+///
+/// The written-size positivity rule makes a length-0 extent unspellable — a
+/// written `0` size is a static error, and a derived 0 types `%dynamic`
+/// (`flatppl-dev/empty-arrays-ruling.md`, 2026-08-20). The emitter's length-0
+/// behavior is still reachable at runtime and still needs its regression
+/// coverage, so it is exercised by CONSTRUCTING the shape instead of spelling it.
+///
+/// Applied to the DETERMINIZED module, not the parsed one: the determiniser
+/// re-runs inference on its working copy (`driver.rs`, "Re-run inference
+/// (idempotent) so type / phase tables are fresh"), which would recompute the
+/// sentinel straight back. The emitter re-runs nothing, and its length-0 special
+/// cases read the operand extent off these types, so this is the input it used
+/// to receive from `cartpow(reals, [0])`. Sound for these models because the
+/// FlatPDL graph is length-independent — every head here lowers in the emitter,
+/// so the determiniser neither unrolls nor sizes anything.
+fn zero_the_extents(m: &mut Module) {
+    for i in 0..m.node_count() {
+        let id = <flatppl_core::NodeId as flatppl_core::Idx>::from_usize(i);
+        if let Some(ty) = m.type_of(id).cloned() {
+            m.set_type(id, zero_extents_ty(&ty));
+        }
+        if let Some(vs) = m.valueset_of(id).cloned() {
+            m.set_valueset(id, zero_extents_vs(&vs));
+        }
+    }
+}
+
+fn zero_dim(d: Dim) -> Dim {
+    match d {
+        Dim::Static(LEN0_SENTINEL) => Dim::Static(0),
+        other => other,
+    }
+}
+
+fn zero_extents_ty(ty: &Type) -> Type {
+    match ty {
+        Type::Array { shape, elem } => Type::Array {
+            shape: shape.iter().map(|d| zero_dim(*d)).collect(),
+            elem: Box::new(zero_extents_ty(elem)),
+        },
+        Type::TVector { len, elem } => Type::TVector {
+            len: zero_dim(*len),
+            elem: elem.clone(),
+        },
+        Type::Tuple(elems) => Type::Tuple(elems.iter().map(zero_extents_ty).collect()),
+        Type::Measure { domain, mass } => Type::Measure {
+            domain: Box::new(zero_extents_ty(domain)),
+            mass: *mass,
+        },
+        other => other.clone(),
+    }
+}
+
+fn zero_extents_vs(vs: &ValueSet) -> ValueSet {
+    match vs {
+        ValueSet::CartPow(inner, len) => {
+            ValueSet::CartPow(Box::new(zero_extents_vs(inner)), zero_dim(*len))
+        }
+        ValueSet::StdSimplex(d) => ValueSet::StdSimplex(zero_dim(*d)),
+        other => other.clone(),
+    }
+}
+
+/// One `head(v)` over a length-0 vector, built rather than spelled: the
+/// sentinel-length source through the determiniser, then [`zero_the_extents`].
+fn len0_module(head: &str, set: &str) -> Module {
+    let mut det = determinize_abi(&vec_src(head, set, LEN0_SENTINEL as usize));
+    zero_the_extents(&mut det);
+    det
+}
+
+/// The length-0 counterpart of [`emit`].
+fn emit_len0(head: &str, set: &str) -> String {
+    flatppl_stablehlo::emit(
+        &len0_module(head, set),
+        flatppl_stablehlo::Mode::LogDensity,
+        &flatppl_stablehlo::EmitOptions::default(),
+    )
+    .expect("must emit @logdensity")
+}
+
+/// The length-0 counterpart of [`emit_err`].
+fn emit_err_len0(head: &str, set: &str) -> String {
+    flatppl_stablehlo::emit(
+        &len0_module(head, set),
+        flatppl_stablehlo::Mode::LogDensity,
+        &flatppl_stablehlo::EmitOptions::default(),
+    )
+    .expect_err("must refuse in the emitter")
+    .msg
 }
 
 // ---- the twelve heads all lower ----------------------------------------------
@@ -551,12 +650,10 @@ fn no_multi_axis_scan_spelling_is_answered_since_section_07_pins_no_axis() {
 }
 
 /// **The complete length-0 behavior of all eight vector heads**, in one place, so
-/// none can regress independently. §07 is silent on the empty case — a tracked
-/// spec gap (`flatppl-dev/TODO-flatppl-js.md:1562`), not a license — and §11
-/// excludes a zero dimension from a well-formed shape outright. Pending a
-/// ruling, each of the eight answers with the mathematically standard identity
-/// value, matching numpy and the js engine's recorded position, verified by
-/// EXECUTION on a `tensor<0x…>` runtime argument:
+/// none can regress independently. Every answer is FIXED by the owner's
+/// zero-size-arrays ruling of 2026-08-20 (`flatppl-dev/empty-arrays-ruling.md`,
+/// sub-ruling 2), each matching numpy and the js engine's recorded position, and
+/// each verified by EXECUTION on a `tensor<0x…>` runtime argument:
 ///
 /// | head | empty result | why |
 /// |---|---|---|
@@ -575,12 +672,17 @@ fn no_multi_axis_scan_spelling_is_answered_since_section_07_pins_no_axis() {
 /// text IREE rejects ("expects window to have positive value for 0-th window
 /// dimension"). `stablehlo.reduce_window` cannot express a length-0 scan at all,
 /// so `lower_cumulative` answers it directly by returning the operand.
+///
+/// **The operand is now CONSTRUCTED, not spelled** — see [`zero_the_extents`].
+/// `cartpow(reals, [0])` is a static error since the written-size positivity
+/// rule, so this coverage would otherwise have been lost with its fixture;
+/// [`a_written_zero_size_is_refused`] guards that fixture change itself.
 #[test]
 fn every_vector_head_has_a_defined_length_zero_result() {
     // The scans and the three vector-valued norm families return a length-0
     // vector; nothing is emitted for the scans, so the module is a bare return.
     for head in ["cumsum", "cumprod"] {
-        let out = emit(&vec_src(head, "reals", 0));
+        let out = emit_len0(head, "reals");
         assert!(
             out.contains("-> tensor<0xf32>"),
             "`{head}` over an empty vector must return an empty vector:\n{out}"
@@ -595,7 +697,7 @@ fn every_vector_head_has_a_defined_length_zero_result() {
         );
     }
     for head in ["l1unit", "l2unit", "softmax", "logsoftmax"] {
-        let out = emit(&vec_src(head, "reals", 0));
+        let out = emit_len0(head, "reals");
         assert!(
             out.contains("-> tensor<0xf32>"),
             "`{head}` over an empty vector must return an empty vector:\n{out}"
@@ -603,7 +705,7 @@ fn every_vector_head_has_a_defined_length_zero_result() {
     }
     // The two scalar-valued norms reduce to a scalar, not to an empty vector.
     for head in ["l1norm", "l2norm"] {
-        let out = emit(&vec_src(head, "reals", 0));
+        let out = emit_len0(head, "reals");
         assert!(
             out.contains("-> tensor<f32>"),
             "`{head}` over an empty vector must return the empty sum, a scalar:\n{out}"
@@ -618,13 +720,33 @@ fn every_vector_head_has_a_defined_length_zero_result() {
 #[test]
 fn an_empty_boolean_scan_keeps_the_promoted_integer_type() {
     for head in ["cumsum", "cumprod"] {
-        let out = emit(&vec_src(head, "booleans", 0));
+        let out = emit_len0(head, "booleans");
         assert!(
             out.contains("stablehlo.convert %arg0 : (tensor<0xi1>) -> tensor<0xi32>")
                 && out.contains("-> tensor<0xi32>"),
             "`{head}` over an empty boolean vector must still promote to i32:\n{out}"
         );
     }
+}
+
+/// The guard on the constructed-operand detour above: the SOURCE spelling these
+/// tests used to carry is now a static error, so [`zero_the_extents`] is
+/// necessary rather than decorative. If the positivity rule were ever reverted,
+/// this fails and the helpers can go back to plain source.
+#[test]
+fn a_written_zero_size_is_refused() {
+    let mut m = flatppl_syntax::parse(&vec_src("cumsum", "reals", 0)).expect("parse");
+    let msgs: Vec<String> = flatppl_infer::infer(&mut m)
+        .into_iter()
+        .filter(|d| d.severity == flatppl_infer::Severity::Error)
+        .map(|d| d.message)
+        .collect();
+    assert!(
+        msgs.iter()
+            .any(|m| m.contains("`cartpow`'s `size` is written as `0`")
+                && m.contains("§03 \"Cartesian power\"")),
+        "a written zero size must be refused citing §03's positive size: {msgs:?}"
+    );
 }
 
 /// §07 lists `prod`/`mean`/`var`/`std` under reductions over ARRAYS, so a scalar
@@ -670,21 +792,23 @@ fn var_and_std_refuse_a_single_element_but_mean_does_not() {
 
 /// A moment over an EMPTY array divides by zero, so it refuses. `prod` does not:
 /// the empty product is the multiplicative identity, which the reduce already
-/// emits — EXECUTED, `prod` over `cartpow(reals, [0])` returns `1.0`.
+/// emits — EXECUTED, `prod` over a length-0 real vector returns `1.0`.
 ///
-/// `cartpow(reals, [0])` parses, infers and determinizes cleanly (checked), so
-/// this refusal is reachable from surface source rather than defensive.
+/// The operand is CONSTRUCTED rather than spelled ([`zero_the_extents`]): a
+/// written `cartpow(reals, [0])` is a static error since the positivity rule, so
+/// the refusal is no longer reachable from surface source. It stays reachable at
+/// runtime through a derived length, which is why the emitter still needs it.
 #[test]
 fn the_moments_refuse_an_empty_array_but_prod_returns_its_identity() {
     for head in ["mean", "var", "std"] {
-        let err = emit_err(&vec_src(head, "reals", 0));
+        let err = emit_err_len0(head, "reals");
         assert!(
             err.contains("over an empty array this is undefined")
                 && err.contains("divides by the element count"),
             "`{head}` must refuse an empty array, got: {err}"
         );
     }
-    let out = emit(&vec_src("prod", "reals", 0));
+    let out = emit_len0("prod", "reals");
     assert!(
         out.contains("stablehlo.constant dense<1.000000e+00>") && out.contains("tensor<0xf32>"),
         "prod over an empty array is the empty product, not a refusal:\n{out}"

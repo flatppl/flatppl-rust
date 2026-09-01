@@ -57,7 +57,7 @@
 //! `[1, NaN, NaN]`); this backend matches the maths, and the divergence is recorded
 //! in `flatppl-dev/TODO-flatppl-rust.md` for a §07 ruling.
 
-use flatppl_core::Module;
+use flatppl_core::{Dim, Module, Type, ValueSet};
 
 fn parse_infer(src: &str) -> Module {
     let mut m = flatppl_syntax::parse(src).expect("parse");
@@ -104,6 +104,89 @@ fn emit_err(src: &str) -> String {
 /// One `head(v)` over a runtime vector of `len` elements drawn from `set`.
 fn vec_src(head: &str, set: &str, len: usize) -> String {
     format!("v = elementof(cartpow({set}, [{len}]))\ny = {head}(v)\ninputs = (v)\noutputs = (y)\n")
+}
+
+/// The sentinel length [`zero_the_extents`] rewrites away. Distinctive on purpose: a
+/// `1` would collide with an incidental unit extent and silently rewrite it.
+const LEN0_SENTINEL: u32 = 7;
+
+/// Rewrite every [`LEN0_SENTINEL`] extent in a module's inferred types and value
+/// sets to 0, in place.
+///
+/// The written-size positivity rule makes a length-0 extent unspellable — a
+/// written `0` size is a static error, and a derived 0 types `%dynamic`
+/// (`flatppl-dev/empty-arrays-ruling.md`, 2026-08-20). The emitter's length-0
+/// behavior is still reachable at runtime and still needs its regression
+/// coverage, so it is exercised by CONSTRUCTING the shape instead of spelling it.
+///
+/// Applied to the DETERMINIZED module, not the parsed one: the determiniser
+/// re-runs inference on its working copy (`driver.rs`, "Re-run inference
+/// (idempotent) so type / phase tables are fresh"), which would recompute the
+/// sentinel straight back. The emitter re-runs nothing, and its length-0 special
+/// cases read the operand extent off these types, so this is the input it used
+/// to receive from `cartpow(reals, [0])`. Sound for these models because the
+/// FlatPDL graph is length-independent — every head here lowers in the emitter,
+/// so the determiniser neither unrolls nor sizes anything.
+fn zero_the_extents(m: &mut Module) {
+    for i in 0..m.node_count() {
+        let id = <flatppl_core::NodeId as flatppl_core::Idx>::from_usize(i);
+        if let Some(ty) = m.type_of(id).cloned() {
+            m.set_type(id, zero_extents_ty(&ty));
+        }
+        if let Some(vs) = m.valueset_of(id).cloned() {
+            m.set_valueset(id, zero_extents_vs(&vs));
+        }
+    }
+}
+
+fn zero_dim(d: Dim) -> Dim {
+    match d {
+        Dim::Static(LEN0_SENTINEL) => Dim::Static(0),
+        other => other,
+    }
+}
+
+fn zero_extents_ty(ty: &Type) -> Type {
+    match ty {
+        Type::Array { shape, elem } => Type::Array {
+            shape: shape.iter().map(|d| zero_dim(*d)).collect(),
+            elem: Box::new(zero_extents_ty(elem)),
+        },
+        Type::TVector { len, elem } => Type::TVector {
+            len: zero_dim(*len),
+            elem: elem.clone(),
+        },
+        Type::Tuple(elems) => Type::Tuple(elems.iter().map(zero_extents_ty).collect()),
+        Type::Measure { domain, mass } => Type::Measure {
+            domain: Box::new(zero_extents_ty(domain)),
+            mass: *mass,
+        },
+        other => other.clone(),
+    }
+}
+
+fn zero_extents_vs(vs: &ValueSet) -> ValueSet {
+    match vs {
+        ValueSet::CartPow(inner, len) => {
+            ValueSet::CartPow(Box::new(zero_extents_vs(inner)), zero_dim(*len))
+        }
+        ValueSet::StdSimplex(d) => ValueSet::StdSimplex(zero_dim(*d)),
+        other => other.clone(),
+    }
+}
+
+/// The length-0 counterpart of [`emit`]: determinize `src` at
+/// [`LEN0_SENTINEL`], then zero the extents before emitting. `src` must be
+/// written with the sentinel length and carry no other extent equal to it.
+fn emit_len0(src: &str) -> String {
+    let mut det = determinize_abi(src);
+    zero_the_extents(&mut det);
+    flatppl_stablehlo::emit(
+        &det,
+        flatppl_stablehlo::Mode::LogDensity,
+        &flatppl_stablehlo::EmitOptions::default(),
+    )
+    .expect("must emit @logdensity")
 }
 
 // ---- the five heads that lower ------------------------------------------------
@@ -640,22 +723,20 @@ fn an_ineligible_reduction_still_gets_the_eligibility_message() {
 /// boolean pair need none: `stablehlo.reduce` over a zero-length axis returns its
 /// init, which is already the right answer.
 ///
-/// **The SOURCE form here is on borrowed time, and so is `golden_norms.rs`'s.** The
-/// same ruling requires `infer` to refuse a WRITTEN literal size of 0 — "never
-/// produce `Dim::Static(0)` — a derived 0 becomes `Dynamic`" — so
-/// `elementof(cartpow(reals, [0]))` becomes a static error, and a length-0 vector can
-/// then only reach the emitter with a `%dynamic` extent, which
-/// `require_static_vector` refuses. That makes every length-0 answer above
-/// unreachable from legal source once the infer half lands. Recorded in
-/// `flatppl-dev/TODO-flatppl-rust.md`: the two files' empty-input tests need
-/// rewriting in the same wave that closes the positivity hole, and the guard needs a
-/// decision about the dynamic-extent path.
+/// **The SOURCE spelling is now illegal; the module is CONSTRUCTED instead.** The
+/// same ruling's other half landed in `infer`: a written size of 0 is a static
+/// error and a derived 0 types `%dynamic`, so `cartpow(reals, [0])` no longer
+/// parses-and-infers clean. The emitter's behavior is unchanged and still worth
+/// pinning, so [`emit_len0`] builds the length-0 shape as IR — inferring the
+/// same model at length 7 and rewriting the extent to 0 — and the frozen golden
+/// keeps its witness. `a_written_zero_size_is_refused` guards the fixture change
+/// itself.
 #[test]
 fn the_empty_cases_match_the_frozen_golden() {
-    let out = emit(
+    let out = emit_len0(
         "\
-v = elementof(cartpow(reals, [0]))
-b = elementof(cartpow(booleans, [0]))
+v = elementof(cartpow(reals, [7]))
+b = elementof(cartpow(booleans, [7]))
 o1 = linfnorm(v)
 o2 = cummax(v)
 o3 = lany(b)
@@ -695,5 +776,25 @@ outputs = (o1, o2, o3, o4, o5)
         out.matches("stablehlo.reduce(").count(),
         2,
         "lany/lall still reduce, and answer their identity:\n{out}"
+    );
+}
+
+/// The guard on the fixture change above: the SOURCE spelling those tests used
+/// to carry is now a static error, so [`emit_len0`]'s detour is necessary rather
+/// than decorative. If the positivity rule were ever reverted, this fails and
+/// the constructed-IR helpers can go back to plain source.
+#[test]
+fn a_written_zero_size_is_refused() {
+    let mut m = flatppl_syntax::parse("v = elementof(cartpow(reals, [0]))\n").expect("parse");
+    let msgs: Vec<String> = flatppl_infer::infer(&mut m)
+        .into_iter()
+        .filter(|d| d.severity == flatppl_infer::Severity::Error)
+        .map(|d| d.message)
+        .collect();
+    assert!(
+        msgs.iter()
+            .any(|m| m.contains("`cartpow`'s `size` is written as `0`")
+                && m.contains("§03 \"Cartesian power\"")),
+        "a written zero size must be refused citing §03's positive size: {msgs:?}"
     );
 }
