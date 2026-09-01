@@ -78,13 +78,15 @@ fn pushfwd_exp_over_discrete_base_emits_no_volume_term() {
 #[test]
 fn pushfwd_affine_over_discrete_base_emits_no_volume_term() {
     // `x -> 2·x + 1` has the constant forward log-volume `log|2|`, emitted as
-    // `(log (abs 2.0))`. The preimage `(0.5 − 1)/2` const-folds to `-0.25`, so the
-    // discrete emission is the bare `builtin_logdensityof` at that literal.
+    // `(log (abs 2.0))`. The preimage `(0.5 − 1)/2` const-folds to -0.25, so the
+    // discrete emission is the bare `builtin_logdensityof` at that term. §11
+    // "Literal values" forbids a signed atom, so the folded term is the
+    // canonical `(neg 0.25)` call, not a bare `-0.25` literal.
     let discrete =
         lp("d = pushfwd(x -> 2.0 * x + 1.0, Poisson(rate = 3.0))\nlp = logdensityof(d, 0.5)");
     assert!(
-        discrete.contains("builtin_logdensityof Poisson") && discrete.contains(" -0.25)"),
-        "the base pmf is scored at the preimage (0.5 − 1)/2:\n{discrete}"
+        discrete.contains("builtin_logdensityof Poisson") && discrete.contains("(neg 0.25)"),
+        "the base pmf is scored at the preimage (0.5 − 1)/2, folded to (neg 0.25):\n{discrete}"
     );
     assert!(
         !discrete.contains("(abs 2.0)"),
@@ -111,8 +113,10 @@ fn locscale_over_discrete_base_emits_no_volume_term() {
     // so it takes the same split: an affine map over a discrete base relabels the
     // atoms and preserves their mass.
     let discrete = lp("d = locscale(Poisson(rate = 3.0), 1.0, 2.0)\nlp = logdensityof(d, 0.5)");
+    // §11 "Literal values" forbids a signed atom: the folded preimage is the
+    // canonical `(neg 0.25)` call, not a bare `-0.25` literal.
     assert!(
-        discrete.contains("builtin_logdensityof Poisson") && discrete.contains(" -0.25)"),
+        discrete.contains("builtin_logdensityof Poisson") && discrete.contains("(neg 0.25)"),
         "the base pmf is scored at the preimage:\n{discrete}"
     );
     assert!(

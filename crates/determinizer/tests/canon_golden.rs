@@ -305,3 +305,73 @@ lp = logdensityof(lawof(record(a = a)), record(a = 0.5))";
         "determinize output is a canonicalization fixpoint"
     );
 }
+
+// §11 "Literal values" forbids a signed atom. Folding `sub` to a negative
+// real (here, inside `locscale`'s log-volume term) must emit `(neg 0.35)`,
+// never a bare `-0.35`, or the printed FlatPIR fails to round-trip through
+// `flatppl_flatpir::read` (the `bc7a1a3` reader refusal). Open [S] surfaced
+// while closing M16.
+#[test]
+fn const_fold_negative_real_result_emits_neg_call_and_round_trips() {
+    let src = "\
+z ~ Normal(0.0, 1.0)
+y ~ locscale(lawof(z), 1.0, 2.0)
+lp = logdensityof(lawof(y), 0.3)";
+    let pir = flatppl_flatpir::write(&determinize_src(src));
+    assert!(
+        pir.contains("(neg 0.35)"),
+        "the folded sub(0.3, ...) result must be the canonical neg call:\n{pir}"
+    );
+    assert!(
+        !pir.contains("-0.35"),
+        "no signed atom may reach the printed FlatPIR:\n{pir}"
+    );
+    flatppl_flatpir::read(&pir).expect("printed FlatPIR must round-trip through the reader");
+}
+
+// Same defect, integer arithmetic: `sub` on two literal ints folding negative
+// (`3 - 5`) must emit `(neg 2)`, not a bare `-2`.
+#[test]
+fn const_fold_negative_int_result_emits_neg_call_and_round_trips() {
+    let src = "lp = 3 - 5";
+    let pir = flatppl_flatpir::write(&determinize_src(src));
+    assert!(
+        pir.contains("(neg 2)"),
+        "the folded sub(3, 5) result must be the canonical neg call:\n{pir}"
+    );
+    assert!(
+        !pir.contains("-2"),
+        "no signed atom may reach the printed FlatPIR:\n{pir}"
+    );
+    flatppl_flatpir::read(&pir).expect("printed FlatPIR must round-trip through the reader");
+}
+
+// A `neg` fold that would itself resurrect a signed atom must not be
+// re-folded: `collect_folds`'s unary path skips replacing `(neg <positive>)`
+// when the arithmetic result is negative (the exact shape this whole fold
+// pass must produce), so a fixpoint is reached in one sweep instead of the
+// pass rebuilding an identical `(neg <mag>)` node forever. Pin this directly
+// against a source-level `-0.35` literal, which the parser already lowers to
+// `neg(0.35)` before const-fold ever runs.
+#[test]
+fn const_fold_does_not_resurrect_a_signed_atom_from_a_source_neg_literal() {
+    let src = "lp = -0.35";
+    let out = determinize_src(src);
+    let pir = flatppl_flatpir::write(&out);
+    assert!(
+        pir.contains("(neg 0.35)"),
+        "a source-level -0.35 literal stays the canonical neg call:\n{pir}"
+    );
+    assert!(
+        !pir.contains("-0.35"),
+        "no signed atom may reach the printed FlatPIR:\n{pir}"
+    );
+    flatppl_flatpir::read(&pir).expect("printed FlatPIR must round-trip through the reader");
+    // And determinizing twice must not loop or diverge: canonicalize already
+    // ran to its fixpoint inside the first determinize.
+    let twice = flatppl_flatpir::write(&determinize_src(src));
+    assert_eq!(
+        pir, twice,
+        "determinize output is a canonicalization fixpoint"
+    );
+}

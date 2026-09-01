@@ -307,12 +307,31 @@ fn the_gated_arm_reads_a_sanitised_point_not_the_query_point() {
     // The witness is the forward op at a point in the base's support — `exp(1.0)` for
     // `pushfwd(exp, Normal)` — whose preimage is that support point, so no dangerous op
     // in the arm sees the excluded value.
+    // §11 "Literal values": the surface `-0.5` query point lowers to `(neg
+    // 0.5)`, never a signed atom, so the printed gate condition and its
+    // matching then-arm both carry that canonical call (three gates in all:
+    // the top-level refusal-to-mislower guard, plus one for the preimage and
+    // one for the volume term).
     let out = lp("d = pushfwd(exp, Normal(mu = 0.0, sigma = 1.0))\nlp = logdensityof(d, -0.5)");
+    assert_eq!(
+        out.matches("(in (%meta ((%scalar real) %fixed reals) (neg 0.5)) posreals)")
+            .count(),
+        3,
+        "every gate condition reads the sanitised negative query point:\n{out}"
+    );
+    assert_eq!(
+        out.matches(
+            "(ifelse (%meta ((%scalar boolean) %fixed booleans) \
+             (in (%meta ((%scalar real) %fixed reals) (neg 0.5)) posreals)) \
+             (%meta ((%scalar real) %fixed reals) (neg 0.5)) "
+        )
+        .count(),
+        2,
+        "the preimage and the volume term must both read the raw point in their then-arm:\n{out}"
+    );
     assert!(
-        out.contains(
-            "(ifelse (%meta ((%scalar boolean) %fixed booleans) (in -0.5 posreals)) -0.5 "
-        ),
-        "the query point must be sanitised against the gate:\n{out}"
+        !out.contains("-0.5"),
+        "no signed atom may reach the printed FlatPIR:\n{out}"
     );
     assert!(
         out.contains("(exp 1.0)"),
@@ -328,7 +347,7 @@ fn the_gated_arm_reads_a_sanitised_point_not_the_query_point() {
     // The gate CONDITION still tests the real query point: sanitising it there would
     // make the gate vacuously true.
     assert!(
-        out.contains("(in -0.5 posreals)"),
+        out.contains("(in (%meta ((%scalar real) %fixed reals) (neg 0.5)) posreals)"),
         "the condition tests the query point itself:\n{out}"
     );
 }

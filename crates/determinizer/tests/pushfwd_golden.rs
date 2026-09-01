@@ -49,12 +49,14 @@ fn pushfwd_affine_lambda_lowers() {
     );
     assert!(p.contains("builtin_logdensityof"), "got:\n{p}");
     // f_inv = (y-1)/2, applied at the literal query point y = 0.5, is now
-    // beta-reduced AND const-folded to the literal -0.25 (Buffy #263 Pass 2
-    // inlines the residual `%call` that used to carry `divide(sub(_x_, 1.0), 2.0)`
-    // unapplied; const-fold then reduces the folded arithmetic to one literal):
+    // beta-reduced AND const-folded to -0.25 (Buffy #263 Pass 2 inlines the
+    // residual `%call` that used to carry `divide(sub(_x_, 1.0), 2.0)`
+    // unapplied; const-fold then reduces the folded arithmetic to one term).
+    // §11 "Literal values" forbids a signed atom, so the negative fold result
+    // is the canonical `(neg 0.25)` call, not a bare `-0.25` literal.
     assert!(
-        p.contains("(builtin_logdensityof Normal") && p.contains(") -0.25)"),
-        "f_inv(0.5) = (0.5 - 1)/2 = -0.25, inlined + folded:\n{p}"
+        p.contains("(builtin_logdensityof Normal") && p.contains("(neg 0.25)"),
+        "f_inv(0.5) = (0.5 - 1)/2 = -0.25, inlined + folded to (neg 0.25):\n{p}"
     );
     // logvol is the constant log|2| = log(abs(2)) — unaffected by inlining:
     assert!(p.contains("(abs 2.0)"), "logvol log(2) present:\n{p}");

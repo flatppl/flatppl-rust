@@ -97,7 +97,10 @@ fn collect_folds(m: &mut Module, id: NodeId, out: &mut HashMap<NodeId, NodeId>) 
             };
             if let Some(checked) = folded {
                 let v = checked?; // overflow → leave unfolded (no f64 fallback)
-                let lit = m.alloc(Node::Lit(Scalar::Int(v)));
+                // §11 "Literal values" forbids a signed atom; `i64::MIN` has
+                // no positive counterpart (`checked_neg` fails), so leave that
+                // one boundary value unfolded rather than lose the magnitude.
+                let lit = alloc_int_result(m, v)?;
                 out.insert(id, lit);
                 return Some(Scalar::Int(v));
             }
@@ -117,7 +120,7 @@ fn collect_folds(m: &mut Module, id: NodeId, out: &mut HashMap<NodeId, NodeId>) 
                 "pow" if is_whole_small(b) => a.powi(b as i32),
                 _ => return None,
             };
-            let lit = m.alloc(Node::Lit(Scalar::Real(rf)));
+            let lit = alloc_real_result(m, rf);
             out.insert(id, lit);
             return Some(Scalar::Real(rf));
         }
@@ -144,12 +147,51 @@ fn collect_folds(m: &mut Module, id: NodeId, out: &mut HashMap<NodeId, NodeId>) 
                 "sqrt" => a.sqrt(),
                 _ => return None,
             };
-            let lit = m.alloc(Node::Lit(Scalar::Real(r)));
+            // A negative `neg` result means `id` is already the canonical
+            // `(neg <positive>)` shape (§11 "Literal values"): replacing it
+            // here would just rebuild that same shape under a fresh id every
+            // sweep, so leave the node unfolded and only propagate its value.
+            // A parent combining it with another operand still sees `r` via
+            // the returned `Scalar` and can fold on top of it as usual.
+            if op == "neg" && r < 0.0 {
+                return Some(Scalar::Real(r));
+            }
+            let lit = alloc_real_result(m, r);
             out.insert(id, lit);
             return Some(Scalar::Real(r));
         }
     }
     None
+}
+
+/// Materialize a real fold result as canonical IR: §11 "Literal values"
+/// forbids a signed atom, so a negative value becomes `neg(<positive Lit>)`
+/// instead of `Lit(<negative>)`. Normalizes `-0.0` to `0.0` first — IEEE
+/// arithmetic can produce a negative-zero result (e.g. `mul` with a
+/// propagated-but-unfolded negative operand) that would otherwise still
+/// print as a signed atom.
+fn alloc_real_result(m: &mut Module, v: f64) -> NodeId {
+    let v = if v == 0.0 { 0.0 } else { v };
+    if v < 0.0 {
+        let pos = m.alloc(Node::Lit(Scalar::Real(-v)));
+        crate::density::build_call(m, "neg", &[pos])
+    } else {
+        m.alloc(Node::Lit(Scalar::Real(v)))
+    }
+}
+
+/// Materialize an int fold result as canonical IR, mirroring
+/// [`alloc_real_result`]. `None` iff `v == i64::MIN`, whose magnitude has no
+/// positive `i64` representation (`checked_neg` fails) — the caller leaves
+/// that boundary value unfolded rather than lose it.
+fn alloc_int_result(m: &mut Module, v: i64) -> Option<NodeId> {
+    if v < 0 {
+        let mag = v.checked_neg()?;
+        let pos = m.alloc(Node::Lit(Scalar::Int(mag)));
+        Some(crate::density::build_call(m, "neg", &[pos]))
+    } else {
+        Some(m.alloc(Node::Lit(Scalar::Int(v))))
+    }
 }
 
 /// A whole number in the small range where `f64::powi` (repeated multiplication)
@@ -162,19 +204,38 @@ fn is_whole_small(x: f64) -> bool {
     x.fract() == 0.0 && x.abs() <= 64.0
 }
 
+/// True iff `rhs` is the canonical `(neg <positive Lit>)` shape a negative
+/// fold result takes under §11 "Literal values" (see `alloc_real_result` /
+/// `alloc_int_result`). Treated as trivial for alias inlining alongside a
+/// bare `Lit`: without this, a binding whose folded value happens to be
+/// negative is no longer a `Lit` itself, so its references would stop being
+/// inlined and a downstream `const_fold` could never fold back through it —
+/// the exact regression this rule prevents.
+fn is_canonical_neg_literal(m: &Module, rhs: NodeId) -> bool {
+    let Node::Call(c) = m.node(rhs) else {
+        return false;
+    };
+    let CallHead::Builtin(sym) = c.head else {
+        return false;
+    };
+    c.args.len() == 1
+        && c.named.is_empty()
+        && m.resolve(sym) == "neg"
+        && matches!(m.node(c.args[0]), Node::Lit(_))
+}
+
 /// Replace `(%ref self x)` where `x` binds a trivial value — another ref leaf,
-/// a `Const`, or a `Lit` — with that value. Non-trivial bindings are left
-/// (inlining them would duplicate shared subterms; leave that to CSE / the
-/// rewriter).
+/// a `Const`, a `Lit`, or the canonical `(neg <Lit>)` shape — with that value.
+/// Non-trivial bindings are left (inlining them would duplicate shared
+/// subterms; leave that to CSE / the rewriter).
 pub(crate) fn resolve_alias_refs(m: &mut Module) -> bool {
     // Map: binding-name Symbol -> trivial replacement NodeId.
     let mut trivial: HashMap<flatppl_core::Symbol, NodeId> = HashMap::new();
     for (_, b) in m.bindings() {
-        match m.node(b.rhs) {
-            Node::Lit(_) | Node::Const(_) | Node::Ref(_) => {
-                trivial.insert(b.name, b.rhs);
-            }
-            _ => {}
+        let is_trivial = matches!(m.node(b.rhs), Node::Lit(_) | Node::Const(_) | Node::Ref(_))
+            || is_canonical_neg_literal(m, b.rhs);
+        if is_trivial {
+            trivial.insert(b.name, b.rhs);
         }
     }
     if trivial.is_empty() {

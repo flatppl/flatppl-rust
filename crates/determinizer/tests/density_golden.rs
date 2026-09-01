@@ -1350,12 +1350,14 @@ fn locscale_scalar_lowers() {
         ls_pir("d = locscale(Normal(mu = 0.0, sigma = 1.0), 2.0, 3.0)\nlp = logdensityof(d, 0.5)");
     assert!(p.contains("builtin_logdensityof"), "got:\n{p}");
     // f_inv preimage (y - 2)/3, applied at the literal query point y = 0.5, is
-    // now beta-reduced AND const-folded to the literal -0.5 (Buffy #263 Pass 2
-    // inlines the residual `%call` that used to carry `divide(sub(_x_, 2.0), 3.0)`
-    // unapplied; const-fold then reduces the folded arithmetic to one literal):
+    // now beta-reduced AND const-folded to -0.5 (Buffy #263 Pass 2 inlines the
+    // residual `%call` that used to carry `divide(sub(_x_, 2.0), 3.0)`
+    // unapplied; const-fold then reduces the folded arithmetic to one term).
+    // §11 "Literal values" forbids a signed atom, so the negative fold result
+    // is the canonical `(neg 0.5)` call, not a bare `-0.5` literal.
     assert!(
-        p.contains("(builtin_logdensityof Normal") && p.contains(") -0.5)"),
-        "f_inv(0.5) = (0.5 - 2)/3 = -0.5, inlined + folded:\n{p}"
+        p.contains("(builtin_logdensityof Normal") && p.contains("(neg 0.5)"),
+        "f_inv(0.5) = (0.5 - 2)/3 = -0.5, inlined + folded to (neg 0.5):\n{p}"
     );
     // logvol = log|3| = log(abs(3.0)) — a constant, unaffected by inlining:
     assert!(p.contains("(abs 3.0)"), "logvol log|3| present:\n{p}");
@@ -1988,7 +1990,9 @@ lp = logdensityof(lawof(y), 0.3)",
 z = draw(Normal(mu = 0.0, sigma = 1.0))
 y = draw(locscale(lawof(z), 1.0, 2.0))
 lp = logdensityof(lawof(y), 0.3)",
-            "-0.35",
+            // §11 "Literal values" forbids a signed atom: the folded sub(0.3,
+            // 1.0) result is the canonical `(neg 0.35)` call.
+            "(neg 0.35)",
         ),
         (
             "\
