@@ -61,6 +61,14 @@ pub struct Module {
     /// latent out needs its `draw(prior)`, which the pin overwrote. Not projected
     /// into any output format.
     query_pinned: HashMap<BindingId, NodeId>,
+    /// Binding names the reification currently being scored declares as its
+    /// INPUTS (`flatppl-determinizer`). A measure parameterized by one of these
+    /// is CONDITIONED on it, so a density lowering must not marginalize it out:
+    /// §04 "Reification to measures" makes a declared input the callable's
+    /// argument, and §06 `likelihoodof` fixes
+    /// `densityof(likelihoodof(K, obs), theta)` as `pdf(K(theta), obs)`. A stack,
+    /// because reifications nest. Not projected into any output format.
+    conditioned_inputs: Vec<Symbol>,
 }
 
 /// A top-level binding `name = rhs`.
@@ -156,6 +164,27 @@ impl Module {
     /// which is unreachable from the binding once the pin overwrote it.
     pub fn query_pinned_rhs(&self, id: BindingId) -> Option<NodeId> {
         self.query_pinned.get(&id).copied()
+    }
+
+    /// Declare `names` as the inputs of the reification whose body is about to be
+    /// scored, so a density lowering conditions on them instead of marginalizing
+    /// them out (see [`Module::conditioned_inputs`]). Pair every call with
+    /// [`Module::pop_conditioned_inputs`].
+    pub fn push_conditioned_inputs(&mut self, names: &[Symbol]) {
+        self.conditioned_inputs.extend_from_slice(names);
+    }
+
+    /// Undo one [`Module::push_conditioned_inputs`]: drop its `count` names off
+    /// the stack, so a sibling measure outside that reification is unaffected.
+    pub fn pop_conditioned_inputs(&mut self, count: usize) {
+        let keep = self.conditioned_inputs.len().saturating_sub(count);
+        self.conditioned_inputs.truncate(keep);
+    }
+
+    /// Is `name` an input of a reification currently being scored — a value the
+    /// density conditions on rather than marginalizes over?
+    pub fn is_conditioned_input(&self, name: Symbol) -> bool {
+        self.conditioned_inputs.contains(&name)
     }
 
     /// Keep only the bindings in `keep`, in their existing source order; drop the

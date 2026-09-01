@@ -1015,3 +1015,148 @@ lp = logdensityof(d, [])";
         "a written `[]` observation must be a static error; got {msgs:?}"
     );
 }
+
+// ── Record-valued `iid`: the table variate ───────────────────────────────────
+
+/// §06 `iid`: "When `M` is record-valued and `size` is a scalar length, the
+/// variate is an N-row table — one row per draw of `M`'s record". The density is
+/// the independent-product Σ over rows, each row scored field-wise by the record
+/// law (§06 "Density of composed measures").
+///
+/// Closed form for the fixture below: Σ_i log N(a_i; 0.3, 1) + Σ_i log N(b_i; 1, 2).
+#[test]
+fn record_iid_over_a_table_variate_lowers_row_wise() {
+    let a = [0.61, -0.32];
+    let b = [1.1, 2.53];
+    let oracle: f64 = a.iter().map(|&x| gaussian_logpdf(x, 0.3, 1.0)).sum::<f64>()
+        + b.iter().map(|&x| gaussian_logpdf(x, 1.0, 2.0)).sum::<f64>();
+
+    let src = "\
+tab_obs = table(a = [0.61, -0.32], b = [1.1, 2.53])
+mu_a = elementof(reals)
+mu_b = elementof(reals)
+run = joint(a = Normal(mu = mu_a, sigma = 1.0), b = Normal(mu = mu_b, sigma = 2.0))
+tab ~ iid(run, 2)
+L = likelihoodof(kernelof(record(tab = tab), mu_a = mu_a, mu_b = mu_b), record(tab = tab_obs))
+lp = logdensityof(L, record(mu_a = 0.3, mu_b = 1.0))";
+    let m = parse_infer(src);
+    let out = determinize(&m).expect("a record-valued iid over a table variate must lower");
+    assert!(
+        flatppl_determinizer::is_flatpdl(&out).is_ok(),
+        "must be FlatPDL"
+    );
+    let pir = flatppl_flatpir::write(&out);
+    assert!(
+        !pir.contains("(iid ") && !pir.contains("(logdensityof ") && !pir.contains("(joint "),
+        "measure layer eliminated:\n{pir}"
+    );
+    // One term per row per field: 2 rows x 2 fields.
+    assert_eq!(
+        pir.matches("builtin_logdensityof").count(),
+        4,
+        "Σ over rows x fields:\n{pir}"
+    );
+    // Each field is scored at the θ value, NOT at the marginal of a latent.
+    assert!(
+        pir.contains("0.3") && pir.contains("1.0"),
+        "the kernel's declared inputs are conditioned on:\n{pir}"
+    );
+    assert!(
+        oracle.is_finite(),
+        "closed-form oracle sanity: {oracle}" // -8.16… ; the live numeric gate is flatppl-testsuite
+    );
+}
+
+/// The emitted FlatPDL reads each row field FROM ITS COLUMN — `crates/stablehlo`
+/// has no `table` constructor arm ("unsupported builtin head 'table'"), so a
+/// lowering that left the table value in place could not execute. §03 "Tables"
+/// makes row `i`'s field `a` element `i` of column `a`, so the column read is the
+/// same value by a spelling the emitter can lower.
+#[test]
+fn record_iid_row_fields_come_from_the_columns_not_a_table_value() {
+    let src = "\
+tab_obs = table(a = [0.61, -0.32], b = [1.1, 2.53])
+mu_a = elementof(reals)
+run = joint(a = Normal(mu = mu_a, sigma = 1.0), b = Normal(mu = 0.0, sigma = 2.0))
+tab ~ iid(run, 2)
+L = likelihoodof(kernelof(record(tab = tab), mu_a = mu_a), record(tab = tab_obs))
+lp = logdensityof(L, record(mu_a = 0.3))";
+    let m = parse_infer(src);
+    let out = determinize(&m).expect("must lower");
+    let pir = flatppl_flatpir::write(&out);
+    // Scope the check to the scored binding: `tab_obs` keeps its own `table`
+    // literal (a public binding the retained subgraph drops only once an
+    // `outputs` ABI names the query), but nothing in `lp` may read a row out of
+    // it — the column reads const-fold to the scalars themselves.
+    let lp = pir
+        .split("(%bind lp ")
+        .nth(1)
+        .expect("the determinized module binds lp");
+    assert!(
+        !lp.contains("(table ") && !lp.contains("(get0 ") && !lp.contains("(get "),
+        "the scored density reads no table value or row:\n{lp}"
+    );
+}
+
+/// §04 "Reification to measures" makes a `kernelof`'s declared name its ARGUMENT,
+/// and §06 `likelihoodof` fixes `densityof(likelihoodof(K, obs), theta)` as
+/// `pdf(K(theta), obs)` — conditional on θ. So a latent the kernel declares as an
+/// input is conditioned on, never marginalized: the record-law rewrite that
+/// serves an undeclared shared latent must not fire for it.
+///
+/// Without this the fixture scored `obs` against `Normal(0, sqrt(5² + 1²))` — the
+/// prior predictive — instead of `Normal(0.3, 1)`.
+#[test]
+fn a_kernels_declared_input_is_conditioned_not_marginalized() {
+    let conditional = gaussian_logpdf(0.61, 0.3, 1.0) + gaussian_logpdf(1.1, 1.0, 2.0);
+    let marginal =
+        gaussian_logpdf(0.61, 0.0, 26.0_f64.sqrt()) + gaussian_logpdf(1.1, 0.0, 29.0_f64.sqrt());
+    assert!(
+        (conditional - marginal).abs() > 1.0,
+        "the two readings must be distinguishable: {conditional} vs {marginal}"
+    );
+
+    let src = "\
+mu_a ~ Normal(mu = 0.0, sigma = 5.0)
+mu_b ~ Normal(mu = 0.0, sigma = 5.0)
+run = joint(a = Normal(mu = mu_a, sigma = 1.0), b = Normal(mu = mu_b, sigma = 2.0))
+r ~ run
+L = likelihoodof(kernelof(record(r = r), mu_a = mu_a, mu_b = mu_b), record(r = record(a = 0.61, b = 1.1)))
+lp = logdensityof(L, record(mu_a = 0.3, mu_b = 1.0))";
+    let m = parse_infer(src);
+    let out = determinize(&m).expect("must lower");
+    let printed = flatppl_syntax::print(&out);
+    // The conditional form carries the θ values as the kernel's own parameters.
+    assert!(
+        printed.contains("record(mu = 0.3, sigma = 1.0)")
+            && printed.contains("record(mu = 1.0, sigma = 2.0)"),
+        "obs scored at θ, not at the prior predictive:\n{printed}"
+    );
+    // sqrt(26) / sqrt(29) are the marginal sigmas the record-law rewrite emitted.
+    assert!(
+        !printed.contains("5.0990195135927845") && !printed.contains("5.385164807134504"),
+        "no prior-predictive marginal sigma:\n{printed}"
+    );
+}
+
+/// The conditioning above is scoped to the reification that declares the input:
+/// a sibling measure outside it keeps marginalizing over the same latent. Here
+/// `z` is declared by the likelihood's kernel but the SECOND query scores a
+/// measure that only READS `z`, so its own density still needs `z` marginalized —
+/// and no closed form covers it, so it refuses rather than emitting a
+/// conditional.
+#[test]
+fn conditioning_is_scoped_to_the_declaring_reification() {
+    let src = "\
+z ~ Normal(mu = 0.0, sigma = 1.0)
+L = likelihoodof(kernelof(record(y = y), z = z), record(y = 0.4))
+y ~ Normal(mu = z, sigma = 1.0)
+lp = logdensityof(L, record(z = 0.2))";
+    let m = parse_infer(src);
+    let out = determinize(&m).expect("the declared-input query must lower");
+    let printed = flatppl_syntax::print(&out);
+    assert!(
+        printed.contains("record(mu = 0.2, sigma = 1.0)"),
+        "the declaring kernel conditions on z:\n{printed}"
+    );
+}

@@ -3077,6 +3077,15 @@ pub(crate) fn measure_stochastic_ancestors(
                 ns: RefNs::SelfMod,
                 name,
             }) => {
+                // An input the enclosing reification declares is a GIVEN, not a
+                // stochastic ancestor: §04 "Reification to measures" makes it the
+                // callable's argument, and §06 `likelihoodof` fixes
+                // `densityof(likelihoodof(K, obs), theta)` as `pdf(K(theta), obs)` —
+                // conditional on θ. Marginalizing it would score the obs against the
+                // model's prior predictive instead.
+                if m.is_conditioned_input(*name) {
+                    return;
+                }
                 let Some(bid) = m.binding_by_name(*name) else {
                     return;
                 };
@@ -5911,6 +5920,114 @@ pub(crate) fn iid_static_size(m: &Module, iid_node: NodeId) -> Option<usize> {
     }
 }
 
+/// The static ROW COUNT of an `iid` whose variate is a **table** — a
+/// record-valued `M` under a scalar size (§06 `iid`: "When `M` is record-valued
+/// and `size` is a scalar length, the variate is an $N$-row table — one row per
+/// draw of `M`'s record"). `flatppl_infer::iid_type` types that case
+/// `Type::Table`, not `Type::Array`, so [`iid_static_size`] reads `None` for it.
+///
+/// **Deliberately separate from [`iid_static_size`] rather than a widening of
+/// it.** That reader is shared with `sample::lower_draw`'s `iid(K, n)` fan-out,
+/// which batches `builtin_sample` over an ARRAY leading axis; a table variate
+/// needs a different sample form, so teaching the shared reader about tables
+/// would silently change the sampling path too. Only the density unroll in
+/// [`lower_iid`] indexes a table row (`get0(t, i)` → the `i`-th row as a record,
+/// §03 "Indexing"), so only it reads this.
+///
+/// A `Dim::Dynamic` row count yields `None` (refuse, same as the array case). A
+/// `Dim::Static(0)` also yields `None`: §06 makes a zero-resolving size over a
+/// record-valued `M` "an error rather than the empty product measure ..., as a
+/// table has no zero-row form", so the caller must refuse instead of emitting
+/// the empty-product `0.0` that the array case is entitled to.
+/// `flatppl_infer::ops::iid_type` refuses that shape upstream (`5aee522`), so a
+/// zero-row table type no longer reaches here; the arm stays as the local floor,
+/// since this reader must never hand a caller a count the spec forbids.
+fn iid_static_table_rows(m: &Module, iid_node: NodeId) -> Option<usize> {
+    let Some(Type::Measure { domain, .. }) = m.type_of(iid_node) else {
+        return None;
+    };
+    let Type::Table { nrows, .. } = domain.as_ref() else {
+        return None;
+    };
+    match nrows {
+        Dim::Static(0) | Dim::Dynamic => None,
+        Dim::Static(n) => Some(*n as usize),
+    }
+}
+
+/// The column names of an `iid` node whose variate is a table, in declaration
+/// order — the field names of one row (§03 "Tables": "Each row of a table is a
+/// record"). `None` for any other domain.
+fn iid_table_columns(m: &Module, iid_node: NodeId) -> Option<Vec<Symbol>> {
+    let Some(Type::Measure { domain, .. }) = m.type_of(iid_node) else {
+        return None;
+    };
+    let Type::Table { columns, .. } = domain.as_ref() else {
+        return None;
+    };
+    Some(columns.iter().map(|&(name, _)| name).collect())
+}
+
+/// Row `i` of the table `v`, as a SYNTACTIC `record(name = …, …)`.
+///
+/// `get0(v, i)` already denotes that row (§03 "Indexing": "returns the `i`-th row
+/// as a record"), but it is a fresh call node with no inferred type, so the arms
+/// that consume a record variate — [`lower_keyword_joint`] above all — cannot pin
+/// their components against it: they match a `record(...)` node structurally and
+/// refuse anything else rather than trust an unresolved type. So the row is handed
+/// over already destructured.
+///
+/// Each field is read **from its column** when `v` is a visible `table(a = …, b =
+/// …)` node: §03 makes a table "a named collection of columns of equal length"
+/// whose row `i` takes field `a` from element `i` of column `a`, so
+/// `get0(col_a, i)` is that field, and the emitted FlatPDL then carries plain
+/// array indexing with no table value at all — the form `crates/stablehlo` can
+/// lower ("unsupported builtin head 'table'" otherwise). A table-valued
+/// expression whose columns are NOT visible (a `load_data`, a passed-in table)
+/// falls back to `get(get0(v, i), "name")`, the general spelling.
+fn row_record(m: &mut Module, v: NodeId, index: NodeId, columns: &[Symbol]) -> NodeId {
+    let visible_columns: Option<Vec<(Symbol, NodeId)>> = {
+        let (resolved, _) = resolve_ref_one(m, v);
+        expect_builtin_call(m, resolved, "table").map(|c| {
+            c.named
+                .iter()
+                .map(|n| (n.name, n.value))
+                .collect::<Vec<_>>()
+        })
+    };
+    let record_sym = m.intern("record");
+    let row = visible_columns
+        .is_none()
+        .then(|| build_call(m, "get0", &[v, index]));
+    let fields: Vec<NamedArg> = columns
+        .iter()
+        .map(|&name| {
+            let value = match visible_columns
+                .as_ref()
+                .and_then(|cols| cols.iter().find(|&&(c, _)| c == name))
+            {
+                Some(&(_, column)) => build_call(m, "get0", &[column, index]),
+                None => {
+                    let key = m.alloc(Node::Lit(Scalar::Str(m.resolve(name).to_string().into())));
+                    let row = row.unwrap_or_else(|| build_call(m, "get0", &[v, index]));
+                    build_call(m, "get", &[row, key])
+                }
+            };
+            NamedArg {
+                kind: NamedKind::Field,
+                name,
+                value,
+            }
+        })
+        .collect();
+    m.alloc(Node::Call(Call {
+        head: CallHead::Builtin(record_sym),
+        args: Vec::<NodeId>::new().into(),
+        named: fields.into(),
+        inputs: None,
+    }))
+}
+
 /// `logdensityof(iid(M, N), v)` = `Σ_{i<N} logdensityof(M, get0(v, i))`
 /// (§06 "Density of composed measures", "iid(M, n) → Σ_i log densityof(M, xᵢ)").
 /// `N` is the static repeat count read from the iid node's own inferred domain
@@ -6048,14 +6165,20 @@ fn lower_iid(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseEr
     // (see `iid_static_size`), so a `lengthof(obs)` / `sizeof(M)` / arithmetic
     // size resolves as readily as a raw literal. A genuinely dynamic or
     // multi-axis size yields `None` and refuses.
-    let n = iid_static_size(m, node).ok_or_else(|| {
-        refuse(
-            node,
-            m,
-            "iid size is not a statically-resolved 1-D count (dynamic, multi-axis, \
-             or unresolved domain); only a 1-D static size is unrolled",
-        )
-    })?;
+    // A record-valued `M` under a scalar size types a TABLE, not an array
+    // (§06 `iid`), so the row count comes from a second reader; the unroll below
+    // is identical either way — `get0(v, i)` is the i-th row for a table and the
+    // i-th element for an array (§03 "Indexing").
+    let n = iid_static_size(m, node)
+        .or_else(|| iid_static_table_rows(m, node))
+        .ok_or_else(|| {
+            refuse(
+                node,
+                m,
+                "iid size is not a statically-resolved 1-D count (dynamic, multi-axis, \
+                 or unresolved domain); only a 1-D static size is unrolled",
+            )
+        })?;
     let m_inner = {
         let c =
             expect_builtin_call(m, node, "iid").ok_or_else(|| refuse(node, m, "expected iid"))?;
@@ -6132,10 +6255,16 @@ fn lower_iid(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseEr
     // rank-mismatch panic in `Emitter::broadcast_pair`, not a missing
     // `broadcast_in_dim`). Keep unrolling here for the shapes the flatten
     // above does not reach.
+    // A table variate's i-th element is a ROW, handed over already destructured so
+    // the record-consuming arms can pin their fields (see [`row_record`]).
+    let table_columns = iid_table_columns(m, node);
     let mut terms = Vec::with_capacity(n);
     for i in 0..n {
         let idx = m.alloc(Node::Lit(Scalar::Int(i as i64)));
-        let elem = build_call(m, "get0", &[v, idx]);
+        let elem = match &table_columns {
+            Some(columns) => row_record(m, v, idx, columns),
+            None => build_call(m, "get0", &[v, idx]),
+        };
         terms.push(lower_measure_density(m, m_inner, elem)?);
     }
     Ok(fold_add(m, &terms))
@@ -6783,6 +6912,22 @@ fn lower_reified_measure(
     v: NodeId,
     origin: VariateOrigin,
 ) -> Result<NodeId, RefuseError> {
+    // The names this reification declares as inputs. Scoring its body conditions
+    // on them (§04 "Reification to measures"), so they are held on the module's
+    // conditioned-input stack for the duration of the body's lowering below and
+    // popped straight after — a sibling measure outside the reification must keep
+    // marginalizing over the same latent.
+    let declared_inputs: Vec<Symbol> = match m.node(node) {
+        Node::Call(Call {
+            inputs: Some(flatppl_core::Inputs::Spec(entries)),
+            ..
+        }) => entries
+            .iter()
+            .filter(|(_, r)| r.ns == RefNs::SelfMod)
+            .map(|&(name, _)| name)
+            .collect(),
+        _ => Vec::new(),
+    };
     let body = {
         let Node::Call(c) = m.node(node) else {
             return Err(refuse(node, m, "expected functionof/kernelof"));
@@ -6830,7 +6975,10 @@ fn lower_reified_measure(
              density — refuse rather than mislower",
         ));
     }
-    lower_measure_density_at(m, body, v, origin)
+    m.push_conditioned_inputs(&declared_inputs);
+    let scored = lower_measure_density_at(m, body, v, origin);
+    m.pop_conditioned_inputs(declared_inputs.len());
+    scored
 }
 
 // ---------------------------------------------------------------------------
