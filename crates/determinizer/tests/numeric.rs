@@ -959,39 +959,52 @@ fn empty_record_is_zero() {
 }
 
 // Empty independent product: `iid(M, 0)` is Σ over an empty index set = 0, the
-// same as the empty measure `record()` (the iid Σ rule, §06 "Density of composed measures",
-// with an empty index set). It lowers to the log-density literal 0 with NO
-// density term — it is NOT refused (both empty products must agree).
+// same as the empty measure `record()` (the iid Σ rule, §06 "Density of composed
+// measures", with an empty index set). The determiniser still lowers that to the
+// log-density literal 0 with no density term — but the shape is NO LONGER
+// REACHABLE from surface source, so this test pins the two static refusals that
+// now stand in front of it instead of the lowering.
 //
-// The observation is a DERIVED empty vector (`flatppl-dev/empty-arrays-ruling.md`,
-// 2026-08-20: "an author may not write a degenerate shape, data may turn out
-// empty"). The literal `[]` this fixture used to score against is now a §05
-// axis-position error — see `empty_vector_literal_observation_is_refused`.
-// The written literal `0` size stays: the ruling's positivity rule for written
-// sizes is a separate, unlanded infer change (TODO-flatppl-rust.md).
+// Both come from `flatppl-dev/empty-arrays-ruling.md` (2026-08-20): "an author
+// may not write a degenerate shape, data may turn out empty".
+//   * A WRITTEN size of `0` is a static error (§06 `iid`, the positivity rule).
+//   * A DERIVED size resolving to 0 types `%dynamic`, never `Dim::Static(0)`
+//     (sub-ruling 3), and the unroll needs a static 1-D count — so it refuses.
+//
+// Which leaves the static empty product with no legal spelling: a derived size
+// only turns out to be 0 at data-load time, and that is the js engine's job, not
+// this crate's. The empty-product lowering stays as §06 requires; it has no
+// surface witness here. Recorded in `flatppl-dev/TODO-flatppl-rust.md`.
 #[test]
-fn iid_zero_size_is_zero() {
-    let src = "\
+fn iid_zero_size_is_refused_written_and_derived() {
+    let written = "\
 xs = [1.0, 2.0, 3.0]
 keep = filter(x -> x < 0.0, xs)
 d = iid(Normal(mu = 0.0, sigma = 1.0), 0)
 lp = logdensityof(d, keep)";
-    let m = parse_infer(src);
-    let out = determinize(&m).expect("iid with zero size must lower to 0, not refuse");
-    assert!(flatppl_determinizer::is_flatpdl(&out).is_ok());
-    let pir = flatppl_flatpir::write(&out);
+    let mut m = flatppl_syntax::parse(written).expect("fixture must parse");
+    let msgs: Vec<String> = flatppl_infer::infer(&mut m)
+        .into_iter()
+        .filter(|d| d.severity == flatppl_infer::Severity::Error)
+        .map(|d| d.message)
+        .collect();
     assert!(
-        !pir.contains("builtin_logdensityof"),
-        "no density terms for an empty product:\n{pir}"
+        msgs.iter()
+            .any(|m| m.contains("`iid`'s `size` is written as `0`")),
+        "a written zero size must be a static error; got {msgs:?}"
     );
+
+    let derived = "\
+xs = [1.0, 2.0, 3.0]
+keep = filter(x -> x < 0.0, xs)
+n = sub(lengthof(xs), lengthof(xs))
+d = iid(Normal(mu = 0.0, sigma = 1.0), n)
+lp = logdensityof(d, keep)";
+    let m = parse_infer(derived);
+    let err = determinize(&m).expect_err("a %dynamic iid size must refuse, not unroll");
     assert!(
-        !pir.contains("(iid ") && !pir.contains("(logdensityof "),
-        "no measure layer:\n{pir}"
-    );
-    // The `lp` binding is the literal 0.0 (log-density of the empty product).
-    assert!(
-        pir.contains("(%bind lp 0.0)"),
-        "empty iid product lowers to log-density 0:\n{pir}"
+        format!("{err:?}").contains("not a statically-resolved 1-D count"),
+        "a derived zero size stays %dynamic and the unroll refuses it: {err:?}"
     );
 }
 

@@ -390,7 +390,34 @@ fn is_value_type(t: &Type) -> bool {
 /// A single shape dim from a size expression. Literal integers resolve at every
 /// level; anything else needs `Level::Shape` (§17.3 — dims stay `%dynamic`
 /// below it). An op-gap here is a loud diagnostic.
+///
+/// A size of 0 becomes `%dynamic`, never `Dim::Static(0)` — see [`size_dim`].
 pub(crate) fn resolve_dim(inf: &mut Inferencer<'_, '_>, node: NodeId) -> Dim {
+    resolve_size_axis(inf, node).0
+}
+
+/// One size axis: the dim as typed, plus whether it RESOLVED to 0 (which types
+/// as `%dynamic`, so the dim alone cannot say).
+fn resolve_size_axis(inf: &mut Inferencer<'_, '_>, node: NodeId) -> (Dim, bool) {
+    if let Node::Lit(Scalar::Int(n)) = inf.module.node(node) {
+        let n = *n;
+        return (size_dim(inf, node, n), n == 0);
+    }
+    if inf.level >= Level::Shape {
+        match const_eval(inf, node, 0) {
+            ConstEval::Val(FixedValue::Int(n)) => return (size_dim(inf, node, n), n == 0),
+            ConstEval::Gap(op) => emit_gap(inf, node, &op),
+            ConstEval::Val(_) | ConstEval::Dynamic => {}
+        }
+    }
+    (Dim::Dynamic, false)
+}
+
+/// A COUNT, not a size: `addaxes`'s `n_leading`/`n_trailing` are non-negative
+/// (spec §07 `addaxes`), so 0 is a legal resolved value and must stay
+/// `Dim::Static(0)` — the size flooring of [`size_dim`] would turn
+/// `addaxes(A, 0, 2)` into an unresolvable shape.
+pub(crate) fn resolve_count(inf: &mut Inferencer<'_, '_>, node: NodeId) -> Dim {
     if let Node::Lit(Scalar::Int(n)) = inf.module.node(node) {
         return static_dim(*n);
     }
@@ -410,27 +437,55 @@ pub(crate) fn resolve_dim(inf: &mut Inferencer<'_, '_>, node: NodeId) -> Dim {
 /// non-literal size is const-evaluated whole (so `zeros(sizeof(M))` recovers
 /// M's rank, not a rank-1 `%dynamic`).
 pub(crate) fn count_dims(inf: &mut Inferencer<'_, '_>, node: NodeId) -> Box<[Dim]> {
+    count_dims_with_zero(inf, node).0
+}
+
+/// [`count_dims`] plus whether any axis RESOLVED to 0. The flag is separate
+/// because a resolved 0 is typed `%dynamic` (see [`size_dim`]), which makes it
+/// indistinguishable from a size that never resolved. Spec §06 `iid` over a
+/// record-valued measure is the one rule that must tell the two apart: a table
+/// has no zero-row form.
+pub(crate) fn count_dims_with_zero(
+    inf: &mut Inferencer<'_, '_>,
+    node: NodeId,
+) -> (Box<[Dim]>, bool) {
     if let Node::Call(c) = inf.module.node(node).clone()
         && matches!(c.head, CallHead::Builtin(op) if inf.module.resolve(op) == "vector")
     {
-        return c.args.iter().map(|&a| resolve_dim(inf, a)).collect();
+        let mut zero = false;
+        let dims = c
+            .args
+            .iter()
+            .map(|&a| {
+                let (d, z) = resolve_size_axis(inf, a);
+                zero |= z;
+                d
+            })
+            .collect();
+        return (dims, zero);
     }
     if inf.level >= Level::Shape {
         match const_eval(inf, node, 0) {
             ConstEval::Val(FixedValue::Vec(elems)) => {
-                return elems.iter().map(fixed_to_dim).collect();
+                let zero = elems.contains(&FixedValue::Int(0));
+                return (
+                    elems.iter().map(|e| fixed_to_dim(inf, node, e)).collect(),
+                    zero,
+                );
             }
-            ConstEval::Val(FixedValue::Int(n)) => return Box::new([static_dim(n)]),
+            ConstEval::Val(FixedValue::Int(n)) => {
+                return (Box::new([size_dim(inf, node, n)]), n == 0);
+            }
             ConstEval::Gap(op) => emit_gap(inf, node, &op),
             ConstEval::Dynamic => {}
         }
     }
-    Box::new([Dim::Dynamic])
+    (Box::new([Dim::Dynamic]), false)
 }
 
-fn fixed_to_dim(v: &FixedValue) -> Dim {
+fn fixed_to_dim(inf: &mut Inferencer<'_, '_>, node: NodeId, v: &FixedValue) -> Dim {
     match v {
-        FixedValue::Int(n) => static_dim(*n),
+        FixedValue::Int(n) => size_dim(inf, node, *n),
         FixedValue::Vec(_) => Dim::Dynamic,
     }
 }
@@ -439,6 +494,32 @@ fn fixed_to_dim(v: &FixedValue) -> Dim {
 /// rather than panicking (overflowed shape arithmetic).
 pub(crate) fn static_dim(n: i64) -> Dim {
     u32::try_from(n).map(Dim::Static).unwrap_or(Dim::Dynamic)
+}
+
+/// A dim from a resolved SIZE, per `flatppl-dev/empty-arrays-ruling.md`
+/// (2026-08-20, shape C): an extent of 0 is `%dynamic`, never `Dim::Static(0)`,
+/// so §11's "a positive integer dimension size, or `%dynamic`" holds for every
+/// type this crate produces. A written 0 is refused earlier, at the call
+/// ([`crate::ops::written_size_check`]); a 0 reaching here is DERIVED, and
+/// legality must not depend on how much of it the const-eval table can fold.
+///
+/// A NEGATIVE extent is no size at any phase, so it is a diagnostic rather
+/// than the silent `%dynamic` it used to become.
+fn size_dim(inf: &mut Inferencer<'_, '_>, node: NodeId, n: i64) -> Dim {
+    if n < 0 {
+        inf.diags.push(Diagnostic::error_at(
+            node,
+            format!(
+                "this size resolves to {n}, but an array extent is a positive \
+                 integer (spec §03 \"Cartesian power\", §07 \"Array constructors\")"
+            ),
+        ));
+        return Dim::Dynamic;
+    }
+    if n == 0 {
+        return Dim::Dynamic;
+    }
+    static_dim(n)
 }
 
 fn emit_gap(inf: &mut Inferencer<'_, '_>, node: NodeId, op: &str) {

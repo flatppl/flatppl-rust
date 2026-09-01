@@ -12,7 +12,7 @@ use flatppl_core::{
 };
 
 use crate::Level;
-use crate::consteval::{count_dims, resolve_dim, static_dim};
+use crate::consteval::{count_dims, count_dims_with_zero, resolve_count, resolve_dim, static_dim};
 use crate::trace::{Inferencer, join_phase};
 
 /// `(node, type, phase)` of an inferred positional argument.
@@ -117,6 +117,12 @@ pub(crate) fn call_rule(
     // per-op rules because most of them index fixed argument positions and so
     // ignore extras and silently type an under-supplied call.
     if let Some(ty) = arity_check(inf, id, &name, args, named) {
+        return (ty, joined);
+    }
+
+    // Written sizes, after `arity_check` (which needs the call as written) and
+    // ahead of the per-op rules, which read the size to build a shape.
+    if let Some(ty) = written_size_check(inf, &name, args, named) {
         return (ty, joined);
     }
 
@@ -390,11 +396,12 @@ pub(crate) fn call_rule(
         // counts are fixed integers: result shape = [1;nl] ++ A.shape ++ [1;nt],
         // element preserved. (e.g. A:(3,4,5), addaxes(A,2,3) → (1,1,3,4,5,1,1,1).)
         "addaxes" => {
-            // The counts are non-negative fixed integers; `resolve_dim` folds
-            // them (a `Static(n)` is ≥ 0 by construction) AND emits the loud
-            // op-gap diagnostic if a count uses an unfoldable fixed op (§17.1).
-            let nl = args.get(1).map(|a| resolve_dim(inf, a.0));
-            let nt = args.get(2).map(|a| resolve_dim(inf, a.0));
+            // The counts are non-negative fixed integers, so they resolve as
+            // COUNTS, not sizes: `resolve_count` keeps a legal `Static(0)`
+            // where `resolve_dim` floors a size positive. It also emits the
+            // loud op-gap diagnostic if a count uses an unfoldable op (§17.1).
+            let nl = args.get(1).map(|a| resolve_count(inf, a.0));
+            let nt = args.get(2).map(|a| resolve_count(inf, a.0));
             match (arg_ty(args, 0), nl, nt) {
                 (
                     Some(Type::Array { shape, elem }),
@@ -3163,15 +3170,18 @@ fn iid_type(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> Type {
     let Some((count_node, _, _)) = args.get(1) else {
         return Type::Deferred;
     };
-    let shape = count_dims(inf, *count_node);
+    let (shape, resolved_zero) = count_dims_with_zero(inf, *count_node);
     // spec §06 iid: a scalar size derived to 0 is an error over a
     // record-valued M — "a table has no zero-row form" — unlike the empty
     // product measure a scalar-valued M gets. §06 already requires a
-    // positive WRITTEN size, so a `Dim::Static(0)` here only ever comes from
-    // a DERIVED size the const-eval table resolved (`resolve_dim`/
-    // `count_dims`, engine-concepts §17.1); a size still open at analysis
-    // time stays `%dynamic` and is untouched by this check.
-    if let (Type::Record(_), [Dim::Static(0)]) = (&domain, shape.as_ref()) {
+    // positive WRITTEN size, so a zero here only ever comes from a DERIVED
+    // size the const-eval table resolved (engine-concepts §17.1); a size
+    // still open at analysis time stays `%dynamic` and is untouched. The
+    // resolved 0 arrives as the flag, not as the dim: a derived 0 types
+    // `%dynamic` per the empty-arrays ruling.
+    if let (Type::Record(_), [_]) = (&domain, shape.as_ref())
+        && resolved_zero
+    {
         inf.diags.push(crate::Diagnostic::error_at(
             *count_node,
             "`iid`'s size resolves to 0 over a record-valued measure (spec \
@@ -5965,6 +5975,123 @@ fn splatted_field_names(inf: &Inferencer<'_, '_>, ty: &Type) -> Vec<String> {
     syms.iter()
         .map(|(n, _)| inf.module.resolve(*n).to_string())
         .collect()
+}
+
+/// Every argument position holding a size WRITTEN in source: the op, the
+/// declared parameter name, its position, and the spec section that floors it
+/// positive.
+///
+/// The written/derived split is the 2026-08-20 owner ruling on zero-size arrays
+/// (`flatppl-dev/empty-arrays-ruling.md`, shape C): "an author may not write a
+/// degenerate shape, data may turn out empty". So this table is exactly the
+/// sizes an author writes; §06's `iid` entry states the other half in the spec
+/// itself — "a `size` derived from data rather than written in source may
+/// resolve to 0, giving the empty product measure".
+///
+/// NOT here: `addaxes`'s two counts, which §07 declares non-negative (0 axes
+/// inserted is a legal no-op), and index positions such as `onehot`'s `i` or
+/// `get`'s selector, which are a separate 1-based-indexing rule.
+const WRITTEN_SIZE_ARGS: &[(&str, &str, usize, &str)] = &[
+    ("array", "size", 1, "§07 \"Array and table generation\""),
+    ("fill", "size", 1, "§07 \"Array and table generation\""),
+    ("zeros", "size", 0, "§07 \"Array and table generation\""),
+    ("ones", "size", 0, "§07 \"Array and table generation\""),
+    ("eye", "n", 0, "§07 \"Array and table generation\""),
+    ("onehot", "n", 1, "§07 \"Array and table generation\""),
+    ("linspace", "n", 2, "§07 \"Array and table generation\""),
+    ("extlinspace", "n", 2, "§07 \"Array and table generation\""),
+    ("tile", "size", 1, "§07 \"Array and table operations\""),
+    (
+        "splitblocks",
+        "blocksize",
+        1,
+        "§07 \"Array and table operations\"",
+    ),
+    ("partition", "spec", 1, "§07 \"Array and table operations\""),
+    ("bandedmat", "rows", 1, "§07 \"Array and table operations\""),
+    ("cartpow", "size", 1, "§03 \"Cartesian power\""),
+    ("stdsimplex", "n", 0, "§03 \"Standard simplex\""),
+    ("iid", "size", 1, "§06 `iid`"),
+    ("markovchain", "n", 2, "§06 `markovchain`"),
+    ("LKJ", "n", 0, "§08 `LKJ`"),
+    ("LKJCholesky", "n", 0, "§08 `LKJCholesky`"),
+];
+
+/// Refuse a non-positive size written in source (see [`WRITTEN_SIZE_ARGS`]).
+///
+/// Only the WRITTEN spelling is read — an integer literal, a negated one, or a
+/// literal inside a written size vector. A size computed from data is derived
+/// and stays legal: it may resolve to 0, and the ruling's sub-ruling 3 keeps
+/// that so whether or not the const-eval table can fold it, "legality must not
+/// depend on optimizer strength".
+fn written_size_check(
+    inf: &mut Inferencer<'_, '_>,
+    name: &str,
+    args: &[ArgInfo],
+    named: &[NamedInfo],
+) -> Option<Type> {
+    let (_, param, pos, section) = WRITTEN_SIZE_ARGS.iter().find(|(op, ..)| *op == name)?;
+    let size_node = named
+        .iter()
+        .find(|(n, ..)| inf.module.resolve(*n) == *param)
+        .map(|(_, n, _, _)| *n)
+        .or_else(|| args.get(*pos).map(|(n, _, _)| *n))?;
+    // A written size vector contributes one axis per element; a scalar size is
+    // the single axis. Either way the elements are read as written.
+    let axes: Vec<NodeId> = match inf.module.node(size_node).clone() {
+        Node::Call(c) if matches!(c.head, CallHead::Builtin(op) if inf.module.resolve(op) == "vector") => {
+            c.args.to_vec()
+        }
+        _ => vec![size_node],
+    };
+    let multi = axes.len() > 1;
+    let mut refused = false;
+    for (i, axis) in axes.iter().enumerate() {
+        let Some(n) = written_int(inf, *axis) else {
+            continue;
+        };
+        if n > 0 {
+            continue;
+        }
+        let which = if multi {
+            format!("axis {} of `{name}`'s `{param}`", i + 1)
+        } else {
+            format!("`{name}`'s `{param}`")
+        };
+        inf.diags.push(crate::Diagnostic::error_at(
+            *axis,
+            format!(
+                "{which} is written as `{n}`, but spec {section} requires a \
+                 positive size. A size computed from data may resolve to 0 — \
+                 giving an empty array, or the empty product measure — but a \
+                 size written in source may not."
+            ),
+        ));
+        refused = true;
+    }
+    refused.then(|| Type::Failed(format!("{name}: non-positive written size").into()))
+}
+
+/// The value of an integer size WRITTEN at this node: a literal, or `neg` over
+/// one (how the lexer spells `-3`). Anything else is not a written size.
+fn written_int(inf: &Inferencer<'_, '_>, node: NodeId) -> Option<i64> {
+    match inf.module.node(node) {
+        Node::Lit(Scalar::Int(n)) => Some(*n),
+        Node::Call(c) => {
+            let CallHead::Builtin(op) = c.head else {
+                return None;
+            };
+            if inf.module.resolve(op) != "neg" {
+                return None;
+            }
+            let inner = *c.args.first()?;
+            match inf.module.node(inner) {
+                Node::Lit(Scalar::Int(n)) => n.checked_neg(),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 fn arity_check(
