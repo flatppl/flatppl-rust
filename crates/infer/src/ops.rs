@@ -3163,6 +3163,22 @@ fn iid_type(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> Type {
         return Type::Deferred;
     };
     let shape = count_dims(inf, *count_node);
+    // spec §06 iid: a scalar size derived to 0 is an error over a
+    // record-valued M — "a table has no zero-row form" — unlike the empty
+    // product measure a scalar-valued M gets. §06 already requires a
+    // positive WRITTEN size, so a `Dim::Static(0)` here only ever comes from
+    // a DERIVED size the const-eval table resolved (`resolve_dim`/
+    // `count_dims`, engine-concepts §17.1); a size still open at analysis
+    // time stays `%dynamic` and is untouched by this check.
+    if let (Type::Record(_), [Dim::Static(0)]) = (&domain, shape.as_ref()) {
+        inf.diags.push(crate::Diagnostic::error_at(
+            *count_node,
+            "`iid`'s size resolves to 0 over a record-valued measure (spec \
+             §06 iid): a table has no zero-row form"
+                .to_string(),
+        ));
+        return Type::Failed("iid: derived size 0 over a record-valued measure".into());
+    }
     let result_domain = match (&domain, shape.as_ref()) {
         (Type::Record(fields), [nrows]) => Type::Table {
             columns: fields.clone(),

@@ -2049,3 +2049,26 @@ fn scalar_iid_over_a_record_measure_with_a_dynamic_count_still_tables() {
         "a dynamic scalar count must still type a %table with a %dynamic row count:\n{out}"
     );
 }
+
+/// A scalar count DERIVED to 0 over a record-valued measure is an error, not
+/// a `(%table … (%nrows 0))` — a table has no zero-row form (spec §06 iid,
+/// PR #83 amendment a131108). §06 already requires a positive WRITTEN size,
+/// so a `Dim::Static(0)` here only ever comes from a derived size the
+/// const-eval table resolved (here `lengthof(zeros(0))`), the analysis-time
+/// counterpart of a size that resolves to 0 at data-load time.
+#[test]
+fn scalar_iid_over_a_record_measure_with_a_derived_zero_count_is_refused() {
+    let src = "n = lengthof(zeros(0))\n\
+               M = joint(a = Normal(mu = 0.0, sigma = 1.0), b = Beta(alpha = 1.0, beta = 1.0))\n\
+               q = iid(M, n)";
+    assert!(
+        rejects(src, "§06 iid"),
+        "a derived-zero record-iid size must be refused citing spec §06 iid: {:?}",
+        diags_of(src)
+    );
+    let out = ir(src);
+    assert!(
+        !out.contains("%nrows 0"),
+        "must not type a zero-row table:\n{out}"
+    );
+}
