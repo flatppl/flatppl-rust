@@ -486,6 +486,15 @@ fn unbatch_field_id(e: &Emitter, p: &Params, name: &str) -> Result<NodeId, EmitE
 /// carries the variate's shape (see [`uniform_logpdf`]), so nothing in the
 /// builder is shape-specific once the batch record's size-1 `support` wrapper is
 /// stripped by [`unbatch_field_id`].
+///
+/// The two §09 entries qualify for the same reason as the §08 arithmetic ones.
+/// [`argus_logpdf`] is add/sub/mul/div/log/exp/sqrt/pow/erf only.
+/// [`crystal_ball_logpdf`] adds a `compare`/`select` pair for its piecewise
+/// branch, which broadcasts exactly like `Uniform`'s support mask — the
+/// condition carries the variate's shape, so both branches and the selection are
+/// rank-agnostic. This is what lets an `iid(hep.CrystalBall(…), n)` — which the
+/// determiniser lowers to the axis-native dotted density, NOT an unroll — reach
+/// StableHLO at all; without these two it refused as "not rank-agnostic".
 pub(crate) fn is_batch_safe(ctor: &str) -> bool {
     matches!(
         ctor,
@@ -511,6 +520,9 @@ pub(crate) fn is_batch_safe(ctor: &str) -> bool {
             | "NegativeBinomial"
             | "Dirac"
             | "Uniform"
+            // §09 particle-physics.
+            | "CrystalBall"
+            | "Argus"
     )
 }
 
@@ -2062,7 +2074,12 @@ fn crystal_ball_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, 
 /// (`slope > 0`) or `M`'s expression a removable `0/0` (`slope = 0`); both emit
 /// `NaN` rather than a wrong finite number.
 fn argus_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
-    let power_id = p.field_id(e, "power")?;
+    // `unbatch_field_id`, not `field_id`: this is the one STRUCTURAL read in an
+    // otherwise arithmetic builder, so it is the one that notices the size-1
+    // `vector` wrapper a batched kernel input puts around a per-batch-constant
+    // parameter. Without the strip, `iid(hep.Argus(…), n)` refused as a
+    // non-literal `power` even when the literal was 0.5.
+    let power_id = unbatch_field_id(e, p, "power")?;
     let power = match e.node(power_id) {
         Node::Lit(Scalar::Real(x)) if *x == 0.5 => 0.5,
         Node::Lit(Scalar::Int(_)) | Node::Lit(Scalar::Real(_)) => {

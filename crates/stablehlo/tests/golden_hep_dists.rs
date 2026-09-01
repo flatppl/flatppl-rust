@@ -109,6 +109,73 @@ outputs = lp";
     );
 }
 
+// An `iid` over a §09 member is the BATCHED (dotted) density, not an unroll: the
+// determiniser emits one `builtin_logdensityof.(D, broadcast(record, …), vec)`
+// under a `sum`. Both builders are rank-agnostic, so they are listed in
+// `is_batch_safe`; without that this refused as "not rank-agnostic".
+//
+// Executed, not merely pinned. Under the suite's Enzyme-JAX executor:
+//
+//   iid(CrystalBall(5.279, 0.003, 1.5, 3.0), 5) at [5.270, 5.276, 5.279, 5.281, 5.285]
+//     -> 18.620861053466797   vs the §09 closed form 18.62083959717085   (1.15e-6 rel)
+//   iid(Argus(5.29, -20.0, 0.5), 5)             at [4.80, 5.00, 5.10, 5.20, 5.25]
+//     -> 2.836592674255371    vs the §09 closed form 2.8365942512560958  (5.56e-7 rel)
+//
+// both the f32 band. The CrystalBall oracle equals
+// `scipy.stats.crystalball.logpdf(...).sum()` exactly.
+#[test]
+fn iid_over_a_hep_member_emits_a_batched_density() {
+    for (ctor, args) in [
+        (
+            "CrystalBall",
+            "m0 = 5.279, sigma = 0.003, alpha = 1.5, n = 3.0",
+        ),
+        ("Argus", "resonance = 5.29, slope = -20.0, power = 0.5"),
+    ] {
+        let src = format!(
+            "hep = standard_module(\"particle-physics\", \"0.1\")\n\
+             obs = [5.1, 5.15, 5.2, 5.22, 5.25]\n\
+             x = elementof(reals)\n\
+             lp = logdensityof(lawof(iid(hep.{ctor}({args}), 5)), obs)\n\
+             inputs = (x)\n\
+             outputs = lp"
+        );
+        let mlir = emit(&src);
+        assert!(
+            mlir.contains("stablehlo.reduce"),
+            "the batched density reduces over the axis rather than unrolling:\n{mlir}"
+        );
+        // One density expression, not one per observation: the batched path is
+        // what makes an n-observation iid independent of n in emitted size.
+        assert!(
+            mlir.matches("chlo.erf").count() <= 2,
+            "{ctor} must emit its normalizer once, not once per element:\n{mlir}"
+        );
+    }
+}
+
+// The batched kernel input wraps each per-batch-constant parameter in a size-1
+// `vector`. `argus_logpdf` reads `power` STRUCTURALLY (its normalizer has a
+// closed form only at 0.5), so it is the one §09 builder that notices, and it
+// strips the wrapper via `unbatch_field_id`. Without the strip, a batched Argus
+// refused as a non-literal `power` even when the literal was 0.5.
+#[test]
+fn batched_argus_still_reads_its_literal_power() {
+    let src = "\
+hep = standard_module(\"particle-physics\", \"0.1\")
+obs = [5.1, 5.15, 5.2]
+x = elementof(reals)
+lp = logdensityof(lawof(iid(hep.Argus(resonance = 5.29, slope = -20.0, power = 1.5), 3)), obs)
+inputs = (x)
+outputs = lp";
+    let msg = emit_err(src);
+    assert!(
+        msg.contains("lower incomplete gamma"),
+        "a batched non-0.5 power must reach the SAME refusal as the scalar case, \
+         not a spurious non-literal one: {msg}"
+    );
+}
+
 // Refuse-don't-mislower: at any other `power` the normalizer is a genuine lower
 // incomplete gamma, for which there is no lowering here. The refusal names the
 // missing function rather than guessing a normalizer.
