@@ -92,6 +92,43 @@ pub(crate) struct ResolvedRef<'a> {
     pub path: String,
 }
 
+/// The `(module-name, member-name)` of a `(%ref <alias> member)` whose `<alias>`
+/// host binding is a `standard_module("name", "version")` call (spec §09), rather
+/// than the `load_module` of §04 *Multi-file models*.
+///
+/// A §09 member is a CATALOGUE entry, not a submodule binding: there is no
+/// subtree in the `ModuleBundle` to graft, so every graft path must decline such
+/// a ref and leave it to the constructor lowering
+/// ([`crate::density::split_kernel_constructor`]), which emits the BARE member
+/// name as the kernel tag — the same tag `lower_broadcast_kernel` already emits
+/// for a module-qualified broadcast head.
+///
+/// The requested `version` is NOT re-checked here: inference already rejects a
+/// version the catalogue does not provide ("standard module `X` has unknown
+/// version `V`"), and the CLI refuses to determinize a module with inference
+/// errors, so a ref reaching the determiniser has a matching name and version.
+pub(crate) fn std_module_member(host: &Module, id: NodeId) -> Option<(String, String)> {
+    let Node::Ref(Ref {
+        ns: RefNs::Module(alias),
+        name: member,
+    }) = *host.node(id)
+    else {
+        return None;
+    };
+    let bid = host.binding_by_name(alias)?;
+    let Node::Call(c) = host.node(host.binding(bid).rhs) else {
+        return None;
+    };
+    let CallHead::Builtin(sym) = c.head else {
+        return None;
+    };
+    if host.resolve(sym) != "standard_module" {
+        return None;
+    }
+    let name = string_literal(host, *c.args.first()?)?;
+    Some((name, host.resolve(member).to_string()))
+}
+
 /// For a `Node::Ref { ns: RefNs::Module(alias), name: member }` at `id` in
 /// `host`, follow `alias` → its `load_module("path", …)` binding → `path` →
 /// `bundle.get(path)` → the submodule's `member` binding, and return the

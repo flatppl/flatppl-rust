@@ -644,6 +644,15 @@ pub(crate) fn graft_kernel_application_callee(
              refuse rather than mislower a dangling reference",
         ));
     }
+    // A §09 STANDARD-module member application (`hep.CrystalBall(m0 = …, …)`) has
+    // no submodule subtree in the bundle to graft: the member is a catalogue
+    // entry. Decline, so the call reaches `split_kernel_constructor` as a
+    // primitive constructor whose tag is the bare member name.
+    if crate::crossmodule::std_module_member(m, callee).is_some()
+        || crate::crossmodule::std_module_member(m, callee_resolved).is_some()
+    {
+        return Ok(None);
+    }
     // Graft the cross-module callee into the host. `graft_cross_module_target`
     // returns `None` only for a same-module ref (excluded by the guard above), so
     // treat that defensively as "nothing to graft".
@@ -7338,17 +7347,45 @@ fn is_scalar_domain_kernel(m: &Module, measure_node: NodeId) -> bool {
 /// `builtin_logdensityof` / `builtin_sample` require (a `record` takes named
 /// fields, §04).
 ///
+/// A §09 standard-module member call (`hep.CrystalBall(m0 = …, …)`) is accepted
+/// too, with the BARE member name as the constructor symbol — see
+/// [`std_module_ctor_sym`].
+///
 /// `None` (⇒ the caller refuses, per refuse-don't-mislower) if `node` is not a
-/// `Call`, not builtin-headed, has a non-kwarg named arg, or — when positional
-/// args are present — the head is not a known distribution constructor, carries
-/// more positional args than the constructor has parameters, or binds a
-/// parameter both positionally and by keyword (a §04 double-bind).
+/// `Call`, is neither builtin-headed nor a §09 distribution member call, has a
+/// non-kwarg named arg, or — when positional args are present — the head is not a
+/// known distribution constructor, carries more positional args than the
+/// constructor has parameters, or binds a parameter both positionally and by
+/// keyword (a §04 double-bind).
 ///
 /// Shared by [`build_density_term`] (the density-side kernel/kernel_input build)
 /// and the sample-side leaf (`sample::split_constructor`) — both need exactly
 /// this constructor-symbol-plus-arguments read before building their respective
 /// `builtin_*` call. Needs `&mut` only to intern parameter-name symbols for the
 /// positional mapping; the keyword-only fast path is non-mutating.
+/// The bare constructor symbol of a §09 standard-module DISTRIBUTION member
+/// reached as a call callee: `hep.CrystalBall` → `CrystalBall`. One `(%ref self …)`
+/// hop is followed, so `sig = hep.CrystalBall; sig(m0 = …)` resolves too.
+///
+/// `None` for anything else — a `load_module` member (which grafts instead), a
+/// local callee, or a §09 member whose catalogue row is a *function* rather than a
+/// distribution. §09 "Standard modules" gives no unqualified spelling for a
+/// member, so the bare name cannot collide with a base §08 constructor: the
+/// catalogue keeps the two namespaces disjoint (`Catalogue::is_module_member`).
+fn std_module_ctor_sym(m: &Module, callee: NodeId) -> Option<Symbol> {
+    let ref_id = if crate::crossmodule::std_module_member(m, callee).is_some() {
+        callee
+    } else {
+        let hop = resolve_ref_one(m, callee).0;
+        crate::crossmodule::std_module_member(m, hop).map(|_| hop)?
+    };
+    let Node::Ref(Ref { name: member, .. }) = *m.node(ref_id) else {
+        return None;
+    };
+    flatppl_infer::distribution_param_names(m.resolve(member))?;
+    Some(member)
+}
+
 pub(crate) fn split_kernel_constructor(
     m: &mut Module,
     node: NodeId,
@@ -7356,8 +7393,15 @@ pub(crate) fn split_kernel_constructor(
     let Node::Call(c) = m.node(node) else {
         return None;
     };
-    let CallHead::Builtin(sym) = c.head else {
-        return None;
+    let sym = match c.head {
+        CallHead::Builtin(sym) => sym,
+        // A §09 standard-module member call (`hep.CrystalBall(m0 = …, …)`) parses
+        // as a USER-headed call whose callee is a `(%ref <alias> member)`. Its tag
+        // is the BARE member name — the same tag `lower_broadcast_kernel` emits for
+        // a module-qualified broadcast head, and the one the engine registry keys.
+        // Gated on the member being a §09 DISTRIBUTION row: a module *function*
+        // member is not a constructor and must not become a density term.
+        CallHead::User(callee) => std_module_ctor_sym(m, callee)?,
     };
     // Snapshot positional args and keyword args (NodeId/Symbol are Copy) so the
     // `&Call` borrow ends before interning parameter names below needs `&mut`.
