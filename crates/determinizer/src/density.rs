@@ -1986,9 +1986,12 @@ fn lower_measure_density_at(
             "ksuperpose is a kernel until it is applied to a parameter family \
              (spec §06): an unapplied `ksuperpose(K, w)` has no density",
         )),
-        Some("markovchain")
-        | Some("kscan")
-        | Some("bayesupdate")
+        // `markovchain` / `kscan` trajectories: the product of the step
+        // conditionals from `init`, statically unrolled (§06 "Dependent
+        // composition"; see [`crate::chain`]).
+        Some("markovchain") => crate::chain::lower_markovchain(m, measure_node, v),
+        Some("kscan") => crate::chain::lower_kscan(m, measure_node, v),
+        Some("bayesupdate")
         | Some("disintegrate")
         | Some("restrict")
         | Some("likelihoodof")
@@ -5843,6 +5846,34 @@ fn select_projection_fields(
 /// Shared with `sample::lower_draw`'s `iid(K, n)` sample fan-out, which needs
 /// the identical static-length read before batching a `builtin_sample` over
 /// `n` — see that call site for why it reuses this rather than re-deriving it.
+/// The statically-known trajectory length of a `markovchain` / `kscan` node,
+/// read from its own inferred domain shape. `flatppl_infer`'s
+/// `trajectory_measure` types the node as `Measure{Array{[len], init-type}}`,
+/// folding `markovchain`'s `n` at `Level::Shape` and taking `kscan`'s from
+/// `xs`'s leading dim — so a named or computed length resolves as readily as a
+/// literal.
+///
+/// `None` for a dynamic length and for a RECORD-state chain, whose trajectory
+/// is a table (§06 `markovchain`: "If `init` and `traj[i]` are records, then the
+/// trajectories are tables, not arrays") and which inference leaves with a
+/// deferred domain. Both refuse in [`crate::chain`] rather than unroll on a
+/// guess.
+pub(crate) fn trajectory_static_len(m: &Module, chain_node: NodeId) -> Option<usize> {
+    let Some(Type::Measure { domain, .. }) = m.type_of(chain_node) else {
+        return None;
+    };
+    let Type::Array { shape, .. } = domain.as_ref() else {
+        return None;
+    };
+    if shape.len() != 1 {
+        return None;
+    }
+    match shape[0] {
+        Dim::Static(n) => Some(n as usize),
+        Dim::Dynamic => None,
+    }
+}
+
 pub(crate) fn iid_static_size(m: &Module, iid_node: NodeId) -> Option<usize> {
     let Some(Type::Measure { domain, .. }) = m.type_of(iid_node) else {
         return None;

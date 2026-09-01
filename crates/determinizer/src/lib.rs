@@ -2,6 +2,7 @@
 //! the measure layer, leaving deterministic ops + the six `builtin_*` primitives.
 //! Type-level transform — flatppl-rust does not evaluate densities.
 mod canon;
+mod chain;
 mod conformance;
 mod crossmodule;
 mod density;

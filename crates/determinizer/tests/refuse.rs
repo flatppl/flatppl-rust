@@ -214,28 +214,65 @@ lp = logdensityof(d, 0.5)";
     );
 }
 
-// `markovchain` is an unsupported measure-algebra combinator in this MVP — it
-// requires a Markov kernel and stationary-distribution reasoning that goes well
-// beyond density disintegration. The determiniser must refuse naming the
-// construct, never emit a partial lowering.
+// §06 `markovchain` takes THREE arguments (`kernel`, `init`, `n`) — it is not a
+// `jointchain`-style variadic. A two-argument spelling is malformed, so the
+// determiniser refuses on the arity rather than guess which argument is missing.
+// (This case previously pinned the blanket "deferred to a later task" refusal
+// that covered every `markovchain`; the trajectory lowering now handles the
+// well-formed shape, so what is left to pin here is the arity gate.)
 #[test]
-fn unsupported_algebra_op_markovchain_refuses() {
-    // markovchain(M, K) — we use the same kernel setup as the kchain test;
-    // markovchain is a different op (stationary distribution of the chain).
+fn markovchain_two_argument_spelling_refuses() {
     let src = "\
 z = draw(Normal(mu = 0.0, sigma = 1.0))
 k = kernelof(record(z = draw(Normal(mu = z, sigma = 0.1))), z = z)
 mc = markovchain(lawof(record(z = z)), k)
 lp = logdensityof(mc, record(z = 1.0))";
     let m = parse_infer(src);
-    let err = determinize(&m).expect_err("markovchain must refuse, not lower");
+    let err = determinize(&m).expect_err("a 2-arg markovchain must refuse, not lower");
     assert!(
         err.construct.contains("markovchain"),
         "refusal names markovchain: {err:?}"
     );
     assert!(
-        err.reason.contains("not implemented") && err.reason.contains("deferred"),
-        "refusal reason explains markovchain density lowering is deferred: {err:?}"
+        err.reason.contains("3 positional args"),
+        "refusal names the §06 arity: {err:?}"
+    );
+}
+
+// A DYNAMIC trajectory length has no static step count, and FlatPDL has no loop
+// or scan primitive to carry one at runtime — so the unroll refuses rather than
+// pick a length. `n` here comes from a `load_data` table whose row count is
+// declared but whose contents are not, so `lengthof` does not fold to a literal.
+#[test]
+fn kscan_dynamic_length_refuses() {
+    let src = "\
+xs = elementof(cartpow(reals, 4))
+f = (s, x) -> Normal(s + x, 1.0)
+t = draw(kscan(f, 0.0, xs))
+lp = logdensityof(lawof(t), [0.1, 0.2, 0.3, 0.4])";
+    let m = parse_infer(src);
+    // `cartpow(reals, 4)` IS static, so this must LOWER — the guard below is the
+    // real dynamic case; keep both so the static/dynamic split is pinned here.
+    assert!(
+        determinize(&m).is_ok(),
+        "a statically-sized kscan over an exogenous input vector lowers"
+    );
+
+    let dynamic = "\
+n_rows = elementof(posintegers)
+xs = elementof(cartpow(reals, n_rows))
+f = (s, x) -> Normal(s + x, 1.0)
+t = draw(kscan(f, 0.0, xs))
+lp = logdensityof(lawof(t), [0.1, 0.2, 0.3, 0.4])";
+    let dm = parse_infer(dynamic);
+    let err = determinize(&dm).expect_err("a dynamic-length kscan must refuse");
+    assert!(
+        err.construct.contains("kscan"),
+        "refusal names kscan: {err:?}"
+    );
+    assert!(
+        err.reason.contains("statically-resolved") && err.reason.contains("no loop"),
+        "refusal names the static-length limit and the missing FlatPDL loop: {err:?}"
     );
 }
 
