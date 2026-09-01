@@ -4274,14 +4274,14 @@ inputs = (mu, kappa)
 outputs = (lp)
 ";
 
-/// §08 Uniform, verbatim: `-log(lambda(S))`, a compile-time constant once
-/// `S = interval(-1.0, 3.0)`'s length (`4.0`) is known — `a` has no free
-/// parameters at all, so `func.func @logdensity` takes NO args (a distinct
-/// shape from every other Task 8/9/10 fixture, all of which have at least
-/// one `elementof`-declared parameter). Exactly two `stablehlo.constant`s:
-/// the pinned observation (`registry::lower_logdensityof` always lowers `v`
-/// up front, even though [`registry::uniform_logpdf`] itself never reads
-/// it — see its doc comment) and the folded `-log(4.0)` — no other op.
+/// §08 Uniform, verbatim: `-log(lambda(S))` inside `S`, `-inf` outside it
+/// (§08's shared "outside the support the density is zero"). The density itself
+/// is a compile-time constant once `S = interval(-1.0, 3.0)`'s length (`4.0`) is
+/// known; the support mask is what makes the module more than that one constant,
+/// and `a` has no free parameters at all, so `func.func @logdensity` takes NO
+/// args (a distinct shape from every other Task 8/9/10 fixture, all of which
+/// have at least one `elementof`-declared parameter). §03 "Interval" makes
+/// `interval(lo, hi)` CLOSED, hence `GE`/`LE`.
 #[test]
 fn emit_logdensity_uniform_has_expected_structure() {
     let d = determinize_src(UNIFORM_DENSITY_SRC);
@@ -4300,15 +4300,21 @@ fn emit_logdensity_uniform_has_expected_structure() {
         out.contains("-> tensor<f32>"),
         "must return tensor<f32> in:\n{out}"
     );
-    assert_eq!(
-        out.matches("stablehlo.constant").count(),
-        2,
-        "expected exactly two constants (the pinned observation, and the folded -log(4.0)), in:\n{out}"
-    );
     assert!(
         out.contains("dense<-1.3862943611198906>"),
         "expected the folded -log(4.0) literal, in:\n{out}"
     );
+    for op in [
+        "compare GE",
+        "compare LE",
+        "stablehlo.and",
+        "stablehlo.select",
+    ] {
+        assert!(
+            out.contains(op),
+            "expected the closed-interval support mask to emit `{op}`, in:\n{out}"
+        );
+    }
     assert!(is_delimiter_balanced(&out));
 }
 
@@ -4326,7 +4332,7 @@ fn emit_logdensity_uniform_matches_frozen_golden() {
 }
 
 /// `Uniform(support = reals)` — an unbounded set, infinite Lebesgue
-/// measure — must refuse with the exact message `registry::lebesgue_measure`
+/// measure — must refuse with the exact message `registry::uniform_bounds`
 /// promises, rather than lowering a nonsensical `-log(inf)`.
 #[test]
 fn uniform_logpdf_refuses_unbounded_support() {

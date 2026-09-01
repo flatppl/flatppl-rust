@@ -224,13 +224,18 @@ fn a_singular_family_argument_emits_against_the_component_axis() {
 /// batched over the family axis. The existing `is_batch_safe` gate refuses it —
 /// refuse-don't-mislower — so the mixture inherits exactly the same restriction
 /// `iid` and value-`broadcast` already have.
+///
+/// `NegativeBinomial2` is the component: its builder uses `get0`/`reshape`, and
+/// it carries no dedicated batched builder either. This test used to use
+/// `Uniform`, which became batch-safe once its density gained §08's support mask
+/// (the mask carries the variate's shape).
 #[test]
 fn a_non_batch_safe_component_refuses_at_the_existing_gate() {
     let mut m = flatppl_syntax::parse(
         "flatppl_compat = \"0.1\"\n\
          w = [0.3, 1.2]\n\
-         mix = ksuperpose(Uniform, w)(support = interval(0.0, 1.0))\n\
-         lp = logdensityof(mix, 0.5)\n\
+         mix = ksuperpose(NegativeBinomial2, w)(mu = [1.0, 2.0], psi = 2.0)\n\
+         lp = logdensityof(mix, 3)\n\
          outputs = (lp)\n",
     )
     .unwrap();

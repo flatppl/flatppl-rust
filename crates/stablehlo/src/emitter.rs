@@ -3053,32 +3053,11 @@ impl<'m> Emitter<'m> {
             // Batched density: `Params::field_id` reads the batched
             // `broadcast(record, %kwarg…)` kernel input; a rank-agnostic logpdf
             // builder auto-broadcasts over the rank-1 variate → a rank-1
-            // log-density vec. GUARD: only a rank-agnostic (pure-arithmetic
-            // univariate) distribution is sound here — a structural builder
-            // (matrix/gather/reduce/`support`) would drive the batched inputs to
-            // shape-inconsistent StableHLO. Refuse a non-batch-safe dist rather
-            // than mislower (refuse-don't-mislower). See `registry::is_batch_safe`.
-            let dist = rest.first().and_then(|&d| match self.m.node(d) {
-                Node::Const(sym) => Some(self.m.resolve(*sym).to_string()),
-                _ => None,
-            });
-            match dist {
-                Some(d) if crate::registry::is_batch_safe(&d) => {
-                    crate::registry::lower_logdensityof(self, id, rest)
-                }
-                Some(d) => Err(EmitError::at(
-                    id,
-                    format!(
-                        "broadcast over builtin_logdensityof of '{d}' is unsupported: \
-                         its density builder is not rank-agnostic (batched density is \
-                         sound only for univariate pure-arithmetic distributions)"
-                    ),
-                )),
-                None => Err(EmitError::at(
-                    id,
-                    "broadcast(builtin_logdensityof, …): distribution must be a bare constructor",
-                )),
-            }
+            // log-density vec, and a dist whose builder is not rank-agnostic
+            // needs a dedicated batched one. Which of the two (or a refusal) is
+            // `registry::lower_logdensityof_batched`'s call: the guard belongs
+            // with the distribution knowledge, not here.
+            crate::registry::lower_logdensityof_batched(self, id, rest)
         } else if let Some((section, domain)) = crate::ops::collection_domain_head(&fname) {
             // A §07 collection-domain head under a broadcast. `lower_builtin` would
             // lower it as the head's WHOLE-ARRAY form, silently discarding the

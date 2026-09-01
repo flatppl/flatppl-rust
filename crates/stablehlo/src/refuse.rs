@@ -427,13 +427,16 @@
 //!   differ only in the kind they widen to (`Int` here, `Real` on the aggregate
 //!   path, whose body types `%deferred`); see `reduce_trailing_axes`'s note.
 //!
-//! **`emitter.rs`** (`Emitter::lower_broadcast`, the batched-density head):
-//! - `broadcast(builtin_logdensityof, K, …)` whose `K` is not
-//!   [`crate::registry::is_batch_safe`] — "broadcast over builtin_logdensityof
+//! **`registry.rs`** (`registry::lower_logdensityof_batched`, the batched-density
+//! head `Emitter::lower_broadcast` routes to):
+//! - `broadcast(builtin_logdensityof, K, …)` whose `K` is neither
+//!   [`crate::registry::is_batch_safe`] nor carries a dedicated batched builder
+//!   (`registry::batched_logpdf`) — "broadcast over builtin_logdensityof
 //!   of '...' is unsupported: its density builder is not rank-agnostic (batched
 //!   density is sound only for univariate pure-arithmetic distributions)". A
-//!   structural builder (matrix / gather / `support`) driven by batched inputs
-//!   would emit shape-inconsistent StableHLO, so the allow-list is default-deny.
+//!   structural builder (matrix / Cholesky / simplex reduction) driven by batched
+//!   inputs would emit shape-inconsistent StableHLO, so the allow-list is
+//!   default-deny.
 //!   This one gate covers every construct that reaches the batched-density path:
 //!   an `iid` fan-out, a value `broadcast`, and §06's `ksuperpose` mixture, all
 //!   of which the determiniser lowers through the same
@@ -640,8 +643,18 @@
 //!   batch (`Bernoulli`/`Poisson`/…/`Multinomial`) and the matrix batch
 //!   (`Wishart`/`InverseWishart`/`LKJ`/`LKJCholesky`) keep the arm reachable.
 //! - `Uniform`'s `support` parameter has no closed-form measurable
-//!   interval/box `ValueSet` (`registry::lebesgue_measure` returns `None`) —
+//!   interval/box `ValueSet` (`registry::uniform_bounds` returns `None`) —
 //!   "Uniform logpdf needs a measurable interval/box support" (Task 10).
+//! - a BATCHED `Categorical`/`Categorical0` (`iid(Categorical(p), n)`) whose
+//!   observed categories are not a literal integer vector — "Categorical/
+//!   Categorical0 batched logdensity: the observed categories must be a literal
+//!   integer vector (a dynamic gather cannot be range-checked)". The lowering is
+//!   one `stablehlo.gather` into `log(p)`, and gather CLAMPS an out-of-range
+//!   index rather than failing, so only a static index vector can be checked
+//!   against `p`'s length first (`registry::literal_variate_indices`). Two
+//!   further arms guard the shapes the check needs: a `p` that is not rank-1,
+//!   and an index outside `1..len` (`0..len` for `Categorical0`) — the batched
+//!   mirror of `registry::slice_indexed_prob`'s single-index checks.
 //! - `MvNormal`'s `mu` has no statically-known vector length — "MvNormal
 //!   logdensity needs a statically-known vector length for 'mu'" (Task 12).
 //! - `MvNormal`'s `cov` is not an `n`x`n` matrix matching `mu`'s length —

@@ -414,6 +414,35 @@ impl Params {
     }
 }
 
+/// The kernel-input field `name`, with the one-element `vector` wrapper a
+/// BATCHED kernel input puts around a per-batch-constant parameter stripped off.
+///
+/// The determiniser lowers `iid(D(args), n)` to
+/// `builtin_logdensityof.(D, broadcast(record, arg = [v]), variate_vec)` — §04
+/// broadcasting makes the size-1 field shared by every batch element, and it is
+/// the only shape a fan-out over ONE parameter node can produce. An arithmetic
+/// builder never notices, because a `tensor<1xf32>` auto-broadcasts against the
+/// batch. A builder that reads the field STRUCTURALLY does notice: `[S]` is not
+/// a set, and `[p]` is not a rank-1 probability vector. This unwraps exactly one
+/// such level, so the same builder serves both the scalar and the batched call.
+///
+/// A wrapper of length > 1 is a genuinely per-element parameter, which none of
+/// these builders can express, so it is left alone and refuses downstream on its
+/// own shape rather than being silently read as the first element.
+fn unbatch_field_id(e: &Emitter, p: &Params, name: &str) -> Result<NodeId, EmitError> {
+    let field = e.resolve_ref_one(p.field_id(e, name)?);
+    match e.node(field) {
+        Node::Call(c)
+            if matches!(c.head, CallHead::Builtin(s) if e.resolve(s) == "vector")
+                && c.args.len() == 1
+                && c.named.is_empty() =>
+        {
+            Ok(c.args[0])
+        }
+        _ => Ok(field),
+    }
+}
+
 /// `builtin_logdensityof(kernel, kernel_input, v)` (`density.rs`'s
 /// `build_density_term`): `kernel` is a bare `Const(ctor)` distribution
 /// constructor symbol, `kernel_input` its kwargs record, `v` the scored
@@ -426,13 +455,18 @@ impl Params {
 /// The gate for the broadcast-density path (`Emitter::lower_broadcast`): a
 /// dotted `builtin_logdensityof.(Dist, broadcast(record, …), vec)` is only sound
 /// for these dists. **Default-deny**: everything not listed — the structural
-/// builders (Categorical/Categorical0's literal-index gather; MvNormal /
-/// Wishart / InverseWishart / LKJ / LKJCholesky / Multinomial's matrix /
-/// Cholesky / static-vector ops; Dirichlet / Multinomial's simplex reductions;
-/// NegativeBinomial2's `get0`/`reshape`; Uniform's set-valued `support`) AND any
-/// FUTURE registry addition — refuses under broadcast rather than risk emitting
-/// shape-inconsistent StableHLO (refuse-don't-mislower). Enable a new dist here
-/// only after verifying its builder uses no shape-specific ops.
+/// builders (MvNormal / Wishart / InverseWishart / LKJ / LKJCholesky /
+/// Multinomial's matrix / Cholesky / static-vector ops; Dirichlet /
+/// Multinomial's simplex reductions; NegativeBinomial2's `get0`/`reshape`) AND
+/// any FUTURE registry addition — refuses under broadcast rather than risk
+/// emitting shape-inconsistent StableHLO (refuse-don't-mislower). Enable a new
+/// dist here only after verifying its builder uses no shape-specific ops, or
+/// give it a dedicated batched builder in [`batched_logpdf`] instead.
+///
+/// `Uniform` qualifies because its density is masked to its support: the mask
+/// carries the variate's shape (see [`uniform_logpdf`]), so nothing in the
+/// builder is shape-specific once the batch record's size-1 `support` wrapper is
+/// stripped by [`unbatch_field_id`].
 pub(crate) fn is_batch_safe(ctor: &str) -> bool {
     matches!(
         ctor,
@@ -457,7 +491,76 @@ pub(crate) fn is_batch_safe(ctor: &str) -> bool {
             | "Geometric"
             | "NegativeBinomial"
             | "Dirac"
+            | "Uniform"
     )
+}
+
+/// A distribution's dedicated BATCHED log-density builder, for the dists whose
+/// scalar builder is not rank-agnostic but whose batched form still has an exact
+/// lowering. The second half of the broadcast-density dispatch
+/// ([`lower_logdensityof_batched`]): [`is_batch_safe`] first, this next, then a
+/// refusal.
+///
+/// Kept a separate table rather than a `DistLowering` field because it is the
+/// exception: 21 of the registry's dists reuse one rank-agnostic builder for
+/// both shapes, and a per-entry `Option` would put a `None` on all of them.
+fn batched_logpdf(ctor: &str) -> Option<LogpdfBuilder> {
+    match ctor {
+        "Categorical" => Some(categorical_logpdf_batched),
+        "Categorical0" => Some(categorical0_logpdf_batched),
+        _ => None,
+    }
+}
+
+/// The broadcast-density entry point: `builtin_logdensityof.(Dist,
+/// broadcast(record, …), variate_vec)`, called by
+/// `Emitter::lower_broadcast`. Routes a rank-agnostic dist
+/// ([`is_batch_safe`]) to its ordinary builder, a dist with a dedicated batched
+/// builder ([`batched_logpdf`]) to that, and refuses anything else rather than
+/// drive a structural builder's shape-specific ops with batched inputs
+/// (refuse-don't-mislower).
+pub(crate) fn lower_logdensityof_batched(
+    e: &mut Emitter,
+    id: NodeId,
+    args: &[NodeId],
+) -> Result<Value, EmitError> {
+    let ctor = match args.first().map(|&d| e.node(d)) {
+        Some(Node::Const(sym)) => e.resolve(*sym).to_string(),
+        _ => {
+            return Err(EmitError::at(
+                id,
+                "broadcast(builtin_logdensityof, …): distribution must be a bare constructor",
+            ));
+        }
+    };
+    if is_batch_safe(&ctor) {
+        return lower_logdensityof(e, id, args);
+    }
+    let Some(builder) = batched_logpdf(&ctor) else {
+        return Err(EmitError::at(
+            id,
+            format!(
+                "broadcast over builtin_logdensityof of '{ctor}' is unsupported: \
+                 its density builder is not rank-agnostic (batched density is \
+                 sound only for univariate pure-arithmetic distributions)"
+            ),
+        ));
+    };
+    let [_, kernel_input, v] = <[NodeId; 3]>::try_from(args).map_err(|_| {
+        EmitError::at(
+            id,
+            format!(
+                "builtin_logdensityof: expected 3 arguments, got {}",
+                args.len()
+            ),
+        )
+    })?;
+    let params = Params {
+        kernel_input,
+        variate: Some(v),
+    };
+    let value = e.lower_node(v)?;
+    builder(e, &params, &value)
 }
 
 pub(crate) fn lower_logdensityof(
@@ -1394,10 +1497,10 @@ fn lognormal_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
 // (e.g. Best & Fisher) but is not part of Task 15's batch — it stays
 // `sample: None` for a later task.
 
-/// The Lebesgue measure `lambda(S)` of a value-set `S`, when `S` is a
-/// closed-form measurable interval: a plain `ValueSet::Interval(lo, hi)`
-/// with finite, correctly-ordered bounds (length `hi - lo`), or
-/// `ValueSet::UnitInterval` (length 1, `[0, 1]`). `None` for anything else —
+/// The `(lo, hi)` bounds of a value-set `S`, when `S` is a closed-form
+/// measurable interval: a plain `ValueSet::Interval(lo, hi)` with finite,
+/// correctly-ordered bounds, or `ValueSet::UnitInterval` (`[0, 1]`). Its
+/// Lebesgue measure `lambda(S)` is then `hi - lo`. `None` for anything else —
 /// `Unknown`/`Deferred` (the support's bounds are not static literals — spec
 /// §03's `ValueSet::Interval` only ever holds compile-time-constant bounds,
 /// never a parameter-dependent one), an unbounded set (`Reals`/`PosReals`/
@@ -1409,19 +1512,8 @@ fn lognormal_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
 /// — support is the only arg-dependent half), so a multi-dimensional support
 /// set could never actually bind a usable variate downstream; refusing it
 /// here rather than lowering a `-log(box-volume)` nobody could reach is the
-/// refuse-don't-mislower call. [`uniform_logpdf`] turns `None` into a
-/// precise refusal. A thin wrapper over [`uniform_bounds`] (`hi - lo`);
-/// [`uniform_sample`] needs the two bounds themselves, not just their
-/// difference, so it calls [`uniform_bounds`] directly instead.
-fn lebesgue_measure(vs: &ValueSet) -> Option<f64> {
-    uniform_bounds(vs).map(|(lo, hi)| hi - lo)
-}
-
-/// The `(lo, hi)` bounds of a value-set `S`, under the exact same
-/// closed-form-measurable-interval criteria as [`lebesgue_measure`] (whose
-/// doc comment this shares) — split out as its own function because
-/// [`uniform_sample`]'s affine transform `a + (b - a) * U` needs `lo`/`hi`
-/// individually, not merely their difference.
+/// refuse-don't-mislower call. [`uniform_logpdf`] and [`uniform_sample`] each
+/// turn `None` into a precise refusal.
 fn uniform_bounds(vs: &ValueSet) -> Option<(f64, f64)> {
     match vs {
         ValueSet::Interval(lo, hi) if lo.is_finite() && hi.is_finite() && hi > lo => {
@@ -1432,37 +1524,59 @@ fn uniform_bounds(vs: &ValueSet) -> Option<(f64, f64)> {
     }
 }
 
-/// §08 Uniform, verbatim: `log f = -log(lambda(S))`, `S` the `support`
-/// parameter. `v` is unused (see the batch doc comment above). `support`'s
-/// raw kernel-input [`NodeId`] — not its lowered [`Value`]: a set expression
-/// like `interval(lo, hi)` has no tensor form of its own, see
-/// `Emitter::valueset_of`'s doc comment — is read via [`Params::field_id`],
-/// then its statically-known [`ValueSet`] via [`Emitter::valueset_of`] and
-/// reduced to a length via [`lebesgue_measure`].
-fn uniform_logpdf(e: &mut Emitter, p: &Params, _v: &Value) -> Result<Value, EmitError> {
-    let support = p.field_id(e, "support")?;
-    let measure = e
+/// §08 Uniform, verbatim: `log f = -log(lambda(S))` inside `S`, `S` the
+/// `support` parameter, and §08's shared rule "outside the support the density
+/// is zero" — so `-inf` off `S`. `support`'s raw kernel-input [`NodeId`] — not
+/// its lowered [`Value`]: a set expression like `interval(lo, hi)` has no
+/// tensor form of its own, see `Emitter::valueset_of`'s doc comment — is read
+/// via [`unbatch_field_id`], then its statically-known [`ValueSet`] via
+/// [`Emitter::valueset_of`] and reduced to bounds via [`uniform_bounds`].
+///
+/// §03 "Interval" makes `interval(lo, hi)` the CLOSED $[lo, hi]$, hence the
+/// `GE`/`LE` guard rather than Beta's strict one: the constant density has no
+/// `log(x)` to `nan` at an endpoint, so there is no reason to exclude it.
+///
+/// The mask is what makes this builder RANK-AGNOSTIC, and therefore batchable:
+/// `in_support` carries the variate's shape and `Emitter::select` broadcasts
+/// the rank-0 density constant onto it, so a batched
+/// `iid(Uniform(S), n)` density is a rank-1 vector of `n` entries. Returning
+/// the bare constant made the caller's `sum` count one term instead of `n`.
+fn uniform_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
+    let support = unbatch_field_id(e, p, "support")?;
+    let (lo, hi) = e
         .valueset_of(support)
-        .and_then(lebesgue_measure)
+        .and_then(uniform_bounds)
         .ok_or_else(|| {
             EmitError::at(
                 support,
                 "Uniform logpdf needs a measurable interval/box support",
             )
         })?;
-    Ok(e.scalar(-measure.ln()))
+
+    let lo_c = e.scalar(lo);
+    let hi_c = e.scalar(hi);
+    let above = e.compare("GE", v, &lo_c);
+    let below = e.compare("LE", v, &hi_c);
+    let in_support = e.and(&above, &below);
+
+    // The [`mask_support`] tail, written out: this density is a CONSTANT, so
+    // there is no formula to feed a domain-safe variate to, and routing through
+    // that helper would emit a `select` onto a `safe` value nothing reads.
+    let dens = e.scalar(-(hi - lo).ln());
+    let pos_inf = e.inf(dens.ty.clone());
+    let neg_inf = e.neg(&pos_inf);
+    Ok(e.select(&in_support, &dens, &neg_inf))
 }
 
 /// §08 Uniform's sampling transform, verbatim: `a + (b - a) * U`, `U ~
 /// Uniform(0, 1)`, `[a, b]` the `support` interval — read exactly like
-/// [`uniform_logpdf`] reads it (via [`Params::field_id`] +
-/// [`Emitter::valueset_of`]), but through [`uniform_bounds`] rather than
-/// [`lebesgue_measure`] (this needs `a`/`b` individually, not just `b - a`).
-/// Drawn at `MlirTy::Scalar`, not any kwarg's own shape: `support` has no
-/// tensor form to read a shape from (same reason [`uniform_logpdf`] takes
-/// `_v` unused), and Uniform's FlatPDL domain is hardcoded to `scalar(real)`
-/// regardless of `support`'s own shape (see [`lebesgue_measure`]'s doc
-/// comment).
+/// [`uniform_logpdf`] reads it (via [`Emitter::valueset_of`] +
+/// [`uniform_bounds`]). Drawn at `MlirTy::Scalar`, not any kwarg's own shape:
+/// `support` has no tensor form to read a shape from, and Uniform's FlatPDL
+/// domain is hardcoded to `scalar(real)` regardless of `support`'s own shape
+/// (see [`uniform_bounds`]'s doc comment). This is the `@sample` path, which
+/// has no batched form, so it reads the field with [`Params::field_id`]
+/// directly rather than through [`unbatch_field_id`].
 fn uniform_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
     let support = p.field_id(e, "support")?;
     let (lo, hi) = e
@@ -2026,6 +2140,110 @@ fn categorical0_logpdf(e: &mut Emitter, p: &Params, _v: &Value) -> Result<Value,
     let k = literal_variate_index(e, p)?;
     let elem = slice_indexed_prob(e, variate, &probs, k)?;
     Ok(e.log(&elem))
+}
+
+/// The literal integer elements of a `vector(...)` variate — the batched
+/// counterpart of [`literal_variate_index`], with the same literal-only
+/// discipline and the same reason: an index is a *selector*, and only a static
+/// one can be range-checked against `p`'s length before it reaches
+/// `stablehlo.gather`, which CLAMPS an out-of-range index instead of failing.
+/// Reading a clamped index as the observed category would answer a different
+/// question, so a dynamic variate vector refuses here rather than lowering.
+fn literal_variate_indices(e: &Emitter, p: &Params) -> Result<Vec<i64>, EmitError> {
+    let id = e.resolve_ref_one(p.variate_id()?);
+    let refuse = || {
+        EmitError::at(
+            id,
+            "Categorical/Categorical0 batched logdensity: the observed categories must be a \
+             literal integer vector (a dynamic gather cannot be range-checked)",
+        )
+    };
+    let Node::Call(c) = e.node(id) else {
+        return Err(refuse());
+    };
+    if !matches!(c.head, CallHead::Builtin(s) if e.resolve(s) == "vector") || !c.named.is_empty() {
+        return Err(refuse());
+    }
+    c.args
+        .iter()
+        .map(|&a| match e.node(e.resolve_ref_one(a)) {
+            Node::Lit(Scalar::Int(i)) => Ok(*i),
+            _ => Err(refuse()),
+        })
+        .collect()
+}
+
+/// §08 Categorical/Categorical0 under a BATCH (`iid(Categorical(p), n)`):
+/// `log p_k` at every entry of the variate vector, in ONE
+/// `stablehlo.gather` into `log(p)` — the same lookup
+/// [`slice_indexed_prob`] performs one index at a time, vectorised, so the
+/// per-observation mass terms come back as the rank-1 vector the caller's `sum`
+/// reduces to the iid log-likelihood.
+///
+/// The scalar builders cannot serve this call: `p` arrives wrapped by the batch
+/// record ([`unbatch_field_id`]) and the variate is a vector rather than one
+/// integer, which is why `Categorical`/`Categorical0` stay out of
+/// [`is_batch_safe`] and route here instead.
+///
+/// `base` is 1 for `Categorical` (1-based `p_k`) and 0 for `Categorical0`,
+/// matching the two scalar builders' `k - 1` / `k` slice positions.
+fn categorical_batched(
+    e: &mut Emitter,
+    p: &Params,
+    base: i64,
+    idx: &Value,
+) -> Result<Value, EmitError> {
+    let probs_id = unbatch_field_id(e, p, "p")?;
+    let probs = e.lower_node(probs_id)?;
+    let len = match &probs.ty {
+        MlirTy::Ranked(dims) if dims.len() == 1 => dims[0],
+        other => {
+            return Err(EmitError::at(
+                probs_id,
+                format!(
+                    "Categorical/Categorical0 batched logdensity: 'p' must be a rank-1 tensor, \
+                     got {other:?}"
+                ),
+            ));
+        }
+    };
+
+    // Range-check every observed category against `p`'s static length, exactly
+    // as `slice_indexed_prob` does for a single index: `stablehlo.gather` clamps
+    // rather than refusing, so an unchecked out-of-range index would silently
+    // score the nearest category.
+    let variate = p.variate_id()?;
+    for k in literal_variate_indices(e, p)? {
+        let pos = k - base;
+        if pos < 0 || len.is_some_and(|n| pos as u64 >= n) {
+            return Err(EmitError::at(
+                variate,
+                "Categorical/Categorical0 batched logdensity: category index out of range",
+            ));
+        }
+    }
+
+    if !matches!(&idx.ty, MlirTy::Ranked(dims) if dims.len() == 1) || idx.elem != ElemKind::Int {
+        return Err(EmitError::at(
+            variate,
+            format!(
+                "Categorical/Categorical0 batched logdensity: the observed categories must \
+                 lower to a rank-1 integer tensor, got {:?} of {:?}",
+                idx.ty, idx.elem
+            ),
+        ));
+    }
+
+    let log_p = e.log(&probs);
+    Ok(e.gather(&log_p, idx, base))
+}
+
+fn categorical_logpdf_batched(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
+    categorical_batched(e, p, 1, v)
+}
+
+fn categorical0_logpdf_batched(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
+    categorical_batched(e, p, 0, v)
 }
 
 // ---- §08/§09 multivariate vector batch (Task 12) ----------------------------
@@ -3658,7 +3876,7 @@ fn multinomial_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
 
 #[cfg(test)]
 mod tests {
-    use super::is_batch_safe;
+    use super::{batched_logpdf, is_batch_safe};
 
     #[test]
     fn batch_safe_allows_univariate_arithmetic_dists() {
@@ -3675,6 +3893,9 @@ mod tests {
             "Geometric",
             "NegativeBinomial",
             "Dirac",
+            // Rank-agnostic because its density is masked to its support, and
+            // the mask carries the variate's shape.
+            "Uniform",
         ] {
             assert!(is_batch_safe(d), "{d} should be batch-safe");
         }
@@ -3682,10 +3903,10 @@ mod tests {
 
     #[test]
     fn batch_safe_denies_structural_multivariate_and_unknown_dists() {
-        // Gather/index (Categorical), matrix/Cholesky (MvNormal/Wishart/LKJ),
-        // simplex reductions (Dirichlet/Multinomial), get0/reshape
-        // (NegativeBinomial2), set-valued support (Uniform), and any future/
-        // unknown ctor are NOT rank-agnostic and must refuse under broadcast.
+        // Matrix/Cholesky (MvNormal/Wishart/LKJ), simplex reductions
+        // (Dirichlet/Multinomial), get0/reshape (NegativeBinomial2), gather/index
+        // (Categorical/Categorical0), and any future/unknown ctor are NOT
+        // rank-agnostic, so none may reuse its scalar builder under broadcast.
         for d in [
             "Categorical",
             "Categorical0",
@@ -3696,11 +3917,32 @@ mod tests {
             "InverseWishart",
             "LKJ",
             "LKJCholesky",
-            "Uniform",
             "NegativeBinomial2",
             "SomeFutureDistribution",
         ] {
             assert!(!is_batch_safe(d), "{d} must not be batch-safe");
+        }
+    }
+
+    #[test]
+    fn only_the_categoricals_carry_a_dedicated_batched_builder() {
+        for d in ["Categorical", "Categorical0"] {
+            assert!(batched_logpdf(d).is_some(), "{d} needs a batched builder");
+        }
+        // A batch-safe dist must NOT also carry one: two builders for one dist
+        // is two places for its density to drift.
+        for d in [
+            "Normal",
+            "Uniform",
+            "MvNormal",
+            "Dirichlet",
+            "LKJ",
+            "SomeFutureDistribution",
+        ] {
+            assert!(
+                batched_logpdf(d).is_none(),
+                "{d} must have no batched builder"
+            );
         }
     }
 }
