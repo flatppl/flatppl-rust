@@ -3641,6 +3641,14 @@ fn lower_superpose(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Re
 ///   any other `logweighted` base (a non-`Gaussian` factor, or ℓ scoring g2 at
 ///   something other than the reified argument) falls through to the refuse.
 ///
+/// * If `M = truncate(weighted(x → polynomial(c, x), Lebesgue(reals)),
+///   interval(lo, hi))` — a POLYNOMIAL DENSITY over a bounded interval, the shape
+///   a HS3 `polynomial_dist` imports to — then `Z = ∫_lo^hi p(x) dx` is the
+///   term-wise power rule on §07's coefficient order
+///   ([`polynomial_interval_mass`]). Both endpoints must be static and finite; an
+///   unbounded interval gives the polynomial infinite mass and refuses with its
+///   own message.
+///
 /// Any other unnormalized `M` (`Finite`, `LocallyFinite`, a non-truncate
 /// combinator, a `logweighted` that is not a Gaussian product, …) has no
 /// closed-form mass rule here, so we **refuse** rather than emit `totalmass`
@@ -3905,6 +3913,38 @@ fn lower_normalize(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, Re
         let z = build_call(m, "sum", &[weights]);
         let log_z = build_call(m, "log", &[z]);
         return Ok(build_call(m, "sub", &[mix_density, log_z]));
+    }
+
+    // Closed-form Z for a POLYNOMIAL DENSITY over a bounded interval:
+    // `normalize(truncate(weighted(x -> polynomial(c, x), Lebesgue(reals)),
+    // interval(lo, hi)))` — the shape a HS3 `polynomial_dist` imports to. §07
+    // *Approximation functions* fixes `polynomial`'s coefficient order, so
+    // `Z = ∫_lo^hi p(x) dx` is the term-wise power rule
+    // ([`polynomial_interval_mass`]) — a closed-form deterministic scalar, no
+    // `totalmass`. The numerator is the existing `truncate`/`weighted`/`Lebesgue`
+    // lowering, which already emits the outside-support `-inf` gate, so the
+    // density is just that minus `log Z`.
+    //
+    // The weight's `Lebesgue(reals)` base is unnormalized and its own weight is
+    // variate-DEPENDENT, so neither the CDF-Z arm above nor
+    // [`closed_form_totalmass`]'s `weighted` arm applies; this rule integrates the
+    // weight instead of requiring it to be constant.
+    if let Some(shape) = recognize_polynomial_over_interval(m, m_inner_resolved) {
+        let Some((lo, hi)) = bounded_interval_endpoints(m, &shape) else {
+            return Err(RefuseError {
+                node,
+                construct: "normalize".to_string(),
+                reason: "normalize(truncate(weighted(polynomial, Lebesgue))): closed-form Z \
+                         needs both interval endpoints static and finite; a polynomial has \
+                         infinite mass over an unbounded interval, and §06 requires Z finite \
+                         and nonzero"
+                    .to_string(),
+            });
+        };
+        let density = lower_measure_density(m, m_inner, v)?;
+        let z = polynomial_interval_mass(m, &shape.coefficients, lo, hi);
+        let log_z = build_call(m, "log", &[z]);
+        return Ok(build_call(m, "sub", &[density, log_z]));
     }
 
     // No closed-form mass rule for an unnormalized measure in this MVP.
@@ -6668,6 +6708,188 @@ fn static_array_variate_len(m: &Module, v: NodeId) -> Option<u32> {
     }
 }
 
+/// A `truncate(weighted(x → polynomial(c, x), Lebesgue(reals)), interval(lo, hi))`
+/// the mass rule below recognized: the coefficient vector's elements in §07 order
+/// (element 1 the constant term) and the truncation interval's endpoint nodes.
+struct PolynomialOverInterval {
+    /// `polynomial`'s coefficient vector, element-wise. The elements are arbitrary
+    /// deterministic expressions (`[1.0, a]` in a HS3 `polynomial_dist` carries a
+    /// free parameter); only the LENGTH has to be static, which is what makes the
+    /// degree — and hence the antiderivative — statically known.
+    coefficients: Vec<NodeId>,
+    lo: NodeId,
+    hi: NodeId,
+}
+
+/// Recognize a polynomial weight over a truncated Lebesgue measure — the shape a
+/// HS3 `polynomial_dist` imports to:
+///
+/// ```text
+/// truncate(weighted(x -> polynomial(c, x), Lebesgue(reals)), interval(lo, hi))
+/// ```
+///
+/// Structural only: the endpoints are returned as nodes and the coefficients as
+/// expressions, so the CALLER decides whether the interval is bounded (see
+/// [`closed_form_polynomial_interval_mass`]) and can refuse with its own message
+/// when it is not.
+///
+/// Every gate below rules out a shape whose mass is NOT this antiderivative:
+///
+/// * the reference measure must be `Lebesgue(reals)`, so the truncation set alone
+///   is the domain of integration — a `Lebesgue(interval(a, b))` base would make
+///   it the intersection instead;
+/// * the weight must be a single-input reified function whose body is
+///   `polynomial(c, x)` applied to EXACTLY that input's placeholder, so `w(x)` is
+///   the polynomial itself and not a polynomial of some other quantity;
+/// * the coefficient vector must be a literal `vector` call, so its length — the
+///   degree — is static.
+fn recognize_polynomial_over_interval(m: &Module, node: NodeId) -> Option<PolynomialOverInterval> {
+    let (base, set) = {
+        let c = expect_builtin_call(m, node, "truncate")?;
+        if c.args.len() != 2 {
+            return None;
+        }
+        (c.args[0], c.args[1])
+    };
+
+    let (lo, hi) = {
+        let (set, _) = resolve_ref_chain(m, set);
+        let ic = expect_builtin_call(m, set, "interval")?;
+        if ic.args.len() != 2 {
+            return None;
+        }
+        (ic.args[0], ic.args[1])
+    };
+
+    let (weight, reference) = {
+        let (base, _) = resolve_ref_chain(m, base);
+        let c = expect_builtin_call(m, base, "weighted")?;
+        if c.args.len() != 2 {
+            return None;
+        }
+        (c.args[0], c.args[1])
+    };
+
+    // The reference measure is Lebesgue over the whole line.
+    {
+        let (reference, _) = resolve_ref_chain(m, reference);
+        let c = expect_builtin_call(m, reference, "Lebesgue")?;
+        let support = named_or_positional(m, c, "support")?;
+        let (support, _) = resolve_ref_chain(m, support);
+        match m.node(support) {
+            Node::Const(sym) if m.resolve(*sym) == "reals" => {}
+            _ => return None,
+        }
+    }
+
+    // `x -> polynomial(c, x)`: a single-input reification whose body applies
+    // `polynomial` to that input's own placeholder.
+    let (body, arg_ref) = {
+        let (weight, _) = resolve_ref_chain(m, weight);
+        let f = expect_builtin_call(m, weight, "functionof")?;
+        if f.args.len() != 1 {
+            return None;
+        }
+        let arg_ref = match &f.inputs {
+            Some(Inputs::Spec(entries)) if entries.len() == 1 => entries[0].1,
+            _ => return None,
+        };
+        (f.args[0], arg_ref)
+    };
+
+    let coefficients = {
+        let p = expect_builtin_call(m, body, "polynomial")?;
+        if p.args.len() != 2 || !p.named.is_empty() {
+            return None;
+        }
+        match m.node(p.args[1]) {
+            Node::Ref(r) if *r == arg_ref => {}
+            _ => return None,
+        }
+        let (coeff_node, _) = resolve_ref_chain(m, p.args[0]);
+        let v = expect_builtin_call(m, coeff_node, "vector")?;
+        if v.args.is_empty() || !v.named.is_empty() {
+            return None;
+        }
+        v.args.to_vec()
+    };
+
+    Some(PolynomialOverInterval {
+        coefficients,
+        lo,
+        hi,
+    })
+}
+
+/// A node's value as a static real, folding the `neg` that a negative literal
+/// parses to (`interval(-10.0, 10.0)` reads as `(interval (neg 10.0) 10.0)`) and
+/// admitting the built-in `inf`, so an unbounded endpoint is RECOGNIZED as
+/// infinite rather than merely unreadable. `None` for anything not static.
+fn static_real(m: &Module, id: NodeId) -> Option<f64> {
+    let (node, _) = resolve_ref_chain(m, id);
+    match m.node(node) {
+        Node::Lit(Scalar::Real(x)) => Some(*x),
+        Node::Lit(Scalar::Int(i)) => Some(*i as f64),
+        Node::Const(sym) if m.resolve(*sym) == "inf" => Some(f64::INFINITY),
+        _ => {
+            let c = expect_builtin_call(m, node, "neg")?;
+            if c.args.len() != 1 {
+                return None;
+            }
+            Some(-static_real(m, c.args[0])?)
+        }
+    }
+}
+
+/// Both FINITE endpoints of a [`recognize_polynomial_over_interval`] shape.
+///
+/// `None` when either endpoint is not a static real, or is not finite: over an
+/// unbounded interval a polynomial has infinite mass, which violates §06's
+/// "`Z` … finite and nonzero" precondition on `normalize`.
+fn bounded_interval_endpoints(m: &Module, shape: &PolynomialOverInterval) -> Option<(f64, f64)> {
+    let lo = static_real(m, shape.lo)?;
+    let hi = static_real(m, shape.hi)?;
+    (lo.is_finite() && hi.is_finite()).then_some((lo, hi))
+}
+
+/// `Λ = ∫_lo^hi polynomial(c, x) dx` as a deterministic scalar node.
+///
+/// §07 *Approximation functions* fixes the coefficient order: `polynomial(c, x)`
+/// is $\sum_{i=0}^{n-1} c_{i+1} x^i$, where "the first element is the constant
+/// term; the $i$-th element is the coefficient of $x^{i-1}$". So term-wise
+/// integration gives
+///
+/// $$\Lambda = \int_{lo}^{hi} \sum_{i=0}^{n-1} c_{i+1}\,x^i \,\mathrm{d}x
+///           = \sum_{i=0}^{n-1} c_{i+1}\,\frac{hi^{i+1} - lo^{i+1}}{i+1}.$$
+///
+/// Each per-degree factor depends on the endpoints alone, so it folds to one
+/// literal per coefficient and the emitted mass is a plain weighted sum — no
+/// `pow`, and no `totalmass`.
+fn polynomial_interval_mass(m: &mut Module, coefficients: &[NodeId], lo: f64, hi: f64) -> NodeId {
+    let terms: Vec<NodeId> = coefficients
+        .iter()
+        .enumerate()
+        .map(|(i, &c)| {
+            // `powi`, not `powf`: the exponent is the integer degree, and a
+            // negative endpoint raised to it must stay exact.
+            let k = i + 1;
+            let factor = (hi.powi(k as i32) - lo.powi(k as i32)) / k as f64;
+            let factor = m.alloc(Node::Lit(Scalar::Real(factor)));
+            build_call(m, "mul", &[c, factor])
+        })
+        .collect();
+    fold_add(m, &terms)
+}
+
+/// [`polynomial_interval_mass`] for a whole measure node, for
+/// [`closed_form_totalmass`]. `None` when the node is not the recognized shape or
+/// its interval is not bounded.
+fn closed_form_polynomial_interval_mass(m: &mut Module, node: NodeId) -> Option<NodeId> {
+    let shape = recognize_polynomial_over_interval(m, node)?;
+    let (lo, hi) = bounded_interval_endpoints(m, &shape)?;
+    Some(polynomial_interval_mass(m, &shape.coefficients, lo, hi))
+}
+
 /// The total mass `Λ = totalmass(M)` of `measure` as a closed-form deterministic
 /// scalar node, or `None` when no rule applies.
 ///
@@ -6685,6 +6907,9 @@ fn static_array_variate_len(m: &Module, v: NodeId) -> Option<u32> {
 /// * `Lebesgue(support = interval(lo, hi))` with a mass inference proved FINITE —
 ///   `Λ = hi − lo`, the support's length. The `Mass::Finite` check is what rules
 ///   out an unbounded interval, whose mass is infinite.
+/// * `truncate(weighted(x → polynomial(c, x), Lebesgue(reals)), interval(lo, hi))` —
+///   the term-wise power rule over the interval
+///   ([`closed_form_polynomial_interval_mass`]).
 ///
 /// Anything else yields `None` and the caller refuses. [`lower_normalize`]
 /// recognizes an overlapping but different set of `Z` shapes inline; merging the
@@ -6731,6 +6956,10 @@ fn closed_form_totalmass(m: &mut Module, measure: NodeId) -> Option<NodeId> {
             ..
         })
     );
+    if let Some(mass) = closed_form_polynomial_interval_mass(m, node) {
+        return Some(mass);
+    }
+
     if bounded_lebesgue {
         let bounds = {
             let c = expect_builtin_call(m, node, "Lebesgue")?;
