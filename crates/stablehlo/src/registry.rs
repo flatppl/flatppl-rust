@@ -327,6 +327,14 @@ static REGISTRY: &[(&str, DistLowering)] = &[
             touniform: None,
         },
     ),
+    (
+        "ContinuedPoisson",
+        DistLowering {
+            logpdf: continued_poisson_logpdf,
+            sample: None,
+            touniform: None,
+        },
+    ),
 ];
 
 /// Look up a distribution's lowering by its constructor name (`"Normal"`,
@@ -487,14 +495,17 @@ fn unbatch_field_id(e: &Emitter, p: &Params, name: &str) -> Result<NodeId, EmitE
 /// builder is shape-specific once the batch record's size-1 `support` wrapper is
 /// stripped by [`unbatch_field_id`].
 ///
-/// The two §09 entries qualify for the same reason as the §08 arithmetic ones.
+/// The three §09 entries qualify for the same reason as the §08 arithmetic ones.
 /// [`argus_logpdf`] is add/sub/mul/div/log/exp/sqrt/pow/erf only.
 /// [`crystal_ball_logpdf`] adds a `compare`/`select` pair for its piecewise
 /// branch, which broadcasts exactly like `Uniform`'s support mask — the
 /// condition carries the variate's shape, so both branches and the selection are
-/// rank-agnostic. This is what lets an `iid(hep.CrystalBall(…), n)` — which the
-/// determiniser lowers to the axis-native dotted density, NOT an unroll — reach
-/// StableHLO at all; without these two it refused as "not rank-agnostic".
+/// rank-agnostic. [`continued_poisson_logpdf`] is arithmetic plus `lgamma`
+/// under the same `Uniform`-style support mask. This is what lets an
+/// `iid(hep.CrystalBall(…), n)` or a HistFactory `staterror` constraint — which
+/// the determiniser lowers to the axis-native dotted density, NOT an unroll —
+/// reach StableHLO at all; without these three they refused as "not
+/// rank-agnostic".
 pub(crate) fn is_batch_safe(ctor: &str) -> bool {
     matches!(
         ctor,
@@ -523,6 +534,7 @@ pub(crate) fn is_batch_safe(ctor: &str) -> bool {
             // §09 particle-physics.
             | "CrystalBall"
             | "Argus"
+            | "ContinuedPoisson"
     )
 }
 
@@ -2133,6 +2145,57 @@ fn argus_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitErr
     let mass = e.mul(&scaled, &bracket);
     let log_mass = e.log(&mass);
     Ok(e.sub(&log_unnorm, &log_mass))
+}
+
+/// §09 `ContinuedPoisson(rate)` — the continuous extension of Poisson to the
+/// reals, density `λ^x·e^{-λ}/Γ(x+1)` for `x ≥ 0` w.r.t. `Lebesgue(reals)`. In
+/// log form, verbatim: `x·log(rate) − rate − lgamma(x + 1)`. That is
+/// [`poisson_logpdf`]'s expression with §09's stated continuation already in
+/// place — the Poisson factorial read as `Γ(x+1)` — so a non-integer `x` (an
+/// Asimov dataset, a HistFactory effective count) scores instead of being a
+/// counting-measure category error.
+///
+/// §09 makes this measure NOT normalized and NOT a probability measure, so
+/// there is no normalizing constant to derive, and `sample` stays `None`: §09
+/// says `rand(rstate, ContinuedPoisson(rate))` is not a well-defined operation
+/// in FlatPPL.
+///
+/// Masked to `nonnegreals`, §09's stated support, per §08's shared rule
+/// "outside the support the density is zero". The mask is not cosmetic: `Γ` has
+/// poles at the non-positive integers, so the raw formula returns a finite but
+/// WRONG value on `-1 < x < 0` and a `+inf`/`nan` at `x = -1, -2, …`, and
+/// `stablehlo.select` is elementwise — a `nan` in the unused branch survives
+/// into the reverse-mode gradient. [`mask_support`] evaluates the formula at a
+/// guarded variate first, which keeps both the value and the gradient clean.
+/// Note that flatppl-js leaves the same density unmasked today, so the two
+/// engines disagree below zero; the spec, not the other engine, is the oracle.
+///
+/// Rank-agnostic, hence listed in [`is_batch_safe`]: every parameter read is a
+/// [`Params::get`] and the mask carries the variate's shape, exactly as
+/// [`uniform_logpdf`]'s does. That is what lets HistFactory's staterror
+/// constraint — `functionof(hepphys.ContinuedPoisson.(mcstat .* mcstat_tau))`,
+/// one dotted per-bin density the determiniser keeps axis-native rather than
+/// unrolling — reach StableHLO at all; without it every HistFactory model
+/// carrying a `staterror` refused as "not rank-agnostic".
+fn continued_poisson_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
+    let rate = p.get(e, "rate")?;
+
+    let zero = e.scalar(0.0);
+    let in_support = e.compare("GE", v, &zero);
+    let safe = e.scalar(1.0);
+    mask_support(e, v, &in_support, &safe, |e, v| {
+        let log_rate = e.log(&rate);
+        let x_log_rate = e.mul(v, &log_rate);
+        let neg_rate = e.neg(&rate);
+
+        let one = e.scalar(1.0);
+        let x_plus_one = e.add(v, &one);
+        let lgamma_x1 = e.lgamma(&x_plus_one);
+        let neg_lgamma_x1 = e.neg(&lgamma_x1);
+
+        let t1 = e.add(&x_log_rate, &neg_rate);
+        Ok(e.add(&t1, &neg_lgamma_x1))
+    })
 }
 
 fn dirac_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitError> {
@@ -4107,6 +4170,9 @@ mod tests {
             // Rank-agnostic because its density is masked to its support, and
             // the mask carries the variate's shape.
             "Uniform",
+            // §09 particle-physics: arithmetic plus `lgamma` under that same
+            // support mask.
+            "ContinuedPoisson",
         ] {
             assert!(is_batch_safe(d), "{d} should be batch-safe");
         }

@@ -1,5 +1,5 @@
-//! StableHLO lowering of the two §09 `particle-physics` densities the coverage
-//! corpus needs: `CrystalBall` and `Argus`.
+//! StableHLO lowering of the §09 `particle-physics` densities the corpora need:
+//! `CrystalBall`, `Argus` and `ContinuedPoisson`.
 //!
 //! Reached exactly like a §08 base constructor — the determiniser emits the BARE
 //! member name as the `builtin_logdensityof` kernel tag, so the module
@@ -191,5 +191,120 @@ outputs = lp";
     assert!(
         msg.contains("lower incomplete gamma"),
         "the refusal must name the missing function: {msg}"
+    );
+}
+
+// ---- §09 ContinuedPoisson ---------------------------------------------------
+//
+// `ContinuedPoisson` is a `%finite` measure, not a probability measure, so
+// `lawof` refuses it (§04: "an unnormalized measure is not its own law"). Every
+// shape below therefore reaches the density the way HistFactory's own converter
+// output does: `functionof(...)` + `likelihoodof(...)`.
+//
+// Executed, not merely pinned. Under the suite's IREE executor
+// (`unified/stablehlo_exec.py`), against the §09 closed form
+// `x*log(rate) - rate - gammaln(x+1)` evaluated with scipy in f64:
+//
+//   scalar, rate = 4.5
+//     x =  0.0  -> -4.500000476837158   vs -4.5                 (4.8e-07 abs)
+//     x =  1.0  -> -2.995922565460205   vs -2.995922603223726    (3.8e-08 abs)
+//     x =  3.0  -> -1.779528021812439   vs -1.779527278899233    (7.4e-07 abs)
+//     x =  3.7  -> -1.6713192462921143  vs -1.6713187782433527   (4.7e-07 abs)
+//     x = 12.5  -> -6.959110260009766   vs -6.959108696541275    (1.6e-06 abs)
+//     x = -0.5  -> -inf                 vs -inf                  (exact)
+//     x = -1.5  -> -inf                 vs -inf                  (exact)
+//
+//   dotted staterror, tau = [400, 100], scored at tau
+//     g = [1.0, 1.0] -> -7.137420654296875  vs -7.137236096803235  (2.6e-05 rel)
+//     g = [1.1, 0.9] -> -9.54931640625      vs -9.549215740855573  (1.1e-05 rel)
+//     g = [1.2, 0.8] -> -16.523193359375    vs -16.52296851064216  (1.4e-05 rel)
+//
+// `x = 3.7` is the point that matters: a non-integer variate is exactly what
+// §09 adds this measure for, and `Poisson`'s counting-measure mass cannot score
+// it. The dotted band is wider because `lgamma(401) ~ 1990` cancels down to a
+// result of order ten, which is f32 arithmetic, not a lowering error. The
+// `corpora/hs3/conversions/histfactory` row gates the same shape against an
+// independent closed-form Poisson-product oracle.
+
+const CONTINUED_POISSON_SRC: &str = "\
+hep = standard_module(\"particle-physics\", \"0.1\")
+x = elementof(nonnegreals)
+aux = functionof(hep.ContinuedPoisson(rate = 4.5))
+aux_lik = likelihoodof(aux, x)
+lp = logdensityof(aux_lik, record(x = x))
+inputs = (x)
+outputs = (lp)";
+
+// The whole density: one `log(rate)`, one `lgamma(x + 1)`, and the support mask.
+// §09's own formula reads the Poisson factorial as `Γ(x+1)`, which is the ONLY
+// difference from `poisson_logpdf` — so an emission that dropped the `lgamma`
+// for a `Poisson`-style integer path would score a non-integer variate wrongly
+// with no structural complaint.
+#[test]
+fn continued_poisson_emits_a_lgamma_continuation_under_a_support_mask() {
+    let mlir = emit(CONTINUED_POISSON_SRC);
+    assert_eq!(
+        mlir.matches("chlo.lgamma").count(),
+        1,
+        "the gamma continuation is the whole point of §09's entry:\n{mlir}"
+    );
+    assert_eq!(
+        mlir.matches("stablehlo.log ").count(),
+        1,
+        "`log(rate)` once:\n{mlir}"
+    );
+    assert!(
+        mlir.contains("compare GE") && mlir.contains("dense<0x7F800000>"),
+        "§09's support is `nonnegreals`, so the density is masked to `-inf` \
+         below zero:\n{mlir}"
+    );
+}
+
+/// Freeze the exact emitted text: any drift (op count, ordering, the mask, the
+/// formula) must be a deliberate, reviewed change to this golden file.
+#[test]
+fn continued_poisson_matches_frozen_golden() {
+    let out = emit(CONTINUED_POISSON_SRC);
+    let golden = include_str!("goldens/continued_poisson_logdensity.mlir");
+    assert_eq!(
+        out, golden,
+        "emitted @logdensity drifted from the frozen golden \
+         (tests/goldens/continued_poisson_logdensity.mlir)"
+    );
+}
+
+// HistFactory's `staterror` constraint, the shape that motivated the builder:
+// `functionof(hep.ContinuedPoisson.(g .* tau))` observed at `tau`. The
+// determiniser keeps this axis-native, so it reaches
+// `registry::lower_logdensityof_batched`, and before `ContinuedPoisson` was
+// batch-safe the WHOLE model refused with "not rank-agnostic" — no HistFactory
+// conversion carrying a `staterror` modifier could emit at all.
+#[test]
+fn a_dotted_staterror_constraint_emits_one_batched_density() {
+    let src = "\
+hep = standard_module(\"particle-physics\", \"0.1\")
+tau = [400.0, 100.0]
+g = elementof(cartpow(posreals, 2))
+aux = functionof(hep.ContinuedPoisson.(g .* tau))
+aux_lik = likelihoodof(aux, tau)
+lp = logdensityof(aux_lik, record(g = g))
+inputs = (g)
+outputs = (lp)";
+    let mlir = emit(src);
+    assert!(
+        mlir.contains("tensor<2xi1>"),
+        "the support mask must carry the variate's rank-1 shape, so the reduce \
+         that follows sums TWO terms rather than one:\n{mlir}"
+    );
+    assert!(
+        mlir.contains("stablehlo.reduce"),
+        "the per-bin densities are reduced over the axis:\n{mlir}"
+    );
+    // One density expression, not one per bin: the batched path is what makes an
+    // n-bin staterror independent of n in emitted size.
+    assert_eq!(
+        mlir.matches("chlo.lgamma").count(),
+        1,
+        "the continuation must be emitted once, not once per bin:\n{mlir}"
     );
 }
