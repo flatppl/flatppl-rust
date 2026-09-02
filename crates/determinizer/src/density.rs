@@ -1378,27 +1378,6 @@ fn lower_applied_ksuperpose_inner(
         }
     }
 
-    // A MULTIVARIATE family — §06's "a vector parameter takes an $N \times d$
-    // matrix while a matrix parameter takes an $N \times d \times d$ array" — has
-    // no form in the `broadcast(record, …)` family below: §04 *Collection
-    // arguments* makes a plain broadcast require the same number of axes from
-    // every collection argument and strips EVERY axis to reach its cell, so an
-    // $N \times d$ `mu` beside an $N \times d \times d$ `cov` cannot be spelled
-    // that way. Refuse rather than emit a form the backend mislowers; the
-    // per-component slice extraction this needs is not built.
-    for &arg in pos_args.iter().chain(kw_args.iter().map(|(_, v)| v)) {
-        let axes = m.type_of(arg).map(array_axes).unwrap_or(0);
-        if axes > 1 {
-            return Err(refuse(
-                lift_node,
-                m,
-                "ksuperpose over a MULTIVARIATE parameter family is not lowered (the \
-                 per-component slice extraction is not built): a family argument with \
-                 an axis beyond the family axis has no `broadcast(record, …)` form",
-            ));
-        }
-    }
-
     // Per-component θᵢ: positional family args bind to the constructor's
     // parameter names in order, a keyword family arg keeps its given name.
     let mut fields: Vec<(Symbol, NodeId)> = Vec::with_capacity(pos_args.len() + kw_args.len());
@@ -1407,6 +1386,20 @@ fn lower_applied_ksuperpose_inner(
         fields.push((name, arg));
     }
     fields.extend(kw_args.iter().copied());
+
+    // A MULTIVARIATE family — §06's "a vector parameter takes an $N \times d$
+    // matrix, a matrix parameter an $N \times d \times d$ array" — has no form in
+    // the `broadcast(record, …)` family below: §04 *Collection arguments* makes a
+    // plain broadcast require the same number of axes from every collection
+    // argument and strips EVERY axis to reach its cell, so an $N \times d$ `mu`
+    // beside an $N \times d \times d$ `cov` cannot be spelled that way. It gets
+    // the unrolled per-component form instead ([`lower_multivariate_ksuperpose`]).
+    if fields
+        .iter()
+        .any(|&(_, arg)| m.type_of(arg).map(array_axes).unwrap_or(0) > 1)
+    {
+        return lower_multivariate_ksuperpose(m, lift_node, ctor_sym, weights, &fields, v);
+    }
 
     let broadcast_sym = m.intern("broadcast");
     let record_head = {
@@ -1450,6 +1443,177 @@ fn lower_applied_ksuperpose_inner(
         inputs: None,
     }));
     Ok(build_call(m, "logsumexp", &[terms]))
+}
+
+/// `logdensityof(ksuperpose(K, w)(θ), x)` for a MULTIVARIATE parameter family —
+/// §06's "a vector parameter [takes] an $N \times d$ matrix, a matrix parameter an
+/// $N \times d \times d$ array".
+///
+/// The density rule is the one [`lower_applied_ksuperpose_inner`] emits
+/// axis-natively; only the per-component θᵢ differs. A family argument carrying
+/// its parameter's own axes beside the family axis cannot ride a plain
+/// `broadcast(record, …)` — §04 *Collection arguments* strips every axis to reach
+/// a cell — so each component's parameters are SLICED out and the mixture is
+/// unrolled:
+/// ```text
+/// tᵢ = add(log(get(w, i)), builtin_logdensityof(K, record(p = get(argₚ, i, all…), …), x))
+/// lp = logsumexp([t₁, …, t_N])
+/// ```
+/// the same `logsumexp` over a `vector` [`lower_superpose`] emits for the variadic
+/// spelling. Every component is scored at the same `x`, and the reduction is
+/// `logsumexp` where an independent product's is `sum`.
+///
+/// **The selector count is the argument's OUTER rank, not its total axis count.**
+/// §07 `get` gives a multi-axis row slice as `get(M, i, all)`, so a FLAT
+/// $N \times d$ `mu` takes one `all` for its remaining outer axis. A NESTED
+/// spelling — an $N$-vector of $d \times d$ matrices, which is what
+/// `covs = [cA, cB]` infers to — carries the parameter's axes in its ELEMENT, so
+/// the single index already lands on the whole matrix. §03 keeps those two
+/// spellings distinct types, so reading the total axis count would emit one `all`
+/// too many for the nested one. `get` is 1-based (§07), as
+/// [`build_weight_call`]'s own component split is.
+///
+/// **Unrolled, where the scalar family is axis-native.** §06 makes $N$ "not
+/// necessarily statically known" and the axis-native form honours that; the slice
+/// extraction cannot, needing one `get` per component. A dynamic $N$ therefore
+/// refuses rather than lowering with a guessed component count.
+fn lower_multivariate_ksuperpose(
+    m: &mut Module,
+    lift_node: NodeId,
+    ctor_sym: Symbol,
+    weights: NodeId,
+    fields: &[(Symbol, NodeId)],
+    v: NodeId,
+) -> Result<NodeId, RefuseError> {
+    let n = match m.type_of(weights).and_then(leading_extent) {
+        Some(Dim::Static(n)) if n > 0 => n as usize,
+        _ => {
+            return Err(refuse(
+                lift_node,
+                m,
+                "ksuperpose over a MULTIVARIATE parameter family needs a statically known \
+                 component count (§06 admits a dynamic `N`, but the per-component slice \
+                 extraction emits one `get` per component): `weights` has no static length",
+            ));
+        }
+    };
+
+    let mut plan: Vec<FamilyArg> = Vec::with_capacity(fields.len());
+    for &(name, arg) in fields {
+        let rank = m.type_of(arg).map(outer_rank).unwrap_or(0);
+        // §06: a non-collection argument is held constant across the components.
+        if rank == 0 {
+            plan.push(FamilyArg {
+                name,
+                node: arg,
+                slice: None,
+            });
+            continue;
+        }
+        // §06: "a collection whose leading axis has size one … is shared by every
+        // component", so a singular argument reads row 1 for all of them.
+        let singular = match m.type_of(arg).and_then(leading_extent) {
+            Some(Dim::Static(1)) => true,
+            Some(Dim::Static(got)) if got as usize == n => false,
+            _ => {
+                return Err(refuse(
+                    arg,
+                    m,
+                    &format!(
+                        "a ksuperpose family argument over a MULTIVARIATE family must have a \
+                         statically known family axis of size {n} — the length of `weights` — \
+                         or be singular (spec §06)"
+                    ),
+                ));
+            }
+        };
+        plan.push(FamilyArg {
+            name,
+            node: arg,
+            slice: Some(FamilySlice { rank, singular }),
+        });
+    }
+
+    let all_sym = m.intern("all");
+    let ldo_sym = m.intern("builtin_logdensityof");
+    let mut terms: Vec<NodeId> = Vec::with_capacity(n);
+    for i in 1..=n as i64 {
+        let mut theta: Vec<(Symbol, NodeId)> = Vec::with_capacity(plan.len());
+        for &FamilyArg { name, node, slice } in &plan {
+            let value = match slice {
+                None => node,
+                Some(FamilySlice { rank, singular }) => {
+                    let row = if singular { 1 } else { i };
+                    let idx = m.alloc(Node::Lit(Scalar::Int(row)));
+                    let mut selectors = vec![node, idx];
+                    for _ in 1..rank {
+                        let all = m.alloc(Node::Const(all_sym));
+                        selectors.push(all);
+                    }
+                    build_call(m, "get", &selectors)
+                }
+            };
+            theta.push((name, value));
+        }
+        let kernel_input = build_record(m, &theta);
+        let kernel = m.alloc(Node::Const(ctor_sym));
+        let density = m.alloc(Node::Call(Call {
+            head: CallHead::Builtin(ldo_sym),
+            args: vec![kernel, kernel_input, v].into(),
+            named: Vec::<NamedArg>::new().into(),
+            inputs: None,
+        }));
+        let idx = m.alloc(Node::Lit(Scalar::Int(i)));
+        let w_i = build_call(m, "get", &[weights, idx]);
+        let log_w = build_call(m, "log", &[w_i]);
+        terms.push(build_call(m, "add", &[log_w, density]));
+    }
+    let terms_vec = build_call(m, "vector", &terms);
+    Ok(build_call(m, "logsumexp", &[terms_vec]))
+}
+
+/// One family argument of a multivariate `ksuperpose` application, with the plan
+/// for slicing its component values out ([`lower_multivariate_ksuperpose`]).
+struct FamilyArg {
+    /// The component constructor's parameter this argument feeds.
+    name: Symbol,
+    node: NodeId,
+    /// `None` for a §06 non-collection argument, held constant across the
+    /// components.
+    slice: Option<FamilySlice>,
+}
+
+/// How to slice one component's value out of a collection family argument.
+#[derive(Clone, Copy)]
+struct FamilySlice {
+    /// The argument's outer rank, which fixes the §07 `get` selector count.
+    rank: usize,
+    /// A §06 "collection whose leading axis has size one", shared by every
+    /// component, so every component reads row 1.
+    singular: bool,
+}
+
+/// The rank of a collection type's OUTER shape — the number of selectors a §07
+/// `get` takes to reach one element of it, counting a nested array's element as
+/// one. `0` for a non-collection. The companion of [`array_axes`], which counts
+/// the nested axes too; see [`lower_multivariate_ksuperpose`] for why the family
+/// slice needs this count and not that one.
+fn outer_rank(t: &Type) -> usize {
+    match t {
+        Type::Array { shape, .. } => shape.len(),
+        Type::TVector { .. } => 1,
+        _ => 0,
+    }
+}
+
+/// The extent of a collection type's LEADING axis, or `None` for a
+/// non-collection. §06's family axis is the leading one.
+fn leading_extent(t: &Type) -> Option<Dim> {
+    match t {
+        Type::Array { shape, .. } => shape.first().copied(),
+        Type::TVector { len, .. } => Some(*len),
+        _ => None,
+    }
 }
 
 /// The fallible body of [`lower_applied_kernel_joint`], split out so the caller's

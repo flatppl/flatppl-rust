@@ -1173,3 +1173,119 @@ lp = logdensityof(L, record(z = 0.2))";
         "the declaring kernel conditions on z:\n{printed}"
     );
 }
+
+/// The §06 `ksuperpose` mixture density over a MULTIVARIATE parameter family, at
+/// three points: `logsumexp_i(log w_i + logdensityof(MvNormal(mu_i, cov_i), y))`,
+/// minus `log(sum w)` for the `normalize`.
+///
+/// A two-component bivariate mixture with `w = [0.5, 1.5]` (so the `normalize`
+/// divisor is a real term, not 1) and two DISTINCT full covariances, so neither
+/// the `mu` family axis nor the `cov` family axis can be dropped without moving
+/// the number.
+///
+/// The closed form below is pure Rust and the reference values are scipy's,
+/// frozen here with their provenance. Per this file's header the comparison is
+/// closed form against independent oracle: nothing in `flatppl-rust` evaluates a
+/// density, so the emitted FlatPDL is checked STRUCTURALLY here and scored
+/// end-to-end by `flatppl-testsuite`'s `corpora/coverage/mv_mixture` against its
+/// own frozen scipy vector.
+///
+/// Reference values, scipy 1.18.0 / numpy 2.5.1:
+/// ```python
+/// import numpy as np
+/// from scipy.stats import multivariate_normal
+/// from scipy.special import logsumexp
+/// W = np.array([0.5, 1.5])
+/// MUS = np.array([[-1.0, 0.5], [2.0, -1.5]])
+/// COVS = [np.array([[2.0, 0.5], [0.5, 1.0]]), np.array([[1.0, -0.4], [-0.4, 0.8]])]
+/// for y in ([0.0, 0.0], [-1.0, 0.5], [2.0, -1.5]):
+///     terms = [np.log(w) + multivariate_normal(mean=m, cov=c).logpdf(y)
+///              for w, m, c in zip(W, MUS, COVS)]
+///     print(float(logsumexp(terms) - np.log(W.sum())))
+/// # -3.481677810460876
+/// # -3.471100311328599
+/// # -1.9021334549441575
+/// ```
+#[test]
+fn a_multivariate_mixture_agrees_with_scipy_and_lowers_to_per_component_slices() {
+    const W: [f64; 2] = [0.5, 1.5];
+    const MUS: [[f64; 2]; 2] = [[-1.0, 0.5], [2.0, -1.5]];
+    const COVS: [[[f64; 2]; 2]; 2] = [[[2.0, 0.5], [0.5, 1.0]], [[1.0, -0.4], [-0.4, 0.8]]];
+    const SCIPY: [f64; 3] = [
+        -3.481_677_810_460_876,
+        -3.471_100_311_328_599,
+        -1.902_133_454_944_157_5,
+    ];
+    const POINTS: [[f64; 2]; 3] = [[0.0, 0.0], [-1.0, 0.5], [2.0, -1.5]];
+
+    for (point, want) in POINTS.iter().zip(SCIPY.iter()) {
+        let terms: Vec<f64> = (0..2)
+            .map(|i| W[i].ln() + bivariate_normal_logpdf(*point, MUS[i], COVS[i]))
+            .collect();
+        let got = logsumexp2(terms[0], terms[1]) - (W[0] + W[1]).ln();
+        assert!(
+            (got - want).abs() < 1e-12,
+            "closed form vs scipy at {point:?}: {got} vs {want}"
+        );
+    }
+
+    let src = "\
+w = [0.5, 1.5]
+mus = rowstack([[-1.0, 0.5], [2.0, -1.5]])
+cA = rowstack([[2.0, 0.5], [0.5, 1.0]])
+cB = rowstack([[1.0, -0.4], [-0.4, 0.8]])
+covs = [cA, cB]
+mix = normalize(ksuperpose(MvNormal, w)(mu = mus, cov = covs))
+y = elementof(cartpow(reals, 2))
+lp = logdensityof(mix, y)";
+    let m = parse_infer(src);
+    let out = determinize(&m).expect("the multivariate mixture must lower");
+    assert!(
+        flatppl_determinizer::is_flatpdl(&out).is_ok(),
+        "emitted FlatPDL must be conformant"
+    );
+    let pir = flatppl_flatpir::write(&out);
+    // The three structural facts the number depends on: one density term per
+    // component, the family axis contracted by `logsumexp`, and each argument
+    // sliced by its own outer rank so the two covariances stay distinct.
+    assert_eq!(
+        pir.matches("builtin_logdensityof").count(),
+        2,
+        "one density term per component:\n{pir}"
+    );
+    assert!(
+        pir.contains("(logsumexp "),
+        "the mixture contraction:\n{pir}"
+    );
+    assert!(
+        pir.contains("(get (%ref self mus) 1 all)")
+            && pir.contains("(get (%ref self mus) 2 all)")
+            && pir.contains("(get (%ref self covs) 1)")
+            && pir.contains("(get (%ref self covs) 2)"),
+        "per-component slices, one `all` for the flat mu and none for the nested cov:\n{pir}"
+    );
+    // §06 puts the lift's mass at sum(w), so `normalize` subtracts log(sum(w)).
+    assert!(
+        pir.contains("(sum (%ref self w))") && pir.contains("(sub "),
+        "the normalize divisor is log(sum(w)):\n{pir}"
+    );
+}
+
+/// Closed-form bivariate normal log-density:
+/// `-log(2 pi) - 0.5 log|C| - 0.5 (y - mu)^T C^-1 (y - mu)`, with the 2x2 inverse
+/// written out.
+fn bivariate_normal_logpdf(y: [f64; 2], mu: [f64; 2], cov: [[f64; 2]; 2]) -> f64 {
+    let det = cov[0][0] * cov[1][1] - cov[0][1] * cov[1][0];
+    let d = [y[0] - mu[0], y[1] - mu[1]];
+    // C^-1 = [[c11, -c01], [-c10, c00]] / det.
+    let quad =
+        (cov[1][1] * d[0] * d[0] - 2.0 * cov[0][1] * d[0] * d[1] + cov[0][0] * d[1] * d[1]) / det;
+    -(2.0 * PI).ln() - 0.5 * det.ln() - 0.5 * quad
+}
+
+/// `log(exp(a) + exp(b))`, shifted by the larger term so neither exponential
+/// overflows.
+fn logsumexp2(a: f64, b: f64) -> f64 {
+    let hi = a.max(b);
+    hi + ((a - hi).exp() + (b - hi).exp()).ln()
+}

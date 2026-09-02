@@ -5,10 +5,16 @@
 //! > `logdensityof(ksuperpose(κ, w)(θ), x) = logsumexp_i(log wᵢ +
 //! > logdensityof(κ(θᵢ), x))`, so a zero weight contributes −∞ and drops out.
 //!
-//! The emitted FlatPDL is AXIS-NATIVE — one `logsumexp` over one broadcast, never
-//! `N` unrolled terms — because §06 makes `N` "the length of `weights`, which need
-//! not be statically known". Numeric verification of these shapes lives in
-//! `crates/stablehlo/tests/golden_ksuperpose.rs`, which executes them.
+//! For a SCALAR parameter family the emitted FlatPDL is AXIS-NATIVE — one
+//! `logsumexp` over one broadcast, never `N` unrolled terms — because §06 makes
+//! `N` "the length of `weights`, which need not be statically known". A
+//! MULTIVARIATE family has no `broadcast(record, …)` form and takes the unrolled
+//! per-component slice form instead, which is why it needs a static `N`. Numeric
+//! verification of these shapes lives in
+//! `crates/stablehlo/tests/golden_ksuperpose.rs`, which executes them, and — for
+//! the multivariate family the StableHLO emitter cannot yet index — in
+//! `flatppl-testsuite`'s `corpora/coverage/mv_mixture` against a frozen scipy
+//! vector.
 
 use flatppl_determinizer::{determinize, is_flatpdl};
 
@@ -241,15 +247,101 @@ fn a_table_family_refuses_and_names_the_working_spelling() {
     );
 }
 
-/// A MULTIVARIATE family types (§06's family rule reads a family argument's axes
-/// against the rank of the parameter it feeds) but has no `broadcast(record, …)`
-/// form, so the lowering refuses. The message must name the implementation limit,
-/// not the spec — the model is legal FlatPPL.
+const MULTIVARIATE: &str = "\
+w = [0.2, 0.8]
+mus = rowstack([[0.0, 0.0], [3.0, 3.0]])
+c1 = rowstack([[1.0, 0.2], [0.2, 1.0]])
+covs = [c1, c1]
+mix = ksuperpose(MvNormal, w)(mu = mus, cov = covs)
+y = elementof(cartpow(reals, 2))
+lp = logdensityof(mix, y)
+";
+
+/// §06's family rule reads a family argument's axes against the rank of the
+/// parameter it feeds, so an $N \times d$ `mu` beside an $N \times d \times d$
+/// `cov` is one legal mixture. It has no `broadcast(record, …)` form (§04
+/// *Collection arguments* strips every axis to reach a cell), so it lowers to the
+/// per-component slice form instead — the SAME §06 density rule, unrolled.
 #[test]
-fn a_multivariate_family_refuses_and_names_the_implementation_limit() {
-    let msg = refusal(
+fn a_multivariate_family_lowers_to_per_component_slices() {
+    let pir = lower(MULTIVARIATE);
+    assert_eq!(
+        pir.matches("builtin_logdensityof").count(),
+        2,
+        "one density term per component, N = 2 here:\n{pir}"
+    );
+    assert!(
+        pir.contains("(logsumexp ") && !pir.contains("(sum "),
+        "the components are still contracted with logsumexp, never sum:\n{pir}"
+    );
+    assert!(
+        !pir.contains("ksuperpose") && !pir.contains("(logdensityof "),
+        "the measure layer is gone:\n{pir}"
+    );
+}
+
+/// The selector count is the argument's OUTER rank, not its total axis count.
+/// §07 `get`: "the keyword `all` selects an entire axis: `get(M, i, all)` returns
+/// row i". So the FLAT $N \times d$ `mus` takes one `all` for its remaining outer
+/// axis, while the NESTED `covs = [c1, c1]` — a 2-vector of 2×2 matrices, a
+/// distinct §03 type — needs no `all`, because its one index already lands on the
+/// whole matrix. Pinned per argument because emitting one `all` too many for the
+/// nested spelling is a silent, plausible-looking mislowering.
+#[test]
+fn each_family_argument_is_sliced_by_its_own_outer_rank() {
+    let pir = lower(MULTIVARIATE);
+    assert!(
+        pir.contains("(get (%ref self mus) 1 all)") && pir.contains("(get (%ref self mus) 2 all)"),
+        "the flat N x d `mus` slices a row per component:\n{pir}"
+    );
+    assert!(
+        pir.contains("(get (%ref self covs) 1)") && pir.contains("(get (%ref self covs) 2)"),
+        "the nested N-vector of matrices takes one selector, no `all`:\n{pir}"
+    );
+    assert!(
+        !pir.contains("(get (%ref self covs) 1 all"),
+        "an `all` for an axis the ELEMENT carries would index into the matrix:\n{pir}"
+    );
+    assert!(
+        pir.contains("(get (%ref self w) 1)") && pir.contains("(get (%ref self w) 2)"),
+        "each component reads its own weight, 1-based per §07:\n{pir}"
+    );
+}
+
+/// §06: "a collection whose leading axis has size one … is shared by every
+/// component", so a singular `cov` reads row 1 for both components while `mu`
+/// keeps advancing.
+#[test]
+fn a_singular_family_axis_is_shared_by_every_component() {
+    let pir = lower(
         "w = [0.2, 0.8]\n\
          mus = rowstack([[0.0, 0.0], [3.0, 3.0]])\n\
+         c1 = rowstack([[1.0, 0.2], [0.2, 1.0]])\n\
+         covs = [c1]\n\
+         mix = ksuperpose(MvNormal, w)(mu = mus, cov = covs)\n\
+         y = elementof(cartpow(reals, 2))\n\
+         lp = logdensityof(mix, y)\n",
+    );
+    assert_eq!(
+        pir.matches("(get (%ref self covs) 1)").count(),
+        2,
+        "the singular cov is read at row 1 by both components:\n{pir}"
+    );
+    assert!(
+        pir.contains("(get (%ref self mus) 2 all)"),
+        "the size-N `mus` still advances:\n{pir}"
+    );
+}
+
+/// §06 makes `N` "not necessarily statically known" and the axis-native scalar
+/// form honours that, but the per-component slice extraction emits one `get` per
+/// component, so it needs a static `N`. Refuse rather than guess a count.
+#[test]
+fn a_multivariate_family_with_a_dynamic_n_refuses() {
+    let msg = refusal(
+        "n = elementof(posintegers)\n\
+         w = external(cartpow(nonnegreals, n))\n\
+         mus = external(cartpow(cartpow(reals, 2), n))\n\
          c1 = rowstack([[1.0, 0.2], [0.2, 1.0]])\n\
          covs = [c1, c1]\n\
          mix = ksuperpose(MvNormal, w)(mu = mus, cov = covs)\n\
@@ -257,12 +349,8 @@ fn a_multivariate_family_refuses_and_names_the_implementation_limit() {
          lp = logdensityof(mix, y)\n",
     );
     assert!(
-        msg.contains("MULTIVARIATE parameter family") && msg.contains("is not lowered"),
+        msg.contains("statically known component count"),
         "got: {msg}"
-    );
-    assert!(
-        !msg.contains("static error"),
-        "the model is legal FlatPPL; the refusal is an implementation limit: {msg}"
     );
 }
 
