@@ -2076,8 +2076,10 @@ fn lower_measure_density_at(
     v: NodeId,
     origin: VariateOrigin,
 ) -> Result<NodeId, RefuseError> {
-    // Resolve a single level of `(%ref self x)` indirection on the measure side.
-    let (measure_node, _binding_opt) = resolve_ref_one(m, measure_expr);
+    // Resolve `(%ref self x)` indirection on the measure side. A CHAIN, not one
+    // level: `M = g1` is a §04 bare-name alias of `g1`'s expression, so stopping
+    // at `M`'s ref-node right-hand side would refuse it as a non-constructor.
+    let (measure_node, _binding_opt) = resolve_ref_chain(m, measure_expr);
 
     // A reified-kernel *application* `k(input)` (a `%call(User(k), [input])`)
     // is not a builtin-named op; β-reduce it to its measure body and recurse.
@@ -7787,9 +7789,9 @@ pub(crate) fn build_density_term(
 ///   (`logdensityof(m.d, v)`). Here the measure is already a measure; there is
 ///   no `lawof` wrapper to strip.
 ///
-/// We resolve one level of ref indirection and strip a `lawof` if present;
+/// We resolve the ref-indirection chain and strip a `lawof` if present;
 /// otherwise we hand the (original, unresolved) measure node straight to the
-/// dispatcher, which itself resolves one ref level and dispatches by op.
+/// dispatcher, which resolves the same chain and dispatches by op.
 ///
 /// The `bool` reports whether a `lawof` was stripped. The strip bypasses the
 /// dispatcher's `"lawof"` arm entirely, so §04's total-law reading — and hence the
@@ -7801,7 +7803,9 @@ pub(crate) fn build_density_term(
 /// query), so it works on a grafted node the caller substituted for the original
 /// cross-module ref.
 fn measure_of_arg(m: &Module, measure_arg: NodeId) -> Result<(NodeId, bool), RefuseError> {
-    let (resolved, _) = resolve_ref_one(m, measure_arg);
+    // A chain, so `M2 = M`, `M = lawof(x)` strips the same `lawof` the direct
+    // spelling does (§04 bare-name alias).
+    let (resolved, _) = resolve_ref_chain(m, measure_arg);
     if let Some(law) = expect_builtin_call(m, resolved, "lawof") {
         if law.args.len() != 1 {
             return Err(refuse(resolved, m, "lawof expects 1 arg"));
@@ -7955,6 +7959,33 @@ pub(crate) fn resolve_ref_one(m: &Module, id: NodeId) -> (NodeId, Option<Binding
         }
     }
     (id, None)
+}
+
+/// Follow a CHAIN of `(%ref self x)` indirections, hopping while each resolved
+/// right-hand side is itself a self-ref.
+///
+/// §04 *Name resolution* resolves an unqualified name to "that binding", and a
+/// module is "an unordered set of bindings of names to expressions". So a
+/// bare-name binding `M = g1` names the very expression `g1` names, and the two
+/// spellings must lower identically. One hop off `M` lands on `M`'s right-hand
+/// side — the ref node `g1` — which is not a measure op and not a constructor
+/// call, so a caller that stops there refuses a legal alias.
+///
+/// Bounded by the binding count: a cyclic module is a static error, but the
+/// determiniser must not hang on one.
+pub(crate) fn resolve_ref_chain(m: &Module, id: NodeId) -> (NodeId, Option<BindingId>) {
+    let (mut node, mut bid) = resolve_ref_one(m, id);
+    for _ in 0..m.binding_count() {
+        let (next, next_bid) = resolve_ref_one(m, node);
+        match next_bid {
+            Some(b) => {
+                node = next;
+                bid = Some(b);
+            }
+            None => break,
+        }
+    }
+    (node, bid)
 }
 
 /// A refusal naming the construct at `id`.
