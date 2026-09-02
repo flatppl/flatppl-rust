@@ -2240,8 +2240,26 @@ fn lower_pi(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitE
 /// `v - max(v)` needs `max(v)` broadcast back up to `v`'s shape first
 /// (StableHLO's elementwise ops require identical operand shapes — no
 /// implicit scalar broadcast).
+///
+/// A statically two-element `vector(a, b)` of SCALAR terms takes
+/// [`lower_logaddexp`] instead and never builds the tensor at all. That is
+/// the shape every two-mixand `superpose` reaches, and the reduce form is
+/// hostile to reverse-mode AD there: the adjoint of a max-reduce has to
+/// recover which element attained the max, so Enzyme-JAX emits a
+/// compare/select pair per term and keeps the argmax on the tape. Measured on
+/// `signal-background-counting`, the reduce form costs 192 bytes of gradient
+/// scratch per event and the scalar form is flat in event count.
 fn lower_logsumexp(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
     let [v] = args_exact(id, args)?;
+    if let Some([t0, t1]) = static_pair_terms(e, v) {
+        let a = e.lower_node(t0)?;
+        let b = e.lower_node(t1)?;
+        if a.ty == MlirTy::Scalar && b.ty == MlirTy::Scalar {
+            return Ok(lower_logaddexp(e, &a, &b));
+        }
+        // Ranked terms: the reduce below contracts the stacked axis together with
+        // the elements' own axes, which the scalar identity cannot express.
+    }
     let v = e.lower_node(v)?;
     let m = e.reduce_max(&v);
     let m_bc = broadcast_to(e, id, &m, &v.ty)?;
@@ -2250,6 +2268,82 @@ fn lower_logsumexp(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value
     let sum = e.reduce_sum(&exp_shifted);
     let log_sum = e.log(&sum);
     Ok(e.add(&log_sum, &m))
+}
+
+/// The two element nodes of a statically two-element `vector(a, b)` argument;
+/// `None` for any other operand (a longer vector literal, an ABI input, a
+/// `partition` result — anything whose length is not visible here).
+fn static_pair_terms(e: &Emitter, v: NodeId) -> Option<[NodeId; 2]> {
+    let v = e.resolve_ref_one(v);
+    let Node::Call(c) = e.node(v) else {
+        return None;
+    };
+    if !matches!(c.head, CallHead::Builtin(sym) if e.resolve(sym) == "vector") {
+        return None;
+    }
+    match c.args.as_ref() {
+        [a, b] => Some([*a, *b]),
+        _ => None,
+    }
+}
+
+/// `logsumexp([a, b])` as scalar elementwise ops:
+/// `max(a, b) + log1p(exp(-|a - b|))`, with the difference gated to `0` on an
+/// exact tie.
+///
+/// Algebraically the shift-by-max identity with the two terms written out:
+/// with `m = max(a, b)` one shifted exponential is `exp(0) = 1` and the other
+/// is `exp(-|a - b|)`, so `log(1 + exp(-|a - b|))` replaces the whole
+/// `reduce max` / broadcast / `reduce add` chain. `log1p` rather than
+/// `log(1 + …)` keeps the small-argument end accurate: for `|a - b|` around
+/// 30 the addend is at the f32 epsilon boundary, where `1 + x` rounds to `1`
+/// and `log` returns exactly `0` while `log1p` returns `x`.
+///
+/// `a - b` is the one ill-defined step: IEEE gives `(±inf) - (±inf) = NaN`,
+/// which the reduce form turns into a NaN density for a mixture whose every
+/// component has zero density at the point. `m` is the maximum, so `|m| =
+/// inf` covers every operand pair that can reach that subtraction, and in ALL
+/// of them the answer is `m` itself: `m = -inf` forces both terms to `-inf`,
+/// and `m = +inf` swamps whatever the other term is. So
+/// `select(|m| == inf, 0, a - b)` gives `m + log1p(exp(0)) = m + log 2`,
+/// which is `±inf` — the right answer, and reached without evaluating the
+/// subtraction's NaN.
+///
+/// The gate deliberately does NOT fire on a finite tie. Gating every `a == b`
+/// is one op cheaper and gives the same values, but it cuts the `a - b` path
+/// out of the adjoint exactly where both terms contribute equally, and the
+/// tie gradient comes back `(1, 0)` from `maximum` alone instead of the
+/// correct `(0.5, 0.5)`. Keying on `|m|` leaves the finite tie on the
+/// ordinary path, where `a - b` is already `0` and the adjoint splits
+/// correctly. It also keys on a magnitude rather than a `NaN` test of the
+/// difference, so nothing here depends on a compiler preserving `x != x`.
+///
+/// Extremes, all checked against the reduce form and against mpmath at 50
+/// digits, value and Enzyme adjoint, in f32 and f64: a finite tie gives
+/// `a + log 2` with adjoint `(0.5, 0.5)`; one term `-inf` gives the other
+/// term, because `-|(-inf) - b|` is `-inf` and `log1p(exp(-inf))` is `0`; a
+/// large gap underflows `exp` to `0` and returns `max` exactly; a NaN term
+/// propagates through `max`.
+///
+/// The reduce path above still returns NaN at an infinite tie. Fixing it
+/// there means gating a whole shifted VECTOR, which is a separate change; it
+/// is carded in `flatppl-dev/TODO-flatppl-rust.md` under the k-way
+/// `superpose`.
+fn lower_logaddexp(e: &mut Emitter, a: &Value, b: &Value) -> Value {
+    let m = e.max(a, b);
+    let mag = e.abs(&m);
+    // `Emitter::inf`, not `scalar(f64::INFINITY)`: a decimal float literal
+    // prints as `inf`, which MLIR's float-attribute grammar rejects.
+    let inf = e.inf(mag.ty.clone());
+    let saturated = e.compare("EQ", &mag, &inf);
+    let raw = e.sub(a, b);
+    let zero = e.scalar(0.0);
+    let d = e.select(&saturated, &zero, &raw);
+    let gap = e.abs(&d);
+    let neg_gap = e.neg(&gap);
+    let ex = e.exp(&neg_gap);
+    let l = e.log1p(&ex);
+    e.add(&m, &l)
 }
 
 /// Broadcast a value `a` up to `ty`'s shape via [`Emitter::broadcast_in_dim`]

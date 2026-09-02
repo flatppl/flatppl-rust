@@ -1282,46 +1282,102 @@ fn lower_logsumexp_emits_stable_shift_by_max_formula_in_order() {
     assert!(is_delimiter_balanced(&out));
 }
 
-/// The REAL shape the determiniser emits (superpose/discrete-marginal):
-/// `logsumexp(vector(t1, t2))`, built as an actual `vector(...)` call node —
-/// not a pre-`bind`ed synthetic tensor. Must emit `stablehlo.concatenate`
-/// (packing the two scalar elements into a length-2 tensor) before the
-/// stable logsumexp formula.
-#[test]
-fn lower_logsumexp_of_vector_emits_concatenate_then_stable_formula() {
+/// Emit a `logsumexp(vector(t1, …, tk))` over `k` scalar terms, the REAL shape
+/// the determiniser emits (superpose/discrete-marginal), built as an actual
+/// `vector(...)` call node rather than a pre-`bind`ed synthetic tensor.
+fn emit_logsumexp_over_scalars(k: usize) -> String {
     let mut m = Module::new();
-    let t1 = local_ref(&mut m, "t1");
-    let t2 = local_ref(&mut m, "t2");
-    let vec_node = call(&mut m, "vector", &[t1, t2]);
+    let terms: Vec<_> = (0..k)
+        .map(|i| local_ref(&mut m, &format!("t{i}")))
+        .collect();
+    let vec_node = call(&mut m, "vector", &terms);
     let node = call(&mut m, "logsumexp", &[vec_node]);
 
     let mut e = Emitter::new(&m, Dtype::F32);
-    e.bind(
-        t1,
-        Value {
-            ssa: "%arg0".to_string(),
-            ty: MlirTy::Scalar,
-            elem: ElemKind::Real,
-        },
-    );
-    e.bind(
-        t2,
-        Value {
-            ssa: "%arg1".to_string(),
-            ty: MlirTy::Scalar,
-            elem: ElemKind::Real,
-        },
-    );
+    let params: Vec<_> = (0..k)
+        .map(|i| (format!("%arg{i}"), MlirTy::Scalar, ElemKind::Real))
+        .collect();
+    for (&t, p) in terms.iter().zip(&params) {
+        e.bind(
+            t,
+            Value {
+                ssa: p.0.clone(),
+                ty: MlirTy::Scalar,
+                elem: ElemKind::Real,
+            },
+        );
+    }
     let result = e.lower_node(node).unwrap();
     assert_eq!(result.ty, MlirTy::Scalar);
-    let out = e.finish(
-        "f",
-        &[
-            ("%arg0".to_string(), MlirTy::Scalar, ElemKind::Real),
-            ("%arg1".to_string(), MlirTy::Scalar, ElemKind::Real),
-        ],
-        &[&result],
+    let out = e.finish("f", &params, &[&result]);
+    assert!(is_delimiter_balanced(&out));
+    out
+}
+
+/// Two scalar terms take the scalar `logaddexp` arm — `max(a, b) +
+/// log1p(exp(-|a - b|))` over the saturation gate — with NO tensor built at
+/// all. The two-element tensor this used to emit is hostile to reverse-mode
+/// AD, because the adjoint of the max-reduce recovers the argmax, so the
+/// shape is pinned here and not just the value.
+#[test]
+fn lower_logsumexp_of_two_scalars_emits_scalar_logaddexp() {
+    let out = emit_logsumexp_over_scalars(2);
+
+    assert!(
+        !out.contains("stablehlo.concatenate"),
+        "two-way logsumexp must not build a tensor, in:\n{out}"
     );
+    assert!(
+        !out.contains("stablehlo.reduce"),
+        "two-way logsumexp must not reduce, in:\n{out}"
+    );
+    assert!(
+        !out.contains("tensor<2xf32>"),
+        "two-way logsumexp must stay scalar, in:\n{out}"
+    );
+
+    let max_pos = out.find("stablehlo.maximum").expect("missing maximum");
+    // `|max(a, b)|`, then `|a - b|` — the gate's magnitude and the gap.
+    let mag_pos = out.find("stablehlo.abs").expect("missing abs");
+    let gap_pos = out.rfind("stablehlo.abs").expect("missing abs");
+    let cmp_pos = out
+        .find("stablehlo.compare EQ")
+        .expect("missing saturation compare");
+    let sub_pos = out.find("stablehlo.subtract").expect("missing subtract");
+    let sel_pos = out.find("stablehlo.select").expect("missing gate select");
+    let neg_pos = out.find("stablehlo.negate").expect("missing negate");
+    let exp_pos = out
+        .find("stablehlo.exponential")
+        .expect("missing exponential");
+    let log1p_pos = out
+        .find("stablehlo.log_plus_one")
+        .expect("missing log_plus_one");
+    let add_pos = out.find("stablehlo.add %").expect("missing final add");
+
+    assert!(max_pos < mag_pos, "maximum before its abs, in:\n{out}");
+    assert!(mag_pos < cmp_pos, "abs before compare, in:\n{out}");
+    assert!(cmp_pos < sub_pos, "compare before subtract, in:\n{out}");
+    assert!(sub_pos < sel_pos, "subtract before select, in:\n{out}");
+    assert!(sel_pos < gap_pos, "select before the gap abs, in:\n{out}");
+    assert!(gap_pos < neg_pos, "gap abs before negate, in:\n{out}");
+    assert!(neg_pos < exp_pos, "negate before exp, in:\n{out}");
+    assert!(exp_pos < log1p_pos, "exp before log1p, in:\n{out}");
+    assert!(log1p_pos < add_pos, "log1p before final add, in:\n{out}");
+    assert!(mag_pos < gap_pos, "two distinct abs ops, in:\n{out}");
+
+    // The gate compares against +inf: an infinite max is the only pair that
+    // can make `a - b` a NaN, and there the answer is the max itself.
+    assert!(
+        out.contains("stablehlo.constant dense<0x7F800000>"),
+        "missing +inf gate constant, in:\n{out}"
+    );
+}
+
+/// Three or more terms keep the shift-by-max tensor reduce: the scalar
+/// identity is two-term only, so `k > 2` must still `concatenate` and reduce.
+#[test]
+fn lower_logsumexp_of_three_scalars_keeps_the_tensor_reduce() {
+    let out = emit_logsumexp_over_scalars(3);
 
     let concat_pos = out
         .find("stablehlo.concatenate")
@@ -1348,10 +1404,13 @@ fn lower_logsumexp_of_vector_emits_concatenate_then_stable_formula() {
         "missing concatenate dim attr in:\n{out}"
     );
     assert!(
-        out.contains("-> tensor<2xf32>"),
+        out.contains("-> tensor<3xf32>"),
         "missing concatenate result shape in:\n{out}"
     );
-    assert!(is_delimiter_balanced(&out));
+    assert!(
+        !out.contains("stablehlo.log_plus_one"),
+        "k > 2 must not take the scalar arm, in:\n{out}"
+    );
 }
 
 /// `sum(a)` (histfactory's `sum(broadcast(builtin_logdensityof, …))`) is a
