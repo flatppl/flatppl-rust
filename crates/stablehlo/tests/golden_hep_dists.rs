@@ -222,9 +222,15 @@ outputs = lp";
 // `x = 3.7` is the point that matters: a non-integer variate is exactly what
 // §09 adds this measure for, and `Poisson`'s counting-measure mass cannot score
 // it. The dotted band is wider because `lgamma(401) ~ 1990` cancels down to a
-// result of order ten, which is f32 arithmetic, not a lowering error. The
-// `corpora/hs3/conversions/histfactory` row gates the same shape against an
-// independent closed-form Poisson-product oracle.
+// result of order ten, which is f32 arithmetic, not a lowering error.
+//
+// This crate evaluates no density (`flatppl-rust` has no evaluator), so it can
+// pin the emitted MODULE but never a number. Those seven scalar points are
+// pinned as an executed gate by `corpora/stablehlo/continued_poisson` in
+// flatppl-testsuite, against the same scipy `gammaln` closed form; the dotted
+// shape is gated by `corpora/hs3/conversions/histfactory` against an
+// independent closed-form Poisson-product oracle. What the tests below add is
+// the structure that gate cannot see.
 
 const CONTINUED_POISSON_SRC: &str = "\
 hep = standard_module(\"particle-physics\", \"0.1\")
@@ -307,4 +313,62 @@ outputs = (lp)";
         1,
         "the continuation must be emitted once, not once per bin:\n{mlir}"
     );
+}
+
+// A LITERAL variate must reach the same guarded formula as an ABI one: the
+// emitted module carries the variate constant, the `GE 0` guard, the guarded
+// `select` feeding the formula, and the `-inf` branch — at every one of the
+// three cases §09 distinguishes.
+//
+// This is the regression a value gate cannot see. An emitter that special-cased
+// a literal would be free to fold `x = 3.0` onto a `Poisson` integer path (same
+// number, wrong measure, and then wrong at `x = 3.7`) or fold `x = -0.5`
+// straight to a bare `-inf` constant, dropping the guarded evaluation that keeps
+// the reverse-mode gradient `nan`-free. Both would still match every frozen
+// value. The executed numbers for these points are in the header table and
+// gated by `corpora/stablehlo/continued_poisson`.
+#[test]
+fn a_literal_variate_reaches_the_same_guarded_formula_at_each_support_case() {
+    // (variate literal, the constant it must emit) — in support at an integer,
+    // in support at a NON-integer, and below the support. A negative literal is
+    // emitted as its magnitude plus a `negate`, which is why the third case
+    // matches `dense<0.5>` rather than a signed constant.
+    for (variate, constant) in [
+        ("3.0", "dense<3.0>"),
+        ("3.7", "dense<3.7>"),
+        ("-0.5", "dense<0.5>"),
+    ] {
+        let src = format!(
+            "hep = standard_module(\"particle-physics\", \"0.1\")\n\
+             d = elementof(reals)\n\
+             aux = functionof(hep.ContinuedPoisson(rate = 4.5))\n\
+             aux_lik = likelihoodof(aux, {variate})\n\
+             lp = logdensityof(aux_lik, record(d = d))\n\
+             inputs = (d)\n\
+             outputs = (lp)"
+        );
+        let mlir = emit(&src);
+        assert!(
+            mlir.contains(constant),
+            "the variate literal {variate} must reach the module as {constant}:\n{mlir}"
+        );
+        assert!(
+            mlir.contains("compare GE"),
+            "{variate}: the support guard must survive a literal variate — a \
+             folded-away guard is how a below-zero variate starts scoring a \
+             finite number:\n{mlir}"
+        );
+        assert_eq!(
+            mlir.matches("chlo.lgamma").count(),
+            1,
+            "{variate}: the gamma continuation must survive a literal variate — \
+             an integer literal must NOT reach a `Poisson` factorial path:\n{mlir}"
+        );
+        assert!(
+            mlir.contains("dense<0x7F800000>") && mlir.contains("stablehlo.negate"),
+            "{variate}: the `-inf` off-support branch must be emitted at every \
+             literal, including one below zero — folding it to a bare constant \
+             would drop the guarded evaluation `mask_support` exists for:\n{mlir}"
+        );
+    }
 }
