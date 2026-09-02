@@ -16,6 +16,9 @@
 //! `flatppl-testsuite`'s `corpora/coverage/mv_mixture` against a frozen scipy
 //! vector.
 
+mod common;
+
+use common::pir_binding;
 use flatppl_determinizer::{determinize, is_flatpdl};
 
 fn lower(src: &str) -> String {
@@ -348,9 +351,107 @@ fn a_multivariate_family_with_a_dynamic_n_refuses() {
          y = elementof(cartpow(reals, 2))\n\
          lp = logdensityof(mix, y)\n",
     );
+    assert_eq!(
+        msg,
+        "ksuperpose :: ksuperpose over a MULTIVARIATE parameter family needs a statically \
+         known component count (§06 admits a dynamic `N`, but the per-component slice \
+         extraction emits one `get` per component): `weights` has no static length"
+    );
     assert!(
-        msg.contains("statically known component count"),
-        "got: {msg}"
+        !msg.contains("static error"),
+        "the model is legal FlatPPL; the refusal is an implementation limit: {msg}"
+    );
+}
+
+/// §06 gives a family argument "size $N$ along the family axis — the length of
+/// `weights` — or be singular". A leading extent that is neither refuses, located
+/// on the offending ARGUMENT rather than on the lift, because that is the binding
+/// the reader has to go fix.
+///
+/// `infer` also rejects this as a §06 static error, so the CLI stops before the
+/// determiniser runs. The guard still earns its place: the determiniser is a
+/// library, and a caller that determinizes past inference errors (as [`refusal`]
+/// does here) would otherwise reach the unrolled path and emit `N` slices of an
+/// argument that has more or fewer rows than that.
+#[test]
+fn a_family_axis_that_is_neither_n_nor_singular_refuses() {
+    let msg = refusal(
+        "w = [0.2, 0.8]\n\
+         mus = rowstack([[0.0, 0.0], [3.0, 3.0], [6.0, 6.0]])\n\
+         c1 = rowstack([[1.0, 0.2], [0.2, 1.0]])\n\
+         covs = [c1, c1]\n\
+         mix = ksuperpose(MvNormal, w)(mu = mus, cov = covs)\n\
+         y = elementof(cartpow(reals, 2))\n\
+         lp = logdensityof(mix, y)\n",
+    );
+    assert_eq!(
+        msg,
+        "`mus` :: a ksuperpose family argument over a MULTIVARIATE family must have a \
+         statically known family axis of size 2 — the length of `weights` — or be \
+         singular (spec §06)"
+    );
+}
+
+/// §06 makes a non-collection argument and a size-one-leading-axis collection MEAN
+/// the same thing: both are "shared by every component". So the two spellings must
+/// agree component for component, which is what this pins — the shared value
+/// reaches every component, the singular collection never advances past row 1, and
+/// the two emissions are otherwise character-for-character identical.
+///
+/// They are NOT byte-identical outright, and cannot be: a non-collection rides as
+/// its own literal (`(%field nu 5.0)`) while a singular collection rides as the
+/// §07 selection that extracts it (`(%field nu (… (get (%ref self dfs) 1)))`).
+/// Collapsing the second to the first would need constant folding of
+/// `get([5.0], 1)`, which this pass does nowhere — and which the axis-native arm
+/// does not do either, where the same two spellings emit `1.0` and
+/// `(%ref self sigmas)` and rely on §04's own singleton expansion. Normalizing
+/// that one field and comparing the rest is the strongest true form of the claim.
+///
+/// `Wishart` because the shape needs one scalar parameter (`nu`, rank 0) beside a
+/// matrix one (`scale`, rank 2): `MvNormal` has no rank-0 parameter, so it cannot
+/// spell a shared argument both ways.
+#[test]
+fn the_two_shared_argument_spellings_agree_component_for_component() {
+    const BASE: &str = "w = [0.3, 0.7]\n\
+                        s1 = rowstack([[2.0, 0.3], [0.3, 2.0]])\n\
+                        s2 = rowstack([[1.0, 0.0], [0.0, 3.0]])\n\
+                        scales = [s1, s2]\n";
+    const TAIL: &str = "y = elementof(cartpow(cartpow(reals, 2), 2))\n\
+                        lp = logdensityof(mix, y)\n";
+    let noncollection = lower(&format!(
+        "{BASE}mix = ksuperpose(Wishart, w)(nu = 5.0, scale = scales)\n{TAIL}"
+    ));
+    let singular = lower(&format!(
+        "{BASE}dfs = [5.0]\nmix = ksuperpose(Wishart, w)(nu = dfs, scale = scales)\n{TAIL}"
+    ));
+
+    const SHARED_LITERAL: &str = "(%field nu 5.0)";
+    const SHARED_SELECTION: &str =
+        "(%field nu (%meta ((%scalar real) %fixed reals) (get (%ref self dfs) 1)))";
+    // The shared value reaches BOTH components, in either spelling.
+    assert_eq!(
+        noncollection.matches(SHARED_LITERAL).count(),
+        2,
+        "the non-collection rides both components:\n{noncollection}"
+    );
+    assert_eq!(
+        singular.matches(SHARED_SELECTION).count(),
+        2,
+        "the singular collection rides both components, read at row 1:\n{singular}"
+    );
+    // §06 shares it, so the singular argument must never advance off row 1 — the
+    // mislowering to guard is reading row `i` and running off a length-1 axis.
+    assert!(
+        !singular.contains("(get (%ref self dfs) 2)"),
+        "a singular family axis must not advance with the component index:\n{singular}"
+    );
+    // Everything else agrees character for character, including both `scale`
+    // slices and both weight reads.
+    let lp = |pir: &str| pir_binding(pir, "lp").replace(SHARED_SELECTION, SHARED_LITERAL);
+    assert_eq!(
+        lp(&noncollection),
+        lp(&singular),
+        "the two §06 spellings differ ONLY in how the shared value is named"
     );
 }
 
