@@ -31,7 +31,8 @@ const END: &str = "<<<FLATPPL-PARITY:END";
 ///
 /// Every entry below was adjudicated against the spec (2026-06-11; the
 /// negated-literal class was closed and its survivors re-adjudicated
-/// 2026-09-01) and falls
+/// 2026-09-01; three fixtures the JS repo added 2026-09-02 hit
+/// already-adjudicated classes) and falls
 /// on the JS side — its `toSexpr` export reflects post-analysis engine
 /// internals rather than the §04 lowering projection. Filed as
 /// "Spec-faithful FlatPIR export" (+ two fixture items) in
@@ -55,6 +56,10 @@ const KNOWN_DIVERGENCES: &[(&str, &str)] = &[
     (
         "rust:modules",
         "JS `toSexpr` crashes on `load_module` %assign substitutions",
+    ),
+    (
+        "js:aggregates",
+        "JS prints built-in values as `(%ref self sum)` (spec: bare symbol)",
     ),
     (
         "js:bayesian_inference_3",
@@ -83,6 +88,10 @@ const KNOWN_DIVERGENCES: &[(&str, &str)] = &[
     (
         "js:disintegrate_dual_kernel",
         "JS splices in symbolically-executed `disintegrate` results",
+    ),
+    (
+        "js:dminus-to-3pi-amplitude",
+        "JS prints built-in values as `(%ref self sum)` (spec: bare symbol)",
     ),
     (
         "js:eight-schools",
@@ -119,6 +128,10 @@ const KNOWN_DIVERGENCES: &[(&str, &str)] = &[
     (
         "js:horseshoe",
         "JS eta-expands dotted-op `broadcast(mul, …)` heads",
+    ),
+    (
+        "js:linear-regression",
+        "JS eta-expands dotted-op `broadcast(add, …)` heads",
     ),
     (
         "js:nested-broadcast-mvnormal-inner",
