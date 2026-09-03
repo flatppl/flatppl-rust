@@ -275,10 +275,17 @@ pub fn run(
                         }
                     }
                     DidCloseTextDocument::METHOD => {
-                        // The editor closed its buffer for this file. Drop it from
-                        // the editor-managed set and forget its version so on-disk
-                        // `didChangeWatchedFiles` events take over again (the file
-                        // is no longer authoritatively owned by the editor).
+                        // LSP 3.17 `textDocument/didClose`: "The document's truth
+                        // now exists where the document's uri points to (e.g. if
+                        // the document's uri is a file uri the truth now exists on
+                        // disk)." So the unsaved buffer must go: re-read the file
+                        // and put the disk text back into the salsa input.
+                        //
+                        // Dropping only `editor_open_uris` and `doc_versions` left
+                        // the abandoned text in the database, and every importing
+                        // module kept inferring against it until an unrelated
+                        // watched-file event happened to arrive. Close-without-save
+                        // is an ordinary editor action, not an edge case.
                         let p: lsp_types::DidCloseTextDocumentParams =
                             match serde_json::from_value(note.params) {
                                 Ok(v) => v,
@@ -290,6 +297,42 @@ pub fn run(
                         let uri_str = p.text_document.uri.as_str().to_owned();
                         editor_open_uris.remove(&uri_str);
                         doc_versions.remove(&uri_str);
+                        release_stale_requests(&connection, &pool, &mut pending)?;
+                        let disk = file_uri_to_path(&uri_str)
+                            .and_then(|path| std::fs::read_to_string(path).ok());
+                        match disk {
+                            // The file exists: its content is the truth again.
+                            Some(text) => {
+                                upsert_file(&mut db, &mut uri_to_file, uri_str.clone(), text);
+                            }
+                            // No file behind the URI (never saved, deleted while
+                            // open, or a non-`file:` scheme). There is no truth to
+                            // fall back to, so stop tracking it entirely rather
+                            // than keep analysing text that exists nowhere.
+                            None => {
+                                uri_to_file.remove(&uri_str);
+                            }
+                        }
+                        sync_file_set(&mut db, fs, &uri_to_file, &url_to_file);
+                        // Every open importer's inference can change, and the
+                        // closed file's own diagnostics are withdrawn if it is
+                        // gone. Publish an empty set for it in that case: the
+                        // client keeps showing the last set otherwise.
+                        if !uri_to_file.contains_key(&uri_str) {
+                            let note = lsp_server::Notification::new(
+                                PublishDiagnostics::METHOD.to_owned(),
+                                PublishDiagnosticsParams {
+                                    uri: p.text_document.uri.clone(),
+                                    diagnostics: Vec::new(),
+                                    version: None,
+                                },
+                            );
+                            connection.sender.send(Message::Notification(note))?;
+                        }
+                        for doc_uri_str in uri_to_file.keys() {
+                            dirty.insert(doc_uri_str.clone());
+                        }
+                        diag_deadline = Some(Instant::now() + DEBOUNCE);
                     }
                     DidChangeWatchedFiles::METHOD => {
                         // Clients (e.g. VS Code) register their own glob watchers and
@@ -793,31 +836,111 @@ fn is_excluded_dir(path: &Path, excluded_dir_names: &HashSet<String>) -> bool {
 /// Convert a `file://` URI string to a filesystem path string, or `None` for
 /// non-`file:` schemes.
 ///
-/// The path portion is percent-decoded so that workspace roots containing
-/// spaces or other special characters (e.g. `file:///Users/me/My%20Project`)
-/// resolve correctly on disk.
+/// Three shapes, per RFC 8089 "The 'file' URI Scheme":
+///
+/// - `file:///Users/me/My%20Project` — an empty authority and a POSIX path.
+///   Percent-decoded so a root containing spaces resolves on disk.
+/// - `file:///C:/proj/m.flatppl` — a Windows local path. The leading `/` before
+///   the drive letter belongs to the URI, not to the path, and the separators
+///   come back as `\`.
+/// - `file://host/share/m.flatppl` — a non-empty authority, i.e. a Windows UNC
+///   path `\\host\share\m.flatppl`.
+///
+/// The old implementation handled only the first: it stripped `file://` and
+/// percent-decoded, with no authority and no drive handling, so a Windows URI
+/// came back as `/C:/proj/m.flatppl` — a path that does not exist — and a UNC
+/// URI lost its leading separators. `build.yml` ships `flatppl-lsp` for
+/// `x86_64-pc-windows-msvc`, so both shapes are reachable.
 fn file_uri_to_path(uri_str: &str) -> Option<String> {
-    let path = uri_str.strip_prefix("file://")?;
-    // strip_prefix leaves "//host/..." on Windows UNC file URIs; on Unix the
-    // authority is always empty so `path` is now the absolute path (possibly
-    // percent-encoded).
-    Some(percent_decode(path))
+    let body = uri_str.strip_prefix("file://")?;
+    // A non-empty authority: `file://host/share/...` is a UNC path. (An empty
+    // authority leaves `body` starting with the path's own `/`.)
+    if !body.is_empty() && !body.starts_with('/') {
+        let decoded = percent_decode(body);
+        return Some(format!("\\\\{}", decoded.replace('/', "\\")));
+    }
+    let decoded = percent_decode(body);
+    if let Some(rest) = windows_drive_path(&decoded) {
+        return Some(rest);
+    }
+    Some(decoded)
 }
 
-/// Percent-encode a filesystem path into a `file://` URI body (encodes spaces
-/// and other reserved bytes; leaves `/` and unreserved chars). Symmetric with
-/// `file_uri_to_path`'s decode.
+/// `\`-separated Windows path for a decoded URI body of the form
+/// `/C:/proj/m.flatppl`, else `None`.
+///
+/// A POSIX absolute path cannot begin with a drive letter followed by `:`, so
+/// the shapes do not collide. (`/c:/x` as a literal POSIX path is legal and
+/// would be misread; every `file:` URI implementation makes that same trade,
+/// because the URI itself carries no platform tag.)
+fn windows_drive_path(body: &str) -> Option<String> {
+    let rest = body.strip_prefix('/')?;
+    let mut chars = rest.chars();
+    let drive = chars.next()?;
+    if !drive.is_ascii_alphabetic() || chars.next()? != ':' {
+        return None;
+    }
+    // A bare `/C:` is the drive root; anything after the colon must be a
+    // separator, not more text.
+    match rest.get(2..3) {
+        None | Some("/") | Some("\\") => Some(rest.replace('/', "\\")),
+        _ => None,
+    }
+}
+
+/// Percent-encode a filesystem path into a `file://` URI (encodes spaces and
+/// other reserved bytes; leaves `/` and unreserved chars). Symmetric with
+/// [`file_uri_to_path`].
+///
+/// Windows paths get their own shapes, matching RFC 8089 and what every LSP
+/// client emits:
+///
+/// - `C:\proj\m.flatppl` -> `file:///C:/proj/m.flatppl`
+/// - `\\host\share\m.flatppl` -> `file://host/share/m.flatppl`
+///
+/// Byte-encoding every non-unreserved byte, as the old implementation did, gave
+/// `file://C%3A%5Cproj%5Cm.flatppl`: no scheme-relative `/`, the drive colon and
+/// every separator escaped. No client resolves that, and it is what the
+/// workspace-root scan, the watched-file handler, the `load_module` base path
+/// and the definition URIs handed back to the client all went through.
 pub(crate) fn path_to_file_uri(path: &str) -> String {
+    // UNC: the host and share become the URI authority.
+    if let Some(rest) = path.strip_prefix("\\\\") {
+        let mut out = String::from("file://");
+        push_encoded(&mut out, &rest.replace('\\', "/"));
+        return out;
+    }
     let mut out = String::from("file://");
-    for b in path.bytes() {
+    let windows_local = {
+        let mut chars = path.chars();
+        matches!(
+            (chars.next(), chars.next(), chars.next()),
+            (Some(d), Some(':'), Some('\\') | Some('/') | None) if d.is_ascii_alphabetic()
+        )
+    };
+    if windows_local {
+        // The `/` before the drive letter is the URI's, so the authority stays
+        // empty and the path is absolute.
+        out.push('/');
+        push_encoded(&mut out, &path.replace('\\', "/"));
+    } else {
+        push_encoded(&mut out, path);
+    }
+    out
+}
+
+/// Percent-encode `s` into `out`, leaving `/`, `:` and the RFC 3986 unreserved
+/// characters. `:` is legal in a URI path (RFC 3986 §3.3 `pchar`) and a Windows
+/// drive letter needs it intact.
+fn push_encoded(out: &mut String, s: &str) {
+    for b in s.bytes() {
         match b {
-            b'/' | b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+            b'/' | b':' | b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
                 out.push(b as char)
             }
             _ => out.push_str(&format!("%{b:02X}")),
         }
     }
-    out
 }
 
 /// Percent-decode a URI path component (`%XX` → byte, then UTF-8).
@@ -849,27 +972,91 @@ fn percent_decode(s: &str) -> String {
 /// into `uri_to_file`.  Unreadable files and non-UTF-8 content are skipped.
 /// A directory whose name is in `excluded_dir_names` is pruned entirely —
 /// none of its descendants are visited.
+///
+/// The walk resolves each entry to its canonical path and stays **inside the
+/// canonical root**, keeping a visited set of directories it has already
+/// entered. `Path::is_dir` follows symlinks, so without both guards a
+/// workspace holding `link -> ../outside` and `selfloop -> .` produced 65
+/// published files from 2 real ones — including a file outside the configured
+/// root, read and analysed, and 32 nested repetitions of the loop until the
+/// OS path limit stopped the walk. Each duplicate was a separate salsa
+/// `SourceFile` with its own diagnostics.
+///
+/// A depth cap alone is not enough: it bounds the loop but still reads outside
+/// the root. Containment is what stops that, and canonicalisation is what makes
+/// containment decidable.
 fn scan_dir(
     dir: &Path,
     db: &mut Database,
     uri_to_file: &mut HashMap<String, SourceFile>,
     excluded_dir_names: &HashSet<String>,
 ) {
+    // The root defines containment, so it must be canonical too: comparing a
+    // canonical child against a symlinked root would reject everything.
+    let Ok(root) = std::fs::canonicalize(dir) else {
+        return;
+    };
+    let mut visited: HashSet<std::path::PathBuf> = HashSet::new();
+    visited.insert(root.clone());
+    scan_dir_within(
+        &root,
+        &root,
+        db,
+        uri_to_file,
+        excluded_dir_names,
+        &mut visited,
+    );
+}
+
+/// One level of [`scan_dir`]'s walk. `root` is the canonical workspace root;
+/// `visited` holds the canonical directories already entered.
+fn scan_dir_within(
+    dir: &Path,
+    root: &Path,
+    db: &mut Database,
+    uri_to_file: &mut HashMap<String, SourceFile>,
+    excluded_dir_names: &HashSet<String>,
+    visited: &mut HashSet<std::path::PathBuf>,
+) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_dir() {
-            if is_excluded_dir(&path, excluded_dir_names) {
+        // Resolve before deciding anything: the entry may be a symlink, and
+        // both the containment test and the loop test are about the target.
+        let Ok(canonical) = std::fs::canonicalize(&path) else {
+            continue; // a broken symlink, or a path we cannot resolve
+        };
+        if !canonical.starts_with(root) {
+            continue; // outside the configured workspace root
+        }
+        if canonical.is_dir() {
+            // Prune on the name the walk reached it by AND on the resolved
+            // name, so a link cannot smuggle an excluded directory back in.
+            if is_excluded_dir(&path, excluded_dir_names)
+                || is_excluded_dir(&canonical, excluded_dir_names)
+            {
                 continue;
             }
-            scan_dir(&path, db, uri_to_file, excluded_dir_names);
-        } else if path.extension().and_then(|e| e.to_str()) == Some("flatppl") {
-            let Ok(text) = std::fs::read_to_string(&path) else {
+            if !visited.insert(canonical.clone()) {
+                continue; // already walked: a loop, or two links to one directory
+            }
+            scan_dir_within(
+                &canonical,
+                root,
+                db,
+                uri_to_file,
+                excluded_dir_names,
+                visited,
+            );
+        } else if canonical.extension().and_then(|e| e.to_str()) == Some("flatppl") {
+            let Ok(text) = std::fs::read_to_string(&canonical) else {
                 continue;
             };
-            let path_str = path.to_string_lossy().into_owned();
+            // Store the canonical path, so two spellings of one file are one
+            // `SourceFile` with one set of diagnostics.
+            let path_str = canonical.to_string_lossy().into_owned();
             let uri_str = path_to_file_uri(&path_str);
             let file = SourceFile::new(db, path_str, text);
             uri_to_file.insert(uri_str, file);
@@ -1786,6 +1973,97 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
+    /// A symlink pointing out of the workspace is not followed, and a symlink
+    /// pointing back at the workspace does not loop.
+    ///
+    /// The audit's workspace — `link -> ../outside` plus `selfloop -> .` — gave
+    /// 65 published files from 2 real ones, one of them outside the configured
+    /// root, plus 32 nested repetitions of the loop.
+    #[test]
+    fn scan_dir_refuses_an_outward_symlink_and_a_self_loop() {
+        let base = std::env::temp_dir().join(format!(
+            "flatppl_lsp_symlink_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let ws = base.join("ws");
+        let outside = base.join("outside").join("secret");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(ws.join("m.flatppl"), "a = 1.5\n").unwrap();
+        std::fs::write(outside.join("leak.flatppl"), "b = 2.5\n").unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(base.join("outside"), ws.join("link")).unwrap();
+            std::os::unix::fs::symlink(&ws, ws.join("selfloop")).unwrap();
+        }
+
+        let mut db = Database::default();
+        let mut uri_to_file: HashMap<String, SourceFile> = HashMap::new();
+        scan_dir(&ws, &mut db, &mut uri_to_file, &HashSet::new());
+
+        let scanned: Vec<String> = uri_to_file.keys().cloned().collect();
+        assert_eq!(
+            scanned.len(),
+            1,
+            "one real file in the root; got: {scanned:?}"
+        );
+        assert!(
+            scanned[0].ends_with("m.flatppl"),
+            "the one file is the root's own; got: {scanned:?}"
+        );
+        assert!(
+            !scanned.iter().any(|u| u.contains("leak")),
+            "a file outside the root must never be read: {scanned:?}"
+        );
+        assert!(
+            !scanned.iter().any(|u| u.contains("selfloop")),
+            "the loop must not produce duplicate entries: {scanned:?}"
+        );
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Two links to one real directory yield one entry each file, not two: the
+    /// visited set is keyed on the canonical path, and the stored path is
+    /// canonical too, so a file has one `SourceFile` and one set of
+    /// diagnostics.
+    #[test]
+    fn scan_dir_deduplicates_two_links_to_one_directory() {
+        let ws = std::env::temp_dir().join(format!(
+            "flatppl_lsp_dedupe_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let real = ws.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("m.flatppl"), "a = 1.5\n").unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&real, ws.join("alias_one")).unwrap();
+            std::os::unix::fs::symlink(&real, ws.join("alias_two")).unwrap();
+        }
+
+        let mut db = Database::default();
+        let mut uri_to_file: HashMap<String, SourceFile> = HashMap::new();
+        scan_dir(&ws, &mut db, &mut uri_to_file, &HashSet::new());
+
+        let scanned: Vec<String> = uri_to_file.keys().cloned().collect();
+        assert_eq!(
+            scanned.len(),
+            1,
+            "one real file behind three names; got: {scanned:?}"
+        );
+
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
     // ── position_to_byte ──────────────────────────────────────────────────────
 
     fn position_to_byte(text: &str, line: u32, character: u32) -> u32 {
@@ -1916,6 +2194,96 @@ mod tests {
         assert_eq!(
             file_uri_to_path("file:///tmp/My%20Project/a.flatppl"),
             Some("/tmp/My Project/a.flatppl".to_owned())
+        );
+    }
+
+    // ── Windows-shaped URIs ──────────────────────────────────────────────────
+    //
+    // `build.yml` ships `flatppl` and `flatppl-lsp` for
+    // `x86_64-pc-windows-msvc`, while `test.yml` runs `ubuntu-latest` alone, so
+    // these are the only coverage the Windows shapes have. They are pure string
+    // conversions, so they run on any host. A Windows CI job is still missing:
+    // nothing here exercises a real Windows filesystem.
+    #[test]
+    fn windows_local_path_round_trips() {
+        // RFC 8089: the `/` before the drive letter is the URI's, and `:` is a
+        // legal path character that must stay unescaped.
+        assert_eq!(
+            path_to_file_uri("C:\\proj\\m.flatppl"),
+            "file:///C:/proj/m.flatppl"
+        );
+        assert_eq!(
+            file_uri_to_path("file:///C:/proj/m.flatppl"),
+            Some("C:\\proj\\m.flatppl".to_owned())
+        );
+        // A drive root, and a lower-case drive letter.
+        assert_eq!(path_to_file_uri("C:\\"), "file:///C:/");
+        assert_eq!(
+            file_uri_to_path("file:///d:/x.flatppl"),
+            Some("d:\\x.flatppl".to_owned())
+        );
+    }
+
+    #[test]
+    fn windows_local_path_with_a_space_round_trips() {
+        assert_eq!(
+            path_to_file_uri("C:\\My Proj\\m.flatppl"),
+            "file:///C:/My%20Proj/m.flatppl"
+        );
+        assert_eq!(
+            file_uri_to_path("file:///C:/My%20Proj/m.flatppl"),
+            Some("C:\\My Proj\\m.flatppl".to_owned())
+        );
+    }
+
+    #[test]
+    fn windows_unc_path_round_trips() {
+        // A UNC host is the URI authority, so there is no third slash.
+        assert_eq!(
+            path_to_file_uri("\\\\host\\share\\m.flatppl"),
+            "file://host/share/m.flatppl"
+        );
+        assert_eq!(
+            file_uri_to_path("file://host/share/m.flatppl"),
+            Some("\\\\host\\share\\m.flatppl".to_owned())
+        );
+    }
+
+    #[test]
+    fn the_old_encoding_is_gone() {
+        // The shape that no client could resolve: no scheme-relative `/`, the
+        // drive colon escaped, every separator escaped.
+        let uri = path_to_file_uri("C:\\proj\\m.flatppl");
+        assert!(
+            !uri.contains("%3A"),
+            "the drive colon must stay literal: {uri}"
+        );
+        assert!(!uri.contains("%5C"), "separators must become `/`: {uri}");
+        assert!(
+            uri.starts_with("file:///"),
+            "a local path needs an empty authority: {uri}"
+        );
+    }
+
+    #[test]
+    fn posix_paths_are_unaffected() {
+        assert_eq!(
+            path_to_file_uri("/Users/me/m.flatppl"),
+            "file:///Users/me/m.flatppl"
+        );
+        assert_eq!(
+            file_uri_to_path("file:///Users/me/m.flatppl"),
+            Some("/Users/me/m.flatppl".to_owned())
+        );
+        // A relative path keeps its old shape (no leading `/` invented).
+        assert_eq!(
+            path_to_file_uri("helpers.flatppl"),
+            "file://helpers.flatppl"
+        );
+        // A POSIX name that merely contains a colon is not a drive path.
+        assert_eq!(
+            file_uri_to_path("file:///Users/odd:name/m.flatppl"),
+            Some("/Users/odd:name/m.flatppl".to_owned())
         );
     }
 
