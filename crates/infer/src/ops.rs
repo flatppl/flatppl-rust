@@ -139,6 +139,13 @@ pub(crate) fn call_rule(
         None => args,
     };
 
+    // Argument DOMAINS, after normalization (the checks index declared positions)
+    // and ahead of the per-op rules, which read an argument's type without asking
+    // whether the row's documented domain admits it.
+    if let Some(ty) = domain_check(inf, &name, args) {
+        return (ty, joined);
+    }
+
     let ty = match name.as_str() {
         // ---- arithmetic (spec §07) — structural: result depends on arg shapes/types ----
         "add" | "sub" => elementwise2(&args.first(), &args.get(1)),
@@ -6146,6 +6153,326 @@ fn arity_check(
     ));
     Some(Type::Failed(
         format!("{name} takes {declared}, got {got}").into(),
+    ))
+}
+
+/// Reject a call whose argument falls outside the domain its row documents.
+/// `None` when every argument is admissible, or when no argument's type is
+/// concrete enough to decide — a `%deferred`, `%any` or type-variable argument
+/// is never refused, so partial inference stays honest and only a definite
+/// mismatch is a static error.
+///
+/// Three domains are checked, each anchored on the spec sentence that states it:
+///
+/// - the boolean-only domain of the conditional and logical heads
+///   ([`refuse_nonboolean_domain`]),
+/// - a string where the row documents no textual parameter
+///   ([`refuse_string_argument`]),
+/// - a non-measure where a §06 operation documents a measure
+///   ([`refuse_nonmeasure_operand`]).
+///
+/// Ordered so the most specific refusal reports first; each returns at most one
+/// diagnostic set, because a second opinion on the same call adds noise.
+///
+/// The scalar-KIND tags in a row's `params` are deliberately not swept
+/// generically here. `ParamSig` documents the spec's declared domain, but §03
+/// "Scalar value categories and sets" admits the canonical inclusions
+/// (`booleans` $\subset$ `integers` $\subset$ `reals`) "where specified by the
+/// language", and §07's Domains column does not say per row whether it means the
+/// declared set or that set's embedding closure. Sweeping the tags would refuse
+/// `Bernoulli(p = true)` and `eye(3.0)`, neither of which any sentence forbids.
+/// The three checks below each rest on a sentence that names its exclusion
+/// outright.
+fn domain_check(inf: &mut Inferencer<'_, '_>, name: &str, args: &[ArgInfo]) -> Option<Type> {
+    refuse_nonboolean_domain(inf, name, args)
+        .or_else(|| refuse_string_argument(inf, name, args))
+        .or_else(|| refuse_nonmeasure_operand(inf, name, args))
+}
+
+/// The argument positions of `name` whose domain §03 "Bool" states as boolean,
+/// or `None` for every other head. `ifelse` constrains only `cond`; the four
+/// connectives constrain every operand.
+///
+/// §03 "Bool" is the decisive sentence and it names the five heads itself:
+/// "Conditional and logical constructs (`ifelse`, `land`, `lor`, `lnot`, `lxor`)
+/// strictly require boolean arguments; zero and one are not implicitly converted
+/// to booleans." §07 "Logic and conditionals" gives the same domains in its
+/// tables — `booleans` for the four connectives, "`cond`: `booleans`" for
+/// `ifelse` — so the two agree and the §03 sentence supplies the "not implicitly
+/// converted" half that decides an integer operand.
+///
+/// `lor` is included although §03's list omits it: §07's table gives it the
+/// `booleans` domain beside its three siblings, and §03's own list names it in
+/// the parenthetical's sibling roster at [`refuse_nonscalar_operand`]. The
+/// omission is a typo in one list, not a licence.
+fn boolean_domain_positions(name: &str) -> Option<&'static [usize]> {
+    match name {
+        "land" | "lor" | "lxor" => Some(&[0, 1]),
+        "lnot" => Some(&[0]),
+        "ifelse" => Some(&[0]),
+        _ => None,
+    }
+}
+
+/// Reject a non-boolean scalar where §03 "Bool" requires a boolean.
+///
+/// [`refuse_nonscalar_operand`] already refuses an ARRAY or table operand on the
+/// four connectives, on the separate ground that §07 gives them a scalar domain.
+/// This check is about the scalar KIND, so it fires on the case that guard admits:
+/// `land(1, 2)` typed `%boolean` at exit 0, and `ifelse(3, 4, 5)` typed the common
+/// type of its branches, both handing the determiniser a predicate the author
+/// never wrote. §03's "zero and one are not implicitly converted to booleans"
+/// forbids exactly this, so the integer that looks like a truth value is refused
+/// rather than silently accepted.
+///
+/// An array argument to `ifelse`'s `cond` is refused here too — `ifelse` is not on
+/// the non-scalar guard's list, and §07's table gives `cond` the scalar domain
+/// `booleans` while spelling `a`/`b`'s domain as `anything`. The remedy names the
+/// dotted form, which is where an elementwise select belongs.
+fn refuse_nonboolean_domain(
+    inf: &mut Inferencer<'_, '_>,
+    name: &str,
+    args: &[ArgInfo],
+) -> Option<Type> {
+    let positions = boolean_domain_positions(name)?;
+    let mut offender = None;
+    for i in positions {
+        let Some((node, ty, _)) = args.get(*i) else {
+            continue;
+        };
+        // Only a concrete non-boolean scalar, or an array of them, is a decided
+        // mismatch. `%any` covers a hole and a string, neither of which this
+        // check owns.
+        let kind = match ty {
+            Type::Scalar(k) if *k != ScalarType::Boolean => *k,
+            Type::Array { elem, .. } | Type::TVector { elem, .. } => match **elem {
+                Type::Scalar(k) if k != ScalarType::Boolean => k,
+                _ => continue,
+            },
+            _ => continue,
+        };
+        let which = if name == "ifelse" {
+            "`cond`".to_string()
+        } else {
+            format!("argument {}", i + 1)
+        };
+        inf.diags.push(crate::Diagnostic::error_at(
+            *node,
+            format!(
+                "`{name}` requires a boolean {which}, got {kind}: spec §03 \"Bool\" \
+                 states that the conditional and logical constructs \"strictly require \
+                 boolean arguments; zero and one are not implicitly converted to \
+                 booleans\", and spec §07 \"Logic and conditionals\" gives the same \
+                 `booleans` domain. Compare against a value instead, as in \
+                 `unequal({which_expr}, 0)`, to get the boolean the domain wants",
+                which_expr = if name == "ifelse" { "cond" } else { "x" },
+            ),
+        ));
+        offender = Some(*i);
+    }
+    offender.map(|i| Type::Failed(format!("{name} argument {} is not boolean", i + 1).into()))
+}
+
+/// The argument positions of `name` whose domain admits a STRING, or `None` when
+/// the row documents no textual parameter at all.
+///
+/// A string is not a §03 value: §03 "Scalar types" enumerates Real, Integer, Bool
+/// and Complex and nothing else, and §11 gives strings no value type — this
+/// crate's [`literal_type`] answers `%any` for one, which is what let a string
+/// reach every numeric rule unchallenged. So a string argument is admissible only
+/// where a spec sentence documents that parameter as textual, and this table is
+/// that set, read off the sentence in each case:
+///
+/// - `load_data` — §07 "Data loading" gives `source` as a path or URL.
+/// - `load_module` — §04 "Module composition": "`source` may be a file path or a
+///   URL".
+/// - `standard_module` — §04 "Standard modules": `name` is an official module name
+///   and `compat` "a compatibility version string".
+/// - `get`, `get0` — §03 "Records": "`r.name1` (lowers to `get(r, "name1")`)", so
+///   every SELECTOR position is textual. Position 0 is the container and is not.
+/// - `equal`, `unequal` — §07 "Operator-equivalent functions" gives this pair the
+///   domains "`integers`, `booleans`, strings", the only §07 row that names
+///   strings.
+/// - `vector`, `cat` — the field-name selector LIST is spelled as an array
+///   literal throughout the spec (§06 `disintegrate(["obs"], …)`, §04
+///   `relabel(x, ["x", "y", "z"])`, §07 `get(_, ["a", "c"])`), and an array
+///   literal lowers to `vector`. Refusing a string element here would refuse the
+///   spec's own examples. §03 "Arrays" bites on the MIXED array instead, where a
+///   string element sits beside a numeric one.
+///
+/// `usize::MAX` in a list means "every position from the previous entry onward",
+/// used for the two variadic rows.
+fn string_domain_positions(name: &str) -> Option<&'static [usize]> {
+    match name {
+        "load_data" | "load_module" => Some(&[0]),
+        "standard_module" => Some(&[0, 1]),
+        "get" | "get0" => Some(&[1, usize::MAX]),
+        "equal" | "unequal" => Some(&[0, 1]),
+        "vector" | "cat" => Some(&[0, usize::MAX]),
+        _ => None,
+    }
+}
+
+/// True when `positions` admits index `i`, expanding a trailing `usize::MAX` into
+/// "and every later position".
+fn position_admitted(positions: &[usize], i: usize) -> bool {
+    if positions.last() == Some(&usize::MAX) {
+        return positions
+            .iter()
+            .rev()
+            .nth(1)
+            .is_some_and(|first_variadic| i >= *first_variadic);
+    }
+    positions.contains(&i)
+}
+
+/// Reject a string literal at a parameter whose row documents no textual domain.
+///
+/// Unenforced, `sqrt("text")` typed a non-negative real and
+/// `Normal(mu = "bad", sigma = 1.0)` typed a normalized measure over `reals`, both
+/// at exit 0, because [`literal_type`] answers `%any` for a string and every
+/// numeric rule reads `%any` as "not yet known". The determiniser then lowered a
+/// density whose parameter record held a string. See [`string_domain_positions`]
+/// for the rows that do document a textual parameter and the sentence for each.
+///
+/// Resolves through a self-module reference, so a string bound to a name and then
+/// passed is caught as well as an inline literal. Anything that is not a written
+/// string literal is left alone: this check refuses what it can see, and says
+/// nothing about a string that arrives from `load_data`.
+fn refuse_string_argument(
+    inf: &mut Inferencer<'_, '_>,
+    name: &str,
+    args: &[ArgInfo],
+) -> Option<Type> {
+    let admitted = string_domain_positions(name);
+    let mut refused = false;
+    for (i, (node, _, _)) in args.iter().enumerate() {
+        if admitted.is_some_and(|p| position_admitted(p, i)) {
+            continue;
+        }
+        let Some(text) = written_string(inf, *node) else {
+            continue;
+        };
+        inf.diags.push(crate::Diagnostic::error_at(
+            *node,
+            format!(
+                "`{name}` argument {} is the string `\"{text}\"`, which is not a \
+                 FlatPPL value: spec §03 \"Scalar types\" gives the scalar types as \
+                 real, integer, boolean and complex, and no spec entry documents a \
+                 textual parameter for `{name}`. Strings denote paths, module names \
+                 and field-name selectors only",
+                i + 1,
+            ),
+        ));
+        refused = true;
+    }
+    refused.then(|| Type::Failed(format!("{name}: string argument").into()))
+}
+
+/// The text of a string WRITTEN at this node: a literal, or a self-module
+/// reference to a binding whose right-hand side is one. Mirrors [`written_int`],
+/// and for the same reason — a string carries no `Type`, so the only way to see
+/// one is to look at the node.
+///
+/// **The reference walk is BOUNDED, and it has to be.** A self-referential
+/// binding is a well-formed parse that inference reports as a cycle
+/// (`crates/infer/tests/named_set_expression.rs`
+/// `::a_self_referential_set_binding_reports_a_cycle_not_a_crash` pins
+/// `s = s`), and this function runs on every argument of every builtin call —
+/// including one whose binding is in that cycle, and before the cycle is
+/// reported. An unbounded `loop` here HUNG that test. The bound is not a
+/// semantic limit: a legitimate alias chain to a string literal is a handful of
+/// hops, so exhausting it means the chain is pathological, and answering `None`
+/// then is the honest reading — "no written string visible here" — which leaves
+/// the cycle to the pass that owns it.
+fn written_string(inf: &Inferencer<'_, '_>, node: NodeId) -> Option<String> {
+    /// Alias hops to follow before giving up. Any real chain is far shorter.
+    const MAX_ALIAS_HOPS: usize = 64;
+    let mut node = node;
+    for _ in 0..MAX_ALIAS_HOPS {
+        match inf.module.node(node) {
+            Node::Lit(Scalar::Str(s)) => return Some(s.to_string()),
+            Node::Ref(r) if r.ns == RefNs::SelfMod => {
+                let binding = inf.module.binding_by_name(r.name)?;
+                node = inf.module.binding(binding).rhs;
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// The argument position of `name` that §06 documents as a MEASURE, with the
+/// operation's own sentence for the diagnostic. `None` for every other head.
+///
+/// Each entry quotes the §06 prose that names the argument a measure, so the
+/// refusal cites the operation the author wrote rather than a general rule:
+///
+/// - `normalize` — "given a measure $M$ with finite total mass".
+/// - `truncate` — "restricts the support of measure `M` to the set `S`".
+/// - `weighted`, `logweighted` — "reweight `base`", the second argument.
+/// - `bayesupdate` — "`prior` reweighted by likelihood `L`", the second argument.
+fn measure_operand(name: &str) -> Option<(usize, &'static str)> {
+    match name {
+        "normalize" => Some((
+            0,
+            "`normalize(M)` is \"given a measure $M$ with finite total mass\"",
+        )),
+        "truncate" => Some((
+            0,
+            "`truncate(M, S)` \"restricts the support of measure `M` to the set `S`\"",
+        )),
+        "weighted" | "logweighted" => Some((1, "the second argument is the `base` measure")),
+        "bayesupdate" => Some((1, "the second argument is the `prior` measure")),
+        _ => None,
+    }
+}
+
+/// Reject a value where a §06 measure operation documents a measure.
+///
+/// Unenforced, `normalize(1)` typed a positive-integer SCALAR and
+/// `weighted(true, 2)` the same, both at exit 0 — the measure operations thread
+/// their argument's type through ([`fresh_measure`] on a non-measure yields the
+/// argument back), so a scalar in gave a scalar out with no diagnostic and no
+/// `%measure` anywhere. `truncate(false, interval(0, 1))` typed `%boolean` with a
+/// unit-interval value set, which is worse: a boolean carrying a real support.
+///
+/// Refuses only a type that CANNOT be a measure — a scalar, an array, a
+/// transposed vector, a record, a table, a tuple, an RNG state or a module
+/// reference. A kernel and a `%deferred` operand both pass: §06's `normalize`
+/// applies "on a non-nullary kernel", and a distribution with no type rule yet is
+/// honestly `%deferred`, which this check must not turn into an error.
+fn refuse_nonmeasure_operand(
+    inf: &mut Inferencer<'_, '_>,
+    name: &str,
+    args: &[ArgInfo],
+) -> Option<Type> {
+    let (i, sentence) = measure_operand(name)?;
+    let (node, ty, _) = args.get(i)?;
+    let got = match ty {
+        Type::Scalar(k) => format!("the {k} scalar"),
+        Type::Array { shape, .. } => format!("a rank-{} array", shape.len()),
+        Type::TVector { .. } => "a transposed vector".to_string(),
+        Type::Record(fields) => format!("a {}-field record", fields.len()),
+        Type::Table { columns, .. } => format!("a {}-column table", columns.len()),
+        Type::Tuple(parts) => format!("a {}-component tuple", parts.len()),
+        Type::RngState => "an RNG state".to_string(),
+        Type::Module => "a module reference".to_string(),
+        // Measure, Kernel, Function, Likelihood, and every open type: not decided
+        // against, so not refused.
+        _ => return None,
+    };
+    inf.diags.push(crate::Diagnostic::error_at(
+        *node,
+        format!(
+            "`{name}` argument {} must be a measure or a kernel, got {got}: spec §06 \
+             says {sentence}. Wrap a density in a measure first, as in \
+             `weighted(f, Lebesgue(support = reals))`",
+            i + 1,
+        ),
+    ));
+    Some(Type::Failed(
+        format!("{name}: argument {} is not a measure", i + 1).into(),
     ))
 }
 

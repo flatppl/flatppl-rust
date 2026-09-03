@@ -179,6 +179,17 @@ fn quantile_is_a_real_scalar_of_two_inputs() {
 /// enforce: there is no dependent interval type, and for a COMPUTED `p` no engine
 /// can enforce it statically at all. Recorded so the gap is a decision rather than
 /// an omission — a `p` outside `[0, 1]` types clean here.
+///
+/// **Kept deliberately when argument-domain checking landed** (see
+/// `crates/infer/tests/argument_domains.rs`). That pass enforces the domains a
+/// spec sentence states as an exclusion — §03 "Bool"'s "zero and one are not
+/// implicitly converted to booleans", §03 "Scalar types"'s omission of strings,
+/// §06's measure operands — and `p`'s is not one of those: `interval(0, 1)` is a
+/// VALUE SET, so refusing `3.0` here would need a value-set membership test on a
+/// literal, which is the §04 value-set surface (`trace.rs`'s substitution check),
+/// not the argument-domain surface. Enforcing it for a literal only would also be
+/// the worst of both: a rule the author cannot rely on, since the same `p` reached
+/// through a binding would pass.
 #[test]
 fn quantile_does_not_enforce_its_p_domain_statically() {
     let mut m = flatppl_syntax::parse("v = [1.0, 2.0]\nr = quantile(v, 3.0)\n").unwrap();
