@@ -3,18 +3,18 @@
 //! Implements the lift described in §12 "pyhf uncorrelated_background" of the
 //! profiles doc: each channel → `broadcast(Poisson, expected)` obs model, with
 //! modifier effects generating auxiliary likelihood terms as needed.
-use crate::builder::Builder;
+use crate::builder::{Builder, check_binding_name};
 use crate::error::{Error, Result};
 use crate::histfactory::{
-    Effect, ParamDomain, PendingConstraint, emit_lumi_constraint, emit_normal01_constraint,
-    emit_shapesys_constraint, emit_staterror_constraint, mod_spec, modifier_effect, require_param,
-    require_spec, sample_nominal,
+    Effect, ParamDomain, PendingConstraint, PyhfParamset, emit_lumi_constraint,
+    emit_normal01_constraint, emit_shapesys_constraint, emit_staterror_constraint, mod_spec,
+    modifier_effect, require_param, require_spec, sample_nominal,
 };
 use crate::model::{PyhfDocument, PyhfParam, SampleData};
 use flatppl_core::Module;
 use flatppl_core::id::NodeId;
 use flatppl_core::node::{Call, CallHead, Node};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 /// Convert a pyhf workspace document into a FlatPPL [`Module`].
 pub fn pyhf_to_module(doc: &PyhfDocument) -> Result<Module> {
@@ -28,7 +28,107 @@ pub fn pyhf_to_module(doc: &PyhfDocument) -> Result<Module> {
     Ok(m)
 }
 
+/// How one modifier occurrence declares its free parameter. Two same-named
+/// modifiers denote ONE nuisance parameter only when their `ParamUse` match:
+/// `paramset` decides which auxiliary measurement the parameter carries and
+/// `domain` decides how many components it has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ParamUse {
+    paramset: PyhfParamset,
+    domain: ParamDomain,
+}
+
+/// Where a parameter was first declared, for the conflict message.
+struct FirstUse<'a> {
+    use_: ParamUse,
+    kind: &'a str,
+    channel: &'a str,
+    per_channel: bool,
+}
+
+/// Reject a pyhf workspace that pyhf itself refuses, before any lowering.
+///
+/// Without this pass each of the three documents converts to exit 0 and writes a
+/// model that is self-contradictory (two disagreeing declarations of one name),
+/// dangling (a POI naming nothing), or length-mismatched (a gamma vector and a
+/// sigma vector of different lengths). The oracle is pyhf 0.7.6 itself; each
+/// check names the exception it mirrors.
+///
+/// The per-modifier shapes that only one reader can see (a `shapesys` array
+/// shorter than the sample, a ragged `staterror` array) are checked where they
+/// are read, not here.
+fn validate_workspace(doc: &PyhfDocument) -> Result<()> {
+    let mut seen: BTreeMap<String, FirstUse<'_>> = BTreeMap::new();
+
+    for channel in &doc.channels {
+        for sample in &channel.samples {
+            for modifier in &sample.modifiers {
+                let spec = require_spec(modifier)?;
+                let param = require_param(modifier, spec)?;
+                check_binding_name(&param, "pyhf modifier parameter")?;
+                let use_ = ParamUse {
+                    paramset: spec.pyhf_paramset,
+                    domain: spec.param_domain,
+                };
+                let Some(first) = seen.get(&param) else {
+                    seen.insert(
+                        param,
+                        FirstUse {
+                            use_,
+                            kind: &modifier.kind,
+                            channel: &channel.name,
+                            per_channel: spec.per_channel,
+                        },
+                    );
+                    continue;
+                };
+                if first.use_ != use_ {
+                    // pyhf: InvalidNameReuse.
+                    return Err(Error::Unsupported(format!(
+                        "modifier name `{param}` is used by a `{}` modifier in channel `{}` and a \
+                         `{}` modifier in channel `{}`; the two cannot share one nuisance \
+                         parameter, so give them distinct names",
+                        first.kind, first.channel, modifier.kind, channel.name
+                    )));
+                }
+                if first.per_channel && first.channel != channel.name {
+                    // pyhf: InvalidModel.
+                    return Err(Error::Unsupported(format!(
+                        "`{}` modifier `{param}` appears in channels `{}` and `{}`; a `{}` \
+                         parameter is per-channel and cannot be shared, so give each channel's \
+                         modifier a distinct name",
+                        modifier.kind, first.channel, channel.name, modifier.kind
+                    )));
+                }
+            }
+        }
+    }
+
+    // A measurement's `poi` must name a parameter some modifier declares. pyhf
+    // does not accept one declared only in `config.parameters` either: that block
+    // configures an existing parameter, it does not create one.
+    let toplvl = doc.toplvl.iter().flat_map(|t| t.measurements.iter());
+    for meas in doc.measurements.iter().chain(toplvl) {
+        check_binding_name(&meas.name, "pyhf measurement")?;
+        match &meas.config.poi {
+            Some(poi) if !poi.is_empty() && !seen.contains_key(poi) => {
+                // pyhf: InvalidModel.
+                return Err(Error::Unsupported(format!(
+                    "measurement `{}` names parameter of interest `{poi}`, which no modifier \
+                     declares",
+                    meas.name
+                )));
+            }
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
 fn emit_pyhf(b: &mut Builder, doc: &PyhfDocument) -> Result<()> {
+    validate_workspace(doc)?;
+
     // `hepphys = standard_module("particle-physics", "0.1")`
     emit_standard_module(b);
 
@@ -185,6 +285,12 @@ pub struct Terms {
     /// belongs to its (possibly shared) parameter, so it is emitted exactly once
     /// (pyhf: one auxiliary measurement per constrained parameter).
     emitted_params: HashSet<String>,
+    /// Parameters already declared as an `elementof` binding. Module-wide, not
+    /// per-channel: a modifier name shared across channels is ONE nuisance
+    /// parameter (§12 "HS³/RooFit measure algebra mapping"; pyhf gives it one
+    /// paramset), so it must be declared once. `validate_workspace` has already
+    /// established that every occurrence of a shared name agrees on the domain.
+    declared_params: HashSet<String>,
 }
 
 /// Bind the flat top-level `likelihood` = `joint_likelihood(observation terms…,
@@ -324,14 +430,12 @@ pub fn assemble_channel(
     }
 
     // ---- Pass 2: declare free params (idempotent by name) ----
-    let mut declared: HashSet<String> = HashSet::new();
-
     for (_name, _nominal, modifiers) in samples {
         for modifier in *modifiers {
             // `declare_modifier_param` validates the modifier kind and requires a
             // `parameter`; only dedupe once we know the name is present.
-            let param_name = declare_modifier_param(b, modifier, n_bins, &declared)?;
-            declared.insert(param_name);
+            let param_name = declare_modifier_param(b, modifier, n_bins, &terms.declared_params)?;
+            terms.declared_params.insert(param_name);
         }
     }
 

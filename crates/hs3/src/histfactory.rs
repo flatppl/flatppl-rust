@@ -259,6 +259,23 @@ pub fn interp_fn(code: Option<&str>, default: &'static str) -> &'static str {
     }
 }
 
+/// pyhf's `paramset_type` for a modifier kind.
+///
+/// This is the FOREIGN tool's classification, used for one purpose: deciding
+/// whether two same-named modifiers may share one nuisance parameter. It is not
+/// a statement about the constraint form this importer emits (that is
+/// `emit_*_constraint`'s business, and for `staterror` it is chosen from the
+/// document's `constraint` field).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PyhfParamset {
+    /// pyhf `unconstrained`: no auxiliary measurement.
+    Unconstrained,
+    /// pyhf `constrained_by_normal`.
+    Normal,
+    /// pyhf `constrained_by_poisson`.
+    Poisson,
+}
+
 /// The set a modifier's free parameter ranges over.
 ///
 /// `PosRealsPow` is `cartpow(posreals, n_bins)` — one positive real per bin.
@@ -293,6 +310,13 @@ pub struct ModSpec {
     /// staterror: nominals and squared errors are aggregated across samples into
     /// one Gaussian (BB-lite) aux term per bin, emitted channel-wide.
     pub channel_staterror: bool,
+    /// pyhf's `paramset_type` for this kind — consulted only by the shared-name
+    /// compatibility check (see [`PyhfParamset`]).
+    pub pyhf_paramset: PyhfParamset,
+    /// pyhf binds one paramset per channel for this kind, so a name shared across
+    /// channels is a different parameter, not a shared one (pyhf `InvalidModel`:
+    /// "Trying to add paramset … but other paramsets exist with the same name").
+    pub per_channel: bool,
 }
 
 /// The modifier-kind table. One row per supported histfactory modifier.
@@ -305,6 +329,8 @@ pub const MOD_SPECS: &[ModSpec] = &[
         replaces_nominal: false,
         channel_lumi: false,
         channel_staterror: false,
+        pyhf_paramset: PyhfParamset::Unconstrained,
+        per_channel: false,
     },
     ModSpec {
         kind: "shapesys",
@@ -313,6 +339,8 @@ pub const MOD_SPECS: &[ModSpec] = &[
         replaces_nominal: false,
         channel_lumi: false,
         channel_staterror: false,
+        pyhf_paramset: PyhfParamset::Poisson,
+        per_channel: true,
     },
     ModSpec {
         kind: "normsys",
@@ -321,6 +349,8 @@ pub const MOD_SPECS: &[ModSpec] = &[
         replaces_nominal: false,
         channel_lumi: false,
         channel_staterror: false,
+        pyhf_paramset: PyhfParamset::Normal,
+        per_channel: false,
     },
     ModSpec {
         kind: "histosys",
@@ -329,6 +359,8 @@ pub const MOD_SPECS: &[ModSpec] = &[
         replaces_nominal: true,
         channel_lumi: false,
         channel_staterror: false,
+        pyhf_paramset: PyhfParamset::Normal,
+        per_channel: false,
     },
     ModSpec {
         kind: "lumi",
@@ -337,6 +369,8 @@ pub const MOD_SPECS: &[ModSpec] = &[
         replaces_nominal: false,
         channel_lumi: true,
         channel_staterror: false,
+        pyhf_paramset: PyhfParamset::Normal,
+        per_channel: false,
     },
     ModSpec {
         kind: "staterror",
@@ -345,6 +379,8 @@ pub const MOD_SPECS: &[ModSpec] = &[
         replaces_nominal: false,
         channel_lumi: false,
         channel_staterror: true,
+        pyhf_paramset: PyhfParamset::Normal,
+        per_channel: false,
     },
     ModSpec {
         kind: "shapefactor",
@@ -353,6 +389,8 @@ pub const MOD_SPECS: &[ModSpec] = &[
         replaces_nominal: false,
         channel_lumi: false,
         channel_staterror: false,
+        pyhf_paramset: PyhfParamset::Unconstrained,
+        per_channel: false,
     },
 ];
 
@@ -433,6 +471,15 @@ pub fn modifier_effect(
                 Error::Unsupported(format!("shapesys `{param}` missing data (per-bin errors)"))
             })?;
             let sigma = f64_array(data, &format!("shapesys `{param}` data"))?;
+            // One sigma per bin. A shorter array would emit a `cartpow(posreals,
+            // nom_len)` gamma against a shorter sigma vector, which no later
+            // stage rejects (pyhf: InvalidModifier).
+            if sigma.len() != nom_len {
+                return Err(Error::Unsupported(format!(
+                    "shapesys `{param}` has {} per-bin errors but the sample has {nom_len} bins",
+                    sigma.len()
+                )));
+            }
             let factor = b.self_ref(&param);
             Ok((
                 Effect::Multiply(factor),

@@ -1,4 +1,5 @@
 //! Ergonomic helpers for building flatppl_core IR.
+use crate::error::{Error, Result};
 use flatppl_core::id::{NodeId, Symbol};
 use flatppl_core::node::{Call, CallHead, Inputs, NamedArg, NamedKind, Node, Ref, RefNs, Scalar};
 use flatppl_core::{Binding, Doc, Markup, Module};
@@ -6,6 +7,65 @@ use flatppl_core::{Binding, Doc, Markup, Module};
 /// FlatPPL reserved words that may not be a binding name (spec §05 / the parser's
 /// `check_binding_name`). The name allocator must never hand one of these back.
 const RESERVED: &[&str] = &["true", "false", "in", "all", "only", "self", "base"];
+
+/// Reserved top-level binding names: the determinization signature (spec §05
+/// "Note on reserved words", §13).
+const RESERVED_TOPLEVEL: &[&str] = &["inputs", "outputs"];
+
+/// Whether `name` is a placeholder `_x_` (spec §05 "Note on holes and
+/// placeholders"): legal inside `functionof`/`kernelof`, never a module binding.
+/// Mirrors `flatppl_syntax`'s own `is_placeholder`, which is not public.
+fn is_placeholder(name: &str) -> bool {
+    let b = name.as_bytes();
+    b.len() >= 3
+        && b[0] == b'_'
+        && b[b.len() - 1] == b'_'
+        && b[1].is_ascii_alphabetic()
+        && (b.len() == 3 || b[b.len() - 2].is_ascii_alphanumeric())
+}
+
+/// Reject a source-document name that cannot be a FlatPPL top-level binding.
+///
+/// Spec §05 grammar: `Name ::= (Letter | "_") (Letter | Digit | "_")*` with
+/// `Letter ::= "a" .. "z" | "A" .. "Z"`, minus the reserved words, the
+/// determinization signature names, and the placeholder form.
+///
+/// The importer must not repair a name by sanitizing it: the emitted model's
+/// names are the source document's names, so a rename would silently produce a
+/// model that no longer matches the input. `what` names the source block for the
+/// message (e.g. "distribution", "pyhf modifier parameter").
+pub(crate) fn check_binding_name(name: &str, what: &str) -> Result<()> {
+    let bad = |why: &str| {
+        Err(Error::Unsupported(format!(
+            "{what} name `{name}` {why}, so it cannot be a FlatPPL binding (spec §05 `Name`)"
+        )))
+    };
+    let Some(first) = name.chars().next() else {
+        return bad("is empty");
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return bad("does not start with a letter or `_`");
+    }
+    if let Some(c) = name
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || *c == '_'))
+    {
+        return bad(&format!("contains `{c}`"));
+    }
+    if RESERVED.contains(&name) {
+        return bad("is a reserved word");
+    }
+    if RESERVED_TOPLEVEL.contains(&name) {
+        return bad("is reserved for the determinization signature");
+    }
+    if name == "_" {
+        return bad("is the hole");
+    }
+    if is_placeholder(name) {
+        return bad("is a placeholder");
+    }
+    Ok(())
+}
 
 /// Sanitize an arbitrary source string (a pyhf/HS3 channel, sample, or modifier
 /// name) into a valid FlatPPL identifier: every character outside
