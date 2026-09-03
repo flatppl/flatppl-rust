@@ -15,10 +15,12 @@ pub enum Location {
 }
 
 /// Does `s` start with an `http://` / `https://` scheme (case-insensitive)?
+///
+/// The comparison runs on bytes. Slicing `s` to the scheme length instead
+/// panicked on any `source` whose 7th or 8th byte falls inside a character.
 fn is_http_url(s: &str) -> bool {
-    let b = s.as_bytes();
-    (b.len() >= 7 && s[..7].eq_ignore_ascii_case("http://"))
-        || (b.len() >= 8 && s[..8].eq_ignore_ascii_case("https://"))
+    use flatppl_core::text::starts_with_ascii_ignore_case as starts_with;
+    starts_with(s, "http://") || starts_with(s, "https://")
 }
 
 impl Location {
@@ -307,6 +309,45 @@ mod tests {
         assert_eq!(
             Location::Remote(u.to_string()).normalized(),
             Location::Remote(u.to_string())
+        );
+    }
+
+    /// A non-ASCII `source` reaches scheme detection and must not abort the
+    /// process. The old byte-slicing check indexed byte 7 or 8 of the string,
+    /// which lands inside a character for a 7- or 8-byte multi-byte name:
+    /// `end byte index 7 is not a char boundary`.
+    #[test]
+    fn a_multibyte_source_is_a_local_path_not_a_panic() {
+        for source in ["αβγδ", "αβγ¤", "μ", "θ_prior.flatppl", "модель.flatppl"] {
+            assert_eq!(
+                Location::parse(source),
+                Location::Local(PathBuf::from(source)),
+                "`{source}` is a local path"
+            );
+        }
+    }
+
+    /// A multi-byte base joined with a multi-byte relative source stays local.
+    #[test]
+    fn a_multibyte_join_stays_local() {
+        let base = Location::Local(PathBuf::from("/προj/αβγδ.flatppl"));
+        assert_eq!(
+            base.join("κοινό.flatppl"),
+            Location::Local(PathBuf::from("/προj/κοινό.flatppl"))
+        );
+    }
+
+    /// The scheme check is still case-insensitive and still only fires on a
+    /// real scheme, so the boundary fix did not widen or narrow it.
+    #[test]
+    fn scheme_detection_is_case_insensitive_and_exact() {
+        assert_eq!(
+            Location::parse("HTTPS://h.example/m.flatppl"),
+            Location::Remote("HTTPS://h.example/m.flatppl".to_string())
+        );
+        assert_eq!(
+            Location::parse("httpx://h.example/m.flatppl"),
+            Location::Local(PathBuf::from("httpx://h.example/m.flatppl"))
         );
     }
 }

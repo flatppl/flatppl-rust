@@ -16,6 +16,7 @@
 pub mod id;
 mod module;
 pub mod node;
+pub mod text;
 pub mod ty;
 
 pub use id::{Arena, BindingId, Idx, Interner, NodeId, SecondaryMap, Symbol};

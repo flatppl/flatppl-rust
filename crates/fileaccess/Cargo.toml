@@ -28,6 +28,7 @@ cache = ["dep:sha2", "dep:dirs", "dep:serde", "dep:serde_json"]
 net = ["cache", "dep:ureq"]
 
 [dependencies]
+flatppl-core = { path = "../core" }
 sha2 = { workspace = true, optional = true }
 dirs = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }

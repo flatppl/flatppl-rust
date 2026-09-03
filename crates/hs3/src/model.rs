@@ -293,12 +293,10 @@ pub fn derive_vector_param_name(parameters: &[String]) -> String {
     let first = &parameters[0];
     let mut prefix_len = first.len();
     for p in &parameters[1..] {
-        let common = first
-            .bytes()
-            .zip(p.bytes())
-            .take_while(|(a, b)| a == b)
-            .count();
-        prefix_len = prefix_len.min(common);
+        // On characters, not bytes: a byte count that lands inside a character
+        // is not a valid `str` index, and slicing with it panicked on a
+        // non-ASCII parameter name.
+        prefix_len = prefix_len.min(flatppl_core::text::common_prefix_len(first, p));
     }
     let trimmed = first[..prefix_len].trim_end_matches(|c: char| c == '_' || c.is_ascii_digit());
     if trimmed.is_empty() {
@@ -467,5 +465,42 @@ mod tests {
             SampleData::Flat(v) => assert_eq!(v, vec![1.0, 2.0]),
             SampleData::Struct { .. } => panic!("expected Flat variant"),
         }
+    }
+
+    /// A per-bin `parameters` array may hold non-ASCII names. The common
+    /// prefix is counted on characters, so the slice index is always valid;
+    /// counted on bytes it landed inside a character and panicked with
+    /// `end byte index 1 is not a char boundary`.
+    #[test]
+    fn a_non_ascii_common_prefix_is_a_valid_index() {
+        // `é` is C3 A9 and `ê` is C3 AA: one shared byte, no shared character.
+        assert_eq!(
+            derive_vector_param_name(&["é0".to_string(), "ê1".to_string()]),
+            "é0"
+        );
+        // A shared multi-byte prefix, trimmed of the separator and bin index.
+        assert_eq!(
+            derive_vector_param_name(&["γ_stat_0".to_string(), "γ_stat_1".to_string()]),
+            "γ_stat"
+        );
+        // Trimming the whole prefix away falls back to the first entry.
+        assert_eq!(
+            derive_vector_param_name(&["μ_0".to_string(), "μ_1".to_string()]),
+            "μ"
+        );
+        assert_eq!(derive_vector_param_name(&["μ".to_string()]), "μ");
+    }
+
+    /// The ASCII behaviour the correlation-preserving naming relies on.
+    #[test]
+    fn an_ascii_common_prefix_is_unchanged() {
+        assert_eq!(
+            derive_vector_param_name(&["gamma_stat_0".to_string(), "gamma_stat_1".to_string()]),
+            "gamma_stat"
+        );
+        assert_eq!(
+            derive_vector_param_name(&["alpha".to_string(), "beta".to_string()]),
+            "alpha"
+        );
     }
 }

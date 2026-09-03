@@ -17,12 +17,12 @@ use crate::catalogue::CatalogueSet;
 /// Does `source` name an `http`/`https` URL (case-insensitive)? Used only to
 /// phrase an unresolved-dependency diagnostic: a remote source absent from the
 /// bundle hasn't been *fetched*, which is different from a local file that isn't
-/// *found*. Mirrors the scheme check in `flatppl-fileaccess` — kept inline so
-/// `flatppl-infer` stays dependency-free and wasm-targetable.
+/// *found*. Shares `flatppl-core`'s byte-wise scheme check with
+/// `flatppl-fileaccess`; the two hand-rolled copies both sliced `source` to the
+/// scheme length and panicked on a non-ASCII `source`.
 fn is_remote_source(source: &str) -> bool {
-    let b = source.as_bytes();
-    (b.len() >= 7 && source[..7].eq_ignore_ascii_case("http://"))
-        || (b.len() >= 8 && source[..8].eq_ignore_ascii_case("https://"))
+    use flatppl_core::text::starts_with_ascii_ignore_case as starts_with;
+    starts_with(source, "http://") || starts_with(source, "https://")
 }
 
 /// Parsed dependency modules, keyed by **resolved file identity** — the host's
@@ -741,6 +741,20 @@ pub(crate) fn seed_plan(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A non-ASCII `load_module` source reaches the unresolved-dependency
+    /// message and must not abort. The hand-rolled scheme check sliced the
+    /// source to the scheme length, which panicked on a 7- or 8-byte
+    /// multi-byte name: `end byte index 7 is not a char boundary`.
+    #[test]
+    fn a_multibyte_source_is_not_remote_and_does_not_panic() {
+        for source in ["αβγδ", "αβγ¤", "μ", "θ_prior.flatppl", "модель.flatppl"] {
+            assert!(!is_remote_source(source), "`{source}` is a local path");
+        }
+        assert!(is_remote_source("HTTPS://h.example/m.flatppl"));
+        assert!(is_remote_source("http://h.example/m.flatppl"));
+        assert!(!is_remote_source("httpx://h.example/m.flatppl"));
+    }
 
     #[test]
     fn bundle_inserts_and_looks_up() {

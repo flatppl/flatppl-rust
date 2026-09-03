@@ -373,6 +373,7 @@ name = "flatppl-fileaccess"
 version = "0.1.0"
 dependencies = [
  "dirs",
+ "flatppl-core",
  "serde",
  "serde_json",
  "sha2",
