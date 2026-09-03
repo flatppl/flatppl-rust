@@ -600,59 +600,6 @@ fn lawof_rejects_a_kernel_that_is_not_normalized() {
     ));
 }
 
-/// The kernel gate's `%deferred` arm mirrors the measure arm's no-laundering
-/// rider exactly: an admitted `%deferred`-mass kernel must come out `%deferred`,
-/// never `%normalized`. `functionof(joint())` is the executed producer (a
-/// zero-component `joint` body, the one source of a genuinely `%deferred`-mass
-/// measure reachable from source).
-#[test]
-fn lawof_of_a_deferred_mass_kernel_stays_deferred() {
-    let out = ir("k = functionof(joint())\nq = lawof(k)");
-    let k = out.lines().find(|l| l.contains("%bind k")).unwrap_or("");
-    let q = out.lines().find(|l| l.contains("%bind q")).unwrap_or("");
-    assert!(
-        k.contains("(%kernel (%inputs ) (%mass %deferred))"),
-        "functionof(joint()) must itself be a %deferred-mass kernel:\n{out}"
-    );
-    assert!(
-        q.contains("(%kernel (%inputs ) (%mass %deferred))"),
-        "lawof of a %deferred-mass kernel must stay %deferred, not launder to \
-         %normalized:\n{out}"
-    );
-    assert!(
-        !q.contains("%normalized"),
-        "must not stamp the unproven assumption as known:\n{out}"
-    );
-}
-
-/// Design-PR #73 option C's no-laundering rider (owner ruling, decisions-log
-/// 2026-08-18): an engine admitting a `%deferred`-mass argument to `lawof` must
-/// leave the RESULT's mass `%deferred`, never stamp `%normalized` — stamping
-/// `%normalized` would record an unproven assumption as §11's "statically KNOWN"
-/// class. `joint()` (zero components) is the one measure reachable from source
-/// whose mass is genuinely `%deferred` (`product_mass`'s empty-list arm), so it
-/// is the red case: `lawof`'s gate admits it (deferred passes, per
-/// `unprovable_normalization`), and the result must carry `%deferred` onward.
-#[test]
-fn lawof_of_a_deferred_mass_measure_stays_deferred() {
-    let out = ir("e = joint()\nq = lawof(e)");
-    let e = out.lines().find(|l| l.contains("%bind e")).unwrap_or("");
-    let q = out.lines().find(|l| l.contains("%bind q")).unwrap_or("");
-    assert!(
-        e.contains("(%mass %deferred)"),
-        "joint() must itself be %deferred mass (the gate's admission case):\n{out}"
-    );
-    assert!(
-        q.contains("(%mass %deferred)"),
-        "lawof of a %deferred-mass measure must stay %deferred, not launder to \
-         %normalized:\n{out}"
-    );
-    assert!(
-        !q.contains("(%mass %normalized)"),
-        "must not stamp the unproven assumption as known:\n{out}"
-    );
-}
-
 /// The VALUE spelling — the only one the corpus uses — is unchanged: the law of a
 /// value is a measure over that value's type.
 #[test]
@@ -1231,23 +1178,31 @@ fn truncate_of_two_lebesgue_joint_is_finite() {
     );
 }
 
-/// `joint()` (arity zero): `product_mass(&[])`'s `all()` was vacuously
-/// `%normalized` regardless of arity — the same root cause the brief names
-/// for the positional bug, reachable through arity zero instead of the
-/// named/positional split. The domain arm already leaves a zero-component
-/// `joint`'s domain `%deferred` (nothing resolves the variate shape), so the
-/// mass side now matches that honestly instead of claiming a definite class
-/// the domain does not support. `joint()`'s legality is a separate,
-/// unaddressed question — not decided here.
-#[test]
-fn joint_of_no_components_is_deferred_not_normalized() {
-    let src = "e = joint()";
-    let out = ir(src);
-    assert!(
-        out.contains("(%mass %deferred)"),
-        "empty joint must be %deferred, not a definite class; got:\n{out}"
-    );
-}
+// The three tests that used to sit here are GONE, and their coverage moved
+// rather than being dropped.
+//
+// They pinned design-PR #73 option C's no-laundering rider — that `lawof` of a
+// `%deferred`-mass argument must leave the result `%deferred`, never
+// `%normalized` — and all three reached it through `joint()`, "the one measure
+// reachable from source whose mass is genuinely `%deferred`
+// (`product_mass`'s empty-list arm)". Spec §04 forbids that call: "Nullary calls
+// (`f()`) are not allowed", and of the special operations "The total number of
+// inputs is never zero". So `joint()` is now a static error
+// (`crates/infer/tests/special_arity.rs`) and the fixture no longer parses to a
+// measure.
+//
+// The rider is asserted instead in `crates/infer/src/ops.rs`
+// `mod no_laundering_tests`, directly against `product_mass` and `lawof_type`.
+// That is the stronger position, not a fallback: the old fixture could only reach
+// `Mass::Deferred` through one spellable expression, so `joint`'s arity and the
+// rider's coverage were coupled for no reason, and the unit tests hold whatever
+// the surface syntax admits. They also cover two cases the source-level fixture
+// could not — that a non-empty all-normalized product is still `%normalized`, and
+// that `lawof` passes EVERY mass class through unchanged rather than special-casing
+// `%deferred`.
+//
+// Nothing else in this file needs a `%deferred`-mass measure, so there is no
+// replacement fixture to build here.
 
 // ============================================================
 // `joint` over KERNEL components — the fan-out kernel

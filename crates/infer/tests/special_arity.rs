@@ -76,29 +76,33 @@ fn nullary_special_operations_are_refused() {
     }
 }
 
-/// The four variadic product and chain heads are EXEMPT from the nullary rule,
-/// against §04's plain reading. `joint()` is "the one measure reachable from
-/// source whose mass is genuinely `%deferred`" per
-/// `spec_coverage_measures.rs::lawof_of_a_deferred_mass_measure_stays_deferred`,
-/// and three tests there pin design-PR #73 option C's no-laundering rider (owner
-/// ruling, decisions-log 2026-08-18) through it. Refusing the call would delete
-/// the only source-level red case for that ruling. `SpecialArity`'s call site
-/// carries the full reasoning; `flatppl-dev/audit-fix-infer.md` records what
-/// closing it would take.
+/// §04's nullary rule reaches the four variadic PRODUCT and CHAIN heads too, with
+/// no exemption (owner ruling). An earlier revision exempted them because three
+/// `spec_coverage_measures.rs` tests reached design-PR #73's no-laundering rider
+/// through `joint()`, the only measure reachable from source whose mass is
+/// genuinely `%deferred`. That coverage moved to `ops.rs`
+/// `mod no_laundering_tests`, asserted against `product_mass` and `lawof_type`
+/// directly, so the rider no longer depends on `joint()` being spellable and §04
+/// applies to all four.
 #[test]
-fn the_nullary_product_and_chain_heads_stay_undecided() {
+fn the_nullary_product_and_chain_heads_are_refused() {
     for src in [
         "e = joint()\n",
         "e = jointchain()\n",
         "e = cartprod()\n",
         "e = superpose()\n",
     ] {
-        let errs = errors(src);
-        assert!(
-            !errs.iter().any(|e| e.contains("called with no arguments")),
-            "`{src}` must not be refused by the nullary rule; got: {errs:?}"
-        );
+        assert_refuses(src, "takes at least 1 input");
     }
+}
+
+/// Each of the four still types with components, so the rule is about the nullary
+/// call and not about the head.
+#[test]
+fn the_product_and_chain_heads_type_with_components() {
+    assert_clean("m = joint(Normal(0.0, 1.0), Normal(2.0, 3.0))\n");
+    assert_clean("s = cartprod(reals, integers)\n");
+    assert_clean("m = superpose(Normal(0.0, 1.0), Normal(2.0, 3.0))\n");
 }
 
 /// `vector` is the one head whose catalogue row admits zero arguments, and the
