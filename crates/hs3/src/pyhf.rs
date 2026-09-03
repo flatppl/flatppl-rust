@@ -6,7 +6,7 @@
 use crate::builder::{Builder, check_binding_name};
 use crate::error::{Error, Result};
 use crate::histfactory::{
-    Effect, ParamDomain, PendingConstraint, PyhfParamset, emit_lumi_constraint,
+    AuxOverride, Effect, ParamDomain, PendingConstraint, PyhfParamset, emit_lumi_constraint,
     emit_normal01_constraint, emit_shapesys_constraint, emit_staterror_constraint, mod_spec,
     modifier_effect, require_param, require_spec, sample_nominal,
 };
@@ -44,6 +44,9 @@ struct FirstUse<'a> {
     kind: &'a str,
     channel: &'a str,
     per_channel: bool,
+    /// The channel's bin count, which is the parameter's component count for a
+    /// per-bin domain. A measurement-config override must have that many values.
+    n_bins: usize,
 }
 
 /// Reject a pyhf workspace that pyhf itself refuses, before any lowering.
@@ -57,7 +60,7 @@ struct FirstUse<'a> {
 /// The per-modifier shapes that only one reader can see (a `shapesys` array
 /// shorter than the sample, a ragged `staterror` array) are checked where they
 /// are read, not here.
-fn validate_workspace(doc: &PyhfDocument) -> Result<()> {
+fn validate_workspace(doc: &PyhfDocument) -> Result<BTreeMap<String, AuxOverride>> {
     let mut seen: BTreeMap<String, FirstUse<'_>> = BTreeMap::new();
 
     for channel in &doc.channels {
@@ -78,6 +81,7 @@ fn validate_workspace(doc: &PyhfDocument) -> Result<()> {
                             kind: &modifier.kind,
                             channel: &channel.name,
                             per_channel: spec.per_channel,
+                            n_bins: sample.data.len(),
                         },
                     );
                     continue;
@@ -123,11 +127,77 @@ fn validate_workspace(doc: &PyhfDocument) -> Result<()> {
         }
     }
 
-    Ok(())
+    collect_param_overrides(doc, &seen)
+}
+
+/// Read the measurement configs' `parameters` blocks into per-parameter
+/// auxiliary-measurement overrides.
+///
+/// An entry naming a parameter no modifier declares is ignored, as pyhf ignores
+/// it: `reduce_paramsets_requirements` walks the paramsets the modifiers
+/// required and only then looks up the user config. An entry that overrides a
+/// field its paramset does not define, or supplies the wrong number of values,
+/// is refused with the defect pyhf names.
+fn collect_param_overrides(
+    doc: &PyhfDocument,
+    seen: &BTreeMap<String, FirstUse<'_>>,
+) -> Result<BTreeMap<String, AuxOverride>> {
+    let mut out: BTreeMap<String, AuxOverride> = BTreeMap::new();
+    let toplvl = doc.toplvl.iter().flat_map(|t| t.measurements.iter());
+    for meas in doc.measurements.iter().chain(toplvl) {
+        for p in &meas.config.parameters {
+            let Some(first) = seen.get(&p.name) else {
+                continue;
+            };
+            let spec = mod_spec(first.kind).expect("kind came from MOD_SPECS");
+            let n_pars = match first.use_.domain {
+                ParamDomain::PosRealsPow => first.n_bins,
+                _ => 1,
+            };
+            for (field, values, used) in [
+                ("auxdata", &p.auxdata, spec.uses_auxdata),
+                ("sigmas", &p.sigmas, spec.uses_sigmas),
+                ("factors", &p.factors, spec.uses_factors),
+            ] {
+                if values.is_empty() {
+                    continue;
+                }
+                if !used {
+                    // pyhf: InvalidModel.
+                    return Err(Error::Unsupported(format!(
+                        "measurement `{}` sets `{field}` on parameter `{}`, but a `{}` \
+                         modifier's parameter does not use `{field}`",
+                        meas.name, p.name, first.kind
+                    )));
+                }
+                if values.len() != n_pars {
+                    // pyhf: InvalidModel.
+                    return Err(Error::Unsupported(format!(
+                        "measurement `{}` sets {} `{field}` value(s) on parameter `{}`, which \
+                         has {n_pars}",
+                        meas.name,
+                        values.len(),
+                        p.name
+                    )));
+                }
+            }
+            let e = out.entry(p.name.clone()).or_default();
+            if !p.auxdata.is_empty() {
+                e.auxdata = p.auxdata.clone();
+            }
+            if !p.sigmas.is_empty() {
+                e.sigmas = p.sigmas.clone();
+            }
+            if !p.factors.is_empty() {
+                e.factors = p.factors.clone();
+            }
+        }
+    }
+    Ok(out)
 }
 
 fn emit_pyhf(b: &mut Builder, doc: &PyhfDocument) -> Result<()> {
-    validate_workspace(doc)?;
+    let param_overrides = validate_workspace(doc)?;
 
     // `hepphys = standard_module("particle-physics", "0.1")`
     emit_standard_module(b);
@@ -136,6 +206,7 @@ fn emit_pyhf(b: &mut Builder, doc: &PyhfDocument) -> Result<()> {
     // observation + constraint likelihood terms.
     let mut terms = Terms {
         staterror_gaussian_default: true,
+        param_overrides,
         ..Terms::default()
     };
     for channel in &doc.channels {
@@ -301,6 +372,17 @@ pub struct Terms {
     /// staterror is always Gaussian. Native HS3 carries an explicit
     /// `constraint`/`constraint_type`, and ROOT's default there is Poisson.
     pub staterror_gaussian_default: bool,
+    /// Per-parameter auxiliary-measurement overrides from the measurement
+    /// config's `parameters` block, keyed by parameter name.
+    pub param_overrides: BTreeMap<String, AuxOverride>,
+}
+
+impl Terms {
+    /// The override for `param`, or the empty one when the measurement config
+    /// says nothing about it.
+    fn aux_override(&self, param: &str) -> AuxOverride {
+        self.param_overrides.get(param).cloned().unwrap_or_default()
+    }
 }
 
 /// Bind the flat top-level `likelihood` = `joint_likelihood(observation terms…,
@@ -517,7 +599,7 @@ pub fn assemble_channel(
         for modifier in *modifiers {
             if mod_spec(&modifier.kind).is_some_and(|spec| spec.replaces_nominal) {
                 let base = b.self_ref(&nom_name);
-                let (effect, constraint) = modifier_effect(b, modifier, base, n_bins)?;
+                let (effect, constraint) = modifier_effect(b, modifier, base, nominal)?;
                 let param = constraint.as_ref().map(|(p, _)| p.clone());
                 if let Effect::ReplaceNominal(new_nom) = effect {
                     shifted.push((param.unwrap_or_default(), new_nom));
@@ -536,7 +618,7 @@ pub fn assemble_channel(
             if mod_spec(&modifier.kind).is_some_and(|spec| spec.replaces_nominal) {
                 continue;
             }
-            let (effect, constraint) = modifier_effect(b, modifier, nom, n_bins)?;
+            let (effect, constraint) = modifier_effect(b, modifier, nom, nominal)?;
             if let Effect::Multiply(factor) = effect {
                 let mul = b.call_head("mul");
                 acc = b.call("broadcast", &[mul, acc, factor]);
@@ -625,7 +707,8 @@ pub fn assemble_channel(
                 Some(_) => false,
                 None => terms.staterror_gaussian_default,
             };
-            let term = emit_staterror_constraint(b, param_name, sum_nom, sum_sq, gaussian);
+            let ov = terms.aux_override(param_name);
+            let term = emit_staterror_constraint(b, param_name, sum_nom, sum_sq, gaussian, &ov);
             terms.constraints.push(term);
         }
     }
@@ -646,11 +729,13 @@ fn emit_pending_constraint(
     if !terms.emitted_params.insert(param.clone()) {
         return; // already emitted (shared parameter)
     }
+    let ov = terms.aux_override(&param);
     let term = match pending {
-        PendingConstraint::Shapesys { sigma } => {
-            emit_shapesys_constraint(b, &param, nominal, &sigma)
-        }
-        PendingConstraint::Normal01 => emit_normal01_constraint(b, &param),
+        PendingConstraint::Shapesys {
+            sigma,
+            nominal: nominal_vals,
+        } => emit_shapesys_constraint(b, &param, nominal, &nominal_vals, &sigma, &ov),
+        PendingConstraint::Normal01 => emit_normal01_constraint(b, &param, &ov),
     };
     terms.constraints.push(term);
 }
@@ -902,6 +987,7 @@ mod tests {
                         name: "lumi".into(),
                         auxdata: vec![1.0],
                         sigmas: vec![0.1],
+                        factors: vec![],
                     }],
                 },
             }],

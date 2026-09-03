@@ -38,6 +38,48 @@ fn json_array(b: &mut Builder, v: &serde_json::Value, what: &str) -> Result<Node
     Ok(b.array(&elems))
 }
 
+/// A measurement config's override of one parameter's auxiliary measurement.
+///
+/// A pyhf `measurements[].config.parameters[]` entry may replace what the
+/// modifier derived: `auxdata` is the value the constraint is observed at,
+/// `sigmas` the Gaussian width, `factors` the Poisson rate factor
+/// (`pyhf.parameters.utils.reduce_paramsets_requirements`). An empty vector
+/// means the entry left that field alone.
+#[derive(Debug, Clone, Default)]
+pub struct AuxOverride {
+    /// The value the constraint is observed at.
+    pub auxdata: Vec<f64>,
+    /// Gaussian constraint width.
+    pub sigmas: Vec<f64>,
+    /// Poisson rate factor.
+    pub factors: Vec<f64>,
+}
+
+/// The per-bin Poisson rate factor for a shapesys parameter:
+/// `tau_b = (nominal_b / sigma_b)^2`, or 1.0 on a bin whose nominal or
+/// uncertainty is not positive. pyhf fixes such a bin's gamma at 1 and gives it
+/// a unit rate factor rather than the infinity the ratio would produce
+/// (`pyhf.modifiers.shapesys.required_parset`).
+pub fn shapesys_tau(nominal: &[f64], sigma: &[f64]) -> Vec<f64> {
+    nominal
+        .iter()
+        .zip(sigma)
+        .map(|(n, s)| {
+            if *n > 0.0 && *s > 0.0 {
+                (n / s).powi(2)
+            } else {
+                1.0
+            }
+        })
+        .collect()
+}
+
+/// Whether every bin has a positive nominal and a positive uncertainty, so
+/// `(nominal/sigma)^2` is finite on all of them.
+fn shapesys_all_bins_valid(nominal: &[f64], sigma: &[f64]) -> bool {
+    nominal.len() == sigma.len() && nominal.iter().zip(sigma).all(|(n, s)| *n > 0.0 && *s > 0.0)
+}
+
 /// tau = broadcast(pow, broadcast(divide, nom, sigma), 2)  [point-free].
 fn tau(b: &mut Builder, nom: NodeId, sigma: NodeId) -> NodeId {
     let divide = b.call_head("divide");
@@ -57,7 +99,9 @@ pub fn emit_shapesys_constraint(
     b: &mut Builder,
     param: &str,
     nominal: NodeId,
+    nominal_vals: &[f64],
     sigma_vals: &[f64],
+    ov: &AuxOverride,
 ) -> NodeId {
     let sigma_elems: Vec<NodeId> = sigma_vals.iter().map(|&v| b.lit_real(v)).collect();
     let sigma_arr = b.array(&sigma_elems);
@@ -66,12 +110,26 @@ pub fn emit_shapesys_constraint(
         sigma_arr,
         "Absolute per-bin uncertainties (pyhf shapesys data).",
     );
-    let sigma_ref = b.self_ref(&sigma_name);
-    let t = tau(b, nominal, sigma_ref);
+    // The `(nominal/sigma)^2` expression reads better, but it cannot express a
+    // measurement's `factors` override, and it is infinite on a bin with a
+    // non-positive nominal or uncertainty. Pin the vector in either case.
+    let t = if !ov.factors.is_empty() {
+        let elems: Vec<NodeId> = ov.factors.iter().map(|&v| b.lit_real(v)).collect();
+        b.array(&elems)
+    } else if shapesys_all_bins_valid(nominal_vals, sigma_vals) {
+        let sigma_ref = b.self_ref(&sigma_name);
+        tau(b, nominal, sigma_ref)
+    } else {
+        let elems: Vec<NodeId> = shapesys_tau(nominal_vals, sigma_vals)
+            .iter()
+            .map(|&v| b.lit_real(v))
+            .collect();
+        b.array(&elems)
+    };
     let tau_name = b.bind_unique_doc(
         &format!("{param}_tau"),
         t,
-        "Effective event counts (nominal/sigma)^2: the constraint's observed aux data.",
+        "Effective event counts (nominal/sigma)^2: the Poisson constraint's rate factor.",
     );
     let gamma = b.self_ref(param);
     let tau_ref = b.self_ref(&tau_name);
@@ -86,8 +144,9 @@ pub fn emit_shapesys_constraint(
         "Auxiliary Poisson constraint on the nuisance parameter.",
     );
     let constraint_ref = b.self_ref(&constraint_name);
-    let tau_ref2 = b.self_ref(&tau_name);
-    let term = b.call("likelihoodof", &[constraint_ref, tau_ref2]);
+    let derived_obs = b.self_ref(&tau_name);
+    let obs = observed_aux(b, &ov.auxdata, derived_obs);
+    let term = b.call("likelihoodof", &[constraint_ref, obs]);
     let term_name = b.bind_unique_doc(
         &format!("{param}_constraint_likelihood"),
         term,
@@ -96,11 +155,21 @@ pub fn emit_shapesys_constraint(
     b.self_ref(&term_name)
 }
 
+/// The node the constraint is observed at: the measurement's `auxdata` when it
+/// set one, otherwise whatever the modifier derived.
+fn observed_aux(b: &mut Builder, auxdata: &[f64], derived: NodeId) -> NodeId {
+    if auxdata.is_empty() {
+        return derived;
+    }
+    let elems: Vec<NodeId> = auxdata.iter().map(|&v| b.lit_real(v)).collect();
+    b.array(&elems)
+}
+
 /// Emit a **Normal(alpha, 1) observed at 0** constraint (normsys / histosys) for
 /// parameter `param`, returning its constraint-likelihood term. Binds
 /// `<param>_constraint` = `functionof(Normal(mu = alpha, sigma = 1.0))` and
 /// `<param>_constraint_likelihood`. Caller emits once per parameter.
-pub fn emit_normal01_constraint(b: &mut Builder, param: &str) -> NodeId {
+pub fn emit_normal01_constraint(b: &mut Builder, param: &str, ov: &AuxOverride) -> NodeId {
     let alpha = b.self_ref(param);
     let sigma_one = b.lit_real(1.0);
     let normal = b.call_kw("Normal", &[("mu", alpha), ("sigma", sigma_one)]);
@@ -111,7 +180,8 @@ pub fn emit_normal01_constraint(b: &mut Builder, param: &str) -> NodeId {
         "Auxiliary Gaussian constraint on the nuisance parameter.",
     );
     let constraint_ref = b.self_ref(&constraint_name);
-    let obs_zero = b.lit_real(0.0);
+    // Scalar parameter, so the measurement's `auxdata` is one number.
+    let obs_zero = b.lit_real(ov.auxdata.first().copied().unwrap_or(0.0));
     let term = b.call("likelihoodof", &[constraint_ref, obs_zero]);
     let term_name = b.bind_unique_doc(
         &format!("{param}_constraint_likelihood"),
@@ -158,14 +228,16 @@ pub fn emit_staterror_constraint(
     sum_nom: &[f64],
     sum_sq: &[f64],
     gaussian: bool,
+    ov: &AuxOverride,
 ) -> NodeId {
     let gamma = b.self_ref(param);
     if gaussian {
-        let delta_elems: Vec<NodeId> = sum_nom
-            .iter()
-            .zip(sum_sq.iter())
-            .map(|(n, sq)| b.lit_real(if *n > 0.0 { sq.sqrt() / n } else { 0.0 }))
-            .collect();
+        let deltas: Vec<f64> = if ov.sigmas.is_empty() {
+            staterror_delta(sum_nom, sum_sq)
+        } else {
+            ov.sigmas.clone()
+        };
+        let delta_elems: Vec<NodeId> = deltas.iter().map(|&v| b.lit_real(v)).collect();
         let delta_arr = b.array(&delta_elems);
         let delta_name = b.bind_unique_doc(
             &format!("{param}_delta"),
@@ -182,7 +254,8 @@ pub fn emit_staterror_constraint(
             "Auxiliary Gaussian (MC-stat) constraint on the nuisance parameter.",
         );
         let ones: Vec<NodeId> = sum_nom.iter().map(|_| b.lit_real(1.0)).collect();
-        let obs = b.array(&ones);
+        let derived_obs = b.array(&ones);
+        let obs = observed_aux(b, &ov.auxdata, derived_obs);
         let constraint_ref = b.self_ref(&constraint_name);
         let term = b.call("likelihoodof", &[constraint_ref, obs]);
         let term_name = b.bind_unique_doc(
@@ -194,11 +267,16 @@ pub fn emit_staterror_constraint(
     }
     // Poisson form: tau_b = sum_nom_b^2 / sum_sq_b (effective counts), computed
     // directly from the sums to match ROOT exactly.
-    let tau_elems: Vec<NodeId> = sum_nom
-        .iter()
-        .zip(sum_sq.iter())
-        .map(|(n, sq)| b.lit_real(if *sq > 0.0 { n * n / sq } else { 0.0 }))
-        .collect();
+    let taus: Vec<f64> = if ov.factors.is_empty() {
+        sum_nom
+            .iter()
+            .zip(sum_sq.iter())
+            .map(|(n, sq)| if *sq > 0.0 { n * n / sq } else { 0.0 })
+            .collect()
+    } else {
+        ov.factors.clone()
+    };
+    let tau_elems: Vec<NodeId> = taus.iter().map(|&v| b.lit_real(v)).collect();
     let tau_arr = b.array(&tau_elems);
     let tau_name = b.bind_unique_doc(
         &format!("{param}_tau"),
@@ -218,13 +296,30 @@ pub fn emit_staterror_constraint(
     );
     let constraint_ref = b.self_ref(&constraint_name);
     let tau_ref2 = b.self_ref(&tau_name);
-    let term = b.call("likelihoodof", &[constraint_ref, tau_ref2]);
+    let obs = observed_aux(b, &ov.auxdata, tau_ref2);
+    let term = b.call("likelihoodof", &[constraint_ref, obs]);
     let term_name = b.bind_unique_doc(
         &format!("{param}_constraint_likelihood"),
         term,
         "staterror constraint likelihood term.",
     );
     b.self_ref(&term_name)
+}
+
+/// The per-bin Gaussian width of a staterror constraint:
+/// `sqrt(sum_sq_b) / sum_nom_b`, the relative MC-stat uncertainty against the
+/// channel-summed nominal. A bin with no nominal or no uncertainty gets 1.0:
+/// pyhf fixes such a bin's gamma and substitutes a unit width for the zero that
+/// would make the Normal degenerate (`pyhf.modifiers.staterror.staterror_builder`).
+fn staterror_delta(sum_nom: &[f64], sum_sq: &[f64]) -> Vec<f64> {
+    sum_nom
+        .iter()
+        .zip(sum_sq.iter())
+        .map(|(n, sq)| {
+            let d = if *n > 0.0 { sq.sqrt() / n } else { 0.0 };
+            if d > 0.0 { d } else { 1.0 }
+        })
+        .collect()
 }
 
 // pyhf interpolation codes (the `interpolation` field on a modifier).
@@ -317,6 +412,14 @@ pub struct ModSpec {
     /// channels is a different parameter, not a shared one (pyhf `InvalidModel`:
     /// "Trying to add paramset … but other paramsets exist with the same name").
     pub per_channel: bool,
+    /// Whether this kind's paramset defines `auxdata`, so a measurement config
+    /// may override it. pyhf refuses an override of a field the paramset does
+    /// not define ("<name> does not use the <field> attribute").
+    pub uses_auxdata: bool,
+    /// Whether this kind's paramset defines `sigmas` (the Gaussian width).
+    pub uses_sigmas: bool,
+    /// Whether this kind's paramset defines `factors` (the Poisson rate factor).
+    pub uses_factors: bool,
 }
 
 /// The modifier-kind table. One row per supported histfactory modifier.
@@ -331,6 +434,9 @@ pub const MOD_SPECS: &[ModSpec] = &[
         channel_staterror: false,
         pyhf_paramset: PyhfParamset::Unconstrained,
         per_channel: false,
+        uses_auxdata: false,
+        uses_sigmas: false,
+        uses_factors: false,
     },
     ModSpec {
         kind: "shapesys",
@@ -341,6 +447,9 @@ pub const MOD_SPECS: &[ModSpec] = &[
         channel_staterror: false,
         pyhf_paramset: PyhfParamset::Poisson,
         per_channel: true,
+        uses_auxdata: true,
+        uses_sigmas: false,
+        uses_factors: true,
     },
     ModSpec {
         kind: "normsys",
@@ -351,6 +460,9 @@ pub const MOD_SPECS: &[ModSpec] = &[
         channel_staterror: false,
         pyhf_paramset: PyhfParamset::Normal,
         per_channel: false,
+        uses_auxdata: true,
+        uses_sigmas: false,
+        uses_factors: false,
     },
     ModSpec {
         kind: "histosys",
@@ -361,6 +473,9 @@ pub const MOD_SPECS: &[ModSpec] = &[
         channel_staterror: false,
         pyhf_paramset: PyhfParamset::Normal,
         per_channel: false,
+        uses_auxdata: true,
+        uses_sigmas: false,
+        uses_factors: false,
     },
     ModSpec {
         kind: "lumi",
@@ -371,6 +486,9 @@ pub const MOD_SPECS: &[ModSpec] = &[
         channel_staterror: false,
         pyhf_paramset: PyhfParamset::Normal,
         per_channel: false,
+        uses_auxdata: true,
+        uses_sigmas: true,
+        uses_factors: false,
     },
     ModSpec {
         kind: "staterror",
@@ -381,6 +499,9 @@ pub const MOD_SPECS: &[ModSpec] = &[
         channel_staterror: true,
         pyhf_paramset: PyhfParamset::Normal,
         per_channel: false,
+        uses_auxdata: true,
+        uses_sigmas: true,
+        uses_factors: false,
     },
     ModSpec {
         kind: "shapefactor",
@@ -391,6 +512,9 @@ pub const MOD_SPECS: &[ModSpec] = &[
         channel_staterror: false,
         pyhf_paramset: PyhfParamset::Unconstrained,
         per_channel: false,
+        uses_auxdata: false,
+        uses_sigmas: false,
+        uses_factors: false,
     },
 ];
 
@@ -438,7 +562,8 @@ pub enum Effect {
 pub enum PendingConstraint {
     /// shapesys: `ContinuedPoisson.(gamma * tau)`, `tau = (nominal/sigma)^2`. The
     /// caller supplies the sample's nominal ref to [`emit_shapesys_constraint`].
-    Shapesys { sigma: Vec<f64> },
+    /// `nominal` carries the same values, which the degenerate-bin rule needs.
+    Shapesys { sigma: Vec<f64>, nominal: Vec<f64> },
     /// normsys / histosys: `Normal(alpha, 1)` observed at 0
     /// ([`emit_normal01_constraint`]).
     Normal01,
@@ -450,16 +575,18 @@ pub enum PendingConstraint {
 /// constraints are channel-level (assembler emits them from the channel-summed
 /// uncertainties / measurement config).
 ///
-/// `nom` is the sample's (post-histosys) nominal node, used for histosys
-/// interpolation; `nom_len` validates histosys `lo`/`hi` array lengths.
+/// `nom` is the sample's nominal node, used for histosys interpolation;
+/// `nom_vals` carries the same values, for the per-bin array-length checks and
+/// the shapesys degenerate-bin rule.
 pub fn modifier_effect(
     b: &mut Builder,
     m: &Modifier,
     nom: NodeId,
-    nom_len: usize,
+    nom_vals: &[f64],
 ) -> Result<(Effect, Option<(String, PendingConstraint)>)> {
     let spec = require_spec(m)?;
     let param = require_param(m, spec)?;
+    let nom_len = nom_vals.len();
     match spec.kind {
         // Free / channel-level-constrained: just a multiply here.
         "normfactor" | "shapefactor" | "lumi" | "staterror" => {
@@ -483,7 +610,13 @@ pub fn modifier_effect(
             let factor = b.self_ref(&param);
             Ok((
                 Effect::Multiply(factor),
-                Some((param, PendingConstraint::Shapesys { sigma })),
+                Some((
+                    param,
+                    PendingConstraint::Shapesys {
+                        sigma,
+                        nominal: nom_vals.to_vec(),
+                    },
+                )),
             ))
         }
 
@@ -646,7 +779,14 @@ mod tests {
                 let c = b.lit_real(52.0);
                 b.array(&[a, c])
             };
-            let _ = emit_shapesys_constraint(&mut b, "gamma", nom, &[3.0, 7.0]);
+            let _ = emit_shapesys_constraint(
+                &mut b,
+                "gamma",
+                nom,
+                &[50.0, 52.0],
+                &[3.0, 7.0],
+                &AuxOverride::default(),
+            );
         }
         let text = print_with(&m, Syntax::Minimal);
         assert!(text.contains("ContinuedPoisson"), "got:\n{text}");
@@ -664,7 +804,7 @@ mod tests {
         let mut m = flatppl_core::Module::new();
         {
             let mut b = Builder::new(&mut m);
-            let _ = emit_normal01_constraint(&mut b, "alpha");
+            let _ = emit_normal01_constraint(&mut b, "alpha", &AuxOverride::default());
         }
         let text = print_with(&m, Syntax::Minimal);
         assert!(text.contains("Normal"), "got:\n{text}");
@@ -680,8 +820,14 @@ mod tests {
         let mut m = flatppl_core::Module::new();
         {
             let mut b = Builder::new(&mut m);
-            let _ =
-                emit_staterror_constraint(&mut b, "gamma", &[100.0, 100.0], &[25.0, 100.0], false);
+            let _ = emit_staterror_constraint(
+                &mut b,
+                "gamma",
+                &[100.0, 100.0],
+                &[25.0, 100.0],
+                false,
+                &AuxOverride::default(),
+            );
         }
         let text = print_with(&m, Syntax::Minimal);
         assert!(text.contains("ContinuedPoisson"), "got:\n{text}");
@@ -703,8 +849,14 @@ mod tests {
         let mut m = flatppl_core::Module::new();
         {
             let mut b = Builder::new(&mut m);
-            let _ =
-                emit_staterror_constraint(&mut b, "gamma", &[100.0, 100.0], &[25.0, 100.0], true);
+            let _ = emit_staterror_constraint(
+                &mut b,
+                "gamma",
+                &[100.0, 100.0],
+                &[25.0, 100.0],
+                true,
+                &AuxOverride::default(),
+            );
         }
         let text = print_with(&m, Syntax::Minimal);
         assert!(text.contains("Normal"), "got:\n{text}");

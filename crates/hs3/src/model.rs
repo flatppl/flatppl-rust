@@ -379,6 +379,9 @@ pub struct PyhfParam {
     pub auxdata: Vec<f64>,
     #[serde(default)]
     pub sigmas: Vec<f64>,
+    /// Poisson rate factors, for a `constrained_by_poisson` parameter (shapesys).
+    #[serde(default)]
+    pub factors: Vec<f64>,
 }
 
 #[derive(Debug, Deserialize)]
