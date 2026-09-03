@@ -716,6 +716,28 @@ fn rejects_a_name_that_would_inject_syntax() {
                 "expr": { "int": 1 } } } }]}}),
         ),
         (
+            "ref ns",
+            json!({ "%module": { "public": ["x"], "binds": [
+                { "name": "y", "expr": { "int": 1 } },
+                { "name": "x", "expr": { "%ref": { "ns": "self) (%bind q 2", "name": "y" } } }]}}),
+        ),
+        (
+            "inputs origin",
+            json!({ "%module": { "public": ["f"], "binds": [
+                { "name": "z", "expr": { "int": 1 } },
+                { "name": "f", "expr": ["functionof", { "int": 1 }, { "%inputs": {
+                    "origin": "%specinputs) (%bind q 2",
+                    "list": [["a", { "%ref": { "ns": "self", "name": "z" } }]] } }] }]}}),
+        ),
+        (
+            "input name",
+            json!({ "%module": { "public": ["f"], "binds": [
+                { "name": "z", "expr": { "int": 1 } },
+                { "name": "f", "expr": ["functionof", { "int": 1 }, { "%inputs": {
+                    "origin": "%specinputs",
+                    "list": [["a) (%bind q 2", { "%ref": { "ns": "self", "name": "z" } }]] } }] }]}}),
+        ),
+        (
             "doc tag",
             json!({ "%module": { "public": ["x"], "binds": [{ "name": "x",
                 "expr": { "int": 1 },
