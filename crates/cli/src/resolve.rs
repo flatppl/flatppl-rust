@@ -236,15 +236,17 @@ pub fn data_sources_of(module: &Module, base: &Location) -> Vec<Location> {
 
 /// Discover and resolve a model's references for inference. Walks the
 /// `load_module` graph breadth-first, resolving + parsing each dependency
-/// through `resolver` into a [`ModuleBundle`] keyed by the directive string the
-/// engine looks up (trust batched per BFS level), and collects every
-/// `load_data` source location found across the graph (root + dependencies),
-/// deduplicated. The data locations are returned, not fetched here — the caller
-/// decides whether/when to resolve them (see [`CliResolver::resolve_all`]).
+/// through `resolver` into a [`ModuleBundle`] keyed by resolved location (trust
+/// batched per BFS level), and collects every `load_data` source location found
+/// across the graph (root + dependencies), deduplicated. The data locations are
+/// returned, not fetched here — the caller decides whether/when to resolve them
+/// (see [`CliResolver::resolve_all`]).
 ///
-/// The bundle is keyed by directive string (the engine's lookup key), so a
-/// given string must denote one file across the whole graph — a conflict is a
-/// hard error rather than a silent last-writer-wins.
+/// Each dependency is recorded under its resolved location together with the
+/// `(declaring file, directive string)` pair that reached it, so the engine
+/// resolves a literal per importer. Two importer-local `common.flatppl` files
+/// are therefore two distinct entries — spec §04 "Path resolution" resolves each
+/// against its own declaring file — rather than a conflict to refuse.
 #[cfg(feature = "infer")]
 pub fn build_bundle(
     root: &Module,
@@ -255,12 +257,11 @@ pub fn build_bundle(
     use std::sync::Arc;
 
     let mut bundle = flatppl_infer::ModuleBundle::new();
+    bundle.set_root(root_loc.display());
     // Parse each distinct file once, keyed by its resolved location.
     let mut parsed: HashMap<String, Arc<Module>> = HashMap::new();
     // Locations whose own dependencies have already been queued (cycle guard).
     let mut walked: HashSet<String> = HashSet::new();
-    // directive string → resolved location, to catch a string used for two files.
-    let mut key_loc: HashMap<String, String> = HashMap::new();
     // `load_data` source locations across the graph, deduped by display.
     let mut data: Vec<Location> = Vec::new();
     let mut data_seen: HashSet<String> = HashSet::new();
@@ -274,28 +275,20 @@ pub fn build_bundle(
 
     collect_data(root, root_loc);
     walked.insert(root_loc.display());
-    let mut level = directives_of(root, root_loc);
+    // Each entry carries the identity of the file that DECLARED the directive,
+    // because that is what the directive resolves against.
+    let mut level: Vec<(String, String, Location)> = directives_of(root, root_loc)
+        .into_iter()
+        .map(|(directive, loc)| (root_loc.display(), directive, loc))
+        .collect();
 
     while !level.is_empty() {
-        let locs: Vec<&Location> = level.iter().map(|(_, l)| l).collect();
+        let locs: Vec<&Location> = level.iter().map(|(_, _, l)| l).collect();
         resolver.ensure_trusted(&locs)?;
 
-        let mut next: Vec<(String, Location)> = Vec::new();
-        for (directive, loc) in &level {
+        let mut next: Vec<(String, String, Location)> = Vec::new();
+        for (importer, directive, loc) in &level {
             let ld = loc.display();
-            match key_loc.get(directive) {
-                Some(prev) if prev != &ld => {
-                    return Err(Failure::Plain(format!(
-                        "load_module(\"{directive}\") refers to two different files \
-                         ({prev} and {ld}); the inference bundle is keyed by the directive \
-                         string, so a name must denote one file across the module graph"
-                    )));
-                }
-                _ => {
-                    key_loc.insert(directive.clone(), ld.clone());
-                }
-            }
-
             let module = match parsed.get(&ld) {
                 Some(m) => m.clone(),
                 None => {
@@ -316,13 +309,22 @@ pub fn build_bundle(
                     module
                 }
             };
-            bundle.insert(directive.clone(), module.clone());
+            bundle.insert_resolved(
+                importer.clone(),
+                directive.clone(),
+                ld.clone(),
+                module.clone(),
+            );
 
             // Queue this file's own dependencies (and collect its data
             // sources) exactly once.
             if walked.insert(ld.clone()) {
                 collect_data(&module, loc);
-                next.extend(directives_of(&module, loc));
+                next.extend(
+                    directives_of(&module, loc)
+                        .into_iter()
+                        .map(|(d, l)| (ld.clone(), d, l)),
+                );
             }
         }
         level = next;

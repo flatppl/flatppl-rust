@@ -449,9 +449,12 @@ pub fn resolve_path(
 /// set transitively includes every (direct or transitive) dependency's `parse`,
 /// so editing any dependency's text invalidates the importer's analysis.
 ///
-/// Each dependency is inserted under the *same* literal directive path string
-/// the directive used, so `infer`'s `(%ref alias X)` resolution (which keys the
-/// bundle by the directive path) finds it.
+/// Each dependency is inserted under the resolved `SourceFile` path — its
+/// identity — together with the `(declaring file, directive literal)` pair that
+/// reached it, so `infer`'s `(%ref alias X)` resolution resolves the literal per
+/// importer. Keying by the literal alone collapses two importer-local
+/// `common.flatppl` files into one entry (spec §04 "Path resolution" resolves
+/// each against its own declaring file), and the second overwrites the first.
 ///
 /// This is a `#[salsa::tracked]` query so the transitive bundle is assembled
 /// **once per revision** rather than rebuilt on every `analyze` call (per
@@ -471,6 +474,8 @@ pub fn import_bundle(db: &dyn salsa::Database, file: SourceFile, fs: FileSet) ->
     IMPORT_BUNDLE_RUNS.with(|c| c.set(c.get() + 1));
 
     let mut bundle = flatppl_infer::ModuleBundle::new();
+    // The root importer's identity, so its own directives resolve against it.
+    bundle.set_root(file.path(db).clone());
     // Tracks the RESOLVED SourceFile for every transitive dependency. Used by
     // `affected_files` (server.rs) to match importers by SourceFile identity
     // instead of directive-literal path strings — so a relative import such as
@@ -495,11 +500,17 @@ pub fn import_bundle(db: &dyn salsa::Database, file: SourceFile, fs: FileSet) ->
             // match by id rather than by the directive's literal path string.
             dep_files.insert(dep_file);
             if let Some(dep_mod) = parse(db, dep_file).module(db) {
-                // Key by the directive-literal path so infer's `(%ref alias X)`
-                // lookup (keyed by directive path) matches. The single deep
-                // clone of the parsed dependency lives here, behind an `Arc`,
-                // computed once per revision rather than per `analyze` call.
-                bundle.insert(path, Arc::new(dep_mod.clone()));
+                // Key by resolved identity, and record the resolution so
+                // infer's `(%ref alias X)` lookup resolves this literal in
+                // THIS declaring file. The single deep clone of the parsed
+                // dependency lives here, behind an `Arc`, computed once per
+                // revision rather than per `analyze` call.
+                bundle.insert_resolved(
+                    current.path(db).clone(),
+                    path,
+                    dep_file.path(db).clone(),
+                    Arc::new(dep_mod.clone()),
+                );
             }
             // Enqueue once; the visited set is keyed on the resolved file so two
             // directives that resolve to the same file (or an import cycle) do

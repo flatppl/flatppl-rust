@@ -565,7 +565,7 @@ impl<'m, 's> Inferencer<'m, 's> {
             };
         // `call` borrow is fully released — safe to push diagnostics.
         if let Some((path, assigns)) = load_check {
-            if let Some(dep) = self.session.bundle.get(&path) {
+            if let Some(dep) = self.session.dep_for_literal(&path) {
                 for (name_sym, value_node) in assigns {
                     let input = self.module.resolve(name_sym).to_string();
                     match dep_input_kind(dep, &input) {

@@ -25,8 +25,16 @@ fn is_remote_source(source: &str) -> bool {
         || (b.len() >= 8 && source[..8].eq_ignore_ascii_case("https://"))
 }
 
-/// Parsed dependency modules, keyed by the `load_module` path string. Supplied
-/// by the host (the engine does no file I/O).
+/// Parsed dependency modules, keyed by **resolved file identity** — the host's
+/// canonical spelling of the file or URL, not the `load_module` literal.
+/// Supplied by the host (the engine does no file I/O).
+///
+/// Spec §04 "Path resolution" resolves a relative `load_module` path against
+/// the directory of the file that declares it, so the same literal in two
+/// importers names two different files. Keying by the literal collapses them,
+/// which hands a reference the wrong module's type with no diagnostic. The
+/// literal is therefore only a lookup input, resolved per importer through
+/// `resolutions`.
 ///
 /// Dependencies are held behind `Arc<Module>` so a host that assembles the same
 /// bundle repeatedly (e.g. the LSP, once per keystroke) shares one parsed copy
@@ -36,7 +44,18 @@ fn is_remote_source(source: &str) -> bool {
 /// (inference annotates it in place).
 #[derive(Debug, Default, Clone)]
 pub struct ModuleBundle {
-    modules: HashMap<String, Arc<Module>>,
+    /// Dependencies by resolved identity.
+    by_id: HashMap<String, Arc<Module>>,
+    /// importer identity -> directive literal -> resolved identity.
+    resolutions: HashMap<String, HashMap<String, String>>,
+    /// Directive literal -> identity, kept only while that literal denotes ONE
+    /// identity across the whole bundle. `None` records a literal used for two
+    /// files: a lookup with no importer context must then refuse rather than
+    /// pick one of them.
+    by_literal: HashMap<String, Option<String>>,
+    /// Identity of the module handed to `infer_module`. Its own directives
+    /// resolve against this key.
+    root: String,
 }
 
 impl ModuleBundle {
@@ -44,19 +63,106 @@ impl ModuleBundle {
         Self::default()
     }
 
-    /// Insert a parsed dependency (shared `Arc`) under its `load_module` path.
+    /// Insert a parsed dependency whose resolved identity **is** its
+    /// `load_module` literal. For a host that does no path resolution of its
+    /// own, and for a single-importer graph.
     pub fn insert(&mut self, path: impl Into<String>, module: Arc<Module>) {
-        self.modules.insert(path.into(), module);
+        let path = path.into();
+        self.insert_by_id(path.clone(), path, module);
     }
 
-    /// The dependency parsed for `path`, if present.
+    /// Insert a parsed dependency under its resolved `identity`, and record that
+    /// `literal`, as spelled in the module identified by `importer`, resolves
+    /// to it.
+    pub fn insert_resolved(
+        &mut self,
+        importer: impl Into<String>,
+        literal: impl Into<String>,
+        identity: impl Into<String>,
+        module: Arc<Module>,
+    ) {
+        let literal = literal.into();
+        let identity = identity.into();
+        self.resolutions
+            .entry(importer.into())
+            .or_default()
+            .insert(literal.clone(), identity.clone());
+        self.insert_by_id(literal, identity, module);
+    }
+
+    /// Record the identity of the module `infer_module` is called on, so its own
+    /// directives resolve against the right importer.
+    pub fn set_root(&mut self, identity: impl Into<String>) {
+        self.root = identity.into();
+    }
+
+    /// Identity of the module `infer_module` is called on.
+    pub fn root(&self) -> &str {
+        &self.root
+    }
+
+    /// The identity `literal` denotes when spelled in `importer`.
+    ///
+    /// Falls back to the unambiguous literal alias when the host recorded no
+    /// resolution for this site, which keeps a literal-keyed bundle
+    /// ([`insert`](Self::insert)) working. An ambiguous literal with no
+    /// resolution yields `None`: refusing beats returning an arbitrary file.
+    pub fn identity_of(&self, importer: &str, literal: &str) -> Option<&str> {
+        if let Some(id) = self
+            .resolutions
+            .get(importer)
+            .and_then(|per_importer| per_importer.get(literal))
+        {
+            return Some(id.as_str());
+        }
+        self.by_literal.get(literal)?.as_deref()
+    }
+
+    /// The dependency `literal` denotes when spelled in `importer`.
+    pub fn get_from(&self, importer: &str, literal: &str) -> Option<&Module> {
+        self.get_by_id(self.identity_of(importer, literal)?)
+    }
+
+    /// The shared `Arc` for the dependency `literal` denotes in `importer`.
+    pub fn get_arc_from(&self, importer: &str, literal: &str) -> Option<&Arc<Module>> {
+        self.get_arc_by_id(self.identity_of(importer, literal)?)
+    }
+
+    /// The dependency stored under resolved `identity`.
+    pub fn get_by_id(&self, identity: &str) -> Option<&Module> {
+        self.by_id.get(identity).map(|a| a.as_ref())
+    }
+
+    /// The shared `Arc` stored under resolved `identity`.
+    pub fn get_arc_by_id(&self, identity: &str) -> Option<&Arc<Module>> {
+        self.by_id.get(identity)
+    }
+
+    /// The dependency for `path` with no importer context: the literal alias
+    /// route. `None` when `path` denotes two different files in this bundle.
     pub fn get(&self, path: &str) -> Option<&Module> {
-        self.modules.get(path).map(|a| a.as_ref())
+        self.get_from("", path)
     }
 
-    /// The shared `Arc` for `path`, if present (refcount bump, no deep clone).
+    /// The shared `Arc` for `path` with no importer context (refcount bump, no
+    /// deep clone). `None` when `path` denotes two different files.
     pub fn get_arc(&self, path: &str) -> Option<&Arc<Module>> {
-        self.modules.get(path)
+        self.get_arc_from("", path)
+    }
+
+    fn insert_by_id(&mut self, literal: String, identity: String, module: Arc<Module>) {
+        match self.by_literal.get(&literal) {
+            // Already bound to a different file: the literal stops being a
+            // usable key for importer-free lookups.
+            Some(Some(prev)) if *prev != identity => {
+                self.by_literal.insert(literal, None);
+            }
+            Some(_) => {}
+            None => {
+                self.by_literal.insert(literal, Some(identity.clone()));
+            }
+        }
+        self.by_id.insert(identity, module);
     }
 }
 
@@ -262,9 +368,12 @@ pub(crate) struct InferSession<'b> {
     /// `standard_module` resolution consults this instead of `builtin()` directly
     /// so that host-supplied external catalogues are visible.
     pub(crate) catalogues: CatalogueSet<'b>,
-    /// (path, substitution-signature) -> the dependency's inferred (annotated) Module.
+    /// (resolved identity, substitution-signature) -> the dependency's inferred
+    /// (annotated) Module.
     memo: RefCell<HashMap<(String, String), Module>>,
-    /// Active import paths on the current resolution chain (cycle detection).
+    /// Resolved identities of the modules on the current resolution chain
+    /// (cycle detection). The top is the module being inferred right now, so it
+    /// is also the importer whose directives resolve next.
     stack: RefCell<Vec<String>>,
     /// Diagnostics accumulated from dependency inference runs. The root
     /// `Inferencer::run` drains this into its own diagnostic list so that
@@ -312,6 +421,23 @@ impl<'b> InferSession<'b> {
         self.dep_diags.borrow_mut().extend(diags);
     }
 
+    /// Resolved identity of the module being inferred right now: the innermost
+    /// dependency on the chain, or the bundle root at the top level. A
+    /// `load_module` literal read out of that module resolves against this key.
+    pub(crate) fn importer_id(&self) -> String {
+        self.stack
+            .borrow()
+            .last()
+            .cloned()
+            .unwrap_or_else(|| self.bundle.root().to_string())
+    }
+
+    /// The dependency a `load_module` literal denotes in the module being
+    /// inferred right now.
+    pub(crate) fn dep_for_literal(&self, literal: &str) -> Option<&Module> {
+        self.bundle.get_from(&self.importer_id(), literal)
+    }
+
     /// Extract the `load_module` / `standard_module` directive from the binding
     /// whose LHS is `alias` in `importer`.
     fn load_directive(&self, importer: &Module, alias: Symbol) -> Result<LoadDirective, String> {
@@ -355,7 +481,8 @@ impl<'b> InferSession<'b> {
         })
     }
 
-    /// Infer (and memo) the dependency at `path`, seeding substitution inputs
+    /// Infer (and memo) the dependency with resolved identity `id`, seeding
+    /// substitution inputs
     /// with `seeds` before the walk. Pushes/pops the active-import stack and
     /// inserts the annotated clone into `self.memo` under `key` when done.
     /// The caller (`resolve`) is responsible for the cycle check before calling.
@@ -371,12 +498,12 @@ impl<'b> InferSession<'b> {
         &self,
         dep: &Module,
         importer: &Module,
-        path: &str,
+        id: &str,
         key: &(String, String),
         seeds: &[(NodeId, Resolved)],
         level: crate::Level,
     ) {
-        self.stack.borrow_mut().push(path.to_string());
+        self.stack.borrow_mut().push(id.to_string());
         let mut dep_clone = dep.clone();
         let seeds: Vec<(NodeId, Resolved)> = seeds
             .iter()
@@ -433,13 +560,17 @@ impl<'b> InferSession<'b> {
             return resolve_standard(&self.catalogues, &directive, binding_name);
         }
 
-        let dep = self.bundle.get(&directive.path).ok_or_else(|| {
-            // Distinguish a remote (URL) directive from a local one. A URL that
-            // isn't in the module set is a fine reference whose source simply
-            // hasn't been fetched yet — say so, rather than a bare "not found"
-            // that reads like a 404 / "use a filename instead". The remedy
-            // (fetch the deps) is host-neutral: `flatppl prepare` on the CLI, the
-            // editor's download-dependencies action in an LSP client.
+        // The literal resolves against the module that declares it (spec §04
+        // "Path resolution"), so the same spelling in two importers can denote
+        // two different files. `importer_id` is that declaring module.
+        let importer_id = self.importer_id();
+        // Distinguish a remote (URL) directive from a local one. A URL that
+        // isn't in the module set is a fine reference whose source simply
+        // hasn't been fetched yet — say so, rather than a bare "not found"
+        // that reads like a 404 / "use a filename instead". The remedy
+        // (fetch the deps) is host-neutral: `flatppl prepare` on the CLI, the
+        // editor's download-dependencies action in an LSP client.
+        let unresolved = || {
             let p = &directive.path;
             if is_remote_source(p) {
                 format!(
@@ -448,24 +579,27 @@ impl<'b> InferSession<'b> {
             } else {
                 format!("module file `{p}` not found")
             }
-        })?;
+        };
+        let dep_id = self
+            .bundle
+            .identity_of(&importer_id, &directive.path)
+            .ok_or_else(unresolved)?
+            .to_string();
+        let dep = self.bundle.get_by_id(&dep_id).ok_or_else(unresolved)?;
 
-        let key = (
-            directive.path.clone(),
-            subst_signature(importer, subst_annos),
-        );
+        let key = (dep_id.clone(), subst_signature(importer, subst_annos));
 
         // Two-phase memo access: check first without holding a `Ref`, then
         // infer+insert (which needs `borrow_mut`), then re-borrow to read.
         // Holding a `Ref` across `borrow_mut` would panic at runtime.
         if !self.memo.borrow().contains_key(&key) {
-            if self.stack.borrow().contains(&directive.path) {
+            if self.stack.borrow().contains(&dep_id) {
                 let mut chain = self.stack.borrow().clone();
-                chain.push(directive.path.clone());
+                chain.push(dep_id.clone());
                 return Err(format!("module cycle: {}", chain.join(" → ")));
             }
             let seeds = seed_plan(dep, subst_annos);
-            self.infer_dep(dep, importer, &directive.path, &key, &seeds, level);
+            self.infer_dep(dep, importer, &dep_id, &key, &seeds, level);
         }
 
         let memo = self.memo.borrow();
