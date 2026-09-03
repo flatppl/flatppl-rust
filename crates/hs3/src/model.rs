@@ -19,7 +19,15 @@ pub struct Function {
     pub extra: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
+/// A native HS3 document.
+///
+/// `deny_unknown_fields` is deliberate: the HS3 spec §"Top-level components"
+/// lists a CLOSED set of nine components, so any other top-level key is not HS3.
+/// Ignoring one turns a typo into structure deletion — `{"distrubutions": […]}`
+/// used to convert to exit 0 and emit a model with no distribution at all.
+/// Every field below is one of those nine.
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct Document {
     #[serde(default)]
     pub distributions: Vec<Distribution>,
@@ -42,6 +50,16 @@ pub struct Document {
     #[allow(dead_code)]
     #[serde(default)]
     pub analyses: Vec<serde_json::Value>,
+    /// HS3 `metadata` block (HS3 version, authors, references). Provenance, not
+    /// model content — parsed so `deny_unknown_fields` accepts a conforming file.
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub metadata: Option<serde_json::Value>,
+    /// HS3 `misc` block (optimizer settings, plotting colours). Tool state, not
+    /// model content — parsed for the same reason as `metadata`.
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub misc: Option<serde_json::Value>,
 }
 
 /// An HS3 data set (unbinned or binned). `unbinned` data uses `entries`; the
@@ -297,9 +315,19 @@ pub fn derive_vector_param_name(parameters: &[String]) -> String {
 /// Supports two schemas:
 /// - **New (workspace):** `observations: [{name, data:[...]}]` and top-level `measurements`.
 /// - **Old (HistFactory dump):** `data: {"<channel>": [...]}` map and `toplvl.measurements`.
+///
+/// `deny_unknown_fields` mirrors pyhf's own `workspace.json` schema, which sets
+/// `additionalProperties: false` and rejects a stray or misspelled top-level key
+/// with `pyhf.exceptions.InvalidSpecification`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PyhfDocument {
     pub channels: Vec<PyhfChannel>,
+    /// pyhf workspace schema version. Not lowered; parsed so
+    /// `deny_unknown_fields` accepts a conforming workspace.
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub version: Option<String>,
     /// New-format per-channel observations (list of `{name, data}`).
     #[serde(default)]
     pub observations: Vec<PyhfObservation>,

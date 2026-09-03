@@ -440,8 +440,77 @@ fn convert(
     if matches!(to, Format::FlatPpl) {
         flatppl_cli::lint_generated(&mut module, output);
     }
+    // Gate the text before it reaches disk (see `check_generated`).
+    let imported = matches!(from_format, FromFormat::Hs3 | FromFormat::Pyhf);
+    check_generated(&text, to, input, output, imported)?;
     fs::write(output, text)
         .map_err(|e| Failure::Plain(format!("writing `{}`: {e}", output.display())))
+}
+
+/// Refuse to write output that does not read back, and — when an import
+/// GENERATED it — does not infer clean either.
+///
+/// `convert` used to write the file and exit 0 whatever the generated code said:
+/// an HS3 document with a dangling parameter of interest left a `.flatppl` on
+/// disk that `flatppl infer` rejected, after printing the error about it, so a
+/// script could not tell the conversion had failed.
+///
+/// `imported` scopes the inference half. For an HS3 or pyhf input the CLI wrote
+/// the code and owns its validity. For a FlatPPL or FlatPIR input the user wrote
+/// the model, `convert` only changes its representation, and `infer` is the verb
+/// that judges it — a model whose remote dependency is not cached converts fine
+/// and is what `flatppl prepare` exists for. The parse-back half runs either
+/// way: unreadable output is the writer's own defect.
+///
+/// Both halves run in EVERY build profile and every feature configuration that
+/// can run `convert`, which is why the `convert` feature pulls in `infer`. A
+/// validity gate that varies by build is the defect, not a mitigation of it.
+#[cfg(feature = "convert")]
+fn check_generated(
+    text: &str,
+    to: Format,
+    input: &Path,
+    output: &Path,
+    imported: bool,
+) -> Result<(), Failure> {
+    let mut module = match flatppl_cli::read_module(to, text) {
+        Ok(module) => module,
+        Err((message, line, span)) => {
+            return Err(Failure::Diagnostic {
+                path: output.to_path_buf(),
+                source: text.to_string(),
+                message: format!("generated output is not valid: {message}"),
+                line,
+                span,
+            });
+        }
+    };
+    if !imported {
+        return Ok(());
+    }
+    // Build the bundle the same way `infer` does, so the two verbs' verdicts
+    // are identical. The base is the INPUT: a relative `load_module` resolves
+    // against the file that wrote it, and the output may sit elsewhere. The
+    // importers emit no `load_module`, so this walk resolves nothing and never
+    // touches the network.
+    let resolver = CliResolver::cache_only();
+    let in_loc = Location::Local(input.to_path_buf());
+    let (bundle, _data_sources) = flatppl_cli::resolve::build_bundle(&module, &in_loc, &resolver)?;
+    let diags = flatppl_infer::infer_module(&mut module, &bundle, flatppl_infer::Level::Shape);
+    let mut errors = 0u32;
+    for d in &diags {
+        if matches!(d.severity, flatppl_infer::Severity::Error) {
+            errors += 1;
+            eprintln!("error: {}", d.message);
+        }
+    }
+    if errors > 0 {
+        return Err(Failure::Plain(format!(
+            "the generated module has {errors} inference error(s); `{}` was not written",
+            output.display()
+        )));
+    }
+    Ok(())
 }
 
 /// `flatppl infer <in> <out.flatpir>` — run the type/phase trace, report

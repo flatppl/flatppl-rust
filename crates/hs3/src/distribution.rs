@@ -84,6 +84,13 @@ pub(crate) fn field_node(b: &mut Builder, v: &serde_json::Value) -> Result<NodeI
         // literal; any other string is a reference to another binding (a
         // parameter, function, or distribution).
         serde_json::Value::String(s) => match s.parse::<f64>() {
+            // `str::parse::<f64>` accepts "NaN". FlatPPL has no NaN literal (spec
+            // §03 "Predefined constants" gives `inf` and `pi`, no NaN), so the
+            // printer writes the bare token `NaN`, which the parser reads as a
+            // name — invalid output that a print-then-reparse check cannot see.
+            Ok(x) if x.is_nan() => Err(Error::Unsupported(format!(
+                "field value `{s}` is not a number; FlatPPL has no NaN literal"
+            ))),
             Ok(x) => Ok(b.lit_real(x)),
             Err(_) => Ok(b.self_ref(s)),
         },
@@ -686,6 +693,23 @@ pub fn emit_distribution(
     }
 }
 
+/// One `edges` entry as a finite `f64`. Accepts a JSON number or a stringified
+/// one (the RooFit/HS3 habit), and rejects anything else, including `"NaN"` and
+/// `"inf"`, which `str::parse::<f64>` would otherwise accept.
+fn as_finite_edge(v: &serde_json::Value, index: usize) -> Result<f64> {
+    let parsed = match v {
+        serde_json::Value::Number(n) => n.as_f64(),
+        serde_json::Value::String(s) => s.parse::<f64>().ok(),
+        _ => None,
+    };
+    match parsed {
+        Some(x) if x.is_finite() => Ok(x),
+        _ => Err(Error::Unsupported(format!(
+            "bin edge {index} is not a finite number: {v}"
+        ))),
+    }
+}
+
 /// Build an edge-vector node from a single HS3 axis object.
 ///
 /// Axis forms:
@@ -702,10 +726,15 @@ fn build_bins(b: &mut Builder, axes: &[serde_json::Value]) -> Result<NodeId> {
     let axis = &axes[0];
     // {edges: [...]} form
     if let Some(edges) = axis.get("edges").and_then(|v| v.as_array()) {
-        let nodes: Vec<NodeId> = edges
-            .iter()
-            .map(|v| field_node(b, v))
-            .collect::<Result<_>>()?;
+        let mut nodes: Vec<NodeId> = Vec::with_capacity(edges.len());
+        for (i, v) in edges.iter().enumerate() {
+            // An edge must be a finite number: bin widths are edge differences,
+            // so a non-finite edge gives at least one bin no width at all. `inf`
+            // is a legal FlatPPL value (spec §03), which is why the emitted
+            // `[0.0, NaN, inf, 2.0]` passed a print-then-reparse check.
+            let x = as_finite_edge(v, i)?;
+            nodes.push(b.lit_real(x));
+        }
         return Ok(b.array(&nodes));
     }
     // {nbins, min, max} form
@@ -713,6 +742,10 @@ fn build_bins(b: &mut Builder, axes: &[serde_json::Value]) -> Result<NodeId> {
         .get("nbins")
         .and_then(|v| v.as_u64())
         .ok_or_else(|| Error::Unsupported("axis missing both `edges` and `nbins`".into()))?;
+    if nbins == 0 {
+        // (hi - lo) / 0 is NaN, so every edge came out NaN.
+        return Err(Error::Unsupported("axis `nbins` is 0".into()));
+    }
     let lo = axis
         .get("min")
         .and_then(|v| v.as_f64())
@@ -862,6 +895,46 @@ pub fn emit_product(
             inputs: None,
         })))
     }
+}
+
+/// Distribution fields that are arrays of NAMES only, so a non-string entry is
+/// malformed rather than a literal. `mixture_dist.coefficients` is deliberately
+/// absent: it legitimately mixes weights and parameter names.
+const NAME_ARRAY_FIELDS: &[(&str, &str)] = &[
+    ("mixture_dist", "summands"),
+    ("product_dist", "factors"),
+    ("barlow_beeston_lite_poisson_constraint_dist", "x"),
+];
+
+/// Reject a non-string entry in one of a distribution's name arrays.
+///
+/// These arrays used to be read with `filter_map(|v| v.as_str())`, which DELETES
+/// a malformed entry: `"factors": ["a", 7, "b"]` converted to a two-factor
+/// product, repairing the input by dropping model structure. The entry count is
+/// part of the model, so a non-string entry must fail.
+pub(crate) fn check_name_arrays(d: &Distribution) -> Result<()> {
+    let mut fields: Vec<&str> = NAME_ARRAY_FIELDS
+        .iter()
+        .filter(|(kind, _)| *kind == d.kind)
+        .map(|(_, field)| *field)
+        .collect();
+    if let Variate::MultiArray(field) = dist_spec::variate(&d.kind) {
+        fields.push(field);
+    }
+    for field in fields {
+        let Some(arr) = d.extra.get(field).and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for (i, v) in arr.iter().enumerate() {
+            if !v.is_string() {
+                return Err(Error::Unsupported(format!(
+                    "distribution `{}` ({}): `{field}` entry {i} is not a name: {v}",
+                    d.name, d.kind
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Factor distribution names of a `product_dist`, in document order.

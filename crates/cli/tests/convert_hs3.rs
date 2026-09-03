@@ -269,17 +269,21 @@ fn hs3_convert_emits_banner_and_compat() {
 /// unconstrained self-reference, so this document converts CLEAN and its
 /// `cmpf = unb > 1.0` compares a 3-row table against a scalar.
 ///
-/// `infer` used to type that `(%scalar boolean)` in silence. It must refuse. The
-/// conversion itself is deliberately still expected to SUCCEED — the converter
-/// transcribes the source document, and the scalar-domain rule is `infer`'s to
-/// enforce.
+/// `infer` used to type that `(%scalar boolean)` in silence. It must refuse.
+///
+/// `convert` must refuse it too, and must not leave the file on disk. This test
+/// used to assert the opposite — that the conversion SUCCEEDS and only a later
+/// `flatppl infer` rejects the result — which made a successful `convert` an
+/// unreliable validity signal: the run printed the type error about the file it
+/// had just written and still exited 0. Whatever the CLI generates, it now
+/// parses and infers before writing, so exit 0 means the output is a valid
+/// module.
 #[cfg(feature = "infer")]
 #[test]
-fn a_generic_function_comparing_an_unbinned_dataset_is_refused_by_infer() {
+fn a_generic_function_comparing_an_unbinned_dataset_is_refused_by_convert() {
     let dir = std::env::temp_dir();
     let inp = dir.join("hs3_table_cmp.json");
     let flat = dir.join("hs3_table_cmp.flatppl");
-    let pir = dir.join("hs3_table_cmp.flatpir");
     std::fs::write(
         &inp,
         r#"{"data":[{"axes":[{"name":"x","value":1.27}],
@@ -287,7 +291,8 @@ fn a_generic_function_comparing_an_unbinned_dataset_is_refused_by_infer() {
             "functions":[{"name":"cmpf","type":"generic_function","expression":"unb > 1.0"}]}"#,
     )
     .unwrap();
-    let status = Command::new(env!("CARGO_BIN_EXE_flatppl"))
+    let _ = std::fs::remove_file(&flat);
+    let out = Command::new(env!("CARGO_BIN_EXE_flatppl"))
         .args([
             "convert",
             "--from",
@@ -295,26 +300,73 @@ fn a_generic_function_comparing_an_unbinned_dataset_is_refused_by_infer() {
             inp.to_str().unwrap(),
             flat.to_str().unwrap(),
         ])
-        .status()
+        .output()
         .unwrap();
-    assert!(status.success(), "the document must still convert");
-    let text = std::fs::read_to_string(&flat).unwrap();
     assert!(
-        text.contains("cmpf = unb > 1.0") && text.contains("unb = table(x = [1.27, 2.5, 3.5])"),
-        "the table-versus-scalar comparison must be what is emitted, got:\n{text}"
+        !out.status.success(),
+        "convert must refuse to write a module that does not infer clean"
     );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("`gt` expects scalar operands") && err.contains("1-column table"),
+        "the failure must carry the diagnostic naming the table operand, got:\n{err}"
+    );
+    assert!(
+        err.contains("was not written"),
+        "the failure must say the output was not written, got:\n{err}"
+    );
+    assert!(
+        !flat.exists(),
+        "no partial output may be left behind at {}",
+        flat.display()
+    );
+}
 
+/// A conversion that succeeds must have produced a module `flatppl infer`
+/// accepts. This pins the gate the other direction: a real HS3 document
+/// converts, and running `infer` on what was written reports no error.
+#[cfg(feature = "infer")]
+#[test]
+fn a_successful_conversion_infers_clean() {
+    let dir = std::env::temp_dir();
+    let inp = dir.join("hs3_gate_ok.json");
+    let flat = dir.join("hs3_gate_ok.flatppl");
+    let pir = dir.join("hs3_gate_ok.flatpir");
+    std::fs::write(
+        &inp,
+        r#"{"distributions":[{"type":"gaussian_dist","name":"g",
+                             "x":"x","mean":"mu","sigma":"s"}],
+            "data":[{"type":"unbinned","name":"d",
+                     "axes":[{"name":"x","min":-5,"max":5}],"entries":[[0.5]]}],
+            "likelihoods":[{"name":"L","distributions":["g"],"data":["d"]}],
+            "domains":[{"type":"product_domain","name":"default_domain",
+                        "axes":[{"name":"x","min":-5,"max":5},
+                                {"name":"mu","min":-5,"max":5},
+                                {"name":"s","min":0.1,"max":10}]}]}"#,
+    )
+    .unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_flatppl"))
+        .args([
+            "convert",
+            "--from",
+            "hs3",
+            inp.to_str().unwrap(),
+            flat.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "a valid HS3 document must still convert, stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let out = Command::new(env!("CARGO_BIN_EXE_flatppl"))
         .args(["infer", flat.to_str().unwrap(), pir.to_str().unwrap()])
         .output()
         .unwrap();
     assert!(
-        !out.status.success(),
-        "infer must refuse the emitted module"
-    );
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        err.contains("`gt` expects scalar operands") && err.contains("1-column table"),
-        "infer must name the table operand, got:\n{err}"
+        out.status.success(),
+        "convert exited 0, so infer must accept what it wrote, stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }

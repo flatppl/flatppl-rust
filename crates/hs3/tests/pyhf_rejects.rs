@@ -145,7 +145,11 @@ fn shapesys_data_shorter_than_sample_errs() {
 }
 
 /// A `shapesys` `data` array LONGER than the sample, the other side of the same
-/// check. pyhf raises the same `InvalidModifier` with the lengths swapped.
+/// check.
+///
+/// pyhf: `pyhf.exceptions.InvalidModifier` — "The 'bkg' sample shapesys
+/// modifier 'uncorr' has data shape inconsistent with the sample.\nbkg has
+/// 'data' of length 2 but uncorr has 'data' of length 3."
 #[test]
 fn shapesys_data_longer_than_sample_errs() {
     assert_err_pyhf(

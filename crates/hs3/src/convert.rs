@@ -7,7 +7,7 @@
 //! intentionally NOT imported: it is layered on top of the model rather than
 //! part of it. Such a block is silently passed over rather than rejected, since
 //! real HS3 files routinely bundle one alongside the model.
-use crate::builder::Builder;
+use crate::builder::{Builder, check_binding_name};
 use crate::dist_spec;
 use crate::distribution::{
     RefMeasure, VariateName, emit_distribution, emit_product, field_node, needs_hepphys,
@@ -62,8 +62,14 @@ pub fn document_to_module(doc: &Document) -> Result<Module> {
 /// Reject documents carrying constructs outside this importer's supported
 /// subset before any lowering begins.
 ///
-/// This guards duplicate distribution or function binding names (which would
-/// silently shadow one another in the emitted module).
+/// Guards, in order: every source name that becomes a top-level binding is a
+/// legal FlatPPL name; no two of them collide; and no name array has a
+/// non-string entry.
+///
+/// The duplicate check covers EVERY block that becomes a top-level binding, not
+/// just distributions and functions. They share one output namespace, so a
+/// distribution and a parameter point both named `g` used to emit
+/// `g = Normal(…)` followed by `g = record(…)` in one module.
 ///
 /// NOTE: a document's HS3 `analyses` / bayesupdate block (§12:147) is
 /// intentionally NOT imported and NOT an error. `analyses` is inference
@@ -74,20 +80,47 @@ pub fn document_to_module(doc: &Document) -> Result<Module> {
 /// `Document::analyses` field is still parsed so its presence is observable, but
 /// the rest of the document lowers normally regardless of it.
 fn reject_unsupported(doc: &Document) -> Result<()> {
-    // Distribution and function entries both become top-level bindings; a name
-    // collision (within or across the two blocks) would silently drop a binding.
-    let mut seen: BTreeSet<&str> = BTreeSet::new();
-    for name in doc
+    // (block label, name). `data` also emits `<name>_domain`, checked below.
+    let named_blocks = doc
         .distributions
         .iter()
-        .map(|d| d.name.as_str())
-        .chain(doc.functions.iter().map(|f| f.name.as_str()))
-    {
+        .map(|d| ("distribution", d.name.as_str()))
+        .chain(doc.functions.iter().map(|f| ("function", f.name.as_str())))
+        .chain(doc.domains.iter().map(|d| ("domain", d.name.as_str())))
+        .chain(
+            doc.parameter_points
+                .iter()
+                .map(|p| ("parameter point", p.name.as_str())),
+        )
+        .chain(doc.data.iter().map(|d| ("dataset", d.name.as_str())))
+        .chain(
+            doc.likelihoods
+                .iter()
+                .map(|l| ("likelihood", l.name.as_str())),
+        );
+
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    for (what, name) in named_blocks {
+        check_binding_name(name, what)?;
         if !seen.insert(name) {
             return Err(Error::Unsupported(format!(
-                "duplicate binding name `{name}` in distributions/functions"
+                "duplicate binding name `{name}`: two HS3 blocks emit a top-level `{name}`"
             )));
         }
+    }
+    // A dataset also emits `<name>_domain`, so that name is taken too.
+    for d in &doc.data {
+        let domain = format!("{}_domain", d.name);
+        if seen.contains(domain.as_str()) {
+            return Err(Error::Unsupported(format!(
+                "duplicate binding name `{domain}`: dataset `{}` emits it alongside another \
+                 block of the same name",
+                d.name
+            )));
+        }
+    }
+    for d in &doc.distributions {
+        crate::distribution::check_name_arrays(d)?;
     }
     Ok(())
 }
@@ -158,7 +191,7 @@ fn declare_array_params(
     dist_names: &BTreeSet<&str>,
     fn_names: &BTreeSet<&str>,
     declared: &mut BTreeSet<String>,
-) {
+) -> Result<()> {
     for elem in arr {
         if let Some(name) = elem.as_str() {
             // A numeric literal written as a string (e.g. "1.0") is a constant
@@ -171,11 +204,13 @@ fn declare_array_params(
             if dist_names.contains(name) || fn_names.contains(name) || declared.contains(name) {
                 continue;
             }
+            check_binding_name(name, "free parameter")?;
             let set = b.call_head(set_name);
             b.bind_set(name, set);
             declared.insert(name.to_string());
         }
     }
+    Ok(())
 }
 
 /// Step 1: declare free parameters — string-valued distribution fields (other
@@ -248,7 +283,7 @@ fn declare_free_params(
                                 dist_names,
                                 fn_names,
                                 &mut declared,
-                            );
+                            )?;
                         }
                         continue;
                     }
@@ -275,7 +310,7 @@ fn declare_free_params(
                                 dist_names,
                                 fn_names,
                                 &mut declared,
-                            );
+                            )?;
                         }
                         continue;
                     }
@@ -322,7 +357,7 @@ fn declare_free_params(
                                 dist_names,
                                 fn_names,
                                 &mut declared,
-                            );
+                            )?;
                         }
                         continue;
                     }
@@ -347,7 +382,7 @@ fn declare_free_params(
                                 dist_names,
                                 fn_names,
                                 &mut declared,
-                            );
+                            )?;
                         }
                         continue;
                     }
@@ -368,6 +403,7 @@ fn declare_free_params(
                     {
                         continue;
                     }
+                    check_binding_name(name, "free parameter")?;
                     let set = b.call_head(dist_spec::param_domain(&d.kind, field)); // bare set constant
                     b.bind_set(name, set);
                     declared.insert(name.to_string());
@@ -468,6 +504,7 @@ fn declare_generic_expr_params(
             if !param_point_names.contains(name.as_str()) {
                 continue;
             }
+            check_binding_name(&name, "free parameter")?;
             let set = match bounds.get(name.as_str()) {
                 Some(&(lo, hi)) => {
                     let lo = b.lit_real(lo);

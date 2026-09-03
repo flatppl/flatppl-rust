@@ -21,7 +21,6 @@ pub(crate) mod presets;
 pub(crate) mod pyhf;
 
 use flatppl_core::Module;
-#[cfg(debug_assertions)]
 use flatppl_syntax::{Syntax, parse, print_with};
 
 /// Validate that a freshly built module survives a print-then-reparse round
@@ -32,11 +31,16 @@ use flatppl_syntax::{Syntax, parse, print_with};
 /// module is returned unchanged (the reparse result is discarded — it only
 /// serves as the validity check).
 ///
-/// This is a self-check on the importer's own output, so it only runs in debug
-/// builds (`#[cfg(debug_assertions)]`): the O(output) print + full reparse is
-/// pure overhead on the default `read*` path in release. Release builds make
-/// `read*` identical to `read*_unchecked`.
-#[cfg(debug_assertions)]
+/// This runs in EVERY build profile. It used to be `#[cfg(debug_assertions)]`,
+/// which made the shipped release binary skip it: a distribution named
+/// `bad name` failed in debug and wrote `bad name = Normal(mu = mu, sigma = s)`
+/// at exit 0 in release. Whether the importer's output is valid FlatPPL cannot
+/// depend on how the importer was compiled. [`read_unchecked`] and its siblings
+/// remain the documented opt-out for a caller that has its own gate.
+///
+/// The check is necessary, not sufficient: it proves the text parses, not that
+/// it means what the document said. A construct that reparses as something else
+/// (a bare `NaN` reads back as a name) has to be refused where it is read.
 fn validate_round_trip(module: Module) -> Result<Module> {
     let text = print_with(&module, Syntax::Minimal);
     match parse(&text) {
@@ -45,21 +49,13 @@ fn validate_round_trip(module: Module) -> Result<Module> {
     }
 }
 
-/// Release-build sibling: the round-trip self-check is skipped (see the
-/// `#[cfg(debug_assertions)]` variant above), so this is the identity.
-#[cfg(not(debug_assertions))]
-fn validate_round_trip(module: Module) -> Result<Module> {
-    Ok(module)
-}
-
 /// Parse an HS3 or pyhf JSON document into a FlatPPL module.
 ///
 /// Dispatch: if the top-level JSON object has a `"channels"` key, the pyhf
 /// workspace lift path is taken; otherwise, the native HS3 path is used.
 ///
-/// The print→reparse well-formedness self-check runs in **debug builds only**;
-/// release builds skip it and behave identically to [`read_unchecked`]. Use
-/// [`read_unchecked`] when you also want it skipped in debug builds.
+/// The output is print→reparse checked in every build profile. Use
+/// [`read_unchecked`] to skip that check.
 pub fn read(json: &str) -> Result<Module> {
     validate_round_trip(read_unchecked(json)?)
 }
@@ -87,9 +83,8 @@ pub fn read_unchecked(json: &str) -> Result<Module> {
 /// Returns [`Error::Unsupported`] if the document lacks `"channels"`, with a
 /// hint to use the native HS3 path instead.
 ///
-/// The print→reparse well-formedness self-check runs in **debug builds only**;
-/// release builds skip it and behave identically to [`read_pyhf_unchecked`].
-/// Use [`read_pyhf_unchecked`] when you also want it skipped in debug builds.
+/// The output is print→reparse checked in every build profile. Use
+/// [`read_pyhf_unchecked`] to skip that check.
 pub fn read_pyhf(json: &str) -> Result<Module> {
     validate_round_trip(read_pyhf_unchecked(json)?)
 }
@@ -143,16 +138,14 @@ pub(crate) fn value_has_analyses(value: &serde_json::Value) -> bool {
 /// workspace, not native HS3), returns [`Error::Unsupported`] with a hint to
 /// use `--from pyhf`.
 ///
-/// The print→reparse well-formedness self-check runs in **debug builds only**;
-/// release builds skip it and behave identically to [`read_hs3_unchecked`].
-/// Use [`read_hs3_unchecked`] when you also want it skipped in debug builds.
+/// The output is print→reparse checked in every build profile. Use
+/// [`read_hs3_unchecked`] to skip that check.
 pub fn read_hs3(json: &str) -> Result<Module> {
     validate_round_trip(read_hs3_unchecked(json)?)
 }
 
 /// Like [`read_hs3`] but without the print→reparse self-check. Lower latency
-/// for callers (e.g. language bindings) that don't need the importer's output
-/// re-validated on every call.
+/// for callers (e.g. language bindings) that gate the output themselves.
 ///
 /// Caveat: output may be syntactically invalid FlatPPL for malformed or
 /// adversarial input, because the well-formedness round-trip is skipped.

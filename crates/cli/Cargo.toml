@@ -27,7 +27,9 @@ required-features = ["fmtlint"]
 # Verbs are opt-in cargo features so heavy capabilities never burden the
 # default build; `infer` is light and rides along by default.
 default = ["convert", "infer", "prepare", "fmtlint", "determinize", "stablehlo"]
-convert = ["dep:flatppl-flatpir"]
+# `convert` requires `infer`: it gates the generated module through the same
+# type/shape trace before writing, so the gate cannot vary by feature set.
+convert = ["dep:flatppl-flatpir", "infer"]
 # `infer` resolves cross-module deps from the cache only (no network), so it
 # links `flatppl-fileaccess` WITHOUT its `net` feature — no TLS stack.
 infer = ["dep:flatppl-infer", "dep:flatppl-flatpir", "dep:flatppl-fileaccess"]

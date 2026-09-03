@@ -659,6 +659,7 @@ mod tests {
 
     fn make_uncorrelated_doc() -> PyhfDocument {
         PyhfDocument {
+            version: None,
             channels: vec![PyhfChannel {
                 name: "singlechannel".into(),
                 samples: vec![
@@ -735,6 +736,7 @@ mod tests {
     fn normsys_emits_normal_aux_and_interp() {
         // Single-channel doc with one normsys modifier
         let doc = PyhfDocument {
+            version: None,
             channels: vec![PyhfChannel {
                 name: "ch".into(),
                 samples: vec![PyhfSample {
@@ -773,6 +775,7 @@ mod tests {
     fn lumi_requires_config_param() {
         // lumi modifier with no measurement config → should return Err
         let doc = PyhfDocument {
+            version: None,
             channels: vec![PyhfChannel {
                 name: "ch".into(),
                 samples: vec![PyhfSample {
@@ -807,6 +810,7 @@ mod tests {
     fn lumi_with_config_converts() {
         // lumi modifier with proper config → converts OK, emits Normal aux
         let doc = PyhfDocument {
+            version: None,
             channels: vec![PyhfChannel {
                 name: "ch".into(),
                 samples: vec![PyhfSample {
