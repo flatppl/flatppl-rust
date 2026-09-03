@@ -27,11 +27,11 @@
 
                 // -- Three-point interpolation functions (spec §09) --
                 // All share signature (left, center, right, alpha): (real,real,real,real) → real.
-                Binding(name: "interp_pwlin",     sig: Function(params: [Scalar(Real), Scalar(Real), Scalar(Real), Scalar(Real)], result: Scalar(Real))),
-                Binding(name: "interp_pwexp",     sig: Function(params: [Scalar(Real), Scalar(Real), Scalar(Real), Scalar(Real)], result: Scalar(Real))),
-                Binding(name: "interp_poly2_lin", sig: Function(params: [Scalar(Real), Scalar(Real), Scalar(Real), Scalar(Real)], result: Scalar(Real))),
-                Binding(name: "interp_poly6_lin", sig: Function(params: [Scalar(Real), Scalar(Real), Scalar(Real), Scalar(Real)], result: Scalar(Real))),
-                Binding(name: "interp_poly6_exp", sig: Function(params: [Scalar(Real), Scalar(Real), Scalar(Real), Scalar(Real)], result: Scalar(Real))),
+                Binding(name: "interp_pwlin",     sig: Function(params: [Scalar(Real), Scalar(Real), Scalar(Real), Scalar(Real)], names: ["left", "center", "right", "alpha"], result: Scalar(Real))),
+                Binding(name: "interp_pwexp",     sig: Function(params: [Scalar(Real), Scalar(Real), Scalar(Real), Scalar(Real)], names: ["left", "center", "right", "alpha"], result: Scalar(Real))),
+                Binding(name: "interp_poly2_lin", sig: Function(params: [Scalar(Real), Scalar(Real), Scalar(Real), Scalar(Real)], names: ["left", "center", "right", "alpha"], result: Scalar(Real))),
+                Binding(name: "interp_poly6_lin", sig: Function(params: [Scalar(Real), Scalar(Real), Scalar(Real), Scalar(Real)], names: ["left", "center", "right", "alpha"], result: Scalar(Real))),
+                Binding(name: "interp_poly6_exp", sig: Function(params: [Scalar(Real), Scalar(Real), Scalar(Real), Scalar(Real)], names: ["left", "center", "right", "alpha"], result: Scalar(Real))),
 
                 // -- Resonance functions (spec §09) --
                 // resonance_breitwigner(sigma, m, width, ma, mb, l, d) → Complex
@@ -41,39 +41,42 @@
                 Binding(name: "resonance_breitwigner",
                     sig: Function(
                         params: [Scalar(Real), Scalar(Real), Scalar(Real), Scalar(Real), Scalar(Real), Scalar(Integer), Scalar(Real)],
+                        names: ["sigma", "m", "width", "ma", "mb", "l", "d"],
                         result: Scalar(Complex))),
 
                 // -- Kinematics functions (spec §09) --
                 // kallen(x, y, z): (real, real, real) → real
                 Binding(name: "kallen",
-                    sig: Function(params: [Scalar(Real), Scalar(Real), Scalar(Real)], result: Scalar(Real))),
+                    sig: Function(params: [Scalar(Real), Scalar(Real), Scalar(Real)], names: ["x", "y", "z"], result: Scalar(Real))),
                 // breakup_momentum(m, ma, mb): (posreal, nonnegreal, nonnegreal) → real
                 // Domains encoded as Scalar(Real); domain constraints are value-level (can't
                 // distinguish posreals from reals in ParamSig).
                 Binding(name: "breakup_momentum",
-                    sig: Function(params: [Scalar(Real), Scalar(Real), Scalar(Real)], result: Scalar(Real))),
+                    sig: Function(params: [Scalar(Real), Scalar(Real), Scalar(Real)], names: ["m", "ma", "mb"], result: Scalar(Real))),
                 // blatt_weisskopf(l, p, d): (nonneginteger, nonnegreal, posreal) → real
                 Binding(name: "blatt_weisskopf",
-                    sig: Function(params: [Scalar(Integer), Scalar(Real), Scalar(Real)], result: Scalar(Real))),
+                    sig: Function(params: [Scalar(Integer), Scalar(Real), Scalar(Real)], names: ["l", "p", "d"], result: Scalar(Real))),
 
                 // -- Wigner rotation functions (spec §09) --
                 // wignerd(j, m1, m2, cosbeta): integer args; cosbeta ∈ [-1,1] → real
                 // Spec domain for j/m1/m2 is integers (integer-valued angular momenta).
                 Binding(name: "wignerd",
-                    sig: Function(params: [Scalar(Integer), Scalar(Integer), Scalar(Integer), Scalar(Real)], result: Scalar(Real))),
+                    sig: Function(params: [Scalar(Integer), Scalar(Integer), Scalar(Integer), Scalar(Real)], names: ["j", "m1", "m2", "cosbeta"], result: Scalar(Real))),
                 // wignerD(j, m1, m2, alpha, cosbeta, gamma) → Complex
                 Binding(name: "wignerD",
                     sig: Function(
                         params: [Scalar(Integer), Scalar(Integer), Scalar(Integer), Scalar(Real), Scalar(Real), Scalar(Real)],
+                        names: ["j", "m1", "m2", "alpha", "cosbeta", "gamma"],
                         result: Scalar(Complex))),
                 // wignerd_doublearg(two_j, two_m1, two_m2, cosbeta): doubled integer args → real
                 // Angular momenta passed as 2j, 2m1, 2m2 (integers, covering half-integer spin).
                 Binding(name: "wignerd_doublearg",
-                    sig: Function(params: [Scalar(Integer), Scalar(Integer), Scalar(Integer), Scalar(Real)], result: Scalar(Real))),
+                    sig: Function(params: [Scalar(Integer), Scalar(Integer), Scalar(Integer), Scalar(Real)], names: ["two_j", "two_m1", "two_m2", "cosbeta"], result: Scalar(Real))),
                 // wignerD_doublearg(two_j, two_m1, two_m2, alpha, cosbeta, gamma) → Complex
                 Binding(name: "wignerD_doublearg",
                     sig: Function(
                         params: [Scalar(Integer), Scalar(Integer), Scalar(Integer), Scalar(Real), Scalar(Real), Scalar(Real)],
+                        names: ["two_j", "two_m1", "two_m2", "alpha", "cosbeta", "gamma"],
                         result: Scalar(Complex))),
             ]
 )

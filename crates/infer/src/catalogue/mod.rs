@@ -385,6 +385,43 @@ const STD_MODULE_SRCS: &[&str] = &[
     include_str!("../../catalogues/distances.ron"),
 ];
 
+/// The declared call arity of any catalogue row, base or §09 module member, or
+/// `None` when the row declares no parameter list.
+///
+/// A distribution row's arity is exact: §08 "Built-in distributions" states that
+/// "the names and order of the distribution parameters specified below define the
+/// names and positional order of the kernel arguments", and no §08 entry gives a
+/// parameter a default, so every one is required. §09 "Standard modules" carries
+/// the same Parameters column for a module's distributions. An unfilled `params`
+/// (the `#[serde(default)]` migration escape) yields `None` rather than an
+/// invented arity of zero.
+///
+/// Keyed on the `Sig` rather than on a name so a §09 member can be checked from
+/// the resolution side-table, which holds the sig and not the catalogue index.
+pub(crate) fn sig_arity(sig: &Sig) -> Option<Arity> {
+    match sig {
+        Sig::Function { params, .. } | Sig::Structural { params, .. } => Some(Arity::of(params)),
+        Sig::Distribution { params, .. } if params.is_empty() => None,
+        Sig::Distribution { params, .. } => Some(Arity {
+            min: params.len(),
+            max: Some(params.len()),
+        }),
+    }
+}
+
+/// The declared parameter NAMES of any catalogue row, or `None` when the row
+/// declares none. See [`Catalogue::base_param_names`] for which rows are
+/// deliberately nameless and why an empty list means "accept".
+pub(crate) fn sig_param_names(sig: &Sig) -> Option<&[String]> {
+    match sig {
+        Sig::Distribution { params, .. } if !params.is_empty() => Some(params),
+        Sig::Function { names, .. } | Sig::Structural { names, .. } if !names.is_empty() => {
+            Some(names)
+        }
+        _ => None,
+    }
+}
+
 impl Catalogue {
     /// Look up a base (built-in) distribution signature by name.
     pub(crate) fn base(&self, name: &str) -> Option<&Sig> {
@@ -401,16 +438,7 @@ impl Catalogue {
     /// unfilled `params` (the `#[serde(default)]` migration escape) yields
     /// `None` rather than an invented arity of zero.
     pub fn base_arity(&self, name: &str) -> Option<Arity> {
-        match self.base(name)? {
-            Sig::Function { params, .. } | Sig::Structural { params, .. } => {
-                Some(Arity::of(params))
-            }
-            Sig::Distribution { params, .. } if params.is_empty() => None,
-            Sig::Distribution { params, .. } => Some(Arity {
-                min: params.len(),
-                max: Some(params.len()),
-            }),
-        }
+        sig_arity(self.base(name)?)
     }
 
     /// Base builtins whose documented domain admits a record or a TABLE, and so
@@ -548,13 +576,7 @@ impl Catalogue {
     /// - **Rows whose §07 "Arguments" cell is not a name list** (a formula or a
     ///   dash), where there is nothing to read.
     pub fn base_param_names(&self, name: &str) -> Option<&[String]> {
-        match self.base(name)? {
-            Sig::Distribution { params, .. } if !params.is_empty() => Some(params),
-            Sig::Function { names, .. } | Sig::Structural { names, .. } if !names.is_empty() => {
-                Some(names)
-            }
-            _ => None,
-        }
+        sig_param_names(self.base(name)?)
     }
 
     /// Does `name` declare a VARIADIC parameter and NO names for its fixed inputs? Such a row
@@ -1611,10 +1633,12 @@ mod tests {
     /// The §09 module counterparts of `base_param_names` / `base_arity`, which
     /// the LSP's signature help reads so the argument roster lives in one place.
     ///
-    /// A distribution row carries its §09 "Parameters" names and an exact arity.
-    /// A `Function` row that declares no `names` answers `None` for the roster
-    /// while still answering its arity — the same "empty list means undocumented"
-    /// contract `base_param_names` states.
+    /// A distribution row carries its §09 "Parameters" names and an exact arity,
+    /// and so — since every module `Function` row gained §09's Arguments column —
+    /// does a function row. The "empty list means undocumented" contract
+    /// `base_param_names` states is still live for a row that declares no names;
+    /// no shipped module row is in that state today, so the case is asserted
+    /// against a synthetic sig in `sig_param_names_reads_an_undocumented_row`.
     #[test]
     fn module_param_names_and_arity_read_the_declared_row() {
         let cat = builtin();
@@ -1631,8 +1655,8 @@ mod tests {
         );
         assert_eq!(
             cat.module_param_names("special-functions", "bessel_j"),
-            None,
-            "the row declares no names, so the roster is undocumented"
+            Some(["v".to_string(), "z".to_string()].as_slice()),
+            "the row carries §09's Arguments column (`v`, `z`)"
         );
         assert_eq!(
             cat.module_arity("special-functions", "bessel_j"),
@@ -1647,6 +1671,31 @@ mod tests {
             None
         );
         assert_eq!(cat.module_arity("no-such-module", "whatever"), None);
+    }
+
+    /// The permissive default: a row with an EMPTY `names` list answers `None`,
+    /// which the arity check reads as "accept", so an undocumented row does not
+    /// refuse every keyword call to it. No shipped module row is undocumented any
+    /// more — every one carries §09's Arguments column — so the contract is
+    /// asserted against a synthetic sig rather than a live row that could later
+    /// gain names and silently stop covering this case.
+    #[test]
+    fn sig_param_names_reads_an_undocumented_row() {
+        let undocumented = Sig::Function {
+            params: vec![ParamSig::Scalar(ScalarTag::Real)],
+            names: Vec::new(),
+            result: ResultSig::Scalar(ScalarTag::Real),
+            result_set: ResultSet::Natural,
+        };
+        assert_eq!(sig_param_names(&undocumented), None);
+        assert_eq!(
+            sig_arity(&undocumented),
+            Some(Arity {
+                min: 1,
+                max: Some(1)
+            }),
+            "the arity is declared by the parameter-type list, names or not"
+        );
     }
 
     #[test]

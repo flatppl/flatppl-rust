@@ -756,18 +756,29 @@ draws = rand(s)";
 // `undrawn_measure_in_a_record_field_still_refuses` below.
 
 // `draw` takes exactly 1 arg (the measure); a 2-arg call is malformed.
+//
+// INFERENCE now owns this refusal: §04 "Calling conventions" gives `draw` "One
+// distinguished input", and `infer::ops::special_arity_check` reports that with a
+// source location, so the binding is `%failed` before the determiniser sees it.
+// The old assertion read the determiniser's own "draw expects 1 arg" message,
+// which is no longer reached — the sample leaf is not visited at all. The
+// determiniser's refusal is still asserted below, because a `%failed` node must
+// never lower; only the WHICH-pass-caught-it changed, and it moved earlier.
 #[test]
 fn sample_draw_wrong_arity_refuses() {
     let src = "\
 s = rnginit(0)
 x = draw(Normal(mu = 0.0, sigma = 1.0), Normal(mu = 1.0, sigma = 1.0))
 draws = rand(s, lawof(record(x = x)))";
-    let m = parse_infer(src);
-    let err = determinize(&m).expect_err("draw with the wrong arity must refuse");
+    let mut m = flatppl_syntax::parse(src).unwrap();
+    let diags = flatppl_infer::infer(&mut m);
     assert!(
-        err.reason.contains("draw expects 1 arg"),
-        "refusal explains the 1-arg draw shape: {err:?}"
+        diags
+            .iter()
+            .any(|d| d.message.contains("`draw` takes 1 input")),
+        "inference reports the 1-arg draw shape with a location: {diags:?}"
     );
+    determinize(&m).expect_err("draw with the wrong arity must refuse");
 }
 
 // `draw(M)` where `M` is a constructor call with MORE positional args than the

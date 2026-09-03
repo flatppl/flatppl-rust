@@ -199,6 +199,15 @@ fn unknown_function_call_head_is_an_error() {
 /// A builtin that HAS no type rule keeps its `%deferred` note — the gate
 /// separates "no rule yet" from "no such name", and must not collapse the two.
 /// `Lebesgue` is a §08 distribution with no catalogue row of any kind.
+///
+/// **Kept deliberately when special-operation arity landed** (see
+/// `crates/infer/tests/argument_domains.rs`). That pass reads §04's enumerated
+/// special-operations list, and §04 does not list `Lebesgue` — it is a §06
+/// fundamental measure with no declared input list anywhere in this crate, so
+/// there is nothing to check `dims` against. Refusing the keyword `dims` would
+/// mean asserting `Lebesgue`'s parameter names, which is a catalogue row this
+/// change does not add. The nullary rule that pass DOES apply would still refuse
+/// `Lebesgue()`; one named argument is not nullary.
 #[test]
 fn a_rowless_builtin_head_still_defers_rather_than_erroring() {
     assert_clean("m = Lebesgue(dims = 1)\n");

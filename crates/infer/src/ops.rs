@@ -120,6 +120,14 @@ pub(crate) fn call_rule(
         return (ty, joined);
     }
 
+    // §04's special operations declare their input counts in prose, not in the
+    // catalogue, so `arity_check` above returns `None` for every one of them.
+    // This is the same rule read off that list, plus §04's flat "Nullary calls
+    // (`f()`) are not allowed."
+    if let Some(ty) = special_arity_check(inf, id, &name, args, named) {
+        return (ty, joined);
+    }
+
     // Written sizes, after `arity_check` (which needs the call as written) and
     // ahead of the per-op rules, which read the size to build a shape.
     if let Some(ty) = written_size_check(inf, &name, args, named) {
@@ -5121,8 +5129,8 @@ fn user_arity_check(
 ) -> Option<Type> {
     // A §09 standard-module application is checked against its catalogue row,
     // not against a local reification's inputs.
-    if inf.module_catalogue_ref(callee).is_some() {
-        return None;
+    if let Some(sig) = inf.module_catalogue_ref(callee).map(|c| c.sig.clone()) {
+        return module_member_arity_check(inf, id, callee, &sig, args, named);
     }
     let declared: Vec<Symbol> = match local_reification(inf, callee) {
         Some((reif_id, _)) => input_entries(inf, reif_id)?
@@ -5163,6 +5171,71 @@ fn user_arity_check(
     ));
     Some(Type::Failed(
         format!("user call declares {want} {noun}, got {got}").into(),
+    ))
+}
+
+/// Reject a §09 standard-module member application whose argument count or names
+/// contradict the member's catalogue row.
+///
+/// [`user_arity_check`] used to return `None` here, so no arity or name rule
+/// reached a module member at all: `pp.CrystalBall()`, `pp.CrystalBall(1.0)` and
+/// `pp.CrystalBall(1.0, 2.0, 3.0, 4.0, 5.0)` all typed as the same normalized
+/// `%measure` over `reals` although §09 gives `CrystalBall` four parameters, and
+/// `sf.erf(nope = true)` typed the same real scalar as `sf.erf(x)`. §09's
+/// Parameters column is the same declaration §08 gives a base distribution, and
+/// §04 "Calling conventions" governs the application either way — "All built-in
+/// ordinary callables have a defined input order and accept both positional and
+/// keyword arguments", and "A call with field or column names that do not match
+/// the callable's argument names is a static error" — so a member call is checked
+/// exactly as a base call is.
+///
+/// Deliberately mirrors [`arity_check`]'s sequence rather than sharing its body:
+/// that function looks its row up by name in the base catalogue, while a member's
+/// row arrives as a `Sig` in the resolution side-table, and the splat guards it
+/// runs first are keyed on base-catalogue predicates that no §09 row satisfies —
+/// no module row declares an unnamed variadic parameter, and `checked` is a base
+/// row. So the two guards are omitted here rather than reimplemented.
+///
+/// `None` when the row declares no parameter list (`sig_arity` answers `None`), on
+/// the same prove-it-is-wrong discipline the base rows use: an undeclared row
+/// stays permissive instead of refusing every call to it.
+fn module_member_arity_check(
+    inf: &mut Inferencer<'_, '_>,
+    id: NodeId,
+    callee: NodeId,
+    sig: &crate::catalogue::Sig,
+    args: &[ArgInfo],
+    named: &[NamedInfo],
+) -> Option<Type> {
+    let arity = crate::catalogue::sig_arity(sig)?;
+    let reading = arg_reading(args, named, false)?;
+    let got = reading.count;
+    let who = match inf.module.node(callee) {
+        Node::Ref(r) => match r.ns {
+            RefNs::Module(alias) => format!(
+                "`{}.{}`",
+                inf.module.resolve(alias),
+                inf.module.resolve(r.name)
+            ),
+            _ => format!("`{}`", inf.module.resolve(r.name)),
+        },
+        _ => "the module member".to_string(),
+    };
+    if arity.admits(got) {
+        let names: Vec<String> = crate::catalogue::sig_param_names(sig)?.to_vec();
+        if let Some(ty) = check_double_bound(inf, &names, &who, "§09", args, named) {
+            return Some(ty);
+        }
+        return arg_name_check(inf, &names, &who, Some("§09"), &reading, args, named);
+    }
+    let declared = arity.describe();
+    let hint = if reading.splatting { SPLAT_HINT } else { "" };
+    inf.diags.push(crate::Diagnostic::error_at(
+        id,
+        format!("{who} takes {declared} (spec §09), got {got}{hint}"),
+    ));
+    Some(Type::Failed(
+        format!("{who} takes {declared}, got {got}").into(),
     ))
 }
 
@@ -6154,6 +6227,294 @@ fn arity_check(
     Some(Type::Failed(
         format!("{name} takes {declared}, got {got}").into(),
     ))
+}
+
+/// How §04 "Calling conventions" declares a special operation's inputs. The
+/// catalogue carries no row for these heads — `ops.rs` types them structurally —
+/// so their arity lives here, read off §04's enumerated list rather than derived.
+///
+/// §04's framing supplies the axis: "Special operations have zero to three
+/// distinguished, unnamed, ordered inputs of fixed arity. They may have additional
+/// variadic named or unnamed inputs."
+///
+/// **These variants check the COUNT only, never the spelling** — with the one
+/// exception §04 states per-operation ([`SpecialArity::PositionalOnly`]). §04 also
+/// says "A distinguished input has no name and so cannot be passed by keyword",
+/// which would forbid the keyword spelling on every `Distinguished` row, but the
+/// spec is not consistent with itself on that point and this crate already carries
+/// both readings:
+///
+/// - [`ksuperpose_type`] refuses `ksuperpose(kernel = K, weights = w)` and cites
+///   that very sentence;
+/// - `crates/infer/tests/axis_position.rs::the_keyword_aggregate_spelling_is_accepted`
+///   accepts `aggregate(f_reduction = sum, output_axes = [.i], expr = …)`, "keyed
+///   on §04's parameter names" — §04's own `aggregate` section names all three
+///   (`f_reduction`, `output_axes`, `expr`) in a bullet list, in the same style
+///   §07 uses for an ordinary callable's parameters.
+///
+/// Both readings have a §04 sentence behind them, so settling it is a spec
+/// question, not an engine one, and it is raised in
+/// `flatppl-dev/audit-fix-infer.md` rather than decided here. The count check
+/// closes the gap this change is for — nullary and over-supplied calls — and
+/// leaves every existing spelling exactly as it was.
+enum SpecialArity {
+    /// Exactly `n` distinguished inputs.
+    Distinguished(usize),
+    /// Exactly `n` distinguished inputs, positional ONLY — for the one operation
+    /// §04 says so about outright: "`standard_module` only accepts positional
+    /// arguments, not keyword arguments" (§04 "Standard modules").
+    PositionalOnly(usize),
+    /// `n` distinguished inputs plus optional variadic NAMED inputs
+    /// (`load_module`'s substitutions).
+    DistinguishedPlusNamed(usize),
+    /// Variadic unnamed inputs, at least `n`.
+    VariadicPositional(usize),
+    /// Variadic inputs that may be unnamed OR named, at least `n` in total.
+    VariadicEither(usize),
+    /// Variadic NAMED inputs, at least `n` — and, for `record`/`table`, the one
+    /// positional argument §03 "Tables" gives their record–table conversions
+    /// ("Tables can also be constructed from records of equal-length vectors via
+    /// `table(r)` and converted to such records via `record(t)`").
+    VariadicNamedOrOneAggregate(usize),
+}
+
+/// The §04 input declaration of special operation `name`, with the bullet that
+/// states it, or `None` for every head §04's list omits.
+///
+/// Every entry below is one line of §04 "Calling conventions". The heads §04 lists
+/// that are ALSO base catalogue rows — `vector`, `cat`, `get`, `get0`,
+/// `load_data`, `checked` — are deliberately absent: [`arity_check`] answers them
+/// from the row and returns before this table is consulted, and duplicating the
+/// count here would give one rule two sources. `functionof` and `kernelof` are
+/// absent for a different reason: a reification is typed on the
+/// `call.inputs.is_some()` path, which returns above this check. `ksuperpose` is
+/// absent for a third: [`ksuperpose_type`] already implements the same §04 rule
+/// with a message naming its two inputs, so a second copy here would report one
+/// defect twice in different words.
+fn special_arity(name: &str) -> Option<(SpecialArity, &'static str)> {
+    use SpecialArity::*;
+    let entry = match name {
+        "elementof" | "external" | "draw" => (
+            Distinguished(1),
+            "\"`elementof`, `external`, `draw`: One distinguished input\"",
+        ),
+        "lawof" | "fixed" => (
+            Distinguished(1),
+            "\"`lawof`, `fixed`: One distinguished input\"",
+        ),
+        "broadcasted" => (
+            Distinguished(1),
+            "\"`broadcasted`: One distinguished input\"",
+        ),
+        "standard_module" => (
+            PositionalOnly(2),
+            "\"`standard_module`: Two distinguished inputs\", and §04 \"Standard \
+             modules\": \"`standard_module` only accepts positional arguments, not \
+             keyword arguments\"",
+        ),
+        "aggregate" | "metricsum" | "markovchain" | "kscan" => (
+            Distinguished(3),
+            "\"`aggregate`, `metricsum`, `markovchain`, `kscan`: Three distinguished inputs\"",
+        ),
+        "load_module" => (
+            DistinguishedPlusNamed(1),
+            "\"`load_module`: One distinguished input plus optional variadic named \
+             inputs with no significant order\"",
+        ),
+        "fchain" | "kchain" => (
+            VariadicPositional(1),
+            "\"`cat`, `fchain`, `kchain`: Variadic unnamed inputs with significant order\"",
+        ),
+        "superpose" => (
+            VariadicPositional(1),
+            "\"`superpose`: Variadic unnamed inputs with no significant order\"",
+        ),
+        "tuple" => (
+            VariadicPositional(2),
+            "\"`tuple`: Unnamed variadic inputs with significant order (minimum two)\"",
+        ),
+        "cartprod" | "joint" | "jointchain" => (
+            VariadicEither(1),
+            "\"`cartprod`, `joint`, `jointchain`: Variadic unnamed or named inputs \
+             with significant order\"",
+        ),
+        "broadcast" => (
+            VariadicEither(2),
+            "\"`broadcast`: One distinguished input for the function to be broadcast, \
+             plus named or unnamed inputs that match the inputs of that function\"",
+        ),
+        "record" | "table" => (
+            VariadicNamedOrOneAggregate(1),
+            "\"`record` and `table`: Named variadic inputs with significant order\"",
+        ),
+        _ => return None,
+    };
+    Some(entry)
+}
+
+/// Reject a special-operation application whose input count or spelling
+/// contradicts §04's declaration for it, and any nullary builtin call.
+///
+/// Unenforced, `aggregate()`, `metricsum()`, `load_module()`, `standard_module()`,
+/// `record()`, `table()` and `broadcast()` all typed at exit 0 — `record()` as an
+/// empty record and the two loaders as `%module` — although §04 states both the
+/// flat rule ("Nullary calls (`f()`) are not allowed.") and, for the special
+/// operations specifically, "The total number of inputs is never zero". Over-supply
+/// passed the same way: `standard_module("particle-physics", "0.1", "ignored")`
+/// typed `%module` with the third argument discarded.
+///
+/// The nullary refusal is the fallback and applies to every builtin head that
+/// reaches here, not only the ones [`special_arity`] tabulates: a head with a
+/// catalogue row has already been answered by [`arity_check`], so anything still
+/// arriving with no arguments at all is a head whose declared count is unknown —
+/// and §04's rule needs no count to apply. `vector` is the one head whose row
+/// admits zero arguments, by the decision recorded on its catalogue row (`[]`
+/// lowers to `(vector)`), and it never reaches here.
+fn special_arity_check(
+    inf: &mut Inferencer<'_, '_>,
+    id: NodeId,
+    name: &str,
+    args: &[ArgInfo],
+    named: &[NamedInfo],
+) -> Option<Type> {
+    // The four variadic PRODUCT and CHAIN heads are exempt from the nullary rule
+    // below, deliberately and against §04's plain reading. §04 does forbid the
+    // call — "Nullary calls (`f()`) are not allowed", and "The total number of
+    // inputs is never zero" — but three existing tests depend on `joint()`
+    // typing, and they pin an OWNER RULING, not an engine convenience:
+    // design-PR #73 option C's no-laundering rider (decisions-log 2026-08-18),
+    // that a `%deferred`-mass argument to `lawof` must leave the result
+    // `%deferred` rather than launder to `%normalized`.
+    //
+    // `spec_coverage_measures.rs::lawof_of_a_deferred_mass_measure_stays_deferred`
+    // states why it has to be `joint()`: it is "the one measure reachable from
+    // source whose mass is genuinely `%deferred` (`product_mass`'s empty-list
+    // arm)". Refusing it would delete the only source-level red case for that
+    // rider and leave the ruling untested. The sibling test
+    // `joint_of_no_components_is_deferred_not_normalized` already records the
+    // state of play in its own words: "`joint()`'s legality is a separate,
+    // unaddressed question — not decided here."
+    //
+    // So it stays undecided here too. Closing it means moving the rider's
+    // coverage off `joint()` first — a `#[cfg(test)]` unit test on `product_mass`
+    // and `lawof`'s mass gate — and that is its own change, raised in
+    // `flatppl-dev/audit-fix-infer.md`. RUST-INFER-009's own repro does not name
+    // any of these four heads.
+    const NULLARY_UNDECIDED: &[&str] = &["joint", "jointchain", "cartprod", "superpose"];
+    if args.is_empty() && named.is_empty() && NULLARY_UNDECIDED.contains(&name) {
+        return None;
+    }
+    let refuse = |inf: &mut Inferencer<'_, '_>, what: String, cite: &str| {
+        inf.diags.push(crate::Diagnostic::error_at(
+            id,
+            format!("`{name}` {what} (spec §04 \"Calling conventions\": {cite})"),
+        ));
+        Some(Type::Failed(format!("{name}: {what}").into()))
+    };
+    let Some((declared, cite)) = special_arity(name) else {
+        // §04: "Nullary calls (`f()`) are not allowed." Only for a head with NO
+        // declared arity anywhere: [`arity_check`] returns `Some` on a mismatch
+        // and `None` on a fitting call, so a row that ADMITS zero arguments has
+        // already ruled and must not be second-guessed here.
+        //
+        // `vector` is that row, and the case is real: §04 "Multi-axis
+        // aggregation" says of `output_axes` that "The empty axis list `[]` is
+        // legal and denotes full reduction to a scalar", and an empty axis list
+        // lowers to `(vector)`. The full-contraction spelling `g: s[] := …` in
+        // `flatppl-examples/examples/dminus-to-3pi-amplitude.flatppl` writes
+        // seven of them.
+        if args.is_empty()
+            && named.is_empty()
+            && crate::catalogue::builtin().base_arity(name).is_none()
+        {
+            return refuse(
+                inf,
+                "is called with no arguments".to_string(),
+                "\"Nullary calls (`f()`) are not allowed.\"",
+            );
+        }
+        return None;
+    };
+    let (pos, kw) = (args.len(), named.len());
+    let total = pos + kw;
+    match declared {
+        SpecialArity::Distinguished(n) => {
+            if total != n {
+                return refuse(inf, format!("takes {n} input(s), got {total}"), cite);
+            }
+        }
+        SpecialArity::PositionalOnly(n) => {
+            if kw > 0 {
+                return refuse(
+                    inf,
+                    format!(
+                        "takes {n} positional input(s) and no keyword arguments; got \
+                         {kw} keyword argument(s)"
+                    ),
+                    cite,
+                );
+            }
+            if pos != n {
+                return refuse(inf, format!("takes {n} input(s), got {pos}"), cite);
+            }
+        }
+        SpecialArity::DistinguishedPlusNamed(n) => {
+            if pos != n {
+                return refuse(
+                    inf,
+                    format!("takes {n} distinguished input(s), got {pos} positional argument(s)"),
+                    cite,
+                );
+            }
+        }
+        SpecialArity::VariadicPositional(n) => {
+            if kw > 0 {
+                return refuse(
+                    inf,
+                    format!("takes unnamed inputs, got {kw} keyword argument(s)"),
+                    cite,
+                );
+            }
+            if pos < n {
+                return refuse(inf, format!("takes at least {n} input(s), got {pos}"), cite);
+            }
+        }
+        SpecialArity::VariadicEither(n) => {
+            if total < n {
+                return refuse(
+                    inf,
+                    format!("takes at least {n} input(s), got {total}"),
+                    cite,
+                );
+            }
+        }
+        SpecialArity::VariadicNamedOrOneAggregate(n) => {
+            // The positional spelling is the §03 record–table conversion, which
+            // takes exactly one argument; anything else must be named.
+            if kw == 0 && pos == 1 {
+                return None;
+            }
+            if pos > 0 && kw > 0 {
+                return refuse(
+                    inf,
+                    format!(
+                        "takes named inputs, or the one positional argument of the \
+                         §03 record-table conversion; got {pos} positional and {kw} \
+                         keyword argument(s)"
+                    ),
+                    cite,
+                );
+            }
+            if total < n {
+                return refuse(
+                    inf,
+                    format!("takes at least {n} input(s), got {total}"),
+                    cite,
+                );
+            }
+        }
+    }
+    None
 }
 
 /// Reject a call whose argument falls outside the domain its row documents.

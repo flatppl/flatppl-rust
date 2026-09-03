@@ -6,7 +6,7 @@
                 // lu(A) → record(P, L, U): permutation, lower-tri, upper-tri —
                 // all matrices with A's element kind (spec §09).
                 Binding(name: "lu",
-                    sig: Function(params: [Matrix], result: Record([
+                    sig: Function(params: [Matrix], names: ["A"], result: Record([
                         ("P", MatrixElem(rows: Dyn, cols: Dyn, elem: OfArg(0))),
                         ("L", MatrixElem(rows: Dyn, cols: Dyn, elem: OfArg(0))),
                         ("U", MatrixElem(rows: Dyn, cols: Dyn, elem: OfArg(0))),
@@ -14,7 +14,7 @@
                 // svd(A) → record(U, S, V): U/V matrices (A's element kind); S is a
                 // vector of non-negative REAL singular values (spec §09).
                 Binding(name: "svd",
-                    sig: Function(params: [Matrix], result: Record([
+                    sig: Function(params: [Matrix], names: ["A"], result: Record([
                         ("U", MatrixElem(rows: Dyn, cols: Dyn, elem: OfArg(0))),
                         ("S", Vector(len: Dyn, elem: Real)),
                         ("V", MatrixElem(rows: Dyn, cols: Dyn, elem: OfArg(0))),
@@ -23,31 +23,31 @@
                 // Element kind follows A (matching eigmax/eigmin, which assume real
                 // eigenvalues); a complex A yields complex values/vectors.
                 Binding(name: "eigen",
-                    sig: Function(params: [Matrix], result: Record([
+                    sig: Function(params: [Matrix], names: ["A"], result: Record([
                         ("values", Vector(len: Dyn, elem: OfArg(0))),
                         ("vectors", MatrixElem(rows: Dyn, cols: Dyn, elem: OfArg(0))),
                     ]))),
                 // eigmax(A) → real (maximal eigenvalue, real-valued when A has real eigenvalues)
                 Binding(name: "eigmax",
-                    sig: Function(params: [Matrix], result: Scalar(Real))),
+                    sig: Function(params: [Matrix], names: ["A"], result: Scalar(Real))),
                 // eigmin(A) → real
                 Binding(name: "eigmin",
-                    sig: Function(params: [Matrix], result: Scalar(Real))),
+                    sig: Function(params: [Matrix], names: ["A"], result: Scalar(Real))),
                 // matexp(A) → matrix with the same shape as A (shape passes through).
                 Binding(name: "matexp",
-                    sig: Function(params: [Matrix], result: SameAsArg(0))),
+                    sig: Function(params: [Matrix], names: ["A"], result: SameAsArg(0))),
                 // kron(A, B): Kronecker product — (rows A · rows B) × (cols A · cols B),
                 // element kind preserved (spec §09).
                 Binding(name: "kron",
-                    sig: Function(params: [Matrix, Matrix], result: MatrixElem(
+                    sig: Function(params: [Matrix, Matrix], names: ["A", "B"], result: MatrixElem(
                         rows: Mul(Axis(0, 0), Axis(1, 0)),
                         cols: Mul(Axis(0, 1), Axis(1, 1)),
                         elem: OfArg(0)))),
                 // lstsq(A, b) → least-squares solution vector x, element kind from b.
                 Binding(name: "lstsq",
-                    sig: Function(params: [Matrix, Vector(Real)], result: Vector(len: Dyn, elem: OfArg(1)))),
+                    sig: Function(params: [Matrix, Vector(Real)], names: ["A", "b"], result: Vector(len: Dyn, elem: OfArg(1)))),
                 // rank(A) → integer (numerical rank)
                 Binding(name: "rank",
-                    sig: Function(params: [Matrix], result: Scalar(Integer), result_set: NonNegIntegers)),
+                    sig: Function(params: [Matrix], names: ["A"], result: Scalar(Integer), result_set: NonNegIntegers)),
             ]
 )

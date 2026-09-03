@@ -7,25 +7,25 @@
                 // matrix, N = lengthof(x) (x is arg 1). (distance/x param domains
                 // stay Callable/Any — inexpressible in ParamSig.)
                 Binding(name: "pairwise_distance",
-                    sig: Function(params: [Callable, Any], result: Matrix(rows: OfParam(1), cols: OfParam(1)))),
+                    sig: Function(params: [Callable, Any], names: ["distance", "x"], result: Matrix(rows: OfParam(1), cols: OfParam(1)))),
                 // cross_distance(distance, x, y): callable + two vector-of-vectors →
                 // N×M matrix, N = lengthof(x) (arg 1), M = lengthof(y) (arg 2).
                 Binding(name: "cross_distance",
-                    sig: Function(params: [Callable, Any, Any], result: Matrix(rows: OfParam(1), cols: OfParam(2)))),
+                    sig: Function(params: [Callable, Any, Any], names: ["distance", "x", "y"], result: Matrix(rows: OfParam(1), cols: OfParam(2)))),
                 // euclidean(u, v) → real
-                Binding(name: "euclidean",         sig: Function(params: [Vector(Real), Vector(Real)], result: Scalar(Real), result_set: NonNegReals)),
+                Binding(name: "euclidean",         sig: Function(params: [Vector(Real), Vector(Real)], names: ["u", "v"], result: Scalar(Real), result_set: NonNegReals)),
                 // squared_euclidean(u, v) → real
-                Binding(name: "squared_euclidean", sig: Function(params: [Vector(Real), Vector(Real)], result: Scalar(Real), result_set: NonNegReals)),
+                Binding(name: "squared_euclidean", sig: Function(params: [Vector(Real), Vector(Real)], names: ["u", "v"], result: Scalar(Real), result_set: NonNegReals)),
                 // cosine(u, v) → real ∈ [0, 2]
-                Binding(name: "cosine",            sig: Function(params: [Vector(Real), Vector(Real)], result: Scalar(Real), result_set: NonNegReals)),
+                Binding(name: "cosine",            sig: Function(params: [Vector(Real), Vector(Real)], names: ["u", "v"], result: Scalar(Real), result_set: NonNegReals)),
                 // manhattan(u, v) → real (L1 distance)
-                Binding(name: "manhattan",         sig: Function(params: [Vector(Real), Vector(Real)], result: Scalar(Real), result_set: NonNegReals)),
+                Binding(name: "manhattan",         sig: Function(params: [Vector(Real), Vector(Real)], names: ["u", "v"], result: Scalar(Real), result_set: NonNegReals)),
                 // chebyshev(u, v) → real (L∞ distance)
-                Binding(name: "chebyshev",         sig: Function(params: [Vector(Real), Vector(Real)], result: Scalar(Real))),
+                Binding(name: "chebyshev",         sig: Function(params: [Vector(Real), Vector(Real)], names: ["u", "v"], result: Scalar(Real))),
                 // minkowski(u, v, p): p-norm distance
-                Binding(name: "minkowski",         sig: Function(params: [Vector(Real), Vector(Real), Scalar(Real)], result: Scalar(Real), result_set: NonNegReals)),
+                Binding(name: "minkowski",         sig: Function(params: [Vector(Real), Vector(Real), Scalar(Real)], names: ["u", "v", "p"], result: Scalar(Real), result_set: NonNegReals)),
                 // jensenshannon(u, v): probability vectors (std simplex) → real ∈ [0,1]
-                Binding(name: "jensenshannon",     sig: Function(params: [Vector(Real), Vector(Real)], result: Scalar(Real), result_set: NonNegReals),
+                Binding(name: "jensenshannon",     sig: Function(params: [Vector(Real), Vector(Real)], names: ["u", "v"], result: Scalar(Real), result_set: NonNegReals),
                     degraded: Some("u and v must be probability vectors (stdsimplex); ParamSig::Vector(Real) is a sound superset; the unit constraint is not encoded")),
             ]
 )
