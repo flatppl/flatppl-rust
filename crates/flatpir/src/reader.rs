@@ -510,7 +510,10 @@ fn read_valueset(module: &mut Module, form: &Sexpr) -> Result<Option<ValueSet>> 
         },
         SexprKind::Str(_) => Err(err(form, "a string is not a value set")),
         SexprKind::List(items) => {
-            let head = atom(&items[0])?;
+            let Some(head) = items.first() else {
+                return Err(err(form, "empty `()` is not a value set"));
+            };
+            let head = atom(head)?;
             match head {
                 "stdsimplex" => {
                     if items.len() != 2 {
@@ -599,6 +602,7 @@ fn read_type(module: &mut Module, form: &Sexpr) -> Result<Option<Type>> {
             }
         },
         SexprKind::Str(_) => Err(err(form, "a string is not a type")),
+        SexprKind::List(items) if items.is_empty() => Err(err(form, "empty `()` is not a type")),
         SexprKind::List(items) => read_type_list(module, items).map(Some),
     }
 }
@@ -613,7 +617,10 @@ fn read_type_required(module: &mut Module, form: &Sexpr) -> Result<Type> {
 }
 
 fn read_type_list(module: &mut Module, items: &[Sexpr]) -> Result<Type> {
-    let head = atom(&items[0])?;
+    let Some(head) = items.first() else {
+        return Err(err_slice(items, "empty `()` is not a type"));
+    };
+    let head = atom(head)?;
     match head {
         "%failed" => {
             if items.len() != 2 {

@@ -660,3 +660,81 @@ fn try_to_json_ok_for_valid_module() {
     let j = flatppl_flatpir::try_to_json(&m).expect("valid module encodes");
     assert_eq!(j, to_json(&m));
 }
+
+/// `from_json` builds canonical text and re-parses it, so a decoded string in a
+/// bare-atom position must be one atom. §11 "Naming convention" gives FlatPIR
+/// only `%`-prefixed structural keywords and bare built-in / user-defined
+/// names; a name holding a delimiter would otherwise become syntax. The payload
+/// below decoded into two bindings before this check.
+#[test]
+fn rejects_a_name_that_would_inject_syntax() {
+    let cases: Vec<(&str, serde_json::Value)> = vec![
+        (
+            "binding name",
+            json!({ "%module": { "public": ["y"], "binds": [
+                { "name": "x 1) (%bind injected", "expr": { "int": 1 } },
+                { "name": "y", "expr": { "int": 2 } }]}}),
+        ),
+        (
+            "public name",
+            json!({ "%module": { "public": ["x) (%bind q 2"], "binds": [
+                { "name": "x", "expr": { "int": 1 } }]}}),
+        ),
+        (
+            "call head",
+            json!({ "%module": { "public": ["x"], "binds": [
+                { "name": "x", "expr": ["add) (%bind q 2", { "int": 1 }] }]}}),
+        ),
+        (
+            "const symbol",
+            json!({ "%module": { "public": ["x"], "binds": [
+                { "name": "x", "expr": { "const": "a) (%bind q 2" } }]}}),
+        ),
+        (
+            "ref name",
+            json!({ "%module": { "public": ["x"], "binds": [
+                { "name": "y", "expr": { "int": 1 } },
+                { "name": "x", "expr": { "%ref": { "ns": "self", "name": "y) (%bind q 2" } } }]}}),
+        ),
+        (
+            "axis name",
+            json!({ "%module": { "public": ["x"], "binds": [
+                { "name": "x", "expr": { "%axis": "mu) (%bind q 2" } }]}}),
+        ),
+        (
+            "named-entry name",
+            json!({ "%module": { "public": ["x"], "binds": [
+                { "name": "x", "expr": ["record", { "%field": {
+                    "name": "a) (%bind q 2", "value": { "int": 1 } } }] }]}}),
+        ),
+        (
+            "meta phase",
+            json!({ "%module": { "public": ["x"], "binds": [{ "name": "x", "expr": { "%meta": {
+                "type": ["%scalar", { "const": "integer" }],
+                "phase": "%fixed) (%bind q 2",
+                "valueset": { "const": "integers" },
+                "expr": { "int": 1 } } } }]}}),
+        ),
+        (
+            "doc tag",
+            json!({ "%module": { "public": ["x"], "binds": [{ "name": "x",
+                "expr": { "int": 1 },
+                "doc": { "tag": "md) (%bind q 2", "lines": ["hi"] } }]}}),
+        ),
+    ];
+    for (what, doc) in cases {
+        let err = from_json(&doc).unwrap_err();
+        assert!(
+            err.to_string().contains("not a single FlatPIR atom"),
+            "{what}: {err}"
+        );
+    }
+}
+
+/// An empty name is not an atom either — it would vanish from the text.
+#[test]
+fn rejects_an_empty_name() {
+    let doc = json!({ "%module": { "public": [], "binds": [
+        { "name": "", "expr": { "int": 1 } }]}});
+    assert!(from_json(&doc).is_err());
+}

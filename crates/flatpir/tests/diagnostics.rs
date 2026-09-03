@@ -124,3 +124,29 @@ fn canonical_neg_call_still_reads() {
         "round-trip should preserve the canonical neg call: {text}"
     );
 }
+
+#[test]
+fn an_empty_nested_type_list_is_an_error_not_a_panic() {
+    // `()` in a `%meta` type slot indexed `items[0]` on an empty list and
+    // aborted the process (exit 101). It must report like any other malformed
+    // form.
+    let src = "(%module\n  (%public x)\n  (%bind x (%meta (() %fixed reals) 1)))\n";
+    let err = read(src).unwrap_err();
+    assert!(
+        err.message.contains("empty `()` is not a type"),
+        "got: {}",
+        err.message
+    );
+    assert_eq!(span_text(src, err.span), "()");
+}
+
+#[test]
+fn an_empty_nested_valueset_list_is_an_error_not_a_panic() {
+    let src = "(%module\n  (%public x)\n  (%bind x (%meta ((%scalar real) %fixed ()) 1)))\n";
+    let err = read(src).unwrap_err();
+    assert!(
+        err.message.contains("empty `()` is not a value set"),
+        "got: {}",
+        err.message
+    );
+}

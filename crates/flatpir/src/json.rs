@@ -251,6 +251,22 @@ fn as_str<'a>(v: &'a Value, ctx: &str) -> Result<&'a str> {
         .ok_or_else(|| Error::new(format!("expected a string for {ctx}")))
 }
 
+/// A decoded string bound for a *bare atom* position in the canonical text.
+///
+/// `emit_*` builds text that [`reader::read`](crate::reader::read) re-parses, so
+/// a decoded name holding a delimiter would become syntax: §11 "Naming
+/// convention" gives FlatPIR only `%`-prefixed structural keywords and bare
+/// built-in / user-defined names, so a name is one atom or it is not a name.
+fn atom_str<'a>(v: &'a Value, ctx: &str) -> Result<&'a str> {
+    let s = as_str(v, ctx)?;
+    if !sexpr::is_atom_text(s) {
+        return Err(Error::new(format!(
+            "{ctx} is not a single FlatPIR atom: {s:?}"
+        )));
+    }
+    Ok(s)
+}
+
 fn emit_module(value: &Value) -> Result<String> {
     let root = obj(value, "the top-level form")?;
     let m = obj(get(root, "%module", "the top-level form")?, "%module")?;
@@ -265,7 +281,7 @@ fn emit_module(value: &Value) -> Result<String> {
     out.push_str("\n  (%public");
     for p in publics {
         out.push(' ');
-        out.push_str(as_str(p, "a public name")?);
+        out.push_str(atom_str(p, "a public name")?);
     }
     out.push(')');
 
@@ -282,7 +298,7 @@ fn emit_module(value: &Value) -> Result<String> {
 
 fn emit_bind(value: &Value) -> Result<String> {
     let b = obj(value, "a binding")?;
-    let name = as_str(get(b, "name", "a binding")?, "a binding name")?;
+    let name = atom_str(get(b, "name", "a binding")?, "a binding name")?;
     let expr = emit(get(b, "expr", "a binding")?, 0)?;
     let mut s = format!("(%bind {name} {expr}");
     if let Some(doc) = b.get("doc") {
@@ -295,7 +311,7 @@ fn emit_bind(value: &Value) -> Result<String> {
 
 fn emit_doc(value: &Value) -> Result<String> {
     let d = obj(value, "a doc form")?;
-    let tag = as_str(get(d, "tag", "a doc form")?, "a doc tag")?;
+    let tag = atom_str(get(d, "tag", "a doc form")?, "a doc tag")?;
     let mut parts = vec![format!("%doc {tag}")];
     for line in get(d, "lines", "a doc form")?
         .as_array()
@@ -366,7 +382,7 @@ fn emit_obj(o: &Map<String, Value>, depth: usize) -> Result<String> {
         return Ok(quote_string(as_str(v, "a string literal")?));
     }
     if let Some(v) = o.get("const") {
-        let s = as_str(v, "a const symbol")?;
+        let s = atom_str(v, "a const symbol")?;
         // A const that would re-classify on re-read (hole/bool/number) is not
         // representable as a bare atom: reject rather than silently mutate it.
         if s == "_" || s == "true" || s == "false" || classify_number(s).is_some() {
@@ -386,13 +402,13 @@ fn emit_obj(o: &Map<String, Value>, depth: usize) -> Result<String> {
         let r = obj(v, "a %ref")?;
         return Ok(format!(
             "(%ref {} {})",
-            as_str(get(r, "ns", "a %ref")?, "ref ns")?,
-            as_str(get(r, "name", "a %ref")?, "ref name")?
+            atom_str(get(r, "ns", "a %ref")?, "ref ns")?,
+            atom_str(get(r, "name", "a %ref")?, "ref name")?
         ));
     }
     for ax in ["%axis", "%uaxis", "%laxis"] {
         if let Some(v) = o.get(ax) {
-            return Ok(format!("({ax} {})", as_str(v, "an axis name")?));
+            return Ok(format!("({ax} {})", atom_str(v, "an axis name")?));
         }
     }
     for nk in ["%kwarg", "%field", "%assign"] {
@@ -400,7 +416,7 @@ fn emit_obj(o: &Map<String, Value>, depth: usize) -> Result<String> {
             let e = obj(v, nk)?;
             return Ok(format!(
                 "({nk} {} {})",
-                as_str(get(e, "name", nk)?, "a named-entry name")?,
+                atom_str(get(e, "name", nk)?, "a named-entry name")?,
                 emit(get(e, "value", nk)?, depth + 1)?
             ));
         }
@@ -418,14 +434,14 @@ fn emit_meta(m: &Map<String, Value>, depth: usize) -> Result<String> {
     Ok(format!(
         "(%meta ({} {} {}) {})",
         emit(get(m, "type", "%meta")?, depth + 1)?,
-        as_str(get(m, "phase", "%meta")?, "a phase")?,
+        atom_str(get(m, "phase", "%meta")?, "a phase")?,
         emit(get(m, "valueset", "%meta")?, depth + 1)?,
         emit(get(m, "expr", "%meta")?, depth + 1)?
     ))
 }
 
 fn emit_inputs(i: &Map<String, Value>, depth: usize) -> Result<String> {
-    let origin = as_str(get(i, "origin", "%inputs")?, "an origin tag")?;
+    let origin = atom_str(get(i, "origin", "%inputs")?, "an origin tag")?;
     let list = get(i, "list", "%inputs")?;
     let list_text = match list {
         Value::String(tag) => tag.clone(), // "%deferred"
@@ -451,7 +467,7 @@ fn emit_inputs(i: &Map<String, Value>, depth: usize) -> Result<String> {
                 }
                 parts.push(format!(
                     "({} {})",
-                    as_str(&pair[0], "an input name")?,
+                    atom_str(&pair[0], "an input name")?,
                     emit(&pair[1], depth + 1)?
                 ));
             }
@@ -469,8 +485,8 @@ fn emit_call(arr: &[Value], depth: usize) -> Result<String> {
     let mut parts: Vec<String> = Vec::with_capacity(arr.len());
     let elements = match arr[0].as_str() {
         // A string first element is the call/structural head.
-        Some(head) => {
-            parts.push(head.to_string());
+        Some(_) => {
+            parts.push(atom_str(&arr[0], "a call head")?.to_string());
             &arr[1..]
         }
         // A non-string first element means a headless, bare parenthesised list

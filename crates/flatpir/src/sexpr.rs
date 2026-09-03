@@ -227,7 +227,7 @@ impl Parser {
     fn parse_atom(&mut self) -> Result<SexprKind> {
         let mut s = String::new();
         while let Some(c) = self.peek() {
-            if c.is_whitespace() || matches!(c, '(' | ')' | '"' | ';') {
+            if is_atom_delimiter(c) {
                 break;
             }
             s.push(c);
@@ -236,6 +236,19 @@ impl Parser {
         debug_assert!(!s.is_empty(), "parse_atom called at a delimiter");
         Ok(SexprKind::Atom(s))
     }
+}
+
+/// Ends an atom: whitespace, the list parens, the string quote, the comment
+/// semicolon.
+fn is_atom_delimiter(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '(' | ')' | '"' | ';')
+}
+
+/// Does `s` re-read as exactly one [`SexprKind::Atom`] holding `s`? Any other
+/// text placed in an atom position would change the form's shape, so a producer
+/// of canonical text must reject it rather than emit it.
+pub(crate) fn is_atom_text(s: &str) -> bool {
+    !s.is_empty() && !s.chars().any(is_atom_delimiter)
 }
 
 #[cfg(test)]
