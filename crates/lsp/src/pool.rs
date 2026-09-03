@@ -23,9 +23,28 @@ use std::thread::JoinHandle;
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
 
-/// Queued requests allowed before the pool refuses. A well-behaved client keeps
-/// a handful of requests outstanding; this is a safety valve on memory and on
-/// the number of live salsa handles, not a throughput knob.
+/// Queued requests allowed before the pool refuses.
+///
+/// A well-behaved client keeps a handful of requests outstanding. This is a cap
+/// on the work an ill-behaved one can commit the server to, and it is what
+/// keeps both edit latency and resident memory bounded under a flood.
+///
+/// Measured on a 4,000-binding file with 2,000 `documentSymbol` requests
+/// followed by one edit, capacity against edit-to-diagnostics latency and peak
+/// resident memory:
+///
+/// | capacity | latency | peak RSS | executed of 2,000 |
+/// |---|---|---|---|
+/// | 256 | 19.7 - 25.2 s | 4.7 - 4.9 GiB | 1,362 - 1,574 |
+/// | 16384 | 29.8 s | 9.7 GiB | 1,975 |
+/// | 16384 | 102.7 s | 11.3 GiB | 2,000 |
+///
+/// A generous bound is worse on both axes, because over stdio the flood arrives
+/// as a trickle the workers keep up with: the queue never accumulates, so
+/// `server::run`'s drain has nothing to release, and every request that gets
+/// dispatched is answered with a full result the server must build, hold and
+/// serialise. Refusing early with `RequestFailed` answers in constant space
+/// instead. Do not raise this without re-measuring both columns.
 pub const QUEUE_CAPACITY: usize = 256;
 
 /// A handle to a fixed pool of worker threads, each pulling [`Job`]s off a
