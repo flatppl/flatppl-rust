@@ -211,6 +211,7 @@ pub(crate) fn lower(sig: &Sig, ctx: &LowerCtx) -> (Type, ValueSet) {
             names: _,
             result,
             result_set,
+            param_sets: _,
         } => {
             let ty = lower_result(result, ctx);
             let vset = function_set(*result_set, &ty);
@@ -372,6 +373,7 @@ mod tests {
             mass: MassTag::Normalized,
             params: vec!["mu".to_string(), "sigma".to_string()],
             param_ranks: vec![],
+            param_sets: Vec::new(),
         };
         let cx = LowerCtx {
             arg_scalar: &|_| Some(ScalarType::Real),
@@ -398,6 +400,7 @@ mod tests {
             names: vec![],
             result: ResultSig::RealOrComplexOfArg(0),
             result_set: crate::catalogue::ResultSet::Natural,
+            param_sets: Vec::new(),
         };
         let cx = LowerCtx {
             arg_scalar: &|_| Some(ScalarType::Complex),

@@ -175,30 +175,65 @@ fn quantile_is_a_real_scalar_of_two_inputs() {
     );
 }
 
-/// `quantile`'s `p` domain is `interval(0, 1)`, which this type system cannot
-/// enforce: there is no dependent interval type, and for a COMPUTED `p` no engine
-/// can enforce it statically at all. Recorded so the gap is a decision rather than
-/// an omission — a `p` outside `[0, 1]` types clean here.
+/// §07 gives `quantile`'s `p` the domain `interval(0, 1)`, and a CONSTANT `p`
+/// outside it is a static error.
 ///
-/// **Kept deliberately when argument-domain checking landed** (see
-/// `crates/infer/tests/argument_domains.rs`). That pass enforces the domains a
-/// spec sentence states as an exclusion — §03 "Bool"'s "zero and one are not
-/// implicitly converted to booleans", §03 "Scalar types"'s omission of strings,
-/// §06's measure operands — and `p`'s is not one of those: `interval(0, 1)` is a
-/// VALUE SET, so refusing `3.0` here would need a value-set membership test on a
-/// literal, which is the §04 value-set surface (`trace.rs`'s substitution check),
-/// not the argument-domain surface. Enforcing it for a literal only would also be
-/// the worst of both: a rule the author cannot rely on, since the same `p` reached
-/// through a binding would pass.
+/// **This test was INVERTED.** It used to assert the opposite — that an
+/// out-of-range literal `p` types clean — on the reasoning that `interval(0, 1)`
+/// is a value set rather than a type, so enforcing it needed a membership test
+/// this crate did not have. It has one now
+/// (`ops::refuse_constant_outside_declared_set`, driven by the catalogue's
+/// `param_sets`), so the gap the old assertion recorded is closed and asserting
+/// it would pin a defect.
+///
+/// The old test's second objection was that a literal-only rule is "a rule the
+/// author cannot rely on, since the same `p` reached through a binding would
+/// pass". That is answered rather than waived: `written_scalar` resolves through a
+/// self-module reference, so `q = 3.0; quantile(v, q)` is refused too — see
+/// `a_constant_reaches_the_check_through_a_binding` in
+/// `crates/infer/tests/argument_domains.rs`.
+///
+/// What stays unenforced is a COMPUTED `p`, and that is a real limit rather than
+/// an omission: §03 says a deterministically computed node's value set is only "a
+/// conservative superset of the values that `x` can take", so no engine can decide
+/// `quantile(v, f(data))` statically.
 #[test]
-fn quantile_does_not_enforce_its_p_domain_statically() {
+fn quantile_refuses_a_constant_p_outside_its_domain() {
     let mut m = flatppl_syntax::parse("v = [1.0, 2.0]\nr = quantile(v, 3.0)\n").unwrap();
     let diags = infer(&mut m);
-    assert!(
-        diags.is_empty(),
-        "an out-of-range literal `p` is not caught here — §07's `interval(0, 1)` has no \
-         static form in this type system; got: {diags:?}"
-    );
+    let hit = diags.iter().find(|d| {
+        d.message
+            .contains("outside its declared value set `interval(0, 1)`")
+    });
+    let Some(d) = hit else {
+        panic!(
+            "a constant `p` of 3.0 must be refused against §07's interval(0, 1); got: {diags:?}"
+        );
+    };
+    assert!(d.node.is_some(), "the refusal must carry its node: {d:?}");
+}
+
+/// The other side of the same rule: an in-range constant `p` still types, and so
+/// does a computed one. §03 makes `interval(lo, hi)` the CLOSED $[lo, hi]$, so
+/// both endpoints are admitted.
+#[test]
+fn quantile_admits_an_in_range_or_computed_p() {
+    for src in [
+        "v = [1.0, 2.0]\nr = quantile(v, 0.5)\n",
+        "v = [1.0, 2.0]\nr = quantile(v, 0.0)\n",
+        "v = [1.0, 2.0]\nr = quantile(v, 1.0)\n",
+        "v = [1.0, 2.0]\nn = lengthof(v)\nr = quantile(v, divide(1.0, n))\n",
+    ] {
+        let mut m = flatppl_syntax::parse(src).unwrap();
+        let diags: Vec<_> = infer(&mut m)
+            .into_iter()
+            .filter(|d| d.severity == flatppl_infer::Severity::Error)
+            .collect();
+        assert!(
+            diags.is_empty(),
+            "`{src}` must type cleanly; got: {diags:?}"
+        );
+    }
 }
 
 // ---- §07 "Table reductions" ---------------------------------------------------

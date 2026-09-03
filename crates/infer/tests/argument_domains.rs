@@ -136,6 +136,98 @@ fn documented_textual_parameters_still_accept_a_string() {
     assert_clean("s = [\"obs\", \"aux\"]\n");
 }
 
+// ---- §08 / §07 declared parameter value sets --------------------------------
+
+/// §08 states each distribution parameter's set outright — `Normal`'s `sigma` is
+/// "`elementof(posreals)`" — and §03 "Sets" fixes what `posreals` contains:
+/// $(0, +\infty]$, which excludes `0`. §03 "Bool" makes `false` the value `0`, so
+/// `Normal(sigma = false)` is decidable and wrong. It typed a normalized
+/// `%measure` over `reals` at exit 0 before, and the determiniser then lowered a
+/// density dividing by that zero.
+#[test]
+fn a_constant_outside_its_declared_value_set_is_refused() {
+    for (src, set) in [
+        ("d = Normal(mu = 0.0, sigma = false)\n", "posreals"),
+        ("d = Normal(mu = 0.0, sigma = 0.0)\n", "posreals"),
+        ("d = Normal(mu = 0.0, sigma = -1.0)\n", "posreals"),
+        ("d = Poisson(rate = -1.0)\n", "nonnegreals"),
+        ("d = Binomial(n = 0, p = 0.5)\n", "posintegers"),
+        ("d = Bernoulli(p = 1.5)\n", "unitinterval"),
+        ("d = Exponential(rate = 0)\n", "posreals"),
+    ] {
+        assert_refuses(src, &format!("outside its declared value set `{set}`"));
+    }
+}
+
+/// The admitting side, and the reason the rule is a MEMBERSHIP TEST rather than a
+/// type check. §03 closes the bounds it closes — `unitinterval` is $[0, 1]$ — so
+/// `Bernoulli(p = true)` is `p = 1`, which is IN the set. The check runs on it and
+/// admits it; it does not decline to look.
+#[test]
+fn a_constant_inside_its_declared_value_set_still_types() {
+    assert_clean("d = Bernoulli(p = true)\n");
+    assert_clean("d = Bernoulli(p = false)\n");
+    assert_clean("d = Normal(mu = 0.0, sigma = 1.0)\n");
+    assert_clean("d = Normal(mu = -3.0, sigma = 0.5)\n");
+    assert_clean("d = Poisson(rate = 0.0)\n");
+    assert_clean("d = Binomial(n = 1, p = 0.0)\n");
+}
+
+/// §03's infinity note is load-bearing: "`posreals`, `nonnegreals`, and `reals`
+/// admit `inf`". So `sigma = inf` is admitted rather than refused as out of range —
+/// the check answers on the spec's sets, not on a narrower numeric intuition.
+#[test]
+fn the_infinite_constant_is_admitted_where_the_spec_admits_it() {
+    assert_clean("d = Normal(mu = 0.0, sigma = inf)\n");
+    assert_clean("d = Poisson(rate = inf)\n");
+}
+
+/// A COMPUTED argument is not tested, and that is the rule's scope rather than a
+/// gap. §03 says a deterministically computed node's value set is only "a
+/// conservative superset of the values that `x` can take", so no engine can decide
+/// it statically. The check answers on what it can see and stays silent otherwise.
+#[test]
+fn a_computed_argument_is_not_checked() {
+    assert_clean("x = elementof(reals)\nd = Normal(mu = 0.0, sigma = x)\n");
+    assert_clean("v = [1.0, 2.0]\nd = Normal(mu = 0.0, sigma = sum(v))\n");
+}
+
+/// A constant reached through a binding is checked the same way an inline literal
+/// is — the walk resolves self-module references. This is what answers the old
+/// `quantile` test's objection that a literal-only rule would be "a rule the
+/// author cannot rely on".
+#[test]
+fn a_constant_reaches_the_check_through_a_binding() {
+    assert_refuses(
+        "s = 0.0\nd = Normal(mu = 0.0, sigma = s)\n",
+        "outside its declared value set `posreals`",
+    );
+    assert_refuses(
+        "q = 3.0\nv = [1.0, 2.0]\nr = quantile(v, q)\n",
+        "outside its declared value set `interval(0, 1)`",
+    );
+}
+
+/// The positional spelling reaches the same check as the keyword one: §04 binds an
+/// argument to a parameter either way, and keyword normalization runs before the
+/// domain checks so both see the same positions.
+#[test]
+fn the_positional_spelling_is_checked_too() {
+    assert_refuses(
+        "d = Normal(0.0, 0.0)\n",
+        "outside its declared value set `posreals`",
+    );
+}
+
+/// A parameter the spec states no scalar set for is untouched: `Uniform`'s
+/// `support` is a SET argument, and every vector or matrix parameter carries a
+/// per-element constraint this check does not reach.
+#[test]
+fn an_unconstrained_parameter_is_not_checked() {
+    assert_clean("d = Uniform(interval(0.0, 1.0))\n");
+    assert_clean("d = Dirichlet(alpha = [1.0, 1.0])\n");
+}
+
 // ---- §06: a measure operation takes a measure -------------------------------
 
 /// §06 gives `normalize(M)` "a measure $M$ with finite total mass", `truncate(M,

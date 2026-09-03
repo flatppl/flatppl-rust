@@ -6523,7 +6523,18 @@ fn special_arity(name: &str) -> Option<(SpecialArity, &'static str)> {
 /// reaches here, not only the ones [`special_arity`] tabulates: a head with a
 /// catalogue row has already been answered by [`arity_check`], so anything still
 /// arriving with no arguments at all is a head whose declared count is unknown —
-/// and §04's rule needs no count to apply. `vector` is the one head whose row
+/// and §04's rule needs no count to apply.
+///
+/// **`joint()` and its three siblings are included, with no exemption** (owner
+/// ruling). An earlier revision exempted `joint`, `jointchain`, `cartprod` and
+/// `superpose` because three `tests/spec_coverage_measures.rs` tests reached
+/// design-PR #73's no-laundering rider through `joint()` — the only measure
+/// reachable from source whose mass is genuinely `%deferred`. That coverage now
+/// lives in [`no_laundering_tests`], asserted directly against `product_mass` and
+/// `lawof_type`, which is where it belonged: the old fixture could only reach
+/// `Mass::Deferred` through one spellable expression, so `joint`'s arity and the
+/// rider's coverage were coupled for no reason. With the rider covered, §04's rule
+/// applies to all four. `vector` is the one head whose row
 /// admits zero arguments, by the decision recorded on its catalogue row (`[]`
 /// lowers to `(vector)`), and it never reaches here.
 fn special_arity_check(
@@ -6533,33 +6544,6 @@ fn special_arity_check(
     args: &[ArgInfo],
     named: &[NamedInfo],
 ) -> Option<Type> {
-    // The four variadic PRODUCT and CHAIN heads are exempt from the nullary rule
-    // below, deliberately and against §04's plain reading. §04 does forbid the
-    // call — "Nullary calls (`f()`) are not allowed", and "The total number of
-    // inputs is never zero" — but three existing tests depend on `joint()`
-    // typing, and they pin an OWNER RULING, not an engine convenience:
-    // design-PR #73 option C's no-laundering rider (decisions-log 2026-08-18),
-    // that a `%deferred`-mass argument to `lawof` must leave the result
-    // `%deferred` rather than launder to `%normalized`.
-    //
-    // `spec_coverage_measures.rs::lawof_of_a_deferred_mass_measure_stays_deferred`
-    // states why it has to be `joint()`: it is "the one measure reachable from
-    // source whose mass is genuinely `%deferred` (`product_mass`'s empty-list
-    // arm)". Refusing it would delete the only source-level red case for that
-    // rider and leave the ruling untested. The sibling test
-    // `joint_of_no_components_is_deferred_not_normalized` already records the
-    // state of play in its own words: "`joint()`'s legality is a separate,
-    // unaddressed question — not decided here."
-    //
-    // So it stays undecided here too. Closing it means moving the rider's
-    // coverage off `joint()` first — a `#[cfg(test)]` unit test on `product_mass`
-    // and `lawof`'s mass gate — and that is its own change, raised in
-    // `flatppl-dev/audit-fix-infer.md`. RUST-INFER-009's own repro does not name
-    // any of these four heads.
-    const NULLARY_UNDECIDED: &[&str] = &["joint", "jointchain", "cartprod", "superpose"];
-    if args.is_empty() && named.is_empty() && NULLARY_UNDECIDED.contains(&name) {
-        return None;
-    }
     let refuse = |inf: &mut Inferencer<'_, '_>, what: String, cite: &str| {
         inf.diags.push(crate::Diagnostic::error_at(
             id,
@@ -6704,6 +6688,142 @@ fn domain_check(inf: &mut Inferencer<'_, '_>, name: &str, args: &[ArgInfo]) -> O
     refuse_nonboolean_domain(inf, name, args)
         .or_else(|| refuse_string_argument(inf, name, args))
         .or_else(|| refuse_nonmeasure_operand(inf, name, args))
+        .or_else(|| refuse_constant_outside_declared_set(inf, name, args))
+}
+
+/// The value of a scalar constant WRITTEN at this node, as an `f64`, or `None`
+/// when the argument is not a statically-known constant.
+///
+/// Deliberately separate from [`crate::consteval`], which folds INTEGERS only —
+/// shapes are the only fixed values it needs, so it answers `Dynamic` for a real
+/// or a boolean, which are exactly the constants a parameter value set has to be
+/// tested against. This walk is the narrower thing the check needs and nothing
+/// more: a literal, a `neg` over one (how the lexer spells `-3`), a predefined
+/// numeric constant, or a self-module reference to a binding that is one.
+///
+/// A boolean reads as `0` or `1`, per §03 "Bool": "In arithmetic contexts, `false`
+/// is promoted to zero and `true` to one." That promotion is what makes
+/// `Normal(sigma = false)` decidable — `false` IS the value `0`, and `0` is not
+/// in `posreals`.
+///
+/// `pi` and `inf` are included because §03 "Predefined constants" gives both a
+/// value, and §03's infinity note makes `inf` a legal member of `posreals`,
+/// `nonnegreals` and `reals` — so admitting it is a real answer, not an
+/// abstention. `im` is absent: a complex constant is not a point on the real line
+/// and no `ParamSet` ranges over one.
+///
+/// The alias walk is bounded for the same reason [`written_string`]'s is: a
+/// self-referential binding is a well-formed parse whose cycle a later pass
+/// reports, and this runs before that.
+fn written_scalar(inf: &Inferencer<'_, '_>, node: NodeId) -> Option<f64> {
+    /// Alias hops to follow before giving up. Any real chain is far shorter.
+    const MAX_ALIAS_HOPS: usize = 64;
+    let mut node = node;
+    let mut negate = false;
+    for _ in 0..MAX_ALIAS_HOPS {
+        let v = match inf.module.node(node) {
+            Node::Lit(Scalar::Int(n)) => Some(*n as f64),
+            Node::Lit(Scalar::Real(x)) => Some(*x),
+            Node::Lit(Scalar::Bool(b)) => Some(f64::from(*b)),
+            Node::Const(c) => match inf.module.resolve(*c) {
+                "pi" => Some(std::f64::consts::PI),
+                "inf" => Some(f64::INFINITY),
+                _ => return None,
+            },
+            Node::Ref(r) if r.ns == RefNs::SelfMod => {
+                let binding = inf.module.binding_by_name(r.name)?;
+                node = inf.module.binding(binding).rhs;
+                continue;
+            }
+            Node::Call(c) => {
+                let CallHead::Builtin(op) = c.head else {
+                    return None;
+                };
+                if inf.module.resolve(op) != "neg" {
+                    return None;
+                }
+                negate = !negate;
+                node = *c.args.first()?;
+                continue;
+            }
+            _ => return None,
+        };
+        return v.map(|v| if negate { -v } else { v });
+    }
+    None
+}
+
+/// Reject a constant argument whose VALUE lies outside the value set the spec
+/// declares for that parameter.
+///
+/// §08 states each distribution parameter's set outright — `Normal`'s is
+/// "`mu = elementof(reals)`" and "`sigma = elementof(posreals)`" — and §04
+/// "Calling conventions" is what binds an argument to that parameter, by position
+/// or by name. §03 "Sets" fixes what each named set contains, including the
+/// bounds: `posreals` is $(0, +\infty]$, so it excludes `0`.
+///
+/// Unenforced, `Normal(mu = "bad", sigma = false)` typed a normalized `%measure`
+/// over `reals` at exit 0. The string half is [`refuse_string_argument`]'s; this
+/// is the other half — `false` IS `0` (§03 "Bool"), and a normal distribution
+/// with zero standard deviation is not a measure §08 defines. The determiniser
+/// then lowered a density dividing by that zero.
+///
+/// **Constants only, and that is the whole scope of the rule.** A computed
+/// argument is not tested: no engine can decide `sigma = f(data)` statically, and
+/// §03 says a deterministically computed node's value set is only "a conservative
+/// superset of the values that `x` can take". So the check answers on what it can
+/// see — a literal, a negated literal, a predefined constant, or a binding holding
+/// one — and stays silent otherwise. That is why `Bernoulli(p = true)` still
+/// types: `1` is in the CLOSED `unitinterval` $[0, 1]$, so the check runs and
+/// ADMITS it, rather than declining to look.
+///
+/// A row lists a set only where the spec states one, so most positions are
+/// `ParamSet::Unconstrained` and never reach a comparison. See [`ParamSet`] for
+/// which parameters are deliberately left unconstrained — a set-valued argument
+/// like `Uniform`'s `support`, and every vector or matrix parameter, whose §08
+/// constraint is per-element rather than a range on one number.
+fn refuse_constant_outside_declared_set(
+    inf: &mut Inferencer<'_, '_>,
+    name: &str,
+    args: &[ArgInfo],
+) -> Option<Type> {
+    let cat = crate::catalogue::builtin();
+    let sets: Vec<crate::catalogue::ParamSet> = cat.base_param_sets(name).to_vec();
+    if sets.is_empty() {
+        return None;
+    }
+    let names: Vec<String> = cat
+        .base_param_names(name)
+        .map(<[String]>::to_vec)
+        .unwrap_or_default();
+    let section = cat.base_param_section(name);
+    let mut refused = None;
+    for (i, (node, _, _)) in args.iter().enumerate() {
+        let Some(set) = sets.get(i) else { break };
+        let Some(value) = written_scalar(inf, *node) else {
+            continue;
+        };
+        // `None` is "this parameter states no set", not "outside it".
+        if set.contains(value) != Some(false) {
+            continue;
+        }
+        let which = names
+            .get(i)
+            .map(|n| format!("`{n}`"))
+            .unwrap_or_else(|| format!("argument {}", i + 1));
+        inf.diags.push(crate::Diagnostic::error_at(
+            *node,
+            format!(
+                "`{name}`'s {which} is written as `{value}`, which is outside its \
+                 declared value set `{}`: spec {section} states the parameter's set, \
+                 and spec §03 \"Sets\" fixes what that set contains. A computed \
+                 argument is not checked — only a constant, whose value is known here",
+                set.describe(),
+            ),
+        ));
+        refused = Some(which);
+    }
+    refused.map(|which| Type::Failed(format!("{name}: {which} is outside its declared set").into()))
 }
 
 /// The argument positions of `name` whose domain §03 "Bool" states as boolean,
@@ -8997,5 +9117,116 @@ mod cat_compose_tests {
     #[test]
     fn an_empty_list_defers() {
         assert_eq!(cat_compose(&[]), Type::Deferred);
+    }
+}
+
+#[cfg(test)]
+mod no_laundering_tests {
+    //! Design-PR #73 option C's **no-laundering rider** (owner ruling,
+    //! decisions-log 2026-08-18): an engine that admits a `%deferred`-mass
+    //! argument to `lawof` must leave the RESULT's mass `%deferred`, never stamp
+    //! `%normalized` — stamping it would record an unproven assumption as §11's
+    //! "statically KNOWN" class.
+    //!
+    //! **This coverage used to live in `tests/spec_coverage_measures.rs` and ran
+    //! through `joint()`**, described there as "the one measure reachable from
+    //! source whose mass is genuinely `%deferred` (`product_mass`'s empty-list
+    //! arm)". §04 forbids that call — "Nullary calls (`f()`) are not allowed",
+    //! and of the special operations "The total number of inputs is never zero" —
+    //! so `ops::special_arity_check` now refuses it and the source-level fixture
+    //! is gone. The rider is not, so it is asserted here instead, directly
+    //! against the two internal surfaces that implement it.
+    //!
+    //! Testing the functions rather than a model is the stronger position, not a
+    //! fallback: the old fixture could only reach `Mass::Deferred` by way of one
+    //! spellable expression, so a change to `joint`'s arity silently took the
+    //! rider's coverage with it. These assertions hold whatever the surface
+    //! syntax admits.
+
+    use super::*;
+
+    /// The empty-product arm. `masses.iter().all(..)` is vacuously true on an
+    /// empty slice, so a `product_mass` without this arm answers `Normalized`
+    /// for a product of nothing — a definite class where no component supports
+    /// one. `%deferred` is §11's "not yet inferred", which is the honest answer.
+    #[test]
+    fn an_empty_product_is_deferred_not_normalized() {
+        assert_eq!(product_mass(&[], &[]), Mass::Deferred);
+    }
+
+    /// A non-empty all-normalized product still answers `Normalized`, so the arm
+    /// above is a carve-out for emptiness and not a blanket degrade.
+    #[test]
+    fn a_normalized_product_is_still_normalized() {
+        assert_eq!(
+            product_mass(&[Mass::Normalized, Mass::Normalized], &[false, false]),
+            Mass::Normalized
+        );
+    }
+
+    /// The rider itself, measure side: `lawof` of a `%deferred`-mass measure
+    /// carries `%deferred` onward.
+    #[test]
+    fn lawof_of_a_deferred_mass_measure_stays_deferred() {
+        let arg = Type::Measure {
+            domain: Box::new(Type::Scalar(ScalarType::Real)),
+            mass: Mass::Deferred,
+        };
+        let Type::Measure { mass, .. } = lawof_type(Some(&arg)) else {
+            panic!("lawof of a measure is a measure");
+        };
+        assert_eq!(
+            mass,
+            Mass::Deferred,
+            "must not launder an unproven assumption into `%normalized`"
+        );
+    }
+
+    /// The rider's kernel side, which `lawof_mass_gate` admits by the same three
+    /// rules as the measure side (2026-08-19, `lawof-kernel-mass-maths.md`).
+    #[test]
+    fn lawof_of_a_deferred_mass_kernel_stays_deferred() {
+        let arg = Type::Kernel {
+            inputs: Box::new([]),
+            mass: Mass::Deferred,
+        };
+        let Type::Kernel { mass, .. } = lawof_type(Some(&arg)) else {
+            panic!("lawof of a kernel is a kernel");
+        };
+        assert_eq!(mass, Mass::Deferred, "same rider, kernel side");
+    }
+
+    /// `lawof` of a VALUE is `%normalized`, and must stay so: the rider is about
+    /// not inventing a class for a measure whose mass is unknown, not about
+    /// refusing to state one where the maths gives it. §06: `lawof(x)` is the law
+    /// of `x`, a probability measure.
+    #[test]
+    fn lawof_of_a_value_is_normalized() {
+        let Type::Measure { mass, .. } = lawof_type(Some(&Type::Scalar(ScalarType::Real))) else {
+            panic!("lawof of a value is a measure");
+        };
+        assert_eq!(mass, Mass::Normalized);
+    }
+
+    /// Every other mass class passes through `lawof_type` unchanged too, so the
+    /// pass-through is the rule and `Deferred` is not a special case bolted on.
+    #[test]
+    fn lawof_passes_every_mass_class_through() {
+        for m in [
+            Mass::Normalized,
+            Mass::Finite,
+            Mass::LocallyFinite,
+            Mass::Unknown,
+            Mass::Deferred,
+        ] {
+            let arg = Type::Measure {
+                domain: Box::new(Type::Scalar(ScalarType::Real)),
+                mass: m,
+            };
+            let Type::Measure { mass, .. } = lawof_type(Some(&arg)) else {
+                unreachable!()
+            };
+            assert_eq!(mass, m, "lawof must not restate a measure's own mass");
+        }
     }
 }

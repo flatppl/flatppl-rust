@@ -74,6 +74,16 @@ pub(crate) enum Sig {
         /// it unread. `param_ranks_are_parallel_to_params` pins the length.
         #[serde(default)]
         param_ranks: Vec<usize>,
+        /// Declared VALUE SET of each parameter, parallel to `params` — §08's
+        /// "Parameters" bullets, e.g. `Normal` → `[Reals, PosReals]` for
+        /// `mu = elementof(reals)` / `sigma = elementof(posreals)`. Read by
+        /// [`Catalogue::base_param_sets`] for the constant-argument check.
+        ///
+        /// **An empty list means no parameter is checked**, and a shorter list
+        /// checks only the prefix it covers, so a row states exactly the sets the
+        /// spec states and nothing is invented for the rest.
+        #[serde(default)]
+        param_sets: Vec<ParamSet>,
     },
     Function {
         /// Declared parameter list. `lower` does not type-check arguments
@@ -101,6 +111,16 @@ pub(crate) enum Sig {
         /// row that does not constrain its range needs no entry.
         #[serde(default)]
         result_set: ResultSet,
+        /// Declared VALUE SET of each parameter, parallel to `params` — §08's
+        /// "Parameters" bullets, e.g. `Normal` → `[Reals, PosReals]` for
+        /// `mu = elementof(reals)` / `sigma = elementof(posreals)`. Read by
+        /// [`Catalogue::base_param_sets`] for the constant-argument check.
+        ///
+        /// **An empty list means no parameter is checked**, and a shorter list
+        /// checks only the prefix it covers, so a row states exactly the sets the
+        /// spec states and nothing is invented for the rest.
+        #[serde(default)]
+        param_sets: Vec<ParamSet>,
     },
     /// A builtin whose §07 parameter list is declared here but whose result type
     /// is computed structurally in `ops.rs` (operand promotion, container shape
@@ -114,6 +134,16 @@ pub(crate) enum Sig {
         /// contract, including the permissive-when-empty default.
         #[serde(default)]
         names: Vec<String>,
+        /// Declared VALUE SET of each parameter, parallel to `params` — §08's
+        /// "Parameters" bullets, e.g. `Normal` → `[Reals, PosReals]` for
+        /// `mu = elementof(reals)` / `sigma = elementof(posreals)`. Read by
+        /// [`Catalogue::base_param_sets`] for the constant-argument check.
+        ///
+        /// **An empty list means no parameter is checked**, and a shorter list
+        /// checks only the prefix it covers, so a row states exactly the sets the
+        /// spec states and nothing is invented for the rest.
+        #[serde(default)]
+        param_sets: Vec<ParamSet>,
     },
 }
 
@@ -186,6 +216,94 @@ pub(crate) enum ResultSet {
     /// A closed real range `[lo, hi]` (infinities allowed for half-bounded
     /// ranges): `tanh → interval(-1, 1)`, `erfc → interval(0, 2)`.
     Interval(f64, f64),
+}
+
+/// The declared VALUE SET of one call parameter, for the constant-argument
+/// check. Read off §08's "Parameters" bullets (`sigma = elementof(posreals)`) or
+/// §07's Domains column (`quantile`'s `p` over `interval(0, 1)`).
+///
+/// This is a VALUE constraint, not a type constraint: `ParamSig` carries the
+/// parameter's type tag and is documentation only, while a `ParamSet` is checked
+/// against a statically-known constant argument by
+/// `ops::refuse_constant_outside_declared_set`.
+///
+/// **`Unconstrained` is the default and means "no check".** A row lists a set
+/// only where the spec states one, so an undocumented parameter stays permissive
+/// — the same prove-it-is-wrong discipline `base_param_names` uses. `Reals` is
+/// worth declaring even though no real constant can fall outside it: it records
+/// that the spec DID state the set, which is what stops a later reader from
+/// mistaking silence for an omission.
+///
+/// Deliberately NOT `SupportTag`: that enum carries dimension-aware entries
+/// (`StdSimplex`, `CartPowReals`) and a `Structural` escape that belong to a
+/// distribution's variate support, none of which a scalar constant can be tested
+/// against. A vector or matrix parameter is left `Unconstrained` here for the same
+/// reason — §08 gives `Dirichlet`'s `alpha` as an "array of positive reals", which
+/// is a per-element claim this check does not reach.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq)]
+pub(crate) enum ParamSet {
+    #[default]
+    Unconstrained,
+    Reals,
+    PosReals,
+    NonNegReals,
+    UnitInterval,
+    Integers,
+    PosIntegers,
+    NonNegIntegers,
+    Booleans,
+    /// A closed real range `[lo, hi]` — §03 "Interval": "`interval(lo, hi)`
+    /// denotes the closed interval $[lo, hi]$."
+    Interval(f64, f64),
+}
+
+impl ParamSet {
+    /// Does this set contain `v`? `None` when the set states no constraint, so a
+    /// caller can tell "admitted" from "not checked".
+    ///
+    /// Every bound is CLOSED where the spec closes it: §03 gives `nonnegreals` as
+    /// $[0, +\infty]$, `posreals` as $(0, +\infty]$, and `unitinterval` as
+    /// $[0, 1]$, and §03 "Interval" makes `interval(lo, hi)` the closed
+    /// $[lo, hi]$. That closure is what keeps `Bernoulli(p = true)` legal: `1` is
+    /// in $[0, 1]$.
+    ///
+    /// §03's infinity note is load-bearing here — "`posreals`, `nonnegreals`, and
+    /// `reals` admit `inf`" — so `+inf` passes those three rather than being
+    /// refused as out of range. A NaN constant satisfies no comparison and so
+    /// answers `false` for every set; nothing constructs one statically today.
+    pub(crate) fn contains(&self, v: f64) -> Option<bool> {
+        use ParamSet::*;
+        let integral = v.fract() == 0.0 && v.is_finite();
+        Some(match self {
+            Unconstrained => return None,
+            Reals => !v.is_nan(),
+            PosReals => v > 0.0,
+            NonNegReals => v >= 0.0,
+            UnitInterval => (0.0..=1.0).contains(&v),
+            Integers => integral,
+            PosIntegers => integral && v >= 1.0,
+            NonNegIntegers => integral && v >= 0.0,
+            Booleans => v == 0.0 || v == 1.0,
+            Interval(lo, hi) => v >= *lo && v <= *hi,
+        })
+    }
+
+    /// The set as the spec spells it, for the diagnostic.
+    pub(crate) fn describe(&self) -> String {
+        use ParamSet::*;
+        match self {
+            Unconstrained => "anything".to_string(),
+            Reals => "reals".to_string(),
+            PosReals => "posreals".to_string(),
+            NonNegReals => "nonnegreals".to_string(),
+            UnitInterval => "unitinterval".to_string(),
+            Integers => "integers".to_string(),
+            PosIntegers => "posintegers".to_string(),
+            NonNegIntegers => "nonnegintegers".to_string(),
+            Booleans => "booleans".to_string(),
+            Interval(lo, hi) => format!("interval({lo}, {hi})"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -409,6 +527,17 @@ pub(crate) fn sig_arity(sig: &Sig) -> Option<Arity> {
     }
 }
 
+/// The declared parameter VALUE SETS of any catalogue row, base or §09 module
+/// member. Empty when the row states none, and a caller reads position `i` only
+/// when the list reaches it — see [`Sig::Distribution::param_sets`].
+pub(crate) fn sig_param_sets(sig: &Sig) -> &[ParamSet] {
+    match sig {
+        Sig::Distribution { param_sets, .. }
+        | Sig::Function { param_sets, .. }
+        | Sig::Structural { param_sets, .. } => param_sets,
+    }
+}
+
 /// The declared parameter NAMES of any catalogue row, or `None` when the row
 /// declares none. See [`Catalogue::base_param_names`] for which rows are
 /// deliberately nameless and why an empty list means "accept".
@@ -577,6 +706,12 @@ impl Catalogue {
     ///   dash), where there is nothing to read.
     pub fn base_param_names(&self, name: &str) -> Option<&[String]> {
         sig_param_names(self.base(name)?)
+    }
+
+    /// The declared parameter value sets of base builtin `name`, empty when the
+    /// row states none. See [`ParamSet`] for why silence means "not checked".
+    pub(crate) fn base_param_sets(&self, name: &str) -> &[ParamSet] {
+        self.base(name).map_or(&[], sig_param_sets)
     }
 
     /// Does `name` declare a VARIADIC parameter and NO names for its fixed inputs? Such a row
@@ -1686,6 +1821,7 @@ mod tests {
             names: Vec::new(),
             result: ResultSig::Scalar(ScalarTag::Real),
             result_set: ResultSet::Natural,
+            param_sets: Vec::new(),
         };
         assert_eq!(sig_param_names(&undocumented), None);
         assert_eq!(
