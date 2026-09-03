@@ -146,8 +146,11 @@ impl Lexer {
     fn bump(&mut self) -> Option<char> {
         let c = self.chars.get(self.pos).copied();
         if let Some(ch) = c {
+            // §05 `Newline ::= LF | CR | CRLF`, so a lone CR opens a line too.
+            // The LF of a CRLF pair must not count a second one.
+            let crlf_tail = ch == '\n' && self.pos > 0 && self.chars[self.pos - 1] == '\r';
             self.pos += 1;
-            if ch == '\n' {
+            if (ch == '\n' || ch == '\r') && !crlf_tail {
                 self.line += 1;
             }
         }
@@ -212,7 +215,7 @@ impl Lexer {
                         self.skip_block_comment()?;
                     } else {
                         while let Some(c) = self.peek() {
-                            if c == '\n' || c == ';' {
+                            if c == '\n' || c == '\r' || c == ';' {
                                 break;
                             }
                             self.bump();
@@ -236,10 +239,10 @@ impl Lexer {
         // After the three fence chars, only whitespace until the newline/EOF.
         let mut i = self.pos + 3;
         while let Some(&c) = self.chars.get(i) {
-            if c == '\n' {
+            if c == '\n' || c == '\r' {
                 return true;
             }
-            if c != ' ' && c != '\t' && c != '\r' {
+            if c != ' ' && c != '\t' {
                 return false;
             }
             i += 1;
@@ -284,8 +287,11 @@ impl Lexer {
 
     fn consume_to_newline(&mut self) {
         while let Some(c) = self.peek() {
-            if c == '\n' {
+            if c == '\n' || c == '\r' {
                 self.bump();
+                if c == '\r' && self.peek() == Some('\n') {
+                    self.bump();
+                }
                 break;
             }
             self.bump();
@@ -750,12 +756,12 @@ impl Lexer {
                     break;
                 }
                 let lstart = self.pos;
-                while !matches!(self.peek(), Some('\n') | None) {
+                while !matches!(self.peek(), Some('\n' | '\r') | None) {
                     self.bump();
                 }
                 let text: String = self.chars[lstart..self.pos].iter().collect();
-                lines.push(text.trim_end_matches('\r').to_string());
-                self.bump(); // newline
+                lines.push(text);
+                self.consume_to_newline();
             }
             self.push(
                 TokenKind::Doc(Doc {
@@ -774,11 +780,11 @@ impl Lexer {
         self.bump(); // %
         let tag = self.read_doc_tag();
         let cstart = self.pos;
-        while !matches!(self.peek(), Some('\n') | Some(';') | None) {
+        while !matches!(self.peek(), Some('\n' | '\r' | ';') | None) {
             self.bump();
         }
         let raw: String = self.chars[cstart..self.pos].iter().collect();
-        let text = raw.trim_end_matches('\r').trim().to_string();
+        let text = raw.trim().to_string();
         self.push(
             TokenKind::Doc(Doc {
                 tag,
@@ -799,7 +805,7 @@ impl Lexer {
             let tag_chars: Vec<char> = tag.chars().collect();
             if self.chars[self.pos..].starts_with(&tag_chars[..]) {
                 let after = self.chars.get(self.pos + tag_chars.len()).copied();
-                if matches!(after, None | Some(' ' | '\t' | '\n' | ';')) {
+                if matches!(after, None | Some(' ' | '\t' | '\n' | '\r' | ';')) {
                     for _ in 0..tag_chars.len() {
                         self.bump();
                     }
@@ -1041,6 +1047,72 @@ mod tests {
                 TokenKind::Int(2),
             ]
         );
+    }
+
+    fn docs(input: &str) -> Vec<Doc> {
+        tokenize(input)
+            .unwrap()
+            .into_iter()
+            .filter_map(|t| match t.kind {
+                TokenKind::Doc(d) => Some(d),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_cr_terminates_a_line_comment() {
+        // §05 `Newline ::= LF | CR | CRLF`, and a LineComment runs to the next
+        // newline. A CR that did not terminate the comment swallowed the rest.
+        assert_eq!(
+            kinds("x = 1 # comment\ry = 2\r"),
+            vec![
+                TokenKind::Name("x".into()),
+                TokenKind::Assign,
+                TokenKind::Int(1),
+                TokenKind::Newline,
+                TokenKind::Name("y".into()),
+                TokenKind::Assign,
+                TokenKind::Int(2),
+                TokenKind::Newline,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_cr_terminates_a_doc_comment_and_keeps_its_text() {
+        let got = docs("x = 1 % keep 100% of this\ry = 2\r");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].lines, vec!["keep 100% of this".to_string()]);
+        assert!(got[0].trailing);
+        assert!(kinds("x = 1 % d\ry = 2\r").contains(&TokenKind::Name("y".into())));
+    }
+
+    #[test]
+    fn a_cr_only_doc_block_keeps_every_line() {
+        let got = docs("%%%\nfirst\rsecond\r%%%\rx = 1\r");
+        assert_eq!(got.len(), 1);
+        assert_eq!(
+            got[0].lines,
+            vec!["first".to_string(), "second".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_crlf_pair_counts_one_line() {
+        let toks = tokenize("x = 1\r\ny = 2\r\nz = 3").unwrap();
+        let z = toks
+            .iter()
+            .find(|t| t.kind == TokenKind::Name("z".into()))
+            .unwrap();
+        assert_eq!(z.line, 3);
+        // A lone CR opens a line just the same.
+        let toks = tokenize("x = 1\ry = 2\rz = 3").unwrap();
+        let z = toks
+            .iter()
+            .find(|t| t.kind == TokenKind::Name("z".into()))
+            .unwrap();
+        assert_eq!(z.line, 3);
     }
 
     #[test]

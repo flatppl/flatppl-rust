@@ -255,6 +255,48 @@ fn full_flatppl_binary_exposes_fmt_and_lint() {
 }
 
 #[test]
+fn fmt_rejects_an_orphan_doc_comment_and_leaves_the_file_untouched() {
+    let dir = Scratch::new("orphandoc");
+    let f = dir.path("m.flatppl");
+    let src = "% orphan\n";
+    fs::write(&f, src).unwrap();
+
+    let out = bin().arg("fmt").arg(&f).output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("must attach to a binding"),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(fs::read(&f).unwrap(), src.as_bytes());
+}
+
+#[test]
+fn fmt_keeps_cr_separated_statements() {
+    let dir = Scratch::new("crcomment");
+    let f = dir.path("m.flatppl");
+    fs::write(&f, "x = 1 # comment\ry = 2\r").unwrap();
+
+    assert!(bin().arg("fmt").arg(&f).status().unwrap().success());
+    assert_eq!(fs::read_to_string(&f).unwrap(), "x = 1\ny = 2\n");
+}
+
+#[test]
+fn fmt_keeps_a_cr_terminated_doc_comment_byte_for_byte() {
+    let dir = Scratch::new("crdoc");
+    let f = dir.path("m.flatppl");
+    fs::write(&f, "x = 1 % keep 100% of this\ry = 2\r").unwrap();
+
+    assert!(bin().arg("fmt").arg(&f).status().unwrap().success());
+    // A doc-comment is content (§04), so its text must survive verbatim; the
+    // canonical position for it is leading.
+    assert_eq!(
+        fs::read_to_string(&f).unwrap(),
+        "% keep 100% of this\nx = 1\ny = 2\n"
+    );
+}
+
+#[test]
 fn fmt_no_extension_errors() {
     let dir = Scratch::new("noext");
     let f = dir.path("noextension");

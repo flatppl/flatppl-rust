@@ -84,6 +84,8 @@ fn split_statements(tokens: &[Token]) -> Result<Vec<Stmt>> {
     let mut cur: Vec<Token> = Vec::new();
     let mut trailing: Option<Doc> = None;
     let mut pending_leading: Option<Doc> = None;
+    // Span source for an orphan doc-comment reported after the final flush.
+    let mut last_doc_tok: Option<Token> = None;
 
     let flush = |cur: &mut Vec<Token>,
                  trailing: &mut Option<Doc>,
@@ -123,6 +125,7 @@ fn split_statements(tokens: &[Token]) -> Result<Vec<Stmt>> {
                         ));
                     }
                     trailing = Some(doc.clone());
+                    last_doc_tok = Some(tok.clone());
                 } else if !cur.is_empty() {
                     return Err(err_at(tok, "a doc-comment may not interrupt a statement"));
                 } else if pending_leading.is_some() {
@@ -134,6 +137,7 @@ fn split_statements(tokens: &[Token]) -> Result<Vec<Stmt>> {
                 } else {
                     // A standalone leading doc-comment; attaches to the next stmt.
                     pending_leading = Some(doc.clone());
+                    last_doc_tok = Some(tok.clone());
                 }
             }
             _ => cur.push(tok.clone()),
@@ -145,6 +149,16 @@ fn split_statements(tokens: &[Token]) -> Result<Vec<Stmt>> {
         &mut pending_leading,
         &mut statements,
     );
+    // Nothing followed the doc-comment, so it attaches to no binding. §04
+    // Documentation calls that invalid code; reporting it keeps `fmt` from
+    // dropping the text on a silent re-print.
+    if pending_leading.is_some() || trailing.is_some() {
+        let message = "a doc-comment must attach to a binding";
+        return Err(match &last_doc_tok {
+            Some(tok) => err_at(tok, message),
+            None => Error::new(message),
+        });
+    }
     Ok(statements)
 }
 
@@ -1642,6 +1656,30 @@ mod tests {
     fn a_trailing_operator_does_not_continue_across_a_semicolon() {
         assert!(parse("x = 1 +; 2").is_err());
         assert!(parse("x = 1 +\n2").is_ok());
+    }
+
+    #[test]
+    fn an_orphan_doc_comment_is_a_parse_error() {
+        // §04 Documentation: "A doc-comment that doesn't attach to a binding is
+        // invalid code." Accepting it silently loses the text on re-print.
+        for src in [
+            "% orphan",
+            "% orphan\n",
+            "%%%\norphan\n%%%\n",
+            "x = 1\n% tail\n",
+        ] {
+            let err = parse(src).expect_err(&format!("{src:?} must not parse"));
+            assert!(
+                err.message.contains("must attach to a binding"),
+                "{src:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cr_terminated_statement_survives() {
+        let m = parse("x = 1 # comment\ry = 2\r").expect("parses");
+        assert_eq!(m.bindings().count(), 2);
     }
 
     #[test]
