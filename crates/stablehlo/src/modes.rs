@@ -42,21 +42,33 @@
 //! `elementof` parameters (a parameter missing from `inputs` refuses).
 //!
 //! **`@sample`.** [`emit_sample_abi`] mirrors [`emit_logdensity_abi`] but
-//! threads the rng key: the leading `%key : tensor<2xui64>` argument (spec §07
+//! threads the rng key: the `%key : tensor<2xui64>` argument (spec §07
 //! `rand(rstate, m) -> (value, new_rstate)`) is bound from the rng source
-//! reachable from the declared output ([`find_rng_source`]) — NOT drawn from
-//! `inputs`, and the rng-source binding is exempt from the inputs-exhaustiveness
-//! check — and the function returns the two-result `(value, new_key)` pair. The
-//! declared sample output's value component (a value-terminal `rand(rng,
-//! lawof(x))` lowers to `get0(builtin_sample(rng, ctor, kernel_input), 0)`) is
-//! projected by [`Emitter::lower_node`]'s dispatch, which recognizes a
-//! `get0`/`get` projection of a `builtin_sample` call structurally and reads
-//! the registry's already-computed drawn value straight through (see
+//! reachable from the declared outputs ([`find_rng_source`]). §13 calls that
+//! state "a promoted fixed input", so when `inputs` lists the source binding,
+//! `%key` IS that declared argument at its declared position; a module that
+//! does not list it gets `%key` prepended as arg 0 and the binding stays exempt
+//! from the inputs-exhaustiveness check. Each declared sample output's value
+//! component (a value-terminal `rand(rng, lawof(x))` lowers to
+//! `get0(builtin_sample(rng, ctor, kernel_input), 0)`) is projected by
+//! [`Emitter::lower_node`]'s dispatch, which recognizes a `get0`/`get`
+//! projection of a `builtin_sample` call structurally and reads the registry's
+//! already-computed drawn value straight through (see
 //! `Emitter::sample_tuple_slot`).
+//!
+//! **Sample results are positional.** Every declared output becomes its own
+//! `func.func` result, in declared order, and a record-shaped output becomes
+//! one result per field ([`lower_sample_output`]). The final RNG state is
+//! appended unless an output already names it. Nothing is ever wrapped in a
+//! `stablehlo.tuple`: a tuple-typed result fails `hlo_call` import in
+//! Enzyme-JAX before any gradient runs, while a multi-result `func.func`
+//! imports, executes and differentiates.
 
 use std::collections::HashSet;
 
-use flatppl_core::{CallHead, Module, Node, NodeId, Phase, Ref, RefNs, Scalar, Symbol, Type};
+use flatppl_core::{
+    CallHead, Module, NamedKind, Node, NodeId, Phase, Ref, RefNs, Scalar, Symbol, Type,
+};
 
 use crate::EmitOptions;
 use crate::emitter::Emitter;
@@ -91,33 +103,57 @@ pub(crate) struct Abi {
 /// Each reserved binding's RHS is a single value or a `tuple(...)` call (the
 /// surface `(v1, v2, …)` sugar) — [`tuple_elems`] normalizes both to a
 /// `Vec<NodeId>` in source order. `inputs` elements are further resolved
-/// through `(%ref self x)` to the referenced binding's [`Symbol`]; a
-/// non-ref element (a malformed `inputs` entry) is dropped rather than
-/// guessed at — [`emit_logdensity_abi`]'s exhaustiveness check (every
-/// `elementof` binding must appear in `inputs`) then refuses rather than
-/// silently mis-binding an argument.
-pub(crate) fn read_abi(m: &Module) -> Option<Abi> {
+/// through `(%ref self x)` to the referenced binding's [`Symbol`].
+///
+/// **Every declared `inputs` element must survive into `Abi::inputs`.** An
+/// element that is not a `(%ref self x)` — a literal, an inline expression —
+/// names no binding to promote, so it REFUSES here. Dropping it instead (what
+/// this did before) let the emitted argument list silently shrink below the
+/// declared one: `inputs = (mu, 1.0)` declared two arguments and emitted one,
+/// at exit 0, so every caller passing two arguments to the one-argument
+/// function was wrong with no diagnostic. A repeated element refuses for the
+/// same reason — one binding cannot occupy two argument positions.
+pub(crate) fn read_abi(m: &Module) -> Result<Option<Abi>, EmitError> {
     let inputs_binding = m.bindings().find(|(_, b)| m.resolve(b.name) == "inputs");
     let outputs_binding = m.bindings().find(|(_, b)| m.resolve(b.name) == "outputs");
     if inputs_binding.is_none() && outputs_binding.is_none() {
-        return None;
+        return Ok(None);
     }
-    let inputs = inputs_binding
+    let declared = inputs_binding
         .map(|(_, b)| tuple_elems(m, b.rhs))
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|elem| match m.node(elem) {
-            Node::Ref(Ref {
-                ns: RefNs::SelfMod,
-                name,
-            }) => Some(*name),
-            _ => None,
-        })
-        .collect();
+        .unwrap_or_default();
+    let mut inputs: Vec<Symbol> = Vec::with_capacity(declared.len());
+    for (position, elem) in declared.iter().enumerate() {
+        let Node::Ref(Ref {
+            ns: RefNs::SelfMod,
+            name,
+        }) = m.node(*elem)
+        else {
+            return Err(EmitError::at(
+                *elem,
+                format!(
+                    "`inputs` element {position} does not name a binding; every element must \
+                     be a reference to a top-level binding, since each one becomes a \
+                     function argument (spec §13 signature)"
+                ),
+            ));
+        };
+        if inputs.contains(name) {
+            return Err(EmitError::at(
+                *elem,
+                format!(
+                    "`inputs` names `{}` more than once; each binding becomes exactly one \
+                     function argument",
+                    m.resolve(*name)
+                ),
+            ));
+        }
+        inputs.push(*name);
+    }
     let outputs = outputs_binding
         .map(|(_, b)| tuple_elems(m, b.rhs))
         .unwrap_or_default();
-    Some(Abi { inputs, outputs })
+    Ok(Some(Abi { inputs, outputs }))
 }
 
 /// Normalize a reserved `inputs`/`outputs` binding's RHS — a single value, or
@@ -141,12 +177,14 @@ fn tuple_elems(m: &Module, rhs: NodeId) -> Vec<NodeId> {
 /// (multi-result via [`Emitter::finish`], already multi-result for
 /// [`emit_sample_abi`]'s two rets).
 ///
-/// Scope: an ABI input is either an `elementof` parameter or a
-/// fixed-phase input construct — `external(S)` (a scalar/shaped runtime arg
-/// typed from `S`) or `load_data(source, valueset)` (shaped from `valueset`,
-/// never from reading `source`; values are never baked). [`bind_input`] builds
-/// each entry's argument(s). Any other binding
-/// named in `inputs` (a literal, a computed value) refuses. `inputs` is
+/// Scope: an ABI input is either an `elementof` parameter or ANY fixed-phase
+/// binding — `external(S)` (a scalar/shaped runtime arg typed from `S`),
+/// `load_data(source, valueset)` (shaped from `valueset`, never from reading
+/// `source`; values are never baked), or a derived fixed value such as
+/// `rnginit(seed)`, which §13's phase table promotes to a "function argument,
+/// replacing the computed value". [`bind_input`] builds each entry's
+/// argument(s). A parameterized binding that is not an `elementof` declaration
+/// is a function OF the parameters, not an argument, and refuses. `inputs` is
 /// authoritative and exhaustive for `elementof`: every `elementof` binding in
 /// `m` must appear in `abi.inputs`, else this refuses naming the missing
 /// parameter. A fixed-phase binding (`external`/`load_data`) that an output
@@ -205,9 +243,11 @@ pub(crate) fn emit_logdensity_abi(
     }
 
     let mut args: Vec<(String, MlirTy, ElemKind)> = Vec::with_capacity(abi.inputs.len());
+    let mut next_arg = 0usize;
     for &sym in &abi.inputs {
-        bind_input(m, &mut e, sym, opts, &mut args)?;
+        bind_input(m, &mut e, sym, opts, &mut args, &mut next_arg)?;
     }
+    check_arity(abi, args.len())?;
 
     let mut rets_vals: Vec<Value> = Vec::with_capacity(abi.outputs.len());
     for &node in &abi.outputs {
@@ -217,17 +257,52 @@ pub(crate) fn emit_logdensity_abi(
     Ok(e.finish("logdensity", &args, &rets))
 }
 
+/// The arity-integrity gate: the emitted argument list must account for every
+/// declared `inputs` element.
+///
+/// One element normally contributes one argument; an aggregate contributes one
+/// per column, so `emitted` can exceed the declared count but must never fall
+/// below it. [`read_abi`] rejects a dropped or repeated element and
+/// [`bind_input`] rejects an entry it cannot bind, so this is the backstop that
+/// turns any remaining shrink into a refusal rather than a silently
+/// wrong-arity `func.func` (RUST-STABLEHLO-001).
+fn check_arity(abi: &Abi, emitted: usize) -> Result<(), EmitError> {
+    if emitted < abi.inputs.len() {
+        return Err(EmitError::whole(format!(
+            "emitted {emitted} function arguments for {} declared `inputs` elements; the \
+             argument list must account for every declared input",
+            abi.inputs.len()
+        )));
+    }
+    Ok(())
+}
+
 /// Emit `@sample` for a determinized module `m` that declares the
 /// `inputs`/`outputs` ABI — the Sample-mode analogue of
-/// [`emit_logdensity_abi`]. The single declared output is the sample query
-/// (a value-terminal `rand(rstate, M)` / `builtin_sample`-bearing binding).
-/// `%key` (the threaded rng state, spec §07's `rand(rstate, m) -> (value,
-/// new_rstate)`) is arg 0, found from the output via [`find_rng_source`] —
-/// NOT drawn from `inputs`; the rng-source binding is exempt from the
-/// inputs-exhaustiveness check. `abi.inputs` supplies the additional free
-/// params (`elementof`) / fixed inputs as `%arg0..` (numbered independently of
-/// `%key`), in declared order. Returns the two-result `(value, new_key)`
-/// function.
+/// [`emit_logdensity_abi`].
+///
+/// **Outputs.** Every declared output is emitted as its own `func.func` result,
+/// in declared order — §13 output reduction licenses several: "Sampled outputs
+/// consume the RNG-state input sequentially in `outputs` order … an exported
+/// RNG state is the state after the last sampled output". So `outputs =
+/// (v1, v2, s3)` emits three results. Results are ALWAYS positional, never a
+/// `stablehlo.tuple`: a tuple-typed result fails `hlo_call` import in
+/// Enzyme-JAX before any gradient runs, while a multi-result `func.func`
+/// imports, executes and differentiates (measured). When `outputs` does not
+/// name the final RNG state, it is appended as the trailing result so a caller
+/// can always thread the next call.
+///
+/// **`%key`.** The threaded RNG state (spec §07's `rand(rstate, m) -> (value,
+/// new_rstate)`) is the argument the rng source reachable from the outputs is
+/// bound to ([`find_rng_source`]). §13 calls it "a promoted fixed input", so
+/// when `inputs` lists that binding, `%key` IS that declared argument, at its
+/// declared position — it is not bound a second time as a `%argN` the body
+/// never reads (NEW-C5). A module that does not list it still gets `%key`
+/// prepended as arg 0, and the binding stays exempt from the
+/// inputs-exhaustiveness check.
+///
+/// `abi.inputs`'s other entries are numbered `%arg0..` independently of
+/// `%key`, in declared order.
 pub(crate) fn emit_sample_abi(
     m: &Module,
     abi: &Abi,
@@ -235,22 +310,20 @@ pub(crate) fn emit_sample_abi(
 ) -> Result<String, EmitError> {
     let mut e = Emitter::new(m, opts.dtype);
 
-    // Exactly one sample output.
-    let output = match abi.outputs.as_slice() {
-        [one] => *one,
-        _ => {
-            return Err(EmitError::whole(
-                "`outputs` for a sample query must name exactly one output (the \
-                 sampled value)",
-            ));
-        }
-    };
+    if abi.outputs.is_empty() {
+        return Err(EmitError::whole(
+            "`outputs` ABI binding is missing or empty; a sample query needs at least one \
+             output (the sampled value)",
+        ));
+    }
 
-    // %key = arg 0, bound from the rng source reachable from the output.
-    let src = find_rng_source(m, output).ok_or_else(|| {
+    // The rng source seeding the whole threaded chain, searched across ALL
+    // declared outputs: with several sampled outputs the source sits in the
+    // first one's slice, and the later outputs read its advanced key.
+    let src = find_rng_source(m, &abi.outputs).ok_or_else(|| {
         EmitError::at(
-            output,
-            "no rng source to bind to %key: the declared sample output reaches \
+            abi.outputs[0],
+            "no rng source to bind to %key: the declared sample outputs reach \
              no rnginit/external(rngstates) source to thread from",
         )
     })?;
@@ -263,13 +336,12 @@ pub(crate) fn emit_sample_abi(
             elem: ElemKind::Real,
         },
     );
-    let mut args: Vec<(String, MlirTy, ElemKind)> = vec![(key_name, MlirTy::Key, ElemKind::Real)];
 
     // Exhaustiveness over the ABI inputs, mirroring emit_logdensity_abi — with
-    // ONE exemption: the rng-source binding is bound to `%key` (arg 0), not a
-    // listed input. `src` is that source's rng-argument node; when it is a
-    // `(%ref self s)` the exempt binding is `s` (a bare `external(rngstates)`
-    // rng source would otherwise trip the fixed-input check below).
+    // ONE exemption: the rng-source binding is bound to `%key`. `src` is that
+    // source's rng-argument node; when it is a `(%ref self s)` the exempt
+    // binding is `s` (a bare `external(rngstates)` rng source would otherwise
+    // trip the fixed-input check below).
     let rng_src_sym = match m.node(src) {
         Node::Ref(Ref {
             ns: RefNs::SelfMod,
@@ -277,6 +349,25 @@ pub(crate) fn emit_sample_abi(
         }) => Some(*name),
         _ => None,
     };
+    // Bind the source BINDING's own RHS to `%key` as well, not just the one
+    // rng-argument node `find_rng_source` returned. Two samples reading the
+    // same state are two distinct `(%ref self s)` nodes, and only one of them
+    // is `src`: without this the other resolves through to `s`'s RHS and the
+    // walk reaches the `rnginit(seed)` call itself, refusing with "unsupported
+    // builtin head 'rnginit'" (NEW-C4) — the seed-to-state math is deliberately
+    // out of scope, because the state arrives as an argument.
+    if let Some(sym) = rng_src_sym {
+        if let Some(bid) = m.binding_by_name(sym) {
+            e.bind(
+                m.binding(bid).rhs,
+                Value {
+                    ssa: key_name.clone(),
+                    ty: MlirTy::Key,
+                    elem: ElemKind::Real,
+                },
+            );
+        }
+    }
     for (_, binding) in m.bindings() {
         if Some(binding.name) == rng_src_sym {
             continue;
@@ -308,27 +399,84 @@ pub(crate) fn emit_sample_abi(
         }
     }
 
-    // Bind declared inputs (in declared order), numbered `%arg0..`
-    // INDEPENDENTLY of the leading `%key` — reproducing the pre-purge
-    // `emit_sample` signature exactly (`%key`, `%arg0`, `%arg1`, …) so the
-    // frozen sample goldens stay byte-identical: the purge removes the query
-    // heuristic, it does not renumber the emitted arguments. Built in their own
-    // vector so `%key` does not enter the numbering.
-    let mut abi_args: Vec<(String, MlirTy, ElemKind)> = Vec::with_capacity(abi.inputs.len());
+    // Build the argument list from `inputs` in declared order. `%key` occupies
+    // the rng-source entry's own position when it is declared, and is prepended
+    // otherwise. Non-key arguments are numbered `%arg0..` INDEPENDENTLY of
+    // `%key` — reproducing the pre-purge `emit_sample` signature exactly
+    // (`%key`, `%arg0`, `%arg1`, …) so the frozen sample goldens stay
+    // byte-identical.
+    let key_arg = (key_name, MlirTy::Key, ElemKind::Real);
+    let key_declared = rng_src_sym.is_some_and(|s| abi.inputs.contains(&s));
+    let mut args: Vec<(String, MlirTy, ElemKind)> = if key_declared {
+        Vec::with_capacity(abi.inputs.len())
+    } else {
+        vec![key_arg.clone()]
+    };
+    let mut next_arg = 0usize;
     for &sym in &abi.inputs {
-        bind_input(m, &mut e, sym, opts, &mut abi_args)?;
+        if key_declared && Some(sym) == rng_src_sym {
+            args.push(key_arg.clone());
+            continue;
+        }
+        bind_input(m, &mut e, sym, opts, &mut args, &mut next_arg)?;
     }
-    args.extend(abi_args);
+    check_arity(abi, args.len())?;
 
-    // The declared output is a `(%ref self draws)` node (ABI outputs are refs,
+    // Each declared output is a `(%ref self draws)` node (ABI outputs are refs,
     // unlike the legacy path's binding RHS); resolve it to the underlying
-    // `rand`/tuple before extracting the value component, so `@sample` returns
-    // the drawn value — not the `tuple(value, advanced_rng)` — as its first
-    // result (spec §07 `rand -> (value, new_rstate)`; keeps parity with
-    // `emit_sample`'s `query.1.rhs`).
-    let value = e.lower_node(query_value_component(m, resolve_self_ref(m, output)))?;
-    let final_key = e.cur_key();
-    Ok(e.finish("sample", &args, &[&value, &final_key]))
+    // `rand`/tuple before extracting the value component, so a sampled result
+    // is the drawn value — not the `tuple(value, advanced_rng)` (spec §07
+    // `rand -> (value, new_rstate)`).
+    let mut rets_vals: Vec<Value> = Vec::with_capacity(abi.outputs.len() + 1);
+    for &node in &abi.outputs {
+        lower_sample_output(m, &mut e, node, &mut rets_vals)?;
+    }
+    // Export the final RNG state unless an output already names it. §13 pins it
+    // to "the state after the last sampled output", which is `cur_key` here.
+    if !rets_vals.iter().any(|v| matches!(v.ty, MlirTy::Key)) {
+        rets_vals.push(e.cur_key());
+    }
+    let rets: Vec<&Value> = rets_vals.iter().collect();
+    Ok(e.finish("sample", &args, &rets))
+}
+
+/// Append the `func.func` result(s) one declared `@sample` output contributes.
+///
+/// A record-shaped output — the hierarchical forward model's
+/// `record(mu = …, y = …)`, `flatppl_determinizer::sample`'s
+/// `lower_shared_record_sample` shape — has no tensor form of its own, so its
+/// FIELDS become results, in declared field order, recursively. Positional
+/// results, never a `stablehlo.tuple`: a tuple-typed result fails `hlo_call`
+/// import in Enzyme-JAX before any gradient runs.
+fn lower_sample_output(
+    m: &Module,
+    e: &mut Emitter,
+    node: NodeId,
+    out: &mut Vec<Value>,
+) -> Result<(), EmitError> {
+    let resolved = query_value_component(m, resolve_self_ref(m, node));
+    if let Node::Call(c) = m.node(resolved) {
+        if matches!(c.head, CallHead::Builtin(sym) if m.resolve(sym) == "record") {
+            let fields: Vec<NodeId> = c
+                .named
+                .iter()
+                .filter(|na| na.kind == NamedKind::Field)
+                .map(|na| na.value)
+                .collect();
+            if fields.is_empty() {
+                return Err(EmitError::at(
+                    resolved,
+                    "a record-shaped sample output with no fields contributes no result",
+                ));
+            }
+            for field in fields {
+                lower_sample_output(m, e, field, out)?;
+            }
+            return Ok(());
+        }
+    }
+    out.push(e.lower_node(resolved)?);
+    Ok(())
 }
 
 /// The value component of a `@sample` query. A destructured `rand` whose
@@ -347,7 +495,7 @@ fn query_value_component(m: &Module, query_rhs: NodeId) -> NodeId {
     query_rhs
 }
 
-/// Find the FlatPDL rng SOURCE reachable from the `@sample` query — the
+/// Find the FlatPDL rng SOURCE reachable from the `@sample` outputs — the
 /// `builtin_sample` whose rng argument does NOT (transitively) resolve to
 /// another sample's advanced-key slot, i.e. the `rnginit(...)`/
 /// `external(rngstates)` that seeds the whole threaded chain (spec §07). The
@@ -356,17 +504,22 @@ fn query_value_component(m: &Module, query_rhs: NodeId) -> NodeId {
 /// `e.lower_node(rng)` resolves straight to the func argument (the `rnginit`
 /// node itself is never lowered — its seed→state math is out of scope).
 ///
+/// Searched across every declared output, since with several sampled outputs
+/// only the first one's slice holds the source.
+///
 /// `None` when no such source exists (every sample's rng arg is another
 /// sample's advanced key — a cycle, or a model whose only rng comes from a
 /// slot with no root): [`emit_sample_abi`] then refuses rather than silently
 /// dropping the key. In a well-formed threaded chain there is exactly one
 /// source; the first found (in reachability-walk order) is returned.
-fn find_rng_source(m: &Module, query_rhs: NodeId) -> Option<NodeId> {
-    for sample in collect_sample_calls(m, query_rhs) {
-        if let Node::Call(c) = m.node(sample) {
-            if let Some(&rng_arg) = c.args.first() {
-                if !derives_from_sample(m, rng_arg) {
-                    return Some(rng_arg);
+fn find_rng_source(m: &Module, outputs: &[NodeId]) -> Option<NodeId> {
+    for &output in outputs {
+        for sample in collect_sample_calls(m, output) {
+            if let Node::Call(c) = m.node(sample) {
+                if let Some(&rng_arg) = c.args.first() {
+                    if !derives_from_sample(m, rng_arg) {
+                        return Some(rng_arg);
+                    }
                 }
             }
         }
@@ -475,6 +628,10 @@ fn resolve_self_ref(m: &Module, id: NodeId) -> NodeId {
 /// Append the `func.func` argument(s) the `inputs` entry `sym` contributes, in
 /// declared order, and pre-bind each so the query walk resolves to it.
 ///
+/// `next_arg` is the `%argN` counter, threaded separately from `args.len()` so
+/// `emit_sample_abi`'s `%key` can sit anywhere in the list without entering the
+/// numbering.
+///
 /// Usually one argument, typed by [`mlir_type_of`]. An entry whose type is an
 /// aggregate with columns — a table or a record, the shapes a
 /// `load_data(source, cartpow(cartprod(…), N))` / `cartprod(…)` valueset
@@ -495,6 +652,7 @@ fn bind_input(
     sym: Symbol,
     opts: &EmitOptions,
     args: &mut Vec<(String, MlirTy, ElemKind)>,
+    next_arg: &mut usize,
 ) -> Result<(), EmitError> {
     let bid = m.binding_by_name(sym).ok_or_else(|| {
         EmitError::whole(format!(
@@ -503,16 +661,20 @@ fn bind_input(
         ))
     })?;
     let rhs = m.binding(bid).rhs;
-    // Accept `elementof` (parameterized) and the fixed-phase input constructs
-    // `external`/`load_data`; anything else (a literal, a computed value) cannot
-    // be an ABI argument and refuses. The message keeps "not an elementof
-    // parameter" for the literal/computed case.
-    if !is_free_param(m, rhs) && !is_fixed_input(m, rhs) {
+    // Accept `elementof` (parameterized) and ANY fixed-phase binding. §13's
+    // phase table gives fixed bindings four rows and maps every one listed in
+    // `inputs` to a function argument: `external`, `load_data`, and a *derived*
+    // value such as `rnginit(seed)` — "function argument, replacing the
+    // computed value". A parameterized binding that is not itself an
+    // `elementof` declaration is a function OF the parameters, not an argument,
+    // and a stochastic binding is not a value at all; both refuse.
+    if !is_free_param(m, rhs) && m.phase_of(rhs) != Some(Phase::Fixed) {
         return Err(EmitError::at(
             rhs,
             format!(
-                "`inputs` entry `{}` is not an elementof parameter, external, or \
-                 load_data input — only these constructs can be ABI arguments",
+                "`inputs` entry `{}` is neither an elementof parameter nor a fixed-phase \
+                 binding, so it cannot be a function argument — a value computed from the \
+                 parameters is a result, not an argument (spec §13 signature)",
                 m.resolve(sym)
             ),
         ));
@@ -531,6 +693,18 @@ fn bind_input(
     }
 
     if let Some(columns) = aggregate_columns(m, rhs) {
+        // An aggregate with no columns would contribute no argument at all and
+        // shrink the emitted arity below the declared one — refuse instead.
+        if columns.is_empty() {
+            return Err(EmitError::at(
+                rhs,
+                format!(
+                    "`inputs` entry `{}` is an aggregate with no columns, so it contributes \
+                     no function argument; give it the value set it actually holds",
+                    m.resolve(sym)
+                ),
+            ));
+        }
         for (name, column_ty) in columns {
             let (ty, elem) = mlir_type_of_ty(rhs, &column_ty, opts.dtype).map_err(|_| {
                 EmitError::at(
@@ -544,7 +718,8 @@ fn bind_input(
                     ),
                 )
             })?;
-            let ssa = format!("%arg{}", args.len());
+            let ssa = format!("%arg{next_arg}");
+            *next_arg += 1;
             e.bind_column(
                 rhs,
                 name,
@@ -559,7 +734,8 @@ fn bind_input(
         return Ok(());
     }
 
-    let ssa = format!("%arg{}", args.len());
+    let ssa = format!("%arg{next_arg}");
+    *next_arg += 1;
     // Use the inferred element kind (not a hardcoded `Real`): an integer /
     // boolean `elementof` (or int `load_data`) input must arrive as an int/bool
     // tensor arg so the value-path widening reconciles correctly.

@@ -4874,44 +4874,26 @@ draws = rand(s, lawof(record(mu = mu, y = y)))
 outputs = (draws)
 ";
 
-/// This fixture's query (`draws`'s RHS) now correctly PASSES
-/// `contains_sample_call`'s guard (it no longer refuses with "no sample
-/// term" — the false-negative Finding 1 reported). Emission then refuses
-/// for a DIFFERENT, genuine reason: the query is `record(...)`-typed, and
-/// `ops::lower_builtin`'s `"record"` arm has no tensor form for it — the
-/// mode builder has no structural decomposition for a record-SHAPED
-/// `@sample` OUTPUT (only for a record-shaped free-parameter *input*, via
-/// the `elementof` loop). Deciding that output ABI (multiple `func.func`
-/// results? a `stablehlo.tuple`? field order convention?) is a new-capability
-/// design decision outside a Task 6 review-findings fix, not forced here —
-/// see the fix-pass report for the concern writeup. This test locks in that
-/// the GUARD itself is fixed without overclaiming the record-output case
-/// fully emits.
+/// This fixture's query (`draws`'s RHS) passes `contains_sample_call`'s guard
+/// AND now emits: the record's fields become positional `func.func` results
+/// (`modes::lower_sample_output`), so the earlier "record has no tensor form"
+/// refusal is gone. The field-order and result-count assertions live in
+/// [`emit_sample_abi_flattens_a_record_output_into_positional_results`]; this
+/// test keeps the guard's own regression check (a record/hierarchical query
+/// reaching `builtin_sample` only through a chain of self-refs must not refuse
+/// with "no sample term").
 #[test]
-fn emit_sample_hierarchical_record_passes_guard_refuses_on_record_output() {
+fn emit_sample_hierarchical_record_reaches_the_sample_and_emits() {
     let d = determinize_src(HIERARCHICAL_SAMPLE_SRC);
     assert!(
         flatppl_determinizer::is_flatpdl(&d).is_ok(),
         "determinized module must be FlatPDL-conformant (no residual measure node)"
     );
 
-    let err = flatppl_stablehlo::emit(
-        &d,
-        flatppl_stablehlo::Mode::Sample,
-        &flatppl_stablehlo::EmitOptions::default(),
-    )
-    .unwrap_err();
+    let out = emit_sample(&d);
     assert!(
-        !err.msg.contains("no sample term"),
-        "the query-output guard must no longer refuse a record/hierarchical \
-         query that DOES contain a builtin_sample term (reached only via a \
-         chain of self-refs): {}",
-        err.msg
-    );
-    assert!(
-        err.msg.contains("record has no tensor form"),
-        "expected the record-output limitation, not a different refusal: {}",
-        err.msg
+        out.contains("func.func @sample(%key: tensor<2xui64>)"),
+        "a record-shaped sample output must emit, in:\n{out}"
     );
 }
 
@@ -9390,22 +9372,24 @@ outputs = q1
     );
 }
 
-/// A binding named in `inputs` that is neither an `elementof` parameter nor a
-/// fixed-phase input construct (`external`/`load_data`) must REFUSE rather than
-/// emit a partial signature: here a literal array `y = [1.0, 2.0]` (not a data
-/// construct — its values ARE known, but it is not an ABI-argument construct).
-/// `mu` is a listed `elementof` so the model determinizes as a standard
-/// parameterized density (isolating the non-input-construct refusal from the
-/// exhaustiveness check, which passes here). Fixed-phase `external`/`load_data`
-/// inputs are now accepted (PR-2) — see the PR-2 section.
+/// A binding named in `inputs` that is neither an `elementof` parameter nor
+/// fixed-phase must REFUSE rather than emit a partial signature: here `z` is a
+/// value computed FROM the parameter `mu`, so it is parameterized but not a
+/// parameter declaration. §13's signature subsection admits parameterized
+/// `elementof` and fixed bindings as arguments and nothing else — a function of
+/// the parameters is a result, not an argument.
+///
+/// A fixed-phase literal binding is NOT this case: §13's phase table promotes
+/// every fixed binding listed in `inputs`, see
+/// [`emit_logdensity_abi_promotes_fixed_literal_input`].
 #[test]
-fn emit_logdensity_abi_refuses_non_elementof_input() {
+fn emit_logdensity_abi_refuses_computed_parameterized_input() {
     let src = "\
 mu = elementof(reals)
-y = [1.0, 2.0]
+z = mu * 2.0
 m = lawof(record(a = draw(Normal(mu = 0.0, sigma = 1.0))))
 q1 = logdensityof(m, record(a = mu))
-inputs = (mu, y)
+inputs = (mu, z)
 outputs = q1
 ";
     let d = determinize_abi_roots(src, &["inputs", "outputs"]);
@@ -9416,8 +9400,338 @@ outputs = q1
     )
     .unwrap_err();
     assert!(
-        err.msg.contains("not an elementof parameter") && err.msg.contains('y'),
-        "expected a non-elementof-input refusal naming `y`, got: {}",
+        err.msg.contains("nor a fixed-phase binding") && err.msg.contains('z'),
+        "expected a non-argument refusal naming `z`, got: {}",
+        err.msg
+    );
+}
+
+// ---- ABI entry integrity (RUST-STABLEHLO-001, NEW-C1, NEW-C2, NEW-C5) ------
+//
+// One rule, checked in both modes: the emitted `func.func` argument list is
+// exactly the declared `inputs`, once each. Before this, three separate paths
+// broke it — a derived fixed entry was const-folded away and its value baked at
+// exit 0, a literal element was dropped so the arity silently shrank, and
+// sample mode bound the rng state twice (`%key` plus a dead `%arg0`).
+
+/// §13's phase table row *fixed / derived (e.g. `rnginit(seed)`) / listed in
+/// `inputs`* maps to "function argument, **replacing the computed value**". So
+/// `inputs = c` for `c = 2.0 * 3.0` compiles to a ONE-argument function whose
+/// body reads that argument — not to a zero-argument function with `6.0` baked
+/// in, which is what the determiniser's alias inlining used to produce (NEW-C1,
+/// the corrected root cause of RUST-STABLEHLO-001).
+#[test]
+fn emit_logdensity_abi_promotes_derived_fixed_input() {
+    let src = "\
+c = 2.0 * 3.0
+m = lawof(record(a = draw(Normal(mu = c, sigma = 1.0))))
+q = logdensityof(m, record(a = 0.5))
+inputs = c
+outputs = q
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let out = emit_logdensity(&d);
+    assert!(
+        out.contains("func.func @logdensity(%arg0: tensor<f32>)"),
+        "the promoted derived input must be the one argument, in:\n{out}"
+    );
+    assert!(
+        !out.contains("dense<6.0>"),
+        "the promoted input's value must NOT be baked as a constant, in:\n{out}"
+    );
+    assert!(
+        out.contains("%arg0"),
+        "the body must read the promoted argument, in:\n{out}"
+    );
+}
+
+/// A fixed-phase literal binding is promoted for the same reason: §13 says
+/// "Fixed values do not change after module initialization; listing one in
+/// `inputs` relaxes this: the caller supplies the value on each call."
+#[test]
+fn emit_logdensity_abi_promotes_fixed_literal_input() {
+    let src = "\
+y = [1.0, 2.0]
+mu = elementof(reals)
+m = lawof(record(a = draw(Normal.(mu, 1.0))))
+q = logdensityof(m, record(a = y .+ mu))
+inputs = (mu, y)
+outputs = q
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let out = emit_logdensity(&d);
+    assert!(
+        out.contains("func.func @logdensity(%arg0: tensor<f32>, %arg1: tensor<2xf32>)"),
+        "both declared inputs must be arguments, in:\n{out}"
+    );
+}
+
+/// An `inputs` element that names no binding must REFUSE, not be dropped.
+/// `inputs = (mu, 1.0)` declared two arguments and emitted one, at exit 0
+/// (RUST-STABLEHLO-001): the signature shrank with no diagnostic, so every
+/// caller passing two arguments was wrong.
+#[test]
+fn read_abi_refuses_an_inputs_element_that_names_no_binding() {
+    let src = "\
+mu = elementof(reals)
+m = lawof(record(a = draw(Normal(mu = mu, sigma = 1.0))))
+y = logdensityof(m, record(a = 0.5))
+inputs = (mu, 1.0)
+outputs = y
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let err = flatppl_stablehlo::emit(
+        &d,
+        flatppl_stablehlo::Mode::LogDensity,
+        &flatppl_stablehlo::EmitOptions::default(),
+    )
+    .unwrap_err();
+    assert!(
+        err.msg.contains("does not name a binding"),
+        "expected the non-reference-element refusal, got: {}",
+        err.msg
+    );
+}
+
+/// One binding cannot occupy two argument positions.
+#[test]
+fn read_abi_refuses_a_repeated_inputs_element() {
+    let src = "\
+mu = elementof(reals)
+m = lawof(record(a = draw(Normal(mu = mu, sigma = 1.0))))
+y = logdensityof(m, record(a = 0.5))
+inputs = (mu, mu)
+outputs = y
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let err = flatppl_stablehlo::emit(
+        &d,
+        flatppl_stablehlo::Mode::LogDensity,
+        &flatppl_stablehlo::EmitOptions::default(),
+    )
+    .unwrap_err();
+    assert!(
+        err.msg.contains("more than once"),
+        "expected the repeated-element refusal, got: {}",
+        err.msg
+    );
+}
+
+/// The arity-integrity rule, asserted directly in LOGDENSITY mode: the emitted
+/// argument count equals the declared `inputs` count.
+#[test]
+fn emit_logdensity_abi_arity_equals_declared_inputs() {
+    let src = "\
+a = elementof(reals)
+b = elementof(reals)
+c = external(reals)
+d = 3.0 * 4.0
+m = lawof(record(v = draw(Normal(mu = a, sigma = 1.0))))
+q = logdensityof(m, record(v = b + c + d))
+inputs = (a, b, c, d)
+outputs = q
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let out = emit_logdensity(&d);
+    let signature = out
+        .lines()
+        .find(|l| l.contains("func.func @logdensity"))
+        .expect("emitted signature");
+    assert_eq!(
+        signature.matches("%arg").count(),
+        4,
+        "4 declared inputs must emit 4 arguments, in:\n{out}"
+    );
+}
+
+/// The same rule in SAMPLE mode, over the case that used to break it: the rng
+/// state listed in `inputs` was bound TWICE — once as `%key` by
+/// `find_rng_source`, once as a `%arg0` the body never reads (NEW-C5) — so the
+/// emitted arity was one larger than the function consumes and a caller had to
+/// pass the state in two positions that nothing forced to agree.
+#[test]
+fn emit_sample_abi_binds_a_declared_rng_state_once() {
+    let src = "\
+s = elementof(rngstates)
+x = draw(Normal(mu = 0.0, sigma = 1.0))
+v1, s2 = rand(s, lawof(x))
+inputs = s
+outputs = (v1)
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let out = emit_sample(&d);
+    let signature = out
+        .lines()
+        .find(|l| l.contains("func.func @sample"))
+        .expect("emitted signature");
+    assert!(
+        signature.contains("%key: tensor<2xui64>"),
+        "the declared rng state is the %key argument, in:\n{out}"
+    );
+    assert_eq!(
+        signature.matches("%arg").count(),
+        0,
+        "the declared rng state must not ALSO be bound as a dead %argN, in:\n{out}"
+    );
+    assert!(
+        signature.contains("@sample(%key: tensor<2xui64>) ->"),
+        "one declared input, one argument, in:\n{out}"
+    );
+}
+
+/// §13 names "a promoted `rnginit` result" as a legitimate promoted fixed
+/// input, and calls the RNG state a sampled output reads exactly that. The
+/// emitter used to refuse it outright (NEW-C2), and the sample path then blamed
+/// the wrong construct with "unsupported builtin head 'rnginit'" (NEW-C4).
+#[test]
+fn emit_sample_abi_promotes_an_rnginit_input() {
+    let src = "\
+s = rnginit(0)
+x = draw(Normal(mu = 0.0, sigma = 1.0))
+draws = rand(s, lawof(x))
+inputs = s
+outputs = (draws)
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let out = emit_sample(&d);
+    assert!(
+        out.contains("func.func @sample(%key: tensor<2xui64>)"),
+        "the promoted rnginit result is the %key argument, in:\n{out}"
+    );
+    assert!(
+        !out.contains("rnginit"),
+        "the seed-to-state math stays out of the emitted module, in:\n{out}"
+    );
+}
+
+// ---- Sample-mode output ABI (RUST-STABLEHLO-002) ---------------------------
+//
+// §13 output reduction: "Sampled outputs consume the RNG-state input
+// sequentially in `outputs` order, with state splitting during fan-out …; an
+// exported RNG state is the state after the last sampled output." Several
+// sampled outputs are licensed word for word, and the exported state's position
+// is pinned last. Sample mode used to refuse anything but one output.
+
+/// Two sampled outputs plus the appended final state: three positional results.
+#[test]
+fn emit_sample_abi_emits_one_result_per_declared_output() {
+    let src = "\
+s = external(rngstates)
+x = draw(Normal(mu = 0.0, sigma = 1.0))
+y = draw(Normal(mu = 0.0, sigma = 1.0))
+v1, s2 = rand(s, lawof(x))
+v2, s3 = rand(s2, lawof(y))
+inputs = s
+outputs = (v1, v2)
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let out = emit_sample(&d);
+    assert!(
+        out.contains("-> (tensor<f32>, tensor<f32>, tensor<2xui64>)"),
+        "two sampled values then the exported state, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.rng_bit_generator").count(),
+        2,
+        "each sampled output draws once, in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// The exact shape §13 licenses word for word — `(v1, v2, s3)`, the state last.
+/// A declared state is NOT duplicated by the appended one.
+#[test]
+fn emit_sample_abi_exports_a_declared_rng_state_without_duplicating_it() {
+    let src = "\
+s = elementof(rngstates)
+x = draw(Normal(mu = 0.0, sigma = 1.0))
+y = draw(Normal(mu = 0.0, sigma = 1.0))
+v1, s2 = rand(s, lawof(x))
+v2, s3 = rand(s2, lawof(y))
+inputs = s
+outputs = (v1, v2, s3)
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let out = emit_sample(&d);
+    assert!(
+        out.contains("-> (tensor<f32>, tensor<f32>, tensor<2xui64>)"),
+        "three declared outputs, three results, in:\n{out}"
+    );
+    let ret = out
+        .lines()
+        .find(|l| l.trim_start().starts_with("return "))
+        .expect("emitted return");
+    assert_eq!(
+        ret.matches("tensor<2xui64>").count(),
+        1,
+        "the declared state must not be returned twice, in:\n{out}"
+    );
+}
+
+/// A record-shaped sample output becomes one result per field, in declared
+/// field order — the hierarchical forward model
+/// (`flatppl_determinizer::sample::lower_shared_record_sample`) that used to
+/// refuse with "record has no tensor form".
+#[test]
+fn emit_sample_abi_flattens_a_record_output_into_positional_results() {
+    let d = determinize_src(HIERARCHICAL_SAMPLE_SRC);
+    let out = emit_sample(&d);
+    assert!(
+        out.contains("-> (tensor<f32>, tensor<f32>, tensor<2xui64>)"),
+        "the record's two fields then the exported state, in:\n{out}"
+    );
+    assert_eq!(
+        out.matches("stablehlo.rng_bit_generator").count(),
+        2,
+        "both drawn fields keep their own draw, in:\n{out}"
+    );
+    assert!(is_delimiter_balanced(&out));
+}
+
+/// Results are positional, NEVER a `stablehlo.tuple`. Measured in the
+/// testsuite's `stablehlo` pixi env: a hand-written
+/// `-> tuple<tensor<f32>, tensor<f32>>` module fails Enzyme-JAX `hlo_call`
+/// import before any gradient runs (`'TupleType' object has no attribute
+/// 'element_type'`), while a two-result `func.func` imports, executes and
+/// differentiates.
+#[test]
+fn emit_sample_abi_never_emits_a_tuple_typed_result() {
+    let src = "\
+s = external(rngstates)
+x = draw(Normal(mu = 0.0, sigma = 1.0))
+y = draw(Normal(mu = 0.0, sigma = 1.0))
+v1, s2 = rand(s, lawof(x))
+v2, s3 = rand(s2, lawof(y))
+inputs = s
+outputs = (v1, v2, s3)
+";
+    let d = determinize_abi_roots(src, &["inputs", "outputs"]);
+    let out = emit_sample(&d);
+    assert!(
+        !out.contains("stablehlo.tuple") && !out.contains("tuple<"),
+        "a tuple-typed result is unimportable by Enzyme-JAX, in:\n{out}"
+    );
+}
+
+/// A sample query needs at least one output.
+#[test]
+fn emit_sample_abi_refuses_empty_outputs() {
+    let src = "\
+s = rnginit(0)
+x = draw(Normal(mu = 0.0, sigma = 1.0))
+draws = rand(s, lawof(x))
+inputs = s
+";
+    let d = determinize_abi_roots(src, &["inputs"]);
+    let err = flatppl_stablehlo::emit(
+        &d,
+        flatppl_stablehlo::Mode::Sample,
+        &flatppl_stablehlo::EmitOptions::default(),
+    )
+    .unwrap_err();
+    assert!(
+        err.msg.contains("at least one output"),
+        "expected the empty-outputs refusal, got: {}",
         err.msg
     );
 }

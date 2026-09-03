@@ -50,7 +50,20 @@
 //!   `sec:determinization-signature`: "function argument (shape from its
 //!   `valueset`, contents at runtime)"). The emitter never opens the file, so a
 //!   model emits whether or not the source exists. `anything` declares no shape
-//!   and refuses.
+//!   and refuses;
+//! - any other fixed-phase binding, `rnginit(seed)` included → an argument
+//!   "replacing the computed value" (§13's phase table). §13 states the
+//!   relaxation outright: "Fixed values do not change after module
+//!   initialization; listing one in `inputs` relaxes this: the caller supplies
+//!   the value on each call." So a binding whose value the emitter could have
+//!   baked is a runtime argument once it is declared.
+//!
+//! **Every declared element becomes an argument, once.** An `inputs` element
+//! that names no binding refuses, as does a repeated one, and the emitted
+//! argument list is checked against the declared count. Silently dropping an
+//! element used to shrink the signature at exit 0 (`inputs = (mu, 1.0)`
+//! declared two arguments and emitted one), so every caller was wrong with no
+//! diagnostic.
 //!
 //! **Orientation is absent from the emitted signature, deliberately.** §03 makes
 //! a transposed vector a distinct type from a one-dimensional array, but MLIR has
@@ -79,10 +92,22 @@
 //! `inputs` is authoritative and exhaustive: every `elementof` parameter in
 //! the module must be listed, or emission refuses. Each `outputs` entry is a
 //! deterministic FlatPDL result in declared order — a `logdensityof(M, point)`
-//! density query, or (`Mode::Sample`) a sampled value: the emitted `@sample`
-//! threads a leading `%key : tensor<2xui64>` rng argument (spec §07 `rand`) and
-//! returns the `(value, new_key)` pair, so its single `outputs` entry names the
-//! sampled binding rather than a density.
+//! density query, or (`Mode::Sample`) a sampled value.
+//!
+//! ## `Mode::Sample` results are positional
+//!
+//! `@sample` threads a `%key : tensor<2xui64>` rng argument (spec §07 `rand`)
+//! and emits ONE `func.func` result per declared output, in declared order,
+//! plus the final RNG state — appended unless an output already names it. §13
+//! output reduction licenses several sampled outputs directly ("Sampled outputs
+//! consume the RNG-state input sequentially in `outputs` order … an exported
+//! RNG state is the state after the last sampled output"), so `outputs =
+//! (v1, v2, s3)` emits three results. A record-shaped output contributes one
+//! result per field, in declared field order.
+//!
+//! Results are never wrapped in a `stablehlo.tuple`. A tuple-typed result
+//! fails `hlo_call` import in Enzyme-JAX before any gradient runs, while a
+//! multi-result `func.func` imports, executes and differentiates.
 //!
 //! ## Worked examples
 //!
@@ -229,7 +254,7 @@ impl Default for EmitOptions {
 pub fn emit(m: &Module, mode: Mode, opts: &EmitOptions) -> Result<String, EmitError> {
     flatppl_determinizer::is_flatpdl(m)
         .map_err(|_| EmitError::whole("input is not FlatPDL (determinize first)"))?;
-    match modes::read_abi(m) {
+    match modes::read_abi(m)? {
         Some(abi) => match mode {
             Mode::LogDensity => modes::emit_logdensity_abi(m, &abi, opts),
             Mode::Sample => modes::emit_sample_abi(m, &abi, opts),
