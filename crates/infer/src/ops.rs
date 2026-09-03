@@ -128,6 +128,12 @@ pub(crate) fn call_rule(
         return (ty, joined);
     }
 
+    // §03 well-formedness of the aggregate CONSTRUCTORS, before the per-op rules
+    // build a type from names they have not checked are usable.
+    if let Some(ty) = constructor_check(inf, id, &name, args, named) {
+        return (ty, joined);
+    }
+
     // Written sizes, after `arity_check` (which needs the call as written) and
     // ahead of the per-op rules, which read the size to build a shape.
     if let Some(ty) = written_size_check(inf, &name, args, named) {
@@ -6227,6 +6233,156 @@ fn arity_check(
     Some(Type::Failed(
         format!("{name} takes {declared}, got {got}").into(),
     ))
+}
+
+/// Reject an aggregate constructor whose §03 well-formedness the per-op rules do
+/// not check: a duplicate field or column name, a positional-and-keyword mix on a
+/// set or measure product, or an array literal that mixes a string element with a
+/// value element.
+///
+/// Each of the three lets an ill-formed model type cleanly and reach the
+/// determiniser: `record(a = 1, a = 2)` produced a two-field record both of whose
+/// fields are named `a`, `cartprod(reals, a = integers)` dropped its positional
+/// component from the value set, and `[1, "x"]` typed an integer array of integers.
+fn constructor_check(
+    inf: &mut Inferencer<'_, '_>,
+    id: NodeId,
+    name: &str,
+    args: &[ArgInfo],
+    named: &[NamedInfo],
+) -> Option<Type> {
+    match name {
+        // §03 "Cartesian product" defines the two spellings SEPARATELY and gives
+        // each its own member type: `cartprod(S1, S2, ...)` yields "a set of
+        // arrays, not a set of tuples", while "The keyword form `cartprod(a = S1,
+        // b = S2, ...)` produces a set of records". No sentence assigns a meaning
+        // to a call that writes both, so the mixed form has no member type to
+        // give. `joint` already refused it (`refuse_mixed_joint_spelling`); this
+        // extends the same refusal to the set product §03 says `joint` mirrors,
+        // and to `jointchain`, which §04 lists alongside them.
+        //
+        // Unrefused, `set_call_valueset_at` took the named branch whenever ANY
+        // named argument was present and silently dropped every positional one:
+        // `cartprod(reals, a = integers)` had value set `record(a = integers)` and
+        // `elementof` of it yielded only the record field.
+        "cartprod" | "jointchain" if !args.is_empty() && !named.is_empty() => {
+            Some(refuse_mixed_product_spelling(inf, id, name))
+        }
+        "record" | "table" | "joint" | "jointchain" | "cartprod" => {
+            refuse_duplicate_field_names(inf, name, named)
+        }
+        "vector" => refuse_mixed_string_array(inf, args),
+        _ => None,
+    }
+}
+
+/// Reject a set or measure product written with both positional and keyword
+/// components. Mirrors [`refuse_mixed_joint_spelling`], which owns `joint`.
+fn refuse_mixed_product_spelling(inf: &mut Inferencer<'_, '_>, id: NodeId, name: &str) -> Type {
+    let (kind, produces) = if name == "cartprod" {
+        (
+            "set",
+            "a set of arrays (positional) or a set of records (keyword)",
+        )
+    } else {
+        (
+            "measure",
+            "an array-variate measure (positional) or a record-variate one (keyword)",
+        )
+    };
+    inf.diags.push(crate::Diagnostic::error_at(
+        id,
+        format!(
+            "`{name}` mixes positional and keyword components: spec §03 \"Cartesian \
+             product\" defines the two spellings separately, and each produces a \
+             different {kind} — {produces}. A mixed call has neither. Name every \
+             component, or name none"
+        ),
+    ));
+    Type::Failed(format!("{name} mixes positional and keyword components").into())
+}
+
+/// Reject a constructor that declares the same field, column or component name
+/// twice.
+///
+/// §03 "Records" makes the name the only access path — "Fields are accessed by
+/// name, not by position — `get(r, i)` is not supported to avoid ambiguity with
+/// row indexing on tables" — so a second field of the same name is unreachable,
+/// and which of the two `r.a` denotes is undefined. §03 "Tables" gives columns the
+/// same access path ("Column access by field name: `t.colname`"), and a duplicate
+/// there is unreachable for the same reason. A keyword `joint` or `cartprod`
+/// carries the names into a record-variate measure or a record set, where they hit
+/// exactly the same wall.
+///
+/// Unrefused, all four kept the duplicate: `record(a = 1, a = 2)` typed
+/// `(%record (a (%scalar integer)) (a (%scalar integer)))`, and the joint's domain
+/// carried two `a` fields into the determiniser's density record.
+///
+/// Anchored at the SECOND occurrence, which is the one the author can delete.
+fn refuse_duplicate_field_names(
+    inf: &mut Inferencer<'_, '_>,
+    name: &str,
+    named: &[NamedInfo],
+) -> Option<Type> {
+    let mut seen: Vec<Symbol> = Vec::with_capacity(named.len());
+    let mut first_dup = None;
+    for (sym, node, _, _) in named {
+        if seen.contains(sym) {
+            let field = inf.module.resolve(*sym).to_string();
+            inf.diags.push(crate::Diagnostic::error_at(
+                *node,
+                format!(
+                    "`{name}` declares `{field}` twice: spec §03 \"Records\" accesses \
+                     fields by name, not by position, so a repeated name is \
+                     unreachable and `.{field}` has no defined component"
+                ),
+            ));
+            first_dup = first_dup.or(Some(field));
+            continue;
+        }
+        seen.push(*sym);
+    }
+    first_dup.map(|f| Type::Failed(format!("{name} declares `{f}` twice").into()))
+}
+
+/// Reject an array literal that mixes a string element with a value element.
+///
+/// §03 "Arrays" admits two kinds of element: "collections of scalar values (real,
+/// integer, boolean and complex values) or arrays". A string is neither, and §03
+/// "Scalar types" does not list one — its only role is as a field-name selector,
+/// which the spec always writes as a HOMOGENEOUS list (§06
+/// `disintegrate(["obs"], …)`, §04 `relabel(x, ["x", "y", "z"])`). So a
+/// homogeneous string array is left alone, and a mixed one is refused: it is
+/// neither an array of values nor a selector list.
+///
+/// The check reads the argument NODES, not their types, because a string carries
+/// no `Type` — [`literal_type`] answers `%any` for one. That is what made the
+/// defect invisible: the element join absorbed the `%any` into its numeric
+/// neighbour, so `[1, "x"]`, `["x", 1]` and even `[true, "x"]` all typed as
+/// `(%array 1 (2) (%scalar integer))` with value set `(cartpow integers 2)` — an
+/// integer element type for two elements, one of which is not a number.
+fn refuse_mixed_string_array(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> Option<Type> {
+    let strings: Vec<bool> = args
+        .iter()
+        .map(|(node, _, _)| written_string(inf, *node).is_some())
+        .collect();
+    if !strings.iter().any(|s| *s) || strings.iter().all(|s| *s) {
+        return None;
+    }
+    for ((node, _, _), is_string) in args.iter().zip(&strings) {
+        if !is_string {
+            continue;
+        }
+        inf.diags.push(crate::Diagnostic::error_at(
+            *node,
+            "an array element is a string, but a sibling element is a value: spec §03 \
+             \"Arrays\" admits \"scalar values (real, integer, boolean and complex \
+             values) or arrays\" as elements, and a string is neither. A string array \
+             is a field-name selector list, which holds only names"
+                .to_string(),
+        ));
+    }
+    Some(Type::Failed("array mixes strings and values".into()))
 }
 
 /// How §04 "Calling conventions" declares a special operation's inputs. The
