@@ -288,12 +288,40 @@ fn the_get_index_spelling_is_accepted() {
     ));
 }
 
-/// The all-keyword spelling of the same call, keyed on §04's parameter names.
+/// The all-keyword spelling of the same call is a STATIC ERROR. §04 "Calling
+/// conventions": "A distinguished input has no name and so cannot be passed by
+/// keyword", and §04 lists `aggregate` under "Three distinguished inputs".
+///
+/// **This test was FLIPPED from acceptance** (adjudicated 2026-09-03,
+/// user-ratified — `flatppl-dev/adjudication-keyword-distinguished-inputs.md`).
+/// It accepted the spelling on the reading that §04's `aggregate(f_reduction,
+/// output_axes, expr)` bullets are keyword names. They label POSITIONS: §04 gives
+/// `normalize(M)` the identical signature-plus-bullets shape and declares
+/// `normalize(M = mu)` a static error, so the shape cannot confer keyword
+/// binding. Accepting it here also made `axes.rs` the one place an illegal
+/// spelling was given an axis-slot meaning.
 #[test]
-fn the_keyword_aggregate_spelling_is_accepted() {
-    accepts(&format!(
-        "{SETUP}x = aggregate(f_reduction = sum, output_axes = [.i], expr = A[.i, .j])\n"
-    ));
+fn the_keyword_aggregate_spelling_is_refused() {
+    rejects(
+        &format!("{SETUP}x = aggregate(f_reduction = sum, output_axes = [.i], expr = A[.i, .j])\n"),
+        "cannot be passed by keyword",
+    );
+}
+
+/// The positional spelling of the same call still types, so the refusal is about
+/// the spelling and not about `aggregate`.
+#[test]
+fn the_positional_aggregate_spelling_is_still_accepted() {
+    accepts(&format!("{SETUP}x = aggregate(sum, [.i], A[.i, .j])\n"));
+}
+
+/// `metricsum` is on the same §04 row and takes the same refusal.
+#[test]
+fn the_keyword_metricsum_spelling_is_refused() {
+    rejects(
+        &format!("{SETUP}x = metricsum(metric = g, output_axes = [.mu^], expr = v[.mu^])\n"),
+        "cannot be passed by keyword",
+    );
 }
 
 #[test]

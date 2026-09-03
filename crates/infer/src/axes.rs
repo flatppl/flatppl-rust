@@ -89,17 +89,16 @@ fn scan(m: &Module, id: NodeId, slot: Slot, in_body: bool, out: &mut Vec<(NodeId
                 };
                 scan(m, a, child, in_body || i == 2, out);
             }
-            // The all-keyword spelling of the same call (§05 "Note on
-            // `MixedArgs`" leaves `KeywordArgs` open to every callable), keyed
-            // on the §04 parameter names.
-            for n in c.named.iter() {
-                let (child, body) = match m.resolve(n.name) {
-                    "output_axes" => (Slot::OutputAxes, in_body),
-                    "expr" => (Slot::Value, true),
-                    _ => (Slot::Value, in_body),
-                };
-                scan(m, n.value, child, body, out);
-            }
+            // No keyword branch: the keyword spelling of a distinguished input
+            // is a static error (§04 "Calling conventions": "A distinguished
+            // input has no name and so cannot be passed by keyword"), refused by
+            // `ops::special_arity_check` before any axis scan runs. Where §04
+            // refers to such an input by a name, the name "identifies the input
+            // in prose only" — adjudicated 2026-09-03, merged as
+            // flatppl-design PR #109; see
+            // `flatppl-dev/adjudication-keyword-distinguished-inputs.md`. An
+            // earlier revision mapped `output_axes`/`expr` by keyword here, which
+            // made this the one place an illegal spelling was given a meaning.
         }
         // `A[.i, 1, .j]` and its `get(A, .i, 1, .j)` spelling: the indices are
         // index positions, the indexed object is not.

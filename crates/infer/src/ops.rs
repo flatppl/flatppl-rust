@@ -6390,39 +6390,64 @@ fn refuse_mixed_string_array(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> 
 /// so their arity lives here, read off §04's enumerated list rather than derived.
 ///
 /// §04's framing supplies the axis: "Special operations have zero to three
-/// distinguished, unnamed, ordered inputs of fixed arity. They may have additional
-/// variadic named or unnamed inputs."
+/// *distinguished inputs*: unnamed, ordered inputs of fixed arity. They may have
+/// additional variadic named or unnamed inputs."
 ///
-/// **These variants check the COUNT only, never the spelling** — with the one
-/// exception §04 states per-operation ([`SpecialArity::PositionalOnly`]). §04 also
-/// says "A distinguished input has no name and so cannot be passed by keyword",
-/// which would forbid the keyword spelling on every `Distinguished` row, but the
-/// spec is not consistent with itself on that point and this crate already carries
-/// both readings:
+/// **A distinguished input is POSITIONAL ONLY, and §04 now says so outright:**
 ///
-/// - [`ksuperpose_type`] refuses `ksuperpose(kernel = K, weights = w)` and cites
-///   that very sentence;
-/// - `crates/infer/tests/axis_position.rs::the_keyword_aggregate_spelling_is_accepted`
-///   accepts `aggregate(f_reduction = sum, output_axes = [.i], expr = …)`, "keyed
-///   on §04's parameter names" — §04's own `aggregate` section names all three
-///   (`f_reduction`, `output_axes`, `expr`) in a bullet list, in the same style
-///   §07 uses for an ordinary callable's parameters.
+/// > A distinguished input has no name and so cannot be passed by keyword. The
+/// > measure combinators likewise take their inputs positionally: a keyword
+/// > spelling such as `normalize(M = mu)` is a static error. Where this
+/// > specification refers to a distinguished input by a name, as in
+/// > `aggregate(f_reduction, output_axes, expr)`, the name identifies the input in
+/// > prose only. A call binds the input by position, never by keyword argument.
 ///
-/// Both readings have a §04 sentence behind them, so settling it is a spec
-/// question, not an engine one, and it is raised in
-/// `flatppl-dev/audit-fix-infer.md` rather than decided here. The count check
-/// closes the gap this change is for — nullary and over-supplied calls — and
-/// leaves every existing spelling exactly as it was.
+/// The last two sentences arrived with flatppl-design PR #109 (`c44993f`), which
+/// settled the question this code was written against. Before it, the rule had to
+/// be READ off §04's own `normalize(M)`: that entry names its input in exactly the
+/// same signature-plus-bullets shape and §04 declared its keyword spelling an
+/// error, so the shape could not be what confers keyword binding. The spec now
+/// states the conclusion directly.
+///
+/// **Adjudicated 2026-09-03** —
+/// `flatppl-dev/adjudication-keyword-distinguished-inputs.md`, user-ratified, and
+/// merged as PR #109. An
+/// earlier revision of this table checked counts only and left both spellings as
+/// it found them, because the crate carried two readings: `ksuperpose_type`
+/// refused the keyword form citing §04 while `aggregate` accepted it. That split
+/// was option C of the adjudication — "keyword allowed only where a later section
+/// names the input" — and it was REJECTED: it is two rules for one concept, and
+/// "names the input" is not a test a user can apply, since `ksuperpose(kernel,
+/// weights)` has names but no bullets and `normalize(M)` has a name and is
+/// forbidden by example. Option B, keyword everywhere, was rejected too: it needs
+/// a normative name for inputs that have none, and it collides with the
+/// user-chosen keyword namespace at `functionof`, `kernelof`, `broadcast` and
+/// `load_module`.
+///
+/// `load_data` is deliberately absent from this table and unaffected: the
+/// adjudication finds it mis-classified — it has no template, binding scope or
+/// variadic part — and reclassifies it as an ordinary builtin in its own spec PR.
 enum SpecialArity {
-    /// Exactly `n` distinguished inputs.
+    /// Exactly `n` distinguished inputs, positional only. `standard_module` is
+    /// no longer a separate variant: §04 "Standard modules" says of it outright
+    /// that it "only accepts positional arguments, not keyword arguments", which
+    /// is now what EVERY distinguished input does, so the carve-out folded in.
     Distinguished(usize),
-    /// Exactly `n` distinguished inputs, positional ONLY — for the one operation
-    /// §04 says so about outright: "`standard_module` only accepts positional
-    /// arguments, not keyword arguments" (§04 "Standard modules").
-    PositionalOnly(usize),
     /// `n` distinguished inputs plus optional variadic NAMED inputs
     /// (`load_module`'s substitutions).
     DistinguishedPlusNamed(usize),
+    /// `n` distinguished POSITIONAL inputs, then variadic inputs that may be
+    /// named or unnamed — `broadcast`'s shape. §04: "`broadcast`: One
+    /// distinguished input for the function to be broadcast, plus named or
+    /// unnamed inputs that match the inputs of that function."
+    ///
+    /// Distinct from [`SpecialArity::VariadicEither`], which has no distinguished
+    /// input and so admits an all-keyword call: `joint(a = M1, b = M2)` is a
+    /// spec-sanctioned spelling, while `broadcast(f = Poisson, rate = v)` is not.
+    /// That call typed `%deferred` at exit 0 before this variant existed —
+    /// `broadcast_type` reads the function from position 0, found nothing there,
+    /// and deferred, where the positional spelling typed a normalized `%measure`.
+    DistinguishedPlusEither(usize),
     /// Variadic unnamed inputs, at least `n`.
     VariadicPositional(usize),
     /// Variadic inputs that may be unnamed OR named, at least `n` in total.
@@ -6463,7 +6488,7 @@ fn special_arity(name: &str) -> Option<(SpecialArity, &'static str)> {
             "\"`broadcasted`: One distinguished input\"",
         ),
         "standard_module" => (
-            PositionalOnly(2),
+            Distinguished(2),
             "\"`standard_module`: Two distinguished inputs\", and §04 \"Standard \
              modules\": \"`standard_module` only accepts positional arguments, not \
              keyword arguments\"",
@@ -6495,7 +6520,7 @@ fn special_arity(name: &str) -> Option<(SpecialArity, &'static str)> {
              with significant order\"",
         ),
         "broadcast" => (
-            VariadicEither(2),
+            DistinguishedPlusEither(1),
             "\"`broadcast`: One distinguished input for the function to be broadcast, \
              plus named or unnamed inputs that match the inputs of that function\"",
         ),
@@ -6579,17 +6604,16 @@ fn special_arity_check(
     let total = pos + kw;
     match declared {
         SpecialArity::Distinguished(n) => {
-            if total != n {
-                return refuse(inf, format!("takes {n} input(s), got {total}"), cite);
-            }
-        }
-        SpecialArity::PositionalOnly(n) => {
+            // Spelling first: on a keyword call the COUNT may well be right, and
+            // reporting "takes 3 inputs, got 3" would be both true and useless.
             if kw > 0 {
                 return refuse(
                     inf,
                     format!(
-                        "takes {n} positional input(s) and no keyword arguments; got \
-                         {kw} keyword argument(s)"
+                        "takes {n} distinguished input(s), which cannot be passed by \
+                         keyword; got {kw} keyword argument(s). Where the spec names \
+                         such an input, the name identifies it in prose only — a call \
+                         binds it by position. Pass the arguments positionally"
                     ),
                     cite,
                 );
@@ -6617,6 +6641,29 @@ fn special_arity_check(
             }
             if pos < n {
                 return refuse(inf, format!("takes at least {n} input(s), got {pos}"), cite);
+            }
+        }
+        SpecialArity::DistinguishedPlusEither(n) => {
+            // The distinguished prefix must be positional; the variadic tail may
+            // be spelled either way, so only the prefix is checked here.
+            if pos < n {
+                return refuse(
+                    inf,
+                    format!(
+                        "takes {n} distinguished input(s) positionally, which cannot \
+                         be passed by keyword; got {pos} positional argument(s). Where \
+                         the spec names such an input, the name identifies it in prose \
+                         only — a call binds it by position"
+                    ),
+                    cite,
+                );
+            }
+            if total < n + 1 {
+                return refuse(
+                    inf,
+                    format!("takes at least {} input(s), got {total}", n + 1),
+                    cite,
+                );
             }
         }
         SpecialArity::VariadicEither(n) => {
