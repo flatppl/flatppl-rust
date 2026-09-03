@@ -148,9 +148,11 @@ pub fn run(
     // worker, a `$/cancelRequest`, a queue drain, a full queue), so the main
     // thread arbitrates: a response goes out only if its id is still here.
     let mut pending: HashSet<RequestId> = HashSet::new();
-    // Ids a client `$/cancelRequest` named. A job checks this before doing any
-    // work, so a cancelled request costs nothing; the main thread has already
-    // answered it `RequestCancelled`.
+    // Ids a client `$/cancelRequest` named. A job takes its own id out of this
+    // before doing any work, so a cancelled request costs nothing; the main
+    // thread has already answered it `RequestCancelled`. Each id is removed by
+    // whichever side reads it, so the set holds only cancels still waiting for
+    // their request — see `note_cancelled` for the bound on those.
     let cancelled: Arc<Mutex<HashSet<RequestId>>> = Arc::new(Mutex::new(HashSet::new()));
     const DEBOUNCE: Duration = Duration::from_millis(200);
     let mut diag_deadline: Option<Instant> = None;
@@ -464,9 +466,7 @@ pub fn run(
                         // Recorded first: a job still queued, or one a worker is
                         // about to start, reads this and abandons its query
                         // instead of computing a result nobody will receive.
-                        if let Ok(mut set) = cancelled.lock() {
-                            set.insert(id.clone());
-                        }
+                        note_cancelled(&cancelled, id.clone());
                         answer(
                             &connection,
                             &mut pending,
@@ -491,11 +491,7 @@ pub fn run(
                 // a replayed buffer) would otherwise leave the request with no
                 // response at all: the main thread had nothing to answer, and
                 // the job sees the id cancelled and returns silently.
-                if cancelled
-                    .lock()
-                    .map(|set| set.contains(&req.id))
-                    .unwrap_or(false)
-                {
+                if take_cancelled(&cancelled, &req.id) {
                     answer(
                         &connection,
                         &mut pending,
@@ -547,6 +543,35 @@ pub fn run(
 }
 
 // ── Response arbitration ─────────────────────────────────────────────────────
+
+/// Cancelled ids retained before the set is cleared.
+///
+/// An id leaves the set as soon as either side reads it, so it only accumulates
+/// for a cancel whose request never arrives — which a client should not send at
+/// all. Clearing past the cap costs nothing but a missed optimisation: a queued
+/// job then runs work whose response `answer` discards anyway, because the
+/// request is no longer `pending`.
+const MAX_CANCELLED_IDS: usize = 4096;
+
+/// Record `id` as cancelled, clearing the set if it has grown past
+/// [`MAX_CANCELLED_IDS`].
+fn note_cancelled(cancelled: &Arc<Mutex<HashSet<RequestId>>>, id: RequestId) {
+    if let Ok(mut set) = cancelled.lock() {
+        if set.len() >= MAX_CANCELLED_IDS {
+            set.clear();
+        }
+        set.insert(id);
+    }
+}
+
+/// Was `id` cancelled? Removes it, so each cancel is read once and the set does
+/// not grow with every cancel a long session sees.
+fn take_cancelled(cancelled: &Arc<Mutex<HashSet<RequestId>>>, id: &RequestId) -> bool {
+    cancelled
+        .lock()
+        .map(|mut set| set.remove(id))
+        .unwrap_or(false)
+}
 
 /// Send `msg`, dropping a duplicate response.
 ///
@@ -661,11 +686,7 @@ fn dispatch_request(
     let cancelled = Arc::clone(cancelled);
     let id = req.id.clone();
     pool.try_spawn(id.clone(), move || {
-        if cancelled
-            .lock()
-            .map(|set| set.contains(&id))
-            .unwrap_or(false)
-        {
+        if take_cancelled(&cancelled, &id) {
             return; // already answered `RequestCancelled` on the main thread
         }
         // `AssertUnwindSafe`: `&Database`/`&Request` are not auto-`UnwindSafe`,
