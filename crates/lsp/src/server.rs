@@ -9,10 +9,11 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::str::FromStr;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::select;
-use lsp_server::{Connection, Message, Response};
+use lsp_server::{Connection, ErrorCode, Message, RequestId, Response};
 use lsp_types::{
     CompletionOptions, HoverProviderCapability, OneOf, PublishDiagnosticsParams,
     ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind, Uri,
@@ -140,8 +141,17 @@ pub fn run(
         std::thread::available_parallelism()
             .map(|n| n.get().min(4))
             .unwrap_or(2),
-        result_tx.clone(),
+        crate::pool::QUEUE_CAPACITY,
     );
+    // Requests dispatched and not yet answered. JSON-RPC 2.0 §5 requires
+    // exactly one response per request, and four paths can produce one (the
+    // worker, a `$/cancelRequest`, a queue drain, a full queue), so the main
+    // thread arbitrates: a response goes out only if its id is still here.
+    let mut pending: HashSet<RequestId> = HashSet::new();
+    // Ids a client `$/cancelRequest` named. A job checks this before doing any
+    // work, so a cancelled request costs nothing; the main thread has already
+    // answered it `RequestCancelled`.
+    let cancelled: Arc<Mutex<HashSet<RequestId>>> = Arc::new(Mutex::new(HashSet::new()));
     const DEBOUNCE: Duration = Duration::from_millis(200);
     let mut diag_deadline: Option<Instant> = None;
     // URIs whose diagnostics need (re)publishing once the burst settles.
@@ -159,7 +169,7 @@ pub fn run(
             Some(t) => select! {
                 recv(connection.receiver) -> m => Some(m),
                 recv(result_rx) -> r => {
-                    if let Ok(msg) = r { connection.sender.send(msg)?; }
+                    if let Ok(msg) = r { answer(&connection, &mut pending, msg)?; }
                     None
                 }
                 default(t) => {
@@ -174,7 +184,7 @@ pub fn run(
             None => select! {
                 recv(connection.receiver) -> m => Some(m),
                 recv(result_rx) -> r => {
-                    if let Ok(msg) = r { connection.sender.send(msg)?; }
+                    if let Ok(msg) = r { answer(&connection, &mut pending, msg)?; }
                     None
                 }
             },
@@ -200,6 +210,7 @@ pub fn run(
                             };
                         let uri_str = p.text_document.uri.as_str().to_owned();
                         let text = p.text_document.text;
+                        release_stale_requests(&connection, &pool, &mut pending)?;
                         // Mark as editor-managed so watched-file CHANGED events
                         // skip it (editor content takes precedence over on-disk).
                         editor_open_uris.insert(uri_str.clone());
@@ -241,6 +252,7 @@ pub fn run(
                             }
                         }
                         doc_versions.insert(uri_str.clone(), new_version);
+                        release_stale_requests(&connection, &pool, &mut pending)?;
                         // Full sync — take last content change.
                         if let Some(change) = p.content_changes.into_iter().last() {
                             upsert_file(&mut db, &mut uri_to_file, uri_str.clone(), change.text);
@@ -299,6 +311,7 @@ pub fn run(
                                 continue;
                             }
                         };
+                        release_stale_requests(&connection, &pool, &mut pending)?;
                         for change in p.changes {
                             let uri_str = change.uri.as_str().to_owned();
                             // Only .flatppl files; skip anything else.
@@ -360,6 +373,9 @@ pub fn run(
                             .cloned()
                             .unwrap_or_default();
                         let mut changed = false;
+                        if !entries.is_empty() {
+                            release_stale_requests(&connection, &pool, &mut pending)?;
+                        }
                         for entry in &entries {
                             let (Some(url), Some(text)) = (
                                 entry.get("uri").and_then(|v| v.as_str()),
@@ -389,19 +405,96 @@ pub fn run(
                             diag_deadline = Some(Instant::now() + DEBOUNCE);
                         }
                     }
+                    "$/cancelRequest" => {
+                        // LSP 3.17 `$/cancelRequest`: the client asks the server
+                        // to stop working on a request. The server still owes
+                        // that request a response, and the protocol reserves
+                        // `RequestCancelled` (-32800) for exactly this.
+                        let Ok(p) = serde_json::from_value::<lsp_types::CancelParams>(note.params)
+                        else {
+                            continue;
+                        };
+                        let id = match p.id {
+                            lsp_types::NumberOrString::Number(n) => RequestId::from(n),
+                            lsp_types::NumberOrString::String(s) => RequestId::from(s),
+                        };
+                        // Recorded first: a job still queued, or one a worker is
+                        // about to start, reads this and abandons its query
+                        // instead of computing a result nobody will receive.
+                        if let Ok(mut set) = cancelled.lock() {
+                            set.insert(id.clone());
+                        }
+                        answer(
+                            &connection,
+                            &mut pending,
+                            Message::Response(Response::new_err(
+                                id,
+                                ErrorCode::RequestCanceled as i32,
+                                "request cancelled by the client".to_owned(),
+                            )),
+                        )?;
+                    }
                     _ => {} // ignore other notifications
                 }
             }
             Message::Request(req) => {
-                // Handle shutdown first.
+                // Handle shutdown first. `handle_shutdown` answers it itself, so
+                // it never enters `pending`.
                 if connection.handle_shutdown(&req)? {
                     break;
+                }
+                pending.insert(req.id.clone());
+                // A cancel that arrived BEFORE its request (message reordering,
+                // a replayed buffer) would otherwise leave the request with no
+                // response at all: the main thread had nothing to answer, and
+                // the job sees the id cancelled and returns silently.
+                if cancelled
+                    .lock()
+                    .map(|set| set.contains(&req.id))
+                    .unwrap_or(false)
+                {
+                    answer(
+                        &connection,
+                        &mut pending,
+                        Message::Response(Response::new_err(
+                            req.id,
+                            ErrorCode::RequestCanceled as i32,
+                            "request cancelled by the client".to_owned(),
+                        )),
+                    )?;
+                    continue;
                 }
                 // Dispatch the request to a worker thread on the pool. The
                 // worker snapshots a salsa handle on the main thread (so a later
                 // edit's `cancel_others` waits for it) and replies on
-                // `result_tx`; cancelled jobs drop silently.
-                dispatch_request(&pool, &result_tx, &db, &uri_to_file, fs, cats, req);
+                // `result_tx`.
+                if let Err(id) = dispatch_request(
+                    &pool,
+                    &result_tx,
+                    &db,
+                    &uri_to_file,
+                    fs,
+                    cats,
+                    &cancelled,
+                    req,
+                ) {
+                    // The queue is full. Answer now rather than block the main
+                    // loop, which must stay free to take the next edit and the
+                    // `$/cancelRequest` that would drain the backlog.
+                    answer(
+                        &connection,
+                        &mut pending,
+                        Message::Response(Response::new_err(
+                            id,
+                            ErrorCode::RequestFailed as i32,
+                            format!(
+                                "server request queue is full ({} outstanding); \
+                                 cancel or retry",
+                                crate::pool::QUEUE_CAPACITY
+                            ),
+                        )),
+                    )?;
+                }
             }
             Message::Response(_) => {} // ignore server-originated response echoes
         }
@@ -410,22 +503,105 @@ pub fn run(
     Ok(())
 }
 
+// ── Response arbitration ─────────────────────────────────────────────────────
+
+/// Send `msg`, dropping a duplicate response.
+///
+/// JSON-RPC 2.0 §5 requires exactly one response per request, and several paths
+/// can produce one for the same id: the worker that ran it, a
+/// `$/cancelRequest`, a queue drain, a full queue. `pending` is the arbiter —
+/// the first path to claim the id wins and the rest are dropped. Notifications
+/// pass through untouched.
+fn answer(
+    connection: &Connection,
+    pending: &mut HashSet<RequestId>,
+    msg: Message,
+) -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
+    if let Message::Response(resp) = &msg {
+        if !pending.remove(&resp.id) {
+            return Ok(()); // already answered by another path
+        }
+    }
+    connection.sender.send(msg)?;
+    Ok(())
+}
+
+/// Drain every queued request job and answer each one `ContentModified`.
+///
+/// Called immediately before an input write. Each queued job holds a
+/// `Database` clone taken before enqueue, and salsa's `cancel_others` blocks
+/// until every outstanding clone drops — so executing a client's backlog is
+/// what delays the edit. Dropping the jobs releases those clones at once.
+///
+/// LSP 3.17 reserves `ContentModified` (-32801) for a result a content change
+/// invalidated. The spec's caveat — do not send it merely because a change sits
+/// *unprocessed* — does not apply here: the change is being applied on this
+/// very iteration, so the revision these jobs were snapshotted against is
+/// gone. Jobs a worker already picked up are untouched; they finish, or unwind
+/// with `salsa::Cancelled`, which answers the same code.
+fn release_stale_requests(
+    connection: &Connection,
+    pool: &crate::pool::Pool,
+    pending: &mut HashSet<RequestId>,
+) -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
+    for id in pool.drain_queued() {
+        answer(
+            connection,
+            pending,
+            Message::Response(Response::new_err(
+                id,
+                ErrorCode::ContentModified as i32,
+                "the document changed before this request ran; re-request against \
+                 the new version"
+                    .to_owned(),
+            )),
+        )?;
+    }
+    Ok(())
+}
+
+/// The `InvalidParams` (-32602) answer for a request whose params did not
+/// deserialize.
+///
+/// JSON-RPC 2.0 §5.1 defines -32602 as "Invalid method parameter(s)" and LSP
+/// 3.17 inherits it. Eight handlers used to fold this failure into the same
+/// `Option` that means "nothing to report at this position" and answered an
+/// empty success, so a client bug or a protocol mismatch looked like a file
+/// with no symbols, no hints and no definition.
+fn invalid_params(req: &lsp_server::Request, what: &str, error: serde_json::Error) -> Response {
+    Response::new_err(
+        req.id.clone(),
+        ErrorCode::InvalidParams as i32,
+        format!("malformed {what} params: {error}"),
+    )
+}
+
 // ── Off-main-thread request dispatch ─────────────────────────────────────────
 
 /// Snapshot the salsa database + file map on the **main thread** and hand a
-/// request job to the worker pool.
+/// request job to the worker pool. `Err(id)` when the queue is full — the
+/// caller owes that request a response.
 ///
 /// The `Database::clone` MUST happen here, on the main thread, before the job
 /// is enqueued: salsa's `Storage::clone` bumps the live-clone count, and a later
 /// input write (`set_text` on an edit) calls `cancel_others`, which sets the
 /// cancellation flag and blocks until every outstanding clone drops. Cloning on
-/// the worker would race that wait. The clone drops when the job returns,
-/// releasing the handle so a pending write can proceed.
+/// the worker would race that wait — a worker cloning as fast as another drops
+/// could hold the count above one indefinitely and livelock the write. Taking
+/// the clone here closes the set of clones at write time, so the wait is
+/// finite; the queue bound is what keeps it short.
 ///
 /// On the worker the query body runs under `salsa::Cancelled::catch`: if a
 /// concurrent write cancels this revision the body unwinds with
-/// `salsa::Cancelled` and we reply nothing (the client re-requests against the
-/// new state; a stale reply computed against pre-edit text would be wrong).
+/// `salsa::Cancelled` and we answer `ContentModified` (-32801). A stale reply
+/// computed against pre-edit text would be wrong, but silence is not the
+/// alternative the protocol allows — JSON-RPC requires a response, and LSP 3.17
+/// defines that code for this case.
+///
+/// A request the client cancelled while it sat in the queue is not run at all:
+/// the main thread has already answered it `RequestCancelled` (-32800), so the
+/// job returns without touching a query.
+#[allow(clippy::too_many_arguments)] // one message-loop seam, not a public API
 fn dispatch_request(
     pool: &crate::pool::Pool,
     result_tx: &crossbeam_channel::Sender<Message>,
@@ -433,27 +609,41 @@ fn dispatch_request(
     uri_to_file: &HashMap<String, SourceFile>,
     fs: FileSet,
     cats: Catalogues,
+    cancelled: &Arc<Mutex<HashSet<RequestId>>>,
     req: lsp_server::Request,
-) {
+) -> Result<(), RequestId> {
     let db: Database = db.clone();
     let files: HashMap<String, SourceFile> = uri_to_file.clone();
     let result_tx = result_tx.clone();
-    pool.spawn(move || {
+    let cancelled = Arc::clone(cancelled);
+    let id = req.id.clone();
+    pool.try_spawn(id.clone(), move || {
+        if cancelled
+            .lock()
+            .map(|set| set.contains(&id))
+            .unwrap_or(false)
+        {
+            return; // already answered `RequestCancelled` on the main thread
+        }
         // `AssertUnwindSafe`: `&Database`/`&Request` are not auto-`UnwindSafe`,
-        // but this is sound — on cancel we discard all captured state and reply
-        // nothing, so no observer sees a half-updated value.
+        // but this is sound — on cancel we discard all captured state and answer
+        // an error, so no observer sees a half-updated value.
         let outcome = salsa::Cancelled::catch(std::panic::AssertUnwindSafe(|| {
             handle_request_on_worker(&db, &files, fs, cats, &req)
         }));
-        match outcome {
-            Ok(resp) => {
-                let _ = result_tx.send(Message::Response(resp));
-            }
-            // Cancelled by a newer revision: drop silently, send no response.
-            Err(_cancelled) => {}
-        }
+        let resp = match outcome {
+            Ok(resp) => resp,
+            Err(_cancelled) => Response::new_err(
+                id,
+                ErrorCode::ContentModified as i32,
+                "the document changed while this request was running; re-request \
+                 against the new version"
+                    .to_owned(),
+            ),
+        };
+        let _ = result_tx.send(Message::Response(resp));
         // `db` (the clone) drops here, releasing the salsa handle.
-    });
+    })
 }
 
 /// Run a single LSP request to a `Response` on a worker thread.
@@ -850,8 +1040,11 @@ fn handle_hover(
     cats: Catalogues,
     req: &lsp_server::Request,
 ) -> Response {
+    let params: lsp_types::HoverParams = match serde_json::from_value(req.params.clone()) {
+        Ok(p) => p,
+        Err(e) => return invalid_params(req, "hover", e),
+    };
     let result = (|| -> Option<lsp_types::Hover> {
-        let params: lsp_types::HoverParams = serde_json::from_value(req.params.clone()).ok()?;
         let uri_str = params
             .text_document_position_params
             .text_document
@@ -889,9 +1082,11 @@ fn handle_document_symbols(
     uri_to_file: &HashMap<String, SourceFile>,
     req: &lsp_server::Request,
 ) -> Response {
+    let params: lsp_types::DocumentSymbolParams = match serde_json::from_value(req.params.clone()) {
+        Ok(p) => p,
+        Err(e) => return invalid_params(req, "documentSymbol", e),
+    };
     let syms: Vec<lsp_types::DocumentSymbol> = (|| {
-        let params: lsp_types::DocumentSymbolParams =
-            serde_json::from_value(req.params.clone()).ok()?;
         let uri_str = params.text_document.uri.as_str().to_owned();
         let file = *uri_to_file.get(&uri_str)?;
         Some(crate::capabilities::document_symbols(db, file))
@@ -905,14 +1100,12 @@ fn handle_document_symbols(
 /// Handle a `workspace/symbol` request.  Returns a `Response` (result or
 /// null) without sending it — the caller dispatches the message.
 fn handle_workspace_symbols(db: &Database, fs: FileSet, req: &lsp_server::Request) -> Response {
-    let query = (|| -> Option<String> {
-        let params: lsp_types::WorkspaceSymbolParams =
-            serde_json::from_value(req.params.clone()).ok()?;
-        Some(params.query)
-    })()
-    .unwrap_or_default();
-
-    let syms = crate::capabilities::workspace_symbols(db, fs, &query);
+    let params: lsp_types::WorkspaceSymbolParams = match serde_json::from_value(req.params.clone())
+    {
+        Ok(p) => p,
+        Err(e) => return invalid_params(req, "workspace/symbol", e),
+    };
+    let syms = crate::capabilities::workspace_symbols(db, fs, &params.query);
     let response = lsp_types::WorkspaceSymbolResponse::Flat(syms);
     Response::new_ok(req.id.clone(), response)
 }
@@ -926,8 +1119,11 @@ fn handle_inlay_hints(
     cats: Catalogues,
     req: &lsp_server::Request,
 ) -> Response {
+    let params: lsp_types::InlayHintParams = match serde_json::from_value(req.params.clone()) {
+        Ok(p) => p,
+        Err(e) => return invalid_params(req, "inlayHint", e),
+    };
     let hints: Vec<lsp_types::InlayHint> = (|| {
-        let params: lsp_types::InlayHintParams = serde_json::from_value(req.params.clone()).ok()?;
         let uri_str = params.text_document.uri.as_str().to_owned();
         let file = *uri_to_file.get(&uri_str)?;
         let li = line_index(db, file);
@@ -957,9 +1153,11 @@ fn handle_goto_definition(
     cats: Catalogues,
     req: &lsp_server::Request,
 ) -> Response {
+    let params: lsp_types::GotoDefinitionParams = match serde_json::from_value(req.params.clone()) {
+        Ok(p) => p,
+        Err(e) => return invalid_params(req, "definition", e),
+    };
     let result = (|| -> Option<lsp_types::GotoDefinitionResponse> {
-        let params: lsp_types::GotoDefinitionParams =
-            serde_json::from_value(req.params.clone()).ok()?;
         let uri_str = params
             .text_document_position_params
             .text_document
@@ -1022,9 +1220,11 @@ fn handle_completion(
     cats: Catalogues,
     req: &lsp_server::Request,
 ) -> Response {
+    let params: lsp_types::CompletionParams = match serde_json::from_value(req.params.clone()) {
+        Ok(p) => p,
+        Err(e) => return invalid_params(req, "completion", e),
+    };
     let result = (|| -> Option<lsp_types::CompletionResponse> {
-        let params: lsp_types::CompletionParams =
-            serde_json::from_value(req.params.clone()).ok()?;
         let uri_str = params
             .text_document_position
             .text_document
@@ -1110,8 +1310,11 @@ fn handle_references(
     cats: Catalogues,
     req: &lsp_server::Request,
 ) -> Response {
+    let params: lsp_types::ReferenceParams = match serde_json::from_value(req.params.clone()) {
+        Ok(p) => p,
+        Err(e) => return invalid_params(req, "references", e),
+    };
     let locations: Vec<lsp_types::Location> = (|| {
-        let params: lsp_types::ReferenceParams = serde_json::from_value(req.params.clone()).ok()?;
         let (file, byte) = position_target(db, uri_to_file, &params.text_document_position)?;
         let index = node_span_index(db, file, fs, cats);
         let locs = crate::rename::references(
@@ -1151,9 +1354,12 @@ fn handle_prepare_rename(
     cats: Catalogues,
     req: &lsp_server::Request,
 ) -> Response {
+    let params: lsp_types::TextDocumentPositionParams =
+        match serde_json::from_value(req.params.clone()) {
+            Ok(p) => p,
+            Err(e) => return invalid_params(req, "prepareRename", e),
+        };
     let result = (|| -> Option<lsp_types::Range> {
-        let params: lsp_types::TextDocumentPositionParams =
-            serde_json::from_value(req.params.clone()).ok()?;
         let (file, byte) = position_target(db, uri_to_file, &params)?;
         let index = node_span_index(db, file, fs, cats);
         let (start, end) = crate::rename::prepare_rename(db, file, fs, cats, byte, &index).ok()?;
@@ -1180,13 +1386,7 @@ fn handle_rename(
 ) -> Response {
     let params: lsp_types::RenameParams = match serde_json::from_value(req.params.clone()) {
         Ok(p) => p,
-        Err(e) => {
-            return Response::new_err(
-                req.id.clone(),
-                lsp_server::ErrorCode::InvalidParams as i32,
-                format!("malformed rename params: {e}"),
-            );
-        }
+        Err(e) => return invalid_params(req, "rename", e),
     };
     let Some((file, byte)) = position_target(db, uri_to_file, &params.text_document_position)
     else {
@@ -1248,9 +1448,11 @@ fn handle_signature_help(
     cats: Catalogues,
     req: &lsp_server::Request,
 ) -> Response {
+    let params: lsp_types::SignatureHelpParams = match serde_json::from_value(req.params.clone()) {
+        Ok(p) => p,
+        Err(e) => return invalid_params(req, "signatureHelp", e),
+    };
     let result = (|| -> Option<lsp_types::SignatureHelp> {
-        let params: lsp_types::SignatureHelpParams =
-            serde_json::from_value(req.params.clone()).ok()?;
         let (file, byte) = position_target(db, uri_to_file, &params.text_document_position_params)?;
         crate::signature::signature_help(db, file, fs, cats, byte)
     })();

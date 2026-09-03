@@ -869,14 +869,14 @@ fn did_change_burst_coalesces_into_one_publish() {
 }
 
 /// A hover issued just before an invalidating edit must never return a result
-/// computed against the PRE-edit text. The server snapshots a salsa handle on
-/// the main thread and runs the query on a worker; a concurrent edit cancels
-/// the in-flight query (salsa `Cancelled`), so the hover either (a) returns a
-/// result consistent with the POST-edit state, or (b) is dropped (no response).
-/// It must never carry stale pre-edit content.
+/// computed against the PRE-edit text, and must never go unanswered.
 ///
-/// This drives the request + an immediate `didChange` and asserts the response,
-/// if any, is consistent with the post-edit document.
+/// The server snapshots a salsa handle on the main thread and runs the query on
+/// a worker; a concurrent edit cancels the in-flight query (salsa `Cancelled`).
+/// Two answers are correct: a hover consistent with the POST-edit state, or
+/// `ContentModified` (-32801) — LSP 3.17's code for a result a content change
+/// invalidated. Silence is not one of them: JSON-RPC 2.0 §5 requires a response
+/// to every request, and this test used to accept the drop.
 #[test]
 fn request_during_edit_does_not_return_stale_result() {
     const URI: &str = "file:///tmp/cancel_test.flatppl";
@@ -957,9 +957,7 @@ fn request_during_edit_does_not_return_stale_result() {
         )))
         .unwrap();
 
-    // Collect any hover response that arrives within a window. The hover may be
-    // cancelled (no response) or return a post-edit-consistent result. Either is
-    // acceptable; a stale pre-edit result is NOT.
+    // Collect the hover response. It MUST arrive.
     let mut hover_resp: Option<lsp_server::Response> = None;
     let deadline = std::time::Instant::now() + Duration::from_millis(800);
     while std::time::Instant::now() < deadline {
@@ -976,20 +974,31 @@ fn request_during_edit_does_not_return_stale_result() {
         }
     }
 
-    // Whatever came back must not be an error, and (if non-null) must be a
-    // well-formed hover. The key guarantee — verified by construction — is that
-    // a cancelled stale query sends NO response, so we never observe a result
-    // computed against the pre-edit text for the post-edit revision.
-    if let Some(resp) = hover_resp {
-        assert!(
-            resp.error.is_none(),
-            "hover response must not be an error; got: {:?}",
-            resp.error
-        );
-        if let Some(result) = resp.result {
+    let resp = hover_resp.expect(
+        "every request needs a response (JSON-RPC 2.0 §5); a cancelled revision \
+         gets ContentModified, never silence",
+    );
+    match resp.error {
+        // Cancelled by the edit: the protocol's own code for it.
+        Some(e) => assert_eq!(
+            e.code,
+            lsp_server::ErrorCode::ContentModified as i32,
+            "the only acceptable error here is ContentModified (-32801); got: {e:?}"
+        ),
+        // Answered: the result must be a well-formed hover over the post-edit
+        // document, never stale pre-edit content.
+        None => {
+            let result = resp.result.expect("a non-error response carries a result");
             if !result.is_null() {
-                let _hover: lsp_types::Hover = serde_json::from_value(result)
+                let hover: lsp_types::Hover = serde_json::from_value(result)
                     .expect("non-null hover result must deserialize to lsp_types::Hover");
+                let HoverContents::Markup(MarkupContent { value, .. }) = hover.contents else {
+                    panic!("hover must be markup");
+                };
+                assert!(
+                    !value.is_empty(),
+                    "an answered hover must carry content; got an empty body"
+                );
             }
         }
     }
