@@ -134,7 +134,10 @@ fn emit_pyhf(b: &mut Builder, doc: &PyhfDocument) -> Result<()> {
 
     // Per channel: declare free params, build expected, obs model, and accumulate
     // observation + constraint likelihood terms.
-    let mut terms = Terms::default();
+    let mut terms = Terms {
+        staterror_gaussian_default: true,
+        ..Terms::default()
+    };
     for channel in &doc.channels {
         emit_channel(b, doc, channel, &mut terms)?;
     }
@@ -291,6 +294,13 @@ pub struct Terms {
     /// paramset), so it must be declared once. `validate_workspace` has already
     /// established that every occurrence of a shared name agrees on the domain.
     declared_params: HashSet<String>,
+    /// The staterror constraint form to use when the modifier does not name one.
+    ///
+    /// pyhf's staterror paramset is always `constrained_by_normal` and its
+    /// workspace schema forbids a `constraint` field on the modifier, so a pyhf
+    /// staterror is always Gaussian. Native HS3 carries an explicit
+    /// `constraint`/`constraint_type`, and ROOT's default there is Poisson.
+    pub staterror_gaussian_default: bool,
 }
 
 /// Bind the flat top-level `likelihood` = `joint_likelihood(observation terms…,
@@ -324,6 +334,43 @@ pub fn bind_likelihood(b: &mut Builder, terms: &Terms) {
 /// a kernel, as `likelihoodof` requires, spec §06), `<channel>_likelihood` (the
 /// observation term), plus the auxiliary constraint terms (lumi, staterror,
 /// per-sample shapesys/normsys/histosys).
+/// Combine one sample's histosys interpolations into its shifted nominal.
+///
+/// `shifted` pairs each histosys parameter name with the interpolation of the
+/// sample's original nominal for that modifier alone. No modifier: the nominal.
+/// One: the interpolation, which already is `nominal + shift`. Two or more:
+/// `nominal + sum_m (interp_m - nominal)`, each shift bound to a name so the
+/// emitted model stays readable.
+fn histosys_total(
+    b: &mut Builder,
+    channel_name: &str,
+    sname: &str,
+    nom_name: &str,
+    shifted: &[(String, NodeId)],
+) -> NodeId {
+    match shifted.len() {
+        0 => b.self_ref(nom_name),
+        1 => shifted[0].1,
+        _ => {
+            let mut acc = b.self_ref(nom_name);
+            for (param, interp) in shifted {
+                let base = b.self_ref(nom_name);
+                let sub = b.call_head("sub");
+                let delta = b.call("broadcast", &[sub, *interp, base]);
+                let shift_name = b.bind_unique_doc(
+                    &format!("{channel_name}_{sname}_{param}_shift"),
+                    delta,
+                    "Additive histosys shift relative to the sample nominal.",
+                );
+                let shift_ref = b.self_ref(&shift_name);
+                let add = b.call_head("add");
+                acc = b.call("broadcast", &[add, acc, shift_ref]);
+            }
+            acc
+        }
+    }
+}
+
 pub fn assemble_channel(
     b: &mut Builder,
     channel_name: &str,
@@ -460,20 +507,28 @@ pub fn assemble_channel(
             nom_arr,
             &format!("Nominal yields for sample \"{sname}\"."),
         );
-        let mut nom = b.self_ref(&nom_name);
-
-        // First: nominal-replacing modifiers (histosys).
+        // First: nominal-replacing modifiers (histosys). Each one interpolates
+        // around the sample's ORIGINAL nominal, and the shifts ADD. Interpolating
+        // the second modifier around the first one's output would use the wrong
+        // nominal and, at a knot, discard the first shift entirely (pyhf sums the
+        // per-modifier additive deltas onto the nominal, then applies the
+        // multiplicative factors; ROOT's PiecewiseInterpolation sums them too).
+        let mut shifted: Vec<(String, NodeId)> = Vec::new();
         for modifier in *modifiers {
             if mod_spec(&modifier.kind).is_some_and(|spec| spec.replaces_nominal) {
-                let (effect, constraint) = modifier_effect(b, modifier, nom, n_bins)?;
+                let base = b.self_ref(&nom_name);
+                let (effect, constraint) = modifier_effect(b, modifier, base, n_bins)?;
+                let param = constraint.as_ref().map(|(p, _)| p.clone());
                 if let Effect::ReplaceNominal(new_nom) = effect {
-                    nom = new_nom;
+                    shifted.push((param.unwrap_or_default(), new_nom));
                 }
                 if let Some((param, pc)) = constraint {
-                    pending.push((param, pc, nom));
+                    let base = b.self_ref(&nom_name);
+                    pending.push((param, pc, base));
                 }
             }
         }
+        let nom = histosys_total(b, channel_name, sname, &nom_name, &shifted);
 
         // Then: multiplicative modifiers (`acc = broadcast(mul, acc, factor)`).
         let mut acc = nom;
@@ -486,9 +541,13 @@ pub fn assemble_channel(
                 let mul = b.call_head("mul");
                 acc = b.call("broadcast", &[mul, acc, factor]);
             }
-            // shapesys uses the sample's nominal for its tau; other constraints ignore it.
+            // shapesys reads the sample's UNSHIFTED nominal for its tau (pyhf
+            // takes `nom_data` from the sample's own `data`); other constraints
+            // ignore it. Passing the post-histosys nominal would make the
+            // constraint's observed aux data depend on the histosys alphas.
             if let Some((param, pc)) = constraint {
-                pending.push((param, pc, nom));
+                let base = b.self_ref(&nom_name);
+                pending.push((param, pc, base));
             }
         }
 
@@ -555,13 +614,17 @@ pub fn assemble_channel(
     // ---- staterror constraints (channel-summed Barlow-Beeston, one per param) ----
     for (param_name, (sum_nom, sum_sq)) in &staterror_acc {
         if terms.emitted_params.insert(param_name.clone()) {
-            // ROOT default is Poisson; `constraint: "Gauss"`/`"Gaussian"` selects Normal.
-            let gaussian = matches!(
-                staterror_constraint
-                    .get(param_name)
-                    .and_then(|c| c.as_deref()),
-                Some("Gauss") | Some("Gaussian")
-            );
+            // `constraint: "Gauss"`/`"Gaussian"` selects Normal, `"Poisson"`
+            // selects Poisson; with no field the dialect decides (see
+            // `Terms::staterror_gaussian_default`).
+            let gaussian = match staterror_constraint
+                .get(param_name)
+                .and_then(|c| c.as_deref())
+            {
+                Some("Gauss") | Some("Gaussian") => true,
+                Some(_) => false,
+                None => terms.staterror_gaussian_default,
+            };
             let term = emit_staterror_constraint(b, param_name, sum_nom, sum_sq, gaussian);
             terms.constraints.push(term);
         }

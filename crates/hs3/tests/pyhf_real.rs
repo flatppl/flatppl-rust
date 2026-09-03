@@ -70,13 +70,23 @@ fn multichan_old_converts() {
     // point-free: no lambda/fn
     assert!(!text.contains("fn("), "must be point-free, got:\n{text}");
 
-    // staterror aux: ROOT-default Poisson (Barlow–Beeston) constraint on the
-    // per-bin staterror scales, emitted as a ContinuedPoisson on
-    // staterror_channel1. Numerical conformance vs ROOT/pyhf lives in the
-    // flatppl-js cross-engine suite.
+    // staterror aux: a pyhf staterror paramset is always
+    // `constrained_by_normal`, and pyhf's workspace schema forbids a
+    // `constraint` field on the modifier, so a pyhf staterror is always
+    // Gaussian. sigma is the per-bin relative error against the summed nominal:
+    // sqrt(5^2 + 0^2)/100 = 0.05 and sqrt(0^2 + 10^2)/100 = 0.1, which is what
+    // pyhf reports for this workspace's `staterror_channel1` paramset.
     assert!(
-        text.contains("hepphys.ContinuedPoisson") && text.contains("staterror_channel1"),
-        "expected a ContinuedPoisson staterror constraint on staterror_channel1, got:\n{text}"
+        text.contains("staterror_channel1_delta = [0.05, 0.1]")
+            && text.contains(
+                "staterror_channel1_constraint = \
+                 functionof(broadcast(Normal, staterror_channel1, staterror_channel1_delta))"
+            ),
+        "expected a Gaussian staterror constraint with sigma [0.05, 0.1], got:\n{text}"
+    );
+    assert!(
+        !text.contains("ContinuedPoisson"),
+        "a pyhf staterror must not take the ROOT Poisson form, got:\n{text}"
     );
 
     // `call(hepphys...)` must never appear — that used a non-existent builtin
