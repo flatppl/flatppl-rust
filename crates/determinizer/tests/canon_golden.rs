@@ -375,3 +375,48 @@ fn const_fold_does_not_resurrect_a_signed_atom_from_a_source_neg_literal() {
         "determinize output is a canonicalization fixpoint"
     );
 }
+
+// A binding the `inputs` ABI promotes to a function argument keeps its
+// references. §13's phase table maps the row *fixed / derived (e.g.
+// `rnginit(seed)`) / listed in `inputs`* to "function argument, replacing the
+// computed value", so `inputs = c` for `c = 2.0 * 3.0` declares a one-argument
+// function. `resolve_alias_refs` used to inline the folded `6.0` into every
+// consumer, which erased the argument: the emitter then saw `inputs = 6.0`,
+// dropped the element, and baked the value at exit 0 (NEW-C1, the corrected
+// root cause of RUST-STABLEHLO-001).
+#[test]
+fn a_promoted_input_is_not_inlined_into_its_consumers() {
+    let src = "\
+c = 2.0 * 3.0
+m = lawof(record(a = draw(Normal(mu = c, sigma = 1.0))))
+q = logdensityof(m, record(a = 0.5))
+inputs = c
+outputs = q";
+    let pir = flatppl_flatpir::write(&determinize_src(src));
+    assert!(
+        pir.contains("(%ref self c)"),
+        "the density must read the promoted binding, not its value:\n{pir}"
+    );
+    assert!(
+        pir.contains("(%bind inputs (%ref self c))"),
+        "the `inputs` declaration itself must survive as a reference:\n{pir}"
+    );
+}
+
+// The same exemption is scoped to `inputs`: a trivial binding NOT promoted is
+// still inlined, so the exemption does not disable alias resolution generally.
+#[test]
+fn an_unpromoted_trivial_binding_is_still_inlined() {
+    let src = "\
+p = elementof(reals)
+c = 2.0 * 3.0
+m = lawof(record(a = draw(Normal(mu = c, sigma = 1.0))))
+q = logdensityof(m, record(a = p))
+inputs = p
+outputs = q";
+    let pir = flatppl_flatpir::write(&determinize_src(src));
+    assert!(
+        !pir.contains("(%ref self c)"),
+        "an unpromoted literal binding is still inlined:\n{pir}"
+    );
+}

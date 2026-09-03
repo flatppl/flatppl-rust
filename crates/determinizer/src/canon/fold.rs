@@ -29,6 +29,9 @@ pub(crate) fn const_fold(m: &mut Module) -> bool {
     let pairs: Vec<(flatppl_core::BindingId, NodeId)> =
         m.bindings().map(|(bid, b)| (bid, b.rhs)).collect();
     for (bid, root) in pairs {
+        if super::is_reserved_abi_binding(m, bid) {
+            continue;
+        }
         let new = map_tree(m, root, &mut |_m, id| replacements.get(&id).copied());
         if new != root {
             m.set_binding_rhs(bid, new);
@@ -229,12 +232,16 @@ fn is_canonical_neg_literal(m: &Module, rhs: NodeId) -> bool {
 /// Non-trivial bindings are left (inlining them would duplicate shared
 /// subterms; leave that to CSE / the rewriter).
 pub(crate) fn resolve_alias_refs(m: &mut Module) -> bool {
+    // A binding the `inputs` ABI promotes to a function argument keeps its
+    // references: substituting its value would bake the argument away (§13's
+    // phase table replaces the computed value with the argument).
+    let promoted = super::promoted_input_names(m);
     // Map: binding-name Symbol -> trivial replacement NodeId.
     let mut trivial: HashMap<flatppl_core::Symbol, NodeId> = HashMap::new();
     for (_, b) in m.bindings() {
         let is_trivial = matches!(m.node(b.rhs), Node::Lit(_) | Node::Const(_) | Node::Ref(_))
             || is_canonical_neg_literal(m, b.rhs);
-        if is_trivial {
+        if is_trivial && !promoted.contains(&b.name) {
             trivial.insert(b.name, b.rhs);
         }
     }
@@ -245,6 +252,9 @@ pub(crate) fn resolve_alias_refs(m: &mut Module) -> bool {
     let pairs: Vec<(flatppl_core::BindingId, NodeId, flatppl_core::Symbol)> =
         m.bindings().map(|(bid, b)| (bid, b.rhs, b.name)).collect();
     for (bid, root, self_name) in pairs {
+        if super::is_reserved_abi_binding(m, bid) {
+            continue;
+        }
         let new = map_tree(m, root, &mut |m, id| {
             if let Node::Ref(Ref {
                 ns: RefNs::SelfMod,
