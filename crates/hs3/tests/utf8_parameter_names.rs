@@ -48,11 +48,15 @@ fn a_non_ascii_per_bin_parameters_array_reaches_a_verdict() {
             );
         }
         Err(e) => {
+            // A refusal is fine and is the current behaviour: `é` is not a
+            // FlatPPL identifier character, so the emitted name is rejected.
+            // The message is NOT asserted — whether and how a non-ASCII emitted
+            // name is refused belongs to the emitted-name validation at
+            // `Builder::bind`, which is a separate finding landing on its own
+            // branch. This test's contract is only that the importer returns
+            // instead of aborting.
             let msg = format!("{e:?}");
-            assert!(
-                msg.contains("unexpected character"),
-                "the only expected refusal is the emitted-name check; got: {msg}"
-            );
+            assert!(!msg.is_empty(), "a refusal must carry a reason");
         }
     }
 }
