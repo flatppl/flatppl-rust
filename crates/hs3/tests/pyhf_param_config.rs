@@ -192,3 +192,53 @@ fn the_first_measurement_wins_a_disagreement() {
         "got:\n{text}"
     );
 }
+
+#[test]
+fn a_spanning_staterror_override_covers_every_channels_bins() {
+    // A staterror name shared across channels is ONE parameter over the union
+    // of their bins, so a measurement's `sigmas` override carries that many
+    // values. Sizing the check by one channel's bin count refused a workspace
+    // pyhf accepts (it reports n_parameters 4 and takes all four sigmas).
+    let text = convert(
+        r#"{
+  "channels": [
+    { "name": "chA",
+      "samples": [{ "name": "s", "data": [10.0, 20.0],
+        "modifiers": [{ "name": "mcstat", "type": "staterror", "data": [5.0, 6.0] }] }] },
+    { "name": "chB",
+      "samples": [{ "name": "s", "data": [30.0, 40.0],
+        "modifiers": [{ "name": "mcstat", "type": "staterror", "data": [1.0, 2.0] }] }] }
+  ],
+  "observations": [{ "name": "chA", "data": [10.0, 20.0] },
+                   { "name": "chB", "data": [30.0, 40.0] }],
+  "measurements": [{ "name": "m", "config": { "poi": "", "parameters": [
+    { "name": "mcstat", "sigmas": [0.4, 0.3, 0.2, 0.1] }] } }]
+}"#,
+    );
+    assert!(
+        text.contains("mcstat_delta = [0.4, 0.3, 0.2, 0.1]"),
+        "expected all four configured sigmas, got:\n{text}"
+    );
+    // A wrong length is still refused, now against the spanning count.
+    let err = flatppl_hs3::read(
+        r#"{
+  "channels": [
+    { "name": "chA",
+      "samples": [{ "name": "s", "data": [10.0, 20.0],
+        "modifiers": [{ "name": "mcstat", "type": "staterror", "data": [5.0, 6.0] }] }] },
+    { "name": "chB",
+      "samples": [{ "name": "s", "data": [30.0, 40.0],
+        "modifiers": [{ "name": "mcstat", "type": "staterror", "data": [1.0, 2.0] }] }] }
+  ],
+  "observations": [{ "name": "chA", "data": [10.0, 20.0] },
+                   { "name": "chB", "data": [30.0, 40.0] }],
+  "measurements": [{ "name": "m", "config": { "poi": "", "parameters": [
+    { "name": "mcstat", "sigmas": [0.4, 0.3] }] } }]
+}"#,
+    )
+    .expect_err("two sigmas for a four-component spanning staterror must be refused");
+    assert!(
+        err.to_string().contains("which has 4"),
+        "message must give the spanning count, got: {err}"
+    );
+}

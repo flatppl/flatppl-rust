@@ -62,6 +62,12 @@ struct FirstUse<'a> {
 /// are read, not here.
 fn validate_workspace(doc: &PyhfDocument) -> Result<BTreeMap<String, AuxOverride>> {
     let mut seen: BTreeMap<String, FirstUse<'_>> = BTreeMap::new();
+    // A staterror parameter spans the channels that carry it, so its component
+    // count is their total bin count, not one channel's. Counted here because
+    // `collect_param_overrides` needs it to size a measurement's override, and
+    // it runs before the layout pass.
+    let mut staterror_total: BTreeMap<String, usize> = BTreeMap::new();
+    let mut staterror_counted: HashSet<(String, String)> = HashSet::new();
 
     if doc.channels.is_empty() {
         // pyhf: InvalidSpecification ("[] should be non-empty").
@@ -108,6 +114,11 @@ fn validate_workspace(doc: &PyhfDocument) -> Result<BTreeMap<String, AuxOverride
                     domain: spec.param_domain,
                 };
                 let Some(first) = seen.get(&param) else {
+                    if spec.channel_staterror
+                        && staterror_counted.insert((param.clone(), channel.name.clone()))
+                    {
+                        *staterror_total.entry(param.clone()).or_default() += sample.data.len();
+                    }
                     seen.insert(
                         param,
                         FirstUse {
@@ -141,6 +152,11 @@ fn validate_workspace(doc: &PyhfDocument) -> Result<BTreeMap<String, AuxOverride
                 if first.channel != channel.name {
                     cross_channel_per_bin(&param, spec, first, &channel.name, sample.data.len())?;
                 }
+                if spec.channel_staterror
+                    && staterror_counted.insert((param.clone(), channel.name.clone()))
+                {
+                    *staterror_total.entry(param.clone()).or_default() += sample.data.len();
+                }
             }
         }
     }
@@ -164,7 +180,7 @@ fn validate_workspace(doc: &PyhfDocument) -> Result<BTreeMap<String, AuxOverride
         }
     }
 
-    collect_param_overrides(doc, &seen)
+    collect_param_overrides(doc, &seen, &staterror_total)
 }
 
 /// Check a per-bin parameter that appears in more than one channel.
@@ -212,6 +228,7 @@ fn cross_channel_per_bin(
 fn collect_param_overrides(
     doc: &PyhfDocument,
     seen: &BTreeMap<String, FirstUse<'_>>,
+    staterror_total: &BTreeMap<String, usize>,
 ) -> Result<BTreeMap<String, AuxOverride>> {
     let mut out: BTreeMap<String, AuxOverride> = BTreeMap::new();
     let toplvl = doc.toplvl.iter().flat_map(|t| t.measurements.iter());
@@ -222,7 +239,12 @@ fn collect_param_overrides(
             };
             let spec = mod_spec(first.kind).expect("kind came from MOD_SPECS");
             let n_pars = match first.use_.domain {
-                ParamDomain::PosRealsPow => first.n_bins,
+                // A staterror parameter spans its channels, so an override
+                // covers every one of their bins.
+                ParamDomain::PosRealsPow => staterror_total
+                    .get(&p.name)
+                    .copied()
+                    .unwrap_or(first.n_bins),
                 _ => 1,
             };
             for (field, values, used) in [
