@@ -5,12 +5,28 @@
 //! `cargo test` build skips the whole file.
 #![cfg(feature = "hs3")]
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+
+/// A scratch directory private to this process.
+///
+/// These tests used to write fixed names straight into the shared system temp
+/// dir, so two concurrent `cargo test` runs traded files: one process wrote the
+/// `--no-header` output while another asserted on the banner, at the same path.
+/// Every other temp-using test in the workspace keys on the process id
+/// (`cli/tests/determinize.rs`, `cli/tests/stablehlo.rs`), so do the same.
+fn scratch(label: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "flatppl-convert-hs3-{label}-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).expect("create the test scratch dir");
+    dir
+}
 
 #[test]
 fn convert_from_hs3_minimal() {
-    let dir = std::env::temp_dir();
+    let dir = scratch("minimal");
     let inp = dir.join("hs3_min_cli.json");
     let out = dir.join("hs3_min_cli.flatppl");
     std::fs::write(&inp, r#"{"distributions":[{"name":"mass","type":"gaussian_dist","mean":"mu","sigma":"s","x":"m_obs"}],"parameter_points":[{"name":"nom","entries":[{"name":"mu","value":5.28},{"name":"s","value":0.003}]}]}"#).unwrap();
@@ -39,7 +55,7 @@ fn convert_from_hs3_minimal() {
 /// assembled `joint_likelihood`); both stamp the leading `flatppl_compat`.
 #[test]
 fn auto_detects_hs3_and_pyhf_by_extension() {
-    let dir = std::env::temp_dir();
+    let dir = scratch("autodetect");
 
     // `*.hs3.json` → HS3 importer, no `--from`.
     let hs3_in = dir.join("auto_detect.hs3.json");
@@ -99,7 +115,7 @@ fn fixture(name: &str) -> std::path::PathBuf {
 #[test]
 fn convert_from_pyhf_fixture() {
     let inp = fixture("2bin_1channel.json");
-    let out = std::env::temp_dir().join("pyhf_2bin_cli.flatppl");
+    let out = scratch("pyhf2bin").join("pyhf_2bin_cli.flatppl");
     let status = Command::new(env!("CARGO_BIN_EXE_flatppl"))
         .args([
             "convert",
@@ -141,7 +157,7 @@ fn convert_from_pyhf_fixture() {
 #[test]
 fn convert_from_hs3_fixture() {
     let inp = fixture("paper_gaussian.json");
-    let out = std::env::temp_dir().join("hs3_paper_gaussian_cli.flatppl");
+    let out = scratch("papergauss").join("hs3_paper_gaussian_cli.flatppl");
     let status = Command::new(env!("CARGO_BIN_EXE_flatppl"))
         .args([
             "convert",
@@ -190,7 +206,7 @@ fn convert_from_hs3_fixture() {
 /// `flatppl_compat` binding — it is part of the model, not the comment.
 #[test]
 fn hs3_convert_emits_banner_and_compat() {
-    let dir = std::env::temp_dir();
+    let dir = scratch("provenance");
     let inp = dir.join("hs3_prov_cli.json");
     let out = dir.join("hs3_prov_cli.flatppl");
     std::fs::write(
@@ -281,7 +297,7 @@ fn hs3_convert_emits_banner_and_compat() {
 #[cfg(feature = "infer")]
 #[test]
 fn a_generic_function_comparing_an_unbinned_dataset_is_refused_by_convert() {
-    let dir = std::env::temp_dir();
+    let dir = scratch("tablecmp");
     let inp = dir.join("hs3_table_cmp.json");
     let flat = dir.join("hs3_table_cmp.flatppl");
     std::fs::write(
@@ -328,7 +344,7 @@ fn a_generic_function_comparing_an_unbinned_dataset_is_refused_by_convert() {
 #[cfg(feature = "infer")]
 #[test]
 fn a_successful_conversion_infers_clean() {
-    let dir = std::env::temp_dir();
+    let dir = scratch("gateok");
     let inp = dir.join("hs3_gate_ok.json");
     let flat = dir.join("hs3_gate_ok.flatppl");
     let pir = dir.join("hs3_gate_ok.flatpir");
