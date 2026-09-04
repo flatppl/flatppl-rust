@@ -227,7 +227,13 @@ fn lower_density_core(
     // typing to `Type::Likelihood`); dispatch on the op name too, since a
     // `(%ref self L)` to a likelihood binding may not carry the `Likelihood` type
     // on the ref node itself.
-    let (resolved, _) = resolve_ref_one(m, arg1);
+    // A CHAIN of hops, not one: `likelihood = c_likelihood` is a legal alias
+    // (§04 — a module is an unordered set of bindings, and a bare-name binding
+    // names the very expression that name names), and the converter emits it for
+    // any workspace whose likelihood has a single term. One hop lands on the ref
+    // node `c_likelihood`, which is not a likelihood op, so the dispatch below
+    // fell through to `lower_likelihood_query` and refused a legal model.
+    let (resolved, _) = resolve_ref_chain(m, arg1);
     if is_likelihood(m, arg1)
         || matches!(
             builtin_name(m, resolved),
@@ -271,7 +277,8 @@ fn is_likelihood(m: &Module, id: NodeId) -> bool {
 /// * `joint_likelihood(L1, …, Lk)` → `Σᵢ logdensityof(Lᵢ, θ)`
 ///   ([`lower_joint_likelihood`]).
 ///
-/// `resolved` is the likelihood node after one `(%ref self …)` hop. A
+/// `resolved` is the likelihood node after following the `(%ref self …)` CHAIN,
+/// so an aliased likelihood (`top = lik`) dispatches like the name it aliases. A
 /// likelihood-typed node that is neither op (e.g. reached only via its type)
 /// falls through to [`lower_likelihood_query`], which refuses unless it is a
 /// well-formed `likelihoodof` (refuse-don't-mislower).
@@ -328,10 +335,10 @@ fn lower_joint_likelihood(
     };
     let mut terms = Vec::with_capacity(components.len());
     for comp in components {
-        // Each component is a likelihood scored at the SHARED θ. Resolve one ref
-        // hop and reuse the per-likelihood dispatch (also handles a nested
-        // joint_likelihood).
-        let (comp_resolved, _) = resolve_ref_one(m, comp);
+        // Each component is a likelihood scored at the SHARED θ. Follow the ref
+        // CHAIN and reuse the per-likelihood dispatch (also handles a nested
+        // joint_likelihood). A component may itself be an alias.
+        let (comp_resolved, _) = resolve_ref_chain(m, comp);
         terms.push(lower_likelihood_density(m, comp_resolved, theta, bundle)?);
     }
     Ok(fold_add(m, &terms))
@@ -387,7 +394,7 @@ fn lower_bayesupdate(
     // `(%ref self L)` hop to the likelihood op (likelihoodof / joint_likelihood)
     // and reuse the shared per-likelihood lowering (which threads the bundle so a
     // cross-module kernel in the posterior also lowers).
-    let l_d = lower_likelihood_density(m, resolve_ref_one(m, l_arg).0, v, bundle)?;
+    let l_d = lower_likelihood_density(m, resolve_ref_chain(m, l_arg).0, v, bundle)?;
     // Unnormalized log-posterior = log-likelihood + log-prior.
     Ok(build_call(m, "add", &[l_d, prior_d]))
 }

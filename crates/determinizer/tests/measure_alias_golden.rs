@@ -122,3 +122,116 @@ L2 = L
 lp = logdensityof(L2, 0.0)",
     );
 }
+
+// ---------------------------------------------------------------------------
+// The LIKELIHOOD layer, which the fix above left behind.
+//
+// The measure dispatcher followed the ref chain; the likelihood dispatcher still
+// took one hop, so an aliased likelihood refused with "expected likelihoodof".
+// The pyhf importer emits `likelihood = <channel>_likelihood` for any workspace
+// whose likelihood has a single term, which is every workspace with no
+// constrained parameter, so nine fixtures of the vendored pyhf corpus hit it.
+// ---------------------------------------------------------------------------
+
+/// `top = lik` where `lik = likelihoodof(K, obs)`.
+#[test]
+fn likelihoodof_alias() {
+    assert_alias_matches_direct(
+        "\
+mu = elementof(reals)
+k = functionof(Normal.(mu))
+lik = likelihoodof(k, [2.0, 3.0])
+lp = logdensityof(lik, record(mu = 1.0))",
+        "\
+mu = elementof(reals)
+k = functionof(Normal.(mu))
+lik = likelihoodof(k, [2.0, 3.0])
+top = lik
+lp = logdensityof(top, record(mu = 1.0))",
+    );
+}
+
+/// Two hops, to pin that it is a chain and not a second single hop.
+#[test]
+fn likelihoodof_alias_chain() {
+    assert_alias_matches_direct(
+        "\
+mu = elementof(reals)
+k = functionof(Normal.(mu))
+lik = likelihoodof(k, [2.0, 3.0])
+lp = logdensityof(lik, record(mu = 1.0))",
+        "\
+mu = elementof(reals)
+k = functionof(Normal.(mu))
+lik = likelihoodof(k, [2.0, 3.0])
+top = lik
+top2 = top
+lp = logdensityof(top2, record(mu = 1.0))",
+    );
+}
+
+/// An aliased `joint_likelihood`.
+#[test]
+fn joint_likelihood_alias() {
+    assert_alias_matches_direct(
+        "\
+mu = elementof(reals)
+k = functionof(Normal.(mu))
+l1 = likelihoodof(k, [2.0, 3.0])
+l2 = likelihoodof(k, [1.0])
+j = joint_likelihood(l1, l2)
+lp = logdensityof(j, record(mu = 1.0))",
+        "\
+mu = elementof(reals)
+k = functionof(Normal.(mu))
+l1 = likelihoodof(k, [2.0, 3.0])
+l2 = likelihoodof(k, [1.0])
+j = joint_likelihood(l1, l2)
+top = j
+lp = logdensityof(top, record(mu = 1.0))",
+    );
+}
+
+/// An aliased COMPONENT inside a `joint_likelihood`, which is the second of the
+/// three dispatch sites: the components are resolved separately from the joint.
+#[test]
+fn joint_likelihood_aliased_component() {
+    assert_alias_matches_direct(
+        "\
+mu = elementof(reals)
+k = functionof(Normal.(mu))
+l1 = likelihoodof(k, [2.0, 3.0])
+l2 = likelihoodof(k, [1.0])
+lp = logdensityof(joint_likelihood(l1, l2), record(mu = 1.0))",
+        "\
+mu = elementof(reals)
+k = functionof(Normal.(mu))
+l1 = likelihoodof(k, [2.0, 3.0])
+l2 = likelihoodof(k, [1.0])
+a1 = l1
+lp = logdensityof(joint_likelihood(a1, l2), record(mu = 1.0))",
+    );
+}
+
+/// An aliased likelihood inside `bayesupdate`, the third dispatch site: the
+/// posterior's likelihood arm resolves separately from the query entry.
+#[test]
+fn bayesupdate_aliased_likelihood() {
+    assert_alias_matches_direct(
+        "\
+mu ~ Normal(mu = 0.0, sigma = 10.0)
+prior = lawof(record(mu = mu))
+k = functionof(Normal.(mu))
+lik = likelihoodof(k, [2.0, 3.0])
+post = bayesupdate(lik, prior)
+lp = logdensityof(post, record(mu = 1.0))",
+        "\
+mu ~ Normal(mu = 0.0, sigma = 10.0)
+prior = lawof(record(mu = mu))
+k = functionof(Normal.(mu))
+lik = likelihoodof(k, [2.0, 3.0])
+alias = lik
+post = bayesupdate(alias, prior)
+lp = logdensityof(post, record(mu = 1.0))",
+    );
+}
