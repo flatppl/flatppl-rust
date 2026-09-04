@@ -7,7 +7,8 @@ use std::str::FromStr;
 
 use crate::db::{Catalogues, Database, FileSet, SourceFile};
 use crate::queries::{
-    SpanIndex, analyze, line_index, node_at_offset_indexed, parse, parsed_catalogues, resolve_path,
+    SpanIndex, analyze, document_symbol_tree, line_index, node_at_offset_indexed, parse,
+    parsed_catalogues, resolve_path,
 };
 use flatppl_core::{BindingId, CallHead, Doc, Node, Ref, RefNs, Scalar};
 
@@ -116,39 +117,16 @@ pub fn diagnostics(
 /// range are derived from the byte span of its RHS node. Bindings whose RHS
 /// node has no recorded span are silently skipped. Returns an empty vec when
 /// the file fails to parse or contains no spanned bindings.
+///
+/// The tree is built by [`document_symbol_tree`], memoized per revision and
+/// shared: the returned `Arc` is a refcount bump on a repeated request, so
+/// concurrent requests against one revision hold one tree between them rather
+/// than a full copy each.
 pub fn document_symbols(
     db: &dyn salsa::Database,
     file: SourceFile,
-) -> Vec<lsp_types::DocumentSymbol> {
-    let li = line_index(db, file);
-    let parsed = parse(db, file);
-    let Some(module) = parsed.module(db) else {
-        return vec![];
-    };
-    let mut syms = Vec::new();
-    for (_, binding) in module.bindings() {
-        let Some(span) = module.span_of(binding.rhs) else {
-            continue;
-        };
-        let start = li.position(span.start);
-        let end = li.position(span.end);
-        let range = lsp_types::Range::new(
-            lsp_types::Position::new(start.line, start.character),
-            lsp_types::Position::new(end.line, end.character),
-        );
-        #[allow(deprecated)]
-        syms.push(lsp_types::DocumentSymbol {
-            name: module.resolve(binding.name).to_string(),
-            kind: lsp_types::SymbolKind::VARIABLE,
-            range,
-            selection_range: range,
-            detail: None,
-            tags: None,
-            deprecated: None,
-            children: None,
-        });
-    }
-    syms
+) -> std::sync::Arc<Vec<lsp_types::DocumentSymbol>> {
+    document_symbol_tree(db, file).symbols()
 }
 
 /// Return all top-level bindings across every file in `fs` as LSP

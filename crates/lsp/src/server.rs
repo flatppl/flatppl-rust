@@ -136,7 +136,12 @@ pub fn run(
     // `Database` handles; worker responses come back on `result_rx`. Diagnostics
     // are debounced: notification arms mark affected URIs `dirty` and arm a
     // deadline; once the burst settles (`DEBOUNCE` of quiescence) we flush.
-    let (result_tx, result_rx) = crossbeam_channel::unbounded::<Message>();
+    // Worker replies. Unbounded is safe because a queued reply is a shared
+    // handle or a small error, never a serialised result — see `Reply`.
+    let (result_tx, result_rx) = crossbeam_channel::unbounded::<Reply>();
+    // Substituted for `result_rx` while the writer's backlog is full, so the
+    // `select!` below waits on the client and the debounce alone.
+    let no_results: crossbeam_channel::Receiver<Reply> = crossbeam_channel::never();
     let pool = crate::pool::Pool::new(
         std::thread::available_parallelism()
             .map(|n| n.get().min(4))
@@ -166,27 +171,40 @@ pub fn run(
     // means "handled internally, no client message to process this iteration".
 
     loop {
-        let timeout = diag_deadline.map(|d| d.saturating_duration_since(Instant::now()));
-        let selected: Option<Result<Message, crossbeam_channel::RecvError>> = match timeout {
+        // Taking a reply means serialising it, so hold off while the writer
+        // still has `OUTBOUND_BACKLOG` messages to get through. The replies
+        // stay in the channel as shared handles and cost nothing meanwhile.
+        let throttled = connection.sender.len() >= OUTBOUND_BACKLOG;
+        let results = if throttled { &no_results } else { &result_rx };
+        let debounce_wait = diag_deadline.map(|d| d.saturating_duration_since(Instant::now()));
+        let wait = match (throttled, debounce_wait) {
+            (true, Some(t)) => Some(t.min(THROTTLE_POLL)),
+            (true, None) => Some(THROTTLE_POLL),
+            (false, d) => d,
+        };
+        let selected: Option<Result<Message, crossbeam_channel::RecvError>> = match wait {
             Some(t) => select! {
                 recv(connection.receiver) -> m => Some(m),
-                recv(result_rx) -> r => {
-                    if let Ok(msg) = r { answer(&connection, &mut pending, msg)?; }
+                recv(results) -> r => {
+                    if let Ok(reply) = r { answer(&connection, &mut pending, reply)?; }
                     None
                 }
                 default(t) => {
-                    // Debounce fired: publish the coalesced dirty set.
-                    flush_dirty(
-                        &connection, &db, fs, cats, &uri_to_file, &doc_versions, &mut dirty,
-                    )?;
-                    diag_deadline = None;
+                    // Either the debounce fired or the throttle poll came round.
+                    // Publish only for the former.
+                    if diag_deadline.is_some_and(|d| Instant::now() >= d) {
+                        flush_dirty(
+                            &connection, &db, fs, cats, &uri_to_file, &doc_versions, &mut dirty,
+                        )?;
+                        diag_deadline = None;
+                    }
                     None
                 }
             },
             None => select! {
                 recv(connection.receiver) -> m => Some(m),
-                recv(result_rx) -> r => {
-                    if let Ok(msg) = r { answer(&connection, &mut pending, msg)?; }
+                recv(results) -> r => {
+                    if let Ok(reply) = r { answer(&connection, &mut pending, reply)?; }
                     None
                 }
             },
@@ -470,11 +488,11 @@ pub fn run(
                         answer(
                             &connection,
                             &mut pending,
-                            Message::Response(Response::new_err(
+                            Reply::Ready(Message::Response(Response::new_err(
                                 id,
                                 ErrorCode::RequestCanceled as i32,
                                 "request cancelled by the client".to_owned(),
-                            )),
+                            ))),
                         )?;
                     }
                     _ => {} // ignore other notifications
@@ -495,11 +513,11 @@ pub fn run(
                     answer(
                         &connection,
                         &mut pending,
-                        Message::Response(Response::new_err(
+                        Reply::Ready(Message::Response(Response::new_err(
                             req.id,
                             ErrorCode::RequestCanceled as i32,
                             "request cancelled by the client".to_owned(),
-                        )),
+                        ))),
                     )?;
                     continue;
                 }
@@ -523,7 +541,7 @@ pub fn run(
                     answer(
                         &connection,
                         &mut pending,
-                        Message::Response(Response::new_err(
+                        Reply::Ready(Message::Response(Response::new_err(
                             id,
                             ErrorCode::RequestFailed as i32,
                             format!(
@@ -531,7 +549,7 @@ pub fn run(
                                  cancel or retry",
                                 crate::pool::QUEUE_CAPACITY
                             ),
-                        )),
+                        ))),
                     )?;
                 }
             }
@@ -573,23 +591,83 @@ fn take_cancelled(cancelled: &Arc<Mutex<HashSet<RequestId>>>, id: &RequestId) ->
         .unwrap_or(false)
 }
 
-/// Send `msg`, dropping a duplicate response.
+/// What a worker hands back to the main thread.
+///
+/// A big result travels as a shared handle and becomes JSON on the main thread
+/// immediately before the write. `serde_json::Value` costs roughly 38x the JSON
+/// text it represents — every `DocumentSymbol` becomes seven nested `Map`s, and
+/// serde_json's `Map` is a `BTreeMap`, so each one allocates a node however few
+/// keys it holds. A 4,000-binding file answers 0.77 MiB of JSON as roughly
+/// 19 MiB of `Value`, so building it on the worker meant one copy per
+/// outstanding request. Building it here means one copy at a time.
+///
+/// `lsp_server` 0.8 offers no way to hand the writer a pre-serialised payload:
+/// `Response::result` is an owned `serde_json::Value`, and serde_json's
+/// `RawValue` does not survive `to_value` — its emitter re-parses the text into
+/// a full `Value`. Deferring the conversion is what is available.
+enum Reply {
+    /// An already-formed message: an error, or a result whose `Value` is small.
+    Ready(Message),
+    /// A document symbol tree, serialised on the main thread.
+    Symbols {
+        id: RequestId,
+        syms: Arc<Vec<lsp_types::DocumentSymbol>>,
+    },
+}
+
+impl Reply {
+    /// The request id this reply answers, for the `pending` arbiter.
+    fn response_id(&self) -> Option<&RequestId> {
+        match self {
+            Reply::Ready(Message::Response(resp)) => Some(&resp.id),
+            Reply::Ready(_) => None,
+            Reply::Symbols { id, .. } => Some(id),
+        }
+    }
+}
+
+/// Responses handed to the writer and not yet on the wire.
+///
+/// The writer's backlog is what a request flood turns into resident memory, at
+/// about 19 MiB per queued `documentSymbol` answer. While the backlog is at
+/// least this deep the main thread stops taking worker replies, so the excess
+/// waits as a queued job (a `Database` clone and a `Request`) instead of as
+/// serialised JSON. It refuses nothing: a delayed request is still answered as
+/// soon as the client reads. Raising it trades resident memory for nothing —
+/// the writer only ever needs one message to work on.
+const OUTBOUND_BACKLOG: usize = 4;
+
+/// How often to re-check the writer's backlog while throttled.
+///
+/// Only armed while the backlog is full, so an idle server still blocks in
+/// `select!` and burns no CPU.
+const THROTTLE_POLL: Duration = Duration::from_millis(2);
+
+/// Send `reply`, dropping a duplicate response.
 ///
 /// JSON-RPC 2.0 §5 requires exactly one response per request, and several paths
 /// can produce one for the same id: the worker that ran it, a
 /// `$/cancelRequest`, a queue drain, a full queue. `pending` is the arbiter —
 /// the first path to claim the id wins and the rest are dropped. Notifications
-/// pass through untouched.
+/// pass through untouched. A duplicate is dropped *before* its JSON is built,
+/// so a cancelled request costs no serialisation.
 fn answer(
     connection: &Connection,
     pending: &mut HashSet<RequestId>,
-    msg: Message,
+    reply: Reply,
 ) -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
-    if let Message::Response(resp) = &msg {
-        if !pending.remove(&resp.id) {
+    if let Some(id) = reply.response_id() {
+        if !pending.remove(id) {
             return Ok(()); // already answered by another path
         }
     }
+    let msg = match reply {
+        Reply::Ready(msg) => msg,
+        // `DocumentSymbolResponse::Nested` is an untagged wrapper around the
+        // vec, so serialising the slice produces the same wire shape without
+        // cloning the tree out of the shared handle.
+        Reply::Symbols { id, syms } => Message::Response(Response::new_ok(id, &*syms)),
+    };
     connection.sender.send(msg)?;
     Ok(())
 }
@@ -616,13 +694,13 @@ fn release_stale_requests(
         answer(
             connection,
             pending,
-            Message::Response(Response::new_err(
+            Reply::Ready(Message::Response(Response::new_err(
                 id,
                 ErrorCode::ContentModified as i32,
                 "the document changed before this request ran; re-request against \
                  the new version"
                     .to_owned(),
-            )),
+            ))),
         )?;
     }
     Ok(())
@@ -672,7 +750,7 @@ fn invalid_params(req: &lsp_server::Request, what: &str, error: serde_json::Erro
 #[allow(clippy::too_many_arguments)] // one message-loop seam, not a public API
 fn dispatch_request(
     pool: &crate::pool::Pool,
-    result_tx: &crossbeam_channel::Sender<Message>,
+    result_tx: &crossbeam_channel::Sender<Reply>,
     db: &Database,
     uri_to_file: &HashMap<String, SourceFile>,
     fs: FileSet,
@@ -695,17 +773,17 @@ fn dispatch_request(
         let outcome = salsa::Cancelled::catch(std::panic::AssertUnwindSafe(|| {
             handle_request_on_worker(&db, &files, fs, cats, &req)
         }));
-        let resp = match outcome {
-            Ok(resp) => resp,
-            Err(_cancelled) => Response::new_err(
+        let reply = match outcome {
+            Ok(reply) => reply,
+            Err(_cancelled) => Reply::Ready(Message::Response(Response::new_err(
                 id,
                 ErrorCode::ContentModified as i32,
                 "the document changed while this request was running; re-request \
                  against the new version"
                     .to_owned(),
-            ),
+            ))),
         };
-        let _ = result_tx.send(Message::Response(resp));
+        let _ = result_tx.send(reply);
         // `db` (the clone) drops here, releasing the salsa handle.
     })
 }
@@ -722,10 +800,31 @@ fn handle_request_on_worker(
     fs: FileSet,
     cats: Catalogues,
     req: &lsp_server::Request,
+) -> Reply {
+    // `documentSymbol` is the one method whose answer is large enough that the
+    // deferred serialisation in `Reply::Symbols` is worth the extra variant.
+    if req.method.as_str() == DocumentSymbolRequest::METHOD {
+        return handle_document_symbols(db, uri_to_file, req);
+    }
+    Reply::Ready(Message::Response(handle_request_response(
+        db,
+        uri_to_file,
+        fs,
+        cats,
+        req,
+    )))
+}
+
+/// The methods whose answer is a `Response` built on the worker.
+fn handle_request_response(
+    db: &Database,
+    uri_to_file: &HashMap<String, SourceFile>,
+    fs: FileSet,
+    cats: Catalogues,
+    req: &lsp_server::Request,
 ) -> Response {
     match req.method.as_str() {
         HoverRequest::METHOD => handle_hover(db, uri_to_file, fs, cats, req),
-        DocumentSymbolRequest::METHOD => handle_document_symbols(db, uri_to_file, req),
         WorkspaceSymbolRequest::METHOD => handle_workspace_symbols(db, fs, req),
         InlayHintRequest::METHOD => handle_inlay_hints(db, uri_to_file, fs, cats, req),
         GotoDefinition::METHOD => handle_goto_definition(db, uri_to_file, fs, cats, req),
@@ -1283,26 +1382,30 @@ fn handle_hover(
     }
 }
 
-/// Handle a `textDocument/documentSymbol` request.  Returns a `Response`
-/// (result or null) without sending it — the caller dispatches the message.
+/// Handle a `textDocument/documentSymbol` request.  Returns the shared symbol
+/// tree without serialising it — the main thread builds the JSON immediately
+/// before the write (see [`Reply`]).
 fn handle_document_symbols(
     db: &Database,
     uri_to_file: &HashMap<String, SourceFile>,
     req: &lsp_server::Request,
-) -> Response {
+) -> Reply {
     let params: lsp_types::DocumentSymbolParams = match serde_json::from_value(req.params.clone()) {
         Ok(p) => p,
-        Err(e) => return invalid_params(req, "documentSymbol", e),
+        Err(e) => return Reply::Ready(Message::Response(invalid_params(req, "documentSymbol", e))),
     };
-    let syms: Vec<lsp_types::DocumentSymbol> = (|| {
+    let syms = (|| {
         let uri_str = params.text_document.uri.as_str().to_owned();
         let file = *uri_to_file.get(&uri_str)?;
         Some(crate::capabilities::document_symbols(db, file))
     })()
+    // An untracked URI has no symbols, which is the empty tree, not an error.
     .unwrap_or_default();
 
-    let response = lsp_types::DocumentSymbolResponse::Nested(syms);
-    Response::new_ok(req.id.clone(), response)
+    Reply::Symbols {
+        id: req.id.clone(),
+        syms,
+    }
 }
 
 /// Handle a `workspace/symbol` request.  Returns a `Response` (result or

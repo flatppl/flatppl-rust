@@ -194,6 +194,100 @@ pub fn line_index(db: &dyn salsa::Database, file: SourceFile) -> LineIndex {
 #[cfg(test)]
 pub static LINE_INDEX_RUNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+// ── document symbol tree tracked query ──────────────────────────────────────
+
+/// The `textDocument/documentSymbol` answer for one file, built once per
+/// revision and handed out as an `Arc` clone.
+///
+/// `lsp_types::DocumentSymbol` has neither `Hash` nor `Update`, so the tracked
+/// return type is this wrapper with pointer-identity equality — the same
+/// conservative policy as [`ArcModule`]: two separately-built trees are never
+/// pointer-equal, so salsa always sees a change and over-recomputes downstream
+/// rather than under-recomputing. Nothing is downstream of this query.
+#[derive(Clone, Debug)]
+pub struct ArcSymbols(Arc<Vec<lsp_types::DocumentSymbol>>);
+
+impl ArcSymbols {
+    /// Clone the shared handle. Cloning is a refcount bump, not a tree copy.
+    pub fn symbols(&self) -> Arc<Vec<lsp_types::DocumentSymbol>> {
+        Arc::clone(&self.0)
+    }
+}
+
+impl PartialEq for ArcSymbols {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for ArcSymbols {}
+
+impl std::hash::Hash for ArcSymbols {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::ptr::hash(Arc::as_ptr(&self.0), state);
+    }
+}
+
+// SAFETY: pointer-identity comparison is conservative — a differing pointer
+// always overwrites and reports a change, so a genuine change is never
+// suppressed.
+unsafe impl salsa::Update for ArcSymbols {
+    unsafe fn maybe_update(old_pointer: *mut Self, new_value: Self) -> bool {
+        let old: &mut Self = unsafe { &mut *old_pointer };
+        if Arc::ptr_eq(&old.0, &new_value.0) {
+            return false;
+        }
+        *old = new_value;
+        true
+    }
+}
+
+/// Build the `DocumentSymbol` tree for `file`: every top-level binding as a
+/// `VARIABLE` symbol ranged over its right-hand side.
+///
+/// Bindings whose right-hand side has no recorded span are skipped, and a file
+/// that fails to parse yields an empty tree. Memoized per revision: a repeated
+/// request on unchanged text is a memo lookup, not a rebuild of every entry.
+#[salsa::tracked]
+pub fn document_symbol_tree(db: &dyn salsa::Database, file: SourceFile) -> ArcSymbols {
+    #[cfg(test)]
+    DOCUMENT_SYMBOL_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let li = line_index(db, file);
+    let parsed = parse(db, file);
+    let Some(module) = parsed.module(db) else {
+        return ArcSymbols(Arc::new(vec![]));
+    };
+    let mut syms = Vec::new();
+    for (_, binding) in module.bindings() {
+        let Some(span) = module.span_of(binding.rhs) else {
+            continue;
+        };
+        let start = li.position(span.start);
+        let end = li.position(span.end);
+        let range = lsp_types::Range::new(
+            lsp_types::Position::new(start.line, start.character),
+            lsp_types::Position::new(end.line, end.character),
+        );
+        #[allow(deprecated)] // DocumentSymbol.deprecated is deprecated in LSP 3.16
+        syms.push(lsp_types::DocumentSymbol {
+            name: module.resolve(binding.name).to_string(),
+            kind: lsp_types::SymbolKind::VARIABLE,
+            range,
+            selection_range: range,
+            detail: None,
+            tags: None,
+            deprecated: None,
+            children: None,
+        });
+    }
+    ArcSymbols(Arc::new(syms))
+}
+
+/// Test-only execution counter (proves the query is memoized per revision).
+#[cfg(test)]
+pub static DOCUMENT_SYMBOL_RUNS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 // ── Salsa field-compatibility wrapper ───────────────────────────────────────
 //
 // salsa tracked-struct fields (even `#[returns(ref)]` ones) must satisfy
@@ -632,6 +726,45 @@ mod tests {
             LINE_INDEX_RUNS.load(Relaxed),
             1,
             "computed once per revision, not per call"
+        );
+    }
+
+    #[test]
+    fn document_symbol_tree_is_memoized_per_revision() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let db = Database::default();
+        let f = SourceFile::new(&db, "m.flatppl".to_string(), "x = 1\ny = 2".to_string());
+        DOCUMENT_SYMBOL_RUNS.store(0, Relaxed);
+        let a = document_symbol_tree(&db, f);
+        let b = document_symbol_tree(&db, f);
+        let c = document_symbol_tree(&db, f);
+        assert_eq!(
+            DOCUMENT_SYMBOL_RUNS.load(Relaxed),
+            1,
+            "built once per revision, not per call"
+        );
+        assert_eq!(a.symbols().len(), 2, "both bindings are symbols");
+        assert!(
+            Arc::ptr_eq(&a.symbols(), &b.symbols()) && Arc::ptr_eq(&b.symbols(), &c.symbols()),
+            "every caller shares one tree, so a request flood holds one copy"
+        );
+    }
+
+    #[test]
+    fn document_symbol_tree_rebuilds_after_an_edit() {
+        use salsa::Setter;
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut db = Database::default();
+        let f = SourceFile::new(&db, "m.flatppl".to_string(), "x = 1".to_string());
+        DOCUMENT_SYMBOL_RUNS.store(0, Relaxed);
+        assert_eq!(document_symbol_tree(&db, f).symbols().len(), 1);
+        f.set_text(&mut db).to("x = 1\ny = 2".to_string());
+        let after = document_symbol_tree(&db, f);
+        assert_eq!(after.symbols().len(), 2, "the new binding is a symbol");
+        assert_eq!(
+            DOCUMENT_SYMBOL_RUNS.load(Relaxed),
+            2,
+            "a new revision rebuilds, so a stale tree is never served"
         );
     }
 
