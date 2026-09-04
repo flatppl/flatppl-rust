@@ -674,19 +674,19 @@ fn parse_normsys_data(m: &Modifier) -> Result<(f64, f64)> {
     let data = m.data.as_ref().ok_or_else(|| {
         Error::Unsupported(format!(
             "normsys modifier `{}` missing data",
-            m.parameter.as_deref().unwrap_or("?")
+            m.effective_param().unwrap_or_else(|| "?".into())
         ))
     })?;
     let lo = data["lo"].as_f64().ok_or_else(|| {
         Error::Unsupported(format!(
             "normsys `{}`: lo is not a number",
-            m.parameter.as_deref().unwrap_or("?")
+            m.effective_param().unwrap_or_else(|| "?".into())
         ))
     })?;
     let hi = data["hi"].as_f64().ok_or_else(|| {
         Error::Unsupported(format!(
             "normsys `{}`: hi is not a number",
-            m.parameter.as_deref().unwrap_or("?")
+            m.effective_param().unwrap_or_else(|| "?".into())
         ))
     })?;
     Ok((lo, hi))
@@ -698,13 +698,13 @@ fn parse_normsys_data(m: &Modifier) -> Result<(f64, f64)> {
 /// and have `nom_len` bins — a ragged or missing array would otherwise feed a
 /// length-mismatched (or empty) array into the interpolation function.
 fn parse_histosys_data(b: &mut Builder, m: &Modifier, nom_len: usize) -> Result<(NodeId, NodeId)> {
-    let param = m.parameter.as_deref().unwrap_or("?");
+    let param = m.effective_param().unwrap_or_else(|| "?".into());
     let data = m
         .data
         .as_ref()
         .ok_or_else(|| Error::Unsupported(format!("histosys modifier `{param}` missing data")))?;
-    let lo_arr = histosys_contents(b, data, "lo", param, nom_len)?;
-    let hi_arr = histosys_contents(b, data, "hi", param, nom_len)?;
+    let lo_arr = histosys_contents(b, data, "lo", &param, nom_len)?;
+    let hi_arr = histosys_contents(b, data, "hi", &param, nom_len)?;
     Ok((lo_arr, hi_arr))
 }
 

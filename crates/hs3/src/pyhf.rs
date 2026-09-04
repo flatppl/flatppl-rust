@@ -63,7 +63,41 @@ struct FirstUse<'a> {
 fn validate_workspace(doc: &PyhfDocument) -> Result<BTreeMap<String, AuxOverride>> {
     let mut seen: BTreeMap<String, FirstUse<'_>> = BTreeMap::new();
 
+    if doc.channels.is_empty() {
+        // pyhf: InvalidSpecification ("[] should be non-empty").
+        return Err(Error::Unsupported(
+            "workspace has no channels, so there is no observation model to build".into(),
+        ));
+    }
+    let mut channel_names: HashSet<&str> = HashSet::new();
     for channel in &doc.channels {
+        // Two channels of one name each get their own bindings but share the one
+        // observation entry, so the observed counts would enter the likelihood
+        // twice. pyhf: InvalidModel.
+        if !channel_names.insert(channel.name.as_str()) {
+            return Err(Error::Unsupported(format!(
+                "channel name `{}` appears twice; each channel needs its own name so it can \
+                 have its own observation",
+                channel.name
+            )));
+        }
+        if channel.samples.is_empty() {
+            // pyhf: InvalidSpecification ("[] should be non-empty").
+            return Err(Error::Unsupported(format!(
+                "channel `{}` has no samples, so it has no expected counts",
+                channel.name
+            )));
+        }
+        let mut sample_names: HashSet<&str> = HashSet::new();
+        for sample in &channel.samples {
+            // pyhf keys a channel's samples by name, so a repeat collides.
+            if !sample_names.insert(sample.name.as_str()) {
+                return Err(Error::Unsupported(format!(
+                    "channel `{}` has two samples named `{}`; give each sample its own name",
+                    channel.name, sample.name
+                )));
+            }
+        }
         for sample in &channel.samples {
             for modifier in &sample.modifiers {
                 let spec = require_spec(modifier)?;
@@ -104,6 +138,9 @@ fn validate_workspace(doc: &PyhfDocument) -> Result<BTreeMap<String, AuxOverride
                         modifier.kind, first.channel, channel.name, modifier.kind
                     )));
                 }
+                if first.channel != channel.name {
+                    cross_channel_per_bin(&param, spec, first, &channel.name, sample.data.len())?;
+                }
             }
         }
     }
@@ -128,6 +165,51 @@ fn validate_workspace(doc: &PyhfDocument) -> Result<BTreeMap<String, AuxOverride
     }
 
     collect_param_overrides(doc, &seen)
+}
+
+/// Check a per-bin parameter that appears in more than one channel.
+///
+/// A `cartpow(posreals, n)` parameter has one component per bin, so the two
+/// channels must agree on the count. pyhf builds a model from a disagreement and
+/// then reads past the end of its own paramset, taking components from whatever
+/// parameter follows — so it produces numbers, but garbage ones.
+///
+/// `staterror` disagrees more deeply: pyhf gives a shared name ONE paramset
+/// spanning every channel that carries it, each channel masking its own slice.
+/// A single `cartpow(posreals, n_bins)` parameter multiplied into both channels
+/// instead correlates gammas pyhf keeps independent, and its constraint covers
+/// only the first channel's bins. Refuse rather than emit that.
+fn cross_channel_per_bin(
+    param: &str,
+    spec: &crate::histfactory::ModSpec,
+    first: &FirstUse<'_>,
+    channel: &str,
+    n_bins: usize,
+) -> Result<()> {
+    if spec.param_domain != ParamDomain::PosRealsPow {
+        return Ok(());
+    }
+    if spec.channel_staterror {
+        return Err(Error::Unsupported(format!(
+            "`{}` modifier `{param}` appears in channels `{}` and `{channel}`; pyhf gives such a \
+             name one parameter spanning every channel's bins ({} here) with each channel using \
+             its own slice, which this importer does not emit. Give each channel's modifier its \
+             own name, as pyhf's own workspaces do (`{param}_{}`, `{param}_{channel}`)",
+            spec.kind,
+            first.channel,
+            first.n_bins + n_bins,
+            first.channel,
+        )));
+    }
+    if first.n_bins != n_bins {
+        return Err(Error::Unsupported(format!(
+            "`{}` modifier `{param}` has {} bins in channel `{}` and {n_bins} in channel \
+             `{channel}`; a per-bin parameter has one component per bin, so the two counts must \
+             agree",
+            spec.kind, first.n_bins, first.channel
+        )));
+    }
+    Ok(())
 }
 
 /// Read the measurement configs' `parameters` blocks into per-parameter

@@ -218,25 +218,58 @@ fn normsys_and_histosys_may_share_a_name() {
     );
 }
 
-/// pyhf accepts one `staterror` name across two channels. The channel-summed
-/// nominals differ per channel, so this must still emit one declaration.
+/// One `staterror` name across two channels.
+///
+/// pyhf accepts it and gives the name ONE paramset spanning both channels'
+/// bins: for the workspace below, 4 components with sigmas
+/// [0.5, 0.3, 0.0333.., 0.05] and auxdata [1, 1, 1, 1], each channel masking
+/// its own two. A single `cartpow(posreals, 2)` parameter multiplied into both
+/// channels instead correlates gammas pyhf keeps independent, and its
+/// constraint covers only the first channel's bins. That is what the importer
+/// used to emit, and it is silently wrong, so refuse until the spanning form is
+/// implemented. pyhf's own workspaces name these per channel
+/// (`staterror_channel1`), which converts.
 #[test]
-fn staterror_shared_across_channels_declares_once() {
-    let json = r#"{"channels":[
-         {"name":"chA","samples":[{"name":"s","data":[10.0,20.0],
-            "modifiers":[{"name":"mcstat","type":"staterror","data":[5.0,6.0]}]}]},
-         {"name":"chB","samples":[{"name":"s","data":[30.0,40.0],
-            "modifiers":[{"name":"mcstat","type":"staterror","data":[1.0,2.0]}]}]}],
-       "observations":[{"name":"chA","data":[10.0,20.0]},{"name":"chB","data":[30.0,40.0]}],
-       "measurements":[{"name":"m","config":{"poi":"","parameters":[]}}],
-       "version":"1.0.0"}"#;
-    let m = flatppl_hs3::read_pyhf(json).expect("pyhf accepts this workspace");
-    let text = flatppl_syntax::print_with(&m, flatppl_syntax::Syntax::Minimal);
-    assert_eq!(
-        text.matches("mcstat = elementof(cartpow(posreals, 2))")
-            .count(),
-        1,
-        "a shared staterror is one nuisance parameter, got:\n{text}"
+fn staterror_shared_across_channels_errs() {
+    assert_err_pyhf(
+        "staterror_two_channels",
+        r#"{"channels":[
+             {"name":"chA","samples":[{"name":"s","data":[10.0,20.0],
+                "modifiers":[{"name":"mcstat","type":"staterror","data":[5.0,6.0]}]}]},
+             {"name":"chB","samples":[{"name":"s","data":[30.0,40.0],
+                "modifiers":[{"name":"mcstat","type":"staterror","data":[1.0,2.0]}]}]}],
+           "observations":[{"name":"chA","data":[10.0,20.0]},{"name":"chB","data":[30.0,40.0]}],
+           "measurements":[{"name":"m","config":{"poi":"","parameters":[]}}],
+           "version":"1.0.0"}"#,
+        &[
+            "`mcstat`",
+            "spanning every channel's bins (4 here)",
+            "mcstat_chB",
+        ],
+    );
+}
+
+/// A `shapefactor` name in two channels with different bin counts.
+///
+/// pyhf builds a model, then reads past the end of its own 2-component paramset
+/// and takes the third channel-B component from whatever parameter follows. It
+/// returns a number, but not the one the document describes, so refuse. An
+/// equal-bin sharing is genuinely one parameter and converts.
+#[test]
+fn per_bin_name_shared_with_different_bin_counts_errs() {
+    assert_err_pyhf(
+        "shapefactor_unequal_bins",
+        r#"{"channels":[
+             {"name":"ca","samples":[{"name":"b","data":[50.0,60.0],"modifiers":[
+                {"name":"mu","type":"normfactor","data":null},
+                {"name":"k","type":"shapefactor","data":null}]}]},
+             {"name":"cb","samples":[{"name":"b","data":[30.0,20.0,10.0],
+                "modifiers":[{"name":"k","type":"shapefactor","data":null}]}]}],
+           "observations":[{"name":"ca","data":[52.0,58.0]},
+                           {"name":"cb","data":[31.0,19.0,11.0]}],
+           "measurements":[{"name":"m","config":{"poi":"mu","parameters":[]}}],
+           "version":"1.0.0"}"#,
+        &["`k`", "has 2 bins in channel `ca` and 3 in channel `cb`"],
     );
 }
 
@@ -255,5 +288,92 @@ fn empty_poi_is_accepted() {
     assert!(
         !text.contains("record(poi"),
         "no POI record when `poi` is empty, got:\n{text}"
+    );
+}
+
+/// Two channels named `c`.
+///
+/// pyhf: `pyhf.exceptions.InvalidModel` — "No parameters specified for the
+/// Model." (pyhf keys channels by name, so the second collapses onto the first.)
+///
+/// The importer used to give each channel its own bindings while both looked up
+/// the workspace's single `c` observation, so the observed counts entered the
+/// likelihood twice.
+#[test]
+fn duplicate_channel_name_errs() {
+    assert_err_pyhf(
+        "duplicate_channel",
+        r#"{"channels":[
+             {"name":"c","samples":[{"name":"b","data":[50.0],
+                "modifiers":[{"name":"mu","type":"normfactor","data":null}]}]},
+             {"name":"c","samples":[{"name":"b","data":[30.0],"modifiers":[]}]}],
+           "observations":[{"name":"c","data":[50.0]}],
+           "measurements":[{"name":"m","config":{"poi":"mu","parameters":[]}}],
+           "version":"1.0.0"}"#,
+        &["channel name `c` appears twice"],
+    );
+}
+
+/// Two samples named `b` in one channel.
+///
+/// pyhf: `pyhf.exceptions.InvalidModel` — "No parameters specified for the
+/// Model." pyhf keys a channel's samples by name, so the repeat collides.
+#[test]
+fn duplicate_sample_name_errs() {
+    assert_err_pyhf(
+        "duplicate_sample",
+        r#"{"channels":[
+             {"name":"c","samples":[
+                {"name":"b","data":[50.0],
+                 "modifiers":[{"name":"mu","type":"normfactor","data":null}]},
+                {"name":"b","data":[30.0],"modifiers":[]}]}],
+           "observations":[{"name":"c","data":[80.0]}],
+           "measurements":[{"name":"m","config":{"poi":"mu","parameters":[]}}],
+           "version":"1.0.0"}"#,
+        &["two samples named `b`"],
+    );
+}
+
+/// A channel with an empty `samples` array, and a workspace with no channels.
+///
+/// pyhf: `pyhf.exceptions.InvalidSpecification` — "[] should be non-empty",
+/// against `channels[0].samples` and `channels`.
+#[test]
+fn empty_channel_and_empty_channels_err() {
+    assert_err_pyhf(
+        "channel_without_samples",
+        r#"{"channels":[{"name":"c","samples":[]}],
+           "observations":[{"name":"c","data":[50.0]}],
+           "measurements":[{"name":"m","config":{"poi":"mu","parameters":[]}}],
+           "version":"1.0.0"}"#,
+        &["channel `c` has no samples"],
+    );
+    assert_err_pyhf(
+        "workspace_without_channels",
+        r#"{"channels":[],"observations":[],
+           "measurements":[{"name":"m","config":{"poi":"mu","parameters":[]}}],
+           "version":"1.0.0"}"#,
+        &["workspace has no channels"],
+    );
+}
+
+/// A histosys whose `lo_data` is shorter than the sample.
+///
+/// pyhf: `pyhf.exceptions.InvalidModifier` — "The 'b' sample histosys modifier
+/// 'h' has data shape inconsistent with the sample." The message must name the
+/// parameter, which a pyhf modifier carries in `name`, not `parameter`.
+#[test]
+fn histosys_length_mismatch_names_the_parameter() {
+    assert_err_pyhf(
+        "histosys_short_lo",
+        r#"{"channels":[
+             {"name":"c","samples":[{"name":"b","data":[50.0,60.0],"modifiers":[
+                {"name":"mu","type":"normfactor","data":null},
+                {"name":"h","type":"histosys",
+                 "data":{"lo_data":[45.0],"hi_data":[55.0]}}]}]}],
+           "observations":[{"name":"c","data":[52.0,58.0]}],
+           "measurements":[{"name":"m","config":{"poi":"mu","parameters":[]}}],
+           "version":"1.0.0"}"#,
+        &["histosys `h`", "has 1 bins but the sample nominal has 2"],
     );
 }
