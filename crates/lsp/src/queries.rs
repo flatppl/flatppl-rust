@@ -186,13 +186,19 @@ pub fn node_at_offset_indexed(index: &SpanIndex, offset: u32) -> Option<NodeId> 
 #[salsa::tracked]
 pub fn line_index(db: &dyn salsa::Database, file: SourceFile) -> LineIndex {
     #[cfg(test)]
-    LINE_INDEX_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    LINE_INDEX_RUNS.with(|c| c.set(c.get() + 1));
     LineIndex::new(file.text(db))
 }
 
-/// Test-only execution counter (proves the query is memoized per revision).
+// Per-thread execution counter for `line_index`. Thread-local so concurrent
+// tests do not interfere with each other's measurements (mirrors
+// `IMPORT_BUNDLE_RUNS`). It was a process-global `AtomicUsize`, which the
+// `document_symbol_tree` tests corrupted: they call `line_index` too, so their
+// counting raced this counter's own test.
 #[cfg(test)]
-pub static LINE_INDEX_RUNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    pub static LINE_INDEX_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 // ── document symbol tree tracked query ──────────────────────────────────────
 
@@ -251,7 +257,7 @@ unsafe impl salsa::Update for ArcSymbols {
 #[salsa::tracked]
 pub fn document_symbol_tree(db: &dyn salsa::Database, file: SourceFile) -> ArcSymbols {
     #[cfg(test)]
-    DOCUMENT_SYMBOL_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    DOCUMENT_SYMBOL_RUNS.with(|c| c.set(c.get() + 1));
     let li = line_index(db, file);
     let parsed = parse(db, file);
     let Some(module) = parsed.module(db) else {
@@ -283,10 +289,15 @@ pub fn document_symbol_tree(db: &dyn salsa::Database, file: SourceFile) -> ArcSy
     ArcSymbols(Arc::new(syms))
 }
 
-/// Test-only execution counter (proves the query is memoized per revision).
+// Per-thread execution counter for `document_symbol_tree`. Thread-local so
+// concurrent tests do not interfere with each other's measurements (mirrors
+// `IMPORT_BUNDLE_RUNS`). As a process-global `AtomicUsize` the two tests below
+// reset and read one counter, so whichever reset second made the other read the
+// wrong count.
 #[cfg(test)]
-pub static DOCUMENT_SYMBOL_RUNS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    pub static DOCUMENT_SYMBOL_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// The `documentSymbol` result as JSON text, shared by pointer.
 ///
@@ -341,16 +352,21 @@ unsafe impl salsa::Update for ArcJson {
 #[salsa::tracked]
 pub fn document_symbol_json(db: &dyn salsa::Database, file: SourceFile) -> ArcJson {
     #[cfg(test)]
-    DOCUMENT_SYMBOL_JSON_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    DOCUMENT_SYMBOL_JSON_RUNS.with(|c| c.set(c.get() + 1));
     let syms = document_symbol_tree(db, file).symbols();
     let text = serde_json::to_string(&*syms).unwrap_or_else(|_| "[]".to_owned());
     ArcJson(Arc::from(text))
 }
 
-/// Test-only execution counter (proves the query is memoized per revision).
+// Per-thread execution counter for `document_symbol_json`. Thread-local so
+// concurrent tests do not interfere with each other's measurements (mirrors
+// `IMPORT_BUNDLE_RUNS`). No test reads it yet; it was a process-global
+// `AtomicUsize` like its two neighbours, and the first test to use it would
+// have inherited the same race.
 #[cfg(test)]
-pub static DOCUMENT_SYMBOL_JSON_RUNS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    pub static DOCUMENT_SYMBOL_JSON_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 // ── Salsa field-compatibility wrapper ───────────────────────────────────────
 //
@@ -779,15 +795,14 @@ mod tests {
 
     #[test]
     fn line_index_is_memoized_per_revision() {
-        use std::sync::atomic::Ordering::Relaxed;
         let db = Database::default();
         let f = SourceFile::new(&db, "m.flatppl".to_string(), "a\nbb\nc".to_string());
-        LINE_INDEX_RUNS.store(0, Relaxed);
+        LINE_INDEX_RUNS.with(|c| c.set(0));
         let _ = line_index(&db, f);
         let _ = line_index(&db, f);
         let _ = line_index(&db, f); // 3 calls, same revision
         assert_eq!(
-            LINE_INDEX_RUNS.load(Relaxed),
+            LINE_INDEX_RUNS.with(|c| c.get()),
             1,
             "computed once per revision, not per call"
         );
@@ -795,15 +810,14 @@ mod tests {
 
     #[test]
     fn document_symbol_tree_is_memoized_per_revision() {
-        use std::sync::atomic::Ordering::Relaxed;
         let db = Database::default();
         let f = SourceFile::new(&db, "m.flatppl".to_string(), "x = 1\ny = 2".to_string());
-        DOCUMENT_SYMBOL_RUNS.store(0, Relaxed);
+        DOCUMENT_SYMBOL_RUNS.with(|c| c.set(0));
         let a = document_symbol_tree(&db, f);
         let b = document_symbol_tree(&db, f);
         let c = document_symbol_tree(&db, f);
         assert_eq!(
-            DOCUMENT_SYMBOL_RUNS.load(Relaxed),
+            DOCUMENT_SYMBOL_RUNS.with(|c| c.get()),
             1,
             "built once per revision, not per call"
         );
@@ -817,16 +831,15 @@ mod tests {
     #[test]
     fn document_symbol_tree_rebuilds_after_an_edit() {
         use salsa::Setter;
-        use std::sync::atomic::Ordering::Relaxed;
         let mut db = Database::default();
         let f = SourceFile::new(&db, "m.flatppl".to_string(), "x = 1".to_string());
-        DOCUMENT_SYMBOL_RUNS.store(0, Relaxed);
+        DOCUMENT_SYMBOL_RUNS.with(|c| c.set(0));
         assert_eq!(document_symbol_tree(&db, f).symbols().len(), 1);
         f.set_text(&mut db).to("x = 1\ny = 2".to_string());
         let after = document_symbol_tree(&db, f);
         assert_eq!(after.symbols().len(), 2, "the new binding is a symbol");
         assert_eq!(
-            DOCUMENT_SYMBOL_RUNS.load(Relaxed),
+            DOCUMENT_SYMBOL_RUNS.with(|c| c.get()),
             2,
             "a new revision rebuilds, so a stale tree is never served"
         );
