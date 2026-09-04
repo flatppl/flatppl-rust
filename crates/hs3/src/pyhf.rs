@@ -174,11 +174,9 @@ fn validate_workspace(doc: &PyhfDocument) -> Result<BTreeMap<String, AuxOverride
 /// then reads past the end of its own paramset, taking components from whatever
 /// parameter follows — so it produces numbers, but garbage ones.
 ///
-/// `staterror` disagrees more deeply: pyhf gives a shared name ONE paramset
-/// spanning every channel that carries it, each channel masking its own slice.
-/// A single `cartpow(posreals, n_bins)` parameter multiplied into both channels
-/// instead correlates gammas pyhf keeps independent, and its constraint covers
-/// only the first channel's bins. Refuse rather than emit that.
+/// `staterror` is exempt: it legitimately spans channels, with one parameter
+/// over the union of their bins and each channel slicing its own part
+/// ([`StaterrorLayout`]), so the per-channel counts need not agree.
 fn cross_channel_per_bin(
     param: &str,
     spec: &crate::histfactory::ModSpec,
@@ -190,16 +188,7 @@ fn cross_channel_per_bin(
         return Ok(());
     }
     if spec.channel_staterror {
-        return Err(Error::Unsupported(format!(
-            "`{}` modifier `{param}` appears in channels `{}` and `{channel}`; pyhf gives such a \
-             name one parameter spanning every channel's bins ({} here) with each channel using \
-             its own slice, which this importer does not emit. Give each channel's modifier its \
-             own name, as pyhf's own workspaces do (`{param}_{}`, `{param}_{channel}`)",
-            spec.kind,
-            first.channel,
-            first.n_bins + n_bins,
-            first.channel,
-        )));
+        return Ok(());
     }
     if first.n_bins != n_bins {
         return Err(Error::Unsupported(format!(
@@ -297,6 +286,20 @@ fn emit_pyhf(b: &mut Builder, doc: &PyhfDocument) -> Result<()> {
         param_overrides,
         ..Terms::default()
     };
+    // Every channel's staterror layout first: a shared name's component count
+    // is the total over the channels that carry it, and the parameter is
+    // declared while the first of them is assembled.
+    for channel in &doc.channels {
+        let n_bins = channel.samples.first().map_or(0, |s| s.data.len());
+        let params: Vec<String> = channel
+            .samples
+            .iter()
+            .flat_map(|s| s.modifiers.iter())
+            .filter(|m| mod_spec(&m.kind).is_some_and(|spec| spec.channel_staterror))
+            .filter_map(|m| m.effective_param())
+            .collect();
+        register_staterror_layout(&mut terms, &channel.name, n_bins, &params);
+    }
     for channel in &doc.channels {
         emit_channel(b, doc, channel, &mut terms)?;
     }
@@ -463,6 +466,94 @@ pub struct Terms {
     /// Per-parameter auxiliary-measurement overrides from the measurement
     /// config's `parameters` block, keyed by parameter name.
     pub param_overrides: BTreeMap<String, AuxOverride>,
+    /// Per-staterror-parameter layout across the channels that carry it. Filled
+    /// by [`register_staterror_layout`] for EVERY channel before any channel is
+    /// assembled, because the component count spans channels.
+    staterror_layout: BTreeMap<String, StaterrorLayout>,
+    /// Channel-summed nominal and squared error per staterror parameter, over
+    /// the full spanning vector. Each channel writes its own slice.
+    staterror_acc: BTreeMap<String, (Vec<f64>, Vec<f64>)>,
+    /// Per-staterror-parameter constraint type (`None` means the dialect default).
+    staterror_constraint: BTreeMap<String, Option<String>>,
+}
+
+/// One staterror parameter's layout across the channels that carry it.
+///
+/// pyhf gives a shared staterror name ONE paramset spanning every channel that
+/// carries it, each channel masking its own slice, and the components are
+/// independent (`pyhf.modifiers.staterror.staterror_builder.finalize`). `total`
+/// is that component count and `offsets` maps a channel to the index of its
+/// first component. A name used in one channel only has `total == n_bins` and a
+/// single zero offset, which is the overwhelmingly common case and is emitted
+/// exactly as it was before this existed.
+#[derive(Debug, Default, Clone)]
+struct StaterrorLayout {
+    total: usize,
+    /// Channel name -> index of that channel's first component.
+    offsets: BTreeMap<String, usize>,
+    /// Channels in document order, so the LAST one can emit the constraint.
+    order: Vec<String>,
+}
+
+/// The spanning component count and this channel's offset within it.
+///
+/// A staterror parameter used in one channel only reports `(n_bins, 0)`, which
+/// is what every path did before spanning existed.
+fn staterror_slice(terms: &Terms, param: &str, channel: &str) -> (usize, usize) {
+    match terms.staterror_layout.get(param) {
+        Some(l) => (l.total, l.offsets.get(channel).copied().unwrap_or(0)),
+        None => (0, 0),
+    }
+}
+
+/// The multiplicative factor a staterror parameter contributes to one channel.
+///
+/// A parameter confined to this channel is the whole vector, so the factor is a
+/// plain reference and nothing about the emission changes. A parameter spanning
+/// several channels is longer than this channel's bin count, so the factor is
+/// this channel's slice of it: pyhf masks the same slice, and the components
+/// are independent.
+fn staterror_factor(
+    b: &mut Builder,
+    param: &str,
+    total: usize,
+    offset: usize,
+    n_bins: usize,
+) -> NodeId {
+    if total == n_bins {
+        return b.self_ref(param);
+    }
+    let elems: Vec<NodeId> = (0..n_bins)
+        .map(|i| {
+            let whole = b.self_ref(param);
+            let index = b.lit_int((offset + i + 1) as i64); // `get` is 1-based
+            b.call("get", &[whole, index])
+        })
+        .collect();
+    b.array(&elems)
+}
+
+/// Record that `channel` has `n_bins` bins and carries staterror parameters
+/// `params`, in document order.
+///
+/// Every channel must be registered before any channel is assembled: a
+/// staterror parameter's component count is the total over the channels that
+/// carry it, and the parameter is declared while the first of them is assembled.
+pub fn register_staterror_layout(
+    terms: &mut Terms,
+    channel: &str,
+    n_bins: usize,
+    params: &[String],
+) {
+    for param in params {
+        let layout = terms.staterror_layout.entry(param.clone()).or_default();
+        if layout.offsets.contains_key(channel) {
+            continue; // several samples in one channel share the parameter
+        }
+        layout.offsets.insert(channel.to_string(), layout.total);
+        layout.order.push(channel.to_string());
+        layout.total += n_bins;
+    }
 }
 
 impl Terms {
@@ -586,12 +677,9 @@ pub fn assemble_channel(
     //
     // Key: staterror parameter name
     // Value: (sum_nom[b], sum_sq_err[b]) accumulated over staterror samples
-    let mut staterror_acc: std::collections::BTreeMap<String, (Vec<f64>, Vec<f64>)> =
-        std::collections::BTreeMap::new();
-    // Per-staterror-param constraint type (None ⇒ ROOT default Poisson).
-    let mut staterror_constraint: std::collections::BTreeMap<String, Option<String>> =
-        std::collections::BTreeMap::new();
-
+    // The accumulator and the constraint-type map live on `terms`: a staterror
+    // name may span channels, and then the constraint covers every channel's
+    // bins, so it cannot be built from one channel alone.
     for (name, nominal, modifiers) in samples {
         for modifier in *modifiers {
             if mod_spec(&modifier.kind).is_some_and(|spec| spec.channel_staterror) {
@@ -632,15 +720,18 @@ pub fn assemble_channel(
                     errors.push(e);
                 }
 
-                staterror_constraint
+                terms
+                    .staterror_constraint
                     .entry(param_name.to_string())
                     .or_insert_with(|| modifier.constraint.clone());
-                let entry = staterror_acc
+                let (total, offset) = staterror_slice(terms, param_name, channel_name);
+                let entry = terms
+                    .staterror_acc
                     .entry(param_name.to_string())
-                    .or_insert_with(|| (vec![0.0; n_bins], vec![0.0; n_bins]));
+                    .or_insert_with(|| (vec![0.0; total], vec![0.0; total]));
                 for i in 0..n_bins {
-                    entry.0[i] += nominal[i]; // sum of nominals
-                    entry.1[i] += errors[i] * errors[i]; // sum of squared errors
+                    entry.0[offset + i] += nominal[i]; // sum of nominals
+                    entry.1[offset + i] += errors[i] * errors[i]; // sum of squared errors
                 }
             }
         }
@@ -651,7 +742,19 @@ pub fn assemble_channel(
         for modifier in *modifiers {
             // `declare_modifier_param` validates the modifier kind and requires a
             // `parameter`; only dedupe once we know the name is present.
-            let param_name = declare_modifier_param(b, modifier, n_bins, &terms.declared_params)?;
+            // A staterror parameter spanning channels has more components than
+            // this channel has bins, so it is declared over its total length.
+            let mut n_components = n_bins;
+            if let Some(spec) = mod_spec(&modifier.kind)
+                && spec.channel_staterror
+                && let Some(param) = modifier.effective_param()
+                && let (total, _) = staterror_slice(terms, &param, channel_name)
+                && total > 0
+            {
+                n_components = total;
+            }
+            let param_name =
+                declare_modifier_param(b, modifier, n_components, &terms.declared_params)?;
             terms.declared_params.insert(param_name);
         }
     }
@@ -708,6 +811,16 @@ pub fn assemble_channel(
             }
             let (effect, constraint) = modifier_effect(b, modifier, nom, nominal)?;
             if let Effect::Multiply(factor) = effect {
+                // A staterror parameter may span channels, in which case this
+                // channel multiplies in only its own slice.
+                let factor = match mod_spec(&modifier.kind) {
+                    Some(spec) if spec.channel_staterror => {
+                        let param = require_param(modifier, spec)?;
+                        let (total, offset) = staterror_slice(terms, &param, channel_name);
+                        staterror_factor(b, &param, total, offset, n_bins)
+                    }
+                    _ => factor,
+                };
                 let mul = b.call_head("mul");
                 acc = b.call("broadcast", &[mul, acc, factor]);
             }
@@ -782,12 +895,29 @@ pub fn assemble_channel(
     }
 
     // ---- staterror constraints (channel-summed Barlow-Beeston, one per param) ----
-    for (param_name, (sum_nom, sum_sq)) in &staterror_acc {
+    //
+    // Emitted from the LAST channel that carries the parameter, not from a pass
+    // after every channel: for the single-channel case that is this channel, so
+    // the binding order is exactly what it was before spanning existed, and for
+    // a spanning name the accumulator is complete by then.
+    let ready: Vec<String> = terms
+        .staterror_layout
+        .iter()
+        .filter(|(p, l)| {
+            l.order.last().is_some_and(|c| c == channel_name)
+                && terms.staterror_acc.contains_key(*p)
+        })
+        .map(|(p, _)| p.clone())
+        .collect();
+    for param_name in &ready {
+        let (sum_nom, sum_sq) = terms.staterror_acc[param_name].clone();
+        let (sum_nom, sum_sq) = (&sum_nom[..], &sum_sq[..]);
         if terms.emitted_params.insert(param_name.clone()) {
             // `constraint: "Gauss"`/`"Gaussian"` selects Normal, `"Poisson"`
             // selects Poisson; with no field the dialect decides (see
             // `Terms::staterror_gaussian_default`).
-            let gaussian = match staterror_constraint
+            let gaussian = match terms
+                .staterror_constraint
                 .get(param_name)
                 .and_then(|c| c.as_deref())
             {

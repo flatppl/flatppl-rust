@@ -218,37 +218,6 @@ fn normsys_and_histosys_may_share_a_name() {
     );
 }
 
-/// One `staterror` name across two channels.
-///
-/// pyhf accepts it and gives the name ONE paramset spanning both channels'
-/// bins: for the workspace below, 4 components with sigmas
-/// [0.5, 0.3, 0.0333.., 0.05] and auxdata [1, 1, 1, 1], each channel masking
-/// its own two. A single `cartpow(posreals, 2)` parameter multiplied into both
-/// channels instead correlates gammas pyhf keeps independent, and its
-/// constraint covers only the first channel's bins. That is what the importer
-/// used to emit, and it is silently wrong, so refuse until the spanning form is
-/// implemented. pyhf's own workspaces name these per channel
-/// (`staterror_channel1`), which converts.
-#[test]
-fn staterror_shared_across_channels_errs() {
-    assert_err_pyhf(
-        "staterror_two_channels",
-        r#"{"channels":[
-             {"name":"chA","samples":[{"name":"s","data":[10.0,20.0],
-                "modifiers":[{"name":"mcstat","type":"staterror","data":[5.0,6.0]}]}]},
-             {"name":"chB","samples":[{"name":"s","data":[30.0,40.0],
-                "modifiers":[{"name":"mcstat","type":"staterror","data":[1.0,2.0]}]}]}],
-           "observations":[{"name":"chA","data":[10.0,20.0]},{"name":"chB","data":[30.0,40.0]}],
-           "measurements":[{"name":"m","config":{"poi":"","parameters":[]}}],
-           "version":"1.0.0"}"#,
-        &[
-            "`mcstat`",
-            "spanning every channel's bins (4 here)",
-            "mcstat_chB",
-        ],
-    );
-}
-
 /// A `shapefactor` name in two channels with different bin counts.
 ///
 /// pyhf builds a model, then reads past the end of its own 2-component paramset

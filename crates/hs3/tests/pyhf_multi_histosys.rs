@@ -83,3 +83,87 @@ fn shapesys_tau_uses_the_unshifted_nominal() {
         "tau must divide the unshifted nominal, got:\n{text}"
     );
 }
+
+/// One `staterror` name across two channels.
+///
+/// pyhf gives such a name ONE paramset spanning every channel that carries it,
+/// each channel masking its own slice, and the components are independent. For
+/// the workspace below that is four components with sigmas
+/// [0.5, 0.3, 1/30, 0.05] and auxdata [1, 1, 1, 1]; pyhf's logpdf is
+/// -5.269013574690845 at init and -32.9547729941094 at [1.1, 0.9, 1.2, 0.8],
+/// which the flatppl-js engine reproduces to 2e-14 on this emission.
+const SPANNING_STATERROR: &str = r#"{
+  "channels": [
+    { "name": "chA",
+      "samples": [{ "name": "s", "data": [10.0, 20.0],
+        "modifiers": [{ "name": "mcstat", "type": "staterror", "data": [5.0, 6.0] }] }] },
+    { "name": "chB",
+      "samples": [{ "name": "s", "data": [30.0, 40.0],
+        "modifiers": [{ "name": "mcstat", "type": "staterror", "data": [1.0, 2.0] }] }] }
+  ],
+  "observations": [{ "name": "chA", "data": [10.0, 20.0] },
+                   { "name": "chB", "data": [30.0, 40.0] }],
+  "measurements": [{ "name": "m", "config": { "poi": "", "parameters": [] } }]
+}"#;
+
+#[test]
+fn a_staterror_name_spans_the_channels_that_carry_it() {
+    let m = flatppl_hs3::read(SPANNING_STATERROR).unwrap();
+    let text = flatppl_syntax::print_with(&m, flatppl_syntax::Syntax::Minimal);
+    // ONE parameter over the union of both channels' bins, not one per channel.
+    assert!(
+        text.contains("mcstat = elementof(cartpow(posreals, 4))"),
+        "expected a 4-component parameter, got:\n{text}"
+    );
+    assert_eq!(
+        text.matches("mcstat = elementof").count(),
+        1,
+        "one declaration only, got:\n{text}"
+    );
+    // Each channel multiplies in its own disjoint slice. `get` is 1-based.
+    assert!(
+        text.contains(
+            "chA_s_expected = broadcast(mul, chA_s_nominal, \
+                       [get(mcstat, 1), get(mcstat, 2)])"
+        ) && text.contains(
+            "chB_s_expected = broadcast(mul, chB_s_nominal, \
+                              [get(mcstat, 3), get(mcstat, 4)])"
+        ),
+        "expected per-channel slices, got:\n{text}"
+    );
+    // One constraint over the whole vector, with pyhf's per-channel sigmas.
+    assert!(
+        text.contains("mcstat_delta = [0.5, 0.3, 0.03333333333333333, 0.05]")
+            && text.contains("likelihoodof(mcstat_constraint, [1.0, 1.0, 1.0, 1.0])"),
+        "expected one spanning constraint, got:\n{text}"
+    );
+    assert_eq!(
+        text.matches("mcstat_constraint_likelihood =").count(),
+        1,
+        "one constraint term only, got:\n{text}"
+    );
+}
+
+/// A staterror name confined to ONE channel must emit exactly what it did
+/// before spanning existed: a plain reference, not a one-element slice.
+#[test]
+fn a_single_channel_staterror_is_not_sliced() {
+    let m = flatppl_hs3::read(
+        r#"{
+  "channels": [
+    { "name": "c",
+      "samples": [{ "name": "b", "data": [50.0, 60.0],
+        "modifiers": [{ "name": "mu", "type": "normfactor", "data": null },
+                      { "name": "st", "type": "staterror", "data": [5.0, 6.0] }] }] }
+  ],
+  "observations": [{ "name": "c", "data": [52.0, 58.0] }],
+  "measurements": [{ "name": "m", "config": { "poi": "mu", "parameters": [] } }]
+}"#,
+    )
+    .unwrap();
+    let text = flatppl_syntax::print_with(&m, flatppl_syntax::Syntax::Minimal);
+    assert!(
+        text.contains("st = elementof(cartpow(posreals, 2))") && !text.contains("get(st,"),
+        "a single-channel staterror must not be sliced, got:\n{text}"
+    );
+}

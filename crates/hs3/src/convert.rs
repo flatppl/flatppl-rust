@@ -904,6 +904,26 @@ fn emit_histfactory_channels(m: &mut Module, doc: &Document) -> Result<()> {
     let mut b = Builder::new(m);
     let mut bound_hepphys = false;
     let mut terms = crate::pyhf::Terms::default();
+
+    // Every channel's staterror layout first: a name shared across channels is
+    // ONE parameter over the union of their bins, and it is declared while the
+    // first of them is assembled, so the total has to be known up front.
+    for d in &doc.distributions {
+        if d.kind != "histfactory_dist" {
+            continue;
+        }
+        let hf: HistFactory = serde_json::from_value(serde_json::to_value(&d.extra)?)?;
+        let n_bins = hf.samples.first().map_or(0, |s| s.data.contents().len());
+        let params: Vec<String> = hf
+            .samples
+            .iter()
+            .flat_map(|s| s.modifiers.iter())
+            .filter(|mo| mo.kind == "staterror")
+            .filter_map(|mo| mo.effective_param())
+            .collect();
+        crate::pyhf::register_staterror_layout(&mut terms, &d.name, n_bins, &params);
+    }
+
     for d in &doc.distributions {
         if d.kind != "histfactory_dist" {
             continue;
