@@ -263,14 +263,20 @@ fn collect_param_overrides(
                     )));
                 }
             }
+            // FIRST measurement wins, matching pyhf's own default: with no
+            // `measurement_name` given, `Workspace.get_measurement` takes index
+            // 0 and logs "multiple measurements defined. Taking the first
+            // measurement." A module has one `likelihood`, so it can carry one
+            // measurement's configuration; taking the LAST would silently
+            // disagree with that default whenever two measurements differ.
             let e = out.entry(p.name.clone()).or_default();
-            if !p.auxdata.is_empty() {
+            if e.auxdata.is_empty() {
                 e.auxdata = p.auxdata.clone();
             }
-            if !p.sigmas.is_empty() {
+            if e.sigmas.is_empty() {
                 e.sigmas = p.sigmas.clone();
             }
-            if !p.factors.is_empty() {
+            if e.factors.is_empty() {
                 e.factors = p.factors.clone();
             }
         }

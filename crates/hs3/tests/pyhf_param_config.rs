@@ -153,3 +153,42 @@ fn staterror_degenerate_bin_gets_a_unit_width() {
         "expected delta [0.1, 1.0], got:\n{text}"
     );
 }
+
+#[test]
+fn the_first_measurement_wins_a_disagreement() {
+    // A module has one `likelihood`, so it carries one measurement's
+    // configuration. pyhf's own default is index 0: with no `measurement_name`,
+    // `Workspace.get_measurement` takes the first and logs "multiple
+    // measurements defined. Taking the first measurement." Taking the LAST
+    // silently disagreed with that default.
+    let text = convert(
+        r#"{
+  "channels": [
+    { "name": "c",
+      "samples": [
+        { "name": "sig", "data": [20.0, 10.0],
+          "modifiers": [{ "name": "mu", "type": "normfactor", "data": null }] },
+        { "name": "bkg", "data": [50.0, 60.0],
+          "modifiers": [{ "name": "t", "type": "normsys",
+                          "data": { "lo": 0.9, "hi": 1.15 } }] }
+      ] }
+  ],
+  "observations": [{ "name": "c", "data": [72.0, 68.0] }],
+  "measurements": [
+    { "name": "meas_a",
+      "config": { "poi": "mu", "parameters": [{ "name": "t", "auxdata": [0.5] }] } },
+    { "name": "meas_b",
+      "config": { "poi": "mu", "parameters": [{ "name": "t", "auxdata": [-0.75] }] } }
+  ]
+}"#,
+    );
+    assert!(
+        text.contains("t_constraint_likelihood = likelihoodof(t_constraint, 0.5)"),
+        "expected the first measurement's auxdata, got:\n{text}"
+    );
+    // Both measurements still declare their parameter of interest.
+    assert!(
+        text.contains("meas_a = record(poi = mu)") && text.contains("meas_b = record(poi = mu)"),
+        "got:\n{text}"
+    );
+}
