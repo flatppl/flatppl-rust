@@ -12,7 +12,7 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::select;
+use crossbeam_channel::{Receiver, select};
 use lsp_server::{Connection, ErrorCode, Message, RequestId, Response};
 use lsp_types::{
     CompletionOptions, HoverProviderCapability, OneOf, PublishDiagnosticsParams,
@@ -30,19 +30,122 @@ use lsp_types::{
 
 use crate::db::{Catalogues, Database, FileSet, SourceFile};
 use crate::line_index::Pos;
+use crate::outbound::{Outbound, Outgoing};
 use crate::queries::{import_bundle, line_index, node_span_index};
 
 // ── run ─────────────────────────────────────────────────────────────────────
 
-/// Drive the FlatPPL LSP event loop.
+/// The client connection: the receive half, and the writer this server owns.
 ///
-/// `connection` is the live [`Connection`] returned by `Connection::stdio()`;
-/// the initialize handshake must have been completed **before** calling this
-/// function (i.e. `connection.initialize` or the start/finish pair have already
-/// been called).  `init_params` is the raw `serde_json::Value` returned from
-/// the handshake.
+/// The write half is an [`Outbound`] rather than `lsp_server`'s sender so a
+/// response body that is already JSON can go straight to the wire — see the
+/// [`crate::outbound`] module for why that matters.
+pub struct Wire {
+    pub receiver: Receiver<Message>,
+    pub out: Outbound,
+}
+
+/// Answer the initialize handshake on `wire`, returning the client's
+/// `InitializeParams` for [`run_on`].
+///
+/// Replaces `Connection::initialize`, which writes through `lsp_server`'s own
+/// sender. Only one writer may hold the output stream, so a server whose
+/// [`Outbound`] owns stdout must answer the handshake through it too.
+pub fn handshake(
+    wire: &Wire,
+    server_capabilities: serde_json::Value,
+) -> Result<serde_json::Value, Box<dyn std::error::Error + Sync + Send>> {
+    loop {
+        let msg = wire.receiver.recv()?;
+        match msg {
+            Message::Request(req) if req.method == "initialize" => {
+                let result = serde_json::json!({ "capabilities": server_capabilities });
+                wire.out
+                    .send(Message::Response(Response::new_ok(req.id, result)))?;
+                // The client must acknowledge before any other traffic. A
+                // request before `initialized` is a client bug, and answering
+                // it against a half-built server is worse than refusing it.
+                match wire.receiver.recv()? {
+                    Message::Notification(n) if n.method == "initialized" => return Ok(req.params),
+                    other => {
+                        return Err(
+                            format!("expected initialized notification, got {other:?}").into()
+                        );
+                    }
+                }
+            }
+            // LSP 3.17: every request before `initialize` is answered
+            // `ServerNotInitialized`, and every notification but `exit` is
+            // dropped.
+            Message::Request(req) => {
+                wire.out.send(Message::Response(Response::new_err(
+                    req.id,
+                    ErrorCode::ServerNotInitialized as i32,
+                    format!("expected an initialize request, got {}", req.method),
+                )))?;
+            }
+            Message::Notification(n) if n.method == "exit" => {
+                return Err("client exited before initialize".into());
+            }
+            Message::Notification(_) | Message::Response(_) => {}
+        }
+    }
+}
+
+/// Answer a `shutdown` request and wait for the `exit` notification.
+///
+/// `Ok(false)` for any other request. Replaces `Connection::handle_shutdown`
+/// for the same reason [`handshake`] replaces `Connection::initialize`.
+fn handle_shutdown(
+    wire: &Wire,
+    req: &lsp_server::Request,
+) -> Result<bool, Box<dyn std::error::Error + Sync + Send>> {
+    if req.method != "shutdown" {
+        return Ok(false);
+    }
+    wire.out
+        .send(Message::Response(Response::new_ok(req.id.clone(), ())))?;
+    // LSP 3.17 has the client send `exit` after the shutdown response. The
+    // bound is `lsp_server`'s: a client that never sends it must not wedge the
+    // process.
+    match wire
+        .receiver
+        .recv_timeout(std::time::Duration::from_secs(30))
+    {
+        Ok(Message::Notification(n)) if n.method == "exit" => Ok(true),
+        // Anything else means the client kept talking after shutdown. Exit
+        // anyway: the server has promised to stop.
+        Ok(_) | Err(_) => Ok(true),
+    }
+}
+
+/// Drive the FlatPPL LSP event loop over an `lsp_server::Connection`.
+///
+/// For a host that drives the server over channels, including the integration
+/// tests. The initialize handshake must have completed before this call, and
+/// `init_params` is the raw `serde_json::Value` it returned. A `documentSymbol`
+/// answer is materialised back into a `serde_json::Value` for the channel,
+/// which the stdio server avoids — see [`crate::outbound`].
 pub fn run(
     connection: Connection,
+    init_params: serde_json::Value,
+) -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
+    let Connection { sender, receiver } = connection;
+    let (out, forwarder) = Outbound::to_messages(sender);
+    let result = run_on(Wire { receiver, out }, init_params);
+    // The forwarder ends when the last `Outbound` clone drops, which `run_on`
+    // has already done by returning.
+    let _ = forwarder.join();
+    result
+}
+
+/// Drive the FlatPPL LSP event loop.
+///
+/// The initialize handshake must have completed before this call (see
+/// [`handshake`]), and `init_params` is the raw `serde_json::Value` it
+/// returned.
+pub fn run_on(
+    connection: Wire,
     init_params: serde_json::Value,
 ) -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
     let mut db = Database::default();
@@ -171,10 +274,11 @@ pub fn run(
     // means "handled internally, no client message to process this iteration".
 
     loop {
-        // Taking a reply means serialising it, so hold off while the writer
-        // still has `OUTBOUND_BACKLOG` messages to get through. The replies
-        // stay in the channel as shared handles and cost nothing meanwhile.
-        let throttled = connection.sender.len() >= OUTBOUND_BACKLOG;
+        // A reply that is not a `Reply::Raw` still carries a
+        // `serde_json::Value`, so hold off while the writer has
+        // `OUTBOUND_BACKLOG` messages to get through. An untaken reply sits in
+        // the channel, and the request behind it in the pool's queue.
+        let throttled = connection.out.backlog() >= OUTBOUND_BACKLOG;
         let results = if throttled { &no_results } else { &result_rx };
         let debounce_wait = diag_deadline.map(|d| d.saturating_duration_since(Instant::now()));
         let wait = match (throttled, debounce_wait) {
@@ -347,7 +451,7 @@ pub fn run(
                                     version: None,
                                 },
                             );
-                            connection.sender.send(Message::Notification(note))?;
+                            connection.out.send(Message::Notification(note))?;
                         }
                         for doc_uri_str in uri_to_file.keys() {
                             dirty.insert(doc_uri_str.clone());
@@ -501,7 +605,7 @@ pub fn run(
             Message::Request(req) => {
                 // Handle shutdown first. `handle_shutdown` answers it itself, so
                 // it never enters `pending`.
-                if connection.handle_shutdown(&req)? {
+                if handle_shutdown(&connection, &req)? {
                     break;
                 }
                 pending.insert(req.id.clone());
@@ -593,26 +697,14 @@ fn take_cancelled(cancelled: &Arc<Mutex<HashSet<RequestId>>>, id: &RequestId) ->
 
 /// What a worker hands back to the main thread.
 ///
-/// A big result travels as a shared handle and becomes JSON on the main thread
-/// immediately before the write. `serde_json::Value` costs roughly 38x the JSON
-/// text it represents — every `DocumentSymbol` becomes seven nested `Map`s, and
-/// serde_json's `Map` is a `BTreeMap`, so each one allocates a node however few
-/// keys it holds. A 4,000-binding file answers 0.77 MiB of JSON as roughly
-/// 19 MiB of `Value`, so building it on the worker meant one copy per
-/// outstanding request. Building it here means one copy at a time.
-///
-/// `lsp_server` 0.8 offers no way to hand the writer a pre-serialised payload:
-/// `Response::result` is an owned `serde_json::Value`, and serde_json's
-/// `RawValue` does not survive `to_value` — its emitter re-parses the text into
-/// a full `Value`. Deferring the conversion is what is available.
+/// A large answer travels as shared JSON text, memoized per revision, so a
+/// queued response costs a refcount rather than a `serde_json::Value` — see
+/// [`crate::outbound`] for the 38x that saves.
 enum Reply {
     /// An already-formed message: an error, or a result whose `Value` is small.
     Ready(Message),
-    /// A document symbol tree, serialised on the main thread.
-    Symbols {
-        id: RequestId,
-        syms: Arc<Vec<lsp_types::DocumentSymbol>>,
-    },
+    /// A response body that is already JSON.
+    Raw { id: RequestId, result: Arc<str> },
 }
 
 impl Reply {
@@ -621,20 +713,19 @@ impl Reply {
         match self {
             Reply::Ready(Message::Response(resp)) => Some(&resp.id),
             Reply::Ready(_) => None,
-            Reply::Symbols { id, .. } => Some(id),
+            Reply::Raw { id, .. } => Some(id),
         }
     }
 }
 
 /// Responses handed to the writer and not yet on the wire.
 ///
-/// The writer's backlog is what a request flood turns into resident memory, at
-/// about 19 MiB per queued `documentSymbol` answer. While the backlog is at
-/// least this deep the main thread stops taking worker replies, so the excess
-/// waits as a queued job (a `Database` clone and a `Request`) instead of as
-/// serialised JSON. It refuses nothing: a delayed request is still answered as
-/// soon as the client reads. Raising it trades resident memory for nothing —
-/// the writer only ever needs one message to work on.
+/// A queued `Reply::Raw` is cheap, but the handlers that still build a
+/// `serde_json::Value` on the worker are not, so the writer's backlog is
+/// capped: while it is at least this deep the main thread stops taking worker
+/// replies, and the excess waits as a queued job (a `Database` clone and a
+/// `Request`) instead of as a `Value`. It refuses nothing — a delayed request
+/// is still answered as soon as the client reads.
 const OUTBOUND_BACKLOG: usize = 4;
 
 /// How often to re-check the writer's backlog while throttled.
@@ -652,7 +743,7 @@ const THROTTLE_POLL: Duration = Duration::from_millis(2);
 /// pass through untouched. A duplicate is dropped *before* its JSON is built,
 /// so a cancelled request costs no serialisation.
 fn answer(
-    connection: &Connection,
+    connection: &Wire,
     pending: &mut HashSet<RequestId>,
     reply: Reply,
 ) -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
@@ -661,14 +752,10 @@ fn answer(
             return Ok(()); // already answered by another path
         }
     }
-    let msg = match reply {
-        Reply::Ready(msg) => msg,
-        // `DocumentSymbolResponse::Nested` is an untagged wrapper around the
-        // vec, so serialising the slice produces the same wire shape without
-        // cloning the tree out of the shared handle.
-        Reply::Symbols { id, syms } => Message::Response(Response::new_ok(id, &*syms)),
-    };
-    connection.sender.send(msg)?;
+    match reply {
+        Reply::Ready(msg) => connection.out.send(msg)?,
+        Reply::Raw { id, result } => connection.out.send(Outgoing::RawResult { id, result })?,
+    }
     Ok(())
 }
 
@@ -686,7 +773,7 @@ fn answer(
 /// gone. Jobs a worker already picked up are untouched; they finish, or unwind
 /// with `salsa::Cancelled`, which answers the same code.
 fn release_stale_requests(
-    connection: &Connection,
+    connection: &Wire,
     pool: &crate::pool::Pool,
     pending: &mut HashSet<RequestId>,
 ) -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
@@ -848,7 +935,7 @@ fn handle_request_response(
 /// (no interleaving with worker responses mid-flush). URIs no longer tracked
 /// (e.g. a file deleted between dirtying and flush) are skipped.
 fn flush_dirty(
-    connection: &Connection,
+    connection: &Wire,
     db: &Database,
     fs: FileSet,
     cats: Catalogues,
@@ -1318,7 +1405,7 @@ fn upsert_url_source(
 /// `uri_str` must be a valid URI string; the send is best-effort (a send
 /// failure is returned as an error to the caller).
 fn publish_diagnostics(
-    connection: &Connection,
+    connection: &Wire,
     db: &Database,
     file: SourceFile,
     fs: FileSet,
@@ -1334,7 +1421,7 @@ fn publish_diagnostics(
         version,
     };
     let note = lsp_server::Notification::new(PublishDiagnostics::METHOD.to_owned(), params);
-    connection.sender.send(Message::Notification(note))?;
+    connection.out.send(Message::Notification(note))?;
     Ok(())
 }
 
@@ -1382,9 +1469,9 @@ fn handle_hover(
     }
 }
 
-/// Handle a `textDocument/documentSymbol` request.  Returns the shared symbol
-/// tree without serialising it — the main thread builds the JSON immediately
-/// before the write (see [`Reply`]).
+/// Handle a `textDocument/documentSymbol` request.  Returns the response body
+/// as shared JSON text, memoized per revision, without building a
+/// `serde_json::Value` for it (see [`crate::outbound`]).
 fn handle_document_symbols(
     db: &Database,
     uri_to_file: &HashMap<String, SourceFile>,
@@ -1394,17 +1481,17 @@ fn handle_document_symbols(
         Ok(p) => p,
         Err(e) => return Reply::Ready(Message::Response(invalid_params(req, "documentSymbol", e))),
     };
-    let syms = (|| {
+    let result = (|| {
         let uri_str = params.text_document.uri.as_str().to_owned();
         let file = *uri_to_file.get(&uri_str)?;
-        Some(crate::capabilities::document_symbols(db, file))
+        Some(crate::queries::document_symbol_json(db, file).text())
     })()
     // An untracked URI has no symbols, which is the empty tree, not an error.
-    .unwrap_or_default();
+    .unwrap_or_else(|| Arc::from("[]"));
 
-    Reply::Symbols {
+    Reply::Raw {
         id: req.id.clone(),
-        syms,
+        result,
     }
 }
 
