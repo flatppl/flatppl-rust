@@ -417,6 +417,80 @@ fn declare_free_params(
         // emitted FlatPPL has an unresolved reference. Declare any such
         // identifier here.
         declare_generic_expr_params(&mut b, doc, dist_names, fn_names, &mut declared)?;
+        // Free parameters named ONLY in a `functions` entry's operand arrays are
+        // seen by neither walk above: the field walk covers `doc.distributions`
+        // and the expression walk covers `expression` strings.
+        declare_function_operand_params(&mut b, doc, dist_names, fn_names, &mut declared)?;
+    }
+    Ok(())
+}
+
+/// Declare free parameters named in a `functions` entry's operand arrays:
+/// `coefficients` (polynomial), `summands` (sum), `factors` (product).
+///
+/// `declare_free_params` walks `doc.distributions`' string fields and
+/// `declare_generic_expr_params` walks `expression` strings, so a name that
+/// appears only here reached neither: rf301's
+/// `{"type":"polynomial","coefficients":["a0","a1"],"x":"y"}` emitted
+/// `fy = y -> polynomial([a0, a1], y)` over two unresolvable names.
+/// `declare_array_params` does handle `coefficients`, but only for the
+/// `polynomial_dist` / `chebychev_dist` / `mixture_dist` DISTRIBUTIONS.
+///
+/// The guards and the domain rule are [`declare_generic_expr_params`]'s, so the
+/// two entry points cannot disagree about what counts as a parameter: an
+/// operand is declared only when `parameter_points` lists it, and it is skipped
+/// when it names a distribution, a function, or an observable. The observable
+/// guard is load-bearing here in a way it is not for the coefficient arrays: a
+/// `sum`'s operands legitimately include its bound variable (rf302's
+/// `{"type":"sum","summands":["a0","y"]}`), and `y` is in `parameter_points`
+/// too, as its reference-point value.
+fn declare_function_operand_params(
+    b: &mut Builder,
+    doc: &Document,
+    dist_names: &BTreeSet<&str>,
+    fn_names: &BTreeSet<&str>,
+    declared: &mut BTreeSet<String>,
+) -> Result<()> {
+    let bounds = domain_bounds(doc)?;
+    let observables = observable_names(doc);
+    let param_point_names: BTreeSet<&str> = doc
+        .parameter_points
+        .iter()
+        .flat_map(|pp| pp.entries.iter().map(|e| e.name.as_str()))
+        .collect();
+
+    for f in &doc.functions {
+        for key in ["coefficients", "summands", "factors"] {
+            let Some(arr) = f.extra.get(key).and_then(|v| v.as_array()) else {
+                continue;
+            };
+            for elem in arr {
+                let Some(name) = elem.as_str() else { continue };
+                // A numeric literal written as a string is a constant operand;
+                // `field_node` lowers it to a literal, so declaring it would
+                // emit an invalid `1.0 = elementof(...)`.
+                if name.parse::<f64>().is_ok()
+                    || dist_names.contains(name)
+                    || fn_names.contains(name)
+                    || observables.contains(name)
+                    || declared.contains(name)
+                    || !param_point_names.contains(name)
+                {
+                    continue;
+                }
+                check_binding_name(name, "free parameter")?;
+                let set = match bounds.get(name) {
+                    Some(&(lo, hi)) => {
+                        let lo = b.lit_real(lo);
+                        let hi = b.lit_real(hi);
+                        b.call("interval", &[lo, hi])
+                    }
+                    None => b.call_head("reals"),
+                };
+                b.bind_set(name, set);
+                declared.insert(name.to_string());
+            }
+        }
     }
     Ok(())
 }
@@ -1120,8 +1194,22 @@ fn find_histfactory_observed(doc: &Document, dist_name: &str) -> Option<Vec<f64>
 ///   here — the expression is a deterministic scalar/function-valued formula).
 fn emit_function(b: &mut Builder, f: &Function, observables: &BTreeSet<String>) -> Result<()> {
     match f.kind.as_str() {
-        "product" => fold_function(b, f, "factors", "mul", "HS3 product function → fold of mul")?,
-        "sum" => fold_function(b, f, "summands", "add", "HS3 sum function → fold of add")?,
+        "product" => fold_function(
+            b,
+            f,
+            "factors",
+            "mul",
+            "HS3 product function → fold of mul",
+            observables,
+        )?,
+        "sum" => fold_function(
+            b,
+            f,
+            "summands",
+            "add",
+            "HS3 sum function → fold of add",
+            observables,
+        )?,
         "generic_function" => {
             let expression = f
                 .extra
@@ -1199,7 +1287,23 @@ fn emit_function(b: &mut Builder, f: &Function, observables: &BTreeSet<String>) 
 /// builtin over its operands. `key` is the operand-array field (`factors` /
 /// `summands`), `op` the fold builtin (`mul` / `add`), and `doc` the provenance
 /// line. Errs if the operand array is missing or empty.
-fn fold_function(b: &mut Builder, f: &Function, key: &str, op: &str, doc: &str) -> Result<()> {
+///
+/// An operand naming an observable makes the entry a function OF that
+/// observable, so the fold is wrapped in a lambda over it, exactly as
+/// `generic_function` and `polynomial` already do. rf302's
+/// `{"type":"sum","summands":["a0","y"]}` emitted the bare `fy_3 = a0 + y`,
+/// leaving the observable `y` unresolvable at module level; it is now
+/// `fy_3 = y -> a0 + y`. A fold over parameters only stays a bare scalar
+/// binding, since wrapping it would make it function-valued where a real is
+/// expected.
+fn fold_function(
+    b: &mut Builder,
+    f: &Function,
+    key: &str,
+    op: &str,
+    doc: &str,
+    observables: &BTreeSet<String>,
+) -> Result<()> {
     let operands = f.extra.get(key).and_then(|v| v.as_array()).ok_or_else(|| {
         Error::Unsupported(format!("{} function `{}` missing `{key}`", f.kind, f.name))
     })?;
@@ -1209,6 +1313,13 @@ fn fold_function(b: &mut Builder, f: &Function, key: &str, op: &str, doc: &str) 
             f.kind, f.name
         )));
     }
+    // The observable this fold is a function of: the FIRST operand naming one,
+    // in document order, mirroring `generic_observable`'s first-free-identifier
+    // rule so the two paths agree on a multi-observable entry.
+    let obs_name: Option<&str> = operands
+        .iter()
+        .filter_map(|v| v.as_str())
+        .find(|s| observables.contains(*s));
     let nodes: Vec<_> = operands
         .iter()
         .map(|v| field_node(b, v))
@@ -1217,7 +1328,11 @@ fn fold_function(b: &mut Builder, f: &Function, key: &str, op: &str, doc: &str) 
         .into_iter()
         .reduce(|acc, x| b.call(op, &[acc, x]))
         .expect("non-empty operands checked above");
-    b.bind_doc(&f.name, folded, &[doc]);
+    let node = match obs_name {
+        Some(obs) => crate::expr::wrap_lambda(b, folded, obs),
+        None => folded,
+    };
+    b.bind_doc(&f.name, node, &[doc]);
     Ok(())
 }
 

@@ -548,3 +548,111 @@ fn generic_dist_piecewise_ternary_converts() {
         parsed.err()
     );
 }
+
+// ---------------------------------------------------------------------------
+// functions: operand names are free parameters, and a fold over an observable
+// is a function OF it.
+//
+// HS3 §"Functions": a `polynomial`'s `coefficients` and a `sum`/`product`'s
+// `summands`/`factors` name model quantities. A name there is a parameter of
+// the model exactly as one in a distribution field is, so it needs a binding;
+// and an entry whose operands include its observable denotes a function of
+// that observable, not a scalar.
+//
+// Neither held before. `declare_free_params` walks distribution fields and
+// `declare_generic_expr_params` walks `expression` strings, so a name appearing
+// only in an operand array reached neither and emitted an unresolvable
+// reference. And a fold ignored its observable, emitting a bare expression over
+// a name unbound at module level.
+//
+// The two folds above keep their bare form on purpose: their operands are
+// parameters only, so there is no observable to be a function of. That is why
+// those goldens do not move, and it is also why the defect survived them.
+// ---------------------------------------------------------------------------
+
+const FUNCTION_OPERANDS_JSON: &str = r#"{
+  "functions": [
+    {"name": "poly_fn", "type": "polynomial", "coefficients": ["a0", "a1"], "x": "y"},
+    {"name": "sum_over_obs", "type": "sum", "summands": ["a0", "y"]},
+    {"name": "prod_over_obs", "type": "product", "factors": ["a1", "y"]},
+    {"name": "sum_params_only", "type": "sum", "summands": ["a0", "a1"]}
+  ],
+  "distributions": [
+    {"name": "obs_dist", "type": "gaussian_dist", "mean": "mu", "sigma": "sig", "x": "y"}
+  ],
+  "domains": [
+    {"name": "default_domain", "type": "product_domain", "axes": [
+      {"name": "a0", "min": -5.0, "max": 5.0},
+      {"name": "a1", "min": -1.0, "max": 1.0}
+    ]}
+  ],
+  "parameter_points": [
+    {"name": "nominal", "parameters": [
+      {"name": "a0", "value": -0.5},
+      {"name": "a1", "value": -0.5},
+      {"name": "y", "value": 0.0},
+      {"name": "mu", "value": 0.0},
+      {"name": "sig", "value": 1.0}
+    ]}
+  ]
+}"#;
+
+#[test]
+fn function_operand_names_are_declared_free_parameters() {
+    let m = flatppl_hs3::read_hs3(FUNCTION_OPERANDS_JSON).expect("read_hs3 must succeed");
+    let text = print_with(&m, Syntax::Minimal);
+
+    // Declared over the `domains` axis when there is one, matching the rule
+    // `declare_generic_expr_params` already uses for expression identifiers.
+    assert!(
+        text.contains("a0 = elementof(interval(-5.0, 5.0))")
+            && text.contains("a1 = elementof(interval(-1.0, 1.0))"),
+        "operand names must be declared over their domain axis, got:\n{text}"
+    );
+    // `y` is the observable, listed in parameter_points as its reference-point
+    // value. It is the lambda's bound variable, NOT a module binding.
+    assert!(
+        !text.contains("y = elementof"),
+        "the observable must not be declared as a free parameter, got:\n{text}"
+    );
+
+    let parsed = parse(&text);
+    assert!(
+        parsed.is_ok(),
+        "round-trip parse failed: {:?}\n\nEmitted:\n{text}",
+        parsed.err()
+    );
+}
+
+#[test]
+fn a_fold_over_an_observable_is_a_lambda() {
+    let m = flatppl_hs3::read_hs3(FUNCTION_OPERANDS_JSON).expect("read_hs3 must succeed");
+    let text = print_with(&m, Syntax::Minimal);
+
+    // A fold whose operands include the observable is a function of it, the
+    // same shape the sibling `polynomial` entry already emits.
+    // Minimal syntax spells a lambda `functionof(<body>, <param> = <hole>)`;
+    // canonical syntax prints the same node as `y -> <body>`.
+    assert!(
+        text.contains("sum_over_obs = functionof(add(a0, _y_), y = _y_)")
+            && text.contains("prod_over_obs = functionof(mul(a1, _y_), y = _y_)"),
+        "a fold over an observable must be a lambda over it, got:\n{text}"
+    );
+    assert!(
+        text.contains("poly_fn = functionof(polynomial([a0, a1], _y_), y = _y_)"),
+        "the polynomial sibling pins the shape being matched, got:\n{text}"
+    );
+    // A fold over parameters ONLY stays a bare scalar: wrapping it would make
+    // it function-valued where a real is expected.
+    assert!(
+        text.contains("sum_params_only = add(a0, a1)"),
+        "a parameter-only fold must stay bare, got:\n{text}"
+    );
+
+    let parsed = parse(&text);
+    assert!(
+        parsed.is_ok(),
+        "round-trip parse failed: {:?}\n\nEmitted:\n{text}",
+        parsed.err()
+    );
+}

@@ -155,7 +155,7 @@ pub(crate) fn wrap_lambda_multi(b: &mut Builder, body: NodeId, obs_names: &[&str
     }))
 }
 
-fn wrap_lambda(b: &mut Builder, body: NodeId, obs_name: &str) -> NodeId {
+pub(crate) fn wrap_lambda(b: &mut Builder, body: NodeId, obs_name: &str) -> NodeId {
     wrap_lambda_multi(b, body, &[obs_name])
 }
 
