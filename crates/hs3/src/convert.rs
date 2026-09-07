@@ -740,6 +740,61 @@ fn ordered_record_axes(
         .collect()
 }
 
+/// The observable a `functions` entry is a function OF, or `None` when it is a
+/// function of parameters only.
+///
+/// ONE decision, deliberately shared by the two places that must agree: the
+/// emission, which picks the lambda's bound variable, and `funcs_axis`, which
+/// picks the argument a distribution field's application passes. If those
+/// disagreed the emitted model would apply the function at the WRONG axis and
+/// still type-check, so the rule lives here rather than being written twice.
+///
+/// Per kind, matching what `emit_function` emits:
+/// - `generic_function`: an explicit `variables[0]`/`x` if the expression
+///   actually references it, else the first free identifier naming an observable.
+/// - `polynomial`: the `x` field (defaulting to `"x"`), which is the variable
+///   `build_polynomial_fn` binds.
+/// - `sum` / `product`: the first operand naming an observable, which is what
+///   `fold_function` binds.
+///
+/// Only a name in `axis_set` is returned: a lambda over a non-observable is not
+/// something a distribution field can be applied at.
+fn function_observable<'a>(f: &'a Function, axis_set: &BTreeSet<&'a str>) -> Option<&'a str> {
+    let in_axes = |name: &str| axis_set.get(name).copied();
+    match f.kind.as_str() {
+        "generic_function" => {
+            let expr = f.extra.get("expression").and_then(|v| v.as_str())?;
+            let free = expr::free_identifiers(expr);
+            let explicit = f
+                .extra
+                .get("variables")
+                .and_then(|v| v.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|v| v.as_str())
+                .or_else(|| f.extra.get("x").and_then(|v| v.as_str()));
+            match explicit {
+                Some(v) if free.iter().any(|id| id == v) => in_axes(v),
+                _ => free.into_iter().find_map(|id| in_axes(&id)),
+            }
+        }
+        "polynomial" => in_axes(f.extra.get("x").and_then(|v| v.as_str()).unwrap_or("x")),
+        "sum" | "product" => {
+            let key = if f.kind == "sum" {
+                "summands"
+            } else {
+                "factors"
+            };
+            f.extra
+                .get(key)
+                .and_then(|v| v.as_array())?
+                .iter()
+                .filter_map(|v| v.as_str())
+                .find_map(in_axes)
+        }
+        _ => None,
+    }
+}
+
 /// Step 2: emit each non-histfactory distribution as a binding, wrapping with a
 /// `relabel` over its variate. Binds the `hepphys` standard module once up front
 /// if any distribution needs it and no histfactory channel path will bind it.
@@ -755,18 +810,16 @@ fn emit_distributions(m: &mut Module, doc: &Document) -> Result<()> {
     // `needed_axes` (built from this map) under-counts and its exact-match tier can
     // pick a same-size wrong dataset or miss the true match — see its doc comment.
     let axis_set: BTreeSet<&str> = observables.iter().map(String::as_str).collect();
+    // EVERY function kind that lowers to a lambda over an observable, not just
+    // `generic_function`. This map is what makes a distribution field naming a
+    // function emit `fy(y)` rather than the bare `fy`, and what marks the
+    // distribution conditional; a `polynomial`, `sum` or `product` entry used to
+    // be invisible to both, so its name landed raw in a record field, which §04
+    // forbids (rf301, rf302, rf303, rf305).
     let funcs_axis: BTreeMap<&str, &str> = doc
         .functions
         .iter()
-        .filter(|f| f.kind == "generic_function")
-        .filter_map(|f| {
-            let expr = f.extra.get("expression").and_then(|v| v.as_str())?;
-            let axis = expr::free_identifiers(expr)
-                .into_iter()
-                .find(|id| axis_set.contains(id.as_str()))?;
-            let axis = *axis_set.get(axis.as_str())?;
-            Some((f.name.as_str(), axis))
-        })
+        .filter_map(|f| function_observable(f, &axis_set).map(|ax| (f.name.as_str(), ax)))
         .collect();
     {
         let mut b = Builder::new(m);

@@ -656,3 +656,96 @@ fn a_fold_over_an_observable_is_a_lambda() {
         parsed.err()
     );
 }
+
+// ---------------------------------------------------------------------------
+// A distribution field naming a `functions` entry is that function APPLIED.
+//
+// HS3 §"Functions": a distribution parameter naming a function takes that
+// function's VALUE. When the function is of another observable the distribution
+// is conditional on it, which the importer lowers as a joint over both axes.
+//
+// The application and the conditional detection both key off one map from
+// function name to observable axis, and that map covered `generic_function`
+// only. So a `polynomial`, `sum` or `product` mean emitted the bare name into a
+// record field, which §04 forbids ("a function may not appear inside a record"),
+// and the model was never marked conditional. rf301, rf302, rf303 and rf305 all
+// hit it; rf302 showed both halves at once, its generic_function mean lowering
+// correctly beside three that did not.
+//
+// `function_observable` is now the single rule, shared by the emission that
+// picks the lambda's bound variable and the map that picks the application
+// argument. Were they to disagree the model would apply the function at the
+// wrong axis and still type-check.
+// ---------------------------------------------------------------------------
+
+const APPLIED_FUNCTION_JSON: &str = r#"{
+  "functions": [
+    {"name": "fy_gen", "type": "generic_function", "expression": "a0 + a1 * y"},
+    {"name": "fy_poly", "type": "polynomial", "coefficients": ["a0", "a1"], "x": "y"},
+    {"name": "fy_sum", "type": "sum", "summands": ["a0", "y"]},
+    {"name": "fy_prod", "type": "product", "factors": ["a1", "y"]}
+  ],
+  "distributions": [
+    {"name": "m_gen", "type": "gaussian_dist", "mean": "fy_gen", "sigma": "sig", "x": "x"},
+    {"name": "m_poly", "type": "gaussian_dist", "mean": "fy_poly", "sigma": "sig", "x": "x"},
+    {"name": "m_sum", "type": "gaussian_dist", "mean": "fy_sum", "sigma": "sig", "x": "x"},
+    {"name": "m_prod", "type": "gaussian_dist", "mean": "fy_prod", "sigma": "sig", "x": "x"}
+  ],
+  "data": [
+    {"name": "d", "type": "unbinned",
+     "axes": [{"name": "y"}, {"name": "x"}],
+     "entries": [[0.1, 0.2], [0.3, 0.4]]}
+  ],
+  "domains": [
+    {"name": "default_domain", "type": "product_domain", "axes": [
+      {"name": "a0", "min": -5.0, "max": 5.0},
+      {"name": "a1", "min": -1.0, "max": 1.0},
+      {"name": "x", "min": -5.0, "max": 5.0},
+      {"name": "y", "min": -5.0, "max": 5.0}
+    ]}
+  ],
+  "parameter_points": [
+    {"name": "nominal", "parameters": [
+      {"name": "a0", "value": 0.0}, {"name": "a1", "value": 0.5},
+      {"name": "x", "value": 0.0}, {"name": "y", "value": 0.0},
+      {"name": "sig", "value": 1.0}
+    ]}
+  ]
+}"#;
+
+#[test]
+fn every_function_kind_is_applied_at_its_observable() {
+    let m = flatppl_hs3::read_hs3(APPLIED_FUNCTION_JSON).expect("read_hs3 must succeed");
+    let text = print_with(&m, Syntax::Minimal);
+
+    // Every kind applies, not just generic_function. The bare name would be a
+    // function inside a record, which §04 forbids.
+    // Minimal syntax names the lambda's bound observable `_y_`, so the
+    // application reads `fy_x(_y_)` inside the conditional's `functionof`.
+    for f in ["fy_gen", "fy_poly", "fy_sum", "fy_prod"] {
+        assert!(
+            text.contains(&format!("Normal(mu = {f}(_y_), sigma = sig)")),
+            "`{f}` must be applied at its observable, got:\n{text}"
+        );
+        assert!(
+            !text.contains(&format!("Normal(mu = {f}, sigma = sig)")),
+            "`{f}` must not appear bare in a record field, got:\n{text}"
+        );
+    }
+    // Applying it also makes the distribution conditional on that axis, so each
+    // model is a joint over (y, x) rather than a bare 1-D Normal.
+    // Count a code-only pattern: each conditional's doc comment also mentions
+    // `logweighted`, so a bare count of that word doubles.
+    assert_eq!(
+        text.matches("normalize(logweighted(functionof(").count(),
+        4,
+        "each of the four models is a conditional joint, got:\n{text}"
+    );
+
+    let parsed = parse(&text);
+    assert!(
+        parsed.is_ok(),
+        "round-trip parse failed: {:?}\n\nEmitted:\n{text}",
+        parsed.err()
+    );
+}
