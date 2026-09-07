@@ -135,13 +135,14 @@ fn builtins_as_values_resolve() {
     );
 }
 
-/// `log2` has a `catalogue.ron` row and a §07 "Elementary functions" entry, but is
-/// still absent from the sibling keyword list, so the union in
+/// `in` has a `catalogue.ron` row but is a deliberate keyword-list exclusion — the
+/// grammars handle the operator structurally — so the union in
 /// `builtins::is_base_name` is load-bearing. Removing either half of it reddens this
-/// test or `set_names_and_constants_resolve`.
+/// test or `set_names_and_constants_resolve`. `log2` is now in BOTH halves.
 #[test]
 fn catalogue_only_builtins_resolve() {
     assert_clean("y = log2(8.0)\n");
+    assert_clean("s = interval(0.0, 1.0)\nb = in(0.5, s)\n");
 }
 
 /// Shadowing keeps working: §04 makes built-in names bindable, and a binding

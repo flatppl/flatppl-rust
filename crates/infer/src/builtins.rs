@@ -7,14 +7,8 @@
 //! [`BUILTINS`] is generated from `flatppl-grammars/keyword-lists.json`; kept in
 //! sync by `crates/lint/tests/builtins_sync.rs`. It is the highlighter's word
 //! list, so it is still not a superset of the `base` namespace, and
-//! [`is_base_name`] adds what it omits: `catalogue.ron` carries two rows the
-//! keyword list does not (`in`, `log2`).
-//!
-//! `log2` is on that list only until the sibling keyword list catches up. It now
-//! HAS a §07 "Elementary functions" entry, so `flatppl-grammars`
-//! `keyword-lists.json` must gain it and this roster with it. The two must land
-//! together: `crates/lint/tests/builtins_sync.rs` compares them exactly, so
-//! adding `log2` here before the grammars change lands turns that test red.
+//! [`is_base_name`] adds what it omits: `catalogue.ron` carries one row the
+//! keyword list does not (`in`).
 //!
 //! It is no longer a SUPERSET either. It used to carry the 21 §09
 //! `particle-physics` members — 8 distribution constructors (`CrystalBall`,
@@ -205,6 +199,7 @@ pub const BUILTINS: &[&str] = &[
     "log",
     "log10",
     "log1p",
+    "log2",
     "logabsdet",
     "logdensityof",
     "loggamma",
@@ -504,12 +499,12 @@ mod tests {
         }
     }
 
-    /// The two `catalogue.ron` rows the keyword list omits.
+    /// The one `catalogue.ron` row the keyword list omits. `in` is an operator the
+    /// grammars handle structurally, so it is a deliberate keyword-list exclusion
+    /// (`check-spec-keywords.py` `INTENTIONAL_EXCLUSIONS`) rather than a lag.
     #[test]
     fn catalogue_only_rows_are_base_names() {
-        for name in ["in", "log2"] {
-            assert!(is_base_name(name), "`{name}` has a catalogue.ron row");
-        }
+        assert!(is_base_name("in"), "`in` has a catalogue.ron row");
     }
 
     /// `length` was superseded by `lengthof` and its row is gone, so the name no
