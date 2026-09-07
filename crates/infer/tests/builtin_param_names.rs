@@ -202,23 +202,23 @@ fn distribution_rows_are_unchanged() {
     );
 }
 
-/// **Prove-it-is-wrong.** A row documenting no names answers `None` from
-/// `base_param_names`, which the arity check reads as "accept" rather than "reject". `length`
-/// has no §07 entry at all, so it declares no names — and the call is still caught, by the
-/// ARITY rule, which is the backstop that makes the permissive default safe.
+/// **Prove-it-is-wrong, with no subject left.** A row documenting no names answers `None`
+/// from `base_param_names`, which the arity check reads as "accept" rather than "reject".
+/// The two rows that used to reach that branch are gone: `length` was superseded by
+/// `lengthof` and its row is deleted, and `log2` now has a §07 entry and declares `x`. Every
+/// remaining nameless row is VARIADIC, and `refuse_splat_onto_unnamed_variadic` refuses a
+/// splat onto one of those before the name check is reached. So the permissive default is
+/// unreachable for a fixed-arity row — which is what this pins.
 #[test]
-fn an_undocumented_row_stays_permissive_on_names_and_relies_on_arity() {
+fn every_fixed_arity_row_documents_its_parameter_names() {
     let cat = builtin_catalogue();
-    assert!(
-        cat.base_param_names("length").is_none(),
-        "`length` has no §07 entry, so no documented names"
-    );
-    let errs = mismatched("length");
-    assert!(
-        errs[0].contains("`length` takes 1 argument (spec §07), got 2"),
-        "the arity rule still catches it: {}",
-        errs[0]
-    );
+    for name in ["lengthof", "log2", "log10", "gamma", "loggamma"] {
+        assert_eq!(
+            cat.base_param_names(name).map(<[String]>::to_vec),
+            Some(vec!["x".to_string()]),
+            "`{name}` documents its §07 argument name"
+        );
+    }
 }
 
 /// `bijection` is a §06 row, not a §07 one — it occurs zero times in §07, and §06 gives it

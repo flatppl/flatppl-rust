@@ -219,6 +219,49 @@ fn the_positional_spelling_is_checked_too() {
     );
 }
 
+/// §07 "Elementary functions" gives `log2`, `log10`, `gamma` and `loggamma` the
+/// domain `posreals` ALONE, with no `complexes` column entry beside it as `log` and
+/// `sqrt` carry. §03 "Sets" makes `posreals` the half-line $(0, +\infty]$, which
+/// excludes `0`. So a written non-positive argument is decidable and wrong — the
+/// same rule that refuses `logit(3.0)` off its `interval(0, 1)` domain.
+#[test]
+fn a_nonpositive_constant_to_a_posreals_function_is_refused() {
+    for name in ["log2", "log10", "gamma", "loggamma"] {
+        for arg in ["-1.0", "0.0", "0", "false"] {
+            assert_refuses(
+                &format!("y = {name}({arg})\n"),
+                "outside its declared value set `posreals`",
+            );
+        }
+    }
+}
+
+/// The keyword and binding spellings reach the same check, and `x` is the parameter
+/// name §07's "Arguments" column states for all four.
+#[test]
+fn the_posreals_function_domain_is_checked_by_name_and_through_a_binding() {
+    assert_refuses(
+        "y = log2(x = -8.0)\n",
+        "`log2`'s `x` is written as `-8`, which is outside its declared value set `posreals`",
+    );
+    assert_refuses(
+        "t = -1.0\ny = loggamma(t)\n",
+        "outside its declared value set `posreals`",
+    );
+}
+
+/// The admitting side. §03's infinity note — "`posreals`, `nonnegreals`, and
+/// `reals` admit `inf`" — puts `inf` inside the domain, and a computed argument is
+/// not checked at all.
+#[test]
+fn a_positive_constant_to_a_posreals_function_still_types() {
+    assert_clean("y = log2(8.0)\n");
+    assert_clean("y = log10(1000.0)\n");
+    assert_clean("y = gamma(0.5)\n");
+    assert_clean("y = loggamma(inf)\n");
+    assert_clean("x = elementof(reals)\ny = log2(x)\n");
+}
+
 /// A parameter the spec states no scalar set for is untouched: `Uniform`'s
 /// `support` is a SET argument, and every vector or matrix parameter carries a
 /// per-element constraint this check does not reach.

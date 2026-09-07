@@ -619,8 +619,8 @@ impl Catalogue {
     /// - `qr` — RETURNS `record(Q, R)`, but its domain is "$m \times n$ matrices".
     ///   The carve-out is about the domain, not the result.
     /// - `totalmass` — §06, and its input is a measure, not an aggregate.
-    /// - `length` and `log2` — catalogue rows with no §07 entry at all, so no
-    ///   documented domain to admit anything.
+    /// - `log2`, `log10`, `gamma`, `loggamma` — §07 gives all four the `posreals`
+    ///   domain, a scalar set, so none of them admits an aggregate.
     /// - Every single-input §08 constructor (`Poisson`, `Dirichlet`, `Categorical`,
     ///   `Exponential`, …) — scalar or vector domains, never aggregates. This is
     ///   what keeps `Poisson(record(zzz = 0.5))` a static error.
@@ -680,10 +680,8 @@ impl Catalogue {
     /// **An empty list answers `None`, which the caller reads as "accept".** So a
     /// row documenting no names stays permissive rather than refusing every
     /// splatted call — prove-it-is-wrong, the same discipline the determiniser's
-    /// shape guards use. Three groups are deliberately nameless:
+    /// shape guards use. Two groups are deliberately nameless:
     ///
-    /// - **`length` and `log2`** — catalogue rows with no §07 entry at all, so
-    ///   there is no documented name to enforce.
     /// - **Every VARIADIC row** (`cat`, `get`, `get0`, `vector`, `builtin_sample`).
     ///   These have no name list to declare, because §04 makes their variadic inputs
     ///   UNNAMED: "Special operations have zero to three distinguished, **unnamed**,
@@ -699,9 +697,11 @@ impl Catalogue {
     ///   [`Self::base_has_unnamed_variadic`] makes a splatted aggregate onto one of
     ///   these rows a §04 static error, reported by
     ///   `ops::refuse_splat_onto_unnamed_variadic` and pinned by
-    ///   `crates/infer/tests/variadic_splat.rs`. So the permissive default below
-    ///   covers only the two undocumented rows above; every nameless VARIADIC row is
-    ///   refused before the name check is reached.
+    ///   `crates/infer/tests/variadic_splat.rs`. So every nameless VARIADIC row is
+    ///   refused before the name check is reached, and the permissive default below
+    ///   is left with no fixed-arity row to cover: `length` is deleted (superseded by
+    ///   `lengthof`) and `log2` now declares `x` off its §07 entry. That is pinned by
+    ///   `crates/infer/tests/builtin_param_names.rs`.
     /// - **Rows whose §07 "Arguments" cell is not a name list** (a formula or a
     ///   dash), where there is nothing to read.
     pub fn base_param_names(&self, name: &str) -> Option<&[String]> {
@@ -1273,7 +1273,6 @@ mod tests {
             ("div", None),
             ("mod", None),
             ("lengthof", None),
-            ("length", None),
             // scalar-real output
             // (divide and mean are structural, not catalogue rows — covered by
             // golden tests divide_promotes_complex_operands / mean_reduces_to_element_type)
@@ -1282,6 +1281,19 @@ mod tests {
             ("l1norm", None),
             ("l2norm", None),
             ("logsumexp", None),
+            // scalar-real output whatever the argument: §07 gives `log2`,
+            // `log10`, `gamma` and `loggamma` the `posreals` domain with no
+            // `complexes` beside it, so the complex-in path is real too.
+            ("log2", None),
+            ("log2", Some(ScalarType::Complex)),
+            ("log2", Some(ScalarType::Integer)),
+            ("log10", None),
+            ("log10", Some(ScalarType::Complex)),
+            ("gamma", None),
+            ("gamma", Some(ScalarType::Complex)),
+            ("loggamma", None),
+            ("loggamma", Some(ScalarType::Complex)),
+            ("loggamma", Some(ScalarType::Integer)),
             // scalar-complex output
             ("cis", None),
             ("complex", None),
@@ -1304,9 +1316,6 @@ mod tests {
             ("exp", None),
             ("exp", Some(ScalarType::Real)),
             ("log", None),
-            // log2: §07 divergence — not in spec but kept for compatibility.
-            ("log2", None),
-            ("log10", None),
             ("sqrt", None),
             ("sin", None),
             ("cos", None),
@@ -1322,8 +1331,6 @@ mod tests {
             ("atanh", None),
             ("log1p", None),
             ("expm1", None),
-            ("gamma", None),
-            ("loggamma", None),
             ("logit", None),
             ("invlogit", None),
             ("probit", None),
@@ -1341,7 +1348,6 @@ mod tests {
             ("log", Some(ScalarType::Integer)),
             ("sqrt", Some(ScalarType::Integer)),
             ("sin", Some(ScalarType::Integer)),
-            ("loggamma", Some(ScalarType::Integer)),
             ("conj", Some(ScalarType::Integer)),
             ("invlogit", Some(ScalarType::Integer)),
             // abs / abs2: complex→real (DomainMap)

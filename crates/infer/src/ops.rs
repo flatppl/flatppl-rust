@@ -9049,24 +9049,25 @@ pub(crate) fn function_type_static(name: &str, arg0_scalar: Option<ScalarType>) 
         // scalar-integer output
         "floor" | "ceil" | "round" | "integer" => Some(Type::Scalar(Integer)),
         "div" | "mod" => Some(Type::Scalar(Integer)),
-        "lengthof" | "length" => Some(Type::Scalar(Integer)),
+        "lengthof" => Some(Type::Scalar(Integer)),
         // scalar-real output
         // (divide and mean are NOT here: they are structural — divide promotes
         // its two operands, mean reduces to the array element type — handled
         // in call_rule, not the catalogue.)
         "logdensityof" | "densityof" => Some(Type::Scalar(Real)),
         "l1norm" | "l2norm" | "logsumexp" => Some(Type::Scalar(Real)),
+        // §07 lists `posreals` ALONE for these four, with no `complexes` beside
+        // it as `log` and `sqrt` carry, so the result is real for every argument.
+        "log2" | "log10" | "gamma" | "loggamma" => Some(Type::Scalar(Real)),
         // scalar-complex output
         "cis" | "complex" => Some(Type::Scalar(Complex)),
         // scalar-boolean output
         "equal" | "unequal" | "lt" | "le" | "gt" | "ge" | "in" | "land" | "lor" | "lnot"
         | "isfinite" | "isinf" | "isnan" | "iszero" => Some(Type::Scalar(Boolean)),
         // real_or_complex: exp/log/sqrt/trig and friends
-        "exp" | "log" | "log2" | "log10" | "sqrt" | "sin" | "cos" | "tan" | "asin" | "acos"
-        | "atan" | "sinh" | "cosh" | "tanh" | "asinh" | "acosh" | "atanh" | "log1p" | "expm1"
-        | "gamma" | "loggamma" | "logit" | "invlogit" | "probit" | "invprobit" | "conj" => {
-            Some(real_or_cplx(arg0_scalar))
-        }
+        "exp" | "log" | "sqrt" | "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "sinh"
+        | "cosh" | "tanh" | "asinh" | "acosh" | "atanh" | "log1p" | "expm1" | "logit"
+        | "invlogit" | "probit" | "invprobit" | "conj" => Some(real_or_cplx(arg0_scalar)),
         // abs / abs2: |z| and |z|² are always REAL even for complex input
         // (spec §07: |·| maps ℂ → ℝ). Legacy ops.rs used real_or_complex which
         // incorrectly returned Complex for complex input; the catalogue

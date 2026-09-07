@@ -135,9 +135,10 @@ fn builtins_as_values_resolve() {
     );
 }
 
-/// `log2` has a `catalogue.ron` row but is absent from the keyword list, so the
-/// union in `builtins::is_base_name` is load-bearing. Removing either half of it
-/// reddens this test or `set_names_and_constants_resolve`.
+/// `log2` has a `catalogue.ron` row and a §07 "Elementary functions" entry, but is
+/// still absent from the sibling keyword list, so the union in
+/// `builtins::is_base_name` is load-bearing. Removing either half of it reddens this
+/// test or `set_names_and_constants_resolve`.
 #[test]
 fn catalogue_only_builtins_resolve() {
     assert_clean("y = log2(8.0)\n");

@@ -113,6 +113,29 @@ fn log10_divides_by_the_ln10_constant() {
     );
 }
 
+/// §07 `log2`, $\log_{2}(x)$ — the same shape as `log10`: `log(x)` divided by a
+/// literal `ln(2)`. The constant is pinned to full f64 digits.
+///
+/// Oracle: $\ln 2$ in 256-bit arithmetic is `0.6931471805599453`, and
+/// $\log_2 10 = \ln 10 / \ln 2 = 3.3219280948873622$, checked independently of
+/// any FlatPPL engine.
+#[test]
+fn log2_divides_by_the_ln2_constant() {
+    let out = emit(&unary_real_src("log2"));
+    assert!(
+        out.contains("stablehlo.log %arg0"),
+        "must log first:\n{out}"
+    );
+    assert!(
+        out.contains("stablehlo.constant dense<0.6931471805599453>"),
+        "must carry ln(2) as a literal:\n{out}"
+    );
+    assert!(
+        out.contains("stablehlo.divide"),
+        "must DIVIDE by ln(2), not multiply by 1/ln(2):\n{out}"
+    );
+}
+
 /// §07 `abs2`, $\vert x\vert^2$ — `x * x` over the reals this crate emits, so
 /// ONE multiply and no `stablehlo.abs` at all (squaring already discards the
 /// sign, and `abs` first would be a wasted op).

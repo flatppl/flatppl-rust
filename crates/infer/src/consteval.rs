@@ -151,7 +151,7 @@ fn eval_call(inf: &mut Inferencer<'_, '_>, node: NodeId, c: &Call, depth: u32) -
     match inf.module.resolve(op).to_string().as_str() {
         // Shape observers: read the inferred TYPE, never recurse into the value
         // (§17.1 laziness short-circuit). Inference-specific — see module docs.
-        "lengthof" | "length" => length_observer(inf, c),
+        "lengthof" => length_observer(inf, c),
         "sizeof" => sizeof_observer(inf, c),
 
         // Pure value ops (the liftable core).

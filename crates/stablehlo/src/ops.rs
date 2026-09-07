@@ -104,6 +104,7 @@ pub(crate) fn lower_builtin(
         "sin" => unary(e, id, args, Emitter::sin),
         "floor" => unary(e, id, args, Emitter::floor),
         "ceil" => unary(e, id, args, Emitter::ceil),
+        "log2" => unary(e, id, args, Emitter::log2),
         "log10" => unary(e, id, args, Emitter::log10),
         "abs2" => unary(e, id, args, Emitter::abs2),
         "asin" => unary(e, id, args, Emitter::asin),

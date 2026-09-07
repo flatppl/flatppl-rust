@@ -538,6 +538,15 @@ impl<'m> Emitter<'m> {
         let ln10 = self.constant(std::f64::consts::LN_10, lx.ty.clone());
         self.div(&lx, &ln10)
     }
+    /// Spec §07 `log2`, $\log_{2}(x)$ — `log(x) / ln(2)`, exactly as
+    /// [`Emitter::log10`] handles its base. StableHLO has no base-2 log op, and
+    /// the division keeps the single rounding a multiply by the inexact
+    /// `1/ln(2)` would double.
+    pub fn log2(&mut self, a: &Value) -> Value {
+        let lx = self.log(a);
+        let ln2 = self.constant(std::f64::consts::LN_2, lx.ty.clone());
+        self.div(&lx, &ln2)
+    }
     /// Spec §07 `abs2`, $\vert x\vert^2$ — `x * x` over the reals this crate
     /// emits (no complex element type, so $\vert x\vert^2 = x^2$). Kind-
     /// polymorphic through [`Emitter::mul`], so an integer operand keeps an

@@ -7,8 +7,14 @@
 //! [`BUILTINS`] is generated from `flatppl-grammars/keyword-lists.json`; kept in
 //! sync by `crates/lint/tests/builtins_sync.rs`. It is the highlighter's word
 //! list, so it is still not a superset of the `base` namespace, and
-//! [`is_base_name`] adds what it omits: `catalogue.ron` carries three rows the
-//! keyword list does not (`in`, `length`, `log2`).
+//! [`is_base_name`] adds what it omits: `catalogue.ron` carries two rows the
+//! keyword list does not (`in`, `log2`).
+//!
+//! `log2` is on that list only until the sibling keyword list catches up. It now
+//! HAS a §07 "Elementary functions" entry, so `flatppl-grammars`
+//! `keyword-lists.json` must gain it and this roster with it. The two must land
+//! together: `crates/lint/tests/builtins_sync.rs` compares them exactly, so
+//! adding `log2` here before the grammars change lands turns that test red.
 //!
 //! It is no longer a SUPERSET either. It used to carry the 21 §09
 //! `particle-physics` members — 8 distribution constructors (`CrystalBall`,
@@ -498,11 +504,22 @@ mod tests {
         }
     }
 
-    /// The three `catalogue.ron` rows the keyword list omits.
+    /// The two `catalogue.ron` rows the keyword list omits.
     #[test]
     fn catalogue_only_rows_are_base_names() {
-        for name in ["in", "length", "log2"] {
+        for name in ["in", "log2"] {
             assert!(is_base_name(name), "`{name}` has a catalogue.ron row");
         }
+    }
+
+    /// `length` was superseded by `lengthof` and its row is gone, so the name no
+    /// longer resolves bare. `lengthof` is the §07 spelling and still does.
+    #[test]
+    fn the_superseded_length_name_no_longer_resolves() {
+        assert!(
+            !is_base_name("length"),
+            "`length` has no row and no §07 entry"
+        );
+        assert!(is_base_name("lengthof"), "`lengthof` is the §07 spelling");
     }
 }

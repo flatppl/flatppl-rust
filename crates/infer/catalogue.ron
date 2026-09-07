@@ -198,9 +198,8 @@ Catalogue(
         // div / mod: integer Euclidean quotient/remainder (spec §07).
         Builtin(name: "div",      sig: Function(params: [Scalar(Integer), Scalar(Integer)], names: ["a", "b"], result: Scalar(Integer))),
         Builtin(name: "mod",      sig: Function(params: [Scalar(Integer), Scalar(Integer)], names: ["a", "b"], result: Scalar(Integer))),
-        // lengthof / length: number of elements in a vector (spec §07 Reductions).
+        // lengthof: number of elements in a vector (spec §07 Reductions).
         Builtin(name: "lengthof", sig: Function(params: [Any], names: ["x"], result: Scalar(Integer), result_set: NonNegIntegers)),
-        Builtin(name: "length",   sig: Function(params: [Any], result: Scalar(Integer), result_set: NonNegIntegers)),
 
         // -- scalar-real output --
         // NOTE: divide and mean are intentionally NOT here. Their result types
@@ -377,10 +376,12 @@ Catalogue(
         // (spec §07 "Elementary functions": all accept reals and complexes)
         Builtin(name: "exp",       sig: Function(params: [Any], names: ["x"], result: RealOrComplexOfArg(0), result_set: PosReals)),
         Builtin(name: "log",       sig: Function(params: [Any], names: ["x"], result: RealOrComplexOfArg(0))),
-        // log2: in ops.rs but absent from spec §07. Kept for engine compatibility.
-        Builtin(name: "log2",      sig: Function(params: [Any], result: RealOrComplexOfArg(0)),
-            degraded: Some("log2 is not listed in spec §07; kept for engine compatibility")),
-        Builtin(name: "log10",     sig: Function(params: [Any], names: ["x"], result: RealOrComplexOfArg(0))),
+        // log2 / log10: spec §07 "Elementary functions" gives both the `posreals`
+        // domain ALONE, with no `complexes` column entry beside it as `log` and
+        // `sqrt` carry. So the result is real whatever the argument, and the
+        // domain is a declared value set the constant-argument check enforces.
+        Builtin(name: "log2",      sig: Function(params: [Any], param_sets: [PosReals], names: ["x"], result: Scalar(Real))),
+        Builtin(name: "log10",     sig: Function(params: [Any], param_sets: [PosReals], names: ["x"], result: Scalar(Real))),
         Builtin(name: "sqrt",      sig: Function(params: [Any], names: ["x"], result: RealOrComplexOfArg(0), result_set: NonNegReals)),
         Builtin(name: "sin",       sig: Function(params: [Any], names: ["x"], result: RealOrComplexOfArg(0), result_set: Interval(-1.0, 1.0))),
         Builtin(name: "cos",       sig: Function(params: [Any], names: ["x"], result: RealOrComplexOfArg(0), result_set: Interval(-1.0, 1.0))),
@@ -396,8 +397,10 @@ Catalogue(
         Builtin(name: "atanh",     sig: Function(params: [Any], names: ["x"], result: RealOrComplexOfArg(0))),
         Builtin(name: "log1p",     sig: Function(params: [Any], names: ["x"], result: RealOrComplexOfArg(0))),
         Builtin(name: "expm1",     sig: Function(params: [Any], names: ["x"], result: RealOrComplexOfArg(0))),
-        Builtin(name: "gamma",     sig: Function(params: [Any], names: ["x"], result: RealOrComplexOfArg(0))),
-        Builtin(name: "loggamma",  sig: Function(params: [Any], names: ["x"], result: RealOrComplexOfArg(0))),
+        // gamma / loggamma: §07 gives both `posreals` alone, with no `complexes`
+        // beside it — same reading as `log2`/`log10` above.
+        Builtin(name: "gamma",     sig: Function(params: [Any], param_sets: [PosReals], names: ["x"], result: Scalar(Real))),
+        Builtin(name: "loggamma",  sig: Function(params: [Any], param_sets: [PosReals], names: ["x"], result: Scalar(Real))),
         Builtin(name: "logit",     sig: Function(params: [Any], param_sets: [Interval(0.0, 1.0)], names: ["p"], result: RealOrComplexOfArg(0))),
         Builtin(name: "invlogit",  sig: Function(params: [Any], names: ["x"], result: RealOrComplexOfArg(0), result_set: UnitInterval)),
         Builtin(name: "probit",    sig: Function(params: [Any], param_sets: [Interval(0.0, 1.0)], names: ["p"], result: RealOrComplexOfArg(0))),
