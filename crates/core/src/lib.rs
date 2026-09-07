@@ -13,12 +13,14 @@
 //! spans) in [`SecondaryMap`] side-tables. See `ARCHITECTURE.md` for the
 //! rationale behind these choices.
 
+pub mod depth;
 pub mod id;
 mod module;
 pub mod node;
 pub mod text;
 pub mod ty;
 
+pub use depth::{DEFAULT_MAX_DEPTH, Depth, TooDeep};
 pub use id::{Arena, BindingId, Idx, Interner, NodeId, SecondaryMap, Symbol};
 pub use module::{Binding, Doc, Markup, Module, Span};
 pub use node::{

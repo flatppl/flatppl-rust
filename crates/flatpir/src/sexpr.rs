@@ -80,6 +80,11 @@ struct Parser {
     line: usize,
     /// Byte offset of the cursor (UTF-8 aware), for error spans.
     byte: u32,
+    /// Recursion budget for nested forms. `parse_form` is the only re-entry
+    /// point, so guarding it bounds the whole reader; without it a deeply
+    /// nested s-expression aborted with a stack overflow above about 8000
+    /// levels instead of refusing.
+    depth: flatppl_core::Depth,
 }
 
 impl Parser {
@@ -89,6 +94,7 @@ impl Parser {
             pos: 0,
             line: 1,
             byte: 0,
+            depth: flatppl_core::Depth::default(),
         }
     }
 
@@ -139,7 +145,21 @@ impl Parser {
     /// The cursor is assumed to sit at the form's first character (callers skip
     /// trivia first), so `start` is the form's opening byte and `end` is the
     /// byte just past its last character.
+    /// Guarded entry to a nested form. Charges one level, parses, then gives
+    /// the level back, so breadth is free and only nesting counts.
     fn parse_form(&mut self) -> Result<Sexpr> {
+        let deeper = self
+            .depth
+            .deeper("s-expression")
+            .map_err(|e| self.err_here(e.to_string()))?;
+        let saved = self.depth;
+        self.depth = deeper;
+        let result = self.parse_form_body();
+        self.depth = saved;
+        result
+    }
+
+    fn parse_form_body(&mut self) -> Result<Sexpr> {
         let start = self.byte;
         let line = self.line;
         let kind = match self.peek() {

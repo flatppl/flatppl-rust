@@ -1366,6 +1366,27 @@ fn fold_function(
             f.kind, f.name
         )));
     }
+    // A left fold over N operands BUILDS a tree N deep, so a document of
+    // nesting depth three can produce one deep enough to overflow the stack
+    // while it is printed or walked. The depth is created here, so it is
+    // checked here, against the same shared limit every reader uses. This
+    // guards the construction; it does not change the fold's shape, and making
+    // the fold not build the depth at all (an n-ary node, or a balanced tree)
+    // is carded separately.
+    if operands.len() > flatppl_core::DEFAULT_MAX_DEPTH {
+        return Err(Error::Unsupported(
+            flatppl_core::TooDeep {
+                construct: format!(
+                    "{} function `{}` folds {} `{key}` into a chain whose",
+                    f.kind,
+                    f.name,
+                    operands.len()
+                ),
+                limit: flatppl_core::DEFAULT_MAX_DEPTH,
+            }
+            .to_string(),
+        ));
+    }
     // The observable this fold is a function of: the FIRST operand naming one,
     // in document order, mirroring `generic_observable`'s first-free-identifier
     // rule so the two paths agree on a multi-observable entry.

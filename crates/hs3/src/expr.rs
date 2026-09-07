@@ -457,11 +457,21 @@ struct Parser<'b, 'm> {
     tokens: &'b [Tok],
     pos: usize,
     b: &'b mut Builder<'m>,
+    /// Recursion budget for nested HS3 expressions. Every nested construct
+    /// re-enters through `parse_expr`, so guarding it bounds the whole
+    /// precedence ladder; without it a deeply nested `expression` string
+    /// aborted with a stack overflow above about 10000 levels.
+    depth: flatppl_core::Depth,
 }
 
 impl<'b, 'm> Parser<'b, 'm> {
     fn new(tokens: &'b [Tok], b: &'b mut Builder<'m>) -> Self {
-        Parser { tokens, pos: 0, b }
+        Parser {
+            tokens,
+            pos: 0,
+            b,
+            depth: flatppl_core::Depth::default(),
+        }
     }
 
     fn peek(&self) -> Option<&Tok> {
@@ -506,8 +516,18 @@ impl<'b, 'm> Parser<'b, 'm> {
     // §07 note ("Logic and conditionals"): `ifelse` and `land`/`lor` do NOT
     // guarantee short-circuit evaluation; HS3 §3.1 makes no laziness promise
     // either, so the lowering is semantics-preserving on values.
+    /// Guarded entry to the expression grammar. Charges one level of nesting,
+    /// parses, then gives the level back, so breadth is free.
     fn parse_expr(&mut self) -> Result<NodeId> {
-        self.parse_ternary()
+        let deeper = self
+            .depth
+            .deeper("HS3 expression")
+            .map_err(|e| Error::Unsupported(e.to_string()))?;
+        let saved = self.depth;
+        self.depth = deeper;
+        let result = self.parse_ternary();
+        self.depth = saved;
+        result
     }
 
     // ternary = or ( '?' ternary ':' ternary )?   — right-associative

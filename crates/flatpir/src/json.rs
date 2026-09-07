@@ -325,7 +325,12 @@ fn emit_doc(value: &Value) -> Result<String> {
 /// Maximum JSON expression nesting `from_json` will follow. Past this, decoding
 /// returns `Err` rather than recursing until the native stack overflows (which
 /// would abort the process, uncatchably). Generous for any real FlatPIR program.
-const MAX_DEPTH: usize = 128;
+///
+/// This was a local constant that happened to equal the shared default. It is
+/// now the shared one, so every reader in the workspace refuses at the same
+/// depth and the number is derived in one place
+/// (`flatppl_core::depth::DEFAULT_MAX_DEPTH`).
+const MAX_DEPTH: usize = flatppl_core::DEFAULT_MAX_DEPTH;
 
 /// Emit one expression. The result may be more than one space-separated token
 /// (the reified `%inputs` element expands to `<origin> <list>`); callers always
@@ -333,7 +338,13 @@ const MAX_DEPTH: usize = 128;
 /// adversarial input (see [`MAX_DEPTH`]).
 fn emit(value: &Value, depth: usize) -> Result<String> {
     if depth > MAX_DEPTH {
-        return Err(Error::new("JSON expression nesting too deep"));
+        return Err(Error::new(
+            flatppl_core::TooDeep {
+                construct: "JSON expression".to_string(),
+                limit: MAX_DEPTH,
+            }
+            .to_string(),
+        ));
     }
     match value {
         Value::Array(arr) => emit_call(arr, depth),

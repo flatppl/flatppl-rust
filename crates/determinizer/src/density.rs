@@ -1775,7 +1775,14 @@ fn component_reaches_draw(m: &Module, component: NodeId) -> bool {
         depth: u32,
         seen: &mut std::collections::HashSet<NodeId>,
     ) -> bool {
-        if depth > 64 || !seen.insert(id) {
+        // The shared limit, so this site cannot disagree with the readers
+        // about how deep is too deep; it was a local 64. This walk keeps a
+        // BOOL rather than the shared `TooDeep` refusal because it is a
+        // predicate whose conservative answer is "does not reach", and it
+        // keeps its own visited set, which is a separate mechanism from the
+        // depth budget (a re-walked DAG is a complexity problem, not a
+        // stack-safety one).
+        if depth as usize > flatppl_core::DEFAULT_MAX_DEPTH || !seen.insert(id) {
             return false;
         }
         if let Node::Ref(Ref {
