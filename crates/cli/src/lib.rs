@@ -436,8 +436,21 @@ pub fn run_lint(
             .map_err(|e| format!("reading `{}`: {e}", file.display()))?;
 
         let mut cfg = base.clone();
-        for rule in inline_allows(&source) {
-            cfg.set(rule, Severity::Allow);
+        match inline_allows(&source) {
+            Ok(rules) => {
+                for rule in rules {
+                    cfg.set(rule, Severity::Allow);
+                }
+            }
+            Err(line) => {
+                return Err(Failure::Diagnostic {
+                    path: file.clone(),
+                    source,
+                    message: LEGACY_DIRECTIVE_MESSAGE.into(),
+                    line,
+                    span: None,
+                });
+            }
         }
         if deny_warnings {
             for rule in RuleId::ALL {
@@ -531,20 +544,45 @@ pub fn lint_generated(module: &mut Module, path: &std::path::Path) {
     }
 }
 
-/// Scan source for file-level `% flatppl-lint: allow RULE` directives.
+/// The file-level lint directive. `#` is FlatPPL's plain-comment syntax, which
+/// the parser discards, so the directive attaches to no binding and is valid at
+/// any position in the file.
 #[cfg(feature = "fmtlint")]
-fn inline_allows(source: &str) -> Vec<flatppl_lint::RuleId> {
-    const PREFIX: &str = "% flatppl-lint: allow ";
+const ALLOW_DIRECTIVE: &str = "# flatppl-lint: allow ";
+
+/// The superseded `%` spelling of the directive. `%` is doc-comment syntax, and
+/// a doc-comment that attaches to no binding is invalid code, so this form is
+/// rejected instead of honoured.
+#[cfg(feature = "fmtlint")]
+const LEGACY_DIRECTIVE: &str = "% flatppl-lint:";
+
+#[cfg(feature = "fmtlint")]
+const LEGACY_DIRECTIVE_MESSAGE: &str = concat!(
+    "the lint directive must be a plain comment: write ",
+    "`# flatppl-lint: allow RULE`. The `%` spelling is a doc-comment, and a ",
+    "doc-comment must attach to a binding",
+);
+
+/// Scan source for file-level `# flatppl-lint: allow RULE` directives.
+///
+/// This is a raw-text scan, so it runs before the parse and sees a directive
+/// anywhere in the file. `Err` carries the 1-based line of a `%`-spelled
+/// directive.
+#[cfg(feature = "fmtlint")]
+fn inline_allows(source: &str) -> Result<Vec<flatppl_lint::RuleId>, usize> {
     let mut out = Vec::new();
-    for line in source.lines() {
+    for (idx, line) in source.lines().enumerate() {
         let line = line.trim();
-        if let Some(rest) = line.strip_prefix(PREFIX) {
+        if line.starts_with(LEGACY_DIRECTIVE) {
+            return Err(idx + 1);
+        }
+        if let Some(rest) = line.strip_prefix(ALLOW_DIRECTIVE) {
             if let Ok(rule) = rest.trim().parse() {
                 out.push(rule);
             }
         }
     }
-    out
+    Ok(out)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

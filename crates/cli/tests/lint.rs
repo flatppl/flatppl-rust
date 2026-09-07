@@ -63,17 +63,18 @@ fn allow_flag_silences_a_rule() {
     assert!(out.status.success());
 }
 
+// The directive is a plain comment, and the printer drops plain comments, so a
+// file carrying one is never canonical — every directive test allows
+// `not-canonical` as well.
+const DIRECTIVES: &str =
+    "# flatppl-lint: allow unused-binding\n# flatppl-lint: allow not-canonical\n";
+const UNUSED: &str = "_helper = 1.0\nx ~ Normal(mu = 0.0, sigma = 1.0)\n";
+
 #[test]
 fn inline_directive_suppresses_a_rule_file_wide() {
     let dir = Scratch::new("suppress");
     let f = dir.path("m.flatppl");
-    // Note: this content is canonical (spaces around = and after ,), so not-canonical will not fire.
-    // The inline directive suppresses unused-binding, allowing --deny-warnings to pass.
-    fs::write(
-        &f,
-        "% flatppl-lint: allow unused-binding\n_helper = 1.0\nx ~ Normal(mu = 0.0, sigma = 1.0)\n",
-    )
-    .unwrap();
+    fs::write(&f, format!("{DIRECTIVES}{UNUSED}")).unwrap();
     let out = bin()
         .arg("lint")
         .arg("--deny-warnings")
@@ -85,6 +86,47 @@ fn inline_directive_suppresses_a_rule_file_wide() {
         "stderr:\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+#[test]
+fn inline_directive_at_end_of_file_is_honoured() {
+    let dir = Scratch::new("suppress_eof");
+    let f = dir.path("m.flatppl");
+    fs::write(&f, format!("{UNUSED}{DIRECTIVES}")).unwrap();
+    let out = bin()
+        .arg("lint")
+        .arg("--deny-warnings")
+        .arg(&f)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The `%` spelling is a doc-comment. It is rejected in both positions: at the
+/// end of a file it attaches to nothing, and before a binding it steals that
+/// binding's doc slot.
+#[test]
+fn percent_spelled_directive_is_rejected() {
+    let legacy = "% flatppl-lint: allow unused-binding\n";
+    for (name, body) in [
+        ("pct_leading", format!("{legacy}{UNUSED}")),
+        ("pct_eof", format!("{UNUSED}{legacy}")),
+    ] {
+        let dir = Scratch::new(name);
+        let f = dir.path("m.flatppl");
+        fs::write(&f, body).unwrap();
+        let out = bin().arg("lint").arg(&f).output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "stderr:\n{stderr}");
+        assert!(
+            stderr.contains("`# flatppl-lint: allow RULE`"),
+            "{name} stderr:\n{stderr}"
+        );
+    }
 }
 
 #[test]

@@ -300,8 +300,21 @@ own cargo feature (`convert`/`infer`/`prepare`/`hs3` all enabling `flatpir`;
 `unused-binding`, `shadows-builtin`, `missing-doc`, `not-canonical`, plus an
 `flatppl-infer` bridge (`unresolved-name` / `inference-cycle` / `inference-gap`);
 severities are leveled (allow/warn/deny) with CLI overrides
-(`--deny`/`--warn`/`--allow`/`--deny-warnings`) and a `% flatppl-lint: allow RULE`
+(`--deny`/`--warn`/`--allow`/`--deny-warnings`) and a `# flatppl-lint: allow RULE`
 file-level suppression directive. The formatter is zero-config and idempotent.
+
+**The lint directive is a plain comment.** `#` is FlatPPL's plain-comment
+syntax (spec §04 *Comments are not documentation*), so the parser discards the
+line and the directive is valid at **any** position in the file, end of file
+included. The `%` spelling this directive used before is doc-comment syntax: a
+`%` line that attaches to no binding is invalid code (spec §04 *Attachment*),
+and one that does attach steals that binding's doc slot. `run_lint` therefore
+**rejects** the `%` spelling with a diagnostic naming the `#` form, rather than
+honouring it — the raw-text scan runs before the parse, so the user sees that
+message instead of a confusing syntax error. Two consequences of the plain-comment
+form, both from the printer dropping plain comments: a file carrying a directive
+always trips `not-canonical`, and `flatppl-fmt fmt` deletes the directive line.
+Both go away only when the printer learns to retain plain comments.
 
 The first directional lowering rules already live inside `flatppl-determinizer`
 (its greedy legalizer + in-crate dispatch table). Planned (later phases):
