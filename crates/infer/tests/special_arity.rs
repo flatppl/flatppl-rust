@@ -53,6 +53,12 @@ fn assert_clean(src: &str) {
     assert!(errs.is_empty(), "`{src}` must type cleanly; got: {errs:?}");
 }
 
+fn ir(src: &str) -> String {
+    let mut m = flatppl_syntax::parse(src).unwrap();
+    let _ = infer(&mut m);
+    flatppl_flatpir::write(&m)
+}
+
 // ---- §04: special-operation arity -------------------------------------------
 
 /// §04 "Calling conventions": "Nullary calls (`f()`) are not allowed", and for
@@ -307,4 +313,67 @@ fn a_module_function_checks_its_argument_names() {
     assert_clean(&format!("{sf}e = sf.erf(x = 1.0)\n"));
     assert_clean(&format!("{sf}e = sf.erf(1.0)\n"));
     assert_clean(&format!("{sf}b = sf.bessel_j(v = 1.0, z = 2.0)\n"));
+}
+
+/// `load_data` is an ORDINARY builtin, so §04's roster of special operations does
+/// not govern it and both call spellings are legal.
+///
+/// **Owner ruling, 2026-09-07**, landed as spec PR
+/// flatppl/flatppl-design#110: `load_data` has no template, no binding scope and
+/// no variadic part, so the §04 "Calling conventions" bullet declaring it "One
+/// distinguished input plus optional variadic named inputs" was a
+/// mis-classification. §07 "Data loading" keeps `load_data(source, valueset)`, and
+/// §04's ordinary rule governs the spellings: "All built-in ordinary callables have
+/// a defined input order and accept both positional and keyword arguments."
+///
+/// The crate already behaved this way — `load_data` is absent from
+/// [`ops::special_arity`] by construction and its arity is answered from the
+/// catalogue row. This test pins that, so a later revision cannot quietly re-add
+/// the bullet's behaviour. The count diagnostic citing **§07** rather than §04 is
+/// the discriminator: a §04-governed head reports through `special_arity`.
+#[test]
+fn load_data_is_an_ordinary_builtin_not_a_special_operation() {
+    // Positional, keyword, and keyword in the other order all type cleanly, and
+    // all three give the same type — the member of the declared `valueset`.
+    let want = "(%bind d (%meta ((%table (%columns (a (%scalar real)) \
+                (b (%scalar real))) (%nrows 4)) %fixed \
+                (cartpow (record (a reals) (b reals)) 4))";
+    for src in [
+        "d = load_data(\"x.csv\", cartpow(cartprod(a = reals, b = reals), 4))\n",
+        "d = load_data(source = \"x.csv\", \
+         valueset = cartpow(cartprod(a = reals, b = reals), 4))\n",
+        "d = load_data(valueset = cartpow(cartprod(a = reals, b = reals), 4), \
+         source = \"x.csv\")\n",
+    ] {
+        assert_clean(src);
+        let out = ir(src);
+        assert!(
+            out.contains(want),
+            "`{src}` must type as the declared value set's member, in:\n{out}"
+        );
+    }
+    // The keyword spelling is NOT refused as a distinguished input, which is what
+    // the deleted bullet would have made it.
+    for src in [
+        "d = load_data(source = \"x.csv\", valueset = reals)\n",
+        "d = load_data(source = \"x.csv\", valueset = cartpow(reals, 3))\n",
+    ] {
+        assert_clean(src);
+    }
+    // The count still binds, and it is the §07 row that reports it.
+    assert_refuses("d = load_data()\n", "takes 2 arguments (spec §07), got 0");
+    assert_refuses(
+        "d = load_data(\"x.csv\", reals, 3)\n",
+        "takes 2 arguments (spec §07), got 3",
+    );
+    assert_refuses(
+        "d = load_data(source = \"x.csv\")\n",
+        "takes 2 arguments (spec §07), got 1",
+    );
+    // An unknown argument name is refused by the ordinary name check, not by a
+    // distinguished-input rule.
+    assert_refuses(
+        "d = load_data(path = \"x.csv\", valueset = reals)\n",
+        "has no parameter `path`",
+    );
 }

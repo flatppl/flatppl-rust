@@ -6426,7 +6426,10 @@ fn refuse_mixed_string_array(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) -> 
 ///
 /// `load_data` is deliberately absent from this table and unaffected: the
 /// adjudication finds it mis-classified — it has no template, binding scope or
-/// variadic part — and reclassifies it as an ordinary builtin in its own spec PR.
+/// variadic part — and reclassified it as an ordinary builtin in its own spec PR,
+/// flatppl/flatppl-design#110, which deleted its §04 bullet. Its arity comes from
+/// the catalogue row instead; `special_arity::load_data_is_an_ordinary_builtin_not_a_special_operation`
+/// in `tests/special_arity.rs` pins that.
 enum SpecialArity {
     /// Exactly `n` distinguished inputs, positional only. `standard_module` is
     /// no longer a separate variant: §04 "Standard modules" says of it outright
