@@ -1,8 +1,10 @@
 //! pyhf workspace JSON → FlatPPL module assembly.
 //!
 //! Implements the lift described in §12 "pyhf uncorrelated_background" of the
-//! profiles doc: each channel → `broadcast(Poisson, expected)` obs model, with
-//! modifier effects generating auxiliary likelihood terms as needed.
+//! profiles doc: each channel → `broadcast(Poisson, expected)` obs model
+//! (`hepphys.ContinuedPoisson` where the channel's observed counts are
+//! fractional), with modifier effects generating auxiliary likelihood terms as
+//! needed.
 use crate::builder::{Builder, check_binding_name};
 use crate::error::{Error, Result};
 use crate::histfactory::{
@@ -381,6 +383,17 @@ pub(crate) fn emit_standard_module(b: &mut Builder) {
     bind_standard_module(b, "hepphys", "particle-physics", "0.1");
 }
 
+/// A channel's observed bin contents, resolved by whichever importer read them.
+#[derive(Debug, Clone, Copy)]
+pub struct Observed {
+    /// Array node holding the per-bin counts.
+    pub node: NodeId,
+    /// Bin count, checked against the samples.
+    pub n_bins: usize,
+    /// Some count is fractional, so the channel scores `hepphys.ContinuedPoisson`.
+    pub fractional: bool,
+}
+
 /// The lumi constraint's resolved config: the Normal `sigma` and the observed
 /// point `nom` (pyhf `auxdata`, §12:208 "observed at lumi_nom").
 #[derive(Debug, Clone, Copy)]
@@ -420,7 +433,7 @@ fn emit_channel(
         .collect();
 
     // Resolve observation for this channel into an array node (and its bin count).
-    let (observed, n_observed) = find_obs(b, doc, channel_name)?;
+    let observed = find_obs(b, doc, channel_name)?;
 
     // Resolve lumi config (sigma) if any sample carries a lumi modifier.
     let has_lumi = channel.samples.iter().any(|s| {
@@ -449,7 +462,7 @@ fn emit_channel(
         None
     };
 
-    assemble_channel(b, channel_name, &samples, observed, n_observed, lumi, terms)
+    assemble_channel(b, channel_name, &samples, observed, lumi, terms)
 }
 
 /// Accumulated likelihood terms across a workspace's channels: the per-channel
@@ -610,6 +623,9 @@ pub fn bind_likelihood(b: &mut Builder, terms: &Terms) {
 /// a kernel, as `likelihoodof` requires, spec §06), `<channel>_likelihood` (the
 /// observation term), plus the auxiliary constraint terms (lumi, staterror,
 /// per-sample shapesys/normsys/histosys).
+///
+/// `observed.fractional` swaps the count distribution to
+/// `hepphys.ContinuedPoisson`, from [`validate_observed_counts`].
 /// Combine one sample's histosys interpolations into its shifted nominal.
 ///
 /// `shifted` pairs each histosys parameter name with the interpolation of the
@@ -651,11 +667,15 @@ pub fn assemble_channel(
     b: &mut Builder,
     channel_name: &str,
     samples: &[(&str, &[f64], &[crate::model::Modifier])],
-    observed: NodeId,
-    n_observed: usize,
+    observed: Observed,
     lumi: Option<LumiConfig>,
     terms: &mut Terms,
 ) -> Result<()> {
+    let Observed {
+        node: observed,
+        n_bins: n_observed,
+        fractional: fractional_observed,
+    } = observed;
     // ---- Pass 0: validate channel shape ----
     //
     // Every sample must have the same number of bins, and that count must match
@@ -677,14 +697,15 @@ pub fn assemble_channel(
                 nominal.len()
             )));
         }
-        if let Some((bin, value)) = nominal
-            .iter()
-            .enumerate()
-            .find(|(_, value)| !value.is_finite() || **value < 0.0)
-        {
+        // A non-finite nominal has no numeric lowering at all, so refuse it here. A
+        // negative nominal is imported as written: spec §08 gives `Poisson(rate)` the
+        // parameter domain `rate = elementof(nonnegreals)`, and the expected yield is a
+        // sum over samples scaled by parameters, so only evaluation knows the rate. The
+        // domain check there refuses a negative rate with the parameters in hand.
+        if let Some((bin, value)) = nominal.iter().enumerate().find(|(_, v)| !v.is_finite()) {
             return Err(Error::Unsupported(format!(
                 "channel `{channel_name}`: sample `{name}` nominal yield at bin {bin} \
-                 must be finite and nonnegative, got {value}"
+                 must be finite, got {value}"
             )));
         }
     }
@@ -898,14 +919,28 @@ pub fn assemble_channel(
     // ---- Observation model + likelihood term ----
     // `functionof` reifies the parameter-dependent measure into a kernel, as
     // `likelihoodof` requires (spec §06).
-    let poisson = b.call_head("Poisson");
+    //
+    // §08 gives `Poisson` support `nonnegintegers`, so it cannot score a
+    // fractional count; §09 says `ContinuedPoisson` matches the Poisson density
+    // at non-negative integers but is not a probability measure and has no
+    // `rand`. So a fractional channel (an Asimov dataset, which pyhf and RooFit
+    // score on the gamma-continued density) uses `ContinuedPoisson`, and an
+    // integer channel keeps the samplable `Poisson`.
+    let (count_dist, dist_doc) = if fractional_observed {
+        (
+            b.module_call("hepphys", "ContinuedPoisson"),
+            "Per-bin continued-Poisson observation model",
+        )
+    } else {
+        (b.call_head("Poisson"), "Per-bin Poisson observation model")
+    };
     let expected_ref = b.self_ref(&expected_name);
-    let obs_measure = b.call("broadcast", &[poisson, expected_ref]);
+    let obs_measure = b.call("broadcast", &[count_dist, expected_ref]);
     let obs_kernel = b.functionof(obs_measure);
     let model_name = b.bind_unique_doc(
         &format!("{channel_name}_model"),
         obs_kernel,
-        &format!("Per-bin Poisson observation model for channel \"{channel_name}\"."),
+        &format!("{dist_doc} for channel \"{channel_name}\"."),
     );
     let model_ref = b.self_ref(&model_name);
     let observed_ref = b.self_ref(&observed_name);
@@ -963,18 +998,23 @@ pub fn assemble_channel(
     Ok(())
 }
 
-pub(crate) fn validate_observed_counts(channel_name: &str, values: &[f64]) -> Result<()> {
+/// Validate a channel's observed bin contents and report whether any is fractional.
+///
+/// Negative or non-finite counts are refused: no Poisson-like density is defined
+/// there. A fractional count is accepted and switches the channel's count
+/// likelihood to `ContinuedPoisson` (see [`assemble_channel`]).
+pub(crate) fn validate_observed_counts(channel_name: &str, values: &[f64]) -> Result<bool> {
     if let Some((bin, value)) = values
         .iter()
         .enumerate()
-        .find(|(_, value)| !value.is_finite() || **value < 0.0 || value.fract() != 0.0)
+        .find(|(_, value)| !value.is_finite() || **value < 0.0)
     {
         return Err(Error::Unsupported(format!(
-            "channel `{channel_name}`: observed event count at bin {bin} must be a \
-             nonnegative integer, got {value}"
+            "channel `{channel_name}`: observed event count at bin {bin} must be \
+             finite and nonnegative, got {value}"
         )));
     }
-    Ok(())
+    Ok(values.iter().any(|value| value.fract() != 0.0))
 }
 
 /// Emit a per-parameter constraint once (deduped via `terms.emitted_params`) and
@@ -1043,17 +1083,23 @@ fn param_domain_set(b: &mut Builder, domain: ParamDomain, n_bins: usize) -> Node
 ///
 /// New format: `doc.observations` list keyed by name.
 /// Old format: `doc.data` map keyed by channel name.
-fn find_obs(b: &mut Builder, doc: &PyhfDocument, channel_name: &str) -> Result<(NodeId, usize)> {
+///
+fn find_obs(b: &mut Builder, doc: &PyhfDocument, channel_name: &str) -> Result<Observed> {
+    let mut build = |data: &[f64]| -> Result<Observed> {
+        let fractional = validate_observed_counts(channel_name, data)?;
+        let elems: Vec<NodeId> = data.iter().map(|x| b.lit_real(*x)).collect();
+        Ok(Observed {
+            node: b.array(&elems),
+            n_bins: data.len(),
+            fractional,
+        })
+    };
     if let Some(obs) = doc.observations.iter().find(|o| o.name == channel_name) {
-        validate_observed_counts(channel_name, &obs.data)?;
-        let elems: Vec<NodeId> = obs.data.iter().map(|x| b.lit_real(*x)).collect();
-        return Ok((b.array(&elems), obs.data.len()));
+        return build(&obs.data);
     }
     if let Some(map) = &doc.data {
         if let Some(data) = map.get(channel_name) {
-            validate_observed_counts(channel_name, data)?;
-            let elems: Vec<NodeId> = data.iter().map(|x| b.lit_real(*x)).collect();
-            return Ok((b.array(&elems), data.len()));
+            return build(data);
         }
     }
     Err(Error::NoObservation(channel_name.to_owned()))
@@ -1116,6 +1162,35 @@ mod tests {
             data: None,
             toplvl: None,
         }
+    }
+
+    // JSON has no non-finite literal, so this branch is unreachable from a document
+    // and needs a reader-input test.
+    #[test]
+    fn non_finite_nominal_is_refused() {
+        for bad in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+            let mut doc = make_uncorrelated_doc();
+            doc.channels[0].samples[0].data[1] = bad;
+            let err = pyhf_to_module(&doc)
+                .expect_err("a non-finite nominal yield must be refused")
+                .to_string();
+            assert!(
+                err.contains("nominal yield at bin 1 must be finite"),
+                "got: {err}"
+            );
+        }
+    }
+
+    // A negative nominal is imported as written. Spec §08 `Poisson(rate)` has
+    // `rate = elementof(nonnegreals)`, and the expected yield is a parameter-scaled
+    // sum over samples, so only evaluation knows the rate and refuses it there.
+    #[test]
+    fn negative_nominal_is_imported() {
+        let mut doc = make_uncorrelated_doc();
+        doc.channels[0].samples[0].data[1] = -11.0;
+        let m = pyhf_to_module(&doc).expect("a negative nominal yield must import");
+        let text = print_with(&m, Syntax::Minimal);
+        assert!(text.contains("-11.0"), "got:\n{text}");
     }
 
     #[test]

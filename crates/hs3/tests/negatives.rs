@@ -311,9 +311,16 @@ fn native_histfactory_counts_must_match_poisson_support() {
         )
     };
 
-    assert_err_hs3("negative nominal", &document("-1.0", "2.0"), "nominal");
+    // A negative nominal is imported as written: the import stays faithful to the
+    // source, and spec §08 `Poisson(rate)` has `rate = elementof(nonnegreals)`, so
+    // the domain check at evaluation refuses the rate once the parameters are known.
+    assert!(flatppl_hs3::read_hs3(&document("-1.0", "2.0")).is_ok());
+    // JSON cannot carry a non-finite literal, so the non-finite nominal refusal is
+    // covered by a unit test on the reader input instead (see `crates/hs3/src/pyhf.rs`).
     assert_err_hs3("negative observed", &document("1.0", "-2.0"), "observed");
-    assert_err_hs3("fractional observed", &document("1.0", "3.5"), "integer");
+    // A fractional count is NOT an error: it selects `ContinuedPoisson`
+    // (positive coverage in tests/fractional_observed_counts.rs).
+    assert!(flatppl_hs3::read_hs3(&document("1.0", "3.5")).is_ok());
 }
 
 // ---------------------------------------------------------------------------
