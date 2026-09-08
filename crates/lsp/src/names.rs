@@ -164,8 +164,9 @@ pub fn def_name_range(text: &str, rhs_start: u32, name: &str) -> Option<(u32, u3
 /// top-level binding names `inputs` and `outputs` are reserved for the
 /// determinization signature." §04 "Name resolution" adds: "`self` and `base`
 /// themselves are reserved names and cannot be bound to something else."
+/// Numeric constants `im`, `pi`, and `inf` cannot be shadowed (§04/§05).
 const RESERVED: &[&str] = &[
-    "in", "true", "false", "all", "only", "inputs", "outputs", "self", "base",
+    "in", "true", "false", "all", "only", "inputs", "outputs", "self", "base", "im", "pi", "inf",
 ];
 
 /// Does `name` match §04's public-binding form?
@@ -533,7 +534,8 @@ mod tests {
     #[test]
     fn reserved_words_are_refused() {
         for bad in [
-            "in", "true", "false", "all", "only", "inputs", "outputs", "self", "base",
+            "in", "true", "false", "all", "only", "inputs", "outputs", "self", "base", "im", "pi",
+            "inf",
         ] {
             let err = check_new_name(bad).expect_err("reserved name must refuse");
             assert!(

@@ -382,7 +382,7 @@ fn lower_statement(module: &mut Module, stmt: &Stmt, names: &Names, synth: &mut 
 fn check_binding_name(name: &str, tok: &Token) -> Result<()> {
     match name {
         "_" => Ok(()),
-        "true" | "false" | "in" | "all" | "only" => Err(err_at(
+        "true" | "false" | "in" | "all" | "only" | "im" | "pi" | "inf" => Err(err_at(
             tok,
             format!("`{name}` is a reserved word and cannot be bound"),
         )),
@@ -774,7 +774,7 @@ impl<'a> ExprParser<'a> {
     fn check_lambda_param(&self, name: &str) -> Result<()> {
         let reserved = matches!(
             name,
-            "_" | "true" | "false" | "in" | "all" | "only" | "self" | "base"
+            "_" | "true" | "false" | "in" | "all" | "only" | "self" | "base" | "im" | "pi" | "inf"
         );
         if reserved || is_placeholder(name) {
             return Err(self.err_here(format!("`{name}` cannot be a lambda argument name")));

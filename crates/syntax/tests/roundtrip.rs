@@ -624,6 +624,12 @@ fn binding_name_rules() {
         "false = 1",
         "self = 1",
         "base = 1",
+        "im = 1",
+        "pi = 1",
+        "inf = 1",
+        "f = im -> im",
+        "f(pi) = pi",
+        "f = (x, inf) -> x + inf",
         "_x_ = 1",
     ] {
         assert!(parse(src).is_err(), "`{src}` should be rejected");
