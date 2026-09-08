@@ -1062,6 +1062,7 @@ fn emit_histfactory_channels(m: &mut Module, doc: &Document) -> Result<()> {
         // through the likelihood that references it.
         let obs_vals = find_histfactory_observed(doc, &d.name)
             .ok_or_else(|| Error::NoObservation(d.name.clone()))?;
+        crate::pyhf::validate_observed_counts(&d.name, &obs_vals)?;
 
         // A `lumi` modifier needs a luminosity constraint (a Normal aux with a
         // sigma from the measurement's lumi-config). The native HS3 Document

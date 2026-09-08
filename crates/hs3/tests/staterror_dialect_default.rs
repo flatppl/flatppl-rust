@@ -60,3 +60,39 @@ fn native_hs3_staterror_defaults_to_poisson() {
         "expected a ContinuedPoisson staterror aux, got:\n{text}"
     );
 }
+
+fn shared_staterror(first: Option<&str>, second: Option<&str>) -> String {
+    let mut source: serde_json::Value = serde_json::from_str(HS3).unwrap();
+    let samples = source["distributions"][0]["samples"]
+        .as_array_mut()
+        .unwrap();
+    let mut other = samples[1].clone();
+    other["name"] = "other".into();
+    samples.push(other);
+    for (sample, constraint) in samples[1..].iter_mut().zip([first, second]) {
+        if let Some(constraint) = constraint {
+            sample["modifiers"][0]["constraint_type"] = constraint.into();
+        }
+    }
+    source.to_string()
+}
+
+#[test]
+fn shared_staterror_rejects_incompatible_constraint_families() {
+    for (first, second) in [("Gauss", "Poisson"), ("Poisson", "Gauss")] {
+        flatppl_hs3::read_hs3(&shared_staterror(Some(first), Some(second)))
+            .expect_err("a shared parameter cannot have incompatible auxiliary families");
+    }
+}
+
+#[test]
+fn shared_staterror_accepts_equivalent_constraint_families() {
+    for (first, second, family) in [
+        (Some("Gauss"), "Gaussian", "broadcast(Normal, st, st_delta)"),
+        (None, "Poisson", "hepphys.ContinuedPoisson"),
+    ] {
+        let module = flatppl_hs3::read_hs3(&shared_staterror(first, Some(second))).unwrap();
+        let text = flatppl_syntax::print_with(&module, flatppl_syntax::Syntax::Minimal);
+        assert!(text.contains(family), "{text}");
+    }
+}

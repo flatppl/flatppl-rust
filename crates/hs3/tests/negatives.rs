@@ -295,6 +295,27 @@ fn native_histfactory_lumi_modifier_errs() {
     assert_err_read("native_lumi", json, &["lumi", "lumi-config"]);
 }
 
+#[test]
+fn native_histfactory_counts_must_match_poisson_support() {
+    let document = |sample: &str, observed: &str| {
+        format!(
+            r#"{{
+                "distributions": [{{"name": "ch", "type": "histfactory_dist",
+                    "samples": [{{"name": "sig", "data": {{"contents": [{sample}]}},
+                        "modifiers": []}}]}}],
+                "likelihoods": [{{"name": "L", "distributions": ["ch"],
+                    "data": ["obs_data"]}}],
+                "data": [{{"name": "obs_data", "type": "binned",
+                    "contents": [{observed}]}}]
+            }}"#
+        )
+    };
+
+    assert_err_hs3("negative nominal", &document("-1.0", "2.0"), "nominal");
+    assert_err_hs3("negative observed", &document("1.0", "-2.0"), "observed");
+    assert_err_hs3("fractional observed", &document("1.0", "3.5"), "integer");
+}
+
 // ---------------------------------------------------------------------------
 // Two `domains` axes naming the same observable with DIFFERENT bounds → Err.
 //

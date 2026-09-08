@@ -69,6 +69,23 @@ fn shapesys_factors_replace_the_derived_rate_factor() {
 }
 
 #[test]
+fn duplicate_parameter_configs_are_refused() {
+    for params in [
+        r#"{ "name": "g", "factors": [50.0, 80.0] },
+            { "name": "g", "factors": [50.0, 80.0] }"#,
+        r#"{ "name": "g", "factors": [50.0, 80.0] },
+            { "name": "g", "factors": [60.0, 90.0] }"#,
+    ] {
+        let err = flatppl_hs3::read(&ws(SHAPESYS, params))
+            .expect_err("duplicate parameter configurations must be refused");
+        assert!(
+            err.to_string().contains("more than once"),
+            "the error must name the duplicate: {err}"
+        );
+    }
+}
+
+#[test]
 fn a_field_the_paramset_does_not_use_is_refused() {
     // pyhf: InvalidModel. A normsys / histosys paramset has no sigmas.
     for modifier in [NORMSYS, HISTOSYS] {
@@ -191,6 +208,44 @@ fn the_first_measurement_wins_a_disagreement() {
         text.contains("meas_a = record(poi = mu)") && text.contains("meas_b = record(poi = mu)"),
         "got:\n{text}"
     );
+}
+
+#[test]
+fn an_unselected_measurement_cannot_replace_default_widths() {
+    let mut source: serde_json::Value = serde_json::from_str(&ws(STATERROR, "")).unwrap();
+    source["measurements"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "name": "other",
+            "config": {
+                "poi": "mu",
+                "parameters": [{"name": "st", "sigmas": [0.5, 0.5]}]
+            }
+        }));
+
+    let text = convert(&source.to_string());
+    // The selected measurement keeps sigma = uncertainty / nominal in each bin.
+    assert!(text.contains("st_delta = [0.1, 0.1]"), "{text}");
+}
+
+#[test]
+fn an_unselected_measurement_cannot_supply_lumi_config() {
+    let lumi = r#"{"name": "lumi", "type": "lumi", "data": null}"#;
+    let mut source: serde_json::Value = serde_json::from_str(&ws(lumi, "")).unwrap();
+    source["measurements"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "name": "other",
+            "config": {
+                "poi": "mu",
+                "parameters": [{"name": "lumi", "sigmas": [0.1], "auxdata": [1.0]}]
+            }
+        }));
+
+    flatppl_hs3::read(&source.to_string())
+        .expect_err("the selected measurement has no required luminosity configuration");
 }
 
 #[test]
