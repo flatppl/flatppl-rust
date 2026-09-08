@@ -20,7 +20,7 @@ impl LineIndex {
     pub fn new(text: &str) -> Self {
         let mut line_starts = vec![0u32];
         for (i, b) in text.bytes().enumerate() {
-            if b == b'\n' {
+            if b == b'\n' || (b == b'\r' && text.as_bytes().get(i + 1) != Some(&b'\n')) {
                 line_starts.push((i + 1) as u32);
             }
         }
@@ -46,7 +46,7 @@ impl LineIndex {
     /// The byte offset of the end of line `line`'s CONTENT.
     ///
     /// For a NON-final line this is the next line's start minus the trailing
-    /// `\n` (and a preceding `\r` for CRLF). For the FINAL line it is
+    /// `\n`, `\r`, or `\r\n`. For the FINAL line it is
     /// `text.len()` with NOTHING stripped: the final line has no terminator —
     /// any trailing `\n` belongs to the *previous* line, making the final line
     /// an empty line that starts at `text.len()`. Stripping there would push
@@ -55,7 +55,7 @@ impl LineIndex {
     /// ends in a newline).
     fn line_content_end(&self, line: usize) -> usize {
         match self.line_starts.get(line + 1) {
-            // Not the final line: `next` is one past THIS line's '\n'.
+            // Not the final line: `next` is one past this line's terminator.
             Some(&next) => {
                 let mut end = next as usize;
                 if end > 0 && self.text.as_bytes().get(end - 1) == Some(&b'\n') {
@@ -118,6 +118,16 @@ mod tests {
         let p = li.position(4); // 'd' → line 1, col 1
         assert_eq!((p.line, p.character), (1, 1));
         assert_eq!(li.offset(p), 4);
+    }
+
+    #[test]
+    fn lone_cr_lines_roundtrip_lsp_positions() {
+        let li = LineIndex::new("ab\rcd\r");
+        let pos = |line, character| Pos { line, character };
+        assert_eq!(li.position(3), pos(1, 0));
+        assert_eq!(li.offset(pos(1, 1)), 4);
+        assert_eq!(li.position(2), pos(0, 2));
+        assert_eq!(li.position(6), pos(2, 0));
     }
 
     #[test]

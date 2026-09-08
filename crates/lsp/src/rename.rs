@@ -14,7 +14,7 @@
 
 use std::collections::HashSet;
 
-use flatppl_core::{BindingId, CallHead, Inputs, Node, Ref, RefNs};
+use flatppl_core::{BindingId, CallHead, Idx, Inputs, Node, NodeId, Ref, RefNs};
 
 use crate::capabilities::resolve_ref_def;
 use crate::db::{Catalogues, FileSet, SourceFile};
@@ -37,8 +37,8 @@ enum Target {
     /// A function/kernel argument name. §04 "Objects, expressions, names and
     /// modules" keeps argument names out of the module namespace, and §04
     /// "Placeholders and holes" scopes a placeholder to "the nearest enclosing
-    /// `functionof` or `kernelof`", so the rename is confined to one binding's
-    /// RHS in one file — never cross-file.
+    /// `functionof` or `kernelof`", so body occurrences are confined to one
+    /// reification, including when several reifications share a binding.
     Argument(ArgumentTarget),
 }
 
@@ -53,8 +53,9 @@ struct BindingTarget {
 /// A callable-argument target, in the file the request came from.
 struct ArgumentTarget {
     file: SourceFile,
-    /// The binding whose RHS reifies the callable that declares this argument.
-    bid: BindingId,
+    /// The reification that declares this argument, possibly a nested lambda.
+    reification: NodeId,
+    declaration: (u32, u32),
     /// The surface argument name, e.g. `a`.
     name: String,
     /// The lowered placeholder the body references, e.g. `_a_`.
@@ -110,7 +111,40 @@ fn resolve_target(
         }
         // An argument declaration site: the cursor is inside the callable's
         // argument list, which carries no node of its own.
-        if let Some(t) = argument_target_at(module, text, file, bid, byte_offset, None) {
+        if let Some(t) = argument_target_at(
+            module,
+            text,
+            file,
+            binding.rhs,
+            Some((start, end)),
+            byte_offset,
+            None,
+        ) {
+            return Ok(t);
+        }
+    }
+
+    // Named-function declarations can precede their RHS span, and were handled
+    // above. Within an expression, the nearest reification owns the placeholder.
+    let owner = (0..module.node_count())
+        .map(NodeId::from_usize)
+        .filter(|&id| matches!(module.node(id), Node::Call(c) if c.inputs.is_some()))
+        .filter_map(|id| {
+            let span = module.span_of(id)?;
+            (span.start <= byte_offset && byte_offset < span.end)
+                .then_some((id, span.end - span.start))
+        })
+        .min_by_key(|(_, width)| *width)
+        .map(|(id, _)| id);
+    let def_name = owner.and_then(|id| {
+        let span = module.span_of(id)?;
+        module
+            .bindings()
+            .find(|(_, b)| b.rhs == id)
+            .and_then(|(_, b)| names::def_name_range(text, span.start, module.resolve(b.name)))
+    });
+    if let Some(id) = owner {
+        if let Some(t) = argument_target_at(module, text, file, id, def_name, byte_offset, None) {
             return Ok(t);
         }
     }
@@ -126,34 +160,29 @@ fn resolve_target(
         // forbids renaming one, so it is supported as its own scoped operation.
         RefNs::Local => {
             let placeholder = module.resolve(r.name).to_string();
-            // Find the binding whose RHS reifies the callable declaring it.
-            let owner = module
-                .bindings()
-                .filter(|(_, b)| {
-                    module
-                        .span_of(b.rhs)
-                        .is_some_and(|s| s.start <= span.start && span.end <= s.end)
-                })
-                .min_by_key(|(_, b)| {
-                    let s = module.span_of(b.rhs).expect("filtered to spanned RHS");
-                    s.end - s.start
-                });
-            let (bid, _) = owner.ok_or_else(|| {
+            let reification = owner.ok_or_else(|| {
                 Refusal(format!(
                     "could not find the callable that declares `{placeholder}`"
                 ))
             })?;
-            argument_target_at(module, text, file, bid, byte_offset, Some(&placeholder)).ok_or_else(
-                || {
-                    Refusal(format!(
-                        "`{placeholder}` is a placeholder whose declaration site has no \
+            argument_target_at(
+                module,
+                text,
+                file,
+                reification,
+                def_name,
+                byte_offset,
+                Some(&placeholder),
+            )
+            .ok_or_else(|| {
+                Refusal(format!(
+                    "`{placeholder}` is a placeholder whose declaration site has no \
                          recorded span: an explicit `functionof`/`kernelof` boundary \
                          declares it as a keyword argument, which the IR stores without \
                          a source span, so the rename cannot be applied safely. Renaming \
                          the argument of a `f(a) = …` definition or a lambda is supported."
-                    ))
-                },
-            )
+                ))
+            })
         }
         RefNs::Module(alias) => {
             // The node spans `alias.member`. When the cursor is on the alias half
@@ -210,11 +239,11 @@ fn resolve_target(
     }
 }
 
-/// Build an [`ArgumentTarget`] for the callable reified by binding `bid`.
+/// Build an [`ArgumentTarget`] for one reification.
 ///
 /// Selects the argument either by `placeholder` (when the cursor was on a body
 /// reference) or by the cursor falling inside a declared argument's range (when it
-/// was on the declaration list). Returns `None` when `bid`'s RHS is not a
+/// was on the declaration list). Returns `None` when the node is not a
 /// reification with an ordered boundary, when the declaration list cannot be
 /// located in the source, or when the requested argument is not among the
 /// declared ones — every one a reason to fail closed rather than edit.
@@ -222,12 +251,12 @@ fn argument_target_at(
     module: &flatppl_core::Module,
     text: &str,
     file: SourceFile,
-    bid: BindingId,
+    reification: NodeId,
+    def_name: Option<(u32, u32)>,
     byte_offset: u32,
     placeholder: Option<&str>,
 ) -> Option<Target> {
-    let binding = module.binding(bid);
-    let Node::Call(call) = module.node(binding.rhs) else {
+    let Node::Call(call) = module.node(reification) else {
         return None;
     };
     let CallHead::Builtin(head) = call.head else {
@@ -241,8 +270,7 @@ fn argument_target_at(
     let Inputs::Spec(entries) = call.inputs.as_ref()? else {
         return None;
     };
-    let reif_span = module.span_of(binding.rhs)?;
-    let def_name = names::def_name_range(text, reif_span.start, module.resolve(binding.name));
+    let reif_span = module.span_of(reification)?;
     let declared = names::argument_decl_ranges(text, reif_span.start, def_name);
     if declared.is_empty() {
         return None;
@@ -272,9 +300,11 @@ fn argument_target_at(
     let entry = entries
         .iter()
         .find(|(sym, _)| module.resolve(*sym) == name)?;
+    let (_, start, end) = declared.iter().find(|(n, _, _)| *n == name)?;
     Some(Target::Argument(ArgumentTarget {
         file,
-        bid,
+        reification,
+        declaration: (*start, *end),
         placeholder: module.resolve(entry.1.name).to_string(),
         name,
     }))
@@ -307,30 +337,24 @@ fn occurrences(
 }
 
 /// Every occurrence of an argument name: each `%local` reference to its
-/// placeholder inside the owning binding's RHS, plus the declaration site in the
+/// placeholder inside the owning reification, plus the declaration site in the
 /// argument list.
 ///
-/// Confined to one binding in one file. §04 "Placeholders and holes" gives the
+/// Confined to one reification in one file. §04 "Placeholders and holes" gives the
 /// scoping rule — "The scope of a placeholder is the nearest enclosing
 /// `functionof` or `kernelof`" — and adds that "The same placeholder name may
-/// appear in different scopes without conflict", so the containment test below is
-/// what keeps a same-named argument of a *different* callable out of the set.
+/// appear in different scopes without conflict", so traversal stops at nested
+/// reifications even when they declare the same placeholder name.
 fn argument_occurrences(
     db: &dyn salsa::Database,
     target: &ArgumentTarget,
     include_declaration: bool,
 ) -> Vec<NameLoc> {
-    use flatppl_core::Idx;
     let Some(module) = parse(db, target.file).module(db) else {
         return Vec::new();
     };
     let text = target.file.text(db);
     let path = target.file.path(db).clone();
-    let binding = module.binding(target.bid);
-    let Some(rhs_span) = module.span_of(binding.rhs) else {
-        return Vec::new();
-    };
-
     let mut out: Vec<NameLoc> = Vec::new();
     let mut seen: HashSet<NameLoc> = HashSet::new();
     let mut push = |start: u32, end: u32| {
@@ -344,8 +368,16 @@ fn argument_occurrences(
         }
     };
 
-    for i in 0..module.node_count() {
-        let id = flatppl_core::NodeId::from_usize(i);
+    let mut pending = vec![target.reification];
+    let mut visited = HashSet::new();
+    while let Some(id) = pending.pop() {
+        if !visited.insert(id)
+            || (id != target.reification
+                && matches!(module.node(id), Node::Call(c) if c.inputs.is_some()))
+        {
+            continue;
+        }
+        module.for_each_child(id, |child| pending.push(child));
         let Node::Ref(r) = module.node(id) else {
             continue;
         };
@@ -355,10 +387,6 @@ fn argument_occurrences(
         let Some(span) = module.span_of(id) else {
             continue;
         };
-        // Only references inside the owning reification's RHS.
-        if span.start < rhs_span.start || span.end > rhs_span.end {
-            continue;
-        }
         // The body writes the SURFACE name for a sugar argument, so the range must
         // match that, not the placeholder. A mismatch fails closed.
         if let Some((s, e)) = names::ref_name_range(text, span.start, RefPart::Head, &target.name) {
@@ -367,12 +395,7 @@ fn argument_occurrences(
     }
 
     if include_declaration {
-        let def_name = names::def_name_range(text, rhs_span.start, module.resolve(binding.name));
-        for (n, s, e) in names::argument_decl_ranges(text, rhs_span.start, def_name) {
-            if n == target.name {
-                push(s, e);
-            }
-        }
+        push(target.declaration.0, target.declaration.1);
     }
     out
 }
@@ -577,11 +600,20 @@ pub fn rename_edits(
     // A definition site we could not locate textually means the rewrite would be
     // partial. This is a fail-closed implementation guard, not a doctrine refusal:
     // no rule forbids the rename, we simply cannot compute a correct edit for it.
-    let (def_path, name) = match &target {
-        Target::Binding(t) => (t.file.path(db).clone(), &t.name),
-        Target::Argument(t) => (t.file.path(db).clone(), &t.name),
+    let (def_path, name, declaration) = match &target {
+        Target::Binding(t) => {
+            let declaration = parse(db, t.file).module(db).and_then(|module| {
+                let span = module.span_of(module.binding(t.bid).rhs)?;
+                names::def_name_range(t.file.text(db), span.start, &t.name)
+            });
+            (t.file.path(db).clone(), &t.name, declaration)
+        }
+        Target::Argument(t) => (t.file.path(db).clone(), &t.name, Some(t.declaration)),
     };
-    if !locs.iter().any(|l| l.path == def_path) {
+    if !locs
+        .iter()
+        .any(|l| l.path == def_path && Some((l.start, l.end)) == declaration)
+    {
         return Err(Refusal(format!(
             "could not locate the declaration of `{name}` in {def_path}"
         )));
@@ -1124,6 +1156,116 @@ mod tests {
         let index = node_span_index(&db, f, fs, cats);
         let locs = rename_edits(&db, f, fs, cats, 2, &index, "z").expect("allowed");
         assert_eq!(apply(src, &locs, "z"), "f(z) = add(z, 1)\ng(a) = mul(a, 2)");
+    }
+
+    #[test]
+    fn rename_outer_argument_preserves_nested_scope() {
+        let src = "f(a) = add(a, sum(broadcast(a -> add(a, 1), [1, 2])))\ny = f(3)";
+        let (db, f, fs, cats) = single_file(src);
+        let index = node_span_index(&db, f, fs, cats);
+        let locs = rename_edits(&db, f, fs, cats, 2, &index, "scale").unwrap();
+        assert_eq!(
+            apply(src, &locs, "scale"),
+            "f(scale) = add(scale, sum(broadcast(a -> add(a, 1), [1, 2])))\ny = f(3)"
+        );
+    }
+
+    #[test]
+    fn rename_binding_ignores_comment_declaration_text() {
+        let src = "x = (\n # x = ignored\n 1)\ny = x";
+        let (db, f, fs, cats) = single_file(src);
+        let index = node_span_index(&db, f, fs, cats);
+        let locs = rename_edits(&db, f, fs, cats, src.len() as u32 - 1, &index, "renamed").unwrap();
+        assert_eq!(
+            apply(src, &locs, "renamed"),
+            "renamed = (\n # x = ignored\n 1)\ny = renamed"
+        );
+    }
+
+    #[test]
+    fn rename_binding_ignores_quoted_declaration_text() {
+        let src = "text = \"x = ignored\"\nx = 1\ny = x";
+        let (db, f, fs, cats) = single_file(src);
+        let index = node_span_index(&db, f, fs, cats);
+        let locs = rename_edits(&db, f, fs, cats, src.len() as u32 - 1, &index, "renamed").unwrap();
+        assert_eq!(
+            apply(src, &locs, "renamed"),
+            "text = \"x = ignored\"\nrenamed = 1\ny = renamed"
+        );
+    }
+
+    #[test]
+    fn rename_refuses_when_decomposition_declaration_is_unavailable() {
+        for name in ["a", "b"] {
+            let src = format!("a, b = [1, 2]\ny = {name}");
+            let (db, f, fs, cats) = single_file(&src);
+            let index = node_span_index(&db, f, fs, cats);
+            assert!(
+                rename_edits(&db, f, fs, cats, src.len() as u32 - 1, &index, "renamed").is_err(),
+                "a rename must include the declaration"
+            );
+        }
+    }
+
+    #[test]
+    fn rename_argument_preserves_comment_trivia() {
+        let src = "f(\n # argument\n a) = add(a, 1)\ny = f(3)";
+        let (db, f, fs, cats) = single_file(src);
+        let index = node_span_index(&db, f, fs, cats);
+        let cursor = nth_offset(src, "add(a", 0) + 4;
+        let edits = rename_edits(&db, f, fs, cats, cursor, &index, "value").unwrap();
+        assert_eq!(
+            apply(src, &edits, "value"),
+            "f(\n # argument\n value) = add(value, 1)\ny = f(3)"
+        );
+    }
+
+    #[test]
+    fn rename_function_with_same_named_identity_argument() {
+        let src = "f(f) = f\ny = f(3)";
+        let (db, f, fs, cats) = single_file(src);
+        let index = node_span_index(&db, f, fs, cats);
+        let cursor = nth_offset(src, "f(3)", 0);
+        let locs = rename_edits(&db, f, fs, cats, cursor, &index, "identity").unwrap();
+        assert_eq!(
+            apply(src, &locs, "identity"),
+            "identity(f) = f\ny = identity(3)"
+        );
+    }
+
+    #[test]
+    fn rename_distinguishes_function_header_from_returned_lambda() {
+        let src = "f(a) = a -> add(a, 1)\ny = f(3)";
+        let (db, f, fs, cats) = single_file(src);
+        let index = node_span_index(&db, f, fs, cats);
+        let outer = rename_edits(&db, f, fs, cats, 2, &index, "outer").unwrap();
+        assert_eq!(
+            apply(src, &outer, "outer"),
+            "f(outer) = a -> add(a, 1)\ny = f(3)"
+        );
+        for cursor in [nth_offset(src, "a ->", 0), nth_offset(src, "add(a", 0) + 4] {
+            let inner = rename_edits(&db, f, fs, cats, cursor, &index, "inner").unwrap();
+            assert_eq!(
+                apply(src, &inner, "inner"),
+                "f(a) = inner -> add(inner, 1)\ny = f(3)"
+            );
+        }
+    }
+
+    #[test]
+    fn rename_nested_argument_selects_its_own_scope() {
+        let src = "f(a) = add(a, sum(broadcast(a -> add(a, 1), [1, 2])))\ny = f(3)";
+        let (db, f, fs, cats) = single_file(src);
+        let index = node_span_index(&db, f, fs, cats);
+        let declaration = nth_offset(src, "a ->", 0);
+        let body_use = nth_offset(src, "add(a, 1)", 0) + 4;
+        for cursor in [declaration, body_use] {
+            let locs = rename_edits(&db, f, fs, cats, cursor, &index, "inner").unwrap();
+            assert_eq!(
+                apply(src, &locs, "inner"),
+                "f(a) = add(a, sum(broadcast(inner -> add(inner, 1), [1, 2])))\ny = f(3)"
+            );
+        }
     }
 
     /// §04 "Reification to functions and kernels" makes a repeated argument name a
