@@ -14,16 +14,15 @@ strip = true
 
 # Size-optimized profile for the SHIPPED flatppl-lsp binary bundled into the
 # VS Code extension vsix (it is downloaded on every install). Inherits release
-# (so `strip = true` still applies) and adds aggressive size flags. `panic =
-# "abort"` is safe: the LSP daemon has no catch_unwind, and abort-on-panic is
-# standard for a long-running server (the client reconnects). NOT for general
-# release artifacts — `flatppl-cli`/`flatppl-fmt` keep using [profile.release].
+# (so `strip = true` still applies) and adds aggressive size flags. Keep the
+# default unwind strategy: Salsa cancels worker queries by unwinding, and the
+# server catches cancellation to answer ContentModified after an edit.
+# `flatppl-cli`/`flatppl-fmt` keep using [profile.release].
 [profile.release-size]
 inherits = "release"
 opt-level = "z"
 lto = true
 codegen-units = 1
-panic = "abort"
 
 [workspace.package]
 version = "0.1.0"

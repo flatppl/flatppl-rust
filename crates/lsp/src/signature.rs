@@ -12,6 +12,7 @@ use flatppl_core::{CallHead, Inputs, Node};
 
 use crate::db::{Catalogues, FileSet, SourceFile};
 use crate::queries::parsed_catalogues;
+use crate::text::{skip_comment, skip_string, skip_trivia};
 
 /// What a call's head names.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -61,7 +62,7 @@ struct Frame {
 /// call's argument list.
 ///
 /// Scans forward from the start of the file rather than backwards from the
-/// cursor: `%` comments and `"` strings can only be recognized reliably in
+/// cursor: comments and `"` strings can only be recognized reliably in
 /// reading order, and a backwards scan would count a comma inside either. Each
 /// bracket gets its own frame, so commas nested in `[…]` or in an inner call do
 /// not advance the outer argument index.
@@ -72,26 +73,8 @@ pub(crate) fn call_site_at(text: &str, byte: u32) -> Option<CallSite> {
     let mut i = 0usize;
     while i < end {
         match bytes[i] {
-            // A `%` comment runs to the end of the line (spec §05).
-            b'%' => {
-                while i < end && bytes[i] != b'\n' {
-                    i += 1;
-                }
-            }
-            b'"' => {
-                i += 1;
-                while i < end {
-                    if bytes[i] == b'\\' {
-                        i += 2;
-                        continue;
-                    }
-                    if bytes[i] == b'"' {
-                        break;
-                    }
-                    i += 1;
-                }
-                i += 1;
-            }
+            b'#' | b'%' => i = skip_comment(bytes, i, end),
+            b'"' => i = skip_string(bytes, i, end),
             open @ (b'(' | b'[' | b'{') => {
                 i += 1;
                 stack.push(Frame {
@@ -116,12 +99,16 @@ pub(crate) fn call_site_at(text: &str, byte: u32) -> Option<CallSite> {
         }
     }
 
-    // The innermost `(` frame: the cursor may be nested in a `[…]` inside an
-    // argument, and the call is still the enclosing paren.
-    let frame = stack.iter().rev().find(|f| f.delim == b'(')?;
-    let head = head_before(text, frame.body - 1)?;
-    let active = active_arg(text, frame.arg_start, byte, frame.commas);
-    Some(CallSite { head, active })
+    // Grouping parentheses and array/record literals retain the enclosing
+    // call's active argument; an actual inner call takes precedence.
+    stack.iter().rev().find_map(|frame| {
+        if frame.delim != b'(' {
+            return None;
+        }
+        let head = head_before(text, frame.body - 1)?;
+        let active = active_arg(text, frame.arg_start, byte, frame.commas);
+        Some(CallSite { head, active })
+    })
 }
 
 /// Read the call head immediately left of the open paren at `open`.
@@ -130,6 +117,13 @@ fn head_before(text: &str, open: u32) -> Option<Head> {
     let mut i = open as usize;
     while i > 0 && matches!(bytes[i - 1], b' ' | b'\t' | b'\r' | b'\n') {
         i -= 1;
+    }
+    // §05 dotted-call sugar broadcasts the same callable and parameter roster.
+    if i > 0 && bytes[i - 1] == b'.' {
+        i -= 1;
+        while i > 0 && matches!(bytes[i - 1], b' ' | b'\t' | b'\r' | b'\n') {
+            i -= 1;
+        }
     }
     let name_end = i;
     while i > 0 && is_ident_byte(bytes[i - 1]) {
@@ -172,17 +166,13 @@ fn active_arg(text: &str, arg_start: u32, byte: u32, commas: usize) -> Active {
     let bytes = text.as_bytes();
     let mut i = arg_start as usize;
     let end = (byte as usize).min(bytes.len());
-    while i < end && matches!(bytes[i], b' ' | b'\t' | b'\r' | b'\n') {
-        i += 1;
-    }
+    i = skip_trivia(bytes, i, end);
     let name_start = i;
     while i < end && is_ident_byte(bytes[i]) {
         i += 1;
     }
     let name_end = i;
-    while i < end && matches!(bytes[i], b' ' | b'\t' | b'\r' | b'\n') {
-        i += 1;
-    }
+    i = skip_trivia(bytes, i, end);
     let is_kwarg = name_end > name_start
         && bytes.get(i) == Some(&b'=')
         && bytes.get(i + 1) != Some(&b'=')
@@ -615,6 +605,34 @@ mod tests {
     }
 
     #[test]
+    fn signature_help_ignores_plain_comment_punctuation() {
+        let h = help("x = Normal(0, # explanation with comma ,\n |").unwrap();
+        assert_eq!(h.signatures[0].active_parameter, Some(1));
+    }
+
+    #[test]
+    fn signature_help_resumes_after_a_doc_comment_semicolon() {
+        let h = help("% doc; x = Normal(0, |").unwrap();
+        assert_eq!(h.signatures[0].active_parameter, Some(1));
+    }
+
+    #[test]
+    fn signature_help_skips_comments_before_keyword_names() {
+        let h = help("x = Normal(# note\n sigma = |").unwrap();
+        assert_eq!(h.signatures[0].active_parameter, Some(1));
+    }
+
+    #[test]
+    fn signature_help_ignores_block_comment_contents() {
+        for (open, close) in [("###", "###"), ("%%%typ", "%%%")] {
+            assert!(help(&format!("  {open}\nNormal(\n  {close}\nx = 1|")).is_none());
+            assert!(help(&format!("{open}\nNormal(|")).is_none());
+            let h = help(&format!("{open}\nNormal(\n{close}\nx = atan2(|")).unwrap();
+            assert_eq!(h.signatures[0].label, "atan2(y, x)");
+        }
+    }
+
+    #[test]
     fn signature_help_maps_a_keyword_argument_to_its_declared_slot() {
         // §05 `KeywordArg ::= Name "=" Expression`: the active parameter follows
         // the NAME, not the comma count.
@@ -655,6 +673,31 @@ mod tests {
     }
 
     #[test]
+    fn signature_help_covers_broadcast_calls() {
+        for (src, label) in [
+            ("x = Normal.(0, |", "Normal(mu, sigma)"),
+            ("f(a, b) = add(a, b)\nx = f.(0, |", "f(a, b)"),
+        ] {
+            let h = help(src).expect("broadcast callable signature");
+            assert_eq!(h.signatures[0].label, label);
+            assert_eq!(h.active_parameter, Some(1));
+        }
+    }
+
+    #[test]
+    fn signature_help_finds_calls_through_grouping() {
+        for (src, label, active) in [
+            ("x = Normal((|", "Normal(mu, sigma)", 0),
+            ("x = Normal(0, ((|", "Normal(mu, sigma)", 1),
+            ("x = Normal(0, ((atan2(1, |", "atan2(y, x)", 1),
+        ] {
+            let h = help(src).expect("nearest enclosing callable signature");
+            assert_eq!(h.signatures[0].label, label);
+            assert_eq!(h.active_parameter, Some(active));
+        }
+    }
+
+    #[test]
     fn signature_help_covers_a_builtin_function() {
         let h = help("x = atan2(|").expect("signature for atan2");
         assert_eq!(h.signatures[0].label, "atan2(y, x)");
@@ -684,15 +727,17 @@ mod tests {
     #[test]
     fn signature_help_covers_a_standard_module_member() {
         let ron = r#"Catalogue(base: [], modules: [Module(name:"myext",version:"0.1",bindings:[Binding(name:"MyDist", sig: Distribution(domain: Scalar(Real), support: Reals, mass: Normalized, params: ["loc","scale"]))])])"#;
-        let src = "e = standard_module(\"myext\",\"0.1\")\nx = e.MyDist(";
-        let db = Database::default();
-        let f = SourceFile::new(&db, "m.flatppl".to_string(), src.to_string());
-        let fs = FileSet::new(&db, vec![f]);
-        let cats = Catalogues::new(&db, vec![ron.to_string()]);
-        let h = signature_help(&db, f, fs, cats, src.len() as u32)
-            .expect("signature for the external module member");
-        assert_eq!(h.signatures[0].label, "e.MyDist(loc, scale)");
-        assert_eq!(h.active_parameter, Some(0));
+        for call in ["e.MyDist(", "e.MyDist.("] {
+            let src = format!("e = standard_module(\"myext\",\"0.1\")\nx = {call}");
+            let db = Database::default();
+            let f = SourceFile::new(&db, "m.flatppl".to_string(), src.to_string());
+            let fs = FileSet::new(&db, vec![f]);
+            let cats = Catalogues::new(&db, vec![ron.to_string()]);
+            let h = signature_help(&db, f, fs, cats, src.len() as u32)
+                .expect("signature for the external module member");
+            assert_eq!(h.signatures[0].label, "e.MyDist(loc, scale)");
+            assert_eq!(h.active_parameter, Some(0));
+        }
     }
 
     #[test]

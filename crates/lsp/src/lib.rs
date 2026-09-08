@@ -19,3 +19,4 @@ pub mod queries;
 pub mod rename;
 pub mod server;
 pub mod signature;
+mod text;

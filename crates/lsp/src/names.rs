@@ -9,6 +9,8 @@
 //! It also holds the spec §04/§05 rules a new name must satisfy, so the legality
 //! decision has one home and is testable without a database.
 
+use crate::text::{skip_comment, skip_string, skip_trivia};
+
 /// A `Ref` node names either one identifier (`x`) or two (`alias.member`).
 /// Which of the two a rename rewrites.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -52,22 +54,10 @@ fn ident_at(text: &str, at: u32) -> Option<(u32, u32)> {
     Some((start as u32, end as u32))
 }
 
-/// Is the identifier occupying `[start, end)` a whole word — neither neighbour
-/// an identifier byte? Guards against matching `x` inside `xy`.
-fn is_whole_word(text: &str, start: u32, end: u32) -> bool {
-    let bytes = text.as_bytes();
-    let before_ok = start == 0 || !is_ident_byte(bytes[start as usize - 1]);
-    let after_ok = end as usize >= bytes.len() || !is_ident_byte(bytes[end as usize]);
-    before_ok && after_ok
-}
-
-/// The first non-whitespace byte at or after `from`, with its offset.
+/// The first byte after whitespace/comment trivia at `from`, with its offset.
 fn next_significant(text: &str, from: u32) -> Option<(u32, u8)> {
     let bytes = text.as_bytes();
-    let mut i = from as usize;
-    while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\r' | b'\n') {
-        i += 1;
-    }
+    let i = skip_trivia(bytes, from as usize, bytes.len());
     bytes.get(i).map(|&b| (i as u32, b))
 }
 
@@ -111,31 +101,57 @@ pub fn ref_name_range(
 ///   name itself (`x ~ Normal(…)` spans from `x`), so the name sits at
 ///   `rhs_start`.
 /// - Otherwise the name precedes the RHS, separated by `=` (plus a parameter
-///   list for a `FunctionDefinition`). Take the LAST whole-word occurrence of
-///   `name` before `rhs_start` that is followed by `=`, `~` or `(` — the
-///   definition site is always the closest such occurrence to its own RHS, so
-///   an earlier keyword argument, comment, or string of the same spelling
-///   cannot win. The `(` case admits `f(a) = …`; requiring a following
+///   list for a `FunctionDefinition`). Take the last identifier `name` before
+///   `rhs_start` followed by `=`, `~` or `(`, skipping comments and strings.
+///   Grouping can put comments between the declaration and the RHS span, so a
+///   text search alone can mistake a comment for the definition. The `(` case
+///   admits `f(a) = …`; requiring a following
 ///   operator is also what rejects a parameter that shares the function's name
 ///   (`f(f) = …`, where the parameter is followed by `)`).
 pub fn def_name_range(text: &str, rhs_start: u32, name: &str) -> Option<(u32, u32)> {
     if let Some((s, e)) = ident_at(text, rhs_start) {
-        if &text[s as usize..e as usize] == name {
+        if &text[s as usize..e as usize] == name
+            && matches!(next_significant(text, e), Some((_, b'~')))
+        {
             return Some((s, e));
         }
     }
     let window = text.get(..rhs_start as usize)?;
+    // Most bindings have just `name = ` before the RHS on their line. That
+    // exact shape cannot contain a comment/string and needs no prefix scan.
+    let line_start = window.rfind(['\n', '\r']).map_or(0, |i| i + 1);
+    let line = &window[line_start..];
+    let unindented = line.trim_start_matches([' ', '\t']);
+    if unindented
+        .trim_end_matches([' ', '\t'])
+        .strip_suffix('=')
+        .is_some_and(|lhs| lhs.trim_end_matches([' ', '\t']) == name)
+    {
+        let start = (line_start + line.len() - unindented.len()) as u32;
+        return Some((start, start + name.len() as u32));
+    }
+    let bytes = window.as_bytes();
     let mut best = None;
-    let mut from = 0usize;
-    while let Some(rel) = window[from..].find(name) {
-        let start = (from + rel) as u32;
-        let end = start + name.len() as u32;
-        from = start as usize + 1;
-        if !is_whole_word(text, start, end) {
-            continue;
-        }
-        if matches!(next_significant(text, end), Some((_, b'=' | b'~' | b'('))) {
-            best = Some((start, end));
+    let mut at = 0usize;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'#' | b'%' => at = skip_comment(bytes, at, bytes.len()),
+            b'"' => at = skip_string(bytes, at, bytes.len()),
+            b if is_ident_byte(b) => {
+                let start = at;
+                while at < bytes.len() && is_ident_byte(bytes[at]) {
+                    at += 1;
+                }
+                if &text[start..at] == name
+                    && matches!(
+                        next_significant(text, at as u32),
+                        Some((_, b'=' | b'~' | b'('))
+                    )
+                {
+                    best = Some((start as u32, at as u32));
+                }
+            }
+            _ => at += 1,
         }
     }
     best
@@ -335,15 +351,15 @@ pub fn argument_decl_ranges(
     reif_start: u32,
     def_name: Option<(u32, u32)>,
 ) -> Vec<(String, u32, u32)> {
+    // A named function may itself return a lambda, whose list then starts at
+    // the RHS span. Its own header must take precedence over that inner list.
+    if let Some((_, name_end)) = def_name {
+        if let Some(list) = ident_list_at(text, name_end) {
+            return list;
+        }
+    }
     // Lambda: the argument list is at the start of the reification's own span.
-    if let Some(list) = ident_list_at(text, reif_start) {
-        return list;
-    }
-    // Named function: the list follows the binding name.
-    match def_name {
-        Some((_, name_end)) => ident_list_at(text, name_end).unwrap_or_default(),
-        None => Vec::new(),
-    }
+    ident_list_at(text, reif_start).unwrap_or_default()
 }
 
 /// Read a §05 lambda/`FunctionDefinition` argument list starting at `at`:
@@ -400,14 +416,6 @@ mod tests {
         // A digit cannot start a §05 `Name`.
         assert_eq!(ident_at("1abc", 0), None);
         assert_eq!(ident_at("x", 5), None);
-    }
-
-    #[test]
-    fn whole_word_rejects_a_substring_of_a_longer_name() {
-        // `x` inside `xy` is not an occurrence of `x`.
-        assert!(!is_whole_word("xy", 0, 1));
-        assert!(is_whole_word("x y", 0, 1));
-        assert!(is_whole_word("x", 0, 1));
     }
 
     // ── ref_name_range ───────────────────────────────────────────────────────
