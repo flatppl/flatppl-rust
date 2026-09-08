@@ -71,6 +71,7 @@ fn read_module(form: &Sexpr) -> Result<Module> {
 
     let mut module = Module::new();
     let mut pending: Vec<PendingBind> = Vec::new();
+    let mut bound_names = std::collections::HashSet::new();
     // Public names keep their span so an unmatched `(%public …)` entry localizes.
     let mut declared_public: Option<Vec<(String, Span)>> = None;
 
@@ -87,13 +88,25 @@ fn read_module(form: &Sexpr) -> Result<Module> {
             .ok_or_else(|| err(elem, "module element has no head symbol"))?;
         match head {
             "%public" => {
+                if declared_public.is_some() {
+                    return Err(err(
+                        elem,
+                        "module has more than one (%public …) declaration",
+                    ));
+                }
                 let mut names = Vec::new();
                 for n in &inner[1..] {
-                    names.push((atom(n)?.to_string(), n.span));
+                    names.push((flatppl_name(n, "public")?.to_string(), n.span));
                 }
                 declared_public = Some(names);
             }
-            "%bind" => pending.push(parse_bind(&mut module, inner)?),
+            "%bind" => {
+                let binding = parse_bind(&mut module, inner)?;
+                if !bound_names.insert(binding.name.clone()) {
+                    return Err(err(elem, format!("duplicate binding `{}`", binding.name)));
+                }
+                pending.push(binding);
+            }
             other => return Err(err(elem, format!("unexpected module element `{other}`"))),
         }
     }
@@ -148,7 +161,7 @@ fn parse_bind(module: &mut Module, items: &[Sexpr]) -> Result<PendingBind> {
     if items.len() < 3 {
         return Err(err_slice(items, "(%bind …) needs a name and an expression"));
     }
-    let name = atom(&items[1])?.to_string();
+    let name = flatppl_name(&items[1], "binding")?.to_string();
 
     // An optional trailing `(%doc …)` follows the single RHS expression.
     let (expr_items, doc) = match items.last() {
@@ -194,6 +207,8 @@ fn read_atom_expr(module: &mut Module, s: &str, span: Span) -> Result<NodeId> {
                 ));
             } else if let Some(num) = classify_number(s) {
                 Node::Lit(num)
+            } else if looks_like_unsigned_number(s) {
+                return Err(err_at(span, format!("malformed numeric atom `{s}`")));
             } else if s.starts_with('%') {
                 return Err(err_at(
                     span,
@@ -913,6 +928,9 @@ pub(crate) fn classify_number(s: &str) -> Option<Scalar> {
 fn parse_number_magnitude(s: &str) -> Option<Scalar> {
     // Hex integer (`0xF7`).
     if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        if !valid_digit_separators(hex, |c| c.is_ascii_hexdigit()) {
+            return None;
+        }
         let digits: String = hex.chars().filter(|&c| c != '_').collect();
         if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_hexdigit()) {
             return None;
@@ -921,6 +939,18 @@ fn parse_number_magnitude(s: &str) -> Option<Scalar> {
         return Some(Scalar::Int(v));
     }
 
+    if !s.char_indices().filter(|(_, c)| *c == '_').all(|(i, _)| {
+        s[..i]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_ascii_digit())
+            && s[i + 1..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_digit())
+    }) {
+        return None;
+    }
     let cleaned: String = s.chars().filter(|&c| c != '_').collect();
     if s.contains(['.', 'e', 'E']) {
         let v: f64 = cleaned.parse().ok()?;
@@ -928,6 +958,25 @@ fn parse_number_magnitude(s: &str) -> Option<Scalar> {
     } else {
         cleaned.parse::<i64>().ok().map(Scalar::Int)
     }
+}
+
+fn valid_digit_separators(s: &str, is_digit: impl Fn(char) -> bool) -> bool {
+    let chars: Vec<_> = s.chars().collect();
+    !chars.is_empty()
+        && chars.iter().enumerate().all(|(i, &c)| {
+            is_digit(c)
+                || (c == '_'
+                    && i > 0
+                    && i + 1 < chars.len()
+                    && is_digit(chars[i - 1])
+                    && is_digit(chars[i + 1]))
+        })
+}
+
+fn looks_like_unsigned_number(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    bytes.first().is_some_and(u8::is_ascii_digit)
+        || (bytes.first() == Some(&b'.') && bytes.get(1).is_some_and(u8::is_ascii_digit))
 }
 
 /// Detect an atom that lexically is a signed numeric literal (`-1.0`, `+5`,
@@ -957,6 +1006,25 @@ fn signed_numeric_magnitude(s: &str) -> Option<&str> {
 fn atom(form: &Sexpr) -> Result<&str> {
     form.as_atom()
         .ok_or_else(|| err(form, format!("expected a symbol, found {}", describe(form))))
+}
+
+fn flatppl_name<'a>(form: &'a Sexpr, context: &str) -> Result<&'a str> {
+    let name = atom(form)?;
+    let bytes = name.as_bytes();
+    let valid = bytes
+        .first()
+        .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_')
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || *b == b'_');
+    if valid {
+        Ok(name)
+    } else {
+        Err(err(
+            form,
+            format!("invalid FlatPPL {context} name `{name}`"),
+        ))
+    }
 }
 
 fn list(form: &Sexpr) -> Result<&[Sexpr]> {

@@ -14,6 +14,9 @@
 
 use crate::error::{Error, Result};
 
+/// Cap source-driven S-expression allocation before semantic module validation.
+const MAX_SEXPR_FORMS: usize = 262_144;
+
 /// A source location for a parsed form: byte range `[start, end)` into the
 /// source plus the 1-based line of the form's first character. Byte offsets
 /// drive the source-annotated renderer; the line is the fallback used when a
@@ -85,6 +88,8 @@ struct Parser {
     /// nested s-expression aborted with a stack overflow above about 8000
     /// levels instead of refusing.
     depth: flatppl_core::Depth,
+    /// Total forms allocated across the file. Breadth is otherwise unbounded.
+    forms_seen: usize,
 }
 
 impl Parser {
@@ -95,6 +100,7 @@ impl Parser {
             line: 1,
             byte: 0,
             depth: flatppl_core::Depth::default(),
+            forms_seen: 0,
         }
     }
 
@@ -148,6 +154,12 @@ impl Parser {
     /// Guarded entry to a nested form. Charges one level, parses, then gives
     /// the level back, so breadth is free and only nesting counts.
     fn parse_form(&mut self) -> Result<Sexpr> {
+        if self.forms_seen >= MAX_SEXPR_FORMS {
+            return Err(self.err_here(format!(
+                "s-expression count exceeds the limit of {MAX_SEXPR_FORMS}; this is a resource guard, not a language rule"
+            )));
+        }
+        self.forms_seen += 1;
         let deeper = self
             .depth
             .deeper("s-expression")

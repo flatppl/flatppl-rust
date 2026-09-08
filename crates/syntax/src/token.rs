@@ -14,6 +14,9 @@
 
 use crate::error::{Error, Result};
 
+/// Bound the number of heap-allocated tokens produced from one source.
+const MAX_SURFACE_TOKENS: usize = 262_144;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Token {
     pub kind: TokenKind,
@@ -175,6 +178,14 @@ impl Lexer {
         loop {
             self.skip_inline_ws_and_comments()?;
             let Some(c) = self.peek() else { break };
+
+            if self.tokens.len() >= MAX_SURFACE_TOKENS {
+                return Err(self.err_span(
+                    self.byte_pos(),
+                    self.line,
+                    format!("surface token count exceeds resource limit of {MAX_SURFACE_TOKENS}"),
+                ));
+            }
 
             if c == '\n' || c == '\r' {
                 self.lex_newline();
@@ -641,6 +652,10 @@ impl Lexer {
                 self.bump();
             }
             let text: String = self.chars[begin..self.pos].iter().collect();
+            if !valid_separated_digits(&self.chars[begin + 2..self.pos], |c| c.is_ascii_hexdigit())
+            {
+                return Err(self.err_span(start, line, format!("invalid hex integer `{text}`")));
+            }
             let digits: String = text[2..].chars().filter(|&c| c != '_').collect();
             let v = i64::from_str_radix(&digits, 16)
                 .map_err(|_| self.err_span(start, line, format!("invalid hex integer `{text}`")))?;
@@ -652,11 +667,27 @@ impl Lexer {
         while matches!(self.peek(), Some(c) if c.is_ascii_digit() || c == '_') {
             self.bump();
         }
+        let integer_end = self.pos;
+        if integer_end > begin
+            && !valid_separated_digits(&self.chars[begin..integer_end], |c| c.is_ascii_digit())
+        {
+            let text: String = self.chars[begin..integer_end].iter().collect();
+            return Err(self.err_span(start, line, format!("invalid integer literal `{text}`")));
+        }
         if self.peek() == Some('.') {
             is_real = true;
             self.bump();
+            let fraction_begin = self.pos;
             while matches!(self.peek(), Some(c) if c.is_ascii_digit() || c == '_') {
                 self.bump();
+            }
+            if self.pos > fraction_begin
+                && !valid_separated_digits(&self.chars[fraction_begin..self.pos], |c| {
+                    c.is_ascii_digit()
+                })
+            {
+                let text: String = self.chars[begin..self.pos].iter().collect();
+                return Err(self.err_span(start, line, format!("invalid real literal `{text}`")));
             }
         }
         if matches!(self.peek(), Some('e' | 'E')) {
@@ -665,8 +696,15 @@ impl Lexer {
             if matches!(self.peek(), Some('+' | '-')) {
                 self.bump();
             }
+            let exponent_begin = self.pos;
             while matches!(self.peek(), Some(c) if c.is_ascii_digit() || c == '_') {
                 self.bump();
+            }
+            if !valid_separated_digits(&self.chars[exponent_begin..self.pos], |c| {
+                c.is_ascii_digit()
+            }) {
+                let text: String = self.chars[begin..self.pos].iter().collect();
+                return Err(self.err_span(start, line, format!("invalid real literal `{text}`")));
             }
         }
 
@@ -740,6 +778,9 @@ impl Lexer {
             self.bump();
             self.bump();
             let tag = self.read_doc_tag();
+            if tag.is_none() {
+                self.reject_unknown_doc_tag(start, line)?;
+            }
             self.consume_to_newline(); // ignore the rest of the opening line
             let mut lines = Vec::new();
             loop {
@@ -779,6 +820,9 @@ impl Lexer {
         let trailing = self.after_value;
         self.bump(); // %
         let tag = self.read_doc_tag();
+        if tag.is_none() {
+            self.reject_unknown_doc_tag(start, line)?;
+        }
         let cstart = self.pos;
         while !matches!(self.peek(), Some('\n' | '\r' | ';') | None) {
             self.bump();
@@ -818,6 +862,34 @@ impl Lexer {
         }
         None
     }
+
+    fn reject_unknown_doc_tag(&mut self, start: u32, line: u32) -> Result<()> {
+        if !self.peek().is_some_and(|c| c.is_ascii_alphabetic()) {
+            return Ok(());
+        }
+        let tag_start = self.pos;
+        while self.peek().is_some_and(|c| c.is_ascii_alphanumeric()) {
+            self.bump();
+        }
+        let tag: String = self.chars[tag_start..self.pos].iter().collect();
+        Err(self.err_span(
+            start,
+            line,
+            format!("unrecognized documentation markup tag `{tag}`"),
+        ))
+    }
+}
+
+fn valid_separated_digits(run: &[char], is_digit: impl Fn(char) -> bool) -> bool {
+    !run.is_empty()
+        && run.iter().enumerate().all(|(i, &c)| {
+            is_digit(c)
+                || (c == '_'
+                    && i > 0
+                    && i + 1 < run.len()
+                    && is_digit(run[i - 1])
+                    && is_digit(run[i + 1]))
+        })
 }
 
 /// The `ContinuationOp` set of spec §05: every infix binary operator, the
@@ -894,6 +966,20 @@ mod tests {
         );
         assert_eq!(kinds("0xF7"), vec![TokenKind::Int(0xF7)]);
         assert_eq!(kinds("1_000"), vec![TokenKind::Int(1000)]);
+    }
+
+    #[test]
+    fn numeric_separators_must_join_digits() {
+        for malformed in ["1__2", "1_", "0x_FF", "0xFF_", "1._2", "1e_2"] {
+            assert!(
+                tokenize(malformed).is_err(),
+                "malformed numeric literal must be refused: {malformed}"
+            );
+        }
+
+        assert_eq!(kinds("0xF_F"), vec![TokenKind::Int(255)]);
+        assert_eq!(kinds("1.2_5"), vec![TokenKind::Real(1.25)]);
+        assert_eq!(kinds("1e1_0"), vec![TokenKind::Real(1e10)]);
     }
 
     #[test]
@@ -1058,6 +1144,15 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn unknown_documentation_markup_is_rejected() {
+        for source in ["%rst text\nx = 1", "%%%rst\ntext\n%%%\nx = 1"] {
+            let error = tokenize(source).unwrap_err();
+            assert!(error.message.contains("markup tag `rst`"), "got: {error}");
+        }
+        assert_eq!(docs("% rest\nx = 1")[0].lines, ["rest"]);
     }
 
     #[test]

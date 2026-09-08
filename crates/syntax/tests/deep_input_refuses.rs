@@ -47,3 +47,36 @@ fn breadth_is_not_charged_as_depth() {
         "a wide flat array is not deep and must parse"
     );
 }
+
+fn flat_sum(terms: usize) -> String {
+    format!(
+        "x = {}\n",
+        std::iter::repeat_n("1", terms)
+            .collect::<Vec<_>>()
+            .join(" + ")
+    )
+}
+
+#[test]
+fn a_flat_operator_chain_is_guarded_before_recursive_consumers() {
+    assert!(flatppl_syntax::parse(&flat_sum(1_000)).is_ok());
+    let err = flatppl_syntax::parse(&flat_sum(50_000))
+        .expect_err("a left-deep constructed tree must be bounded");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("constructed expression depth") && msg.contains("4096"),
+        "the refusal must name the constructed-tree limit: {msg}"
+    );
+}
+
+#[test]
+fn punctuation_breadth_is_bounded_before_parser_allocation() {
+    let source = format!("x = [{}]\n", ",".repeat(300_000));
+    let err =
+        flatppl_syntax::parse(&source).expect_err("a punctuation stream must hit the token budget");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("surface token count") && msg.contains("262144"),
+        "the refusal must name the token limit: {msg}"
+    );
+}

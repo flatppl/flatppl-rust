@@ -35,6 +35,21 @@ fn arity_error_points_at_the_offending_form() {
 }
 
 #[test]
+fn repeated_public_interface_is_localized() {
+    let src = "(%module\n  (%public x)\n  (%public y)\n  (%bind x 1)\n  (%bind y 2))";
+    let err = read(src).unwrap_err();
+    assert_eq!(span_text(src, err.span), "(%public y)");
+}
+
+#[test]
+fn duplicate_binding_is_localized() {
+    let src = "(%module\n  (%bind x 1)\n  (%bind x 2))";
+    let err = read(src).unwrap_err();
+    assert_eq!(span_text(src, err.span), "(%bind x 2)");
+    assert!(err.message.contains("duplicate binding `x`"));
+}
+
+#[test]
 fn unknown_call_head_is_localized() {
     let src = "(%module\n  (%bind x (%bogus 1)))\n";
     let err = read(src).unwrap_err();
@@ -123,6 +138,39 @@ fn canonical_neg_call_still_reads() {
         text.contains("(neg 1.0)"),
         "round-trip should preserve the canonical neg call: {text}"
     );
+}
+
+#[test]
+fn malformed_numeric_atoms_are_refused() {
+    for atom in ["1__2", "1_", "0x_FF", "0xFF_", "1._2", "1e_2"] {
+        let src = format!("(%module (%bind x {atom}))\n");
+        let err = read(&src).expect_err("malformed numeric atoms must not become constants");
+        assert!(
+            err.message.contains("malformed numeric atom"),
+            "unexpected error for {atom}: {}",
+            err.message
+        );
+    }
+
+    for atom in ["0xF_F", "1.2_5", "1e1_0"] {
+        let src = format!("(%module (%bind x {atom}))\n");
+        read(&src).unwrap_or_else(|err| panic!("valid numeric atom {atom} failed: {err}"));
+    }
+}
+
+#[test]
+fn numeric_module_names_are_refused() {
+    for src in [
+        "(%module (%bind 1 0))\n",
+        "(%module (%public 1) (%bind x 0))\n",
+    ] {
+        let err = read(src).expect_err("module binding and public names must be names");
+        assert!(
+            err.message.contains("invalid FlatPPL") && err.message.contains("name"),
+            "unexpected error: {}",
+            err.message
+        );
+    }
 }
 
 #[test]

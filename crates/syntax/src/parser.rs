@@ -18,7 +18,7 @@
 //! construct calls**. Printer operator/indexing re-sugaring is a deferred
 //! enhancement (the lowered linear form is canonical).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use flatppl_core::{
     Axis, Binding, Call, CallHead, Doc as CoreDoc, Inputs, Markup, Module, NamedArg, NamedKind,
@@ -27,6 +27,9 @@ use flatppl_core::{
 
 use crate::error::{Error, Result};
 use crate::token::{self, Doc, Token, TokenKind};
+
+/// Bound parser-built tree depth that is not visible as recursive source syntax.
+const MAX_CONSTRUCTED_EXPR_DEPTH: usize = 4096;
 
 /// An error anchored to `tok`'s span (widened to one byte for the
 /// zero-width Eof token).
@@ -53,11 +56,14 @@ pub fn parse(input: &str) -> Result<Module> {
     // `standard_module` — member access `m.x` resolves to a cross-module ref).
     let mut names = Names::default();
     for st in &statements {
-        collect_lhs_names(st, &mut names);
+        collect_lhs_names(st, &mut names)?;
+    }
+    for st in &statements {
+        collect_module_name(st, &mut names);
     }
 
     let mut module = Module::new();
-    let mut synth: u32 = 0;
+    let mut synth: u64 = 0;
     for st in &statements {
         lower_statement(&mut module, st, &names, &mut synth)?;
     }
@@ -166,7 +172,7 @@ fn split_statements(tokens: &[Token]) -> Result<Vec<Stmt>> {
 /// `Name (',' Name)*` run, up to the binding operator / `[` / `:`.
 /// `_` is the discard name, not a binding. A `metric: result[…] := …`
 /// statement binds the name *after* the colon (the metric is a reference).
-fn collect_lhs_names(stmt: &Stmt, names: &mut Names) {
+fn collect_lhs_names(stmt: &Stmt, names: &mut Names) -> Result<()> {
     let toks = &stmt.tokens;
 
     // Metricsum statement: `Name ':' Name '[' …` — only the second name binds.
@@ -175,19 +181,17 @@ fn collect_lhs_names(stmt: &Stmt, names: &mut Names) {
     {
         if let Some(TokenKind::Name(result)) = toks.get(2).map(|t| &t.kind) {
             if result != "_" {
-                names.bound.insert(result.clone());
+                insert_bound_name(names, result, &toks[2])?;
             }
         }
-        return;
+        return Ok(());
     }
 
-    let mut count = 0;
     let mut i = 0;
     while let Some(TokenKind::Name(n)) = toks.get(i).map(|t| &t.kind) {
         if n != "_" {
-            names.bound.insert(n.clone());
+            insert_bound_name(names, n, &toks[i])?;
         }
-        count += 1;
         i += 1;
         if matches!(toks.get(i).map(|t| &t.kind), Some(TokenKind::Comma)) {
             i += 1;
@@ -195,13 +199,34 @@ fn collect_lhs_names(stmt: &Stmt, names: &mut Names) {
             break;
         }
     }
+    Ok(())
+}
 
-    // `m = load_module(…)` / `m = standard_module(…)` makes `m` a module binding.
-    if count == 1
-        && matches!(toks.get(1).map(|t| &t.kind), Some(TokenKind::Assign))
-        && matches!(toks.get(2).map(|t| &t.kind),
+fn insert_bound_name(names: &mut Names, name: &str, tok: &Token) -> Result<()> {
+    if !names.bound.insert(name.to_owned()) {
+        return Err(err_at(tok, format!("duplicate binding `{name}`")));
+    }
+    Ok(())
+}
+
+/// Collect an actual builtin loader result after every user binding is known.
+/// User bindings shadow builtins throughout the module, independent of order.
+fn collect_module_name(stmt: &Stmt, names: &mut Names) {
+    let toks = &stmt.tokens;
+    let bare_builtin = matches!(toks.get(2).map(|t| &t.kind),
+        Some(TokenKind::Name(h))
+            if (h == "load_module" || h == "standard_module")
+                && !names.bound.contains(h))
+        && matches!(toks.get(3).map(|t| &t.kind), Some(TokenKind::LParen));
+    let qualified_builtin = matches!(toks.get(2).map(|t| &t.kind),
+        Some(TokenKind::Name(base)) if base == "base")
+        && matches!(toks.get(3).map(|t| &t.kind), Some(TokenKind::Dot))
+        && matches!(toks.get(4).map(|t| &t.kind),
             Some(TokenKind::Name(h)) if h == "load_module" || h == "standard_module")
-        && matches!(toks.get(3).map(|t| &t.kind), Some(TokenKind::LParen))
+        && matches!(toks.get(5).map(|t| &t.kind), Some(TokenKind::LParen));
+    if matches!(toks.first().map(|t| &t.kind), Some(TokenKind::Name(_)))
+        && matches!(toks.get(1).map(|t| &t.kind), Some(TokenKind::Assign))
+        && (bare_builtin || qualified_builtin)
     {
         if let Some(TokenKind::Name(m)) = toks.first().map(|t| &t.kind) {
             names.modules.insert(m.clone());
@@ -209,7 +234,7 @@ fn collect_lhs_names(stmt: &Stmt, names: &mut Names) {
     }
 }
 
-fn lower_statement(module: &mut Module, stmt: &Stmt, names: &Names, synth: &mut u32) -> Result<()> {
+fn lower_statement(module: &mut Module, stmt: &Stmt, names: &Names, synth: &mut u64) -> Result<()> {
     let toks = &stmt.tokens;
 
     // LHS: leading `Name (',' Name)*`, then the binding operator. The token
@@ -240,7 +265,7 @@ fn lower_statement(module: &mut Module, stmt: &Stmt, names: &Names, synth: &mut 
             let mut ep = ExprParser::new(&toks[i..], module, names);
             let rhs = ep.parse_aggregate()?;
             ep.expect_end()?;
-            bind_name(module, &lhs[0], rhs, stmt.doc.as_ref(), synth);
+            bind_name(module, names, &lhs[0], rhs, stmt.doc.as_ref(), synth);
             Ok(())
         }
         // `metric: result[.axes…] := expr` — metric-aware Einstein summation
@@ -255,7 +280,7 @@ fn lower_statement(module: &mut Module, stmt: &Stmt, names: &Names, synth: &mut 
             check_binding_name(&result, ep.prev_token().unwrap_or(&toks[0]))?;
             let rhs = ep.parse_metricsum(&lhs[0])?;
             ep.expect_end()?;
-            bind_name(module, &result, rhs, stmt.doc.as_ref(), synth);
+            bind_name(module, names, &result, rhs, stmt.doc.as_ref(), synth);
             Ok(())
         }
         // `f(arg1, arg2, …) = expr` — function-definition sugar (spec §05
@@ -321,7 +346,7 @@ fn lower_statement(module: &mut Module, stmt: &Stmt, names: &Names, synth: &mut 
             }
             let rhs = ep.lower_lambda(params, 0)?;
             ep.expect_end()?;
-            bind_name(module, &lhs[0], rhs, stmt.doc.as_ref(), synth);
+            bind_name(module, names, &lhs[0], rhs, stmt.doc.as_ref(), synth);
             Ok(())
         }
         Some(op @ (TokenKind::Assign | TokenKind::Tilde)) => {
@@ -336,11 +361,11 @@ fn lower_statement(module: &mut Module, stmt: &Stmt, names: &Names, synth: &mut 
                 rhs = wrap_draw(module, rhs, stmt_span(toks));
             }
             if lhs.len() == 1 {
-                bind_name(module, &lhs[0], rhs, stmt.doc.as_ref(), synth);
+                bind_name(module, names, &lhs[0], rhs, stmt.doc.as_ref(), synth);
             } else if lhs.is_empty() {
                 return Err(err_at(&toks[0], "binding has no name"));
             } else {
-                lower_decomposition(module, &lhs, rhs, synth, stmt_span(toks));
+                lower_decomposition(module, names, &lhs, rhs, synth, stmt_span(toks));
             }
             Ok(())
         }
@@ -375,10 +400,16 @@ fn check_binding_name(name: &str, tok: &Token) -> Result<()> {
 
 /// Bind `rhs` to `name`; `_` discards by binding to a fresh auto-generated
 /// private name instead (spec §04 binding names).
-fn bind_name(module: &mut Module, name: &str, rhs: NodeId, doc: Option<&Doc>, synth: &mut u32) {
+fn bind_name(
+    module: &mut Module,
+    names: &Names,
+    name: &str,
+    rhs: NodeId,
+    doc: Option<&Doc>,
+    synth: &mut u64,
+) {
     if name == "_" {
-        *synth += 1;
-        let tmp = format!("__0x{:x}", *synth);
+        let tmp = next_synthetic_name(names, synth);
         let tmp_sym = module.intern(&tmp);
         module.add_binding(Binding {
             name: tmp_sym,
@@ -389,6 +420,16 @@ fn bind_name(module: &mut Module, name: &str, rhs: NodeId, doc: Option<&Doc>, sy
         });
     } else {
         add_simple_binding(module, name, rhs, doc);
+    }
+}
+
+fn next_synthetic_name(names: &Names, synth: &mut u64) -> String {
+    loop {
+        *synth += 1;
+        let candidate = format!("__0x{:x}", *synth);
+        if !names.bound.contains(&candidate) {
+            return candidate;
+        }
     }
 }
 
@@ -426,13 +467,13 @@ fn add_simple_binding(module: &mut Module, name: &str, rhs: NodeId, doc: Option<
 /// is stochastic (re-evaluating it would redraw).
 fn lower_decomposition(
     module: &mut Module,
+    all_names: &Names,
     names: &[String],
     source: NodeId,
-    synth: &mut u32,
+    synth: &mut u64,
     span: Span,
 ) {
-    *synth += 1;
-    let tmp_name = format!("__0x{:x}", *synth);
+    let tmp_name = next_synthetic_name(all_names, synth);
     let tmp_sym = module.intern(&tmp_name);
     module.add_binding(Binding {
         name: tmp_sym,
@@ -639,9 +680,36 @@ impl<'a> ExprParser<'a> {
             .map_err(|e| self.err_here(e.to_string()))?;
         let saved = self.depth;
         self.depth = deeper;
-        let result = self.parse_expr_body();
+        let result = self
+            .parse_expr_body()
+            .and_then(|id| self.guard_constructed_depth(id).map(|()| id));
         self.depth = saved;
         result
+    }
+
+    /// Reject a left-deep tree before recursive inference and printers see it.
+    fn guard_constructed_depth(&self, root: NodeId) -> Result<()> {
+        let mut deepest = HashMap::new();
+        let mut pending = vec![(root, 1usize)];
+        while let Some((id, depth)) = pending.pop() {
+            if depth > MAX_CONSTRUCTED_EXPR_DEPTH {
+                return Err(self.err_prev(format!(
+                    "constructed expression depth exceeds the limit of {MAX_CONSTRUCTED_EXPR_DEPTH}; this is a resource guard, not a language rule"
+                )));
+            }
+            if deepest.get(&id).is_some_and(|&seen| seen >= depth) {
+                continue;
+            }
+            deepest.insert(id, depth);
+            pending.extend(
+                self.module
+                    .node(id)
+                    .children()
+                    .into_iter()
+                    .map(|child| (child, depth + 1)),
+            );
+        }
+        Ok(())
     }
 
     fn parse_expr_body(&mut self) -> Result<NodeId> {

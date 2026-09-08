@@ -177,6 +177,42 @@ fn type_grammar_roundtrip_and_headless_shape() {
 // ---- from_json error paths (malformed input must error, not panic) ----
 
 #[test]
+fn unit_tags_preserve_only_canonical_payloads() {
+    for tag in ["hole", "%dynamic"] {
+        for payload in [json!(true), json!(false)] {
+            let marker = json!({ tag: payload });
+            let expr = if tag == "hole" {
+                marker
+            } else {
+                json!({ "%meta": {
+                    "type": ["%array", {"int": 1}, [marker], ["%scalar", {"const": "real"}]],
+                    "phase": "%fixed",
+                    "valueset": {"const": "reals"},
+                    "expr": ["elementof", {"const": "reals"}]
+                }})
+            };
+            let encoded = json!({ "%module": { "public": ["x"], "binds": [
+                { "name": "x", "expr": expr }
+            ]}});
+            let decoded = from_json(&encoded);
+            if payload == json!(true) {
+                assert_eq!(to_json(&decoded.unwrap()), encoded);
+            } else {
+                assert!(decoded.is_err(), "{expr} must not silently change to true");
+            }
+        }
+    }
+}
+
+#[test]
+fn unknown_node_fields_do_not_disappear() {
+    let encoded = json!({ "%module": { "public": [], "binds": [
+        { "name": "x", "expr": { "int": 7, "typo": 8 } }
+    ]}});
+    assert!(from_json(&encoded).is_err());
+}
+
+#[test]
 fn rejects_missing_module() {
     assert!(from_json(&json!({})).is_err());
     assert!(from_json(&json!({ "public": [], "binds": [] })).is_err());

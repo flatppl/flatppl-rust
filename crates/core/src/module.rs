@@ -4,7 +4,7 @@
 use crate::id::{Arena, BindingId, Idx, Interner, NodeId, SecondaryMap, Symbol};
 use crate::node::{CallHead, Node, Ref};
 use crate::ty::{Mass, Phase, Type, ValueSet};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// The trailing ` · <mass>` annotation for a measure/kernel type in
 /// [`Module::display_type`]. An unknown or not-yet-inferred mass adds no
@@ -429,36 +429,49 @@ impl Module {
     ///
     /// Equal REFERENCES, not equal values: `(%ref self psi)` twice is the same
     /// expression, but two distinct bindings with equal right-hand sides are not.
+    /// Shared child pairs are compared once, without recursive stack growth.
     pub fn structural_eq(&self, a: NodeId, b: NodeId) -> bool {
         if a == b {
             return true;
         }
-        match (self.node(a), self.node(b)) {
-            (Node::Lit(x), Node::Lit(y)) => x == y,
-            (Node::Const(x), Node::Const(y)) => x == y,
-            (Node::Hole, Node::Hole) => true,
-            (Node::Ref(x), Node::Ref(y)) => x == y,
-            (Node::Axis(x), Node::Axis(y)) => x == y,
-            (Node::Call(x), Node::Call(y)) => {
-                let heads = match (x.head, y.head) {
-                    (CallHead::Builtin(p), CallHead::Builtin(q)) => p == q,
-                    (CallHead::User(p), CallHead::User(q)) => self.structural_eq(p, q),
-                    _ => false,
-                };
-                heads
-                    && x.inputs == y.inputs
-                    && x.args.len() == y.args.len()
-                    && x.args
-                        .iter()
-                        .zip(y.args.iter())
-                        .all(|(&p, &q)| self.structural_eq(p, q))
-                    && x.named.len() == y.named.len()
-                    && x.named.iter().zip(y.named.iter()).all(|(p, q)| {
-                        p.kind == q.kind && p.name == q.name && self.structural_eq(p.value, q.value)
-                    })
-            }
-            _ => false,
+        if !matches!(self.node(a), Node::Call(_)) {
+            return self.node(a) == self.node(b);
         }
+        let mut pending = vec![(a, b)];
+        let mut seen = HashSet::new();
+        while let Some((a, b)) = pending.pop() {
+            if a == b {
+                continue;
+            }
+            match (self.node(a), self.node(b)) {
+                (Node::Call(x), Node::Call(y)) => {
+                    if !seen.insert((a, b)) {
+                        continue;
+                    }
+                    if x.inputs != y.inputs
+                        || x.args.len() != y.args.len()
+                        || x.named.len() != y.named.len()
+                    {
+                        return false;
+                    }
+                    match (x.head, y.head) {
+                        (CallHead::Builtin(p), CallHead::Builtin(q)) if p == q => {}
+                        (CallHead::User(p), CallHead::User(q)) => pending.push((p, q)),
+                        _ => return false,
+                    }
+                    pending.extend(x.args.iter().copied().zip(y.args.iter().copied()));
+                    for (p, q) in x.named.iter().zip(y.named.iter()) {
+                        if p.kind != q.kind || p.name != q.name {
+                            return false;
+                        }
+                        pending.push((p.value, q.value));
+                    }
+                }
+                (x, y) if x == y => {}
+                _ => return false,
+            }
+        }
+        true
     }
 
     // ---- annotate (side-tables) ----
@@ -732,6 +745,80 @@ mod tests {
             m.display_valueset(&cpow),
             "cartpow(record(a: reals, b: unitinterval), 3)"
         );
+    }
+
+    #[test]
+    fn structural_equality_preserves_sharing_and_distinct_child_pairs() {
+        let mut m = Module::new();
+        let add = m.intern("add");
+        let one = m.alloc(Node::Lit(Scalar::Int(1)));
+        let same_one = m.alloc(Node::Lit(Scalar::Int(1)));
+        let two = m.alloc(Node::Lit(Scalar::Int(2)));
+        let call = |args: Vec<NodeId>| {
+            Node::Call(Call {
+                head: CallHead::Builtin(add),
+                args: args.into(),
+                named: Box::new([]),
+                inputs: None,
+            })
+        };
+        let mut roots = [one, same_one, two];
+        for _ in 0..12 {
+            for root in &mut roots {
+                *root = m.alloc(call(vec![*root, *root]));
+            }
+        }
+        assert!(m.structural_eq(roots[0], roots[1]));
+        assert!(!m.structural_eq(roots[0], roots[2]));
+        let shared = m.alloc(call(vec![one, one]));
+        for args in [vec![same_one, two], vec![two, same_one]] {
+            let different = m.alloc(call(args));
+            assert!(!m.structural_eq(shared, different));
+            assert!(!m.structural_eq(different, shared));
+        }
+    }
+
+    #[test]
+    fn structural_equality_compares_callees_named_values_and_boundaries() {
+        use crate::node::{Inputs, NamedArg, NamedKind};
+        let mut m = Module::new();
+        let name = m.intern("argument");
+        let one = m.alloc(Node::Lit(Scalar::Int(1)));
+        let same_one = m.alloc(Node::Lit(Scalar::Int(1)));
+        let two = m.alloc(Node::Lit(Scalar::Int(2)));
+        let base = Call {
+            head: CallHead::User(one),
+            args: Box::new([]),
+            named: Box::new([NamedArg {
+                kind: NamedKind::Kwarg,
+                name,
+                value: one,
+            }]),
+            inputs: None,
+        };
+        let left = m.alloc(Node::Call(base.clone()));
+        let mut equal = base.clone();
+        equal.head = CallHead::User(same_one);
+        equal.named[0].value = same_one;
+        let right = m.alloc(Node::Call(equal));
+        assert!(m.structural_eq(left, right));
+        let mut different_callee = base.clone();
+        different_callee.head = CallHead::User(two);
+        let mut different_value = base.clone();
+        different_value.named[0].value = two;
+        let mut different_kind = base.clone();
+        different_kind.named[0].kind = NamedKind::Field;
+        let mut different_boundary = base;
+        different_boundary.inputs = Some(Inputs::Auto);
+        for call in [
+            different_callee,
+            different_value,
+            different_kind,
+            different_boundary,
+        ] {
+            let right = m.alloc(Node::Call(call));
+            assert!(!m.structural_eq(left, right));
+        }
     }
 
     #[test]

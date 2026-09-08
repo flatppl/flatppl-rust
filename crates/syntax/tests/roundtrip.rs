@@ -322,6 +322,35 @@ fn user_vs_builtin_calls() {
     assert!(matches!(rhs_head("a"), CallHead::Builtin(_)));
 }
 
+/// A module-level binding shadows a builtin throughout the module. Calling a
+/// user function named `load_module` must therefore produce an ordinary value,
+/// whose dotted access is record-field access rather than module-member access.
+#[test]
+fn shadowed_module_loader_is_not_a_module_binding() {
+    let src = "load_module(x) = record(y = x)\n\
+               m = load_module(1)\n\
+               z = m.y";
+    let printed = print(&parse(src).unwrap());
+    assert!(printed.contains("z = m.y"), "got:\n{printed}");
+
+    let pir = flatppl_flatpir::write(&parse(src).unwrap());
+    assert!(pir.contains("(get (%ref self m) \"y\")"), "got:\n{pir}");
+    assert!(!pir.contains("(%ref m y)"), "got:\n{pir}");
+}
+
+/// `base.foo` always selects the builtin. A qualified builtin loader therefore
+/// creates the same module namespace as its unqualified form.
+#[test]
+fn qualified_builtin_loaders_create_module_bindings() {
+    let src = "m = base.load_module(\"x.flatppl\")\n\
+               s = base.standard_module(\"particle-physics\", \"0.1\")\n\
+               x = m.value\n\
+               y = s.Argus";
+    let pir = flatppl_flatpir::write(&parse(src).unwrap());
+    assert!(pir.contains("(%ref m value)"), "got:\n{pir}");
+    assert!(pir.contains("(%ref s Argus)"), "got:\n{pir}");
+}
+
 /// `~` round-trips through `draw`: the printed form re-sugars to `~`.
 #[test]
 fn tilde_resugars() {
@@ -601,6 +630,18 @@ fn binding_name_rules() {
     }
     let printed = print(&parse("_ = exp(1.0)").unwrap());
     assert_eq!(printed, "__0x1 = exp(1.0)");
+
+    for src in ["x = 1\nx = 2", "a, a = [1, 2]"] {
+        let err = parse(src).expect_err("duplicate module binding must be rejected");
+        assert!(
+            err.to_string().contains("duplicate binding `"),
+            "got: {err}"
+        );
+    }
+
+    let printed = print(&parse("__0x1 = 1\n_ = 2").unwrap());
+    assert!(printed.contains("__0x1 = 1"), "got:\n{printed}");
+    assert!(printed.contains("__0x2 = 2"), "got:\n{printed}");
 }
 
 /// `:` lowers to the `all` selector, a trailing `!` to `only`, and a `!` not

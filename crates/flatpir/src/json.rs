@@ -354,16 +354,11 @@ fn emit(value: &Value, depth: usize) -> Result<String> {
 }
 
 fn emit_obj(o: &Map<String, Value>, depth: usize) -> Result<String> {
-    // A node object carries exactly one recognized discriminator key. More than
-    // one (e.g. `{"int":3,"real":4}` or `{"int":1,"%ref":…}`) is ambiguous: the
-    // ladder below would pick the first and silently drop the rest.
-    let node_keys = [
-        "int", "real", "bool", "str", "const", "hole", "%dynamic", "%ref", "%axis", "%uaxis",
-        "%laxis", "%kwarg", "%field", "%assign", "%meta", "%inputs",
-    ];
-    if node_keys.iter().filter(|k| o.contains_key(**k)).count() > 1 {
+    // A node object is a single tagged expression; extra keys would otherwise
+    // be silently dropped, whether they are known tags or misspellings.
+    if o.len() > 1 {
         return Err(Error::new(
-            "ambiguous node object: multiple recognized keys",
+            "ambiguous node object: expected exactly one discriminator key",
         ));
     }
     if let Some(v) = o.get("int") {
@@ -403,11 +398,13 @@ fn emit_obj(o: &Map<String, Value>, depth: usize) -> Result<String> {
         }
         return Ok(s.to_string());
     }
-    if o.get("hole").is_some() {
-        return Ok("_".to_string());
-    }
-    if o.get("%dynamic").is_some() {
-        return Ok("%dynamic".to_string());
+    for (tag, atom) in [("hole", "_"), ("%dynamic", "%dynamic")] {
+        if let Some(value) = o.get(tag) {
+            if value != &Value::Bool(true) {
+                return Err(Error::new(format!("`{tag}` must be true")));
+            }
+            return Ok(atom.to_string());
+        }
     }
     if let Some(v) = o.get("%ref") {
         let r = obj(v, "a %ref")?;

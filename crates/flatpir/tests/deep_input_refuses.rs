@@ -35,6 +35,17 @@ fn a_sexpr_within_the_limit_still_reads() {
 }
 
 #[test]
+fn shallow_breadth_is_bounded_before_module_validation() {
+    let src = format!("(%module {})", "()".repeat(300_000));
+    let err = flatppl_flatpir::read(&src).expect_err("form breadth must be bounded");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("s-expression count exceeds") && msg.contains("262144"),
+        "the refusal must name the breadth limit: {msg}"
+    );
+}
+
+#[test]
 fn deep_json_refuses_cleanly_at_some_layer() {
     // Built iteratively; a recursive builder would hit the test's own stack.
     let mut expr = String::from("1.0");
