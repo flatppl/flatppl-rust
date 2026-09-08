@@ -718,6 +718,8 @@ fn as_finite_edge(v: &serde_json::Value, index: usize) -> Result<f64> {
 /// Multi-axis (>1 element) is not yet implemented and returns
 /// `Err(Error::Unimplemented)`.
 fn build_bins(b: &mut Builder, axes: &[serde_json::Value]) -> Result<NodeId> {
+    const MAX_GENERATED_BINS: u64 = 4_096;
+
     if axes.len() != 1 {
         return Err(Error::Unimplemented(
             "multi-axis bincounts not yet supported".into(),
@@ -746,6 +748,11 @@ fn build_bins(b: &mut Builder, axes: &[serde_json::Value]) -> Result<NodeId> {
         // (hi - lo) / 0 is NaN, so every edge came out NaN.
         return Err(Error::Unsupported("axis `nbins` is 0".into()));
     }
+    if nbins > MAX_GENERATED_BINS {
+        return Err(Error::Unsupported(format!(
+            "axis `nbins` {nbins} exceeds the generated-bin limit {MAX_GENERATED_BINS}"
+        )));
+    }
     let lo = axis
         .get("min")
         .and_then(|v| v.as_f64())
@@ -754,9 +761,27 @@ fn build_bins(b: &mut Builder, axes: &[serde_json::Value]) -> Result<NodeId> {
         .get("max")
         .and_then(|v| v.as_f64())
         .ok_or_else(|| Error::Unsupported("axis missing `max`".into()))?;
-    let step = (hi - lo) / nbins as f64;
+    if !lo.is_finite() || !hi.is_finite() || lo >= hi {
+        return Err(Error::Unsupported(format!(
+            "axis bounds must be finite and increasing, got min={lo}, max={hi}"
+        )));
+    }
     let edges: Vec<NodeId> = (0..=nbins)
-        .map(|i| b.lit_real(lo + step * i as f64))
+        .map(|i| {
+            let value = if i == 0 {
+                lo
+            } else if i == nbins {
+                hi
+            } else {
+                let t = i as f64 / nbins as f64;
+                if lo.is_sign_negative() == hi.is_sign_negative() {
+                    lo + (hi - lo) * t
+                } else {
+                    lo * (1.0 - t) + hi * t
+                }
+            };
+            b.lit_real(value)
+        })
         .collect();
     Ok(b.array(&edges))
 }
@@ -1158,6 +1183,48 @@ mod tests {
         }
         let text = print_with(&m, Syntax::Minimal);
         assert!(text.contains("Normal"), "got: {text}");
+    }
+
+    #[test]
+    fn generated_bin_edges_stay_finite_across_extreme_bounds() {
+        let mut m = flatppl_core::Module::new();
+        let node = {
+            let mut b = Builder::new(&mut m);
+            build_bins(
+                &mut b,
+                &[serde_json::json!({
+                    "nbins": 2,
+                    "min": -1.0e308,
+                    "max": 1.0e308
+                })],
+            )
+            .unwrap()
+        };
+        {
+            let mut b = Builder::new(&mut m);
+            b.bind("bins", node);
+        }
+        let text = print_with(&m, Syntax::Minimal);
+        assert!(
+            !text.contains("NaN") && !text.contains("inf"),
+            "got: {text}"
+        );
+        assert!(text.contains(", 0.0,"), "midpoint mismatch: {text}");
+
+        let mut b = Builder::new(&mut m);
+        let err = build_bins(
+            &mut b,
+            &[serde_json::json!({
+                "nbins": u64::MAX,
+                "min": 0.0,
+                "max": 1.0
+            })],
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("generated-bin limit"),
+            "got: {err}"
+        );
     }
 
     #[test]

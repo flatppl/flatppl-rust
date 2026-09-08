@@ -217,7 +217,7 @@ fn cross_channel_per_bin(
     Ok(())
 }
 
-/// Read the measurement configs' `parameters` blocks into per-parameter
+/// Read the first measurement's `parameters` block into per-parameter
 /// auxiliary-measurement overrides.
 ///
 /// An entry naming a parameter no modifier declares is ignored, as pyhf ignores
@@ -232,8 +232,17 @@ fn collect_param_overrides(
 ) -> Result<BTreeMap<String, AuxOverride>> {
     let mut out: BTreeMap<String, AuxOverride> = BTreeMap::new();
     let toplvl = doc.toplvl.iter().flat_map(|t| t.measurements.iter());
-    for meas in doc.measurements.iter().chain(toplvl) {
+    // pyhf selects measurement index 0 by default. Later measurements must
+    // neither replace that measurement's defaults nor validate its overrides.
+    for meas in doc.measurements.iter().chain(toplvl).take(1) {
+        let mut configured = HashSet::new();
         for p in &meas.config.parameters {
+            if !configured.insert(p.name.as_str()) {
+                return Err(Error::Unsupported(format!(
+                    "measurement `{}` configures parameter `{}` more than once",
+                    meas.name, p.name
+                )));
+            }
             let Some(first) = seen.get(&p.name) else {
                 continue;
             };
@@ -274,12 +283,6 @@ fn collect_param_overrides(
                     )));
                 }
             }
-            // FIRST measurement wins, matching pyhf's own default: with no
-            // `measurement_name` given, `Workspace.get_measurement` takes index
-            // 0 and logs "multiple measurements defined. Taking the first
-            // measurement." A module has one `likelihood`, so it can carry one
-            // measurement's configuration; taking the LAST would silently
-            // disagree with that default whenever two measurements differ.
             let e = out.entry(p.name.clone()).or_default();
             if e.auxdata.is_empty() {
                 e.auxdata = p.auxdata.clone();
@@ -388,27 +391,17 @@ pub struct LumiConfig {
     pub nom: f64,
 }
 
-/// Find the lumi parameter config entry across both new- and old-format measurements.
+/// Find the lumi parameter config in the selected first measurement.
 fn find_lumi_param(doc: &PyhfDocument) -> Option<&PyhfParam> {
-    // New format: top-level measurements
-    for m in &doc.measurements {
-        for p in &m.config.parameters {
-            if p.name == "lumi" {
-                return Some(p);
-            }
-        }
-    }
-    // Old format: toplvl.measurements
-    if let Some(toplvl) = &doc.toplvl {
-        for m in &toplvl.measurements {
-            for p in &m.config.parameters {
-                if p.name == "lumi" {
-                    return Some(p);
-                }
-            }
-        }
-    }
-    None
+    let toplvl = doc.toplvl.iter().flat_map(|t| t.measurements.iter());
+    doc.measurements
+        .iter()
+        .chain(toplvl)
+        .next()?
+        .config
+        .parameters
+        .iter()
+        .find(|p| p.name == "lumi")
 }
 
 fn emit_channel(
@@ -495,8 +488,8 @@ pub struct Terms {
     /// Channel-summed nominal and squared error per staterror parameter, over
     /// the full spanning vector. Each channel writes its own slice.
     staterror_acc: BTreeMap<String, (Vec<f64>, Vec<f64>)>,
-    /// Per-staterror-parameter constraint type (`None` means the dialect default).
-    staterror_constraint: BTreeMap<String, Option<String>>,
+    /// Resolved constraint family per staterror parameter (`true` means Gaussian).
+    staterror_gaussian: BTreeMap<String, bool>,
 }
 
 /// One staterror parameter's layout across the channels that carry it.
@@ -684,6 +677,16 @@ pub fn assemble_channel(
                 nominal.len()
             )));
         }
+        if let Some((bin, value)) = nominal
+            .iter()
+            .enumerate()
+            .find(|(_, value)| !value.is_finite() || **value < 0.0)
+        {
+            return Err(Error::Unsupported(format!(
+                "channel `{channel_name}`: sample `{name}` nominal yield at bin {bin} \
+                 must be finite and nonnegative, got {value}"
+            )));
+        }
     }
     if n_observed != n_bins {
         return Err(Error::Unsupported(format!(
@@ -742,10 +745,21 @@ pub fn assemble_channel(
                     errors.push(e);
                 }
 
-                terms
-                    .staterror_constraint
+                let gaussian = match modifier.constraint.as_deref() {
+                    Some("Gauss") | Some("Gaussian") => true,
+                    Some(_) => false,
+                    None => terms.staterror_gaussian_default,
+                };
+                let first = terms
+                    .staterror_gaussian
                     .entry(param_name.to_string())
-                    .or_insert_with(|| modifier.constraint.clone());
+                    .or_insert(gaussian);
+                if *first != gaussian {
+                    return Err(Error::Unsupported(format!(
+                        "shared staterror `{param_name}` has incompatible Gaussian and Poisson \
+                         auxiliary constraints (channel `{channel_name}`, sample `{name}`)"
+                    )));
+                }
                 let (total, offset) = staterror_slice(terms, param_name, channel_name);
                 let entry = terms
                     .staterror_acc
@@ -935,24 +949,31 @@ pub fn assemble_channel(
         let (sum_nom, sum_sq) = terms.staterror_acc[param_name].clone();
         let (sum_nom, sum_sq) = (&sum_nom[..], &sum_sq[..]);
         if terms.emitted_params.insert(param_name.clone()) {
-            // `constraint: "Gauss"`/`"Gaussian"` selects Normal, `"Poisson"`
-            // selects Poisson; with no field the dialect decides (see
-            // `Terms::staterror_gaussian_default`).
-            let gaussian = match terms
-                .staterror_constraint
+            let gaussian = terms
+                .staterror_gaussian
                 .get(param_name)
-                .and_then(|c| c.as_deref())
-            {
-                Some("Gauss") | Some("Gaussian") => true,
-                Some(_) => false,
-                None => terms.staterror_gaussian_default,
-            };
+                .copied()
+                .unwrap_or(terms.staterror_gaussian_default);
             let ov = terms.aux_override(param_name);
             let term = emit_staterror_constraint(b, param_name, sum_nom, sum_sq, gaussian, &ov);
             terms.constraints.push(term);
         }
     }
 
+    Ok(())
+}
+
+pub(crate) fn validate_observed_counts(channel_name: &str, values: &[f64]) -> Result<()> {
+    if let Some((bin, value)) = values
+        .iter()
+        .enumerate()
+        .find(|(_, value)| !value.is_finite() || **value < 0.0 || value.fract() != 0.0)
+    {
+        return Err(Error::Unsupported(format!(
+            "channel `{channel_name}`: observed event count at bin {bin} must be a \
+             nonnegative integer, got {value}"
+        )));
+    }
     Ok(())
 }
 
@@ -1024,11 +1045,13 @@ fn param_domain_set(b: &mut Builder, domain: ParamDomain, n_bins: usize) -> Node
 /// Old format: `doc.data` map keyed by channel name.
 fn find_obs(b: &mut Builder, doc: &PyhfDocument, channel_name: &str) -> Result<(NodeId, usize)> {
     if let Some(obs) = doc.observations.iter().find(|o| o.name == channel_name) {
+        validate_observed_counts(channel_name, &obs.data)?;
         let elems: Vec<NodeId> = obs.data.iter().map(|x| b.lit_real(*x)).collect();
         return Ok((b.array(&elems), obs.data.len()));
     }
     if let Some(map) = &doc.data {
         if let Some(data) = map.get(channel_name) {
+            validate_observed_counts(channel_name, data)?;
             let elems: Vec<NodeId> = data.iter().map(|x| b.lit_real(*x)).collect();
             return Ok((b.array(&elems), data.len()));
         }

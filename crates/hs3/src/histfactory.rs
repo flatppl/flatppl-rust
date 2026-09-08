@@ -341,16 +341,18 @@ pub const INTERP_HISTOSYS_DEFAULT: &str = "interp_poly6_lin";
 
 /// Map `modifier.interpolation` field (or None) to the hepphys interp function name.
 ///
-/// `default` is the interp function used when the field is absent or unrecognised —
+/// `default` is the interp function used when the field is absent —
 /// `INTERP_NORMSYS_DEFAULT` for normsys, `INTERP_HISTOSYS_DEFAULT` for histosys.
-pub fn interp_fn(code: Option<&str>, default: &'static str) -> &'static str {
+pub fn interp_fn(code: Option<&str>, default: &'static str) -> Result<&'static str> {
     match code {
-        Some(INTERP_CODE_LIN) => INTERP_PWLIN,
-        Some(INTERP_CODE_LOG) => INTERP_PWEXP,
-        Some(INTERP_CODE_PARABOLIC) => INTERP_POLY2_LIN,
-        Some(INTERP_CODE_POLY6) => INTERP_POLY6_LIN,
-        // Absent or unrecognised: fall back to the caller's default.
-        _ => default,
+        Some(INTERP_CODE_LIN) => Ok(INTERP_PWLIN),
+        Some(INTERP_CODE_LOG) => Ok(INTERP_PWEXP),
+        Some(INTERP_CODE_PARABOLIC) => Ok(INTERP_POLY2_LIN),
+        Some(INTERP_CODE_POLY6) => Ok(INTERP_POLY6_LIN),
+        None => Ok(default),
+        Some(other) => Err(Error::Unsupported(format!(
+            "unknown interpolation code `{other}`"
+        ))),
     }
 }
 
@@ -627,7 +629,7 @@ pub fn modifier_effect(
             let one = b.lit_real(1.0);
             let hi = b.lit_real(hi_val);
             let alpha = b.self_ref(&param);
-            let fn_name = interp_fn(m.interpolation.as_deref(), INTERP_NORMSYS_DEFAULT);
+            let fn_name = interp_fn(m.interpolation.as_deref(), INTERP_NORMSYS_DEFAULT)?;
             let factor = b.module_user_call("hepphys", fn_name, &[lo, one, hi, alpha]);
             Ok((
                 Effect::Multiply(factor),
@@ -639,7 +641,7 @@ pub fn modifier_effect(
             // data = {hi: {contents:[...]}, lo: {contents:[...]}}
             let (lo_arr, hi_arr) = parse_histosys_data(b, m, nom_len)?;
             let alpha = b.self_ref(&param);
-            let fn_name = interp_fn(m.interpolation.as_deref(), INTERP_HISTOSYS_DEFAULT);
+            let fn_name = interp_fn(m.interpolation.as_deref(), INTERP_HISTOSYS_DEFAULT)?;
             let new_nom = b.module_user_call("hepphys", fn_name, &[lo_arr, nom, hi_arr, alpha]);
             Ok((
                 Effect::ReplaceNominal(new_nom),
@@ -747,6 +749,20 @@ mod tests {
     use super::*;
     use crate::builder::Builder;
     use flatppl_syntax::{Syntax, print_with};
+
+    #[test]
+    fn interpolation_codes_are_closed() {
+        assert_eq!(
+            interp_fn(None, INTERP_NORMSYS_DEFAULT).unwrap(),
+            INTERP_NORMSYS_DEFAULT
+        );
+        assert_eq!(
+            interp_fn(Some("parabolic"), INTERP_NORMSYS_DEFAULT).unwrap(),
+            INTERP_POLY2_LIN
+        );
+        let err = interp_fn(Some("parabolik"), INTERP_NORMSYS_DEFAULT).unwrap_err();
+        assert!(err.to_string().contains("parabolik"), "got: {err}");
+    }
 
     #[test]
     fn parse_pyhf_channel_sample() {

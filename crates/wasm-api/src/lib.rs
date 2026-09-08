@@ -41,14 +41,14 @@ pub fn convert_str(input: &str, from: &str, to: &str) -> Result<String, String> 
 }
 
 /// The wasm/JS boundary. `convert(input, from, to) -> string`; a returned
-/// `Err` surfaces to JavaScript as a thrown `Error` carrying the message.
+/// `Err` becomes a JavaScript `Error` object carrying the message.
 #[cfg(target_arch = "wasm32")]
 mod wasm {
     use wasm_bindgen::prelude::*;
 
     #[wasm_bindgen]
-    pub fn convert(input: &str, from: &str, to: &str) -> Result<String, JsValue> {
-        super::convert_str(input, from, to).map_err(|e| JsValue::from_str(&e))
+    pub fn convert(input: &str, from: &str, to: &str) -> Result<String, JsError> {
+        super::convert_str(input, from, to).map_err(|e| JsError::new(&e))
     }
 }
 
@@ -60,12 +60,48 @@ mod tests {
     const PYHF_2BIN: &str = include_str!("../../hs3/tests/fixtures/2bin_1channel.json");
 
     #[test]
-    fn pyhf_to_flatppl_produces_source() {
+    fn pyhf_to_flatppl_preserves_the_model() {
         let out = convert_str(PYHF_2BIN, "pyhf", "flatppl").expect("pyhf → flatppl");
-        assert!(
-            out.trim().len() > 20,
-            "converted FlatPPL should be a non-trivial model, got:\n{out}"
-        );
+        // Expected quantities come from the fixture, not from another importer
+        // run. Compare parsed expressions so whitespace and printer sugar are
+        // irrelevant. shapesys has rate factor (nominal / uncertainty)^2.
+        let expected = [
+            ("singlechannel_observed", "[50.0, 60.0]"),
+            ("singlechannel_signal_nominal", "[5.0, 10.0]"),
+            ("singlechannel_background_nominal", "[50.0, 60.0]"),
+            ("uncorr_bkguncrt_sigma", "[5.0, 12.0]"),
+            (
+                "uncorr_bkguncrt_tau",
+                "(singlechannel_background_nominal ./ uncorr_bkguncrt_sigma) .^ 2",
+            ),
+            (
+                "singlechannel_likelihood",
+                "likelihoodof(singlechannel_model, singlechannel_observed)",
+            ),
+            (
+                "likelihood",
+                "joint_likelihood(singlechannel_likelihood, uncorr_bkguncrt_constraint_likelihood)",
+            ),
+        ];
+        let mut source = out;
+        for (name, expression) in expected {
+            source.push_str(&format!("\n_expected_{name} = {expression}\n"));
+        }
+        let module = flatppl_syntax::parse(&source).expect("returned source must parse");
+        let rhs = |name: &str| {
+            module
+                .bindings()
+                .find(|(_, binding)| module.resolve(binding.name) == name)
+                .unwrap_or_else(|| panic!("missing binding {name}"))
+                .1
+                .rhs
+        };
+        for (name, _) in expected {
+            assert!(
+                module.structural_eq(rhs(name), rhs(&format!("_expected_{name}"))),
+                "converted expression changed for {name}"
+            );
+        }
     }
 
     #[test]
