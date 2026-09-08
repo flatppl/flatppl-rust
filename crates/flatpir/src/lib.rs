@@ -28,4 +28,4 @@ pub mod sexpr;
 pub use error::{Error, Result};
 pub use json::{from_json, to_json, try_to_json};
 pub use reader::read;
-pub use writer::write;
+pub use writer::{try_write, write};

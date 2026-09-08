@@ -9,13 +9,55 @@
 //! Annotations are emitted as a transparent `(%meta (<type> <phase> <valueset>)
 //! <expr>)` wrapper, only where the side-tables hold one for a node; a bare
 //! (pre-inference) module writes no `%meta`.
+//!
+//! [`write`] itself enforces no resource guard; [`try_write`] is the entry point
+//! that refuses text the reader cannot read back.
 
+use crate::error::{Error, Result};
+use crate::sexpr::{self, Sexpr};
 use flatppl_core::{
     Axis, Call, CallHead, Dim, Doc, Inputs, Markup, Mass, Module, NamedKind, Node, NodeId, Phase,
     Ref, RefNs, Scalar, ScalarType, Symbol, Type, ValueSet, Variance,
 };
 
+/// Render `module` as canonical FlatPIR text, refusing text the FlatPIR reader
+/// would reject.
+///
+/// The reader carries resource guards (a nesting depth and a form count) that
+/// the renderer does not, and inference annotations amplify nesting: a rank-64
+/// array's value set is 64 nested `cartpow` forms, and each enclosing record or
+/// tuple level adds its own type and value-set wrapper. A module whose source
+/// sits well inside every limit therefore prints text past the reader's depth
+/// guard. Spec §11 fixes no nesting bound, so the two sides must agree, and
+/// they agree here by construction: the check is the reader's own s-expression
+/// parser, so it covers whatever guards that parser carries.
+///
+/// The check is structural. It does not run the semantic reader, so it proves
+/// the text parses, not that reading rebuilds an equal module.
+pub fn try_write(module: &Module) -> Result<String> {
+    write_verified(module).map(|(text, _)| text)
+}
+
+/// [`try_write`], also handing back the parsed forms so a caller that needs the
+/// tree does not parse the same text twice.
+pub(crate) fn write_verified(module: &Module) -> Result<(String, Vec<Sexpr>)> {
+    let text = write(module);
+    match sexpr::parse_top(&text) {
+        Ok(forms) => Ok((text, forms)),
+        Err(e) => Err(Error::new(format!(
+            "the rendered FlatPIR cannot be read back: {}. \
+             Inference annotations nest as deep as an array's rank and as the \
+             enclosing records and tuples, so reduce the model's nesting or its \
+             array rank",
+            e.message
+        ))),
+    }
+}
+
 /// Render `module` as canonical FlatPIR text (no trailing newline).
+///
+/// Unguarded: an annotated module can render text past a reader resource guard
+/// (see [`try_write`]). Use [`try_write`] whenever the text will be read back.
 pub fn write(module: &Module) -> String {
     let mut out = String::from("(%module");
 

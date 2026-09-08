@@ -367,7 +367,8 @@ pub fn write_module(
     Ok(match format {
         Format::FlatPpl => flatppl_syntax::print_with(module, syntax),
         #[cfg(any(feature = "convert", feature = "infer", feature = "hs3"))]
-        Format::FlatPir => flatppl_flatpir::write(module),
+        Format::FlatPir => flatppl_flatpir::try_write(module)
+            .map_err(|e| Failure::Plain(format!("writing `.flatpir`: {}", e.message)))?,
         #[cfg(any(feature = "convert", feature = "infer", feature = "hs3"))]
         Format::FlatPirJson => {
             let value = flatppl_flatpir::try_to_json(module)

@@ -2,8 +2,8 @@
 //!
 //! Reading is fail-fast: the first malformed form aborts with an [`Error`]
 //! carrying a human-readable message and, where known, the 1-based source line.
-//! (Writing is infallible — a well-formed [`Module`](flatppl_core::Module)
-//! always renders.)
+//! [`crate::write`] is infallible, but [`crate::try_write`] reports through this
+//! same type when the rendered text would not read back.
 
 use std::fmt;
 

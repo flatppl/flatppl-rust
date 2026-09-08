@@ -40,14 +40,11 @@ pub fn to_json(module: &Module) -> Value {
 }
 
 /// Encode a [`Module`] as FlatPIR JSON, returning an error instead of panicking
-/// if the module is not writable as valid FlatPIR (e.g. a symbol/const name
-/// containing whitespace or `()";`, which the canonical text cannot represent).
+/// if the module is not writable as valid FlatPIR — a symbol or const name
+/// containing whitespace or `()";`, which the canonical text cannot represent,
+/// or annotations that render past a reader resource guard.
 pub fn try_to_json(module: &Module) -> Result<Value> {
-    let text = crate::writer::write(module);
-    // The writer emits canonical, well-formed FlatPIR for any in-contract module,
-    // so this re-parse succeeds and the tree shape is what `enc_*` expects. It can
-    // only fail if the module holds a name that is not a valid FlatPIR token.
-    let forms = sexpr::parse_top(&text)?;
+    let (_, forms) = crate::writer::write_verified(module)?;
     let form = forms
         .first()
         .ok_or_else(|| Error::new("writer produced no top-level form"))?;

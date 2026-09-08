@@ -587,7 +587,17 @@ fn infer_cmd(
         )));
     }
 
-    let mut text = flatppl_flatpir::write(&module);
+    // `try_write`, not `write`: annotations nest as deep as an array's rank, so
+    // a model well inside every source limit can render FlatPIR past the
+    // reader's depth guard. Writing that file would exit 0 with output no tool
+    // can read back.
+    let mut text = flatppl_flatpir::try_write(&module).map_err(|e| {
+        Failure::Plain(format!(
+            "writing `{}`: {}",
+            flatppl_cli::terminal_path(output),
+            e.message
+        ))
+    })?;
     if !text.ends_with('\n') {
         text.push('\n');
     }
@@ -759,7 +769,8 @@ fn determinize_cmd(
         .map_err(|e| Failure::Refuse(refuse_message(input, &source, &module, &e)))?;
     let rendered = match emit {
         EmitForm::Flatppl => flatppl_syntax::print(&lowered),
-        EmitForm::Flatpir => flatppl_flatpir::write(&lowered),
+        EmitForm::Flatpir => flatppl_flatpir::try_write(&lowered)
+            .map_err(|e| Failure::Plain(format!("emitting FlatPIR: {}", e.message)))?,
     };
     match output {
         Some(path) => fs::write(path, rendered).map_err(|e| {
