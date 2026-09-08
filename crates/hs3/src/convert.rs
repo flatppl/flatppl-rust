@@ -1062,7 +1062,7 @@ fn emit_histfactory_channels(m: &mut Module, doc: &Document) -> Result<()> {
         // through the likelihood that references it.
         let obs_vals = find_histfactory_observed(doc, &d.name)
             .ok_or_else(|| Error::NoObservation(d.name.clone()))?;
-        crate::pyhf::validate_observed_counts(&d.name, &obs_vals)?;
+        let fractional_observed = crate::pyhf::validate_observed_counts(&d.name, &obs_vals)?;
 
         // A `lumi` modifier needs a luminosity constraint (a Normal aux with a
         // sigma from the measurement's lumi-config). The native HS3 Document
@@ -1159,17 +1159,13 @@ fn emit_histfactory_channels(m: &mut Module, doc: &Document) -> Result<()> {
 
         // Observed array node.
         let obs_elems: Vec<_> = obs_vals.iter().map(|v| b.lit_real(*v)).collect();
-        let observed = b.array(&obs_elems);
+        let observed = crate::pyhf::Observed {
+            node: b.array(&obs_elems),
+            n_bins: obs_vals.len(),
+            fractional: fractional_observed,
+        };
 
-        crate::pyhf::assemble_channel(
-            &mut b,
-            &d.name,
-            &samples,
-            observed,
-            obs_vals.len(),
-            None,
-            &mut terms,
-        )?;
+        crate::pyhf::assemble_channel(&mut b, &d.name, &samples, observed, None, &mut terms)?;
     }
     // Flat top-level `likelihood` over the histfactory channels (the
     // `histfactory_dist` internals can restructure; the generic-distribution HS3

@@ -313,7 +313,9 @@ fn native_histfactory_counts_must_match_poisson_support() {
 
     assert_err_hs3("negative nominal", &document("-1.0", "2.0"), "nominal");
     assert_err_hs3("negative observed", &document("1.0", "-2.0"), "observed");
-    assert_err_hs3("fractional observed", &document("1.0", "3.5"), "integer");
+    // A fractional count is NOT an error: it selects `ContinuedPoisson`
+    // (positive coverage in tests/fractional_observed_counts.rs).
+    assert!(flatppl_hs3::read_hs3(&document("1.0", "3.5")).is_ok());
 }
 
 // ---------------------------------------------------------------------------
