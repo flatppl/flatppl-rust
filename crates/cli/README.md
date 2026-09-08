@@ -17,10 +17,12 @@ Formats are inferred from file extensions. Generated files carry a single minima
 (`AUTOMATICALLY GENERATED - do not edit`) - deliberately no timestamp, user, host, platform, or
 command line, which would leak personal/system information; model imports also stamp a leading
 `flatppl_compat` binding recording the targeted FlatPPL version. `--no-header` omits the banner.
-Verbs are opt-in cargo features (`infer`, `hs3`; both on by default).
+Verbs are controlled by Cargo features. Conversion, inference, preparation, formatting,
+linting, determinization, and StableHLO emission are enabled by default. HS3 and pyhf
+import require the additional `hs3` feature.
 
 Install from the repository:
 
 ```sh
-cargo install --git https://github.com/flatppl/flatppl-rust flatppl-cli
+cargo install --git https://github.com/flatppl/flatppl-rust flatppl-cli --features hs3
 ```

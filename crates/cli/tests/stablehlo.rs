@@ -187,3 +187,81 @@ fn stablehlo_abi_model_refuses_non_exhaustive_inputs_with_exit_3() {
         "expected the exhaustiveness refusal message, got:\n{stderr}"
     );
 }
+
+/// A source-controlled vector length must not allocate or emit billions of
+/// component samplers. The emitter refuses before the static unroll.
+#[test]
+fn stablehlo_dirichlet_sample_caps_static_unroll() {
+    let input = write_model(
+        "dirichlet-static-unroll",
+        "alpha = elementof(cartpow(posreals, 4294967295))\n\
+         s = rnginit(0)\n\
+         x = draw(Dirichlet(alpha = alpha))\n\
+         draws = rand(s, lawof(x))\n\
+         inputs = (alpha)\n\
+         outputs = (draws)\n",
+    );
+    let out = flatppl()
+        .arg("stablehlo")
+        .arg(&input)
+        .args(["--mode", "sample"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("Dirichlet sample"), "{stderr}");
+    assert!(stderr.contains("resource guard"), "{stderr}");
+    assert!(out.stdout.is_empty(), "refusal must emit no partial IR");
+}
+
+/// Static shape products must not wrap in moment denominators. Both whole-array
+/// and aggregate reductions share the checked element-count path.
+#[test]
+fn stablehlo_moments_reject_shape_product_overflow() {
+    let cases = [
+        ("mean", "y = mean(x)"),
+        ("var", "y = var(x)"),
+        ("std", "y = std(x)"),
+        (
+            "aggregate-mean",
+            "y = aggregate(mean, [.l], x[.i, .j, .k, .l])",
+        ),
+        (
+            "aggregate-var",
+            "y = aggregate(var, [.l], x[.i, .j, .k, .l])",
+        ),
+        (
+            "aggregate-std",
+            "y = aggregate(std, [.l], x[.i, .j, .k, .l])",
+        ),
+    ];
+    for (name, expr) in cases {
+        let input = write_model(
+            name,
+            &format!(
+                "x = elementof(cartpow(reals, [4294967295, 4294967295, 2, 1]))\n\
+                 {expr}\n\
+                 inputs = (x)\n\
+                 outputs = (y)\n"
+            ),
+        );
+        let out = flatppl().arg("stablehlo").arg(&input).output().unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(3),
+            "{name}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("element count exceeds u64"),
+            "{name}: {stderr}"
+        );
+        assert!(out.stdout.is_empty(), "{name}: refusal emitted partial IR");
+    }
+}
