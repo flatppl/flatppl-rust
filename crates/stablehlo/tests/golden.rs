@@ -4792,6 +4792,20 @@ fn emit_sample_normal_has_expected_structure() {
     assert!(is_delimiter_balanced(&out));
 }
 
+/// The two §07 `rnginit` seed forms emit the SAME MLIR. The emitter never
+/// lowers the seed-to-state math: the rng-source binding is bound to `%key`,
+/// so a scalar seed and its 8-byte little-endian byte vector both reach the
+/// emitter as the same function argument. This pins that, so a later change
+/// that starts reading the seed cannot make the two forms diverge silently.
+#[test]
+fn both_rnginit_seed_forms_emit_the_same_sample() {
+    let scalar = emit_sample(&determinize_src(NORMAL_SAMPLE_SRC));
+    let bytes = emit_sample(&determinize_src(
+        &NORMAL_SAMPLE_SRC.replace("rnginit(0)", "rnginit([0, 0, 0, 0, 0, 0, 0, 0])"),
+    ));
+    assert_eq!(scalar, bytes);
+}
+
 /// Freeze the exact emitted text: any drift (op count, ordering, arg naming,
 /// formula) must be a deliberate, reviewed change to this golden file.
 #[test]

@@ -168,6 +168,11 @@ Catalogue(
         Builtin(name: "selectbins", sig: Structural(params: [Vector(Real), Any, Any], names: ["edges", "region", "counts"])),
 
         // §07 "Random value generation": `rnginit | rngseed`, `rand | rstate, m`.
+        // `rnginit`'s Domains cell states TWO forms — "byte vector (`integers` in
+        // `interval(0, 255)`) or integer in `interval(0, 2^64 - 1)`" — which one
+        // `ParamSig` cannot say. The row keeps the byte vector, the form every
+        // other §07 vector row is shaped like, and `ops::refuse_bad_rng_seed`
+        // decides the argument against both.
         Builtin(name: "rnginit", sig: Structural(params: [Vector(Integer)], names: ["rngseed"])),
         Builtin(name: "rand",    sig: Structural(params: [Any, Any], names: ["rstate", "m"])),
 

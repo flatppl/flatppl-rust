@@ -6867,7 +6867,113 @@ fn domain_check(inf: &mut Inferencer<'_, '_>, name: &str, args: &[ArgInfo]) -> O
     refuse_nonboolean_domain(inf, name, args)
         .or_else(|| refuse_string_argument(inf, name, args))
         .or_else(|| refuse_nonmeasure_operand(inf, name, args))
+        .or_else(|| refuse_bad_rng_seed(inf, name, args))
         .or_else(|| refuse_constant_outside_declared_set(inf, name, args))
+}
+
+/// 2^64 — the exclusive upper bound on `rnginit`'s integer seed. An `i64`
+/// literal never reaches it, so the bound documents the spec's set rather than
+/// gating a case the front end can produce; see [`refuse_bad_rng_seed`].
+const RNG_SEED_BOUND: i128 = 1 << 64;
+
+/// Reject an `rnginit` seed that is neither a byte vector nor an integer.
+///
+/// §07 `rnginit` states two forms: "`rngseed` must be a seed vector of bytes
+/// (integers in $\{0, \ldots, 255\}$)", and "A single integer
+/// $n \in \{0, \ldots, 2^{64} - 1\}$ is also accepted, and denotes the byte
+/// vector of the 8-byte little-endian unsigned encoding of $n$."
+///
+/// Unenforced, both `rnginit(1.5)` and `rnginit(eye(3))` typed `rngstates` at
+/// exit 0 — the `"rnginit"` arm answers `Type::RngState` whatever the argument
+/// is, and the row's `Vector(Integer)` parameter tag is documentation that
+/// nothing sweeps ([`domain_check`]'s doc comment says why the tags are not
+/// swept generically). This is the narrow check the two stated forms support.
+///
+/// A boolean seed is refused with the rest: §03 promotes `true` to one "in
+/// arithmetic contexts", and a seed is not an arithmetic context — §07 says a
+/// single INTEGER, and `rnginit(true)` is far likelier a mistake than a request
+/// for seed 1.
+///
+/// The RANGE is only checked for a written constant, and only downward: a
+/// negative seed is in neither form's set. The upper bound cannot fire from
+/// source, because a literal above `i64::MAX` is already a lex error
+/// ("invalid integer literal"), which leaves $[2^{63}, 2^{64})$ unwritable as a
+/// literal here — a front-end limit, not an `rnginit` rule. The byte vector's
+/// own $\{0, \ldots, 255\}$ element range stays unchecked, as it was.
+fn refuse_bad_rng_seed(inf: &mut Inferencer<'_, '_>, name: &str, args: &[ArgInfo]) -> Option<Type> {
+    if name != "rnginit" {
+        return None;
+    }
+    let (node, ty, _) = args.first()?;
+    let form = match ty {
+        Type::Scalar(ScalarType::Integer) => "an integer seed",
+        Type::Array { shape, elem } if shape.len() == 1 => {
+            if matches!(**elem, Type::Scalar(ScalarType::Integer)) {
+                "a byte vector"
+            } else {
+                ""
+            }
+        }
+        // Not decided against, so not refused — same abstention as every other
+        // check in `domain_check`.
+        Type::Deferred | Type::Failed(_) | Type::Any | Type::Var(_) => return None,
+        _ => "",
+    };
+    if form.is_empty() {
+        inf.diags.push(crate::Diagnostic::error_at(
+            *node,
+            format!(
+                "`rnginit` seed must be a byte vector (integers in 0..255) or a single \
+                 integer in 0..2^64-1, got {}: spec §07 `rnginit` states those two \
+                 forms and no other",
+                describe_seed(ty),
+            ),
+        ));
+        return Some(Type::Failed("rnginit: seed is neither form".into()));
+    }
+    if form == "an integer seed" {
+        let n = written_int(inf, *node)?;
+        if n < 0 || i128::from(n) >= RNG_SEED_BOUND {
+            inf.diags.push(crate::Diagnostic::error_at(
+                *node,
+                format!(
+                    "`rnginit` integer seed is {n}, outside 0..2^64-1: spec §07 \
+                     `rnginit` accepts \"a single integer $n \\in \\{{0, \\ldots, \
+                     2^{{64}} - 1\\}}$\""
+                ),
+            ));
+            return Some(Type::Failed("rnginit: seed out of range".into()));
+        }
+    }
+    None
+}
+
+/// How a refused `rnginit` seed reads in its diagnostic. An array names its
+/// ELEMENT as well as its rank: `[1.5, 2.5]` fails on the element and
+/// `eye(3)` on the rank, and "a rank-1 array" alone would not say which.
+fn describe_seed(ty: &Type) -> String {
+    match ty {
+        Type::Scalar(k) => format!("the {k} scalar"),
+        Type::Array { shape, elem } => match &**elem {
+            Type::Scalar(k) => format!("a rank-{} array of {k}", shape.len()),
+            _ => format!("a rank-{} array of a non-scalar element", shape.len()),
+        },
+        Type::TVector { .. } => "a transposed vector".to_string(),
+        Type::Record(fields) => format!("a {}-field record", fields.len()),
+        Type::Table { columns, .. } => format!("a {}-column table", columns.len()),
+        Type::Tuple(parts) => format!("a {}-component tuple", parts.len()),
+        Type::RngState => "an RNG state".to_string(),
+        Type::Module => "a module reference".to_string(),
+        Type::Measure { .. } => "a measure".to_string(),
+        Type::Kernel { .. } => "a kernel".to_string(),
+        Type::Function { .. } => "a function".to_string(),
+        Type::Likelihood { .. } => "a likelihood".to_string(),
+        // Never reached: `refuse_bad_rng_seed` abstains on an undecided type
+        // before describing it.
+        Type::Deferred | Type::Failed(_) | Type::Any | Type::Var(_) => {
+            "an undecided type".to_string()
+        }
+    }
 }
 
 /// The value of a scalar constant WRITTEN at this node, as an `f64`, or `None`

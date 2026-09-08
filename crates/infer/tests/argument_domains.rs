@@ -299,3 +299,51 @@ fn measure_and_deferred_operands_still_type() {
     assert_clean("m = weighted(2.0, Normal(mu = 0.0, sigma = 1.0))\n");
     assert_clean("b = BinnedPoissonProcess([1.0, 2.0], [0.0, 1.0, 2.0])\nm = normalize(b)\n");
 }
+
+// ---- §07 `rnginit`: a byte vector or a single integer -----------------------
+
+/// §07 `rnginit`: "`rngseed` must be a seed vector of bytes (integers in
+/// $\{0, \ldots, 255\}$)", and "A single integer
+/// $n \in \{0, \ldots, 2^{64} - 1\}$ is also accepted, and denotes the byte
+/// vector of the 8-byte little-endian unsigned encoding of $n$." Both forms
+/// type; neither is a special case of the other.
+#[test]
+fn both_rnginit_seed_forms_type() {
+    assert_clean("s = rnginit(0)\n");
+    assert_clean("s = rnginit(12345)\n");
+    assert_clean("s = rnginit([42, 0, 0, 0])\n");
+    assert_clean("seed = [0xb2, 0x51, 0xa4, 0x93]\ns = rnginit(seed)\n");
+}
+
+/// Neither §07 form admits a real, a boolean, a matrix, or a real vector. Before
+/// this, every one of them typed `rngstates` at exit 0 — the `"rnginit"` type arm
+/// answers `RngState` whatever the argument is.
+#[test]
+fn an_rnginit_seed_of_neither_form_is_refused() {
+    for src in [
+        "s = rnginit(1.5)\n",
+        "s = rnginit(true)\n",
+        "s = rnginit(eye(3))\n",
+        "s = rnginit([1.5, 2.5])\n",
+        // The keyword spelling, because a sole positional record splats (§04).
+        "s = rnginit(rngseed = record(a = 1))\n",
+        "s = rnginit(Normal(0.0, 1.0))\n",
+    ] {
+        assert_refuses(src, "seed must be a byte vector");
+    }
+}
+
+/// A negative integer seed is in neither form's set. The upper bound is
+/// unreachable from source: a literal above `i64::MAX` is a lex error, which
+/// leaves $[2^{63}, 2^{64})$ unwritable here.
+#[test]
+fn a_negative_rnginit_seed_is_refused() {
+    assert_refuses("s = rnginit(-7)\n", "outside 0..2^64-1");
+}
+
+/// An undecided seed is not decided against: `external` carries no type here, and
+/// the check must not turn that into an error.
+#[test]
+fn an_undecided_rnginit_seed_still_types() {
+    assert_clean("seed = external(cartpow(integers, 4))\ns = rnginit(seed)\n");
+}
