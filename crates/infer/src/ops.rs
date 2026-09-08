@@ -101,9 +101,10 @@ pub(crate) fn call_rule(
     let name = inf.module.resolve(op).to_string();
 
     // Reified callables (`functionof` / `kernelof`) — typed by their boundary
-    // + body, and always *fixed* (a reification closes over its ancestry).
+    // + body. The phase follows the CAPTURED ancestors, so the rule returns it
+    // rather than assuming `%fixed`; see [`reification_type`].
     if call.inputs.is_some() {
-        return (reification_type(inf, id, call, &name, args), Phase::Fixed);
+        return reification_type(inf, id, call, &name, args);
     }
 
     // Keyword arguments moved into their DECLARED POSITIONS, once, before any rule reads
@@ -4528,19 +4529,30 @@ fn ksuperpose_cell_variate(
 
 /// `functionof` / `kernelof` (spec §04 reification, §11 reified callables).
 /// A `functionof` whose body is a measure *is* a kernel.
+///
+/// Returns the phase as well as the type, because a reification's phase follows
+/// its CAPTURED ancestors rather than being `%fixed` by construction. A
+/// `functionof` that captures a `draw` node — one its boundary does not name and
+/// no `lawof` absorbs — is itself of stochastic phase: the callable is
+/// conditional on that draw's single realization, which it shares with the rest
+/// of the graph. See [`captured_draws`].
 fn reification_type(
     inf: &mut Inferencer<'_, '_>,
     id: NodeId,
     call: &Call,
     name: &str,
     args: &[ArgInfo],
-) -> Type {
+) -> (Type, Phase) {
     // Boundary entries whose target ref is a `%local` placeholder — that entry
     // IS the placeholder's declaration (spec §04), under either origin tag. The
     // auto-trace itself only ever records `elementof` leaves, but FlatPIR may
     // carry an explicit entry list under `%autoinputs`, and such an entry
     // declares its placeholder exactly as a `%specinputs` entry does.
     let mut declared: Vec<Symbol> = Vec::new();
+    // Self-module bindings a boundary entry designates. §04 substitutes each
+    // with a fresh `elementof(valueset(a))` input BEFORE the ancestor trace
+    // runs, so the referential-transparency walk below cuts there.
+    let mut boundary_targets: Vec<Symbol> = Vec::new();
     let inputs: Box<[Symbol]> = match call.inputs.as_ref() {
         Some(Inputs::Spec(entries)) => {
             // Reification is module-local (spec §04): a boundary may not designate
@@ -4559,12 +4571,21 @@ fn reification_type(
                         inf.module.resolve(r.name)
                     ),
                 ));
-                return Type::Failed("cross-module reification boundary".into());
+                return (
+                    Type::Failed("cross-module reification boundary".into()),
+                    Phase::Fixed,
+                );
             }
             declared.extend(
                 entries
                     .iter()
                     .filter(|(_, r)| r.ns == RefNs::Local)
+                    .map(|(_, r)| r.name),
+            );
+            boundary_targets.extend(
+                entries
+                    .iter()
+                    .filter(|(_, r)| r.ns == RefNs::SelfMod)
                     .map(|(_, r)| r.name),
             );
             entries.iter().map(|(n, _)| *n).collect()
@@ -4577,6 +4598,12 @@ fn reification_type(
                         .filter(|(_, r)| r.ns == RefNs::Local)
                         .map(|(_, r)| r.name),
                 );
+                boundary_targets.extend(
+                    entries
+                        .iter()
+                        .filter(|(_, r)| r.ns == RefNs::SelfMod)
+                        .map(|(_, r)| r.name),
+                );
                 entries.iter().map(|(n, _)| *n).collect()
             }
             None => {
@@ -4584,7 +4611,7 @@ fn reification_type(
                 // leaves (canonical-sorted by name) and fill the side-table, so
                 // the reification types as a kernel/function over those inputs.
                 let Some((body, _, _)) = args.first() else {
-                    return Type::Deferred;
+                    return (Type::Deferred, Phase::Fixed);
                 };
                 let (entries, cross_module) = inf.collect_auto_inputs(*body);
                 if cross_module {
@@ -4599,10 +4626,19 @@ fn reification_type(
                          (spec §04); use the dependency's callables/values instead, or \
                          reify within the module that defines it",
                     ));
-                    return Type::Failed("cross-module reification".into());
+                    return (
+                        Type::Failed("cross-module reification".into()),
+                        Phase::Fixed,
+                    );
                 }
 
                 let names: Box<[Symbol]> = entries.iter().map(|(n, _)| *n).collect();
+                boundary_targets.extend(
+                    entries
+                        .iter()
+                        .filter(|(_, r)| r.ns == RefNs::SelfMod)
+                        .map(|(_, r)| r.name),
+                );
                 inf.module.set_auto_inputs(id, entries.into());
                 names
             }
@@ -4636,7 +4672,10 @@ fn reification_type(
                 ),
             ));
         }
-        return Type::Failed("repeated boundary input name".into());
+        return (
+            Type::Failed("repeated boundary input name".into()),
+            Phase::Fixed,
+        );
     }
     // §04 *Placeholders and holes*, the front door: a placeholder this
     // reification's body reaches and its boundary does not declare is a static
@@ -4659,11 +4698,39 @@ fn reification_type(
                     ),
                 ));
             }
-            return Type::Failed("undeclared placeholder".into());
+            return (Type::Failed("undeclared placeholder".into()), Phase::Fixed);
         }
     }
+    // §04 reification, the PHASE of a reified callable. A `functionof` may
+    // reference `draw` nodes of the enclosing graph: they stay shared ancestors
+    // with a single realization, so the callable is conditional on that
+    // realization — never resampled per call, never marginalized. What that
+    // costs is determinism, and the phase is where it is paid: a reification
+    // that captures a draw, or a node descending from one, is itself
+    // STOCHASTIC. §04's no-closures sentence then narrows to the deterministic
+    // ancestors it names, "a fixed ancestor is resolved to its value".
+    //
+    // A boundary-named ancestor is not captured — §04 substitutes it with a
+    // fresh `elementof(valueset(a))` input before the trace runs — so
+    // `functionof(m, raw_syst = raw_syst)` is the conditional kernel and stays
+    // `%fixed`. `functionof(lawof(m))` likewise: `lawof` absorbs, so nothing
+    // stochastic is captured.
+    //
+    // `kernelof` is never stochastic. §04 "Kernels and `kernelof`" makes
+    // `kernelof(x, kwargs…)` equivalent to `functionof(lawof(x), kwargs…)`, so
+    // its whole body sits under an implicit `lawof` and every draw it reaches is
+    // absorbed — the marginalization the eight-schools `forward_kernel` and the
+    // `prior_predictive` example rely on.
+    let phase = match (name, args.first()) {
+        ("functionof", Some((body, _, _)))
+            if !captured_draws(inf.module, *body, &boundary_targets).is_empty() =>
+        {
+            Phase::Stochastic
+        }
+        _ => Phase::Fixed,
+    };
     let body_ty = args.first().map(|(_, t, _)| t);
-    match (name, body_ty) {
+    let ty = match (name, body_ty) {
         // `kernelof` reifies the LAW of a value-typed body — a probability
         // measure per input, i.e. a Markov kernel. Its body must BE a value:
         // §04 "Kernels and `kernelof`" says it "reifies (typically stochastic)
@@ -4708,7 +4775,15 @@ fn reification_type(
         },
         ("functionof", _) => Type::Function { inputs },
         _ => Type::Deferred,
-    }
+    };
+    // A `%failed` reification carries no meaningful phase; keep it `%fixed` so a
+    // downstream phase join is not reddened twice for one error.
+    let phase = if matches!(ty, Type::Failed(_)) {
+        Phase::Fixed
+    } else {
+        phase
+    };
+    (ty, phase)
 }
 
 /// Every `%local` placeholder the reified expression at `body` reaches that
@@ -4754,6 +4829,102 @@ fn undeclared_placeholders(
                         if matches!(module.resolve(h), "functionof" | "kernelof")) =>
             {
                 continue;
+            }
+            _ => {}
+        }
+        pending.extend(module.node(id).children().into_iter().rev());
+    }
+    found
+}
+
+/// Every `draw` node the subgraph reified at `body` CAPTURES — reaches without
+/// a boundary naming it and without a `lawof` absorbing it — as
+/// `(binding name, node)` pairs in walk order. The name is `None` for a
+/// `draw(…)` written inline in the reified expression.
+///
+/// A non-empty result makes the reification stochastic-phase. A captured draw
+/// is a shared ancestor with a single realization, so the callable is
+/// conditional on that realization rather than a function of its inputs alone.
+/// That is exactly what `%stochastic` records; the names are kept so a caller
+/// can say WHICH draws a callable is conditional on.
+///
+/// `draw` is the only source of a stochastic node (§04 "Phases"; §07 *Random
+/// value generation* makes `rand`/`rnginit`/`rngstate` ordinary functions whose
+/// "value phases propagate as usual"), so the captured draws are the whole
+/// stochastic dependency.
+///
+/// The walk cuts at four places, each of which ends the reified subgraph:
+///
+/// * a boundary target — §04 substitutes it with a fresh
+///   `elementof(valueset(a))` input *before* the ancestor trace runs, so
+///   `functionof(m, raw_syst = raw_syst)` captures nothing and is the
+///   conditional kernel over a declared input;
+/// * a `lawof` call — it "absorbs stochasticity into the reified law rather
+///   than propagating it outward" (§04 "Phase of the reified law");
+/// * a nested `functionof`/`kernelof` — the inner reification carries its own
+///   phase, computed when inference reaches that node, and a callable value is
+///   not itself a stochastic node;
+/// * an `elementof` set argument — §04 traces "back to all leaves of parametric
+///   phase — that is, all `elementof` leaves", so the set is outside the
+///   subgraph. This mirrors [`Inferencer::collect_auto_inputs`].
+///
+/// A cross-module reference is also a cut: a stochastic dependency binding is
+/// invisible across the load boundary (`modules.rs` refuses it there), so no
+/// draw can reach the subgraph through one.
+fn captured_draws(
+    module: &flatppl_core::Module,
+    body: NodeId,
+    boundary_targets: &[Symbol],
+) -> Vec<(Option<Symbol>, NodeId)> {
+    fn is_draw(module: &flatppl_core::Module, id: NodeId) -> bool {
+        matches!(module.node(id), Node::Call(c)
+            if matches!(c.head, CallHead::Builtin(h) if module.resolve(h) == "draw"))
+    }
+    let mut found: Vec<(Option<Symbol>, NodeId)> = Vec::new();
+    let mut visited = std::collections::HashSet::new();
+    let mut pending = vec![body];
+    while let Some(id) = pending.pop() {
+        if !visited.insert(id) {
+            continue;
+        }
+        match module.node(id) {
+            Node::Ref(r) if r.ns == RefNs::SelfMod => {
+                if boundary_targets.contains(&r.name) {
+                    continue;
+                }
+                if let Some(b) = module.binding_by_name(r.name) {
+                    let rhs = module.binding(b).rhs;
+                    if is_draw(module, rhs) {
+                        // Report the BINDING, not the anonymous `draw` node, so a
+                        // caller names the identifier the user wrote.
+                        if !found.iter().any(|(n, _)| *n == Some(r.name)) {
+                            found.push((Some(r.name), id));
+                        }
+                    } else {
+                        pending.push(rhs);
+                    }
+                }
+                continue;
+            }
+            Node::Ref(_) => continue,
+            Node::Call(c)
+                if c.inputs.is_some()
+                    && matches!(c.head, CallHead::Builtin(h)
+                        if matches!(module.resolve(h), "functionof" | "kernelof")) =>
+            {
+                continue;
+            }
+            Node::Call(c) => {
+                if let CallHead::Builtin(h) = c.head {
+                    match module.resolve(h) {
+                        "lawof" | "elementof" => continue,
+                        "draw" => {
+                            found.push((None, id));
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
             }
             _ => {}
         }

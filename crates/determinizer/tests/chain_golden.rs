@@ -167,3 +167,45 @@ lp = logdensityof(lawof(t), [record(a = 0.5), record(a = 1.5), record(a = 1.0)])
         "refusal names markovchain: {err:?}"
     );
 }
+
+// A step kernel that CAPTURES a drawn value: `sigma_step` is a `draw` node the
+// lambda references rather than takes as an argument. §04 makes such a capture a
+// shared ancestor with a SINGLE realization — the callable is conditional on it,
+// never resampled per call — so every step of the chain must score against the
+// same value, and the chain must contribute exactly `n` terms plus the captured
+// draw's own prior term.
+//
+// This is the shape `flatppl-examples/examples/ar1-noise-estimation.flatppl`
+// uses. `infer` types the step kernel `%stochastic` for the capture; the
+// determiniser has to agree that one realization is shared, and a per-step
+// resample would show up here as a `sigma` that is not the query point.
+#[test]
+fn a_captured_draw_in_a_step_kernel_is_one_shared_value() {
+    let src = "\
+sigma_step ~ normalize(truncate(Cauchy(0.0, 1.0), interval(0.0, inf)))
+step_kernel = prev -> Normal(mu = prev, sigma = sigma_step)
+x ~ markovchain(step_kernel, 0.0, 3)
+prior = lawof(record(sigma_step = sigma_step))
+forward_kernel = kernelof(record(x = x), sigma_step = sigma_step)
+L = likelihoodof(forward_kernel, record(x = [0.1, 0.2, 0.3]))
+posterior = bayesupdate(L, prior)
+lp = logdensityof(posterior, record(sigma_step = 0.7))";
+    let pir = lower(src);
+    // Three Normal step terms, each at the SAME sigma — the query point. A
+    // per-step resample could not produce three identical sigma fields.
+    assert_eq!(
+        pir.matches("(%field sigma 0.7)").count(),
+        3,
+        "all three steps share one realization of the captured draw:\n{pir}"
+    );
+    // The means chain through the trajectory: init, then the observed slots.
+    for mu in ["(%field mu 0.0)", "(%field mu 0.1)", "(%field mu 0.2)"] {
+        assert!(pir.contains(mu), "step means chain through {mu}:\n{pir}");
+    }
+    // The captured draw keeps its own prior term, scored once, not per step.
+    assert_eq!(
+        pir.matches("builtin_logdensityof Cauchy").count(),
+        1,
+        "the captured draw's prior is scored once:\n{pir}"
+    );
+}
