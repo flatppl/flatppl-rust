@@ -6,6 +6,8 @@
 //! §07 functions (domains/results), §08 distributions (variate domains),
 //! §06 measure combinators, §04 reified callables.
 
+use std::collections::HashSet;
+
 use flatppl_core::{
     Call, CallHead, Dim, Inputs, Mass, Node, NodeId, Phase, Ref, RefNs, Scalar, ScalarType, Symbol,
     Type, ValueSet, Variance,
@@ -19,6 +21,10 @@ use crate::trace::{Inferencer, join_phase};
 type ArgInfo = (NodeId, Type, Phase);
 /// `(name, node, type, phase)` of an inferred named argument.
 type NamedInfo = (Symbol, NodeId, Type, Phase);
+
+/// Maximum array rank inference materializes from a compact count expression.
+/// This is an implementation resource guard, not a FlatPPL language limit.
+const MAX_STRUCTURAL_RANK: usize = 64;
 
 pub(crate) fn literal_type(s: &Scalar) -> Type {
     match s {
@@ -429,8 +435,25 @@ pub(crate) fn call_rule(
                     Some(Dim::Static(nl)),
                     Some(Dim::Static(nt)),
                 ) => {
-                    let mut dims: Vec<Dim> =
-                        std::iter::repeat_n(static_dim(1), nl as usize).collect();
+                    let rank = (nl as usize)
+                        .checked_add(shape.len())
+                        .and_then(|rank| rank.checked_add(nt as usize));
+                    let Some(rank) = rank.filter(|&rank| rank <= MAX_STRUCTURAL_RANK) else {
+                        inf.diags.push(crate::Diagnostic::error_at(
+                            id,
+                            format!(
+                                "`addaxes` result structural rank exceeds the implementation \
+                                 resource guard of {MAX_STRUCTURAL_RANK}; reduce `n_leading` or \
+                                 `n_trailing`"
+                            ),
+                        ));
+                        return (
+                            Type::Failed("addaxes structural rank exceeds resource guard".into()),
+                            joined,
+                        );
+                    };
+                    let mut dims = Vec::with_capacity(rank);
+                    dims.extend(std::iter::repeat_n(static_dim(1), nl as usize));
                     dims.extend_from_slice(shape);
                     dims.extend(std::iter::repeat_n(static_dim(1), nt as usize));
                     Type::Array {
@@ -1833,21 +1856,15 @@ fn reduced_scalar(head: &str, elem: ScalarType) -> ScalarType {
 ///
 /// §04 "Multi-axis aggregation" makes the result "an array of the shape declared by
 /// `output_axes`" whose entries are `f_reduction` applied to the contracted slice.
-/// So the entry type is whatever that reduction gives, which for three of §04's ten
-/// eligible built-ins is not the body's own kind:
+/// So the entry type is whatever that reduction gives. [`reduced_scalar`]
+/// supplies the same rule used by ordinary array and table reductions. Axis
+/// indexing leaves the body node deferred, so [`aggregate_body_scalar_kind`]
+/// traces through `get` and local references to recover its element kind.
 ///
 /// - `median` — real even over an integer body, for [`reduced_scalar`]'s reason.
 /// - `lany`/`lall` — boolean whatever the body was; §07 "Boolean reductions" gives
 ///   both a truth value.
 ///
-/// `mean`, `var` and `std` have the SAME mismatch (all three are real-valued over an
-/// integer body) and are deliberately not listed: fixing them changes an
-/// already-shipped type on a construct outside this batch. Recorded in
-/// `flatppl-dev/TODO-flatppl-rust.md`, alongside the `sum` divergence
-/// `stablehlo::Emitter::reduce_trailing_axes` documents from the other side. Every
-/// axis-indexed body types `%deferred`, so the fallback lands on `Real` and the
-/// three are right on the common case; only a genuinely integer-typed body
-/// (`indicesof(...)`) surfaces it.
 /// Spec §04 "Metric-aware Einstein summation" / "Static checks": "bare neutral
 /// aggregate axes (`.i` without a variance marker) are not allowed inside
 /// `metricsum`." The same section states variance-marked axis names are
@@ -2335,11 +2352,38 @@ fn aggregate_result_kind(inf: &Inferencer<'_, '_>, args: &[ArgInfo]) -> Option<S
     let Node::Const(op) = inf.module.node(args.first()?.0) else {
         return None;
     };
-    match inf.module.resolve(*op) {
+    let head = inf.module.resolve(*op);
+    match head {
         "median" => Some(ScalarType::Real),
         "lany" | "lall" => Some(ScalarType::Boolean),
+        "sum" | "prod" | "maximum" | "minimum" | "mean" | "var" | "std" => args
+            .get(2)
+            .and_then(|a| aggregate_body_scalar_kind(inf, a.0))
+            .map(|elem| reduced_scalar(head, elem)),
         _ => None,
     }
+}
+
+/// Find the scalar kind beneath an aggregate body. Axis indexing leaves `get`
+/// itself deferred, so follow only its collection operand and local binding
+/// references. The fixed bound keeps malformed reference cycles harmless.
+fn aggregate_body_scalar_kind(inf: &Inferencer<'_, '_>, mut node: NodeId) -> Option<ScalarType> {
+    for _ in 0..64 {
+        if let Some(kind) = inf.lookup_type(node).and_then(elem_scalar_kind_of) {
+            return Some(kind);
+        }
+        node = match inf.module.node(node) {
+            Node::Call(call) if matches!(call.head, CallHead::Builtin(op) if inf.module.resolve(op) == "get") => {
+                *call.args.first()?
+            }
+            Node::Ref(r) if matches!(r.ns, flatppl_core::RefNs::SelfMod) => {
+                let binding = inf.module.binding_by_name(r.name)?;
+                inf.module.declared_binding_rhs(binding)
+            }
+            _ => return None,
+        };
+    }
+    None
 }
 
 /// `sum`/`prod`/`mean` over an ARRAY (spec §07 Reductions). A scalar element type is
@@ -2488,6 +2532,13 @@ fn table_reduction_type(head: &str, a: Option<&Type>) -> Type {
     )
 }
 
+/// Record a static projection error at its selector node.
+fn failed_get(inf: &mut Inferencer<'_, '_>, node: NodeId, message: String) -> Type {
+    inf.diags
+        .push(crate::Diagnostic::error_at(node, message.clone()));
+    Type::Failed(message.into())
+}
+
 /// `get` with static selectors: integer indices consume array axes / pick
 /// tuple components; string keys pick record fields. Anything dynamic or
 /// sliced (`all` / `only` / axes) is deferred until the shape work.
@@ -2502,7 +2553,7 @@ fn get_type(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo], base: i64) -> Type {
             (Type::Tuple(comps), Node::Lit(Scalar::Int(k))) => {
                 match usize::try_from(k - base).ok().and_then(|i| comps.get(i)) {
                     Some(t) => t.clone(),
-                    None => return Type::Failed("tuple index out of range".into()),
+                    None => return failed_get(inf, *node, "tuple index out of range".into()),
                 }
             }
             (Type::Array { shape, elem }, Node::Lit(Scalar::Int(_))) => {
@@ -2520,7 +2571,7 @@ fn get_type(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo], base: i64) -> Type {
                 let sym = fields.iter().find(|(n, _)| inf.module.resolve(*n) == &**s);
                 match sym {
                     Some((_, t)) => t.clone(),
-                    None => return Type::Failed(format!("record has no field `{s}`").into()),
+                    None => return failed_get(inf, *node, format!("record has no field `{s}`")),
                 }
             }
             // A table indexed by an integer is ROW access → the row record
@@ -2545,7 +2596,7 @@ fn get_type(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo], base: i64) -> Type {
                         shape: Box::new([*nrows]),
                         elem: Box::new(colty.clone()),
                     },
-                    None => return Type::Failed(format!("table has no column `{s}`").into()),
+                    None => return failed_get(inf, *node, format!("table has no column `{s}`")),
                 }
             }
             (Type::Any | Type::Deferred, _) => return current.clone(),
@@ -4563,15 +4614,12 @@ fn reification_type(
     // lambda or named function from repeating an argument name." The §05 sugars
     // (`f(a, a) = …`, `(a, a) -> …`) lower to this same boundary list, so one
     // check here covers every reified form.
-    let mut seen: Vec<Symbol> = Vec::with_capacity(inputs.len());
+    let mut seen: HashSet<Symbol> = HashSet::with_capacity(inputs.len());
+    let mut repeated_seen: HashSet<Symbol> = HashSet::new();
     let mut repeated: Vec<Symbol> = Vec::new();
     for n in inputs.iter() {
-        if seen.contains(n) {
-            if !repeated.contains(n) {
-                repeated.push(*n);
-            }
-        } else {
-            seen.push(*n);
+        if !seen.insert(*n) && repeated_seen.insert(*n) {
+            repeated.push(*n);
         }
     }
     if !repeated.is_empty() {
@@ -4680,51 +4728,37 @@ fn undeclared_placeholders(
     body: NodeId,
     declared: &[Symbol],
 ) -> Vec<(Symbol, NodeId)> {
-    fn walk(
-        module: &flatppl_core::Module,
-        id: NodeId,
-        declared: &[Symbol],
-        found: &mut Vec<(Symbol, NodeId)>,
-        visited: &mut std::collections::HashSet<NodeId>,
-    ) {
+    let mut found = Vec::new();
+    let mut visited = std::collections::HashSet::new();
+    let mut pending = vec![body];
+    while let Some(id) = pending.pop() {
         if !visited.insert(id) {
-            return;
+            continue;
         }
         match module.node(id) {
             Node::Ref(r) if r.ns == RefNs::Local => {
                 if !declared.contains(&r.name) && !found.iter().any(|(p, _)| *p == r.name) {
                     found.push((r.name, id));
                 }
-                return;
+                continue;
             }
             Node::Ref(r) if r.ns == RefNs::SelfMod => {
                 if let Some(b) = module.binding_by_name(r.name) {
-                    let rhs = module.binding(b).rhs;
-                    walk(module, rhs, declared, found, visited);
+                    pending.push(module.binding(b).rhs);
                 }
-                return;
+                continue;
             }
             Node::Call(c)
                 if c.inputs.is_some()
                     && matches!(c.head, CallHead::Builtin(h)
                         if matches!(module.resolve(h), "functionof" | "kernelof")) =>
             {
-                return;
+                continue;
             }
             _ => {}
         }
-        for child in module.node(id).children() {
-            walk(module, child, declared, found, visited);
-        }
+        pending.extend(module.node(id).children().into_iter().rev());
     }
-    let mut found = Vec::new();
-    walk(
-        module,
-        body,
-        declared,
-        &mut found,
-        &mut std::collections::HashSet::new(),
-    );
     found
 }
 
@@ -4906,6 +4940,8 @@ enum CatShape {
     Cat(Type),
     /// Genuinely different recognized shape classes (a static error, spec §06).
     Mixed,
+    /// Record components repeat a field name across their concatenated fields.
+    DuplicateField(Symbol),
     /// A component is deferred or an unclassifiable shape (higher-rank array,
     /// exotic type) — defer quietly, no error.
     Unresolved,
@@ -4992,10 +5028,16 @@ fn cat_shape(types: &[Type]) -> CatShape {
         // all records → a merged record (component fields assumed distinct)
         _ => {
             let mut fields: Vec<(Symbol, Type)> = Vec::new();
+            let mut seen = HashSet::new();
             for t in types {
                 let Type::Record(fs) = t else {
                     unreachable!("class 2 is a record")
                 };
+                for (name, _) in fs {
+                    if !seen.insert(*name) {
+                        return CatShape::DuplicateField(*name);
+                    }
+                }
                 fields.extend(fs.iter().cloned());
             }
             CatShape::Cat(Type::Record(fields.into()))
@@ -5008,7 +5050,7 @@ fn cat_shape(types: &[Type]) -> CatShape {
 fn cat_compose(types: &[Type]) -> Type {
     match cat_shape(types) {
         CatShape::Cat(t) => t,
-        CatShape::Mixed | CatShape::Unresolved => Type::Deferred,
+        CatShape::Mixed | CatShape::DuplicateField(_) | CatShape::Unresolved => Type::Deferred,
     }
 }
 
@@ -5033,6 +5075,16 @@ fn cat_or_diagnose(
                 ),
             ));
             Type::Deferred
+        }
+        CatShape::DuplicateField(field) => {
+            let field = inf.module.resolve(field);
+            inf.diags.push(crate::Diagnostic::error_at(
+                anchor,
+                format!(
+                    "{what} record components repeat field `{field}`: spec §07 requires distinct field names when concatenating records"
+                ),
+            ));
+            Type::Failed(format!("{what} repeats record field `{field}`").into())
         }
         CatShape::Unresolved => Type::Deferred,
     }
@@ -5151,7 +5203,7 @@ fn user_arity_check(
     // argument exactly as a builtin call does. #78's single-input carve-out turns
     // on a DOCUMENTED DOMAIN, which a user callable does not have — its boundary
     // declares parameters, not domains — so a user call is never exempt.
-    let reading = arg_reading(args, named, false)?;
+    let reading = arg_reading(inf, args, named, false)?;
     let got = reading.count;
     let who = match inf.module.node(callee) {
         Node::Ref(r) if r.ns == RefNs::SelfMod => {
@@ -5214,7 +5266,7 @@ fn module_member_arity_check(
     named: &[NamedInfo],
 ) -> Option<Type> {
     let arity = crate::catalogue::sig_arity(sig)?;
-    let reading = arg_reading(args, named, false)?;
+    let reading = arg_reading(inf, args, named, false)?;
     let got = reading.count;
     let who = match inf.module.node(callee) {
         Node::Ref(r) => match r.ns {
@@ -6189,7 +6241,7 @@ fn arity_check(
 ) -> Option<Type> {
     let cat = crate::catalogue::builtin();
     let arity = cat.base_arity(name)?;
-    let reading = arg_reading(args, named, cat.base_takes_aggregate_whole(name))?;
+    let reading = arg_reading(inf, args, named, cat.base_takes_aggregate_whole(name))?;
     let got = reading.count;
     // A splat onto a row whose variadic inputs are UNNAMED can never bind, whatever the
     // count, so this precedes the arity comparison: with a fitting column count the arity
@@ -6268,12 +6320,90 @@ fn constructor_check(
         "cartprod" | "jointchain" if !args.is_empty() && !named.is_empty() => {
             Some(refuse_mixed_product_spelling(inf, id, name))
         }
-        "record" | "table" | "joint" | "jointchain" | "cartprod" => {
+        "record" => {
+            if let Some((field, node, _, _)) = named
+                .iter()
+                .find(|(_, _, ty, _)| matches!(ty, Type::Module))
+            {
+                inf.diags.push(crate::Diagnostic::error_at(
+                    *node,
+                    format!(
+                        "record field `{}` is a module, but modules are namespaces rather than values and cannot be stored in a record (spec §11 Type categories)",
+                        inf.module.resolve(*field)
+                    ),
+                ));
+                Some(Type::Failed("module-valued record field".into()))
+            } else {
+                refuse_duplicate_field_names(inf, name, named)
+            }
+        }
+        "table" | "joint" | "jointchain" | "cartprod" => {
             refuse_duplicate_field_names(inf, name, named)
         }
         "vector" => refuse_mixed_string_array(inf, args),
+        "cat" => refuse_cat_string_vectors(inf, id, args),
         _ => None,
     }
+}
+
+/// Reject concatenation between a written string-selector vector and a value
+/// vector. Their element `Type`s alone cannot distinguish strings from `%any`.
+fn refuse_cat_string_vectors(
+    inf: &mut Inferencer<'_, '_>,
+    id: NodeId,
+    args: &[ArgInfo],
+) -> Option<Type> {
+    let kinds: Vec<(NodeId, bool)> = args
+        .iter()
+        .filter_map(|(node, _, _)| written_vector_is_string(inf, *node).map(|k| (*node, k)))
+        .collect();
+    if !kinds.iter().any(|(_, strings)| *strings) || !kinds.iter().any(|(_, strings)| !*strings) {
+        return None;
+    }
+    inf.diags.push(crate::Diagnostic::error_at(
+        id,
+        "`cat` cannot concatenate a string selector list with a value vector: spec §07 admits vectors with one element domain, and strings are not scalar values"
+            .to_string(),
+    ));
+    Some(Type::Failed(
+        "cat mixes a string selector list and a value vector".into(),
+    ))
+}
+
+/// Classify a written vector as all strings or all known values.
+fn written_vector_is_string(inf: &Inferencer<'_, '_>, node: NodeId) -> Option<bool> {
+    let mut node = node;
+    for _ in 0..64 {
+        match inf.module.node(node) {
+            Node::Ref(r) if r.ns == RefNs::SelfMod => {
+                let binding = inf.module.binding_by_name(r.name)?;
+                node = inf.module.binding(binding).rhs;
+            }
+            Node::Call(call) if matches!(call.head, CallHead::Builtin(head) if inf.module.resolve(head) == "vector") =>
+            {
+                let mut kind = None;
+                for &child in call.args.iter() {
+                    let child_kind = if written_string(inf, child).is_some() {
+                        true
+                    } else if matches!(
+                        inf.lookup_type(child),
+                        Some(Type::Scalar(_) | Type::Array { .. } | Type::TVector { .. })
+                    ) {
+                        false
+                    } else {
+                        return None;
+                    };
+                    if kind.is_some_and(|prior| prior != child_kind) {
+                        return None;
+                    }
+                    kind = Some(child_kind);
+                }
+                return kind;
+            }
+            _ => return None,
+        }
+    }
+    None
 }
 
 /// Reject a set or measure product written with both positional and keyword
@@ -6324,10 +6454,10 @@ fn refuse_duplicate_field_names(
     name: &str,
     named: &[NamedInfo],
 ) -> Option<Type> {
-    let mut seen: Vec<Symbol> = Vec::with_capacity(named.len());
+    let mut seen: HashSet<Symbol> = HashSet::with_capacity(named.len());
     let mut first_dup = None;
     for (sym, node, _, _) in named {
-        if seen.contains(sym) {
+        if !seen.insert(*sym) {
             let field = inf.module.resolve(*sym).to_string();
             inf.diags.push(crate::Diagnostic::error_at(
                 *node,
@@ -6340,7 +6470,6 @@ fn refuse_duplicate_field_names(
             first_dup = first_dup.or(Some(field));
             continue;
         }
-        seen.push(*sym);
     }
     first_dup.map(|f| Type::Failed(format!("{name} declares `{f}` twice").into()))
 }
@@ -7243,8 +7372,10 @@ struct ArgReading {
 /// `base_arity` lookup for a head the catalogue declares no parameter list for,
 /// which is every special operation.
 ///
-/// When the sole argument's type is still open, the reading is not knowable.
+/// When the sole argument's type is still open, the reading is not knowable
+/// unless the node is structurally a scalar literal, which can never splat.
 fn arg_reading(
+    inf: &Inferencer<'_, '_>,
     args: &[ArgInfo],
     named: &[NamedInfo],
     takes_aggregate_whole: bool,
@@ -7260,6 +7391,11 @@ fn arg_reading(
     let fields = match &args[0].1 {
         Type::Record(fields) => fields.len(),
         Type::Table { columns, .. } => columns.len(),
+        Type::Deferred | Type::Var(_) | Type::Any | Type::Failed(_)
+            if matches!(inf.module.node(args[0].0), Node::Lit(_)) =>
+        {
+            return plain_reading;
+        }
         Type::Deferred | Type::Var(_) | Type::Any | Type::Failed(_) => return None,
         // Not a record or table: an ordinary sole positional argument.
         _ => return plain_reading,

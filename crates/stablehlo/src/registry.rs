@@ -16,6 +16,9 @@ use crate::emitter::Emitter;
 use crate::mlir::{ElemKind, MlirTy, Value};
 use crate::refuse::EmitError;
 
+/// Cap source-driven emit-time expansion before allocating or generating IR.
+const MAX_STATIC_UNROLL: u64 = 4096;
+
 /// `fn(emitter, params, variate) -> log f(variate; params)` — a
 /// distribution's closed-form log-density/-mass builder (§08/§09/§12/§13).
 pub type LogpdfBuilder = fn(&mut Emitter, &Params, &Value) -> Result<Value, EmitError>;
@@ -3597,6 +3600,15 @@ fn dirichlet_sample(e: &mut Emitter, p: &Params) -> Result<Value, EmitError> {
             ));
         }
     };
+
+    if d > MAX_STATIC_UNROLL {
+        return Err(EmitError::at(
+            alpha_id,
+            format!(
+                "Dirichlet sample length {d} exceeds the {MAX_STATIC_UNROLL}-element static-unroll resource guard"
+            ),
+        ));
+    }
 
     let one = e.scalar(1.0);
     // Draw g_j ~ Gamma(alpha_j, 1) per component. `draw_gamma` reads the

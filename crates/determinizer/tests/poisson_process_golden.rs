@@ -203,3 +203,17 @@ lp = logdensityof(lawof(record(a = a)), record(a = 2.0))";
         "is_flatpdl failed:\n{text}"
     );
 }
+
+// A source-controlled event count must not allocate or synthesize billions of
+// density terms. Determinization refuses before the static unroll.
+#[test]
+fn poisson_process_caps_static_unroll() {
+    let src = "\
+events = elementof(cartpow(reals, 4294967295))
+lp = logdensityof(PoissonProcess(intensity = Normal(mu = 0.0, sigma = 1.0)), events)
+inputs = (events)
+outputs = (lp)";
+    let err = determinize(&parse_infer(src)).expect_err("the event unroll must be bounded");
+    assert_eq!(err.construct, "PoissonProcess", "{err:?}");
+    assert!(err.reason.contains("resource guard"), "{err:?}");
+}

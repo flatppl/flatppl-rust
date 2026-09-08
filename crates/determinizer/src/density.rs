@@ -151,6 +151,9 @@ use flatppl_core::{
 };
 use flatppl_infer::ModuleBundle;
 
+/// Cap source-driven determinization expansion before allocating new nodes.
+const MAX_STATIC_UNROLL: u32 = 4096;
+
 // ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
@@ -6621,6 +6624,16 @@ fn lower_poisson_process(m: &mut Module, node: NodeId, v: NodeId) -> Result<Node
              supported",
         )
     })?;
+
+    if n > MAX_STATIC_UNROLL {
+        return Err(refuse(
+            node,
+            m,
+            &format!(
+                "PoissonProcess event count {n} exceeds the {MAX_STATIC_UNROLL}-event static-unroll resource guard"
+            ),
+        ));
+    }
 
     let total_mass = closed_form_totalmass(m, intensity).ok_or_else(|| {
         refuse(

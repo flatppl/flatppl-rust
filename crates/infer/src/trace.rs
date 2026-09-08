@@ -35,6 +35,7 @@ pub(crate) struct Inferencer<'m, 's> {
     seeds: HashMap<NodeId, (Type, Phase, ValueSet)>,
     /// Bindings on the active resolution path (cycle detection).
     in_progress: Vec<BindingId>,
+    active_bindings: HashSet<BindingId>,
     /// Ops already reported as catalogue gaps (one note per op).
     noted_gaps: HashSet<Symbol>,
     /// For a cross-module callable reference (`helpers.obs_kernel`), the
@@ -78,17 +79,17 @@ pub(crate) struct Inferencer<'m, 's> {
 /// (`builtin_logdensityof(Normal, record(…), CrystalBall)` and friends lowered at
 /// exit 0). Only the tag slot is a tag.
 fn collect_kernel_tag_nodes(m: &Module) -> HashSet<NodeId> {
-    fn walk(m: &Module, id: NodeId, out: &mut HashSet<NodeId>) {
+    let mut out = HashSet::new();
+    let mut visited = HashSet::new();
+    let mut pending: Vec<NodeId> = m.bindings().map(|(_, binding)| binding.rhs).collect();
+    while let Some(id) = pending.pop() {
+        if !visited.insert(id) {
+            continue;
+        }
         if let Node::Call(c) = m.node(id) {
             out.extend(crate::builtins::kernel_tag_node(m, c));
         }
-        for child in m.node(id).children() {
-            walk(m, child, out);
-        }
-    }
-    let mut out = HashSet::new();
-    for (_bid, b) in m.bindings() {
-        walk(m, b.rhs, &mut out);
+        pending.extend(m.node(id).children());
     }
     out
 }
@@ -106,6 +107,7 @@ impl<'m, 's> Inferencer<'m, 's> {
             vsets: HashMap::new(),
             seeds: HashMap::new(),
             in_progress: Vec::new(),
+            active_bindings: HashSet::new(),
             noted_gaps: HashSet::new(),
             module_callable_results: HashMap::new(),
             module_catalogue_refs: HashMap::new(),
@@ -137,6 +139,7 @@ impl<'m, 's> Inferencer<'m, 's> {
             vsets: HashMap::new(),
             seeds: seed_map,
             in_progress: Vec::new(),
+            active_bindings: HashSet::new(),
             noted_gaps: HashSet::new(),
             module_callable_results: HashMap::new(),
             module_catalogue_refs: HashMap::new(),
@@ -251,7 +254,7 @@ impl<'m, 's> Inferencer<'m, 's> {
         )
     }
 
-    /// Depth-first ancestor walk for [`collect_auto_inputs`], following `self`
+    /// Iterative ancestor walk for [`collect_auto_inputs`], following `self`
     /// references across binding boundaries and recording each `elementof`
     /// leaf binding's name once (`leaves`, keyed by name → sorted + deduped);
     /// sets `cross_module` if it reaches a parametric loaded-module reference.
@@ -262,59 +265,62 @@ impl<'m, 's> Inferencer<'m, 's> {
         cross_module: &mut bool,
         visited: &mut HashSet<NodeId>,
     ) {
-        if !visited.insert(id) {
-            return;
-        }
-        // A fixed-phase subgraph has no `elementof` ancestor (spec §04) — prune.
-        // (Absent phase ⇒ don't prune: soundly does extra work, never skips.)
-        if self.phases.get(&id) == Some(&Phase::Fixed) {
-            return;
-        }
-        // Gather the children to recurse into, releasing the node borrow first.
-        let children: Vec<NodeId> = match self.module.node(id) {
-            Node::Ref(r) if r.ns == RefNs::SelfMod => match self.module.binding_by_name(r.name) {
-                Some(b) => {
-                    let rhs = self.module.binding(b).rhs;
-                    if is_elementof(self.module, rhs) {
-                        // A parametric leaf: record the binding (by name); do not
-                        // descend into the `elementof` set argument.
-                        leaves.insert(
-                            self.module.resolve(r.name).to_string(),
-                            Ref {
-                                ns: RefNs::SelfMod,
-                                name: r.name,
-                            },
-                        );
-                        Vec::new()
-                    } else {
-                        vec![rhs]
+        let mut pending = vec![id];
+        while let Some(id) = pending.pop() {
+            if !visited.insert(id) {
+                continue;
+            }
+            // A fixed-phase subgraph has no `elementof` ancestor (spec §04) — prune.
+            // (Absent phase ⇒ don't prune: soundly does extra work, never skips.)
+            if self.phases.get(&id) == Some(&Phase::Fixed) {
+                continue;
+            }
+            // Cached reference chains can be arbitrarily deep even when inference
+            // itself never recurses. Keep their traversal on the heap.
+            let children: Vec<NodeId> = match self.module.node(id) {
+                Node::Ref(r) if r.ns == RefNs::SelfMod => match self.module.binding_by_name(r.name)
+                {
+                    Some(b) => {
+                        let rhs = self.module.binding(b).rhs;
+                        if is_elementof(self.module, rhs) {
+                            // A parametric leaf: record the binding (by name); do not
+                            // descend into the `elementof` set argument.
+                            leaves.insert(
+                                self.module.resolve(r.name).to_string(),
+                                Ref {
+                                    ns: RefNs::SelfMod,
+                                    name: r.name,
+                                },
+                            );
+                            Vec::new()
+                        } else {
+                            vec![rhs]
+                        }
                     }
+                    None => Vec::new(),
+                },
+                // A parametric cross-module dependency. Reification is module-local
+                // (spec §04): such a value cannot become a reified input — flag it so
+                // the caller errors. (A FIXED cross-module ref was pruned above, so
+                // reaching here means the referenced binding is parameterized.)
+                Node::Ref(r) if matches!(r.ns, RefNs::Module(_)) => {
+                    *cross_module = true;
+                    Vec::new()
                 }
-                None => Vec::new(),
-            },
-            // A parametric cross-module dependency. Reification is module-local
-            // (spec §04): such a value cannot become a reified input — flag it so
-            // the caller errors. (A FIXED cross-module ref was pruned above, so
-            // reaching here means the referenced binding is parameterized.)
-            Node::Ref(r) if matches!(r.ns, RefNs::Module(_)) => {
-                *cross_module = true;
-                Vec::new()
-            }
-            Node::Call(call) => {
-                let mut c = Vec::new();
-                if let CallHead::User(callee) = call.head {
-                    c.push(callee);
+                Node::Call(call) => {
+                    let mut c = Vec::new();
+                    if let CallHead::User(callee) = call.head {
+                        c.push(callee);
+                    }
+                    c.extend(call.args.iter().copied());
+                    c.extend(call.named.iter().map(|n| n.value));
+                    c
                 }
-                c.extend(call.args.iter().copied());
-                c.extend(call.named.iter().map(|n| n.value));
-                c
-            }
-            // Lit / Const / Hole / Axis / Ref(%local) carry no parametric leaves
-            // (a `%local` placeholder is a Spec-boundary input, never auto).
-            _ => Vec::new(),
-        };
-        for child in children {
-            self.walk_auto(child, leaves, cross_module, visited);
+                // Lit / Const / Hole / Axis / Ref(%local) carry no parametric leaves
+                // (a `%local` placeholder is a Spec-boundary input, never auto).
+                _ => Vec::new(),
+            };
+            pending.extend(children.into_iter().rev());
         }
     }
 
@@ -324,7 +330,7 @@ impl<'m, 's> Inferencer<'m, 's> {
         if let (Some(ty), Some(phase)) = (self.tys.get(&rhs), self.phases.get(&rhs)) {
             return (ty.clone(), *phase);
         }
-        if self.in_progress.contains(&id) {
+        if !self.active_bindings.insert(id) {
             let path: Vec<&str> = self
                 .in_progress
                 .iter()
@@ -346,6 +352,7 @@ impl<'m, 's> Inferencer<'m, 's> {
         self.in_progress.push(id);
         let result = self.infer_node(rhs);
         self.in_progress.pop();
+        self.active_bindings.remove(&id);
         result
     }
 
@@ -367,6 +374,28 @@ impl<'m, 's> Inferencer<'m, 's> {
         if let (Some(ty), Some(phase)) = (self.tys.get(&id), self.phases.get(&id)) {
             return (ty.clone(), *phase);
         }
+        // Readers bound syntax nesting, but shallow references can form an
+        // arbitrarily deep dependency graph. Share the trace budget with child
+        // modules and restore it before visiting siblings. Memo hits cost no depth.
+        let depth = self.session.trace_depth.get();
+        let next = match depth.deeper("inference graph") {
+            Ok(next) => next,
+            Err(error) => {
+                let message = error.to_string();
+                self.diags.push(Diagnostic::error_at(id, &message));
+                let ty = Type::Failed(message.into());
+                self.tys.insert(id, ty.clone());
+                self.phases.insert(id, Phase::Fixed);
+                return (ty, Phase::Fixed);
+            }
+        };
+        self.session.trace_depth.set(next);
+        let result = self.infer_node_inner(id);
+        self.session.trace_depth.set(depth);
+        result
+    }
+
+    fn infer_node_inner(&mut self, id: NodeId) -> (Type, Phase) {
         // Clone the node to release the module borrow during recursion; nodes
         // are small (boxed slices of ids).
         let node = self.module.node(id).clone();

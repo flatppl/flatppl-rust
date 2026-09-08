@@ -819,6 +819,11 @@ fn aggregate_resolves_exact_einsum_dims() {
         out.contains("(%meta ((%scalar real) %fixed reals) (aggregate"),
         "aggregate over no axes should be a real scalar, got:\n{out}"
     );
+    let out = ir("A = [1, 2, 3]\ns = aggregate(sum, [], A[.i])");
+    assert!(
+        out.contains("(%meta ((%scalar integer) %fixed integers) (aggregate"),
+        "sum aggregate over integers should be an integer scalar, got:\n{out}"
+    );
     // var over axis .j of A:(2,3) → length-3 vector (.j ← A dim1); metricsum
     // shares the rule.
     let out = ir("A = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]\nV = aggregate(var, [.j], A[.i, .j])");

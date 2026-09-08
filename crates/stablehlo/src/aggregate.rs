@@ -57,6 +57,7 @@ use flatppl_core::{CallHead, Node, NodeId, Scalar, Symbol};
 
 use crate::emitter::{AxisReduce, Emitter, elem_rank};
 use crate::mlir::{ElemKind, MlirTy, Value};
+use crate::norms::checked_shape_product;
 use crate::refuse::EmitError;
 
 /// The eligible `f_reduction`s this module LOWERS.
@@ -149,12 +150,6 @@ impl Frame {
 
     fn pos(&self, axis: Symbol) -> Option<usize> {
         self.axes.iter().position(|&a| a == axis)
-    }
-
-    /// The number of body evaluations each output cell reduces over — the
-    /// product of the reduced axes' lengths (`1` when nothing is reduced).
-    fn reduced_count(&self) -> u64 {
-        self.lens[self.n_out..].iter().product()
     }
 }
 
@@ -727,7 +722,11 @@ fn reduce(
     frame: &Frame,
 ) -> Result<Value, EmitError> {
     let n_red = frame.lens.len() - frame.n_out;
-    let count = frame.reduced_count();
+    let count = if reduction.is_moment() {
+        checked_shape_product(id, "aggregate", &frame.lens[frame.n_out..])?
+    } else {
+        0
+    };
 
     // The result must carry the element kind inference recorded for this node
     // (`Real` whenever the body's own type is `%deferred`, which is the common

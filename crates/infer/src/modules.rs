@@ -3,7 +3,7 @@
 //! memo, and cross-module cycle detection. Single-module inference lives in
 //! `trace.rs`; everything that crosses a module boundary lives here.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -364,6 +364,8 @@ struct LoadDirective {
 /// `Inferencer` over a cloned dependency.
 pub(crate) struct InferSession<'b> {
     pub(crate) bundle: &'b ModuleBundle,
+    /// Active trace depth spans loaded modules as well as local references.
+    pub(crate) trace_depth: Cell<flatppl_core::depth::Depth>,
     /// Merged catalogue set (built-in + host-supplied external catalogues).
     /// `standard_module` resolution consults this instead of `builtin()` directly
     /// so that host-supplied external catalogues are visible.
@@ -385,6 +387,7 @@ impl<'b> InferSession<'b> {
     pub(crate) fn new(bundle: &'b ModuleBundle) -> Self {
         InferSession {
             bundle,
+            trace_depth: Cell::default(),
             catalogues: CatalogueSet::builtin_only(),
             memo: RefCell::new(HashMap::new()),
             stack: RefCell::new(Vec::new()),
@@ -401,6 +404,7 @@ impl<'b> InferSession<'b> {
     ) -> Self {
         InferSession {
             bundle,
+            trace_depth: Cell::default(),
             catalogues: CatalogueSet::with_external(external),
             memo: RefCell::new(HashMap::new()),
             stack: RefCell::new(Vec::new()),

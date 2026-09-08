@@ -55,6 +55,16 @@ fn nested_record_field_chains() {
     );
 }
 
+#[test]
+fn a_record_cannot_contain_a_module() {
+    let errs = errors("m = standard_module(\"special-functions\", \"0.1\"); x = record(m = m)");
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("module") && e.contains("record field")),
+        "a module is not a value that a record can contain: {errs:?}"
+    );
+}
+
 // ── Nested tuples (tuple-in-tuple) ───────────────────────────────────────────
 
 /// A tuple may contain another tuple (spec §04 — tuples nest): the type nests.
@@ -382,5 +392,24 @@ fn cat_op_uses_the_shared_shape_rule() {
     assert!(
         errs.iter().any(|m| m.contains("shape class")),
         "cat of a scalar and a vector must be a static error; got: {errs:?}"
+    );
+}
+
+#[test]
+fn cat_rejects_duplicate_record_fields_and_mixed_string_vectors() {
+    for src in [
+        "x = cat(record(a = 1), record(a = 2))",
+        "x = cat([1], [\"s\"])",
+        "values = [1]\nnames = [\"s\"]\nx = cat(values, names)",
+    ] {
+        assert!(!errors(src).is_empty(), "must reject:\n{src}");
+    }
+    assert!(
+        errors("x = cat(record(a = 1), record(b = 2))").is_empty(),
+        "distinct record fields remain valid"
+    );
+    assert!(
+        errors("x = cat([\"a\"], [\"b\"])").is_empty(),
+        "homogeneous string selector lists remain valid"
     );
 }

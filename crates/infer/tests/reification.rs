@@ -147,6 +147,20 @@ model = functionof(add(b, b))
     }
 }
 
+#[test]
+fn auto_inputs_follow_long_cached_alias_chains() {
+    let mut src = String::from("x0 = elementof(reals)\n");
+    for i in 1..=12000 {
+        src.push_str(&format!("x{i} = x{}\n", i - 1));
+    }
+    src.push_str("model = functionof(x12000)\n");
+    let module = infer_src(&src, Level::Type);
+    match binding_ty(&module, "model") {
+        Some(Type::Function { inputs }) => assert_eq!(input_names(&module, inputs), ["x0"]),
+        other => panic!("model should be a Function; got {other:?}"),
+    }
+}
+
 /// The walk descends through a *user-callable application* in the body — the
 /// callee is followed and the argument's `elementof` leaf is discovered — so a
 /// reification over a body that calls a helper binding still types its inputs.

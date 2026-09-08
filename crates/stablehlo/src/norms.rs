@@ -238,7 +238,6 @@ pub(crate) fn lower_reduction(
         }
     };
     let rank = dims.len();
-    let n: u64 = dims.iter().map(|d| d.expect("checked above")).product();
 
     // §03 "Bool": "`false` is promoted to zero and `true` to one, permitting
     // expressions such as `true + true`, `3 * false`, and `sum(mask)` to count
@@ -257,6 +256,12 @@ pub(crate) fn lower_reduction(
     if !which.is_moment() {
         return e.reduce_trailing_axes(id, AxisReduce::Prod, &xs, rank);
     }
+
+    let static_dims: Vec<u64> = dims
+        .iter()
+        .map(|d| d.expect("static shape checked above"))
+        .collect();
+    let n = checked_shape_product(id, head, &static_dims)?;
 
     if n == 0 {
         return Err(EmitError::at(
@@ -301,6 +306,27 @@ pub(crate) fn lower_reduction(
         return Ok(var);
     }
     Ok(e.sqrt(&var))
+}
+
+/// Multiply static extents without wrapping a reduction denominator.
+pub(crate) fn checked_shape_product(
+    id: NodeId,
+    context: &str,
+    dims: &[u64],
+) -> Result<u64, EmitError> {
+    if dims.contains(&0) {
+        return Ok(0);
+    }
+    dims.iter().try_fold(1u64, |count, &dim| {
+        count.checked_mul(dim).ok_or_else(|| {
+            EmitError::at(
+                id,
+                format!(
+                    "{context}: the static shape's element count exceeds u64; refusing instead of wrapping the reduction denominator"
+                ),
+            )
+        })
+    })
 }
 
 // ---- §07 cumulative pair ------------------------------------------------------
