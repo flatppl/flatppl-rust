@@ -25,6 +25,97 @@ fn fmt_rewrites_in_place_and_is_idempotent() {
     assert_eq!(fs::read_to_string(&f).unwrap(), once);
 }
 
+#[cfg(unix)]
+#[test]
+fn fmt_write_failure_keeps_the_original_source() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = Scratch::new("atomic-failure");
+    let f = dir.path("m.flatppl");
+    let original = "x ~ Normal(mu=0.0,sigma=1.0)\n";
+    fs::write(&f, original).unwrap();
+
+    fs::set_permissions(f.parent().unwrap(), fs::Permissions::from_mode(0o555)).unwrap();
+    let output = bin().arg("fmt").arg(&f).output().unwrap();
+    fs::set_permissions(f.parent().unwrap(), fs::Permissions::from_mode(0o700)).unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(fs::read_to_string(&f).unwrap(), original);
+}
+
+#[cfg(unix)]
+#[test]
+fn fmt_atomic_replacement_preserves_mode_and_removes_its_temp() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = Scratch::new("atomic-mode");
+    let f = dir.path("m.flatppl");
+    fs::write(&f, "x ~ Normal(mu=0.0,sigma=1.0)\n").unwrap();
+    fs::set_permissions(&f, fs::Permissions::from_mode(0o640)).unwrap();
+
+    let output = bin().arg("fmt").arg(&f).output().unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::metadata(&f).unwrap().permissions().mode() & 0o777,
+        0o640
+    );
+    assert!(fs::read_to_string(&f).unwrap().contains("mu = 0.0"));
+    assert_eq!(fs::read_dir(f.parent().unwrap()).unwrap().count(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn fmt_atomic_replacement_preserves_a_final_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let dir = Scratch::new("atomic-symlink");
+    let target = dir.path("target.flatppl");
+    let link = dir.path("link.flatppl");
+    fs::write(&target, "x ~ Normal(mu=0.0,sigma=1.0)\n").unwrap();
+    symlink(&target, &link).unwrap();
+
+    let output = bin().arg("fmt").arg(&link).output().unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert!(fs::read_to_string(&target).unwrap().contains("mu = 0.0"));
+}
+
+#[cfg(unix)]
+#[test]
+fn fmt_atomic_replacement_does_not_bypass_a_read_only_source() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = Scratch::new("atomic-readonly");
+    let f = dir.path("m.flatppl");
+    let original = "x ~ Normal(mu=0.0,sigma=1.0)\n";
+    fs::write(&f, original).unwrap();
+    fs::set_permissions(&f, fs::Permissions::from_mode(0o444)).unwrap();
+
+    let output = bin().arg("fmt").arg(&f).output().unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(fs::read_to_string(&f).unwrap(), original);
+    assert_eq!(
+        fs::metadata(&f).unwrap().permissions().mode() & 0o777,
+        0o444
+    );
+}
+
 #[test]
 fn fmt_check_succeeds_on_canonical_and_fails_on_dirty() {
     let dir = Scratch::new("check");

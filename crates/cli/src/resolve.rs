@@ -11,6 +11,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashSet;
+#[cfg(feature = "prepare")]
 use std::io::IsTerminal;
 
 use flatppl_core::{CallHead, Idx, Module, Node, NodeId, Scalar};
@@ -85,11 +86,7 @@ impl CliResolver {
             return Ok(());
         }
         if !self.interactive {
-            return Err(Failure::Plain(format!(
-                "refusing to fetch untrusted URL(s) — non-interactive; set FLATPPL_TRUST to \
-                 allow, or pre-trust them:\n  {}",
-                need.join("\n  ")
-            )));
+            return Err(Failure::Plain(noninteractive_trust_message(&need)));
         }
         if prompt_trust(&need)? {
             let mut approved = self.approved.borrow_mut();
@@ -111,13 +108,16 @@ impl CliResolver {
     pub fn resolve_path(&self, loc: &Location) -> Result<std::path::PathBuf, Failure> {
         self.ensure_trusted(&[loc])?;
         match loc {
-            Location::Local(p) => {
-                if p.exists() {
-                    Ok(p.clone())
-                } else {
-                    Err(Failure::Plain(format!("file not found: {}", p.display())))
-                }
-            }
+            Location::Local(p) => match crate::require_regular_file(p) {
+                Ok(()) => Ok(p.clone()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(Failure::Plain(
+                    format!("file not found: {}", crate::terminal_path(p)),
+                )),
+                Err(error) => Err(Failure::Plain(format!(
+                    "invalid source `{}`: {error}",
+                    crate::terminal_path(p)
+                ))),
+            },
             Location::Remote(url) => {
                 let oracle = |u: &str| self.approved.borrow().contains(u);
                 let fetched = if self.update {
@@ -127,10 +127,11 @@ impl CliResolver {
                 };
                 fetched.map_err(|e| match e {
                     flatppl_fileaccess::Error::Offline(u) => Failure::Plain(format!(
-                        "`{u}` is not in the local cache — run `flatppl prepare <model>` to fetch \
-                         its dependencies"
+                        "`{}` is not in the local cache — run `flatppl prepare <model>` to fetch \
+                         its dependencies",
+                        terminal_url(&u)
                     )),
-                    other => Failure::Plain(other.to_string()),
+                    other => Failure::Plain(terminal_fileaccess_error(other)),
                 })
             }
         }
@@ -140,7 +141,7 @@ impl CliResolver {
     pub fn read_string(&self, loc: &Location) -> Result<String, Failure> {
         let path = self.resolve_path(loc)?;
         std::fs::read_to_string(&path)
-            .map_err(|e| Failure::Plain(format!("reading `{}`: {e}", loc.display())))
+            .map_err(|e| Failure::Plain(format!("reading `{}`: {e}", terminal_location(loc))))
     }
 
     /// Resolve a batch of locations to local files (fetching + caching URLs,
@@ -161,11 +162,7 @@ impl CliResolver {
 /// stdin. Returns `true` on `y`/`yes`.
 fn prompt_trust(urls: &[String]) -> Result<bool, Failure> {
     use std::io::Write;
-    eprintln!("flatppl: the following URL source(s) are not yet trusted:");
-    for url in urls {
-        eprintln!("  {url}");
-    }
-    eprint!("Fetch and trust them? [y/N]: ");
+    eprint!("{}", interactive_trust_message(urls));
     let _ = std::io::stderr().flush();
     let mut line = String::new();
     std::io::stdin()
@@ -175,6 +172,114 @@ fn prompt_trust(urls: &[String]) -> Result<bool, Failure> {
         line.trim().to_ascii_lowercase().as_str(),
         "y" | "yes"
     ))
+}
+
+/// Render untrusted URL text without allowing it to control terminal layout.
+/// URL identity and fetch semantics continue to use the original string.
+fn terminal_url(url: &str) -> String {
+    terminal_message(url)
+}
+
+/// Render a diagnostic message without allowing embedded source URLs or text
+/// to disclose authority userinfo or control terminal layout. The inference
+/// engine and module bundle retain their original strings.
+pub fn terminal_message(message: &str) -> String {
+    let display = redact_url_userinfo(message);
+    // `escape_debug` also exposes bidi, zero-width, and other Unicode format
+    // characters while preserving ordinary printable Unicode.
+    crate::terminal_text(&display)
+}
+
+fn terminal_location(location: &Location) -> String {
+    match location {
+        Location::Local(path) => crate::terminal_path(path),
+        Location::Remote(url) => terminal_url(url),
+    }
+}
+
+/// A diagnostic label derived from a source location. Bundle and cache
+/// identities continue to use the original location; only this displayed copy
+/// drops remote authority userinfo. Control escaping remains centralized in
+/// the diagnostic renderer's `terminal_path` call.
+fn diagnostic_path(location: &Location) -> std::path::PathBuf {
+    match location {
+        Location::Local(path) => path.clone(),
+        Location::Remote(url) => std::path::PathBuf::from(redact_url_userinfo(url).as_ref()),
+    }
+}
+
+/// Redact authority userinfo in a display-only copy. The last literal `@`
+/// before the path/query/fragment is the delimiter, so encoded delimiters stay
+/// inside the redacted span and `@` elsewhere in the URL is not hidden.
+fn redact_url_userinfo(text: &str) -> std::borrow::Cow<'_, str> {
+    let mut result: Option<String> = None;
+    let mut copied_through = 0;
+    let mut search_from = 0;
+    while let Some(relative_scheme_end) = text[search_from..].find("://") {
+        let scheme_end = search_from + relative_scheme_end;
+        let authority_start = scheme_end + 3;
+        let authority_end = text[authority_start..]
+            .find(|c: char| matches!(c, '/' | '?' | '#') || c.is_whitespace())
+            .map_or(text.len(), |i| authority_start + i);
+        let authority = &text[authority_start..authority_end];
+        if let Some(at) = authority.rfind('@') {
+            let host_start = authority_start + at + 1;
+            let output = result.get_or_insert_with(|| String::with_capacity(text.len()));
+            output.push_str(&text[copied_through..authority_start]);
+            output.push_str("<redacted>@");
+            copied_through = host_start;
+        }
+        if authority_end == text.len() {
+            break;
+        }
+        search_from = authority_end;
+    }
+    let Some(mut result) = result else {
+        return text.into();
+    };
+    result.push_str(&text[copied_through..]);
+    result.into()
+}
+
+fn terminal_url_list(urls: &[String]) -> String {
+    urls.iter()
+        .map(|url| terminal_url(url))
+        .collect::<Vec<_>>()
+        .join("\n  ")
+}
+
+fn noninteractive_trust_message(urls: &[String]) -> String {
+    format!(
+        "refusing to fetch untrusted URL(s) — non-interactive; set FLATPPL_TRUST to \
+         allow, or pre-trust them:\n  {}",
+        terminal_url_list(urls)
+    )
+}
+
+fn interactive_trust_message(urls: &[String]) -> String {
+    format!(
+        "flatppl: the following URL source(s) are not yet trusted:\n  {}\n\
+         Fetch and trust them? [y/N]: ",
+        terminal_url_list(urls)
+    )
+}
+
+fn terminal_fileaccess_error(error: flatppl_fileaccess::Error) -> String {
+    match error {
+        flatppl_fileaccess::Error::NotFound(path) => {
+            format!("file not found: {}", crate::terminal_path(&path))
+        }
+        flatppl_fileaccess::Error::Untrusted(url) => format!(
+            "`{}` is not trusted — approve it (or set FLATPPL_TRUST) to fetch it",
+            terminal_url(&url)
+        ),
+        flatppl_fileaccess::Error::Fetch { url, reason } => format!(
+            "failed to fetch `{}`: {}",
+            terminal_url(&url),
+            terminal_url(&reason)
+        ),
+        other => other.to_string(),
+    }
 }
 
 /// The string literal `source` of a `load_module`/`load_data` call: the first
@@ -297,7 +402,7 @@ pub fn build_bundle(
                     let module =
                         crate::read_module(format, &source).map_err(|(message, line, span)| {
                             Failure::Diagnostic {
-                                path: std::path::PathBuf::from(loc.display()),
+                                path: diagnostic_path(loc),
                                 source: source.clone(),
                                 message,
                                 line,
@@ -357,7 +462,7 @@ pub fn fetch_graph(files: &[Location], resolver: &CliResolver) -> Result<(), Fai
             let format = crate::Format::from_location(loc).map_err(Failure::Plain)?;
             let module = crate::read_module(format, &source).map_err(|(message, line, span)| {
                 Failure::Diagnostic {
-                    path: std::path::PathBuf::from(loc.display()),
+                    path: diagnostic_path(loc),
                     source: source.clone(),
                     message,
                     line,
@@ -376,6 +481,75 @@ pub fn fetch_graph(files: &[Location], resolver: &CliResolver) -> Result<(), Fai
         level = next;
     }
     resolver.resolve_all(&data)
+}
+
+#[cfg(test)]
+mod terminal_output_tests {
+    use super::*;
+
+    fn control_urls() -> Vec<String> {
+        vec![
+            "https://user:secret@example.test/\n\r\t\0\u{1b}\u{202e}\u{200b}\u{ad}/café"
+                .to_string(),
+            "https://user%3Aname:p%40ss@example.test/data?email=a%40b".to_string(),
+        ]
+    }
+
+    const ESCAPED_URL: &str =
+        "https://<redacted>@example.test/\\n\\r\\t\\0\\u{1b}\\u{202e}\\u{200b}\\u{ad}/café";
+    const ENCODED_URL: &str = "https://<redacted>@example.test/data?email=a%40b";
+
+    #[test]
+    fn interactive_trust_output_escapes_url_controls() {
+        assert_eq!(
+            interactive_trust_message(&control_urls()),
+            format!(
+                "flatppl: the following URL source(s) are not yet trusted:\n  \
+                 {ESCAPED_URL}\n  {ENCODED_URL}\nFetch and trust them? [y/N]: "
+            )
+        );
+    }
+
+    #[test]
+    fn noninteractive_trust_output_escapes_url_controls() {
+        assert_eq!(
+            noninteractive_trust_message(&control_urls()),
+            format!(
+                "refusing to fetch untrusted URL(s) — non-interactive; set FLATPPL_TRUST to \
+                 allow, or pre-trust them:\n  {ESCAPED_URL}\n  {ENCODED_URL}"
+            )
+        );
+    }
+
+    #[test]
+    fn fileaccess_error_output_escapes_url_controls() {
+        let error = flatppl_fileaccess::Error::Fetch {
+            url: "https://user%3Aname:p%40ss@example.test/\n\u{1b}/café".to_string(),
+            reason: "invalid\ruri".to_string(),
+        };
+        assert_eq!(
+            terminal_fileaccess_error(error),
+            "failed to fetch `https://<redacted>@example.test/\\n\\u{1b}/café`: invalid\\ruri"
+        );
+    }
+
+    #[test]
+    fn at_signs_outside_authority_userinfo_remain_visible() {
+        let url = "https://example.test/path@name?email=user@example.test";
+        assert_eq!(terminal_url(url), url);
+    }
+
+    #[test]
+    fn diagnostic_messages_redact_each_url_and_escape_controls_once() {
+        let message = "from https://safe.test/a to \
+                       https://first:p%40ss@one.test/path@name and \
+                       http://second:secret@two.test?q=a@b\nfailed";
+        assert_eq!(
+            terminal_message(message),
+            "from https://safe.test/a to https://<redacted>@one.test/path@name and \
+             http://<redacted>@two.test?q=a@b\\nfailed"
+        );
+    }
 }
 
 #[cfg(all(test, feature = "infer"))]
@@ -459,6 +633,55 @@ mod tests {
 #[cfg(all(test, feature = "prepare"))]
 mod fetch_tests {
     use super::*;
+
+    struct InvalidRemote;
+
+    impl Fetcher for InvalidRemote {
+        fn fetch(&self, url: &str) -> Result<flatppl_fileaccess::Fetched, String> {
+            Ok(flatppl_fileaccess::Fetched {
+                bytes: b"@(".to_vec(),
+                resolved_url: url.to_string(),
+                content_type: Some("text/plain".to_string()),
+                etag: None,
+                last_modified: None,
+            })
+        }
+    }
+
+    #[test]
+    fn remote_parse_diagnostic_redacts_url_userinfo() {
+        let dir =
+            std::env::temp_dir().join(format!("flatppl-remote-diagnostic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let url = "http://user:p%40ss@host.test/bad@name.flatppl?email=a@b";
+        let model = dir.join("model.flatppl");
+        std::fs::write(&model, format!("bad = load_module(\"{url}\")\n")).unwrap();
+        let resolver = CliResolver {
+            cache: Cache::new(dir.join("cache"), false, true),
+            fetcher: Box::new(InvalidRemote),
+            interactive: false,
+            update: false,
+            approved: RefCell::new(HashSet::new()),
+        };
+
+        let error = fetch_graph(&[Location::Local(model)], &resolver)
+            .expect_err("the fetched invalid source must produce a parse diagnostic");
+        let Failure::Diagnostic { path, .. } = error else {
+            panic!("expected a parse diagnostic, got {error:?}");
+        };
+        assert_eq!(
+            crate::terminal_path(&path),
+            "http://<redacted>@host.test/bad@name.flatppl?email=a@b"
+        );
+        assert_eq!(
+            Location::Remote(url.to_string()).display(),
+            url,
+            "semantic location identity remains unchanged"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// `fetch_graph` walks an all-local model graph (module dep + data source)
     /// with nothing to fetch, and errors when a dependency is missing. (Uses a

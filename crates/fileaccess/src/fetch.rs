@@ -49,8 +49,12 @@ impl Fetcher for HttpFetcher {
         // `get_uri` (the post-redirect URL) is on `ResponseExt`.
         use std::io::Read;
         use ureq::ResponseExt;
-        // `ureq` follows redirects by default and returns `Err` for non-2xx.
+        // `ureq` follows redirects by default. Its status-as-error policy only
+        // covers 4xx/5xx, so enforce the fetcher's final-2xx contract here too.
         let resp = ureq::get(url).call().map_err(|e| e.to_string())?;
+        if !resp.status().is_success() {
+            return Err(format!("http status: {}", resp.status().as_u16()));
+        }
         let resolved_url = resp.get_uri().to_string();
         // Read the headers before consuming the response for its body.
         let (content_type, etag, last_modified) = {

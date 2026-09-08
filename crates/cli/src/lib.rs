@@ -12,6 +12,42 @@ use std::process::ExitCode;
 use ariadne::{Config, Label, Report, ReportKind, Source};
 use flatppl_core::Module;
 
+/// Render a filesystem path without allowing its text to control terminal
+/// layout. Filesystem operations continue to use the original [`Path`].
+pub fn terminal_path(path: &Path) -> String {
+    terminal_text(&path.to_string_lossy())
+}
+
+/// Require a local source path to resolve to a regular file. Metadata follows
+/// symlinks, so a symlink to a regular file remains a valid input.
+pub fn require_regular_file(path: &Path) -> std::io::Result<()> {
+    if std::fs::metadata(path)?.is_file() {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ))
+    }
+}
+
+/// Read a UTF-8 local source after rejecting directories and special files.
+pub fn read_regular_utf8(path: &Path) -> std::io::Result<String> {
+    require_regular_file(path)?;
+    std::fs::read_to_string(path)
+}
+
+/// Render untrusted text as one terminal-safe representation. Ordinary
+/// printable Unicode stays readable; controls and format characters are
+/// exposed with Rust debug escapes.
+pub(crate) fn terminal_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        out.extend(ch.escape_debug());
+    }
+    out
+}
+
 pub mod provenance;
 pub use provenance::banner;
 
@@ -97,14 +133,15 @@ impl Format {
             Some("flatppl") => Ok(Format::FlatPpl),
             Some("flatpir") => Ok(Format::FlatPir),
             Some(other) => Err(format!(
-                "unsupported file extension `.{other}` for `{}` \
+                "unsupported file extension `.{}` for `{}` \
                  (expected `.flatppl`, `.flatpir`, or `.flatpir.json`)",
-                path.display()
+                terminal_text(other),
+                terminal_path(path)
             )),
             None => Err(format!(
                 "cannot infer a format for `{}`: no file extension \
                  (expected `.flatppl`, `.flatpir`, or `.flatpir.json`)",
-                path.display()
+                terminal_path(path)
             )),
         }
     }
@@ -183,7 +220,7 @@ pub(crate) fn render_diagnostic(
 ) {
     let located = span.or_else(|| line_span(source, line));
     let (Some((start, end)), false) = (located, source.is_empty()) else {
-        eprintln!("flatppl: {}: {message}", path.display());
+        eprintln!("flatppl: {}: {message}", terminal_path(path));
         return;
     };
     // Clamp to the source: spans may legitimately point at EOF (zero-width
@@ -191,7 +228,7 @@ pub(crate) fn render_diagnostic(
     let start = start.min(source.len() - 1);
     let end = end.clamp(start + 1, source.len());
 
-    let name = path.display().to_string();
+    let name = terminal_path(path);
     let report = Report::build(ReportKind::Error, (name.clone(), start..end))
         .with_config(Config::default().with_color(std::io::stderr().is_terminal()))
         .with_message(message)
@@ -253,6 +290,44 @@ pub fn report(result: Result<(), Failure>) -> ExitCode {
 /// format-agnostic shape for [`render_diagnostic`].
 pub type ReadError = (String, usize, Option<(usize, usize)>);
 
+#[cfg(any(feature = "convert", feature = "infer", feature = "hs3"))]
+const MAX_JSON_STRUCTURAL_TOKENS: usize = 262_144;
+
+/// Bound JSON value breadth before `serde_json::Value` allocates the full tree.
+#[cfg(any(feature = "convert", feature = "infer", feature = "hs3"))]
+fn guard_json_structure(source: &str) -> Result<(), ReadError> {
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut count = 0usize;
+    for byte in source.bytes() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        if byte == b'"' {
+            in_string = true;
+        } else if matches!(byte, b'[' | b'{' | b',') {
+            count += 1;
+            if count > MAX_JSON_STRUCTURAL_TOKENS {
+                return Err((
+                    format!(
+                        "`.flatpir.json` structure exceeds the limit of {MAX_JSON_STRUCTURAL_TOKENS} tokens; this is a resource guard, not a language rule"
+                    ),
+                    0,
+                    None,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn read_module(format: Format, source: &str) -> Result<Module, ReadError> {
     fn widen(span: Option<(u32, u32)>) -> Option<(usize, usize)> {
         span.map(|(s, e)| (s as usize, e as usize))
@@ -269,6 +344,7 @@ pub fn read_module(format: Format, source: &str) -> Result<Module, ReadError> {
         // errors are not source-positioned: report unlocalized (line 0).
         #[cfg(any(feature = "convert", feature = "infer", feature = "hs3"))]
         Format::FlatPirJson => {
+            guard_json_structure(source)?;
             let value: serde_json::Value = serde_json::from_str(source)
                 .map_err(|e| (format!("invalid `.flatpir.json`: {e}"), 0usize, None))?;
             flatppl_flatpir::from_json(&value).map_err(|e| (e.message, 0usize, None))
@@ -320,6 +396,72 @@ pub fn format_text(source: &str, syntax: flatppl_syntax::Syntax) -> Result<Strin
     Ok(text)
 }
 
+/// Replace one existing file through an exclusive same-directory temporary.
+/// A final symlink is resolved first so formatting preserves the link itself,
+/// matching the previous in-place write behavior.
+#[cfg(feature = "fmtlint")]
+fn write_file_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::fs::{self, OpenOptions};
+    use std::io::{ErrorKind, Write};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let target = match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => fs::canonicalize(path)?,
+        Ok(_) => path.to_path_buf(),
+        Err(error) => return Err(error),
+    };
+    let metadata = fs::metadata(&target)?;
+    if metadata.permissions().readonly() {
+        return Err(std::io::Error::new(
+            ErrorKind::PermissionDenied,
+            "refusing to replace a read-only file",
+        ));
+    }
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let parent = target.parent().unwrap_or_else(|| Path::new("."));
+    let (temp, mut file) = loop {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let temp = parent.join(format!(".flatppl-fmt-{}-{n}.tmp", std::process::id()));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            options.mode(metadata.permissions().mode() & 0o777);
+        }
+        match options.open(&temp) {
+            Ok(file) => break (temp, file),
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    };
+
+    if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+        drop(file);
+        let _ = fs::remove_file(&temp);
+        return Err(error);
+    }
+    drop(file);
+
+    #[cfg(unix)]
+    let permissions = {
+        use std::os::unix::fs::PermissionsExt;
+        fs::Permissions::from_mode(metadata.permissions().mode() & 0o777)
+    };
+    #[cfg(not(unix))]
+    let permissions = metadata.permissions();
+    if let Err(error) = fs::set_permissions(&temp, permissions) {
+        let _ = fs::remove_file(&temp);
+        return Err(error);
+    }
+    if let Err(error) = fs::rename(&temp, &target) {
+        let _ = fs::remove_file(&temp);
+        return Err(error);
+    }
+    Ok(())
+}
+
 /// `flatppl fmt` logic — canonicalize FlatPPL in place / on stdin, or `--check`.
 #[cfg(feature = "fmtlint")]
 pub fn run_fmt(
@@ -362,12 +504,12 @@ pub fn run_fmt(
             Format::FlatPir | Format::FlatPirJson => {
                 return Err(Failure::Plain(format!(
                     "`fmt` only formats FlatPPL; `{}` is FlatPIR (use `convert`)",
-                    file.display()
+                    terminal_path(file)
                 )));
             }
         }
-        let source = std::fs::read_to_string(file)
-            .map_err(|e| format!("reading `{}`: {e}", file.display()))?;
+        let source = read_regular_utf8(file)
+            .map_err(|e| format!("reading `{}`: {e}", terminal_path(file)))?;
         let formatted =
             format_text(&source, syntax).map_err(|(message, line, span)| Failure::Diagnostic {
                 path: file.clone(),
@@ -381,14 +523,14 @@ pub fn run_fmt(
                 dirty.push(file.clone());
             }
         } else if source != formatted {
-            std::fs::write(file, &formatted)
-                .map_err(|e| format!("writing `{}`: {e}", file.display()))?;
+            write_file_atomic(file, formatted.as_bytes())
+                .map_err(|e| format!("writing `{}`: {e}", terminal_path(file)))?;
         }
     }
 
     if check && !dirty.is_empty() {
         for f in &dirty {
-            eprintln!("flatppl: not canonically formatted: {}", f.display());
+            eprintln!("flatppl: not canonically formatted: {}", terminal_path(f));
         }
         return Err(Failure::Plain(format!(
             "{} file(s) not canonically formatted",
@@ -432,8 +574,8 @@ pub fn run_lint(
     let mut any_deny = false;
     for file in files {
         let from = Format::from_path(file)?;
-        let source = std::fs::read_to_string(file)
-            .map_err(|e| format!("reading `{}`: {e}", file.display()))?;
+        let source = read_regular_utf8(file)
+            .map_err(|e| format!("reading `{}`: {e}", terminal_path(file)))?;
 
         let mut cfg = base.clone();
         match inline_allows(&source) {
@@ -497,7 +639,7 @@ pub fn run_lint(
         // one acquire instead of one per line (matters when many fire on piped,
         // unbuffered stderr).
         use std::io::Write;
-        let path = file.display();
+        let path = terminal_path(file);
         let mut err = std::io::stderr().lock();
         for d in &diags {
             let tag = match d.severity {
@@ -532,7 +674,7 @@ pub fn lint_generated(module: &mut Module, path: &std::path::Path) {
     cfg.set(RuleId::NotCanonical, Severity::Allow);
     let diags = flatppl_lint::lint(module, &cfg);
 
-    let disp = path.display();
+    let disp = terminal_path(path);
     let mut err = std::io::stderr().lock();
     for d in &diags {
         let tag = match d.severity {
@@ -598,5 +740,18 @@ mod tests {
         let twice = format_text(&once, flatppl_syntax::Syntax::Full).unwrap();
         assert_eq!(once, twice);
         assert!(once.contains("mu = 0.0"));
+    }
+
+    #[cfg(any(feature = "convert", feature = "infer", feature = "hs3"))]
+    #[test]
+    fn flatpir_json_breadth_is_guarded_before_deserialization() {
+        let source = format!("[{}]", "[],".repeat(300_000));
+        let err = read_module(Format::FlatPirJson, &source)
+            .expect_err("shallow JSON breadth must be bounded");
+        assert!(err.0.contains("structure exceeds"), "{err:?}");
+        assert!(
+            guard_json_structure(r#"{"text":"[,{\\\""}"#).is_ok(),
+            "structural punctuation inside strings does not spend the budget"
+        );
     }
 }

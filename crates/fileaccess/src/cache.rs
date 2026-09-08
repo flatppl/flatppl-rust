@@ -4,7 +4,7 @@
 //! [`TrustOracle`]. This module owns the layout, keys, and the resolve
 //! algorithm.
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -67,9 +67,9 @@ fn hex(bytes: &[u8]) -> String {
     s
 }
 
-/// The full trailing extension of a URL's final path segment — everything after
-/// the first `.` (so `data.tar.gz` → `tar.gz`, `.flatppl` → `flatppl`); `None`
-/// for a final segment with no `.` (or an empty extension). Query is excluded.
+/// The trailing extension of a URL's final path segment. A literal backslash
+/// is omitted because Windows treats it as a path separator. The URL hash still
+/// identifies that object. Percent-encoded backslashes remain inert text.
 fn url_ext(url: &str) -> Option<String> {
     // Drop scheme://authority, then the query.
     let after_authority = match url.find("://") {
@@ -87,7 +87,7 @@ fn url_ext(url: &str) -> Option<String> {
         .map_or(after_authority, |i| &after_authority[..i]);
     let seg = path.rsplit('/').next().unwrap_or("");
     match seg.split_once('.') {
-        Some((_, rest)) if !rest.is_empty() => Some(rest.to_string()),
+        Some((_, rest)) if !rest.is_empty() && !rest.contains('\\') => Some(rest.to_string()),
         _ => None,
     }
 }
@@ -149,7 +149,7 @@ impl Cache {
         }
         let k = cache_key(url);
         // A cached object is returned without fetching → no prompt.
-        if self.object_path(&k).exists() {
+        if is_regular_file(&self.object_path(&k)) {
             return false;
         }
         !self.trust_path(&k).exists()
@@ -170,7 +170,7 @@ impl Cache {
     ) -> Result<PathBuf, Error> {
         let k = cache_key(url);
         let object = self.object_path(&k);
-        if object.exists() {
+        if is_regular_file(&object) {
             return Ok(object);
         }
         self.fetch_and_store(url, &k, object, fetcher, trust)
@@ -265,32 +265,32 @@ impl Cache {
     // ── write helpers ─────────────────────────────────────────────────────────
 
     /// Write `bytes` to `dest` atomically: download to `tmp/`, fsync, rename.
-    /// A rename that fails because `dest` already exists (Windows; or a
-    /// concurrent tool that won the race) is treated as success — the cache is
-    /// lock-free and content is addressed by URL hash.
+    /// Every failed write or rename removes its temporary file and reaches the
+    /// caller. Concurrent writers may replace each other atomically.
     fn write_atomic(&self, dest: &Path, bytes: &[u8]) -> Result<(), Error> {
         let tmp_dir = self.tmp_dir();
-        fs::create_dir_all(&tmp_dir)?;
+        create_cache_dir_all(&tmp_dir)?;
         if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent)?;
+            create_cache_dir_all(parent)?;
         }
-        let tmp = tmp_dir.join(tmp_name(dest));
-        {
-            let mut f = File::create(&tmp)?;
-            f.write_all(bytes)?;
-            f.sync_all()?;
-        }
-        match fs::rename(&tmp, dest) {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                if dest.exists() {
-                    let _ = fs::remove_file(&tmp);
-                    Ok(())
-                } else {
-                    Err(Error::Io(e))
-                }
+        let (tmp, mut file) = loop {
+            let tmp = tmp_dir.join(tmp_name());
+            match create_private_file(&tmp) {
+                Ok(file) => break (tmp, file),
+                Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(Error::Io(e)),
             }
+        };
+        if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+            let _ = fs::remove_file(&tmp);
+            return Err(Error::Io(error));
         }
+        drop(file);
+        if let Err(error) = fs::rename(&tmp, dest) {
+            let _ = fs::remove_file(&tmp);
+            return Err(Error::Io(error));
+        }
+        Ok(())
     }
 
     /// Create the trust marker with an exclusive create. An existing marker
@@ -298,9 +298,9 @@ impl Cache {
     fn create_trust_marker(&self, k: &Key) -> Result<(), Error> {
         let path = self.trust_path(k);
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+            create_cache_dir_all(parent)?;
         }
-        match OpenOptions::new().write(true).create_new(true).open(&path) {
+        match create_private_file(&path) {
             Ok(_) => Ok(()),
             Err(e) if e.kind() == ErrorKind::AlreadyExists => Ok(()),
             Err(e) => Err(Error::Io(e)),
@@ -308,16 +308,46 @@ impl Cache {
     }
 }
 
-/// A per-process-unique temp filename, so concurrent writers never collide in
-/// `tmp/` before the atomic rename.
-fn tmp_name(dest: &Path) -> String {
+/// Create cache-owned directories privately on Unix. Recursive creation leaves
+/// every pre-existing component, including a configured root, unchanged.
+fn create_cache_dir_all(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700).create(path)
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(path)
+    }
+}
+
+/// Exclusively create a cache file. Objects and metadata retain this mode when
+/// their temporary file is atomically renamed into its published location.
+fn create_private_file(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
+/// Accept only a regular cache object without following a final symlink.
+fn is_regular_file(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_file())
+}
+
+/// A short per-process-unique temp filename. It deliberately excludes the
+/// destination basename so internal suffixes cannot make an otherwise valid
+/// normative object filename exceed the filesystem component limit.
+fn tmp_name() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let base = dest
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("object");
-    format!("{base}.{}.{n}.tmp", std::process::id())
+    format!(".flatppl-cache.{}.{n}.tmp", std::process::id())
 }
 
 /// Format the current time as ISO 8601 UTC (`YYYY-MM-DDTHH:MM:SSZ`).
@@ -410,6 +440,30 @@ mod tests {
     }
 
     #[test]
+    fn a_literal_windows_separator_cannot_create_path_components() {
+        let url = "https://h/x.a\\..\\..\\outside.flatppl";
+        let k = cache_key(url);
+        assert_eq!(k.ext, None);
+        assert_eq!(
+            Cache::new(PathBuf::from("cache"), false, true)
+                .object_path(&k)
+                .file_name()
+                .unwrap(),
+            k.key.as_str()
+        );
+    }
+
+    #[test]
+    fn an_encoded_windows_separator_remains_inert_extension_text() {
+        assert_eq!(
+            cache_key("https://h/x.a%5C..%5Coutside.flatppl")
+                .ext
+                .as_deref(),
+            Some("a%5C..%5Coutside.flatppl")
+        );
+    }
+
+    #[test]
     fn iso8601_matches_independent_oracle() {
         assert_eq!(iso8601_utc(0), "1970-01-01T00:00:00Z");
         assert_eq!(iso8601_utc(1_700_000_000), "2023-11-14T22:13:20Z");
@@ -457,5 +511,27 @@ mod tests {
                 "/cache/v1/trust/85/85112c1cdb4c8595f8766b87aa90f366d7e660612d551f16b301f44c05fedf30"
             )
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_file_creator_uses_owner_only_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        static N: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "flatppl-cache-file-mode-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("candidate.tmp");
+        drop(create_private_file(&path).unwrap());
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(root).unwrap();
     }
 }

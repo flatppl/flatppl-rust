@@ -340,7 +340,7 @@ fn main() -> ExitCode {
 // left in place (Low severity, accepted by review). The cheaper `&Value`
 // alternative would require adding a `serde_json` dependency to this crate's
 // `Cargo.toml`, which is likewise out of scope here.
-#[cfg(feature = "hs3")]
+#[cfg(all(feature = "hs3", feature = "convert"))]
 fn note_dropped_analyses(source: &str) {
     if flatppl_hs3::document_has_analyses(source) {
         eprintln!(
@@ -370,8 +370,8 @@ fn convert(
     let mut module = match from_format {
         #[cfg(feature = "hs3")]
         FromFormat::Hs3 => {
-            let source = fs::read_to_string(input)
-                .map_err(|e| format!("reading `{}`: {e}", input.display()))?;
+            let source = flatppl_cli::read_regular_utf8(input)
+                .map_err(|e| format!("reading `{}`: {e}", flatppl_cli::terminal_path(input)))?;
             let module =
                 flatppl_hs3::read_hs3(&source).map_err(|e| Failure::Plain(format!("hs3: {e}")))?;
             note_dropped_analyses(&source);
@@ -379,8 +379,8 @@ fn convert(
         }
         #[cfg(feature = "hs3")]
         FromFormat::Pyhf => {
-            let source = fs::read_to_string(input)
-                .map_err(|e| format!("reading `{}`: {e}", input.display()))?;
+            let source = flatppl_cli::read_regular_utf8(input)
+                .map_err(|e| format!("reading `{}`: {e}", flatppl_cli::terminal_path(input)))?;
             let module = flatppl_hs3::read_pyhf(&source)
                 .map_err(|e| Failure::Plain(format!("pyhf: {e}")))?;
             note_dropped_analyses(&source);
@@ -407,8 +407,8 @@ fn convert(
                 }
                 e
             })?;
-            let source = fs::read_to_string(input)
-                .map_err(|e| format!("reading `{}`: {e}", input.display()))?;
+            let source = flatppl_cli::read_regular_utf8(input)
+                .map_err(|e| format!("reading `{}`: {e}", flatppl_cli::terminal_path(input)))?;
             match flatppl_cli::read_module(from, &source) {
                 Ok(module) => module,
                 Err((message, line, span)) => {
@@ -443,8 +443,12 @@ fn convert(
     // Gate the text before it reaches disk (see `check_generated`).
     let imported = matches!(from_format, FromFormat::Hs3 | FromFormat::Pyhf);
     check_generated(&text, to, input, output, imported)?;
-    fs::write(output, text)
-        .map_err(|e| Failure::Plain(format!("writing `{}`: {e}", output.display())))
+    fs::write(output, text).map_err(|e| {
+        Failure::Plain(format!(
+            "writing `{}`: {e}",
+            flatppl_cli::terminal_path(output)
+        ))
+    })
 }
 
 /// Refuse to write output that does not read back, and — when an import
@@ -501,13 +505,16 @@ fn check_generated(
     for d in &diags {
         if matches!(d.severity, flatppl_infer::Severity::Error) {
             errors += 1;
-            eprintln!("error: {}", d.message);
+            eprintln!(
+                "error: {}",
+                flatppl_cli::resolve::terminal_message(&d.message)
+            );
         }
     }
     if errors > 0 {
         return Err(Failure::Plain(format!(
             "the generated module has {errors} inference error(s); `{}` was not written",
-            output.display()
+            flatppl_cli::terminal_path(output)
         )));
     }
     Ok(())
@@ -527,13 +534,13 @@ fn infer_cmd(
         return Err(Failure::Plain(format!(
             "`infer` writes annotated FlatPIR; `{}` must have a `.flatpir` extension \
              (FlatPPL cannot carry %meta annotations)",
-            output.display()
+            flatppl_cli::terminal_path(output)
         )));
     }
     // The input is a local file; cross-module deps resolve from the local cache
     // only (run `flatppl prepare` first for remote deps).
-    let source =
-        fs::read_to_string(input).map_err(|e| format!("reading `{}`: {e}", input.display()))?;
+    let source = flatppl_cli::read_regular_utf8(input)
+        .map_err(|e| format!("reading `{}`: {e}", flatppl_cli::terminal_path(input)))?;
     let mut module = match flatppl_cli::read_module(from, &source) {
         Ok(module) => module,
         Err((message, line, span)) => {
@@ -562,15 +569,21 @@ fn infer_cmd(
         match d.severity {
             flatppl_infer::Severity::Error => {
                 errors += 1;
-                eprintln!("error: {}", d.message);
+                eprintln!(
+                    "error: {}",
+                    flatppl_cli::resolve::terminal_message(&d.message)
+                );
             }
-            flatppl_infer::Severity::Note => eprintln!("note: {}", d.message),
+            flatppl_infer::Severity::Note => eprintln!(
+                "note: {}",
+                flatppl_cli::resolve::terminal_message(&d.message)
+            ),
         }
     }
     if errors > 0 {
         return Err(Failure::Plain(format!(
             "inference found {errors} error(s) in `{}`",
-            input.display()
+            flatppl_cli::terminal_path(input)
         )));
     }
 
@@ -582,8 +595,12 @@ fn infer_cmd(
         // `infer` always writes FlatPIR (`;` comments).
         text.insert_str(0, &banner(Format::FlatPir.comment_style()));
     }
-    fs::write(output, text)
-        .map_err(|e| Failure::Plain(format!("writing `{}`: {e}", output.display())))
+    fs::write(output, text).map_err(|e| {
+        Failure::Plain(format!(
+            "writing `{}`: {e}",
+            flatppl_cli::terminal_path(output)
+        ))
+    })
 }
 
 /// `flatppl prepare <file>… [--update]` — fetch each model's remote dependencies
@@ -610,8 +627,8 @@ fn prepare_cmd(files: &[PathBuf], update: bool) -> Result<(), Failure> {
 fn load_and_infer(
     input: &Path,
 ) -> Result<(flatppl_core::Module, flatppl_infer::ModuleBundle, String), Failure> {
-    let source =
-        fs::read_to_string(input).map_err(|e| format!("reading `{}`: {e}", input.display()))?;
+    let source = flatppl_cli::read_regular_utf8(input)
+        .map_err(|e| format!("reading `{}`: {e}", flatppl_cli::terminal_path(input)))?;
     let mut module = match flatppl_cli::read_module(Format::FlatPpl, &source) {
         Ok(m) => m,
         Err((message, line, span)) => {
@@ -637,15 +654,21 @@ fn load_and_infer(
         match d.severity {
             flatppl_infer::Severity::Error => {
                 errors += 1;
-                eprintln!("error: {}", d.message);
+                eprintln!(
+                    "error: {}",
+                    flatppl_cli::resolve::terminal_message(&d.message)
+                );
             }
-            flatppl_infer::Severity::Note => eprintln!("note: {}", d.message),
+            flatppl_infer::Severity::Note => eprintln!(
+                "note: {}",
+                flatppl_cli::resolve::terminal_message(&d.message)
+            ),
         }
     }
     if errors > 0 {
         return Err(Failure::Plain(format!(
             "inference found {errors} error(s) in `{}`",
-            input.display()
+            flatppl_cli::terminal_path(input)
         )));
     }
 
@@ -672,7 +695,10 @@ fn refuse_message(
     }
     if let Some(span) = module.span_of(e.node) {
         let (line, col) = line_col(source, span.start as usize);
-        site.push_str(&format!(" ({}:{line}:{col})", input.display()));
+        site.push_str(&format!(
+            " ({}:{line}:{col})",
+            flatppl_cli::terminal_path(input)
+        ));
     }
     format!("determinize: refuse {}{site}: {}", e.construct, e.reason)
 }
@@ -736,8 +762,12 @@ fn determinize_cmd(
         EmitForm::Flatpir => flatppl_flatpir::write(&lowered),
     };
     match output {
-        Some(path) => fs::write(path, rendered)
-            .map_err(|e| Failure::Plain(format!("writing `{}`: {e}", path.display())))?,
+        Some(path) => fs::write(path, rendered).map_err(|e| {
+            Failure::Plain(format!(
+                "writing `{}`: {e}",
+                flatppl_cli::terminal_path(path)
+            ))
+        })?,
         None => print!("{rendered}"),
     }
     Ok(())
@@ -799,8 +829,12 @@ fn stablehlo_cmd(input: &Path, mode: &str, output: Option<&Path>) -> Result<(), 
     let rendered = flatppl_stablehlo::emit(&lowered, mode, &opts)
         .map_err(|e| Failure::Refuse(e.to_string()))?;
     match output {
-        Some(path) => fs::write(path, rendered)
-            .map_err(|e| Failure::Plain(format!("writing `{}`: {e}", path.display())))?,
+        Some(path) => fs::write(path, rendered).map_err(|e| {
+            Failure::Plain(format!(
+                "writing `{}`: {e}",
+                flatppl_cli::terminal_path(path)
+            ))
+        })?,
         None => print!("{rendered}"),
     }
     Ok(())
