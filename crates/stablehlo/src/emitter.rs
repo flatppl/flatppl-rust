@@ -1419,20 +1419,11 @@ impl<'m> Emitter<'m> {
     ///   i1 would answer parity and reducing in a wider kind would contradict the
     ///   declared result type.
     ///
-    /// NOTE: both routes to a §07 reduction now WIDEN a boolean operand, and
-    /// differ only in the kind they widen to. This one is reached from
-    /// `crate::aggregate::reduce`, which widens the frame to the AGGREGATE
-    /// node's inferred kind — `Real` whenever the body's own type is
-    /// `%deferred`, which an axis-indexed body always is — so the arms above
-    /// stay dead. [`Emitter::reduce_axis`] widens to `Int`, because
-    /// `infer::ops::reduced_scalar` types `sum(bool_array)` as `integers` per
-    /// §03's promotion. Both count correctly, so neither answers parity, but one
-    /// §07 reduction over one boolean array does have two result types depending
-    /// on the spelling: `sum(mask)` returns `tensor<i32>` and
-    /// `aggregate(sum, [], mask[.i])` returns `tensor<f32>`. §03's derivation
-    /// says `integers` is the answer, so the divergence is the aggregate rule's
-    /// `unwrap_or(Real)` fallback in `infer`, not this method — recorded in
-    /// `flatppl-dev/TODO-flatppl-rust.md` for the next aggregate wave.
+    /// `aggregate(sum, [], A[.i])` and `sum(A)` now agree on an integer result
+    /// kind: `infer::ops::reduced_scalar` passes an integer body's kind
+    /// through instead of falling back to `Real`. An integer-bodied
+    /// `maximum`/`minimum` therefore reaches the Int refusal arm above, per
+    /// §07's real-array domain for both.
     pub(crate) fn reduce_trailing_axes(
         &mut self,
         id: NodeId,
