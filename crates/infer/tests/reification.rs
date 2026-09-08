@@ -388,8 +388,7 @@ fn a_thrice_repeated_boundary_input_reports_once() {
 #[test]
 fn a_repeated_autoinputs_name_is_a_static_error() {
     let pir = "(%module\n  \
-       (%public other)\n  \
-       (%public F)\n  \
+       (%public other F)\n  \
        (%bind other (elementof reals))\n  \
        (%bind F (functionof (add (%ref self other) (%ref self other)) \
        %autoinputs ((a (%ref self other)) (a (%ref self other))))))";
@@ -408,8 +407,7 @@ fn a_repeated_autoinputs_name_is_a_static_error() {
 #[test]
 fn an_autoinputs_list_that_misses_the_placeholder_still_errors() {
     let pir = "(%module\n  \
-       (%public other)\n  \
-       (%public F)\n  \
+       (%public other F)\n  \
        (%bind other (elementof reals))\n  \
        (%bind F (functionof (Normal (%kwarg mu (%ref %local _v_)) (%kwarg sigma 1.0)) \
        %autoinputs ((w (%ref self other))))))";
