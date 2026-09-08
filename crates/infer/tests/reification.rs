@@ -611,16 +611,59 @@ f = functionof(add(a, b), a = a, b = b)";
     );
 }
 
-/// A nested reification carries its OWN phase. The walk cuts at the inner
-/// `functionof`, so the outer one is stochastic only through what IT captures —
-/// a callable value is not itself a stochastic node.
+/// A reification over a REFERENCE to a capturing callable captures too. §04
+/// gives a reified callable the same ancestor rule as any other binding, so
+/// `z = inner()` outside a reification is stochastic exactly because `inner`
+/// captures `a` — and a `functionof` over that same expression cannot be more
+/// deterministic than the expression is. `z` is asserted alongside to pin the
+/// two against each other.
+///
+/// This was `%fixed` when the walk cut at any nested reification, which put it
+/// at odds with the JS analyzer's `reificationCapturesDraw`.
 #[test]
-fn a_nested_reification_carries_its_own_phase() {
+fn a_reification_over_a_capturing_callable_reference_is_stochastic() {
     let src = "\
 c = elementof(reals)
 a ~ Normal(mu = 0.0, sigma = 1.0)
 inner = functionof(add(a, c))
-outer = functionof(inner(c))";
+outer = functionof(inner(c))
+z = inner(c)";
+    let module = infer_phases(src);
+    for name in ["inner", "z", "outer"] {
+        assert_eq!(
+            binding_phase(&module, name),
+            Some(flatppl_core::Phase::Stochastic),
+            "`{name}` is conditional on `a`'s realization"
+        );
+    }
+}
+
+/// The same for a nested reification LITERAL: its own body captures the draw, so
+/// the literal is stochastic by its own rule and the enclosing `functionof`
+/// captures a stochastic ancestor.
+#[test]
+fn a_reification_over_a_capturing_nested_literal_is_stochastic() {
+    let src = "\
+a ~ Normal(mu = 0.0, sigma = 1.0)
+resolution = mul(2.5, exp(mul(0.12, a)))
+lit = functionof(functionof(resolution)())";
+    assert_eq!(
+        binding_phase(&infer_phases(src), "lit"),
+        Some(flatppl_core::Phase::Stochastic),
+        "the nested literal captures `a`, so the outer one does too"
+    );
+}
+
+/// The control that keeps the reference case from swallowing everything:
+/// `lawof` absorbs, so a `functionof` over the LAW of a capturing callable's
+/// output is `%fixed`. §04 "Phase of the reified law".
+#[test]
+fn a_functionof_over_the_law_of_a_capturing_callable_is_fixed() {
+    let src = "\
+a ~ Normal(mu = 0.0, sigma = 1.0)
+resolution = mul(2.5, exp(mul(0.12, a)))
+inner = functionof(Normal(mu = resolution, sigma = 1.0))
+ctrl = functionof(lawof(inner()))";
     let module = infer_phases(src);
     assert_eq!(
         binding_phase(&module, "inner"),
@@ -628,10 +671,65 @@ outer = functionof(inner(c))";
         "`inner` captures `a`"
     );
     assert_eq!(
-        binding_phase(&module, "outer"),
+        binding_phase(&module, "ctrl"),
         Some(flatppl_core::Phase::Fixed),
-        "`outer` captures no draw of its own; it applies a callable"
+        "`lawof` absorbs the capture before the outer reification sees it"
     );
+}
+
+/// The other control: a nested reification that captures NOTHING is settled
+/// non-stochastic by its own rule, and the phase cut stops the walk there. This
+/// is the useful half of the old blanket nested-reification cut.
+#[test]
+fn a_reification_over_a_deterministic_callable_is_fixed() {
+    let src = "\
+c = elementof(reals)
+inner = functionof(add(c, 1.0))
+outer = functionof(inner(c))";
+    let module = infer_phases(src);
+    for name in ["inner", "outer"] {
+        assert_eq!(
+            binding_phase(&module, name),
+            Some(flatppl_core::Phase::Fixed),
+            "`{name}` captures nothing"
+        );
+    }
+}
+
+/// An INNER boundary cuts inside the inner body only. Here the outer boundary
+/// names `a` and the inner one names `a` as well, so `a` is substituted at both
+/// levels — but `b`, which neither names, is still captured through the nested
+/// callable. Pins that entering a reification adds its names rather than
+/// replacing the enclosing scope, and that the addition does not leak outward.
+#[test]
+fn an_inner_boundary_cuts_inside_the_inner_body_only() {
+    let src = "\
+a ~ Normal(mu = 0.0, sigma = 1.0)
+b ~ Normal(mu = 0.0, sigma = 1.0)
+inner = functionof(add(a, b), a = a)
+outer = functionof(inner(a), a = a)";
+    let module = infer_phases(src);
+    for name in ["inner", "outer"] {
+        assert_eq!(
+            binding_phase(&module, name),
+            Some(flatppl_core::Phase::Stochastic),
+            "`{name}` still captures `b`, which no boundary names"
+        );
+    }
+    // Cutting `b` as well at both levels settles both back to fixed.
+    let cut = "\
+a ~ Normal(mu = 0.0, sigma = 1.0)
+b ~ Normal(mu = 0.0, sigma = 1.0)
+inner = functionof(add(a, b), a = a, b = b)
+outer = functionof(inner(a, b), a = a, b = b)";
+    let module = infer_phases(cut);
+    for name in ["inner", "outer"] {
+        assert_eq!(
+            binding_phase(&module, name),
+            Some(flatppl_core::Phase::Fixed),
+            "`{name}` captures nothing once both draws are named"
+        );
+    }
 }
 
 /// A fully-cut nesting is fixed at both levels.

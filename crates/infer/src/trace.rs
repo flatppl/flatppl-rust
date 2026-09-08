@@ -202,6 +202,14 @@ impl<'m, 's> Inferencer<'m, 's> {
         self.tys.get(&id)
     }
 
+    /// The inferred phase of an already-visited node. `None` while the walk has
+    /// not reached it — the module's own annotations are not written until the
+    /// final flush, so an ops rule must read the live table, not `Module`.
+    /// A caller pruning on this must treat `None` as "do not prune".
+    pub(crate) fn lookup_phase(&self, id: NodeId) -> Option<Phase> {
+        self.phases.get(&id).copied()
+    }
+
     /// The cross-module callable body-result type recorded for `id`, if `id`
     /// is a `RefNs::Module` reference to a reified-callable binding. `None`
     /// for local callables (their body is looked up by node instead).

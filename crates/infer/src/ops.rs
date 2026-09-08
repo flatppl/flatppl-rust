@@ -4723,7 +4723,7 @@ fn reification_type(
     // `prior_predictive` example rely on.
     let phase = match (name, args.first()) {
         ("functionof", Some((body, _, _)))
-            if !captured_draws(inf.module, *body, &boundary_targets).is_empty() =>
+            if !captured_draws(inf, *body, &boundary_targets).is_empty() =>
         {
             Phase::Stochastic
         }
@@ -4853,65 +4853,118 @@ fn undeclared_placeholders(
 /// "value phases propagate as usual"), so the captured draws are the whole
 /// stochastic dependency.
 ///
-/// The walk cuts at four places, each of which ends the reified subgraph:
+/// The walk cuts at four kinds of place, each of which ends the reified
+/// subgraph:
 ///
 /// * a boundary target — §04 substitutes it with a fresh
 ///   `elementof(valueset(a))` input *before* the ancestor trace runs, so
 ///   `functionof(m, raw_syst = raw_syst)` captures nothing and is the
-///   conditional kernel over a declared input;
+///   conditional kernel over a declared input. Every reification the walk
+///   enters contributes its own boundary names for its own body, so an inner
+///   boundary cuts inside the inner body without cutting anywhere else;
 /// * a `lawof` call — it "absorbs stochasticity into the reified law rather
-///   than propagating it outward" (§04 "Phase of the reified law");
-/// * a nested `functionof`/`kernelof` — the inner reification carries its own
-///   phase, computed when inference reaches that node, and a callable value is
-///   not itself a stochastic node;
+///   than propagating it outward" (§04 "Phase of the reified law") — and a
+///   `kernelof`, whose body sits under an implicit `lawof` by §04's
+///   `functionof(lawof(x), kwargs…)` equivalence;
 /// * an `elementof` set argument — §04 traces "back to all leaves of parametric
 ///   phase — that is, all `elementof` leaves", so the set is outside the
-///   subgraph. This mirrors [`Inferencer::collect_auto_inputs`].
+///   subgraph. This mirrors [`Inferencer::collect_auto_inputs`];
+/// * any node whose already-inferred phase is **not** stochastic. Phase joins
+///   upward, so a `%fixed` or `%parameterized` node has no stochastic
+///   descendant reaching the output through it. An absent phase does NOT prune
+///   — the same "soundly does extra work, never skips" convention
+///   `walk_auto` uses.
+///
+/// A nested `functionof` is deliberately **not** a cut in itself. §04 gives a
+/// reified callable the same ancestor rule as any other binding, so
+/// `z = inner()` outside a reification is stochastic exactly when `inner`
+/// captures a draw — and a `functionof` over that same expression must capture
+/// it too. The phase cut above is what stops the walk at a nested reification
+/// that captures nothing, which is the useful half of the old blanket cut.
+/// (Without this, `inner = functionof(resolution)` over a drawn `raw_syst`
+/// followed by `outer = functionof(inner())` came out `%fixed` while the JS
+/// analyzer's `reificationCapturesDraw` called it stochastic.)
 ///
 /// A cross-module reference is also a cut: a stochastic dependency binding is
 /// invisible across the load boundary (`modules.rs` refuses it there), so no
 /// draw can reach the subgraph through one.
 fn captured_draws(
-    module: &flatppl_core::Module,
+    inf: &Inferencer<'_, '_>,
     body: NodeId,
     boundary_targets: &[Symbol],
 ) -> Vec<(Option<Symbol>, NodeId)> {
-    fn is_draw(module: &flatppl_core::Module, id: NodeId) -> bool {
+    let module = &*inf.module;
+    let is_draw = |id: NodeId| {
         matches!(module.node(id), Node::Call(c)
             if matches!(c.head, CallHead::Builtin(h) if module.resolve(h) == "draw"))
-    }
+    };
+    // A node whose phase is settled and not stochastic has no stochastic
+    // descendant. `None` means the walk has not typed it yet: do not prune.
+    let provably_deterministic =
+        |id: NodeId| matches!(inf.lookup_phase(id), Some(p) if p != Phase::Stochastic);
+
+    // Boundary scopes, arena-style: entering a reification pushes its own names
+    // onto the enclosing scope. `visited` is keyed by (node, scope) because one
+    // node can be reached under two scopes and the looser one must still walk.
+    let mut scopes: Vec<Vec<Symbol>> = vec![boundary_targets.to_vec()];
     let mut found: Vec<(Option<Symbol>, NodeId)> = Vec::new();
-    let mut visited = std::collections::HashSet::new();
-    let mut pending = vec![body];
-    while let Some(id) = pending.pop() {
-        if !visited.insert(id) {
+    let mut visited: HashSet<(NodeId, usize)> = HashSet::new();
+    let mut pending: Vec<(NodeId, usize)> = vec![(body, 0)];
+
+    while let Some((id, scope)) = pending.pop() {
+        if !visited.insert((id, scope)) {
             continue;
         }
         match module.node(id) {
             Node::Ref(r) if r.ns == RefNs::SelfMod => {
-                if boundary_targets.contains(&r.name) {
+                if scopes[scope].contains(&r.name) {
                     continue;
                 }
                 if let Some(b) = module.binding_by_name(r.name) {
                     let rhs = module.binding(b).rhs;
-                    if is_draw(module, rhs) {
+                    if is_draw(rhs) {
                         // Report the BINDING, not the anonymous `draw` node, so a
                         // caller names the identifier the user wrote.
                         if !found.iter().any(|(n, _)| *n == Some(r.name)) {
                             found.push((Some(r.name), id));
                         }
-                    } else {
-                        pending.push(rhs);
+                    } else if !provably_deterministic(rhs) {
+                        pending.push((rhs, scope));
                     }
                 }
                 continue;
             }
+            // A `%local` placeholder is this reification's own input, and a
+            // cross-module binding cannot be stochastic (see above).
             Node::Ref(_) => continue,
-            Node::Call(c)
-                if c.inputs.is_some()
-                    && matches!(c.head, CallHead::Builtin(h)
-                        if matches!(module.resolve(h), "functionof" | "kernelof")) =>
-            {
+            Node::Call(c) if c.inputs.is_some() => {
+                let head_is =
+                    |n: &str| matches!(c.head, CallHead::Builtin(h) if module.resolve(h) == n);
+                // `kernelof` absorbs its whole body; and a reification that
+                // captures nothing is settled non-stochastic by its own rule.
+                if head_is("kernelof") || provably_deterministic(id) {
+                    continue;
+                }
+                // Enter the nested `functionof` under its own boundary names.
+                let mut inner = scopes[scope].clone();
+                inner.extend(reification_boundary_targets(module, id));
+                inner.sort_unstable();
+                inner.dedup();
+                let next = match scopes.iter().position(|s| *s == inner) {
+                    Some(i) => i,
+                    None => {
+                        scopes.push(inner);
+                        scopes.len() - 1
+                    }
+                };
+                pending.extend(
+                    module
+                        .node(id)
+                        .children()
+                        .into_iter()
+                        .rev()
+                        .map(|c| (c, next)),
+                );
                 continue;
             }
             Node::Call(c) => {
@@ -4925,12 +4978,44 @@ fn captured_draws(
                         _ => {}
                     }
                 }
+                if provably_deterministic(id) {
+                    continue;
+                }
             }
-            _ => {}
+            _ => continue,
         }
-        pending.extend(module.node(id).children().into_iter().rev());
+        pending.extend(
+            module
+                .node(id)
+                .children()
+                .into_iter()
+                .rev()
+                .map(|c| (c, scope)),
+        );
     }
     found
+}
+
+/// The self-module bindings the reification at `id` designates as boundary
+/// inputs, under either origin tag. A `%local` placeholder entry names no
+/// binding and is skipped: it is the reification's own input, not an ancestor
+/// the boundary cuts away.
+fn reification_boundary_targets(module: &flatppl_core::Module, id: NodeId) -> Vec<Symbol> {
+    let Node::Call(call) = module.node(id) else {
+        return Vec::new();
+    };
+    let collect = |entries: &[(Symbol, Ref)]| {
+        entries
+            .iter()
+            .filter(|(_, r)| r.ns == RefNs::SelfMod)
+            .map(|(_, r)| r.name)
+            .collect()
+    };
+    match call.inputs.as_ref() {
+        Some(Inputs::Spec(entries)) => collect(entries),
+        Some(Inputs::Auto) => module.auto_inputs_of(id).map(collect).unwrap_or_default(),
+        None => Vec::new(),
+    }
 }
 
 /// `likelihoodof(K, obs)` — inputs ride over from the kernel; the obstype is
