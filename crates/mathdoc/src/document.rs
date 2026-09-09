@@ -272,12 +272,42 @@ fn doc_math(latex: &str, display: bool) -> String {
     // The converter reports an unknown command inline as an `[PARSE ERROR …]`
     // text node rather than an `Err`; treat both the same way.
     match latex2mathml::latex_to_mathml(latex, style) {
-        Ok(mathml) if !mathml.contains("[PARSE ERROR") => mathml,
+        Ok(mathml) if !mathml.contains("[PARSE ERROR") => escape_text_angles(&mathml),
         _ => {
             let delim = if display { "$$" } else { "$" };
             format!("<code>{delim}{}{delim}</code>", escape(latex))
         }
     }
+}
+
+/// `latex2mathml` writes a literal `<` or `>` operator as the bare character
+/// (`<mo><</mo>`), which is not HTML. Escape angle brackets in text content;
+/// a tag is a `<` followed by a letter or `/`, copied through its `>`.
+fn escape_text_angles(mathml: &str) -> String {
+    let mut out = String::with_capacity(mathml.len());
+    let mut rest = mathml;
+    while let Some(pos) = rest.find(['<', '>']) {
+        let (text, tail) = rest.split_at(pos);
+        out.push_str(text);
+        let is_tag = tail.starts_with('<')
+            && tail[1..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '/');
+        if is_tag && let Some(end) = tail.find('>') {
+            out.push_str(&tail[..=end]);
+            rest = &tail[end + 1..];
+        } else {
+            out.push_str(if tail.starts_with('<') {
+                "&lt;"
+            } else {
+                "&gt;"
+            });
+            rest = &tail[1..];
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// One `<mtr>` of the aligned block: lhs, relation, rhs, annotation.
@@ -464,6 +494,14 @@ mod tests {
         assert!(out.contains("<code>$\\undefinedmacro{x}$</code>"), "{out}");
         let out = markdown("see $x^2$ here");
         assert!(out.contains("<math"), "{out}");
+        // A literal comparison operator is escaped in the MathML.
+        let out = markdown("the condition $a < b$ and $c > d$ holds");
+        assert!(out.contains("<mo>&lt;</mo>"), "{out}");
+        assert!(out.contains("<mo>&gt;</mo>"), "{out}");
+        assert!(
+            !out.contains("<mo><</mo>") && !out.contains("<mo>></mo>"),
+            "{out}"
+        );
     }
 
     #[test]

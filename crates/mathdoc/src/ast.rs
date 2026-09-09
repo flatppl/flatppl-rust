@@ -485,8 +485,10 @@ impl Math {
     /// Whether `child` in the given slot of `self` must be bracketed.
     pub fn needs_parens(&self, child: &Math, slot: Slot) -> bool {
         // A big operator swallows everything to its right: it is bracketed
-        // wherever something follows it (`(∑ᵢ xᵢ) + 1`, `(∑ᵢ xᵢ)²`) and never
-        // where it ends the expression (`1 + ∑ᵢ xᵢ`, `−∑ᵢ xᵢ`, `∑ᵢ ∑ⱼ xᵢⱼ`).
+        // wherever an operator or a script follows it (`(∑ᵢ xᵢ) + 1`,
+        // `(∑ᵢ xᵢ) = 1`, `(∑ᵢ xᵢ)²`) and never where it ends the operand
+        // (`1 + ∑ᵢ xᵢ`, `−∑ᵢ xᵢ`, `∑ᵢ ∑ⱼ xᵢⱼ`). A comma or a fence delimits
+        // it by itself (`Normal(∑ᵢ xᵢ, 1)`).
         if matches!(child, Math::BigOp { .. }) {
             return matches!(slot, Slot::Left | Slot::Base);
         }
@@ -620,10 +622,8 @@ fn children_reversed(m: &Math) -> Vec<&Math> {
 pub enum Slot {
     Left,
     Right,
-    /// The base of a power.
+    /// The base of a script.
     Base,
-    /// Any other position (arguments, subscripts, fenced items).
-    Other,
 }
 
 #[cfg(test)]

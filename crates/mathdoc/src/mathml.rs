@@ -131,19 +131,19 @@ fn write_expr(out: &mut String, m: &Math) {
         }
         Math::Sub(base, sub) => {
             out.push_str("<msub>");
-            write_base(out, base);
+            write_base(out, m, base);
             write_expr(out, sub);
             out.push_str("</msub>");
         }
         Math::Sup(base, sup) => {
             out.push_str("<msup>");
-            write_base(out, base);
+            write_base(out, m, base);
             write_expr(out, sup);
             out.push_str("</msup>");
         }
         Math::SubSup(base, sub, sup) => {
             out.push_str("<msubsup>");
-            write_base(out, base);
+            write_base(out, m, base);
             write_expr(out, sub);
             write_expr(out, sup);
             out.push_str("</msubsup>");
@@ -189,9 +189,9 @@ fn write_expr(out: &mut String, m: &Math) {
         }
         Math::Relation { lhs, rel, rhs } => {
             out.push_str("<mrow>");
-            write_expr(out, lhs);
+            write_operand(out, m, lhs, Slot::Left);
             let _ = write!(out, "<mo>{}</mo>", rel_glyph(*rel));
-            write_expr(out, rhs);
+            write_operand(out, m, rhs, Slot::Right);
             out.push_str("</mrow>");
         }
         Math::BigOp { op, sub, sup, body } => {
@@ -389,9 +389,9 @@ fn write_wrapped(out: &mut String, m: &Math) {
     write_expr(out, m);
 }
 
-/// The base of a script: bracketed unless it reads as one unit.
-fn write_base(out: &mut String, base: &Math) {
-    if base.prec() < 9 {
+/// The base of the script `parent`: bracketed when the tree rules say so.
+fn write_base(out: &mut String, parent: &Math, base: &Math) {
+    if parent.needs_parens(base, Slot::Base) {
         out.push_str("<mrow><mo>(</mo>");
         write_expr(out, base);
         out.push_str("<mo>)</mo></mrow>");
@@ -618,6 +618,20 @@ mod tests {
         // As a power's base: bracketed.
         let sq = expr(&Math::pow(sum.clone(), Math::int(2)));
         assert!(sq.starts_with("<msup><mrow><mo>(</mo>"), "{sq}");
+        // On the left of a relation: bracketed; on the right: not.
+        let rel = expr(&Math::relation(sum.clone(), Rel::Eq, Math::int(1)));
+        assert!(
+            rel.starts_with("<mrow><mrow><mo>(</mo><mrow><munder>"),
+            "{rel}"
+        );
+        let rel = expr(&Math::relation(Math::int(1), Rel::Eq, sum.clone()));
+        assert!(
+            rel.starts_with("<mrow><mn>1</mn><mo>=</mo><mrow><munder>"),
+            "{rel}"
+        );
+        // As an argument: the call's own parentheses and the comma delimit it.
+        let arg = expr(&Math::call("Normal", vec![sum.clone(), Math::int(1)]));
+        assert_eq!(arg.matches("<mo>(</mo>").count(), 1, "{arg}");
         // An additive body is bracketed, a product body is not.
         let add_body = Math::big(
             BigOp::Prod,
