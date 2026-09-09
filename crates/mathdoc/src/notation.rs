@@ -55,7 +55,7 @@ fn entry(name: &str) -> NotationEntry {
         "lawof" => (
             apply_builtin(name, vec![Math::letter('X')]),
             "lawof(X)".to_string(),
-            "Probability law of X, not its density.",
+            "Probability law (distribution) of X.",
         ),
         _ => {
             let params = flatppl_infer::distribution_param_names(name).unwrap_or_default();
@@ -64,11 +64,11 @@ fn entry(name: &str) -> NotationEntry {
                 "Normal" => {
                     "Mean and variance. The source standard deviation stays explicitly squared, even when numeric."
                 }
-                "MvNormal" => "Mean vector and covariance matrix. The covariance is not squared.",
+                "MvNormal" => "Mean vector and covariance matrix.",
                 "StudentT" => "Degrees of freedom; zero location and unit scale.",
                 "ChiSquared" => "Degrees of freedom.",
-                "Gamma" | "Exponential" => "Rate parameterisation, not scale.",
-                "InverseGamma" | "Weibull" => "Scale parameterisation, not rate.",
+                "Gamma" | "Exponential" => "Rate parameterisation.",
+                "InverseGamma" | "Weibull" => "Scale parameterisation.",
                 "Uniform" => "Uniform probability measure on the displayed set.",
                 _ => "Arguments follow the source parameter order.",
             };
