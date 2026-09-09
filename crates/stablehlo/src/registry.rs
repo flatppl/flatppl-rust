@@ -2170,8 +2170,8 @@ fn argus_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Value, EmitErr
 /// `stablehlo.select` is elementwise — a `nan` in the unused branch survives
 /// into the reverse-mode gradient. [`mask_support`] evaluates the formula at a
 /// guarded variate first, which keeps both the value and the gradient clean.
-/// Note that flatppl-js leaves the same density unmasked today, so the two
-/// engines disagree below zero; the spec, not the other engine, is the oracle.
+/// §09 also permits rate zero: its density limit is one at zero and zero
+/// elsewhere. Guard the logarithm before selecting that boundary value.
 ///
 /// Rank-agnostic, hence listed in [`is_batch_safe`]: every parameter read is a
 /// [`Params::get`] and the mask carries the variate's shape, exactly as
@@ -2187,7 +2187,9 @@ fn continued_poisson_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Va
     let in_support = e.compare("GE", v, &zero);
     let safe = e.scalar(1.0);
     mask_support(e, v, &in_support, &safe, |e, v| {
-        let log_rate = e.log(&rate);
+        let zero_rate = e.compare("EQ", &rate, &zero);
+        let safe_rate = e.select(&zero_rate, &safe, &rate);
+        let log_rate = e.log(&safe_rate);
         let x_log_rate = e.mul(v, &log_rate);
         let neg_rate = e.neg(&rate);
 
@@ -2197,7 +2199,13 @@ fn continued_poisson_logpdf(e: &mut Emitter, p: &Params, v: &Value) -> Result<Va
         let neg_lgamma_x1 = e.neg(&lgamma_x1);
 
         let t1 = e.add(&x_log_rate, &neg_rate);
-        Ok(e.add(&t1, &neg_lgamma_x1))
+        let regular = e.add(&t1, &neg_lgamma_x1);
+        let zero_variate = e.compare("EQ", v, &zero);
+        let inf = e.inf(MlirTy::Scalar);
+        let neg_inf = e.neg(&inf);
+        // At x=0 the log-density is -rate, including its boundary derivative.
+        let boundary = e.select(&zero_variate, &neg_rate, &neg_inf);
+        Ok(e.select(&zero_rate, &boundary, &regular))
     })
 }
 
