@@ -349,6 +349,7 @@ dependencies = [
  "flatppl-hs3",
  "flatppl-infer",
  "flatppl-lint",
+ "flatppl-mathdoc",
  "flatppl-stablehlo",
  "flatppl-syntax",
  "serde_json",

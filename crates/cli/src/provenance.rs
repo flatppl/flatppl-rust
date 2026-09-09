@@ -27,6 +27,7 @@ pub fn banner(style: CommentStyle) -> String {
     match style {
         CommentStyle::None => String::new(),
         CommentStyle::Line(prefix) => format!("{prefix} {BANNER}\n\n"),
+        CommentStyle::Block(open, close) => format!("{open} {BANNER} {close}\n"),
     }
 }
 

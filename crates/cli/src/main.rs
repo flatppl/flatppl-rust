@@ -73,10 +73,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Convert between FlatPPL, FlatPIR, and the FlatPIR JSON encoding.
+    /// Convert between FlatPPL, FlatPIR, and the FlatPIR JSON encoding, or
+    /// render a model as mathematics (`.html`).
     ///
     /// Formats are inferred from the file extensions (`.flatppl` / `.flatpir` /
-    /// `.flatpir.json`, and `.hs3.json` / `.pyhf.json` for HS3 / pyhf import).
+    /// `.flatpir.json`, `.html` for an HTML page of MathML, and `.hs3.json` /
+    /// `.pyhf.json` for HS3 / pyhf import).
     /// Converting to the same format canonicalizes the file. `.flatpir.json` is
     /// an alternate representation of FlatPIR (same content, including `%meta`
     /// annotations). `--from hs3` / `--from pyhf` force HS3 / pyhf import of any
@@ -88,7 +90,7 @@ enum Command {
         /// path — a model with remote `load_module` deps must be pre-fetched
         /// with `flatppl prepare`.
         input: PathBuf,
-        /// Output file (`.flatppl`, `.flatpir`, or `.flatpir.json`)
+        /// Output file (`.flatppl`, `.flatpir`, `.flatpir.json`, or `.html`)
         output: PathBuf,
         /// FlatPPL output syntax level (ignored for FlatPIR output):
         /// `full` re-applies all syntactic sugar (operators, indexing,
@@ -424,6 +426,20 @@ fn convert(
         }
     };
 
+    // An HTML page is rendered from the TYPED module (index ranges, kernel
+    // inputs and the notation appendix read inference), so it takes the
+    // `infer` front end rather than the plain printer.
+    #[cfg(feature = "mathdoc")]
+    if matches!(to, Format::Html) {
+        return convert_html(input, output, &mut module, no_header);
+    }
+    #[cfg(not(feature = "mathdoc"))]
+    if matches!(to, Format::Html) {
+        return Err(Failure::Plain(
+            "HTML output is not compiled in — rebuild with `--features mathdoc`".into(),
+        ));
+    }
+
     let mut text = write_module(to, &module, syntax)?;
     if !text.ends_with('\n') {
         text.push('\n');
@@ -443,6 +459,49 @@ fn convert(
     // Gate the text before it reaches disk (see `check_generated`).
     let imported = matches!(from_format, FromFormat::Hs3 | FromFormat::Pyhf);
     check_generated(&text, to, input, output, imported)?;
+    fs::write(output, text).map_err(|e| {
+        Failure::Plain(format!(
+            "writing `{}`: {e}",
+            flatppl_cli::terminal_path(output)
+        ))
+    })
+}
+
+/// `convert <model> <out>.html`: assemble the cross-module bundle, infer, and
+/// write the model as an HTML page of mathematics. Inference diagnostics go to
+/// stderr and into the page; they never block the render — a mistyped model
+/// still reads, with the typed features degraded where inference failed.
+#[cfg(feature = "mathdoc")]
+fn convert_html(
+    input: &Path,
+    output: &Path,
+    module: &mut flatppl_core::Module,
+    no_header: bool,
+) -> Result<(), Failure> {
+    let resolver = CliResolver::cache_only();
+    let in_loc = Location::Local(input.to_path_buf());
+    let (bundle, _data_sources) = flatppl_cli::resolve::build_bundle(module, &in_loc, &resolver)?;
+    let diags = flatppl_infer::infer_module(module, &bundle, flatppl_infer::Level::Shape);
+    for d in &diags {
+        let level = match d.severity {
+            flatppl_infer::Severity::Error => "error",
+            flatppl_infer::Severity::Note => "note",
+        };
+        eprintln!(
+            "{level}: {}",
+            flatppl_cli::resolve::terminal_message(&d.message)
+        );
+    }
+    let mut rendering = flatppl_mathdoc::render(module);
+    flatppl_mathdoc::render::attach_inference_diagnostics(&mut rendering, module, &diags);
+    let title = input
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("model");
+    let mut text = flatppl_mathdoc::document::html(module, &rendering, title);
+    if !no_header {
+        text.insert_str(0, &banner(Format::Html.comment_style()));
+    }
     fs::write(output, text).map_err(|e| {
         Failure::Plain(format!(
             "writing `{}`: {e}",

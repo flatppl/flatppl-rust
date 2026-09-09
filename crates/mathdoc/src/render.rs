@@ -113,20 +113,32 @@ pub fn render_source(
     }
     let infer_diags = flatppl_infer::infer_module(&mut module, &deps, Level::Shape);
     let mut rendering = render(&module);
-    for d in infer_diags {
+    attach_inference_diagnostics(&mut rendering, &module, &infer_diags);
+    Ok(rendering)
+}
+
+/// Add inference ERRORS to `rendering` as diagnostics on the binding whose
+/// right-hand side holds the offending node (module-level when there is
+/// none). Notes — honest `%deferred` gaps — are not rendering defects and are
+/// left out.
+pub fn attach_inference_diagnostics(
+    rendering: &mut Rendering,
+    module: &Module,
+    diags: &[flatppl_infer::Diagnostic],
+) {
+    for d in diags {
         if d.severity != flatppl_infer::Severity::Error {
             continue;
         }
         let binding = d
             .node
-            .and_then(|n| owning_binding(&module, n))
+            .and_then(|n| owning_binding(module, n))
             .unwrap_or_default();
         rendering.diagnostics.push(Diagnostic {
             binding,
-            message: d.message,
+            message: d.message.clone(),
         });
     }
-    Ok(rendering)
 }
 
 /// The binding whose right-hand side contains `node`, by name.

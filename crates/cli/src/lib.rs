@@ -119,6 +119,8 @@ pub enum Format {
     FlatPir,
     /// The JSON encoding of FlatPIR (`.flatpir.json`).
     FlatPirJson,
+    /// An HTML page rendering the model as mathematics (`.html`). Output only.
+    Html,
 }
 
 impl Format {
@@ -132,15 +134,16 @@ impl Format {
         match path.extension().and_then(|e| e.to_str()) {
             Some("flatppl") => Ok(Format::FlatPpl),
             Some("flatpir") => Ok(Format::FlatPir),
+            Some("html") => Ok(Format::Html),
             Some(other) => Err(format!(
                 "unsupported file extension `.{}` for `{}` \
-                 (expected `.flatppl`, `.flatpir`, or `.flatpir.json`)",
+                 (expected `.flatppl`, `.flatpir`, `.flatpir.json`, or `.html`)",
                 terminal_text(other),
                 terminal_path(path)
             )),
             None => Err(format!(
                 "cannot infer a format for `{}`: no file extension \
-                 (expected `.flatppl`, `.flatpir`, or `.flatpir.json`)",
+                 (expected `.flatppl`, `.flatpir`, `.flatpir.json`, or `.html`)",
                 terminal_path(path)
             )),
         }
@@ -165,6 +168,7 @@ impl Format {
             Format::FlatPpl => CommentStyle::Line("#"),
             Format::FlatPir => CommentStyle::Line(";"),
             Format::FlatPirJson => CommentStyle::None,
+            Format::Html => CommentStyle::Block("<!--", "-->"),
         }
     }
 }
@@ -176,6 +180,8 @@ pub enum CommentStyle {
     Line(&'static str),
     /// The format has no comment syntax (JSON): no banner is written.
     None,
+    /// Wrap the banner line in these open/close markers (HTML `<!-- -->`).
+    Block(&'static str, &'static str),
 }
 
 // ── Failure / diagnostics ────────────────────────────────────────────────────
@@ -356,6 +362,12 @@ pub fn read_module(format: Format, source: &str) -> Result<Module, ReadError> {
             0,
             None,
         )),
+        Format::Html => Err((
+            "HTML is an output format only; the input must be FlatPPL, FlatPIR, or an HS3/pyhf document"
+                .to_string(),
+            0,
+            None,
+        )),
     }
 }
 
@@ -380,6 +392,14 @@ pub fn write_module(
         Format::FlatPir | Format::FlatPirJson => unreachable!(
             "write_module called with a FlatPIR format in a lean build; all callers are guarded by a converter feature"
         ),
+        // HTML is rendered from the typed module by the `mathdoc` path in
+        // `convert`, never from the bare module this function sees.
+        Format::Html => {
+            return Err(Failure::Plain(
+                "HTML output needs the `mathdoc` feature's renderer, not `write_module`"
+                    .to_string(),
+            ));
+        }
     })
 }
 
@@ -505,6 +525,12 @@ pub fn run_fmt(
             Format::FlatPir | Format::FlatPirJson => {
                 return Err(Failure::Plain(format!(
                     "`fmt` only formats FlatPPL; `{}` is FlatPIR (use `convert`)",
+                    terminal_path(file)
+                )));
+            }
+            Format::Html => {
+                return Err(Failure::Plain(format!(
+                    "`fmt` only formats FlatPPL; `{}` is an HTML rendering",
                     terminal_path(file)
                 )));
             }

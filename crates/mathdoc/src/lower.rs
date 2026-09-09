@@ -466,7 +466,7 @@ impl<'m> Lowerer<'m> {
         let mut items = self.law_items(output);
         if !params.is_empty() {
             items.push(Math::Op(Op::Bar));
-            items.extend(params.iter().cloned());
+            items.extend(intersperse_commas(params.to_vec()));
         }
         Math::apply(Math::text("Law"), vec![Math::row(items)])
     }
@@ -492,7 +492,7 @@ impl<'m> Lowerer<'m> {
             && !inputs.is_empty()
         {
             items.push(Math::Op(Op::Bar));
-            items.extend(inputs.iter().cloned());
+            items.extend(intersperse_commas(inputs.to_vec()));
         }
         Math::apply(
             Math::subscript(Math::letter('p'), k),
@@ -1707,7 +1707,7 @@ mod tests {
         assert!(lhs.starts_with("<mrow><mi data-flatppl-ref=\"K\">K</mi><mo>&#x2061;</mo><mrow><mo>(</mo><mi data-flatppl-ref=\"mu\">μ</mi>"), "{lhs}");
         let rhs = mathml::expr(&k.statement.rhs);
         assert!(rhs.contains("<mi>Law</mi>"), "{rhs}");
-        assert!(rhs.contains("<mi data-flatppl-ref=\"y\">y</mi><mo stretchy=\"false\">|</mo><mi data-flatppl-ref=\"mu\">μ</mi>"), "{rhs}");
+        assert!(rhs.contains("<mi data-flatppl-ref=\"y\">y</mi><mo stretchy=\"false\">|</mo><mi data-flatppl-ref=\"mu\">μ</mi><mo>,</mo><mi data-flatppl-ref=\"tau\">τ</mi>"), "{rhs}");
         let l = row_named(&rows, "L");
         assert_eq!(l.kind, Kind::Likelihood);
         let lhs = mathml::expr(&l.statement.lhs);

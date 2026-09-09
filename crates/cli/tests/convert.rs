@@ -406,3 +406,46 @@ fn flatppl_through_flatpir_json_is_lossless() {
         "expected at least 8 .flatppl fixtures, found {count}"
     );
 }
+
+#[test]
+fn converts_flatppl_to_an_html_page_of_mathematics() {
+    let dir = Scratch::new("html");
+    let src = dir.path("eight_schools.flatppl");
+    let out = dir.path("eight_schools.html");
+    fs::write(
+        &src,
+        "%%%\n# Eight Schools\n\nA hierarchical model.\n%%%\nflatppl_compat = \"0.1\"\nJ = 8\n% the programme mean\nmu ~ Normal(0, 5)\ntau ~ normalize(truncate(Cauchy(0, 5), interval(0, inf)))\ntheta ~ iid(Normal(mu, tau), J)\nprior = lawof(record(mu = mu, tau = tau, theta = theta))\n",
+    )
+    .unwrap();
+    let status = bin()
+        .args(["convert"])
+        .arg(&src)
+        .arg(&out)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let html = fs::read_to_string(&out).unwrap();
+    assert!(html.starts_with("<!-- AUTOMATICALLY GENERATED - do not edit -->\n<!doctype html>"));
+    assert!(html.contains("<title>Eight Schools</title>"));
+    assert!(html.contains("<mtr data-flatppl-binding=\"mu\" id=\"flatppl-mu\">"));
+    assert!(html.contains("<mtext class=\"flatppl-annot\">the programme mean</mtext>"));
+    assert!(
+        html.contains("<mi data-flatppl-ref=\"J\">J</mi></mrow></msup>"),
+        "{html}"
+    );
+
+    // `--no-header` drops the banner; an HTML input is refused.
+    convert_nh(&src, &out);
+    assert!(
+        fs::read_to_string(&out)
+            .unwrap()
+            .starts_with("<!doctype html>")
+    );
+    let status = bin()
+        .args(["convert"])
+        .arg(&out)
+        .arg(dir.path("back.flatppl"))
+        .status()
+        .unwrap();
+    assert!(!status.success());
+}
