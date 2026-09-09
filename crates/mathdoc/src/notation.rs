@@ -83,12 +83,6 @@ pub fn entries(module: &Module, rows: &[crate::render::BindingRender]) -> Vec<No
     {
         names.insert("measurable-set");
     }
-    if rows
-        .iter()
-        .any(|b| has_script_head(&b.statement.lhs) || has_script_head(&b.statement.rhs))
-    {
-        names.insert("likelihood");
-    }
     let mut stack: Vec<_> = module.bindings().map(|(_, b)| b.rhs).collect();
     let mut visited = std::collections::HashSet::new();
     while let Some(id) = stack.pop() {
@@ -114,19 +108,6 @@ pub fn entries(module: &Module, rows: &[crate::render::BindingRender]) -> Vec<No
     names.into_iter().map(entry).collect()
 }
 
-/// Whether an identifier in `m` prints with a script head (`ℒ`).
-fn has_script_head(m: &Math) -> bool {
-    let mut stack = vec![m];
-    while let Some(n) = stack.pop() {
-        if matches!(n, Math::Ident(id) if matches!(id.display.head, crate::names::Atom::Script(_)))
-        {
-            return true;
-        }
-        stack.extend(n.children());
-    }
-    false
-}
-
 /// Whether `m` holds the symbol `sym` anywhere.
 fn contains_sym(m: &Math, sym: Sym) -> bool {
     let mut stack = vec![m];
@@ -144,17 +125,6 @@ fn entry(name: &str) -> NotationEntry {
         "measurable-set" => (
             Math::Sym(Sym::MeasurableSet),
             vec![text("A generic measurable set.")],
-        ),
-        "likelihood" => (
-            Math::Ident(crate::ast::Ident {
-                name: "L".to_string(),
-                display: crate::names::DisplayName {
-                    head: crate::names::Atom::Script('L'),
-                    subs: Vec::new(),
-                },
-                target: None,
-            }),
-            vec![text("A likelihood.")],
         ),
         "reals" => (
             Math::Sym(Sym::ExtendedReals),

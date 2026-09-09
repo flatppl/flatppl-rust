@@ -723,11 +723,10 @@ mod tests {
         );
         // The rate family pins its convention by the mean, in math.
         assert!(with.contains("Gamma distribution with shape <math><mi>α</mi></math> and rate <math><mi>β</mi></math>."), "{with}");
-        // A likelihood named `L` prints as ℒ, and the legend says so.
-        assert!(
-            with.contains("<td><math><mi>ℒ</mi></math></td><td><p>A likelihood.</p>"),
-            "{with}"
-        );
+        // A likelihood named `L` prints as ℒ; that is how a row is written,
+        // not a symbol the reader must look up, so the legend stays silent.
+        // The set letter 𝘈 is listed: it stands on both sides of a row.
+        assert!(!with.contains("<td><math><mi>ℒ</mi></math></td>"), "{with}");
         // The legend explains the notation; it never shows the code spelling.
         assert!(!with.contains("<code>Gamma("), "{with}");
         assert!(!with.contains("Normal(mu, sigma)"), "{with}");
