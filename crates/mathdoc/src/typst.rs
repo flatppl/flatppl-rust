@@ -209,6 +209,7 @@ pub(crate) fn quote(text: &str) -> String {
 fn atom(atom: &Atom) -> String {
     match atom {
         Atom::Greek(c) | Atom::Letter(c) => c.to_string(),
+        Atom::Script(c) => format!("cal({c})"),
         Atom::Digits(d) => d.clone(),
         Atom::Word(w) => quote(w),
     }

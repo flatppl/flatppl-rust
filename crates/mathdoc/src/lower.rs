@@ -193,6 +193,10 @@ pub struct Lowerer<'m> {
     inlining: Vec<BindingId>,
     /// The module's source text, for fallback rows.
     source: Option<&'m str>,
+    /// Bindings whose identifier prints with a script head: a likelihood
+    /// object named `L`, `L1` or `L_x` is `ℒ`, `ℒ₁`, `ℒ_x` (the statistics
+    /// convention). The one name rule that reads the inferred types.
+    script_names: HashSet<String>,
 }
 
 /// What a binding's right-hand side lowered to.
@@ -213,7 +217,7 @@ impl<'m> Lowerer<'m> {
             .bindings()
             .map(|(_, b)| m.resolve(b.name).to_string())
             .collect();
-        Lowerer {
+        let mut lowerer = Lowerer {
             m,
             scopes: Vec::new(),
             diagnostics: Vec::new(),
@@ -221,7 +225,33 @@ impl<'m> Lowerer<'m> {
             indices: Vec::new(),
             inlining: Vec::new(),
             source,
+            script_names: HashSet::new(),
+        };
+        lowerer.script_names = m
+            .bindings()
+            .filter(|(_, b)| lowerer.kind(b.rhs) == Kind::Likelihood)
+            .map(|(_, b)| m.resolve(b.name).to_string())
+            .filter(|name| crate::names::display_name(name).head == crate::names::Atom::Letter('L'))
+            .collect();
+        lowerer
+    }
+
+    /// Apply the script-head rule to every identifier that denotes one of
+    /// [`Self::script_names`].
+    fn style_idents(&self, m: &mut Math) {
+        if self.script_names.is_empty() {
+            return;
         }
+        m.for_each_ident_mut(&mut |id| {
+            if id
+                .target
+                .as_deref()
+                .is_some_and(|t| self.script_names.contains(t))
+                && let crate::names::Atom::Letter(c) = id.display.head
+            {
+                id.display.head = crate::names::Atom::Script(c);
+            }
+        });
     }
 
     // ── rows ───────────────────────────────────────────────────────────────
@@ -243,7 +273,9 @@ impl<'m> Lowerer<'m> {
         {
             lowered = None;
         }
-        let lowered = lowered.unwrap_or_else(|| self.source_fallback(id, &name));
+        let mut lowered = lowered.unwrap_or_else(|| self.source_fallback(id, &name));
+        self.style_idents(&mut lowered.statement.lhs);
+        self.style_idents(&mut lowered.statement.rhs);
         Row {
             binding: id,
             names: vec![name],
@@ -299,6 +331,9 @@ impl<'m> Lowerer<'m> {
                 rhs: Math::Code(text),
             }
         });
+        let mut statement = statement;
+        self.style_idents(&mut statement.lhs);
+        self.style_idents(&mut statement.rhs);
         Row {
             binding: consumers[0].1,
             names,
@@ -317,10 +352,11 @@ impl<'m> Lowerer<'m> {
         if too_deep(self.m, rhs) {
             return Math::Code(self.rhs_text(id).1);
         }
-        let value = self.expr(rhs);
+        let mut value = self.expr(rhs);
         if value.depth() > DEFAULT_MAX_DEPTH {
             return Math::Code(self.rhs_text(id).1);
         }
+        self.style_idents(&mut value);
         value
     }
 
@@ -2361,7 +2397,7 @@ mod tests {
         let l = row_named(&rows, "L");
         assert_eq!(l.kind, Kind::Likelihood);
         let lhs = mathml::expr(&l.statement.lhs);
-        assert!(lhs.starts_with("<mrow><mi data-flatppl-ref=\"L\">L</mi><mo>&#x2061;</mo><mrow><mo stretchy=\"false\">(</mo><mi data-flatppl-ref=\"mu\">μ</mi>"), "{lhs}");
+        assert!(lhs.starts_with("<mrow><mi data-flatppl-ref=\"L\">ℒ</mi><mo>&#x2061;</mo><mrow><mo stretchy=\"false\">(</mo><mi data-flatppl-ref=\"mu\">μ</mi>"), "{lhs}");
         let rhs = mathml::expr(&l.statement.rhs);
         assert!(rhs.starts_with("<mrow><msub><mi>p</mi><mi data-flatppl-ref=\"K\">K</mi></msub><mo>&#x2061;</mo><mrow><mo stretchy=\"false\">(</mo><mrow><mrow><mi>y</mi><mo>=</mo>"), "{rhs}");
         assert!(
@@ -2382,7 +2418,7 @@ mod tests {
             "{post}"
         );
         assert!(
-            post.contains("<mi data-flatppl-ref=\"L\">L</mi><mo>&#x2061;</mo>"),
+            post.contains("<mi data-flatppl-ref=\"L\">ℒ</mi><mo>&#x2061;</mo>"),
             "{post}"
         );
         assert!(post.contains("<mspace width=\"0.1667em\"/><mi mathvariant=\"normal\">d</mi><mspace width=\"0.1667em\"/><mi data-flatppl-ref=\"prior\">prior</mi><mrow><mo stretchy=\"false\">(</mo><mi data-flatppl-ref=\"mu\">μ</mi>"), "{post}");
@@ -2437,10 +2473,42 @@ mod tests {
         // In expression position the set slot is the placeholder.
         let n = mathml::expr(&row_named(&rows, "n").statement.rhs);
         assert!(n.contains("<msub><mo>∫</mo><mo>·</mo></msub>"), "{n}");
-        assert!(n.contains("<mi data-flatppl-ref=\"L\">L</mi><mo>&#x2061;</mo><mrow><mo stretchy=\"false\">(</mo><mi data-flatppl-ref=\"mu\">μ</mi>"), "{n}");
+        assert!(n.contains("<mi data-flatppl-ref=\"L\">ℒ</mi><mo>&#x2061;</mo><mrow><mo stretchy=\"false\">(</mo><mi data-flatppl-ref=\"mu\">μ</mi>"), "{n}");
         // A likelihood with no inputs weights by a constant.
         let q = mathml::expr(&row_named(&rows, "q").statement.rhs);
         assert!(q.contains("<mo>⋅</mo>") && !q.contains("∫"), "{q}");
+    }
+
+    #[test]
+    fn a_likelihood_named_l_prints_as_script_l_and_nothing_else_does() {
+        let src = "mu = elementof(reals)\ny ~ Normal(mu, 1)\nK = kernelof(y, mu = mu)\nL_1 = likelihoodof(K, 0.3)\nL2 = likelihoodof(K, 0.7)\nL = joint_likelihood(L_1, L2)\nLik = likelihoodof(K, 0.1)\nM = 2.0\nprior = Normal(0, 10)\npost = bayesupdate(L, prior)";
+        let rows = rows(src);
+        let l = mathml::expr(&row_named(&rows, "L").statement.rhs);
+        assert!(
+            l.contains("<msub data-flatppl-ref=\"L_1\"><mi>ℒ</mi><mn>1</mn></msub>"),
+            "{l}"
+        );
+        assert!(
+            l.contains("<msub data-flatppl-ref=\"L2\"><mi>ℒ</mi><mn>2</mn></msub>"),
+            "{l}"
+        );
+        assert_eq!(
+            mathml::expr(&row_named(&rows, "L").statement.lhs),
+            "<mi data-flatppl-ref=\"L\">ℒ</mi>"
+        );
+        // A word is not restyled, nor is an `L` that is not a likelihood.
+        assert!(
+            mathml::expr(&row_named(&rows, "Lik").statement.lhs)
+                .starts_with("<mrow><mi data-flatppl-ref=\"Lik\">Lik</mi>")
+        );
+        let plain = rows_without_source("L = 2.0\nx = L + 1");
+        assert!(
+            mathml::expr(&row_named(&plain, "x").statement.rhs)
+                .contains("<mi data-flatppl-ref=\"L\">L</mi>")
+        );
+        // The reference inside the posterior integral is restyled too.
+        let post = mathml::expr(&row_named(&rows, "post").statement.rhs);
+        assert!(post.contains("<mi data-flatppl-ref=\"L\">ℒ</mi>"), "{post}");
     }
 
     #[test]

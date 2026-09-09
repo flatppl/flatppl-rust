@@ -246,6 +246,12 @@ impl Statement {
     pub fn depth(&self) -> usize {
         self.lhs.depth().max(self.rhs.depth())
     }
+
+    /// Visit every identifier on both sides, mutably.
+    pub fn for_each_ident_mut(&mut self, f: &mut impl FnMut(&mut Ident)) {
+        self.lhs.for_each_ident_mut(f);
+        self.rhs.for_each_ident_mut(f);
+    }
 }
 
 impl Math {
@@ -634,6 +640,58 @@ impl Math {
             | Math::Sym(_)
             | Math::Op(_)
             | Math::Code(_) => Vec::new(),
+        }
+    }
+
+    /// The direct sub-expressions, mutably.
+    pub fn children_mut(&mut self) -> Vec<&mut Math> {
+        match self {
+            Math::Row(items) | Math::Fenced { items, .. } => items.iter_mut().collect(),
+            Math::Sub(a, b) | Math::Sup(a, b) | Math::Frac(a, b) => vec![a, b],
+            Math::SubSup(a, b, c) => vec![a, b, c],
+            Math::Sqrt(a) | Math::Overline(a) | Math::Unary { arg: a, .. } => vec![a],
+            Math::Apply { head, args } => std::iter::once(head.as_mut())
+                .chain(args.iter_mut())
+                .collect(),
+            Math::Binary { lhs, rhs, .. } | Math::Relation { lhs, rhs, .. } => vec![lhs, rhs],
+            Math::BigOp { sub, sup, body, .. } => sub
+                .iter_mut()
+                .chain(sup.iter_mut())
+                .map(Box::as_mut)
+                .chain(std::iter::once(body.as_mut()))
+                .collect(),
+            Math::Family { body, index, range } => {
+                let mut out = vec![body.as_mut(), index.as_mut()];
+                if let Some((lo, hi)) = range {
+                    out.push(lo);
+                    out.push(hi);
+                }
+                out
+            }
+            Math::Matrix(rows) => rows.iter_mut().flatten().collect(),
+            Math::Cases(rows) => rows
+                .iter_mut()
+                .flat_map(|(v, c)| std::iter::once(v).chain(c.iter_mut()))
+                .collect(),
+            Math::Ident(_)
+            | Math::Num(_)
+            | Math::Text(_)
+            | Math::Str(_)
+            | Math::Sym(_)
+            | Math::Op(_)
+            | Math::Code(_) => Vec::new(),
+        }
+    }
+
+    /// Visit every identifier in the tree, mutably (iterative).
+    pub fn for_each_ident_mut(&mut self, f: &mut impl FnMut(&mut Ident)) {
+        let mut stack: Vec<&mut Math> = vec![self];
+        while let Some(m) = stack.pop() {
+            if let Math::Ident(id) = m {
+                f(id);
+                continue;
+            }
+            stack.extend(m.children_mut());
         }
     }
 

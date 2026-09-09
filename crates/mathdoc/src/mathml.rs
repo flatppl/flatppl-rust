@@ -352,6 +352,7 @@ fn write_ident(out: &mut String, id: &Ident) {
 fn atom_text(atom: &Atom) -> String {
     match atom {
         Atom::Greek(c) | Atom::Letter(c) => c.to_string(),
+        Atom::Script(c) => crate::names::script_capital(*c).to_string(),
         Atom::Digits(d) => escape(d),
         Atom::Word(w) => escape(w),
     }

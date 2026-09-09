@@ -190,6 +190,7 @@ pub fn expr(m: &Math) -> String {
 fn atom(a: &Atom) -> String {
     match a {
         Atom::Greek(c) | Atom::Letter(c) => c.to_string(),
+        Atom::Script(c) => format!(r"\mathcal{{{c}}}"),
         Atom::Digits(s) => s.clone(),
         Atom::Word(s) => format!(r"\mathrm{{{}}}", escape(s)),
     }

@@ -77,6 +77,10 @@ trailing digits split off.
 | a single Latin letter | that letter in italics | `x`, `J`, `L` |
 | anything else | the **whole name** as upright text, underscores kept | `prior`, `alphaxy`, `forward_kernel`, `rcp_max`, `yS` |
 
+One rule reads the inferred types: a binding named `L`, `L1` or `L_x` that is
+bound to a likelihood object prints as ℒ, ℒ₁, ℒ_x, the statistics convention,
+and the legend says so. No other name is restyled by what it holds.
+
 Only a Greek or single-letter head takes subscripts: the head's trailing digits
 first, then each further segment (Greek, letter, word or digits by the same
 rule), comma-separated.

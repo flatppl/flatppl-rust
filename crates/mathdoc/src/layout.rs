@@ -8,7 +8,7 @@ pub(crate) const LINE_WIDTH: usize = 72;
 /// Approximate printed glyph count, not a font or viewport measurement.
 pub(crate) fn width(m: &Math) -> usize {
     let atom = |a: &Atom| match a {
-        Atom::Greek(_) | Atom::Letter(_) => 1,
+        Atom::Greek(_) | Atom::Letter(_) | Atom::Script(_) => 1,
         Atom::Digits(s) | Atom::Word(s) => s.chars().count(),
     };
     match m {
