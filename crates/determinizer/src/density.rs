@@ -8150,11 +8150,11 @@ pub(crate) fn fold_add(m: &mut Module, terms: &[NodeId]) -> NodeId {
     while level.len() > 1 {
         next.clear();
         next.reserve(level.len().div_ceil(2));
-        let mut chunks = level.chunks_exact(2);
-        for pair in &mut chunks {
+        let (pairs, remainder) = level.as_chunks::<2>();
+        for pair in pairs {
             next.push(build_call(m, "add", &[pair[0], pair[1]]));
         }
-        next.extend_from_slice(chunks.remainder());
+        next.extend_from_slice(remainder);
         std::mem::swap(&mut level, &mut next);
     }
     level[0]
