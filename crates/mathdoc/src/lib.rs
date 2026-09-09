@@ -11,5 +11,6 @@
 #![doc = include_str!("../NOTATION.md")]
 
 pub mod ast;
+pub mod lower;
 pub mod mathml;
 pub mod names;

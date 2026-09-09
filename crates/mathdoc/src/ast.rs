@@ -133,6 +133,8 @@ pub enum Op {
     Dot,
     /// A multiplication dot in a row (`1 · 10^{-3}`).
     Cdot,
+    /// A separating comma inside a script (`A_{i,j}`).
+    Comma,
     /// Restriction bar before a subscript (`M|_S`).
     Restrict,
     /// Differential `d` in `M(dx)`.
@@ -214,6 +216,19 @@ pub struct Statement {
     pub rhs: Math,
 }
 
+impl Statement {
+    /// Every binding the row refers to, left-hand side first, each once.
+    pub fn refs(&self) -> Vec<String> {
+        let mut out = self.lhs.refs();
+        for r in self.rhs.refs() {
+            if !out.contains(&r) {
+                out.push(r);
+            }
+        }
+        out
+    }
+}
+
 impl Math {
     // ── constructors ───────────────────────────────────────────────────────
 
@@ -249,7 +264,7 @@ impl Math {
 
     pub fn int(i: i64) -> Math {
         if i < 0 {
-            Math::neg(Math::Num(i.unsigned_abs().to_string()))
+            Math::negate(Math::Num(i.unsigned_abs().to_string()))
         } else {
             Math::Num(i.to_string())
         }
@@ -263,10 +278,10 @@ impl Math {
         }
         if x.is_infinite() {
             let inf = Math::Sym(Sym::Infinity);
-            return if x < 0.0 { Math::neg(inf) } else { inf };
+            return if x < 0.0 { Math::negate(inf) } else { inf };
         }
         if x < 0.0 {
-            return Math::neg(Math::real(-x));
+            return Math::negate(Math::real(-x));
         }
         let mag = x.abs();
         if mag != 0.0 && !(1e-4..1e16).contains(&mag) {
@@ -286,7 +301,7 @@ impl Math {
         Math::Num(format!("{x}"))
     }
 
-    pub fn neg(arg: Math) -> Math {
+    pub fn negate(arg: Math) -> Math {
         Math::Unary {
             op: UnOp::Neg,
             arg: Box::new(arg),
@@ -301,17 +316,17 @@ impl Math {
         }
     }
 
-    pub fn add(lhs: Math, rhs: Math) -> Math {
+    pub fn plus(lhs: Math, rhs: Math) -> Math {
         Math::binary(BinOp::Add, lhs, rhs)
     }
 
-    pub fn sub(lhs: Math, rhs: Math) -> Math {
+    pub fn minus(lhs: Math, rhs: Math) -> Math {
         Math::binary(BinOp::Sub, lhs, rhs)
     }
 
     /// Multiplication, choosing juxtaposition unless the right operand starts
     /// with a number (`x · 2`, `2 · 3`) or is negated.
-    pub fn mul(lhs: Math, rhs: Math) -> Math {
+    pub fn times(lhs: Math, rhs: Math) -> Math {
         let explicit = rhs.starts_with_number()
             || matches!(rhs, Math::Unary { .. })
             || (lhs.ends_with_number() && rhs.starts_with_number());
@@ -336,7 +351,7 @@ impl Math {
         Math::Sup(Box::new(base), Box::new(exp))
     }
 
-    pub fn sub_(base: Math, sub: Math) -> Math {
+    pub fn subscript(base: Math, sub: Math) -> Math {
         Math::Sub(Box::new(base), Box::new(sub))
     }
 
@@ -590,22 +605,22 @@ mod tests {
     fn mul_picks_juxtaposition_unless_a_number_follows() {
         let x = Math::binding("x");
         assert!(matches!(
-            Math::mul(Math::int(2), x.clone()),
+            Math::times(Math::int(2), x.clone()),
             Math::Binary {
                 op: BinOp::Juxtapose,
                 ..
             }
         ));
         assert!(matches!(
-            Math::mul(x.clone(), Math::int(2)),
+            Math::times(x.clone(), Math::int(2)),
             Math::Binary { op: BinOp::Dot, .. }
         ));
         assert!(matches!(
-            Math::mul(Math::int(3), Math::real(4.5)),
+            Math::times(Math::int(3), Math::real(4.5)),
             Math::Binary { op: BinOp::Dot, .. }
         ));
         assert!(matches!(
-            Math::mul(x, Math::neg(Math::binding("y"))),
+            Math::times(x, Math::negate(Math::binding("y"))),
             Math::Binary { op: BinOp::Dot, .. }
         ));
     }
@@ -619,7 +634,7 @@ mod tests {
             Math::Row(items) => assert!(matches!(items[0], Math::Num(ref m) if m == "1")),
             other => panic!("{other:?}"),
         }
-        assert_eq!(Math::real(-2.5), Math::neg(Math::Num("2.5".into())));
+        assert_eq!(Math::real(-2.5), Math::negate(Math::Num("2.5".into())));
         assert_eq!(Math::real(f64::INFINITY), Math::Sym(Sym::Infinity));
     }
 
@@ -628,20 +643,20 @@ mod tests {
         let a = Math::binding("a");
         let b = Math::binding("b");
         let c = Math::binding("c");
-        let inner = Math::sub(b.clone(), c.clone());
-        let left = Math::sub(inner.clone(), a.clone());
-        let right = Math::sub(a, inner.clone());
+        let inner = Math::minus(b.clone(), c.clone());
+        let left = Math::minus(inner.clone(), a.clone());
+        let right = Math::minus(a, inner.clone());
         assert!(!left.needs_parens(&inner, Slot::Left));
         assert!(right.needs_parens(&inner, Slot::Right));
-        let sum = Math::add(b, c);
-        let prod = Math::mul(sum.clone(), Math::binding("d"));
+        let sum = Math::plus(b, c);
+        let prod = Math::times(sum.clone(), Math::binding("d"));
         assert!(prod.needs_parens(&sum, Slot::Left));
     }
 
     #[test]
     fn refs_collects_binding_targets_once_in_order() {
-        let m = Math::add(
-            Math::mul(Math::binding("a"), Math::binding("b")),
+        let m = Math::plus(
+            Math::times(Math::binding("a"), Math::binding("b")),
             Math::apply(
                 Math::text("exp"),
                 vec![Math::binding("a"), Math::ident("p", None)],

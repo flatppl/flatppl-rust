@@ -358,6 +358,7 @@ fn write_op(out: &mut String, op: Op) {
         Op::Times => "<mo>×</mo>",
         Op::Dot => "<mo>.</mo>",
         Op::Cdot => "<mo>⋅</mo>",
+        Op::Comma => "<mo>,</mo>",
         Op::Restrict => "<mo stretchy=\"false\">|</mo>",
         Op::Differential => "<mi mathvariant=\"normal\">d</mi>",
         Op::Transpose => "<mi mathvariant=\"normal\">T</mi>",
@@ -457,30 +458,33 @@ mod tests {
 
     #[test]
     fn juxtaposition_uses_the_invisible_times_and_the_dot_is_explicit() {
-        let m = Math::add(Math::mul(Math::int(2), b("x")), Math::int(1));
+        let m = Math::plus(Math::times(Math::int(2), b("x")), Math::int(1));
         assert_eq!(
             expr(&m),
             "<mrow><mrow><mn>2</mn><mo>&#x2062;</mo><mi data-flatppl-ref=\"x\">x</mi></mrow><mo>+</mo><mn>1</mn></mrow>"
         );
-        let m = Math::mul(b("x"), Math::int(2));
+        let m = Math::times(b("x"), Math::int(2));
         assert!(expr(&m).contains("<mo>⋅</mo>"));
     }
 
     #[test]
     fn brackets_follow_the_tree_rules() {
-        let inner = Math::sub(b("b"), b("c"));
-        let m = Math::sub(b("a"), inner.clone());
+        let inner = Math::minus(b("b"), b("c"));
+        let m = Math::minus(b("a"), inner.clone());
         assert!(expr(&m).contains("<mo>(</mo>"));
-        let m = Math::sub(inner, b("a"));
+        let m = Math::minus(inner, b("a"));
         assert!(!expr(&m).contains("<mo>(</mo>"));
-        let m = Math::mul(Math::add(b("a"), b("b")), b("c"));
+        let m = Math::times(Math::plus(b("a"), b("b")), b("c"));
         assert!(expr(&m).starts_with("<mrow><mrow><mo>(</mo>"));
-        let m = Math::pow(Math::neg(Math::int(2)), Math::int(3));
+        let m = Math::pow(Math::negate(Math::int(2)), Math::int(3));
         assert_eq!(
             expr(&m),
             "<msup><mrow><mo>(</mo><mrow><mo>−</mo><mn>2</mn></mrow><mo>)</mo></mrow><mn>3</mn></msup>"
         );
-        let m = Math::pow(Math::sub_(b("x"), Math::ident("i", None)), Math::int(2));
+        let m = Math::pow(
+            Math::subscript(b("x"), Math::ident("i", None)),
+            Math::int(2),
+        );
         assert!(!expr(&m).contains("<mo>(</mo>"));
     }
 
@@ -525,7 +529,7 @@ mod tests {
     #[test]
     fn families_and_big_operators_lay_out_their_limits() {
         let fam = Math::family(
-            Math::add(b("a"), Math::sub_(b("x"), Math::ident("i", None))),
+            Math::plus(b("a"), Math::subscript(b("x"), Math::ident("i", None))),
             Math::ident("i", None),
             Some((Math::int(1), b("N"))),
         );
@@ -538,9 +542,9 @@ mod tests {
             BigOp::Sum,
             Some(Math::ident("j", None)),
             None,
-            Math::mul(
-                Math::sub_(b("A"), Math::ident("ij", None)),
-                Math::sub_(b("B"), Math::ident("jk", None)),
+            Math::times(
+                Math::subscript(b("A"), Math::ident("ij", None)),
+                Math::subscript(b("B"), Math::ident("jk", None)),
             ),
         );
         assert!(expr(&sum).starts_with("<mrow><munder><mo>∑</mo><mi>j</mi></munder>"));
@@ -554,7 +558,7 @@ mod tests {
             Some(b("n")),
             Math::call(
                 "Normal",
-                vec![Math::sub_(b("mu"), Math::ident("i", None)), b("s")],
+                vec![Math::subscript(b("mu"), Math::ident("i", None)), b("s")],
             ),
         );
         assert!(expr(&prod).contains("<munderover><mo>⨂</mo>"));
@@ -563,7 +567,7 @@ mod tests {
     #[test]
     fn conditional_densities_and_restrictions_use_bare_operators() {
         let p = Math::apply(
-            Math::sub_(Math::letter('p'), b("K")),
+            Math::subscript(Math::letter('p'), b("K")),
             vec![Math::row(vec![b("y_data"), Math::Op(Op::Bar), b("theta")])],
         );
         let s = expr(&p);
@@ -571,7 +575,7 @@ mod tests {
             "<mrow><msub><mi>p</mi><mi data-flatppl-ref=\"K\">K</mi></msub><mo>&#x2061;</mo>"
         ));
         assert!(s.contains("<mo stretchy=\"false\">|</mo>"));
-        let r = Math::sub_(
+        let r = Math::subscript(
             Math::row(vec![
                 Math::call("Cauchy", vec![Math::int(0), Math::int(5)]),
                 Math::Op(Op::Restrict),
@@ -604,7 +608,7 @@ mod tests {
         assert!(is_single_element("<mi>x</mi>"));
         assert!(is_single_element("<msub><mi>x</mi><mn>1</mn></msub>"));
         assert!(!is_single_element("<mi>x</mi><mo>+</mo><mi>y</mi>"));
-        let f = Math::frac(Math::add(b("a"), b("b")), b("c"));
+        let f = Math::frac(Math::plus(b("a"), b("b")), b("c"));
         assert_eq!(
             expr(&f),
             "<mfrac><mrow><mi data-flatppl-ref=\"a\">a</mi><mo>+</mo><mi data-flatppl-ref=\"b\">b</mi></mrow><mi data-flatppl-ref=\"c\">c</mi></mfrac>"
