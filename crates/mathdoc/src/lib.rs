@@ -11,6 +11,11 @@
 #![doc = include_str!("../NOTATION.md")]
 
 pub mod ast;
+#[cfg(feature = "json")]
+pub mod json;
 pub mod lower;
 pub mod mathml;
 pub mod names;
+pub mod render;
+
+pub use render::{BindingRender, Diagnostic, Rendering, render, render_source};
