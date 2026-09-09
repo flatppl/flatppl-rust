@@ -947,7 +947,7 @@ impl<'m> Lowerer<'m> {
             "iid" if call.args.len() == 2 && call.named.is_empty() => {
                 let m = self.expr(call.args[0]);
                 let n = self.size_exponent(call.args[1]);
-                Math::pow(m, Math::row(vec![Math::Op(Op::Otimes), n]))
+                Math::pow(m, n)
             }
             "relabel" if call.args.len() == 2 && self.is_string_vector(call.args[1]) => {
                 let m = self.expr(call.args[0]);
@@ -1190,7 +1190,7 @@ impl<'m> Lowerer<'m> {
                 }
                 items.push(d);
             }
-            return Math::paren(vec![Math::row(items)]);
+            return Math::row(items);
         }
         self.expr(size)
     }
@@ -1762,7 +1762,7 @@ pub fn apply_builtin(name: &str, mut args: Vec<Math>) -> Math {
         ("logweighted", 2) => Math::dot(Math::pow(Math::Sym(Sym::Euler), take(0)), take(1)),
         ("superpose", _) if n > 0 => chain(BinOp::Add, args).expect("one or more operands"),
         ("truncate", 2) => restrict(take(0), take(1)),
-        ("iid", 2) => Math::pow(take(0), Math::row(vec![Math::Op(Op::Otimes), take(1)])),
+        ("iid", 2) => Math::pow(take(0), take(1)),
         ("locscale", 3) => {
             let m = take(0);
             let shift = take(1);
@@ -2063,7 +2063,17 @@ mod tests {
         let src = "J = 8\nmu ~ Normal(0, 5)\ntau = elementof(posreals)\ntheta ~ iid(Normal(mu, tau), J)\ns = [15.0, 10.0, 16.0, 11.0, 9.0, 11.0, 10.0, 18.0]\ny ~ Normal.(theta, s)\nalpha = elementof(reals)\nbeta = elementof(reals)\nx = [1.1, 1.5, 1.3, 1.4]\nmeans = alpha .+ beta .* x";
         let rows = rows(src);
         let theta = mathml::expr(&row_named(&rows, "theta").statement.rhs);
-        assert!(theta.ends_with("<mrow><mo>⊗</mo><mi data-flatppl-ref=\"J\">J</mi></mrow></msup>"));
+        // The n-fold product measure is the bare power `Mⁿ` (van der Vaart's
+        // `Pⁿ`), not `M^{⊗n}`; a vector size is `M^{m×n}`.
+        assert!(
+            theta.ends_with("<mo>)</mo></mrow></mrow><mi data-flatppl-ref=\"J\">J</mi></msup>"),
+            "{theta}"
+        );
+        let grid = rhs("w ~ iid(Normal(0, 1), [2, 3])", "w");
+        assert!(
+            grid.ends_with("<mrow><mn>2</mn><mo>×</mo><mn>3</mn></mrow></msup>"),
+            "{grid}"
+        );
         let y = mathml::expr(&row_named(&rows, "y").statement.rhs);
         assert!(y.starts_with("<mrow><munderover><mo>⨂</mo><mrow><mi>i</mi><mo>=</mo><mn>1</mn></mrow><mi data-flatppl-ref=\"J\">J</mi></munderover>"), "{y}");
         assert!(y.contains("<msub><mi data-flatppl-ref=\"theta\">θ</mi><mi>i</mi></msub><mo>,</mo><msub><mi data-flatppl-ref=\"s\">s</mi><mi>i</mi></msub>"));

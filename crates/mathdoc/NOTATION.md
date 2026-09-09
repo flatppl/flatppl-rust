@@ -21,7 +21,7 @@ the rules stated here.
   prints as the measure; a density value prints as `p_M(x)` with the measure in
   the subscript. The distinction FlatPPL makes at the language level is kept.
 - **Overload notation, never semantics.** Math may overload operators more freely
-  than code (`M^{⊗n}` for `iid`, `f_* M` for `pushfwd`), but every rendering is
+  than code (`Mⁿ` for `iid`, `f_* M` for `pushfwd`), but every rendering is
   the definition of the construct it stands for, never a guess at what the
   author meant.
 - **A row never goes blank.** A right-hand side the lowering cannot render
@@ -150,7 +150,7 @@ callable without one they print as `name = value`.
 
 | FlatPPL | Math |
 | --- | --- |
-| `iid(M, n)`, `iid(M, [m, n])` | M^{⊗n}, M^{⊗(m×n)} |
+| `iid(M, n)`, `iid(M, [m, n])` | Mⁿ, M^{m×n} — the n-fold product measure as a bare power (van der Vaart's Pⁿ), matching Sⁿ for `cartpow`; the `⊗` is kept for products of different factors |
 | `K.(xs, ys)`, `broadcast(K, xs, ys)` with K a kernel | ⨂_{i=1}^{n} K(xs_i, ys_i) |
 | `f.(xs, c)`, `xs .+ c`, `broadcast(f, xs, c)` with f a function | (f(xs_i, c))_{i=1}^{n}, (xs_i + c)_{i=1}^{n} |
 | nested dotted expressions | one family, one index: (invlogit(a_{g_i} + b x_i))_{i} |

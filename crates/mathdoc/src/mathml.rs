@@ -359,7 +359,6 @@ fn write_op(out: &mut String, op: Op) {
     out.push_str(match op {
         Op::Bar => "<mo stretchy=\"false\">|</mo>",
         Op::Star => "<mo>∗</mo>",
-        Op::Otimes => "<mo>⊗</mo>",
         Op::Times => "<mo>×</mo>",
         Op::Dot => "<mo>.</mo>",
         Op::Cdot => "<mo>⋅</mo>",

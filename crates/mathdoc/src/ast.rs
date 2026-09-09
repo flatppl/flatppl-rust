@@ -125,9 +125,7 @@ pub enum Op {
     Bar,
     /// Lower-star for the pushforward `f_*`.
     Star,
-    /// `⊗` inside a superscript (`M^{⊗n}`).
-    Otimes,
-    /// `×` inside a superscript (`S^{m×n}`).
+    /// `×` inside a superscript (`S^{m×n}`, `M^{m×n}`).
     Times,
     /// A member-access dot (`r.a`).
     Dot,
