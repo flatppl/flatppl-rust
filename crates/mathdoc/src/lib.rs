@@ -1,0 +1,13 @@
+//! `flatppl-mathdoc` — FlatPPL rendered as mathematics.
+//!
+//! Builds a target-independent math AST ([`ast`]) from a typed and phased
+//! [`flatppl_core::Module`] and prints it as MathML. The notation — which
+//! FlatPPL construct becomes which mathematical form, how names render, where
+//! the measure/density distinction shows — is specified in `NOTATION.md`
+//! (reproduced below) and is the contract both printers implement.
+//!
+//! Binary-free: the CLI (`flatppl convert model.flatppl model.html`) and the
+//! wasm API (`render_math`) are thin adapters in their own crates.
+#![doc = include_str!("../NOTATION.md")]
+
+pub mod names;

@@ -1,0 +1,24 @@
+[package]
+name = "flatppl-mathdoc"
+description = "FlatPPL → mathematics: a math AST over the typed module, printed as MathML (and later Typst), plus document assembly (binary-free; surfaced by flatppl-cli as `flatppl convert model.flatppl model.html` and by flatppl-wasm-api as `render_math`)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["json", "document"]
+# The string-in / string-out JSON contract the viewer and the wasm API use.
+json = ["dep:serde", "dep:serde_json"]
+# Whole-document assembly (HTML page): doc-comment Markdown and its LaTeX math.
+document = ["dep:pulldown-cmark", "dep:latex2mathml"]
+
+[dependencies]
+flatppl-core = { path = "../core" }
+flatppl-infer = { path = "../infer" }
+flatppl-syntax = { path = "../syntax" }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+pulldown-cmark = { version = "0.13", default-features = false, optional = true }
+latex2mathml = { version = "0.2", optional = true }
