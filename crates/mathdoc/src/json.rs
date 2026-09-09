@@ -40,7 +40,9 @@
 //! `tex` and `typst` give native math source without delimiters. Unknown
 //! formats add a module-level diagnostic rather than failing. The notation
 //! key uses the same requested formats as the binding rows; its `note` is an
-//! HTML fragment (text escaped, parameter letters as inline MathML).
+//! HTML fragment (text escaped, parameter letters as inline MathML) and its
+//! `name` the builtin explained, a key for hosts — the math view shows the
+//! notation and the note, never a code spelling.
 //! Set `document: true` to also receive `document: { html, css }`: the full
 //! article and scoped stylesheet shared with the standalone HTML export.
 //! Binding metadata remains available for host selection and source navigation.
@@ -99,7 +101,8 @@ struct NotationJson {
     tex: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     typst: Option<String>,
-    source: String,
+    /// The builtin the entry explains (`Normal`, `lawof`, `reals`), a key.
+    name: String,
     note: String,
 }
 
@@ -238,7 +241,7 @@ fn to_response(rendering: Rendering, want_mathml: bool, formats: &[String]) -> R
                 tex: want_tex.then(|| crate::tex::expr(&n.form)),
                 typst: want_typst.then(|| crate::typst::expr(&n.form)),
                 note: n.note_html(),
-                source: n.source,
+                name: n.name,
             })
             .collect(),
         order,
@@ -287,7 +290,7 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .find(|n| n["source"] == "Normal(mu, sigma)")
+            .find(|n| n["name"] == "Normal")
             .unwrap();
         assert!(
             normal["mathml"]

@@ -22,7 +22,9 @@ pub enum NoteSegment {
 #[derive(Clone, Debug, PartialEq)]
 pub struct NotationEntry {
     pub form: Math,
-    pub source: String,
+    /// The builtin the entry explains (`Normal`, `lawof`, `reals`), a key for
+    /// hosts; the math view never shows a code spelling beside the notation.
+    pub name: String,
     /// Prose with inline mathematics; rendered per target by
     /// [`NotationEntry::note_html`] and the export formats.
     pub note: Vec<NoteSegment>,
@@ -119,10 +121,9 @@ fn contains_sym(m: &Math, sym: Sym) -> bool {
 }
 
 fn entry(name: &str) -> NotationEntry {
-    let (form, source, note) = match name {
+    let (form, note) = match name {
         "measurable-set" => (
             Math::Sym(Sym::MeasurableSet),
-            String::new(),
             vec![
                 text("A measurable set. A row "),
                 math(Math::relation(
@@ -144,12 +145,10 @@ fn entry(name: &str) -> NotationEntry {
         ),
         "reals" => (
             Math::Sym(Sym::ExtendedReals),
-            "reals".to_string(),
             vec![text("Extended real numbers, including both infinities.")],
         ),
         "lawof" => (
             apply_builtin(name, vec![Math::letter('X')]),
-            "lawof(X)".to_string(),
             vec![
                 text("Probability law (distribution) of "),
                 math(Math::letter('X')),
@@ -158,9 +157,9 @@ fn entry(name: &str) -> NotationEntry {
         ),
         _ => {
             let params = flatppl_infer::distribution_param_names(name).unwrap_or_default();
-            // The rate and scale families show conventional letters so the
-            // note can pin the convention by the mean; the source column
-            // maps them to the parameter names by position.
+            // Conventional letters where the parameter names are words
+            // (`shape`, `rate`, `location`); the note names each by its
+            // letter.
             let letters: Vec<&str> = match name {
                 "Gamma" | "InverseGamma" => vec!["alpha", "beta"],
                 "Exponential" | "Poisson" => vec!["lambda"],
@@ -304,12 +303,12 @@ fn entry(name: &str) -> NotationEntry {
                     note
                 }
             };
-            (
-                apply_builtin(name, args),
-                format!("{name}({})", params.join(", ")),
-                note,
-            )
+            (apply_builtin(name, args), note)
         }
     };
-    NotationEntry { form, source, note }
+    NotationEntry {
+        form,
+        name: name.to_string(),
+        note,
+    }
 }

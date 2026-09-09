@@ -551,14 +551,9 @@ fn notation_section(module: &Module, rendering: &Rendering) -> String {
     if !rendering.notation.is_empty() {
         out.push_str("<h3>Symbols and parameterisations</h3>\n<table>\n");
         for entry in &rendering.notation {
-            let source = if entry.source.is_empty() {
-                String::new()
-            } else {
-                format!("<code>{}</code>", escape(&entry.source))
-            };
             let _ = writeln!(
                 out,
-                "<tr><td><math>{}</math></td><td>{source}<p>{}</p></td></tr>",
+                "<tr><td><math>{}</math></td><td><p>{}</p></td></tr>",
                 mathml::expr(&entry.form),
                 entry.note_html()
             );
@@ -606,7 +601,11 @@ mod tests {
         assert!(p.contains("<mtr data-flatppl-binding=\"tau\" id=\"flatppl-tau\">"));
         // Notation appendix lists the latent variables and the distributions.
         assert!(p.contains("<h3>Random variables</h3>"));
-        assert!(p.contains("<code>Cauchy(location, scale)</code>"));
+        assert!(
+            p.contains("Cauchy distribution with location <math>"),
+            "{p}"
+        );
+        assert!(!p.contains("<code>Cauchy("), "{p}");
     }
 
     #[test]
@@ -769,7 +768,9 @@ mod tests {
         assert!(with.contains("defines the measure <math><mi>ν</mi></math> by its value on every set <math><mi>𝘈</mi></math>."), "{with}");
         // The rate family pins its convention by the mean, in math.
         assert!(with.contains("Gamma distribution with shape <math><mi>α</mi></math> and rate <math><mi>β</mi></math>."), "{with}");
-        assert!(with.contains("<code>Gamma(shape, rate)</code>"), "{with}");
+        // The legend explains the notation; it never shows the code spelling.
+        assert!(!with.contains("<code>Gamma("), "{with}");
+        assert!(!with.contains("Normal(mu, sigma)"), "{with}");
         let without = page("x ~ Normal(0, 1)");
         assert!(!without.contains("<mi>𝘈</mi>"), "{without}");
         assert!(without.contains("Normal distribution with mean <math><mi>μ</mi></math> and variance <math><msup><mi>σ</mi><mn>2</mn></msup></math>."), "{without}");

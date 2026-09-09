@@ -58,9 +58,13 @@ the rules stated here.
   enclosing fences, powers and source references stay intact. The shared
   width estimate is deterministic, not a font or viewport measurement.
   HTML equation blocks scroll horizontally when an expression still cannot fit.
-- A generated notation key explains the symbols and distribution conventions
-  used in the module. The HTML appendix also lists parameters (`elementof`),
-  external inputs, and random variables (`draw`).
+- A generated notation key explains the symbols used in the module: each
+  distribution in the notation of its row (`𝒩(μ, σ²)`, `Exp(λ)`) with a
+  one-line note naming its parameters, the law, the extended reals, and the
+  set letter 𝘈 when a row is a set function. The key explains the notation
+  only; a code spelling such as `Normal(mu, sigma)` never appears beside it —
+  a reader who wants the code has the source. The HTML appendix also lists
+  parameters (`elementof`), external inputs, and random variables (`draw`).
 
 ## Names
 

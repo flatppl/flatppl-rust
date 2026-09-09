@@ -153,19 +153,19 @@ impl Format {
 
     fn legend(self, out: &mut String, entry: &crate::notation::NotationEntry) {
         let form = &entry.form;
-        let source = &entry.source;
         // The note's mathematics goes through this format's own math printer;
-        // its text through this format's escaping.
+        // its text through this format's escaping. No code spelling: the
+        // legend explains the notation, not the source.
         match self {
             Self::Markdown => {
                 let _ = writeln!(out, "```math\n{}\n```\n", tex::expr(form));
                 let note = entry.note_with(markdown_text, |m| format!("${}$", tex::expr(m)));
-                let _ = writeln!(out, "{}{note}\n", label(&markdown_text(source)));
+                let _ = writeln!(out, "{note}\n");
             }
             Self::Latex => {
                 let _ = writeln!(out, "\\[{}\\]\n", tex::expr(form));
                 let note = entry.note_with(tex::escape, |m| format!("${}$", tex::expr(m)));
-                let _ = writeln!(out, "{}{note}\n", label(&tex::escape(source)));
+                let _ = writeln!(out, "{note}\n");
             }
             Self::Typst => {
                 let _ = writeln!(out, "$ {} $\n", typst::expr(form));
@@ -173,12 +173,7 @@ impl Format {
                     |t| format!("#text({})", typst::quote(t)),
                     |m| format!("${}$", typst::expr(m)),
                 );
-                let source = if source.is_empty() {
-                    String::new()
-                } else {
-                    format!("#text({}): ", typst::quote(source))
-                };
-                let _ = writeln!(out, "{source}{note}\n");
+                let _ = writeln!(out, "{note}\n");
             }
         }
     }
@@ -324,16 +319,6 @@ fn document(
         out.push_str("\\end{document}\n");
     }
     out
-}
-
-/// `source: ` before a legend note, or nothing for an entry without a source
-/// spelling (the set letter).
-fn label(source: &str) -> String {
-    if source.is_empty() {
-        String::new()
-    } else {
-        format!("{source}: ")
-    }
 }
 
 fn markdown_text(text: &str) -> String {
