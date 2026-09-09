@@ -1,7 +1,7 @@
 //! The math AST — target-independent mathematical structure.
 //!
 //! The lowering (`lower`) builds this tree from the IR; the printers
-//! (`mathml`, later `typst`) only choose glyphs. Nothing here carries a target
+//! (`mathml`, `tex`, `typst`) only choose glyphs. Nothing here carries a target
 //! escape or a target-specific layout decision. Parenthesisation is a property
 //! of the tree ([`Math::prec`] + the slot rules in [`Math::needs_parens`]) so
 //! every printer brackets identically.
@@ -343,9 +343,27 @@ impl Math {
         Math::binary(BinOp::Sub, lhs, rhs)
     }
 
-    /// Multiplication, choosing juxtaposition unless the right operand starts
-    /// with a number (`x · 2`, `2 · 3`) or is negated.
+    /// Ordinary arithmetic multiplication: numeric coefficients read first,
+    /// and multiplication by a unit reciprocal reads as a fraction.
+    /// Symbolic factors retain their order; neither rule evaluates constants.
+    /// Measure weighting uses [`Math::dot`] instead.
     pub fn times(lhs: Math, rhs: Math) -> Math {
+        let number = |m: &Math| {
+            matches!(m, Math::Num(_))
+                || matches!(m, Math::Unary { op: UnOp::Neg, arg } if matches!(**arg, Math::Num(_)))
+        };
+        if number(&rhs) && !number(&lhs) {
+            return Math::times(rhs, lhs);
+        }
+        let rhs = match rhs {
+            // FlatPPL's ordinary division has a scalar denominator (§07).
+            // Keep that denominator intact: no cancellation or reassociation
+            // inside it, even when it contains the same symbol as the numerator.
+            Math::Frac(num, den) if matches!(&*num, Math::Num(n) if n == "1") => {
+                return Math::frac(lhs, *den);
+            }
+            other => other,
+        };
         let explicit = rhs.starts_with_number()
             || matches!(rhs, Math::Unary { .. })
             || (lhs.ends_with_number() && rhs.starts_with_number());
@@ -498,6 +516,14 @@ impl Math {
         }
         match self {
             Math::Binary { op, .. } => {
+                // A negative coefficient inside a product still needs a
+                // fence on the right: `a(-3b)`, never `a - 3b`.
+                if slot == Slot::Right
+                    && matches!(op, BinOp::Juxtapose | BinOp::Dot)
+                    && child.starts_with_minus()
+                {
+                    return true;
+                }
                 let p = self.prec();
                 let c = child.prec();
                 if c < p {
@@ -525,6 +551,18 @@ impl Math {
             Math::Sub(..) | Math::Sup(..) | Math::SubSup(..) if slot == Slot::Base => {
                 child.prec() < 9
             }
+            _ => false,
+        }
+    }
+
+    fn starts_with_minus(&self) -> bool {
+        match self {
+            Math::Unary { op: UnOp::Neg, .. } => true,
+            Math::Binary {
+                op: BinOp::Juxtapose | BinOp::Dot,
+                lhs,
+                ..
+            } => lhs.starts_with_minus(),
             _ => false,
         }
     }
@@ -641,27 +679,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mul_picks_juxtaposition_unless_a_number_follows() {
+    fn multiplication_keeps_numeric_products_explicit_and_symbolic_order() {
         let x = Math::binding("x");
-        assert!(matches!(
-            Math::times(Math::int(2), x.clone()),
-            Math::Binary {
-                op: BinOp::Juxtapose,
-                ..
-            }
-        ));
-        assert!(matches!(
-            Math::times(x.clone(), Math::int(2)),
-            Math::Binary { op: BinOp::Dot, .. }
-        ));
-        assert!(matches!(
-            Math::times(Math::int(3), Math::real(4.5)),
-            Math::Binary { op: BinOp::Dot, .. }
-        ));
-        assert!(matches!(
-            Math::times(x, Math::negate(Math::binding("y"))),
-            Math::Binary { op: BinOp::Dot, .. }
-        ));
+        assert_eq!(
+            crate::tex::expr(&Math::times(Math::int(2), x.clone())),
+            "2  x"
+        );
+        assert_eq!(
+            crate::tex::expr(&Math::times(x.clone(), Math::int(2))),
+            "2  x"
+        );
+        assert_eq!(
+            crate::tex::expr(&Math::times(Math::int(3), Math::real(4.5))),
+            r"3 \cdot 4.5"
+        );
+        assert_eq!(
+            crate::tex::expr(&Math::times(x, Math::negate(Math::binding("y")))),
+            r"x \cdot \left(- y\right)"
+        );
     }
 
     #[test]

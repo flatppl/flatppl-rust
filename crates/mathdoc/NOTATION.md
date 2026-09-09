@@ -125,8 +125,9 @@ the same rules (`.mu` → μ).
 | FlatPPL | Math |
 | --- | --- |
 | `a + b`, `a - b`, `-a` | a + b, a − b, −a |
-| `a * b` | ab by juxtaposition; a · b when the right operand is a number or both are |
+| `a * b` | ab by juxtaposition; a numeric literal coefficient reads first (`x * 3` → 3x), with a dot between numeric factors |
 | `a / b` | a fraction |
+| `a * (1 / b)` | a / b as one fraction, without cancelling factors |
 | `a ^ b`, `sqrt(a)`, `abs(a)` | a^{b}, √a, \|a\| |
 | `==`, `!=`, `<`, `<=`, `>`, `>=`, `in` | =, ≠, <, ≤, >, ≥, ∈ |
 | `&&`, `\|\|`, `!` | ∧, ∨, ¬ |
@@ -145,6 +146,15 @@ the same rules (`.mu` → μ).
 Keyword arguments to a builtin with a declared parameter order print
 positionally in that order (`Normal(mu = m, sigma = s)` → 𝒩(m, s²)); on a
 callable without one they print as `name = value`.
+
+The arithmetic tree applies these display rules as it is built, so MathML,
+TeX and Typst agree. Signed numeric coefficients read first too
+(`cis(-1.2)` → e^{−1.2i}). Symbolic factors keep their order, including matrix
+products. No constants or powers are evaluated, and no factors cancel:
+`Normal(0, sigma * 3)` remains 𝒩(0, (3σ)²), and `x * (1 / x)` remains x/x.
+The source graph and its numeric evaluation are unchanged.
+Negative right-hand factors keep parentheses, including nested coefficients:
+`a * (b * -3)` reads as a(−3b), not a − 3b.
 
 ## Collections, broadcasting, aggregation
 

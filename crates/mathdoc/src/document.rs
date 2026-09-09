@@ -222,6 +222,8 @@ const CSS: &str = "\
 .flatppl-doc .flatppl-diagnostics, .flatppl-doc .flatppl-row-diag { color: #a33; font-size: 90%; }
 .flatppl-doc .flatppl-notation table { border-collapse: collapse; }
 .flatppl-doc .flatppl-notation td, .flatppl-doc .flatppl-notation th { padding: 0.1em 0.8em 0.1em 0; text-align: left; vertical-align: top; }
+.flatppl-doc .flatppl-notation-bindings td { padding: 0.1em 0; vertical-align: baseline; }
+.flatppl-doc .flatppl-notation-bindings td:first-child { text-align: right; }
 ";
 
 pub(crate) fn doc_text(doc: &Doc) -> String {
@@ -463,11 +465,14 @@ fn notation_section(module: &Module, rendering: &Rendering) -> String {
         if rows.is_empty() {
             return;
         }
-        let _ = writeln!(out, "<h3>{title}</h3>\n<table>");
+        let _ = writeln!(
+            out,
+            "<h3>{title}</h3>\n<table class=\"flatppl-notation-bindings\">"
+        );
         for (lhs, rhs) in rows {
             let _ = writeln!(
                 out,
-                "<tr><td><math>{lhs}</math></td><td><math><mrow><mo>{rel}</mo>{rhs}</mrow></math></td></tr>"
+                "<tr><td><math>{lhs}</math></td><td><math><mrow><mo form=\"infix\">{rel}</mo>{rhs}</mrow></math></td></tr>"
             );
         }
         out.push_str("</table>\n");

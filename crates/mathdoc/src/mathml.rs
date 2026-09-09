@@ -491,7 +491,7 @@ mod tests {
             expr(&m),
             "<mrow><mrow><mn>2</mn><mo>&#x2062;</mo><mi data-flatppl-ref=\"x\">x</mi></mrow><mo>+</mo><mn>1</mn></mrow>"
         );
-        let m = Math::times(b("x"), Math::int(2));
+        let m = Math::dot(b("x"), Math::int(2));
         assert!(expr(&m).contains("<mo>⋅</mo>"));
     }
 

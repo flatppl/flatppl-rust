@@ -2377,7 +2377,7 @@ mod tests {
         );
         let u = mathml::expr(&row_named(&rows, "u").statement.rhs);
         assert!(
-            u.starts_with("<mrow><mrow><mo>(</mo><mrow><mrow><mo>(</mo><mrow><munder>"),
+            u.starts_with("<mrow><mn>2</mn><mo>&#x2062;</mo><mrow><mo>(</mo><mrow><mrow><mo>(</mo><mrow><munder>"),
             "{u}"
         );
     }

@@ -358,6 +358,74 @@ mod tests {
     }
 
     #[test]
+    fn numeric_coefficients_read_first_without_folding_normal_variances() {
+        let src = "sigma = elementof(posreals)\nx ~ Normal(0, sigma * 3)\nz = cis(-1.2)";
+        let r = render_source(src, "m.flatppl", &HashMap::new()).expect("renders");
+        assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+        let x = &r.bindings[1];
+        let (start, end) = x.loc.expect("source link");
+        assert_eq!(
+            &src[start as usize..end as usize],
+            "x ~ Normal(0, sigma * 3)"
+        );
+        assert_eq!(
+            crate::tex::expr(&x.statement.rhs),
+            r"\mathcal{N}\left(0, {\left(3  σ\right)}^{2}\right)"
+        );
+        assert!(
+            x.mathml
+                .contains(r#"<mn>3</mn><mo>&#x2062;</mo><mi data-flatppl-ref="sigma">σ</mi>"#)
+        );
+        assert_eq!(x.refs, ["sigma"]);
+        assert_eq!(
+            crate::tex::expr(&r.bindings[2].statement.rhs),
+            r"{e}^{- 1.2  \mathrm{i}}"
+        );
+        assert_eq!(
+            crate::typst::expr(&r.bindings[2].statement.rhs),
+            "attach(e, tr: − 1.2 upright(i))"
+        );
+    }
+
+    #[test]
+    fn nested_negative_coefficients_cannot_read_as_subtraction() {
+        let src = "a = elementof(reals)\nb = elementof(reals)\ny = a * (b * -3)";
+        let r = render_source(src, "m.flatppl", &HashMap::new()).expect("renders");
+        assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+        let y = &r.bindings[2];
+        assert_eq!(
+            crate::tex::expr(&y.statement.rhs),
+            r"a  \left(- 3  b\right)"
+        );
+        assert_eq!(crate::typst::expr(&y.statement.rhs), r"a lr(\( − 3 b \))");
+        assert!(
+            y.mathml
+                .contains(r#"<mo stretchy="false">(</mo><mrow><mrow><mo>−</mo><mn>3</mn>"#),
+            "{}",
+            y.mathml
+        );
+        assert_eq!(y.refs, ["a", "b"]);
+    }
+
+    #[test]
+    fn reciprocal_products_keep_grouping_and_symbolic_factor_order() {
+        let src = "a = elementof(reals)\nb = elementof(posreals)\nc = elementof(reals)\ny = (a + c) * (1 / (b + 2))\nA = elementof(cartpow(reals, [2, 2]))\nB = elementof(cartpow(reals, [2, 2]))\nC = (A * B) * (1 / b)";
+        let r = render_source(src, "m.flatppl", &HashMap::new()).expect("renders");
+        assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+        let y = &r.bindings[3];
+        assert_eq!(crate::tex::expr(&y.statement.rhs), r"\frac{a + c}{b + 2}");
+        assert_eq!(crate::typst::expr(&y.statement.rhs), "frac(a + c, b + 2)");
+        assert!(y.mathml.contains("<mfrac>"));
+        for name in ["a", "c", "b"] {
+            assert!(y.mathml.contains(&format!("data-flatppl-ref=\"{name}\"")));
+        }
+        assert_eq!(y.refs, ["a", "c", "b"]);
+        let c = &r.bindings[6];
+        assert_eq!(crate::tex::expr(&c.statement.rhs), r"\frac{A  B}{b}");
+        assert_eq!(c.refs, ["A", "B", "b"]);
+    }
+
+    #[test]
     fn render_lists_rows_in_source_order_with_refs_and_kinds() {
         let src = "%%%\n# Title\n%%%\nflatppl_compat = \"0.1\"\n% the mean\nmu ~ Normal(0, 5)\nx = 2 * mu\nK = kernelof(x, mu = mu)";
         let r = render_source(src, "m.flatppl", &HashMap::new()).expect("renders");
