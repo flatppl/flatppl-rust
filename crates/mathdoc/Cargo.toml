@@ -9,10 +9,12 @@ repository.workspace = true
 
 [features]
 default = ["json", "document"]
-# The string-in / string-out JSON contract the viewer and the wasm API use.
-json = ["dep:serde", "dep:serde_json"]
-# Whole-document assembly (HTML page): doc-comment Markdown and its LaTeX math.
-document = ["dep:pulldown-cmark", "dep:latex2mathml"]
+# The string-in / string-out JSON contract the viewer and the wasm API use;
+# it carries rendered doc-comments, so it needs `document`.
+json = ["dep:serde", "dep:serde_json", "document"]
+# Doc-comment rendering (Markdown and its LaTeX math) and whole-document
+# assembly (the HTML page).
+document = ["dep:pulldown-cmark", "dep:math-core"]
 
 [dependencies]
 flatppl-core = { path = "../core" }
@@ -24,4 +26,6 @@ flatppl-fileaccess = { path = "../fileaccess", default-features = false }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"], optional = true }
-latex2mathml = { version = "0.2", optional = true }
+# LaTeX math → MathML Core for doc-comments; escapes its own output and
+# refuses unknown commands with an error, which the fallback relies on.
+math-core = { version = "0.8", optional = true }

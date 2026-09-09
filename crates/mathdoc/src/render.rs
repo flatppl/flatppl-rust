@@ -58,6 +58,8 @@ pub struct Rendering {
     pub order: Vec<String>,
     pub bindings: Vec<BindingRender>,
     pub diagnostics: Vec<Diagnostic>,
+    /// The module doc: the doc-comment on `flatppl_compat`, when there is one.
+    pub module_doc: Option<Doc>,
 }
 
 /// Render every binding of `module` in source order.
@@ -105,10 +107,15 @@ pub fn render_with_source(module: &Module, source: Option<&str>) -> Rendering {
             elided,
         });
     }
+    let module_doc = module
+        .bindings()
+        .find(|(_, b)| module.resolve(b.name) == "flatppl_compat")
+        .and_then(|(_, b)| b.doc.clone());
     Rendering {
         order: bindings.iter().map(|b| b.name.clone()).collect(),
         bindings,
         diagnostics,
+        module_doc,
     }
 }
 

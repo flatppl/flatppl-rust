@@ -12,11 +12,21 @@
 //!
 //! ```json
 //! { "order": ["mu", "tau"],
+//!   "doc": { "title": "Eight Schools", "html": "<p>…</p>" },
 //!   "bindings": [ { "name": "mu", "names": ["mu"], "kind": "draw",
-//!                   "mathml": "<math …>…</math>", "refs": ["mu"],
-//!                   "loc": { "start": 12, "end": 30 }, "annotation": null } ],
+//!                   "mathml": "<math …>…</math>", "refs": [],
+//!                   "loc": { "start": 12, "end": 30 }, "annotation": null,
+//!                   "doc": { "html": "<p>the mean</p>", "block": false } } ],
 //!   "diagnostics": [ { "binding": "", "message": "…" } ] }
 //! ```
+//!
+//! `doc` is a doc-comment rendered to an HTML fragment by [`crate::document`]
+//! (Markdown with `$…$` math as MathML, sanitised, headings shifted one level
+//! down); `block` marks a multi-line `%%%` comment. The module-level `doc` is
+//! the doc-comment on `flatppl_compat`, its leading heading split off as
+//! `title`. Both are absent when there is no such comment. Math the converter
+//! refused shows as `<span class="math-error">` and adds a diagnostic on the
+//! binding (module-level for the module doc).
 //!
 //! `bundle` is keyed by each dependency's **resolved** path — the directive
 //! joined to its importer's directory per spec §04 (`/` separator, `..`
@@ -34,6 +44,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::document;
 use crate::render::{self, Rendering};
 
 #[derive(Deserialize)]
@@ -58,8 +69,22 @@ fn default_formats() -> Vec<String> {
 #[derive(Serialize)]
 struct Response {
     order: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    doc: Option<ModuleDocJson>,
     bindings: Vec<BindingJson>,
     diagnostics: Vec<DiagnosticJson>,
+}
+
+#[derive(Serialize)]
+struct ModuleDocJson {
+    title: Option<String>,
+    html: String,
+}
+
+#[derive(Serialize)]
+struct DocJson {
+    html: String,
+    block: bool,
 }
 
 #[derive(Serialize)]
@@ -74,6 +99,8 @@ struct BindingJson {
     loc: Option<Loc>,
     #[serde(skip_serializing_if = "Option::is_none")]
     annotation: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    doc: Option<DocJson>,
 }
 
 #[derive(Serialize)]
@@ -103,6 +130,7 @@ fn to_response(rendering: Rendering, want_mathml: bool, formats: &[String]) -> R
         order,
         bindings,
         diagnostics,
+        module_doc,
     } = rendering;
     let mut diagnostics: Vec<DiagnosticJson> = diagnostics
         .into_iter()
@@ -111,6 +139,17 @@ fn to_response(rendering: Rendering, want_mathml: bool, formats: &[String]) -> R
             message: d.message,
         })
         .collect();
+    let doc = module_doc.as_ref().map(|d| {
+        let rendered = document::module_doc_html(d);
+        diagnostics.extend(rendered.errors.into_iter().map(|message| DiagnosticJson {
+            binding: String::new(),
+            message,
+        }));
+        ModuleDocJson {
+            title: rendered.title,
+            html: rendered.html,
+        }
+    });
     for f in formats {
         if f != "mathml" {
             diagnostics.push(DiagnosticJson {
@@ -119,20 +158,34 @@ fn to_response(rendering: Rendering, want_mathml: bool, formats: &[String]) -> R
             });
         }
     }
+    let mut rows = Vec::with_capacity(bindings.len());
+    for b in bindings {
+        let doc = b.doc.as_ref().map(|d| {
+            let rendered = document::doc_html(d);
+            diagnostics.extend(rendered.errors.into_iter().map(|message| DiagnosticJson {
+                binding: b.name.clone(),
+                message,
+            }));
+            DocJson {
+                html: rendered.html,
+                block: rendered.block,
+            }
+        });
+        rows.push(BindingJson {
+            name: b.name,
+            names: b.names,
+            kind: b.kind.as_str(),
+            mathml: want_mathml.then_some(b.mathml),
+            refs: b.refs,
+            loc: b.loc.map(|(start, end)| Loc { start, end }),
+            annotation: b.annotation,
+            doc,
+        });
+    }
     Response {
         order,
-        bindings: bindings
-            .into_iter()
-            .map(|b| BindingJson {
-                name: b.name,
-                names: b.names,
-                kind: b.kind.as_str(),
-                mathml: want_mathml.then_some(b.mathml),
-                refs: b.refs,
-                loc: b.loc.map(|(start, end)| Loc { start, end }),
-                annotation: b.annotation,
-            })
-            .collect(),
+        doc,
+        bindings: rows,
         diagnostics,
     }
 }
@@ -144,7 +197,7 @@ mod tests {
     #[test]
     fn the_contract_round_trips() {
         let input = serde_json::json!({
-            "source": "mu ~ Normal(0, 5)\nx = 2 * mu\na, b ~ MvNormal(mu = [0.0, 0.0], cov = eye(2))",
+            "source": "%%%\n# Title\n\nAbstract with $\\mu$.\n%%%\nflatppl_compat = \"0.1\"\n% the mean, $\\bad{x}$\nmu ~ Normal(0, 5)\nx = 2 * mu\na, b ~ MvNormal(mu = [0.0, 0.0], cov = eye(2))",
             "path": "m.flatppl",
             "bundle": {},
             "formats": ["mathml", "typst"]
@@ -164,6 +217,28 @@ mod tests {
         assert_eq!(v["bindings"][0]["refs"], serde_json::json!([]));
         assert_eq!(v["bindings"][1]["refs"], serde_json::json!(["mu"]));
         assert!(v["bindings"][0]["loc"]["start"].is_number());
+        assert_eq!(v["doc"]["title"], "Title");
+        assert!(
+            v["doc"]["html"]
+                .as_str()
+                .unwrap()
+                .starts_with("<p>Abstract with <math>")
+        );
+        assert_eq!(v["bindings"][0]["doc"]["block"], false);
+        assert!(
+            v["bindings"][0]["doc"]["html"]
+                .as_str()
+                .unwrap()
+                .contains("math-error")
+        );
+        assert!(v["bindings"][1].get("doc").is_none());
+        assert!(
+            v["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|d| d["binding"] == "mu" && d["message"].as_str().unwrap().contains("bad"))
+        );
         assert!(
             v["diagnostics"]
                 .as_array()
