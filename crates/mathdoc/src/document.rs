@@ -718,10 +718,9 @@ mod tests {
             "mu = elementof(reals)\ny ~ Normal(mu, 1)\nK = kernelof(y, mu = mu)\nL = likelihoodof(K, 0.3)\nprior = Normal(0, 10)\npost = bayesupdate(L, prior)\ng ~ Gamma(2, 3)",
         );
         assert!(
-            with.contains("<td><math><mi>𝘈</mi></math></td><td><p>A measurable set. A row <math>"),
+            with.contains("<td><math><mi>𝘈</mi></math></td><td><p>A generic measurable set.</p>"),
             "{with}"
         );
-        assert!(with.contains("defines the measure <math><mi>ν</mi></math> by its value on every set <math><mi>𝘈</mi></math>."), "{with}");
         // The rate family pins its convention by the mean, in math.
         assert!(with.contains("Gamma distribution with shape <math><mi>α</mi></math> and rate <math><mi>β</mi></math>."), "{with}");
         // The legend explains the notation; it never shows the code spelling.

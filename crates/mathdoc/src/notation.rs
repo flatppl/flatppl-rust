@@ -124,24 +124,7 @@ fn entry(name: &str) -> NotationEntry {
     let (form, note) = match name {
         "measurable-set" => (
             Math::Sym(Sym::MeasurableSet),
-            vec![
-                text("A measurable set. A row "),
-                math(Math::relation(
-                    Math::apply(Math::ident("nu", None), vec![Math::Sym(Sym::MeasurableSet)]),
-                    crate::ast::Rel::Eq,
-                    Math::big(
-                        crate::ast::BigOp::Integral,
-                        Some(Math::Sym(Sym::MeasurableSet)),
-                        None,
-                        Math::Sym(Sym::Ellipsis),
-                    ),
-                )),
-                text(" defines the measure "),
-                math(Math::ident("nu", None)),
-                text(" by its value on every set "),
-                math(Math::Sym(Sym::MeasurableSet)),
-                text("."),
-            ],
+            vec![text("A generic measurable set.")],
         ),
         "reals" => (
             Math::Sym(Sym::ExtendedReals),
