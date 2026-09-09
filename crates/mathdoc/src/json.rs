@@ -346,7 +346,7 @@ mod tests {
         assert!(page.contains(out["document"]["css"].as_str().unwrap()));
         assert!(article.contains("flatppl-data-grid"));
         assert!(article.contains("<mn>13</mn>"));
-        assert!(article.contains("Random variables"));
+        assert!(article.contains("<h2>Notation</h2>"));
         assert!(article.contains("data-flatppl-binding=\"x\""));
         assert!(!article.contains("$\\alpha$"));
         assert!(article.contains(out["bindings"][0]["doc"]["html"].as_str().unwrap()));

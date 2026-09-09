@@ -27,7 +27,7 @@
 use std::fmt::Write;
 use std::sync::OnceLock;
 
-use flatppl_core::{CallHead, Doc, Markup, Module, Node};
+use flatppl_core::{Doc, Markup, Module};
 use pulldown_cmark::{CowStr, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
 use crate::ast::Math;
@@ -263,7 +263,7 @@ pub(crate) fn fragment(
         body.push_str("</section>\n");
     }
 
-    body.push_str(&notation_section(module, rendering));
+    body.push_str(&notation_section(rendering));
 
     HtmlFragment {
         title,
@@ -496,71 +496,23 @@ fn flush_block(body: &mut String, block: &mut Vec<String>, diags: &mut Vec<Strin
     }
 }
 
-/// Parameters, external inputs, random variables and the distributions used,
-/// read off the module's heads and the rendered rows.
-fn notation_section(module: &Module, rendering: &Rendering) -> String {
-    let mut params = Vec::new();
-    let mut inputs = Vec::new();
-    let mut latents = Vec::new();
-    for b in &rendering.bindings {
-        let Some((_, binding)) = module
-            .bindings()
-            .find(|(_, x)| module.resolve(x.name) == b.name)
-        else {
-            continue;
-        };
-        let Node::Call(call) = module.node(binding.rhs) else {
-            continue;
-        };
-        let CallHead::Builtin(head) = call.head else {
-            continue;
-        };
-        let (_, _, rhs) = mathml::statement_parts(&b.statement);
-        let lhs = mathml::expr(&b.statement.lhs);
-        match module.resolve(head) {
-            "elementof" => params.push((lhs, rhs)),
-            "external" => inputs.push((lhs, rhs)),
-            "draw" => latents.push((lhs, rhs)),
-            _ => {}
-        }
-    }
-    if params.is_empty() && inputs.is_empty() && latents.is_empty() && rendering.notation.is_empty()
-    {
+/// The notation key: every symbol the rows use, in the notation of its row,
+/// with a one-line note. Nothing else: a list of the parameters, inputs or
+/// random variables would only repeat the rows above.
+fn notation_section(rendering: &Rendering) -> String {
+    if rendering.notation.is_empty() {
         return String::new();
     }
-    let mut out = String::from("<section class=\"flatppl-notation\"><h2>Notation</h2>\n");
-    let table = |out: &mut String, title: &str, rows: &[(String, String)], rel: &str| {
-        if rows.is_empty() {
-            return;
-        }
+    let mut out = String::from("<section class=\"flatppl-notation\"><h2>Notation</h2>\n<table>\n");
+    for entry in &rendering.notation {
         let _ = writeln!(
             out,
-            "<h3>{title}</h3>\n<table class=\"flatppl-notation-bindings\">"
+            "<tr><td><math>{}</math></td><td><p>{}</p></td></tr>",
+            mathml::expr(&entry.form),
+            entry.note_html()
         );
-        for (lhs, rhs) in rows {
-            let _ = writeln!(
-                out,
-                "<tr><td><math>{lhs}</math></td><td><math><mrow><mo form=\"infix\">{rel}</mo>{rhs}</mrow></math></td></tr>"
-            );
-        }
-        out.push_str("</table>\n");
-    };
-    table(&mut out, "Parameters", &params, "∈");
-    table(&mut out, "External inputs", &inputs, "∈");
-    table(&mut out, "Random variables", &latents, "∼");
-    if !rendering.notation.is_empty() {
-        out.push_str("<h3>Symbols and parameterisations</h3>\n<table>\n");
-        for entry in &rendering.notation {
-            let _ = writeln!(
-                out,
-                "<tr><td><math>{}</math></td><td><p>{}</p></td></tr>",
-                mathml::expr(&entry.form),
-                entry.note_html()
-            );
-        }
-        out.push_str("</table>\n");
     }
-    out.push_str("</section>\n");
+    out.push_str("</table>\n</section>\n");
     out
 }
 
@@ -599,8 +551,12 @@ mod tests {
         assert!(p.contains("<span class=\"flatppl-caption\"><p>the programme mean</p>"));
         // Rows are addressable.
         assert!(p.contains("<mtr data-flatppl-binding=\"tau\" id=\"flatppl-tau\">"));
-        // Notation appendix lists the latent variables and the distributions.
-        assert!(p.contains("<h3>Random variables</h3>"));
+        // The notation key lists the symbols only; nothing repeats the rows.
+        assert!(p.contains("<h2>Notation</h2>"));
+        assert!(
+            !p.contains("Random variables") && !p.contains("<h3>Parameters</h3>"),
+            "{p}"
+        );
         assert!(
             p.contains("Cauchy distribution with location <math>"),
             "{p}"
@@ -644,7 +600,7 @@ mod tests {
         assert!(p.contains(
             "<tr><td><math><mn>13</mn></math></td><td><math><mn>13</mn></math></td></tr>"
         ));
-        assert!(p.contains("<h3>Parameters</h3>"));
+        assert!(!p.contains("<h3>Parameters</h3>"));
     }
 
     #[test]

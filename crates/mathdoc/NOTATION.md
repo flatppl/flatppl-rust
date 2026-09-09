@@ -63,8 +63,8 @@ the rules stated here.
   one-line note naming its parameters, the law, the extended reals, and the
   set letter 𝘈 when a row is a set function. The key explains the notation
   only; a code spelling such as `Normal(mu, sigma)` never appears beside it —
-  a reader who wants the code has the source. The HTML appendix also lists
-  parameters (`elementof`), external inputs, and random variables (`draw`).
+  a reader who wants the code has the source. Nothing else is appended: a
+  list of the parameters, inputs or random variables would repeat the rows.
 
 ## Names
 
