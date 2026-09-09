@@ -217,7 +217,8 @@ pub struct Statement {
 }
 
 impl Statement {
-    /// Every binding the row refers to, left-hand side first, each once.
+    /// Every binding the row refers to, left-hand side first, each once
+    /// (including the row's own names, when the left-hand side carries them).
     pub fn refs(&self) -> Vec<String> {
         let mut out = self.lhs.refs();
         for r in self.rhs.refs() {
@@ -226,6 +227,11 @@ impl Statement {
             }
         }
         out
+    }
+
+    /// The deeper of the two sides ([`Math::depth`]).
+    pub fn depth(&self) -> usize {
+        self.lhs.depth().max(self.rhs.depth())
     }
 }
 
@@ -285,9 +291,18 @@ impl Math {
         }
         let mag = x.abs();
         if mag != 0.0 && !(1e-4..1e16).contains(&mag) {
-            let exp = mag.log10().floor() as i32;
-            let mant = mag / 10f64.powi(exp);
-            // Shortest decimal of the mantissa (round-trip of x is what matters).
+            let mut exp = mag.log10().floor() as i32;
+            let mut mant = mag / 10f64.powi(exp);
+            // `log10` of an exact power of ten can land a hair under the
+            // integer (`1e-5` → `−5.000…01`): renormalise into `[1, 10)`.
+            if mant >= 10.0 {
+                mant /= 10.0;
+                exp += 1;
+            } else if mant < 1.0 {
+                mant *= 10.0;
+                exp -= 1;
+            }
+            // Twelve significant digits, trailing zeros dropped.
             let mant = format!("{}", (mant * 1e12).round() / 1e12);
             return Math::Row(vec![
                 Math::Num(mant),
@@ -469,6 +484,12 @@ impl Math {
 
     /// Whether `child` in the given slot of `self` must be bracketed.
     pub fn needs_parens(&self, child: &Math, slot: Slot) -> bool {
+        // A big operator swallows everything to its right: it is bracketed
+        // wherever something follows it (`(∑ᵢ xᵢ) + 1`, `(∑ᵢ xᵢ)²`) and never
+        // where it ends the expression (`1 + ∑ᵢ xᵢ`, `−∑ᵢ xᵢ`, `∑ᵢ ∑ⱼ xᵢⱼ`).
+        if matches!(child, Math::BigOp { .. }) {
+            return matches!(slot, Slot::Left | Slot::Base);
+        }
         match self {
             Math::Binary { op, .. } => {
                 let p = self.prec();
@@ -477,16 +498,21 @@ impl Math {
                     return true;
                 }
                 if c == p {
-                    // Left-associative operators: the right operand of `−`
-                    // and `÷`-like operators keeps its parentheses.
+                    // Left-associative: the right operand of `−` keeps its
+                    // parentheses (`a − (b − c)`).
                     return slot == Slot::Right && matches!(op, BinOp::Sub);
                 }
                 false
             }
             Math::Unary { .. } => child.prec() < self.prec(),
-            // The base of a power needs brackets unless it reads as one unit
-            // (`x_i^2`, `f(x)^2`, `2^3`; but `(−2)^3`, `(2x)^3`).
-            Math::Sup(..) if slot == Slot::Base => child.prec() < 9,
+            // The body of a big operator: an additive or logical body is
+            // bracketed (`∏ⱼ (Aᵢⱼ + Bⱼₖ)`), a product is not (`∑ⱼ Aᵢⱼ Bⱼₖ`).
+            Math::BigOp { .. } => child.prec() <= 3,
+            // The base of a script needs brackets unless it reads as one unit
+            // (`x_i^2`, `f(x)^2`, `2^3`; but `(−2)^3`, `(2x)^3`, `(a + b)_2`).
+            Math::Sub(..) | Math::Sup(..) | Math::SubSup(..) if slot == Slot::Base => {
+                child.prec() < 9
+            }
             _ => false,
         }
     }
@@ -512,78 +538,81 @@ impl Math {
         }
     }
 
-    /// Every binding name referenced by identifiers in this tree, in order of
-    /// first appearance.
-    pub fn refs(&self) -> Vec<String> {
-        let mut out = Vec::new();
-        self.collect_refs(&mut out);
-        out
-    }
-
-    fn collect_refs(&self, out: &mut Vec<String>) {
-        let mut push = |m: &Math| m.collect_refs(out);
+    /// The direct sub-expressions, in reading order.
+    pub fn children(&self) -> Vec<&Math> {
         match self {
-            Math::Ident(id) => {
-                if let Some(t) = &id.target
-                    && !out.iter().any(|o| o == t)
-                {
-                    out.push(t.clone());
-                }
-            }
-            Math::Row(items) | Math::Fenced { items, .. } => items.iter().for_each(&mut push),
-            Math::Sub(a, b) | Math::Sup(a, b) | Math::Frac(a, b) => {
-                push(a);
-                push(b);
-            }
-            Math::SubSup(a, b, c) => {
-                push(a);
-                push(b);
-                push(c);
-            }
-            Math::Sqrt(a) | Math::Overline(a) => push(a),
+            Math::Row(items) | Math::Fenced { items, .. } => items.iter().collect(),
+            Math::Sub(a, b) | Math::Sup(a, b) | Math::Frac(a, b) => vec![a, b],
+            Math::SubSup(a, b, c) => vec![a, b, c],
+            Math::Sqrt(a) | Math::Overline(a) | Math::Unary { arg: a, .. } => vec![a],
             Math::Apply { head, args } => {
-                push(head);
-                args.iter().for_each(&mut push);
+                std::iter::once(head.as_ref()).chain(args.iter()).collect()
             }
-            Math::Binary { lhs, rhs, .. } | Math::Relation { lhs, rhs, .. } => {
-                push(lhs);
-                push(rhs);
-            }
-            Math::Unary { arg, .. } => push(arg),
-            Math::BigOp { sub, sup, body, .. } => {
-                if let Some(s) = sub {
-                    push(s);
-                }
-                if let Some(s) = sup {
-                    push(s);
-                }
-                push(body);
-            }
+            Math::Binary { lhs, rhs, .. } | Math::Relation { lhs, rhs, .. } => vec![lhs, rhs],
+            Math::BigOp { sub, sup, body, .. } => sub
+                .iter()
+                .chain(sup.iter())
+                .map(Box::as_ref)
+                .chain(std::iter::once(body.as_ref()))
+                .collect(),
             Math::Family { body, index, range } => {
-                push(body);
-                push(index);
+                let mut out = vec![body.as_ref(), index.as_ref()];
                 if let Some((lo, hi)) = range {
-                    push(lo);
-                    push(hi);
+                    out.push(lo);
+                    out.push(hi);
                 }
+                out
             }
-            Math::Matrix(rows) => rows.iter().flatten().for_each(&mut push),
-            Math::Cases(rows) => {
-                for (v, c) in rows {
-                    push(v);
-                    if let Some(c) = c {
-                        push(c);
-                    }
-                }
-            }
-            Math::Num(_)
+            Math::Matrix(rows) => rows.iter().flatten().collect(),
+            Math::Cases(rows) => rows
+                .iter()
+                .flat_map(|(v, c)| std::iter::once(v).chain(c.iter()))
+                .collect(),
+            Math::Ident(_)
+            | Math::Num(_)
             | Math::Text(_)
             | Math::Str(_)
             | Math::Sym(_)
             | Math::Op(_)
-            | Math::Code(_) => {}
+            | Math::Code(_) => Vec::new(),
         }
     }
+
+    /// Every binding name referenced by identifiers in this tree, in order of
+    /// first appearance.
+    pub fn refs(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        // Depth-first in reading order: children are pushed reversed.
+        let mut stack = vec![self];
+        while let Some(m) = stack.pop() {
+            if let Math::Ident(id) = m
+                && let Some(t) = &id.target
+                && !out.iter().any(|o| o == t)
+            {
+                out.push(t.clone());
+            }
+            stack.extend(children_reversed(m));
+        }
+        out
+    }
+
+    /// The nesting depth of the tree (a leaf is 1), computed without
+    /// recursion so it is safe on any input.
+    pub fn depth(&self) -> usize {
+        let mut max = 0;
+        let mut stack = vec![(self, 1usize)];
+        while let Some((m, d)) = stack.pop() {
+            max = max.max(d);
+            stack.extend(children_reversed(m).into_iter().map(|c| (c, d + 1)));
+        }
+        max
+    }
+}
+
+fn children_reversed(m: &Math) -> Vec<&Math> {
+    let mut children = m.children();
+    children.reverse();
+    children
 }
 
 /// Which operand slot a child occupies, for [`Math::needs_parens`].

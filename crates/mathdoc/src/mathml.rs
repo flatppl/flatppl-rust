@@ -6,6 +6,11 @@
 //! `data-flatppl-binding="<name>"` on its `<math>` root — the two hooks the
 //! viewer wires click-to-focus and click-to-source from. All text is escaped
 //! here; the output is trusted markup.
+//!
+//! The printer recurses over the tree. The lowering guarantees every
+//! [`Statement`] it hands out is at most [`flatppl_core::DEFAULT_MAX_DEPTH`]
+//! levels deep (deeper ones come back as source text), so the recursion is
+//! bounded.
 
 use std::fmt::Write;
 
@@ -376,15 +381,12 @@ fn write_list(out: &mut String, items: &[Math]) {
     }
 }
 
-/// A child that must be a single element (an `<mfrac>` / `<munder>` slot):
-/// multi-token children are wrapped in `<mrow>`.
+/// A child in a slot that must hold exactly one element (`<mfrac>`,
+/// `<munder>`, a script). Every [`Math`] variant prints as exactly one
+/// element — a multi-token expression is already an `<mrow>` — so this is
+/// [`write_expr`] under a name that states the requirement.
 fn write_wrapped(out: &mut String, m: &Math) {
-    let inner = expr(m);
-    if inner.starts_with("<mrow>") || is_single_element(&inner) {
-        out.push_str(&inner);
-    } else {
-        let _ = write!(out, "<mrow>{inner}</mrow>");
-    }
+    write_expr(out, m);
 }
 
 /// The base of a script: bracketed unless it reads as one unit.
@@ -407,30 +409,6 @@ fn write_operand(out: &mut String, parent: &Math, child: &Math, slot: Slot) {
     } else {
         write_expr(out, child);
     }
-}
-
-/// Whether `markup` is exactly one top-level element. Tags never nest a
-/// same-named tag at depth 0 here, so a single scan of `<`/`</` suffices.
-fn is_single_element(markup: &str) -> bool {
-    let mut depth = 0i32;
-    let mut closed_once = false;
-    let mut rest = markup;
-    while let Some(pos) = rest.find('<') {
-        rest = &rest[pos..];
-        if rest.starts_with("</") {
-            depth -= 1;
-            if depth == 0 {
-                if closed_once {
-                    return false;
-                }
-                closed_once = true;
-            }
-        } else {
-            depth += 1;
-        }
-        rest = &rest[1..];
-    }
-    closed_once
 }
 
 #[cfg(test)]
@@ -486,6 +464,9 @@ mod tests {
             Math::int(2),
         );
         assert!(!expr(&m).contains("<mo>(</mo>"));
+        // A compound subscript base is bracketed too: `(a + b)_2`.
+        let m = Math::subscript(Math::plus(b("a"), b("b")), Math::int(2));
+        assert!(expr(&m).starts_with("<msub><mrow><mo>(</mo>"));
     }
 
     #[test]
@@ -604,14 +585,51 @@ mod tests {
     }
 
     #[test]
-    fn single_element_detection_drives_mrow_wrapping() {
-        assert!(is_single_element("<mi>x</mi>"));
-        assert!(is_single_element("<msub><mi>x</mi><mn>1</mn></msub>"));
-        assert!(!is_single_element("<mi>x</mi><mo>+</mo><mi>y</mi>"));
+    fn single_element_slots_hold_one_element() {
         let f = Math::frac(Math::plus(b("a"), b("b")), b("c"));
         assert_eq!(
             expr(&f),
             "<mfrac><mrow><mi data-flatppl-ref=\"a\">a</mi><mo>+</mo><mi data-flatppl-ref=\"b\">b</mi></mrow><mi data-flatppl-ref=\"c\">c</mi></mfrac>"
         );
+    }
+
+    #[test]
+    fn big_operators_bracket_where_something_follows_them() {
+        let sum = Math::big(
+            BigOp::Sum,
+            Some(Math::ident("i", None)),
+            None,
+            Math::subscript(b("x"), Math::ident("i", None)),
+        );
+        // Left operand: bracketed. Right operand: not.
+        let left = expr(&Math::plus(sum.clone(), Math::int(1)));
+        assert!(
+            left.starts_with("<mrow><mrow><mo>(</mo><mrow><munder>"),
+            "{left}"
+        );
+        let right = expr(&Math::plus(Math::int(1), sum.clone()));
+        assert!(
+            right.starts_with("<mrow><mn>1</mn><mo>+</mo><mrow><munder>"),
+            "{right}"
+        );
+        // Negated and nested: not bracketed.
+        let neg = expr(&Math::negate(sum.clone()));
+        assert!(neg.starts_with("<mrow><mo>−</mo><mrow><munder>"), "{neg}");
+        // As a power's base: bracketed.
+        let sq = expr(&Math::pow(sum.clone(), Math::int(2)));
+        assert!(sq.starts_with("<msup><mrow><mo>(</mo>"), "{sq}");
+        // An additive body is bracketed, a product body is not.
+        let add_body = Math::big(
+            BigOp::Prod,
+            Some(Math::ident("j", None)),
+            None,
+            Math::plus(b("a"), b("c")),
+        );
+        assert!(
+            expr(&add_body).contains("</munder><mrow><mo>(</mo>"),
+            "{}",
+            expr(&add_body)
+        );
+        assert!(!expr(&sum).contains("<mo>(</mo>"));
     }
 }
