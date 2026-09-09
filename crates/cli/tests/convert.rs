@@ -428,7 +428,7 @@ fn converts_flatppl_to_an_html_page_of_mathematics() {
     assert!(html.starts_with("<!-- AUTOMATICALLY GENERATED - do not edit -->\n<!doctype html>"));
     assert!(html.contains("<title>Eight Schools</title>"));
     assert!(html.contains("<mtr data-flatppl-binding=\"mu\" id=\"flatppl-mu\">"));
-    assert!(html.contains("<mtext class=\"flatppl-annot\">the programme mean</mtext>"));
+    assert!(html.contains("<span class=\"flatppl-caption\"><p>the programme mean</p>"));
     // `theta ~ iid(Normal(mu, tau), J)` is the bare power `Normal(μ, τ)ᴶ`.
     assert!(
         html.contains(
