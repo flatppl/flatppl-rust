@@ -21,6 +21,28 @@ pub fn statement(stmt: &Statement) -> String {
 
 /// An expression in native Typst math syntax, without `$` delimiters.
 pub fn expr(m: &Math) -> String {
+    let lines = crate::layout::sum_lines(m);
+    if !lines.is_empty() {
+        let rows = lines
+            .iter()
+            .map(|line| {
+                let term = expr(line.term);
+                let term = if line.parens {
+                    fenced(Fence::Paren, Fence::Paren, &term)
+                } else {
+                    term
+                };
+                let sign = match line.sign {
+                    Some(BinOp::Sub) => "− ",
+                    Some(_) => "+ ",
+                    None => "",
+                };
+                format!("{sign}{term}")
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        return format!("vec(delim: #none, align: #left, {rows})");
+    }
     match m {
         Math::Ident(id) => {
             let head = atom(&id.display.head);

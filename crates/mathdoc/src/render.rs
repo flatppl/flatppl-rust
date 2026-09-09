@@ -37,8 +37,8 @@ pub struct BindingRender {
     /// Source byte range of the binding's right-hand side, when known.
     pub loc: Option<(u32, u32)>,
     pub annotation: Option<String>,
-    /// The row shows a membership in place of a long literal array; the
-    /// values belong in a data appendix.
+    /// The row summarizes literal data whose full values belong in the
+    /// data appendix.
     pub elided: bool,
     /// The binding's doc-comment, when it has one.
     pub doc: Option<Doc>,
@@ -384,6 +384,39 @@ mod tests {
         assert_eq!(
             crate::typst::expr(&r.bindings[2].statement.rhs),
             "attach(e, tr: − 1.2 upright(i))"
+        );
+    }
+
+    #[test]
+    fn wrapped_sums_keep_subtraction_scope_and_outer_square() {
+        let src = "first_coefficient = elementof(reals)\nsecond_coefficient = elementof(reals)\nthird_coefficient = elementof(reals)\nx = abs(first_coefficient * second_coefficient + second_coefficient * third_coefficient - (third_coefficient + first_coefficient))^2";
+        let r = render_source(src, "m.flatppl", &HashMap::new()).expect("renders");
+        assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+        let x = &r.bindings[3];
+        let tex = crate::tex::expr(&x.statement.rhs);
+        assert_eq!(tex.matches(r"\\").count(), 2, "{tex}");
+        assert!(
+            tex.contains(
+                r"- \left(\mathrm{third\_coefficient} + \mathrm{first\_coefficient}\right)"
+            ),
+            "{tex}"
+        );
+        assert!(tex.ends_with(r"\end{aligned}\right|}^{2}"), "{tex}");
+        assert!(x.mathml.contains("class=\"flatppl-sum\""));
+        assert!(
+            x.mathml
+                .contains(r#"<mo form="infix">−</mo><mrow><mo stretchy="false">(</mo>"#),
+            "{}",
+            x.mathml
+        );
+        assert!(crate::typst::expr(&x.statement.rhs).contains("vec(delim: #none, align: #left,"));
+        assert_eq!(
+            x.refs,
+            [
+                "first_coefficient",
+                "second_coefficient",
+                "third_coefficient"
+            ]
         );
     }
 

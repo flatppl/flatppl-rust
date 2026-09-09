@@ -47,9 +47,17 @@ the rules stated here.
   A partial decomposition `p, _ = v` inlines the source: `p = v_1`. A discarded
   value `_ = e` renders nothing. Author-named `_private` bindings are ordinary
   rows.
-- Arrays beyond twelve entries print as `x ∈ ℝ^{n}` with an annotation and the
-  values in a data appendix. A `table(…)` literal prints as `table(c = …)` with
-  its columns (typesetting it as a table is planned).
+- Literal arrays beyond twelve entries, or wider than the shared 72-glyph
+  estimate, print as `x ∈ ℝ^{n}` with an annotation and all values in an
+  indexed data appendix. Wide rectangular tables of literal columns also
+  move there, with their column names and row order intact; the model row
+  shows a `data table` placeholder and its shape. Small or computed tables
+  keep their `table(c = …)` expression. No values are rounded for layout.
+- Long sums with at least three terms use aligned continuation lines in all
+  printers. Only the left-associated sum chain splits; right-hand groups,
+  enclosing fences, powers and source references stay intact. The shared
+  width estimate is deterministic, not a font or viewport measurement.
+  HTML equation blocks scroll horizontally when an expression still cannot fit.
 - A generated notation key explains the symbols and distribution conventions
   used in the module. The HTML appendix also lists parameters (`elementof`),
   external inputs, and random variables (`draw`).

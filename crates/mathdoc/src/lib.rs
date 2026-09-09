@@ -12,11 +12,14 @@
 
 pub mod ast;
 #[cfg(feature = "document")]
+mod data;
+#[cfg(feature = "document")]
 pub mod document;
 #[cfg(feature = "document")]
 pub mod export;
 #[cfg(feature = "json")]
 pub mod json;
+mod layout;
 pub mod lower;
 pub mod mathml;
 pub mod names;

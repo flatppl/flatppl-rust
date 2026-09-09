@@ -27,8 +27,8 @@ use flatppl_core::{
 
 use crate::ast::{BigOp, BinOp, Fence, Math, Op, Rel, Statement, Sym};
 
-/// Arrays longer than this print as a membership statement, their values
-/// going to the document's data appendix.
+/// Literal data beyond this entry count moves to the data appendix.
+/// Wide numeric strings may reach the shared display-width limit sooner.
 pub const INLINE_ARRAY_LIMIT: usize = 12;
 
 /// The structural kind of a row, for the viewer (`NOTATION.md`, contract §4).
@@ -67,8 +67,8 @@ pub struct Row {
     pub statement: Statement,
     /// A short annotation beside the row (`external input`, `120 values`, …).
     pub annotation: Option<String>,
-    /// The row shows a membership in place of a long literal array whose
-    /// values belong in a data appendix ([`Lowerer::full_value`]).
+    /// The row summarizes literal data whose full values belong in the
+    /// data appendix ([`Lowerer::full_value`]).
     pub elided: bool,
     /// Constructs this row could not render and printed as source text.
     pub diagnostics: Vec<String>,
@@ -518,7 +518,11 @@ impl<'m> Lowerer<'m> {
                     elided: false,
                 }
             }
-            "vector" if call.args.len() > INLINE_ARRAY_LIMIT && self.all_literals(call) => {
+            "vector"
+                if self.all_literals(call)
+                    && (call.args.len() > INLINE_ARRAY_LIMIT
+                        || crate::layout::width(&self.expr(rhs)) > crate::layout::LINE_WIDTH) =>
+            {
                 let n = call.args.len();
                 let set = self.literal_array_set(call, rhs);
                 Lowered {
@@ -528,6 +532,24 @@ impl<'m> Lowerer<'m> {
                         rhs: set,
                     },
                     annotation: Some(format!("{n} values, see the data appendix")),
+                    elided: true,
+                }
+            }
+            "table" => {
+                let Some(nrows) = self.literal_table_rows(call) else {
+                    return plain(self, lhs);
+                };
+                if nrows * call.named.len() <= INLINE_ARRAY_LIMIT
+                    && crate::layout::width(&self.expr(rhs)) <= crate::layout::LINE_WIDTH
+                {
+                    return plain(self, lhs);
+                }
+                Lowered {
+                    statement: eq(lhs, Math::text("data table")),
+                    annotation: Some(format!(
+                        "{nrows} rows × {} columns, see the data appendix",
+                        call.named.len()
+                    )),
                     elided: true,
                 }
             }
@@ -545,6 +567,27 @@ impl<'m> Lowerer<'m> {
             }
             _ => false,
         })
+    }
+
+    /// Only rectangular tables of literal columns belong in the data appendix.
+    fn literal_table_rows(&self, call: &Call) -> Option<usize> {
+        if !call.args.is_empty() || call.named.is_empty() {
+            return None;
+        }
+        let mut nrows = None;
+        for column in &call.named {
+            let Node::Call(values) = self.m.node(column.value) else {
+                return None;
+            };
+            if !self.head_is(values, "vector") || !self.all_literals(values) {
+                return None;
+            }
+            if nrows.is_some_and(|n| n != values.args.len()) {
+                return None;
+            }
+            nrows = Some(values.args.len());
+        }
+        nrows
     }
 
     /// `ℝ^{n}` / `ℤ^{n}` for an elided literal array.

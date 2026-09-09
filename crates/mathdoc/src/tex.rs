@@ -13,6 +13,28 @@ pub fn statement(stmt: &Statement) -> String {
 }
 
 pub fn expr(m: &Math) -> String {
+    let lines = crate::layout::sum_lines(m);
+    if !lines.is_empty() {
+        let rows = lines
+            .iter()
+            .map(|line| {
+                let term = expr(line.term);
+                let term = if line.parens {
+                    format!(r"\left({term}\right)")
+                } else {
+                    term
+                };
+                let sign = match line.sign {
+                    Some(BinOp::Sub) => "- ",
+                    Some(_) => "+ ",
+                    None => "",
+                };
+                format!("&{sign}{term}")
+            })
+            .collect::<Vec<_>>()
+            .join(r" \\ ");
+        return format!(r"\begin{{aligned}}{rows}\end{{aligned}}");
+    }
     let render = |m: &Math| expr(m);
     let operand = |child: &Math, slot| {
         let s = render(child);

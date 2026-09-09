@@ -181,6 +181,30 @@ pub fn html(module: &Module, rendering: &Rendering, fallback_title: &str) -> Str
                 .find(|(_, b)| module.resolve(b.name) == name)
             {
                 let value = lowerer.full_value(id);
+                if let Some(grid) = crate::data::grid(&value) {
+                    let _ = writeln!(
+                        body,
+                        "<h3><math>{}</math></h3><table class=\"flatppl-data-grid\"><thead><tr>",
+                        mathml::expr(&Math::binding(name))
+                    );
+                    for header in &grid.headers {
+                        let _ = write!(
+                            body,
+                            "<th scope=\"col\"><math>{}</math></th>",
+                            mathml::expr(header)
+                        );
+                    }
+                    body.push_str("</tr></thead><tbody>\n");
+                    for row in &grid.rows {
+                        body.push_str("<tr>");
+                        for value in row {
+                            let _ = write!(body, "<td><math>{}</math></td>", mathml::expr(value));
+                        }
+                        body.push_str("</tr>\n");
+                    }
+                    body.push_str("</tbody></table>\n");
+                    continue;
+                }
                 let stmt = crate::ast::Statement {
                     lhs: Math::binding(name),
                     rel: crate::ast::Rel::Eq,
@@ -224,6 +248,13 @@ const CSS: &str = "\
 .flatppl-doc .flatppl-notation td, .flatppl-doc .flatppl-notation th { padding: 0.1em 0.8em 0.1em 0; text-align: left; vertical-align: top; }
 .flatppl-doc .flatppl-notation-bindings td { padding: 0.1em 0; vertical-align: baseline; }
 .flatppl-doc .flatppl-notation-bindings td:first-child { text-align: right; }
+.flatppl-doc .flatppl-data-grid { border-collapse: collapse; margin: 0.8em 0; }
+.flatppl-doc .flatppl-data-grid th, .flatppl-doc .flatppl-data-grid td { text-align: right; padding: 0.2em 1em; }
+.flatppl-doc .flatppl-data-grid thead { border-bottom: 1px solid currentColor; }
+.flatppl-doc .flatppl-block { overflow-x: auto; max-width: 100%; }
+.flatppl-doc .flatppl-block > mtable > mtr > mtd { text-align: left; }
+.flatppl-doc .flatppl-block > mtable > mtr > mtd:first-child { text-align: right; }
+.flatppl-doc .flatppl-block > mtable > mtr > mtd:nth-child(2) { text-align: center; }
 ";
 
 pub(crate) fn doc_text(doc: &Doc) -> String {
@@ -538,12 +569,41 @@ mod tests {
     }
 
     #[test]
+    fn wide_literal_data_keeps_values_and_columns_in_the_appendix() {
+        let src = "xs = [0.123456789012345, 0.234567890123456, 0.345678901234567, 0.456789012345678, 0.567890123456789]\ndata = table(exposure = [1, 2, 3, 4, 5], efficiency = [6, 7, 8, 9, 10], counts = [11, 12, 13, 14, 15])\ncomputed = table(values = xs)";
+        let rendering = crate::render_source(src, "m.flatppl", &HashMap::new()).expect("renders");
+        assert!(
+            rendering.diagnostics.is_empty(),
+            "{:?}",
+            rendering.diagnostics
+        );
+        assert!(rendering.bindings[0].elided);
+        assert!(rendering.bindings[1].elided);
+        assert!(!rendering.bindings[2].elided);
+        let p = page(src);
+        let (body, appendix) = p.split_once("<h2>Data</h2>").expect("appendix");
+        assert!(!body.contains("0.123456789012345"));
+        assert!(appendix.contains("<mn>0.123456789012345</mn>"));
+        assert!(appendix.contains("<tr><td><math><mn>1</mn></math></td><td><math><mn>6</mn></math></td><td><math><mn>11</mn></math></td></tr>"));
+        let mut module = flatppl_syntax::parse(src).unwrap();
+        flatppl_infer::infer(&mut module);
+        let md = crate::export::github_markdown(&module, &rendering, "m");
+        assert!(
+            md.contains("| $\\mathrm{exposure}$ | $\\mathrm{efficiency}$ | $\\mathrm{counts}$ |"),
+            "{md}"
+        );
+        assert!(md.contains("| $5$ | $10$ | $15$ |"), "{md}");
+    }
+
+    #[test]
     fn long_arrays_land_in_the_data_appendix() {
         let src = "xs = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0]\nm = elementof(reals)";
         let p = page(src);
         assert!(p.contains("<h2>Data</h2>"));
         assert!(p.contains("13 values, see the data appendix"));
-        assert!(p.contains("<mn>13</mn><mo stretchy=\"false\">)</mo>"));
+        assert!(p.contains(
+            "<tr><td><math><mn>13</mn></math></td><td><math><mn>13</mn></math></td></tr>"
+        ));
         assert!(p.contains("<h3>Parameters</h3>"));
     }
 
@@ -606,7 +666,7 @@ mod tests {
         let src = "xs = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0]";
         let p = page(src);
         assert_eq!(p.matches("data-flatppl-binding=\"xs\"").count(), 1, "{p}");
-        assert!(p.contains("class=\"flatppl-data-value\""));
+        assert!(p.contains("class=\"flatppl-data-grid\""));
     }
 
     #[test]

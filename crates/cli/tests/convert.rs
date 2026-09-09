@@ -482,13 +482,12 @@ bad = Normal(0, "not a scale")
 "#,
     )
     .unwrap();
-    for (extension, banner, normal, covariance, data, escaped) in [
+    for (extension, banner, normal, covariance, escaped) in [
         (
             "md",
             "<!--",
             r"\mathcal{N}\left(0, {\left(1 + 2\right)}^{2}\right)",
             r"\mathcal{N}\left(μ, Σ\right)",
-            "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13",
             r"\input{private}",
         ),
         (
@@ -496,7 +495,6 @@ bad = Normal(0, "not a scale")
             "%",
             r"\mathcal{N}\left(0, {\left(1 + 2\right)}^{2}\right)",
             r"\mathcal{N}\left(μ, Σ\right)",
-            "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13",
             r"\textbackslash{}input\{private\}",
         ),
         (
@@ -504,7 +502,6 @@ bad = Normal(0, "not a scale")
             "//",
             "cal(N) lr(\\( 0 \\, attach(lr(\\( 1 + 2 \\)), tr: 2) \\))",
             "cal(N) lr(\\( μ \\, Σ \\))",
-            "1 \\, 2 \\, 3 \\, 4 \\, 5 \\, 6 \\, 7 \\, 8 \\, 9 \\, 10 \\, 11 \\, 12 \\, 13",
             r#"\\input{private} and #panic(\"private\")"#,
         ),
     ] {
@@ -547,13 +544,25 @@ bad = Normal(0, "not a scale")
             "Data",
             normal,
             covariance,
-            data,
             escaped,
         ] {
             assert!(
                 text.contains(expected),
                 "missing {expected:?} in {extension}:\n{text}"
             );
+        }
+        // Every indexed value survives in source order in the data table.
+        let mut remaining = text.as_str();
+        for i in 1..=13 {
+            let row = match extension {
+                "md" => format!("| ${i}$ | ${i}$ |"),
+                "tex" => format!(r"${i}$ & ${i}$ \\"),
+                _ => format!("[$ {i} $],\n[$ {i} $],"),
+            };
+            let position = remaining
+                .find(&row)
+                .unwrap_or_else(|| panic!("missing ordered row {row:?} in {extension}"));
+            remaining = &remaining[position + row.len()..];
         }
         let result = bin()
             .arg("convert")

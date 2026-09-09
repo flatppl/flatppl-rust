@@ -109,6 +109,27 @@ fn fence_glyph(f: Fence, open: bool) -> &'static str {
 }
 
 fn write_expr(out: &mut String, m: &Math) {
+    let lines = crate::layout::sum_lines(m);
+    if !lines.is_empty() {
+        out.push_str("<mtable class=\"flatppl-sum\" columnalign=\"left\" rowspacing=\"0.25em\">");
+        for line in lines {
+            out.push_str("<mtr><mtd style=\"text-align: left\"><mrow>");
+            if let Some(sign) = line.sign {
+                let glyph = if sign == BinOp::Sub { "−" } else { "+" };
+                let _ = write!(out, "<mo form=\"infix\">{glyph}</mo>");
+            }
+            if line.parens {
+                write_fenced(out, "(", ")", is_tall(line.term), |out| {
+                    write_expr(out, line.term)
+                });
+            } else {
+                write_expr(out, line.term);
+            }
+            out.push_str("</mrow></mtd></mtr>");
+        }
+        out.push_str("</mtable>");
+        return;
+    }
     match m {
         Math::Ident(id) => write_ident(out, id),
         Math::Num(n) => {
@@ -403,6 +424,9 @@ fn write_fenced(
 fn is_tall(m: &Math) -> bool {
     let mut stack = vec![m];
     while let Some(n) = stack.pop() {
+        if !crate::layout::sum_lines(n).is_empty() {
+            return true;
+        }
         match n {
             Math::Frac(..) | Math::Matrix(_) | Math::Cases(_) | Math::BigOp { .. } => return true,
             Math::Sub(_, s) | Math::Sup(_, s) if holds_fence(s) => return true,

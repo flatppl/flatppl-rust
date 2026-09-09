@@ -165,6 +165,56 @@ impl Format {
         }
         self.prose(out, &format!("{source}: {note}"), None);
     }
+
+    fn data_grid(self, out: &mut String, name: &str, grid: &crate::data::Grid) {
+        self.heading(out, name, false);
+        let columns = grid.headers.len();
+        match self {
+            Self::Markdown => {}
+            Self::Latex => {
+                let _ = writeln!(out, "\\begin{{tabular}}{{{}}}", "r".repeat(columns));
+            }
+            Self::Typst => {
+                let _ = writeln!(out, "#table(columns: {columns}, align: right,");
+            }
+        }
+        for (i, row) in std::iter::once(&grid.headers).chain(&grid.rows).enumerate() {
+            match self {
+                Self::Markdown => {
+                    let cells = row
+                        .iter()
+                        .map(|m| format!("${}$", tex::expr(m)))
+                        .collect::<Vec<_>>()
+                        .join(" | ");
+                    let _ = writeln!(out, "| {cells} |");
+                    if i == 0 {
+                        let _ = writeln!(out, "|{}", " ---: |".repeat(columns));
+                    }
+                }
+                Self::Latex => {
+                    let cells = row
+                        .iter()
+                        .map(|m| format!("${}$", tex::expr(m)))
+                        .collect::<Vec<_>>()
+                        .join(" & ");
+                    let _ = writeln!(out, "{cells} \\\\");
+                    if i == 0 {
+                        out.push_str("\\hline\n");
+                    }
+                }
+                Self::Typst => {
+                    for value in row {
+                        let _ = writeln!(out, "[$ {} $],", typst::expr(value));
+                    }
+                }
+            }
+        }
+        match self {
+            Self::Markdown => out.push('\n'),
+            Self::Latex => out.push_str("\\end{tabular}\n\n"),
+            Self::Typst => out.push_str(")\n\n"),
+        }
+    }
 }
 
 fn document(
@@ -233,10 +283,15 @@ fn document(
                 .bindings()
                 .find(|(_, b)| module.resolve(b.name) == binding.name)
             {
+                let value = lowerer.full_value(id);
+                if let Some(grid) = crate::data::grid(&value) {
+                    format.data_grid(&mut out, &binding.name, &grid);
+                    continue;
+                }
                 let stmt = Statement {
                     lhs: Math::binding(&binding.name),
                     rel: Rel::Eq,
-                    rhs: lowerer.full_value(id),
+                    rhs: value,
                 };
                 format.equations(&mut out, &[(&stmt, None)]);
             }
