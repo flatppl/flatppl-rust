@@ -768,7 +768,7 @@ mod tests {
         );
         assert!(with.contains("defines the measure <math><mi>ν</mi></math> by its value on every set <math><mi>𝘈</mi></math>."), "{with}");
         // The rate family pins its convention by the mean, in math.
-        assert!(with.contains("Gamma distribution with shape <math><mi>α</mi></math> and rate <math><mi>β</mi></math>; mean <math><mfrac>"), "{with}");
+        assert!(with.contains("Gamma distribution with shape <math><mi>α</mi></math> and rate <math><mi>β</mi></math>."), "{with}");
         assert!(with.contains("<code>Gamma(shape, rate)</code>"), "{with}");
         let without = page("x ~ Normal(0, 1)");
         assert!(!without.contains("<mi>𝘈</mi>"), "{without}");

@@ -1914,6 +1914,7 @@ pub fn apply_builtin(name: &str, mut args: Vec<Math>) -> Math {
             vec![take(0), Math::pow(take(1), Math::int(2))],
         ),
         ("MvNormal", 2) => Math::apply(Math::Sym(Sym::Normal), args),
+        ("Exponential", 1) => Math::apply(Math::text("Exp"), args),
         ("StudentT", 1) => Math::subscript(Math::letter('t'), take(0)),
         ("ChiSquared", 1) => Math::SubSup(
             Box::new(Math::letter('χ')),

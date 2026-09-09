@@ -163,8 +163,10 @@ fn entry(name: &str) -> NotationEntry {
             // maps them to the parameter names by position.
             let letters: Vec<&str> = match name {
                 "Gamma" | "InverseGamma" => vec!["alpha", "beta"],
-                "Exponential" => vec!["lambda"],
+                "Exponential" | "Poisson" => vec!["lambda"],
                 "Weibull" => vec!["k", "lambda"],
+                "Cauchy" => vec!["x_0", "gamma"],
+                "Laplace" => vec!["x_0", "b"],
                 _ => params.iter().map(String::as_str).collect(),
             };
             let args = letters.iter().map(|p| Math::ident(p, None)).collect();
@@ -198,15 +200,68 @@ fn entry(name: &str) -> NotationEntry {
                     math(param("alpha")),
                     text(" and rate "),
                     math(param("beta")),
-                    text("; mean "),
-                    math(Math::frac(param("alpha"), param("beta"))),
                     text("."),
                 ],
                 "Exponential" => vec![
                     text("Exponential distribution with rate "),
                     math(param("lambda")),
-                    text("; mean "),
-                    math(Math::frac(Math::int(1), param("lambda"))),
+                    text("."),
+                ],
+                "Poisson" => vec![
+                    text("Poisson distribution with rate "),
+                    math(param("lambda")),
+                    text("."),
+                ],
+                "Cauchy" => vec![
+                    text("Cauchy distribution with location "),
+                    math(param("x_0")),
+                    text(" and scale "),
+                    math(param("gamma")),
+                    text("."),
+                ],
+                "Laplace" => vec![
+                    text("Laplace distribution with location "),
+                    math(param("x_0")),
+                    text(" and scale "),
+                    math(param("b")),
+                    text("."),
+                ],
+                "Logistic" => vec![
+                    text("Logistic distribution with location "),
+                    math(param("mu")),
+                    text(" and scale "),
+                    math(param("s")),
+                    text("."),
+                ],
+                "Beta" => vec![
+                    text("Beta distribution with shape parameters "),
+                    math(param("alpha")),
+                    text(" and "),
+                    math(param("beta")),
+                    text("."),
+                ],
+                "Dirichlet" => vec![
+                    text("Dirichlet distribution with concentration vector "),
+                    math(param("alpha")),
+                    text("."),
+                ],
+                "Binomial" => vec![
+                    text("Binomial distribution with "),
+                    math(param("n")),
+                    text(" trials and success probability "),
+                    math(param("p")),
+                    text("."),
+                ],
+                "Bernoulli" => vec![
+                    text("Bernoulli distribution with success probability "),
+                    math(param("p")),
+                    text("."),
+                ],
+                "LogNormal" => vec![
+                    text("Log-normal distribution with log-mean "),
+                    math(param("mu")),
+                    text(" and log-standard deviation "),
+                    math(param("sigma")),
                     text("."),
                 ],
                 "InverseGamma" => vec![
@@ -228,7 +283,26 @@ fn entry(name: &str) -> NotationEntry {
                     math(param("S")),
                     text("."),
                 ],
-                _ => vec![text("Arguments follow the source parameter order.")],
+                // Anything else: the distribution and its parameters by the
+                // letters of the form, in the source order.
+                _ => {
+                    let mut note = vec![text(&format!(
+                        "{name} distribution with parameter{} ",
+                        if letters.len() == 1 { "" } else { "s" }
+                    ))];
+                    for (i, l) in letters.iter().enumerate() {
+                        if i > 0 {
+                            note.push(text(if i + 1 == letters.len() {
+                                " and "
+                            } else {
+                                ", "
+                            }));
+                        }
+                        note.push(math(param(l)));
+                    }
+                    note.push(text("."));
+                    note
+                }
             };
             (
                 apply_builtin(name, args),
