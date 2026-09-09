@@ -790,7 +790,15 @@ impl<'m> Lowerer<'m> {
             return None;
         }
         let m = self.expr(measure);
-        let differential = Math::row(vec![Math::Op(Op::Differential), unit(m), Math::paren(vars)]);
+        // `dM(x)` is tight; a multi-letter or compound measure gets a thin
+        // space after the `d` (`d prior(μ)`, `d (M₁ + M₂)(x)`).
+        let mut differential = vec![Math::Op(Op::Differential)];
+        if !single_letter(&m) {
+            differential.push(Math::Op(Op::ThinSpace));
+        }
+        differential.push(unit(m));
+        differential.push(Math::paren(vars));
+        let differential = Math::row(differential);
         let body = Math::row(vec![integrand, Math::Op(Op::ThinSpace), differential]);
         Some(Math::big(BigOp::Integral, Some(set), None, body))
     }
@@ -2022,6 +2030,23 @@ fn norm(v: Math, which: Math) -> Math {
     Math::subscript(fenced(Fence::Norm, v), which)
 }
 
+/// A single letter (possibly with a script), which a differential `d`
+/// attaches to without a space: `dM(x)`, `dλ_S(x)`.
+fn single_letter(m: &Math) -> bool {
+    match m {
+        Math::Ident(id) => {
+            id.display.subs.is_empty()
+                && matches!(
+                    id.display.head,
+                    crate::names::Atom::Letter(_) | crate::names::Atom::Greek(_)
+                )
+        }
+        Math::Sym(_) => true,
+        Math::Sub(base, _) | Math::Sup(base, _) | Math::SubSup(base, _, _) => single_letter(base),
+        _ => false,
+    }
+}
+
 /// `m` as a single unit: bracketed unless it already reads as one.
 fn unit(m: Math) -> Math {
     if m.prec() < 9 {
@@ -2358,7 +2383,7 @@ mod tests {
             post.contains("<mi data-flatppl-ref=\"L\">L</mi><mo>&#x2061;</mo>"),
             "{post}"
         );
-        assert!(post.contains("<mspace width=\"0.1667em\"/><mi mathvariant=\"normal\">d</mi><mi data-flatppl-ref=\"prior\">prior</mi><mrow><mo stretchy=\"false\">(</mo><mi data-flatppl-ref=\"mu\">μ</mi>"), "{post}");
+        assert!(post.contains("<mspace width=\"0.1667em\"/><mi mathvariant=\"normal\">d</mi><mspace width=\"0.1667em\"/><mi data-flatppl-ref=\"prior\">prior</mi><mrow><mo stretchy=\"false\">(</mo><mi data-flatppl-ref=\"mu\">μ</mi>"), "{post}");
         let f = row_named(&rows, "f");
         assert_eq!(
             mathml::expr(&f.statement.lhs),
