@@ -160,16 +160,22 @@ fn write_expr(out: &mut String, m: &Math) {
             out.push_str("</msqrt>");
         }
         Math::Fenced { open, close, items } => {
-            let _ = write!(out, "<mrow><mo>{}</mo>", fence_glyph(*open, true));
-            write_list(out, items);
-            let _ = write!(out, "<mo>{}</mo></mrow>", fence_glyph(*close, false));
+            let tall = items.iter().any(is_tall);
+            write_fenced(
+                out,
+                fence_glyph(*open, true),
+                fence_glyph(*close, false),
+                tall,
+                |out| write_list(out, items),
+            );
         }
         Math::Apply { head, args } => {
             out.push_str("<mrow>");
             write_expr(out, head);
-            out.push_str("<mo>&#x2061;</mo><mrow><mo>(</mo>");
-            write_list(out, args);
-            out.push_str("<mo>)</mo></mrow></mrow>");
+            out.push_str("<mo>&#x2061;</mo>");
+            let tall = args.iter().any(is_tall);
+            write_fenced(out, "(", ")", tall, |out| write_list(out, args));
+            out.push_str("</mrow>");
         }
         Math::Binary { op, lhs, rhs } => {
             out.push_str("<mrow>");
@@ -228,9 +234,8 @@ fn write_expr(out: &mut String, m: &Math) {
         }
         Math::Family { body, index, range } => {
             let tag = if range.is_some() { "msubsup" } else { "msub" };
-            let _ = write!(out, "<{tag}><mrow><mo>(</mo>");
-            write_expr(out, body);
-            out.push_str("<mo>)</mo></mrow>");
+            let _ = write!(out, "<{tag}>");
+            write_fenced(out, "(", ")", is_tall(body), |out| write_expr(out, body));
             match range {
                 Some((lo, hi)) => {
                     out.push_str("<mrow>");
@@ -370,6 +375,52 @@ fn write_op(out: &mut String, op: Op) {
     });
 }
 
+/// `<mrow>` `open` … `close` `</mrow>` around what `body` writes. The fences
+/// stretch only around content taller than a line: MathML Core stretches
+/// every fence by default, and Chromium gives a stretchy fence a wider
+/// advance even around plain content, which read as `Normal ( μ, τ )`.
+/// LaTeX has the same rule — `(` is rigid unless written `\left(`.
+fn write_fenced(
+    out: &mut String,
+    open: &str,
+    close: &str,
+    tall: bool,
+    body: impl FnOnce(&mut String),
+) {
+    let attr = if tall { "" } else { " stretchy=\"false\"" };
+    let _ = write!(out, "<mrow><mo{attr}>{open}</mo>");
+    body(out);
+    let _ = write!(out, "<mo{attr}>{close}</mo></mrow>");
+}
+
+/// Whether `m` is taller than a line of text: a fraction, matrix, case
+/// distinction or big operator anywhere in it, or a script that itself
+/// holds a fence or fraction (`M|_{[0, ∞]}` hangs below the line).
+fn is_tall(m: &Math) -> bool {
+    let mut stack = vec![m];
+    while let Some(n) = stack.pop() {
+        match n {
+            Math::Frac(..) | Math::Matrix(_) | Math::Cases(_) | Math::BigOp { .. } => return true,
+            Math::Sub(_, s) | Math::Sup(_, s) if holds_fence(s) => return true,
+            Math::SubSup(_, a, b) if holds_fence(a) || holds_fence(b) => return true,
+            _ => {}
+        }
+        stack.extend(n.children());
+    }
+    false
+}
+
+fn holds_fence(m: &Math) -> bool {
+    let mut stack = vec![m];
+    while let Some(n) = stack.pop() {
+        if matches!(n, Math::Fenced { .. } | Math::Frac(..)) {
+            return true;
+        }
+        stack.extend(n.children());
+    }
+    false
+}
+
 /// Comma-separated items.
 fn write_list(out: &mut String, items: &[Math]) {
     for (i, item) in items.iter().enumerate() {
@@ -391,9 +442,7 @@ fn write_wrapped(out: &mut String, m: &Math) {
 /// The base of the script `parent`: bracketed when the tree rules say so.
 fn write_base(out: &mut String, parent: &Math, base: &Math) {
     if parent.needs_parens(base, Slot::Base) {
-        out.push_str("<mrow><mo>(</mo>");
-        write_expr(out, base);
-        out.push_str("<mo>)</mo></mrow>");
+        write_fenced(out, "(", ")", is_tall(base), |out| write_expr(out, base));
     } else {
         write_wrapped(out, base);
     }
@@ -402,9 +451,7 @@ fn write_base(out: &mut String, parent: &Math, base: &Math) {
 /// An operand of `parent`, bracketed when the tree's precedence rules say so.
 fn write_operand(out: &mut String, parent: &Math, child: &Math, slot: Slot) {
     if parent.needs_parens(child, slot) {
-        out.push_str("<mrow><mo>(</mo>");
-        write_expr(out, child);
-        out.push_str("<mo>)</mo></mrow>");
+        write_fenced(out, "(", ")", is_tall(child), |out| write_expr(out, child));
     } else {
         write_expr(out, child);
     }
@@ -448,24 +495,24 @@ mod tests {
     fn brackets_follow_the_tree_rules() {
         let inner = Math::minus(b("b"), b("c"));
         let m = Math::minus(b("a"), inner.clone());
-        assert!(expr(&m).contains("<mo>(</mo>"));
+        assert!(expr(&m).contains("<mo stretchy=\"false\">(</mo>"));
         let m = Math::minus(inner, b("a"));
-        assert!(!expr(&m).contains("<mo>(</mo>"));
+        assert!(!expr(&m).contains("<mo stretchy=\"false\">(</mo>"));
         let m = Math::times(Math::plus(b("a"), b("b")), b("c"));
-        assert!(expr(&m).starts_with("<mrow><mrow><mo>(</mo>"));
+        assert!(expr(&m).starts_with("<mrow><mrow><mo stretchy=\"false\">(</mo>"));
         let m = Math::pow(Math::negate(Math::int(2)), Math::int(3));
         assert_eq!(
             expr(&m),
-            "<msup><mrow><mo>(</mo><mrow><mo>−</mo><mn>2</mn></mrow><mo>)</mo></mrow><mn>3</mn></msup>"
+            "<msup><mrow><mo stretchy=\"false\">(</mo><mrow><mo>−</mo><mn>2</mn></mrow><mo stretchy=\"false\">)</mo></mrow><mn>3</mn></msup>"
         );
         let m = Math::pow(
             Math::subscript(b("x"), Math::ident("i", None)),
             Math::int(2),
         );
-        assert!(!expr(&m).contains("<mo>(</mo>"));
+        assert!(!expr(&m).contains("<mo stretchy=\"false\">(</mo>"));
         // A compound subscript base is bracketed too: `(a + b)_2`.
         let m = Math::subscript(Math::plus(b("a"), b("b")), Math::int(2));
-        assert!(expr(&m).starts_with("<msub><mrow><mo>(</mo>"));
+        assert!(expr(&m).starts_with("<msub><mrow><mo stretchy=\"false\">(</mo>"));
     }
 
     #[test]
@@ -478,7 +525,7 @@ mod tests {
         assert_eq!(
             fragment("mu", &stmt),
             "<math display=\"block\" data-flatppl-binding=\"mu\"><mrow><mi data-flatppl-ref=\"mu\">μ</mi><mo>∼</mo>\
-             <mrow><mi>Normal</mi><mo>&#x2061;</mo><mrow><mo>(</mo><mn>0</mn><mo>,</mo><mn>5</mn><mo>)</mo></mrow></mrow></mrow></math>"
+             <mrow><mi>Normal</mi><mo>&#x2061;</mo><mrow><mo stretchy=\"false\">(</mo><mn>0</mn><mo>,</mo><mn>5</mn><mo stretchy=\"false\">)</mo></mrow></mrow></mrow></math>"
         );
     }
 
@@ -514,7 +561,7 @@ mod tests {
             Some((Math::int(1), b("N"))),
         );
         let s = expr(&fam);
-        assert!(s.starts_with("<msubsup><mrow><mo>(</mo>"));
+        assert!(s.starts_with("<msubsup><mrow><mo stretchy=\"false\">(</mo>"));
         assert!(s.contains(
             "<mrow><mi>i</mi><mo>=</mo><mn>1</mn></mrow><mi data-flatppl-ref=\"N\">N</mi></msubsup>"
         ));
@@ -563,7 +610,7 @@ mod tests {
             Math::bracket(vec![Math::int(0), Math::Sym(Sym::Infinity)]),
         );
         assert!(
-            expr(&r).ends_with("<mo>[</mo><mn>0</mn><mo>,</mo><mi>∞</mi><mo>]</mo></mrow></msub>")
+            expr(&r).ends_with("<mo stretchy=\"false\">[</mo><mn>0</mn><mo>,</mo><mi>∞</mi><mo stretchy=\"false\">]</mo></mrow></msub>")
         );
     }
 
@@ -630,7 +677,7 @@ mod tests {
         );
         // As an argument: the call's own parentheses and the comma delimit it.
         let arg = expr(&Math::call("Normal", vec![sum.clone(), Math::int(1)]));
-        assert_eq!(arg.matches("<mo>(</mo>").count(), 1, "{arg}");
+        assert_eq!(arg.matches(">(</mo>").count(), 1, "{arg}");
         // An additive body is bracketed, a product body is not.
         let add_body = Math::big(
             BigOp::Prod,
@@ -639,10 +686,10 @@ mod tests {
             Math::plus(b("a"), b("c")),
         );
         assert!(
-            expr(&add_body).contains("</munder><mrow><mo>(</mo>"),
+            expr(&add_body).contains("</munder><mrow><mo stretchy=\"false\">(</mo>"),
             "{}",
             expr(&add_body)
         );
-        assert!(!expr(&sum).contains("<mo>(</mo>"));
+        assert!(!expr(&sum).contains("<mo stretchy=\"false\">(</mo>"));
     }
 }

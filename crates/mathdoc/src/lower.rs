@@ -1925,16 +1925,15 @@ mod tests {
         assert_eq!(mathml::expr(&mu.statement.rhs), "<mi>ℝ</mi>");
         let c = row_named(&rows, "c");
         assert_eq!(c.annotation.as_deref(), Some("external input"));
-        assert!(
-            mathml::expr(&c.statement.rhs)
-                .starts_with("<mrow><mo>(</mo><mn>0</mn><mo>,</mo><mi>∞</mi><mo>]</mo>")
-        );
+        assert!(mathml::expr(&c.statement.rhs).starts_with(
+            "<mrow><mo stretchy=\"false\">(</mo><mn>0</mn><mo>,</mo><mi>∞</mi><mo stretchy=\"false\">]</mo>"
+        ));
         let x = row_named(&rows, "x");
         assert_eq!(x.statement.rel, Rel::Sim);
         assert_eq!(x.kind, Kind::Draw);
         assert_eq!(
             mathml::expr(&x.statement.rhs),
-            "<mrow><mi>Normal</mi><mo>&#x2061;</mo><mrow><mo>(</mo><mi data-flatppl-ref=\"mu\">μ</mi><mo>,</mo><mn>1</mn><mo>)</mo></mrow></mrow>"
+            "<mrow><mi>Normal</mi><mo>&#x2061;</mo><mrow><mo stretchy=\"false\">(</mo><mi data-flatppl-ref=\"mu\">μ</mi><mo>,</mo><mn>1</mn><mo stretchy=\"false\">)</mo></mrow></mrow>"
         );
         let y = row_named(&rows, "y");
         assert_eq!(y.kind, Kind::Value);
@@ -1945,7 +1944,7 @@ mod tests {
     fn keyword_arguments_take_their_declared_positions_or_stay_labelled() {
         assert_eq!(
             rhs("d = Normal(sigma = 2.0, mu = 1.0)", "d"),
-            "<mrow><mi>Normal</mi><mo>&#x2061;</mo><mrow><mo>(</mo><mn>1</mn><mo>,</mo><mn>2</mn><mo>)</mo></mrow></mrow>"
+            "<mrow><mi>Normal</mi><mo>&#x2061;</mo><mrow><mo stretchy=\"false\">(</mo><mn>1</mn><mo>,</mo><mn>2</mn><mo stretchy=\"false\">)</mo></mrow></mrow>"
         );
         assert!(
             rhs("d = Gamma(shape = 4.0, rate = 2.0)", "d")
@@ -1974,13 +1973,15 @@ mod tests {
                 "<mrow><mi>normalize</mi><mo>&#x2061;</mo><mrow><mo>(</mo><msub><mrow>"
             )
         );
-        assert!(tau.contains("<mo stretchy=\"false\">|</mo></mrow><mrow><mo>[</mo><mn>0</mn><mo>,</mo><mi>∞</mi><mo>]</mo></mrow></msub>"));
+        assert!(tau.contains("<mo stretchy=\"false\">|</mo></mrow><mrow><mo stretchy=\"false\">[</mo><mn>0</mn><mo>,</mo><mi>∞</mi><mo stretchy=\"false\">]</mo></mrow></msub>"));
         let mix = rhs(
             "p = elementof(unitinterval)\nmix = normalize(superpose(weighted(p, Normal(0, 1)), weighted(1 - p, Gamma(2, 1))))",
             "mix",
         );
         assert!(mix.contains("<mi data-flatppl-ref=\"p\">p</mi><mo>⋅</mo>"));
-        assert!(mix.contains("<mo>+</mo><mrow><mrow><mo>(</mo><mrow><mn>1</mn><mo>−</mo>"));
+        assert!(mix.contains(
+            "<mo>+</mo><mrow><mrow><mo stretchy=\"false\">(</mo><mrow><mn>1</mn><mo>−</mo>"
+        ));
         let pf = rhs("m = pushfwd(exp, Normal(0, 1))", "m");
         assert!(pf.starts_with("<mrow><msub><mi>exp</mi><mo>∗</mo></msub><mo>&#x2062;</mo>"));
         let ls = rhs(
@@ -1998,11 +1999,14 @@ mod tests {
         let rows = rows(src);
         let t = mathml::expr(&row_named(&rows, "t").statement.rhs);
         assert!(
-            t.starts_with("<msub><mrow><mrow><mo>(</mo><mrow><msub data-flatppl-ref=\"M1\">"),
+            t.starts_with("<msub><mrow><mrow><mo stretchy=\"false\">(</mo><mrow><msub data-flatppl-ref=\"M1\">"),
             "{t}"
         );
         let r = mathml::expr(&row_named(&rows, "r").statement.rhs);
-        assert!(r.starts_with("<mrow><mrow><mo>(</mo>"), "{r}");
+        assert!(
+            r.starts_with("<mrow><mrow><mo stretchy=\"false\">(</mo>"),
+            "{r}"
+        );
         assert!(
             r.contains("<mi mathvariant=\"normal\">d</mi><mi>x</mi>"),
             "{r}"
@@ -2049,7 +2053,7 @@ mod tests {
         let src = "z ~ Normal(0, 1)\nobs ~ Normal(z, 1)\nm = lawof(record(z = z, obs = obs))\npost = restrict(m, record(obs = 2.1))";
         let post = rhs(src, "post");
         assert!(
-            post.starts_with("<mrow><mi data-flatppl-ref=\"m\">m</mi><mo>&#x2061;</mo><mrow><mo>(</mo><mrow><mo>·</mo><mo stretchy=\"false\">|</mo>"),
+            post.starts_with("<mrow><mi data-flatppl-ref=\"m\">m</mi><mo>&#x2061;</mo><mrow><mo stretchy=\"false\">(</mo><mrow><mo>·</mo><mo stretchy=\"false\">|</mo>"),
             "{post}"
         );
         assert!(
@@ -2066,7 +2070,7 @@ mod tests {
         // The n-fold product measure is the bare power `Mⁿ` (van der Vaart's
         // `Pⁿ`), not `M^{⊗n}`; a vector size is `M^{m×n}`.
         assert!(
-            theta.ends_with("<mo>)</mo></mrow></mrow><mi data-flatppl-ref=\"J\">J</mi></msup>"),
+            theta.ends_with("<mo stretchy=\"false\">)</mo></mrow></mrow><mi data-flatppl-ref=\"J\">J</mi></msup>"),
             "{theta}"
         );
         let grid = rhs("w ~ iid(Normal(0, 1), [2, 3])", "w");
@@ -2078,7 +2082,10 @@ mod tests {
         assert!(y.starts_with("<mrow><munderover><mo>⨂</mo><mrow><mi>i</mi><mo>=</mo><mn>1</mn></mrow><mi data-flatppl-ref=\"J\">J</mi></munderover>"), "{y}");
         assert!(y.contains("<msub><mi data-flatppl-ref=\"theta\">θ</mi><mi>i</mi></msub><mo>,</mo><msub><mi data-flatppl-ref=\"s\">s</mi><mi>i</mi></msub>"));
         let means = mathml::expr(&row_named(&rows, "means").statement.rhs);
-        assert!(means.starts_with("<msubsup><mrow><mo>(</mo>"), "{means}");
+        assert!(
+            means.starts_with("<msubsup><mrow><mo stretchy=\"false\">(</mo>"),
+            "{means}"
+        );
         assert!(
             means.contains("<mi>i</mi><mo>=</mo><mn>1</mn></mrow><mn>4</mn></msubsup>"),
             "{means}"
@@ -2093,7 +2100,7 @@ mod tests {
         let eta = mathml::expr(&row_named(&rows, "eta").statement.rhs);
         assert!(eta.contains("<msub><mi data-flatppl-ref=\"a\">a</mi><msub><mi data-flatppl-ref=\"g\">g</mi><mi>i</mi></msub></msub>"), "{eta}");
         let p = mathml::expr(&row_named(&rows, "p").statement.rhs);
-        assert!(p.contains("<mi>invlogit</mi><mo>&#x2061;</mo><mrow><mo>(</mo><msub><mi data-flatppl-ref=\"eta\">η</mi><mi>i</mi></msub>"), "{p}");
+        assert!(p.contains("<mi>invlogit</mi><mo>&#x2061;</mo><mrow><mo stretchy=\"false\">(</mo><msub><mi data-flatppl-ref=\"eta\">η</mi><mi>i</mi></msub>"), "{p}");
     }
 
     #[test]
@@ -2103,21 +2110,21 @@ mod tests {
         let prior = mathml::expr(&row_named(&rows, "prior").statement.rhs);
         assert_eq!(
             prior,
-            "<mrow><mi>Law</mi><mo>&#x2061;</mo><mrow><mo>(</mo><mrow><mi data-flatppl-ref=\"mu\">μ</mi><mo>,</mo><mi data-flatppl-ref=\"tau\">τ</mi><mo>,</mo><mi data-flatppl-ref=\"theta\">θ</mi></mrow><mo>)</mo></mrow></mrow>"
+            "<mrow><mi>Law</mi><mo>&#x2061;</mo><mrow><mo stretchy=\"false\">(</mo><mrow><mi data-flatppl-ref=\"mu\">μ</mi><mo>,</mo><mi data-flatppl-ref=\"tau\">τ</mi><mo>,</mo><mi data-flatppl-ref=\"theta\">θ</mi></mrow><mo stretchy=\"false\">)</mo></mrow></mrow>"
         );
         let k = row_named(&rows, "K");
         assert_eq!(k.kind, Kind::Callable);
         let lhs = mathml::expr(&k.statement.lhs);
-        assert!(lhs.starts_with("<mrow><mi data-flatppl-ref=\"K\">K</mi><mo>&#x2061;</mo><mrow><mo>(</mo><mi data-flatppl-ref=\"mu\">μ</mi>"), "{lhs}");
+        assert!(lhs.starts_with("<mrow><mi data-flatppl-ref=\"K\">K</mi><mo>&#x2061;</mo><mrow><mo stretchy=\"false\">(</mo><mi data-flatppl-ref=\"mu\">μ</mi>"), "{lhs}");
         let rhs = mathml::expr(&k.statement.rhs);
         assert!(rhs.contains("<mi>Law</mi>"), "{rhs}");
         assert!(rhs.contains("<mi data-flatppl-ref=\"y\">y</mi><mo stretchy=\"false\">|</mo><mi data-flatppl-ref=\"mu\">μ</mi><mo>,</mo><mi data-flatppl-ref=\"tau\">τ</mi>"), "{rhs}");
         let l = row_named(&rows, "L");
         assert_eq!(l.kind, Kind::Likelihood);
         let lhs = mathml::expr(&l.statement.lhs);
-        assert!(lhs.starts_with("<mrow><mi data-flatppl-ref=\"L\">L</mi><mo>&#x2061;</mo><mrow><mo>(</mo><mi data-flatppl-ref=\"mu\">μ</mi>"), "{lhs}");
+        assert!(lhs.starts_with("<mrow><mi data-flatppl-ref=\"L\">L</mi><mo>&#x2061;</mo><mrow><mo stretchy=\"false\">(</mo><mi data-flatppl-ref=\"mu\">μ</mi>"), "{lhs}");
         let rhs = mathml::expr(&l.statement.rhs);
-        assert!(rhs.starts_with("<mrow><msub><mi>p</mi><mi data-flatppl-ref=\"K\">K</mi></msub><mo>&#x2061;</mo><mrow><mo>(</mo><mrow><mrow><mi>y</mi><mo>=</mo>"), "{rhs}");
+        assert!(rhs.starts_with("<mrow><msub><mi>p</mi><mi data-flatppl-ref=\"K\">K</mi></msub><mo>&#x2061;</mo><mrow><mo stretchy=\"false\">(</mo><mrow><mrow><mi>y</mi><mo>=</mo>"), "{rhs}");
         assert!(
             rhs.contains("<mo stretchy=\"false\">|</mo><mi data-flatppl-ref=\"mu\">μ</mi>"),
             "{rhs}"
@@ -2130,7 +2137,7 @@ mod tests {
         let f = row_named(&rows, "f");
         assert_eq!(
             mathml::expr(&f.statement.lhs),
-            "<mrow><mi data-flatppl-ref=\"f\">f</mi><mo>&#x2061;</mo><mrow><mo>(</mo><mi>x</mi><mo>)</mo></mrow></mrow>"
+            "<mrow><mi data-flatppl-ref=\"f\">f</mi><mo>&#x2061;</mo><mrow><mo stretchy=\"false\">(</mo><mi>x</mi><mo stretchy=\"false\">)</mo></mrow></mrow>"
         );
         assert_eq!(
             mathml::expr(&f.statement.rhs),
@@ -2152,7 +2159,7 @@ mod tests {
         let f = row_named(&rows, "f_sqrt");
         let lhs = mathml::expr(&f.statement.lhs);
         assert!(
-            lhs.contains("<mo>(</mo><mi data-flatppl-ref=\"a\">a</mi><mo>)</mo>"),
+            lhs.contains("<mo stretchy=\"false\">(</mo><mi data-flatppl-ref=\"a\">a</mi><mo stretchy=\"false\">)</mo>"),
             "{lhs}"
         );
         assert_eq!(
@@ -2171,7 +2178,7 @@ mod tests {
         let g = &row_named(&rows, "g").statement;
         assert_eq!(
             mathml::expr(&g.lhs),
-            "<mrow><mi data-flatppl-ref=\"g\">g</mi><mo>&#x2061;</mo><mrow><mo>(</mo><mo>)</mo></mrow></mrow>"
+            "<mrow><mi data-flatppl-ref=\"g\">g</mi><mo>&#x2061;</mo><mrow><mo stretchy=\"false\">(</mo><mo stretchy=\"false\">)</mo></mrow></mrow>"
         );
         assert!(mathml::expr(&g.rhs).starts_with("<mrow><mi>Normal</mi>"));
         // In expression position a closed reification is its body.
@@ -2199,10 +2206,9 @@ mod tests {
         assert_eq!(ab.names, vec!["a", "b"]);
         assert_eq!(ab.statement.rel, Rel::Sim);
         assert_eq!(ab.kind, Kind::Draw);
-        assert!(
-            mathml::expr(&ab.statement.lhs)
-                .starts_with("<mrow><mo>(</mo><mi data-flatppl-ref=\"a\">a</mi><mo>,</mo>")
-        );
+        assert!(mathml::expr(&ab.statement.lhs).starts_with(
+            "<mrow><mo stretchy=\"false\">(</mo><mi data-flatppl-ref=\"a\">a</mi><mo>,</mo>"
+        ));
         let d = &rows[2];
         assert_eq!(d.names, vec!["fk", "pr"]);
         let drhs = mathml::expr(&d.statement.rhs);
@@ -2215,7 +2221,7 @@ mod tests {
         assert_eq!(p.names, vec!["p"]);
         assert_eq!(
             mathml::expr(&p.statement.rhs),
-            "<msub><mrow><mo>(</mo><mn>3</mn><mo>,</mo><mn>4</mn><mo>)</mo></mrow><mn>1</mn></msub>"
+            "<msub><mrow><mo stretchy=\"false\">(</mo><mn>3</mn><mo>,</mo><mn>4</mn><mo stretchy=\"false\">)</mo></mrow><mn>1</mn></msub>"
         );
     }
 
@@ -2249,7 +2255,9 @@ mod tests {
         // An additive body is bracketed under the big operator.
         let p = mathml::expr(&row_named(&rows, "P").statement.rhs);
         assert!(
-            p.starts_with("<mrow><munder><mo>∏</mo><mi>j</mi></munder><mrow><mo>(</mo>"),
+            p.starts_with(
+                "<mrow><munder><mo>∏</mo><mi>j</mi></munder><mrow><mo stretchy=\"false\">(</mo>"
+            ),
             "{p}"
         );
         // Nested aggregation: a scalar reduction inline, an indexed one as a family.
@@ -2299,7 +2307,7 @@ mod tests {
         assert!(!ks.elided);
         assert_eq!(
             mathml::expr(&ks.statement.rhs),
-            "<mrow><mo>(</mo><mn>1</mn><mo>,</mo><mn>2</mn><mo>,</mo><mn>3</mn><mo>)</mo></mrow>"
+            "<mrow><mo stretchy=\"false\">(</mo><mn>1</mn><mo>,</mo><mn>2</mn><mo>,</mo><mn>3</mn><mo stretchy=\"false\">)</mo></mrow>"
         );
     }
 
@@ -2322,7 +2330,7 @@ mod tests {
         );
         assert!(
             mathml::expr(&row_named(&rows, "q").statement.rhs).ends_with(
-                "<mrow><mo>{</mo><mi>a</mi><mo>,</mo><mi>b</mi><mo>}</mo></mrow></msub>"
+                "<mrow><mo stretchy=\"false\">{</mo><mi>a</mi><mo>,</mo><mi>b</mi><mo stretchy=\"false\">}</mo></mrow></msub>"
             )
         );
         // A big operator that is not the last thing in a row is bracketed.
@@ -2346,7 +2354,7 @@ mod tests {
         assert!(k.starts_with("<mrow><mrow><mi data-flatppl-ref=\"h\">h</mi><mo>.</mo><mi>kallen</mi></mrow><mo>&#x2061;</mo>"), "{k}");
         assert_eq!(row_named(&rows, "h").kind, Kind::Module);
         let d = mathml::expr(&row_named(&rows, "d").statement.rhs);
-        assert!(d.starts_with("<mrow><mi>load_data</mi><mo>&#x2061;</mo><mrow><mo>(</mo><mtext>\"x.csv\"</mtext><mo>,</mo><msup><mi>ℝ</mi><mn>4</mn></msup>"), "{d}");
+        assert!(d.starts_with("<mrow><mi>load_data</mi><mo>&#x2061;</mo><mrow><mo stretchy=\"false\">(</mo><mtext>\"x.csv\"</mtext><mo>,</mo><msup><mi>ℝ</mi><mn>4</mn></msup>"), "{d}");
         assert!(
             mathml::expr(&row_named(&rows, "b").statement.rhs)
                 .starts_with("<mrow><mi>bincounts</mi>")
@@ -2354,7 +2362,7 @@ mod tests {
         // A standard-module distribution's keyword arguments follow §09 order.
         let cb = mathml::expr(&row_named(&rows, "cb").statement.rhs);
         assert!(
-            cb.ends_with("<mo>(</mo><mn>5</mn><mo>,</mo><mn>0.3</mn><mo>,</mo><mn>1.5</mn><mo>,</mo><mn>2</mn><mo>)</mo></mrow></mrow>"),
+            cb.ends_with("<mo stretchy=\"false\">(</mo><mn>5</mn><mo>,</mo><mn>0.3</mn><mo>,</mo><mn>1.5</mn><mo>,</mo><mn>2</mn><mo stretchy=\"false\">)</mo></mrow></mrow>"),
             "{cb}"
         );
     }
@@ -2375,7 +2383,7 @@ mod tests {
         let w = mathml::expr(&row_named(&rows, "w").statement.rhs);
         assert_eq!(
             w,
-            "<msup><mrow><mo>|</mo><mi data-flatppl-ref=\"z\">z</mi><mo>|</mo></mrow><mn>2</mn></msup>"
+            "<msup><mrow><mo stretchy=\"false\">|</mo><mi data-flatppl-ref=\"z\">z</mi><mo stretchy=\"false\">|</mo></mrow><mn>2</mn></msup>"
         );
         let c = mathml::expr(&row_named(&rows, "c").statement.rhs);
         assert!(c.contains("<mtext>if&#xa0;</mtext><mrow><mi data-flatppl-ref=\"m\">m</mi><mo>&gt;</mo><mn>1</mn></mrow>"), "{c}");

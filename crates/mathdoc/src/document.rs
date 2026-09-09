@@ -484,7 +484,7 @@ mod tests {
         let p = page(src);
         assert!(p.contains("<h2>Data</h2>"));
         assert!(p.contains("13 values, see the data appendix"));
-        assert!(p.contains("<mn>13</mn><mo>)</mo>"));
+        assert!(p.contains("<mn>13</mn><mo stretchy=\"false\">)</mo>"));
         assert!(p.contains("<h3>Parameters</h3>"));
     }
 
