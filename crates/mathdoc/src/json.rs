@@ -4,8 +4,8 @@
 //! Request:
 //!
 //! ```json
-//! { "source": "<module text>", "path": "model.flatppl",
-//!   "bundle": { "<directive>": "<text>" }, "formats": ["mathml"] }
+//! { "source": "<module text>", "path": "models/model.flatppl",
+//!   "bundle": { "<resolved path>": "<text>" }, "formats": ["mathml"] }
 //! ```
 //!
 //! Response:
@@ -18,6 +18,10 @@
 //!   "diagnostics": [ { "binding": "", "message": "…" } ] }
 //! ```
 //!
+//! `bundle` is keyed by each dependency's **resolved** path — the directive
+//! joined to its importer's directory per spec §04 (`/` separator, `..`
+//! allowed, an `http`/`https` URL as is) — exactly what the host resolved to
+//! load the text; transitive directives resolve against their own importer.
 //! `names` lists every binding a row binds: a decomposition `a, b ~ M` is one
 //! row named `a` with `names: ["a", "b"]`, and `order` lists row names only.
 //! Formats other than `mathml` are not produced yet; asking for one adds a

@@ -2,9 +2,9 @@
 //! text, and every row carries its back-reference hooks.
 //!
 //! Covers the resilience copies in `tests/fixtures/` and the repo's own
-//! `fixtures/flatppl/` tree. `load_module` dependencies are supplied as the
-//! viewer would supply them: a `{directive: text}` bundle read from the
-//! importing file's directory.
+//! `fixtures/flatppl/` tree. `load_module` dependencies are supplied as a host
+//! would supply them: a `{resolved path: text}` bundle, each directive joined
+//! to its importer's directory.
 
 use std::collections::HashMap;
 use std::fs;
@@ -49,25 +49,23 @@ fn directives(source: &str) -> Vec<String> {
 }
 
 /// The bundle a host would pass: each directive resolved against the
-/// importing file's directory, recursively.
+/// importing file's directory, recursively, keyed by the resolved path.
 fn bundle_for(file: &Path, source: &str) -> HashMap<String, String> {
     let mut bundle = HashMap::new();
     let dir = file.parent().unwrap();
-    let mut todo: Vec<(PathBuf, String)> = directives(source)
-        .into_iter()
-        .map(|d| (dir.join(&d), d))
-        .collect();
-    while let Some((path, directive)) = todo.pop() {
-        if bundle.contains_key(&directive) {
+    let mut todo: Vec<PathBuf> = directives(source).iter().map(|d| dir.join(d)).collect();
+    while let Some(path) = todo.pop() {
+        let key = path.to_string_lossy().to_string();
+        if bundle.contains_key(&key) {
             continue;
         }
         let Ok(text) = fs::read_to_string(&path) else {
             continue;
         };
         for d in directives(&text) {
-            todo.push((path.parent().unwrap().join(&d), d));
+            todo.push(path.parent().unwrap().join(&d));
         }
-        bundle.insert(directive, text);
+        bundle.insert(key, text);
     }
     bundle
 }
@@ -81,7 +79,8 @@ fn every_fixture_renders_without_source_text_fallbacks() {
             let source = fs::read_to_string(&file).unwrap();
             let bundle = bundle_for(&file, &source);
             let name = file.file_name().unwrap().to_string_lossy().to_string();
-            let rendering = match flatppl_mathdoc::render_source(&source, &name, &bundle) {
+            let path = file.to_string_lossy();
+            let rendering = match flatppl_mathdoc::render_source(&source, &path, &bundle) {
                 Ok(r) => r,
                 Err(e) => {
                     failures.push(format!("{name}: does not render: {e}"));

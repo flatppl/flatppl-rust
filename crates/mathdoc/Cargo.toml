@@ -18,6 +18,9 @@ document = ["dep:pulldown-cmark", "dep:latex2mathml"]
 flatppl-core = { path = "../core" }
 flatppl-infer = { path = "../infer" }
 flatppl-syntax = { path = "../syntax" }
+# The pure §04 `Location` resolver only (no cache, no network): bundle keys are
+# resolved module paths, and a directive is joined against its importer.
+flatppl-fileaccess = { path = "../fileaccess", default-features = false }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"], optional = true }

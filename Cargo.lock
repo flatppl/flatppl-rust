@@ -440,6 +440,7 @@ name = "flatppl-mathdoc"
 version = "0.1.0"
 dependencies = [
  "flatppl-core",
+ "flatppl-fileaccess",
  "flatppl-infer",
  "flatppl-syntax",
  "latex2mathml",
