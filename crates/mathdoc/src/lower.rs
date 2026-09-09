@@ -2389,7 +2389,7 @@ mod tests {
         );
         let rhs = mathml::expr(&m.statement.rhs);
         assert!(
-            rhs.starts_with("<mrow><msub><mo>∫</mo><mi>A</mi></msub><mrow><msup><mi>e</mi>"),
+            rhs.starts_with("<mrow><msub><mo>∫</mo><mi>A</mi></msub><mrow><mrow><mi>exp</mi>"),
             "{rhs}"
         );
         assert!(
