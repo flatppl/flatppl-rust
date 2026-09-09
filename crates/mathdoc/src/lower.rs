@@ -811,38 +811,36 @@ impl<'m> Lowerer<'m> {
     /// inputs, where there is nothing to integrate over and `w · M` says it.
     fn integral_form(&mut self, head: &str, call: &Call, set: Math) -> Option<Math> {
         let (weight, measure) = (call.args[0], call.args[1]);
-        let (vars, integrand) = if head == "bayesupdate" {
+        let integrand = if head == "bayesupdate" {
             self.likelihood_integrand(weight)?
         } else {
-            let (vars, w) = self.weight_integrand(weight)?;
-            let integrand = if head == "logweighted" {
-                Math::pow(Math::Sym(Sym::Euler), w)
-            } else {
-                w
-            };
-            (vars, integrand)
+            let mut w = self.weight_integrand(weight)?;
+            if head == "logweighted" {
+                w.body = Math::pow(Math::Sym(Sym::Euler), w.body);
+            }
+            w
         };
-        if vars.is_empty() {
-            return None;
-        }
         let m = self.expr(measure);
-        // `dM(x)` is tight; a multi-letter or compound measure gets a thin
-        // space after the `d` (`d prior(μ)`, `d (M₁ + M₂)(x)`).
+        // `dM` is tight; a multi-letter or compound measure gets a thin space
+        // after the `d` (`d prior`, `d (M₁ + M₂)(x)`).
         let mut differential = vec![Math::Op(Op::Differential)];
         if !single_letter(&m) {
             differential.push(Math::Op(Op::ThinSpace));
         }
         differential.push(unit(m));
-        differential.push(Math::paren(vars));
+        if let Some(vars) = integrand.vars {
+            differential.push(Math::paren(vars));
+        }
         let differential = Math::row(differential);
-        let body = Math::row(vec![integrand, Math::Op(Op::ThinSpace), differential]);
+        let body = Math::row(vec![integrand.body, Math::Op(Op::ThinSpace), differential]);
         Some(Math::big(BigOp::Integral, Some(set), None, body))
     }
 
-    /// A weight as an integrand: a lambda's body under its own parameters, a
-    /// named or builtin function applied to a fresh variable; `None` for a
-    /// constant or anything not known to be a function.
-    fn weight_integrand(&mut self, weight: NodeId) -> Option<(Vec<Math>, Math)> {
+    /// A weight as an integrand: a lambda's body under its own parameters
+    /// (`∫ exp(−x) dM(x)`), or a named or builtin function argument-free, as
+    /// measure theory writes `∫ f dM`; `None` for a constant or anything not
+    /// known to be a function.
+    fn weight_integrand(&mut self, weight: NodeId) -> Option<Integrand> {
         if let Node::Call(c) = self.m.node(weight)
             && self.head_is(c, "functionof")
             && !c.args.is_empty()
@@ -855,7 +853,10 @@ impl<'m> Lowerer<'m> {
             let vars: Vec<Math> = params.iter().map(|p| self.param_math(p)).collect();
             let body = self.expr(c.args[0]);
             self.scopes.pop();
-            return Some((vars, body));
+            return Some(Integrand {
+                body,
+                vars: Some(vars),
+            });
         }
         let is_function = match self.m.type_of(weight) {
             Some(Type::Function { .. }) => true,
@@ -865,31 +866,40 @@ impl<'m> Lowerer<'m> {
         if !is_function {
             return None;
         }
-        let x = self.fresh_variate(&["x", "y", "z", "u", "v", "w"]);
-        let f = self.expr(weight);
-        Some((vec![x.clone()], Math::apply(f, vec![x])))
+        Some(Integrand {
+            body: self.expr(weight),
+            vars: None,
+        })
     }
 
-    /// A likelihood as an integrand over its inputs: `p_K(data | θ)` for an
-    /// inline `likelihoodof`, `L(θ)` for a named one.
-    fn likelihood_integrand(&mut self, likelihood: NodeId) -> Option<(Vec<Math>, Math)> {
-        let vars = match self.callable_inputs(likelihood) {
-            Some(inputs) => inputs,
-            None => vec![self.fresh_variate(&["theta", "x", "y", "z"])],
-        };
-        if vars.is_empty() {
+    /// A likelihood as an integrand: `p_K(data | θ)` over its inputs for an
+    /// inline `likelihoodof`; a named one argument-free, `∫ ℒ d prior`, its
+    /// inputs stated by its own row. `None` for a likelihood known to have
+    /// no inputs, which is a constant weight.
+    fn likelihood_integrand(&mut self, likelihood: NodeId) -> Option<Integrand> {
+        let inputs = self.callable_inputs(likelihood);
+        if inputs.as_ref().is_some_and(Vec::is_empty) {
             return None;
         }
         if let Node::Call(c) = self.m.node(likelihood)
             && self.head_is(c, "likelihoodof")
             && c.args.len() == 2
         {
+            let vars = match inputs {
+                Some(inputs) => inputs,
+                None => vec![self.fresh_variate(&["theta", "x", "y", "z"])],
+            };
             let (kernel, data) = (c.args[0], c.args[1]);
-            let integrand = self.likelihood(kernel, data, &vars);
-            return Some((vars, integrand));
+            let body = self.likelihood(kernel, data, &vars);
+            return Some(Integrand {
+                body,
+                vars: Some(vars),
+            });
         }
-        let l = self.expr(likelihood);
-        Some((vars.clone(), Math::apply(l, vars)))
+        Some(Integrand {
+            body: self.expr(likelihood),
+            vars: None,
+        })
     }
 
     /// The set of a set-function row (`ν(𝘈) = ∫_𝘈 …`): one styled letter
@@ -1778,6 +1788,14 @@ impl<'m> Lowerer<'m> {
     }
 }
 
+/// The integrand of a reweighted measure: the body, and the bound variables
+/// the differential names — `None` for a named function, which integrates
+/// argument-free (`∫ f dM`).
+struct Integrand {
+    body: Math,
+    vars: Option<Vec<Math>>,
+}
+
 /// The pieces of a lowered `aggregate` / `metricsum`.
 struct Aggregation {
     out_axes: Vec<(String, Option<Variance>)>,
@@ -2427,10 +2445,10 @@ mod tests {
             "{post}"
         );
         assert!(
-            post.contains("<mi data-flatppl-ref=\"L\">ℒ</mi><mo>&#x2061;</mo>"),
+            post.contains("<mi data-flatppl-ref=\"L\">ℒ</mi><mspace width=\"0.1667em\"/>"),
             "{post}"
         );
-        assert!(post.contains("<mspace width=\"0.1667em\"/><mi mathvariant=\"normal\">d</mi><mspace width=\"0.1667em\"/><mi data-flatppl-ref=\"prior\">prior</mi><mrow><mo stretchy=\"false\">(</mo><mi data-flatppl-ref=\"mu\">μ</mi>"), "{post}");
+        assert!(post.contains("<mspace width=\"0.1667em\"/><mi mathvariant=\"normal\">d</mi><mspace width=\"0.1667em\"/><mi data-flatppl-ref=\"prior\">prior</mi></mrow>"), "{post}");
         let f = row_named(&rows, "f");
         assert_eq!(
             mathml::expr(&f.statement.lhs),
@@ -2474,15 +2492,18 @@ mod tests {
         assert!(c.starts_with("<mrow><mn>2</mn><mo>⋅</mo>"), "{c}");
         // A named function weight is applied to a fresh variable.
         let g = mathml::expr(&row_named(&rows, "g").statement.rhs);
-        assert!(g.contains("<msup><mi>e</mi><mrow><mi data-flatppl-ref=\"f\">f</mi><mo>&#x2061;</mo><mrow><mo stretchy=\"false\">(</mo><mi>x</mi>"), "{g}");
         assert!(
-            g.contains("<mi mathvariant=\"normal\">d</mi><mi data-flatppl-ref=\"M\">M</mi>"),
+            g.contains("<msup><mi>e</mi><mi data-flatppl-ref=\"f\">f</mi></msup>"),
+            "{g}"
+        );
+        assert!(
+            g.contains("<mi mathvariant=\"normal\">d</mi><mi data-flatppl-ref=\"M\">M</mi></mrow>"),
             "{g}"
         );
         // In expression position the set slot is the placeholder.
         let n = mathml::expr(&row_named(&rows, "n").statement.rhs);
         assert!(n.contains("<msub><mo>∫</mo><mo>·</mo></msub>"), "{n}");
-        assert!(n.contains("<mi data-flatppl-ref=\"L\">ℒ</mi><mo>&#x2061;</mo><mrow><mo stretchy=\"false\">(</mo><mi data-flatppl-ref=\"mu\">μ</mi>"), "{n}");
+        assert!(n.contains("<mi data-flatppl-ref=\"L\">ℒ</mi><mspace width=\"0.1667em\"/><mi mathvariant=\"normal\">d</mi>"), "{n}");
         // A likelihood with no inputs weights by a constant.
         let q = mathml::expr(&row_named(&rows, "q").statement.rhs);
         assert!(q.contains("<mo>⋅</mo>") && !q.contains("∫"), "{q}");

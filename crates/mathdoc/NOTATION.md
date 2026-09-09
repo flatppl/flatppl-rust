@@ -201,7 +201,7 @@ range comes from the typed module: a named size where the source gives one
 | `InverseGamma(shape, scale)`, `Weibull(shape, scale)` | InverseGamma(shape, scale), Weibull(shape, scale) |
 | `Uniform(S)` | 𝒰(S) with the set |
 | `Lebesgue(support = S)`, `Counting(S)`, `Dirac(v)` | λ_S (λ for ℝ̄), Counting(S), δ_v |
-| `weighted(w, M)`, `logweighted(l, M)` | as the set function §06 defines: ν(𝘈) = ∫_𝘈 w(x) dM(x), ν(𝘈) = ∫_𝘈 e^{l(x)} dM(x); the bound variable is the weight's own parameter (a lambda's body is written out), else a fresh letter; a constant weight is c · M |
+| `weighted(w, M)`, `logweighted(l, M)` | as the set function §06 defines: a named weight argument-free, ν(𝘈) = ∫_𝘈 w dM, ν(𝘈) = ∫_𝘈 e^{l} dM, as measure theory writes ∫ f dμ; a lambda writes its body under its own variable, ∫_𝘈 exp(−x) dM(x); a constant weight is c · M |
 | `superpose(M1, M2)` | M₁ + M₂ |
 | `normalize(M)`, `totalmass(M)` | normalize(M), totalmass(M) |
 | `truncate(M, S)` | M\|_S |
@@ -215,7 +215,7 @@ range comes from the typed module: a named size where the source gives one
 | `densityof(M, x)`, `logdensityof(M, x)` | p_M(x), log p_M(x) |
 | `likelihoodof(K, data)` as an expression | p_K(data \| inputs); with no inputs, p_K(data) |
 | `joint_likelihood(L1, L2)` | L₁ · L₂ |
-| `bayesupdate(L, prior)` | ν(𝘈) = ∫_𝘈 L(θ) d prior(θ) with L's inputs as the bound variables (an inline `likelihoodof` writes p_K(data \| θ)); L · prior when L has no inputs |
+| `bayesupdate(L, prior)` | ν(𝘈) = ∫_𝘈 ℒ d prior for a named likelihood, argument-free — its inputs stand in its own row; an inline `likelihoodof` writes ∫_𝘈 p_K(data \| θ) d prior(θ) with the inputs as bound variables; L · prior when L is known to have no inputs |
 | the set 𝘈 of a set-function row | sans-serif italic A (U+1D608), the same in every model: a plain letter is reachable from a binding name (`A`, `Gamma` → Γ) and would collide, a styled one cannot be typed in FlatPPL and carries no established meaning (unlike script 𝒜, a σ-algebra); bound variables (x, θ, …) are chosen to avoid the module's names |
 | any of the three in expression position | the set slot is the placeholder: normalize(∫_· L(θ) d prior(θ)) |
 | `restrict(M, record(a = v))` | M(· \| a = v) — the unnormalised conditional, distinct from `truncate`'s M\|_S |
