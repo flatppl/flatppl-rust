@@ -11,6 +11,8 @@
 #![doc = include_str!("../NOTATION.md")]
 
 pub mod ast;
+#[cfg(feature = "document")]
+pub mod document;
 #[cfg(feature = "json")]
 pub mod json;
 pub mod lower;

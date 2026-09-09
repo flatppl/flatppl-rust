@@ -20,5 +20,5 @@ flatppl-infer = { path = "../infer" }
 flatppl-syntax = { path = "../syntax" }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
-pulldown-cmark = { version = "0.13", default-features = false, optional = true }
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"], optional = true }
 latex2mathml = { version = "0.2", optional = true }
