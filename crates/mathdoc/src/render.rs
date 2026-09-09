@@ -62,7 +62,14 @@ pub struct Rendering {
 
 /// Render every binding of `module` in source order.
 pub fn render(module: &Module) -> Rendering {
-    let rows = lower::lower_module(module);
+    render_with_source(module, None)
+}
+
+/// [`render`] with the module's source text at hand: a row that falls back
+/// to source text then quotes the expression as written, and the fallback
+/// never has to print a deep expression.
+pub fn render_with_source(module: &Module, source: Option<&str>) -> Rendering {
+    let rows = lower::lower_module_with(module, source);
     let mut bindings = Vec::with_capacity(rows.len());
     let mut diagnostics = Vec::new();
     for row in rows {
@@ -124,7 +131,7 @@ pub fn render_source(
     let mut module = flatppl_syntax::parse(source).map_err(|e| format!("{path}: {e}"))?;
     let deps = resolve_bundle(&module, path, bundle)?;
     let infer_diags = flatppl_infer::infer_module(&mut module, &deps, Level::Shape);
-    let mut rendering = render(&module);
+    let mut rendering = render_with_source(&module, Some(source));
     attach_inference_diagnostics(&mut rendering, &module, &infer_diags);
     Ok(rendering)
 }
@@ -365,6 +372,23 @@ mod tests {
         );
         let r = render_source(src, "models/m.flatppl", &spelled).expect("renders");
         assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+    }
+
+    #[test]
+    fn a_joint_of_loaded_module_laws_claims_no_independence() {
+        // §06's own example: the two laws share the draw `z` inside `sub`.
+        let mut bundle = HashMap::new();
+        bundle.insert(
+            "sub.flatppl".to_string(),
+            "z ~ Normal(0, 1)\na ~ Normal(z, 1.0)\nb ~ Normal(z, 2.0)\nLa = lawof(a)\nLb = lawof(b)"
+                .to_string(),
+        );
+        let src = "s = load_module(\"sub.flatppl\")\nj = joint(s.La, s.Lb)";
+        let r = render_source(src, "m.flatppl", &bundle).expect("renders");
+        assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+        let j = &r.bindings[1].mathml;
+        assert!(j.contains("<mi>joint</mi>"), "{j}");
+        assert!(!j.contains("<mo>⊗</mo>"), "{j}");
     }
 
     #[test]

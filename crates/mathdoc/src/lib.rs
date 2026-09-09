@@ -20,4 +20,4 @@ pub mod mathml;
 pub mod names;
 pub mod render;
 
-pub use render::{BindingRender, Diagnostic, Rendering, render, render_source};
+pub use render::{BindingRender, Diagnostic, Rendering, render, render_source, render_with_source};

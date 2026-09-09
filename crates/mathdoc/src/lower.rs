@@ -81,7 +81,14 @@ pub struct Row {
 /// one tuple row, every other use of a synthetic binding is inlined where it
 /// is referenced, and an unreferenced one (`_ = expr`) renders nothing.
 pub fn lower_module(module: &Module) -> Vec<Row> {
-    let mut lowerer = Lowerer::new(module);
+    lower_module_with(module, None)
+}
+
+/// [`lower_module`] with the module's source text at hand, so a row that
+/// falls back to source text shows the expression as written rather than
+/// its canonical print.
+pub fn lower_module_with(module: &Module, source: Option<&str>) -> Vec<Row> {
+    let mut lowerer = Lowerer::with_source(module, source);
     let groups = decomposition_groups(module);
     let mut done: HashSet<BindingId> = HashSet::new();
     let mut rows = Vec::new();
@@ -93,14 +100,13 @@ pub fn lower_module(module: &Module) -> Vec<Row> {
             continue;
         }
         // A consumer of a complete decomposition renders the whole group once.
-        if let Some((source_node, consumers)) = groups
-            .values()
-            .find(|(_, c)| c.iter().any(|(_, b)| *b == id))
+        if let Some((source_binding, consumers)) =
+            groups.iter().find(|(_, c)| c.iter().any(|(_, b)| *b == id))
         {
             for (_, b) in consumers {
                 done.insert(*b);
             }
-            rows.push(lowerer.decomposition_row(*source_node, consumers));
+            rows.push(lowerer.decomposition_row(*source_binding, consumers));
             continue;
         }
         rows.push(lowerer.row(id));
@@ -110,8 +116,8 @@ pub fn lower_module(module: &Module) -> Vec<Row> {
 
 /// Synthetic decomposition sources whose projections cover positions
 /// `1..n` for some `n ≥ 2` → their consumers `(position, binding)` in position
-/// order. A projection is a binding `get(<ref to the source>, <int>)`.
-fn decomposition_groups(module: &Module) -> HashMap<BindingId, (NodeId, Vec<(i64, BindingId)>)> {
+/// order.
+fn decomposition_groups(module: &Module) -> HashMap<BindingId, Vec<(i64, BindingId)>> {
     let mut groups = HashMap::new();
     for (id, binding) in module.bindings() {
         if !binding.synthetic {
@@ -119,7 +125,10 @@ fn decomposition_groups(module: &Module) -> HashMap<BindingId, (NodeId, Vec<(i64
         }
         let mut consumers: Vec<(i64, BindingId)> = module
             .bindings()
-            .filter_map(|(cid, c)| projection_of(module, c.rhs, binding.name).map(|k| (k, cid)))
+            .filter_map(|(cid, c)| match projection_source(module, c.rhs) {
+                Some((source, k)) if source == id => Some((k, cid)),
+                _ => None,
+            })
             .collect();
         consumers.sort_by_key(|(k, _)| *k);
         let complete = consumers.len() >= 2
@@ -128,14 +137,14 @@ fn decomposition_groups(module: &Module) -> HashMap<BindingId, (NodeId, Vec<(i64
                 .enumerate()
                 .all(|(i, (k, _))| *k == i as i64 + 1);
         if complete {
-            groups.insert(id, (binding.rhs, consumers));
+            groups.insert(id, consumers);
         }
     }
     groups
 }
 
-/// `get(<ref to source>, k)` → `k`.
-fn projection_of(module: &Module, rhs: NodeId, source: Symbol) -> Option<i64> {
+/// A projection `get(<ref to a synthetic source>, k)` → `(source, k)`.
+fn projection_source(module: &Module, rhs: NodeId) -> Option<(BindingId, i64)> {
     let Node::Call(call) = module.node(rhs) else {
         return None;
     };
@@ -148,11 +157,15 @@ fn projection_of(module: &Module, rhs: NodeId, source: Symbol) -> Option<i64> {
     let Node::Ref(r) = module.node(call.args[0]) else {
         return None;
     };
-    if r.ns != RefNs::SelfMod || r.name != source {
+    if r.ns != RefNs::SelfMod {
+        return None;
+    }
+    let source = module.binding_by_name(r.name)?;
+    if !module.binding(source).synthetic {
         return None;
     }
     match module.node(call.args[1]) {
-        Node::Lit(Scalar::Int(k)) => Some(*k),
+        Node::Lit(Scalar::Int(k)) => Some((source, *k)),
         _ => None,
     }
 }
@@ -178,6 +191,8 @@ pub struct Lowerer<'m> {
     /// Synthetic bindings being inlined, so a malformed self-reference
     /// prints as a name rather than recursing.
     inlining: Vec<BindingId>,
+    /// The module's source text, for fallback rows.
+    source: Option<&'m str>,
 }
 
 /// What a binding's right-hand side lowered to.
@@ -189,6 +204,11 @@ struct Lowered {
 
 impl<'m> Lowerer<'m> {
     pub fn new(m: &'m Module) -> Self {
+        Self::with_source(m, None)
+    }
+
+    /// A lowerer that can quote the module's source text in fallback rows.
+    pub fn with_source(m: &'m Module, source: Option<&'m str>) -> Self {
         let bound = m
             .bindings()
             .map(|(_, b)| m.resolve(b.name).to_string())
@@ -200,6 +220,7 @@ impl<'m> Lowerer<'m> {
             bound,
             indices: Vec::new(),
             inlining: Vec::new(),
+            source,
         }
     }
 
@@ -235,9 +256,14 @@ impl<'m> Lowerer<'m> {
     }
 
     /// The row for a decomposition `a, b = source`.
-    fn decomposition_row(&mut self, source: NodeId, consumers: &[(i64, BindingId)]) -> Row {
+    fn decomposition_row(
+        &mut self,
+        source_binding: BindingId,
+        consumers: &[(i64, BindingId)],
+    ) -> Row {
         self.indices.clear();
         self.diagnostics.clear();
+        let source = self.m.binding(source_binding).rhs;
         let names: Vec<String> = consumers
             .iter()
             .map(|(_, b)| self.m.resolve(self.m.binding(*b).name).to_string())
@@ -266,10 +292,11 @@ impl<'m> Lowerer<'m> {
         }
         let statement = statement.unwrap_or_else(|| {
             self.diagnostics.push(too_deep_message(&names.join(", ")));
+            let (rel, text) = self.rhs_text(source_binding);
             Statement {
                 lhs,
-                rel: Rel::Eq,
-                rhs: Math::Code(self.source_text(consumers[0].1)),
+                rel,
+                rhs: Math::Code(text),
             }
         });
         Row {
@@ -288,36 +315,64 @@ impl<'m> Lowerer<'m> {
         self.indices.clear();
         let rhs = self.m.binding(id).rhs;
         if too_deep(self.m, rhs) {
-            return Math::Code(self.source_text(id));
+            return Math::Code(self.rhs_text(id).1);
         }
         let value = self.expr(rhs);
         if value.depth() > DEFAULT_MAX_DEPTH {
-            return Math::Code(self.source_text(id));
+            return Math::Code(self.rhs_text(id).1);
         }
         value
     }
 
     /// A row that shows the binding's source text because its expression is
-    /// too deeply nested to lower.
+    /// too deeply nested to lower. A projection of a decomposition source
+    /// (`p, _ = v`) shows the source with the component index, never the
+    /// generated name: `p = v[1]`, or `p ∼ M` annotated "component 1".
     fn source_fallback(&mut self, id: BindingId, name: &str) -> Lowered {
         self.diagnostics.push(too_deep_message(name));
+        let lhs = Math::binding(name);
+        let (rel, text, annotation) = match projection_source(self.m, self.m.binding(id).rhs) {
+            Some((source, k)) => match self.rhs_text(source) {
+                (Rel::Sim, text) => (Rel::Sim, text, Some(format!("component {k}"))),
+                (_, text) => (Rel::Eq, format!("{text}[{k}]"), None),
+            },
+            None => {
+                let (rel, text) = self.rhs_text(id);
+                (rel, text, None)
+            }
+        };
         Lowered {
             statement: Statement {
-                lhs: Math::binding(name),
-                rel: Rel::Eq,
-                rhs: Math::Code(self.source_text(id)),
+                lhs,
+                rel,
+                rhs: Math::Code(text),
             },
-            annotation: None,
+            annotation,
             elided: false,
         }
     }
 
-    /// The canonical FlatPPL text of a binding's right-hand side.
-    fn source_text(&self, id: BindingId) -> String {
+    /// A binding's right-hand side as FlatPPL text, with the relation it
+    /// binds under (`∼` for a `draw`, whose measure is then the text): the
+    /// source slice when the source is at hand, the canonical print of that
+    /// one binding otherwise. The canonical printer recurses, so the slice
+    /// is what keeps a fallback row safe on a deep expression; a module
+    /// without source text is a programmatic caller's.
+    fn rhs_text(&self, id: BindingId) -> (Rel, String) {
+        let rhs = self.m.binding(id).rhs;
+        let (rel, node) = match self.m.node(rhs) {
+            Node::Call(c) if self.head_is(c, "draw") && c.args.len() == 1 => (Rel::Sim, c.args[0]),
+            _ => (Rel::Eq, rhs),
+        };
+        if let Some(src) = self.source
+            && let Some(span) = self.m.span_of(node)
+            && let Some(slice) = src.get(span.start as usize..span.end as usize)
+        {
+            return (rel, slice.trim().to_string());
+        }
         let name = self.m.resolve(self.m.binding(id).name);
         let mut only = self.m.clone();
-        let keep: HashSet<BindingId> = [id].into_iter().collect();
-        only.retain_bindings(&keep);
+        only.retain_bindings(&[id].into_iter().collect());
         let text = flatppl_syntax::print(&only);
         // Drop doc-comment lines and the `name =` / `name ~` prefix.
         let body: Vec<&str> = text
@@ -330,7 +385,7 @@ impl<'m> Lowerer<'m> {
             .strip_prefix(name)
             .and_then(|r| r.strip_prefix(" = ").or_else(|| r.strip_prefix(" ~ ")))
             .unwrap_or(trimmed);
-        rest.to_string()
+        (rel, rest.to_string())
     }
 
     fn kind(&self, rhs: NodeId) -> Kind {
@@ -888,7 +943,7 @@ impl<'m> Lowerer<'m> {
                 let cond = Math::row(intersperse_commas(self.labelled(call)));
                 conditional(m, cond)
             }
-            "joint" => self.joint(id, call),
+            "joint" => self.joint(call),
             "iid" if call.args.len() == 2 && call.named.is_empty() => {
                 let m = self.expr(call.args[0]);
                 let n = self.size_exponent(call.args[1]);
@@ -974,6 +1029,16 @@ impl<'m> Lowerer<'m> {
         let RefNs::Module(alias) = r.ns else {
             return None;
         };
+        let module = self.standard_module_name(alias)?;
+        flatppl_infer::builtin_catalogue()
+            .module_param_names(module, self.m.resolve(r.name))
+            .map(|names| names.to_vec())
+    }
+
+    /// The name of the standard module bound to `alias`
+    /// (`h = standard_module("particle-physics", …)` → `particle-physics`);
+    /// `None` for a loaded module.
+    fn standard_module_name(&self, alias: Symbol) -> Option<&'m str> {
         let alias_binding = self.m.binding_by_name(alias)?;
         let Node::Call(load) = self.m.node(self.m.binding(alias_binding).rhs) else {
             return None;
@@ -981,26 +1046,26 @@ impl<'m> Lowerer<'m> {
         if !self.head_is(load, "standard_module") {
             return None;
         }
-        let Node::Lit(Scalar::Str(module)) = self.m.node(*load.args.first()?) else {
-            return None;
-        };
-        flatppl_infer::builtin_catalogue()
-            .module_param_names(module, self.m.resolve(r.name))
-            .map(|names| names.to_vec())
+        match self.m.node(*load.args.first()?) {
+            Node::Lit(Scalar::Str(module)) => Some(&**module),
+            _ => None,
+        }
     }
 
     /// `joint`: `⊗` of the components when they provably share no stochastic
     /// ancestor (spec §06 "Joint composition"), the construct name otherwise.
-    fn joint(&mut self, id: NodeId, call: &Call) -> Math {
+    fn joint(&mut self, call: &Call) -> Math {
         let components: Vec<NodeId> = call
             .args
             .iter()
             .copied()
             .chain(call.named.iter().map(|n| n.value))
             .collect();
-        let is_kernel = matches!(self.m.type_of(id), Some(Type::Kernel { .. }));
+        // A spelling that mixes positional and keyword components is not a
+        // §06 form; it keeps the construct name with every component.
+        let mixed = !call.args.is_empty() && !call.named.is_empty();
         let independent = !components.is_empty()
-            && !is_kernel
+            && !mixed
             && components.iter().all(|c| self.independent_component(*c));
         if !independent {
             let mut args = self.args(call);
@@ -1028,8 +1093,11 @@ impl<'m> Lowerer<'m> {
 
     /// A `joint` component contributes a fresh coordinate with no shared
     /// stochastic node when it is not of stochastic phase and its subtree
-    /// (through module references) holds no reification or draw — the two
-    /// channels §06 names for sharing.
+    /// (through this module's bindings) holds no reification or draw — the
+    /// two channels §06 names for sharing. A reference into a loaded module
+    /// may reach a draw this module cannot see, so it counts as sharing; a
+    /// standard module is a catalogue of pure functions and distributions and
+    /// holds none.
     fn independent_component(&self, component: NodeId) -> bool {
         if self.m.phase_of(component) == Some(Phase::Stochastic) {
             return false;
@@ -1054,11 +1122,19 @@ impl<'m> Lowerer<'m> {
                         stack.push(callee);
                     }
                 }
-                Node::Ref(r) if r.ns == RefNs::SelfMod => {
-                    if let Some(b) = self.m.binding_by_name(r.name) {
-                        stack.push(self.m.binding(b).rhs);
+                Node::Ref(r) => match r.ns {
+                    RefNs::SelfMod => {
+                        if let Some(b) = self.m.binding_by_name(r.name) {
+                            stack.push(self.m.binding(b).rhs);
+                        }
                     }
-                }
+                    RefNs::Module(alias) => {
+                        if self.standard_module_name(alias).is_none() {
+                            return false;
+                        }
+                    }
+                    RefNs::Local => {}
+                },
                 _ => {}
             }
         }
@@ -1489,11 +1565,21 @@ struct Aggregation {
 
 /// Whether the expression at `id` nests deeper than
 /// [`DEFAULT_MAX_DEPTH`] (iterative, so the check itself cannot overflow).
+/// A reference to a synthetic binding counts the binding's right-hand side,
+/// which the lowering inlines at that point.
 fn too_deep(m: &Module, id: NodeId) -> bool {
     let mut stack = vec![(id, 0usize)];
     while let Some((node, depth)) = stack.pop() {
         if depth > DEFAULT_MAX_DEPTH {
             return true;
+        }
+        if let Node::Ref(r) = m.node(node)
+            && r.ns == RefNs::SelfMod
+            && let Some(b) = m.binding_by_name(r.name)
+            && m.binding(b).synthetic
+        {
+            stack.push((m.binding(b).rhs, depth + 1));
+            continue;
         }
         m.for_each_child(node, |c| stack.push((c, depth + 1)));
     }
@@ -1806,6 +1892,13 @@ mod tests {
     fn rows(src: &str) -> Vec<Row> {
         let mut module = flatppl_syntax::parse(src).expect("parses");
         flatppl_infer::infer(&mut module);
+        lower_module_with(&module, Some(src))
+    }
+
+    /// As [`rows`], for a caller that has no source text (fallbacks print).
+    fn rows_without_source(src: &str) -> Vec<Row> {
+        let mut module = flatppl_syntax::parse(src).expect("parses");
+        flatppl_infer::infer(&mut module);
         lower_module(&module)
     }
 
@@ -1936,6 +2029,19 @@ mod tests {
             "dep",
         );
         assert!(param.starts_with("<mrow><mi>joint</mi>"), "{param}");
+        // A mixed spelling keeps every component under the construct name.
+        let mixed = rhs("m = joint(Normal(0, 1), b = Exponential(1))", "m");
+        assert!(mixed.starts_with("<mrow><mi>joint</mi>"), "{mixed}");
+        assert!(mixed.contains("<mi>Normal</mi>") && mixed.contains("<mi>Exponential</mi>"));
+        // A standard-module distribution holds no draw: still a product.
+        let std = rhs(
+            "h = standard_module(\"particle-physics\", \"0.1\")\nm = joint(h.CrystalBall(5.0, 0.3, 1.5, 2.0), Normal(0, 1))",
+            "m",
+        );
+        assert!(std.contains("<mo>⊗</mo>"), "{std}");
+        // A kernel-typed joint is a product of its (independent) components.
+        let kernel = rhs("K = joint(kernelof(Normal(0, 1)), Exponential(1))", "K");
+        assert!(kernel.starts_with("<mrow><mi>joint</mi>"), "{kernel}");
     }
 
     #[test]
@@ -2288,5 +2394,45 @@ mod tests {
         // A shallower one lowers normally.
         let shallow = rows("m = superpose(Normal(0, 1), Normal(1, 1), Normal(2, 1))");
         assert!(row_named(&shallow, "m").diagnostics.is_empty());
+    }
+
+    #[test]
+    fn a_too_deep_decomposition_source_falls_back_without_generated_names() {
+        let terms: Vec<&str> = std::iter::repeat_n("1", DEFAULT_MAX_DEPTH + 20).collect();
+        let sum = terms.join(" + ");
+        // A partial decomposition inlines the source; the guard sees through
+        // the synthetic binding it inlines.
+        let src = format!("p, _ = ({sum}, 2)\nq = p * 2");
+        // With the source at hand the row quotes it as written; without, the
+        // canonical print (line-broken) stands in. Neither names `__0x…`.
+        for (label, rows) in [
+            ("source", rows(&src)),
+            ("printed", rows_without_source(&src)),
+        ] {
+            let p = row_named(&rows, "p");
+            let Math::Code(text) = &p.statement.rhs else {
+                panic!("{label}: {:?}", p.statement.rhs);
+            };
+            let flat: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(
+                flat.starts_with("( 1 + 1") || flat.starts_with("(1 + 1"),
+                "{label}: {flat}"
+            );
+            assert!(flat.ends_with(")[1]"), "{label}: {flat}");
+            assert!(!text.contains("__0x"), "{label}: {text}");
+            assert_eq!(p.diagnostics.len(), 1, "{label}");
+            assert!(row_named(&rows, "q").diagnostics.is_empty(), "{label}");
+        }
+        // A complete decomposition of a draw keeps its relation.
+        let src = format!("a, b ~ MvNormal([{sum}, 0.0], eye(2))");
+        let rows = rows(&src);
+        let ab = row_named(&rows, "a");
+        assert_eq!(ab.names, vec!["a", "b"]);
+        assert_eq!(ab.statement.rel, Rel::Sim);
+        assert!(
+            matches!(&ab.statement.rhs, Math::Code(t) if t.starts_with("MvNormal([1 + 1")),
+            "{:?}",
+            ab.statement.rhs
+        );
     }
 }

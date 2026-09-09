@@ -25,8 +25,8 @@ the rules stated here.
   the definition of the construct it stands for, never a guess at what the
   author meant.
 - **A row never goes blank.** A right-hand side the lowering cannot render
-  prints as its canonical FlatPPL text in monospace, with a diagnostic saying
-  why (see "Fallback").
+  prints as its FlatPPL text in monospace, with a diagnostic saying why (see
+  "Fallback").
 
 ## Document structure
 
@@ -70,7 +70,7 @@ first, then each further segment (Greek, letter, word or digits by the same
 rule), comma-separated.
 
 | Name | Renders as |
-|---|---|
+| --- | --- |
 | `theta1`, `s12`, `c0` | θ₁, s₁₂, c₀ |
 | `mu_a`, `sigma_B`, `S_mu`, `nu_B` | μ_a, σ_B, S_μ, ν_B |
 | `y_data`, `x_init`, `L_input` | y_{data}, x_{init}, L_{input} (upright subscript words) |
@@ -86,7 +86,7 @@ the same rules (`.mu` → μ).
 ## Statement forms
 
 | FlatPPL | Row |
-|---|---|
+| --- | --- |
 | `x = expr` | x = expr |
 | `x ~ M`, `x = draw(M)` | x ∼ M |
 | `x = elementof(S)` | x ∈ S |
@@ -104,7 +104,7 @@ the same rules (`.mu` → μ).
 ## Values and sets
 
 | FlatPPL | Math |
-|---|---|
+| --- | --- |
 | `3`, `1.5`, `1e-6`, `true`, `"s"` | 3, 1.5, 1·10⁻⁶, true, "s" (powers of ten below 10⁻⁴ and from 10¹⁶) |
 | `pi`, `inf`, `im` | π, ∞, i (upright) |
 | `[a, b, c]`, `vector(…)` | (a, b, c) |
@@ -123,7 +123,7 @@ the same rules (`.mu` → μ).
 ## Operators and functions
 
 | FlatPPL | Math |
-|---|---|
+| --- | --- |
 | `a + b`, `a - b`, `-a` | a + b, a − b, −a |
 | `a * b` | ab by juxtaposition; a · b when the right operand is a number or both are |
 | `a / b` | a fraction |
@@ -149,7 +149,7 @@ callable without one they print as `name = value`.
 ## Collections, broadcasting, aggregation
 
 | FlatPPL | Math |
-|---|---|
+| --- | --- |
 | `iid(M, n)`, `iid(M, [m, n])` | M^{⊗n}, M^{⊗(m×n)} |
 | `K.(xs, ys)`, `broadcast(K, xs, ys)` with K a kernel | ⨂_{i=1}^{n} K(xs_i, ys_i) |
 | `f.(xs, c)`, `xs .+ c`, `broadcast(f, xs, c)` with f a function | (f(xs_i, c))_{i=1}^{n}, (xs_i + c)_{i=1}^{n} |
@@ -165,7 +165,7 @@ range comes from the typed module: a named size where the source gives one
 ## Measures, kernels, likelihoods (§06, §04)
 
 | FlatPPL | Math |
-|---|---|
+| --- | --- |
 | `Normal(0, 1)`, `Gamma(shape = a, rate = b)` | Normal(0, 1), Gamma(a, b) — §08 names, §08 argument order |
 | `Uniform(S)` | Uniform(S) with the set |
 | `Lebesgue(support = S)`, `Counting(S)`, `Dirac(v)` | λ_S (λ for ℝ), Counting(S), δ_v |
@@ -174,7 +174,7 @@ range comes from the typed module: a named size where the source gives one
 | `normalize(M)`, `totalmass(M)` | normalize(M), totalmass(M) |
 | `truncate(M, S)` | M\|_S |
 | `pushfwd(f, M)`, `locscale(M, a, b)` | f_* M, a + b · M |
-| `joint(M1, M2)`, `joint(a = M1, b = M2)` | M₁ ⊗ M₂, M₁(da) ⊗ M₂(db) — only when no component is stochastic or reifies a draw (§06: `joint` retains shared stochastic ancestors and is then not a product); otherwise joint(…) in roman |
+| `joint(M1, M2)`, `joint(a = M1, b = M2)` | M₁ ⊗ M₂, M₁(da) ⊗ M₂(db) — only when no component is stochastic, reifies a draw, or reaches into a loaded module (§06: `joint` retains shared stochastic ancestors and is then not a product; a loaded module's binding may hold a draw this module cannot see, a standard module holds none); otherwise, and for a spelling that mixes positional and keyword components, joint(…) in roman |
 | `relabel(M, ["x"])` | M(dx) |
 | `lawof(x)`, `lawof(record(a = a, b = b))` | Law(x), Law(a, b) |
 | `kernelof(x, p = a)` as an expression | p ↦ Law(x \| p); with no inputs, Law(x) |
@@ -194,7 +194,7 @@ list of those symbols (`Law(μ, τ, θ)`); any other field prints as `name = val
 ## Modules, data, randomness
 
 | FlatPPL | Math |
-|---|---|
+| --- | --- |
 | `m = load_module("f.flatppl", c = v)` | m = load_module("f.flatppl", c = v) |
 | `h = standard_module("particle-physics", "0.1")` | h = standard_module("particle-physics", "0.1") |
 | `x = load_data("d.csv", S)` | x = load_data("d.csv", S) |
@@ -206,7 +206,9 @@ Every construct has a rendering (unknown builtins print in roman), so the
 fallback is reached on two conditions only: a right-hand side nested deeper than
 `flatppl_core::DEFAULT_MAX_DEPTH` levels before or after lowering (a
 `superpose` of 200 terms folds into a 200-deep chain), or a bare hole `_`
-outside `fn(…)`. The row then shows the binding's canonical FlatPPL text in
-monospace and carries a diagnostic saying why. A binding whose inference failed
+outside `fn(…)`. The row then shows the binding's FlatPPL text in monospace (as
+written when the source is at hand, its canonical print otherwise; a projection
+of a decomposition shows the source with its component index, `p = v[1]`) and
+carries a diagnostic saying why. A binding whose inference failed
 still renders structurally; only the typed features (index ranges, kernel input
 lists, the `joint` independence test, the notation appendix) degrade.

@@ -492,7 +492,12 @@ fn convert_html(
             flatppl_cli::resolve::terminal_message(&d.message)
         );
     }
-    let mut rendering = flatppl_mathdoc::render(module);
+    // FlatPPL input: the page quotes the source as written where a row falls
+    // back to source text. Other inputs have no FlatPPL text to quote.
+    let source = matches!(Format::from_path(input), Ok(Format::FlatPpl))
+        .then(|| flatppl_cli::read_regular_utf8(input).ok())
+        .flatten();
+    let mut rendering = flatppl_mathdoc::render_with_source(module, source.as_deref());
     flatppl_mathdoc::render::attach_inference_diagnostics(&mut rendering, module, &diags);
     let title = input
         .file_stem()
