@@ -10,4 +10,6 @@
 //! wasm API (`render_math`) are thin adapters in their own crates.
 #![doc = include_str!("../NOTATION.md")]
 
+pub mod ast;
+pub mod mathml;
 pub mod names;
