@@ -164,6 +164,24 @@ pub fn greek(name: &str) -> Option<char> {
     })
 }
 
+/// The Unicode Mathematical Script capital for an ASCII capital (`L` → `ℒ`).
+/// Eight of the twenty-six live in the Letterlike Symbols block, the rest in
+/// the Mathematical Alphanumeric Symbols block.
+pub fn script_capital(c: char) -> char {
+    match c {
+        'B' => 'ℬ',
+        'E' => 'ℰ',
+        'F' => 'ℱ',
+        'H' => 'ℋ',
+        'I' => 'ℐ',
+        'L' => 'ℒ',
+        'M' => 'ℳ',
+        'R' => 'ℛ',
+        'A'..='Z' => char::from_u32(0x1D49C + (c as u32 - 'A' as u32)).unwrap_or(c),
+        other => other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::Atom::*;
@@ -272,23 +290,5 @@ mod tests {
         assert_eq!(dn("__0x1f"), DisplayName::word("__0x1f"));
         assert_eq!(dn("a__b"), DisplayName::word("a__b"));
         assert_eq!(dn("x_"), DisplayName::word("x_"));
-    }
-}
-
-/// The Unicode Mathematical Script capital for an ASCII capital (`L` → `ℒ`).
-/// Eight of the twenty-six live in the Letterlike Symbols block, the rest in
-/// the Mathematical Alphanumeric Symbols block.
-pub fn script_capital(c: char) -> char {
-    match c {
-        'B' => 'ℬ',
-        'E' => 'ℰ',
-        'F' => 'ℱ',
-        'H' => 'ℋ',
-        'I' => 'ℐ',
-        'L' => 'ℒ',
-        'M' => 'ℳ',
-        'R' => 'ℛ',
-        'A'..='Z' => char::from_u32(0x1D49C + (c as u32 - 'A' as u32)).unwrap_or(c),
-        other => other,
     }
 }
