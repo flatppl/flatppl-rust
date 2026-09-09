@@ -191,7 +191,7 @@ range comes from the typed module: a named size where the source gives one
 | `InverseGamma(shape, scale)`, `Weibull(shape, scale)` | InverseGamma(shape, scale), Weibull(shape, scale) |
 | `Uniform(S)` | 𝒰(S) with the set |
 | `Lebesgue(support = S)`, `Counting(S)`, `Dirac(v)` | λ_S (λ for ℝ̄), Counting(S), δ_v |
-| `weighted(w, M)`, `logweighted(l, M)` | w · M, e^{l} · M |
+| `weighted(w, M)`, `logweighted(l, M)` | as the set function §06 defines: ν(A) = ∫_A w(x) dM(x), ν(A) = ∫_A e^{l(x)} dM(x); the bound variable is the weight's own parameter (a lambda's body is written out), else a fresh letter; a constant weight is c · M |
 | `superpose(M1, M2)` | M₁ + M₂ |
 | `normalize(M)`, `totalmass(M)` | normalize(M), totalmass(M) |
 | `truncate(M, S)` | M\|_S |
@@ -205,7 +205,8 @@ range comes from the typed module: a named size where the source gives one
 | `densityof(M, x)`, `logdensityof(M, x)` | p_M(x), log p_M(x) |
 | `likelihoodof(K, data)` as an expression | p_K(data \| inputs); with no inputs, p_K(data) |
 | `joint_likelihood(L1, L2)` | L₁ · L₂ |
-| `bayesupdate(L, prior)` | L · prior |
+| `bayesupdate(L, prior)` | ν(A) = ∫_A L(θ) d prior(θ) with L's inputs as the bound variables (an inline `likelihoodof` writes p_K(data \| θ)); L · prior when L has no inputs |
+| any of the three in expression position | the set slot is the placeholder: normalize(∫_· L(θ) d prior(θ)) |
 | `restrict(M, record(a = v))` | M(· \| a = v) — the unnormalised conditional, distinct from `truncate`'s M\|_S |
 | a keyword spelling of a measure operator (`bayesupdate(prior = …, L = …)`) | the construct name in roman with `name = value` arguments |
 | `kchain`, `jointchain`, `markovchain`, `kscan`, `ksuperpose`, `disintegrate`, `bijection`, `PoissonProcess`, … | the construct name in roman with its arguments |

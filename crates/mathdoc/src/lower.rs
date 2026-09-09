@@ -495,6 +495,19 @@ impl<'m> Lowerer<'m> {
                     elided: false,
                 }
             }
+            "weighted" | "logweighted" | "bayesupdate"
+                if call.args.len() == 2 && call.named.is_empty() =>
+            {
+                let set = self.fresh_set();
+                match self.integral_form(&head, call, set.clone()) {
+                    Some(rhs) => Lowered {
+                        statement: eq(Math::apply(lhs, vec![set]), rhs),
+                        annotation: None,
+                        elided: false,
+                    },
+                    None => plain(self, lhs),
+                }
+            }
             "likelihoodof" if call.args.len() == 2 && call.named.is_empty() => {
                 let inputs = self.callable_inputs(rhs).unwrap_or_default();
                 let lhs = if inputs.is_empty() {
@@ -752,6 +765,115 @@ impl<'m> Lowerer<'m> {
         )
     }
 
+    // ── reweighted measures ────────────────────────────────────────────────
+
+    /// `weighted(w, M)`, `logweighted(l, M)` and `bayesupdate(L, prior)` as
+    /// the set function §06 defines them by: `∫_{set} w(x) dM(x)`,
+    /// `∫_{set} e^{l(x)} dM(x)`, `∫_{set} L(θ) dπ(θ)`. The bound variables are
+    /// the weight's own parameters (a lambda), the likelihood's inputs (typed),
+    /// or a fresh letter. `None` for a constant weight or a likelihood with no
+    /// inputs, where there is nothing to integrate over and `w · M` says it.
+    fn integral_form(&mut self, head: &str, call: &Call, set: Math) -> Option<Math> {
+        let (weight, measure) = (call.args[0], call.args[1]);
+        let (vars, integrand) = if head == "bayesupdate" {
+            self.likelihood_integrand(weight)?
+        } else {
+            let (vars, w) = self.weight_integrand(weight)?;
+            let integrand = if head == "logweighted" {
+                Math::pow(Math::Sym(Sym::Euler), w)
+            } else {
+                w
+            };
+            (vars, integrand)
+        };
+        if vars.is_empty() {
+            return None;
+        }
+        let m = self.expr(measure);
+        let differential = Math::row(vec![Math::Op(Op::Differential), unit(m), Math::paren(vars)]);
+        let body = Math::row(vec![integrand, Math::Op(Op::ThinSpace), differential]);
+        Some(Math::big(BigOp::Integral, Some(set), None, body))
+    }
+
+    /// A weight as an integrand: a lambda's body under its own parameters, a
+    /// named or builtin function applied to a fresh variable; `None` for a
+    /// constant or anything not known to be a function.
+    fn weight_integrand(&mut self, weight: NodeId) -> Option<(Vec<Math>, Math)> {
+        if let Node::Call(c) = self.m.node(weight)
+            && self.head_is(c, "functionof")
+            && !c.args.is_empty()
+            && let Some(params) = self.reification_params(weight, c)
+        {
+            if params.is_empty() {
+                return None;
+            }
+            self.scopes.push(params.clone());
+            let vars: Vec<Math> = params.iter().map(|p| self.param_math(p)).collect();
+            let body = self.expr(c.args[0]);
+            self.scopes.pop();
+            return Some((vars, body));
+        }
+        let is_function = match self.m.type_of(weight) {
+            Some(Type::Function { .. }) => true,
+            Some(_) => false,
+            None => matches!(self.m.node(weight), Node::Const(_)),
+        };
+        if !is_function {
+            return None;
+        }
+        let x = self.fresh_variate(&["x", "y", "z", "u", "v", "w"]);
+        let f = self.expr(weight);
+        Some((vec![x.clone()], Math::apply(f, vec![x])))
+    }
+
+    /// A likelihood as an integrand over its inputs: `p_K(data | θ)` for an
+    /// inline `likelihoodof`, `L(θ)` for a named one.
+    fn likelihood_integrand(&mut self, likelihood: NodeId) -> Option<(Vec<Math>, Math)> {
+        let vars = match self.callable_inputs(likelihood) {
+            Some(inputs) => inputs,
+            None => vec![self.fresh_variate(&["theta", "x", "y", "z"])],
+        };
+        if vars.is_empty() {
+            return None;
+        }
+        if let Node::Call(c) = self.m.node(likelihood)
+            && self.head_is(c, "likelihoodof")
+            && c.args.len() == 2
+        {
+            let (kernel, data) = (c.args[0], c.args[1]);
+            let integrand = self.likelihood(kernel, data, &vars);
+            return Some((vars, integrand));
+        }
+        let l = self.expr(likelihood);
+        Some((vars.clone(), Math::apply(l, vars)))
+    }
+
+    /// A fresh set letter for a set-function row (`ν(A) = ∫_A …`).
+    fn fresh_set(&mut self) -> Math {
+        self.fresh_name(&["A", "B", "C", "D", "E", "F", "G", "H"], "A")
+    }
+
+    /// A fresh bound variable for an integrand.
+    fn fresh_variate(&mut self, preferred: &[&str]) -> Math {
+        self.fresh_name(preferred, "x")
+    }
+
+    /// The first of `candidates` no binding, index or parameter uses;
+    /// numbered from `stem` when all are taken.
+    fn fresh_name(&mut self, candidates: &[&str], stem: &str) -> Math {
+        for c in candidates {
+            let s = c.to_string();
+            if self.bound.contains(&s) || self.indices.contains(&s) || self.scope_has(&s) {
+                continue;
+            }
+            self.indices.push(s);
+            return Math::ident(c, None);
+        }
+        let s = format!("{stem}{}", self.indices.len());
+        self.indices.push(s.clone());
+        Math::ident(&s, None)
+    }
+
     // ── expressions ────────────────────────────────────────────────────────
 
     pub fn expr(&mut self, id: NodeId) -> Math {
@@ -950,6 +1072,17 @@ impl<'m> Lowerer<'m> {
             "lawof" if call.args.len() == 1 && call.named.is_empty() => {
                 let items = self.law_items(call.args[0]);
                 Math::apply(Math::Sym(Sym::Law), vec![Math::row(items)])
+            }
+            "weighted" | "logweighted" | "bayesupdate"
+                if call.args.len() == 2 && call.named.is_empty() =>
+            {
+                match self.integral_form(head, call, Math::Sym(Sym::Placeholder)) {
+                    Some(m) => m,
+                    None => {
+                        let args = self.args(call);
+                        apply_builtin(head, args)
+                    }
+                }
             }
             "likelihoodof" if call.args.len() == 2 && call.named.is_empty() => {
                 let inputs = self.callable_inputs(id).unwrap_or_default();
@@ -2208,11 +2341,24 @@ mod tests {
             rhs.contains("<mo stretchy=\"false\">|</mo><mi data-flatppl-ref=\"mu\">μ</mi>"),
             "{rhs}"
         );
-        let post = mathml::expr(&row_named(&rows, "post").statement.rhs);
-        assert_eq!(
-            post,
-            "<mrow><mi data-flatppl-ref=\"L\">L</mi><mo>⋅</mo><mi data-flatppl-ref=\"prior\">prior</mi></mrow>"
+        // The unnormalised posterior is the set function §06 defines:
+        // `post(A) = ∫_A L(μ, τ, θ) d prior(μ, τ, θ)`.
+        let post = row_named(&rows, "post");
+        let lhs = mathml::expr(&post.statement.lhs);
+        assert!(
+            lhs.starts_with("<mrow><mi data-flatppl-ref=\"post\">post</mi><mo>&#x2061;</mo><mrow><mo stretchy=\"false\">(</mo><mi>A</mi>"),
+            "{lhs}"
         );
+        let post = mathml::expr(&post.statement.rhs);
+        assert!(
+            post.starts_with("<mrow><msub><mo>∫</mo><mi>A</mi></msub>"),
+            "{post}"
+        );
+        assert!(
+            post.contains("<mi data-flatppl-ref=\"L\">L</mi><mo>&#x2061;</mo>"),
+            "{post}"
+        );
+        assert!(post.contains("<mspace width=\"0.1667em\"/><mi mathvariant=\"normal\">d</mi><mi data-flatppl-ref=\"prior\">prior</mi><mrow><mo stretchy=\"false\">(</mo><mi data-flatppl-ref=\"mu\">μ</mi>"), "{post}");
         let f = row_named(&rows, "f");
         assert_eq!(
             mathml::expr(&f.statement.lhs),
@@ -2229,6 +2375,45 @@ mod tests {
             mathml::expr(&sq.statement.rhs),
             "<msup><mi>a</mi><mn>2</mn></msup>"
         );
+    }
+
+    #[test]
+    fn reweighted_measures_are_set_functions() {
+        let src = "m = weighted(x -> exp(-x), Lebesgue(support = nonnegreals))\nc = weighted(2.0, Normal(0, 1))\nf(t) = -t^2\nM = Normal(0, 1)\ng = logweighted(f, M)\nmu = elementof(reals)\ny ~ Normal(mu, 1)\nK = kernelof(y, mu = mu)\nL = likelihoodof(K, 0.3)\nprior = Normal(0, 10)\nn = normalize(bayesupdate(L, prior))\nL0 = likelihoodof(functionof(Normal(0, 1)), 1.5)\nq = bayesupdate(L0, prior)";
+        let rows = rows(src);
+        // A lambda weight: its body under its own variable.
+        let m = row_named(&rows, "m");
+        assert!(
+            mathml::expr(&m.statement.lhs)
+                .contains("<mo stretchy=\"false\">(</mo><mi>A</mi><mo stretchy=\"false\">)</mo>")
+        );
+        let rhs = mathml::expr(&m.statement.rhs);
+        assert!(
+            rhs.starts_with("<mrow><msub><mo>∫</mo><mi>A</mi></msub><mrow><msup><mi>e</mi>"),
+            "{rhs}"
+        );
+        assert!(
+            rhs.contains("<mi mathvariant=\"normal\">d</mi><msub><mi>λ</mi>"),
+            "{rhs}"
+        );
+        assert!(rhs.ends_with("<mrow><mo stretchy=\"false\">(</mo><mi>x</mi><mo stretchy=\"false\">)</mo></mrow></mrow></mrow>"), "{rhs}");
+        // A constant weight has nothing to integrate over: `2 · Normal(0, 1)`.
+        let c = mathml::expr(&row_named(&rows, "c").statement.rhs);
+        assert!(c.starts_with("<mrow><mn>2</mn><mo>⋅</mo>"), "{c}");
+        // A named function weight is applied to a fresh variable.
+        let g = mathml::expr(&row_named(&rows, "g").statement.rhs);
+        assert!(g.contains("<msup><mi>e</mi><mrow><mi data-flatppl-ref=\"f\">f</mi><mo>&#x2061;</mo><mrow><mo stretchy=\"false\">(</mo><mi>x</mi>"), "{g}");
+        assert!(
+            g.contains("<mi mathvariant=\"normal\">d</mi><mi data-flatppl-ref=\"M\">M</mi>"),
+            "{g}"
+        );
+        // In expression position the set slot is the placeholder.
+        let n = mathml::expr(&row_named(&rows, "n").statement.rhs);
+        assert!(n.contains("<msub><mo>∫</mo><mo>·</mo></msub>"), "{n}");
+        assert!(n.contains("<mi data-flatppl-ref=\"L\">L</mi><mo>&#x2061;</mo><mrow><mo stretchy=\"false\">(</mo><mi data-flatppl-ref=\"mu\">μ</mi>"), "{n}");
+        // A likelihood with no inputs weights by a constant.
+        let q = mathml::expr(&row_named(&rows, "q").statement.rhs);
+        assert!(q.contains("<mo>⋅</mo>") && !q.contains("∫"), "{q}");
     }
 
     #[test]

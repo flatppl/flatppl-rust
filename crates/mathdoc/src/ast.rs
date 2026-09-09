@@ -141,7 +141,9 @@ pub enum Op {
     Comma,
     /// Restriction bar before a subscript (`M|_S`).
     Restrict,
-    /// Differential `d` in `M(dx)`.
+    /// A thin space, between an integrand and its differential.
+    ThinSpace,
+    /// Differential `d` in `M(dx)` and `dM(x)`.
     Differential,
     /// Transpose `ᵀ`, as a superscript body.
     Transpose,
@@ -210,6 +212,9 @@ pub enum BigOp {
     /// A named reduction (`var`, `mean`, …) written as an operator with
     /// the reduced index below it.
     Named(&'static str),
+    /// `∫_{A} body`: the set of integration as a subscript, not a limit
+    /// below.
+    Integral,
 }
 
 /// One rendered row: `lhs rel rhs`.

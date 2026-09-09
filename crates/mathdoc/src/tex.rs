@@ -73,6 +73,7 @@ pub fn expr(m: &Math) -> String {
             Op::Cdot => r"\cdot",
             Op::Comma => ",",
             Op::Restrict => r"\vert",
+            Op::ThinSpace => r"\,",
             Op::Differential => r"\mathrm{d}",
             Op::Transpose => r"\mathrm{T}",
             Op::Dagger => r"\dagger",
@@ -136,6 +137,7 @@ pub fn expr(m: &Math) -> String {
                 BigOp::Max => r"\max".into(),
                 BigOp::Min => r"\min".into(),
                 BigOp::Named(name) => format!(r"\operatorname*{{{}}}", escape(name)),
+                BigOp::Integral => r"\int".into(),
             };
             if let Some(sub) = sub {
                 s.push_str(&format!("_{{{}}}", render(sub)));

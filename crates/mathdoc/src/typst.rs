@@ -132,8 +132,14 @@ pub fn expr(m: &Math) -> String {
                 BigOp::Max => "op(\"max\", limits: #true)".into(),
                 BigOp::Min => "op(\"min\", limits: #true)".into(),
                 BigOp::Named(name) => format!("op({}, limits: #true)", quote(name)),
+                BigOp::Integral => "integral".into(),
             };
-            let mut head = format!("limits({head})");
+            // An integral takes its limits as scripts, the others below/above.
+            let mut head = if matches!(op, BigOp::Integral) {
+                head
+            } else {
+                format!("limits({head})")
+            };
             if let Some(sub) = sub {
                 let _ = write!(head, "_({})", expr(sub));
             }
@@ -288,6 +294,7 @@ fn operator(op: Op) -> &'static str {
         Op::Dot => ".",
         Op::Cdot => "⋅",
         Op::Comma => "\\,",
+        Op::ThinSpace => "thin",
         Op::Differential => "upright(d)",
         Op::Transpose => "upright(T)",
         Op::Dagger => "†",

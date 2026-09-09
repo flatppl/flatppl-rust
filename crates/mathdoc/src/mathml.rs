@@ -230,23 +230,30 @@ fn write_expr(out: &mut String, m: &Math) {
                 BigOp::Max => "<mi>max</mi>".to_string(),
                 BigOp::Min => "<mi>min</mi>".to_string(),
                 BigOp::Named(name) => format!("<mi>{}</mi>", escape(name)),
+                BigOp::Integral => "<mo>∫</mo>".to_string(),
+            };
+            // An integral takes its limits as scripts, the others below/above.
+            let (both, under, over) = if matches!(op, BigOp::Integral) {
+                ("msubsup", "msub", "msup")
+            } else {
+                ("munderover", "munder", "mover")
             };
             match (sub, sup) {
                 (Some(sub), Some(sup)) => {
-                    let _ = write!(out, "<munderover>{glyph}");
+                    let _ = write!(out, "<{both}>{glyph}");
                     write_wrapped(out, sub);
                     write_wrapped(out, sup);
-                    out.push_str("</munderover>");
+                    let _ = write!(out, "</{both}>");
                 }
                 (Some(sub), None) => {
-                    let _ = write!(out, "<munder>{glyph}");
+                    let _ = write!(out, "<{under}>{glyph}");
                     write_wrapped(out, sub);
-                    out.push_str("</munder>");
+                    let _ = write!(out, "</{under}>");
                 }
                 (None, Some(sup)) => {
-                    let _ = write!(out, "<mover>{glyph}");
+                    let _ = write!(out, "<{over}>{glyph}");
                     write_wrapped(out, sup);
-                    out.push_str("</mover>");
+                    let _ = write!(out, "</{over}>");
                 }
                 (None, None) => out.push_str(&glyph),
             }
@@ -394,6 +401,7 @@ fn write_op(out: &mut String, op: Op) {
         Op::Cdot => "<mo>⋅</mo>",
         Op::Comma => "<mo>,</mo>",
         Op::Restrict => "<mo stretchy=\"false\">|</mo>",
+        Op::ThinSpace => "<mspace width=\"0.1667em\"/>",
         Op::Differential => "<mi mathvariant=\"normal\">d</mi>",
         Op::Transpose => "<mi mathvariant=\"normal\">T</mi>",
         Op::Dagger => "<mo>†</mo>",
