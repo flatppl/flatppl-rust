@@ -2095,17 +2095,15 @@ fn norm(v: Math, which: Math) -> Math {
     Math::subscript(fenced(Fence::Norm, v), which)
 }
 
-/// A single letter (possibly with a script), which a differential `d`
-/// attaches to without a space: `dM(x)`, `dλ_S(x)`.
+/// A letter, with or without a script, which a differential `d` attaches
+/// to without a space: `dM`, `dλ_S(x)`, `dΠ_prior`. A word or a bracketed
+/// compound measure takes a thin space (`d prior`).
 fn single_letter(m: &Math) -> bool {
     match m {
-        Math::Ident(id) => {
-            id.display.subs.is_empty()
-                && matches!(
-                    id.display.head,
-                    crate::names::Atom::Letter(_) | crate::names::Atom::Greek(_)
-                )
-        }
+        Math::Ident(id) => matches!(
+            id.display.head,
+            crate::names::Atom::Letter(_) | crate::names::Atom::Greek(_)
+        ),
         Math::Sym(_) => true,
         Math::Sub(base, _) | Math::Sup(base, _) | Math::SubSup(base, _, _) => single_letter(base),
         _ => false,
@@ -2539,6 +2537,17 @@ mod tests {
         // The reference inside the posterior integral is restyled too.
         let post = mathml::expr(&row_named(&rows, "post").statement.rhs);
         assert!(post.contains("<mi data-flatppl-ref=\"L\">ℒ</mi>"), "{post}");
+    }
+
+    #[test]
+    fn the_differential_is_tight_against_a_subscripted_letter() {
+        let src = "mu = elementof(reals)\ny ~ Normal(mu, 1)\nK = kernelof(y, mu = mu)\nL = likelihoodof(K, 0.3)\nPi_prior = Normal(0, 10)\nPi_post = bayesupdate(L, Pi_prior)";
+        let rows = rows(src);
+        let post = mathml::expr(&row_named(&rows, "Pi_post").statement.rhs);
+        assert!(
+            post.contains("<mi mathvariant=\"normal\">d</mi><msub data-flatppl-ref=\"Pi_prior\"><mi>Π</mi><mi>prior</mi></msub>"),
+            "{post}"
+        );
     }
 
     #[test]

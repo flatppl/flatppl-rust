@@ -225,6 +225,9 @@ range comes from the typed module: a named size where the source gives one
 A record whose fields are references to bindings of the same name prints as the
 list of those symbols (`Law(μ, τ, θ)`); any other field prints as `name = value`.
 
+In an integral the differential is tight against a letter, with or without a
+subscript (`dM`, `dΠ_prior`), and spaced before a word or a bracketed compound
+measure (`d prior`, `d (M₁ + M₂)`).
 The Normal variance keeps the source scale expression, grouped before squaring;
 a scale that is the literal `1` is not squared (`𝒩(0, 1)`, since 1² = 1).
 Rate and scale conventions appear in the legend, not as argument labels. Other
