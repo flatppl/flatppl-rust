@@ -113,7 +113,7 @@ pub fn render_with_source(module: &Module, source: Option<&str>) -> Rendering {
         .find(|(_, b)| module.resolve(b.name) == "flatppl_compat")
         .and_then(|(_, b)| b.doc.clone());
     Rendering {
-        notation: crate::notation::entries(module),
+        notation: crate::notation::entries(module, &bindings),
         order: bindings.iter().map(|b| b.name.clone()).collect(),
         bindings,
         diagnostics,

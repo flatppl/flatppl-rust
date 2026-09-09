@@ -551,11 +551,15 @@ fn notation_section(module: &Module, rendering: &Rendering) -> String {
     if !rendering.notation.is_empty() {
         out.push_str("<h3>Symbols and parameterisations</h3>\n<table>\n");
         for entry in &rendering.notation {
+            let source = if entry.source.is_empty() {
+                String::new()
+            } else {
+                format!("<code>{}</code>", escape(&entry.source))
+            };
             let _ = writeln!(
                 out,
-                "<tr><td><math>{}</math></td><td><code>{}</code><p>{}</p></td></tr>",
+                "<tr><td><math>{}</math></td><td>{source}<p>{}</p></td></tr>",
                 mathml::expr(&entry.form),
-                escape(&entry.source),
                 entry.note_html()
             );
         }
@@ -751,6 +755,24 @@ mod tests {
             out.matches("</mrow></math>").count(),
             "{out}"
         );
+    }
+
+    #[test]
+    fn the_legend_explains_the_set_letter_only_beside_a_set_function_row() {
+        let with = page(
+            "mu = elementof(reals)\ny ~ Normal(mu, 1)\nK = kernelof(y, mu = mu)\nL = likelihoodof(K, 0.3)\nprior = Normal(0, 10)\npost = bayesupdate(L, prior)\ng ~ Gamma(2, 3)",
+        );
+        assert!(
+            with.contains("<td><math><mi>𝘈</mi></math></td><td><p>A measurable set. A row <math>"),
+            "{with}"
+        );
+        assert!(with.contains("defines the measure <math><mi>ν</mi></math> by its value on every set <math><mi>𝘈</mi></math>."), "{with}");
+        // The rate family pins its convention by the mean, in math.
+        assert!(with.contains("Gamma distribution with shape <math><mi>α</mi></math> and rate <math><mi>β</mi></math>; mean <math><mfrac>"), "{with}");
+        assert!(with.contains("<code>Gamma(shape, rate)</code>"), "{with}");
+        let without = page("x ~ Normal(0, 1)");
+        assert!(!without.contains("<mi>𝘈</mi>"), "{without}");
+        assert!(without.contains("Normal distribution with mean <math><mi>μ</mi></math> and variance <math><msup><mi>σ</mi><mn>2</mn></msup></math>."), "{without}");
     }
 
     #[test]

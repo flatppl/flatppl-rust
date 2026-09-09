@@ -70,9 +70,17 @@ fn param(name: &str) -> Math {
     Math::ident(name, None)
 }
 
-pub fn entries(module: &Module) -> Vec<NotationEntry> {
+/// The legend entries for `module`: one per distribution, law, `reals` and
+/// — when a row is a set function `ν(𝘈) = ∫_𝘈 …` — the set letter 𝘈.
+pub fn entries(module: &Module, rows: &[crate::render::BindingRender]) -> Vec<NotationEntry> {
     let catalogue = flatppl_infer::builtin_catalogue();
     let mut names = BTreeSet::new();
+    if rows
+        .iter()
+        .any(|b| contains_sym(&b.statement.lhs, Sym::MeasurableSet))
+    {
+        names.insert("measurable-set");
+    }
     let mut stack: Vec<_> = module.bindings().map(|(_, b)| b.rhs).collect();
     let mut visited = std::collections::HashSet::new();
     while let Some(id) = stack.pop() {
@@ -98,8 +106,42 @@ pub fn entries(module: &Module) -> Vec<NotationEntry> {
     names.into_iter().map(entry).collect()
 }
 
+/// Whether `m` holds the symbol `sym` anywhere.
+fn contains_sym(m: &Math, sym: Sym) -> bool {
+    let mut stack = vec![m];
+    while let Some(n) = stack.pop() {
+        if matches!(n, Math::Sym(s) if *s == sym) {
+            return true;
+        }
+        stack.extend(n.children());
+    }
+    false
+}
+
 fn entry(name: &str) -> NotationEntry {
     let (form, source, note) = match name {
+        "measurable-set" => (
+            Math::Sym(Sym::MeasurableSet),
+            String::new(),
+            vec![
+                text("A measurable set. A row "),
+                math(Math::relation(
+                    Math::apply(Math::ident("nu", None), vec![Math::Sym(Sym::MeasurableSet)]),
+                    crate::ast::Rel::Eq,
+                    Math::big(
+                        crate::ast::BigOp::Integral,
+                        Some(Math::Sym(Sym::MeasurableSet)),
+                        None,
+                        Math::Sym(Sym::Ellipsis),
+                    ),
+                )),
+                text(" defines the measure "),
+                math(Math::ident("nu", None)),
+                text(" by its value on every set "),
+                math(Math::Sym(Sym::MeasurableSet)),
+                text("."),
+            ],
+        ),
         "reals" => (
             Math::Sym(Sym::ExtendedReals),
             "reals".to_string(),
@@ -116,7 +158,16 @@ fn entry(name: &str) -> NotationEntry {
         ),
         _ => {
             let params = flatppl_infer::distribution_param_names(name).unwrap_or_default();
-            let args = params.iter().map(|p| Math::ident(p, None)).collect();
+            // The rate and scale families show conventional letters so the
+            // note can pin the convention by the mean; the source column
+            // maps them to the parameter names by position.
+            let letters: Vec<&str> = match name {
+                "Gamma" | "InverseGamma" => vec!["alpha", "beta"],
+                "Exponential" => vec!["lambda"],
+                "Weibull" => vec!["k", "lambda"],
+                _ => params.iter().map(String::as_str).collect(),
+            };
+            let args = letters.iter().map(|p| Math::ident(p, None)).collect();
             let note = match name {
                 "Normal" => vec![
                     text("Normal distribution with mean "),
@@ -142,8 +193,36 @@ fn entry(name: &str) -> NotationEntry {
                     math(param("k")),
                     text(" degrees of freedom."),
                 ],
-                "Gamma" | "Exponential" => vec![text("Rate parameterisation.")],
-                "InverseGamma" | "Weibull" => vec![text("Scale parameterisation.")],
+                "Gamma" => vec![
+                    text("Gamma distribution with shape "),
+                    math(param("alpha")),
+                    text(" and rate "),
+                    math(param("beta")),
+                    text("; mean "),
+                    math(Math::frac(param("alpha"), param("beta"))),
+                    text("."),
+                ],
+                "Exponential" => vec![
+                    text("Exponential distribution with rate "),
+                    math(param("lambda")),
+                    text("; mean "),
+                    math(Math::frac(Math::int(1), param("lambda"))),
+                    text("."),
+                ],
+                "InverseGamma" => vec![
+                    text("Inverse-gamma distribution with shape "),
+                    math(param("alpha")),
+                    text(" and scale "),
+                    math(param("beta")),
+                    text("."),
+                ],
+                "Weibull" => vec![
+                    text("Weibull distribution with shape "),
+                    math(param("k")),
+                    text(" and scale "),
+                    math(param("lambda")),
+                    text("."),
+                ],
                 "Uniform" => vec![
                     text("Uniform distribution on the set "),
                     math(param("S")),
