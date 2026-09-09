@@ -17,6 +17,7 @@ This monorepo is a Cargo workspace; member crates live under `crates/`:
 * [`flatppl-infer`](crates/infer) — type, shape, and phase inference
 * [`flatppl-hs3`](crates/hs3) — HS3 / pyhf → FlatPPL importer
 * [`flatppl-fileaccess`](crates/fileaccess) — resolve a `source` (local path or `http`/`https` URL) to a local file, with the shared remote-content cache (native host layer)
+* [`flatppl-mathdoc`](crates/mathdoc) — FlatPPL rendered as mathematics: a math AST over the typed module, printed as MathML (HTML pages, the viewer's Math pane); notation in [`NOTATION.md`](crates/mathdoc/NOTATION.md)
 * [`flatppl-cli`](crates/cli) — the `flatppl` command-line driver
 * [`flatppl-lsp`](crates/lsp) — FlatPPL language server (diagnostics, hover, go-to-definition, completion)
 
@@ -41,6 +42,7 @@ flatppl convert messy.flatppl tidy.flatppl    # canonicalize (same format)
 flatppl infer model.flatppl typed.flatpir    # emit type/phase-annotated FlatPIR
 flatppl infer --level=phase m.flatppl m.flatpir  # or: type, valueset, normalization, shape
 flatppl prepare model.flatppl                  # fetch the model's remote deps into the cache
+flatppl convert model.flatppl model.html       # the model as a page of mathematics (MathML)
 ```
 
 Formats are inferred from the file extensions. FlatPPL output uses the full

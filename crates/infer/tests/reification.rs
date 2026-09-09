@@ -838,10 +838,10 @@ x ~ markovchain(step_kernel, 0.0, 120)";
         if !seen.insert(id) {
             continue;
         }
-        if let flatppl_core::Node::Ref(r) = module.node(id) {
-            if module.resolve(r.name) == "sigma_step" {
-                refs += 1;
-            }
+        if let flatppl_core::Node::Ref(r) = module.node(id)
+            && module.resolve(r.name) == "sigma_step"
+        {
+            refs += 1;
         }
         pending.extend(module.node(id).children());
     }

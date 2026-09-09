@@ -1,0 +1,22 @@
+%%%
+# Poisson model with Gamma prior (conjugate)
+
+Conjugate Bayesian model for count data: a Gamma prior on the Poisson rate
+is updated with IID count observations to yield a closed-form Gamma posterior.
+%%%
+flatppl_compat = "0.1"
+
+counts_data = [2, 3, 7, 6, 4]
+n = lengthof(counts_data)
+
+% Conjugate Gamma(shape, rate) prior on the Poisson rate
+lambda ~ Gamma(2, 1)
+
+% IID Poisson counts
+y ~ iid(Poisson(lambda), n)
+
+prior = lawof(record(lambda = lambda))
+
+forward_kernel = kernelof(record(y = y), lambda = lambda)
+L = likelihoodof(forward_kernel, record(y = counts_data))
+posterior = bayesupdate(L, prior)

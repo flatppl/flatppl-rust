@@ -73,10 +73,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Convert between FlatPPL, FlatPIR, and the FlatPIR JSON encoding.
+    /// Convert between FlatPPL, FlatPIR, and the FlatPIR JSON encoding, or
+    /// render a model as mathematics (`.html`, `.md`, `.tex`, `.typ`).
     ///
     /// Formats are inferred from the file extensions (`.flatppl` / `.flatpir` /
-    /// `.flatpir.json`, and `.hs3.json` / `.pyhf.json` for HS3 / pyhf import).
+    /// `.flatpir.json`, `.html` / `.md` / `.markdown` / `.tex` / `.typ` for
+    /// mathematics, and `.hs3.json` / `.pyhf.json` for HS3 / pyhf import).
     /// Converting to the same format canonicalizes the file. `.flatpir.json` is
     /// an alternate representation of FlatPIR (same content, including `%meta`
     /// annotations). `--from hs3` / `--from pyhf` force HS3 / pyhf import of any
@@ -88,7 +90,7 @@ enum Command {
         /// path — a model with remote `load_module` deps must be pre-fetched
         /// with `flatppl prepare`.
         input: PathBuf,
-        /// Output file (`.flatppl`, `.flatpir`, or `.flatpir.json`)
+        /// Output file (`.flatppl`, `.flatpir`, `.flatpir.json`, `.html`, `.md`, `.markdown`, `.tex`, `.typ`)
         output: PathBuf,
         /// FlatPPL output syntax level (ignored for FlatPIR output):
         /// `full` re-applies all syntactic sugar (operators, indexing,
@@ -424,6 +426,20 @@ fn convert(
         }
     };
 
+    // Mathematical documents use the typed module (index ranges, kernel inputs
+    // and the notation appendix read inference), so they take the
+    // `infer` front end rather than the plain printer.
+    #[cfg(feature = "mathdoc")]
+    if to.is_document() {
+        return convert_document(input, output, to, &mut module, no_header);
+    }
+    #[cfg(not(feature = "mathdoc"))]
+    if to.is_document() {
+        return Err(Failure::Plain(
+            "Document output is not compiled in — rebuild with `--features mathdoc`".into(),
+        ));
+    }
+
     let mut text = write_module(to, &module, syntax)?;
     if !text.ends_with('\n') {
         text.push('\n');
@@ -443,6 +459,60 @@ fn convert(
     // Gate the text before it reaches disk (see `check_generated`).
     let imported = matches!(from_format, FromFormat::Hs3 | FromFormat::Pyhf);
     check_generated(&text, to, input, output, imported)?;
+    fs::write(output, text).map_err(|e| {
+        Failure::Plain(format!(
+            "writing `{}`: {e}",
+            flatppl_cli::terminal_path(output)
+        ))
+    })
+}
+
+/// Assemble the cross-module bundle, infer, and write a mathematical document.
+/// Inference diagnostics go to stderr and into the document; a mistyped model
+/// still renders, with the typed features degraded where inference failed.
+#[cfg(all(feature = "convert", feature = "mathdoc"))]
+fn convert_document(
+    input: &Path,
+    output: &Path,
+    to: Format,
+    module: &mut flatppl_core::Module,
+    no_header: bool,
+) -> Result<(), Failure> {
+    let resolver = CliResolver::cache_only();
+    let in_loc = Location::Local(input.to_path_buf());
+    let (bundle, _data_sources) = flatppl_cli::resolve::build_bundle(module, &in_loc, &resolver)?;
+    let diags = flatppl_infer::infer_module(module, &bundle, flatppl_infer::Level::Shape);
+    for d in &diags {
+        let level = match d.severity {
+            flatppl_infer::Severity::Error => "error",
+            flatppl_infer::Severity::Note => "note",
+        };
+        eprintln!(
+            "{level}: {}",
+            flatppl_cli::resolve::terminal_message(&d.message)
+        );
+    }
+    // FlatPPL input: the page quotes the source as written where a row falls
+    // back to source text. Other inputs have no FlatPPL text to quote.
+    let source = matches!(Format::from_path(input), Ok(Format::FlatPpl))
+        .then(|| flatppl_cli::read_regular_utf8(input).ok())
+        .flatten();
+    let mut rendering = flatppl_mathdoc::render_with_source(module, source.as_deref());
+    flatppl_mathdoc::render::attach_inference_diagnostics(&mut rendering, module, &diags);
+    let title = input
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("model");
+    let mut text = match to {
+        Format::Html => flatppl_mathdoc::document::html(module, &rendering, title),
+        Format::Markdown => flatppl_mathdoc::export::github_markdown(module, &rendering, title),
+        Format::Latex => flatppl_mathdoc::export::latex(module, &rendering, title),
+        Format::Typst => flatppl_mathdoc::export::typst(module, &rendering, title),
+        _ => unreachable!("convert_document requires a document output format"),
+    };
+    if !no_header {
+        text.insert_str(0, &banner(to.comment_style()));
+    }
     fs::write(output, text).map_err(|e| {
         Failure::Plain(format!(
             "writing `{}`: {e}",

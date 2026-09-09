@@ -227,12 +227,11 @@ fn find_op_node(m: &Module, ops: &[&str]) -> Option<(BindingId, NodeId)> {
         while qi < queue.len() {
             let id = queue[qi];
             qi += 1;
-            if let Node::Call(c) = m.node(id) {
-                if let CallHead::Builtin(sym) = c.head {
-                    if ops.contains(&m.resolve(sym)) {
-                        return Some((bid, id));
-                    }
-                }
+            if let Node::Call(c) = m.node(id)
+                && let CallHead::Builtin(sym) = c.head
+                && ops.contains(&m.resolve(sym))
+            {
+                return Some((bid, id));
             }
             m.for_each_child(id, |child| queue.push(child));
         }
@@ -311,12 +310,12 @@ fn find_in_subtree(m: &Module, root: NodeId) -> Option<NodeId> {
 /// as arguments to `logdensityof`/`densityof` in Task 3+. Scanning by op name
 /// (not type) ensures we target algebra operations, not their primitive operands.
 fn is_measure_layer(m: &Module, id: NodeId) -> bool {
-    if let Node::Call(c) = m.node(id) {
-        if let CallHead::Builtin(sym) = c.head {
-            let name = m.resolve(sym);
-            if MEASURE_VOCAB.contains(&name) {
-                return true;
-            }
+    if let Node::Call(c) = m.node(id)
+        && let CallHead::Builtin(sym) = c.head
+    {
+        let name = m.resolve(sym);
+        if MEASURE_VOCAB.contains(&name) {
+            return true;
         }
     }
     false
@@ -646,20 +645,20 @@ pub(crate) fn rebuild_with_children(m: &mut Module, id: NodeId, new_children: &[
 
 /// True iff `id` is a builtin call whose head is named `op`.
 fn is_op(m: &Module, id: NodeId, op: &str) -> bool {
-    if let Node::Call(c) = m.node(id) {
-        if let CallHead::Builtin(sym) = c.head {
-            return m.resolve(sym) == op;
-        }
+    if let Node::Call(c) = m.node(id)
+        && let CallHead::Builtin(sym) = c.head
+    {
+        return m.resolve(sym) == op;
     }
     false
 }
 
 /// The op name for a measure-layer node (for refusal messages).
 fn op_name(m: &Module, id: NodeId) -> String {
-    if let Node::Call(c) = m.node(id) {
-        if let CallHead::Builtin(sym) = c.head {
-            return m.resolve(sym).to_string();
-        }
+    if let Node::Call(c) = m.node(id)
+        && let CallHead::Builtin(sym) = c.head
+    {
+        return m.resolve(sym).to_string();
     }
     // Fallback for Measure/Likelihood-typed non-call nodes.
     format!("{:?}", m.type_of(id))
@@ -872,10 +871,10 @@ fn is_measure_typed_rhs(m: &Module, rhs: NodeId) -> bool {
 
 /// True iff `rhs` is a builtin call whose head is in [`COMBINATOR_OPS`].
 fn is_combinator_rhs(m: &Module, rhs: NodeId) -> bool {
-    if let Node::Call(c) = m.node(rhs) {
-        if let CallHead::Builtin(sym) = c.head {
-            return COMBINATOR_OPS.contains(&m.resolve(sym));
-        }
+    if let Node::Call(c) = m.node(rhs)
+        && let CallHead::Builtin(sym) = c.head
+    {
+        return COMBINATOR_OPS.contains(&m.resolve(sym));
     }
     false
 }

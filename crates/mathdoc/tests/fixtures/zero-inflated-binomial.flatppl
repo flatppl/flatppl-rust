@@ -1,0 +1,28 @@
+flatppl_compat = "0.1"
+
+% Number of trials per observation
+K = 20
+
+% Observed number of successes
+y_obs = [7, 0, 5, 8, 0, 6, 4, 0, 9, 3]
+N = lengthof(y_obs)
+
+% Probability of success for each Bernoulli trian (given not drawn from zero mixand)
+p ~ Beta(1.5, 1.5)
+
+% Probability of being drawn from the Binomial mixand
+psi ~ Beta(1.5, 1.5)
+
+% A zero-inflated binomial distribution
+ZeroInflatedBinomial = superpose(
+    weighted(psi, Binomial(K, p)),
+    weighted(1 - psi, Dirac(0))
+)
+
+y ~ iid(ZeroInflatedBinomial, N)
+
+prior = lawof(record(p = p, psi = psi))
+forward_kernel = kernelof(record(y = y), p = p, psi = psi)
+L = likelihoodof(forward_kernel, record(y = y_obs))
+
+posterior = bayesupdate(L, prior)

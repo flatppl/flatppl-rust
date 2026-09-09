@@ -143,26 +143,27 @@ fn collect_folds(m: &mut Module, id: NodeId, out: &mut HashMap<NodeId, NodeId>) 
     // term (see `pushfwd_golden.rs`/`density_golden.rs`, five existing goldens
     // pin `(abs <k>)` unevaluated as "logvol = log|k|") — folding it away would
     // erase that documented, human-legible structure for no numeric benefit.
-    if nargs == 1 && c.named.is_empty() {
-        if let Some(Scalar::Real(a)) = &child_scalars[0] {
-            let r = match op.as_str() {
-                "neg" => -a,
-                "sqrt" => a.sqrt(),
-                _ => return None,
-            };
-            // A negative `neg` result means `id` is already the canonical
-            // `(neg <positive>)` shape (§11 "Literal values"): replacing it
-            // here would just rebuild that same shape under a fresh id every
-            // sweep, so leave the node unfolded and only propagate its value.
-            // A parent combining it with another operand still sees `r` via
-            // the returned `Scalar` and can fold on top of it as usual.
-            if op == "neg" && r < 0.0 {
-                return Some(Scalar::Real(r));
-            }
-            let lit = alloc_real_result(m, r);
-            out.insert(id, lit);
+    if nargs == 1
+        && c.named.is_empty()
+        && let Some(Scalar::Real(a)) = &child_scalars[0]
+    {
+        let r = match op.as_str() {
+            "neg" => -a,
+            "sqrt" => a.sqrt(),
+            _ => return None,
+        };
+        // A negative `neg` result means `id` is already the canonical
+        // `(neg <positive>)` shape (§11 "Literal values"): replacing it
+        // here would just rebuild that same shape under a fresh id every
+        // sweep, so leave the node unfolded and only propagate its value.
+        // A parent combining it with another operand still sees `r` via
+        // the returned `Scalar` and can fold on top of it as usual.
+        if op == "neg" && r < 0.0 {
             return Some(Scalar::Real(r));
         }
+        let lit = alloc_real_result(m, r);
+        out.insert(id, lit);
+        return Some(Scalar::Real(r));
     }
     None
 }

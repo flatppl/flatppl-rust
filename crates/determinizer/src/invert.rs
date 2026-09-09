@@ -1645,17 +1645,17 @@ fn bare_bijection(
     let Some((op, entry)) = unary_entry(name) else {
         return Ok(None);
     };
-    if let Some(domain) = entry.domain {
-        if !domain.admits(support) {
-            return Err(refuse(
-                f,
-                m,
-                &format!(
-                    "pushfwd({op}, M) requires M's support to lie within {op}'s domain, {}",
-                    domain.describe()
-                ),
-            ));
-        }
+    if let Some(domain) = entry.domain
+        && !domain.admits(support)
+    {
+        return Err(refuse(
+            f,
+            m,
+            &format!(
+                "pushfwd({op}, M) requires M's support to lie within {op}'s domain, {}",
+                domain.describe()
+            ),
+        ));
     }
     let f_inv = entry.inverse.callable(m);
     let logvol = match &entry.logvol_out {
@@ -1811,10 +1811,10 @@ fn classify(m: &Module, cur: NodeId) -> Result<Option<(ChainOp, NodeId)>, Refuse
     // does, so the two cannot cover different sets of ops. Its inverse and local
     // log-volume are built later, at the op's OUTPUT in the inverse walk; `args[0]`
     // is returned only as the subterm to descend into.
-    if args.len() == 1 {
-        if let Some((op, entry)) = unary_entry(&name) {
-            return Ok(Some((ChainOp::Registry { op, entry }, args[0])));
-        }
+    if args.len() == 1
+        && let Some((op, entry)) = unary_entry(&name)
+    {
+        return Ok(Some((ChainOp::Registry { op, entry }, args[0])));
     }
     match name.as_str() {
         // Affine multiply: exactly one literal operand (the scale `c`), and that
@@ -2542,17 +2542,17 @@ fn recognise(m: &Module, f: NodeId) -> Recognized {
     match m.node(f) {
         Node::Const(sym) => Recognized::BareConst(m.resolve(*sym).to_string()),
         Node::Call(c) => {
-            if let CallHead::Builtin(sym) = c.head {
-                if m.resolve(sym) == "functionof" && c.args.len() == 1 {
-                    if let Some(Inputs::Spec(entries)) = &c.inputs {
-                        if entries.len() == 1 && entries[0].1.ns == RefNs::Local {
-                            return Recognized::Lambda {
-                                body: c.args[0],
-                                ph: entries[0].1.name,
-                            };
-                        }
-                    }
-                }
+            if let CallHead::Builtin(sym) = c.head
+                && m.resolve(sym) == "functionof"
+                && c.args.len() == 1
+                && let Some(Inputs::Spec(entries)) = &c.inputs
+                && entries.len() == 1
+                && entries[0].1.ns == RefNs::Local
+            {
+                return Recognized::Lambda {
+                    body: c.args[0],
+                    ph: entries[0].1.name,
+                };
             }
             Recognized::Unrecognized
         }

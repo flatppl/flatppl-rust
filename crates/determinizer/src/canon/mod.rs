@@ -63,10 +63,10 @@ pub(crate) fn promoted_input_names(m: &Module) -> HashSet<Symbol> {
 /// Mirrors `flatppl_stablehlo::modes::tuple_elems`, which reads the same shape
 /// back off the determinized module.
 fn abi_tuple_elems(m: &Module, rhs: NodeId) -> Vec<NodeId> {
-    if let Node::Call(c) = m.node(rhs) {
-        if matches!(c.head, CallHead::Builtin(sym) if m.resolve(sym) == "tuple") {
-            return c.args.to_vec();
-        }
+    if let Node::Call(c) = m.node(rhs)
+        && matches!(c.head, CallHead::Builtin(sym) if m.resolve(sym) == "tuple")
+    {
+        return c.args.to_vec();
     }
     vec![rhs]
 }

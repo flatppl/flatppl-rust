@@ -1,0 +1,31 @@
+[package]
+name = "flatppl-mathdoc"
+description = "FlatPPL → mathematics: a shared math AST with MathML, TeX and Typst printers, plus HTML, GitHub Markdown, LaTeX and Typst document exports."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["json", "document"]
+# The string-in / string-out JSON contract the viewer and the wasm API use;
+# it carries rendered doc-comments, so it needs `document`.
+json = ["dep:serde", "dep:serde_json", "document"]
+# Doc-comment rendering (Markdown and its LaTeX math) and whole-document
+# assembly (HTML, GitHub Markdown, LaTeX and Typst).
+document = ["dep:pulldown-cmark", "dep:math-core"]
+
+[dependencies]
+flatppl-core = { path = "../core" }
+flatppl-infer = { path = "../infer" }
+flatppl-syntax = { path = "../syntax" }
+# The pure §04 `Location` resolver only (no cache, no network): bundle keys are
+# resolved module paths, and a directive is joined against its importer.
+flatppl-fileaccess = { path = "../fileaccess", default-features = false }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"], optional = true }
+# LaTeX math → MathML Core for doc-comments; escapes its own output and
+# refuses unknown commands with an error, which the fallback relies on.
+math-core = { version = "0.8", optional = true }

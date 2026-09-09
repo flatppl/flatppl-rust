@@ -122,10 +122,10 @@ fn render_doc(doc: &Doc) -> String {
 /// (pre-inference) node also renders without a wrapper.
 fn render_node(module: &Module, id: NodeId) -> String {
     let inner = render_node_inner(module, id);
-    if matches!(module.node(id), Node::Call(_)) {
-        if let Some(triple) = render_meta(module, id) {
-            return format!("(%meta {triple} {inner})");
-        }
+    if matches!(module.node(id), Node::Call(_))
+        && let Some(triple) = render_meta(module, id)
+    {
+        return format!("(%meta {triple} {inner})");
     }
     inner
 }

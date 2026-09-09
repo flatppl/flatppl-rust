@@ -428,15 +428,15 @@ enum TailKind {
 /// structural; everything else (including `(%ref …)`, `(%axis …)`, `(%call …)`,
 /// a `(%meta …)` wrapper, and built-in calls) is a positional expression.
 fn tail_kind(item: &Sexpr) -> TailKind {
-    if let SexprKind::List(inner) = &item.kind {
-        if let Some(head) = inner.first().and_then(Sexpr::as_atom) {
-            return match head {
-                "%kwarg" => TailKind::Named(NamedKind::Kwarg),
-                "%field" => TailKind::Named(NamedKind::Field),
-                "%assign" => TailKind::Named(NamedKind::Assign),
-                _ => TailKind::Expr,
-            };
-        }
+    if let SexprKind::List(inner) = &item.kind
+        && let Some(head) = inner.first().and_then(Sexpr::as_atom)
+    {
+        return match head {
+            "%kwarg" => TailKind::Named(NamedKind::Kwarg),
+            "%field" => TailKind::Named(NamedKind::Field),
+            "%assign" => TailKind::Named(NamedKind::Assign),
+            _ => TailKind::Expr,
+        };
     }
     TailKind::Expr
 }
@@ -608,10 +608,10 @@ fn read_type(module: &mut Module, form: &Sexpr) -> Result<Option<Type>> {
             "%module" => Ok(Some(Type::Module)),
             "%rngstate" => Ok(Some(Type::RngState)),
             other => {
-                if let Some(n) = other.strip_prefix("%var") {
-                    if let Ok(v) = n.parse::<u32>() {
-                        return Ok(Some(Type::Var(v)));
-                    }
+                if let Some(n) = other.strip_prefix("%var")
+                    && let Ok(v) = n.parse::<u32>()
+                {
+                    return Ok(Some(Type::Var(v)));
                 }
                 Err(err(form, format!("unknown type `{other}`")))
             }

@@ -51,19 +51,19 @@ fn field_node_ctx(
     v: &serde_json::Value,
     cond: Option<&CondCtx>,
 ) -> Result<NodeId> {
-    if let (Some(ctx), Some(name)) = (cond, v.as_str()) {
-        if let Some(axis) = ctx.funcs.get(name) {
-            let func = b.self_ref(name);
-            let arg = b.self_ref(axis);
-            return Ok(b
-                .m
-                .alloc(flatppl_core::node::Node::Call(flatppl_core::node::Call {
-                    head: flatppl_core::node::CallHead::User(func),
-                    args: Box::new([arg]),
-                    named: Box::new([]),
-                    inputs: None,
-                })));
-        }
+    if let (Some(ctx), Some(name)) = (cond, v.as_str())
+        && let Some(axis) = ctx.funcs.get(name)
+    {
+        let func = b.self_ref(name);
+        let arg = b.self_ref(axis);
+        return Ok(b
+            .m
+            .alloc(flatppl_core::node::Node::Call(flatppl_core::node::Call {
+                head: flatppl_core::node::CallHead::User(func),
+                args: Box::new([arg]),
+                named: Box::new([]),
+                inputs: None,
+            })));
     }
     field_node(b, v)
 }

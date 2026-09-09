@@ -261,10 +261,10 @@ fn lower_density_core(
     // queried value's OWN variate here, which is what licenses `lower_value_law`
     // to pin it back onto the binding.
     let (measure_expr, stripped_lawof) = measure_of_arg(m, arg1)?;
-    if stripped_lawof {
-        if let Some(marginal) = marginalize_or_refuse_stochastic_law(m, measure_expr, arg2)? {
-            return Ok(marginal);
-        }
+    if stripped_lawof
+        && let Some(marginal) = marginalize_or_refuse_stochastic_law(m, measure_expr, arg2)?
+    {
+        return Ok(marginal);
     }
     lower_measure_density_at_point(m, measure_expr, arg2)
 }
@@ -995,10 +995,10 @@ fn subtree_capturing_reification_input(
                     None => Vec::new(),
                 };
                 for r in entries {
-                    if r.ns == RefNs::SelfMod {
-                        if let Some(hit) = names.iter().find(|n| **n == r.name) {
-                            return Some(*hit);
-                        }
+                    if r.ns == RefNs::SelfMod
+                        && let Some(hit) = names.iter().find(|n| **n == r.name)
+                    {
+                        return Some(*hit);
                     }
                 }
                 m.for_each_child(id, |c| stack.push(c));
@@ -1010,10 +1010,10 @@ fn subtree_capturing_reification_input(
                 ns: RefNs::SelfMod,
                 name,
             }) => {
-                if let Some(bid) = m.binding_by_name(*name) {
-                    if visited_bindings.insert(bid) {
-                        stack.push(m.binding(bid).rhs);
-                    }
+                if let Some(bid) = m.binding_by_name(*name)
+                    && visited_bindings.insert(bid)
+                {
+                    stack.push(m.binding(bid).rhs);
                 }
             }
             _ => {}
@@ -1373,19 +1373,18 @@ fn lower_applied_ksuperpose_inner(
     // A sole positional TABLE family argument reads as a splat, not as the
     // constructor's first parameter — refuse rather than bind a whole table to
     // one parameter name.
-    if let Some(&sole) = pos_args.first() {
-        if pos_args.len() == 1
-            && kw_args.is_empty()
-            && matches!(m.type_of(sole), Some(Type::Table { .. }))
-        {
-            return Err(refuse(
-                lift_node,
-                m,
-                "ksuperpose over a TABLE parameter family is not lowered (the \
+    if let Some(&sole) = pos_args.first()
+        && pos_args.len() == 1
+        && kw_args.is_empty()
+        && matches!(m.type_of(sole), Some(Type::Table { .. }))
+    {
+        return Err(refuse(
+            lift_node,
+            m,
+            "ksuperpose over a TABLE parameter family is not lowered (the \
                  per-column family extraction is not built); pass the columns as \
                  keyword vectors instead",
-            ));
-        }
+        ));
     }
 
     // Per-component θᵢ: positional family args bind to the constructor's
@@ -1997,12 +1996,11 @@ fn subtree_reaches_boundary_ref(m: &Module, root: NodeId, targets: &[Ref]) -> Op
                 if let Some(hit) = targets.iter().find(|t| t.ns == r.ns && t.name == r.name) {
                     return Some(*hit);
                 }
-                if r.ns == RefNs::SelfMod {
-                    if let Some(bid) = m.binding_by_name(r.name) {
-                        if visited_bindings.insert(bid) {
-                            stack.push(m.binding(bid).rhs);
-                        }
-                    }
+                if r.ns == RefNs::SelfMod
+                    && let Some(bid) = m.binding_by_name(r.name)
+                    && visited_bindings.insert(bid)
+                {
+                    stack.push(m.binding(bid).rhs);
                 }
             }
             Node::Call(c) => {
@@ -2980,13 +2978,13 @@ fn resolve_component_draw(
     // read as a function of the draw. The call need not be a recognised bijection
     // here — the driver's `pushfwd(g, Mᵢ)` lowering refuses a non-invertible `g`
     // (refuse-don't-mislower).
-    if let Node::Call(c) = m.node(effective) {
-        if matches!(c.head, CallHead::Builtin(_)) {
-            let sites = field_draw_sites(m, effective);
-            if let [site] = sites[..] {
-                let measure = draw_argument(m, site)?;
-                return Some((measure, outer_binding, Some(effective), site));
-            }
+    if let Node::Call(c) = m.node(effective)
+        && matches!(c.head, CallHead::Builtin(_))
+    {
+        let sites = field_draw_sites(m, effective);
+        if let [site] = sites[..] {
+            let measure = draw_argument(m, site)?;
+            return Some((measure, outer_binding, Some(effective), site));
         }
     }
     None
@@ -3205,10 +3203,11 @@ fn lower_value_law(
             let scored = built.and_then(|mg| score_marginal_form(m, &mg.form, v));
             // Pin as the ancestor-free path does: the marginal consumed this value's
             // `draw`, so the binding must not survive into the conformance check.
-            if scored.is_ok() && origin == VariateOrigin::Point {
-                if let Some(bid) = binding {
-                    m.pin_binding_to_query_point(bid, v);
-                }
+            if scored.is_ok()
+                && origin == VariateOrigin::Point
+                && let Some(bid) = binding
+            {
+                m.pin_binding_to_query_point(bid, v);
             }
             return Some(scored);
         }
@@ -3242,10 +3241,11 @@ fn lower_value_law(
         }
     };
     let scored = lower_measure_density(m, law, v);
-    if scored.is_ok() && origin == VariateOrigin::Point {
-        if let Some(bid) = binding {
-            m.pin_binding_to_query_point(bid, v);
-        }
+    if scored.is_ok()
+        && origin == VariateOrigin::Point
+        && let Some(bid) = binding
+    {
+        m.pin_binding_to_query_point(bid, v);
     }
     Some(scored)
 }
@@ -3513,10 +3513,10 @@ fn weight_declared_arity(m: &Module, w_node: NodeId) -> Option<usize> {
     {
         return Some(inputs.len());
     }
-    if let Node::Call(c) = m.node(resolved) {
-        if let Some(Inputs::Spec(entries)) = &c.inputs {
-            return Some(entries.len());
-        }
+    if let Node::Call(c) = m.node(resolved)
+        && let Some(Inputs::Spec(entries)) = &c.inputs
+    {
+        return Some(entries.len());
     }
     None
 }
@@ -4826,15 +4826,15 @@ fn variate_is_vector(domain: &Type) -> bool {
 /// [`build_density_term`]'s downstream guard cannot see this: by then the point is
 /// `f_inv(v)`, a node inference never typed, so `variate_kind` is `None` there.
 fn refuse_variate_kind_mismatch(m: &Module, domain: &Type, v: NodeId) -> Result<(), RefuseError> {
-    if let (Some(dk), Some(vk)) = (variate_kind(domain), m.type_of(v).and_then(variate_kind)) {
-        if dk != vk {
-            return Err(refuse(
-                v,
-                m,
-                "the query point's kind does not match the pushforward base variate, and every \
+    if let (Some(dk), Some(vk)) = (variate_kind(domain), m.type_of(v).and_then(variate_kind))
+        && dk != vk
+    {
+        return Err(refuse(
+            v,
+            m,
+            "the query point's kind does not match the pushforward base variate, and every \
                  synthesised forward map preserves kind (§06 \"Engine contract for pushfwd\")",
-            ));
-        }
+        ));
     }
     Ok(())
 }
@@ -6510,11 +6510,11 @@ fn lower_iid(m: &mut Module, node: NodeId, v: NodeId) -> Result<NodeId, RefuseEr
     // — a length-1 array-of-params-record singleton-expanded across the obs
     // axis `v`, summed. This is the card's target and reuses the tested
     // `lower_broadcast_kernel` tail.
-    if let Some((ctor_sym, kwargs)) = split_kernel_constructor(m, m_inner) {
-        if is_scalar_domain_kernel(m, m_inner) {
-            let kernel_input = singleton_kernel_input(m, &kwargs, 1);
-            return Ok(emit_kernel_broadcast_density(m, ctor_sym, kernel_input, v));
-        }
+    if let Some((ctor_sym, kwargs)) = split_kernel_constructor(m, m_inner)
+        && is_scalar_domain_kernel(m, m_inner)
+    {
+        let kernel_input = singleton_kernel_input(m, &kwargs, 1);
+        return Ok(emit_kernel_broadcast_density(m, ctor_sym, kernel_input, v));
     }
 
     // Nested-`iid`-of-primitive-kernel fast path: peel through as many further
@@ -6706,10 +6706,10 @@ fn named_or_positional(m: &Module, c: &Call, name: &str) -> Option<NodeId> {
         return Some(v);
     }
     let arg = *c.args.first()?;
-    if let Some(rec) = expect_builtin_call(m, arg, "record") {
-        if let Some(v) = field(&rec.named) {
-            return Some(v);
-        }
+    if let Some(rec) = expect_builtin_call(m, arg, "record")
+        && let Some(v) = field(&rec.named)
+    {
+        return Some(v);
     }
     Some(arg)
 }
@@ -7676,16 +7676,16 @@ fn lower_reified_measure(
         // per-query θ-inliner (SelfMod-keyed) cannot reach once the wrapper is
         // unwrapped — refuse rather than leave a dangling `(%ref local …)` in the
         // scored density.
-        if let Some(flatppl_core::Inputs::Spec(entries)) = &c.inputs {
-            if entries.iter().any(|(_, r)| r.ns == RefNs::Local) {
-                return Err(refuse(
-                    node,
-                    m,
-                    "functionof/kernelof used as a measure has a placeholder boundary input that \
+        if let Some(flatppl_core::Inputs::Spec(entries)) = &c.inputs
+            && entries.iter().any(|(_, r)| r.ns == RefNs::Local)
+        {
+            return Err(refuse(
+                node,
+                m,
+                "functionof/kernelof used as a measure has a placeholder boundary input that \
                      cannot be inlined per query; this reified measure is not yet lowerable — \
                      refuse rather than mislower",
-                ));
-            }
+            ));
         }
         c.args[0]
     };
@@ -7998,14 +7998,14 @@ pub(crate) fn build_density_term(
         _ => None,
     };
     let obs_kind = m.type_of(pinned).and_then(variate_kind);
-    if let (Some(dk), Some(ok)) = (domain_kind, obs_kind) {
-        if dk != ok {
-            return Err(refuse(
-                pinned,
-                m,
-                "variate type does not match the measure's domain",
-            ));
-        }
+    if let (Some(dk), Some(ok)) = (domain_kind, obs_kind)
+        && dk != ok
+    {
+        return Err(refuse(
+            pinned,
+            m,
+            "variate type does not match the measure's domain",
+        ));
     }
 
     let (ctor_sym, kwargs) = split_kernel_constructor(m, measure).ok_or_else(|| {
@@ -8150,11 +8150,11 @@ pub(crate) fn fold_add(m: &mut Module, terms: &[NodeId]) -> NodeId {
     while level.len() > 1 {
         next.clear();
         next.reserve(level.len().div_ceil(2));
-        let mut chunks = level.chunks_exact(2);
-        for pair in &mut chunks {
+        let (pairs, remainder) = level.as_chunks::<2>();
+        for pair in pairs {
             next.push(build_call(m, "add", &[pair[0], pair[1]]));
         }
-        next.extend_from_slice(chunks.remainder());
+        next.extend_from_slice(remainder);
         std::mem::swap(&mut level, &mut next);
     }
     level[0]
@@ -8194,10 +8194,10 @@ pub(crate) fn expect_builtin_call<'a>(m: &'a Module, id: NodeId, name: &str) -> 
 
 /// Return the builtin op name for `id`, or `None` if it is not a builtin call.
 pub(crate) fn builtin_name(m: &Module, id: NodeId) -> Option<&str> {
-    if let Node::Call(c) = m.node(id) {
-        if let CallHead::Builtin(sym) = c.head {
-            return Some(m.resolve(sym));
-        }
+    if let Node::Call(c) = m.node(id)
+        && let CallHead::Builtin(sym) = c.head
+    {
+        return Some(m.resolve(sym));
     }
     None
 }
@@ -8209,10 +8209,9 @@ pub(crate) fn resolve_ref_one(m: &Module, id: NodeId) -> (NodeId, Option<Binding
         ns: RefNs::SelfMod,
         name,
     }) = m.node(id)
+        && let Some(bid) = m.binding_by_name(*name)
     {
-        if let Some(bid) = m.binding_by_name(*name) {
-            return (m.binding(bid).rhs, Some(bid));
-        }
+        return (m.binding(bid).rhs, Some(bid));
     }
     (id, None)
 }

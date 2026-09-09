@@ -119,6 +119,14 @@ pub enum Format {
     FlatPir,
     /// The JSON encoding of FlatPIR (`.flatpir.json`).
     FlatPirJson,
+    /// An HTML page rendering the model as mathematics (`.html`). Output only.
+    Html,
+    /// GitHub Markdown with TeX math (`.md`, `.markdown`). Output only.
+    Markdown,
+    /// A standalone LaTeX document (`.tex`). Output only.
+    Latex,
+    /// A native Typst document (`.typ`). Output only.
+    Typst,
 }
 
 impl Format {
@@ -132,15 +140,19 @@ impl Format {
         match path.extension().and_then(|e| e.to_str()) {
             Some("flatppl") => Ok(Format::FlatPpl),
             Some("flatpir") => Ok(Format::FlatPir),
+            Some("html") => Ok(Format::Html),
+            Some("md" | "markdown") => Ok(Format::Markdown),
+            Some("tex") => Ok(Format::Latex),
+            Some("typ") => Ok(Format::Typst),
             Some(other) => Err(format!(
                 "unsupported file extension `.{}` for `{}` \
-                 (expected `.flatppl`, `.flatpir`, or `.flatpir.json`)",
+                 (expected `.flatppl`, `.flatpir`, `.flatpir.json`, `.html`, `.md`, `.markdown`, `.tex`, or `.typ`)",
                 terminal_text(other),
                 terminal_path(path)
             )),
             None => Err(format!(
                 "cannot infer a format for `{}`: no file extension \
-                 (expected `.flatppl`, `.flatpir`, or `.flatpir.json`)",
+                 (expected `.flatppl`, `.flatpir`, `.flatpir.json`, `.html`, `.md`, `.markdown`, `.tex`, or `.typ`)",
                 terminal_path(path)
             )),
         }
@@ -165,7 +177,18 @@ impl Format {
             Format::FlatPpl => CommentStyle::Line("#"),
             Format::FlatPir => CommentStyle::Line(";"),
             Format::FlatPirJson => CommentStyle::None,
+            Format::Html | Format::Markdown => CommentStyle::Block("<!--", "-->"),
+            Format::Latex => CommentStyle::Line("%"),
+            Format::Typst => CommentStyle::Line("//"),
         }
+    }
+
+    /// Document outputs use the typed math renderer instead of a module printer.
+    pub fn is_document(self) -> bool {
+        matches!(
+            self,
+            Self::Html | Self::Markdown | Self::Latex | Self::Typst
+        )
     }
 }
 
@@ -176,6 +199,8 @@ pub enum CommentStyle {
     Line(&'static str),
     /// The format has no comment syntax (JSON): no banner is written.
     None,
+    /// Wrap the banner line in these open/close markers (HTML `<!-- -->`).
+    Block(&'static str, &'static str),
 }
 
 // ── Failure / diagnostics ────────────────────────────────────────────────────
@@ -356,6 +381,12 @@ pub fn read_module(format: Format, source: &str) -> Result<Module, ReadError> {
             0,
             None,
         )),
+        Format::Html | Format::Markdown | Format::Latex | Format::Typst => Err((
+            "Mathematical documents are output formats only; the input must be FlatPPL, FlatPIR, or an HS3/pyhf document"
+                .to_string(),
+            0,
+            None,
+        )),
     }
 }
 
@@ -380,6 +411,14 @@ pub fn write_module(
         Format::FlatPir | Format::FlatPirJson => unreachable!(
             "write_module called with a FlatPIR format in a lean build; all callers are guarded by a converter feature"
         ),
+        // Documents are rendered from the typed module by the `mathdoc` path in
+        // `convert`, never from the bare module this function sees.
+        Format::Html | Format::Markdown | Format::Latex | Format::Typst => {
+            return Err(Failure::Plain(
+                "Document output needs the `mathdoc` feature's renderer, not `write_module`"
+                    .to_string(),
+            ));
+        }
     })
 }
 
@@ -505,6 +544,12 @@ pub fn run_fmt(
             Format::FlatPir | Format::FlatPirJson => {
                 return Err(Failure::Plain(format!(
                     "`fmt` only formats FlatPPL; `{}` is FlatPIR (use `convert`)",
+                    terminal_path(file)
+                )));
+            }
+            Format::Html | Format::Markdown | Format::Latex | Format::Typst => {
+                return Err(Failure::Plain(format!(
+                    "`fmt` only formats FlatPPL; `{}` is a mathematical document",
                     terminal_path(file)
                 )));
             }
@@ -719,10 +764,10 @@ fn inline_allows(source: &str) -> Result<Vec<flatppl_lint::RuleId>, usize> {
         if line.starts_with(LEGACY_DIRECTIVE) {
             return Err(idx + 1);
         }
-        if let Some(rest) = line.strip_prefix(ALLOW_DIRECTIVE) {
-            if let Ok(rule) = rest.trim().parse() {
-                out.push(rule);
-            }
+        if let Some(rest) = line.strip_prefix(ALLOW_DIRECTIVE)
+            && let Ok(rule) = rest.trim().parse()
+        {
+            out.push(rule);
         }
     }
     Ok(out)

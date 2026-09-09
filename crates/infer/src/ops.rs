@@ -1891,10 +1891,10 @@ fn metricsum_neutral_axis_check(inf: &mut Inferencer<'_, '_>, args: &[ArgInfo]) 
     if let Some((axes, _, _)) = args.get(1) {
         neutral_axis_scan(inf, *axes, &mut bare);
     }
-    if bare.is_none() {
-        if let Some((body, _, _)) = args.get(2) {
-            neutral_axis_scan(inf, *body, &mut bare);
-        }
+    if bare.is_none()
+        && let Some((body, _, _)) = args.get(2)
+    {
+        neutral_axis_scan(inf, *body, &mut bare);
     }
     let (node, name) = bare?;
     inf.diags.push(crate::Diagnostic::error_at(
@@ -3426,10 +3426,10 @@ fn collect_axis_dims(
             let arr_ty = inf.infer_node(c.args[0]).0;
             let flat = flatten_dims(&arr_ty);
             for (k, &idx) in c.args.iter().enumerate().skip(1) {
-                if let Node::Axis(ax) = inf.module.node(idx) {
-                    if let Some(&d) = flat.get(k - 1) {
-                        out.entry(ax.name).or_insert(d);
-                    }
+                if let Node::Axis(ax) = inf.module.node(idx)
+                    && let Some(&d) = flat.get(k - 1)
+                {
+                    out.entry(ax.name).or_insert(d);
                 }
             }
         }
@@ -3898,20 +3898,20 @@ fn component_draw_nodes(
             return;
         }
         if let Node::Ref(r) = inf.module.node(node) {
-            if r.ns == RefNs::SelfMod && !boundary.contains(&r.name) {
-                if let Some(b) = inf.module.binding_by_name(r.name) {
-                    let rhs = inf.module.binding(b).rhs;
-                    walk(inf, rhs, boundary, depth + 1, seen, out);
-                }
+            if r.ns == RefNs::SelfMod
+                && !boundary.contains(&r.name)
+                && let Some(b) = inf.module.binding_by_name(r.name)
+            {
+                let rhs = inf.module.binding(b).rhs;
+                walk(inf, rhs, boundary, depth + 1, seen, out);
             }
             return;
         }
-        if let Node::Call(c) = inf.module.node(node) {
-            if let CallHead::Builtin(op) = c.head {
-                if inf.module.resolve(op) == "draw" {
-                    out.push(node);
-                }
-            }
+        if let Node::Call(c) = inf.module.node(node)
+            && let CallHead::Builtin(op) = c.head
+            && inf.module.resolve(op) == "draw"
+        {
+            out.push(node);
         }
         let mut children = Vec::new();
         inf.module
@@ -8299,10 +8299,10 @@ pub(crate) fn call_valueset(
         // sqrt(x)` — carries `nonnegreals` to the call site. Fall back to the
         // un-substituted body set when substitution binds nothing or yields no
         // finer set.
-        if let Some((_, vs)) = substituted_result(inf, *callee_node, args, named) {
-            if vs != ValueSet::Unknown {
-                return vs;
-            }
+        if let Some((_, vs)) = substituted_result(inf, *callee_node, args, named)
+            && vs != ValueSet::Unknown
+        {
+            return vs;
         }
         return match reified_body(inf, *callee_node) {
             Some(body) => inf.lookup_valueset(body),
@@ -8861,12 +8861,11 @@ pub(crate) fn is_opaque_value_source(name: &str) -> bool {
 /// coordinate, so two `(%ref self psi)` nodes denote the same value however `psi`
 /// was produced. Only sources written INSIDE the compared subtree defeat identity.
 fn contains_opaque_value_source(inf: &Inferencer<'_, '_>, node: NodeId) -> bool {
-    if let Node::Call(c) = inf.module.node(node) {
-        if let CallHead::Builtin(op) = c.head {
-            if is_opaque_value_source(inf.module.resolve(op)) {
-                return true;
-            }
-        }
+    if let Node::Call(c) = inf.module.node(node)
+        && let CallHead::Builtin(op) = c.head
+        && is_opaque_value_source(inf.module.resolve(op))
+    {
+        return true;
     }
     let mut found = false;
     inf.module.for_each_child(node, |child| {

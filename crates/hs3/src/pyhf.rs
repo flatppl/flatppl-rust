@@ -1096,10 +1096,10 @@ fn find_obs(b: &mut Builder, doc: &PyhfDocument, channel_name: &str) -> Result<O
     if let Some(obs) = doc.observations.iter().find(|o| o.name == channel_name) {
         return build(&obs.data);
     }
-    if let Some(map) = &doc.data {
-        if let Some(data) = map.get(channel_name) {
-            return build(data);
-        }
+    if let Some(map) = &doc.data
+        && let Some(data) = map.get(channel_name)
+    {
+        return build(data);
     }
     Err(Error::NoObservation(channel_name.to_owned()))
 }

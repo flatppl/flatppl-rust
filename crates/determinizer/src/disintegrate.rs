@@ -267,23 +267,24 @@ fn collect_reachable_bindings(m: &Module, start: NodeId, out: &mut HashSet<Symbo
         {
             let name = *name;
             // First visit of this binding: record it, then descend into its rhs.
-            if out.insert(name) {
-                if let Some(bid) = m.binding_by_name(name) {
-                    stack.push(m.binding(bid).rhs);
-                }
+            if out.insert(name)
+                && let Some(bid) = m.binding_by_name(name)
+            {
+                stack.push(m.binding(bid).rhs);
             }
             continue;
         }
         // Follow a reification's `%specinputs` boundary source refs (invisible to
         // `children()`), enqueuing each `(%ref self …)` cut like a body edge.
-        if let Node::Call(c) = node {
-            if let Some(Inputs::Spec(entries)) = &c.inputs {
-                for (_, r) in entries.iter() {
-                    if r.ns == RefNs::SelfMod && out.insert(r.name) {
-                        if let Some(bid) = m.binding_by_name(r.name) {
-                            stack.push(m.binding(bid).rhs);
-                        }
-                    }
+        if let Node::Call(c) = node
+            && let Some(Inputs::Spec(entries)) = &c.inputs
+        {
+            for (_, r) in entries.iter() {
+                if r.ns == RefNs::SelfMod
+                    && out.insert(r.name)
+                    && let Some(bid) = m.binding_by_name(r.name)
+                {
+                    stack.push(m.binding(bid).rhs);
                 }
             }
         }
@@ -320,12 +321,12 @@ fn collect_selected_bindings(m: &Module, start: NodeId, out: &mut HashSet<Symbol
             out.insert(*name);
             continue;
         }
-        if let Node::Call(c) = node {
-            if let Some(Inputs::Spec(entries)) = &c.inputs {
-                for (_, r) in entries.iter() {
-                    if r.ns == RefNs::SelfMod {
-                        out.insert(r.name);
-                    }
+        if let Node::Call(c) = node
+            && let Some(Inputs::Spec(entries)) = &c.inputs
+        {
+            for (_, r) in entries.iter() {
+                if r.ns == RefNs::SelfMod {
+                    out.insert(r.name);
                 }
             }
         }
@@ -518,12 +519,11 @@ mod tests {
     /// the desugared `__0xN` binding).
     fn find_disintegrate(m: &Module) -> NodeId {
         for (_, b) in m.bindings() {
-            if let Node::Call(c) = m.node(b.rhs) {
-                if let CallHead::Builtin(op) = c.head {
-                    if m.resolve(op) == "disintegrate" {
-                        return b.rhs;
-                    }
-                }
+            if let Node::Call(c) = m.node(b.rhs)
+                && let CallHead::Builtin(op) = c.head
+                && m.resolve(op) == "disintegrate"
+            {
+                return b.rhs;
             }
         }
         panic!("no disintegrate node in module");

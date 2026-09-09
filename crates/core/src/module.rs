@@ -279,12 +279,11 @@ impl Module {
     pub fn display_meta(&self, id: NodeId) -> Option<String> {
         let ty = self.type_of(id)?;
         let mut facts: Vec<String> = Vec::new();
-        if let Some(vs) = self.valueset_of(id) {
-            if !matches!(vs, ValueSet::Unknown | ValueSet::Deferred)
-                && *vs != ValueSet::natural_of(ty)
-            {
-                facts.push(self.display_valueset(vs));
-            }
+        if let Some(vs) = self.valueset_of(id)
+            && !matches!(vs, ValueSet::Unknown | ValueSet::Deferred)
+            && *vs != ValueSet::natural_of(ty)
+        {
+            facts.push(self.display_valueset(vs));
         }
         if let Some(phase) = self.phase_of(id) {
             facts.push(phase.to_string());

@@ -42,25 +42,26 @@ fn closure_reaches_elementof(m: &Module, root: NodeId) -> bool {
         }) = node
         {
             let name = *name;
-            if seen_bindings.insert(name) {
-                if let Some(bid) = m.binding_by_name(name) {
-                    stack.push(m.binding(bid).rhs);
-                }
+            if seen_bindings.insert(name)
+                && let Some(bid) = m.binding_by_name(name)
+            {
+                stack.push(m.binding(bid).rhs);
             }
             continue;
         }
         if let Node::Call(c) = node {
-            if let CallHead::Builtin(sym) = c.head {
-                if m.resolve(sym) == "elementof" {
-                    return true;
-                }
+            if let CallHead::Builtin(sym) = c.head
+                && m.resolve(sym) == "elementof"
+            {
+                return true;
             }
             if let Some(Inputs::Spec(entries)) = &c.inputs {
                 for (_, r) in entries.iter() {
-                    if r.ns == RefNs::SelfMod && seen_bindings.insert(r.name) {
-                        if let Some(bid) = m.binding_by_name(r.name) {
-                            stack.push(m.binding(bid).rhs);
-                        }
+                    if r.ns == RefNs::SelfMod
+                        && seen_bindings.insert(r.name)
+                        && let Some(bid) = m.binding_by_name(r.name)
+                    {
+                        stack.push(m.binding(bid).rhs);
                     }
                 }
             }

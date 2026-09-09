@@ -125,17 +125,16 @@ fn visit(
         ns: RefNs::SelfMod,
         name,
     }) = m.node(id)
+        && m.binding_by_name(*name).is_none()
     {
-        if m.binding_by_name(*name).is_none() {
-            bad.push(NonConformance {
-                node: id,
-                kind: NonConformKind::DanglingSelfRef,
-                reason: format!(
-                    "dangling (%ref self {}) — no binding of that name in the module",
-                    m.resolve(*name)
-                ),
-            });
-        }
+        bad.push(NonConformance {
+            node: id,
+            kind: NonConformKind::DanglingSelfRef,
+            reason: format!(
+                "dangling (%ref self {}) — no binding of that name in the module",
+                m.resolve(*name)
+            ),
+        });
     }
     // Free-name check, over BOTH shapes the `base` namespace can be spelled in:
     // a bare atom (`Node::Const`) and a builtin call head

@@ -601,69 +601,69 @@ impl<'m, 's> Inferencer<'m, 's> {
                 None
             };
         // `call` borrow is fully released — safe to push diagnostics.
-        if let Some((path, assigns)) = load_check {
-            if let Some(dep) = self.session.dep_for_literal(&path) {
-                for (name_sym, value_node) in assigns {
-                    let input = self.module.resolve(name_sym).to_string();
-                    match dep_input_kind(dep, &input) {
-                        // Spec §04: the LHS must name an *input* of the loaded
-                        // module. No binding by that name → "has no input".
-                        None => self.diags.push(Diagnostic::error_at(
-                            value_node,
-                            format!("module `{path}` has no input `{input}`"),
-                        )),
-                        // A binding exists but is an ordinary computed value, not
-                        // an `external`/`elementof` input ("No other kinds of
-                        // nodes … may be bound").
-                        Some(InputKind::Other) => self.diags.push(Diagnostic::error_at(
-                            value_node,
-                            format!(
-                                "`{input}` is not an input (`external`/`elementof`) of module `{path}`"
-                            ),
-                        )),
-                        // An input: its phase governs what may bind to it —
-                        // `external` ← fixed, `elementof` ← parameterized — and
-                        // (spec §04) the value's set must lie within the input's
-                        // declared set.
-                        Some(kind) => {
-                            // Phase. The substitution value was inferred just
-                            // above, so its phase is recorded; skip if not (never
-                            // false-positive on a missing phase).
-                            if let Some(&value_phase) = self.phases.get(&value_node) {
-                                let required = kind.required_phase();
-                                if value_phase != required {
-                                    self.diags.push(Diagnostic::error_at(
-                                        value_node,
-                                        format!(
-                                            "{} `{input}` of module `{path}` may only be bound to \
+        if let Some((path, assigns)) = load_check
+            && let Some(dep) = self.session.dep_for_literal(&path)
+        {
+            for (name_sym, value_node) in assigns {
+                let input = self.module.resolve(name_sym).to_string();
+                match dep_input_kind(dep, &input) {
+                    // Spec §04: the LHS must name an *input* of the loaded
+                    // module. No binding by that name → "has no input".
+                    None => self.diags.push(Diagnostic::error_at(
+                        value_node,
+                        format!("module `{path}` has no input `{input}`"),
+                    )),
+                    // A binding exists but is an ordinary computed value, not
+                    // an `external`/`elementof` input ("No other kinds of
+                    // nodes … may be bound").
+                    Some(InputKind::Other) => self.diags.push(Diagnostic::error_at(
+                        value_node,
+                        format!(
+                            "`{input}` is not an input (`external`/`elementof`) of module `{path}`"
+                        ),
+                    )),
+                    // An input: its phase governs what may bind to it —
+                    // `external` ← fixed, `elementof` ← parameterized — and
+                    // (spec §04) the value's set must lie within the input's
+                    // declared set.
+                    Some(kind) => {
+                        // Phase. The substitution value was inferred just
+                        // above, so its phase is recorded; skip if not (never
+                        // false-positive on a missing phase).
+                        if let Some(&value_phase) = self.phases.get(&value_node) {
+                            let required = kind.required_phase();
+                            if value_phase != required {
+                                self.diags.push(Diagnostic::error_at(
+                                    value_node,
+                                    format!(
+                                        "{} `{input}` of module `{path}` may only be bound to \
                                              a {required} value (got {value_phase})",
-                                            kind.describe()
-                                        ),
-                                    ));
-                                }
+                                        kind.describe()
+                                    ),
+                                ));
                             }
-                            // Value set (only at `Level::Valueset`+). Conservative:
-                            // flag only a *proven strict superset* — the value
-                            // admits points outside the declared domain. Pairs the
-                            // checker can't prove (incomparable / `Unknown` sets)
-                            // are left alone, so no valid model is rejected.
-                            if self.level >= Level::Valueset {
-                                let declared = declared_input_set(dep, &input);
-                                let value_set = self.lookup_valueset(value_node);
-                                if is_concrete_set(&value_set)
-                                    && declared.subset_of(&value_set)
-                                    && !value_set.subset_of(&declared)
-                                {
-                                    self.diags.push(Diagnostic::error_at(
-                                        value_node,
-                                        format!(
-                                            "the substitution value set `{}` is wider than input \
+                        }
+                        // Value set (only at `Level::Valueset`+). Conservative:
+                        // flag only a *proven strict superset* — the value
+                        // admits points outside the declared domain. Pairs the
+                        // checker can't prove (incomparable / `Unknown` sets)
+                        // are left alone, so no valid model is rejected.
+                        if self.level >= Level::Valueset {
+                            let declared = declared_input_set(dep, &input);
+                            let value_set = self.lookup_valueset(value_node);
+                            if is_concrete_set(&value_set)
+                                && declared.subset_of(&value_set)
+                                && !value_set.subset_of(&declared)
+                            {
+                                self.diags.push(Diagnostic::error_at(
+                                    value_node,
+                                    format!(
+                                        "the substitution value set `{}` is wider than input \
                                              `{input}`'s declared set `{declared}` in module \
                                              `{path}` (spec §04: value sets must be compatible)",
-                                            self.module.display_valueset(&value_set)
-                                        ),
-                                    ));
-                                }
+                                        self.module.display_valueset(&value_set)
+                                    ),
+                                ));
                             }
                         }
                     }

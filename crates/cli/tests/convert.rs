@@ -406,3 +406,177 @@ fn flatppl_through_flatpir_json_is_lossless() {
         "expected at least 8 .flatppl fixtures, found {count}"
     );
 }
+
+#[test]
+fn converts_flatppl_to_an_html_page_of_mathematics() {
+    let dir = Scratch::new("html");
+    let src = dir.path("eight_schools.flatppl");
+    let out = dir.path("eight_schools.html");
+    fs::write(
+        &src,
+        "%%%\n# Eight Schools\n\nA hierarchical model.\n%%%\nflatppl_compat = \"0.1\"\nJ = 8\n% the programme mean\nmu ~ Normal(0, 5)\ntau ~ normalize(truncate(Cauchy(0, 5), interval(0, inf)))\ntheta ~ iid(Normal(mu, tau), J)\nprior = lawof(record(mu = mu, tau = tau, theta = theta))\n",
+    )
+    .unwrap();
+    let status = bin()
+        .args(["convert"])
+        .arg(&src)
+        .arg(&out)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let html = fs::read_to_string(&out).unwrap();
+    assert!(html.starts_with("<!-- AUTOMATICALLY GENERATED - do not edit -->\n<!doctype html>"));
+    assert!(html.contains("<title>Eight Schools</title>"));
+    assert!(html.contains("<mtr data-flatppl-binding=\"mu\" id=\"flatppl-mu\">"));
+    assert!(html.contains("<span class=\"flatppl-caption\"><p>the programme mean</p>"));
+    // `theta ~ iid(Normal(mu, tau), J)` is the bare power `Normal(μ, τ)ᴶ`.
+    assert!(
+        html.contains(
+            "<mo stretchy=\"false\">)</mo></mrow></mrow><mi data-flatppl-ref=\"J\">J</mi></msup>"
+        ),
+        "{html}"
+    );
+
+    // `--no-header` drops the banner; an HTML input is refused.
+    convert_nh(&src, &out);
+    assert!(
+        fs::read_to_string(&out)
+            .unwrap()
+            .starts_with("<!doctype html>")
+    );
+    let status = bin()
+        .args(["convert"])
+        .arg(&out)
+        .arg(dir.path("back.flatppl"))
+        .status()
+        .unwrap();
+    assert!(!status.success());
+}
+
+#[test]
+fn exports_native_mathematical_documents() {
+    let dir = Scratch::new("math-exports");
+    let src = dir.path("model.flatppl");
+    fs::write(
+        &src,
+        r#"%%%
+# Native exports
+
+Literal author commands: \input{private} and #panic("private").
+%%%
+flatppl_compat = "0.1"
+% source scale
+N = Normal(0, 1 + 2)
+mu = [0, 0]
+Sigma = eye(2)
+M = MvNormal(mu, Sigma)
+z ~ Exponential(2)
+%%%
+A data paragraph.
+These values appear in full in the appendix.
+%%%
+x = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+a = elementof(reals)
+f = floor(a) + ceil(a) + l2norm(x)
+bad = Normal(0, "not a scale")
+"#,
+    )
+    .unwrap();
+    for (extension, banner, normal, covariance, escaped) in [
+        (
+            "md",
+            "<!--",
+            r"\mathcal{N}\left(0, {\left(1 + 2\right)}^{2}\right)",
+            r"\mathcal{N}\left(μ, Σ\right)",
+            r"\input{private}",
+        ),
+        (
+            "tex",
+            "%",
+            r"\mathcal{N}\left(0, {\left(1 + 2\right)}^{2}\right)",
+            r"\mathcal{N}\left(μ, Σ\right)",
+            r"\textbackslash{}input\{private\}",
+        ),
+        (
+            "typ",
+            "//",
+            "cal(N) lr(\\( 0 \\, attach(lr(\\( 1 + 2 \\)), tr: 2) \\))",
+            "cal(N) lr(\\( μ \\, Σ \\))",
+            r#"\\input{private} and #panic(\"private\")"#,
+        ),
+    ] {
+        let out = dir.path(&format!("model.{extension}"));
+        let result = bin().arg("convert").arg(&src).arg(&out).output().unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let text = fs::read_to_string(&out).unwrap();
+        assert!(text.starts_with(banner), "{text}");
+        let (start, end, draw) = if extension == "typ" {
+            ("$\nN &=", "\n$\n", "z &∼")
+        } else {
+            (r"\begin{aligned}", r"\end{aligned}", r"z &\sim")
+        };
+        let block_start = text.find(start).expect("aligned equation block");
+        let block_end = text[block_start..].find(end).unwrap() + block_start;
+        let block = &text[block_start..block_end];
+        assert!(block.contains(draw), "{block}");
+        assert!(block.contains("source scale"), "{block}");
+        assert!(block_end < text.find("A data paragraph").unwrap());
+        if extension == "md" {
+            assert!(text.contains("```math\n\\begin{aligned}\nN &="));
+            assert!(block.contains(r"\operatorname{Exp}"));
+        }
+        if extension != "typ" {
+            assert!(text.contains(r#"\text{"not a scale"}"#), "{text}");
+            for delimiter in [r"\left\lfloor a", r"\left\lceil a", r"\left\Vert x"] {
+                assert!(text.contains(delimiter), "{text}");
+            }
+        }
+        for expected in [
+            "Native exports",
+            "source scale",
+            "A data paragraph",
+            "Diagnostics",
+            "Notation",
+            "Data",
+            normal,
+            covariance,
+            escaped,
+        ] {
+            assert!(
+                text.contains(expected),
+                "missing {expected:?} in {extension}:\n{text}"
+            );
+        }
+        // Every indexed value survives in source order in the data table.
+        let mut remaining = text.as_str();
+        for i in 1..=13 {
+            let row = match extension {
+                "md" => format!("| ${i}$ | ${i}$ |"),
+                "tex" => format!(r"${i}$ & ${i}$ \\"),
+                _ => format!("[$ {i} $],\n[$ {i} $],"),
+            };
+            let position = remaining
+                .find(&row)
+                .unwrap_or_else(|| panic!("missing ordered row {row:?} in {extension}"));
+            remaining = &remaining[position + row.len()..];
+        }
+        let result = bin()
+            .arg("convert")
+            .arg(&out)
+            .arg(dir.path("back.flatppl"))
+            .output()
+            .unwrap();
+        assert!(!result.status.success());
+    }
+    let out = dir.path("model.markdown");
+    convert_nh(&src, &out);
+    assert!(
+        fs::read_to_string(out)
+            .unwrap()
+            .starts_with("# Native exports\n")
+    );
+}

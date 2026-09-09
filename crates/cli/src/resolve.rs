@@ -74,10 +74,11 @@ impl CliResolver {
     pub fn ensure_trusted(&self, locs: &[&Location]) -> Result<(), Failure> {
         let mut need: Vec<String> = Vec::new();
         for loc in locs {
-            if let Location::Remote(url) = loc {
-                if !self.approved.borrow().contains(url) && self.cache.needs_approval(url) {
-                    need.push(url.clone());
-                }
+            if let Location::Remote(url) = loc
+                && !self.approved.borrow().contains(url)
+                && self.cache.needs_approval(url)
+            {
+                need.push(url.clone());
             }
         }
         need.sort();
@@ -287,16 +288,16 @@ fn terminal_fileaccess_error(error: flatppl_fileaccess::Error) -> String {
 /// commonly uses). `None` for a non-literal source — it cannot be resolved
 /// statically by the host.
 fn source_of<'m>(module: &'m Module, call: &flatppl_core::Call) -> Option<&'m str> {
-    if let Some(&arg0) = call.args.first() {
-        if let Node::Lit(Scalar::Str(s)) = module.node(arg0) {
-            return Some(s);
-        }
+    if let Some(&arg0) = call.args.first()
+        && let Node::Lit(Scalar::Str(s)) = module.node(arg0)
+    {
+        return Some(s);
     }
     for named in call.named.iter() {
-        if module.resolve(named.name) == "source" {
-            if let Node::Lit(Scalar::Str(s)) = module.node(named.value) {
-                return Some(s);
-            }
+        if module.resolve(named.name) == "source"
+            && let Node::Lit(Scalar::Str(s)) = module.node(named.value)
+        {
+            return Some(s);
         }
     }
     None
