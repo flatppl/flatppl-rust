@@ -556,7 +556,7 @@ fn notation_section(module: &Module, rendering: &Rendering) -> String {
                 "<tr><td><math>{}</math></td><td><code>{}</code><p>{}</p></td></tr>",
                 mathml::expr(&entry.form),
                 escape(&entry.source),
-                escape(&entry.note)
+                entry.note_html()
             );
         }
         out.push_str("</table>\n");

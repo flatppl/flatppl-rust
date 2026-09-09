@@ -151,19 +151,31 @@ impl Format {
         out.push_str(end);
     }
 
-    fn legend(self, out: &mut String, form: &Math, source: &str, note: &str) {
+    fn legend(self, out: &mut String, entry: &crate::notation::NotationEntry) {
+        let form = &entry.form;
+        let source = &entry.source;
+        // The note's mathematics goes through this format's own math printer;
+        // its text through this format's escaping.
         match self {
             Self::Markdown => {
                 let _ = writeln!(out, "```math\n{}\n```\n", tex::expr(form));
+                let note = entry.note_with(markdown_text, |m| format!("${}$", tex::expr(m)));
+                let _ = writeln!(out, "{}: {note}\n", markdown_text(source));
             }
             Self::Latex => {
                 let _ = writeln!(out, "\\[{}\\]\n", tex::expr(form));
+                let note = entry.note_with(tex::escape, |m| format!("${}$", tex::expr(m)));
+                let _ = writeln!(out, "{}: {note}\n", tex::escape(source));
             }
             Self::Typst => {
                 let _ = writeln!(out, "$ {} $\n", typst::expr(form));
+                let note = entry.note_with(
+                    |t| format!("#text({})", typst::quote(t)),
+                    |m| format!("${}$", typst::expr(m)),
+                );
+                let _ = writeln!(out, "#text({}): {note}\n", typst::quote(source));
             }
         }
-        self.prose(out, &format!("{source}: {note}"), None);
     }
 
     fn data_grid(self, out: &mut String, name: &str, grid: &crate::data::Grid) {
@@ -300,7 +312,7 @@ fn document(
     if !rendering.notation.is_empty() {
         format.heading(&mut out, "Notation", false);
         for entry in &rendering.notation {
-            format.legend(&mut out, &entry.form, &entry.source, &entry.note);
+            format.legend(&mut out, entry);
         }
     }
     if matches!(format, Format::Latex) {

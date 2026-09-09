@@ -39,7 +39,8 @@
 //! appearance, its own names excluded. An empty `formats` means `["mathml"]`;
 //! `tex` and `typst` give native math source without delimiters. Unknown
 //! formats add a module-level diagnostic rather than failing. The notation
-//! key uses the same requested formats as the binding rows.
+//! key uses the same requested formats as the binding rows; its `note` is an
+//! HTML fragment (text escaped, parameter letters as inline MathML).
 //! Set `document: true` to also receive `document: { html, css }`: the full
 //! article and scoped stylesheet shared with the standalone HTML export.
 //! Binding metadata remains available for host selection and source navigation.
@@ -236,8 +237,8 @@ fn to_response(rendering: Rendering, want_mathml: bool, formats: &[String]) -> R
                 mathml: want_mathml.then(|| crate::mathml::expr(&n.form)),
                 tex: want_tex.then(|| crate::tex::expr(&n.form)),
                 typst: want_typst.then(|| crate::typst::expr(&n.form)),
+                note: n.note_html(),
                 source: n.source,
-                note: n.note,
             })
             .collect(),
         order,
