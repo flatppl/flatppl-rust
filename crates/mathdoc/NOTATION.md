@@ -48,8 +48,8 @@ the rules stated here.
 - Arrays beyond twelve entries print as `x ∈ ℝ^{n}` with an annotation and the
   values in a data appendix; a `table(…)` literal is a table.
 - A generated notation appendix lists parameters (`elementof`), external inputs,
-  latent variables and the parametrisation of every distribution used, read
-  off the typed and phased module.
+  random variables (`draw`) and the parametrisation of every distribution used,
+  read off the module.
 
 ## Names
 

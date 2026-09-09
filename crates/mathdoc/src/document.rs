@@ -5,7 +5,7 @@
 //! current equation block; a one-line doc-comment is the right-column
 //! annotation of its row; consecutive rows without prose between them form one
 //! block aligned on the relation symbol. Long data literals and a notation
-//! summary (parameters, inputs, latent variables, distribution
+//! summary (parameters, inputs, random variables, distribution
 //! parametrisations) go to appendices.
 //!
 //! Doc-comment Markdown renders through `pulldown-cmark`; its `$…$` math
@@ -250,7 +250,7 @@ fn flush_block(body: &mut String, block: &mut Vec<String>, diags: &mut Vec<Strin
     }
 }
 
-/// Parameters, external inputs, latent variables and the distributions used,
+/// Parameters, external inputs, random variables and the distributions used,
 /// read off the module's heads and the rendered rows.
 fn notation_section(module: &Module, rendering: &Rendering) -> String {
     let mut params = Vec::new();
@@ -304,7 +304,7 @@ fn notation_section(module: &Module, rendering: &Rendering) -> String {
     };
     table(&mut out, "Parameters", &params, "∈");
     table(&mut out, "External inputs", &inputs, "∈");
-    table(&mut out, "Latent variables", &latents, "∼");
+    table(&mut out, "Random variables", &latents, "∼");
     if !dists.is_empty() {
         out.push_str("<h3>Distributions</h3>\n<table>\n");
         for d in dists {
@@ -388,7 +388,7 @@ mod tests {
         // Rows are addressable.
         assert!(p.contains("<mtr data-flatppl-binding=\"tau\" id=\"flatppl-tau\">"));
         // Notation appendix lists the latent variables and the distributions.
-        assert!(p.contains("<h3>Latent variables</h3>"));
+        assert!(p.contains("<h3>Random variables</h3>"));
         assert!(p.contains("<code>Cauchy(location, scale)</code>"));
     }
 
