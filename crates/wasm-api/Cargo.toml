@@ -15,7 +15,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 flatppl-hs3 = { path = "../hs3" }
 flatppl-syntax = { path = "../syntax" }
-# The math renderer's JSON contract only (no document assembly, no Markdown).
+# The JSON contract includes sanitised docs and optional full-document HTML.
 flatppl-mathdoc = { path = "../mathdoc", default-features = false, features = ["json"] }
 
 # wasm-bindgen is pulled in ONLY for the wasm target, so host builds (and the

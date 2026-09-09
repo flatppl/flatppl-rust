@@ -101,6 +101,29 @@ pub fn module_doc_html(doc: &Doc) -> ModuleDoc {
 /// page. `fallback_title` names the document when the module doc has no
 /// heading (the file stem, typically).
 pub fn html(module: &Module, rendering: &Rendering, fallback_title: &str) -> String {
+    let doc = fragment(module, rendering, fallback_title);
+    format!(
+        "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n\
+         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
+         <title>{}</title>\n<style>\n{}</style>\n</head>\n<body>\n{}\n</body>\n</html>\n",
+        escape(&doc.title),
+        CSS,
+        doc.html
+    )
+}
+
+/// The same article is embedded by the viewer and wrapped by the HTML export.
+/// Its stylesheet is scoped to `.flatppl-doc`, leaving host chrome untouched.
+pub(crate) struct HtmlFragment {
+    pub title: String,
+    pub html: String,
+}
+
+pub(crate) fn fragment(
+    module: &Module,
+    rendering: &Rendering,
+    fallback_title: &str,
+) -> HtmlFragment {
     let module_doc = rendering.module_doc.as_ref().map(module_doc_html);
     let title = module_doc
         .as_ref()
@@ -126,7 +149,7 @@ pub fn html(module: &Module, rendering: &Rendering, fallback_title: &str) -> Str
     let mut block_diags: Vec<String> = Vec::new();
     let mut elided: Vec<&str> = Vec::new();
     for b in &rendering.bindings {
-        let mut annotation = b.annotation.clone();
+        let mut annotation = b.annotation.as_deref().map(escape);
         if let Some(doc) = &b.doc {
             let rendered = doc_html(doc);
             if rendered.block {
@@ -136,11 +159,13 @@ pub fn html(module: &Module, rendering: &Rendering, fallback_title: &str) -> Str
                     "<div class=\"flatppl-prose\">\n{}</div>\n",
                     rendered.html
                 );
-            } else if let Some(line) = doc.lines.first() {
-                let line = line.trim();
+            } else {
+                // mtext is an HTML integration point. Keep the sanitised
+                // caption markup so inline math and links work in both hosts.
+                let caption = format!("<span class=\"flatppl-caption\">{}</span>", rendered.html);
                 annotation = Some(match annotation {
-                    Some(a) => format!("{line}; {a}"),
-                    None => line.to_string(),
+                    Some(a) => format!("{caption}; {a}"),
+                    None => caption,
                 });
             }
             for e in rendered.errors {
@@ -151,7 +176,11 @@ pub fn html(module: &Module, rendering: &Rendering, fallback_title: &str) -> Str
             elided.push(&b.name);
         }
         block.push(row_html(b, annotation.as_deref()));
-        for d in rendering.diagnostics.iter().filter(|d| d.binding == b.name) {
+        for d in rendering
+            .diagnostics
+            .iter()
+            .filter(|d| b.names.contains(&d.binding))
+        {
             block_diags.push(format!("{}: {}", b.name, d.message));
         }
     }
@@ -161,8 +190,19 @@ pub fn html(module: &Module, rendering: &Rendering, fallback_title: &str) -> Str
         rendering
             .diagnostics
             .iter()
-            .filter(|d| d.binding.is_empty())
-            .map(|d| d.message.clone()),
+            .filter(|d| {
+                !rendering
+                    .bindings
+                    .iter()
+                    .any(|b| b.names.contains(&d.binding))
+            })
+            .map(|d| {
+                if d.binding.is_empty() {
+                    d.message.clone()
+                } else {
+                    format!("{}: {}", d.binding, d.message)
+                }
+            }),
     );
     if !module_diags.is_empty() {
         body.push_str("<section class=\"flatppl-diagnostics\"><h2>Diagnostics</h2><ul>\n");
@@ -225,22 +265,19 @@ pub fn html(module: &Module, rendering: &Rendering, fallback_title: &str) -> Str
 
     body.push_str(&notation_section(module, rendering));
 
-    format!(
-        "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n\
-         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
-         <title>{}</title>\n<style>\n{}</style>\n</head>\n<body>\n<article class=\"flatppl-doc\">\n{}</article>\n</body>\n</html>\n",
-        escape(&title),
-        CSS,
-        body
-    )
+    HtmlFragment {
+        title,
+        html: format!("<article class=\"flatppl-doc\">\n{body}</article>"),
+    }
 }
 
-const CSS: &str = "\
+pub(crate) const CSS: &str = "\
 .flatppl-doc { max-width: 50em; margin: 2em auto; padding: 0 1em; font-family: system-ui, sans-serif; line-height: 1.5; }
 .flatppl-doc h1 { font-size: 1.8em; }
 .flatppl-doc math[display=block] { margin: 0.8em 0; }
 .flatppl-doc mtable { column-gap: 0.5em; }
 .flatppl-doc .flatppl-annot { font-size: 85%; opacity: 0.7; }
+.flatppl-doc .flatppl-caption > * { display: inline; margin: 0; }
 .flatppl-doc .flatppl-code { font-family: ui-monospace, monospace; }
 .flatppl-doc .math-error { font-family: ui-monospace, monospace; color: #a33; }
 .flatppl-doc .flatppl-diagnostics, .flatppl-doc .flatppl-row-diag { color: #a33; font-size: 90%; }
@@ -430,11 +467,11 @@ fn wrap_in_mrow(mathml: &str) -> String {
     )
 }
 
-/// One `<mtr>` of the aligned block: lhs, relation, rhs, annotation.
+/// One `<mtr>` of the aligned block. Annotation is already escaped or sanitised.
 fn row_html(b: &crate::render::BindingRender, annotation: Option<&str>) -> String {
     let (lhs, rel, rhs) = mathml::statement_parts(&b.statement);
     let annot = annotation
-        .map(|a| format!("<mtext class=\"flatppl-annot\">{}</mtext>", escape(a)))
+        .map(|a| format!("<mtext class=\"flatppl-annot\">{a}</mtext>"))
         .unwrap_or_default();
     format!(
         "<mtr data-flatppl-binding=\"{name}\" id=\"flatppl-{name}\"><mtd>{lhs}</mtd><mtd><mo>{rel}</mo></mtd><mtd>{rhs}</mtd><mtd>{annot}</mtd></mtr>",
@@ -560,7 +597,7 @@ mod tests {
             2
         );
         // One-line doc → annotation.
-        assert!(p.contains("<mtext class=\"flatppl-annot\">the programme mean</mtext>"));
+        assert!(p.contains("<span class=\"flatppl-caption\"><p>the programme mean</p>"));
         // Rows are addressable.
         assert!(p.contains("<mtr data-flatppl-binding=\"tau\" id=\"flatppl-tau\">"));
         // Notation appendix lists the latent variables and the distributions.

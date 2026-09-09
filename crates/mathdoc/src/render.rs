@@ -137,12 +137,21 @@ pub fn render_source(
     path: &str,
     bundle: &HashMap<String, String>,
 ) -> Result<Rendering, String> {
+    render_source_with_module(source, path, bundle).map(|(_, rendering)| rendering)
+}
+
+/// Retain the inferred module for document appendices without parsing twice.
+pub(crate) fn render_source_with_module(
+    source: &str,
+    path: &str,
+    bundle: &HashMap<String, String>,
+) -> Result<(Module, Rendering), String> {
     let mut module = flatppl_syntax::parse(source).map_err(|e| format!("{path}: {e}"))?;
     let deps = resolve_bundle(&module, path, bundle)?;
     let infer_diags = flatppl_infer::infer_module(&mut module, &deps, Level::Shape);
     let mut rendering = render_with_source(&module, Some(source));
     attach_inference_diagnostics(&mut rendering, &module, &infer_diags);
-    Ok(rendering)
+    Ok((module, rendering))
 }
 
 /// Add inference ERRORS to `rendering` as diagnostics on the binding whose

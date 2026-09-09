@@ -40,6 +40,9 @@
 //! `tex` and `typst` give native math source without delimiters. Unknown
 //! formats add a module-level diagnostic rather than failing. The notation
 //! key uses the same requested formats as the binding rows.
+//! Set `document: true` to also receive `document: { html, css }`: the full
+//! article and scoped stylesheet shared with the standalone HTML export.
+//! Binding metadata remains available for host selection and source navigation.
 
 use std::collections::HashMap;
 
@@ -57,6 +60,8 @@ struct Request {
     bundle: HashMap<String, String>,
     #[serde(default = "default_formats")]
     formats: Vec<String>,
+    #[serde(default)]
+    document: bool,
 }
 
 fn default_path() -> String {
@@ -69,12 +74,20 @@ fn default_formats() -> Vec<String> {
 
 #[derive(Serialize)]
 struct Response {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    document: Option<DocumentJson>,
     order: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     doc: Option<ModuleDocJson>,
     bindings: Vec<BindingJson>,
     diagnostics: Vec<DiagnosticJson>,
     notation: Vec<NotationJson>,
+}
+
+#[derive(Serialize)]
+struct DocumentJson {
+    html: String,
+    css: &'static str,
 }
 
 #[derive(Serialize)]
@@ -137,9 +150,19 @@ struct DiagnosticJson {
 /// request or an unparsable primary module is an `Err` with the message.
 pub fn render_math(input: &str) -> Result<String, String> {
     let req: Request = serde_json::from_str(input).map_err(|e| format!("request: {e}"))?;
-    let rendering = render::render_source(&req.source, &req.path, &req.bundle)?;
+    let (module, rendering) =
+        render::render_source_with_module(&req.source, &req.path, &req.bundle)?;
+    let document = req.document.then(|| {
+        let title = req.path.rsplit('/').next().unwrap_or(&req.path);
+        let title = title.strip_suffix(".flatppl").unwrap_or(title);
+        DocumentJson {
+            html: document::fragment(&module, &rendering, title).html,
+            css: document::CSS,
+        }
+    });
     let want_mathml = req.formats.is_empty() || req.formats.iter().any(|f| f == "mathml");
-    let response = to_response(rendering, want_mathml, &req.formats);
+    let mut response = to_response(rendering, want_mathml, &req.formats);
+    response.document = document;
     serde_json::to_string(&response).map_err(|e| format!("response: {e}"))
 }
 
@@ -206,6 +229,7 @@ fn to_response(rendering: Rendering, want_mathml: bool, formats: &[String]) -> R
         });
     }
     Response {
+        document: None,
         notation: notation
             .into_iter()
             .map(|n| NotationJson {
@@ -301,6 +325,38 @@ mod tests {
                 .iter()
                 .any(|d| d["message"].as_str().unwrap().contains("svg"))
         );
+    }
+
+    #[test]
+    fn embedded_document_matches_the_standalone_article() {
+        let source =
+            "% $\\alpha$\nx ~ Normal(0, 2)\ndata = [1,2,3,4,5,6,7,8,9,10,11,12,13]\n_ = Normal(0)";
+        let input = serde_json::json!({ "source": source, "document": true });
+        let out: serde_json::Value =
+            serde_json::from_str(&render_math(&input.to_string()).unwrap()).unwrap();
+        let (module, rendering) =
+            render::render_source_with_module(source, "model.flatppl", &HashMap::new()).unwrap();
+        let page = document::html(&module, &rendering, "model");
+        let article = out["document"]["html"].as_str().unwrap();
+        assert!(page.contains(article));
+        assert!(page.contains(out["document"]["css"].as_str().unwrap()));
+        assert!(article.contains("flatppl-data-grid"));
+        assert!(article.contains("<mn>13</mn>"));
+        assert!(article.contains("Random variables"));
+        assert!(article.contains("data-flatppl-binding=\"x\""));
+        assert!(!article.contains("$\\alpha$"));
+        assert!(article.contains(out["bindings"][0]["doc"]["html"].as_str().unwrap()));
+        for diagnostic in out["diagnostics"].as_array().unwrap() {
+            assert!(article.contains(&crate::mathml::escape(
+                diagnostic["message"].as_str().unwrap()
+            )));
+        }
+        let legacy: serde_json::Value = serde_json::from_str(
+            &render_math(&serde_json::json!({ "source": source }).to_string()).unwrap(),
+        )
+        .unwrap();
+        assert!(legacy.get("document").is_none());
+        assert_eq!(out["bindings"], legacy["bindings"]);
     }
 
     #[test]
