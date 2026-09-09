@@ -102,7 +102,7 @@ the same rules (`.mu` → μ).
 | `f(a, b) = expr`, `f = (a, b) -> expr`, `f = fn(… _ …)` | f(a, b) = expr |
 | `F = functionof(e, p = a, q = d)` | F(p, q) = e with a, d read as p, q |
 | `F = functionof(y)` (inputs from inference) | F(inputs) = y, by reference to y's own row |
-| `K = kernelof(x, p = a)` | K(p) = ℒ(x \| p) |
+| `K = kernelof(x, p = a)` | K(p) = Law(x \| p) |
 | `L = likelihoodof(K, data)` | L(inputs) = p_K(data \| inputs) |
 | `C[.i, .k] := body` | C_{ik} = Σ_{j} body |
 | `g: s[] := body` | s = body with upper/lower indices, annotation "indices lowered with g" |
@@ -198,8 +198,8 @@ range comes from the typed module: a named size where the source gives one
 | `pushfwd(f, M)`, `locscale(M, a, b)` | f_* M, a + b · M |
 | `joint(M1, M2)`, `joint(a = M1, b = M2)` | M₁ ⊗ M₂, M₁(da) ⊗ M₂(db) — only when no component is stochastic, reifies a draw, or reaches into a loaded module (§06: `joint` retains shared stochastic ancestors and is then not a product; a loaded module's binding may hold a draw this module cannot see, a standard module holds none); otherwise, and for a spelling that mixes positional and keyword components, joint(…) in roman |
 | `relabel(M, ["x"])` | M(dx) |
-| `lawof(x)`, `lawof(record(a = a, b = b))` | ℒ(x), ℒ(a, b) |
-| `kernelof(x, p = a)` as an expression | p ↦ ℒ(x \| p); with no inputs, ℒ(x) |
+| `lawof(x)`, `lawof(record(a = a, b = b))` | Law(x), Law(a, b) — upright, as in current probability writing; the script ℒ stays free for an author's likelihood |
+| `kernelof(x, p = a)` as an expression | p ↦ Law(x \| p); with no inputs, Law(x) |
 | `functionof(e, p = a)` as an expression | p ↦ e; with no inputs, e |
 | `F = functionof(e)` with no inputs | F() = e |
 | `densityof(M, x)`, `logdensityof(M, x)` | p_M(x), log p_M(x) |
@@ -211,7 +211,7 @@ range comes from the typed module: a named size where the source gives one
 | `kchain`, `jointchain`, `markovchain`, `kscan`, `ksuperpose`, `disintegrate`, `bijection`, `PoissonProcess`, … | the construct name in roman with its arguments |
 
 A record whose fields are references to bindings of the same name prints as the
-list of those symbols (`ℒ(μ, τ, θ)`); any other field prints as `name = value`.
+list of those symbols (`Law(μ, τ, θ)`); any other field prints as `name = value`.
 
 The Normal variance keeps the source scale expression, grouped before squaring.
 Rate and scale conventions appear in the legend, not as argument labels. Other

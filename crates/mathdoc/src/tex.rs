@@ -255,7 +255,7 @@ fn symbol(s: Sym) -> &'static str {
         Sym::ExtendedReals => r"\overline{\mathbb{R}}",
         Sym::Normal => r"\mathcal{N}",
         Sym::Uniform => r"\mathcal{U}",
-        Sym::Law => r"\mathcal{L}",
+        Sym::Law => r"\operatorname{Law}",
         Sym::Integers => r"\mathbb{Z}",
         Sym::Complexes => r"\mathbb{C}",
         Sym::Booleans => r"\mathbb{B}",

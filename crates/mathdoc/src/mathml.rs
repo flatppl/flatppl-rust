@@ -370,7 +370,7 @@ fn write_sym(out: &mut String, s: Sym) {
         Sym::ExtendedReals => "<mover><mi>ℝ</mi><mo>¯</mo></mover>",
         Sym::Normal => "<mi>𝒩</mi>",
         Sym::Uniform => "<mi>𝒰</mi>",
-        Sym::Law => "<mi>ℒ</mi>",
+        Sym::Law => "<mi>Law</mi>",
         Sym::Integers => "<mi>ℤ</mi>",
         Sym::Complexes => "<mi>ℂ</mi>",
         Sym::Booleans => "<mi>𝔹</mi>",

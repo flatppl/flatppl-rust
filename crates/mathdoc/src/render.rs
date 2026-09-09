@@ -325,7 +325,7 @@ mod tests {
             ("y", "<msubsup><mi>χ</mi><mn>3</mn><mn>2</mn></msubsup>"),
             ("u", "𝒰"),
             ("g", "<mn>2</mn><mo>,</mo><mn>3</mn>"),
-            ("L", "ℒ"),
+            ("L", "<mi>Law</mi>"),
         ] {
             let row = r.bindings.iter().find(|b| b.name == name).unwrap();
             assert!(row.mathml.contains(markup), "{name}: {}", row.mathml);

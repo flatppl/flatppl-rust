@@ -2189,14 +2189,14 @@ mod tests {
         let prior = mathml::expr(&row_named(&rows, "prior").statement.rhs);
         assert_eq!(
             prior,
-            "<mrow><mi>ℒ</mi><mo>&#x2061;</mo><mrow><mo stretchy=\"false\">(</mo><mrow><mi data-flatppl-ref=\"mu\">μ</mi><mo>,</mo><mi data-flatppl-ref=\"tau\">τ</mi><mo>,</mo><mi data-flatppl-ref=\"theta\">θ</mi></mrow><mo stretchy=\"false\">)</mo></mrow></mrow>"
+            "<mrow><mi>Law</mi><mo>&#x2061;</mo><mrow><mo stretchy=\"false\">(</mo><mrow><mi data-flatppl-ref=\"mu\">μ</mi><mo>,</mo><mi data-flatppl-ref=\"tau\">τ</mi><mo>,</mo><mi data-flatppl-ref=\"theta\">θ</mi></mrow><mo stretchy=\"false\">)</mo></mrow></mrow>"
         );
         let k = row_named(&rows, "K");
         assert_eq!(k.kind, Kind::Callable);
         let lhs = mathml::expr(&k.statement.lhs);
         assert!(lhs.starts_with("<mrow><mi data-flatppl-ref=\"K\">K</mi><mo>&#x2061;</mo><mrow><mo stretchy=\"false\">(</mo><mi data-flatppl-ref=\"mu\">μ</mi>"), "{lhs}");
         let rhs = mathml::expr(&k.statement.rhs);
-        assert!(rhs.contains("<mi>ℒ</mi>"), "{rhs}");
+        assert!(rhs.contains("<mi>Law</mi>"), "{rhs}");
         assert!(rhs.contains("<mi data-flatppl-ref=\"y\">y</mi><mo stretchy=\"false\">|</mo><mi data-flatppl-ref=\"mu\">μ</mi><mo>,</mo><mi data-flatppl-ref=\"tau\">τ</mi>"), "{rhs}");
         let l = row_named(&rows, "L");
         assert_eq!(l.kind, Kind::Likelihood);
