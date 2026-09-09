@@ -540,27 +540,26 @@ fn declare_generic_expr_params(
         if matches!(
             d.kind.as_str(),
             "generic_dist" | "density_function_dist" | "log_density_function_dist"
-        ) {
-            if let Some(expr) = d.extra.get("expression").and_then(|v| v.as_str()) {
-                // generic_dist lowers over the hardcoded observable `x`.
-                sources.push((expr, "x"));
-            }
+        ) && let Some(expr) = d.extra.get("expression").and_then(|v| v.as_str())
+        {
+            // generic_dist lowers over the hardcoded observable `x`.
+            sources.push((expr, "x"));
         }
     }
     // generic_function expressions, over their declared bound variable.
     for f in &doc.functions {
-        if f.kind == "generic_function" {
-            if let Some(expr) = f.extra.get("expression").and_then(|v| v.as_str()) {
-                let obs_name = f
-                    .extra
-                    .get("variables")
-                    .and_then(|v| v.as_array())
-                    .and_then(|arr| arr.first())
-                    .and_then(|v| v.as_str())
-                    .or_else(|| f.extra.get("x").and_then(|v| v.as_str()))
-                    .unwrap_or("x");
-                sources.push((expr, obs_name));
-            }
+        if f.kind == "generic_function"
+            && let Some(expr) = f.extra.get("expression").and_then(|v| v.as_str())
+        {
+            let obs_name = f
+                .extra
+                .get("variables")
+                .and_then(|v| v.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|v| v.as_str())
+                .or_else(|| f.extra.get("x").and_then(|v| v.as_str()))
+                .unwrap_or("x");
+            sources.push((expr, obs_name));
         }
     }
 
@@ -629,12 +628,11 @@ fn expr_uses_specfun(expr: &str) -> bool {
 fn doc_uses_specfun(doc: &Document) -> bool {
     // Scan generic_function expressions.
     for f in &doc.functions {
-        if f.kind == "generic_function" {
-            if let Some(expr) = f.extra.get("expression").and_then(|v| v.as_str()) {
-                if expr_uses_specfun(expr) {
-                    return true;
-                }
-            }
+        if f.kind == "generic_function"
+            && let Some(expr) = f.extra.get("expression").and_then(|v| v.as_str())
+            && expr_uses_specfun(expr)
+        {
+            return true;
         }
     }
     // Scan generic_dist / density_function_dist / log_density_function_dist inline expressions.
@@ -642,12 +640,10 @@ fn doc_uses_specfun(doc: &Document) -> bool {
         if matches!(
             d.kind.as_str(),
             "generic_dist" | "density_function_dist" | "log_density_function_dist"
-        ) {
-            if let Some(expr) = d.extra.get("expression").and_then(|v| v.as_str()) {
-                if expr_uses_specfun(expr) {
-                    return true;
-                }
-            }
+        ) && let Some(expr) = d.extra.get("expression").and_then(|v| v.as_str())
+            && expr_uses_specfun(expr)
+        {
+            return true;
         }
     }
     false
@@ -1218,18 +1214,15 @@ fn emit_likelihoods(
 /// to a binned datum, then reading that datum's `contents`.
 fn find_histfactory_observed(doc: &Document, dist_name: &str) -> Option<Vec<f64>> {
     for lk in &doc.likelihoods {
-        if let Some(idx) = lk.distributions.iter().position(|n| n == dist_name) {
-            if let Some(serde_json::Value::String(data_name)) = lk.data.get(idx) {
-                if let Some(datum) = doc
-                    .data
-                    .iter()
-                    .find(|d| &d.name == data_name && d.kind == "binned")
-                {
-                    if let Some(contents) = &datum.contents {
-                        return Some(contents.clone());
-                    }
-                }
-            }
+        if let Some(idx) = lk.distributions.iter().position(|n| n == dist_name)
+            && let Some(serde_json::Value::String(data_name)) = lk.data.get(idx)
+            && let Some(datum) = doc
+                .data
+                .iter()
+                .find(|d| &d.name == data_name && d.kind == "binned")
+            && let Some(contents) = &datum.contents
+        {
+            return Some(contents.clone());
         }
     }
     None

@@ -431,7 +431,9 @@ fn converts_flatppl_to_an_html_page_of_mathematics() {
     assert!(html.contains("<mtext class=\"flatppl-annot\">the programme mean</mtext>"));
     // `theta ~ iid(Normal(mu, tau), J)` is the bare power `Normal(μ, τ)ᴶ`.
     assert!(
-        html.contains("<mo>)</mo></mrow></mrow><mi data-flatppl-ref=\"J\">J</mi></msup>"),
+        html.contains(
+            "<mo stretchy=\"false\">)</mo></mrow></mrow><mi data-flatppl-ref=\"J\">J</mi></msup>"
+        ),
         "{html}"
     );
 

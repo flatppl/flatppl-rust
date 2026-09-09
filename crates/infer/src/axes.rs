@@ -52,10 +52,10 @@ pub(crate) fn position_errors(module: &Module) -> Vec<(NodeId, Diagnostic)> {
 fn scan(m: &Module, id: NodeId, slot: Slot, in_body: bool, out: &mut Vec<(NodeId, Diagnostic)>) {
     let node = m.node(id);
     let Node::Call(c) = node else {
-        if let Node::Axis(ax) = node {
-            if slot != Slot::Index {
-                out.push((id, axis_error(m, id, ax.name)));
-            }
+        if let Node::Axis(ax) = node
+            && slot != Slot::Index
+        {
+            out.push((id, axis_error(m, id, ax.name)));
         }
         return;
     };

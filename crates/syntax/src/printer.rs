@@ -177,12 +177,11 @@ impl<'m> Printer<'m> {
         let mut modules = HashSet::new();
         for (_, b) in module.bindings() {
             bound.insert(b.name);
-            if let Node::Call(c) = module.node(b.rhs) {
-                if let CallHead::Builtin(op) = c.head {
-                    if matches!(module.resolve(op), "load_module" | "standard_module") {
-                        modules.insert(b.name);
-                    }
-                }
+            if let Node::Call(c) = module.node(b.rhs)
+                && let CallHead::Builtin(op) = c.head
+                && matches!(module.resolve(op), "load_module" | "standard_module")
+            {
+                modules.insert(b.name);
             }
         }
         Printer {
@@ -210,16 +209,15 @@ impl<'m> Printer<'m> {
         let name = self.module.resolve(binding.name);
         if let Node::Call(call) = self.module.node(binding.rhs) {
             // `name = draw(M)` re-sugars to `name ~ M` (both levels).
-            if let CallHead::Builtin(op) = call.head {
-                if self.module.resolve(op) == "draw"
-                    && call.args.len() == 1
-                    && call.named.is_empty()
-                    && call.inputs.is_none()
-                {
-                    let prefix = format!("{name} ~ ");
-                    let body = self.body_w(call.args[0], prefix.chars().count());
-                    return format!("{prefix}{body}");
-                }
+            if let CallHead::Builtin(op) = call.head
+                && self.module.resolve(op) == "draw"
+                && call.args.len() == 1
+                && call.named.is_empty()
+                && call.inputs.is_none()
+            {
+                let prefix = format!("{name} ~ ");
+                let body = self.body_w(call.args[0], prefix.chars().count());
+                return format!("{prefix}{body}");
             }
             if self.syntax == Syntax::Full {
                 if let Some(text) = self.aggregate_stmt(name, call) {
@@ -374,29 +372,31 @@ impl<'m> Printer<'m> {
         match &call.head {
             CallHead::Builtin(op) => {
                 let name = self.module.resolve(*op);
-                if call.named.is_empty() && call.args.len() == 2 {
-                    if let Some(op) = binop(name) {
-                        if op.prec == AND {
-                            // `land` may be a lowered comparison chain.
-                            if let Some(chain) = self.comparison_chain(id, lambda) {
-                                return (chain, CMP);
-                            }
+                if call.named.is_empty()
+                    && call.args.len() == 2
+                    && let Some(op) = binop(name)
+                {
+                    if op.prec == AND {
+                        // `land` may be a lowered comparison chain.
+                        if let Some(chain) = self.comparison_chain(id, lambda) {
+                            return (chain, CMP);
                         }
-                        let (lmin, rmin) = operand_mins(op.prec);
-                        let text = format!(
-                            "{} {} {}",
-                            self.full(call.args[0], lmin, lambda),
-                            op.plain,
-                            self.full(call.args[1], rmin, lambda)
-                        );
-                        return (text, op.prec);
                     }
+                    let (lmin, rmin) = operand_mins(op.prec);
+                    let text = format!(
+                        "{} {} {}",
+                        self.full(call.args[0], lmin, lambda),
+                        op.plain,
+                        self.full(call.args[1], rmin, lambda)
+                    );
+                    return (text, op.prec);
                 }
-                if call.named.is_empty() && call.args.len() == 1 {
-                    if let Some((plain, _)) = unop(name) {
-                        let text = format!("{plain}{}", self.full(call.args[0], UNARY, lambda));
-                        return (text, UNARY);
-                    }
+                if call.named.is_empty()
+                    && call.args.len() == 1
+                    && let Some((plain, _)) = unop(name)
+                {
+                    let text = format!("{plain}{}", self.full(call.args[0], UNARY, lambda));
+                    return (text, UNARY);
                 }
                 match name {
                     "get" if call.named.is_empty() && call.args.len() >= 2 => {
@@ -438,13 +438,13 @@ impl<'m> Printer<'m> {
     /// (`self` / `base` / a module binding — dot syntax there means member
     /// access).
     fn get_form(&self, call: &Call, lambda: &[Symbol]) -> (String, u8) {
-        if call.args.len() == 2 {
-            if let Node::Lit(Scalar::Str(key)) = self.module.node(call.args[1]) {
-                if is_field_name(key) && !self.is_namespace(call.args[0]) {
-                    let object = self.dot_object(call.args[0], lambda);
-                    return (format!("{object}.{key}"), POSTFIX);
-                }
-            }
+        if call.args.len() == 2
+            && let Node::Lit(Scalar::Str(key)) = self.module.node(call.args[1])
+            && is_field_name(key)
+            && !self.is_namespace(call.args[0])
+        {
+            let object = self.dot_object(call.args[0], lambda);
+            return (format!("{object}.{key}"), POSTFIX);
         }
         let object = self.full(call.args[0], POSTFIX, lambda);
         let entries: Vec<String> = call.args[1..]
@@ -484,28 +484,27 @@ impl<'m> Printer<'m> {
     /// operator when the head is that operator's name, a dot-call `f.(…)`
     /// otherwise.
     fn broadcast_form(&self, call: &Call, lambda: &[Symbol]) -> (String, u8) {
-        if call.named.is_empty() {
-            if let Node::Const(f) = self.module.node(call.args[0]) {
-                let f = self.module.resolve(*f);
-                if call.args.len() == 3 {
-                    if let Some(op) = binop(f) {
-                        if let Some(dotted) = op.dotted {
-                            let (lmin, rmin) = operand_mins(op.prec);
-                            let text = format!(
-                                "{} {dotted} {}",
-                                self.full(call.args[1], lmin, lambda),
-                                self.full(call.args[2], rmin, lambda)
-                            );
-                            return (text, op.prec);
-                        }
-                    }
-                }
-                if call.args.len() == 2 {
-                    if let Some((_, dotted)) = unop(f) {
-                        let text = format!("{dotted}{}", self.full(call.args[1], UNARY, lambda));
-                        return (text, UNARY);
-                    }
-                }
+        if call.named.is_empty()
+            && let Node::Const(f) = self.module.node(call.args[0])
+        {
+            let f = self.module.resolve(*f);
+            if call.args.len() == 3
+                && let Some(op) = binop(f)
+                && let Some(dotted) = op.dotted
+            {
+                let (lmin, rmin) = operand_mins(op.prec);
+                let text = format!(
+                    "{} {dotted} {}",
+                    self.full(call.args[1], lmin, lambda),
+                    self.full(call.args[2], rmin, lambda)
+                );
+                return (text, op.prec);
+            }
+            if call.args.len() == 2
+                && let Some((_, dotted)) = unop(f)
+            {
+                let text = format!("{dotted}{}", self.full(call.args[1], UNARY, lambda));
+                return (text, UNARY);
             }
         }
         let mut parts: Vec<String> = call.args[1..]
@@ -603,18 +602,16 @@ impl<'m> Printer<'m> {
 
     /// Flatten the left-leaning spine of plain binary `land` calls.
     fn land_spine(&self, id: NodeId, out: &mut Vec<NodeId>) {
-        if let Node::Call(c) = self.module.node(id) {
-            if let CallHead::Builtin(op) = c.head {
-                if self.module.resolve(op) == "land"
-                    && c.args.len() == 2
-                    && c.named.is_empty()
-                    && c.inputs.is_none()
-                {
-                    self.land_spine(c.args[0], out);
-                    out.push(c.args[1]);
-                    return;
-                }
-            }
+        if let Node::Call(c) = self.module.node(id)
+            && let CallHead::Builtin(op) = c.head
+            && self.module.resolve(op) == "land"
+            && c.args.len() == 2
+            && c.named.is_empty()
+            && c.inputs.is_none()
+        {
+            self.land_spine(c.args[0], out);
+            out.push(c.args[1]);
+            return;
         }
         out.push(id);
     }
@@ -707,10 +704,8 @@ impl<'m> Printer<'m> {
     fn break_node(&self, id: NodeId, lambda: &[Symbol], indent: usize, bracketed: bool) -> String {
         // An operator chain breaks one operand per line — but only inside a
         // bracket, since a leading operator does not continue a depth-0 line.
-        if bracketed {
-            if let Some(inf) = self.as_infix(id) {
-                return self.break_op(id, &inf.op, inf.lmin, inf.rmin, lambda, indent);
-            }
+        if bracketed && let Some(inf) = self.as_infix(id) {
+            return self.break_op(id, &inf.op, inf.lmin, inf.rmin, lambda, indent);
         }
         let Node::Call(c) = self.module.node(id) else {
             return self.full(id, EXPR, lambda);
@@ -838,12 +833,12 @@ impl<'m> Printer<'m> {
     /// Flatten the left spine of nodes joined by the SAME infix operator `op`
     /// (left-associative), so the chain prints as one column of operands.
     fn op_spine(&self, id: NodeId, op: &str, out: &mut Vec<NodeId>) {
-        if let Some(inf) = self.as_infix(id) {
-            if inf.op == op {
-                self.op_spine(inf.left, op, out);
-                out.push(inf.right);
-                return;
-            }
+        if let Some(inf) = self.as_infix(id)
+            && inf.op == op
+        {
+            self.op_spine(inf.left, op, out);
+            out.push(inf.right);
+            return;
         }
         out.push(id);
     }
@@ -863,36 +858,35 @@ impl<'m> Printer<'m> {
             return None;
         };
         let name = self.module.resolve(op);
-        if c.args.len() == 2 {
-            if let Some(b) = binop(name) {
-                if b.prec == AND {
-                    return None;
-                }
-                let (lmin, rmin) = operand_mins(b.prec);
-                return Some(Infix {
-                    op: b.plain.to_string(),
-                    lmin,
-                    rmin,
-                    left: c.args[0],
-                    right: c.args[1],
-                });
+        if c.args.len() == 2
+            && let Some(b) = binop(name)
+        {
+            if b.prec == AND {
+                return None;
             }
+            let (lmin, rmin) = operand_mins(b.prec);
+            return Some(Infix {
+                op: b.plain.to_string(),
+                lmin,
+                rmin,
+                left: c.args[0],
+                right: c.args[1],
+            });
         }
-        if name == "broadcast" && c.args.len() == 3 {
-            if let Node::Const(f) = self.module.node(c.args[0]) {
-                if let Some(b) = binop(self.module.resolve(*f)) {
-                    if let Some(dotted) = b.dotted {
-                        let (lmin, rmin) = operand_mins(b.prec);
-                        return Some(Infix {
-                            op: dotted.to_string(),
-                            lmin,
-                            rmin,
-                            left: c.args[1],
-                            right: c.args[2],
-                        });
-                    }
-                }
-            }
+        if name == "broadcast"
+            && c.args.len() == 3
+            && let Node::Const(f) = self.module.node(c.args[0])
+            && let Some(b) = binop(self.module.resolve(*f))
+            && let Some(dotted) = b.dotted
+        {
+            let (lmin, rmin) = operand_mins(b.prec);
+            return Some(Infix {
+                op: dotted.to_string(),
+                lmin,
+                rmin,
+                left: c.args[1],
+                right: c.args[2],
+            });
         }
         None
     }

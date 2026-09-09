@@ -327,10 +327,10 @@ pub(crate) fn substitute_refs(m: &mut Module, root: NodeId, map: &[(Symbol, Node
         return root;
     }
     if let Node::Ref(Ref { ns, name }) = m.node(root) {
-        if matches!(ns, RefNs::SelfMod | RefNs::Local) {
-            if let Some((_, new_id)) = map.iter().find(|(n, _)| n == name) {
-                return *new_id;
-            }
+        if matches!(ns, RefNs::SelfMod | RefNs::Local)
+            && let Some((_, new_id)) = map.iter().find(|(n, _)| n == name)
+        {
+            return *new_id;
         }
         return root;
     }

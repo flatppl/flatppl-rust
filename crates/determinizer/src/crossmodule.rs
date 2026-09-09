@@ -639,14 +639,13 @@ fn graft_node(
             // Load-time `%assign` substitution: a `(%ref self <param>)` naming a
             // substituted submodule parameter is replaced by the host expression
             // it was bound to at `load_module`. The host node is already interned.
-            if r.ns == RefNs::SelfMod {
-                if let Some((_, host_expr)) = ctx
+            if r.ns == RefNs::SelfMod
+                && let Some((_, host_expr)) = ctx
                     .assign
                     .iter()
                     .find(|(n, _)| n.as_str() == src.resolve(r.name))
-                {
-                    return Ok(*host_expr);
-                }
+            {
+                return Ok(*host_expr);
             }
             let hr = graft_ref(host, src, r, ctx)?;
             host.alloc(Node::Ref(hr))
@@ -870,10 +869,10 @@ fn graft_binding(
     // re-export and falls through to the origin guard below unchanged.
     if let Some(src_bid) = src.binding_by_name(name_sym) {
         let rhs = src.binding(src_bid).rhs;
-        if let Some((alias, target)) = as_pure_reexport(src, rhs) {
-            if resolve_src_module_ref(ctx.bundle, src, alias, target).is_some() {
-                return graft_reexport(host, src, &name, alias, target, ctx);
-            }
+        if let Some((alias, target)) = as_pure_reexport(src, rhs)
+            && resolve_src_module_ref(ctx.bundle, src, alias, target).is_some()
+        {
+            return graft_reexport(host, src, &name, alias, target, ctx);
         }
     }
     // Origin key is COMPOSITE (`origin-path\0member-name`), matching the composite
@@ -947,10 +946,10 @@ fn graft_module_member(
     // origin rather than record a distinct origin here (which would false-collide
     // with the target). `public` (the re-exporting binding's own visibility) is not
     // used on this branch — the resolve-through carries the target's visibility.
-    if let Some((alias, target)) = as_pure_reexport(src, rhs) {
-        if resolve_src_module_ref(ctx.bundle, src, alias, target).is_some() {
-            return graft_reexport(host, src, name, alias, target, ctx);
-        }
+    if let Some((alias, target)) = as_pure_reexport(src, rhs)
+        && resolve_src_module_ref(ctx.bundle, src, alias, target).is_some()
+    {
+        return graft_reexport(host, src, name, alias, target, ctx);
     }
     // Composite origin key (`ctx.origin\0name`), consistent with `graft_binding`
     // and `graft_reexport` so the three collision guards compare like-for-like.

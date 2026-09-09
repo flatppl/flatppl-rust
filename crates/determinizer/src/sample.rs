@@ -299,18 +299,18 @@ fn lower_pushfwd_sample(
     // For a RECORD-valued variate the forward application is an auto-splatting
     // call, whose §04 correspondence rule the reducer does not enforce — check it
     // before reducing (see [`record_splat_mismatch`]).
-    if let Some(kernel) = crate::kernel::resolve_reified(m, map) {
-        if let Some(why) = record_splat_mismatch(m, value, &kernel.inputs) {
-            return Err(refuse(
-                pushfwd_node,
-                m,
-                &format!(
-                    "pushfwd's map does not correspond to its base measure's record variate \
+    if let Some(kernel) = crate::kernel::resolve_reified(m, map)
+        && let Some(why) = record_splat_mismatch(m, value, &kernel.inputs)
+    {
+        return Err(refuse(
+            pushfwd_node,
+            m,
+            &format!(
+                "pushfwd's map does not correspond to its base measure's record variate \
                      ({why}); §04 \"Calling conventions\" makes a field/argument-name mismatch a \
                      static error"
-                ),
-            ));
-        }
+            ),
+        ));
     }
     let applied = build_user_call(m, map, value);
     let reduced = crate::kernel::reduce_kernel_application(m, applied).ok_or_else(|| {
@@ -922,16 +922,14 @@ fn transitive_draw_bindings(m: &Module, root: NodeId) -> Vec<BindingId> {
             ns: RefNs::SelfMod,
             name,
         }) = m.node(id)
+            && let Some(bid) = m.binding_by_name(*name)
+            && !seen.contains(&bid)
         {
-            if let Some(bid) = m.binding_by_name(*name) {
-                if !seen.contains(&bid) {
-                    seen.push(bid);
-                    if draw_argument(m, m.binding(bid).rhs).is_some() {
-                        found.push(bid);
-                    } else {
-                        queue.push(m.binding(bid).rhs);
-                    }
-                }
+            seen.push(bid);
+            if draw_argument(m, m.binding(bid).rhs).is_some() {
+                found.push(bid);
+            } else {
+                queue.push(m.binding(bid).rhs);
             }
         }
         m.for_each_child(id, |c| queue.push(c));
@@ -1130,12 +1128,11 @@ fn referenced_draw_bindings(m: &Module, root: NodeId) -> Vec<BindingId> {
             ns: RefNs::SelfMod,
             name,
         }) = m.node(id)
+            && let Some(bid) = m.binding_by_name(*name)
+            && draw_argument(m, m.binding(bid).rhs).is_some()
+            && !found.contains(&bid)
         {
-            if let Some(bid) = m.binding_by_name(*name) {
-                if draw_argument(m, m.binding(bid).rhs).is_some() && !found.contains(&bid) {
-                    found.push(bid);
-                }
-            }
+            found.push(bid);
         }
         m.for_each_child(id, |c| queue.push(c));
     }

@@ -1483,10 +1483,10 @@ fn lower_matrix_product(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<
 /// "unsupported builtin head" for EVERY argument type, which made this guard
 /// `sum`-only; `crate::norms` wires them, so each needs the same table check.
 fn lower_sum(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitError> {
-    if let [arg] = args {
-        if matches!(e.type_of(*arg), Some(Type::Table { .. })) {
-            return Err(crate::norms::table_reduction_refusal(id, "sum"));
-        }
+    if let [arg] = args
+        && matches!(e.type_of(*arg), Some(Type::Table { .. }))
+    {
+        return Err(crate::norms::table_reduction_refusal(id, "sum"));
     }
     unary(e, id, args, Emitter::reduce_sum)
 }
@@ -2481,10 +2481,10 @@ fn lower_get_literal(
             ));
         }
     };
-    if let Some(len) = len {
-        if idx >= len {
-            return Err(EmitError::at(id, "get/get0: index out of range"));
-        }
+    if let Some(len) = len
+        && idx >= len
+    {
+        return Err(EmitError::at(id, "get/get0: index out of range"));
     }
 
     let sliced = e.slice(&v, &[idx], &[idx + 1], &[1]);
@@ -2579,13 +2579,13 @@ fn lower_in(e: &mut Emitter, id: NodeId, args: &[NodeId]) -> Result<Value, EmitE
         };
         // A literal power that disagrees with the point's own static length is a
         // type error upstream, not something to lower against one of the two.
-        if let (Node::Lit(Scalar::Int(n)), Some(len)) = (e.node(n_id), dims[0]) {
-            if *n < 0 || (*n as u64) != len {
-                return Err(EmitError::at(
-                    id,
-                    format!("'in' over cartpow({n}): point has length {len}"),
-                ));
-            }
+        if let (Node::Lit(Scalar::Int(n)), Some(len)) = (e.node(n_id), dims[0])
+            && (*n < 0 || (*n as u64) != len)
+        {
+            return Err(EmitError::at(
+                id,
+                format!("'in' over cartpow({n}): point has length {len}"),
+            ));
         }
         let set = classify_elem_set(e, id, elem_id)?;
         let per_cell = elem_membership(e, id, &v, set)?;

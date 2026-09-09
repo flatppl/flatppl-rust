@@ -143,10 +143,10 @@ fn resolve_target(
             .find(|(_, b)| b.rhs == id)
             .and_then(|(_, b)| names::def_name_range(text, span.start, module.resolve(b.name)))
     });
-    if let Some(id) = owner {
-        if let Some(t) = argument_target_at(module, text, file, id, def_name, byte_offset, None) {
-            return Ok(t);
-        }
+    if let Some(id) = owner
+        && let Some(t) = argument_target_at(module, text, file, id, def_name, byte_offset, None)
+    {
+        return Ok(t);
     }
 
     let node_id = node_at_offset_indexed(index, byte_offset).ok_or_else(unresolved)?;
@@ -455,14 +455,14 @@ fn binding_occurrences(
 
         if include_declaration && f == target.file {
             let binding = module.binding(target.bid);
-            if let Some(span) = module.span_of(binding.rhs) {
-                if let Some((start, end)) = names::def_name_range(text, span.start, &target.name) {
-                    push(NameLoc {
-                        path: path.clone(),
-                        start,
-                        end,
-                    });
-                }
+            if let Some(span) = module.span_of(binding.rhs)
+                && let Some((start, end)) = names::def_name_range(text, span.start, &target.name)
+            {
+                push(NameLoc {
+                    path: path.clone(),
+                    start,
+                    end,
+                });
             }
         }
     }

@@ -161,10 +161,10 @@ pub(crate) fn read_abi(m: &Module) -> Result<Option<Abi>, EmitError> {
 /// [`crate::modes`]'s design-doc reference) — to its element [`NodeId`]s in
 /// declared order.
 fn tuple_elems(m: &Module, rhs: NodeId) -> Vec<NodeId> {
-    if is_builtin_call(m, rhs, "tuple") {
-        if let Node::Call(c) = m.node(rhs) {
-            return c.args.to_vec();
-        }
+    if is_builtin_call(m, rhs, "tuple")
+        && let Node::Call(c) = m.node(rhs)
+    {
+        return c.args.to_vec();
     }
     vec![rhs]
 }
@@ -356,17 +356,17 @@ pub(crate) fn emit_sample_abi(
     // walk reaches the `rnginit(seed)` call itself, refusing with "unsupported
     // builtin head 'rnginit'" (NEW-C4) — the seed-to-state math is deliberately
     // out of scope, because the state arrives as an argument.
-    if let Some(sym) = rng_src_sym {
-        if let Some(bid) = m.binding_by_name(sym) {
-            e.bind(
-                m.binding(bid).rhs,
-                Value {
-                    ssa: key_name.clone(),
-                    ty: MlirTy::Key,
-                    elem: ElemKind::Real,
-                },
-            );
-        }
+    if let Some(sym) = rng_src_sym
+        && let Some(bid) = m.binding_by_name(sym)
+    {
+        e.bind(
+            m.binding(bid).rhs,
+            Value {
+                ssa: key_name.clone(),
+                ty: MlirTy::Key,
+                elem: ElemKind::Real,
+            },
+        );
     }
     for (_, binding) in m.bindings() {
         if Some(binding.name) == rng_src_sym {
@@ -455,25 +455,25 @@ fn lower_sample_output(
     out: &mut Vec<Value>,
 ) -> Result<(), EmitError> {
     let resolved = query_value_component(m, resolve_self_ref(m, node));
-    if let Node::Call(c) = m.node(resolved) {
-        if matches!(c.head, CallHead::Builtin(sym) if m.resolve(sym) == "record") {
-            let fields: Vec<NodeId> = c
-                .named
-                .iter()
-                .filter(|na| na.kind == NamedKind::Field)
-                .map(|na| na.value)
-                .collect();
-            if fields.is_empty() {
-                return Err(EmitError::at(
-                    resolved,
-                    "a record-shaped sample output with no fields contributes no result",
-                ));
-            }
-            for field in fields {
-                lower_sample_output(m, e, field, out)?;
-            }
-            return Ok(());
+    if let Node::Call(c) = m.node(resolved)
+        && matches!(c.head, CallHead::Builtin(sym) if m.resolve(sym) == "record")
+    {
+        let fields: Vec<NodeId> = c
+            .named
+            .iter()
+            .filter(|na| na.kind == NamedKind::Field)
+            .map(|na| na.value)
+            .collect();
+        if fields.is_empty() {
+            return Err(EmitError::at(
+                resolved,
+                "a record-shaped sample output with no fields contributes no result",
+            ));
         }
+        for field in fields {
+            lower_sample_output(m, e, field, out)?;
+        }
+        return Ok(());
     }
     out.push(e.lower_node(resolved)?);
     Ok(())
@@ -485,12 +485,12 @@ fn lower_sample_output(
 /// `value` slot; every other query shape (a value-terminal `get0(sample, 0)`,
 /// a `record(...)`, a bare ref) is already the value and is returned unchanged.
 fn query_value_component(m: &Module, query_rhs: NodeId) -> NodeId {
-    if let Node::Call(c) = m.node(query_rhs) {
-        if let CallHead::Builtin(sym) = c.head {
-            if m.resolve(sym) == "tuple" && c.args.len() == 2 {
-                return c.args[0];
-            }
-        }
+    if let Node::Call(c) = m.node(query_rhs)
+        && let CallHead::Builtin(sym) = c.head
+        && m.resolve(sym) == "tuple"
+        && c.args.len() == 2
+    {
+        return c.args[0];
     }
     query_rhs
 }
@@ -515,12 +515,11 @@ fn query_value_component(m: &Module, query_rhs: NodeId) -> NodeId {
 fn find_rng_source(m: &Module, outputs: &[NodeId]) -> Option<NodeId> {
     for &output in outputs {
         for sample in collect_sample_calls(m, output) {
-            if let Node::Call(c) = m.node(sample) {
-                if let Some(&rng_arg) = c.args.first() {
-                    if !derives_from_sample(m, rng_arg) {
-                        return Some(rng_arg);
-                    }
-                }
+            if let Node::Call(c) = m.node(sample)
+                && let Some(&rng_arg) = c.args.first()
+                && !derives_from_sample(m, rng_arg)
+            {
+                return Some(rng_arg);
             }
         }
     }
@@ -548,10 +547,9 @@ fn collect_sample_calls(m: &Module, root: NodeId) -> Vec<NodeId> {
             ns: RefNs::SelfMod,
             name,
         }) = m.node(id)
+            && let Some(bid) = m.binding_by_name(*name)
         {
-            if let Some(bid) = m.binding_by_name(*name) {
-                stack.push(m.binding(bid).rhs);
-            }
+            stack.push(m.binding(bid).rhs);
         }
         m.for_each_child(id, |c| stack.push(c));
     }
@@ -588,16 +586,14 @@ fn derives_from_sample(m: &Module, id: NodeId) -> bool {
         return true;
     }
     // `get`/`get0` of a literal `tuple(...)` → recurse into the projected slot.
-    if let Node::Call(tc) = m.node(container) {
-        if let CallHead::Builtin(sym) = tc.head {
-            if m.resolve(sym) == "tuple" {
-                if let Node::Lit(Scalar::Int(sel)) = m.node(index) {
-                    let idx = sel - base;
-                    if idx >= 0 && (idx as usize) < tc.args.len() {
-                        return derives_from_sample(m, tc.args[idx as usize]);
-                    }
-                }
-            }
+    if let Node::Call(tc) = m.node(container)
+        && let CallHead::Builtin(sym) = tc.head
+        && m.resolve(sym) == "tuple"
+        && let Node::Lit(Scalar::Int(sel)) = m.node(index)
+    {
+        let idx = sel - base;
+        if idx >= 0 && (idx as usize) < tc.args.len() {
+            return derives_from_sample(m, tc.args[idx as usize]);
         }
     }
     false

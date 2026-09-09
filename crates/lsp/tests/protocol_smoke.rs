@@ -84,10 +84,10 @@ fn do_open_and_drain_diags(client_conn: &Connection, uri: &str, text: &str) {
             .receiver
             .recv_timeout(Duration::from_secs(5))
             .expect("timed out waiting for publishDiagnostics");
-        if let Message::Notification(n) = &msg {
-            if n.method == lsp_types::notification::PublishDiagnostics::METHOD {
-                break;
-            }
+        if let Message::Notification(n) = &msg
+            && n.method == lsp_types::notification::PublishDiagnostics::METHOD
+        {
+            break;
         }
     }
 }
@@ -586,10 +586,10 @@ fn did_close_lets_watched_file_changes_take_over() {
             .receiver
             .recv_timeout(Duration::from_secs(5))
             .expect("timed out waiting for publishDiagnostics after didOpen");
-        if let Message::Notification(n) = &msg {
-            if n.method == lsp_types::notification::PublishDiagnostics::METHOD {
-                break;
-            }
+        if let Message::Notification(n) = &msg
+            && n.method == lsp_types::notification::PublishDiagnostics::METHOD
+        {
+            break;
         }
     }
 
@@ -627,10 +627,10 @@ fn did_close_lets_watched_file_changes_take_over() {
             .receiver
             .recv_timeout(Duration::from_secs(5))
             .expect("timed out waiting for publishDiagnostics after watched change");
-        if let Message::Notification(n) = &msg {
-            if n.method == lsp_types::notification::PublishDiagnostics::METHOD {
-                break msg;
-            }
+        if let Message::Notification(n) = &msg
+            && n.method == lsp_types::notification::PublishDiagnostics::METHOD
+        {
+            break msg;
         }
     };
     let Message::Notification(diag_note) = diag_msg else {
@@ -708,10 +708,10 @@ fn stale_did_change_is_ignored() {
             .receiver
             .recv_timeout(Duration::from_secs(5))
             .expect("timed out waiting for publishDiagnostics after didOpen v5");
-        if let Message::Notification(n) = &msg {
-            if n.method == lsp_types::notification::PublishDiagnostics::METHOD {
-                break;
-            }
+        if let Message::Notification(n) = &msg
+            && n.method == lsp_types::notification::PublishDiagnostics::METHOD
+        {
+            break;
         }
     }
 
@@ -805,10 +805,10 @@ fn did_change_burst_coalesces_into_one_publish() {
             .receiver
             .recv_timeout(Duration::from_secs(5))
             .expect("timed out waiting for didOpen publishDiagnostics");
-        if let Message::Notification(n) = &msg {
-            if n.method == lsp_types::notification::PublishDiagnostics::METHOD {
-                break;
-            }
+        if let Message::Notification(n) = &msg
+            && n.method == lsp_types::notification::PublishDiagnostics::METHOD
+        {
+            break;
         }
     }
 
@@ -834,10 +834,10 @@ fn did_change_burst_coalesces_into_one_publish() {
             .receiver
             .recv_timeout(Duration::from_millis(700))
             .expect("timed out waiting for coalesced publishDiagnostics");
-        if let Message::Notification(n) = &msg {
-            if n.method == lsp_types::notification::PublishDiagnostics::METHOD {
-                break msg;
-            }
+        if let Message::Notification(n) = &msg
+            && n.method == lsp_types::notification::PublishDiagnostics::METHOD
+        {
+            break msg;
         }
     };
     let Message::Notification(diag_note) = diag_msg else {
@@ -913,10 +913,10 @@ fn request_during_edit_does_not_return_stale_result() {
             .receiver
             .recv_timeout(Duration::from_secs(5))
             .expect("timed out waiting for didOpen publishDiagnostics");
-        if let Message::Notification(n) = &msg {
-            if n.method == lsp_types::notification::PublishDiagnostics::METHOD {
-                break;
-            }
+        if let Message::Notification(n) = &msg
+            && n.method == lsp_types::notification::PublishDiagnostics::METHOD
+        {
+            break;
         }
     }
 
@@ -1067,10 +1067,10 @@ fn published_diagnostics_carry_version() {
             .receiver
             .recv_timeout(Duration::from_secs(5))
             .expect("timed out waiting for publishDiagnostics");
-        if let Message::Notification(n) = &msg {
-            if n.method == lsp_types::notification::PublishDiagnostics::METHOD {
-                break msg;
-            }
+        if let Message::Notification(n) = &msg
+            && n.method == lsp_types::notification::PublishDiagnostics::METHOD
+        {
+            break msg;
         }
     };
     let Message::Notification(diag_note) = diag_msg else {

@@ -16,10 +16,10 @@ fn assert_comment_precedes_binding(text: &str, comment_substr: &str, binding: &s
     for (i, line) in lines.iter().enumerate() {
         if line.trim_start().starts_with('%') && line.contains(comment_substr) {
             // The next non-blank line must be the target binding.
-            if let Some(next) = lines[i + 1..].iter().find(|l| !l.trim().is_empty()) {
-                if next.trim_start().starts_with(&binding_prefix) {
-                    return; // found comment correctly attached to binding
-                }
+            if let Some(next) = lines[i + 1..].iter().find(|l| !l.trim().is_empty())
+                && next.trim_start().starts_with(&binding_prefix)
+            {
+                return; // found comment correctly attached to binding
             }
         }
     }

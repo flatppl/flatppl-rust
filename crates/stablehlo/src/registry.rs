@@ -2353,13 +2353,13 @@ fn slice_indexed_prob(
             ));
         }
     };
-    if let Some(len) = len {
-        if idx >= len {
-            return Err(EmitError::at(
-                blame,
-                "Categorical/Categorical0 logdensity: category index out of range",
-            ));
-        }
+    if let Some(len) = len
+        && idx >= len
+    {
+        return Err(EmitError::at(
+            blame,
+            "Categorical/Categorical0 logdensity: category index out of range",
+        ));
     }
     let sliced = e.slice(probs, &[idx], &[idx + 1], &[1]);
     Ok(e.reshape(&sliced, MlirTy::Scalar))

@@ -125,12 +125,11 @@ fn collect_member_calls(m: &Module) -> Vec<(NodeId, String, String)> {
             return;
         }
         seen.push(id);
-        if let Node::Call(c) = m.node(id) {
-            if let CallHead::User(callee) = c.head {
-                if let Some(hit) = member_of_callee(m, callee) {
-                    out.push((id, hit.0, hit.1));
-                }
-            }
+        if let Node::Call(c) = m.node(id)
+            && let CallHead::User(callee) = c.head
+            && let Some(hit) = member_of_callee(m, callee)
+        {
+            out.push((id, hit.0, hit.1));
         }
         for child in m.node(id).children() {
             walk(m, child, seen, out);

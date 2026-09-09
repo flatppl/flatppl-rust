@@ -90,11 +90,11 @@ fn enc_bind(items: &[Sexpr]) -> Value {
     let name = items[1].as_atom().expect("bind name is a symbol");
     let mut rest = &items[2..];
     let mut doc: Option<Value> = None;
-    if let Some(last) = rest.last() {
-        if list_head(last) == Some("%doc") {
-            doc = Some(enc_doc(last));
-            rest = &rest[..rest.len() - 1];
-        }
+    if let Some(last) = rest.last()
+        && list_head(last) == Some("%doc")
+    {
+        doc = Some(enc_doc(last));
+        rest = &rest[..rest.len() - 1];
     }
     let mut obj = Map::new();
     obj.insert("name".into(), json!(name));

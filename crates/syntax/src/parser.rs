@@ -179,10 +179,10 @@ fn collect_lhs_names(stmt: &Stmt, names: &mut Names) -> Result<()> {
     if matches!(toks.first().map(|t| &t.kind), Some(TokenKind::Name(_)))
         && matches!(toks.get(1).map(|t| &t.kind), Some(TokenKind::Colon))
     {
-        if let Some(TokenKind::Name(result)) = toks.get(2).map(|t| &t.kind) {
-            if result != "_" {
-                insert_bound_name(names, result, &toks[2])?;
-            }
+        if let Some(TokenKind::Name(result)) = toks.get(2).map(|t| &t.kind)
+            && result != "_"
+        {
+            insert_bound_name(names, result, &toks[2])?;
         }
         return Ok(());
     }
@@ -227,10 +227,9 @@ fn collect_module_name(stmt: &Stmt, names: &mut Names) {
     if matches!(toks.first().map(|t| &t.kind), Some(TokenKind::Name(_)))
         && matches!(toks.get(1).map(|t| &t.kind), Some(TokenKind::Assign))
         && (bare_builtin || qualified_builtin)
+        && let Some(TokenKind::Name(m)) = toks.first().map(|t| &t.kind)
     {
-        if let Some(TokenKind::Name(m)) = toks.first().map(|t| &t.kind) {
-            names.modules.insert(m.clone());
-        }
+        names.modules.insert(m.clone());
     }
 }
 

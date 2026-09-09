@@ -66,16 +66,16 @@ fn inline_walk(m: &mut Module, id: NodeId) -> NodeId {
         id
     };
     // Then reduce this node if it is a user call.
-    if let Node::Call(c) = m.node(id) {
-        if matches!(c.head, CallHead::User(_)) {
-            if let Some(head) = builtin_callee_head(m, id) {
-                return rebuild_with_head(m, id, head);
-            }
-            if let Some(reduced) = reduce_kernel_application(m, id) {
-                // The reduced body may itself contain further user calls
-                // (e.g. a function whose body calls another function).
-                return inline_walk(m, reduced);
-            }
+    if let Node::Call(c) = m.node(id)
+        && matches!(c.head, CallHead::User(_))
+    {
+        if let Some(head) = builtin_callee_head(m, id) {
+            return rebuild_with_head(m, id, head);
+        }
+        if let Some(reduced) = reduce_kernel_application(m, id) {
+            // The reduced body may itself contain further user calls
+            // (e.g. a function whose body calls another function).
+            return inline_walk(m, reduced);
         }
     }
     id

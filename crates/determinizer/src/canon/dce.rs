@@ -20,10 +20,10 @@ pub(crate) fn retain_reachable(m: &mut Module, roots: &[Symbol]) {
     let mut keep: HashSet<BindingId> = HashSet::new();
     let mut work: Vec<BindingId> = Vec::new();
     for &r in roots {
-        if let Some(bid) = m.binding_by_name(r) {
-            if keep.insert(bid) {
-                work.push(bid);
-            }
+        if let Some(bid) = m.binding_by_name(r)
+            && keep.insert(bid)
+        {
+            work.push(bid);
         }
     }
     // Transitive closure: for each kept binding, mark every binding it references.
@@ -32,10 +32,10 @@ pub(crate) fn retain_reachable(m: &mut Module, roots: &[Symbol]) {
         let mut names: HashSet<Symbol> = HashSet::new();
         collect_referenced_names(m, rhs, &mut names);
         for name in names {
-            if let Some(dep) = m.binding_by_name(name) {
-                if keep.insert(dep) {
-                    work.push(dep);
-                }
+            if let Some(dep) = m.binding_by_name(name)
+                && keep.insert(dep)
+            {
+                work.push(dep);
             }
         }
     }

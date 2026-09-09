@@ -3240,14 +3240,13 @@ impl<'m> Emitter<'m> {
                 ns: RefNs::Local,
                 name,
             }) = self.m.node(n)
+                && let Some(v) = local_values.get(name)
             {
-                if let Some(v) = local_values.get(name) {
-                    self.bind(n, v.clone());
-                }
-                // A `%local` not among the declared inputs is a malformed
-                // reification; leaving it unbound lets the body walk hit
-                // `lower_ref`'s `Local` refusal — refuse-don't-mislower.
+                self.bind(n, v.clone());
             }
+            // A `%local` not among the declared inputs is a malformed
+            // reification; leaving it unbound lets the body walk hit
+            // `lower_ref`'s `Local` refusal — refuse-don't-mislower.
         }
 
         let result = self.lower_node(body);

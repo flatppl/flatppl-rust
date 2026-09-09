@@ -668,12 +668,12 @@ fn resolve_standard(
         .ok_or_else(|| format!("standard module `{path}` not found"))?;
 
     // Validate the requested version (when the call supplied one).
-    if let Some(requested) = &directive.version {
-        if requested != known_version {
-            return Err(format!(
-                "standard module `{path}` has unknown version `{requested}` (catalogue provides `{known_version}`)"
-            ));
-        }
+    if let Some(requested) = &directive.version
+        && requested != known_version
+    {
+        return Err(format!(
+            "standard module `{path}` has unknown version `{requested}` (catalogue provides `{known_version}`)"
+        ));
     }
 
     let (sig, degraded) = catalogues

@@ -745,10 +745,10 @@ fn inline_allows(source: &str) -> Result<Vec<flatppl_lint::RuleId>, usize> {
         if line.starts_with(LEGACY_DIRECTIVE) {
             return Err(idx + 1);
         }
-        if let Some(rest) = line.strip_prefix(ALLOW_DIRECTIVE) {
-            if let Ok(rule) = rest.trim().parse() {
-                out.push(rule);
-            }
+        if let Some(rest) = line.strip_prefix(ALLOW_DIRECTIVE)
+            && let Ok(rule) = rest.trim().parse()
+        {
+            out.push(rule);
         }
     }
     Ok(out)

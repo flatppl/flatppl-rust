@@ -109,12 +109,11 @@ pub fn ref_name_range(
 ///   operator is also what rejects a parameter that shares the function's name
 ///   (`f(f) = …`, where the parameter is followed by `)`).
 pub fn def_name_range(text: &str, rhs_start: u32, name: &str) -> Option<(u32, u32)> {
-    if let Some((s, e)) = ident_at(text, rhs_start) {
-        if &text[s as usize..e as usize] == name
-            && matches!(next_significant(text, e), Some((_, b'~')))
-        {
-            return Some((s, e));
-        }
+    if let Some((s, e)) = ident_at(text, rhs_start)
+        && &text[s as usize..e as usize] == name
+        && matches!(next_significant(text, e), Some((_, b'~')))
+    {
+        return Some((s, e));
     }
     let window = text.get(..rhs_start as usize)?;
     // Most bindings have just `name = ` before the RHS on their line. That
@@ -354,10 +353,10 @@ pub fn argument_decl_ranges(
 ) -> Vec<(String, u32, u32)> {
     // A named function may itself return a lambda, whose list then starts at
     // the RHS span. Its own header must take precedence over that inner list.
-    if let Some((_, name_end)) = def_name {
-        if let Some(list) = ident_list_at(text, name_end) {
-            return list;
-        }
+    if let Some((_, name_end)) = def_name
+        && let Some(list) = ident_list_at(text, name_end)
+    {
+        return list;
     }
     // Lambda: the argument list is at the start of the reification's own span.
     ident_list_at(text, reif_start).unwrap_or_default()

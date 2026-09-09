@@ -370,10 +370,10 @@ pub fn run_on(
                         // (network reordering, replayed buffers). Applying it would
                         // resurrect older text; ignore it entirely.
                         let new_version = p.text_document.version;
-                        if let Some(&prev) = doc_versions.get(&uri_str) {
-                            if new_version < prev {
-                                continue;
-                            }
+                        if let Some(&prev) = doc_versions.get(&uri_str)
+                            && new_version < prev
+                        {
+                            continue;
                         }
                         doc_versions.insert(uri_str.clone(), new_version);
                         release_stale_requests(&connection, &pool, &mut pending)?;
@@ -747,10 +747,10 @@ fn answer(
     pending: &mut HashSet<RequestId>,
     reply: Reply,
 ) -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
-    if let Some(id) = reply.response_id() {
-        if !pending.remove(id) {
-            return Ok(()); // already answered by another path
-        }
+    if let Some(id) = reply.response_id()
+        && !pending.remove(id)
+    {
+        return Ok(()); // already answered by another path
     }
     match reply {
         Reply::Ready(msg) => connection.out.send(msg)?,
@@ -1159,15 +1159,16 @@ fn percent_decode(s: &str) -> String {
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let (Some(hi), Some(lo)) = (
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (
                 (bytes[i + 1] as char).to_digit(16),
                 (bytes[i + 2] as char).to_digit(16),
-            ) {
-                out.push((hi * 16 + lo) as u8);
-                i += 3;
-                continue;
-            }
+            )
+        {
+            out.push((hi * 16 + lo) as u8);
+            i += 3;
+            continue;
         }
         out.push(bytes[i]);
         i += 1;
