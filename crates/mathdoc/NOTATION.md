@@ -24,9 +24,9 @@ the rules stated here.
   than code (`M^{⊗n}` for `iid`, `f_* M` for `pushfwd`), but every rendering is
   the definition of the construct it stands for, never a guess at what the
   author meant.
-- **A row never goes blank.** A construct the lowering cannot render prints as
-  its canonical FlatPPL text in monospace, with a diagnostic naming the
-  construct.
+- **A row never goes blank.** A right-hand side the lowering cannot render
+  prints as its canonical FlatPPL text in monospace, with a diagnostic saying
+  why (see "Fallback").
 
 ## Document structure
 
@@ -41,12 +41,15 @@ the rules stated here.
 - Consecutive rows with no prose between them form one aligned block (aligned on
   the relation symbol). Each row is labelled with its binding name.
 - Plain `#` comments do not exist after parsing and never appear.
-- Parser-generated bindings (`__0x…`, from decomposition) fold into the
-  statement they serve: `a, b, c ~ M` is one row `(a, b, c) ∼ M`; a
-  `disintegrate` decomposition is one row `(K, ν) = disintegrate_{sel}(M)`.
-  Author-named `_private` bindings are ordinary rows.
+- Parser-generated bindings (`__0x…`) have no row of their own. A decomposition
+  folds into the statement it serves: `a, b, c ~ M` is one row `(a, b, c) ∼ M`;
+  a `disintegrate` decomposition is one row `(K, ν) = disintegrate_{sel}(M)`.
+  A partial decomposition `p, _ = v` inlines the source: `p = v_1`. A discarded
+  value `_ = e` renders nothing. Author-named `_private` bindings are ordinary
+  rows.
 - Arrays beyond twelve entries print as `x ∈ ℝ^{n}` with an annotation and the
-  values in a data appendix; a `table(…)` literal is a table.
+  values in a data appendix. A `table(…)` literal prints as `table(c = …)` with
+  its columns (typesetting it as a table is planned).
 - A generated notation appendix lists parameters (`elementof`), external inputs,
   random variables (`draw`) and the parametrisation of every distribution used,
   read off the module.
@@ -102,7 +105,7 @@ the same rules (`.mu` → μ).
 
 | FlatPPL | Math |
 |---|---|
-| `3`, `1.5`, `1e-3`, `true`, `"s"` | 3, 1.5, 1·10⁻³, true, "s" |
+| `3`, `1.5`, `1e-6`, `true`, `"s"` | 3, 1.5, 1·10⁻⁶, true, "s" (powers of ten below 10⁻⁴ and from 10¹⁶) |
 | `pi`, `inf`, `im` | π, ∞, i (upright) |
 | `[a, b, c]`, `vector(…)` | (a, b, c) |
 | `record(a = 1, b = x)` | (a = 1, b = x) |
@@ -115,7 +118,7 @@ the same rules (`.mu` → μ).
 | `cartpow(S, n)`, `cartpow(S, [m, n])` | Sⁿ, S^{m×n} |
 | `cartprod(S, T)`, `cartprod(a = S, b = T)` | S × T, {a ∈ S, b ∈ T} |
 | `stdsimplex(n)` | Δ^{n−1} |
-| `fixed(x)` | x, annotation "fixed" |
+| `c = fixed(x)` | c = x, annotation "fixed"; inside a record `fixed(x)` stays in roman |
 
 ## Operators and functions
 
@@ -171,16 +174,18 @@ range comes from the typed module: a named size where the source gives one
 | `normalize(M)`, `totalmass(M)` | normalize(M), totalmass(M) |
 | `truncate(M, S)` | M\|_S |
 | `pushfwd(f, M)`, `locscale(M, a, b)` | f_* M, a + b · M |
-| `joint(M1, M2)`, `joint(a = M1, b = M2)` | M₁ ⊗ M₂, M₁(da) ⊗ M₂(db) |
+| `joint(M1, M2)`, `joint(a = M1, b = M2)` | M₁ ⊗ M₂, M₁(da) ⊗ M₂(db) — only when no component is stochastic or reifies a draw (§06: `joint` retains shared stochastic ancestors and is then not a product); otherwise joint(…) in roman |
 | `relabel(M, ["x"])` | M(dx) |
 | `lawof(x)`, `lawof(record(a = a, b = b))` | Law(x), Law(a, b) |
-| `kernelof(x, p = a)` as an expression | p ↦ Law(x \| p) |
-| `functionof(e, p = a)` as an expression | p ↦ e |
+| `kernelof(x, p = a)` as an expression | p ↦ Law(x \| p); with no inputs, Law(x) |
+| `functionof(e, p = a)` as an expression | p ↦ e; with no inputs, e |
+| `F = functionof(e)` with no inputs | F() = e |
 | `densityof(M, x)`, `logdensityof(M, x)` | p_M(x), log p_M(x) |
-| `likelihoodof(K, data)` as an expression | p_K(data \| ·) |
+| `likelihoodof(K, data)` as an expression | p_K(data \| inputs); with no inputs, p_K(data) |
 | `joint_likelihood(L1, L2)` | L₁ · L₂ |
 | `bayesupdate(L, prior)` | L · prior |
-| `restrict(M, record(a = v))` | M\|_{a = v} |
+| `restrict(M, record(a = v))` | M(· \| a = v) — the unnormalised conditional, distinct from `truncate`'s M\|_S |
+| a keyword spelling of a measure operator (`bayesupdate(prior = …, L = …)`) | the construct name in roman with `name = value` arguments |
 | `kchain`, `jointchain`, `markovchain`, `kscan`, `ksuperpose`, `disintegrate`, `bijection`, `PoissonProcess`, … | the construct name in roman with its arguments |
 
 A record whose fields are references to bindings of the same name prints as the
@@ -197,7 +202,11 @@ list of those symbols (`Law(μ, τ, θ)`); any other field prints as `name = val
 
 ## Fallback
 
-A node the lowering does not handle prints as its canonical FlatPPL text in
-monospace, and the binding carries a diagnostic naming the construct. A binding
-whose inference failed still renders structurally; only the typed features
-(index ranges, kernel input lists, the notation appendix) degrade.
+Every construct has a rendering (unknown builtins print in roman), so the
+fallback is reached on two conditions only: a right-hand side nested deeper than
+`flatppl_core::DEFAULT_MAX_DEPTH` levels before or after lowering (a
+`superpose` of 200 terms folds into a 200-deep chain), or a bare hole `_`
+outside `fn(…)`. The row then shows the binding's canonical FlatPPL text in
+monospace and carries a diagnostic saying why. A binding whose inference failed
+still renders structurally; only the typed features (index ranges, kernel input
+lists, the `joint` independence test, the notation appendix) degrade.

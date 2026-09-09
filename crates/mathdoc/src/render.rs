@@ -31,11 +31,15 @@ pub struct BindingRender {
     pub mathml: String,
     /// The statement tree, for document assembly.
     pub statement: Statement,
-    /// Bindings the fragment refers to, left-hand side first.
+    /// The other bindings the row refers to (its own `names` excluded), in
+    /// order of appearance, left-hand side first.
     pub refs: Vec<String>,
     /// Source byte range of the binding's right-hand side, when known.
     pub loc: Option<(u32, u32)>,
     pub annotation: Option<String>,
+    /// The row shows a membership in place of a long literal array; the
+    /// values belong in a data appendix.
+    pub elided: bool,
     /// The binding's doc-comment, when it has one.
     pub doc: Option<Doc>,
 }
@@ -68,6 +72,7 @@ pub fn render(module: &Module) -> Rendering {
             kind,
             statement,
             annotation,
+            elided,
             diagnostics: row_diags,
         } = row;
         let name = names[0].clone();
@@ -78,9 +83,11 @@ pub fn render(module: &Module) -> Rendering {
             });
         }
         let b = module.binding(binding);
+        let mut refs = statement.refs();
+        refs.retain(|r| !names.contains(r));
         bindings.push(BindingRender {
             mathml: mathml::fragment(&name, &statement),
-            refs: statement.refs(),
+            refs,
             loc: module.span_of(b.rhs).map(|s| (s.start, s.end)),
             doc: b.doc.clone(),
             name,
@@ -88,6 +95,7 @@ pub fn render(module: &Module) -> Rendering {
             kind,
             statement,
             annotation,
+            elided,
         });
     }
     Rendering {
@@ -262,18 +270,16 @@ fn load_module_literals(module: &Module) -> Vec<String> {
 }
 
 /// The binding whose right-hand side contains `node`, by name.
-fn owning_binding(module: &Module, node: flatppl_core::NodeId) -> Option<String> {
-    fn contains(module: &Module, root: flatppl_core::NodeId, node: flatppl_core::NodeId) -> bool {
-        if root == node {
-            return true;
-        }
-        let mut found = false;
-        module.for_each_child(root, |c| {
-            if !found && contains(module, c, node) {
-                found = true;
+fn owning_binding(module: &Module, node: NodeId) -> Option<String> {
+    fn contains(module: &Module, root: NodeId, node: NodeId) -> bool {
+        let mut stack = vec![root];
+        while let Some(n) = stack.pop() {
+            if n == node {
+                return true;
             }
-        });
-        found
+            module.for_each_child(n, |c| stack.push(c));
+        }
+        false
     }
     module
         .bindings()
@@ -299,9 +305,14 @@ mod tests {
         );
         assert_eq!(mu.doc.as_ref().map(|d| d.lines.len()), Some(1));
         assert!(mu.loc.is_some());
+        assert!(mu.refs.is_empty(), "a row does not refer to itself");
         let x = &r.bindings[1];
-        assert_eq!(x.refs, vec!["x", "mu"]);
-        assert_eq!(r.bindings[2].kind, Kind::Callable);
+        assert_eq!(x.refs, vec!["mu"]);
+        let k = &r.bindings[2];
+        assert_eq!(k.kind, Kind::Callable);
+        // `K(μ) = x`: the parameter on the left is a reference, the row's own
+        // name is not.
+        assert_eq!(k.refs, vec!["mu", "x"]);
     }
 
     #[test]

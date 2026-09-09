@@ -10,12 +10,19 @@
 //! reification being lowered — a body reference to a boundary node prints as
 //! its input name) and **index letters** (fresh per statement, skipping every
 //! name the module binds).
+//!
+//! Nesting is bounded by [`flatppl_core::DEFAULT_MAX_DEPTH`] at both ends: a
+//! right-hand side nested deeper than that is not lowered at all, and a lowered
+//! statement that ends up deeper (a 200-term `superpose` folds into a 200-deep
+//! chain) is discarded; either way the row shows the binding's source text
+//! with a diagnostic. Every printer over a [`Statement`] may therefore recurse
+//! freely.
 
 use std::collections::{HashMap, HashSet};
 
 use flatppl_core::{
-    BindingId, Call, CallHead, Dim, Inputs, Module, Node, NodeId, Ref, RefNs, Scalar, Symbol, Type,
-    Variance,
+    BindingId, Call, CallHead, DEFAULT_MAX_DEPTH, Dim, Inputs, Module, Node, NodeId, Phase, Ref,
+    RefNs, Scalar, Symbol, Type, Variance,
 };
 
 use crate::ast::{BigOp, BinOp, Fence, Math, Op, Rel, Statement, Sym};
@@ -60,35 +67,40 @@ pub struct Row {
     pub statement: Statement,
     /// A short annotation beside the row (`external input`, `120 values`, …).
     pub annotation: Option<String>,
+    /// The row shows a membership in place of a long literal array whose
+    /// values belong in a data appendix ([`Lowerer::full_value`]).
+    pub elided: bool,
     /// Constructs this row could not render and printed as source text.
     pub diagnostics: Vec<String>,
 }
 
 /// Lower every binding of `module` in source order.
+///
+/// Parser-generated (synthetic) bindings get no row of their own: a
+/// decomposition whose projections cover positions `1..n` (`n ≥ 2`) renders as
+/// one tuple row, every other use of a synthetic binding is inlined where it
+/// is referenced, and an unreferenced one (`_ = expr`) renders nothing.
 pub fn lower_module(module: &Module) -> Vec<Row> {
     let mut lowerer = Lowerer::new(module);
     let groups = decomposition_groups(module);
-    let mut folded: HashSet<BindingId> = groups.keys().copied().collect();
     let mut done: HashSet<BindingId> = HashSet::new();
     let mut rows = Vec::new();
     for (id, binding) in module.bindings() {
-        if module.resolve(binding.name) == "flatppl_compat" || folded.contains(&id) {
+        if module.resolve(binding.name) == "flatppl_compat" || binding.synthetic {
             continue;
         }
         if done.contains(&id) {
             continue;
         }
-        // A consumer of a decomposition group renders the whole group once.
-        if let Some((source_id, (source_node, consumers))) = groups
-            .iter()
-            .find(|(_, (_, c))| c.iter().any(|(_, b)| *b == id))
+        // A consumer of a complete decomposition renders the whole group once.
+        if let Some((source_node, consumers)) = groups
+            .values()
+            .find(|(_, c)| c.iter().any(|(_, b)| *b == id))
         {
-            let consumers = consumers.clone();
-            for (_, b) in &consumers {
+            for (_, b) in consumers {
                 done.insert(*b);
             }
-            folded.remove(source_id);
-            rows.push(lowerer.decomposition_row(*source_node, &consumers));
+            rows.push(lowerer.decomposition_row(*source_node, consumers));
             continue;
         }
         rows.push(lowerer.row(id));
@@ -96,47 +108,53 @@ pub fn lower_module(module: &Module) -> Vec<Row> {
     rows
 }
 
-/// Synthetic decomposition sources → their consumers `(position, binding)`,
-/// sorted by position. A synthetic binding is a decomposition source when every
-/// reference to it is a `get(<ref>, <int>)` projection binding.
+/// Synthetic decomposition sources whose projections cover positions
+/// `1..n` for some `n ≥ 2` → their consumers `(position, binding)` in position
+/// order. A projection is a binding `get(<ref to the source>, <int>)`.
 fn decomposition_groups(module: &Module) -> HashMap<BindingId, (NodeId, Vec<(i64, BindingId)>)> {
-    let mut groups: HashMap<BindingId, (NodeId, Vec<(i64, BindingId)>)> = HashMap::new();
+    let mut groups = HashMap::new();
     for (id, binding) in module.bindings() {
         if !binding.synthetic {
             continue;
         }
-        let consumers: Vec<(i64, BindingId)> = module
+        let mut consumers: Vec<(i64, BindingId)> = module
             .bindings()
-            .filter_map(|(cid, c)| {
-                let Node::Call(call) = module.node(c.rhs) else {
-                    return None;
-                };
-                let CallHead::Builtin(head) = call.head else {
-                    return None;
-                };
-                if module.resolve(head) != "get" || call.args.len() != 2 {
-                    return None;
-                }
-                let Node::Ref(r) = module.node(call.args[0]) else {
-                    return None;
-                };
-                if r.ns != RefNs::SelfMod || r.name != binding.name {
-                    return None;
-                }
-                match module.node(call.args[1]) {
-                    Node::Lit(Scalar::Int(k)) => Some((*k, cid)),
-                    _ => None,
-                }
-            })
+            .filter_map(|(cid, c)| projection_of(module, c.rhs, binding.name).map(|k| (k, cid)))
             .collect();
-        if consumers.is_empty() {
-            continue;
-        }
-        let mut consumers = consumers;
         consumers.sort_by_key(|(k, _)| *k);
-        groups.insert(id, (binding.rhs, consumers));
+        let complete = consumers.len() >= 2
+            && consumers
+                .iter()
+                .enumerate()
+                .all(|(i, (k, _))| *k == i as i64 + 1);
+        if complete {
+            groups.insert(id, (binding.rhs, consumers));
+        }
     }
     groups
+}
+
+/// `get(<ref to source>, k)` → `k`.
+fn projection_of(module: &Module, rhs: NodeId, source: Symbol) -> Option<i64> {
+    let Node::Call(call) = module.node(rhs) else {
+        return None;
+    };
+    let CallHead::Builtin(head) = call.head else {
+        return None;
+    };
+    if module.resolve(head) != "get" || call.args.len() != 2 {
+        return None;
+    }
+    let Node::Ref(r) = module.node(call.args[0]) else {
+        return None;
+    };
+    if r.ns != RefNs::SelfMod || r.name != source {
+        return None;
+    }
+    match module.node(call.args[1]) {
+        Node::Lit(Scalar::Int(k)) => Some(*k),
+        _ => None,
+    }
 }
 
 /// A reification parameter in scope: the node it stands for and the name it
@@ -157,6 +175,16 @@ pub struct Lowerer<'m> {
     bound: HashSet<String>,
     /// Index letters handed out for the statement being lowered.
     indices: Vec<String>,
+    /// Synthetic bindings being inlined, so a malformed self-reference
+    /// prints as a name rather than recursing.
+    inlining: Vec<BindingId>,
+}
+
+/// What a binding's right-hand side lowered to.
+struct Lowered {
+    statement: Statement,
+    annotation: Option<String>,
+    elided: bool,
 }
 
 impl<'m> Lowerer<'m> {
@@ -171,6 +199,7 @@ impl<'m> Lowerer<'m> {
             diagnostics: Vec::new(),
             bound,
             indices: Vec::new(),
+            inlining: Vec::new(),
         }
     }
 
@@ -182,13 +211,25 @@ impl<'m> Lowerer<'m> {
         self.diagnostics.clear();
         let binding = self.m.binding(id);
         let name = self.m.resolve(binding.name).to_string();
-        let (statement, annotation) = self.statement(&name, binding.rhs);
+        let mut lowered = if too_deep(self.m, binding.rhs) {
+            None
+        } else {
+            Some(self.statement(&name, binding.rhs))
+        };
+        if lowered
+            .as_ref()
+            .is_some_and(|l| l.statement.depth() > DEFAULT_MAX_DEPTH)
+        {
+            lowered = None;
+        }
+        let lowered = lowered.unwrap_or_else(|| self.source_fallback(id, &name));
         Row {
             binding: id,
             names: vec![name],
             kind: self.kind(binding.rhs),
-            statement,
-            annotation,
+            statement: lowered.statement,
+            annotation: lowered.annotation,
+            elided: lowered.elided,
             diagnostics: std::mem::take(&mut self.diagnostics),
         }
     }
@@ -202,18 +243,42 @@ impl<'m> Lowerer<'m> {
             .map(|(_, b)| self.m.resolve(self.m.binding(*b).name).to_string())
             .collect();
         let lhs = Math::paren(names.iter().map(|n| Math::binding(n)).collect());
-        let (rel, rhs) = match self.m.node(source) {
-            Node::Call(call) if self.head_is(call, "draw") && call.args.len() == 1 => {
-                (Rel::Sim, self.expr(call.args[0]))
-            }
-            _ => (Rel::Eq, self.expr(source)),
+        let mut statement = if too_deep(self.m, source) {
+            None
+        } else {
+            let (rel, rhs) = match self.m.node(source) {
+                Node::Call(call) if self.head_is(call, "draw") && call.args.len() == 1 => {
+                    (Rel::Sim, self.expr(call.args[0]))
+                }
+                _ => (Rel::Eq, self.expr(source)),
+            };
+            Some(Statement {
+                lhs: lhs.clone(),
+                rel,
+                rhs,
+            })
         };
+        if statement
+            .as_ref()
+            .is_some_and(|s| s.depth() > DEFAULT_MAX_DEPTH)
+        {
+            statement = None;
+        }
+        let statement = statement.unwrap_or_else(|| {
+            self.diagnostics.push(too_deep_message(&names.join(", ")));
+            Statement {
+                lhs,
+                rel: Rel::Eq,
+                rhs: Math::Code(self.source_text(consumers[0].1)),
+            }
+        });
         Row {
             binding: consumers[0].1,
             names,
             kind: self.kind(source),
-            statement: Statement { lhs, rel, rhs },
+            statement,
             annotation: None,
+            elided: false,
             diagnostics: std::mem::take(&mut self.diagnostics),
         }
     }
@@ -221,7 +286,51 @@ impl<'m> Lowerer<'m> {
     /// The full value of a binding whose row elided it (the data appendix).
     pub fn full_value(&mut self, id: BindingId) -> Math {
         self.indices.clear();
-        self.expr(self.m.binding(id).rhs)
+        let rhs = self.m.binding(id).rhs;
+        if too_deep(self.m, rhs) {
+            return Math::Code(self.source_text(id));
+        }
+        let value = self.expr(rhs);
+        if value.depth() > DEFAULT_MAX_DEPTH {
+            return Math::Code(self.source_text(id));
+        }
+        value
+    }
+
+    /// A row that shows the binding's source text because its expression is
+    /// too deeply nested to lower.
+    fn source_fallback(&mut self, id: BindingId, name: &str) -> Lowered {
+        self.diagnostics.push(too_deep_message(name));
+        Lowered {
+            statement: Statement {
+                lhs: Math::binding(name),
+                rel: Rel::Eq,
+                rhs: Math::Code(self.source_text(id)),
+            },
+            annotation: None,
+            elided: false,
+        }
+    }
+
+    /// The canonical FlatPPL text of a binding's right-hand side.
+    fn source_text(&self, id: BindingId) -> String {
+        let name = self.m.resolve(self.m.binding(id).name);
+        let mut only = self.m.clone();
+        let keep: HashSet<BindingId> = [id].into_iter().collect();
+        only.retain_bindings(&keep);
+        let text = flatppl_syntax::print(&only);
+        // Drop doc-comment lines and the `name =` / `name ~` prefix.
+        let body: Vec<&str> = text
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('%'))
+            .collect();
+        let joined = body.join("\n");
+        let trimmed = joined.trim();
+        let rest = trimmed
+            .strip_prefix(name)
+            .and_then(|r| r.strip_prefix(" = ").or_else(|| r.strip_prefix(" ~ ")))
+            .unwrap_or(trimmed);
+        rest.to_string()
     }
 
     fn kind(&self, rhs: NodeId) -> Kind {
@@ -277,69 +386,97 @@ impl<'m> Lowerer<'m> {
     }
 
     /// `name = rhs` as a statement, with the statement forms of `NOTATION.md`.
-    fn statement(&mut self, name: &str, rhs: NodeId) -> (Statement, Option<String>) {
+    fn statement(&mut self, name: &str, rhs: NodeId) -> Lowered {
         let lhs = Math::binding(name);
+        let plain = |this: &mut Self, lhs: Math| Lowered {
+            statement: eq(lhs, this.expr(rhs)),
+            annotation: None,
+            elided: false,
+        };
         let Node::Call(call) = self.m.node(rhs) else {
-            return (eq(lhs, self.expr(rhs)), None);
+            return plain(self, lhs);
         };
         let Some(head) = self.head_name(call).map(str::to_string) else {
-            return (eq(lhs, self.expr(rhs)), None);
+            return plain(self, lhs);
         };
         match head.as_str() {
             "elementof" | "external" if call.args.len() == 1 => {
                 let set = self.expr(call.args[0]);
-                let annotation = (head == "external").then(|| "external input".to_string());
-                (
-                    Statement {
+                Lowered {
+                    statement: Statement {
                         lhs,
                         rel: Rel::In,
                         rhs: set,
                     },
-                    annotation,
-                )
+                    annotation: (head == "external").then(|| "external input".to_string()),
+                    elided: false,
+                }
             }
             "draw" if call.args.len() == 1 => {
                 let measure = self.expr(call.args[0]);
-                (
-                    Statement {
+                Lowered {
+                    statement: Statement {
                         lhs,
                         rel: Rel::Sim,
                         rhs: measure,
                     },
-                    None,
-                )
+                    annotation: None,
+                    elided: false,
+                }
             }
-            "functionof" | "kernelof" => self.reification_statement(name, rhs, call, &head),
-            "likelihoodof" if call.args.len() == 2 => {
-                let inputs = self.callable_inputs(rhs);
-                let lhs = match &inputs {
-                    Some(inputs) if !inputs.is_empty() => Math::apply(lhs, inputs.clone()),
-                    _ => lhs,
+            "fixed" if call.args.len() == 1 && call.named.is_empty() => {
+                let value = self.expr(call.args[0]);
+                Lowered {
+                    statement: eq(lhs, value),
+                    annotation: Some("fixed".to_string()),
+                    elided: false,
+                }
+            }
+            "functionof" | "kernelof" if !call.args.is_empty() => {
+                let statement = self.reification_statement(name, rhs, call, &head);
+                Lowered {
+                    statement,
+                    annotation: None,
+                    elided: false,
+                }
+            }
+            "likelihoodof" if call.args.len() == 2 && call.named.is_empty() => {
+                let inputs = self.callable_inputs(rhs).unwrap_or_default();
+                let lhs = if inputs.is_empty() {
+                    lhs
+                } else {
+                    Math::apply(lhs, inputs.clone())
                 };
-                let rhs = self.likelihood(call.args[0], call.args[1], inputs.as_deref());
-                (eq(lhs, rhs), None)
+                let rhs = self.likelihood(call.args[0], call.args[1], &inputs);
+                Lowered {
+                    statement: eq(lhs, rhs),
+                    annotation: None,
+                    elided: false,
+                }
             }
             "aggregate" | "metricsum" if call.args.len() == 3 => {
-                let (lhs_indices, body, annotation) = self.aggregation(call, &head);
-                let lhs = match lhs_indices {
-                    Some(idx) => idx(lhs),
-                    None => lhs,
-                };
-                (eq(lhs, body), annotation)
+                let agg = self.aggregation(call, &head);
+                let lhs = decorate_with_axes(lhs, &agg.out_axes);
+                Lowered {
+                    statement: eq(lhs, agg.body),
+                    annotation: agg.annotation,
+                    elided: false,
+                }
             }
             "vector" if call.args.len() > INLINE_ARRAY_LIMIT && self.all_literals(call) => {
                 let n = call.args.len();
                 let set = self.literal_array_set(call, rhs);
-                (
-                    Statement {
+                Lowered {
+                    statement: Statement {
                         lhs,
                         rel: Rel::In,
                         rhs: set,
                     },
-                    Some(format!("{n} values, see the data appendix")),
-                )
+                    annotation: Some(format!("{n} values, see the data appendix")),
+                    elided: true,
+                }
             }
-            _ => (eq(lhs, self.expr(rhs)), None),
+            _ => plain(self, lhs),
         }
     }
 
@@ -366,7 +503,10 @@ impl<'m> Lowerer<'m> {
             _ => {
                 let all_int = call.args.iter().all(|a| match self.m.node(*a) {
                     Node::Lit(Scalar::Int(_)) => true,
-                    Node::Call(c) => matches!(self.m.node(c.args[0]), Node::Lit(Scalar::Int(_))),
+                    Node::Call(c) => c
+                        .args
+                        .first()
+                        .is_some_and(|x| matches!(self.m.node(*x), Node::Lit(Scalar::Int(_)))),
                     _ => false,
                 });
                 Math::Sym(if all_int { Sym::Integers } else { Sym::Reals })
@@ -378,19 +518,19 @@ impl<'m> Lowerer<'m> {
     // ── reifications ───────────────────────────────────────────────────────
 
     /// `F = functionof(e, …)` → `F(params) = e`; `K = kernelof(x, …)` →
-    /// `K(params) = Law(x | params)`.
+    /// `K(params) = Law(x | params)`. A reification with no parameters is
+    /// `F() = e`.
     fn reification_statement(
         &mut self,
         name: &str,
         node: NodeId,
         call: &Call,
         head: &str,
-    ) -> (Statement, Option<String>) {
+    ) -> Statement {
         let Some(params) = self.reification_params(node, call) else {
             // Unfilled `%autoinputs`: the boundary is unknown.
             let body = self.expr(call.args[0]);
-            let rhs = Math::call(head, vec![body]);
-            return (eq(Math::binding(name), rhs), None);
+            return eq(Math::binding(name), Math::call(head, vec![body]));
         };
         self.scopes.push(params.clone());
         let param_maths: Vec<Math> = params.iter().map(|p| self.param_math(p)).collect();
@@ -398,13 +538,14 @@ impl<'m> Lowerer<'m> {
         let rhs = if head == "kernelof" {
             self.law_given(call.args[0], &param_maths)
         } else {
-            self.reified_body(call.args[0])
+            self.expr(call.args[0])
         };
         self.scopes.pop();
-        (eq(lhs, rhs), None)
+        eq(lhs, rhs)
     }
 
-    /// A reification in expression position: `params ↦ body`.
+    /// A reification in expression position: `params ↦ body`, or the body
+    /// alone when it has no parameters.
     fn reification_expr(&mut self, node: NodeId, call: &Call, head: &str) -> Math {
         let Some(params) = self.reification_params(node, call) else {
             let body = self.expr(call.args[0]);
@@ -415,15 +556,14 @@ impl<'m> Lowerer<'m> {
         let body = if head == "kernelof" {
             self.law_given(call.args[0], &param_maths)
         } else {
-            self.reified_body(call.args[0])
+            self.expr(call.args[0])
         };
         self.scopes.pop();
-        let lhs = if param_maths.len() == 1 {
-            param_maths.into_iter().next().unwrap()
-        } else {
-            Math::paren(param_maths)
-        };
-        Math::relation(lhs, Rel::MapsTo, body)
+        match param_maths.len() {
+            0 => body,
+            1 => Math::relation(param_maths.into_iter().next().unwrap(), Rel::MapsTo, body),
+            _ => Math::relation(Math::paren(param_maths), Rel::MapsTo, body),
+        }
     }
 
     /// The parameters of a reification: authored boundary entries, or the
@@ -454,14 +594,8 @@ impl<'m> Lowerer<'m> {
         Math::ident(&p.name, p.linked.then_some(p.name.as_str()))
     }
 
-    /// The body of a `functionof`: by reference when the output is a named
-    /// binding that is not itself a parameter, else lowered in scope.
-    fn reified_body(&mut self, output: NodeId) -> Math {
-        self.expr(output)
-    }
-
     /// `Law(x | params)` for a kernel body, with `x` flattened by the record
-    /// rule.
+    /// rule; no bar when there are no parameters.
     fn law_given(&mut self, output: NodeId, params: &[Math]) -> Math {
         let mut items = self.law_items(output);
         if !params.is_empty() {
@@ -484,13 +618,12 @@ impl<'m> Lowerer<'m> {
         vec![self.expr(output)]
     }
 
-    /// `p_K(data | inputs)` — the likelihood body.
-    fn likelihood(&mut self, kernel: NodeId, data: NodeId, inputs: Option<&[Math]>) -> Math {
+    /// `p_K(data | inputs)` — the likelihood body; no bar when the kernel has
+    /// no inputs.
+    fn likelihood(&mut self, kernel: NodeId, data: NodeId, inputs: &[Math]) -> Math {
         let k = self.expr(kernel);
         let mut items = self.law_items(data);
-        if let Some(inputs) = inputs
-            && !inputs.is_empty()
-        {
+        if !inputs.is_empty() {
             items.push(Math::Op(Op::Bar));
             items.extend(intersperse_commas(inputs.to_vec()));
         }
@@ -536,7 +669,11 @@ impl<'m> Lowerer<'m> {
                 self.constant(name)
             }
             Node::Ref(r) => self.reference(*r),
-            Node::Hole => Math::Code("_".into()),
+            Node::Hole => {
+                self.diagnostics
+                    .push("a bare hole `_` outside `fn(…)`; shown as source text".to_string());
+                Math::Code("_".into())
+            }
             Node::Axis(axis) => Math::ident(self.m.resolve(axis.name), None),
             Node::Call(call) => self.call(id, call),
         }
@@ -563,7 +700,7 @@ impl<'m> Lowerer<'m> {
         }
     }
 
-    fn reference(&self, r: Ref) -> Math {
+    fn reference(&mut self, r: Ref) -> Math {
         // A reification parameter in scope prints as its input name.
         for scope in self.scopes.iter().rev() {
             if let Some(p) = scope.iter().find(|p| p.target == r) {
@@ -571,7 +708,19 @@ impl<'m> Lowerer<'m> {
             }
         }
         match r.ns {
-            RefNs::SelfMod => Math::binding(self.m.resolve(r.name)),
+            RefNs::SelfMod => {
+                // A synthetic binding has no row: inline it where it is used.
+                if let Some(b) = self.m.binding_by_name(r.name)
+                    && self.m.binding(b).synthetic
+                    && !self.inlining.contains(&b)
+                {
+                    self.inlining.push(b);
+                    let inlined = self.expr(self.m.binding(b).rhs);
+                    self.inlining.pop();
+                    return inlined;
+                }
+                Math::binding(self.m.resolve(r.name))
+            }
             RefNs::Local => {
                 // A placeholder no boundary declares: strip its underscores.
                 let raw = self.m.resolve(r.name);
@@ -647,60 +796,16 @@ impl<'m> Lowerer<'m> {
     }
 
     /// Positional arguments followed by keyword arguments moved into their
-    /// declared positions (§08 order for distributions, the catalogue's order
-    /// for functions); undeclared names stay as `name = value`.
+    /// declared positions (see [`order_kwargs`]).
     fn ordered_args(&mut self, name: &str, call: &Call) -> Vec<Math> {
-        let mut args = self.args(call);
-        if call.named.is_empty() {
-            return args;
-        }
-        let names = flatppl_infer::constructor_param_names(name).or_else(|| {
-            flatppl_infer::builtin_catalogue()
-                .base_param_names(name)
-                .map(|n| n.to_vec())
-        });
+        let args = self.args(call);
         let kwargs = self.kwargs(call);
-        match names {
-            Some(order) => {
-                let mut slots: Vec<Option<Math>> = vec![None; order.len()];
-                let mut extra = Vec::new();
-                for (i, a) in args.drain(..).enumerate() {
-                    if i < slots.len() {
-                        slots[i] = Some(a);
-                    } else {
-                        extra.push(a);
-                    }
-                }
-                for (k, v) in kwargs {
-                    match order.iter().position(|p| *p == k) {
-                        Some(i) if slots[i].is_none() => slots[i] = Some(v),
-                        _ => extra.push(Math::relation(Math::ident(&k, None), Rel::Eq, v)),
-                    }
-                }
-                let mut out: Vec<Math> = slots.into_iter().flatten().collect();
-                out.extend(extra);
-                out
-            }
-            None => {
-                args.extend(
-                    kwargs
-                        .into_iter()
-                        .map(|(k, v)| Math::relation(Math::ident(&k, None), Rel::Eq, v)),
-                );
-                args
-            }
-        }
+        order_kwargs(param_names(name), args, kwargs)
     }
 
     fn call(&mut self, id: NodeId, call: &Call) -> Math {
         let Some(head) = self.head_name(call).map(str::to_string) else {
-            let CallHead::User(callee) = call.head else {
-                unreachable!()
-            };
-            let head = self.expr(callee);
-            let mut args = self.args(call);
-            args.extend(self.labelled(call));
-            return Math::apply(head, args);
+            return self.user_call(call);
         };
         let head = head.as_str();
         match head {
@@ -710,45 +815,26 @@ impl<'m> Lowerer<'m> {
             "record" => Math::paren(self.record_items(call)),
             "table" => Math::apply(Math::text("table"), self.labelled(call)),
             "rowstack" | "colstack" if call.args.len() == 1 => self.stack(head, call.args[0]),
-            "complex" if call.args.len() == 2 => {
-                let re = self.expr(call.args[0]);
-                let im = self.expr(call.args[1]);
-                Math::plus(re, Math::times(im, Math::Sym(Sym::ImagUnit)))
-            }
-            "cis" if call.args.len() == 1 => {
-                let t = self.expr(call.args[0]);
-                Math::pow(Math::Sym(Sym::Euler), imag_times(t))
-            }
-            "conj" if call.args.len() == 1 => Math::Overline(Box::new(self.expr(call.args[0]))),
-            "real" | "imag" if call.args.len() == 1 => {
-                let z = self.expr(call.args[0]);
-                Math::call(if head == "real" { "Re" } else { "Im" }, vec![z])
-            }
             // ── sets ─────────────────────────────────────────────────────
-            "interval" if call.args.len() == 2 => {
-                let lo = self.expr(call.args[0]);
-                let hi = self.expr(call.args[1]);
-                Math::bracket(vec![lo, hi])
-            }
             "cartpow" if call.args.len() == 2 => {
                 let set = self.expr(call.args[0]);
                 let size = self.size_exponent(call.args[1]);
                 Math::pow(set, size)
             }
-            "cartprod" => {
-                if !call.named.is_empty() {
-                    let items = call
-                        .named
-                        .iter()
-                        .map(|n| {
-                            let set = self.expr(n.value);
-                            Math::relation(Math::ident(self.m.resolve(n.name), None), Rel::In, set)
-                        })
-                        .collect();
-                    return Math::brace(items);
-                }
+            "cartprod" if !call.named.is_empty() && call.args.is_empty() => {
+                let items = call
+                    .named
+                    .iter()
+                    .map(|n| {
+                        let set = self.expr(n.value);
+                        Math::relation(Math::ident(self.m.resolve(n.name), None), Rel::In, set)
+                    })
+                    .collect();
+                Math::brace(items)
+            }
+            "cartprod" if !call.args.is_empty() && call.named.is_empty() => {
                 let sets = self.args(call);
-                chain(BinOp::Times, sets)
+                chain(BinOp::Times, sets).unwrap_or_else(|| Math::call(head, vec![]))
             }
             "stdsimplex" if call.args.len() == 1 => {
                 let n = match self.m.node(call.args[0]) {
@@ -763,51 +849,31 @@ impl<'m> Lowerer<'m> {
             "functionof" | "kernelof" if !call.args.is_empty() => {
                 self.reification_expr(id, call, head)
             }
-            "lawof" if call.args.len() == 1 => {
+            "lawof" if call.args.len() == 1 && call.named.is_empty() => {
                 let items = self.law_items(call.args[0]);
                 Math::apply(Math::text("Law"), vec![Math::row(items)])
             }
-            "densityof" | "logdensityof" if call.args.len() == 2 => {
-                let m = self.expr(call.args[0]);
-                let x = self.expr(call.args[1]);
-                let p = Math::apply(Math::subscript(Math::letter('p'), m), vec![x]);
-                if head == "logdensityof" {
-                    Math::row(vec![Math::text("log"), p])
-                } else {
-                    p
-                }
+            "likelihoodof" if call.args.len() == 2 && call.named.is_empty() => {
+                let inputs = self.callable_inputs(id).unwrap_or_default();
+                self.likelihood(call.args[0], call.args[1], &inputs)
             }
-            "likelihoodof" if call.args.len() == 2 => {
-                let inputs = self.callable_inputs(id);
-                match inputs {
-                    Some(inputs) if !inputs.is_empty() => {
-                        self.likelihood(call.args[0], call.args[1], Some(&inputs))
-                    }
-                    _ => {
-                        let placeholder = [Math::Sym(Sym::Placeholder)];
-                        self.likelihood(call.args[0], call.args[1], Some(&placeholder))
-                    }
-                }
-            }
-            "joint_likelihood" | "bayesupdate" => chain(BinOp::Dot, self.args(call)),
-            // ── measure algebra ──────────────────────────────────────────
-            "weighted" if call.args.len() == 2 => {
-                let w = self.expr(call.args[0]);
+            "disintegrate" if call.args.len() == 2 && self.is_string_vector(call.args[0]) => {
+                let selector = self
+                    .string_vector(call.args[0])
+                    .iter()
+                    .map(|s| Math::ident(s, None))
+                    .collect();
                 let m = self.expr(call.args[1]);
-                Math::dot(w, m)
+                Math::apply(
+                    Math::subscript(
+                        Math::text("disintegrate"),
+                        Math::row(intersperse_commas(selector)),
+                    ),
+                    vec![m],
+                )
             }
-            "logweighted" if call.args.len() == 2 => {
-                let l = self.expr(call.args[0]);
-                let m = self.expr(call.args[1]);
-                Math::dot(Math::pow(Math::Sym(Sym::Euler), l), m)
-            }
-            "superpose" if !call.args.is_empty() => chain(BinOp::Add, self.args(call)),
-            "truncate" if call.args.len() == 2 => {
-                let m = self.expr(call.args[0]);
-                let s = self.expr(call.args[1]);
-                restrict(m, s)
-            }
-            "restrict" if call.args.len() == 2 => {
+            // ── measure algebra with node-level structure ────────────────
+            "restrict" if call.args.len() == 2 && call.named.is_empty() => {
                 let m = self.expr(call.args[0]);
                 let cond = match self.m.node(call.args[1]) {
                     Node::Call(c) if self.head_is(c, "record") => {
@@ -815,46 +881,15 @@ impl<'m> Lowerer<'m> {
                     }
                     _ => self.expr(call.args[1]),
                 };
-                restrict(m, cond)
+                conditional(m, cond)
             }
             "restrict" if call.args.len() == 1 && !call.named.is_empty() => {
                 let m = self.expr(call.args[0]);
                 let cond = Math::row(intersperse_commas(self.labelled(call)));
-                restrict(m, cond)
+                conditional(m, cond)
             }
-            "pushfwd" if call.args.len() == 2 => {
-                let f = self.expr(call.args[0]);
-                let m = self.expr(call.args[1]);
-                Math::binary(BinOp::Juxtapose, Math::subscript(f, Math::Op(Op::Star)), m)
-            }
-            "locscale" if call.args.len() == 3 => {
-                let m = self.expr(call.args[0]);
-                let shift = self.expr(call.args[1]);
-                let scale = self.expr(call.args[2]);
-                Math::plus(shift, Math::dot(scale, m))
-            }
-            "joint" => {
-                if !call.named.is_empty() {
-                    let factors = call
-                        .named
-                        .iter()
-                        .map(|n| {
-                            let m = self.expr(n.value);
-                            let label = Math::ident(self.m.resolve(n.name), None);
-                            Math::row(vec![
-                                m,
-                                Math::paren(vec![Math::row(vec![
-                                    Math::Op(Op::Differential),
-                                    label,
-                                ])]),
-                            ])
-                        })
-                        .collect();
-                    return chain(BinOp::Otimes, factors);
-                }
-                chain(BinOp::Otimes, self.args(call))
-            }
-            "iid" if call.args.len() == 2 => {
+            "joint" => self.joint(id, call),
+            "iid" if call.args.len() == 2 && call.named.is_empty() => {
                 let m = self.expr(call.args[0]);
                 let n = self.size_exponent(call.args[1]);
                 Math::pow(m, Math::row(vec![Math::Op(Op::Otimes), n]))
@@ -866,21 +901,7 @@ impl<'m> Lowerer<'m> {
                     .iter()
                     .map(|l| Math::row(vec![Math::Op(Op::Differential), Math::ident(l, None)]))
                     .collect();
-                Math::row(vec![m, Math::paren(ds)])
-            }
-            "Lebesgue" => {
-                let args = self.ordered_args(head, call);
-                match args.into_iter().next() {
-                    None | Some(Math::Sym(Sym::Reals)) => Math::Sym(Sym::Lebesgue),
-                    Some(s) => Math::subscript(Math::Sym(Sym::Lebesgue), s),
-                }
-            }
-            "Dirac" => {
-                let args = self.ordered_args(head, call);
-                match args.into_iter().next() {
-                    Some(v) => Math::subscript(Math::Sym(Sym::Dirac), v),
-                    None => Math::Sym(Sym::Dirac),
-                }
+                Math::row(vec![unit(m), Math::paren(ds)])
             }
             // ── collections ──────────────────────────────────────────────
             "broadcast" if !call.args.is_empty() => self.broadcast(id, call, None),
@@ -897,23 +918,151 @@ impl<'m> Lowerer<'m> {
                 let body = self.indexed(call.args[0], &i);
                 Math::big(op, Some(i), None, body)
             }
-            "fchain" if call.args.len() >= 2 => {
+            "aggregate" | "metricsum" if call.args.len() == 3 => {
+                let agg = self.aggregation(call, head);
+                if agg.out_axes.is_empty() {
+                    agg.body
+                } else {
+                    let index = Math::row(
+                        agg.out_axes
+                            .iter()
+                            .map(|(n, _)| Math::ident(n, None))
+                            .collect(),
+                    );
+                    Math::family(agg.body, index, None)
+                }
+            }
+            "fchain" if call.args.len() >= 2 && call.named.is_empty() => {
                 let mut fs = self.args(call);
                 fs.reverse();
-                chain(BinOp::Compose, fs)
-            }
-            "ifelse" if call.args.len() == 3 => {
-                let c = self.expr(call.args[0]);
-                let a = self.expr(call.args[1]);
-                let b = self.expr(call.args[2]);
-                Math::Cases(vec![(a, Some(c)), (b, None)])
+                chain(BinOp::Compose, fs).expect("fchain has two or more operands")
             }
             // ── everything with a math-level rendering ───────────────────
             _ => {
                 let args = self.ordered_args(head, call);
+                // A keyword spelling on a head with no declared parameter
+                // order keeps its construct name: the glyph forms apply to
+                // positional operands only.
+                if !call.named.is_empty() && param_names(head).is_none() {
+                    return Math::call(head, args);
+                }
                 apply_builtin(head, args)
             }
         }
+    }
+
+    /// `callee(args, name = value)` for a user-defined or module callable. A
+    /// standard-module distribution's keyword arguments follow its declared
+    /// parameter order, like a base distribution's.
+    fn user_call(&mut self, call: &Call) -> Math {
+        let CallHead::User(callee) = call.head else {
+            unreachable!("user_call is reached for CallHead::User only");
+        };
+        let head = self.expr(callee);
+        let args = self.args(call);
+        let kwargs = self.kwargs(call);
+        let order = self.standard_module_params(callee);
+        Math::apply(head, order_kwargs(order, args, kwargs))
+    }
+
+    /// The declared parameter names of `callee` when it is a member of a
+    /// standard module (`hep.CrystalBall`), from the catalogue.
+    fn standard_module_params(&self, callee: NodeId) -> Option<Vec<String>> {
+        let Node::Ref(r) = self.m.node(callee) else {
+            return None;
+        };
+        let RefNs::Module(alias) = r.ns else {
+            return None;
+        };
+        let alias_binding = self.m.binding_by_name(alias)?;
+        let Node::Call(load) = self.m.node(self.m.binding(alias_binding).rhs) else {
+            return None;
+        };
+        if !self.head_is(load, "standard_module") {
+            return None;
+        }
+        let Node::Lit(Scalar::Str(module)) = self.m.node(*load.args.first()?) else {
+            return None;
+        };
+        flatppl_infer::builtin_catalogue()
+            .module_param_names(module, self.m.resolve(r.name))
+            .map(|names| names.to_vec())
+    }
+
+    /// `joint`: `⊗` of the components when they provably share no stochastic
+    /// ancestor (spec §06 "Joint composition"), the construct name otherwise.
+    fn joint(&mut self, id: NodeId, call: &Call) -> Math {
+        let components: Vec<NodeId> = call
+            .args
+            .iter()
+            .copied()
+            .chain(call.named.iter().map(|n| n.value))
+            .collect();
+        let is_kernel = matches!(self.m.type_of(id), Some(Type::Kernel { .. }));
+        let independent = !components.is_empty()
+            && !is_kernel
+            && components.iter().all(|c| self.independent_component(*c));
+        if !independent {
+            let mut args = self.args(call);
+            args.extend(self.labelled(call));
+            return Math::call("joint", args);
+        }
+        if !call.named.is_empty() {
+            let factors = call
+                .named
+                .iter()
+                .map(|n| {
+                    let m = self.expr(n.value);
+                    let label = Math::ident(self.m.resolve(n.name), None);
+                    Math::row(vec![
+                        unit(m),
+                        Math::paren(vec![Math::row(vec![Math::Op(Op::Differential), label])]),
+                    ])
+                })
+                .collect();
+            return chain(BinOp::Otimes, factors).expect("joint has a component");
+        }
+        let args = self.args(call);
+        chain(BinOp::Otimes, args).expect("joint has a component")
+    }
+
+    /// A `joint` component contributes a fresh coordinate with no shared
+    /// stochastic node when it is not of stochastic phase and its subtree
+    /// (through module references) holds no reification or draw — the two
+    /// channels §06 names for sharing.
+    fn independent_component(&self, component: NodeId) -> bool {
+        if self.m.phase_of(component) == Some(Phase::Stochastic) {
+            return false;
+        }
+        let mut visited: HashSet<NodeId> = HashSet::new();
+        let mut stack = vec![component];
+        while let Some(node) = stack.pop() {
+            if !visited.insert(node) {
+                continue;
+            }
+            match self.m.node(node) {
+                Node::Call(c) => {
+                    if matches!(
+                        self.head_name(c),
+                        Some("lawof" | "kernelof" | "functionof" | "draw" | "rand")
+                    ) {
+                        return false;
+                    }
+                    c.args.iter().for_each(|a| stack.push(*a));
+                    c.named.iter().for_each(|n| stack.push(n.value));
+                    if let CallHead::User(callee) = c.head {
+                        stack.push(callee);
+                    }
+                }
+                Node::Ref(r) if r.ns == RefNs::SelfMod => {
+                    if let Some(b) = self.m.binding_by_name(r.name) {
+                        stack.push(self.m.binding(b).rhs);
+                    }
+                }
+                _ => {}
+            }
+        }
+        true
     }
 
     /// `rowstack([[…], […]])` / `colstack` as a matrix when the argument is a
@@ -1003,7 +1152,11 @@ impl<'m> Lowerer<'m> {
         if selectors.len() == 1
             && let Node::Lit(Scalar::Str(field)) = self.m.node(selectors[0])
         {
-            return Math::row(vec![base, Math::Op(Op::Dot), Math::ident(field, None)]);
+            return Math::row(vec![
+                unit(base),
+                Math::Op(Op::Dot),
+                Math::ident(field, None),
+            ]);
         }
         // Subset selectors: a vector of names or indices.
         if selectors.len() == 1 && self.is_string_vector(selectors[0]) {
@@ -1238,66 +1391,37 @@ impl<'m> Lowerer<'m> {
     fn apply_head(&mut self, head: NodeId, args: Vec<Math>, kwargs: Vec<(String, Math)>) -> Math {
         if let Node::Const(sym) = self.m.node(head) {
             let name = self.m.resolve(*sym);
-            let args = order_kwargs(name, args, kwargs);
+            let keyword_form = !kwargs.is_empty() && param_names(name).is_none();
+            let args = order_kwargs(param_names(name), args, kwargs);
+            if keyword_form {
+                return Math::call(name, args);
+            }
             return apply_builtin(name, args);
         }
         let f = self.expr(head);
-        let mut args = args;
-        args.extend(
-            kwargs
-                .into_iter()
-                .map(|(k, v)| Math::relation(Math::ident(&k, None), Rel::Eq, v)),
-        );
-        Math::apply(f, args)
+        let order = self.standard_module_params(head);
+        Math::apply(f, order_kwargs(order, args, kwargs))
     }
 
     // ── aggregation ────────────────────────────────────────────────────────
 
     /// `aggregate(f, [out axes], body)` / `metricsum(g, [out axes], body)`:
-    /// the LHS index decoration, the reduced body, and an annotation.
-    #[allow(clippy::type_complexity)]
-    fn aggregation(
-        &mut self,
-        call: &Call,
-        head: &str,
-    ) -> (Option<Box<dyn FnOnce(Math) -> Math>>, Math, Option<String>) {
+    /// the output axes, the reduced body, and an annotation.
+    fn aggregation(&mut self, call: &Call, head: &str) -> Aggregation {
         let out_axes = self.axis_list(call.args[1]);
         let body_node = call.args[2];
         let body = self.expr(body_node);
-        let mut body_axes = Vec::new();
-        self.collect_axes(body_node, &mut body_axes);
-        let lhs_decoration: Option<Box<dyn FnOnce(Math) -> Math>> = if out_axes.is_empty() {
-            None
-        } else {
-            let (lower, upper): (Vec<_>, Vec<_>) = out_axes
-                .iter()
-                .cloned()
-                .partition(|(_, v)| !matches!(v, Some(Variance::Upper)));
-            let lower: Vec<Math> = lower
-                .into_iter()
-                .map(|(n, _)| Math::ident(&n, None))
-                .collect();
-            let upper: Vec<Math> = upper
-                .into_iter()
-                .map(|(n, _)| Math::ident(&n, None))
-                .collect();
-            Some(Box::new(move |lhs: Math| {
-                match (lower.is_empty(), upper.is_empty()) {
-                    (false, true) => Math::subscript(lhs, Math::row(lower)),
-                    (true, false) => Math::pow(lhs, Math::row(upper)),
-                    (false, false) => Math::SubSup(
-                        Box::new(lhs),
-                        Box::new(Math::row(lower)),
-                        Box::new(Math::row(upper)),
-                    ),
-                    (true, true) => lhs,
-                }
-            }))
-        };
+        let body_axes = self.collect_axes(body_node);
         if head == "metricsum" {
             let metric = self.expr(call.args[0]);
-            let annotation = format!("indices lowered with the metric {}", plain_name(&metric));
-            return (lhs_decoration, body, Some(annotation));
+            return Aggregation {
+                out_axes,
+                body,
+                annotation: Some(format!(
+                    "indices lowered with the metric {}",
+                    plain_name(&metric)
+                )),
+            };
         }
         let reduced: Vec<Math> = body_axes
             .iter()
@@ -1305,13 +1429,7 @@ impl<'m> Lowerer<'m> {
             .map(|a| Math::ident(a, None))
             .collect();
         let op = match self.m.node(call.args[0]) {
-            Node::Const(s) => match self.m.resolve(*s) {
-                "sum" => BigOp::Sum,
-                "prod" => BigOp::Prod,
-                "maximum" => BigOp::Max,
-                "minimum" => BigOp::Min,
-                other => BigOp::Named(leak_static(other)),
-            },
+            Node::Const(s) => reduction_op(self.m.resolve(*s)),
             _ => BigOp::Named("aggregate"),
         };
         let body = if reduced.is_empty() {
@@ -1319,7 +1437,11 @@ impl<'m> Lowerer<'m> {
         } else {
             Math::big(op, Some(Math::row(intersperse_commas(reduced))), None, body)
         };
-        (lhs_decoration, body, None)
+        Aggregation {
+            out_axes,
+            body,
+            annotation: None,
+        }
     }
 
     fn axis_list(&self, id: NodeId) -> Vec<(String, Option<Variance>)> {
@@ -1338,59 +1460,154 @@ impl<'m> Lowerer<'m> {
     }
 
     /// Axis names occurring in `id`, in first-appearance order.
-    fn collect_axes(&self, id: NodeId, out: &mut Vec<String>) {
-        match self.m.node(id) {
-            Node::Axis(ax) => {
+    fn collect_axes(&self, id: NodeId) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut stack = vec![id];
+        while let Some(node) = stack.pop() {
+            if let Node::Axis(ax) = self.m.node(node) {
                 let name = self.m.resolve(ax.name).to_string();
                 if !out.contains(&name) {
                     out.push(name);
                 }
+                continue;
             }
-            node => node.for_each_child(|c| self.collect_axes(c, out)),
+            // Children in source order: push them reversed.
+            let mut children = Vec::new();
+            self.m.for_each_child(node, |c| children.push(c));
+            stack.extend(children.into_iter().rev());
         }
+        out
     }
 }
 
-/// Move keyword arguments into their declared positions for a broadcast head.
-fn order_kwargs(name: &str, mut args: Vec<Math>, kwargs: Vec<(String, Math)>) -> Vec<Math> {
-    if kwargs.is_empty() {
-        return args;
+/// The pieces of a lowered `aggregate` / `metricsum`.
+struct Aggregation {
+    out_axes: Vec<(String, Option<Variance>)>,
+    body: Math,
+    annotation: Option<String>,
+}
+
+/// Whether the expression at `id` nests deeper than
+/// [`DEFAULT_MAX_DEPTH`] (iterative, so the check itself cannot overflow).
+fn too_deep(m: &Module, id: NodeId) -> bool {
+    let mut stack = vec![(id, 0usize)];
+    while let Some((node, depth)) = stack.pop() {
+        if depth > DEFAULT_MAX_DEPTH {
+            return true;
+        }
+        m.for_each_child(node, |c| stack.push((c, depth + 1)));
     }
-    let names = flatppl_infer::constructor_param_names(name).or_else(|| {
+    false
+}
+
+fn too_deep_message(name: &str) -> String {
+    format!(
+        "`{name}` nests deeper than {DEFAULT_MAX_DEPTH} levels of mathematics; shown as source text"
+    )
+}
+
+/// `lhs` decorated with the output axes: lowers and neutral axes as a
+/// subscript, uppers as a superscript.
+fn decorate_with_axes(lhs: Math, out_axes: &[(String, Option<Variance>)]) -> Math {
+    let (lower, upper): (Vec<_>, Vec<_>) = out_axes
+        .iter()
+        .partition(|(_, v)| !matches!(v, Some(Variance::Upper)));
+    let lower: Vec<Math> = lower
+        .into_iter()
+        .map(|(n, _)| Math::ident(n, None))
+        .collect();
+    let upper: Vec<Math> = upper
+        .into_iter()
+        .map(|(n, _)| Math::ident(n, None))
+        .collect();
+    match (lower.is_empty(), upper.is_empty()) {
+        (false, true) => Math::subscript(lhs, Math::row(lower)),
+        (true, false) => Math::pow(lhs, Math::row(upper)),
+        (false, false) => Math::SubSup(
+            Box::new(lhs),
+            Box::new(Math::row(lower)),
+            Box::new(Math::row(upper)),
+        ),
+        (true, true) => lhs,
+    }
+}
+
+/// The big-operator form of an `aggregate` reduction (spec §04 lists the
+/// eligible reductions).
+fn reduction_op(name: &str) -> BigOp {
+    match name {
+        "sum" => BigOp::Sum,
+        "prod" => BigOp::Prod,
+        "maximum" => BigOp::Max,
+        "minimum" => BigOp::Min,
+        "mean" => BigOp::Named("mean"),
+        "var" => BigOp::Named("var"),
+        "std" => BigOp::Named("std"),
+        "median" => BigOp::Named("median"),
+        "lany" => BigOp::Named("lany"),
+        "lall" => BigOp::Named("lall"),
+        _ => BigOp::Named("aggregate"),
+    }
+}
+
+/// The declared parameter names of a builtin: §08/§06 constructors first,
+/// then the §07 catalogue rows that carry names.
+fn param_names(name: &str) -> Option<Vec<String>> {
+    flatppl_infer::constructor_param_names(name).or_else(|| {
         flatppl_infer::builtin_catalogue()
             .base_param_names(name)
             .map(|n| n.to_vec())
-    });
-    match names {
-        Some(order) => {
-            let mut slots: Vec<Option<Math>> = vec![None; order.len()];
-            let mut extra = Vec::new();
-            for (i, a) in args.drain(..).enumerate() {
-                if i < slots.len() {
-                    slots[i] = Some(a);
-                } else {
-                    extra.push(a);
-                }
+    })
+}
+
+/// Positional `args` followed by `kwargs` moved into their declared
+/// positions. When every declared slot up to the last supplied one is
+/// filled the result is purely positional; otherwise — a missing argument, an
+/// undeclared name, or no declared order at all — the keyword arguments stay
+/// labelled `name = value`, so a misspelt or missing argument never shifts
+/// into another parameter's place.
+pub fn order_kwargs(
+    order: Option<Vec<String>>,
+    mut args: Vec<Math>,
+    kwargs: Vec<(String, Math)>,
+) -> Vec<Math> {
+    if kwargs.is_empty() {
+        return args;
+    }
+    let labelled = |args: &mut Vec<Math>, kwargs: Vec<(String, Math)>| {
+        args.extend(
+            kwargs
+                .into_iter()
+                .map(|(k, v)| Math::relation(Math::ident(&k, None), Rel::Eq, v)),
+        );
+    };
+    let Some(order) = order else {
+        labelled(&mut args, kwargs);
+        return args;
+    };
+    if args.len() > order.len() {
+        labelled(&mut args, kwargs);
+        return args;
+    }
+    let mut slots: Vec<Option<Math>> = vec![None; order.len()];
+    for (i, a) in args.iter().enumerate() {
+        slots[i] = Some(a.clone());
+    }
+    for (k, v) in &kwargs {
+        match order.iter().position(|p| p == k) {
+            Some(i) if slots[i].is_none() => slots[i] = Some(v.clone()),
+            _ => {
+                labelled(&mut args, kwargs);
+                return args;
             }
-            for (k, v) in kwargs {
-                match order.iter().position(|p| *p == k) {
-                    Some(i) if slots[i].is_none() => slots[i] = Some(v),
-                    _ => extra.push(Math::relation(Math::ident(&k, None), Rel::Eq, v)),
-                }
-            }
-            let mut out: Vec<Math> = slots.into_iter().flatten().collect();
-            out.extend(extra);
-            out
-        }
-        None => {
-            args.extend(
-                kwargs
-                    .into_iter()
-                    .map(|(k, v)| Math::relation(Math::ident(&k, None), Rel::Eq, v)),
-            );
-            args
         }
     }
+    let last = slots.iter().rposition(Option::is_some).map_or(0, |i| i + 1);
+    if slots[..last].iter().any(Option::is_none) {
+        labelled(&mut args, kwargs);
+        return args;
+    }
+    slots.into_iter().flatten().collect()
 }
 
 /// A builtin applied to lowered arguments: operators and the functions with a
@@ -1437,7 +1654,7 @@ pub fn apply_builtin(name: &str, mut args: Vec<Math>) -> Math {
             let a = take(0);
             let x = take(1);
             Math::times(
-                Math::times(Math::pow(x.clone(), Math::Op(Op::Transpose)), a),
+                Math::times(Math::pow(x.clone(), Math::Op(Op::Dagger)), a),
                 x,
             )
         }
@@ -1453,8 +1670,11 @@ pub fn apply_builtin(name: &str, mut args: Vec<Math>) -> Math {
         ("conj", 1) => Math::Overline(Box::new(take(0))),
         ("real", 1) => Math::call("Re", vec![take(0)]),
         ("imag", 1) => Math::call("Im", vec![take(0)]),
+        ("interval", 2) => Math::bracket(vec![take(0), take(1)]),
+        // ── measure algebra (§06) ───────────────────────────────────────
         ("weighted", 2) => Math::dot(take(0), take(1)),
-        ("superpose", _) if n > 0 => chain(BinOp::Add, args),
+        ("logweighted", 2) => Math::dot(Math::pow(Math::Sym(Sym::Euler), take(0)), take(1)),
+        ("superpose", _) if n > 0 => chain(BinOp::Add, args).expect("one or more operands"),
         ("truncate", 2) => restrict(take(0), take(1)),
         ("iid", 2) => Math::pow(take(0), Math::row(vec![Math::Op(Op::Otimes), take(1)])),
         ("locscale", 3) => {
@@ -1468,6 +1688,7 @@ pub fn apply_builtin(name: &str, mut args: Vec<Math>) -> Math {
             Math::subscript(take(0), Math::Op(Op::Star)),
             take(1),
         ),
+        ("Lebesgue", 0) => Math::Sym(Sym::Lebesgue),
         ("Lebesgue", 1) => match take(0) {
             Math::Sym(Sym::Reals) => Math::Sym(Sym::Lebesgue),
             s => Math::subscript(Math::Sym(Sym::Lebesgue), s),
@@ -1479,7 +1700,8 @@ pub fn apply_builtin(name: &str, mut args: Vec<Math>) -> Math {
             Math::text("log"),
             Math::apply(Math::subscript(Math::letter('p'), take(0)), vec![take(1)]),
         ]),
-        ("bayesupdate", 2) | ("joint_likelihood", _) if n >= 1 => chain(BinOp::Dot, args),
+        ("bayesupdate", 2) => Math::dot(take(0), take(1)),
+        ("joint_likelihood", _) if n > 0 => chain(BinOp::Dot, args).expect("one or more operands"),
         _ => Math::call(name, args),
     }
 }
@@ -1505,9 +1727,30 @@ fn norm(v: Math, which: Math) -> Math {
     Math::subscript(fenced(Fence::Norm, v), which)
 }
 
-/// `M|_S`.
+/// `m` as a single unit: bracketed unless it already reads as one.
+fn unit(m: Math) -> Math {
+    if m.prec() < 9 {
+        Math::paren(vec![m])
+    } else {
+        m
+    }
+}
+
+/// `M|_S` — `truncate`, the support restriction.
 fn restrict(m: Math, s: Math) -> Math {
-    Math::subscript(Math::row(vec![m, Math::Op(Op::Restrict)]), s)
+    Math::subscript(Math::row(vec![unit(m), Math::Op(Op::Restrict)]), s)
+}
+
+/// `M(· | a = v)` — `restrict`, the unnormalised conditional measure.
+fn conditional(m: Math, cond: Math) -> Math {
+    Math::apply(
+        unit(m),
+        vec![Math::row(vec![
+            Math::Sym(Sym::Placeholder),
+            Math::Op(Op::Bar),
+            cond,
+        ])],
+    )
 }
 
 /// `(0, ∞]` / `[0, ∞]`: the §03 positive and non-negative half-lines.
@@ -1519,21 +1762,12 @@ fn half_line(open: Fence, lo: Math) -> Math {
     }
 }
 
-fn eq(lhs: Math, rhs: Math) -> Statement {
-    Statement {
-        lhs,
-        rel: Rel::Eq,
-        rhs,
-    }
-}
-
-/// Left-fold `items` under `op`; a single item is returned as itself.
-fn chain(op: BinOp, items: Vec<Math>) -> Math {
+/// Left-fold `items` under `op`; a single item is returned as itself, no
+/// items as `None`.
+fn chain(op: BinOp, items: Vec<Math>) -> Option<Math> {
     let mut iter = items.into_iter();
-    let Some(first) = iter.next() else {
-        return Math::Code(String::new());
-    };
-    iter.fold(first, |acc, x| Math::binary(op, acc, x))
+    let first = iter.next()?;
+    Some(iter.fold(first, |acc, x| Math::binary(op, acc, x)))
 }
 
 fn intersperse_commas(items: Vec<Math>) -> Vec<Math> {
@@ -1547,26 +1781,20 @@ fn intersperse_commas(items: Vec<Math>) -> Vec<Math> {
     out
 }
 
+fn eq(lhs: Math, rhs: Math) -> Statement {
+    Statement {
+        lhs,
+        rel: Rel::Eq,
+        rhs,
+    }
+}
+
 /// The source name of an identifier, for annotations.
 fn plain_name(m: &Math) -> String {
     match m {
         Math::Ident(id) => id.name.clone(),
         Math::Text(t) => t.clone(),
         _ => "g".to_string(),
-    }
-}
-
-/// Reduction names are a small fixed set; leaking the rare unknown one keeps
-/// `BigOp::Named` a plain `&'static str`.
-fn leak_static(s: &str) -> &'static str {
-    match s {
-        "mean" => "mean",
-        "var" => "var",
-        "std" => "std",
-        "median" => "median",
-        "lany" => "lany",
-        "lall" => "lall",
-        _ => "aggregate",
     }
 }
 
@@ -1621,7 +1849,7 @@ mod tests {
     }
 
     #[test]
-    fn keyword_distribution_arguments_print_in_spec_order() {
+    fn keyword_arguments_take_their_declared_positions_or_stay_labelled() {
         assert_eq!(
             rhs("d = Normal(sigma = 2.0, mu = 1.0)", "d"),
             "<mrow><mi>Normal</mi><mo>&#x2061;</mo><mrow><mo>(</mo><mn>1</mn><mo>,</mo><mn>2</mn><mo>)</mo></mrow></mrow>"
@@ -1630,6 +1858,16 @@ mod tests {
             rhs("d = Gamma(shape = 4.0, rate = 2.0)", "d")
                 .contains("<mn>4</mn><mo>,</mo><mn>2</mn>")
         );
+        // A missing argument never shifts into another slot.
+        let d = rhs("d = Normal(sigma = 2.0)", "d");
+        assert!(d.contains("<mi>σ</mi><mo>=</mo><mn>2</mn>"), "{d}");
+        // A keyword spelling of a measure operator keeps the construct name.
+        let p = rhs(
+            "pr = Normal(0, 1)\nL = likelihoodof(functionof(Normal(0, 1)), 0.5)\npost = bayesupdate(prior = pr, L = L)",
+            "post",
+        );
+        assert!(p.starts_with("<mrow><mi>bayesupdate</mi>"), "{p}");
+        assert!(p.contains("<mi>prior</mi><mo>=</mo>"), "{p}");
     }
 
     #[test]
@@ -1657,11 +1895,61 @@ mod tests {
             "m",
         );
         assert!(ls.starts_with("<mrow><mn>0</mn><mo>+</mo><mrow><mn>2.5</mn><mo>⋅</mo>"));
-        let j = rhs("pr = joint(a = Normal(0, 1), b = Exponential(1))", "pr");
-        assert!(j.contains("<mo>⊗</mo>"));
-        assert!(j.contains("<mi mathvariant=\"normal\">d</mi><mi>a</mi>"));
         assert_eq!(rhs("l = Lebesgue(support = reals)", "l"), "<mi>λ</mi>");
         assert!(rhs("d = Dirac(0)", "d").starts_with("<msub><mi>δ</mi>"));
+    }
+
+    #[test]
+    fn postfix_measure_operators_bracket_a_compound_operand() {
+        let src = "M1 = Normal(0, 1)\nM2 = Normal(1, 2)\nt = truncate(superpose(M1, M2), interval(0, 1))\nr = relabel(superpose(M1, M2), [\"x\"])";
+        let rows = rows(src);
+        let t = mathml::expr(&row_named(&rows, "t").statement.rhs);
+        assert!(
+            t.starts_with("<msub><mrow><mrow><mo>(</mo><mrow><msub data-flatppl-ref=\"M1\">"),
+            "{t}"
+        );
+        let r = mathml::expr(&row_named(&rows, "r").statement.rhs);
+        assert!(r.starts_with("<mrow><mrow><mo>(</mo>"), "{r}");
+        assert!(
+            r.contains("<mi mathvariant=\"normal\">d</mi><mi>x</mi>"),
+            "{r}"
+        );
+    }
+
+    #[test]
+    fn joint_is_a_tensor_product_only_without_shared_stochastic_ancestry() {
+        let independent = rhs("pr = joint(a = Normal(0, 1), b = Exponential(1))", "pr");
+        assert!(independent.contains("<mo>⊗</mo>"), "{independent}");
+        assert!(independent.contains("<mi mathvariant=\"normal\">d</mi><mi>a</mi>"));
+        let positional = rhs("pr = joint(Normal(0, 1), Exponential(1))", "pr");
+        assert!(positional.contains("<mo>⊗</mo>"), "{positional}");
+        // Reified components share their ancestry (§06): no product claim.
+        let shared = rhs(
+            "z ~ Normal(0, 1)\na ~ Normal(z, 1)\nb ~ Normal(z, 2)\ndep = joint(a = lawof(a), b = lawof(b))",
+            "dep",
+        );
+        assert!(shared.starts_with("<mrow><mi>joint</mi>"), "{shared}");
+        assert!(!shared.contains("<mo>⊗</mo>"), "{shared}");
+        // A constructor with a stochastic parameter is a sharing channel too.
+        let param = rhs(
+            "z ~ Normal(0, 1)\ndep = joint(a = Normal(z, 1), b = Normal(z, 2))",
+            "dep",
+        );
+        assert!(param.starts_with("<mrow><mi>joint</mi>"), "{param}");
+    }
+
+    #[test]
+    fn restrict_reads_as_a_conditional_measure() {
+        let src = "z ~ Normal(0, 1)\nobs ~ Normal(z, 1)\nm = lawof(record(z = z, obs = obs))\npost = restrict(m, record(obs = 2.1))";
+        let post = rhs(src, "post");
+        assert!(
+            post.starts_with("<mrow><mi data-flatppl-ref=\"m\">m</mi><mo>&#x2061;</mo><mrow><mo>(</mo><mrow><mo>·</mo><mo stretchy=\"false\">|</mo>"),
+            "{post}"
+        );
+        assert!(
+            post.contains("<mi>obs</mi><mo>=</mo><mn>2.1</mn>"),
+            "{post}"
+        );
     }
 
     #[test]
@@ -1758,11 +2046,39 @@ mod tests {
     }
 
     #[test]
-    fn decompositions_fold_into_one_row() {
-        let src = "a, b ~ MvNormal(mu = [0.0, 0.0], cov = eye(2))\nm = lawof(record(a = a, b = b))\nfk, pr = disintegrate([\"a\"], m)";
+    fn zero_input_likelihoods_and_closed_reifications_carry_no_bar() {
+        let src = "L0 = likelihoodof(functionof(Normal(0, 1)), 1.5)\ng = functionof(Normal(0, 1))\nh = weighted(2.0, functionof(Normal(0, 1)))";
+        let rows = rows(src);
+        let l = mathml::expr(&row_named(&rows, "L0").statement.rhs);
+        assert!(!l.contains('|'), "{l}");
+        assert!(!l.contains("<mo>·</mo>"), "{l}");
+        let g = &row_named(&rows, "g").statement;
+        assert_eq!(
+            mathml::expr(&g.lhs),
+            "<mrow><mi data-flatppl-ref=\"g\">g</mi><mo>&#x2061;</mo><mrow><mo>(</mo><mo>)</mo></mrow></mrow>"
+        );
+        assert!(mathml::expr(&g.rhs).starts_with("<mrow><mi>Normal</mi>"));
+        // In expression position a closed reification is its body.
+        let h = mathml::expr(&row_named(&rows, "h").statement.rhs);
+        assert!(!h.contains("↦"), "{h}");
+    }
+
+    #[test]
+    fn fixed_values_keep_their_value_and_gain_an_annotation() {
+        let rows = rows("c = fixed(8.0)\nr = record(a = 2.0, c = fixed(8.0))");
+        let c = row_named(&rows, "c");
+        assert_eq!(mathml::expr(&c.statement.rhs), "<mn>8</mn>");
+        assert_eq!(c.annotation.as_deref(), Some("fixed"));
+        let r = mathml::expr(&row_named(&rows, "r").statement.rhs);
+        assert!(r.contains("<mi>fixed</mi>"), "{r}");
+    }
+
+    #[test]
+    fn decompositions_fold_into_one_row_and_partial_ones_inline_the_source() {
+        let src = "a, b ~ MvNormal(mu = [0.0, 0.0], cov = eye(2))\nm = lawof(record(a = a, b = b))\nfk, pr = disintegrate([\"a\"], m)\np, _ = (3.0, 4.0)\n_ = 1.0 + 2.0";
         let rows = rows(src);
         let names: Vec<&str> = rows.iter().map(|r| r.names[0].as_str()).collect();
-        assert_eq!(names, vec!["a", "m", "fk"]);
+        assert_eq!(names, vec!["a", "m", "fk", "p"]);
         let ab = &rows[0];
         assert_eq!(ab.names, vec!["a", "b"]);
         assert_eq!(ab.statement.rel, Rel::Sim);
@@ -1773,12 +2089,23 @@ mod tests {
         );
         let d = &rows[2];
         assert_eq!(d.names, vec!["fk", "pr"]);
-        assert!(mathml::expr(&d.statement.rhs).contains("<mi>disintegrate</mi>"));
+        let drhs = mathml::expr(&d.statement.rhs);
+        assert!(
+            drhs.starts_with("<mrow><msub><mi>disintegrate</mi><mi>a</mi></msub><mo>&#x2061;</mo>"),
+            "{drhs}"
+        );
+        // A partial decomposition keeps the component index on the inlined source.
+        let p = &rows[3];
+        assert_eq!(p.names, vec!["p"]);
+        assert_eq!(
+            mathml::expr(&p.statement.rhs),
+            "<msub><mrow><mo>(</mo><mn>3</mn><mo>,</mo><mn>4</mn><mo>)</mo></mrow><mn>1</mn></msub>"
+        );
     }
 
     #[test]
     fn aggregates_are_sums_over_the_reduced_axes_and_metricsums_keep_index_positions() {
-        let src = "A = rowstack([[1, 3, 5], [9, 5, 1]])\nB = rowstack([[1, 0], [0, 1], [1, 1]])\nC = aggregate(sum, [.i, .k], A[.i, .j] * B[.j, .k])\nV = aggregate(var, [.j], A[.i, .j])\ng = rowstack([[1.0, 0.0], [0.0, -1.0]])\nr = [1.0, 2.0]\ng: s[] := r[.mu^] * r[.mu_]";
+        let src = "A = rowstack([[1, 3, 5], [9, 5, 1]])\nB = rowstack([[1, 0], [0, 1], [1, 1]])\nC = aggregate(sum, [.i, .k], A[.i, .j] * B[.j, .k])\nV = aggregate(var, [.j], A[.i, .j])\nP = aggregate(prod, [.i, .k], A[.i, .j] + B[.j, .k])\nv = [1.0, 2.0]\ny = 2.0 * aggregate(sum, [], v[.i])\nW = 2.0 * aggregate(sum, [.i], A[.i, .j])\ng = rowstack([[1.0, 0.0], [0.0, -1.0]])\nr = [1.0, 2.0]\ng: s[] := r[.mu^] * r[.mu_]";
         let rows = rows(src);
         let a = mathml::expr(&row_named(&rows, "A").statement.rhs);
         assert!(a.starts_with("<mrow><mo>[</mo><mtable><mtr><mtd><mn>1</mn></mtd>"));
@@ -1803,6 +2130,23 @@ mod tests {
             v.starts_with("<mrow><munder><mi>var</mi><mi>i</mi></munder>"),
             "{v}"
         );
+        // An additive body is bracketed under the big operator.
+        let p = mathml::expr(&row_named(&rows, "P").statement.rhs);
+        assert!(
+            p.starts_with("<mrow><munder><mo>∏</mo><mi>j</mi></munder><mrow><mo>(</mo>"),
+            "{p}"
+        );
+        // Nested aggregation: a scalar reduction inline, an indexed one as a family.
+        let y = mathml::expr(&row_named(&rows, "y").statement.rhs);
+        assert!(
+            y.contains("<mo>&#x2062;</mo><mrow><munder><mo>∑</mo><mi>i</mi></munder>"),
+            "{y}"
+        );
+        let w = mathml::expr(&row_named(&rows, "W").statement.rhs);
+        assert!(
+            w.contains("<msub><mrow><mo>(</mo><mrow><munder><mo>∑</mo><mi>j</mi></munder>"),
+            "{w}"
+        );
         let s = row_named(&rows, "s");
         let body = mathml::expr(&s.statement.rhs);
         assert!(
@@ -1825,6 +2169,7 @@ mod tests {
         let rows = rows(src);
         let xs = row_named(&rows, "xs");
         assert_eq!(xs.statement.rel, Rel::In);
+        assert!(xs.elided);
         assert_eq!(
             mathml::expr(&xs.statement.rhs),
             "<msup><mi>ℝ</mi><mn>13</mn></msup>"
@@ -1835,6 +2180,7 @@ mod tests {
         );
         let ks = row_named(&rows, "ks");
         assert_eq!(ks.statement.rel, Rel::Eq);
+        assert!(!ks.elided);
         assert_eq!(
             mathml::expr(&ks.statement.rhs),
             "<mrow><mo>(</mo><mn>1</mn><mo>,</mo><mn>2</mn><mo>,</mo><mn>3</mn><mo>)</mo></mrow>"
@@ -1843,7 +2189,7 @@ mod tests {
 
     #[test]
     fn access_forms_and_sums() {
-        let src = "r = record(a = 1.0, b = 2.0)\nv = [1.0, 2.0, 3.0]\nx = r.a\ny = v[2]\nz = sum(v)\nt = table(c = [1.0, 2.0], d = [3.0, 4.0])\nw = t.c\nq = get(r, [\"a\", \"b\"])";
+        let src = "r = record(a = 1.0, b = 2.0)\nv = [1.0, 2.0, 3.0]\nx = r.a\ny = v[2]\nz = sum(v)\nt = table(c = [1.0, 2.0], d = [3.0, 4.0])\nw = t.c\nq = get(r, [\"a\", \"b\"])\ns = sum(v) + 1.0\nu = (sum(v) + 1.0) * 2.0";
         let rows = rows(src);
         assert_eq!(
             mathml::expr(&row_named(&rows, "x").statement.rhs),
@@ -1863,11 +2209,22 @@ mod tests {
                 "<mrow><mo>{</mo><mi>a</mi><mo>,</mo><mi>b</mi><mo>}</mo></mrow></msub>"
             )
         );
+        // A big operator that is not the last thing in a row is bracketed.
+        let s = mathml::expr(&row_named(&rows, "s").statement.rhs);
+        assert!(
+            s.starts_with("<mrow><mrow><mo>(</mo><mrow><munder><mo>∑</mo>"),
+            "{s}"
+        );
+        let u = mathml::expr(&row_named(&rows, "u").statement.rhs);
+        assert!(
+            u.starts_with("<mrow><mrow><mo>(</mo><mrow><mrow><mo>(</mo><mrow><munder>"),
+            "{u}"
+        );
     }
 
     #[test]
     fn module_references_and_unknown_builtins_stay_roman() {
-        let src = "h = standard_module(\"particle-physics\", \"0.1\")\nk = h.kallen(1.0, 2.0, 3.0)\nd = load_data(\"x.csv\", cartpow(reals, 4))\nb = bincounts([0.0, 1.0, 2.0], d)";
+        let src = "h = standard_module(\"particle-physics\", \"0.1\")\nk = h.kallen(1.0, 2.0, 3.0)\nd = load_data(\"x.csv\", cartpow(reals, 4))\nb = bincounts([0.0, 1.0, 2.0], d)\ncb = h.CrystalBall(n = 2.0, alpha = 1.5, sigma = 0.3, m0 = 5.0)";
         let rows = rows(src);
         let k = mathml::expr(&row_named(&rows, "k").statement.rhs);
         assert!(k.starts_with("<mrow><mrow><mi data-flatppl-ref=\"h\">h</mi><mo>.</mo><mi>kallen</mi></mrow><mo>&#x2061;</mo>"), "{k}");
@@ -1877,6 +2234,12 @@ mod tests {
         assert!(
             mathml::expr(&row_named(&rows, "b").statement.rhs)
                 .starts_with("<mrow><mi>bincounts</mi>")
+        );
+        // A standard-module distribution's keyword arguments follow §09 order.
+        let cb = mathml::expr(&row_named(&rows, "cb").statement.rhs);
+        assert!(
+            cb.ends_with("<mo>(</mo><mn>5</mn><mo>,</mo><mn>0.3</mn><mo>,</mo><mn>1.5</mn><mo>,</mo><mn>2</mn><mo>)</mo></mrow></mrow>"),
+            "{cb}"
         );
     }
 
@@ -1900,5 +2263,30 @@ mod tests {
         );
         let c = mathml::expr(&row_named(&rows, "c").statement.rhs);
         assert!(c.contains("<mtext>if&#xa0;</mtext><mrow><mi data-flatppl-ref=\"m\">m</mi><mo>&gt;</mo><mn>1</mn></mrow>"), "{c}");
+    }
+
+    #[test]
+    fn too_deep_mathematics_renders_as_source_text_with_a_diagnostic() {
+        // A wide `superpose` folds into a chain as deep as it is wide.
+        let terms: Vec<String> = (0..DEFAULT_MAX_DEPTH + 20)
+            .map(|i| format!("Normal({i}, 1)"))
+            .collect();
+        let src = format!("m = superpose({})", terms.join(", "));
+        let deep = rows(&src);
+        let m = row_named(&deep, "m");
+        assert!(
+            matches!(m.statement.rhs, Math::Code(ref t) if t.starts_with("superpose(") && t.contains("Normal(0, 1)")),
+            "{:?}",
+            m.statement.rhs
+        );
+        assert_eq!(m.diagnostics.len(), 1);
+        assert!(
+            m.diagnostics[0].contains("deeper than"),
+            "{}",
+            m.diagnostics[0]
+        );
+        // A shallower one lowers normally.
+        let shallow = rows("m = superpose(Normal(0, 1), Normal(1, 1), Normal(2, 1))");
+        assert!(row_named(&shallow, "m").diagnostics.is_empty());
     }
 }
