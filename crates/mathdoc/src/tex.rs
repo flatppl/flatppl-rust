@@ -268,6 +268,7 @@ fn symbol(s: Sym) -> &'static str {
         Sym::Simplex => r"\Delta",
         Sym::Ellipsis => r"\ldots",
         Sym::Placeholder => r"\cdot",
+        Sym::MeasurableSet => r"\mathsfit{A}",
         Sym::Euler => "e",
     }
 }

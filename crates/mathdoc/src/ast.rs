@@ -120,6 +120,10 @@ pub enum Sym {
     Ellipsis,
     /// `·` as a placeholder argument (`A_{·,j}`, `p_K(data | ·)`).
     Placeholder,
+    /// The generic measurable set of a set-function row (`ν(𝘈) = ∫_𝘈 …`):
+    /// sans-serif italic A, U+1D608, which no FlatPPL name can spell, so it
+    /// never collides with a binding.
+    MeasurableSet,
     /// Euler's e.
     Euler,
 }

@@ -856,9 +856,11 @@ impl<'m> Lowerer<'m> {
         Some((vars.clone(), Math::apply(l, vars)))
     }
 
-    /// A fresh set letter for a set-function row (`ν(A) = ∫_A …`).
+    /// The set of a set-function row (`ν(𝘈) = ∫_𝘈 …`): one styled letter
+    /// no binding name can spell, so it needs no freshness check and reads
+    /// the same in every model.
     fn fresh_set(&mut self) -> Math {
-        self.fresh_name(&["A", "B", "C", "D", "E", "F", "G", "H"], "A")
+        Math::Sym(Sym::MeasurableSet)
     }
 
     /// A fresh bound variable for an integrand.
@@ -2371,12 +2373,12 @@ mod tests {
         let post = row_named(&rows, "post");
         let lhs = mathml::expr(&post.statement.lhs);
         assert!(
-            lhs.starts_with("<mrow><mi data-flatppl-ref=\"post\">post</mi><mo>&#x2061;</mo><mrow><mo stretchy=\"false\">(</mo><mi>A</mi>"),
+            lhs.starts_with("<mrow><mi data-flatppl-ref=\"post\">post</mi><mo>&#x2061;</mo><mrow><mo stretchy=\"false\">(</mo><mi>𝘈</mi>"),
             "{lhs}"
         );
         let post = mathml::expr(&post.statement.rhs);
         assert!(
-            post.starts_with("<mrow><msub><mo>∫</mo><mi>A</mi></msub>"),
+            post.starts_with("<mrow><msub><mo>∫</mo><mi>𝘈</mi></msub>"),
             "{post}"
         );
         assert!(
@@ -2410,11 +2412,11 @@ mod tests {
         let m = row_named(&rows, "m");
         assert!(
             mathml::expr(&m.statement.lhs)
-                .contains("<mo stretchy=\"false\">(</mo><mi>A</mi><mo stretchy=\"false\">)</mo>")
+                .contains("<mo stretchy=\"false\">(</mo><mi>𝘈</mi><mo stretchy=\"false\">)</mo>")
         );
         let rhs = mathml::expr(&m.statement.rhs);
         assert!(
-            rhs.starts_with("<mrow><msub><mo>∫</mo><mi>A</mi></msub><mrow><mrow><mi>exp</mi>"),
+            rhs.starts_with("<mrow><msub><mo>∫</mo><mi>𝘈</mi></msub><mrow><mrow><mi>exp</mi>"),
             "{rhs}"
         );
         assert!(

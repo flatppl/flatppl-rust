@@ -282,6 +282,7 @@ fn symbol(sym: Sym) -> &'static str {
         Sym::Simplex => "Δ",
         Sym::Ellipsis => "…",
         Sym::Placeholder => "⋅",
+        Sym::MeasurableSet => "𝘈",
         Sym::Euler => "e",
     }
 }

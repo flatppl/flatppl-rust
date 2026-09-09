@@ -388,6 +388,8 @@ fn write_sym(out: &mut String, s: Sym) {
         Sym::Simplex => "<mi>Δ</mi>",
         Sym::Ellipsis => "<mi>…</mi>",
         Sym::Placeholder => "<mo>·</mo>",
+        // The code point, not `mathvariant`: MathML Core keeps only `normal`.
+        Sym::MeasurableSet => "<mi>𝘈</mi>",
         Sym::Euler => "<mi>e</mi>",
     });
 }
