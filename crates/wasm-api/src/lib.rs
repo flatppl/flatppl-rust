@@ -2,10 +2,11 @@
 //! FlatPPL.
 //!
 //! A thin `wasm-bindgen` wrapper over the pure library crates (the
-//! `flatppl-hs3` importers + the `flatppl-syntax` printer), built to wasm
-//! and consumed in-browser by the web gallery's "Convert to FlatPPL"
-//! command. The conversion logic lives in the libraries; this crate only
-//! adapts string-in / string-out to the JS boundary.
+//! `flatppl-hs3` importers + the `flatppl-syntax` printer, and the
+//! `flatppl-mathdoc` math renderer), built to wasm and consumed in-browser by
+//! the web gallery's "Convert to FlatPPL" command and by the viewer's Math
+//! pane. The logic lives in the libraries; this crate only adapts
+//! string-in / string-out to the JS boundary.
 //!
 //! It is the **browser member of the host-binding family** — the same
 //! library crates also link into PyO3 / jlrs / cxx hosts (see the workspace
@@ -40,8 +41,21 @@ pub fn convert_str(input: &str, from: &str, to: &str) -> Result<String, String> 
     Ok(flatppl_syntax::print(&module))
 }
 
-/// The wasm/JS boundary. `convert(input, from, to) -> string`; a returned
-/// `Err` becomes a JavaScript `Error` object carrying the message.
+/// Render a model as per-binding mathematics (the viewer's Math pane).
+///
+/// `request` and the returned string are the JSON contract of
+/// `flatppl-dev/math-view-design.md` §4, implemented by
+/// [`flatppl_mathdoc::json::render_math`]: `{source, path, bundle, formats}`
+/// in, `{order, bindings, diagnostics}` out. A malformed request or an
+/// unparsable primary module is an error; inference failures are diagnostics
+/// inside a response that still renders.
+pub fn render_math_str(request: &str) -> Result<String, String> {
+    flatppl_mathdoc::json::render_math(request)
+}
+
+/// The wasm/JS boundary. `convert(input, from, to) -> string` and
+/// `render_math(request) -> string`; a returned `Err` becomes a JavaScript
+/// `Error` object carrying the message.
 #[cfg(target_arch = "wasm32")]
 mod wasm {
     use wasm_bindgen::prelude::*;
@@ -49,6 +63,11 @@ mod wasm {
     #[wasm_bindgen]
     pub fn convert(input: &str, from: &str, to: &str) -> Result<String, JsError> {
         super::convert_str(input, from, to).map_err(|e| JsError::new(&e))
+    }
+
+    #[wasm_bindgen]
+    pub fn render_math(request: &str) -> Result<String, JsError> {
+        super::render_math_str(request).map_err(|e| JsError::new(&e))
     }
 }
 
@@ -102,6 +121,17 @@ mod tests {
                 "converted expression changed for {name}"
             );
         }
+    }
+
+    #[test]
+    fn render_math_answers_the_viewer_contract() {
+        let out = super::render_math_str(
+            r#"{"source": "mu ~ Normal(0, 5)\nx = 2 * mu", "path": "m.flatppl", "bundle": {}, "formats": ["mathml"]}"#,
+        )
+        .expect("renders");
+        assert!(out.contains("\"order\":[\"mu\",\"x\"]"), "{out}");
+        assert!(out.contains("data-flatppl-binding=\\\"mu\\\""), "{out}");
+        assert!(super::render_math_str("{").is_err());
     }
 
     #[test]

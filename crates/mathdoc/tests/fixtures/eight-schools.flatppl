@@ -1,0 +1,26 @@
+%%%
+# Eight Schools model (Rubin, 1981)
+
+Classic hierarchical Normal model. Eight high-school coaching programmes each
+have an estimated treatment effect $y_j$ with known standard error $\sigma_j$.
+A shared hyperprior on the programme mean $\mu$ and scale $\tau$ partially pools
+the estimates. The half-Cauchy prior on $\tau$ is rendered with
+`normalize(truncate(...))`.
+%%%
+flatppl_compat = "0.1"
+
+y_data = [28, 8, -3, 7, -1, 1, 18, 12]
+std_errs_data = [15, 10, 16, 11, 9, 11, 10, 18]
+J = 8
+
+mu ~ Normal(0, 5)
+tau ~ normalize(truncate(Cauchy(0, 5), interval(0, inf)))
+theta ~ iid(Normal(mu, tau), J)
+
+prior = lawof(record(mu = mu, tau = tau, theta = theta))
+
+y ~ Normal.(theta, std_errs_data)
+
+forward_kernel = kernelof(record(y = y), mu = mu, tau = tau, theta = theta)
+L = likelihoodof(forward_kernel, record(y = y_data))
+posterior = bayesupdate(L, prior)

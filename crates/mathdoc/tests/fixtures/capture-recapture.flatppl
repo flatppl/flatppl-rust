@@ -1,0 +1,23 @@
+flatppl_compat = "0.1"
+
+% Marked
+M_obs = 10
+% Captured
+C_obs = 15
+% Recaptured
+R_obs = 5
+
+% Maximum probability of recapture
+rcp_max = M_obs / (C_obs - R_obs + M_obs)
+
+% Probability of recapture
+rcp ~ Uniform(interval(0, rcp_max))
+#rcp ~ normalize(truncate(Beta(1.2, 1.2), interval(0, rcp_max)))
+
+% Recapture stochastic node
+R ~ Binomial(C_obs, rcp)
+
+prior = lawof(record(rcp = rcp))
+forward_kernel = kernelof(record(R = R), rcp = rcp)
+L = likelihoodof(forward_kernel, record(R = R_obs))
+posterior = bayesupdate(L, prior)

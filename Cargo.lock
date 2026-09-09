@@ -472,6 +472,7 @@ name = "flatppl-wasm-api"
 version = "0.1.0"
 dependencies = [
  "flatppl-hs3",
+ "flatppl-mathdoc",
  "flatppl-syntax",
  "wasm-bindgen",
 ]

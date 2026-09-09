@@ -1,0 +1,59 @@
+%%%
+# BEST — Bayesian estimation supersedes the t-test
+
+Kruschke (2013)'s robust Bayesian replacement for the two-sample
+$t$-test. Each group's observations are modeled as Student-$t$
+(heavy-tailed, so outliers are down-weighted rather than dragging the
+estimates) with its own mean $\mu_g$ and scale $\sigma_g$, sharing one
+normality parameter $\nu$:
+
+$$y_{g,i} \sim \mathrm{StudentT}(\nu,\ \mu_g,\ \sigma_g),\qquad g \in \{1, 2\}.$$
+
+The location-scale Student-$t$ is expressed with `locscale`, which shifts
+and scales a standard `StudentT(nu)` base. The quantities of interest are
+the posterior *distributions* of the differences $\mu_1 - \mu_2$ and
+$\sigma_1 - \sigma_2$ — not a point $p$-value.
+
+Placeholder data: two groups of IQ-like scores, $N_1 = N_2 = 8$.
+%%%
+flatppl_compat = "0.1"
+
+# --- Data (placeholders) ---
+y1_data = [101.0, 100.0, 102.0, 104.0, 100.0, 103.0, 99.0, 105.0]
+y2_data = [99.0, 101.0, 100.0, 98.0, 100.0, 97.0, 102.0, 100.0]
+N1 = 8
+N2 = 8
+
+# --- Priors ---
+% Group means: a broad Normal centred on the pooled data scale.
+mu1 ~ Normal(100.0, 20.0)
+mu2 ~ Normal(100.0, 20.0)
+
+% Group scales: wide uniform priors (Kruschke's choice), strictly positive.
+sigma1 ~ Uniform(interval(0.1, 20.0))
+sigma2 ~ Uniform(interval(0.1, 20.0))
+
+%%%
+Shared normality parameter, drawn $\nu \sim \mathrm{Exponential}(1/29)$
+(mean $\approx 29$, near-Normal, with enough tail mass at small $\nu$ to
+turn strongly heavy-tailed when the data demand it).
+%%%
+nu ~ Exponential(1.0 / 29.0)
+
+prior = lawof(record(mu1 = mu1, mu2 = mu2, sigma1 = sigma1, sigma2 = sigma2, nu = nu))
+
+# --- Likelihood: location-scale Student-t per group ---
+# iid observations in each group: the base StudentT(nu) shifted and scaled
+# by that group's mean and scale via locscale (the location-scale t).
+y1 ~ iid(locscale(StudentT(nu), mu1, sigma1), N1)
+y2 ~ iid(locscale(StudentT(nu), mu2, sigma2), N2)
+
+# --- Posterior assembly ---
+forward_kernel = kernelof(record(y1 = y1, y2 = y2),
+    mu1 = mu1, mu2 = mu2, sigma1 = sigma1, sigma2 = sigma2, nu = nu)
+L              = likelihoodof(forward_kernel, record(y1 = y1_data, y2 = y2_data))
+posterior      = bayesupdate(L, prior)
+
+# --- Derived quantities of interest ---
+diff_means = mu1 - mu2
+diff_sigma = sigma1 - sigma2

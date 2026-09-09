@@ -1,0 +1,40 @@
+flatppl_compat = "0.1"
+
+% Observed data
+y_obs = [7.23, 5.13, 1.20, -0.33, 0.23,
+    -0.22, 1.34, 0.80, 0.50, -0.75,
+    3.79, 0.01, -0.76, 0.21, 1.48,
+    1.21, 12.11, 15.96, 9.83, 3.92
+]
+N = lengthof(y_obs)
+
+% Probability of being drawn from the first (normal) mixand
+p ~ Beta(2, 2)
+
+% Mean of Normal mixand
+mu ~ Normal(0, 1)
+sigma2 ~ InverseGamma(2, 2)
+% Standard deviation of Normal mixand
+sigma = sqrt(sigma2)
+% Normal mixand
+normal_mixand = Normal(mu, sigma)
+
+% Shape parameter of Gamma mixand
+shape ~ normalize(truncate(Normal(0, 5), interval(0, inf)))
+% Rate parameter of Gamma mixand
+rate ~ normalize(truncate(Normal(0, 5), interval(0, inf)))
+% Gamma mixand
+gamma_mixand = Gamma(shape, rate)
+
+% Mixture distribution
+mixture = normalize(superpose(
+    weighted(p, normal_mixand),
+    weighted(1 - p, gamma_mixand)
+))
+
+y ~ iid(mixture, N)
+
+prior = lawof(record(p = p, mu = mu, sigma = sigma, shape = shape, rate = rate))
+forward_kernel = kernelof(record(y = y), p = p, mu = mu, sigma = sigma, shape = shape, rate = rate)
+L = likelihoodof(forward_kernel, record(y = y_obs))
+posterior = bayesupdate(L, prior)
