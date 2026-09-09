@@ -333,6 +333,36 @@ mod tests {
     }
 
     #[test]
+    fn a_unit_normal_scale_is_not_squared() {
+        let src = "a = Normal(0, 1)\nb = Normal(0, 1.0)\nc = Normal(0, 2)\ns = 1\nd = Normal(0, s)";
+        let r = render_source(src, "m.flatppl", &HashMap::new()).unwrap();
+        let row = |name| r.bindings.iter().find(|b| b.name == name).unwrap();
+        for name in ["a", "b"] {
+            assert!(
+                row(name)
+                    .mathml
+                    .contains("<mn>0</mn><mo>,</mo><mn>1</mn><mo stretchy=\"false\">)</mo>"),
+                "{}",
+                row(name).mathml
+            );
+            assert!(!row(name).mathml.contains("<msup>"), "{}", row(name).mathml);
+        }
+        // Any other scale, a binding named `s` with value 1 included, is squared.
+        assert!(
+            row("c")
+                .mathml
+                .contains("<msup><mn>2</mn><mn>2</mn></msup>")
+        );
+        assert!(
+            row("d")
+                .mathml
+                .contains("<msup><mi data-flatppl-ref=\"s\">s</mi><mn>2</mn></msup>"),
+            "{}",
+            row("d").mathml
+        );
+    }
+
+    #[test]
     fn normal_shows_the_scale_squared_without_folding_or_losing_refs() {
         let src = "mu = elementof(reals)\na = elementof(posreals)\nb = elementof(posreals)\nn = Normal(0, 2)\np = Normal(sigma = a + b, mu = mu)\nv = Normal.(mu, [2, 3])\nm = MvNormal([0, 0], eye(2))\nq = Normal(0, a^2)";
         let r = render_source(src, "model.flatppl", &HashMap::new()).unwrap();

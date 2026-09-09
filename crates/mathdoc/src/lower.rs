@@ -1945,10 +1945,19 @@ pub fn apply_builtin(name: &str, mut args: Vec<Math>) -> Math {
     match (name, n) {
         // §08 takes a standard deviation. Show its square without folding,
         // including literal scales, so the displayed parameterisation is clear.
-        ("Normal", 2) => Math::apply(
-            Math::Sym(Sym::Normal),
-            vec![take(0), Math::pow(take(1), Math::int(2))],
-        ),
+        ("Normal", 2) => {
+            // 𝒩(μ, σ²) takes the variance, `Normal(mu, sigma)` the standard
+            // deviation: the source scale is written squared — except the
+            // literal 1, where 1² = 1 and the square only looks odd.
+            let mu = take(0);
+            let sigma = take(1);
+            let variance = if matches!(&sigma, Math::Num(n) if n == "1") {
+                sigma
+            } else {
+                Math::pow(sigma, Math::int(2))
+            };
+            Math::apply(Math::Sym(Sym::Normal), vec![mu, variance])
+        }
         ("MvNormal", 2) => Math::apply(Math::Sym(Sym::Normal), args),
         ("StudentT", 1) => Math::subscript(Math::letter('t'), take(0)),
         ("ChiSquared", 1) => Math::SubSup(
@@ -2208,7 +2217,7 @@ mod tests {
         assert_eq!(x.kind, Kind::Draw);
         assert_eq!(
             mathml::expr(&x.statement.rhs),
-            "<mrow><mi>𝒩</mi><mo>&#x2061;</mo><mrow><mo stretchy=\"false\">(</mo><mi data-flatppl-ref=\"mu\">μ</mi><mo>,</mo><msup><mn>1</mn><mn>2</mn></msup><mo stretchy=\"false\">)</mo></mrow></mrow>"
+            "<mrow><mi>𝒩</mi><mo>&#x2061;</mo><mrow><mo stretchy=\"false\">(</mo><mi data-flatppl-ref=\"mu\">μ</mi><mo>,</mo><mn>1</mn><mo stretchy=\"false\">)</mo></mrow></mrow>"
         );
         let y = row_named(&rows, "y");
         assert_eq!(y.kind, Kind::Value);

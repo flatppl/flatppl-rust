@@ -225,7 +225,8 @@ range comes from the typed module: a named size where the source gives one
 A record whose fields are references to bindings of the same name prints as the
 list of those symbols (`Law(μ, τ, θ)`); any other field prints as `name = value`.
 
-The Normal variance keeps the source scale expression, grouped before squaring.
+The Normal variance keeps the source scale expression, grouped before squaring;
+a scale that is the literal `1` is not squared (`𝒩(0, 1)`, since 1² = 1).
 Rate and scale conventions appear in the legend, not as argument labels. Other
 distributions retain their upright FlatPPL names and declared argument order.
 Unresolved keyword arguments retain the named call rather than guessing roles.
