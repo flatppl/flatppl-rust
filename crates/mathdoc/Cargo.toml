@@ -1,6 +1,6 @@
 [package]
 name = "flatppl-mathdoc"
-description = "FlatPPL → mathematics: a math AST over the typed module, printed as MathML (and later Typst), plus document assembly (binary-free; surfaced by flatppl-cli as `flatppl convert model.flatppl model.html` and by flatppl-wasm-api as `render_math`)."
+description = "FlatPPL → mathematics: a shared math AST with MathML, TeX and Typst printers, plus HTML, GitHub Markdown, LaTeX and Typst document exports."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,7 +13,7 @@ default = ["json", "document"]
 # it carries rendered doc-comments, so it needs `document`.
 json = ["dep:serde", "dep:serde_json", "document"]
 # Doc-comment rendering (Markdown and its LaTeX math) and whole-document
-# assembly (the HTML page).
+# assembly (HTML, GitHub Markdown, LaTeX and Typst).
 document = ["dep:pulldown-cmark", "dep:math-core"]
 
 [dependencies]

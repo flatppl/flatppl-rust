@@ -57,6 +57,7 @@ pub struct Rendering {
     /// Row names in source order.
     pub order: Vec<String>,
     pub bindings: Vec<BindingRender>,
+    pub notation: Vec<crate::notation::NotationEntry>,
     pub diagnostics: Vec<Diagnostic>,
     /// The module doc: the doc-comment on `flatppl_compat`, when there is one.
     pub module_doc: Option<Doc>,
@@ -112,6 +113,7 @@ pub fn render_with_source(module: &Module, source: Option<&str>) -> Rendering {
         .find(|(_, b)| module.resolve(b.name) == "flatppl_compat")
         .and_then(|(_, b)| b.doc.clone());
     Rendering {
+        notation: crate::notation::entries(module),
         order: bindings.iter().map(|b| b.name.clone()).collect(),
         bindings,
         diagnostics,
@@ -304,6 +306,56 @@ fn owning_binding(module: &Module, node: NodeId) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn statistical_symbols_keep_parameter_roles_and_extended_support() {
+        let r = render_source("s = elementof(reals)\nx ~ StudentT(5)\ny ~ ChiSquared(3)\nu = Uniform(unitinterval)\ng = Gamma(2, 3)\nL = lawof(x)", "m.flatppl", &HashMap::new()).unwrap();
+        for (name, markup) in [
+            ("s", "<mover><mi>ℝ</mi><mo>¯</mo></mover>"),
+            ("x", "<msub><mi>t</mi><mn>5</mn></msub>"),
+            ("y", "<msubsup><mi>χ</mi><mn>3</mn><mn>2</mn></msubsup>"),
+            ("u", "𝒰"),
+            ("g", "<mn>2</mn><mo>,</mo><mn>3</mn>"),
+            ("L", "ℒ"),
+        ] {
+            let row = r.bindings.iter().find(|b| b.name == name).unwrap();
+            assert!(row.mathml.contains(markup), "{name}: {}", row.mathml);
+        }
+    }
+
+    #[test]
+    fn normal_shows_the_scale_squared_without_folding_or_losing_refs() {
+        let src = "mu = elementof(reals)\na = elementof(posreals)\nb = elementof(posreals)\nn = Normal(0, 2)\np = Normal(sigma = a + b, mu = mu)\nv = Normal.(mu, [2, 3])\nm = MvNormal([0, 0], eye(2))\nq = Normal(0, a^2)";
+        let r = render_source(src, "model.flatppl", &HashMap::new()).unwrap();
+        let row = |name| r.bindings.iter().find(|b| b.name == name).unwrap();
+        assert!(row("n").mathml.contains("𝒩"));
+        assert!(
+            row("n")
+                .mathml
+                .contains("<msup><mn>2</mn><mn>2</mn></msup>")
+        );
+        assert!(
+            row("p")
+                .mathml
+                .contains(r#"<msup><mrow><mo stretchy="false">(</mo>"#)
+        );
+        assert!(row("p").mathml.contains("</mo></mrow><mn>2</mn></msup>"));
+        assert_eq!(row("p").refs, ["mu", "a", "b"]);
+        assert!(row("v").mathml.contains("𝒩"));
+        assert!(row("v").mathml.contains("<msup>"));
+        assert!(row("m").mathml.contains("𝒩"));
+        assert!(!row("m").mathml.contains("<msup>"));
+        assert!(
+            row("q")
+                .mathml
+                .contains(r#"<msup><mrow><mo stretchy="false">(</mo><msup>"#)
+        );
+        assert!(crate::tex::statement(&row("q").statement).contains(r"{\left({a}^{2}\right)}^{2}"));
+        assert!(
+            crate::typst::statement(&row("q").statement)
+                .contains(r"attach(lr(\( attach(a, tr: 2) \)), tr: 2)")
+        );
+    }
 
     #[test]
     fn render_lists_rows_in_source_order_with_refs_and_kinds() {

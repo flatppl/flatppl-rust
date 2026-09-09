@@ -2,8 +2,8 @@
 
 How `flatppl-mathdoc` renders a FlatPPL module as mathematical notation. The
 conversion is one way (FlatPPL → math), built from the typed and phased module,
-and printed as MathML (the viewer's Math pane, HTML documents) or Typst
-(documents). The structure below is target-independent; printers only choose
+and printed as MathML (the viewer's Math pane, HTML documents), plain TeX,
+GitHub Markdown with TeX math, or native Typst. The structure below is target-independent; printers only choose
 glyphs. Semantics follow spec §04 and §06; where a construct has an established
 mathematical notation it is used, where it has none the construct keeps its
 FlatPPL name in roman type. Nothing is inferred about the author's intent beyond
@@ -38,8 +38,8 @@ the rules stated here.
   document. A **one-line** (`%`) doc-comment is an annotation in the right
   column of its row. Whether the comment led or trailed the binding in the
   source is irrelevant.
-- Consecutive rows with no prose between them form one aligned block (aligned on
-  the relation symbol). Each row is labelled with its binding name.
+- Document exports group consecutive rows with no prose between them into one block,
+  aligned on the relation symbol. Each row is labelled with its binding name.
 - Plain `#` comments do not exist after parsing and never appear.
 - Parser-generated bindings (`__0x…`) have no row of their own. A decomposition
   folds into the statement it serves: `a, b, c ~ M` is one row `(a, b, c) ∼ M`;
@@ -50,9 +50,9 @@ the rules stated here.
 - Arrays beyond twelve entries print as `x ∈ ℝ^{n}` with an annotation and the
   values in a data appendix. A `table(…)` literal prints as `table(c = …)` with
   its columns (typesetting it as a table is planned).
-- A generated notation appendix lists parameters (`elementof`), external inputs,
-  random variables (`draw`) and the parametrisation of every distribution used,
-  read off the module.
+- A generated notation key explains the symbols and distribution conventions
+  used in the module. The HTML appendix also lists parameters (`elementof`),
+  external inputs, and random variables (`draw`).
 
 ## Names
 
@@ -94,7 +94,7 @@ the same rules (`.mu` → μ).
 | `f(a, b) = expr`, `f = (a, b) -> expr`, `f = fn(… _ …)` | f(a, b) = expr |
 | `F = functionof(e, p = a, q = d)` | F(p, q) = e with a, d read as p, q |
 | `F = functionof(y)` (inputs from inference) | F(inputs) = y, by reference to y's own row |
-| `K = kernelof(x, p = a)` | K(p) = Law(x \| p) |
+| `K = kernelof(x, p = a)` | K(p) = ℒ(x \| p) |
 | `L = likelihoodof(K, data)` | L(inputs) = p_K(data \| inputs) |
 | `C[.i, .k] := body` | C_{ik} = Σ_{j} body |
 | `g: s[] := body` | s = body with upper/lower indices, annotation "indices lowered with g" |
@@ -112,7 +112,7 @@ the same rules (`.mu` → μ).
 | `(a, b)` tuple | (a, b) |
 | `rowstack([[1, 2], [3, 4]])` | a bracketed matrix |
 | `complex(a, b)`, `cis(t)`, `conj(z)`, `abs2(z)`, `real(z)`, `imag(z)` | a + b i, e^{i t}, z̄, \|z\|², Re z, Im z |
-| `reals`, `posreals`, `nonnegreals`, `unitinterval` | ℝ, (0, ∞], [0, ∞], [0, 1] |
+| `reals`, `posreals`, `nonnegreals`, `unitinterval` | ℝ̄, (0, ∞], [0, ∞], [0, 1] |
 | `integers`, `posintegers`, `nonnegintegers`, `booleans`, `complexes` | ℤ, ℤ_{>0}, ℕ₀, 𝔹, ℂ |
 | `interval(a, b)` | [a, b] (closed, as §03 defines it; `inf` ends stay closed) |
 | `cartpow(S, n)`, `cartpow(S, [m, n])` | Sⁿ, S^{m×n} |
@@ -143,7 +143,7 @@ the same rules (`.mu` → μ).
 | any other builtin `f(args)` | f(args) in roman |
 
 Keyword arguments to a builtin with a declared parameter order print
-positionally in that order (`Normal(mu = m, sigma = s)` → Normal(m, s)); on a
+positionally in that order (`Normal(mu = m, sigma = s)` → 𝒩(m, s²)); on a
 callable without one they print as `name = value`.
 
 ## Collections, broadcasting, aggregation
@@ -166,9 +166,13 @@ range comes from the typed module: a named size where the source gives one
 
 | FlatPPL | Math |
 | --- | --- |
-| `Normal(0, 1)`, `Gamma(shape = a, rate = b)` | Normal(0, 1), Gamma(a, b) — §08 names, §08 argument order |
-| `Uniform(S)` | Uniform(S) with the set |
-| `Lebesgue(support = S)`, `Counting(S)`, `Dirac(v)` | λ_S (λ for ℝ), Counting(S), δ_v |
+| `Normal(mu, sigma)` | 𝒩(μ, σ²); `Normal(0, 2)` stays 𝒩(0, 2²), never 𝒩(0, 4) |
+| `MvNormal(mu, cov)` | 𝒩(μ, cov), with the covariance unchanged |
+| `StudentT(nu)`, `ChiSquared(k)` | t_ν, χ²_k |
+| `Gamma(shape, rate)`, `Exponential(rate)` | Gamma(shape, rate), Exp(rate) |
+| `InverseGamma(shape, scale)`, `Weibull(shape, scale)` | InverseGamma(shape, scale), Weibull(shape, scale) |
+| `Uniform(S)` | 𝒰(S) with the set |
+| `Lebesgue(support = S)`, `Counting(S)`, `Dirac(v)` | λ_S (λ for ℝ̄), Counting(S), δ_v |
 | `weighted(w, M)`, `logweighted(l, M)` | w · M, e^{l} · M |
 | `superpose(M1, M2)` | M₁ + M₂ |
 | `normalize(M)`, `totalmass(M)` | normalize(M), totalmass(M) |
@@ -176,8 +180,8 @@ range comes from the typed module: a named size where the source gives one
 | `pushfwd(f, M)`, `locscale(M, a, b)` | f_* M, a + b · M |
 | `joint(M1, M2)`, `joint(a = M1, b = M2)` | M₁ ⊗ M₂, M₁(da) ⊗ M₂(db) — only when no component is stochastic, reifies a draw, or reaches into a loaded module (§06: `joint` retains shared stochastic ancestors and is then not a product; a loaded module's binding may hold a draw this module cannot see, a standard module holds none); otherwise, and for a spelling that mixes positional and keyword components, joint(…) in roman |
 | `relabel(M, ["x"])` | M(dx) |
-| `lawof(x)`, `lawof(record(a = a, b = b))` | Law(x), Law(a, b) |
-| `kernelof(x, p = a)` as an expression | p ↦ Law(x \| p); with no inputs, Law(x) |
+| `lawof(x)`, `lawof(record(a = a, b = b))` | ℒ(x), ℒ(a, b) |
+| `kernelof(x, p = a)` as an expression | p ↦ ℒ(x \| p); with no inputs, ℒ(x) |
 | `functionof(e, p = a)` as an expression | p ↦ e; with no inputs, e |
 | `F = functionof(e)` with no inputs | F() = e |
 | `densityof(M, x)`, `logdensityof(M, x)` | p_M(x), log p_M(x) |
@@ -189,7 +193,43 @@ range comes from the typed module: a named size where the source gives one
 | `kchain`, `jointchain`, `markovchain`, `kscan`, `ksuperpose`, `disintegrate`, `bijection`, `PoissonProcess`, … | the construct name in roman with its arguments |
 
 A record whose fields are references to bindings of the same name prints as the
-list of those symbols (`Law(μ, τ, θ)`); any other field prints as `name = value`.
+list of those symbols (`ℒ(μ, τ, θ)`); any other field prints as `name = value`.
+
+The Normal variance keeps the source scale expression, grouped before squaring.
+Rate and scale conventions appear in the legend, not as argument labels. Other
+distributions retain their upright FlatPPL names and declared argument order.
+Unresolved keyword arguments retain the named call rather than guessing roles.
+`reals` means the extended reals ℝ̄, including both infinities (§03). The ℝ in
+the shorthand for an elided array of finite literals remains the finite reals.
+
+## Export formats
+
+The CLI selects the document format from the output suffix:
+
+```sh
+flatppl convert model.flatppl model.html
+flatppl convert model.flatppl model.md
+flatppl convert model.flatppl model.tex
+flatppl convert model.flatppl model.typ
+```
+
+All formats use the same lowered expressions and notation key. HTML retains
+MathML, source links, and rendered documentation. GitHub Markdown uses fenced
+`math` blocks with `aligned` equations and preserves Markdown documentation.
+The fences keep TeX backslashes and underscores out of Markdown parsing.
+The emitted `\operatorname` and `aligned` constructs belong to MathJax's AMS
+support. Author documentation is preserved, not translated to a restricted TeX
+dialect. Foreign Typst documentation
+appears as fenced source. TeX and Typst exports preserve documentation as
+escaped literal text, not executable author commands. They include diagnostics
+and the full data appendix. TeX documents require LuaLaTeX or XeLaTeX with
+`unicode-math` for Unicode identifiers and prose.
+
+The Rust JSON API also accepts `formats: ["mathml", "tex", "typst"]`. Each
+binding and notation entry contains only the requested forms. TeX and Typst
+forms are native math source without delimiters or browser annotations.
+MathML remains the default. The viewer shows the shared notation key in a
+collapsed disclosure after the equations.
 
 ## Modules, data, randomness
 

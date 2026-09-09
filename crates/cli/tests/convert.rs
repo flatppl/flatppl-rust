@@ -452,3 +452,122 @@ fn converts_flatppl_to_an_html_page_of_mathematics() {
         .unwrap();
     assert!(!status.success());
 }
+
+#[test]
+fn exports_native_mathematical_documents() {
+    let dir = Scratch::new("math-exports");
+    let src = dir.path("model.flatppl");
+    fs::write(
+        &src,
+        r#"%%%
+# Native exports
+
+Literal author commands: \input{private} and #panic("private").
+%%%
+flatppl_compat = "0.1"
+% source scale
+N = Normal(0, 1 + 2)
+mu = [0, 0]
+Sigma = eye(2)
+M = MvNormal(mu, Sigma)
+z ~ Exponential(2)
+%%%
+A data paragraph.
+These values appear in full in the appendix.
+%%%
+x = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+a = elementof(reals)
+f = floor(a) + ceil(a) + l2norm(x)
+bad = Normal(0, "not a scale")
+"#,
+    )
+    .unwrap();
+    for (extension, banner, normal, covariance, data, escaped) in [
+        (
+            "md",
+            "<!--",
+            r"\mathcal{N}\left(0, {\left(1 + 2\right)}^{2}\right)",
+            r"\mathcal{N}\left(μ, Σ\right)",
+            "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13",
+            r"\input{private}",
+        ),
+        (
+            "tex",
+            "%",
+            r"\mathcal{N}\left(0, {\left(1 + 2\right)}^{2}\right)",
+            r"\mathcal{N}\left(μ, Σ\right)",
+            "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13",
+            r"\textbackslash{}input\{private\}",
+        ),
+        (
+            "typ",
+            "//",
+            "cal(N) lr(\\( 0 \\, attach(lr(\\( 1 + 2 \\)), tr: 2) \\))",
+            "cal(N) lr(\\( μ \\, Σ \\))",
+            "1 \\, 2 \\, 3 \\, 4 \\, 5 \\, 6 \\, 7 \\, 8 \\, 9 \\, 10 \\, 11 \\, 12 \\, 13",
+            r#"\\input{private} and #panic(\"private\")"#,
+        ),
+    ] {
+        let out = dir.path(&format!("model.{extension}"));
+        let result = bin().arg("convert").arg(&src).arg(&out).output().unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let text = fs::read_to_string(&out).unwrap();
+        assert!(text.starts_with(banner), "{text}");
+        let (start, end, draw) = if extension == "typ" {
+            ("$\nN &=", "\n$\n", "z &∼")
+        } else {
+            (r"\begin{aligned}", r"\end{aligned}", r"z &\sim")
+        };
+        let block_start = text.find(start).expect("aligned equation block");
+        let block_end = text[block_start..].find(end).unwrap() + block_start;
+        let block = &text[block_start..block_end];
+        assert!(block.contains(draw), "{block}");
+        assert!(block.contains("source scale"), "{block}");
+        assert!(block_end < text.find("A data paragraph").unwrap());
+        if extension == "md" {
+            assert!(text.contains("```math\n\\begin{aligned}\nN &="));
+            assert!(block.contains(r"\operatorname{Exp}"));
+        }
+        if extension != "typ" {
+            assert!(text.contains(r#"\text{"not a scale"}"#), "{text}");
+            for delimiter in [r"\left\lfloor a", r"\left\lceil a", r"\left\Vert x"] {
+                assert!(text.contains(delimiter), "{text}");
+            }
+        }
+        for expected in [
+            "Native exports",
+            "source scale",
+            "A data paragraph",
+            "Diagnostics",
+            "Notation",
+            "Data",
+            normal,
+            covariance,
+            data,
+            escaped,
+        ] {
+            assert!(
+                text.contains(expected),
+                "missing {expected:?} in {extension}:\n{text}"
+            );
+        }
+        let result = bin()
+            .arg("convert")
+            .arg(&out)
+            .arg(dir.path("back.flatppl"))
+            .output()
+            .unwrap();
+        assert!(!result.status.success());
+    }
+    let out = dir.path("model.markdown");
+    convert_nh(&src, &out);
+    assert!(
+        fs::read_to_string(out)
+            .unwrap()
+            .starts_with("# Native exports\n")
+    );
+}

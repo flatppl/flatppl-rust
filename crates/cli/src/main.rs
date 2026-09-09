@@ -74,11 +74,11 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Convert between FlatPPL, FlatPIR, and the FlatPIR JSON encoding, or
-    /// render a model as mathematics (`.html`).
+    /// render a model as mathematics (`.html`, `.md`, `.tex`, `.typ`).
     ///
     /// Formats are inferred from the file extensions (`.flatppl` / `.flatpir` /
-    /// `.flatpir.json`, `.html` for an HTML page of MathML, and `.hs3.json` /
-    /// `.pyhf.json` for HS3 / pyhf import).
+    /// `.flatpir.json`, `.html` / `.md` / `.markdown` / `.tex` / `.typ` for
+    /// mathematics, and `.hs3.json` / `.pyhf.json` for HS3 / pyhf import).
     /// Converting to the same format canonicalizes the file. `.flatpir.json` is
     /// an alternate representation of FlatPIR (same content, including `%meta`
     /// annotations). `--from hs3` / `--from pyhf` force HS3 / pyhf import of any
@@ -90,7 +90,7 @@ enum Command {
         /// path — a model with remote `load_module` deps must be pre-fetched
         /// with `flatppl prepare`.
         input: PathBuf,
-        /// Output file (`.flatppl`, `.flatpir`, `.flatpir.json`, or `.html`)
+        /// Output file (`.flatppl`, `.flatpir`, `.flatpir.json`, `.html`, `.md`, `.markdown`, `.tex`, `.typ`)
         output: PathBuf,
         /// FlatPPL output syntax level (ignored for FlatPIR output):
         /// `full` re-applies all syntactic sugar (operators, indexing,
@@ -426,17 +426,17 @@ fn convert(
         }
     };
 
-    // An HTML page is rendered from the TYPED module (index ranges, kernel
-    // inputs and the notation appendix read inference), so it takes the
+    // Mathematical documents use the typed module (index ranges, kernel inputs
+    // and the notation appendix read inference), so they take the
     // `infer` front end rather than the plain printer.
     #[cfg(feature = "mathdoc")]
-    if matches!(to, Format::Html) {
-        return convert_html(input, output, &mut module, no_header);
+    if to.is_document() {
+        return convert_document(input, output, to, &mut module, no_header);
     }
     #[cfg(not(feature = "mathdoc"))]
-    if matches!(to, Format::Html) {
+    if to.is_document() {
         return Err(Failure::Plain(
-            "HTML output is not compiled in — rebuild with `--features mathdoc`".into(),
+            "Document output is not compiled in — rebuild with `--features mathdoc`".into(),
         ));
     }
 
@@ -467,14 +467,14 @@ fn convert(
     })
 }
 
-/// `convert <model> <out>.html`: assemble the cross-module bundle, infer, and
-/// write the model as an HTML page of mathematics. Inference diagnostics go to
-/// stderr and into the page; they never block the render — a mistyped model
-/// still reads, with the typed features degraded where inference failed.
-#[cfg(feature = "mathdoc")]
-fn convert_html(
+/// Assemble the cross-module bundle, infer, and write a mathematical document.
+/// Inference diagnostics go to stderr and into the document; a mistyped model
+/// still renders, with the typed features degraded where inference failed.
+#[cfg(all(feature = "convert", feature = "mathdoc"))]
+fn convert_document(
     input: &Path,
     output: &Path,
+    to: Format,
     module: &mut flatppl_core::Module,
     no_header: bool,
 ) -> Result<(), Failure> {
@@ -503,9 +503,15 @@ fn convert_html(
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("model");
-    let mut text = flatppl_mathdoc::document::html(module, &rendering, title);
+    let mut text = match to {
+        Format::Html => flatppl_mathdoc::document::html(module, &rendering, title),
+        Format::Markdown => flatppl_mathdoc::export::github_markdown(module, &rendering, title),
+        Format::Latex => flatppl_mathdoc::export::latex(module, &rendering, title),
+        Format::Typst => flatppl_mathdoc::export::typst(module, &rendering, title),
+        _ => unreachable!("convert_document requires a document output format"),
+    };
     if !no_header {
-        text.insert_str(0, &banner(Format::Html.comment_style()));
+        text.insert_str(0, &banner(to.comment_style()));
     }
     fs::write(output, text).map_err(|e| {
         Failure::Plain(format!(

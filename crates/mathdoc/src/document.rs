@@ -27,7 +27,7 @@
 use std::fmt::Write;
 use std::sync::OnceLock;
 
-use flatppl_core::{CallHead, Doc, Markup, Module, Node, NodeId};
+use flatppl_core::{CallHead, Doc, Markup, Module, Node};
 use pulldown_cmark::{CowStr, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
 use crate::ast::Math;
@@ -224,7 +224,7 @@ const CSS: &str = "\
 .flatppl-doc .flatppl-notation td, .flatppl-doc .flatppl-notation th { padding: 0.1em 0.8em 0.1em 0; text-align: left; vertical-align: top; }
 ";
 
-fn doc_text(doc: &Doc) -> String {
+pub(crate) fn doc_text(doc: &Doc) -> String {
     doc.lines.join("\n")
 }
 
@@ -233,7 +233,7 @@ fn typst_source(text: &str) -> String {
 }
 
 /// A leading Markdown heading is the title; the rest is the abstract.
-fn split_title(md: &str) -> (Option<String>, String) {
+pub(crate) fn split_title(md: &str) -> (Option<String>, String) {
     let first = md
         .lines()
         .enumerate()
@@ -454,14 +454,8 @@ fn notation_section(module: &Module, rendering: &Rendering) -> String {
             _ => {}
         }
     }
-    let mut dists: Vec<String> = Vec::new();
-    for (_, b) in module.bindings() {
-        collect_distributions(module, b.rhs, &mut dists);
-    }
-    dists.sort();
-    dists.dedup();
-
-    if params.is_empty() && inputs.is_empty() && latents.is_empty() && dists.is_empty() {
+    if params.is_empty() && inputs.is_empty() && latents.is_empty() && rendering.notation.is_empty()
+    {
         return String::new();
     }
     let mut out = String::from("<section class=\"flatppl-notation\"><h2>Notation</h2>\n");
@@ -481,48 +475,21 @@ fn notation_section(module: &Module, rendering: &Rendering) -> String {
     table(&mut out, "Parameters", &params, "∈");
     table(&mut out, "External inputs", &inputs, "∈");
     table(&mut out, "Random variables", &latents, "∼");
-    if !dists.is_empty() {
-        out.push_str("<h3>Distributions</h3>\n<table>\n");
-        for d in dists {
-            let params = flatppl_infer::distribution_param_names(&d)
-                .map(|p| p.join(", "))
-                .unwrap_or_default();
+    if !rendering.notation.is_empty() {
+        out.push_str("<h3>Symbols and parameterisations</h3>\n<table>\n");
+        for entry in &rendering.notation {
             let _ = writeln!(
                 out,
-                "<tr><td><math><mi>{}</mi></math></td><td><code>{}({})</code></td></tr>",
-                escape(&d),
-                escape(&d),
-                escape(&params)
+                "<tr><td><math>{}</math></td><td><code>{}</code><p>{}</p></td></tr>",
+                mathml::expr(&entry.form),
+                escape(&entry.source),
+                escape(&entry.note)
             );
         }
         out.push_str("</table>\n");
     }
     out.push_str("</section>\n");
     out
-}
-
-/// The base distributions named under `root`: call heads, and the bare atoms a
-/// broadcast applies (`Normal.(…)`).
-fn collect_distributions(module: &Module, root: NodeId, out: &mut Vec<String>) {
-    let catalogue = flatppl_infer::builtin_catalogue();
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
-        let name = match module.node(node) {
-            Node::Call(call) => match call.head {
-                CallHead::Builtin(head) => Some(module.resolve(head)),
-                CallHead::User(_) => None,
-            },
-            Node::Const(sym) => Some(module.resolve(*sym)),
-            _ => None,
-        };
-        if let Some(name) = name
-            && catalogue.base_is_distribution(name)
-            && !out.iter().any(|d| d == name)
-        {
-            out.push(name.to_string());
-        }
-        module.for_each_child(node, |c| stack.push(c));
-    }
 }
 
 #[cfg(test)]

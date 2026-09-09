@@ -121,6 +121,12 @@ pub enum Format {
     FlatPirJson,
     /// An HTML page rendering the model as mathematics (`.html`). Output only.
     Html,
+    /// GitHub Markdown with TeX math (`.md`, `.markdown`). Output only.
+    Markdown,
+    /// A standalone LaTeX document (`.tex`). Output only.
+    Latex,
+    /// A native Typst document (`.typ`). Output only.
+    Typst,
 }
 
 impl Format {
@@ -135,15 +141,18 @@ impl Format {
             Some("flatppl") => Ok(Format::FlatPpl),
             Some("flatpir") => Ok(Format::FlatPir),
             Some("html") => Ok(Format::Html),
+            Some("md" | "markdown") => Ok(Format::Markdown),
+            Some("tex") => Ok(Format::Latex),
+            Some("typ") => Ok(Format::Typst),
             Some(other) => Err(format!(
                 "unsupported file extension `.{}` for `{}` \
-                 (expected `.flatppl`, `.flatpir`, `.flatpir.json`, or `.html`)",
+                 (expected `.flatppl`, `.flatpir`, `.flatpir.json`, `.html`, `.md`, `.markdown`, `.tex`, or `.typ`)",
                 terminal_text(other),
                 terminal_path(path)
             )),
             None => Err(format!(
                 "cannot infer a format for `{}`: no file extension \
-                 (expected `.flatppl`, `.flatpir`, `.flatpir.json`, or `.html`)",
+                 (expected `.flatppl`, `.flatpir`, `.flatpir.json`, `.html`, `.md`, `.markdown`, `.tex`, or `.typ`)",
                 terminal_path(path)
             )),
         }
@@ -168,8 +177,18 @@ impl Format {
             Format::FlatPpl => CommentStyle::Line("#"),
             Format::FlatPir => CommentStyle::Line(";"),
             Format::FlatPirJson => CommentStyle::None,
-            Format::Html => CommentStyle::Block("<!--", "-->"),
+            Format::Html | Format::Markdown => CommentStyle::Block("<!--", "-->"),
+            Format::Latex => CommentStyle::Line("%"),
+            Format::Typst => CommentStyle::Line("//"),
         }
+    }
+
+    /// Document outputs use the typed math renderer instead of a module printer.
+    pub fn is_document(self) -> bool {
+        matches!(
+            self,
+            Self::Html | Self::Markdown | Self::Latex | Self::Typst
+        )
     }
 }
 
@@ -362,8 +381,8 @@ pub fn read_module(format: Format, source: &str) -> Result<Module, ReadError> {
             0,
             None,
         )),
-        Format::Html => Err((
-            "HTML is an output format only; the input must be FlatPPL, FlatPIR, or an HS3/pyhf document"
+        Format::Html | Format::Markdown | Format::Latex | Format::Typst => Err((
+            "Mathematical documents are output formats only; the input must be FlatPPL, FlatPIR, or an HS3/pyhf document"
                 .to_string(),
             0,
             None,
@@ -392,11 +411,11 @@ pub fn write_module(
         Format::FlatPir | Format::FlatPirJson => unreachable!(
             "write_module called with a FlatPIR format in a lean build; all callers are guarded by a converter feature"
         ),
-        // HTML is rendered from the typed module by the `mathdoc` path in
+        // Documents are rendered from the typed module by the `mathdoc` path in
         // `convert`, never from the bare module this function sees.
-        Format::Html => {
+        Format::Html | Format::Markdown | Format::Latex | Format::Typst => {
             return Err(Failure::Plain(
-                "HTML output needs the `mathdoc` feature's renderer, not `write_module`"
+                "Document output needs the `mathdoc` feature's renderer, not `write_module`"
                     .to_string(),
             ));
         }
@@ -528,9 +547,9 @@ pub fn run_fmt(
                     terminal_path(file)
                 )));
             }
-            Format::Html => {
+            Format::Html | Format::Markdown | Format::Latex | Format::Typst => {
                 return Err(Failure::Plain(format!(
-                    "`fmt` only formats FlatPPL; `{}` is an HTML rendering",
+                    "`fmt` only formats FlatPPL; `{}` is a mathematical document",
                     terminal_path(file)
                 )));
             }

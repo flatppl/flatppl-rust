@@ -657,7 +657,7 @@ impl<'m> Lowerer<'m> {
             items.push(Math::Op(Op::Bar));
             items.extend(intersperse_commas(params.to_vec()));
         }
-        Math::apply(Math::text("Law"), vec![Math::row(items)])
+        Math::apply(Math::Sym(Sym::Law), vec![Math::row(items)])
     }
 
     /// The arguments of `Law(…)`: a record's fields by the same-name rule,
@@ -740,7 +740,7 @@ impl<'m> Lowerer<'m> {
             "inf" => Math::Sym(Sym::Infinity),
             "im" => Math::Sym(Sym::ImagUnit),
             "true" | "false" => Math::text(name),
-            "reals" => Math::Sym(Sym::Reals),
+            "reals" => Math::Sym(Sym::ExtendedReals),
             "posreals" => half_line(Fence::Paren, Math::int(0)),
             "nonnegreals" => half_line(Fence::Bracket, Math::int(0)),
             "unitinterval" => Math::bracket(vec![Math::int(0), Math::int(1)]),
@@ -906,7 +906,7 @@ impl<'m> Lowerer<'m> {
             }
             "lawof" if call.args.len() == 1 && call.named.is_empty() => {
                 let items = self.law_items(call.args[0]);
-                Math::apply(Math::text("Law"), vec![Math::row(items)])
+                Math::apply(Math::Sym(Sym::Law), vec![Math::row(items)])
             }
             "likelihoodof" if call.args.len() == 2 && call.named.is_empty() => {
                 let inputs = self.callable_inputs(id).unwrap_or_default();
@@ -1700,9 +1700,42 @@ pub fn order_kwargs(
 /// standard glyph get it; every other builtin is `name(args)` in roman. Used
 /// by direct calls and by the elementwise body of a broadcast alike.
 pub fn apply_builtin(name: &str, mut args: Vec<Math>) -> Math {
+    // Unresolved keyword slots keep their names, not a guessed parameter role.
+    if matches!(
+        name,
+        "Normal"
+            | "MvNormal"
+            | "StudentT"
+            | "ChiSquared"
+            | "Uniform"
+            | "Gamma"
+            | "Exponential"
+            | "InverseGamma"
+            | "Weibull"
+    ) && args
+        .iter()
+        .any(|a| matches!(a, Math::Relation { rel: Rel::Eq, .. }))
+    {
+        return Math::call(name, args);
+    }
     let n = args.len();
     let mut take = |k: usize| std::mem::replace(&mut args[k], Math::Num(String::new()));
     match (name, n) {
+        // §08 takes a standard deviation. Show its square without folding,
+        // including literal scales, so the displayed parameterisation is clear.
+        ("Normal", 2) => Math::apply(
+            Math::Sym(Sym::Normal),
+            vec![take(0), Math::pow(take(1), Math::int(2))],
+        ),
+        ("MvNormal", 2) => Math::apply(Math::Sym(Sym::Normal), args),
+        ("StudentT", 1) => Math::subscript(Math::letter('t'), take(0)),
+        ("ChiSquared", 1) => Math::SubSup(
+            Box::new(Math::letter('χ')),
+            Box::new(take(0)),
+            Box::new(Math::int(2)),
+        ),
+        ("Uniform", 1) => Math::apply(Math::Sym(Sym::Uniform), args),
+        ("Exponential", 1) => Math::call("Exp", args),
         ("add", 2) => Math::plus(take(0), take(1)),
         ("sub", 2) => Math::minus(take(0), take(1)),
         ("mul", 2) => Math::times(take(0), take(1)),
@@ -1776,11 +1809,11 @@ pub fn apply_builtin(name: &str, mut args: Vec<Math>) -> Math {
         ),
         ("Lebesgue", 0) => Math::Sym(Sym::Lebesgue),
         ("Lebesgue", 1) => match take(0) {
-            Math::Sym(Sym::Reals) => Math::Sym(Sym::Lebesgue),
+            Math::Sym(Sym::Reals | Sym::ExtendedReals) => Math::Sym(Sym::Lebesgue),
             s => Math::subscript(Math::Sym(Sym::Lebesgue), s),
         },
         ("Dirac", 1) => Math::subscript(Math::Sym(Sym::Dirac), take(0)),
-        ("lawof", 1) => Math::call("Law", vec![take(0)]),
+        ("lawof", 1) => Math::apply(Math::Sym(Sym::Law), vec![take(0)]),
         ("densityof", 2) => Math::apply(Math::subscript(Math::letter('p'), take(0)), vec![take(1)]),
         ("logdensityof", 2) => Math::row(vec![
             Math::text("log"),
@@ -1922,7 +1955,10 @@ mod tests {
         assert_eq!(rows.len(), 4, "flatppl_compat has no row");
         let mu = row_named(&rows, "mu");
         assert_eq!(mu.statement.rel, Rel::In);
-        assert_eq!(mathml::expr(&mu.statement.rhs), "<mi>ℝ</mi>");
+        assert_eq!(
+            mathml::expr(&mu.statement.rhs),
+            "<mover><mi>ℝ</mi><mo>¯</mo></mover>"
+        );
         let c = row_named(&rows, "c");
         assert_eq!(c.annotation.as_deref(), Some("external input"));
         assert!(mathml::expr(&c.statement.rhs).starts_with(
@@ -1933,7 +1969,7 @@ mod tests {
         assert_eq!(x.kind, Kind::Draw);
         assert_eq!(
             mathml::expr(&x.statement.rhs),
-            "<mrow><mi>Normal</mi><mo>&#x2061;</mo><mrow><mo stretchy=\"false\">(</mo><mi data-flatppl-ref=\"mu\">μ</mi><mo>,</mo><mn>1</mn><mo stretchy=\"false\">)</mo></mrow></mrow>"
+            "<mrow><mi>𝒩</mi><mo>&#x2061;</mo><mrow><mo stretchy=\"false\">(</mo><mi data-flatppl-ref=\"mu\">μ</mi><mo>,</mo><msup><mn>1</mn><mn>2</mn></msup><mo stretchy=\"false\">)</mo></mrow></mrow>"
         );
         let y = row_named(&rows, "y");
         assert_eq!(y.kind, Kind::Value);
@@ -1944,7 +1980,7 @@ mod tests {
     fn keyword_arguments_take_their_declared_positions_or_stay_labelled() {
         assert_eq!(
             rhs("d = Normal(sigma = 2.0, mu = 1.0)", "d"),
-            "<mrow><mi>Normal</mi><mo>&#x2061;</mo><mrow><mo stretchy=\"false\">(</mo><mn>1</mn><mo>,</mo><mn>2</mn><mo stretchy=\"false\">)</mo></mrow></mrow>"
+            "<mrow><mi>𝒩</mi><mo>&#x2061;</mo><mrow><mo stretchy=\"false\">(</mo><mn>1</mn><mo>,</mo><msup><mn>2</mn><mn>2</mn></msup><mo stretchy=\"false\">)</mo></mrow></mrow>"
         );
         assert!(
             rhs("d = Gamma(shape = 4.0, rate = 2.0)", "d")
@@ -2036,7 +2072,7 @@ mod tests {
         // A mixed spelling keeps every component under the construct name.
         let mixed = rhs("m = joint(Normal(0, 1), b = Exponential(1))", "m");
         assert!(mixed.starts_with("<mrow><mi>joint</mi>"), "{mixed}");
-        assert!(mixed.contains("<mi>Normal</mi>") && mixed.contains("<mi>Exponential</mi>"));
+        assert!(mixed.contains("<mi>𝒩</mi>") && mixed.contains("<mi>Exp</mi>"));
         // A standard-module distribution holds no draw: still a product.
         let std = rhs(
             "h = standard_module(\"particle-physics\", \"0.1\")\nm = joint(h.CrystalBall(5.0, 0.3, 1.5, 2.0), Normal(0, 1))",
@@ -2080,7 +2116,7 @@ mod tests {
         );
         let y = mathml::expr(&row_named(&rows, "y").statement.rhs);
         assert!(y.starts_with("<mrow><munderover><mo>⨂</mo><mrow><mi>i</mi><mo>=</mo><mn>1</mn></mrow><mi data-flatppl-ref=\"J\">J</mi></munderover>"), "{y}");
-        assert!(y.contains("<msub><mi data-flatppl-ref=\"theta\">θ</mi><mi>i</mi></msub><mo>,</mo><msub><mi data-flatppl-ref=\"s\">s</mi><mi>i</mi></msub>"));
+        assert!(y.contains("<msub><mi data-flatppl-ref=\"theta\">θ</mi><mi>i</mi></msub><mo>,</mo><msup><msub><mi data-flatppl-ref=\"s\">s</mi><mi>i</mi></msub><mn>2</mn></msup>"));
         let means = mathml::expr(&row_named(&rows, "means").statement.rhs);
         assert!(
             means.starts_with("<msubsup><mrow><mo stretchy=\"false\">(</mo>"),
@@ -2110,14 +2146,14 @@ mod tests {
         let prior = mathml::expr(&row_named(&rows, "prior").statement.rhs);
         assert_eq!(
             prior,
-            "<mrow><mi>Law</mi><mo>&#x2061;</mo><mrow><mo stretchy=\"false\">(</mo><mrow><mi data-flatppl-ref=\"mu\">μ</mi><mo>,</mo><mi data-flatppl-ref=\"tau\">τ</mi><mo>,</mo><mi data-flatppl-ref=\"theta\">θ</mi></mrow><mo stretchy=\"false\">)</mo></mrow></mrow>"
+            "<mrow><mi>ℒ</mi><mo>&#x2061;</mo><mrow><mo stretchy=\"false\">(</mo><mrow><mi data-flatppl-ref=\"mu\">μ</mi><mo>,</mo><mi data-flatppl-ref=\"tau\">τ</mi><mo>,</mo><mi data-flatppl-ref=\"theta\">θ</mi></mrow><mo stretchy=\"false\">)</mo></mrow></mrow>"
         );
         let k = row_named(&rows, "K");
         assert_eq!(k.kind, Kind::Callable);
         let lhs = mathml::expr(&k.statement.lhs);
         assert!(lhs.starts_with("<mrow><mi data-flatppl-ref=\"K\">K</mi><mo>&#x2061;</mo><mrow><mo stretchy=\"false\">(</mo><mi data-flatppl-ref=\"mu\">μ</mi>"), "{lhs}");
         let rhs = mathml::expr(&k.statement.rhs);
-        assert!(rhs.contains("<mi>Law</mi>"), "{rhs}");
+        assert!(rhs.contains("<mi>ℒ</mi>"), "{rhs}");
         assert!(rhs.contains("<mi data-flatppl-ref=\"y\">y</mi><mo stretchy=\"false\">|</mo><mi data-flatppl-ref=\"mu\">μ</mi><mo>,</mo><mi data-flatppl-ref=\"tau\">τ</mi>"), "{rhs}");
         let l = row_named(&rows, "L");
         assert_eq!(l.kind, Kind::Likelihood);
@@ -2180,7 +2216,7 @@ mod tests {
             mathml::expr(&g.lhs),
             "<mrow><mi data-flatppl-ref=\"g\">g</mi><mo>&#x2061;</mo><mrow><mo stretchy=\"false\">(</mo><mo stretchy=\"false\">)</mo></mrow></mrow>"
         );
-        assert!(mathml::expr(&g.rhs).starts_with("<mrow><mi>Normal</mi>"));
+        assert!(mathml::expr(&g.rhs).starts_with("<mrow><mi>𝒩</mi>"));
         // In expression position a closed reification is its body.
         let h = mathml::expr(&row_named(&rows, "h").statement.rhs);
         assert!(!h.contains("↦"), "{h}");
@@ -2354,7 +2390,7 @@ mod tests {
         assert!(k.starts_with("<mrow><mrow><mi data-flatppl-ref=\"h\">h</mi><mo>.</mo><mi>kallen</mi></mrow><mo>&#x2061;</mo>"), "{k}");
         assert_eq!(row_named(&rows, "h").kind, Kind::Module);
         let d = mathml::expr(&row_named(&rows, "d").statement.rhs);
-        assert!(d.starts_with("<mrow><mi>load_data</mi><mo>&#x2061;</mo><mrow><mo stretchy=\"false\">(</mo><mtext>\"x.csv\"</mtext><mo>,</mo><msup><mi>ℝ</mi><mn>4</mn></msup>"), "{d}");
+        assert!(d.starts_with("<mrow><mi>load_data</mi><mo>&#x2061;</mo><mrow><mo stretchy=\"false\">(</mo><mtext>\"x.csv\"</mtext><mo>,</mo><msup><mover><mi>ℝ</mi><mo>¯</mo></mover><mn>4</mn></msup>"), "{d}");
         assert!(
             mathml::expr(&row_named(&rows, "b").statement.rhs)
                 .starts_with("<mrow><mi>bincounts</mi>")

@@ -97,6 +97,12 @@ pub enum Sym {
     /// The imaginary unit, upright.
     ImagUnit,
     Reals,
+    /// Extended reals, the predefined FlatPPL `reals` set (§03).
+    ExtendedReals,
+    /// Distribution and law symbols, distinct from author-named variables.
+    Normal,
+    Uniform,
+    Law,
     Integers,
     Complexes,
     Booleans,
@@ -508,6 +514,12 @@ impl Math {
             // The body of a big operator: an additive or logical body is
             // bracketed (`∏ⱼ (Aᵢⱼ + Bⱼₖ)`), a product is not (`∑ⱼ Aᵢⱼ Bⱼₖ`).
             Math::BigOp { .. } => child.prec() <= 3,
+            // A second superscript must not look like an exponent tower.
+            Math::Sup(..) | Math::SubSup(..)
+                if slot == Slot::Base && matches!(child, Math::Sup(..) | Math::SubSup(..)) =>
+            {
+                true
+            }
             // The base of a script needs brackets unless it reads as one unit
             // (`x_i^2`, `f(x)^2`, `2^3`; but `(−2)^3`, `(2x)^3`, `(a + b)_2`).
             Math::Sub(..) | Math::Sup(..) | Math::SubSup(..) if slot == Slot::Base => {

@@ -37,8 +37,9 @@
 //! is one row named `a` with `names: ["a", "b"]`, and `order` lists row names
 //! only. `refs` lists the *other* rows a row refers to, in order of
 //! appearance, its own names excluded. An empty `formats` means `["mathml"]`;
-//! formats other than `mathml` are not produced yet, and asking for one adds a
-//! module-level diagnostic rather than failing.
+//! `tex` and `typst` give native math source without delimiters. Unknown
+//! formats add a module-level diagnostic rather than failing. The notation
+//! key uses the same requested formats as the binding rows.
 
 use std::collections::HashMap;
 
@@ -73,6 +74,19 @@ struct Response {
     doc: Option<ModuleDocJson>,
     bindings: Vec<BindingJson>,
     diagnostics: Vec<DiagnosticJson>,
+    notation: Vec<NotationJson>,
+}
+
+#[derive(Serialize)]
+struct NotationJson {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mathml: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tex: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    typst: Option<String>,
+    source: String,
+    note: String,
 }
 
 #[derive(Serialize)]
@@ -94,6 +108,10 @@ struct BindingJson {
     kind: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     mathml: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tex: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    typst: Option<String>,
     refs: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     loc: Option<Loc>,
@@ -126,11 +144,14 @@ pub fn render_math(input: &str) -> Result<String, String> {
 }
 
 fn to_response(rendering: Rendering, want_mathml: bool, formats: &[String]) -> Response {
+    let want_tex = formats.iter().any(|f| f == "tex");
+    let want_typst = formats.iter().any(|f| f == "typst");
     let Rendering {
         order,
         bindings,
         diagnostics,
         module_doc,
+        notation,
     } = rendering;
     let mut diagnostics: Vec<DiagnosticJson> = diagnostics
         .into_iter()
@@ -151,10 +172,10 @@ fn to_response(rendering: Rendering, want_mathml: bool, formats: &[String]) -> R
         }
     });
     for f in formats {
-        if f != "mathml" {
+        if !matches!(f.as_str(), "mathml" | "tex" | "typst") {
             diagnostics.push(DiagnosticJson {
                 binding: String::new(),
-                message: format!("format `{f}` is not available yet; only `mathml` is produced"),
+                message: format!("unsupported format `{f}`; use `mathml`, `tex`, or `typst`"),
             });
         }
     }
@@ -176,6 +197,8 @@ fn to_response(rendering: Rendering, want_mathml: bool, formats: &[String]) -> R
             names: b.names,
             kind: b.kind.as_str(),
             mathml: want_mathml.then_some(b.mathml),
+            tex: want_tex.then(|| crate::tex::statement(&b.statement)),
+            typst: want_typst.then(|| crate::typst::statement(&b.statement)),
             refs: b.refs,
             loc: b.loc.map(|(start, end)| Loc { start, end }),
             annotation: b.annotation,
@@ -183,6 +206,16 @@ fn to_response(rendering: Rendering, want_mathml: bool, formats: &[String]) -> R
         });
     }
     Response {
+        notation: notation
+            .into_iter()
+            .map(|n| NotationJson {
+                mathml: want_mathml.then(|| crate::mathml::expr(&n.form)),
+                tex: want_tex.then(|| crate::tex::expr(&n.form)),
+                typst: want_typst.then(|| crate::typst::expr(&n.form)),
+                source: n.source,
+                note: n.note,
+            })
+            .collect(),
         order,
         doc,
         bindings: rows,
@@ -200,13 +233,22 @@ mod tests {
             "source": "%%%\n# Title\n\nAbstract with $\\mu$.\n%%%\nflatppl_compat = \"0.1\"\n% the mean, $\\bad{x}$\nmu ~ Normal(0, 5)\nx = 2 * mu\na, b ~ MvNormal(mu = [0.0, 0.0], cov = eye(2))",
             "path": "m.flatppl",
             "bundle": {},
-            "formats": ["mathml", "typst"]
+            "formats": ["mathml", "tex", "typst", "svg"]
         })
         .to_string();
         let out = render_math(&input).expect("renders");
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["order"], serde_json::json!(["mu", "x", "a"]));
         assert_eq!(v["bindings"][0]["kind"], "draw");
+        let tex = v["bindings"][0]["tex"].as_str().expect("plain TeX");
+        assert!(tex.contains(r"\mathcal{N}\left(0, {5}^{2}\right)"), "{tex}");
+        assert!(!tex.contains("htmlData"));
+        assert!(
+            v["bindings"][0]["typst"]
+                .as_str()
+                .unwrap()
+                .contains("attach(5, tr: 2)")
+        );
         assert!(
             v["bindings"][0]["mathml"]
                 .as_str()
@@ -216,6 +258,19 @@ mod tests {
         assert_eq!(v["bindings"][2]["names"], serde_json::json!(["a", "b"]));
         assert_eq!(v["bindings"][0]["refs"], serde_json::json!([]));
         assert_eq!(v["bindings"][1]["refs"], serde_json::json!(["mu"]));
+        let normal = v["notation"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["source"] == "Normal(mu, sigma)")
+            .unwrap();
+        assert!(
+            normal["mathml"]
+                .as_str()
+                .unwrap()
+                .contains("<msup><mi>σ</mi><mn>2</mn></msup>")
+        );
+        assert!(normal["note"].as_str().unwrap().contains("variance"));
         assert!(v["bindings"][0]["loc"]["start"].is_number());
         assert_eq!(v["doc"]["title"], "Title");
         assert!(
@@ -244,7 +299,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|d| d["message"].as_str().unwrap().contains("typst"))
+                .any(|d| d["message"].as_str().unwrap().contains("svg"))
         );
     }
 
