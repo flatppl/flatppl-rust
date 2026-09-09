@@ -10,15 +10,18 @@
 //!
 //! Doc-comment Markdown renders through `pulldown-cmark`; its `$…$` math
 //! through `latex2mathml`, falling back to the LaTeX source in `<code>` for
-//! anything that converter does not know.
+//! anything that converter does not know. The page is served to a browser, so
+//! the Markdown is sanitised: raw HTML in a doc-comment is shown as text, and
+//! a link or image whose target is not `http(s)`, `mailto`, a fragment or a
+//! relative path loses its target.
 
 use std::fmt::Write;
 
-use flatppl_core::{CallHead, Doc, Module, Node};
-use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use flatppl_core::{CallHead, Doc, Module, Node, NodeId};
+use pulldown_cmark::{CowStr, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
 use crate::ast::Math;
-use crate::lower::{self, Lowerer};
+use crate::lower::Lowerer;
 use crate::mathml::{self, escape};
 use crate::render::Rendering;
 
@@ -63,10 +66,7 @@ pub fn html(module: &Module, rendering: &Rendering, fallback_title: &str) -> Str
                 });
             }
         }
-        if b.annotation
-            .as_deref()
-            .is_some_and(|a| a.contains("data appendix"))
-        {
+        if b.elided {
             elided.push(&b.name);
         }
         block.push(row_html(b, annotation.as_deref()));
@@ -104,7 +104,14 @@ pub fn html(module: &Module, rendering: &Rendering, fallback_title: &str) -> Str
                     rel: crate::ast::Rel::Eq,
                     rhs: value,
                 };
-                let _ = writeln!(body, "{}", mathml::fragment(name, &stmt));
+                // Not a `fragment`: the row above already carries the
+                // binding's `data-flatppl-binding` hook, and the page must
+                // name each binding once.
+                let _ = writeln!(
+                    body,
+                    "<math display=\"block\" class=\"flatppl-data-value\">{}</math>",
+                    mathml::statement(&stmt)
+                );
             }
         }
         body.push_str("</section>\n");
@@ -164,7 +171,8 @@ fn split_title(md: &str, fallback: &str) -> (String, String) {
 }
 
 /// Markdown → HTML with `$…$` math as MathML and headings shifted one level
-/// down (the document title is the only `<h1>`).
+/// down (the document title is the only `<h1>`). Raw HTML in the Markdown is
+/// emitted as text, and link and image targets pass [`safe_url`].
 pub fn markdown(md: &str) -> String {
     let mut options = Options::empty();
     options.insert(Options::ENABLE_MATH);
@@ -173,6 +181,8 @@ pub fn markdown(md: &str) -> String {
     let parser = Parser::new_ext(md, options).map(|event| match event {
         Event::InlineMath(src) => Event::InlineHtml(doc_math(&src, false).into()),
         Event::DisplayMath(src) => Event::Html(doc_math(&src, true).into()),
+        // Author HTML is content, not markup.
+        Event::Html(raw) | Event::InlineHtml(raw) => Event::Text(raw),
         Event::Start(Tag::Heading {
             level,
             id,
@@ -185,11 +195,60 @@ pub fn markdown(md: &str) -> String {
             attrs,
         }),
         Event::End(TagEnd::Heading(level)) => Event::End(TagEnd::Heading(shift_heading(level))),
+        Event::Start(Tag::Link {
+            link_type,
+            dest_url,
+            title,
+            id,
+        }) => Event::Start(Tag::Link {
+            link_type,
+            dest_url: safe_url(dest_url),
+            title,
+            id,
+        }),
+        Event::Start(Tag::Image {
+            link_type,
+            dest_url,
+            title,
+            id,
+        }) => Event::Start(Tag::Image {
+            link_type,
+            dest_url: safe_url(dest_url),
+            title,
+            id,
+        }),
         other => other,
     });
     let mut out = String::new();
     pulldown_cmark::html::push_html(&mut out, parser);
     out
+}
+
+/// A link or image target the page may carry: `http(s)`, `mailto`, a
+/// fragment, or a relative path. Anything with another scheme (`javascript:`,
+/// `data:`, `vbscript:`, …) is replaced by an empty target.
+fn safe_url(url: CowStr<'_>) -> CowStr<'_> {
+    let lower = url.trim().to_ascii_lowercase();
+    let allowed_scheme = ["http:", "https:", "mailto:"]
+        .iter()
+        .any(|s| lower.starts_with(s));
+    // A scheme is a non-empty run of letters, digits, `+`, `-`, `.` ending
+    // in `:` before any `/`, `?` or `#`.
+    let has_scheme = match lower.find(':') {
+        Some(i) => {
+            i > 0
+                && lower[..i]
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c))
+                && lower.find(['/', '?', '#']).is_none_or(|j| i < j)
+        }
+        None => false,
+    };
+    if allowed_scheme || !has_scheme {
+        url
+    } else {
+        CowStr::Borrowed("")
+    }
 }
 
 fn shift_heading(level: HeadingLevel) -> HeadingLevel {
@@ -325,32 +384,29 @@ fn notation_section(module: &Module, rendering: &Rendering) -> String {
     out
 }
 
-fn collect_distributions(module: &Module, node: flatppl_core::NodeId, out: &mut Vec<String>) {
-    if let Node::Call(call) = module.node(node)
-        && let CallHead::Builtin(head) = call.head
-    {
-        let name = module.resolve(head);
-        if flatppl_infer::builtin_catalogue().base_is_distribution(name)
+/// The base distributions named under `root`: call heads, and the bare atoms a
+/// broadcast applies (`Normal.(…)`).
+fn collect_distributions(module: &Module, root: NodeId, out: &mut Vec<String>) {
+    let catalogue = flatppl_infer::builtin_catalogue();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        let name = match module.node(node) {
+            Node::Call(call) => match call.head {
+                CallHead::Builtin(head) => Some(module.resolve(head)),
+                CallHead::User(_) => None,
+            },
+            Node::Const(sym) => Some(module.resolve(*sym)),
+            _ => None,
+        };
+        if let Some(name) = name
+            && catalogue.base_is_distribution(name)
             && !out.iter().any(|d| d == name)
         {
             out.push(name.to_string());
         }
+        module.for_each_child(node, |c| stack.push(c));
     }
-    // Broadcast heads are bare atoms.
-    if let Node::Const(sym) = module.node(node) {
-        let name = module.resolve(*sym);
-        if flatppl_infer::builtin_catalogue().base_is_distribution(name)
-            && !out.iter().any(|d| d == name)
-        {
-            out.push(name.to_string());
-        }
-    }
-    module.for_each_child(node, |c| collect_distributions(module, c, out));
 }
-
-// Keep `lower` referenced for the appendix threshold documentation.
-#[allow(dead_code)]
-const _: usize = lower::INLINE_ARRAY_LIMIT;
 
 #[cfg(test)]
 mod tests {
@@ -408,5 +464,41 @@ mod tests {
         assert!(out.contains("<code>$\\undefinedmacro{x}$</code>"), "{out}");
         let out = markdown("see $x^2$ here");
         assert!(out.contains("<math"), "{out}");
+    }
+
+    #[test]
+    fn doc_comment_html_is_text_and_unsafe_link_targets_are_dropped() {
+        let out = markdown("a <script>alert(1)</script> b\n\n<img src=x onerror=alert(1)>\n");
+        assert!(!out.contains("<script>"), "{out}");
+        assert!(out.contains("&lt;script&gt;"), "{out}");
+        assert!(!out.contains("<img"), "{out}");
+        let out = markdown(
+            "[x](javascript:alert(1)) [y](https://example.org/p?q=1#f) [z](../rel/p.html) [w](#frag) [v](mailto:a@b.c) [u](DATA:text/html,hi)",
+        );
+        assert!(!out.contains("javascript:"), "{out}");
+        assert!(!out.to_ascii_lowercase().contains("data:"), "{out}");
+        assert!(
+            out.contains("href=\"https://example.org/p?q=1#f\""),
+            "{out}"
+        );
+        assert!(out.contains("href=\"../rel/p.html\""), "{out}");
+        assert!(out.contains("href=\"#frag\""), "{out}");
+        assert!(out.contains("href=\"mailto:a@b.c\""), "{out}");
+        // A colon inside a path or query is not a scheme.
+        let out = markdown("[p](dir/a:b.html) [q](?k=a:b)");
+        assert!(out.contains("href=\"dir/a:b.html\""), "{out}");
+        assert!(out.contains("href=\"?k=a:b\""), "{out}");
+        // Images go through the same filter.
+        let out = markdown("![i](javascript:alert(1)) ![j](https://example.org/i.png)");
+        assert!(!out.contains("javascript:"), "{out}");
+        assert!(out.contains("src=\"https://example.org/i.png\""), "{out}");
+    }
+
+    #[test]
+    fn the_data_appendix_names_each_binding_once() {
+        let src = "xs = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0]";
+        let p = page(src);
+        assert_eq!(p.matches("data-flatppl-binding=\"xs\"").count(), 1, "{p}");
+        assert!(p.contains("class=\"flatppl-data-value\""));
     }
 }
