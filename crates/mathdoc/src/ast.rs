@@ -379,9 +379,14 @@ impl Math {
             }
             other => other,
         };
+        // Juxtaposition needs symbols that separate by themselves (`2x`,
+        // `β xᵢ`). A multi-letter name on either side would fuse with its
+        // neighbour (`cpar`, `c exp(−x)` without a gap), so it takes a dot.
         let explicit = rhs.starts_with_number()
             || matches!(rhs, Math::Unary { .. })
-            || (lhs.ends_with_number() && rhs.starts_with_number());
+            || (lhs.ends_with_number() && rhs.starts_with_number())
+            || lhs.ends_with_word()
+            || rhs.starts_with_word();
         let op = if explicit {
             BinOp::Dot
         } else {
@@ -603,6 +608,32 @@ impl Math {
         }
     }
 
+    /// A multi-letter name (an upright word identifier or an operator name)
+    /// at the very start: `par`, `exp(−x)`, `std_errs_dataᵢ`.
+    fn starts_with_word(&self) -> bool {
+        match self {
+            Math::Ident(id) => matches!(id.display.head, crate::names::Atom::Word(_)),
+            Math::Text(_) => true,
+            Math::Row(items) => items.first().is_some_and(Math::starts_with_word),
+            Math::Binary { lhs, .. } => lhs.starts_with_word(),
+            Math::Apply { head, .. } => head.starts_with_word(),
+            Math::Sub(b, _) | Math::Sup(b, _) | Math::SubSup(b, _, _) => b.starts_with_word(),
+            _ => false,
+        }
+    }
+
+    /// A multi-letter name at the very end, scripts included: `par`, `parᵢ`.
+    fn ends_with_word(&self) -> bool {
+        match self {
+            Math::Ident(id) => matches!(id.display.head, crate::names::Atom::Word(_)),
+            Math::Text(_) => true,
+            Math::Row(items) => items.last().is_some_and(Math::ends_with_word),
+            Math::Binary { rhs, .. } => rhs.ends_with_word(),
+            Math::Sub(b, _) | Math::Sup(b, _) | Math::SubSup(b, _, _) => b.ends_with_word(),
+            _ => false,
+        }
+    }
+
     /// The direct sub-expressions, in reading order.
     pub fn children(&self) -> Vec<&Math> {
         match self {
@@ -744,6 +775,50 @@ pub enum Slot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_word_in_a_product_takes_a_dot() {
+        let c = Math::binding("c");
+        let par = Math::binding("par");
+        assert!(matches!(
+            Math::times(c.clone(), par.clone()),
+            Math::Binary { op: BinOp::Dot, .. }
+        ));
+        assert!(matches!(
+            Math::times(par.clone(), c.clone()),
+            Math::Binary { op: BinOp::Dot, .. }
+        ));
+        assert!(matches!(
+            Math::times(Math::int(2), par),
+            Math::Binary { op: BinOp::Dot, .. }
+        ));
+        let exp = Math::call("exp", vec![Math::negate(Math::binding("x"))]);
+        assert!(matches!(
+            Math::times(c.clone(), exp),
+            Math::Binary { op: BinOp::Dot, .. }
+        ));
+        let data_i = Math::subscript(Math::binding("std_errs_data"), Math::ident("i", None));
+        assert!(matches!(
+            Math::times(c.clone(), data_i),
+            Math::Binary { op: BinOp::Dot, .. }
+        ));
+        // Single letters, scripted or not, still juxtapose.
+        let x_i = Math::subscript(Math::binding("x"), Math::ident("i", None));
+        assert!(matches!(
+            Math::times(Math::binding("beta"), x_i),
+            Math::Binary {
+                op: BinOp::Juxtapose,
+                ..
+            }
+        ));
+        assert!(matches!(
+            Math::times(c, Math::binding("theta1")),
+            Math::Binary {
+                op: BinOp::Juxtapose,
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn multiplication_keeps_numeric_products_explicit_and_symbolic_order() {
