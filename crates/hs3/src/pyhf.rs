@@ -10,7 +10,7 @@ use crate::error::{Error, Result};
 use crate::histfactory::{
     AuxOverride, Effect, ParamDomain, PendingConstraint, PyhfParamset, emit_lumi_constraint,
     emit_normal01_constraint, emit_shapesys_constraint, emit_staterror_constraint, mod_spec,
-    modifier_effect, require_param, require_spec, sample_nominal,
+    modifier_effect, require_param, require_spec, sample_nominal, staterror_gaussian,
 };
 use crate::model::{PyhfDocument, PyhfParam, SampleData};
 use flatppl_core::Module;
@@ -766,11 +766,10 @@ pub fn assemble_channel(
                     errors.push(e);
                 }
 
-                let gaussian = match modifier.constraint.as_deref() {
-                    Some("Gauss") | Some("Gaussian") => true,
-                    Some(_) => false,
-                    None => terms.staterror_gaussian_default,
-                };
+                let gaussian = staterror_gaussian(
+                    modifier.constraint.as_deref(),
+                    terms.staterror_gaussian_default,
+                )?;
                 let first = terms
                     .staterror_gaussian
                     .entry(param_name.to_string())

@@ -356,6 +356,45 @@ pub fn interp_fn(code: Option<&str>, default: &'static str) -> Result<&'static s
     }
 }
 
+// HS3 staterror constraint types (the `constraint` / `constraint_type` field).
+//
+// The HS3 standard enumerates three: "The supported constraint distributions,
+// also called constraint types, are Gauss […], Poisson […], or LogNormal"
+// (HS3 §HistFactory). ROOT's reader accepts the same set spelled `Gauss`,
+// `Poisson`, `Const` and `Lognormal`
+// (`roofit/hs3/src/JSONFactories_HistFactory.cxx`,
+// `isLegacyConstraintType`), and its writer emits `Gaussian` for the Gaussian
+// family (`constraint_type_alias.rs`).
+const CONSTRAINT_GAUSS: [&str; 2] = ["Gauss", "Gaussian"];
+const CONSTRAINT_POISSON: [&str; 1] = ["Poisson"];
+/// Constraint types HS3 or ROOT defines that this importer does not lower.
+///
+/// `Const` is ROOT's "hold the parameter fixed, emit no auxiliary term";
+/// `LogNormal` / `Lognormal` is the unit log-normal penalty.
+const CONSTRAINT_UNIMPLEMENTED: [&str; 3] = ["Const", "LogNormal", "Lognormal"];
+
+/// Resolve a staterror modifier's constraint type to its auxiliary family.
+/// `true` means Gaussian, `false` Poisson.
+///
+/// `default` applies when the field is absent — Gaussian for pyhf, Poisson for
+/// native HS3 (§12 "HS³/RooFit measure algebra mapping").
+///
+/// The set is closed. An unlisted spelling used to fall through to the Poisson
+/// family, so `Poison` silently changed the emitted auxiliary measurement.
+pub fn staterror_gaussian(constraint: Option<&str>, default: bool) -> Result<bool> {
+    match constraint {
+        None => Ok(default),
+        Some(c) if CONSTRAINT_GAUSS.contains(&c) => Ok(true),
+        Some(c) if CONSTRAINT_POISSON.contains(&c) => Ok(false),
+        Some(c) if CONSTRAINT_UNIMPLEMENTED.contains(&c) => Err(Error::Unimplemented(format!(
+            "staterror constraint type `{c}`"
+        ))),
+        Some(c) => Err(Error::Unsupported(format!(
+            "unknown staterror constraint type `{c}`"
+        ))),
+    }
+}
+
 /// pyhf's `paramset_type` for a modifier kind.
 ///
 /// This is the FOREIGN tool's classification, used for one purpose: deciding
@@ -762,6 +801,35 @@ mod tests {
         );
         let err = interp_fn(Some("parabolik"), INTERP_NORMSYS_DEFAULT).unwrap_err();
         assert!(err.to_string().contains("parabolik"), "got: {err}");
+    }
+
+    #[test]
+    fn staterror_constraint_types_are_closed() {
+        // The absent field takes the caller's dialect default, both ways.
+        assert!(staterror_gaussian(None, true).unwrap());
+        assert!(!staterror_gaussian(None, false).unwrap());
+
+        for spelling in CONSTRAINT_GAUSS {
+            assert!(
+                staterror_gaussian(Some(spelling), false).unwrap(),
+                "{spelling} must select the Gaussian family"
+            );
+        }
+        for spelling in CONSTRAINT_POISSON {
+            assert!(
+                !staterror_gaussian(Some(spelling), true).unwrap(),
+                "{spelling} must select the Poisson family"
+            );
+        }
+        for spelling in CONSTRAINT_UNIMPLEMENTED {
+            let err = staterror_gaussian(Some(spelling), false).unwrap_err();
+            assert!(matches!(err, Error::Unimplemented(_)), "got: {err}");
+            assert!(err.to_string().contains(spelling), "got: {err}");
+        }
+
+        let err = staterror_gaussian(Some("Poison"), false).unwrap_err();
+        assert!(matches!(err, Error::Unsupported(_)), "got: {err}");
+        assert!(err.to_string().contains("Poison"), "got: {err}");
     }
 
     #[test]

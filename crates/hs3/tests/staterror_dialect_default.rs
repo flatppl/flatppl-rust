@@ -96,3 +96,67 @@ fn shared_staterror_accepts_equivalent_constraint_families() {
         assert!(text.contains(family), "{text}");
     }
 }
+
+/// `HS3` with `constraint_type` set on its one staterror modifier.
+fn constrained_staterror(constraint: &str) -> String {
+    let mut source: serde_json::Value = serde_json::from_str(HS3).unwrap();
+    source["distributions"][0]["samples"][1]["modifiers"][0]["constraint_type"] = constraint.into();
+    source.to_string()
+}
+
+#[test]
+fn an_unknown_staterror_constraint_type_is_refused() {
+    // A misspelling used to fall through to the Poisson family, so `Poison`
+    // emitted a ContinuedPoisson aux and exited 0.
+    for constraint in ["Poison", "Gaus", "gauss", "poisson", "Normal", ""] {
+        let err = flatppl_hs3::read_hs3(&constrained_staterror(constraint))
+            .expect_err("an unlisted constraint type must be refused, not defaulted");
+        let message = err.to_string();
+        assert!(
+            message.contains("unknown staterror constraint type") && message.contains(constraint),
+            "the error must name the rejected spelling: {message}"
+        );
+    }
+}
+
+#[test]
+fn a_known_but_unlowered_staterror_constraint_type_is_refused() {
+    // HS3 defines LogNormal (ROOT spells it Lognormal) and ROOT adds Const.
+    // Both are valid source documents this importer does not lower, so they
+    // take the `Unimplemented` marker the conversion testsuite reads as a skip.
+    for constraint in ["LogNormal", "Lognormal", "Const"] {
+        let err = flatppl_hs3::read_hs3(&constrained_staterror(constraint))
+            .expect_err("an unlowered constraint type must be refused, not defaulted");
+        let message = err.to_string();
+        assert!(
+            message.starts_with("unimplemented HS3 construct: ") && message.contains(constraint),
+            "the error must mark the gap and name the type: {message}"
+        );
+    }
+}
+
+#[test]
+fn both_known_staterror_constraint_families_still_import() {
+    for (constraint, family, other) in [
+        (
+            "Gauss",
+            "broadcast(Normal, st, st_delta)",
+            "ContinuedPoisson",
+        ),
+        (
+            "Gaussian",
+            "broadcast(Normal, st, st_delta)",
+            "ContinuedPoisson",
+        ),
+        (
+            "Poisson",
+            "hepphys.ContinuedPoisson",
+            "broadcast(Normal, st,",
+        ),
+    ] {
+        let module = flatppl_hs3::read_hs3(&constrained_staterror(constraint)).unwrap();
+        let text = flatppl_syntax::print_with(&module, flatppl_syntax::Syntax::Minimal);
+        assert!(text.contains(family), "{constraint}:\n{text}");
+        assert!(!text.contains(other), "{constraint}:\n{text}");
+    }
+}
