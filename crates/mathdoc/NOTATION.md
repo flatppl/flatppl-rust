@@ -83,6 +83,10 @@ It is how the row is written, not a symbol the reader has to interpret, so
 the legend does not list it (unlike the set letter 𝘈, which stands on both
 sides of a row). No other name is restyled by what it holds.
 
+Two names never become one symbol. When two bindings of a module would print
+alike (`theta1` and `theta_1` both give θ₁), both print as written, as upright
+words, and each row carries a diagnostic naming the pair.
+
 Only a Greek or single-letter head takes subscripts: the head's trailing digits
 first, then each further segment (Greek, letter, word or digits by the same
 rule), comma-separated.

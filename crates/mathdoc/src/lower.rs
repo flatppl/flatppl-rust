@@ -197,6 +197,10 @@ pub struct Lowerer<'m> {
     /// object named `L`, `L1` or `L_x` is `ℒ`, `ℒ₁`, `ℒ_x` (the statistics
     /// convention). The one name rule that reads the inferred types.
     script_names: HashSet<String>,
+    /// Bindings whose display names collide (`theta1` and `theta_1` both
+    /// print θ₁): each maps to the whole group, and all of them print
+    /// verbatim, so two names never become one symbol.
+    verbatim: HashMap<String, Vec<String>>,
 }
 
 /// What a binding's right-hand side lowered to.
@@ -226,7 +230,22 @@ impl<'m> Lowerer<'m> {
             inlining: Vec::new(),
             source,
             script_names: HashSet::new(),
+            verbatim: HashMap::new(),
         };
+        // Group the bindings by what the name rules would print.
+        let mut by_display: HashMap<String, Vec<String>> = HashMap::new();
+        for (_, b) in m.bindings() {
+            let name = m.resolve(b.name).to_string();
+            let key = format!("{:?}", crate::names::display_name(&name));
+            by_display.entry(key).or_default().push(name);
+        }
+        for group in by_display.into_values().filter(|g| g.len() > 1) {
+            let mut group = group;
+            group.sort();
+            for name in &group {
+                lowerer.verbatim.insert(name.clone(), group.clone());
+            }
+        }
         lowerer.script_names = m
             .bindings()
             .filter(|(_, b)| lowerer.kind(b.rhs) == Kind::Likelihood)
@@ -239,19 +258,38 @@ impl<'m> Lowerer<'m> {
     /// Apply the script-head rule to every identifier that denotes one of
     /// [`Self::script_names`].
     fn style_idents(&self, m: &mut Math) {
-        if self.script_names.is_empty() {
+        if self.script_names.is_empty() && self.verbatim.is_empty() {
             return;
         }
         m.for_each_ident_mut(&mut |id| {
-            if id
-                .target
-                .as_deref()
-                .is_some_and(|t| self.script_names.contains(t))
+            let Some(target) = id.target.as_deref() else {
+                return;
+            };
+            if self.verbatim.contains_key(target) {
+                id.display = crate::names::DisplayName {
+                    head: crate::names::Atom::Word(target.to_string()),
+                    subs: Vec::new(),
+                };
+            } else if self.script_names.contains(target)
                 && let crate::names::Atom::Letter(c) = id.display.head
             {
                 id.display.head = crate::names::Atom::Script(c);
             }
         });
+    }
+
+    /// The diagnostic a colliding binding's row carries.
+    fn collision_diagnostic(&self, name: &str) -> Option<String> {
+        let group = self.verbatim.get(name)?;
+        let others: Vec<String> = group
+            .iter()
+            .filter(|n| n.as_str() != name)
+            .map(|n| format!("`{n}`"))
+            .collect();
+        Some(format!(
+            "`{name}` and {} would print as the same symbol; both are shown as written",
+            others.join(", ")
+        ))
     }
 
     // ── rows ───────────────────────────────────────────────────────────────
@@ -276,6 +314,9 @@ impl<'m> Lowerer<'m> {
         let mut lowered = lowered.unwrap_or_else(|| self.source_fallback(id, &name));
         self.style_idents(&mut lowered.statement.lhs);
         self.style_idents(&mut lowered.statement.rhs);
+        if let Some(d) = self.collision_diagnostic(&name) {
+            self.diagnostics.push(d);
+        }
         Row {
             binding: id,
             names: vec![name],
@@ -2548,6 +2589,36 @@ mod tests {
             post.contains("<mi mathvariant=\"normal\">d</mi><msub data-flatppl-ref=\"Pi_prior\"><mi>Π</mi><mi>prior</mi></msub>"),
             "{post}"
         );
+    }
+
+    #[test]
+    fn colliding_display_names_print_verbatim_with_a_diagnostic() {
+        let rows = rows("theta1 = 1.0\ntheta_1 = 2.0\nx = theta1 + theta_1\ntheta2 = 3.0");
+        let x = mathml::expr(&row_named(&rows, "x").statement.rhs);
+        assert!(
+            x.contains("<mi data-flatppl-ref=\"theta1\">theta1</mi>"),
+            "{x}"
+        );
+        assert!(
+            x.contains("<mi data-flatppl-ref=\"theta_1\">theta_1</mi>"),
+            "{x}"
+        );
+        for name in ["theta1", "theta_1"] {
+            let row = row_named(&rows, name);
+            assert!(mathml::expr(&row.statement.lhs).contains(&format!(">{name}</mi>")));
+            assert_eq!(row.diagnostics.len(), 1, "{name}");
+            assert!(
+                row.diagnostics[0].contains("same symbol"),
+                "{}",
+                row.diagnostics[0]
+            );
+        }
+        // An uncontested name keeps its symbol, and the row of `x` carries no note.
+        assert!(
+            mathml::expr(&row_named(&rows, "theta2").statement.lhs)
+                .contains("<mi>θ</mi><mn>2</mn>")
+        );
+        assert!(row_named(&rows, "x").diagnostics.is_empty());
     }
 
     #[test]
