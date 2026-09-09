@@ -364,7 +364,7 @@ fn doc_math(latex: &str, display: bool, errors: &mut Vec<String>) -> String {
         math_core::MathDisplay::Inline
     };
     match converter().convert_with_local_state(latex, style) {
-        Ok(result) => result.mathml,
+        Ok(result) => wrap_in_mrow(&result.mathml),
         Err(e) => {
             let delim = if display { "$$" } else { "$" };
             errors.push(format!("math `{latex}`: {e}"));
@@ -374,6 +374,27 @@ fn doc_math(latex: &str, display: bool, errors: &mut Vec<String>) -> String {
             )
         }
     }
+}
+
+/// `<math …>children</math>` → `<math …><mrow>children</mrow></math>`.
+/// math-core writes the children directly under `<math>`; Chromium applies
+/// the operator dictionary (the spacing around `∼`, `=`, `,`) only inside an
+/// `<mrow>`-like element and does not treat the `<math>` root as one, so
+/// without the wrap a doc line renders as `θ∼Normal(μ,τ)`. Temml and the row
+/// printer both write the wrap; wrapping an already single `<mrow>` again is
+/// harmless.
+fn wrap_in_mrow(mathml: &str) -> String {
+    let Some(open_end) = mathml.find('>') else {
+        return mathml.to_string();
+    };
+    let Some(body) = mathml.strip_suffix("</math>") else {
+        return mathml.to_string();
+    };
+    format!(
+        "{}<mrow>{}</mrow></math>",
+        &mathml[..=open_end],
+        &body[open_end + 1..]
+    )
 }
 
 /// One `<mtr>` of the aligned block: lhs, relation, rhs, annotation.
@@ -626,7 +647,7 @@ mod tests {
         assert!(m.errors.is_empty());
         let mu = doc_html(r.bindings[0].doc.as_ref().unwrap());
         assert!(!mu.block);
-        assert!(mu.html.contains("<math><mi>μ</mi>"), "{}", mu.html);
+        assert!(mu.html.contains("<math><mrow><mi>μ</mi>"), "{}", mu.html);
         let tau = doc_html(r.bindings[1].doc.as_ref().unwrap());
         assert!(tau.block);
         assert!(
@@ -644,6 +665,22 @@ mod tests {
         assert!(
             page.contains("<p class=\"flatppl-row-diag\">tau: math `\\bad{x}`"),
             "{page}"
+        );
+    }
+
+    #[test]
+    fn doc_math_children_sit_in_one_mrow_under_the_math_root() {
+        let out = markdown("$\\theta \\sim \\mathrm{Normal}(\\mu, \\tau)$ and $$x = 1$$");
+        assert!(out.contains("<math><mrow><mi>θ</mi>"), "{out}");
+        assert!(out.contains("</mrow></math>"), "{out}");
+        assert!(
+            out.contains("<math display=\"block\"><mrow><mi>x</mi>"),
+            "{out}"
+        );
+        assert_eq!(
+            out.matches("<math").count(),
+            out.matches("</mrow></math>").count(),
+            "{out}"
         );
     }
 
