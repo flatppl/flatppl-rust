@@ -54,6 +54,24 @@ fn bind_line(src: &str, name: &str) -> String {
         .to_string()
 }
 
+#[test]
+fn record_broadcast_collects_table_rows() {
+    let line = bind_line(
+        "t = table(a = [1,2])\nf(r) = record(b = r.a + 1, nested = record(c = r.a))\nu = broadcast(f, r = t)\ny = u[2].nested.c",
+        "y",
+    );
+    assert!(line.contains("(%scalar integer)"), "{line}");
+}
+
+#[test]
+fn record_broadcast_requires_one_axis() {
+    let errs = errors("f(a) = record(x = a)\nt = broadcast(f, addaxes([1,2], 1, 0))");
+    assert!(
+        errs.iter().any(|e| e.contains("requires one axis")),
+        "{errs:?}"
+    );
+}
+
 /// The vector operand whose elements are scalars — the shape every witness below
 /// starts from.
 fn scalar_cells(head: &str, set: &str) -> String {
