@@ -382,25 +382,7 @@ impl<'m, 's> Inferencer<'m, 's> {
         if let (Some(ty), Some(phase)) = (self.tys.get(&id), self.phases.get(&id)) {
             return (ty.clone(), *phase);
         }
-        // Readers bound syntax nesting, but shallow references can form an
-        // arbitrarily deep dependency graph. Share the trace budget with child
-        // modules and restore it before visiting siblings. Memo hits cost no depth.
-        let depth = self.session.trace_depth.get();
-        let next = match depth.deeper("inference graph") {
-            Ok(next) => next,
-            Err(error) => {
-                let message = error.to_string();
-                self.diags.push(Diagnostic::error_at(id, &message));
-                let ty = Type::Failed(message.into());
-                self.tys.insert(id, ty.clone());
-                self.phases.insert(id, Phase::Fixed);
-                return (ty, Phase::Fixed);
-            }
-        };
-        self.session.trace_depth.set(next);
-        let result = self.infer_node_inner(id);
-        self.session.trace_depth.set(depth);
-        result
+        self.infer_node_inner(id)
     }
 
     fn infer_node_inner(&mut self, id: NodeId) -> (Type, Phase) {

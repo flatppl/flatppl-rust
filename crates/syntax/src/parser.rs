@@ -535,12 +535,6 @@ struct ExprParser<'a> {
     /// innermost frame; a match in an outer frame is the spec's DISALLOWED
     /// cross-reification capture and errors.
     reify_frames: Vec<ReifyFrame>,
-    /// Recursion budget for nested expressions. Every nested construct —
-    /// parentheses, call arguments, array elements, index arguments — re-enters
-    /// through `parse_expr`, so guarding that one entry bounds the whole
-    /// precedence ladder. Without it, deeply nested source aborted the process
-    /// with a stack overflow above about 5500 levels instead of refusing.
-    depth: flatppl_core::Depth,
 }
 
 /// One enclosing reification while its body is being parsed. Every variant is
@@ -572,7 +566,6 @@ impl<'a> ExprParser<'a> {
             module,
             names,
             reify_frames: Vec::new(),
-            depth: flatppl_core::Depth::default(),
         }
     }
 
@@ -669,21 +662,11 @@ impl<'a> ExprParser<'a> {
 
     // ---- precedence levels (low → high) ----
 
-    /// Guarded entry to the expression grammar. Charges one level of nesting,
-    /// runs the real parse, then gives the level back so that BREADTH is free
-    /// and only nesting counts.
+    /// Parse an expression and check the resulting tree before consumers see it.
     fn parse_expr(&mut self) -> Result<NodeId> {
-        let deeper = self
-            .depth
-            .deeper("expression")
-            .map_err(|e| self.err_here(e.to_string()))?;
-        let saved = self.depth;
-        self.depth = deeper;
-        let result = self
-            .parse_expr_body()
-            .and_then(|id| self.guard_constructed_depth(id).map(|()| id));
-        self.depth = saved;
-        result
+        let id = self.parse_expr_body()?;
+        self.guard_constructed_depth(id)?;
+        Ok(id)
     }
 
     /// Reject a left-deep tree before recursive inference and printers see it.
