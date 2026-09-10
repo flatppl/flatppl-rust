@@ -4095,6 +4095,7 @@ fn ksuperpose_type(
         ksuperpose_component_mass(inf, component_node, &component_ty),
         &weights_ty,
         weights_phase,
+        matches!(inf.lookup_valueset(weights_node), ValueSet::StdSimplex(_)),
     );
     Type::Kernel { inputs, mass }
 }
@@ -4196,7 +4197,15 @@ fn ksuperpose_component_mass(inf: &Inferencer<'_, '_>, node: NodeId, ty: &Type) 
 }
 
 /// §06's mass rule for the lift, shaped after `fill_mass`'s `weighted` arm.
-fn ksuperpose_mass(component: Mass, weights_ty: &Type, weights_phase: Phase) -> Mass {
+fn ksuperpose_mass(
+    component: Mass,
+    weights_ty: &Type,
+    weights_phase: Phase,
+    simplex: bool,
+) -> Mass {
+    if component == Mass::Normalized && simplex {
+        return Mass::Normalized;
+    }
     if component == Mass::Null {
         // Every component is the zero measure, so every weighted term is too.
         return Mass::Null;
@@ -8717,14 +8726,14 @@ fn distribution_support(
 ///
 /// 1. Every argument is `weighted(w_i, m_i)` (positional spelling) with `m_i`
 ///    proven `%normalized`.
-/// 2. The weights provably sum to one, by exactly two decidable readings —
-///    [`literal_weights_sum_to_one`] and [`complement_pair`]. No arithmetic
+/// 2. The weights provably sum to one, by literals, a complement pair, or
+///    exhaustive indexing of one simplex vector. No arithmetic
 ///    prover, so `superpose(weighted(w, m), weighted(1 - w, m2))` written with
 ///    two separately-bound halves of one sum is NOT proven.
 /// 3. Every weight is provably in [0, 1], so each component is a measure and
 ///    the sum is a mixture rather than a signed combination.
 fn superpose_is_provably_normalized(inf: &Inferencer<'_, '_>, args: &[ArgInfo]) -> bool {
-    if args.len() < 2 {
+    if args.is_empty() {
         return false;
     }
     let mut weights = Vec::with_capacity(args.len());
@@ -8743,7 +8752,41 @@ fn superpose_is_provably_normalized(inf: &Inferencer<'_, '_>, args: &[ArgInfo]) 
         }
         weights.push(weight);
     }
-    literal_weights_sum_to_one(inf, &weights) || complement_pair(inf, &weights)
+    literal_weights_sum_to_one(inf, &weights)
+        || complement_pair(inf, &weights)
+        || simplex_weights_cover_vector(inf, &weights)
+}
+
+/// §06: each coordinate of one simplex node occurs once, in any order.
+fn simplex_weights_cover_vector(inf: &Inferencer<'_, '_>, weights: &[NodeId]) -> bool {
+    let mut vector = None;
+    let mut seen = vec![false; weights.len()];
+    for &weight in weights {
+        let Node::Call(call) = inf.module.node(resolve_binding_refs(inf, weight)) else {
+            return false;
+        };
+        if !matches!(call.head, CallHead::Builtin(op) if inf.module.resolve(op) == "get")
+            || call.args.len() != 2
+            || !call.named.is_empty()
+        {
+            return false;
+        }
+        let base = resolve_binding_refs(inf, call.args[0]);
+        if vector.is_some_and(|previous| previous != base)
+            || !matches!(inf.lookup_valueset(base), ValueSet::StdSimplex(Dim::Static(n)) if n as usize == weights.len())
+        {
+            return false;
+        }
+        let Node::Lit(Scalar::Int(index)) = inf.module.node(call.args[1]) else {
+            return false;
+        };
+        if *index < 1 || *index as usize > weights.len() || seen[*index as usize - 1] {
+            return false;
+        }
+        seen[*index as usize - 1] = true;
+        vector = Some(base);
+    }
+    !weights.is_empty()
 }
 
 /// `(weight, base)` of a `weighted(w, M)` call, looking through binding
