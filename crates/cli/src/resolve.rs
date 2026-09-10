@@ -109,6 +109,10 @@ impl CliResolver {
     pub fn resolve_path(&self, loc: &Location) -> Result<std::path::PathBuf, Failure> {
         self.ensure_trusted(&[loc])?;
         match loc {
+            Location::Invalid(_) => Err(Failure::Plain(format!(
+                "invalid source `{}`: only local file, http and https URLs are allowed",
+                terminal_location(loc)
+            ))),
             Location::Local(p) => match crate::require_regular_file(p) {
                 Ok(()) => Ok(p.clone()),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(Failure::Plain(
@@ -120,7 +124,17 @@ impl CliResolver {
                 ))),
             },
             Location::Remote(url) => {
-                let oracle = |u: &str| self.approved.borrow().contains(u);
+                let oracle = |u: &str| {
+                    if self.approved.borrow().contains(u) {
+                        return true;
+                    }
+                    // Redirect destinations were not known during the initial wave.
+                    if self.interactive && prompt_trust(&[u.to_string()]).unwrap_or(false) {
+                        self.approved.borrow_mut().insert(u.to_string());
+                        return true;
+                    }
+                    false
+                };
                 let fetched = if self.update {
                     self.cache.refetch(url, &*self.fetcher, &oracle)
                 } else {
@@ -194,7 +208,7 @@ pub fn terminal_message(message: &str) -> String {
 fn terminal_location(location: &Location) -> String {
     match location {
         Location::Local(path) => crate::terminal_path(path),
-        Location::Remote(url) => terminal_url(url),
+        Location::Remote(url) | Location::Invalid(url) => terminal_url(url),
     }
 }
 
@@ -205,7 +219,9 @@ fn terminal_location(location: &Location) -> String {
 fn diagnostic_path(location: &Location) -> std::path::PathBuf {
     match location {
         Location::Local(path) => path.clone(),
-        Location::Remote(url) => std::path::PathBuf::from(redact_url_userinfo(url).as_ref()),
+        Location::Remote(url) | Location::Invalid(url) => {
+            std::path::PathBuf::from(redact_url_userinfo(url).as_ref())
+        }
     }
 }
 
@@ -638,14 +654,16 @@ mod fetch_tests {
     struct InvalidRemote;
 
     impl Fetcher for InvalidRemote {
-        fn fetch(&self, url: &str) -> Result<flatppl_fileaccess::Fetched, String> {
-            Ok(flatppl_fileaccess::Fetched {
-                bytes: b"@(".to_vec(),
-                resolved_url: url.to_string(),
-                content_type: Some("text/plain".to_string()),
-                etag: None,
-                last_modified: None,
-            })
+        fn fetch(&self, url: &str) -> Result<flatppl_fileaccess::FetchResult, String> {
+            Ok(flatppl_fileaccess::FetchResult::Content(
+                flatppl_fileaccess::Fetched {
+                    bytes: b"@(".to_vec(),
+                    resolved_url: url.to_string(),
+                    content_type: Some("text/plain".to_string()),
+                    etag: None,
+                    last_modified: None,
+                },
+            ))
         }
     }
 

@@ -34,7 +34,7 @@ use std::path::PathBuf;
 #[cfg(feature = "cache")]
 pub use cache::{Cache, Meta};
 #[cfg(feature = "cache")]
-pub use fetch::{Fetched, Fetcher, OfflineFetcher};
+pub use fetch::{FetchResult, Fetched, Fetcher, OfflineFetcher};
 #[cfg(feature = "cache")]
 pub use trust::{ApproveAll, DenyAll, TrustOracle};
 
@@ -221,6 +221,10 @@ impl<'a> Resolver<'a> {
                 Err(error) => Err(Error::Io(error)),
             },
             Location::Remote(url) => self.cache.get(url, self.fetcher, self.trust),
+            Location::Invalid(source) => Err(Error::Fetch {
+                url: source.clone(),
+                reason: "invalid source: only local file, http and https URLs are allowed".into(),
+            }),
         }
     }
 
@@ -256,24 +260,75 @@ mod tests {
         }
     }
     impl Fetcher for FakeFetcher {
-        fn fetch(&self, url: &str) -> Result<Fetched, String> {
+        fn fetch(&self, url: &str) -> Result<FetchResult, String> {
             self.calls.borrow_mut().push(url.to_string());
-            Ok(Fetched {
+            Ok(FetchResult::Content(Fetched {
                 bytes: self.body.clone(),
                 resolved_url: url.to_string(),
                 content_type: Some("text/plain".to_string()),
                 etag: Some("\"abc\"".to_string()),
                 last_modified: None,
-            })
+            }))
         }
     }
 
     /// A fetcher that always fails (network error / non-2xx).
     struct FailFetcher;
     impl Fetcher for FailFetcher {
-        fn fetch(&self, _url: &str) -> Result<Fetched, String> {
+        fn fetch(&self, _url: &str) -> Result<FetchResult, String> {
             Err("503 Service Unavailable".to_string())
         }
+    }
+
+    #[test]
+    fn redirect_is_approved_before_the_next_fetch() {
+        struct Redirect(RefCell<Vec<String>>);
+        impl Fetcher for Redirect {
+            fn fetch(&self, url: &str) -> Result<FetchResult, String> {
+                self.0.borrow_mut().push(url.into());
+                if url == "https://other.test/model.flatppl" {
+                    return FakeFetcher::new("result").fetch(url);
+                }
+                Ok(FetchResult::Redirect(
+                    "https://other.test/model.flatppl".into(),
+                ))
+            }
+        }
+        let root = TempRoot::new();
+        let cache = Cache::new(root.path(), false, false);
+        let start = "https://example.test/model.flatppl";
+        struct TrustStart;
+        impl TrustOracle for TrustStart {
+            fn approve(&self, url: &str) -> bool {
+                url == "https://example.test/model.flatppl"
+            }
+        }
+        let fetcher = Redirect(RefCell::new(Vec::new()));
+        assert!(matches!(
+            cache.get(start, &fetcher, &TrustStart),
+            Err(Error::Untrusted(_))
+        ));
+        assert_eq!(*fetcher.0.borrow(), vec![start]);
+        assert!(!cache.object_path(&super::cache::cache_key(start)).exists());
+        let path = cache.get(start, &fetcher, &ApproveAll).unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), b"result");
+    }
+
+    #[test]
+    fn unsupported_schemes_never_fetch_and_file_urls_stay_local() {
+        let root = TempRoot::new();
+        let fetcher = FakeFetcher::new("remote");
+        let resolver = Resolver::new(Cache::new(root.path(), false, true), &fetcher, &DenyAll);
+        assert!(
+            resolver
+                .read(&Location::parse("ftp://example.test/model"))
+                .is_err()
+        );
+        let path = root.path().join("a b.flatppl");
+        std::fs::write(&path, "local").unwrap();
+        let url = format!("file://{}", path.display()).replace(' ', "%20");
+        assert_eq!(resolver.read(&Location::parse(&url)).unwrap(), b"local");
+        assert_eq!(fetcher.call_count(), 0);
     }
 
     /// A private temp cache root per test (no env, no network), deleted when the
@@ -682,6 +737,16 @@ mod tests {
         server.join().unwrap();
 
         assert!(err.contains("101"), "got {err}");
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn http_fetcher_returns_redirect_without_following_it() {
+        let (url, server) = one_http_response(
+            b"HTTP/1.1 302 Found\r\nLocation: /next.flatppl\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        let response = HttpFetcher.fetch(&url).unwrap();
+        server.join().unwrap();
+        assert!(matches!(response, FetchResult::Redirect(path) if path == "/next.flatppl"));
     }
 
     #[test]
