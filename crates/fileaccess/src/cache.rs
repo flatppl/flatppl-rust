@@ -15,6 +15,16 @@ use sha2::{Digest, Sha256};
 
 use crate::{Error, Fetcher, TrustOracle};
 
+fn require_http_url(url: &str) -> Result<(), Error> {
+    if crate::location::is_http_url(url) {
+        return Ok(());
+    }
+    Err(Error::Fetch {
+        url: url.to_string(),
+        reason: "only http and https URLs can be fetched".into(),
+    })
+}
+
 /// The mandatory `<key>_meta.json` sidecar (spec §sec:url-cache "Layout and
 /// keys"). Unknown fields are ignored on read; absent validators are `null`.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -168,6 +178,7 @@ impl Cache {
         fetcher: &dyn Fetcher,
         trust: &dyn TrustOracle,
     ) -> Result<PathBuf, Error> {
+        require_http_url(url)?;
         let k = cache_key(url);
         let object = self.object_path(&k);
         if is_regular_file(&object) {
@@ -203,20 +214,34 @@ impl Cache {
             return Err(Error::Offline(url.to_string()));
         }
 
-        // Trust gate (only reached on a miss/refresh that needs a fetch).
-        let trusted = self.trust_all || self.trust_path(k).exists();
-        if !trusted {
-            if trust.approve(url) {
-                self.create_trust_marker(k)?;
-            } else {
-                return Err(Error::Untrusted(url.to_string()));
+        let mut current = url.to_string();
+        let mut hops = 0;
+        let fetched = loop {
+            require_http_url(&current)?;
+            if hops > 10 {
+                return Err(Error::Fetch {
+                    url: current,
+                    reason: "too many redirects".into(),
+                });
             }
-        }
-
-        let fetched = fetcher.fetch(url).map_err(|reason| Error::Fetch {
-            url: url.to_string(),
-            reason,
-        })?;
+            let hop_key = cache_key(&current);
+            if !self.trust_all && !self.trust_path(&hop_key).exists() {
+                if !trust.approve(&current) {
+                    return Err(Error::Untrusted(current));
+                }
+                self.create_trust_marker(&hop_key)?;
+            }
+            match fetcher.fetch(&current).map_err(|reason| Error::Fetch {
+                url: current.clone(),
+                reason,
+            })? {
+                crate::FetchResult::Content(content) => break content,
+                crate::FetchResult::Redirect(target) => {
+                    current = crate::Location::parse(&current).join(&target).display();
+                    hops += 1;
+                }
+            }
+        };
 
         let meta = Meta {
             url: url.to_string(),

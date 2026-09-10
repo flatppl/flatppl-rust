@@ -12,23 +12,32 @@ pub enum Location {
     /// An `http`/`https` URL (verbatim, including any query; the cache strips
     /// the `#`-fragment when keying).
     Remote(String),
+    /// An unsupported scheme or malformed local file URL. Never read or fetched.
+    Invalid(String),
 }
 
 /// Does `s` start with an `http://` / `https://` scheme (case-insensitive)?
 ///
 /// The comparison runs on bytes. Slicing `s` to the scheme length instead
 /// panicked on any `source` whose 7th or 8th byte falls inside a character.
-fn is_http_url(s: &str) -> bool {
+pub(crate) fn is_http_url(s: &str) -> bool {
     use flatppl_core::text::starts_with_ascii_ignore_case as starts_with;
     starts_with(s, "http://") || starts_with(s, "https://")
 }
 
 impl Location {
-    /// Interpret a top-level `source` string: an `http`/`https` URL becomes
-    /// [`Location::Remote`], anything else a [`Location::Local`] path.
+    /// Interpret a path or file/http/https URL. Unsupported schemes remain
+    /// invalid locations, so no host can silently treat one as a local path.
     pub fn parse(source: &str) -> Location {
         if is_http_url(source) {
             Location::Remote(source.to_string())
+        } else if let Some(scheme) = flatppl_core::text::uri_scheme(source) {
+            if scheme.eq_ignore_ascii_case("file") {
+                file_url_path(source)
+                    .map_or_else(|| Location::Invalid(source.to_string()), Location::Local)
+            } else {
+                Location::Invalid(source.to_string())
+            }
         } else {
             Location::Local(PathBuf::from(source))
         }
@@ -40,12 +49,13 @@ impl Location {
     /// `..` is allowed; absolute paths are permitted). An absolute `http`/`https`
     /// URL in `source` is taken as-is regardless of the base.
     pub fn join(&self, source: &str) -> Location {
-        if is_http_url(source) {
-            return Location::Remote(source.to_string());
+        if flatppl_core::text::uri_scheme(source).is_some() {
+            return Location::parse(source);
         }
         match self {
             Location::Local(base_file) => Location::Local(join_local(base_file, source)),
             Location::Remote(base_url) => Location::Remote(join_url(base_url, source)),
+            Location::Invalid(_) => self.clone(),
         }
     }
 
@@ -53,7 +63,7 @@ impl Location {
     pub fn display(&self) -> String {
         match self {
             Location::Local(p) => p.display().to_string(),
-            Location::Remote(u) => u.clone(),
+            Location::Remote(u) | Location::Invalid(u) => u.clone(),
         }
     }
 
@@ -71,6 +81,7 @@ impl Location {
                 let no_qf = url.split(['?', '#']).next().unwrap_or(url);
                 no_qf.rsplit('/').next().unwrap_or("").to_string()
             }
+            Location::Invalid(_) => String::new(),
         }
     }
 
@@ -85,9 +96,41 @@ impl Location {
     pub fn normalized(&self) -> Location {
         match self {
             Location::Local(p) => Location::Local(lexical_normalize(p)),
-            Location::Remote(_) => self.clone(),
+            Location::Remote(_) | Location::Invalid(_) => self.clone(),
         }
     }
+}
+
+fn file_url_path(source: &str) -> Option<PathBuf> {
+    let body = source.get(5..)?.strip_prefix("//")?;
+    let slash = body.find('/')?;
+    let authority = &body[..slash];
+    if !authority.is_empty() && !authority.eq_ignore_ascii_case("localhost") {
+        return None;
+    }
+    let path = body[slash..].split(['?', '#']).next()?;
+    let mut bytes = path.bytes();
+    let mut decoded = Vec::new();
+    while let Some(byte) = bytes.next() {
+        decoded.push(if byte == b'%' {
+            let hi = (bytes.next()? as char).to_digit(16)?;
+            let lo = (bytes.next()? as char).to_digit(16)?;
+            (hi * 16 + lo) as u8
+        } else {
+            byte
+        });
+    }
+    if decoded.contains(&0) {
+        return None;
+    }
+    let path = String::from_utf8(decoded).ok()?;
+    #[cfg(windows)]
+    let path = if path.as_bytes().get(2) == Some(&b':') {
+        path[1..].to_string()
+    } else {
+        path
+    };
+    Some(PathBuf::from(path))
 }
 
 /// Join a relative (or absolute) path `source` against the directory of the
@@ -136,7 +179,21 @@ fn lexical_normalize(p: &Path) -> PathBuf {
 /// directory (or as an absolute path when it starts with `/`), normalise
 /// `.`/`..`, and reattach the origin. The base's query/fragment are dropped.
 fn join_url(base_url: &str, source: &str) -> String {
+    if source.starts_with("//") {
+        return format!("{}:{source}", base_url.split(':').next().unwrap_or("https"));
+    }
+    if source.starts_with('#') {
+        return format!("{}{source}", base_url.split('#').next().unwrap_or(base_url));
+    }
+    if source.starts_with('?') {
+        return format!(
+            "{}{source}",
+            base_url.split(['?', '#']).next().unwrap_or(base_url)
+        );
+    }
     let (origin, base_path) = split_url(base_url);
+    let suffix_at = source.find(['?', '#']).unwrap_or(source.len());
+    let (source, suffix) = source.split_at(suffix_at);
     let combined = if source.starts_with('/') {
         source.to_string()
     } else {
@@ -146,7 +203,7 @@ fn join_url(base_url: &str, source: &str) -> String {
         };
         format!("{dir}{source}")
     };
-    format!("{origin}{}", normalize_url_path(&combined))
+    format!("{origin}{}{suffix}", normalize_url_path(&combined))
 }
 
 /// Split `scheme://authority/path?query#frag` into `("scheme://authority",
@@ -238,6 +295,11 @@ mod tests {
     #[test]
     fn join_url_resolves_against_base_url() {
         let base = Location::Remote("https://h.example/dir/model.flatppl".to_string());
+        assert_eq!(
+            base.join("../next?origin=https://other.test/a/../b#part/../name")
+                .display(),
+            "https://h.example/next?origin=https://other.test/a/../b#part/../name"
+        );
         assert_eq!(
             base.join("helper.flatppl"),
             Location::Remote("https://h.example/dir/helper.flatppl".to_string())
@@ -347,7 +409,7 @@ mod tests {
         );
         assert_eq!(
             Location::parse("httpx://h.example/m.flatppl"),
-            Location::Local(PathBuf::from("httpx://h.example/m.flatppl"))
+            Location::Invalid("httpx://h.example/m.flatppl".to_string())
         );
     }
 }

@@ -12,6 +12,22 @@ use std::path::PathBuf;
 use flatppl_core::{Mass, ScalarType, Type};
 use flatppl_infer::{Level, ModuleBundle, Severity, infer_module};
 
+#[test]
+fn source_scheme_allowlist_is_a_static_check() {
+    for source in [
+        "m = load_module(\"ftp://example.test/model.flatppl\")",
+        "x = load_data(\"ftp://example.test/data\", reals)",
+    ] {
+        let mut module = flatppl_syntax::parse(source).unwrap();
+        let diags = flatppl_infer::infer(&mut module);
+        assert!(
+            diags.iter().any(|d| d.severity == Severity::Error
+                && d.message.contains("only file, http and https")),
+            "{diags:?}"
+        );
+    }
+}
+
 fn read_fixture(name: &str) -> String {
     let path: PathBuf = [
         env!("CARGO_MANIFEST_DIR"),

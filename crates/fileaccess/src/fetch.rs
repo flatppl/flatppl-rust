@@ -18,12 +18,18 @@ pub struct Fetched {
     pub last_modified: Option<String>,
 }
 
-/// Fetches a URL's bytes, following redirects. Implementations must report a
+/// One response. Redirects are followed by the cache, after its trust gate.
+pub enum FetchResult {
+    Content(Fetched),
+    Redirect(String),
+}
+
+/// Fetches one URL without following redirects. Implementations must report a
 /// failed fetch — a network error, a final non-`2xx` status, or an unresolvable
 /// redirect — as `Err` (the cache then writes nothing; spec §sec:url-cache
 /// "Resolve and fetch").
 pub trait Fetcher {
-    fn fetch(&self, url: &str) -> Result<Fetched, String>;
+    fn fetch(&self, url: &str) -> Result<FetchResult, String>;
 }
 
 /// A fetcher that never reaches the network — for cache-only / offline
@@ -33,25 +39,35 @@ pub trait Fetcher {
 pub struct OfflineFetcher;
 
 impl Fetcher for OfflineFetcher {
-    fn fetch(&self, url: &str) -> Result<Fetched, String> {
+    fn fetch(&self, url: &str) -> Result<FetchResult, String> {
         Err(format!("offline: refusing to fetch `{url}`"))
     }
 }
 
-/// A blocking HTTP(S) fetcher backed by `ureq` (rustls TLS). Follows redirects
-/// and treats a non-`2xx` final status as an error, per the spec.
+/// A blocking, single-hop HTTP(S) fetcher backed by `ureq` (rustls TLS).
 #[cfg(feature = "net")]
 pub struct HttpFetcher;
 
 #[cfg(feature = "net")]
 impl Fetcher for HttpFetcher {
-    fn fetch(&self, url: &str) -> Result<Fetched, String> {
+    fn fetch(&self, url: &str) -> Result<FetchResult, String> {
         // `get_uri` (the post-redirect URL) is on `ResponseExt`.
         use std::io::Read;
         use ureq::ResponseExt;
-        // `ureq` follows redirects by default. Its status-as-error policy only
-        // covers 4xx/5xx, so enforce the fetcher's final-2xx contract here too.
-        let resp = ureq::get(url).call().map_err(|e| e.to_string())?;
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .max_redirects(0)
+            .build()
+            .into();
+        let resp = agent.get(url).call().map_err(|e| e.to_string())?;
+        if matches!(resp.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
+            let target = resp
+                .headers()
+                .get("location")
+                .and_then(|v| v.to_str().ok())
+                .filter(|s| !s.is_empty())
+                .ok_or("redirect has no valid Location header")?;
+            return Ok(FetchResult::Redirect(target.to_string()));
+        }
         if !resp.status().is_success() {
             return Err(format!("http status: {}", resp.status().as_u16()));
         }
@@ -75,12 +91,12 @@ impl Fetcher for HttpFetcher {
             .into_reader()
             .read_to_end(&mut bytes)
             .map_err(|e| e.to_string())?;
-        Ok(Fetched {
+        Ok(FetchResult::Content(Fetched {
             bytes,
             resolved_url,
             content_type,
             etag,
             last_modified,
-        })
+        }))
     }
 }

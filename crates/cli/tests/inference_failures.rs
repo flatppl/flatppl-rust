@@ -9,14 +9,16 @@ use common::Scratch;
 struct FixedModule;
 
 impl flatppl_fileaccess::Fetcher for FixedModule {
-    fn fetch(&self, url: &str) -> Result<flatppl_fileaccess::Fetched, String> {
-        Ok(flatppl_fileaccess::Fetched {
-            bytes: b"present = 1\n".to_vec(),
-            resolved_url: url.to_string(),
-            content_type: Some("text/plain".to_string()),
-            etag: None,
-            last_modified: None,
-        })
+    fn fetch(&self, url: &str) -> Result<flatppl_fileaccess::FetchResult, String> {
+        Ok(flatppl_fileaccess::FetchResult::Content(
+            flatppl_fileaccess::Fetched {
+                bytes: b"present = 1\n".to_vec(),
+                resolved_url: url.to_string(),
+                content_type: Some("text/plain".to_string()),
+                etag: None,
+                last_modified: None,
+            },
+        ))
     }
 }
 

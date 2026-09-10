@@ -99,6 +99,23 @@ pub(crate) fn call_rule(
         unreachable!("user calls handled above");
     };
     let name = inf.module.resolve(op).to_string();
+    if matches!(name.as_str(), "load_module" | "load_data")
+        && let Some(source) = named_or_positional_node(inf.module, named, args, "source", 0)
+        && let Some(value) = written_string(inf, source)
+        && let Some(scheme) = flatppl_core::text::uri_scheme(&value)
+        && !["file", "http", "https"]
+            .iter()
+            .any(|s| scheme.eq_ignore_ascii_case(s))
+    {
+        inf.diags.push(crate::Diagnostic::error_at(
+            source,
+            "only file, http and https source schemes are allowed (spec §04)",
+        ));
+        return (
+            Type::Failed("unsupported source scheme".into()),
+            Phase::Fixed,
+        );
+    }
 
     // Reified callables (`functionof` / `kernelof`) — typed by their boundary
     // + body. The phase follows the CAPTURED ancestors, so the rule returns it

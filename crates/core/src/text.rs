@@ -6,6 +6,22 @@
 //! `source` strings and HS3 parameter names are all arbitrary UTF-8, so every
 //! such site needs the boundary check. These helpers do the check once.
 
+/// An explicit URI scheme, not a colon later in a relative path.
+pub fn uri_scheme(source: &str) -> Option<&str> {
+    let (scheme, rest) = source.trim_start().split_once(':')?;
+    // A Windows drive path is a filesystem path, not a one-letter URI scheme.
+    if scheme.len() == 1 && rest.starts_with(['/', '\\']) {
+        return None;
+    }
+    let mut bytes = scheme.bytes();
+    if !bytes.next()?.is_ascii_alphabetic()
+        || !bytes.all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
+    {
+        return None;
+    }
+    Some(scheme)
+}
+
 /// Does `s` begin with `prefix`, comparing ASCII case-insensitively?
 ///
 /// `prefix` must be ASCII. The comparison runs on bytes, so it never slices `s`
@@ -42,6 +58,20 @@ pub fn common_prefix_len(a: &str, b: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uri_schemes_do_not_confuse_paths_with_urls() {
+        assert_eq!(uri_scheme("https://example.test/a"), Some("https"));
+        assert_eq!(uri_scheme("ftp://example.test/a"), Some("ftp"));
+        for path in [
+            "C:/models/a.flatppl",
+            "C:\\models\\a.flatppl",
+            "./a:b",
+            "αβγδ",
+        ] {
+            assert_eq!(uri_scheme(path), None);
+        }
+    }
 
     #[test]
     fn ascii_prefix_matches_either_case() {
