@@ -5987,6 +5987,15 @@ fn broadcast_type(
                 }
                 elems.push(elem.as_ref().clone());
             }
+            Type::Table { columns, nrows } => {
+                let rows: Box<[Dim]> = Box::new([*nrows]);
+                match &shape {
+                    None => shape = Some(rows),
+                    Some(prev) if prev == &rows => {}
+                    Some(_) => return Type::Deferred,
+                }
+                elems.push(Type::Record(columns.clone()));
+            }
             other => elems.push(other.clone()),
         }
     }
@@ -6009,6 +6018,7 @@ fn broadcast_type(
     // direct call.
     let cell_arg = |t: &Type| match t {
         Type::Array { elem, .. } => elem.as_ref().clone(),
+        Type::Table { columns, .. } => Type::Record(columns.clone()),
         other => other.clone(),
     };
     match &head_ty {
@@ -6025,6 +6035,19 @@ fn broadcast_type(
                 .map(|(ty, _)| ty)
                 .or_else(|| reified_result_type(inf, head_node))
                 .unwrap_or(Type::Deferred);
+            if let Type::Record(columns) = cell {
+                if shape.len() != 1 {
+                    inf.diags.push(crate::Diagnostic::error_at(
+                        id,
+                        "record-valued broadcast requires one axis (spec §04)",
+                    ));
+                    return Type::Failed("multi-axis record broadcast".into());
+                }
+                return Type::Table {
+                    columns,
+                    nrows: shape[0],
+                };
+            }
             return Type::Array {
                 shape,
                 elem: Box::new(cell),
