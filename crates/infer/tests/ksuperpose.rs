@@ -44,6 +44,48 @@ sigmas = [1.0, 0.5]
 mix = ksuperpose(Normal, w)(mu = mus, sigma = sigmas)
 ";
 
+#[test]
+fn simplex_weights_make_probability_mixtures_drawable() {
+    for source in [
+        "n = external(posintegers)\np = elementof(stdsimplex(n))\nm = ksuperpose(Normal, p)(mu = 0, sigma = 1)\nx ~ m",
+        "p = elementof(stdsimplex(3))\nq = p\nm = superpose(weighted(q[3], Normal(2, 1)), weighted(p[1], Normal(0, 1)), weighted(p[2], Normal(1, 1)))\nx ~ m",
+        "p = elementof(stdsimplex(1))\nm = superpose(weighted(p[1], Dirac(2)))\nx ~ m",
+    ] {
+        let out = pir(source);
+        assert!(out.contains("(%mass %normalized)"), "{out}");
+    }
+}
+
+#[test]
+fn simplex_recognition_does_not_invent_unit_mass() {
+    for rhs in [
+        "superpose(weighted(p[1], Normal(0,1)), weighted(p[2], Normal(0,1)))",
+        "superpose(weighted(p[1], Normal(0,1)), weighted(p[1], Normal(0,1)), weighted(p[3], Normal(0,1)))",
+        "superpose(weighted(p[1], Normal(0,1)), weighted(p[2], Normal(0,1)), weighted(q[3], Normal(0,1)))",
+        "ksuperpose(x -> weighted(2, Dirac(x)), p)(x = [0,1,2])",
+    ] {
+        let (mut module, diags) = infer_src(&format!(
+            "p = elementof(stdsimplex(3))\nq = elementof(stdsimplex(3))\nm = {rhs}"
+        ));
+        assert!(
+            !diags.iter().any(|d| d.severity == Severity::Error),
+            "{diags:?}"
+        );
+        let name = module.intern("m");
+        let binding = module.binding_by_name(name).unwrap();
+        assert!(
+            matches!(
+                module.type_of(module.binding(binding).rhs),
+                Some(flatppl_core::Type::Measure {
+                    mass: flatppl_core::Mass::Unknown,
+                    ..
+                })
+            ),
+            "{rhs}"
+        );
+    }
+}
+
 /// §06: "`ksuperpose(kernel, weights)` is itself a kernel". Its declared inputs
 /// are the component constructor's own §08 parameter names, since §06 passes the
 /// family "as to `broadcast`".
