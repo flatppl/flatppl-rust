@@ -145,6 +145,9 @@ impl Emitter<'_> {
         );
         let out = Value { ssa, ..v.clone() };
         self.copy_constant(v, &out);
+        if let Some(op) = self.pointwise.get(&v.ssa).cloned() {
+            self.pointwise.insert(out.ssa.clone(), op);
+        }
         out
     }
 
@@ -179,6 +182,9 @@ impl Emitter<'_> {
     pub(super) fn expand_axes(&mut self, v: &Value, dims: &[u64], ty: MlirTy, axes: Axes) -> Value {
         if v.ty == ty && dims.iter().copied().eq(0..shape(&ty).len() as u64) {
             return self.axes_view(v, axes);
+        }
+        if let Some(value) = self.expand_pointwise(v, dims, &ty, &axes) {
+            return value;
         }
         let from = v.ty.render(self.dtype, v.elem);
         let to = ty.render(self.dtype, v.elem);

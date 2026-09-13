@@ -38,7 +38,10 @@ use crate::refuse::EmitError;
 mod batching;
 #[path = "constants.rs"]
 mod constants;
+#[path = "pointwise.rs"]
+mod pointwise;
 use batching::{Axes, shape};
+use pointwise::Pointwise;
 
 /// The dtype-exact `stablehlo.reduce` identity for `stablehlo.maximum`: real
 /// negative infinity, spelled as the raw bit pattern MLIR's float-attribute
@@ -120,6 +123,10 @@ pub struct Emitter<'m> {
     memo: HashMap<NodeId, Value>,
     /// Exact pure-operation RHS -> SSA, confined to the current region.
     pure_ops: HashMap<(String, Option<Axes>), String>,
+    /// Reusable scalar-cell producers; their SSA operands never change.
+    pointwise: HashMap<String, Pointwise>,
+    /// Expanded results belong to the current region, just like pure_ops.
+    expanded: HashMap<(String, Vec<Option<u64>>, Axes), Value>,
     axes: HashMap<String, Axes>,
     constants: HashMap<String, constants::Constant>,
     broadcast_frame: Vec<Option<u64>>,
@@ -162,6 +169,8 @@ impl<'m> Emitter<'m> {
             next: 0,
             memo: HashMap::new(),
             pure_ops: HashMap::new(),
+            pointwise: HashMap::new(),
+            expanded: HashMap::new(),
             axes: HashMap::new(),
             constants: HashMap::new(),
             broadcast_frame: Vec::new(),
@@ -338,6 +347,7 @@ impl<'m> Emitter<'m> {
         }
         let ty_text = a.ty.render(self.dtype, a.elem);
         let ssa = self.pure_like(format!("{op} {} : {ty_text}", a.ssa), a);
+        self.remember_pointwise(&ssa, a, Pointwise::Unary(op.to_owned(), a.clone()));
         Value {
             ssa,
             ty: a.ty.clone(),
@@ -357,6 +367,11 @@ impl<'m> Emitter<'m> {
         }
         let ty_text = a.ty.render(self.dtype, a.elem);
         let ssa = self.pure_like(format!("{op} {}, {} : {ty_text}", a.ssa, b.ssa), a);
+        self.remember_pointwise(
+            &ssa,
+            a,
+            Pointwise::Binary(op.to_owned(), a.clone(), b.clone()),
+        );
         Value {
             ssa,
             ty: a.ty.clone(),
@@ -819,6 +834,11 @@ impl<'m> Emitter<'m> {
             "stablehlo.compare {dir}, {}, {}{compare_type} : ({lhs_ty}, {rhs_ty}) -> {result_ty}",
             a.ssa, b.ssa
         ), &a);
+        self.remember_pointwise(
+            &ssa,
+            &a,
+            Pointwise::Compare(dir.to_owned(), a.clone(), b.clone()),
+        );
         Value {
             ssa,
             ty: a.ty,
@@ -896,6 +916,9 @@ impl<'m> Emitter<'m> {
             ),
             &a,
         );
+        if c.ty == a.ty && c.elem == ElemKind::Bool {
+            self.remember_pointwise(&ssa, &a, Pointwise::Select(c, a.clone(), b));
+        }
         Value {
             ssa,
             ty: a.ty,
@@ -920,6 +943,7 @@ impl<'m> Emitter<'m> {
         let from = v.ty.render(self.dtype, v.elem);
         let to = v.ty.render(self.dtype, target);
         let ssa = self.pure_like(format!("stablehlo.convert {} : ({from}) -> {to}", v.ssa), v);
+        self.remember_pointwise(&ssa, v, Pointwise::Convert(v.clone(), target));
         Value {
             ssa,
             ty: v.ty.clone(),
@@ -2895,16 +2919,20 @@ impl<'m> Emitter<'m> {
         // cond region, captured into its own buffer.
         let saved = std::mem::take(&mut self.body);
         let saved_pure_ops = std::mem::take(&mut self.pure_ops);
+        let saved_expanded = std::mem::take(&mut self.expanded);
         let pred = cond(&mut *self, &arg_values);
         let cond_body = std::mem::replace(&mut self.body, saved);
         self.pure_ops = saved_pure_ops;
+        self.expanded = saved_expanded;
 
         // do region, captured into its own buffer.
         let saved = std::mem::take(&mut self.body);
         let saved_pure_ops = std::mem::take(&mut self.pure_ops);
+        let saved_expanded = std::mem::take(&mut self.expanded);
         let next = body(&mut *self, &arg_values);
         let do_body = std::mem::replace(&mut self.body, saved);
         self.pure_ops = saved_pure_ops;
+        self.expanded = saved_expanded;
         assert_eq!(
             next.len(),
             inits.len(),
