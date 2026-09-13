@@ -33,7 +33,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use flatppl_core::{CallHead, Module, Node, NodeId, Ref, RefNs, Scalar};
+use flatppl_core::{Call, CallHead, Inputs, Module, Node, NodeId, Ref, RefNs, Scalar, Type};
 
 use crate::density::{build_call, resolve_ref_one};
 use crate::refuse::RefuseError;
@@ -110,8 +110,8 @@ pub(crate) fn lower_std_module_functions(m: &mut Module) -> Result<(), RefuseErr
 /// member-call-inside-member-call-argument; no realistic model nests deeply.
 const MAX_PASSES: usize = 64;
 
-/// Every `(node, module-name, member-name)` for a call whose head is a §09
-/// standard-module member, anywhere in a binding RHS. One `(%ref self …)` hop is
+/// Every `(node, module-name, member-name)` for a direct or broadcast call of a
+/// §09 standard-module member, anywhere in a binding RHS. One `(%ref self …)` hop is
 /// followed on the callee, so `f = hep.kallen; f(x, y, z)` is found too — the same
 /// hop `density::std_module_ctor_sym` follows for a distribution member.
 fn collect_member_calls(m: &Module) -> Vec<(NodeId, String, String)> {
@@ -124,11 +124,15 @@ fn collect_member_calls(m: &Module) -> Vec<(NodeId, String, String)> {
         if !seen.insert(id) {
             return;
         }
-        if let Node::Call(c) = m.node(id)
-            && let CallHead::User(callee) = c.head
-            && let Some(hit) = member_of_callee(m, callee)
-        {
-            out.push((id, hit.0, hit.1));
+        if let Node::Call(c) = m.node(id) {
+            let callee = match c.head {
+                CallHead::User(callee) => Some(callee),
+                CallHead::Builtin(s) if m.resolve(s) == "broadcast" => c.args.first().copied(),
+                _ => None,
+            };
+            if let Some(hit) = callee.and_then(|callee| member_of_callee(m, callee)) {
+                out.push((id, hit.0, hit.1));
+            }
         }
         for child in m.node(id).children() {
             walk(m, child, seen, out);
@@ -155,53 +159,117 @@ fn member_of_callee(m: &Module, callee: NodeId) -> Option<(String, String)> {
 /// the call alone (no base-op form for this member, or a call shape this pass
 /// cannot read: named arguments, wrong arity, or a non-literal integer degree).
 fn lower_member_call(m: &mut Module, id: NodeId, module: &str, member: &str) -> Option<NodeId> {
-    let args: Vec<NodeId> = match m.node(id) {
-        Node::Call(c) if c.named.is_empty() => c.args.to_vec(),
+    let c = match m.node(id) {
+        Node::Call(c) if c.named.is_empty() => c.clone(),
         _ => return None,
     };
+    if matches!(c.head, CallHead::Builtin(s) if m.resolve(s) == "broadcast") {
+        return lower_member_broadcast(m, &c.args[1..], module, member);
+    }
+    lower_member_function(m, &c.args, module, member)
+}
+
+/// Reify the existing scalar/cell formula, leaving shape expansion to the
+/// ordinary callable broadcast path. All non-literal arguments become inputs:
+/// outer query locals stay outside this new scope, not accidental captures.
+fn lower_member_broadcast(
+    m: &mut Module,
+    args: &[NodeId],
+    module: &str,
+    member: &str,
+) -> Option<NodeId> {
+    let scope = m.node_count();
+    let mut inputs = Vec::with_capacity(args.len());
+    let mut cells = Vec::with_capacity(args.len());
+    for (i, &arg) in args.iter().enumerate() {
+        let label = m.intern(&format!("stdfn_arg_{i}"));
+        let name = m.intern(&format!("_stdfn_{scope}_{i}_"));
+        let reference = Ref {
+            ns: RefNs::Local,
+            name,
+        };
+        inputs.push((label, reference));
+        let resolved = resolve_ref_one(m, arg).0;
+        // Literal degrees must remain visible to degree-specialized formulas.
+        // Keep their broadcast arguments too, preserving arity and shape checks.
+        let cell = if matches!(m.node(resolved), Node::Lit(_)) {
+            resolved
+        } else {
+            let ty = match m.type_of(arg).or_else(|| m.type_of(resolved)).cloned() {
+                Some(Type::Array { elem, .. } | Type::TVector { elem, .. }) => *elem,
+                Some(Type::Table { columns, .. }) => Type::Record(columns),
+                Some(ty) => ty,
+                None => Type::Any,
+            };
+            let cell = m.alloc(Node::Ref(reference));
+            m.set_type(cell, ty);
+            cell
+        };
+        cells.push(cell);
+    }
+    let body = lower_member_function(m, &cells, module, member)?;
+    let head = CallHead::Builtin(m.intern("functionof"));
+    let function = m.alloc(Node::Call(Call {
+        head,
+        args: vec![body].into(),
+        named: vec![].into(),
+        inputs: Some(Inputs::Spec(inputs.into())),
+    }));
+    let mut mapped_args = Vec::with_capacity(args.len() + 1);
+    mapped_args.push(function);
+    mapped_args.extend_from_slice(args);
+    Some(build_call(m, "broadcast", &mapped_args))
+}
+
+fn lower_member_function(
+    m: &mut Module,
+    args: &[NodeId],
+    module: &str,
+    member: &str,
+) -> Option<NodeId> {
     match (module, member) {
-        ("particle-physics", "interp_pwlin") => arity::<4>(&args).map(|a| interp_pwlin(m, a)),
-        ("particle-physics", "interp_pwexp") => arity::<4>(&args).map(|a| interp_pwexp(m, a)),
+        ("particle-physics", "interp_pwlin") => arity::<4>(args).map(|a| interp_pwlin(m, a)),
+        ("particle-physics", "interp_pwexp") => arity::<4>(args).map(|a| interp_pwexp(m, a)),
         ("particle-physics", "interp_poly2_lin") => {
-            arity::<4>(&args).map(|a| interp_poly2_lin(m, a))
+            arity::<4>(args).map(|a| interp_poly2_lin(m, a))
         }
         ("particle-physics", "interp_poly6_lin") => {
-            arity::<4>(&args).map(|a| interp_poly6_lin(m, a))
+            arity::<4>(args).map(|a| interp_poly6_lin(m, a))
         }
         ("particle-physics", "interp_poly6_exp") => {
-            arity::<4>(&args).map(|a| interp_poly6_exp(m, a))
+            arity::<4>(args).map(|a| interp_poly6_exp(m, a))
         }
-        ("particle-physics", "kallen") => arity::<3>(&args).map(|a| kallen(m, a)),
+        ("particle-physics", "kallen") => arity::<3>(args).map(|a| kallen(m, a)),
         ("particle-physics", "breakup_momentum") => {
-            arity::<3>(&args).map(|a| breakup_momentum(m, a))
+            arity::<3>(args).map(|a| breakup_momentum(m, a))
         }
         ("particle-physics", "blatt_weisskopf") => {
-            let a = arity::<3>(&args)?;
+            let a = arity::<3>(args)?;
             blatt_weisskopf(m, a)
         }
         ("polynomials", name @ ("legendre" | "hermite" | "laguerre" | "chebyshev")) => {
-            let [n, x] = arity::<2>(&args)?;
+            let [n, x] = arity::<2>(args)?;
             let degree = literal_degree(m, n)?;
             orthogonal_polynomial(m, name, degree, x)
         }
-        ("distances", "euclidean") => arity::<2>(&args).map(|[u, v]| {
+        ("distances", "euclidean") => arity::<2>(args).map(|[u, v]| {
             let d = sub(m, u, v);
             build_call(m, "l2norm", &[d])
         }),
-        ("distances", "squared_euclidean") => arity::<2>(&args).map(|[u, v]| {
+        ("distances", "squared_euclidean") => arity::<2>(args).map(|[u, v]| {
             let d = sub(m, u, v);
             let dt = build_call(m, "transpose", &[d]);
             mul(m, dt, d)
         }),
-        ("distances", "manhattan") => arity::<2>(&args).map(|[u, v]| {
+        ("distances", "manhattan") => arity::<2>(args).map(|[u, v]| {
             let d = sub(m, u, v);
             build_call(m, "l1norm", &[d])
         }),
-        ("distances", "chebyshev") => arity::<2>(&args).map(|[u, v]| {
+        ("distances", "chebyshev") => arity::<2>(args).map(|[u, v]| {
             let d = sub(m, u, v);
             build_call(m, "linfnorm", &[d])
         }),
-        ("distances", "cosine") => arity::<2>(&args).map(|[u, v]| cosine(m, u, v)),
+        ("distances", "cosine") => arity::<2>(args).map(|[u, v]| cosine(m, u, v)),
         _ => None,
     }
 }

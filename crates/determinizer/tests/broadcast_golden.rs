@@ -180,31 +180,6 @@ lp = logdensityof(lawof(broadcast(hepphys.ContinuedPoisson, rates)), obs)";
     assert!(is_flatpdl(&out).is_ok(), "is_flatpdl:\n{pir}");
 }
 
-// Refuse-don't-mislower survives the module-member generalization: a module
-// *function* member as a broadcast head (`hepphys.interp_poly6_exp`) resolves to a
-// name, but that name is NOT a distribution (`distribution_param_names` → `None`),
-// so it must still refuse — the module namespace does not by itself make a head a
-// kernel. Only a module member that resolves to a known §09 distribution lowers.
-#[test]
-fn broadcast_module_function_head_still_refuses() {
-    let src = "\
-hepphys = standard_module(\"particle-physics\", \"0.1\")
-lo = [0.9, 0.8]
-nom = [1.0, 1.0]
-hi = [1.1, 1.2]
-alpha = elementof(reals)
-lp = logdensityof(lawof(broadcast(hepphys.interp_poly6_exp, lo, nom, hi, alpha)), [1.0, 1.0])";
-    let err = determinize(&parse_infer(src)).expect_err(
-        "a module FUNCTION member used as a broadcast head is not a distribution constructor \
-         and must refuse, not mislower",
-    );
-    let msg = format!("{err:?}");
-    assert!(
-        msg.contains("not a known distribution constructor"),
-        "refusal should name that the module member is not a known distribution constructor: {msg}"
-    );
-}
-
 // A multi-parameter kernel — `Normal.(mus, sigmas)` — binds its POSITIONAL
 // data-args to the constructor's ordered parameter names (`mu`, then `sigma`)
 // when building the per-cell record.
