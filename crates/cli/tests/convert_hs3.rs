@@ -236,6 +236,21 @@ fn hs3_convert_emits_banner_and_compat() {
         text.contains("flatppl_compat = \"0.1\""),
         "generated module must stamp the leading flatppl_compat binding, got:\n{text}"
     );
+    for args in [
+        vec!["fmt", "--check"],
+        vec!["lint", "--deny", "not-canonical"],
+    ] {
+        let check = Command::new(env!("CARGO_BIN_EXE_flatppl"))
+            .args(args)
+            .arg(&out)
+            .output()
+            .unwrap();
+        assert!(
+            check.status.success(),
+            "{}",
+            String::from_utf8_lossy(&check.stderr)
+        );
+    }
     // No pseudo-provenance / personal information of any kind.
     for leaked in [
         "generator:",

@@ -433,7 +433,18 @@ pub fn format_text(source: &str, syntax: flatppl_syntax::Syntax) -> Result<Strin
     if !text.ends_with('\n') {
         text.push('\n');
     }
+    preserve_generated_banner(source, &mut text);
     Ok(text)
+}
+
+// The syntax printer drops comments, but our generated-file marker must
+// survive formatting and must not itself cause a canonical-format warning.
+#[cfg(feature = "fmtlint")]
+fn preserve_generated_banner(source: &str, text: &mut String) {
+    let banner = provenance::banner(CommentStyle::Line("#"));
+    if source.starts_with(&banner) {
+        text.insert_str(0, &banner);
+    }
 }
 
 /// Replace one existing file through an exclusive same-directory temporary.
@@ -671,6 +682,7 @@ pub fn run_lint(
             if !canonical.ends_with('\n') {
                 canonical.push('\n');
             }
+            preserve_generated_banner(&source, &mut canonical);
             if source != canonical {
                 diags.push(flatppl_lint::Diagnostic {
                     rule: RuleId::NotCanonical,
