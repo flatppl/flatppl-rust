@@ -168,7 +168,6 @@ fn validate_workspace(doc: &PyhfDocument) -> Result<BTreeMap<String, AuxOverride
     // configures an existing parameter, it does not create one.
     let toplvl = doc.toplvl.iter().flat_map(|t| t.measurements.iter());
     for meas in doc.measurements.iter().chain(toplvl) {
-        check_binding_name(&meas.name, "pyhf measurement")?;
         match &meas.config.poi {
             Some(poi) if !poi.is_empty() && !seen.contains_key(poi) => {
                 // pyhf: InvalidModel.
@@ -331,21 +330,22 @@ fn emit_pyhf(b: &mut Builder, doc: &PyhfDocument) -> Result<()> {
         emit_channel(b, doc, channel, &mut terms)?;
     }
 
-    // Measurement parameter-of-interest → record binding (so `config.poi`
-    // survives the lift; FlatPPL has no dedicated POI construct).
-    emit_poi(b, doc);
-
     // The flat top-level `likelihood` = joint of every channel's observation term
     // and all constraint terms.
     bind_likelihood(b, &terms);
 
+    // Allocate metadata after the model so labels cannot shadow its bindings.
+    emit_poi(b, doc);
+
     Ok(())
 }
 
-/// Emit each measurement's parameter-of-interest as `<measurement> = record(poi = <param>)`.
+/// Preserve each measurement's parameter-of-interest in a named record.
 ///
 /// pyhf's `config.poi` names a free parameter already declared by a modifier; a
 /// record preserves the association without inventing a language construct.
+/// Measurement labels are not parameter names: allocate a valid, unique binding
+/// and retain the original label in its doc comment.
 /// Measurements from either schema (top-level `measurements` or old-format
 /// `toplvl.measurements`) are covered.
 fn emit_poi(b: &mut Builder, doc: &PyhfDocument) {
@@ -357,7 +357,11 @@ fn emit_poi(b: &mut Builder, doc: &PyhfDocument) {
             Some(poi) if !poi.is_empty() => {
                 let poi_ref = b.self_ref(poi);
                 let rec = b.call_kw("record", &[("poi", poi_ref)]);
-                b.bind(&meas.name, rec);
+                b.bind_unique_doc(
+                    &meas.name,
+                    rec,
+                    &format!("pyhf measurement {:?}", meas.name),
+                );
             }
             _ => {}
         }
