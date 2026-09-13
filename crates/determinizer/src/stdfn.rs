@@ -31,7 +31,7 @@
 //! A member this pass does implement, but whose call shape it cannot read (named
 //! arguments, wrong arity, a non-literal degree), is likewise left alone.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use flatppl_core::{CallHead, Module, Node, NodeId, Ref, RefNs, Scalar};
 
@@ -118,13 +118,12 @@ fn collect_member_calls(m: &Module) -> Vec<(NodeId, String, String)> {
     fn walk(
         m: &Module,
         id: NodeId,
-        seen: &mut Vec<NodeId>,
+        seen: &mut HashSet<NodeId>,
         out: &mut Vec<(NodeId, String, String)>,
     ) {
-        if seen.contains(&id) {
+        if !seen.insert(id) {
             return;
         }
-        seen.push(id);
         if let Node::Call(c) = m.node(id)
             && let CallHead::User(callee) = c.head
             && let Some(hit) = member_of_callee(m, callee)
@@ -135,7 +134,7 @@ fn collect_member_calls(m: &Module) -> Vec<(NodeId, String, String)> {
             walk(m, child, seen, out);
         }
     }
-    let mut seen = Vec::new();
+    let mut seen = HashSet::new();
     let mut out = Vec::new();
     for (_bid, b) in m.bindings() {
         walk(m, b.rhs, &mut seen, &mut out);
